@@ -1,29 +1,33 @@
-<%- include('_header') %>
+<%- include('_header', { nav: 'dashboard' }) %>
 
   <main class="mis-main mis-dashboard">
-    <p class="back-link"><a href="/apps/mis-shipment">← 一覧へ戻る</a></p>
-
-    <h2 class="form-title">📊 誤出荷ダッシュボード</h2>
+    <div class="mis-page-head">
+      <div>
+        <h2>📊 誤出荷ダッシュボード</h2>
+        <div class="mis-sub">誤出荷件数率 = 件数 ÷ 同じ期間の出荷件数</div>
+      </div>
+      <a href="/apps/mis-shipment" class="mis-btn">← 一覧へ戻る</a>
+    </div>
 
     <!-- 期間切替 -->
-    <form id="period-form" class="period-form">
-      <label>
-        <span class="label">期間タイプ</span>
-        <select name="period">
+    <form id="period-form" class="mis-panel period-form">
+      <div class="mis-field">
+        <label class="mis-field-label" for="period-select">期間</label>
+        <select name="period" id="period-select">
           <option value="month" selected>当月</option>
           <option value="week">今週 (月〜日)</option>
           <option value="custom">カスタム期間</option>
         </select>
-      </label>
-      <label class="custom-only" hidden>
-        <span class="label">開始日</span>
-        <input type="date" name="from">
-      </label>
-      <label class="custom-only" hidden>
-        <span class="label">終了日</span>
-        <input type="date" name="to">
-      </label>
-      <button type="submit" class="btn-primary">適用</button>
+      </div>
+      <div class="mis-field custom-only" hidden>
+        <label class="mis-field-label" for="period-from">開始日</label>
+        <input type="date" name="from" id="period-from">
+      </div>
+      <div class="mis-field custom-only" hidden>
+        <label class="mis-field-label" for="period-to">終了日</label>
+        <input type="date" name="to" id="period-to">
+      </div>
+      <button type="submit" class="mis-btn">適用</button>
       <span id="period-label" class="period-label-text"></span>
     </form>
 

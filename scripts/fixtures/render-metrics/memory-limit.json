@@ -1,0 +1,29 @@
+[
+  {
+    "labels": [
+      {
+        "field": "resource",
+        "value": "dpg-d60fixture0000000000-a"
+      },
+      {
+        "field": "instance",
+        "value": "dpg-d60fixture0000000000-a-0"
+      }
+    ],
+    "values": [
+      {
+        "timestamp": "2026-10-03T02:58:30Z",
+        "value": 1073741824
+      },
+      {
+        "timestamp": "2026-10-03T02:59:00Z",
+        "value": 1073741824
+      },
+      {
+        "timestamp": "2026-10-03T02:59:30Z",
+        "value": 1073741824
+      }
+    ],
+    "unit": "bytes"
+  }
+]

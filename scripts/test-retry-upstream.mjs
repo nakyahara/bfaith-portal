@@ -22,7 +22,8 @@ t('表の整合: 上流も下流も retry の定義と順序にあり、上流�
     for (const j of [down, up]) { assert.ok(Object.hasOwn(JOB_DEFINITIONS, j), `${j} が JOB_DEFINITIONS に無い`); assert.ok(RETRY_ORDER.includes(j), `${j} が RETRY_ORDER に無い`); assert.ok(retryable.includes(j), `${j} が daily-sync の RETRYABLE_JOBS に無い`); }
     assert.ok(RETRY_ORDER.indexOf(up) < RETRY_ORDER.indexOf(down), `${up} が ${down} より後に走る`);
   }
-  assert.deepEqual(UPSTREAM_OF, { 'CompanyDB注文(Qoo10)': 'Qoo10' });
+  // 決済の取込 → 財務の送り手の組 (F2b-3) は、スイッチ CDB_FINANCE_COORDINATOR が無いとき (今までの 2 工程) の組 (#1567)。あるときは coordinator 'Amazon決済と財務' の 1 工程 = この組は走らない
+  assert.deepEqual(UPSTREAM_OF, { 'CompanyDB注文(Qoo10)': 'Qoo10', 'CompanyDB広告費(Amazon)': 'Amazon Ads (SKU)', 'CompanyDB財務(Amazon)': 'Amazon Settlement', 'CompanyDB観測原価': 'm_products_history', '新商品の許可': 'マスタ照合' });
 });
 t('定義と順序の食い違いが無い (定義にあるのに順序に無いジョブは、retry-state に載っても永久に走らない)', () => {
   assert.deepEqual(Object.keys(JOB_DEFINITIONS).filter((j) => !RETRY_ORDER.includes(j)), []);
@@ -40,6 +41,7 @@ t('規則: この回で上流を再試行して失敗 → 下流は見送り / �
 });
 t('daily-sync: Qoo10 の取込が失敗した朝は、送信を「⏭️ skipped」の失敗として結果に載せる (= retry-state に入る)。取込が retry されないモールの見送りは載せない', () => {
   assert.match(dailySync, /results\.push\(\{ name: 'CompanyDB注文\(Qoo10\)', success: false, summary: '⏭️ skipped \(Qoo10 の取込が失敗/);
+  assert.match(dailySync, /results\.push\(\{ name: 'CompanyDB広告費\(Amazon\)', success: false, summary: '⏭️ skipped \(Amazon Ads \(SKU\) の取込が失敗/);   // 広告の取込は retry の対象 (Company DB構想 11 の ②)
   for (const mall of ['楽天', 'Amazon', 'auPAY', 'LINEギフト']) assert.equal(new RegExp(`results\\.push\\(\\{ name: 'CompanyDB注文\\(${mall}\\)', success: false`).test(dailySync), false, `${mall} の見送りを retry に載せている (取込が retry されないので、失敗したままの raw を送ってしまう)`);
 });
 

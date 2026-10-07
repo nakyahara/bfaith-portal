@@ -19,6 +19,7 @@ import { fileViewUrl } from './lib/drive-link.js';
 import { YAHOO_OVERRIDE_SHIPPING_GROUPS } from './lib/shipping-groups.js';
 // セットの画像の引き継ぎ計画 (§4.7)。枠の数え方と行の作り方は lib が正 (services とも共用)
 import { backfillSetImagePlans } from './lib/set-image-plan.js';
+import { ASIN_RE } from '../../lib/asin.js';
 
 export const DRAFT_STATUSES = [
   'draft', 'ready_for_ai', 'review', 'approved', 'listed', 'expanded', 'on_hold', 'excluded',
@@ -42,6 +43,323 @@ export const IMAGE_PRIORITIES = [
   { value: '自社商品（重要度：高）', bg: '#dbeafe', fg: '#1d4ed8' },
 ];
 export const IMAGE_PRIORITY_VALUES = new Set(IMAGE_PRIORITIES.map((p) => p.value));
+// ─── SP広告KW の表の定義 (初回作成と、CHECK 制約を広げる作り直し (migrateAdKwCheckConstraints) の両方で使う。1 か所に置いてズレを防ぐ) ───
+const AD_KW_EVIDENCE_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id    INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      source        TEXT NOT NULL CHECK (source IN ('suggest', 'aba', 'input', 'ai')),
+      seed          TEXT NOT NULL,
+      status        TEXT NOT NULL CHECK (status IN ('success', 'partial', 'empty', 'failed')),
+      options_json  TEXT NOT NULL DEFAULT '{}',
+      coverage_json TEXT NOT NULL,
+      raw_json      TEXT NOT NULL,
+      error         TEXT,
+      fetched_at    TEXT,
+      created_by    TEXT,
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );`;
+const AD_KW_EVIDENCE_COLS = 'id, request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by, created_at';
+const AD_KW_EVIDENCE_INDEXES = ['CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_evidence_seed ON ph_ad_kw_evidence(request_id, source, seed, id);'];
+const AD_KW_CANDIDATES_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id     INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      kind           TEXT NOT NULL CHECK (kind IN ('kw', 'negative', 'asin')),
+      value          TEXT NOT NULL,
+      value_norm     TEXT NOT NULL,
+      origin         TEXT NOT NULL CHECK (origin IN ('observed', 'ai', 'input')),
+      evidence_id    INTEGER NOT NULL REFERENCES ph_ad_kw_evidence(id),
+      observed_json  TEXT NOT NULL,
+      observed_count INTEGER NOT NULL DEFAULT 1,
+      sort_key       TEXT NOT NULL,
+      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );`;
+const AD_KW_CANDIDATES_COLS = 'id, request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key, created_at';
+const AD_KW_CANDIDATES_INDEXES = ['CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_candidates_value ON ph_ad_kw_candidates(request_id, kind, value_norm);'];
+const AD_KW_EXPORTS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id       INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      draft_id         INTEGER NOT NULL,
+      kind             TEXT NOT NULL CHECK (kind IN ('search_keywords', 'ad_copy')),
+      decision_version INTEGER NOT NULL,
+      body_json        TEXT NOT NULL,
+      body_hash        TEXT NOT NULL,
+      copied_json      TEXT NOT NULL DEFAULT '{}',
+      created_by       TEXT,
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );`;
+const AD_KW_EXPORTS_COLS = 'id, request_id, draft_id, kind, decision_version, body_json, body_hash, copied_json, created_by, created_at';
+const AD_KW_EXPORTS_INDEXES = ['CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_exports_request ON ph_ad_kw_exports(request_id, id);'];
+// 採否 = append-only。match_type の exact_phrase = 完全一致とフレーズ一致の両方に載せる (2026-09-23 中原さん「基本、完全一致とフレーズ一致を全部かけている」)
+const AD_KW_DECISIONS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      candidate_id           INTEGER NOT NULL,
+      request_id             INTEGER NOT NULL,
+      decision               TEXT NOT NULL CHECK (decision IN ('adopt', 'hold', 'reject', 'undecided')),
+      keyword                TEXT,
+      match_type             TEXT CHECK (match_type IN ('exact_phrase', 'exact', 'phrase', 'broad')),
+      scope                  TEXT,
+      supersedes_decision_id INTEGER,
+      actor                  TEXT,
+      created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );`;
+const AD_KW_DECISIONS_COLS = 'id, candidate_id, request_id, decision, keyword, match_type, scope, supersedes_decision_id, actor, created_at';
+const AD_KW_DECISIONS_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_decisions_candidate ON ph_ad_kw_decisions(candidate_id, id);',
+  'CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_decisions_request ON ph_ad_kw_decisions(request_id, id);',
+];
+// 🚨 トリガーは DROP TABLE で表と一緒に消える (削除禁止トリガーは DROP では発動しない) → 作り直しのあとに付け直す
+const AD_KW_DECISIONS_TRIGGERS = [
+  `CREATE TRIGGER IF NOT EXISTS trg_ph_ad_kw_decisions_no_update
+    BEFORE UPDATE ON ph_ad_kw_decisions
+    BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS trg_ph_ad_kw_decisions_no_delete
+    BEFORE DELETE ON ph_ad_kw_decisions
+    BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;`,
+];
+
+// ─── SP広告KW の夜間 AI (PR3a・2026-09-23 / PR3c おまかせ全自動・2026-09-26。正本 §5「PR3 実装計画 v2」「PR3c 計画 v3」) ───
+// job = 生成の依頼。manual = 人が頼んだ 1 段 (受付時に packet を固定) / auto = 夜に自動で受け付けた 2 段 (種 → 材料集め → 最終案)。
+// generation = AI 呼び出しの予約 (= 永続の予算・段ごとに 1 回・最終処分は結果保存と同じ txn)。予約した段の packet_hash を持つ。
+// probe = auto の材料集めの下書き (1 行 = 1 外部照会)。候補・採否・evidence は最終案の保存と同じ txn で書く (人の収集・採否と衝突しない)
+const AD_KW_AI_JOBS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id       INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      draft_id         INTEGER NOT NULL,
+      idempotency_key  TEXT NOT NULL,
+      mode             TEXT NOT NULL DEFAULT 'manual' CHECK (mode IN ('manual', 'auto')),
+      auto_round       INTEGER,
+      stage            TEXT NOT NULL DEFAULT 'final' CHECK (stage IN ('seeds', 'collecting', 'final')),
+      status           TEXT NOT NULL CHECK (status IN ('queued', 'running', 'retry_wait', 'done', 'needs_review', 'needs_input', 'failed', 'cancelled')),
+      seed_packet_json TEXT,
+      seed_packet_hash TEXT,
+      seeds_json       TEXT,
+      packet_json      TEXT,
+      packet_hash      TEXT,
+      packet_version   INTEGER NOT NULL,
+      lease_token      TEXT,
+      lease_until      TEXT,
+      runner_run_id    TEXT,
+      claims           INTEGER NOT NULL DEFAULT 0,
+      retries          INTEGER NOT NULL DEFAULT 0,
+      next_run_at      TEXT,
+      result_kind      TEXT CHECK (result_kind IN ('complete', 'partial', 'empty', 'rejected')),
+      accepted         INTEGER NOT NULL DEFAULT 0,
+      rejected         INTEGER NOT NULL DEFAULT 0,
+      own_decision_min INTEGER,
+      own_decision_max INTEGER,
+      error_code       TEXT,
+      error            TEXT,
+      reviewed_by      TEXT,
+      reviewed_at      TEXT,
+      requested_by     TEXT,
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finished_at      TEXT,
+      CHECK (mode = 'auto' OR (stage = 'final' AND packet_json IS NOT NULL AND packet_hash IS NOT NULL)),
+      CHECK (mode = 'manual' OR (auto_round IS NOT NULL AND seed_packet_json IS NOT NULL AND seed_packet_hash IS NOT NULL)),
+      CHECK (stage = 'seeds' OR mode = 'manual' OR seeds_json IS NOT NULL),
+      CHECK (stage != 'final' OR (packet_json IS NOT NULL AND packet_hash IS NOT NULL))
+    );`;
+// PR3a の表 (mode・stage 以下の列が無い) から写す列 = 旧い表にある列だけ
+const AD_KW_AI_JOBS_V1_COLS = 'id, request_id, draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, lease_token, lease_until, runner_run_id, claims, retries, next_run_at, result_kind, accepted, rejected, error_code, error, reviewed_by, reviewed_at, requested_by, created_at, updated_at, finished_at';
+const AD_KW_AI_JOBS_INDEXES = [
+  'CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_jobs_key ON ph_ad_kw_ai_jobs(request_id, idempotency_key);',
+  // 同じ依頼で動いている (待ち・実行中・再試行待ち) AI の依頼は 1 つだけ
+  "CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_jobs_active ON ph_ad_kw_ai_jobs(request_id) WHERE status IN ('queued', 'running', 'retry_wait');",
+  'CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_jobs_status ON ph_ad_kw_ai_jobs(status, next_run_at, id);',
+  // おまかせは 1 商品 1 回 (やり直すと round が 1 つ進む)
+  "CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_jobs_auto ON ph_ad_kw_ai_jobs(draft_id, auto_round) WHERE mode = 'auto';",
+  'CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_jobs_draft ON ph_ad_kw_ai_jobs(draft_id, id);',
+];
+const AD_KW_AI_GENERATIONS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id         INTEGER NOT NULL REFERENCES ph_ad_kw_ai_jobs(id) ON DELETE CASCADE,
+      stage          TEXT NOT NULL CHECK (stage IN ('seeds', 'final')),
+      packet_hash    TEXT NOT NULL,
+      lease_token    TEXT NOT NULL,
+      runner_run_id  TEXT,
+      status         TEXT NOT NULL CHECK (status IN ('reserved', 'accepted', 'rejected', 'discarded')),
+      model          TEXT NOT NULL,
+      prompt_version TEXT NOT NULL,
+      reserved_day   TEXT NOT NULL,
+      payload_json   TEXT,
+      payload_hash   TEXT,
+      receipt_json   TEXT,
+      discard_reason TEXT,
+      reserved_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finalized_at   TEXT,
+      UNIQUE (job_id, stage)
+    );`;
+const AD_KW_AI_GENERATIONS_V1_COLS = 'id, job_id, lease_token, runner_run_id, status, model, prompt_version, reserved_day, payload_json, payload_hash, receipt_json, discard_reason, reserved_at, finalized_at';
+const AD_KW_AI_GENERATIONS_INDEXES = ['CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_generations_day ON ph_ad_kw_ai_generations(reserved_day);'];
+const AD_KW_AI_PROBES_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id         INTEGER NOT NULL REFERENCES ph_ad_kw_ai_jobs(id) ON DELETE CASCADE,
+      step_key       TEXT NOT NULL,
+      seq            INTEGER NOT NULL,
+      kind           TEXT NOT NULL CHECK (kind IN ('suggest', 'terms', 'asin')),
+      input_json     TEXT NOT NULL,
+      status         TEXT NOT NULL CHECK (status IN ('running', 'failed', 'ok', 'empty', 'incomplete', 'skipped', 'gave_up')),
+      outcome_json   TEXT,
+      error          TEXT,
+      run_token      TEXT,
+      run_until      TEXT,
+      attempts       INTEGER NOT NULL DEFAULT 0,
+      nights_failed  INTEGER NOT NULL DEFAULT 0,
+      last_fail_day  TEXT,
+      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finished_at    TEXT,
+      UNIQUE (job_id, step_key)
+    );`;
+const AD_KW_AI_PROPOSALS_DDL = `
+    CREATE TABLE IF NOT EXISTS ph_ad_kw_ai_proposals (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id        INTEGER NOT NULL REFERENCES ph_ad_kw_ai_jobs(id) ON DELETE CASCADE,
+      generation_id INTEGER NOT NULL,
+      candidate_id  INTEGER NOT NULL REFERENCES ph_ad_kw_candidates(id) ON DELETE CASCADE,
+      value         TEXT NOT NULL,
+      value_norm    TEXT NOT NULL,
+      basis_obs_ids TEXT NOT NULL DEFAULT '[]',
+      reason        TEXT,
+      match_hint    TEXT,
+      observed      TEXT NOT NULL CHECK (observed IN ('observed', 'ai_only')),
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_proposals ON ph_ad_kw_ai_proposals(job_id, value_norm);
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_proposals_candidate ON ph_ad_kw_ai_proposals(candidate_id, id);`;
+
+/** AI の表が PR3c の定義か (generations に stage 列がある = 作り直し済み) */
+export function adKwAiTablesV2(db) {
+  return db.prepare("SELECT 1 FROM pragma_table_info('ph_ad_kw_ai_generations') WHERE name = 'stage'").get() != null
+    && db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ph_ad_kw_ai_probes'").get() != null;
+}
+
+/**
+ * PR3a の AI の表 (jobs に mode/stage が無い・generations が UNIQUE(job_id)) を PR3c の定義へ作り直す (1 トランザクション)。
+ * 既存の行 = manual / final。generation の packet_hash = その job の packet_hash。id と採番はそのまま。
+ * 失敗したら旧い表のまま (呼び手はログを出して起動を続ける。新規の受付・claim・reserve は aiSchemaReady で止まる。結果の保存は旧い表でも通る)
+ * @returns {{migrated: boolean}}
+ */
+export function migrateAdKwAiTables(db) {
+  const hasCol = (t, c) => db.prepare(`SELECT 1 FROM pragma_table_info('${t}') WHERE name = ?`).get(c) != null;
+  const needJobs = !hasCol('ph_ad_kw_ai_jobs', 'mode');
+  const needGens = !hasCol('ph_ad_kw_ai_generations', 'stage');
+  if (!needJobs && !needGens) {
+    db.exec(AD_KW_AI_PROBES_DDL('ph_ad_kw_ai_probes'));
+    return { migrated: false };
+  }
+  const fkWas = db.pragma('foreign_keys', { simple: true });
+  db.pragma('foreign_keys = OFF');
+  const seqOf = (name) => db.prepare('SELECT seq FROM sqlite_sequence WHERE name = ?').get(name)?.seq ?? null;
+  const keepSeq = (name, before) => {
+    const now = seqOf(name);
+    const want = Math.max(before ?? 0, now ?? 0);
+    if (want <= 0) return;
+    if (now == null) db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(name, want);
+    else if (now < want) db.prepare('UPDATE sqlite_sequence SET seq = ? WHERE name = ?').run(want, name);
+  };
+  const count = (t) => db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
+  try {
+    db.transaction(() => {
+      if (needJobs) {
+        const before = count('ph_ad_kw_ai_jobs'), seq = seqOf('ph_ad_kw_ai_jobs');
+        db.exec('DROP TABLE IF EXISTS ph_ad_kw_ai_jobs__new');
+        db.exec(AD_KW_AI_JOBS_DDL('ph_ad_kw_ai_jobs__new'));
+        db.exec(`INSERT INTO ph_ad_kw_ai_jobs__new (${AD_KW_AI_JOBS_V1_COLS}, mode, stage) SELECT ${AD_KW_AI_JOBS_V1_COLS}, 'manual', 'final' FROM ph_ad_kw_ai_jobs`);
+        db.exec('DROP TABLE ph_ad_kw_ai_jobs');
+        db.exec('ALTER TABLE ph_ad_kw_ai_jobs__new RENAME TO ph_ad_kw_ai_jobs');
+        if (count('ph_ad_kw_ai_jobs') !== before) throw new Error(`ph_ad_kw_ai_jobs の作り直しで行数が変わった`);
+        keepSeq('ph_ad_kw_ai_jobs', seq);
+      }
+      if (needGens) {
+        const before = count('ph_ad_kw_ai_generations'), seq = seqOf('ph_ad_kw_ai_generations');
+        db.exec('DROP TABLE IF EXISTS ph_ad_kw_ai_generations__new');
+        db.exec(AD_KW_AI_GENERATIONS_DDL('ph_ad_kw_ai_generations__new'));
+        const cols = AD_KW_AI_GENERATIONS_V1_COLS.split(', ').map((c) => 'g.' + c).join(', ');
+        db.exec(`INSERT INTO ph_ad_kw_ai_generations__new (${AD_KW_AI_GENERATIONS_V1_COLS}, stage, packet_hash)
+          SELECT ${cols}, 'final', j.packet_hash FROM ph_ad_kw_ai_generations g JOIN ph_ad_kw_ai_jobs j ON j.id = g.job_id`);
+        db.exec('DROP TABLE ph_ad_kw_ai_generations');
+        db.exec('ALTER TABLE ph_ad_kw_ai_generations__new RENAME TO ph_ad_kw_ai_generations');
+        if (count('ph_ad_kw_ai_generations') !== before) throw new Error(`ph_ad_kw_ai_generations の作り直しで行数が変わった (job の無い予約がある?)`);
+        keepSeq('ph_ad_kw_ai_generations', seq);
+      }
+      db.exec(AD_KW_AI_PROBES_DDL('ph_ad_kw_ai_probes'));
+      for (const ix of [...AD_KW_AI_JOBS_INDEXES, ...AD_KW_AI_GENERATIONS_INDEXES]) db.exec(ix);
+      const fkErrors = db.pragma('foreign_key_check');
+      if (fkErrors.length) throw new Error(`作り直し後に外部キーの不整合: ${JSON.stringify(fkErrors.slice(0, 3))}`);
+    })();
+  } finally {
+    db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
+  }
+  console.log('[product-hub] SP広告KW の AI の表を PR3c の定義に作り直した (jobs / generations / probes)');
+  return { migrated: true };
+}
+
+/**
+ * PR1 (2026-09-23 午前・#1408) の CHECK 制約を PR2-C の定義に広げる。SQLite は CHECK を ALTER できないので、
+ * 公式手順 (新しい表を作る → 行をコピー → 旧表を DROP → 改名 → 索引を作り直す) を 1 トランザクションで行う。
+ * 🚨 旧表を先に改名しない (参照する FK の定義が追随して壊れる)。id は明示コピーで保つ (decisions は id を論理参照している)。
+ *    行数が変われば例外で ROLLBACK。二度目以降は定義が新しいので何もしない (冪等)
+ * @returns {{migrated: string[]}}
+ */
+export function migrateAdKwCheckConstraints(db) {
+  const sqlOf = (t) => db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(t)?.sql || '';
+  const plan = [];
+  // PR1 の ('suggest') と、PR2-C〜の ('suggest', 'aba', 'input') のどちらからも、AI の生成回 ('ai'・PR3a 2026-09-23) を足した定義へ
+  if (/CHECK \(source IN \('suggest'\)\)|CHECK \(source IN \('suggest', 'aba', 'input'\)\)/.test(sqlOf('ph_ad_kw_evidence'))) plan.push(['ph_ad_kw_evidence', AD_KW_EVIDENCE_DDL, AD_KW_EVIDENCE_COLS, AD_KW_EVIDENCE_INDEXES]);
+  if (/CHECK \(origin IN \('observed', 'ai'\)\)/.test(sqlOf('ph_ad_kw_candidates'))) plan.push(['ph_ad_kw_candidates', AD_KW_CANDIDATES_DDL, AD_KW_CANDIDATES_COLS, AD_KW_CANDIDATES_INDEXES]);
+  if (/CHECK \(kind IN \('search_keywords'\)\)/.test(sqlOf('ph_ad_kw_exports'))) plan.push(['ph_ad_kw_exports', AD_KW_EXPORTS_DDL, AD_KW_EXPORTS_COLS, AD_KW_EXPORTS_INDEXES]);
+  // 2026-09-23 match_type に exact_phrase (完全一致＋フレーズ一致) を足す
+  if (/CHECK \(match_type IN \('exact', 'phrase', 'broad'\)\)/.test(sqlOf('ph_ad_kw_decisions'))) plan.push(['ph_ad_kw_decisions', AD_KW_DECISIONS_DDL, AD_KW_DECISIONS_COLS, AD_KW_DECISIONS_INDEXES, AD_KW_DECISIONS_TRIGGERS]);
+  if (plan.length === 0) return { migrated: [] };
+  const fkWas = db.pragma('foreign_keys', { simple: true });
+  db.pragma('foreign_keys = OFF');   // DROP/改名の間だけ。トランザクションの外でしか変えられない
+  const seqOf = (name) => db.prepare("SELECT seq FROM sqlite_sequence WHERE name = ?").get(name)?.seq ?? null;
+  // decisions は FK 無しの論理参照。ドラフトを消すと候補は CASCADE で消え、採否は監査として残る (= 正常な「孤立」) ので、
+  // 「孤立が 0」ではなく「作り直しで孤立が増えていない」を検証する (Codex #1413 R1 #1)
+  const orphanCount = () => db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions d WHERE NOT EXISTS (SELECT 1 FROM ph_ad_kw_candidates c WHERE c.id = d.candidate_id)').get().n;
+  try {
+    db.transaction(() => {
+      const orphanBefore = orphanCount();
+      for (const [name, ddl, cols, indexes, triggers = []] of plan) {
+        const tmp = `${name}__new`;
+        db.exec(`DROP TABLE IF EXISTS ${tmp}`);
+        db.exec(ddl(tmp));
+        const before = db.prepare(`SELECT COUNT(*) AS n FROM ${name}`).get().n;
+        const seqBefore = seqOf(name);   // 消した行を含む採番の上限。DROP で失われるので退避 (id を再利用させない — Codex #1413 R1 #2)
+        db.exec(`INSERT INTO ${tmp} (${cols}) SELECT ${cols} FROM ${name}`);
+        db.exec(`DROP TABLE ${name}`);
+        db.exec(`ALTER TABLE ${tmp} RENAME TO ${name}`);   // sqlite_sequence の name も追随する
+        for (const ix of indexes) db.exec(ix);
+        for (const tg of triggers) db.exec(tg);
+        const after = db.prepare(`SELECT COUNT(*) AS n FROM ${name}`).get().n;
+        if (before !== after) throw new Error(`${name} の作り直しで行数が変わった (${before} → ${after})`);
+        const seqNow = seqOf(name);
+        const seqWant = Math.max(seqBefore ?? 0, seqNow ?? 0);
+        if (seqWant > 0) {
+          if (seqNow == null) db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(name, seqWant);
+          else if (seqNow < seqWant) db.prepare('UPDATE sqlite_sequence SET seq = ? WHERE name = ?').run(seqWant, name);
+        }
+      }
+      const fkErrors = db.pragma('foreign_key_check');
+      if (fkErrors.length) throw new Error(`作り直し後に外部キーの不整合: ${JSON.stringify(fkErrors.slice(0, 3))}`);
+      const orphanAfter = orphanCount();
+      if (orphanAfter !== orphanBefore) throw new Error(`作り直しで候補を失った採否が増えた (${orphanBefore} → ${orphanAfter} 件)`);
+    })();
+  } finally {
+    db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
+  }
+  console.log(`[product-hub] SP広告KW の表の CHECK を広げた: ${plan.map((p) => p[0]).join(', ')}`);
+  return { migrated: plan.map((p) => p[0]) };
+}
+
 // 「自社商品」の重要度は own_brand チェックと連動する (2026-08-24 中原さん要望)
 export const OWN_BRAND_IMAGE_PRIORITY = '自社商品（重要度：高）';
 // 画像制作の管理項目 (撮影・素材 / Canva / 依頼文 / 保留 / 定型文) は重要度に関係なく全商品で使える
@@ -995,7 +1313,203 @@ export function initProductHubDB() {
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
     CREATE INDEX IF NOT EXISTS idx_draft_events_draft ON draft_events(draft_id);
+
+    -- ── LP 構成の AI 生成 (段階1・2026-10-01) ───────────────────────────
+    -- 正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』。
+    -- 型は SP広告KW の夜間 AI (ph_ad_kw_ai_jobs / _generations) の manual を縮小して写したもの。
+    -- 段階1 の目的は機能ではなく測定 (AI の構成が使えるか)。画像生成・GAS 送信・夜間実行は範囲外。
+
+    -- 仕様書のスナップショット。**追記専用** — 一度入れた行は書き換えない (Codex R3 #3)。
+    -- job は「最新版」ではなく受付時の spec_id を持ち、claim で hash を照合する。
+    -- こうしないと、依頼から claim までに仕様書が差し替わると packet_hash が同じまま中身が変わる。
+    CREATE TABLE IF NOT EXISTS ph_lp_specs (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind              TEXT NOT NULL CHECK (kind IN ('product_analysis')),
+      title             TEXT NOT NULL,
+      body              TEXT NOT NULL,          -- 全タブをテキスト化したもの
+      hash              TEXT NOT NULL,          -- body の sha256
+      sheet_titles_json TEXT NOT NULL DEFAULT '[]',
+      imported_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      imported_by       TEXT NOT NULL
+    );
+    -- 同じ中身を上げ直しても行が増えない (= 版が無駄に進まない)
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_specs_hash ON ph_lp_specs(kind, hash);
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_specs_kind ON ph_lp_specs(kind, id DESC);
+    -- 「追記専用」を宣言でなく DB で担保する (Codex R4 #4)。
+    -- 宣言だけだと通常の UPDATE で中身を差し替えられ、spec_hash の照合が通ったまま
+    -- AI への実効入力が変わる = job の再現性が失われる。
+    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_update BEFORE UPDATE ON ph_lp_specs
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (更新は新しい行として入れてください)'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_delete BEFORE DELETE ON ph_lp_specs
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (job が版を参照しています)'); END;
+
+    -- 🚨 draft_id に FK / ON DELETE CASCADE を張らない (Codex R3 #5)。
+    --    段階1 は測定が目的なので、draft を普通に消しただけで実験記録が消えては困る。
+    -- 🚨 kind 列を作らない (Codex R3 #6)。この 2 表は**構成生成専用**。
+    --    SQLite は CHECK の変更に表の再構築が要るので「段階2 で足す」前提の列は足かせにしかならない。
+    --    段階2 の画像生成は別の表 (image job / attempt / artifact) にし、構成の結果をその入力にする。
+    CREATE TABLE IF NOT EXISTS ph_lp_compose_jobs (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id        INTEGER NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      status          TEXT NOT NULL
+                        CHECK (status IN ('queued','running','done','needs_review','failed','cancelled')),
+      packet_json     TEXT NOT NULL,          -- 受付時に固定した材料
+      packet_hash     TEXT NOT NULL,
+      packet_version  INTEGER NOT NULL,
+      spec_id         INTEGER NOT NULL REFERENCES ph_lp_specs(id),
+      spec_hash       TEXT NOT NULL,
+      lease_token     TEXT,
+      lease_until     TEXT,
+      runner_run_id   TEXT,
+      claims          INTEGER NOT NULL DEFAULT 0,
+      output_text     TEXT,                   -- ⑦ の全文 (人がコピーするもの)
+      output_hash     TEXT,
+      lint_json       TEXT,                   -- lint と parser 検査の結果
+      review_rounds   INTEGER,                -- 検品が何巡で通ったか (測定用)
+      error_code      TEXT,
+      error           TEXT,
+      requested_by    TEXT NOT NULL,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      -- 測定用の 2 列 (Codex R4 #2)。lease は 40 分なので、3 分の合格ラインと接続されていないと
+      -- 「3 分では終わらなかったが後で成功した」job が所要時間の母数から抜けてしまう。
+      --   measurement_deadline_at = 受付時に created_at + 3 分で固定 (以後書き換えない)
+      --   completed_at            = done / failed / needs_review / cancelled の**すべて**で必ず入れる
+      --                             (finalized_at は reserve 後の終了にしか付かないので別に持つ)
+      -- 期限内に終わったかは completed_at <= measurement_deadline_at で後から計算する。
+      -- どちらも一度書いたら変えないので、集計をあとから都合よく動かせない。
+      measurement_deadline_at TEXT NOT NULL,
+      -- 🚨 実行役へ実際に配った商品画像の記録 (file_id / sha256 / bytes)。
+      --    **サーバが配ったときに自分で書く**。実行役の作業ディレクトリに置くと、
+      --    Claude のセッションが Write できてしまい「見ていないのに見たことにする」偽造ができる
+      --    (codex exec review P1)。証跡は測定の根拠なので、セッションが触れない所に持つ。
+      images_served_json TEXT NOT NULL DEFAULT '[]',
+      completed_at    TEXT,
+      finalized_at    TEXT
+    );
+    -- 二重クリック・通信リトライで job が増えない
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_compose_jobs_key
+      ON ph_lp_compose_jobs(draft_id, idempotency_key);
+    -- 同じ商品で動いている依頼は 1 つだけ
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_compose_jobs_active
+      ON ph_lp_compose_jobs(draft_id) WHERE status IN ('queued','running');
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_jobs_status ON ph_lp_compose_jobs(status, id);
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_jobs_draft ON ph_lp_compose_jobs(draft_id, id DESC);
+
+    -- AI を呼ぶ「前」に予約する行。呼んだ後の終了は必ずここを確定させる (設計 §4.3b)。
+    -- reserved のまま残る = 成否不明 → job は needs_review。自動で作り直さない。
+    CREATE TABLE IF NOT EXISTS ph_lp_compose_generations (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id         INTEGER NOT NULL REFERENCES ph_lp_compose_jobs(id) ON DELETE CASCADE,
+      packet_hash    TEXT NOT NULL,
+      lease_token    TEXT NOT NULL,
+      runner_run_id  TEXT,
+      status         TEXT NOT NULL CHECK (status IN ('reserved','accepted','rejected','discarded')),
+      model          TEXT NOT NULL,
+      prompt_version TEXT NOT NULL,
+      reserved_day   TEXT NOT NULL,
+      payload_hash   TEXT,
+      -- receipt_json には「何を見て作ったか」を残す: 実際に配った商品画像のバイト列の sha256 と枚数。
+      -- Drive の差し替えに対する**事前**照合は段階1 では張らない (Codex R4 #3 を承知で見送り):
+      -- 生成は数分で、その間に社内の商品画像が差し替わる確率は低く、事前照合には Drive metadata の
+      -- 追加参照が要る (既存 getDriveThumbnail の version はキャッシュキーで検証ではない)。
+      -- 段階2 (画像生成で本当に効く場面) で revision / md5Checksum の固定を入れる。
+      -- 段階1 は「あとから何を見たか分かる」ところまでで足りる。
+      receipt_json   TEXT,
+      discard_reason TEXT,
+      reserved_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finalized_at   TEXT,
+      UNIQUE (job_id)                          -- 段階1 は 1 job 1 生成 (構成生成試行として閉じる)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_generations_day
+      ON ph_lp_compose_generations(reserved_day);
+
+    -- LP 画像の生成 (段階2・2026-10-04 中原さん「画像を作って比べたい」)。
+    -- 構成ができた (done・実モデル一致) 依頼の ⑦ を画像ごとに gpt-image-2.5 へ。人がボタンを押したときだけ。
+    CREATE TABLE IF NOT EXISTS ph_lp_image_jobs (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id        INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      compose_job_id  INTEGER NOT NULL REFERENCES ph_lp_compose_jobs(id) ON DELETE CASCADE,
+      idempotency_key TEXT NOT NULL,
+      status          TEXT NOT NULL CHECK (status IN ('queued','running','done','partial','failed','cancelled')),
+      model           TEXT NOT NULL,
+      quality         TEXT NOT NULL,
+      size            TEXT NOT NULL,
+      folder_id       TEXT,                    -- 商品の画像フォルダ (drive_folder_url)
+      ai_folder_id    TEXT,                    -- その中の「AI初稿」。**最初の画像を作る前に**用意して固定する (#1612 R1)
+      requested_by    TEXT,
+      error           TEXT,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      started_at      TEXT,
+      completed_at    TEXT,
+      UNIQUE (draft_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_image_jobs_draft ON ph_lp_image_jobs(draft_id, id DESC);
+
+    -- 1 枚ずつ。prompt と参考画像は受付時に固定 (作り直すときは新しい job)
+    CREATE TABLE IF NOT EXISTS ph_lp_images (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      image_job_id    INTEGER NOT NULL REFERENCES ph_lp_image_jobs(id) ON DELETE CASCADE,
+      seq             INTEGER NOT NULL,         -- 作る順 (1〜)
+      no              INTEGER,                  -- 構成の画像番号 (0 = サムネイル)
+      name            TEXT,
+      prompt          TEXT NOT NULL,
+      refs_json       TEXT NOT NULL DEFAULT '[]',  -- 参考に渡す画像 [{file_id, role, label}]
+      status          TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','skipped')),
+      est_jpy         INTEGER NOT NULL DEFAULT 0, -- 取り置き額 (円・切り上げ。品質段・参考画像・prompt のバイト数から・#1612 R1〜R4)
+      claimed_by      TEXT,                    -- 作っているプロセス (再起動の片付けで、生きているものを中断にしない・#1612 R1)
+      lease_until     TEXT,
+      drive_file_id   TEXT,
+      error           TEXT,
+      cost_jpy        INTEGER,                 -- 円 (切り上げ・金額は整数の決まり)
+      started_at      TEXT,
+      completed_at    TEXT,
+      UNIQUE (image_job_id, seq)
+    );
+
+    -- AI の従量課金の台帳 (検討 §6 層2・fail-closed)。呼ぶ**前**に見込みで取り置き (reserved)、
+    -- 終わったら実額 (charged) か 0 (failed・請求されない失敗) に確定する。
+    -- 当月の合計 = charged の実額 + reserved / unknown の見込み額。これが上限を超えるなら呼ばない
+    CREATE TABLE IF NOT EXISTS ph_ai_usage (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind            TEXT NOT NULL,            -- 'lp_image'
+      month           TEXT NOT NULL,            -- JST の YYYY-MM
+      draft_id        INTEGER,
+      ref_id          INTEGER,                  -- ph_lp_images.id
+      model           TEXT,
+      quality         TEXT,
+      status          TEXT NOT NULL CHECK (status IN ('reserved','charged','failed','unknown')),
+      est_jpy         INTEGER NOT NULL,        -- 円 (切り上げ)
+      cost_jpy        INTEGER,                 -- 円 (切り上げ・推定)
+      in_text_tokens  INTEGER,
+      in_image_tokens INTEGER,
+      out_tokens      INTEGER,
+      error           TEXT,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finished_at     TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_ai_usage_month ON ph_ai_usage(kind, month);
   `);
+
+  // LP 構成: 実行役へ配った画像の記録 (PR1-b で追加。PR1-a でデプロイ済みの DB にも入れる)
+  const lpJobCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_jobs)').all().map((c) => c.name));
+  if (lpJobCols.size > 0 && !lpJobCols.has('images_served_json')) {
+    db.exec("ALTER TABLE ph_lp_compose_jobs ADD COLUMN images_served_json TEXT NOT NULL DEFAULT '[]'");
+  }
+  // LP 構成: 実際に本回答を書いたモデル (2026-10-02・codex exec review #1591 High)。
+  // model = 頼んだモデル (reserve)。こちらはランナーが stream-json の assistant.message.model を読んで後から付ける。
+  // model_check: match / mismatch / unknown (NULL = まだ付いていない)。一度付けたら書き換えない
+  const lpGenCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_generations)').all().map((c) => c.name));
+  if (lpGenCols.size > 0 && !lpGenCols.has('actual_model')) {
+    db.exec('ALTER TABLE ph_lp_compose_generations ADD COLUMN actual_model TEXT');
+  }
+  if (lpGenCols.size > 0 && !lpGenCols.has('model_check')) {
+    db.exec("ALTER TABLE ph_lp_compose_generations ADD COLUMN model_check TEXT CHECK (model_check IN ('match','mismatch','unknown'))");
+  }
+  if (lpGenCols.size > 0 && !lpGenCols.has('model_checked_at')) {
+    db.exec('ALTER TABLE ph_lp_compose_generations ADD COLUMN model_checked_at TEXT');
+  }
 
   // 既存 DB へのカラム追加 (warehouse-mirror/db.js の addColumnIfMissing と同方針の冪等 ALTER)
   const draftCols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));
@@ -1101,6 +1615,41 @@ export function initProductHubDB() {
   if (!draftCols.has('imported_at')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
   }
+  // 既存の楽天ページへのバリエーション追加か (2026-09-25 スタッフ要望「既存ページラベルが欲しい」)。
+  // NULL = 自動判定に任せる / 1 = 人が「既存ページに追加」と決めた / 0 = 人が「新規ページ」と決めた。
+  // 自動判定は lib/existing-page.js (NE の同じグループにアプリ導入前からの商品があるか)
+  if (!draftCols.has('existing_page')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN existing_page INTEGER CHECK (existing_page IS NULL OR existing_page IN (0, 1))');
+  }
+  // 出品済みのページに後から色 (SKU) が足されたときのカードが、どのページ (ドラフト) への追加か (2026-09-25)。
+  // 以前は自動取込が既存のドラフトへ黙ってまとめるだけで、カードが出なかった (new-product-intake.js)。
+  // parent_draft_id (セット派生) とは別物 — 流用するとセット扱いになる
+  if (!draftCols.has('added_to_draft_id')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN added_to_draft_id INTEGER');
+  }
+  // Company DB の「新商品の登録」から作ったカード (2026-10-01・Company DB構想 14 ⑤-2a)。cdb_sku_id = Company DB の core.skus.sku_id。
+  // 1 つの SKU にカードは 1 枚 (部分 unique)。取り込み (services/cdb-card-intake.js) はこの一意で冪等。
+  // ph_cdb_card_events = 取り込んだ知らせ (Company DB の ops.product_hub_outbox の event_id) と結果 (作った / 結んであった / 衝突)・
+  // 発送方法 (送料コード) を楽天の配送方法に対応できたか (unmapped = カードに「要確認」)
+  if (!draftCols.has('cdb_sku_id')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN cdb_sku_id INTEGER');
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_product_drafts_cdb_sku ON product_drafts(cdb_sku_id) WHERE cdb_sku_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS ph_cdb_card_events (
+      event_id          TEXT PRIMARY KEY,
+      cdb_sku_id        INTEGER NOT NULL,
+      ne_code           TEXT NOT NULL,
+      outcome           TEXT NOT NULL CHECK (outcome IN ('created', 'linked', 'conflict')),
+      draft_id          INTEGER,
+      conflict_draft_id INTEGER,
+      shipping_status   TEXT CHECK (shipping_status IS NULL OR shipping_status IN ('mapped', 'unmapped')),
+      shipping_code     TEXT,
+      shipping_method   TEXT,
+      applied_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_cdb_card_events_draft ON ph_cdb_card_events(draft_id);
+  `);
   // ページ表記の自動保存 (#691): ページロードごとのトークン + 単調増加 seq。
   // 自動保存とpagehideビーコンの到着順が逆転しても「古いリクエストが新しい保存を
   // 上書きしない」ためのリビジョン (同一トークン内でのみ seq を比較する)
@@ -1424,7 +1973,7 @@ export function initProductHubDB() {
     ['workflow_state', "ALTER TABLE draft_image_production ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'active' CHECK (workflow_state IN ('active', 'on_hold'))"],
     ['hold_note', 'ALTER TABLE draft_image_production ADD COLUMN hold_note TEXT'],
     // 2026-09-13 スタッフ要望: 本番の構成の 済/まだ。縦列 ②仮構成 とは別に持つ。
-    //   NULL = 人がまだ決めていない (③素材待ちが決着していれば 済 とみなす) / 'done' / 'todo' = 人が決めた値 (推定より優先)
+    //   NULL = 人がまだ決めていない (④AI制作が決着していれば 済 とみなす) / 'done' / 'todo' = 人が決めた値 (推定より優先)
     ['compose_status', "ALTER TABLE draft_image_production ADD COLUMN compose_status TEXT CHECK (compose_status IN ('done', 'todo'))"],
     ['compose_updated_at', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_at TEXT'],
     ['compose_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_by TEXT'],
@@ -1457,6 +2006,105 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_dini_draft ON draft_image_notion_imports(draft_id);
   `);
+
+  // ─── SP広告 検索キーワード (2026-09-23 PR1・『Amazon_SP広告KW自動生成_設計方針_20260922.md』§4.5) ───
+  // 依頼 → 材料 (evidence) → 候補 → 採否 (append-only) → コピー履歴 の 5 表。採否の正本はここ (Render) だけ。
+  // PR1 は「サジェスト収集 (miniPC 経由・人の操作で同期) → 観測語の採否 → マッチタイプ別コピー」。
+  // AI 提案 (PR3) / ABA (PR2) / 除外KW (PR4) の列は使う PR で足す (ここで先に空の列を作らない)。
+  // 🚨 既存の sp_keywords_snapshot (7 日で消える上書きキャッシュ) はこの用途に使わない
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_ad_kw_requests (
+      id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id              INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      idempotency_key       TEXT NOT NULL,
+      status                TEXT NOT NULL DEFAULT 'review_ready'
+                            CHECK (status IN ('collecting', 'review_ready', 'cancelled', 'superseded')),
+      -- 収集の排他 (同期処理の lease)。miniPC に頼んでいる間だけ入る。token が違う結果は保存しない
+      collecting_seed       TEXT,
+      collecting_token      TEXT,
+      collecting_since      TEXT,
+      -- 依頼時点の商品情報 (name / ne_code / asin)。あとで商品情報が変わったら「旧情報に基づく」と出す
+      product_snapshot_json TEXT NOT NULL,
+      input_hash            TEXT NOT NULL,
+      supersedes_request_id INTEGER,
+      requested_by          TEXT,
+      created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_requests_key ON ph_ad_kw_requests(draft_id, idempotency_key);
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_requests_draft ON ph_ad_kw_requests(draft_id, id);
+
+    -- 材料 = 取得元ごと・種ごと・**取得回ごと**の「取得した事実」(上書きしない。取り直しは行を足す。
+    -- 候補の観測は取得回の行を指すので、前回だけで観測した語の日時・出典が今回の結果に書き換わらない — Codex R2 #4)。
+    -- status は 失敗 / 0 件 / 一部 / 成功 を混ぜない (§4.3)。種の「いまの状態」は最新の行
+    ${AD_KW_EVIDENCE_DDL('ph_ad_kw_evidence')}
+    ${AD_KW_EVIDENCE_INDEXES.join('\n')}
+
+    -- 候補 = 材料から取り出した語 / 人が入れた ASIN。origin は observed (材料で観測) / ai (PR3) / input (人の入力 = 競合 ASIN)
+    ${AD_KW_CANDIDATES_DDL('ph_ad_kw_candidates')}
+    ${AD_KW_CANDIDATES_INDEXES.join('\n')}
+
+    -- 採否 = append-only (訂正は新しい行。最新の行がいまの採否)。draft_events と同じく FK を張らない:
+    -- CASCADE の削除が no_delete トリガーで止まり、ドラフトを消せなくなるため
+    ${AD_KW_DECISIONS_DDL('ph_ad_kw_decisions')}
+    ${AD_KW_DECISIONS_INDEXES.join('\n')}
+
+    -- コピー履歴 = 採否版 (decision_version = そのとき見た採否の最新 id) を参照した固定の本文。
+    -- 「コピー済み」であって「Amazon 登録済み」ではない (登録は人が広告画面で行う)
+    ${AD_KW_EXPORTS_DDL('ph_ad_kw_exports')}
+    ${AD_KW_EXPORTS_INDEXES.join('\n')}
+  `);
+  for (const tg of AD_KW_DECISIONS_TRIGGERS) db.exec(tg);
+  // ─── 広告の進み (2026-09-28 中原さん「広告をかけた商品は何か・どこまでやったかを管理したい」) ───
+  // ボードの「📣 広告」タブの記録。人が記録するのは 段階 (stage) と「調整した」(adjust) だけ。
+  // 広告費の実績 (mirror_amazon_ads_sku_daily) と SP広告KW の進みは画面を開いたときに読む (ここには写さない)。
+  // append-only (訂正は新しい行・最新の stage 行がいまの段階)。draft_events と同じく FK を張らない:
+  // CASCADE の削除が no_delete トリガーで止まり、ドラフトを消せなくなるため
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_ad_ops_events (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id       INTEGER NOT NULL,
+      mall           TEXT NOT NULL DEFAULT 'amazon' CHECK (mall IN ('amazon')),
+      kind           TEXT NOT NULL CHECK (kind IN ('stage', 'adjust')),
+      stage          TEXT CHECK (stage IN ('none', 'kw_ready', 'running', 'stopped')),
+      -- 出したキャンペーンの種類 (JSON 配列: auto / manual_kw / product_target)。stage='running' の行だけ
+      campaign_types TEXT,
+      memo           TEXT,
+      -- 実際にやった日 (JST の YYYY-MM-DD)。記録した時刻 (created_at) とは別 = あとから記録してよい
+      happened_on    TEXT NOT NULL CHECK (happened_on GLOB '????-??-??'),
+      actor          TEXT,
+      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      CHECK ((kind = 'stage' AND stage IS NOT NULL) OR (kind = 'adjust' AND stage IS NULL))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_ops_events_draft ON ph_ad_ops_events(draft_id, mall, kind, id);
+    CREATE TRIGGER IF NOT EXISTS trg_ph_ad_ops_events_no_update
+      BEFORE UPDATE ON ph_ad_ops_events
+      BEGIN SELECT RAISE(ABORT, 'ph_ad_ops_events is append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_ph_ad_ops_events_no_delete
+      BEFORE DELETE ON ph_ad_ops_events
+      BEGIN SELECT RAISE(ABORT, 'ph_ad_ops_events is append-only'); END;
+  `);
+  // ─── SP広告KW の夜間 AI (PR3a・2026-09-23・正本 §5「PR3 実装計画 v2 / v2.1」) ───
+  // job = 生成の依頼 (受付時に材料 packet を固定)。generation = AI 呼び出しの予約 (= 永続の予算・1 job 1 回・最終処分は結果保存と同じ txn)。
+  // proposal = job ごとの提案記録 (候補の observed_json には足さない = 観測記録を汚さない・既存の採否を戻さない)
+  // 新しい DB は PR3c の定義で作る。PR3a の表が既にある DB は migrateAdKwAiTables が作り直す (索引は作り直しのあと = 旧い表に無い列を参照するため)
+  db.exec(AD_KW_AI_JOBS_DDL('ph_ad_kw_ai_jobs'));
+  db.exec(AD_KW_AI_GENERATIONS_DDL('ph_ad_kw_ai_generations'));
+  db.exec(AD_KW_AI_PROPOSALS_DDL);
+  try {
+    migrateAdKwAiTables(db);
+    for (const ix of [...AD_KW_AI_JOBS_INDEXES, ...AD_KW_AI_GENERATIONS_INDEXES]) db.exec(ix);
+  } catch (e) {
+    console.error('[product-hub] SP広告KW の AI の表の作り直しに失敗 (旧い表のまま。新しい AI の依頼・おまかせは止まる。届いた結果の保存は受ける):', e.message);
+  }
+  // PR1 (2026-09-23 午前) の CHECK 制約を広げる (source に aba/input・origin に input・kind に ad_copy・match_type に exact_phrase)。
+  // SQLite は CHECK を ALTER できないので表を作り直す (行と id はそのまま)。既に新しい定義なら何もしない。
+  // 🚨 失敗しても起動は止めない (product-hub 全体を落とさない)。旧い定義のままだと、競合 ASIN の追加と「完全一致＋フレーズ一致」の採用が CHECK で失敗する → ログで気づく
+  try {
+    migrateAdKwCheckConstraints(db);
+  } catch (e) {
+    console.error('[product-hub] SP広告KW の表の作り直しに失敗 (旧い定義のまま動く。競合 ASIN の追加と「完全一致＋フレーズ一致」の採用は失敗する):', e.message);
+  }
 
   // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
   // 毎起動で巻き戻らない (code が PK)。ph_steps.role_code は ph_roles を参照するので順序が要る
@@ -2101,7 +2749,7 @@ export function listGenerationQueue(db, { limit = 50, ids = null } = {}) {
  */
 export function extractAsin(draft) {
   const direct = String(draft?.asin || '').trim().toUpperCase();
-  if (/^[A-Z0-9]{10}$/.test(direct)) return direct;
+  if (ASIN_RE.test(direct)) return direct;
   const m = String(draft?.amazon_url || '').match(/\/dp\/([A-Z0-9]{10})(?:[/?#]|$)/i);
   return m ? m[1].toUpperCase() : null;
 }
@@ -2348,8 +2996,11 @@ export function imageRefOfFileId(db, fileId) {
     SELECT white_bg_modified_time FROM draft_rakuten WHERE white_bg_drive_file_id = ?
     UNION ALL
     SELECT drive_modified_time FROM draft_sku_images WHERE drive_file_id = ?
+    UNION ALL
+    -- AI が作った LP 画像 (段階2)。保存したのはサーバ自身なので、登録済みの画像と同じく見せてよい
+    SELECT completed_at FROM ph_lp_images WHERE drive_file_id = ?
     LIMIT 1
-  `).get(fileId, fileId, fileId) || null;
+  `).get(fileId, fileId, fileId, fileId) || null;
 }
 
 /**

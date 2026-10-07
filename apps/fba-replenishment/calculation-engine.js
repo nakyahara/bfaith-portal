@@ -7,7 +7,12 @@
 import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
          getWarehouseSummary, getDailySnapshots, getAllNonFbaMax60d,
          getWarehouseLocationsByCode,
-         getRestockLatest, getPlanningLatestMap } from './db.js';
+         getRestockLatest, getPlanningLatestMap,
+         getReplenishmentExcluded, getSelfShipSalesByCode, getPendingFbaSlips, getTrialInputs, getSheetlessCalcBlock } from './db.js';
+import { allocateWarehouse } from './self-reserve.js';
+import { readUsReserved } from '../fba-replenishment-us/ledger.js';
+// v3-2 のならしの枠を「記録される提案」と同じ判定で数えるため (shadow-draft.mjs は依存の無い純粋な関数だけ)
+import { blockedReason } from './shadow-draft.mjs';
 
 /**
  * 推奨リストを生成
@@ -21,11 +26,48 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
  *
  * 発注点で自然に絞り込み、ハードリミットは設けない
  */
-export function generateRecommendations(debug = false, inboundWorkingOverride = null) {
-  const settings = getSettings();
+export function generateRecommendations(debug = false, inboundWorkingOverride = null, opts = {}) {
+  const first = computeRecommendations(debug, inboundWorkingOverride, opts);
+  // v3-2 推奨が少ない日のならし (中原さん 9/24 の方針 ②): v3 だけ。1 回目の結果が目安に届かない日に、
+  //   「発注点を下回っていないだけ」の SKU を選び、2 回目の計算で通常の補充と同じ経路 (Amazon 推奨・倉庫・期限・
+  //   最低出荷日数・丸め・ロケ補正・配分) に通す。配分は通常の補充を先、早めに送る分をあと (Codex v3 設計レビュー High 5)
+  if (first.rules !== 'v3' || opts._pullForward || (first.errors || []).length) return first;
+  const settings = rulesSettings(getSettings(), 'v3');
+  let result = first;
+  if (opts.smoothing !== false) {
+    const plan = planSmoothing(first, settings);
+    if (!plan.picks.size) {
+      first.data_quality.smoothing = plan.summary;
+    } else {
+      result = computeRecommendations(debug, inboundWorkingOverride, { ...opts, _pullForward: plan.picks });
+      result.data_quality.smoothing = summarizeSmoothing(plan, first, result);
+    }
+  }
+  // v3-4 1 日の上限は配分の中 (allocateForItems) でかける = 試す候補の空き・返す合計が削ったあとの数になる (Codex PR #1505 R1)
+  return result;
+}
+
+function computeRecommendations(debug = false, inboundWorkingOverride = null, opts = {}) {
+  // 決まりの版。画面・手動の推奨は v2 (今までどおり)。9:40 の自動決定だけ v3 も計算して比べる (決まりの変更 v3-1。2026-09-26)
+  //   🚨 v3 の数字は v3_* の設定だけで持ち、既存の設定は書き換えない (画面・米国補充に効かせない。Codex v3 設計レビュー High 1)
+  const rules = opts.rules === 'v3' ? 'v3' : 'v2';
+  // 🚨 Sheet なしのモード (FBA_SHEETLESS_MODE=1・⑦-F): 設定・SKU の対応・商品管理リストのどれかが欠けたら計算しない。
+  //    Sheet の値には戻らない。何も作らずに失敗を返す = 前の結果 (画面の一覧・健全性の記録) はそのまま、9:40 の自動決定は fail の ping
+  const sheetlessBlock = getSheetlessCalcBlock();
+  if (sheetlessBlock) return { items: [], errors: [sheetlessBlock], sheetless_blocked: true };
+  const settings = rulesSettings(getSettings(), rules);
+  const feeGuard = rules === 'v3' ? feeGuardDays(settings) : null;
   const mappings = getSkuMappings();
   const exceptions = getSkuExceptions();
-  const warehouseSummary = getWarehouseSummary();
+  // 倉庫在庫: ふつうは画面と同じ warehouse_inventory (手動 CSV)。影の下書き (9:40 の自動決定) はロジザードの写しから
+  //   組み立てたものを opts.warehouse で渡す。🚨 渡されたら合計もロケも全部それを使う (一部だけ手動 CSV に戻らない。
+  //   Codex A2b 設計レビュー Medium 6)
+  const injectedWarehouse = opts.warehouse || null;
+  if (injectedWarehouse && (!Array.isArray(injectedWarehouse.summaryRows) || typeof injectedWarehouse.locationsByCode !== 'function')) {
+    throw new Error('opts.warehouse には summaryRows と locationsByCode の両方が要る');
+  }
+  const warehouseSummary = injectedWarehouse ? injectedWarehouse.summaryRows : getWarehouseSummary();
+  const warehouseLocationsOf = injectedWarehouse ? injectedWarehouse.locationsByCode : getWarehouseLocationsByCode;
 
   // PR4: SKU/コード正規化 (mirror は seller_sku・ne_code を小文字保存、FBA側データ(snapshot/restock/warehouse)は
   // 元ケース → 突き合わせを case 非依存にして SKU 欠落・在庫0誤判定を防ぐ。sheet モードでも同値同士なので無害)。
@@ -180,7 +222,21 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       ? components.filter(c => c.ne_code).map(c => ({ code: c.ne_code, perSet: c.qty || 1 }))
       : (mapping.logizard_code ? [{ code: mapping.logizard_code, perSet: 1 }] : []);
     const locCache = {};
-    const locsFor = (code) => (locCache[code] ??= getWarehouseLocationsByCode(code));
+    const locsFor = (code) => (locCache[code] ??= warehouseLocationsOf(code));
+    // 倉庫在庫の配分 (self-reserve.js) で使う: この SKU 1 個が使う構成品と個数 / 期限で縛られる構成品の在庫
+    //   (単品の倉庫の引き方は下の warehouseMap と同じ logizard_code → ne_code の順。同じ構成品が 2 行あれば足す)
+    const allocUnits = [];
+    if (!invalidMapping) {
+      const src = (components && components.length > 0)
+        ? components.map(c => ({ code: c.ne_code, qty: c.qty || 1 }))
+        : ((mapping.logizard_code || mapping.ne_code) ? [{ code: mapping.logizard_code || mapping.ne_code, qty: 1 }] : []);
+      for (const u of src) {
+        const code = normCode(u.code);
+        const hit = allocUnits.find(x => x.code === code);
+        if (hit) hit.qty += u.qty; else allocUnits.push({ code, qty: u.qty });
+      }
+    }
+    const expiryPools = [];
 
     // --- 期限管理商品判定 (effectiveFbaStock 計算と min_shipment_days フィルタで使用) ---
     // セット品は全構成品を確認 (従来は先頭構成品のみで、2番目以降の構成品の期限管理を見落としていた)
@@ -222,8 +278,21 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
     // --- 動的在庫日数目標 & 発注点 ---
     const perUnitVolume = snap.per_unit_volume || mapping.per_unit_volume || 0;
-    const targetDays = calcTargetDays(sold30d, perUnitVolume, snap, settings);
-    const reorderPointDays = calcReorderPoint(sold30d, sold7d, perUnitVolume, snap, settings);
+    let targetDays = calcTargetDays(sold30d, perUnitVolume, snap, settings);
+    let reorderPointDays = calcReorderPoint(sold30d, sold7d, perUnitVolume, snap, settings);
+    // 低在庫手数料の見張り (v3): 免除でないと分かっている・売れている SKU は、発注点を「手数料の閾値 + 納品にかかる日数 + 余裕」まで上げる。
+    //   免除かどうか分からない (PLANNING に無い) SKU は上げない (記録だけ)。目標は発注点 + 最低出荷日数より下げない
+    //   (発注点だけ上がって 1 回の量が最低出荷日数に届かず、送らない になるのを避ける)
+    const feeStatus = snap.low_inv_fee_exempt === 'Yes' ? 'exempt' : snap.low_inv_fee_exempt === 'No' ? 'eligible' : 'unknown';
+    let reorderReason = 'tier';
+    if (rules === 'v3') {
+      if (feeStatus === 'eligible' && sold30d > 0 && reorderPointDays > 0 && reorderPointDays < feeGuard) {
+        reorderPointDays = feeGuard;
+        reorderReason = 'fee_guard';
+      }
+      const minCover = parseInt(settings.min_shipment_cover_days || 7);
+      if (reorderPointDays > 0 && targetDays < reorderPointDays + minCover) targetDays = reorderPointDays + minCover;
+    }
     // 発注点を個数換算（日数 × FBA日販、最低1個 ※日販>0の場合）
     const reorderPointUnits = reorderPointDays > 0 && dailySales > 0
       ? Math.max(1, Math.ceil(dailySales * reorderPointDays))
@@ -233,11 +302,16 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const daysOfSupply = dailySales > 0 ? effectiveFbaStock / dailySales : (effectiveFbaStock > 0 ? 999 : 0);
 
     // --- 発注点チェック: FBA在庫 < 発注点(個数) の場合のみ補充推奨 ---
-    const needsReplenishment = effectiveFbaStock < reorderPointUnits;
+    // v3-2: 推奨が少ない日に早めに送ると選んだ SKU (2 回目の計算だけ)。量は選んだ数まで
+    const pullCap = opts._pullForward ? opts._pullForward.get(sku) : undefined;
+    const belowReorder = effectiveFbaStock < reorderPointUnits;
+    const pullForward = pullCap !== undefined && !belowReorder;
+    const needsReplenishment = belowReorder || pullForward;
 
     // --- 必要補充数 ---
     const targetStock = Math.ceil(dailySales * targetDays);
-    const rawNeeded = needsReplenishment ? Math.max(0, targetStock - effectiveFbaStock) : 0;
+    let rawNeeded = needsReplenishment ? Math.max(0, targetStock - effectiveFbaStock) : 0;
+    if (pullForward) rawNeeded = Math.min(rawNeeded, pullCap);
 
     // --- 倉庫在庫確認 ---
     let warehouseRaw = 0;
@@ -348,6 +422,10 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
           }
         }
         maxSameExpirySets = Math.min(maxSameExpirySets, Math.floor(sameExpiryTotal / u.perSet));
+        // 同じ構成品が 2 行あるセット (X×1, X×1) でも期限ごとの在庫は 1 つ (配分側は統合した構成数で 1 回だけ引く。Codex R5 Medium 2)
+        if (!expiryPools.some(e => e.code === normCode(u.code) && e.expiry === baseExpiry)) {
+          expiryPools.push({ code: normCode(u.code), expiry: baseExpiry, total: sameExpiryTotal });
+        }
       }
 
       if (anyExpiry && recommendedQty > 0 && maxSameExpirySets < recommendedQty) {
@@ -442,6 +520,12 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       locationAdjusted = false;
       locationDetail = '';
     }
+    // v3-2: 早めに送る数は、丸め・ロケ補正のあとも選んだ数 (残りの枠) まで (枠を超えない。Codex PR #1471 R1 Medium 2)
+    if (pullForward && adjustedQty > pullCap) {
+      adjustedQty = pullCap;
+      locationAdjusted = false;
+      locationDetail = '';
+    }
 
     // --- アラート ---
     const alerts = calcAlerts(snap, mapping, effectiveFbaStock, daysOfSupply, warehouseAvailable, settings);
@@ -521,6 +605,14 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       reorder_point: reorderPointUnits,
       reorder_point_days: reorderPointDays,
       target_days: targetDays,
+      rules,
+      pull_forward: pullForward,             // v3-2: 推奨が少ない日に早めに送る (発注点はまだ下回っていない)
+      pull_forward_cap: pullForward ? pullCap : null,
+      reorder_point_reason: reorderReason,   // tier (区分どおり) / fee_guard (低在庫手数料の見張りで上げた。v3 だけ)
+      fee_status: feeStatus,                 // exempt / eligible / unknown (PLANNING の免除欄が無い)
+      fee_short_term_dos: snap.short_term_dos ?? null,
+      fee_long_term_dos: snap.long_term_dos ?? null,
+      fee_applied: snap.low_inv_fee_applied || null,
       days_of_supply: Math.round(daysOfSupply * 10) / 10,
       target_stock: targetStock,
       raw_needed: rawNeeded,
@@ -602,17 +694,31 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
       // デバッグ
       calc_steps: calc_steps,
+
+      // 倉庫在庫の配分の材料 (応答には出さない。配分のあと消す)
+      _units: allocUnits,
+      _expiry: expiryPools,
     });
   }
 
   // 緊急度スコア降順でソート
   items.sort((a, b) => b.urgency_score - a.urgency_score);
 
+  // --- 倉庫在庫の配分: 自社出荷ぶんを残す (FBA と自社を同じ日数分に) + 同じ NE 商品の取り合いを止める ---
+  const allocation = allocateForItems(items, {
+    settings, warehouseMap, normCode, opts, debug,
+    // v3-4 1 日の上限 (v3 だけ・opts.dailyCap === false で切れる)。配分の直後・試す候補の前にかける
+    capSettings: rules === 'v3' && opts.dailyCap !== false ? settings : null,
+    // v3-3 の「試す候補」(v3 だけ): SKU マスタ (新規出品を拾う)・取り直した準備中 (SKU → 数)
+    trialCtx: rules === 'v3' ? { mappings, inboundWorkingOf: (sku) => lookupInboundWorking(sku) } : null,
+  });
+
   // 補充推奨SKU（発注点を下回ったもの）
   const recommendedItems = items.filter(i => i.recommended_qty > 0);
 
   return {
     items,
+    rules,
     generated_at: new Date().toISOString(),
     snapshot_date: snapshotDate,
     total_skus: items.length,
@@ -631,12 +737,508 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       invalid_mappings: invalidMappingSkus,
       planning_missing_count: planningMissingSkus.length,
       planning_missing_skus: planningMissingSkus,
+      allocation,
+      ...(allocation.daily_cap ? { daily_cap: allocation.daily_cap } : {}),
     },
   };
 }
 
+/**
+ * 倉庫在庫の配分 (self-reserve.js) を items に当てる。材料 (自社日販・出荷待ちの FBA 伝票・恒久除外) を集め、
+ * 結果の要約を data_quality.allocation として返す。
+ * opts.selfShipSales / opts.pendingSlips / opts.excluded は試験から差し込むため (本番は db から読む)
+ */
+function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug, trialCtx = null, capSettings = null }) {
+  const mode = String(settings.self_reserve_mode || 'equal_days').toLowerCase() === 'off' ? 'off' : 'equal_days';
+  const maxAge = parseInt(settings.self_sales_max_age_days || 7);
+  const lookback = parseInt(settings.pending_slip_lookback_days || 10);
+
+  const selfSales = opts.selfShipSales ?? getSelfShipSalesByCode({ maxAgeDays: maxAge });
+  let pending;
+  // 倉庫在庫を opts.warehouse で渡されたときは、出荷待ち伝票を外す基準の時刻もその在庫を取った時刻にする
+  //   (手動 CSV の時刻に戻らない。Codex A2b 設計レビュー Medium 6)
+  const whAt = opts.warehouse ? (Number.isFinite(opts.warehouse.baseAtMs) ? opts.warehouse.baseAtMs : null) : undefined;
+  try { pending = opts.pendingSlips ?? getPendingFbaSlips({ lookbackDays: lookback, warehouseAtMs: whAt }); }
+  catch (e) { pending = { status: 'error', error: String(e.message).slice(0, 200), slips: [], byCode: new Map() }; }
+  // 米国の NE 伝票 (米国FBA在庫補充の台帳) の押さえ中を、ここ 1 か所で合算する = 通常の配分と試す候補 (planTrials) の両方に効く
+  //   (設計方針 §12.6・中原さん 9/27 = B。日本の出荷待ち伝票の中身 (slips) は変えない = 画面の「出荷待ちFBA伝票」の一覧は日本だけ)
+  //   倉庫在庫の時点 = 渡された在庫の時刻 (影の下書き) か、倉庫 CSV の取り込み時刻 (画面)。「倉庫から出た」伝票はこの時点が出た時刻より後になるまで引く
+  const whMsForUs = whAt !== undefined ? whAt
+    : (pending.warehouse_uploaded_at ? new Date(String(pending.warehouse_uploaded_at).replace(' ', 'T')).getTime() : null);
+  let usReserved;
+  try { usReserved = opts.usReserved ?? readUsReserved({ warehouseAtMs: Number.isFinite(whMsForUs) ? whMsForUs : null }); }
+  catch (e) { usReserved = { status: 'error', error: String(e.message).slice(0, 200), version: null, byCode: new Map(), count: 0, units: 0 }; }
+  if (usReserved.status === 'ok' && usReserved.byCode.size > 0) {
+    const merged = new Map(pending.byCode instanceof Map ? pending.byCode : []);
+    for (const [c, q] of usReserved.byCode) merged.set(c, (merged.get(c) || 0) + q);
+    pending = { ...pending, byCode: merged };
+  }
+  let excludedRows = opts.excluded;
+  if (!excludedRows) { try { excludedRows = getReplenishmentExcluded().map(r => r.amazon_sku); } catch { excludedRows = []; } }
+  const excluded = new Set(excludedRows.map(normCode));
+  // 恒久除外の印 (画面は router が同じ印を付けて外している。影の下書き・ならしもこれを見る。Codex PR #1471 R1 High)
+  for (const it of items) it.is_excluded = excluded.has(normCode(it.amazon_sku));
+
+  const useSelf = mode === 'equal_days' && selfSales.status === 'ok' && selfSales.map instanceof Map;
+  const missingSelf = new Set();
+  const selfDailyOf = (code) => {
+    if (!useSelf) return null;
+    const n = selfSales.map.get(code);
+    if (n === undefined) { missingSelf.add(code); return null; }   // 行が無い = 分からない → この構成品は上限なし
+    return n / 30;
+  };
+
+  const totals = allocateWarehouse(items, {
+    warehouseOf: (code) => warehouseMap[code]?.warehouse_available || 0,
+    pendingOf: (code) => pending.byCode?.get(code) || 0,
+    selfDailyOf,
+    excluded,
+    norm: normCode,
+    minShipmentDays: parseInt(settings.min_shipment_cover_days || 7),
+  });
+
+  // 自社日販が分からない構成品を使う SKU の印は、1 日の上限の前に付ける (上限は保留の行を数えない)
+  if (useSelf) for (const it of items) {
+    if ((it._units || []).some(u => missingSelf.has(u.code))) it.data_gaps = { ...(it.data_gaps || {}), self_sales_missing: true };
+  }
+  // v3-4: 1 日の上限 (配分の直後・試す候補の前 = 翌日へ回して空いた倉庫在庫を試す候補が使える)。
+  //   🚨 it.allocation は「配分の段階」の数 (before / after)。上限で削った数は it.daily_cap に別に持つ
+  const dailyCap = capSettings ? applyDailyCap(items, capSettings) : null;
+
+  // v3-3: 長期欠品の復活・新規出品の「試す候補」(提案には入れない。配分・1 日の上限のあとの倉庫の空きから)
+  const trials = trialCtx ? planTrials(items, {
+    settings, warehouseMap, normCode, pending, selfDailyOf: useSelf ? selfDailyOf : () => null, excluded, trialCtx,
+    trialInputs: opts.trialInputs ?? getTrialInputs(), nowMs: opts.nowMs ?? Date.now(),
+  }) : null;
+
+  // 行が無い構成品のうち、今回 FBA に出す SKU が使うものだけを知らせる (出さない商品まで並べない)
+  const missingForCandidates = new Set();
+  for (const it of items) {
+    if (debug && it.allocation && Array.isArray(it.calc_steps)) {
+      const a = it.allocation;
+      const u = a.units.map(x => `${x.code}: 倉庫${x.warehouse}${x.pending_fba_slips ? `−出荷待ちFBA伝票${x.pending_fba_slips}` : ''}=${x.free}`
+        + ` / 自社日販${x.self_daily ?? '不明'} / そろう日数${x.equal_days ?? '上限なし'}`).join(' ; ');
+      it.calc_steps.push(`[Step11] 倉庫在庫の配分: ${a.before} → ${a.after}`
+        + ` (自社ぶん −${a.self_cut} / 他SKUへ −${a.shared_cut}${a.min_days_cut ? ` / 最低出荷日数で −${a.min_days_cut}` : ''}) [${u}]`);
+    }
+    if ((it.allocation?.before || 0) > 0) for (const u of it._units || []) if (missingSelf.has(u.code)) missingForCandidates.add(u.code);
+    // 自社日販が分からない構成品を使う SKU に印を付ける (画面の数量は今までどおり。影の下書きはこの SKU を保留にする)
+    if (useSelf && (it._units || []).some(u => missingSelf.has(u.code))) {
+      it.data_gaps = { ...(it.data_gaps || {}), self_sales_missing: true };
+    }
+    delete it._units;
+    delete it._expiry;
+  }
+
+  return {
+    mode,
+    self_sales: {
+      used: useSelf,
+      status: mode === 'off' ? 'off' : selfSales.status,
+      as_of: selfSales.as_of || null,
+      age_days: selfSales.age_days ?? null,
+      error: selfSales.error || null,
+      invalid_count: (selfSales.invalid || []).length,
+      missing_codes: [...missingForCandidates],
+    },
+    pending_slips: {
+      status: pending.status,
+      error: pending.error || null,
+      count: (pending.slips || []).length,
+      units: (pending.slips || []).reduce((s, x) => s + (x.qty || 0), 0),
+      slips: pending.slips || [],
+      warehouse_uploaded_at: pending.warehouse_uploaded_at || null,
+      inbound_last_synced_at: pending.inbound_last_synced_at || null,
+    },
+    // 米国の NE 伝票の押さえ中 (上の pending.byCode に合算済み)。status: ok / not_available (Render でない) / error (台帳を読めない)
+    //   version = 米国の台帳の版。日本の画面が NE CSV を出すとき「推奨を出したあとに米国の伝票が変わったか」を見る
+    us_slips: {
+      status: usReserved.status,
+      error: usReserved.error || null,
+      version: usReserved.version ?? null,
+      count: usReserved.count || 0,
+      units: usReserved.units || 0,
+    },
+    cut: totals,
+    trials,
+    daily_cap: dailyCap,
+  };
+}
+
+/**
+ * v3-3: 長期欠品の復活 (revive) と新規出品 (new_listing) の「試す候補」。**提案には入れない** (中原さん 9/26: 試験数つきの「要確認」から)。
+ *   倉庫の空き = 構成品ごとに 倉庫 − 出荷待ち FBA 伝票 − その日の提案で使う数 − 自社日販 × v3_trial_self_keep_days。
+ *   自社日販が分からない構成品を使うなら出さない。候補どうしも空きを取り合う (出した分を引いていく)
+ * 出さない (毎朝また候補になるのを止める): 恒久除外・保留 (blockedReason)・入荷待ち (準備中・輸送中・受領中) がある・
+ *   出荷待ちの FBA 伝票が構成品にある・倉庫の空きが無い。新規はさらに 人が非表示にした・対応づけ不正
+ * 復活と新規は排他: FBA で一度も在庫・入荷を見ていない SKU は新規、見たことがあって長期欠品なら復活
+ */
+/**
+ * v3-4: 1 日に送る量の上限。提案として記録できる行 (恒久除外・保留を除く) を
+ *   FBA の在庫日数の短い順 (同じなら 30 日販売の多い順、早めに送る分は最後) に積み、
+ *   個数 v3_daily_cap_units・SKU 数 v3_daily_cap_skus に届いたら残りはその日 0 (翌日また計算される)。
+ *   境目の SKU は、残りの枠が最低出荷日数以上なら枠まで (入数の丸めは切り下げ)、足りなければ翌日へ。
+ * 🚨 数を増やすことはしない (削るだけ)。削った行には daily_cap = { before, after } と理由を付ける
+ */
+export function applyDailyCap(items, settings) {
+  const num = (k) => Number(settings[k] ?? V3_DEFAULTS[k]);
+  if (String(settings.v3_daily_cap ?? V3_DEFAULTS.v3_daily_cap).toLowerCase() === 'off') return { enabled: false, reason: 'off' };
+  const capUnits = num('v3_daily_cap_units'), capSkus = num('v3_daily_cap_skus');
+  const minDays = parseInt(settings.min_shipment_cover_days || 7);
+  const roundUnit = parseInt(settings.round_unit || 5), roundThreshold = parseInt(settings.round_threshold || 20);
+  const props = items.filter((i) => (Number(i.adjusted_qty) || 0) > 0 && !i.is_excluded && !blockedReason(i));
+  const beforeUnits = props.reduce((s, i) => s + (Number(i.adjusted_qty) || 0), 0);
+  const base = { enabled: true, cap_units: capUnits, cap_skus: capSkus, before_units: beforeUnits, before_skus: props.length };
+  if (beforeUnits <= capUnits && props.length <= capSkus) return { ...base, reason: 'within', after_units: beforeUnits, after_skus: props.length };
+  const order = [...props].sort((a, b) => (a.pull_forward ? 1 : 0) - (b.pull_forward ? 1 : 0)
+    || (Number(a.days_of_supply) || 0) - (Number(b.days_of_supply) || 0)
+    || (Number(b.units_sold_30d) || 0) - (Number(a.units_sold_30d) || 0)
+    || String(a.amazon_sku).localeCompare(String(b.amazon_sku)));
+  let units = 0, skus = 0, partial = 0;
+  const deferred = [];   // 翌日へ回した分 (全部回した行 + 境目で一部回した行)
+  const defer = (it) => {
+    const q = Number(it.adjusted_qty) || 0;
+    it.daily_cap = { before: q, after: 0 };
+    it.adjusted_qty = 0;
+    it.recommended_qty = 0;
+    it.location_adjusted = false;
+    (it.alerts ||= []).push({ type: 'daily_cap', level: 1, message: `1 日の上限 (${capUnits} 個・${capSkus} SKU) を超えたので翌日へ (${q} 個)` });
+    deferred.push({ sku: it.amazon_sku, qty: q, days_of_supply: it.days_of_supply, sold30d: it.units_sold_30d, pull_forward: !!it.pull_forward });
+  };
+  for (const it of order) {
+    const q = Number(it.adjusted_qty) || 0;
+    if (skus >= capSkus || units >= capUnits) { defer(it); continue; }
+    if (units + q <= capUnits) { units += q; skus++; continue; }
+    // 境目: 残りの枠で送れるか (最低出荷日数以上・入数の丸めは切り下げ)
+    let rem = capUnits - units;
+    if (!it.expiry_limited && rem > roundThreshold) rem = Math.floor(rem / roundUnit) * roundUnit;
+    const daily = Number(it.daily_sales) || 0;
+    if (rem > 0 && daily > 0 && rem / daily >= minDays) {
+      it.daily_cap = { before: q, after: rem };
+      it.adjusted_qty = rem;
+      it.recommended_qty = Math.min(Number(it.recommended_qty) || 0, rem);
+      it.location_adjusted = false;
+      (it.alerts ||= []).push({ type: 'daily_cap', level: 1, message: `1 日の上限 (${capUnits} 個) のため ${q} → ${rem} 個 (残りは翌日)` });
+      units += rem; skus++; partial++;
+      deferred.push({ sku: it.amazon_sku, qty: q - rem, days_of_supply: it.days_of_supply, sold30d: it.units_sold_30d, pull_forward: !!it.pull_forward, partial: true });
+    } else defer(it);
+  }
+  // 🚨 境目で一部だけ回した分も「翌日へ回した個数」に数える (Codex PR #1505 R1 Medium 2)
+  return {
+    ...base, reason: 'capped', after_units: units, after_skus: skus, partial,
+    deferred_skus: deferred.length, deferred_full_skus: deferred.filter((d) => !d.partial).length,
+    deferred_units: deferred.reduce((s, d) => s + d.qty, 0),
+    deferred_list: deferred.map((d) => d.sku),   // 連続で翌日へ回された日数を数えるため (decision-job)
+    deferred_top: deferred.slice(0, 50),
+  };
+}
+
+/** 同じ構成品コードの構成数を合わせる (通常の配分 allocUnits と同じ) */
+function mergeUnits(units) {
+  const m = new Map();
+  for (const u of units) m.set(u.code, (m.get(u.code) || 0) + u.qty);
+  return [...m.entries()].map(([code, qty]) => ({ code, qty }));
+}
+
+export function planTrials(items, { settings, warehouseMap, normCode, pending, selfDailyOf, excluded, trialCtx, trialInputs, nowMs }) {
+  const num = (k) => Number(settings[k] ?? V3_DEFAULTS[k]);
+  const summary = { enabled: true, revive: [], new_listing: [], skipped: {}, counts: {} };
+  const skip = (k) => { summary.skipped[k] = (summary.skipped[k] || 0) + 1; };
+  if (String(settings.v3_trials ?? V3_DEFAULTS.v3_trials).toLowerCase() === 'off') return { ...summary, enabled: false, reason: 'off' };
+  if (!trialInputs || trialInputs.error || !Array.isArray(trialInputs.everStocked)) {
+    return { ...summary, enabled: false, reason: 'inputs_unavailable', error: trialInputs?.error || null };
+  }
+  const keepDays = num('v3_trial_self_keep_days');
+  // 構成品ごとの空き (その日の提案で使う数を引いたあと)
+  const used = new Map();
+  for (const it of items) {
+    const q = Number(it.adjusted_qty) || 0;
+    if (q <= 0 || it.is_excluded) continue;
+    for (const u of it._units || []) used.set(u.code, (used.get(u.code) || 0) + q * u.qty);
+  }
+  const free = new Map();
+  const freeOf = (code) => {
+    if (free.has(code)) return free.get(code);
+    const rS = selfDailyOf(code);
+    const v = rS === null ? null
+      : Math.max(0, (warehouseMap[code]?.warehouse_available || 0) - (pending.byCode?.get(code) || 0) - (used.get(code) || 0) - rS * keepDays);
+    free.set(code, v);
+    return v;
+  };
+  const capOf = (units) => {
+    let cap = Infinity;
+    for (const u of units) {
+      const f = freeOf(u.code);
+      if (f === null) return null;                       // 自社日販が分からない
+      cap = Math.min(cap, Math.floor(f / u.qty));
+    }
+    return Number.isFinite(cap) ? cap : 0;
+  };
+  const take = (units, qty) => { for (const u of units) free.set(u.code, freeOf(u.code) - qty * u.qty); };
+  // 空きの内訳 (本当に自社ぶんを残したかを後から確かめる。Codex PR #1480 R1 Low)
+  const freeDetail = (units) => units.map((u) => {
+    const rS = selfDailyOf(u.code);
+    return {
+      code: u.code, qty: u.qty, warehouse: warehouseMap[u.code]?.warehouse_available || 0, pending_fba_slips: pending.byCode?.get(u.code) || 0,
+      used_by_proposals: used.get(u.code) || 0, self_daily: rS, self_keep: rS === null ? null : Math.round(rS * keepDays * 100) / 100,
+      free_now: free.get(u.code) ?? null,
+    };
+  });
+  const pendingOn = (units) => units.some((u) => (pending.byCode?.get(u.code) || 0) > 0);
+  const everStocked = new Set(trialInputs.everStocked.map(normCode));
+
+  // --- A. 長期欠品の復活 (FBA で在庫を見たことがある SKU だけ) ---
+  const reviveDays = num('v3_revive_trial_days'), reviveMax = num('v3_revive_trial_max'), noHist = num('v3_revive_trial_no_history');
+  const reviveCands = items.filter((it) => it.stock_state === 'revivable_long_oos')
+    .sort((a, b) => (Number(b.amazon_recommended_qty) || 0) - (Number(a.amazon_recommended_qty) || 0) || String(a.amazon_sku).localeCompare(String(b.amazon_sku)));
+  for (const it of reviveCands) {
+    if (!everStocked.has(normCode(it.amazon_sku))) continue;   // 見たことが無い = 新規の側で扱う
+    if (it.is_excluded) { skip('revive_excluded'); continue; }
+    const br = blockedReason(it);   // 自社日販が分からない印は 1 日の上限の前に付く (v3-4) = 理由の名前は元どおり分ける
+    if (br) { skip(br === 'self_sales_unknown' ? 'revive_self_unknown' : 'revive_blocked'); continue; }
+    const inbound = (Number(it.fba_inbound_working_effective) || 0) + (Number(it.fba_inbound_shipped) || 0) + (Number(it.fba_inbound_received) || 0);
+    if (inbound > 0) { skip('revive_inbound'); continue; }
+    const units = it._units || [];
+    if (!units.length) { skip('revive_no_units'); continue; }
+    if (pendingOn(units)) { skip('revive_pending_slip'); continue; }
+    const cap = capOf(units);
+    if (cap === null) { skip('revive_self_unknown'); continue; }
+    const hist = trialInputs.lastInStock?.get(normCode(it.amazon_sku)) || null;
+    const histAgeDays = hist ? (nowMs - Date.parse(`${hist.snapshot_date}T00:00:00+09:00`)) / 86400e3 : null;
+    // 過去の 30 日販売に基づく試験数: 在庫があった最新の日の 30 日販売 (移動集計を 1 行だけ)。その日に売れていなければ
+    //   控えめな数 (no_history) にする。🚨 30 日の間ずっと在庫があったとは限らないので、日販の保証ではない (上限つきの目安)
+    const fresh = hist && Number.isFinite(histAgeDays) && histAgeDays <= 180;
+    const usable = fresh && hist.units_sold_30d > 0;
+    const historyState = !hist ? 'none' : !fresh ? 'too_old' : hist.units_sold_30d > 0 ? 'sold' : 'unsold_in_stock';
+    const amazon = Number(it.amazon_recommended_qty) || 0;
+    const byHistory = usable ? Math.ceil(hist.units_sold_30d / 30 * reviveDays) : null;
+    const qty = Math.floor(Math.min(amazon, usable ? Math.min(byHistory, reviveMax) : noHist, cap));
+    if (!(qty >= 1)) { skip(cap < 1 ? 'revive_no_free_stock' : 'revive_zero'); continue; }
+    take(units, qty);
+    it.trial = {
+      kind: 'revive', qty,
+      basis: {
+        amazon_recommended_qty: amazon, free_cap: cap,
+        last_in_stock_date: hist?.snapshot_date || null, last_in_stock_sold_30d: hist?.units_sold_30d ?? null,
+        history_usable: !!usable, history_state: historyState, by_history: byHistory, trial_days: reviveDays, trial_max: reviveMax, no_history_qty: noHist,
+        free_detail: freeDetail(units),
+      },
+    };
+    summary.revive.push({ sku: it.amazon_sku, qty, ...it.trial.basis });
+  }
+
+  // --- B. 新規出品 (SKU マスタにあり、FBA で一度も在庫・入荷を見ていない) ---
+  const hidden = new Set((trialInputs.hidden || []).map(normCode));
+  const newQty = num('v3_new_trial_qty'), newMax = num('v3_new_trial_max_skus');
+  const newCands = [];
+  const inItems = new Set(items.map((it) => normCode(it.amazon_sku)));
+  for (const m of trialCtx.mappings || []) {
+    const sku = m.amazon_sku;
+    if (!sku || everStocked.has(normCode(sku))) continue;
+    // 🚨 エンジンの計算対象 (RESTOCK にある) SKU は、提案・保留・送らなくてよい のどれかとして既に扱っている = 新規にしない
+    //    (保留の行と「10 個で試す」の 2 行を書かない。Codex PR #1480 R1 Medium 2)
+    if (inItems.has(normCode(sku))) { skip('new_in_restock'); continue; }
+    if (excluded.has(normCode(sku))) { skip('new_excluded'); continue; }
+    if (hidden.has(normCode(sku))) { skip('new_hidden'); continue; }
+    let comps = null;
+    try {
+      comps = m.set_components ? (typeof m.set_components === 'string' ? JSON.parse(m.set_components) : m.set_components) : null;
+      if (comps !== null && !Array.isArray(comps)) throw new Error('not array');
+      if (Array.isArray(comps) && comps.length === 0) { if (m.is_set) throw new Error('empty set'); comps = null; }
+      // 🚨 セット品は構成が空でない配列であること (null・"null" だと代表コード 1 個の単品として数えてしまう。Codex PR #1480 R2 Medium)
+      if (m.is_set && !(Array.isArray(comps) && comps.length > 0)) throw new Error('set without components');
+      for (const c of comps || []) {
+        const q = Number(c?.qty ?? 1);
+        if (!c || typeof c.ne_code !== 'string' || !c.ne_code.trim() || !Number.isSafeInteger(q) || q < 1) throw new Error('bad component');
+      }
+    } catch { skip('new_invalid_mapping'); continue; }
+    // 🚨 同じ構成品が 2 行あるセットは構成数を合わせる (1 個ずつ 2 行 = 2 個。合わせないと空きの 2 倍のセット数を出す。Codex PR #1480 R1 High)
+    const units = mergeUnits(comps ? comps.map((c) => ({ code: normCode(c.ne_code), qty: Number(c.qty ?? 1) }))
+      : (m.logizard_code || m.ne_code ? [{ code: normCode(m.logizard_code || m.ne_code), qty: 1 }] : []));
+    if (!units.length) { skip('new_no_code'); continue; }
+    if ((Number(trialCtx.inboundWorkingOf(sku)) || 0) > 0) { skip('new_inbound'); continue; }
+    if (pendingOn(units)) { skip('new_pending_slip'); continue; }
+    newCands.push({ m, units });
+  }
+  // 倉庫の空きの大きい順 (同点は SKU 順)。空きは候補どうしで取り合う
+  const scored = newCands.map((c) => ({ ...c, cap0: capOf(c.units) }))
+    .filter((c) => { if (c.cap0 === null) { skip('new_self_unknown'); return false; } return true; })
+    .sort((a, b) => b.cap0 - a.cap0 || String(a.m.amazon_sku).localeCompare(String(b.m.amazon_sku)));
+  for (const c of scored) {
+    if (summary.new_listing.length >= newMax) { skip('new_over_max_skus'); continue; }
+    const cap = capOf(c.units);
+    const qty = Math.floor(Math.min(newQty, cap));
+    if (!(qty >= 1)) { skip('new_no_free_stock'); continue; }
+    take(c.units, qty);
+    summary.new_listing.push({
+      sku: c.m.amazon_sku, qty, product_name: c.m.product_name || '', asin: c.m.asin || null, ne_code: c.m.ne_code || null,
+      units: c.units, free_cap: cap, trial_qty: newQty, non_fba_sales_30d: c.m.non_fba_sales_30d ?? null,
+      free_detail: freeDetail(c.units),
+    });
+  }
+  summary.counts = {
+    revive: summary.revive.length, revive_units: summary.revive.reduce((s, x) => s + x.qty, 0),
+    new_listing: summary.new_listing.length, new_listing_units: summary.new_listing.reduce((s, x) => s + x.qty, 0),
+    new_candidates: newCands.length,
+  };
+  return summary;
+}
+
+// ===== 決まりの版 (v3 = 2026-09-26 の中原さんの方針) =====
+/** v3 の既定値。設定 (settings) に同じ名前があればそちらを使う */
+export const V3_DEFAULTS = {
+  v3_reorder_point_high_volume: 28,      // 高回転の発注点 (v2 は reorder_point_high_volume = 21)
+  v3_target_days_high_volume_small: 42,  // 高回転・小型の目標 (v2 は 40)
+  v3_target_days_high_volume_large: 35,  // 高回転・大型の目標 (v2 は 30)
+  v3_target_days_low_volume_small: 70,   // 低回転の目標 (v2 は 小型 180・大型 90)。倉庫が足りない日は等日数配分が削る
+  v3_target_days_low_volume_large: 70,
+  v3_inbound_lead_days: 7,               // 納品してから Amazon で売れるまでの日数 (手数料の見張りに使う)
+  v3_fee_safety_days: 7,                 // 手数料の見張りの余裕
+  // v3-2 推奨が少ない日のならし。🚨 目安は固定 (実際の納品量の中央値にすると、ならした量が翌月の目安を押し上げる。Codex Medium 6)
+  v3_smooth_target_units: 2500,          // 1 日の作業量の目安 (6/1〜9/24 の平日の実績の中央値 約 2,900 個より少し下)
+  v3_smooth_max_add_units: 1500,         // 1 日に早めに足す個数の上限
+  v3_pull_forward_days: 10,              // 候補 = 在庫日数 < 発注点 + この日数
+  v3_smooth_max_skus: 100,               // 通常の補充と合わせた SKU 数がここに達したら足すのをやめる (通常の補充は削らない)
+  v3_smoothing: 'on',                    // off で止める
+  // v3-3 長期欠品の復活・新規出品の「試す候補」(提案には入れない。要確認として記録)
+  v3_revive_trial_days: 30,              // 復活: 欠品前の日販 × この日数
+  v3_revive_trial_max: 30,               // 復活: 上限
+  v3_revive_trial_no_history: 10,        // 復活: 欠品前の売れ行きが分からない (180 日より古い・無い) とき
+  v3_new_trial_qty: 10,                  // 新規: 試す数
+  v3_new_trial_max_skus: 50,             // 新規: 1 日に出す件数
+  v3_trial_self_keep_days: 30,           // 倉庫に自社出荷ぶんとして残す日数 (自社日販 × この日数は試さない)
+  v3_trials: 'on',                       // off で止める
+  // v3-4 1 日の上限 (中原さん 9/28)。超えた分は欠品が近い順に残し、残りは翌日へ (その日は 0)
+  v3_daily_cap_units: 6000,
+  v3_daily_cap_skus: 120,
+  v3_daily_cap: 'on',                    // off で止める
+};
+/** 決まりの版に応じた設定。v3 は v3_* を既存の名前に当てはめた写しを返す (元の設定は変えない) */
+export function rulesSettings(base, rules) {
+  if (rules !== 'v3') return base;
+  const v = (k) => {
+    const x = base[k];
+    return (x === undefined || x === null || String(x).trim() === '') ? String(V3_DEFAULTS[k]) : String(x);
+  };
+  return {
+    ...base,
+    reorder_point_high_volume: v('v3_reorder_point_high_volume'),
+    target_days_high_volume_small: v('v3_target_days_high_volume_small'),
+    target_days_high_volume_large: v('v3_target_days_high_volume_large'),
+    target_days_low_volume_small: v('v3_target_days_low_volume_small'),
+    target_days_low_volume_large: v('v3_target_days_low_volume_large'),
+    v3_inbound_lead_days: v('v3_inbound_lead_days'),
+    v3_fee_safety_days: v('v3_fee_safety_days'),
+    v3_smooth_target_units: v('v3_smooth_target_units'),
+    v3_smooth_max_add_units: v('v3_smooth_max_add_units'),
+    v3_pull_forward_days: v('v3_pull_forward_days'),
+    v3_smooth_max_skus: v('v3_smooth_max_skus'),
+    v3_smoothing: v('v3_smoothing'),
+    v3_revive_trial_days: v('v3_revive_trial_days'),
+    v3_revive_trial_max: v('v3_revive_trial_max'),
+    v3_revive_trial_no_history: v('v3_revive_trial_no_history'),
+    v3_new_trial_qty: v('v3_new_trial_qty'),
+    v3_new_trial_max_skus: v('v3_new_trial_max_skus'),
+    v3_trial_self_keep_days: v('v3_trial_self_keep_days'),
+    v3_trials: v('v3_trials'),
+    v3_daily_cap_units: v('v3_daily_cap_units'),
+    v3_daily_cap_skus: v('v3_daily_cap_skus'),
+    v3_daily_cap: v('v3_daily_cap'),
+  };
+}
+
+/**
+ * v3-2: 推奨が少ない日に早めに送る SKU を選ぶ (1 回目の計算結果から)。
+ * 候補 = 「発注点を下回っていない」だけが理由で送らなかった SKU (Codex v3 設計レビュー High 5):
+ *   通常の状態・売れている・データの欠けが無い・配分で削られていない・最低出荷日数で落ちていない・
+ *   在庫日数 < 発注点 + v3_pull_forward_days・Amazon 推奨が 0 でない
+ * 在庫日数の短い順に、目標日数までの不足を「残りの枠」まで足す。最低出荷日数に満たない量なら足さない。
+ * 自社出荷の日販を使えない日 (配分なし・取れない) はならさない (自社ぶんを守れると言えない)
+ * @returns {{ picks: Map<string, number>, summary: object }}
+ */
+export function planSmoothing(result, settings) {
+  const num = (k) => Number(settings[k] ?? V3_DEFAULTS[k]);
+  const target = num('v3_smooth_target_units');
+  const maxAdd = num('v3_smooth_max_add_units');
+  const pfDays = num('v3_pull_forward_days');
+  const maxSkus = num('v3_smooth_max_skus');
+  const minDays = parseInt(settings.min_shipment_cover_days || 7);
+  const base = { target_units: target, max_add_units: maxAdd, pull_forward_days: pfDays, max_skus: maxSkus };
+  const none = (reason, extra = {}) => ({ picks: new Map(), summary: { ...base, enabled: false, reason, ...extra } });
+  if (String(settings.v3_smoothing ?? V3_DEFAULTS.v3_smoothing).toLowerCase() === 'off') return none('off');
+  const al = result?.data_quality?.allocation;
+  if (!al || al.mode !== 'equal_days' || !al.self_sales?.used) return none('self_sales_not_used');
+  const items = Array.isArray(result.items) ? result.items : [];
+  const gap = (dg) => !!(dg && (dg.sales_30d_missing || dg.sales_7d_missing || dg.planning_missing || dg.warehouse_row_missing
+    || (dg.warehouse_missing_components || []).length || dg.self_sales_missing));
+  // 🚨 枠は「提案として記録される通常の補充」で数える = 記録の判定 (shadow-draft の blockedReason) そのものを使う
+  //    (保留の行を数えて、ならしを止めない / 数えない行を増やして枠を超えない。Codex PR #1471 R1・R2 Medium 3)
+  const proposable = (i) => !i.is_excluded && !blockedReason(i);
+  const regular = items.filter((i) => (Number(i.adjusted_qty) || 0) > 0 && proposable(i));
+  const regularUnits = regular.reduce((s, i) => s + (Number(i.adjusted_qty) || 0), 0);
+  if (regularUnits >= target) return none('enough', { regular_units: regularUnits, regular_skus: regular.length });
+  const candidates = items.filter((i) => !((Number(i.adjusted_qty) || 0) > 0) && !i.needs_replenishment
+    && proposable(i) && !gap(i.data_gaps)   // 恒久除外・保留は候補にしない (Codex PR #1471 R1 High)。候補は 7 日販売などの欠けも見る (記録より厳しく)
+    && i.stock_state === 'normal' && (Number(i.daily_sales) || 0) > 0
+    && !i.skipped_min_days && !(i.allocation && i.allocation.before > 0) && !gap(i.data_gaps)
+    && Number(i.days_of_supply) < Number(i.reorder_point_days) + pfDays
+    && !(i.amazon_recommended_qty !== null && i.amazon_recommended_qty !== undefined && Number(i.amazon_recommended_qty) <= 0))
+    .map((i) => ({ i, need: Math.max(0, Math.ceil(Number(i.daily_sales) * Number(i.target_days)) - (Number(i.effective_fba_stock) || 0)) }))
+    .filter((c) => c.need > 0)
+    .sort((a, b) => Number(a.i.days_of_supply) - Number(b.i.days_of_supply) || String(a.i.amazon_sku).localeCompare(String(b.i.amazon_sku)));
+  let budget = Math.min(target - regularUnits, maxAdd);
+  const budgetStart = budget;
+  const picks = new Map();
+  const list = [];
+  let skippedSmall = 0, stopped = null;
+  for (const { i, need } of candidates) {
+    if (regular.length + picks.size >= maxSkus) { stopped = 'max_skus'; break; }
+    if (budget <= 0) { stopped = 'budget'; break; }
+    const amazon = (i.amazon_recommended_qty === null || i.amazon_recommended_qty === undefined) ? Infinity : Number(i.amazon_recommended_qty);
+    const q = Math.floor(Math.min(need, amazon, Number(i.warehouse_available) || 0, budget));
+    if (!(q > 0) || q / Number(i.daily_sales) < minDays) { skippedSmall++; continue; }   // 少なすぎる量は足さない (二度手間)
+    picks.set(i.amazon_sku, q);
+    budget -= q;
+    list.push({ sku: i.amazon_sku, qty: q, need, days_of_supply: i.days_of_supply, reorder_point_days: i.reorder_point_days, target_days: i.target_days });
+  }
+  return {
+    picks,
+    summary: {
+      ...base, enabled: true, reason: picks.size ? 'smoothed' : 'no_candidate',
+      regular_units: regularUnits, regular_skus: regular.length, budget_units: budgetStart,
+      candidates: candidates.length, picked: picks.size, planned_units: budgetStart - budget, skipped_small: skippedSmall, stopped,
+      picks: list.slice(0, 100),
+    },
+  };
+}
+
+/** 2 回目の計算のあと: 早めに送る分が実際に何個になったか (配分で削られた分を含む)・通常の補充が変わっていないか */
+function summarizeSmoothing(plan, first, second) {
+  const before = new Map(first.items.map((i) => [i.amazon_sku, Number(i.adjusted_qty) || 0]));
+  let pulledUnits = 0, pulledSkus = 0, cut = 0, regularChanged = 0;
+  for (const i of second.items) {
+    const q = Number(i.adjusted_qty) || 0;
+    if (i.pull_forward) {
+      if (q > 0) { pulledSkus++; pulledUnits += q; }
+      cut += Math.max(0, (plan.picks.get(i.amazon_sku) || 0) - q);
+    } else if ((before.get(i.amazon_sku) || 0) !== q) regularChanged++;
+  }
+  return { ...plan.summary, pulled_skus: pulledSkus, pulled_units: pulledUnits, cut_after_allocation: cut, regular_changed: regularChanged };
+}
+/**
+ * 低在庫手数料の見張りの発注点 (日) = 手数料の閾値 (14) + 納品してから売れるまで (7) + 余裕 (7) = 28。
+ * 日本の在庫僅少手数料は「過去の在庫日数が短期 (30 日)・長期 (90 日) とも 14 日未満」でかかる
+ * (9/26 実データ: かかっている 5 SKU は両方 14 日未満)。🚨 過去の平均なので、今の在庫を上げてもすぐには外れない = 予防の目安
+ */
+export function feeGuardDays(settings) {
+  return parseFloat(settings.low_inventory_fee_threshold_days || 14)
+    + parseFloat(settings.v3_inbound_lead_days ?? V3_DEFAULTS.v3_inbound_lead_days)
+    + parseFloat(settings.v3_fee_safety_days ?? V3_DEFAULTS.v3_fee_safety_days);
+}
+
 // ===== 動的在庫日数目標（推奨に上がった時に何日分送るか） =====
-function calcTargetDays(sold30d, perUnitVolume, snap, settings) {
+// export は米国FBA在庫補充が「日本に残す数」を日本と同じ目標日数で出すため (読むだけ・中身は変えない)
+export function calcTargetDays(sold30d, perUnitVolume, snap, settings) {
   const highVol = parseInt(settings.high_volume_threshold || 100);
   const lowVol = parseInt(settings.low_volume_threshold || 20);
   const largeVol = parseFloat(settings.large_volume_cm3 || 5000);

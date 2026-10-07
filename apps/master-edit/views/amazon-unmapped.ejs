@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // 未登録 = 直近 N 日に売れたのに構成が無い seller SKU (新しいデザイン・第 2 段 10/5)。区分 (FBA / FBM / 全部) の札・1 行 = 1 SKU と「対応を作る」
+    const chLabel = (ch) => (ch ? (CHANNELS[ch] || ch) : '—');
+    const tabs = [['FBA', 'FBA'], ['FBM', 'FBM (自社発送)'], ['all', '全部']];
+    const cur = channel || 'all';
+  %>
+  <div class="page" id="unmapped-page">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/amazon/" data-list-back>Amazon SKU</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">未登録</span></nav>
+    <div class="ph">
+      <div>
+        <h1>売れたのに対応が無い SKU</h1>
+        <div class="lead">直近 <%= UNMAPPED_DAYS %> 日の Amazon の注文のうち、Company DB の出品が無い (コードだけ) か、出品に構成 (NE コード × 数量) が無い seller SKU です。売上の日次で商品に分けられていません。</div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/manual#amazon"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
+    </div>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (data) { %>
+      <% if (data.tableMissing) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)。</div></div><% } %>
+      <% if (data.undecided.length) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">未判定: 売上の日次がまだ公開されていない日があります (<%= data.undecided.join('・') %>)</div><div class="hint">その日の注文が入っていない = 「0 件」とは言えません。</div></div></div><% } %>
+      <% if (!data.channelsAvailable) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">FBA / FBM の区分 (fees) が読めないので、全部の区分を出しています。</div></div><% } %>
+      <section class="panel">
+        <div class="chips" style="margin-bottom:14px">
+          <span class="chip-lab">区分</span>
+          <% for (const [k, t] of tabs) { %><a class="chip<%= cur === k ? ' on' : '' %>" href="?channel=<%= k %>"<%- cur === k ? ' aria-current="true"' : '' %>><%= t %></a><% } %>
+          <span class="vsep" aria-hidden="true"></span>
+          <span class="hint"><b style="color:var(--text)"><%= data.rows.length %></b> 件 (全部の区分で <%= data.total_all %> 件) · 今日 (東京) <%= ui.fmtDay(data.today) %></span>
+        </div>
+        <% if (!data.rows.length) { %>
+          <div class="empty"><%= data.undecided.length ? '未判定の日があります (上の帯)。分かっている日の分では、当てはまる SKU はありません。' : '当てはまる SKU はありません' %></div>
+        <% } else { %>
+        <div class="todo-row head" aria-hidden="true"><span>seller SKU</span><span>区分</span><span>個数</span><span>注文</span><span class="lastd">最後に売れた日</span><span>いまの対応</span><span></span></div>
+        <ul style="list-style:none" aria-label="売れたのに対応が無い SKU">
+          <% for (const r of data.rows) { const sk = String(r.code).trim().toLowerCase(); %>
+          <li class="todo-row"><span class="code"><%= r.code %></span><span><span class="b <%= r.channel === 'FBM' ? 'vio' : 'mute' %>"><%= chLabel(r.channel) %></span></span><span class="num"><%= r.units %> 個</span><span class="num"><%= r.orders %> 件</span><span class="lastd"><%= ui.fmtDay(r.last_date, data.today) %></span>
+            <span class="muted"><%= r.map_state ? (MAP_STATES[r.map_state] || r.map_state) : (r.listing_id ? '出品はある (構成なし)' : '出品なし') %></span>
+            <a class="btn soft sm" href="sku?sku=<%= encodeURIComponent(sk) %>" aria-label="<%= r.code %> の対応を<%= r.map_state ? '直す' : '作る' %>"><%= r.map_state ? '対応を直す' : '対応を作る' %></a></li>
+          <% } %>
+        </ul>
+        <% } %>
+        <div class="hint" style="margin-top:10px">seller SKU の「対応を作る」で構成を入れられます (保存を開いた後)。FBA / FBM は Amazon の手数料の取得 (fees) の区分です。</div>
+      </section>
+    <% } %>
+  </div>
+  <%- include('_footer') %>
+</body>
+</html>

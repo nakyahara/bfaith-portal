@@ -92,11 +92,125 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
     「lint は通るのに 1 件も submit できない」形で止まる** (9/1 の実例 = codex の sandbox が powershell を拒否)
   - `no progress` + claude が数秒で終了 (`*.out.log` に `Failed to refresh OAuth token`) →
     `~\.claude\.oauth_refresh.lock` の残骸 (9/2 の実例)。ランナーが実行前に削除 + 60 秒後に 1 回だけ再実行する。
+    🚨 2026-09-23 (PR3-0) から、削除は **Claude 共通ロックを持っていて、かつ Claude のプロセスが 1 つも無いときだけ** (年齢では消さない)。
+  - **Claude 共通ロック** (`scripts/claude-guard/ClaudeGuard.ps1` → install で `bin\ClaudeGuard.ps1`): 同じサブスクの OAuth を
+    ProductKWScout (05:00・S4U) も使うので、Claude を動かすランナーは `C:\tools\claude-lock\claude.lock` を排他で開いたまま持つ
+    (OS がプロセスの終了で放す)。ランナー自身は起動直後に KILL_ON_JOB_CLOSE の Job Object に入る = 親が落ちると node / claude も止まる。
+    Claude の起動前に claude / claude-code / AI ランナーのプロセスが残っていないことも確かめる。
+    `another Claude job held the lock` で失敗 → 前の晩のランナーや ProductKWScout がまだ動いていないか (タスクの状態・`Get-Process`) を見る
     それでも駄目なら bfaith で lock を消して `claude auth status` → 小さな `claude -p` で疎通を見る
   - `timeout` → 件数が多かっただけとは限らない (ハング・認証・Codex 停止も)。`*.out.log` で最後に何をしていたか見る
   - `partial` → 翌晩に続く。連日続くなら件数か時間の見直し
 - **スキルを直したい**: PR で `.claude/skills/ph-generate/SKILL.md` を変更 → miniPC で `git pull` → `install.ps1` (コピーなので再 install が要る)
 - **止めたい**: `Disable-ScheduledTask PhGenerateNightly`
+
+## SP広告KW の夜間 AI (2026-09-23・PR3b)
+同じランナーが、原稿のあとに **SP広告KW の AI の依頼**を 1 件ずつ処理する (新しいタスクは作らない)。設計 = AI_reference『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5「PR3 実装計画」。
+- 流れ: `bin\ad-kw-ai.mjs` が Render の service-api `/ad-kw-ai/*` から 1 件 claim → **AI を呼ぶ前に Render で予約** (1 依頼 1 回・1 日 `AD_KW_AI_DAILY_CAP` 回) →
+  claude を **ツール無し** (`cli.cjs` の `ADKW1` = claude-sonnet-5・`--tools ""`・stdin・JSON) で 1 回 → **送る前に結果を `ad-kw-ai-data\pending\` に保存** → 送信 → 保存を消す
+- 課金: `cli.cjs` の preflight (ANTHROPIC_* などの課金経路の環境変数・サブスク認証) + `bin\ad-kw-ai-config.json` の **billing_attestation** (人が「追加使用なし」を確認して `install.ps1 -AttestAdKwBilling '<名前>'` で書く。bin の中なので実行役は書き換えられない)。無ければ claim しない。実モデルが違う / 分からないときも止める
+- 時間: ランナーの残り時間から最大 25 分 (原稿は最大 80 分)。実行役は受け取った締め切りまでに予約・CLI・送信を収める (予約の前に残り 9 分以上)
+- ping は **`ph-adkw-ai-nightly`** (原稿の `ph-generate-nightly` とは別。原稿の成功で広告の失敗を隠さない)
+  - `ok disabled on Render` = Render の `AD_KW_AI_ENABLED` が付いていない (実行役を入れたら付ける)
+  - `fail billing_unverified` → `ad-kw-ai-config.json` が無い / 記録が不完全 / `fail preflight:BILLING_MODE_MISMATCH` → 環境変数を消す
+  - `partial` = 一部失敗 (予約後の失敗は **needs_review** = 画面で「確認済みにする」→ もう一度頼む。自動では作り直さない) / 1 日の上限 / 未送信が残った (次の晩に先に再送) / 待ちが 36 時間を超えた
+  - `fail ad queue check failed` = Render に届かない (「0 件」とは扱わない)
+- 共通ロック・Job Object は原稿と同じ (ランナーが持ったまま実行役を起動する。親が落ちたら実行役と claude も止まる)
+- 試験: `scripts/test-ph-ad-kw-ai-runner.mjs` (実行役 × 本物の service-api) / `scripts/test-ph-nightly-runner.mjs` (このランナーを偽の Claude で最初から最後まで)
+
+### おまかせ全自動 (2026-09-26・PR3c)
+中原さん「KW をこっちで指定するより推奨 KW を出してほしい。いつもチャッピーに聞く時は Amazon のタイトルだけ渡してる」→ **自社商品は毎晩自動**。人は朝に採否とコピーだけ。
+設計 = 同じ設計書 §5「PR3c 計画 v1〜v3」。
+- ランナーは広告の段の**最初に** `POST /ad-kw-ai/auto-enqueue` を呼ぶ (キューが空でも。1 日 `AD_KW_AUTO_DAILY` 件 (既定 3)・新しい商品から・1 商品 1 回。上限は Render が数える)。
+  **対象** (中原さん 9/26) = NE コード `chlorellap` + ポータルで 2026-09-26 17:15 JST 以降に登録した新商品だけ (Notion の既存カードの取り込みは数えない。`apps/product-hub/lib/ad-kw-ai.js` の `AUTO_TARGET_*`)。対象外の商品は画面の「おまかせで作る」で人が頼む
+  失敗は `fail auto-enqueue failed` (「0 件」とは扱わない)。フラグ OFF は `auto=off`
+- 実行役は claim に `capabilities:['auto']` を付ける (付けない旧い版にはおまかせが渡らない)。おまかせの job は段ごと:
+  1. **seeds** = 予約 → AI (種 KW 1〜5 個・材料 = 商品名・Amazon タイトル・楽天タイトル・仕様) → 送信
+  2. **collecting** = Render に `POST /jobs/:id/collect` を順に (1 回 = 1 照会。Render が miniPC のサジェスト・ABA を叩く。残り 130 秒 + 余裕を切ったら手放す)
+  3. **finalize** → 最終案の packet (観測語・競合 ASIN・Amazon タイトル)
+  4. **final** = 予約 → AI → 送信 (Render が材料・競合 ASIN の自動採用・提案を 1 txn で書く)
+- 時間が足りなければ段の途中で**手放す** (retries に数えない)。次の晩は続きの段から (claim は final → collecting → seeds の順)。**受付 3 件 ≠ 完了 3 件**
+- 材料の取得失敗 (miniPC 停止・ABA 未取込など) → その job はその晩やめて 12 時間後 (`retry_wait`)。同じ照会が 3 晩失敗したら打ち切り
+- ping の note: `auto=+N (今日/上限)`・`input=` (材料が見つからない = 画面で種を入れて続ける)・`failed=` (失敗で未確認 = 画面で「確認済みにする」まで partial)
+
+## LP 構成の AI 生成 (段階1・2026-10-01)
+
+商品ハブの詳細画面で「🤖 構成をAIに作らせる」を押した商品の **LP 構成 (⑦ AI画像生成プロンプト)** を書く。
+正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』。
+
+**段階1 の目的は機能ではなく測定** — 「AI の構成はスタッフの ChatGPT 出力と比べて使えるか」を 10 件で判定する。
+書き戻した構成は画面に出るだけで、**人がコピーして lp-tool に貼る運用は変わらない**。
+画像生成・GAS への送信・撮影依頼書は段階2 以降。
+
+| もの | 場所 (miniPC) |
+|---|---|
+| CLI (書き換え不可) | `bin\phlp.mjs` |
+| シム・検品ラッパー | `work\phlp` / `work\phlpreview` (ACL で書き込み拒否) |
+| スキル (コピー) | `work\.claude\skills\ph-lp-compose` |
+| ランナー | `bin\run-lp-compose.ps1` + Task Scheduler `PhLpComposeMinutely` |
+| ログ | `logs\lp-compose.log` + 実行ごとの `*.lp.out.log` / `*.lp.err.log` |
+| 監視 | jobs-monitor ping `ph-lp-compose` (heartbeat・max_age 1 時間) |
+
+### なぜ 1 分おきでよいか
+
+**仕事が無い分は HTTP 1 回だけで終わる。** ランナーはまず `bin\phlp.mjs queue` を叩き、
+`claimable` が 0 なら Claude を起動せず終了する (ロックも残骸検査もしない)。
+人がボタンを押して画面を見ている運用なので、拾うのは速いほうがよい。
+
+### 夜間ジョブとの関係
+
+同じサブスク OAuth を `PhGenerateNightly` (02:30) と `ProductKWScout` (05:00) が使う。
+LP のランナーも **Claude 共通ロックを取る**が、期限は **5 秒**。
+夜間ジョブがロックを持っている間は `skipped` を出して**その分をあきらめ、次の分で拾う**
+(1 分おきなので、2 時間の夜間ジョブの後ろに積み上がってはいけない)。
+`ClaudeGuard.ps1` の `$ClaudeResiduePattern` には `phlp.mjs` を入れてある
+(入れないと、残った実行役を「残骸なし」と誤判定して 2 つ目の Claude を起動する)。
+
+### 朝のチェック (jobs-monitor に `ph-lp-compose` が出たら)
+
+`C:\tools\ph-nightly\logs\lp-compose.log` の末尾を見る:
+
+- `skipped (another Claude job holds the lock)` → 夜間ジョブが動いている間は**正常**
+- `needs_review +N` (partial) → AI を呼んだのに結果が返らなかった = **成否不明**。
+  **自動では作り直さない**ので、画面でもう一度依頼する
+- `nothing moved` (fail) → claude の認証切れ・ツールの deny・仕様書が未取込。
+  `*.lp.err.log` と `*.lp.out.log` の `permission_denials` を見る
+- `PH_LP_COMPOSE_ENABLED is off` → Render のフラグが未設定 (立ち上げ中は正常)
+- `server sent no usable model` (fail) → Render の `PH_LP_COMPOSE_MODEL` が読めない値 (下の「モデル」)
+- `model not verified` (partial) → 本回答を書いたモデルが頼んだモデルと違った・読めなかった・確認を送れなかった。
+  その依頼は needs_review になり、画面は本文を出さず理由を出す。もう一度依頼する。
+  `main model(s)=` の行に実際のモデル、`check=` にサーバの判定 (match / mismatch / unknown / send failed) が出る
+- `model check re-send failed (kept)` → 確認を送れず `state\lp-model-check-*.json` に控えてある。
+  毎分送り直す (キューが空でも)。サーバは 15 分付かなければ「未確認」で閉じるので、放っておいても画面は止まらない
+- `claude reported an error: API Error: 400 ... version 2.1.280 or newer is required` → Claude Code が古い (下の「モデル」)
+
+### モデル (2026-10-02〜)
+
+- 決める場所は **Render の `PH_LP_COMPOSE_MODEL` だけ** (未設定なら `claude-opus-5-5[1m]` = Opus 5.5・1M)。
+  ボタンにも「🤖 構成をAIに作らせる (Opus 5.5)」と出る。**設定してあるのに読めない値**ならボタンは押せず、claim もしない (黙って既定に戻さない)
+- ランナーは queue で受け取った値を `claude --model` と `PH_LP_MODEL` (`./phlp reserve` が送る) に渡す。サーバは違うモデルの予約を断る
+- 終わったらランナーが stream-json の `assistant.message.model` (サブエージェント以外) を読み、ランナーだけが呼ぶ
+  `POST /lp-compose/model-check` で「実際に書いたモデル」を付ける。**一致した done にだけ本文を出す**
+- 🚨 Opus 5.5 は **Claude Code 2.1.280 以上**が要る。miniPC は 2026-10-02 に 2.1.252 → 2.1.280 に上げた (決め打ち・自動更新なし)。
+  上げ下げするときは夜間の `PhGenerateNightly`・`ProductKWScout` も同じ Claude Code を使うので、
+  商品スカウトの引数 (`product-idea-scout/ai/cli.cjs` の `invocationArgs`) が `claude --help` に残っているかを見る
+- モデルを変えるとき・配置するとき: Render の `PH_LP_COMPOSE_ENABLED` を外す → **queue の `running` が 0 になったのを確かめる** →
+  Render の反映 → miniPC で `install.ps1` → フラグを戻す (サーバとランナーの版が食い違う数分に依頼を受けない)
+
+### 素材画像 (2026-10-02〜)
+
+- 商品の画像フォルダ (`drive_folder_url`) の**中のフォルダ (何階層下でも)** の画像 = 素材画像。**直下**の画像は商品画像 (白抜き・1 TOP・2〜)
+- **押したときに 1 回だけ** Drive を読んで packet に固定する (商品 6 + 素材 10 = 16 枚まで)。読めなければ依頼を作らない。
+  歯止め = 6 階層・60 フォルダ・500 件・25 秒・API 200 回
+- 実行役は claim で `max_images` (この phlp は 16) を送る。**送らない古い phlp は 6 枚まで扱い**で、素材つきの依頼は掴まない (queued のまま)。
+  ランナーのログに `too_many_images` が出たら miniPC で `install.ps1`
+- 「添付画像の説明」(`packet.image_guide`) は **AI にもスタッフにも同じ文**。くらべるときは画面の「ChatGPT 版に貼る文」を
+  「📝 商品分析を準備」の文の最後に貼り、画像を同じ順に添付する
+
+### 止めたい
+
+Render の `PH_LP_COMPOSE_ENABLED` を外す (受付・claim・予約が止まる) か、
+`Disable-ScheduledTask PhLpComposeMinutely`。
 
 ## 費用の目安 (API 方式に切り替える場合の参考)
 

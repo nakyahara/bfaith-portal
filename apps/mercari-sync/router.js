@@ -156,7 +156,9 @@ router.get('/settings', async (req, res) => {
   renderView(res, 'settings', { cfg, category_mappings, saved });
 });
 
-router.post('/settings', async (req, res) => {
+router.post('/settings', async (req, res, next) => {
+  // 🚨 Express 4 は async の例外を拾わない (応答が返らずぶら下がる) → 保存の失敗 (SQLJS_DB_* = 上書きしなかった) も含めて next(err) で 500 にする (Codex #1407 R2 #1)
+  try {
   await ensureDb();
   const b = req.body;
 
@@ -189,12 +191,14 @@ router.post('/settings', async (req, res) => {
 
   // カテゴリ
   settingsDb.setConfig('default_mercari_category', (b.default_mercari_category || '').trim());
-  try {
-    const mappings = JSON.parse(b.category_mappings_json || '[]');
-    settingsDb.saveCategoryMappings(mappings);
-  } catch { /* ignore */ }
+  // JSON が壊れているのは入力の誤り (無視して saved=1 にしない) / 保存の失敗 (SQLJS_DB_* = 外から書かれて上書きしなかった) は握りつぶさず route の例外に (Codex #1407 R1 #3)
+  let mappings = null;
+  try { mappings = JSON.parse(b.category_mappings_json || '[]'); } catch { mappings = null; }
+  if (!Array.isArray(mappings)) return res.redirect('/apps/mercari-sync/settings?error=category_mappings_json');
+  settingsDb.saveCategoryMappings(mappings);
 
   res.redirect('/apps/mercari-sync/settings?saved=1');
+  } catch (e) { next(e); }
 });
 
 // --- CSVモード用APIエンドポイント ---

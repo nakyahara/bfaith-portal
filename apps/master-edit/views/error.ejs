@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head', { ui2: true }) %>
+</head>
+<body>
+  <%- include('_header', { ui2: true }) %>
+  <div class="page errpage">
+    <div class="callout err" role="alert"><svg class="ic l" aria-hidden="true"><use href="#i-warn"/></svg>
+      <div class="grow"><div class="t"><%= message %></div><div class="hint">上の「全体から探す」(Ctrl + K) か、一覧から探し直せます。</div></div></div>
+    <p><a class="btn" href="<%= base %>/"><svg class="ic" aria-hidden="true"><use href="#i-grid"/></svg>商品・セットの一覧へ</a></p>
+  </div>
+  <%- include('_footer', { ui2: true }) %>
+</body>
+</html>

@@ -19,6 +19,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
+import { shouldSkipEmptyMonthClear, resolveDqNow } from './finance-dq-month-mode.js';
 
 const ENTITY_NAME = 'aupay_finance_sku_daily';
 const CONTRACT_VERSION = 1;
@@ -102,6 +103,19 @@ const rows = db.prepare(`
 `).all(dateRange.from, dateRange.to);
 
 console.log(`\n  Rows to sync: ${rows.length.toLocaleString()}`);
+// 月初の猶予 (PR #1572 R1): --month の月がまだ一度も 0 でなくなっていない (dq_run_results の印) かつ 月初の猶予の日数の中 なら、
+// 0 行でも空の chunk (= Render のその月を消す) を送らずに終える。一度 0 でなくなった月の 0 行は今までどおり送る (その朝の DQ は CRITICAL)。
+// --now は試験専用 (env FINANCE_DQ_ALLOW_NOW=1 のときだけ)。daily-sync は渡さない
+if (rows.length === 0 && monthStr) {
+  let nowForGrace;
+  try { nowForGrace = resolveDqNow(getArg('--now')); }
+  catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
+  if (shouldSkipEmptyMonthClear(db, { mall: 'aupay', ym: monthStr, now: nowForGrace })) {
+    console.log(`  (${monthStr} はまだ一度も行が無い・月初の猶予の中 = 空の chunk を送らない = Render のその月を消さない)`);
+    db.close();
+    process.exit(0);
+  }
+}
 // 注意: rows.length===0 でも早期 exit しない。空 chunk を 1 個送って Render に scope 全日付を
 // clear させる必要がある (月内全注文がキャンセル等で消えた極稀ケースで mirror に旧 row が残るのを防ぐ
 // = Codex review high #2 round 2 反映)。

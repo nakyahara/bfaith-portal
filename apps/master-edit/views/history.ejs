@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // 変更の記録 (新しいデザイン・第 2 段 10/5): 人の言葉 (列の名前・JSON を出さない)・日本時間・保存 1 回 = 1 枚 (同じ取引 = 同じ時刻・同じ人・同じ理由をまとめる)・日ごと。
+    // 見て分かる項目が無い行 (version だけ など) は数えない
+    const groups = [];
+    if (h) {
+      for (const e of h.events) {
+        const w = ui.eventWords(e);
+        if (!w) continue;
+        const key = [e.recorded_at, e.actor_type, e.actor_id, e.source_system, e.reason_text].join('|');
+        const g = groups.length && groups[groups.length - 1].key === key ? groups[groups.length - 1] : null;
+        if (g) { g.lines.push({ e, w }); continue; }
+        const when = ui.fmtJst(e.recorded_at, { nowMs });
+        const m = /^(.*\S) (\d{2}:\d{2})$/.exec(when);
+        const load = e.source_system === 'company_db_load' || (e.actor_type !== 'human' && !e.actor_id);
+        groups.push({ key, e, day: m ? m[1] : when, time: m ? m[2] : '', who: load ? 'load' : 'human', lines: [{ e, w }] });
+      }
+    }
+    for (const g of groups) g.cost = g.lines.some((x) => x.e.entity_type === 'sku_cost');
+    const nHuman = groups.filter((g) => g.who === 'human').length;
+    const nLoad = groups.length - nHuman;
+    const nCost = groups.filter((g) => g.cost).length;
+    let lastDay = null;
+  %>
+  <div class="page" id="history-page">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><% if (h) { %><a class="mono" href="<%= base %>/sku/<%= encodeURIComponent(h.sku.code) %>"><%= h.sku.code %></a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><% } %><span aria-current="page">変更の記録</span></nav>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (h) { %>
+    <div class="ph">
+      <div>
+        <div class="idrow"><span class="code-pill"><%= h.sku.code %></span></div>
+        <h1>変更の記録 <span class="muted" style="font-size:17px;font-weight:500"><%= h.sku.name %></span></h1>
+        <div class="lead">だれが・いつ・何を・なぜ。保存 1 回が 1 枚のカードです。時刻はすべて日本時間。新しい順に 200 件まで (DB のトリガーが同じ取引で残しています)。</div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/sku/<%= encodeURIComponent(h.sku.code) %>"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>商品の画面へ</a></div>
+    </div>
+
+    <% if (groups.length) { %>
+    <div class="panel" style="padding:14px 18px">
+      <div class="chips" role="group" aria-label="見るもの" id="hist-filter">
+        <span class="chip-lab" aria-hidden="true">見るもの</span>
+        <button class="chip" type="button" data-hf="" aria-pressed="true">すべて <span class="n"><%= groups.length %></span></button>
+        <button class="chip" type="button" data-hf="human" aria-pressed="false"<%= nHuman ? '' : ' disabled' %>><svg class="ic s" aria-hidden="true"><use href="#i-user"/></svg>人の変更 <span class="n"><%= nHuman %></span></button>
+        <button class="chip" type="button" data-hf="load" aria-pressed="false"<%= nLoad ? '' : ' disabled' %>><svg class="ic s" aria-hidden="true"><use href="#i-moon"/></svg>夜間の取り込みなど <span class="n"><%= nLoad %></span></button>
+        <% if (nCost) { %><button class="chip" type="button" data-hf="cost" aria-pressed="false"><svg class="ic s" aria-hidden="true"><use href="#i-yen"/></svg>原価 <span class="n"><%= nCost %></span></button><% } %>
+      </div>
+    </div>
+    <% } %>
+
+    <div class="sr" id="hist-status" role="status" aria-live="polite"></div>
+    <div id="hist-cards">
+    <% if (!groups.length) { %><div class="empty">記録はまだありません</div><% } %>
+    <% for (const g of groups) { %>
+      <% if (g.day !== lastDay) { lastDay = g.day; %><div class="daygrp" data-day><%= g.day %></div><% } %>
+      <article class="hcard<%= g.who === 'load' ? ' load' : '' %><%= g.cost ? ' cost' : '' %>" data-who="<%= g.who %>" data-cost="<%= g.cost ? '1' : '' %>">
+        <div class="hh"><span class="time"><%= g.time %></span><span class="who"><%= ui.actorWords(g.e) %></span><span class="b mute"><%= ui.sourceWords(g.e.source_system) %></span><% if (g.cost) { %><span class="b vio"><svg class="ic" aria-hidden="true"><use href="#i-yen"/></svg>原価</span><% } %><% if (g.lines.length > 1) { %><span class="muted" style="font-size:13px"><%= g.lines.length %> 項目</span><% } %></div>
+        <% if (g.e.reason_text) { %><div class="why">理由 <q><%= g.e.reason_text %></q></div><% } %>
+        <ul class="hchanges">
+          <% for (const { w } of g.lines) { %>
+          <li><span class="what"><%= w.what %></span><span class="ch"><% if (w.from) { %><span class="from"><%= w.from %></span><span class="arrow" aria-label="から">→</span><% } %><span class="to"><%= w.to %></span></span></li>
+          <% } %>
+        </ul>
+      </article>
+    <% } %>
+    </div>
+
+    <% if (h.requests.length) { %>
+    <section class="panel" aria-labelledby="h-req" style="margin-top:18px">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-layers"/></svg></span><h2 id="h-req">構成の依頼</h2><span class="sub">保存してすぐには効かず、NE で確かめた後に「今の構成」になります</span></div>
+      <div class="tblwrap">
+        <table class="tbl">
+          <thead><tr><th scope="col">依頼した時刻</th><th scope="col">依頼した構成</th><th scope="col">状態</th><th scope="col">依頼した人</th><th scope="col">理由</th><th scope="col">閉じた時刻</th></tr></thead>
+          <tbody>
+            <% for (const r of h.requests) { %>
+            <tr>
+              <td class="num" style="white-space:nowrap"><%= ui.fmtJst(r.created_at, { nowMs }) %></td>
+              <td><% for (const x of (r.rows || [])) { %><span class="compchip"><span class="mono"><%= x.code %></span><span class="x">×<%= x.qty %></span></span><% } %></td>
+              <td><span class="b <%= r.status === 'open' ? 'warn' : r.status === 'applied' ? 'ok' : 'mute' %>"><%= r.status === 'open' ? '依頼中' : r.status === 'applied' ? 'NE に入った (閉じた)' : (r.close_reason === 'withdrawn' ? '取り下げ' : '次の依頼で置き換え') %></span></td>
+              <td><%= r.requested_by %></td>
+              <td class="muted"><%= r.reason || '' %></td>
+              <td class="num" style="white-space:nowrap"><%= r.closed_at ? ui.fmtJst(r.closed_at, { nowMs }) : '' %></td>
+            </tr>
+            <% } %>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <% } %>
+    <% } %>
+  </div>
+  <%- include('_footer') %>
+  <% if (h) { %><script src="<%= base %>/public/me-history.js?v=<%= assetV %>" defer></script><% } %>
+</body>
+</html>

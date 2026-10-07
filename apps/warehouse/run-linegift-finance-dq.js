@@ -9,8 +9,9 @@
  *   DATA_DIR=C:/Users/bfaith/bfaith-portal/data node apps/warehouse/run-linegift-finance-dq.js --month 2026-05
  *
  * 12 check (severity / threshold、設計書 v0.5 §8):
- *   1. row_count_drift                        (error: rows = 0、当月 < 50% of 7日平均)
- *   2. listing_diff_pct                       (warn 1% / error 5%、当月 5%/15%) — f_sales_by_listing (linegift) vs fact gross
+ *   1. row_count_drift                        (error: rows = 0、当月 < 50% of 7日平均。当月の月初の 0 行は条件つきで warn = finance-dq-month-mode.js の decideMonthStartEmpty)
+ *   2. listing_diff_pct                       (warn 1% / error 5%、当月・前月の月初 5%/15%) — f_sales_by_listing (linegift。NE の受注 = 受注日の月) vs raw を fact と同じ条件で **受注日の月** に数えた売上
+ *                                              🚨 2026-09-21 まで fact (受取日の月) と比べていた → 月末の受注が翌月の受取に流れて構造的に 4〜5% ずれ、8 月が 5.06% で毎朝 ❌ だった (linegift-listing-diff.js)
  *                                              ※ 重複 3ヶ月期間は受注日 vs 受取日のズレで informational に格下げ (Codex #9)
  *   3. missing_cost_rate_pct                  (warn 0.5% / error 1%) — 100% master_match のはず
  *   4. shipping_missing_rate_pct              (Phase A 無効化: 'no_shipping_in_api' が常態) — Phase B で実額入れたら有効化
@@ -23,6 +24,8 @@
  *  11. horizon_frozen_observed_count          (info、LINEギフト特有、Codex R5 critical 反映で意味変更) — monthStr 月に final observation (last_seen_at) を持つ frozen 行数 = 凍結に向かう正常な observation 監視指標
  *                                              ※ 設計書 §8 #11「frozen=1 行が再取得時に値変動」検知は raw に frozen_at + snapshot hash を追加すれば厳密実装可能、現スキーマでは測定不能のため info 化
  *  12. received_missing_received_on_count     (error: 1件以上、LINEギフト特有、Codex Round 2 #4) — status='received' なのに received_on_unix IS NULL or =0
+ *  14. fact_raw_mismatch_keys                 (error: 1 件以上、2026-09-21 追加) — fact と、raw を build と同じ式で (受取日 × SKU) に集約したものが鍵ごとに一致するか。
+ *                                              Check 2 を受注日の月どうしに変えたので、「fact が raw から欠けずに作られているか」はここで見る (listing が無い月・重複期間でも省かない)
  *  13. monthless_received_rows                (error: 1件以上、LINEギフト特有、Codex R3 medium 反映) — status='received' で received/last_seen/bought 全て月不明 (どの月の DQ にも乗らない孤児行) を全期間 global で常時検知
  *
  * 設計書: g:/共有ドライブ/AI_reference/システム設計/LINEギフトPhase1設計書_v0.5_20260515.md §8
@@ -30,7 +33,8 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote, monthStartRampOlder, listingOlderPart, whitelistOlderPart, NO_LISTING_RAMP_FLAG } from './finance-dq-month-mode.js';
+import { linegiftListingDiff, linegiftFactRawMismatch, listingDiffThreshold, listingDiffSeverity, linegiftListingBetween } from './linegift-listing-diff.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -43,6 +47,14 @@ const dbPath = path.join(DATA_DIR, 'warehouse.db');
 if (!fs.existsSync(dbPath)) { console.error(`FATAL: warehouse.db not found at ${dbPath}`); process.exit(2); }
 
 const checkedAt = new Date().toISOString();
+// 月の判定の「今」(試験だけ: env FINANCE_DQ_ALLOW_NOW=1 のときだけ --now を受ける。daily-sync は渡さない)
+let now;
+try { now = resolveDqNow(getArg('--now')); }
+catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
+// daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
+const noMonthStartGrace = args.includes('--no-month-start-grace');
+// daily-sync はこの回の f_sales の再構築か、listing の元の NE の取込が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い。R2 Medium)
+const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 // 重複期間: 既存 linegift_accounting CSV (受注日基準) と新 fact (受取日基準) が並走している月 → listing_diff_pct を informational に格下げ
 // (設計書 §8 #2、Codex #9: 受注日 vs 受取日で 1〜数日ずれて売上が流れるため、構造的に diff が出る)
@@ -72,6 +84,7 @@ const THRESHOLDS_PAST = {
   horizon_frozen_observed_count:         { warn: 999999, error: 999999 },  // info 固定 (Codex R5 critical 反映、現スキーマでは違反検知不能)
   received_missing_received_on_count:    { warn: 1,    error: 1 },    // 1件以上 error
   monthless_received_rows:               { warn: 1,    error: 1 },    // 全期間 global、月割不能孤児行を常時 error
+  fact_raw_mismatch_keys:                { warn: 1,    error: 1 },    // fact ↔ raw (受取日の月) の鍵が 1 つでも食い違えば error (受取日どうし = 構造的なずれは無い)
 };
 const THRESHOLDS_CURRENT = {
   ...THRESHOLDS_PAST,
@@ -80,16 +93,24 @@ const THRESHOLDS_CURRENT = {
 };
 // 月の判定は共通ヘルパー (当月 / 前月+月初14日以内 / 過去)。前月の月初は received への遷移ラグで
 // coverage が構造的に低いので whitelist_coverage_pct だけ当月閾値を使う (Qoo10 2026-08 の再発防止と同型)
-const mode = monthMode(monthStr);
+const mode = monthMode(monthStr, { now });
 const isCur = mode === 'current';
 const isDuplicatePeriod = DUPLICATE_PERIOD_MONTHS.has(monthStr);
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
+// 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct・whitelist_coverage_pct の error を、
+// 「足りない向き」かつ「直近 3 日 + 今日より前に error 級の差が無い (ふだんのしきい値で error でない = warn は通す)」かつ「足りない分 ≤ 直近の受注」の
+// ときだけ ⚠️ に下げる (受取待ちの差。受注 → 受取は 0〜8 日)
+const ramp = monthStartRamp('linegift', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
+const rampedChecks = [];
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 const issues = [];
 let hasError = false;
+// 月初の猶予で通すときの判定 (null = 猶予なし)。猶予の中は SKIP_IN_MONTH_START_GRACE の検査を info に落とす (applyMonthStartSkip)
+let monthStartGrace = null;
 function recordResult(name, severity, actual, threshold, details = null) {
+  ({ severity, details } = applyMonthStartSkip(monthStartGrace, name, severity, details));
   db.prepare(`INSERT OR REPLACE INTO dq_run_results (run_id, check_name, severity, actual_value, threshold_value, details_json, checked_at) VALUES (?,?,?,?,?,?,?)`)
     .run(runId, name, severity, actual, threshold, details ? JSON.stringify(details) : null, checkedAt);
   if (severity === 'error') hasError = true;
@@ -97,17 +118,35 @@ function recordResult(name, severity, actual, threshold, details = null) {
 }
 
 console.log(`=== LINEギフト DQ gate: ${runId} (month=${monthStr}, ${modeLabel(mode)} mode${isDuplicatePeriod ? ', DUPLICATE_PERIOD' : ''}) ===`);
+// 月初の猶予の印 (PR #1572 R2): dq_run_results の DELETE より前に、mall・月ごとの消えない印 (dq_month_high_water) を付ける。
+// 一度 0 でなくなった月は、同じ run_id で流し直しても印が残る (前の記録は初回だけ移す)
+prepareMonthHighWater(db, { mall: 'linegift', ym: monthStr, at: checkedAt,
+  count: db.prepare("SELECT COUNT(*) AS c FROM f_linegift_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?").get(monthStr).c });
 db.prepare(`DELETE FROM dq_run_results WHERE run_id = ?`).run(runId);
 
 // Check 1: row_count_drift (rows=0 がエラー、当月のみ「直近日次 < 7日平均×0.5」も warn、Codex R1 #1 反映)
 const dailyCount = db.prepare("SELECT COUNT(*) AS c FROM f_linegift_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr).c;
+recordResult(MONTH_ROW_COUNT_CHECK, 'info', dailyCount, null, monthRowCountDetails('linegift', monthStr, dailyCount));
 if (dailyCount === 0) {
-  recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount });
-  console.error(`  ⚠️ CRITICAL: f_linegift_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
-  printSummary();
-  process.exit(1);
+  // 月初の猶予 (finance-dq-month-mode.js の decideMonthStartEmpty): 当月・月初の日数の中・この月が一度も 0 でなくなっていない・
+  // 前月の終わりまで新しい・daily-sync が禁じていない、を全部満たすときだけ ⚠️ 警告で続ける。早く終わらずに残りの検査も流す
+  // (行数で比べる検査 = SKIP_IN_MONTH_START_GRACE だけ info に落とす。raw・全期間・原価の検査はそのまま)
+  const g = decideMonthStartEmpty(db, { mall: 'linegift', ym: monthStr, now, noGrace: noMonthStartGrace });
+  if (g.grace) {
+    monthStartGrace = g;
+    recordResult('row_count_drift', 'warn', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace: true, jst_day: g.calendar.dayOfMonth, grace_days: g.graceDays, prev_month_max_date: g.prev?.maxDate ?? null });
+    console.log(`  ${monthStartEmptyNote('f_linegift_finance_sku_daily_v1', monthStr, g)}`);
+  } else {
+    recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace_denied: g.reasons });
+    console.error(`  ⚠️ CRITICAL: f_linegift_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
+    if (g.calendar.mode === 'current') console.error(`  → 月初の猶予を使わない理由: ${g.reasons.join(' / ')}`);
+    printSummary();
+    process.exit(1);
+  }
 }
-if (isCur) {
+if (monthStartGrace) {
+  // 月初の猶予 (当月 0 行): row_count_drift は上で warn を記録済み。直近 8 日の比べ方は当月の行があるときだけ
+} else if (isCur) {
   // 当月のみ partial ingest 検知 (Codex R2 #1 反映、date spine で「fact に存在する日だけ」見ない)
   // 朝 07:00 cron 運用なので「期待する最新日 = JST yesterday」。spine = 期待 latest を含む直近 8 calendar days。
   // 月初/月跨ぎでも spine が必ず 8 日揃い、欠損日は 0 として扱われる (drift 発火可能)
@@ -148,20 +187,29 @@ if (isCur) {
   recordResult('row_count_drift', 'info', dailyCount, 0, { daily_row_count: dailyCount, note: 'PAST mode は rows>0 のみチェック' });
 }
 
-// Check 2: listing_diff_pct (重複期間は informational)
-const factGross = db.prepare("SELECT SUM(gross_sales_jpy_incl) AS p FROM f_linegift_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr).p || 0;
-let listingTotal = 0, listingAvail = false;
-try { const r = db.prepare("SELECT SUM(売上金額) AS p FROM f_sales_by_listing WHERE モール='linegift' AND substr(日付,1,7) = ?").get(monthStr); listingTotal = r?.p || 0; listingAvail = listingTotal > 0; }
+// Check 2: listing_diff_pct (重複期間は informational)。比べるのは受注日の月どうし (linegift-listing-diff.js)。受取日の月の fact との差は参考として details に残す
+let ld = null;
+try { ld = linegiftListingDiff(db, monthStr); }
 catch (e) { console.log(`  (listing 突合スキップ: ${e.message})`); }
-if (listingAvail) {
-  const diffPct = listingTotal !== 0 ? Math.abs(factGross - listingTotal) / Math.abs(listingTotal) * 100 : 0;
-  let severity;
-  if (isDuplicatePeriod) severity = 'info';  // 重複期間は info に格下げ
-  else if (diffPct > THRESHOLDS.listing_diff_pct.error) severity = 'error';
-  else if (diffPct > THRESHOLDS.listing_diff_pct.warn) severity = 'warn';
-  else severity = 'info';
-  recordResult('listing_diff_pct', severity, diffPct, THRESHOLDS.listing_diff_pct.error, { fact_gross_jpy: factGross, listing_jpy: listingTotal, diff_jpy: factGross - listingTotal, duplicate_period: isDuplicatePeriod });
-} else { recordResult('listing_diff_pct', 'info', null, THRESHOLDS.listing_diff_pct.error, { skipped: true }); }
+const thr = listingDiffThreshold(mode, THRESHOLDS_PAST.listing_diff_pct, THRESHOLDS_CURRENT.listing_diff_pct);
+if (ld && ld.listingAvail) {
+  const lw = monthStartRampWindow(ramp, 'listing_diff_pct');
+  const lr = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct', listingDiffSeverity(ld.diffPct, thr, { isDuplicatePeriod }),
+    { basis: 'bought_month', bought_basis_jpy: ld.boughtBasisJpy, listing_jpy: ld.listingJpy, diff_jpy: ld.boughtBasisJpy - ld.listingJpy,
+      not_received_yet_jpy: ld.notReceivedJpy, received_without_bought_date: ld.receivedWithoutBoughtDate, received_basis_fact_jpy: ld.receivedBasisFactJpy, received_basis_diff_pct: ld.receivedBasisDiffPct, duplicate_period: isDuplicatePeriod },
+    { shortfall: ld.listingJpy - ld.boughtBasisJpy, explainedBy: recentListingJpy(db, 'linegift', lw),
+      // 窓より前の古い部分 (受注日が月の 1 日〜窓の前の日) の listing と受注日の売上を、同じしきい値で比べる
+      older: monthStartRampOlder(lw, (from, to) => { const o = linegiftListingBetween(db, from, to); return listingOlderPart(o.listingJpy, o.boughtBasisJpy, (pct) => listingDiffSeverity(pct, thr, { isDuplicatePeriod })); }) });
+  if (lr.ramped) rampedChecks.push({ checkName: 'listing_diff_pct', value: ld.diffPct });
+  recordResult('listing_diff_pct', lr.severity, ld.diffPct, thr.error, lr.details);
+} else { recordResult('listing_diff_pct', 'info', null, thr.error, { skipped: true }); }
+
+// Check 14: fact_raw_mismatch_keys — fact が raw から欠けずに作られているか (受取日の月どうし。listing の有無・重複期間に関係なく必ず見る)
+{
+  const fm = linegiftFactRawMismatch(db, monthStr);
+  recordResult('fact_raw_mismatch_keys', fm.mismatched >= THRESHOLDS.fact_raw_mismatch_keys.error ? 'error' : 'info', fm.mismatched, THRESHOLDS.fact_raw_mismatch_keys.error,
+    { keys: fm.keys, missing_in_fact: fm.missingInFact, extra_in_fact: fm.extraInFact, amount_differs: fm.amountDiffers, raw_jpy: fm.rawJpy, fact_jpy: fm.factJpy, examples: fm.examples });
+}
 
 // Check 3: missing_cost_rate_pct
 const cs = db.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN cost_status='missing_cost' THEN 1 ELSE 0 END) AS missing FROM f_linegift_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr);
@@ -194,9 +242,17 @@ const cov = db.prepare(`SELECT
   (SELECT COUNT(*) FROM raw_linegift_orders WHERE substr(received_date_jst,1,7)=? OR (received_date_jst IS NULL AND substr(bought_date_jst,1,7)=?)) AS total,
   (SELECT COUNT(*) FROM raw_linegift_orders WHERE substr(received_date_jst,1,7)=? AND status='received') AS wl`).get(monthStr, monthStr, monthStr);
 const wlPct = cov.total > 0 ? cov.wl / cov.total * 100 : 0;
-recordResult('whitelist_coverage_pct',
-  wlPct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : wlPct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info',
-  wlPct, THRESHOLDS.whitelist_coverage_pct.warn, { total_lines: cov.total, whitelist_lines: cov.wl });
+// 月初の立ち上がりの ③: whitelist に入っていない行 (まだ受け取っていない) の数 ≤ 直近 3 日 + 今日の受注の行の数
+const wlWin = monthStartRampWindow(ramp, 'whitelist_coverage_pct');
+const wlRecent = wlWin ? db.prepare('SELECT COUNT(*) AS c FROM raw_linegift_orders WHERE substr(bought_date_jst, 1, 10) BETWEEN ? AND ?').get(wlWin.from, wlWin.to).c : null;
+const wlSeverity = (pct) => (pct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : pct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info');
+const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct', wlSeverity(wlPct),
+  { total_lines: cov.total, whitelist_lines: cov.wl }, { shortfall: (cov.total || 0) - (cov.wl || 0), explainedBy: wlRecent,
+    // 窓より前の古い部分: 受注日がその期間で、上の total と同じ数え方 (当月に受取 or まだ受け取っていない) の行のうち受け取った割合を、同じしきい値で判定
+    older: monthStartRampOlder(wlWin, (from, to) => { const o = db.prepare(`SELECT COUNT(*) AS t, COALESCE(SUM(substr(received_date_jst, 1, 7) = ? AND status = 'received'), 0) AS w FROM raw_linegift_orders
+      WHERE substr(bought_date_jst, 1, 10) BETWEEN ? AND ? AND (substr(received_date_jst, 1, 7) = ? OR received_date_jst IS NULL)`).get(monthStr, from, to, monthStr); return whitelistOlderPart(o.t, o.w, wlSeverity); }) });
+if (wl.ramped) rampedChecks.push({ checkName: 'whitelist_coverage_pct', value: wlPct });
+recordResult('whitelist_coverage_pct', wl.severity, wlPct, THRESHOLDS.whitelist_coverage_pct.warn, wl.details);
 
 // Check 8: resolved_but_zero_cost_count
 // 原価状態='OVERRIDDEN' AND 原価=0 は人手の意図的 0 円上書き → snapshot=0 (lookup 成功で 0 円) の行のみ除外。
@@ -291,5 +347,9 @@ function printSummary() {
   else console.log(`✅ DQ gate passed (no error, no warn)`);
 }
 printSummary();
+// 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
+if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_linegift_finance_sku_daily_v1', monthStr, monthStartGrace));
+// 月初の立ち上がりで下げた回も、最後の行を「⚠️ 月初の立ち上がり: …」にする (daily-sync は見出しを ⚠️ にする)
+else if (rampedChecks.length > 0 && !hasError) console.log(monthStartRampNote(ramp, rampedChecks));
 db.close();
 process.exit(hasError ? 1 : 0);

@@ -632,9 +632,12 @@ export const PAUSE_REASONS = ['資材の交換', '休憩', '他作業への応�
 export const UNDO_REASONS = ['誤タップ', '入れ間違いの確認', 'その他'];
 // ④ 配送方法変更の理由 (要件§5.7)
 export const SHIP_CHANGE_REASONS = ['入らない', '資材が違う', 'その他'];
-// ④ 提案できる配送方法 (固定リスト — 中原さん指定 2026-08-16)
+// ④ 提案できる配送方法 (固定リスト — 中原さん指定 2026-08-16)。
+// PAS-LINE の 2 つは配送方法 (ネコポス) は同じで梱包機の変更 = MELT ラインで梱包中に PAS へ回したいとき
+// (現場指摘 2026-09-15: 選択肢が無く LINE で送っていた → 中原さん 9/22「選択肢に足す」)
 export const SHIP_CHANGE_METHOD_OPTIONS = [
-  '定形外', 'ネコポス', 'ゆうパケットパフ', 'レターパック', '宅急便50サイズ', '宅急便60サイズ',
+  '定形外', 'ネコポス', 'ネコポス (PAS-LINE 3つ折り)', 'ネコポス (PAS-LINE 2つ折り)',
+  'ゆうパケットパフ', 'レターパック', '宅急便50サイズ', '宅急便60サイズ',
 ];
 // ④ 特殊依頼: ネコポス二枚出し (中原さん指示 2026-09-02) — 配送方法は変えず、ネコポスの
 // 送り状をもう1枚 (2個口) 発行してもらう。扱いは通常の変更依頼と同じ (記録+GChat通知のみ・
@@ -883,6 +886,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       throw new PackError(409, 'not_line_batch', '梱包機バッチではありません');
     }
     let taskNotify = null;   // ①②のGChat通知情報 (routerがfail-softで送る。replayでは再送しない)
+    let shipChangeId = null; // ④ 作った pk_pack_ship_changes.id (router が通知の成否を書く行。replay でも同じ行を見る)
     let switchedFrom = null; // ライン工程開始での担当交代 (payload に監査記録)
     // 再ピック待ち区間の境界時刻。中断/再開は端末時刻 (クランプ) を使い、中断計測と二重控除しない (Codex)
     let blockedAt = now;
@@ -1072,13 +1076,15 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
       const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
       if (!slip) throw new PackError(404, 'slip_not_found', `伝票 ${slipSeq} がありません`);
-      db.prepare(`
+      // 作った行の id を結果に残す (router が通知の成否をこの行に書き、replay 応答でもこの行の状態を返す —
+      // 同じ伝票に別の依頼が重なっても取り違えない: Codex R3)
+      shipChangeId = Number(db.prepare(`
         INSERT INTO pk_pack_ship_changes
           (batch_id, slip_seq, ne_slip_no, folder_name, current_method, proposed_method,
            reason, requested_by, status, updated_at, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)
       `).run(batchId, slipSeq, slip.ne_slip_no, batch.folder_name, slip.delivery_method,
-        proposed, reasonVal, worker, now, now);
+        proposed, reasonVal, worker, now, now).lastInsertRowid);
     } else if (event === 'reprint' || event === 'label_missing') {
       // 🖨 伝票再印刷依頼 (2026-08-21 中原さん指示): 記録+即時通知のみ。伝票状態は変えず、
       // 梱包画面にも痕跡を出さない (理由入力なし)。完了済み伝票でも押せる (配送変更と同様)
@@ -1299,6 +1305,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     // いま完了させた伝票が反映されない。next のときはここで上書きする
     if (event === 'next') result.lastDoneSeq = slipSeq;
     if ((event === 'reprint' || event === 'label_missing') && typeof reprintId !== 'undefined') result.reprintId = reprintId;
+    if (event === 'ship_change' && shipChangeId != null) result.shipChangeId = shipChangeId;
     const payload = (clientAt || reason || jumped || proposedMethod || sku || actualSku || qty != null
         || finalCount != null || manualCount != null || excludedCount != null || toPasCount != null || note || switchedFrom)
       ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined, proposedMethod: proposedMethod || undefined,
@@ -1533,13 +1540,41 @@ function insertIncident(db, batch, { slipSeq, kind, sku, actualSku, actualName, 
   `).run(batch.id, slipSeq ?? null, kind, sku, actualSku ?? null, actualName ?? null, qty, worker, now, now).lastInsertRowid);
 }
 
-/** 伝票内のSKU明細を引く (数量上限の検証用)。 */
+/**
+ * 伝票内のSKU明細を引く (数量上限の検証用)。
+ * 同じ SKU が別行に分かれた伝票 (NE の受注明細が 2 行になる: 例 レモンオイル 2 個 + 1 個) は
+ * 1 つにまとめて qty を合算する。不足・品違いの単位は「伝票 × SKU」なので、行ごとに扱うと
+ * 2 行目が二重依頼 (dup_task) で弾かれ、数量上限も片方の行ぶんしか通らない (現場指摘 2026-09-15)。
+ * @returns {{sku, product_name, print_name, qty:number, line_count:number}|undefined}
+ */
 function slipLineOf(db, batchId, slipSeq, sku) {
   return db.prepare(`
-    SELECT l.* FROM pk_pack_lines l
+    SELECT l.sku, l.product_name, l.print_name, l.short_name, l.barcode,
+           SUM(l.qty) AS qty, COUNT(*) AS line_count
+    FROM pk_pack_lines l
     JOIN pk_pack_slips s ON s.id = l.slip_id
     WHERE s.batch_id=? AND s.seq=? AND LOWER(TRIM(l.sku))=?
+    GROUP BY s.id
   `).get(batchId, slipSeq, normSku(sku));
+}
+
+/**
+ * 伝票の明細を SKU ごとにまとめる (同じ SKU の別行は qty を合算・line_count に行数)。
+ * packing-dispatch の classifyOrder と同じ「同一 SKU を合算した正規化中間」— 恒久ルール申請の
+ * 明細はこの形で送る (行のまま送ると「明細にSKUの重複があります」で申請が通らない — 2026-09-15)。
+ * 先頭行の name などはそのまま残す。
+ */
+export function mergeLinesBySku(lines) {
+  const m = new Map();
+  for (const l of lines || []) {
+    const k = normSku(l.sku);
+    if (!k) continue;
+    const q = Number(l.qty) || 0;
+    const cur = m.get(k);
+    if (cur) { cur.qty += q; cur.line_count += 1; }
+    else m.set(k, { ...l, qty: q, line_count: 1 });
+  }
+  return [...m.values()];
 }
 
 /**

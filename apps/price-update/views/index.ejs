@@ -383,8 +383,9 @@
   /** 概算粗利。★新売価が空の間は「今の価格での粗利」— どちらの値かを必ず添える */
   function grossCell(r, ev) {
     if (!ev || ev.estimate.gross == null) return '<span class="dim">—</span>';
-    const body = '<div>' + yen(Math.round(ev.estimate.gross)) + ' 円</div>'
-      + '<div class="pu-note">' + (ev.estimate.rate * 100).toFixed(1) + '%</div>';
+    // 円・% はサーバーで丸めた数 (lib/profit-estimate.js の grossYen / ratePct1 = マスタの入力の利益と同じ丸め)。素の Math.round(gross) は浮動小数の端で 1 円ずれる
+    const body = '<div>' + yen(ev.estimate.grossYen) + ' 円</div>'
+      + '<div class="pu-note">' + (ev.estimate.ratePct == null ? '—' : ev.estimate.ratePct.toFixed(1) + '%') + '</div>';
     const pre = r.newPrice == null ? '<div class="tag">いまの価格で</div>' : '';
     // 送料が不明なままの粗利は当てにならない。隠す列ではなく、粗利のすぐ横で知らせる
     const post = r.shippingSource === 'unknown' ? '<div class="tag tag-warn">送料不明</div>' : '';

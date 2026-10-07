@@ -9,7 +9,7 @@
  *
  * 読むだけ (DB を書かない)。数字の出どころは getRunState = iPad・出荷前チェック・Excel 出力と同じなので食い違わない。
  */
-import { getRunState, listMaterials, SHORTAGE_REASON_JA } from './db.js';
+import { getRunState, listMaterials, SHORTAGE_REASON_JA, sendQtyOf } from './db.js';
 
 /** 完了判定から外している行 (Excel に無い = プラン外 / Excel の差し替えで外れた)。出荷前チェックと同じ */
 const EXCLUDED = new Set(['picking_only', 'retired']);
@@ -65,6 +65,8 @@ function buildPlanBoxes(groups, boxesOut) {
 
 /** 不足の理由 (内訳があれば「破損 2 + 今回は納品しない 3」) */
 function reasonJaOf(r) {
+  // 予定より増やした (2026-10-05)。不足とは同時に持たない
+  if (r.extra_qty > 0) return r.extra_reason ? `予定より増やした (${SHORTAGE_REASON_JA[r.extra_reason] || r.extra_reason})` : '予定より増やした';
   if (!(r.shortage_qty > 0)) return null;
   const arr = parseJson(r.shortage_detail);
   if (Array.isArray(arr) && arr.length) return arr.map((x) => `${SHORTAGE_REASON_JA[x.reason] || x.reason} ${x.qty}`).join(' + ');
@@ -127,7 +129,7 @@ export function buildRunReport(runId) {
     .map((r) => {
       const excluded = EXCLUDED.has(r.match_state);
       const shortage = r.shortage_qty || 0;
-      const remaining = excluded ? 0 : Math.max(0, r.planned_qty - r.placed - shortage);
+      const remaining = excluded ? 0 : Math.max(0, sendQtyOf(r) - r.placed);
       const diff = r.placed - r.planned_qty;
       return {
         id: r.id, groupId: r.pack_group_id, planNo: r.plan_no, name: r.product_name || r.seller_sku || '', fnsku: r.fnsku, sku: r.seller_sku,

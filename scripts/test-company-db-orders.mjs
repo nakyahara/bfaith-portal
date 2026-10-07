@@ -3,7 +3,7 @@
  * test-company-db-orders.mjs — 0013 (受注・出荷) の受入試験 (Company DB 構想 08 §4.1〜4.3 / §4.7。D4)
  *
  * PGlite で 0001〜0013 を流し、DDL と関数の「歯止め」を実際の操作で確かめる:
- *   状態の対応 (データ) / NE 店舗の対応 / 注文の可否 (Yahoo は D-32 で不可) /
+ *   状態の対応 (データ) / NE 店舗の対応 / 注文の可否 (Yahoo は 0013 で不可 → 0031 で可 = D-32 を 2026-09-26 に a へ) /
  *   apply_order_batch = ヘッダ + 明細集合の適用 (applied・same (世代だけ進み updated_at は動かない)・stale・同じ世代で内容違いは例外・明細の丸ごと置換・内部 ID の解決・JPY・取消) /
  *   apply_shipment_batch = 伝票の適用 + 注文との結び (同じ番号 / Yahoo は接頭辞 / 未着なら null → relink_shipments) /
  *   在庫イベント → 出荷明細 (会社一致) / v_shipments_daily = 旧 f_shipments_daily と同じ式 / v_shipments_unlinked の理由
@@ -45,7 +45,7 @@ const H = (x = {}) => ({ source_system: 'mall_api', ordered_at: '2026-09-13T16:3
 const SH = (x = {}) => ({ ne_order_no: '123456-20260914-0001', shop_code: '1', ne_status_code: '50', shipped_at: '2026-09-13T16:00:00Z', order_date_jst: '2026-09-13', delivery_method_code: '28', delivery_method_name: 'ネコポス', tracking_no: 'T1', source_updated_at: '2026-09-14T01:00:00Z', transform_version: 'v1', content_hash: 's1', ...x });   // lines_checksum は送らない
 
 console.log('0013: 表・関数・seed');
-await t('表・view・関数がある。状態の対応 (NE 5 件) / NE 店舗 15 件 / 注文の可否 8 件 (Yahoo は false)', async () => {
+await t('表・view・関数がある。状態の対応 (NE 5 件) / NE 店舗 15 件 / 注文の可否 8 件 (Yahoo は 0031 で true)', async () => {
   const tables = (await pg.query(`select table_name as t from information_schema.tables where table_schema = 'core' and table_type = 'BASE TABLE' and table_name in ('order_status_map','ne_shops','mall_order_policy','orders','order_lines','shipments','shipment_lines') order by 1`)).rows.map((r) => r.t);
   assert.equal(tables.length, 7);
   const views = (await pg.query(`select table_name as t from information_schema.views where table_schema = 'mart' and table_name like 'v_shipments%' order by 1`)).rows.map((r) => r.t);
@@ -58,7 +58,7 @@ await t('表・view・関数がある。状態の対応 (NE 5 件) / NE 店舗 1
   const y = await one(`select mall, scope_key, order_no_prefix from core.ne_shops where shop_code = '2'`);
   assert.equal(y.mall, 'yahoo'); assert.equal(y.order_no_prefix, 'b-faith01-');
   assert.equal((await one(`select mall from core.ne_shops where shop_code = '15'`)).mall, null);
-  assert.equal((await one(`select orders_enabled from core.mall_order_policy where mall = 'yahoo'`)).orders_enabled, false);
+  assert.equal((await one(`select orders_enabled from core.mall_order_policy where mall = 'yahoo'`)).orders_enabled, true);   // 0031 (D-32 = a)
   assert.equal((await one(`select orders_enabled from core.mall_order_policy where mall = 'rakuten'`)).orders_enabled, true);
   assert.equal(await num(`select count(*) as n from information_schema.columns where table_schema = 'events' and table_name = 'inventory_events' and column_name = 'shipment_line_id'`), 1);
 });
@@ -124,8 +124,10 @@ await t('🚨 新しい世代で内容が変わったら、ヘッダを更新し
   assert.equal(await num(`select count(*) as n from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'RK-1'`), 2);
   await rejects(() => pg.query(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash) values ($1, 'rakuten', 'main', 'bad', 'mall_api', now(), current_date, 'shipped', true, 1, now(), 'v1', 'h')`, [co]), /ck_orders_cancelled/);
 });
-await t('🚨 入れてよいモールだけ: Yahoo は D-32 で不可、policy の無い scope も不可 (黙って入れない)。JPY 以外・content_hash 無し・ordered_at 無し・世代 0 は例外', async () => {
+await t('🚨 入れてよいモールだけ: orders_enabled が false のモール (0013 の Yahoo と同じ形。試験の中だけ止める) は不可、policy の無い scope も不可 (黙って入れない)。JPY 以外・content_hash 無し・ordered_at 無し・世代 0 は例外', async () => {
+  await pg.query(`update core.mall_order_policy set orders_enabled = false where mall = 'yahoo'`);
   await rejects(() => applyOrder('yahoo', 'main', 'b-faith01-12345678', 1, H(), []), /not enabled/);
+  await pg.query(`update core.mall_order_policy set orders_enabled = true where mall = 'yahoo'`);
   await rejects(() => applyOrder('amazon', 'us', 'AMZ-US-1', 1, H(), []), /no row/);
   await rejects(() => applyOrder('amazon', 'jp', 'AMZ-1', 1, H({ currency: 'USD' }), []), /non-JPY/);
   await rejects(() => applyOrder('amazon', 'jp', 'AMZ-1', 1, H({ content_hash: '' }), []), /content_hash/);
@@ -173,8 +175,7 @@ await t('🚨 注文が未着の伝票は order_id が null のまま (v_shipmen
   assert.equal(await applyOrder('amazon', 'jp', '503-0000001-0000001', 1, H({ content_hash: 'amz3' }), []), 'applied');
   assert.equal(Number((await one(`select core.relink_shipments($1::smallint) as n`, [co])).n), 1);
   assert.equal((await one(`select o.mall_order_no from core.shipments s join core.orders o on o.order_id = s.order_id where s.ne_slip_no = 'S-2'`)).mall_order_no, '503-0000001-0000001');
-  // Yahoo: D-32 の確認が取れた想定で一時的に有効化 → 注文が届いた後の「same」の再送では結ばない (updated_at も order_id も動かない) → relink で接頭辞つきで結ばれる → 元に戻す
-  await pg.query(`update core.mall_order_policy set orders_enabled = true where mall = 'yahoo'`);
+  // Yahoo (0031 で有効): 注文が届いた後の「same」の再送では結ばない (updated_at も order_id も動かない) → relink で接頭辞つきで結ばれる
   assert.equal(await applyOrder('yahoo', 'main', 'b-faith01-12345678', 1, H({ content_hash: 'y1' }), []), 'applied');
   const s3 = await one(`select updated_at::text as u, order_id from core.shipments where ne_slip_no = 'S-3'`);
   assert.equal(await applyShip('S-3', 2, SH({ shop_code: '2', ne_order_no: '12345678', content_hash: 's3' }), [{ line_no: '1', sku_code: 'sku-a', qty: 1 }]), 'same');
@@ -182,7 +183,6 @@ await t('🚨 注文が未着の伝票は order_id が null のまま (v_shipmen
   assert.equal(s3b.u, s3.u); assert.equal(s3b.order_id, null); assert.equal(Number(s3b.received_batch_seq), 2);   // R1 #7
   assert.equal(Number((await one(`select core.relink_shipments($1::smallint) as n`, [co])).n), 1);
   assert.equal((await one(`select o.mall_order_no from core.shipments s join core.orders o on o.order_id = s.order_id where s.ne_slip_no = 'S-3'`)).mall_order_no, 'b-faith01-12345678');
-  await pg.query(`update core.mall_order_policy set orders_enabled = false where mall = 'yahoo'`);
   assert.equal(Number((await one(`select core.relink_shipments($1::smallint) as n`, [co])).n), 0);
   assert.equal(await num(`select count(*) as n from mart.v_shipments_unlinked`), 2);   // S-4 (対象外の店舗) と S-5 (店舗なし)
   // 🚨 受注番号を未着の番号に訂正したら、古い結びは残さない (order_id = null → unlinked に出る)。届いたら relink で結ばれる (R1 #4)

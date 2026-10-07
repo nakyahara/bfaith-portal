@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
+    const REG_BADGE = { draft: 'warn', ne_pending: 'info', ne_confirmed: 'info', distributable: 'info', quarantined: 'err', cancelled: 'mute' };
+    const REGISTERED_ON_SOURCES_LABEL = { ne: 'NE の作成日', portal: 'ポータルで登録', first_seen: '夜間ロードで初めて見た日' };
+    const FLAG_BADGE = { 'NEとの差': 'err', 'CSV待ち': 'info', '構成の依頼': 'warn', 'カード作成待ち': 'warn', 'カード作成待ち (失敗)': 'err', 'カードの衝突': 'err' };
+    // 今の絞り込み (offset を除く) を土台に、1 つだけ変えた URL
+    // 詳細検索を印 (?s=) で使っているときは、詳細検索の項目は印に任せる (URL に長い条件を戻さない = HTTP 431 にしない)
+    const keep = Object.fromEntries(Object.entries(filters).filter(([k, v]) => v && k !== 'offset' && !(filters.s && ADV_KEYS.includes(k))));
+    // 注文残を見せない人 (発注アプリの利用権が無い) = 列・絞り込みを出さない
+    const poDenied = !!(extras && extras.backorders && extras.backorders.denied);
+    const hrefWith = (over) => {
+      const p = { ...keep };
+      for (const [k, v] of Object.entries(over)) { if (v) p[k] = v; else delete p[k]; }
+      const s = new URLSearchParams(p).toString();
+      return s ? '?' + s : './';
+    };
+    const pageHref = (offset) => { const s = new URLSearchParams({ ...keep, ...(offset ? { offset: String(offset) } : {}) }).toString(); return s ? '?' + s : './'; };
+    const nOf = (v) => (v == null ? null : Number(v));
+    // 札: [ラベル, 絞り込みの名前, 値, 数, 色]。数 0 = 押せない (いま絞っている札だけは外せるように押せる)
+    const chip = (label, key, value, n, tone, icon) => {
+      const on = filters[key] === value || (key === 'kind' && value === '' && !filters.kind);
+      const zero = n === 0 && !on;
+      const href = key === 'kind' ? hrefWith({ kind: value }) : hrefWith({ [key]: on ? '' : value });
+      const num = n == null ? '' : '<span class="n">' + Number(n).toLocaleString('ja-JP') + '</span>';
+      const ic = icon ? '<svg class="ic s" aria-hidden="true"><use href="#' + icon + '"/></svg>' : '';
+      const cls = 'chip' + (on ? ' on' : '') + (tone ? ' t-' + tone : '') + (zero ? ' zero' : '');
+      if (zero) return '<span class="' + cls + '" aria-disabled="true" aria-label="' + label + ' いま 0 件">' + ic + label + ' ' + num + '</span>';
+      return '<a class="' + cls + '" href="' + href + '"' + (on ? ' aria-current="true"' : '') + '>' + ic + label + ' ' + num + '</a>';
+    };
+    const c = counts || {};
+    // 札で出せない絞り込み (状態 = 取扱中・登録の下書き以外・札の無い未入力) のときは「もっと絞る」を開いておく
+    const moreOn = (filters.state && filters.state !== 'discontinued') || (filters.reg && filters.reg !== 'draft') || (filters.missing && !['cost', 'sales', 'tax'].includes(filters.missing));
+  %>
+  <div class="page" id="list-page">
+    <div class="ph">
+      <div>
+        <h1>商品・セット</h1>
+        <div class="meta"><span>Company DB の商品マスタ</span><span class="dotsep"></span><span>NE との照合 <%= data.latestRun ? ui.fmtJst(data.latestRun.observed_at, { nowMs }) : 'まだありません' %></span></div>
+      </div>
+      <div class="ph-actions">
+        <a class="btn" href="new?kind=set"><svg class="ic" aria-hidden="true"><use href="#i-box"/></svg>新しいセット</a>
+        <a class="btn pri" href="new?kind=single"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg>新しい単品</a>
+      </div>
+    </div>
+
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= closedWhy %>)</div><div class="hint">この画面は見るだけです。切替日までは商品マスタの正は NE・/register です。</div></div></div><% } %>
+    <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+
+    <div class="panel hud">
+      <form method="get" action="" role="search" class="bigsearch" id="list-search">
+        <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="q" name="q" value="<%= filters.q %>" autocomplete="off" aria-keyshortcuts="/" aria-label="商品・セットを絞る (コード・名前・JAN)" placeholder="商品・セットを絞る (コード・名前・JAN)　例: はちみつ / 4901234567894">
+        <% for (const [k, v] of Object.entries(keep)) { if (k === 'q') continue; %><input type="hidden" name="<%= k %>" value="<%= v %>"><% } %>
+        <button class="btn soft sm go" type="submit" title="Enter でも絞れます">絞る</button>
+        <span class="kbd" aria-hidden="true">/</span>
+      </form>
+      <div class="filters">
+        <div class="chips" role="group" aria-label="区分">
+          <span class="chip-lab" aria-hidden="true">区分</span>
+          <%- chip('全部', 'kind', '', nOf(c.n_all)) %>
+          <%- chip('単品', 'kind', 'single', nOf(c.n_single)) %>
+          <%- chip('セット', 'kind', 'set', nOf(c.n_set)) %>
+          <% if (nOf(c.n_exception) || filters.kind === 'exception') { %><%- chip('例外', 'kind', 'exception', nOf(c.n_exception)) %><% } %>
+          <span class="vsep" aria-hidden="true"></span>
+          <%- chip('取扱を中止した商品', 'state', 'discontinued', nOf(c.discontinued)) %>
+        </div>
+        <div class="chips" role="group" aria-label="やること">
+          <span class="chip-lab" aria-hidden="true">やること</span>
+          <%- chip('原価が未入力', 'missing', 'cost', nOf(c.miss_cost), 'err') %>
+          <%- chip('売上分類が未入力', 'missing', 'sales', null, 'warn') %>
+          <%- chip('税率が未入力', 'missing', 'tax', nOf(c.miss_tax), 'warn') %>
+          <% if (c.reg_draft != null) { %><%- chip('登録が下書き', 'reg', 'draft', nOf(c.reg_draft), 'warn') %><% } %>
+          <% if (c.card_waiting != null) { %><%- chip('カード作成待ち', 'card', 'waiting', nOf(c.card_waiting), 'warn') %><% } %>
+          <% if (c.card_conflict) { %><%- chip('カードの衝突', 'card', 'conflict', nOf(c.card_conflict), 'err') %><% } %>
+          <% if (data.diffAvailable) { %><%- chip('NE との差', 'diff', '1', nOf(c.diff), 'err') %><% } %>
+        </div>
+        <details class="more filters-more"<%= moreOn ? ' open' : '' %>>
+          <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>もっと絞る (状態・登録・カード・未入力の項目)</summary>
+          <form method="get" action="" class="row2">
+            <% if (filters.q) { %><input type="hidden" name="q" value="<%= filters.q %>"><% } %>
+            <% if (filters.sort) { %><input type="hidden" name="sort" value="<%= filters.sort %>"><% } %>
+            <% if (filters.s) { %><input type="hidden" name="s" value="<%= filters.s %>"><% } else { for (const k of ADV_KEYS) { if (filters[k] && !['state'].includes(k)) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } } %>
+            <label>区分 <select class="in" name="kind"><option value="">全部</option><% for (const [k, v] of Object.entries(KINDS)) { %><option value="<%= k %>"<%= filters.kind === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+            <label>状態 <select class="in" name="state"><option value="">全部</option><% for (const [k, v] of Object.entries(STATES)) { %><option value="<%= k %>"<%= filters.state === k ? ' selected' : '' %>><%= k === 'available' ? '取扱中' : v %></option><% } %></select></label>
+            <label>登録 <select class="in" name="reg"><option value="">全部</option><% for (const [k, v] of Object.entries(REG_STATES)) { %><option value="<%= k %>"<%= filters.reg === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+            <label>カード <select class="in" name="card"><option value="">全部</option><% for (const [k, v] of Object.entries(CARD_FILTERS)) { %><option value="<%= k %>"<%= filters.card === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+            <label>未入力 <select class="in" name="missing"><option value="">—</option><% for (const [k, v] of Object.entries(MISSING)) { %><option value="<%= k %>"<%= filters.missing === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
+            <label><input type="checkbox" name="diff" value="1"<%= filters.diff ? ' checked' : '' %><%= data.diffAvailable ? '' : ' disabled' %>> NE との差あり</label>
+            <button class="btn sm" type="submit">この条件で表示</button>
+            <% if (Object.keys(keep).length) { %><a class="btn ghost sm" href="./">条件を全部外す</a><% } %>
+          </form>
+        </details>
+        <%
+          const advOn = ADV_KEYS.some((k) => filters[k]);
+          const sel = (name, opts, cur, blank) => '<select class="in" name="' + name + '" id="adv-' + name + '"><option value="">' + blank + '</option>' + Object.entries(opts).map(([k, v]) => '<option value="' + k + '"' + (String(cur) === String(k) ? ' selected' : '') + '>' + v + '</option>').join('') + '</select>';
+        %>
+        <details class="more adv"<%= advOn ? ' open' : '' %> id="adv">
+          <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>詳細検索 (商品コードを複数・JAN・仕入先・代表・名前・原価・売価・登録日・在庫・注文残)<% if (advOn) { %> <span class="b info">使っている</span><% } %></summary>
+          <%# 長い条件 (商品コード 500 件など) は画面の JS が POST api/search で印にして ?s=<印> で開く (GET の URL は HTTP 431 になる)。JS が無いときは今までどおり GET %>
+          <form method="get" action="" class="adv-grid" id="adv-form" data-api="api/search">
+            <% for (const k of ['q', 'missing', 'reg', 'card', 'diff', 'sort']) { if (filters[k]) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } %>
+            <label class="adv-codes"><span class="lab">商品コード (複数)</span>
+              <textarea class="in" name="codes" id="adv-codes" rows="5" spellcheck="false" placeholder="Excel の列をそのまま貼り付け&#10;(改行・カンマ・空白・タブで区切る)&#10;ぴったり当てる · 大文字小文字・全角半角は同じ"><%= filters.codes %></textarea>
+              <span class="hint"><%= MULTI_MAX %> 件まで · 見つからないコードは一覧の上に出ます</span></label>
+            <div class="adv-col">
+              <label><span class="lab">JAN (複数)</span><textarea class="in" name="jans" id="adv-jans" rows="2" spellcheck="false"><%= filters.jans %></textarea></label>
+              <label><span class="lab">仕入先コード (複数・代表の仕入先)</span><textarea class="in" name="sups" id="adv-sups" rows="2" spellcheck="false" placeholder="例: 0001 (1 でも同じ)"><%= filters.sups %></textarea></label>
+            </div>
+            <div class="adv-col">
+              <label><span class="lab">代表 (親) の商品コード (複数)</span><textarea class="in" name="parents" id="adv-parents" rows="2" spellcheck="false" placeholder="その代表の商品と代表そのもの"><%= filters.parents %></textarea></label>
+              <label><span class="lab">商品名 (含む)</span><input class="in" name="name" id="adv-name" value="<%= filters.name %>" autocomplete="off" placeholder="ひらがな・カタカナ・半角カナは同じ"></label>
+            </div>
+            <div class="adv-col adv-ranges">
+              <div class="rng"><span class="lab">原価</span><input class="in" name="cost_min" inputmode="numeric" value="<%= filters.cost_min %>" aria-label="原価 から (円)"><span>〜</span><input class="in" name="cost_max" inputmode="numeric" value="<%= filters.cost_max %>" aria-label="原価 まで (円)"><span class="unit">円</span></div>
+              <div class="rng"><span class="lab">売価</span><input class="in" name="price_min" inputmode="numeric" value="<%= filters.price_min %>" aria-label="売価 から (円)"><span>〜</span><input class="in" name="price_max" inputmode="numeric" value="<%= filters.price_max %>" aria-label="売価 まで (円)"><span class="unit">円</span></div>
+              <% if (data.registeredOnAvailable) { %><div class="rng" id="adv-regdate"><span class="lab">登録日</span><input class="in" type="date" name="reg_from" value="<%= filters.reg_from %>" min="2000-01-01" aria-label="登録日 から"><span>〜</span><input class="in" type="date" name="reg_to" value="<%= filters.reg_to %>" min="2000-01-01" aria-label="登録日 まで"><span class="unit"></span></div><% } %>
+              <div class="rng"><span class="lab">在庫</span><input class="in" name="stock_min" inputmode="numeric" value="<%= filters.stock_min %>" aria-label="在庫 (ロジザード) から"><span>〜</span><input class="in" name="stock_max" inputmode="numeric" value="<%= filters.stock_max %>" aria-label="在庫 (ロジザード) まで"><span class="unit">個</span></div>
+              <% if (poDenied) { %><span class="hint" id="po-denied">注文残 (発注アプリの権限がないので出せません)</span><% } else { %><label class="chk"><input type="checkbox" name="po" value="1"<%= filters.po ? ' checked' : '' %>> 注文残あり (発注アプリ)</label><% } %>
+            </div>
+            <div class="adv-col adv-sels">
+              <label><span class="lab">取扱区分</span><%- sel('state', { available: '取扱中', discontinued: '中止' }, filters.state, '全部') %></label>
+              <label><span class="lab">単品 / セット</span><%- sel('kind', KINDS, filters.kind, '全部') %></label>
+              <label><span class="lab">税率</span><%- sel('tax', TAX_FILTERS, filters.tax, '全部') %></label>
+              <label><span class="lab">売上分類</span><%- sel('sales', SALES_FILTERS, filters.sales, '全部') %></label>
+            </div>
+            <div class="adv-foot">
+              <button class="btn pri sm" type="submit"><svg class="ic s" aria-hidden="true"><use href="#i-search"/></svg>この条件で探す</button>
+              <a class="btn ghost sm" href="./">クリア (条件を全部外す)</a>
+              <span class="hint">条件は URL に残ります (戻る・共有で同じ結果。長い条件は 24 時間の印) · 在庫 = ロジザード · FBA (JP) = Amazon の朝のレポート (販売可能) · 注文残 = 発注アプリ</span>
+            </div>
+          </form>
+        </details>
+      </div>
+    </div>
+
+    <% if (locals.searchExpired) { %><div class="callout warn" id="search-expired" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">条件の期限が切れました。もう一度検索してください</div><div class="hint">長い詳細検索の条件は、画面の裏で 24 時間だけ預かっています (アプリの入れ替えでも消えます)。</div></div><a class="btn sm" href="./">条件を外す</a></div><% } %>
+    <% if (data.notFound && data.notFound.length) { %><div class="callout warn" id="not-found" role="status"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= data.notFound.length %> 件 見つからない</div><div class="hint mono" style="color:var(--text2)"><%= data.notFound.slice(0, 60).join(', ') %><%= data.notFound.length > 60 ? ' ほか ' + (data.notFound.length - 60) + ' 件' : '' %></div></div></div><% } %>
+    <% if (data.multiCut) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">複数の欄は <%= MULTI_MAX %> 件までを使いました (それより後は使っていません)</div></div><% } %>
+
+    <div class="panel">
+      <div class="tbl-top">
+        <span><b><%= data.total.toLocaleString('ja-JP') %></b> 件</span><span class="dotsep" aria-hidden="true"></span>
+        <span>絞る欄で <span class="kbd">Enter</span> = 絞る · コードを押すか <span class="kbd">↑</span><span class="kbd">↓</span> で選んで <span class="kbd">Enter</span> で開く</span>
+        <% if (data.sorts) { %><span class="dotsep" aria-hidden="true"></span><span>並び <% for (const [k, v] of Object.entries(data.sorts)) { %><% if ((filters.sort || '') === k) { %><b aria-current="true"><%= v %></b><% } else if (k === 'reg_desc' && !data.registeredOnAvailable) { %><% } else { %><a href="<%= hrefWith({ sort: k }) %>"><%= v %></a><% } %> <% } %></span><% } %>
+        <span class="right">
+          <%
+            // 絞った一覧の全件 (ページ分けに関係なく) = 今の絞り込み (札・絞る欄・詳細検索の印 ?s=・並び) のまま。上限 = exportMax 件
+            const qsNow = hrefWith({}); const qsTail = qsNow === './' ? '' : qsNow;
+            const overMax = data.total > exportMax;
+            const exTitle = overMax ? data.total.toLocaleString('ja-JP') + ' 件あります。' + exportMax.toLocaleString('ja-JP') + ' 件までなので、絞ってから' : '';
+          %>
+          <% if (data.total) { %>
+          <button type="button" class="btn sm ghost" id="copy-all" data-url="api/codes<%= qsTail %>" data-n="<%= data.total %>"<%= overMax ? ' disabled' : '' %> title="<%= exTitle || '絞った一覧の商品コードを全部 (ページに関係なく・1 行 1 つ) コピー' %>"><svg class="ic s" aria-hidden="true"><use href="#i-copy"/></svg>コードを全部コピー (<%= data.total.toLocaleString('ja-JP') %> 件)</button>
+          <% if (overMax) { %><span class="btn sm ghost" id="csv-link" aria-disabled="true" title="<%= exTitle %>"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>CSV</span><% } else { %><a class="btn sm ghost" id="csv-link" href="list.csv<%= qsTail %>" download title="絞った一覧を全部 (ページに関係なく) CSV で (Excel で開ける・UTF-8)"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>CSV (<%= data.total.toLocaleString('ja-JP') %> 件)</a><% } %>
+          <% } %>
+          <span><span class="fx">計算</span> = 構成品から計算した値 · <span class="fx warnx">仮</span> = 税率か送料が未入力のまま計算した利益</span>
+        </span>
+      </div>
+      <div class="tblwrap">
+        <table class="tbl click" id="list-tbl">
+          <caption class="sr">商品・セットの一覧 (<%= data.total %> 件)</caption>
+          <%
+            const st = extras && extras.stock, bo = extras && extras.backorders;
+            const stSub = !st || !st.ok ? '読めない' : (st.stale ? '古い ' : '') + ui.fmtJst(st.asOf, { nowMs }).replace(/^.*\) /, '');
+            const stTitle = !st || !st.ok ? (st && st.error) || '読めない' : 'ロジザード ' + ui.fmtJst(st.asOf, { nowMs }) + ' 時点' + (st.stale ? ' (古い = 2 時間より前・夜は 18 時台の写しなら次の朝 10 時まで古くない)' : '') + ' · 参考 · セットは構成品から作れる数';
+            // FBA (JP) = Company DB の在庫の日次 (朝の SP-API のレポートを取り終えた時刻 = 何時時点か・26 時間より前 = 古い)
+            const fb = extras && extras.fba;
+            const fbWhen = fb && fb.ok ? ui.fmtJst(fb.asOf, { nowMs }).replace(/ \(.\) /, ' ') : '';
+            const fbSub = !fb || !fb.ok ? '読めない' : (fb.stale ? '古い ' : '') + fbWhen;
+            const fbTitle = !fb || !fb.ok ? (fb && fb.error) || '読めない'
+              : 'FBA (日本) の販売可能 · ' + ui.fmtJst(fb.asOf, { nowMs }) + ' 時点 (朝のレポート)' + (fb.stale ? ' (26 時間より前 = 古い)' : '') + (fb.newer ? ' · ' + ui.fmtDay(fb.newer.date) + ' は' + fb.newer.words + 'ので前の日の値' : '')
+                + ' · 参考 · この SKU 1 個の出品だけの合計 (まとめ売り・セットの出品は入れない)';
+            // 売れた数 (7 日 / 30 日) = 商品管理リストの公開の回 (発注アプリ・商品管理リストと同じ数・前日まで・今日は入れない)
+            const sa = extras && extras.sales;
+            const saDay = sa && sa.ok ? ui.fmtDay(sa.asOf).replace(/ \(.\)$/, '') : '';
+            const saSub = !sa || !sa.ok ? '読めない' : (sa.stale ? '古い ' : '') + saDay + ' まで';
+            const saTitle = !sa || !sa.ok ? (sa && sa.error) || '読めない'
+              : '売れた数 (7 日 / 30 日) · ' + ui.fmtDay(sa.asOf) + ' まで (7 日 = ' + ui.fmtDay(sa.from7).replace(/ \(.\)$/, '') + '〜・30 日 = ' + ui.fmtDay(sa.from30).replace(/ \(.\)$/, '') + '〜・今日は入れない)'
+                + (sa.stale ? ' (前日までの数になっていない = 古い)' : '')
+                + ' · 参考 · 商品管理リスト・発注アプリと同じ数 (注文日・キャンセルを除く・全部のモール = NE の受注 + Amazon FBA) · セットで売れた分は構成品の数に入る';
+          %>
+          <thead><tr><th scope="col" style="width:130px">コード</th><th scope="col" style="min-width:260px">名前</th><th scope="col" style="width:74px" id="th-kind">区分</th><th scope="col" style="width:150px">状態</th><th scope="col" style="width:96px">登録日</th><th scope="col" class="n" style="width:84px">売価</th><th scope="col" class="n" style="width:112px">原価</th><th scope="col" class="n" style="width:74px">税</th><th scope="col" class="n" style="width:92px" id="th-profit" title="1 個あたりの参考の利益 = 売価 − 手数料 (売価の <%= Math.round(PF.PLATFORM_FEE_RATES.standard * 1000) / 10 %>%) − 原価 × (1 + 税率) − 送料 (自社の計算用)。モールごとの手数料・送料の違いは入れていません">利益<span class="thsub">1 個・参考</span></th><th scope="col" class="n" style="width:74px" id="th-profit-rate">利益率</th><th scope="col" style="width:120px">売上分類</th><th scope="col" class="n ref<%= !st || !st.ok ? ' bad' : st.stale ? ' stale' : '' %>" style="width:86px" title="<%= stTitle %>" id="th-stock">在庫<span class="thsub"><%= stSub %></span></th><th scope="col" class="n ref<%= !fb || !fb.ok ? ' bad' : fb.stale ? ' stale' : '' %>" style="width:92px" title="<%= fbTitle %>" id="th-fba">FBA (JP)<span class="thsub"><%= fbSub %></span></th><th scope="col" class="n ref<%= !sa || !sa.ok ? ' bad' : sa.stale ? ' stale' : '' %>" style="width:96px" title="<%= saTitle %>" id="th-sales">売れた 7日/30日<span class="thsub"><%= saSub %></span></th><% if (!poDenied) { %><th scope="col" class="n ref<%= !bo || !bo.ok ? ' bad' : '' %>" style="width:76px" title="<%= !bo || !bo.ok ? '発注アプリの台帳を読めない' : '発注アプリの注文残 (発注したがまだ入庫していない数)' %>">注文残<span class="thsub"><%= !bo || !bo.ok ? '読めない' : '発注' %></span></th><% } %><th scope="col" style="width:150px">対応が必要</th></tr></thead>
+          <tbody>
+            <% if (!data.rows.length) { %><tr><td colspan="<%= poDenied ? 15 : 16 %>" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
+            <% for (const r of data.rows) { const isSet = r.kind === 'set'; %>
+            <tr>
+              <td data-col="code"><span class="codecell"><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a><button type="button" class="copybtn" data-copy="<%= r.code %>" aria-label="商品コード <%= r.code %> をコピー" title="コピー"><svg class="ic s" aria-hidden="true"><use href="#i-copy"/></svg></button></span></td>
+              <td><span class="nm"><%= r.name %></span><span class="sub"><% if (isSet) { %><% } else if (r.kind === 'exception') { %>例外の SKU (NE に無い)<% } else { %><%= r.primary_supplier ? '仕入先 ' + r.primary_supplier : '代表の仕入先なし' %><% } %></span></td>
+              <td data-col="kind"><% if (isSet) { %><span class="b info kind">セット</span><span class="sub kindn" title="構成品の数"><svg class="ic s" aria-hidden="true" style="vertical-align:-2px"><use href="#i-box"/></svg> <%= r.comp_count %> 品</span><% } else if (r.kind === 'exception') { %><span class="b warn kind">例外</span><% } else { %><span class="b mute kind">単品</span><% } %></td>
+              <td>
+                <% if (r.state === 'discontinued') { %><span class="b mute">中止</span><% } else { %><span class="b ok"><span class="dot" aria-hidden="true"></span>取扱中</span><% } %>
+                <% if (r.reg_state !== 'none' && r.reg_state !== 'available') { %><span class="b <%= REG_BADGE[r.reg_state] || 'mute' %>" style="margin-top:4px"><%= REG_STATES[r.reg_state] || r.reg_state %></span><% } %>
+              </td>
+              <td class="muted"<%- r.registered_on_source ? ' title="' + (REGISTERED_ON_SOURCES_LABEL[r.registered_on_source] || r.registered_on_source) + '"' : '' %>><%= r.registered_on ? r.registered_on.replace(/-/g, '/') : '—' %></td>
+              <td class="n"><%= fmt.yen(r.standard_price) %></td>
+              <td class="n"><% if (r.cost == null) { %><span class="b err">未入力</span><% } else { %><%= fmt.yen(r.cost) %><% if (r.cost_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <td class="n"><% if (r.tax_rate == null) { %><span class="b warn">未入力</span><% } else { %><%= fmt.tax(r.tax_rate) %>%<% if (r.tax_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <% const pd = r.profit_detail; const pnote = PF.profitNoteWords(r.profit_notes); %>
+              <td class="n" data-col="profit"><% if (r.profit == null) { %><span class="muted" title="<%= r.profit_reason %>">—</span><% } else { %><span class="pf<%= r.profit < 0 ? ' neg' : '' %>" title="<%= PF.profitLine(pd) %><%= pnote.length ? ' · ' + pnote.join(' · ') : '' %>"><%= PF.fmtProfitYen(r.profit) %></span><% if (pnote.length) { %><span class="fx warnx" title="<%= pnote.join(' · ') %>">仮</span><% } %><% } %></td>
+              <td class="n" data-col="profit-rate"><% if (r.profit_rate == null) { %><span class="muted">—</span><% } else { %><span class="pf<%= r.profit_rate < 0 ? ' neg' : '' %>"><%= PF.fmtProfitRate(r.profit_rate) %></span><% } %></td>
+              <td><% if (r.sales_class == null) { %><% if (r.kind !== 'exception') { %><span class="b warn">未入力</span><% } %><% } else { %><%= SALES[r.sales_class] || r.sales_class %><% if (r.sales_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <td class="n ref" data-col="stock"><% if (isSet) { %><% if (r.buildable != null) { %><span title="構成品の在庫から作れる数 (参考)"><%= r.buildable.toLocaleString('ja-JP') %></span><span class="fx">作れる</span><% } %><% } else if (r.stock != null) { %><%= r.stock ? r.stock.toLocaleString('ja-JP') : '0' %><% } else { %><span class="muted">—</span><% } %></td>
+              <td class="n ref" data-col="fba"><% if (r.fba != null) { %><%= r.fba.toLocaleString('ja-JP') %><% if (!r.fba_row) { %><span class="fx" title="その日の FBA のレポートに、この SKU 1 個だけの出品の行が無い (販売可能 0 と数える)">出品なし</span><% } %><% } else { %><span class="muted">—</span><% } %></td>
+              <td class="n ref" data-col="sales"><% const sq = r.sales; if (sq && !sq.missing && !isSet) { %><span title="7 日 <%= sq.d7.toLocaleString('ja-JP') %> (FBA <%= sq.d7fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d7other.toLocaleString('ja-JP') %>) / 30 日 <%= sq.d30.toLocaleString('ja-JP') %> (FBA <%= sq.d30fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d30other.toLocaleString('ja-JP') %>)"><%= sq.d7.toLocaleString('ja-JP') %> / <%= sq.d30.toLocaleString('ja-JP') %></span><% } else if (sq && isSet) { %><span class="muted" title="セットで売れた分は構成品の数に入る (商品管理リスト・発注アプリと同じ数え方)">—</span><% } else if (sq) { %><span class="muted" title="商品管理リストに無い商品 (NE にまだ無いなど)">—</span><% } else { %><span class="muted">—</span><% } %></td>
+              <% if (!poDenied) { %><td class="n ref" data-col="po"><% if (r.backorder) { %><%= r.backorder.toLocaleString('ja-JP') %><% } else if (r.backorder == null) { %><span class="muted">—</span><% } %></td><% } %>
+              <td><div class="flags"><% for (const f of r.flags) { %><span class="b <%= FLAG_BADGE[f] || 'mute' %>"><%= f %></span><% } %></div></td>
+            </tr>
+            <% } %>
+          </tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <% if (data.offset > 0) { %><a class="btn sm" href="<%= pageHref(Math.max(0, data.offset - data.limit)) %>">← 前の <%= data.limit %> 件</a><% } %>
+        <% if (data.total) { %><span><%= (data.offset + 1).toLocaleString('ja-JP') %>〜<%= (data.offset + data.rows.length).toLocaleString('ja-JP') %> 件目</span><% } %>
+        <% if (data.total > data.offset + data.rows.length) { %><a class="btn sm" href="<%= pageHref(data.offset + data.limit) %>">次の <%= data.limit %> 件 →</a><% } %>
+      </div>
+    </div>
+    <p class="hint">登録の札 = 新商品の登録の進み (札が無い = 登録済み・切替の前からある商品)。Amazon SKU の対応は左の「Amazon SKU」で見ます。</p>
+  </div>
+  <%- include('_footer') %>
+</body>
+</html>

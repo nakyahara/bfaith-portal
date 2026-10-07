@@ -9,7 +9,17 @@
  *
  * 種類ごとに渡すもの:
  *   kind / label / paths { post, status, receipt, keys } / countOf(statusJson) → { count, maxBatchSeq } / keysOf(keysJson) → string[]
- *   iterate(warehouse, stats) = raw を鍵順に流し読みする generator (呼ぶ側の読み取り取引の中で動く。stats は自由に使ってよい)
+ *   iterate(warehouse, stats, ctx) = raw を鍵順に流し読みする generator (呼ぶ側の読み取り取引の中で動く。stats は自由に使ってよい。ctx = { startedAt, fps, pre, dryRun })
+ *   任意 (Amazon 財務 F2b-2 で足した):
+ *     beforeScan(hctx) → pre = 走査の前 (lock の中・台帳の初期化の後) に 1 回だけ Render を読む (全件の作り直しで Render にだけある鍵を知る)。dry-run では呼ばない
+ *     beforeChunk({ rows, lines, ...hctx }) = 各 chunk を送る直前 (容量の見張り。throw = 送らずに止める)。戻り値の release() = 期限超過で送らなかったときに呼ぶ (見込みの予約を戻す)
+ *     receiptRows(body) → 受け口が正規化した rows (key つき) = 受領記録の指紋を受け口と同じ形で計算する (受け口が行を作り直す種類。既定 = 送った行そのまま)
+ *     beforeAck({ failedKeys, staleKeys }) = chunk の応答で failed / stale になった鍵を、outbox から消す前に呼ぶ (全部を読み直さない種類が「読み直す鍵」に残す)
+ *   任意 (Amazon 財務の決済のそろい D7b-1b-3 で足した・設計 13 §3.1):
+ *     onScanSnapshot({ warehouse, stats, ctx, r }) → snapshot = 走査の **同じ読み取りの取引の中** で (全部の build の後・rollback の前) 1 回だけ呼ぶ
+ *       (manifest と生の表の版を計算する)。戻り値は r.scanSnapshot に入り afterSend({ scanSnapshot }) に渡る。例外 = 走査を戻して run ごと失敗 (coverage は updating のまま)
+ *       dry-run でも呼ぶ (計算してよい・送らない)
+ *     chunkExtra = 全部の chunk の body に足す object (Amazon 財務 = { coverage_generation, run_token })。受領記録の指紋 (receiptRows) には入らない
  *   inScope(group, fps) / build(group, ctx) → { key, payload, n_lines, no_synced_at? } (throw = 整形できない) / transformVersion
  */
 import crypto from 'node:crypto';
@@ -26,6 +36,9 @@ export const MAX_LINES_PER_CHUNK = 5000;
 export const HTTP_TIMEOUT_MS = 120000;
 export const RETRIES = 6;                            // 5xx / 通信エラーの再送 (5・10・20・40・80 秒 = 合計 155 秒。master へのマージで Render が再デプロイされる 1〜3 分の 502 をまたぐ)
 export const backoffMs = (attempt) => 5000 * 2 ** (attempt - 1);
+// outbox に書く区切り (行)。🆕 #1567 メモリ: 1,000 → 100 = 書く前の行 (整形した JSON) が若い世代の GC を 2 回生き延びて古い世代に上がり、次の大きな GC まで
+//   ごみとして積もる (送り直し 51 万件の合成で 1 回目の大きな GC の前に 674 MB) のを減らす。取引の数は増える (WAL・1 回ごとの fsync は無い)
+const OUTBOX_FLUSH_ROWS = 100;
 const HEARTBEAT_EVERY = 5000;                        // 走査中の心拍 (行数)
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -37,23 +50,55 @@ export function fingerprintOf(transformVersion, payload) {
   return crypto.createHash('sha256').update(transformVersion + '|' + payload.header.content_hash + '|' + canonicalJson(payload.lines)).digest('hex').slice(0, 32);
 }
 
-async function getJson(fetchImpl, url, syncKey, what) {
-  const res = await fetchImpl(url, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`${what}が取れない: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
-  return res.json();
+/**
+ * Render から読む (GET)。408・429・5xx・通信の失敗は間を空けて読み直す (Render の入れ替わり = master へのマージの 1〜3 分の 502 をまたぐ。
+ *   2026-09-30 の Amazon 財務の完了印で 502 に一度で負けた。GET は冪等 = 送信 (postJson) と同じく 5xx を全部読み直す)。ほかの 4xx はすぐ止める。
+ *   止める = 最大 GET_MAX_ATTEMPTS 回 か 時間の枠 (budgetMs・deadline の早い方) を超えるとき (工程の上限より前に必ず終わる)。
+ *   待ち = 5・10・20・30・30… 秒 (合計 約 2.5 分)。1 回の通信の上限は min(HTTP_TIMEOUT_MS, 枠の残り)
+ */
+// 回数は env CDB_GET_MAX_ATTEMPTS で変えられる (1〜20。つながらない Render を相手にする CLI の試験は 1 = 本物の待ちで試験の打ち切りに当たらない)
+const envAttempts = Number(process.env.CDB_GET_MAX_ATTEMPTS);
+export const GET_MAX_ATTEMPTS = Number.isInteger(envAttempts) && envAttempts >= 1 && envAttempts <= 20 ? envAttempts : 8;
+export const GET_BUDGET_MS = 240000;
+export const getRetryDelayMs = (attempt) => Math.min(5000 * 2 ** (attempt - 1), 30000);
+const retryableGetStatus = (s) => s === 408 || s === 429 || s >= 500;
+export async function getJson(fetchImpl, url, syncKey, what, { budgetMs = GET_BUDGET_MS, deadline = null, maxAttempts = GET_MAX_ATTEMPTS, sleep = defaultSleep, log = () => {}, now = () => Date.now() } = {}) {
+  const end = Math.min(deadline == null ? Infinity : deadline, now() + budgetMs);
+  let last = null;
+  for (let attempt = 1; ; attempt++) {
+    // 締め切りを過ぎていれば新しい読み取りを始めない (工程の上限より前に自分で理由を出して止まる。#1545 Codex R2)
+    const remaining = end - now();
+    if (remaining <= 0) throw new Error(`${what}が取れない: 読み取りの締め切りを過ぎた${last ? ` (最後 = ${String(last.message).slice(0, 120)})` : ''} (${attempt - 1} 回読んだ)`);
+    try {
+      const timeout = Math.min(HTTP_TIMEOUT_MS, remaining);
+      const res = await fetchImpl(url, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(timeout) });
+      if (res.ok) return await res.json();
+      const text = (await res.text()).replace(/\s+/g, ' ').slice(0, 200);
+      last = new Error(`${what}が取れない: HTTP ${res.status} ${text}`);
+      if (!retryableGetStatus(res.status)) { if (attempt > 1) last.message += ` (${attempt} 回読んだ)`; throw Object.assign(last, { fatal: true }); }
+    } catch (e) {
+      if (e.fatal) throw e;
+      if (e !== last) last = new Error(`${what}が取れない: ${String(e && e.message).slice(0, 200)}`);
+    }
+    const wait = getRetryDelayMs(attempt);
+    if (attempt >= maxAttempts || now() + wait >= end) { last.message += ` (${attempt} 回読んだ)`; throw last; }
+    log(`  ${String(last.message).slice(0, 160)} → ${wait / 1000} 秒後に読み直す (${attempt}/${maxAttempts})`);
+    await sleep(wait);
+  }
 }
 /** 前回受領確認した chunk が Render に同じ内容で残っているか */
-export async function fetchReceiptFound(fetchImpl, { base, syncKey, path, receipt }) {
-  const j = await getJson(fetchImpl, `${base}${path}?run_id=${encodeURIComponent(receipt.run_id)}&chunk_index=${receipt.chunk_index}`, syncKey, 'Render の受領記録');
+export async function fetchReceiptFound(fetchImpl, { base, syncKey, path, receipt, getOpts = {} }) {
+  const j = await getJson(fetchImpl, `${base}${path}?run_id=${encodeURIComponent(receipt.run_id)}&chunk_index=${receipt.chunk_index}`, syncKey, 'Render の受領記録', getOpts);
   if (!j || typeof j.found !== 'boolean') throw new Error('Render の受領記録の応答に found が無い');
   return j.found && j.payload_checksum === receipt.payload_checksum;
 }
 /** Render にある鍵を全部 (keyset で数回に分けて) */
-export async function fetchAllKeys(fetchImpl, { base, syncKey, path, keysOf, limit = 20000 }) {
+export async function fetchAllKeys(fetchImpl, { base, syncKey, path, keysOf, limit = 20000, getOpts = {}, onPage = () => {} }) {
   const out = []; let after = '';
   const sep = path.includes('?') ? '&' : '?';
   for (let i = 0; i < 1000; i++) {
-    const j = await getJson(fetchImpl, `${base}${path}${sep}after=${encodeURIComponent(after)}&limit=${limit}`, syncKey, 'Render の鍵');
+    const j = await getJson(fetchImpl, `${base}${path}${sep}after=${encodeURIComponent(after)}&limit=${limit}`, syncKey, 'Render の鍵', getOpts);
+    onPage();   // ページごとに lock の心拍 (読み直しでページが長引いても、合計が lock の期限を越えて奪われない。#1545 Codex R2)
     const keys = keysOf(j);
     if (!Array.isArray(keys)) throw new Error('Render の鍵の応答に一覧が無い');
     out.push(...keys);
@@ -100,15 +145,22 @@ export async function runPush({
   minSplit = MIN_SPLIT, maxBodyBytes = MAX_BODY_BYTES, stats = {},
   metaOnFirstChunk = null,   // 最初の chunk の直前 (世代を取る取引) に台帳へ書く印 { 鍵: 値 } = 「送った後に要る処理」を HTTP より先に永続化 (注文の結び直し。Codex D5b-1 R2 #1)
   afterSend = null,          // 送り終えた後 (lock の中・持ち主の確認の後) に回す処理 (ctx) → 結果。error があれば run は ok = false (Codex D5b-1 R2 #3)
+  beforeScan = null, beforeChunk = null, receiptRows = null, beforeAck = null,   // 上の「任意」
+  onScanSnapshot = null, chunkExtra = null,                                       // 上の「任意」(D7b-1b-3)
+  lazyFingerprints = false,   // true = 台帳の指紋を Map に全部読まずに 1 つずつ引く (ledger.fingerprintLookup。#1567 メモリ・Amazon 財務だけ)。iterate / build / inScope には get / has の同じ口で渡る
+  measure = false,   // dry-run だけ: 毎朝の実の回に近い時間・メモリを測る = beforeScan (Render の読み取り) を呼び、変わった行を chunk の形に serialize して捨てる (送らない・台帳に書かない。#1567 Codex R5 Medium 2)
 }) {
   if (chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk は 1〜${MAX_CHUNK}`);
+  if (measure && !dryRun) throw new Error('measure は dry-run だけ');
+  if (measure && (!base || !syncKey)) throw new Error('measure は Render を読む = 送り先と MIRROR_SYNC_KEY が要る');
   if (!dryRun) {
     if (!base) throw new Error('送り先が決まらない (RENDER_MIRROR_URL / RENDER_PORTAL_URL を確かめる。https で同じホストのときだけ)');
     if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
   }
   const startedAt = now();
   const r = { ok: false, kind, mode, dryRun, force, runId: null, batchSeq: null, scanned: 0, inScope: 0, unchanged: 0, changed: 0, sent: 0, applied: 0, same: 0, stale: 0, failed: [], staleKeys: [], chunks: 0,
-    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats, afterSend: null };
+    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats, afterSend: null, scanSnapshot: null, measure: null,
+    coverageInvalidated: 0 };   // 受け口が無効にした決済のそろい (complete → updating) の数の合計 (応答の coverage_invalidated。#1567 Codex R6 Medium 1)
   if (!dryRun) {
     const lock = ledger.acquireLock({ owner, pid, now: startedAt, ...(isAlive ? { isAlive } : {}) });
     if (!lock.ok) { r.lockedBy = lock.held; log(`[company-db push ${label}] 別の送り手が走っている (${lock.held.owner} pid ${lock.held.pid} 心拍 ${lock.held.heartbeat_at}) ので見送った`); return r; }
@@ -118,14 +170,15 @@ export async function runPush({
   try {
     if (!dryRun) {
       r.runId = newRunId(startedAt); ledger.recordRun({ run_id: r.runId, mode, started_at: startedAt.toISOString() });
-      const statusJson = await getJson(fetchImpl, `${base}${paths.status}`, syncKey, 'Render の状態');
+      const getOpts = { sleep, log };   // 読み取りも 5xx を読み直す (試験は sleep を差し替える)
+      const statusJson = await getJson(fetchImpl, `${base}${paths.status}`, syncKey, 'Render の状態', getOpts);
       mustOwn();   // HTTP を待った後は必ず持ち主を確かめてから台帳に書く (Codex R3 #4 / R4 #1)
       r.remote = countOf(statusJson);
       if (!Number.isInteger(r.remote.count)) throw new Error('Render の状態の応答に件数が無い');
       if (r.remote.maxBatchSeq != null) ledger.ensureBatchSeqAtLeast(r.remote.maxBatchSeq, startedAt);   // 世代は Render の最大以上 (台帳を失くしても 'stale' で全部弾かれない)
       const receipt = ledger.getLastReceipt();
       if (receipt) {
-        const found = await fetchReceiptFound(fetchImpl, { base, syncKey, path: paths.receipt, receipt });
+        const found = await fetchReceiptFound(fetchImpl, { base, syncKey, path: paths.receipt, receipt, getOpts });
         mustOwn();
         if (!found) {
           const n = ledger.resetFingerprints(owner);
@@ -134,7 +187,7 @@ export async function runPush({
         }
       }
       if (!ledger.isInitialized() && ledger.countTracked() === 0 && r.remote.count > 0) {
-        const keys = await fetchAllKeys(fetchImpl, { base, syncKey, path: paths.keys, keysOf });
+        const keys = await fetchAllKeys(fetchImpl, { base, syncKey, path: paths.keys, keysOf, getOpts, onPage: mustOwn });
         mustOwn();
         r.ledgerRebuilt = ledger.trackKeys(keys, startedAt, owner);
         log(`[company-db push ${label}] 台帳が空なので Render の投入済み ${keys.length} 件を追跡対象に取り戻した (指紋は空 = 全部送り直す)`);
@@ -146,14 +199,32 @@ export async function runPush({
       ledger.markInitialized(startedAt);
       mustOwn();
     }
-    fps = ledger.loadFingerprints();
+    let pre = null;
+    if (beforeScan && !dryRun) { pre = await beforeScan({ fetchImpl, base, syncKey, log, mustOwn }); mustOwn(); }
+    // measure (dry-run) = 実の回と同じく Render を読む (読むだけ・lock は持たない = 持ち主の確かめは無し)
+    else if (beforeScan && measure) { const t0 = Date.now(); pre = await beforeScan({ fetchImpl, base, syncKey, log, mustOwn: () => {} }); r.measure = { beforeScanMs: Date.now() - t0 }; }
+    // 変わった行を実の回の chunk と同じ区切り (行数・明細の行数・バイト) で serialize して捨てる (送らない・outbox に書かない)
+    const mz = measure ? Object.assign(r.measure || (r.measure = {}), { renderKeys: pre && pre.renderKeys ? pre.renderKeys.size : null, rows: 0, rowBytes: 0, chunks: 0, chunkBytes: 0, maxChunkBytes: 0 }) : null;
+    let mzRows = [], mzLines = 0, mzBytes = 0;
+    const mzFlush = () => {
+      if (!mz || !mzRows.length) return;
+      const n = Buffer.byteLength(JSON.stringify({ run_id: 'measure', batch_seq: 0, chunk_index: mz.chunks, last: false, transform_version: transformVersion, rows: mzRows, ...(chunkExtra || {}) }));
+      mz.chunks++; mz.chunkBytes += n; mz.maxChunkBytes = Math.max(mz.maxChunkBytes, n);
+      mzRows = []; mzLines = 0; mzBytes = 0;
+    };
+    const mzAdd = (item) => {
+      const p = JSON.stringify(item.payload), n = Buffer.byteLength(p), lines = item.payload.lines ? item.payload.lines.length : 0;
+      if (mzRows.length && (mzRows.length >= chunkSize || mzLines + lines > MAX_LINES_PER_CHUNK || mzBytes + n > maxBodyBytes)) mzFlush();
+      mzRows.push(JSON.parse(p)); mzLines += lines; mzBytes += n; mz.rows++; mz.rowBytes += n;
+    };
+    fps = lazyFingerprints ? ledger.fingerprintLookup() : ledger.loadFingerprints();
     // ── ① raw を 1 つの読み取り取引で流し読み (snapshot はここで閉じる。HTTP の間は持たない。Codex R2 #6) ──
     let buf = [];
     const flushBuf = () => { if (buf.length) { ledger.pushOutbox(r.runId, buf); buf = []; } };
-    const ctx = { startedAt, fps };
+    const ctx = { startedAt, fps, pre, dryRun };
     warehouse.exec('begin');
     try {
-      for (const group of iterate(warehouse, stats)) {
+      for (const group of iterate(warehouse, stats, ctx)) {
         r.scanned++;
         if (!dryRun && r.scanned % HEARTBEAT_EVERY === 0) mustOwn();   // 走査中も心拍 (Codex R3 #4)
         if (!inScope(group, fps)) continue;
@@ -168,17 +239,21 @@ export async function runPush({
         if (!force && fps.get(item.key) === fp) { r.unchanged++; continue; }
         r.changed++;
         if (!r.example) r.example = item.payload;
-        if (dryRun) continue;
+        if (dryRun) { if (mz) mzAdd(item); continue; }
         const payload = JSON.stringify(item.payload);
         buf.push({ key: item.key, fp, payload, n_lines: item.payload.lines.length, n_bytes: Buffer.byteLength(payload) });
-        if (buf.length >= 1000) flushBuf();
+        if (buf.length >= OUTBOX_FLUSH_ROWS) flushBuf();
       }
       flushBuf();
+      mzFlush();
+      // 同じ読み取りの取引の中で manifest と生の表の版を計算する (D7b-1b-3)。例外 = run ごと失敗 (送らない)
+      if (onScanSnapshot) r.scanSnapshot = onScanSnapshot({ warehouse, stats, ctx, r });
     } finally {
       try { warehouse.exec('rollback'); } catch { /* 読むだけの取引 */ }
     }
     log(`[company-db push ${label}] ${scopeLabel}: 読んだ ${r.scanned} / 範囲 ${r.inScope} / 変化なし ${r.unchanged} / 変わった ${r.changed} (整形できない ${r.transformErrors.length} / 更新時刻無し ${r.noSyncedAt})${dryRun ? ' [dry-run]' : ''}`);
     for (const t of r.transformErrors.slice(0, 20)) log(`  整形できない: ${t.key}: ${t.error}`);
+    if (mz) log(`[company-db push ${label}] measure: Render の鍵 ${mz.renderKeys ?? '-'} 件 (${mz.beforeScanMs ?? '-'} ms) / 変わった行の serialize ${mz.rows} 行・${Math.round(mz.rowBytes / 1024)} KB / chunk ${mz.chunks} 個・最大 ${Math.round(mz.maxChunkBytes / 1024)} KB (送らない)`);
     if (dryRun) { if (r.example) log(`  例: ${JSON.stringify(r.example).slice(0, 600)}`); r.ok = r.transformErrors.length === 0; return r; }
 
     // ── ② outbox から chunk を取って送る ──
@@ -187,10 +262,13 @@ export async function runPush({
     const sendRows = async (rows, last) => {
       if (r.batchSeq == null) r.batchSeq = ledger.nextBatchSeq(now(), owner, metaOnFirstChunk);   // 世代は最初の chunk の直前に取る (送る物が無い run では進めない。持ち主の確認・送る前に残す印と同じ取引)
       const items = rows.map((p) => p.item);
-      const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: transformVersion, rows: items };
+      const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: transformVersion, rows: items, ...(chunkExtra || {}) };
+      let hold = null;
+      if (beforeChunk) { hold = await beforeChunk({ rows: items, lines: rows.reduce((s, p) => s + (p.item.lines ? p.item.lines.length : 0), 0), fetchImpl, base, syncKey, log, mustOwn }); mustOwn(); }
       const res = await postJson(fetchImpl, { base, syncKey, path: paths.post, log, sleep, body, beforeAttempt: mustOwn });
       if (res.deadline) {
         chunkIndex--;                                                                // 使わなかった番号を戻す
+        if (hold && typeof hold.release === 'function') hold.release();              // 適用されていない = 見込みの予約を戻す (割った半分ずつでまた見る)
         if (rows.length <= minSplit) throw new Error(`${res.message} (${rows.length} 件でも期限超過)`);
         const half = Math.ceil(rows.length / 2);
         log(`  期限超過 (${rows.length} 件) → ${half} + ${rows.length - half} に割って送り直す`);
@@ -199,14 +277,16 @@ export async function runPush({
         return;
       }
       for (const k of ['applied', 'same', 'stale']) { if (!Number.isInteger(res[k])) throw new Error(`応答に ${k} が無い`); r[k] += res[k]; }
+      if (Number.isInteger(res.coverage_invalidated) && res.coverage_invalidated > 0) r.coverageInvalidated += res.coverage_invalidated;   // 捨てない (Codex R6 Medium 1)
       const staleKeys = res.stale_keys ?? res.stale_slips;
       if (!Array.isArray(res.failed) || !Array.isArray(staleKeys)) throw new Error('応答に failed / stale_keys が無い');
       if (res.applied + res.same + res.stale + res.failed.length !== rows.length) throw new Error(`chunk ${body.chunk_index}: 送った ${rows.length} と応答の合計 ${res.applied + res.same + res.stale + res.failed.length} が合わない`);
       const failedKeys = res.failed.map((f) => f.key ?? f.ne_slip_no);
       r.failed.push(...res.failed.map((f, i) => ({ ...f, key: failedKeys[i] }))); r.staleKeys.push(...staleKeys);
       const skip = new Set([...failedKeys, ...staleKeys]);
+      if (beforeAck && skip.size) { mustOwn(); beforeAck({ failedKeys, staleKeys }); }
       // 受領記録の指紋は受け口と同じ計算 (validateChunk が正規化した rows = key を含む) → 送る行に key を足して計算
-      const normalized = rows.map((p) => ({ key: p.key, ...p.item }));
+      const normalized = receiptRows ? receiptRows(body) : rows.map((p) => ({ key: p.key, ...p.item }));
       ledger.ackOutbox(rows, rows.filter((p) => !skip.has(p.key)).map((p) => ({ key: p.key, fp: p.fp })), r.batchSeq,
         { owner, at: now(), receipt: { run_id: r.runId, chunk_index: body.chunk_index, payload_checksum: payloadChecksum(normalized) } });
       r.sent += rows.length; r.chunks++;
@@ -225,7 +305,7 @@ export async function runPush({
     r.ok = r.failed.length === 0 && r.transformErrors.length === 0 && r.stale === 0;
     if (afterSend) {
       mustOwn();   // 送った後の処理も同じ lock の中 (別の送り手が印を消せない)。HTTP のたびに ctx.mustOwn で持ち主を確かめる
-      r.afterSend = await afterSend({ ledger, owner, fetchImpl, base, syncKey, log, now, mustOwn, r });
+      r.afterSend = await afterSend({ ledger, owner, fetchImpl, base, syncKey, log, now, mustOwn, r, scanSnapshot: r.scanSnapshot });
       if (r.afterSend && r.afterSend.error) r.ok = false;
     }
     if (total.n >= 50000) { try { ledger.vacuum(); } catch { /* 詰めるだけ */ } }

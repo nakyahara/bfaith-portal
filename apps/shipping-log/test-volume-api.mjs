@@ -55,7 +55,10 @@ console.log('\n── /api/options ──');
   const r = await get('/api/options');
   eq(r.status, 200, 'HTTP 200');
   eq(r.json.malls.map(m => m.shop_name), ['雑貨イズムAmazon店', '雑貨イズム楽天市場店'], 'モール選択肢は件数の多い順');
-  eq(r.json.methods.map(m => m.delivery_name), ['AES', 'ヤマト(ネコポス)'], '配送方法選択肢');
+  eq(r.json.methods.map(m => m.delivery_name), ['Amazon Easy Ship (AES)', 'ヤマト(ネコポス)'], '配送方法選択肢');
+  eq([r.json.methods[0].key, r.json.methods[0].delivery_id], ['g:64', '64'],
+    '旧 AES(71) の選択肢は区分キー g:64 (生の配送方法ID とは別の名前空間)');
+  eq(r.json.methods[1].key, '28', '区分に入らない配送方法の値は生の配送方法ID のまま');
   eq([r.json.min_date, r.json.max_date], ['2026-08-04', '2026-08-05'], 'データ範囲');
 }
 
@@ -67,8 +70,8 @@ console.log('\n── /api/volume ──');
   eq(r.json.cancelled, 2, 'キャンセルは内数として別に返る');
   eq(r.json.days.map(d => d.total), [647, 539], '日別合計');
   eq(r.json.malls[0], { name: '雑貨イズムAmazon店', n: 802 }, 'モール別 最多は Amazon');
-  eq(r.json.methods[0], { name: 'AES', n: 795 }, '配送方法別 最多は AES');
-  eq(r.json.days[0].methods['AES'], 400, '日 × 配送方法 (8/4 AES)');
+  eq(r.json.methods[0], { name: 'Amazon Easy Ship (AES)', n: 795 }, '配送方法別 最多は Easy Ship');
+  eq(r.json.days[0].methods['Amazon Easy Ship (AES)'], 400, '日 × 配送方法 (8/4 Easy Ship)');
   eq(r.json.avgPerDay, 593, '1日平均');
 }
 
@@ -79,13 +82,81 @@ console.log('\n── basis=valid (キャンセルを除く) ──');
   eq(r.json.days[0].malls['雑貨イズムAmazon店'], 405, '8/4 Amazon = 400-2+7');
 }
 
-console.log('\n── 絞り込み (Amazon × AES = 中原さんの見たい軸) ──');
+console.log('\n── 絞り込み (Amazon × Easy Ship = 中原さんの見たい軸) ──');
 {
-  const r = await get('/api/volume?from=2026-08-04&to=2026-08-05&mall=4&method=71');
-  eq(r.json.total, 795, 'Amazon の AES だけ');
-  eq(r.json.days.map(d => d.total), [400, 395], '日別 AES 件数');
+  const r = await get('/api/volume?from=2026-08-04&to=2026-08-05&mall=4&method=g:64');
+  eq(r.json.total, 795, 'Amazon の Easy Ship だけ (区分キーで旧 AES(71) の行も出る)');
+  eq(r.json.days.map(d => d.total), [400, 395], '日別 Easy Ship 件数');
+  const legacy = await get('/api/volume?from=2026-08-04&to=2026-08-05&mall=4&method=71');
+  eq(legacy.json.total, 795, '生の配送方法ID を直接指定すると、その ID の行だけ (この期間は同じ数)');
   const r2 = await get('/api/volume?from=2026-08-04&to=2026-08-05&mall=4');
-  eq(r2.json.total, 802, 'モールだけの絞り込み (AES 以外の Amazon も含む)');
+  eq(r2.json.total, 802, 'モールだけの絞り込み (Easy Ship 以外の Amazon も含む)');
+}
+
+console.log('\n── NE の 71:AES → 64:Amazon Easy Ship 切替をまたいでも 1 系列 ──');
+{
+  // 9/18 までは 71/'AES'、9/19 からは 64/'Amazon Easy Ship' で入る (NE の実データと同じ形)
+  const ins2 = db.prepare(`INSERT INTO mirror_shipments_daily
+    (ship_date, shop_code, shop_name, platform, delivery_id, delivery_name, slips, cancelled_slips, source_updated_at, synced_at)
+    VALUES (?,?,?,?,?,?,?,?,NULL,'2026-09-20T07:00:00Z')`);
+  ins2.run('2026-09-18', '4', '雑貨イズムAmazon店', 'amazon_fbm', '71', 'AES', 435, 0);
+  ins2.run('2026-09-19', '4', '雑貨イズムAmazon店', 'amazon_fbm', '64', 'Amazon Easy Ship', 461, 0);
+  ins2.run('2026-09-20', '4', '雑貨イズムAmazon店', 'amazon_fbm', '64', 'Amazon Easy Ship', 375, 0);
+
+  const r = await get('/api/volume?from=2026-09-18&to=2026-09-20');
+  eq(r.json.methods, [{ name: 'Amazon Easy Ship (AES)', n: 1271 }], '切替をまたいでも配送方法は1つ (435+461+375)');
+  eq(r.json.days.map(d => d.methods['Amazon Easy Ship (AES)']), [435, 461, 375],
+    '切替後の日が 0 件にならない (これが今回の不具合)');
+
+  const opt = await get('/api/options');
+  eq(opt.json.methods.filter(m => /Easy Ship|AES/.test(m.delivery_name)).map(m => [m.key, m.n]),
+    [['g:64', 2066]], '選択肢も 1 つに畳まれる (795 + 1271)');
+
+  const picked = await get('/api/volume?from=2026-09-18&to=2026-09-20&method=g:64');
+  eq(picked.json.total, 1271, '区分キーで絞っても切替前の分が落ちない');
+  const legacy = await get('/api/volume?from=2026-09-18&to=2026-09-20&method=71');
+  eq(legacy.json.total, 435, '生の ID 71 を直接指定したときは 71 の行だけ (区分は足さない)');
+
+  const csv = await get('/api/volume.csv?from=2026-09-18&to=2026-09-20');
+  const csvLines = csv.text.trim().split('\r\n');
+  eq(csvLines.length, 4, 'CSV はヘッダ + 3日分');
+  ok(csvLines.every(l => !l.includes(',AES,')), 'CSV の過去分も新しい区分名に揃う');
+
+  db.prepare("DELETE FROM mirror_shipments_daily WHERE ship_date >= '2026-09-18'").run();
+}
+
+console.log('\n── 区分にまとまらない (ID を再利用された) 行は混ざらない ──');
+{
+  // NE が ID を別の便に使い回したケース。名前が区分の定義と違うので Easy Ship には畳まない。
+  // 旧 ID 71 の再利用と、**新 ID 64 の再利用** の両方を見る (Codex R1 Medium)
+  const ins3 = db.prepare(`INSERT INTO mirror_shipments_daily
+    (ship_date, shop_code, shop_name, platform, delivery_id, delivery_name, slips, cancelled_slips, source_updated_at, synced_at)
+    VALUES (?,?,?,?,?,?,?,?,NULL,'2026-10-01T07:00:00Z')`);
+  // (ship_date, shop_code, delivery_id) が主キーなので、同じ ID の別名は日を分けて入れる
+  ins3.run('2026-10-01', '4', '雑貨イズムAmazon店', 'amazon_fbm', '71', '佐川急便', 12, 0);
+  ins3.run('2026-10-01', '4', '雑貨イズムAmazon店', 'amazon_fbm', '64', 'Amazon Easy Ship', 30, 0);
+  ins3.run('2026-10-02', '4', '雑貨イズムAmazon店', 'amazon_fbm', '64', '別の便', 5, 0);
+
+  const r = await get('/api/volume?from=2026-10-01&to=2026-10-02');
+  eq(r.json.methods, [{ name: 'Amazon Easy Ship (AES)', n: 30 }, { name: '佐川急便', n: 12 }, { name: '別の便', n: 5 }],
+    '畳まれなかった行は別の便として出る (Easy Ship に化けない)');
+
+  const picked = await get('/api/volume?from=2026-10-01&to=2026-10-02&method=g:64');
+  eq(picked.json.total, 30, '区分キーで絞ると、同じ ID でも名前が違う行は拾わない');
+
+  const opt = await get('/api/options');
+  const keys = opt.json.methods.filter(m => ['Amazon Easy Ship (AES)', '別の便', '佐川急便'].includes(m.delivery_name))
+    .map(m => [m.delivery_name, m.key]).sort();
+  eq(keys, [['Amazon Easy Ship (AES)', 'g:64'], ['佐川急便', '71'], ['別の便', '64']],
+    '選択肢の値も区分と生の配送方法ID で分かれる (画面で別々に絞れる)');
+
+  // 画面で区分外の配送方法を選んだとき、区分 (Easy Ship) が足されないこと (Codex R2 Medium)
+  const sagawa = await get('/api/volume?from=2026-10-01&to=2026-10-02&method=71');
+  eq(sagawa.json.total, 12, '「佐川急便 (71)」を選んでも Easy Ship(64) は足されない');
+  const betsu = await get('/api/volume?from=2026-10-01&to=2026-10-02&method=64');
+  eq(betsu.json.total, 35, '生の ID 64 の指定は 64 の行すべて (Easy Ship 30 + 別の便 5)');
+
+  db.prepare("DELETE FROM mirror_shipments_daily WHERE ship_date >= '2026-10-01'").run();
 }
 
 console.log('\n── 月別 (granularity=month) ──');
@@ -102,7 +173,7 @@ console.log('\n── 月別 (granularity=month) ──');
   eq(r.json.days.map(d => d.work_days), [1, 2], '出荷があった日数 (稼働日)');
   eq(r.json.days.map(d => d.avg_per_day), [100, 593], '月ごとの1日平均 (稼働日で割る)');
   eq(r.json.days[1].malls['雑貨イズムAmazon店'], 802, '月 × モール');
-  eq(r.json.days[1].methods['AES'], 795, '月 × 配送方法');
+  eq(r.json.days[1].methods['Amazon Easy Ship (AES)'], 795, '月 × 配送方法');
   eq(r.json.total, 1286, '期間合計');
   eq(r.json.avgPerBucket, 643, '月平均 (1286 / 2ヶ月)');
   eq(r.json.workDays, 3, '期間内で出荷があった日数');
@@ -118,7 +189,7 @@ console.log('\n── 月別 (granularity=month) ──');
     '出荷月,モール,配送方法,件数,うちキャンセル,この組み合わせの出荷日数,1日あたり平均(この組み合わせ)',
     '月別CSVのヘッダ (画面の月合計とは分母が違うことが列名で分かる)');
   ok(lines.some(l => l.startsWith('2026-07,雑貨イズム楽天市場店,ヤマト(ネコポス),100,0,1,100')), '月別CSVの行 (平均つき)');
-  ok(lines.some(l => l.startsWith('2026-08,雑貨イズムAmazon店,AES,795,2,2,398')), '月にまたがる行が畳まれている');
+  ok(lines.some(l => l.startsWith('2026-08,雑貨イズムAmazon店,Amazon Easy Ship (AES),795,2,2,398')), '月にまたがる行が畳まれている');
 
   // 出荷が無い月も「月平均」の分母に入れる (データのある月だけで割ると平均が高く出る)
   const gap = await get('/api/volume?from=2026-05-01&to=2026-08-05&granularity=month');
@@ -179,7 +250,7 @@ console.log('\n── CSV の数式インジェクション対策 ──');
 
 console.log('\n── CSV ──');
 {
-  const r = await get('/api/volume.csv?from=2026-08-04&to=2026-08-05&mall=4&method=71');
+  const r = await get('/api/volume.csv?from=2026-08-04&to=2026-08-05&mall=4&method=g:64');
   eq(r.status, 200, 'HTTP 200');
   // fetch の text() は BOM を落とすのでバイト列で確認する (Excel が UTF-8 と判定するのに必要)
   const raw = new Uint8Array(await (await fetch(base + '/api/volume.csv?from=2026-08-04&to=2026-08-05')).arrayBuffer());
@@ -187,7 +258,7 @@ console.log('\n── CSV ──');
   ok(r.text.trim().startsWith('出荷日,モール,配送方法,件数,うちキャンセル'), 'ヘッダ行');
   const lines = r.text.trim().split('\r\n');
   eq(lines.length, 3, '絞り込みが CSV にも効く (ヘッダ + 2日分)');
-  ok(lines[1].includes('AES') && lines[1].includes('400'), '8/4 の AES 行');
+  ok(lines[1].includes('Amazon Easy Ship (AES)') && lines[1].includes('400'), '8/4 の Easy Ship 行');
 }
 
 // close を待たずに process.exit すると Windows の node が

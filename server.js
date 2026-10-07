@@ -29,6 +29,7 @@ import { startCompanyDbNightlyLoadCron } from './apps/company-db/nightly.mjs';
 import { startCompanyDbInventoryHourlyCron } from './apps/company-db/inventory-hourly.mjs';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
+import fbaUsRouter from './apps/fba-replenishment-us/router.js';
 import warehouseRouter from './apps/warehouse/router.js';
 import ordersLookupRouter from './apps/warehouse/orders-lookup-router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
@@ -64,6 +65,9 @@ import { startMediaWorker as startIrohaMediaWorker } from './apps/iroha-work/med
 import { startIrohaPrintQueueWorker } from './apps/iroha-work/print-worker.js';
 import { startNotifyOutbox as startFbaBoxNotifyOutbox } from './apps/fba-box/notify-outbox.js';
 import staffRouter from './apps/staff/router.js';
+import masterDecisionsRouter from './apps/master-decisions/router.mjs';
+import masterEditRouter from './apps/master-edit/router.mjs';
+import { legacyAckHeartbeat, maybeRefreshLegacyAck, legacyAckState, ackLegacyGatesStopped, legacyAckHost, markPreviousInstanceStopped } from './lib/master-legacy-gate.mjs';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 // 🆕 新商品のパッケージ裏面ラベル写真を Drive へ送るキュー (プロセス内2分間隔の再試行)
 import { startBackLabelWorker } from './apps/inbound-check/back-label.js';
@@ -106,15 +110,25 @@ import { neSyncControlRouter } from './apps/warehouse/ne-sync-control-router.js'
 import abaExtRouter from './apps/aba-keywords/router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
 import jobsMonitorRouter from './apps/jobs-monitor/router.js';
+import logizardImportStateRouter from './apps/logizard-import-state/router.js';
+import logizardImportAdminRouter, { adminApiGate as logizardImportAdminGate, adminPageGate as logizardImportAdminPageGate, renderAdminPage as renderLogizardImportAdminPage } from './apps/logizard-import-state/admin-router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 import shohyoLinksRouter from './apps/shohyo-links/router.js';
 import { startShohyoAttachCron } from './apps/shohyo-links/attach-job.js';
 import { apps, warehouseVariantDashboardApps } from './lib/portal-apps.js';
+import { sessionHasApp } from './lib/app-access.js';
 import { dashboardLocals, validateRegistry } from './lib/portal-dashboard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+// マスタの古い入口の門の記録 (ack。Company DB構想 14 §10 契約 v3 H1・PR #1565 R1 H2。表と書き手の関数は ⑤-1 の 0051)。Render = 'render' / miniPC (PORTAL_VARIANT=warehouse) = 'minipc'。
+// それ以外 (手元の PC) は書かない。起動のとき (下の listen) と、要求が来たついでに 5 分おきに書き直す (死活の確かめの要求でも回る。新しい定期実行は作らない)。
+// 中身 = build の番号・manifest_hash・持ち主表のハッシュ・見た段階・書きかけの件数。書く前に確かめる (段階を読める・build の番号・書く接続先・関数)。
+// だめなら書かずに理由をログと読み戻し (/apps/warehouse/api/master-legacy-gate) に出す
+const LEGACY_ACK_HOST = legacyAckHost();   // 読み戻しの API (apps/warehouse/router.js) と同じ判定
+if (LEGACY_ACK_HOST) app.use(legacyAckHeartbeat(LEGACY_ACK_HOST));
 const SQLiteStore = connectSqlite3(session);
 
 // --- 設定 ---
@@ -308,8 +322,17 @@ if (PERF_ON) {
 
 // Company DB の伝票 push (miniPC → Render) は x-sync-key の検査を**どの body parser よりも前**に置く (未認可の body を読まない。
 // app.use の prefix は routing と同じく大文字小文字を区別しない = 下の共通 parser の素通り判定と組で。Codex PR #1336 R1 #6)
-app.use(['/apps/company-db/sync/shipments', '/apps/company-db/sync/orders'], companyDbRequireSyncKey);
-app.use(express.urlencoded({ extended: true }));
+app.use(['/apps/company-db/sync/shipments', '/apps/company-db/sync/orders', '/apps/company-db/sync/order-finance', '/apps/company-db/sync/stock-daily', '/apps/company-db/sync/ad-spend', '/apps/company-db/sync/sku-cost-observed'], companyDbRequireSyncKey);   // order-finance = Amazon 財務 (0043・F2b-1。'/orders' の前方一致には入らない)
+// ロジザードの毎日の商品マスタの取込の状態 (マスタ正本切替 ③c-1b-1)。自動の ③ (miniPC) と手の ③ (Stream Deck の PC) が 1 つの状態と鍵を共用する。
+// Render だけ (miniPC に立てると状態が 2 つになる = jobs-monitor と同じ JOBS_MONITOR_ENABLED)。
+// **どの body parser (urlencoded・共通の JSON) よりも前に mount** = method・Content-Type によらず、Bearer LZ_LOCK_TOKEN の認証の前に本文を読まない (Codex #1513 R1 Medium)。
+if (process.env.JOBS_MONITOR_ENABLED === '1') {
+  app.use('/apps/logizard-import-state', logizardImportStateRouter);
+  console.log('[server] logizard-import-state mounted');
+}
+// フォームの parser も /apps/logizard-import-state (機械の口・画面の口) は読まない = どちらも認証の後にその口だけの parser で読む (画面の口 = ログイン・管理者・Origin の後。③c-1b-3b-4a)
+const urlencodedParser = express.urlencoded({ extended: true });
+app.use((req, res, next) => (String(req.path || '').toLowerCase().startsWith('/apps/logizard-import-state') ? next() : urlencodedParser(req, res, next)));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
 // 単純に全体 limit を上げると未認可リクエストのDoS面が広がるため、例外列挙方式を採る。
@@ -336,6 +359,14 @@ app.use((req, res, next) => {
     // /apps/company-db/sync/shipments (miniPC からの伝票 push) は x-sync-key の検査 (上の app.use、body parser より前) の後に router 側の 12MB parser が走る (mirror と同じ流儀)。
     // routing は大文字小文字を区別しないので、ここも小文字にそろえて比べる (Codex PR #1336 R1 #6)
     if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/shipments') || normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/orders')) return next();
+    // /apps/company-db/sync/order-finance (Amazon 財務の push。router 側の 12MB・圧縮なしの parser) も同じ (#1533 Codex R2)
+    if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/order-finance')) return next();
+    // /apps/company-db/sync/stock-daily (在庫の日次。router 側の 4MB parser) も同じ: 共通の 10MB parser が先に読むと、後段の 4MB の上限が効かない (Codex #1383 R1 #2)
+    if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/stock-daily')) return next();
+    // /apps/company-db/sync/ad-spend (広告費の日次。router 側の 4MB parser) も同じ
+    if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/ad-spend')) return next();
+    // /apps/company-db/sync/sku-cost-observed (観測の原価。D7b-2。router 側の 12MB・圧縮なしの parser) も同じ
+    if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/sku-cost-observed')) return next();
     // /apps/stock-bot は Chat Bearer 検証 (stockBotAuth) 後に専用 parser (256kb) が走る。
     // 認証前に body を読まない (未認可 DoS 面を閉じる)
     if (normalizedPath.startsWith('/apps/stock-bot')) return next();
@@ -350,6 +381,8 @@ app.use((req, res, next) => {
     // mgmt-accounting は mount 側で「認証ゲート → 50MB parser」の順に処理する (Excel seed 等の
     // 大容量投入があるため global 10MB を通すと mount 側 50MB が無効化される問題も同時に解消)。
     if (normalizedPath.startsWith('/apps/mgmt-accounting')) return next();
+    // /apps/logizard-import-state (ロジザードの取込の状態の口) は router 内で「Bearer LZ_LOCK_TOKEN → 64KB parser」の順 (認証前 body parse を避ける)
+    if (normalizedPath.toLowerCase().startsWith('/apps/logizard-import-state')) return next();
     // /aba-ext-api は router 内で「x-api-key 認証 → 64KB parser」の順に処理 (認証前 body parse を避ける)
     if (normalizedPath.startsWith('/aba-ext-api')) return next();
     // /apps/easy-ship/ext-api も同様に router 内で「x-api-key 認証 → 64KB parser」の順に処理
@@ -360,6 +393,10 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/select-set/ext-api')) return next();
     // /apps/select-set/master-api は miniPC が x-sync-key で取りに来るマスタ配信 (Render側で有効)
     if (normalizedPath.startsWith('/apps/select-set/master-api')) return next();
+    // /apps/master-decisions (マスタの判断) は mount 側で「requireAppAccess → router の Origin の守り → 512kb parser」の順に処理する (共通の 10MB が先に読むと router の上限が効かない・認証の前に本文を読む。Codex #1481 R1 Medium)
+    if (normalizedPath.toLowerCase().startsWith('/apps/master-decisions')) return next();
+    // /apps/master-edit (マスタの入力) も同じ: mount 側で「requireAppAccess → router の Origin の守り → 256kb parser」の順 (認証の前に本文を読まない)
+    if (normalizedPath.toLowerCase().startsWith('/apps/master-edit')) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -467,8 +504,8 @@ function requireAppAccess(appId) {
       rememberReturnTo(req);
       return res.redirect('/login');
     }
-    const allowed = req.session.allowedApps;
-    if (allowed === '*' || (Array.isArray(allowed) && allowed.includes(appId))) {
+    // 判定は lib/app-access.js (ほかのアプリの情報を見せる画面も同じ判定を使う)
+    if (sessionHasApp(req.session, appId)) {
       return next();
     }
     if (isApiRequest(req)) return res.status(403).json({ error: 'forbidden' });
@@ -635,6 +672,7 @@ app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profit
 // FBA納品 → 福山通運の伝票CSV: Chrome拡張向けAPI (x-api-key 認証・fail-closed) は
 // セッション認証付き本体より先に mount する
 app.use('/apps/fba-replenishment/ext-api', fbaTrackingExtRouter);
+app.use('/apps/fba-replenishment-us', requireAppAccess('fba-replenishment-us'), fbaUsRouter);
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 // 子会社向け公開印刷 (ログイン不要・トークン認可)。requireAppAccess の外側に置く。
 app.use('/print', fbaPublicPrintRouter);
@@ -888,6 +926,26 @@ app.use('/apps/iroha-work', express.json({ limit: '256kb' }), irohaWorkRouter);
 app.use('/apps/fba-box', express.json({ limit: '256kb' }), fbaBoxRouter);
 // スタッフマスタ (staff.db): 管理画面/API は router 内で管理者限定。/export だけトークン認証 (miniPC 同期用)
 app.use('/apps/staff', express.json({ limit: '256kb' }), staffRouter);
+// マスタの判断 (照合 ② の NE との差・D2')。Render だけ (env MASTER_DECISIONS_ENABLED=1)。miniPC は同じ server.js を動かすが載せない = Company DB に人が書く口を 1 つに。
+// 見る = 利用権 (requireAppAccess)。決める (承認・却下・取り消し) = router 内の名簿 MASTER_DECISION_APPROVERS (空なら誰も決められない)。/apps/company-db/sync (機械用) とは別の口
+// ロジザードの取込の状態の画面の口 (③c-1b-3b-4a・人がどの端末でもブラウザで使う手の取込など)。Render だけ (機械の口と同じ JOBS_MONITOR_ENABLED)。
+// ログイン + 管理者 (JSON の 401 / 403) → router の中で Origin → Content-Type → その口だけの parser。機械の口 (Bearer) は /api だけ = ここは通らない
+if (process.env.JOBS_MONITOR_ENABLED === '1') {
+  app.use('/apps/logizard-import-state/admin-api', logizardImportAdminGate, logizardImportAdminRouter);
+  app.get('/apps/logizard-import-state/admin', logizardImportAdminPageGate, renderLogizardImportAdminPage);   // 画面 + 手順 (③c-1b-3b-4b・管理者だけ = 門は admin-router.js)
+  console.log('[server] logizard-import-state admin-api mounted');
+}
+if (process.env.MASTER_DECISIONS_ENABLED === '1') {
+  app.use('/apps/master-decisions', requireAppAccess('master-decisions'), masterDecisionsRouter);
+  console.log('[server] master-decisions mounted');
+}
+// マスタの入力 (商品・セットを Company DB で直す・Company DB構想 14 ⑤-1)。Render だけ (env MASTER_EDIT_ENABLED=1 かつ PORTAL_VARIANT=render)。
+// 載せるだけでは見るだけ: 保存が開くのは 持ち主表 (config/master-ownership.mjs) が 'company' かつ env MASTER_EDIT_OPEN=1 のときだけ (router / lib/master-write.mjs)。
+// 見る = 利用権 (requireAppAccess)。保存 = router 内の名簿 MASTER_EDITORS (空なら誰も保存できない)
+if (process.env.MASTER_EDIT_ENABLED === '1' && PORTAL_VARIANT === 'render') {
+  app.use('/apps/master-edit', requireAppAccess('master-edit'), masterEditRouter);
+  console.log(`[server] master-edit mounted (保存 ${process.env.MASTER_EDIT_OPEN === '1' ? 'は開いている (持ち主表の company の列だけ)' : 'は閉じている = 見るだけ'})`);
+}
 // MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
 // limit 8mb = MF照合画面の証憑添付 (MFの上限5MBファイル → base64で約6.7MB) を受けるため
 app.use('/apps/shohyo-links', requireAppAccess('shohyo-links'), express.json({ limit: '8mb' }), shohyoLinksRouter);
@@ -1094,7 +1152,7 @@ app.post('/admin/users/reset-password', requireAdmin, (req, res) => {
 // --- 起動 ---
 bootNote('web', `server.js ロード完了 (Node ${process.version}, PORT=${PORT}, RENDER=${!!process.env.RENDER})`);
 bootStart('web', 'express-listen');
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   bootEnd('web', 'express-listen', `port=${PORT}`);
   console.log(`B-Faith Portal running at http://localhost:${PORT}`);
 
@@ -1131,6 +1189,17 @@ app.listen(PORT, () => {
   if (process.env.RENDER) {
     try { startMgmtAutoSyncScheduler(); }
     catch (e) { console.warn('[mgmt-auto-sync] scheduler 起動スキップ:', e.message); }
+  }
+
+  // マスタの古い入口の門の記録 (ack) を起動のときに書く (段階を legacy_open から進めるには、全部の場所・全部のプロセスの
+  // 新しい記録が要る = 確かめは ⑤-1 の DB の関数)。その後は要求が来たついでに 5 分おき (上の legacyAckHeartbeat)。起動は止めない
+  if (LEGACY_ACK_HOST) {
+    Promise.resolve(maybeRefreshLegacyAck({ host: LEGACY_ACK_HOST, force: true }))
+      .then(() => { const a = legacyAckState(); console.log(`[master-legacy-gate] ack ${LEGACY_ACK_HOST}: ${a.state}${a.detail ? ` (${a.detail})` : ''}`); })
+      // miniPC だけ: 前の起動のプロセスが「止めた」を書かずに消えていたら書く (前の pid がまだある = 書かない)
+      .then(() => (LEGACY_ACK_HOST === 'minipc' ? markPreviousInstanceStopped({ host: LEGACY_ACK_HOST }) : null))
+      .then((p) => { if (p) console.log(`[master-legacy-gate] 前の起動: ${p.state} (${p.detail})`); })
+      .catch((e) => console.warn('[master-legacy-gate] ack の誤り:', e && e.message));
   }
 
   // ミニPC warehouse死活監視
@@ -1207,15 +1276,25 @@ app.listen(PORT, () => {
   startCompanyDbInventoryHourlyCron();
 });
 
+// 止めるとき: マスタの古い入口の門の「止めた」を書いてから終わる (長くても 10 秒。書けなくても止まる = 次の起動 (miniPC) か人が master-legacy-instance.mjs で「止めた」を書ける)
+function stopLegacyGateThenExit(signal) {
+  if (!LEGACY_ACK_HOST) return process.exit(0);
+  // 受付を閉じる (新しい要求を受けない) → 書いている途中の門の記録と書きかけ (切符は止める) を待つ → 「止めた」を 1 回 (lib が順番を守る・長くても 10 秒。Render は 30 秒・WinSW は既定 15 秒待つ)
+  try { httpServer.close(); } catch { /* 閉じ済み */ }
+  ackLegacyGatesStopped({ host: LEGACY_ACK_HOST, reason: `${signal} で止めた`, timeoutMs: 10000 })
+    .then((r) => bootNote('web', `門の「止めた」: ${r.state}`))
+    .catch(() => {})
+    .finally(() => process.exit(0));
+}
 process.on('SIGTERM', () => {
   bootNote('web', 'SIGTERM受信 → shutdown');
   stopPythonBackend();
-  process.exit(0);
+  stopLegacyGateThenExit('SIGTERM');
 });
 process.on('SIGINT', () => {
   bootNote('web', 'SIGINT受信 → shutdown');
   stopPythonBackend();
-  process.exit(0);
+  stopLegacyGateThenExit('SIGINT');
 });
 process.on('exit', (code) => {
   bootNote('web', `process.exit code=${code}`);

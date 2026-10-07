@@ -35,12 +35,20 @@ if (!isDryRun && (!renderUrl || !syncKey)) {
   console.error('FATAL: RENDER_MIRROR_URL and MIRROR_SYNC_KEY required for non-dry-run'); process.exit(2);
 }
 
-// scope: monthsBack ヶ月前の月初 〜 当月月初 (JST)
+// scope: monthsBack ヶ月前の月初 〜 当月月初 (JST)。--from-month YYYY-MM があればその月から (daily-sync が月の手数料のやり残しまでさかのぼるとき・2026-09-29 F2b-2)
+const fromMonthArg = getArg('--from-month');
+if (fromMonthArg != null && !/^\d{4}-(0[1-9]|1[0-2])$/.test(fromMonthArg)) { console.error(`FATAL: --from-month は YYYY-MM: ${fromMonthArg}`); process.exit(2); }
 const nowJst = new Date(Date.now() + 9 * 3600 * 1000);
 const monthStarts = [];
-for (let i = monthsBack - 1; i >= 0; i--) {
-  const d = new Date(Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth() - i, 1));
-  monthStarts.push(d.toISOString().slice(0, 10));
+if (fromMonthArg) {
+  const end = Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth(), 1);
+  for (let d = new Date(`${fromMonthArg}-01T00:00:00Z`); d.getTime() <= end; d = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1))) monthStarts.push(d.toISOString().slice(0, 10));
+  if (!monthStarts.length) { console.error(`FATAL: --from-month ${fromMonthArg} が当月より先`); process.exit(2); }
+} else {
+  for (let i = monthsBack - 1; i >= 0; i--) {
+    const d = new Date(Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth() - i, 1));
+    monthStarts.push(d.toISOString().slice(0, 10));
+  }
 }
 const dateRange = { from: monthStarts[0], to: monthStarts[monthStarts.length - 1] };
 

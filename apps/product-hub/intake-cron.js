@@ -15,6 +15,7 @@
  */
 import cron from 'node-cron';
 import { syncNewProducts } from './services/new-product-intake.js';
+import { runLegacyJob } from '../../lib/master-legacy-gate.mjs';
 import { attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
 import { recordPing } from '../jobs-monitor/store.js';
 
@@ -26,6 +27,52 @@ function ping(status, note) {
 }
 
 const ON = new Set(['1', 'true', 'on', 'yes']);
+
+/**
+ * 1 回分の取込 (cron が呼ぶ。試験も呼ぶ)。切替で古い入口を閉じた後は丸ごと止める (下の門)
+ */
+export async function runProductHubIntake({ sync = syncNewProducts } = {}) {
+  try {
+    // 🚨 古い入口の門が閉じている (段階 frozen 以降で新しい登録の列が全部 C = owner_match 'all'・段階か持ち主が読めない) ときは取込を丸ごと止める = NE が先の新商品の作り方は古い入口
+    //    (legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る)。10/5 の 13 キーでは開いたまま)
+    //    (新商品は新しい登録の画面から Company DB 経由。Codex ⑤-2a M5)。閉じている = ok で「止めた」と残す (見張りを鳴らさない)・読めない = fail (鳴らす)
+    //    取込は門の共通の包み (runLegacyJob) の中 = 終わるまで書きかけに数える (門の記録の書きかけ・読み戻しの inflight.by_entry。Codex #1565 R2 Medium 2)
+    const job = await runLegacyJob('job:product-hub:intake-cron', () => sync({ actor: 'cron:ne-intake' }));
+    if (!job.ran) {
+      const gate = job.state;
+      // 広げる道 PR-6: 取込は NE の単品だけ = 単品の新しい登録の列 (skus.sku_kind を含む) が全部 C で閉じる (単品はポータルの「新商品の登録」へ)
+      const why = gate.readable ? `切替の段階 ${gate.phase}・単品の新しい登録の列が全部 Company DB = 古い新商品の取込は閉じている (単品は新商品の登録へ)` : `切替の段階か持ち主を読めない (${gate.error}) = 止める`;
+      console.log(`[product-hub] intake skipped: ${why}`);
+      ping(gate.readable ? 'ok' : 'fail', `skip: ${why}`.slice(0, 180));   // 読めない = 設定・つながりの誤り = 見張りを鳴らす
+      return;
+    }
+    const r = job.result;
+    if (!r.ok) {
+      console.warn(`[product-hub] intake skipped: ${r.error}`);
+      ping('fail', String(r.error).slice(0, 180));
+    } else if (r.mode === 'seed') {
+      console.log(`[product-hub] intake seeded: ${r.seeded} codes (初回カットオフ。ドラフトは作っていません)`);
+      ping('ok', `seed ${r.seeded}`);
+    } else {
+      console.log(`[product-hub] intake done: created=${r.created} merged=${r.merged}${r.capped ? ' (上限到達)' : ''}`);
+      ping('ok', `created=${r.created} merged=${r.merged}`);
+      // 新カードの画像フォルダ「商品コード_商品名」を裏で作る (単品のみ・fail-soft。
+      // 失敗しても取込は成功のまま = draft_events の drive_folder_failed で追える)。
+      // あわせて過去に失敗したまま URL 空の分も回収する (一時障害・権限付与前の失敗の自然回復)
+      const ids = (r.drafts || []).map((d) => d.id).filter(Boolean);
+      void attemptImageFolderCreationBatch(ids, { actor: 'cron:ne-intake' })
+        .then((s) => {
+          if (ids.length > 0) console.log(`[product-hub] 画像フォルダ一括作成(cron): created=${s.created} reused=${s.reused} skipped=${s.skipped} failed=${s.failed}`);
+          return retryFailedImageFolders({ actor: 'cron:ne-intake' });
+        })
+        .then((s) => { if (s.retried > 0) console.log(`[product-hub] 画像フォルダ再試行(cron): retried=${s.retried} created=${s.created} failed=${s.failed}`); })
+        .catch((e) => console.error('[product-hub] 画像フォルダ一括作成(cron)に失敗:', e.message));
+    }
+  } catch (e) {
+    console.error('[product-hub] intake failed:', e.message);
+    ping('fail', String(e.message).slice(0, 180));
+  }
+}
 
 export function startProductHubIntakeCron() {
   if (!ON.has(String(process.env.PH_INTAKE_CRON_ENABLED ?? '').trim().toLowerCase())) {
@@ -40,35 +87,7 @@ export function startProductHubIntakeCron() {
     console.error(`[product-hub] intake cron: 不正な cron 式 "${bad.join('", "')}" — 起動しません`);
     return;
   }
-  const run = () => {
-    try {
-      const r = syncNewProducts({ actor: 'cron:ne-intake' });
-      if (!r.ok) {
-        console.warn(`[product-hub] intake skipped: ${r.error}`);
-        ping('fail', String(r.error).slice(0, 180));
-      } else if (r.mode === 'seed') {
-        console.log(`[product-hub] intake seeded: ${r.seeded} codes (初回カットオフ。ドラフトは作っていません)`);
-        ping('ok', `seed ${r.seeded}`);
-      } else {
-        console.log(`[product-hub] intake done: created=${r.created} merged=${r.merged}${r.capped ? ' (上限到達)' : ''}`);
-        ping('ok', `created=${r.created} merged=${r.merged}`);
-        // 新カードの画像フォルダ「商品コード_商品名」を裏で作る (単品のみ・fail-soft。
-        // 失敗しても取込は成功のまま = draft_events の drive_folder_failed で追える)。
-        // あわせて過去に失敗したまま URL 空の分も回収する (一時障害・権限付与前の失敗の自然回復)
-        const ids = (r.drafts || []).map((d) => d.id).filter(Boolean);
-        void attemptImageFolderCreationBatch(ids, { actor: 'cron:ne-intake' })
-          .then((s) => {
-            if (ids.length > 0) console.log(`[product-hub] 画像フォルダ一括作成(cron): created=${s.created} reused=${s.reused} skipped=${s.skipped} failed=${s.failed}`);
-            return retryFailedImageFolders({ actor: 'cron:ne-intake' });
-          })
-          .then((s) => { if (s.retried > 0) console.log(`[product-hub] 画像フォルダ再試行(cron): retried=${s.retried} created=${s.created} failed=${s.failed}`); })
-          .catch((e) => console.error('[product-hub] 画像フォルダ一括作成(cron)に失敗:', e.message));
-      }
-    } catch (e) {
-      console.error('[product-hub] intake failed:', e.message);
-      ping('fail', String(e.message).slice(0, 180));
-    }
-  };
+  const run = runProductHubIntake;
   for (const expr of exprs) cron.schedule(expr, run, { timezone: 'Asia/Tokyo' });
   console.log(`[product-hub] intake cron: enabled (${exprs.join(' / ')} JST)`);
 }

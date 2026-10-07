@@ -16,6 +16,8 @@ import { createJob } from './job-manager.js';
 // --- 既存FBAモジュール ---
 import { fetchAllReports, normalizePlanningRow, normalizeRestockRow } from '../fba-replenishment/sp-api-reports.js';
 import { acquireFbaFetchLock, releaseFbaFetchLock } from './fba-fetch-lock.js';
+import { runFbaReportSnapshot, isBusinessDate, toJstDate } from './fba-report-snapshot.js';
+import { readLatestUsReports } from './fba-us-reports-store.js';
 import {
   createInboundPlan as spCreateInboundPlan,
   listShipments,
@@ -25,7 +27,9 @@ import {
 } from '../fba-replenishment/inbound-plans.js';
 import { syncInboundHistory } from '../fba-replenishment/inbound-history.js';
 import { syncSkuMappings } from '../fba-replenishment/sheets-sync.js';
+import { isSheetlessIoRequested, SHEET_SYNC_GONE_MESSAGE } from '../fba-replenishment/sheetless-mode.js';
 import { generateRecommendations } from '../fba-replenishment/calculation-engine.js';
+import { nextInboundCache } from '../fba-replenishment/inbound-state.js';
 
 // --- 商品管理リスト(PML) オンデマンドFBA更新 (Part2) ---
 import { getDB as getWarehouseDB } from './db.js';
@@ -33,6 +37,8 @@ import { acquireLock, releaseLock, heartbeatLock } from './job-locks.js';
 import { refreshFbaLive } from './refresh-fba-live.js';
 import { buildProductManagementSnapshot } from './build-product-management-snapshot.js';
 import { syncPmlSnapshotOnly } from './sync-to-render.js';
+import { runPmlFbaRefresh } from './pml-fba-refresh.js';
+import { readPublishGate } from './publish-gate.js';
 
 // db.jsは default export + named exports の混在なので動的importで対応
 let db;
@@ -111,7 +117,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
         // FNSKU 更新 (RESTOCK からも取れる)
         const fnskuRows = normalizedRestock
           .filter(r => r.fnsku && r.amazon_sku)
-          .map(r => ({ sku: r.amazon_sku, fnsku: r.fnsku }));
+          .map(r => ({ sku: r.amazon_sku, fnsku: r.fnsku, asin: r.asin || null }));   // asin は Sheet なしのモードのときだけ使う (⑦-F)
         if (fnskuRows.length > 0) db.updateFnskuBatch(fnskuRows);
       }
 
@@ -123,6 +129,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
         try {
           db.savePlanningData(normalized);
         } catch (e) {
+          if (db.isFbaDbConflict(e)) throw e;   // 保存の競合・読み直しは握りつぶさない (保存していないのに completed を返さない。Codex #1376 R2 #4)
           console.warn('[FBA-Service] savePlanningData failed (legacy):', e.message);
         }
         try {
@@ -132,13 +139,14 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
             console.warn('[FBA-Service] PLANNING 保存スキップ:', saveRes.reason, saveRes);
           }
         } catch (e) {
+          if (db.isFbaDbConflict(e)) throw e;
           console.warn('[FBA-Service] savePlanningLatest failed:', e.message);
         }
         planningCount = normalized.length;
         // PLANNING報告に含まれる全SKUについて現在のFNSKUを明示同期（nullなら明示的にクリア）
         const fnskuRows = results.planning
           .filter(r => r['sku'])
-          .map(r => ({ sku: r['sku'], fnsku: r['fnsku'] || null }));
+          .map(r => ({ sku: r['sku'], fnsku: r['fnsku'] || null, asin: r['asin'] || null }));   // asin は Sheet なしのモードのときだけ使う (⑦-F)
         if (fnskuRows.length > 0) db.syncFnskuBatch(fnskuRows);
       }
 
@@ -161,6 +169,60 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
 
   fetchReportsJobId = job.jobId;
   okResponse(res, job, 202);
+});
+
+// ==========================================
+// 日次スナップショット (朝の cron = snapshot-fba-stock.js から頼まれる)
+//   🚨 fba.db の書き手をこのプロセス 1 つにするための口 (経緯は fba-report-snapshot.js の先頭)。
+//   cron が自分で fba.db を開いて書くと、このプロセスの古いメモリが次の保存でそれを消す (本番で 9/18・9/19 が消えた)。
+//   中身は今までの cron と同じ (RESTOCK 先行 → PLANNING → US)。上の /fetch-reports (UI の手動取得) は変えていない。
+// ==========================================
+let snapshotReportsJobId = null;
+let snapshotReportsDate = null;   // 実行中のジョブの business_date (cron が「同じ日付のジョブなら、その終わりを待つ」ために返す)
+
+router.post('/snapshot-reports', rateLimitMiddleware('sp-api'), async (req, res) => {
+  const businessDate = (req.body && req.body.businessDate) || toJstDate(new Date());
+  if (!isBusinessDate(businessDate)) {
+    return errorResponse(res, { status: 400, error: 'BAD_BUSINESS_DATE', message: `businessDate は YYYY-MM-DD: ${businessDate}`, requestId: req.requestId });
+  }
+  if (snapshotReportsJobId) {
+    const { getJob } = await import('./job-manager.js');
+    const existing = getJob(snapshotReportsJobId);
+    if (existing && existing.status === 'running') {
+      return okResponse(res, { jobId: snapshotReportsJobId, businessDate: snapshotReportsDate, status: 'already_running', message: '日次スナップショットが既に実行中です' }, 202);
+    }
+    snapshotReportsJobId = null; snapshotReportsDate = null;
+  }
+  // プロセス跨ぎ: UI の手動取得・直接実行の cron と排他
+  const lock = acquireFbaFetchLock('cron-via-server');
+  if (!lock.acquired) {
+    // lock ファイルを作れなかった (権限・ディスク) は「実行中」ではない = 待っても直らないので失敗で返す
+    if (lock.holder && lock.holder.error) {
+      return errorResponse(res, { status: 500, error: 'FBA_FETCH_LOCK_ERROR', message: `レポート取得の lock を作れない: ${lock.holder.error}`, requestId: req.requestId });
+    }
+    // UI の手動取得など。jobId は返さない = cron は終わるのを待って頼み直す (手動取得は日次の在庫の区分を書かないので、相乗りさせない)
+    return okResponse(res, { status: 'already_running', message: '別のレポート取得が実行中です', holder: lock.holder }, 202);
+  }
+  const job = createJob('fba-snapshot-reports', async (updateProgress) => {
+    try {
+      updateProgress({ step: 'fetching', message: `SP-API レポートを取得中 (business_date=${businessDate})` });
+      const db = await getDb();
+      const log = (...a) => { console.log(...a); updateProgress({ step: String(a[0]).slice(0, 160) }); };
+      // FBA 補充 B1: レポートの前後に納品プラン・出荷便の状態を記録 (記録だけ。失敗しても日次処理は止めない)
+      const inboundCapture = async (phase, ctx) => {
+        const [{ captureInboundPhase }, { callInboundApi }] = await Promise.all([import('./inbound-baseline.js'), import('../fba-replenishment/inbound-history.js')]);
+        // 日次の枠 (14 分) を食わない: 全体の締め切り S0 4 分・S1 3 分、空プランの確かめは S0 150 秒・S1 60 秒まで
+        const snapshotOpts = phase === 'S0' ? { deadlineMs: 240000, budgetMs: 150000 } : { deadlineMs: 180000, budgetMs: 60000 };
+        return captureInboundPhase(phase, { ...ctx, call: callInboundApi, snapshotOpts });
+      };
+      return await runFbaReportSnapshot({ db, businessDate, log, inboundCapture });
+    } finally {
+      snapshotReportsJobId = null; snapshotReportsDate = null;
+      releaseFbaFetchLock(lock);
+    }
+  });
+  snapshotReportsJobId = job.jobId; snapshotReportsDate = businessDate;
+  okResponse(res, { ...job, businessDate }, 202);
 });
 
 // ==========================================
@@ -196,27 +258,9 @@ router.post('/pml/fba-refresh', rateLimitMiddleware('sp-api'), async (req, res) 
     job = createJob('pml-fba-refresh', async (updateProgress) => {
       const hb = setInterval(() => { try { heartbeatLock(wdb, lock); } catch {} }, 60 * 1000);
       try {
-        updateProgress({ step: 'fetch-restock', message: 'AmazonからRESTOCK在庫を取得中…(数分かかります)' });
-        const live = await refreshFbaLive();
-
-        updateProgress({ step: 'build', message: `スナップショット再生成中 (FBA ${live.row_count}件)…` });
-        const built = await buildProductManagementSnapshot({ fbaSource: 'live' });
-        if (!built.ok) {
-          throw new Error(`snapshot生成に失敗 (status=${built.status}): ${(built.reasons || []).join('; ')}`);
-        }
-
-        updateProgress({ step: 'sync', message: 'Renderへ反映中…' });
-        const synced = await syncPmlSnapshotOnly();
-        if (synced.state !== 'sent') {
-          throw new Error(`Render同期に失敗/スキップ: ${synced.reason || synced.state}`);
-        }
-
-        return {
-          fba_fetched_at: live.fetched_at,
-          fba_row_count: live.row_count,
-          pml_run_id: built.run_id,
-          synced_count: synced.count,
-        };
+        // Company DB の写しの反映が世代と違う朝は作らない・送らない (daily-sync・再試行と同じ証跡 = publish-gate.js。#1564 の見直し M-2)
+        return await runPmlFbaRefresh({ updateProgress, refresh: refreshFbaLive, build: buildProductManagementSnapshot, sync: syncPmlSnapshotOnly,
+          gate: () => readPublishGate({ db: wdb }) });
       } finally {
         clearInterval(hb);
         releaseLock(wdb, lock);
@@ -342,6 +386,8 @@ router.get('/sku-mappings', dbHandler(async (req, res, db) => {
 }));
 
 router.post('/sync-sku-mappings', async (req, res) => {
+  // Sheet なしのモード (⑦-F): 手の Sheet 同期の口は止める。miniPC は計算をしないので FBA_SHEETLESS_IO=1 で止める (Codex PR R1 Medium 1)
+  if (isSheetlessIoRequested()) return errorResponse(res, { status: 410, error: 'SHEETLESS_MODE', message: SHEET_SYNC_GONE_MESSAGE, requestId: req.requestId });
   try {
     const result = await syncSkuMappings();
     okResponse(res, { result });
@@ -390,13 +436,14 @@ router.post('/warehouse/upload', dbHandler(async (req, res, db) => {
 // 推奨リスト（同期 + SP-APIキャッシュ）
 // ==========================================
 
-let inboundCache = { data: null, at: 0 };
+let inboundCache = { data: null, at: 0, startedAt: 0 };
 const CACHE_TTL = 10 * 60 * 1000;
 
 async function getCachedInbound() {
   if (inboundCache.data && (Date.now() - inboundCache.at) < CACHE_TTL) return inboundCache.data;
+  const startedAt = Date.now();
   const data = await fetchActiveInboundQuantities();
-  inboundCache = { data, at: Date.now() };
+  inboundCache = nextInboundCache(inboundCache, { data, at: Date.now(), startedAt });
   return data;
 }
 
@@ -425,9 +472,13 @@ router.get('/recommendations/:sku', async (req, res) => {
 
 router.post('/refresh-inbound-working', rateLimitMiddleware('sp-api'), async (req, res) => {
   try {
+    const startedAt = Date.now();
     const data = await fetchActiveInboundQuantities();
-    inboundCache = { data, at: Date.now() };
-    okResponse(res, { count: Object.keys(data).length });
+    const fetchedAt = Date.now();
+    // 🚨 先に始まった取得が後から終わっても、新しい中身を古い中身で上書きしない (Codex PR #1455 R1 High)
+    inboundCache = nextInboundCache(inboundCache, { data, at: fetchedAt, startedAt });
+    // この取り直しで取った中身そのものも返す (共有キャッシュを読み直すと、ほかの取り直しと混ざりうる)
+    okResponse(res, { count: Object.keys(data).length, data, fetchedAt, startedAt });
   } catch (e) {
     errorResponse(res, { status: 500, error: 'SP_API_ERROR', message: e.message, requestId: req.requestId });
   }
@@ -446,13 +497,34 @@ router.get('/recommendations-inbound-cache', async (req, res) => {
 
 // ミニPC→Render 同期用: 最新日付のPLANNINGスナップショットとFNSKU一覧（全SKU、null含む）を返す
 router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
+  // Sheet なしのモードの Render は ?fnsku_source=attrs で頼む (⑦-F): FNSKU は fba_sku_attrs からだけ返す (sku_mapping の値を渡さない)。
+  //   🚨 miniPC が Sheet の入出力を止めている (FBA_SHEETLESS_IO) ときは、頼み方に関わらず fba_sku_attrs から返す
+  //      (sku_mapping はもう FNSKU を書かない = 凍結。古い Render が ? を付けずに頼んでも古い FNSKU を渡さない。Codex PR R3 Medium 1)
+  //   どちらでもなければ今までどおり
+  const ioOn = isSheetlessIoRequested();
+  const fromAttrs = req.query?.fnsku_source === 'attrs' || ioOn;
+  // miniPC の fba.db に一回限りの移行の印が無い = 起動のたびに Sheet の値が fba_sku_attrs に入る / 最後の backfill が済んでいない
+  //   → fba_sku_attrs をまだ正にできない (fnsku_ready: false。Render は反映しない・9:40 は partial。Codex PR R2 Medium 1)
+  const attrsReady = fromAttrs ? !!db.getBackfillMark() : null;
+  // 🚨 入出力を止めたのに印が無い = fba_sku_attrs が欠けているかもしれない → どの Render にも FNSKU を渡さない (503 = 引き取りそのものが失敗)
+  if (ioOn && !attrsReady) {
+    errorResponse(res, { status: 503, error: 'FBA_SHEETLESS_NOT_READY', message: 'miniPC は FBA_SHEETLESS_IO=1 だが fba.db に一回限りの移行の印が無い。scripts/fba-sheetless-backfill-once.mjs を IO を外して流してから入れ直す', requestId: req.requestId });
+    return undefined;
+  }
   const rows = db.getLatestSnapshots();
   const snapshotDate = rows[0]?.snapshot_date || null;
-  const mappings = db.getSkuMappings();
+  // fba_sku_attrs から返すときは、大小文字・前後の空白だけ違う SKU を 1 行にまとめる。FNSKU が食い違えば渡さない (503。Codex PR R4 Medium)
+  const attrsSync = fromAttrs ? db.getFbaSkuAttrsForSync() : null;
+  if (attrsSync && attrsSync.conflicts.length) {
+    errorResponse(res, { status: 503, error: 'FBA_SKU_ATTRS_CONFLICT', message: `fba_sku_attrs に大小文字だけ違う SKU で FNSKU が食い違う組が ${attrsSync.conflicts.length} 組ある: ${attrsSync.conflicts.slice(0, 10).map((c) => c.rows.join(' ≠ ')).join(' | ')}。scripts/fba-sheetless-backfill-once.mjs の説明の手順 (b) で 1 行にする (印は消さない・スクリプトは流さない)`, requestId: req.requestId });
+    return undefined;
+  }
   // 全SKU対象（fnsku=nullも含む）。Render側で現状に合わせてupsert（null時はクリア）
-  const fnskus = mappings
-    .filter(m => m.amazon_sku)
-    .map(m => ({ sku: m.amazon_sku, fnsku: m.fnsku || null }));
+  const fnskus = fromAttrs
+    ? attrsSync.rows.map(a => ({ sku: a.amazon_sku, fnsku: a.fnsku || null }))
+    : db.getSkuMappings()
+      .filter(m => m.amazon_sku)
+      .map(m => ({ sku: m.amazon_sku, fnsku: m.fnsku || null }));
   // RESTOCK / PLANNING_LATEST も同送 (Render側で saveRestockLatest / savePlanningLatest される)
   const restockRows = typeof db.getRestockLatest === 'function' ? db.getRestockLatest() : [];
   const planningLatestRows = typeof db.getPlanningLatest === 'function' ? db.getPlanningLatest() : [];
@@ -462,8 +534,22 @@ router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
     fnskus,
     restock_rows: restockRows,
     planning_latest_rows: planningLatestRows,
+    ...(fromAttrs ? {
+      fnsku_source: 'fba_sku_attrs', fnsku_ready: attrsReady,
+      ...(attrsReady ? {} : { fnsku_not_ready_reason: 'miniPC の fba.db に一回限りの移行の印が無い (scripts/fba-sheetless-backfill-once.mjs を流してから FBA_SHEETLESS_IO=1)' }),
+    } : {}),
   };
 }));
+
+// 米国FBA納品アプリ (Render /apps/fba-replenishment-us) 用: 毎朝取った米国の RESTOCK / PLANNING を取れたままの行で返す。
+// fba.db は読まない (DATA_DIR/fba-us-reports/ の JSON だけ)。最後の取得が失敗していれば last_attempt に出る
+router.get('/us/reports/latest', (req, res) => {
+  try {
+    okResponse(res, readLatestUsReports());
+  } catch (e) {
+    errorResponse(res, { status: 500, error: 'US_REPORTS_READ_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
 
 // ==========================================
 // 納品プラン（ジョブ化）

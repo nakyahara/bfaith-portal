@@ -12,7 +12,7 @@
  *     node apps/warehouse/run-yahoo-finance-dq.js --month 2026-04
  *
  * 8 つの DQ check (severity / threshold):
- *   1. row_count_drift               (error: rows = 0)
+ *   1. row_count_drift               (error: rows = 0。当月の月初の 0 行は条件つきで warn = finance-dq-month-mode.js の decideMonthStartEmpty)
  *   2. listing_diff_pct              (warn 1% / error 5%、当月は warn 5% / error 15%)
  *   3. missing_cost_rate_pct         (warn 5% / error 10%)
  *   4. shipping_missing_rate_pct     (warn 5% / error 10%)
@@ -37,7 +37,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import { monthMode, pickThresholds, modeLabel } from './finance-dq-month-mode.js';
+import { monthMode, pickThresholds, modeLabel, decideMonthStartEmpty, monthStartEmptyNote, MONTH_ROW_COUNT_CHECK, monthRowCountDetails, prepareMonthHighWater, applyMonthStartSkip, resolveDqNow, monthStartRamp, monthStartRampWindow, recentListingJpy, applyMonthStartRamp, monthStartRampNote, monthStartRampOlder, listingOlderPart, whitelistOlderPart, NO_LISTING_RAMP_FLAG } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -65,6 +65,14 @@ if (!fs.existsSync(dbPath)) {
 }
 
 const checkedAt = new Date().toISOString();
+// 月の判定の「今」(試験だけ: env FINANCE_DQ_ALLOW_NOW=1 のときだけ --now を受ける。daily-sync は渡さない)
+let now;
+try { now = resolveDqNow(getArg('--now')); }
+catch (e) { console.error(`FATAL: ${e.message}`); process.exit(2); }
+// daily-sync はこの回のモールの取込が ❌ のとき --no-month-start-grace を付ける (= 当月 0 行は猶予なしで CRITICAL)
+const noMonthStartGrace = args.includes('--no-month-start-grace');
+// daily-sync はこの回の f_sales の再構築か、listing の元の NE の取込が ❌ のとき --no-listing-ramp を付ける (= listing_diff_pct の月初の立ち上がりを使わない。比べる相手が古い。R2 Medium)
+const noListingRamp = args.includes(NO_LISTING_RAMP_FLAG);
 
 
 const THRESHOLDS_PAST_MONTH = {
@@ -89,17 +97,25 @@ const THRESHOLDS_CURRENT_MONTH = {
 
 // 月の判定は共通ヘルパー (当月 / 前月+月初14日以内 / 過去)。前月の月初は出荷完了への遷移ラグで
 // coverage が構造的に低いので whitelist_coverage_pct だけ当月閾値を使う (Qoo10 2026-08 の再発防止と同型)
-const mode = monthMode(monthStr);
+const mode = monthMode(monthStr, { now });
 const isCurMonth = mode === 'current';
 const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST_MONTH, THRESHOLDS_CURRENT_MONTH);
+// 月初の立ち上がり (finance-dq-month-mode.js の applyMonthStartRamp): 当月の 7 日目までは listing_diff_pct・whitelist_coverage_pct の error を、
+// 「足りない向き」かつ「直近 2 日 + 今日より前に error 級の差が無い (ふだんのしきい値で error でない = warn は通す)」かつ「足りない分 ≤ 直近の受注」の
+// ときだけ ⚠️ に下げる (出荷待ちの差。6〜10 月の毎月 2〜3・6 日に ❌ だった)
+const ramp = monthStartRamp('yahoo', monthStr, { now, noGrace: noMonthStartGrace, noListingRamp });
+const rampedChecks = [];
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 
 const issues = [];
 let hasError = false;
+// 月初の猶予で通すときの判定 (null = 猶予なし)。猶予の中は SKIP_IN_MONTH_START_GRACE の検査を info に落とす (applyMonthStartSkip)
+let monthStartGrace = null;
 
 function recordResult(checkName, severity, actualValue, thresholdValue, details = null) {
+  ({ severity, details } = applyMonthStartSkip(monthStartGrace, checkName, severity, details));
   db.prepare(`
     INSERT OR REPLACE INTO dq_run_results
       (run_id, check_name, severity, actual_value, threshold_value, details_json, checked_at)
@@ -116,6 +132,10 @@ if (isCurMonth) {
   console.log(`  ℹ️  当月モード: listing_diff_pct warn ${THRESHOLDS.listing_diff_pct.warn}%/error ${THRESHOLDS.listing_diff_pct.error}% に緩和`);
 }
 
+// 月初の猶予の印 (PR #1572 R2): dq_run_results の DELETE より前に、mall・月ごとの消えない印 (dq_month_high_water) を付ける。
+// 一度 0 でなくなった月は、同じ run_id で流し直しても印が残る (前の記録は初回だけ移す)
+prepareMonthHighWater(db, { mall: 'yahoo', ym: monthStr, at: checkedAt,
+  count: db.prepare("SELECT COUNT(*) AS c FROM f_yahoo_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?").get(monthStr).c });
 db.prepare(`DELETE FROM dq_run_results WHERE run_id = ?`).run(runId);
 
 // ============================================================
@@ -126,18 +146,25 @@ const dailyCount = db.prepare(`
   WHERE substr(date_jst, 1, 7) = ?
 `).get(monthStr).c;
 
-recordResult(
-  'row_count_drift',
-  dailyCount === 0 ? 'error' : 'info',
-  dailyCount, 0,
-  { daily_row_count: dailyCount }
-);
-
+recordResult(MONTH_ROW_COUNT_CHECK, 'info', dailyCount, null, monthRowCountDetails('yahoo', monthStr, dailyCount));
 if (dailyCount === 0) {
-  console.error(`  ⚠️  CRITICAL: f_yahoo_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
-  printSummary();
-  process.exit(1);
+  // 月初の猶予 (finance-dq-month-mode.js の decideMonthStartEmpty): 当月・月初の日数の中・この月が一度も 0 でなくなっていない・
+  // 前月の終わりまで新しい・daily-sync が禁じていない、を全部満たすときだけ ⚠️ 警告で続ける。早く終わらずに残りの検査も流す
+  // (行数で比べる検査 = SKIP_IN_MONTH_START_GRACE だけ info に落とす。raw・全期間・原価の検査はそのまま)
+  const g = decideMonthStartEmpty(db, { mall: 'yahoo', ym: monthStr, now, noGrace: noMonthStartGrace });
+  if (g.grace) {
+    monthStartGrace = g;
+    recordResult('row_count_drift', 'warn', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace: true, jst_day: g.calendar.dayOfMonth, grace_days: g.graceDays, prev_month_max_date: g.prev?.maxDate ?? null });
+    console.log(`  ${monthStartEmptyNote('f_yahoo_finance_sku_daily_v1', monthStr, g)}`);
+  } else {
+    recordResult('row_count_drift', 'error', dailyCount, 0, { daily_row_count: dailyCount, month_start_grace_denied: g.reasons });
+    console.error(`  ⚠️ CRITICAL: f_yahoo_finance_sku_daily_v1 に ${monthStr} のデータが 0 行`);
+    if (g.calendar.mode === 'current') console.error(`  → 月初の猶予を使わない理由: ${g.reasons.join(' / ')}`);
+    printSummary();
+    process.exit(1);
+  }
 }
+if (dailyCount > 0) recordResult('row_count_drift', 'info', dailyCount, 0, { daily_row_count: dailyCount });
 
 // ============================================================
 // Check 2: listing_diff_pct (estimated vs listing 突合)
@@ -162,13 +189,16 @@ try {
 if (listingAvailable) {
   const totalDiff = Math.abs(dailyTotal - listingTotal);
   const totalDiffPct = listingTotal !== 0 ? (totalDiff / Math.abs(listingTotal)) * 100 : 0;
-  recordResult(
-    'listing_diff_pct',
-    totalDiffPct > THRESHOLDS.listing_diff_pct.error ? 'error' :
-      totalDiffPct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info',
-    totalDiffPct, THRESHOLDS.listing_diff_pct.error,
-    { daily_listing_estimated_jpy: dailyTotal, listing_total_jpy: listingTotal, diff_jpy: dailyTotal - listingTotal }
-  );
+  const listingSeverity = (pct) => (pct > THRESHOLDS.listing_diff_pct.error ? 'error' : pct > THRESHOLDS.listing_diff_pct.warn ? 'warn' : 'info');
+  const lw = monthStartRampWindow(ramp, 'listing_diff_pct');
+  const ld = applyMonthStartRamp(monthStartGrace ? null : ramp, 'listing_diff_pct', listingSeverity(totalDiffPct),
+    { daily_listing_estimated_jpy: dailyTotal, listing_total_jpy: listingTotal, diff_jpy: dailyTotal - listingTotal },
+    { shortfall: listingTotal - dailyTotal, explainedBy: recentListingJpy(db, 'yahoo', lw),
+      // 窓より前の古い部分 (月の 1 日〜窓の前の日) の listing と fact を、同じしきい値で比べる
+      older: monthStartRampOlder(lw, (from, to) => listingOlderPart(recentListingJpy(db, 'yahoo', { from, to }),
+        Number(db.prepare('SELECT SUM(listing_sales_estimated_jpy_incl) AS p FROM f_yahoo_finance_sku_daily_v1 WHERE date_jst BETWEEN ? AND ?').get(from, to)?.p || 0), listingSeverity)) });
+  if (ld.ramped) rampedChecks.push({ checkName: 'listing_diff_pct', value: totalDiffPct });
+  recordResult('listing_diff_pct', ld.severity, totalDiffPct, THRESHOLDS.listing_diff_pct.error, ld.details);
 } else {
   recordResult('listing_diff_pct', 'info', null, THRESHOLDS.listing_diff_pct.error, { skipped: true });
 }
@@ -252,14 +282,18 @@ const whitelistCheck = db.prepare(`
 `).get(monthStr, monthStr);
 
 const wlPct = whitelistCheck.pct || 0;
+// 月初の立ち上がりの ③: whitelist に入っていない行の数 ≤ 直近 2 日 + 今日の受注の行の数
+const wlWin = monthStartRampWindow(ramp, 'whitelist_coverage_pct');
+const wlRecent = wlWin ? db.prepare("SELECT COUNT(*) AS c FROM raw_yahoo_orders WHERE substr(order_time, 1, 10) BETWEEN ? AND ?").get(wlWin.from, wlWin.to).c : null;
 // 下限閾値: warn < 95%、error < 90% (低い方が NG なので比較反転)
-recordResult(
-  'whitelist_coverage_pct',
-  wlPct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' :
-    wlPct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info',
-  wlPct, THRESHOLDS.whitelist_coverage_pct.warn,
-  { total_lines: whitelistCheck.total, whitelist_lines: whitelistCheck.wl }
-);
+const wlSeverity = (pct) => (pct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : pct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info');
+const wl = applyMonthStartRamp(monthStartGrace ? null : ramp, 'whitelist_coverage_pct', wlSeverity(wlPct),
+  { total_lines: whitelistCheck.total, whitelist_lines: whitelistCheck.wl },
+  { shortfall: (whitelistCheck.total || 0) - (whitelistCheck.wl || 0), explainedBy: wlRecent,
+    // 窓より前の古い部分: その期間の受注のうち whitelist に入った割合を、同じしきい値で判定 (古い注文が止まっていれば ❌ のまま)
+    older: monthStartRampOlder(wlWin, (from, to) => { const o = db.prepare("SELECT COUNT(*) AS t, COALESCE(SUM(order_status = '5' AND pay_status = '1' AND ship_status = '3'), 0) AS w FROM raw_yahoo_orders WHERE substr(order_time, 1, 10) BETWEEN ? AND ?").get(from, to); return whitelistOlderPart(o.t, o.w, wlSeverity); }) });
+if (wl.ramped) rampedChecks.push({ checkName: 'whitelist_coverage_pct', value: wlPct });
+recordResult('whitelist_coverage_pct', wl.severity, wlPct, THRESHOLDS.whitelist_coverage_pct.warn, wl.details);
 
 // ============================================================
 // Check 7: resolved_but_zero_cost_count (Phase 1.3)
@@ -343,6 +377,9 @@ function printSummary() {
 }
 
 printSummary();
-
+// 月初の猶予で通した回は、最後の行を「⚠️ 月初の猶予: …」にする (daily-sync はこの行を要約に出し、warn を立てて見出しを ⚠️ にする)
+if (monthStartGrace && !hasError) console.log(monthStartEmptyNote('f_yahoo_finance_sku_daily_v1', monthStr, monthStartGrace));
+// 月初の立ち上がりで下げた回も、最後の行を「⚠️ 月初の立ち上がり: …」にする (daily-sync は見出しを ⚠️ にする)
+else if (rampedChecks.length > 0 && !hasError) console.log(monthStartRampNote(ramp, rampedChecks));
 db.close();
 process.exit(hasError ? 1 : 0);

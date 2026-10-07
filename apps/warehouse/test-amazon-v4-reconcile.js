@@ -1,0 +1,153 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
+/**
+ * test-amazon-v4-reconcile.js — 日次の財務と v4 の突き合わせ (amazon-finance-v4-reconcile.js・2026-09-29) の試験
+ *
+ *   決まりの違い (原価・ポイント・送料の税・返品の管理手数料・返金の範囲) を引くと、残りは 0 円になる
+ *   (本番 1〜9 月も 0 円)。照合の関所 (run-amazon-finance-dq.js) は その残りで「月の合計の差」「説明できない残り」を判定する
+ *   期待値は手で計算した値
+ *
+ * 実行: node apps/warehouse/test-amazon-v4-reconcile.js (daily-sync 冒頭でも実行)。本番 DB には触れない (一時 DATA_DIR)
+ */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amazon-v4-reconcile-test-'));
+process.env.DATA_DIR = tmpDir;
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const { initDB, getDB } = await import('./db.js');
+const { backfillDocumentVersions } = await import('./amazon-settlement-versions.js');   // 直接入れた行に文書の版を付ける (build は版の無い行があれば止まる)
+const { reconcileMonthly, reconcileSkuTop } = await import('./amazon-finance-v4-reconcile.js');
+
+let failed = 0;
+const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
+await initDB();
+const db = getDB();
+const nowJst = new Date(Date.now() + 9 * 3600 * 1000);
+const YM = `${nowJst.getUTCFullYear()}-${String(nowJst.getUTCMonth() + 1).padStart(2, '0')}`, YMI = Number(YM.replace('-', ''));
+let n = 0;
+const line = (o) => {
+  const day = o.day ?? '05', sku = o.sku ?? 'SKU-B';
+  db.prepare(`INSERT INTO raw_amazon_settlement_lines (
+    physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version, source_settlement_id,
+    posted_date_utc, posted_datetime_jst, economic_date, year_month_int, amazon_order_id, seller_sku, seller_sku_normalized, transaction_type,
+    quantity_purchased, price_type, price_amount_micro, item_related_fee_type, item_related_fee_amount_micro, promotion_type, promotion_amount_micro, other_amount_micro, currency, ingest_run_id, observed_at, ingested_at)
+  VALUES (?, ?, 'D1', 'h', 'p', ?, 'sp_api_v2', 'v2.0.0', 'S1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'JPY', 'r', 'o', '2026-01-01 00:00:00')`)
+  .run(`ph-${++n}`, `k-${n}`, n, `${YM}-${day}T01:00:00+00:00`, `${YM}-${day} 10:00:00`, `${YM}-${day}`, YMI,
+    o.order === undefined ? 'O2' : o.order, sku, sku.toLowerCase(), o.tt ?? 'Order',
+    o.qty ?? null, o.pt ?? null, o.pa == null ? null : o.pa * 1e6, o.ft ?? null, o.fa == null ? null : o.fa * 1e6, o.prt ?? null, o.pra == null ? null : o.pra * 1e6,
+    o.oa == null ? null : o.oa * 1e6);
+};
+// 2 個売って (送料の税 30・ポイント 20)、1 個は返品 (返品の管理手数料 −22・送料の返金 −300・返品の手数料 +50)、1 個はカードの支払い取り消し
+line({ qty: 2 });
+line({ pt: 'Principal', pa: 2000 }); line({ pt: 'Tax', pa: 200 }); line({ pt: 'Shipping', pa: 300 }); line({ pt: 'ShippingTax', pa: 30 });
+line({ ft: 'Commission', fa: -220 }); line({ ft: 'FBAPerUnitFulfillmentFee', fa: -660 }); line({ ft: 'ShippingChargeback', fa: -330 }); line({ ft: 'PointsGranted', fa: -20 });
+line({ prt: 'Shipping', pra: -300 }); line({ prt: 'TaxDiscount', pra: -30 });
+const R = { tt: 'Refund', day: '10' };
+line({ ...R, pt: 'Principal', pa: -1000 }); line({ ...R, pt: 'Tax', pa: -100 }); line({ ...R, pt: 'Shipping', pa: -300 }); line({ ...R, pt: 'RestockingFee', pa: 50 });
+line({ ...R, ft: 'Commission', fa: 110 }); line({ ...R, ft: 'RefundCommission', fa: -22 }); line({ ...R, ft: 'ShippingChargeback', fa: 330 });
+// 原価の登録が無い SKU (原価未登録 = missing_cost・利益 500)。関所の cost_late_binding は金額を数えず診断額だけ残す (Codex #1531 R2)
+line({ sku: 'SKU-M', order: 'O9', qty: 1 }); line({ sku: 'SKU-M', order: 'O9', pt: 'Principal', pa: 500 });
+line({ ...R, prt: 'Shipping', pra: 300 }); line({ ...R, prt: 'TaxDiscount', pra: 30 });
+const C = { tt: 'Chargeback Refund', day: '12' };
+line({ ...C, pt: 'Principal', pa: -1000 }); line({ ...C, pt: 'Tax', pa: -100 });
+line({ ...C, ft: 'Commission', fa: 110 }); line({ ...C, ft: 'RefundCommission', fa: -22 });
+// 🆕 2026-09-30 (D-63): 日次だけが利益に入れる SAFE-T の補てん (取引の種類 Other + price_type) +634 と 補てんの取り消し −120 (v4 は入れない = 決まりの違い ⑥ ⑦)
+//   SKU のある納品不備 −200 (日次の財務から外した・利益には前から入っていない)・納品不備だけの SKU (SKU-I = 日次に行が無い・v4 には 0 円の行)
+line({ tt: 'Other', pt: 'SAFE-T Reimbursement', oa: 634, day: '15' }); line({ tt: 'PAYMENT_RETRACTION_ITEMS', oa: -120, day: '15' });
+line({ tt: 'Inbound Defect Fee - Missing label', oa: -200, day: '16', order: null });
+line({ sku: 'SKU-I', tt: 'Inbound Defect Fee - Barcode cannot be scanned', oa: -90, day: '17', order: null });
+// 納品不備 + BuyerRecharge だけの SKU (SKU-J) も日次に行が無い = v4 の側でも数えない (日次の silver の除外の条件と全部そろえる・Codex #1551 R1 M1)
+line({ sku: 'SKU-J', tt: 'Inbound Defect Fee - Missing label', oa: -70, day: '18', order: null }); line({ sku: 'SKU-J', tt: 'BuyerRecharge', oa: 40, day: '18', order: null });
+db.prepare(`INSERT INTO m_products (商品コード, 商品名, 商品区分, 原価状態, 原価, updated_at) VALUES ('sku-b', 'B', '単品', 'ok', 400, 't')`).run();
+// v4 は SKU 別の広告費の表を参照する (本番は広告の取込が作る・ここでは空の表だけ)
+db.exec(`CREATE TABLE IF NOT EXISTS fact_ad_spend (日付 TEXT, モール TEXT, ターゲット粒度 TEXT, ターゲット TEXT, 広告費 REAL, 広告経由売上 REAL)`);
+
+const runNode = (args) => (backfillDocumentVersions(db), execFileSync)(process.execPath, args, { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+runNode(['apps/warehouse/rebuild-amazon-settlement-mart.js', '--ym', String(YMI)]);
+runNode(['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM]);
+
+const r = reconcileMonthly(db, { month: YM })[0];
+ok(!!r, `月の行がある (${JSON.stringify(r && { d: r.profit_d, v4: r.profit_v4 })})`);
+// 手で計算した決まりの違い (日次 − v4 の向き)
+ok(Math.round(r.points) === 20, `② ポイント = 20 (${r.points})`);
+ok(Math.round(r.ship_tax) === 30, `③ 送料の税 (v4 だけ売上に入れる) = 30 (${r.ship_tax})`);
+ok(Math.round(r.refund_commission) === -44, `④ 返品の管理手数料 (v4 に無い) = −22 × 2 = −44 (${r.refund_commission})`);
+ok(Math.round(r.other_refund) === -1250, `⑤ 返金の範囲 (v4 に無い) = 送料の返金 −300 + 返品の手数料 +50 + 支払い取り消しの本体 −1,000 = −1,250 (${r.other_refund})`);
+ok(Math.round(r.cogs_d) === 400 && Math.round(r.cogs_v4) === 800, `① 原価: 日次 = 400 × 返品を引いた 1 個 / v4 = 400 × 注文 2 個 (${r.cogs_d} / ${r.cogs_v4})`);
+ok(Math.round(r.safe_t_other) === 634 && Math.round(r.retraction) === -120, `⑥ SAFE-T (Other) = 634・⑦ 補てんの取り消し = −120 (v4 に無い) (${r.safe_t_other} / ${r.retraction})`);
+const dsum = db.prepare(`SELECT SUM(safe_t_jpy) s, SUM(reversal_reimbursement_jpy) r, SUM(other_amount_jpy) o FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b'`).get();
+ok(dsum.s === 634 && dsum.r === -120 && dsum.o === 0, `日次の財務: SAFE-T 634・取り消し −120・行き先の無い金額 0 (SKU のある納品不備は入らない) (${JSON.stringify(dsum)})`);
+ok(db.prepare(`SELECT COUNT(*) n FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-i'`).get().n === 0
+  && db.prepare(`SELECT COUNT(*) n FROM v_amazon_sku_profit_actual_v4 WHERE seller_sku = 'sku-i'`).get().n === 1, '納品不備だけの SKU は日次に無く v4 にだけある (利益 0)');
+ok(Math.abs(r.resid) < 1e-6, `決まりの違いを引くと残り 0 (そのままの差 ${Math.round(r.raw_diff)} 円 / 残り ${r.resid})`);
+ok(reconcileSkuTop(db, { month: YM }).length === 0, 'SKU × 月でも残り 0');
+
+// 照合の関所: 月の合計の差・説明できない残りが 0 = info (GChat の通知先は外す)
+const env = { ...process.env, DATA_DIR: tmpDir }; delete env.GCHAT_WEBHOOK_INSIGHT;
+let out = '', code = 0;
+try { out = execFileSync(process.execPath, ['apps/warehouse/run-amazon-finance-dq.js', '--month', YM, '--run-id', 'test-reconcile'], { cwd: repoRoot, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { code = e.status; out = String(e.stdout || '') + String(e.stderr || ''); }
+const res = Object.fromEntries(db.prepare(`SELECT check_name, severity, actual_value FROM dq_run_results WHERE run_id = 'test-reconcile'`).all().map((x) => [x.check_name, x]));
+ok(res.monthly_total_diff_pct?.severity === 'info' && res.monthly_total_diff_pct.actual_value === 0, `関所: 月の合計の差 = 0% (info) (${JSON.stringify(res.monthly_total_diff_pct)})`);
+ok(res.unbucketed_diff_jpy?.severity === 'info' && res.unbucketed_diff_jpy.actual_value === 0, `関所: 説明できない残り = 0 円 (info) (${JSON.stringify(res.unbucketed_diff_jpy)})`);
+const adj = db.prepare(`SELECT bucket_amount a, details_json d FROM accounting_diff_buckets WHERE run_id = 'test-reconcile' AND bucket_code = 'adjustment_diff'`).get();
+const det = adj && JSON.parse(adj.d);
+ok(adj && Math.abs(adj.a - det.raw_diff) < 1e-6 && Math.round(det.points) === -20 && Math.round(det.other_refund) === -1250 && Math.round(det.safe_t_other) === 634 && Math.round(det.retraction) === -120, `関所: 説明できる差 (決まりの違い) の内訳 = そのままの差 (${adj && Math.round(adj.a)} / ${det && Math.round(det.raw_diff)})`);
+ok(res.row_count_drift?.severity === 'info' && res.row_count_drift.actual_value === 0, `関所: 行数の差 = 0 (納品不備だけの SKU は v4 の側でも数えない・2026-09-30 D-63) (${JSON.stringify(res.row_count_drift)})`);
+// 人が読む報告 (validate-v4-reference.js) も同じ決まりの違いを出す・納品不備だけの SKU は集合差に出ない
+const vr = execFileSync(process.execPath, ['apps/warehouse/validate-v4-reference.js', '--month', YM, '--markdown'], { cwd: repoRoot, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+ok(/\| SAFE-T \(Other\) \| 補てんの取り消し \|/.test(vr) && /\| 634 \| -120 \| 0 \|/.test(vr) && !new RegExp(`\\| ${YM} \\| [1-9]`).test(vr.split('## C.')[1].split('## D.')[0]),
+  `報告: A2 に SAFE-T (Other) 634・取り消し −120・残り 0 / C の集合差に v4 だけの SKU が無い`);
+
+// 壊れたら残りが出る: v4 の元 (月の集計) を 1 円ずらす
+db.prepare(`UPDATE fact_amazon_settlement_monthly_wide SET sales_principal_micro = sales_principal_micro + 1000000 WHERE year_month_int = ? AND seller_sku_normalized = 'sku-b'`).run(YMI);
+const r2 = reconcileMonthly(db, { month: YM })[0];
+ok(Math.round(r2.resid) === -1, `v4 側が 1 円ずれると残り −1 円 (${r2.resid})`);
+
+db.prepare(`UPDATE fact_amazon_settlement_monthly_wide SET sales_principal_micro = sales_principal_micro - 1000000 WHERE year_month_int = ? AND seller_sku_normalized = 'sku-b'`).run(YMI);   // 戻す
+
+// 打ち消しを見逃さない (Codex #1531 R1)
+const dq = (runId) => {
+  let code = 0;
+  try { execFileSync(process.execPath, ['apps/warehouse/run-amazon-finance-dq.js', '--month', YM, '--run-id', runId], { cwd: repoRoot, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { code = e.status; }
+  return { code, res: Object.fromEntries(db.prepare(`SELECT check_name, severity, actual_value FROM dq_run_results WHERE run_id = ?`).all(runId).map((x) => [x.check_name, x])) };
+};
+// ① SKU どうし: sku-b +1,000 / 日次にだけある sku-z −1,000 = 月の合計は 0 でも SKU ごとの絶対値は 2,000
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET profit_amount = profit_amount + 1000 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+db.prepare(`INSERT INTO f_amazon_finance_sku_daily_v1 (date_jst, seller_sku, profit_amount, cost_status, source_layer_summary, source_row_count, built_at) VALUES (?, 'sku-z', -1000, 'complete', 'sp_api_v2', 1, 't')`).run(`${YM}-05`);
+const r3 = reconcileMonthly(db, { month: YM })[0];
+ok(Math.abs(r3.resid) < 1e-6 && Math.round(r3.resid_abs) === 2000, `SKU どうしの打ち消し: 月の残りは 0 でも SKU ごとの絶対値の合計 = 2,000 (${r3.resid} / ${r3.resid_abs})`);
+let q = dq('test-offset');
+ok(q.res.unbucketed_diff_jpy?.severity === 'warn' && q.res.unbucketed_diff_jpy.actual_value === 2000 && q.res.monthly_total_diff_pct?.severity === 'error' && q.code === 1,
+  `関所: 説明できない残り 2,000 円 = warn (500 超)・月の差 (絶対値の合計 ÷ v4) は試しのデータが小さいので error = 終了コード 1 (${JSON.stringify([q.res.unbucketed_diff_jpy, q.res.monthly_total_diff_pct])} / ${q.code})`);
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET profit_amount = profit_amount - 1000 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+db.prepare(`DELETE FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-z'`).run();
+// ② 項目どうし: sku-b の売上と手数料が同じだけ多い (+10,000 / +10,000) = 利益の残りは 0 でも売上の残りが 10,000
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET sales_principal_jpy = sales_principal_jpy + 10000, commission_jpy = commission_jpy + 10000 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+const r4 = reconcileMonthly(db, { month: YM })[0];
+ok(Math.abs(r4.resid_abs) < 1e-6 && Math.round(r4.rev_resid_abs) === 10000, `項目どうしの打ち消し: 利益の残りは 0 でも売上の残り = 10,000 (${r4.resid_abs} / ${r4.rev_resid_abs})`);
+q = dq('test-rev');
+ok(q.res.unbucketed_diff_jpy?.severity === 'error' && q.code === 1, `関所: 売上の残り 10,000 円 = error (5,000 超)・終了コード 1 (${JSON.stringify(q.res.unbucketed_diff_jpy)} / ${q.code})`);
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET sales_principal_jpy = sales_principal_jpy - 10000, commission_jpy = commission_jpy - 10000 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+// ③ 縦長の表にだけある SKU (日次にも v4 にも無い) を落とさない
+db.prepare(`INSERT INTO fact_amazon_settlement_monthly_long (year_month_int, seller_sku_normalized, transaction_type, component_family, component_type, value_micro, row_count, source_layer, generated_at) VALUES (?, 'sku-long', 'Refund', 'fee', 'RefundCommission', -5000000, 1, 'sp_api_v2', 't')`).run(YMI);
+const r5 = reconcileMonthly(db, { month: YM })[0];
+ok(r5.long_only_skus === 1 && Math.round(r5.resid_abs) === 5, `縦長の表にだけある SKU = 1・その調整 (−5) も残りに出る (${r5.long_only_skus} / ${r5.resid_abs})`);
+ok(reconcileSkuTop(db, { month: YM }).some((x) => x.sku === 'sku-long' && x.in_long && !x.in_d && !x.in_v4), 'SKU × 月の一覧にも縦長の表だけの SKU が出る');
+q = dq('test-long');
+ok(q.res.long_only_skus?.severity === 'warn' && q.res.long_only_skus.actual_value === 1, `関所: 縦長の表だけの SKU = warn (${JSON.stringify(q.res.long_only_skus)})`);
+const clb = db.prepare(`SELECT bucket_amount a, row_count n, details_json d FROM accounting_diff_buckets WHERE run_id = 'test-reconcile' AND bucket_code = 'cost_late_binding'`).get();
+ok(clb && clb.a === 0 && clb.n === 1 && JSON.parse(clb.d).missing_profit_jpy_diagnostic === 500,
+  `原価未登録の分類はある (1 行) が金額は 0・影響額 500 は診断に (原価の差は決まりの違い ① に入る = 二重にしない) (${clb && JSON.stringify([clb.a, clb.n, clb.d])})`);
+// 月の差 % に売上の残りも入る (利益の残り 0・売上の残り 100 → % は 0 にならない。Codex #1531 R2)
+db.prepare(`DELETE FROM fact_amazon_settlement_monthly_long WHERE seller_sku_normalized = 'sku-long'`).run();
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET sales_principal_jpy = sales_principal_jpy + 100, commission_jpy = commission_jpy + 100 WHERE seller_sku = 'sku-b' AND date_jst = ?`).run(`${YM}-05`);
+const r6 = reconcileMonthly(db, { month: YM })[0];
+ok(r6.resid_abs < 1e-6 && Math.round(r6.rev_resid_abs) === 100 && Math.abs(r6.resid_pct - 100 / Math.abs(r6.cmp_v4) * 100) < 1e-9 && r6.resid_pct > 0,
+  `月の差 % の分子 = 利益の残り 0 + 売上の残り 100 (${r6.resid_pct.toFixed(3)}%)`);
+
+console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 日次の財務と v4 の突き合わせテスト ALL PASS ===');
+process.exit(failed ? 1 : 0);

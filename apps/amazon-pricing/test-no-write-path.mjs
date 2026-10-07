@@ -68,7 +68,8 @@ const ALLOWED_BARE_IMPORTS = new Set(['express', 'path', 'fs', 'url', 'os', 'nod
 /** アプリのモジュール (./ で参照してよいもの)。test-* はここに無いので、本番ファイルからは import できない */
 const APP_MODULES = new Set(['./engine.js', './db.js', './read-model.js', './evaluate.js', './router.js']);
 /** アプリの外で到達してよいモジュール (相対パスで、アプリのファイルから見た形) */
-const ALLOWED_EXTERNAL = new Set(['../warehouse-mirror/db.js', '../price-update/format.js']);
+// lib/amazon-finance-read.js = Amazon の財務の表の名前を返すだけの読み口 (入出力なし・F4-1 2026-10-03)。中身も 2. で同じ検査に掛かる
+const ALLOWED_EXTERNAL = new Set(['../warehouse-mirror/db.js', '../price-update/format.js', '../../lib/amazon-finance-read.js']);
 /** 計算プロパティの直前にあってよい語 (配列リテラルの直前に来るキーワード) */
 const ARRAY_LITERAL_KEYWORDS = new Set(['of', 'in', 'return', 'typeof', 'await', 'yield', 'case', 'throw', 'delete', 'void', 'new', 'else', 'do', 'instanceof']);
 /** この語の直後の / は正規表現の始まり (割り算ではない) */

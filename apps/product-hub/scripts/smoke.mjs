@@ -17,6 +17,10 @@ if (!process.env.DATA_DIR) {
   process.exit(1);
 }
 fs.mkdirSync(process.env.DATA_DIR, { recursive: true });
+// 切替の段階 = legacy_open (マスタの古い入口の門を今までどおり通す。門そのものの試験は scripts/test-master-legacy-gate.mjs)
+(await import('../../../lib/master-legacy-gate.mjs')).__setLegacyPhaseReader(async () => ({ readable: true, phase: 'legacy_open' }));
+// 出品の税率 = 切替前の決め方 (draft_yahoo.tax_rate。閉じた後の Company DB の税率は test-master-legacy-gate.mjs)
+const LEGACY_TAX = { tax: { mode: 'legacy' } };
 
 let failed = 0;
 function check(name, cond, detail = '') {
@@ -610,6 +614,7 @@ check('delete cascades children',
 
 // ─── バリエーション判定 (NE 代表商品コード) ───
 const vari = await import('../lib/variation.js');
+const existingPageMod = await import('../lib/existing-page.js');
 // mirror_products に実データ相当を入れる (rooms = 代表コードだが商品としては実在しない = 本番の93%型)
 const insProd = db.prepare(`INSERT OR REPLACE INTO mirror_products
   (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
@@ -736,6 +741,78 @@ check('regroup: 単品は対象外 (400)',
   rg.regroupToRepCode(db, soloId, { expectedFrom: 'SOLO-1', expectedTo: 'SOLO-1' }).code === 400);
 check('regroup: 存在しないIDは404',
   rg.regroupToRepCode(db, 999999, { expectedFrom: 'a', expectedTo: 'b' }).code === 404);
+
+// ─── 既存の楽天ページへの追加か (2026-09-25 スタッフ要望「既存ページラベル」) ───
+// 自動判定 = NE の同じ代表商品コードのグループに、アプリ導入前からある商品 (初回シード = draft_id NULL) があるか
+{
+  const epIns = (code, rep) => insProd.run(9100 + epIns.n++, code, code, rep);
+  epIns.n = 0;
+  const seen = db.prepare('INSERT OR REPLACE INTO ph_ne_seen_codes (code_key, ne_code, draft_id) VALUES (?, ?, ?)');
+  const mkDraft = (code, source = 'portal') => Number(db.prepare(
+    'INSERT INTO product_drafts (ne_code, name, source) VALUES (?, ?, ?)').run(code, code, source).lastInsertRowid);
+  // A: 既存ページ epx (青は前からある) に赤を足した = 典型のカラバリ追加。カードの商品コードは大文字でも同じ
+  epIns('epx-blue', 'epx'); epIns('epx-red', 'epx');
+  const dA = mkDraft('EPX');
+  seen.run('epx-blue', 'epx-blue', null); seen.run('epx-red', 'epx-red', dA);
+  // B: 新商品 epn (2 色とも今回はじめて入った)
+  epIns('epn-blue', 'epn'); epIns('epn-red', 'epn');
+  const dB = mkDraft('epn');
+  seen.run('epn-blue', 'epn-blue', dB); seen.run('epn-red', 'epn-red', dB);
+  // C: 前からある単品 (グループなし) = ページがまだ無いこともあるので自動では付けない
+  epIns('eps', null);
+  const dC = mkDraft('eps');
+  seen.run('eps', 'eps', null);
+  // D: 単品ページ epy に色を足し、元の商品の代表商品コードが空のまま = カード自身がシード済み + グループあり
+  epIns('epy', null); epIns('epy-2', 'epy');
+  const dD = mkDraft('epy');
+  seen.run('epy', 'epy', null); seen.run('epy-2', 'epy-2', dD);
+  // E: Notion から取り込んだ商品 (導入前から進めていた新商品 = シード済みになる) は誤検知なので付けない
+  epIns('epz-1', 'epz');
+  const dE = mkDraft('epz', 'notion_import');
+  seen.run('epz-1', 'epz-1', null);
+  // F: このアプリから楽天に出品した商品 = ページを作ったのはアプリ (新規ページ)
+  epIns('epw-1', 'epw');
+  const dF = mkDraft('epw');
+  seen.run('epw-1', 'epw-1', null);
+  db.prepare("INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-09-01T00:00:00Z')").run(dF);
+
+  const epm = existingPageMod;
+  const of = (id) => epm.existingPageOfDraft(db, id);
+  check('既存ページ: 前からある色のグループに足した商品 = 自動で既存ページ',
+    of(dA).existingPage === true && of(dA).auto === true && of(dA).choice === '', JSON.stringify(of(dA)));
+  check('既存ページ: 全色はじめての新商品は付かない', of(dB).existingPage === false, JSON.stringify(of(dB)));
+  check('既存ページ: 前からある単品 (グループなし) は自動では付けない', of(dC).existingPage === false, JSON.stringify(of(dC)));
+  check('既存ページ: 元の商品の代表コードが空でも、カード自身が前からあってグループがあれば付く',
+    of(dD).existingPage === true, JSON.stringify(of(dD)));
+  check('既存ページ: Notion 取り込み由来は自動では付けない', of(dE).existingPage === false, JSON.stringify(of(dE)));
+  check('既存ページ: アプリから楽天に出品した商品は自動では付けない', of(dF).existingPage === false, JSON.stringify(of(dF)));
+  // 人が決めた値が自動判定より優先 (自動の誤りを直せる / 自動で分からないものを付けられる)
+  db.prepare('UPDATE product_drafts SET existing_page = 0 WHERE id = ?').run(dA);
+  db.prepare('UPDATE product_drafts SET existing_page = 1 WHERE id = ?').run(dB);
+  check('既存ページ: 人が「新規ページ」と決めたら自動判定より優先',
+    of(dA).existingPage === false && of(dA).auto === false && of(dA).choice === '0', JSON.stringify(of(dA)));
+  check('既存ページ: 人が「既存ページに追加」と決めたら付く',
+    of(dB).existingPage === true && of(dB).auto === false && of(dB).choice === '1', JSON.stringify(of(dB)));
+  // まとめて引く (ボード) も 1 件ずつ (詳細) と同じ答え
+  const all = epm.existingPageOf(db, db.prepare(`
+    SELECT d.id, d.ne_code, d.existing_page, d.source,
+      (SELECT registered_at FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_registered_at
+    FROM product_drafts d WHERE d.id IN (?, ?, ?, ?, ?, ?)`).all(dA, dB, dC, dD, dE, dF));
+  check('既存ページ: まとめて引いても 1 件ずつと同じ',
+    [dA, dB, dC, dD, dE, dF].every((id) => all.get(id).existingPage === of(id).existingPage),
+    JSON.stringify([...all]));
+  let epCheckErr = null;
+  try { db.prepare('UPDATE product_drafts SET existing_page = 2 WHERE id = ?').run(dC); } catch (e) { epCheckErr = e; }
+  check('既存ページ: 列は NULL / 0 / 1 だけ (CHECK)', /CHECK/i.test(String(epCheckErr?.message)), epCheckErr?.message || '通ってしまった');
+
+  // 後片付け (後段の自動取込の試験が mirror の未知コードを新商品として拾わないように)
+  const ids = [dA, dB, dC, dD, dE, dF];
+  db.prepare(`DELETE FROM draft_rakuten WHERE draft_id = ?`).run(dF);
+  db.prepare(`DELETE FROM product_drafts WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+  db.prepare("DELETE FROM mirror_products WHERE product_id BETWEEN 9100 AND 9199").run();
+  const epCodes = ['epx-blue', 'epx-red', 'epn-blue', 'epn-red', 'eps', 'epy', 'epy-2', 'epz-1', 'epw-1'];
+  db.prepare(`DELETE FROM ph_ne_seen_codes WHERE code_key IN (${epCodes.map(() => '?').join(',')})`).run(...epCodes);
+}
 
 // ─── バリエーション除外 (既定でまとめ、例外だけ外す) ───
 db.prepare(`DELETE FROM product_drafts WHERE ne_code IN ('rooms-l-bk','rooms')`).run();
@@ -989,9 +1066,86 @@ check('一括登録: 上限を超えたら弾く',
   intake.registerByCodes(Array.from({ length: intake.MAX_REGISTER_CODES + 1 }, (_, i) => `X-${i}`), {}).error === 'too_many_codes');
 check('一括登録: 空入力は弾く', intake.registerByCodes([], {}).error === 'no_codes');
 
+// ── 出品済みのページに後から色が足された (2026-09-25) ──
+// 以前は既存のドラフトへ黙ってまとめるだけで、カードが出なかった = 楽天ページに色を足す作業が誰にも見えない
+{
+  const sgsId = db.prepare(`SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = 'sgs'`).get().id;
+  const cardOf = (code) => db.prepare('SELECT * FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(code);
+  const seenOf = (code) => db.prepare('SELECT draft_id FROM ph_ne_seen_codes WHERE code_key = ?').get(code)?.draft_id;
+  // まだページを作っている途中なら、新しい色はそのページにそのまま入る (従来どおりまとめる)
+  insP.run(9207, 'sgs-wh', 'メガネストラップ ホワイト', 'sgs', 0.1);
+  const r0 = intake.syncNewProducts({ dryRun: true });
+  check('色追加: 出品前のページならまとめる (カードを出さない)',
+    r0.created === 0 && r0.merged === 1 && intake.pagePublished(db, sgsId) === false, JSON.stringify(r0));
+  // アプリから楽天に出品した = ページが出ている
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-09-01T00:00:00Z')
+    ON CONFLICT(draft_id) DO UPDATE SET registered_at = excluded.registered_at`).run(sgsId);
+  check('色追加: 楽天に出品済みならページが出ている扱い', intake.pagePublished(db, sgsId) === true);
+  insP.run(9208, 'sgs-rd', 'メガネストラップ レッド', 'sgs', 0.1);
+  const dryAdd = intake.syncNewProducts({ dryRun: true });
+  check('色追加 dry-run: 同じページへの 2 色は 1 枚のカードとして数える',
+    dryAdd.created === 1 && dryAdd.merged === 1 && dryAdd.drafts[0]?.addedTo === sgsId, JSON.stringify(dryAdd));
+  const runAdd = intake.syncNewProducts({});
+  const card = cardOf('sgs-rd') || cardOf('sgs-wh');
+  check('色追加: 出品済みページのグループに新しい色が来たらカードを 1 枚出す',
+    runAdd.created === 1 && runAdd.merged === 1 && !!card && runAdd.drafts[0]?.addedTo === sgsId, JSON.stringify(runAdd));
+  check('色追加: カードは 📄既存ページ + 追加先のページを持つ (セットではない)',
+    card.existing_page === 1 && card.added_to_draft_id === sgsId && card.parent_draft_id == null, JSON.stringify(card));
+  check('色追加: 2 色目は同じカードにまとまる (色ごとにカードが乱立しない)',
+    seenOf('sgs-wh') === card.id && seenOf('sgs-rd') === card.id);
+  check('色追加: カードの札 = 既存ページ・追加先が読める',
+    existingPageMod.existingPageOfDraft(db, card.id).existingPage === true
+    && existingPageMod.existingPageOfDraft(db, card.id).addedTo?.ne_code === 'sgs');
+  check('色追加: 追加先のページにも記録が残る',
+    db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'variation_added'`).get(sgsId).c === 1);
+  // 楽天出品は止める (商品コードが新しい色の SKU なので、出すと別の新しいページができる)
+  const listingEarly = await import('../services/rakuten-listing.js');
+  const built = listingEarly.buildItemPayload(db, card.id, LEGACY_TAX);
+  check('色追加: カードからは楽天に出品しない (理由に直すページが出る)',
+    built.ok === false && built.reasons.some((x) => /既存の楽天ページ「sgs」に追加する商品です/.test(x)), JSON.stringify(built.reasons));
+  // 画像フォルダは既存ページのものを使うので自動では作らない
+  const dif0 = await import('../services/drive-image-folder.js');
+  const fold = await dif0.attemptImageFolderCreationBatch([card.id], { actor: 'smoke' });
+  check('色追加: 画像フォルダを自動で作らない', fold.skipped === 1 && fold.created === 0 && fold.failed === 0, JSON.stringify(fold));
+  // 前からある色を一括登録し直しても、色追加のカードは出さない (見たことのあるコード = まとめる)
+  const regOld = intake.registerByCodes(['sgs-or'], { actor: 'smoke' });
+  check('色追加: 前からある色の登録し直しではカードを出さない',
+    regOld.summary.created === 0 && regOld.summary.merged === 1, JSON.stringify(regOld.summary));
+  // 色追加のカードが済んだあと、さらに色が足されたら新しいカードを出す
+  db.prepare(`UPDATE product_drafts SET status = 'expanded' WHERE id = ?`).run(card.id);
+  insP.run(9209, 'sgs-pk', 'メガネストラップ ピンク', 'sgs', 0.1);
+  const runAdd2 = intake.syncNewProducts({});
+  check('色追加: 前の色追加カードが済んでいたら新しいカードを出す',
+    runAdd2.created === 1 && cardOf('sgs-pk')?.added_to_draft_id === sgsId, JSON.stringify(runAdd2));
+  // 色追加カードは札の設定を「新規ページ」にしても出品を止める (新しい色の SKU で別ページができる — Codex #1450 R1 high)
+  const pk = cardOf('sgs-pk');
+  db.prepare('UPDATE product_drafts SET existing_page = 0 WHERE id = ?').run(pk.id);
+  const builtPk = listingEarly.buildItemPayload(db, pk.id, LEGACY_TAX);
+  check('色追加: 「新規ページ」にしても色追加カードは既存ページのまま・出品は止まる',
+    existingPageMod.existingPageOfDraft(db, pk.id).existingPage === true
+    && builtPk.reasons.some((x) => /既存の楽天ページ「sgs」/.test(x)), JSON.stringify(builtPk.reasons));
+  db.prepare('UPDATE product_drafts SET existing_page = 1 WHERE id = ?').run(pk.id);
+  // 楽天を済ませた色追加カードには、次の色をまとめない (他モールが残っていても。Codex #1450 R1 medium)
+  db.prepare(`INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
+    ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'done'`).run(pk.id);
+  insP.run(9210, 'sgs-yl', 'メガネストラップ イエロー', 'sgs', 0.1);
+  const dryYl = intake.syncNewProducts({ dryRun: true });
+  const runYl = intake.syncNewProducts({});
+  check('色追加: 楽天が済んだ色追加カードには次の色をまとめず新しいカード (dry-run も同じ)',
+    dryYl.created === 1 && runYl.created === 1 && cardOf('sgs-yl')?.added_to_draft_id === sgsId
+    && seenOf('sgs-yl') === cardOf('sgs-yl')?.id, JSON.stringify({ dryYl, runYl }));
+  // モール別の状況で楽天を手で「完了」にした商品 (アプリ以前に手で出した) もページが出ている扱い
+  db.prepare(`DELETE FROM draft_rakuten WHERE draft_id = ?`).run(sgsId);
+  db.prepare(`INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
+    ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'done'`).run(sgsId);
+  check('色追加: 楽天を手で完了にした商品もページが出ている扱い', intake.pagePublished(db, sgsId) === true);
+  db.prepare(`DELETE FROM draft_mall_status WHERE draft_id = ?`).run(sgsId);
+  db.prepare(`DELETE FROM product_drafts WHERE added_to_draft_id = ?`).run(sgsId);
+}
+
 // 後片付け (後続の render fixture に影響させない)
 db.prepare(`DELETE FROM product_drafts WHERE LOWER(TRIM(ne_code)) IN ('sgs','flaxseed','notaxprod','newitem1')`).run();
-db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 9201 AND 9206`).run();
+db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 9201 AND 9210`).run();
 db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 50000 AND ${50000 + intake.MIN_SEED_SINGLES}`).run();
 
 // ─── 楽天出品 (P3): payload builder / 属性パース (RMS 非接続) ───
@@ -1017,7 +1171,7 @@ check('parseAttributes: name欠落 → null', listing.parseAttributes('[{"values
 
 // payload builder — 単品ドラフトで組み立て
 const rkId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price) VALUES ('rk-smoke-1', '出品スモーク商品', 1980)`).run().lastInsertRowid);
-let built = listing.buildItemPayload(db, rkId);
+let built = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 不足理由を列挙 (ジャンル/画像)',
   built.ok === false && built.reasons.some((r) => r.includes('ジャンル')) && built.reasons.some((r) => r.includes('画像')),
   JSON.stringify(built.reasons));
@@ -1038,7 +1192,7 @@ db.prepare(`UPDATE draft_step_progress SET state = 'done', done_by = 'smoke'
 // **バナーの無い配送方法 (4 = ゆうパック)** を選ぶ — 下の画像テストは共通3枚だけの並びを見ているため
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '4' WHERE draft_id = ?`).run(rkId);
 
-built = listing.buildItemPayload(db, rkId);
+built = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 組み立て成功', built.ok === true, JSON.stringify(built.reasons || null));
 const pl = built.payload;
 check('payload: hideItem=false (公開で登録 — 2026-08-05 中原さん指示)', pl.hideItem === false);
@@ -1069,14 +1223,14 @@ check('payload: スマホ用説明文 = 販売説明文 + PC説明文',
 
 // 10240字ガード (Codex R1 Low): PC説明文の超過は理由で止める
 db.prepare(`UPDATE draft_ai_outputs SET content = ? WHERE draft_id = ? AND kind = 'desc_features'`).run('あ'.repeat(11000), rkId);
-let bLen = listing.buildItemPayload(db, rkId);
+let bLen = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: PC説明文10240字超は理由で止める',
   bLen.ok === false && bLen.reasons.some((r) => r.includes('PC用商品説明文が長すぎます')), JSON.stringify(bLen.reasons));
 // スマホ用だけが連結で超過するケース (PC・販売は上限内)
 db.prepare(`UPDATE draft_ai_outputs SET content = ? WHERE draft_id = ? AND kind = 'desc_features'`).run('あ'.repeat(6000), rkId);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'glong')`).run(rkId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'glong', ?)`).run(rkId, '/app-newitems/' + 'x'.repeat(4000) + '.jpg');
-bLen = listing.buildItemPayload(db, rkId);
+bLen = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: スマホ用 (販売+PC連結) だけの超過も止める',
   bLen.ok === false
   && bLen.reasons.some((r) => r.includes('スマホ用商品説明文'))
@@ -1128,12 +1282,12 @@ const salesEmptyLen = listing.buildSalesDescriptionHtml(['']).length;
 const exactLocLen = 10240 - salesLine1Len - 1 - salesEmptyLen; // -1 は行間の '\n'
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gedge')`).run(rkId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gedge', ?)`).run(rkId, '/' + 'x'.repeat(exactLocLen - 1));
-bLen = listing.buildItemPayload(db, rkId);
+bLen = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 販売説明文ちょうど10240字は販売ガードにかからない (連結のスマホ用のみ)',
   bLen.ok === false && !bLen.reasons.some((r) => r.includes('画像HTML')) && bLen.reasons.some((r) => r.includes('スマホ用')),
   JSON.stringify(bLen.reasons));
 db.prepare(`UPDATE draft_cabinet_images SET cabinet_location = ? WHERE draft_id = ? AND drive_file_id = 'gedge'`).run('/' + 'x'.repeat(exactLocLen), rkId);
-bLen = listing.buildItemPayload(db, rkId);
+bLen = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 販売説明文10241字は理由で止める', bLen.ok === false && bLen.reasons.some((r) => r.includes('画像HTML')), JSON.stringify(bLen.reasons));
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gedge'`).run(rkId);
 db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = 'gedge'`).run(rkId);
@@ -1173,25 +1327,25 @@ check('payload: variants は ne_code キー + 属性 + 型番なし例外',
 // (2026-09-02 shaganshi で実証)。型番を入れても articleNumber は免除理由のまま、が正しい
 db.prepare(`UPDATE draft_rakuten SET article_number = 'ABC-100' WHERE draft_id = ?`).run(rkId);
 check('payload: メーカー型番は articleNumber に入れない (IE0228 の再発防止)',
-  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 5
-  && listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.value === undefined,
-  JSON.stringify(listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber));
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 5
+  && listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber.value === undefined,
+  JSON.stringify(listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber));
 
 // カタログIDなしの理由は選んだ値で送る (未選択なら 5)
 db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = 3 WHERE draft_id = ?`).run(rkId);
 check('payload: カタログIDなしの理由は選んだ値で送る',
-  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 3);
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 3);
 // 1 (セット商品) は articleNumberForSet が要るのでまだ送れない → 止める
 db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = 1 WHERE draft_id = ?`).run(rkId);
 check('payload: 理由1 (セット商品) は未対応として止める',
-  listing.buildItemPayload(db, rkId).ok === false);
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).ok === false);
 db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = NULL WHERE draft_id = ?`).run(rkId);
 
 // JAN があればそれをカタログIDとして送る (免除理由より優先)
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
 check('payload: JANがあればカタログIDとして value で送る',
-  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.value === '4901234567894',
-  JSON.stringify(listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber));
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber.value === '4901234567894',
+  JSON.stringify(listing.buildItemPayload(db, rkId, LEGACY_TAX).payload.variants['rk-smoke-1'].articleNumber));
 db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(rkId);
 
 // ─── 2026-07-27 出品仕様: 税率 / JAN / 配送 / 納期 / 白抜き / 画像20枚 ───
@@ -1206,7 +1360,7 @@ check('isValidGtin: チェックデジット不一致/桁数違い/非数字を�
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '8%' });
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5', postage_included = 1, normal_delivery_date_id = '1000' WHERE draft_id = ?`).run(rkId);
-built = listing.buildItemPayload(db, rkId);
+built = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 const rkVar = built.payload?.variants?.['rk-smoke-1'] || {};
 // 2026-07-28 本番検証: 属性辞書はジャンルごとで「カタログID」が無いジャンル (111145実測) では
 // IE1002 で登録自体が失敗する → **自動付与しない**。手入力した場合だけ送る (JAN欄との一致検証あり)
@@ -1233,12 +1387,12 @@ check('freshCabinetMap/cabinetKeyOf: ID+更新日時で突合する',
     .run(rkId, imgRow.drive_file_id);
   db.prepare(`UPDATE draft_images SET drive_modified_time = 'NEW' WHERE draft_id = ? AND drive_file_id = ?`)
     .run(rkId, imgRow.drive_file_id);
-  const stale = listing.buildItemPayload(db, rkId);
+  const stale = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: Driveで上書きされた画像は「未転送」に落ちて登録が止まる',
     (stale.reasons || []).some((r) => r.includes('未転送')), JSON.stringify(stale.reasons));
   db.prepare(`UPDATE draft_cabinet_images SET drive_modified_time = 'NEW' WHERE draft_id = ? AND drive_file_id = ?`)
     .run(rkId, imgRow.drive_file_id);
-  const okAgain = listing.buildItemPayload(db, rkId);
+  const okAgain = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: 再転送 (更新日時が一致) すれば未転送の理由は消える',
     !(okAgain.reasons || []).some((r) => r.includes('未転送')), JSON.stringify(okAgain.reasons));
   // 復元
@@ -1256,12 +1410,12 @@ check('freshCabinetMap/cabinetKeyOf: ID+更新日時で突合する',
 {
   const sortsBefore = db.prepare('SELECT id, sort FROM draft_images WHERE draft_id = ?').all(rkId);
   db.prepare('UPDATE draft_images SET sort = sort + 1 WHERE draft_id = ?').run(rkId);
-  const noTop = listing.buildItemPayload(db, rkId);
+  const noTop = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: 枠1 (_top) が空なら登録を止める',
     (noTop.reasons || []).some((r) => r.includes('TOP画像がありません')), JSON.stringify(noTop.reasons));
   const restore = db.prepare('UPDATE draft_images SET sort = ? WHERE id = ?');
   for (const r of sortsBefore) restore.run(r.sort, r.id);
-  const withTop = listing.buildItemPayload(db, rkId);
+  const withTop = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: 枠1が埋まっていれば TOP画像の理由は出ない',
     !(withTop.reasons || []).some((r) => r.includes('TOP画像がありません')), JSON.stringify(withTop.reasons));
 }
@@ -1280,7 +1434,7 @@ check('payload: 販売説明文 (画像HTML) にはバナーを入れない (商
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?`).run(rkId);
 db.prepare(`INSERT OR REPLACE INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 原価, 送料, 配送方法, 消費税率, updated_at)
   VALUES (99401, 'rk-smoke-1', '出品smoke', '1', '取扱中', 'ok', 660, 120, '定形外', 0.1, '2026-08-03T00:00:00Z')`).run();
-let bNe = listing.buildItemPayload(db, rkId);
+let bNe = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 // 🚨 RMS へ送る配送方法は **セットだけ** NE へフォールバックする (§4.4 決⑥)。
 // 単品まで NE に落とすと、いま店舗デフォルトで出ている商品の配送方法が黙って変わるため。
 // では単品はどうするか → **選んでいないなら出品を止める** (中原さん判断 2026-09-05)。
@@ -1395,7 +1549,7 @@ check('shippingSelectValueOf: ヤフー別扱いのときだけ複合キーへ�
   const leaked = [];
   for (const choice of [...Object.keys(listing.SHIPPING_METHOD_GROUPS), ...Object.keys(listing.YAHOO_OVERRIDE_SHIPPING_GROUPS)]) {
     setGroup.run(choice, rkId);
-    const b = listing.buildItemPayload(db, rkId);
+    const b = listing.buildItemPayload(db, rkId, LEGACY_TAX);
     if ((b.reasons || []).some((r) => r.includes('配送方法'))) blocked.push(choice);
     const sent = b.payload?.variants?.['rk-smoke-1']?.shipping?.shippingMethodGroup;
     if (sent !== undefined && !listing.SHIPPING_METHOD_GROUPS[sent]) leaked.push(`${choice}→${sent}`);
@@ -1406,7 +1560,7 @@ check('shippingSelectValueOf: ヤフー別扱いのときだけ複合キーへ�
     leaked.length === 0, leaked.join(','));
   // 複合を選んだときは楽天=定形外として出る (ページ表記・バナーと同じ扱い)
   setGroup.run('1y5', rkId);
-  const bOv = listing.buildItemPayload(db, rkId);
+  const bOv = listing.buildItemPayload(db, rkId, LEGACY_TAX);
   check('payload: 複合(1y5)は楽天グループ1 (定形外) で送る',
     bOv.ok === true && bOv.payload.variants['rk-smoke-1'].shipping.shippingMethodGroup === '1',
     JSON.stringify(bOv.payload?.variants?.['rk-smoke-1']?.shipping || bOv.reasons));
@@ -1537,7 +1691,7 @@ db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id 
 const capIns = db.prepare('INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)');
 const capCab = db.prepare('INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, ?, ?)');
 for (let i = 1; i <= 16; i++) { capIns.run(rkId, `gcap${i}`); capCab.run(rkId, `gcap${i}`, `/app-newitems/rk-smoke-1-cap${i}.jpg`); }
-let bCap = listing.buildItemPayload(db, rkId); // 商品17枚 + バナー4枚 = 21
+let bCap = listing.buildItemPayload(db, rkId, LEGACY_TAX); // 商品17枚 + バナー4枚 = 21
 check('payload: 商品画像+自動追加バナーで20枚超は理由で止める',
   bCap.ok === false && bCap.reasons.some((r) => r.includes('自動追加バナー')), JSON.stringify(bCap.reasons));
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id LIKE 'gcap%'`).run(rkId);
@@ -1545,14 +1699,21 @@ db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_i
 
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
 check('payload: 10% も payment.taxRate 0.1 を明示して送る (2026-08-05〜)',
-  listing.buildItemPayload(db, rkId).payload?.payment?.taxRate === 0.1);
+  listing.buildItemPayload(db, rkId, LEGACY_TAX).payload?.payment?.taxRate === 0.1);
+// 🚨 切替で古い入口を閉じた後 (PR #1565 R1 H5): 税率は Company DB の値だけ (draft_yahoo の 10% は使わない)・決められない = 止める・決め方が無い = 止める
+{ const bCdb = listing.buildItemPayload(db, rkId, { tax: { mode: 'cdb', percent: 8, label: '8%' } });
+  check('payload: 閉じた後は Company DB の税率 (8%) を送る (draft_yahoo は 10%)', bCdb.ok === true && bCdb.payload?.payment?.taxRate === 0.08, JSON.stringify(bCdb.reasons || null)); }
+{ const bBlk = listing.buildItemPayload(db, rkId, { tax: { mode: 'blocked', reason: '税率を Company DB から決められないので出品を止めています: 試験' } });
+  check('payload: 閉じた後に税率を決められない = 出品を止める (理由つき)', bBlk.ok === false && bBlk.reasons.some((r) => r.includes('決められないので出品を止め')), JSON.stringify(bBlk.reasons)); }
+{ const bNone = listing.buildItemPayload(db, rkId);
+  check('payload: 税率の決め方を渡さない呼び方は止める (fail-closed)', bNone.ok === false && bNone.reasons.some((r) => r.includes('税率の決め方')), JSON.stringify(bNone.reasons)); }
 
 // 白抜き背景: 未転送なら理由を返し、転送済みなら whiteBgImage 別枠 (images には入れない)
 db.prepare(`UPDATE draft_rakuten SET white_bg_drive_file_id = 'gwhite', white_bg_drive_url = 'https://drive.google.com/file/d/gwhite/view' WHERE draft_id = ?`).run(rkId);
-let b27 = listing.buildItemPayload(db, rkId);
+let b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 白抜き未転送は理由を返す', b27.ok === false && b27.reasons.some((r) => r.includes('白抜き')), JSON.stringify(b27.reasons));
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gwhite', '/app-newitems/rk-smoke-1-white.jpg')`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: whiteBgImage は images と別枠',
   b27.ok === true
   && b27.payload.whiteBgImage?.location === '/app-newitems/rk-smoke-1-white.jpg'
@@ -1562,7 +1723,7 @@ check('payload: 販売説明文にも白抜き画像は入れない', !b27.paylo
 
 // 不正値は理由で弾く
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '99', normal_delivery_date_id = 'abc' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 配送方法/納期の不正値を弾く',
   b27.ok === false && b27.reasons.some((r) => r.includes('配送方法')) && b27.reasons.some((r) => r.includes('納期')),
   JSON.stringify(b27.reasons));
@@ -1571,21 +1732,21 @@ db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5', normal_deliver
 
 // 税率の不正値は fail-closed (Codex R1 Medium-1)
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '9.6%' });
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 税率の不正値を弾く (8/10/空欄のみ)', b27.ok === false && b27.reasons.some((r) => r.includes('税率')), JSON.stringify(b27.reasons));
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
 
 // 商品属性の行に「カタログID」を手入力する経路は廃止 (2026-09-02: 入口は基本情報タブだけ)。
 // JAN欄と一致していても弾く (旧データの掃除を促す)
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567894"]}]' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 属性行のカタログIDは弾く (入口は基本情報タブだけ)',
   b27.ok === false && b27.reasons.some((r) => r.includes('属性の行に「カタログID」')), JSON.stringify(b27.reasons));
 
 // JAN欄の不正値 (チェックデジット違い) は止める
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567890' WHERE id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["ノーブランド品"]}]' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: JAN欄の不正値を弾く',
   b27.ok === false && b27.reasons.some((r) => r.includes('JANコード') && r.includes('不正')), JSON.stringify(b27.reasons));
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
@@ -1593,18 +1754,18 @@ db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド�
 
 // 転送後に削除した画像は送らない (Codex R1 Medium-2: draft_images との JOIN)
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gstale', '/app-newitems/rk-smoke-1-stale.jpg')`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 削除済み画像 (転送履歴のみ) は送らない',
   b27.ok === true && b27.payload.images.every((i) => !i.location.includes('stale')), JSON.stringify(b27.reasons || b27.payload?.images));
 
 // ─── 商品ページ表記の統合 (Codex R1 high: import だけで未統合だった回帰) ───
 db.prepare(`INSERT INTO draft_page_info (draft_id, product_type, content_volume) VALUES (?, 'cosmetics', '50ml')`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 化粧品の必須記載不足は登録をブロック',
   b27.ok === false && b27.reasons.some((r) => r.includes('商品ページ表記')), JSON.stringify(b27.reasons));
 db.prepare(`UPDATE draft_page_info SET seller_name = 'メーカーA', origin_type = '日本製', category_label = '化粧品' WHERE draft_id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 // 発送方法の行は出さない (2026-08-31 中原さん: 表には不要。配送方法は画像末尾のバナーで見せている)
 check('payload: 充足すると説明文末尾に表を連結 (発送方法の行は出さない)',
   b27.ok === true
@@ -1616,7 +1777,7 @@ check('payload: 充足すると説明文末尾に表を連結 (発送方法の�
 check('payload: 表は説明文の末尾に付く', b27.payload.productDescription.pc.trim().endsWith('</table>'));
 // 仕様表とページ表記の同名ラベルはページ表記が正 (Codex R1 Medium: 重複行を作らない)
 db.prepare(`UPDATE draft_page_info SET size_text = '約W5cm' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 仕様表とページ表記の同名ラベルはページ表記が正 (サイズ行は1つ)',
   b27.ok === true
   && (b27.payload.productDescription.pc.match(/<b>サイズ<\/b>/g) || []).length === 1
@@ -1627,7 +1788,7 @@ db.prepare(`UPDATE draft_page_info SET size_text = NULL WHERE draft_id = ?`).run
 // 発送方法の行を出さない状態を作る (バナーの付かない配送方法。NULL にすると出品ゲートで止まる)
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '4' WHERE draft_id = ?`).run(rkId);
 db.prepare(`DELETE FROM draft_page_info WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: page_info 未保存でも説明は表形式 (表記の行だけ載らない)',
   b27.ok === true
   && b27.payload.productDescription.pc.includes('<b>説明</b>')
@@ -1636,7 +1797,7 @@ check('payload: page_info 未保存でも説明は表形式 (表記の行だけ�
 
 // 未転送の画像があれば止める
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gnotyet')`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 未転送の商品画像があれば止める', b27.ok === false && b27.reasons.some((r) => r.includes('未転送')), JSON.stringify(b27.reasons));
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gnotyet'`).run(rkId);
 
@@ -1644,7 +1805,7 @@ db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gno
 const insImg21 = db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)`);
 const insCab = db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, ?, ?)`);
 for (let i = 2; i <= 21; i++) { insImg21.run(rkId, `gfile${i}`); insCab.run(rkId, `gfile${i}`, `/app-newitems/rk-smoke-1-${i}.jpg`); }
-b27 = listing.buildItemPayload(db, rkId);
+b27 = listing.buildItemPayload(db, rkId, LEGACY_TAX);
 check('payload: 画像は20枚まで', b27.ok === false && b27.reasons.some((r) => r.includes('20')), JSON.stringify(b27.reasons));
 
 // 公開切替は「アプリから登録済み」のドラフト限定 (registered_at 無しは RMS に接続せず拒否)
@@ -1662,7 +1823,7 @@ db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_l
 // 出品できる状態にする (TOP画像 sort=0 + 詳細画像は対象外) → 残る不足は項目選択肢だけ
 db.prepare('UPDATE draft_images SET sort = 0 WHERE draft_id = ?').run(rkvId);
 db.prepare('UPDATE product_drafts SET detail_images_excluded = 1, jan_code = NULL WHERE id = ?').run(rkvId);
-let bv = listing.buildItemPayload(db, rkvId);
+let bv = listing.buildItemPayload(db, rkvId, LEGACY_TAX);
 check('カラバリ: 項目選択肢の見出しと値が無ければ止める',
   bv.ok === false
   && bv.reasons.some((r) => r.includes('項目名'))
@@ -1677,7 +1838,7 @@ insSel.run(rkvId, 'rkv-b', 'ホワイト');
 db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(rkvId, 'rkv-a', '4901234567894');
 // SKU別売価 (画面入力) が最優先。NE の標準売価より強い
 db.prepare('INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, ?, ?)').run(rkvId, 'rkv-a', 2480);
-bv = listing.buildItemPayload(db, rkvId);
+bv = listing.buildItemPayload(db, rkvId, LEGACY_TAX);
 check('カラバリ: SKU別売価 (画面入力) が NE の標準売価より優先される',
   bv.ok === true && bv.payload.variants['rkv-a'].standardPrice === 2480,
   JSON.stringify(bv.ok ? bv.payload.variants['rkv-a'] : bv.reasons));
@@ -1830,7 +1991,7 @@ db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gd1')
 // (ここの主題はジャンル辞書の検証。画像ゲート自体は専用ブロックで検証している)
 db.prepare(`UPDATE product_drafts SET detail_images_excluded = 1 WHERE id = ?`).run(gdId);
 
-let gb = listing.buildItemPayload(db, gdId);
+let gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 必須が揃っていれば通り、カタログIDはJAN欄から自動付与 (辞書にあるジャンル)',
   gb.ok === true
   && gb.payload.variants['gd-smoke-1'].attributes.some((a) => a.name === 'カタログID' && a.values[0] === '4999999999999'),
@@ -1838,19 +1999,19 @@ check('genre: 必須が揃っていれば通り、カタログIDはJAN欄から�
 
 // 辞書に無い属性名は登録前に止める (IE1002 の事前検知)
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"存在しない属性","values":["y"]}]' WHERE draft_id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 辞書に無い属性名を事前に止める (IE1002対策)',
   gb.ok === false && gb.reasons.some((r) => r.includes('存在しない属性') && r.includes('IE1002')), JSON.stringify(gb.reasons));
 
 // 必須属性の欠落を事前に止める
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["x"]}]' WHERE draft_id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 必須属性の欠落を事前に止める',
   gb.ok === false && gb.reasons.some((r) => r.includes('必須属性「代表カラー」')), JSON.stringify(gb.reasons));
 
 // multiValueLimit / maxLength
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["a","b","c","d"]},{"name":"代表カラー","values":["黒"]}]' WHERE draft_id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 値の個数上限を事前に止める', gb.ok === false && gb.reasons.some((r) => r.includes('最大 3 個')), JSON.stringify(gb.reasons));
 
 // 数値の属性 (総容量・総重量 など。fixture では「総枚数」= NUMBER・単位 枚) — 2026-09-14 cassisp30 の IE0418
@@ -1862,23 +2023,23 @@ check('genre: 値の個数上限を事前に止める', gb.ok === false && gb.re
   const cases = [['30枚', '30'], ['３０', '30'], ['30', '30'], [' 1,000 枚 ', '1000'], ['2.5', '2.5']];
   for (const [input, want] of cases) {
     put(input);
-    const b = listing.buildItemPayload(db, gdId);
+    const b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
     const a = attrOf(b);
     check(`数値の属性: 「${input}」→ values ['${want}'] + unit '枚'`,
       !!a && a.values.length === 1 && a.values[0] === want && a.unit === '枚', JSON.stringify(b.ok ? a : b.reasons));
   }
   put('三十枚');
-  let b = listing.buildItemPayload(db, gdId);
+  let b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 数値で始まらない値は送る前に止める (単位の例つき)',
     b.ok === false && b.reasons.some((r) => r.includes('総枚数') && r.includes('数値で入れて') && r.includes('30枚')), JSON.stringify(b.reasons));
   put('1234567890');
-  b = listing.buildItemPayload(db, gdId);
+  b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 上限 (999999999) を超える値は止める', b.ok === false && b.reasons.some((r) => r.includes('総枚数') && r.includes('大きすぎる')), JSON.stringify(b.reasons));
   put('1.12345678');
-  b = listing.buildItemPayload(db, gdId);
+  b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 小数 8 桁は止める', b.ok === false && b.reasons.some((r) => r.includes('総枚数') && r.includes('7 桁')), JSON.stringify(b.reasons));
   put('30枚');
-  b = listing.buildItemPayload(db, gdId);
+  b = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 文字の属性 (ブランド名) と カタログID は変えない (unit を付けない)',
     b.ok === true && b.payload.variants['gd-smoke-1'].attributes.filter((a) => a.name !== '総枚数').every((a) => !('unit' in a))
     && b.payload.variants['gd-smoke-1'].attributes.find((a) => a.name === 'ブランド名').values[0] === 'x',
@@ -1919,32 +2080,32 @@ check('splitNumberWithUnit: 数値で始まらない・空は ok:false',
   const put2 = (attrs) => db.prepare("UPDATE draft_rakuten SET genre_id = '900002', attributes_json = ? WHERE draft_id = ?").run(JSON.stringify(attrs), gdId);
   const find = (b, name) => (b.ok ? b.payload.variants['gd-smoke-1'].attributes.find((a) => a.name === name) : null);
   put2([{ name: 'ブランド名', values: ['x'] }, { name: '総重量', values: ['1kg', '2kg'] }]);
-  let b2 = listing.buildItemPayload(db, gdId);
+  let b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性 (複数値): 単位がそろっていれば {values:[1,2], unit:kg}',
     JSON.stringify(find(b2, '総重量')) === JSON.stringify({ name: '総重量', values: ['1', '2'], unit: 'kg' }),
     JSON.stringify(b2.ok ? find(b2, '総重量') : b2.reasons));
   for (const mixed of [['1kg', '500g'], ['1kg', '500']]) {
     put2([{ name: 'ブランド名', values: ['x'] }, { name: '総重量', values: mixed }]);
-    b2 = listing.buildItemPayload(db, gdId);
+    b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
     check('数値の属性 (複数値): 単位が違えば送る前に止める (' + mixed.join(' / ') + ')',
       b2.ok === false && b2.reasons.some((r) => r.includes('総重量') && r.includes('そろっていません')), JSON.stringify(b2.reasons));
   }
   check('toRmsAttribute: 単位がそろっていない複数値は変えない (換算しない)',
     JSON.stringify(listing.toRmsAttribute({ name: '総重量', values: ['1kg', '500g'] }, dict2[1])) === JSON.stringify({ name: '総重量', values: ['1kg', '500g'] }));
   put2([{ name: 'ブランド名', values: ['x'] }, { name: '個数', values: ['３'] }]);
-  b2 = listing.buildItemPayload(db, gdId);
+  b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性 (単位なし): 数値だけにそろえ unit は付けない',
     JSON.stringify(find(b2, '個数')) === JSON.stringify({ name: '個数', values: ['3'] }), JSON.stringify(b2.ok ? find(b2, '個数') : b2.reasons));
   put2([{ name: 'ブランド名', values: ['x'] }, { name: '個数', values: ['3個'] }]);
-  b2 = listing.buildItemPayload(db, gdId);
+  b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性 (単位なし): 単位を書いたら止める',
     b2.ok === false && b2.reasons.some((r) => r.includes('個数') && r.includes('単位を付けずに')), JSON.stringify(b2.reasons));
   put2([{ name: 'ブランド名', values: ['x'] }, { name: 'メモ', values: ['30g'] }]);
-  b2 = listing.buildItemPayload(db, gdId);
+  b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('文字の属性は辞書に単位があっても変えない',
     JSON.stringify(find(b2, 'メモ')) === JSON.stringify({ name: 'メモ', values: ['30g'] }), JSON.stringify(b2.ok ? find(b2, 'メモ') : b2.reasons));
   put2([{ name: 'ブランド名', values: ['x'] }, { name: '総重量', values: ['999999999'] }, { name: '個数', values: ['1.1234567'] }]);
-  b2 = listing.buildItemPayload(db, gdId);
+  b2 = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('数値の属性: 上限ちょうど・小数 7 桁は通る',
     b2.ok === true && find(b2, '総重量').values[0] === '999999999' && find(b2, '総重量').unit === 'g' && find(b2, '個数').values[0] === '1.1234567',
     JSON.stringify(b2.ok ? b2.payload.variants['gd-smoke-1'].attributes : b2.reasons));
@@ -1967,7 +2128,7 @@ check('splitNumberWithUnit: 基準単位と別の知っている単位はそろ�
 
 // 辞書が無いジャンルでは検証もカタログID付与もしない (従来どおり RMS に任せる)
 db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[{"name":"何でも属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 辞書未取得ジャンルは検証スキップ + カタログID付与なし',
   gb.ok === true
   && !gb.payload.variants['gd-smoke-1'].attributes.some((a) => a.name === 'カタログID'),
@@ -1976,7 +2137,7 @@ check('genre: 辞書未取得ジャンルは検証スキップ + カタログID�
 // JAN欄が空 + 辞書のカタログID必須 → 必須欠落として止まる
 db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]}]' WHERE draft_id = ?`).run(gdId);
 db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(gdId);
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラーになる',
   gb.ok === false && gb.reasons.some((r) => r.includes('カタログID') && r.includes('「カタログID」の行')), JSON.stringify(gb.reasons));
 
@@ -1996,14 +2157,14 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   insSelV.run(gdvId, 'gdv-a', '黒');
   insSelV.run(gdvId, 'gdv-b', '白');
   db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(gdvId, 'gdv-a', '4901234567894');
-  let gv = listing.buildItemPayload(db, gdvId);
+  let gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   check('genre×バリエーション: JAN の無い SKU があると SKU 名つきで止まる (ページ代表の jan_code は見ない)',
     gv.ok === false
     && gv.reasons.some((r) => r.includes('gdv-b') && r.includes('カタログID') && r.includes('SKU表'))
     && !gv.reasons.some((r) => r.includes('gdv-a') && r.includes('カタログID')),
     JSON.stringify(gv.reasons));
   db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(gdvId, 'gdv-b', '4999999999999');
-  gv = listing.buildItemPayload(db, gdvId);
+  gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   const catOf = (sku) => ((gv.ok && gv.payload.variants[sku].attributes) || []).filter((a) => a.name === 'カタログID').map((a) => a.values[0]);
   check('genre×バリエーション: カタログID属性は SKU ごとに自分の JAN (articleNumber と一致)',
     gv.ok === true
@@ -2014,20 +2175,20 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   const insSkuAttr = db.prepare('INSERT INTO draft_sku_attributes (draft_id, sku_code, name, value) VALUES (?, ?, ?, ?)');
   insSkuAttr.run(gdvId, 'gdv-a', '総枚数', '30枚');
   insSkuAttr.run(gdvId, 'gdv-b', '総枚数', '５');
-  gv = listing.buildItemPayload(db, gdvId);
+  gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   const numOf = (sku) => ((gv.ok && gv.payload.variants[sku].attributes) || []).find((a) => a.name === '総枚数') || null;
   check('genre×バリエーション: SKU 表の数値の属性も SKU ごとに {values:[数値], unit}',
     gv.ok === true && JSON.stringify(numOf('gdv-a')) === JSON.stringify({ name: '総枚数', values: ['30'], unit: '枚' })
     && JSON.stringify(numOf('gdv-b')) === JSON.stringify({ name: '総枚数', values: ['5'], unit: '枚' }),
     JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
   db.prepare("UPDATE draft_sku_attributes SET value = '五枚' WHERE draft_id = ? AND sku_code = 'gdv-b' AND name = '総枚数'").run(gdvId);
-  gv = listing.buildItemPayload(db, gdvId);
+  gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   check('genre×バリエーション: 数値で読めない SKU の値は SKU 名つきで止める',
     gv.ok === false && gv.reasons.some((r) => r.includes('gdv-b') && r.includes('総枚数') && r.includes('数値で入れて')), JSON.stringify(gv.reasons));
   db.prepare('DELETE FROM draft_sku_attributes WHERE draft_id = ?').run(gdvId);
   // 辞書に無いジャンルでは SKU にもカタログID属性を付けない (IE1002 対策はバリエーションでも同じ)
   db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[]' WHERE draft_id = ?`).run(gdvId);
-  gv = listing.buildItemPayload(db, gdvId);
+  gv = listing.buildItemPayload(db, gdvId, LEGACY_TAX);
   check('genre×バリエーション: 辞書未取得ジャンルでは SKU にカタログID属性を付けない',
     gv.ok === true && catOf('gdv-a').length === 0 && gv.payload.variants['gdv-a'].articleNumber.value === '4901234567894',
     JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
@@ -2085,7 +2246,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
       && g4.legacyModelConflict === true && g4.bySku.get('gsa-a').get(listing.MODEL_ATTR_NAME).join() === 'NEW',
       JSON.stringify({ g3: g3.legacyModels, g4: g4.legacyModels }));
   }
-  let gs = listing.buildItemPayload(db, gsaId);
+  let gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   const attrsOfSku = (sku) => ((gs.ok && gs.payload.variants[sku].attributes) || []).map((a) => a.name + '=' + a.values.join('|')).sort().join(',');
   check('payload×SKU仕様: SKU ごとに違う代表カラー + 共通ブランド名 + SKU 別カタログID (辞書に無いメーカー型番は送らない)',
     gs.ok === true
@@ -2094,7 +2255,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
     JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
   // '' の行 = 明示的に空 (共通の既定値を打ち消す) → その SKU だけ必須欠落
   insAttr.run(gsaId, 'gsa-a', 'ブランド名', '');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 空の行は既定値を打ち消し、その SKU だけ SKU 名つきで必須欠落',
     gs.ok === false
     && gs.reasons.some((r) => r.includes('gsa-a') && r.includes('必須属性「ブランド名」'))
@@ -2103,13 +2264,13 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND sku_code = 'gsa-a' AND name = 'ブランド名'`).run(gsaId);
   // 辞書に無い属性名は SKU 名つきで止める
   insAttr.run(gsaId, 'gsa-b', '存在しない属性', 'z');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 辞書に無い属性名は SKU 名つきで止める (IE1002 対策)',
     gs.ok === false && gs.reasons.some((r) => r.includes('gsa-b') && r.includes('存在しない属性') && r.includes('IE1002')), JSON.stringify(gs.reasons));
   db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND name = '存在しない属性'`).run(gsaId);
   // SKU 行に「カタログID」は入れさせない (JAN は専用行)
   insAttr.run(gsaId, 'gsa-a', 'カタログID', '4901234567894');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: SKU 行の「カタログID」は止める', gs.ok === false && gs.reasons.some((r) => r.includes('gsa-a') && r.includes('「カタログID」の行')), JSON.stringify(gs.reasons));
   db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND name = 'カタログID'`).run(gsaId);
   // SKU ごとの「IDなしの理由」: 辞書の無いジャンルで b の JAN を外し、b だけ理由 3
@@ -2117,45 +2278,45 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   db.prepare(`DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = 'gsa-b'`).run(gsaId);
   db.prepare('INSERT INTO draft_sku_catalog_exemptions (draft_id, sku_code, reason) VALUES (?, ?, 3)').run(gsaId, 'gsa-b');
   db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = 4 WHERE draft_id = ?`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: カタログIDなしの理由は SKU ごと (無い SKU はページ共通の理由)',
     gs.ok === true
     && gs.payload.variants['gsa-a'].articleNumber.value === '4901234567894'
     && gs.payload.variants['gsa-b'].articleNumber.exemptionReason === 3,
     JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
   db.prepare(`DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = 'gsa-a'`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: SKU の理由が無ければページ共通の理由で送る',
     gs.ok === true && gs.payload.variants['gsa-a'].articleNumber.exemptionReason === 4, JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
   // 理由 1 (セット商品) は SKU 単位で未対応チェック
   db.prepare(`UPDATE draft_sku_catalog_exemptions SET reason = 1 WHERE draft_id = ? AND sku_code = 'gsa-b'`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: SKU の理由 1 (セット商品) は未対応で止める', gs.ok === false && gs.reasons.some((r) => r.includes('セット商品')), JSON.stringify(gs.reasons));
   db.prepare(`UPDATE draft_sku_catalog_exemptions SET reason = 3 WHERE draft_id = ? AND sku_code = 'gsa-b'`).run(gsaId);
   // 共通の多値属性はそのまま複数値で送る (Codex R1 medium)。辞書 900001 の ブランド名 は multiValueLimit 3
   insJanA.run(gsaId, 'gsa-a', '4901234567894'); insJanA.run(gsaId, 'gsa-b', '4999999999999');
   db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = '[{"name":"ブランド名","values":["A","B"]}]' WHERE draft_id = ?`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 共通の多値属性は values 配列のまま送る',
     gs.ok === true && (gs.payload.variants['gsa-a'].attributes.find((a) => a.name === 'ブランド名') || {}).values.join(',') === 'A,B',
     JSON.stringify(gs.ok ? gs.payload.variants['gsa-a'].attributes : gs.reasons));
   insAttr.run(gsaId, 'gsa-a', 'ブランド名', 'P | Q | R | S');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: SKU 行の | 区切りも複数値として上限 (3 個) を検査する',
     gs.ok === false && gs.reasons.some((r) => r.includes('gsa-a') && r.includes('最大 3 個')), JSON.stringify(gs.reasons));
   db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND name = 'ブランド名'`).run(gsaId);
   // 旧データでメーカー型番が食い違っているバリエーション: SKU 表の行が全 SKU に入るまで止める (Codex R1 high)
   db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["A"]},{"name":"メーカー型番","values":["OLD"]}]', article_number = 'NEW' WHERE draft_id = ?`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 旧メーカー型番の食い違いは SKU 表への入力を促して止める (黙って捨てない)',
     gs.ok === false && gs.reasons.some((r) => r.includes('食い違って') && r.includes('OLD') && r.includes('NEW')), JSON.stringify(gs.reasons));
   insAttr.run(gsaId, 'gsa-a', listing.MODEL_ATTR_NAME, 'M-A');
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 全 SKU に SKU 表の値が入れば旧データは使わず通る',
     gs.ok === true, JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
   // 旧データの「カタログID」属性が残るバリエーションは、警告ボタンでの削除を促して止める (SKU 表には展開しない)
   db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["A"]},{"name":"カタログID","values":["4901234567894"]}]', article_number = 'NEW' WHERE draft_id = ?`).run(gsaId);
-  gs = listing.buildItemPayload(db, gsaId);
+  gs = listing.buildItemPayload(db, gsaId, LEGACY_TAX);
   check('payload×SKU仕様: 旧データの「カタログID」属性は削除を促して止める (SKU ごとの行にはしない)',
     gs.ok === false && gs.reasons.some((r) => r.includes('旧データ') && r.includes('カタログID') && r.includes('削除'))
     && !gs.reasons.some((r) => r.includes('SKU「gsa-a」の商品仕様に「カタログID」')),
@@ -2188,7 +2349,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
 
   // ① 欄に入れれば、属性に メーカー型番 が無くても必須欠落にならず、payload には積まれる
   db.prepare(`UPDATE draft_rakuten SET genre_id = '900002', attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`).run(OK_ATTRS, gdId);
-  let bm = listing.buildItemPayload(db, gdId);
+  let bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   const attrsOf = (r) => (r.ok ? r.payload.variants['gd-smoke-1'].attributes || [] : []);
   check('メーカー型番: 欄に入れれば属性行が無くても通り、属性として自動で積まれる',
     bm.ok === true && attrsOf(bm).some((a2) => a2.name === MODEL && a2.values[0] === 'toys3pen'),
@@ -2202,7 +2363,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
 
   // ② 欄が空なら、辞書必須の メーカー型番 は今までどおり欠落エラー (黙って通さない)
   db.prepare(`UPDATE draft_rakuten SET article_number = NULL WHERE draft_id = ?`).run(gdId);
-  bm = listing.buildItemPayload(db, gdId);
+  bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('メーカー型番: 欄が空なら辞書必須の欠落として止まる',
     bm.ok === false && bm.reasons.some((r) => r.includes(MODEL)), JSON.stringify(bm.reasons));
 
@@ -2210,7 +2371,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   db.prepare(`UPDATE draft_rakuten SET article_number = 'toys3pen',
     attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"メーカー型番","values":["別の型番"]}]'
     WHERE draft_id = ?`).run(gdId);
-  bm = listing.buildItemPayload(db, gdId);
+  bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('メーカー型番: 属性側の旧値と欄が食い違ったら止める',
     bm.ok === false && bm.reasons.some((r) => r.includes('一致しません')), JSON.stringify(bm.reasons));
 
@@ -2218,14 +2379,14 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   db.prepare(`UPDATE draft_rakuten SET attributes_json =
     '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"メーカー型番","values":["toys3pen"]}]'
     WHERE draft_id = ?`).run(gdId);
-  bm = listing.buildItemPayload(db, gdId);
+  bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('メーカー型番: 属性側と同じ値なら通り、属性は 1 つだけ (二重に積まない)',
     bm.ok === true && attrsOf(bm).filter((a2) => a2.name === MODEL).length === 1,
     JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
 
   // ⑤ 辞書に メーカー型番 が無いジャンルでは属性に積まない (IE1002 になる)
   db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`).run(OK_ATTRS, gdId);
-  bm = listing.buildItemPayload(db, gdId);
+  bm = listing.buildItemPayload(db, gdId, LEGACY_TAX);
   check('メーカー型番: 辞書に無いジャンルでは属性に積まない (IE1002 対策)',
     bm.ok === true && !attrsOf(bm).some((a2) => a2.name === MODEL),
     JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
@@ -2236,7 +2397,7 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
 db.prepare(`UPDATE product_drafts SET jan_code = '4999999999999' WHERE id = ?`).run(gdId);
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"存在しない属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);
 db.prepare(`UPDATE ph_genre_attributes SET fetched_at = '2026-01-01T00:00:00.000Z' WHERE genre_id = '900001'`).run();
-gb = listing.buildItemPayload(db, gdId);
+gb = listing.buildItemPayload(db, gdId, LEGACY_TAX);
 check('genre: 鮮度切れ辞書は検証スキップ + カタログID付与なし (RMSに任せる)',
   gb.ok === true
   && !gb.payload.variants['gd-smoke-1'].attributes.some((a) => a.name === 'カタログID'),
@@ -2256,6 +2417,118 @@ const fetch200 = await listing.fetchGenreAttributes(db, '900001', { force: true,
 check('genre: fetch 200 → 正規化して保存', fetch200.ok === true && fetch200.genre.genreName === 'テストジャンル');
 const fetchCached = await listing.fetchGenreAttributes(db, '900001', { fetcher: async () => { throw new Error('should not fetch'); } });
 check('genre: 24h以内はキャッシュから返す (通信しない)', fetchCached.ok === true && fetchCached.cached === true);
+
+// ─── 選択式の属性の選択肢 (2026-09-20): 属性ごとの dictionaryValues から取り、取れなければ null ───
+{
+  const dictOf = (values) => ({ genre: { genreId: 900001, attributes: [{ id: 8, nameJa: '代表カラー', dictionaryValues: values.map((v, i) => ({ id: i + 1, nameJa: v })) }] } });
+  const colors = (from, n) => Array.from({ length: n }, (_, i) => `色${from + i}`);
+  const makeFetcher = (dictHandler, calls) => async (path) => {
+    calls.push(path);
+    if (!path.includes('/dictionaryValues')) return { status: 200, data: RMS_GENRE_FIXTURE };
+    return dictHandler(path);
+  };
+  const colorOf = (r) => r.genre.attributes.find((a) => a.name === '代表カラー');
+
+  // 実応答 (2026-09-20 ジャンル 205761・代表カラー) と同じ振る舞いをする偽の楽天:
+  //   page と limit は両方必須 (片方だけ = 400 invalidPageAndLimit) / limit は効く /
+  //   最後のページの先は 404 notDictionaryValueFound
+  const NO_MORE = { status: 404, data: { errors: [{ code: 'notDictionaryValueFound', message: 'Not dictionaryValue found.' }] } };
+  const rakutenLike = (all) => (p) => {
+    const page = Number((p.match(/[?&]page=(\d+)/) || [])[1] || 0);
+    const limit = Number((p.match(/[?&]limit=(\d+)/) || [])[1] || 0);
+    if (!page || !limit) return { status: 400, data: { errors: [{ code: 'invalidPageAndLimit', message: 'Both page and limit parameters are required.' }] } };
+    const slice = all.slice((page - 1) * limit, page * limit);
+    return slice.length === 0 ? NO_MORE : { status: 200, data: dictOf(slice) };
+  };
+  const dictCallsOf = (list) => list.filter((p) => p.includes('/dictionaryValues'));
+
+  let calls = [];
+  const one = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher(rakutenLike(['-', 'ホワイト', 'ブラック', ' レッド ']), calls) });
+  check('genre: 選択式だけ選択肢を取りに行く (属性ID 8・page と limit を両方送る・1 回で終わり)',
+    one.ok && JSON.stringify(colorOf(one).options) === JSON.stringify(['-', 'ホワイト', 'ブラック', 'レッド'])
+    && dictCallsOf(calls).length === 1
+    && /^\/service-api\/rakuten-rms\/genres\/900001\/attributes\/8\/dictionaryValues\?page=1&limit=1000/.test(dictCallsOf(calls)[0])
+    && one.genre.attributes.find((x) => x.name === 'ブランド名').options === undefined,
+    JSON.stringify(calls));
+  check('genre: 人が押した取り直し (force) は miniPC の失敗のキャッシュも通り越す (refresh=1)',
+    dictCallsOf(calls).every((p) => p.includes('refresh=1')), JSON.stringify(calls));
+  check('genre: 選択肢は保存され、次はキャッシュから返る',
+    JSON.stringify(colorOf({ genre: listing.getCachedGenreAttributes(db, '900001') }).options) === JSON.stringify(['-', 'ホワイト', 'ブラック', 'レッド']));
+
+  calls = [];
+  const full = await listing.fetchGenreAttributes(db, '900001', { force: true, fetcher: makeFetcher(rakutenLike(colors(1, 1000)), calls) });
+  check('genre: ちょうど満杯のページの次が 404 notDictionaryValueFound なら「そろった」(1000 件)',
+    colorOf(full).options.length === 1000 && dictCallsOf(calls).length === 2 && dictCallsOf(calls)[1].includes('page=2&limit=1000'), JSON.stringify(dictCallsOf(calls)));
+
+  const tooMany = await listing.fetchGenreAttributes(db, '900001', { force: true, fetcher: makeFetcher(rakutenLike(colors(1, 1001)), []) });
+  check('genre: 多すぎる選択肢は持たない ([] = セレクトにしない・取り直さない)', Array.isArray(colorOf(tooMany).options) && colorOf(tooMany).options.length === 0);
+
+  const noValues = await listing.fetchGenreAttributes(db, '900001', { force: true, fetcher: makeFetcher(rakutenLike([]), []) });
+  check('genre: 1 ページ目から notDictionaryValueFound = 選択肢が無い属性 ([]・失敗ではない)', Array.isArray(colorOf(noValues).options) && colorOf(noValues).options.length === 0);
+
+  const samePage = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher(() => ({ status: 200, data: dictOf(colors(1, 1000)) }), []) });
+  check('🚨 genre: page を無視して同じ一覧を返す応答は「そろった」と言えない (null)', colorOf(samePage).options === null);
+
+  const plain404 = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher((p) => (p.includes('page=2') ? { status: 404, data: null } : { status: 200, data: dictOf(colors(1, 1000)) }), []) });
+  check('🚨 genre: 本文の無い 404 (miniPC に口が無い等) は「その先は無い」の証拠にしない (null)', colorOf(plain404).options === null);
+
+  const brokenMid = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher((p) => (p.includes('page=2') ? { status: 503, data: null } : { status: 200, data: dictOf(colors(1, 1000)) }), []) });
+  check('🚨 genre: 途中で落ちたら途中までの一覧を出さない (null = 自由入力のまま)', brokenMid.ok && colorOf(brokenMid).options === null);
+
+  const blankName = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher((p) => (p.includes('page=1&') ? { status: 200, data: dictOf([...colors(1, 999), '']) } : NO_MORE), calls = []) });
+  check('genre: 満杯かどうかは整形前の件数で数える (空の名前が混ざっても次のページを見る)',
+    colorOf(blankName).options.length === 999 && dictCallsOf(calls).length === 2, String(dictCallsOf(calls).length));
+
+  // 締切はページごとに見る: 時計を進めるフェッチャで、20 ページぶん待ち続けないこと (Codex R1 medium)
+  {
+    const realNow = Date.now; let skew = 0; let dictCalls = 0;
+    Date.now = () => realNow() + skew;
+    try {
+      // 毎回 29 秒かかり、いつまでも満杯のページが続く (新しい値は 1 ページ 40 件 = 上限 1,000 件には届かない)
+      const endless = (p) => {
+        dictCalls += 1; skew += 29_000;
+        const page = Number((p.match(/page=(\d+)/) || [])[1]);
+        return { status: 200, data: dictOf(Array.from({ length: 1000 }, (_, i) => `色${page}-${i % 40}`)) };
+      };
+      const slow = await listing.fetchGenreAttributes(db, '900001', { force: true, fetcher: makeFetcher(endless, []) });
+      check('genre: 合計 60 秒の締切を超えたら、ページの途中でもやめて出さない (null・通信は 3 回まで)',
+        colorOf(slow).options === null && dictCalls === 3, JSON.stringify({ options: colorOf(slow).options, dictCalls }));
+    } finally { Date.now = realNow; }
+  }
+
+  // miniPC が古い版 (口が無い = 404) でも辞書そのものは使える
+  const noRoute = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher(() => ({ status: 404, data: null }), []) });
+  check('genre: 選択肢が取れなくても辞書は保存される', noRoute.ok && colorOf(noRoute).options === null
+    && listing.getCachedGenreAttributes(db, '900001').attributes.length === 4);
+  calls = [];
+  const keep = await listing.fetchGenreAttributes(db, '900001', { fetcher: makeFetcher(() => ({ status: 404, data: null }), calls) });
+  check('genre: 取れなかった印 (null) は、出品・プレビューの経路では取り直さない', keep.cached === true && calls.length === 0);
+  const retry = await listing.fetchGenreAttributes(db, '900001', { retryOptions: true,
+    fetcher: makeFetcher(rakutenLike(['ホワイト']), calls) });
+  check('genre: 「ジャンル情報を取得」(retryOptions) では取り直す (miniPC の失敗のキャッシュも通り越す)',
+    retry.cached === false && colorOf(retry).options.length === 1
+    && calls.filter((p) => p.includes('/dictionaryValues')).every((p) => p.includes('refresh=1')), JSON.stringify(calls));
+
+  // 選択肢を取る前の版で保存された辞書 (options が無い) は 1 回だけ取り直す
+  const oldPayload = listing.getCachedGenreAttributes(db, '900001').attributes.map(({ options, id, ...rest }) => rest);
+  db.prepare(`UPDATE ph_genre_attributes SET payload_json = ? WHERE genre_id = '900001'`).run(JSON.stringify(oldPayload));
+  const migrated = await listing.fetchGenreAttributes(db, '900001', { fetcher: makeFetcher(rakutenLike(['ホワイト', 'ブラック']), []) });
+  check('genre: 旧形式のキャッシュは取り直して選択肢が入る', migrated.cached === false && colorOf(migrated).options.length === 2);
+
+  check('genre: pickDictionaryValues は形が違えば null・件数は整形前で数える',
+    listing.pickDictionaryValues({ genre: { attributes: [{ id: 8, dictionaryValues: [{ id: 1, nameJa: '' }, { id: 2, nameJa: '白' }] }] } }, 8).rawCount === 2
+    // 属性 ID が違う一覧は、1 件だけでも採用しない (Codex R2)
+    && listing.pickDictionaryValues({ genre: { attributes: [{ id: 99, dictionaryValues: [{ id: 1, nameJa: '白' }] }] } }, 8) === null
+    && listing.pickDictionaryValues({ genre: { attributes: [{ dictionaryValues: [{ id: 1, nameJa: '白' }] }] } }, 8) === null
+    && listing.pickDictionaryValues(null, 8) === null && listing.pickDictionaryValues({ genre: { attributes: [{ id: 8 }] } }, 8) === null
+    && listing.pickDictionaryValues({ genre: { attributes: [{ id: 1, dictionaryValues: [] }, { id: 2, dictionaryValues: [] }] } }, 8) === null);
+}
 
 db.prepare(`DELETE FROM product_drafts WHERE id = ?`).run(gdId);
 db.prepare(`DELETE FROM ph_genre_attributes WHERE genre_id = '900001'`).run();
@@ -3165,7 +3438,7 @@ let wfDraftId = null;
   // TOP画像は工程でなく「画像が登録されているか」で見る (2026-08-31) ので、
   // ここでは画像を入れて**詳細 (LP) の工程が終わっていない**ことだけをゲートの理由にする
   db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'gate-img-1', 0)`).run(idGate);
-  const blocked = listing.buildItemPayload(db, idGate);
+  const blocked = listing.buildItemPayload(db, idGate, LEGACY_TAX);
   check('画像の工程が未完了なら出品を止める',
     (blocked.reasons || []).some((x) => /画像の工程が終わっていません/.test(x)), JSON.stringify(blocked.reasons || []).slice(0, 200));
   check('止める理由にいまの工程が出る',
@@ -3214,8 +3487,8 @@ let wfDraftId = null;
     wfp.setStepState(idGate, s.step_code, { state: 'done' }, 'admin', ADMIN);
   }
   check('詳細対象外なら TOP 承認だけで画像の理由が消える',
-    !(listing.buildItemPayload(db, idGate).reasons || []).some((x) => /画像トラック/.test(x)),
-    JSON.stringify((listing.buildItemPayload(db, idGate).reasons || []).filter((x) => /画像/.test(x))));
+    !(listing.buildItemPayload(db, idGate, LEGACY_TAX).reasons || []).some((x) => /画像トラック/.test(x)),
+    JSON.stringify((listing.buildItemPayload(db, idGate, LEGACY_TAX).reasons || []).filter((x) => /画像/.test(x))));
   // 対象外を解除すると詳細側が未完了なのでまたブロックされる
   wfp.setDetailImagesExcluded(idGate, false, 'admin', ADMIN);
   check('対象外を解除すると詳細側でまたブロック',
@@ -3304,7 +3577,7 @@ let wfDraftId = null;
     if (s.state !== 'done') wfp.setStepState(idGate, s.step_code, { state: s.step_code === 'imgd_rakuten' ? 'skip' : 'done' }, 'admin', ADMIN);
   }
   check('画像承認まで終われば画像の理由は消える',
-    !(listing.buildItemPayload(db, idGate).reasons || []).some((x) => /画像トラック/.test(x)));
+    !(listing.buildItemPayload(db, idGate, LEGACY_TAX).reasons || []).some((x) => /画像トラック/.test(x)));
 
   // 後から足した画像工程: 既に楽天へ登録済みの商品だけ done で入る (承認者に「出品済みの承認」をさせない)
   const idListedRk = Number(db.prepare(
@@ -3357,6 +3630,42 @@ const ms = await import('../lib/mall-status.js');
   check('掲載日が入る', !!st2.list.find((m) => m.code === 'rakuten').listed_at);
   check('まだ工程は完了しない (他モールが残る)',
     wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state !== 'done');
+
+  // 🚨 楽天モールを**手で**完了にしたら、画像工程 ⑧楽天登録 も閉じる (2026-10-01)。
+  //    RMS で手で出した商品が、画像ボードの ⑧ の列に残り続けないようにする
+  //    (⑧ は役割なしの工程なので、残ると管理者しか閉じられない)
+  {
+    const idMx = Number(db.prepare(
+      "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-MALL-RK', '手で楽天に出した商品', 'approved', 'smoke')"
+    ).run().lastInsertRowid);
+    wfp.ensureProgress(db, idMx);
+    const rkStepOf = () => db.prepare(
+      "SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(idMx)?.state;
+    check('前提: ⑧楽天登録 は未着手', rkStepOf() === 'todo', rkStepOf());
+    ms.setMallState(idMx, 'yahoo', { state: 'done' }, 'admin', ADMIN);
+    check('他モールを完了にしても ⑧楽天登録 は動かない', rkStepOf() === 'todo', rkStepOf());
+    ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
+    check('🚨 楽天モールを手で完了にすると ⑧楽天登録 も完了になる', rkStepOf() === 'done', rkStepOf());
+    // 一方向 (モールを戻しても ⑧ は開けない。開くかどうかはボードの D&D で人が決める)
+    ms.setMallState(idMx, 'rakuten', { state: 'todo' }, 'admin', ADMIN);
+    check('楽天モールを戻しても ⑧楽天登録 は開かない (一方向の連動)', rkStepOf() === 'done', rkStepOf());
+    // 🚨 閉じるのは「done に変わった瞬間」だけ (Codex R7 P1)。すでに done の楽天モールの
+    //    URL やメモを直しただけで閉じ直すと、「画像を直して楽天に出し直す」ために人が開いた
+    //    ⑧ が黙って消える
+    ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
+    db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idMx);
+    ms.setMallState(idMx, 'rakuten', { item_url: 'https://item.rakuten.co.jp/b-faith/wf-mall-rk/' }, 'admin', ADMIN);
+    check('🚨 すでに完了の楽天モールの URL を直しただけでは ⑧楽天登録 を閉じ直さない (出し直しの作業が消えない)',
+      rkStepOf() === 'todo', rkStepOf());
+    ms.setMallState(idMx, 'rakuten', { note: 'メモだけ更新' }, 'admin', ADMIN);
+    check('メモだけの更新でも ⑧楽天登録 を閉じ直さない', rkStepOf() === 'todo', rkStepOf());
+    // 「対象外」にしてあった ⑧ は上書きしない (人が決めた予定を消さない)
+    db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idMx);
+    ms.setMallState(idMx, 'rakuten', { state: 'todo' }, 'admin', ADMIN);
+    ms.setMallState(idMx, 'rakuten', { state: 'done' }, 'admin', ADMIN);
+    check('⑧楽天登録 が「対象外」なら自動完了で上書きしない', rkStepOf() === 'skip', rkStepOf());
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idMx);
+  }
 
   // URL の検証
   let urlErr = null;
@@ -3706,7 +4015,7 @@ let wfSetParentId = null;
   check('セットからさらにセットは作れない', nestErr?.status === 400);
 
   // 出品ゲート: 仮コードのままでは出品できない
-  const payload = listing.buildItemPayload(db, r.draftId);
+  const payload = listing.buildItemPayload(db, r.draftId, LEGACY_TAX);
   check('仮コードのままでは出品を止める',
     (payload.reasons || []).some((x) => /商品コードが仮のまま/.test(x)),
     JSON.stringify(payload.reasons || []).slice(0, 200));
@@ -3737,7 +4046,7 @@ let wfSetParentId = null;
   const notInNe = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId);
   check('NE未確認なら仮フラグは残る', notInNe.provisional_code === 1);
   check('NE未確認でも出品は止まる',
-    (listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /NE商品マスタに見つかりません/.test(x)));
+    (listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []).some((x) => /NE商品マスタに見つかりません/.test(x)));
   check('NEに無いうちは自動確定しない', sd.reconcileProvisionalCode(db, { ...notInNe }) === false);
   // NE 商品マスタに現れたら確定する
   db.prepare(`
@@ -3768,19 +4077,19 @@ let wfSetParentId = null;
     && db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`).get(parentId)?.state === 'todo');
   db.prepare(`DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`).run(parentId);
   check('確定後は出品ゲートが開く',
-    !(listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /商品コード/.test(x)));
+    !(listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []).some((x) => /商品コード/.test(x)));
 
   // 配送方法 (§4.4 決⑥ + 2026-09-05 中原さん判断)。
   // セットは親からコピーしないので、**NE の配送方法が唯一の出どころ**。
   // NE にも無ければ「決まらない」ので出品を止める — 送らないまま出すと、
   // 商品ページの帯と楽天の設定が食い違ったまま世に出る
   check('セット: NE に配送方法が無ければ出品を止める',
-    (listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /配送方法が決まりません/.test(x)),
-    JSON.stringify(listing.buildItemPayload(db, r.draftId).reasons || []));
+    (listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []).some((x) => /配送方法が決まりません/.test(x)),
+    JSON.stringify(listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []));
   db.prepare(`UPDATE mirror_products SET 配送方法 = 'ネコポス' WHERE 商品コード = 'WF-SET-REAL'`).run();
   check('セット: NE に配送方法が載れば、選ばなくても出品できる (単品と違うのはここ)',
-    !(listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /配送方法/.test(x)),
-    JSON.stringify(listing.buildItemPayload(db, r.draftId).reasons || []));
+    !(listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []).some((x) => /配送方法/.test(x)),
+    JSON.stringify(listing.buildItemPayload(db, r.draftId, LEGACY_TAX).reasons || []));
   // (送る値そのものは payloadShippingGroup の単体テストで見ている。
   //  ここは画像が未登録なので payload まで組み上がらない = 出品ゲートの他の理由が先に立つ)
   check('確定後は Notion カードも作れる',
@@ -3855,14 +4164,24 @@ let wfSetParentId = null;
     sd.applyReuseImages(db, setId).copied === 0
     && db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(setId).c === 3);
 
-  // ④ 全部そのまま使うなら制作は要らない = 画像の工程は「対象外」で決着
+  // ④ 全部そのまま使うなら制作は要らない = 画像の工程は「対象外」で決着。
+  //    🚨 ただし ⑧楽天登録 は残す (2026-10-01): 画像を作る仕事は無くても楽天には出すので、
+  //       ここを対象外にすると「楽天未登録なのにカードが完了列」になり、人が楽天登録の列へ
+  //       戻しても計画を保存し直すと黙って対象外に戻る
   const detailSteps = () => db.prepare(`
     SELECT p.step_code, p.state FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
     WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail' ORDER BY s.sort
   `).all(setId);
+  const prodSteps = () => detailSteps().filter((x) => x.step_code !== 'imgd_rakuten');
+  const rkStep = () => detailSteps().find((x) => x.step_code === 'imgd_rakuten')?.state;
   check('全部そのまま使う → 画像の制作工程は「対象外」で決着する',
-    detailSteps().length > 0 && detailSteps().every((x) => x.state === 'skip'),
+    prodSteps().length > 0 && prodSteps().every((x) => x.state === 'skip'),
     JSON.stringify(detailSteps().map((x) => x.state)));
+  check('🚨 全部そのまま使っても ⑧楽天登録 は対象外にしない (楽天には出すので)',
+    rkStep() === 'todo', rkStep());
+  check('🚨 全部そのまま使うセットのカードは完了列ではなく ⑧楽天登録 の列に出る',
+    wfp.progressOf(setId, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+    wfp.progressOf(setId, { db }).imageDetail.current?.step_code || '(完了列)');
 
   // ⑤ 1枠でも「直して使う」にすると制作が動き出し、指示が依頼に載る
   const put = (items) => sd.replaceSetImagePlans(db, setId, items, 'smoke');
@@ -3917,8 +4236,43 @@ let wfSetParentId = null;
 
   // ⑦ 戻せば制作工程もまた「対象外」になる (todo のものだけ。人が進めた done は触らない)
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
-  check('全部そのまま使うに戻せば、制作工程はまた「対象外」になる',
-    detailSteps().every((x) => x.state === 'skip'), JSON.stringify(detailSteps().map((x) => x.state)));
+  check('全部そのまま使うに戻せば、制作工程はまた「対象外」になる (⑧楽天登録は残る)',
+    prodSteps().every((x) => x.state === 'skip') && rkStep() === 'todo',
+    JSON.stringify(detailSteps().map((x) => x.state)));
+  // 🚨 この修正より前に作ったセット (⑧ が対象外のまま) は、計画を保存し直したときに開き直す。
+  //    反映対象から完全に外すと、既存のカードが永久に完了列から出てこない (Codex 名指し R2 P1)
+  db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 対象外で残っていた ⑧楽天登録 は、画像の計画を保存し直すと開き直る (既存セットの収束)',
+    rkStep() === 'todo', rkStep());
+  // 🚨 もう楽天に出ている旧セットは `todo` ではなく `done` で開ける (Codex R10 P2)。
+  //    `todo` にすると閉じる自動の経路が無く、出品済みなのに ⑧楽天登録 の列に残り続ける
+  db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
+  db.prepare(`
+    INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
+    ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'done'
+  `).run(setId);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 もう楽天に出ている旧セットは ⑧楽天登録 を「完了」で開ける (未着手で残すと閉じられない)',
+    rkStep() === 'done', rkStep());
+  // 🚨 完了の日時・人は**実際に楽天へ出したときのもの** (名指し R5 P2)。計画を保存した時刻・人を
+  //    入れると工程の所要時間や担当者の集計が狂う
+  {
+    const rkRow = db.prepare("SELECT done_at, done_by FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(setId);
+    const listedAt = db.prepare("SELECT listed_at FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").get(setId)?.listed_at || null;
+    check('🚨 計画の保存で完了にした ⑧ の日時は実際の出品の日時・人は system (計画を保存した人を入れない)',
+      rkRow?.done_by === 'system' && rkRow?.done_at === listedAt, JSON.stringify({ ...rkRow, listedAt }));
+    const ev = db.prepare("SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_image_plan_rakuten' ORDER BY id DESC LIMIT 1").get(setId);
+    check('🚨 ⑧を動かしたことは別のイベントで残る (制作工程の 1 行に埋もれない)',
+      !!ev && /完了/.test(ev.detail), ev?.detail || '(イベントが無い)');
+  }
+  // 🚨 楽天モールが「対象外」のセットは ⑧ を開かない (開くと閉じられず詰まる)
+  db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
+  db.prepare("UPDATE draft_mall_status SET state = 'skip' WHERE draft_id = ? AND mall = 'rakuten'").run(setId);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 楽天が「対象外」のセットは ⑧楽天登録 を開かない (対象外のまま)', rkStep() === 'skip', rkStep());
+  db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(setId);
+  db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(setId);
   const firstStep = detailSteps()[0].step_code;
   db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = ?`).run(setId, firstStep);
   put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
@@ -3952,15 +4306,15 @@ let wfSetParentId = null;
     check('🚨 制作が done でも、あとから足した「直して使う」の枠は「まだ空」と分かる',
       pend.length === 1 && pend[0].slot === 2, JSON.stringify(pend.map((x) => x.slot)));
     check('🚨 その状態では出品ゲートが止める (工程が done でも)',
-      (listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
-      JSON.stringify(listing.buildItemPayload(db, setId).reasons || []));
+      (listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []));
     // 画像が届けば止まらない (計画より後に入った画像であること)
     db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)')
       .run(setId, 'made-01', sip.imageSortOfSlot(2));
     check('画像が届けば、計画の枠では止まらなくなる',
       sd.pendingImagePlanSlots(db, setId).length === 0
-      && !(listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
-      JSON.stringify(listing.buildItemPayload(db, setId).reasons || []));
+      && !(listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []));
 
     // 🚨 指示を変えたら、**前の指示で作った画像では満たされない** (Codex R2 high)。
     // 「2個並べて」の成果物が入っていても、「3個並べて」に変えたら作り直しが要る
@@ -3970,7 +4324,7 @@ let wfSetParentId = null;
       sd.pendingImagePlanSlots(db, setId).map((x) => x.slot).join(',') === '2',
       JSON.stringify(sd.pendingImagePlanSlots(db, setId).map((x) => x.slot)));
     check('🚨 指示を変えたあとは出品も止まる',
-      (listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)));
+      (listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)));
 
     // 🚨 指定を変えた枠は、変えた先が何であれ前の画像を残さない (Codex R3 high)
     db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)')
@@ -4017,7 +4371,7 @@ let wfSetParentId = null;
         images: db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ?').all(setId),
       }));
     check('🚨 その状態では出品も止まる',
-      (listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画/.test(x)));
+      (listing.buildItemPayload(db, setId, LEGACY_TAX).reasons || []).some((x) => /画像の計画/.test(x)));
     check('使わない枠は空でよい (未達に数えない)',
       !sd.pendingImagePlanSlots(db, setId).some((x) => x.action === 'drop'));
     db.prepare('DELETE FROM draft_images WHERE draft_id = ?').run(setId);
@@ -4183,6 +4537,12 @@ let wfSetParentId = null;
     wfp.moveBoardCard(setId, { view: 'main', to: 'ai_generate', expectedCurrent: 'set_compose' }, 'smoke', ADMIN2);
   } catch (e) { noColErr = e; }
   check('D&D: セットが持たない列には落とせない', noColErr?.status === 400, noColErr?.message || '通ってしまった');
+  // 「移動先の工程が見つかりません」だけだと何が悪いのか分からない (2026-09-25 スタッフ報告)
+  check('D&D: セットが持たない列の理由と進め方を言う',
+    /セット商品には「AI情報入力待ち」の工程がありません/.test(noColErr?.message || '') && /セット工程」タブ/.test(noColErr?.message || ''),
+    noColErr?.message || '');
+  check('D&D: セットが持たない列に落としても工程は動かない',
+    wfp.progressOf(setId, { db }).current?.step_code === 'set_compose', wfp.progressOf(setId, { db }).current?.step_code);
 
   // ⑥ 権限 (§4.1): セット企画者はセット工程の全部を操作できる。単品には効かない
   const plannerId = Number(db.prepare(
@@ -4637,7 +4997,9 @@ let wfSetParentId = null;
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(madeId);
 
       // 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列 ②仮構成 とは別の印で持ち、
-      // 印が無くても ③素材待ちが決着していれば 済 とみなす (既存カードを軒並み まだ にしない)
+      // 印が無くても ④AI制作が決着していれば 済 とみなす (= ⑤デザイン修正 に移った時点。
+      // 2026-10-01 スタッフ要望で ③素材待ち から 1 列ずらした — AI制作 の最中は
+      // まだ構成ができていない商品がある)
       {
         const cId = Number(db.prepare(
           "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-COMPOSE', '構成 済 判定テスト', 'draft', 'smoke')"
@@ -4645,7 +5007,7 @@ let wfSetParentId = null;
         wfp.ensureProgress(db, cId);
         const composeOf = () => wfp.boardData(db, {}).columns.flatMap((c) => c.cards)
           .find((x) => x.id === cId)?.image?.compose;
-        check('ボード 構成: 印が無く ③素材待ち も終わっていなければ「まだ」', composeOf()?.done === false, JSON.stringify(composeOf()));
+        check('ボード 構成: 印が無く ④AI制作 も終わっていなければ「まだ」', composeOf()?.done === false, JSON.stringify(composeOf()));
         for (const code of ['imgd_request', 'imgd_compose']) wfp.setStepState(cId, code, { state: 'done' }, 'smoke', ADMIN);
         check('ボード 構成: ②仮構成 が終わっても、本番の構成の印が無ければ「まだ」',
           composeOf()?.done === false, JSON.stringify(composeOf()));
@@ -4654,11 +5016,17 @@ let wfSetParentId = null;
           composeOf()?.done === true && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
         db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
         wfp.setStepState(cId, 'imgd_material', { state: 'done' }, 'smoke', ADMIN);
-        check('ボード 構成: 人が決めていなくても ③素材待ちが決着していれば「済」とみなす',
+        // 🚨 2026-10-01 スタッフ要望の本体: ③素材待ち が決着して ④AI制作 に居るだけでは「まだ」。
+        //    AI で画像を作った時点で構成が確定する商品があるので、ここで 済 にすると
+        //    構成ができていないカードが「済」で出る
+        check('ボード 構成: ③素材待ちが決着して ④AI制作 に居るだけでは「まだ」 (2026-10-01)',
+          composeOf()?.done === false && composeOf()?.implied === false && composeOf()?.marked === false, JSON.stringify(composeOf()));
+        wfp.setStepState(cId, 'imgd_ai', { state: 'done' }, 'smoke', ADMIN);
+        check('ボード 構成: 人が決めていなくても ④AI制作が決着 (= ⑤デザイン修正 に移った) なら「済」とみなす',
           composeOf()?.done === true && composeOf()?.implied === true && composeOf()?.marked === false, JSON.stringify(composeOf()));
         // Codex R1: 推定の 済 でも人が「まだ」にしたらそちらが勝つ (戻せないと誤操作を直せない)
         db.prepare("UPDATE draft_image_production SET compose_status = 'todo' WHERE draft_id = ?").run(cId);
-        check('ボード 構成: 人が「まだ」にしたら ③素材待ちが済んでいても「まだ」 (推定より人の値)',
+        check('ボード 構成: 人が「まだ」にしたら ④AI制作が済んでいても「まだ」 (推定より人の値)',
           composeOf()?.done === false && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
         db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
         check('ボード 構成: 詳細画像が対象外なら 対象外 (済にしない)', (() => {
@@ -4986,6 +5354,8 @@ let wfSetParentId = null;
   const wfp = wfpEarly;
   const express = (await import('express')).default;
   const routerMod = await import('../router.js');
+  // 切替の段階 = legacy_open (マスタの古い入口の門を今までどおり通す。門そのものの試験は scripts/test-master-legacy-gate.mjs)
+  (await import('../../../lib/master-legacy-gate.mjs')).__setLegacyPhaseReader(async () => ({ readable: true, phase: 'legacy_open' }));
   const app = express();
   // セッションを偽装して直接マウント (本番は server.js の requireAppAccess を通る)
   // 一部のテストは一般ユーザーとして叩く (smokeSession を差し替える)
@@ -5097,11 +5467,15 @@ let wfSetParentId = null;
     'SELECT version FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code)?.version;
   const eventsOf = (id) => db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'step_changed' ORDER BY id`).all(id).map((r) => r.detail);
 
-  // 一般ユーザーは基本情報 → 商品説明確認 へ直接は動かせない (間の AI待ち = システム工程は admin のみ。特例は作らない)
+  // AI待ちは一般ユーザーも跨げる (2026-09-25 スタッフ要望) が、その先に他人の担当工程があれば
+  // 全体ロールバック = 先行した basic_info・AI待ちも元に戻る (中途半端に進めない)
+  db.prepare(`UPDATE draft_step_progress SET assignee_id = ? WHERE draft_id = ? AND step_code = 'desc_review'`).run(wfOkawaId, idM5);
   let dndSys = null;
-  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'desc_review', expectedCurrent: 'basic_info' }, 'tanaka', TANAKA); } catch (e) { dndSys = e; }
-  check('D&D 自動引き受け: システム工程 (AI待ち) は一般ユーザーでは跨げない (403) + 先行の basic_info もロールバック',
-    dndSys?.status === 403 && stepOf(idM5, 'basic_info') === 'todo' && assigneeOf(idM5, 'basic_info') == null, dndSys?.message || '例外が出ていない');
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'title_approve', expectedCurrent: 'basic_info' }, 'tanaka', TANAKA); } catch (e) { dndSys = e; }
+  check('D&D: AI待ちを跨いだ先で他人の担当に当たったら 403 + basic_info・AI待ちもロールバック',
+    dndSys?.status === 403 && stepOf(idM5, 'basic_info') === 'todo' && assigneeOf(idM5, 'basic_info') == null
+    && stepOf(idM5, 'ai_generate') === 'todo', dndSys?.message || '例外が出ていない');
+  db.prepare(`UPDATE draft_step_progress SET assignee_id = NULL WHERE draft_id = ? AND step_code = 'desc_review'`).run(idM5);
   // 基本情報 → AI待ちの列 (隣) へは動かせる = 未割り当ての basic_info を引き受けて完了 (version は 1 だけ増える・イベント 1 件)
   const v0 = versionOf(idM5, 'basic_info');
   const ev0 = eventsOf(idM5).length;
@@ -5114,8 +5488,42 @@ let wfSetParentId = null;
   check('D&D 自動引き受け: イベントは 1 件で「自動引き受け」と明記', evs.length === ev0 + 1 && /自動引き受け/.test(evs[evs.length - 1]), JSON.stringify(evs.slice(ev0)));
   check('D&D 自動引き受け: 移動先がシステム工程なら担当は付けない', assigneeOf(idM5, 'ai_generate') == null);
 
-  // AI待ちが済んだ体にして、商品説明確認 → セット検討 へ (title_approve を跨ぐ)
-  wfpEarly.setStepState(idM5, 'ai_generate', { state: 'done' }, 'smoke', ADMIN2);
+  // AI待ち → 商品説明確認: 一般ユーザーが AI を待たずに手で進められる (2026-09-25 スタッフ要望。
+  // 既存ページへのカラバリ追加などで人が項目を入れた商品が、管理者に頼まないと進めなかった)
+  const statusOfM5 = () => db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(idM5).status;
+  check('前提: AI待ちの列 = ready_for_ai', statusOfM5() === 'ready_for_ai', statusOfM5());
+  const evAi0 = eventsOf(idM5).length;
+  dndClaim = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'desc_review', expectedCurrent: 'ai_generate' }, 'tanaka', TANAKA); } catch (e) { dndClaim = e; }
+  check('D&D: 一般ユーザーが AI待ち → 商品説明確認 へ手で進められる',
+    dndClaim === null && stepOf(idM5, 'ai_generate') === 'done' && statusOfM5() === 'review', dndClaim?.message || statusOfM5());
+  check('D&D: AI待ちを手で進めても担当は付けない (システム工程のまま)', assigneeOf(idM5, 'ai_generate') == null);
+  {
+    // AI が生成中 (claim 済み) に人が手で進めたら、AI の結果は書き込ませない (Codex R1 要確認)。
+    // 書き込み直前の再確認 acquireGenerationWriteLock が status=ready_for_ai を見るので拒否される
+    db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'run-smoke-race',
+      generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(idM5);
+    check('D&D: 生成中に手で進めた商品には AI の書き込み権を渡さない',
+      dbmod.acquireGenerationWriteLock(db, idM5, 'run-smoke-race') === false);
+    db.prepare('UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id = ?').run(idM5);
+  }
+  check('D&D: AI待ちを手で進めたことがイベントで読み分けられる',
+    eventsOf(idM5).slice(evAi0).some((e) => /AI情報入力待ち: .*完了 \(AI を待たずに手で進めた\)/.test(e)), JSON.stringify(eventsOf(idM5).slice(evAi0)));
+  // 戻す (AI にもう一度書かせる) のも一般ユーザーができる = 夜間の AI キューに戻る
+  dndClaim = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'ai_generate', expectedCurrent: 'desc_review' }, 'tanaka', TANAKA); } catch (e) { dndClaim = e; }
+  check('D&D: 一般ユーザーが AI待ちの列へ戻せる (ready_for_ai に戻る)',
+    dndClaim === null && stepOf(idM5, 'ai_generate') === 'todo' && statusOfM5() === 'ready_for_ai', dndClaim?.message || statusOfM5());
+  // 状態以外 (対象外・担当の付け替え) は従来どおり管理者だけ
+  let aiSkip = null;
+  try { wfpEarly.setStepState(idM5, 'ai_generate', { state: 'skip' }, 'tanaka', TANAKA); } catch (e) { aiSkip = e; }
+  check('AI待ちの「対象外」は一般ユーザーにはできない', aiSkip?.status === 403, aiSkip?.message || '通ってしまった');
+  let aiAssign = null;
+  try { wfpEarly.setStepState(idM5, 'ai_generate', { state: 'done', assignee_id: wfTanakaId }, 'tanaka', TANAKA); } catch (e) { aiAssign = e; }
+  check('AI待ちに担当を付けながら進めることは一般ユーザーにはできない', aiAssign?.status === 403 && stepOf(idM5, 'ai_generate') === 'todo', aiAssign?.message || '通ってしまった');
+  wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'desc_review', expectedCurrent: 'ai_generate' }, 'tanaka', TANAKA);
+
+  // 商品説明確認 → セット検討 へ (title_approve を跨ぐ)
   dndClaim = null;
   try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'set_review', expectedCurrent: 'desc_review' }, 'tanaka', TANAKA); } catch (e) { dndClaim = e; }
   check('D&D 自動引き受け: 通過工程 2 つを一度に引き受けて done', dndClaim === null
@@ -5153,6 +5561,13 @@ let wfSetParentId = null;
     });
     check('工程API: body の boardClaim は無視され、未割り当て工程の引き受け+完了は 403', r.status === 403
       && stepOf(idM5, 'title_approve') === 'todo' && assigneeOf(idM5, 'title_approve') == null, JSON.stringify(r.json));
+    // boardMove も同じ: D&D 経路の内部オプションなので body で送っても効かない (2026-10-01)。
+    // AI待ちは役割なしのシステム工程 = 抜け道の対象に見える形で試す
+    r = await call('POST', `/api/drafts/${idM5}/steps/ai_generate`, {
+      state: 'skip', boardMove: true, expected_version: versionOf(idM5, 'ai_generate'),
+    });
+    check('工程API: body の boardMove は無視され、システム工程の「対象外」は 403 のまま',
+      r.status === 403 && stepOf(idM5, 'ai_generate') !== 'skip', JSON.stringify(r.json));
   } finally { smokeSession = adminSession; }
 
   // 画像ビュー: 依頼 → 素材待ち へ (依頼・構成が done)、完了列で残りをまとめて閉じる。
@@ -5178,6 +5593,229 @@ let wfSetParentId = null;
     wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'detail', to: 'compose', expectedCurrent: 'imgd_aplus' }, 'smoke', ADMIN2);
   } catch (e) { moveCas = e; }
   check('D&D の CAS: 掴んだ時点の工程と違えば 409', moveCas?.status === 409, moveCas?.message || '例外が出ていない');
+
+  // 🚨 落とした列が「いまやる番」になること (2026-10-01 スタッフ報告:「2個セットで楽天未登録なのに
+  //    『楽天登録』に移動しようとすると『A＋コンテンツ』まで飛ばされる」)。
+  //    原因 = 親の画像をそのまま使うセットは作成時に画像の工程がまるごと「対象外」になる
+  //    (applyImagePlanToTrack) ので、⑧楽天登録 が skip のまま残り、前方移動が移動先を飛ばしていた
+  {
+    const idSkip = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SKIPTGT', '対象外の列へ落とす', 'smoke')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idSkip);
+    const st = (code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkip, code)?.state;
+    // セット作成と同じ形を作る: 詳細の画像工程をまるごと「対象外」にする (applyImagePlanToTrack と同じ)
+    for (const code of dbmod.DETAIL_V2_CODES) {
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, code);
+    }
+    // 🚨 まず報告どおりの形で確かめる (Codex R4 P1): 親の画像をそのまま使うセットは画像の工程が
+    //    10 段階まるごと「対象外」になるので、カードは**完了列**にいる。そこから ⑧楽天登録 に
+    //    直接落とす = 後方移動。ここで開き直せないと「楽天登録に置けない」が残る
+    {
+      const skipImg0 = wf.createStaff({ name: '完了列から楽天登録スモーク', kind: 'internal' });
+      db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'image')`).run(skipImg0);
+      check('D&D 前提: 画像の工程が全部「対象外」のカードは完了列にいる',
+        wfpEarly.progressOf(idSkip, { db }).imageDetail.current === null
+        && wfpEarly.progressOf(idSkip, { db }).imageDetail.done === true);
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: null },
+        'img', { isAdmin: false, actorStaffId: skipImg0 });
+      check('🚨 D&D: 完了列 (全部対象外) のカードを ⑧楽天登録 に直接落とせる (画像登録者でも・報告どおりの形)',
+        st('imgd_rakuten') === 'todo'
+        && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+        `⑧=${st('imgd_rakuten')} / current=${wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code}`);
+      wf.setStaffActive(skipImg0, false);
+      // 以降のテスト (前方移動) の形に戻す: ⑧ を対象外に、③素材待ちを未着手に
+      // (= 完了列のカードを人が ③ へ差し戻した状態)
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, 'imgd_rakuten');
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_material');
+    }
+    check('D&D 前提: ⑧楽天登録 が「対象外」で残り、いまの工程は ③素材待ち',
+      st('imgd_rakuten') === 'skip' && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_material');
+    // 🚨 動かすのは**管理者ではなく画像登録者** (Codex R1 P1: ⑧楽天登録 は役割を置かない
+    //    システム工程なので、管理者で試すと「非管理者は 403 で直っていない」を見逃す)
+    const skipImgStaffId = wf.createStaff({ name: '対象外の列スモーク', kind: 'internal' });
+    db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'image')`).run(skipImgStaffId);
+    const SKIP_IMG = { isAdmin: false, actorStaffId: skipImgStaffId };
+    wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_material' }, 'img', SKIP_IMG);
+    check('🚨 D&D: 対象外で残っていた ⑧楽天登録 に落とすと、そこが「いまやる番」になる (A+ へ飛ばない・画像登録者でも)',
+      st('imgd_rakuten') === 'todo'
+      && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+      `⑧=${st('imgd_rakuten')} / current=${wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code}`);
+    check('🚨 D&D: 通過した「対象外」の工程は done に書き換えない (⑤⑥⑦ は対象外のまま)',
+      st('imgd_design') === 'skip' && st('imgd_review_1') === 'skip'
+      && st('imgd_review_2') === 'skip' && st('imgd_amazon') === 'skip',
+      JSON.stringify(['imgd_design', 'imgd_review_1', 'imgd_review_2', 'imgd_amazon'].map(st)));
+    check('D&D: 通過したまだ決着していない工程は done になる (③素材待ち)', st('imgd_material') === 'done');
+    // 対象外の ⑧ を**跨いで** ⑨A+ に落とすのも通る (以前は ⑧ を done にしようとして 400 で丸ごと失敗)
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, 'imgd_rakuten');
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_amazon');
+    let overSkip = null;
+    try {
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_amazon' }, 'img', SKIP_IMG);
+    } catch (e) { overSkip = e; }
+    check('🚨 D&D: 対象外の ⑧楽天登録 を跨いで ⑨A+ に落とせる (⑧ は対象外のまま・400 にならない)',
+      !overSkip && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done' && st('imgd_aplus') === 'todo',
+      overSkip?.message || JSON.stringify(['imgd_rakuten', 'imgd_amazon', 'imgd_aplus'].map(st)));
+    // 🚨 開いた後に閉じられること (名指し R4 F: 片道にしない)。ただし**楽天登録の根拠**は要る
+    {
+      // ⑧ を未着手・⑨を未着手にして、いまの工程を ⑧ にそろえる
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code IN ('imgd_rakuten', 'imgd_aplus')").run(idSkip);
+      check('D&D 前提: いまの工程が ⑧楽天登録',
+        wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+        wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code);
+      let noEvidence = null;
+      try {
+        wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_rakuten' }, 'img', SKIP_IMG);
+      } catch (e) { noEvidence = e; }
+      check('D&D: 出品の根拠が無ければ ⑧楽天登録 は閉じられない (400・移動ごとロールバック)',
+        noEvidence?.status === 400 && /自動で完了/.test(noEvidence.message) && st('imgd_rakuten') === 'todo',
+        noEvidence?.message || '例外が出ていない');
+      // モール別の展開状況で楽天を完了 = 根拠あり → 画像登録者でも閉じられる
+      db.prepare(`
+        INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
+        ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'done'
+      `).run(idSkip);
+      wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'aplus', expectedCurrent: 'imgd_rakuten' }, 'img', SKIP_IMG);
+      check('🚨 D&D: 出品の根拠があれば画像登録者でも ⑧楽天登録 を閉じて先へ進める (片道にしない)',
+        st('imgd_rakuten') === 'done' && st('imgd_aplus') === 'todo',
+        `⑧=${st('imgd_rakuten')} / ⑨=${st('imgd_aplus')}`);
+      db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_aplus'").run(idSkip);
+    }
+    // 🚨 楽天モールが「対象外」の商品は ⑧ を開かせない (名指し R5 P1)。
+    //    開くと出品の根拠が無いので閉じられず、対象外に戻せるのは管理者だけ = カードが詰まる。
+    //    移動自体は成功し、カードは ⑧ を飛ばして先の列に出る (= 楽天に出さない商品の正しい見え方)
+    {
+      db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_amazon'").run(idSkip);
+      db.prepare(`
+        INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'skip')
+        ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'skip'
+      `).run(idSkip);
+      const mv = wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' }, 'img', SKIP_IMG);
+      check('🚨 D&D: 楽天が「対象外」の商品は ⑧楽天登録 を開かない (移動は成功・理由を返す)',
+        mv.changed === true && /楽天が「対象外」/.test(mv.reopenBlocked?.message || '')
+        && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'done',
+        `reopenBlocked=${JSON.stringify(mv.reopenBlocked)} / ⑧=${st('imgd_rakuten')}`);
+      // 🚨 管理者の D&D でも開かせない (isAdmin の早期 return より前で弾く — 名指し R6 P1)
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_amazon'").run(idSkip);
+      const mvAdmin = wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' }, 'admin', ADMIN2);
+      check('🚨 D&D: 楽天が「対象外」なら管理者でも ⑧楽天登録 は開かない',
+        /楽天が「対象外」/.test(mvAdmin.reopenBlocked?.message || '') && st('imgd_rakuten') === 'skip',
+        `reopenBlocked=${JSON.stringify(mvAdmin.reopenBlocked)} / ⑧=${st('imgd_rakuten')}`);
+      db.prepare("DELETE FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").run(idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code = 'imgd_rakuten'").run(idSkip);
+    }
+    // 🚨 「対象外」にする道は開けていない (従来どおり管理者だけ)
+    let skipSys = null;
+    try { wfpEarly.setStepState(idSkip, 'imgd_rakuten', { state: 'skip' }, 'img', SKIP_IMG); } catch (e) { skipSys = e; }
+    check('D&D の抜け道: ⑧楽天登録 を「対象外」にはできない (管理者だけ)',
+      skipSys?.status === 403, skipSys?.message || '例外が出ていない');
+    // 🚨 抜け道は画像登録者だけ (Codex R3 P1)。役割の無い担当者は従来どおり弾く
+    {
+      const noRoleId = wf.createStaff({ name: '役割なし・対象外の列スモーク', kind: 'internal' });
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('skip', idSkip, 'imgd_rakuten');
+      db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_amazon');
+      let noRoleErr = null;
+      try {
+        wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_amazon' },
+          'norole', { isAdmin: false, actorStaffId: noRoleId });
+      } catch (e) { noRoleErr = e; }
+      check('D&D の抜け道: 画像登録者の役割が無い担当者は ⑧楽天登録 を開き直せない (403・全体ロールバック)',
+        noRoleErr?.status === 403 && st('imgd_rakuten') === 'skip' && st('imgd_amazon') === 'todo',
+        noRoleErr?.message || '例外が出ていない');
+      wf.setStaffActive(noRoleId, false);
+    }
+    // 🚨 抜け道は ⑧楽天登録 の段階だけ (Codex R9 P2)。管理画面から足した「役割なしの画像工程」には
+    //    効かせない (これも従来はシステム工程 = 管理者だけの扱い)
+    {
+      const customCode = wf.createStep({ label: '役割なしのカスタム画像工程', track: 'image', image_kind: 'detail' });
+      db.prepare('UPDATE ph_steps SET role_code = NULL WHERE code = ?').run(customCode);
+      wfpEarly.ensureProgress(db, idSkip);
+      db.prepare("UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code = ?").run(idSkip, customCode);
+      const custState = () => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkip, customCode)?.state;
+      let custErr = null;
+      try {
+        wfpEarly.setStepState(idSkip, customCode, { state: 'todo' }, 'img', SKIP_IMG);
+      } catch (e) { custErr = e; }
+      check('D&D の抜け道: 役割なしのカスタム画像工程は画像登録者でも開き直せない (⑧楽天登録 の段階だけ)',
+        custErr?.status === 403 && custState() === 'skip', custErr?.message || custState());
+      db.prepare('UPDATE ph_steps SET active = 0 WHERE code = ?').run(customCode);
+      db.prepare('DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').run(idSkip, customCode);
+    }
+    // 🚨 本流のシステム工程 (出品・展開) には効かせない。そもそも「対象外」にできない工程なので、
+    //    画像トラック限定にしておけば、ここから status (expanded) を巻き戻す道は増えない
+    {
+      let listingSkip = null;
+      try { wfpEarly.setStepState(idSkip, 'listing', { state: 'skip' }, 'admin', ADMIN2); } catch (e) { listingSkip = e; }
+      check('D&D の抜け道: 「出品・展開」はそもそも対象外にできない (開き直しの対象にならない)',
+        listingSkip?.status === 400, listingSkip?.message || '例外が出ていない');
+    }
+    // 🚨 完了で残っている移動先も開き直す (Codex 名指し R2 P1)。
+    //    「楽天登録済み → ⑤デザイン修正へ差し戻し → 直したので ⑧楽天登録 へ」が通らないと、
+    //    直した版を楽天へ反映する作業が board から消える
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('done', idSkip, 'imgd_rakuten');
+    db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?').run('todo', idSkip, 'imgd_design');
+    wfpEarly.moveBoardCard(idSkip, { view: 'image', kind: 'detail', to: 'rakuten', expectedCurrent: 'imgd_design' }, 'img', SKIP_IMG);
+    check('🚨 D&D: 完了で残っている ⑧楽天登録 に落とすと開き直る (直した版を楽天へ反映する作業が見える)',
+      st('imgd_rakuten') === 'todo'
+      && wfpEarly.progressOf(idSkip, { db }).imageDetail.current?.step_code === 'imgd_rakuten',
+      st('imgd_rakuten'));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkip);
+    wf.setStaffActive(skipImgStaffId, false);
+
+    // 🚨 本流で「対象外の未割り当て工程」に落とす場合 (Codex R3 P2)。
+    //    開き直しと引き受けを一緒にやらないと「先に『自分が担当する』を押してから」で 403 になり、
+    //    飛ばされる不具合が 403 に変わるだけになる
+    const idSkipMain = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+      VALUES ('DRV-SKIPMAIN', '本流の対象外の列へ落とす', 'https://example.com/skipmain', 'smoke')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idSkipMain);
+    db.prepare('UPDATE draft_step_progress SET assignee_id = NULL WHERE draft_id = ?').run(idSkipMain);
+    const stM = (code) => db.prepare('SELECT state, assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSkipMain, code) || {};
+    // 管理者が「商品説明確認」を対象外にしてから、未着手の基本情報に戻す
+    wfpEarly.setStepState(idSkipMain, 'desc_review', { state: 'skip' }, 'admin', ADMIN2);
+    const regStaffId = wf.createStaff({ name: '商品登録者スモーク', kind: 'internal' });
+    db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'registrar')`).run(regStaffId);
+    const REG = { isAdmin: false, actorStaffId: regStaffId };
+    let mainSkipErr = null;
+    try {
+      wfpEarly.moveBoardCard(idSkipMain, { view: 'main', to: 'desc_review', expectedCurrent: 'basic_info' }, 'reg', REG);
+    } catch (e) { mainSkipErr = e; }
+    check('🚨 D&D: 本流で「対象外」の未割り当て工程に落とすと、引き受けつきで開き直る (403 にしない)',
+      !mainSkipErr && stM('desc_review').state === 'todo' && stM('desc_review').assignee_id === regStaffId,
+      mainSkipErr?.message || JSON.stringify(stM('desc_review')));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSkipMain);
+
+    // 🚨 移動先が**完了**かつ**他人の担当**のときは、開き直しだけ諦めて移動は成功させる
+    //    (Codex 名指し R3 P1: 前は移動先を触らなかったので通っていた操作を 403 にしない)。
+    //    カードは従来どおりその先の列に出る
+    const idDoneOther = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+      VALUES ('DRV-DONEOTHER', '完了の他人担当へ前方移動', 'https://example.com/doneother', 'smoke')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idDoneOther);
+    const stD = (code) => db.prepare('SELECT state, assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idDoneOther, code) || {};
+    // 通過する工程は動かす人 (REG) の担当にしておく (通過工程で弾かれると別の理由で 403 になる)。
+    // 「タイトル確認」だけ他人 (大川さん) の担当で完了にしておく = 開き直せない移動先
+    db.prepare('UPDATE draft_step_progress SET assignee_id = ? WHERE draft_id = ?').run(regStaffId, idDoneOther);
+    wfpEarly.setStepState(idDoneOther, 'title_approve', { state: 'done' }, 'admin', ADMIN2);
+    wfpEarly.setStepState(idDoneOther, 'title_approve', { assignee_id: wfOkawaId }, 'admin', ADMIN2);
+    let doneOtherErr = null;
+    let doneOtherMove = null;
+    try {
+      doneOtherMove = wfpEarly.moveBoardCard(idDoneOther, { view: 'main', to: 'title_approve', expectedCurrent: 'basic_info' }, 'reg', REG);
+    } catch (e) { doneOtherErr = e; }
+    check('🚨 D&D: 完了で他人担当の移動先は開き直しだけ諦めて移動は成功する (403 で全部巻き戻さない)',
+      !doneOtherErr && stD('basic_info').state === 'done' && stD('title_approve').state === 'done',
+      doneOtherErr?.message || JSON.stringify([stD('basic_info'), stD('title_approve')]));
+    check('D&D: 開き直せなかった工程名と理由を戻り値で返す (画面が理由を出せる)',
+      doneOtherMove?.reopenBlocked?.label === 'タイトル確認'
+      && /担当です/.test(doneOtherMove.reopenBlocked.message || ''), JSON.stringify(doneOtherMove));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDoneOther);
+    wf.setStaffActive(regStaffId, false);
+  }
 
   // カードは 1 商品 1 枚 (2026-08-31 TOP工程の廃止。「制作件数がぱっと見で分かりにくい」の解消)
   const ib = wfpEarly.boardData(db, { view: 'image' });
@@ -5276,6 +5914,27 @@ let wfSetParentId = null;
     check('v2: 詳細カードに 撮影・素材 / 商品情報あり が乗る',
       cardV2 && cardV2.materialStatus === 'ready' && cardV2.materialLabel === '素材完了' && cardV2.hasProductInfo === true && cardV2.ownBrand === true,
       JSON.stringify(cardV2 && { m: cardV2.materialStatus, l: cardV2.materialLabel, i: cardV2.hasProductInfo }));
+    // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない」を拾う印なので、
+    // 撮影・素材ステータスとは別に持つ。撮影不要の商品だけ「対象外」
+    {
+      const ciOf = () => [...wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.flatMap((c) => c.cards)]
+        .find((c) => c.id === idV2)?.image?.cameraInstruction;
+      check('撮影指示書: URL が無ければ まだ (素材完了で商品が届いていても まだ のまま)',
+        ciOf()?.registered === false && ciOf()?.notRequired === false, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: 'https://docs.google.com/spreadsheets/d/x/edit' });
+      check('撮影指示書: カメラ撮影指示URL を入れると 済', ciOf()?.registered === true, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: '   ' });
+      check('撮影指示書: 空白だけの URL は 済 にしない', ciOf()?.registered === false, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { material_status: 'not_required' });
+      check('撮影指示書: 撮影不要の商品は 対象外 (仕入れ商品が軒並み まだ にならない)',
+        ciOf()?.notRequired === true && ciOf()?.registered === false, JSON.stringify(ciOf()));
+      // 🚨 撮影不要 + 古い撮影指示URL あり (Notion は撮影・素材と URL を別々に埋めるので作れる)。
+      //    画面は撮影不要を先に見るので「対象外」になる = ここでは両方の印が立つことだけ固定する
+      dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: 'https://docs.google.com/spreadsheets/d/old/edit' });
+      check('撮影指示書: 撮影不要 + 古い URL でも 撮影不要 の印が立つ (画面は対象外を先に出す)',
+        ciOf()?.notRequired === true && ciOf()?.registered === true, JSON.stringify(ciOf()));
+      dbmod.upsertImageProduction(db, idV2, { material_status: 'ready', camera_instruction_url: null });
+    }
     // 楽天登録済みの既存商品には詳細 v2 も自動 done で入る
     const idV2Rk = Number(db.prepare(`
       INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('DRV-V2-RK', 'v2・登録済み', 'listed', 'smoke')
@@ -5850,6 +6509,35 @@ let wfSetParentId = null;
   const listRes = await fetch(base + '/list');
   check('ルート: /list が一覧を返す', listRes.status === 200 && (await listRes.text()).includes('新規登録'));
 
+  // ─── 📣 広告 (2026-09-28): 実ルートで 記録 → タブの表 → カードの札 ───
+  {
+    const own = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('adops-smoke', '広告スモーク商品', 'smoke', 1)`).run().lastInsertRowid);
+    const notOwn = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('adops-smoke-x', '広告スモーク仕入', 'smoke', 0)`).run().lastInsertRowid);
+    let ar = await call('POST', `/api/drafts/${notOwn}/ad-ops`, { kind: 'stage', stage: 'kw_ready', base_stage_event_id: 0 });
+    check('広告: 自社でない商品は 400', ar.status === 400 && ar.json.code === 'not_own_brand', JSON.stringify(ar));
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'stage', stage: 'running', campaign_types: ['auto'], base_stage_event_id: 0 });
+    check('広告: 出稿中を記録できる (記録者 = ログインの人)', ar.status === 200 && ar.json.ok && ar.json.event.actor === 'smoke@b-faith.biz', JSON.stringify(ar));
+    const runningId = ar.json.event?.id;
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'stage', stage: 'stopped', memo: '赤字', base_stage_event_id: 0 });
+    check('広告: 古い画面からの段階の変更は 409', ar.status === 409 && ar.json.code === 'stale', JSON.stringify(ar));
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'adjust', memo: '古い画面', base_stage_event_id: 0 });
+    check('広告: 古い画面からの「調整した」も 409', ar.status === 409 && ar.json.code === 'stale', JSON.stringify(ar));
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'adjust', memo: '入札を下げた', base_stage_event_id: runningId });
+    check('広告: 「調整した」を記録できる', ar.status === 200 && ar.json.ok, JSON.stringify(ar));
+    ar = await call('POST', `/api/drafts/999999/ad-ops`, { kind: 'adjust' });
+    check('広告: 無い商品は 404', ar.status === 404);
+    const adHtml = await (await fetch(base + '/board?view=ad')).text();
+    const ownRow = (adHtml.match(new RegExp(`<tr class="ad-row[^"]*" data-ad-draft="${own}"[\\s\\S]*?</tr>`)) || [''])[0];
+    check('広告: タブに自社商品の行が出て、段階・調整のボタンがある',
+      ownRow.includes('kb-tag ad-running') && ownRow.includes('ad-stage-btn') && new RegExp(`ad-adjust-btn" data-draft="${own}"[^>]*data-base="${runningId}"`).test(ownRow) && ownRow.includes('入札を下げた'),
+      ownRow.slice(0, 400));
+    check('広告: 自社でない商品は表に出ない', !adHtml.includes(`data-ad-draft="${notOwn}"`));
+    check('広告: タブでは担当者・確認中の絞り込みを出さず、カンバンは隠す',
+      !adHtml.includes('id="assignee-select"') && !adHtml.includes('🔍 確認中') && /<div class="kb" hidden>/.test(adHtml));
+    const mainHtml = await (await fetch(base + '/board')).text();
+    check('広告: 全体ビューのタブに「📣 広告」がある', mainHtml.includes('>📣 広告</a>'));
+  }
+
   // ─── かんばんの手動並び順 + 詳細の戻り先 (2026-08-28 中原さん要望) ───
   {
     // 既定の並びは「停滞が長い順 → 登録順」。手で並べ替えたらその順が残る (読み直しても戻らない)
@@ -6147,6 +6835,65 @@ let wfSetParentId = null;
     obRow().own_brand === 1 && obRow().image_priority === '自社商品（重要度：高）');
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idOb);
 
+  // ─── 既存の楽天ページへの追加か (2026-09-25 スタッフ要望「既存ページラベル」): 実ルート ───
+  // router が詳細画面へ判定を渡し忘れると detail が 500 になる → 描画テストではなく実ルートで見る
+  {
+    const idEp = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-EXISTPAGE', '既存ページテスト', 'smoke')
+    `).run().lastInsertRowid);
+    const epRow = () => db.prepare('SELECT existing_page FROM product_drafts WHERE id = ?').get(idEp).existing_page;
+    const pg0 = await (await fetch(`${base}/detail/${idEp}`)).text();
+    check('既存ページ: 詳細に選択欄が出る (既定 = 自動で判定)',
+      pg0.includes('id="f-existing-page"') && /<option value=""\s+selected>自動で判定/.test(pg0), pg0.slice(pg0.indexOf('f-existing-page'), pg0.indexOf('f-existing-page') + 400));
+    r = await call('POST', `/api/drafts/${idEp}/existing-page`, { value: '1' });
+    check('既存ページ: 「既存ページに追加」を保存できる',
+      r.status === 200 && r.json.existingPage === true && r.json.auto === false && epRow() === 1, JSON.stringify(r.json));
+    const pg1 = await (await fetch(`${base}/detail/${idEp}`)).text();
+    check('既存ページ: 保存した値が詳細の選択欄に出る', /<option value="1"\s+selected>/.test(pg1));
+    const board = await (await fetch(`${base}/board`)).text();
+    const at = board.indexOf(`data-draft="${idEp}"`);
+    const cardHtml = at === -1 ? '' : board.slice(at, board.indexOf('kb-card-top', at));
+    check('既存ページ: ボードのカードに「📄 既存ページ」の札が出る',
+      cardHtml.includes('kb-tag existing-page') && cardHtml.includes('既存ページ'), at === -1 ? 'カードがボードに無い' : cardHtml.slice(0, 600));
+    r = await call('POST', `/api/drafts/${idEp}/existing-page`, { value: 'x' });
+    check('既存ページ: 不正な値は 400 で保存しない', r.status === 400 && epRow() === 1, JSON.stringify(r.json));
+    r = await call('POST', `/api/drafts/${idEp}/existing-page`, { value: '' });
+    check('既存ページ: 「自動で判定」に戻せる (NULL)', r.status === 200 && r.json.auto === true && epRow() == null, JSON.stringify(r.json));
+    const board2 = await (await fetch(`${base}/board`)).text();
+    const at2 = board2.indexOf(`data-draft="${idEp}"`);
+    check('既存ページ: 自動判定で新規ならボードに札を出さない',
+      at2 !== -1 && !board2.slice(at2, board2.indexOf('kb-card-top', at2)).includes('existing-page'));
+    // 「出品・展開」の列: 既存ページのカードには出品ボタンを出さず、RMS で直す案内を出す。
+    // 列に落としたときの出品の確認も出さない (data-rk=existing)
+    await call('POST', `/api/drafts/${idEp}/existing-page`, { value: '1' });
+    wfpEarly.ensureProgress(db, idEp);
+    db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ?
+      AND step_code IN ('basic_info', 'ai_generate', 'desc_review', 'title_approve', 'set_review')`).run(idEp);
+    const board3 = await (await fetch(`${base}/board`)).text();
+    const at3 = board3.indexOf(`data-draft="${idEp}"`);
+    // 次のカードの頭 (<div class="kb-card ..."> / 列の終わり) まで。kb-card-link などカードの中身では切らない
+    const next3 = at3 === -1 ? -1 : board3.slice(at3).search(/<div class="kb-card[ "]|class="kb-col[ "]/);
+    const end3 = next3 === -1 ? -1 : at3 + next3;
+    const card3 = at3 === -1 ? '' : board3.slice(at3, end3 === -1 ? undefined : end3);
+    check('既存ページ: 出品・展開の列では出品ボタンの代わりに RMS で直す案内',
+      card3.includes('既存ページに追加: 楽天は RMS でページ') && !card3.includes('⚡ 楽天に出品'), card3.slice(0, 1500));
+    check('既存ページ: 列に落としても出品の確認を出さない印 (data-rk=existing)', card3.includes('data-rk="existing"'), card3.slice(0, 400));
+    // 出品済みページへの色追加のカード: 「楽天ページ」は変えられない (新規ページにして出品すると別ページができる)
+    const idAdd = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by, existing_page, added_to_draft_id)
+      VALUES ('DRV-EXISTPAGE-GR', '既存ページテスト グリーン', 'smoke', 1, ?)
+    `).run(idEp).lastInsertRowid);
+    r = await call('POST', `/api/drafts/${idAdd}/existing-page`, { value: '0' });
+    check('色追加: 「楽天ページ」を新規ページに変えられない (400・値はそのまま)',
+      r.status === 400 && db.prepare('SELECT existing_page FROM product_drafts WHERE id = ?').get(idAdd).existing_page === 1, JSON.stringify(r.json));
+    const pgAdd = await (await fetch(`${base}/detail/${idAdd}`)).text();
+    check('色追加: 詳細の選択欄は押せない + 追加先のページへのリンク',
+      /id="f-existing-page"[^>]*disabled/.test(pgAdd) && pgAdd.includes(`/apps/product-hub/detail/${idEp}"`) && pgAdd.includes('DRV-EXISTPAGE</a>'),
+      pgAdd.slice(pgAdd.indexOf('f-existing-page'), pgAdd.indexOf('f-existing-page') + 900));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idAdd);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idEp);
+  }
+
   // 起動時バックフィル (連動導入前の既存データの整合化。重要度が設定済みなら重要度が正)
   const idBf = (ob, pr) => Number(db.prepare(`
     INSERT INTO product_drafts (ne_code, name, own_brand, image_priority, created_by)
@@ -6270,8 +7017,8 @@ let wfSetParentId = null;
     check('配送: ジャンルだけ保存しても配送方法は未選択のまま (勝手に確定しない)',
       r0.status === 200 && !shipOf()?.shipping_method_group, JSON.stringify(shipOf()));
     check('配送: 未選択のままでは出品できない',
-      (listing.buildItemPayload(db, idSh).reasons || []).some((x) => /配送方法を選んでください/.test(x)),
-      JSON.stringify(listing.buildItemPayload(db, idSh).reasons || []));
+      (listing.buildItemPayload(db, idSh, LEGACY_TAX).reasons || []).some((x) => /配送方法を選んでください/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, idSh, LEGACY_TAX).reasons || []));
 
     // ③ 人が選んで保存すれば入る (「これにする」= NE の値でも、選んだのは人)
     r0 = await call('POST', `/api/drafts/${idSh}/rakuten`, { genre_id: '565004', shipping_method_group: '5' });
@@ -6300,8 +7047,8 @@ let wfSetParentId = null;
       htmlSet.includes('セットは NE の配送方法') && !htmlSet.includes('未選択です（このままでは出品できません）'),
       htmlSet.includes('未選択です（このままでは出品できません）') ? '単品と同じ警告が出ている' : '案内が出ていない');
     check('配送: セットは選んでいなくても配送方法では止まらない',
-      !(listing.buildItemPayload(db, idShSet).reasons || []).some((x) => /配送方法/.test(x)),
-      JSON.stringify(listing.buildItemPayload(db, idShSet).reasons || []));
+      !(listing.buildItemPayload(db, idShSet, LEGACY_TAX).reasons || []).some((x) => /配送方法/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, idShSet, LEGACY_TAX).reasons || []));
     db.prepare('DELETE FROM mirror_products WHERE product_id = 99451').run();
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idShSet);
 
@@ -7746,6 +8493,973 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   server.close();
 }
 
+// ─── SP広告KW の夜間 AI (PR3a・2026-09-23): service-api (miniPC の実行役が使う口) を HTTP で ───
+// 1 件ずつ claim → reserve (AI を呼ぶ前に予約) → result (応答断の再送は同じ receipt) / fail / release。フラグ OFF は 503・トークン無しは 401
+{
+  process.env.PH_SERVICE_TOKEN = 'smoke-token-1234567890';
+  const express = (await import('express')).default;
+  const { serviceApiRouter } = await import('../router.js');
+  const akm = await import('../lib/ad-keywords.js');
+  const aim = await import('../lib/ad-kw-ai.js');
+  const app = express();
+  app.use('/svc', serviceApiRouter);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/svc`;
+  const call = async (method, p, body, token = 'smoke-token-1234567890') => {
+    const res = await fetch(base + p, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+      body: body !== undefined ? JSON.stringify(body) : undefined });
+    return { status: res.status, json: await res.json().catch(() => ({})) };
+  };
+  const savedFlag = process.env.AD_KW_AI_ENABLED;
+  const aiDraft = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('ADKW-AI-1', 'ハッカ油 AI', 'smoke', 1)`).run().lastInsertRowid);
+  const draftRow = () => db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(aiDraft);
+  const rq = akm.ensureRequest(db, draftRow(), { idempotencyKey: 'k-ai', actor: 'smoke' }).request;
+  const ev = Number(db.prepare(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json, fetched_at) VALUES (?, 'suggest', 'ハッカ油', 'success', '{}', '[]', '2026-09-23T01:00:00Z')`).run(rq.id).lastInsertRowid);
+  db.prepare(`INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key) VALUES (?, 'kw', 'ハッカ油 スプレー', 'ハッカ油 スプレー', 'observed', ?, ?, 1, 'a')`)
+    .run(rq.id, ev, JSON.stringify([{ evidence_id: ev, seed: 'ハッカ油', source: 'base' }]));
+
+  delete process.env.AD_KW_AI_ENABLED;
+  let r = await call('POST', '/ad-kw-ai/claim', { runner_run_id: 'n1' });
+  check('AI svc: フラグ OFF の claim は 503 (実行役の導入前は動かない)', r.status === 503 && r.json.code === 'ai_disabled', JSON.stringify(r));
+  r = await call('GET', '/ad-kw-ai/queue', undefined, null);
+  check('AI svc: トークン無しは 401', r.status === 401);
+  process.env.AD_KW_AI_ENABLED = '1';
+  const job = aim.requestAiJob(db, draftRow(), rq.id, { idempotencyKey: 'j', actor: 'smoke' }).job;
+  r = await call('GET', '/ad-kw-ai/queue');
+  check('AI svc: 要約に claimable 1', r.status === 200 && r.json.queue.claimable === 1 && r.json.queue.enabled === true, JSON.stringify(r.json));
+  r = await call('POST', '/ad-kw-ai/claim', { runner_run_id: 'n1' });
+  const lease = r.json.job && r.json.job.lease_token;
+  check('AI svc: claim = lease と固定 packet (観測語つき)', r.status === 200 && r.json.job.job_id === job.id && lease && r.json.job.packet.observations[0].value === 'ハッカ油 スプレー'
+    && r.json.job.packet_hash === job.packet_hash, JSON.stringify(r.json).slice(0, 300));
+  r = await call('POST', `/ad-kw-ai/jobs/${job.id}/reserve`, { lease_token: 'bad', model: 'claude-sonnet-5', prompt_version: 'p1' });
+  check('AI svc: 別の token の予約は 409', r.status === 409 && r.json.code === 'lease_lost');
+  r = await call('POST', `/ad-kw-ai/jobs/${job.id}/reserve`, { lease_token: lease, model: 'claude-sonnet-5', prompt_version: 'p1' });
+  const gid = r.json.generation_id;
+  check('AI svc: 予約できる', r.status === 200 && gid > 0, JSON.stringify(r.json));
+  r = await call('POST', `/ad-kw-ai/jobs/${job.id}/release`, { lease_token: lease });
+  check('AI svc: 予約後の release は needs_review (成否不明)', r.status === 200 && r.json.status === 'needs_review', JSON.stringify(r.json));
+  const out = { keywords: [{ keyword: 'ハッカ油 ルームスプレー', basis_obs_ids: ['o1'], reason: '用途を広げた' }, { keyword: 'ハッカ油 スプレー', basis_obs_ids: ['o1'] }] };
+  r = await call('POST', `/ad-kw-ai/generations/${gid}/result`, { packet_hash: job.packet_hash, output: out });
+  check('AI svc: 予約済みなら lease を失っても結果を受ける (復旧)', r.status === 200 && r.json.receipt.accepted === 2 && r.json.receipt.new_candidates === 1 && r.json.replay === false, JSON.stringify(r.json));
+  const receipt1 = r.json.receipt;
+  r = await call('POST', `/ad-kw-ai/generations/${gid}/result`, { packet_hash: job.packet_hash, output: out });
+  check('AI svc: 同じ内容の再送 = 同じ receipt (replay)', r.status === 200 && r.json.replay === true && JSON.stringify(r.json.receipt) === JSON.stringify(receipt1));
+  r = await call('POST', `/ad-kw-ai/generations/${gid}/result`, { packet_hash: job.packet_hash, output: { keywords: [] } });
+  check('AI svc: 確定後に別の内容は 409', r.status === 409 && r.json.code === 'already_finalized');
+  r = await call('POST', `/ad-kw-ai/generations/999999/result`, { packet_hash: 'x', output: out });
+  check('AI svc: 無い予約は 404', r.status === 404);
+  r = await call('POST', `/ad-kw-ai/jobs/${job.id}/fail`, { lease_token: lease, code: 'network' });
+  check('AI svc: 終わった job への fail は 409 (巻き戻さない)', r.status === 409 && db.prepare('SELECT status FROM ph_ad_kw_ai_jobs WHERE id = ?').get(job.id).status === 'done');
+  const st = akm.stateForDraft(db, draftRow(), { configured: true });
+  const aiCand = st.candidates.find((c) => c.value === 'ハッカ油 ルームスプレー');
+  check('AI svc: 画面の状態に AI の候補 (未採用) と提案 (AI だけ・理由・根拠) が載る',
+    aiCand && aiCand.origin === 'ai' && aiCand.decision === null && st.ai.proposals[aiCand.id].observed === 'ai_only' && st.ai.proposals[aiCand.id].reason === '用途を広げた'
+    && JSON.stringify(st.ai.proposals[aiCand.id].basis) === '["ハッカ油 スプレー"]' && st.ai.jobs[0].status === 'done', JSON.stringify(st.ai).slice(0, 300));
+  if (savedFlag === undefined) delete process.env.AD_KW_AI_ENABLED; else process.env.AD_KW_AI_ENABLED = savedFlag;
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(aiDraft);
+  server.close();
+}
+
+// ─── SP広告 検索KW PR1 (2026-09-23): 依頼 → サジェスト収集 (miniPC は差し替え) → 採否 (append-only) → コピー履歴 ───
+// 守りたいこと (『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5「検証で必須にすること」):
+//   失敗 / 0 件 / 一部 / 未実行 を混ぜない・取消後と lease を失った結果を保存しない・同じ依頼で 2 つ同時に集めない・
+//   採否は人の API だけ (append-only)・コピー本文は採否版を参照して固定・自社商品以外では使えない
+{
+  const express = (await import('express')).default;
+  const routerMod = await import('../router.js');
+  const kwClient = await import('../lib/keyword-suggest-client.js');
+  const abaClient = await import('../lib/aba-client.js');
+  const app = express();
+  app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
+  app.use('/ph', routerMod.default);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/ph`;
+  const call = async (method, p, body) => {
+    const res = await fetch(base + p, {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, json: await res.json() };
+  };
+  const getHtml = async (p) => { const res = await fetch(base + p); return { status: res.status, html: await res.text() }; };
+
+  // 「miniPC を呼ぶ設定あり」にする。本物は呼ばない (fetcher を差し替える)
+  const savedToken = process.env.WAREHOUSE_SERVICE_TOKEN;
+  process.env.WAREHOUSE_SERVICE_TOKEN = 'smoke-token';
+  // miniPC の応答の形 (prefix は 基本 1 + ひらがな 46 = 47 件。a〜z 指定なら +26)。summary は prefix から数える
+  // (クライアントは prefix の件数と requested が合わない応答を受け取らない)
+  const HIRA = 'あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん'.split('');
+  const suggestResult = (seed, { alphabet = false } = {}) => {
+    const prefixes = [{ prefix: seed, source: 'base', status: 'success', count: 3, fetchedAt: '2026-09-23T01:00:00.000Z' }];
+    for (const h of HIRA) {
+      const st = h === 'あ' || h === 'す' ? 'success' : h === 'い' || h === 'う' ? 'failed' : h === 'わ' ? 'unrun' : 'empty';
+      prefixes.push({ prefix: `${seed} ${h}`, source: `hiragana:${h}`, status: st, count: st === 'success' ? 1 : 0,
+        error: st === 'failed' ? 'timeout' : st === 'unrun' ? 'maxRequests に達したため未実行' : null, fetchedAt: st === 'unrun' ? null : '2026-09-23T01:00:01.000Z' });
+    }
+    if (alphabet) for (const a of 'abcdefghijklmnopqrstuvwxyz') prefixes.push({ prefix: `${seed} ${a}`, source: `alphabet:${a}`, status: a === 'a' ? 'success' : 'empty', count: a === 'a' ? 1 : 0, fetchedAt: '2026-09-23T01:00:02.000Z' });
+    const summary = { requested: prefixes.length, success: 0, empty: 0, failed: 0, unrun: 0, requests: 0, stopped: null };
+    for (const p of prefixes) { summary[p.status] += 1; if (p.status !== 'unrun') summary.requests += 1; }
+    return {
+      seed, total: 5,
+      suggestions: [
+        { keyword: `${seed} スプレー`, source: 'base', depth: 0 },
+        { keyword: `${seed} 虫除け`, source: 'base', depth: 0 },
+        { keyword: `${seed} あせも`, source: 'hiragana:あ', depth: 0 },
+        { keyword: seed, source: 'base', depth: 0 },                        // 種そのもの → 候補にしない
+        { keyword: `${seed}  スプレー `, source: 'hiragana:す', depth: 0 },   // 空白違いの同じ語 → 1 つ
+      ],
+      prefixes, summary, fetchedAt: '2026-09-23T01:00:00.000Z', options: { alphabet },
+    };
+  };
+  // 内訳を指定して応答を作る (prefix 別の状態と summary を必ず一致させる。クライアントは食い違いを受け取らない)
+  const resultWith = (seed, { success = 0, empty = 0, failed = 0, unrun = 0, stopped = null, suggestions = [], alphabet = false } = {}) => {
+    const sources = ['base', ...HIRA.map((h) => `hiragana:${h}`), ...(alphabet ? 'abcdefghijklmnopqrstuvwxyz'.split('').map((a) => `alphabet:${a}`) : [])];
+    const statuses = [...Array(success).fill('success'), ...Array(empty).fill('empty'), ...Array(failed).fill('failed'), ...Array(unrun).fill('unrun')];
+    if (statuses.length !== sources.length) throw new Error(`fixture: 内訳 ${statuses.length} ≠ prefix ${sources.length}`);
+    const prefixes = sources.map((source, i) => ({
+      prefix: i === 0 ? seed : `${seed} ${source.split(':')[1]}`, source, status: statuses[i], count: statuses[i] === 'success' ? 1 : 0,
+      error: statuses[i] === 'failed' ? 'HTTP 503' : statuses[i] === 'unrun' ? '未実行' : null, fetchedAt: statuses[i] === 'unrun' ? null : '2026-09-23T01:00:00.000Z',
+    }));
+    return { seed, total: suggestions.length, suggestions, prefixes,
+      summary: { requested: prefixes.length, success, empty, failed, unrun, requests: prefixes.length - unrun, stopped },
+      fetchedAt: '2026-09-23T01:00:00.000Z', options: { alphabet } };
+  };
+  let fetcherCalls = [];
+  let fetcherImpl = async (body) => { fetcherCalls.push(body); return suggestResult(body.seed); };
+  kwClient._setSuggestFetcher((body) => fetcherImpl(body));
+  // miniPC の ABA 参照 (/service-api/aba/lookup・PR #1414) の応答の形。走査しない = 取込済みの週をそのまま返す
+  const abaWeek = (ws, we, extra = {}) => ({ week_start: ws, week_end: we, ingested_at: `${we}T23:30:00Z`, term_count: 400000, row_count: 1300000, parsed_count: 1300000, mode: 'full', skipped_count: 0, pruned_at: null, ...extra });
+  const abaTerm = (t, rank, pos, cs, conv) => ({ search_term: t, department: 'amazon.co.jp', search_frequency_rank: rank, click_position: pos, click_share: cs, conversion_share: conv });
+  const abaResult = (asin, item, week = abaWeek('2026-09-13', '2026-09-19')) => ({
+    week, requested_week: null, week_coverage: week ? 'complete' : 'unknown', registered: true, register_errors: [], invalid: [],
+    items: [{ asin, proof: 'week_ingested', reason: null, ...item }],
+  });
+  let abaCalls = [];
+  let abaImpl = async (body) => { abaCalls.push(body); return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('ハッカ油 スプレー', 1200, 2, 0.21, 0.15)] }); };
+  abaClient._setAbaFetcher((body, path) => abaImpl(body, path));
+
+  const idOwn = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand, asin)
+    VALUES ('ADKW-1', 'ハッカ油スプレー', 'smoke', 1, 'B0ADKWOWN1')`).run().lastInsertRowid);
+  const idOwn2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand)
+    VALUES ('ADKW-2', '別の自社商品', 'smoke', 1)`).run().lastInsertRowid);
+  const idOther = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand)
+    VALUES ('ADKW-3', '他社商品', 'smoke', 0)`).run().lastInsertRowid);
+  const P = (id) => `/api/drafts/${id}/ad-keywords`;
+
+  // 自社商品でなければ使えない (受付・状態・画面)
+  let r = await call('POST', `${P(idOther)}/requests`, { idempotency_key: 'k-other' });
+  check('SP広告KW: 自社商品でないドラフトは受け付けない (400 not_own_brand)', r.status === 400 && r.json.code === 'not_own_brand', JSON.stringify(r.json));
+  r = await call('GET', P(idOther));
+  check('SP広告KW: 自社商品でないドラフトは状態も返さない', r.status === 400 && r.json.code === 'not_own_brand');
+  {
+    const pg = await getHtml(`/detail/${idOther}`);
+    check('SP広告KW: 自社商品でない詳細画面にはタブが無い', pg.status === 200 && !pg.html.includes('data-tab="tab-adkw"') && !pg.html.includes('id="adkw-json"'));
+  }
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 集める前の状態 = 依頼なし・設定あり', r.status === 200 && r.json.state.request === null && r.json.state.configured === true, JSON.stringify(r.json).slice(0, 200));
+
+  // 依頼: 冪等キー
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k1' });
+  const rid = r.json.request_id;
+  check('SP広告KW: 依頼を作れる', r.status === 200 && Number.isInteger(rid) && r.json.reused === false, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k1' });
+  check('SP広告KW: 同じ冪等キーの再送は同じ依頼 (二重に作らない)', r.json.request_id === rid && r.json.reused === true, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k2' });
+  check('SP広告KW: 開いている依頼があれば別キーでもそれを返す (restart 無し)', r.json.request_id === rid && r.json.reused === true, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests`, {});
+  check('SP広告KW: 冪等キー無しは受け付けない', r.status === 400 && r.json.code === 'bad_key');
+
+  // 収集
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: '  ハッカ油 ' });
+  check('SP広告KW: 収集 → 候補 3 語 (種そのもの・空白違いの重複は除く)', r.status === 200 && r.json.collected === true && r.json.added === 3, JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW: miniPC へは種 1 つ・ひらがな固定・深掘り無しで頼む',
+    fetcherCalls.length === 1 && fetcherCalls[0].seed === 'ハッカ油' && fetcherCalls[0].hiragana === true && fetcherCalls[0].alphabet === false && !('depth' in fetcherCalls[0]),
+    JSON.stringify(fetcherCalls));
+  const st1 = r.json.state;
+  check('SP広告KW: 取得範囲が 失敗/未実行 込みで残る (partial)',
+    st1.seeds.length === 1 && st1.seeds[0].status === 'partial' && /2 回失敗/.test(st1.seeds[0].coverage_text) && /上限で 1 回未実行/.test(st1.seeds[0].coverage_text),
+    JSON.stringify(st1.seeds));
+  check('SP広告KW: 出典の文 (§4.8) = 観測・取得日・検索回数は不明', /Amazon サジェストで観測・取得日 9月23日。検索回数は不明/.test(st1.seeds[0].fetched_text), st1.seeds[0].fetched_text);
+  check('SP広告KW: 候補は全件「未採用」から始まる', st1.candidates.length === 3 && st1.candidates.every((c) => c.decision === null));
+  check('SP広告KW: 並びは出方の順 (そのまま → +あ)。総合点は無い',
+    st1.candidates.map((c) => c.observed[0].source_label).join(',') === 'そのまま,そのまま,+あ' && !('score' in st1.candidates[0]),
+    JSON.stringify(st1.candidates.map((c) => [c.value, c.observed[0].source_label])));
+  check('SP広告KW: 収集が終わると依頼は review_ready に戻り lease が消える',
+    st1.request.status === 'review_ready' && st1.request.collecting_seed === null
+    && db.prepare('SELECT collecting_token FROM ph_ad_kw_requests WHERE id = ?').get(rid).collecting_token === null);
+  check('SP広告KW: 材料 (evidence) に prefix ごとの状態がそのまま残る',
+    JSON.parse(db.prepare(`SELECT raw_json FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ハッカ油'`).get(rid).raw_json).some((p) => p.status === 'unrun'));
+
+  fetcherCalls = [];
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油' });
+  check('SP広告KW: 取得済みの種は miniPC を呼ばず「取得済み」を返す', r.status === 200 && r.json.reused === true && r.json.added === 0 && fetcherCalls.length === 0, JSON.stringify(r.json).slice(0, 200));
+
+  fetcherImpl = async (body) => resultWith(body.seed, { success: 2, empty: 45, suggestions: [{ keyword: 'ハッカ油 スプレー', source: 'base' }, { keyword: 'はっか油 業務用', source: 'base' }] });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'はっか油' });
+  check('SP広告KW: 別の種で同じ語が出たら候補は増えず観測が 2 つになる',
+    r.json.added === 1 && r.json.merged === 1 && r.json.state.candidates.find((c) => c.value === 'ハッカ油 スプレー').observed_count === 2,
+    JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW: 失敗も未実行も無い種は success', r.json.state.seeds.find((s) => s.seed === 'はっか油').status === 'success');
+
+  // miniPC が落ちている → 「取れなかった」を記録 (0 件と混ぜない)。依頼は閉じない
+  fetcherImpl = async () => { const e = new Error('HTTP 502'); e.code = 'unreachable'; throw e; };
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ひば油' });
+  check('SP広告KW: miniPC が落ちていれば「取れなかった」を記録して返す (200・collected=false・理由つき)',
+    r.status === 200 && r.json.collected === false && r.json.evidence.status === 'failed' && /unreachable/.test(r.json.error || ''),
+    JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW: 失敗した種は候補 0・依頼は review_ready のまま',
+    r.json.state.seeds.find((s) => s.seed === 'ひば油').candidate_count === 0 && r.json.state.request.status === 'review_ready');
+  fetcherImpl = async (body) => resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: 'ひば油 スプレー', source: 'base' }] });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ひば油' });
+  check('SP広告KW: 失敗した種はもう一度集められ、種の表示は 1 つ (取得回は 2 回・いまの状態は success)',
+    r.json.collected === true && r.json.state.seeds.filter((s) => s.seed === 'ひば油').length === 1
+    && r.json.state.seeds.find((s) => s.seed === 'ひば油').status === 'success' && r.json.state.seeds.find((s) => s.seed === 'ひば油').fetch_count === 2
+    && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ひば油'`).get(rid).n === 2, JSON.stringify(r.json.state.seeds));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: '' });
+  check('SP広告KW: 空の種は受け付けない (何も記録しない)', r.status === 400 && r.json.code === 'bad_seed');
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'x'.repeat(61) });
+  check('SP広告KW: 61 文字の種は受け付けない', r.status === 400 && r.json.code === 'bad_seed');
+
+  // 排他: 進行中の収集がある依頼では 409。死んだ収集中 (3 分超) は奪える
+  db.prepare(`UPDATE ph_ad_kw_requests SET status = 'collecting', collecting_seed = 'x', collecting_token = 't', collecting_since = ? WHERE id = ?`)
+    .run(new Date().toISOString(), rid);
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ゆず' });
+  check('SP広告KW: 別の収集が進行中なら 409 (同じ依頼で 2 つ同時に走らせない)', r.status === 409 && r.json.code === 'busy', JSON.stringify(r.json));
+  db.prepare('UPDATE ph_ad_kw_requests SET collecting_since = ? WHERE id = ?').run(new Date(Date.now() - 10 * 60 * 1000).toISOString(), rid);
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ゆず' });
+  check('SP広告KW: 死んだ収集中 (3 分超) は奪って集められる', r.status === 200 && r.json.collected === true, JSON.stringify(r.json).slice(0, 200));
+
+  // lease を失った結果は保存しない: 収集の途中で死んだとみなされ、別の収集に奪われた
+  {
+    let inner = null;
+    fetcherImpl = async (body) => {
+      if (body.seed === 'ラベンダー') {
+        db.prepare('UPDATE ph_ad_kw_requests SET collecting_since = ? WHERE id = ?').run(new Date(Date.now() - 10 * 60 * 1000).toISOString(), rid);
+        inner = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ローズマリー' });   // 奪う側 (新しい token)
+        return { ...suggestResult(body.seed), suggestions: [{ keyword: 'ラベンダー 香り', source: 'base' }] };
+      }
+      return resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }] });
+    };
+    r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ラベンダー' });
+    check('SP広告KW: lease を奪われた古い収集の結果は保存しない (409 lost_lease・材料も候補も無い)',
+      r.status === 409 && r.json.code === 'lost_lease' && inner && inner.json.collected === true
+      && !db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ラベンダー'`).get(rid)
+      && !db.prepare(`SELECT 1 FROM ph_ad_kw_candidates WHERE request_id = ? AND value = 'ラベンダー 香り'`).get(rid),
+      JSON.stringify(r.json));
+    check('SP広告KW: 奪った側の結果は保存され、依頼は review_ready に戻る',
+      db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ローズマリー'`).get(rid)?.status === 'success'
+      && db.prepare('SELECT status FROM ph_ad_kw_requests WHERE id = ?').get(rid).status === 'review_ready');
+  }
+
+  // 全部失敗 (通信はできたが 47 回とも失敗) は「取れなかった」だが取得範囲は残す (R1 #8)
+  fetcherImpl = async (body) => ({
+    seed: body.seed, total: 0, suggestions: [],
+    prefixes: Array.from({ length: 47 }, (_, i) => ({ prefix: `${body.seed} ${i}`, source: i === 0 ? 'base' : `hiragana:${i}`, status: 'failed', error: 'HTTP 503' })),
+    summary: { requested: 47, success: 0, empty: 0, failed: 47, unrun: 0, requests: 94, stopped: null }, fetchedAt: '2026-09-23T02:00:00.000Z',
+  });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'すだち' });
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'すだち');
+    check('SP広告KW: 全 prefix 失敗は failed でも取得範囲 (47 回失敗) を残す', r.json.collected === true && s.status === 'failed' && /47 回失敗/.test(s.coverage_text) && s.candidate_count === 0, JSON.stringify(s));
+    const evId = s.id;
+    fetcherImpl = async (body) => resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: 'すだち 果汁', source: 'base' }] });
+    r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'すだち' });
+    const s2 = r.json.state.seeds.find((x) => x.seed === 'すだち');
+    check('SP広告KW: 失敗した種の取り直しは取得回の行を足す (前の失敗の記録は残る・いまの状態は新しい行)',
+      r.json.collected === true && s2.id !== evId && s2.status === 'success' && s2.candidate_count === 1 && s2.fetch_count === 2
+      && db.prepare('SELECT status FROM ph_ad_kw_evidence WHERE id = ?').get(evId).status === 'failed', JSON.stringify(s2));
+  }
+  // 全体の期限で打ち切られた収集 (miniPC 側 40 秒) は理由つきで残る
+  fetcherImpl = async (body) => resultWith(body.seed, { success: 1, empty: 36, unrun: 10, stopped: 'deadline', suggestions: [{ keyword: 'かぼす ポン酢', source: 'base' }] });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'かぼす' });
+  check('SP広告KW: 期限で打ち切られた収集は partial・理由「全体の期限で打ち切り」つき', r.json.state.seeds.find((x) => x.seed === 'かぼす').status === 'partial'
+    && /全体の期限で打ち切り・10 回未実行/.test(r.json.state.seeds.find((x) => x.seed === 'かぼす').coverage_text), JSON.stringify(r.json.state.seeds.find((x) => x.seed === 'かぼす')));
+
+  // 条件を広げる (a〜z を足す) と取り直す。取れていた語の観測は二重に足さない (R1 #5)
+  fetcherCalls = [];
+  fetcherImpl = async (body) => { fetcherCalls.push(body); return resultWith(body.seed, { alphabet: true, success: 3, empty: 70, suggestions: [{ keyword: 'ハッカ油 スプレー', source: 'base' }, { keyword: 'はっか油 業務用', source: 'base' }, { keyword: 'はっか油 amazon', source: 'alphabet:a' }] }); };
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'はっか油' });
+  check('SP広告KW: 取得済みの種を同じ条件で頼んでも取り直さない', r.json.reused === true && fetcherCalls.length === 0);
+  const gyomuBefore = (await call('GET', P(idOwn))).json.state.candidates.find((c) => c.value === 'はっか油 業務用');
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'はっか油', alphabet: true });
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'はっか油');
+    const spray = r.json.state.candidates.find((c) => c.value === 'ハッカ油 スプレー');
+    const gyomu = r.json.state.candidates.find((c) => c.value === 'はっか油 業務用');
+    check('SP広告KW: a〜z を足すと同じ種でも取り直す (miniPC に alphabet:true で頼み、いまの取得回の条件が a〜z 込みになる)',
+      r.json.collected === true && fetcherCalls.length === 1 && fetcherCalls[0].alphabet === true && s.options.alphabet === true && s.fetch_count === 2, JSON.stringify([fetcherCalls, s.options, s.fetch_count]));
+    check('SP広告KW: 取り直しで同じ語の観測を二重に足さない (観測 2 のまま)・新しく出た語だけ増える',
+      spray.observed_count === 2 && r.json.added === 1 && r.json.merged === 0 && r.json.state.candidates.some((c) => c.value === 'はっか油 amazon'), JSON.stringify([spray.observed_count, r.json.added, r.json.merged]));
+    check('SP広告KW: 前の取得回で観測した語の出典 (取得回・日付) は取り直しで書き換わらない (R2 #4)',
+      gyomu.evidence_id === gyomuBefore.evidence_id && gyomu.first_fetched_at === gyomuBefore.first_fetched_at && gyomu.observed.length === 1
+      && gyomu.evidence_id !== s.id, JSON.stringify([gyomuBefore.evidence_id, gyomu.evidence_id, s.id]));
+    check('SP広告KW: 種ごとの数 = 観測した語 (別の種で先に出た語も含む) と この種で初めて出た語 (R1 #9)',
+      s.candidate_count === 3 && s.new_count === 2, JSON.stringify([s.candidate_count, s.new_count]));
+  }
+  // 一部取得 (partial) は「取り直す」指定のときだけ取り直す。取り直しが失敗しても前の材料は消えない
+  fetcherCalls = [];
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油' });
+  check('SP広告KW: 一部取得の種は指定が無ければ取り直さない (取得済み扱い)', r.json.reused === true && fetcherCalls.length === 0);
+  fetcherImpl = async () => { const e = new Error('HTTP 502'); e.code = 'unreachable'; throw e; };
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油', retake: true });
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'ハッカ油');
+    check('SP広告KW: 一部取得の取り直しが通信で失敗しても、前の取得回と候補はそのまま (collected=false・「前の取得回は残っています」)',
+      r.json.collected === false && /unreachable/.test(r.json.error || '') && r.json.previous_ok === true && s.status === 'failed' && s.previous_ok === true
+      && /前の取得回/.test(s.status_ja) && s.candidate_count === 3, JSON.stringify([r.json.error, s.status, s.status_ja, s.candidate_count]));
+  }
+  // HTTP は成功したが全 prefix 失敗 (取り直し) → 前の取得回を failed で上書きしない (R2 #4)
+  fetcherImpl = async (body) => ({
+    seed: body.seed, total: 0, suggestions: [],
+    prefixes: Array.from({ length: 47 }, (_, i) => ({ prefix: `${body.seed} ${i}`, source: i === 0 ? 'base' : `hiragana:${i}`, status: 'failed', error: 'HTTP 503' })),
+    summary: { requested: 47, success: 0, empty: 0, failed: 47, unrun: 0, requests: 94, stopped: null }, fetchedAt: '2026-09-23T03:00:00.000Z',
+  });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油' });
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'ハッカ油');
+    const mushi = r.json.state.candidates.find((c) => c.value === 'ハッカ油 虫除け');
+    check('SP広告KW: 取り直しで全 prefix 失敗でも、前の取得回 (partial) は残り、候補の出典は前の取得回のまま',
+      r.json.collected === true && s.status === 'failed' && s.previous_ok === true && /47 回失敗/.test(s.coverage_text) && s.candidate_count === 3
+      && mushi.observed[0].fetched_at === '2026-09-23T01:00:00.000Z'
+      && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ハッカ油' AND status = 'partial'`).get(rid).n === 1,
+      JSON.stringify([s.status, s.previous_ok, s.coverage_text, s.candidate_count, mushi.observed]));
+  }
+  fetcherImpl = async (body) => resultWith(body.seed, { success: 2, empty: 45, suggestions: suggestResult(body.seed).suggestions });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油' });   // いまの状態は failed なので指定なしでも取り直せる
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'ハッカ油');
+    const mushi = r.json.state.candidates.find((c) => c.value === 'ハッカ油 虫除け');
+    check('SP広告KW: 取り直しが成功すると success になり、既にあった語の観測は増えない (同じ種・同じ出方)',
+      r.json.collected === true && s.status === 'success' && r.json.added === 0 && r.json.merged === 0 && mushi.observed_count === 1, JSON.stringify([s.status, r.json.added, r.json.merged, mushi.observed_count]));
+  }
+  // 20 種の上限は「取れた種」で数える。失敗しかない種を取り直して取れるときも数える (R2 #10)
+  {
+    const validSeeds = db.prepare(`SELECT COUNT(DISTINCT seed) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND status != 'failed'`).get(rid).n;
+    fetcherImpl = async (body) => resultWith(body.seed, { empty: 47 });
+    for (let i = validSeeds; i < 20; i++) await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: `埋め${i}` });
+    check('SP広告KW: 取れた種が 20 になった', db.prepare(`SELECT COUNT(DISTINCT seed) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND status != 'failed'`).get(rid).n === 20);
+    r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: '21 個目' });
+    check('SP広告KW: 21 種目は too_many', r.status === 400 && r.json.code === 'too_many', JSON.stringify(r.json));
+    // 失敗しかない種 (すだち は success になっているので別の種で作る): 上限に達している状態で失敗行を作ることはできないので、
+    // 上限の 1 つ手前で失敗行を作ってから、別の種で 20 に到達させ、失敗行の取り直しが too_many になることを見る
+    db.prepare(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json, error) VALUES (?, 'suggest', '失敗だけ', 'failed', '{}', '[]', 'x')`).run(rid);
+    r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: '失敗だけ' });
+    check('SP広告KW: 失敗しかない種の取り直しも上限を超えない (too_many)', r.status === 400 && r.json.code === 'too_many', JSON.stringify(r.json));
+    db.prepare(`DELETE FROM ph_ad_kw_evidence WHERE request_id = ? AND (seed LIKE '埋め%' OR seed = '失敗だけ')`).run(rid);
+  }
+
+  // 採否 (人の API・append-only)
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 採用が無ければ本文を固定できない (400 nothing)', r.status === 400 && r.json.code === 'nothing', JSON.stringify(r.json));
+  r = await call('GET', P(idOwn));
+  const cands = r.json.state.candidates;
+  const cSpray = cands.find((c) => c.value === 'ハッカ油 スプレー');
+  const cMushi = cands.find((c) => c.value === 'ハッカ油 虫除け');
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'adopt' });
+  check('SP広告KW: 採用にはマッチタイプが要る (400)', r.status === 400 && r.json.code === 'bad_match_type', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'adopt', match_type: 'exact' });
+  check('SP広告KW: 採用 (完全一致) を記録できる。語は候補の語がそのまま入る',
+    r.status === 200 && r.json.decision.decision === 'adopt' && r.json.decision.keyword === 'ハッカ油 スプレー' && r.json.decision.match_type === 'exact'
+    && r.json.decision.actor === 'smoke@b-faith.biz', JSON.stringify(r.json));
+  const d1 = r.json.decision.id;
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'adopt', match_type: 'phrase', keyword: ' ハッカ油  スプレー 携帯 ' });
+  check('SP広告KW: 語を直して採用し直すと新しい行 (訂正元つき)。前の行は残る',
+    r.json.decision.keyword === 'ハッカ油 スプレー 携帯' && r.json.decision.supersedes_decision_id === d1
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE candidate_id = ?').get(cSpray.id).n === 2, JSON.stringify(r.json));
+  {
+    const rejects = (sql, ...args) => { try { db.prepare(sql).run(...args); return false; } catch (e) { return /append-only/.test(e.message); } };
+    check('SP広告KW: 採否は append-only (UPDATE / DELETE がトリガーで拒否される)',
+      rejects('UPDATE ph_ad_kw_decisions SET decision = ? WHERE id = ?', 'reject', d1) && rejects('DELETE FROM ph_ad_kw_decisions WHERE id = ?', d1));
+  }
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'bogus' });
+  check('SP広告KW: 不正な採否は 400', r.status === 400 && r.json.code === 'bad_decision');
+  r = await call('POST', `${P(idOwn)}/candidates/999999/decisions`, { decision: 'reject' });
+  check('SP広告KW: 無い候補は 404', r.status === 404);
+  r = await call('POST', `${P(idOwn2)}/candidates/${cSpray.id}/decisions`, { decision: 'reject' });
+  check('SP広告KW: 別のドラフトから他人の候補を触れない (404)', r.status === 404 && r.json.code === 'not_found', JSON.stringify(r.json));
+
+  // コピー本文 = 採否版を参照して固定。同じ採否なら履歴を増やさない
+  r = await call('POST', `${P(idOwn)}/candidates/${cMushi.id}/decisions`, { decision: 'adopt', match_type: 'exact' });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  const e1 = r.json.export;
+  check('SP広告KW: 本文を固定できる (マッチタイプ別に分かれる・採否版つき)',
+    r.status === 200 && r.json.reused === false && e1.body.total === 2
+    && e1.body.blocks.map((b) => `${b.match_type}:${b.text}`).join('|') === 'exact:ハッカ油 虫除け|phrase:ハッカ油 スプレー 携帯'
+    && e1.decision_version === db.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_decisions WHERE request_id = ?').get(rid).m,
+    JSON.stringify(r.json).slice(0, 400));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 採否が変わっていなければ同じ履歴を返す (二重に作らない)', r.json.reused === true && r.json.export.id === e1.id);
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'adopt', match_type: 'exact', keyword: 'ハッカ油 スプレー' });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 採否を変えたら新しい履歴 (前の履歴はそのまま残る)',
+    r.json.reused === false && r.json.export.id !== e1.id
+    && r.json.export.body.blocks.length === 1 && r.json.export.body.blocks[0].match_type === 'exact' && r.json.export.body.blocks[0].count === 2
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_exports WHERE request_id = ?').get(rid).n === 2, JSON.stringify(r.json).slice(0, 300));
+  const e2 = r.json.export;
+  r = await call('POST', `${P(idOwn)}/exports/${e2.id}/copied`, { match_type: 'exact' });
+  check('SP広告KW: コピーした印が付く', r.status === 200 && typeof r.json.copied.exact === 'string', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/exports/${e2.id}/copied`, { match_type: 'bogus' });
+  check('SP広告KW: 不正なマッチタイプの印は 400', r.status === 400);
+  r = await call('POST', `${P(idOwn2)}/exports/${e2.id}/copied`, { match_type: 'exact' });
+  check('SP広告KW: 別のドラフトからコピー履歴に印を付けられない', r.status === 404);
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 状態にコピー履歴 (最新が先・印つき) と採否版が載る',
+    r.json.state.exports[0].id === e2.id && typeof r.json.state.exports[0].copied.exact === 'string'
+    && r.json.state.decision_version === e2.decision_version && r.json.state.adopted_count === 2, JSON.stringify(r.json.state.exports).slice(0, 300));
+  check('SP広告KW: 「Amazon 登録済み」を表す状態を持たない (コピー済みは登録済みではない)',
+    !JSON.stringify(r.json.state).includes('registered') && !JSON.stringify(r.json.state).includes('登録済み'));
+  check('SP広告KW: 操作履歴 (draft_events) に 依頼・収集・採否・固定 が残る',
+    ['ad_kw_request', 'ad_kw_collected', 'ad_kw_collect_failed', 'ad_kw_decision', 'ad_kw_export', 'ad_kw_copied']
+      .every((ev) => db.prepare('SELECT 1 FROM draft_events WHERE draft_id = ? AND event = ?').get(idOwn, ev)));
+
+  // ─── 採用 = 完全一致＋フレーズ一致 (exact_phrase・2026-09-23 中原さん「基本、完全一致とフレーズ一致を全部かけている」) ───
+  check('SP広告KW: 採否の選択肢は 完全一致＋フレーズ一致 が先頭 (既定)', JSON.stringify(r.json.state.match_types) === '["exact_phrase","exact","phrase","broad"]'
+    && r.json.state.labels.match_type.exact_phrase === '完全一致＋フレーズ一致' && !('exact_phrase' in r.json.state.labels.copy_block), JSON.stringify(r.json.state.match_types));
+  r = await call('POST', `${P(idOwn)}/candidates/${cMushi.id}/decisions`, { decision: 'adopt', match_type: 'exact_phrase' });
+  check('SP広告KW: 完全一致＋フレーズ一致 で採用できる', r.status === 200 && r.json.decision.match_type === 'exact_phrase', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 完全一致＋フレーズ一致 の語は 完全一致 と フレーズ一致 の両方のブロックに載る',
+    r.status === 200 && r.json.export.body.blocks.map((b) => `${b.match_type}:${b.text.replace(/\n/g, '/')}`).join('|') === 'exact:ハッカ油 スプレー/ハッカ油 虫除け|phrase:ハッカ油 虫除け',
+    JSON.stringify(r.json.export?.body).slice(0, 300));
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 採用数は語の数 (両方に載せても 2 回と数えない)', r.json.state.adopted_count === 2, String(r.json.state.adopted_count));
+  r = await call('POST', `${P(idOwn)}/candidates/${cMushi.id}/decisions`, { decision: 'adopt', match_type: 'exact' });   // 以降の検査の前提 (完全一致 2 語) に戻す
+
+  // ─── PR2-C: 競合 ASIN (商品ターゲット) を人が入れる → 採否 → コピー本文の別ブロック ───
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: '' });
+  check('SP広告KW/ASIN: 空は 400', r.status === 400 && r.json.code === 'bad_asin', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: 'b0compet01, https://www.amazon.co.jp/dp/B0COMPET02/ref=x B0ADKWOWN1 not-asin B0COMPET01' });
+  check('SP広告KW/ASIN: 大文字化・URL から抽出・自分の ASIN と重複と形式違いを弾く',
+    r.status === 200 && JSON.stringify(r.json.added) === '["B0COMPET01","B0COMPET02"]'
+    && r.json.skipped.some((s) => s.asin === 'B0ADKWOWN1' && /自分/.test(s.reason)) && JSON.stringify(r.json.invalid) === '["not-asin"]', JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW/ASIN: 状態に asins が載り、検索語の候補とは別 (candidates に混ざらない)',
+    r.json.state.asins.length === 2 && r.json.state.asins.every((a) => a.decision === null && a.added_by === 'smoke@b-faith.biz')
+    && !r.json.state.candidates.some((c) => c.value === 'B0COMPET01'), JSON.stringify(r.json.state.asins));
+  check('SP広告KW/ASIN: 材料は source=input・候補は kind=asin origin=input',
+    db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'input'`).get(rid).n === 2
+    && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'asin' AND origin = 'input'`).get(rid).n === 2);
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: ['B0COMPET03', 'B0COMPET04', 'B0COMPET05', 'B0COMPET06'] });
+  check('SP広告KW/ASIN: 6 件目も入る (上限は 20 件。2026-09-23 に 5 → 20)', r.json.added.length === 4 && r.json.skipped.length === 0 && r.json.state.limits.max_asins === 20, JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW/ASIN: 種の表に ASIN は混ざらない (input は種ではない)', !r.json.state.seeds.some((s) => /^B0COMPET/.test(s.seed)));
+  const aC1 = r.json.state.asins.find((a) => a.asin === 'B0COMPET01');
+  r = await call('POST', `${P(idOwn)}/candidates/${aC1.id}/decisions`, { decision: 'adopt', match_type: 'exact' });
+  check('SP広告KW/ASIN: 商品ターゲットにマッチタイプは付けられない (400)', r.status === 400 && r.json.code === 'bad_match_type', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/candidates/${aC1.id}/decisions`, { decision: 'adopt' });
+  check('SP広告KW/ASIN: マッチタイプ無しで採用できる (keyword = ASIN・match_type = null)',
+    r.status === 200 && r.json.decision.keyword === 'B0COMPET01' && r.json.decision.match_type === null, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  {
+    const blocks = r.json.export.body.blocks;
+    const pt = blocks.find((b) => b.match_type === 'product_targets');
+    check('SP広告KW/ASIN: 本文に「商品ターゲット」のブロックが別に出る (キーワードのブロックに混ざらない)',
+      r.status === 200 && r.json.export.kind === 'ad_copy' && pt && pt.text === 'B0COMPET01' && pt.count === 1
+      && !blocks.filter((b) => b.match_type !== 'product_targets').some((b) => /B0COMPETIT/.test(b.text))
+      && r.json.export.body.target_total === 1 && r.json.export.body.keyword_total === 2, JSON.stringify(r.json.export.body));
+    r = await call('POST', `${P(idOwn)}/exports/${r.json.export.id}/copied`, { match_type: 'product_targets' });
+    check('SP広告KW/ASIN: 商品ターゲットのブロックにコピーの印が付く', r.status === 200 && typeof r.json.copied.product_targets === 'string', JSON.stringify(r.json));
+  }
+  r = await call('GET', P(idOwn));
+  check('SP広告KW/ASIN: 状態に採用した商品ターゲットの数が別に載る', r.json.state.adopted_asin_count === 1 && r.json.state.adopted_count === 2, JSON.stringify([r.json.state.adopted_asin_count, r.json.state.adopted_count]));
+
+  // 商品情報が変わったら「旧情報に基づく」
+  db.prepare(`UPDATE product_drafts SET name = 'ハッカ油スプレー 100ml' WHERE id = ?`).run(idOwn);
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 依頼のあとで商品名が変わると stale=true (旧情報に基づく候補と出す)', r.json.state.stale === true && r.json.state.request.snapshot.name === 'ハッカ油スプレー');
+
+  // 詳細画面: 自社商品ならタブと状態 JSON が載る (中身は JS が描く)
+  {
+    const pg = await getHtml(`/detail/${idOwn}`);
+    const m = pg.html.match(/<script type="application\/json" id="adkw-json">([\s\S]*?)<\/script>/);
+    const embedded = m ? JSON.parse(m[1]) : null;
+    check('SP広告KW: 自社商品の詳細画面にタブと状態 JSON が載る',
+      pg.status === 200 && pg.html.includes('data-tab="tab-adkw"') && embedded && embedded.draftId === idOwn
+      && embedded.state.adopted_count === 2 && embedded.state.seeds.length >= 3, `${pg.status} ${m ? m[1].slice(0, 200) : pg.html.slice(0, 300)}`);
+    check('SP広告KW: 画面の注意書き = Amazon に登録はされない・コピー済み≠登録済み・実績は未取得',
+      /Amazon に登録はされません/.test(pg.html) && /「コピー済み」は「Amazon 登録済み」ではありません/.test(pg.html) && /ACOS は未取得/.test(pg.html));
+    check('SP広告KW/ABA: 画面の文言 (§4.8) = クリック上位 3 商品に含まれた検索語・対象週・該当なし ≠ 注文なし・全注文語でも広告成果でもない',
+      /クリック上位 3 商品に含まれた検索語/.test(pg.html) && /対象週/.test(pg.html) && /該当なし ≠ 注文なし/.test(pg.html) && /全注文語でも広告成果でも/.test(pg.html));
+    // 描画後の JS が構文として通る (タブの JS は状態 JSON から DOM を組む。文字列を innerHTML に流さない)
+    const vmMod = await import('node:vm');
+    const js = checkInlineScriptSyntax(vmMod, pg.html, 'detail(ad-keywords)');
+    const tabScript = (pg.html.match(/<script>\s*\/\/ SP広告KW タブ[\s\S]*?<\/script>/) || [''])[0];
+    check('SP広告KW: 詳細画面の JS が構文として通り、タブの JS は innerHTML を使わない',
+      js.ok && tabScript.includes('initAdKeywords') && !/\.innerHTML\b/.test(tabScript), js.detail + ` / タブ script ${tabScript.length} 文字`);
+  }
+
+  // ─── PR2-B2: 競合 ASIN の ABA 検索語を miniPC の aba.db (取込済みの週) から引く。走査しない・Render から Amazon を呼ばない ───
+  //   守りたいこと: 該当なし ≠ 注文なし (証明の無い「該当なし」を出さない)・失敗と 0 件と「判定できない」を混ぜない・材料は取得回ごと・
+  //   候補は先勝ちで観測を足す・取得済みは miniPC を呼ばない・取り直しは行を足す (前の材料と採否は残る)・閉じた依頼には保存しない
+  const A = (cid) => `${P(idOwn)}/asins/${cid}/aba`;
+  {
+    abaCalls = [];
+    abaImpl = async (body) => {
+      abaCalls.push(body);
+      return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [
+        abaTerm('ハッカ油 スプレー', 1200, 2, 0.21, 0.15), abaTerm('はっか油 虫除け 最強', 8800, 1, 0.33, 0.30),
+        abaTerm('  ハッカ油 スプレー ', 1200, 2, 0.21, 0.15), abaTerm('ハッカ油 スプレー 作り方', 25000, 3, 0.05, 0.02),
+      ] });
+    };
+    r = await call('GET', P(idOwn));
+    const asinsBefore = r.json.state.asins;
+    check('SP広告KW/ABA: 引く前は asins[].aba が null・取得 0 回', asinsBefore.length === 6 && asinsBefore.every((a) => a.aba === null && a.aba_fetch_count === 0), JSON.stringify(asinsBefore).slice(0, 300));
+    const aC2 = asinsBefore.find((a) => a.asin === 'B0COMPET02');
+    const kwBefore = r.json.state.candidates.length;
+    r = await call('POST', A(aC2.id), {});
+    check('SP広告KW/ABA: 引くと found・対象週・語数が返り、miniPC には ASIN 1 つ・register=true で頼む',
+      r.status === 200 && r.json.looked_up === true && r.json.reused === false && r.json.aba.status === 'found' && r.json.aba.week_start === '2026-09-13' && r.json.aba.term_count === 4
+      && abaCalls.length === 1 && JSON.stringify(abaCalls[0].asins) === '["B0COMPET02"]' && abaCalls[0].register === true, JSON.stringify(r.json).slice(0, 400));
+    check('SP広告KW/ABA: 候補 = 既出 1 語 (ハッカ油 スプレー = サジェストで先に出た) に観測を足し、新規 2 語 (空白違いの重複は 1 つ)',
+      r.json.added === 2 && r.json.merged === 1 && r.json.state.candidates.length === kwBefore + 2, JSON.stringify([r.json.added, r.json.merged, kwBefore, r.json.state.candidates.length]));
+    {
+      const st = r.json.state;
+      const spray = st.candidates.find((c) => c.value === 'ハッカ油 スプレー');
+      const strongest = st.candidates.find((c) => c.value === 'はっか油 虫除け 最強');
+      const howto = st.candidates.find((c) => c.value === 'ハッカ油 スプレー 作り方');
+      check('SP広告KW/ABA: 先勝ち = サジェストで先に出た語は種の側に残り (seed は変わらない)、ABA の観測 (順位・位置・シェア・週) が足される',
+        !!spray && spray.seed !== 'B0COMPET02' && spray.first_source !== 'aba' && spray.observed_count === spray.observed.length && spray.observed.length >= 2
+        && spray.observed.some((o) => o.source === 'aba' && o.seed === 'B0COMPET02' && o.rank === 1200 && o.click_position === 2 && o.click_share === 0.21 && o.week_start === '2026-09-13' && o.source_label === 'ABA' && /9月13日〜9月19日/.test(o.week_text)),
+        JSON.stringify(spray && spray.observed));
+      check('SP広告KW/ABA: ABA で初めて出た語は seed=ASIN・first_source=aba・origin=observed で、並びは検索頻度順位 (小さい順)',
+        !!strongest && !!howto && strongest.seed === 'B0COMPET02' && strongest.first_source === 'aba' && strongest.origin === 'observed'
+        && st.candidates.indexOf(strongest) < st.candidates.indexOf(howto), JSON.stringify(st.candidates.map((c) => [c.value, c.seed])));
+      const a2 = st.asins.find((a) => a.asin === 'B0COMPET02');
+      check('SP広告KW/ABA: asins[].aba に 状態・対象週・§4.8 の文 (クリック上位 3 商品に含まれた検索語・対象週) が載る',
+        !!a2.aba && a2.aba.status === 'found' && a2.aba.status_ja === '該当あり' && a2.aba.coverage === 'complete' && a2.aba.week_text === '9月13日〜9月19日'
+        && /競合 ASIN B0COMPET02 がクリック上位 3 商品に含まれた検索語・対象週 9月13日〜9月19日/.test(a2.aba.observed_text) && a2.aba_fetch_count === 1 && a2.aba_candidate_count === 3,
+        JSON.stringify(a2));
+      check('SP広告KW/ABA: 材料は source=aba・seed=ASIN・status=success・coverage に aba_status/週/証明・raw に語がそのまま',
+        (() => {
+          const ev = db.prepare(`SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET02'`).all(rid);
+          const c = ev.length === 1 ? JSON.parse(ev[0].coverage_json) : {};
+          return ev.length === 1 && ev[0].status === 'success' && c.aba_status === 'found' && c.week_start === '2026-09-13' && c.proof === 'week_ingested' && c.term_count === 4 && JSON.parse(ev[0].raw_json).length === 4;
+        })());
+      check('SP広告KW/ABA: 指標は原値のまま (換算しない)・成果スコアの項目が無い',
+        !!strongest && !/score|volume|ボリューム/.test(JSON.stringify(strongest.observed)) && strongest.observed[0].conversion_share === 0.30);
+    }
+    abaCalls = [];
+    r = await call('POST', A(aC2.id), {});
+    check('SP広告KW/ABA: 取得済みの ASIN は miniPC を呼ばず reused', r.status === 200 && r.json.reused === true && r.json.added === 0 && abaCalls.length === 0, JSON.stringify(r.json).slice(0, 200));
+    // 取り直し = 新しい週で行を足す (前の材料・候補は残る)。同じ語の同じ週の観測は二重にしない
+    abaImpl = async (body) => { abaCalls.push(body); return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('はっか油 虫除け 最強', 7000, 1, 0.35, 0.31), abaTerm('ハッカ油 ゴキブリ', 30000, 3, 0.04, 0.01)] }, abaWeek('2026-09-20', '2026-09-26')); };
+    r = await call('POST', A(aC2.id), { retake: true });
+    check('SP広告KW/ABA: 取り直しは取得回の行を足す (2 行)・新しい週で、既出の語には新しい週の観測が足され、新規 1 語',
+      r.status === 200 && r.json.reused === false && r.json.added === 1 && r.json.merged === 1 && r.json.aba.week_start === '2026-09-20'
+      && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET02'`).get(rid).n === 2
+      && r.json.state.asins.find((a) => a.asin === 'B0COMPET02').aba_fetch_count === 2, JSON.stringify(r.json).slice(0, 300));
+    {
+      const strongest = r.json.state.candidates.find((c) => c.value === 'はっか油 虫除け 最強');
+      check('SP広告KW/ABA: 最初の観測 (seed・週) は取り直しで書き換わらない (観測が 2 つ: 9/13 と 9/20)',
+        !!strongest && strongest.seed === 'B0COMPET02' && strongest.observed_count === 2 && strongest.observed[0].week_start === '2026-09-13' && strongest.observed[1].week_start === '2026-09-20', JSON.stringify(strongest && strongest.observed));
+      check('SP広告KW/ABA: 前の取得回でだけ出た語も候補に残る', !!r.json.state.candidates.find((c) => c.value === 'ハッカ油 スプレー 作り方'));
+    }
+    // 該当なし (証明つき)・判定できない・レポート無し・失敗 を混ぜない
+    const aC3 = asinsBefore.find((a) => a.asin === 'B0COMPET03');
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'none', coverage: 'complete', terms: [] });
+    r = await call('POST', A(aC3.id), {});
+    check('SP広告KW/ABA: 該当なし (full かつ捨てた行 0 の週) = empty・証明 week_ingested・候補 0',
+      r.status === 200 && r.json.looked_up === true && r.json.aba.status === 'none' && r.json.aba.proof === 'week_ingested' && r.json.added === 0
+      && db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET03'`).get(rid).status === 'empty'
+      && /該当なし/.test(r.json.aba.status_ja), JSON.stringify(r.json.aba));
+    const aC4 = asinsBefore.find((a) => a.asin === 'B0COMPET04');
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'not_covered', coverage: 'unknown', proof: null, reason: 'incomplete_ingest', terms: [] }, abaWeek('2026-09-13', '2026-09-19', { skipped_count: 12 }));
+    r = await call('POST', A(aC4.id), {});
+    check('SP広告KW/ABA: 判定できない (取込が不完全) は「該当なし」にしない (partial・理由つき)',
+      r.status === 200 && r.json.aba.status === 'not_covered' && /判定できない/.test(r.json.aba.status_ja) && /捨てた行/.test(r.json.aba.reason_ja)
+      && db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET04'`).get(rid).status === 'partial', JSON.stringify(r.json.aba));
+    abaCalls = [];
+    r = await call('POST', A(aC4.id), {});
+    check('SP広告KW/ABA: 判定できない は取得済み扱い (retake 無しでは呼び直さない)', r.json.reused === true && abaCalls.length === 0);
+    const aC5 = asinsBefore.find((a) => a.asin === 'B0COMPET05');
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'no_week', coverage: 'unknown', proof: null, reason: 'no_ingested_week', terms: [] }, null);
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: レポート無し (取込済みの週が無い) は failed 扱いで「もう一度」できる (状態は no_week)',
+      r.status === 200 && r.json.looked_up === true && r.json.aba.status === 'no_week' && r.json.aba.week_start === null && /レポート無し/.test(r.json.aba.status_ja)
+      && db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET05'`).get(rid).status === 'failed', JSON.stringify(r.json.aba));
+    abaImpl = async () => { throw new Error('ECONNREFUSED'); };
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: miniPC が落ちていれば「取れなかった」を記録して返す (200・looked_up=false・理由つき・呼び直せる)',
+      r.status === 200 && r.json.looked_up === false && /unreachable/.test(r.json.error) && r.json.aba.status === 'failed'
+      && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET05'`).get(rid).n === 2, JSON.stringify(r.json).slice(0, 300));
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'none', coverage: 'partial', terms: [] });
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: 証明の無い「該当なし」(coverage≠complete) は受け取らず失敗として記録 (bad_response)',
+      r.status === 200 && r.json.looked_up === false && /bad_response/.test(r.json.error), JSON.stringify(r.json).slice(0, 300));
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('ラベンダー スプレー', 500, 1, 0.5, 0.4)] });
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: 失敗のあとに引き直せる (取得回 4 行・いまの状態は found)',
+      r.status === 200 && r.json.looked_up === true && r.json.reused === false && r.json.added === 1
+      && r.json.state.asins.find((a) => a.asin === 'B0COMPET05').aba_fetch_count === 4 && r.json.state.asins.find((a) => a.asin === 'B0COMPET05').aba.status === 'found', JSON.stringify(r.json.aba));
+    // 入口の守り
+    r = await call('POST', A(cSpray.id), {});
+    check('SP広告KW/ABA: 検索語の候補 (kind=kw) の id では引けない (404)', r.status === 404 && r.json.code === 'not_found', JSON.stringify(r.json));
+    r = await call('POST', A(999999), {});
+    check('SP広告KW/ABA: 無い候補は 404', r.status === 404);
+    r = await call('POST', `${P(idOwn2)}/asins/${aC2.id}/aba`, {});
+    check('SP広告KW/ABA: 別のドラフトからは引けない (404)', r.status === 404, JSON.stringify(r.json));
+    // ABA の語も採用・コピーできる (キーワードのブロックに入る。商品ターゲットのブロックには混ざらない)
+    r = await call('GET', P(idOwn));
+    {
+      const strongest = r.json.state.candidates.find((c) => c.value === 'はっか油 虫除け 最強');
+      r = await call('POST', `${P(idOwn)}/candidates/${strongest.id}/decisions`, { decision: 'adopt', match_type: 'phrase' });
+      check('SP広告KW/ABA: ABA で出た語も採用できる (マッチタイプつき)', r.status === 200 && r.json.decision.match_type === 'phrase', JSON.stringify(r.json));
+      r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+      const ph = r.json.export.body.blocks.find((b) => b.match_type === 'phrase');
+      const pt = r.json.export.body.blocks.find((b) => b.match_type === 'product_targets');
+      check('SP広告KW/ABA: 本文のフレーズ一致に入る (商品ターゲットのブロックには混ざらない)',
+        !!ph && /はっか油 虫除け 最強/.test(ph.text) && !!pt && !/はっか油/.test(pt.text), JSON.stringify(r.json.export.body));
+      check('SP広告KW/ABA: 操作履歴に 引いた・失敗 が残る',
+        ['ad_kw_aba_looked_up', 'ad_kw_aba_failed'].every((ev) => db.prepare('SELECT 1 FROM draft_events WHERE draft_id = ? AND event = ?').get(idOwn, ev)));
+    }
+    // 並行照会 (lease を取らない代わりの守り): 週A → 週B → 週A の順に保存が進んでも、同じ週の材料を二重に足さない (Codex R1 #1)
+    {
+      const adkw = await import('../lib/ad-keywords.js');
+      const draftRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(idOwn);
+      const aC1 = asinsBefore.find((a) => a.asin === 'B0COMPET01');
+      const deferred = () => { let resolve; const p = new Promise((res) => { resolve = res; }); return { p, resolve }; };
+      const d1 = deferred(), d2 = deferred(), d3 = deferred();
+      const mk = (d, ws, we) => () => d.p.then(() => ({ ok: true, result: abaResult('B0COMPET01', { status: 'found', coverage: 'complete', terms: [abaTerm(`ハッカ油 ${ws}`, 100, 1, 0.1, 0.1)] }, abaWeek(ws, we)) }));
+      const p1 = adkw.lookupAbaForAsin(db, draftRow, aC1.id, { actor: 'smoke', lookup: mk(d1, '2026-09-13', '2026-09-19') });
+      const p2 = adkw.lookupAbaForAsin(db, draftRow, aC1.id, { actor: 'smoke', retake: true, lookup: mk(d2, '2026-09-20', '2026-09-26') });
+      const p3 = adkw.lookupAbaForAsin(db, draftRow, aC1.id, { actor: 'smoke', retake: true, lookup: mk(d3, '2026-09-13', '2026-09-19') });
+      d1.resolve(); const r1 = await p1;
+      d2.resolve(); const r2 = await p2;
+      d3.resolve(); const r3 = await p3;
+      check('SP広告KW/ABA: 並行照会が 週A → 週B → 週A の順に保存へ進んでも、同じ週 (A) の材料は二重に足さない (3 つ目は最初の A を再利用)',
+        r1.ok && r1.reused === false && r2.ok && r2.reused === false && r3.ok && r3.reused === true && r3.evidence.id === r1.evidence.id
+        && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET01'`).get(rid).n === 2,
+        JSON.stringify([r1.reused, r2.reused, r3.reused, r3.evidence && r3.evidence.id, r1.evidence && r1.evidence.id]));
+      r = await call('GET', P(idOwn));
+      const a1 = r.json.state.asins.find((a) => a.asin === 'B0COMPET01');
+      check('SP広告KW/ABA: 画面の最新週は 週B のまま (A に巻き戻らない)・取得 2 回', a1.aba.week_start === '2026-09-20' && a1.aba_fetch_count === 2, JSON.stringify(a1.aba));
+    }
+  }
+
+  // 取消: 以後の収集・採否・固定は 409。収集の途中で取り消された結果は保存しない
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/cancel`);
+  check('SP広告KW: 依頼を取り消せる', r.status === 200, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ゼラニウム' });
+  check('SP広告KW: 取り消した依頼では集められない (409 closed)', r.status === 409 && r.json.code === 'closed');
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'reject' });
+  check('SP広告KW: 取り消した依頼の採否は変えられない (409 closed)', r.status === 409 && r.json.code === 'closed');
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 取り消した依頼の本文は固定できない (409 closed)', r.status === 409 && r.json.code === 'closed');
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/cancel`);
+  check('SP広告KW: 二度目の取消は 409', r.status === 409);
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 取り消すと画面の状態は「依頼なし」に戻る (候補・採否は DB に残る)',
+    r.json.state.request === null && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE request_id = ?').get(rid).n > 0);
+
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k1' });
+  check('SP広告KW: 取り消した依頼のキーを再送しても、閉じた依頼を返さない (409 closed。画面が同じキーで詰まらない)',
+    r.status === 409 && r.json.code === 'closed', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k3' });
+  const rid3 = r.json.request_id;
+  check('SP広告KW: 取消のあとは新しいキーで新しい依頼を作れる', r.status === 200 && rid3 !== rid && r.json.reused === false);
+  {
+    let cancelled = null;
+    fetcherImpl = async (body) => {
+      cancelled = await call('POST', `${P(idOwn)}/requests/${rid3}/cancel`);   // 収集の途中で人が取り消す
+      return { ...suggestResult(body.seed), suggestions: [{ keyword: 'レモン 香り', source: 'base' }] };
+    };
+    r = await call('POST', `${P(idOwn)}/requests/${rid3}/collect`, { seed: 'レモン' });
+    check('SP広告KW: 収集の途中で取り消された結果は保存しない (409 cancelled・材料なし)',
+      r.status === 409 && r.json.code === 'cancelled' && cancelled && cancelled.status === 200
+      && !db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ?`).get(rid3)
+      && db.prepare('SELECT status FROM ph_ad_kw_requests WHERE id = ?').get(rid3).status === 'cancelled', JSON.stringify(r.json));
+  }
+  {
+    // ABA も同じ: 引いている途中で取り消された結果は保存しない
+    r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k3b' });
+    const rid3b = r.json.request_id;
+    r = await call('POST', `${P(idOwn)}/requests/${rid3b}/asins`, { asins: 'B0COMPET07' });
+    const c7 = r.json.state.asins[0];
+    let cancelled = null;
+    abaImpl = async (body) => {
+      cancelled = await call('POST', `${P(idOwn)}/requests/${rid3b}/cancel`);
+      return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('レモン スプレー', 10, 1, 0.1, 0.1)] });
+    };
+    r = await call('POST', A(c7.id), {});
+    check('SP広告KW/ABA: 引いている途中で取り消された結果は保存しない (409 cancelled・材料なし)',
+      r.status === 409 && r.json.code === 'cancelled' && cancelled && cancelled.status === 200
+      && !db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba'`).get(rid3b), JSON.stringify(r.json));
+    r = await call('POST', A(c7.id), {});
+    check('SP広告KW/ABA: 閉じた依頼の ASIN では引けない (409 closed)', r.status === 409 && r.json.code === 'closed', JSON.stringify(r.json));
+  }
+
+  // 置き換え (restart): 以前の依頼は superseded。採否は消えないが変えられない
+  fetcherImpl = async (body) => (resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }] }));
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k4' });
+  const rid4 = r.json.request_id;
+  r = await call('POST', `${P(idOwn)}/requests/${rid4}/collect`, { seed: 'ティーツリー' });
+  const c4 = r.json.state.candidates[0];
+  r = await call('POST', `${P(idOwn)}/candidates/${c4.id}/decisions`, { decision: 'adopt', match_type: 'broad' });
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k5', restart: true });
+  const rid5 = r.json.request_id;
+  check('SP広告KW: restart で新しい依頼になり、前の依頼は superseded (採否の行はそのまま)',
+    rid5 !== rid4 && r.json.reused === false
+    && db.prepare('SELECT status, supersedes_request_id FROM ph_ad_kw_requests WHERE id = ?').get(rid5).supersedes_request_id === rid4
+    && db.prepare('SELECT status FROM ph_ad_kw_requests WHERE id = ?').get(rid4).status === 'superseded'
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE request_id = ?').get(rid4).n === 1, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/candidates/${c4.id}/decisions`, { decision: 'reject' });
+  check('SP広告KW: 置き換えられた依頼の採否は変えられない (上書きしない)', r.status === 409 && r.json.code === 'closed');
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 新しい依頼は空から始まる (前の候補は持ち越さない)', r.json.state.request.id === rid5 && r.json.state.candidates.length === 0);
+
+  // ─── 競合 ASIN を ABA から自動で出す (2026-09-23)。採用した語ごとのクリック上位 3 → 多く出た順に「採用 (自動)」→ 人が却下 ───
+  {
+    db.prepare(`UPDATE product_drafts SET asin = 'B0AUTOOWN1' WHERE id = ?`).run(idOwn2);
+    r = await call('POST', `${P(idOwn2)}/requests`, { idempotency_key: 'k-auto' });
+    const ridA = r.json.request_id;
+    const AU = `${P(idOwn2)}/requests/${ridA}/auto-asins`;
+    abaCalls = [];
+    r = await call('POST', AU, {});
+    check('SP広告KW/自動: 採用した検索 KW が無ければ 400 (miniPC を呼ばない)', r.status === 400 && r.json.code === 'no_adopted' && abaCalls.length === 0, JSON.stringify(r.json));
+    fetcherImpl = async (body) => { fetcherCalls.push(body); return suggestResult(body.seed); };
+    r = await call('POST', `${P(idOwn2)}/requests/${ridA}/collect`, { seed: 'ラベンダー' });
+    const cs = r.json.state.candidates;
+    const kSpray = cs.find((c) => c.value === 'ラベンダー スプレー'), kMushi = cs.find((c) => c.value === 'ラベンダー 虫除け');
+    await call('POST', `${P(idOwn2)}/candidates/${kSpray.id}/decisions`, { decision: 'adopt', match_type: 'exact_phrase' });
+    await call('POST', `${P(idOwn2)}/candidates/${kMushi.id}/decisions`, { decision: 'adopt', match_type: 'exact', keyword: 'ラベンダー 虫よけ' });
+
+    // miniPC /aba/terms の応答 (語ごと・部門ごと)
+    const tWeek = abaWeek('2026-09-13', '2026-09-19');
+    const hit = (asin, pos, cs2) => ({ asin, click_position: pos, product_title: null, click_share: cs2, conversion_share: cs2 / 2 });
+    const termsResult = (terms, byTerm, week = tWeek, wc = 'complete') => ({
+      week, requested_week: null, week_coverage: wc, invalid: [],
+      items: terms.map((t) => byTerm[t] ? { term: t, matched_term: t, variants: [t], status: 'found', coverage: wc, reason: null, departments: byTerm[t] }
+        : { term: t, matched_term: null, variants: [t], status: 'none', coverage: 'complete', reason: null, departments: [] }),
+    });
+    let termsImpl = (terms) => termsResult(terms, {
+      'ラベンダー スプレー': [{ department: 'amazon.co.jp', search_frequency_rank: 800, asins: [hit('B0AUTOAAA1', 1, 0.3), hit('B0AUTOOWN1', 2, 0.2), hit('B0AUTOBBB2', 3, 0.05)] }],
+      'ラベンダー 虫よけ': [{ department: 'amazon.co.jp', search_frequency_rank: 2000, asins: [hit('B0AUTOAAA1', 2, 0.2), hit('B0AUTOCCC3', 3, 0.1)] }],
+    });
+    abaImpl = async (body, path) => { abaCalls.push({ body, path }); if (path !== '/terms') throw new Error('unexpected path ' + path); return termsImpl(body.terms); };
+    r = await call('POST', AU, {});
+    check('SP広告KW/自動: 採用した語 (直した語) を miniPC /aba/terms に送る', r.status === 200 && abaCalls.length === 1 && abaCalls[0].path === '/terms'
+      && JSON.stringify(abaCalls[0].body.terms) === '["ラベンダー スプレー","ラベンダー 虫よけ"]', JSON.stringify(abaCalls));
+    check('SP広告KW/自動: 多く出た順 (語の数 → 良い順位 → シェア) に入り、自分の ASIN は除く',
+      JSON.stringify(r.json.added) === '["B0AUTOAAA1","B0AUTOCCC3","B0AUTOBBB2"]' && r.json.skipped.some((s) => s.asin === 'B0AUTOOWN1' && /自分/.test(s.reason)), JSON.stringify(r.json).slice(0, 400));
+    const stA = r.json.state;
+    const aA = stA.asins.find((a) => a.asin === 'B0AUTOAAA1');
+    check('SP広告KW/自動: 最初から「採用」(記録者 = auto:aba)・候補は origin=observed',
+      stA.asins.every((a) => a.auto && a.decision && a.decision.decision === 'adopt' && a.decision.actor === 'auto:aba' && a.origin === 'observed') && stA.adopted_asin_count === 3,
+      JSON.stringify(stA.asins.map((a) => [a.asin, a.decision && a.decision.actor])));
+    check('SP広告KW/自動: どの語で何位かを添える (原値)',
+      aA.auto_term_count === 2 && JSON.stringify(aA.auto_hits.map((h) => [h.term, h.click_position, h.click_share])) === '[["ラベンダー スプレー",1,0.3],["ラベンダー 虫よけ",2,0.2]]'
+      && aA.auto_week_text === '9月13日〜9月19日' && aA.added_by === null, JSON.stringify(aA));
+    check('SP広告KW/自動: 前回の要約 (語 2 → 該当あり 2・出てきた商品 4 → 採用 3)',
+      stA.auto_asins && stA.auto_asins.status === 'success' && stA.auto_asins.terms_sent === 2 && stA.auto_asins.found === 2 && stA.auto_asins.asins_seen === 4 && stA.auto_asins.added === 3,
+      JSON.stringify(stA.auto_asins));
+    check('SP広告KW/自動: 材料は source=aba・seed=*top_asins* (ASIN の ABA 検索語とは別)・操作履歴に残る',
+      db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = '*top_asins*'`).get(ridA).n === 1
+      && stA.asins.every((a) => a.aba === null)
+      && !!db.prepare(`SELECT 1 FROM draft_events WHERE draft_id = ? AND event = 'ad_kw_auto_asins'`).get(idOwn2));
+    r = await call('POST', AU, {});
+    check('SP広告KW/自動: もう一度押しても同じ ASIN は二重に入らない (入力済み)', r.json.added.length === 0 && r.json.skipped.filter((s) => s.reason === '入力済み').length === 3
+      && r.json.state.asins.length === 3, JSON.stringify(r.json).slice(0, 300));
+    // 人が却下 → 本文の商品ターゲットから外れる
+    const aB = r.json.state.asins.find((a) => a.asin === 'B0AUTOBBB2');
+    r = await call('POST', `${P(idOwn2)}/candidates/${aB.id}/decisions`, { decision: 'reject' });
+    check('SP広告KW/自動: 自動で入った ASIN を人が却下できる', r.status === 200 && r.json.decision.decision === 'reject' && r.json.decision.actor === 'smoke@b-faith.biz');
+    r = await call('POST', `${P(idOwn2)}/requests/${ridA}/exports`);
+    {
+      const pt = r.json.export.body.blocks.find((b) => b.match_type === 'product_targets');
+      check('SP広告KW/自動: 本文の商品ターゲット = 採用 (自動) のうち却下していないもの', pt && pt.text === 'B0AUTOAAA1\nB0AUTOCCC3', JSON.stringify(r.json.export.body).slice(0, 300));
+    }
+    // 失敗の記録 (0 件と混ぜない)
+    abaImpl = async () => { throw new Error('ECONNREFUSED'); };
+    r = await call('POST', AU, {});
+    check('SP広告KW/自動: miniPC に届かなければ looked_up=false・材料は failed・前回の要約も failed',
+      r.status === 200 && r.json.looked_up === false && /unreachable|ECONNREFUSED/.test(r.json.error) && r.json.state.auto_asins.status === 'failed' && r.json.state.asins.length === 3, JSON.stringify(r.json).slice(0, 300));
+    abaImpl = async (body) => ({ week: null, requested_week: null, week_coverage: 'unknown', invalid: [],
+      items: body.terms.map((t) => ({ term: t, matched_term: null, variants: [t], status: 'no_week', coverage: 'unknown', reason: 'no_ingested_week', departments: [] })) });
+    r = await call('POST', AU, {});
+    check('SP広告KW/自動: 取込済みの週が無ければ failed (no_week)・何も入れない', r.json.looked_up === true && r.json.added.length === 0 && r.json.state.auto_asins.status === 'failed'
+      && /no_week/.test(r.json.state.auto_asins.error || ''), JSON.stringify(r.json.state.auto_asins));
+    abaImpl = async (body) => termsResult(body.terms, {}, tWeek, 'partial');
+    r = await call('POST', AU, {});
+    check('SP広告KW/自動: 証明の無い「該当なし」(none なのに週が partial) は受け取らない (bad_response)', r.json.looked_up === false && /bad_response/.test(r.json.error), JSON.stringify(r.json).slice(0, 300));
+    abaImpl = async (body) => termsResult(body.terms, { [body.terms[0]]: [{ department: 'x', search_frequency_rank: 1, asins: [hit('NOT-AN-ASIN', 1, 0.1)] }] });
+    r = await call('POST', AU, {});
+    check('SP広告KW/自動: ASIN の形でない値は受け取らない (bad_response)', r.json.looked_up === false && /bad_response/.test(r.json.error), JSON.stringify(r.json).slice(0, 300));
+    // 上限 20 件: 手入力で 19 件にしてから自動 → 1 件だけ入り、残りは「20 件まで」
+    const fill = Array.from({ length: 16 }, (_, i) => 'B0FILL' + String(i).padStart(4, '0'));
+    r = await call('POST', `${P(idOwn2)}/requests/${ridA}/asins`, { asins: fill });
+    check('SP広告KW/ASIN: 手入力は 20 件まで入る', r.json.added.length === 16 && r.json.state.asins.length === 19, JSON.stringify(r.json).slice(0, 200));
+    abaImpl = async (body) => termsResult(body.terms, { [body.terms[0]]: [{ department: 'amazon.co.jp', search_frequency_rank: 5, asins: [hit('B0AUTODDD4', 1, 0.5), hit('B0AUTOEEE5', 2, 0.3)] }] });
+    r = await call('POST', AU, {});
+    check('SP広告KW/自動: 1 依頼 20 件で止まる (入りきらない分は skip・理由つき)',
+      JSON.stringify(r.json.added) === '["B0AUTODDD4"]' && r.json.skipped.some((s) => s.asin === 'B0AUTOEEE5' && /20 件/.test(s.reason)) && r.json.state.asins.length === 20, JSON.stringify(r.json).slice(0, 300));
+    r = await call('POST', `${P(idOwn2)}/requests/${ridA}/asins`, { asins: 'B0FILLXXX1' });
+    check('SP広告KW/ASIN: 20 件あれば手入力も skip', r.json.added.length === 0 && r.json.skipped.some((s) => /20 件/.test(s.reason)), JSON.stringify(r.json).slice(0, 200));
+    // 閉じた依頼には保存しない
+    r = await call('POST', `${P(idOwn2)}/requests/${ridA}/cancel`, {});
+    abaCalls = [];
+    r = await call('POST', AU, {});
+    check('SP広告KW/自動: 閉じた依頼は 409 (miniPC を呼ばない)', r.status === 409 && r.json.code === 'closed' && abaCalls.length === 0, JSON.stringify(r.json));
+    r = await call('POST', `${P(idOwn)}/requests/${ridA}/auto-asins`, {});
+    check('SP広告KW/自動: 別のドラフトの依頼は 404', r.status === 404, JSON.stringify(r.json));
+  }
+
+  // 設定が無ければ集めない (採否・コピーはできる)
+  delete process.env.WAREHOUSE_SERVICE_TOKEN;
+  fetcherCalls = [];
+  fetcherImpl = async (body) => { fetcherCalls.push(body); return suggestResult(body.seed); };
+  r = await call('POST', `${P(idOwn)}/requests/${rid5}/collect`, { seed: 'ミント' });
+  check('SP広告KW: WAREHOUSE_SERVICE_TOKEN が無ければ 503 で止まる (Render から代わりに叩かない・記録も残さない)',
+    r.status === 503 && r.json.code === 'not_configured' && fetcherCalls.length === 0
+    && !db.prepare('SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ?').get(rid5), JSON.stringify(r.json));
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 設定が無いことを状態で伝える (configured=false)', r.json.state.configured === false);
+  abaCalls = [];
+  abaImpl = async (body) => { abaCalls.push(body); return abaResult(body.asins[0], { status: 'none', coverage: 'complete', terms: [] }); };
+  r = await call('POST', A(db.prepare(`SELECT id FROM ph_ad_kw_candidates WHERE kind = 'asin' AND value = 'B0COMPET02'`).get().id), {});
+  check('SP広告KW/ABA: WAREHOUSE_SERVICE_TOKEN が無ければ 503 で止まる (記録も残さない)', r.status === 503 && r.json.code === 'not_configured' && abaCalls.length === 0, JSON.stringify(r.json));
+
+  // 後始末
+  if (savedToken === undefined) delete process.env.WAREHOUSE_SERVICE_TOKEN; else process.env.WAREHOUSE_SERVICE_TOKEN = savedToken;
+  kwClient._setSuggestFetcher(null);
+  abaClient._setAbaFetcher(null);
+  server.close();
+  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(idOwn, idOwn2, idOther);
+  check('SP広告KW: ドラフトを消すと依頼・材料・候補・コピー履歴も消える (採否の行は監査として残る)',
+    !db.prepare('SELECT 1 FROM ph_ad_kw_requests WHERE draft_id = ?').get(idOwn)
+    && !db.prepare('SELECT 1 FROM ph_ad_kw_candidates WHERE request_id = ?').get(rid)
+    && !db.prepare('SELECT 1 FROM ph_ad_kw_exports WHERE draft_id = ?').get(idOwn)
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE request_id = ?').get(rid).n > 0);
+}
+
+// ─── SP広告KW PR2-C: PR1 の CHECK 制約を広げる作り直し (migrateAdKwCheckConstraints) ───
+// 本番には PR1 (9/23 午前) の定義で行が入っているかもしれない。行と id を保ったまま作り直せること・二度目は何もしないことを、
+// PR1 の DDL を写した別の DB で確かめる
+{
+  const Database = (await import('better-sqlite3')).default;
+  const mpath = path.join(process.env.DATA_DIR, 'adkw-migration-test.db');
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
+  const mdb = new Database(mpath);
+  mdb.pragma('foreign_keys = ON');
+  mdb.exec(`
+    CREATE TABLE product_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+    CREATE TABLE ph_ad_kw_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      idempotency_key TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'review_ready', collecting_seed TEXT, collecting_token TEXT, collecting_since TEXT,
+      product_snapshot_json TEXT NOT NULL, input_hash TEXT NOT NULL, supersedes_request_id INTEGER, requested_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE TABLE ph_ad_kw_evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      source TEXT NOT NULL CHECK (source IN ('suggest')), seed TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('success', 'partial', 'empty', 'failed')),
+      options_json TEXT NOT NULL DEFAULT '{}', coverage_json TEXT NOT NULL, raw_json TEXT NOT NULL, error TEXT, fetched_at TEXT, created_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE INDEX idx_ph_ad_kw_evidence_seed ON ph_ad_kw_evidence(request_id, source, seed, id);
+    CREATE TABLE ph_ad_kw_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('kw', 'negative', 'asin')), value TEXT NOT NULL, value_norm TEXT NOT NULL,
+      origin TEXT NOT NULL CHECK (origin IN ('observed', 'ai')), evidence_id INTEGER NOT NULL REFERENCES ph_ad_kw_evidence(id),
+      observed_json TEXT NOT NULL, observed_count INTEGER NOT NULL DEFAULT 1, sort_key TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE UNIQUE INDEX uq_ph_ad_kw_candidates_value ON ph_ad_kw_candidates(request_id, kind, value_norm);
+    CREATE TABLE ph_ad_kw_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, candidate_id INTEGER NOT NULL, request_id INTEGER NOT NULL,
+      decision TEXT NOT NULL, keyword TEXT, match_type TEXT, scope TEXT, supersedes_decision_id INTEGER, actor TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE TABLE ph_ad_kw_exports (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      draft_id INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('search_keywords')), decision_version INTEGER NOT NULL,
+      body_json TEXT NOT NULL, body_hash TEXT NOT NULL, copied_json TEXT NOT NULL DEFAULT '{}', created_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE INDEX idx_ph_ad_kw_exports_request ON ph_ad_kw_exports(request_id, id);
+    INSERT INTO product_drafts (id, name) VALUES (1, 'x');
+    INSERT INTO ph_ad_kw_requests (id, draft_id, idempotency_key, product_snapshot_json, input_hash) VALUES (7, 1, 'k', '{}', 'h');
+    INSERT INTO ph_ad_kw_evidence (id, request_id, source, seed, status, coverage_json, raw_json) VALUES (30, 7, 'suggest', 'ハッカ油', 'success', '{}', '[]');
+    INSERT INTO ph_ad_kw_candidates (id, request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (500, 7, 'kw', 'ハッカ油 スプレー', 'ハッカ油 スプレー', 'observed', 30, '[]', 's');
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type) VALUES (9000, 500, 7, 'adopt', 'ハッカ油 スプレー', 'exact');
+    INSERT INTO ph_ad_kw_exports (id, request_id, draft_id, kind, decision_version, body_json, body_hash) VALUES (42, 7, 1, 'search_keywords', 9000, '{}', 'hh');
+    -- 消したドラフトの採否 (候補は CASCADE で消え、採否は監査として残る = 正常な孤立) と、消した行を含む採番の上限 (Codex #1413 R1 #1 #2)
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type) VALUES (9001, 777, 8, 'adopt', '消した商品の語', 'exact');
+    UPDATE sqlite_sequence SET seq = 900 WHERE name = 'ph_ad_kw_candidates';
+    UPDATE sqlite_sequence SET seq = 88 WHERE name = 'ph_ad_kw_evidence';
+  `);
+  check('移行前: 正常な孤立採否が 1 件ある (前提の確認)', mdb.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions d WHERE NOT EXISTS (SELECT 1 FROM ph_ad_kw_candidates c WHERE c.id = d.candidate_id)').get().n === 1);
+  const rejects = (sql) => { try { mdb.exec(sql); return false; } catch (e) { return /CHECK/.test(e.message); } };
+  check('移行前: PR1 の定義では source=input を受け付けない (前提の確認)', rejects(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json) VALUES (7, 'input', 'B0X', 'success', '{}', '[]')`));
+  const m1 = dbmod.migrateAdKwCheckConstraints(mdb);
+  check('移行: 3 表を作り直す', JSON.stringify(m1.migrated) === '["ph_ad_kw_evidence","ph_ad_kw_candidates","ph_ad_kw_exports"]', JSON.stringify(m1));
+  check('移行: 行と id がそのまま (evidence 30 / candidate 500 / decision 9000 / export 42)',
+    mdb.prepare('SELECT id FROM ph_ad_kw_evidence').get().id === 30 && mdb.prepare('SELECT id, evidence_id FROM ph_ad_kw_candidates').get().evidence_id === 30
+    && mdb.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE id = 500').get().n === 1
+    && mdb.prepare('SELECT candidate_id FROM ph_ad_kw_decisions WHERE id = 9000').get().candidate_id === 500
+    && mdb.prepare('SELECT kind FROM ph_ad_kw_exports WHERE id = 42').get().kind === 'search_keywords');
+  check('移行後: source=input / origin=input / kind=ad_copy を受け付ける',
+    !rejects(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json) VALUES (7, 'input', 'B0X', 'success', '{}', '[]')`)
+    && !rejects(`INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (7, 'asin', 'B0X', 'B0X', 'input', 30, '[]', 'a')`)
+    && !rejects(`INSERT INTO ph_ad_kw_exports (request_id, draft_id, kind, decision_version, body_json, body_hash) VALUES (7, 1, 'ad_copy', 1, '{}', 'x')`));
+  check('移行後: 索引が作り直されている (UNIQUE が効く)',
+    (() => { try { mdb.exec(`INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (7, 'asin', 'B0X', 'B0X', 'input', 30, '[]', 'a')`); return false; } catch (e) { return /UNIQUE/.test(e.message); } })()
+    && mdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name IN ('idx_ph_ad_kw_evidence_seed', 'uq_ph_ad_kw_candidates_value', 'idx_ph_ad_kw_exports_request')").get().n === 3);
+  check('移行後: 外部キーは有効のまま・不整合なし', mdb.pragma('foreign_keys', { simple: true }) === 1 && mdb.pragma('foreign_key_check').length === 0);
+  check('移行後: 採番が続く (新しい id が既存より大きい)', mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_candidates').get().m > 500);
+  check('移行後: 消した行を含む採番の上限 (sqlite_sequence) が保たれ、過去の id を再利用しない (候補 900 超・材料 88 超)',
+    mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_candidates').get().m > 900
+    && (mdb.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'ph_ad_kw_evidence'").get()?.seq ?? 0) >= 88
+    && mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_evidence').get().m > 88,
+    JSON.stringify(mdb.prepare("SELECT name, seq FROM sqlite_sequence").all()));
+  check('移行後: 正常な孤立採否 (消したドラフトの監査) はそのまま残り、移行を止めない', mdb.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE id = 9001').get().n === 1);
+  const m2 = dbmod.migrateAdKwCheckConstraints(mdb);
+  check('移行: 二度目は何もしない (冪等)', JSON.stringify(m2.migrated) === '[]', JSON.stringify(m2));
+  check('移行: 本番の init で作った (新しい定義の) DB でも何もしない', JSON.stringify(dbmod.migrateAdKwCheckConstraints(db).migrated) === '[]');
+  mdb.close();
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
+}
+
+// ─── 採否の match_type に exact_phrase を足す作り直し (2026-09-23)。本番の採否表 (PR1 の定義・append-only トリガーつき) を写して確かめる ───
+// 🚨 トリガーは DROP TABLE で表と一緒に消える → 作り直しのあと付け直されていること
+{
+  const Database = (await import('better-sqlite3')).default;
+  const mpath = path.join(process.env.DATA_DIR, 'adkw-migration-decisions-test.db');
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
+  const tdb = new Database(mpath);
+  tdb.pragma('foreign_keys = ON');
+  // 候補表は孤立の検証 (candidate_id の突き合わせ) にだけ使う。材料・コピー履歴の表は無い = 作り直しの対象外
+  tdb.exec(`
+    CREATE TABLE ph_ad_kw_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL);
+    INSERT INTO ph_ad_kw_candidates (id, value) VALUES (500, 'ハッカ油 スプレー');
+    CREATE TABLE ph_ad_kw_decisions (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      candidate_id           INTEGER NOT NULL,
+      request_id             INTEGER NOT NULL,
+      decision               TEXT NOT NULL CHECK (decision IN ('adopt', 'hold', 'reject', 'undecided')),
+      keyword                TEXT,
+      match_type             TEXT CHECK (match_type IN ('exact', 'phrase', 'broad')),
+      scope                  TEXT,
+      supersedes_decision_id INTEGER,
+      actor                  TEXT,
+      created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_ph_ad_kw_decisions_candidate ON ph_ad_kw_decisions(candidate_id, id);
+    CREATE INDEX idx_ph_ad_kw_decisions_request ON ph_ad_kw_decisions(request_id, id);
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type, actor) VALUES (9000, 500, 7, 'adopt', 'ハッカ油 スプレー', 'exact', 'a@b');
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type, supersedes_decision_id) VALUES (9005, 500, 7, 'adopt', 'ハッカ油 スプレー', 'phrase', 9000);
+    UPDATE sqlite_sequence SET seq = 9100 WHERE name = 'ph_ad_kw_decisions';
+    CREATE TRIGGER trg_ph_ad_kw_decisions_no_update BEFORE UPDATE ON ph_ad_kw_decisions BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;
+    CREATE TRIGGER trg_ph_ad_kw_decisions_no_delete BEFORE DELETE ON ph_ad_kw_decisions BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;
+  `);
+  const rejects = (sql, re) => { try { tdb.exec(sql); return false; } catch (e) { return re.test(e.message); } };
+  check('採否の移行前: PR1 の定義は exact_phrase を受け付けない (前提の確認)',
+    rejects(`INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type) VALUES (500, 7, 'adopt', 'x', 'exact_phrase')`, /CHECK/));
+  const m1 = dbmod.migrateAdKwCheckConstraints(tdb);
+  check('採否の移行: 採否表だけを作り直す', JSON.stringify(m1.migrated) === '["ph_ad_kw_decisions"]', JSON.stringify(m1));
+  check('採否の移行: 行と id と訂正元がそのまま (9000 / 9005→9000)',
+    JSON.stringify(tdb.prepare('SELECT id, match_type, supersedes_decision_id AS s, actor FROM ph_ad_kw_decisions ORDER BY id').all())
+      === JSON.stringify([{ id: 9000, match_type: 'exact', s: null, actor: 'a@b' }, { id: 9005, match_type: 'phrase', s: 9000, actor: null }]));
+  check('採否の移行後: exact_phrase を受け付け、知らない値は今も拒む',
+    !rejects(`INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type) VALUES (500, 7, 'adopt', 'x', 'exact_phrase')`, /CHECK/)
+    && rejects(`INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type) VALUES (500, 7, 'adopt', 'x', 'bogus')`, /CHECK/));
+  check('採否の移行後: 採番の上限 (9100) を保つ (過去の id を再利用しない)', tdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_decisions').get().m > 9100);
+  check('採否の移行後: append-only のトリガーが付き直っている (UPDATE / DELETE を拒む)',
+    rejects('UPDATE ph_ad_kw_decisions SET decision = \'reject\' WHERE id = 9000', /append-only/)
+    && rejects('DELETE FROM ph_ad_kw_decisions WHERE id = 9000', /append-only/)
+    && tdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'ph_ad_kw_decisions'").get().n === 2);
+  check('採否の移行後: 索引が作り直されている', tdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name IN ('idx_ph_ad_kw_decisions_candidate', 'idx_ph_ad_kw_decisions_request')").get().n === 2);
+  check('採否の移行: 二度目は何もしない (冪等)', JSON.stringify(dbmod.migrateAdKwCheckConstraints(tdb).migrated) === '[]');
+  tdb.close();
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
+}
+
 // ─── SP広告マニュアルKW: join ロジック (2026-08-04。実測: keywords/list はオートの
 // プレースホルダ "(_targeting_auto_)" を含む → マニュアルKWだけ残すのが要点) ───
 {
@@ -7871,10 +9585,34 @@ const renders = [
     maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
     isAdmin: false, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
   }],
+  // LP構成の仕様書カード (PR1-e) の **オフ / 未取込** の見え方。共通 locals の既定は
+  // 「機能オン・仕様書あり」なので、ここを別に描かないと初回デプロイ・機能オフのときだけ
+  // 壊れる退行を拾えない (Codex 名指し R2 P2)
+  ['index.ejs (LP仕様書: 機能オフ)', 'index.ejs', {
+    title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: null,
+    statuses, statusLabels, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
+    isAdmin: true, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
+    lpSpec: { enabled: false, spec: null },
+  }],
+  ['index.ejs (LP仕様書: まだ取り込まれていない)', 'index.ejs', {
+    title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: null,
+    statuses, statusLabels, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
+    isAdmin: true, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
+    lpSpec: { enabled: true, spec: null },
+  }],
   ['new.ejs', 'new.ejs', { title: 't', displayName: 'smoke' }],
   ['detail.ejs (full/own_brand)', 'detail.ejs', {
     title: 't', displayName: 'smoke',
     draft: { ...after, own_brand: 1, asin: 'B0TEST', amazon_url: 'https://www.amazon.co.jp/dp/B0TEST' },
+    // SP広告KW タブ (自社商品だけ)。JSON に埋めるだけなので中身は最小。</script> を含めても script を壊さないこと
+    adKeywords: { configured: true, request: { id: 1, status: 'review_ready', collecting_seed: null, snapshot: { name: 'x' } }, stale: false,
+      seeds: [{ id: 1, seed: '</script><script>alert(1)</script>', status: 'partial', coverage_text: '47 回中 1 回に候補あり', fetched_text: 'Amazon サジェストで観測・取得日 9月23日。検索回数は不明', candidate_count: 1 }],
+      candidates: [{ id: 1, value: 'x y', evidence_id: 1, observed_count: 1, observed: [{ source: 'base', source_label: 'そのまま', seed: 'x' }], decision: null }],
+      asins: [{ id: 2, asin: 'B0TESTTEST', added_by: 'smoke', added_at: '2026-09-23T00:00:00Z', decision: null }], adopted_asin_count: 0, own_asin: 'B0TEST',
+      adopted_count: 0, exports: [], decision_version: 0, limits: { seed_max_len: 60, max_seeds: 20, max_asins: 5 },
+      labels: { decision: {}, match_type: { exact: '完全一致' }, copy_block: { exact: '完全一致', product_targets: '商品ターゲット (ASIN)' }, evidence_status: {} }, match_types: ['exact', 'phrase', 'broad'] },
     refs: [{ id: 1, url: 'https://example.com/ref' }],
     images: [{ id: 1, drive_file_id: 'x', thumb: 'https://x', view_url: 'https://x' }],
     specs: [{ id: 1, spec_key: 'サイズ', spec_value: 'W10' }],
@@ -8216,6 +9954,16 @@ renders.push(
     }]);
     // 確認中 (2026-08-31): 立っているとき = 青い帯 + 経過日数 + 解除ボタン、
     // 立っていないとき = 理由ボタンが並ぶ帯 (既定の detail fixture 側で描かれる)
+    // 🤖 構成をAIに作らせる (PR1-d) の **オフ / 押せない** の見え方。共通 locals の既定は
+    // 「機能オン・押せる」なので、ここを別に描かないと機能オフのときだけ壊れる退行を拾えない
+    // (Codex 名指し R2 P2)
+    renders.push(['detail.ejs (LP構成AI: 機能オフ)', 'detail.ejs', {
+      ...d0[2], lpCompose: { enabled: false, job: null, blocked: null, spec: null },
+    }]);
+    renders.push(['detail.ejs (LP構成AI: 仕様書なしで押せない)', 'detail.ejs', {
+      ...d0[2],
+      lpCompose: { enabled: true, job: null, blocked: '仕様書がまだ取り込まれていません', spec: null },
+    }]);
     renders.push(['detail.ejs (確認中)', 'detail.ejs', {
       ...d0[2],
       draft: {
@@ -8230,6 +9978,12 @@ renders.push(
 // かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
 // 確認中 (2026-08-31) のラベルを実際に描かせるため、ボード用の fixture を作る間だけ 1 件立てる
 dbmod.setDraftChecking(db, wfDraftId, { reasonCode: 'package_label', note: '裏面の成分表示を確認', actor: 'smoke' });
+// 📣 広告 (2026-09-28)。router が board に渡す辞書と同じもの
+const adOpsLib = await import('../lib/ad-ops.js');
+const adOpsDefsForSmoke = {
+  stages: adOpsLib.AD_OPS_STAGES, stageJa: adOpsLib.AD_OPS_STAGE_JA, types: adOpsLib.AD_OPS_CAMPAIGN_TYPES, typeJa: adOpsLib.AD_OPS_CAMPAIGN_TYPE_JA,
+  adjustStaleDays: adOpsLib.ADJUST_STALE_DAYS, windowDays: adOpsLib.ACTUAL_WINDOW_DAYS, activeDays: adOpsLib.ACTIVE_WINDOW_DAYS,
+};
 const boardBase = {
   title: '工程ボード', displayName: '中原 大輔',
   board: wfp.boardData(db, { mallSummary: ms.mallSummaryFor }), staff: wf.listStaff(),
@@ -8262,6 +10016,22 @@ renders.push(
     board: wfp.boardData(db, { view: 'image', imageKind: 'top' }),
   }],
   ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
+  // 撮影指示書 (2026-10-01): 撮影不要 + 古い撮影指示URL あり。実データでは作りにくいので
+  // カードの値を直接差し替えて、画面が「対象外」を先に出すことを固定する
+  ['board.ejs (撮影指示書: 撮影不要 + 古いURL)', 'board.ejs', {
+    ...boardBase,
+    board: {
+      ...boardBase.board,
+      columns: boardBase.board.columns.map((c, i) => (i === 0 ? {
+        ...c,
+        cards: c.cards.slice(0, 1).map((card) => ({
+          ...card,
+          image: { ...card.image, cameraInstruction: { registered: true, notRequired: true } },
+        })),
+      } : { ...c, cards: [] })),
+      doneCards: [],
+    },
+  }],
   // 完了列のカードにも画像の状況を出す (2026-09-01)。実データでは完了が 0 件のこともあるので、
   // 進行中のカードを 1 枚借りて必ず描かせる
   ['board.ejs (完了列にカード)', 'board.ejs', {
@@ -8453,7 +10223,40 @@ renders.push(
     ...boardBase,
     board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false, checkingTotal: 0 },
   }],
+  // 📣 広告 (2026-09-28)。表: 食い違いの行 / 出稿中 (調整から日数が長い) / 結びつかない行
+  ['board.ejs (📣 広告)', 'board.ejs', (() => {
+    const base = { isSet: false, stageEventId: 0, stageOn: null, stageMemo: null, campaignTypes: [], lastAdjustOn: null, lastAdjustMemo: null,
+      sinceAdjust: null, sinceKind: null, adjustStale: false, kw: null, linked: true, skuCount: 1, warn: null, history: [],
+      actual: { cost: 0, sales: 0, units: 0, clicks: 0, imp: 0, acos: null, active: false, lastActive: null, campaigns: [] } };
+    const rows = [
+      { ...base, id: 97001, neCode: 'chlorellap', name: 'クロレラ粒 <b>', asin: 'B0TESTAAA1', stage: 'none', stageLabel: '未着手',
+        warn: '未着手の記録ですが、直近 7 日に広告が表示されています (段階を「出稿中」に?)',
+        actual: { cost: 12340, sales: 45600, units: 9, clicks: 120, imp: 5000, acos: 27.1, active: true, lastActive: '2026-09-27',
+          campaigns: [{ id: 'c1', name: 'クロレラ 手動', status: 'ENABLED', cost: 12340, active: true }] } },
+      { ...base, id: 97002, neCode: 'hakka', name: 'ハッカ油', asin: null, stage: 'running', stageLabel: '出稿中', stageEventId: 5,
+        stageOn: '2026-09-01', campaignTypes: ['auto', 'manual_kw'], lastAdjustOn: '2026-09-05', lastAdjustMemo: '入札 40→30',
+        sinceAdjust: 23, sinceKind: 'adjust', adjustStale: true, kw: { requestId: 1, adoptedKw: 12, adoptedAsin: 3, copiedOn: '2026-09-01' },
+        history: [{ id: 6, kind: 'adjust', stage: null, stageLabel: null, types: [], memo: '入札 40→30', on: '2026-09-05', actor: 'a@b', at: '' },
+          { id: 5, kind: 'stage', stage: 'running', stageLabel: '出稿中', types: ['auto', 'manual_kw'], memo: null, on: '2026-09-01', actor: 'a@b', at: '' }] },
+      { ...base, id: 97003, neCode: 'nolink', name: '結びつかない商品', asin: null, stage: 'stopped', stageLabel: '停止', stageEventId: 7,
+        stageOn: '2026-09-10', stageMemo: '赤字のため', linked: false, skuCount: 0 },
+    ];
+    return {
+      ...boardBase, boardView: 'ad',
+      board: { view: 'ad', columns: [], doneCards: [], doneTotal: 0, total: rows.length, truncated: false, checkingTotal: 0 },
+      adOps: { rows, counts: { none: 1, kw_ready: 0, running: 1, stopped: 1, warn: 1 },
+        actualLatest: '2026-09-27', actualFrom: '2026-08-29', actualStale: false, today: '2026-09-28' },
+    };
+  })()],
 );
+// カードの札 (いまの段階)。カードのある fixture を借りて 1 枚に札を付ける
+{
+  const b0 = renders.find((r) => r[1] === 'board.ejs' && r[2].boardView === 'main' && (r[2].board?.columns || []).some((col) => (col.cards || []).length));
+  if (b0) {
+    const first = b0[2].board.columns.flatMap((c) => c.cards)[0];
+    renders.push(['board.ejs (📣 広告の札)', 'board.ejs', { ...b0[2], adStages: new Map([[first.id, 'running']]) }]);
+  }
+}
 // 🆕 工程ボードのカードに「裏面あり」バッジが出るか (全 fixture が出そろってから足す)
 {
   const b0 = renders.find((r) => r[1] === 'board.ejs' && (r[2].board?.columns || []).some((col) => (col.cards || []).length));
@@ -8481,6 +10284,13 @@ for (const [name, file, data] of renders) {
         //    「ある」ときの見え方は fixture 側で上書きする
         backLabelPhotos: [], backLabelOcrEnabled: false,
         backLabelCounts: new Map(),
+        // 既存の楽天ページへの追加か (2026-09-25)。既定 = 自動判定で新規ページ
+        existingPage: { existingPage: false, auto: true, choice: '', addedTo: null },
+        existingPageChoices: existingPageMod.EXISTING_PAGE_CHOICES,
+        // SP広告 検索KW (2026-09-23)。router は own_brand のときだけ状態を渡す。既定 = 無し (タブを出さない)
+        adKeywords: null,
+        // 📣 広告 (2026-09-28)。router は board に 表 (広告タブのときだけ)・カードの札・辞書 を渡す
+        adOps: null, adStages: new Map(), adOpsDefs: adOpsDefsForSmoke,
         // 詳細画面の「← 戻る」の戻り先 (router の backLinkOf 相当。既定 = 一覧)
         backLink: { url: '/apps/product-hub/list', label: '← 一覧に戻る' },
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
@@ -8489,6 +10299,22 @@ for (const [name, file, data] of renders) {
         skuJans: {}, skuSelectorValues: {},
         imagePriorities: dbmod.IMAGE_PRIORITIES,
         materialStatuses: dbmod.MATERIAL_STATUSES,
+        // 📄 LP構成の仕様書の取り込みカード (段階1・PR1-e)。router は一覧画面に常に渡す。
+        // 既定 = 機能オン・いまの版あり (admin に出る形)。機能オフ・未取込の見え方は
+        // 「index.ejs (LP仕様書: 機能オフ)」「(まだ取り込まれていない)」の fixture で上書きする
+        lpSpec: {
+          enabled: true,
+          spec: { id: 3, title: 'LP制作システム.xlsx', imported_at: '2026-10-01T09:30:00Z', imported_by: 'smoke',
+                  hash_short: 'abc123def456', sheet_titles: ['LP制作システム', '出力形式'], chars: 12345 },
+        },
+        // 🤖 構成をAIに作らせる (段階1・PR1-d)。router は詳細画面に常に渡す。
+        // 既定 = 機能オン・仕様書あり・まだ依頼なし (押せる状態)。機能オフ・押せないの見え方は
+        // 「detail.ejs (LP構成AI: 機能オフ)」「(仕様書なしで押せない)」の fixture で上書きする
+        lpCompose: {
+          enabled: true, job: null, blocked: null,
+          spec: { id: 1, title: 'LP制作システム.xlsx', imported_at: '2026-10-01T00:00:00Z', imported_by: 'smoke',
+                  hash_short: 'abc123def456', sheet_titles: ['LP制作システム'], chars: 1234 },
+        },
         // 確認中 (2026-08-31)。detail は理由リスト、board は絞り込みの状態を使う
         checkingReasons: dbmod.CHECKING_REASONS,
         checkingNoteMax: dbmod.CHECKING_NOTE_MAX,
@@ -8502,6 +10328,11 @@ for (const [name, file, data] of renders) {
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: '@LP制作システム' },
         // 本番の構成の 済/まだ (2026-09-13)。router が composeStateOf で作って渡す
         composeState: { excluded: false, done: false, marked: false, implied: false },
+        // 🤖 構成をAIに作らせる (段階1・2026-10-01)。
+        // router は detail に lpCompose (状態)、list に lpSpec (いまの仕様書) を渡す。
+        // 🚨 ここを忘れると画面が丸ごと 500 になる (実際に PR1-d/e で落とした)
+        lpCompose: { enabled: true, job: null, blocked: null, spec: { id: 1, title: 'LP制作システム', imported_at: '2026-09-30T00:00:00.000Z', imported_by: 'nakahara@x', hash_short: 'abc123def456', sheet_titles: ['出力形式', 'AIプロンプトV2.2'], chars: 24635 } },
+        lpSpec: { enabled: true, spec: { id: 1, title: 'LP制作システム', imported_at: '2026-09-30T00:00:00.000Z', imported_by: 'nakahara@x', hash_short: 'abc123def456', sheet_titles: ['出力形式', 'AIプロンプトV2.2'], chars: 24635 } },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
         workflowStaff: wf.listStaff(),
@@ -8652,6 +10483,27 @@ for (const [name, file, data] of renders) {
   })());
 }
 
+// ─── 📣 広告 (2026-09-28) の描画 ───
+{
+  const ah = renderedHtml.get('board.ejs (📣 広告)') || '';
+  const rowOf = (id) => (ah.match(new RegExp(`<tr class="ad-row[^"]*" data-ad-draft="${id}"[\\s\\S]*?</tr>`)) || [''])[0];
+  check('広告タブ: 食い違いの行は橙色 + 理由が出る', /<tr class="ad-row ad-warn" data-ad-draft="97001"/.test(ah) && rowOf(97001).includes('直近 7 日に広告が表示されています'));
+  check('広告タブ: 商品名はエスケープされる', rowOf(97001).includes('クロレラ粒 &lt;b&gt;') && !rowOf(97001).includes('クロレラ粒 <b>'));
+  check('広告タブ: 実績 (広告費・ACOS・キャンペーン・Amazon へのリンク)',
+    rowOf(97001).includes('¥12,340') && rowOf(97001).includes('ACOS 27.1%') && rowOf(97001).includes('クロレラ 手動') && rowOf(97001).includes('https://www.amazon.co.jp/dp/B0TESTAAA1'));
+  check('広告タブ: 出稿中の行 = 種類・KW・調整から日数 (長いと赤)・「調整した」ボタン・履歴',
+    rowOf(97002).includes('オート・マニュアルKW') && rowOf(97002).includes('採用 12 語') && rowOf(97002).includes('コピー 9/1')
+    && /class="ad-late">調整から 23 日/.test(rowOf(97002)) && rowOf(97002).includes('ad-adjust-btn') && rowOf(97002).includes('最近の記録 2 件'));
+  check('広告タブ: 停止の行 = 理由が出て「調整した」は出ない・結びつかない案内',
+    rowOf(97003).includes('赤字のため') && !rowOf(97003).includes('ad-adjust-btn') && rowOf(97003).includes('結びつきません'));
+  check('広告タブ: 段階の変更ボタンが見ていた段階の行 id を持つ (先に変えた人との衝突の検出に使う)', /data-stage="running" data-base="5"/.test(rowOf(97002)));
+  check('広告タブ: 段階の絞り込みチップと、入力ダイアログ (段階 4 つ・キャンペーン 3 種) がある',
+    (ah.match(/class="chip[^"]*ad-filter"/g) || []).length === 6 && (ah.match(/type="radio" name="ad-stage"/g) || []).length === 4 && (ah.match(/type="checkbox" name="ad-type"/g) || []).length === 3);
+  const ch = renderedHtml.get('board.ejs (📣 広告の札)') || '';
+  check('ボード: 広告の段階の札がカードに出る (未着手は出さない)', ch.includes('kb-tag ad-running') && ch.includes('📣 出稿中')
+    && !(renderedHtml.get('board.ejs') || '').includes('📣 出稿中'));
+}
+
 // ─── 確認中が画面に出ていること (2026-08-31 スタッフ要望の本体は「カードに表示」) ───
 {
   const bh = renderedHtml.get('board.ejs') || '';
@@ -8679,6 +10531,18 @@ for (const [name, file, data] of renders) {
   check('ボード: カードの 構成 行に 済/まだ/対象外 のバッジが付く',
     rowsOk(rows.filter((r) => r.includes('>構成<'))),
     rows.filter((r) => r.includes('>構成<')).slice(0, 2).join(' | ') || '(構成の行が無い)');
+  // 撮影指示書 (2026-10-01 スタッフ要望)。トップ画像・詳細画像と同じ形で 済/まだ/対象外 を出す
+  check('ボード: カードの 撮影指示書 行に 済/まだ/対象外 のバッジが付く',
+    rowsOk(rows.filter((r) => r.includes('>撮影指示書<'))),
+    rows.filter((r) => r.includes('>撮影指示書<')).slice(0, 2).join(' | ') || '(撮影指示書の行が無い)');
+  // 🚨 撮影不要 + 古い撮影指示URL は「対象外」が勝つ (URL を先に見ると「済」に出てしまう)
+  {
+    const bhCi = renderedHtml.get('board.ejs (撮影指示書: 撮影不要 + 古いURL)') || '';
+    const ciRows = krowsOf(bhCi).filter((r) => r.includes('>撮影指示書<'));
+    check('ボード 撮影指示書: 撮影不要 + 古いURL のときは「対象外」(URL より撮影不要を先に見る)',
+      ciRows.length > 0 && ciRows.every((r) => badgeOf(r)?.text === '対象外'),
+      ciRows.slice(0, 2).join(' | ') || '(撮影指示書の行が無い)');
+  }
   // まとめて移動 (2026-09-13 スタッフ要望)。カードごとに選択のチェックがあり、リンクの外に置く (押しても詳細へ飛ばない)
   check('ボード: カードにまとめて移動の選択チェックがあり、リンクの外にある',
     /<label class="kb-pick"[^>]*><input type="checkbox" class="kb-pick-box"[^>]*><\/label>\s*<a class="kb-card-link"/.test(bh));
@@ -8696,8 +10560,9 @@ for (const [name, file, data] of renders) {
     const bhDone = renderedHtml.get('board.ejs (完了列にカード)') || '';
     const doneCol = bhDone.split('data-col="done"')[1] || '';
     const doneRows = krowsOf(doneCol);
-    check('ボード: 完了列のカードにも トップ画像 / 詳細画像 の状況が出る',
-      rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<'))),
+    check('ボード: 完了列のカードにも トップ画像 / 詳細画像 / 撮影指示書 の状況が出る',
+      rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<')))
+      && rowsOk(doneRows.filter((r) => r.includes('>撮影指示書<'))),
       doneRows.slice(0, 2).join(' | ') || '(完了列に画像の行が無い)');
     // 完了列のカードにも楽天の状態と商品名を持たせる (2026-09-10 監査: 差し戻し時の出品確認が
     // 商品名なし・対象外でも出ていた)
@@ -9026,7 +10891,7 @@ for (const [name, file, data] of renders) {
   check('セット判断の画面: 記録は工程の版数を添えて送り、409 なら読み直す',
     /set-decision/.test(src)
     && /expected_version: decRow\.dataset\.version/.test(src)
-    && /r\.status === 409[\s\S]{0,80}location\.reload/.test(src));
+    && /r\.status === 409[\s\S]{0,80}reloadSafely\(\)/.test(src));
   check('セット判断の画面: 工程の行は今の状態を持つ (完了を選び直しても戻せる)',
     /data-prev-state="<%= s\.state %>"/.test(src));
 }
@@ -10772,7 +12637,7 @@ for (const [name, file, data] of renders) {
     // 前後して、古いチェックの状態で保存済みの重要度を戻していた (簡易LPの定型文に DB と違う重要度が入る)。
     // 重要度の保存中は何も送らず、基本情報の保存 (→ 読み直し) の間は重要度の欄を触らせない (Codex 名指し R4)
     {
-      const bStart = src.indexOf("  document.getElementById('save-basic-btn').addEventListener('click', async () => {");
+      const bStart = src.indexOf("  document.getElementById('save-basic-btn').addEventListener('click', () => phEnqueueSave(async () => {");
       const bEnd = src.indexOf('  function hasVariationPayload()', bStart);
       const basic = bStart >= 0 && bEnd > bStart ? src.slice(bStart, bEnd) : '';
       check('基本情報を保存: detail.ejs から切り出せる', basic.includes('await post(BASE') && !basic.includes('<%'), String(basic.length));
@@ -10789,6 +12654,11 @@ for (const [name, file, data] of renders) {
           post: (url, body) => { log.push('basic'); posts.push(body); return new Promise((r) => { release = () => r(respond()); }); },
           showAndReload: (json) => { if (json.ok) reloads.push(json); },
           hasVariationPayload: () => ({}), alert: (m) => alerts.push(String(m)), console,
+          // 未保存ガード (2026-09-21) はこの切り出しの外にあるので、無い状態で動くことも確かめる
+          phKeep: null,
+          // 保存の列 (2026-09-21) も外。ここでは素通しして、ボタン自身の動きだけを見る
+          phEnqueueSave: (fn) => fn(),
+          phSending: () => () => {},
         };
         vm.createContext(ctx);
         new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
@@ -10861,7 +12731,7 @@ for (const [name, file, data] of renders) {
         },
         Event: FakeEvent, alert: (m) => alerts.push(String(m)), BASE: '/x',
         post: (url, body) => new Promise((resolve, reject) => { posts.push(body); pending.push({ body, resolve, reject }); }),
-        setTimeout, console,
+        setTimeout, console, phKeep: null,
       };
       vm.createContext(ctx);
       const api = new vm.Script(`const skuSavers = [];\nlet skuSaveGeneration = 0;\nconst skuPendingOps = new Set();\nlet skuOpFailed = false;\n${iife}\n({ flush: () => flushSkuSavers(), track: (p) => trackSkuOp(p) })`, { filename: 'initSkuJans' }).runInContext(ctx);
@@ -11041,6 +12911,18 @@ for (const [name, file, data] of renders) {
     check('属性のずれ: 専用クラスのスタイルが定義されている',
       /input\.attr-unknown\s*\{/.test(src) && /th\.attr-unknown\s*\{/.test(src));
   }
+  // 選択式の属性はセレクトで選ばせる (2026-09-20)。動きは実ブラウザで確かめた。ここは配線の呼び忘れを止める
+  {
+    const fn = src.slice(src.indexOf('function syncSelectiveInputs'), src.indexOf('function renderAttrSuggest'));
+    check('選択式セレクト: 属性候補の描画と同じタイミングで走る (読み込み時・取得後・名前の打ち替え)',
+      /function renderAttrSuggest\(\)\s*\{\s*markAttrsNotInGenre\(\);\s*syncSelectiveInputs\(\);/.test(src));
+    check('選択式セレクト: 選択肢は画面の辞書 (初期表示と取得後の両方) に渡している',
+      (src.match(/options: Array\.isArray\(a\.options\) \? a\.options : null/g) || []).length === 2);
+    check('選択式セレクト: セレクトも保存が読むクラス (rk-attr-value) を持つ', /el\.className = 'rk-attr-value'/.test(fn));
+    check('🚨 選択式セレクト: 選択肢に無い値は消さずに残して選び直しを促す', /dataset\.unknown/.test(fn) && fn.includes('選び直してください'));
+    check('選択式セレクト: 複数の値を入れられる属性・「|」入りの値はセレクトにしない',
+      /multiValueLimit > 1\) return null/.test(src) && /value\.includes\('\|'\) \? null/.test(fn));
+  }
 }
 
 {
@@ -11076,8 +12958,12 @@ for (const [name, file, data] of renders) {
       src.includes('shipping_method_group_prev: shipSelectInitial'));
     const harness = (initial, selectValue, ok) => {
       const posts = [];
-      const h = new Function('collectRakutenFields', 'post', 'BASE', 'initial', `
+      const savedCalls = [];   // 未保存ガードの「ここまで保存できた」の記録
+      const h = new Function('collectRakutenFields', 'post', 'BASE', 'initial', 'savedCalls', `
         let shipSelectInitial = initial;
+        // 未保存ガード (2026-09-21) はこの切り出しの外にある。送る直前に控え、
+        // 保存が通ったときだけ基準を進めることを、このスタブで見る
+        const phKeep = { saving: () => 'SNAP', saved: (s) => savedCalls.push(s) };
         ${chunk}
         return { call: postRakutenFields, get: () => shipSelectInitial };
       `)(
@@ -11085,16 +12971,21 @@ for (const [name, file, data] of renders) {
         async (_url, body) => { posts.push(body); return { ok }; },
         '/ph',
         initial,
+        savedCalls,
       );
-      return { h, posts };
+      return { h, posts, savedCalls };
     };
     const t1 = harness('1y5', '1y8', true);
     await t1.h.call();
     check('楽天保存: 保存できたら「前回の選択」を送った値まで進める',
       t1.h.get() === '1y8' && t1.posts[0].shipping_method_group_prev === '1y5', JSON.stringify(t1.posts));
+    check('楽天保存: 保存が通ったら未保存の基準も送った値まで進める (2026-09-21)',
+      JSON.stringify(t1.savedCalls) === '["SNAP"]', JSON.stringify(t1.savedCalls));
     const t2 = harness('1y5', '1y8', false);
     await t2.h.call();
     check('楽天保存: 保存できなければ進めない (次の保存でも選び直しとして扱う)', t2.h.get() === '1y5');
+    check('楽天保存: 保存できなければ未保存の基準も進めない (打った値を捨てない)',
+      t2.savedCalls.length === 0, JSON.stringify(t2.savedCalls));
     const t3 = harness('1y8', '1y8', true);
     await t3.h.call({ drop_legacy_catalog_attr: true });
     check('楽天保存: 追加パラメータを渡す経路も同じ扱い',
@@ -11111,16 +13002,18 @@ for (const [name, file, data] of renders) {
     const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
     function harness(initial) {
       const el = { value: initial };
-      const pending = []; const alerts = []; const posts = [];
+      const pending = []; const alerts = []; const posts = []; const janSaved = [];
       const ctx = {
         document: { getElementById: (id) => (id === 'f-jan' ? el : null) },
         alert: (m) => alerts.push(String(m)), BASE: '/x',
         post: (url, body) => new Promise((resolve, reject) => { posts.push(body); pending.push({ body, resolve, reject }); }),
         setTimeout, console,
+        // 未保存ガード (2026-09-21) は切り出しの外。JAN が保存できたら基準を進めることを見る
+        phKeep: { savedValue: (id, v) => janSaved.push(id + '=' + v) },
       };
       vm.createContext(ctx);
       const api = new vm.Script(`${chunk}\n({ save: () => saveJanIfChanged() })`, { filename: 'saveJanIfChanged' }).runInContext(ctx);
-      return { el, pending, alerts, posts, save: api.save };
+      return { el, pending, alerts, posts, save: api.save, janSaved };
     }
     // X → A に変更して保存開始 → 通信中に X へ戻す → 応答消失。次の保存は値が同じでも必ず再送する
     {
@@ -11154,6 +13047,8 @@ for (const [name, file, data] of renders) {
       h.pending.shift().resolve({ ok: true });
       const ok = await s1;
       check('jan save: 最新値まで保存できたら true', ok === true && h.posts.length === 2);
+      check('jan save: 保存できた値まで未保存の基準も進める (2026-09-21)',
+        h.janSaved.join(',') === 'f-jan=4901234567894,f-jan=4912345678904', h.janSaved.join(','));
     }
     // 結果不明 → 再送が拒否 → それでも未確定のまま (同値を再送し続け、成功時だけ解除) (Codex R6 low)
     {
@@ -11249,6 +13144,310 @@ for (const [name, file, data] of renders) {
     rows()[0].querySelector('.set-member-qty').value = '0';
     check('セット構成の行: 個数が不正でも読み取りは値を隠さない (押した瞬間に理由を出せる)',
       api.read()[0].qty === 0, JSON.stringify(api.read()));
+  }
+}
+
+// ─── 未保存の入力は「読み直し」で消えない (2026-09-21 中原さん) ─────────────────
+// 売価を打ってから「セット商品にする?」を記録すると、読み直しで売価が空に戻っていた
+// (明示保存の欄はボタンを押すまで DB に行かないのに、読み直しが 30 箇所あった)。
+// 塞いだのは引き金ではなく**読み直す側** = reloadSafely。ここでは
+//   ①関所を通っているか ②挙げた欄の id が実在するか ③本当に値が戻るか を見る。
+// 🚨 ③が要る: ①②だけだと「id は合っているが戻らない」が丸ごと素通りする
+{
+  const vm = await import('node:vm');
+  const srcDetail = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+  const full = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  const js = inlineScriptsOf(full).map((b) => b.code).join('\n');
+
+  const reloads = (js.match(/location\.reload\(\)/g) || []).length;
+  check('読み直しは関所 1 本だけを通る (直に location.reload() を書かない)',
+    reloads === 1 && /function reloadSafely\(\)\s*\{[\s\S]*?location\.reload\(\)/.test(js),
+    `直書き ${reloads} 箇所`);
+  check('関所は読み直す前に未保存を退避する',
+    /function reloadSafely\(\)\s*\{[\s\S]{0,900}?phKeep\.stash\(/.test(js));
+  check('関所は退避するだけで保存しない (勝手に DB を書かない)',
+    /function writeStash\(/.test(js) && !/function writeStash\([\s\S]{0,900}?(fetch\(|post\()/.test(js));
+  // 🚨 読み直しは**列の最後尾**まで待つ。最初の 1 本だけ待つと、待っている間に確定した欄が
+  //    通信中のまま読み直され、保存できたばかりの値を「他人の変更」と誤判定して捨てる (Codex R1)
+  check('関所は保存の列が空になるまで待つ (待つ間に増えた保存も待つ)',
+    /tail !== phSaveTail/.test(js) && /waitTail\(\)/.test(js));
+  check('関所は待てなかった欄の「送った値」も添えて退避する (自分の保存と他人の変更を見分ける)',
+    /phKeep\.stash\(\{ inflight \}\)/.test(js) && /phInflight\.forEach/.test(js));
+  // 保存が通った経路は「保存済み」の基準を進める。忘れると、次の読み直しで
+  // 自分が保存した値を他人の変更と誤判定して、打ち直した分を捨てる (Codex R1)
+  for (const [route, needle] of [
+    ['基本情報', 'phKeep.saved(basicSnap)'],
+    ['出品情報 (楽天)', "phKeep.saving(['rakuten'])"],
+    ['Yahoo!項目', "phKeep.saving(['yahoo'], ['y-tax'])"],
+    ['画像制作情報', "phKeep.saving(['image'])"],
+    ['JANコード', "phKeep.savedValue('f-jan', value)"],
+  ]) {
+    check(`未保存ガード: ${route}の保存が通ったら基準を進める`, js.includes(needle), needle);
+  }
+  check('戻したことを知らせる置き場と、未保存の印がある',
+    full.includes('id="unsaved-zone"') && full.includes('.unsaved-mark') && full.includes('.tab-unsaved'));
+
+  // 退避する欄の id は、打ち間違えても画面は普通に動く (黙って効かなくなる) ので実在を確かめる。
+  // 商品によって出ない欄があるため、描いた detail.ejs 全部の和集合で見る
+  const ids = [...js.matchAll(/\{ id: '([\w-]+)', label: '/g)].map((m) => m[1]);
+  const everywhere = [...renderedHtml.entries()]
+    .filter(([n]) => n.startsWith('detail.ejs')).map(([, h]) => h).join('\n');
+  const missing = ids.filter((id) => !everywhere.includes(`id="${id}"`));
+  check('未保存ガード: 明示保存の欄がひと通り挙がっている (売価を含む)',
+    ids.length >= 15 && ids.includes('f-price') && ids.includes('rk-genre') && ids.includes('y-price'),
+    `ids=${ids.length}`);
+  check('未保存ガード: 挙げた欄の id が画面に実在する', missing.length === 0, missing.join(','));
+
+  // ── 実際に往復させる (素の JS を切り出して、スタブ DOM の上で動かす) ──
+  const start = srcDetail.indexOf('  function initUnsavedGuard(KEY) {');
+  const end = srcDetail.indexOf('  // ここまでが「未保存ガード」の切り出し範囲', start);
+  const chunk = start >= 0 && end > start ? srcDetail.slice(start, end) : '';
+  check('未保存ガード: detail.ejs から initUnsavedGuard を切り出せる',
+    chunk.length > 1000 && !chunk.includes('<%'), `len=${chunk.length}`);
+
+  if (chunk) {
+    // タブの外に置いた欄・ボタンだけを用意する。用意しない id は getElementById が null を返す
+    // = ガードが「その商品では出ていない欄」として追わない、という本番と同じ形になる
+    const makeEl = (opts = {}) => {
+      const el = {
+        type: opts.type || 'text', value: opts.value === undefined ? '' : opts.value,
+        checked: !!opts.checked, className: '', textContent: '', title: '', disabled: false,
+        style: {}, children: [], dataset: opts.dataset || {},
+        _classes: new Set(), _handlers: {}, _fired: [],
+        classList: {
+          add: (c) => el._classes.add(c), remove: (c) => el._classes.delete(c),
+          contains: (c) => el._classes.has(c),
+          toggle: (c, on) => { if (on) el._classes.add(c); else el._classes.delete(c); },
+        },
+        closest: (sel) => (sel === '.tab-panel' ? { id: opts.tab || 'tab-basic' } : null),
+        addEventListener: (t, fn) => { (el._handlers[t] = el._handlers[t] || []).push(fn); },
+        dispatchEvent: (ev) => { el._fired.push(ev && ev.type); (el._handlers[ev.type] || []).forEach((fn) => fn(ev)); return true; },
+        insertAdjacentElement: (_pos, node) => { el.children.push(node); return node; },
+        appendChild: (node) => { el.children.push(node); return node; },
+        replaceChildren: () => { el.children.length = 0; },
+        _click: () => (el._handlers.click || []).forEach((fn) => fn({})),
+      };
+      return el;
+    };
+    // sessionStorage は「読み直し」をまたいで残る唯一の入れ物 = テストでも 1 つを共有する
+    const store = new Map();
+    const session = {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => { store.set(k, String(v)); },
+      removeItem: (k) => { store.delete(k); },
+    };
+    // 1 回ぶんの「画面を開く」。dbValues = その時点で DB に入っている値
+    function open(dbValues, opts = {}) {
+      const at = (id, def, tab) => makeEl({ value: dbValues[id] === undefined ? def : dbValues[id], tab });
+      const els = new Map();
+      els.set('f-jan', at('f-jan', '', 'tab-category'));
+      els.set('y-price', at('y-price', '', 'tab-basic'));
+      els.set('f-price', at('f-price', '', 'tab-basic'));
+      els.set('f-name', at('f-name', '商品A', 'tab-basic'));
+      els.set('f-asin', at('f-asin', '', 'tab-basic'));
+      els.set('f-amazon-url', at('f-amazon-url', '', 'tab-basic'));
+      // 戻さない欄 (画面のほかの状態と連動するため、印と警告だけ出す)
+      els.set('rk-shipping-group', at('rk-shipping-group', 'nekopos', 'tab-basic'));
+      els.set('rk-genre', at('rk-genre', '', 'tab-category'));
+      els.set('save-basic-btn', makeEl());
+      els.set('rk-save-btn-cat', makeEl());
+      els.set('unsaved-zone', makeEl());
+      // 本番と同じ「ASIN を打つと Amazon URL を作る」連動。復元がこれを走らせないことを見る
+      els.get('f-asin').addEventListener('input', () => {
+        els.get('f-amazon-url').value = 'https://www.amazon.co.jp/dp/' + els.get('f-asin').value;
+      });
+      const tabBtns = [makeEl({ dataset: { tab: 'tab-basic' } }), makeEl({ dataset: { tab: 'tab-category' } })];
+      const timers = []; const winHandlers = new Map();
+      const ctx = {
+        document: {
+          getElementById: (id) => els.get(id) || null,
+          createElement: () => makeEl(),
+          querySelectorAll: (sel) => (sel === '#tabbar .tab-btn' ? tabBtns : []),
+        },
+        sessionStorage: session,
+        // 離脱 (pagehide) と、退避を捨てるタイマーは手で動かして確かめる
+        window: { addEventListener: (t, fn) => { winHandlers.set(t, fn); } },
+        setTimeout: (fn) => { timers.push(fn); return timers.length; },
+        Event: class { constructor(type) { this.type = type; } },
+        Date, JSON, console,
+      };
+      vm.createContext(ctx);
+      new vm.Script(chunk, { filename: 'initUnsavedGuard' }).runInContext(ctx);
+      const api = ctx.initUnsavedGuard('ph-unsaved:9');
+      const fire = (id, type) => {
+        const el = els.get(id);
+        (el._handlers[type] || []).forEach((fn) => fn({ type }));
+      };
+      return {
+        api, els, tabBtns, val: (id) => els.get(id).value,
+        // 「実際に出ていく」= pagehide / 「取り消して編集を続ける」= 入力を触る
+        leave: () => { const fn = winHandlers.get('pagehide'); if (fn) fn(); },
+        type: (id, v) => { els.get(id).value = v; fire(id, 'input'); },
+      };
+    }
+
+    // ① 売価を打って読み直す = 戻ってくる (今回の症状そのもの)
+    const a = open({ 'f-price': '' });
+    a.els.get('f-price').value = '1980';
+    check('未保存ガード: 打った時点で「未保存」に数える', a.api.dirtyLabels().join(',') === '売価', a.api.dirtyLabels().join(','));
+    a.api.stash();
+    check('未保存ガード: 読み直す前に退避される', store.size === 1, String(store.size));
+    const b = open({ 'f-price': '' });
+    check('🚨 売価を打ってからセット判断などで読み直しても消えない', b.val('f-price') === '1980', b.val('f-price'));
+    check('未保存ガード: 戻したことを画面で知らせる', b.els.get('unsaved-zone').children.length === 1);
+    check('未保存ガード: 戻した欄は「未保存」のまま (保存はしていない)', b.api.dirtyLabels().join(',') === '売価');
+    check('未保存ガード: 退避は 1 回で使い切る (次に開いた人に古い値が出ない)', store.size === 0);
+    const c = open({ 'f-price': '' });
+    check('未保存ガード: 2 回目の読み直しでは何も戻さない', c.val('f-price') === '' && c.els.get('unsaved-zone').children.length === 0);
+
+    // ② すでに保存されていた欄は戻さない (保存 → 読み直しで古い値が復活しない)
+    const d = open({ 'f-price': '' });
+    d.els.get('f-price').value = '1980';
+    d.api.stash();
+    const e = open({ 'f-price': '1980' });   // 保存が通った後の画面
+    check('未保存ガード: 保存済みの値は「戻した」と言わない', e.els.get('unsaved-zone').children.length === 0);
+    check('未保存ガード: 保存済みなら未保存の印も出ない', e.api.dirtyLabels().length === 0);
+
+    // ③ 退避のあいだに別の人が変えていたら戻さない (他人の変更を黙って隠さない)
+    const f = open({ 'f-price': '' });
+    f.els.get('f-price').value = '1980';
+    f.api.stash();
+    const g = open({ 'f-price': '2500' });   // 別の人が先に 2500 で保存した
+    check('🚨 未保存ガード: 退避中に他の人が変えた欄は戻さない', g.val('f-price') === '2500', g.val('f-price'));
+    check('未保存ガード: 戻さなかったことは知らせる', g.els.get('unsaved-zone').children.length === 1);
+
+    // ④ 未保存が無ければ何も残さない / 触ったタブに印が出る
+    const h = open({ 'f-price': '1000' });
+    check('未保存ガード: 未保存が無ければ退避しない', h.api.stash() === true && store.size === 0);
+    h.els.get('rk-genre').value = '100371';
+    h.els.get('rk-genre').dispatchEvent(new (class { constructor() { this.type = 'input'; } })());
+    check('未保存ガード: 触ったタブに印が出る (カテゴリ・属性タブ)',
+      h.tabBtns[1].children[0]._classes.has('on') === true && h.tabBtns[0].children[0]._classes.has('on') === false);
+    check('未保存ガード: 印はその欄を保存するボタンの横に出る',
+      h.els.get('rk-save-btn-cat').children[0]._classes.has('on') === true
+      && h.els.get('save-basic-btn').children[0]._classes.has('on') === false);
+
+    // ⑤ 保存の送信中に打ち直した分を「保存済み」にしない (Codex R1)
+    //    送った値 (saving) を控え、応答後の画面の値では基準を進めない
+    const i = open({ 'rk-genre': '100' });
+    i.els.get('rk-genre').value = '200';
+    const snap = i.api.saving(['rakuten']);   // ここで 200 を送った
+    i.els.get('rk-genre').value = '300';      // 通信中に人が打ち直した
+    i.api.saved(snap);
+    check('🚨 未保存ガード: 保存中に打ち直した分は未保存のまま残る',
+      i.api.dirtyLabels().join(',') === 'ジャンルID', i.api.dirtyLabels().join(','));
+    i.api.stash();
+    const j = open({ 'rk-genre': '200' });    // DB は送った 200 になっている
+    check('🚨 未保存ガード: 保存中に打ち直した値は読み直しても残る', j.val('rk-genre') === '300', j.val('rk-genre'));
+
+    // ⑥ 自分の保存を「他人の変更」と誤判定しない (Codex R1)
+    //    保存 → 読み直しの間に打ち足した分を、競合として捨てない
+    const k = open({ 'f-price': '1000' });
+    k.els.get('f-price').value = '1980';
+    const snapK = k.api.saving(['basic']);
+    k.api.saved(snapK);                        // 保存が通った (まだ読み直していない)
+    k.els.get('f-price').value = '2500';       // そのあと打ち足した
+    k.api.stash();
+    const l = open({ 'f-price': '1980' });     // 読み直すと DB は自分が保存した 1980
+    check('🚨 未保存ガード: 自分の保存を他人の変更と間違えない', l.val('f-price') === '2500', l.val('f-price'));
+
+    // ⑦ 退避できなければ、離脱の警告を消さない (Codex R1)
+    const m = open({ 'f-price': '' });
+    m.els.get('f-price').value = '1980';
+    const realSet = session.setItem;
+    session.setItem = () => { throw new Error('QuotaExceededError'); };
+    const kept = m.api.stash();
+    session.setItem = realSet;
+    check('🚨 未保存ガード: 退避できなければ false を返す (読み直しの前に警告を残す)', kept === false);
+
+    // ⑧ 復元はほかの欄を書き換えるハンドラを走らせない (Codex R1)
+    //    ASIN の復元で Amazon URL が書き換わると、競合で守った欄を上書きしてしまう
+    store.clear();
+    const n = open({ 'f-asin': '', 'f-amazon-url': '' });
+    n.els.get('f-asin').value = 'B00TEST123';
+    n.api.stash();
+    const o = open({ 'f-asin': '', 'f-amazon-url': 'https://www.amazon.co.jp/dp/OTHER' });
+    check('🚨 未保存ガード: 復元は連動ハンドラを走らせない (別の欄を上書きしない)',
+      o.val('f-asin') === 'B00TEST123' && o.val('f-amazon-url') === 'https://www.amazon.co.jp/dp/OTHER',
+      o.val('f-amazon-url'));
+    check('未保存ガード: 売価だけは戻したあとに表示を描き直す (自分の欄しか触らないため)',
+      /refresh: true/.test(chunk) && (chunk.match(/refresh: true/g) || []).length === 1);
+
+    // ⑨ 戻さない欄 (配送方法など) は書き戻さないが、未保存としては数える
+    store.clear();
+    const p = open({ 'rk-shipping-group': 'nekopos' });
+    p.els.get('rk-shipping-group').value = 'teikeigai';
+    check('未保存ガード: 戻さない欄も「未保存」に数える', p.api.dirtyLabels().join(',') === '配送方法');
+    check('🚨 未保存ガード: 戻さない欄が残っていれば、退避しても警告は消さない', p.api.stash() === false);
+    const q = open({ 'rk-shipping-group': 'nekopos' });
+    check('未保存ガード: 戻さない欄は書き戻さない (画面のほかの状態と食い違わせない)',
+      q.val('rk-shipping-group') === 'nekopos');
+
+    // ⑩ 古い退避は使わない (読み直しが流れて、だいぶ経ってから値が現れるのを防ぐ)
+    store.clear();
+    const r = open({ 'f-price': '' });
+    r.els.get('f-price').value = '1980';
+    r.api.stash();
+    const raw = JSON.parse(store.get('ph-unsaved:9'));
+    raw.at = Date.now() - 31 * 60 * 1000;
+    store.set('ph-unsaved:9', JSON.stringify(raw));
+    const s = open({ 'f-price': '' });
+    check('未保存ガード: 30 分より古い退避は使わない', s.val('f-price') === '');
+
+    // ⑪ Yahoo!保存は「送った欄」だけを保存済みにする (Codex R2)
+    //    まとめて基本情報を保存済みにすると、売価を打ったまま Yahoo!を保存した人の入力が消える
+    store.clear();
+    const t = open({ 'f-price': '1000', 'y-price': '' });
+    t.els.get('f-price').value = '1980';
+    t.els.get('y-price').value = '2200';
+    t.api.saved(t.api.saving(['yahoo'], ['y-tax']));   // Yahoo!項目を保存した
+    check('🚨 未保存ガード: Yahoo!を保存しても、売価の未保存は消えない',
+      t.api.dirtyLabels().join(',') === '売価', t.api.dirtyLabels().join(','));
+    t.api.stash();
+    const u = open({ 'f-price': '1000', 'y-price': '2200' });
+    check('🚨 未保存ガード: Yahoo!保存のあとに読み直しても売価が戻る', u.val('f-price') === '1980', u.val('f-price'));
+
+    // ⑫ JAN は戻さない (「IDあり/なし」のラジオと入力枠が DB のままで食い違う)
+    store.clear();
+    const v = open({ 'f-jan': '' });
+    v.els.get('f-jan').value = '4901234567894';
+    check('未保存ガード: JAN も「未保存」には数える', v.api.dirtyLabels().join(',') === 'JANコード');
+    check('未保存ガード: 戻せない欄なので警告は残す', v.api.stash() === false);
+    const w = open({ 'f-jan': '' });
+    check('🚨 未保存ガード: JAN は書き戻さない (画面に出ていない JAN を送らせない)', w.val('f-jan') === '');
+
+    // ⑬ 退避は「実際に出ていく瞬間の入力」と結びつける (Codex R2 / R3)
+    //    時間では「読み直しの取り消し」と「読み込み待ち」を区別できないので、タイマーには頼らない
+    store.clear();
+    const x = open({ 'f-price': '1000' });
+    x.type('f-price', '1980');
+    check('未保存ガード: 読み直しの前に退避できるか確かめている', x.api.stash() === true && store.size === 1);
+    x.type('f-price', '1000');   // 取り消して、値を元に戻した
+    check('🚨 未保存ガード: 読み直しをやめて編集を続けたら退避を捨てる', store.size === 0);
+    const y = open({ 'f-price': '1000' });
+    check('未保存ガード: そのあと自分で再読み込みしても、取り消した値は復活しない', y.val('f-price') === '1000');
+
+    // 読み込みが遅れても退避は消えない。出ていく瞬間の値で書き直す
+    store.clear();
+    const z = open({ 'f-price': '1000' });
+    z.type('f-price', '1980');
+    z.api.stash();
+    z.type('f-price', '2500');   // 読み直しを待っている間に打ち直した (= 取り消し扱いで一度消える)
+    check('未保存ガード: 打ち直した時点では退避は消えている', store.size === 0);
+    z.api.stash();               // 読み直しをやり直した
+    z.leave();                   // ここで実際に出ていく
+    check('🚨 未保存ガード: 出ていく瞬間の値が退避される', store.size === 1
+      && JSON.parse(store.get('ph-unsaved:9')).values['f-price'] === '2500',
+      store.get('ph-unsaved:9'));
+    const w2 = open({ 'f-price': '1000' });
+    check('🚨 未保存ガード: 読み込みが遅れても値は戻る', w2.val('f-price') === '2500', w2.val('f-price'));
+
+    // ふつうの離脱 (タブを閉じる・別ページへ行く) では退避しない。警告を見て出ていくのは捨てる意思
+    store.clear();
+    const v2 = open({ 'f-price': '1000' });
+    v2.type('f-price', '1980');
+    v2.leave();
+    check('未保存ガード: 読み直し以外の離脱では退避しない', store.size === 0);
   }
 }
 

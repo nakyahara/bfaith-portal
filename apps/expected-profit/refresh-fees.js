@@ -16,6 +16,7 @@
 import { getExpectedProfitDB, getSetting, setSetting, SETTING_AMAZON_SELLER_ID } from './db.js';
 import { canReuseFeeEstimate, normalizeFeeEstimate, feeCacheKey } from './calc.js';
 import { nowIso, addDays } from './util.js';
+import { ASIN_RE } from '../../lib/asin.js';
 
 /**
  * SP-API の公式値 (2026-09-08 確認)
@@ -359,7 +360,7 @@ export function loadCache(db) {
  *    (実データで 5 件そうなっていた)。公式も「ASIN か SellerSKU。UPC/ISBN 等は不可」
  */
 export function looksLikeAsin(v) {
-  return /^[A-Z0-9]{10}$/.test(String(v ?? ''));
+  return ASIN_RE.test(String(v ?? ''));
 }
 
 /**

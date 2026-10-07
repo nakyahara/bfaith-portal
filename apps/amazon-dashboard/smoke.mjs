@@ -3,6 +3,7 @@
 // ⚠️ DATA_DIR 内の warehouse-mirror.db の対象テーブルを DELETE するため本番 DATA_DIR で実行禁止
 import { initMirrorDB, getMirrorDB } from '../warehouse-mirror/db.js';
 import * as q from './queries.js';
+import fs from 'node:fs';
 
 initMirrorDB();
 const db = getMirrorDB();
@@ -45,10 +46,10 @@ const tx = db.transaction(() => {
     const date = d(i);
     // alpha: 10個/日 単価1000 手数料150 FBA100 保管10 プロモ20 damage 5 refund 30 原価300
     const profitA = 10000 - 1500 - 1000 - 100 - 200 + 50 - 300 - 3000;
-    insFin.run(date, 'pr_alpha', 'B0ALPHA', 'アルファ商品', 10, 10, 10000, 1500, 1000, 100, 200, 50, 300, 300, date, 310, 3000, profitA);
+    insFin.run(date, 'pr_alpha', 'B0ALPHA001', 'アルファ商品', 10, 10, 10000, 1500, 1000, 100, 200, 50, 300, 300, date, 310, 3000, profitA);
     // beta: 5個/日 単価800
     const profitB = 4000 - 600 - 500 - 50 - 80 + 0 - 100 - 1200;
-    insFin.run(date, 'pr_beta', 'B0BETA', 'ベータ商品', 5, 5, 4000, 600, 500, 50, 80, 0, 100, 240, date, 240, 1200, profitB);
+    insFin.run(date, 'pr_beta', 'B0BETA0001', 'ベータ商品', 5, 5, 4000, 600, 500, 50, 80, 0, 100, 240, date, 240, 1200, profitB);
   }
 
   const insFlash = db.prepare(`INSERT INTO mirror_f_sales_by_listing (
@@ -73,19 +74,19 @@ const tx = db.transaction(() => {
   for (let i = 0; i < 90; i++) {
     const date = d(i);
     insAdsSku.run(date, 'C1', 'pr_alpha', 'sku', 20, 2000, 500, 3000, 3);
-    insAdsSku.run(date, 'C2', 'b0beta', 'asin', 30, 3000, 1500, 1600, 2);  // beta は ASIN 粒度 + 広告費過大
+    insAdsSku.run(date, 'C2', 'b0beta0001', 'asin', 30, 3000, 1500, 1600, 2);  // beta は ASIN 粒度 + 広告費過大
     insAdsCamp.run(date, 'C1', 'アルファSP', 20, 2000, 500, 100, 200, 3000, 3100, 3);
     insAdsCamp.run(date, 'C2', 'ベータSP', 30, 3000, 1500, 50, 100, 1600, 1700, 2);
     insAdsCamp.run(date, 'C3', 'オート全商品', 10, 5000, 300, 0, 0, 0, 0, 0);  // 未配賦分
   }
 
   db.prepare(`INSERT INTO mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, referral_fee, referral_fee_rate, fba_fee, variable_closing_fee, per_item_fee, total_fee, price_used, fetched_at)
-    VALUES ('pr_alpha', 'B0ALPHA', 'AMAZON_JP', 150, 0.15, 250, 0, 0, 400, 1100, 't')`).run();
+    VALUES ('pr_alpha', 'B0ALPHA001', 'AMAZON_JP', 150, 0.15, 250, 0, 0, 400, 1100, 't')`).run();
   db.prepare(`INSERT INTO mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, referral_fee, referral_fee_rate, fba_fee, variable_closing_fee, per_item_fee, total_fee, price_used, fetched_at)
-    VALUES ('pr_beta', 'B0BETA', 'AMAZON_JP', 120, 0.15, 200, 0, 0, 320, 880, 't')`).run();
+    VALUES ('pr_beta', 'B0BETA0001', 'AMAZON_JP', 120, 0.15, 200, 0, 0, 320, 880, 't')`).run();
 
   // pr_gamma: settlement fact の商品名が空 (フォールバック解決のテスト用)
-  insFin.run(d(3), 'pr_gamma', 'B0GAMMA', '', 2, 2, 1600, 240, 200, 20, 30, 0, 40, 100, d(3), 100, 200, 770);
+  insFin.run(d(3), 'pr_gamma', 'B0GAMMA001', '', 2, 2, 1600, 240, 200, 20, 30, 0, 40, 100, d(3), 100, 200, 770);
 
   const insRes = db.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, 商品名, source_updated_at, synced_at) VALUES (?, ?, ?, 'master', ?, 't', 't')`);
   insRes.run('pr_alpha', 'NE-A', 1, 'アルファ商品');
@@ -110,9 +111,9 @@ const tx = db.transaction(() => {
 
   // カート価格スナップショット: alpha=自分が5%以上高い+カート他社 / beta=カート自社保有
   const insSnap = db.prepare("INSERT INTO mirror_amazon_price_snapshot_daily (date_jst, seller_sku, asin, channel, my_price, buybox_price, buybox_is_mine, fetched_at, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, 'FBA', ?, ?, ?, 't', 'smoke', 'h', 't')");
-  insSnap.run(today, 'pr_alpha', 'B0ALPHA', 1200, 1000, 0);
-  insSnap.run(today, 'pr_beta', 'B0BETA', 880, 880, 1);
-  insSnap.run(today, 'pr_gamma', 'B0GAMMA', 900, 700, null);  // 保有者不明 → 非検出であるべき
+  insSnap.run(today, 'pr_alpha', 'B0ALPHA001', 1200, 1000, 0);
+  insSnap.run(today, 'pr_beta', 'B0BETA0001', 880, 880, 1);
+  insSnap.run(today, 'pr_gamma', 'B0GAMMA001', 900, 700, null);  // 保有者不明 → 非検出であるべき
 
   // アカウント単位フィー (当月+前月、負=費用)
   const insFee = db.prepare("INSERT INTO mirror_amazon_account_fees_monthly (date_jst, fee_type, amount_jpy, row_count, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, 1, 'smoke', 'h', 't')");
@@ -120,6 +121,7 @@ const tx = db.transaction(() => {
   insFee.run(ymNow + '-01', 'long_term_storage', -20000);
   insFee.run(ymPrev + '-01', 'storage', -48000);
   insFee.run(ymPrev + '-01', 'removal', -3000);
+  insFee.run(ymNow + '-01', 'easy_ship', -110000);   // 2026-09-28: Easy Ship の配送料 (税込 110,000 = 税抜 100,000)
 });
 tx();
 
@@ -162,7 +164,19 @@ check('getTrend month', () => {
 
 check('getWaterfall 全体', () => {
   const r = q.getWaterfall(d(29), today, null);
-  assert(r.steps.length === 14, 'steps 14');
+  assert(r.steps.length === 14 && !r.steps.some((x) => x.key === 'easy_ship'), 'steps 14 (ポイントの段を足した・Easy Ship は内訳に入れない = 月のタイルでアカウント単位に引く・利益に入っていない「その他フィー」も出さない)');
+  {
+    // Easy Ship の割り振りだけの行 (翌日・売上なし) は決済の最後の日を動かさない (2026-09-28 Codex #1520 R2)
+    const before = q.lastSettledDate(db);
+    db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (date_jst, seller_sku, asin_norm, product_name, easy_ship_jpy, cost_status, source_run_id, source_row_hash, synced_at) VALUES (?, 'pr_alpha', 'B0ALPHA001', '', 500, 'missing_cost', 'smoke', 'h', 't')`).run(q.addDays(today, 1));
+    const after = q.lastSettledDate(db);
+    db.prepare(`DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst = ?`).run(q.addDays(today, 1));
+    assert(before === after, 'Easy Ship だけの行で決済の最後の日が動かない (' + before + ' / ' + after + ')');
+    db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (date_jst, seller_sku, asin_norm, product_name, easy_ship_jpy, cost_status, source_run_id, source_row_hash, synced_at) VALUES (?, 'pr_alpha', 'B0ALPHA001', '', 0, 'missing_cost', 'smoke', 'h', 't')`).run(q.addDays(today, 2));
+    const after0 = q.lastSettledDate(db);
+    db.prepare(`DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst = ?`).run(q.addDays(today, 2));
+    assert(before === after0, '料金と返金が打ち消し合った 0 円の割り振りだけの行でも動かない (' + before + ' / ' + after0 + ')');
+  }
   const rev = r.steps.find(s => s.key === 'revenue');
   const after = r.steps.find(s => s.key === 'profit_after_ads');
   assert(rev.amount > 0 && typeof after.amount === 'number', 'metrics');
@@ -172,6 +186,32 @@ check('getWaterfall SKU', () => {
   assert(r.sku === 'pr_alpha', 'sku');
   const ad = r.steps.find(s => s.key === 'ad_cost');
   assert(ad.amount > 0, 'SKU広告費(直接+按分)>0');
+});
+
+// 🆕 2026-09-30: 税込で引いた計算 (_incl) の広告の後は広告費 × 1.1 を引く (広告費は税抜)。全部の _incl の場所で確かめる (Codex #1550 R1)
+//   差 = 広告費 × 1.1 (丸めで ±1 円) かつ 広告費そのまま (旧い式) ではない
+check('税込で引いた計算の広告の後 = 広告費 × 1.1 を引く (推移・内訳の段・SKU の表・Easy Ship の後)', () => {
+  const near = (a, b) => Math.abs(a - b) <= 1;
+  const tr = q.getTrend(d(29), today, 'day').rows.filter((x) => x.ad_cost > 20);
+  assert(tr.length > 0, '広告費のある日がある');
+  for (const x of tr) assert(Math.abs((x.profit_before_ads_incl - x.profit_after_ads_incl) - x.ad_cost * 1.1) < 1e-6, '推移の日 ' + JSON.stringify([x.bucket, x.profit_before_ads_incl, x.profit_after_ads_incl, x.ad_cost]));
+  const trm = q.getTrend(d(89), today, 'month').rows.filter((x) => x.ad_cost > 20);
+  assert(trm.length > 0, '広告費のある月がある');
+  for (const x of trm) assert(Math.abs((x.profit_before_ads_incl - x.profit_after_ads_incl) - x.ad_cost * 1.1) < 1e-6, '推移の月 ' + JSON.stringify([x.bucket, x.ad_cost]));
+  for (const sku of [null, 'pr_alpha']) {
+    const wf = q.getWaterfall(d(29), today, sku);
+    const ad = wf.steps.find((s) => s.key === 'ad_cost').amount;
+    const diff = wf.incl.profit_before_ads - wf.incl.profit_after_ads;
+    assert(ad > 20 && near(diff, ad * 1.1) && !near(diff, ad), '内訳の段 ' + JSON.stringify([sku, diff, ad]));
+  }
+  const rows = q.getSkuProfit(d(29), today, {}).rows.filter((r) => r.ad_direct + r.ad_allocated > 20);
+  assert(rows.length > 0, '広告費のある SKU がある');
+  for (const r of rows) {
+    const ad = r.ad_direct + r.ad_allocated;
+    const diff = r.profit_before_ads_incl - r.profit_after_ads_incl;
+    assert(near(diff, ad * 1.1) && !near(diff, ad), 'SKU の表 ' + JSON.stringify([r.seller_sku, diff, ad]));
+    assert(near(r.profit_after_ads_incl - r.profit_after_easy_ship_incl, r.easy_ship_incl), 'Easy Ship の後 ' + JSON.stringify([r.seller_sku, r.profit_after_ads_incl, r.profit_after_easy_ship_incl, r.easy_ship_incl]));
+  }
 });
 
 const sp = check('getSkuProfit', () => {
@@ -226,12 +266,13 @@ check('getAccountFees + 月タイル控除', () => {
   const fees = q.getAccountFees(13);
   assert(fees.months.length >= 2, '2ヶ月分');
   const cur = fees.months.find(m => m.ym === ymNow);
-  assert(cur.fees.storage === 50000 && cur.fees.long_term_storage === 20000, 'コスト正値変換');
-  assert(cur.total_cost === 70000, 'total 70000 (got ' + cur.total_cost + ')');
+  assert(cur.fees.storage === 50000 && cur.fees.long_term_storage === 20000 && cur.fees.easy_ship === 110000, 'コスト正値変換 (表は税込のまま・Easy Ship も)');
+  assert(cur.total_cost === 180000, '表の合計は税込のまま 50,000 + 20,000 + Easy Ship 110,000 = 180,000 (got ' + cur.total_cost + ')');
   const ov3 = q.getOverview();
   const tm = ov3.tiles.find(t => t.key === 'this_month');
-  assert(tm.account_fees === 70000, '月タイル account_fees (got ' + tm.account_fees + ')');
-  assert(tm.settled_profit_final === tm.settled_profit_after_ads - 70000 - (tm.custom_expenses || 0), '最終利益にフィー反映');
+  // 月タイルは税抜で 1 回だけ引く: (50,000 + 20,000 + 110,000) ÷ 1.1 = 163,636
+  assert(tm.account_fees === 163636, '月タイル account_fees = 税込 180,000 ÷ 1.1 (got ' + tm.account_fees + ')');
+  assert(tm.settled_profit_final === tm.settled_profit_after_ads - 163636 - (tm.custom_expenses || 0), '最終利益にフィー反映 (税抜・Easy Ship 込み・1 回だけ)');
 });
 
 check('診断 launch_flop', () => {
@@ -265,6 +306,119 @@ check('expenses CRUD + settings', () => {
   const s = q.saveSettings({ dead_stock_days: 90, bogus_key: 1 });
   assert(s.dead_stock_days === 90 && !('bogus_key' in s) === false || !('bogus_key' in s), 'settings save');
   assert(q.getSettings().dead_stock_days === 90, 'settings persist');
+});
+
+// 🚨 決済 (確定売上) は数日遅れる = 広告のタブは期間の終わりを決済の最後の日で切る (2026-09-27。直近の TACoS が高く出ていた)。
+//   最後に置く (決済の行を消すので、ほかの check より後)
+check('getAdsAnalysis 決済の最後の日で切る', () => {
+  const before = q.getAdsAnalysis(d(29), today);
+  db.prepare(`DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst > ?`).run(d(3));
+  const lastRaw = db.prepare(`SELECT MAX(date_jst) AS m FROM mirror_amazon_finance_sku_daily`).get().m;
+  const last = q.addDays(lastRaw, -1);   // 最後の日は途中 = その前日まで比べる
+  const r = q.getAdsAnalysis(d(29), today);
+  const campAfter = db.prepare(`SELECT COALESCE(SUM(ad_cost),0) AS c FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' AND date_jst > ? AND date_jst <= ?`).get(last, today).c;
+  const campIn = db.prepare(`SELECT COALESCE(SUM(ad_cost),0) AS c FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' AND date_jst >= ? AND date_jst <= ?`).get(d(29), last).c;
+  assert(r.settled.last_date === lastRaw && r.settled.complete_to === last && r.settled.effective_to === last && r.settled.trimmed === true, 'settled ' + JSON.stringify(r.settled));
+  assert(r.settled.excluded_ad_cost === Math.round(campAfter), `切った日の広告費 (got ${r.settled.excluded_ad_cost} / ${campAfter})`);
+  assert(r.totals.campaign_total === Math.round(campIn), `比べる広告費は決済の最後の日まで (got ${r.totals.campaign_total} / ${campIn})`);
+  assert(r.campaigns.reduce((s, c) => s + c.ad_cost, 0) <= r.totals.campaign_total + r.campaigns.length, 'キャンペーン表も同じ範囲');
+  assert(before.settled.trimmed === (before.settled.complete_to < today), '決済が今日まであっても最後の日 (今日) は途中 = 前日で切る');
+  const cur = r.tacos_trend.find(x => x.ym === last.slice(0, 7));
+  assert(cur && cur.partial === (last < q.monthEnd(last.slice(0, 7))), '決済の途中の月は partial');
+  // 開始日 = 切った日: その日は比べる側・除く広告費は翌日から (#1499 Codex R1)
+  const same = q.getAdsAnalysis(last, today);
+  const campSameIn = db.prepare(`SELECT COALESCE(SUM(ad_cost),0) AS c FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' AND date_jst = ?`).get(last).c;
+  assert(same.totals.campaign_total === Math.round(campSameIn) && same.settled.excluded_ad_cost === Math.round(campAfter), '開始日 = 切った日 ' + JSON.stringify([same.totals.campaign_total, campSameIn, same.settled.excluded_ad_cost, campAfter]));
+  // 期間がまるごと決済の後 = 比べる日が無い (売上も広告費も 0・切った広告費は全部)
+  const all = q.getAdsAnalysis(q.addDays(last, 1), today);
+  const campAll = db.prepare(`SELECT COALESCE(SUM(ad_cost),0) AS c FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' AND date_jst > ? AND date_jst <= ?`).get(last, today).c;
+  assert(all.totals.campaign_total === 0 && all.skus.length === 0 && all.settled.excluded_ad_cost === Math.round(campAll), '期間がまるごと決済の後 ' + JSON.stringify(all.settled));
+});
+
+// 利益分析・売れ筋・概要のタイルも同じ窓 (決済のそろった日まで・広告費も同じ日まで。前の check で決済は d(3) までに減らしてある)
+check('ほかのタブも決済のそろった日で切る', () => {
+  const lastRaw = db.prepare(`SELECT MAX(date_jst) AS m FROM mirror_amazon_finance_sku_daily`).get().m;
+  const last = q.addDays(lastRaw, -1);
+  const campIn = (a, b) => db.prepare(`SELECT COALESCE(SUM(ad_cost),0) AS c FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' AND date_jst >= ? AND date_jst <= ?`).get(a, b).c;
+  const sp = q.getSkuProfit(d(29), today, {});
+  assert(sp.settled.effective_to === last && sp.ad_campaign_total === Math.round(campIn(d(29), last)), 'SKU 表 ' + JSON.stringify([sp.settled, sp.ad_campaign_total]));
+  const wf = q.getWaterfall(d(29), today);
+  const wfAd = wf.steps.find(x => x.key === 'ad_cost').amount;
+  const wfRev = wf.steps.find(x => x.key === 'revenue').amount;
+  const revIn = db.prepare(`SELECT SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS r FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(d(29), last).r;
+  assert(wfAd === Math.round(campIn(d(29), last)) && wfRev === Math.round(revIn) && wf.to === today && wf.settled.effective_to === last, 'ウォーターフォール ' + JSON.stringify([wfAd, wfRev, revIn]));
+  const bs = q.getBestsellers(d(29), today, 'sales');
+  const days = (a, b) => Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / 86400000) + 1;
+  assert(bs.settled.effective_to === last && days(bs.prev_from, bs.prev_to) === days(d(29), last) && bs.prev_to === q.addDays(d(29), -1), '売れ筋の前期は今期 (切った後) と同じ日数 ' + JSON.stringify([bs.prev_from, bs.prev_to]));
+  const ov = q.getOverview();
+  const tm = ov.tiles.find(t => t.key === 'this_month');
+  const monthFrom = tm.from;
+  const expAds = last >= monthFrom ? campIn(monthFrom, last) : 0;
+  const settledProfit = db.prepare(`SELECT COALESCE(SUM(profit_amount),0) AS p FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, last).p;   // 利益もそろった日まで (#1500 Codex R1)
+  // 2026-09-29: 主の利益は税抜で引いた計算 (手数料 ÷ 1.1)・税込で引いた計算 (profit_amount) も _incl で持つ
+  const settledProfitEx = db.prepare(`SELECT COALESCE(SUM(${q.PROFIT_EX_SQL}),0) AS p FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, last).p;
+  assert(tm.settled_profit_after_ads === Math.round(settledProfitEx - expAds), '今月のタイルの確定利益 (広告後・税抜で引く) はそろった日までの広告費だけ引く ' + JSON.stringify([tm.settled_profit_after_ads, settledProfitEx, expAds]));
+  assert(tm.settled_profit_after_ads_incl === Math.round(settledProfit - expAds * 1.1), '税込で引いた計算も持つ (広告費は税抜 = × 1.1 を引く・2026-09-30) ' + JSON.stringify([tm.settled_profit_after_ads_incl, settledProfit, expAds]));
+  const feesIn = db.prepare(`SELECT COALESCE(SUM(${q.TAXED_FEES_SQL}),0) AS f, COALESCE(SUM(promotion_tax_jpy),0) AS t FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, last);
+  assert(Math.abs((settledProfitEx - settledProfit) - (feesIn.f / 11 + feesIn.t)) < 0.01 && feesIn.f > 0, '税抜 − 税込 = 課税の手数料 × 1/11 + 値引きの税の分 ' + JSON.stringify([settledProfitEx - settledProfit, feesIn.f / 11]));
+  assert(tm.ad_cost === Math.round(campIn(monthFrom, today)), '広告費の行は今日までの実額のまま');
+  const td = ov.tiles.find(t => t.key === 'today');
+  assert(td.settled_to === null && td.settled_profit_after_ads === 0 && td.settled_refunds === 0, '今日のタイルは決済がそろっていない = 確定の数字は空 ' + JSON.stringify([td.settled_to, td.settled_profit_after_ads]));
+  // 今月のタイルとウォーターフォール (同じ期間) の広告後利益が一致する
+  const wfMonth = q.getWaterfall(monthFrom, today);
+  assert(tm.settled_profit_after_ads === wfMonth.steps.find(x => x.key === 'profit_after_ads').amount, 'タイルとウォーターフォールの広告後利益が一致 ' + JSON.stringify([tm.settled_profit_after_ads, wfMonth.steps.find(x => x.key === 'profit_after_ads').amount]));
+  // 売れ筋: 期間がまるごと決済の後なら今期は空 (決済の最後の日 = 途中の日を入れない)
+  const bsAll = q.getBestsellers(lastRaw, today, 'sales');
+  assert(bsAll.ranking.length === 0 && bsAll.settled.effective_to < lastRaw, '期間がまるごと決済の後の売れ筋は空 ' + JSON.stringify([bsAll.ranking.length, bsAll.settled]));
+});
+
+// 2026-09-29 (Codex #1522 R1): 値引きの税の分が 0 でない日・届いていない日 (NULL) と、内訳の段の足し引き = 利益
+check('値引きの税の分 (0 でない・未取得) と内訳の段の足し引き', () => {
+  const lastRaw = db.prepare(`SELECT MAX(date_jst) AS m FROM mirror_amazon_finance_sku_daily`).get().m;
+  const last = q.addDays(lastRaw, -1);
+  // 値引き 200 / 80 のうち税の分 18 / 7。1 日だけ NULL (古い miniPC から来た行) のまま
+  db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET promotion_tax_jpy = CASE seller_sku WHEN 'pr_alpha' THEN 18 ELSE 7 END WHERE date_jst <> ?`).run(d(10));
+  db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET promotion_tax_jpy = NULL WHERE date_jst = ?`).run(d(10));
+  // 出品者が付けたポイント (2026-09-29): alpha に 1 日 15 (profit_amount でも引いている = miniPC の集計と同じ)
+  db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET points_jpy = 15, profit_amount = profit_amount - 15 WHERE seller_sku = 'pr_alpha'`).run();
+  const from = d(29);
+  const days = db.prepare(`SELECT COUNT(DISTINCT date_jst) AS n FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(from, last).n;
+  const withTax = days - 1;   // d(10) は NULL = 0 として計算
+  const wf = q.getWaterfall(from, today);
+  const step = (k) => wf.steps.find(x => x.key === k).amount;
+  // 期待値は fixture の 1 日の額から (alpha: 手数料 1,500・FBA 1,000・保管 100・値引き 200 (うち税 18)・補てん 50・返金 300・原価 3,000 / beta: 600・500・50・80 (7)・0・100・1,200)
+  const exFees = (1500 + 1000 + 100 + 600 + 500 + 50) / 1.1;
+  const expProfitEx = days * (10000 + 4000 - exFees - 200 - 80 - 15 + 50 - 300 - 100 - 3000 - 1200) + withTax * (18 + 7);   // − 15 = ポイント (額面のまま)
+  assert(Math.abs(step('profit_before_ads') - expProfitEx) <= 1, '税抜で引いた利益 (手で計算) ' + JSON.stringify([step('profit_before_ads'), expProfitEx]));
+  assert(step('promotion') === Math.round(days * 280 - withTax * 25), '値引き (税抜) = 値引き − 税の分 ' + JSON.stringify([step('promotion'), days * 280 - withTax * 25]));
+  const sum = wf.steps.filter(x => !['profit_before_ads', 'ad_cost', 'profit_after_ads'].includes(x.key))
+    .reduce((a, x) => a + (x.kind === 'total' ? x.amount : x.kind === 'income' ? x.amount : -x.amount), 0);
+  assert(Math.abs(sum - step('profit_before_ads')) <= wf.steps.length, '内訳の段を足し引きすると粗利 (その他の手数料など 利益に入っていない段は無い) ' + JSON.stringify([sum, step('profit_before_ads')]));
+  assert(!wf.steps.some(x => x.key === 'other_fees'), '利益に入っていない「その他フィー」の段は出さない');
+  assert(wf.promo_tax_missing_days === 1, '値引きの税の分が未取得の日 = 1 ' + wf.promo_tax_missing_days);
+  const sp = q.getSkuProfit(from, today, {});
+  assert(sp.promo_tax_missing_days === 1, 'SKU 表も未取得の日 = 1');
+  const a = sp.rows.find(r => r.seller_sku === 'pr_alpha');
+  assert(a.fees === Math.round(days * 2600 / 1.1) && a.fees_incl === days * 2600, 'SKU の手数料 = 利益で引いた手数料だけ (税抜 / 税込) ' + JSON.stringify([a.fees, a.fees_incl]));
+  assert(a.points === days * 15 && Math.abs(a.revenue_excl - a.fees - a.promotion - a.points - a.refunds + a.reimbursements - a.cogs - a.profit_before_ads) <= 3, 'SKU の 売上 − 手数料 − 値引き − ポイント − 返金 + 補てん − 原価 = 粗利 ' + JSON.stringify([a.points, days * 15]));
+  assert(step('points') === days * 15, '内訳にポイントの段 (額面のまま) ' + step('points'));
+  // SKU の表: 見出しの列の数 = 明細のセルの数 (列を足して明細を忘れると後ろの列が全部ずれる。Codex #1525 R1)
+  {
+    const ejs = fs.readFileSync(new URL('../../views/amazon-dashboard.ejs', import.meta.url), 'utf8');
+    const colsSrc = ejs.slice(ejs.indexOf("['seller_sku', 'SKU']"), ejs.indexOf('];', ejs.indexOf("['seller_sku', 'SKU']")));
+    const rowSrc = ejs.slice(ejs.indexOf('const rowsHtml = data.rows.map'), ejs.indexOf('</tr>`', ejs.indexOf('const rowsHtml = data.rows.map')));
+    const nCols = (colsSrc.match(/\['[a-z_]+', /g) || []).length, nTd = (rowSrc.match(/<td[ >]/g) || []).length;
+    assert(nCols > 10 && nCols === nTd, 'SKU の表の見出しの列の数 = 明細のセルの数 ' + JSON.stringify([nCols, nTd]));
+    assert(/fmtYen\(r\.fees\)\}<\/td>\s*<td class="num">\$\{fmtYen\(r\.points\)\}/.test(rowSrc), 'ポイントのセルは手数料の次 (見出しと同じ並び)');
+  }
+  // ポイント順と利益順が逆になるように beta (利益が一番低い) に大きいポイント (並べ替えが効かず利益順に戻ると先頭が alpha になって落ちる。Codex #1525 R2)
+  db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET points_jpy = points_jpy + 5000, profit_amount = profit_amount - 5000 WHERE seller_sku = 'pr_beta' AND date_jst = ?`).run(d(5));
+  const byPoints = q.getSkuProfit(from, today, { sort: 'points', dir: 'desc' });
+  const byProfit = q.getSkuProfit(from, today, { sort: 'profit_after_ads', dir: 'desc' });
+  assert(byPoints.rows[0].seller_sku === 'pr_beta' && byProfit.rows[0].seller_sku === 'pr_alpha', 'ポイントで並べ替えられる (利益順とは先頭が違う) ' + JSON.stringify(byPoints.rows.map((r) => [r.seller_sku, r.points])));
+  db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET points_jpy = points_jpy - 5000, profit_amount = profit_amount + 5000 WHERE seller_sku = 'pr_beta' AND date_jst = ?`).run(d(5));
+  const tm = q.getOverview().tiles.find(t => t.key === 'this_month');
+  assert(tm.promo_tax_missing_days === (d(10) >= tm.from && d(10) <= (tm.settled_to || '') ? 1 : 0), '今月のタイルの未取得の日 ' + JSON.stringify([tm.promo_tax_missing_days, tm.from, tm.settled_to]));
 });
 
 console.log(`\n=== smoke: ${pass} PASS / ${fail} FAIL ===`);

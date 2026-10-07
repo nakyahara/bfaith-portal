@@ -185,7 +185,7 @@
             <div class="chart-wrap tall"><canvas id="chart-waterfall"></canvas></div>
           </div>
           <div class="chart-card" style="grid-column: 1 / -1;">
-            <h3>Amazonアカウントフィー月次 <span class="pbadge settled">確定</span> <span class="note">SKU利益に含まれない控除 — 月タイルの「最終利益」で反映済み</span></h3>
+            <h3>Amazonアカウントフィー月次 <span class="pbadge settled">確定</span> <span class="note">SKU利益に含まれない控除 (この表は税込) — 月タイルの「最終利益」では税抜 (÷1.1) で反映済み</span></h3>
             <div class="chart-wrap"><canvas id="chart-account-fees"></canvas></div>
           </div>
         </div>
@@ -198,6 +198,7 @@
       <!-- 📣 広告 -->
       <div class="tab-pane" id="pane-ads">
         <div class="toolbar"><div class="period-switcher" id="ad-period"></div></div>
+        <div class="note" id="ad-settled-note" style="margin:4px 0 8px;color:#555;font-size:12px"></div>
         <div class="tile-grid" id="ad-totals"></div>
         <div class="charts-grid">
           <div class="chart-card">
@@ -344,18 +345,21 @@ async function loadOverview() {
     document.getElementById('meta-updated').textContent = '更新: ' + new Date(data.generated_at).toLocaleString('ja-JP');
     const tiles = data.tiles.map(t => {
       const monthExtra = t.custom_expenses !== undefined ? `
-        <div class="row"><span>アカウントフィー <span class="note">(保管/長期/返送等)</span></span><span class="v">−${fmtYen(t.account_fees || 0)}</span></div>
+        <div class="row"><span>アカウントフィー <span class="note">(保管/長期/返送/Easy Ship 等・税抜)</span></span><span class="v">−${fmtYen(t.account_fees || 0)}</span></div>
         <div class="row"><span>自社経費</span><span class="v">−${fmtYen(t.custom_expenses)}</span></div>
-        <div class="row"><span>最終利益 <span class="pbadge settled">確定</span></span><span class="v ${signClass(t.settled_profit_final)}">${fmtJPY(t.settled_profit_final)}</span></div>` : '';
+        <div class="row"><span>最終利益 <span class="pbadge settled">確定</span> <span class="note">手数料は税抜</span></span><span class="v ${signClass(t.settled_profit_final)}">${fmtJPY(t.settled_profit_final)}</span></div>
+        <div class="row"><span class="note">　税込で引くと</span><span class="v note">${fmtJPY(t.settled_profit_final_incl)}</span></div>` : '';
+      // 値引きの税の分がまだ届いていない日 (古い miniPC から送られた行)。税抜の利益がその分だけ少ない (2026-09-29)
+      const promoTaxNote = t.promo_tax_missing_days ? `<div class="row"><span class="note">⚠️ 値引きの税の分が未取得の日 ${t.promo_tax_missing_days} 日 (値引きの税の分が入っていない = 税抜の利益がその分ずれます)</span></div>` : '';
       return `<div class="tile">
         <h3>${t.label} <span class="note">(${t.from}${t.from !== t.to ? '〜' + t.to : ''})</span></h3>
         <div class="row"><span>売上 <span class="pbadge flash">速報</span></span><span class="v">${fmtJPY(t.flash_sales_incl)}</span></div>
         <div class="row"><span>販売数 / 注文</span><span class="v">${t.flash_units.toLocaleString()} / ${t.flash_orders.toLocaleString()}</span></div>
         <div class="row"><span>広告費</span><span class="v">${fmtYen(t.ad_cost)}</span></div>
         <div class="row"><span>返金 <span class="pbadge settled">確定</span></span><span class="v">${fmtYen(t.settled_refunds)}</span></div>
-        <div class="row"><span>確定利益(広告後) <span class="pbadge settled">確定</span> <span class="note">${t.settled_coverage_pct}%確定</span></span><span class="v ${signClass(t.settled_profit_after_ads)}">${fmtJPY(t.settled_profit_after_ads)}</span></div>
+        <div class="row"><span>確定利益(広告後) <span class="pbadge settled">確定</span> <span class="note">${t.settled_coverage_pct}%確定${t.settled_to && t.settled_to < t.to ? ' ・〜' + esc(t.settled_to) : ''}</span></span><span class="v ${signClass(t.settled_profit_after_ads)}">${fmtJPY(t.settled_profit_after_ads)}</span></div>
         <div class="row hero"><span>速報利益 <span class="pbadge est">推定</span> <span class="note">ｶﾊﾞｰ${t.est_coverage_pct}%</span></span><span class="v ${signClass(t.est_profit)}">${fmtJPY(t.est_profit)}</span></div>
-        ${monthExtra}
+        ${monthExtra}${promoTaxNote}
       </div>`;
     }).join('');
     document.getElementById('ov-tiles').innerHTML = tiles;
@@ -413,7 +417,7 @@ async function loadTrend() {
     const tt = ads.tacos_trend;
     mkChart('chart-tacos', {
       type: 'bar',
-      data: { labels: tt.map(r => r.ym), datasets: [
+      data: { labels: tt.map(r => r.ym + (r.partial ? '（途中）' : '')), datasets: [
         { label: '広告費', data: tt.map(r => r.ad_cost), backgroundColor: '#fca5a5', yAxisID: 'y' },
         { label: 'TACOS%', data: tt.map(r => r.tacos_pct), type: 'line', borderColor: '#dc2626', yAxisID: 'y1' },
       ]},
@@ -449,7 +453,8 @@ function sparkSvg(points) {
 async function fetchBestsellers() {
   try {
     const data = await getJSON(`${API}/bestsellers?preset=${bsPreset}&axis=${bsAxis}`);
-    document.getElementById('bs-note').textContent = `期間 ${data.from}〜${data.to} (前期: ${data.prev_from}〜${data.prev_to}) / 全${data.total_skus} SKU`;
+    const bss = data.settled || {};
+    document.getElementById('bs-note').textContent = `期間 ${data.from}〜${bss.trimmed ? bss.effective_to + ' (決済のそろった日まで)' : data.to} (前期: ${data.prev_from}〜${data.prev_to}) / 全${data.total_skus} SKU`;
     const abc = data.abc;
     document.getElementById('bs-abc').innerHTML =
       `ABC分析: <span class="pill A">A ${abc.count.A} SKU (${fmtJPY(abc.revenue.A)})</span> <span class="pill B">B ${abc.count.B} SKU (${fmtJPY(abc.revenue.B)})</span> <span class="pill C">C ${abc.count.C} SKU (${fmtJPY(abc.revenue.C)})</span> — A群の在庫切れが最優先リスク`;
@@ -505,7 +510,7 @@ async function loadProfit() {
 }
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
-const FEE_COLORS = { storage: '#60a5fa', long_term_storage: '#f59e0b', removal: '#a78bfa', inbound_defect: '#f87171', low_inventory: '#fb923c', subscription: '#9ca3af', other_account_fee: '#d1d5db' };
+const FEE_COLORS = { storage: '#60a5fa', long_term_storage: '#f59e0b', removal: '#a78bfa', inbound_defect: '#f87171', low_inventory: '#fb923c', subscription: '#9ca3af', easy_ship: '#34d399', other_account_fee: '#d1d5db' };
 async function fetchAccountFees() {
   try {
     const data = await getJSON(`${API}/account-fees?months=13`);
@@ -559,19 +564,24 @@ function renderWaterfall(canvasId, wf) {
 async function fetchWaterfall() {
   try {
     const wf = await getJSON(`${API}/waterfall?preset=${pfPreset}`);
-    document.getElementById('pf-wf-title').textContent = `(${wf.from}〜${wf.to} 全体)`;
+    const ws = wf.settled || {};
+    document.getElementById('pf-wf-title').textContent = (ws.trimmed ? `(${wf.from}〜${ws.effective_to} 全体・決済のそろった日まで。広告費も同じ)` : `(${wf.from}〜${wf.to} 全体)`)
+      // 利益に入れていない額 (その他の手数料など) は段に出さない = 段を足し引きすると利益になる (2026-09-29)
+      + (wf.not_in_profit ? ` / 利益に入れていない その他の額 ${fmtJPY(wf.not_in_profit)}` : '')
+      + (wf.promo_tax_missing_days ? ` / ⚠️ 値引きの税の分が未取得の日 ${wf.promo_tax_missing_days} 日` : '');
     renderWaterfall('chart-waterfall', wf);
   } catch (e) { console.error(e); }
 }
 async function fetchSkuTable(reset) {
   try {
     const data = await getJSON(`${API}/sku-profit?preset=${pfPreset}&sort=${pfSort}&dir=${pfDir}&q=${encodeURIComponent(pfQ)}&limit=100&offset=${pfOffset}`);
-    document.getElementById('pf-adnote').innerHTML = `広告費 期間合計 ${fmtYen(data.ad_campaign_total)} (うち未配賦 ${fmtYen(data.ad_unallocated)} を広告経由売上比で<span class="pbadge alloc">按分</span>)`;
+    const ps = data.settled || {};
+    document.getElementById('pf-adnote').innerHTML = ((data.degradedLookups && data.degradedLookups.length) ? `⚠️ SKU と ASIN の対応の一部 (${esc(data.degradedLookups.join(', '))}) が読めません = ASIN の広告の一部が按分に回っています / ` : '') + (data.promo_tax_missing_days ? `⚠️ 値引きの税の分が未取得の日 ${data.promo_tax_missing_days} 日 (値引きの税の分が入っていない = 税抜の利益がその分ずれます) / ` : '') + (ps.trimmed ? `📅 売上・利益は決済データで <b>${esc(ps.effective_to)} まで</b> (その翌日〜${esc(data.to)} の広告費 ${fmtYen(ps.excluded_ad_cost)} は入れていません) / ` : '') + `広告費 期間合計 ${fmtYen(data.ad_campaign_total)} (うち未配賦 ${fmtYen(data.ad_unallocated)} を広告経由売上比で<span class="pbadge alloc">按分</span>)`;
     const cols = [
       ['seller_sku', 'SKU'], ['product_name', '商品名'], ['units_net', '販売数'], ['revenue_excl', '売上(税抜)'],
-      ['fees', '手数料計'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
+      ['fees', '手数料計(税抜)'], ['points', 'ポイント'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
       ['profit_before_ads', '粗利(広告前)'], ['ad_direct', '広告(直接)'], ['ad_allocated', '広告(按分)'],
-      ['profit_after_ads', '広告後利益'], ['margin_pct', '利益率'], ['cost_status', '原価状態'],
+      ['profit_after_ads', '広告後利益'], ['easy_ship', 'Easy Ship(税抜)'], ['profit_after_easy_ship', 'Easy Ship後'], ['margin_pct', '利益率'], ['cost_status', '原価状態'],
     ];
     const thead = `<thead><tr>${cols.map(([k, label]) =>
       `<th data-sort="${k}">${label}${pfSort === k ? (pfDir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`).join('')}</tr></thead>`;
@@ -581,6 +591,7 @@ async function fetchSkuTable(reset) {
       <td class="num">${r.units_net.toLocaleString()}</td>
       <td class="num">${fmtYen(r.revenue_excl)}</td>
       <td class="num">${fmtYen(r.fees)}</td>
+      <td class="num">${fmtYen(r.points)}</td>
       <td class="num">${fmtYen(r.refunds)}</td>
       <td class="num">${fmtYen(r.reimbursements)}</td>
       <td class="num">${fmtYen(r.cogs)}</td>
@@ -588,6 +599,8 @@ async function fetchSkuTable(reset) {
       <td class="num">${fmtYen(r.ad_direct)}</td>
       <td class="num">${fmtYen(r.ad_allocated)}</td>
       <td class="num ${signClass(r.profit_after_ads)}"><b>${fmtYen(r.profit_after_ads)}</b></td>
+      <td class="num">${fmtYen(r.easy_ship)}</td>
+      <td class="num ${signClass(r.profit_after_easy_ship)}">${fmtYen(r.profit_after_easy_ship)}</td>
       <td class="num">${fmtPct(r.margin_pct)}</td>
       <td>${r.cost_status === 'complete' ? '✓' : '<span class="pill edge">' + esc(r.cost_status || '?') + '</span>'}</td>
     </tr>`).join('');
@@ -635,6 +648,12 @@ async function fetchAds() {
   try {
     const data = await getJSON(`${API}/ads?preset=${adPreset}`);
     const t = data.totals;
+    const st = data.settled || {};
+    // 売上 (決済) は注文の数日あと = 決済の最後の日で期間を切っている (切った日の広告費も出す)
+    document.getElementById('ad-settled-note').innerHTML = !st.last_date ? '⚠️ 決済の売上データがまだありません'
+      : st.effective_to < data.from ? `⚠️ この期間の決済の売上はまだありません (決済は ${esc(st.last_date)} まで)。広告費 ${fmtJPY(st.excluded_ad_cost)} は比べていません`
+      : st.trimmed ? `📅 売上は決済データで <b>${esc(st.effective_to)} まで</b> (決済は ${esc(st.last_date)} まで届いているが最後の日は途中)。広告費も ${esc(data.from)}〜${esc(st.effective_to)} で比べています (${esc(st.effective_to)} の翌日〜${esc(data.to)} の広告費 ${fmtJPY(st.excluded_ad_cost)} は入れていません)`
+      : `📅 ${esc(data.from)}〜${esc(data.to)} (決済は ${esc(st.last_date)} まで)`;
     document.getElementById('ad-totals').innerHTML = `
       <div class="tile"><h3>広告費 全体 (キャンペーン正本)</h3><div class="row hero"><span></span><span class="v">${fmtJPY(t.campaign_total)}</span></div></div>
       <div class="tile"><h3>SKU直接紐付け分</h3><div class="row hero"><span></span><span class="v">${fmtJPY(t.sku_direct_total)}</span></div></div>
@@ -655,7 +674,7 @@ async function fetchAds() {
     });
     mkChart('chart-tacos2', {
       type: 'line',
-      data: { labels: data.tacos_trend.map(r => r.ym), datasets: [{ label: 'TACOS%', data: data.tacos_trend.map(r => r.tacos_pct), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', fill: true }] },
+      data: { labels: data.tacos_trend.map(r => r.ym + (r.partial ? '（途中）' : '')), datasets: [{ label: 'TACOS%', data: data.tacos_trend.map(r => r.tacos_pct), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', fill: true }] },
       options: { responsive: true, maintainAspectRatio: false, scales: { y: { ticks: { callback: v => v + '%' } } } },
     });
 

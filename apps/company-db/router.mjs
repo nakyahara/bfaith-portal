@@ -20,8 +20,14 @@ import path from 'node:path';
 import { runLoadOnce, readRunning, reportDir } from './load/run-initial-load.mjs';
 import { newLoadRunId } from './load/engine.mjs';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
+import { ingestStockDay, stockDayStatus } from './ingest/stock-daily.mjs';
+import { ingestAdSpendDay, adSpendStatus, relinkAdSpend } from './ingest/ad-spend.mjs';
 import { ingestShipmentChunk, validateChunk } from './ingest/shipments.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk, MALLS } from './ingest/orders.mjs';
+import { ingestOrderFinanceChunk, validateFinanceChunk, FINANCE_MALLS } from './ingest/order-finance.mjs';
+import { ingestSkuCostObserved, skuCostObservedStatus, skuCodeNorms } from './ingest/sku-cost-observed.mjs';
+import { applyCoverage, coverageStatus, coverageReady } from './ingest/finance-coverage.mjs';
+import { SOURCES as COVERAGE_SOURCES } from './finance/order-finance-checksum.mjs';
 
 const router = express.Router();
 
@@ -40,14 +46,16 @@ export function __setPgClientFactory(fn) { pgClientFactory = fn || openPgClient;
  * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる = 未認可の 12MB を読まない。mirror と同じ流儀)
  */
 const shipmentsJson = express.json({ limit: '12mb', inflate: false });
-function shipmentsParserError(err, req, res, next) {
+/** parser の失敗の応答。上限の文言は受け口ごと (#1561 Codex R1 Low: coverage は 64KB なのに「12MB」と返していた) */
+const parserErrorFor = (limitLabel) => function parserError(err, req, res, next) {
   if (!err) return next();
-  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'payload too large (12MB)' });
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: `payload too large (${limitLabel})` });
   if (err.type === 'encoding.unsupported') return res.status(415).json({ error: 'compressed body is not accepted' });
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'invalid JSON' });
   if (err.type === 'request.aborted') return res.status(400).json({ error: 'request aborted' });
   return next(err);
-}
+};
+const shipmentsParserError = parserErrorFor('12MB');
 
 export function requireSyncKey(req, res, next) {
   const key = process.env.MIRROR_SYNC_KEY;
@@ -65,7 +73,7 @@ export const getLoadState = () => ({ current: state.current, last: state.last })
  * 開始 (単一飛行のガードはここ)。戻り値 = { started, current, done }
  *   done = 終わったときの current で解決する Promise (HTTP は使わない。夜間の再ロードが結果を待つのに使う)
  */
-export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => console.log(m) }) {
+export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => console.log(m), usePrepared = false }) {
   if (state.current) return { started: false, current: state.current, done: state.current._done || Promise.resolve(state.current) };
   const runId = newLoadRunId();
   const cur = { run_id: runId, dry_run: !apply, status: 'running', started_at: new Date().toISOString(), finished_at: null, summary: null, conflicts: null, unresolved: null, error: null, error_code: null };
@@ -81,7 +89,7 @@ export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => c
   };
   // 202 を先に返してから始める (SQLite の読み取りも応答の後)
   setImmediate(() => {
-    runLoadOnce({ dataDir, url, apply, log, host, runId })
+    runLoadOnce({ dataDir, url, apply, log, host, runId, usePrepared, connect: (u) => pgClientFactory(u) })   // usePrepared = 切替の日に明示して頼んだロードだけ (毎晩の cron は active)
       .then((report) => done({ status: report.ok ? 'done' : 'failed', summary: report.summary || null, conflicts: (report.conflicts || []).length, unresolved: Object.fromEntries(Object.entries(report.unresolved || {}).map(([k, v]) => [k, v.length])), sources: report.plan_sources || null }))
       .catch((e) => { log(`[company-db load] FAILED ${runId}: ${e.message}`); done({ status: 'failed', error: String(e.message), error_code: e.code || null, summary: e.report?.summary || null }); });
   });
@@ -102,9 +110,11 @@ router.post('/load', requireSyncKey, (req, res) => {
   if (!dataDir || !url) return res.status(503).json({ error: 'DATA_DIR / COMPANY_DB_URL not configured' });
   if (!fs.existsSync(path.join(dataDir, 'warehouse-mirror.db'))) return res.status(409).json({ error: 'warehouse-mirror.db not found (run on Render)' });
   const apply = String(req.query.apply || '') === '1';
+  // 切替の日だけ: prepared の持ち主で動かす (0055。master-ownership-epoch.mjs prepare の後に remote-load.mjs load --apply --use-prepared)
+  const usePrepared = String(req.query.use_prepared || '') === '1';
   let interrupted = null;
   try { interrupted = interruptedRecord(dataDir); } catch (e) { interrupted = { error: e.message }; }
-  const r = startLoad({ dataDir, url, apply });
+  const r = startLoad({ dataDir, url, apply, usePrepared });
   if (!r.started) return res.status(409).json({ error: 'load already running', run_id: r.current.run_id, started_at: r.current.started_at });
   res.status(202).json({ accepted: true, run_id: r.current.run_id, dry_run: r.current.dry_run, started_at: r.current.started_at, status_url: '/apps/company-db/sync/status', previous_interrupted: interrupted });
 });
@@ -199,13 +209,14 @@ router.get('/orders/status', requireSyncKey, async (req, res) => {
     const [c] = await q(`select (select count(*) from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as orders,
       (select count(*) from core.order_lines l join core.orders o on o.order_id = l.order_id where o.company_id = 1 and o.mall = $1 and o.scope_key = $2 and l.removed_at is null) as lines,
       (select max(received_batch_seq) from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as max_batch_seq,
-      (select max(order_date_jst)::text from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as max_order_date`, [ms.mall, ms.scope]);
+      (select max(order_date_jst)::text from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as max_order_date,
+      (select count(*) from core.orders where company_id = 1 and mall = $1 and scope_key = $2 and not is_cancelled and mall_coupon_jpy is null) as mall_coupon_unknown`, [ms.mall, ms.scope]);   // 売上日次は null を 0 として払った額を出す (Yahoo の公開の前提。#1502 Codex R1)
     const runs = await q(`select r.ingest_run_id, r.status, r.started_at, r.finished_at, r.rows_seen, r.rows_inserted, r.rows_skipped, r.checksum as batch_seq, r.pages as chunks_expected, r.error,
         (select count(*)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as chunks_received,
         (select coalesce(sum(c.rows_failed), 0)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as rows_failed,
         (r.status = 'running' and r.started_at < now() - interval '6 hours') as stalled
        from ops.ingest_runs r where r.source_system = $1 and r.entity = 'orders' and r.scope_key = $2 order by r.started_at desc limit 5`, [ms.mall, ms.scope]);
-    res.json({ mall: ms.mall, scope: ms.scope, counts: { orders: Number(c.orders), lines: Number(c.lines), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_order_date: c.max_order_date }, runs });
+    res.json({ mall: ms.mall, scope: ms.scope, counts: { orders: Number(c.orders), lines: Number(c.lines), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_order_date: c.max_order_date, mall_coupon_unknown: Number(c.mall_coupon_unknown) }, runs });
   });
 });
 
@@ -236,6 +247,198 @@ router.get('/orders/daily', requireSyncKey, async (req, res) => {
     res.json({ mall: ms.mall, scope: ms.scope, from, to, rows: rows.map((r) => ({ ...r, items_amount_jpy: Number(r.items_amount_jpy) })) });
   });
 });
+
+/**
+ * 注文 (疑似注文) の財務の push の受け口 (F2b-1。送り手 = apps/company-db/push/amazon-finance.mjs (F2b-2)、本体 = ingest/order-finance.mjs・0043):
+ *   POST /apps/company-db/sync/order-finance                          1 chunk (1 モール × 1 scope) を 1 取引で core.apply_order_finance_batch() に。集合の指紋は受け口が計算し直す
+ *   GET  /apps/company-db/sync/order-finance/status?mall&scope        件数・世代・直近の run・DB の大きさ (pg_database_size と、読めれば WAL の大きさ = 送り手が次の chunk の前に容量を見る)
+ *   GET  /apps/company-db/sync/order-finance/receipt                  受領記録 (伝票と同じ = run_id で引く)
+ *   GET  /apps/company-db/sync/order-finance/keys?mall&scope&after&limit     受け取った注文番号 (疑似注文も。送り手の全件の作り直しで Render にだけある鍵を見つける)
+ *   GET  /apps/company-db/sync/order-finance/daily?mall&scope&from&to        mart.finance_daily_range (0044 = v_finance_daily と同じ式を期間の月だけで。日 × SKU・突き合わせの材料)
+ *   GET  /apps/company-db/sync/order-finance/account-fees?mall&scope&from&to mart.v_finance_account_fees_monthly (月 × 手数料の種類)
+ *   GET  /apps/company-db/sync/order-finance/uncovered?mall&scope            mart.v_order_finance_uncovered の件数と例 (policy が無い日・source が違う日)
+ *   POST /apps/company-db/sync/order-finance/coverage                       決済のそろい (0050・D7b-1b-2) の updating / complete (下の節)
+ *   GET  /apps/company-db/sync/order-finance/coverage/status?mall&scope&source   決済のそろいの今の状態・世代
+ *   🆕 chunk の body に coverage_generation / run_token (両方) = その世代・token の coverage が updating のときだけ適用 (違えば 409 COVERAGE_MISMATCH)。
+ *      無い chunk (今の送り手) は今までどおり受けるが、受領記録を変えたら complete を updating に落とす (応答の coverage_invalidated)
+ * 設計 = AI_reference『CompanyDB構想/12_Amazon財務のCompanyDB取込_設計_20260929.md』
+ */
+const financeMallScopeOf = (req) => {
+  const mall = String(req.query.mall || ''), scope = String(req.query.scope || '');
+  if (!FINANCE_MALLS.includes(mall) || !/^[0-9A-Za-z][0-9A-Za-z_-]{0,30}$/.test(scope)) return null;
+  return { mall, scope };
+};
+// 2026-02-30 は通さない (DB の 500 ではなく 400)・2026-13-01 は Date が不正 = toISOString の例外の前に NaN で落とす (#1533 Codex R2)
+const isRealDate = (s) => { if (!DATE_RE.test(s)) return false; const ms = Date.parse(`${s}T00:00:00Z`); return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === s; };
+const financeRangeOf = (req, maxDays) => {
+  const from = String(req.query.from || ''), to = String(req.query.to || '');
+  if (!isRealDate(from) || !isRealDate(to) || from > to) return { error: 'from / to must be real dates (YYYY-MM-DD) and from <= to' };
+  if ((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 + 1 > maxDays) return { error: `range must be <= ${maxDays} days (both ends included)` };
+  return { from, to };
+};
+
+router.post('/order-finance', requireSyncKey, shipmentsJson, shipmentsParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let chunk;
+  try { chunk = validateFinanceChunk(req.body); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  if (!chunk.mall) return res.status(400).json({ error: 'an order finance chunk needs at least one row (mall / scope come from the rows)' });
+  let client;
+  const t0 = Date.now();
+  try {
+    client = await pgClientFactory(url);
+    await client.query(`set statement_timeout = '20s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
+    const r = await ingestOrderFinanceChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db order-finance ${chunk.mall}] ${chunk.runId} ${m}`) });
+    res.json(r);
+  } catch (e) {
+    // NOT_MIGRATED = 新しい形 (分けられない部品の 4 列) の行が 0047 の適用前に届いた・token 付きの chunk が 0050 の適用前に届いた /
+    // DOWNGRADE = 今の形の版の注文を旧い版で置き換えようとした (ingest/order-finance.mjs) /
+    // COVERAGE_MISMATCH = token 付きの chunk の世代・token の coverage が updating でない (complete の後・別の世代・別の token) / LOCKED = coverage の要求か別の chunk が lock を持ったまま (0050)
+    const status = (e.code === 'CHUNK_DEADLINE' || e.code === 'LOCKED') ? 503
+      : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED' || e.code === 'NOT_MIGRATED' || e.code === 'DOWNGRADE' || e.code === 'COVERAGE_MISMATCH') ? 409
+        : e.code === 'BAD_REQUEST' ? 400 : 500;
+    console.error(`[company-db order-finance ${chunk.mall}] ${chunk.runId} chunk ${chunk.chunkIndex} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null, run_id: chunk.runId, chunk_index: chunk.chunkIndex });
+  } finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+/**
+ * 決済のそろい (coverage・0050・D7b-1b-2。本体 = ingest/finance-coverage.mjs。設計 = AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.1):
+ *   POST /apps/company-db/sync/order-finance/coverage   { state: 'updating' | 'complete', mall, scope, source, generation, run_token, manifest? (complete だけ), request_hash? }
+ *     → { status: 'applied' | 'same' | 'stale', state, generation, current_generation?, complete_to?, receipt? }
+ *       400 = 形 / 409 = CONFLICT (状態の移り方で受けない)・RECEIPT_MISMATCH (受領記録が manifest と違う = detail.render に Render の数と digest)・NO_POLICY・POLICY_MISMATCH (manifest.policy_fingerprint が今の policy と違う)・not_migrated (0050 の前) / 503 LOCKED (lock が空かない)
+ *   GET  /apps/company-db/sync/order-finance/coverage/status?mall&scope&source[&receipts=1]
+ *     → { mall, scope, source, coverage: 行 | null, effective: { complete_to, generation, source_revision } (core.finance_coverage_state), policy: { fingerprint, rows }, receipts?: { count, lines, digest } }
+ *       世代・source_revision = 10 進の文字列。0050 の前は 409 { error: 'not_migrated' }
+ *   🚨 送るのは miniPC の coordinator (D7b-1b-3・後の PR) だけ。今の送り手 (daily-sync) は coverage を送らない = complete が無い間は正式な利益は全部 null のまま
+ *   🚨 鍵の検査は server.js の '/apps/company-db/sync/order-finance' の前方一致 (body parser より前) に入る
+ */
+const coverageJson = express.json({ limit: '64kb', inflate: false });
+router.post('/order-finance/coverage', requireSyncKey, coverageJson, parserErrorFor('64KB'), async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  const t0 = Date.now();
+  const tag = `${String(req.body && req.body.mall).slice(0, 12)}/${String(req.body && req.body.scope).slice(0, 12)} ${String(req.body && req.body.state).slice(0, 10)} gen ${String(req.body && req.body.generation).slice(0, 20)}`;
+  try {
+    client = await pgClientFactory(url);
+    // complete は受領記録 (約 51 万注文) を 1 回読む。lock は走っている chunk の後に取れるまで待つ (20 秒で 503 LOCKED = 送り手がやり直す。
+    // 設計の complete の送信 = 1 回 30 秒の再試行 → 待ち 20 秒 + digest の計算が 30 秒に入るように)
+    await client.query(`set statement_timeout = '60s'; set lock_timeout = '20s'; set idle_in_transaction_session_timeout = '90s'`);
+    const r = await applyCoverage(pgAdapter(client), req.body, { log: (m) => console.log(`[company-db coverage] ${tag} ${m}`) });
+    res.json({ ...r, ms: Date.now() - t0 });
+  } catch (e) {
+    if (e.code === 'NOT_MIGRATED') return res.status(409).json({ error: 'not_migrated', detail: 'migration 0050 (core.finance_coverage) is not applied', code: e.code });
+    const status = e.code === 'BAD_REQUEST' ? 400 : (e.code === 'CONFLICT' || e.code === 'RECEIPT_MISMATCH' || e.code === 'NO_POLICY' || e.code === 'POLICY_MISMATCH') ? 409 : e.code === 'LOCKED' ? 503 : 500;
+    console.error(`[company-db coverage] ${tag} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 400), code: e.code || null, ...(e.detail ? { detail: e.detail } : {}) });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+router.get('/order-finance/coverage/status', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const source = String(req.query.source || '');
+  if (!COVERAGE_SOURCES.includes(source)) return res.status(400).json({ error: `source must be one of ${COVERAGE_SOURCES.join(', ')}` });
+  await withPg(res, async (client) => {
+    const db = pgAdapter(client);
+    if (!(await coverageReady(db))) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0050 (core.finance_coverage) is not applied' });
+    await client.query(`set statement_timeout = '60s'`);
+    res.json(await coverageStatus(db, { mall: ms.mall, scope: ms.scope, source, withReceipts: String(req.query.receipts || '') === '1' }));
+  });
+});
+
+router.get('/order-finance/status', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  await withPg(res, async (client) => {
+    const q = async (sql, p = []) => (await client.query(sql, p)).rows;
+    const [c] = await q(`select (select count(*) from core.order_finance_receipts where company_id = 1 and mall = $1 and scope_key = $2) as orders,
+      (select count(*) from core.order_finance_daily where company_id = 1 and mall = $1 and scope_key = $2) as rows,
+      (select max(received_batch_seq) from core.order_finance_receipts where company_id = 1 and mall = $1 and scope_key = $2) as max_batch_seq,
+      (select max(economic_date_jst)::text from core.order_finance_daily where company_id = 1 and mall = $1 and scope_key = $2) as max_economic_date,
+      pg_database_size(current_database()) as db_bytes`, [ms.mall, ms.scope]);
+    // WAL の大きさ (pg_database_size は WAL を含まない)。権限が無ければ null = 送り手は Render での試しで測った倍率で見込む
+    let walBytes = null;
+    try { walBytes = Number((await q(`select coalesce(sum(size), 0) as b from pg_ls_waldir()`))[0].b); } catch { walBytes = null; }
+    const runs = await q(`select r.ingest_run_id, r.status, r.started_at, r.finished_at, r.rows_seen, r.rows_inserted, r.rows_skipped, r.checksum as batch_seq, r.pages as chunks_expected, r.error,
+        (select count(*)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as chunks_received,
+        (select coalesce(sum(c.rows_failed), 0)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as rows_failed,
+        (r.status = 'running' and r.started_at < now() - interval '6 hours') as stalled
+       from ops.ingest_runs r where r.source_system = $1 and r.entity = 'order_finance' and r.scope_key = $2 order by r.started_at desc limit 5`, [ms.mall, ms.scope]);
+    res.json({ mall: ms.mall, scope: ms.scope,
+      counts: { orders: Number(c.orders), rows: Number(c.rows), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_economic_date: c.max_economic_date },
+      size: { db_bytes: Number(c.db_bytes), wal_bytes: walBytes }, runs });
+  });
+});
+
+router.get('/order-finance/keys', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const after = String(req.query.after || '');
+  const limitRaw = req.query.limit === undefined ? 20000 : Number(req.query.limit);
+  if (!Number.isInteger(limitRaw)) return res.status(400).json({ error: 'limit must be an integer' });
+  const limit = Math.min(Math.max(limitRaw, 1), 50000);
+  await withPg(res, async (client) => {
+    // 受領状態の表 = 空の集合を受け取った注文も入る (lines = 0)。鍵の並びは collate "C" (バイト順・送り手の after と同じ)
+    const rows = (await client.query(`select mall_order_no, lines from core.order_finance_receipts where company_id = 1 and mall = $1 and scope_key = $2 and mall_order_no collate "C" > $3 order by mall_order_no collate "C" limit $4`,
+      [ms.mall, ms.scope, after, limit])).rows;
+    res.json({ keys: rows.map((r) => r.mall_order_no), lines: rows.map((r) => Number(r.lines)), next: rows.length === limit ? rows[rows.length - 1].mall_order_no : null });
+  });
+});
+
+router.get('/order-finance/daily', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const rg = financeRangeOf(req, 62); if (rg.error) return res.status(400).json({ error: rg.error });
+  await withPg(res, async (client) => {
+    // 🚨 view (mart.v_finance_daily) は全期間をまとめてから絞る = 52 万行で 5 分を超えた (2026-09-29) → 期間の月だけ読む関数 (0044)。止まらないように時間の上限も
+    await client.query(`set statement_timeout = '120s'`);
+    const rows = (await client.query(`select economic_date_jst::text as date_jst, seller_sku, units_ordered, units_refunded_customer, units_marketplace_guarantee, units_a_to_z_refund, units_net_sold,
+        sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy, commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy,
+        shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy, promotion_tax_jpy, points_jpy, warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
+        refund_principal_jpy, reversal_reimbursement_jpy, misc_fee_jpy, other_fee_jpy, other_amount_jpy, profit_before_cogs_jpy
+       from mart.finance_daily_range(1::smallint, $1, $2, $3::date, $4::date)
+       order by economic_date_jst, seller_sku collate "C"`, [ms.mall, ms.scope, rg.from, rg.to])).rows;
+    res.json({ mall: ms.mall, scope: ms.scope, from: rg.from, to: rg.to, rows: rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, k === 'date_jst' || k === 'seller_sku' ? v : Number(v)]))) });
+  });
+});
+
+router.get('/order-finance/account-fees', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const rg = financeRangeOf(req, 800); if (rg.error) return res.status(400).json({ error: rg.error });
+  await withPg(res, async (client) => {
+    await client.query(`set statement_timeout = '120s'`);
+    const rows = (await client.query(`select month_start_jst::text as month_start_jst, fee_type, amount_jpy, row_count from mart.v_finance_account_fees_monthly
+       where company_id = 1 and mall = $1 and scope_key = $2 and month_start_jst between date_trunc('month', $3::date) and $4::date order by 1, 2`, [ms.mall, ms.scope, rg.from, rg.to])).rows;
+    res.json({ mall: ms.mall, scope: ms.scope, rows: rows.map((r) => ({ ...r, amount_jpy: Number(r.amount_jpy), row_count: Number(r.row_count) })) });
+  });
+});
+
+router.get('/order-finance/uncovered', requireSyncKey, async (req, res) => {
+  const ms = financeMallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  await withPg(res, async (client) => {
+    const rows = (await client.query(`select reason, count(*)::int as n, min(economic_date_jst)::text as first_date, max(economic_date_jst)::text as last_date
+       from mart.v_order_finance_uncovered where company_id = 1 and mall = $1 and scope_key = $2 group by reason order by reason`, [ms.mall, ms.scope])).rows;
+    res.json({ mall: ms.mall, scope: ms.scope, rows });
+  });
+});
+
+/**
+ * Amazon の利益の mart (D7b-3・0049) の読む口 = 🚨 2026-10-01 から 503 (封じ込め)。0049 の関数は呼ばない・DB に接続もしない:
+ *   GET /apps/company-db/sync/amazon-profit/daily   → 503 { ok: false, code: 'PROFIT_ROUTE_DISABLED', error }
+ *   GET /apps/company-db/sync/amazon-profit/totals  → 503 (同じ)
+ *   理由 = 10/1 00:10、93 日分の計算で本番の Postgres (1GB) が落ちた。本番は temp_file_limit = -1 (一時ファイルが無制限) で SET の権限も無い
+ *     = 長い期間の要求 1 本で DB を落とせる。設計 (AI_reference『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10 D-60 v3.1 =
+ *     保存しないで 1 か月ずつ計算) で作り直すまで、この口を止める。
+ *   🚨 再び有効にする設定 (環境変数など) は作らない。戻すのはコードの変更 (§3.10 の作り直しの PR) で行う。前の実装 = #1559 (c894ca64) の router.mjs
+ *   鍵の検査 (x-sync-key) は残す = 鍵の無い要求は今までどおり 401
+ */
+const PROFIT_ROUTE_DISABLED = Object.freeze({
+  ok: false,
+  code: 'PROFIT_ROUTE_DISABLED',
+  error: 'Amazon の利益の読む口は 2026-10-01 から止めています (封じ込め)。93 日分の計算で本番の Postgres が落ちたため。'
+    + '設計『CompanyDB構想/13_Amazon利益のmart_設計_20260930.md』§3.10 (D-60 v3.1 = 1 か月ずつ計算) で作り直すまで使えません。',
+});
+for (const kind of ['daily', 'totals']) {
+  router.get(`/amazon-profit/${kind}`, requireSyncKey, (req, res) => res.status(503).json(PROFIT_ROUTE_DISABLED));
+}
 
 router.post('/shipments/relink', requireSyncKey, express.json({ limit: '4kb' }), async (req, res) => {
   const after = Number(req.body && req.body.after) || 0, limit = Math.min(Math.max(Number(req.body && req.body.limit) || 20000, 1), 100000);
@@ -300,7 +503,122 @@ router.get('/orders/sales-daily/check', requireSyncKey, async (req, res) => {
 });
 
 /** 送り手が「前回受領確認した chunk が Render にまだあるか」を確かめる (無ければ Render が復元・作り直された = 台帳の指紋を空にして全部送り直す。Codex R3 #2) */
-router.get(['/shipments/receipt', '/orders/receipt'], requireSyncKey, async (req, res) => {
+/**
+ * 在庫の日次 (SKU 単位。08 §3.3 の ③ NE = D2b-1)。miniPC が朝の在庫スナップショットの直後に 1 日 = 1 要求で送る (apps/company-db/push/stock-daily.mjs)。
+ *   POST /apps/company-db/sync/stock-daily  { source, scope?, snapshot_date, captured_at, rows: [{ code, qty }] } | { source, scope?, snapshot_date, missing: true }
+ *     → { status: 'applied' | 'same' | 'missing' | 'missing_same', rows, resolved, unresolved, run_id, checksum }
+ *     1 取引で stock_capture_days を building → 行 → complete。先に確定した日は書き換えない (同じ内容 = same / 違う内容 = 409)。未来の日付・行 0 件は 400
+ *   GET  /apps/company-db/sync/stock-daily/status?source&scope&from&to  → { days: [{ snapshot_date, status, rows, checksum }] } (送り手が「まだ送っていない日」を決める)
+ */
+const stockJson = express.json({ limit: '4mb' });   // NE = 1 日 約 5,000 行 ≒ 200KB
+const stockParserError = (err, req, res, next) => (err ? res.status(err.type === 'entity.too.large' ? 413 : 400).json({ error: `body を読めない: ${String(err.message).slice(0, 200)}` }) : next());
+router.post('/stock-daily', requireSyncKey, stockJson, stockParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  const t0 = Date.now();
+  const tag = `${String(req.body && req.body.source).slice(0, 20)} ${String(req.body && req.body.snapshot_date).slice(0, 12)}`;
+  try {
+    client = await pgClientFactory(url);
+    await client.query(`set statement_timeout = '40s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
+    const r = await ingestStockDay(pgAdapter(client), req.body, { host: 'render', log: (m) => console.log(`[company-db stock-daily] ${m}`) });
+    res.json({ ...r, ms: Date.now() - t0 });
+  } catch (e) {
+    const status = e.code === 'BAD_REQUEST' ? 400 : e.code === 'CONFLICT' ? 409 : e.code === 'LOCKED' ? 503 : 500;
+    if (status >= 500) console.error(`[company-db stock-daily] ${tag} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+router.get('/stock-daily/status', requireSyncKey, async (req, res) => {
+  await withPg(res, async (client) => {
+    try {
+      const days = await stockDayStatus(pgAdapter(client), { source: String(req.query.source || ''), scope: req.query.scope === undefined ? undefined : String(req.query.scope), from: String(req.query.from || ''), to: String(req.query.to || '') });
+      res.json({ days });
+    } catch (e) {
+      if (e.code === 'BAD_REQUEST') return res.status(400).json({ error: e.message });
+      throw e;
+    }
+  });
+});
+
+/**
+ * 広告費の日次 (Company DB構想 11 の ②。本体 = ingest/ad-spend.mjs、送り手 = apps/company-db/push/ad-spend.mjs)。
+ *   POST /apps/company-db/sync/ad-spend/day     { mall, scope, ad_type, date_jst, generation, report_id, checksum, rows: [...] }
+ *     → { status: 'applied' | 'same' | 'refreshed' | 'stale', rows, resolved, unresolved_sku, run_id, checksum }。同じ世代で違う内容 = 409
+ *   GET  /apps/company-db/sync/ad-spend/status?mall&scope&ad_type&from&to  → { days: [{ date_jst, generation, report_id, checksum, row_count, cost_total }] }
+ *   POST /apps/company-db/sync/ad-spend/relink  → { relinked, unresolved_sku } (マスタが後から増えた SKU の行を出品に結び直す)
+ */
+router.post('/ad-spend/day', requireSyncKey, stockJson, stockParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  const t0 = Date.now();
+  const tag = `${String(req.body && req.body.mall).slice(0, 20)} ${String(req.body && req.body.date_jst).slice(0, 12)}`;
+  try {
+    client = await pgClientFactory(url);
+    await client.query(`set statement_timeout = '40s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
+    const r = await ingestAdSpendDay(pgAdapter(client), req.body, { host: 'render', log: (m) => console.log(`[company-db ad-spend] ${m}`) });
+    res.json({ ...r, ms: Date.now() - t0 });
+  } catch (e) {
+    const status = e.code === 'BAD_REQUEST' ? 400 : e.code === 'CONFLICT' ? 409 : e.code === 'LOCKED' ? 503 : 500;
+    if (status >= 500) console.error(`[company-db ad-spend] ${tag} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+router.get('/ad-spend/status', requireSyncKey, async (req, res) => {
+  await withPg(res, async (client) => {
+    try {
+      const q = (k) => String(req.query[k] || '');
+      res.json({ days: await adSpendStatus(pgAdapter(client), { mall: q('mall'), scope: q('scope'), adType: q('ad_type'), from: q('from'), to: q('to') }) });
+    } catch (e) {
+      if (e.code === 'BAD_REQUEST') return res.status(400).json({ error: e.message });
+      throw e;
+    }
+  });
+});
+router.post('/ad-spend/relink', requireSyncKey, async (req, res) => {
+  await withPg(res, async (client) => { await client.query(`set statement_timeout = '120s'`); res.json(await relinkAdSpend(pgAdapter(client))); });
+});
+
+/**
+ * 観測の原価 (D7b-2。本体 = ingest/sku-cost-observed.mjs、送り手 = apps/company-db/push/sku-cost-observed.mjs、受け皿 = 0046)。
+ *   POST /apps/company-db/sync/sku-cost-observed   { source, generation, checksum, row_count, unresolved_code_count, ambiguous_code_count, rows: [...] }
+ *     → { status: 'applied' | 'same' | 'stale', generation, checksum, rows, observed_load_id, run_id }。全部 = 1 要求 = 1 取引で入れ替える。
+ *       同じ世代で manifest が違う = 409 CONFLICT / Render に無い SKU の商品コード = 409 SKU_UNRESOLVED / 別の取込が走っている = 503 LOCKED
+ *   GET  /apps/company-db/sync/sku-cost-observed/status      → { source, load: { generation, checksum, row_count, unresolved_code_count, ambiguous_code_count, … } | null, rows, skus }。0046 の適用前は 409 { error: 'not_migrated' }
+ *   GET  /apps/company-db/sync/sku-cost-observed/sku-codes?after&limit → { keys: [code_norm], next } (送り手が商品コードを結べるか決める)
+ * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる)。1 回で 2 万行 ≒ 5MB = 伝票と同じ 12MB・圧縮なしの parser
+ */
+router.post('/sku-cost-observed', requireSyncKey, shipmentsJson, shipmentsParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  const t0 = Date.now();
+  try {
+    client = await pgClientFactory(url);
+    await client.query(`set statement_timeout = '60s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '90s'`);
+    const r = await ingestSkuCostObserved(pgAdapter(client), req.body, { host: 'render', log: (m) => console.log(`[company-db sku-cost-observed] ${m}`) });
+    res.json({ ...r, ms: Date.now() - t0 });
+  } catch (e) {
+    const status = e.code === 'BAD_REQUEST' ? 400 : (e.code === 'CONFLICT' || e.code === 'SKU_UNRESOLVED') ? 409 : e.code === 'LOCKED' ? 503 : 500;
+    if (status >= 500) console.error(`[company-db sku-cost-observed] FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+router.get('/sku-cost-observed/status', requireSyncKey, async (req, res) => {
+  await withPg(res, async (client) => {
+    // 0046 の適用前 = 409 not_migrated (送り手は「⚠️ 0046 が未適用」で送らない = マージから migrate までの朝を ❌ にしない。売上日次の 0021 と同じ流儀)
+    if ((await client.query(`select to_regclass('core.sku_cost_observed_loads') is not null as ok`)).rows[0].ok !== true) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0046 (core.sku_cost_observed) is not applied' });
+    res.json(await skuCostObservedStatus(pgAdapter(client)));
+  });
+});
+router.get('/sku-cost-observed/sku-codes', requireSyncKey, async (req, res) => {
+  const limitRaw = req.query.limit === undefined ? 20000 : Number(req.query.limit);
+  if (!Number.isInteger(limitRaw)) return res.status(400).json({ error: 'limit must be an integer' });
+  await withPg(res, async (client) => { res.json(await skuCodeNorms(pgAdapter(client), { after: String(req.query.after || ''), limit: limitRaw })); });
+});
+
+router.get(['/shipments/receipt', '/orders/receipt', '/order-finance/receipt'], requireSyncKey, async (req, res) => {
   const url = process.env.COMPANY_DB_URL;
   if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
   const runId = String(req.query.run_id || ''), idx = Number(req.query.chunk_index);

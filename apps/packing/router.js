@@ -30,7 +30,7 @@ import {
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, SHIP_CHANGE_TWO_LABELS, lastDoneSeqOf, getDailySummary,
   resolveIncident, lineKindOf, batchHikiateClass, batchClassInfo, listLineRuns, lineDailyTotal, listRepickReady,
-  claimStockoutNotify, markStockoutNotify, shortageSummaryFor, setTaskLocationHint,
+  claimStockoutNotify, markStockoutNotify, shortageSummaryFor, setTaskLocationHint, mergeLinesBySku,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText, notifyStockout } from './notify.js';
 import {
@@ -674,9 +674,12 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   // ④ 配送方法変更は事務へ GChat 通知。事務キュー廃止後は通知が実質の伝達経路なので、
   // 成否を行に記録し (失敗はポーラーが再送)、失敗は現場にも表示する (Codexレビュー high)
   if (req.body.event === 'ship_change' && !result.replayed) {
-    const row = getDB().prepare(
-      'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
-    ).get(Number(req.params.id), Number(req.body.slip_seq));
+    // 行は applyEvent が返した id で引く (同じ伝票に依頼が重なっても取り違えない)。古い保存結果に id が無ければ最新行
+    const row = result.shipChangeId != null
+      ? getDB().prepare('SELECT * FROM pk_pack_ship_changes WHERE id=?').get(result.shipChangeId)
+      : getDB().prepare(
+        'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
+      ).get(Number(req.params.id), Number(req.body.slip_seq));
     if (row) {
       const lines = getDB().prepare(`
         SELECT COALESCE(l.print_name, l.product_name) AS name, l.sku, l.qty
@@ -696,7 +699,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         getDB().prepare('UPDATE pk_pack_ship_changes SET notified_at=?, notify_error=? WHERE id=?')
           .run(sent ? new Date().toISOString().slice(0, 19) + 'Z' : null,
             sent ? null : 'webhook未設定', row.id);
-        if (!sent) result.shipNotify = 'failed';
+        result.shipNotify = sent ? 'ok' : 'failed';
       } catch (e) {
         console.warn(`[packing-notify] 配送変更通知失敗 (${row.ne_slip_no}): ${e.message}`);
         getDB().prepare('UPDATE pk_pack_ship_changes SET notify_error=? WHERE id=?')
@@ -704,6 +707,16 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         result.shipNotify = 'failed';
       }
     }
+  } else if (req.body.event === 'ship_change' && result.replayed) {
+    // 応答が届かず再送された (replay) ときも通知の状態を返す。初回の通知失敗の応答が落ちていると
+    // 画面は「送れています」と誤認する (Codex R2 Medium)。行の notified_at (ポーラーの再送で埋まる) が正。
+    // 行は保存結果の shipChangeId で引く (同じ伝票の別の依頼の結果を返さない — Codex R3)。id が無い古い結果は最新行
+    const row = result.shipChangeId != null
+      ? getDB().prepare('SELECT notified_at FROM pk_pack_ship_changes WHERE id=?').get(result.shipChangeId)
+      : getDB().prepare(
+        'SELECT notified_at FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
+      ).get(Number(req.params.id), Number(req.body.slip_seq));
+    if (row) result.shipNotify = row.notified_at ? 'ok' : 'failed';
   }
   res.json({ ok: true, ...result });
 }));
@@ -1321,17 +1334,43 @@ router.post('/admin/materials/notify/:id(\\d+)/resend', checkOrigin, requireAdmi
 const PD_RULE_URL = (process.env.PD_RULE_CHANGE_URL
   || 'https://bfaith-portal.onrender.com/apps/packing-dispatch/rule-change-api').replace(/\/+$/, '');
 let _ruleOptionsCache = { at: 0, data: null };
+// Render が再デプロイ中・応答しないときに fetch が返らず、画面が「現在の登録を読み込み中…」のまま固まる
+// (9/22 現場指摘: 「なぜか恒久ルール変更できない」)。時間切れで 504 を返し、画面に再試行を出す
+// 本文の受信まで時間切れの対象 (ヘッダーだけ届いて本文で止まると、呼び出し側の json().catch が {} にして
+// 「承認依頼 #undefined を受け付けました」になる — Codex R1)。
+// @returns {{res: Response, body: object}} body は JSON でなければ {}
+const PD_RULE_TIMEOUT_MS = 15_000;
+async function fetchRuleApi(path, init) {
+  try {
+    const res = await fetch(`${PD_RULE_URL}${path}`, { ...init, signal: AbortSignal.timeout(PD_RULE_TIMEOUT_MS) });
+    const text = await res.text();
+    let body = {};
+    try { if (res.ok && !text.trim()) throw new Error('empty'); body = text ? JSON.parse(text) : {}; } catch {
+      // 2xx なのに JSON でない (ログイン画面の HTML・空本文) を成功にすると、空の選択肢を 10 分キャッシュして
+      // 復旧後も操作できなくなる (Codex R2) → 上流エラーとして返す。4xx/5xx の HTML はそのまま !ok で扱う
+      if (res.ok) throw new PackError(502, 'upstream', '配送ルールのサーバー (Render) の応答が読めません (JSON ではない)。少し待って再試行してください');
+      body = {};
+    }
+    return { res, body };
+  } catch (e) {
+    if (e instanceof PackError) throw e;
+    const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+    throw new PackError(504, 'upstream_timeout', timedOut
+      ? `配送ルールのサーバー (Render) が ${PD_RULE_TIMEOUT_MS / 1000} 秒応答しませんでした。少し待って再試行してください`
+      : `配送ルールのサーバー (Render) に接続できません (${String(e?.cause?.code || e?.message || e).slice(0, 80)})`);
+  }
+}
 
 router.get('/api/rule-change/options', api(async (req, res) => {
   if (!process.env.PD_RULE_CHANGE_KEY) {
     throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
   }
   if (!_ruleOptionsCache.data || Date.now() - _ruleOptionsCache.at > 600_000) {
-    const r = await fetch(`${PD_RULE_URL}/options`, {
+    const { res: r, body } = await fetchRuleApi('/options', {
       headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY },
     });
     if (!r.ok) throw new PackError(502, 'upstream', `選択肢の取得に失敗しました (HTTP ${r.status})`);
-    _ruleOptionsCache = { at: Date.now(), data: await r.json() };
+    _ruleOptionsCache = { at: Date.now(), data: body };
   }
   res.json({ ok: true, ...(_ruleOptionsCache.data) });
 }));
@@ -1346,9 +1385,10 @@ router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, 
   const slipSeq = Number(req.body.slip_seq);
   const slip = listPackSlips(batch.id).find((x) => x.seq === slipSeq);
   if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
-  const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
+  // 同じ SKU の別行は合算して 1 明細に (packing-dispatch 側は SKU 単位。行のまま送ると重複で弾かれる)
+  const lines = mergeLinesBySku(listPackLinesBySlip(batch.id).get(slip.id) || []);
   if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
-  const r = await fetch(`${PD_RULE_URL}/current`, {
+  const { res: r, body } = await fetchRuleApi('/current', {
     method: 'POST',
     headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1356,7 +1396,6 @@ router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, 
       items: lines.map((l) => ({ sku: l.sku, qty: l.qty })),
     }),
   });
-  const body = await r.json().catch(() => ({}));
   if (!r.ok) throw new PackError(502, 'upstream', body.error || `現在の登録の取得に失敗しました (HTTP ${r.status})`);
   res.json(body);
 }));
@@ -1383,7 +1422,8 @@ router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, r
   const slipSeq = Number(req.body.slip_seq);
   const slip = listPackSlips(batch.id).find((x) => x.seq === slipSeq);
   if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
-  const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
+  // rule-current と同じく同じ SKU の別行は合算 (kind の判定も合算後の SKU 数で)
+  const lines = mergeLinesBySku(listPackLinesBySlip(batch.id).get(slip.id) || []);
   if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
   const kind = lines.length === 1 ? 'single' : 'assort';
   const payload = {
@@ -1400,12 +1440,11 @@ router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, r
     expect_machine_code: req.body.expect_machine_code ?? null,
     expect_none: req.body.expect_none === true,
   };
-  const r = await fetch(`${PD_RULE_URL}/requests`, {
+  const { res: r, body } = await fetchRuleApi('/requests', {
     method: 'POST',
     headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  const body = await r.json().catch(() => ({}));
   if (!r.ok) {
     throw new PackError(r.status === 400 ? 400 : 502, 'upstream', body.error || `申請に失敗しました (HTTP ${r.status})`);
   }

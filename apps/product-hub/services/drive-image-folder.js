@@ -209,6 +209,11 @@ async function doAttempt(draftId, { actor = null, driveClient = null } = {}) {
 export async function attemptImageFolderCreationBatch(draftIds, { actor = null, driveClient = null } = {}) {
   const summary = { created: 0, reused: 0, skipped: 0, failed: 0 };
   for (const id of draftIds || []) {
+    // 出品済みページへの色追加のカード (2026-09-25) は、画像を既存ページのフォルダで扱うので
+    // 自動では作らない (取込のたびに「新しい色のコード_商品名」のフォルダが増えるのを避ける)
+    let addedTo = null;
+    try { addedTo = getDB().prepare('SELECT added_to_draft_id FROM product_drafts WHERE id = ?').get(id)?.added_to_draft_id ?? null; } catch (_) { /* 列が無い古い DB */ }
+    if (addedTo != null) { summary.skipped += 1; continue; }
     const r = await attemptImageFolderCreation(id, { actor, driveClient });
     if (r.outcome === 'created') summary.created += 1;
     else if (r.outcome === 'reused') summary.reused += 1;

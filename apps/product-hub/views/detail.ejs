@@ -91,6 +91,17 @@ th.attr-unknown { color: #dc2626; }
   .ne-step.on.ok { background:#dcfce7; color:#166534; border-color:#86efac; }
   .ne-step.on.bad { background:#fee2e2; color:#991b1b; border-color:#fca5a5; }
   .ne-arrow { color:#cbd5e1; }
+  /* 未保存の印 (2026-09-21)。明示保存の欄は「ボタンを押すまで DB に行かない」ので、
+     どこに未保存が残っているかをボタンとタブの両方で見えるようにする */
+  .unsaved-mark { display:none; margin-left:8px; font-size:12px; font-weight:700; color:#b45309; }
+  .unsaved-mark.on { display:inline; }
+  .tab-unsaved { display:none; margin-left:4px; color:#f59e0b; font-size:11px; }
+  .tab-unsaved.on { display:inline; }
+  .unsaved-banner { margin-top:10px; padding:8px 12px; border-radius:8px; font-size:12.5px;
+                    background:#fffbeb; border:1px solid #fcd34d; color:#92400e; }
+  /* 即保存の結果 (2026-09-21)。入力を確定した時点で保存されたことを、その欄のそばで知らせる */
+  .autosave-mark { margin-left: 8px; font-size: 11.5px; color: #16a34a; }
+  .autosave-mark.bad { color: #dc2626; font-weight: 600; }
 </style>
 <div class="wrap wide">
 
@@ -193,6 +204,8 @@ th.attr-unknown { color: #dc2626; }
     <div style="margin-top:10px; font-size:13px;">
       <span class="muted" id="action-result"></span>
     </div>
+    <%# 読み直しで戻した未保存の入力の知らせ (2026-09-21)。中身は JS が作る %>
+    <div id="unsaved-zone"></div>
   </div>
 
   <!-- タブバー。バッジ = 未入力の主要な必須項目数。
@@ -276,7 +289,7 @@ th.attr-unknown { color: #dc2626; }
     <details class="hdr-help" style="margin:0 0 6px;">
       <summary>送られる値・項目の場所</summary>
       <p>
-        税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と カタログID (JAN<%= (variation && variation.kind === 'variation' && variation.memberCount > 1) ? ' — SKU表の値をSKUごとに' : ': ' + (draft.jan_code || '未入力') %>) は基本情報タブの値を自動で送ります。
+        <% const phTaxMode = (typeof taxMode !== 'undefined' && taxMode) || 'legacy'; %>税率 (<%= phTaxMode === 'cdb' ? ('Company DB の税率 = ' + ((typeof cdbTax !== 'undefined' && cdbTax && cdbTax.ok) ? cdbTax.label : '決まっていない = 出品は止まります')) : phTaxMode === 'readonly' ? ((yahoo?.tax_rate || '未設定') + '。切替の状態を読めないので、いまは出品できません (少し待ってもう一度)') : (yahoo?.tax_rate || '未設定 = 店舗デフォルト10%') %>) と カタログID (JAN<%= (variation && variation.kind === 'variation' && variation.memberCount > 1) ? ' — SKU表の値をSKUごとに' : ': ' + (draft.jan_code || '未入力') %>) は基本情報タブの値を自動で送ります。
         在庫は常に 0 で登録します。<br>
         配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
         </p>
@@ -374,7 +387,7 @@ th.attr-unknown { color: #dc2626; }
               </td>
               <td>
                 <select class="wf-state" <%= editable ? '' : 'disabled' %>
-                        title="<%= editable ? '' : (isDetailKind && workflow.detailExcluded ? '詳細画像は対象外です' : (s.track === 'image' && s.role_code ? '画像の工程は 画像登録者・画像作成承認者 の役割がある人が操作します' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : 'システムが進める工程です')))) %>">
+                        title="<%= editable ? '' : (isDetailKind && workflow.detailExcluded ? '詳細画像は対象外です' : (s.track === 'image' && s.role_code ? '画像の工程は 画像登録者・画像作成承認者 の役割がある人が操作します' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : (s.step_code === 'ai_generate' ? 'AI が進める工程です。AI を待たずに進めるときは工程ボードでカードを動かしてください' : 'システムが進める工程です'))))) %>">
                   <% for (const code of Object.keys(stepStateLabels)) { %>
                     <%# 「対象外」は工程を飛ばすので admin だけ。TOP画像の工程はサムネ必須のため admin でも不可、
                         詳細画像を丸ごと作らない場合は下の「詳細画像は対象外」を使う (商品単位のフラグ) %>
@@ -726,6 +739,10 @@ th.attr-unknown { color: #dc2626; }
     <button type="button" class="tab-btn" data-tab="tab-category">🗂 カテゴリ・属性<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-desc">📝 商品説明<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-images">🖼 画像<span class="tab-badge" hidden></span></button>
+    <% if (draft.own_brand && adKeywords) { %>
+      <%# SP広告 検索KW (2026-09-23 PR1)。自社商品だけ。工程には足さない (足すと楽天出品が止まる副作用) %>
+      <button type="button" class="tab-btn" data-tab="tab-adkw">📣 SP広告KW<span class="tab-badge" hidden></span></button>
+    <% } %>
     <span class="muted" style="margin-left:6px;">赤い数字 = 未入力の主要な必須項目 (内訳はマウスオーバー。最終チェックは「送信内容を確認」で)</span>
   </div>
 
@@ -843,8 +860,22 @@ th.attr-unknown { color: #dc2626; }
         </div>
         <div style="flex:1">
           <!-- 税率は基本情報 (2026-08-06 中原さん指示: Yahoo!欄から移動)。楽天・Yahoo!両方の登録で使う -->
+          <% const phTaxModeB = (typeof taxMode !== 'undefined' && taxMode) || 'legacy'; %>
+          <% if (phTaxModeB === 'readonly') { %>
+          <%# 段階を読めない (中間レビュー 2 回目 M-B): 今の値を見るだけ。手入力の欄 (id="y-tax") は出さない = 税率を送らない (ほかの欄の保存は通る) %>
+          <label>税率 <span class="muted">(見るだけ)</span></label>
+          <input type="text" id="y-tax-view" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="未設定" readonly disabled>
+          <div class="muted" style="font-size:12px;">切替の状態を読めないので、いまは税率を変えられません (少し待って開き直す)</div>
+          <% } else if (phTaxModeB === 'cdb') { %>
+          <%# 税率の列の古い入口が閉じた後 (frozen 以降で skus.tax_rate が C (active ∪ prepared)・Company DB構想 10 §4 #6・⑤-3b): 手入力の欄 (id="y-tax") は出さない = 保存でも即保存でも税率を送らない。Company DB の税率を見せるだけ %>
+          <% const cdbTaxView = (typeof cdbTax !== 'undefined' && cdbTax) ? cdbTax : { ok: false, reason: '読めません' }; %>
+          <label>税率 <span class="muted">(Company DB の税率・見るだけ)</span></label>
+          <input type="text" id="y-tax-cdb" value="<%= cdbTaxView.ok ? cdbTaxView.label : '' %>" placeholder="<%= cdbTaxView.ok ? '' : cdbTaxView.reason %>" readonly disabled>
+          <div class="muted" style="font-size:12px;"><a href="<%= masterLegacy.url %>" target="_blank" rel="noopener">マスタは新しい画面で直します ↗</a></div>
+          <% } else { %>
           <label>税率 <span class="muted">(登録時にNEから初期値)</span><span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
+          <% } %>
         </div>
       </div>
       <!-- 配送・納期。売価とセットで見たい (利益に効く) ため基本情報タブに配置 (2026-07-29 中原さん要望)。
@@ -964,6 +995,25 @@ th.attr-unknown { color: #dc2626; }
       </div>
       <div class="field">
         <label><input type="checkbox" id="f-own-brand" style="width:auto" <%= draft.own_brand ? 'checked' : '' %>> 自社商品 (画像制作ワークフローを使う)</label>
+      </div>
+      <%# 既存の楽天ページへの追加か (2026-09-25 スタッフ要望)。選ぶと即保存。ボードのカードに「📄 既存ページ」の札が出る %>
+      <div class="field">
+        <label for="f-existing-page">楽天ページ</label>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <%# 色追加のカードは既存ページのまま (サーバーも 400 で断る) %>
+          <select id="f-existing-page" style="width:auto" data-saved="<%= existingPage.choice %>" <%= existingPage.addedTo ? 'disabled title="出品済みのページに色を足すカードなので変えられません"' : '' %>>
+            <% for (const c of existingPageChoices) { %>
+              <option value="<%= c.value %>" <%= existingPage.choice === c.value ? 'selected' : '' %>><%= c.label %></option>
+            <% } %>
+          </select>
+          <span class="muted" id="existing-page-note" style="font-size:12px;"><%= existingPage.auto ? `自動判定: ${existingPage.existingPage ? '既存ページに追加' : '新規ページ'}` : '' %></span>
+        </div>
+        <% if (existingPage.addedTo) { %>
+          <div style="font-size:13px; margin-top:4px;">📄 出品済みのページ
+            <a href="/apps/product-hub/detail/<%= existingPage.addedTo.id %>"><%= existingPage.addedTo.ne_code || `#${existingPage.addedTo.id}` %></a>
+            に NE で色 (SKU) が足されたので出したカードです。楽天のページは RMS で手で編集してください</div>
+        <% } %>
+        <div class="muted" style="font-size:12px;">既存ページに追加する商品 (カラバリ追加など) は、楽天のページ編集を目視・手作業で行います (このアプリからは楽天に出品しません)。自動判定 = NE の同じ代表商品コードに前からある商品があるか</div>
       </div>
       <!-- 画像フォルダURL は画像タブ「画像フォルダから自動セット」に一本化 (2026-08-06 中原さん指示: 二重入力欄の解消) -->
       <div class="field">
@@ -1562,6 +1612,87 @@ th.attr-unknown { color: #dc2626; }
             <textarea id="prompt-text" rows="16" style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
           </div>
         </div>
+          <%# 🤖 構成をAIに作らせる (段階1・PR1-d)。既存の「📝 商品分析を準備」は残す (退避路)。
+              押す = キューに積むだけ。書き戻した構成は**ここに出るだけ**で、
+              人がコピーして lp-tool に貼るところまでは変わらない %>
+          <% if (lpCompose.enabled) { %>
+          <div id="lpc" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;"
+               data-draft-id="<%= draft.id %>" data-ne-code="<%= draft.ne_code || '' %>" data-name="<%= draft.name || '' %>">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <%# モデル名をボタンに出す (2026-10-02 中原さん)。決める場所は Render の PH_LP_COMPOSE_MODEL だけ %>
+              <button type="button" class="btn" id="lpc-btn">🤖 構成をAIに作らせる<%= lpCompose.model_label ? ' (' + lpCompose.model_label + ')' : '' %></button>
+              <span class="muted" id="lpc-status" style="font-size:12px;"></span>
+            </div>
+            <div class="muted" id="lpc-spec" style="font-size:11px; margin-top:4px;"></div>
+            <%# AI に渡す (渡した) 画像の並び。測定で比べるときはスタッフ版 (ChatGPT) にも同じ画像を同じ順に添付する
+                (codex #1592 High: 同じ材料から作った 2 つを比べるのが測定の前提) %>
+            <div class="muted" id="lpc-images" style="font-size:11px; margin-top:2px;"></div>
+            <%# 添付画像の説明 = AI に渡したのと同じ文。くらべっこ (測定) を公平にするため、スタッフの ChatGPT 版にも貼る
+                (codex #1593 High・中原さん 2026-10-03「A」) %>
+            <div id="lpc-guide" hidden style="margin-top:6px; background:#fff; border:1px dashed #cbd5e1; border-radius:8px; padding:6px 8px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <strong style="font-size:12px;">ChatGPT 版に貼る文 (添付画像の説明)</strong>
+                <button type="button" class="btn btn-sm" id="lpc-guide-copy">コピー</button>
+                <span class="muted" id="lpc-guide-result" style="font-size:12px;"></span>
+              </div>
+              <div class="muted" style="font-size:11px; margin:2px 0 4px;">
+                くらべるとき: 「📝 商品分析を準備」の文の最後にこれを貼り、画像をこの順に添付してください (AI にも同じ文を渡しています)
+              </div>
+              <textarea id="lpc-guide-text" rows="6" readonly style="width:100%; font-size:12px;"></textarea>
+            </div>
+            <%# 🚨 失敗したときの説明はここ。lint の中身 (lpc-lint) は「できた」ときの箱の中にあるので、
+                失敗したときは見えない (codex exec review P2) %>
+            <div id="lpc-fail" hidden class="muted" style="font-size:11px; margin-top:4px; color:#b45309;"></div>
+            <%# チェック (Codex 検品など) を通らなかった構成 (参考)。捨てずに出して、使えるかは人が決める
+                (2026-10-04 中原さん「A」: 段階1 は AI と人のくらべっこなので、落ちた構成も比べる材料) %>
+            <div id="lpc-draft" hidden style="margin-top:8px; background:#fffbeb; border:1px solid #fcd34d; border-radius:8px; padding:8px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:4px;">
+                <strong style="font-size:13px;">⚠️ チェックを通らなかった構成 (参考)</strong>
+                <button type="button" class="btn btn-sm" id="lpc-draft-copy">コピー</button>
+                <span class="muted" id="lpc-draft-result" style="font-size:12px;"></span>
+              </div>
+              <div class="muted" style="font-size:11px; margin-bottom:4px;">
+                AI は最後まで書きましたが、チェック役に指摘が残りました。下の「指摘されたこと」を読んで、使えるかどうかを決めてください
+              </div>
+              <div id="lpc-draft-reason" style="font-size:12px; white-space:pre-wrap; background:#fff; border:1px solid #fde68a; border-radius:6px; padding:6px; margin-bottom:6px;"></div>
+              <textarea id="lpc-draft-text" rows="12" readonly style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
+            </div>
+            <%# 測定台帳 (設計 §7.1b) に書き写す値。画面は作らない方針なので、
+                台帳に要る「機械が知っている事実」だけをここに並べる %>
+            <div id="lpc-meas" hidden class="muted" style="font-size:11px; margin-top:4px; font-family:ui-monospace, monospace; word-break:break-all;"></div>
+            <div id="lpc-result" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
+                <strong style="font-size:13px;">AI が作った構成 (⑦ AI画像生成プロンプト)</strong>
+                <button type="button" class="btn btn-primary btn-sm" id="lpc-copy">コピー</button>
+                <a class="btn btn-sm" id="lpc-open" href="#" target="_blank" rel="noopener">lp-tool を開く</a>
+                <span class="muted" id="lpc-copy-result" style="font-size:12px;"></span>
+              </div>
+              <div class="muted" id="lpc-lint" style="font-size:11px; margin-bottom:6px;"></div>
+              <textarea id="lpc-text" rows="16" readonly style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
+              <div class="muted" style="font-size:11px; margin-top:4px;">
+                🚨 <strong>そのまま使わないでください。</strong>初稿です。中身を読んでから lp-tool に貼ってください
+                (材料に無い効果・数値・認証が混じっていないか、商品の形・容量が合っているか)。
+              </div>
+            </div>
+          </div>
+          <%# 🚨 `<` は必ず潰す。本文は **AI が書いたもの** なので `</script>` を含みうる。
+              潰さないとそこで script が閉じて、以降の画面が丸ごと壊れる (prompt-templates-json と同じ作り) %>
+          <script type="application/json" id="lpc-json"><%- JSON.stringify(lpCompose).replace(/</g, '\\u003c') %></script>
+          <% } %>
+          <%# 🖼 画像を作る (段階2・2026-10-04 中原さん)。できた構成から gpt-image-2.5 で画像を作り、
+              商品の画像フォルダの中の「AI初稿」に保存する。人が押したときだけ・月の上限つき %>
+          <% if (typeof lpImage !== 'undefined' && lpImage && lpImage.enabled) { %>
+          <div id="lpi" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0;"
+               data-draft-id="<%= draft.id %>">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <button type="button" class="btn" id="lpi-btn">🖼 画像を作る</button>
+              <span class="muted" id="lpi-status" style="font-size:12px;"></span>
+            </div>
+            <div class="muted" id="lpi-meta" style="font-size:11px; margin-top:4px;"></div>
+            <div id="lpi-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px; margin-top:8px;"></div>
+          </div>
+          <script type="application/json" id="lpi-json"><%- JSON.stringify(lpImage).replace(/</g, '\\u003c') %></script>
+          <% } %>
         <script type="application/json" id="prompt-templates-json"><%- JSON.stringify(promptTemplates).replace(/</g, '\\u003c') %></script>
         <%# 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列「仮構成」とは別。ボードのカードに「構成：まだ／済」で出る %>
         <div class="field" style="padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;">
@@ -1572,7 +1703,7 @@ th.attr-unknown { color: #dc2626; }
             <% if (composeState.done) { %><strong style="color:#15803d;">済</strong><% } else { %><strong>まだ</strong><% } %>
             <span class="muted" style="font-size:12px;">
               <% if (composeState.marked) { %><%= String(ip.compose_updated_at || '').slice(0, 16).replace('T', ' ') %> <%= ip.compose_updated_by || '' %>
-              <% } else if (composeState.implied) { %>(③素材待ちが済んでいるので 済 とみなしています)
+              <% } else if (composeState.implied) { %>(④AI制作が済んで ⑤デザイン修正 に移っているので 済 とみなしています)
               <% } else { %>(本番の構成ができたら押す。縦列「仮構成」とは別)<% } %>
             </span>
             <%# 推定の 済 でも「まだに戻す」を出す (人の値が推定より優先 — Codex R1) %>
@@ -2009,7 +2140,7 @@ th.attr-unknown { color: #dc2626; }
       for (const n of gridData.names) if (!gridNames.includes(n)) gridNames.push(n);
       const skuKeyOf = (m) => String(m.商品コード || '').trim().toLowerCase();
     %>
-    <label>カタログID・商品仕様 <span class="muted">(RMSの「製品情報」と同じ表。列 = <%= isVariationPage ? 'SKU' : 'この商品' %>、行 = 項目。「ジャンル情報を取得」で必須の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
+    <label>カタログID・商品仕様 <span class="muted">(RMSの「製品情報」と同じ表。列 = <%= isVariationPage ? 'SKU' : 'この商品' %>、行 = 項目。「ジャンル情報を取得」で必須の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式は「ジャンル情報を取得」を押すと楽天の選択肢から選べます。選択肢が出ない項目はRMSと同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
     <% if (isVariationPage) { %>
       <p class="muted" style="margin:0 0 6px; font-size:12px;">
         入力欄を離れると<strong>即保存</strong>。「一括入力」で全SKUに同じ値を入れられます。JANが無いSKUは「IDなし」を選んで理由を選択。
@@ -2159,7 +2290,7 @@ th.attr-unknown { color: #dc2626; }
             </td>
             <td><input type="text" class="rk-attr-value" value="<%= (a.values && a.values[0]) || '' %>">
               <% if (da && da.inputMethod === 'SELECTIVE') { %>
-                <div class="muted" style="font-size:11px; color:#b45309;">
+                <div class="muted rk-attr-selective" style="font-size:11px; color:#b45309;">
                   ⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)
                 </div>
               <% } %>
@@ -2178,7 +2309,7 @@ th.attr-unknown { color: #dc2626; }
     <div id="rk-attr-unknown" style="margin-top:10px;"></div>
     <div id="rk-attr-suggest" style="margin-top:10px;"></div>
     <%# 候補ボタン用にジャンルの全属性 (必須+任意)。名前・必須・入力方式・単位・上限だけあれば足りる %>
-    <script type="application/json" id="rk-attrdict-json"><%- JSON.stringify(genreDict ? genreDict.attributes.map((a) => ({ name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null, unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null })) : []).replace(/</g, '\\u003c') %></script>
+    <script type="application/json" id="rk-attrdict-json"><%- JSON.stringify(genreDict ? genreDict.attributes.map((a) => ({ name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null, unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null, options: Array.isArray(a.options) ? a.options : null })) : []).replace(/</g, '\\u003c') %></script>
     <script type="application/json" id="rk-model-attr-json"><%- JSON.stringify(modelAttrName) %></script>
 
 
@@ -2214,6 +2345,875 @@ th.attr-unknown { color: #dc2626; }
     </div>
   </div>
   </div><!-- /tab-category -->
+
+  <% if (draft.own_brand && adKeywords) { %>
+  <!-- ═══ タブ6: SP広告 検索KW (2026-09-23 PR1・『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5) ═══
+       サジェスト収集 (miniPC 経由・種 1 つずつ同期) → 観測語の採否 → マッチタイプ別コピー。
+       AI 提案・ABA・除外KW・商品ターゲットは後続 PR。Amazon (Ads API) には書き込まない。
+       画面は adkw-json の状態から JS が描く (収集のたびに state を受け取って描き直す。ページは読み直さない) -->
+  <div class="tab-panel" id="tab-adkw">
+    <div class="card" style="border-color:#fde68a; background:#fffdf5;">
+      <h2>📣 SP広告 検索キーワード — サジェスト収集・採用支援</h2>
+      <p class="muted" style="margin-top:-6px;">
+        頭で考えた種キーワードを入れると、Amazon の検索ボックスに出るサジェスト (そのまま + あ〜わ) を会社の回線 (miniPC) から集めます。
+        出てきた語を人が採用・保留・却下し、採用した語をマッチタイプ別にコピーして、Amazon の広告画面に<strong>手で</strong>貼ります。<br>
+        🚨 ここから Amazon に登録はされません (「コピー済み」は「Amazon 登録済み」ではありません)。
+        競合 ASIN は ABA から自動で出す (最初から採用・要らないものを却下) か、人が入れます (商品ターゲットの候補)。その ASIN が<strong>クリック上位 3 商品に入った検索語</strong>を、miniPC に取込済みの週の ABA (Amazon ブランド分析) から引けます (該当なし ≠ 注文なし)。
+        「🌙 おまかせ」= 自社商品は、夜に AI が Amazon のタイトルから種キーワードを考え、サジェストと ABA を集め、案まで自動で作ります (1 晩 3 商品・新しい商品から。人は朝に採否を決めてコピーするだけ)。「🤖 AI の案 (夜間)」= 自分で集めた材料をもとに、夜間に AI が検索キーワードの案を出します (未採用で並ぶ・観測は未確認)。除外キーワードはまだありません (次の段階)。自社広告のクリック・注文・ACOS は未取得です。
+      </p>
+      <script type="application/json" id="adkw-json"><%- JSON.stringify({ draftId: draft.id, state: adKeywords }).replace(/</g, '\\u003c') %></script>
+      <div id="adkw-root"><span class="muted">読み込み中…</span></div>
+    </div>
+  </div>
+  <script>
+  // SP広告KW タブ。状態 (adkw-json) から DOM を組む。innerHTML に文字列を流さない (候補の語は外部由来)
+  (function initAdKeywords() {
+    const boot = document.getElementById('adkw-json');
+    const root = document.getElementById('adkw-root');
+    if (!boot || !root) return;
+    let draftId = null, state = null;
+    try { const j = JSON.parse(boot.textContent); draftId = j.draftId; state = j.state; } catch (e) { state = null; }
+    if (!state) { root.textContent = '状態を読めませんでした。ページを読み直してください'; return; }
+    const API = '/apps/product-hub/api/drafts/' + draftId + '/ad-keywords';
+    // 依頼の冪等キー = 「新しい依頼を作る」1 回の意図ごとに 1 つ。通信に失敗して再送しても同じ依頼になる。
+    // 依頼ができたら捨てる (取消・置き換えのあとに同じキーを送ると、閉じた依頼に当たって詰まる)
+    let pendingKey = null;
+    const newKey = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(36).slice(2));
+    let busy = false;
+    // 世代 = この画面で状態を変えた回数。遅れて届いた応答 (古い GET・古い収集) で新しい状態を巻き戻さないための番号
+    let gen = 0;
+    // 依頼の切替世代 = 置き換え・取消・(別画面での切替を GET で知った) の回数。切替前に送った採否・固定・収集の応答は、
+    // 届いても捨てる (旧依頼の応答が gen を進めて、切替後の GET を無効にしないため。R4 #2)
+    let reqGen = 0;
+    // 保存中の候補 (id)。GET で描き直されても「保存中」のまま出し、応答はいま表示している行に反映する (R3 #3)
+    const inflight = new Map();
+    const rowOf = (cid) => root.querySelector('tr[data-cid="' + cid + '"]');
+    const rerow = (cand) => { const row = rowOf(cand.id); if (row) row.replaceWith(candidateRow(cand)); };
+
+    // throw しない (通信断でも {ok:false} を返す。呼び手は finally で欄を戻し、refresh で保存結果を確かめる)
+    async function api(path, body) {
+      let res;
+      try {
+        res = await fetch(API + path, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+        });
+      } catch (e) {
+        return { ok: false, network: true, error: '通信できません (' + (e && e.message ? e.message : e) + ')。サーバーには届いているかもしれないので、画面を読み直して確かめてください' };
+      }
+      let json = null;
+      try { json = await res.json(); } catch (e) { json = null; }
+      // ヘッダーは来たが本文を読めなかった = サーバーでは処理済みかもしれない「結果不明」(通信断と同じ扱い。R3 #4)
+      if (!json) return { ok: false, network: true, error: 'サーバーの応答を読めません (HTTP ' + res.status + ')。届いているかもしれないので、画面を読み直して確かめてください' };
+      return json;
+    }
+    // 状態を取り直す。取りに行っている間にこの画面で状態が変わった (世代が進んだ) / 収集中 なら、古い応答は捨てる
+    async function refresh() {
+      const myGen = gen;
+      try {
+        const res = await fetch(API, { headers: { Accept: 'application/json' } });
+        const json = await res.json().catch(() => null);
+        if (!json || !json.ok || !json.state) return false;
+        if (gen !== myGen || busy) return false;   // 古い応答 (この画面が先に進んでいる) は適用しない
+        // 別の画面で依頼が切り替わっていた → 切替前に送った応答をこれ以降捨てる
+        const before = state.request ? state.request.id : null, after = json.state.request ? json.state.request.id : null;
+        if (before !== after) reqGen += 1;
+        state = json.state;
+        gen += 1;   // 状態が変わった = 応答を待っている操作 (ASIN 追加・収集) は古い state を適用しない (Codex #1413 R2)
+        render();
+        return true;
+      } catch (e) { return false; /* 通信断。次の操作か自動再取得でもう一度 */ }
+    }
+    // 別の画面が収集している間は 5 秒ごとに状態を取り直す (終わった・3 分過ぎた をこの画面でも検知する)。
+    // 予約は 1 か所で管理し、GET が失敗しても・この画面の収集が終わっても、必要なら続ける
+    let pollTimer = null;
+    const collectingElsewhere = () => !!(state.request && state.request.status === 'collecting' && !state.request.collecting_stale);
+    function schedulePollIfNeeded() {
+      clearTimeout(pollTimer);
+      if (!collectingElsewhere() || busy) return;
+      pollTimer = setTimeout(async () => { await refresh(); schedulePollIfNeeded(); }, 5000);
+    }
+    function el(tag, attrs, children) {
+      const n = document.createElement(tag);
+      if (attrs) for (const k of Object.keys(attrs)) {
+        if (k === 'class') n.className = attrs[k];
+        else if (k === 'style') n.setAttribute('style', attrs[k]);
+        else if (k.slice(0, 2) === 'on') n.addEventListener(k.slice(2), attrs[k]);
+        else if (k === 'text') n.textContent = attrs[k];
+        else if (attrs[k] === false || attrs[k] == null) { /* 付けない */ }
+        else n.setAttribute(k, attrs[k] === true ? '' : attrs[k]);
+      }
+      for (const c of (children || [])) {
+        if (c == null) continue;
+        n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+      }
+      return n;
+    }
+    // DB の時刻は UTC (strftime 'now')。見る人の時計 (日本) に直して 分まで
+    const fmtTime = (iso) => {
+      const t = iso ? Date.parse(iso) : NaN;
+      if (!Number.isFinite(t)) return '';
+      const d = new Date(t), p = (n) => String(n).padStart(2, '0');
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+    };
+    const L = state.labels;
+
+    function render() {
+      // 入力途中の種は描き直しても消さない (別画面の収集を 5 秒ごとに確かめている間に打っていることがある)
+      const prevSeed = document.getElementById('adkw-seed'), prevAlpha = document.getElementById('adkw-alpha');
+      const keepSeed = prevSeed ? prevSeed.value : '', keepAlpha = prevAlpha ? prevAlpha.checked : false;
+      const prevAsin = document.getElementById('adkw-asin');
+      const keepAsin = prevAsin ? prevAsin.value : '';   // 入力途中の競合 ASIN も消さない
+      root.textContent = '';
+      const req = state.request;
+      if (!state.configured) {
+        root.appendChild(el('div', { class: 'muted', style: 'padding:8px 10px; border:1px solid #fecaca; background:#fef2f2; border-radius:8px; margin-bottom:10px; color:#991b1b;',
+          text: 'miniPC を呼ぶ設定 (WAREHOUSE_SERVICE_TOKEN) がこのサーバーに無いため、サジェストを集められません。既に集めた候補の採否とコピーはできます。' }));
+      }
+      // ── おまかせ (夜の自動・PR3c)。自社商品は毎晩 AI が種 KW → サジェスト・ABA → 最終案まで作る。人は朝に採否とコピーだけ
+      if (state.ai && state.ai.auto) root.appendChild(autoSection());
+      // ── 依頼の状態
+      const head = el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:10px; font-size:13px;' });
+      if (!req) {
+        head.appendChild(el('span', { class: 'muted', text: (state.ai && state.ai.auto && state.ai.auto.waiting)
+          ? 'まだ集めていません。夜に AI がおまかせで集めます (自分で集めるなら種キーワードを入れて「サジェストを集める」)'
+          : 'まだ集めていません。種キーワードを入れて「サジェストを集める」を押してください' }));
+      } else {
+        head.appendChild(el('span', { text: '依頼 #' + req.id + '（' + fmtTime(req.created_at) + (req.requested_by ? '・' + req.requested_by : '') + '）' }));
+        if (req.status === 'collecting' && !req.collecting_stale) {
+          head.appendChild(el('span', { class: 'badge badge-ready_for_ai', text: '「' + (req.collecting_seed || '') + '」を収集中' }));
+        }
+        if (state.stale) {
+          head.appendChild(el('span', { class: 'badge badge-excluded', text: '旧情報に基づく候補 (商品名・コード・ASIN が依頼のあとで変わりました)' }));
+        }
+        head.appendChild(el('button', { type: 'button', class: 'btn btn-sm', onclick: () => restart(),
+          text: '🔄 新しい依頼にする', title: 'いまの候補と採否はこの依頼に残り、画面からは消えます (上書きはしません)' }));
+        head.appendChild(el('button', { type: 'button', class: 'btn btn-sm btn-danger', onclick: () => cancel(), text: '取り消す' }));
+      }
+      root.appendChild(head);
+
+      // ── 種の入力
+      const seedInput = el('input', { type: 'text', id: 'adkw-seed', maxlength: String(state.limits.seed_max_len), placeholder: '例: ハッカ油 スプレー', style: 'flex:1; min-width:220px;', value: keepSeed });
+      const alphaChk = el('input', { type: 'checkbox', id: 'adkw-alpha', style: 'width:auto;' });
+      alphaChk.checked = keepAlpha;
+      const collectBtn = el('button', { type: 'button', class: 'btn btn-primary', id: 'adkw-collect', text: 'サジェストを集める (約 10〜20 秒)' });
+      const progress = el('span', { class: 'muted', id: 'adkw-progress' });
+      const collecting = collectingElsewhere();
+      if (!state.configured || collecting) collectBtn.disabled = true;
+      if (collecting) progress.textContent = '別の画面で収集中です。終わるまで待ってください (5 秒ごとに確かめます)';
+      schedulePollIfNeeded();
+      collectBtn.addEventListener('click', () => collect(seedInput.value, alphaChk.checked, { seedInput, collectBtn, progress }));
+      seedInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); collectBtn.click(); } });
+      root.appendChild(el('div', { class: 'field' }, [
+        el('label', { text: '種キーワード (頭で考えた語。1 つずつ・' + state.limits.seed_max_len + ' 文字まで・1 依頼 ' + state.limits.max_seeds + ' 個まで)' }),
+        el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center;' }, [
+          seedInput,
+          el('label', { style: 'display:flex; align-items:center; gap:4px; font-weight:normal; white-space:nowrap;' }, [alphaChk, 'a〜z も付けて集める (+26 回)']),
+          collectBtn, progress,
+        ]),
+      ]));
+
+      // ── 取得範囲 (種ごと)
+      if (state.seeds.length) {
+        const tb = el('tbody');
+        for (const s of state.seeds) {
+          const badgeClass = s.status === 'success' ? 'badge-approved' : s.status === 'partial' ? 'badge-ready_for_ai' : s.status === 'failed' ? 'badge-excluded' : 'badge-on_hold';
+          // 全部失敗でも取得範囲 (何回失敗・何回未実行) は隠さない。通信そのものが成立しなかったときだけ理由だけになる
+          const rangeText = s.status === 'failed' ? [s.error || '取得できませんでした', s.coverage_text].filter(Boolean).join('。') : s.coverage_text;
+          const withAlpha = !!(s.options && s.options.alphabet);
+          const cells = [
+            el('td', {}, [s.seed, withAlpha ? el('span', { class: 'muted', text: ' (a〜z 込み)' }) : null,
+              s.fetch_count > 1 ? el('span', { class: 'muted', text: ' (取得 ' + s.fetch_count + ' 回)' }) : null]),
+            el('td', {}, [el('span', { class: 'badge ' + badgeClass, text: s.status_ja })]),
+            el('td', { class: 'muted', text: rangeText }),
+            el('td', { class: 'muted', text: s.fetched_text || '—' }),
+            el('td', { style: 'text-align:right;', text: String(s.candidate_count) }),
+            el('td', { style: 'text-align:right;', text: String(s.new_count) }),
+          ];
+          const act = el('td');
+          if ((s.status === 'failed' || s.status === 'partial') && state.configured && !collecting) {
+            act.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: s.status === 'failed' ? 'もう一度' : '取り直す',
+              title: s.status === 'failed' ? '同じ条件でもう一度集める' : '失敗・未実行が残っている分を含めて同じ条件で取り直す (取れていた語と採否はそのまま)',
+              onclick: () => collect(s.seed, withAlpha, { collectBtn, progress }, s.status === 'partial') }));
+          }
+          cells.push(act);
+          tb.appendChild(el('tr', {}, cells));
+        }
+        root.appendChild(el('details', { open: true, style: 'margin:10px 0;' }, [
+          el('summary', { style: 'cursor:pointer; font-weight:600; font-size:13px;', text: '取得範囲 (' + state.seeds.length + ' 種)' }),
+          el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:6px;' }, [
+            el('thead', {}, [el('tr', {}, ['種', '状態', '取得範囲 (サジェストの口を叩いた回数ごとの結果)', '出典', '観測した語', 'うち初出', ''].map((h) => el('th', { text: h })))]),
+            tb,
+          ])]),
+        ]));
+      }
+
+      // ── 夜間 AI に検索 KW の案を頼む (PR3a)。材料 (観測語・採用語・商品情報) は依頼した時点で固定。AI の案は未採用で並ぶ
+      if (req && state.ai) root.appendChild(aiSection());
+
+      // ── 候補と採否
+      if (state.candidates.length) {
+        // 語は「最初に観測した種」の下に並べる (取り直しても動かない)
+        const bySeed = new Map();
+        for (const c of state.candidates) {
+          // いま観測が無い AI の語は「AI 提案」のグループ (PR3a)。あとでサジェスト等に観測されたら、その種のグループへ (origin では決めない — Codex #1429 R1 #1)
+          const key = (c.origin === 'ai' && c.observed.length === 0) ? '\u0000ai' : (c.seed || '');
+          if (!bySeed.has(key)) bySeed.set(key, []);
+          bySeed.get(key).push(c);
+        }
+        const seedOf = new Map(state.seeds.map((s) => [s.seed, s]));
+        const wrap = el('div', { style: 'margin-top:10px;' });
+        wrap.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:6px;' }, [
+          el('span', { id: 'adkw-count', style: 'font-weight:600; font-size:13px;', text: '候補 ' + state.candidates.length + ' 語 (採用 ' + state.adopted_count + ')' }),
+          el('span', { class: 'muted', text: '並びは 種 → サジェストの出方 (そのまま → あ〜わ → a〜z) → 語。ABA の語は 競合 ASIN → 検索頻度順位。総合点は付けていません' }),
+        ]));
+        for (const [seedKey, list] of bySeed) {
+          const s = seedOf.get(seedKey);
+          // 最初の観測が ABA の語 = 「競合 ASIN の検索語」のグループ (§4.8 の文言。サジェストの文言を使い回さない)
+          const isAba = !!(list[0] && list[0].first_source === 'aba');
+          const abaOf = isAba ? ((state.asins || []).find((x) => x.asin === seedKey) || {}).aba : null;
+          const firstObs = isAba ? (list[0].observed.find((o) => o.source === 'aba') || {}) : null;
+          const tb = el('tbody');
+          for (const c of list) tb.appendChild(candidateRow(c));
+          const isAi = seedKey === '\u0000ai';
+          wrap.appendChild(el('details', { open: true, style: 'margin:6px 0;' }, [
+            el('summary', { style: 'cursor:pointer; font-size:13px;' }, isAi ? [
+              el('strong', { text: '🤖 AI 提案 ' + list.length + ' 語' }),
+              el('span', { class: 'muted', text: '　AI 提案。サジェスト／ABA での観測は未確認 (出したときの材料には無かった語)。理由は AI の説明で、広告成果は未検証。初期状態は未採用です' }),
+            ] : isAba ? [
+              el('strong', { text: '競合 ASIN「' + seedKey + '」がクリック上位 3 商品に含まれた検索語 ' + list.length + ' 語' }),
+              el('span', { class: 'muted', text: '　対象週 ' + (firstObs.week_text || '不明') + (abaOf && abaOf.week_text && abaOf.week_text !== firstObs.week_text ? '（最新の取得は ' + abaOf.week_text + '）' : '')
+                + '。ABA = 検索語ごとのクリック上位 3 商品とシェアであって、競合の全注文語でも広告成果でもない。順位 = 検索頻度順位 (小さいほど多く検索された)・位置 = その語のクリック上位 3 の中の順・シェア = その語のクリック / 購入に占める割合'
+                + ((state.asins || []).some((x) => x.asin === seedKey && x.aba_candidate_count > list.length) ? '　(サジェストで先に出た語はその種の側に表示)' : '') }),
+            ] : [
+              el('strong', { text: '「' + seedKey + '」で初めて出た ' + list.length + ' 語' }),
+              el('span', { class: 'muted', text: '　Amazon サジェストで観測。検索回数は不明 (取得日は各行)' + (s && s.candidate_count > list.length ? '　(別の種で先に出た ' + (s.candidate_count - list.length) + ' 語はその種の側に表示)' : '') }),
+            ]),
+            el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:4px;' }, [
+              el('thead', {}, [el('tr', {}, ['語', isAi ? 'AI の理由・根拠にした観測語' : isAba ? 'ABA の順位・位置・シェア (対象週)' : '出方', '採否 (人が決める)', '採用する語 (直せる)', '記録'].map((h) => el('th', { text: h })))]),
+              tb,
+            ])]),
+          ]));
+        }
+        root.appendChild(wrap);
+      } else if (req) {
+        root.appendChild(el('p', { class: 'muted', text: 'まだ候補がありません (取得が 0 件だったか、失敗しています)' }));
+      }
+
+      // ── 競合 ASIN (商品ターゲット)。ABA から自動で出す (最初から採用・要らないものを人が却下) + 人の入力。PR2-C / 2026-09-23
+      if (req) {
+        const asins = state.asins || [];
+        const asinInput = el('input', { type: 'text', id: 'adkw-asin', placeholder: '例: B0XXXXXXXX, B0YYYYYYYY (Amazon の URL でも可)', style: 'flex:1; min-width:260px;', value: keepAsin });
+        const asinBtn = el('button', { type: 'button', class: 'btn', id: 'adkw-asin-add', text: '競合 ASIN を追加' });
+        const asinMsg = el('span', { class: 'muted', id: 'adkw-asin-msg' });
+        asinBtn.addEventListener('click', () => addAsins(asinInput, asinBtn, asinMsg));
+        asinInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); asinBtn.click(); } });
+        // ABA から自動で出す (2026-09-23)。採用済みの検索 KW ごとのクリック上位 3。出てきたものは「採用 (自動)」で入る → 要らないものを却下
+        const autoBtn = autoAsinsButton();
+        const au = state.auto_asins;
+        const autoLine = el('div', { class: 'muted', id: 'adkw-auto-summary', style: 'font-size:12px;' });
+        if (au) {
+          autoLine.textContent = '前回の自動: ' + fmtTime(au.fetched_at || '') + '・'
+            + (au.status === 'failed' ? '取れませんでした (' + (au.error || '') + ')'
+              : '対象週 ' + (au.week_text || '不明') + (au.week_coverage && au.week_coverage !== 'complete' ? ' (' + (au.week_coverage_ja || au.week_coverage) + ')' : '')
+                + '・語 ' + au.terms_sent + (au.terms_truncated ? ' (+' + au.terms_truncated + ' 語は上限で送らず)' : '')
+                + ' → 該当あり ' + au.found + ' / 該当なし ' + au.none + (au.not_covered ? ' / 判定できない ' + au.not_covered : '')
+                + '・出てきた商品 ' + au.asins_seen + ' → 採用 (自動) ' + au.added + ' 件');
+        }
+        const box = el('div', { style: 'margin-top:14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' }, [
+          el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:6px;' }, [
+            el('strong', { style: 'font-size:13px;', text: '商品ターゲット (競合 ASIN) — ' + asins.length + ' / ' + state.limits.max_asins + ' 件' }),
+            el('span', { class: 'muted', text: '「ABA から競合を自動で出す」= 採用した検索キーワードごとに、ABA (miniPC に取込済みの週) でクリック上位 3 に入った商品を集め、多く出た順に「採用 (自動)」で入れます。'
+              + '要らないものは「却下」にしてください (採用しても Amazon には何も登録されません。下の本文をコピーして人が貼ります)。手で ASIN を足すこともできます。'
+              + '採用した ASIN は下の本文に「商品ターゲット」として別に出ます (検索KW とは別キャンペーン)。'
+              + '「競合の検索語を引く」= その ASIN がクリック上位 3 商品に入った検索語を ABA から引きます。ABA は検索語ごとのクリック上位 3 商品とシェアであって、競合の全注文語でも広告成果でもありません (該当なし ≠ 注文なし)' }),
+          ]),
+          el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:6px;' }, [autoBtn, autoLine]),
+          el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center;' }, [asinInput, asinBtn, asinMsg]),
+        ]);
+        if (asins.length) {
+          const tb = el('tbody');
+          for (const a of asins) tb.appendChild(asinRow(a));
+          box.appendChild(el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:8px;' }, [
+            el('thead', {}, [el('tr', {}, ['ASIN', '出どころ・日時', 'ABA の検索語 (クリック上位 3 に入った語)', '採否 (人が決める)', '記録'].map((h) => el('th', { text: h })))]),
+            tb,
+          ])]));
+        }
+        root.appendChild(box);
+      }
+
+      // ── コピー
+      root.appendChild(exportSection());
+    }
+
+    function asinRow(a) {
+      const d = a.decision;
+      const cur = d ? d.decision : 'undecided';
+      const sel = el('select', { style: 'min-width:170px;' });
+      for (const [v, t] of [['undecided', '未採用'], ['adopt', '採用 (商品ターゲットに載せる)'], ['hold', '保留'], ['reject', '却下']]) {
+        sel.appendChild(el('option', { value: v, text: t, selected: v === cur }));
+      }
+      const autoAdopted = d && d.decision === 'adopt' && d.actor === 'auto:aba';
+      const note = el('span', { class: 'muted', style: 'font-size:11px;' + (autoAdopted ? ' color:#b45309;' : ''),
+        text: inflight.has(a.id) ? '保存中…' : (autoAdopted ? '自動で採用・' + fmtTime(d.created_at) + ' (要らなければ却下)'
+          : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '')) });
+      if (inflight.has(a.id)) sel.disabled = true;
+      sel.addEventListener('change', async () => {
+        if (inflight.has(a.id)) return;
+        inflight.set(a.id, true);
+        sel.disabled = true; note.textContent = '保存中…';
+        const myReqGen = reqGen;
+        let r = null;
+        try { r = await api('/candidates/' + a.id + '/decisions', { decision: sel.value }); }
+        finally { inflight.delete(a.id); }
+        if (myReqGen !== reqGen) return;
+        const cur2 = (state.asins || []).find((x) => x.id === a.id);
+        if (!r || !r.ok) { alert((r && r.error) || '採否を記録できませんでした'); if (!(await refresh()) && cur2) { const row = rowOf(a.id); if (row) row.replaceWith(asinRow(cur2)); } return; }
+        if (!state.request || r.decision.request_id !== state.request.id || !cur2) { await refresh(); return; }
+        const dec = { id: r.decision.id, decision: r.decision.decision, keyword: r.decision.keyword, match_type: null, actor: r.decision.actor, created_at: r.decision.created_at };
+        if (!cur2.decision || dec.id > cur2.decision.id) cur2.decision = dec;
+        gen += 1;
+        state.decision_version = Math.max(state.decision_version || 0, r.decision.id);
+        state.adopted_asin_count = (state.asins || []).filter((x) => x.decision && x.decision.decision === 'adopt').length;
+        const row = rowOf(a.id);
+        if (row) row.replaceWith(asinRow(cur2));
+        const ex = document.getElementById('adkw-export');
+        if (ex) ex.replaceWith(exportSection());
+        rerenderAi();
+      });
+      const badge = d && d.decision === 'adopt' ? 'badge-approved' : d && d.decision === 'hold' ? 'badge-on_hold' : d && d.decision === 'reject' ? 'badge-excluded' : '';
+      const link = el('a', { href: 'https://www.amazon.co.jp/dp/' + encodeURIComponent(a.asin), target: '_blank', rel: 'noopener', text: '🔗', title: 'Amazon で開く', style: 'margin-left:6px;' });
+      return el('tr', { 'data-cid': String(a.id) }, [
+        el('td', {}, [el('span', { class: badge ? 'badge ' + badge : '', style: 'font-family:ui-monospace,Consolas,monospace;', text: a.asin }), link]),
+        a.auto ? autoOriginCell(a) : el('td', { class: 'muted', text: (a.added_by || '') + (a.added_at ? '・' + fmtTime(a.added_at) : '') }),
+        abaCell(a),
+        el('td', {}, [sel]),
+        el('td', {}, [note]),
+      ]);
+    }
+
+    // ABA (競合がクリック上位 3 に入った検索語) の欄。miniPC の aba.db に取込済みの週を引くだけ (数秒)。
+    // 状態 = 該当あり / 該当なし (証明つき) / 判定できない / レポート無し / 取得失敗 を混ぜない。該当なし ≠ 注文なし
+    function abaCell(a) {
+      const key = 'aba:' + a.id;
+      const cell = el('td');
+      if (inflight.has(key)) { cell.appendChild(el('span', { class: 'muted', text: 'miniPC から引いています…' })); return cell; }
+      const ab = a.aba;
+      const canPull = !!state.configured;
+      if (!ab) {
+        cell.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: '競合の検索語を引く', disabled: !canPull,
+          title: canPull ? 'この ASIN がクリック上位 3 商品に入った検索語を、miniPC に取込済みの週 (ABA) から引きます (数秒)' : 'miniPC を呼ぶ設定が無いため引けません',
+          onclick: () => lookupAba(a, false) }));
+        return cell;
+      }
+      const badgeClass = ab.status === 'found' ? 'badge-approved' : ab.status === 'none' ? 'badge-on_hold' : 'badge-excluded';
+      const line = el('div', { style: 'display:flex; flex-wrap:wrap; gap:4px 8px; align-items:center;' });
+      line.appendChild(el('span', { class: 'badge ' + badgeClass, text: ab.status_ja }));
+      const bits = [];
+      if (ab.week_text) bits.push('対象週 ' + ab.week_text);
+      if (ab.status === 'found') bits.push(ab.term_count + ' 語' + (ab.coverage && ab.coverage !== 'complete' ? '・' + (ab.coverage_ja || ab.coverage) : ''));
+      if (ab.reason_ja && ab.status !== 'found' && ab.status !== 'none') bits.push(ab.reason_ja);
+      if (ab.status === 'failed' && ab.error) bits.push(ab.error);
+      if (a.aba_fetch_count > 1) bits.push('取得 ' + a.aba_fetch_count + ' 回');
+      if (a.aba_previous_ok) bits.push('前の取得回は残っています');
+      if (bits.length) line.appendChild(el('span', { class: 'muted', style: 'font-size:11px;', text: bits.join('・') }));
+      const retry = ab.status === 'failed' || ab.status === 'no_week';
+      line.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: retry ? 'もう一度' : '取り直す', disabled: !canPull,
+        title: retry ? '同じ条件でもう一度引く' : '新しい週の取込があれば、その週で引き直す (前の結果と採否はそのまま残る)',
+        onclick: () => lookupAba(a, !retry) }));
+      cell.appendChild(line);
+      return cell;
+    }
+
+    // いまの state からその ASIN の行を描き直す (「引いています…」のまま残さない)
+    const reasinRow = (id) => { const cur = (state.asins || []).find((x) => x.id === id); const row = rowOf(id); if (cur && row) row.replaceWith(asinRow(cur)); };
+    async function lookupAba(a, retake) {
+      const key = 'aba:' + a.id;
+      if (inflight.has(key) || !state.request) return;
+      inflight.set(key, true);
+      reasinRow(a.id);   // 「引いています…」を出す
+      const myReqGen = reqGen, myGen = gen;
+      let r = null;
+      try { r = await api('/asins/' + a.id + '/aba', { retake: !!retake }); }
+      finally { inflight.delete(key); }
+      if (myReqGen !== reqGen) { await refresh(); return; }   // 待つ間に依頼が切り替わった → この応答は旧依頼のもの (切替後の GET が描き直す)
+      if (!r || !r.ok) {
+        alert((r && r.error) || '引けませんでした');
+        // 通信断ならサーバーでは保存済みかもしれない → 読み直す。読み直せなければ行だけ戻す (押せないまま残さない)
+        if (!(await refresh())) reasinRow(a.id);
+        return;
+      }
+      gen += 1;
+      // 待っている間に採否や固定が進んでいたら (世代が進んでいたら)、応答に載った状態は古い → 適用せず読み直す。
+      // 🚨 読み直せなかった (通信断・さらに世代が進んだ) ときも行は戻す (Codex #1415 R1 #2)
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) reasinRow(a.id); }
+      else { state = r.state; render(); }
+      const m2 = document.getElementById('adkw-asin-msg');
+      if (m2) {
+        const ab = r.aba || {};
+        m2.textContent = a.asin + ': ' + (ab.status_ja || '') + (ab.week_text ? '・対象週 ' + ab.week_text : '')
+          + (r.looked_up ? (r.reused ? '（取得済み）' : '・候補 +' + r.added + ' 語' + (r.merged ? ' (既出 ' + r.merged + ')' : ''))
+            : '・取れませんでした: ' + (r.error || '') + '（失敗として記録。あとで「もう一度」できます）');
+      }
+    }
+
+    // 夜間 AI の枠。状態 = 今夜の実行待ち / 実行中 / 再試行待ち / 完了 / 要確認 / 失敗 / 取消。材料が変わったら「旧材料に基づく」
+    let aiKey = null;   // 冪等キー (通信断で押し直しても同じ依頼になる。受け付けたら捨てる)
+    function aiSection() {
+      const ai = state.ai;
+      const box = el('div', { id: 'adkw-ai', style: 'margin-top:12px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' });
+      const busy = inflight.has('ai-request');
+      const btn = el('button', { type: 'button', class: 'btn btn-primary', id: 'adkw-ai-request', disabled: !ai.can_request || busy,
+        text: busy ? '受け付けています…' : '🤖 AI に案を出してもらう (今夜)',
+        title: !ai.enabled ? (ai.reason_disabled || '準備中') : ai.active ? 'AI の依頼はすでに待ち・実行中です'
+          : ai.too_large ? '材料が大きすぎて AI に渡せません (採用語や仕様が多すぎる可能性)'
+          : !ai.can_request ? '材料がありません (先にサジェストを集めるか、競合 ASIN の検索語を引いてください)'
+            : 'いまの観測語・採用した語・商品情報を材料として固定し、今夜 (02:30〜) AI が検索キーワードの案を出します。案は「未採用」で候補に並びます',
+        onclick: () => requestAi() });
+      box.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [
+        el('strong', { style: 'font-size:13px;', text: '🤖 AI の案 (夜間)' }), btn,
+        el('span', { class: 'muted', id: 'adkw-ai-msg', text: !ai.enabled ? (ai.reason_disabled || '準備中')
+          : '材料は押した時点で固定します。02:30 以降に頼んだ分は翌晩。AI の案は「AI 提案。観測は未確認」として未採用で並び、採否は人が決めます' }),
+      ]));
+      for (const j of ai.jobs.slice(0, 3)) {
+        const bits = ['#' + j.id + ' ' + j.status_ja, fmtTime(j.created_at) + (j.requested_by ? '・' + j.requested_by : ''), '材料 ' + j.observations + ' 語' + (j.omitted ? ' (+' + j.omitted + ' 語は上限で省略)' : '')];
+        if (j.status === 'done') bits.push((j.result_kind_ja || '') + '・受理 ' + j.accepted + ' / 棄却 ' + j.rejected);
+        if (j.error && j.status !== 'done') bits.push(j.error);
+        // 採否版は画面の state.decision_version と比べ直す (採否を保存するたびに aiSection を描き直す — Codex #1429 R1 #5)
+        const staleNow = j.stale_product || (j.packet_decision_version != null && j.packet_decision_version !== state.decision_version);
+        if (staleNow && j.status !== 'cancelled') bits.push('⚠ 旧材料に基づく (頼んだあとに商品情報か採否が変わった)');
+        if (j.reviewed_by) bits.push('確認済み (' + j.reviewed_by + ')');
+        if (j.mode === 'auto') bits.unshift('おまかせ');
+        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (j.needs_ack ? ' color:#b45309;' : '') }, [el('span', { text: bits.join('・') })]);
+        if (j.needs_ack) line.appendChild(reviewButton(j));
+        box.appendChild(line);
+      }
+      return box;
+    }
+    async function requestAi() {
+      if (inflight.has('ai-request') || !state.request) return;
+      inflight.set('ai-request', true);
+      if (!aiKey) aiKey = 'ai-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      const box = document.getElementById('adkw-ai');
+      if (box) box.replaceWith(aiSection());
+      const myReqGen = reqGen, myGen = gen;
+      let r = null;
+      try { r = await api('/requests/' + state.request.id + '/ai-jobs', { idempotency_key: aiKey }); }
+      finally { inflight.delete('ai-request'); }
+      if (myReqGen !== reqGen) { aiKey = null; if (!(await refresh())) render(); return; }
+      if (!r || !r.ok) {
+        if (r && !r.network) aiKey = null;   // 受け付けられなかった (理由あり) → 次は新しいキー。通信断は同じキーで押し直せる
+        alert((r && r.error) || '受け付けられませんでした');
+        if (!(await refresh())) render();
+        return;
+      }
+      aiKey = null;
+      gen += 1;
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
+      else { state = r.state; render(); }
+    }
+    // 止まった依頼の「確認済みにする」。要確認 = 結果が届かないまま止まった / 失敗 / 材料なし (監視の警告が消える)
+    function reviewButton(j) {
+      const title = j.status === 'needs_review' ? 'AI を呼ぶ予約のあと結果が届かないまま止まった依頼です (成否不明のため自動では作り直しません)。確認済みにすると、もう一度頼めます'
+        : j.status === 'needs_input' ? 'サジェストにも ABA にも語が見つかりませんでした。種を入れて集めてから「AI に案を出してもらう」で続けられます。確認済みにすると夜の監視の知らせが消えます'
+          : '失敗した依頼です。確認済みにすると夜の監視の知らせが消えます (「おまかせをやり直す」で作り直せます)';
+      return el('button', { type: 'button', class: 'btn btn-sm', style: 'margin-left:8px;', text: '確認済みにする', onclick: () => reviewAi(j.id, j.status), title });
+    }
+    async function reviewAi(jobId, status) {
+      if (!confirm(status === 'needs_review' ? 'この AI の依頼を確認済みにしますか？ (結果は届いていません。もう一度頼めるようになります)' : 'この依頼を確認済みにしますか？')) return;
+      const myReqGen = reqGen, myGen = gen;
+      const r = await api('/ai-jobs/' + jobId + '/review', {});
+      if (myReqGen !== reqGen) { if (!(await refresh())) render(); return; }   // 待つ間に依頼が切り替わった
+      if (!r || !r.ok) { alert((r && r.error) || '確認済みにできませんでした'); if (!(await refresh())) render(); return; }
+      // 成功したら世代を進める (先に出ていた古い GET が「要確認」のまま上書きしないように — Codex #1429 R1 #4)
+      gen += 1;
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
+      else { state = r.state; render(); }
+    }
+    // おまかせ (PR3c) の枠。状態 = 今夜の実行待ち (まだ受け付けていない) / 種 KW → 材料集め → 最終案 / 完了 / 材料なし / 失敗
+    let autoKey = null;   // やり直すの冪等キー (通信断で押し直しても同じ回になる)
+    function autoSection() {
+      const a = state.ai.auto;
+      const box = el('div', { id: 'adkw-auto', style: 'margin-bottom:12px; padding:10px 12px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff;' });
+      const j = a.job;
+      const head = el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [el('strong', { style: 'font-size:13px;', text: '🌙 おまかせ (夜に AI が自動で)' })]);
+      let msg;
+      if (!state.ai.enabled) msg = state.ai.reason_disabled || '準備中';
+      else if (a.waiting) msg = '今夜以降に順番で受け付けます (1 晩 3 商品・新しい商品から)。Amazon のタイトル → 種 KW → サジェスト・ABA → 最終案まで AI が作り、朝には「🤖 AI 提案」として候補に並びます';
+      else if (a.out_of_scope) msg = '夜の自動の対象外です (自動 = 2026-09-26 17:15 以降にこの画面で登録した新商品と chlorellap だけ)。この商品も作りたいときは「おまかせで作る」を押してください (今夜 AI が作ります)';
+      else if (j.status === 'done') msg = '完了 (' + fmtTime(j.finished_at) + ')。サジェスト・ABA に出た語の AI 提案と ABA の競合 ASIN は最初から「採用」です。要らないものを「却下」にしてコピーしてください';
+      else msg = j.status_ja + (['queued', 'running', 'retry_wait'].includes(j.status) ? '・いまの段: ' + j.stage_ja : '');
+      head.appendChild(el('span', { class: 'muted', text: msg }));
+      if (a.can_rerun) {
+        const busy = inflight.has('auto-rerun');
+        head.appendChild(el('button', { type: 'button', class: 'btn btn-sm', id: 'adkw-auto-rerun', disabled: busy, text: busy ? '受け付けています…' : (j ? 'おまかせをやり直す' : 'おまかせで作る'),
+          title: '商品情報 (名前・Amazon タイトル・仕様) から、もう一度 種 KW → 材料集め → 最終案 を作ります (今夜)。今の候補と採否は消えません', onclick: () => rerunAuto() }));
+      }
+      box.appendChild(head);
+      if (j) {
+        const bits = ['#' + j.id + (j.round > 1 ? ' (' + j.round + ' 回目)' : ''), '受付 ' + fmtTime(j.created_at)];
+        bits.push(j.amazon_title ? 'Amazon の商品ページあり' : 'Amazon の商品ページなし (商品名と楽天タイトルから)');
+        if (j.seeds && j.seeds.length) bits.push('種: ' + j.seeds.join(' / '));
+        if (j.error && j.status !== 'done') bits.push(j.error);
+        if (j.reviewed_by) bits.push('確認済み (' + j.reviewed_by + ')');
+        const needsAck = ['needs_review', 'failed', 'needs_input'].includes(j.status) && !j.reviewed_by;
+        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (needsAck ? ' color:#b45309;' : '') }, [el('span', { text: bits.join('・') })]);
+        if (needsAck) line.appendChild(reviewButton(j));
+        box.appendChild(line);
+      }
+      return box;
+    }
+    async function rerunAuto() {
+      if (inflight.has('auto-rerun')) return;
+      if (!confirm(state.ai.auto.job ? 'おまかせをやり直しますか？ (今夜、AI がもう一度 種 KW から作ります。今の候補と採否は消えません)' : 'この商品をおまかせで作りますか？ (今夜、AI が Amazon のタイトルから種 KW → サジェスト・ABA → 案まで作ります)')) return;
+      inflight.set('auto-rerun', true);
+      if (!autoKey) autoKey = 'rr-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      const box = document.getElementById('adkw-auto');
+      if (box) box.replaceWith(autoSection());
+      const myGen = gen;
+      let r = null;
+      try { r = await api('/auto-rerun', { idempotency_key: autoKey }); }
+      finally { inflight.delete('auto-rerun'); }
+      if (!r || !r.ok) {
+        if (r && !r.network) autoKey = null;
+        alert((r && r.error) || '受け付けられませんでした');
+        if (!(await refresh())) render();
+        return;
+      }
+      autoKey = null;
+      gen += 1;
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
+      else { state = r.state; render(); }
+    }
+
+    // 採否を保存したあと (行だけ描き直す経路) に、AI の枠の「旧材料」も描き直す
+    function rerenderAi() {
+      const b = document.getElementById('adkw-ai');
+      if (b && state.ai) b.replaceWith(aiSection());
+      // AI の提案がある候補の「出方」欄の文字だけ書き換える (「旧材料」の印が採否版に追従する)。
+      // 行ごと描き直さない: 採否の選択・打ちかけの語 (まだ change が来ていない入力) を消さない (Codex #1429 R3)
+      const props = (state.ai && state.ai.proposals) || {};
+      for (const c of state.candidates || []) {
+        if (!props[c.id]) continue;
+        const row = rowOf(c.id);
+        const cell = row && row.querySelector('td[data-obs]');
+        if (cell) cell.textContent = obsCellText(c);
+      }
+    }
+
+    // 「ABA から競合を自動で出す」ボタン。採用した検索 KW が 1 つも無ければ押せない。
+    // 🚨 検索 KW の採否を変えたとき (行だけ描き直す経路) にも作り直す — 作り直さないと、採用しても押せないまま残る
+    function autoAsinsButton() {
+      const busy = inflight.has('auto-asins');
+      const can = !!state.configured && (state.adopted_count || 0) > 0 && !busy;
+      return el('button', { type: 'button', class: 'btn btn-primary', id: 'adkw-auto-asins', disabled: !can,
+        text: busy ? 'miniPC から引いています…' : '🔎 ABA から競合を自動で出す',
+        title: !state.configured ? 'miniPC を呼ぶ設定が無いため引けません'
+          : !(state.adopted_count > 0) ? '先に検索キーワードを採用してください (採用した語ごとに ABA のクリック上位 3 の商品を集めます)'
+            : '採用済みの検索キーワード (最大 ' + state.limits.auto_terms_max + ' 語) ごとに、ABA のクリック上位 3 の商品を集め、多く出た順に最大 ' + state.limits.auto_asins_per_run + ' 件を「採用 (自動)」で入れます (数秒)',
+        onclick: () => autoAsins() });
+    }
+
+    // 自動で出した ASIN の出どころ欄: どの語で何位だったか (ABA のクリック上位 3・対象週)
+    function autoOriginCell(a) {
+      const cell = el('td', { style: 'font-size:12px;' });
+      cell.appendChild(el('div', {}, [
+        el('span', { class: 'badge badge-ready_for_ai', text: '自動 (ABA)' }),
+        el('span', { class: 'muted', text: '　' + a.auto_term_count + ' 語で上位 3' + (a.auto_week_text ? '・対象週 ' + a.auto_week_text : '') + (a.added_at ? '・' + fmtTime(a.added_at) : '') }),
+      ]));
+      // 部門が複数あるときは部門を、当たった表記が送った語と違うときはその表記を添える (どの数値か分かるように — Codex #1422 R1 任意)
+      const multiDept = new Set((a.auto_hits || []).map((h) => h.department)).size > 1;
+      const hits = (a.auto_hits || []).map((h) => '「' + h.term + '」'
+        + (h.matched_term && h.matched_term !== h.term ? '(ABA では「' + h.matched_term + '」)' : '')
+        + (multiDept && h.department ? '[' + h.department + ']' : '')
+        + (h.click_position ? h.click_position + '位' : '') + (h.click_share != null ? ' (シェア ' + (Math.round(Number(h.click_share) * 1000) / 10) + '%)' : ''));
+      if (hits.length) cell.appendChild(el('div', { class: 'muted', style: 'font-size:11px;', text: hits.join('・') + (a.auto_term_count > hits.length ? ' ほか' : '') }));
+      return cell;
+    }
+
+    async function autoAsins() {
+      if (inflight.has('auto-asins') || !state.request) return;
+      inflight.set('auto-asins', true);
+      render();   // ボタンを「引いています…」にする
+      const myReqGen = reqGen, myGen = gen;
+      let r = null;
+      try { r = await api('/requests/' + state.request.id + '/auto-asins', {}); }
+      finally { inflight.delete('auto-asins'); }
+      // 待つ間に依頼が切り替わった → この応答は旧依頼のもの。読み直せなくてもボタンは戻す (inflight は共有なので、
+      // 新しい依頼のボタンも「引いています…」で描かれている — Codex #1422 R1 #1)
+      if (myReqGen !== reqGen) { if (!(await refresh())) render(); return; }
+      if (!r || !r.ok) {
+        alert((r && r.error) || '引けませんでした');
+        if (!(await refresh())) render();   // 読み直せなくてもボタンは戻す
+        return;
+      }
+      gen += 1;
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
+      else { state = r.state; render(); }
+      const m2 = document.getElementById('adkw-asin-msg');
+      if (m2) {
+        const parts = [];
+        // 「取れなかった」「判定できなかった」を「新しい競合なし」と言わない (Codex #1422 R1 #2)
+        const su = r.summary || {};
+        if (!r.looked_up) parts.push('取れませんでした: ' + (r.error || '') + '（失敗として記録。あとでもう一度押せます）');
+        else if (su.status === 'failed') parts.push('取込済みの ABA の週がまだありません (何も入れていません。取込が進んだらもう一度押してください)');
+        else if (r.added.length) parts.push('採用 (自動) ' + r.added.length + ' 件: ' + r.added.join(', ') + '　要らないものは「却下」にしてください');
+        // 入れなかった理由は skipped から数える (理由を決めつけない — Codex #1422 R2)
+        else if (su.found > 0) parts.push('競合は見つかりましたが、新しく入れたものはありません');
+        else if (!(su.not_covered > 0)) parts.push('採用した語はどれも、その週の ABA に載っていませんでした (新しく入れたものはありません)');
+        if (su.status !== 'failed' && su.not_covered > 0) parts.push('ABA の取込が不完全で判定できない語が ' + su.not_covered + ' 語あります' + (su.found > 0 || r.added.length ? '' : ' (新しく入れたものはありません)'));
+        const byReason = new Map();
+        for (const s of r.skipped || []) byReason.set(s.reason, (byReason.get(s.reason) || 0) + 1);
+        if (byReason.size) parts.push('入れなかった: ' + [...byReason.entries()].map(([k, n]) => k + ' ' + n + ' 件').join(' / '));
+        m2.textContent = parts.join('　');
+      }
+    }
+
+    async function addAsins(input, btn, msg) {
+      const raw = String(input.value || '').trim();
+      if (!raw) { alert('ASIN を入力してください'); return; }
+      if (!state.request) { alert('先に種キーワードを 1 つ集めて依頼を作ってください'); return; }
+      btn.disabled = true; msg.textContent = '追加しています…';
+      const myReqGen = reqGen, myGen = gen;
+      const r = await api('/requests/' + state.request.id + '/asins', { asins: raw });
+      btn.disabled = false;
+      if (myReqGen !== reqGen) { await refresh(); return; }
+      if (!r.ok) { alert(r.error || '追加できませんでした'); await refresh(); return; }
+      gen += 1;
+      // 待っている間に採否や固定が進んでいたら (世代が進んでいたら)、応答に載った状態は古い → 適用せず読み直す (Codex #1413 R1 #3)
+      if (gen - 1 !== myGen || !r.state) { await refresh(); }
+      else { state = r.state; render(); }
+      const m2 = document.getElementById('adkw-asin-msg');
+      if (m2) {
+        const parts = [];
+        if (r.added.length) parts.push('追加 ' + r.added.join(', '));
+        for (const s of r.skipped || []) parts.push(s.asin + ': ' + s.reason);
+        if (r.invalid && r.invalid.length) parts.push('形式が違う: ' + r.invalid.join(', '));
+        m2.textContent = parts.join(' / ') || '追加するものがありませんでした';
+      }
+    }
+
+    function candidateRow(c) {
+      const d = c.decision;
+      const cur = d ? (d.decision === 'adopt' ? 'adopt:' + d.match_type : d.decision) : 'undecided';
+      const sel = el('select', { style: 'min-width:150px;' });
+      const opts = [['undecided', '未採用']];
+      for (const mt of state.match_types) opts.push(['adopt:' + mt, '採用: ' + L.match_type[mt]]);
+      opts.push(['hold', '保留'], ['reject', '却下']);
+      for (const [v, t] of opts) sel.appendChild(el('option', { value: v, text: t, selected: v === cur }));
+      const kwInput = el('input', { type: 'text', maxlength: '80', style: 'min-width:180px;', value: d && d.decision === 'adopt' ? (d.keyword || c.value) : c.value });
+      // 採用したときだけ直せる。押せない欄は薄くして「直せる欄」と見分けがつくように
+      const setEditable = (on) => { kwInput.disabled = !on; kwInput.style.opacity = on ? '1' : '.45'; };
+      setEditable(!!(d && d.decision === 'adopt'));
+      const saving = inflight.has(c.id);
+      // おまかせが観測のある語を最初から採用した (auto:ai) = 要らなければ却下 (中原さん 2026-09-26)
+      const aiAdopted = d && d.decision === 'adopt' && d.actor === 'auto:ai';
+      const note = el('span', { class: 'muted', style: 'font-size:11px;' + (aiAdopted ? ' color:#b45309;' : ''), text: saving ? '保存中…'
+        : aiAdopted ? 'AI が自動で採用・' + fmtTime(d.created_at) + ' (要らなければ却下)'
+          : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '') });
+      if (saving) { sel.disabled = true; kwInput.disabled = true; }   // GET で描き直されても保存中は触れない
+      const send = async () => {
+        if (inflight.has(c.id)) return;
+        const v = sel.value;
+        const body = v.indexOf('adopt:') === 0
+          ? { decision: 'adopt', match_type: v.slice(6), keyword: kwInput.value }
+          : { decision: v };
+        inflight.set(c.id, true);
+        sel.disabled = true; kwInput.disabled = true; note.textContent = '保存中…';
+        const myReqGen = reqGen;
+        let r = null;
+        try {
+          r = await api('/candidates/' + c.id + '/decisions', body);
+        } finally {
+          inflight.delete(c.id);
+        }
+        // 待っている間に依頼が切り替わった (置き換え・取消) → この応答は旧依頼のもの。何も進めない (切替後の GET に任せる)
+        if (myReqGen !== reqGen) return;
+        // 🚨 ここから先、この行 (sel / kwInput / note) は GET の描き直しで取り外されているかもしれない。
+        //    いまの state の候補を id で引き直し、表示している行を id で探して描き直す (R3 #3)
+        const cur = state.candidates.find((x) => x.id === c.id);
+        if (!r || !r.ok) {
+          alert((r && r.error) || '採否を記録できませんでした');
+          // サーバーでは保存済みかもしれない → 読み直して確かめる。読み直せなければ、手元の状態で行だけ戻す (操作不能のまま残さない)
+          if (!(await refresh()) && cur) rerow(cur);
+          return;
+        }
+        // 待っている間に依頼が置き換わっていたら、この応答は古い依頼のもの → 描き直す
+        if (!state.request || r.decision.request_id !== state.request.id || !cur) { await refresh(); return; }
+        const dec = { id: r.decision.id, decision: r.decision.decision, keyword: r.decision.keyword, match_type: r.decision.match_type, actor: r.decision.actor, created_at: r.decision.created_at };
+        // 同じ候補の遅い応答 (もっと新しい採否が既に載っている) では巻き戻さない
+        if (!cur.decision || dec.id > cur.decision.id) cur.decision = dec;
+        gen += 1;
+        // 採否版 = この依頼の採否の最新 id。固定した本文がこれより古ければ「押し直して」と出す。巻き戻さない (単調増加)
+        state.decision_version = Math.max(state.decision_version || 0, r.decision.id);
+        state.adopted_count = state.candidates.filter((x) => x.decision && x.decision.decision === 'adopt').length;
+        rerow(cur);
+        const ex = document.getElementById('adkw-export');
+        if (ex) ex.replaceWith(exportSection());
+        const cnt = document.getElementById('adkw-count');
+        if (cnt) cnt.textContent = '候補 ' + state.candidates.length + ' 語 (採用 ' + state.adopted_count + ')';
+        const ab = document.getElementById('adkw-auto-asins');
+        if (ab) ab.replaceWith(autoAsinsButton());   // 採用数で押せる / 押せないが変わる
+        rerenderAi();
+      };
+      sel.addEventListener('change', send);
+      kwInput.addEventListener('change', () => { if (sel.value.indexOf('adopt:') === 0) send(); });
+      const badge = d && d.decision === 'adopt' ? 'badge-approved' : d && d.decision === 'hold' ? 'badge-on_hold' : d && d.decision === 'reject' ? 'badge-excluded' : '';
+      return el('tr', { 'data-cid': String(c.id) }, [
+        el('td', {}, [el('span', { class: badge ? 'badge ' + badge : '', text: c.value })]),
+        el('td', { class: 'muted', 'data-obs': '1', text: obsCellText(c) }),
+        el('td', {}, [sel]),
+        el('td', {}, [kwInput]),
+        el('td', {}, [note]),
+      ]);
+    }
+
+    // 候補の「出方」欄の文字 = どの種のどの prefix で、いつ観測したか (取り直しても最初の観測の日付は変わらない) / ABA なら順位・位置・シェア・週。
+    // AI の提案 (PR3a) = 理由と根拠にした観測語。観測済みの語に AI も提案したときは「🤖 AI も提案」を添える。
+    // 採否の保存のたびに rerenderAi() がこの欄の文字だけを書き換える (行ごと描き直すと、別の行の打ちかけの語が消える — Codex #1429 R3)
+    function obsCellText(c) {
+      const dateOf = (iso) => { const t = iso ? Date.parse(iso) : NaN; return Number.isFinite(t) ? (new Date(t).getMonth() + 1) + '/' + new Date(t).getDate() : '?'; };
+      // ABA の観測 = 順位・位置・シェアを原値で (定義は表の頭に。ボリュームや成果に換算しない)
+      const pct = (v) => (typeof v === 'number' && isFinite(v)) ? (Math.round(v * 1000) / 10) + '%' : '?';
+      const obsText = (o) => o.source === 'aba'
+        ? 'ABA 順位 ' + (o.rank != null ? o.rank : '?') + '・位置 ' + (o.click_position != null ? o.click_position : '?') + '・クリック ' + pct(o.click_share) + '・購入 ' + pct(o.conversion_share)
+          + (o.seed !== c.seed ? '（' + o.seed + '）' : '') + ' 週 ' + (o.week_text || dateOf(o.week_start))
+        : o.source_label + (o.seed !== c.seed ? '（' + o.seed + '）' : '') + ' ' + dateOf(o.fetched_at);
+      const p = (state.ai && state.ai.proposals) ? state.ai.proposals[c.id] : null;
+      const onlyAi = c.observed.length === 0;
+      const aiText = p ? ((onlyAi ? '' : '🤖 AI も提案') + (p.reason ? (onlyAi ? '' : '：') + p.reason : '')
+        + (p.basis && p.basis.length ? '（根拠: ' + p.basis.join('・') + '）' : '')
+        + '［AI #' + p.job_id + (p.count > 1 ? '・提案 ' + p.count + ' 回' : '')
+        // 旧材料 = 商品情報が変わった or 固定した採否版がいまの採否版と違う (画面の state で比べ直す — Codex #1429 R2 #1)
+        + ((p.job_stale_product || (p.job_decision_version != null && p.job_decision_version !== state.decision_version)) ? '・旧材料' : '') + '］') : '';
+      const obs = c.observed.map(obsText).join(' / ');
+      return [obs, aiText].filter(Boolean).join(' / ') || (c.origin === 'ai' ? 'AI 提案 (理由なし)' : '');
+    }
+
+    function exportSection() {
+      const box = el('div', { id: 'adkw-export', style: 'margin-top:14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' });
+      box.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [
+        el('strong', { style: 'font-size:13px;', text: '広告画面に貼る本文 (採用 ' + state.adopted_count + ' 語・商品ターゲット ' + (state.adopted_asin_count || 0) + ' 件)' }),
+        el('button', { type: 'button', class: 'btn btn-sm btn-primary', text: '本文を固定する', onclick: () => makeExport(),
+          disabled: !state.request || (state.adopted_count === 0 && !(state.adopted_asin_count > 0)) }),
+        el('span', { class: 'muted', text: '固定 = このときの採否でコピー本文を作って履歴に残す。採否を変えたらもう一度固定する' }),
+      ]));
+      const latest = state.exports && state.exports[0];
+      if (latest && latest.body) {
+        if (latest.decision_version !== state.decision_version) {
+          box.appendChild(el('p', { class: 'muted', style: 'color:#b45309; margin:8px 0 0;', text: '⚠ 固定したあとに採否が変わっています。下の本文は古い採否のものです。「本文を固定する」を押し直してください' }));
+        }
+        box.appendChild(el('p', { class: 'muted', style: 'margin:6px 0 0;', text: '履歴 #' + latest.id + '（' + fmtTime(latest.created_at) + (latest.created_by ? '・' + latest.created_by : '') + '）— マッチタイプごとに分けてあります。Amazon の広告画面の「キーワードを入力」に、同じマッチタイプを選んで貼ってください' }));
+        for (const b of latest.body.blocks || []) {
+          const ta = el('textarea', { readonly: true, rows: String(Math.min(8, Math.max(2, b.count))), style: 'width:100%; font-family:ui-monospace,Consolas,monospace; font-size:13px;' });
+          ta.value = b.text;
+          const copiedAt = latest.copied && latest.copied[b.match_type];
+          const hint = el('span', { class: 'muted', style: 'font-size:12px;', text: copiedAt ? '✅ コピー済み ' + fmtTime(copiedAt) + '（Amazon 登録済みの印ではありません）' : '' });
+          const blockLabel = ((L.copy_block || L.match_type)[b.match_type] || b.match_type);
+          const unit = b.match_type === 'product_targets' ? ' 件' : ' 語';
+          const btn = el('button', { type: 'button', class: 'btn btn-sm', text: '📋 ' + blockLabel + ' をコピー (' + b.count + unit + ')' });
+          btn.addEventListener('click', async () => {
+            const ok = await (typeof copyText === 'function' ? copyText(b.text) : Promise.resolve(false));
+            if (!ok) { hint.textContent = '⚠️ コピーできません。上の欄を選択して手でコピーしてください'; return; }
+            const r = await api('/exports/' + latest.id + '/copied', { match_type: b.match_type });
+            if (r.ok) { latest.copied = r.copied; hint.textContent = '✅ コピー済み ' + fmtTime(r.copied[b.match_type]) + '（Amazon 登録済みの印ではありません）'; }
+            else hint.textContent = '✅ コピーしました (記録は失敗: ' + (r.error || '') + ')';
+          });
+          box.appendChild(el('div', { style: 'margin-top:8px;' }, [
+            el('div', { style: 'display:flex; gap:8px; align-items:center; margin-bottom:4px;' }, [
+              el('strong', { style: 'font-size:13px;', text: blockLabel + '（' + b.count + unit + '）' }), btn, hint,
+            ]),
+            ta,
+          ]));
+        }
+      }
+      return box;
+    }
+
+    async function makeExport() {
+      if (!state.request) return;
+      const myReqGen = reqGen;
+      const r = await api('/requests/' + state.request.id + '/exports', {});
+      if (myReqGen !== reqGen) return;   // 待つ間に依頼が切り替わった → 旧依頼の応答は捨てる
+      if (!r.ok) { alert(r.error || '本文を固定できませんでした'); if (r.network) await refresh(); return; }
+      // 待っている間に依頼が置き換わっていたら、この応答は古い依頼のもの
+      if (!state.request || r.export.request_id !== state.request.id) { await refresh(); return; }
+      state.exports = [r.export].concat((state.exports || []).filter((e) => e.id !== r.export.id));
+      gen += 1;
+      // 🚨 固定の応答で採否版を巻き戻さない。応答を待つ間に採否が進んでいれば「押し直して」が出たままになる (PR #1408 R1 #3)
+      state.decision_version = Math.max(state.decision_version || 0, r.export.decision_version);
+      const ex = document.getElementById('adkw-export');
+      if (ex) ex.replaceWith(exportSection());
+    }
+    async function ensureRequest(restart) {
+      if (!pendingKey) pendingKey = newKey();
+      const r = await api('/requests', { idempotency_key: pendingKey, restart: !!restart });
+      // 結果が分からない通信失敗 (サーバーには届いたかもしれない) では同じキーを持ち続ける = 再送で二重に作らない。
+      // はっきり断られたとき・できたときはキーを捨てる (R2 #9)
+      if (!r.ok) { if (!r.network) pendingKey = null; throw new Error(r.error || '依頼を作れませんでした'); }
+      pendingKey = null;
+      return r.request_id;
+    }
+    async function collect(rawSeed, alphabet, ui, retake) {
+      if (busy) return;
+      const seed = String(rawSeed || '').trim();
+      if (!seed) { alert('種になるキーワードを入力してください'); return; }
+      busy = true;
+      clearTimeout(pollTimer);
+      if (ui.collectBtn) ui.collectBtn.disabled = true;
+      if (ui.progress) ui.progress.textContent = '「' + seed + '」を miniPC で集めています… (約 10〜20 秒・最長 40 秒)';
+      try {
+        const rid = state.request ? state.request.id : await ensureRequest(false);
+        const myGen = gen, myReqGen = reqGen;
+        const r = await api('/requests/' + rid + '/collect', { seed, alphabet: !!alphabet, retake: !!retake });
+        if (myReqGen !== reqGen) { busy = false; await refresh(); return; }   // 待つ間に依頼が切り替わった → 収集の応答は捨てて読み直す
+        if (!r.ok) { alert(r.error || '集められませんでした'); busy = false; await refresh(); return; }
+        gen += 1;
+        // 待っている間に採否を変えていたら (世代が進んでいたら)、収集の応答に載った状態は古い → 取り直す
+        if (gen - 1 !== myGen || !r.state) { busy = false; await refresh(); }
+        else { state = r.state; render(); }
+        const p = document.getElementById('adkw-progress');
+        if (p) {
+          p.textContent = r.collected
+            ? (r.reused ? '「' + seed + '」は取得済みです' : '「' + seed + '」: 候補 +' + r.added + ' 語' + (r.merged ? ' (既出 ' + r.merged + ')' : ''))
+            : '「' + seed + '」は取れませんでした: ' + (r.error || '') + '（失敗として記録。あとで「もう一度」できます）';
+        }
+        const inp = document.getElementById('adkw-seed');
+        if (inp && r.collected) { inp.value = ''; inp.focus(); }
+      } catch (e) {
+        alert(e && e.message ? e.message : String(e));
+        busy = false;
+        await refresh();
+      } finally {
+        busy = false;
+        // 無条件に押せるようにしない: 別の画面が収集中なら押せないまま (5 秒ごとの確認で戻る)
+        const b = document.getElementById('adkw-collect');
+        if (b) b.disabled = !state.configured || collectingElsewhere();
+        schedulePollIfNeeded();
+      }
+    }
+    // 依頼を切り替えたあとの読み直し。1 度で読めなければもう 1 度、それでも駄目なら人に読み直してもらう (古い依頼を出したままにしない)
+    async function refreshAfterSwitch() {
+      reqGen += 1; gen += 1;
+      if (await refresh()) return;
+      await new Promise((r) => setTimeout(r, 1000));
+      if (await refresh()) return;
+      alert('依頼を切り替えましたが、画面を読み直せませんでした。ページを読み直してください');
+    }
+    async function restart() {
+      if (!confirm('新しい依頼にしますか？ いまの候補と採否はこの依頼に残りますが、画面からは消えます (上書きはしません)')) return;
+      try { await ensureRequest(true); } catch (e) { alert(e.message || String(e)); return; }
+      await refreshAfterSwitch();
+    }
+    async function cancel() {
+      if (!state.request || !confirm('この依頼を取り消しますか？ (収集中の結果は保存されません)')) return;
+      const r = await api('/requests/' + state.request.id + '/cancel', {});
+      if (!r.ok) alert(r.error || '取り消せませんでした');
+      await refreshAfterSwitch();   // 通信断で届いていたかもしれないので、成否に関わらず読み直す
+    }
+    render();
+  })();
+  </script>
+  <% } %>
 
 
   <!-- ジャンル選択モーダル (RMS の「ジャンルID選択」と同じ操作感) -->
@@ -2329,16 +3329,80 @@ th.attr-unknown { color: #dc2626; }
     return res.json();
   }
 
+  // 読み直しの関所。この画面の読み直しは**すべてここを通す** (ほかの場所で location.reload を直に呼ばない)。
+  // 明示保存の欄に打ったまま保存していない値を退避してから読み直し、読み直した後に書き戻す
+  // (initUnsavedGuard を参照)。phKeep は var 宣言 — この関数は巻き上がるので、
+  // ガードの初期化より前に呼ばれても落ちないようにしている
+  var phKeep = null;
+  // ─── 保存の順番を 1 本の列にそろえる (2026-09-21) ───────────────────────────
+  // 🚨 欄ごとの即保存と、ボタンのまとめ保存が**並行に飛ぶ**と、先に送った古い値が
+  //    後から着いて新しい値を上書きする (画面と DB が食い違い、未保存の印も出ない)。
+  //    基本情報を触る保存は全部この列に並べる (楽天の全量保存は税率を送らないので対象外)
+  // 🚨 ここから「保存の列と読み直し」の切り出し範囲 — テストが**描画ではなくこの素の JS** を
+  //    vm で動かして、順番・待ち方を確かめる。EJS の埋め込み (<%= %>) をこの範囲に入れない
+  var phSaveTail = Promise.resolve();
+  // いま応答を待っている欄と、**その送った値** (id → 送った値)。
+  // 🚨 読み直しのときに「DB のいまの値が自分の保存の結果か」を見分けるのに要る (Codex R2)。
+  //    送った値を覚えておかないと、他人の変更まで自分のものとして黙って隠してしまう
+  var phInflight = new Map();
+  /** 送信の開始を記録する。@returns {Function} 終わったときに呼ぶ解除関数 */
+  function phSending(entries) {
+    for (const [id, v] of entries) phInflight.set(id, v);
+    return () => { for (const [id] of entries) phInflight.delete(id); };
+  }
+  function phEnqueueSave(fn) {
+    // 前が失敗しても次は動かす。🚨 つなぐ先も吸収済みにする — reject が残ると
+    //    以後の保存が 1 つも動かなくなる (Codex R1)
+    const p = phSaveTail.then(fn, fn);
+    phSaveTail = p.then(() => {}, () => {});
+    return p;
+  }
+
+  function reloadSafely() {
+    const doReload = () => {
+      let kept = false;
+      // 🚨 応答を待てなかった欄は「送った値」も添えて退避する (Codex R1/R2)。
+      //    DB は送った値に変わっているかもしれない。元の値とも送った値とも違えば、
+      //    それは**ほかの人の変更**なので隠さない
+      const inflight = {};
+      phInflight.forEach((v, id) => { inflight[id] = v; });
+      try { kept = phKeep ? phKeep.stash({ inflight }) : true; } catch (_) { kept = false; }
+      // 🚨 退避できたときだけ離脱の警告を消す。容量不足やプライベートモードで
+      //    退避できないのに黙って読み直すと、未保存が無警告で消える
+      if (kept) { try { phKeep.mute(); } catch (_) { /* 印の都合は本筋ではない */ } }
+      location.reload();
+    };
+    // 🚨 保存が飛んでいる最中に読み直すと、保存できたばかりの値を「ほかの人が変えた」と
+    //    誤判定して捨ててしまう。**列の最後尾まで**待つ — 待っている間に増えた保存も待つ
+    //    (最初の 1 本だけ待つと、後から確定した欄が通信中のまま読み直してしまう)。
+    //    固まっても 3 秒で進む (そのときは上の inflight が効く)
+    let fired = false;
+    const go = () => { if (fired) return; fired = true; doReload(); };
+    const deadline = Date.now() + 3000;
+    const waitTail = () => {
+      const tail = phSaveTail;
+      Promise.resolve(tail).then(() => {
+        if (fired) return;
+        if (tail !== phSaveTail && Date.now() < deadline) { waitTail(); return; }   // 待つ間に増えた
+        go();
+      }, go);
+    };
+    waitTail();
+    setTimeout(go, 3000);
+  }
+  // ここまでが「保存の列と読み直し」の切り出し範囲
+
   function showAndReload(json, okMsg) {
     if (json.ok) {
       if (json.demoted) {
         alert('必須項目が欠けたため、ステータスを「下書き」に戻しました:\n' + json.demoted.join('\n'));
       }
       result.textContent = okMsg;
-      setTimeout(() => location.reload(), 600);
+      setTimeout(() => reloadSafely(), 600);
     } else {
       const detail = json.reasons ? json.reasons.join(' / ') : '';
-      alert((json.error || 'エラーが発生しました') + (detail ? '\n' + detail : ''));
+      const gateMsg = (json.error === 'master_frozen' || json.error === 'master_phase_unreadable' || json.error === 'master_owner_unreadable') ? json.message : null;
+      alert((gateMsg || json.error || 'エラーが発生しました') + (detail ? '\n' + detail : ''));
     }
   }
 
@@ -2493,6 +3557,35 @@ th.attr-unknown { color: #dc2626; }
   }
 
 
+  // 楽天ページ (既存ページに追加 / 新規ページ / 自動判定): 選択で即保存 (2026-09-25)。
+  // 保存中は触らせない (続けて変えると応答の順序で表示と DB が食い違う)。失敗したら保存済みの値に戻す
+  const existingPageSel = document.getElementById('f-existing-page');
+  if (existingPageSel) {
+    existingPageSel.addEventListener('change', async () => {
+      const note = document.getElementById('existing-page-note');
+      note.textContent = '保存中…';
+      existingPageSel.disabled = true;
+      let json;
+      try {
+        json = await post(BASE + '/existing-page', { value: existingPageSel.value });
+      } catch (e) {
+        json = { ok: false, error: '通信エラーで保存できたか分かりません。画面を読み直して確かめてください' };
+      } finally {
+        existingPageSel.disabled = false;
+      }
+      if (!json.ok) {
+        existingPageSel.value = existingPageSel.dataset.saved || '';
+        note.textContent = '';
+        alert(json.error || '保存に失敗しました');
+        return;
+      }
+      existingPageSel.dataset.saved = json.choice || '';
+      note.textContent = json.auto
+        ? `保存しました (自動判定: ${json.existingPage ? '既存ページに追加' : '新規ページ'})`
+        : '保存しました';
+    });
+  }
+
   // 画像の重要度: 選択で即保存 (基本情報の保存ボタンとは独立。ボードのセレクトと同じ API)
   const imgPrioritySel = document.getElementById('f-image-priority');
   const ownBrandChk = document.getElementById('f-own-brand');
@@ -2590,7 +3683,9 @@ th.attr-unknown { color: #dc2626; }
     }
   }
 
-  document.getElementById('save-basic-btn').addEventListener('click', async () => {
+  // 🚨 欄ごとの即保存と同じ列に並べる (Codex R1)。並行に飛ばすと、ボタンが送った古い値が
+  //    後から着いて、直後に打ち直した値を上書きする (画面と DB が食い違い、印も出ない)
+  document.getElementById('save-basic-btn').addEventListener('click', () => phEnqueueSave(async () => {
     // 重要度・自社商品チェックの保存中は何も送らない (2026-09-17 Codex 名指し R4)。保存が終わる前に読み直すと、
     // 変更が消えるか、読み直した画面の重要度が DB より古くなる (簡易LPに古い値が入る)
     if (imgPrioritySel && imgPrioritySel.dataset.saving === '1') {
@@ -2604,10 +3699,17 @@ th.attr-unknown { color: #dc2626; }
     };
     lockPriority(true);
     let reloading = false;
+    // 🚨 応答を待っている間に読み直されても「何をいくらで送ったか」が分かるようにする (Codex R2)。
+    //    分からないと、自分の保存を他人の変更と誤判定して打ち直した分を捨てる
+    let doneSending = () => {};
+    let sendSettled = false;
     try {
       // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
       // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
       if (!(await saveRakutenFields())) return;
+      const basicSnap = phKeep ? phKeep.saving(['basic']) : null;   // 送る値を控えてから送る (Codex R1)
+      doneSending = phSending(basicSnap ? basicSnap.map((s) => [s.f.id, s.v]) : []);
+      const sentTax = (() => { const el = document.getElementById('y-tax'); return el && el.value !== el.defaultValue ? el.value : undefined; })();   // 税率は変えたときだけ送る (欄の元の値と比べる・欄が無い = 送らない)
       const json = await post(BASE, {
         name: document.getElementById('f-name').value,
         official_url: document.getElementById('f-official-url').value,
@@ -2623,15 +3725,22 @@ th.attr-unknown { color: #dc2626; }
         // NE で判定できる商品はキーごと送らない (DB に焼かせない)
         ...hasVariationPayload(),
         // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
-        tax_rate: document.getElementById('y-tax').value,
+        // 税率は変えたときだけ送る (変えていない保存は門を読まない = Company DB が止まっても名前・売価・メモは保存できる)。
+        // 欄が無い (切替で閉じた後) = 送らない (undefined は JSON に載らない)
+        tax_rate: sentTax,
         memo: document.getElementById('f-memo').value,
       });
+      sendSettled = true;
+      if (json && json.ok && sentTax !== undefined) { const taxEl = document.getElementById('y-tax'); if (taxEl) taxEl.defaultValue = sentTax; }   // 保存できたら送った税率を元の値に (読み直すまでの次の保存で送り直さない)
+      if (json.ok && phKeep) phKeep.saved(basicSnap);
       reloading = !!json.ok;
       showAndReload(json, '保存しました');
     } finally {
+      // 結果が分からない (通信エラー) ときは記録を残す — 上の即保存と同じ理由
+      if (sendSettled) doneSending();
       if (!reloading) lockPriority(false);
     }
-  });
+  }));
 
   function hasVariationPayload() {
     const el = document.getElementById('f-has-variation');
@@ -3180,8 +4289,91 @@ th.attr-unknown { color: #dc2626; }
     box.appendChild(msg);
   }
 
+  // ─── 選択式の属性はセレクトで選ばせる (2026-09-20 中原さん) ───
+  // 「ジャンル情報を取得」で楽天の選択肢 (options) まで取れた属性だけ。取れていない属性・複数の値を
+  // 入れられる属性は今まで通りの入力欄 (+ 注意書き) のまま = 選択肢が欠けたセレクトで正しい値を選べなくしない。
+  // いまの値が選択肢に無いときは黙って消さず、その値を選んだ状態で残して選び直しを促す
+  const SELECTIVE_NOTE = '⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)';
+  function selectOptionsOf(meta) {
+    if (!meta || meta.inputMethod !== 'SELECTIVE' || !Array.isArray(meta.options) || meta.options.length === 0) return null;
+    if (meta.multiValueLimit != null && meta.multiValueLimit > 1) return null;
+    return meta.options;
+  }
+  function selectiveDatalistId(meta) {
+    if (!meta || meta.inputMethod !== 'SELECTIVE' || !Array.isArray(meta.options) || meta.options.length === 0) return '';
+    const id = 'rk-attr-dl-' + attrDict.indexOf(meta);
+    let dl = document.getElementById(id);
+    if (!dl) { dl = document.createElement('datalist'); dl.id = id; document.body.appendChild(dl); }
+    // 中身で見比べる (名前と件数だけだと、同じ件数の入れ替えを見逃す — Codex R1 medium)
+    const sig = JSON.stringify([meta.name, meta.options]);
+    if (dl.dataset.sig !== sig) {
+      dl.textContent = '';
+      dl.dataset.sig = sig;
+      for (const o of meta.options) { const op = document.createElement('option'); op.value = o; dl.appendChild(op); }
+    }
+    return id;
+  }
+  function syncSelectiveInputs() {
+    document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
+      const nameEl = tr.querySelector('.rk-attr-name');
+      const cur = tr.querySelector('.rk-attr-value');
+      if (!nameEl || !cur) return;   // 固定行 (カタログID・メーカー型番)
+      const meta = attrDict.find((a) => a.name === nameEl.value.trim()) || null;
+      const value = cur.value;
+      const options = value.includes('|') ? null : selectOptionsOf(meta);
+      let el = cur;
+      // 取り直して選択肢が変わったら作り直す (値は残し、選択肢にあるかも見直す — Codex R1 medium)
+      const sig = options ? JSON.stringify([meta.name, options]) : '';
+      if (options && (cur.tagName !== 'SELECT' || cur.dataset.sig !== sig)) {
+        el = document.createElement('select');
+        el.className = 'rk-attr-value';
+        el.dataset.sig = sig;
+        const head = document.createElement('option');
+        head.value = ''; head.textContent = '(選んでください)';
+        el.appendChild(head);
+        if (value.trim() && !options.includes(value.trim())) {
+          const keep = document.createElement('option');
+          keep.value = value; keep.textContent = '⚠️ ' + value + ' (楽天の選択肢にありません)';
+          keep.dataset.unknown = '1';
+          el.appendChild(keep);
+        }
+        for (const o of options) { const op = document.createElement('option'); op.value = o; op.textContent = o; el.appendChild(op); }
+        el.value = options.includes(value.trim()) ? value.trim() : value;
+        cur.replaceWith(el);
+      } else if (!options && cur.tagName === 'SELECT') {
+        el = document.createElement('input');
+        el.type = 'text'; el.className = 'rk-attr-value'; el.value = value;
+        cur.replaceWith(el);
+      }
+      if (el.tagName === 'INPUT') {
+        const dl = selectiveDatalistId(meta);
+        if (dl) el.setAttribute('list', dl); else el.removeAttribute('list');
+      }
+      // 注意書き: セレクトで選べているなら要らない。選択肢に無い値が残っているときは選び直しを促す
+      let note = tr.querySelector('.rk-attr-selective');
+      const picked = el.tagName === 'SELECT' ? el.selectedOptions[0] : null;
+      const text = el.tagName === 'SELECT'
+        ? (picked && picked.dataset.unknown ? '⚠️ いまの値は楽天の選択肢にありません。このままだと登録に失敗します — 選び直してください' : '')
+        : (meta && meta.inputMethod === 'SELECTIVE' ? SELECTIVE_NOTE : '');
+      if (text && !note) {
+        note = document.createElement('div');
+        note.className = 'muted rk-attr-selective';
+        note.style.cssText = 'font-size:11px; color:#b45309;';
+        el.parentNode.appendChild(note);
+      }
+      if (note) { note.textContent = text; note.style.display = text ? '' : 'none'; }
+    });
+    // バリエーションの SKU 表: セルは即保存・「|」区切りの複数値があるので入力欄のまま、候補だけ出す
+    document.querySelectorAll('#rk-sku-grid tr.sku-grid-attr').forEach((tr) => {
+      const meta = attrDict.find((a) => a.name === String(tr.dataset.name || '').trim()) || null;
+      const dl = selectiveDatalistId(meta);
+      tr.querySelectorAll('.sku-attr-input').forEach((c) => { if (dl) c.setAttribute('list', dl); else c.removeAttribute('list'); });
+    });
+  }
+
   function renderAttrSuggest() {
     markAttrsNotInGenre();
+    syncSelectiveInputs();
     const box = document.getElementById('rk-attr-suggest');
     if (!box) return;
     box.textContent = '';
@@ -3259,8 +4451,7 @@ th.attr-unknown { color: #dc2626; }
     if (hint) tr.querySelector('td div').textContent = hint;
     // 選択式は自由入力できない (2026-09-02 代表カラーの IE0418)。値欄の直下に出す
     if (selective) {
-      tr.querySelector('.rk-attr-selective').textContent =
-        '⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)';
+      tr.querySelector('.rk-attr-selective').textContent = SELECTIVE_NOTE;
     }
     if (meta && meta.mandatory) tr.querySelector('.rk-attr-name').style.borderColor = '#fca5a5';
     document.querySelector('#rk-attrs tbody').appendChild(tr);
@@ -3320,6 +4511,7 @@ th.attr-unknown { color: #dc2626; }
       attrDict = (g.attributes || []).map((a) => ({
         name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null,
         unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null,
+        options: Array.isArray(a.options) ? a.options : null,
       }));
       let added = 0;
       for (const a of mandatory) {
@@ -3436,6 +4628,10 @@ th.attr-unknown { color: #dc2626; }
     rkAttrsTable.addEventListener('input', (ev) => {
       if (ev.target.classList && ev.target.classList.contains('rk-attr-name')) renderAttrSuggest();
     });
+    // セレクトで選び直したら「選択肢にありません」の注意書きを外す
+    rkAttrsTable.addEventListener('change', (ev) => {
+      if (ev.target.tagName === 'SELECT' && ev.target.classList.contains('rk-attr-value')) syncSelectiveInputs();
+    });
     rkAttrsTable.addEventListener('click', (ev) => {
       const del = ev.target.closest && ev.target.closest('.rk-attr-del');
       if (del) { del.closest('tr').remove(); renderAttrSuggest(); }
@@ -3494,8 +4690,14 @@ th.attr-unknown { color: #dc2626; }
   // 「複合選択肢を選び直した」と誤判定して、人が直したヤフーの配送方法を既定値へ戻してしまう
   async function postRakutenFields(extra) {
     const payload = { ...collectRakutenFields(), ...(extra || {}) };
+    // 🚨 送る値をここで控える (Codex R1)。afterRakutenSave まで待つと、そこを通らない経路
+    //    (プレビュー・登録) で基準が進まず、次の読み直しで打ち直した分を競合として捨てる
+    const snap = phKeep ? phKeep.saving(['rakuten']) : null;
     const json = await post(BASE + '/rakuten', payload);
-    if (json.ok) shipSelectInitial = payload.shipping_method_group;
+    if (json.ok) {
+      shipSelectInitial = payload.shipping_method_group;
+      if (phKeep) phKeep.saved(snap);
+    }
     return json;
   }
 
@@ -3511,7 +4713,7 @@ th.attr-unknown { color: #dc2626; }
         const json = await post(BASE + '/rakuten/sync-shop-categories', {});
         if (json.ok) {
           out.textContent = '✅ ' + json.count + ' 件を反映しました';
-          setTimeout(() => location.reload(), 1000);
+          setTimeout(() => reloadSafely(), 1000);
         } else {
           out.textContent = '';
           alert(json.error || '反映に失敗しました');
@@ -3527,7 +4729,7 @@ th.attr-unknown { color: #dc2626; }
       rkPublishBtn.disabled = true;
       try {
         const json = await post(BASE + '/rakuten/visibility', { hide: false, confirm: true });
-        if (json.ok) { rkResult.textContent = '🟢 公開しました'; setTimeout(() => location.reload(), 1000); }
+        if (json.ok) { rkResult.textContent = '🟢 公開しました'; setTimeout(() => reloadSafely(), 1000); }
         else { alert(json.error || '公開に失敗しました'); }
       } finally { rkPublishBtn.disabled = false; }
     });
@@ -3539,7 +4741,7 @@ th.attr-unknown { color: #dc2626; }
       rkUnpublishBtn.disabled = true;
       try {
         const json = await post(BASE + '/rakuten/visibility', { hide: true, confirm: true });
-        if (json.ok) { rkResult.textContent = '非公開に戻しました'; setTimeout(() => location.reload(), 1000); }
+        if (json.ok) { rkResult.textContent = '非公開に戻しました'; setTimeout(() => reloadSafely(), 1000); }
         else { alert(json.error || '切り替えに失敗しました'); }
       } finally { rkUnpublishBtn.disabled = false; }
     });
@@ -3594,6 +4796,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { alert(json.error || 'JANコードの保存に失敗しました'); return false; }
         janSaveUnknown = false;
         lastSavedJan = value;
+        if (phKeep) phKeep.savedValue('f-jan', value);   // 未保存の基準もここまで進める (Codex R1)
       }
       return el.value.trim() === lastSavedJan && !janSaveUnknown;
     });
@@ -3620,7 +4823,7 @@ th.attr-unknown { color: #dc2626; }
   function afterRakutenSave(resultEl) {
     if (modelConflictResolved) {
       resultEl.textContent = '保存しました (メーカー型番を 1 箇所にまとめました)';
-      setTimeout(() => location.reload(), 700);
+      setTimeout(() => reloadSafely(), 700);
       return;
     }
     resultEl.textContent = '保存しました';
@@ -3644,7 +4847,7 @@ th.attr-unknown { color: #dc2626; }
       try {
         if (await saveRakutenFields()) {
           rkResultCat.textContent = 'メーカー型番を 1 つにまとめました';
-          setTimeout(() => location.reload(), 700);
+          setTimeout(() => reloadSafely(), 700);
           return;
         }
       } catch (e) {
@@ -3676,7 +4879,7 @@ th.attr-unknown { color: #dc2626; }
           + skuFailed.map((f) => '\n・SKU画像 ' + f.sku + ': ' + (f.error || '')).join('')
           + '\n\nDriveの画像フォルダがサービスアカウントに共有されているか確認してください。');
       } else {
-        setTimeout(() => location.reload(), 900);
+        setTimeout(() => reloadSafely(), 900);
       }
     } finally { btn.disabled = false; }
   });
@@ -3687,12 +4890,14 @@ th.attr-unknown { color: #dc2626; }
     const json = await res.json();
     const pre = document.getElementById('rk-preview');
     pre.style.display = 'block';
+    // 注意 (例: 切替の段階を読めない = 今の税率で見せている) は先頭に出す
+    const warn = (json.warnings || []).length ? '⚠️ ' + json.warnings.join('\n⚠️ ') + '\n\n' : '';
     if (!json.ok) {
-      pre.textContent = 'まだ送信できません:\n' + (json.reasons || []).map((r) => '・' + r).join('\n');
+      pre.textContent = warn + 'まだ送信できません:\n' + (json.reasons || []).map((r) => '・' + r).join('\n');
       return;
     }
     const cats = json.shopCategories || [];
-    pre.textContent = '商品管理番号: ' + json.manageNumber
+    pre.textContent = warn + '商品管理番号: ' + json.manageNumber
       + (cats.length ? '\n店舗内カテゴリ (登録時にアプリが自動で棚に反映 — この payload とは別API): ' + cats.join(' ／ ') : '')
       + '\n\n' + JSON.stringify(json.payload, null, 2);
   });
@@ -3717,7 +4922,7 @@ th.attr-unknown { color: #dc2626; }
         } else {
           rkResult.textContent = '✅ 公開で登録しました';
         }
-        setTimeout(() => location.reload(), cat && cat.ok === false ? 300 : 1200);
+        setTimeout(() => reloadSafely(), cat && cat.ok === false ? 300 : 1200);
       } else {
         rkResult.textContent = '';
         const pre = document.getElementById('rk-preview');
@@ -3737,7 +4942,7 @@ th.attr-unknown { color: #dc2626; }
     if (ex && !confirm(code + ' をこのページのバリエーションから外します。\n\n別ページにしたい場合は、後でこのコードで新規登録してください。')) return;
     btn.disabled = true;
     const json = await post(BASE + '/variation/' + (ex ? 'exclude' : 'restore'), { ne_code: code });
-    if (json.ok) { location.reload(); } else { alert(json.error || '操作に失敗しました'); btn.disabled = false; }
+    if (json.ok) { reloadSafely(); } else { alert(json.error || '操作に失敗しました'); btn.disabled = false; }
   });
 
   // 子SKUのドラフトを代表商品コードにまとめる。
@@ -3750,7 +4955,7 @@ th.attr-unknown { color: #dc2626; }
       if (!confirm('このドラフトの商品コードを「' + from + '」から代表商品コード「' + to + '」に変更します。\n\nよろしいですか?')) return;
       regroupBtn.disabled = true;
       const json = await post(BASE + '/regroup', { expected_from: from, expected_to: to });
-      if (json.ok) { location.reload(); } else { alert(json.error || 'まとめられませんでした'); regroupBtn.disabled = false; }
+      if (json.ok) { reloadSafely(); } else { alert(json.error || 'まとめられませんでした'); regroupBtn.disabled = false; }
     });
   }
 
@@ -3968,7 +5173,8 @@ th.attr-unknown { color: #dc2626; }
     const body = document.getElementById('profit-sim-body');
     if (!box || !body) return; // 原価/送料が無いときは静的メッセージのみ
     const cost = Number(box.dataset.cost);
-    const tax = Number(box.dataset.tax);
+    // 税率が決まっていない (切替で閉じた後に Company DB の税率が決まらない) = 空 → 試算しない (Number('') = 0 で利益を多く見せない)
+    const tax = box.dataset.tax === '' || box.dataset.tax == null ? null : Number(box.dataset.tax);
     const take = Number(box.dataset.take);
     const priceInput = document.getElementById('f-price');
     // 配送費は「選んでいる配送方法」で決まる (2026-09-04)。初期値は NE の送料
@@ -3978,6 +5184,11 @@ th.attr-unknown { color: #dc2626; }
     const amountEl = document.getElementById('profit-sim-amount');
     const marginEl = document.getElementById('profit-sim-margin');
     function render() {
+      if (tax == null || !Number.isFinite(tax)) {
+        if (figs) figs.hidden = true;
+        body.textContent = '税率が決まっていません (Company DB の税率が決まるまで利益は出しません)';
+        return;
+      }
       const price = Number(priceInput.value);
       if (!Number.isFinite(price) || price <= 0) {
         if (figs) figs.hidden = true;
@@ -4080,7 +5291,8 @@ th.attr-unknown { color: #dc2626; }
     const inputs = document.querySelectorAll('.sku-price-input');
     if (!inputs.length) return;
     const simBox = document.getElementById('profit-sim');
-    const tax = Number(simBox?.dataset.tax ?? 10);
+    // 税率が決まっていない (data-tax が空) = null = 試算しない。試算の枠が無いときは今までどおり 10%
+    const tax = !simBox ? 10 : (simBox.dataset.tax === '' || simBox.dataset.tax == null ? null : Number(simBox.dataset.tax));
     const take = Number(simBox?.dataset.take ?? 0.9);
     inputs.forEach((input) => {
       const cell = document.getElementById('sku-profit-' + input.dataset.key);
@@ -4090,9 +5302,9 @@ th.attr-unknown { color: #dc2626; }
         if (!cell) return;
         // 空欄はページ代表の売価 (placeholder) で計算 = 「設定しなければ draft.price」を可視化
         const price = Number(input.value !== '' ? input.value : input.placeholder);
-        if (!Number.isFinite(price) || price <= 0 || cost == null || ship == null) {
+        if (!Number.isFinite(price) || price <= 0 || cost == null || ship == null || tax == null || !Number.isFinite(tax)) {
           cell.textContent = '—';
-          cell.title = cost == null ? 'NEに原価がありません' : (ship == null ? 'NEに送料がありません' : '売価を入れると利益が出ます');
+          cell.title = (tax == null || !Number.isFinite(tax)) ? '税率が決まっていません' : (cost == null ? 'NEに原価がありません' : (ship == null ? 'NEに送料がありません' : '売価を入れると利益が出ます'));
           cell.classList.remove('neg');
           cell.classList.add('none');
           return;
@@ -4415,7 +5627,7 @@ th.attr-unknown { color: #dc2626; }
         json = { ok: false, error: '通信エラーで削除できませんでした。もう一度お試しください' };
       }
       if (!json.ok) { alert(json.error || '削除に失敗しました'); btn.disabled = false; return; }
-      location.reload();
+      reloadSafely();
     });
   })();
 
@@ -4486,18 +5698,32 @@ th.attr-unknown { color: #dc2626; }
     });
   }
 
-  document.getElementById('save-yahoo-btn').addEventListener('click', async () => {
-    showAndReload(await post(BASE + '/yahoo', {
-      yahoo_price: document.getElementById('y-price').value,
-      yahoo_price_sagawa: document.getElementById('y-price-sagawa').value,
-      delivery_label: document.getElementById('y-delivery').value,
-      // 楽天項目より先に保存しても「別扱い」が落ちないよう、こちらでも現在値を送る
-      shipping_override: yahooOverrideOn ? 1 : 0,
-      tax_rate: document.getElementById('y-tax').value,
-      yahoo_category_id: document.getElementById('y-category-id').value,
-      yahoo_path: document.getElementById('y-path').value,
-    }), 'Yahoo!項目を保存しました');
-  });
+  // 税率 (基本情報の欄) も送るので、こちらも同じ列に並べる
+  document.getElementById('save-yahoo-btn').addEventListener('click', () => phEnqueueSave(async () => {
+    // 🚨 Yahoo!保存が送るのは Yahoo!項目と税率だけ (Codex R2)。基本情報をまとめて
+    //    「保存済み」にすると、売価などを打ったまま Yahoo!を保存した人の入力が消える
+    const snap = phKeep ? phKeep.saving(['yahoo'], ['y-tax']) : null;
+    const doneSending = phSending(snap ? snap.map((s) => [s.f.id, s.v]) : []);
+    let json;
+    let sendSettled = false;
+    const sentTax = (() => { const el = document.getElementById('y-tax'); return el && el.value !== el.defaultValue ? el.value : undefined; })();   // 税率は変えたときだけ送る (欄の元の値と比べる・欄が無い = 送らない)
+    try {
+      json = await post(BASE + '/yahoo', {
+        yahoo_price: document.getElementById('y-price').value,
+        yahoo_price_sagawa: document.getElementById('y-price-sagawa').value,
+        delivery_label: document.getElementById('y-delivery').value,
+        // 楽天項目より先に保存しても「別扱い」が落ちないよう、こちらでも現在値を送る
+        shipping_override: yahooOverrideOn ? 1 : 0,
+        tax_rate: sentTax,   // 変えたときだけ送る・切替で閉じた後は欄が無い = 送らない
+        yahoo_category_id: document.getElementById('y-category-id').value,
+        yahoo_path: document.getElementById('y-path').value,
+      });
+      sendSettled = true;
+      if (json && json.ok && sentTax !== undefined) { const taxEl = document.getElementById('y-tax'); if (taxEl) taxEl.defaultValue = sentTax; }   // 保存できたら送った税率を元の値に (読み直すまでの次の保存で送り直さない)
+    } finally { if (sendSettled) doneSending(); }
+    if (json.ok && phKeep) phKeep.saved(snap);
+    showAndReload(json, 'Yahoo!項目を保存しました');
+  }));
 
   // ─── Yahoo!売価・配送方法のゲート (2026-08-06 中原さん指示) ───
   // 通常は楽天と同じ配送・売価で出すため入力不可。基本情報の配送方法で
@@ -4556,7 +5782,8 @@ th.attr-unknown { color: #dc2626; }
   const saveIpBtn = document.getElementById('save-ip-btn');
   if (saveIpBtn) {
     saveIpBtn.addEventListener('click', async () => {
-      showAndReload(await post(BASE + '/image-production', {
+      const snap = phKeep ? phKeep.saving(['image']) : null;
+      const json = await post(BASE + '/image-production', {
         status: document.getElementById('ip-status').value,
         importance_tier: document.getElementById('ip-tier').value,
         production_type: document.getElementById('ip-type').value,
@@ -4574,7 +5801,9 @@ th.attr-unknown { color: #dc2626; }
         material_status: document.getElementById('ip-material').value,
         ...productInfoPayload(),
         back_info_text: document.getElementById('ip-back-info').value,
-      }), '画像制作情報を保存しました');
+      });
+      if (json.ok && phKeep) phKeep.saved(snap);
+      showAndReload(json, '画像制作情報を保存しました');
     });
   }
   // 🆕 入荷のときに撮った裏面の写真を AI に文字起こしさせる (2026-09-18)。
@@ -4635,6 +5864,399 @@ th.attr-unknown { color: #dc2626; }
         btn.textContent = before;
       }
     });
+  })();
+  // 🖼 画像を作る (段階2・2026-10-04)。押す → サーバの作る係が 1 枚ずつ作って Drive の「AI初稿」へ。
+  // 画面は作っている間 5 秒おきに状況を見て、できた画像からサムネイルを並べる
+  (function initLpImages() {
+    const root = document.getElementById('lpi');
+    const holder = document.getElementById('lpi-json');
+    if (!root || !holder) return;
+    let state = null;
+    try { state = JSON.parse(holder.textContent); } catch (e) { return; }
+    const draftId = root.dataset.draftId;
+    const btn = document.getElementById('lpi-btn');
+    const statusEl = document.getElementById('lpi-status');
+    const metaEl = document.getElementById('lpi-meta');
+    const gridEl = document.getElementById('lpi-grid');
+    const RUNNING = ['queued', 'running'];
+    const STATUS_TEXT = { queued: '待ち', running: '作っています…', done: 'できました', failed: '作れませんでした', skipped: '作っていません' };
+    let timer = null;
+    let posting = false;
+    let idemKey = null;
+    const newKey = () => (window.crypto?.randomUUID ? window.crypto.randomUUID()
+      : 'lpi-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
+    const yen = (n) => Math.round(Number(n) || 0).toLocaleString() + ' 円';
+
+    function tile(im) {
+      const box = document.createElement('div');
+      box.style.cssText = 'border:1px solid #e2e8f0; border-radius:8px; padding:4px; background:#fff; font-size:11px;';
+      const title = document.createElement('div');
+      title.style.cssText = 'font-weight:600; margin-bottom:2px;';
+      title.textContent = (im.no != null ? im.no + '枚目' : im.seq + '番目') + (im.name ? '｜' + im.name : '');
+      box.appendChild(title);
+      if (im.status === 'done' && im.drive_file_id) {
+        const a = document.createElement('a');
+        a.href = 'https://drive.google.com/file/d/' + encodeURIComponent(im.drive_file_id) + '/view';
+        a.target = '_blank'; a.rel = 'noopener';
+        const img = document.createElement('img');
+        img.src = '/apps/product-hub/api/thumb/' + encodeURIComponent(im.drive_file_id) + '?w=320';
+        img.alt = title.textContent; img.loading = 'lazy';
+        img.style.cssText = 'width:100%; aspect-ratio:1/1; object-fit:contain; background:#f8fafc; border-radius:6px;';
+        a.appendChild(img);
+        box.appendChild(a);
+      } else {
+        const ph = document.createElement('div');
+        ph.style.cssText = 'width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; background:#f8fafc; border-radius:6px; color:#64748b; text-align:center; padding:4px;';
+        ph.textContent = STATUS_TEXT[im.status] || im.status;
+        box.appendChild(ph);
+      }
+      if (im.error) {
+        const er = document.createElement('div');
+        er.style.cssText = 'color:#b45309; margin-top:2px; white-space:pre-wrap;';
+        er.textContent = im.error;
+        box.appendChild(er);
+      }
+      return box;
+    }
+
+    function render(s) {
+      state = s;
+      const job = s.job;
+      const running = !!job && RUNNING.includes(job.status);
+      // 押したときに取り置く額 (安全側の見込み・保証ではない)。実際はふつうもっと安い
+      const est = Number(s.planned_reserve_jpy) || 0;
+      btn.disabled = !!s.blocked || running || posting;
+      btn.textContent = running ? '🖼 画像を作っています…' : (job ? '🖼 もう一度画像を作る' : '🖼 画像を作る') + (est ? ' (' + s.planned_count + ' 枚・取り置き 約 ' + yen(est) + ')' : '');
+      metaEl.textContent = (s.model ? s.model + ' / 品質 ' + s.quality + '・' : '')
+        + '今月 ' + yen(s.used_jpy) + ' / 上限 ' + yen(s.budget_jpy)
+        + (job && job.cost_jpy ? '・この画像で ' + yen(job.cost_jpy) : '');
+      if (s.blocked && !running) statusEl.textContent = s.blocked;
+      else if (!job) statusEl.textContent = '押すと、できた構成から画像を作って画像フォルダの「AI初稿」に保存します (1 枚 1 分くらい)';
+      else {
+        const done = (job.images || []).filter((im) => im.status === 'done').length;
+        const total = (job.images || []).length;
+        statusEl.textContent = running ? '画像を作っています… (' + done + ' / ' + total + ' 枚)'
+          : job.status === 'done' ? 'できました (' + done + ' / ' + total + ' 枚)。画像を押すと Drive で開きます'
+          : job.status === 'partial' ? '一部だけできました (' + done + ' / ' + total + ' 枚)' + (job.error ? ' — ' + job.error : '')
+          : '作れませんでした' + (job.error ? ': ' + job.error : '');
+      }
+      gridEl.textContent = '';
+      for (const im of (job && job.images) || []) gridEl.appendChild(tile(im));
+      if (running) schedule(); else stop();
+    }
+    function stop() { if (timer) { clearTimeout(timer); timer = null; } }
+    function schedule() { stop(); timer = setTimeout(poll, 5000); }
+    async function poll() {
+      stop();
+      if (document.hidden) { schedule(); return; }
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', { headers: { Accept: 'application/json' } });
+        const json = await res.json();
+        if (json && json.ok) { render(json); return; }
+      } catch (e) { /* 一時的な通信断。次の回で拾う */ }
+      schedule();
+    }
+    btn.addEventListener('click', async () => {
+      if (posting) return;
+      const est = Number(state.planned_reserve_jpy) || 0;
+      // 作り直しはお金がかかるので確かめる
+      if (state.job && !window.confirm('もう一度作ります。月の枠から約 ' + yen(est) + ' を取り置きます (見込み・実際はふつうもっと少ない。前の画像は Drive に残ります)。作りますか？')) return;
+      posting = true;
+      btn.disabled = true;
+      statusEl.textContent = '依頼しています…';
+      if (!idemKey) idemKey = newKey();
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idempotency_key: idemKey }),
+        });
+        const json = await res.json().catch(() => null);
+        posting = false;
+        if (json && json.ok) { idemKey = null; render(json); return; }
+        statusEl.textContent = (json && json.error) || '依頼できませんでした';
+        if (res.status === 409 || res.status === 400) idemKey = null;
+        btn.disabled = !!state.blocked;
+        // 別のタブで作っている最中などは、最新の状況を取り直して出す (#1612 R1 Low)
+        if (res.status === 409) poll();
+      } catch (e) {
+        posting = false;
+        btn.disabled = false;
+        statusEl.textContent = '依頼できたか分かりません。もう一度押してください (二重にはなりません)';
+      }
+    });
+    render(state);
+  })();
+  // 🤖 構成をAIに作らせる (段階1・PR1-d)。
+  // 画面がするのは「押す」「状況を見る」「出す」だけ。判定も lint もサーバー側。
+  // 書き戻した構成は**ここに出るだけ**で、lp-tool へは人がコピーして貼る。
+  (function initLpCompose() {
+    const root = document.getElementById('lpc');
+    const holder = document.getElementById('lpc-json');
+    if (!root || !holder) return;
+    let state = null;
+    try { state = JSON.parse(holder.textContent); } catch (e) { return; }
+
+    const draftId = root.dataset.draftId;
+    const btn = document.getElementById('lpc-btn');
+    const statusEl = document.getElementById('lpc-status');
+    const specEl = document.getElementById('lpc-spec');
+    const resultEl = document.getElementById('lpc-result');
+    const textEl = document.getElementById('lpc-text');
+    const lintEl = document.getElementById('lpc-lint');
+    const openEl = document.getElementById('lpc-open');
+    const copyResultEl = document.getElementById('lpc-copy-result');
+    const failEl = document.getElementById('lpc-fail');
+    const measEl = document.getElementById('lpc-meas');
+    const imagesEl = document.getElementById('lpc-images');
+    const draftEl = document.getElementById('lpc-draft');
+    const draftTextEl = document.getElementById('lpc-draft-text');
+    const draftReasonEl = document.getElementById('lpc-draft-reason');
+    const guideEl = document.getElementById('lpc-guide');
+    const guideTextEl = document.getElementById('lpc-guide-text');
+
+    const RUNNING = ['queued', 'running'];
+    let timer = null;
+    // 二重クリック・通信リトライで依頼を増やさないためのキー。
+    // 🚨 押すたびに作り直さない — 返事が来ないまま押し直したときに別の依頼になってしまう
+    let idemKey = null;
+    let posting = false;
+
+    const LP_TOOL = 'https://bfaith-flow.onrender.com/lp-tool.html';
+    const newKey = () => (window.crypto?.randomUUID ? window.crypto.randomUUID()
+      : 'lpc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
+
+    function lintLine(lint) {
+      if (!lint) return '';
+      if (lint.ok === false) {
+        const n = (lint.errors || []).length;
+        return 'lint: ' + n + ' 件ひっかかりました';
+      }
+      const warn = (lint.warnings || []).length;
+      return 'lint: 通っています' + (warn ? ' (警告 ' + warn + ' 件 — 仕様書とパーサーのズレ。構成そのものは問題ありません)' : '');
+    }
+
+    // 実際に本回答を書いたモデルの確認 (ランナーが終わった後に付ける・codex exec review #1591 High)。
+    // 頼んだモデル (job.model) と違えば測定に数えない
+    const MODEL_CHECK_TEXT = { match: '一致', mismatch: '不一致', unknown: '未確認' };
+    // 🚨 本文は「一致」した done にしか来ない (サーバが出さない)。不一致・未確認は needs_review に落ちて理由が error に入る
+    function modelNote(job) {
+      if (!job.model) return '';
+      if (job.model_check === 'match') return job.model_label + '・モデル確認済み';
+      return job.model_label;
+    }
+    // できてから実モデルの確認が付くまで (ふつうは数十秒〜2 分) 見に行く。上限は置かない —
+    // サーバが 15 分付かなければ「未確認」で閉じる (= needs_review になってポーリングも止まる)。
+    // 🚨 completed_at を基準にしない: lease 切れの後に結果が届いた依頼は completed_at が古いまま (codex #1591 R3 Low)
+    // lpc-checking:start (試験がここを切り出して動かす)
+    // チェックを通らなかった (rejected) 依頼も、確認が付くまでは待つ (付けば参考の構成が出る・codex #1609 High)
+    const checkingModel = (job) => !!job && !!job.model && !job.model_check
+      && (job.status === 'done' || (job.status === 'failed' && job.error_code === 'rejected' && job.has_draft === true));
+    // lpc-checking:end
+
+    // lpc-images-text:start (試験がここを切り出して動かす・scripts/test-ph-lp-compose-ui.mjs)
+    // AI に渡す画像の並び。作っている間・確認待ちの間はその依頼で渡した画像だけ。終わった後は
+    // 「この依頼で渡した画像」(測定はこちら) と「もう一度押すと渡す画像」(いまの画像タブ) の両方
+    // (codex #1592 R2 High: 終わった依頼の並びだけを出すと、画像を差し替えて押し直したときに食い違う)
+    function lpcImagesText(s, inProgress) {
+      // 素材 (role = material:N) は画像フォルダの下のフォルダの画像。商品画像の並びとは分けて、場所と名前つきで出す
+      const isMat = (im) => /^material:/.test(String(im.role || ''));
+      const line = (imgs) => imgs.filter((im) => !isMat(im)).map((im) => im.label).join(' → ');
+      const matLine = (im) => im.label + ' ' + (im.folder ? im.folder + '/' : '') + (im.name || '');
+      const jobImgs = s.job && Array.isArray(s.job.images) && s.job.images.length ? s.job.images : null;
+      const plan = Array.isArray(s.image_plan) ? s.image_plan : [];
+      const lines = [];
+      if (jobImgs) {
+        lines.push('この依頼で AI に渡した画像: ' + line(jobImgs));
+        const mats = jobImgs.filter(isMat);
+        const omitted = Number(s.job.materials_omitted) || 0;
+        if (mats.length) lines.push('素材 (' + mats.length + ' 枚): ' + mats.map(matLine).join(' / '));
+        if (omitted) lines.push('⚠️ 上限 (素材 10 枚) で入らなかった素材 ' + omitted + ' 枚');
+      }
+      if (!inProgress && !s.blocked && plan.length) {
+        lines.push((jobImgs ? 'もう一度押すと渡す画像: ' : '押すと AI に渡す画像: ') + line(plan)
+          + (s.materials_folder ? ' + 素材 (画像フォルダの下のフォルダから最大 10 枚・押したときに読む)' : ''));
+      }
+      if (!lines.length) return '';
+      return lines.join('\n') + '\n— くらべるときは「📝 商品分析を準備」の ChatGPT 版にも、その依頼で AI に渡した画像を同じ順に添付し、下の「ChatGPT 版に貼る文」を貼ってください';
+    }
+    // lpc-images-text:end
+
+    function render(s) {
+      state = s;
+      const job = s.job;
+      const blocked = s.blocked;
+      const running = !!job && RUNNING.includes(job.status);
+      // 確認待ちの間も押させない (サーバも already_running で断る・codex #1591 R4 Medium)
+      btn.disabled = !!blocked || running || checkingModel(job) || posting;
+      // モデル名をボタンに出す。ここは「いま押したら使われるモデル」(サーバの設定)
+      const ml = s.model_label ? ' (' + s.model_label + ')' : '';
+      btn.textContent = running ? '🤖 AI' + ml + ' が作っています…' : '🤖 構成をAIに作らせる' + ml;
+
+      imagesEl.textContent = lpcImagesText(s, running || checkingModel(job));
+      const guide = job && typeof job.image_guide === 'string' ? job.image_guide : '';
+      guideEl.hidden = !guide;
+      if (guide && guideTextEl.value !== guide) guideTextEl.value = guide;
+      imagesEl.style.whiteSpace = 'pre-wrap';
+
+      specEl.textContent = s.spec
+        ? '仕様書: ' + s.spec.title + ' (' + String(s.spec.imported_at || '').slice(0, 10) + ' 取込)'
+        : '';
+
+      if (blocked) { statusEl.textContent = blocked; }
+      else if (!job) { statusEl.textContent = '押すと AI が構成の初稿を作ります (2分ほど)'; }
+      else if (running) {
+        statusEl.textContent = 'AI が構成を作っています… (2分ほどかかります・' + (job.elapsed_sec || 0) + ' 秒経過)';
+      } else if (job.status === 'done') {
+        // ここは「この依頼で実際に予約されたモデル」(設定がその後に変わっても、作ったモデルを出す)
+        if (job.model && !job.model_check) {
+          statusEl.textContent = 'できました。作ったモデル (' + job.model_label + ') を確かめています… 確かめたら本文を出します';
+        } else {
+          const mn = modelNote(job);
+          statusEl.textContent = 'できました (' + (mn ? mn + '・' : '') + (job.elapsed_sec || 0) + ' 秒'
+            + (job.review_rounds != null ? '・検品 ' + job.review_rounds + ' 巡' : '') + ')';
+        }
+      } else if (job.status === 'needs_review' && String(job.error_code || '').startsWith('model_')) {
+        // 実モデルが頼んだモデルと違う・確かめられなかった。本文は出さない (測定に数えない)
+        statusEl.textContent = '⚠️ ' + (job.error || '作ったモデルを確かめられませんでした。もう一度依頼してください');
+      } else if (job.status === 'needs_review') {
+        // 🚨 成否不明。自動では作り直さない (AI 枠を使ったかもしれないので人が見る)
+        statusEl.textContent = '結果を受け取れませんでした。もう一度依頼してください';
+      } else if (job.status === 'failed' && job.error_code === 'rejected' && checkingModel(job)) {
+        statusEl.textContent = '⚠️ チェックを通りませんでした。作ったモデル (' + job.model_label + ') を確かめています… 確かめたら書いた構成を参考として出します';
+      } else if (job.status === 'failed' && job.error_code === 'rejected' && job.has_draft && job.model_check && job.model_check !== 'match') {
+        // 実モデルが違った・確かめられなかったので参考の構成も出さない。その理由も出す (codex #1609 R2 Low)
+        statusEl.textContent = '作れませんでした: ' + (job.error || '理由が残っていません')
+          + (job.model_check === 'mismatch'
+            ? ' — 作ったモデル (' + (job.actual_model || '?') + ') が頼んだモデルと違ったので、書いた構成は出していません'
+            : ' — 作ったモデルを確かめられなかったので、書いた構成は出していません');
+      } else if (job.status === 'failed' && job.draft_text) {
+        statusEl.textContent = '⚠️ チェックを通りませんでした。書いた構成は下に参考として出しています (' + (job.elapsed_sec || 0) + ' 秒)';
+      } else if (job.status === 'failed') {
+        statusEl.textContent = '作れませんでした: ' + (job.error || '理由が残っていません');
+      } else {
+        statusEl.textContent = '';
+      }
+
+      const done = !!job && job.status === 'done' && job.output_text;
+      resultEl.hidden = !done;
+      if (done) {
+        if (textEl.value !== job.output_text) textEl.value = job.output_text;
+        lintEl.textContent = lintLine(job.lint);
+        const q = new URLSearchParams({ product_code: root.dataset.neCode || '', product_name: root.dataset.name || '' });
+        openEl.href = LP_TOOL + '?' + q.toString();
+      }
+      // 失敗したときも lint が残っていれば何がひっかかったかを出す (直す手がかり)。
+      // 🚨 出す場所は resultEl の**外**。中に書くと「できた」ときしか見えない (codex exec review P2)
+      // チェックを通らなかった構成 (参考)。本文と同じく、実モデルが一致したものだけサーバが返す
+      const draft = !!job && job.status === 'failed' && typeof job.draft_text === 'string' && job.draft_text ? job.draft_text : '';
+      draftEl.hidden = !draft;
+      if (draft) {
+        if (draftTextEl.value !== draft) draftTextEl.value = draft;
+        draftReasonEl.textContent = '指摘されたこと: ' + (job.error || '(理由が残っていません)');
+      }
+      const failing = !!job && job.status === 'failed' && job.lint && job.lint.ok === false;
+      failEl.hidden = !failing;
+      if (failing) {
+        const errs = (job.lint.errors || []).slice(0, 8).map((e) => '・' + (e.detail || e.label)).join('\n');
+        failEl.textContent = lintLine(job.lint) + (errs ? '\n' + errs : '')
+          + ((job.lint.errors || []).length > 8 ? '\n…ほか ' + ((job.lint.errors || []).length - 8) + ' 件' : '');
+        failEl.style.whiteSpace = 'pre-wrap';
+      }
+
+      // 測定台帳 (設計 §7.1b) に書き写す値。終わった job だけ出す
+      const terminal = !!job && ['done', 'failed', 'needs_review', 'cancelled'].includes(job.status);
+      measEl.hidden = !terminal;
+      if (terminal) {
+        measEl.textContent = '測定用 … job_id=' + job.id + ' / spec_id=' + job.spec_id
+          // 🚨 切り詰めない — 台帳に packet_hash を残すのは「この測定がどの材料で作られたか」を
+          // 後から突き合わせるためなので、頭 12 文字だけでは用をなさない (codex exec review P2)
+          + ' / packet_hash=' + String(job.packet_hash || '')
+          + ' / 所要秒=' + (job.elapsed_sec != null ? job.elapsed_sec : '?')
+          + ' / 期限内=' + (job.within_deadline === null ? '?' : (job.within_deadline ? 'はい' : 'いいえ'))
+          + ' / lint=' + (job.lint ? (job.lint.ok ? '通った' : 'ひっかかった') : 'なし')
+          + ' / 検品巡回=' + (job.review_rounds != null ? job.review_rounds : '?')
+          + ' / モデル=' + (job.model || 'なし (AI を呼ぶ前に止まった)')
+          + (job.model ? ' / 実モデル=' + (job.actual_model || '-')
+            + ' / モデル確認=' + (MODEL_CHECK_TEXT[job.model_check] || '確認中') : '')
+          + ' / 画像=' + (job.images || []).map((im) => im.label + ':' + im.file_id).join(',')
+          + ' / 状態=' + job.status;
+      }
+
+      if (running || checkingModel(job)) schedule(); else stop();
+    }
+
+    function stop() { if (timer) { clearTimeout(timer); timer = null; } }
+    function schedule() { stop(); timer = setTimeout(poll, 5000); }
+
+    async function poll() {
+      // 🚨 `timer = null` ではなく stop()。null にするだけだと、
+      //    待っている setTimeout を消さずに手放すことになり、
+      //    それが後から発火して**ポーリングが 2 本に増える** (codex exec review P2)
+      stop();
+      // タブが裏に回っている間は叩かない (5 秒おきが積み上がらないように)
+      if (document.hidden) { schedule(); return; }
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-compose', { headers: { Accept: 'application/json' } });
+        const json = await res.json();
+        if (json && json.ok) { render(json); return; }
+      } catch (e) { /* 一時的な通信断。次の回で拾う */ }
+      schedule();
+    }
+
+    btn.addEventListener('click', async () => {
+      if (posting) return;
+      posting = true;
+      btn.disabled = true;
+      statusEl.textContent = '依頼しています…';
+      if (!idemKey) idemKey = newKey();
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-compose', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idempotency_key: idemKey }),
+        });
+        const json = await res.json();
+        posting = false;
+        if (!res.ok || !json.ok) {
+          statusEl.textContent = json?.error || '依頼できませんでした';
+          btn.disabled = false;
+          return;
+        }
+        // 受け付けられた = このキーは使い切り。次に押すときは新しい依頼
+        idemKey = null;
+        render(json);
+      } catch (e) {
+        // 🚨 ここで idemKey を消さない。届いているかもしれないので、押し直しは同じキーで送る
+        posting = false;
+        btn.disabled = false;
+        statusEl.textContent = '依頼できたか分かりません。もう一度押してください (二重にはなりません)';
+      }
+    });
+
+    document.getElementById('lpc-draft-copy').addEventListener('click', async () => {
+      const r = document.getElementById('lpc-draft-result');
+      try { await navigator.clipboard.writeText(draftTextEl.value); r.textContent = 'コピーしました (指摘されたことを直してから使ってください)'; }
+      catch (e) { draftTextEl.select(); r.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
+    });
+    document.getElementById('lpc-guide-copy').addEventListener('click', async () => {
+      const r = document.getElementById('lpc-guide-result');
+      try { await navigator.clipboard.writeText(guideTextEl.value); r.textContent = 'コピーしました。ChatGPT 版の定型文の最後に貼ってください'; }
+      catch (e) { guideTextEl.select(); r.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
+    });
+    document.getElementById('lpc-copy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(textEl.value); copyResultEl.textContent = 'コピーしました。lp-tool に貼ってください'; }
+      catch (e) { textEl.select(); copyResultEl.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
+    });
+
+    // 裏に回って戻ってきたら、待たずに 1 回見る。
+    // 🚨 待機中の setTimeout を**先に消す**。消さないと表裏を行き来するたびに
+    //    ポーリングが増えていく (codex exec review P2)
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && timer) { stop(); poll(); }
+    });
+
+    render(state);
   })();
   // 定型文ボタン (画像工程 v2)。文面はサーバー (lib/prompt-templates.js) が組み立て、画面は表示とコピーだけ
   (function initPromptButtons() {
@@ -4993,7 +6615,7 @@ th.attr-unknown { color: #dc2626; }
       if (json.demoted) warns.push('必須項目が欠けたため、ステータスを「下書き」に戻しました: ' + json.demoted.join(' / '));
       if (warns.length) alert(msg + '\n\n⚠ ' + warns.join('\n'));
       result.textContent = msg;
-      setTimeout(() => location.reload(), warns.length ? 100 : 600);
+      setTimeout(() => reloadSafely(), warns.length ? 100 : 600);
     } finally {
       btn.disabled = false; btn.textContent = 'フォルダから自動セット';
     }
@@ -5069,11 +6691,11 @@ th.attr-unknown { color: #dc2626; }
         const warns = json.warnings || [];
         if (warns.length) alert(done + '\n\n⚠ ' + warns.join('\n'));
         result.textContent = done;
-        setTimeout(() => location.reload(), warns.length ? 100 : 600);
+        setTimeout(() => reloadSafely(), warns.length ? 100 : 600);
       } catch (e) {
         // 通信切断・応答が JSON でない等。サーバー側では登録まで済んでいる可能性があるので、画面を読み直して確かめてもらう (Codex R1 medium)
         alert('登録の結果を確認できませんでした (' + e.message + ')。画面を読み直して、白抜きの枠と受信箱を確認してください');
-        location.reload();
+        reloadSafely();
       } finally {
         busy = false; el.disabled = false;
       }
@@ -5106,7 +6728,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { alert('保存失敗 (' + ta.dataset.kind + '): ' + (json.error || '')); return; }
       }
       result.textContent = '保存しました';
-      setTimeout(() => location.reload(), 600);
+      setTimeout(() => reloadSafely(), 600);
     });
   });
 
@@ -5124,7 +6746,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { out.textContent = ''; alert(json.error || 'エラーが発生しました'); return; }
         out.textContent = '🔗 ' + json.synced.length + ' SKU に紐づけました'
           + (json.unmatched.length ? ' / ページ側に無いSKU: ' + json.unmatched.join(', ') : '');
-        setTimeout(() => location.reload(), 1500);
+        setTimeout(() => reloadSafely(), 1500);
       } catch (e) {
         out.textContent = '通信エラー: ' + e.message;
       } finally { syncBtn.disabled = false; }
@@ -5178,7 +6800,7 @@ th.attr-unknown { color: #dc2626; }
           out.textContent = '';
           alert(j.error || '保存に失敗しました');
           // 409 = 別の人が先に動かした。古い画面のまま操作を続けさせない
-          if (res.status === 409) location.reload();
+          if (res.status === 409) reloadSafely();
           return false;
         }
         // 連続で操作できるよう、次の楽観ロック用に最新の updated_at を持ち直す
@@ -5257,7 +6879,7 @@ th.attr-unknown { color: #dc2626; }
             const j = await r.json();
             if (!j.ok) { alert(j.error || '取り消せませんでした'); decUndoBtn.disabled = false; return; }
             if (j.withdrawn) alert('判断を取り消し、セット商品「' + j.withdrawn.name + '」(' + j.withdrawn.neCode + ') を取り下げました');
-            location.reload();
+            reloadSafely();
           } catch (e) {
             alert('通信エラー: ' + e.message);
             decUndoBtn.disabled = false;
@@ -5307,10 +6929,10 @@ th.attr-unknown { color: #dc2626; }
             res.textContent = '';
             alert(j.error || '記録できませんでした');
             // 409 = 別の人が先に動かした。古い画面のまま操作を続けさせない
-            if (r.status === 409) location.reload();
+            if (r.status === 409) reloadSafely();
             return;
           }
-          location.reload();
+          reloadSafely();
         } catch (e) {
           res.textContent = '';
           alert('通信エラー: ' + e.message);
@@ -5339,7 +6961,7 @@ th.attr-unknown { color: #dc2626; }
           const statusChanged = r && r.draftStatus && r.draftStatus !== '<%= draft.status %>';
           if (r && (state.value === 'done' || statusChanged) && !advanced) {
             advanced = true;
-            setTimeout(function () { location.reload(); }, 900);
+            setTimeout(function () { reloadSafely(); }, 900);
           }
         });
       }
@@ -5352,7 +6974,7 @@ th.attr-unknown { color: #dc2626; }
         claim.addEventListener('click', async function () {
           claim.disabled = true;
           const ok = await save(tr, { assignee_id: <%= myStaffId == null ? 'null' : myStaffId %> });
-          if (ok) location.reload(); else claim.disabled = false;
+          if (ok) reloadSafely(); else claim.disabled = false;
         });
       }
       if (due) due.addEventListener('change', function () { save(tr, { due_date: due.value }); });
@@ -5373,7 +6995,7 @@ th.attr-unknown { color: #dc2626; }
           });
           const j = await res.json();
           if (!j.ok) { alert(j.error || '切り替えに失敗しました'); exBtn.disabled = false; return; }
-          location.reload();
+          reloadSafely();
         } catch (e) { alert('通信エラー: ' + e.message); exBtn.disabled = false; }
       });
     }
@@ -5393,13 +7015,13 @@ th.attr-unknown { color: #dc2626; }
         if (!j.ok) {
           mlOut.textContent = '';
           alert(j.error || '保存に失敗しました');
-          if (res.status === 409) location.reload();
+          if (res.status === 409) reloadSafely();
           return false;
         }
         if (j.version != null) tr.dataset.version = String(j.version);
         mlOut.textContent = '保存しました';
         // 全モールが決着すると工程「出品・展開」が閉じる → 上部の表示が変わるので読み直す
-        if (j.listingCompleted) setTimeout(function () { location.reload(); }, 900);
+        if (j.listingCompleted) setTimeout(function () { reloadSafely(); }, 900);
         return true;
       } catch (e) {
         mlOut.textContent = '';
@@ -5419,7 +7041,7 @@ th.attr-unknown { color: #dc2626; }
         claim.addEventListener('click', async function () {
           claim.disabled = true;
           const ok = await saveMall(tr, { assignee_id: <%= myStaffId == null ? 'null' : myStaffId %> });
-          if (ok) location.reload(); else claim.disabled = false;
+          if (ok) reloadSafely(); else claim.disabled = false;
         });
       }
     });
@@ -5587,7 +7209,7 @@ th.attr-unknown { color: #dc2626; }
               + '\n取り込まれるまで楽天には出品できません (この画面を開いたときに自動で解除されます)。');
           }
           out.textContent = '差し替えました';
-          setTimeout(function () { location.reload(); }, 800);
+          setTimeout(function () { reloadSafely(); }, 800);
         } catch (e) {
           out.textContent = '';
           alert('通信エラー: ' + e.message);
@@ -5618,7 +7240,7 @@ th.attr-unknown { color: #dc2626; }
           const j = await res.json();
           if (!j.ok) { out.textContent = ''; alert(j.error || '保存できませんでした'); sipSave.disabled = false; return; }
           out.textContent = '保存しました';
-          setTimeout(function () { location.reload(); }, 600);
+          setTimeout(function () { reloadSafely(); }, 600);
         } catch (e) {
           out.textContent = ''; alert('通信エラー: ' + e.message); sipSave.disabled = false;
         }
@@ -5653,7 +7275,7 @@ th.attr-unknown { color: #dc2626; }
             body: JSON.stringify({ state: state, reason: reason }),
           });
           const j = await res.json();
-          if (j.ok) location.reload();
+          if (j.ok) reloadSafely();
           else { alert(j.error || '更新できませんでした'); btn.disabled = false; }
         } catch (e) { alert('通信エラー: ' + e.message); btn.disabled = false; }
       });
@@ -5667,10 +7289,431 @@ th.attr-unknown { color: #dc2626; }
         try {
           const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/parent-snapshot-ack', { method: 'POST' });
           const j = await res.json();
-          if (j.ok) location.reload();
+          if (j.ok) reloadSafely();
           else { alert(j.error || '更新できませんでした'); parentAck.disabled = false; }
         } catch (e) { alert('通信エラー: ' + e.message); parentAck.disabled = false; }
       });
     }
   })();
+  // ─── 未保存の入力を「読み直し」で失わせない (2026-09-21 中原さん) ───────────────
+  // この画面は保存の流儀が 3 つ混ざっている:
+  //   ①即保存   … SKU別売価・画像の重要度・自社商品チェック (触った時点で DB へ)
+  //   ②自動保存 … 商品情報タブ (入力停止 1 秒 + 離脱時ビーコン)
+  //   ③明示保存 … 基本情報 / カテゴリ・属性 / Yahoo!項目 (**ボタンを押すまで DB に行かない**)
+  // そこへ読み直し (location.reload) が 30 箇所あり、③の欄に打った値だけが黙って消えていた。
+  //   例: 売価を打つ → 「セット商品にする?」を記録 → 読み直しで売価が空に戻る (2026-09-21 中原さん)
+  // 🚨 引き金 (読み直す操作) を 1 つずつ塞ぐやり方は必ず数え漏らす。関所は**読み直す側**に
+  //    1 本だけ置く: reloadSafely() が未保存を sessionStorage へ退避し、読み直した後に書き戻す。
+  // 🚨 退避するだけで**保存はしない**。勝手に保存すると、楽天の全量 upsert が持つ
+  //    「画面を開いたときの値」(shipping_method_group_prev / model_conflict_seen) を
+  //    人の意図と関係なく進めてしまう。値を戻して見せるところまでが仕事で、押すのは人。
+  // 🚨 ここから「未保存ガード」の切り出し範囲 — smoke が **描画ではなくこの素の JS** を
+  //    vm で動かして、打った値が読み直しで戻るところまで確かめる。
+  //    EJS の埋め込み (<%= %>) をこの範囲に入れない (入れると素の JS として動かせなくなる)
+  function initUnsavedGuard(KEY) {
+    // 退避する欄 = ③明示保存の**固定**入力欄だけ。①②の欄は消えないので入れない。
+    // 🚨 動的に増減する行 (商品属性の表・店舗内カテゴリの並び) はこの版では対象外
+    //    (行が増減すると「どの行に戻すか」が決まらない)。SKU表は①即保存なので消えない。
+    //   route   … どの保存経路で DB に行くか (その経路が通ったら「保存済み」を進める)
+    //   button  … 未保存の印を出すボタン (その欄が見えているタブのもの)
+    //   restore … false なら**書き戻さない** (印と離脱の警告だけ)。
+    //     🚨 値を戻すだけでは画面のほかの状態と食い違う欄がある (Codex R1):
+    //        配送方法 … ヤフー別扱い (yahooOverrideOn) は change でしか動かない
+    //        送料込み・納期 … ふだんは固定表示で、解除したときだけ選べる
+    //        画像タブの商品情報 … 「自動のまま/手入力」の印 (data-edited) は入力でしか立たない
+    //        Yahoo!の配送方法 … 配送方法の連動で書き換わる
+    //      戻すと噛み合わないまま保存されるので、戻さずに「未保存です」とだけ知らせる
+    //   refresh … 書き戻した後に input を出す欄。**自分の表示だけ**を描き直すものに限る
+    //     🚨 ほかの欄を書き換えるハンドラ (ASIN → Amazon URL) を走らせない (Codex R1)。
+    //        競合で守ったはずの欄が、別の欄の復元で上書きされてしまう
+    const FIELDS = [
+      // 「基本情報を保存」(基本情報 API)
+      { id: 'f-name', label: '商品名', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-official-url', label: '公式ページURL', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-price', label: '売価', route: 'basic', button: 'save-basic-btn', refresh: true },
+      { id: 'y-tax', label: '税率', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-asin', label: 'ASIN', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-amazon-url', label: 'Amazon URL', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-has-variation', label: 'バリエーションあり', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-memo', label: 'メモ', route: 'basic', button: 'save-basic-btn' },
+      // 配送・送料・納期は楽天の項目だが基本情報タブにある (「基本情報を保存」が一緒に送る)
+      { id: 'rk-shipping-group', label: '配送方法', route: 'rakuten', button: 'save-basic-btn', restore: false },
+      { id: 'rk-postage', label: '送料込み', route: 'rakuten', button: 'save-basic-btn', restore: false },
+      { id: 'rk-delivery-date', label: '納期', route: 'rakuten', button: 'save-basic-btn', restore: false },
+      // 「カテゴリ・属性を保存」/「出品情報を保存」(楽天 API)
+      { id: 'rk-genre', label: 'ジャンルID', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-variant-selector', label: 'バリエーションの項目名', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-catalog-exemption', label: 'カタログIDなしの理由', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-article', label: 'メーカー型番', route: 'rakuten', button: 'rk-save-btn-cat' },
+      // 🚨 戻さない: 「IDあり/IDなし」のラジオと入力枠の出し分けは DB の値のまま描かれるので、
+      //    値だけ戻すと**画面に出ていない JAN が次の保存で送られる** (Codex R2)
+      { id: 'f-jan', label: 'JANコード', route: 'jan', button: 'rk-save-btn-cat', restore: false },
+      { id: 'rk-whitebg', label: '白抜き背景画像', route: 'rakuten', button: 'rk-save-btn' },
+      // 「Yahoo!項目を保存」(Yahoo API)
+      { id: 'y-price', label: 'Yahoo!売価', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-price-sagawa', label: 'Yahoo!売価 (佐川)', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-delivery', label: '配送方法 (Yahoo!)', route: 'yahoo', button: 'save-yahoo-btn', restore: false },
+      { id: 'y-category-id', label: 'Yahoo!カテゴリID', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-path', label: 'Yahoo!path', route: 'yahoo', button: 'save-yahoo-btn' },
+      // 「画像制作情報を保存」(image-production API)
+      { id: 'ip-status', label: '画像制作の状態', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-tier', label: '重要度ランク', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-type', label: '制作タイプ', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-aplus', label: 'A+コンテンツ', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-aplus-related', label: 'A+の関連商品', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-camera-url', label: '撮影指示URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-refcol', label: '参考コレクション', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-designer', label: 'デザイナー', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-composer', label: 'ページ構成', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-request', label: '制作依頼の文面', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-canva-url', label: 'Canva URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-top-compose', label: 'TOP画像の構成', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-top-ref-url', label: 'TOP画像の参考URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-material', label: '素材の状態', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-back-info', label: '裏面情報', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-product-info', label: '画像タブの商品情報', route: 'image', button: 'save-ip-btn', restore: false },
+    ];
+    // これより古い退避は使わない (読み直しが途中で流れて、だいぶ経ってから値が現れるのを防ぐ)
+    const MAX_AGE_MS = 30 * 60 * 1000;
+
+    const readValue = (el) => (el.type === 'checkbox' ? (el.checked ? '1' : '0') : String(el.value == null ? '' : el.value));
+    function writeValue(el, v) {
+      if (el.type === 'checkbox') el.checked = (v === '1');
+      else el.value = v;
+    }
+
+    const tracked = [];
+    for (const f of FIELDS) {
+      const el = document.getElementById(f.id);
+      if (!el) continue;   // その商品では出ていない欄 (固定表示・SKU表へ寄せた欄) は追わない
+      const panel = el.closest('.tab-panel');
+      tracked.push({ restore: true, refresh: false, ...f, el, tab: panel ? panel.id : null, saved: readValue(el) });
+    }
+    const dirty = () => tracked.filter((f) => readValue(f.el) !== f.saved);
+    let armed = false;   // reloadSafely が始めた読み直しの最中か (取り消されたら下ろす)
+    let armedInflight = {};   // その読み直しで応答を待っていた欄 (id → 送った値)
+
+    // ── 印 (ボタンの横・タブ) ──
+    const marks = new Map();
+    for (const f of tracked) {
+      if (marks.has(f.button)) continue;
+      const btn = document.getElementById(f.button);
+      if (!btn) continue;
+      const span = document.createElement('span');
+      span.className = 'unsaved-mark';
+      span.textContent = '● 未保存';
+      btn.insertAdjacentElement('afterend', span);
+      marks.set(f.button, span);
+    }
+    const tabMarks = new Map();
+    document.querySelectorAll('#tabbar .tab-btn').forEach((b) => {
+      const span = document.createElement('span');
+      span.className = 'tab-unsaved';
+      span.textContent = '●';
+      span.title = '未保存の入力があります';
+      b.appendChild(span);
+      tabMarks.set(b.dataset.tab, span);
+    });
+    function paint() {
+      const ds = dirty();
+      const buttons = new Set(ds.map((f) => f.button));
+      const tabs = new Set(ds.map((f) => f.tab).filter(Boolean));
+      for (const [id, span] of marks) span.classList.toggle('on', buttons.has(id));
+      for (const [id, span] of tabMarks) span.classList.toggle('on', tabs.has(id));
+    }
+    // 🚨 読み直しをやめて編集を続けた = さっき退避した分はもう要らない (Codex R3)。
+    //    残したままだと「値を元に戻してから自分で再読み込み」した人に、取り消した入力が復活する
+    function onTouch() {
+      if (armed) { armed = false; mute = false; forget(); }
+      paint();
+    }
+    for (const f of tracked) {
+      f.el.addEventListener('input', onTouch);
+      f.el.addEventListener('change', onTouch);
+    }
+
+    // ── 退避 / 書き戻し ──
+    const forget = () => { try { sessionStorage.removeItem(KEY); } catch (_) { /* 使えない環境は諦める */ } };
+    /**
+     * いまの未保存を退避に書く。
+     * @param {Object<string,string>} inflight 応答を待っている欄 (id → 送った値)。
+     *   🚨 この欄は**画面の値が基準と同じでも退避する** (Codex R2)。DB が送った値に
+     *   変わっているかもしれず、退避しないと黙ってその値に戻ってしまう
+     * @returns {boolean} 戻せない欄を残さず書けたか
+     */
+    /**
+     * 「送った値が保存されると DB はこうなるはず」の候補。
+     * 🚨 サーバーの正規化 (trim・整数への丸め) を画面で完全には再現できない (Codex R3)。
+     *    ここは**当てにいく**だけで、外したときは「戻さずに、打っていた内容を見せる」に倒れる
+     *    (黙って上書きする方向には倒さない)
+     */
+    function sentCandidates(v) {
+      const raw = String(v == null ? '' : v);
+      const out = [raw];
+      const t = raw.trim();
+      if (out.indexOf(t) < 0) out.push(t);
+      const n = Number(t);
+      if (t !== '' && Number.isFinite(n)) {
+        const rounded = String(Math.round(n));
+        if (out.indexOf(rounded) < 0) out.push(rounded);
+      }
+      return out;
+    }
+    function writeStash(inflight) {
+      const sending = inflight || {};
+      const isSending = (id) => Object.prototype.hasOwnProperty.call(sending, id);
+      const all = dirty();
+      const blocked = all.filter((f) => !f.restore).length;
+      const ds = all.filter((f) => f.restore)
+        .concat(tracked.filter((f) => f.restore && isSending(f.id) && all.indexOf(f) < 0));
+      // 🚨 戻せない欄 (restore:false) の未保存が残っているときは false。
+      //    「退避した」と言い切ると、消える欄があるのに警告まで消してしまう
+      if (!ds.length) { forget(); return blocked === 0; }
+      // base = 「これなら自分の変更」と言える DB の値の候補。書き戻す前にこれと照合する。
+      // 応答待ちの欄は**送った値も候補**に入れる (どちらとも違えば、ほかの人が変えたということ)
+      const data = { at: Date.now(), values: {}, base: {} };
+      for (const f of ds) {
+        data.values[f.id] = readValue(f.el);
+        const cands = [f.saved];
+        if (isSending(f.id)) cands.push(...sentCandidates(sending[f.id]));
+        data.base[f.id] = cands;
+      }
+      try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (_) { return false; }
+      return blocked === 0;
+    }
+    /**
+     * 読み直しの前に呼ぶ。ここで一度書くのは、**退避できるかをその場で確かめる**ため
+     * (容量不足・戻せない欄が残るなら、離脱の警告を消さずに読み直す)。
+     * 🚨 中身は出ていく瞬間 (pagehide) に書き直す (Codex R3)。読み込みの応答が遅れても
+     *    退避は消えず、その間に打ち直した分まで残る。時間では「取り消し」と「待ち」を区別できない
+     * @returns {boolean} 未保存を失わずに読み直せるか
+     */
+    function stash(opts) {
+      armed = true;
+      armedInflight = (opts && opts.inflight) || {};
+      return writeStash(armedInflight);
+    }
+    function restore() {
+      let data = null;
+      try {
+        const raw = sessionStorage.getItem(KEY);
+        if (raw) data = JSON.parse(raw);
+      } catch (_) { data = null; }
+      // 🚨 読んだら必ず消す。戻し損ねた分が残り続けると、あとで開いた人に古い値が突然現れる
+      forget();
+      if (!data || !data.values) return;
+      if (typeof data.at !== 'number' || Date.now() - data.at > MAX_AGE_MS) return;
+      // 🚨 先に**全部**の可否を決めてから書く (Codex R1)。書きながら決めると、
+      //    片方を戻したときに走るハンドラが、もう片方の判定より先に値を書き換える
+      const plan = [], conflicted = [];
+      for (const f of tracked) {
+        if (!f.restore) continue;
+        const v = data.values[f.id];
+        if (v === undefined) continue;
+        if (v === f.saved) continue;   // 読み直した DB の値と同じ = もう保存されている
+        const base = data.base ? data.base[f.id] : undefined;
+        // 候補は配列 (元の値と、応答を待っていた欄は送った値)。どれとも違えば、
+        // 🚨 退避のあいだに**ほかの人**が変えたということなので戻さない (黙って隠さない)
+        const cands = base === undefined ? undefined : (Array.isArray(base) ? base : [base]);
+        if (cands !== undefined && cands.indexOf(f.saved) < 0) { conflicted.push({ label: f.label, value: v }); continue; }
+        plan.push({ f, v });
+      }
+      for (const p of plan) writeValue(p.f.el, p.v);
+      // 表示の描き直しは、**自分の欄だけ**を直すものに限って後から出す
+      for (const p of plan) { if (p.f.refresh) p.f.el.dispatchEvent(new Event('input', { bubbles: true })); }
+      if (plan.length || conflicted.length) showBanner(plan.map((p) => p.f), conflicted);
+      paint();
+    }
+
+    const zone = document.getElementById('unsaved-zone');
+    function showBanner(restored, conflicted) {
+      if (!zone) return;
+      zone.replaceChildren();
+      const box = document.createElement('div');
+      box.className = 'unsaved-banner';
+      const lines = [];
+      if (restored.length) lines.push('保存前だった入力を戻しました: ' + restored.map((f) => f.label).join('・'));
+      if (conflicted.length) {
+        lines.push('⚠️ ほかの人が先に変えていたため戻さなかった項目: '
+          + conflicted.map((c) => c.label).join('・'));
+      }
+      for (const text of lines) {
+        const row = document.createElement('div');
+        row.textContent = text;
+        box.appendChild(row);
+      }
+      // 🚨 戻さなかった項目は、**打っていた内容を全文**残す (Codex R3)。
+      //    退避は 1 回で使い切るので、ここで切り詰めると商品名・メモの続きが二度と拾えない
+      for (const c of conflicted) {
+        const det = document.createElement('details');
+        const sum = document.createElement('summary');
+        sum.style.cssText = 'cursor:pointer; font-size:12px; margin-top:4px;';
+        sum.textContent = c.label + ' — 打っていた内容を見る (コピーして貼り直せます)';
+        const ta = document.createElement('textarea');
+        ta.readOnly = true;
+        ta.rows = 3;
+        ta.style.cssText = 'width:100%; margin-top:4px; font-size:12px;';
+        ta.value = String(c.value == null ? '' : c.value);
+        det.appendChild(sum);
+        det.appendChild(ta);
+        box.appendChild(det);
+      }
+      const note = document.createElement('div');
+      note.style.cssText = 'margin-top:4px; font-size:11.5px;';
+      note.textContent = 'まだ保存されていません。内容を確かめて、いつもの保存ボタンを押してください。';
+      box.appendChild(note);
+      if (restored.length) {
+        const undo = document.createElement('button');
+        undo.type = 'button';
+        undo.className = 'btn btn-sm';
+        undo.style.marginTop = '6px';
+        undo.textContent = '戻さない (読み直した内容のままにする)';
+        undo.addEventListener('click', () => {
+          for (const f of restored) writeValue(f.el, f.saved);
+          for (const f of restored) { if (f.refresh) f.el.dispatchEvent(new Event('input', { bubbles: true })); }
+          zone.replaceChildren();
+          paint();
+        });
+        box.appendChild(undo);
+      }
+      zone.appendChild(box);
+    }
+
+    // ── 画面を離れるときの警告 ──
+    // 読み直し (reloadSafely) は退避できたときだけ警告を止める。
+    // タブを閉じる・別のページへ行く場合は sessionStorage ごと失われるので必ず警告する
+    let mute = false;
+    // 🚨 退避は「実際に出ていく瞬間の入力」と合わせる (Codex R3)。
+    //    reloadSafely が始めた読み直しのときだけ書き直す — ふつうの離脱 (タブを閉じる・
+    //    別のページへ行く) では退避しない。警告を見たうえで出ていくのは、捨てる意思だから
+    window.addEventListener('pagehide', () => {
+      if (!armed) return;
+      try { writeStash(armedInflight); } catch (_) { /* 出ていく途中なので、書けなければそのまま */ }
+    });
+    window.addEventListener('beforeunload', (ev) => {
+      if (mute || !dirty().length) return;
+      ev.preventDefault();
+      ev.returnValue = '';
+    });
+
+    const api = {
+      stash,
+      mute: () => { mute = true; },
+      // 🚨 保存を**送る直前**に呼んで、送った値を控える (Codex R1)。応答が返ってから
+      //    画面の値を読むと、通信中に打ち直された分まで「保存済み」にしてしまう
+      //    ids = 経路に属さないが、その保存でいっしょに送る欄 (Yahoo!保存の税率など)
+      saving: (routes, ids) => tracked
+        .filter((f) => routes.indexOf(f.route) >= 0 || (ids ? ids.indexOf(f.id) >= 0 : false))
+        .map((f) => ({ f, v: readValue(f.el) })),
+      // 🚨 保存が通ったら控えた値まで基準を進める。ここを忘れると、次の読み直しで
+      //    「自分が保存した値」を他人の変更と誤判定して、打ち直した分を捨てる (Codex R1)
+      saved: (snap) => { if (!snap) return; for (const s of snap) s.f.saved = s.v; paint(); },
+      // 値が分かっている 1 欄ぶん (JAN のように専用の保存経路を持つ欄)
+      savedValue: (id, v) => { for (const f of tracked) { if (f.id === id) f.saved = String(v == null ? '' : v); } paint(); },
+      dirtyLabels: () => dirty().map((f) => f.label),
+    };
+    restore();
+    paint();
+    return api;
+  }
+  // ここまでが「未保存ガード」の切り出し範囲
+  phKeep = initUnsavedGuard('ph-unsaved:<%= draft.id %>');
+
+  // ─── 基本情報の即保存 (2026-09-21 中原さん「もっと根本解決ないの?」) ──────────────
+  // 明示保存の欄は「ボタンを押すまで DB に行かない」ので、読み直しで消える事故が起きていた
+  // (#1397 で退避と書き戻しを入れた)。ここでは**未保存でいる時間そのもの**を短くする:
+  // 入力を確定した時点 (change) で、その欄だけを送る。サーバーは送られたキーだけ更新し、
+  // 送らなかったキーは既存値のまま (部分保存)。
+  // 🚨 公式ページURL・Amazon URL は即保存にしない。空にした瞬間に AI 生成のゲートが壊れて
+  //    「基本情報入力」工程が自動で差し戻される — URL の打ち替えは「消す → 入れ直す」の
+  //    2 手なので、途中の 1 手のたびに差し戻されてしまう。この 2 欄はボタンで保存する
+  // 🚨 バリエーションのチェックも即保存にしない (NE が判定できる商品では送らない、という
+  //    出し分けがあり、ここだけ別経路で送ると DB に焼いてしまう)
+  // ここに無い欄 (配送方法・ジャンル・Yahoo!項目・画像制作情報) は従来どおりボタン保存で、
+  // 打ちっぱなしのまま読み直しても #1397 の関所が退避して書き戻す
+  // 🚨 ここから「基本情報の即保存」の切り出し範囲 — テストが**描画ではなくこの素の JS** を
+  //    vm で動かして、確定した欄が送られること・失敗しても打った値を戻さないことを確かめる。
+  //    EJS の埋め込み (<%= %>) をこの範囲に入れない
+  function initBasicAutoSave() {
+    const FIELDS = [
+      { id: 'f-name', key: 'name', label: '商品名', required: true },
+      { id: 'f-price', key: 'price', label: '売価' },
+      { id: 'f-asin', key: 'asin', label: 'ASIN' },
+      { id: 'y-tax', key: 'tax_rate', label: '税率' },
+      { id: 'f-memo', key: 'memo', label: 'メモ' },
+    ];
+    const marks = new Map();
+    function markOf(f, el) {
+      // 🚨 nextElementSibling を使い回さない (売価の次は利益の枠。別の要素に文字を入れてしまう)
+      if (!marks.has(f.id)) {
+        const span = document.createElement('span');
+        span.className = 'autosave-mark';
+        el.insertAdjacentElement('afterend', span);
+        marks.set(f.id, span);
+      }
+      return marks.get(f.id);
+    }
+    function say(f, el, text, bad) {
+      const span = markOf(f, el);
+      span.classList.toggle('bad', !!bad);
+      span.textContent = text;
+    }
+    const hhmm = () => new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+
+    function save(f, el) {
+      // 🚨 送る値は**確定した瞬間**に捕まえる (Codex R1)。列に並んでから el.value を読むと、
+      //    待っている間に打ち直された値を送ったり、古い応答で画面を書き戻したりする
+      const value = el.value;
+      if (f.required && !String(value).trim()) {
+        // サーバーは空の商品名を既存値で受け流すので、送ると画面と DB が食い違う
+        say(f, el, f.label + 'は空にできません。入れ直してください', true);
+        return Promise.resolve();
+      }
+      // 保存は 1 本の列に並べる (欄ごとの即保存も、ボタンのまとめ保存も同じ列)
+      return phEnqueueSave(async () => {
+        const body = {};
+        body[f.key] = value;
+        let json;
+        const doneSending = phSending([[f.id, value]]);
+        let settled = false;   // 保存できた/できなかったが**はっきりした**か
+        try { json = await post(BASE, body); settled = true; } catch (_) { json = null; }
+        finally {
+          // 🚨 通信エラーは「保存できたか分からない」(Codex R3)。送信の記録を消さない —
+          //    消すと、応答待ちに元の値へ戻した人の意思が退避されず、DB の値に黙って戻る
+          if (settled) doneSending();
+        }
+        if (!json || !json.ok) {
+          // 🚨 打った値は戻さない (人の入力を消さない)。未保存の印が出たままになるので、
+          //    「基本情報を保存」で拾えるし、読み直しても #1397 の関所が書き戻す
+          say(f, el, (json && (json.error === 'master_frozen' || json.error === 'master_phase_unreadable' || json.error === 'master_owner_unreadable') ? json.message : (json && json.error ? json.error : '保存できませんでした'))
+            + ' — 「基本情報を保存」を押してください', true);
+          return;
+        }
+        // 🚨 基準は**サーバーが返した保存後の値**で進める。売価は整数に丸められ、
+        //    文字列は trim されるので、画面の値で進めると「未保存」がいつまでも消えない
+        const after = json.saved ? json.saved[f.key] : undefined;
+        const s = after === undefined ? value : (after == null ? '' : String(after));
+        // 🚨 画面を書き換えるのは**送ったあと編集されていない**ときだけ (Codex R1)。
+        //    打ち直した値を古い応答で上書きしない。カーソルがその欄にあるときも触らない
+        if (el.value === value && el.value !== s && document.activeElement !== el) el.value = s;
+        if (phKeep) phKeep.savedValue(f.id, s);
+        if (json.demoted) {
+          alert('必須項目が欠けたため、ステータスを「下書き」に戻しました:\n' + json.demoted.join('\n'));
+        }
+        say(f, el, '✓ ' + hhmm() + ' 保存しました', false);
+        updateTabBadges();
+      });
+    }
+    for (const f of FIELDS) {
+      const el = document.getElementById(f.id);
+      if (!el) continue;
+      // この欄は即保存、という印 (画面を見て分かるように / 描画後の確認にも使う)
+      el.dataset.autosave = '1';
+      // change = 値が変わって確定したとき。変わっていなければ発火しないので、空打ちは送らない
+      el.addEventListener('change', () => save(f, el));
+    }
+  }
+  // ここまでが「基本情報の即保存」の切り出し範囲
+  initBasicAutoSave();
+
 </script>

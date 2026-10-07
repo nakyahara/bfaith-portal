@@ -23,9 +23,10 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initDB, getDB, updateSyncMeta } from './db.js';
+import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev, neSrc, addSpelling, writeCodeSpellings } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
+import { NE_FETCH_COUNTS_VERSION, NE_FETCH_COUNTS_KEY, checkNeFetchCounts, beginNeFetch, endNeFetch, releaseNeFetch, computeFetchFingerprint } from './ne-fetch-counts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -37,6 +38,13 @@ const CLIENT_SECRET = process.env.NE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.NE_REDIRECT_URI || 'https://localhost:3000/callback';
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
+/**
+ * 取得の版 (広げる道 PR-9・設計 v14 §3.7・R14)。商品・セット商品の取得の始め (API の入力を読む前) に 1 回だけ計算し、完了まで持ち回る。
+ * 読めなければ null = 件数の確かめが落ちて完了の印を付けない (fail-closed)。取得そのものは止めない (raw 表への書き込みは今までどおり)
+ */
+function fetchFingerprintOrNull() {
+  try { return computeFetchFingerprint(); } catch (e) { console.warn(`[NE] ⚠️ 取得の版を計算できない (${e.message}) → 最後まで取れた印を付けない`); return null; }
+}
 
 // ─── トークン管理 ───
 
@@ -100,6 +108,8 @@ async function authenticate(callbackUrl) {
 
 // 他モジュール (ne-sync-runner 等) から再利用するため export 化 (2026-06-06 構成 4 PR)
 export { callNE, loadTokens, saveTokens };
+// 取込の試験 (scripts/test-material-lineage.mjs の完了の印) 用
+export { fetchProducts, fetchSetProducts };
 async function callNE(endpoint, params = {}) {
   const tokens = loadTokens();
   if (!tokens) throw new Error('トークンがありません。先に認証してください: node ne-api.js auth <callback_url>');
@@ -137,11 +147,25 @@ async function callNE(endpoint, params = {}) {
 
 // ─── 商品マスタ取得 ───
 
-async function fetchProducts() {
+/**
+ * 取得の関数を抜けるとき (成功・失敗のどれでも)、この process の「今走っている」から外す (ne-fetch-counts.js の releaseNeFetch)。
+ * DB の取得中の印には触らない = 失敗した回の印は残り (ゲートが拒む)、次の取得が死んだ印として回収する。
+ * 同じ種類の取得がまだ生きていれば、beginNeFetch が throw して何もしない (同じ種類の取得は 1 本ずつ。広げる道 PR-9 Codex R1 Medium)
+ */
+async function withFetchRun(run) {
+  const h = { inProgress: null };
+  try { return await run(h); } finally { if (h.inProgress) releaseNeFetch(h.inProgress); }
+}
+async function fetchProducts() { return withFetchRun(fetchProductsRun); }
+async function fetchSetProducts() { return withFetchRun(fetchSetProductsRun); }
+
+async function fetchProductsRun(h) {
   console.log('[NE] 商品マスタ取得開始');
   await initDB();
   const db = getDB();
-  const ts = now();
+  const startedAt = new Date();   // 取得の始め (API の入力を読む前)。ts (synced_at = raw の集合の世代 = 完了の印の時刻) と同じ時刻
+  const ts = startedAt.toISOString().replace('T', ' ').slice(0, 19);
+  const fetchFp = fetchFingerprintOrNull();   // 取得の版 (API の入力を読む前に 1 回だけ・完了まで持ち回る)
 
   const fields = 'goods_id,goods_name,goods_supplier_id,goods_cost_price,goods_selling_price,goods_merchandise_name,goods_representation_id,goods_location,goods_delivery_name,goods_lot,goods_last_time_supplied_date,goods_tag,goods_creation_date,stock_quantity,stock_allocation_quantity,goods_last_modified_date,goods_tax_rate,stock_remaining_order_quantity';
 
@@ -150,13 +174,33 @@ async function fetchProducts() {
       商品コード, 商品名, 仕入先コード, 原価, 売価, 取扱区分,
       代表商品コード, ロケーションコード, 配送業者, 発注ロット単位,
       最終仕入日, 商品分類タグ, 作成日, 在庫数, 引当数,
-      最終更新日, 消費税率, 発注残数, synced_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      最終更新日, 消費税率, 発注残数, synced_at,
+      原価_src, 売価_src, 消費税率_src, 代表商品コード_src
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   let offset = 0;
   let total = 0;
   const LIMIT = 1000;
+  // 取込の整合 (C1。Codex ③a-2 C-R1 H3): 取った行・コードが空で飛ばした行・同じコードが 2 度来た (ページの重なり = INSERT OR REPLACE で後の行だけ残る)
+  let fetchedRows = 0, droppedNoCode = 0;
+  const seenCodes = new Map();
+  // 取得の件数 (広げる道 PR-9。ne-fetch-counts.js): 同じコード (小文字) が 2 度目以降に来た行の数 (= write_attempts − stored_rows を書く前に確かめる)・ページごとの行数
+  let dupRows = 0;
+  const pageRows = [];
+  // NE のコードの元の書き方 (③b-1b): 保存 (小文字・上書き) の前に集める = ABC と abc が両方来ても消えない
+  const spell = { single: new Map(), rep: new Map() };
+
+  // 🚨 最初のページを書く前に前回の「最後まで取れた印」を消す (Company DB構想 10 §6 / ③a-1。Codex R1 M-4)。
+  //   ページごとに INSERT OR REPLACE するので、途中で失敗すると synced_at だけ今回の時刻の行が混ざり、
+  //   前回の印のままでは「synced_at = 印の時刻」で前回の集合を取り出せない。印が無い = 照合は「判定できない」
+  //   通し番号 (raw_ne_products を書き換えた行の数。db.js のトリガー) を同じ取引で読んでおき、最後に「自分が書いた行数だけ増えたか」を確かめる
+  //   (増え方が違う = 同時に別の取込・CSV が書いた = 印を付けない。Codex PR #1453 R1 High-2)
+  //   取得中の印 (ne-fetch-counts.js) も同じ取引で書く = 最初の API の呼び出しの前に commit。完了の印と同じ取引で消す (途中で失敗したら残る)
+  let inProgress;
+  //   同じ種類の取得がまだ生きていれば beginNeFetch が throw = この取引ごと戻る (前の回の印は消えない)
+  const rev0 = db.transaction(() => { clearNeCompleteMarks('products'); inProgress = beginNeFetch(db, 'products', startedAt); return readNeRawRev('products'); })();
+  h.inProgress = inProgress;
 
   while (true) {
     const data = await callNE('/api_v1_master_goods/search', {
@@ -166,12 +210,19 @@ async function fetchProducts() {
     });
 
     const items = data.data || [];
+    pageRows.push(items.length);
     if (items.length === 0) break;
 
     const tx = db.transaction(() => {
       for (const item of items) {
+        fetchedRows++;
         const code = (item.goods_id || '').toLowerCase();
-        if (!code) continue;
+        // 代表の名札は、商品コードが空で飛ばす行からも集める (名札の全部 = 取得した全部の行。#1497 Codex R1 High)
+        if (item.goods_representation_id) addSpelling(spell.rep, String(item.goods_representation_id).toLowerCase(), String(item.goods_representation_id));
+        if (!code) { droppedNoCode++; continue; }
+        if (seenCodes.has(code)) dupRows++;
+        seenCodes.set(code, (seenCodes.get(code) || 0) + 1);
+        addSpelling(spell.single, code, String(item.goods_id));
         stmt.run(
           code,
           item.goods_name || '',
@@ -191,7 +242,8 @@ async function fetchProducts() {
           item.goods_last_modified_date || '',
           parseFloat(item.goods_tax_rate) || 0,
           parseInt(item.stock_remaining_order_quantity) || 0,
-          ts
+          ts,
+          neSrc(item.goods_cost_price), neSrc(item.goods_selling_price), neSrc(item.goods_tax_rate), neSrc(item.goods_representation_id)
         );
         total++;
       }
@@ -206,25 +258,64 @@ async function fetchProducts() {
 
   updateSyncMeta('ne_api_products_last', now());
   updateSyncMeta('ne_api_products_count', String(total));
+  // 取得が最後のページまで終わった印 (Company DB構想 10 §6 / ③a-1)。この回に取れた商品 = synced_at がこの時刻の行。
+  //   raw_ne_products は消えた商品を消さないので、「この回の集合」はこれでしか分からない。途中で失敗した回は印が無いまま (上で throw する)。
+  //   件数は「synced_at = 印の時刻」で実際に取り出せる行数 (ページの重なりで同じ商品が 2 度来ても 1 行)
+  //   印と一緒に、その時点の通し番号 (complete_rev) を残す = 照合・作り直しは「今の番号 = 印の番号」のときだけ印を信用する
+  const marked = db.transaction(() => {
+    const rev1 = readNeRawRev('products');
+    if (rev1 - rev0 !== total) return { ok: false, rev0, rev1 };
+    const completeCount = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_products WHERE synced_at = ?').get(ts).c;
+    // 取得の件数 (広げる道 PR-9・設計 v13 §3.6.3)。stored_rows は DB で数えた「この回の時刻の行」= コードの数えと別の数え方。
+    //   式 (fetched = write_attempts + dropped_no_code + dropped_missing_fields) か、重なり (write_attempts − stored_rows = コードが数えた重なり) が崩れたら印を付けない (fail-closed)
+    const counts = { version: NE_FETCH_COUNTS_VERSION, kind: 'products', complete_at: ts, complete_rev: rev1, fetch_fingerprint: fetchFp,
+      started_at: startedAt.toISOString(), finished_at: new Date().toISOString(),   // 取得の始め・完了 (この取引の中の今。完了の印の時刻 = 始めの時刻 のままなので、完了は別に残す。設計 R20)
+      fetched_rows: fetchedRows, write_attempts: total, stored_rows: completeCount, dropped_no_code: droppedNoCode, dropped_missing_fields: 0, dropped_missing_detail: {}, notes: {},
+      page_limit: LIMIT, pages: pageRows.length, page_rows: pageRows, last_page_rows: pageRows.length ? pageRows[pageRows.length - 1] : 0 };
+    const problems = checkNeFetchCounts('products', counts, { expectDuplicates: dupRows });
+    if (problems.length) return { ok: false, counts: problems };
+    updateSyncMeta('ne_api_products_complete_at', ts);
+    updateSyncMeta('ne_api_products_complete_count', String(completeCount));
+    updateSyncMeta('ne_api_products_complete_rev', String(rev1));
+    updateSyncMeta(NE_FETCH_COUNTS_KEY.products, JSON.stringify(counts));
+    endNeFetch(db, 'products', inProgress);   // 取得中の印を消す (自分の印だけ)
+    // 対象のコードは全件残す (保存の後では重複の前の情報が消えるので、切り詰めると照合 ② が該当の SKU を特定できない。Codex C1-R1 M2)
+    const dups = [...seenCodes].filter(([, n]) => n > 1);
+    updateSyncMeta('ne_api_products_integrity', JSON.stringify({ fetched_rows: fetchedRows, written_rows: total, dropped_no_code: droppedNoCode,
+      distinct_codes: seenCodes.size, dup_code_count: dups.length, dup_codes: dups.map(([c]) => c) }));
+    writeCodeSpellings('products', ts, spell);   // 元の書き方と、集め終えた印 (完了の印と同じ取引)
+    return { ok: true };
+  })();
+  if (!marked.ok && marked.counts) console.warn(`[NE] ⚠️ 取得の件数が合わない (${marked.counts.join(', ')}) → 最後まで取れた印を付けない (照合は判定できない)`);
+  else if (!marked.ok) console.warn(`[NE] ⚠️ 取得中に別の書き込みがあった (通し番号 ${marked.rev0}→${marked.rev1}・自分の書き込み ${total}) → 最後まで取れた印を付けない (照合は判定できない)`);
   console.log(`[NE] 商品マスタ取得完了: ${total}件`);
   return total;
 }
 
 // ─── セット商品取得 ───
 
-async function fetchSetProducts() {
+async function fetchSetProductsRun(h) {
   console.log('[NE] セット商品取得開始');
   await initDB();
   const db = getDB();
-  const ts = now();
+  const startedAt = new Date();   // 取得の始め (API の入力を読む前)。ts (synced_at = raw の集合の世代 = 完了の印の時刻) と同じ時刻
+  const ts = startedAt.toISOString().replace('T', ' ').slice(0, 19);
+  const fetchFp = fetchFingerprintOrNull();   // 取得の版 (API の入力を読む前に 1 回だけ・完了まで持ち回る)
 
-  const fields = 'set_goods_id,set_goods_name,set_goods_selling_price,set_goods_detail_goods_id,set_goods_detail_quantity,set_goods_representation_id';
+  // set_goods_creation_date = セットの作成日 (NE の API の説明の取得できる項目にある)。商品管理リストの snapshot の 登録日 (セット) → Company DB の登録日 (0057)
+  const fields = 'set_goods_id,set_goods_name,set_goods_selling_price,set_goods_detail_goods_id,set_goods_detail_quantity,set_goods_representation_id,set_goods_creation_date';
 
   // 全ページを先にメモリへ取得してから、DELETE + INSERT を単一トランザクションで実行する。
   // DELETE を先に commit してからページ毎に挿入すると、途中の API エラー / 親 timeout kill で
   // raw_ne_set_products が空 or 部分状態のまま残り、下流の m_products rebuild が
   // セット商品を単品扱いで通してしまう (2026-07-19 構造監査 H-1)。
   const allItems = [];
+  const pageRows = [];   // 取得の件数 (広げる道 PR-9): ページごとの行数
+  // 取得中の印 (ne-fetch-counts.js): 最初の API の呼び出しの前に独立した取引で commit する (API と通信している間は書き込みの鍵を持たないので、
+  //   開く前のゲートはこの印で取得中を見分ける)。入れ替え・完了の印と同じ取引で消す (途中で失敗した・印を付けなかった回は残る)
+  //   同じ種類の取得がまだ生きていれば beginNeFetch が throw (何も書かない)
+  const inProgress = db.transaction(() => beginNeFetch(db, 'setproducts', startedAt))();
+  h.inProgress = inProgress;
   let offset = 0;
   const LIMIT = 1000;
 
@@ -236,6 +327,7 @@ async function fetchSetProducts() {
     });
 
     const items = data.data || [];
+    pageRows.push(items.length);
     if (items.length === 0) break;
     allItems.push(...items);
 
@@ -247,11 +339,50 @@ async function fetchSetProducts() {
 
   // tx 前に有効行へ正規化。「API は要素を返すが必須キーが全滅」(仕様変更等) でも
   // 空 commit しないよう、有効行 0 件 + 既存データありなら洗い替えせず中断 (全消し防止)
+  // 取込の整合 (C1。Codex ③a-2 C-R1 H3): 保存 (INSERT OR REPLACE) の前に、同じ親の名前・売価の食い違い・同じ親 × 子の重複・キーの欠落を数える
+  //   (保存すると後の行だけ残って食い違いが消える)。取込は今までどおり続け、証跡 ne_api_setproducts_integrity に残す = 照合 ② が該当の親を「判定できない」にする
   const validRows = [];
+  const parentAttrs = new Map(), pairSeen = new Map();
+  let droppedMissingKey = 0, droppedMissingParent = 0;
+  // 取得の件数 (広げる道 PR-9): 受け取った行・同じ親 × 子 (小文字) が 2 度目以降に来た行 (= write_attempts − stored_rows を書く前に確かめる)
+  let seenRows = 0, dupRows = 0;
+  let qtyDefaulted = 0;   // 構成品の数を整数として読めない・0 で、今までどおり 1 として書いた行 (落とさない。別の integrity 情報として数だけ。R14)
+  const missingChildParents = new Set();   // 親はあるが子のコードが空 (C2。Codex C2-R0 M5 = その親だけ照合を止める)
+  const spell = { set: new Map(), child: new Map(), set_rep: new Map() };   // NE のコードの元の書き方 (③b-1b。保存の前に全部の行から)
+  // セットの作成日は親ごとに 1 つに決まるときだけ使う (#1624 Codex R1 Medium 1)。保存の前の全部の行 (同じ親 × 子の重複・子のコードが空の行も) で集める
+  //   = 保存 (INSERT OR REPLACE) の後では重複の前の値が消えて食い違いが見えない。日付が 2 つ以上・空と日付が混ざる親 = 全部の行を NULL
+  //   (登録日は一度入ると変えられないので、疑わしい日は入れない)
+  const setDates = new Map();   // setCode → Set (trim した元の値。無い・null・空 = '')
   for (const item of allItems) {
     const setCode = (item.set_goods_id || '').toLowerCase();
+    if (!setCode) continue;
+    if (!setDates.has(setCode)) setDates.set(setCode, new Set());
+    setDates.get(setCode).add(String(item.set_goods_creation_date ?? '').trim());
+  }
+  const setDateOf = (setCode) => { const ds = setDates.get(setCode); return ds && ds.size === 1 ? ([...ds][0] || null) : null; };
+  const dateConflicts = [...setDates].filter(([, ds]) => ds.size > 1).map(([c]) => c);
+  for (const item of allItems) {
+    seenRows++;
+    const setCode = (item.set_goods_id || '').toLowerCase();
     const childCode = (item.set_goods_detail_goods_id || '').toLowerCase();
-    if (!setCode || !childCode) continue;
+    if (setCode) addSpelling(spell.set, setCode, String(item.set_goods_id));
+    if (childCode) addSpelling(spell.child, childCode, String(item.set_goods_detail_goods_id));
+    if (item.set_goods_representation_id) addSpelling(spell.set_rep, String(item.set_goods_representation_id).toLowerCase(), String(item.set_goods_representation_id));
+    if (!setCode || !childCode) {
+      droppedMissingKey++;
+      if (!setCode) droppedMissingParent++;   // 親のコードが空 = どの親の行か分からない (照合は「セットの表に無い」を根拠にする判定を止める)
+      else missingChildParents.add(setCode);
+      continue;
+    }
+    // 比べる値は *_src と同じ元の値の形 (neSrc)。?? null で潰すと「null」と「欠落」が同じになる (Codex C1-R1 M1)
+    const attr = JSON.stringify([neSrc(item.set_goods_name), neSrc(item.set_goods_selling_price)]);
+    if (!parentAttrs.has(setCode)) parentAttrs.set(setCode, new Set());
+    parentAttrs.get(setCode).add(attr);
+    const pk = `${setCode}\u0000${childCode}`;
+    if (pairSeen.has(pk)) dupRows++;
+    if (!parseInt(item.set_goods_detail_quantity)) qtyDefaulted++;   // 下の parseInt(...) || 1 と同じ条件
+    if (!pairSeen.has(pk)) pairSeen.set(pk, []);
+    pairSeen.get(pk).push(neSrc(item.set_goods_detail_quantity));
     validRows.push([
       setCode,
       item.set_goods_name || '',
@@ -261,8 +392,18 @@ async function fetchSetProducts() {
       0,  // セット在庫数（APIでは取得不可、stock APIが必要）
       (item.set_goods_representation_id || '').toLowerCase(),
       ts,
+      neSrc(item.set_goods_selling_price), neSrc(item.set_goods_detail_quantity),
+      setDateOf(setCode),   // 親ごとに 1 つに決まる作成日。無い・空・食い違い = NULL (分からない)
     ]);
   }
+  const parentConflicts = [...parentAttrs].filter(([, s]) => s.size > 1).map(([c]) => c);
+  const pairDups = [...pairSeen].filter(([, qs]) => qs.length > 1).map(([k, qs]) => ({ parent: k.split('\u0000')[0], child: k.split('\u0000')[1], qtys: qs }));
+  // 対象の親・親 × 子は全件残す (切り詰めると照合 ② が該当の親だけを「判定できない」にできない。Codex C1-R1 M2)。qtys = 来た順の数量 (neSrc の形。欠落 = null)
+  const setIntegrity = { fetched_rows: allItems.length, valid_rows: validRows.length, dropped_missing_key: droppedMissingKey,
+    dropped_missing_parent: droppedMissingParent, missing_child_parents: [...missingChildParents],
+    parent_conflict_count: parentConflicts.length, parent_conflicts: parentConflicts,
+    pair_dup_count: pairDups.length, pair_dups: pairDups,
+    creation_date_conflict_count: dateConflicts.length, creation_date_conflicts: dateConflicts };   // 作成日が食い違う (空と日付の混在を含む) 親 = 作成日を NULL にした
   if (validRows.length === 0) {
     const cur = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products').get().c;
     if (cur > 0) {
@@ -273,8 +414,9 @@ async function fetchSetProducts() {
   const stmt = db.prepare(`
     INSERT OR REPLACE INTO raw_ne_set_products (
       セット商品コード, セット商品名, セット販売価格,
-      商品コード, 数量, セット在庫数, 代表商品コード, synced_at
-    ) VALUES (?,?,?,?,?,?,?,?)
+      商品コード, 数量, セット在庫数, 代表商品コード, synced_at,
+      セット販売価格_src, 数量_src, 作成日
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   let total = 0;
@@ -284,8 +426,34 @@ async function fetchSetProducts() {
       stmt.run(...row);
       total++;
     }
+    const completeCount = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products WHERE synced_at = ?').get(ts).c;
+    const completeRev = readNeRawRev('setproducts');
+    // 取得の件数 (広げる道 PR-9・設計 v13 §3.6.3)。1 行は 1 つの分類 (ne-fetch-counts.js の NE_FETCH_MISSING_FIELDS の説明): コードが空 = 親のコードが空
+    //   (子も空の行を含む = 上の droppedMissingParent) / 要る欄の欠け = 親はあるが子のコードが空 (droppedMissingKey − droppedMissingParent)。
+    //   stored_rows は DB で数えた「この回の時刻の行」。式か重なりが崩れたら印を付けない (fail-closed):
+    //   入れ替えは今までどおり行い、前回の印・件数・整合の証跡を同じ取引で消す (CSV の取込と同じ「印が無い」= 照合は判定できない)
+    const missingChild = droppedMissingKey - droppedMissingParent;
+    const counts = { version: NE_FETCH_COUNTS_VERSION, kind: 'setproducts', complete_at: ts, complete_rev: completeRev, fetch_fingerprint: fetchFp,
+      started_at: startedAt.toISOString(), finished_at: new Date().toISOString(),   // 取得の始め・完了 (この取引の中の今。完了の印の時刻 = 始めの時刻 のままなので、完了は別に残す。設計 R20)
+      fetched_rows: seenRows, write_attempts: total, stored_rows: completeCount, dropped_no_code: droppedMissingParent, dropped_missing_fields: missingChild,
+      dropped_missing_detail: { set_goods_detail_goods_id: missingChild }, notes: { quantity_defaulted_rows: qtyDefaulted },
+      page_limit: LIMIT, pages: pageRows.length, page_rows: pageRows, last_page_rows: pageRows.length ? pageRows[pageRows.length - 1] : 0 };
+    const problems = checkNeFetchCounts('setproducts', counts, { expectDuplicates: dupRows });
+    if (problems.length) { clearNeCompleteMarks('setproducts'); return problems; }
+    // 全件を入れ替え終わった印 (③a-1)。**入れ替えと同じ取引** で書く (入れ替えだけ済んで印が前回のまま、を作らない)
+    updateSyncMeta('ne_api_setproducts_complete_at', ts);
+    updateSyncMeta('ne_api_setproducts_complete_count', String(completeCount));
+    updateSyncMeta('ne_api_setproducts_complete_rev', String(completeRev));   // 入れ替えと同じ取引 = この番号がこの集合
+    updateSyncMeta(NE_FETCH_COUNTS_KEY.setproducts, JSON.stringify(counts));
+    endNeFetch(db, 'setproducts', inProgress);   // 取得中の印を消す (自分の印だけ)
+    // 親の数 (保存された同じ集合から) と、保存の前に数えた整合 (C1。Codex C-R1 #5・H3)
+    updateSyncMeta('ne_api_setproducts_complete_parents', String(db.prepare('SELECT COUNT(DISTINCT セット商品コード) AS c FROM raw_ne_set_products WHERE synced_at = ?').get(ts).c));
+    updateSyncMeta('ne_api_setproducts_integrity', JSON.stringify(setIntegrity));
+    writeCodeSpellings('sets', ts, spell);   // 元の書き方と、集め終えた印 (入れ替え・完了の印と同じ取引)
+    return null;
   });
-  tx();
+  const countProblems = tx();
+  if (countProblems) console.warn(`[NE] ⚠️ セット商品の取得の件数が合わない (${countProblems.join(', ')}) → 最後まで取れた印を付けない (照合は判定できない)`);
 
   updateSyncMeta('ne_api_setproducts_last', now());
   updateSyncMeta('ne_api_setproducts_count', String(total));

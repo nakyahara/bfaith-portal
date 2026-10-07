@@ -20,6 +20,7 @@ import {
   getShipmentsNeedingItemSync,
   getInboundSyncStatus,
   flushInboundDb,
+  getDbGeneration,
 } from './db.js';
 
 const ALL_STATUSES = [
@@ -103,6 +104,69 @@ async function callWithRetry(apiPath, label, maxRetries = 4) {
       waitMs *= 2;
     }
   }
+}
+
+/**
+ * FBA 補充 B1 の inbound-snapshot.js 用の GET。応答の payload を返す。
+ * 🚨 締め切り (deadlineAt) を越えて通信を続けない (Codex PR #1463 R2 Medium 1):
+ *   - 専用のクライアントで SDK の 429 自動再試行 (auto_request_throttled) と通信エラーの自動再試行 (retry_remote_timeout) を止め、
+ *     通信にも時間切れをつける (Codex PR #1463 R3)
+ *   - 認証の更新は呼ぶ前に自分で済ませ (50 分より古ければ)、更新のあとにも残り時間を確かめる = 本要求の中で SDK が更新しない
+ *   - こちらの再試行も、締め切りまでに終わらない待ちはしない
+ */
+const SNAPSHOT_CALL_TIMEOUT_MS = 30000;
+let snapshotClient = null;
+let snapshotTokenAt = 0;
+function getSnapshotClient() {
+  if (!snapshotClient) {
+    snapshotClient = new SellingPartner({
+      region: 'fe',
+      refresh_token: process.env.SP_API_REFRESH_TOKEN,
+      credentials: {
+        SELLING_PARTNER_APP_CLIENT_ID: process.env.SP_API_CLIENT_ID,
+        SELLING_PARTNER_APP_CLIENT_SECRET: process.env.SP_API_CLIENT_SECRET,
+        AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+      options: { auto_request_throttled: false, retry_remote_timeout: false, timeouts: { response: 20000, idle: 20000, deadline: SNAPSHOT_CALL_TIMEOUT_MS } },
+    });
+  }
+  return snapshotClient;
+}
+/**
+ * @param {object} [o]
+ * @param {number} [o.deadlineAt]      スナップショット全体の締め切り。**認証を更新してよいか** の判断にだけ使う
+ * @param {number} [o.callDeadlineAt]  この 1 回の呼び出しの締め切り。**再試行・待ち・通信の時間切れ** はこれを越えない
+ *   (呼ぶ側の Promise.race が打ち切ったあとに裏で送り直さない。Codex PR #1482 R1 Medium)
+ */
+export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, callDeadlineAt = deadlineAt, maxRetries = 3, client = null } = {}) {
+  const sp = client || getSnapshotClient();   // client は試験用 (本物と同じ経路で認証の更新を確かめる)
+  const callEnd = Math.min(callDeadlineAt, deadlineAt);
+  let waitMs = 2000;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (Date.now() >= callEnd) throw new Error(`締め切りを過ぎた: ${label}`);
+    if (Date.now() - snapshotTokenAt > 50 * 60 * 1000) {
+      // 認証の更新はクライアントの timeouts (最大 30 秒) で動き、今回の残り時間では切れない
+      //   → 残りが 30 秒ない回は更新しない (締め切りを越えて通信を残さない。Codex PR #1463 R4)
+      if (deadlineAt - Date.now() < SNAPSHOT_CALL_TIMEOUT_MS) throw new Error(`締め切りまでに認証を更新する時間がない: ${label}`);
+      await sp.refreshAccessToken();
+      snapshotTokenAt = Date.now();
+    }
+    const left = callEnd - Date.now();
+    if (left < 1000) throw new Error(`締め切りを過ぎた (認証の更新のあと): ${label}`);   // 本要求の時間切れ (最低 1 秒) が締め切りを越えないように
+    try {
+      const res = await sp.callAPI({ api_path: apiPath, method: 'GET', options: { timeouts: { deadline: Math.min(SNAPSHOT_CALL_TIMEOUT_MS, left) } } });
+      return res?.payload || res;
+    } catch (e) {
+      const { retryable } = retryableInfo(e);
+      if (!retryable || attempt === maxRetries) throw e;
+      const wait = retryAfterMs(e) ?? Math.round(waitMs * (0.8 + Math.random() * 0.4));
+      if (Date.now() + wait >= callEnd) throw e;   // 待っても この 1 回の締め切りまでに次を打てない (裏で送り直さない)
+      await sleep(wait);
+      waitMs *= 2;
+    }
+  }
+  throw new Error(`再試行の上限: ${label}`);
 }
 
 /**
@@ -242,6 +306,10 @@ export async function syncInboundHistory(opts = {}) {
 
   let itemsSynced = 0;
   const errors = [];
+  // 🚨 明細は「メモリに反映 → 100 件ごとに保存」で、その間に SP-API を待つ (await)。待っている間に、別の保存が
+  //    「fba.db が外から書き換えられていた」と気づいてメモリを読み直すと、ここで抱えていた未保存の明細は黙って消える。
+  //    → 世代を控えておき、保存の前に比べる。変わっていたら失敗で終わる (消えた明細を「同期済み」に数えない。次の回が取り直す。Codex #1376 R1 #5)
+  const dbGeneration = getDbGeneration();
   for (let i = 0; i < targets.length; i++) {
     const { shipment_id } = targets[i];
     try {
@@ -253,13 +321,13 @@ export async function syncInboundHistory(opts = {}) {
       console.log(`[InboundHistory] ❌ ${shipment_id}: ${e?.message || e}`);
     }
     if ((i + 1) % FLUSH_EVERY === 0) {
-      flushInboundDb();
+      flushInboundDb(dbGeneration);
       console.log(`[InboundHistory] 明細 ${i + 1}/${targets.length}`);
     }
     if (onProgress) onProgress({ phase: 'items', done: i + 1, total: targets.length });
     await sleep(CALL_INTERVAL_MS);
   }
-  flushInboundDb();
+  flushInboundDb(dbGeneration);
 
   const status = getInboundSyncStatus();
   const elapsedSec = Math.round((Date.now() - startedAt) / 1000);

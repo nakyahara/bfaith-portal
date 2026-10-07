@@ -671,10 +671,11 @@ async function yahooOrderInfo(orderId) {
   //   (5/8 PROXY_SECRET rotation 修正のついでに 4/11 修正前の壊れた構造に regression していた)
   //   公式仕様: https://developer.yahoo.co.jp/webapi/shopping/orderInfo.html
   //   memory: project_yahoo_api.md (2026-04-11/12 bug 修正履歴) 参照
+  //   2026-09-26: TotalMallCouponDiscount (モールクーポンで値引きされる額の合計) を足した = Company DB の「モール負担の値引」(個人情報ではない)
   const xml = `<Req>
   <Target>
     <OrderId>${orderId}</OrderId>
-    <Field>OrderId,OrderTime,LastUpdateTime,OrderStatus,PayStatus,ShipStatus,ShipDate,SocialGiftType,TotalPrice,PayCharge,ShipCharge,Discount,UsePoint,LineId,ItemId,Title,SubCode,UnitPrice,OriginalPrice,Quantity,ItemTaxRatio,CouponDiscount</Field>
+    <Field>OrderId,OrderTime,LastUpdateTime,OrderStatus,PayStatus,ShipStatus,ShipDate,SocialGiftType,TotalPrice,PayCharge,ShipCharge,Discount,UsePoint,TotalMallCouponDiscount,LineId,ItemId,Title,SubCode,UnitPrice,OriginalPrice,Quantity,ItemTaxRatio,CouponDiscount</Field>
   </Target>
   <SellerId>${YAHOO_SELLER_ID}</SellerId>
 </Req>`;

@@ -160,6 +160,25 @@ export const JOBS_REGISTRY = [
     runbook: 'Render ログの [inquiry-hub-cron] を確認。店舗単位の失敗は ⚙️運用管理 (/apps/inquiry-hub/admin) の同期状態・sync_errors。復旧は Render 再デプロイ',
   },
   {
+    id: 'inbound-check-drive-fetch',
+    type: 'heartbeat',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '入荷受付チェック (iPad) の取込 = 共有ドライブの入荷受付CSV (miniPC の logizard-nyuka-csv が置く) を 30 分おきに読み、'
+      + '商品マスタ (期限管理あり/なし)・バーコードマスタも同じ巡回で読む。止まると iPad の一覧・期限管理・値札の JAN が古いままになる。'
+      + '置く側 (miniPC) は logizard-nyuka-csv が見ているが、読む側 (Render) は 2026-09-25 まで台帳にも監視にも無かった (棚卸しの試験で発覚)',
+    where: 'Render bfaith-portal 常駐 (apps/inbound-check/sync-job.js startInboundCheckCron → drive-fetch.js runScheduledFetch。env INBOUND_CHECK_SYNC_ENABLED / INBOUND_CHECK_SYNC_CRON)',
+    schedule: '常駐 (既定 */30 0,6-20 JST = 0 時台と 6〜20 時台に 30 分おき。生存 ping は Drive から取れた回だけ・1 時間に 1 回へ間引き)',
+    max_age_hours: 8,   // 夜 (0:30〜6:00) は回らない + 間引き 1 時間 = ふだんの最長の空きは約 6 時間
+    lifecycle: 'permanent',
+    runbook: '/apps/inbound-check/admin で Drive の更新日時・最終取込・失敗理由を見る (「Drive から今すぐ取り込む」ボタンあり)。'
+      + 'Render ログの [inbound-check] を確認。Drive の CSV が古いなら置く側 = logizard-nyuka-csv (miniPC) を見る。'
+      + '0 件・中身が別物の CSV は取込側が断る (#1263) = その間は ping が来ない。復旧は Render 再デプロイ。'
+      + '⚠️ping は入荷受付CSV の取得だけを見る (商品マスタ・バーコードマスタの失敗は管理画面で見る)。'
+      + '⚠️env INBOUND_CHECK_SYNC_ENABLED で止めるときは、同じ変更でこのエントリも外す (止めたままだと 8 時間で鳴る = 台帳と実物をそろえる)。'
+      + 'INBOUND_CHECK_SYNC_CRON で間隔を広げるときは max_age_hours も見直す',
+  },
+  {
     id: 'inquiry-hub-outbox',
     type: 'heartbeat',
     importance: 'P2',
@@ -265,7 +284,65 @@ export const JOBS_REGISTRY = [
       + '(permission denied は allow を安易に増やさず ./phq で代替できないか先に確認 / codex 未ログイン / Amazon の HTML 構造変更) / '
       + '"no progress" + claude が数秒で終了 = *.out.log に "Failed to refresh OAuth token" → ~\\.claude\\.oauth_refresh.lock の残骸 '
       + '(9/2 の実例。ランナーが実行前に削除+1回再実行する。それでも駄目なら bfaith で lock を消して claude auth status) / '
-      + 'timeout は件数超過とは限らない (ハング・認証・Codex 停止も。*.out.log を見る) / partial は翌晩に続く。止めるなら Disable-ScheduledTask PhGenerateNightly',
+      + 'timeout は件数超過とは限らない (ハング・認証・Codex 停止も。*.out.log を見る) / partial は翌晩に続く。止めるなら Disable-ScheduledTask PhGenerateNightly。'
+      + '2026-09-23 から同じランナーが原稿のあとに SP広告KW の夜間 AI も回す (ping は別 = ph-adkw-ai-nightly)。原稿の枠は最大 80 分 (旧 100 分)',
+  },
+  {
+    // 同じランナー (PhGenerateNightly) の 2 つ目の仕事。新しいスケジュールは作らない (入口を増やさない)
+    id: 'ph-adkw-ai-nightly',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: 'SP広告KW の夜間 AI (PR3b・2026-09-23)。product-hub の「🤖 AI に案を出してもらう」で受け付けた依頼を、原稿のあとに 1 件ずつ処理: '
+      + 'claim → Render で AI 呼び出しを予約 (1 依頼 1 回・1 日 AD_KW_AI_DAILY_CAP 回) → claude をツール無し・stdin・JSON で 1 回 (課金経路と実モデルを確認) → 結果を送る。'
+      + '案は「未採用」で候補に並ぶ (採否は人)。送信に失敗した結果は次の晩に再送 (AI を再実行しない)。予約後に止まった依頼は needs_review (人が「確認済み」にする)。'
+      + '2026-09-26 PR3c「おまかせ全自動」: 広告の段の最初に auto-enqueue で自社商品 (対象 = chlorellap + 9/26 以降にポータルで登録した新商品) を 1 日 AD_KW_AUTO_DAILY 件 (既定 3) 自動で受け付け、'
+      + '種 KW (AI) → サジェスト・ABA (Render 経由・1 回 1 照会) → 最終案 (AI) を段ごとに進める (時間切れは手放して次の晩に続き)',
+    where: 'miniPC TaskScheduler [PhGenerateNightly] の 2 つ目の仕事 (scripts/ph-nightly/run-ph-generate.ps1 → bin\\ad-kw-ai.mjs)。Render の AD_KW_AI_ENABLED=1 のときだけ動く',
+    schedule: '毎日 02:30 起動のランナーの中で、原稿のあと (最大 25 分)。依頼が無い夜・Render のフラグが OFF の夜も ok を打つ',
+    anchor_hour_jst: 2,
+    anchor_minute_jst: 30,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: 'scripts/ph-nightly/README.md「SP広告KW の夜間 AI」。C:\\tools\\ph-nightly\\logs\\runner.log の "ad before/after" と *.adkw.err.log を見る: '
+      + '"billing_unverified" → bin\\ad-kw-ai-config.json が無い → 人が Claude の追加使用なしを確認して install.ps1 -AttestAdKwBilling <名前> を再実行 / '
+      + '"preflight:BILLING_MODE_MISMATCH" → ANTHROPIC_* などの環境変数を消す / "ai:QUOTA_BLOCKED" → サブスクの利用上限 (翌晩に続く) / '
+      + 'needs_review が増えた (partial) → 画面で「確認済みにする」→ もう一度頼む / pending が残る → 次の晩に再送 (C:\\tools\\ph-nightly\\ad-kw-ai-data\\pending) / '
+      + '"fail auto-enqueue failed" → Render に届かない / failed= が残る (partial) → 画面で「確認済みにする」 / input= → 材料が見つからない商品 (画面で種を入れて集める) / '
+      + 'retry_wait が続く → miniPC のサジェスト・ABA の取込を確認 (同じ材料が 3 晩失敗で打ち切り)。'
+      + '止めるなら Render の AD_KW_AI_ENABLED を外す (受付・claim・予約が止まる。予約済みの結果の再送は受ける)',
+  },
+  {
+    id: 'ph-lp-compose',
+    // 1 分おきに走るので、時刻 (anchor) ではなく**経過時間**で生死を見る
+    type: 'heartbeat',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: 'LP 構成の AI 生成 (段階1・2026-10-01)。商品ハブの詳細画面で「🤖 構成をAIに作らせる」を押した商品について、'
+      + 'claim → 画像を落として見る (商品画像 6 枚 + 素材画像 10 枚まで・素材 = 商品の画像フォルダの中のフォルダの画像・2026-10-02〜) → '
+      + '仕様書 (LP制作システム V2.2) と添付画像の説明 (スタッフの ChatGPT 版と同じ文) に従って ⑦ AI画像生成プロンプトを書く → lint → Codex 検品 (最大 2 巡) → 書き戻す。'
+      + '1 件の上限 20 分。チェックを通らなかった構成も画面に「参考」として出す (人が判断する・2026-10-04)。memory と claude.ai の接続は使わない (毎回同じ条件)。'
+      + '**段階1 の目的は機能ではなく測定** (AI の構成がスタッフの ChatGPT 出力と比べて使えるか・10 件で判定)。'
+      + '書き戻した構成は画面に出るだけで、人がコピーして lp-tool に貼る運用は変わらない。画像生成・GAS への送信・撮影依頼書は段階2 以降',
+    where: 'miniPC TaskScheduler [PhLpComposeMinutely] (scripts/ph-nightly/run-lp-compose.ps1 → work の ./phlp + スキル ph-lp-compose)。Render の PH_LP_COMPOSE_ENABLED=1 のときだけ動く',
+    schedule: '1 分おき。**仕事が無い分は HTTP 1 回だけで終わる** (Claude を起動しない)。依頼が無い分・フラグが OFF の分も ok を打つ',
+    // 1 分おきなので、1 時間 ping が途切れたらタスクが止まっている (miniPC のログオフ・タスク無効化)
+    max_age_hours: 1,
+    lifecycle: 'permanent',
+    runbook: 'scripts/ph-nightly/README.md「LP 構成の AI 生成」。C:\tools\ph-nightly\logs\lp-compose.log と *.lp.err.log を見る: '
+      + '"skipped (another Claude job holds the lock)" → 夜間ジョブが動いている間は正常 (次の分で拾う) / '
+      + '"needs_review +N" (partial) → AI を呼んだのに結果が返らなかった = 成否不明。**自動では作り直さない**ので、画面でもう一度依頼する / '
+      + '"nothing moved" (fail) → claude の認証切れ・ツールの deny・仕様書が未取込。*.lp.out.log の permission_denials と Claude の最後の報告を見る / '
+      + '"PH_LP_COMPOSE_ENABLED is off" → Render のフラグが未設定 (段階1 の立ち上げ中は正常) / '
+      // モデル (2026-10-02・#1591): 決める場所は Render の PH_LP_COMPOSE_MODEL だけ。Opus 5.5 は Claude Code 2.1.280 以上
+      + '"server sent no usable model" (fail) → Render の PH_LP_COMPOSE_MODEL が読めない値 (読めなければ止める・既定に戻さない) / '
+      + '"model not verified" (partial) → 本回答のモデルが頼んだモデルと違う・読めない・確認を送れなかった。その依頼は needs_review で本文は出ない。もう一度依頼する / '
+      + '"model check re-send failed (kept)" → state\\lp-model-check-*.json に控えて毎分再送 (サーバは 15 分で未確認として閉じる) / '
+      + '"API Error: 400 ... 2.1.280 or newer" → miniPC の Claude Code が古い (上げるときは夜間の原稿生成・商品スカウトの引数も確認) / '
+      // 素材画像 (2026-10-02・#1593)
+      + '依頼が queued のまま進まず claim の応答に too_many_images が出る → miniPC の phlp が古い (素材つき・7 枚以上の依頼を掴めない)。miniPC で install.ps1 を流す / '
+      + '押すと「素材画像を Drive から読めませんでした」→ 画像フォルダの共有・中のフォルダの数 (6 階層・60 フォルダ・500 件まで) を確かめてもう一度押す。'
+      + '止めるなら Render の PH_LP_COMPOSE_ENABLED を外すか Disable-ScheduledTask PhLpComposeMinutely',
   },
   {
     id: 'mall-csv-fetch-all',
@@ -365,6 +442,17 @@ export const JOBS_REGISTRY = [
       + 'その直後に「Company DB 出荷 push」(NE 伝票を Render Postgres の core.shipments へ。apps/company-db/push/ne-shipments.mjs --incremental。'
       + 'Company DB構想 08 §9 D5a。カーソル以降に変わった伝票だけ。失敗した伝票があればカーソルを進めず ❌ = 翌日また同じ伝票から。'
       + '止まると mart.v_shipments_daily が古びる。手で流す・突合 = db/company/README.md「出荷を毎日送る」) が走る。'
+      + '「NE在庫スナップショット」の直後に「Company DB 在庫日次 (NE)」(ne_stock_daily_snapshot を Render Postgres の snapshots.sku_stock_daily へ。apps/company-db/push/stock-daily.mjs --source ne --days 14。'
+      + '08 §3.3 ③ = D2b-1。直近 14 日で Render にまだ無い日だけ・1 日 = 1 要求 = 1 取引・台帳は持たず Render に聞く・先に確定した日は書き換えない・取れなかった過去の日は missing と申告。'
+      + '止まると mart.v_sku_stock の ne_qty が古びる。手で流す・初回の --all = README「在庫の日次を送る」) が走る。'
+      + '「FBA在庫スナップショット」の直後に「Company DB 在庫日次 (fba_jp / fba_us)」(fba.db の daily_snapshots を同じ送り手で。--source fba_jp / fba_us --days 14。08 §3.3 ④ = D2b-2。'
+      + 'RESTOCK が取れなかった日は partial = FC 移管中・処理中・出荷待ちを 0 ではなく不明で送る。fba.db は読むあいだ db.js と同じ lock を取る。止まると mart.v_sku_stock の fba_jp が古びる) が走る。'
+      + '同じ「FBA在庫スナップショット」の中で、米国の RESTOCK / PLANNING を取れたままの行で DATA_DIR/fba-us-reports/ にも残す (apps/warehouse/fba-us-reports-store.js。YYYY-MM-DD.json = その日の行・400 日で消す / last-attempt.json = 最後の取得の成否と保存の失敗。fba.db の外)。'
+      + '米国FBA在庫補充 (/apps/fba-replenishment-us) が miniPC の GET /service-api/fba/us/reports/latest で読む。保存に失敗しても朝のスナップショットは失敗にしない (最後の行の末尾に「取れたままのレポートを残せなかった」)。'
+      + '止まると米国の画面に「RESTOCK が古い」「最新の取得で失敗」の赤帯。見る所 = そのフォルダの last-attempt.json と logs/daily-sync-*.log の [fba-stock-snapshot:us]。新しい定期実行は無い。'
+      + '同じ「FBA在庫スナップショット」の中で、JP のレポートを頼む直前 (S0) と保存した直後 (S1) に、納品プラン・出荷便の状態を ID ごとに記録してレポートと照合する (FBA 補充 B1。apps/warehouse/inbound-baseline.js → DATA_DIR/fba-inbound-state.db。'
+      + '表 = inbound_snapshots (30 日で消す) / inbound_baselines (その日の基準 = レポート作成中に動いたプラン・準備中と輸送中の不一致・一部出荷・結べない v0 便・Render が使う世代) / inbound_state_kv (追跡中のプラン・空プランの記録)。'
+      + 'B1 は記録だけで誰も使わない。失敗しても朝のスナップショットは失敗にしない (最後の行の末尾に「準備中の基準: S0 … → S1 …」)。空の古い ACTIVE プラン (約 460 件) は 1 回 150 秒までしか確かめないので、最初の数日は S0/S1 が「不完全」になる (正常)。新しい定期実行は無い。'
       + '「楽天 RMS API」の直後に「Company DB 注文 push (楽天)」(raw_rakuten_orders を core.orders へ。apps/company-db/push/mall-orders.mjs --mall rakuten --incremental。'
       + '08 §9 D5b-1。台帳の指紋で変わった注文だけ・送った後に伝票との結び直し。止まると core.orders の楽天が古びる。手で流す・突合 = README「注文を毎日送る」) が走る。'
       + '「Amazon SP-API」の直後に「Company DB 注文 push (Amazon)」(raw_sp_orders を core.orders へ。mall-orders.mjs --mall amazon --incremental --require-backfilled。'
@@ -375,20 +463,104 @@ export const JOBS_REGISTRY = [
       + 'これらの注文の push は、最後に Render の売上日次 mart.sales_daily を作り直す (POST …/orders/sales-daily/refresh。08 §9 D7a / 0021。どの日を作り直すかは Render の DB が注文の更新時刻から自分で見つける。'
       + '止まると mart.v_sales_daily が古びる。失敗・打ち切りは push のステップが ❌。手で流す・検算 = README「売上の日次」)。'
       + '「Qoo10」の取込の直後にも同じ送り手 (--mall qoo10 --incremental --require-backfilled。08 §9 D5b-4。API の行だけ = 2026-02-19 以降。旧データの行は送らない。手順 = README「Qoo10 の注文」) が走る。'
+      + '「Yahoo!ショッピング」の取込の直後にも同じ送り手 (--mall yahoo --incremental --require-backfilled。08 §9 D5b-5。2026-09-26 に D-32 を「入れる」に。0031 の適用 → 初回の投入 → 突合 → --mark-backfilled まで「バックフィル前」と出して送らない。手順 = README「Yahoo の注文」) が走る。'
       + 'Qoo10 の取込が失敗した朝は送信を見送って retry に載せ、自動再試行で取込が成功した回に送る (retry-failed-jobs.js の UPSTREAM_OF)。'
+      + '「Amazon Ads (SKU)」の直後に「Company DB 広告費 (Amazon)」(fact_ad_spend の Amazon SP を Render Postgres の core.ad_spend_daily へ。apps/company-db/push/ad-spend.mjs --mall amazon --days 35。'
+      + 'Company DB構想 11 の ② / 0035。取込の取得の記録 (ads_fetch_days) がある日だけ・Render に日ごとの世代と指紋を聞いて違う日だけ・1 日 = 1 要求 = 1 取引・古い世代は受け口が拒む・送った後に出品の結び直し。'
+      + '取込が失敗した朝は見送って retry に載せ、取込の再試行が成功した回に送る (UPSTREAM_OF)。止まると mart.v_ad_spend_daily が古びる。手で流す・初回 = README「広告費の日次」。新しい定期実行は無い)。'
+      + '全部の push の後・見張りの前に「マスタ照合」(apps/company-db/master-compare/run.mjs --daily。①ロードの検証 + ②NE との照合 (C2・反映待ちの台帳 = DATA_DIR/cdb-master-compare/pending/)。設計 = AI_reference CompanyDB構想/10 §6.1.1 B・C2。'
+      + '②b = 持ち主が C で NE に欄が無い列 (税区分・売上分類・送料・推奨保有月数) の Company DB ↔ 古い表 (m_products・product_shipping・m_reorder_setting)。反映待ちの台帳 = DATA_DIR/cdb-master-compare/old-tables/pending/・'
+      + '世代にあった値が無い / 翌朝の作り直しでも違う = ⚠️ (要約の先頭)。今は持ち主が全部 load = 比べない (④a・Codex #1564 R1 H3)。'
+      + '最新の夜間ロード (Render・02:00) が実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直し、Company DB (watcher で読むだけ) と比べる = ロードの検証。'
+      + '全件 JSON = DATA_DIR/cdb-master-compare/<日付>/ (35 日)・証跡 master-compare (始めに実行中で前の結果を無効に)。見張りの W13 が読む。差がある・判定できないは ⚠️ (exit 0)・照合そのものの失敗だけ ❌。'
+      + 'retry: Render同期 が retry で直ったら マスタ照合 → 見張り も走らせ直す (retry-failed-jobs.js の RERUN_AFTER)。新しい定期実行ではない) が走る。'
+      + '🆕 2026-10 (PR-7・計画 newentry_min_plan.md §3 の 2): 「マスタ照合」の直後に「新商品の許可」(apps/company-db/master-compare/new-entry-gate.mjs --daily。新しい定期実行ではない・この台帳の ping に乗る)。'
+      + 'その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease(\'single\', 回) を呼ぶ (0058・ログイン new_entry_gate = miniPC の .env の COMPANY_DB_NEW_ENTRY_GATE_URL)。'
+      + '許可が出た = 単品の新商品をポータルで開ける (〜翌日 07:00 JST・要約に「🆕 新商品の入口: 開」)。照合 ② は始めに入口を閉じ (close_new_entry_for_compare)、最後にゲートの結果を 1 行書く (record_new_entry_gate) = 照合が失敗した日は閉じたまま。'
+      + 'マスタ照合が失敗・見送り = この段は流さない (⏭️・retry で照合が直ったら RERUN_AFTER で流す)。照合 ② が判定できない・落ちた = grant を呼ばず revoke (閉・exit 0)。'
+      + '接続が無い = 「未設定」・関数が無い (0058 の前) = 「0058 の前」で飛ばす (exit 0 = 毎朝の処理を止めない)。「閉」と出すのは新しい接続で閉じたのを確かめたときだけ。widen の前で拒まれた = ⏸️ 閉 (準備中・exit 0)。'
+      + 'ほかで拒まれた (kind_gate が 0 でない・最終形・今日でない・停止の床・回の不一致) = 新しい接続で revoke → new_entry_lease_valid = false を確かめてから理由つきで「閉」❌。'
+      + 'grant の応答が切れた・返り値が壊れた・閉じたのを確かめられない = 「⚠️ 状態不明 (開いている可能性)」❌。'
+      + '失敗した朝の retry は「マスタ照合」も載せて、新しい照合の回 (close → record) から許可を出し直す (同じ回は停止の床で二度と開かない = 人が直せば同じ日に開く)。'
+      + '自動再試行 (Retry1〜3) は 2026-09-29 から 1 回ずつしか動かない (apps/warehouse/retry-lock.js = data/retry-failed-jobs.lock.json)。前の回・朝の daily-sync がまだ動いていれば見送り、retry-state があれば ⏸️ を通知 (最後の 11:30 を見送った日は残りを人が確かめる)。'
+      + '全部の push の後に「Company DB 見張り」(apps/company-db/watch/run.mjs。設計 = AI_reference CompanyDB構想/09。今朝の push の証跡 (DATA_DIR/company-db-evidence) と Render の完了の印を読み、'
+      + '在庫の取込の完了 W1 / 欠測 W2 / 在庫の差 W3 / 注文の取込 W7 / 売上日次の公開 W9 ほか (W1〜W15 = config/watch-checks.mjs) を 4 値 (pass / breach / blocked / execution_error) で判定。結果は ops.watch_runs / watch_results / watch_issues (0023)。'
+      + 'W15 = 朝の時点で migrate の lock (migrate.mjs の MIGRATE_LOCK_NAME) が持たれていれば ⚠️ (本番の migrate は人が昼に scripts/company-db/migrate-watched.mjs で流す = 45 分の GChat の見張りつきの 1 つのコマンド・定期実行ではない。W15 はその起動忘れ・見張りの消失・止まった migrate の保険。runbook = db/company/README.md「migrate の lock の 45 分の見張り」)。'
+      + '業務の異常は ⚠️ (exit 0)・見張り自身の失敗だけ ❌。env COMPANY_DB_WATCH_URL / _WRITER_URL (ロール watcher / watch_writer = scripts/company-db/create-watch-roles.mjs) が無ければ ⏭️ 未設定。新しい定期実行は無い) が走る。'
+      + '「ABA検索ワード」(apps/aba-keywords/fetch-aba-search-terms.js。SP-API Brand Analytics の週次レポートを aba.db へ。対象は直近の完了週 3 つ・期間は UTC の日曜〜土曜。'
+      + '🚨 2026-07-29〜09-23 は JST 境界で送っていて毎週 FATAL →「未公開」として緑で skip・8 週間 0 週だった (incident_aba_weekly_report_never_ingested_20260923)。'
+      + 'サマリ行の「DB保有 N 週」が増えていなければ異常。🚨まだ1週も保有していない の印が出たら見る) も走る。'
       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
       + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'
       + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知)、'
       + '「Yahooトークン期限アラート」(refresh token 残り5日から毎日1通、GChatボットの「yahoo再認可」へ誘導)、'
       + '「楽天ライセンス期限アラート」(licenseKey は90日で失効。残り14日から毎日1通。'
-      + '切れると楽天API が全部 401 になり受注取込・問い合わせ返信・クーポン・価格改定が止まる) も走る',
+      + '切れると楽天API が全部 401 になり受注取込・問い合わせ返信・クーポン・価格改定が止まる) も走る。'
+      + '「マスタ照合」の直後に「ロジザード毎日の商品マスタ(影)」(scripts/company-db/lz-daily.mjs。マスタ正本切替 ③c-1a。Company DB の値でロジザードの毎日の商品マスタを作り、'
+      + 'NE の取得の値から作ったもの (GAS と同じ変換) と突き合わせる。**まだロジザードに取り込まない**。材料 = その朝の照合の全件 JSON・元のコードの印・'
+      + 'ロジザードの全件の一覧 (logizard-shohin-csv の 00:20 の成功した書き出し)。欠ける = ⏭️ (exit 3 = 失敗として retry に載る)・差や不正 = ⚠️ (exit 0)・作ること自体の失敗 = ❌ (retry。マスタ照合が retry で直ったら作り直す = RERUN_AFTER)。'
+      + '作れた回だけ自分で ok の ping (台帳 lz-daily-build)。'
+      + '出すもの = DATA_DIR/lz-daily/<日付>/<実行ID>/ と証跡 lz-daily。新しい定期実行は無い)。'
+      + '「m_products 再構築」の直前に「Company DB の写し」(apps/company-db/publish/fetch.mjs --daily。マスタ正本切替 ④a。設計 = AI_reference CompanyDB構想/15。'
+      + '持ち主が C の列の値を watcher で読み、確かめて warehouse.db の世代の表に入れる = m_products 再構築が持ち主が C の列だけ C の値を重ねる (入れた後に読み直して違えば巻き戻す)。'
+      + '今は持ち主が全部 load = 値 0 行 = m_products は変わらない。NE が失敗した朝も取る。受け入れない・取れない = ❌ (作り直しは前の世代)・retry には載せない) と、'
+      + '直後に「Company DB の写しの反映」(同じ fetch.mjs の --verify-apply。今朝の写しが今朝の作り直しで m_products と上書き表に入ったかを読み直す。'
+      + '古い表が世代と違う (exit 4) = その後の m_products・上書き表を読む工程を全部見送る (⚠️・blocked。一覧 = apps/warehouse/publish-gate.js)。'
+      + '確かめられた回だけ自分で ok の ping (台帳 cdb-master-publish)。証跡 master-publish の apply。新しい定期実行は無い)。'
+      + '冒頭の「Settlement冪等性テスト」の後に「Settlement V2 並べ直しテスト」(apps/warehouse/test-settlement-v2.js。2026-09-28 に決済の取込を V2 に切り替えた = #1508) と '
+      + '「Settlement 重複除去テスト」(apps/warehouse/test-settlement-dedup-occurrence.js。同じ決済の同じ鍵の本物の別々の行を潰さない = 出現順つき。#1511) も走る (どちらも一時 DB だけ・失敗しても後続は止めない。新しい定期実行は無い)。'
+      + '🆕 2026-10-01 (D7b-1b-3・設計 = AI_reference CompanyDB構想/13 §3.1・D-65・D-66): 前の「Amazon Settlement」(取込) と「CompanyDB財務(Amazon)」(Company DB Amazon 財務 push) の 2 工程を '
+      + '「Amazon決済と財務」(apps/warehouse/amazon-finance-coverage-run.js = coordinator・工程の上限 90 分) の 1 工程にまとめた (新しい定期実行ではない・retry の単位も同じ 1 工程)。'
+      + '🚨 ただし coordinator で回すのは .env に CDB_FINANCE_COORDINATOR=1 があるときだけ (スイッチ = apps/warehouse/finance-coordinator-switch.js・#1567・一時物 cdb-finance-coordinator-switch)。'
+      + '無い朝は今までどおり「Amazon Settlement」(fetch-amazon-settlements.js --days 14 = 書く取込・coverage の lease を取る) → 「CompanyDB財務(Amazon)」(amazon-finance.mjs 日曜 --full・ほか --incremental) の 2 工程 (retry も同じスイッチで名前を読み替える)。'
+      + '足すのは夜に手で実の --full を 1 回流して exit 0・60 分以内・最大メモリ 1,200 MB 以下に合格した後 (中原さんの指示の後)。'
+      + 'coordinator は warehouse.db の lease (amazon_finance_coverage_lease の 1 行・持ち主の判定は retry-lock.js と同じ) を持ち、① 過去の決済の行に文書の版が無ければ ❌ で止まる (重い版付けは流さない = 夜に手で migrate-settlement-document-versions.js --commit。#1567 Codex R1) '
+      + '② Render の決済のそろい (core.finance_coverage・0050) を新しい世代で updating (失敗なら取込を始めない) ③ 手で積んだ決済のファイル (amazon-settlement-manual-file.js) → SP-API の取込 (V2・一覧を記録。初期の印の順番待ちも updating の後に入れる) '
+      + '④ 財務の送信 (全部の chunk に世代・token・coverage の回は --full) ⑤ 完成の判定 (一覧の鎖・初期の印・採った文書の版・receipt digest・source_revision の読み直し) → complete を 1 回として回す。'
+      + '財務のバックフィルの完了印の前 = 取込だけ (最後の行に「財務 push: ⏭️」= coverage で一度も回っていないとローカルと Render の両方で言えるときだけ・回った・判定できない = 取込もせず ❌)・'
+      + 'Render の決済のそろいが 404 / 409 = Render が #1561 / 0050 の前に戻った疑い = ❌ (今までの送り方の保険 cdb-coverage-legacy-path は #1567 Codex R8 で消した)・初期の印が無いなど人が直すまで complete にしない = ⚠️ (exit 0。正式な利益は null のまま)・'
+      + '失敗 = ❌ (retry)・取り込めない V2 = 終了コード 3。初期の印 = apps/warehouse/amazon-finance-initial-marker.js --queue (Seller Central の過去の決済情報・順番待ちに積むだけ)。冒頭に「Settlement 文書の版テスト」(test-settlement-document-versions.js・一時 DB) も走る。'
+      + '(以下は取込の中身の説明) 決済のレポートの一覧は 2026-09-30 (D7b-1b の下ごしらえ) から warehouse.db の amazon_settlement_report_inventory_runs / amazon_settlement_report_inventory に記録する '
+      + '(取込のダウンロードのループが全部終わった後に別の getReports・窓 = 回の開始の時刻から 85 日前を明示・時間の上限 120 秒・report ごとの取込の結果と 1 回で書く)。2026-10-01 (#1567 Codex R4) から取込の一覧も同じ固定の窓 = 85〜90 日前に作られた report は取込まない (前 = 日時の境なし)。一覧が最後のページまで取れない・一覧の要求の失敗・記録の失敗 = 完了の行の末尾に ⚠️ (取込の結果・終了コードは変えない)。読み手 = coverage の判定 (Amazon決済と財務)。'
+      + '冒頭に「Settlement 一覧テスト」(apps/warehouse/test-settlement-inventory.js・一時 DB・SP-API は差し替え) も走る。新しい定期実行は無い。'
+      + '「Amazon finance build / sync」(日次の財務 f_amazon_finance_sku_daily_v1 を作って Render へ) は 2026-09-28 から **当月 + 直近 35 日に決済の行が入った月** を全部作り直す '
+      + '(apps/warehouse/amazon-finance-months.js。旧 = 当月 + 20 日までは前月 = 月末をまたぐ決済が遅れると前月の後半が欠けた (5 月が半分欠けていた))。当月以外は名前に月が付く (例: Amazon finance build (2026-08))。'
+      + '作り直しか Render への送信が失敗した月は DATA_DIR/amazon-finance-pending.json に「やり残し」として残し、通るまで毎朝持ち越す。月を決められなければ 当月 + 前月 + やり残し に戻って ⚠️ (Amazon finance 作り直す月)。'
+      + '冒頭に「Amazon finance 作り直す月テスト」(test-amazon-finance-months.js・一時 DB) も走る。'
+      + '「Amazonアカウントフィー build」(rebuild-amazon-account-fees.js・14 か月) は 2026-09-28 から新しい名前の保管料 (FBA Inventory Storage Fee)・長期保管料 (FBA Long Term Storage Fee)・返送料 (FBA Removal Order …) も拾う '
+      + '(7 月から 0 だった)。2026-09-28 から Easy Ship の配送料 (Amazon Easy Ship Charges) を全部 easy_ship として入れる (月の最終利益から引く)。「Amazon finance build」は同じ料金を注文番号で SKU に割り振って日次の財務の easy_ship_jpy に入れる (SKU ごとの利益を見るための列・利益の合計からは引かない = 二重にならない。冒頭に「Easy Ship 割り振りテスト」test-easy-ship-allocation.js・一時 DB)。「Amazon finance build」は 2026-09-29 から値引きの消費税の分 (promotion_tax_jpy) も持つ (Amazon 分析の税抜で引いた利益で使う。冒頭に「値引きの税の分テスト」test-finance-promotion-tax.js・一時 DB)。冒頭に「v4 突き合わせテスト」test-amazon-v4-reconcile.js (日次の財務と v4 は決まりの違い 5 つを引くと残り 0 = 手で流す照合の道具 run-amazon-finance-dq.js / validate-v4-reference.js の判定・一時 DB) も走る。分けられない SKU なしの取引が出たら最後の行が ⚠️ (名前が変わった手数料の疑い)。冒頭に「Amazonアカウントフィー テスト」(test-amazon-account-fees.js・一時 DB) も走る。'
+      + '2026-09-29 (F2b-2・#1534) から「Amazonアカウントフィー build / sync」はふだん 14 か月・DATA_DIR/amazon-account-fees-pending.json (月の手数料のやり残し = Company DB の Amazon 財務との突き合わせで差が出た月) があれば '
+      + 'その一番古い月まで (最大 60 か月) さかのぼって作り直す (--from-month で始まりの月を明示 = 途中で月をまたいでも範囲がずれない)。やり残しは build と sync の両方が通った後にだけ消す。'
+      + 'やり残しのファイルが読めない・60 か月より古い = ⚠️ (Amazonアカウントフィー やり残し)。さかのぼる回は所要時間が延びる (1 か月あたり数秒〜十数秒の見込み)。新しい定期実行は無い。'
+      + '「Amazonアカウントフィー build / sync」の後に (2026-10-01 まで) 「Company DB Amazon 財務 push」(apps/company-db/push/amazon-finance.mjs。F2b-3・設計 = AI_reference CompanyDB構想/12 §5。🆕 送信は「Amazon決済と財務」の中に移った・突き合わせだけここに残る。'
+      + '決済の行を 注文 × 計上日 × SKU × 行の種類 にまとめて Company DB (0043) へ。日曜は --full = 全部を集約し直す + Render にだけある鍵に空の集合・ほかは --incremental。'
+      + 'バックフィルの完了印 (台帳 DATA_DIR/company-db-push.db の order_finance:amazon) の前は「⏭️ バックフィル前」で送らない。容量の上限 CDB_DB_LIMIT_BYTES が無ければ送らない (D-W5)。'
+      + '送信の失敗・送れない鍵 = ❌ (retry = Amazon決済と財務)・拾われない金額 = ⚠️) → 送れた朝 (最後の行に「財務 push (」がある) だけ「Company DB Amazon 財務 突き合わせ」(--reconcile。直近 45 日 + 未照合の月の 日 × SKU と月の手数料を SQLite と。'
+      + '差の月は amazon-finance-pending.json / amazon-account-fees-pending.json に登録 = 次の朝の build が作り直す。差が 1 回目 ⚠️・2 回続けば ❌・retry には載せない)。新しい定期実行は無い。'
+      + '🚨 2026-09-30 (D7b-1a・PR #1554・受け皿 0047 / 0048) から財務の送り手の変換の版は amazon_finance_v2 (行に「分けられない決済の部品」の 4 列)。'
+      + '版が変わると --incremental も全部 (約 51 万注文) を選ぶ = 手で --full を済ませる前の朝の daily-sync は 1 工程 30 分の上限に当たりうる → マージの夜に手で --full を済ませる。'
+      + '順番 = 本番で使っていない worktree から migrate (0047 → 0048・中原さんの指示の後) → Render の新しい版を確かめる → miniPC 本体を pull (v2 の送り手が有効) → 同じ夜に --full → --reconcile --all。'
+      + '🚨 migrate の前に miniPC 本体を pull しない (v2 の行は 0047 の前は 409 NOT_MIGRATED = ❌)。'
+      + '🚨 旧い版 (amazon_finance_v1) の送り手に戻さない (受け口が v2 の注文への旧い版を 409 DOWNGRADE で拒む = 毎朝 ❌。分類の数を 0 に戻して正式な利益を fail-open にしないため)。'
+      + '手の --full の完了の条件 = 送り手の最後の行が ✅ (failed 0・整形できない 0・stale 0) かつ core.order_finance_receipts の amazon / jp の lines > 0 の行の transform_version が全部 amazon_finance_v2 (空の集合の墓石は旧い版のまま残ってよい) かつ --reconcile --all が一致。'
+      + '「m_products 履歴記録」の直後に「Company DB 観測の原価」(apps/company-db/push/sku-cost-observed.mjs --send。D7b-2・設計 = AI_reference CompanyDB構想/13 §3.4・D-57・受け皿 0046。'
+      + 'm_products_history から SKU × 原価の期間 (changed_at の JST の翌日から・5/5 の最初の写しはその日から・それより前は同じ値を 2026-01-01 から推定) を全部作り直し、Render の今の世代の中身と違えば 1 要求 = 1 取引で core.sku_cost_observed を入れ替える。'
+      + '世代 = 台帳 DATA_DIR/company-db-push.db の sku_cost_observed: の連番 (HTTP の前に書く・Render の世代まで進める)。core.sku_costs には触らない (読む口 mart.v_sku_cost_observed_effective が SKU ごとに sku_costs の最初の日より前に切る)。'
+      + '送信の失敗・409・別の送り手の見送り・🛑 安全弁 (前の世代より行が 80% 未満 / 0 行 / 結びつかない数が急増 = 既存の行を消さない。わざとなら手で --force) = ❌ (retry = CompanyDB観測原価 --send)。「m_products 履歴記録」が失敗した朝は送らず、retry で履歴の記録 (m_products_history) → 観測の原価の順に走らせる (上流)。正規化の後に ASCII でない商品コードがあれば送らない (⚠️)。Render に 0046 がまだ無い = ⚠️ (送らない・exit 0。migrate を忘れても毎朝見える。migrate は中原さんの指示の後)。止まると 9/10 より前の原価が古いまま (Amazon の利益の mart = D7b-3 が使う)。手で流す・初回 = db/company/README.md「観測の原価」。新しい定期実行は無い)',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,
     anchor_minute_jst: 0,
     grace_hours: 7, // retry3 (11:30) + 実行時間 + 余裕。14:00までに ok が無ければ締切超過
     lifecycle: 'permanent',
-    runbook: 'logs/daily-sync-*.log を確認。個別ジョブ再実行は reference_daily_sync_manual_job_rerun (node -r dotenv/config)',
+    runbook: 'logs/daily-sync-*.log を確認。個別ジョブ再実行は reference_daily_sync_manual_job_rerun (node -r dotenv/config)。'
+      + '「新商品の許可」が閉: 要約の理由を見る。未設定 = miniPC の .env に COMPANY_DB_NEW_ENTRY_GATE_URL (ログイン new_entry_gate = scripts/company-db/create-master-edit-roles.mjs が作る・パスワードは中原さんだけ) を 1 行足す / '
+      + '関数が無い = 0058 の前 / 準備中 = widen の前 (sku_kind_not_company・not_widened) / kind_gate・shape = 照合 ② の要約と全件 JSON (DATA_DIR/cdb-master-compare/<日付>/) で区分の差を直す → retry か、手で「マスタ照合 → 新商品の許可」の順に流す / '
+      + '⚠️ 状態不明 = 開いている可能性 = すぐ DB の持ち主か new_entry_gate で ops.revoke_new_entry_lease(\'single\', 理由) → ops.new_entry_lease_valid(\'single\') が false を確かめる / '
+      + 'compare_run_mismatch = 照合 ② がゲートの結果を書けなかった (マスタ照合の要約の「新商品のゲートの記録」) / 照合が完了していない = マスタ照合を先に直す。'
+      + '手で流す = 必ず「マスタ照合」(node -r dotenv/config apps/company-db/master-compare/run.mjs --daily) → 「新商品の許可」(node -r dotenv/config apps/company-db/master-compare/new-entry-gate.mjs --daily) の順 '
+      + '(許可だけを流し直しても同じ照合の回は停止の床で拒まれる。DAILY_SYNC_RUN_ID が無い回は手で流した照合の証跡 master-compare.manual を読む・DB が一番新しい結果の行の回と同じかを確かめる)。'
+      + '急いで閉じる = DB の持ち主か new_entry_gate で ops.revoke_new_entry_lease(\'single\', 理由) (非常の止めは MASTER_NEW_ENTRY_STOP=1)',
   },
   {
     id: 'mf-daily-sync',
@@ -452,7 +624,9 @@ export const JOBS_REGISTRY = [
       + '(00:20 = 在庫CSV 00:00 の20分後。日付が変わってすぐ取り直し、朝いちばんの一覧を当日ぶんにする 2026-09-07 追加)。'
       + '保険として bat が最大10分ロックの解放を待ってから node を起動する (node の acquireLock は失敗時に即終了するため)。'
       + '異常終了で残ったロックは PID の死亡を確認して削除。'
-      + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』',
+      + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』。'
+      + '🆕2026-09-28 から、入荷受付CSV と商品マスタの書き出しの間に「毎日の商品マスタの取込」(scripts/logizard-import/lz-daily-import.mjs) が走る。'
+      + '切替 (2b-2 の切替の PR) から毎晩の本番 = 台帳 lz-daily-import (00:20 の回に取り込む・08:40 / 11:45 は知らせの送り直しだけ・この bat の終了コードは変えない)。bat の正本 = bfaith-portal の tools/logizard-automation/',
   },
   {
     id: 'logizard-shohin-csv',
@@ -460,7 +634,9 @@ export const JOBS_REGISTRY = [
     importance: 'P3',
     owner: '中原さん',
     purpose: 'ロジザード エクスポート[FM08_01] の「商品 / デフォルト」を出力し、rclone で共有ドライブへ置く。'
-      + '目的は1つだけ = **入荷受付チェック (iPad) の「期限管理あり/なし」の正本を取ること**。'
+      + '目的 = **入荷受付チェック (iPad) の「期限管理あり/なし」の正本を取ること**。'
+      + '🆕 2026-09-28 から **ロジザード毎日の商品マスタ (マスタ正本切替 ③c) の必須の材料**にもなった (daily-sync の lz-daily.mjs が miniPC の書き出しの元のファイル '
+      + '(C:\\tools\\logizard-automation\\out\\shohin_master.csv) を「ロジザードにある商品の全件の一覧」として読む。その日の 00:20 の書き出しが無いと作らない = ⏭️)。'
       + '入荷受付CSV [FA04_01] には期限管理の設定が出てこないため (58列を実測)、これが無いと'
       + '在庫データからの推定 (在庫ゼロの商品は推定できない) と手動設定に頼ることになる。'
       + '⭐止まっても現場は止まらない (推定と手動で動き続ける) ので P3',
@@ -484,7 +660,10 @@ export const JOBS_REGISTRY = [
       + '順番に走るので、この2つが競合することはない。'
       + '⭐2026-09-07 に深夜 00:20 のトリガーが増えたので、通常はそこで取り終わる '
       + '(重い 5000行/1.7MB の取得が朝のピークから外れた)。深夜が落ちた日は 08:40 の回が拾う。'
-      + '⭐「有効期限区分」の値の内訳を毎回ログに出す。ロジザード側の表記が変わったら気付けるようにしてある',
+      + '⭐「有効期限区分」の値の内訳を毎回ログに出す。ロジザード側の表記が変わったら気付けるようにしてある。'
+      + '🆕2026-09-28 から auto-shohin-csv.js・画面の手順 (shohin-export.js)・logizard-common.js・bat の**正本は bfaith-portal の tools/logizard-automation/** '
+      + '(miniPC へは node tools/logizard-automation/deploy.mjs --pc minipc --apply で写す・DEPLOYED.json に写したコミット・--check でずれ)。'
+      + 'C:\\tools\\logizard-automation で直接直さない (直すと --check が 1)',
   },
   {
     id: 'logizard-nefuda-csv',
@@ -619,7 +798,7 @@ export const JOBS_REGISTRY = [
     type: 'scheduled_job', importance: 'P3', owner: '中原さん',
     purpose: 'Keepa保存情報からKW案を広く出し、未判定を蓄積。代表の判断と理由を次の探索・提案へ反映',
     where: 'miniPC TaskScheduler [ProductKWScout] (bfaith/S4U)',
-    schedule: '毎日 05:00。07:00締切、最大90分。案数目標なし。全件機械選別後、100商品ずつ発案・選別を最大3組',
+    schedule: '毎日 05:00。07:00締切、最大90分。案数目標なし。全件機械選別後、60商品ずつ発案・選別を最大6組 (2026-10-06 まで 100商品×3組)',
     anchor_hour_jst: 5, anchor_minute_jst: 0, grace_hours: 2, partial_max_days: 2,
     lifecycle: 'permanent',
     runbook: 'scripts/product-idea-scout/ai/KW_RUNBOOK.md。kw-runtime/daily.log・last-error.json・last-published.jsonを確認。既存収集はSYSTEMでCLIログインを共有できず朝を越えるため、独立実行。既存収集を04:15で区切り、KWはbfaithで実行。公開の読み戻し確認後だけ成功ping。未確認商品を巡回し25%は新用途探索。旧判断は上書きせず訂正も追記し、差分同期で全件保持。採否と選定評価を分け、理由をR01とR03の両方へ渡す。分類1の自社商品と分類2の既存取扱品を区別して重複照合する。二重課金防止のため失敗runを自動再実行しない。',
@@ -719,7 +898,7 @@ export const JOBS_REGISTRY = [
     purpose: 'Render にしかないデータ (warehouse-mirror.db の Render 正本 = po_* 発注 / pd_* 出荷伝票 / draft_* 商品登録 / '
       + 'f_iroha_* いろは作業 / f_inbound_* 入荷検品 / inv_snapshot 棚卸し / mgmt_* 会計確定値 / ai_*、'
       + 'inquiry-hub.db 問い合わせ、staff.db 社員、fba.db、profit.db、rakuten-yahoo-sync.db、easy-ship.db、shohyo-links.db、'
-      + 'fba-box.db、postage.db、users.json、**Company DB (PostgreSQL) の論理ダンプ**) を毎晩 Google Drive (bfaith-backup/render) へ退避する唯一の手段。'
+      + 'fba-box.db、postage.db、fba-us.db (米国FBA在庫補充の NE 伝票の台帳・2026-09-27〜)、users.json、**Company DB (PostgreSQL) の論理ダンプ**) を毎晩 Google Drive (bfaith-backup/render) へ退避する唯一の手段。'
       + 'Drive 世代 = 日次 14 日 + 月次 13 か月。止まると Render ディスク以外にデータの写しが無くなる。'
       + '⭐2026-07-20 #590 で作ったが Dark Launch (env 未設定) のまま台帳にも載っておらず、'
       + '2026-09-05 の Company DB 実機確認 (R-2) で「7 週間一度も動いていない」と判明 → 登録。'
@@ -728,8 +907,10 @@ export const JOBS_REGISTRY = [
       + 'Render の PITR は 3〜7 日しかないため (CompanyDB構想 06 §12 の Codex 条件「Render 外バックアップ + 復元訓練」)',
     where: 'Render bfaith-portal 内 node-cron (apps/render-backup/backup-render.js startRenderBackupCron。'
       + 'RENDER_BACKUP_CRON_ENABLED=1 のときだけ起動。miniPC では動かない)',
-    schedule: '毎日 03:30 JST (env RENDER_BACKUP_CRON、UTC 18:30) + 起動5分後の catch-up (当日分が無く定刻超過なら) '
-      + '+ 6時間毎 staleness (最終成功から 26h 超で再実行)。手動 = Render Shell で node apps/render-backup/backup-render.js run',
+    schedule: '毎日 03:30 JST (env RENDER_BACKUP_CRON、UTC 18:30) + 取り戻し (起動5分後と毎時に判定: 当日分が無く定刻超過なら catch-up / '
+      + '最終成功から 26h 超なら staleness)。🚨 取り戻しは夜間の窓 (env BACKUP_RECOVERY_WINDOW_JST、既定 22-6 = 22:00〜05:59 JST) の中だけ + '
+      + '前の試行から 6 時間あける (2026-09-25 中原さん「バックアップは夜間に」。以前は昼でもデプロイのたびに流れ、ポータルが固まった)。'
+      + '手動 = Render Shell で node apps/render-backup/backup-render.js run (窓の制限なし)',
     anchor_hour_jst: 3,
     anchor_minute_jst: 30,
     grace_hours: 6,
@@ -798,7 +979,9 @@ export const JOBS_REGISTRY = [
     anchor_minute_jst: 0,
     grace_hours: 6,
     lifecycle: 'permanent',
-    runbook: '見送りが続いて締切超過になったら「前の回が終わっていない」= ロードが固まっている。'
+    runbook: 'FBA 補充の Sheet なしのモード (⑦-F) で Render の fba.db の sku_mapping が凍結されている (fba_sheetless_state.sheet_frozen = 1・FBA 補充が起動時に書く) 間は、'
+      + 'sku_mapping の値 (fba_sheet_import の ASIN / FNSKU・JAN・Sheet にだけある出品) を使わない (計画の sources.fba_sheet_frozen = true)。'
+      + '見送りが続いて締切超過になったら「前の回が終わっていない」= ロードが固まっている。'
       + 'ping の note に「N.N時間前から」が出る。Render を再起動して /status の interrupted と ops.ingest_runs で '
       + '本適用が commit 済みかを確かめる。'
       + '有効化 = Render dashboard → bfaith-portal → Environment に COMPANY_DB_LOAD_CRON_ENABLED=1 '
@@ -819,6 +1002,7 @@ export const JOBS_REGISTRY = [
       + '変わった行だけを raw.logizard_inventory_* に残す (新規・変化 = ok、消えた = not_found。同じ世代なら skipped の run だけ) '
       + '② 日付 (JST) が変わった最初の回で前日を締める = その日の最後に完走した取得の状態から '
       + 'snapshots.warehouse_stock_daily (sku × ロケ) / sku_stock_daily (sku) を作り stock_capture_days を complete に (取得が無い日は missing) '
+      + '②\' 締めた日どうしの差 (前日 → 当日・SKU 単位) を events.inventory_events に inferred で追記し、作り終えた日の印を snapshots.stock_diff_days に残す (0022。未適用の間は何もしない) '
       + '③ 締めが追いついている回だけ raw の整理 (30 日 = D-25) と DB の大きさを ops.job_runs に記録 (未締めの日が残る間は整理しない)。'
       + 'これが止まると mart.v_sku_stock / v_warehouse_stock_current が古びる (見ている人は気づけない) と、在庫の履歴に穴が空く (missing の日が増える)。'
       + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
@@ -866,21 +1050,92 @@ export const JOBS_REGISTRY = [
     importance: 'P2',
     owner: '中原さん',
     purpose: 'FBA SKUマッピング同期 (Sheets「商品コード変換テーブル」→ sku_mapping + 他CH売上スナップショット)'
-      + ' + 土台商品マスタ + 納品実績 + **影の下書き** (Company DB構想 Phase 2 ステップ1)。'
+      + ' + 土台商品マスタ + 納品実績。'
       + '補充計算の土台なので、止まると計算が古いマッピングのまま静かにズレる。'
-      + '影の下書き = 同期のあとに今の計算エンジンをそのまま走らせ、その日の提案を Company DB (ai.decisions) に'
-      + '記録するだけ (画面には出さない・外へは何も書かない・autonomy_level=0)。'
-      + '7 日連続で自動実行され「欠損/0/取得失敗」を区別できたらステップ1は完了',
+      + '(影の下書きは 2026-09-25 に 09:40 の fba-decision-draft へ移した)。'
+      + '🆕 Sheet なしのモード (env FBA_SHEETLESS_MODE=1・マスタ正本切替 ⑦-F・既定は OFF) では Sheet の同期の段だけ外し、'
+      + '「Sheet なしの材料」(env FBA_SKU_MAPPING_SOURCE=mirror・FBA_NONFBA_SOURCE=pml / SKU の対応 mirror_sku_resolved が 1 行以上 / 商品管理リストの snapshot が使える) を確かめる。土台・納品実績は続ける',
     where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js)',
     schedule: '毎日 06:00',
     anchor_hour_jst: 6,
     anchor_minute_jst: 0,
     grace_hours: 6,
     lifecycle: 'permanent',
-    runbook: 'Render Logs で「FBA-Cron」を検索。ok の基準はSKUマッピング同期の成否 (土台/納品実績/影の下書きは best-effort で note に出る)。'
+    runbook: 'Render Logs で「FBA-Cron」を検索。ok の基準はSKUマッピング同期の成否。**SKU は成功したが納品実績の同期が失敗なら partial** (= ok の日付が進まない → 締切で通知。'
+      + '2026-09-25 まで納品実績の失敗も ok にしていて、miniPC のジョブの応答 { ok, job } の読み違いで 8/5 から一度も引き取れていないのに 7 週間気づかなかった)。'
+      + '土台は best-effort で note に出る。納品実績の手動の引き取り = POST /apps/fba-replenishment/api/inbound-history/pull。'
       + 'GOOGLE_SERVICE_ACCOUNT_KEY 未設定/失効、Sheets の共有解除で落ちる。手動実行 = FBA在庫補充画面の同期ボタン。'
-      + '影の下書きの結果 = Company DB の ops.job_runs (job_id=fba-daily-sync) と ai.decisions (domain=fba_replenishment)。'
-      + 'COMPANY_DB_URL が無ければ影の下書きだけ静かに見送る (note に「影=見送り」)',
+      + '2026-09-24 までの影の下書きの記録は ops.job_runs (job_id=fba-daily-sync) に残っている。'
+      + '【Sheet なしのモード (FBA_SHEETLESS_MODE=1)】ok の基準 = Sheet なしの材料がそろっている (note「Sheetなし 対応=N 他CH=M」)。'
+      + '欠けていれば fail (note「Sheetなし 材料が欠けている: 理由」= 09:40 の計算も止まる。Sheet には戻らない)。材料がそろい納品実績が失敗なら partial (今までと同じ)。'
+      + '手の Sheet 同期の口 (画面の Step3・POST /api/sync-sku-mappings) は 410。画面の Step4 は POST /api/recommendations/recalculate = 「Amazon 仮確定」を計算できて中身が変わっていないときだけ消す (変わっていたら 409)。'
+      + 'Render の fba.db に一回限りの移行の印が無いと材料が欠けている扱い (計算しない・fail)。miniPC の印が無いと FNSKU を反映しない (fnsku_ready=false・9:40 は partial)。'
+      + 'miniPC が FBA_SHEETLESS_IO=1 なら、頼み方に関わらず FNSKU は fba_sku_attrs から返す (古い Render にも凍結した sku_mapping の FNSKU を渡さない)。IO=1 なのに印が無いと /service-api/fba/sync/latest-planning は 503 (引き取りそのものが失敗する = 印を書いてから IO を入れ直す)。'
+      + 'fba_sku_attrs に大小文字だけ違う SKU の行が 2 つ以上あると、一回限りの移行は断る (--check に一覧)・FNSKU が食い違えば miniPC の引き取りは 503 (FBA_SKU_ATTRS_CONFLICT)。大小文字・空白 (U+3000 なども) は読み手と同じ正規化で数える。直し方 = scripts/fba-sheetless-backfill-once.mjs の説明 = (a) 移行の前に断られた: 控え → 止める → 1 行に → 起動 → スクリプト / (b) 移行の後の 503: 控え → 止める → 1 行に → 同じ IO で起動 → 口が 200 か確かめる (印は消さない・スクリプトは流さない)。'
+      + '入れる順番: ① miniPC にコードを配る (?fnsku_source=attrs に答える) ② miniPC で scripts/fba-sheetless-backfill-once.mjs (WarehouseServer を止めて) '
+      + '→ miniPC の .env (リポジトリの直下の 1 つ) に FBA_SHEETLESS_IO=1 → WarehouseServer を起動 (miniPC は計算しないので入出力だけ止める = '
+      + '/service-api/fba/sync-sku-mappings は 410・FNSKU は fba_sku_attrs だけ・起動時の backfill を流さない) '
+      + '③ Render の shell で同じスクリプト → env FBA_SKU_MAPPING_SOURCE=mirror・FBA_NONFBA_SOURCE=pml・FBA_SHEETLESS_MODE=1。'
+      + 'miniPC のコードが古いと Render は FNSKU を反映しない (9:40 が partial)',
+  },
+  {
+    id: 'fba-decision-draft',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'FBA 補充の「送る SKU と数量」を毎朝自動で決めて Company DB (ai.decisions、generator=fba-shadow-draft) に記録する (影だけ。'
+      + '画面には出さない・納品プランも CSV も作らない・autonomy_level=0)。入力 = miniPC から引き直した今朝の RESTOCK/PLANNING・'
+      + 'ロジザードの写し (mirror_logizard_stock、在庫を取った時刻が 3 時間以内) から組んだ倉庫在庫・取り直した準備中。'
+      + '画面の倉庫在庫 (手動 CSV) との差を run 要約行の warehouse_input.diff_vs_manual に残す (写しへ切り替える判断の材料)。'
+      + '🚨 レポートの取り込みは画面の「レポート全取得」と同じ処理なので、09:40 以降は画面の計算材料も新しくなる。'
+      + ' 決まりの変更 v3-1 (2026-09-26): 同じ入力で v2 (画面と同じ決まり) と v3 (中原さんの方針 = 低在庫手数料の見張りで発注点 28・高回転 目標 小型 42/大型 35・低回転 目標 70) を'
+      + '両方計算し、記録するのは設定 decision_rules の版 (既定 v3、rule_version = fba-reco-v3)。もう片方との差を run 要約行の rules_compare に SKU ごと。'
+      + 'v3 の数字は v3_* の設定だけ (既存の設定・画面・米国補充は変えない)。'
+      + 'v3-2 (2026-09-26): v3 の提案の合計が v3_smooth_target_units (既定 2,500 個) に届かない日は、発注点を下回っていないだけの SKU を'
+      + '在庫日数の短い順に足す (上限 v3_smooth_max_add_units 1,500 個・SKU 数 v3_smooth_max_skus 100・最低出荷日数に満たない量は足さない・'
+      + '通常の補充を先に配る・自社日販が使えない日はならさない・v3_smoothing=off で止める)。結果 = rules_compare.smoothing。'
+      + 'v3-3 (2026-09-26): 長期欠品の復活・新規出品を「試す候補」(finding・action_type fba_trial_replenish・提案には入れない) として 1 SKU 1 行。'
+      + '入荷待ち・出荷待ち伝票・恒久除外・非表示・自社日販不明・倉庫の空き無しは出さない。v3_trials=off で止める。件数 = rules_compare.trials。'
+      + 'v3-4 (2026-09-28): 1 日の上限 v3_daily_cap_units 6,000 個・v3_daily_cap_skus 120 SKU (中原さん)。在庫日数の短い順に残し、残りはその日 0 (翌日また計算)。'
+      + '境目は最低出荷日数以上なら枠まで。v3_daily_cap=off で止める。結果 = rules_compare.daily_cap',
+    where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js → decision-job.js)',
+    schedule: '毎日 09:40 / 10:40 / 11:40 (その日に決めたらあとの回は何もしない) + 起動時の追いつき',
+    anchor_hour_jst: 9,
+    anchor_minute_jst: 40,
+    grace_hours: 3,   // 11:40 の最後の回 + 処理時間 (最大 25 分) まで。09:40 に決められればその時点で ok
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「FBA-Decision」を検索。ok = その日の提案を記録した / partial = 11:40 でも入力がそろわず「今日は決められない」を記録 (前日以前の提案は superseded) / fail = 計算の失敗・例外。'
+      + 'Sheet なしのモード (FBA_SHEETLESS_MODE=1) で SKU の対応・商品管理リスト・env が欠けた日も fail (「Sheet なしのモード: 理由」。Sheet の値には戻らない・fba-daily-sync の note と同じ理由)。'
+      + 'この日は前の提案に触らない (superseded にしない = 人は見られる)。run 要約行に「止めた印」(send_blocked) を残し、自動で送る段は findSendBlock / sendableProposals で止まる。'
+      + 'Sheet なしの材料は倉庫の写しの関所とは別に先に確かめる (写しが読めない・古い日でも、材料が欠けていれば最後の回まで止めた印の道。前の提案を superseded にしない)。'
+      + 'miniPC が引き取りを 503 (FBA_SHEETLESS_NOT_READY / FBA_SKU_ATTRS_CONFLICT) で断った日も同じ止めた印の道 (fail・note に code)。miniPC の fba.db を直す (fba-daily-sync の runbook)。'
+      + '同じモードで miniPC の FNSKU を反映しなかった日 (miniPC のコードが古い = ?fnsku_source=attrs に答えない・FNSKU が 0 件でも) は、提案を記録したうえで partial '
+      + '(note「🚨 FNSKU を反映していない」・run 要約行の report_sync.fnsku_skip_reason)。miniPC を配り直す。'
+      + '09:40・10:40 で入力がそろわない回は ping せず ops.job_runs (job_id=fba-decision-draft) に「待機 (理由)」を残す。'
+      + '理由コード: report_not_this_morning (RESTOCK/PLANNING の元データが今日 05:00 JST より前 = miniPC の daily-sync の Amazon 取得を確認) / '
+      + 'report_sync_failed・report_sync_skipped (取り込みの失敗・件数急減ガード) / warehouse_mirror_not_ready (ロジザード毎時取り込み logizard-stock-hourly と写しの転送を確認) / '
+      + 'inbound_working_not_fresh (miniPC の準備中の取得) / self_sales_unavailable / pending_slips_unknown。'
+      + 'その日に決めたか = ai.decisions の dedupe_key=fba_replenishment:__run__ で inputs_ref.business_date と decision_final。'
+      + '試行は Company DB の advisory lock (鍵 0x46424144) で 1 本に絞る。COMPANY_DB_URL が無ければ何もしない (ping も無い → 締切で通知)',
+  },
+  {
+    id: 'fba-sheetless-transition',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: 'Claude + 中原さん',
+    purpose: 'FBA 補充を Google Sheet「商品コード変換テーブル」から切り離すまでの一時のもの (マスタ正本切替 ⑦-F)。'
+      + '① 一回限りの移行 scripts/fba-sheetless-backfill-once.mjs (Render と miniPC の fba.db に印 fba_migration_marks を書く) '
+      + '② 同じか確かめる道具 scripts/fba-sheetless-parity.mjs (モードなしで master と同じ出力か) '
+      + '③ モードを使わないときの Sheet の経路 (06:00 の Sheet の同期・手の Sheet 同期の口・sku_mapping と fba_sku_attrs の二重書き・起動時の backfill・Sheet の値への戻り・Step4 の先に消す順番) '
+      + 'と env FBA_SHEETLESS_MODE (Render)・FBA_SHEETLESS_IO (miniPC) の切り替えそのもの。'
+      + 'モードを入れて 7 日問題が無ければ、片付けの PR で ①② を消し、③ を外して Sheet なしを既定にする (sku_mapping は読み取り専用で残すか消すかをそこで決める)',
+    where: 'scripts/fba-sheetless-backfill-once.mjs・scripts/fba-sheetless-parity.mjs・apps/fba-replenishment/sheetless-mode.js・'
+      + 'apps/fba-replenishment/db.js / router.js / sheets-sync.js の Sheet の経路・apps/warehouse/fba-service.js の /sync-sku-mappings と /sync/latest-planning の fnsku_source',
+    remove_by: '2027-01-31',
+    lifecycle: 'temporary',
+    runbook: 'モードを入れる手順 = fba-daily-sync の runbook (① を miniPC と Render で 1 回ずつ → miniPC の FBA_SHEETLESS_IO=1 → Render の FBA_SHEETLESS_MODE=1)。'
+      + '片付け = モードを 7 日動かして fba-daily-sync・fba-decision-draft が ok なら、①② と Sheet の経路を消す PR を出し、このエントリを消す。'
+      + '切替が延びるなら remove_by を延ばす (理由を書く)',
   },
   {
     id: 'inbound-info-daily',
@@ -1039,39 +1294,232 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」(amzn1.sp.solution.6f05e71e…) の LWA クライアントシークレット交換。'
       + '期限を過ぎると米国の FBA 在庫スナップショット (daily_snapshots_us・月末棚卸しの US 分) が止まる。'
-      + '⚠ 2026-09-17 時点で前回の交換日が分からない (その日の SPP 一覧では ⚠ なし。⚠ は 30 日以内に期限切れになるアプリに付く)。'
-      + 'ping が来るまでの期限は監視開始から数えた仮のもので実際の期限ではない → 初回の交換は temporary_asset '
-      + 'sp-api-lwa-us-first-rotation (期限つき) で別に追う。日本と同じ日に交換すれば期限がそろう',
+      + '日本 (sp-api-lwa-secret-rotation-jp・次の期限 2027-03-16) と 1 週間ちがい。次は日本と同じ日に交換すれば期限がそろう',
     where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
-    schedule: '180日ごと (前回の交換日は未確認)',
+    schedule: '180日ごと (2026-09-24 13:50 JST に交換 → Amazon の次の期限 2027-03-23 13:50 JST)。'
+      + '監視は ok ping から 175 日 (2027-03-18 ごろ) を期限にし、その 14 日前 (2027-03-04 ごろ) から催促する',
     period_hours: 175 * 24,
     warn_days: 14,
     lifecycle: 'permanent',
     runbook: '① Solution Provider Portal にログイン → アカウント「雑貨イズム」→ アプリ一覧の「B-Faith Warehouse US」の'
       + '「LWA認証情報」の「表示」→「資格情報のローテーション」を 1 回だけ押す '
-      + '② 新しいシークレット (amzn1.oa2-cs.v1. で始まる) を USB で miniPC の .env の SP_API_CLIENT_SECRET_US へ '
-      + '(日本用の SP_API_CLIENT_SECRET の行と取り違えない。client ID と refresh token は触らない) ③ Restart-Service WarehouseServer '
+      + '② 新しいシークレット (amzn1.oa2-cs.v1. で始まる) を miniPC の .env の SP_API_CLIENT_SECRET_US へ入れる。'
+      + '標準 = 2026-09-24 と同じ入れ方: 会社 PC でシークレットをコピー → Claude に頼んで一回きりの道具を作ってもらい、中原さんが実行する '
+      + '(クリップボードの値を ssh の標準入力で miniPC に渡し、dotenv で解析して米国の 1 行だけを置き換える。値は Claude に見えない。使ったら消す)。'
+      + '予備 = USB で miniPC に運び、メモ帳で .env の該当行を書き換える。'
+      + '(日本用の SP_API_CLIENT_SECRET の行と取り違えない。client ID と refresh token は触らない。'
+      + 'Render は米国のシークレットを使っていないので Render の環境変数は触らない = 使うのは miniPC の倉庫サーバー apps/warehouse だけ、2026-09-24 にコードで確認) ③ Restart-Service WarehouseServer '
       + '④ 米国の疎通 (トークン取得と SP-API 呼び出しが 200) を確かめる (画面の入口は無いので Claude に頼む) '
       + '⑤ ①で**交換した当日のうちに** ok ping を打つ (④まで済ませてから)。'
       + '🚨当日に打てなかったら、ping だけ後から打たない。①から交換し直して、その当日に打つ (旧シークレットは交換から 7 日間使える)。'
       + 'ping の後、翌朝の daily-sync ログの [fba-stock-snapshot:us] が errors=0 になっていることも見る',
   },
+  {
+    id: 'cdb-master-publish',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: 'Claude + 中原さん',
+    purpose: 'Company DB の写し (マスタ正本切替 ④a。apps/company-db/publish/fetch.mjs。設計 = AI_reference CompanyDB構想/15 + Codex ④ 設計 R0・R1 = 契約)。daily-sync の 2 工程: '
+      + '①「Company DB の写し」(m_products 再構築の直前) = 持ち主が C (Company DB) の列の値を watcher で読むだけの 1 つの取引で読み、確かめて '
+      + '(持ち主の設定が ④a で扱える (一緒に切り替える組・写さない列) ・時刻が今の世代より新しい・変更の記録 events.master_change_events の最大の番号が下がらず前の水位の出来事が同じ中身・'
+      + '値の範囲・正規化したコードに重なりが無い・持ち主の設定が Company DB の epoch (0055 の ops.master_ownership_state の active。切替の日は prepared) と最新の夜間ロードの記録で同じ・今の m_products のコード × 要る列の欄が全部ある・'
+      + '行数 (同じ持ち主のとき) と SKU 数が前の世代の 90% 以上・単品の商品名と状態が SKU と同じ・入れた後に読み直したハッシュが同じ) '
+      + 'warehouse.db の世代の表 (cdb_publish_generations / cdb_publish_values・sync_meta の cdb_publish_current = 前にしか進まない・14 世代残す) に 1 取引で入れる。'
+      + 'm_products 再構築が今の世代を読み、持ち主が C の列だけ C の値を重ねる (1 つの取引で 重ねる → 入れ替え → 上書き表をそろえる → 全部の確かめ (持ち主が load の列は今までの値のまま) → 記録。'
+      + '違えば巻き戻す)。上書き表 = exception_genka / product_shipping は既にある行だけ直す・空なら行を消す / m_reorder_setting はこの作り直しの SKU を入れる・直す・消す / '
+      + 'Company DB にしか無い SKU は足さない。持ち主が C の列があるのに同じ持ち主 (epoch) の世代が無い・欠けがある朝は作り直しを止める (前の m_products のまま)。'
+      + '②「Company DB の写しの反映」(m_products 再構築の直後。--verify-apply) = 今朝の写し・今朝の作り直し・今の世代・今使っている epoch・読み直した m_products と上書き表がそろったときだけ ok の ping。'
+      + '古い表が世代と違う (exit 4) = その後の m_products・上書き表を読む工程を全部止める (apps/warehouse/publish-gate.js の一覧 = 履歴・観測の原価・f_sales・販売速度・商品管理リスト・各モールの財務の日次・Render同期・ロジザードの商品マスタ (影) ほか。'
+      + '⚠️ 見送り・retry に載せない・lz-daily-build は fail の ping)。'
+      + '持ち主の epoch (0055): config/master-ownership.mjs を書き換えただけでは何も変わらない (夜間ロード・写し・作り直しは Company DB の active)。'
+      + '切替の日 = (AI_reference 17 §4.2 の表が正) readiness → scripts/company-db/master-ownership-epoch.mjs prepare → master-cutover.mjs --to frozen → 書きかけ 0 → 最後の active (全部 load) のロード (--use-prepared なし = prepare をまたいだ古い書き込みの回収) → そのロードの run_id の report の成功 + 照合 ② → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → activate '
+      + '(今の作り直しが prepared の世代・今朝の確かめが通った・読み直しても同じ ときだけ)。🚨 古い書き込み口 (/register など) を閉じるのは ⑤-3 の切替の手順 (持ち主を変える前) = ここでは閉じない。'
+      + '今は持ち主が全部 load = 値 0 行の世代 = しくみが毎日通ることの確かめ (m_products は変わらない) = 止まっても今は何も困らない = P3。'
+      + '切替の後は、止まると C の変更が古い表 (m_products・mirror) に届かない',
+    where: 'miniPC TaskScheduler [WarehouseDailySync] の 2 ステップ (新しい定期実行ではない。ping は fetch.mjs が自分で打つ = --daily の回だけ。ok は ② の確かめが通った回だけ・① の失敗は fail。retry には載せない)',
+    schedule: '毎日 07:00 の daily-sync の m_products 再構築の直前 (①) と直後 (②)',
+    anchor_hour_jst: 7,
+    anchor_minute_jst: 0,
+    grace_hours: 7,   // daily-sync と同じ締切 (14:00)。retry には載せないので、落ちた朝は締切で気づく
+    lifecycle: 'permanent',
+    runbook: 'logs/daily-sync-*.log の「Company DB の写し」「Company DB の写しの反映」の行と DATA_DIR/company-db-evidence/<日付>/master-publish.json (state・problems・detail・generation_no・epochs・shadow・apply)。'
+      + '① の ❌ の理由: ownership_not_supported (config/master-ownership.mjs の一緒に切り替える組 products.name+skus.name / products.status+skus.handling / skus.tax_rate+skus.tax_class の片方だけ・'
+      + '④a が写さない列を company にした) / not_newer (今の世代より古い読み) / watermark_backward・watermark_fork (変更の記録の番号が下がった・前の水位の出来事が無い・違う = Company DB の復元・別の DB を疑う) / '
+      + 'ownership_mismatch (Company DB の epoch (active・prepared) と最新の夜間ロードが記録した持ち主が違う = 切替の日は「readiness → prepare → master-cutover.mjs --to frozen → 書きかけ 0 → 最後の active (全部 load) のロード (--use-prepared なし = prepare をまたいだ古い書き込みの回収) → そのロードの run_id の report の成功 + 照合 ② → remote-load.mjs load --apply --wait --use-prepared → 写し → 作り直し → --verify-apply → activate」の順 (17 §4.2)。'
+      + 'status = node scripts/company-db/master-ownership-epoch.mjs status) / '
+      + 'no_nightly_load・no_load_ownership (夜間ロードの記録が無い) / incomplete (C にある SKU なのに持ち主が C の欄が無い = 種類の違いなど) / '
+      + '⚠️ だけ (止めない・ok の ping): Company DB に無い SKU (NE にしか無い) = NE の値のまま作る = 証跡の not_in_cdb (件数とコード)・夜間ロードが入れた翌朝から C の値 / '
+      + 'value_out_of_range・norm_mismatch・norm_collision・target_norm_collision (Company DB の値・コード・m_products の 2 つのコードが同じ SKU) / '
+      + 'product_name_mismatch・product_status_mismatch・single_without_product・product_shared (単品の商品と SKU が食い違う) / '
+      + 'shrunk (前の世代の 90% 未満 = 読み落としを疑う) / no_0027・no_version (Company DB の migrate の不足) / stage_failed (warehouse.db に入れられない)。'
+      + '落ちた朝は印が動かない = 作り直しは前の世代 (持ち主が C の列があれば m_products 再構築が ❌ CDB_PUBLISH_UNAVAILABLE / CDB_PUBLISH_VERIFY = 前の m_products のまま)。'
+      + '② の ❌ の理由: 遅れ (exit 1・後の工程は止めない・翌朝の作り直しで届く) = fetch_not_verified (① が通らなかった)・build_not_this_run (NE の失敗で作り直しを飛ばした・作り直しが止まった)・'
+      + 'build_generation_not_today・generation_moved (写しだけ新しい世代に進んだ) / build_epoch_mismatch / '
+      + 'applied_mismatch・applied_hash_changed (m_products・上書き表が「作り直しが使った世代」の値と違う = 作り直しの後に /register などで書き換えられた? = exit 4 = broken)。'
+      + '止めるかどうかの正 = warehouse.db の門 cdb_publish_gate (safe / broken / unknown。apps/warehouse/publish-gate.js の readPublishGate)。違う = broken (証跡より先に書く = 証跡が書けなくても exit 4)・'
+      + '遅れ・確かめられない = 前の値のまま・行が無く持ち主が C = unknown (止める)・全部 load で行が無い = 確かめた今の世代と、それを使った最新の作り直し (今の世代を使った = 番号・ID・中身が同じ) がそろうときだけ流す (無い・作り直しが前の世代 = unknown。#1564 Codex R4 Medium 1)。'
+      + '確かめが通った朝は全部 load でも safe を書く (作り直しを飛ばした朝も、確かめた作り直しのままなら行で流せる)。'
+      + '確かめが通らなかった朝 (落ちた・exit 1) = 確かめた safe の行が今も合う (遅れの朝) ときだけ流す。それ以外は unknown を残し (broken はそのまま)、daily-sync もその回の工程を止める (#1564 Codex R5)。'
+      + '遅れだけ (写しが取れない・作り直しが前の世代) で古い表が作り直しの世代と同じ朝 = 確かめは exit 1・fail の ping のまま、その作り直しの safe を書く = 後の工程は流す (#1564 Codex R6)。'
+      + '止めの印 = DATA_DIR/cdb-publish-gate.stop.json (warehouse.db を開けない・門を書けない (SQLITE_BUSY など) 回に残す)。ある間は門の行・暗黙の safe より先に止める。'
+      + '消すのは safe を書けた確かめだけ = 故障を直したら node apps/company-db/publish/fetch.mjs --verify-apply (手) で消える (ファイルを手で消さない)。'
+      + 'safe は確かめた作り直し・世代・入れた値のハッシュを持つ = 後に作り直した・書き換えられた (broken を書けなかった) = その safe は使わない (unknown。全部 load と分かれば流す)・'
+      + '門の表が読めない = unknown (#1564 Codex R3 High 2)。daily-sync (exit 4 と門の両方)・自動再試行 (RERUN_AFTER も)・'
+      + '商品管理リストの手の更新 (fba-service → pml-fba-refresh.js) が同じ門で止まる。broken を safe に戻せるのは通った確かめだけ = 直したら fetch.mjs --verify-apply (手) で safe。'
+      + '確かめ: sqlite3 warehouse.db "select * from cdb_publish_gate" (証跡 master-publish の apply.broken・gate は人が読む控え)。'
+      + 'activate が断る理由 (master-ownership-epoch.mjs): build_not_prepared_epoch・generation_before_prepare (prepare より前に読んだ世代)・no_verified_apply_evidence・evidence_not_prepared_epoch・'
+      + 'apply_not_verified・applied_mismatch_now・applied_hash_changed・切替の段階 (⑤-1 の ops.master_cutover_state) が frozen でない・段階の表が無い・'
+      + 'PREPARED_CHANGED (証拠を集めた後に prepare がやり直された = 書きかけ 0 → 最後の active (全部 load) のロード (README の 2b・17 §4.2 #5) → その run_id の report の成功 + 照合 ② → --use-prepared のロード からやり直す。新しく C に入った列の入口はやり直しの prepare まで開いていた)・'
+      + 'LOAD_AFTER_EVIDENCE (証拠の世代の後に夜間ロードが入った = 最後の active (全部 load) のロード (README の 2b・17 §4.2 #5) → その run_id の report の成功 + 照合 ② → --use-prepared のロード からやり直す。夜間ロードと prepare / activate / cancel は epoch の鍵 4705310055 で並ぶ。#1564 Codex R3 High 1)・'
+      + 'LOAD_EPOCH_MISMATCH (最後に commit したロードの持ち主が prepared でない)・generation_without_load_commit (世代に commit の番号が無い = 0055 の後のロードから写し直す)。'
+      + '「最後のロード」= 0055 の ops.master_load_commits の番号 (DB が commit の直前に振る = commit の順。時計・場所では決めない)。写しも同じ番号で選ぶ (HTTP の --use-prepared のロード = host render も入る。#1564 Codex R4)。'
+      + '持ち主の正は 1 つ (0055・Codex #1564 R2 High 3): ⑤-1 の切替の段階を company_owner・new_open に進めるのは epoch が active (前提 0055_ownership_epoch = epoch_missing・epoch_prepared_pending・epoch_all_load・epoch_broken) で、'
+      + '段階の owner_hash = active のときだけ (trigger trg_master_cutover_state_prereq_0055 = cutover_epoch: owner_hash_not_active)。画面の保存 (ops.begin_master_write) も active と同じ持ち主表だけ (before_cutover: 持ち主表が持ち主の epoch と違う)。'
+      + '持ち主表のハッシュは 1 つの式 = load の列は数えない (0055 の ops.ownership_hash・lib/master-cutover.mjs の ownershipHash。列を足しても保存は止まらない。#1564 Codex R3 Medium)。'
+      + '手で試す = node apps/company-db/publish/fetch.mjs --dry-run (読んで確かめるだけ・書かない・ping なし)',
+  },
+  {
+    id: 'lz-daily-build',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: 'Claude + 中原さん',
+    purpose: 'ロジザードの毎日の商品マスタを Company DB の値で作る (マスタ正本切替 ③c-1a。daily-sync の「ロジザード毎日の商品マスタ(影)」= scripts/company-db/lz-daily.mjs)。'
+      + '作る (このステップ) と取り込む (③c-1b の miniPC のタスク) は別の項目 (v2 M9)。作れた回だけ ok の ping (合格でも不合格でも。合否と 3 日の合格は lz-daily-cutover が見る)。'
+      + '🆕2026-09-29 (③c-1b-3b-3・契約 K3-1): 作れた回は成果物 (CSV) をポータルの口 (LZ_LOCK_TOKEN・/apps/logizard-import-state/api/artifacts) に送り、**ポータルが受け取れたときだけ ok** '
+      + '(送れない = fail = 朝の再試行で作り直して送り直す)。ポータルの成果物 = miniPC が止まったときにどの端末からも取れる手の取込の材料 + 毎晩の本番の取込の条件。'
+      + '材料が欠けた朝 (その朝の照合・NE の取得・ロジザードの全件の一覧 = logizard-shohin-csv のその日の成功した書き出し) と作ること自体の失敗は fail の ping (理由つき) = ok が進まない = 締切で気づく (v3 M6)。'
+      + '今は作って突き合わせるだけ (まだ取り込まない)。③c-1b の後は自動の取込の材料 = 止まると取り込まない (GAS の手の取込のまま・現場は止まらない) = P3',
+    where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3] の 1 ステップ (新しい定期実行ではない。ping は lz-daily.mjs が自分で打つ = --daily で --out-dir が無い回だけ)',
+    schedule: '毎日 07:00 の daily-sync の後半 (retry 08:30 / 10:00 / 11:30)',
+    anchor_hour_jst: 7,
+    anchor_minute_jst: 0,
+    grace_hours: 7,   // retry3 (11:30) + 実行時間 + 余裕。14:00 までに ok が無ければ締切超過 (warehouse-daily-sync と同じ)
+    lifecycle: 'permanent',
+    runbook: 'logs/daily-sync-*.log の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json (state・reason・run_id)。'
+      + '⏭️ の理由: compare_not_complete / compare_json_* / codes_not_this_run = マスタ照合 (retry で直れば作り直す) / ne_* = NE の取得 / '
+      + 'lz_master_missing / lz_master_not_today / lz_stamp_missing / lz_export_not_confirmed = logizard-shohin-csv のその日の書き出しが成功していない '
+      + '(miniPC の C:\\tools\\logizard-automation\\logs\\shohin-last-success.txt の中身と時刻・out\\shohin_master.csv の時刻。印は保存の 15 分以内) / '
+      + 'lz_master_shrunk = 前回の半分より少ない (抽出の事故の疑い。ロジザードの画面で商品数を確かめる) / lz_master_blank_id・header・row_width・broken・duplicate_id = 書き出しが壊れた。'
+      + '❌「成果物をポータルに送れない (理由)」= unreachable / internal_5xx (Render が落ちている・遅い。3 回まで待って送り直した後) / '
+      + 'conflict_409 (同じ実行 ID で違う中身 = 起きないはず・証跡とポータルの成果物を比べる) / mismatch_400・bad_request_400 (送った識別と中身が違う) / '
+      + 'csv_changed・csv_missing (作った CSV が証跡と違う・消えた) / no_token (miniPC の .env に LZ_LOCK_TOKEN が無い)。証跡の portal に結果。'
+      + 'ポータルの成果物の一覧 = import-state-client.js の listArtifacts (Bearer)。'
+      + '手で試す = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」 (--out-dir の回は送らない)。'
+      + '送れなかった回の証跡は state = complete のまま portal.ok = false = 影の取込・少数件の試験の計画・切替の判定はその回を使わない (portal_not_stored)',
+  },
+  {
+    id: 'lz-daily-import',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: 'Claude + 中原さん',
+    purpose: 'ロジザードの毎日の商品マスタの取込 (毎晩の本番・マスタ正本切替 ③c-1b-2b-2)。毎晩 00:20 に、前の日の lz-daily の成果物 '
+      + '(Company DB の値・判定 pass・ポータルに保存済み) をロジザードに取り込み、取込の直前と直後の商品マスタとバーコードを全部比べて確かめる (決まり = RULES_2B2)。'
+      + 'ok の ping = その夜の取込 (または前の夜の未確かめの確かめのやり直し) が verified かつ未送の知らせ 0 のときだけ。ほか = ping しない (ここの締切で気づく) / 途中の例外 = fail。'
+      + '止まった・確かめられない回はポータルの取込の状態が止まった状態になり、要対応スペース (GCHAT_WEBHOOK_JOBS) に知らせる。'
+      + '止まるとロジザードの商品マスタ (商品名・仕入単価・取引先) が Company DB から遅れる (入荷・出荷の現場は止まらない。'
+      + '急ぐときはポータルの画面「ロジザードの取込の状態」の手の取込で人が取り込む) = P2。'
+      + '切替で影 (lz-daily-import-shadow) を置き換えた (影の ok を本番の ok にしない。契約 v3 H9)',
+    where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat の 1.5 ステップ目 '
+      + '(新しい定期実行ではない。scripts/logizard-import/lz-daily-import.mjs の LZ_DAILY_IMPORT=on → lz-nightly.mjs。ping は自分で打つ)',
+    schedule: '毎日 00:20 (Render の時計で 00:15〜00:50 に始める・00:55 が締め切り)。08:40 / 11:45 の回は知らせの送り直しだけ (ping しない)',
+    anchor_hour_jst: 0,
+    anchor_minute_jst: 20,
+    grace_hours: 40 / 60,   // 01:00 までに ok が無ければ締切超過 (00:55 の締め切り + 5 分。2b-2 設計 §3「01:00 に気づく」)
+    lifecycle: 'permanent',
+    runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [lz-daily-import] の行 (✅ verified / ⏭️ しない (理由) / ❌)。'
+      + '1 回の記録 = DATA_DIR\\lz-import\\runs\\<実行 ID lzim_night_…>\\import.json (stages・stamp_window・result・verify)・その夜の済みの印 = DATA_DIR\\lz-import\\<JST の日>\\nightly-done.json。'
+      + 'ポータルの取込の状態 = 画面 /apps/logizard-import-state/admin か miniPC で node C:\\tools\\logizard-automation\\import-state-cli.js status。'
+      + '⏭️ の理由: artifact_missing / artifact_mismatch / not_ready = その朝の lz-daily の成果物が無い・ポータルに送れていない (台帳 lz-daily-build) / '
+      + 'halted = 止めてある (止めた理由は status) / manual_open = 手の取込が開いている / stopped (unknown・partial・verify_failed・imported_unverified) = 前の回が止まった = '
+      + 'ロジザードのインポート履歴を見て import-state-cli.js resolve (手順 = tools/logizard-automation/README.md) / stop_notice_pending = 止まった状態の知らせが届いていない / '
+      + 'window_closed = 振り分けの間に 00:50 を過ぎた / 未送の知らせ = 要対応スペースに送れていない (次の 08:40 / 11:45 で送り直す)。'
+      + '❌: GCHAT_WEBHOOK_JOBS・DATA_DIR が無い / 途中の例外 (理由つき)。'
+      + '手順と戻し方 = db/company/README.md「毎晩の本番の切替と GAS への戻し」',
+  },
+  {
+    id: 'lz-daily-cutover',
+    type: 'human_obligation',
+    importance: 'P3',
+    owner: 'Claude + 中原さん (実機の取込と切替日は中原さんと)',
+    purpose: 'ロジザードの毎日の商品マスタの取込を GAS から Company DB の自動に切り替える (マスタ正本切替 ③c)。完了の条件 (v3 M6) = '
+      + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 **かつ成果物をポータルに送れた** (verdict = pass かつ portal.ok = true・版 lzd-v3 以降。説明できない差・判定できない・形の差・不正 = 0。作る回そのものは lz-daily-build が見る。③c-1b-3b-3) '
+      + '② ③c-1b (鍵の口・auto-barcode の起動の分け方・取込の記録) の後に、少数件の実機の取込で ロジザードの照合の鍵・大文字小文字・無効の商品・取り込んだ後の値・対象外の列を確かめる '
+      + '③ 切替日 = 切替の PR (Stream Deck の auto-barcode.js から ③ を外す・台帳 lz-daily-import) を切替の手順の中でマージし、自動の ③ を始める '
+      + '(手順 = db/company/README.md「毎晩の本番の切替と GAS への戻し」・確かめ = scripts/logizard-import/lz-cutover-check.mjs)。切替の前に止まる = GAS の手の取込のまま・切替の後に毎晩の取込が止まる = ポータルの画面の手の取込 (どちらも現場は止まらない) = P3',
+    where: 'miniPC の daily-sync (lz-daily.mjs) の証跡 + 中原さんとの実機の取込。手順 = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
+    schedule: '一度きり。期限 = 台帳に載ってから 30 日 (見張りは台帳に載った時から数える)',
+    period_hours: 30 * 24,
+    warn_days: 5,
+    lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。完了の後に RETIRED_JOBS へ移す
+    runbook: '① 毎朝の daily-sync の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json の verdict と portal.ok を見る (3 日続けて pass かつ portal.ok = true か。送れていない日は数えない) '
+      + '② 不合格なら report.json の unexplained / invalid を読み、直すか中原さんに認めてもらう '
+      + '③ ③c-1b の後に中原さんと少数件の実機の取込 (scripts/logizard-import/lz-import-test.mjs plan → 中原さんが一覧を認める → run・手順 = db/company/README.md) (2026-09-30 済み・verified) '
+      + '→ 戻しの練習 → 切替日 (夜の窓の外) → 次の夜の 00:20 の lz-daily-import が verified → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
+  },
+  {
+    id: 'lz-shadow-compare',
+    type: 'human_obligation',
+    importance: 'P3',
+    owner: 'Claude (中原さんが GAS のメニューを押した日に、Claude が手で流す)',
+    purpose: 'ロジザード用 CSV の影運転 (マスタ正本切替 ③b-2a)。今 GAS が作っている 2 つの CSV (毎日の商品マスタ・新商品) を、'
+      + 'NE の取得の値から同じ形で作り、GAS の出力と 1 行ずつ突き合わせる。合格 = 切替 (③c) に進める。'
+      + '一度きりの作業 (14 日の期限つき)。止まると切替の判断の材料が無いまま (本番の取込は GAS のまま動くので現場は止まらない) = P3',
+    where: 'miniPC (材料を読むだけ: scripts/company-db/lz-shadow-snapshot.mjs) + G ドライブが見える PC (突き合わせ: scripts/company-db/lz-shadow.mjs)。'
+      + '記録 = AI_reference システム設計/CompanyDB構想/_raw/LZ影運転/<実行 ID>/ (消さない記録)。定期実行ではない',
+    schedule: 'GAS の出力のファイルが新しくなった日だけ (中原さん 2026-09-27 L-1)。期限 = 台帳に載ってから 14 日 (契約 v3 M5)',
+    // 途中の突き合わせでは ping を打たない (打つと期限が延びる)。合格したときだけ 1 回打ち、その後この項目を RETIRED_JOBS へ移す。
+    // 14 日で合格しなければ期限切れとして毎朝の要対応に出る = 放置させない (合格しないまま期限を延ばしたいときは中原さんが決める)
+    period_hours: 14 * 24,
+    warn_days: 3,
+    lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。撤去は合格の後に RETIRED_JOBS へ移す
+    runbook: '手順 = db/company/README.md「ロジザード用 CSV の影運転」。'
+      + '① miniPC で node scripts/company-db/lz-shadow-snapshot.mjs --data-dir C:\\Users\\bfaith\\bfaith-portal\\data --out <ファイル> (読むだけ・照合が元のコードを書いた後) → PC に持ってくる '
+      + '② PC で node scripts/company-db/lz-shadow.mjs --snapshot <ファイル> --lz-list <GAS が読んだバーコードマスタ.csv> --gas-input <GAS が読んだ logi_hinban.csv> (場所は README) '
+      + '(GAS の出力が前の回と同じなら何もしない。写しは全部 shadow_<実行 ID>_ の名前) '
+      + '③ 不合格なら報告 (shadow_<実行 ID>_report.json) の「説明できない」「判定できない」を読んで中原さんに伝える '
+      + '④ 2 つのファイルとも合格したら、miniPC で ping.ps1 -Id lz-shadow-compare -Status ok -Note "<実行 ID>" を 1 回打ち、'
+      + 'この項目を RETIRED_JOBS へ移す PR を作る (replaced_by = ③c の切替)',
+  },
 
   // ─────────────── temporary_asset (期限つきの一時物) ───────────────
   {
-    // human_obligation の -us は ping が来るまで「監視開始から数えた仮の期限」しか持たず、
-    // 実際の期限がそれより早くても鳴らない (Codex #1351 R2)。初回の交換だけはここで短い期限つきで追う
-    id: 'sp-api-lwa-us-first-rotation',
+    id: 'lz-gas-rollback',
     type: 'temporary_asset',
     importance: 'TMP',
-    owner: '中原さん',
-    purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」の LWA シークレットを 1 回交換して、期限を分かる状態にする。'
-      + '2026-09-17 時点で前回の交換日が分からない (その日の SPP 一覧で ⚠ なし = 少なくとも 30 日以上先)',
-    where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
-    remove_by: '2026-10-01',
+    owner: '中原さん + Claude',
+    purpose: 'ロジザードの毎日の商品マスタの取込を、毎晩の自動 (lz-daily-import) から GAS の手の ③ (Stream Deck の auto-barcode.js の ③) に戻すための固定の版 '
+      + '(マスタ正本切替・3b 契約 K3-8・2b-2 契約 v3 N2・N9)。切替の PR (#1558) で auto-barcode.js から ③ を外す。戻すときはこの版を Stream Deck の PC に配る '
+      + '(コードに ③ を足し戻さない)。固定したもの = 下の rollback (tag・commit・配る 11 ファイルの sha256・対応する manifest.json の sha256)。'
+      + 'この版は 2026-09-30 に Stream Deck の PC (中原さんの PC・manifest の streamdeck はこの 1 台) に入っていたものと 11 ファイルとも同じバイト。'
+      + '切替の前の戻しの練習でも使う (切替の PR より先に載せる = 練習の日に固定の版と期限が台帳にある)。'
+      + '期限 (remove_by) の後は使わない (lz-cutover-check.mjs --expect rollback が Render の日付で断る)',
+    where: 'bfaith-portal の tag lz-gas-rollback-20260930 (tools/logizard-automation の streamdeck の版) → Stream Deck の PC の C:\\tools\\logizard-automation',
+    remove_by: '2026-11-30',
     lifecycle: 'temporary',
-    runbook: 'human_obligation sp-api-lwa-secret-rotation-us の runbook どおり交換 → 疎通確認 → 当日に ok ping。'
-      + '終わったら、このエントリを消し、-us の purpose の「⚠ 前回の交換日が分からない」と schedule の「前回の交換日は未確認」を交換日に書き換える',
+    rollback: Object.freeze({
+      tag: 'lz-gas-rollback-20260930',
+      commit: '69999181aae38bded0ad162cad523e0a4f796c1b',
+      pc: 'streamdeck',
+      manifest_sha256: 'f4ff4459970459c6fae44fedad79b741b633af2d1ba2e83da38a9e2e8c6d9348',
+      // 配るバイト (チェックアウトした形 = .bat は CRLF)。deploy.mjs --check がこの版の作業場所と照らす
+      files: Object.freeze({
+        'logizard-common.js': '120b35c3b34e3dc165ad0d748f9eb916b09a36031cafbfb6ec082c6919ce7857',
+        'csv-util.js': 'cf93a7b3ecd892e04f9890c8fcb93321844aa9eb9e2c5a2f3bad66e3567466d1',
+        'shohin-export.js': 'a1d31b86b0ba320cec9c3653c5cdf04497b22031c67ac94fc380578255ca8e47',
+        'auto-shohin-csv.js': 'a2203fd739ce5856778da2a295f2daaecfca86bd11d0b13c7ff913fa6149604d',
+        'auto-barcode.js': '28b5f992d91f457cda25a4bee5faf38805df9b406b61abdf2490f3aa6c2e7c1a',
+        'barcode-mode.js': '055b12aa2611bda96ec387d4d614154472fa27095d52cb2743dc1a03e438c997',
+        'import-state-cli.js': 'd11af723bbd9ffab1ad6f14ecb7722437c07fd5f4a951b8b9d4e7256598f8442',
+        'import-state-client.js': 'fd35581068967dfdc840ffee008ce7bf8d6583c0ab8de26066966fc973966311',
+        'lz-import-screen.js': '364fd47de64e771846b65157db53a9afc36e9aeb3db838f857d29a56b1eee845',
+        'import-guard.js': '5791684528fa8deb7d7938654eeb2e912d6ce38f03bfb468ab5a744061ee390d',
+        'run-barcode.bat': '700d90c30dc8b06f0cda621f7f4c56d2841ba46a6f2a3646148b83264e7f74ef',
+      }),
+    }),
+    runbook: '戻す順番と練習 = db/company/README.md「毎晩の本番の切替と GAS への戻し」の「GAS への戻し」(止める → LZ_DAILY_IMPORT=off → Render の LZ_MANUAL_V4=off → '
+      + 'lz-cutover-check.mjs --expect rollback (期限もここで見る) → この tag の作業場所から deploy.mjs --pc streamdeck --apply → --check → node auto-barcode.js --dry で ①②③ と出る)。'
+      + '期限の後: 手順書の「GAS への戻し」を閉じる (固定の版を配らない)・tag は消さずに残してよい (git の履歴)・このエントリを消す。'
+      + '切替が延びた・戻しをもっと持つなら remove_by を延ばす (理由を書く)',
   },
   {
     id: 'mall-fetch-skip-rakuten-blocked',
@@ -1095,28 +1543,6 @@ export const JOBS_REGISTRY = [
       + '.env の MALL_FETCH_ONLY を削除してこのエントリも消す。'
       + '🚨検証は1日1回まで (失敗するたびにセッションが切れ、連続ログインでアカウントが弾かれる)。'
       + '経緯 = AI_reference のインシデント記録『楽天RMS サブアプリ認証拒否障害』2026-08-30 追記',
-  },
-  {
-    id: 'retired-tasks-cleanup',
-    type: 'temporary_asset',
-    importance: 'TMP',
-    owner: '中原さん',
-    purpose: '2026-08-01 に退役 (Disabled化) した7タスクの本体削除 + 退避XML (C:\\tmp\\retired-tasks-20260801) の削除',
-    where: 'miniPC TaskScheduler + C:\\tmp',
-    remove_by: '2026-09-01',
-    lifecycle: 'temporary',
-    runbook: '1ヶ月困らなかったら Unregister-ScheduledTask で削除し、このエントリも消す',
-  },
-  {
-    id: 'aupay-coupon-handplaced-backup',
-    type: 'temporary_asset',
-    importance: 'TMP',
-    owner: '中原さん',
-    purpose: 'PR #653 マージ前に手置きしていたファイルの退避 (C:\\tmp\\aupay-coupon-handplaced-20260731)',
-    where: 'miniPC C:\\tmp',
-    remove_by: '2026-09-01',
-    lifecycle: 'temporary',
-    runbook: 'フォルダを削除し、このエントリも消す',
   },
   {
     id: 'yahoo-cancel-vendor-sent-coupons-script',
@@ -1147,18 +1573,146 @@ export const JOBS_REGISTRY = [
     runbook: '1 か月、楽天・Yahoo・auPAY・Qoo10 の取得と送信が問題なく動いていたら、フォルダごと削除し、このエントリも消す',
   },
   {
-    id: 'expected-profit-seller-fix-backup-20260914',
+    id: 'settlement-v1-fallback',
     type: 'temporary_asset',
     importance: 'TMP',
     owner: '中原さん',
-    purpose: '想定利益の Amazon の出席簿 (mall_price_snapshot) の店の名前を unknown@A1VC38T7YXB528 → A6HMLHKUUJC27@A1VC38T7YXB528 に '
-      + '書き直したとき (2026-09-14・159,537 行・中原さん指示「両方やって」・PR #1340) の、書き直す前の expected-profit.db の丸ごとの控え (607MB)。'
-      + '書き直しで何か壊れていたら、これに戻す',
-    where: 'miniPC C:\\Users\\bfaith\\bfaith-portal\\data\\expected-profit.before-seller-fix-20260914.bak',
-    remove_by: '2026-09-21',
+    purpose: 'Amazon 決済レポートの取込 (fetch-amazon-settlements.js) を 2026-09-28 に V2 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2) に切り替えた。'
+      + 'V1 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE) に戻す逃げ道 --source v1 (coordinator amazon-finance-coverage-run.js の引数) を残してある。'
+      + '(2026-10-01 D-66: V2 で V1 取込済みの決済を入れない判定 (settlementIngestedByV1) は取込では使わなくなった = V2 も必ず文書の版として保存。関数は調べ用に残る)。'
+      + 'V1 は 2026-11-11 に Amazon 側で廃止 = その後は使えない',
+    where: 'bfaith-portal リポジトリ apps/warehouse/fetch-amazon-settlements.js (SOURCES.v1・settlementIngestedByV1) と apps/warehouse/amazon-finance-coverage-run.js (--source)',
+    remove_by: '2026-11-30',
     lifecycle: 'temporary',
-    runbook: '1 週間、想定利益の夜間処理で Amazon が ok のまま公開できていたら (logs/expected-profit-*.out.log の「amazon: N件 (ok)」)、'
-      + 'ファイルを削除し、このエントリも消す',
+    runbook: '退避で --source v1 を使っても、有効な V2 の版がある決済は V2 のまま採られる (採る版の層の順 = V2 → V1・#1567 Codex R12 Medium 1)。V1 が採られるのは V2 の版が無い・壊れた決済だけ = '
+      + 'V2 の取込に戻せば次の回から V2 の版が入り採られる (手で版を選び直す作業は要らない)。'
+      + '11/11 以降、毎朝の Amazon決済と財務 (V2) が問題なく動いていたら --source v1 の分岐を消す。'
+      + 'settlementIngestedByV1 (調べ用) も同じ PR で消してよい。このエントリも消す',
+  },
+  {
+    id: 'cdb-finance-untokened-chunk',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Company DB の財務の受け口 (Render apps/company-db/ingest/order-finance.mjs・PR #1561) が、coverage の世代・token の無い chunk (今までの送り手・人のバックフィル --from/--to・'
+      + 'スイッチ CDB_FINANCE_COORDINATOR が無いときの今までの送り手) をまだ受けている互換の道 (受けたら complete を無効にする = fail-closed。'
+      + 'coordinator の legacy の分岐は #1567 Codex R8 で消した・単独の送信は切り替えの後は送る前に止まる)。'
+      + '設計 (AI_reference CompanyDB構想/13 §3.1) の終わりの形 = 送るのは coordinator だけ = token の無い chunk は拒む契約にする (後の PR)',
+    where: 'bfaith-portal リポジトリ apps/company-db/ingest/order-finance.mjs (coverageOfChunk が null の chunk を受ける分岐・invalidateCompleteAfterWrite の untokened) と '
+      + 'apps/company-db/push/amazon-finance.mjs (--from/--to の単独の送信)',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: 'cdb-finance-coordinator-switch (スイッチ) を消して常に coordinator にした後、Render の受け口で token の無い chunk を 409 にする PR を作る (人のバックフィルも coordinator の回か token つきで送る形に)。'
+      + '消す前に core.finance_coverage の invalidated_reason = untokened_finance_write が 2 週間出ていないことを確かめる。このエントリも消す',
+  },
+  {
+    id: 'cdb-finance-coordinator-switch',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Amazon の決済と財務を coordinator (amazon-finance-coverage-run.js・PR #1567) で回すかのスイッチ = env CDB_FINANCE_COORDINATOR (=1 のときだけ coordinator)。'
+      + '無い間は daily-sync・retry が今までの 2 工程 (Amazon Settlement → CompanyDB財務(Amazon)) のまま動く = miniPC の本体がほかの PR の deploy で pull されても、'
+      + '定期実行の前のハードゲート (夜に手で実の --full を 1 回: exit 0・60 分以内・最大メモリ 1,200 MB 以下) に合格する前に新しい coordinator が毎朝動き出さない。'
+      + '🚨 一方向 (#1567 Codex R6 High): 一度 coordinator が coverage の回 (世代) で回った後は、スイッチが無くても今までの 2 工程に戻らない '
+      + '(daily-sync・retry・単独の入口が、今までの取込は生の表を書く前・送り手は送る前に ❌ = 古い complete を残さない・勝手に coordinator も起動しない)。'
+      + '証拠 = ローカル (台帳・warehouse.db) と Render の決済のそろいの行の両方 (ローカルを失くした・古いバックアップに戻した・新しい DATA_DIR でも Render で分かる)。'
+      + 'Render を読めない = 判定できない = ❌ (切り替えの前でも Render が落ちた朝は今までの取込も止まる = 可用性の代わりに正しさ)。単独の --from/--to の送信も送る前に同じ門 (#1567 Codex R7)。'
+      + '一時物にした理由 = 設計の終わりの形は「決済の取込と財務の送信は coordinator だけ」(今までの 2 工程は token の無い chunk で Render の complete を毎朝無効にする = 正式な利益が出ない) = '
+      + '合格して足した後はスイッチを残す意味が無い (残すと 2 つの道の試験と保守が続く)',
+    where: 'bfaith-portal リポジトリ apps/warehouse/finance-coordinator-switch.js (スイッチと工程の選び方)・apps/warehouse/daily-sync.js (工程)・apps/warehouse/retry-failed-jobs.js '
+      + '(Amazon Settlement / CompanyDB財務(Amazon) の定義と名前の読み替え)・apps/warehouse/fetch-amazon-settlements.js / apps/company-db/push/amazon-finance.mjs の単独の入口 (無い = 今までどおり書く)・'
+      + 'miniPC の .env の CDB_FINANCE_COORDINATOR',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: '① 夜に手で実の --full を 1 回 (README「デプロイの前に本番の DB のコピーで測る」・PR #1567 の手順) → 合格したら中原さんの指示の後に **同じ保守の枠の中ですぐ** miniPC の .env に CDB_FINANCE_COORDINATOR=1 を足す '
+      + '(手順とコマンド = db/company/README.md「.env に CDB_FINANCE_COORDINATOR=1 を足す手順」= 足す前にキーが 0 行・足した後にちょうど 1 行・新しい node から 1 と読める・ほかの必須の鍵が残っている (値は出さない)。'
+      + '🚨 .env はリポジトリの直下の 1 つだけ・足す 1 行だけ書き、ほかの行を書き直さない = 2026-09-30 に .env を書き直して CDB_DB_LIMIT_BYTES など 4 つが消えた。'
+      + 'Restart-Service は要らない = daily-sync・Retry1〜3 は Task Scheduler が毎回新しい node で起こし .env を読む。翌朝の daily-sync の「Amazon決済と財務」を見る。'
+      + '足す前に朝が来た・足した後に消えた朝は「Amazon Settlement」が ❌ (一方向の門) = .env を確かめて足す) '
+      + '② 1 週間 coordinator で回ったら、スイッチ・今までの 2 工程の分岐 (daily-sync / retry の定義 / 単独の入口の書く道)・その試験を消して常に coordinator にする PR を作る。.env の行も消す。このエントリも消す。'
+      + '🚨 不合格でも一方向 = 実の回が coverage の世代を作った後は今までの 2 工程に戻らない = 足さないと翌朝から「Amazon Settlement」が ❌ で止まる (取込も止まる) → その日のうちに相談 (直して実の回をもう一度 か 上限の中なら足して coordinator で回す)。'
+      + '合格しないまま期限が来たら延ばす前に相談 (今までの 2 工程のままでは正式な利益が出ない)',
+  },
+  {
+    id: 'rclone-own-client-id',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'rclone の Google Drive の remote を、rclone 共有の client_id から自前の client_id に切り替える (1 回きりの作業)。'
+      + 'rclone 公式「The shared client_id is being retired and will stop working during 2026」(止まる日付は未発表)。'
+      + '止まると Drive への転送が全部止まる: render-backup (Render の毎晩のバックアップ・Company DB 含む) / '
+      + 'warehouse.db のバックアップ / ロジザードの値札・入荷受付・商品 CSV の共有ドライブ置き / mall-items・logizard の履歴の offsite。'
+      + '2026-09-26 に miniPC で rclone v1.74.4 が毎回 NOTICE を出していることを確認',
+    where: 'miniPC C:\\tools\\rclone\\rclone.conf の remote 2 つ + その写しの Render bfaith-portal の Secret File rclone.conf '
+      + '(BACKUP_RCLONE_CONFIG=/etc/secrets/rclone.conf)。会社 PC に rclone は無い (2026-09-26 確認)。'
+      + 'gdrive = 中原さんの b-faith.biz アカウント・scope=drive.file (その client が作ったファイルだけ触れる = Render が乗っ取られても被害を rclone のファイルに限る、2026-07 の判断)・'
+      + '使う所 = bfaith-backup/ の下の render・warehouse・logizard-history・mall-items-history だけ / '
+      + 'gdrive-nefuda = 値札専用の gmail アカウント・scope=drive・team_drive=ロジザード【値札発行】・使う所 = 値札・入荷受付・商品の CSV',
+    remove_by: '2026-10-31',   // 止まる日が未発表なので、年末を待たずに 10 月中に終える
+    lifecycle: 'temporary',
+    // 🚨 本番の rclone.conf を直接いじらない (Codex 2026-09-26 High): 旧 client のトークンは新 client では使えないので、
+    //    認可し直しの途中の設定で転送が走ると失敗する。作業用の写しで認可と確認を済ませ、何も走っていない時に差し替える。
+    //    旧 client の認可は取り消さない (差し替えの失敗は旧設定に戻せば元どおり)。
+    // 🚨 gdrive は drive.file = 新しい client からは、旧 client が作った bfaith-backup フォルダも過去のバックアップも見えない。
+    //    そのまま差し替えると、rclone は同じ名前の bfaith-backup をもう 1 つ作り、古いバックアップの自動削除も効かなくなる。
+    //    → 案 A (2026-09-26 中原さん): drive.file のまま、差し替えと同じ時間帯に旧フォルダの名前を変え、新しい client に作り直させる。
+    //       scope を drive に広げる案 B は、Render が乗っ取られたとき中原さんの Drive 全体を触られるので採らない
+    runbook: '① Google Cloud Console で Google Drive API を有効にし、OAuth クライアント (種類 = デスクトップ アプリ) を作る。'
+      + '同意画面は「外部 (External)」(gdrive-nefuda が gmail のアカウントなので「内部」は使えない)。'
+      + '🚨 **認可の前に**「本番環境」に公開する。「テスト中」で取ったトークンは 7 日で切れる (テスト中に取ってしまったら公開後に取り直す)。'
+      + '公開しても審査が済むわけではない: drive (gdrive-nefuda) は制限付きのスコープなので未審査のアプリの警告が出て、使える人数にも上限がある '
+      + '(自分たちの 2 アカウントだけなので足りる)。drive.file (gdrive) は警告が出ないことがある。'
+      + 'b-faith.biz 側で Workspace 管理コンソールの API アクセス制御が「未設定のアプリを許可しない」になっていると、警告を越えても認可できない → 管理コンソールで新しいクライアントを許可する。'
+      + '② miniPC で本番の設定を写して作業用の設定を作る: 旧設定の控え rclone.conf.bak-<日付> と作業用 rclone.conf.new (どちらも C:\\tools\\rclone)。'
+      + '以降のコマンドは全部 --config C:\\tools\\rclone\\rclone.conf.new を付ける (本番の rclone.conf に触らない)。'
+      + '作業用に対して対話式の rclone config → remote ごとに edit → client_id / client_secret を入れる → '
+      + '**scope は remote ごとに今のまま** (gdrive = drive.file / gdrive-nefuda = drive) → '
+      + '質問はこの順に出る: 「Token already configured - replace it?」= Yes → 「ブラウザで自動認可するか」= No → '
+      + 'rclone が「ブラウザのある PC で流すコマンド」rclone authorize "drive" "<長い文字列>" を表示する。'
+      + '🚨 **その表示されたコマンドをそのまま** ブラウザのある PC (rclone は同じ版) で流す (長い文字列の中に client_id と scope が入っている)。'
+      + '自分で rclone authorize "drive" "<client_id>" "<client_secret>" と打つと scope が既定の drive になり、gdrive にも Drive 全体の権限が付いたトークンができてしまう。'
+      + 'ブラウザの同意画面で、(a) ログインしたメールアドレスがその remote のアカウントか (ファイルが見えるかでは確かめられない) '
+      + '(b) 求められる権限が scope と合っているか (gdrive = 「このアプリで使用する特定の Google ドライブ ファイルのみ」/ gdrive-nefuda = 「Google ドライブのすべてのファイル」) を見てから許可し、出た結果を貼る → '
+      + '(gdrive-nefuda のみ)「Change current Shared Drive …?」= No (再選択すると root_folder_id が消える)。'
+      + '(rclone config update は保存と同時に認可を始めるので使わない)。'
+      + '③ 作業用の設定で確かめる (--config …rclone.conf.new)。順番を守る: (a) 共有 client_id の NOTICE が出ない '
+      + '(b) **書き込む前に** gdrive-nefuda の team_drive・root_folder_id が旧設定と同じ (rclone config show で中原さんが見比べる) '
+      + '(c) gdrive-nefuda = 共有ドライブに nefuda.csv が見える / gdrive = 直下に bfaith-backup が **見えない** のが正しい '
+      + '(drive.file の新しい client は旧 client のフォルダを見られない。見えたら ② の同意画面の権限を疑って取り直す) '
+      + '(d) 書ける: 確認用のファイル名は「rclone-check-<UUID>.txt」の新しい名前だけを使う (🚨 nefuda.csv などの本番のファイル名は使わない = copyto は上書きする)。'
+      + '無いことを lsf で確かめてから copyto し (gdrive は直下・gdrive-nefuda は共有ドライブの直下)、できたことを確かめ、**そのファイルだけ** deletefile する。'
+      + '④ 差し替え = 1 回の時間帯で全部やる (旧フォルダの名前を変える前に新しい設定の rclone が 1 回でも動くと、bfaith-backup が 2 つになる)。'
+      + '昼の空いている時間 (例 = 平日 13:05〜13:55。daily-sync の再試行が走っていない日。次の毎時 00 分の LogizardZaikoHourly までに終える):'
+      + ' (1) Task Scheduler の WarehouseDailySync* (本体と再試行)・Logizard-NefudaCSV・Logizard-NyukaCSV・LogizardZaikoHourly・ExpectedProfitNightly を '
+      + 'Disable-ScheduledTask で止め、そのどれも State が Running でなく、Get-Process rclone も空になったのを確かめる '
+      + '(🚨 rclone はトークンを更新したときに実行中でも設定ファイルへ書き戻す = 旧設定を読んだ rclone が残っていると、新しい設定が古い中身で上書きされる)'
+      + ' (2) rclone.conf.new を rclone.conf に置き換える'
+      + ' (3) Render: 新しい rclone.conf の中身を Secret File (rclone.conf → /etc/secrets/rclone.conf) に貼り直して保存 → 保存で始まるデプロイが成功して稼働したのを Events で確かめる'
+      + ' (4) Drive の画面 (中原さんの b-faith.biz アカウント) で、マイドライブ直下の bfaith-backup の名前を bfaith-backup-旧client-<日付> に変える (中は触らない)'
+      + ' (5) 新しい設定で先にフォルダを 1 回だけ作る: rclone mkdir gdrive:bfaith-backup/render と …/warehouse・…/logizard-history・…/mall-items-history '
+      + '(--config C:\\tools\\rclone\\rclone.conf) → Drive の画面で、名前が bfaith-backup のフォルダが 1 つだけなのを確かめる '
+      + '(タスクを戻したあと複数のジョブが同時に初めて作ると、同じ名前のフォルダが 2 つできることがある)'
+      + ' (6) 止めたタスクを Enable-ScheduledTask で戻す。'
+      + '🚨 途中で止める・戻すとき (どの段階でも、タスクは止めたまま・rclone が動いていないのを確かめてから): '
+      + '[a] miniPC: rclone.conf.bak-<日付> を rclone.conf に戻す '
+      + '[b] Render: Secret File を保存していたら (デプロイの途中でも)、rclone.conf.bak-<日付> の中身を貼り直して保存し、そのデプロイの成功を Events で確かめる '
+      + '(miniPC だけ戻すと、夜に新しい client の Render が旧フォルダを見つけられず bfaith-backup を作る) '
+      + '[c] Drive: 新しい bfaith-backup ができていたら bfaith-backup-新client-失敗-<日付> に名前を変えて退け、それから旧フォルダの名前を bfaith-backup に戻す '
+      + '[d] タスクを戻す。旧 client の認可は生きているので元どおり動く。'
+      + '⑤ 翌日、各ジョブの実際の転送が通ったのを見る: render-backup (GChat ✅ Renderバックアップ) / warehouse-daily-sync の DB バックアップ / '
+      + 'logizard-nefuda-csv (08:30) / logizard-nyuka-csv と logizard-shohin-csv (00:20) / logizard-stock-hourly と expected-profit-nightly の履歴の offsite。'
+      + 'Drive で bfaith-backup が 1 つだけで、その下に render・warehouse・logizard-history・mall-items-history があること。'
+      + '履歴 (logizard-history・mall-items-history) は miniPC に残っている分を新しいフォルダへ送り直す (rclone copy で削除はしない。'
+      + 'mall-items は 1 回の持ち時間が短いので初回は途中で打ち切られ、次の回から追いつく)。'
+      + '保持期間の削除 (--min-age) は render・warehouse の daily / monthly の中だけ = 新しいフォルダの新しいファイルだけが対象。'
+      + '月次の控えは次の 1 日から新しいフォルダにできる (それまでの月次は旧フォルダにある)。'
+      + '⑥ 全部通ったら rclone.conf.bak-<日付> と rclone.conf.new を消し、このエントリを消す。'
+      + '代わりに旧フォルダの render と warehouse を撤去期限つきの temporary_asset で台帳に載せる '
+      + '(撤去期限 = 切り替えの日 + 13 か月。消すのは、新しいフォルダの monthly に render・warehouse の月次の控えが実際にそろっているのを確かめてから。'
+      + 'それまでは旧フォルダから Drive の画面で取り出せる)。'
+      + '🚨 旧フォルダの logizard-history と mall-items-history は消さない (撤去の対象にしない): 履歴の offsite は rclone copy で消さずに積む作りなので、'
+      + 'miniPC から消えた古い履歴が旧フォルダにしか無いことがある。撤去するなら、その分を別の置き場へ移して確かめるか、残さなくてよいと決めてから (Codex 2026-09-26)。'
+      + 'client_secret と token は Claude に渡さない (中原さんが入れる)。手順の正本 = https://rclone.org/drive/#making-your-own-client-id',
   },
 ];
 
@@ -1180,6 +1734,14 @@ function isRealYmd(ymd) {
  * 「なぜ・何に置き換わったか」を残す (二度と同じ役目の定期実行を作らないための記録)
  */
 export const RETIRED_JOBS = [
+  {
+    id: 'lz-daily-import-shadow',
+    retired_at: '2026-10-02',   // 🚨切替の日にマージの前に直す (db/company/README.md「切替の手順」6)
+    reason: 'ロジザードの毎日の商品マスタの取込の影 (プレビューまで・押さない) は切替までの一時のもの。切替 (2b-2 の切替の PR) で毎晩の本番 lz-daily-import に置き換えた '
+      + '(影の ok を本番の ok にしない。契約 v3 H9)。影のコード (lz-daily-import.mjs の LZ_DAILY_IMPORT_SHADOW=on) は、本番が off の夜のためにまだ残る '
+      + '(本番が on の夜は影はしない)。撤去の一時物 lz-daily-import-shadow-retire もこの切替で消した',
+    replaced_by: 'lz-daily-import (scripts/logizard-import/lz-nightly.mjs・LZ_DAILY_IMPORT=on)',
+  },
   {
     id: 'inbound-check-notion-cards',
     retired_at: '2026-09-05',

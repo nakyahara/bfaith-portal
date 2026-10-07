@@ -1,6 +1,6 @@
 'use strict';
 const {test}=require('node:test'),assert=require('node:assert/strict');
-const {interpretJudgement,learningContext,preferenceScore,preferenceScorer,relatedHistory,sameKeyword,LEARNING_RULE_VERSION}=require('./kw-learning.cjs');
+const {REASONS,REASON_GROUPS,interpretJudgement,learningContext,preferenceScore,preferenceScorer,relatedHistory,sameKeyword,LEARNING_RULE_VERSION}=require('./kw-learning.cjs');
 const {catalogNames}=require('./kw-catalog.cjs');
 const {candidateGate,ownMatches}=require('./kw-filters.cjs');
 const {screenCandidates}=require('./kw-screen.cjs');
@@ -11,6 +11,14 @@ const source={asin:'B000000001',title:'植え替え 土受け シート',categor
 const candidate={candidate_id:keywordId('植え替え シート'),kw:'植え替え シート',use:'鉢の土を受ける',idea:'植え替え時の土受け',reason:'室内の片付けを減らす',seed_asins:[source.asin],learning_refs:[]};
 const session=()=>({state:{deadline:new Date(Date.now()+80*60000).toISOString()},budget:()=>({}),saveBudget:()=>{},recordStage:()=>{}});
 const parse=prompt=>JSON.parse(prompt.split('<untrusted_data>\n')[1].split('\n</untrusted_data>')[0]);
+// ⭐画面は REASON_GROUPS.positive だけを「良いと思う点」に出し、残りを「気になる点」に出す。読み方がずれたらここで落とす
+test('理由の分け方が解釈側の読み方と一致する (良い点は肯定・残りは懸念として読まれる)',()=>{
+ const known=[...REASON_GROUPS.positive,...REASON_GROUPS.other];
+ assert.equal(new Set(known).size,known.length,'同じコードを2か所に入れない');
+ assert.ok(known.every(c=>REASONS[c]),'無いコードを分け方に書いている');
+ for(const code of REASON_GROUPS.positive)assert.equal(interpretJudgement(event('園芸 シート','hold','',{reason_codes:[code]})).direction,'positive',code);
+ for(const code of Object.keys(REASONS).filter(c=>!known.includes(c)))assert.ok(interpretJudgement(event('園芸 シート','hold','',{reason_codes:[code]})).blockers.includes(code),code+' が懸念として読まれていない');
+});
 test('見送りのまま方向性への肯定と価格の懸念を別々に保持する',()=>{
  const e=event('園芸 シート','reject','選定はいいけど、他社の価格が安すぎる');const before=JSON.stringify(e),s=interpretJudgement(e);
  assert.equal(s.direction,'positive');assert.deepEqual(s.blockers,['price_competition']);assert.equal(s.weight,2);assert.equal(s.actionable_positive,false);assert.equal(JSON.stringify(e),before);

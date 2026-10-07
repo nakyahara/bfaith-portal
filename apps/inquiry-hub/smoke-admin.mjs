@@ -95,6 +95,11 @@ console.log('1. 画面表示');
   check('pending (送信待ち) も要対応に出る (送信前に止められる)', html.includes('⏳送信待ち'));
   check('認証期限30日前警告が出る', html.includes('認証期限 残'));
   check('ナビに運用管理タブ', html.includes('運用管理'));
+  // ファビコン (2026-10-05): ブラウザのタブで他のポータル画面と見分ける
+  check('問い合わせ管理のファビコン (タブ・ホーム画面)',
+    html.includes('href="/app-icons/inquiry-hub-192.png"') && html.includes('href="/app-icons/inquiry-hub-180.png"')
+    && fs.existsSync(new URL('../../public/app-icons/inquiry-hub-192.png', import.meta.url))
+    && fs.existsSync(new URL('../../public/app-icons/inquiry-hub-180.png', import.meta.url)));
 }
 
 // ─── 1b. 詳細画面の本文表示 (空行圧縮+長文折りたたみ) ───
@@ -230,6 +235,39 @@ console.log('5. 返信エディタ');
     html4.includes('class="ghost job-restore"') && html4.includes('返信欄に戻す'));
   check('本文の改行は pre-wrap で保持 (CSSが載っている)', html4.includes('.job-body-full') && html4.includes('white-space: pre-wrap'));
 
+  // 📄 この回答をテンプレに保存 (2026-10-05 スタッフ要望)
+  const vm = await import('vm');
+  const pageScript = html => { const m = html.match(/<script>([\s\S]*)<\/script>\s*<\/body>/); return m ? m[1] : ''; };
+  check('返信欄の下に「この回答をテンプレに保存」ボタン', htmlOn.includes('id="saveTplBtn"') && htmlOn.includes('この回答をテンプレに保存'));
+  check('保存の小窓 (グループ選択・名前・本文) が置かれる',
+    htmlOn.includes('id="saveTplDlg"') && htmlOn.includes('id="stCat"') && htmlOn.includes('id="stName"') && htmlOn.includes('id="stBody"'));
+  check('送信ジョブ履歴の本文からも保存できる', html4.includes('class="ghost job-save-tpl"'));
+  let eJs = null; try { new vm.Script(pageScript(htmlOn)); } catch (e) { eJs = e; }
+  check('詳細画面のクライアントJSが構文OK', pageScript(htmlOn).includes('ST_SEED') && eJs === null, String(eJs));
+  // お客様の名前は画面の JS に埋め込む (本文に残っていないかの確認用) → </script> で閉じられないこと
+  db.prepare('UPDATE inquiries SET customer_name = ?, order_number = ? WHERE id = ?').run('</script><b>山田 花子', '373343-20261005-001', inq4);
+  const htmlXss = await (await fetch(base + `/inquiries/${inq4}`)).text();
+  check('お客様の名前に </script> があっても画面の JS が閉じない',
+    !htmlXss.includes('"</script><b>山田') && htmlXss.includes('\\u003c/script>\\u003cb>山田 花子'));
+  let eXss = null; try { new vm.Script(pageScript(htmlXss)); } catch (e) { eXss = e; }
+  check('同じく JS は構文OK のまま', eXss === null, String(eXss));
+
+  const before = db.prepare('SELECT COUNT(*) c FROM reply_templates').get().c;
+  const rTpl = await jpost('/api/templates', { template_name: '成分の問い合わせ', category: '商品について',
+    template_body: '成分は以下のとおりです。\n・水', notes: `問い合わせ #${inq4} の返信から登録` });
+  const jTpl = await rTpl.json();
+  const tplRow = db.prepare('SELECT * FROM reply_templates WHERE id = ?').get(jTpl.id);
+  check('テンプレ保存APIが新しい id を返す', rTpl.status === 200 && jTpl.ok === true && Number.isInteger(jTpl.id) && jTpl.id > 0);
+  check('選んだグループ・本文・どこから作ったかが残る',
+    tplRow && tplRow.category === '商品について' && tplRow.template_body === '成分は以下のとおりです。\n・水'
+    && tplRow.notes === `問い合わせ #${inq4} の返信から登録` && tplRow.is_active === 1
+    && db.prepare('SELECT COUNT(*) c FROM reply_templates').get().c === before + 1);
+  const tplList = await (await fetch(base + '/api/templates')).json();
+  check('保存したテンプレがすぐ返信欄の一覧に出る', tplList.templates.some(t => t.id === jTpl.id && t.category === '商品について')
+    && tplList.categories.includes('商品について'));
+  const rTplNoName = await jpost('/api/templates', { template_name: ' ', category: '商品について', template_body: 'x' });
+  check('名前が空なら400', rTplNoName.status === 400);
+
   const rEmpty = await jpost(`/api/inquiries/${inq}/reply`, { body: '  ', clientOperationId: randomUUID(), baseConversationRev: 1 });
   check('空本文は400', rEmpty.status === 400);
   const rBadOp = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: 'not-a-uuid', baseConversationRev: 1 });
@@ -259,6 +297,9 @@ console.log('5. 返信エディタ');
   // 履歴の本文は読めるが、書き戻し先の返信欄が無いのでボタンは出さない (CSS側の .job-restore は常に載る)
   check('未決着ジョブ中は「返信欄に戻す」ボタンを出さない',
     !htmlActive.includes('class="ghost job-restore"') && htmlActive.includes('job-body-full'));
+  // スクショの場面 (送信待ちで返信欄が閉じている) でも、送った本文からテンプレにできる
+  check('未決着ジョブ中も履歴の本文から「テンプレに保存」できる (返信欄のボタンは無い)',
+    htmlActive.includes('class="ghost job-save-tpl"') && htmlActive.includes('id="saveTplDlg"') && !htmlActive.includes('id="saveTplBtn"'));
   check('運用管理の要対応に⏳送信待ちで出る', (await (await fetch(base + '/admin')).text()).includes('⏳送信待ち'));
   delete process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED;
 }

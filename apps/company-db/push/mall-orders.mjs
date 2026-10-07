@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後) / Qoo10 (D5b-4。--mall qoo10。API の行だけ = 2026-02-19 以降)
+ * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後) / Qoo10 (D5b-4。--mall qoo10。API の行だけ = 2026-02-19 以降) / Yahoo (D5b-5。--mall yahoo。2026-09-26 に D-32 を a = 入れる に。年 5 万注文前後)
  *
  * 流れは伝票 (ne-shipments.mjs) と同じ共通部 (pipeline.mjs): 台帳 (種類 'order:<mall>') の指紋で差分を決め、outbox から chunk で送り、失敗・stale は次回また送る。
  * 送った後、注文が入ったので伝票との結び直し (POST /shipments/relink = core.relink_shipments_bulk) を回す。
@@ -28,8 +28,10 @@ import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL,
   buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, isLinegiftJst,
-  buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey } from './mall-orders-transform.mjs';
+  buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey,
+  buildYahooOrder, YAHOO_TRANSFORM_VERSION, YAHOO_COLUMNS, isYahooJst, isYahooOrderNo } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
+import { writeEvidence } from './evidence.mjs';
 
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28
 /**
@@ -204,6 +206,51 @@ export const MALL_SPECS = {
              sum(case when round(coalesce(order_price, 0)) > 0 then round(order_price) * order_qty else 0 end) as items_amount_jpy, 0 as cancelled
         from raw_qoo10_orders where substr(source_type, 1, 4) = 'api_' and substr(order_date, 1, 10) >= ? and substr(order_date, 1, 10) <= ? group by 1`,
   },
+  /**
+   * Yahoo!ショッピング (D5b-5)。元 = raw_yahoo_orders (1 行 = 注文 × 明細。2025-01-01 から = floor と同じ)。個人情報の列はこの表に無い。
+   * 範囲の判定に使う order_time と注文番号は、整形と同じ関数 (isYahooJst / isYahooOrderNo。原値のまま) で検証する。
+   * 後ろの明細の order_time が先頭と違う注文 (整形は「行によって違う」で例外) も必ず整形に渡す (#1363 の約束)。raw が floor からなので referencedByShipments は持たない
+   */
+  yahoo: {
+    label: 'Yahoo の注文', scope: 'main', transformVersion: YAHOO_TRANSFORM_VERSION,
+    // 売上日次 (mart.sales_daily) に公開する (2026-09-28〜)。9/26 までは止めていた = モール負担の値引 (TotalMallCouponDiscount) を取込が取っていなかった (#1465 Codex R1 P2)
+    //   → #1476 で取込が取るようにし、2025-01〜2026-09 を取り直して NULL が残っていないのを確かめてから開けた。
+    // 🚨 salesDailyGuard: mart は モール負担 null を 0 として「払った額」を出す = 取込がまた取り損ねたら払った額が多く出る → raw に null が 1 行でもあれば作り直さず ❌
+    //   requireKnownMallCoupon: さらに Company DB 側 (取消でない注文でモール負担 null) も 0 件でなければ作り直さない (raw を直しても送信の失敗で Company DB に古い null が残りうる。#1502 Codex R1)
+    requireKnownMallCoupon: true,
+    salesDailyGuard: (warehouse) => {
+      const has = new Set(warehouse.prepare(`pragma table_info(raw_yahoo_orders)`).all().map((c) => c.name));
+      if (!has.has('mall_coupon_discount')) return 'raw_yahoo_orders に mall_coupon_discount の列が無い (取込が古い)';
+      const n = warehouse.prepare(`select count(distinct order_id) as n from raw_yahoo_orders where mall_coupon_discount is null and order_time >= '2025-01-01'`).get().n;
+      return n > 0 ? `モール負担 (mall_coupon_discount) が分からない注文が ${n} 件ある = 払った額が多く出るので売上日次を作り直さない (取込・VPS の Field を確かめて取り直す。README「Yahoo の注文」)` : null;
+    },
+    iterate: function* (warehouse) {
+      let cur = null;
+      // mall_coupon_discount は 2026-09-26 に取込が足す列 = まだ無ければ NULL (取っていない) として読む
+      const has = new Set(warehouse.prepare(`pragma table_info(raw_yahoo_orders)`).all().map((c) => c.name));
+      const cols = YAHOO_COLUMNS.map((c) => (has.has(c) || c !== 'mall_coupon_discount' ? c : `null as ${c}`));
+      for (const row of warehouse.prepare(`select ${cols.join(', ')} from raw_yahoo_orders order by order_id, line_id`).iterate()) {
+        if (cur && cur.rows[0].order_id === row.order_id) {
+          if ((row.order_time ?? null) !== (cur.rows[0].order_time ?? null)) cur.invalidDate = true;
+          cur.rows.push(row); continue;
+        }
+        if (cur) yield cur;
+        const okNo = isYahooOrderNo(row.order_id), okDt = isYahooJst(row.order_time);
+        const no = okNo ? row.order_id : String(row.order_id ?? '');
+        cur = { key: `yahoo|main|${no}`, no, rows: [row], order_date: okDt ? row.order_time : '', invalidDate: !okNo || !okDt };
+      }
+      if (cur) yield cur;
+    },
+    dateOf: (group) => group.order_date.slice(0, 10),
+    build: (group, ctx) => buildYahooOrder(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString() }),
+    /** 突合の材料: 注文日 (JST) ごとの 注文数 / 明細数 / 商品代 (Σ unit_price × quantity。UnitPrice は店のクーポン値引き後) / 取消の注文数 (order_status = '4') */
+    dailySql: `with o as (
+        select order_id, substr(min(order_time), 1, 10) as d, count(*) as n_lines, sum(round(coalesce(unit_price, 0)) * coalesce(quantity, 0)) as amt,
+               max(case when trim(coalesce(order_status, '')) = '4' then 1 else 0 end) as c
+          from raw_yahoo_orders group by order_id)
+      select d as order_date, count(*) as orders, sum(n_lines) as lines, sum(amt) as items_amount_jpy, sum(c) as cancelled
+        from o where d >= ? and d <= ? group by d`,
+  },
 };
 
 /** 素の MALL_SPECS[x] は 'toString' のような継承プロパティも拾う → 自前の鍵だけ (Codex D5b-2 R2 #2) */
@@ -358,10 +405,34 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
  * remaining > 0 の間、呼び直す。回 (session) の続きは Render の DB が覚えている = 時間予算か回数の上限で打ち切っても (complete = false = 失敗扱い)、次の run は続きからやる (先頭に戻らない。Codex D7a R1 #2)。
  * 0021 がまだ適用されていなければ { skipped: 'not_migrated' } (注文の push 自体は失敗にしない。最後の行に出すので黙った緑にはならない)
  */
+/** Company DB 側で、取消でない注文のうちモール負担の分からない数 (GET …/orders/status の counts.mall_coupon_unknown)。Render が古くて数が無ければ例外 */
+export async function remoteMallCouponUnknown({ mall, base, syncKey, fetchImpl = fetch }) {
+  const spec = specOf(mall);
+  const res = await fetchImpl(`${base}/orders/status?mall=${encodeURIComponent(mall)}&scope=${encodeURIComponent(spec.scope)}`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`注文の状態が取れない: HTTP ${res.status}`);
+  const j = await res.json();
+  const n = j && j.counts ? j.counts.mall_coupon_unknown : undefined;
+  if (!Number.isInteger(n) || n < 0) throw new Error('Render の注文の状態にモール負担の分からない数が無い (Render が古い)');
+  return n;
+}
+/** 売上日次を作り直してよいか (モール負担が分かっているか)。作り直してよければ null、だめなら理由 */
+export async function salesDailyBlocker({ mall, warehouse = null, pushOk = true, base, syncKey, fetchImpl = fetch }) {
+  const spec = specOf(mall);
+  if (!spec.requireKnownMallCoupon && !spec.salesDailyGuard) return null;
+  if (!pushOk) return '注文の送信に失敗・古い世代がある = Company DB にモール負担の古い値が残りうるので売上日次を作り直さない (送信が通った回に作り直す)';
+  if (warehouse && spec.salesDailyGuard) { const g = spec.salesDailyGuard(warehouse); if (g) return g; }
+  if (spec.requireKnownMallCoupon) {
+    const n = await remoteMallCouponUnknown({ mall, base, syncKey, fetchImpl });
+    if (n > 0) return `Company DB に、取消でないのにモール負担の分からない注文が ${n} 件ある = 払った額が多く出るので売上日次を作り直さない (取り直して送り直す)`;
+  }
+  return null;
+}
+
 export const DEFAULT_SALES_LIMIT = 31;                     // 1 回の呼び出しで作る日数。実測 (2026-09-20 本番): 楽天 31 日 = 1.2〜1.5 万注文で平均 1.1 秒・最大 1.5 秒 / au PAY 最大 0.4 秒。Amazon は約 7.5 万注文 = 単純比例で 7 秒前後の見込み (Render の 60 秒の枠に十分)
 export const DEFAULT_SALES_BUDGET_MS = 10 * 60 * 1000;     // env CDB_SALES_BUDGET_MS
 export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey, limit = DEFAULT_SALES_LIMIT, reset = false, maxCalls = 100, budgetMs = DEFAULT_SALES_BUDGET_MS, now = () => Date.now(), log = console.log }) {
   const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
+  if (spec.salesDaily === false) throw new Error(`${mall} の売上日次は止めている (salesDaily = false。モール負担を取込が取っていない = 払った額が出せない)`);
   if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
   const started = now();
   let calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null, catchUp = false, staleAtStart = false;
@@ -436,6 +507,7 @@ export function parseArgs(argv) {
     else if (a === '--chunk') out.chunk = val();
     else throw new Error(`知らない引数: ${a}`);
   }
+  if (out.incremental && (out.from || out.to)) throw new Error('--incremental と --from/--to は一緒に指定しない (範囲を流すなら --from/--to だけ。証跡の mode を取り違えない)');
   return out;
 }
 
@@ -462,7 +534,11 @@ async function main() {
     if (a.incremental || a.relink || a.reconcile || a.resetLedger || a.markBackfilled || a.dryRun) throw new Error('--refresh-sales / --check-sales はほかの操作と一緒に指定しない');
     // 売上日次だけ (Render を叩くだけ = DATA_DIR 不要)
     if (!a.mall || !specOf(a.mall)) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
+    if (a.refreshSales && specOf(a.mall).salesDaily === false) throw new Error(`${a.mall} の売上日次は止めている (モール負担の値引を取込が取っていない = 払った額が出せない。README「Yahoo の注文」)`);
     if (a.refreshSales) {
+      // 手で流す作り直しも Company DB 側のモール負担を確かめる (warehouse.db は開かない = raw は見ない。送信が通った後に流す)
+      const blocker = await salesDailyBlocker({ mall: a.mall, base, syncKey });
+      if (blocker) throw new Error(blocker);
       const s = await refreshSalesDaily({ mall: a.mall, base, syncKey, reset: a.all, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS });
       console.log(s.skipped === 'not_migrated' ? '⏭️ 売上日次は未適用 (migration 0021 を当てる)' : s.complete ? `✅ 売上日次 (${a.mall}): ${s.dates} 日ぶんを作り直した (${s.rows} 行)` : `⚠️ 売上日次 (${a.mall}): ${s.dates} 日で打ち切り・残り ${s.remaining} 日 (もう一度 --refresh-sales を流す)`);
       process.exitCode = s.skipped || s.complete ? 0 : 1;
@@ -512,8 +588,10 @@ async function main() {
     // 🚨 黙って緑にしない: 最後の行 (= 朝の通知に出る要約) に「バックフィル前」と書く
     if (a.requireBackfilled && a.incremental && !a.dryRun && !isBackfillDone(ledger)) {
       console.log(`⏭️ Company DB ${MALL_SPECS[a.mall].label} push: 初回のバックフィル前 (台帳に完了印が無い。送付確認済み ${ledger.countConfirmed()} 件) なので送らない → db/company/README.md の手順で --from/--to のバックフィルを最後まで流し、--reconcile --all が一致したら --mark-backfilled`);
+      writeEvidence(dataDir, `orders-${a.mall}`, { kind: 'orders', mall: a.mall, scope: MALL_SPECS[a.mall].scope, mode: 'incremental', ok: null, skipped: 'not_backfilled', confirmed: ledger.countConfirmed() });
       return;
     }
+    const pushStartedAt = new Date();
     const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to, relink: !a.noRelink, relinkLimit });
     if (r.stats && (r.stats.sentinel || r.stats.negative)) console.log(`  金額を null にした: 番兵 (-9999) ${r.stats.sentinel} 個 / 負 ${r.stats.negative} 個`);
     if (a.mall === 'qoo10' && r.stats) console.log(`  Qoo10: 旧データの行 (legacy_migration。鍵がカート番号) で送らなかった ${r.stats.skippedLegacy} 行 / 単価 0 を「分からない」にした注文 ${r.stats.zeroPrice}`);
@@ -522,15 +600,44 @@ async function main() {
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
     // 売上日次の作り直し: 注文を送れた・送る物が無かった どちらでも回す (前の回の取りこぼしを拾う)。別の送り手が走っている・dry-run・--no-sales のときは回さない
     let sales = null;
-    if (!r.dryRun && !r.lockedBy && !a.noSales) {
-      try { sales = await refreshSalesDaily({ mall: a.mall, base, syncKey, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS }); }
-      catch (e) { sales = { ok: false, error: e.message }; }
+    if (!r.dryRun && !r.lockedBy && !a.noSales && MALL_SPECS[a.mall].salesDaily !== false) {
+      let guard = null;   // 材料が売上日次に足りているか (Yahoo = モール負担。送信の成否・raw・Company DB)
+      try { guard = await salesDailyBlocker({ mall: a.mall, warehouse, pushOk: r.ok, base, syncKey }); } catch (e) { guard = `モール負担を確かめられない: ${e.message}`; }
+      if (guard) sales = { ok: false, error: guard };
+      else {
+        try { sales = await refreshSalesDaily({ mall: a.mall, base, syncKey, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS }); }
+        catch (e) { sales = { ok: false, error: e.message }; }
+      }
     }
     console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote + salesNote(sales));
     const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : (r.ok && (!sales || sales.ok)));
+    // 朝の見張り (apps/company-db/watch) に渡す証跡。🚨 変更ゼロの朝は Render に run が作られない = 「走査は完了した・変わった注文は 0」を後から確かめられるのはこれだけ (設計 09 §2.1)
+    if (a.incremental && !a.dryRun) writeEvidence(dataDir, `orders-${a.mall}`, evidenceOf(a.mall, r, { startedAt: pushStartedAt, success, relink: rl, sales }));
     process.exitCode = success ? 0 : 1;
+  } catch (e) {
+    if (a.incremental && !a.dryRun) writeEvidence(dataDir, `orders-${a.mall}`, { kind: 'orders', mall: a.mall, scope: MALL_SPECS[a.mall].scope, mode: 'incremental', ok: false, error: String(e && e.message).slice(0, 300) });
+    throw e;
   } finally { ledger.close(); warehouse.close(); }
 }
 
+/** 証跡の形 (見張りの W7 / W9 が読む)。件数は数だけ (注文の中身は入れない) */
+export function evidenceOf(mall, r, { startedAt, success, relink = null, sales = null } = {}) {
+  return {
+    kind: 'orders', mall, scope: MALL_SPECS[mall].scope, mode: r.mode, ok: !!success, push_ok: !!r.ok, locked: !!r.lockedBy,
+    run_id: r.runId ?? null, batch_seq: r.batchSeq ?? null, started_at: startedAt ? startedAt.toISOString() : null,
+    scanned: r.scanned, in_scope: r.inScope, unchanged: r.unchanged, changed: r.changed, sent: r.sent, applied: r.applied, same: r.same, stale: r.stale,
+    failed: Array.isArray(r.failed) ? r.failed.length : 0, transform_errors: Array.isArray(r.transformErrors) ? r.transformErrors.length : 0,
+    ledger_reset: r.ledgerReset || null, ledger_rebuilt: r.ledgerRebuilt || null,
+    relink: relink && relink.ran ? { ok: !relink.error, linked: relink.result ? relink.result.linked : null, pending: !!relink.pending } : null,
+    sales: sales ? { ok: !!sales.ok, complete: !!sales.complete, dates: sales.dates ?? null, skipped: sales.skipped || null, error: sales.error ? String(sales.error).slice(0, 200) : null } : null,
+  };
+}
+
 const isMain = !!process.argv[1] && path.resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
-if (isMain) main().catch((e) => { console.error(`❌ Company DB 注文 push: ${e.message}`); process.exit(1); });
+// 落ちたときの最後の行は 1 行にする (Render のデプロイ中の 502 は本文が HTML = そのまま出すと何十行にもなる。2026-09-21 に本番のバックフィルで出た)。
+// 🚨 fetch の直後に process.exit() しない: Windows の Node は libuv の assertion で異常終了して終了コードが 127 になる (#1386)。exitCode を置いて自然に終わらせ、保険に 10 秒後 (unref = ループを延ばさない)
+if (isMain) main().catch((e) => {
+  console.error(`❌ Company DB 注文 push: ${String(e && e.message).replace(/\s+/g, ' ').slice(0, 400)}`);
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 10000).unref();
+});

@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // Amazon SKU の対応の一覧 (新しいデザイン・第 2 段 10/5)。上に「売れたのに対応が無い SKU」(絞り込みの無い最初の画面だけ)・大きな検索欄・状態の札・表
+    const keep = Object.fromEntries(Object.entries(filters).filter(([k, v]) => v && k !== 'offset'));
+    const hrefWith = (over) => {
+      const p = { ...keep };
+      for (const [k, v] of Object.entries(over)) { if (v) p[k] = v; else delete p[k]; }
+      const s = new URLSearchParams(p).toString();
+      return s ? '?' + s : './';
+    };
+    const pageHref = (offset) => { const s = new URLSearchParams({ ...keep, ...(offset ? { offset: String(offset) } : {}) }).toString(); return s ? '?' + s : './'; };
+    const comps = (s) => String(s || '').split(', ').filter(Boolean).map((x) => { const i = x.lastIndexOf('×'); return i > 0 ? [x.slice(0, i), x.slice(i + 1)] : [x, '']; });
+    const um = unmapped && !unmapped.tableMissing ? unmapped : null;
+    const umRows = um ? um.rows.slice(0, 5) : [];
+    // 札の色: 対応の無い SKU がある = 赤 / 未判定の日がある = 黄 (0 件と言い切れない) / どちらも無い = 緑
+    const umTone = !um ? '' : um.rows.length ? 'err' : um.undecided.length ? 'warn' : 'ok';
+    const TONE = { err: ['', 'i-warn', 'color:var(--err);border-color:rgba(255,112,133,.45);background:var(--err-bg)'], warn: [' warnc', 'i-info', 'color:var(--warn);border-color:rgba(255,200,87,.45);background:var(--warn-bg)'], ok: [' calm', 'i-check', 'color:var(--ok);border-color:rgba(46,230,168,.45);background:var(--ok-bg)'] };
+    const chLabel = (ch) => (ch ? (CHANNELS[ch] || ch) : '—');
+  %>
+  <div class="page" id="amazon-page">
+    <div class="ph">
+      <div>
+        <h1>Amazon SKU の対応</h1>
+        <div class="lead">Amazon の seller SKU が、どの NE の商品 × 何個 でできているか。古い表 (miniPC の SKU マスタ・Render) と FBA 補充に届くのは、毎朝 07:00 の写しの後です。</div>
+      </div>
+      <div class="ph-actions">
+        <a class="btn" href="unmapped"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg>未登録 (売れたのに構成が無い SKU)</a>
+        <a class="btn" href="<%= base %>/manual#amazon"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a>
+      </div>
+    </div>
+
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (amazonClosed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= amazonClosedWhy %>)</div><div class="hint">この画面は見るだけです。切替日までは Amazon SKU の対応の正は miniPC の SKU マスタ (/apps/warehouse の「SKUマスタ」) です。</div></div></div><% } %>
+    <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+    <% if (data.tableMissing) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)。</div></div><% } %>
+
+    <% if (um) { %>
+    <section class="panel todo-card<%= TONE[umTone][0] %>" aria-labelledby="h-um">
+      <div class="panel-h">
+        <span class="hico" aria-hidden="true" style="<%= TONE[umTone][2] %>"><svg class="ic"><use href="#<%= TONE[umTone][1] %>"/></svg></span>
+        <h2 id="h-um">売れたのに対応が無い SKU — <%= um.rows.length %> 件</h2>
+        <span class="sub">直近 <%= UNMAPPED_DAYS %> 日 · このままだと売上の日次で商品に分けられません</span>
+        <span class="right"><a class="btn sm" href="unmapped?channel=all">全部見る<svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg></a></span>
+      </div>
+      <% if (um.undecided.length) { %><div class="callout warn" style="margin-bottom:12px"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">売上の日次がまだ公開されていない日があります (<%= um.undecided.map((d) => ui.fmtDay(d, um.today)).join('・') %>)。その日の注文が入っていない = 「0 件」とは言い切れません (未判定)。</div></div><% } %>
+      <% if (umRows.length) { %>
+      <div class="todo-row head" aria-hidden="true"><span>seller SKU</span><span>区分</span><span>個数</span><span>注文</span><span class="lastd">最後に売れた日</span><span>いまの対応</span><span></span></div>
+      <ul style="list-style:none">
+      <% for (const r of umRows) { const sk = String(r.code).trim().toLowerCase(); %>
+        <li class="todo-row"><span class="code"><%= r.code %></span><span><span class="b <%= r.channel === 'FBM' ? 'vio' : 'mute' %>"><%= chLabel(r.channel) %></span></span><span class="num"><%= r.units %> 個</span><span class="num"><%= r.orders %> 件</span><span class="lastd"><%= ui.fmtDay(r.last_date, um.today) %></span>
+          <span class="muted"><%= r.map_state ? (MAP_STATES[r.map_state] || r.map_state) : (r.listing_id ? '出品はある (構成なし)' : '出品なし') %></span>
+          <a class="btn soft sm" href="sku?sku=<%= encodeURIComponent(sk) %>" aria-label="<%= r.code %> の対応を<%= r.map_state ? '直す' : '作る' %>"><%= r.map_state ? '対応を直す' : '対応を作る' %></a></li>
+      <% } %>
+      </ul>
+      <% if (um.rows.length > umRows.length) { %><div class="hint" style="margin-top:4px">ほか <%= um.rows.length - umRows.length %> 件は「全部見る」で。</div><% } %>
+      <% } else { %><div class="hint"><%= um.undecided.length ? '分かっている日の分では、対応の無い SKU はありません。' : '直近に売れた seller SKU は、全部 対応があります。' %></div><% } %>
+    </section>
+    <% } %>
+
+    <section class="panel hud" aria-label="探す">
+      <form method="get" action="" role="search" class="bigsearch" id="list-search">
+        <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="q" name="q" value="<%= filters.q %>" autocomplete="off" aria-keyshortcuts="/" aria-label="Amazon SKU の対応を絞る (seller SKU・名前・NE コード)" placeholder="seller SKU・名前・NE コードで絞る　例: pr_ / はちみつ">
+        <% if (filters.state) { %><input type="hidden" name="state" value="<%= filters.state %>"><% } %>
+        <span class="kbd" aria-hidden="true">/</span>
+        <button class="btn pri go" type="submit">絞る</button>
+      </form>
+      <div class="chips" style="margin-top:12px">
+        <span class="chip-lab">状態</span>
+        <a class="chip<%= !filters.state ? ' on' : '' %>" href="<%= hrefWith({ state: '' }) %>"<%- !filters.state ? ' aria-current="true"' : '' %>>全部</a>
+        <% for (const [k, v] of Object.entries(MAP_STATES)) { %><a class="chip<%= filters.state === k ? ' on' : '' %>" href="<%= hrefWith({ state: filters.state === k ? '' : k }) %>"<%- filters.state === k ? ' aria-current="true"' : '' %>><%= v %></a><% } %>
+      </div>
+      <form method="get" action="sku" class="opensku">
+        <label for="open-sku">seller SKU を開く (無ければ新しい対応)</label>
+        <input class="in mono" id="open-sku" name="sku" required autocomplete="off" spellcheck="false" placeholder="例: pr_abc001">
+        <button class="btn sm" type="submit">開く</button>
+      </form>
+    </section>
+
+    <section class="panel" aria-label="一覧">
+      <div class="tbl-top"><span><b><%= data.total.toLocaleString('ja-JP') %></b> 件<% if (data.total) { %> <span class="muted">(<%= data.offset + 1 %>〜<%= data.offset + data.rows.length %> 件目)</span><% } %></span><span class="dotsep" aria-hidden="true"></span><span>時刻は日本時間</span></div>
+      <div class="tblwrap">
+        <table class="tbl click" id="list-tbl">
+          <caption class="sr">Amazon SKU の対応の一覧 (seller SKU を押すと開きます)</caption>
+          <thead><tr><th scope="col">seller SKU</th><th scope="col">名前</th><th scope="col">構成 (NE の商品 × 数)</th><th scope="col">区分</th><th scope="col">ASIN</th><th scope="col">状態</th><th scope="col">変えた</th></tr></thead>
+          <tbody>
+            <% if (!data.rows.length) { %><tr><td colspan="7" class="muted" style="padding:24px 12px;text-align:center"><%= dbError ? '読めません' : (filters.q || filters.state ? '当てはまる対応がありません' : 'まだ対応がありません (切替の日の移行の前は 0 件です。今の正は miniPC の SKU マスタ)') %></td></tr><% } %>
+            <% for (const r of data.rows) { const del = r.state === 'deleted'; %>
+            <tr class="<%= del ? 'row-del' : '' %>">
+              <td><a class="rowlink" href="sku?sku=<%= encodeURIComponent(r.seller_sku) %>"><%= r.seller_sku %></a></td>
+              <td class="nm"><%= r.name %></td>
+              <td><% if (r.comps) { for (const [c, q] of comps(r.comps)) { %><span class="compchip"><span class="mono"><%= c %></span><span class="x">×<%= q %></span></span><% } } else { %><span class="muted">—<%= del ? ' (外した)' : '' %></span><% } %></td>
+              <td><% if (r.channel) { %><span class="b <%= r.channel === 'FBM' ? 'vio' : 'mute' %>"><%= chLabel(r.channel) %></span><% } else { %><span class="muted">—</span><% } %></td>
+              <td class="mono" style="font-size:13px"><%= r.asin || '' %><% if (!r.asin) { %><span class="muted">—</span><% } %></td>
+              <td><span class="b <%= del ? 'mute' : 'ok' %>"><% if (!del) { %><span class="dot" aria-hidden="true"></span><% } %><%= MAP_STATES[r.state] || r.state %></span><% if (r.origin === 'legacy') { %> <span class="b mute" title="切替の日の移行で入った対応">移行</span><% } %></td>
+              <td class="num" style="white-space:nowrap"><%= ui.fmtJst(r.changed_at, { nowMs }) %><span class="sub"><%= r.changed_by || '' %></span></td>
+            </tr>
+            <% } %>
+          </tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <% if (data.offset > 0) { %><a class="btn sm" href="<%= pageHref(Math.max(0, data.offset - data.limit)) %>">← 前の <%= data.limit %> 件</a><% } %>
+        <% if (data.total > data.offset + data.rows.length) { %><a class="btn sm" href="<%= pageHref(data.offset + data.limit) %>">次の <%= data.limit %> 件 →</a><% } %>
+      </div>
+    </section>
+  </div>
+  <%- include('_footer') %>
+</body>
+</html>

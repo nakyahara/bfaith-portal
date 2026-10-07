@@ -375,6 +375,22 @@ export function loadLedgerBackorders() {
 }
 
 /**
+ * 1 つの商品の注残の明細 (読むだけ)。母集合は loadLedgerBackorders と同じ (v_ledger_backorder_by_product = この明細の合計)。
+ * マスタの入力 (apps/master-edit) の 1 つの商品の画面の「注文残」の内訳。古い発注から順
+ * @returns {{ poNumber, supplierCode, supplierName, issuedAt, due, dueKind: 'promised'|'requested'|null, remaining }[]}
+ */
+export function loadBackorderLines(productKey) {
+  const db = getDB();
+  return db.prepare(`SELECT po_number, supplier_code, supplier_name, issued_at, promised_date, requested_date, remaining_qty
+      FROM v_ledger_backorder_lines WHERE product_key = ? ORDER BY issued_at, order_item_id`).all(normProductCode(productKey))
+    .map((r) => ({
+      poNumber: r.po_number, supplierCode: r.supplier_code, supplierName: r.supplier_name, issuedAt: r.issued_at,
+      due: r.promised_date || r.requested_date || null, dueKind: r.promised_date ? 'promised' : (r.requested_date ? 'requested' : null),
+      remaining: r.remaining_qty,
+    }));
+}
+
+/**
  * 商品別オープン注残の希望納期内訳 → Map(product_key → [{date:'YYYY-MM-DD', qty}] 日付昇順)。
  * 母集合は loadLedgerBackorders と同じ (v_ledger_backorder_requested_dates)。納期未指定の注残は含まれない。
  */

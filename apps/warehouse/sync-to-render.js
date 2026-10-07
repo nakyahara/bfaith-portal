@@ -13,6 +13,9 @@
  */
 import 'dotenv/config';
 import { getDB } from './db.js';
+import { buildMaterialGeneration, saveMaterialSnapshot } from './material-lineage.js';
+import { readMaterialWithLineage } from './master-material.js';
+import { writeEvidence } from '../company-db/push/evidence.mjs';
 
 const RENDER_URL = process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror';
 const SYNC_KEY = process.env.MIRROR_SYNC_KEY || '';
@@ -114,6 +117,46 @@ export function shipmentsDailyVerify({ status, shipments_daily, shipments_daily_
   const v = shipmentsDailyVerdict({ state: shipments_daily_state, sent, received });
   return { state: shipments_daily_state, sent, received, match: v.match, line: v.line };
 }
+/**
+ * マスタの部の応答から「Render 到達」の証跡を作る (証跡 render-master。Company DB構想 10 §6.1.1 A3)。entity ごとの status:
+ *   recorded     = 受け手が送った世代 (ID・ハッシュが同じ) を記録した
+ *   mismatch     = 記録したと言うが、世代・ハッシュが送ったものと違う
+ *   not_recorded = 入れ替えたが記録しなかった (理由つき。前の世代の記録は受け手が消した)
+ *   not_replaced = 応答に material_recorded はあるがこの entity が無い (送っていない・空 = 入れ替えていない)
+ *   unconfirmed  = 応答に material_recorded が無い (古い受け手) / 送信が失敗した (timeout・HTTP・応答が読めない = 受け手に反映済みかもしれない)。
+ *                  どちらも「確認できない」であって「届いていない」とは言わない
+ */
+export function masterReceiptEvidence({ generation, lineage, masterPart, response, error = null }) {
+  const mr = !error && response && typeof response === 'object' ? response.material_recorded : undefined;
+  const entities = {};
+  for (const entity of ['products', 'set_components']) {
+    const req = generation ? generation[entity] ?? null : null;
+    let status, reason = null;
+    if (error) { status = 'unconfirmed'; reason = `送信が失敗した (${String(error.message || error).slice(0, 160)})`; }
+    else if (!mr || typeof mr !== 'object') status = 'unconfirmed';
+    else if (!Object.hasOwn(mr, entity)) status = 'not_replaced';
+    else if (mr[entity] && mr[entity].recorded === true) {
+      const same = !!generation && mr[entity].generation_id === generation.generation_id && !!req && mr[entity].content_hash === req.content_hash;
+      status = same ? 'recorded' : 'mismatch';
+      if (!same) reason = '応答の世代・ハッシュが送ったものと違う';
+    } else { status = 'not_recorded'; reason = (mr[entity] && mr[entity].reason) || null; }
+    entities[entity] = {
+      sent_rows: Array.isArray(masterPart && masterPart[entity]) ? masterPart[entity].length : null,
+      requested: req ? { row_count: req.row_count, content_hash: req.content_hash } : null,
+      status, reason,
+    };
+  }
+  return {
+    generation_id: generation ? generation.generation_id : null,
+    build_id: lineage && lineage.build_id ? lineage.build_id : null,
+    lineage_reason: lineage && !lineage.build_id ? lineage.reason ?? null : null,
+    // 作り直しが使った Company DB の写しの世代 (④a。由来が分かるときだけ)
+    cdb_publish: lineage && lineage.build_id ? lineage.cdb_publish ?? null : null,
+    send_error: error ? String(error.message || error).slice(0, 300) : null,
+    entities,
+  };
+}
+
 export function buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state }) {
   if (masterPart && Object.prototype.hasOwnProperty.call(masterPart, 'shipments_daily')) throw new Error('masterPart に shipments_daily を入れない (別の部として送る)');
   const parts = [{ payload: masterPart, label: 'マスタ' }];
@@ -221,17 +264,30 @@ export async function syncToRender() {
   days90ago.setDate(days90ago.getDate() - 90);
   const days90agoStr = days90ago.toISOString().slice(0, 10); // YYYY-MM-DD
 
-  // 1. products（代表商品コードをraw_ne_productsからJOIN）
-  const products = db.prepare(`
-    SELECT p.*, n.代表商品コード
-    FROM m_products p
-    LEFT JOIN raw_ne_products n ON p.商品コード = n.商品コード COLLATE NOCASE
-  `).all();
+  // 1. products（代表商品コードをraw_ne_productsからJOIN）+ 2. set_components + 作り直しの記録。
+  //   1 つの読み取り取引で読み、送る中身が最新の作り直しの記録と同じときだけ由来 (build) を付ける (master-material.js。Company DB構想 10 §6.1.1 A2)
+  const { products, set_components, semantics: materialSemantics, lineage: materialLineage } = readMaterialWithLineage(db);
   console.log(`[Sync→Render]   products: ${products.length}件`);
-
-  // 2. set_components
-  const set_components = db.prepare('SELECT * FROM m_set_components').all();
   console.log(`[Sync→Render]   set_components: ${set_components.length}件`);
+
+  // 2a. Company DB の夜間ロードの材料の世代 (material-lineage.js。Company DB構想 10 §6 / ③a-1)。
+  //   送る products / set_components を Render の mirror が持つ形にそろえた中身のハッシュと世代 ID を付け、その中身を DATA_DIR/cdb-material に控える。
+  //   NE の印は **作り直しが読んだ印** (送信時点の印ではない)。由来が不明 (作り直しの後に画面で直された・作り直しの記録が無い) なら null (照合は「判定できない」)。
+  //   🚨 ここで失敗しても送信は止めない (控えが無い世代は照合で「判定できない」になるだけ)
+  let materialGeneration = null;
+  try {
+    const known = !!materialLineage.build_id;
+    materialGeneration = buildMaterialGeneration({
+      products, set_components, build: materialLineage,
+      productsSemantics: materialSemantics,   // D3: 代表商品コードの意味の版 (受け手が残し、夜間ロードが読み方を決める)
+      neProductsCompleteAt: known ? materialLineage.ne_products_complete_at : null,
+      neSetProductsCompleteAt: known ? materialLineage.ne_setproducts_complete_at : null,
+    });
+    const file = saveMaterialSnapshot({ dataDir: process.env.DATA_DIR, generation: materialGeneration, products, set_components });
+    console.log(`[Sync→Render]   material: ${materialGeneration.generation_id} (控え ${file}・作り直し ${known ? materialLineage.build_id : `不明 (${materialLineage.reason}${materialLineage.differs ? ` ${materialLineage.differs.join('/')}` : ''})`})`);
+  } catch (e) {
+    console.warn(`[Sync→Render]   material: 控えを残せなかった (送信は続ける): ${e.message}`);
+  }
 
   // 2b-3. inv_daily_summary（PR-B: 日次在庫スナップショット集計）
   //   小規模 (1日3行 × 365日 = 1,095/年)、毎回全件送って Render mirror を完全置換
@@ -477,6 +533,8 @@ export async function syncToRender() {
     const masterPart = {
       products, set_components, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
     };
+    // 材料の世代 (Render の受け手が products / set_components を入れ替えたのと同じ取引で記録する。古い受け手は無視する)
+    if (materialGeneration) masterPart.material_generation = materialGeneration;
     // 出荷サマリ (shipments_daily) はマスタに入れず **別の部** で送る (buildMasterSyncParts。2026-09-15 の 413 = マスタと合わせて 12MB 超)。
     //   「当日再構築された表を SELECT できたとき」だけ、0 件でも送る (元が正当に空になったケースを写す)。failed / stale は送らず Render は前回分を保持。
     // sku_resolved と sku_master は同一の m_sku_master スナップショット由来。
@@ -494,7 +552,13 @@ export async function syncToRender() {
     }
     // Part 1 = マスタ (8.8MB 前後) + Part 1a = 出荷サマリ (3.6MB 前後、別 POST)
     for (const part of buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state })) {
-      await sendPart(part.payload, part.label);
+      if (part.payload !== masterPart) { await sendPart(part.payload, part.label); continue; }
+      // マスタの部: 応答を受けた直後に「Render 到達」の証跡を残す (後の部の失敗で消さない。Company DB構想 10 §6.1.1 A3)。
+      //   送信が失敗した回も残す (同じ実行 ID の retry で失敗したとき、前の回の recorded を残さない。timeout は反映済みかもしれない = 確認できない。Codex PR #1453 R1 Medium-4)
+      let resp = null, sendError = null;
+      try { resp = await sendPart(part.payload, part.label); } catch (e) { sendError = e; }
+      writeEvidence(process.env.DATA_DIR, 'render-master', masterReceiptEvidence({ generation: materialGeneration, lineage: materialLineage, masterPart, response: resp, error: sendError }));
+      if (sendError) throw sendError;
     }
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)
@@ -808,20 +872,51 @@ export async function syncPmlSnapshotOnly() {
 // (古いスナップショットを再送して synced_at だけ新しく見せない — isShipmentsRebuildFresh と同じ思想の毎時版)
 const LOGIZARD_SYNC_MAX_AGE_MIN = 90;
 
+/**
+ * 取り込みの素性 (在庫を取った時刻の下限・行数・読み飛ばし行数)。logizard_source_for が今回の取り込みと
+ * 同じときだけ返す (違う = 素性を残さない経路で取り込んだ → 送らない。Render 側は null として受ける)
+ */
+export function readLogizardSnapshot(db) {
+  return db.transaction(() => {
+    const at = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
+    if (!at) return { importedAt: null, rows: [], meta: {} };
+    const rows = db.prepare(`
+      SELECT 商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
+             在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, ブロック引当順
+      FROM raw_lz_inventory ORDER BY 商品ID, ブロック略称, ロケ
+    `).all();
+    return { importedAt: at, rows, meta: logizardSourceMeta(db, at) };
+  })();
+}
+
+export function logizardSourceMeta(db, importedAt) {
+  const get = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
+  if (get('logizard_source_for') !== importedAt) return {};
+  const out = {};
+  const src = get('logizard_source_at');
+  if (src && Number.isFinite(Date.parse(src))) out.source_at = src;
+  for (const [k, key] of [['rows_read', 'logizard_rows_read'], ['skipped_rows', 'logizard_skipped_rows']]) {
+    const n = Number(get(key));
+    if (Number.isInteger(n) && n >= 0) out[k] = n;
+  }
+  return out;
+}
+
 export async function syncLogizardStockOnly() {
   requireSyncKey();
   const db = getDB();
-  const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
+  // 🚨 取り込み時刻・在庫の行・素性は 1 回の読み取りトランザクションで (途中で次の取り込みが入って世代が混ざらないように。
+  //    PR #1446 R1 Medium)
+  const snap = readLogizardSnapshot(db);
+  const importedAt = snap.importedAt;
   if (!importedAt) return { state: 'skipped', reason: 'logizard未取込 (sync_meta無し)' };
   const ageMin = (Date.now() - Date.parse(importedAt)) / 60000;
   if (!Number.isFinite(ageMin) || ageMin > LOGIZARD_SYNC_MAX_AGE_MIN) {
     return { state: 'skipped', reason: `取込が古い (${Math.round(ageMin)}分前 > ${LOGIZARD_SYNC_MAX_AGE_MIN}分)` };
   }
-  const rows = db.prepare(`
-    SELECT 商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
-           在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日
-    FROM raw_lz_inventory ORDER BY 商品ID, ブロック略称, ロケ
-  `).all();
+  const rows = snap.rows;
+  // 在庫を取った時刻と行数 (csv-import.js recordLogizardSourceMeta)。今回の取り込みの値のときだけ付く
+  const meta = snap.meta;
   // 0件は送らない (mirror温存。全置換 payload の空配列は受信側も 400 で拒否する)
   if (rows.length === 0) return { state: 'skipped', reason: '0件 (mirror温存)' };
 
@@ -830,7 +925,7 @@ export async function syncLogizardStockOnly() {
   console.log(`[logizard-only-sync] 送信: rows=${rows.length} captured=${importedAt}`);
   const resp = await fetch(`${RENDER_URL}/api/sync`, {
     method: 'POST', headers,
-    body: JSON.stringify({ logizard_stock: { captured_at: importedAt, rows } }),
+    body: JSON.stringify({ logizard_stock: { captured_at: importedAt, ...meta, rows } }),
     signal: AbortSignal.timeout(120000),
   });
   if (!resp.ok) {

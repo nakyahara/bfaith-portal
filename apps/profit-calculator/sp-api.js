@@ -117,7 +117,20 @@ export async function getProduct(asin) {
     jan: ean,
     partNumber: partNumber !== 'unknown' ? partNumber : '',
     manufacturer,
+    // 商品ページの箇条書き (特長) と商品説明 (SP広告KW のおまかせの材料・2026-09-26 中原さん「Amazon のリンク先の情報も考慮して」)。
+    // 日本語 (ja_JP) の値を優先。無ければ空
+    bulletPoints: pickLocalized(attrs.bullet_point).slice(0, 10).map((v) => v.slice(0, 500)),
+    description: (pickLocalized(attrs.product_description)[0] || '').slice(0, 3000),
   };
+}
+
+/** カタログの属性 (多言語の配列) から値の配列。ja_JP を優先し、無ければ言語の指定の無い値 */
+export function pickLocalized(list) {
+  if (!Array.isArray(list)) return [];
+  const clean = (v) => String(v ?? '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const ja = list.filter((x) => x && /^ja/i.test(String(x.language_tag || ''))).map((x) => clean(x.value)).filter(Boolean);
+  if (ja.length) return ja;
+  return list.filter((x) => x && !x.language_tag).map((x) => clean(x.value)).filter(Boolean);
 }
 
 /**

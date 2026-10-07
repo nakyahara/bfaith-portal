@@ -62,16 +62,30 @@ import {
 } from './lib/set-image-plan.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
-import { buildPromptTemplates, composeColorVariations } from './lib/prompt-templates.js';
+import { buildPromptTemplates, composeColorVariations, composeProductInfo } from './lib/prompt-templates.js';
 // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)
 import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-auto.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
+import { existingPageOfDraft, EXISTING_PAGE_CHOICES } from './lib/existing-page.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
-import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
-import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
+import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
+// Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
+import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
+import { sweepCardOutbox, newEntryGate } from '../../lib/product-hub-outbox.mjs';
+import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders, getDriveWriteClient, ensureImageFolder } from './services/drive-image-folder.js';
+import {
+  requestImageJob as requestLpImageJob, imageStateFor as lpImageStateFor, createLpImageWorker, openaiGenerateImage,
+  imageBlockReason as lpImageBlockReason, imageRefCandidates as lpImageRefCandidates, validImageRequestKey as lpImageValidKey,
+} from './lib/lp-image.js';
+import { Readable } from 'node:stream';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
+// 🆕 広告の進み (2026-09-28)。ボードの「📣 広告」タブ
+import {
+  adOpsRows, adStagesByDraft, recordAdOps, AD_OPS_STAGES, AD_OPS_STAGE_JA, AD_OPS_CAMPAIGN_TYPES, AD_OPS_CAMPAIGN_TYPE_JA,
+  ADJUST_STALE_DAYS, ACTUAL_WINDOW_DAYS, ACTIVE_WINDOW_DAYS,
+} from './lib/ad-ops.js';
 import {
   transcribeBackLabel, backLabelOcrEnabled, UNREADABLE_MARK,
   MAX_IMAGES as MAX_OCR_IMAGES, MAX_IMAGE_BYTES as MAX_OCR_IMAGE_BYTES, MAX_TOTAL_BYTES as MAX_OCR_TOTAL_BYTES,
@@ -80,7 +94,7 @@ import { photoSource, driveDownload } from '../inbound-check/back-label.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, listDriveFolderMaterialImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
   isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid, genreIdFromItemUrl,
@@ -97,6 +111,32 @@ import {
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
+// SP広告 検索KW (2026-09-23 PR1): サジェスト収集 (miniPC 経由) → 採否 → マッチタイプ別コピー。AI 無し・夜間無し
+import { collectSuggestions, suggestConfigured } from './lib/keyword-suggest-client.js';
+import {
+  ensureRequest as ensureAdKwRequest, cancelRequest as cancelAdKwRequest, collectSeed as collectAdKwSeed,
+  recordDecision as recordAdKwDecision, createExport as createAdKwExport, markCopied as markAdKwCopied,
+  addCompetitorAsins as addAdKwAsins, lookupAbaForAsin as lookupAdKwAba, stateForDraft as adKeywordsState,
+  autoCompetitorAsins as autoAdKwAsins,
+} from './lib/ad-keywords.js';
+import {
+  requestAiJob as requestAdKwAiJob, reviewAiJob as reviewAdKwAiJob, queueSummary as adKwAiQueueSummary, claimAiJob as claimAdKwAiJob,
+  reserveGeneration as reserveAdKwAiGeneration, submitGenerationResult as submitAdKwAiResult, failAiJob as failAdKwAiJob, releaseAiJob as releaseAdKwAiJob,
+  autoEnqueue as adKwAutoEnqueue, rerunAuto as adKwRerunAuto, collectStep as adKwCollectStep, finalizeAutoJob as adKwFinalizeAuto,
+} from './lib/ad-kw-ai.js';
+// LP 構成の AI 生成 (段階1)。正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』
+import {
+  lpComposeEnabled, importSpec as importLpSpec, latestSpec as latestLpSpec, specSummary as lpSpecSummary,
+  requestJob as requestLpComposeJob, requestBlockReason as lpComposeBlockReason, requestPrecheck as lpComposeRequestPrecheck,
+  queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
+  reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
+  failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
+  lpComposeImageRef, recordImageServed as recordLpComposeImageServed, imagePlan as lpComposeImagePlan, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_PRODUCT_IMAGES as LP_COMPOSE_MAX_PRODUCT_IMAGES,
+  lintForJob as lintLpComposeForJob,
+} from './lib/lp-compose.js';
+import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
+import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
+import { fetchAmazonCatalog } from './lib/catalog-client.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
   PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
@@ -109,10 +149,21 @@ import {
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
   shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
+import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLegacyNewKind, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
+import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
+import { resolveListingTax } from './services/listing-tax.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 router.use(express.json({ limit: '512kb' }));
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #6・14 §5・契約 v3 H1・PR #1565 R1 H4/H5・⑤-3b)。legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る):
+//    税率の手入力 (tax_rate を送る保存) = 税率の列が C (frozen 以降)・段階か持ち主が読めない = 410 / 503 (何も書かない)。tax_rate を送らない保存 (ほかの欄) は通る。
+//    Notion の取込 (税率も書く)・古い新商品の作り方 (POST /api/drafts・NE のコードから登録・自動取込を手で回す) = 閉じる (新商品は新しい登録の画面から)。
+//    🆕 広げる道 PR-6 (種類ごとの門): 新商品の古い作り方は、その種類 (単品 / セット) の新しい登録の列が全部 C になったら、その種類の作成だけ 409 (新しい「新商品の登録」へ案内)。
+//       skus.sku_kind を C に広げる = 単品の作成が閉じる (セットは sku_components を広げるまで今までどおり)。種類は handler が NE の商品区分で決める (newKindOfCode)
+//    セットを作る = 作るのは通すが、親の税率は写さない (res.locals.masterLegacyWrite.writable のときだけ)。
+//    詳細画面・利益の試算・楽天の出品は Company DB の税率 (listing-tax.mjs)。本文を読んだ後に置く
+router.use(masterLegacyGate('product-hub'));
 
 const view = (name) => path.join(__dirname, 'views', name);
 const actorOf = (req) => req.session?.email || req.session?.displayName || null;
@@ -171,6 +222,8 @@ router.get('/', (req, res) => {
   res.redirect('/apps/product-hub/board');
 });
 
+/** /list の新商品を作る部品 (NE のコードから一括の確認・登録・自動取込を今すぐ)。全部の種類が閉じた・読めない = 隠す (広げる道 PR-6) */
+export const LIST_NEW_ENTRY_WRITE_SELECTORS = Object.freeze(['#reg-preview-btn', '#reg-run-btn', '#intake-run-btn']);
 router.get('/list', (req, res) => {
   const db = getDB();
   maybeBackfillDerivedStatus(db);   // PR4 切替の一回きりバックフィル (実施済みなら即 return)
@@ -213,16 +266,64 @@ router.get('/list', (req, res) => {
     maxRegisterCodes: MAX_REGISTER_CODES,
     intake: intakeStatus(),
     isAdmin: req.session?.role === 'admin',
+    // LP 構成の AI 生成 (段階1) の仕様書。admin にだけ出すカードで使う
+    lpSpec: { enabled: lpComposeEnabled(), spec: lpSpecSummary(db, 'product_analysis') },
     shopCategoryCount: countActiveShopCategories(db),
     maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
+    // 広げる道 PR-6 (門 product-hub:screen:/list。今までどおりなら空):
+    //   全部の種類が閉じた・段階 / 持ち主が読めない = 帯 + 一括登録・自動取込のボタンを隠す (Codex #1636 R1 Medium)
+    //   一部の種類 (例: 単品) だけ新しい画面へ移した = 案内 (ボタンは残す = セットは作れる)
+    masterLegacyNewEntryHtml: legacyBannerHtml(res.locals.masterLegacy, { hideSelectors: LIST_NEW_ENTRY_WRITE_SELECTORS }) + legacyNewKindNoticeHtml(res.locals.masterLegacy),
   });
 });
 
-router.get('/new', (req, res) => {
-  res.render(view('new.ejs'), {
-    title: '新規商品ドラフト',
-    displayName: req.session?.displayName || req.session?.email || '',
-  });
+// 新規作成 (2026-10-01・Company DB構想 14 §11 の 2「新商品の入口を 1 つに」)。
+//   切替の前 (MASTER_EDIT_OPEN が無い・段階 legacy_open) と、古い作り方の門が開いている間 (新しい登録の列にまだ load がある = owner_match 'all'・⑤-3b) = 今までの画面のまま
+//   切替の後 (段階 new_open かつ MASTER_EDIT_OPEN = 1) = 「マスタの入力 → 新商品の登録」へ案内するだけ (保存でカードが自動でできる)
+//   切替の途中・段階が読めない = 登録は止めている、の案内 (古い入口も開けない = fail-closed)
+//   🚨 (PR #1566 R1 M5) 段階が frozen 以降に ⑤-2a のコードがカードを作る道は outbox の取り込み (services/cdb-card-intake.js) だけ。
+//      ここの画面の案内以外の古い作成の道 (POST /api/drafts・NE の一括登録・自動取込 intake-cron) を閉じるのは ⑤-3 の門 (⑤-3b: frozen 以降で新しい登録の列が全部 C (active ∪ prepared) のとき = owner_match 'all'。cancel で再び開き得る)
+//   (async は門を読む前段だけ。描画は今までどおり同期の handler = 誤りは Express の誤りの handler へ)
+router.get('/new', (req, res, next) => {
+  newEntryGate()
+    .catch((e) => ({ mode: 'paused', error: String(e && e.message || e) }))
+    .then((gate) => { res.locals.newEntryGate = gate; next(); });
+}, (req, res) => {
+  const gate = res.locals.newEntryGate || { mode: 'paused' };
+  const displayName = req.session?.displayName || req.session?.email || '';
+  if (gate.mode === 'legacy') {
+    return res.render(view('new.ejs'), {
+      title: '新規商品ドラフト', displayName,
+      // 切替で古い新商品の作り方を閉じた後だけ帯 (登録のボタンを隠す。POST /api/drafts は門が 410)。閉じる前は空文字 = 今までどおり
+      // 広げる道 PR-6: 単品だけ閉じた = 案内 (ボタンは残す = NE のセットのコードは今までどおり作れる。単品は POST が 409)
+      masterLegacyBanner: legacyBannerHtml(res.locals.masterLegacy, { hideSelectors: ['#create-btn'] }) + legacyNewKindNoticeHtml(res.locals.masterLegacy),
+    });
+  }
+  res.render(view('new-guide.ejs'), { title: '新商品の登録', displayName, mode: gate.mode, phase: gate.phase || null });
+});
+
+/**
+ * 詳細画面の税率の見せ方 (中間レビュー 2 回目 M-B):
+ *   'cdb'      = 段階と持ち主を読めて、税率の列が閉じている (frozen 以降で skus.tax_rate が C (active ∪ prepared)) → Company DB の税率を読む (代表コードは構成の SKU から。混ざる・無い・読めない = 決められない)
+ *   'readonly' = 段階を読めない → 今の値 (draft_yahoo) を見るだけ (Company DB を読みに行かない = 詳細を開くたびに接続を作らない・切替前に「出品は止まります」と出さない)
+ *   'legacy'   = 切替前 → 今までどおり (手入力の欄)
+ */
+function taxModeOf(ml) {
+  if (!ml) return 'legacy';
+  if (ml.readable !== true) return 'readonly';
+  return ml.frozen ? 'cdb' : 'legacy';
+}
+router.get('/detail/:id', async (req, res, next) => {
+  res.locals.taxMode = taxModeOf(res.locals.masterLegacy);
+  if (res.locals.taxMode !== 'cdb') return next();
+  try {
+    const id = Number.parseInt(req.params.id, 10);
+    const draft = Number.isInteger(id) && id > 0 ? getDB().prepare('SELECT * FROM product_drafts WHERE id = ?').get(id) : null;
+    res.locals.cdbTax = draft ? await resolveCdbDraftTax(getDB(), draft) : { ok: false, reason: '商品が無い' };
+  } catch (e) {
+    res.locals.cdbTax = { ok: false, reason: String((e && e.message) || e) };
+  }
+  next();
 });
 
 router.get('/detail/:id', (req, res) => {
@@ -295,12 +396,14 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(draft.id)) {
     skuExemptions[r.sku_code] = r.reason;
   }
-  const simTaxPercent = (() => {
+  // 切替で閉じた後 = Company DB の税率だけ (決められない = 試算しない)。閉じる前・段階を読めない (見るだけ) は今までどおり (Yahoo 欄 → NE → 10%)
+  const cdbTaxForSim = res.locals.taxMode === 'cdb' ? (res.locals.cdbTax || { ok: false, reason: '読めません' }) : null;
+  const simTaxPercent = cdbTaxForSim ? (cdbTaxForSim.ok ? cdbTaxForSim.percent : null) : (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
     return neCost?.taxPercent ?? 10;
   })();
-  const profitSim = neCost ? computeProfit({
+  const profitSim = neCost && simTaxPercent != null ? computeProfit({
     price: draft.price, costExTax: neCost.costExTax,
     taxPercent: simTaxPercent, shippingCost: neCost.shippingCost,
   }) : null;
@@ -367,10 +470,15 @@ router.get('/detail/:id', (req, res) => {
     blockLabels: GENERATION_BLOCK_CODES,
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
+    // 既存の楽天ページへの追加か (2026-09-25)。基本情報の選択欄 + ボードの札と同じ判定
+    existingPage: existingPageOfDraft(db, draft.id),
+    existingPageChoices: EXISTING_PAGE_CHOICES,
     rakuten, cabinetImages, genreDict,
     // 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18)。基本情報を書きながら見る
     backLabelPhotos: backLabelPhotosForDraft(db, draft),
     backLabelOcrEnabled: backLabelOcrEnabled(),
+    // SP広告 検索KW (2026-09-23)。自社商品のときだけタブを出す。画面は JSON から JS が描く
+    adKeywords: draft.own_brand ? adKeywordsState(db, draft, { configured: suggestConfigured() }) : null,
     // 白抜き画像の受信箱 (2026-09-14)。画像タブの選択画面から Drive の受信箱を開くリンク
     whiteBgInboxUrl: whiteBgInboxFolderUrl(),
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
@@ -429,6 +537,12 @@ router.get('/detail/:id', (req, res) => {
       ...(imageProduction || {}),
       product_info_text: effectiveProductInfo(imageProduction?.product_info_text, autoProductInfo),
     }, promptVariations),
+    // 「🤖 構成をAIに作らせる」(段階1・PR1-d)。最初の表示をここで作っておく
+    // (読み込み直後に 1 回 fetch すると、押せる/押せないが一瞬ちらつく)。
+    // 画面はこの後 5 秒おきに GET /api/drafts/:id/lp-compose を叩いて更新する
+    lpCompose: lpComposeInitialState(db, draft),
+    // 「🖼 画像を作る」(段階2・2026-10-04)。同じく最初の表示をここで作る
+    lpImage: lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }),
   });
 });
 
@@ -462,6 +576,8 @@ router.post('/api/drafts', async (req, res) => {
       error: '商品コードの重複 (大文字小文字違い) があるため登録を停止しています。管理者にご連絡ください',
     });
   }
+  // 🚨 広げる道 PR-6 (種類ごとの門): 作る種類 (NE のセットのコード = セット・それ以外 = 単品) が閉じていれば 409 (書く前・この後は同期で書く)
+  if (refuseLegacyNewKind(res, newKindOfCode(db, neCode), { extra: { ne_code: neCode } })) return;
 
   // 既定でまとめる (2026-07-25 中原さん方針): 子SKUのコードで登録されたら、
   // 確認を挟まず代表商品コード (= 楽天1ページ) に正規化する。人の作業を最小にするため。
@@ -558,12 +674,18 @@ router.post('/api/drafts/:id', async (req, res) => {
   // **own_brand=1 ⟺ 重要度=自社商品（重要度：高）** を保存のたびに強制する:
   // ON → 重要度を自社商品へ / OFF → 自社商品の重要度なら未設定へ (他の重要度はそのまま)。
   // 連動列はトランザクション内で読み直した最新行を基準にする (Codex R2: 並行更新後の no-op 化を防ぐ)
-  const { ownBrandValue, imagePriorityValue } = db.transaction(() => {
+  const { ownBrandValue, imagePriorityValue, saved } = db.transaction(() => {
     const cur = db.prepare('SELECT own_brand, image_priority FROM product_drafts WHERE id = ?').get(draft.id);
     const ownBrand = req.body?.own_brand !== undefined ? (req.body.own_brand ? 1 : 0) : cur.own_brand;
     let imagePriority = cur.image_priority;
     if (ownBrand === 1) imagePriority = OWN_BRAND_IMAGE_PRIORITY;
     else if (imagePriority === OWN_BRAND_IMAGE_PRIORITY) imagePriority = null;
+    // 🚨 保存する値は変数に取る (2026-09-21)。画面の即保存が「保存できた値」を基準にするので、
+    //    UPDATE に渡した値そのものを返す必要がある (売価は整数に丸め、文字列は trim される)
+    const priceValue = req.body?.price !== undefined ? sanitizeMoney(req.body.price) : draft.price;
+    const janValue = req.body?.jan_code !== undefined ? cleanText(req.body.jan_code, 20) : draft.jan_code;
+    const memoValue = req.body?.memo !== undefined ? cleanText(req.body.memo, 4000) : draft.memo;
+    const asinValue = req.body?.asin !== undefined ? cleanText(req.body.asin, 20) : draft.asin;
     db.prepare(`
       UPDATE product_drafts SET
         name = ?, official_url = ?, price = ?, jan_code = ?, has_variation = ?,
@@ -573,12 +695,12 @@ router.post('/api/drafts/:id', async (req, res) => {
     `).run(
       name,
       officialUrl,
-      req.body?.price !== undefined ? sanitizeMoney(req.body.price) : draft.price,
-      req.body?.jan_code !== undefined ? cleanText(req.body.jan_code, 20) : draft.jan_code,
+      priceValue,
+      janValue,
       hasVariationValue,
       driveFolderUrl,
-      req.body?.memo !== undefined ? cleanText(req.body.memo, 4000) : draft.memo,
-      req.body?.asin !== undefined ? cleanText(req.body.asin, 20) : draft.asin,
+      memoValue,
+      asinValue,
       amazonUrl,
       ownBrand,
       imagePriority,
@@ -589,20 +711,44 @@ router.post('/api/drafts/:id', async (req, res) => {
     }
     // 商品リンク台帳へ同一トランザクションで写す (画像フォルダURL)。台帳側の失敗は握って夜間照合で自己修復
     syncDraftLinks(db, draft.id, { actor: actorOf(req) });
-    return { ownBrandValue: ownBrand, imagePriorityValue: imagePriority };
+    return {
+      ownBrandValue: ownBrand, imagePriorityValue: imagePriority,
+      saved: {
+        name, official_url: officialUrl, price: priceValue, jan_code: janValue,
+        memo: memoValue, asin: asinValue, amazon_url: amazonUrl,
+        has_variation: hasVariationValue, drive_folder_url: driveFolderUrl,
+      },
+    };
   })();
+  // 何を変えたかを履歴に残す (2026-09-21)。欄ごとの即保存にしたので 1 行ずつ増える —
+  // 「updated」だけが並ぶと何が起きたか読めない
+  const changed = [];
+  const note = (label, before, after) => { if ((before ?? null) !== (after ?? null)) changed.push(label); };
+  note('商品名', draft.name, saved.name);
+  note('公式ページURL', draft.official_url, saved.official_url);
+  note('売価', draft.price, saved.price);
+  note('JANコード', draft.jan_code, saved.jan_code);
+  note('メモ', draft.memo, saved.memo);
+  note('ASIN', draft.asin, saved.asin);
+  note('Amazon URL', draft.amazon_url, saved.amazon_url);
+  note('バリエーション', draft.has_variation, saved.has_variation);
+  note('画像フォルダURL', draft.drive_folder_url, saved.drive_folder_url);
   // 税率は基本情報の項目として保存する (2026-08-06 中原さん指示で Yahoo!欄から移動。
   // 格納先は従来どおり draft_yahoo.tax_rate — 楽天 payload.taxRate も Yahoo 移行もここを読む)
   if (req.body?.tax_rate !== undefined) {
-    upsertDraftYahoo(db, draft.id, { tax_rate: cleanText(req.body.tax_rate, 20) });
+    const beforeTax = db.prepare('SELECT tax_rate FROM draft_yahoo WHERE draft_id = ?').get(draft.id)?.tax_rate ?? null;
+    saved.tax_rate = cleanText(req.body.tax_rate, 20);
+    upsertDraftYahoo(db, draft.id, { tax_rate: saved.tax_rate });
+    note('税率', beforeTax, saved.tax_rate);
   }
-  logEvent(db, draft.id, 'updated', null, actorOf(req));
+  logEvent(db, draft.id, 'updated', changed.length ? changed.join(' / ') : null, actorOf(req));
   // ゲート必須項目 (公式URL等) を消したら ready_for_ai を draft に自動差し戻し (Codex R1 high)
   const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
-  // own_brand / image_priority は連動して変わりうるので、リロードしない保存経路のために返す
+  // own_brand / image_priority は連動して変わりうるので、リロードしない保存経路のために返す。
+  // saved = 保存できた値そのもの (画面の即保存が「ここまで保存できた」の基準に使う)
   res.json({
     ok: true, demoted: demoted || undefined,
-    own_brand: ownBrandValue, image_priority: imagePriorityValue,
+    own_brand: ownBrandValue, image_priority: imagePriorityValue, saved,
   });
 });
 
@@ -1014,6 +1160,201 @@ router.post('/api/drafts/:id/ai-outputs', (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── SP広告 検索KW (2026-09-23 PR1・『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5) ───
+// 自社商品 (own_brand=1) だけ。サジェストは miniPC の service-api に種 1 つずつ頼む (Render から Amazon は叩かない)。
+// Ads API への書き込みは無い。採否は人の API だけが書く。「コピー済み」は「Amazon 登録済み」ではない
+function loadOwnBrandDraftOr4xx(req, res) {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return null;
+  if (draft.own_brand !== 1) {
+    res.status(400).json({ ok: false, code: 'not_own_brand', error: 'SP広告KW は「自社商品」にチェックのあるドラフトだけで使えます' });
+    return null;
+  }
+  return draft;
+}
+const AD_KW_CONFLICT_CODES = ['busy', 'closed', 'cancelled', 'lost_lease'];
+const adKwFail = (res, r) => res.status(r.code === 'not_found' ? 404 : AD_KW_CONFLICT_CODES.includes(r.code) ? 409 : 400)
+  .json({ ok: false, code: r.code, error: r.error });
+
+router.get('/api/drafts/:id/ad-keywords', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  res.json({ ok: true, state: adKeywordsState(getDB(), draft, { configured: suggestConfigured() }) });
+});
+
+// body: { idempotency_key, restart?: boolean }。開いている依頼があればそれを返す (restart のときだけ置き換える)
+router.post('/api/drafts/:id/ad-keywords/requests', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = ensureAdKwRequest(getDB(), draft, {
+    idempotencyKey: cleanText(req.body?.idempotency_key, 100), actor: actorOf(req), restart: req.body?.restart === true,
+  });
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, request_id: r.request.id, reused: r.reused });
+});
+
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/cancel', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = cancelAdKwRequest(getDB(), draft, Number.parseInt(req.params.rid, 10) || 0, actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true });
+});
+
+// body: { seed, alphabet?: boolean, retake?: boolean }。同期 (1 種 ≈ 10〜20 秒・miniPC 側の期限 40 秒)。
+// miniPC が落ちていれば「取れなかった」と記録して返す。retake = 一部取得の種を取り直す
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/collect', async (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const rid = Number.parseInt(req.params.rid, 10) || 0;
+  const request = db.prepare('SELECT * FROM ph_ad_kw_requests WHERE id = ? AND draft_id = ?').get(rid, draft.id);
+  if (!request) return res.status(404).json({ ok: false, code: 'not_found', error: '依頼がありません' });
+  if (!suggestConfigured()) {
+    return res.status(503).json({ ok: false, code: 'not_configured', error: 'miniPC を呼ぶ設定 (WAREHOUSE_SERVICE_TOKEN) が無いため収集できません' });
+  }
+  try {
+    const r = await collectAdKwSeed(db, draft, request, req.body?.seed, {
+      actor: actorOf(req), alphabet: req.body?.alphabet === true, retake: req.body?.retake === true, collector: collectSuggestions,
+    });
+    if (!r.ok) return adKwFail(res, r);
+    res.json({
+      ok: true, collected: r.collected, reused: !!r.reused, added: r.added, merged: r.merged, error: r.error,
+      // previous_ok = 取り直しが失敗したが、前の取得回 (取れた材料) は残っている
+      previous_ok: !!r.previous_ok,
+      evidence: { id: r.evidence.id, seed: r.evidence.seed, status: r.evidence.status },
+      state: adKeywordsState(db, draft, { configured: true }),
+    });
+  } catch (e) {
+    console.error('[product-hub] ad-keywords collect failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
+});
+
+// body: { asins: "B0..., B0..." | ["B0..."] }。競合 ASIN (商品ターゲットの候補) を人が入れる (PR2-C)。ABA からの自動は /auto-asins
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/asins', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const raw = Array.isArray(req.body?.asins) ? req.body.asins.map((x) => String(x)).join(' ') : cleanText(req.body?.asins, 2000);
+  const r = addAdKwAsins(getDB(), draft, Number.parseInt(req.params.rid, 10) || 0, raw || '', actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, added: r.added, skipped: r.skipped, invalid: r.invalid, state: adKeywordsState(getDB(), draft, { configured: suggestConfigured() }) });
+});
+
+// 夜間 AI に検索 KW の案を頼む (PR3a・2026-09-23)。材料 (観測語・採用語・商品情報) をここで固定する。body: { idempotency_key }
+// AD_KW_AI_ENABLED=1 (実行役の導入後) までは 503。AI の案は初期状態 未採用 (採否は人)
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/ai-jobs', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const r = requestAdKwAiJob(db, draft, Number.parseInt(req.params.rid, 10) || 0, { idempotencyKey: cleanText(req.body?.idempotency_key, 100), actor: actorOf(req) });
+  if (!r.ok) {
+    const status = r.code === 'not_found' ? 404 : ['closed', 'key_conflict', 'active_exists'].includes(r.code) ? 409 : ['ai_disabled', 'ai_schema'].includes(r.code) ? 503 : 400;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error });
+  }
+  res.json({ ok: true, job_id: r.job.id, reused: r.reused, state: adKeywordsState(db, draft, { configured: suggestConfigured() }) });
+});
+// 要確認 (予約後に結果が届かないまま止まった AI の依頼) を人が確認済みにする
+router.post('/api/drafts/:id/ad-keywords/ai-jobs/:jid/review', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const r = reviewAdKwAiJob(db, draft, Number.parseInt(req.params.jid, 10) || 0, actorOf(req));
+  if (!r.ok) return res.status(r.code === 'not_found' ? 404 : 409).json({ ok: false, code: r.code, error: r.error });
+  res.json({ ok: true, state: adKeywordsState(db, draft, { configured: suggestConfigured() }) });
+});
+
+// おまかせ (夜の自動・PR3c 2026-09-26) をやり直す。前のおまかせが終わっているときだけ。body: { idempotency_key }。今夜の実行役が続きをする
+router.post('/api/drafts/:id/ad-keywords/auto-rerun', async (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const db = getDB();
+  try {
+    const r = await adKwRerunAuto(db, draft, { idempotencyKey: cleanText(req.body?.idempotency_key, 80), actor: actorOf(req), titleFetcher: fetchAmazonCatalog });
+    if (!r.ok) {
+      const status = r.code === 'not_found' ? 404 : ['conflict', 'active_exists'].includes(r.code) ? 409 : ['ai_disabled', 'ai_schema'].includes(r.code) ? 503 : 400;
+      return res.status(status).json({ ok: false, code: r.code, error: r.error });
+    }
+    res.json({ ok: true, job_id: r.job.id, reused: r.reused, state: adKeywordsState(db, draft, { configured: suggestConfigured() }) });
+  } catch (e) {
+    console.error('[product-hub] ad-keywords auto rerun failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
+});
+
+// 競合 ASIN を ABA から自動で出す (2026-09-23)。採用済みの検索 KW ごとのクリック上位 3 を miniPC の aba.db (取込済みの週) から引き、
+// 多く出た順に最大 10 件を「採用 (自動)」で入れる。人は要らないものを却下する。同期・数秒。Render から Amazon を呼ばない
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/auto-asins', async (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  if (!abaConfigured()) {
+    return res.status(503).json({ ok: false, code: 'not_configured', error: 'miniPC を呼ぶ設定 (WAREHOUSE_SERVICE_TOKEN) が無いため引けません' });
+  }
+  const db = getDB();
+  try {
+    const r = await autoAdKwAsins(db, draft, Number.parseInt(req.params.rid, 10) || 0, { actor: actorOf(req), lookup: lookupAbaTopAsins });
+    if (!r.ok) return adKwFail(res, r);
+    res.json({
+      ok: true, looked_up: r.looked_up, added: r.added, skipped: r.skipped, error: r.error, summary: r.summary,
+      state: adKeywordsState(db, draft, { configured: true }),
+    });
+  } catch (e) {
+    console.error('[product-hub] ad-keywords auto asins failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
+});
+
+// body: { retake?: boolean }。競合 ASIN (kind=asin の候補) の ABA 検索語を miniPC の aba.db (取込済みの週) から引く (PR2-B2)。
+// 同期・数秒。走査しない・Render から Amazon を呼ばない。miniPC が落ちていれば「取れなかった」と記録して返す。retake = 新しい週で取り直す
+router.post('/api/drafts/:id/ad-keywords/asins/:cid/aba', async (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  if (!abaConfigured()) {
+    return res.status(503).json({ ok: false, code: 'not_configured', error: 'miniPC を呼ぶ設定 (WAREHOUSE_SERVICE_TOKEN) が無いため引けません' });
+  }
+  const db = getDB();
+  try {
+    const r = await lookupAdKwAba(db, draft, Number.parseInt(req.params.cid, 10) || 0, { actor: actorOf(req), retake: req.body?.retake === true, lookup: lookupAbaTerms });
+    if (!r.ok) return adKwFail(res, r);
+    res.json({
+      ok: true, looked_up: r.looked_up, reused: !!r.reused, added: r.added, merged: r.merged, error: r.error, previous_ok: !!r.previous_ok,
+      aba: r.aba, evidence: { id: r.evidence.id, seed: r.evidence.seed, status: r.evidence.status },
+      state: adKeywordsState(db, draft, { configured: true }),
+    });
+  } catch (e) {
+    console.error('[product-hub] ad-keywords aba lookup failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
+});
+
+// body: { decision: adopt|hold|reject|undecided, keyword?, match_type? }。人の操作だけ (append-only)
+router.post('/api/drafts/:id/ad-keywords/candidates/:cid/decisions', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = recordAdKwDecision(getDB(), draft, Number.parseInt(req.params.cid, 10) || 0, {
+    decision: req.body?.decision, keyword: cleanText(req.body?.keyword, 200), match_type: req.body?.match_type,
+  }, actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, decision: r.decision });
+});
+
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/exports', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = createAdKwExport(getDB(), draft, Number.parseInt(req.params.rid, 10) || 0, actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, export: r.export, reused: r.reused });
+});
+
+// body: { match_type }。クリップボードに書けたあとの印。Amazon に登録した印ではない
+router.post('/api/drafts/:id/ad-keywords/exports/:eid/copied', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = markAdKwCopied(getDB(), draft, Number.parseInt(req.params.eid, 10) || 0, String(req.body?.match_type || ''), actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, copied: r.copied });
+});
+
 // 「人の確認待ち」の解除 (2026-08-28)。解除 = AI の claim 対象に戻すだけで、自動では何もしない。
 // body: { clear: true, blocked_at?: string }  blocked_at は画面が見ていた値 (楽観ロック)
 router.post('/api/drafts/:id/generation-block', (req, res) => {
@@ -1206,7 +1547,7 @@ router.post('/api/drafts/:id/compose', (req, res) => {
   if (typeof req.body?.done !== 'boolean') {
     return res.status(400).json({ ok: false, error: 'done は true / false で指定してください' });
   }
-  // 「まだ」も 'todo' として残す (NULL に戻すと ③素材待ちからの推定で 済 に戻ってしまう — Codex R1)
+  // 「まだ」も 'todo' として残す (NULL に戻すと ④AI制作からの推定で 済 に戻ってしまう — Codex R1)
   const status = req.body.done ? 'done' : 'todo';
   const db = getDB();
   const changed = db.transaction(() => {
@@ -1830,7 +2171,8 @@ router.get('/api/rakuten/genre-attributes', async (req, res) => {
   const genreId = cleanText(req.query?.genre_id, 12);
   if (!genreId) return res.status(400).json({ ok: false, error: 'genre_id が必要です' });
   try {
-    const r = await fetchGenreAttributes(getDB(), genreId, { force: req.query?.refresh === '1' });
+    // 人が押した取得なので、前回取れなかった選択肢 (選択式の属性) はここでやり直す
+    const r = await fetchGenreAttributes(getDB(), genreId, { force: req.query?.refresh === '1', retryOptions: true });
     if (!r.ok) {
       if (r.notFound) {
         return res.status(404).json({ ok: false, error: 'このジャンルIDは見つかりません (末端ジャンルのIDか確認してください)' });
@@ -1863,10 +2205,14 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   if (rkRow?.genre_id && /^\d+$/.test(String(rkRow.genre_id).trim())) {
     try { await fetchGenreAttributes(db, String(rkRow.genre_id).trim()); } catch (_) { /* best-effort */ }
   }
-  const built = buildItemPayload(db, draft.id);
-  if (!built.ok) return res.json({ ok: false, reasons: built.reasons });
+  // 税率: 切替前は今までどおり / 閉じた後は Company DB (決められない = 止める)。PR #1565 R1 H5
+  // プレビューは送らないので、段階を読めないときは今の税率で見せて注意を添える (登録は止まる。中間レビュー 2 回目 Low)
+  const tax = await resolveListingTax(db, draft, { preview: true });
+  const built = buildItemPayload(db, draft.id, { tax });
+  if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(tax.warning ? { warnings: [tax.warning] } : {}) });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
+    ...(tax.warning ? { warnings: [tax.warning] } : {}),
     // 店舗内カテゴリは RMS payload に含まれない (item-mappings API で登録成功後に自動反映)。
     // プレビューには参考情報として添える
     shopCategories: selectedShopCategoryPaths(db, draft.id),
@@ -2487,7 +2833,16 @@ router.post('/api/register-codes', (req, res) => {
   if (codes.length > MAX_REGISTER_CODES) {
     return res.status(400).json({ ok: false, error: `一度に登録できるのは ${MAX_REGISTER_CODES} 件までです (指定: ${codes.length} 件)` });
   }
-  const r = registerByCodes(codes, { actor: actorOf(req), dryRun: req.body?.dry_run === true });
+  // 🚨 広げる道 PR-6 (種類ごとの門): コードごとに種類 (NE のセット = セット・それ以外 = 単品) を決め、閉じた種類のコードが 1 つでもあれば
+  //    丸ごと 409 (一部だけ作らない = 何を作ったか分かりにくくしない)。NE の写しを読めない = registerByCodes が断る (何も作らない)
+  const dryRunReg = req.body?.dry_run === true;
+  const phDb = getDB();
+  if (mirrorReady(phDb)) {
+    const byKind = new Map();
+    for (const c of codes) { const k = newKindOfCode(phDb, c); if (!byKind.has(k)) byKind.set(k, []); byKind.get(k).push(c); }
+    for (const [k, list] of byKind) if (refuseLegacyNewKind(res, k, { dryRun: dryRunReg, extra: { codes: list } })) return;
+  }
+  const r = registerByCodes(codes, { actor: actorOf(req), dryRun: dryRunReg });
   if (!r.ok) {
     const msg = {
       mirror_unavailable: 'NE商品マスタを参照できません (時間をおいて再試行してください)',
@@ -2515,6 +2870,8 @@ router.post('/api/intake/run', (req, res) => {
   if (req.session?.role !== 'admin') {
     return res.status(403).json({ ok: false, error: '自動取込の実行は管理者のみです' });
   }
+  // 広げる道 PR-6: 自動取込は NE の単品だけを作る (入口の門も単品の列で閉じる = ここは念のための同じ確かめ)
+  if (refuseLegacyNewKind(res, 'single', { dryRun: req.body?.dry_run === true })) return;
   const r = syncNewProducts({ dryRun: req.body?.dry_run === true, actor: actorOf(req) });
   if (!r.ok) {
     const msg = {
@@ -2544,7 +2901,8 @@ router.post('/api/intake/run', (req, res) => {
 // 商品コード指定で Notion 既存カードを取り込む。**読み取り専用** (Notion へ書き戻さない)。
 // 取り込んだ行は source='notion_import' で印が付き、notion-card.js の同期経路から外れる。
 
-router.post('/api/notion-import', async (req, res) => {
+// 🚨 Notion を待ってから書く = legacyHandler で包む (終わるまで書きかけに数える) + 書く直前に legacyWriteFence (Codex #1565 R2 High 1)
+router.post('/api/notion-import', legacyHandler(async (req, res) => {
   const codes = parseNeCodes(req.body?.codes);
   if (codes.length === 0) {
     return res.status(400).json({ ok: false, error: '商品コードを1件以上入力してください' });
@@ -2553,33 +2911,35 @@ router.post('/api/notion-import', async (req, res) => {
     return res.status(400).json({ ok: false, error: `一度に取り込めるのは ${MAX_IMPORT_CODES} 件までです (指定: ${codes.length} 件)` });
   }
   try {
-    const { results, summary } = await importFromNotion(codes, { actor: actorOf(req) });
+    const { results, summary } = await importFromNotion(codes, { actor: actorOf(req), beforeWrite: () => legacyWriteFence(res) });
     res.json({ ok: summary.failed === 0, summary, results });
   } catch (e) {
+    if (respondIfLegacyAborted(res, e)) return;
     // Notion env 未設定 (fail-closed) 等。取り込みは検証機能なので落ちても他機能に影響させない。
     // 詳細はサーバーログに残し、クライアントには内部情報を返さない (Codex R1 low-7)
     console.error('[product-hub] notion-import failed:', e);
     res.status(500).json({ ok: false, error: '取り込みに失敗しました (詳細はサーバーログを確認してください)' });
   }
-});
+}));
 
 // ─── API: Notion ステータス①〜⑥の一括移植 (2026-08-25 中原さん指示) ───
 // Status が ①〜⑥ の商品のうち**このアプリにカードが無いものだけ**を取り込む。
 // 既定は dry_run (書き込みなしのプレビュー)。実行は dry_run: false の明示が必要。
 // Notion 画像DB (商品ページ商品画像登録) の対象ステータスを移植 (2026-08-26 中原さん指示)。
 // #922 と同じ admin 限定・dryRun 既定・snapshot 一致必須。要件定義 = AI_reference『Notion画像DB移植_要件定義_20260826.md』
-router.post('/api/notion-image-import', async (req, res) => {
+router.post('/api/notion-image-import', legacyHandler(async (req, res) => {
   if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
   try {
     const dryRun = req.body?.dry_run !== false; // 安全側デフォルト
     const expectedSnapshot = typeof req.body?.expected_snapshot === 'string' ? req.body.expected_snapshot : null;
-    const r = await importImageDbByStatus({ actor: actorOf(req), dryRun, expectedSnapshot });
+    const r = await importImageDbByStatus({ actor: actorOf(req), dryRun, expectedSnapshot, beforeWrite: () => legacyWriteFence(res) });
     res.json({
       ok: true, dryRun, statuses: r.statuses, missingStatuses: r.missingStatuses, total: r.total,
       summary: r.summary, snapshot: r.snapshot,
       results: r.results.slice(0, 300), truncated: r.results.length > 300,
     });
   } catch (e) {
+    if (respondIfLegacyAborted(res, e)) return;
     if (e && (e.code === 'snapshot_mismatch' || e.code === 'missing_statuses')) {
       return res.status(409).json({ ok: false, error: e.message });
     }
@@ -2589,20 +2949,21 @@ router.post('/api/notion-image-import', async (req, res) => {
     console.error('[product-hub] notion-image-import failed:', e);
     res.status(500).json({ ok: false, error: '移植に失敗しました (詳細はサーバーログを確認してください)' });
   }
-});
+}));
 
-router.post('/api/notion-import-by-status', async (req, res) => {
+router.post('/api/notion-import-by-status', legacyHandler(async (req, res) => {
   if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
   try {
     const dryRun = req.body?.dry_run !== false; // 安全側デフォルト
     const expectedSnapshot = typeof req.body?.expected_snapshot === 'string' ? req.body.expected_snapshot : null;
-    const r = await importByNotionStatus({ actor: actorOf(req), dryRun, expectedSnapshot });
+    const r = await importByNotionStatus({ actor: actorOf(req), dryRun, expectedSnapshot, beforeWrite: () => legacyWriteFence(res) });
     // 一覧は大きくなりうるので 300 件で打ち切る (全体の件数は summary / total にある)
     res.json({
       ok: true, dryRun, statuses: r.statuses, total: r.total, summary: r.summary, snapshot: r.snapshot,
       results: r.results.slice(0, 300), truncated: r.results.length > 300,
     });
   } catch (e) {
+    if (respondIfLegacyAborted(res, e)) return;
     // プレビュー後に Notion 側が変わった → 書き込まず再プレビューを要求 (Codex R1 high)
     if (e && e.code === 'snapshot_mismatch') {
       return res.status(409).json({ ok: false, error: e.message });
@@ -2610,7 +2971,7 @@ router.post('/api/notion-import-by-status', async (req, res) => {
     console.error('[product-hub] notion-import-by-status failed:', e);
     res.status(500).json({ ok: false, error: '移植に失敗しました (詳細はサーバーログを確認してください)' });
   }
-});
+}));
 
 // 取り込んだテストデータの掃除。**取り込み由来だけ**削除可 (ポータル起点の商品は消させない)。
 // Notion 側のカードには一切触らない (ポータル DB の行を消すだけ)。
@@ -2648,14 +3009,28 @@ function workflowError(res, e) {
 // かんばんボード = 「ステータスごとに誰が何をするか」の主画面 (中原さん 2026-08-23)。
 // ボードは 1 枚で、?view= で「本流の工程で並べる / 画像の工程で並べる」を切り替える
 // (2026-08-24: 上下 2 段だと同じ商品が 2 箇所に出て 2 重管理に見える、の対応)
-router.get('/board', (req, res) => {
+/** ボードを開いたときに、Company DB の新商品の登録の知らせを取り込む (MASTER_EDIT_OPEN = 1 の Render だけ・3 秒まで待つ・失敗してもボードは出す) */
+export const CARD_SWEEP_WAIT_MS = 3000;
+async function sweepCdbCards() {
+  let timer;
+  try {
+    await Promise.race([
+      sweepCardOutbox((ev) => applyCdbCardEvent(ev)),
+      new Promise((resolve) => { timer = setTimeout(resolve, CARD_SWEEP_WAIT_MS); }),
+    ]);
+  } catch (e) {
+    console.error(`[product-hub] 新商品のカードの取り込みの失敗: ${e && e.message}`);
+  } finally { clearTimeout(timer); }
+}
+
+router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }, (req, res) => {
   const db = getDB();
   maybeBackfillDerivedStatus(db);
   const me = staffByPortalEmail(req.session?.email);
   // ビュー (2026-09-04 §5.1)。all は main の別名 (要件定義の呼び名)。
   // 知らない値は全体に倒す — 壊れたブックマークで空の画面を見せない
   const rawView = String(req.query.view || '');
-  const boardView = ['single', 'set', 'image', 'ne'].includes(rawView) ? rawView : 'main';
+  const boardView = ['single', 'set', 'image', 'ne', 'ad'].includes(rawView) ? rawView : 'main';
   // 画像ビューは担当者で絞らない (2026-09-13 中原さん決定: 画像の工程は担当者を置かないので
   // 「自分のボール / 担当者で絞る / 未割り当て」を画像ビューでは出さない)。全体ビューから切り替えて
   // URL に残っていても効かせない — チップが見えないのにカードが絞られたままになるため
@@ -2674,9 +3049,12 @@ router.get('/board', (req, res) => {
   // NE要対応は列ではなく表 (§5.5)。表示のついでに本コードの取り込みを追いかける
   // (mirror は毎時なので、画面を開くだけで追いつく。新しい定期実行は作らない)
   const neRows = boardView === 'ne' ? neRegistrationRows(db, { reconcile: reconcileProvisionalCode }) : [];
+  // 📣 広告 (2026-09-28) も列ではなく表 — 自社商品を段階・実績で見比べる。工程には足さない
+  // (足すと listing_gate で楽天出品が止まる副作用)。実績は mirror を画面を開いたときに読む (定期実行を増やさない)
+  const adOps = boardView === 'ad' ? adOpsRows(db) : null;
   // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
-  const board = boardView === 'ne'
-    ? { view: 'ne', columns: [], doneCards: [], doneTotal: 0, total: neRows.length, truncated: false, checkingTotal: 0 }
+  const board = boardView === 'ne' || boardView === 'ad'
+    ? { view: boardView, columns: [], doneCards: [], doneTotal: 0, total: boardView === 'ne' ? neRows.length : adOps.rows.length, truncated: false, checkingTotal: 0 }
     : boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind,
       mallSummary: mallSummaryFor, reconcileSet: reconcileProvisionalCode });
   // NE要対応の件数はどのタブでもバッジに出す (件数だけ。上の reconcile が済んだ後に数える)
@@ -2691,6 +3069,13 @@ router.get('/board', (req, res) => {
     // 🆕 入荷のときに撮ったパッケージ裏面の写真がある商品 (2026-09-18)。
     //    カード 800 枚ぶんを 1 クエリで作った Map を渡す (カードごとに引かない)
     backLabelCounts: backLabelCountsByGroup(db),
+    // 📣 広告 (2026-09-28): タブの表と、カードの札 (いまの段階。未着手は札を出さない)
+    adOps,
+    adStages: boardView === 'ad' || boardView === 'ne' ? new Map() : adStagesByDraft(db),
+    adOpsDefs: {
+      stages: AD_OPS_STAGES, stageJa: AD_OPS_STAGE_JA, types: AD_OPS_CAMPAIGN_TYPES, typeJa: AD_OPS_CAMPAIGN_TYPE_JA,
+      adjustStaleDays: ADJUST_STALE_DAYS, windowDays: ACTUAL_WINDOW_DAYS, activeDays: ACTIVE_WINDOW_DAYS,
+    },
     staff: listStaff(),
     me,
     assigneeId,
@@ -2711,6 +3096,8 @@ router.get('/board', (req, res) => {
     rakutenRmsItemUrl,
     // 結果不明 (outcome=unknown) の商品を再実行する「確認済みで再実行」は管理者だけに出す
     isAdmin: req.session?.role === 'admin',
+    // Company DB の新商品の登録で、発送方法 (送料コード) に楽天の配送方法の対応が無かったカード (2026-10-01)
+    cdbShippingCheck: cdbShippingCheckIds(db),
   });
 });
 
@@ -2836,7 +3223,9 @@ router.post('/api/drafts/:id/board-move', (req, res) => {
       isAdmin: req.session?.role === 'admin',
       actorStaffId: me?.id ?? null,
     });
-    res.json({ ok: true, changed: r.changed });
+    // reopenBlocked = 移動先の工程を開き直す権限が無くて諦めた工程名 (移動自体は成功)。
+    // 画面が「落とした列に止まらなかった」理由を出すのに使う
+    res.json({ ok: true, changed: r.changed, reopenBlocked: r.reopenBlocked || null });
   } catch (e) { workflowError(res, e); }
 });
 
@@ -2889,6 +3278,33 @@ router.post('/api/drafts/:id/image-priority', (req, res) => {
   // image_priority も返す: 画面はこの値で「画像制作の管理項目が使えるか」を判定し直す
   // (返さないと、取扱先限定商品に変えても欄が出ないまま — Codex R3 medium)
   res.json({ ok: true, own_brand: ownBrand, image_priority: value });
+});
+
+// 既存の楽天ページへの追加か の即保存 (2026-09-25 スタッフ要望)。'' = 自動判定に戻す / '1' = 既存ページ / '0' = 新規ページ。
+// 札 (目印) だけで工程のゲートには使わないので、担当者に限らず誰でも直せる (自社商品チェックと同じ扱い)
+router.post('/api/drafts/:id/existing-page', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const raw = req.body?.value == null ? '' : String(req.body.value);
+  if (!EXISTING_PAGE_CHOICES.some((c) => c.value === raw)) {
+    return res.status(400).json({ ok: false, error: '既存ページの指定が不正です' });
+  }
+  const value = raw === '' ? null : Number(raw);
+  const db = getDB();
+  // 出品済みページへの色追加のカードは既存ページのまま (新規ページにして出品すると別ページができる)
+  if (db.prepare('SELECT added_to_draft_id FROM product_drafts WHERE id = ?').get(draft.id)?.added_to_draft_id != null) {
+    return res.status(400).json({ ok: false, error: '出品済みのページに色を足すカードなので、既存ページのまま変えられません' });
+  }
+  db.transaction(() => {
+    const cur = db.prepare('SELECT existing_page FROM product_drafts WHERE id = ?').get(draft.id);
+    if ((cur?.existing_page ?? null) === value) return;
+    db.prepare(`
+      UPDATE product_drafts SET existing_page = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?
+    `).run(value, draft.id);
+    const label = (v) => EXISTING_PAGE_CHOICES.find((c) => c.value === (v == null ? '' : String(v)))?.label || String(v);
+    logEvent(db, draft.id, 'updated', `既存ページ: ${label(cur?.existing_page)} → ${label(value)}`, actorOf(req));
+  })();
+  res.json({ ok: true, ...existingPageOfDraft(db, draft.id) });
 });
 
 // 自社商品チェックの即保存 (2026-08-24)。基本情報の汎用APIとは分ける:
@@ -3057,7 +3473,8 @@ router.post('/api/drafts/:id/set-drafts', (req, res) => {
     // 権限判定は createSetDraft 内の setStepState (親の「セット商品作成検討」を閉じる操作) が行う。
     // 判断した本人か admin だけが作れる = 誰かのレビュー中に横から作られない
     const me = staffByPortalEmail(req.session?.email);
-    const ctx = { isAdmin: req.session?.role === 'admin', actorStaffId: me?.id ?? null, requireVersion: true };
+    // withTax = 親の税率を写すか (切替で閉じた後は写さない。門 = res.locals.masterLegacyWrite)
+    const ctx = { isAdmin: req.session?.role === 'admin', actorStaffId: me?.id ?? null, requireVersion: true, withTax: res.locals.masterLegacyWrite?.writable === true };
     // ボードのカードから「作る」を押したとき (claim: true) は、未割り当てなら本人が引き受ける。
     // 引き受けは版数を 1 消費するので、createSetDraft へ渡す親工程の版数も進める。
     // 引き受けと作成は 1 トランザクション — 作成が途中で失敗したのに担当だけ付くのを防ぐ
@@ -3100,6 +3517,19 @@ router.post('/api/drafts/:id/ne-registration', (req, res) => {
   try {
     const r = setNeRegistrationState(db, draft.id, req.body || {}, actorOf(req));
     res.json({ ok: true, state: r.state, reason: r.reason });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 📣 広告の進み (2026-09-28)。段階 (未着手 / KW作成済み / 出稿中 / 停止) と「調整した」を追記する。
+// 広告の作業は工程の担当者とは別なので、ログインしている人なら誰でも記録できる (記録者は残る)。
+// 別の人が先に段階を変えていたら 409 (画面が見ていた段階の行 id = base_stage_event_id で照合)
+router.post('/api/drafts/:id/ad-ops', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = recordAdOps(getDB(), draft, req.body || {}, actorOf(req));
+    if (!r.ok) return res.status(r.status || 400).json({ ok: false, code: r.code, error: r.error });
+    res.json({ ok: true, event: r.event });
   } catch (e) { workflowError(res, e); }
 });
 
@@ -3238,14 +3668,608 @@ export const serviceApiRouter = express.Router();
 serviceApiRouter.use(express.json({ limit: '1mb' }));
 serviceApiRouter.use(requireServiceToken);
 
-// 生成待ち一覧 (AI 生成の材料つき、読み取り専用 = プレビュー用)
-serviceApiRouter.get('/generation-queue', (req, res) => {
+// ─── SP広告KW の夜間 AI (PR3a・2026-09-23)。miniPC の実行役 (PR3b) が使う。設計 = 正本 §5「PR3 実装計画 v2 / v2.1」───
+// 1 件ずつ: claim → reserve (AI を呼ぶ前に予約) → result (generation 単位・lease 切れ後の復旧も) / fail / release
+const AD_KW_AI_HTTP = { not_found: 404, lease_lost: 409, lease_expired: 409, already_reserved: 409, already_finalized: 409, packet_mismatch: 409,
+  parent_invalid: 409, bad_stage: 409, not_ready: 409, probe_lost: 409, ai_disabled: 503, ai_schema: 503, daily_cap: 429, too_large: 413 };
+const adKwAiFail = (res, r) => res.status(AD_KW_AI_HTTP[r.code] || 400).json({ ok: false, code: r.code, error: r.error });
+const intParam = (v) => { const n = Number.parseInt(v, 10); return Number.isInteger(n) && n > 0 ? n : 0; };
+serviceApiRouter.get('/ad-kw-ai/queue', (req, res) => {
+  res.json({ ok: true, queue: adKwAiQueueSummary(getDB()) });
+});
+// おまかせの自動受付 (PR3c)。run-ph-generate.ps1 がキューを見る前に呼ぶ。1 日の上限はサーバーが数える (再送は残り枠まで)
+serviceApiRouter.post('/ad-kw-ai/auto-enqueue', async (req, res) => {
+  try {
+    const r = await adKwAutoEnqueue(getDB(), { titleFetcher: fetchAmazonCatalog });
+    if (!r.ok) return adKwAiFail(res, r);
+    res.json({ ok: true, enqueued: r.enqueued, skipped: r.skipped, today: r.today, cap: r.cap, queue: adKwAiQueueSummary(getDB()) });
+  } catch (e) {
+    console.error('[product-hub] ad-kw-ai auto-enqueue failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
+});
+// capabilities: ['auto'] を送る実行役 (PR3c-2 以降) にだけ、おまかせを渡す
+serviceApiRouter.post('/ad-kw-ai/claim', (req, res) => {
+  const caps = Array.isArray(req.body?.capabilities) ? req.body.capabilities.map((c) => String(c).slice(0, 20)).slice(0, 10) : [];
+  const r = claimAdKwAiJob(getDB(), { runnerRunId: cleanText(req.body?.runner_run_id, 80), capabilities: caps });
+  if (!r.ok) return adKwAiFail(res, r);
+  res.json({ ok: true, job: r.job });
+});
+serviceApiRouter.post('/ad-kw-ai/jobs/:id/reserve', (req, res) => {
+  const r = reserveAdKwAiGeneration(getDB(), intParam(req.params.id), {
+    leaseToken: cleanText(req.body?.lease_token, 100), model: cleanText(req.body?.model, 80), promptVersion: cleanText(req.body?.prompt_version, 80),
+    stage: cleanText(req.body?.stage, 20) || null,
+  });
+  if (!r.ok) return adKwAiFail(res, r);
+  res.json({ ok: true, generation_id: r.generation_id, stage: r.stage });
+});
+// おまかせの材料を 1 つ集める (1 回 = 1 外部照会・同期 最大 45 秒前後)。サーバーが次の照会を決める
+serviceApiRouter.post('/ad-kw-ai/jobs/:id/collect', async (req, res) => {
+  try {
+    const r = await adKwCollectStep(getDB(), intParam(req.params.id), {
+      leaseToken: cleanText(req.body?.lease_token, 100),
+      clients: {
+        suggest: (seed) => collectSuggestions(seed, { alphabet: false }),
+        terms: (terms) => lookupAbaTopAsins(terms),
+        asin: (asin) => lookupAbaTerms(asin, { register: false }),
+      },
+    });
+    if (!r.ok) return adKwAiFail(res, r);
+    res.json(r);
+  } catch (e) {
+    console.error('[product-hub] ad-kw-ai collect failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
+});
+// 材料集めを終えて最終案の packet を固定する (再送は同じ packet)
+serviceApiRouter.post('/ad-kw-ai/jobs/:id/finalize', (req, res) => {
+  const r = adKwFinalizeAuto(getDB(), intParam(req.params.id), { leaseToken: cleanText(req.body?.lease_token, 100) });
+  if (!r.ok) return adKwAiFail(res, r);
+  res.json(r);
+});
+serviceApiRouter.post('/ad-kw-ai/generations/:gid/result', (req, res) => {
+  const r = submitAdKwAiResult(getDB(), intParam(req.params.gid), { packetHash: cleanText(req.body?.packet_hash, 100), output: req.body?.output });
+  if (!r.ok) return adKwAiFail(res, r);
+  res.json({ ok: true, receipt: r.receipt, replay: !!r.replay });
+});
+serviceApiRouter.post('/ad-kw-ai/jobs/:id/fail', (req, res) => {
+  const r = failAdKwAiJob(getDB(), intParam(req.params.id), {
+    leaseToken: cleanText(req.body?.lease_token, 100), code: cleanText(req.body?.code, 40), message: cleanText(req.body?.message, 500),
+  });
+  if (!r.ok) return adKwAiFail(res, r);
+  res.json({ ok: true, status: r.status });
+});
+serviceApiRouter.post('/ad-kw-ai/jobs/:id/release', (req, res) => {
+  const r = releaseAdKwAiJob(getDB(), intParam(req.params.id), { leaseToken: cleanText(req.body?.lease_token, 100) });
+  if (!r.ok) return adKwAiFail(res, r);
+  res.json({ ok: true, status: r.status });
+});
+
+/**
+ * AI 生成の材料の税率 (draft_yahoo.tax_rate) は、税率の列が開いている間 (legacy_open・frozen 以降でも skus.tax_rate が load) だけ渡す。
+ * 閉じた後・段階を読めない = 渡さない (null)。税率の持ち主は Company DB = 古い手入力の値を AI の文に入れない (中間レビュー 2 回目 Low)。
+ * 段階は画面と同じ読み方 (30 秒の使い回し・1 秒で諦める = 生成の材料を待たせない)
+ */
+async function dropLegacyTaxUnlessOpen(drafts) {
+  let g;
+  try { g = await checkLegacyGate({ purpose: 'screen', cols: ['skus.tax_rate'] }); } catch { g = { readable: false, writable: false }; }   // 税率の列の持ち主で決める (⑤-3b)
+  if (g.readable === true && g.writable === true) return drafts;
+  for (const d of drafts) if (d && d.yahoo) d.yahoo = { ...d.yahoo, tax_rate: null };
+  return drafts;
+}
+
+// ─── 管理: LP 仕様書の取込 (段階1・2026-10-01) ───────────────
+// スタッフが「スプレッドシート → ファイル → ダウンロード → Excel」で落とした .xlsx をそのまま上げる。
+// スプレッドシートを毎晩直接読む案は不可 (miniPC に G: も Drive 認証も無い + 編集途中を掏む。設計 §4.1)。
+// 追記専用 — 同じ中身なら版を増やさず既存を返す。変わったら新しい版になる。
+const LP_SPEC_MAX_BYTES = 5 * 1024 * 1024;
+// 展開後の上限。xlsx は ZIP なので 5MB のファイルが展開で巨大になりうる (zip bomb)。
+// 完全な防御 (展開前の ZIP 検査・別プロセスへの隔離) は入れていない —
+// この口を **admin 限定**にして攻撃面を絞ったうえで、安い上限だけ置く (Codex API R1 #2 を承知)。
+// 実物の仕様書は 8 タブ・数百行・5 万字程度なので、この枕で十分。
+const LP_SPEC_MAX_SHEETS = 50;
+const LP_SPEC_MAX_ROWS_PER_SHEET = 5000;
+const LP_SPEC_MAX_CELLS = 200000;
+// 本文の総文字数。巨大な単一セルをセル数だけでは防げない (Codex API R2)。
+// lib 側の SPEC_BODY_MAX (50 万) と揃える — 実物の仕様書は 5 万字程度
+const LP_SPEC_MAX_CHARS = 500000;
+// 展開後の合計。実物の仕様書 (45KB) は展開しても数 MB。余裕を見て 80MB
+const LP_SPEC_MAX_EXPANDED_BYTES = 80 * 1024 * 1024;
+
+/** exceljs の cell.value を素の文字列に潰す (apps/inbound-info/router.js の plainValue と同じ考え方) */
+function lpSpecCellText(v) {
+  if (v == null) return '';
+  if (typeof v === 'object') {
+    if (Array.isArray(v.richText)) return v.richText.map((t) => t.text).join('');
+    if ('result' in v) return lpSpecCellText(v.result);
+    if ('text' in v) return String(v.text);
+    if (v instanceof Date) return v.toISOString();
+    if ('formula' in v) return '=' + v.formula;
+    if ('error' in v) return '';
+    return String(v);
+  }
+  return String(v);
+}
+
+/**
+ * .xlsx を AI に渡すテキストにする。
+ * 全タブを「## タブ名」の見出し付きで TSV に並べる (タブの順をそのまま保つ)。
+ * 仕様書は 1 セルに長い文片が入るので、改行をそのまま渡す (タブを TSV の区切りにしているので 	 だけ落とす)。
+ */
+async function lpSpecWorkbookToText(buf) {
+  // 🚨 load の **前** に展開後の大きさを見る。exceljs の load は ZIP 全体を展開してから
+  //    メモリに載せるので、load を呼んだ時点で手遅れ (Codex API R3 #1)
+  assertXlsxExpandsSafely(buf, { maxExpandedBytes: LP_SPEC_MAX_EXPANDED_BYTES });
+  const ExcelJS = (await import('exceljs')).default;
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  if (wb.worksheets.length > LP_SPEC_MAX_SHEETS) {
+    throw new XlsxTooLargeError(`タブが多すぎます (${wb.worksheets.length} / ${LP_SPEC_MAX_SHEETS} まで)`);
+  }
+  const titles = [];
+  const parts = [];
+  // 🚨 累計は**セルを 1 つ処理するごとに**見る (Codex API R2)。
+  //    タブを 1 枚読み終えてから数えると、疎な巨大範囲で先に大量の走査と文字列生成が起きる。
+  //    セル数だけでは巨大な単一セルを防げないので、本文の総文字数も同時に見る。
+  //    eachRow / eachCell は途中で抜けられないので、上限を超えたら throw して打ち切る
+  let cells = 0;
+  let chars = 0;
+  const countCell = (text) => {
+    cells += 1;
+    chars += text.length;
+    if (cells > LP_SPEC_MAX_CELLS) throw new XlsxTooLargeError(`セルが多すぎます (${LP_SPEC_MAX_CELLS} まで)`);
+    if (chars > LP_SPEC_MAX_CHARS) throw new XlsxTooLargeError(`中身が大きすぎます (${LP_SPEC_MAX_CHARS} 文字まで)`);
+    return text;
+  };
+  for (const ws of wb.worksheets) {
+    if (ws.rowCount > LP_SPEC_MAX_ROWS_PER_SHEET) {
+      throw new XlsxTooLargeError(`タブ「${ws.name}」の行が多すぎます (${ws.rowCount} / ${LP_SPEC_MAX_ROWS_PER_SHEET} まで)`);
+    }
+    titles.push(ws.name);
+    const lines = [];
+    ws.eachRow({ includeEmpty: false }, (row) => {
+      const vals = [];
+      row.eachCell({ includeEmpty: true }, (c) => vals.push(countCell(lpSpecCellText(c.value).replace(/\t/g, ' '))));
+      while (vals.length && vals[vals.length - 1] === '') vals.pop();
+      lines.push(vals.join('\t'));
+    });
+    parts.push(`## ${ws.name}\n${lines.join('\n')}`);
+  }
+  return { body: parts.join('\n\n'), sheetTitles: titles };
+}
+
+/**
+ * 仕様書を上げる。Content-Type: application/octet-stream で .xlsx の生バイトを送る。
+ * 種類と名前はクエリ (?kind=product_analysis&title=...)。
+ */
+router.post('/api/lp-specs',
+  express.raw({ type: 'application/octet-stream', limit: LP_SPEC_MAX_BYTES + 1024 * 1024 }),
+  async (req, res) => {
+    // 🚨 仕様書は **AI への指示そのもの**。差し替える = 全商品の生成内容を変える。
+    //    「誰でも押せる」は生成依頼 (ボタン) の話で、ここは別権限 (Codex API R1 #1)
+    if (!requireAdminJson(req, res)) return;
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({ ok: false, code: 'bad_request', error: '.xlsx の中身が空です' });
+    }
+    if (req.body.length > LP_SPEC_MAX_BYTES) {
+      return res.status(413).json({ ok: false, code: 'too_large', error: 'ファイルが大きすぎます (5MB まで)' });
+    }
+    let parsed;
+    try {
+      parsed = await lpSpecWorkbookToText(req.body);
+    } catch (e) {
+      console.error('[product-hub] lp-spec xlsx の読み込みに失敗:', String(e?.message || e).slice(0, 300));
+      // 🚨 「大きすぎる」と「.xlsx として読めない」を区別する (Codex API R3 #3)。
+      //    上限超過を bad_xlsx にすると、上げた人が「ファイルが壊れている」と誤解する
+      if (e instanceof XlsxTooLargeError || e?.tooLarge) {
+        return res.status(413).json({ ok: false, code: 'too_large', error: e.message });
+      }
+      return res.status(400).json({ ok: false, code: 'bad_xlsx', error: '.xlsx として読めません (ダウンロードし直してください)' });
+    }
+    const db = getDB();
+    const r = importLpSpec(db, {
+      kind: cleanText(req.query?.kind, 40) || 'product_analysis',
+      title: cleanText(req.query?.title, 200) || 'LP制作システム',
+      body: parsed.body, sheetTitles: parsed.sheetTitles, actor: actorOf(req),
+    });
+    if (!r.ok) {
+      const status = r.code === 'too_large' ? 413 : 400;
+      return res.status(status).json({ ok: false, code: r.code, error: r.error });
+    }
+    res.json({ ok: true, created: r.created, spec: lpSpecSummary(db, r.spec.kind) });
+  });
+
+/** いまの版 (画面に「仕様書: ○○ (YYYY-MM-DD 取込)」を出す) */
+router.get('/api/lp-specs', (req, res) => {
+  res.json({ ok: true, enabled: lpComposeEnabled(), spec: lpSpecSummary(getDB(), cleanText(req.query?.kind, 40) || 'product_analysis') });
+});
+
+// ─── 画面: LP 構成を AI に作らせる (段階1・2026-10-01) ──────────
+/**
+ * 詳細画面の最初の表示に渡す「構成をAIに作らせる」の状態。
+ * GET /api/drafts/:id/lp-compose と**同じ形**にする (画面が同じ描画関数を使う)。
+ */
+function lpComposeInitialState(db, draft) {
+  const spec = latestLpSpec(db, 'product_analysis');
+  // 🚨 材料の組み方は **API と全く同じ** lpComposeMaterial を通す (codex exec review P1)。
+  //    カラバリや裏面情報を含めるのは composeProductInfo の中なので、
+  //    ここだけ effectiveProductInfo を渡すと、**裏面情報だけの商品が
+  //    画面ではずっと押せない** (API では押せる) という食い違いになる。
+  const { productInfo, images } = lpComposeMaterial(db, draft);
+  return {
+    ...lpComposeStateFor(db, draft.id),
+    blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
+    // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
+    image_plan: lpComposeImagePlan(images),
+    // 押したときに素材 (画像フォルダの下のフォルダ) を読むか。読むのは押したときだけ (ここでは Drive を読まない)
+    materials_folder: parseDriveLink(draft.drive_folder_url)?.type === 'folder',
+    spec: lpSpecSummary(db, 'product_analysis'),
+  };
+}
+
+// 誰でも押せる (中原さん 2026-10-01。既存の定型文ボタンと同じ扱い)。
+// 押す = キューに積んで即 claim 対象にするだけ。構成に 1〜3 分かかるので画面はポーリングする。
+
+/** 依頼する。body: { idempotency_key }。二重クリック・通信リトライで job を増やさない */
+router.post('/api/drafts/:id/lp-compose', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
   const db = getDB();
-  // キューは status='ready_for_ai' を見るので、切替バックフィル前の古い status のまま
-  // 拾い漏れ・拾い過ぎが起きないよう、AI キューの入口でも自己修復する
-  maybeBackfillDerivedStatus(db);
-  // drafts = 今 claim できるもの (人の確認待ちは含まない)。queue.blocked で人待ちの件数を別枠で返す
-  res.json({ ok: true, drafts: listGenerationQueue(db), queue: generationQueueSummary(db) });
+  const spec = latestLpSpec(db, 'product_analysis');
+  const { productInfo, colorVariations, images } = lpComposeMaterial(db, draft);
+  // 素材画像 = 商品の画像フォルダの**サブフォルダ (何階層下でも)** の画像 (2026-10-02 中原さん)。
+  // 押したときに 1 回だけ Drive を読み、packet に固定する (画面のポーリング GET では読まない)。
+  // 同じキーの再送は前の依頼を返すだけなので読まない (Drive が一時的に落ちていても再送は通る)。
+  // 🚨 読めなければ依頼を作らない (素材が無いまま作った結果を、素材ありと同じ測定に混ぜない)
+  // 🚨 Drive を読む前に、手軽な受付の検査を済ませる (機能 OFF・押せない・動いている依頼なら読まない・codex #1593 Medium)
+  const lpReqStatus = (code) => (code === 'disabled' ? 503 : ['already_running', 'not_ready'].includes(code) ? 409 : 400);
+  const pre = lpComposeRequestPrecheck(db, { draft, productInfo, spec, images, idempotencyKey: req.body?.idempotency_key });
+  if (pre?.code) return res.status(lpReqStatus(pre.code)).json({ ok: false, code: pre.code, error: pre.error });
+  let materials = [];
+  const folder = parseDriveLink(draft.drive_folder_url);
+  if (!pre?.prior && folder && folder.type === 'folder') {
+    try {
+      materials = (await listDriveFolderMaterialImages(folder.id)).map((m) => ({
+        file_id: m.id, drive_modified_time: m.modifiedTime, role: 'material', name: m.name, folder: m.folder,
+      }));
+    } catch (e) {
+      console.error('[product-hub] lp-compose materials failed:', draft.id, String(e?.message || e).slice(0, 300));
+      return res.status(502).json({
+        ok: false, code: 'materials_unavailable',
+        error: '素材画像 (画像フォルダの下のフォルダ) を Drive から読めませんでした: ' + String(e?.message || e).slice(0, 160) + ' — もう一度押してください',
+      });
+    }
+  }
+  const r = requestLpComposeJob(db, {
+    draft, productInfo, colorVariations, images: [...images, ...materials], spec,
+    idempotencyKey: req.body?.idempotency_key, actor: actorOf(req),
+  });
+  if (!r.ok) return res.status(lpReqStatus(r.code)).json({ ok: false, code: r.code, error: r.error });
+  // 🚨 応答は初期表示・GET と同じ形 (押せない理由・仕様書・画像の並びも) にする。
+  //    同じキーの再送で終わった依頼が返ると画面はポーリングを止めるので、ここで欠けると
+  //    「もう一度押すと渡す画像」が再読み込みまで出ない (codex #1592 R3 Medium)
+  res.json({ ok: true, created: r.created, ...lpComposeInitialState(db, draft) });
+});
+
+/** 状況と結果。画面が 5 秒おきに叩くので軽く保つ (done のときだけ本文を返す) */
+router.get('/api/drafts/:id/lp-compose', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const spec = latestLpSpec(db, 'product_analysis');
+  const { productInfo, images } = lpComposeMaterial(db, draft);
+  res.json({
+    ok: true,
+    ...lpComposeStateFor(db, draft.id),
+    // 押せるか。押せない理由はそのまま画面に出す
+    blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
+    // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
+    image_plan: lpComposeImagePlan(images),
+    // 押したときに素材 (画像フォルダの下のフォルダ) を読むか。読むのは押したときだけ (ここでは Drive を読まない)
+    materials_folder: parseDriveLink(draft.drive_folder_url)?.type === 'folder',
+    // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
+    spec: lpSpecSummary(db, 'product_analysis'),
+  });
+});
+
+// ─── 画面: LP 画像を作る (段階2・2026-10-04 中原さん) ─────────────
+// 正本 = AI_reference『商品ハブ_LP構成と画像の自動生成_検討_20260929.md』。ロジックは lib/lp-image.js。
+
+/** 保存先 = 商品の画像フォルダ (画像タブの「画像フォルダから自動セット」の URL) */
+function lpImageFolderId(draft) {
+  const p = parseDriveLink(draft?.drive_folder_url);
+  return p && p.type === 'folder' ? p.id : null;
+}
+/** 先頭のバイト列で画像の種類を見る (Drive のサムネイルは JPEG が多いが、PNG のこともある) */
+function sniffImageMime(buf) {
+  if (buf && buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  if (buf && buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  return 'image/jpeg';
+}
+// 作る係 (Render のプロセスの中で 1 枚ずつ)。押されたときと起動のときに動く
+const lpImageWorker = createLpImageWorker({
+  getDB,
+  generate: (args) => openaiGenerateImage(args),
+  // 参考画像は AI に構成を書かせたときと同じ幅 (1024px) のサムネイル。ラベルの文字が読める大きさ
+  // 受付時の更新日時と照らし、差し替わっていたら作らない (#1612 R1 Medium)。更新日時が無ければ作らない (#1612 R2 Medium)
+  fetchRef: async (fileId, { expectedModifiedTime = null } = {}) => {
+    if (!expectedModifiedTime) throw Object.assign(new Error('参考画像の更新日時がありません'), { changed: true });
+    {
+      const meta = await getDriveWriteClient().files.get({ fileId, fields: 'modifiedTime', supportsAllDrives: true }, { timeout: 30_000 });
+      const cur = meta?.data?.modifiedTime || null;
+      if (!cur || Date.parse(cur) !== Date.parse(expectedModifiedTime)) {
+        throw Object.assign(new Error(`参考画像が差し替わっています (${fileId})`), { changed: true });
+      }
+    }
+    // 版 = 受付時の更新日時 (サムネイルのキャッシュも受付時の版で引く)
+    const e = await getDriveThumbnail(fileId, LP_COMPOSE_IMAGE_WIDTH, expectedModifiedTime || '');
+    return { buf: e.buf, mime: sniffImageMime(e.buf) };
+  },
+  ensureFolder: async (parentId) => (await ensureImageFolder(getDriveWriteClient(), { name: 'AI初稿', parentId })).id,
+  upload: async ({ folderId, name, buf }) => {
+    const r = await getDriveWriteClient().files.create({
+      requestBody: { name, parents: [folderId], mimeType: 'image/png' },
+      media: { mimeType: 'image/png', body: Readable.from(buf) },
+      fields: 'id',
+      supportsAllDrives: true,
+    }, { timeout: 120_000 });
+    return r.data.id;
+  },
+});
+const lpImageTick = () => lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
+// 起動のとき 1 回: 期限の切れた途中の画像を片付けてから、残りを作る (機能が有効なときだけ)。
+// kick の中で recover するので、入れ替え中の古いプロセスが作っている画像 (期限内) には触らない (#1612 R1 Medium)。
+// 定期の見回り (setInterval) は置かない — 画面が作っている間 5 秒おきに状況を見に来るので、そのときに起こす (#1612 R2)
+if (process.env.PH_LP_IMAGE_ENABLED === '1') setTimeout(lpImageTick, 15_000).unref();
+
+/** 参考画像の Drive の更新日時をいま取り直す (受付時に固定する値・#1612 R2 Medium)。取れなければ throw */
+async function lpImageRefTimes(fileIds) {
+  const drive = getDriveWriteClient();
+  const out = {};
+  for (const fileId of fileIds) {
+    const meta = await drive.files.get({ fileId, fields: 'modifiedTime', supportsAllDrives: true }, { timeout: 30_000 });
+    if (!meta?.data?.modifiedTime) throw new Error(`更新日時が返ってきませんでした (${fileId})`);
+    out[fileId] = meta.data.modifiedTime;
+  }
+  return out;
+}
+
+/** 状況 (画面が作っている間 5 秒おきに叩く) */
+router.get('/api/drafts/:id/lp-images', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const st = lpImageStateFor(getDB(), { draft, folderId: lpImageFolderId(draft) });
+  // 作っている途中なのに作る係が休んでいる (再起動の後・期限切れの片付け待ち) なら起こす。kick は重ねて呼んでも 1 本だけ
+  if (st.job && ['queued', 'running'].includes(st.job.status) && !lpImageWorker.isRunning()) lpImageTick();
+  res.json({ ok: true, ...st });
+});
+
+/** 作る (誰でも押せる)。body: { idempotency_key }。同じキーの再送は前の依頼を返す */
+router.post('/api/drafts/:id/lp-images', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const folderId = lpImageFolderId(draft);
+  // 押せない理由があれば Drive を読まずに断る (同じキーの再送は requestLpImageJob が前の依頼を返す)
+  const key = req.body?.idempotency_key;
+  if (!lpImageValidKey(key)) return res.status(400).json({ ok: false, code: 'bad_request', error: 'idempotency_key の形が不正です' });
+  const prior = db.prepare('SELECT 1 FROM ph_lp_image_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draft.id, key);
+  let refTimes = null;
+  if (!prior) {
+    const blocked = lpImageBlockReason(db, { draft, folderId });
+    if (blocked) return res.status(409).json({ ok: false, code: 'not_ready', error: blocked });
+    try { refTimes = await lpImageRefTimes(lpImageRefCandidates(db, draft)); }
+    catch (e) {
+      console.error('[product-hub] lp-image ref times:', draft.id, String(e?.message || e).slice(0, 300));
+      return res.status(502).json({ ok: false, code: 'refs_unavailable', error: '参考画像の情報を Drive から読めませんでした — もう一度押してください' });
+    }
+  }
+  const r = requestLpImageJob(db, { draft, folderId, idempotencyKey: key, actor: actorOf(req), refTimes });
+  if (!r.ok) {
+    const status = r.code === 'already_running' || r.code === 'not_ready' ? 409 : 400;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error });
+  }
+  lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
+  res.json({ ok: true, created: r.created, ...lpImageStateFor(db, { draft, folderId }) });
+});
+
+/**
+ * LP 構成の AI 生成に渡す材料を組む (段階1)。
+ * 画面の API (lpComposeRouter) と service-api の両方がこれを通る。
+ * 🚨 **定型文 (lib/prompt-templates.js) と同じ組み立てを使う** — 画面の「商品分析を準備」が
+ *    ChatGPT に渡すものと、AI に渡す packet が食い違わないようにする。
+ *    ここで独自に組み直すと、定型文の正本が 2 つになる (設計 §4.2)。
+ */
+function lpComposeMaterial(db, draft) {
+  const ip = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draft.id) || null;
+  const autoInfo = autoProductInfoText(db, draft.id);
+  const variation = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
+  const rakuten = db.prepare('SELECT variant_selector_name FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
+  const selectorValues = {};
+  for (const r of db.prepare('SELECT sku_code, value FROM draft_sku_selector_values WHERE draft_id = ?').all(draft.id)) {
+    selectorValues[r.sku_code] = r.value;
+  }
+  const productInfo = composeProductInfo({
+    ...(ip || {}),
+    product_info_text: effectiveProductInfo(ip?.product_info_text, autoInfo),
+  });
+  const colorVariations = composeColorVariations({
+    variation, hasVariation: effectiveHasVariation(variation, draft),
+    selectorName: rakuten?.variant_selector_name, selectorValues,
+  });
+  // 白抜き (_00) は draft_images に入らず draft_rakuten にある。**白抜きを先頭に入れる** (2026-10-02):
+  // 商品だけが写っているので、仕様書の「商品再現ルール」(形・ラベル・色) のいちばんの手がかりになる。
+  // 入荷直後の新商品は白抜きしか無いことが多く、入れないと「商品画像がありません」で押せなかった (fukidashiseal)。
+  // 続けて TOP から順に、合わせて最大 MAX_IMAGES 枚 (重複は buildPacket が除く)
+  const wb = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
+  // role = 何の画像か (white_bg / slot:N・N は画像タブの番号で 1 が TOP = sort + 1)。packet に残して画面と測定行に出す
+  const rows = db.prepare(`SELECT drive_file_id, drive_modified_time, sort FROM draft_images
+    WHERE draft_id = ? AND drive_file_id IS NOT NULL ORDER BY sort, id LIMIT ?`).all(draft.id, LP_COMPOSE_MAX_PRODUCT_IMAGES + 1);
+  const images = [
+    ...(wb?.white_bg_drive_file_id
+      ? [{ drive_file_id: wb.white_bg_drive_file_id, drive_modified_time: wb.white_bg_modified_time, role: 'white_bg' }] : []),
+    ...rows.map((r) => ({ drive_file_id: r.drive_file_id, drive_modified_time: r.drive_modified_time, role: 'slot:' + (Number(r.sort) + 1) })),
+  ];
+  return { productInfo, colorVariations, images };
+}
+
+// ─── LP 構成の AI 生成 (段階1・2026-10-01) ───────────────────────
+// 正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』§4.3。
+// miniPC の実行役 (scripts/ph-nightly/lp-compose.mjs) が 1 分おきに叩く。
+// 🚨 lease_token / hash / prompt_version は **cleanText を通さない** — trim や切り詰めで形が
+//    変わると、lp-compose.js 側の「正規化せず形を直接見る」検査の意味が無くなる (Codex コード R3〜R6)。
+//    長さだけ先に見て、形の判定は lib に任せる。
+// lp-compose 固有の code を HTTP に対応づける (ad-kw-ai の表に無いもの)。
+// 🚨 disabled を落とすと「機能が無効」が 400 に見え、実行役が「依頼が壊れている」と誤解する
+const LP_COMPOSE_HTTP = { ...AD_KW_AI_HTTP, disabled: 503, bad_config: 503, bad_model: 409, already_generated: 409, job_finalized: 409, already_running: 409, lint_failed: 422 };
+// 🚨 lint で断ったときは**何が落ちたかも返す** (codex exec review P2)。
+//    code と error だけだと、実行役は直すために lint をもう一度呼ぶしか無く、
+//    lease が切れた後はそれもできない (= 直しようが無い)。
+const lpComposeFail = (res, r) => res.status(LP_COMPOSE_HTTP[r.code] || 400)
+  .json({ ok: false, code: r.code, error: r.error, ...(r.lint ? { lint: r.lint } : {}) });
+const rawField = (v, maxLen) => (typeof v === 'string' && v.length <= maxLen ? v : null);
+// 🚨 共有の intParam は Number.parseInt なので "12abc" を 12 として通す。
+//    lib 側の posInt を厳しくしても、router で変換して渡すとそこに届かず、
+//    壊れた URL が **別の正当な job / generation** を指してしまう (codex exec review の P2)。
+//    パスの成分全体を見てから数にする。
+//    共有の intParam はここでは直さない (ad-kw-ai など他の口の挙動をこの PR で変えない)。
+const lpIdParam = (v) => (typeof v === 'string' && /^[1-9]\d*$/.test(v) ? Number(v) : 0);
+
+serviceApiRouter.get('/lp-compose/queue', (req, res) => {
+  res.json({ ok: true, queue: lpComposeQueueSummary(getDB()) });
+});
+
+serviceApiRouter.post('/lp-compose/claim', (req, res) => {
+  // max_images = 実行役が落とせる画像の枚数 (言わない古い phlp は 6 枚まで扱い・codex #1593 Medium)
+  const r = claimLpComposeJob(getDB(), { runnerRunId: cleanText(req.body?.runner_run_id, 80), maxImages: req.body?.max_images });
+  if (!r.ok) return lpComposeFail(res, r);
+  // exhausted = 壊れた依頼が並んでいて 50 回掴めなかった (「仕事なし」と区別する)
+  res.json({ ok: true, job: r.job, exhausted: r.exhausted || undefined, too_many_images: r.too_many_images || undefined, error: r.error || undefined });
+});
+
+serviceApiRouter.post('/lp-compose/jobs/:id/reserve', (req, res) => {
+  const r = reserveLpComposeGeneration(getDB(), lpIdParam(req.params.id), {
+    leaseToken: rawField(req.body?.lease_token, 100),
+    // 🚨 cleanText (trim) を通さない — 空白付きを同じモデルに畳まない (codex exec review #1591 Low)
+    model: rawField(req.body?.model, 80),
+    promptVersion: rawField(req.body?.prompt_version, 80),
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, generation_id: r.generation_id, packet_hash: r.packet_hash });
+});
+
+/**
+ * 実際に本回答を書いたモデルを付ける (codex exec review #1591 High)。
+ * 🚨 **miniPC のランナー (PowerShell) だけが呼ぶ**。./phlp にはこの口を呼ぶコマンドが無いので、
+ *    Claude (権限は ./phlp と ./phlpreview だけ) からは届かない。body: { runner_run_id, actual_models: [] }
+ */
+serviceApiRouter.post('/lp-compose/model-check', (req, res) => {
+  const r = recordLpComposeModelCheck(getDB(), {
+    runnerRunId: rawField(req.body?.runner_run_id, 100),
+    actualModels: req.body?.actual_models,
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json(r);
+});
+
+serviceApiRouter.post('/lp-compose/generations/:gid/result', (req, res) => {
+  const r = submitLpComposeResult(getDB(), lpIdParam(req.params.gid), {
+    packetHash: rawField(req.body?.packet_hash, 100),
+    verdict: cleanText(req.body?.verdict, 20),
+    output: req.body?.output,
+    lint: req.body?.lint,
+    reviewRounds: req.body?.review_rounds,
+    receipt: req.body?.receipt,
+    reason: cleanText(req.body?.reason, 1000),
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, status: r.status, already: !!r.already, receipt: r.receipt });
+});
+
+serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
+  const r = failLpComposeJob(getDB(), lpIdParam(req.params.id), {
+    leaseToken: rawField(req.body?.lease_token, 100),
+    code: cleanText(req.body?.code, 40), message: cleanText(req.body?.message, 500),
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, status: r.status });
+});
+
+// 構成を lint するだけ (結果は確定しない・PR1-c)。
+// 🚨 **AI 枠を消費しない**ので何度でも呼べる。実行役はこれを見て自分で直してから result を出す。
+// これが無いと result で断られて初めて lint 結果を知ることになり、generation を 1 回で使い切る
+serviceApiRouter.post('/lp-compose/jobs/:id/lint', express.json({ limit: '1mb' }), (req, res) => {
+  const r = lintLpComposeForJob(getDB(), lpIdParam(req.params.id), {
+    leaseToken: rawField(req.body?.lease_token, 100), output: req.body?.output,
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, lint: r.lint });
+});
+
+serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {
+  const r = releaseLpComposeJob(getDB(), lpIdParam(req.params.id), {
+    leaseToken: rawField(req.body?.lease_token, 100), reason: cleanText(req.body?.reason, 300),
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  res.json({ ok: true, status: r.status });
+});
+
+/**
+ * その依頼に固定した n 枚目 (1 始まり) の商品画像 (JPEG・幅 1024)。
+ * 🚨 fileId を外から受けない — packet に固定済みの images[n] だけを返す。
+ *    任意の ID を覗ける confused-deputy を作らないため (/api/thumb と同じ考え方)。
+ * 🚨 幅は 1024 固定。画面用の /api/thumb は 160/320 しか受けず、320px では AI が
+ *    ラベル文字や商品形状を判断できない (仕様書の「商品再現ルール」を守れない)。
+ *    画面用の THUMB_WIDTHS は触らない。
+ */
+serviceApiRouter.get('/lp-compose/jobs/:id/images/:n', async (req, res) => {
+  // 🚨 lease_token はヘッダで受ける — クエリに載せるとプロキシやアクセスログに
+  //    URL ごと残る (Codex API R1 #3)。資格情報を URL に載せない
+  const lease = rawField(req.get('X-LP-Compose-Lease'), 100);
+  const r = lpComposeImageRef(getDB(), lpIdParam(req.params.id), {
+    leaseToken: lease, index: lpIdParam(req.params.n) - 1,
+  });
+  if (!r.ok) return lpComposeFail(res, r);
+  try {
+    const { buf } = await getDriveThumbnail(r.file_id, LP_COMPOSE_IMAGE_WIDTH, r.version || '');
+    // 🚨 配ったことをここで記録する。証跡を実行役から受け取ると、
+    //    作業ディレクトリに Write できる Claude のセッションが偽造できた (codex exec review P1)。
+    // 🚨 Drive から落としている間に lease が切れて別の実行役が掴み直していたら、
+    //    記録も配布もしない。記録が**次の実行役のもの**になってしまう (codex exec review P2)
+    const rec = recordLpComposeImageServed(getDB(), lpIdParam(req.params.id), {
+      leaseToken: lease,
+      fileId: r.file_id,
+      sha256: crypto.createHash('sha256').update(buf).digest('hex'),
+      bytes: buf.length,
+    });
+    if (!rec.ok) return lpComposeFail(res, rec);
+    res.set('Content-Type', 'image/jpeg');
+    res.set('X-Content-Type-Options', 'nosniff');
+    // 🚨 no-store。URL が同じで lease をヘッダで渡すので、私有キャッシュを許すと
+    //    別の / 失効した lease にも画像を返してしまう (Codex API R3 #2)。
+    //    実行役は 1 回落とすだけなのでキャッシュの利き目は無い (サーバ内の thumbCache は効く)
+    res.set('Cache-Control', 'no-store');
+    res.set('Vary', 'X-LP-Compose-Lease');
+    res.send(buf);
+  } catch (e) {
+    const upstream = e?.code || e?.response?.status;
+    const status = upstream === 404 ? 404 : upstream === 403 ? 403 : 502;
+    console.error(`[product-hub] lp-compose image failed (${status}):`, r.file_id, String(e?.message || e).slice(0, 300));
+    res.status(status).json({ ok: false, code: 'image_unavailable', error: '商品画像を取得できませんでした' });
+  }
+});
+
+// 生成待ち一覧 (AI 生成の材料つき、読み取り専用 = プレビュー用)
+serviceApiRouter.get('/generation-queue', async (req, res, next) => {
+  try {
+    const db = getDB();
+    // キューは status='ready_for_ai' を見るので、切替バックフィル前の古い status のまま
+    // 拾い漏れ・拾い過ぎが起きないよう、AI キューの入口でも自己修復する
+    maybeBackfillDerivedStatus(db);
+    // drafts = 今 claim できるもの (人の確認待ちは含まない)。queue.blocked で人待ちの件数を別枠で返す
+    const drafts = listGenerationQueue(db);
+    res.json({ ok: true, drafts: await dropLegacyTaxUnlessOpen(drafts), queue: generationQueueSummary(db) });
+  } catch (e) { next(e); }   // async にしたので、誤りは今までどおり Express の誤りの扱いへ
 });
 
 // 生成対象の claim (2026-08-03、Codex設計相談 Critical 対応)。
@@ -3303,7 +4327,7 @@ serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
       for (const d of claimedList) d.sp_keywords_error = kwError;
     }
   }
-  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed, queue: generationQueueSummary(db) });
+  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: Array.isArray(r.claimed) ? await dropLegacyTaxUnlessOpen(r.claimed) : r.claimed, queue: generationQueueSummary(db) });
 });
 
 // claim の解放 (生成を断念した draft を他の実行がすぐ拾えるように)

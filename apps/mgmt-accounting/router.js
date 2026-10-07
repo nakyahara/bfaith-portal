@@ -16,6 +16,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pingJob } from '../jobs-monitor/ping-local.js';
+// 配送方法は NE 側で ID と名前が入れ替わることがある (AES → Amazon Easy Ship)。
+// 出荷件数ダッシュボードと同じ正規化を使って、切替日をまたいでも 1 本の系列で読めるようにする
+import { normalizeDelivery, GROUP_KEY_PREFIX } from '../shipping-log/delivery-groups.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -54,6 +57,16 @@ const HISTORICAL_SEED_PATH = path.join(__dirname, 'seed', 'historical-pl-seed.js
 // 運送会社・仕入先のプリセット（Excel「運賃集計」「輸出運賃」「梱包資材費」シートのヘッダーに合わせる）
 const CARRIERS = ['FBA運賃', 'Easy Ship運賃', 'RSL費用', 'ヤマト', 'ヤマト2', '佐川', '西濃', '福山通運', '郵便局（UPSIDER1）', '郵便局（UPSIDER2）', 'クリックポスト'];
 const EXPORT_CARRIERS = ['TNK運賃(輸出)', 'FBA運賃(輸出)'];
+
+// 出荷1件あたりの運賃を出すときの分子。分母は NE の伝票数 (mirror_shipments_daily) なので、
+// 「うちが伝票を作って発送した便」だけを足す。
+//   Easy Ship は NE に配送方法 (64 / 旧71) として伝票が立つのでこちら側。
+//   FBA運賃 (= Amazon の配送代行手数料) と RSL費用 (楽天スーパーロジ) は相手が発送する分で
+//   NE に伝票が立たない → 分子に入れると 1 件あたりが実際より高く出る。
+const SELF_SHIP_CARRIERS = ['Easy Ship運賃', 'ヤマト', 'ヤマト2', '佐川', '西濃', '福山通運', '郵便局（UPSIDER1）', '郵便局（UPSIDER2）', 'クリックポスト'];
+// 相手が発送する分 (件数と釣り合わないと分かっているもの)。これ以外の未知の carrier は
+// どちらとも言えないので画面に名前を出す (黙って落とすと単価が実際より安く見える)。
+const FULFILLMENT_CARRIERS = ['FBA運賃', 'RSL費用'];
 
 // Amazon ペイメント由来の自動運賃（売上同期で mart_amazon_monthly_summary.by_segment から投入。画面では読み取り専用・保存対象外）
 //   FBA運賃       = |Σ FBA手数料|             … Excel 旧運用踏襲（2026-04-20・§12）
@@ -988,7 +1001,10 @@ router.get('/api/historical', (req, res) => {
   // 途中・不完全な月（売上過少→粗利マイナス）がグラフに出るのを防ぐ。
   const months = db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed' ORDER BY year_month")
     .all().map(r => r.year_month).slice(-limit);
-  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [] });
+  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], plByMall: [], plByMallSegment: [], monthlyTotals: [], shipments: [],
+    shipments_from: null, shipments_through: null, shipments_partial_months: [], shipments_error: null,
+    shipments_by_delivery: [], delivery_keys: [],
+    fixed_costs: [], fixed_costs_error: null });
 
   const placeholders = months.map(() => '?').join(',');
 
@@ -1012,7 +1028,124 @@ router.get('/api/historical', (req, res) => {
     FROM mgmt_monthly_pl WHERE year_month IN (${placeholders})
     GROUP BY year_month, segment ORDER BY year_month`).all(...months);
 
-  res.json({ months, freight, material, sales, pl });
+  // PL：期間合計のモール×売上分類（色つきの表用）。月ごとではなく期間をまとめた断面
+  const plByMallSegment = db.prepare(`SELECT mall_id, segment, SUM(sales) as sales, SUM(gross_profit) as gross_profit
+    FROM mgmt_monthly_pl WHERE year_month IN (${placeholders})
+    GROUP BY mall_id, segment ORDER BY mall_id, segment`).all(...months);
+
+  // PL：月×モール（モール別の粗利率用）。mart_monthly_segment_sales には粗利が無いので
+  // 按分後の mgmt_monthly_pl から取る
+  const plByMall = db.prepare(`SELECT year_month, mall_id, SUM(sales) as sales, SUM(gross_profit) as gross_profit
+    FROM mgmt_monthly_pl WHERE year_month IN (${placeholders})
+    GROUP BY year_month, mall_id ORDER BY year_month`).all(...months);
+
+  // 月次合計：前年同月比とコスト構造の比率で使う。
+  // ここだけは表示期間(months)で絞らない — 直近12ヶ月を選んだときでも前年と比べられるようにするため。
+  // 月数ぶんの行しか返らない（数十行）ので、絞らなくても重くならない。
+  const monthlyTotals = db.prepare(`
+    SELECT c.year_month, c.fiscal_year, c.fiscal_month,
+      SUM(p.sales) AS sales, SUM(p.cost) AS cost, SUM(p.pf_fee) AS pf_fee,
+      SUM(p.ad_cost) AS ad_cost, SUM(p.freight) AS freight, SUM(p.material) AS material,
+      SUM(p.variable_cost) AS variable_cost, SUM(p.gross_profit) AS gross_profit
+    FROM mgmt_monthly_closing c
+    JOIN mgmt_monthly_pl p ON p.year_month = c.year_month
+    WHERE c.status = 'confirmed'
+    GROUP BY c.year_month, c.fiscal_year, c.fiscal_month
+    ORDER BY c.year_month`).all();
+
+  // 出荷件数 (NE 伝票ベース)。出荷1件あたりの運賃・資材費の分母。
+  // ship_date に substr を使うと idx_msd_date が効かないので範囲比較で引く。
+  // 同期前・テーブル初期化失敗の環境でもヒストリカル全体を落とさない (グラフ1枚が出ないだけ)。
+  let shipments = [];
+  let shipmentsFrom = null;      // 取り込めている最初の日
+  let shipmentsThrough = null;   // 取り込めている最後の日
+  let shipmentsPartialMonths = []; // 月の一部しか取り込めておらず、分母にできない月
+  let shipmentsError = null;
+  let shipmentsByDelivery = [];
+  let deliveryKeys = [];
+  try {
+    const range = db.prepare('SELECT MIN(ship_date) AS a, MAX(ship_date) AS b FROM mirror_shipments_daily').get();
+    shipmentsFrom = range?.a || null;
+    shipmentsThrough = range?.b || null;
+    const rows = db.prepare(`
+      SELECT substr(ship_date, 1, 7) AS year_month,
+        SUM(slips) AS slips, SUM(cancelled_slips) AS cancelled_slips
+      FROM mirror_shipments_daily
+      WHERE ship_date >= ? AND ship_date <= ?
+      GROUP BY 1 ORDER BY 1`).all(months[0] + '-01', months[months.length - 1] + '-31');
+    // 取り込みの両端の月は「月の一部しか無い」ことがある。月全額をその件数で割ると単価がずれる:
+    //   ・始まり側 = backfill が月の途中の日から取ることがある (--months 12 など) → 件数が少なく、単価は高く出る
+    //   ・終わり側 = 同期が止まっていても前回ぶんは残る → 同じく高く出る
+    // 始まりが月初 (-01) なら、その月はそろっているので残す。終わり側は月末まで届いたかを
+    // 判定できない (出荷の無い日が月末に来ることもある) ので、常に外す。
+    if (shipmentsFrom && !shipmentsFrom.endsWith('-01')) shipmentsPartialMonths.push(shipmentsFrom.slice(0, 7));
+    if (shipmentsThrough) {
+      const lastMonth = shipmentsThrough.slice(0, 7);
+      if (!shipmentsPartialMonths.includes(lastMonth)) shipmentsPartialMonths.push(lastMonth);
+    }
+    shipments = rows.filter(r => !shipmentsPartialMonths.includes(r.year_month));
+
+    // 配送区分別の件数。ID と名前の組を normalizeDelivery で畳んでから月ごとに足す
+    //   (畳まずに出すと、改名をまたいだ月で「旧区分が0件・新区分が別系列」になる)
+    const byDelivery = new Map();
+    const detail = db.prepare(`
+      SELECT substr(ship_date, 1, 7) AS year_month, delivery_id, delivery_name,
+        SUM(slips) AS slips, SUM(cancelled_slips) AS cancelled_slips
+      FROM mirror_shipments_daily
+      WHERE ship_date >= ? AND ship_date <= ?
+      GROUP BY 1, delivery_id, delivery_name`).all(months[0] + '-01', months[months.length - 1] + '-31');
+    for (const r of detail) {
+      if (shipmentsPartialMonths.includes(r.year_month)) continue; // 月の一部しか無い月は構成も出さない
+      const g = normalizeDelivery(r.delivery_id, r.delivery_name);
+      // 区分に畳まれた便はその区分キー。畳まれなかった便は (ID, 名前) の組で見分ける。
+      // ID だけにすると、NE が使わなくなった ID を別の便に使い回したときに
+      // 「41/旧便」と「41/別便」が 1 本の系列に混ざり、過去の件数まで後の名前で出てしまう
+      const seriesKey = g.key.startsWith(GROUP_KEY_PREFIX) ? g.key : JSON.stringify([g.id, g.name]);
+      const mapKey = r.year_month + '\u0000' + seriesKey;
+      const cur = byDelivery.get(mapKey) || { year_month: r.year_month, delivery_key: seriesKey, delivery_name: g.name, slips: 0, cancelled_slips: 0 };
+      cur.slips += r.slips || 0;
+      cur.cancelled_slips += r.cancelled_slips || 0;
+      byDelivery.set(mapKey, cur);
+    }
+    shipmentsByDelivery = [...byDelivery.values()].sort((a, b) =>
+      a.year_month.localeCompare(b.year_month) || a.delivery_key.localeCompare(b.delivery_key));
+
+    // 色を決めるための台紙。表示期間や「上位8便」の選び方で色が動かないよう、
+    // DB にある全部の配送方法から作る (期間で絞らない)
+    const allKeys = new Set();
+    for (const r of db.prepare('SELECT DISTINCT delivery_id, delivery_name FROM mirror_shipments_daily').all()) {
+      const g = normalizeDelivery(r.delivery_id, r.delivery_name);
+      allKeys.add(g.key.startsWith(GROUP_KEY_PREFIX) ? g.key : JSON.stringify([g.id, g.name]));
+    }
+    deliveryKeys = [...allKeys].sort();
+  } catch (e) {
+    console.warn('[mgmt-accounting] 出荷件数を読めなかった (1件あたり・配送方法のグラフだけ出ない):', e.message);
+    shipmentsError = String(e.message || e); // 「読めなかった」と「0件だった」を画面で分ける
+  }
+
+  // 固定費 = MF会計の販管費。B-Faith は「原価 = 変動費 / 販管費 = 固定費」で記帳していて、
+  // 広告宣伝費・支払手数料・システム利用料も【原価】と【固定費】に分けて入れている。
+  // そのため、この画面の変動費 (原価・PF手数料・広告費・運賃・資材費 = MF の cogs_*) と
+  // 二重に数えることにはならない。exec-dashboard と同じ「最新の成功した取り込み」を見る。
+  let fixedCosts = [];
+  let fixedCostsError = null;
+  try {
+    fixedCosts = db.prepare(`
+      SELECT month_ym AS year_month, SUM(amount_excl_tax) AS amount
+      FROM v_mirror_mf_pl_monthly_latest
+      WHERE role_key LIKE 'sgae\\_%' ESCAPE '\\'
+        AND month_ym >= ? AND month_ym <= ?
+      GROUP BY month_ym ORDER BY month_ym`).all(months[0], months[months.length - 1]);
+  } catch (e) {
+    console.warn('[mgmt-accounting] 固定費 (MF販管費) を読めなかった (損益分岐点のグラフだけ出ない):', e.message);
+    fixedCostsError = String(e.message || e);
+  }
+
+  res.json({ months, freight, material, sales, pl, plByMall, plByMallSegment, monthlyTotals, shipments,
+    shipments_from: shipmentsFrom, shipments_through: shipmentsThrough,
+    shipments_partial_months: shipmentsPartialMonths, shipments_error: shipmentsError,
+    shipments_by_delivery: shipmentsByDelivery, delivery_keys: deliveryKeys,
+    fixed_costs: fixedCosts, fixed_costs_error: fixedCostsError });
 });
 
 // 利用可能な会計年度一覧
@@ -1070,6 +1203,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 8px 10px; text-align: right; border-bottom: 1px solid #eee; }
 th { background: #f8f9fa; font-weight: 600; position: sticky; top: 0; color: #555; }
+/* 色つきの表 (モール×売上分類) はマス目として読むので、縦にも罫線を入れる。
+   見出しの sticky は縦に長い表のためのものなので、ここでは切る (行見出しが浮くと読みにくい) */
+#heatTable th, #heatTable td { border-right: 1px solid #e8eaed; position: static; }
+#heatTable td { line-height: 1.35; }
 td:first-child, th:first-child { text-align: left; }
 tr:hover { background: #f0f4ff; }
 .input-amount { width: 120px; padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; text-align: right; font-size: 13px; }
@@ -1245,8 +1382,79 @@ tr:hover { background: #f0f4ff; }
     <div style="position:relative;height:320px;"><canvas id="chartSales"></canvas></div>
   </div>
   <div class="card">
+    <h3>📊 売上構成の推移（100%） <span id="salesMixInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <label style="font-size:13px;color:#666">分け方:</label>
+      <select id="salesMixBy" onchange="renderSalesMixChart()">
+        <option value="mall">モール別</option>
+        <option value="segment">売上分類別</option>
+      </select>
+    </div>
+    <div style="position:relative;height:320px;"><canvas id="chartSalesMix"></canvas></div>
+    <div class="note-text">上の売上推移は金額なので、全体が伸びると全部の帯が伸びて「どこに寄っているか」が分かりにくい。ここでは毎月を100%にして構成だけを見る。楽天への偏りが減ったか、新しいモールが育っているかを追うための図。<b>金額は分からない</b>ので、規模はカーソルを合わせて見ること。その月に行が無いモール・分類は 0% として扱う。<b>構成として読めない月は帯を出さず空ける</b>（集計がまだ無い月／返品などで売上がマイナスの分類がある月／合計が0以下の月）。理由は見出しに出す。</div>
+  </div>
+  <div class="card">
+    <h3>📅 前年同月比（期ごとに重ねる）</h3>
+    <div style="margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <label style="font-size:13px;color:#666">見る数字:</label>
+      <select id="yoyMetric" onchange="renderYoyChart()">
+        <option value="sales">売上</option>
+        <option value="gross_profit">粗利益</option>
+        <option value="gross_margin">粗利率</option>
+      </select>
+      <span id="yoyInfo" style="color:#666;font-size:13px"></span>
+    </div>
+    <div style="position:relative;height:320px;"><canvas id="chartYoy"></canvas></div>
+    <div class="note-text">横軸は決算期の月（7月始まり）。同じ月の位置で期どうしを重ねるので、季節の山谷に関係なく去年より伸びているかが分かる。薄い緑の棒が当期の前年同月比（右目盛り）。<b>このグラフだけは上の「表示期間」を見ず、いつも直近3期を描く</b>（前年と比べるため）。前年が0以下の月は比率が読み違いのもとなので出さない。粗利率のときだけは比率ではなく引き算（ポイント差）なので、前年がマイナスでも出す。</div>
+  </div>
+  <div class="card">
     <h3>📊 月次粗利益・粗利率推移</h3>
     <div style="position:relative;height:320px;"><canvas id="chartProfit"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>🏬 モール別の粗利率 <span id="mallMarginInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartMallMargin"></canvas></div>
+    <div class="note-text">上の粗利率は全体を 1 本にまとめたものなので、どのモールが下がっているかが分からない。ここではモール別に分けて出す。太い灰色の破線が全体（米国Amazon も含む）。<b>売上の小さいモールは率が大きく振れる</b>ので、カーソルを合わせて売上の額も見ること。売上が 0 以下の月は率を出せないので線が途切れる。
+    <br><b>この率は運賃・資材費を売上で按分したあとの数字。</b>あるモールで共通の運賃・資材費が増えると、売上の比で配り直されるので他のモールの率にも影響する（上がることも下がることもある）。<b>どのモールの費用が増えたのかまでは、このグラフでは分からない</b>（費目ごとの内訳を見る必要がある）。※ 米国Amazon は運賃の付け方が国内と違う（輸出専用の運賃だけを当てている）ので、他と優劣を比べられない。</div>
+  </div>
+  <div class="card">
+    <h3>🪜 売上から粗利まで（1ヶ月の内訳） <span id="waterfallInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <label style="font-size:13px;color:#666">月:</label>
+      <select id="waterfallMonth" onchange="renderWaterfallChart()"></select>
+    </div>
+    <div style="position:relative;height:340px;"><canvas id="chartWaterfall"></canvas></div>
+    <div class="note-text">売上から何にいくら持っていかれて、粗利がいくら残ったかを 1 ヶ月ぶん並べたもの。会議で「どこを削ると効くか」を話すときの図。棒の下は 名前 / 金額 / 売上に対する割合。費目がマイナス（返金など）の月は「＋」で出る。</div>
+  </div>
+  <div class="card">
+    <h3>📐 コスト構造の比率（売上を100%としたときの内訳） <span id="costMixInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartCostMix"></canvas></div>
+    <div class="note-text">金額ではなく率で見るグラフ。売上が伸びれば費目の金額も増えるので、金額の棒だけでは良し悪しが分からない。率が悪化していれば原因は手数料・運賃・広告・原価の側にある。緑（粗利）の帯が細っていく月が要注意。灰色の「差額」が出る月は、費目と粗利を足しても売上に届いていない月（過去の初期データはこうなることがある）。</div>
+  </div>
+  <div class="card">
+    <h3>📣 広告費と粗利率 <span id="adEffectInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartAdEffect"></canvas></div>
+    <div class="note-text">広告費をどれだけ使い、率としてどう動いたかを並べる図。薄い黄色の棒が広告費の金額（左目盛り）、線が 広告費率 と 粗利率（右目盛り）。<b>広告費は変動費として粗利から引いている</b>ので、広告を増やせば粗利率はその分下がるのが基本。
+    <br>広告費率の上がり幅より粗利率の下がり幅が小さければ、<b>広告費を除いた粗利率（カーソルを合わせると出る）が上がった</b>ということ。<b>それは「広告で売上が増えた」という意味ではない</b>（売上が減っていても、原価率が下がれば同じ形になる）。金額がどう動いたかは上の売上・粗利のグラフと合わせて見ること。
+    <br>右の目盛りは0起点に固定していない（率どうしの変化の幅を比べる図なので）。率そのものの大きさは目盛りの数字を見ること。棒と線の高さの上下関係には意味がない。<b>広告費の入力漏れは画面から見分けられない</b>（0円として入る）。</div>
+  </div>
+  <div class="card">
+    <h3>📦 出荷1件あたりの運賃・資材費 <span id="unitCostInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartUnitCost"></canvas></div>
+    <div class="note-text" id="unitCostNote">運賃が増えた月に「値上げされたのか、物量が増えただけか」を切り分けるグラフ。棒が出荷件数（左目盛り）、線が1件あたりの金額（右目盛り・税抜 = 入力画面の税込金額 ÷ 1.1）。件数が増えていないのに線が上がっていたら、<b>値上げ・配送方法の構成が変わった・費用を計上した月がずれた</b>のどれかを疑う（平均なので、大きい箱や遠方の比率が増えただけでも上がる）。分母は NE の伝票数（出荷確定ぶんからキャンセルを引いた数）。FBA手数料と RSL費用は相手が発送する分で伝票が立たないため、1件あたりの分子には入れていない。出荷件数や費目が入っていない月は、0円にせず線を途切れさせている。運賃の入力が途中の月は単価が実際より安く出る（確定済みの月だけを描いているが、入力漏れまでは見分けられない）。</div>
+    <div class="note-text" id="unitCostWarn" style="color:#c5221f"></div>
+  </div>
+  <div class="card">
+    <h3>🚛 配送方法の構成（出荷件数） <span id="deliveryMixInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartDeliveryMix"></canvas></div>
+    <div class="note-text">毎月の出荷件数を100%にして、どの便で出したかの内訳を見る。安い便（メール便・クリックポストなど）に寄せられているか、上の「1件あたり運賃」が下がった理由が構成の変化なのかを見るための図。件数は NE の伝票数（出荷確定ぶんからキャンセルを引いた数）。<b>運賃の金額とは突き合わせていない</b>（入力の運送会社と NE の配送方法は名前が別で、対応表が無い）。取り込みが月の一部しか無い月は空ける。</div>
+    <div class="note-text" id="deliveryMixWarn" style="color:#888"></div>
+  </div>
+  <div class="card">
+    <h3>⚖️ モール売上だけで固定費をまかなえるか <span id="breakEvenInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartBreakEven"></canvas></div>
+    <div class="note-text" id="breakEvenNote">棒が実際の売上、赤い線が「モール売上だけで全社の固定費をまかなうのに必要な売上」（固定費 ÷ モールの粗利率）。線を超えていればモールだけで固定費をまかなえている。固定費は MF会計の販売費及び一般管理費（B-Faith は「原価＝変動費／販管費＝固定費」で記帳しているので、この画面の変動費と二重に数えていない）。<b>これは会社全体の損益分岐点ではない。</b>卸など他の事業の利益・損失を入れていないので、全社の損益分岐点より高く出ることも低く出ることもある（他事業の粗利率しだい）。MF会計の営業利益とも一致しない。賞与を払った月などは固定費が増え、その月だけ線が跳ね上がる。</div>
+    <div class="note-text" id="breakEvenWarn" style="color:#888"></div>
   </div>
   <div class="card">
     <h3>🚚 月次運賃推移（運送会社別）</h3>
@@ -1255,6 +1463,11 @@ tr:hover { background: #f0f4ff; }
   <div class="card">
     <h3>📦 月次資材費推移（仕入先別）</h3>
     <div style="position:relative;height:320px;"><canvas id="chartMaterial"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>🔥 モール×売上分類の粗利率 <span id="heatInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div id="heatTable" style="overflow-x:auto"></div>
+    <div class="note-text">表示期間をまとめた断面。どのモールのどの分類に手を入れるかを決めるための表。<b>赤いマスほど粗利率が低い</b>（0%未満は濃い赤、基準より低いと薄い赤、基準ちょうどは色なし、高いと緑）。基準はふだん全体の粗利率で、全体が赤字のときは 0%。マスの下の数字はその組み合わせの売上。<b>売上が小さいマスは率が大きく振れる</b>ので、率だけで決めないこと。運賃・資材費は売上で按分したあとの数字なので、<b>そのマスの費用が多いとは限らない</b>。※ の付いた行（米国Amazon）は運賃の付け方が国内と違う（輸出専用の運賃だけを当てている）ので、<b>他の行と色を見比べても意味がない</b>。売上が0以下のマスは率を出せないので空欄。</div>
   </div>
   <div class="card">
     <h3>🥧 セグメント別売上シェア（直近月）</h3>
@@ -1273,6 +1486,8 @@ const CARRIERS = ${JSON.stringify(CARRIERS)};
 const AUTO_FREIGHT = ${JSON.stringify(AUTO_FREIGHT)}; // 自動運賃 (FBA運賃 / Easy Ship運賃): 読み取り専用・保存対象外
 const EXPORT_CARRIERS = ${JSON.stringify(EXPORT_CARRIERS)};
 const SUPPLIERS = ${JSON.stringify(SUPPLIERS)};
+const SELF_SHIP_CARRIERS = ${JSON.stringify(SELF_SHIP_CARRIERS)};
+const FULFILLMENT_CARRIERS = ${JSON.stringify(FULFILLMENT_CARRIERS)};
 
 // ─── ユーティリティ ───
 const fmt = n => (n || 0).toLocaleString('ja-JP');
@@ -1780,6 +1995,24 @@ async function loadAnnualPL() {
 const CHART_COLORS = ['#1a73e8', '#ea4335', '#fbbc04', '#34a853', '#ff6d01', '#46bdc6', '#9334e8', '#b31412', '#7cb342', '#d81b60', '#00acc1', '#5e35b1', '#8e24aa', '#039be5', '#43a047'];
 const _charts = {};
 
+// 前年同月比 / コスト構造の比率が使う月次合計。指標の切替（売上⇔粗利⇔粗利率）を
+// 再取得なしで描き直せるよう、loadHistorical が取った結果をここに置く。
+let _monthlyTotals = [];
+let _histMonthSet = new Set();
+
+// 会計月 (1 = 7月) の表示ラベル
+const FISCAL_MONTH_LABELS = ['7月', '8月', '9月', '10月', '11月', '12月', '1月', '2月', '3月', '4月', '5月', '6月'];
+
+// コスト構造の帯。この並び順がそのまま下から上への積み上げ順になる
+const COST_MIX_PARTS = [
+  { key: 'cost', label: '原価', color: '#5f6368' },
+  { key: 'pf_fee', label: 'PF手数料', color: '#1a73e8' },
+  { key: 'ad_cost', label: '広告費', color: '#fbbc04' },
+  { key: 'freight', label: '運賃', color: '#ff6d01' },
+  { key: 'material', label: '資材費', color: '#9334e8' },
+  { key: 'gross_profit', label: '粗利', color: '#34a853' },
+];
+
 function destroyChart(key) {
   if (_charts[key]) { _charts[key].destroy(); delete _charts[key]; }
 }
@@ -1814,9 +2047,25 @@ async function loadHistorical() {
 
   if (!data.months || data.months.length === 0) {
     document.getElementById('histInfo').textContent = 'データがありません';
+    // 前回描いたグラフが残ると「古い数字が今のもの」に見えるので消す
+    _monthlyTotals = [];
+    _histMonthSet = new Set();
+    renderYoyChart();
+    renderSalesMixChart(data);
+    renderMallMarginChart(data);
+    fillWaterfallMonths();
+    renderWaterfallChart();
+    renderCostMixChart();
+    renderAdEffectChart(data);
+    renderHeatmap(data);
+    renderUnitCostChart(data);
+    renderDeliveryMixChart(data);
+    renderBreakEvenChart(data);
     return;
   }
   document.getElementById('histInfo').textContent = data.months[0] + ' 〜 ' + data.months[data.months.length - 1] + '（' + data.months.length + 'ヶ月）';
+  _monthlyTotals = data.monthlyTotals || [];
+  _histMonthSet = new Set(data.months);
 
   // サマリー: 期間合計
   const totalSales = data.sales.reduce((s, r) => s + (r.sales || 0), 0);
@@ -1865,11 +2114,11 @@ async function loadHistorical() {
     data: {
       labels: plGrp.months,
       datasets: [
-        ...plGrp.keys.map((k, i) => ({
+        ...plGrp.keys.map((k) => ({
           type: 'bar',
           label: (SEGMENT_NAMES[k] || 'seg' + k) + ' 粗利',
           data: plGrp.data[k],
-          backgroundColor: CHART_COLORS[i % CHART_COLORS.length],
+          backgroundColor: segmentColor(k), // 売上構成・円グラフと同じ色で同じ分類を指す
           yAxisID: 'y',
           stack: 'gp',
         })),
@@ -1949,7 +2198,7 @@ async function loadHistorical() {
         labels: latestSeg.map(r => SEGMENT_NAMES[r.segment] || 'seg' + r.segment),
         datasets: [{
           data: latestSeg.map(r => r.sales),
-          backgroundColor: CHART_COLORS,
+          backgroundColor: latestSeg.map(r => segmentColor(r.segment)), // 売上構成の帯と同じ色
         }],
       },
       options: {
@@ -1962,6 +2211,1149 @@ async function loadHistorical() {
       },
     });
   }
+
+  // ⑥ 前年同月比 / ⑦ コスト構造の比率（どちらも monthlyTotals から描く）
+  renderYoyChart();
+  renderSalesMixChart(data);
+  renderMallMarginChart(data);
+  fillWaterfallMonths();
+  renderWaterfallChart();
+  renderCostMixChart();
+  renderAdEffectChart(data);
+  renderHeatmap(data);
+  // ⑧ 出荷1件あたりの運賃・資材費 / ⑨ 損益分岐点
+  renderUnitCostChart(data);
+  renderDeliveryMixChart(data);
+  renderBreakEvenChart(data);
+}
+
+// 🚛 配送方法の構成 — 1 件あたり運賃が動いたとき、便の構成が変わっただけかを見る
+const DELIVERY_MIX_TOP = 8;       // これより多い便は「その他」にまとめる (凡例が読めなくなるため)
+const DELIVERY_OTHER_KEY = '__other__';
+function renderDeliveryMixChart(data) {
+  destroyChart('deliveryMix');
+  const info = document.getElementById('deliveryMixInfo');
+  const warn = document.getElementById('deliveryMixWarn');
+  const months = data.months || [];
+  const rows = data.shipments_by_delivery || [];
+
+  // 注意書きは描けるかどうかに関わらず先に書き換える (前の回の文言が残らないように)
+  const partial = data.shipments_partial_months || [];
+  const msgs = [];
+  if (data.shipments_error) msgs.push('出荷件数を読めませんでした（' + data.shipments_error + '）。');
+  else if (partial.length) msgs.push(partial.join('・') + ' は取り込みが月の一部しか無いので空けている。');
+  warn.textContent = msgs.join(' ');
+
+  if (months.length === 0) { info.textContent = 'データがありません'; return; }
+
+  const byKey = {};
+  const nameOf = {};
+  const totalByMonth = {};
+  // API は最初と最後の確定月のあいだを範囲で引くので、途中の未確定月の行も混ざる。
+  // 表示しない月の行から便の一覧を作ると、どの月も 0% の系列が凡例に出る
+  const monthSet = new Set(months);
+  for (const r of rows) {
+    if (!monthSet.has(r.year_month)) continue;
+    const k = r.delivery_key;
+    nameOf[k] = r.delivery_name;
+    const n = Math.max(0, (r.slips || 0) - (r.cancelled_slips || 0));
+    if (!byKey[k]) byKey[k] = {};
+    byKey[k][r.year_month] = (byKey[k][r.year_month] || 0) + n;
+    totalByMonth[r.year_month] = (totalByMonth[r.year_month] || 0) + n;
+  }
+
+  // 期間の件数が多い便から。同数ならキー順にして並びを固定する
+  const sumOf = (k) => months.reduce((acc, ym) => acc + (byKey[k][ym] || 0), 0);
+  const ranked = Object.keys(byKey).sort((a, b) => (sumOf(b) - sumOf(a)) || a.localeCompare(b));
+  const shown = ranked.slice(0, DELIVERY_MIX_TOP);
+  const rest = ranked.slice(DELIVERY_MIX_TOP);
+  if (rest.length > 0) {
+    byKey[DELIVERY_OTHER_KEY] = {};
+    for (const ym of months) {
+      // 行があって正味 0 件 (全部キャンセル) の月と、行が無い月を分ける。
+      // v > 0 だけを入れると、まとめた便だけ「この月の行なし」と出てしまう
+      if (!rest.some(k => byKey[k][ym] !== undefined)) continue;
+      byKey[DELIVERY_OTHER_KEY][ym] = rest.reduce((acc, k) => acc + (byKey[k][ym] || 0), 0);
+    }
+    nameOf[DELIVERY_OTHER_KEY] = 'その他 ' + rest.length + '便';
+    shown.push(DELIVERY_OTHER_KEY);
+  }
+
+  // 構成を出せない月は帯を出さず、横軸からは詰めない (上の件数グラフと月の位置を揃える)
+  const skipped = { noRows: 0, zero: 0 };
+  const monthOk = months.map(ym => {
+    if (totalByMonth[ym] === undefined) { skipped.noRows++; return false; }
+    if (!(totalByMonth[ym] > 0)) { skipped.zero++; return false; }
+    return true;
+  });
+  const usableCount = monthOk.filter(Boolean).length;
+  const why = [];
+  if (skipped.noRows) why.push('出荷件数が無い ' + skipped.noRows + 'ヶ月');
+  if (skipped.zero) why.push('件数が0 ' + skipped.zero + 'ヶ月');
+  if (usableCount === 0) {
+    info.textContent = '構成を出せる月がありません' + (why.length ? '（' + why.join(' / ') + '）' : '');
+    return;
+  }
+  info.textContent = usableCount + 'ヶ月分 / ' + ranked.length + '便'
+    + (why.length ? '（出せないので空けている: ' + why.join(' / ') + '）' : '');
+
+  // 色は名前から決めるが、15 色しかないので別の便に同じ色が当たりうる。隣り合うと
+  // 境目が消えて 1 本の帯に見えるので、使用済みの色は 1 つずらす。
+  // 🚨ずらす相手は「DB にある全部の配送方法」をキーの辞書順に並べたもの。
+  // 表示する便だけを相手にすると、期間を変えて便の顔ぶれが変わったときに色が動き、
+  // 切り替えながら見ると別の便を同じ色で追ってしまう
+  const usedColors = new Set(['#9aa0a6']); // 「その他」の灰色
+  const colorByKey = {};
+  const palette = (data.delivery_keys || []).slice().sort();
+  for (const k of palette) {
+    if (k === DELIVERY_OTHER_KEY) continue;
+    let c = keyColor(k);
+    for (let n = 0; n < CHART_COLORS.length && usedColors.has(c); n++) {
+      c = CHART_COLORS[(CHART_COLORS.indexOf(c) + 1) % CHART_COLORS.length];
+    }
+    usedColors.add(c);
+    colorByKey[k] = c;
+  }
+  const datasets = shown.map(k => ({
+    label: nameOf[k],
+    data: months.map((ym, i) => (monthOk[i] ? (byKey[k][ym] || 0) / totalByMonth[ym] * 100 : null)),
+    counts: months.map(ym => byKey[k][ym] ?? null), // 率だけだと規模が分からないので件数も持つ
+    // 台紙に無いキー (取り込みの直後など) は名前から決めた色をそのまま使う
+    backgroundColor: k === DELIVERY_OTHER_KEY ? '#9aa0a6' : (colorByKey[k] || keyColor(k)),
+    borderColor: '#fff', // 同じ色が隣り合っても境目が見えるように
+    borderWidth: 1,
+  }));
+
+  _charts.deliveryMix = new Chart(document.getElementById('chartDeliveryMix'), {
+    type: 'bar',
+    data: { labels: months, datasets },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      // 件数が無い便は高さ0の帯になり、既定の当たり判定ではホバーできない
+      interaction: { mode: 'index', intersect: false },
+      // 100% 積み上げなので目盛りの上は 100 で足りる。suggested にしておくのは、
+      // 丸めで 100.1% になる月があっても上が切れないようにするため
+      scales: { x: { stacked: true }, y: { stacked: true, suggestedMax: 100, ticks: { callback: v => v.toFixed(0) + '%' } } },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const c = ctx.dataset.counts[ctx.dataIndex];
+              return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '%'
+                + (c === null ? '（この月の行なし）' : '（' + fmt(c) + '件）');
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+// ⑨ 損益分岐点 — モール売上が固定費をまかなえているか
+function renderBreakEvenChart(data) {
+  destroyChart('breakEven');
+  const info = document.getElementById('breakEvenInfo');
+  const warn = document.getElementById('breakEvenWarn');
+  const months = data.months || [];
+
+  const fixedByMonth = {};
+  for (const r of (data.fixed_costs || [])) fixedByMonth[r.year_month] = r.amount || 0;
+  const totalByMonth = {};
+  for (const t of _monthlyTotals) totalByMonth[t.year_month] = t;
+
+  // 線 = 固定費 ÷ 粗利率。粗利率が 0 以下の月は計算できない (割ると符号が逆転して負の線になる)。
+  // 出せない月は理由を数えておく。ひとまとめに「出していない」と書くと、取り込み漏れなのか
+  // 採算の問題なのかが分からなくなる。
+  const salesLine = [];
+  const bepLine = [];
+  const detail = [];
+  const skipped = { noPl: 0, noSales: 0, noFixed: 0, noMargin: 0 };
+  for (const m of months) {
+    const t = totalByMonth[m];
+    const fixed = fixedByMonth[m];
+    salesLine.push(t ? t.sales : null);
+    let reason = null;
+    if (!t) reason = 'noPl';
+    else if (!(t.sales > 0)) reason = 'noSales';
+    else if (fixed === undefined) reason = 'noFixed';
+    else if (!(t.gross_profit > 0)) reason = 'noMargin';
+    if (reason) {
+      skipped[reason]++;
+      bepLine.push(null);
+      detail.push(null);
+      continue;
+    }
+    const rate = t.gross_profit / t.sales;
+    const bep = fixed / rate;
+    bepLine.push(bep);
+    detail.push({ fixed, rate, bep, sales: t.sales, left: t.gross_profit - fixed });
+  }
+
+  const usable = detail.filter(d => d !== null).length;
+  const msgs = [];
+  if (data.fixed_costs_error) {
+    msgs.push('固定費 (MF会計の販管費) を読めませんでした（' + data.fixed_costs_error + '）。');
+  } else {
+    const parts = [];
+    if (skipped.noFixed) parts.push('MF会計の販管費がまだ無い ' + skipped.noFixed + 'ヶ月');
+    if (skipped.noMargin) parts.push('粗利が0以下で割れない ' + skipped.noMargin + 'ヶ月');
+    if (skipped.noSales) parts.push('売上が0 ' + skipped.noSales + 'ヶ月');
+    if (skipped.noPl) parts.push('集計がまだ無い ' + skipped.noPl + 'ヶ月');
+    if (parts.length) msgs.push('線を出していない月: ' + parts.join(' / ') + '。');
+  }
+  warn.textContent = msgs.join(' ');
+
+  // 線を 1 本も引けなくても、売上があるなら棒は描く。棒まで消すと「売上のデータが無い」と読まれる
+  const hasSales = salesLine.some(v => v !== null && v > 0);
+  if (usable === 0 && !hasSales) {
+    info.textContent = data.fixed_costs_error ? '固定費を読めませんでした'
+      : (data.fixed_costs || []).length === 0 ? '固定費のデータがない期間です'
+      : '線を引ける月がありません';
+    return;
+  }
+
+  if (usable === 0) {
+    info.textContent = data.fixed_costs_error ? '固定費を読めませんでした（売上だけ表示）'
+      : (data.fixed_costs || []).length === 0 ? '固定費のデータがないため売上だけ表示'
+      : '線を引ける月がないため売上だけ表示';
+  } else {
+    // 直近の、線を引けた月で「足りているか」を一言にする
+    let lastIdx = -1;
+    for (let i = detail.length - 1; i >= 0; i--) { if (detail[i]) { lastIdx = i; break; } }
+    const d = detail[lastIdx];
+    const diff = d.sales - d.bep;
+    info.textContent = months[lastIdx] + ' はこの線を ' + fmt(Math.abs(Math.round(diff))) + '円 '
+      + (diff >= 0 ? '上回っている' : '下回っている') + '（' + usable + 'ヶ月分）';
+  }
+
+  _charts.breakEven = new Chart(document.getElementById('chartBreakEven'), {
+    data: {
+      labels: months,
+      datasets: [
+        {
+          type: 'bar',
+          label: '売上（モール）',
+          data: salesLine,
+          backgroundColor: 'rgba(26,115,232,0.25)',
+          borderColor: 'rgba(26,115,232,0.5)',
+          borderWidth: 1,
+        },
+        {
+          type: 'line',
+          label: 'モール売上だけで固定費をまかなう線',
+          data: bepLine,
+          detail,
+          borderColor: '#d93025',
+          backgroundColor: 'transparent',
+          borderWidth: 3,
+          tension: 0.2,
+          spanGaps: false,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: { y: { beginAtZero: true, ticks: { callback: v => fmt(v) }, title: { display: true, text: '円（税抜）' } } },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            // 「何を何で割った数か」と「足りているか」を同じ吹き出しに出す
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              if (v === null || v === undefined) return ctx.dataset.label + ': -';
+              if (ctx.dataset.type === 'bar') return ctx.dataset.label + ': ' + fmt(Math.round(v)) + '円';
+              const dd = ctx.dataset.detail[ctx.dataIndex];
+              if (!dd) return ctx.dataset.label + ': -';
+              const over = dd.sales - dd.bep;
+              return [
+                'この月に要るモール売上: ' + fmt(Math.round(dd.bep)) + '円',
+                '　固定費 ' + fmt(Math.round(dd.fixed)) + '円 ÷ 粗利率 ' + (dd.rate * 100).toFixed(1) + '%',
+                '　売上は ' + fmt(Math.abs(Math.round(over))) + '円 ' + (over >= 0 ? '上回っている' : '下回っている'),
+                '　固定費を引いた残り: ' + fmt(Math.round(dd.left)) + '円',
+              ];
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+// ⑧ 出荷1件あたりの運賃・資材費 — 金額が増えたのが「単価」か「物量」かを切り分ける
+function renderUnitCostChart(data) {
+  destroyChart('unitCost');
+  const info = document.getElementById('unitCostInfo');
+  const months = data.months || [];
+
+  // 分母: NE の伝票数。出荷確定ぶんからキャンセル (内数) を引く
+  const shipByMonth = {};
+  for (const r of (data.shipments || [])) {
+    shipByMonth[r.year_month] = Math.max(0, (r.slips || 0) - (r.cancelled_slips || 0));
+  }
+
+  // 分子: うちが発送した便の運賃 (税抜)。輸出専用など shared でない行は按分の外なので除く
+  const freightByMonth = {};
+  const unclassified = new Set();
+  const incompleteMonths = new Set(); // 分子が欠けている月 (運賃の単価を出してはいけない月)
+  for (const r of (data.freight || [])) {
+    if (r.cost_scope !== 'shared') continue;
+    if (SELF_SHIP_CARRIERS.includes(r.carrier)) {
+      freightByMonth[r.year_month] = (freightByMonth[r.year_month] || 0) + (r.amount || 0);
+    } else if (!FULFILLMENT_CARRIERS.includes(r.carrier) && (r.amount || 0) !== 0) {
+      // 自社発送か相手発送かが決まっていない便。その金額だけ分子から落とすと単価が実際より
+      // 安く出て、「安くなった」と読まれたまま誰も気づかない → その月は単価そのものを出さない
+      unclassified.add(r.carrier);
+      incompleteMonths.add(r.year_month);
+    }
+  }
+  const materialByMonth = {};
+  for (const r of (data.material || [])) {
+    materialByMonth[r.year_month] = (materialByMonth[r.year_month] || 0) + (r.amount || 0);
+  }
+
+  // 注意書きは、グラフを描けるかどうかに関わらず先に書き換える。描けない回で return してしまうと、
+  // 前に描いたときの取り込み日や便名が残って、今のデータの話として読まれる。
+  const warn = document.getElementById('unitCostWarn');
+  if (warn) {
+    const msgs = [];
+    if (data.shipments_through) {
+      const partial = data.shipments_partial_months || [];
+      msgs.push('出荷件数は ' + (data.shipments_from || '?') + ' 〜 ' + data.shipments_through + ' を取り込み済み。'
+        + (partial.length ? partial.join('・') + ' は月の一部しか無いので分母にしていない。' : ''));
+    }
+    if (unclassified.size > 0) {
+      msgs.push([...unclassified].join('・') + ' は自社発送か相手発送かが決まっていないため、その便があった月の運賃は出していない。');
+    }
+    warn.textContent = msgs.join(' ');
+    // 取り込み日の案内はただの説明。手を打つ必要があるのは分類できない便があるときだけなので、そこだけ赤
+    warn.style.color = unclassified.size > 0 ? '#c5221f' : '#888';
+  }
+
+  // 件数は「わからない (null)」と「0件」を分ける。0件の月は棒に 0 を出し、単価は割れないので出さない
+  const counts = months.map(m => (m in shipByMonth ? shipByMonth[m] : null));
+  if (!counts.some(v => v !== null)) {
+    info.textContent = data.shipments_error
+      ? '出荷件数を読めませんでした（' + data.shipments_error + '）'
+      : '出荷件数のデータがない期間です';
+    return;
+  }
+  // 分子が欠けている月は単価を出さない。少なく出すと「安くなった」と読まれて誰も気づかない。
+  //   ・行が 1 つも無い月 = 未入力
+  //   ・合計が 0 以下の月 = 出荷があるのに運賃・資材費が 0 は実務上ないので、入っていないとみなす
+  //   ・分類できない便があった月 (運賃だけ)
+  const perSlip = (byMonth, skip) => months.map(m => {
+    const c = shipByMonth[m];
+    if (!(c > 0)) return null;
+    if (skip && skip.has(m)) return null;
+    const v = byMonth[m];
+    return v === undefined || v <= 0 ? null : v / c;
+  });
+  const freightPer = perSlip(freightByMonth, incompleteMonths);
+  const materialPer = perSlip(materialByMonth, null);
+
+  const known = counts.filter(v => v !== null).length;
+  info.textContent = known + 'ヶ月分';
+
+  _charts.unitCost = new Chart(document.getElementById('chartUnitCost'), {
+    data: {
+      labels: months,
+      datasets: [
+        {
+          type: 'bar',
+          label: '出荷件数',
+          data: counts,
+          backgroundColor: 'rgba(26,115,232,0.2)',
+          borderColor: 'rgba(26,115,232,0.5)',
+          borderWidth: 1,
+          yAxisID: 'y',
+        },
+        {
+          type: 'line',
+          label: '1件あたり運賃',
+          data: freightPer,
+          amounts: months.map(m => freightByMonth[m] ?? null),
+          counts,
+          borderColor: '#ff6d01',
+          backgroundColor: 'transparent',
+          borderWidth: 3,
+          tension: 0.2,
+          yAxisID: 'y1',
+          spanGaps: false,
+        },
+        {
+          type: 'line',
+          label: '1件あたり資材費',
+          data: materialPer,
+          amounts: months.map(m => materialByMonth[m] ?? null),
+          counts,
+          borderColor: '#9334e8',
+          backgroundColor: 'transparent',
+          borderWidth: 2,
+          tension: 0.2,
+          yAxisID: 'y1',
+          spanGaps: false,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: {
+        y: { position: 'left', beginAtZero: true, title: { display: true, text: '出荷件数（伝票）' }, ticks: { callback: v => fmt(v) } },
+        y1: { position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: '1件あたり（円・税抜）' }, ticks: { callback: v => fmt(Math.round(v)) + '円' } },
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            // 単価だけ見せると「何を何で割った数か」が分からなくなるので、分子と分母も添える
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              if (v === null || v === undefined) return ctx.dataset.label + ': -';
+              if (ctx.dataset.yAxisID === 'y') return ctx.dataset.label + ': ' + fmt(v) + '件';
+              const i = ctx.dataIndex;
+              return ctx.dataset.label + ': ' + fmt(Math.round(v)) + '円'
+                + '（' + fmt(ctx.dataset.amounts[i]) + '円 ÷ ' + fmt(ctx.dataset.counts[i]) + '件）';
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+// ⑥ 前年同月比 — 決算期(7月始まり)の同じ月どうしを重ねる
+function renderYoyChart() {
+  destroyChart('yoy');
+  const metric = document.getElementById('yoyMetric').value;
+  const info = document.getElementById('yoyInfo');
+  if (_monthlyTotals.length === 0) { info.textContent = 'データがありません'; return; }
+
+  // 期 → 会計月 → その月の合計
+  const byFy = {};
+  for (const t of _monthlyTotals) {
+    if (!byFy[t.fiscal_year]) byFy[t.fiscal_year] = {};
+    byFy[t.fiscal_year][t.fiscal_month] = t;
+  }
+  const fys = Object.keys(byFy).map(Number).sort((a, b) => a - b);
+  const shown = fys.slice(-3); // 直近3期まで。それ以上は線が重なって読めない
+  const current = shown[shown.length - 1];
+  // 「前年」は 1 つ前の期に限る。期が飛んでいるとき (第8期と第10期しか無い等) に
+  // 第10期 ÷ 第8期 を前年同月比として出してしまわないようにする
+  const prev = byFy[current - 1] ? current - 1 : null;
+  const isRate = metric === 'gross_margin';
+
+  const valueOf = (t) => {
+    if (!t) return null;
+    if (isRate) return t.sales > 0 ? t.gross_profit / t.sales * 100 : null;
+    return t[metric];
+  };
+
+  // 当期と前期の同じ会計月を比べる。前年が0以下だと比率が逆の意味に読めてしまうので出さない
+  // （例: 前年 -100万 → 今年 -50万 が「+50%」と出ると改善が悪化に見える）
+  const compare = FISCAL_MONTH_LABELS.map((_, i) => {
+    if (prev === null) return null;
+    const fm = i + 1;
+    const cur = valueOf(byFy[current][fm]);
+    const old = valueOf(byFy[prev][fm]);
+    if (cur === null || old === null) return null;
+    if (isRate) return cur - old;              // 率どうしは引き算（ポイント差）
+    return old > 0 ? (cur / old - 1) * 100 : null;
+  });
+
+  const lineColors = ['#e8eaed', '#9aa0a6', '#1a73e8']; // 古い期ほど薄く、当期が青
+  const datasets = shown.map((fy, i) => ({
+    type: 'line',
+    label: '第' + fy + '期',
+    data: FISCAL_MONTH_LABELS.map((_, j) => valueOf(byFy[fy][j + 1])),
+    borderColor: lineColors[lineColors.length - shown.length + i] || '#dadce0',
+    backgroundColor: 'transparent',
+    borderWidth: fy === current ? 3 : 2,
+    tension: 0.2,
+    yAxisID: 'y',
+    spanGaps: false, // 未確定の月はつながず途切れさせる（確定済みの月だけを線にする）
+  }));
+  if (prev !== null) {
+    datasets.unshift({
+      type: 'bar',
+      label: isRate ? '前年差（pt）' : '前年同月比（%）',
+      data: compare,
+      backgroundColor: 'rgba(52,168,83,0.25)',
+      borderColor: 'rgba(52,168,83,0.6)',
+      borderWidth: 1,
+      yAxisID: 'y1',
+      barPercentage: 0.45,   // 棒が少ない月でも帯のように太らせない
+      categoryPercentage: 0.6,
+    });
+  }
+
+  info.textContent = prev === null
+    ? '第' + current + '期（ひとつ前の第' + (current - 1) + '期に確定した月がないため、比べていません）'
+    : '第' + current + '期 と 第' + prev + '期 の同じ月どうしを比べています';
+
+  _charts.yoy = new Chart(document.getElementById('chartYoy'), {
+    data: { labels: FISCAL_MONTH_LABELS, datasets },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: {
+        y: {
+          position: 'left',
+          beginAtZero: true, // 0 から描く。途中から描くと差が実際より大きく見える
+          title: { display: true, text: isRate ? '粗利率（%）' : (metric === 'sales' ? '売上（円）' : '粗利益（円）') },
+          ticks: { callback: v => isRate ? v.toFixed(1) + '%' : fmt(v) },
+        },
+        y1: {
+          position: 'right',
+          beginAtZero: true, // 0% を必ず入れる（棒の根元が見えないと伸び幅が読めない）
+          grid: { drawOnChartArea: false },
+          title: { display: true, text: isRate ? '前年差（pt）' : '前年同月比（%）' },
+          ticks: { callback: v => (v > 0 ? '+' : '') + v.toFixed(0) + (isRate ? 'pt' : '%') },
+        },
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              if (v === null || v === undefined) return ctx.dataset.label + ': -';
+              if (ctx.dataset.yAxisID === 'y1') return ctx.dataset.label + ': ' + (v > 0 ? '+' : '') + v.toFixed(1) + (isRate ? 'pt' : '%');
+              return ctx.dataset.label + ': ' + (isRate ? v.toFixed(1) + '%' : fmt(Math.round(v)) + '円');
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+// 📊 売上構成の推移 — 毎月を100%にして「どこに寄っているか」だけを見る
+//   最後に描いたときのデータを覚えておく (分け方の切替で再取得しないため)
+let _salesMixData = null;
+function renderSalesMixChart(data) {
+  if (data) _salesMixData = data;
+  const d = _salesMixData;
+  destroyChart('salesMix');
+  const info = document.getElementById('salesMixInfo');
+  const by = document.getElementById('salesMixBy').value;
+  const months = (d && d.months) || [];
+  // モール別は plByMall、売上分類別は pl (どちらも月×キーの売上)
+  const rows = (by === 'segment' ? (d && d.pl) : (d && d.plByMall)) || [];
+  if (months.length === 0) { info.textContent = 'データがありません'; return; }
+  // 行が 1 つも無くてもここで止めない。下の集計に通すと「集計がまだ無い ◯ヶ月」と言える
+
+  const keyOf = (r) => (by === 'segment' ? String(r.segment) : r.mall_id);
+  const nameOf = (k) => (by === 'segment' ? (SEGMENT_NAMES[k] || 'seg' + k) : (MALL_NAMES[k] || k));
+  const byKey = {};
+  const totalByMonth = {};
+  for (const r of rows) {
+    const k = keyOf(r);
+    if (!byKey[k]) byKey[k] = {};
+    byKey[k][r.year_month] = (byKey[k][r.year_month] || 0) + (r.sales || 0);
+    totalByMonth[r.year_month] = (totalByMonth[r.year_month] || 0) + (r.sales || 0);
+  }
+
+  // 期間の売上が大きい順。同額なら キー順にして並びを固定する
+  const keys = Object.keys(byKey).sort((a, b) => {
+    const sum = (k) => months.reduce((acc, ym) => acc + (byKey[k][ym] || 0), 0);
+    return (sum(b) - sum(a)) || a.localeCompare(b);
+  });
+
+  // 構成比として読めない月は帯を出さない。理由は分けて数える:
+  //   noRows     … その月の行が 1 つも無い (集計がまだ)
+  //   negative   … 返品などで売上がマイナスの分類がある。120% と −20% の帯になり「構成」に見えない
+  //   nonPositive… 合計が 0 以下で割れない
+  const skipped = { noRows: 0, negative: 0, nonPositive: 0 };
+  const monthOk = months.map(ym => {
+    if (!keys.some(k => byKey[k][ym] !== undefined)) { skipped.noRows++; return false; }
+    if (keys.some(k => (byKey[k][ym] || 0) < 0)) { skipped.negative++; return false; }
+    if (!(totalByMonth[ym] > 0)) { skipped.nonPositive++; return false; }
+    return true;
+  });
+  const usableCount = monthOk.filter(Boolean).length;
+  // 理由は、1 ヶ月も出せないときこそ要る。早期 return より前に作る
+  const why = [];
+  if (skipped.noRows) why.push('集計がまだ無い ' + skipped.noRows + 'ヶ月');
+  if (skipped.negative) why.push('売上がマイナスの分類がある ' + skipped.negative + 'ヶ月');
+  if (skipped.nonPositive) why.push('合計が0以下 ' + skipped.nonPositive + 'ヶ月');
+  if (usableCount === 0) {
+    info.textContent = '構成を出せる月がありません' + (why.length ? '（' + why.join(' / ') + '）' : '');
+    return;
+  }
+
+  // 横軸は月を詰めない。詰めると上の売上推移と月の位置がずれて、並べて見られなくなる
+  const datasets = keys.map((k) => ({
+    label: nameOf(k),
+    data: months.map((ym, i) => (monthOk[i] ? (byKey[k][ym] || 0) / totalByMonth[ym] * 100 : null)),
+    amounts: months.map(ym => byKey[k][ym] ?? null), // 率だけだと規模が分からないので金額も持つ
+    // 色は他のグラフと同じ決め方にして、帯とも線とも同じ色で追えるようにする
+    backgroundColor: by === 'segment' ? segmentColor(k) : mallColor(k),
+  }));
+
+  info.textContent = usableCount + 'ヶ月分'
+    + (why.length ? '（出せないので空けている: ' + why.join(' / ') + '）' : '');
+
+  _charts.salesMix = new Chart(document.getElementById('chartSalesMix'), {
+    type: 'bar',
+    data: { labels: months, datasets },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      // 売上が無い分類は高さ0の帯になり、既定の当たり判定ではホバーできない。
+      // 月にカーソルを合わせたら、その月の全分類をまとめて出す
+      interaction: { mode: 'index', intersect: false },
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => v.toFixed(0) + '%' } } },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const a = ctx.dataset.amounts[ctx.dataIndex];
+              // その分類の行が無い月は「0円」と言い切らない (売っていないのか集計前なのか分からない)
+              return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '%'
+                + (a === null ? '（この月の行なし）' : '（' + fmt(a) + '円）');
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+// 売上分類ごとに決まった色を返す。売上順や API の返却順で振ると、グラフごとに同じ分類が
+// 違う色になり、円グラフと見比べたときに取り違える
+const SEGMENT_COLOR_ORDER = Object.keys(SEGMENT_NAMES);
+function segmentColor(seg) {
+  const i = SEGMENT_COLOR_ORDER.indexOf(String(seg));
+  return CHART_COLORS[(i >= 0 ? i : SEGMENT_COLOR_ORDER.length) % CHART_COLORS.length];
+}
+
+// モールごとに決まった色を返す。MALL_NAMES の定義順を使い、知らないモールは名前から決める
+// (どちらも表示のたびに変わらないので、期間を切り替えても線の色が入れ替わらない)
+const MALL_COLOR_ORDER = Object.keys(MALL_NAMES);
+// 決まった一覧が無いもの (配送方法など) の色。名前から決めるので、並び順が変わっても色は動かない
+function keyColor(key, offset) {
+  let h = 0;
+  const str = String(key);
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  return CHART_COLORS[((offset || 0) + h) % CHART_COLORS.length];
+}
+
+function mallColor(mallId) {
+  const i = MALL_COLOR_ORDER.indexOf(mallId);
+  if (i >= 0) return CHART_COLORS[i % CHART_COLORS.length];
+  return keyColor(mallId, MALL_COLOR_ORDER.length);
+}
+
+// 🏬 モール別の粗利率 — 全体 1 本では、どのモールが下げているのかが分からない
+function renderMallMarginChart(data) {
+  destroyChart('mallMargin');
+  const info = document.getElementById('mallMarginInfo');
+  const months = data.months || [];
+  const rows = data.plByMall || [];
+  if (months.length === 0 || rows.length === 0) { info.textContent = 'データがありません'; return; }
+
+  // モール → 月 → {売上, 粗利}
+  const byMall = {};
+  const totalByMonth = {};
+  for (const r of rows) {
+    if (!byMall[r.mall_id]) byMall[r.mall_id] = {};
+    byMall[r.mall_id][r.year_month] = { sales: r.sales || 0, gp: r.gross_profit || 0 };
+    const t = totalByMonth[r.year_month] || (totalByMonth[r.year_month] = { sales: 0, gp: 0 });
+    t.sales += r.sales || 0;
+    t.gp += r.gross_profit || 0;
+  }
+
+  // 期間の売上が大きいモールから並べる (凡例の順 = 見るべき順)。同額なら ID 順にして並びを固定する
+  const malls = Object.keys(byMall).sort((a, b) => {
+    const sum = (m) => months.reduce((acc, ym) => acc + ((byMall[m][ym] || {}).sales || 0), 0);
+    return (sum(b) - sum(a)) || a.localeCompare(b);
+  });
+
+  // 売上0で率を出せない月と、そもそも行が無い月を分けて数える (どちらも線は途切れるが意味が違う)
+  let zeroSalesCells = 0;
+  let missingCells = 0;
+  for (const m of malls) {
+    for (const ym of months) {
+      const c = byMall[m][ym];
+      if (!c) missingCells++;
+      else if (!(c.sales > 0)) zeroSalesCells++;
+    }
+  }
+
+  const datasets = malls.map((m) => ({
+    type: 'line',
+    // ※ = 運賃の付け方が国内と違うモール (注記で説明)
+    label: (MALL_NAMES[m] || m) + (m === 'amazon_usa' ? ' ※' : ''),
+    // 売上が 0 以下の月は率が出せない。0% と描くと「粗利が消えた」に見えるので線を途切れさせる
+    data: months.map(ym => {
+      const c = byMall[m][ym];
+      return c && c.sales > 0 ? c.gp / c.sales * 100 : null;
+    }),
+    salesRow: months.map(ym => (byMall[m][ym] || {}).sales ?? null), // tooltip で売上額も出す
+    // 色はモールごとに固定する。売上順に振ると、期間を変えて順位が入れ替わったときに
+    // 別のモールが同じ色になり、切り替えながら見ると取り違える
+    borderColor: mallColor(m),
+    backgroundColor: 'transparent',
+    borderWidth: 2,
+    tension: 0.2,
+    spanGaps: false,
+  }));
+  // 全体は先頭に置く (Chart.js は後ろの dataset ほど背面に描くので、先頭 = いちばん手前)
+  datasets.unshift({
+    type: 'line',
+    label: '全体',
+    data: months.map(ym => {
+      const t = totalByMonth[ym];
+      return t && t.sales > 0 ? t.gp / t.sales * 100 : null;
+    }),
+    salesRow: months.map(ym => (totalByMonth[ym] || {}).sales ?? null),
+    borderColor: '#5f6368',
+    backgroundColor: 'transparent',
+    borderWidth: 4,
+    borderDash: [6, 3], // モールの線と重なっても両方見えるように破線にする
+    tension: 0.2,
+    spanGaps: false,
+  });
+
+  const notes = [malls.length + 'モール（売上の大きい順）'];
+  // 線が途切れている理由を書く。書かないと「粗利が消えた」と読まれる
+  if (zeroSalesCells > 0) notes.push('売上0以下で率を出せない ' + zeroSalesCells + '件');
+  if (missingCells > 0) notes.push('その月に集計が無い ' + missingCells + '件');
+  info.textContent = notes.join(' / ');
+
+  _charts.mallMargin = new Chart(document.getElementById('chartMallMargin'), {
+    data: { labels: months, datasets },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: { y: { ticks: { callback: v => v.toFixed(1) + '%' }, title: { display: true, text: '粗利率（%）' } } },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            // 率だけ見て「悪い」と決めないよう、売上の額も同じ吹き出しに出す
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              const sv = ctx.dataset.salesRow[ctx.dataIndex];
+              if (v === null || v === undefined) {
+                return ctx.dataset.label + ': -' + (sv ? '（売上 ' + fmt(sv) + '円）' : '');
+              }
+              return ctx.dataset.label + ': ' + v.toFixed(1) + '%（売上 ' + fmt(sv || 0) + '円）';
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+// 🪜 売上から粗利まで — 月を選ぶプルダウンの中身を作る (選んでいた月は残す)
+function fillWaterfallMonths() {
+  const sel = document.getElementById('waterfallMonth');
+  if (!sel) return;
+  const prev = sel.value;
+  // 表示期間に入っている確定月だけ。新しい月を上に並べる
+  const ms = _monthlyTotals.filter(t => _histMonthSet.has(t.year_month)).map(t => t.year_month).reverse();
+  // option は DOM として作る。CHECK(year_month GLOB '????-??') の '?' は任意の 1 文字なので、
+  // 引用符や < が入った値でも通る = HTML に直接入れてよい根拠にならない。
+  sel.replaceChildren(...ms.map(m => {
+    const o = document.createElement('option');
+    o.value = m;
+    o.textContent = m; // 文字列としてそのまま入る (HTML として解釈されない)
+    return o;
+  }));
+  // 期間を変えても、見ていた月が残っていればそのまま。無ければいちばん新しい月。
+  // (ブラウザは innerHTML を入れると勝手に先頭を選ぶが、それに頼らず明示する)
+  sel.value = ms.includes(prev) ? prev : (ms[0] || '');
+}
+
+// 🪜 売上から粗利まで — 1 ヶ月ぶんの滝グラフ
+function renderWaterfallChart() {
+  destroyChart('waterfall');
+  const info = document.getElementById('waterfallInfo');
+  const sel = document.getElementById('waterfallMonth');
+  const ym = sel ? sel.value : '';
+  const t = _monthlyTotals.find(x => x.year_month === ym);
+  if (!t) { info.textContent = 'データがありません'; return; }
+
+  // 売上から費目を順に引いていく。各棒は [下端, 上端] で置く。
+  // 棒の下は [名前, 金額, 売上に対する割合] の 3 行。会議で画面を出すとき、
+  // カーソルを合わせないと割合が読めないのでは使いものにならない。
+  // 金額は mgmt_monthly_pl が INTEGER なので必ず整数 (端数の持ち越しは起きない)。
+  const parts = COST_MIX_PARTS.filter(p => p.key !== 'gross_profit');
+  // 費目は「売上の何%を持っていかれたか」なので絶対値。粗利は率そのものなので符号を残す
+  // (赤字の月に 5.0% と出すと、見出しの −5.0% と食い違う)
+  const pctAbs = (v) => (t.sales > 0 ? (Math.abs(v) / t.sales * 100).toFixed(1) + '%' : '');
+  const pctSigned = (v) => (t.sales > 0 ? (v / t.sales * 100).toFixed(1) + '%' : '');
+  // 費目がマイナス (返金など) なら残高は増える。符号は値そのものから決める
+  const signed = (delta) => (delta >= 0 ? '+' : '−') + fmt(Math.abs(delta));
+  const bars = [[0, t.sales]];
+  const labels = [['売上', fmt(t.sales), '']];
+  const pcts = ['']; // ラベルと tooltip で同じ文字列を使う
+  const colors = ['rgba(26,115,232,0.25)']; // 売上は「元」。PF手数料の濃い青と見分けるため薄い塗り + 枠線
+  const amounts = [t.sales];
+  let running = t.sales;
+  const span = (from, to) => [Math.min(from, to), Math.max(from, to)]; // 費目がマイナスなら上下が入れ替わる
+  for (const p of parts) {
+    const v = t[p.key] || 0;
+    bars.push(span(running, running - v));
+    labels.push([p.label, signed(-v), pctAbs(v)]);
+    pcts.push(pctAbs(v));
+    colors.push(p.color);
+    amounts.push(-v);
+    running -= v;
+  }
+  // 費目を全部引いても粗利に届かない月がある (過去の初期データは変動費が『売上 − 粗利』で
+  // 入っていて費目の合計とは別物)。黙って辻褄を合わせず、差額の棒を出す
+  const resid = running - t.gross_profit;
+  if (Math.abs(resid) >= 1) {
+    bars.push(span(running, running - resid));
+    labels.push(['差額', signed(-resid), pctAbs(resid)]);
+    pcts.push(pctAbs(resid));
+    colors.push('#80868b');
+    amounts.push(-resid);
+    running -= resid;
+  }
+  bars.push([0, t.gross_profit]);
+  labels.push(['粗利', fmt(t.gross_profit), pctSigned(t.gross_profit)]);
+  pcts.push(pctSigned(t.gross_profit));
+  colors.push(t.gross_profit >= 0 ? '#34a853' : '#d93025');
+  amounts.push(t.gross_profit);
+
+  const rate = t.sales > 0 ? t.gross_profit / t.sales * 100 : null;
+  info.textContent = ym + '：売上 ' + fmt(t.sales) + '円 → 粗利 ' + fmt(t.gross_profit) + '円'
+    + (rate === null ? '（売上が0なので率は出せない）' : '（' + rate.toFixed(1) + '%）');
+
+  _charts.waterfall = new Chart(document.getElementById('chartWaterfall'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: '金額',
+        data: bars,
+        amounts,
+        pcts,
+        salesBase: t.sales,
+        backgroundColor: colors,
+        borderColor: colors.map((c, i) => (i === 0 ? '#1a73e8' : c)),
+        borderWidth: colors.map((_, i) => (i === 0 ? 2 : 0)),
+      }],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.dataset.amounts[ctx.dataIndex];
+              const p = ctx.dataset.pcts[ctx.dataIndex]; // 棒の下のラベルと同じ割合を出す
+              return (v >= 0 ? '' : '−') + fmt(Math.abs(v)) + '円' + (p ? '（売上の ' + p + '）' : '');
+            },
+          },
+        },
+      },
+      scales: { y: { beginAtZero: true, ticks: { callback: v => fmt(v) }, title: { display: true, text: '円（税抜）' } } },
+    },
+  });
+}
+
+// 期間の最初の月から最後の月まで、暦のとおりに月を並べる (抜けている月も入れる)
+function monthsInRange(from, to) {
+  const out = [];
+  let [y, m] = from.split('-').map(Number);
+  const [ty, tm] = to.split('-').map(Number);
+  while (y < ty || (y === ty && m <= tm)) {
+    out.push(y + '-' + String(m).padStart(2, '0'));
+    m += 1;
+    if (m > 12) { m = 1; y += 1; }
+  }
+  return out;
+}
+
+// 🔥 モール×売上分類の粗利率 — どこに手を入れるかを決める表
+//   Chart.js にヒートマップが無いので、色を塗った表で作る。
+//   最後に作った中身はテストから見えるように残す (DOM を辿らずに値を確かめられる)
+let _lastHeatmap = null;
+
+// 色の基準。ふだんは全体の粗利率だが、全体が赤字 (または 0) のときは 0% を基準にする
+// (基準までマイナスだと、赤字でないマスが全部「良い」側になってしまう)
+function heatBase(baseRate) { return baseRate !== null && baseRate > 0 ? baseRate : 0; }
+
+// 率に応じた背景色。0% 未満は濃い赤、基準までは薄い赤、基準ちょうどは色なし、上は緑
+function heatColor(rate, baseRate) {
+  if (rate === null) return '#f8f9fa';
+  if (rate < 0) return '#d93025'; // 赤字
+  const base = heatBase(baseRate);
+  if (base <= 0) {
+    // 基準が 0% のとき。0% は色なしにして、そこから上を緑にする
+    // (上限が決められないので 10pt 上で最大の濃さにする)
+    return 'rgba(52,168,83,' + (0.45 * Math.min(1, rate / 10)).toFixed(3) + ')';
+  }
+  if (rate < base) {
+    return 'rgba(217,48,37,' + (0.45 * (1 - rate / base)).toFixed(3) + ')'; // 0 → 基準 で 濃い赤 → 色なし
+  }
+  return 'rgba(52,168,83,' + (0.45 * Math.min(1, (rate - base) / base)).toFixed(3) + ')'; // 基準 → 2倍 で 色なし → 緑
+}
+
+function renderHeatmap(data) {
+  const info = document.getElementById('heatInfo');
+  const box = document.getElementById('heatTable');
+  const rows = (data && data.plByMallSegment) || [];
+  _lastHeatmap = null;
+  box.replaceChildren();
+  if (rows.length === 0) { info.textContent = 'データがありません'; return; }
+
+  const cell = {};        // mall → segment → {sales, gp}
+  const mallTotal = {};
+  const segTotal = {};
+  const all = { sales: 0, gp: 0 };
+  for (const r of rows) {
+    const m = r.mall_id;
+    const g = String(r.segment);
+    if (!cell[m]) cell[m] = {};
+    const c = cell[m][g] || (cell[m][g] = { sales: 0, gp: 0 });
+    c.sales += r.sales || 0;
+    c.gp += r.gross_profit || 0;
+    const mt = mallTotal[m] || (mallTotal[m] = { sales: 0, gp: 0 });
+    mt.sales += r.sales || 0; mt.gp += r.gross_profit || 0;
+    const st = segTotal[g] || (segTotal[g] = { sales: 0, gp: 0 });
+    st.sales += r.sales || 0; st.gp += r.gross_profit || 0;
+    all.sales += r.sales || 0; all.gp += r.gross_profit || 0;
+  }
+
+  // 行は売上の大きいモールから、列は売上分類の番号順 (画面のほかの場所と同じ並び)
+  const malls = Object.keys(mallTotal).sort((a, b) => (mallTotal[b].sales - mallTotal[a].sales) || a.localeCompare(b));
+  const segs = Object.keys(segTotal).sort((a, b) => Number(a) - Number(b));
+  const rateOf = (c) => (c && c.sales > 0 ? c.gp / c.sales * 100 : null);
+  const baseRate = rateOf(all);
+
+  _lastHeatmap = { malls, segs, cell, mallTotal, segTotal, all, baseRate };
+
+  const table = document.createElement('table');
+  table.style.fontSize = '12px';
+  const thead = document.createElement('thead');
+  const hr = document.createElement('tr');
+  const corner = document.createElement('th');
+  corner.textContent = '';
+  hr.appendChild(corner);
+  for (const g of segs.concat(['__total__'])) {
+    const th = document.createElement('th');
+    th.textContent = g === '__total__' ? '合計' : (SEGMENT_NAMES[g] || 'seg' + g);
+    th.style.textAlign = 'right';
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  const addRow = (label, get, isTotalRow) => {
+    const tr = document.createElement('tr');
+    const th = document.createElement('th');
+    th.textContent = label;
+    th.style.textAlign = 'left';
+    th.style.whiteSpace = 'nowrap';
+    tr.appendChild(th);
+    for (const g of segs.concat(['__total__'])) {
+      const c = get(g);
+      const rate = rateOf(c);
+      const td = document.createElement('td');
+      td.style.textAlign = 'right';
+      td.style.whiteSpace = 'nowrap';
+      td.style.background = isTotalRow || g === '__total__' ? '#f1f3f4' : heatColor(rate, baseRate);
+      if (rate === null) {
+        td.textContent = c && c.sales !== 0 ? '-' : '';
+        td.title = c ? '売上 ' + fmt(c.sales) + '円（率は出せない）' : 'この組み合わせの売上なし';
+      } else {
+        const top = document.createElement('div');
+        top.textContent = rate.toFixed(1) + '%';
+        const bottom = document.createElement('div');
+        bottom.style.color = '#666';
+        bottom.style.fontSize = '11px';
+        bottom.textContent = fmt(c.sales);
+        td.appendChild(top);
+        td.appendChild(bottom);
+        td.title = '粗利 ' + fmt(c.gp) + '円 ÷ 売上 ' + fmt(c.sales) + '円';
+      }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  };
+
+  for (const m of malls) {
+    // ※ = 運賃の付け方が国内と違う行 (注記で説明)
+    addRow((MALL_NAMES[m] || m) + (m === 'amazon_usa' ? ' ※' : ''), (g) => (g === '__total__' ? mallTotal[m] : (cell[m] || {})[g]), false);
+  }
+  addRow('合計', (g) => (g === '__total__' ? all : segTotal[g]), true);
+  table.appendChild(tbody);
+  box.appendChild(table);
+
+  // 表示期間のうち、集計 (PL 行) が無い月。この表はその月を含んでいないので、そう書く。
+  //   API は月を落として合計するので、画面側で月次合計と突き合わせないと分からない。
+  //   🚨突き合わせる相手は暦月。data.months は確定済みの月だけなので、締めも集計も無い月は
+  //   そもそも入っておらず、そのままでは「抜けている」ことに気づけない
+  const haveMonths = new Set(_monthlyTotals.map(t => t.year_month));
+  const span = (data && data.months) || [];
+  const calendar = span.length ? monthsInRange(span[0], span[span.length - 1]) : [];
+  const missingMonths = calendar.filter(ym => !haveMonths.has(ym));
+
+  const colorBase = heatBase(baseRate);
+  const parts = [malls.length + 'モール × ' + segs.length + '分類'];
+  if (baseRate !== null) {
+    parts.push(Math.abs(baseRate - colorBase) < 1e-9
+      ? '全体 ' + baseRate.toFixed(1) + '% を境に色を塗る'
+      : '全体 ' + baseRate.toFixed(1) + '%（赤字なので色は 0% を境に塗る）');
+  }
+  if (missingMonths.length > 0) parts.push('集計がまだ無い ' + missingMonths.length + 'ヶ月はこの表に入っていない');
+  info.textContent = parts.join(' / ');
+}
+
+// 📣 広告費と粗利率 — 広告を増やした月に利益が残ったか
+function renderAdEffectChart(data) {
+  destroyChart('adEffect');
+  const info = document.getElementById('adEffectInfo');
+  // 横軸は暦のとおりに並べる。API が返す months は「確定済みの月」だけなので、
+  // それをそのまま横軸にすると、確定していない月を飛ばして線がつながり、
+  // 1 ヶ月ぶんの動きとして読まれる (spanGaps は配列に無い月には効かない)
+  const confirmed = (data && data.months) || [];
+  const months = confirmed.length ? monthsInRange(confirmed[0], confirmed[confirmed.length - 1]) : [];
+  const byMonth = {};
+  for (const t of _monthlyTotals) byMonth[t.year_month] = t;
+  const rows = months.map(ym => byMonth[ym] || null);
+  if (months.length === 0 || rows.every(r => r === null)) {
+    info.textContent = '表示できる月がありません';
+    return;
+  }
+
+  const adCost = rows.map(r => (r ? (r.ad_cost || 0) : null));
+  // 売上が 0 以下の月は率を出せない。0% と描くと「広告を使わなかった」に見える
+  const rate = (pick) => rows.map(r => (r && r.sales > 0 ? pick(r) / r.sales * 100 : null));
+  const adRate = rate(r => r.ad_cost || 0);
+  const gpRate = rate(r => r.gross_profit || 0);
+  // 広告費を除いた粗利率。「広告費率の上がり幅 < 粗利率の下がり幅」が何を意味するかは
+  // これを見れば分かる (上がっていれば、広告費以外のところが良くなっている)
+  const gpBeforeAd = rows.map((r, i) => (adRate[i] === null || gpRate[i] === null ? null : gpRate[i] + adRate[i]));
+
+  const noRate = rows.filter((r, i) => r !== null && adRate[i] === null).length;
+  const missing = rows.filter(r => r === null).length;
+  const why = [];
+  if (noRate > 0) why.push('売上が0以下で率を出せない ' + noRate + 'ヶ月');
+  if (missing > 0) why.push('確定していない・集計がまだ無い ' + missing + 'ヶ月');
+  info.textContent = months.length + 'ヶ月分'
+    + (why.length ? '（' + why.join(' / ') + 'は空ける）' : '');
+
+  _charts.adEffect = new Chart(document.getElementById('chartAdEffect'), {
+    data: {
+      labels: months,
+      datasets: [
+        {
+          type: 'bar',
+          label: '広告費（円）',
+          data: adCost,
+          backgroundColor: 'rgba(251,188,4,0.35)',
+          borderColor: '#fbbc04',
+          borderWidth: 1,
+          yAxisID: 'y',
+        },
+        {
+          type: 'line',
+          label: '広告費率',
+          data: adRate,
+          borderColor: '#f29900',
+          backgroundColor: 'transparent',
+          borderWidth: 3,
+          tension: 0.2,
+          yAxisID: 'y1',
+          spanGaps: false,
+        },
+        {
+          type: 'line',
+          label: '粗利率',
+          data: gpRate,
+          beforeAd: gpBeforeAd, // tooltip 用: 広告費を除いた粗利率
+          borderColor: '#34a853',
+          backgroundColor: 'transparent',
+          borderWidth: 3,
+          tension: 0.2,
+          yAxisID: 'y1',
+          spanGaps: false,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        y: { position: 'left', beginAtZero: true, title: { display: true, text: '広告費（円・税抜）' }, ticks: { callback: v => fmt(v) } },
+        y1: { position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: '率（%）' }, ticks: { callback: v => v.toFixed(1) + '%' } },
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              if (v === null || v === undefined) return ctx.dataset.label + ': -';
+              if (ctx.dataset.yAxisID === 'y') return ctx.dataset.label + ': ' + fmt(Math.round(v)) + '円';
+              const b = ctx.dataset.beforeAd && ctx.dataset.beforeAd[ctx.dataIndex];
+              return ctx.dataset.label + ': ' + v.toFixed(1) + '%'
+                + (b === null || b === undefined ? '' : '（広告費を除くと ' + b.toFixed(1) + '%）');
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+// ⑦ コスト構造の比率 — 売上を100%としたときに何に何%持っていかれたか
+function renderCostMixChart() {
+  destroyChart('costMix');
+  const note = document.getElementById('costMixInfo');
+  // 表示期間に入っている確定月のうち、売上がある月だけ（売上0の月は率が出せない）
+  const rows = _monthlyTotals.filter(t => _histMonthSet.has(t.year_month) && t.sales > 0);
+  if (rows.length === 0) { if (note) note.textContent = '表示できる月がありません'; return; }
+  if (note) note.textContent = rows.length + 'ヶ月分';
+
+  const datasets = COST_MIX_PARTS.map(p => ({
+    label: p.label,
+    data: rows.map(r => (r[p.key] || 0) / r.sales * 100),
+    amounts: rows.map(r => r[p.key] || 0), // tooltip で率と一緒に金額も出す
+    backgroundColor: p.color,
+  }));
+  // 費目と粗利を足しても売上に届かない月がある。過去の初期データ(2026年2月以前)は
+  // 変動費が『売上 − 粗利』で入っていて、費目の合計とは別物のため。
+  // 黙って100%に見せると内訳が正しいものとして読まれるので、余りを帯にして見えるようにする。
+  const residual = rows.map(r => r.sales - COST_MIX_PARTS.reduce((sum, p) => sum + (r[p.key] || 0), 0));
+  if (residual.some(v => Math.abs(v) >= 1)) {
+    datasets.push({
+      label: '差額（内訳に入らない分）',
+      data: residual.map((v, i) => v / rows[i].sales * 100),
+      amounts: residual,
+      backgroundColor: '#80868b', // 見落とすと『内訳が正しい』と読まれるので、背景に紛れない濃さにする
+    });
+  }
+
+  _charts.costMix = new Chart(document.getElementById('chartCostMix'), {
+    type: 'bar',
+    data: {
+      labels: rows.map(r => r.year_month),
+      datasets,
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => v.toFixed(0) + '%' } } },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: ctx => ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '%（' + fmt(ctx.dataset.amounts[ctx.dataIndex]) + '円）',
+          },
+        },
+      },
+    },
+  });
 }
 
 // 初期読み込み

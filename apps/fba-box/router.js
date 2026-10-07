@@ -25,7 +25,7 @@ import {
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState, finishRun,
   createRunFromPicking, getRunBySource, attachExcelToRun,
   createBox, closeBox, reopenBox, voidBox, listBoxContents, getBox,
-  addPlacement, replayPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
+  addPlacement, replayPlacement, revokePlacement, revokePlacements, adjustPlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
   listProductImages, listRowsNeedingCatalog,
@@ -42,6 +42,7 @@ import { listStaffForLink } from '../staff/roster-link.js';
 import { buildRunReport } from './report.js';
 import { drainNotifyOutbox } from './notify-outbox.js';
 import { WEBHOOK_ENV } from './notify.js';
+import { pickingPdfPath } from '../fba-replenishment/picking-pdf-store.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
 const kickCatalog = (runId) => { ensureRunCatalog(runId).catch((e) => console.warn('[fba-box] catalog', e.message)); };
@@ -77,6 +78,18 @@ let pickingSource = async () => {
   };
 };
 export function _setPickingSource(fn) { pickingSource = fn; }
+/**
+ * 納品回の元になった picking 実行の「納品プランNo 付き」ピッキング PDF (ロジザード TMP1 に注番したもの) の URL。
+ * 公開の /print/picking/:id/pdf をそのまま使う (Notion カードに貼っているのと同じ・見られて困らない — 中原さん 2026-10-01)。
+ * PDF は picking-prep 側で直近 40 件だけ残すので、消えた回・PDF の無い回は null (ボタンを出さない)。
+ * 取消した回も null — 開いたままの iPad に取消済みの作業指示への入口を残さない (Codex #1575 R1 #1)
+ */
+function pickingPdfUrlOf(run) {
+  if (!run || run.status === 'cancelled') return null;
+  const src = Number(run?.source_run_id);
+  if (!Number.isInteger(src) || src <= 0) return null;
+  try { return pickingPdfPath(src) ? `/print/picking/${src}/pdf` : null; } catch { return null; }
+}
 async function loadPickingRuns(limit = 15) {
   try {
     const src = await pickingSource();
@@ -389,6 +402,7 @@ router.get('/api/state', api((req, res) => {
   if (state.run.status === 'active' && state.rows.some((r) => r.expiry_source == null && r.match_state !== 'retired')) kickExpiry(runId);
   res.json({
     ok: true, ...state,
+    pickingPdfUrl: pickingPdfUrlOf(state.run),
     workers: listWorkers(),
     materials: listMaterials(),
     // 箱に「どのサイズか」を出すための名前だけの引き (中原さん 2026-09-18)。
@@ -505,6 +519,16 @@ router.post('/api/staff/verify', checkOrigin, api((req, res) => {
   res.json({ ok: true, approvedBy: gate.approvedBy });
 }));
 
+/**
+ * 複数の箱へ分けて入れる (splits: [{box_id, qty}, …])。無ければ undefined = いままでどおり box_id + qty の 1 箱。
+ * 🚨 配列でない値は「分けていない」とは扱わない (空配列にして断らせる) — 1 箱の投入に化けて記録されないように
+ */
+function splitsOf(body) {
+  if (!body || body.splits === undefined) return undefined;
+  if (!Array.isArray(body.splits)) return [];
+  return body.splits.map((x) => ({ boxId: Number(x?.box_id), qty: x?.qty }));
+}
+
 /** 割当の追加 (F-2: 原子的残数検証+冪等性) */
 router.post('/api/placements', checkOrigin, api((req, res) => {
   // 応答喪失後の送り直しは、**作業者の検証より先に**前回の結果を返す (Codex PQ-R2 high#2)。
@@ -513,14 +537,14 @@ router.post('/api/placements', checkOrigin, api((req, res) => {
   const replay = replayPlacement({
     deviceKey: deviceKeyOf(req), requestId: String(req.body?.request_id || ''),
     runId: Number(req.body?.run_id), rowId: Number(req.body?.row_id), boxId: Number(req.body?.box_id),
-    qty: req.body?.qty, expiry: req.body?.expiry, layer: req.body?.layer,
+    qty: req.body?.qty, splits: splitsOf(req.body), expiry: req.body?.expiry, layer: req.body?.layer,
   });
   if (replay) return res.status(replay.ok ? 200 : 409).json(replay);
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const r = addPlacement({
     runId: Number(req.body?.run_id), rowId: Number(req.body?.row_id), boxId: Number(req.body?.box_id),
-    qty: req.body?.qty, expiry: req.body?.expiry, layer: req.body?.layer,
+    qty: req.body?.qty, splits: splitsOf(req.body), expiry: req.body?.expiry, layer: req.body?.layer,
     worker: w.worker, deviceKey: deviceKeyOf(req), deviceLabel: deviceLabelOf(req),
     requestId: String(req.body?.request_id || ''),
   });
@@ -552,6 +576,23 @@ router.post('/api/placements/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
+/**
+ * 分けて入れた記録をまとめて取り消す (1 トランザクション・押し直しても同じ結果)。入力ミスの訂正なので PIN 不要。
+ * 1 件ずつの取消を並べると、途中で通信が切れたとき一部だけ戻る (Codex PR #1421 R1 #1)
+ */
+router.post('/api/placements/revoke-batch', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const r = revokePlacements({
+    placementIds: req.body?.placement_ids, worker: w.worker, deviceKey: deviceKeyOf(req), deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) {
+    const st = { not_found: 404, run_not_active: 409 }[r.error] || 400;
+    return res.status(st).json(r);
+  }
+  res.json(r);
+}));
+
 /** 割当の数の修正 (取消 + 入れ直しを 1 回で)。入力ミスの訂正なので PIN 不要 (中原さん 9/3) */
 router.post('/api/placements/:id(\\d+)/adjust', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
@@ -567,7 +608,7 @@ router.post('/api/placements/:id(\\d+)/adjust', checkOrigin, api((req, res) => {
     worker: w.worker, deviceKey: deviceKeyOf(req), deviceLabel: deviceLabelOf(req), requestId: req.body?.request_id ? String(req.body.request_id) : null,
   });
   if (!r.ok) {
-    const st = { staff_required: 403, not_found: 404, revoked: 409, run_not_active: 409, over_qty: 409, box_closed: 409, box_void: 409, row_excluded: 409, reason_required: 400 }[r.error] || 400;
+    const st = { staff_required: 403, not_found: 404, revoked: 409, run_not_active: 409, over_qty: 409, box_closed: 409, box_void: 409, row_excluded: 409, idempotency_conflict: 409, placement_revoked: 409, reason_required: 400 }[r.error] || 400;
     return res.status(st).json(r);
   }
   res.json(r);
@@ -822,7 +863,7 @@ router.get('/admin', requireSession, api(async (req, res) => {
     displayName: req.session.displayName,
     isAdmin: isAdmin(req),
     base: BASE,
-    runs: listRuns(30),
+    runs: listRuns(30).map((r) => ({ ...r, pickingPdfUrl: pickingPdfUrlOf(r) })),
     pickingRuns, pickingError,
     workers: listWorkers(true),
     staffMaster: isAdmin(req) ? listStaffForLink() : [],   // 紐付け直しの選択肢 (名簿はスタッフマスタの鏡)

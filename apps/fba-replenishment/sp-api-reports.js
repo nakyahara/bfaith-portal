@@ -61,12 +61,13 @@ function sleep(ms) {
 }
 
 function withTimeout(promise, ms, label = '') {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`タイムアウト (${ms/1000}秒): ${label}`)), ms)
-    ),
-  ]);
+  // 終わったらタイマーを片付ける: 残すと、処理が成功した後も最大 ms の間プロセスが終われない
+  // (snapshot-fba-stock.js --direct が自然に終われず、10 秒の保険の process.exit に頼ることになる。Codex #1386 R1)
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`タイムアウト (${ms/1000}秒): ${label}`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**

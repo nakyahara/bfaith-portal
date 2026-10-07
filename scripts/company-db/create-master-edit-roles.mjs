@@ -1,0 +1,321 @@
+#!/usr/bin/env node
+/**
+ * create-master-edit-roles.mjs — マスタの入力の仕組みのロールを作る / 権限をそろえる (Company DB構想 14 ⑤-1・PR #1563 R1 M8・R2 H2 / M3 / M4・仮レビュー Low 2 / Low 3 / Low 4)
+ *   create-watch-roles.mjs と同じ作り = 1 取引・作った後に属性を確かめて違えば取り消す。流し直すと、前に付けた権限を外してから付け直す
+ *
+ * master_edit     (Render の apps/master-edit が env COMPANY_DB_MASTER_EDIT_URL で使う。無ければ画面は見るだけ):
+ *   読む: 画面が読む表だけ (MASTER_EDIT_SELECT) / 書く: 保存の経路で書く表の列だけ (MASTER_EDIT_WRITE。insert も列を絞る)
+ *   🚨 書けるのは同じ取引で ops.begin_master_write (実行だけ渡す) を呼んだ後・その約束の相手 (SKU・含むセット・商品)・操作の書き方だけ (DB の trigger。段階・持ち主表・版・誰が を DB で守る・#1563 R3 M2・R4 M2)
+ *   🚨 渡さない: events.master_change_events の insert (記録は 0026 の関数 = security definer が書く = 偽れない)・core.skus.version・core.sku_components の書き込み・
+ *      切替の段階・門の記録・NE の観測の書き込み。core.sku_costs の削除は渡すが、今日より前の行は DB の trigger が拒む (0051)
+ *      core.suppliers の update (仕入先の行の共有の鍵は 0051 の関数 core.lock_suppliers_for_share = security definer の実行だけ)
+ *   ロールの設定 = statement_timeout 20s・lock_timeout 10s・idle_in_transaction_session_timeout 60s (画面の接続の設定と同じ。画面が付け忘れても長く持たない)
+ *   ⑤-2a (0052・新商品の登録 lib/master-register.mjs・カードの知らせ lib/product-hub-outbox.mjs): 登録の関数 (ops.register_new_sku = 番号 → 登録の約束 →
+ *   商品・SKU・状態・仕入先・原価・構成の依頼・知らせ → done を関数の中で)・新しいコードの決まり (ops.new_sku_code_problem)・SKU を足した commit の確かめ
+ *   (ops.sku_registration_problem = 遅らせた trigger が呼び手の権限で呼ぶ)・知らせを借りる / 結果を書く関数 (ops.claim_card_events / finish_card_event) の実行。
+ *   🚨 渡さない: core.products / core.skus の insert・知らせの insert (登録の関数だけが書く)・ops.create_sku_registration の実行 (登録の関数の中だけ)・
+ *      登録の状態・履歴・backfill の印の表の書き込み (関数だけ)・知らせの状態 / 結果 / 借りの列の update (関数だけ・仮レビュー L7)
+ *   ⑤-2b (0053・新商品の NE 登録の CSV lib/master-reg-csv.mjs・JAN lib/master-write.mjs): 新規登録の CSV の表・実機の確かめ・仕入先の登録の状態を読む /
+ *   新規登録の CSV の関数 (ops.ne_reg_build / issue / declare / supersede / record_verified = 約束 reg_csv_*)・保存の中の ops.ne_reg_guard_on_save・
+ *   JAN の関数 (ops.edit_sku_jan = 約束 jan_edit)・NE の元のコードを要る分だけ読む関数 (ops.ne_reg_ne_codes) の実行。
+ *   🚨 渡さない: 新規登録の CSV の表・core.external_ids・仕入先の登録の状態の表の書き込み (関数だけ)・NE の元のコードの表の select・
+ *      仕入先の関数 (ops.create_supplier ほか = 書くロールは ⑥ で決める)・照合の確かめの 3 つ (watch_writer だけ = create-watch-roles.mjs)・関数の中の部品
+ *   ⑦-1 (0054・Amazon SKU の対応): 保存と削除の関数 (ops.save_amazon_sku_map / ops.delete_amazon_sku_map = 出品・対応・構成・保存の記録 done を関数の中で)・
+ *   「未登録」の一覧と売上の公開のそろいの関数 (注文の表は読ませない) の実行と、対応の表・ASIN (catalog_items) を読むだけ。
+ *   🚨 渡さない: core.amazon_sku_maps / core.listings / core.listing_components の書き込み (DELETE も = 墓標は消さない)・関数の中の部品 (ops.amazon_map_begin ほか)
+ *   FBA の在庫 (10/5・apps/master-edit/fba-stock.mjs): snapshots の usage と、在庫の日次の 2 つの表 (FBA_STOCK_SELECT) の select だけ。
+ *   🚨 mart (mart.v_sku_stock) は渡さない: 取得の時刻と内訳が無い・mart の usage を渡すと mart の関数も呼べる範囲が広がる。
+ *      snapshots の関数 = 月の分割を作る 2 つ (呼び手の権限 = schema の CREATE が要る = master_edit では何もできない) と trigger の関数だけ
+ * master_ops      (手の操作 scripts/company-db/master-cutover.mjs が env COMPANY_DB_MASTER_OPS_URL で使う): ops.set_master_cutover_phase の実行と、段階・記録を読むだけ。
+ *   ⑤-2a: 切替の日の backfill (ops.registration_backfill_plan / backfill_sku_registrations) と、登録をやめる (ops.transition_sku_registration) の実行・登録の状態を読む
+ * master_observer (⑤-2 の夜間ロードが NE のセットの構成の観測を書く env COMPANY_DB_MASTER_OBSERVER_URL): ops.record_ne_set_observations の実行だけ
+ * master_gate     (まとめのロール・ログインできない): ops.record_legacy_gate_ack の実行と、段階・列ごとの持ち主 (0055 の ops.master_ownership_state・⑤-3b) を読むだけ。ログインは場所ごとのメンバー (#1563 仮レビュー Low 3):
+ *   master_gate_render (Render の ⑤-3 の古い入口の門 env COMPANY_DB_MASTER_GATE_RENDER_URL) / master_gate_minipc (miniPC の門 env COMPANY_DB_MASTER_GATE_MINIPC_URL)。
+ *   DB の関数がログインのロールと記録の場所 (host) を照らす = Render のログインで minipc を名乗れない
+ * 構成の依頼を上げる (promoteComponentRequest) のは夜間ロード = 表の持ち主のロール (COMPANY_DB_URL)
+ * 🆕 0058 (広げる道 PR-1): new_entry_gate (NOINHERIT のログイン・開く前のゲート env COMPANY_DB_NEW_ENTRY_GATE_URL = miniPC の .env・中原さんが入れる):
+ *   新商品の開放の許可を出す / 取り消す (ops.grant_new_entry_lease / revoke_new_entry_lease) と、取り消した後に閉じたことを確かめる ops.new_entry_lease_valid の実行だけ。
+ *   表は読まない (ゲートの診断の表の読み取りは watcher)。
+ *   master_edit には active の持ち主表 (ops.master_ownership_active_map)・許可の表示用 (ops.new_entry_lease_valid)・鍵の入口 (ops.acquire_new_entry_locks)・
+ *   配ったファイル (ops.ne_reg_file)、master_gate には門の記録の 2 版の実行を足す。
+ *   広げる道の DB の持ち主の関数 (prepare / widen / cancel / 停止 / 保守の印 / private の _ の関数) はだれにも渡さない
+ *
+ * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
+ *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
+ *    (付けたロールの新しい接続文字列だけを出す。変えたら、そのロールを使う場所の env を同じ日に書き換える)
+ * 使い方:
+ *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --dry-run   # 流す文だけ見る
+ *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs             # 作る / 権限をそろえる (新しいロールのパスワードだけ、この画面に出る)
+ *   node -r dotenv/config scripts/company-db/create-master-edit-roles.mjs --rotate-password master_gate_render   # そのロールのパスワードだけ変える (何回でも付けられる)
+ * 🚨 0054 まで migration を流した後に (⑤-2b・⑦-1 の表・関数が無いと止まる)。migration で表を足したら流し直す (権限は表ごとに付ける)
+ */
+import crypto from 'node:crypto';
+import { openPgClient } from './migrate.mjs';
+import { urlFor } from './create-watch-roles.mjs';
+
+/** 場所ごとの門のログイン (DB の関数 ops.record_legacy_gate_ack は session_user = 'master_gate_' || host を求める) */
+export const GATE_LOGIN_ROLES = Object.freeze({ render: 'master_gate_render', minipc: 'master_gate_minipc' });
+/** ログインできるロール (パスワードを持つ) */
+export const MASTER_LOGIN_ROLES = Object.freeze(['master_edit', 'master_gate_minipc', 'master_gate_render', 'master_observer', 'master_ops', 'new_entry_gate']);
+/** まとめのロール (ログインできない・パスワードなし) */
+export const MASTER_GROUP_ROLES = Object.freeze(['master_gate']);
+export const MASTER_EDIT_ROLES = Object.freeze([...MASTER_LOGIN_ROLES, ...MASTER_GROUP_ROLES].sort());
+const CONN_LIMIT = { master_edit: 5, master_ops: 2, master_observer: 2, master_gate_render: 8, master_gate_minipc: 8, new_entry_gate: 2 };   // 門: プロセス・CLI が同時に記録を書く (⑤-3)
+/** まとめのロールのメンバー (INHERIT = まとめのロールの権限をそのまま使う) */
+const MEMBER_OF = { master_gate_render: 'master_gate', master_gate_minipc: 'master_gate' };
+/** ロールごとの設定 (master_edit = 画面の接続と同じ値。apps/master-edit/router.mjs の connect) */
+const ROLE_SETTINGS = {
+  master_edit: { statement_timeout: '20s', lock_timeout: '10s', idle_in_transaction_session_timeout: '60s' },
+  master_gate_render: { statement_timeout: '20s' }, master_gate_minipc: { statement_timeout: '20s' },
+  master_observer: { statement_timeout: '20s' }, master_ops: { statement_timeout: '20s' }, new_entry_gate: { statement_timeout: '20s' },
+};
+/** 画面が読む表 */
+export const MASTER_EDIT_SELECT = [
+  'core.skus', 'core.products', 'core.sku_components', 'core.sku_costs', 'core.suppliers', 'core.supplier_skus', 'core.external_ids', 'core.listings', 'core.listing_components',
+  'events.master_change_events',
+  'ops.master_cutover_state', 'ops.master_edit_requests', 'ops.sku_component_requests', 'ops.sku_component_breaches', 'ops.ne_set_observations', 'ops.ne_set_observation_runs',
+  'ops.ne_csv_exports', 'ops.ne_csv_export_rows', 'ops.master_decision_candidates', 'ops.master_decision_observations', 'ops.master_compare_runs',
+  // ⑤-2a (0052): 登録の状態 (画面に出す)・backfill の印 (新商品の登録の前提)・カードの知らせ (読むだけ)
+  'ops.master_registrations', 'ops.master_registration_backfill', 'ops.product_hub_outbox',
+  // ⑤-2b (0053): 新規登録の CSV (ファイル・試み・商品・行・照合の確かめ)・実機の確かめ・仕入先の登録の状態 (読むだけ。NE の元のコードは関数 ops.ne_reg_ne_codes で)
+  'ops.ne_reg_exports', 'ops.ne_reg_attempts', 'ops.ne_reg_export_items', 'ops.ne_reg_export_rows', 'ops.ne_reg_checks', 'ops.ne_csv_verified', 'ops.supplier_registrations',
+  // ⑦-1 (0054): Amazon SKU の対応 (読むだけ)・ASIN
+  'core.amazon_sku_maps', 'core.catalog_items',
+];
+/** FBA の在庫 (参考・読むだけ。10/5): 在庫の日次の取れた日と行 (source = fba_jp ほか)。schema snapshots の usage も渡す (この 2 つの表のためだけ) */
+export const FBA_STOCK_SELECT = Object.freeze(['snapshots.stock_capture_days', 'snapshots.sku_stock_daily']);
+/** 保存の経路で書く表・列 (lib/master-write.mjs の saveSku)。insert も列を絞る */
+export const MASTER_EDIT_WRITE = [
+  ['update (name, tax_rate, tax_class, handling, standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy, reorder_months, set_sales_class_override, handling_own)', 'core.skus'],
+  ['update (name, status, sales_class, parent_product_id, parent_set_by)', 'core.products'],
+  ['insert (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id), update (is_primary)', 'core.supplier_skus'],
+  ['insert (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, reason, created_by_type, created_by_id), update (valid_to), delete', 'core.sku_costs'],
+  ['insert (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, error, started_at)', 'ops.master_edit_requests'],
+  ['insert (company_id, set_sku_id, rows, rows_hash, base_rows, reason, requested_by, edit_request_id), update (status, closed_at, closed_by, close_reason)', 'ops.sku_component_requests'],
+  ['update (status, closed_at, closed_by, close_reason)', 'ops.sku_component_breaches'],
+  // ⑤-2a (0052): 新商品の商品・SKU・カードの知らせの insert は渡さない (登録の関数 ops.register_new_sku だけが書く)
+];
+/** ⑤-2a (0052): 画面のロールが実行する関数 (security definer) */
+export const REGISTER_FUNCTION = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)';
+export const REGISTER_EDIT_FUNCTIONS = Object.freeze([REGISTER_FUNCTION, 'ops.new_sku_code_problem(text)', 'ops.sku_registration_problem(bigint, text)',
+  'ops.claim_card_events(text, text, uuid, bigint, integer, integer, integer)', 'ops.finish_card_event(uuid, text, text, jsonb, text)']);
+/** ⑤-2a (0052): 運用のロールが実行する関数 (切替の日の backfill・登録をやめる) と読む表 */
+export const REGISTER_OPS_FUNCTIONS = Object.freeze(['ops.registration_backfill_plan()', 'ops.backfill_sku_registrations(integer, text, text, text)',
+  'ops.transition_sku_registration(bigint, text, text, text, text, jsonb, text)']);
+export const REGISTER_OPS_SELECT = Object.freeze(['ops.master_registrations', 'ops.master_registration_events', 'ops.master_registration_backfill']);
+/** ⑤-2a (0052): だれにも渡さない (夜間ロード = 持ち主だけ・状態の行は登録の関数の中だけ) */
+export const REGISTER_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.quarantine_unregistered_skus(text)', 'ops.create_sku_registration(bigint, text, text, text)']);
+/** ⑤-2b (0053): 画面のロールが実行する関数 (security definer = 約束を書くのも表に書くのも関数の中だけ・#1571 R1 High 3) */
+export const REG_CSV_EDIT_FUNCTIONS = Object.freeze(['ops.ne_reg_build(jsonb, bytea)', 'ops.ne_reg_issue(uuid, text, jsonb, bigint)',
+  'ops.ne_reg_declare(uuid, text, jsonb, bigint, text, text, text, timestamptz, text)', 'ops.ne_reg_supersede(uuid, text, jsonb, bigint, text, text)',
+  'ops.ne_reg_guard_on_save(bigint[], text, text)', 'ops.ne_reg_record_verified(uuid, text, jsonb, text, text, text, text, text, bigint)',
+  'ops.edit_sku_jan(uuid, text, text, jsonb, bigint, jsonb, jsonb)', 'ops.ne_reg_ne_codes(text[])']);
+/** ⑤-2b (0053): だれにも渡さない (関数の中の部品・trigger・仕入先の関数 = 書くロールは ⑥ で決める)。照合の確かめの 3 つは watch_writer (create-watch-roles.mjs) */
+export const REG_CSV_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.ne_reg_lock_skus(bigint[])', 'ops.ne_reg_lock_export(bigint)', 'ops.ne_reg_export_skus(bigint)',
+  'ops.ne_reg_canonical(bigint, date)', 'ops.ne_reg_supersede_built(bigint[], text, text)', 'ops.ne_reg_observation_hash(text)',
+  'ops.reg_write_gate(jsonb, text[])', 'ops.open_reg_write(text, uuid, text, text, jsonb, bigint, bigint[], bigint[], text, jsonb)', 'ops.close_reg_write(jsonb, text)', 'ops.reg_hash(jsonb)',
+  'ops.guard_reg_csv_write()', 'ops.guard_reg_csv_live()', 'core.guard_master_edit_jan()',
+  'ops.create_supplier(uuid, text, text, jsonb, text, text, text, integer)', 'ops.declare_supplier_in_ne(uuid, text, jsonb, text, text, text)',
+  'ops.deactivate_supplier(uuid, text, text, jsonb, text, text)',
+  'ops.snapshot_ne_reg_targets(text)', 'ops.record_ne_registration_observations(jsonb)', 'ops.seal_ne_registration_run(text, text, text)', 'ops.record_ne_registration_check(text)']);
+/** ⑤-2b (0053): 読むだけで、ほかのロールの一覧に入らない表 (流し直しのときに外す) */
+export const REG_CSV_OTHER_TABLES = Object.freeze(['ops.supplier_registration_events', 'ops.v_ne_reg_targets', 'ops.ne_reg_compare_targets', 'ops.ne_reg_compare_runs', 'ops.ne_reg_compare_observations',
+  'ops.ne_reg_compare_receipts', 'ops.master_ne_codes', 'ops.master_ne_code_mark']);
+/** ⑦-1 (0054): 画面のロールが実行する関数 (Amazon SKU の対応の保存・削除・未登録の一覧・売上の公開のそろい) */
+export const AMAZON_MAP_EDIT_FUNCTIONS = Object.freeze(['ops.save_amazon_sku_map(uuid, text, text, jsonb, text, jsonb)', 'ops.delete_amazon_sku_map(uuid, text, text, jsonb, text, jsonb)',
+  'ops.amazon_map_unmapped_recent(date, integer)', 'ops.amazon_map_sales_coverage(date, integer)']);
+/** ⑦-1 (0054): だれにも渡さない (保存の関数の中の部品・不変条件・守り) */
+export const AMAZON_MAP_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.amazon_map_begin(text, uuid, text, text, jsonb, text, jsonb)', 'ops.amazon_map_components(jsonb)',
+  'core.amazon_map_problem(bigint)', 'core.check_amazon_map_invariant()', 'core.guard_amazon_map_writer()', 'ops.guard_amazon_map_write()', 'ops.guard_master_edit_request_listing()']);
+export const CUTOVER_FUNCTION = 'ops.set_master_cutover_phase(text, text, jsonb, text)';
+export const OBSERVE_FUNCTION = 'ops.record_ne_set_observations(jsonb)';
+export const ACK_FUNCTION = 'ops.record_legacy_gate_ack(text, text, text, jsonb, text, text, integer, timestamptz, boolean, text)';
+export const LOCK_SUPPLIERS_FUNCTION = 'core.lock_suppliers_for_share(bigint[])';
+/** 画面の保存を始める (段階・持ち主表を DB で確かめて、取引の行を書く。これの後でないと画面のロールは書けない・#1563 R3 M2) */
+export const BEGIN_WRITE_FUNCTION = 'ops.begin_master_write(uuid, text, text, jsonb, text, bigint, text, text, jsonb)';
+/** 0058 (広げる道 PR-1): 画面のロールが実行する (表は読ませない = SECURITY DEFINER の関数の EXECUTE だけ・R1 H4)。無い DB (0058 の前) では付けない。
+ *   new_entry_lease_valid は画面の表示用の読むだけ (保存の強制は register_new_sku などの DB の関数の中) */
+export const WIDEN_EDIT_FUNCTIONS = Object.freeze(['ops.master_ownership_active_map()', 'ops.new_entry_lease_valid(text)', 'ops.ne_reg_file(bigint)', 'ops.acquire_new_entry_locks(text)']);
+/** 0058 (§3.9 の 3・R16 H1): ops.ne_reg_exports の file_bytes を owner でない全部のロールから外す (表の SELECT → 列ごと)。「表に GRANT」の後に毎回流す = 流し直しても戻らない */
+export const RESTRICT_FILE_BYTES_SQL = "do $$ begin if to_regprocedure('ops.restrict_ne_reg_file_bytes()') is not null then perform ops.restrict_ne_reg_file_bytes(); end if; end $$";
+/** 0058: 門の記録の 2 版 (active / prepared を見た・capable)。master_gate に実行だけ */
+export const ACK_V2_FUNCTION = 'ops.record_legacy_gate_ack_v2(text, text, text, jsonb, text, text, integer, timestamptz, text, text, text[], boolean, text)';
+/** 0058 (§3.7): 開放の許可を出す / 取り消す = NOINHERIT のログイン new_entry_gate だけ (watch_writer には渡さない = 照合のコード 1 本で証拠から開放まで完結しない) */
+export const LEASE_GATE_FUNCTIONS = Object.freeze(['ops.grant_new_entry_lease(text, text)', 'ops.revoke_new_entry_lease(text, text)']);
+/** 0058 (#1645): new_entry_gate も取り消した後に閉じたことを確かめる (読むだけ)。WIDEN_EDIT_FUNCTIONS の 1 つ = master_edit にも付く */
+export const LEASE_VALID_FUNCTION = 'ops.new_entry_lease_valid(text)';
+/** 0058: だれにも渡さない (DB の持ち主だけ = prepare / cancel / 停止 / widen / 保守の印 / 判定の本体 / private の _ の関数 / trigger と部品) */
+export const WIDEN_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.prepare_master_widen(integer, jsonb, text, jsonb, text)', 'ops.cancel_master_widen(uuid, text)',
+  'ops.record_widen_manual_stop(uuid, text, text, text)', 'ops.widen_master_ownership(uuid, integer, text, jsonb)', 'ops._widen_judge(uuid, integer)',
+  'ops.begin_master_maintenance(text)', 'ops.master_maintenance_active()', 'ops.stop_new_entry_for_restore(text)',
+  'ops._new_entry_lease_ok(text)', 'ops._require_new_entry_lease(text)', 'ops.ne_code_seen(text)', 'ops._new_entry_gate_problems(text, bigint)', 'ops._new_entry_lease_shared_locks()',
+  'ops.sku_kind_locked()', 'ops.sku_kind_shape_counts(integer)', 'ops.assert_sku_kind_shape_after_restore()', 'ops.session_is_db_owner()',
+  'core.guard_sku_kind_locked()', 'core.check_sku_kind_shape()', 'ops.guard_master_ownership_widen()', 'ops.guard_new_entry_gate_results()', 'ops.restrict_ne_reg_file_bytes()']);
+
+const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
+const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
+const newPassword = () => crypto.randomBytes(24).toString('base64url');
+
+/**
+ * 流す文の一覧。pw = { ロール: パスワード } = パスワードを付けるロールだけ (無いロールのパスワードは変えない)。
+ * 🚨 ロールを新しく作る文 (create role) には login を付けない: 付けるのは下の alter role (パスワードがあれば一緒に)。パスワードなしで作ったログインのロールは入れない
+ */
+export function masterEditRoleStatements({ dbName, pw = {} }) {
+  const db = ident(dbName);
+  const all = MASTER_EDIT_ROLES.join(', ');
+  const s = [];
+  for (const role of MASTER_EDIT_ROLES) {
+    s.push(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${role}') then create role ${role}; end if; end $$`);
+  }
+  for (const role of MASTER_GROUP_ROLES) {
+    // まとめのロール = ログインできない・パスワードなし (前に login で作っていても外す)
+    s.push(`alter role ${role} with nologin password null nocreaterole noinherit`);
+  }
+  for (const role of MASTER_LOGIN_ROLES) {
+    // 🚨 nosuperuser などは書かない (create-watch-roles.mjs と同じ理由)。作った後に pg_roles で確かめる
+    const inherit = MEMBER_OF[role] ? 'inherit' : 'noinherit';
+    s.push(`alter role ${role} with login${pw[role] != null ? ` password ${lit(pw[role])}` : ''} nocreaterole ${inherit} connection limit ${CONN_LIMIT[role]}`);
+    for (const [k, v] of Object.entries(ROLE_SETTINGS[role] || {})) s.push(`alter role ${role} set ${ident(k)} = ${lit(v)}`);
+    s.push(`grant connect on database ${db} to ${role}`);
+  }
+  for (const [role, group] of Object.entries(MEMBER_OF)) s.push(`grant ${group} to ${role}`);
+  // 前に付けた権限を外してから付け直す (流し直しで広い権限が残らない)
+  for (const t of new Set([...MASTER_EDIT_SELECT, ...FBA_STOCK_SELECT, ...MASTER_EDIT_WRITE.map(([, t2]) => t2), 'events.master_change_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests', 'ops.master_cutover_events',
+    'ops.master_write_sessions', 'ops.master_cutover_prereq_checks', ...REGISTER_OPS_SELECT, ...REG_CSV_OTHER_TABLES])) {
+    s.push(`revoke all on ${t} from ${all}`);
+  }
+  for (const f of [CUTOVER_FUNCTION, OBSERVE_FUNCTION, ACK_FUNCTION, LOCK_SUPPLIERS_FUNCTION, BEGIN_WRITE_FUNCTION, ...REGISTER_EDIT_FUNCTIONS, ...REGISTER_OPS_FUNCTIONS, ...REGISTER_OWNER_ONLY_FUNCTIONS,
+    ...REG_CSV_EDIT_FUNCTIONS, ...REG_CSV_OWNER_ONLY_FUNCTIONS, ...AMAZON_MAP_EDIT_FUNCTIONS, ...AMAZON_MAP_OWNER_ONLY_FUNCTIONS]) {
+    s.push(`revoke all on function ${f} from public, ${all}`);
+  }
+  // master_edit
+  for (const sc of ['core', 'ops', 'events']) s.push(`grant usage on schema ${sc} to master_edit`);
+  for (const t of MASTER_EDIT_SELECT) s.push(`grant select on ${t} to master_edit`);
+  s.push('grant usage on schema snapshots to master_edit');
+  for (const t of FBA_STOCK_SELECT) s.push(`grant select on ${t} to master_edit`);
+  for (const [priv, t] of MASTER_EDIT_WRITE) s.push(`grant ${priv} on ${t} to master_edit`);
+  s.push(`grant execute on function ${LOCK_SUPPLIERS_FUNCTION} to master_edit`);
+  s.push(`grant execute on function ${BEGIN_WRITE_FUNCTION} to master_edit`);
+  for (const f of REGISTER_EDIT_FUNCTIONS) s.push(`grant execute on function ${f} to master_edit`);
+  for (const f of REG_CSV_EDIT_FUNCTIONS) s.push(`grant execute on function ${f} to master_edit`);
+  for (const f of AMAZON_MAP_EDIT_FUNCTIONS) s.push(`grant execute on function ${f} to master_edit`);
+  s.push('grant usage on sequence core.master_version_seq to master_edit');   // version の既定値・0026 の bump_master_version の nextval (呼び手の権限)
+  // master_ops
+  s.push('grant usage on schema ops to master_ops');
+  for (const t of ['ops.master_cutover_state', 'ops.master_cutover_events', 'ops.master_legacy_gate_acks', 'ops.master_legacy_manifests']) s.push(`grant select on ${t} to master_ops`);
+  s.push(`grant execute on function ${CUTOVER_FUNCTION} to master_ops`);
+  for (const t of REGISTER_OPS_SELECT) s.push(`grant select on ${t} to master_ops`);
+  for (const f of REGISTER_OPS_FUNCTIONS) s.push(`grant execute on function ${f} to master_ops`);
+  // master_observer
+  s.push('grant usage on schema ops to master_observer');
+  s.push(`grant execute on function ${OBSERVE_FUNCTION} to master_observer`);
+  // master_gate (まとめ。ログインは master_gate_render / master_gate_minipc が INHERIT で使う)
+  s.push('grant usage on schema ops to master_gate');
+  s.push('grant select on ops.master_cutover_state to master_gate');
+  // ⑤-3b: 古い入口の門は列ごとの持ち主 (active と prepared) も読む。表は 0055 から = 無ければ付けない (流し直しで付く)。
+  //   付いていない = 門は legacy_open 以外で「持ち主を読めない」= 全部閉じる (fail-closed)
+  s.push(`do $$ begin if to_regclass('ops.master_ownership_state') is not null then execute 'revoke all on ops.master_ownership_state from ${all}'; execute 'grant select on ops.master_ownership_state to master_gate'; end if; end $$`);
+  s.push(`grant execute on function ${ACK_FUNCTION} to master_gate`);
+  // 0058 (広げる道 PR-1): 関数がある DB だけ (0058 の前は付けない = 流し直すと付く)。前に付けた実行権を外してから付け直す
+  const ifFn = (sig, body) => `do $$ begin if to_regprocedure('${sig}') is not null then ${body} end if; end $$`;
+  for (const f of [...WIDEN_EDIT_FUNCTIONS, ACK_V2_FUNCTION, ...LEASE_GATE_FUNCTIONS, ...WIDEN_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of WIDEN_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
+  // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
+  //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、
+  //   LEASE_GATE_FUNCTIONS には入れない (入れると上の revoke の対象が増える)。上の revoke の後にここで 1 行足す
+  s.push('grant usage on schema ops to new_entry_gate');
+  for (const f of LEASE_GATE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to new_entry_gate';`));
+  s.push(ifFn(LEASE_VALID_FUNCTION, `execute 'grant execute on function ${LEASE_VALID_FUNCTION} to new_entry_gate';`));
+  // 0058: 上の「画面が読む表」の GRANT (ops.ne_reg_exports の表の SELECT) の後に、file_bytes を外して列ごとに付け直す (byte 列は ops.ne_reg_file だけ)
+  s.push(RESTRICT_FILE_BYTES_SQL);
+  return s;
+}
+
+/**
+ * ロールを作る / 権限をそろえる (1 取引)。commit の前に属性を確かめ、違えば取り消す。
+ * パスワードを付けるのは: まだ無いログインのロール (新しいパスワード) / rotate に入れたロール (新しいパスワード) / pw で渡したロール (その値・試験用)。
+ * それ以外のもうあるロールのパスワードは変えない。戻り値の pw = 付けたロールのパスワードだけ
+ */
+export async function createMasterEditRoles(client, { pw = {}, rotate = [], dryRun = false } = {}) {
+  const info = (await client.query(`select current_user as owner, current_database() as db, r.rolcreaterole, r.rolsuper from pg_roles r where r.rolname = current_user`)).rows[0];
+  if (!info.rolcreaterole && !info.rolsuper) throw new Error(`${info.owner} に CREATEROLE が無い = ロールを作れない`);
+  for (const r of rotate) if (!MASTER_LOGIN_ROLES.includes(r)) throw new Error(`--rotate-password に知らないロール: ${r} (${MASTER_LOGIN_ROLES.join(' / ')})`);
+  const existing = new Set((await client.query('select rolname from pg_roles where rolname = any($1::text[])', [MASTER_LOGIN_ROLES])).rows.map((r) => r.rolname));
+  const pws = {};
+  for (const role of MASTER_LOGIN_ROLES) {
+    if (pw[role] != null) pws[role] = pw[role];
+    else if (!existing.has(role) || rotate.includes(role)) pws[role] = dryRun ? `<${role} の新しいパスワード>` : newPassword();
+  }
+  const stmts = masterEditRoleStatements({ dbName: info.db, pw: pws });
+  if (dryRun) return { info, stmts, roles: [], pw: pws, created: MASTER_LOGIN_ROLES.filter((r) => !existing.has(r)) };
+  await client.query('begin');
+  try {
+    for (const s of stmts) await client.query(s);
+    const roles = (await client.query(`select r.rolname, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolbypassrls, r.rolreplication, r.rolcanlogin, r.rolinherit, r.rolconnlimit,
+        coalesce((select string_agg(g.rolname, ',' order by g.rolname) from pg_auth_members m join pg_roles g on g.oid = m.roleid where m.member = r.oid), '') as memberships
+      from pg_roles r where r.rolname = any($1::text[]) order by r.rolname`, [MASTER_EDIT_ROLES])).rows;
+    const bad = [];
+    for (const r of roles) {
+      const why = [];
+      const login = MASTER_LOGIN_ROLES.includes(r.rolname);
+      if (r.rolsuper) why.push('superuser'); if (r.rolcreaterole) why.push('createrole'); if (r.rolcreatedb) why.push('createdb'); if (r.rolbypassrls) why.push('bypassrls'); if (r.rolreplication) why.push('replication');
+      if (login && !r.rolcanlogin) why.push('login できない');
+      if (!login && r.rolcanlogin) why.push('まとめのロールなのに login できる');
+      if (r.rolinherit !== !!MEMBER_OF[r.rolname]) why.push(r.rolinherit ? 'inherit' : 'noinherit (まとめのロールの権限を使えない)');
+      if (login && Number(r.rolconnlimit) !== CONN_LIMIT[r.rolname]) why.push(`connection limit ${r.rolconnlimit}`);
+      if (r.memberships !== (MEMBER_OF[r.rolname] || '')) why.push(`メンバー = (${r.memberships || 'なし'}) (期待 ${MEMBER_OF[r.rolname] || 'なし'})`);
+      if (why.length) bad.push(`${r.rolname}: ${why.join(' / ')}`);
+    }
+    if (roles.length !== MASTER_EDIT_ROLES.length) bad.push(`ロールが ${roles.length} 件しか無い`);
+    if (bad.length) throw new Error(`ロールの属性が期待と違う (取り消した): ${bad.join(' ; ')}`);
+    await client.query('commit');
+    return { info, stmts, roles, pw: pws, created: MASTER_LOGIN_ROLES.filter((r) => !existing.has(r)) };
+  } catch (e) { try { await client.query('rollback'); } catch { /* */ } throw e; }
+}
+
+/** --rotate-password <ロール> (何回でも) を読む */
+export function parseRotateArgs(argv) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--rotate-password') {
+      const v = argv[i + 1];
+      if (!v || v.startsWith('--')) throw new Error('--rotate-password の後にロールの名前が要る');
+      out.push(v); i++;
+    }
+  }
+  return out;
+}
+
+const ENV_OF = {
+  master_edit: ['COMPANY_DB_MASTER_EDIT_URL', 'Render (apps/master-edit)'],
+  master_ops: ['COMPANY_DB_MASTER_OPS_URL', '切替の段階を進める手の操作'],
+  new_entry_gate: ['COMPANY_DB_NEW_ENTRY_GATE_URL', '開く前のゲート (0058・miniPC の .env・開放の許可を出す / 取り消す・閉じたかを読むだけ)'],
+  master_observer: ['COMPANY_DB_MASTER_OBSERVER_URL', '⑤-2 の夜間ロード (NE の観測)'],
+  master_gate_render: ['COMPANY_DB_MASTER_GATE_RENDER_URL', 'Render の ⑤-3 の古い入口の門 (Render の env)'],
+  master_gate_minipc: ['COMPANY_DB_MASTER_GATE_MINIPC_URL', 'miniPC の ⑤-3 の古い入口の門 (miniPC の .env)'],
+};
+
+async function main() {
+  const dryRun = process.argv.includes('--dry-run');
+  const rotate = parseRotateArgs(process.argv.slice(2));
+  const base = process.env.COMPANY_DB_URL;
+  if (!base) throw new Error('COMPANY_DB_URL が要る (node -r dotenv/config …)');
+  const client = await openPgClient(base);
+  try {
+    const r = await createMasterEditRoles(client, { dryRun, rotate });
+    if (dryRun) {
+      for (const s of r.stmts) console.log(s.replace(/password '[^']*'/, "password '***'") + ';');
+      console.log(`-- パスワードを付けるロール: ${Object.keys(r.pw).join(' / ') || 'なし (もうあるロールのパスワードは変えない)'}`);
+      return;
+    }
+    console.log(`✅ ${MASTER_EDIT_ROLES.join(' / ')} を作った / 権限をそろえた (owner=${r.info.owner} db=${r.info.db})`);
+    const set = Object.keys(r.pw);
+    if (!set.length) { console.log('パスワードは変えていない (もうあるロールは今の env のまま)。変えるときは --rotate-password <ロール>'); return; }
+    console.log('環境変数に足す / 書き換える (パスワードはこの画面にしか出ない。ここに出ないロールは今の env のまま):');
+    for (const role of set) console.log(`${ENV_OF[role][0]}=${urlFor(base, role, r.pw[role])}      # ${role} = ${ENV_OF[role][1]}${r.created.includes(role) ? ' (新しく作った)' : ' (パスワードを変えた)'}`);
+  } finally { await client.end(); }
+}
+
+const isMain = process.argv[1] && /create-master-edit-roles\.mjs$/i.test(process.argv[1]);
+if (isMain) main().then(() => { process.exitCode = 0; }).catch((e) => { console.error(`❌ ${e.message}`); process.exitCode = 1; });

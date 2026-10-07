@@ -166,12 +166,16 @@ export function listStockCandidates(data, {
   // 棚ロケ (8桁数字に正規化できるもの) を先に、それ以外 (ロジザード上の特殊ロケ。
   // 実データに ZZZ-ZZZ-ZZ が存在) を後ろに並べる。特殊ロケも実在のロケコードなので、
   // 造語 (「仮想ロケ」等) にせずそのままの名前で見せる。
-  // 並び = ロケ合計フリー在庫の多い順。同ロケの期限違いロットは隣接させて期限の近い順 (先入先出)
+  // 並び = ピックロケ (ブロック P3F〜 = 本館 3F のピッキングエリア。ここ以外は保管ロケ — 倉庫ロケーション体系) を先に
+  // (中原さん 9/22「P3F にあるロケ優先、あとはどこでもいい」)、次にロケ合計フリー在庫の多い順。
+  // 同ロケの期限違いロットは隣接させて期限の近い順 (先入先出)
   const isShelf = (r) => normalizeLocationDigits(r.location).length === 8;
+  const isPickLoc = (r) => /^P3F/i.test(String(r.block || ''));
   const locKey = (r) => `${r.block}\u001f${r.location}`;   // 区切り無しだと block=A/loc=BC と block=AB/loc=C が衝突する
   const locTotals = new Map();
   for (const r of candidates) locTotals.set(locKey(r), (locTotals.get(locKey(r)) || 0) + Number(r.free));
-  const byLocThenExpiry = (a, b) => (locTotals.get(locKey(b)) - locTotals.get(locKey(a)))
+  const byLocThenExpiry = (a, b) => (Number(isPickLoc(b)) - Number(isPickLoc(a)))
+    || (locTotals.get(locKey(b)) - locTotals.get(locKey(a)))
     || String(a.location).localeCompare(String(b.location))
     || String(a.expiry || '9999').localeCompare(String(b.expiry || '9999'));
   const sorted = [...candidates.filter(isShelf).sort(byLocThenExpiry), ...candidates.filter((r) => !isShelf(r)).sort(byLocThenExpiry)];

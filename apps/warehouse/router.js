@@ -22,8 +22,10 @@ import iconv from 'iconv-lite';
 import { initDB, getDB, getStats, saveToFile, updateSyncMeta } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import { mountSkuMasterApi } from './sku-master-api.js';
+import { isRender } from '../../lib/is-render.js';
 import { importSkuMasterCSV } from './import-sku-master.js';
 import { resolveTaxRate, resolveSetTaxRate, resolveSetSalesClass, KNOWN_DECIMAL_RATES } from './rebuild-m-products.js';
+import { masterLegacyGate, legacyRecheck, legacyBannerHtml, legacyGateStatus, legacyAckHost } from '../../lib/master-legacy-gate.mjs';
 
 const router = Router();
 const upload = multer({ dest: 'data/import/' });
@@ -67,7 +69,27 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+// ─── Render では書き込まない ───
+// 同じ server.js が Render でも動き、Render の DATA_DIR に空の warehouse.db を開く。そこへ送料・原価・税率などを
+// 書いても、m_products の作り直し (miniPC) にも Render への写し (sync-to-render) にも使われず、誰にも届かない
+// (Company DB構想 10 §9 A)。黙って捨てるより、書き込みを断って miniPC 版の画面へ案内する。読むだけの GET はそのまま。
+export const MASTER_REGISTER_URL = 'https://wh.bfaith-wh.uk/apps/warehouse/register';
+const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+export function rejectWritesOnRender(req, res, next) {
+  if (!isRender() || READ_METHODS.has(req.method)) return next();
+  return res.status(409).json({
+    error: `この画面 (Render 版) では登録・編集できません。マスタ登録 (${MASTER_REGISTER_URL}) で行ってください`,
+    code: 'WAREHOUSE_WRITE_ON_RENDER',
+  });
+}
+
+router.use(rejectWritesOnRender);
 router.use(requireApiKey);
+// 🚨 マスタの古い入口の門 (Company DB構想 14 §5・§10 契約 v3 H1)。config/master-legacy-entries.mjs の warehouse の入口だけを見る:
+//    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る) = owner_cols のどれかが C のときだけ閉じる (⑤-3b・列が全部 load の入口は開いたまま)・段階 / 持ち主が読めない = 410 / 503 (何も書かない)。
+//    画面 (/register と /) は res.locals.masterLegacy で帯を出す。multer の取込 (CSV) より前 = 閉じているときはファイルを受け取らない。
+//    CSV はファイルを受け取った後・書く前にもう一度読む (legacyRecheck。受け取っている間に段階が変わっても書かない)
+router.use(masterLegacyGate('warehouse'));
 router.use(ensureDB);
 
 // ─── ヘルパー ───
@@ -81,6 +103,17 @@ function preparedQuery(sql, params = []) {
   const db = getDB();
   return db.prepare(sql).all(...params);
 }
+
+// ─── GET /api/master-legacy-gate ───
+// 切替の手順の「全部の環境で古い入口が閉じたかを読み戻す」用 (契約 v3 H1)。この環境・このプロセスが見ている段階を毎回読んで返す
+// (段階・書けるか・持ち主表と入口の一覧の指紋)。読むだけ
+router.get('/api/master-legacy-gate', async (req, res) => {
+  try {
+    res.json(await legacyGateStatus({ host: legacyAckHost() }));   // server.js の門の記録と同じ判定 (手元の PC = null = 記録を書かない)
+  } catch (e) {
+    res.status(500).json({ error: '門の状態を読めませんでした', detail: String(e && e.message) });
+  }
+});
 
 // ─── GET /api/stats ───
 
@@ -602,7 +635,7 @@ function parseCsvBuffer(buf) {
 
 // POST /api/csv/shipping — 送料CSV一括登録（追加・更新、既存は消さない）
 // CSV形式: 商品コード, 送料コード, 配送方法, 送料
-router.post('/api/csv/shipping', upload.single('file'), (req, res) => {
+router.post('/api/csv/shipping', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/shipping'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -656,7 +689,7 @@ router.post('/api/csv/shipping', upload.single('file'), (req, res) => {
 
 // POST /api/csv/genka — 原価CSV一括登録
 // CSV形式: 商品コード, 原価, 商品名（任意）
-router.post('/api/csv/genka', upload.single('file'), (req, res) => {
+router.post('/api/csv/genka', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/genka'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -698,7 +731,7 @@ function uploadSkuMasterMw(req, res, next) {
     return res.status(400).json({ error: 'アップロード処理に失敗しました' });
   });
 }
-router.post('/api/csv/m-sku-master', uploadSkuMasterMw, (req, res) => {
+router.post('/api/csv/m-sku-master', uploadSkuMasterMw, legacyRecheck('warehouse:POST:/api/csv/m-sku-master'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const csvPath = req.file.path;
   const dryRun = req.query.dry_run === '1';
@@ -1215,7 +1248,7 @@ router.post('/api/sales_class', (req, res) => {
 // 売上分類CSV一括登録
 // CSV形式: 商品コード, 売上分類(1-4)
 
-router.post('/api/csv/sales_class', upload.single('file'), (req, res) => {
+router.post('/api/csv/sales_class', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/sales_class'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -1352,7 +1385,7 @@ router.get('/api/reorder/unregistered', (req, res) => {
 
 // POST /api/csv/reorder_setting — 推奨保有月数CSV一括登録
 //   CSV形式: 商品コード, 推奨保有月数(0〜60) ／ ヘッダー行は自動スキップ
-router.post('/api/csv/reorder_setting', upload.single('file'), (req, res) => {
+router.post('/api/csv/reorder_setting', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/reorder_setting'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -1439,7 +1472,7 @@ router.post('/api/tax_rate', (req, res) => {
 // 消費税率CSV一括登録
 // CSV形式: 商品コード, 税率(0.08 or 0.1)
 
-router.post('/api/csv/tax_rate', upload.single('file'), (req, res) => {
+router.post('/api/csv/tax_rate', upload.single('file'), legacyRecheck('warehouse:POST:/api/csv/tax_rate'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
   const db = getDB();
   const buf = fs.readFileSync(req.file.path);
@@ -1624,14 +1657,14 @@ router.get('/register', (req, res) => {
     email: sess.email || '',
     displayName: sess.displayName || '',
     role: sess.role || '',
-  }));
+  }, res.locals.masterLegacy));
 });
 
 // ─── ダッシュボード（HTML）───
 
 router.get('/', (req, res) => {
   const stats = getStats();
-  res.send(renderDashboard(stats));
+  res.send(renderDashboard(stats, res.locals.masterLegacy));
 });
 
 function escapeHtml(s) {
@@ -1646,7 +1679,43 @@ function jsonForScriptTag(value) {
   );
 }
 
-function renderRegisterPage(shippingRates, session = {}) {
+/** Render で開いたときだけ出す案内 (書き込みは rejectWritesOnRender が断る) */
+export function renderOnRenderNotice() {
+  if (!isRender()) return '';
+  return `<div style="background:#fff3cd;color:#664d03;border-bottom:1px solid #ffe69c;padding:10px 24px;font-size:14px">
+    ⚠️ この画面は Render 版です。ここに出る件数は社内のデータではなく、登録・編集もできません。
+    送料・原価・税率・売上分類・SKU の登録は <a href="${MASTER_REGISTER_URL}" style="color:#664d03;font-weight:bold">マスタ登録 (社内版)</a> で行ってください。
+  </div>`;
+}
+
+// 切替で古い入口を閉じたとき (masterLegacy.frozen) に隠す書く部品 (登録・更新・削除・構成の足し引き・CSV の取込)。見る・検索・CSV ダウンロードは残す
+export const REGISTER_WRITE_SELECTORS = Object.freeze([
+  '[data-act^="reg-"]', '[data-act^="update-"]', '[data-act="del"]', '[data-act="add-sku-row"]', '[data-act="remove-sku-row"]',
+  '[data-act="edit-sku-master"]', '#m-sku-master-new-btn', '#sku-modal-submit', '#sku-modal-comps button', '#csv-card',
+]);
+export const DASHBOARD_WRITE_SELECTORS = Object.freeze(['[data-action^="reg-"]', '[data-action^="update-"]', '[data-action="delete"]']);
+/** ⑤-3b: データウェアハウスの画面の書く部品を列ごとに (送料 / 原価)。合わせると DASHBOARD_WRITE_SELECTORS と同じ */
+export const DASHBOARD_WRITE_PARTS = Object.freeze([
+  { cols: ['skus.shipping'], selectors: ['[data-action="reg-shipping"]', '[data-action="update-shipping"]', '[data-action="delete"][data-type="shipping"]'] },
+  { cols: ['sku_costs'], selectors: ['[data-action="reg-genka"]', '[data-action="update-genka"]', '[data-action="delete"][data-type="genka"]'] },
+].map((p) => Object.freeze({ ...p, cols: Object.freeze(p.cols), selectors: Object.freeze(p.selectors) })));
+/**
+ * ⑤-3b: /register の書く部品を列ごとに分ける (その列の持ち主が C になった部品だけ隠す)。
+ *   SKU タブ (Amazon SKU ↔ NE コードの対応 = listing_components.amazon) と、それ以外 (送料・原価・売上分類・税率・推奨保有月数) を分ける。
+ *   合わせると REGISTER_WRITE_SELECTORS と同じ部品 (試験が確かめる)。CSV のカードは、全部の種類を閉じたときだけ丸ごと隠す (match 'all')
+ */
+export const REGISTER_WRITE_PARTS = Object.freeze([
+  { cols: ['skus.shipping'], selectors: ['[data-act="reg-ship"]', '[data-act="update-ship"]', '[data-act="del"][data-type="shipping"]', '#csv-tab-shipping'] },
+  { cols: ['sku_costs'], selectors: ['[data-act="reg-genka"]', '[data-act="update-genka"]', '[data-act="del"][data-type="genka"]', '#csv-tab-genka'] },
+  { cols: ['products.sales_class'], selectors: ['[data-act="reg-class"]', '[data-act="update-class"]', '[data-act="del"][data-type="sales_class"]', '#csv-tab-salesclass'] },
+  { cols: ['skus.tax_rate', 'skus.tax_class'], selectors: ['[data-act="reg-tax"]', '[data-act="update-tax"]', '[data-act="del"][data-type="tax_rate"]', '#csv-tab-taxrate'] },
+  { cols: ['skus.reorder_months'], selectors: ['[data-act="reg-reorder"]', '[data-act="update-reorder"]', '[data-act="del"][data-type="reorder_setting"]', '#csv-tab-reorder'] },
+  { cols: ['listing_components.amazon'], selectors: ['[data-act="reg-sku"]', '[data-act="reg-sku-multi"]', '[data-act="add-sku-row"]', '[data-act="remove-sku-row"]', '[data-act="edit-sku-master"]',
+    '[data-act="del"][data-type="m-sku-master"]', '#m-sku-master-new-btn', '#sku-modal-submit', '#sku-modal-comps button', '#csv-tab-msku'] },
+  { cols: ['skus.shipping', 'sku_costs', 'products.sales_class', 'skus.tax_rate', 'skus.tax_class', 'skus.reorder_months', 'listing_components.amazon'], match: 'all', selectors: ['#csv-card'] },
+].map((p) => Object.freeze({ ...p, cols: Object.freeze(p.cols), selectors: Object.freeze(p.selectors) })));
+
+function renderRegisterPage(shippingRates, session = {}, legacy = null) {
   const ratesJson = jsonForScriptTag(shippingRates);
   const isAdmin = session.role === 'admin';
   const userLabel = session.displayName || session.email || '';
@@ -1719,6 +1788,8 @@ function renderRegisterPage(shippingRates, session = {}) {
   </style>
 </head>
 <body>
+  ${renderOnRenderNotice()}
+  ${legacyBannerHtml(legacy, { parts: REGISTER_WRITE_PARTS })}
   <div class="header">
     <h1>マスタ登録</h1>
     <div class="spacer"></div>
@@ -1790,7 +1861,7 @@ function renderRegisterPage(shippingRates, session = {}) {
     </div>
 
     <!-- CSV一括アップロード -->
-    <div class="card">
+    <div class="card" id="csv-card">
       <h2>CSV一括アップロード</h2>
       <div class="tabs">
         <button class="active" id="csv-tab-shipping" onclick="switchCsvType('shipping',this)">送料</button>
@@ -1847,7 +1918,7 @@ function renderRegisterPage(shippingRates, session = {}) {
 
     async function api(path, opts) {
       const r = await fetch(B + path, opts);
-      if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.error || r.statusText); }
+      if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.message || e.error || r.statusText); }
       return r.json();
     }
 
@@ -2463,6 +2534,13 @@ function renderRegisterPage(shippingRates, session = {}) {
       document.getElementById('csv-result').textContent = '';
     }
     switchCsvType('shipping', document.getElementById('csv-tab-shipping'));
+    // 切替で送料の CSV を閉じたとき (⑤-3b・帯の CSS で隠した) は、見えている最初の種類を選ぶ (隠した種類を選んだまま取り込ませない)
+    (function () {
+      var t = document.getElementById('csv-tab-shipping');
+      if (!t || getComputedStyle(t).display !== 'none') return;
+      var v = Array.prototype.find.call(document.querySelectorAll('#csv-card .tabs button'), function (b) { return getComputedStyle(b).display !== 'none'; });
+      if (v) v.click();
+    })();
 
     function downloadMissing() {
       window.location.href = B + '/api/missing/download?type=' + curType;
@@ -2512,7 +2590,7 @@ function renderRegisterPage(shippingRates, session = {}) {
             document.getElementById('c-reorder').textContent = c.reorder || 0;
           } catch {}
         } else {
-          document.getElementById('csv-result').textContent = '❌ エラー: ' + (data.error || '不明');
+          document.getElementById('csv-result').textContent = '❌ エラー: ' + (data.message || data.error || '不明');
           toast('アップロード失敗', true);
         }
       } catch(e) {
@@ -2528,7 +2606,7 @@ function renderRegisterPage(shippingRates, session = {}) {
 </html>`;
 }
 
-function renderDashboard(stats) {
+function renderDashboard(stats, legacy = null) {
   // 未登録データ件数は重いのでダッシュボード初期表示では取得しない（JSで非同期取得）
   const missingCounts = {};
 
@@ -2582,6 +2660,8 @@ function renderDashboard(stats) {
   </style>
 </head>
 <body>
+  ${renderOnRenderNotice()}
+  ${legacyBannerHtml(legacy, { parts: DASHBOARD_WRITE_PARTS })}
   <div class="header">
     <h1>Data Warehouse</h1>
     <nav>
@@ -2721,7 +2801,7 @@ function renderDashboard(stats) {
       const res = await fetch(BASE + path, opts);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data.error || ('HTTP ' + res.status));
+        throw new Error(data.message || data.error || ('HTTP ' + res.status));
       }
       return data;
     }

@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
   sales_giftwrap_jpy REAL NOT NULL DEFAULT 0,
   sales_tax_jpy REAL NOT NULL DEFAULT 0,
 
-  -- 手数料 7 列
+  -- 手数料 7 列 (費用を正。2026-09-29 から 符号つきの正味を反転 = 返品で戻る分は差し引く・返品だけの日は負になりうる。
+  --   前は行ごとの絶対値 = 戻りも費用に数えていた。Codex #1522 R1 High)
   commission_jpy REAL NOT NULL DEFAULT 0,
   fba_fulfillment_jpy REAL NOT NULL DEFAULT 0,
   fba_storage_jpy REAL NOT NULL DEFAULT 0,
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
   warehouse_damage_jpy REAL NOT NULL DEFAULT 0,
   warehouse_lost_jpy REAL NOT NULL DEFAULT 0,
   safe_t_jpy REAL NOT NULL DEFAULT 0,
+  -- 返金 = 本体 + 送料 + ギフト包装 − 返品の手数料 (2026-09-29 から本体以外も。列の名前は昔のまま)
   refund_principal_jpy REAL NOT NULL DEFAULT 0,
   reversal_reimbursement_jpy REAL NOT NULL DEFAULT 0,
 
@@ -55,6 +57,21 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
   misc_fee_jpy REAL NOT NULL DEFAULT 0,
   other_fee_jpy REAL NOT NULL DEFAULT 0,
   other_amount_jpy REAL NOT NULL DEFAULT 0,
+
+  -- Easy Ship の配送料 (2026-09-28)。決済の額 = 税込・費用を正で持つ (返金は負)。注文番号で SKU に割り振った分
+  --   (同じ注文の売上の行の SKU へ・複数 SKU は本体売上の割合・本体が 0 なら等分・1 円単位で端数は大きい順)。
+  --   🚨 SKU ごとの利益を見るための列 = profit_amount からは引かない。月の数字の Easy Ship は全部アカウント単位の手数料 (easy_ship) で引く
+  --   (二つの表に分けると、片方だけの失敗や月をまたぐ遅着で二重・漏れが起きる。Codex #1520 R1)
+  easy_ship_jpy REAL NOT NULL DEFAULT 0,
+
+  -- 値引き (promotion_jpy) のうち消費税の分 (promotion_type = TaxDiscount・2026-09-29)。promotion_jpy と同じ符号の決め (正味を反転 = 値引きを正・戻りを負)。
+  --   税抜で引いた利益 (Amazon 分析) では値引きからこの分を除く (売上の本体・送料は税抜 = 値引きも税抜にそろえる)
+  --   NULL = まだ計算していない (列を足す前に作った行)。作り直すと数値になる (Codex #1522 R3)
+  promotion_tax_jpy REAL,
+
+  -- 出品者が付けた Amazon ポイント (PointsGranted − / PointsReturned + の正味を反転 = 費用を正・2026-09-29)。profit_amount で引く。
+  --   税の扱いが決まっていないので額面のまま (÷1.1 しない)。列を足す前の行は 0 = その行の profit_amount もポイントを引いていない (行の中でつじつまが合う)
+  points_jpy REAL NOT NULL DEFAULT 0,
 
   -- 原価関連 4 列 (snapshot 方式)
   unit_cost_snapshot REAL,                    -- 取引日時点の原価 (一度書いたら不変)

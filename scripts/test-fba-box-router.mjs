@@ -211,6 +211,31 @@ await t('応答喪失後の送り直しは、作業者が無効になってい�
   assert.equal(back.j.ok, true, JSON.stringify(back.j));
 });
 
+await t('複数の箱へ分けて入れる (splits): 1 回の POST で 2 箱・送り直しは前の結果・配列でなければ断る (中原さん 2026-09-23)', async () => {
+  const r0 = rows[0];
+  assert.ok(r0.planned_qty >= 2, '分けて入れられる予定数の行で試す');
+  const st = await call('GET', `/api/state?run=${runId}`);
+  const mine = st.j.placements.filter((x) => x.row_id === r0.id);
+  for (const m of mine) assert.equal((await call('POST', `/api/placements/${m.id}/revoke`, { body: { worker_id: memberId } })).j.ok, true);
+  const body = { run_id: runId, row_id: r0.id, worker_id: memberId, request_id: 'split-1',
+    splits: [{ box_id: box1.boxId, qty: r0.planned_qty - 1 }, { box_id: box2.boxId, qty: 1 }] };
+  const first = await call('POST', '/api/placements', { body });
+  assert.equal(first.j.ok, true, JSON.stringify(first.j));
+  assert.deepEqual(first.j.placements.map((p) => p.boxId), [box1.boxId, box2.boxId]);
+  const again = await call('POST', '/api/placements', { body });
+  assert.equal(again.j.already, true, JSON.stringify(again.j));
+  const bad = await call('POST', '/api/placements', { body: Object.assign({}, body, { request_id: 'split-2', splits: 'x' }) });
+  assert.equal(bad.status, 400, '配列でない splits を 1 箱の投入として通さない');
+  // 後始末 = まとめて取り消す API (1 トランザクション)。元どおり box1 に全部 (box2 はあとで空箱として取消の試験に使う)
+  const ids = first.j.placements.map((p) => p.placementId);
+  assert.equal((await call('POST', '/api/placements/revoke-batch', { body: { placement_ids: ids } })).status, 400, '作業者なしは断る');
+  const rb = await call('POST', '/api/placements/revoke-batch', { body: { worker_id: memberId, placement_ids: ids } });
+  assert.equal(rb.j.ok, true, JSON.stringify(rb.j)); assert.equal(rb.j.revoked, 2);
+  assert.equal((await call('POST', '/api/placements/revoke-batch', { body: { worker_id: memberId, placement_ids: ids } })).j.already, 2, '押し直しても同じ結果');
+  const back = await call('POST', '/api/placements', { body: { run_id: runId, row_id: r0.id, box_id: box1.boxId, qty: r0.planned_qty, worker_id: memberId, request_id: 'restore-split' } });
+  assert.equal(back.j.ok, true, JSON.stringify(back.j));
+});
+
 await t('職員の本人確認だけの API: PIN が違えば通らない・通れば監査に残る (PQ-R3 high#4)', async () => {
   assert.equal((await call('POST', '/api/staff/verify', { body: { auth_worker_id: staffId, auth_pin: '0000', purpose: 'discard_broken_pending' } })).status, 403);
   assert.equal((await call('POST', '/api/staff/verify', { body: { auth_worker_id: memberId, auth_pin: '2468', purpose: 'x' } })).status, 403, '利用者は通さない');
@@ -389,6 +414,28 @@ await t('端末から POST /api/runs/from-picking → active な納品回。二�
   const st = await call('GET', `/api/state?run=${pkRunId}`);
   assert.equal(st.j.run.status, 'active'); assert.equal(st.j.groups[0].display_name, '通常'); assert.equal(st.j.rows.length, 2);
 });
+await t('納品ピッキング PDF: 元の picking 実行の PDF が残っていれば iPad (/api/state) と管理画面に公開 URL、無ければ出さない (中原さん 2026-10-01)', async () => {
+  const pdfDir = path.join(tmp, 'picking-prep-pdf');
+  const pdf = path.join(pdfDir, '501.pdf');
+  // PDF がまだ無い (or 40 件の保持から外れた) 回: null / ボタンなし
+  assert.equal((await call('GET', `/api/state?run=${pkRunId}`)).j.pickingPdfUrl, null);
+  assert.ok(!(await (await fetch(`${BASE}/admin`, { headers: { 'x-test-session': 'admin' } })).text()).includes('/print/picking/501/pdf'));
+  fs.mkdirSync(pdfDir, { recursive: true });
+  fs.writeFileSync(pdf, '%PDF-1.4 test');
+  try {
+    assert.equal((await call('GET', `/api/state?run=${pkRunId}`)).j.pickingPdfUrl, '/print/picking/501/pdf');
+    const html = await (await fetch(`${BASE}/admin`, { headers: { 'x-test-session': 'admin' } })).text();
+    assert.ok(html.includes('href="/print/picking/501/pdf"') && html.includes('📄 ピッキングPDF'), '管理画面の納品回一覧にボタン');
+    assert.ok(!html.includes('/print/picking/502/pdf'), 'PDF の無い回 (502) には出さない');
+    // 取消した回は iPad にも出さない (開いたままの画面が 10 秒ごとに取り直すと消える — Codex #1575 R1 #1)
+    const c = db.createRunFromPicking({ pickingRun: { id: 503, delivery_date: '2026-10-02' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: pkRows }], createdBy: 't' });
+    fs.writeFileSync(path.join(pdfDir, '503.pdf'), '%PDF-1.4 test');
+    assert.equal((await call('GET', `/api/state?run=${c.runId}`)).j.pickingPdfUrl, '/print/picking/503/pdf');
+    db.getDB().prepare("UPDATE fbx_runs SET status = 'cancelled' WHERE id = ?").run(c.runId);
+    assert.equal((await call('GET', `/api/state?run=${c.runId}`)).j.pickingPdfUrl, null);
+    assert.ok(!(await (await fetch(`${BASE}/admin`, { headers: { 'x-test-session': 'admin' } })).text()).includes('/print/picking/503/pdf'), '管理画面にも出さない');
+  } finally { fs.rmSync(pdf, { force: true }); fs.rmSync(path.join(pdfDir, '503.pdf'), { force: true }); }
+});
 await t('作業を終える: 利用者は 403 / 職員PIN + 未投入あり → 409 incomplete (一覧) / acknowledge で done', async () => {
   const st = await call('GET', `/api/state?run=${pkRunId}`);
   const gid = st.j.groups[0].id;
@@ -400,7 +447,16 @@ await t('作業を終える: 利用者は 403 / 職員PIN + 未投入あり → 
   assert.equal((await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: memberId, send_qty: 2 } })).status, 403);
   const sq = await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: staffId, pin: '2468', send_qty: 2, reason: 'stock_short' } });
   assert.equal(sq.j.ok, true, JSON.stringify(sq.j)); assert.equal(sq.j.shortage, row.planned_qty - 2);
-  const open = await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468' } });
+  // 予定より増やす (2026-10-05): 理由が「在庫が少ない」なら 400 / 「本社指示」なら通り、iPad の状態に増やした数が載る
+  const upBad = await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: staffId, pin: '2468', send_qty: row.planned_qty + 1, reason: 'stock_short' } });
+  assert.equal(upBad.status, 400); assert.equal(upBad.j.error, 'bad_reason');
+  const up = await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: staffId, pin: '2468', send_qty: row.planned_qty + 1, reason: 'hq_order' } });
+  assert.equal(up.j.ok, true, JSON.stringify(up.j)); assert.equal(up.j.extra, 1); assert.equal(up.j.shortage, 0);
+  const stUp = (await call('GET', `/api/state?run=${pkRunId}`)).j.rows.find((x) => x.id === row.id);
+  assert.equal(stUp.extra_qty, 1); assert.equal(stUp.extra_reason, 'hq_order'); assert.equal(stUp.shortage_qty, null);
+  // 元の流れに戻す (送る数 2)
+  assert.equal((await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: staffId, pin: '2468', send_qty: 2, reason: 'stock_short' } })).j.ok, true);
+  const open =await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468' } });
   assert.equal(open.status, 409); assert.equal(open.j.error, 'open_boxes');
   assert.equal((await call('POST', `/api/boxes/${bx.boxId}/close`, { body: { worker_id: memberId, measured_kg: 1.2 } })).j.ok, true);
   const inc = await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468' } });

@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body data-can-decide="<%= canDecide ? '1' : '0' %>" data-gate-message="<%= gateMessage %>">
+  <%- include('_header') %>
+  <%#
+    NE に取り込む CSV。流れ = ① CSV を作る → ② ダウンロードして、取り込む日に確かめる → ③ NE に取り込んで申告 → ④ 翌朝の照合で行ごとの届き方。
+    上の流れの帯がいまの段と「次にやること」1 つを出す。ファイルは 1 つずつ札にして、札ごとに次の操作を 1 つ目立たせる。
+    API・CSV の中身は変えない (画面の描き方と画面の JS だけ・10/5)
+  %>
+  <div class="page" id="csv-page">
+    <div class="crumb"><a href="./">マスタの判断</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span>NE に取り込む CSV</span></div>
+    <div class="ph">
+      <div>
+        <h1>NE に取り込む CSV</h1>
+        <div class="meta"><span id="today">今日の照合: 読み込み中…</span></div>
+        <div class="lead">判断の画面で <b>NE を直す</b> と承認した差を、NE の一括登録 (商品管理の一括登録) で取り込むファイルにします。1 つのファイルに NE の列は 1 つだけ (+ 商品コード)。<b>在庫の列は入りません</b>。</div>
+      </div>
+      <div class="ph-actions">
+        <a class="btn" href="manual#csv"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a>
+        <a class="btn soft" href="./"><svg class="ic" aria-hidden="true"><use href="#i-scale"/></svg>判断の画面へ</a>
+      </div>
+    </div>
+
+    <% if (!canDecide) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">見るだけです</div><div class="hint"><%= gateMessage %></div></div></div><% } %>
+    <div id="notoday"></div>
+
+    <section class="panel hud flow" aria-labelledby="flow-h">
+      <h2 class="sr" id="flow-h">取り込みの流れ</h2>
+      <ol class="steps" id="flow">
+        <li class="step" id="st-1"><div class="dot">1</div><div class="t">CSV を作る</div><div class="cnt-big num" id="st1-n">–</div><div class="s" id="st1-s">CSV にできる承認</div></li>
+        <li class="step" id="st-2"><div class="dot">2</div><div class="t">ダウンロード・確かめる</div><div class="cnt-big num" id="st2-n">–</div><div class="s" id="st2-s">取り込む日に確かめるファイル</div></li>
+        <li class="step" id="st-3"><div class="dot">3</div><div class="t">NE に取り込んで申告</div><div class="cnt-big num" id="st3-n">–</div><div class="s" id="st3-s">今日確かめた・まだ申告していないファイル</div></li>
+        <li class="step" id="st-4"><div class="dot">4</div><div class="t">翌朝の届き方</div><div class="cnt-big num" id="st4-n">–</div><div class="s" id="st4-s">届かなかった・確かめが要る行</div></li>
+      </ol>
+      <div class="nextline" id="next"><svg class="ic" aria-hidden="true"><use href="#i-arrow"/></svg><span class="grow" id="next-t">読み込み中…</span><span id="next-a"></span></div>
+    </section>
+
+    <div class="callout warn" id="rules"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">
+      <div class="t">取り込む日の 2 つの決まり</div>
+      <ol>
+        <li>取り込む日は、その商品を NE の画面で手で直さないでください (直した分は翌朝「確かめが要る」になります)。</li>
+        <li>申告の結果は NE の履歴の<b>メッセージ</b>で選んでください。一部の行が失敗してもステータスは「処理成功」のままです (「N件成功、M件失敗しました。」= 一部失敗した)。</li>
+      </ol>
+    </div></div>
+    <div class="msgline" id="msg" role="status" aria-live="polite"></div>
+
+    <section class="panel" id="make" tabindex="-1" aria-labelledby="make-h">
+      <div class="panel-h"><span class="stepno">1</span><h2 id="make-h">CSV を作る (列ごと)</h2><span class="sub">試し用 (実機で確かめる前) は 1 つのファイルに 5 行まで</span></div>
+      <div class="tblwrap">
+        <table class="tbl">
+          <thead><tr><th scope="col">種類</th><th scope="col">項目</th><th scope="col">CSV の見出し</th><th class="n" scope="col">CSV にできる</th><th class="n" scope="col">予約中</th><th scope="col">実機の確かめ</th><th scope="col"><span class="sr">操作</span></th></tr></thead>
+          <tbody id="groups"><tr class="loadrow"><td colspan="7">読み込み中…</td></tr></tbody>
+        </table>
+      </div>
+      <details class="more" id="pick-more">
+        <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>CSV にできる承認の中身を見る・選んで作る (テスト用の商品だけで作るとき) <span class="b mute" id="items-n">–</span></summary>
+        <div class="body">
+          <div class="tblwrap" style="max-height:46vh;overflow:auto">
+            <table class="tbl">
+              <thead><tr><th class="ck" scope="col"><span class="sr">選ぶ</span></th><th scope="col">SKU</th><th scope="col">項目</th><th scope="col">NE の今の値 → 直す値</th><th scope="col">状態</th></tr></thead>
+              <tbody id="items"></tbody>
+            </table>
+          </div>
+          <div class="vrow" style="margin-top:10px"><span id="selcount" aria-live="polite">0 件を選択中</span> <button class="btn" type="button" id="make-sel">選んだものだけで CSV を作る</button><span class="hint">1 つのファイルには同じ種類・同じ項目だけ</span></div>
+        </div>
+      </details>
+    </section>
+
+    <section class="panel" aria-labelledby="files-h">
+      <div class="panel-h"><span class="stepno">2</span><h2 id="files-h">作ったファイル</h2><span class="sub">ファイルごとに、次にやることを 1 つ目立たせています</span></div>
+      <div class="files" id="exports"><div class="empty">読み込み中…</div></div>
+    </section>
+
+    <section class="panel soft" aria-labelledby="screen-h">
+      <div class="panel-h"><svg class="ic" aria-hidden="true"><use href="#i-ext"/></svg><h2 id="screen-h">NE の画面で直す (CSV にしない)</h2><span class="b mute" id="screen-n">–</span><span class="sub">直ったら翌朝の照合が「完了」にします</span></div>
+      <div class="tblwrap">
+        <table class="tbl">
+          <thead><tr><th scope="col">SKU</th><th scope="col">項目</th><th scope="col">NE の今の値 → 直す値</th><th scope="col">CSV にしない理由</th></tr></thead>
+          <tbody id="screen"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel soft" aria-labelledby="ver-h">
+      <div class="panel-h"><svg class="ic" aria-hidden="true"><use href="#i-flask"/></svg><h2 id="ver-h">実機で確かめた結果</h2><span class="sub">ok を残した列は、1 つのファイルに 1,000 行まで作れるようになります</span></div>
+      <p class="hint" style="margin-bottom:10px">NE に試しのファイルを取り込んで、その列が正しく変わった (ほかの列は変わらなかった) ことを NE の画面で見たら残します。</p>
+      <div class="vrow">
+        <label class="sr" for="v-key">種類・項目</label><select class="in" id="v-key"></select>
+        <label class="sr" for="v-result">結果</label><select class="in" id="v-result"><option value="ok">ok (正しく取り込めた)</option><option value="ng">ng (だめだった)</option></select>
+        <label class="sr" for="v-export">ファイル番号</label><input class="in w-xs" id="v-export" inputmode="numeric" placeholder="ファイル番号">
+        <label class="sr" for="v-note">メモ</label><input class="in" id="v-note" style="flex:1;min-width:220px" maxlength="500" placeholder="メモ (見たこと・500 字まで)">
+        <button class="btn" type="button" id="v-save">実機で確かめた結果を残す</button>
+      </div>
+      <div id="verified" class="hint" style="margin-top:8px"></div>
+    </section>
+    <div class="hint" id="gate"></div>
+  </div>
+
+  <div class="drawer-bg" id="dr-bg">
+    <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="dr-t">
+      <div class="dr-h"><h2 id="dr-t">ファイルの行</h2><button class="iconbtn" type="button" id="dr-x" aria-label="閉じる (Esc)"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button></div>
+      <div id="detail"></div>
+    </aside>
+  </div>
+
+  <%- include('_footer') %>
+<script>
+(() => {
+  const CAN = document.body.dataset.canDecide === '1';
+  const GATE = document.body.dataset.gateMessage || '';
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const icon = (id, cls) => '<svg class="ic' + (cls ? ' ' + cls : '') + '" aria-hidden="true"><use href="#' + id + '"/></svg>';
+  const COL = { name: '商品名', handling: '取扱区分', tax_rate: '税率', standard_price_jpy: '売価', cost: '原価', primary_supplier: '代表の仕入先', components: '構成', exists: '有無', kind: '種類', parent: '代表 (親)' };
+  const KIND = { products: '単品 (商品 CSV)', sets: 'セット (セット商品 CSV)' };
+  const FILE = { made: '作った (まだ確かめていない)', checked: '確かめた', declared: '取り込んだ (申告済み)', void: '使えない (void)' };
+  const FILE_TONE = { made: 'warn', checked: 'info', declared: 'ok', void: 'err' };
+  const ROW = { reserved: '予約中', confirmed: '確認済み', not_reflected: '反映されていない', needs_look: '確かめが要る', unconfirmable: '確認できない (翌朝の照合待ち)', cancelled: '取り消し' };
+  const ROW_TONE = { reserved: 'info', confirmed: 'ok', not_reflected: 'err', needs_look: 'warn', unconfirmable: 'mute', cancelled: 'mute' };
+  const WHY = { col_not_csv: 'この項目は CSV にしない (構成・セットの税率・有無・種類)', code_chars: 'コードに使えない文字がある', empty_word: '値が「empty」という文字 (NE では消す指示になる)',
+    name_control: '改行・制御文字を含む', name_astral: '絵文字などを含む', name_length: '255 文字を超える', name_blank: '名前が空・前後に空白', yen_range: '1〜999,999,999 の整数でない',
+    tax_value: '10% か 8% でない', handling_value: '取扱中 / 取扱中止 でない', supplier_format: '仕入先コードが 4 桁の数字でない', parent_code: '親のコードに使えない文字がある', target_mismatch: '承認の目標が候補と合わない',
+    ne_code_pending: 'NE のコードの元の書き方が、今日の照合の分でまだ無い (照合の後に出ます)', ne_code_unknown: 'NE の取得にこのコードが無い', ne_code_collided: 'NE に同じコードの書き方が 2 つある (大文字・小文字違い。NE を見て決める)',
+    ne_code_invalid: 'NE のコードに CSV に書けない文字がある', parent_code_unknown: '親の名札の書き方が決まらない',
+    name_is_code: '名前が商品コードと同じ (コードは名前ではない = NE に入れない。社内 (ポータル) で本当の名前を入れる)' };
+  const VOIDWHY = { superseded: '後から別の判断があった', check_failed: '直前の確かめで外れた', rejected_all: 'NE に全部拒まれた', by_user: '使わないにした' };
+  const FAIL = { not_latest_approval: '承認がもう最後の判断ではない', done: 'もう完了した (NE が目標の値になった)', value_changed: '値が変わった', 'waiting:not_current': '今朝の照合に出ていない (NE の値が変わった)', reserved: 'ほかのファイルが予約中',
+    // 今の決まりで確かめ直して外れた (直す前に作ったファイル。#1629)。ダウンロードも 410 (unsafe) で配らない
+    'unsafe:name_is_code': '今の決まりでは使えない (名前が商品コードと同じ行がある)', 'unsafe:cell_format': '今の決まりでは使えない (値の形が違う行がある)',
+    'unsafe:bytes_differ': '今の決まりでは使えない (今の作り方とファイルの中身が違う)', 'unsafe:col_not_csv': '今の決まりでは使えない (CSV にしない項目)' };
+  // 申告の 3 択 (NE の「進捗状況・履歴」のメッセージで選ぶ)
+  const RESULTS = [['ok', '全部取り込めた', '「N件成功しました。」だけ'], ['partial', '一部失敗した', '「N件成功、M件失敗しました。」'], ['rejected_all', '全部拒まれた', '1 件も成功していない']];
+  const show = (v) => (v === null || v === undefined ? '<span class="muted">(空)</span>' : esc(typeof v === 'object' ? JSON.stringify(v) : v));
+  // 税率は NE の書き方 (消費税率 % = 10 / 8) で見せる (CSV にも 10 / 8 と書く。値は Company DB の形 0.1 / 0.08)
+  const isRate = (x, v) => x.col === 'tax_rate' && typeof v === 'number' && Number.isFinite(v);
+  const pct = (v) => Math.round(v * 1000) / 10;
+  const showN = (x) => (isRate(x, x.n) ? esc(pct(x.n) + '%') : show(x.n));
+  const target = (x) => (x.col === 'parent' && x.value === null ? '親なし' : isRate(x, x.value) ? esc(pct(x.value) + '%') : show(x.value));
+  const toDate = (s) => { if (!s) return null; const d = new Date(String(s).replace(' ', 'T').replace(/([+-]\d\d)$/, '$1:00')); return isNaN(d) ? null : d; };
+  const fmtAt = (s) => { const d = toDate(s); if (!d) return String(s || '').slice(0, 16);
+    try { return new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(d); } catch (e) { return String(s).slice(0, 16); } };
+  const who = (email) => String(email || '').split('@')[0];
+  const hasWin = typeof window !== 'undefined';
+  const ME = hasWin ? (window.MasterEdit = window.MasterEdit || {}) : {};
+  let S = null, selected = new Set(), vDefaultKey = '';
+
+  async function getJson(url) { const r = await fetch(url, { headers: { Accept: 'application/json' } }); const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }
+  async function postJson(url, body) {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body || {}) });
+    const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) { const e = new Error(j.error || ('HTTP ' + r.status)); e.details = j.details; throw e; } return j;
+  }
+  function setMsg(text, cls) { const m = $('msg'); if (m.setAttribute) m.setAttribute('role', cls === 'err' ? 'alert' : 'status'); m.className = 'msgline ' + (cls || ''); m.textContent = text || ''; if (text && ME.toast && cls === 'ok') ME.toast(text.split('。')[0]); }
+
+  async function load() {
+    S = await getJson('api/csv/summary');
+    if (!S.applied) { $('today').textContent = 'NE 用 CSV の記録の表 (migration 0040) がまだ入っていません'; return; }
+    $('today').innerHTML = S.run ? ('最新の照合 <b class="num">' + esc(fmtAt(S.observed_at)) + '</b>' + (S.today ? ' <span class="b ok">今日の回</span>' : ' <span class="b warn">今日の回ではない</span>')) : '最新の照合: まだありません';
+    $('notoday').innerHTML = (S.today ? '' : '<div class="callout err">' + icon('i-x') + '<div class="grow"><div class="t">今日 (' + esc(S.today_jst) + ') の照合の回がまだ無いので、CSV を作る・取り込む直前に確かめるはできません</div><div class="hint">今朝の照合が止まった・まだ のどちらかです。</div></div></div>')
+      + (S.ne_codes && S.ne_codes.current ? '' : '<div class="callout warn">' + icon('i-warn') + '<div class="grow"><div class="t">NE のコードの元の書き方 (大文字・小文字) が今日の照合の分でまだ無いので、CSV にできる承認はありません</div><div class="hint">全部「NE の画面で直す」に出ます。</div></div></div>');
+    $('groups').innerHTML = S.groups.length ? S.groups.map((g) => '<tr><td style="white-space:nowrap">' + esc(KIND[g.kind]) + '</td><td>' + esc(COL[g.col] || g.col) + '</td><td><span class="mono">' + esc(g.header) + '</span></td><td class="n"><b>' + g.csv + '</b></td><td class="n">' + g.reserved + '</td>'
+      + '<td>' + (g.verified ? '<span class="b ok">' + icon('i-check') + '済み (1,000 行まで)</span>' : '<span class="b mute">まだ = 試し用 (5 行まで)</span>') + '</td>'
+      + '<td style="text-align:right"><button class="btn sm' + (CAN && S.today && g.csv ? ' pri' : '') + '" type="button" data-make="' + esc(g.key) + '"' + (CAN && S.today && g.csv ? '' : ' disabled') + '>CSV を作る</button></td></tr>').join('')
+      : '<tr class="loadrow"><td colspan="7">CSV にする列がありません</td></tr>';
+    for (const b of document.querySelectorAll('[data-make]')) b.onclick = () => { const [kind, col] = b.dataset.make.split(':'); make({ kind, col }, b); };
+    selected = new Set();
+    const free = S.csv_items.filter((x) => !x.export_id).length;
+    $('items-n').textContent = free + ' 件';
+    $('items').innerHTML = S.csv_items.length ? S.csv_items.map((x, i) => '<tr><td class="ck">' + (x.export_id ? '' : '<input type="checkbox" class="ckb" data-i="' + i + '" aria-label="' + esc(x.code_norm + ' ' + (COL[x.col] || x.col)) + ' を選ぶ">') + '</td><td class="code">' + esc(x.code_norm) + '</td><td>' + esc(COL[x.col] || x.col)
+      + ' <span class="muted">' + esc(x.sku_kind === 'set' ? 'セット' : '単品') + '</span></td><td>' + showN(x) + ' <span class="muted">→</span> <b>' + target(x) + '</b></td><td>'
+      + (x.export_id ? '<span class="b info">予約中 (ファイル ' + x.export_id + ')</span>' : '<span class="b mute">CSV にできる</span>') + '</td></tr>').join('') : '<tr class="loadrow"><td colspan="5">ありません</td></tr>';
+    for (const cb of document.querySelectorAll('#items input[type=checkbox]')) cb.onchange = () => { const i = Number(cb.dataset.i); if (cb.checked) selected.add(i); else selected.delete(i); $('selcount').textContent = selected.size + ' 件を選択中'; };
+    $('selcount').textContent = '0 件を選択中';
+    $('make-sel').disabled = !CAN || !S.today;
+    $('screen-n').textContent = S.ne_screen.length + ' 件';
+    $('screen').innerHTML = S.ne_screen.length ? S.ne_screen.map((x) => '<tr><td class="code">' + esc(x.code_norm) + '</td><td>' + esc(COL[x.col] || x.col) + (x.child ? ' / ' + esc(x.child) : '') + '</td><td>' + showN(x) + ' <span class="muted">→</span> <b>' + target(x) + '</b></td><td class="muted">' + esc(WHY[x.reason] || x.reason) + '</td></tr>').join('')
+      : '<tr class="loadrow"><td colspan="4">ありません</td></tr>';
+    renderExports();
+    renderFlow();
+    const keepKey = $('v-key').value;
+    $('v-key').innerHTML = S.groups.map((g) => '<option value="' + esc(g.key) + '">' + esc(KIND[g.kind] + ' / ' + (COL[g.col] || g.col)) + '</option>').join('');
+    $('verified').innerHTML = S.verified.length ? '記録: ' + S.verified.map((v) => esc(v.kind + ':' + v.col + ' ' + v.result + ' (' + who(v.verified_by) + ' ' + (v.verified_at || '').slice(0, 10) + ')')).join(' / ') : 'まだ記録がありません';
+    vDefaultKey = S.groups.length ? S.groups[0].key : '';
+    if (keepKey && S.groups.some((g) => g.key === keepKey)) $('v-key').value = keepKey;
+    $('v-save').disabled = !CAN;
+    $('gate').textContent = CAN ? '' : GATE;
+  }
+
+  // ─────────── 流れの帯と「次にやること」 ───────────
+  function renderFlow() {
+    const ex = S.exports;
+    const make = S.csv_items.filter((x) => !x.export_id).length;
+    const toCheck = ex.filter((e) => e.state === 'made' || (e.state === 'checked' && !e.checked_current));
+    const toDeclare = ex.filter((e) => e.state === 'checked' && e.checked_current);
+    let bad = 0, waiting = 0;
+    for (const e of ex) { const rs = e.row_states || {}; bad += (rs.not_reflected || 0) + (rs.needs_look || 0); waiting += rs.unconfirmable || 0; }
+    const steps = [
+      { n: make, s: 'CSV にできる承認', todo: make > 0 },
+      { n: toCheck.length, s: '取り込む日に確かめるファイル', todo: toCheck.length > 0 },
+      { n: toDeclare.length, s: '今日確かめた・まだ申告していないファイル', todo: toDeclare.length > 0 },
+      { n: bad, s: bad ? '届かなかった・確かめが要る行' : (waiting ? '翌朝の照合待ち ' + waiting + ' 行' : '届かなかった・確かめが要る行'), todo: bad > 0 },
+    ];
+    // 次にやること = 今日のうちに終わらせること (確かめたファイルの取り込み) → 届かなかった行 → 確かめ → 作る の順
+    const cur = steps[2].todo ? 2 : steps[3].todo ? 3 : steps[1].todo ? 1 : steps[0].todo ? 0 : -1;
+    steps.forEach((st, i) => {
+      const li = $('st-' + (i + 1));
+      li.className = 'step' + (i === cur ? ' cur' : st.todo ? ' warn' : ' done');
+      $('st' + (i + 1) + '-n').textContent = String(st.n);
+      $('st' + (i + 1) + '-s').textContent = st.s;
+    });
+    let tone = '', text = '', act = '';
+    if (cur === 2) { const e = toDeclare[0]; text = '<b>ファイル ' + e.export_id + '</b> は今日の照合で確かめました。<b>今日のうちに NE に取り込んで</b>、NE の履歴のメッセージを見て申告してください'; act = '<button class="btn pri sm" type="button" data-goto="file-' + e.export_id + '">ファイル ' + e.export_id + ' へ</button>'; }
+    else if (cur === 3) { tone = 'warn'; const e = ex.find((x) => (x.row_states || {}).not_reflected || (x.row_states || {}).needs_look); text = '<b>届かなかった・確かめが要る行が ' + bad + ' 行</b>あります。行を見て、作り直すか NE の画面で直してください'; act = e ? '<button class="btn sm" type="button" data-goto="file-' + e.export_id + '">ファイル ' + e.export_id + ' へ</button>' : ''; }
+    else if (cur === 1) { const e = toCheck[0]; text = '<b>ファイル ' + e.export_id + '</b> をダウンロードし、取り込む日に「取り込む直前に確かめる」を押してください'; act = '<button class="btn pri sm" type="button" data-goto="file-' + e.export_id + '">ファイル ' + e.export_id + ' へ</button>'; }
+    else if (cur === 0) { text = '<b>CSV にできる承認が ' + make + ' 件</b>あります。列ごとに「CSV を作る」を押してください' + (S.today ? '' : ' (今日の照合の回が無いので、いまは作れません)'); act = '<button class="btn pri sm" type="button" data-goto="make">作る所へ</button>'; }
+    else { tone = 'ok'; text = '<b>いまやることはありません。</b>' + (waiting ? '申告したファイルの ' + waiting + ' 行は翌朝の照合で届いたかが出ます' : '判断の画面で NE を直すと決めると、ここで CSV にできます'); }
+    $('next').className = 'nextline' + (tone ? ' ' + tone : '');
+    $('next-t').innerHTML = text; $('next-a').innerHTML = act;
+    for (const b of document.querySelectorAll('[data-goto]')) b.onclick = () => goTo(b.dataset.goto);
+    const rc = $('rail-n-csv'); if (rc) { const n = make + toCheck.length + toDeclare.length; rc.hidden = !n; rc.textContent = String(n); }
+  }
+
+  /** 「次にやること」のボタン: その札 (または作る所) へ送って、フォーカスを移す (上の帯に隠れないよう scroll-margin は md.css。#1626 Codex R1 M1) */
+  function goTo(id) {
+    const t = $(id); if (!t) return;
+    if (t.scrollIntoView) t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (t.focus) t.focus({ preventScroll: true });
+  }
+
+  // ─────────── ファイルの札 ───────────
+  const counts = (rs) => Object.entries(rs || {}).map(([k, n]) => '<span class="b ' + (ROW_TONE[k] || 'mute') + '">' + esc(ROW[k] || k) + ' ' + n + '</span>').join(' ');
+  function fileCard(e) {
+    const usable = e.state === 'made' || e.state === 'checked' || (e.state === 'declared' && e.reusable);
+    const needCheck = e.state === 'made' || (e.state === 'checked' && !e.checked_current);
+    const canDeclare = (e.state === 'checked' && e.checked_current) || (e.state === 'declared' && e.reusable);
+    const now = canDeclare && e.state === 'checked';
+    // 進み: 作った → 確かめた → 申告 → 翌朝の届き方
+    const lv = e.state === 'void' ? -1 : e.state === 'made' ? 0 : e.state === 'checked' ? (e.checked_current ? 1 : 0) : 3;
+    const fs = ['作った', '確かめた (今日)', '取り込んで申告', '翌朝の届き方'].map((t, i) => '<span class="' + (lv < 0 ? '' : i < lv ? 'd' : i === lv ? 'c' : '') + '">' + esc(t) + '</span>').join('<i aria-hidden="true">›</i>');
+    let nt;
+    if (e.state === 'void') nt = '<span class="donot">取り込まないでください</span> · ' + esc(VOIDWHY[e.void_reason] || e.void_reason);
+    else if (e.state === 'made') nt = '<b>ダウンロード</b>して、取り込む日に <b>取り込む直前に確かめる</b> を押してください';
+    else if (e.state === 'checked') nt = e.checked_current ? '今日の照合で確かめました。<b>今日のうちに NE に取り込んで</b>、結果を申告してください' : esc(e.checked_today ? '確かめた後に新しい照合があった (もう一度)' : '確かめたのが今日ではない (もう一度)');
+    else nt = e.reusable ? '申告済み。今日のうちなら、取り込み直して申告し直せます' : 'このファイルはもう使えない (取り込み直すなら作り直す)';
+    const ops = [];
+    if (CAN) {
+      if (usable) ops.push('<a class="btn' + (e.state === 'made' ? ' pri' : '') + '" href="api/csv/exports/' + e.export_id + '/file" download>' + icon('i-down', 's') + '<span>ダウンロード</span></a>');
+      if (needCheck) ops.push('<button class="btn' + (e.state === 'checked' ? ' pri' : '') + '" type="button" data-check="' + e.export_id + '">' + icon('i-check', 's') + '<span>取り込む直前に確かめる</span></button>');
+      // 申告済みでまだ使えるファイル (今日のうちの取り込み直し) は畳んでおく = いつもの次の操作ではない
+      if (canDeclare) ops.push((e.state === 'declared' ? '<details class="more" style="flex-basis:100%"><summary>' + icon('i-chevr', 's') + '取り込み直したら、もう一度申告する</summary><div class="body">' : '') + '<div class="declare"><div class="t">NE の [商品] → [商品管理の一括登録] で取り込んだら、「進捗状況・履歴」の<b>メッセージ</b>を見て選んでください</div>'
+        + '<div class="reason-pick" role="radiogroup" aria-label="ファイル ' + e.export_id + ' の取り込みの結果">' + RESULTS.map(([v, l, h]) => '<label class="rp"><input type="radio" name="res-' + e.export_id + '" value="' + v + '"><span>' + esc(l) + '<small>' + esc(h) + '</small></span></label>').join('') + '</div>'
+        + '<div class="row3"><input class="in" data-note-for="' + e.export_id + '" maxlength="500" placeholder="メモ (NE の取込の履歴で見たこと。任意)" aria-label="ファイル ' + e.export_id + ' の申告のメモ"><button class="btn pri" type="button" data-declare="' + e.export_id + '">' + icon('i-send', 's') + '<span>取り込んだと申告</span></button></div></div>' + (e.state === 'declared' ? '</div></details>' : ''));
+      if (e.state === 'made' || e.state === 'checked') ops.push('<button class="btn ghost" type="button" data-void="' + e.export_id + '">' + icon('i-x', 's') + '<span>使わない (void)</span></button>');
+    }
+    ops.push('<button class="btn ghost sm" type="button" data-open="' + e.export_id + '">行を見る ' + icon('i-chevr', 's') + '</button>');
+    return '<article class="fcard' + (e.state === 'void' ? ' void' : now ? ' now' : e.state === 'declared' && !e.reusable ? ' old' : '') + '" id="file-' + e.export_id + '" tabindex="-1" aria-labelledby="fh-' + e.export_id + '">'
+      + '<div class="fh"><span class="fno" id="fh-' + e.export_id + '">ファイル ' + e.export_id + '</span><span class="grow"><b>' + esc(KIND[e.kind]) + ' / ' + esc(COL[e.col] || e.col) + '</b> · ' + e.row_count + ' 行' + (e.trial ? ' · <span class="b vio">試し用</span>' : '')
+      + '<div class="fmeta">' + esc(e.file_name) + ' · ' + esc(fmtAt(e.created_at)) + ' に ' + esc(who(e.created_by)) + ' が作った</div></span><span class="b ' + (FILE_TONE[e.state] || 'mute') + '"><span class="dot"></span>' + esc(FILE[e.state]) + '</span></div>'
+      + (lv >= 0 ? '<div class="fsteps" aria-label="進み">' + fs + '</div>' : '')
+      + '<div class="fnext"><div class="nt">' + nt + '</div>' + (CAN ? '' : '<span class="muted">名簿の人だけ</span>') + ops.join(' ') + '</div>'
+      + (Object.keys(e.row_states || {}).length ? '<div class="rs" aria-label="行の届き方">' + counts(e.row_states) + '</div>' : '') + '</article>';
+  }
+  function renderExports() {
+    $('exports').innerHTML = S.exports.length ? S.exports.map(fileCard).join('') : '<div class="empty">まだありません。上の「CSV を作る」で作ると、ここに並びます</div>';
+    for (const b of document.querySelectorAll('[data-check]')) b.onclick = (ev) => { ev.stopPropagation(); act('api/csv/exports/' + b.dataset.check + '/check', {}, (r) => (r.passed ? '確かめました。今日のうちに NE に取り込んで「取り込んだと申告」を押してください' : '外れた行があったので、このファイルは使えなくしました (void)。作り直してください: ' + r.failures.map((f) => f.code_norm + ' ' + (FAIL[f.reason] || f.reason)).join(' / ')), b); };
+    for (const b of document.querySelectorAll('[data-declare]')) b.onclick = (ev) => {
+      ev.stopPropagation();
+      const id = b.dataset.declare;
+      const chosen = document.querySelector('input[name="res-' + id + '"]:checked');
+      if (!chosen) return setMsg('NE の「進捗状況・履歴」のメッセージを見て、ファイル ' + id + ' の結果を 1 つ選んでください (全部取り込めた / 一部失敗した / 全部拒まれた)', 'err');
+      const noteEl = document.querySelector('[data-note-for="' + id + '"]');
+      const note = (noteEl && noteEl.value && noteEl.value.trim()) || null;
+      act('api/csv/exports/' + id + '/declare', { result: chosen.value, note }, (r) => (r.state === 'void' ? '全部拒まれたので、このファイルは使えなくしました。作り直せます' : '申告しました。翌朝の照合で行ごとに届いたかが出ます'), b);
+    };
+    for (const b of document.querySelectorAll('[data-void]')) b.onclick = (ev) => { ev.stopPropagation(); if (confirm('ファイル ' + b.dataset.void + ' を使わない (void) にしますか? 予約が外れて、作り直せるようになります')) act('api/csv/exports/' + b.dataset.void + '/void', {}, () => '使わないにしました', b); };
+    for (const b of document.querySelectorAll('[data-open]')) b.onclick = (ev) => { if (ev && ev.stopPropagation) ev.stopPropagation(); openDetail(b.dataset.open, b).catch((e) => setMsg(e.message, 'err')); };
+  }
+  /** 送っている口 (同じ口の 2 回目は送らない = 連打で同じ POST を 2 回出さない。#1626 Codex R1 M2) */
+  const sending = new Set();
+  /** 書く操作。btn = 押したボタン (送っている間は閉じる・finally で戻す)。返り値 = 通ったか */
+  async function act(url, body, okText, btn) {
+    if (sending.has(url)) return false;
+    sending.add(url);
+    if (btn) { btn.disabled = true; if (btn.setAttribute) btn.setAttribute('aria-busy', 'true'); }
+    try {
+      // 確かめで外れた (passed = false) は通信の失敗ではない = 理由を出して一覧を読み直す (void になったファイルを画面に残さない。#1495 Codex R1 Medium)
+      const r = await postJson(url, body); setMsg(okText(r), r.passed === false || r.voided ? 'err' : 'ok'); await load(); refreshDirty(); return true;
+    } catch (e) { setMsg('できませんでした: ' + e.message + (e.details ? '\n' + e.details.map((d) => d.fingerprint.slice(0, 8) + ' ' + d.status + (d.reason ? ' (' + (WHY[d.reason] || d.reason) + ')' : '')).join('\n') : ''), 'err'); return false; }
+    finally { sending.delete(url); if (btn) { btn.disabled = false; if (btn.removeAttribute) btn.removeAttribute('aria-busy'); } }
+  }
+  async function make(body, btn) {
+    await act('api/csv/exports', body, (r) => 'ファイル ' + r.export.export_id + ' を作りました (' + r.export.row_count + ' 行' + (r.export.trial ? '・試し用' : '') + ')' + (r.left ? '。残り ' + r.left + ' 件は次のファイルで' : '') + '。ダウンロードして、取り込む日に「取り込む直前に確かめる」を押してください', btn);
+  }
+  $('make-sel').onclick = () => {
+    const list = [...selected].map((i) => S.csv_items[i]);
+    if (!list.length) return setMsg('選んでください', 'err');
+    const keys = new Set(list.map((x) => (x.sku_kind === 'set' ? 'sets' : 'products') + ':' + x.col));
+    if (keys.size !== 1) return setMsg('1 つのファイルには同じ種類・同じ項目だけ (種類・項目ごとに選んでください)', 'err');
+    const [kind, col] = [...keys][0].split(':');
+    make({ kind, col, fingerprints: list.map((x) => x.fingerprint) }, $('make-sel'));
+  };
+  $('v-save').onclick = () => {
+    const [kind, col] = $('v-key').value.split(':');
+    const ex = $('v-export').value.trim();
+    act('api/csv/verified', { kind, col, result: $('v-result').value, note: $('v-note').value.trim() || null, export_id: ex ? Number(ex) : null }, () => '残しました', $('v-save')).then((ok) => { if (ok) resetVerified(); refreshDirty(); });
+  };
+
+  /** 実機の確かめの欄を既定に戻す (残せた後) */
+  function resetVerified() { $('v-key').value = vDefaultKey; $('v-result').value = 'ok'; $('v-export').value = ''; $('v-note').value = ''; }
+
+  // ─────────── ファイルの行 (右から出る窓) ───────────
+  let drawerFrom = null;
+  async function openDetail(id, from) {
+    const d = await getJson('api/csv/exports/' + id);
+    const e = d.export;
+    $('dr-t').innerHTML = 'ファイル ' + e.export_id + ' の行<span class="sub">' + esc(e.file_name) + ' · sha256 ' + esc(e.sha256.slice(0, 16)) + '…</span>';
+    $('detail').innerHTML = (e.state === 'void' ? '<div class="callout err">' + icon('i-x') + '<div class="grow"><div class="t">取り込まないでください</div><div class="hint">' + esc(VOIDWHY[e.void_reason] || e.void_reason || '') + '</div></div></div>' : '')
+      + '<div class="tblwrap"><table class="tbl"><thead><tr><th scope="col">SKU</th><th scope="col">CSV に書いた値</th><th scope="col">行の届き方</th><th scope="col">照合の回</th></tr></thead><tbody>'
+      + d.rows.map((r) => '<tr><td class="code">' + esc(r.ne_code) + '</td><td>' + esc(r.cell) + '</td><td><span class="b ' + (ROW_TONE[r.state] || 'mute') + '">' + esc(ROW[r.state] || r.state) + '</span>' + (r.state === 'cancelled' && r.reason ? ' <span class="muted">' + esc(r.reason === 'superseded' ? '後から別の判断' : 'ファイルを void') + '</span>' : '') + '</td><td class="muted mono" style="font-size:12px">' + esc(r.done_run || r.run || '') + '</td></tr>').join('')
+      + '</tbody></table></div><h3>取込の試み</h3><ul class="mini-hist">' + (d.attempts.length ? d.attempts.map((a) => '<li>' + esc(a.result) + (a.note ? ' 「' + esc(a.note) + '」' : '') + '<span class="w">' + esc(fmtAt(a.declared_at)) + ' · ' + esc(a.declared_by) + '</span></li>').join('') : '<li class="muted">まだ</li>') + '</ul>';
+    drawerFrom = from || null;
+    $('dr-bg').className = 'drawer-bg on';
+    if ($('dr-x').focus) $('dr-x').focus();
+  }
+  function closeDrawer() {
+    if ($('dr-bg').className.indexOf('on') < 0) return;
+    $('dr-bg').className = 'drawer-bg';
+    if (drawerFrom && drawerFrom.focus && document.contains(drawerFrom)) drawerFrom.focus();
+  }
+  $('dr-x').onclick = closeDrawer;
+  $('dr-bg').onclick = (ev) => { if (ev && ev.target === $('dr-bg')) closeDrawer(); };
+
+  // ─────────── キー・離れるときの確認 (ブラウザだけ) ───────────
+  function refreshDirty() { if (ME.setUnsaved) ME.setUnsaved(ME.dirty().n); }
+  if (hasWin && document.addEventListener) {
+    window.addEventListener('keydown', (ev) => {
+      if (document.querySelector('#leave-bg.on') || document.querySelector('#palette-bg.on')) return;
+      if ($('dr-bg').className.indexOf('on') < 0) return;
+      if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); closeDrawer(); return; }
+      if (ev.key === 'Tab') {
+        const f = [...$('drawer').querySelectorAll('button, a[href], input, select, summary')].filter((x) => !x.disabled && x.offsetParent !== null);
+        if (!f.length) return;
+        if (!$('drawer').contains(document.activeElement)) { ev.preventDefault(); f[0].focus(); return; }
+        if (ev.shiftKey && document.activeElement === f[0]) { ev.preventDefault(); f[f.length - 1].focus(); }
+        else if (!ev.shiftKey && document.activeElement === f[f.length - 1]) { ev.preventDefault(); f[0].focus(); }
+      }
+    }, true);
+    /**
+     * まだ送っていない入力を画面の上から順に [{ el, t }]: ファイルごとの申告 (結果を選んだ・メモを書いた = まだ「取り込んだと申告」を押していない) →
+     * 実機で確かめた結果 (種類・結果・ファイル番号・メモのどれかを既定から変えた)。数えるのも戻るのもこの順 (#1626 Codex R1 L3)
+     */
+    const unsent = () => {
+      const out = [];
+      for (const d of document.querySelectorAll('.declare')) {
+        const btn = d.querySelector('[data-declare]'); if (!btn) continue;
+        const id = btn.dataset.declare, r = d.querySelector('input[type=radio]:checked'), n = d.querySelector('[data-note-for]');
+        if (r) out.push({ el: r, t: 'ファイル ' + id + ' の申告 (結果を選んだが、まだ「取り込んだと申告」を押していない)' });
+        else if (n && n.value.trim()) out.push({ el: n, t: 'ファイル ' + id + ' の申告のメモ' });
+      }
+      const v = [['v-key', $('v-key').value !== vDefaultKey, '種類・項目'], ['v-result', $('v-result').value !== 'ok', '結果'], ['v-export', !!$('v-export').value.trim(), 'ファイル番号'], ['v-note', !!$('v-note').value.trim(), 'メモ']].filter((x) => x[1]);
+      if (v.length) out.push({ el: $(v[0][0]), t: '実機で確かめた結果 (' + v.map((x) => x[2]).join('・') + ')' });
+      return out;
+    };
+    ME.dirty = () => { const u = unsent(); return { n: u.length, items: u.map((x) => x.t), impacts: [] }; };
+    // 「入力を確認する」= 最初の まだ送っていない欄へ (畳んだ申告は開く)
+    ME.review = () => {
+      const u = unsent(); if (!u.length) return;
+      const el = u[0].el, det = el.closest && el.closest('details');
+      if (det) det.open = true;
+      if (el.scrollIntoView) el.scrollIntoView({ block: 'center' });
+      el.focus();
+    };
+    const V_IDS = ['v-key', 'v-result', 'v-export', 'v-note'];
+    document.addEventListener('change', (ev) => { if (ev.target && ((ev.target.closest && ev.target.closest('.declare')) || V_IDS.includes(ev.target.id))) refreshDirty(); });
+    document.addEventListener('input', (ev) => { if (ev.target && (V_IDS.includes(ev.target.id) || (ev.target.dataset && ev.target.dataset.noteFor))) refreshDirty(); });
+    getJson('api/summary').then((s) => { const rn = $('rail-n-decide'); if (rn && s.total) { rn.hidden = !s.total.pending; rn.textContent = String(s.total.pending); } }).catch(() => { /* 件数の札を出さないだけ */ });
+  }
+
+  load().catch((e) => setMsg('読み込めませんでした: ' + e.message, 'err'));
+})();
+</script>
+</body>
+</html>

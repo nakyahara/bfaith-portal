@@ -607,6 +607,18 @@
       if ((x.pickingShortages || []).some((p) => p.kind === 'none' && normSku(p.sku) === k)) return '❌ 3階に無い商品 (再ピック依頼は不要・「在庫なしを確認」へ)';
       return null;
     }
+    // 同じ SKU が別行に分かれた伝票は 1 行にまとめて数量を合算する (依頼の単位は伝票 × SKU。行ごとに選ぶと
+    // 2 行目が dup_task で送れない — 現場指摘 2026-09-15)。サーバー (slipLineOf) も合算した数量を上限にする
+    function repickItems(x) {
+      const m = new Map();
+      for (const l of x.lines) {
+        const k = normSku(l.sku);
+        const cur = m.get(k);
+        if (cur) { cur.qty += l.qty; cur.lineCount += 1; }
+        else m.set(k, { ...l, lineCount: 1 });
+      }
+      return [...m.values()];
+    }
     function reqRepick(seqArg) {
       const x = seqArg ? bySeq.get(Number(seqArg)) : selectedSlip();
       if (!x) return;
@@ -614,7 +626,7 @@
       if (seqArg && slipPick && [...slipPick.options].some((o) => o.value === String(x.seq))) { slipPick.value = String(x.seq); showSlip(); }
       rpSeq = x.seq; rpPick.clear();
       // 選べる明細が1つで数量1なら、選ぶ手間を省いて送信ボタンだけにする
-      const free = x.lines.map((l, i) => [l, i]).filter(([l]) => !repickLock(x, l));
+      const free = repickItems(x).map((l, i) => [l, i]).filter(([l]) => !repickLock(x, l));
       if (free.length === 1 && free[0][0].qty === 1) rpPick.set(free[0][1], 1);
       renderRepickBox();
     }
@@ -628,16 +640,17 @@
     function renderRepickBox() {
       const x = bySeq.get(rpSeq);
       if (!x) return;
-      const rows = x.lines.map((l, i) => {
+      const items = repickItems(x);
+      const rows = items.map((l, i) => {
         const lock = repickLock(x, l);
-        const label = `${esc(l.name)} <span class="sub">(${esc(l.sku)})</span> × ${l.qty}`;
+        const label = `${esc(l.name)} <span class="sub">(${esc(l.sku)})</span> × ${l.qty}${l.lineCount > 1 ? ` <span class="sub">(${l.lineCount}行の合計)</span>` : ''}`;
         if (lock) return `<div class="rp-row locked"><div style="padding:8px 10px">${label}<div class="sub">${esc(lock)}</div></div></div>`;
         const q = rpPick.get(i);
         const on = q != null;
         return `<div class="rp-row ${on ? 'on' : ''}"><button type="button" class="rp-toggle" data-i="${i}">${on ? '☑' : '☐'} ${label}${on ? ` → <b>${q} 個</b>` : ''}</button>${on && l.qty > 1 ? qtyPadHtml(i, l.qty, q) : ''}</div>`;
       }).join('');
       const cnt = rpPick.size;
-      const allLocked = x.lines.length > 0 && x.lines.every((l) => repickLock(x, l));
+      const allLocked = items.length > 0 && items.every((l) => repickLock(x, l));
       const hint = allLocked ? '<div class="sub" style="grid-column:1/-1">この伝票の商品はすべて依頼済み・報告済みです</div>' : '';
       openReqBox(`#${x.seq} 足りない商品を選ぶ (複数可)`,
         `<div class="rp-list">${rows}</div><div class="reason-grid">${hint}<button type="button" class="wide" id="rpSend" style="background:#e03131; color:#fff; border-color:#e03131" ${cnt ? '' : 'disabled'}>🔄 選んだ ${cnt} 品をピッキングへ送信</button>${cancelBtn}</div>`);
@@ -645,8 +658,9 @@
     // 選択箱の操作は委譲で受ける (再描画してもリスナーが消えない・SKU を属性に埋めない)
     document.getElementById('reqBoxBody').addEventListener('click', (e) => {
       const x = bySeq.get(rpSeq);
+      const items = x ? repickItems(x) : [];
       const tg = e.target.closest('.rp-toggle');
-      if (tg && x) { const i = Number(tg.dataset.i); if (rpPick.has(i)) rpPick.delete(i); else rpPick.set(i, x.lines[i].qty); renderRepickBox(); return; }
+      if (tg && x) { const i = Number(tg.dataset.i); if (rpPick.has(i)) rpPick.delete(i); else rpPick.set(i, items[i].qty); renderRepickBox(); return; }
       const qb = e.target.closest('.rp-q');
       if (qb) { rpPick.set(Number(qb.dataset.i), Number(qb.dataset.q)); renderRepickBox(); return; }
       const ok = e.target.closest('.rp-qok');
@@ -654,25 +668,26 @@
         const i = Number(ok.dataset.i);
         const inp = document.querySelector(`.rp-qin[data-i="${i}"]`);
         const v = Number(inp && inp.value);
-        const max = x.lines[i].qty;
+        const max = items[i].qty;
         if (!Number.isInteger(v) || v < 1 || v > max) { alert(`数量は 1〜${max} で入力してください`); return; }
         rpPick.set(i, v); renderRepickBox(); return;
       }
       if (e.target.closest('#rpSend') && x) {
         if (!commitQtyInputs(x)) return;   // 数値入力欄 (10以上) の未確定値を送信前に取り込む (Codex R1)
-        const items = [...rpPick.entries()].map(([i, qty]) => ({ sku: x.lines[i].sku, name: x.lines[i].name, qty }));
-        if (!items.length) return;
-        const list = items.map((it) => `・${it.name} × ${it.qty}`).join('\n');
+        const picked = [...rpPick.entries()].map(([i, qty]) => ({ sku: items[i].sku, name: items[i].name, qty }));
+        if (!picked.length) return;
+        const list = picked.map((it) => `・${it.name} × ${it.qty}`).join('\n');
         if (!confirm(`#${x.seq} の次の商品が足りないとして、ピッキングへ再ピックを依頼します。\n${list}\nよろしいですか?`)) return;
         closeReqBox();
-        sendRepickMany(x.seq, items);
+        sendRepickMany(x.seq, picked);
       }
     });
     // 数値入力欄 (10以上) の値を rpPick に取り込む。不正なら知らせて false (送信しない)
     function commitQtyInputs(x) {
+      const items = repickItems(x);
       for (const inp of document.querySelectorAll('.rp-qin')) {
         const i = Number(inp.dataset.i);
-        const max = x.lines[i] ? x.lines[i].qty : 0;
+        const max = items[i] ? items[i].qty : 0;
         const raw = String(inp.value || '').trim();
         if (!raw) {
           // 1〜9 ボタンで選んでいれば空欄で正常。10以上が選択中なのに欄を消したら未確定 = 止める (見えない旧数量を送らない — Codex R2)

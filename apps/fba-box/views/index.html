@@ -73,6 +73,47 @@
     .boxmat.none { background: #F1F3F5; color: #868E96; font-weight: 700; font-size: 0.95em; }
     .boxbtn.newbox { border-style: dashed; color: #B5651D; border-color: #E8890C; }
 
+    /* ─ 番号で探す ─ 商品が 60 を超えるとスクロールが大変 (いろは 2026-09-23)。
+       利用者さんが言った「商品番号」(通常_22 の 22) を入れると、その商品だけが出る。
+       🚨 文字は 16px 以上 — それより小さいと iPhone が入力のたびに画面を拡大する */
+    .findbar { background: #fff; border-bottom: 2px solid #E9ECEF; padding: 6px 12px;
+      display: flex; align-items: center; gap: 8px; }
+    .findbar label { font-weight: 800; color: #B5651D; white-space: nowrap; }
+    #find { flex: 1 1 auto; min-width: 0; font-size: 1.3em; font-weight: 800; padding: 8px 12px;
+      border: 2px solid #DEE2E6; border-radius: 12px; letter-spacing: 0.05em; }
+    #find:focus { outline: none; border-color: #E8890C; }
+    /* 端末の標準の「×」は隠す (右の「× 消す」と 2 つ並んで紛らわしい) */
+    #find::-webkit-search-cancel-button { -webkit-appearance: none; display: none; }
+    #find-x { flex: none; border: 0; background: #E9ECEF; color: #495057; border-radius: 10px;
+      padding: 10px 14px; font-size: 1em; font-weight: 800; cursor: pointer; }
+    .findn { flex: none; font-size: 0.9em; color: #868E96; white-space: nowrap; }
+    .findmiss { padding: 18px 14px; color: #868E96; text-align: center; line-height: 1.8; }
+    .findmiss button { margin: 4px; }
+
+    /* ─ 商品の画面: どの箱に何個 (中原さん 2026-09-23: 商品 → 箱の順で、複数の箱に分けて入れる) ─ */
+    .splitrow { display: flex; align-items: center; gap: 8px; padding: 8px; margin-bottom: 6px;
+      border: 2px solid #DEE2E6; border-radius: 12px; background: #fff; }
+    .splitrow.on { border-color: #E8890C; background: #FFF4E6; }
+    .splitrow .sb { flex: 1 1 auto; min-width: 0; cursor: pointer; line-height: 1.35; }
+    .splitrow .sb b { font-size: 1.15em; color: #B5651D; }
+    .splitrow .sb small { color: #868E96; }
+    .splitrow .sbest { font-size: 0.8em; }
+    .splitrow .stepbtn { width: 58px; height: 58px; font-size: 1.7em; }
+    .splitrow .qtyin { width: 84px; flex: none; font-size: 1.6em; padding: 8px 4px; }
+    .splitsum { margin: 6px 0 2px; font-size: 1.05em; font-weight: 700; color: #495057; }
+    /* 「入れた」の帯: ダイアログの下に貼り付く。.dlg の padding (18px) の分だけ外へ広げて、下の余白まで白で覆う
+       (覆わないと、スクロールした中身が帯の下の隙間から透けて見える) */
+    .addbar { position: sticky; bottom: -18px; z-index: 2; margin: 12px -18px -18px; padding: 8px 18px 16px;
+      background: #fff; border-top: 1px solid #E9ECEF; box-shadow: 0 -6px 14px rgba(0,0,0,0.08); }
+    .addbar .msg { margin: 0 0 6px; min-height: 0; }
+    .addbar .msg:empty { display: none; }
+    .splitsum.bad { color: #C92A2A; }
+    @media (max-width: 480px) {
+      .splitrow { gap: 5px; padding: 6px; }
+      .splitrow .stepbtn { width: 44px; height: 50px; font-size: 1.4em; }
+      .splitrow .qtyin { width: 60px; font-size: 1.3em; }
+    }
+
     /* ─ タブ (梱包グループ) ─ */
     .tabs { display: flex; gap: 8px; padding: 10px 12px 0; overflow-x: auto; }
     .tab { border: 0; background: #E9ECEF; color: #495057; border-radius: 10px 10px 0 0;
@@ -199,6 +240,11 @@
         <a class="chip" style="background:#E9ECEF; color:#495057; text-decoration:none" href="./manual" target="_blank">📖 つかいかた</a>
         <button class="chip" style="background:#E9ECEF; color:#495057" id="btn-roster">👥 名簿</button>
       </div>
+      <!-- 🆕 アップデートのお知らせ。版を上げたら UPDATE_ID も変える (✕ で消した端末にも、新しい版はまた出る) -->
+      <div id="updbar" class="hidden" style="display:flex; align-items:center; gap:10px; background:#FFF4E6; border:2px solid #E8890C; border-radius:12px; padding:10px 12px; margin-bottom:12px">
+        <a href="./manual#updates" target="_blank" style="flex:1; color:#8A4B00; font-weight:800; text-decoration:none; line-height:1.5">🆕 10/5 アップデート: 送る数を予定より増やせるようになりました (職員の「送る数を直す」) <span style="text-decoration:underline">→ 何が変わったか見る</span></a>
+        <button id="updbar-x" class="chip" style="background:#E9ECEF; color:#495057; flex:none" aria-label="お知らせを閉じる">✕</button>
+      </div>
       <div id="runlist">読み込み中…</div>
     </div>
     <div class="card" style="text-align:center; color:#868E96; font-size:0.9em">
@@ -214,6 +260,7 @@
         <button class="chip" id="btn-back">← 回を選ぶ</button>
         <span class="title" id="run-title"></span>
         <span class="sp"></span>
+        <a class="chip hidden" id="btn-picking" target="_blank" rel="noopener" style="text-decoration:none">📄 ピッキング</a>
         <button class="chip" id="btn-summary">📋 まとめ</button>
         <button class="chip" id="btn-worker">👤 作業者を選ぶ</button>
       </div>
@@ -227,6 +274,13 @@
         <div id="boxbtns" style="display:flex; gap:8px;"></div>
         <button class="boxbtn newbox" id="btn-newbox">＋ 新しい箱</button>
       </div>
+      <!-- 番号で探す: 利用者さんが言った商品番号を入れる → その商品だけ出る (Enter で開く) -->
+      <form class="findbar" id="findform" action="javascript:void(0)" autocomplete="off">
+        <label for="find">🔍 番号</label>
+        <input id="find" type="search" inputmode="numeric" enterkeyhint="go" autocomplete="off" placeholder="商品の番号 (例: 22)">
+        <button type="button" id="find-x" class="hidden">× 消す</button>
+        <span class="findn" id="find-n"></span>
+      </form>
     </div>
     <div class="tabs" id="tabs"></div>
     <div class="rows" id="rows"></div>
@@ -472,26 +526,6 @@
       ${sel}`;
   }
 
-  /** 投入画面の「あと約N個」。推定が信用できる箱のときだけ (単重不明ゼロ + 資材の自重あり) */
-  function roomHint(box, row) {
-    const w = unitOf(row.fnsku);
-    const e = box.est;
-    if (!e) return '';
-    if (!w) {
-      return `<div style="color:#B5651D">⚖ この商品の重さが未登録です — ${e.estG > 0
-        ? `この箱の推定 ${(e.estG / 1000).toFixed(1)}kg (重量不明 ${e.unknownQty}点を除く) には入っていません`
-        : 'この箱の推定は出せません'}</div>`;
-    }
-    const n = roomLeft(box, w.unitG);
-    const L = limits();
-    if (n === null) {
-      return `<div style="color:#B5651D">⚖ 推定 ${estKg(box)}kg${e.unknownQty > 0 ? ` (重量不明 ${e.unknownQty}点を除く)` : ''} — 「あと何個」は重さが全部そろってから出ます</div>`;
-    }
-    if (e.estG > L.limitG) return `<div style="color:#C92A2A; font-weight:700">🚨 推定 ${estKg(box)}kg — 上限 ${L.limitG / 1000}kg を超えています。この箱は閉じて新しい箱にしてください</div>`;
-    if (n <= 0) return `<div style="color:#C92A2A; font-weight:700">⚠ 推定 ${estKg(box)}kg — 目標 ${L.targetG / 1000}kg に達しています。新しい箱にしましょう</div>`;
-    return `<div style="color:#2B8A3E">⚖ 推定 ${estKg(box)}kg — この商品なら<b>あと約 ${n} 個</b>で ${L.targetG / 1000}kg です</div>`;
-  }
-
   // ─── 納品回一覧 ───
   // 一覧が読めないときは 10 秒ごとに取り直す (回を開いたあとの自動更新と同じ間隔)。
   // これが無いと、サーバーが戻っても一覧は「待ってください」のまま止まる (Codex PR #1366 R1 #3)
@@ -568,6 +602,7 @@
   async function openRun(runId) {
     curRunId = runId;
     curBoxId = LS.get('curbox_' + runId, null);
+    $('#find').value = '';   // 前の回の番号を持ち越さない
     await refresh(true);
     if (!S) return;
     $('#screen-runs').classList.add('hidden');
@@ -602,6 +637,7 @@
       const boxOk = S.boxes.some(b => b.id === curBoxId && b.status === 'open' && b.pack_group_id === curGroupId);
       if (!boxOk) curBoxId = null;
       render();
+      if (!dialogOpen && !showPendingUndo()) showUnsentNow();
     } catch {
       setOnline(false, 'net');   // 例外 = 応答が無い = 届いていない (Codex PR #1366 R1 #4)
     }
@@ -623,11 +659,21 @@
     } catch { return null; }
   }
 
+  /** 記録の時刻 (HH:MM・日本時間)。created_at は UTC の ISO なので、文字を切り出すと 9 時間ずれる */
+  function hhmm(iso) {
+    const d = new Date(iso || '');
+    if (Number.isNaN(d.getTime())) return '';
+    const j = new Date(d.getTime() + 9 * 3600 * 1000);
+    return String(j.getUTCHours()).padStart(2, '0') + ':' + String(j.getUTCMinutes()).padStart(2, '0');
+  }
   function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
 
   function render() {
     if (!S) return;
     $('#run-title').textContent = S.run.title;
+    // この回の納品ピッキング PDF (納品プランNo 付き)。残っていない回は出さない
+    if (S.pickingPdfUrl) $('#btn-picking').href = S.pickingPdfUrl;
+    $('#btn-picking').classList.toggle('hidden', !S.pickingPdfUrl);
     $('#btn-worker').textContent = worker ? `👤 ${worker.display_name}` : '👤 作業者を選ぶ';
     $('#btn-worker').classList.toggle('warn', !worker);
     // タブ
@@ -636,12 +682,7 @@
       const doneN = rowsOf.filter(r => rowDone(r)).length;
       return `<button class="tab ${g.id === curGroupId ? 'on' : ''}" data-id="${g.id}">${esc(g.sheet_name)} (${doneN}/${rowsOf.length})</button>`;
     }).join('');
-    $('#tabs').querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => {
-      curGroupId = Number(b.dataset.id);
-      const boxOk = S.boxes.some(x => x.id === curBoxId && x.status === 'open' && x.pack_group_id === curGroupId);
-      if (!boxOk) curBoxId = null;
-      render();
-    }));
+    $('#tabs').querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => switchGroup(Number(b.dataset.id))));
     // 箱バー (取消した箱は出さない。Amazon 番号がずれた箱は →P1 - B2 を添える)
     const boxes = S.boxes.filter(b => b.pack_group_id === curGroupId && b.status !== 'void');
     const cur = boxes.find(b => b.id === curBoxId);
@@ -658,10 +699,18 @@
         ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${matShort(b) ? esc(matShort(b)) + ' / ' : ''}${b.total_qty}個${estChip(b)}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
       </button>`).join('');
     $('#boxbtns').querySelectorAll('.boxbtn').forEach(b => b.addEventListener('click', () => openBoxDialog(Number(b.dataset.id))));
-    // 行リスト (retired = 差し替えで消えた行は出さない)
-    const rows = S.rows.filter(r => r.pack_group_id === curGroupId && r.match_state !== 'retired');
+    // 行リスト (retired = 差し替えで消えた行は出さない)。番号が入っていれば、その番号の商品だけ
+    const allRows = S.rows.filter(r => r.pack_group_id === curGroupId && r.match_state !== 'retired');
+    const q = findQuery();
+    const rows = q ? findRows(allRows, q) : allRows;
+    renderFindInfo(q, rows, allRows);
+    if (q && rows.length === 0) {
+      $('#rows').innerHTML = findMissHtml(q);
+      $('#rows').querySelectorAll('button[data-gid]').forEach(b => b.addEventListener('click', () => switchGroup(Number(b.dataset.gid))));
+      return;
+    }
     $('#rows').innerHTML = rows.map(r => {
-      const rem = r.planned_qty - r.placed - (r.shortage_qty || 0);
+      const rem = sendOf(r) - r.placed;
       const done = rowDone(r);
       const pp = planParts(r.plan_no);
       return `<div class="row ${done ? 'done' : ''} ${r.shortage_qty ? 'short' : ''}" data-id="${r.id}">
@@ -673,17 +722,73 @@
             ${r.match_state === 'excel_only' ? '<span class="badge warnm">Excelにだけある</span>' : ''}
             ${r.match_state === 'picking_only' ? '<span class="badge short">Excelに無い (入れない)</span>' : ''}
             ${r.shortage_qty ? `<span class="badge short">送る数 ${r.planned_qty - r.shortage_qty} (予定 ${r.planned_qty}${r.shortage_reason ? '・' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) : ''})</span>` : ''}
+            ${r.extra_qty ? `<span class="badge warnm">送る数 ${sendOf(r)} (予定 ${r.planned_qty} から増やした${r.extra_reason ? '・' + esc(REASON_JA[r.extra_reason] || r.extra_reason) : ''})</span>` : ''}
             ${expiryOf(r.id) ? `<span class="badge exp">期限 ${esc(expiryOf(r.id))}</span>` : ''}
             ${!expiryOf(r.id) && r.requires_expiry === 1 && r.placed > 0 ? '<span class="badge short">期限まだ</span>' : ''}
             ${r.check_worker ? `✅${esc(r.check_worker)}` : ''}
           </div>
         </div>
-        <div class="qty"><span class="rem">${done ? '✓' : rem}</span><div class="of">${r.placed}/${r.planned_qty}</div></div>
+        <div class="qty"><span class="rem">${done ? '✓' : rem}</span><div class="of">${r.placed}/${r.extra_qty ? sendOf(r) : r.planned_qty}</div></div>
       </div>`;
     }).join('');
     $('#rows').querySelectorAll('.row').forEach(el => el.addEventListener('click', () => openRowDialog(Number(el.dataset.id))));
   }
-  function rowDone(r) { return r.match_state === 'picking_only' || (r.placed + (r.shortage_qty || 0) >= r.planned_qty && r.planned_qty > 0); }
+  function rowDone(r) { return r.match_state === 'picking_only' || (r.placed >= sendOf(r) && (r.planned_qty > 0 || sendOf(r) > 0)); }
+  /** 送る数 = 予定 − 不足 + 予定より増やした数 (2026-10-05: 予定より多く送ることもある。db.js sendQtyOf と同じ) */
+  function sendOf(r) { return r.planned_qty - (r.shortage_qty || 0) + (r.extra_qty || 0); }
+  function switchGroup(gid) {
+    curGroupId = gid;
+    const boxOk = S.boxes.some(x => x.id === curBoxId && x.status === 'open' && x.pack_group_id === curGroupId);
+    if (!boxOk) curBoxId = null;
+    render();
+  }
+
+  // ─── 番号で探す (いろは 2026-09-23: 60 商品を超えるとスクロールが大変。利用者さんが言った番号を直接入れる) ───
+  /** 入力欄の文字。全角の数字・英字は半角にそろえる (iPad の日本語キーボードのまま打っても当たるように) */
+  function findQuery() {
+    const el = $('#find');
+    return el ? el.value.replace(/[０-９Ａ-Ｚａ-ｚ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).trim() : '';
+  }
+  /**
+   * 数字だけ = 商品番号 (「通常_22」の 22)。**その番号ちょうど**を先頭に、続けて その番号で始まる商品
+   * (「2」と打った途中でも 2・20〜29 が出て、「22」まで打てば 22 が先頭)。
+   * 数字以外 = FNSKU (下 4 桁など) か商品名に含まれるもの
+   */
+  function findRows(rows, q) {
+    if (/^\d+$/.test(q)) {
+      const n = String(Number(q));   // 「022」でも 22 に当てる
+      const noOf = (r) => { const s = planParts(r.plan_no).no; return /^\d+$/.test(s) ? String(Number(s)) : s; };
+      return [...rows.filter(r => noOf(r) === n), ...rows.filter(r => noOf(r) !== n && noOf(r).startsWith(n))];
+    }
+    const u = q.toUpperCase();
+    return rows.filter(r => String(r.fnsku || '').toUpperCase().includes(u) || String(r.product_name || '').toUpperCase().includes(u));
+  }
+  /** Enter (キーボードの「開く」) で開く商品 = 番号ちょうどの商品が 1 つだけのとき (数字以外なら当たりが 1 つだけのとき) */
+  function findTarget(rows, q) {
+    if (!q) return null;
+    if (/^\d+$/.test(q)) {
+      const exact = rows.filter(r => { const s = planParts(r.plan_no).no; return /^\d+$/.test(s) && Number(s) === Number(q); });
+      return exact.length === 1 ? exact[0] : null;
+    }
+    return rows.length === 1 ? rows[0] : null;
+  }
+  function renderFindInfo(q, rows, allRows) {
+    $('#find-x').classList.toggle('hidden', !q);
+    $('#find-n').textContent = q ? (rows.length ? `${rows.length} 件` : '') : `${allRows.length} 商品`;
+  }
+  /** このタブに無いとき、ほかのタブにあれば切り替えボタンを出す (番号はタブごとに 1 から振ってある) */
+  function findMissHtml(q) {
+    const others = S.groups.filter(g => g.id !== curGroupId).map(g => ({
+      g, n: findRows(S.rows.filter(r => r.pack_group_id === g.id && r.match_state !== 'retired'), q).length,
+    })).filter(x => x.n > 0);
+    return `<div class="findmiss">このタブには「${esc(q)}」の商品がありません${others.length
+      ? `<br>${others.map(x => `<button class="selbtn" data-gid="${x.g.id}">${esc(x.g.sheet_name)} に ${x.n} 件 → 切り替える</button>`).join('')}`
+      : ''}</div>`;
+  }
+  function clearFind() {
+    const el = $('#find');
+    if (el && el.value) { el.value = ''; render(); }
+  }
 
   // ─── まとめ (出荷前チェック): 何が残っているかを現場でも見られる ───
   async function summaryDialog() {
@@ -691,7 +796,7 @@
     if (!j.ok) { alert(j.message || '読み込めませんでした'); return; }
     const r = j.readiness;
     const item = (x, color) => `<div style="padding:6px 0; border-bottom:1px solid #F1F3F5; color:${color}">${esc(x.message)}
-      ${x.rows ? `<div style="font-size:0.85em; color:#495057">${x.rows.slice(0, 12).map(y => `・${esc(shortName(y.name, 16))} ${esc(fn4(y.fnsku))} (${y.placed}/${y.planned})`).join('<br>')}${x.rows.length > 12 ? '<br>…' : ''}</div>` : ''}
+      ${x.rows ? `<div style="font-size:0.85em; color:#495057">${x.rows.slice(0, 12).map(y => `・${esc(shortName(y.name, 16))} ${esc(fn4(y.fnsku))} (${y.placed}/${y.sendQty ?? y.planned})`).join('<br>')}${x.rows.length > 12 ? '<br>…' : ''}</div>` : ''}
       ${x.boxes ? `<div style="font-size:0.85em; color:#495057">${x.boxes.map(y => `・${esc(y.code)}${y.amazonName && y.amazonBoxNo !== y.boxNo ? ' → Amazon ' + esc(y.amazonName) : ''}`).join('<br>')}</div>` : ''}</div>`;
     openDialog(`
       <h2>📋 まとめ — ${esc(S.run.title)}</h2>
@@ -723,9 +828,9 @@
         <h2>⚠ まだ入っていない商品があります</h2>
         <div class="msg" style="color:#495057">${esc(j.message)}</div>
         <div style="max-height:40vh; overflow-y:auto; margin:10px 0; background:#FFF5F5; border-radius:10px; padding:10px">
-          ${j.rows.map(x => `<div style="padding:5px 0; border-bottom:1px solid #FFE3E3"><b>${esc(x.planNo || '')}</b> ${esc(shortName(x.name, 22))} — 予定 ${x.planned} / 入れた ${x.placed}${x.shortage ? ' / 不足 ' + x.shortage : ''} → <b style="color:#C92A2A">残り ${x.remaining}</b></div>`).join('')}
+          ${j.rows.map(x => `<div style="padding:5px 0; border-bottom:1px solid #FFE3E3"><b>${esc(x.planNo || '')}</b> ${esc(shortName(x.name, 22))} — 予定 ${x.planned}${x.extra ? ` (送る数 ${x.sendQty})` : ''} / 入れた ${x.placed}${x.shortage ? ' / 不足 ' + x.shortage : ''} → <b style="color:#C92A2A">残り ${x.remaining}</b>${x.trim ? `<br><small style="color:#B5651D">${x.notShip ? `予定に届かない ${x.notShip} 個は「今回は納品しない」・` : ''}増やした分の ${x.trim} 個は増やすのをやめる</small>` : ''}</div>`).join('')}
         </div>
-        <div class="msg" style="color:#868E96">破損・自社出荷の引当などで納品しない場合はそのまま完了できます。残りは「今回は納品しない」として記録され、本社の画面に出ます</div>
+        <div class="msg" style="color:#868E96">破損・自社出荷の引当などで納品しない場合はそのまま完了できます。${(j.notShipTotal ?? 1) > 0 ? '予定に届かない残りは「今回は納品しない」として記録され、本社の画面に出ます' : ''}${j.trimTotal ? `${(j.notShipTotal ?? 1) > 0 ? '。' : ''}予定より増やした商品は、入れた数まで送る数を戻します` : ''}</div>
         <div class="grid2" style="margin-top:12px">
           <button class="bigbtn sub" id="f-back">戻って続ける</button>
           <button class="bigbtn red" id="f-go">それでも完了する</button>
@@ -735,7 +840,7 @@
         const j2 = await apiPost(`/api/runs/${curRunId}/finish`, { worker_id: sw.id, pin, acknowledge: true });
         if (!j2.ok) { alert(j2.message || '終えられませんでした'); return; }
         closeDialog();
-        alert(`✅ 作業を終えました (納品しない商品 ${j2.notShipped} 行)`);
+        alert(`✅ 作業を終えました (納品しない商品 ${j2.notShipped} 行${j2.extraTrimmed ? ` / 予定より増やすのをやめた商品 ${j2.extraTrimmed} 行` : ''})`);
         backToRuns();
       });
     });
@@ -749,6 +854,9 @@
   function openDialog(html, opts) {
     dialogOpen = true;
     dialogLocked = false;   // 新しい画面は必ず閉じられる状態から始める
+    // 🚨 前の「記録しました / 元に戻す」のトーストは消す。トーストは画面の下で、ダイアログより手前 (z-index 70 > 60)。
+    //    「入れた」を画面の下に貼り付けたので、重なったところを押すと前の商品の記録を取り消してしまう (Codex PR #1428 R1 #1)
+    hideToast();
     $('#ovl-root').innerHTML = `<div class="ovl"><div class="dlg">${html}</div></div>`;
     // sticky = 背景タップで閉じない。「さらに入れましたか?」の答えを取りこぼすと
     // 実際に入れた分が記録されない (Codex PQ-R1 high#4)
@@ -857,12 +965,19 @@
   }
 
   // ─── 商品行ダイアログ (割当・担当者・読み上げ) ───
-  function openRowDialog(rowId) {
+  /**
+   * 商品の画面。**商品 → どの箱に何個** の順で入れる (中原さん 2026-09-23)。
+   * いろはでは利用者さんが「商品番号」を言ってから「何番の箱に入れるか」を職員に伝えるルールなので、
+   * 先に箱を選ばなくても、この画面で箱を選べる・1 箱目に何個 / 2 箱目に何個 と分けられる。
+   * 「いまの箱」があれば、その箱に残り全部が入った状態で開く (これまでどおり 1 回押せば済む)。
+   * draft = この画面の入力途中 (「＋ 新しい箱」「⚖ 重さ」「確認した人」で別の画面へ行って戻ったときに消さない)
+   */
+  function openRowDialog(rowId, draft) {
     const r = S.rows.find(x => x.id === rowId);
     if (!r) return;
-    const rem = r.planned_qty - r.placed - (r.shortage_qty || 0);
-    const boxes = S.boxes.filter(b => b.pack_group_id === r.pack_group_id && b.status === 'open');
-    const cur = boxes.find(b => b.id === curBoxId);
+    const rem = sendOf(r) - r.placed;
+    // この商品のグループで開いている箱。箱の番号順 (箱に書いた「1箱目・2箱目」と同じ並び)
+    const boxes = S.boxes.filter(b => b.pack_group_id === r.pack_group_id && b.status === 'open').sort((a, b) => a.box_no - b.box_no);
     const knownExpiry = expiryOf(r.id);
     const excluded = r.match_state === 'picking_only';   // 添付した Excel (納品プラン) に無い → 入れない
     const mine = (S.placements || []).filter(p => p.row_id === r.id).sort((a, b) => b.id - a.id);   // この商品の記録 (新しい順)
@@ -874,9 +989,29 @@
     const checkDefault = worker ? worker.display_name : '';
     // サーバーが入れるのは「この行に残っている一番古い投入をした人」= まだ1個も入っていない行のときだけ
     // いまの作業者と一致する。既に誰かが入れている行で名前を約束すると嘘になる (Codex PR2.6-R2 medium#2)
-    const canAutoCheck = rem > 0 && !excluded;                   // 「この箱に入れた」がある = 自動で入る行
+    const canAutoCheck = rem > 0 && !excluded;                   // 「入れた」がある = 自動で入る行
     const willAutoCheck = canAutoCheck && r.placed === 0 && !!checkDefault;
     const pp = planParts(r.plan_no);
+    // 最初の個数: 入力途中があればそれ / 無ければ「いまの箱」に残り全部 (これまでの 1 箱の入れ方と同じ手数)
+    const startQty = (b) => {
+      if (draft && draft.split) return draft.split[b.id] != null ? String(draft.split[b.id]) : '';
+      return b.id === curBoxId ? String(rem) : '';
+    };
+    // 行を出す箱 = 数が入っている箱 + 入力途中で出していた箱 (新しくつくった箱は空でも出す — Codex PR #1426 R1 #1:
+    // 全部割り振ってあるときに新しい箱をつくると、その箱がボタンの中に隠れ、そのまま押すと前の箱に記録されていた)
+    const shown = (b) => startQty(b) !== '' || !!(draft && Array.isArray(draft.show) && draft.show.includes(b.id));
+    const startVisibleCount = boxes.filter(shown).length;   // 開いたときに行を出す箱の数
+    /**
+     * 残りが 0 なのに、入力途中の箱ごとの数が残っている (送る数を減らした直後など)。黙って捨てずに見せる
+     * (Codex PR #1426 R2 #2)。送る数を戻せば、その入力のまま開き直る
+     */
+    const pendingDraftNote = () => {
+      const ent = Object.entries((draft && draft.split) || {}).filter(([, v]) => String(v).trim() !== '' && String(v).trim() !== '0');
+      if (!ent.length) return '';
+      const code = (id) => (S.boxes.find(b => b.id === Number(id)) || {}).box_code || '?';
+      return `<div class="warnbox" style="margin-top:8px">⚠ 入れようとしていた数 (${esc(ent.map(([id, v]) => `${code(id)} に ${v}個`).join('・'))}) は、残りが 0 なので記録できません
+        <small>箱に入れてあるなら、職員が「送る数を直す」で数を戻してください (この入力のまま開き直します)</small></div>`;
+    };
     const dlg = openDialog(`
       <div style="display:flex; gap:14px; align-items:flex-start">
         ${thumbHtml(r, true)}
@@ -892,23 +1027,25 @@
         </div>
       </div>
       <div class="grid2">
-        <div>予定 <b style="font-size:1.3em">${r.planned_qty}</b></div>
+        <div>予定 <b style="font-size:1.3em">${r.planned_qty}</b>${r.extra_qty ? ` <small style="color:#B5651D; font-weight:700">→ 送る数 ${sendOf(r)}</small>` : ''}</div>
         <div>残り <b style="font-size:1.3em; color:${rem > 0 ? '#C92A2A' : '#2B8A3E'}">${excluded ? '—' : rem}</b></div>
       </div>
+      ${draft && draft.notStored ? `<div class="warnbox" style="margin-top:8px">⚠ 前に押した分は、まだ記録していません (この端末に控えを保存できませんでした)
+          <small>箱の中身を確かめて「入れた」を押すまで、この画面を閉じたり読み込み直したりしないでください</small></div>` : ''}
       ${excluded ? `<div class="msg err">この商品は納品プラン (Excel) に無いので箱に入れません。${r.placed > 0 ? `すでに ${r.placed} 個入っています — 職員が取り消してください。` : ''}本社に確認してください</div>` : ''}
       ${rem > 0 && !excluded ? `
-        <div class="lbl">📦 入れる箱 ${cur ? `= <b>${esc(cur.box_code)}</b>` : ''}</div>
-        ${cur ? roomHint(cur, r) : `
-          <div class="warnbox">⚠ 「いまの箱」が選ばれていません
-            <small>下から箱を選ぶか「＋新しい箱」を作るまで、この商品は記録できません</small></div>
-          <div class="grid3" style="margin-top:8px">${boxes.map(b => `<button class="selbtn boxpick" data-id="${b.id}">${esc(b.box_code)}</button>`).join('')}
-            <button class="selbtn boxnew">＋新しい箱</button></div>`}
-        <div class="lbl">個数</div>
-        <div class="qtyrow">
-          <button class="stepbtn" id="d-minus" aria-label="1個へらす">−</button>
-          <input class="qtyin" id="d-qty" type="tel" inputmode="numeric" value="${rem}">
-          <button class="stepbtn" id="d-plus" aria-label="1個ふやす">＋</button>
+        <div class="lbl">📦 どの箱に何個</div>
+        <!-- ふだんは「いまの箱」の 1 行だけ。ほかの箱は「＋ 別の箱にも入れる」を押したときだけ小さく並べる
+             (中原さん 2026-09-23: 箱が増えると、箱を全部並べる作りでは かなり下までスクロールする) -->
+        <div id="d-splits">${boxes.map(b => splitRowHtml(b, r, !shown(b))).join('')}</div>
+        <button class="selbtn${startVisibleCount === 0 ? ' hidden' : ''}" id="d-otherbox" style="width:100%">＋ 別の箱にも入れる (分けるとき)</button>
+        <div id="d-boxpick" class="${startVisibleCount === 0 ? '' : 'hidden'}" style="margin-top:6px">
+          ${startVisibleCount === 0 ? `<div class="warnbox" style="margin-bottom:8px">入れた箱をえらんでください<small>「いまの箱」が決まっていません。押した箱に残り全部が入ります</small></div>` : ''}
+          ${boxes.length ? `<div class="grid3">${boxes.map(b => `<button class="selbtn boxchip${shown(b) ? ' hidden' : ''}" data-box="${b.id}">${esc(b.box_code)}<br><small style="font-weight:600; color:#868E96">${matShort(b) ? esc(matShort(b)) + ' ・ ' : ''}いま ${b.total_qty}個</small></button>`).join('')}</div>`
+            : '<div class="msg" style="color:#868E96">このグループに開いている箱がありません</div>'}
+          <button class="selbtn boxnew" style="width:100%; margin-top:8px">＋ 新しい箱をつくる</button>
         </div>
+        <div class="splitsum" id="d-splitsum"></div>
         <div class="qtyw" id="d-weight"></div>
         ${packBlockHtml(r)}
         <div class="lbl">置いた場所 (この箱で・わかれば)</div>
@@ -917,13 +1054,14 @@
           <button class="selbtn layer" data-v="middle">↔ 中</button>
           <button class="selbtn layer" data-v="top">⬆ 上</button>
         </div>
+        <div class="msg hidden" id="d-laynote" style="color:#868E96">箱を 2 つ以上に分けたときは、置いた場所は記録しません</div>
         ${expiryBlockHtml(r, knownExpiry)}
-      ` : (excluded ? '' : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>${packBlockHtml(r)}`)}
+      ` : (excluded ? '' : `${pendingDraftNote()}<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>${packBlockHtml(r)}`)}
       ${mine.length > 0 ? `
         <div class="lbl">📝 この商品の記録 (間違えたら「数を直す」)</div>
         <div style="background:#F8F9FA; border-radius:10px; padding:6px 10px">
           ${mine.map(p => `<div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #E9ECEF">
-            <span><b>${esc(boxCodeOf(p.box_id))}</b> に <b style="font-size:1.2em">${p.qty}</b>個 <small style="color:#868E96">${esc(String(p.created_at || '').slice(11, 16))} ${esc(p.worker_name || '')}${boxClosed(p.box_id) ? ' / 箱は閉じ済み' : ''}</small></span>
+            <span><b>${esc(boxCodeOf(p.box_id))}</b> に <b style="font-size:1.2em">${p.qty}</b>個 <small style="color:#868E96">${esc(hhmm(p.created_at))} ${esc(p.worker_name || '')}${boxClosed(p.box_id) ? ' / 箱は閉じ済み' : ''}</small></span>
             <span style="white-space:nowrap"><button class="selbtn adj" data-id="${p.id}" data-qty="${p.qty}" style="padding:6px 10px">数を直す</button>
               <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px">取消</button></span>
           </div>`).join('')}
@@ -932,35 +1070,202 @@
       <button class="selbtn ${r.check_worker ? 'on' : ''}" id="d-cw" style="width:100%">${r.check_worker
         ? `✅ ${esc(r.check_worker)}`
         : (willAutoCheck
-          ? `${esc(checkDefault)} <small style="font-weight:600; color:#868E96">(「この箱に入れた」を押すと、この人で記録します・タップで変更)</small>`
+          ? `${esc(checkDefault)} <small style="font-weight:600; color:#868E96">(「入れた」を押すと、この人で記録します・タップで変更)</small>`
           : (canAutoCheck && checkDefault
-            ? `— <small style="font-weight:600; color:#868E96">(「この箱に入れた」を押すと、最初に入れた人で記録します・タップで指名)</small>`
+            ? `— <small style="font-weight:600; color:#868E96">(「入れた」を押すと、最初に入れた人で記録します・タップで指名)</small>`
             : `— <small style="font-weight:600; color:#C92A2A">${checkDefault
               ? 'まだ記録されていません。タップして選んでください'
               : '上の「👤 作業者を選ぶ」から選んでください'}</small>`))}</button>
       <div class="lbl">⚠ 困ったとき (職員)</div>
       <div class="grid3">
-        <button class="selbtn" id="d-sendqty">${r.shortage_qty ? `送る数 ${r.planned_qty - r.shortage_qty} を直す` : '送る数を直す'}</button>
+        <button class="selbtn" id="d-sendqty">${r.shortage_qty || r.extra_qty ? `送る数 ${sendOf(r)} を直す` : '送る数を直す'}</button>
         <button class="selbtn" id="d-short">数が足りない</button>
         <button class="selbtn" id="d-close">閉じる</button>
       </div>
       ${r.shortage_qty ? `<div class="msg" style="color:#C92A2A">予定 ${r.planned_qty} → 送る数 ${r.planned_qty - r.shortage_qty}${r.shortage_reason ? ' (' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) + ')' : ''}</div>` : ''}
-      <div class="msg" id="d-msg"></div>
-      ${rem > 0 && !excluded ? `<div style="margin-top:4px"><button class="bigbtn" id="d-add" ${cur ? '' : 'disabled'}>${
-        cur ? 'この箱に入れた' : '先に「入れる箱」を選んでください'}</button></div>` : ''}`);
+      ${r.extra_qty ? `<div class="msg" style="color:#B5651D">予定 ${r.planned_qty} → 送る数 ${sendOf(r)} (予定より増やした${r.extra_reason ? '・' + esc(REASON_JA[r.extra_reason] || r.extra_reason) : ''})</div>` : ''}
+      ${rem > 0 && !excluded
+        // 「入れた」は画面の下に貼り付ける (中原さん 2026-09-23: 積み方・置いた場所・期限などの下にあってスクロールが要った)。
+        // 送信中・エラーの文言も同じ帯に置く (押したボタンのすぐ上で見える)
+        ? `<div class="addbar"><div class="msg" id="d-msg"></div><button class="bigbtn" id="d-add" disabled>入れた</button></div>`
+        : '<div class="msg" id="d-msg"></div>'}`);
+
+    // ── どの箱に何個 ──
+    const splitEls = [...dlg.querySelectorAll('.splitrow')];
+    const qtyIn = (el) => el.querySelector('.qtyin');
+    /**
+     * 箱に打った数。空欄 = 0 / 整数 (全角数字も) / それ以外 (6.5・文字) = 不正 (NaN)。
+     * 🚨 不正を 0 にして黙って外すと、打った箱の分が抜けたまま残りだけ記録される (Codex PR #1421 R1 #3)
+     */
+    const parseQty = (v) => {
+      const t = String(v || '').replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).trim();
+      if (t === '') return 0;
+      return /^\d{1,6}$/.test(t) ? Number(t) : NaN;
+    };
+    const rawOf = (el) => parseQty(qtyIn(el).value);
+    const valOf = (el) => { const n = rawOf(el); return Number.isFinite(n) ? n : 0; };
+    const badOf = (el) => !Number.isFinite(rawOf(el));
+    const setVal = (el, n) => { qtyIn(el).value = n > 0 ? String(n) : ''; };
+    /** 箱に入れる個数 (0 の箱は含めない)。並びは画面の順 = 箱の番号順 */
+    const readSplits = () => splitEls.map(el => ({ boxId: Number(el.dataset.box), qty: valOf(el) })).filter(s => s.qty > 0);
+    // 送信中は数を触らせない・「入れた」を生き返らせない (Codex PR #1421 R1 #4: 送信中に数を変えて押し直すと
+    // 送信キューが「さらに入れましたか」を出し、1 回目の完了と食い違う)
+    let sending = false;
+    // 積み方 (土台/重い/通常) を保存しているあいだは「入れた」を押せない。保存の結果 (失敗) をこの画面で見てから入れる
+    // (Codex PR #1428 R2: 先に投入が終わって画面が閉じると、積み方の失敗が伝わらない・トーストの「元に戻す」を消す)
+    let packSaving = false;
+    const setSending = (v) => {
+      sending = v;
+      // 🚨 画面の中のボタン・入力を全部塞ぎ、背景タップでも閉じない。⚖ や「確認した人」へ移れると、
+      //    送信の完了が移った先の画面を閉じて、そこでの入力が消える (Codex PR #1426 R1 #2 = master から)
+      dialogLocked = v;
+      dlg.querySelectorAll('button, input, select').forEach(x => { x.disabled = v; });
+      if (v) hideToast();   // 画面の外の「元に戻す」からも別の画面へ移れないように (R2 #1)
+      if (!v) syncSplits();   // 戻すときは、数の条件で押せない ＋ − や「入れた」を数え直す
+    };
+    dlg._setSending = setSending;   // handlePlaceOutcome が失敗したときに戻す
+    const others = (el) => splitEls.filter(x => x !== el).reduce((a, x) => a + valOf(x), 0);
+    splitEls.forEach(el => { qtyIn(el).value = startQty({ id: Number(el.dataset.box) }); });   // 打った文字のまま (不正な値も赤で残す)
 
     let layer = null;
-    dlg.querySelectorAll('.layer').forEach(b => b.addEventListener('click', () => {
-      const on = !b.classList.contains('on');
-      dlg.querySelectorAll('.layer').forEach(x => x.classList.remove('on'));
-      layer = on ? b.dataset.v : null;
-      if (on) b.classList.add('on');
+    const layerBtns = [...dlg.querySelectorAll('.layer')];
+    const setLayer = (v) => { layer = v; layerBtns.forEach(x => x.classList.toggle('on', x.dataset.v === v)); };
+    layerBtns.forEach(b => b.addEventListener('click', () => {
+      if (b.disabled) return;
+      setLayer(b.classList.contains('on') ? null : b.dataset.v);
     }));
-    dlg.querySelectorAll('.boxpick').forEach(b => b.addEventListener('click', () => {
-      setCurBox(Number(b.dataset.id));
-      closeDialog(); openRowDialog(rowId);
+
+    function syncSplits() {
+      const sp = readSplits();
+      const sum = sp.reduce((a, s) => a + s.qty, 0);
+      const bad = splitEls.filter(badOf);
+      splitEls.forEach(el => {
+        const v = valOf(el);
+        el.classList.toggle('on', v > 0);
+        qtyIn(el).style.borderColor = badOf(el) ? '#E03131' : '';
+        if (sending) return;
+        el.querySelector('[data-d="-1"]').disabled = !(v > 0);
+        el.querySelector('[data-d="1"]').disabled = !(v + others(el) < rem);
+      });
+      const sumEl = dlg.querySelector('#d-splitsum');
+      if (sumEl) {
+        sumEl.classList.toggle('bad', sum > rem || bad.length > 0);
+        sumEl.innerHTML = bad.length > 0
+          ? `⚠ ${bad.map(el => esc(el.querySelector('.sb b').textContent)).join('・')} の個数が数字になっていません (1 個単位の数字で入れてください)`
+          : sum === 0
+          ? `どの箱に何個入れたかを入れてください (残り ${rem} 個)`
+          : (sum > rem
+            ? `⚠ 合計 ${sum} 個 — 残り ${rem} 個を超えています`
+            : `合計 <b style="font-size:1.2em">${sum}</b> 個 / 残り ${rem} 個${sum < rem ? ` (あと ${rem - sum} 個)` : ' ✓ 全部'}`);
+      }
+      const wEl = dlg.querySelector('#d-weight');
+      if (wEl) {
+        wEl.innerHTML = !unit
+          ? '<span style="color:#B5651D">⚖ 1個の重さが未登録です — 上の「⚖ 重さを登録」から登録できます</span>'
+          : (sum > 0
+            ? `⚖ 1個 ${fmtG(unit.unitG)}${unit.source === 'measured' ? ' (実測)' : ' (参考)'} × ${sum}個 = <b style="font-size:1.15em">${fmtG(unit.unitG * sum)}</b>`
+            : `⚖ 1個 ${fmtG(unit.unitG)}${unit.source === 'measured' ? ' (実測)' : ' (参考)'}`);
+      }
+      // 置いた場所 (下/中/上) は「この箱で」の記録。箱を分けたら、どの箱の話か決まらないので記録しない
+      const multi = sp.length > 1;
+      layerBtns.forEach(x => { x.disabled = multi; });
+      if (multi && layer) setLayer(null);
+      dlg.querySelector('#d-laynote')?.classList.toggle('hidden', !multi);
+      const add = dlg.querySelector('#d-add');
+      if (add) {
+        add.disabled = sending || packSaving || sum <= 0 || sum > rem || bad.length > 0;
+        if (sending) return;
+        add.textContent = packSaving ? '積み方を保存しています…' : bad.length > 0 ? '個数を数字で入れてください' : sum <= 0 ? '先に「どの箱に何個」を入れてください'
+          : (sp.length === 1 ? `${boxCodeOf(sp[0].boxId)} に ${sum}個 入れた` : `${sp.length}箱に 合計 ${sum}個 入れた`);
+      }
+    }
+    splitEls.forEach(el => {
+      const inp = qtyIn(el);
+      el.querySelectorAll('.stepbtn').forEach(btn => btn.addEventListener('click', () => {
+        if (sending) return;
+        const next = valOf(el) + Number(btn.dataset.d);
+        setVal(el, Math.max(0, Math.min(rem - others(el), next)));
+        syncSplits();
+      }));
+      // 箱の名前を押す = まだどの箱にも割り振っていない残りを、この箱に足す。
+      // もう全部割り振ってあれば、全部をこの箱へ移す (「いまの箱」に残り全部が入った状態で別の箱を押したとき)。
+      // 🚨 0 に戻す動きは持たせない (押すたびに入ったり消えたりすると、何が起きたか分からない — Codex PR #1421 R1 #5)。減らすのは − か数字
+      el.querySelector('.sb').addEventListener('click', () => {
+        if (sending) return;
+        const free = rem - others(el) - valOf(el);
+        const holders = splitEls.filter(x => x !== el && valOf(x) > 0);
+        if (free > 0) setVal(el, valOf(el) + free);
+        // 「いまの箱」に残り全部が入った状態で別の箱を押した = その箱へ移したい。
+        // 🚨 2 つ以上に分けてあるときは移さない (分けた数を黙って消すと、実物と違う箱別の数で記録される — Codex PR #1421 R2 #4)
+        else if (valOf(el) === 0 && holders.length === 1 && valOf(holders[0]) === rem) { setVal(holders[0], 0); setVal(el, rem); }
+        else {
+          const m = dlg.querySelector('#d-msg');
+          if (m) { m.className = 'msg'; m.textContent = 'もう全部の箱に割り振ってあります。数を変えるときは − ＋ か数字で直してください'; }
+        }
+        syncSplits();
+      });
+      inp.addEventListener('input', syncSplits);
+      // 🚨 打った数は丸めない (ほかの箱と合わせて残りを超えたときに 0 や上限へ勝手に直すと、打った数が消えて見える)。
+      //    超えていれば合計の行を赤くして「入れた」を押せなくするだけ。整数でない・マイナスだけ直す
+      inp.addEventListener('change', () => { if (!badOf(el)) setVal(el, valOf(el)); syncSplits(); });   // 不正な値は消さずに赤く残す
+      inp.addEventListener('focus', () => inp.select());
+    });
+
+    /** 入力途中を持ち出す (別の画面へ行って戻ったときに、入れた個数・期限・置いた場所を消さない) */
+    const readDraft = () => {
+      // 箱の入力欄が無い画面 (残り 0) では、持ってきた入力途中をそのまま持ち回る (R2 #2: 送る数を戻したら復元できるように)
+      if (splitEls.length === 0 && draft) return draft;
+      const split = {};
+      // 🚨 打った文字のまま持ち出す。数に直してから持つと「6.5」が 0 になって消え、戻った画面で残りだけ送れてしまう (Codex PR #1421 R2 #3)
+      splitEls.forEach(el => { const t = qtyIn(el).value.trim(); if (t !== '' && t !== '0') split[el.dataset.box] = t; });
+      const show = splitEls.filter(el => !el.classList.contains('hidden')).map(el => Number(el.dataset.box));
+      const sel = (id) => { const x = dlg.querySelector(id); return x ? x.value : ''; };
+      const wrap = dlg.querySelector('#d-expwrap');
+      return { split, show, layer, ey: sel('#d-ey'), em: sel('#d-em'), ed: sel('#d-ed'), expOpen: !!(wrap && !wrap.hidden),
+        unsentId: (draft && draft.unsentId) || null, notStored: !!(draft && draft.notStored) };
+    };
+    dlg._readDraft = readDraft;   // 前の記録の失敗を見せたあと、この入力のまま開き直すため (handlePlaceOutcome)
+    // ↩ 戻ってきたとき: 置いた場所・期限の選択も戻す
+    if (draft) {
+      if (draft.layer) setLayer(draft.layer);
+      const put = (id, v) => { const x = dlg.querySelector(id); if (x && v) x.value = v; };
+      put('#d-ey', draft.ey); put('#d-em', draft.em); put('#d-ed', draft.ed);
+      if (draft.expOpen && dlg.querySelector('#d-expwrap')) {
+        dlg.querySelector('#d-expwrap').hidden = false;
+        const ob = dlg.querySelector('#d-expopen'); if (ob) ob.hidden = true;
+      }
+    }
+    syncSplits();
+
+    // 「＋ 別の箱にも入れる」→ ほかの箱を小さく並べる。押した箱の行を出し、まだ割り振っていない残りを入れる
+    dlg.querySelector('#d-otherbox')?.addEventListener('click', () => {
+      dlg.querySelector('#d-boxpick').classList.toggle('hidden');
+    });
+    dlg.querySelectorAll('.boxchip').forEach(chip => chip.addEventListener('click', () => {
+      if (sending) return;
+      const el = splitEls.find(x => x.dataset.box === chip.dataset.box);
+      if (!el) return;
+      const free = rem - splitEls.reduce((a, x) => a + valOf(x), 0);
+      el.classList.remove('hidden');
+      chip.classList.add('hidden');
+      if (free > 0) setVal(el, valOf(el) + free);
+      dlg.querySelector('#d-boxpick').classList.add('hidden');
+      dlg.querySelector('#d-otherbox').classList.remove('hidden');
+      syncSplits();
+      if (free <= 0) qtyIn(el).focus();   // 残りが無い = 何個かは人が決める
     }));
-    dlg.querySelector('.boxnew')?.addEventListener('click', () => { closeDialog(); newBoxDialog(() => openRowDialog(rowId)); });
+    dlg.querySelector('.boxnew')?.addEventListener('click', () => {
+      const dr = readDraft();
+      closeDialog();
+      // つくった箱には、まだどの箱にも割り振っていない残りを入れておく (1 箱目に 12・残りは新しい箱に、が 1 回で済む)
+      newBoxDialog(async (newBoxId) => {
+        const used = Object.values(dr.split).reduce((a, v) => { const n = parseQty(v); return a + (Number.isFinite(n) ? n : 0); }, 0);
+        if (newBoxId && rem - used > 0) dr.split[newBoxId] = rem - used;
+        if (newBoxId) dr.show = [...(dr.show || []), newBoxId];   // 残りが無くても、つくった箱の行は出す (箱の名前を押せば全部移せる)
+        await refresh(true);   // つくった箱を画面の状態に入れてから開き直す (古い状態のままだと新しい箱が出ない)
+        if (!dialogOpen) openRowDialog(rowId, dr);   // refresh が未確認の記録を出していたら上書きしない
+      });
+    });
     // 期限管理商品ではない商品の「＋ この商品にも賞味期限を入れる」(判定が違っていても現場で入れられる逃げ道)
     dlg.querySelector('#d-expopen')?.addEventListener('click', (ev) => {
       ev.currentTarget.hidden = true;
@@ -968,7 +1273,7 @@
     });
     dlg.querySelector('#d-tts').addEventListener('click', () => speak(`${shortName(r.product_name)}。${Math.max(0, rem)}個`));
     dlg.querySelector('#d-digits').addEventListener('click', () => speakDigits(r));
-    dlg.querySelector('#d-weigh').addEventListener('click', () => { closeDialog(); weighDialog(r, () => openRowDialog(rowId)); });
+    dlg.querySelector('#d-weigh').addEventListener('click', () => { const dr = readDraft(); closeDialog(); weighDialog(r, () => openRowDialog(rowId, dr)); });
     // 積み方 (土台 / 重い / 通常): 押した瞬間に保存 (投入の送信キューとは別の API。投入を送らなくても残る)。
     // 選択中のボタンをもう一度押すと未設定に戻す。ただし「重さから自動」の重いを押したときは手動の重いに固定する
     // (自動を外すのは「通常」— 未設定に戻しても自動で重いに戻るだけなので)
@@ -980,45 +1285,38 @@
       const isOn = btn.classList.contains('on');
       const next = (isOn && p && p.source !== 'weight') ? null : btn.dataset.v;
       dlg.querySelectorAll('.pack').forEach(x => { x.disabled = true; });
+      packSaving = true; syncSplits();
       let j;
       try { j = await apiPost('/api/packing-class', { fnsku: r.fnsku, class: next, run_id: curRunId, worker_id: worker.id }); }
       catch { j = { ok: false, message: '通信できませんでした。もう一度押してください' }; }
-      dlg.querySelectorAll('.pack').forEach(x => { x.disabled = false; });
-      if (!j.ok) { msg.innerHTML = `<span style="color:#C92A2A; font-weight:700">${esc(j.message || '保存できませんでした')}</span>`; return; }
+      // 「入れた」の送信中なら押せないまま (送信中の塞ぎを積み方の返事で解かない — Codex PR #1428 R1 #2)
+      dlg.querySelectorAll('.pack').forEach(x => { x.disabled = sending; });
+      packSaving = false; if (dlg.isConnected) syncSplits();
+      if (!j.ok) {
+        // 返事が来る前に画面が閉じていたら (入れた が先に終わった)、閉じた画面に書いても見えない → トーストで知らせる
+        if (!dlg.isConnected) {
+          const note = `📦 積み方を保存できませんでした: ${j.message || ''} (商品の画面からもう一度選んでください)`;
+          // 「記録しました / 元に戻す」が出ていれば、上書きせずに書き足す (元に戻すを消さない — Codex PR #1428 R3)
+          const span = document.querySelector('#toast-root .toast span');
+          if (document.getElementById('undo') && span) span.insertAdjacentHTML('beforeend', `<br><small>${esc(note)}</small>`);
+          else showNoteToast(note);
+          return;
+        }
+        msg.innerHTML = `<span style="color:#C92A2A; font-weight:700">${esc(j.message || '保存できませんでした')}</span>`; return;
+      }
       if (S && S.packing && j.effective) S.packing[String(r.fnsku).toUpperCase()] = j.effective;   // 次の refresh で同じ値が来る
       const cur = j.effective && j.effective.cls;
       dlg.querySelectorAll('.pack').forEach(x => x.classList.toggle('on', x.dataset.v === cur));
       msg.innerHTML = packStatusText(r.fnsku);
     }));
-    dlg.querySelector('#d-close').addEventListener('click', closeDialog);
-    dlg.querySelector('#d-cw').addEventListener('click', () => pickCheckWorker(r, () => openRowDialog(rowId)));
+    dlg.querySelector('#d-close').addEventListener('click', () => {
+      // 控えを保存できていない分がある = この画面を閉じると、どこにも残らない (Codex PR #1424 R3 #3)
+      if (draft && draft.notStored && !confirm('前に押した分は、まだ記録していません (端末にも控えていません)。記録せずに閉じますか?')) return;
+      closeDialog();
+    });
+    dlg.querySelector('#d-cw').addEventListener('click', () => { const dr = readDraft(); pickCheckWorker(r, () => openRowDialog(rowId, dr)); });
     dlg.querySelector('#d-short').addEventListener('click', () => shortageDialog(r));
-    dlg.querySelector('#d-sendqty').addEventListener('click', () => sendQtyDialog(r));
-    // 個数の ＋ / − (1個ずつ) と「1個の重さ × 個数」。残り数を超えては増やせない
-    const qtyIn = dlg.querySelector('#d-qty');
-    const unitTxt = unit ? `1個 ${fmtG(unit.unitG)}${unit.source === 'measured' ? ' (実測)' : ' (参考)'}` : '';
-    function syncQty() {
-      const n = Number(qtyIn.value);
-      dlg.querySelector('#d-minus').disabled = !(n > 1);
-      dlg.querySelector('#d-plus').disabled = !(n < rem);
-      dlg.querySelector('#d-weight').innerHTML = !unit
-        // 箱を選んでいるときは roomHint が同じことを言うので、ここでは繰り返さない
-        ? (cur ? '' : '<span style="color:#B5651D">⚖ 1個の重さが未登録です — 上の「⚖ 重さを登録」から登録できます</span>')
-        : (Number.isFinite(n) && n > 0
-          ? `⚖ ${unitTxt} × ${n}個 = <b style="font-size:1.15em">${fmtG(unit.unitG * n)}</b>`
-          : `⚖ ${unitTxt}`);
-    }
-    if (qtyIn) {
-      const step = (d) => {
-        const n = Math.round(Number(qtyIn.value) || 0);
-        qtyIn.value = String(Math.min(rem, Math.max(1, n + d)));
-        syncQty();
-      };
-      dlg.querySelector('#d-minus').addEventListener('click', () => step(-1));
-      dlg.querySelector('#d-plus').addEventListener('click', () => step(1));
-      qtyIn.addEventListener('input', syncQty);
-      syncQty();
-    }
+    dlg.querySelector('#d-sendqty').addEventListener('click', () => sendQtyDialog(r, readDraft()));   // 戻ったとき箱ごとの数を消さない (R1 #3)
     // 記録の修正・取消 = 入力ミスの訂正なので PIN は要らない (中原さん 9/3)。閉じた箱のときだけ量り直しを案内
     dlg.querySelectorAll('.adj').forEach(btn => btn.addEventListener('click', () => adjustDialog(r, Number(btn.dataset.id), Number(btn.dataset.qty))));
     dlg.querySelectorAll('.rvk').forEach(btn => btn.addEventListener('click', async () => {
@@ -1036,15 +1334,190 @@
       // 通信断のときは新規入力を止める (要件 §5-7)。ただし送れていない記録が残っているときは、
       // 押し直し = 再送なので通す (online イベントが来ない障害から抜けられなくなる — PQ-R2 medium#1)
       if (!online && !placeQueue.peek()) { msg.className = 'msg err'; msg.textContent = '通信できないため入力できません'; return; }
-      const qty = Number(dlg.querySelector('#d-qty').value);
+      if (sending || packSaving) return;
+      if (splitEls.some(badOf)) { msg.className = 'msg err'; msg.textContent = '個数が数字になっていない箱があります'; return; }
+      const splits = readSplits();
+      const sum = splits.reduce((a, s) => a + s.qty, 0);
+      if (sum <= 0) { msg.className = 'msg err'; msg.textContent = 'どの箱に何個入れたかを入れてください'; return; }
+      if (sum > rem) { msg.className = 'msg err'; msg.textContent = `合計 ${sum} 個は残り ${rem} 個を超えています`; return; }
       let expiry = knownExpiry ? null : readExpiry(dlg);
       if (expiry === false) { msg.className = 'msg err'; msg.textContent = '期限は 年・月 まで選んでください (日は任意)'; return; }
+      setSending(true);
       dlg.querySelector('#d-add').disabled = true;
       msg.className = 'msg'; msg.textContent = '送信中…';
       // meta = あとで結果を見せるときに要る情報 (裏で送り直して確定したときはダイアログが無い)
-      const meta = { productName: r.product_name || r.seller_sku, checkDefault, hadCheckWorker: !!r.check_worker };
-      const out = await sendPlacement({ rowId: r.id, boxId: curBoxId, qty, layer, expiry, meta });
+      // 控えから開いた画面で、**控えと同じ箱・同じ数**で押したときだけ控えの印を付ける (記録できたら控えを消す)。
+      // 🚨 箱や数を変えて押した = 控えの分とは別の投入かもしれない → 控えは残し、人に決めてもらう (Codex PR #1424 R3 #1)
+      const stash = unsentNow.get();
+      const sameAsStash = !!(stash && draft && draft.unsentId === stash.id
+        && JSON.stringify(bodySplits(stash.body).map(x => [x.boxId, x.qty])) === JSON.stringify(splits.map(x => [x.boxId, x.qty])));
+      const meta = { productName: r.product_name || r.seller_sku, checkDefault, hadCheckWorker: !!r.check_worker,
+        unsentId: sameAsStash ? stash.id : null };
+      const out = await sendPlacement({ rowId: r.id, splits, layer: splits.length > 1 ? null : layer, expiry, meta });
       await handlePlaceOutcome(out, { dlg, msg, row: r });
+    });
+  }
+
+  /**
+   * 商品の画面の「箱 1 つ分」の行: [箱の名前・サイズ・いまの個数・推定] [−] [個数] [＋]。
+   * 推定の見せ方は要件 §7 のまま (重量不明があれば必ず添える。「あと約N個」は重さが全部そろったときだけ)
+   */
+  function splitRowHtml(b, r, hidden) {
+    return `<div class="splitrow${hidden ? ' hidden' : ''}" data-box="${b.id}">
+        <div class="sb"><b>${esc(b.box_code)}</b>${b.id === curBoxId ? ' <span class="badge exp">いまの箱</span>' : ''}
+          <br><small>${matShort(b) ? esc(matShort(b)) + ' ・ ' : ''}いま ${b.total_qty}個</small>
+          <div class="sbest">${splitHint(b, r)}</div></div>
+        <button class="stepbtn" data-d="-1" aria-label="1個へらす">−</button>
+        <input class="qtyin" type="tel" inputmode="numeric" placeholder="0" aria-label="${esc(b.box_code)} に入れる個数">
+        <button class="stepbtn" data-d="1" aria-label="1個ふやす">＋</button>
+      </div>`;
+  }
+  function splitHint(box, row) {
+    const e = box.est;
+    if (!e || !(e.estG > 0)) return '';
+    const w = unitOf(row.fnsku);
+    const L = limits();
+    if (e.estG > L.limitG) return `<span style="color:#C92A2A; font-weight:700">🚨 推定 ${estKg(box)}kg — 上限 ${L.limitG / 1000}kg 超え</span>`;
+    const n = w ? roomLeft(box, w.unitG) : null;
+    if (n === null) return estLabel(box);   // 「あと何個」は重さが全部そろってから (要件 §7)
+    if (n <= 0) return `<span style="color:#C92A2A; font-weight:700">⚠ 推定 ${estKg(box)}kg — 目標 ${L.targetG / 1000}kg に達しています</span>`;
+    return `${estLabel(box)} <span style="color:#2B8A3E">・あと約 ${n} 個</span>`;
+  }
+
+  /** 送った中身 (1 箱 = box_id + qty / 分けた = splits) を同じ形 [{boxId, qty}] にそろえる */
+  function bodySplits(body) {
+    if (body && Array.isArray(body.splits)) return body.splits.map(s => ({ boxId: Number(s.box_id), qty: Number(s.qty) }));
+    return [{ boxId: Number(body && body.box_id), qty: Number(body && body.qty) }];
+  }
+  const bodyQty = (body) => bodySplits(body).reduce((a, s) => a + (s.qty || 0), 0);
+  const boxCodeById = (id) => (((S && S.boxes) || []).find(b => b.id === id) || {}).box_code || '?';
+  /** 「G1-1」/ 分けたときは「G1-1 に 12個・G1-2 に 5個」 */
+  function bodyWhere(body) {
+    const sp = bodySplits(body);
+    return sp.length === 1 ? boxCodeById(sp[0].boxId) : sp.map(s => `${boxCodeById(s.boxId)} に ${s.qty}個`).join('・');
+  }
+  /** 記録できた投入の ID (分けたときは箱の数だけ) */
+  function placementIdsOf(j) {
+    if (j && Array.isArray(j.placements) && j.placements.length) return j.placements.map(p => p.placementId);
+    return j && j.placementId ? [j.placementId] : [];
+  }
+  /**
+   * 取り消す (分けた投入は全部)。分けた分は **1 回の POST・1 トランザクション** = 全部戻るか、1 つも戻らない
+   * (1 件ずつだと途中で通信が切れたとき一部だけ戻る — Codex PR #1421 R1 #1)。取消済みは成功扱いなので押し直してよい。
+   * unknown = 返事が来ない・5xx・本文が落ちた = 戻ったかどうか分からない
+   */
+  /**
+   * 返事の来ていない「元に戻す」の控え。**取り消す記録の組ごと**に持つ (1 つの入れ物を上書きすると、
+   * 別の納品回の取消が前の回の控えを消す — Codex PR #1421 R3 #1)。{ [key]: {ids, what, runId} }
+   */
+  const UNDO_KEY = 'fbx_pending_undo';
+  const undoKeyOf = (ids) => ids.map(Number).sort((a, b) => a - b).join(',');
+  const pendingUndo = {
+    all() { try { const v = JSON.parse(localStorage.getItem(UNDO_KEY) || '{}'); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; } catch { return {}; } },
+    /** 保存して読み直す。保存できなければ false (呼び出し側は送らない) */
+    add(ids, what, runId) {
+      const k = undoKeyOf(ids);
+      try {
+        const m = this.all(); m[k] = { ids, what: what || '', runId };
+        localStorage.setItem(UNDO_KEY, JSON.stringify(m));
+        return !!this.all()[k];
+      } catch { return false; }
+    },
+    remove(ids) {
+      try { const m = this.all(); delete m[undoKeyOf(ids)]; localStorage.setItem(UNDO_KEY, JSON.stringify(m)); } catch { /* noop */ }
+    },
+    firstFor(runId) { return Object.values(this.all()).find(p => p && Array.isArray(p.ids) && p.ids.length && p.runId === runId) || null; },
+  };
+  /**
+   * 🚨 取り消す前に「何を取り消すか」を端末に残す。返事の前に通信が切れて画面を読み込み直しても、
+   *    同じ記録をもう一度取り消せる (Codex PR #1421 R2 #1)。通れば消す。取り消せないと確定した (4xx) ときも消す。
+   *    🚨 控えを保存できない端末では送らない (送ったあとに通信が切れると、取り消したかどうか追えなくなる — R3 #3)
+   */
+  async function revokeAll(ids, what) {
+    if (!pendingUndo.add(ids, what, curRunId)) {
+      return { ok: false, unknown: false, message: 'この端末に控えを保存できないため、取り消しを送りませんでした (プライベートモードになっていませんか)。職員を呼んでください' };
+    }
+    const r = await revokeAllOnce(ids);
+    if (r.ok || !r.unknown) pendingUndo.remove(ids);
+    return r;
+  }
+  /**
+   * 「前の記録が登録できなかった」ときに、いま押した分 (まだ送っていない) の控え。1 件だけ持つ。
+   * 送信キューとは別 (キューに入れると自動で送られる。前の分が入っていないので、人が箱を確かめてから押す)
+   */
+  const UNSENT_KEY = 'fbx_unsent_now';
+  const unsentNow = {
+    get() { try { const v = JSON.parse(localStorage.getItem(UNSENT_KEY) || 'null'); return v && v.id && v.body && v.rowId ? v : null; } catch { return null; } },
+    /** 保存して読み直す。保存できなければ null (呼び出し側が「控えられていない」と見せる — Codex PR #1424 R2 #3) */
+    set(v) {
+      const id = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+      try { localStorage.setItem(UNSENT_KEY, JSON.stringify(Object.assign({ id, at: Date.now() }, v))); } catch { return null; }
+      const back = this.get();
+      return back && back.id === id ? id : null;
+    },
+    clear() { try { localStorage.removeItem(UNSENT_KEY); } catch { /* noop */ } },
+    /**
+     * 🚨 消すのは「**この控えから押した操作**が記録できた」と分かったときだけ (Codex PR #1424 R2 #1・#2)。
+     *    同じ商品の別の投入が通っただけで消すと、控えていた分が追えなくなる。
+     *    裏で送り直して確定した結果 (showLeftoverPlacement・askPlacedAgain) でも同じように消す
+     */
+    settle(rec) {
+      const v = this.get();
+      if (v && rec && rec.result && rec.result.ok === true && rec.meta && rec.meta.unsentId === v.id) this.clear();
+    },
+  };
+  /** 前の画面で「まだ記録していない」と見せた分が残っている → 開き直せる画面を出す (読み込み直し・ページが捨てられたあと) */
+  function showUnsentNow() {
+    const v = unsentNow.get();
+    if (!v || dialogOpen || v.runId !== curRunId || placeQueue.peek()) return false;
+    const row = S && S.rows.find(r => r.id === v.rowId);
+    const dlg = openDialog(`
+      <h2>⚠ まだ記録していない分があります</h2>
+      <div class="pname">${esc(shortName((v.meta && v.meta.productName) || 'この商品'))} <b style="font-size:1.2em">${bodyQty(v.body)}</b>個 → ${esc(bodyWhere(v.body))}</div>
+      <div class="msg err">前の画面で「入れた」を押しましたが、前の記録が登録できなかったため、この分はまだ送っていません。
+        <small style="display:block; font-weight:600">箱の中身を確かめて、入れてあれば商品の画面から「入れた」を押してください</small></div>
+      ${row ? '<div style="margin-top:12px"><button class="bigbtn" id="un-open">この商品の画面を開く (入力はそのまま)</button></div>' : '<div class="msg err">この商品は一覧にありません (画面を更新してください)</div>'}
+      <div style="margin-top:8px"><button class="bigbtn sub" id="un-drop">箱には入れていない・もう記録した (この控えを消す)</button></div>`, { sticky: true });
+    dlg.querySelector('#un-open')?.addEventListener('click', () => { closeDialog(); openRowDialog(v.rowId, Object.assign({}, v.draft || {}, { unsentId: v.id })); });
+    dlg.querySelector('#un-drop').addEventListener('click', () => {
+      if (!confirm('この控えを消してよいですか? (箱に入れてあって、まだ記録していないなら「この商品の画面を開く」から記録してください)')) return;
+      unsentNow.clear(); closeDialog();
+    });
+    return true;
+  }
+  /** 前の画面で「元に戻す」の返事が来ないままだった → 押し直せる画面を出す (回を開いたとき・更新のたび)。いま開いている回の分だけ */
+  function showPendingUndo() {
+    const p = pendingUndo.firstFor(curRunId);
+    if (!p || dialogOpen) return false;
+    showUndoFailed(p.ids, { ok: false, unknown: true, message: '前の画面で「元に戻す」を押しましたが、返事が届いていません' }, p.what);
+    return true;
+  }
+  async function revokeAllOnce(ids) {
+    try {
+      const j = ids.length === 1
+        ? await apiPost(`/api/placements/${ids[0]}/revoke`, { worker_id: worker && worker.id })
+        : await apiPost('/api/placements/revoke-batch', { worker_id: worker && worker.id, placement_ids: ids });
+      if (j.ok) return { ok: true, boxReopened: !!j.boxReopened };
+      return { ok: false, unknown: j.error === 'no_body' || j._status >= 500, message: j.message || '' };
+    } catch { return { ok: false, unknown: true, message: '通信できませんでした' }; }
+  }
+  /** 「元に戻す」が通らなかった。トーストは消えているので、押し直せる画面を出す (押し直しても二重には取り消さない) */
+  function showUndoFailed(ids, res, what) {
+    const dlg = openDialog(`
+      <h2>${res.unknown ? '❓ 取り消せたか分かりません' : '⚠ 取り消せませんでした'}</h2>
+      <div class="pname">${esc(what || '')}</div>
+      <div class="msg err">${esc(res.message || '')}${res.unknown ? '<br>通信が戻ってから「もう一度取り消す」を押してください (押し直しても二重には取り消しません)' : '<br>職員を呼んでください'}</div>
+      <div style="margin-top:12px"><button class="bigbtn" id="uf-retry">もう一度取り消す</button></div>
+      <div style="margin-top:8px"><button class="bigbtn sub" id="uf-close">閉じる (取り消さない)</button></div>
+      <div class="msg" id="uf-msg"></div>`, { sticky: true });   // 背景タップで閉じない (閉じても次の更新でまた出るだけになる)
+    // 「閉じる」= 取り消さないと決めた → この組の控えだけ消す
+    dlg.querySelector('#uf-close').addEventListener('click', () => { pendingUndo.remove(ids); closeDialog(); });
+    dlg.querySelector('#uf-retry').addEventListener('click', async (ev) => {
+      // 🚨 送っている間は「閉じる」も押せない (返事の前に閉じて控えを消すと、通信が切れたとき追えなくなる — R3 #2)
+      dlg.querySelectorAll('button').forEach(b => { b.disabled = true; });
+      const r = await revokeAll(ids, what);
+      if (r.ok) { closeDialog(); if (r.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください'); return; }
+      closeDialog(); showUndoFailed(ids, r, what);
     });
   }
 
@@ -1056,7 +1529,10 @@
    */
   async function handlePlaceOutcome(out, ctx) {
     const dlg = ctx && ctx.dlg, msg = ctx && ctx.msg;
-    const reenable = () => { const b = dlg && dlg.querySelector('#d-add'); if (b) b.disabled = false; };
+    const reenable = () => {
+      if (dlg && dlg._setSending) { dlg._setSending(false); return; }   // 商品の画面: 数の入力ごと戻す (数の条件も見直す)
+      const b = dlg && dlg.querySelector('#d-add'); if (b) b.disabled = false;
+    };
     const err = (t) => {
       if (msg) { msg.className = 'msg err'; msg.textContent = t; } else { alert(t); }
       reenable();
@@ -1075,11 +1551,23 @@
       case 'broken':
         reenable();
         return showBrokenPending(out.record, { body: out.body, meta: out.meta, row: ctx && ctx.row });
-      case 'previousFailed':
+      case 'previousFailed': {
         // 前の分は登録できていない = 今回の分を自動で送ると何が入ったか分からなくなる。
-        // まず失敗を見せて、押し直してもらう
+        // まず失敗を見せて、押し直してもらう。
+        // 🚨 いま押した分の入力を捨てない (Codex PR #1421 R1 #6 = master から): 失敗の画面で商品の画面が置き換わり、
+        //    「わかりました」で閉じると、いま箱に入れた分がどこにも残らなかった。
+        //    → 「いま押した分はまだ記録していない」と見せ、閉じたら**同じ入力のまま**商品の画面に戻す (自動では送らない)
         reenable();
-        return showLeftoverPlacement(out.prev);
+        const row = ctx && ctx.row;
+        const draft = dlg && dlg._readDraft ? dlg._readDraft() : null;   // 画面が置き換わる前に持ち出す
+        // 🚨 端末にも控える。この画面のあいだに読み込み直し・iPad がページを捨てても、「まだ記録していない分」を
+        //    追えるように (Codex PR #1424 R1 #1)。送信キューの 1 件にすると自動で送られてしまうので、別の控え
+        const unsentId = unsentNow.set({ runId: curRunId, rowId: row ? row.id : out.body.row_id, draft, body: out.body, meta: out.meta });
+        const dr = Object.assign({}, draft || {}, { unsentId: unsentId || null, notStored: !unsentId });
+        return showLeftoverPlacement(out.prev, null,
+          row ? async () => { if (!dialogOpen) openRowDialog(row.id, dr); } : null,
+          { pendingNow: { body: out.body, meta: out.meta }, reopens: !!row, notStored: !unsentId });
+      }
       case 'showFirst':
         // 別の商品の見せそびれ。見せてから、ack と今回分の保存を**1回の操作で**やる
         // (間で落ちると今回の現物投入がどこにも残らない — PQ-R2 high#5)
@@ -1108,12 +1596,19 @@
     // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
     // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
     setOnline(true);
+    unsentNow.settle(rec);   // 控えていた「まだ記録していない分」は、その控えから押した操作が記録できたら消す
     const acked = await placeQueue.ack(rec.requestId);   // 押した本人が見ている場面なのでトーストでよい
     if (!acked.ok && acked.reason === 'storage_failed') {
       return err('記録は入りましたが、この端末に保存できませんでした。職員を呼んでください');
     }
-    closeDialog();
-    showUndoToast(j.placementId, { product_name: rec.meta && rec.meta.productName }, rec.body.qty, checkWorkerNoteOf(rec, j));
+    // 「いまの箱」= 最後に入れた箱 (次の商品も同じ箱なら、開いたときに残り全部が入った状態になる)
+    const sp = bodySplits(rec.body);
+    const lastBox = sp[sp.length - 1] && sp[sp.length - 1].boxId;
+    if (lastBox && ((S && S.boxes) || []).some(b => b.id === lastBox && b.status === 'open')) setCurBox(lastBox);
+    // 🚨 閉じるのは「送った画面」がまだ出ているときだけ。別の画面に替わっていたら、そこでの入力を消さない (Codex PR #1426 R2 #1)
+    if (!dlg || $('#ovl-root .dlg') === dlg) closeDialog();
+    clearFind();   // 次の商品の番号をすぐ打てるように (一覧は全部に戻る)
+    showUndoToast(placementIdsOf(j), { product_name: rec.meta && rec.meta.productName }, bodyQty(rec.body), checkWorkerNoteOf(rec, j), sp.length > 1 ? bodyWhere(rec.body) : '');
   }
   async function withSaving(fn) { showSaving(true); try { return await fn(); } finally { showSaving(false); } }
 
@@ -1123,7 +1618,6 @@
    */
   function showBrokenPending(rec, pressed) {
     const now = pressed && pressed.body;
-    const boxOf = (id) => (((S && S.boxes) || []).find(b => b.id === id) || {}).box_code || '?';
     const dlg = openDialog(`
       <h2>⚠ 送れていない記録が読めません</h2>
       <div class="msg err">この端末に、送れていない記録が残っていますが、中身を読めませんでした${
@@ -1131,7 +1625,7 @@
         <b>箱に入れた分が記録に入っていないかもしれません。</b></div>
       ${now ? `<div class="lbl">いま押した分 (まだ記録できていません)</div>
         <div class="pname">${esc(shortName((pressed.meta && pressed.meta.productName) || 'この商品'))}
-          <b style="font-size:1.2em">${now.qty}</b>個 → ${esc(boxOf(now.box_id))}</div>` : ''}
+          <b style="font-size:1.2em">${bodyQty(now)}</b>個 → ${esc(bodyWhere(now))}</div>` : ''}
       <div class="lbl">職員の方へ</div>
       <div class="msg" style="color:#495057">「📋 まとめ」か本社の画面で、この商品の記録が入っているかを確かめてください。
         入っていなければ、捨てたあとに現物どおり入れ直してください${now ? ' (いま押した分も入れ直しが要ります)' : ''}</div>
@@ -1164,18 +1658,17 @@
    * 実際に入れた分が記録されない — Codex PQ-R1 high#4)
    */
   function askPlacedAgain(out) {
-    const prevQty = out.prev.body.qty;
+    const prevQty = bodyQty(out.prev.body), nowQty = bodyQty(out.body);
     const name = (out.prev.meta && out.prev.meta.productName) || 'この商品';
-    const boxOf = (id) => (((S && S.boxes) || []).find(b => b.id === id) || {}).box_code || '?';
-    const prevBox = boxOf(out.prev.body.box_id), nowBox = boxOf(out.body.box_id);
+    const prevBox = bodyWhere(out.prev.body), nowBox = bodyWhere(out.body);
     const dlg = openDialog(`
       <h2>⚠ さっきの分は記録できています</h2>
       <div class="pname" style="margin:10px 0">${esc(shortName(name))}</div>
       <div class="msg" style="color:#2B8A3E; font-weight:700">前に押した <b style="font-size:1.2em">${prevQty}</b>個 (${esc(prevBox)}) は登録できていました
         <small style="display:block; color:#868E96; font-weight:600">通信が切れて画面に出ていませんでした</small></div>
-      <div class="lbl">そのあと、<b>さらに ${out.body.qty}個</b> を ${esc(nowBox)} に入れましたか?</div>
+      <div class="lbl">そのあと、<b>さらに ${nowQty}個</b> を ${esc(nowBox)} に入れましたか?</div>
       <div style="margin-top:10px"><button class="bigbtn" id="pa-no">いいえ (入れていない)</button></div>
-      <div style="margin-top:10px"><button class="selbtn" id="pa-yes" style="width:100%">はい、さらに ${out.body.qty}個 入れた</button></div>
+      <div style="margin-top:10px"><button class="selbtn" id="pa-yes" style="width:100%">はい、さらに ${nowQty}個 入れた</button></div>
       <div class="msg" style="color:#868E96">迷ったら「いいえ」を押して、箱の中身と画面の数を見くらべてください${
         prevBox !== nowBox ? '<br>前と違う箱です。入れ直したのなら「いいえ」を押して、職員に記録を直してもらってください' : ''}</div>
       <div class="msg" id="pa-msg"></div>`,
@@ -1184,6 +1677,7 @@
     const busy = (v) => dlg.querySelectorAll('button').forEach(b => { b.disabled = v; });
     dlg.querySelector('#pa-no').addEventListener('click', async () => {
       busy(true);
+      unsentNow.settle(out.prev);
       const a = await placeQueue.ack(out.prev.requestId);
       busy(false);
       if (!a.ok && a.reason === 'storage_failed') {
@@ -1195,6 +1689,7 @@
     });
     dlg.querySelector('#pa-yes').addEventListener('click', async () => {
       busy(true);
+      unsentNow.settle(out.prev);
       const again = await withSaving(() => placeQueue.ackAndSend({ ackRequestId: out.prev.requestId, body: out.body, meta: out.meta }));
       busy(false);
       // 現物はもう箱に入っている。ここで閉じると記録が漏れるので、送れるまで閉じない (PQ-R2 high#6)
@@ -1286,20 +1781,32 @@
    * 8秒で消えるトーストだと、裏で確定した分を見落として押し直し → 二重登録になる
    * (Codex PQ-R1 high#5)。ack は人がボタンを押したあと (Codex PQ-R1 high#2)
    */
-  function showLeftoverPlacement(rec, next, after) {
+  function showLeftoverPlacement(rec, next, after, opts) {
+    // いま押した分 (前の記録が失敗と分かったので、送っていない)。見せないと「入れた」と思ったまま次へ進む
+    const now = opts && opts.pendingNow;
     const j = rec.result || {}, ok = j.ok === true;
+    // 分けて入れた記録の一部だけが取り消されている (Codex PR #1421 R2 #2: 全体を「記録できませんでした」と出すと、残っている分まで入れ直す)
+    const parts = (!ok && j.partial && Array.isArray(j.placements)) ? j.placements : null;
+    const partial = !!parts;
+    const liveParts = partial ? parts.filter(p => !p.revoked) : [], goneParts = partial ? parts.filter(p => p.revoked) : [];
     const name = rec.meta && rec.meta.productName ? rec.meta.productName : 'この商品';
-    const boxCode = ((S && S.boxes) || []).find(b => b.id === rec.body.box_id);
     const dlg = openDialog(`
-      <h2>${ok ? '✅ さっきの分は記録できています' : '⚠ さっきの分は記録できませんでした'}</h2>
+      <h2>${ok ? '✅ さっきの分は記録できています' : (partial ? '⚠ さっきの分は一部だけ記録が残っています' : '⚠ さっきの分は記録できませんでした')}</h2>
       <div class="pname" style="margin:10px 0">${esc(shortName(name))}
-        <b style="font-size:1.2em">${rec.body.qty}</b>個${boxCode ? ' → ' + esc(boxCode.box_code) : ''}</div>
-      ${ok
+        ${partial ? '' : `<b style="font-size:1.2em">${bodyQty(rec.body)}</b>個 → ${esc(bodyWhere(rec.body))}`}</div>
+      ${partial ? `<div style="background:#EBFBEE; border-radius:10px; padding:8px 12px; margin:6px 0">✅ 記録が残っている: <b>${esc(liveParts.map(p => `${p.boxCode} に ${p.qty}個`).join('・'))}</b>
+          <small style="display:block; color:#495057">この分は入れ直さないでください</small></div>
+        <div style="background:#FFF5F5; border-radius:10px; padding:8px 12px; margin:6px 0">↩ 取り消されている: <b>${esc(goneParts.map(p => `${p.boxCode} に ${p.qty}個`).join('・'))}</b>
+          <small style="display:block; color:#C92A2A">箱の中身と見くらべて、実物が入っていればこの分だけ入れ直してください (職員を呼んでください)</small></div>`
+      : ok
         ? '<div class="msg" style="color:#2B8A3E; font-weight:700">通信が切れていて、画面に出せていませんでした</div>'
         : `<div class="msg err">${esc(j.message || '登録できませんでした')}
             <small style="display:block; font-weight:600">箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)</small></div>`}
+      ${now ? `<div class="warnbox" style="margin-top:10px">いま押した分 (${esc(shortName((now.meta && now.meta.productName) || 'この商品'))} ${bodyQty(now.body)}個 → ${esc(bodyWhere(now.body))}) は、まだ記録していません
+          <small>${opts.reopens ? '「わかりました」を押すと、入力した画面に戻ります。箱の中身を確かめてから、もう一度「入れた」を押してください' : 'この商品の画面を開いて、もう一度入れてください'}</small>
+          ${opts.notStored ? '<small style="color:#C92A2A">⚠ この端末に控えを保存できませんでした。画面を閉じたり読み込み直したりせず、このまま入れ直してください</small>' : ''}</div>` : ''}
       <div style="margin-top:12px"><button class="bigbtn" id="lo-ok">わかりました</button></div>
-      ${ok && j.placementId ? '<div style="margin-top:10px"><button class="selbtn" id="lo-undo" style="width:100%">この記録を取り消す</button></div>' : ''}
+      ${ok && placementIdsOf(j).length ? '<div style="margin-top:10px"><button class="selbtn" id="lo-undo" style="width:100%">この記録を取り消す</button></div>' : ''}
       <div class="msg" id="lo-msg"></div>`,
       { sticky: true });
     const loMsg = dlg.querySelector('#lo-msg');
@@ -1309,6 +1816,7 @@
       busy(true);
       try {
         if (next) {
+          unsentNow.settle(rec);
           const again = await withSaving(() => placeQueue.ackAndSend({ ackRequestId: rec.requestId, body: next.body, meta: next.meta }));
           // 置き換えられなかった = いま箱に入れた分がまだどこにも残っていない → 閉じない
           if (again.kind === 'storage_failed' || again.kind === 'conflict' || again.kind === 'broken') {
@@ -1322,6 +1830,7 @@
           if (after) await after(again);
           return;
         }
+        unsentNow.settle(rec);   // 裏で送り直して確定した分が、控えから押したものなら控えを消す (R2 #1)
         const a = await placeQueue.ack(rec.requestId);
         if (!a.ok && a.reason === 'storage_failed') {
           loMsg.className = 'msg err';
@@ -1336,10 +1845,11 @@
     dlg.querySelector('#lo-undo')?.addEventListener('click', async () => {
       busy(true);
       try {
-        const j2 = await apiPost(`/api/placements/${j.placementId}/revoke`, { worker_id: worker && worker.id });
+        // 分けて入れた記録は全部戻す。1 つでも戻せなければ、ここで止めて知らせる (押し直せば残りを戻す)
+        const j2 = await revokeAll(placementIdsOf(j), `${shortName(name, 20)} ${bodyQty(rec.body)}個`);
         if (!j2.ok) {
           loMsg.className = 'msg err';
-          loMsg.textContent = j2.message || '戻せませんでした (通信を確かめて、もう一度押してください)';
+          loMsg.textContent = (j2.message || '戻せませんでした') + (j2.unknown ? ' — 戻せたか分かりません。通信を確かめて、もう一度押してください (二重には取り消しません)' : '');
           return;
         }
       } catch (e) {
@@ -1365,11 +1875,18 @@ ${j.message || ''}
 箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)`);
   }
   /** 投入を送る。戻り値は place-queue の outcome (done / blocked / confirm) をそのまま返す */
-  async function sendPlacement({ rowId, boxId, qty, layer, expiry, meta }) {
-    const body = {
-      run_id: curRunId, row_id: rowId, box_id: boxId, qty, layer: layer || null,
-      expiry: expiry || null, worker_id: worker.id,
-    };
+  /**
+   * splits = [{boxId, qty}]。箱が 1 つなら、いままでと同じ形 (box_id + qty) で送る —
+   * サーバーも送信キューの送り直しも、1 箱の投入はこれまでとまったく同じに扱う。
+   * 2 つ以上は splits で 1 回に送る (サーバーが 1 トランザクションで全部入れるか、1 つも入れない)
+   */
+  async function sendPlacement({ rowId, splits, layer, expiry, meta }) {
+    const where = splits.length === 1
+      ? { box_id: splits[0].boxId, qty: splits[0].qty }
+      : { splits: splits.map(s => ({ box_id: s.boxId, qty: s.qty })) };
+    const body = Object.assign({ run_id: curRunId, row_id: rowId }, where, {
+      layer: layer || null, expiry: expiry || null, worker_id: worker.id,
+    });
     showSaving(true);
     try { return await placeQueue.send({ body, meta }); } finally { showSaving(false); }
   }
@@ -1391,15 +1908,16 @@ ${j.message || ''}
     $('#toast-root').innerHTML = '';
   }
 
-  function showUndoToast(placementId, row, qty, checkWorkerNote) {
+  function showUndoToast(placementIds, row, qty, checkWorkerNote, where) {
     showToast(`<div class="toast">
-      <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました${checkWorkerNote
+      <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました${where ? `<br><small>${esc(where)}</small>` : ''}${checkWorkerNote
         ? `<br><small>👤 確認した人は${checkWorkerNote.auto ? '先に入れた ' : ''}<b>${esc(checkWorkerNote.name)}</b> さんで記録されています</small>` : ''}</span>
       <button id="undo">元に戻す</button></div>`, 8000);
     $('#undo').addEventListener('click', async () => {
       hideToast();
-      const j = await apiPost(`/api/placements/${placementId}/revoke`, { worker_id: worker.id });
-      if (!j.ok) alert(j.message || '戻せませんでした (職員を呼んでください)');
+      const j = await revokeAll(placementIds, `${shortName(row.product_name, 20)} ${qty}個${where ? ' (' + where + ')' : ''}`);
+      if (!j.ok) { showUndoFailed(placementIds, j, `${shortName(row.product_name, 20)} ${qty}個${where ? ' (' + where + ')' : ''}`); return; }
+      if (j.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
       refresh(true);
     });
   }
@@ -1523,7 +2041,7 @@ ${j.message || ''}
       setCurBox(j.boxId);
       closeDialog();
       alert(`📦 箱「${j.boxCode}」(${j.boxNo}箱目) をつくりました。\n箱に太いペンで「${j.boxCode}」と書いてください`);
-      if (after) after();
+      if (after) after(j.boxId);   // 商品の画面から来たときは、つくった箱に残りを入れて戻る
     });
   }
 
@@ -1545,9 +2063,10 @@ ${j.message || ''}
       <div style="margin:12px 0; max-height:40vh; overflow-y:auto">
         ${contents.length === 0 ? 'まだ空です' : contents.map(p => `
           <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #F1F3F5">
-            <span>${esc(shortName(p.product_name, 18))} <small style="color:#868E96">${esc(fn4(p.fnsku))}${p.expiry ? ' / ' + esc(p.expiry) : ''}${p.placement_layer ? ' / ' + layJa[p.placement_layer] : ''}</small></span>
-            <span><b>${p.qty}個</b>
-              <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px; margin-left:8px">↩</button>
+            <span>${esc(shortName(p.product_name, 18))} <small style="color:#868E96">${esc(fn4(p.fnsku))}${p.expiry ? ' / ' + esc(p.expiry) : ''}${p.placement_layer ? ' / ' + layJa[p.placement_layer] : ''} / ${esc(hhmm(p.created_at))}</small></span>
+            <span style="white-space:nowrap"><b>${p.qty}個</b>
+              <button class="selbtn badj" data-id="${p.id}" data-row="${p.row_id}" data-qty="${p.qty}" style="padding:6px 10px; margin-left:8px">数を直す</button>
+              <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px">取消</button>
             </span>
           </div>`).join('')}
       </div>
@@ -1589,6 +2108,15 @@ ${j.message || ''}
       else if (j2.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
       closeDialog(); openBoxDialog(boxId);
     }));
+    // 箱の中身から数を直す (いろは 2026-09-23: 箱詰めで数を間違えたとき、箱の画面から直せなかった)。直したら箱の画面に戻る
+    dlg.querySelectorAll('.badj').forEach(btn => btn.addEventListener('click', () => {
+      const row = (S.rows || []).find(x => x.id === Number(btn.dataset.row));
+      if (!row) { alert('この商品が一覧にありません。画面を更新してください'); return; }
+      adjustDialog(row, Number(btn.dataset.id), Number(btn.dataset.qty), {
+        boxCode: b.box_code, placement: contents.find(p => p.id === Number(btn.dataset.id)) || null,
+        after: async () => { await refresh(true); if (!dialogOpen) openBoxDialog(boxId); },
+      });
+    }));
   }
 
   /** 箱クローズ = 読み合わせ → 実測重量 → 理由・緩衝材 (要件 D6 / 結果シグナル) */
@@ -1596,7 +2124,10 @@ ${j.message || ''}
     const dlg = openDialog(`
       <h2>✅ ${esc(b.box_code)} を閉じます — 読み合わせ</h2>
       <div style="margin:10px 0; max-height:30vh; overflow-y:auto; background:#F8F9FA; border-radius:10px; padding:10px">
-        ${contents.map(p => `<div style="padding:4px 0">・${esc(shortName(p.product_name, 20))} <b>${p.qty}個</b>${p.expiry ? ` (期限 ${esc(p.expiry)})` : ''}</div>`).join('')}
+        ${contents.map(p => `<div style="padding:4px 0; display:flex; justify-content:space-between; align-items:center; gap:8px">
+          <span>・${esc(shortName(p.product_name, 20))} <b>${p.qty}個</b>${p.expiry ? ` (期限 ${esc(p.expiry)})` : ''}
+            <small style="color:#868E96">${esc(hhmm(p.created_at))}${p.placement_layer ? ' / ' + ({ bottom: '下', middle: '中', top: '上' })[p.placement_layer] : ''}</small></span>
+          <button class="selbtn cadj" data-id="${p.id}" data-row="${p.row_id}" data-qty="${p.qty}" style="padding:4px 10px; flex:none">直す</button></div>`).join('')}
         <div style="border-top:1px solid #DEE2E6; margin-top:6px; padding-top:6px"><b>合計 ${b.total_qty}個 / ${b.sku_count}種類</b></div>
       </div>
       ${estLabel(b) ? `<div style="margin:8px 0; text-align:center">${estLabel(b)}${b.est && b.est.complete ? ' (推定は登録済みの単重からの目安です)' : ''}</div>` : ''}
@@ -1630,6 +2161,16 @@ ${j.message || ''}
       <div style="margin-top:8px"><button class="bigbtn sub" id="c-cancel">やめる (まだ閉じない)</button></div>
       <div class="msg" id="c-msg"></div>`);
     dlg.querySelector('#c-cancel')?.addEventListener('click', () => closeDialog());
+    // 読み合わせで数の違いに気づいたら、ここから直す (いろは 2026-09-23)。直したら箱の画面に戻って、読み合わせからやり直す
+    dlg.querySelectorAll('.cadj').forEach(btn => btn.addEventListener('click', () => {
+      if (dialogLocked) return;   // 閉じる送信中は触らせない
+      const row = (S.rows || []).find(x => x.id === Number(btn.dataset.row));
+      if (!row) { alert('この商品が一覧にありません。画面を更新してください'); return; }
+      adjustDialog(row, Number(btn.dataset.id), Number(btn.dataset.qty), {
+        boxCode: b.box_code, placement: contents.find(p => p.id === Number(btn.dataset.id)) || null,
+        after: async () => { await refresh(true); if (!dialogOpen) openBoxDialog(b.id); },
+      });
+    }));
     /** 上限超え: 「分ける」か「このまま閉じる」かを画面の中で選んでもらう (二段階。PIN は要らない) */
     const showOverLimit = (message) => {
       dlg.querySelector('#c-over-t').textContent = message;
@@ -1810,32 +2351,92 @@ ${j.message || ''}
   }
 
   // ─── 記録の数を直す (間違えて押したとき): 取消 + 入れ直しを 1 回で ───
-  function adjustDialog(row, placementId, currentQty) {
+  /** opts.after = 直したあとの戻り先 (既定 = 商品の画面) / opts.boxCode = どの箱の記録か (見出しに出す) */
+  function adjustDialog(row, placementId, currentQty, opts) {
     if (!worker) { pickWorker(); return; }
+    const pp = planParts(row.plan_no);
+    const rem = sendOf(row) - row.placed;
+    // 箱の中身・読み合わせから来たときは、その画面が出していた記録そのもの (opts.placement) を使う。
+    // S.placements は少し古いことがあり、別の iPad が入れた直後の記録だと見つからない・置いた場所が食い違う (Codex PR #1430 R2 #1)
+    const pl = (opts && opts.placement) || (S.placements || []).find(p => p.id === placementId) || null;
+    const boxCode = (opts && opts.boxCode) || (pl ? boxCodeById(pl.box_id) : '');
+    // 同じ箱に同じ商品の記録が 2 つあると、商品名と数だけでは見分けられない → 置いた場所・時刻・入れた人を出す (Codex PR #1430 R1 #2)
+    const LAYJA = { bottom: '下', middle: '中', top: '上' };
+    const plInfo = pl ? [hhmm(pl.created_at), pl.worker_name || '', pl.placement_layer ? '置いた場所 ' + LAYJA[pl.placement_layer] : ''].filter(Boolean).join(' ・ ') : '';
     const dlg = openDialog(`
       <h2>✏ 数を直す</h2>
-      <div class="pname">${esc(shortName(row.product_name))} — いまの記録 <b style="font-size:1.3em">${currentQty}</b>個</div>
+      <div style="font-weight:800; color:#495057">${esc(pp.label)}<span style="font-size:1.6em; color:#B5651D; margin-left:2px">${esc(pp.no)}</span></div>
+      <div class="pname">${esc(shortName(row.product_name))}${boxCode ? ` — <b>${esc(boxCode)}</b> の記録` : ''} <b style="font-size:1.3em">${currentQty}</b>個</div>
+      ${plInfo ? `<div class="msg" style="color:#495057; margin-top:0">記録: ${esc(plInfo)}</div>` : ''}
+      <div class="msg" style="color:#868E96; margin-top:0">予定 ${row.planned_qty}${row.extra_qty ? ` (送る数 ${sendOf(row)})` : ''} / 入れた ${row.placed}${row.shortage_qty ? ` / 送らない ${row.shortage_qty}` : ''} → この記録は <b>${currentQty + Math.max(0, rem)}</b> 個まで増やせます</div>
       <div class="lbl">正しい個数 (0 = この記録を取り消す)</div>
       <input class="qtyin" id="a-qty" type="tel" inputmode="numeric" value="${currentQty}">
       <div style="margin-top:14px"><button class="bigbtn" id="a-go">この数に直す</button></div>
+      <div style="margin-top:8px"><button class="bigbtn sub" id="a-cancel">やめる (直さない)</button></div>
       <div class="msg" id="a-msg"></div>`);
-    dlg.querySelector('#a-go').addEventListener('click', async () => {
+    // 出口を画面に出す (背景タップしか無いと「どこも押せない」に見える)。直したあとの戻り先と同じ画面へ戻る
+    dlg.querySelector('#a-cancel').addEventListener('click', async () => {
+      if (busy) return;
+      closeDialog();
+      if (opts && opts.after) { await opts.after(); return; }
+      await refresh(true); if (!dialogOpen) openRowDialog(row.id);
+    });
+    // 操作ID は「同じ数を押し直すあいだ」使い続ける。返事が落ちて押し直したとき、サーバーは同じ修正として
+    // 前の結果を返す (二重に直さない)。数を変えたら新しい ID (Codex PR #1421 R1 #7: 以前は押すたびに新しい ID だった)
+    let requestId = null, sentQty = null, busy = false;
+    dlg.querySelector('#a-go').addEventListener('click', async (ev) => {
+      if (busy) return;
       const msg = dlg.querySelector('#a-msg');
-      const qty = Number(dlg.querySelector('#a-qty').value);
-      if (!Number.isInteger(qty) || qty < 0) { msg.className = 'msg err'; msg.textContent = '0 以上の整数で入れてください'; return; }
-      const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
-      const j = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId });
+      // 🚨 空欄を 0 (= 取消) にしない。書き換えの途中で押すと記録が消える (Codex PR #1430 R1 #4)。全角の数字は受け付ける
+      const raw = dlg.querySelector('#a-qty').value.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).trim();
+      if (!/^\d{1,6}$/.test(raw)) { msg.className = 'msg err'; msg.textContent = raw === '' ? '個数を入れてください (取り消すときは 0)' : '0 以上の整数で入れてください'; return; }
+      const qty = Number(raw);
+      if (!requestId || sentQty !== qty) {
+        requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+        sentQty = qty;
+      }
+      // 🚨 ボタンは await の前に掴んでおく (ev.currentTarget は await のあとで null になる)
+      const goBtn = ev.currentTarget;
+      // 送信中は背景タップでも閉じない。閉じて別の画面を開くと、遅れて来た返事がその画面を閉じてしまう (Codex PR #1430 R1 #3)
+      busy = true; goBtn.disabled = true; dialogLocked = true;
+      const cancelBtn = dlg.querySelector('#a-cancel'); if (cancelBtn) cancelBtn.disabled = true;
+      msg.className = 'msg'; msg.textContent = '送信中…';
+      let j;
+      try { j = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId }); }
+      catch { j = { ok: false, error: 'no_body' }; }
+      busy = false; goBtn.disabled = false; if (cancelBtn) cancelBtn.disabled = false;
+      const mine = $('#ovl-root .dlg') === dlg;
+      if (mine) dialogLocked = false;
+      if (!j.ok && (j.error === 'no_body' || j._status >= 500)) {
+        msg.className = 'msg err';
+        msg.textContent = '返事が届きませんでした。通信が戻ってから、同じ数のままもう一度押してください (二重には直りません)';
+        // 🚨 直ったかどうか分からない。「やめる (直さない)」と言うと嘘になりうる → 言い換える (Codex PR #1432 R1 #1)
+        // 戻った画面も通信が戻るまでは古いことがある (R2) → 「まだ分からない」ことをそのまま書く
+        if (cancelBtn) cancelBtn.textContent = '画面を閉じる (直ったかはまだ分かりません — 通信が戻ってから記録を確かめる)';
+        return;
+      }
+      // 予定を超える: サーバーの文は「取り消してから入れ直す」途中の数 (入力済み 0 など) で分かりにくいので、この画面の言葉で言い直す
+      // 上限はサーバーが返した**今の**数で出す (画面を開いたあとに別の iPad が入れていると、開いた時点の数は古い — Codex PR #1430 R1 #1)。
+      // placed はこの記録を取り消したあとの数
+      if (!j.ok && j.error === 'over_qty') {
+        const max = Number.isFinite(j.plannedQty) && Number.isFinite(j.placed) ? Math.max(0, j.plannedQty - (j.shortage || 0) + (j.extra || 0) - j.placed) : currentQty + Math.max(0, rem);
+        msg.className = 'msg err'; msg.textContent = `この記録は ${max} 個までにしか直せません (送る数を超えます。予定より多く送るときは、職員が商品の画面の「送る数を直す」で増やしてください)`; return;
+      }
       if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message || '直せませんでした'; return; }
       if (j.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
+      if (!mine) { showNoteToast(`✏ ${shortName(row.product_name, 14)} の数を ${qty}個 に直しました`); return; }   // 別の画面に替わっていたら、その画面は閉じない
       closeDialog();
+      if (opts && opts.after) { await opts.after(); return; }
       await refresh(true); openRowDialog(row.id);
     });
   }
 
   // ─── 送る数の修正 (職員): 棚の在庫が予定より少ないとき等。予定 → 送る数 と理由を記録 ───
-  function sendQtyDialog(row) {
+  // 予定より多くもできる (中原さん 2026-10-05)。そのときの理由は「本社指示」「その他」だけ (減らす理由は押せなくする)
+  const EXTRA_REASONS = ['hq_order', 'other'];
+  function sendQtyDialog(row, draft) {
     staffPinPrompt(async (staffWorker, pin) => {
-      const current = row.planned_qty - (row.shortage_qty || 0);
+      const current = sendOf(row);
       const dlg = openDialog(`
         <h2>✏ 送る数を直す (職員)</h2>
         <div class="pname">${esc(shortName(row.product_name))}</div>
@@ -1849,22 +2450,49 @@ ${j.message || ''}
         <div class="lbl">理由</div>
         <div class="grid3">
           ${[['stock_short', '在庫が少ない'], ['damaged', '破損'], ['not_shipped', '今回は納品しない'], ['hq_order', '本社指示'], ['other', 'その他']]
-            .map(([v, ja]) => `<button class="selbtn qrsn ${(row.shortage_reason || 'stock_short') === v ? 'on' : ''}" data-v="${v}">${ja}</button>`).join('')}
+            .map(([v, ja]) => `<button class="selbtn qrsn" data-v="${v}">${ja}</button>`).join('')}
         </div>
+        <div class="msg hidden" id="q-extra" style="color:#B5651D; font-weight:700"></div>
         <div class="msg" style="color:#868E96">予定に戻すときは送る数に予定の数 (${row.planned_qty}) を入れてください。本社の画面には「予定 → 送る数」と理由が出ます</div>
         <div style="margin-top:14px"><button class="bigbtn" id="q-go">この数で送る</button></div>
         <div class="msg" id="q-msg"></div>`);
-      let reason = ['stock_short', 'damaged', 'not_shipped', 'hq_order', 'other'].includes(row.shortage_reason) ? row.shortage_reason : 'stock_short';
+      const prevReason = row.extra_qty ? row.extra_reason : row.shortage_reason;
+      let reason = ['stock_short', 'damaged', 'not_shipped', 'hq_order', 'other'].includes(prevReason) ? prevReason : 'stock_short';
+      const qtyIn = dlg.querySelector('#q-qty');
+      // 空欄・数字以外は NaN (Number('') = 0 で「送らない」にしない)
+      const readQty = () => { const raw = qtyIn.value.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).trim(); return /^\d{1,6}$/.test(raw) ? Number(raw) : NaN; };
+      // 予定より多い数のときは、減らす理由 (在庫が少ない・破損・今回は納品しない) を押せなくして「本社指示」に寄せる。
+      // 寄せたあと予定以下に戻したら、寄せる前の理由に戻す (人が選んでいない「本社指示」を残さない — Codex PR #1621 R1 Medium)
+      let autoFrom = null;   // 自動で「本社指示」に寄せる前の理由。人が理由を押したら消す
+      const paint = () => {
+        const q = readQty();
+        const over = Number.isInteger(q) && q > row.planned_qty;
+        if (over && !EXTRA_REASONS.includes(reason)) { autoFrom = reason; reason = 'hq_order'; }
+        else if (!over && autoFrom) { reason = autoFrom; autoFrom = null; }
+        dlg.querySelectorAll('.qrsn').forEach(b => {
+          const off = over && !EXTRA_REASONS.includes(b.dataset.v);
+          b.disabled = off; b.style.opacity = off ? '0.35' : '';
+          b.classList.toggle('on', b.dataset.v === reason);
+        });
+        const ex = dlg.querySelector('#q-extra');
+        ex.classList.toggle('hidden', !over);
+        ex.textContent = over ? `予定 (${row.planned_qty}) より ${q - row.planned_qty} 個 多く送ります。Amazon の納品プランの数量は本社が直します` : '';
+      };
+      qtyIn.addEventListener('input', paint);
+      paint();
       dlg.querySelectorAll('.qrsn').forEach(b => b.addEventListener('click', () => {
-        dlg.querySelectorAll('.qrsn').forEach(x => x.classList.remove('on'));
-        b.classList.add('on'); reason = b.dataset.v;
+        if (b.disabled) return;
+        reason = b.dataset.v; autoFrom = null; paint();
       }));
       dlg.querySelector('#q-go').addEventListener('click', async () => {
         const msg = dlg.querySelector('#q-msg');
-        const j = await apiPost(`/api/rows/${row.id}/send-qty`, { worker_id: staffWorker.id, pin, send_qty: Number(dlg.querySelector('#q-qty').value), reason });
+        const q = readQty();
+        if (!Number.isInteger(q)) { msg.className = 'msg err'; msg.textContent = '送る数を 0 以上の整数で入れてください'; return; }
+        const j = await apiPost(`/api/rows/${row.id}/send-qty`, { worker_id: staffWorker.id, pin, send_qty: q, reason });
         if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message; return; }
         dialogOpen = false; $('#ovl-root').innerHTML = '';
-        await refresh(true); openRowDialog(row.id);   // 商品の画面に戻る (一覧に落とさない)
+        // 商品の画面に戻る (一覧に落とさない)。入力途中の箱ごとの数はそのまま — 送る数が減って残りを超えたら赤く出る
+        await refresh(true); if (!dialogOpen) openRowDialog(row.id, draft || null);
       });
     });
   }
@@ -1915,12 +2543,34 @@ ${j.message || ''}
     });
   }
 
+  // ─── アップデートのお知らせ (端末ごとに ✕ で閉じられる。版が変われば また出る) ───
+  const UPDATE_ID = '2026-10-05';
+  (function initUpdateBar() {
+    const bar = $('#updbar');
+    if (!bar) return;
+    if (LS.get('upd_seen', null) !== UPDATE_ID) bar.classList.remove('hidden');
+    $('#updbar-x').addEventListener('click', () => { LS.set('upd_seen', UPDATE_ID); bar.classList.add('hidden'); });
+  })();
+
   // ─── 初期化 ───
   $('#btn-back').addEventListener('click', backToRuns);
   $('#btn-worker').addEventListener('click', pickWorker);
   $('#btn-roster').addEventListener('click', () => rosterDialog());
   $('#btn-summary').addEventListener('click', () => summaryDialog());
   $('#btn-newbox').addEventListener('click', () => newBoxDialog());
+  // 番号で探す: 打つたびに絞る / Enter (キーボードの「開く」) で、その番号の商品を開く / × で全部に戻す
+  $('#find').addEventListener('input', () => { if (S) { render(); window.scrollTo(0, 0); } });
+  $('#findform').addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!S) return;
+    const q = findQuery();
+    const all = S.rows.filter(r => r.pack_group_id === curGroupId && r.match_state !== 'retired');
+    const hit = findTarget(findRows(all, q), q);
+    if (!hit) return;
+    $('#find').blur();   // キーボードを下げてから商品の画面を出す (iPad でダイアログの下半分が隠れないように)
+    openRowDialog(hit.id);
+  });
+  $('#find-x').addEventListener('click', () => { $('#find').value = ''; if (S) render(); $('#find').focus(); });
   window.addEventListener('online', () => setOnline(true));
   window.addEventListener('offline', () => setOnline(false, 'net'));
   // 「結果を見る」から戻る操作で、押した直後 (ボタンが塞がったまま) の画面が保存から出てくることがある → 一覧を読み直す

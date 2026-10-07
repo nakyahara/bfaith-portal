@@ -25,6 +25,8 @@ const FORCE_ON = new Set(['true', '1', 'on', 'yes']);
 // ⭐ 1〜5時台は入れない。狙いは 00:30 の1回だけで、深夜帯を通しで開けると Drive を12回余計に叩く
 //    (Codex #1231 追加分 Medium)。21〜23時台も現場が動いていないので入れない
 const DEFAULT_CRON = '*/30 0,6-20 * * *';
+/** 台帳 (config/jobs-registry.mjs) の id。入荷受付CSV の Drive 取込の生存を見る */
+const FETCH_JOB_ID = 'inbound-check-drive-fetch';
 
 let task = null;
 
@@ -52,7 +54,13 @@ export function startInboundCheckCron() {
   // timezone を明示 (未指定だとプロセスのローカル TZ 依存になる)
   // runScheduledFetch 自身が実行中フラグを持つので重ならない。ここでは例外を握って巡回を止めない
   task = cron.schedule(use, async () => {
-    try { await runScheduledFetch({ actor: 'cron' }); }
+    try {
+      const r = await runScheduledFetch({ actor: 'cron' });
+      // dead-man 生存 ping (台帳 inbound-check-drive-fetch)。入荷受付CSV が Drive から取れた (取り込んだ / 前回から変わっていない) ときだけ。
+      // Drive に届かない・CSV を断った回は打たない = 続けば締切超過で気づく。30 分おきなので 1 時間に 1 回へ間引く。
+      // 🚨 商品マスタ・バーコードマスタ (下の 2 つ) の成否はこの ping に入らない (それぞれ管理画面に出る)
+      if (r && (r.ok || r.error === 'duplicate_file')) pingJobThrottled(FETCH_JOB_ID, r.ok ? `取込 ${r.slipCount}伝票 / ${r.rowCount}行` : 'Drive の CSV は前回から変わっていない');
+    }
     catch (e) { console.warn(`[inbound-check] cron: ${e.message}`); }
     // 商品マスタ (期限管理あり/なし) も同じ巡回で見る。中身が変わっていなければ何もしない。
     // ⭐入口を増やさないため専用の cron は作らない (CLAUDE.md の定期実行ルール)

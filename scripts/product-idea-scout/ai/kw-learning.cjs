@@ -2,6 +2,10 @@
 const {hash,requireValue:check}=require('./common.cjs');
 const LEARNING_RULE_VERSION='reason-aware-v1';
 const REASONS=Object.freeze({use_clear:'選定・用途がいい',demand_promising:'需要がありそう',policy_fit:'方針に合う',own_duplicate:'自社品と重複',already_proposed:'過去に提案済み',price_competition:'安価な競合が強い',tooling_investment:'金型・初期投資が重い',safety_responsibility:'安全面の責任が重い',too_similar:'似た案が多い',policy_mismatch:'方針に合わない',brand_dependent:'ブランド頼み',other:'その他'});
+// 画面は理由を「良いと思う点」と「気になる点」に分けて出す。その分け方の正本。
+// positive = interpretJudgement が方向性の肯定として読むコード。other = どちらでもないもの。
+// 残り (= 気になる点) はここに列挙しない。2か所に書くと必ずずれるので、REASONS からの引き算で出す。
+const REASON_GROUPS=Object.freeze({positive:Object.freeze(['use_clear','demand_promising','policy_fit']),other:Object.freeze(['other'])});
 const LEARNING_INSTRUCTION='代表の今回の採否と、選定・用途の良さを分けて読む。「見送りだが選定は良い」は方向性への肯定を保つ。「いい」でも既存商品・過去提案なら新規採用例とは数えず、同用途の再提案を避ける。価格競争、初期投資、安全面の懸念は似た案の選別へ引き継ぐが、製造方法・金型の必要性・競合の製造国・商標を事実確認した記録とは扱わない。同じ問題を解消する具体的な違いが示せなければ再び推薦しない。製造先・工程・原価の未確認だけを理由に落とさない。判断なし・保留は否定ではない。少数の例から素材・カテゴリ全体を禁止しない。';
 const normal=s=>String(s||'').normalize('NFKC').toLowerCase().replace(/\s+/g,'');
 const words=s=>[...new Set(String(s||'').normalize('NFKC').toLowerCase().split(/[\s、・/]+/).filter(x=>x.length>=2))];
@@ -85,4 +89,4 @@ function preferenceScorer(judgements){
     for(let i=0;i<chars.length;i++){let node=root;for(let j=i;j<chars.length;j++){node=node.children.get(chars[j]);if(!node)break;if(node.word&&!seen.has(node.word)){seen.add(node.word);score+=node.weight;}}}return score;
   };
 }
-module.exports={REASONS,LEARNING_RULE_VERSION,LEARNING_INSTRUCTION,latestJudgements,interpretJudgement,learningContext,preferenceScore,preferenceScorer,relatedHistory,sameKeyword};
+module.exports={REASONS,REASON_GROUPS,LEARNING_RULE_VERSION,LEARNING_INSTRUCTION,latestJudgements,interpretJudgement,learningContext,preferenceScore,preferenceScorer,relatedHistory,sameKeyword};

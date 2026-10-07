@@ -15,8 +15,10 @@
  */
 import fs from 'fs';
 import iconv from 'iconv-lite';
-import { initDB, getDB, saveToFile, updateSyncMeta } from './db.js';
+import { initDB, getDB, saveToFile, updateSyncMeta, clearNeCompleteMarks, neSrc } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
+import { legacyCliGate, runWithLegacyCliLock } from '../../lib/master-legacy-gate.mjs';
+import { cliEntry } from '../../config/master-legacy-entries.mjs';
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
 
@@ -49,13 +51,15 @@ function parseCsv(text) {
   if (lines.length < 2) return { headers: [], rows: [] };
   const headers = parseRow(lines[0]);
   const rows = [];
+  let rejected = 0;   // 列数が合わず捨てた行 (読み飛ばし件数に入れる。黙って消さない)
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
     const values = parseRow(line);
     if (values.length === headers.length) rows.push(values);
+    else rejected++;
   }
-  return { headers, rows };
+  return { headers, rows, rejected };
 }
 
 function parseRow(line) {
@@ -92,11 +96,13 @@ function importProducts(filePath) {
       商品コード, 商品名, 仕入先コード, 原価, 売価, 取扱区分,
       代表商品コード, ロケーションコード, 配送業者, 発注ロット単位,
       最終仕入日, 商品分類タグ, 作成日, 在庫数, 引当数,
-      最終更新日, 消費税率, 発注残数, synced_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?)
+      最終更新日, 消費税率, 発注残数, synced_at, 原価_src, 売価_src, 消費税率_src
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?, ?, ?, ?)
   `);
 
   const tx = db.transaction(() => {
+    // CSV で上書きすると NE 取込の「最後まで取れた印」が集合と食い違う → 同じ取引で消す (db.js clearNeCompleteMarks。Company DB構想 10 §6 / ③a-1)
+    clearNeCompleteMarks('products');
     let count = 0;
     for (const row of rows) {
       const code = (row[0]?.trim() || '').toLowerCase();
@@ -104,7 +110,8 @@ function importProducts(filePath) {
       stmt.run(code, row[1]||'', row[2]||'', parseFloat(row[3])||0, parseFloat(row[4])||0,
         row[5]||'', row[6]||'', row[7]||'', row[8]||'', parseInt(row[9])||0,
         row[10]||'', row[11]||'', row[12]||'', parseInt(row[13])||0, parseInt(row[14])||0,
-        row[15]||'', parseFloat(row[16])||0, parseInt(row[17])||0, now());
+        row[15]||'', parseFloat(row[16])||0, parseInt(row[17])||0, now(),
+        neSrc(row[3]), neSrc(row[4]), neSrc(row[16]));   // 元の値 (C1。列が無ければ NULL)
       count++;
     }
     return count;
@@ -172,18 +179,21 @@ function importSetProducts(filePath) {
   const stmt = db.prepare(`
     INSERT OR REPLACE INTO raw_ne_set_products (
       セット商品コード, セット商品名, セット販売価格,
-      商品コード, 数量, セット在庫数, 代表商品コード, synced_at
-    ) VALUES (?,?,?,?,?,?,?, ?)
+      商品コード, 数量, セット在庫数, 代表商品コード, synced_at, セット販売価格_src, 数量_src
+    ) VALUES (?,?,?,?,?,?,?, ?, ?, ?)
   `);
 
   const tx = db.transaction(() => {
+    // CSV で上書きすると NE 取込の「最後まで取れた印」が集合と食い違う → 同じ取引で消す (db.js clearNeCompleteMarks。Company DB構想 10 §6 / ③a-1)
+    clearNeCompleteMarks('setproducts');
     let count = 0;
     for (const row of rows) {
       const setCode = (row[0]?.trim() || '').toLowerCase();
       const childCode = (row[3]?.trim() || '').toLowerCase();
       if (!setCode || !childCode) continue;
       stmt.run(setCode, row[1]||'', parseFloat(row[2])||0, childCode,
-        parseInt(row[4])||1, parseInt(row[5])||0, row[6]||'', now());
+        parseInt(row[4])||1, parseInt(row[5])||0, row[6]||'', now(),
+        neSrc(row[2]), neSrc(row[4]));   // 元の値 (C1。列が無ければ NULL)
       count++;
     }
     return count;
@@ -198,9 +208,33 @@ function importSetProducts(filePath) {
 
 // ─── ロジザード在庫投入 ───
 
+/**
+ * 取り込んだ在庫の素性を sync_meta に残す (Render の写しへ一緒に送る。2026-09-25)。
+ * - logizard_source_at: 在庫を取った時刻 (ロジザードへ取りに行く直前の時刻)。分からなければ空
+ *   (logizard_last_import は「取り込み完了」で在庫を取った時刻ではない。FBA 補充が未出荷伝票を外す基準に使うため、
+ *    遅い方に倒さない。Codex 2026-09-25 A2 設計レビュー High 1 / PR #1446 R1 High)
+ * - logizard_rows_read / logizard_skipped_rows: CSV のデータ行数と、読み飛ばした行数
+ *   (列数が合わない行 + 商品 ID が空の行。全件かどうかの材料。PR #1446 R1 Medium)
+ * - logizard_source_for: 上の値がどの取り込みのものか (= logizard_last_import と同じ値。送り手が突き合わせる)
+ * 🚨 在庫の入れ替えと同じトランザクションで呼ぶ (在庫と素性がずれた状態を見せない)
+ */
+export function recordLogizardSourceMeta({ importedAt, sourceAt, rowsRead, skipped }) {
+  updateSyncMeta('logizard_source_at', sourceAt || '');
+  updateSyncMeta('logizard_rows_read', String(rowsRead));
+  updateSyncMeta('logizard_skipped_rows', String(Math.max(0, skipped)));
+  updateSyncMeta('logizard_source_for', importedAt);
+}
+
 function importLogizard(filePath) {
   console.log(`[Import] ロジザード在庫読み込み: ${filePath}`);
-  const { headers, rows } = readCsvFile(filePath);
+  // 在庫を取った時刻: 毎時ランナーが「ロジザードへ取りに行く直前」の時刻を LZ_SOURCE_REQUESTED_AT で渡す。
+  //   CSV がその後に書かれた (= この回でダウンロードしたもの) と確認できたときだけ使う。確認できなければ null (不明)。
+  //   🚨 CSV の時刻から引くだけでは、古い CSV を保存し直したときに新しく見えてしまう (Codex PR #1446 R1 High)
+  const fileMtimeMs = fs.statSync(filePath).mtimeMs;   // 読む前に取る (読んでいる間に上書きされても前の時刻)
+  const requestedMs = Date.parse(process.env.LZ_SOURCE_REQUESTED_AT || '');
+  const sourceAt = (Number.isFinite(requestedMs) && requestedMs <= Date.now() && fileMtimeMs >= requestedMs)
+    ? new Date(requestedMs).toISOString() : null;
+  const { headers, rows, rejected } = readCsvFile(filePath);
   console.log(`[Import] データ行数: ${rows.length}`);
   const db = getDB();
   const col = (name) => headers.indexOf(name);
@@ -254,8 +288,10 @@ function importLogizard(filePath) {
     if (count < minRows) {
       throw new Error(`実挿入件数が少なすぎます (${count}件 < 下限${minRows}件)。全行ロールバックし既存データを温存しました (意図的なら LZ_IMPORT_MIN_ROWS で下限を下げてください)`);
     }
-    updateSyncMeta('logizard_last_import', new Date().toISOString());
+    const importedAt = new Date().toISOString();
+    updateSyncMeta('logizard_last_import', importedAt);
     updateSyncMeta('logizard_count', String(count));
+    recordLogizardSourceMeta({ importedAt, sourceAt, rowsRead: rows.length + rejected, skipped: rejected + (rows.length - count) });
     return count;
   });
 
@@ -375,6 +411,13 @@ async function main() {
   const command = args[0];
   const files = args.slice(1);
 
+  // 🚨 マスタを書く mode (product_shipping・exception_genka = 全部消して入れ直す) は古い入口の門を通す
+  //    (Company DB構想 10 §4 #10・14 §9 M2・契約 v3 H1・PR #1565 R1。一覧 = config/master-legacy-entries.mjs)。
+  //    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る)。閉じている (その mode の列が C)・段階か持ち主が読めない = 引数・ファイルの検査より前・DB を開く前に終了コード 3。
+  //    受注・ロジザード・NE の写し・送料の表の mode は止めない (ファイル単位ではなく mode 単位)
+  const legacyEntry = command ? cliEntry('apps/warehouse/csv-import.js', command) : null;
+  if (legacyEntry && !(await legacyCliGate(legacyEntry.id))) return;
+
   if (!command || files.length === 0) {
     console.log('使い方:');
     console.log('  node apps/warehouse/csv-import.js products <CSVファイル>');
@@ -409,7 +452,9 @@ async function main() {
   };
 
   if (handlers[command]) {
-    handlers[command]();
+    // マスタを書く mode = 段階の鍵を共有で持ったまま段階と持ち主を読み直し、その入口の列で書いてよいときだけ書く (legacy_open は書く・それ以降は active ∪ prepared と owner_cols。段階を変える関数は書き終わるまで待つ) (PR #1565 中間レビュー M2)
+    if (legacyEntry) await runWithLegacyCliLock(legacyEntry.id, () => handlers[command]());
+    else handlers[command]();
   } else {
     console.error(`不明なコマンド: ${command}`);
     console.log(`有効なコマンド: ${Object.keys(handlers).join(', ')}`);

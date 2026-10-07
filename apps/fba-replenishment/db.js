@@ -3,6 +3,8 @@
  * sql.js パターン（profit-calculator/db.js 準拠）
  */
 import initSqlJs from 'sql.js';
+import BetterSqlite from 'better-sqlite3';   // ファイルの中の「世代の印」を 1 行だけ読むのに使う (sql.js はファイル全体を読まないと開けない)
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -10,12 +12,29 @@ import { fileURLToPath } from 'url';
 // import 時点では mirror DB を初期化しない (getMirrorDB を呼んだ時に lazy、未初期化なら throw)。
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
+// Sheet なし (fail-closed) のモード (⑦-F)。env を読むだけ。モードを使わないときは今までと同じ動き
+import { isSheetlessRequested, isSheetlessIoRequested, sheetlessProblems, sheetlessMisconfigError, BACKFILL_MARK_KEY, normSkuKey, SKU_NORM_SQL_FN } from './sheetless-mode.js';
+import { findPendingSlips, shipmentSinceJstDate, LEFT_WAREHOUSE_STATUSES } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
+// SQL の IN 句に埋める「倉庫を出た」状態の一覧 (固定の英大文字だけなので直接埋めてよい)
+const LEFT_STATUS_SQL = `(${LEFT_WAREHOUSE_STATUSES.map(s => `'${s}'`).join(', ')})`;
+import { normCodeKey, isAsciiKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const DB_FILE = path.join(DATA_DIR, 'fba.db');
 
+const LOCK_DB_FILE = lockDbFileOf(DB_FILE);
+// 相手の保存 (100MB で 1〜2 秒) を待つ上限。🚨 待つ間は同期 = このプロセスのイベントループが止まる (常駐サーバなら全部の API)。
+// 書き手は常駐サーバ 1 つが前提なので、ここで待つのは異常なときだけ。長く待たずに失敗させる (Codex #1376 R2 #3)。env は試験用
+const LOCK_WAIT_MS = Number(process.env.FBA_DB_LOCK_WAIT_MS) || 5000;
+
 let db = null;
+let fbaDbReady = false;   // initDb() が最後まで終わったら true (isFbaDbReady)
+let SQLMod = null;       // initSqlJs() の結果 (外から書き換えられたファイルを読み直すのに使う)
+let fileStamp = null;     // このプロセスが最後に「読んだ / 書いた」時点の fba.db の姿 { mtimeMs, size }。null = その時点でファイルが無かった
+let knownToken = null;    // 同じく、その時点でファイルの中にあった世代の印 (_file_gen.token)。null = 印が無かった
+let memGeneration = 0;    // メモリをファイルから読み直すたびに増える (未保存の変更を抱えた処理が「捨てられた」と気づくため)
 
 // ===== ヘルパー =====
 function queryAll(sql, params = []) {
@@ -38,24 +57,320 @@ function run(sql, params = []) {
   db.run(sql, params);
 }
 
+/** fba.db のいまの姿。無ければ null */
+function stampOfFile() {
+  try { const st = fs.statSync(DB_FILE); return { mtimeMs: st.mtimeMs, size: st.size }; }
+  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+}
+const sameStamp = (a, b) => (_testHooks.stampAlwaysSame && a !== null && b !== null ? true : a === null || b === null ? a === b : a.mtimeMs === b.mtimeMs && a.size === b.size);
+
+/**
+ * Sheet なしの経路の SQL が使う SKU の正規化 fba_norm_sku (JS の normSku と同じ関数。⑦-F・Codex PR R5 Medium 1)。
+ * 接続ごとの関数 = ファイルには残らない。読み直したとき・export() の後に登録する
+ */
+function registerSqlFunctions(target) {
+  target.create_function(SKU_NORM_SQL_FN, (v) => normSkuKey(v));
+}
+
+/** 取引がもう無いときの ROLLBACK で、元の例外を隠さない (COMMIT の後の保存で失敗した・メモリを読み直した) */
+function rollbackQuiet() {
+  try { db.run('ROLLBACK'); } catch { /* no transaction is active */ }
+}
+
+/** fba.db の「読む」「確かめて書く」をプロセス間で 1 つずつにする lock (本体は file-lock.js。FBA の在庫日次の送り手も、読むときに同じ lock を取る) */
+const withFileLock = (fn) => withSqliteFileLock(LOCK_DB_FILE, LOCK_WAIT_MS, fn);
+
+/** SQLite のヘッダが言う大きさ (ページの大きさ × ページ数) に、実際の長さが足りているか。足りない = 書いている途中で止まったファイル */
+function isTornSqlite(headerBytes, actualSize) {
+  if (actualSize < 100 || headerBytes.length < 100) return true;
+  if (headerBytes.toString('latin1', 0, 15) !== 'SQLite format 3') return true;
+  const ps = headerBytes.readUInt16BE(16);
+  const pageSize = ps === 1 ? 65536 : ps;
+  const pages = headerBytes.readUInt32BE(28);
+  return pages > 0 && actualSize < pageSize * pages;
+}
+
+/** いまのファイル: null (無い) | { stamp, token, torn }。lock の中で呼ぶ */
+function inspectFile() {
+  const stamp = stampOfFile();
+  if (!stamp) return null;
+  const head = Buffer.alloc(100);
+  const fd = fs.openSync(DB_FILE, 'r');
+  try { fs.readSync(fd, head, 0, 100, 0); } finally { fs.closeSync(fd); }
+  if (isTornSqlite(head, stamp.size)) return { stamp, token: null, torn: true };
+  let f = null;
+  try {
+    f = new BetterSqlite(DB_FILE, { readonly: true, fileMustExist: true });
+    const has = f.prepare(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_file_gen'`).get();
+    const row = has ? f.prepare('SELECT token FROM _file_gen WHERE id = 1').get() : null;
+    return { stamp, token: row ? row.token : null, torn: false };
+  } catch (e) {
+    if (e && (e.code === 'SQLITE_NOTADB' || e.code === 'SQLITE_CORRUPT')) return { stamp, token: null, torn: true };
+    throw e;
+  } finally {
+    try { f?.close(); } catch { /* */ }
+  }
+}
+
+/** ファイルをメモリに読む (このプロセスの未保存の変更は捨てる)。lock の中で呼ぶ。壊れたファイルは読まない */
+function loadFromFileLocked() {
+  if (!SQLMod) throw new Error('initDb() の前には読めない');
+  const f = inspectFile();
+  if (f && f.torn) throw Object.assign(new Error(`fba.db が書きかけで止まっている (長さ ${f.stamp.size} がヘッダの言う大きさに足りない)。読み込まない = 控えから戻すか、正しいメモリを持つプロセスに保存させる`), { code: 'FBA_DB_FILE_TORN' });
+  const fresh = f ? new SQLMod.Database(fs.readFileSync(DB_FILE)) : new SQLMod.Database();
+  registerSqlFunctions(fresh);
+  const old = db;
+  db = fresh;
+  fileStamp = f ? f.stamp : null;
+  knownToken = f ? f.token : null;
+  memGeneration++;
+  try { old?.close(); } catch { /* 閉じられなくても新しい側は使える */ }
+}
+
+/**
+ * メモリの DB をファイルへ書き戻す (sql.js = **ファイル全体**を書く)。
+ * 🚨 歯止め (2026-09-20): このプロセスが最後に読んだ / 書いた後に、ほかのプロセスがファイルを書き換えていたら **上書きしない**。
+ *   上書きすると、相手が入れた行がファイルごと消える (本番で、朝の cron が入れた FBA 在庫の日次 9/18・9/19 が、常駐サーバの保存で消えた。164 日の範囲に 137 日ぶん)。
+ *   → ファイルを読み直して (= このプロセスの未保存の変更は捨てる)、code = 'FBA_DB_EXTERNAL_WRITE' の例外を投げる。呼び出し元は失敗を返し、やり直せば (読み直した後なので) 通る。
+ *   本来の対策は「書き手を 1 プロセスにする」(apps/warehouse/fba-report-snapshot.js)。これはそれでも外から書かれたときの最後の歯止め。
+ * 判定 (Codex #1376 R1・R2): 「確かめる → 書く」と「読む」を **プロセス間の lock (withFileLock = SQLite のファイルロック) の中** で行う (確かめた後に相手が書く窓を無くす)。
+ *   比べるのは ① ファイルの中の世代の印 (_file_gen.token。保存のたびに新しい乱数。= 読んだ / 書いた **内容** と結びつく。更新時刻とサイズが同じ書き換えも見つかる)
+ *   ② 更新時刻 + サイズ (印を書かない古い版の書き手が混ざったときのため)。どちらかが違えば「外から書かれた」
+ *   ファイルが無い → 失うものが無いので書く / ファイルが書きかけ (ヘッダの大きさに足りない) → 守る中身が無いので、このメモリで書き直す
+ */
 function saveToFile() {
   if (!db) return;
-  const data = db.export();
-  fs.writeFileSync(DB_FILE, Buffer.from(data));
+  try {
+    saveToFileLocked();
+  } catch (e) {
+    // 保存の途中のどんな失敗 (ファイルの検査・書き込みの I/O) も「保存されていない」= FBA_DB_* にそろえる (R3 #1)
+    if (e && typeof e.code === 'string' && e.code.startsWith('FBA_DB_')) throw e;
+    throw Object.assign(new Error(`fba.db を保存できなかった (${(e && e.code) || ''} ${(e && e.message) || e})。この操作は保存されていない`), { code: 'FBA_DB_SAVE_FAILED', cause: e });
+  }
+}
+
+function saveToFileLocked() {
+  withFileLock(() => {
+    const f = inspectFile();
+    if (f && f.torn) {
+      console.warn(`[fba-db] fba.db が書きかけで止まっていた (長さ ${f.stamp.size})。このプロセスのメモリで書き直す`);
+    } else if (f && (f.token !== knownToken || !sameStamp(f.stamp, fileStamp))) {
+      const was = fileStamp;
+      loadFromFileLocked();
+      throw Object.assign(new Error(`fba.db がほかのプロセスに書き換えられていたので上書きしなかった (最後に読んだ時点 ${was ? new Date(was.mtimeMs).toISOString() : 'なし'} → いま ${new Date(f.stamp.mtimeMs).toISOString()})。ファイルを読み直した = この操作は保存されていない。もう一度実行する`), { code: 'FBA_DB_EXTERNAL_WRITE' });
+    }
+    if (_testHooks.insideSaveLock) _testHooks.insideSaveLock();
+    const token = crypto.randomUUID();
+    db.run('CREATE TABLE IF NOT EXISTS _file_gen (id INTEGER PRIMARY KEY CHECK (id = 1), token TEXT NOT NULL)');
+    db.run('INSERT OR REPLACE INTO _file_gen (id, token) VALUES (1, ?)', [token]);
+    const data = db.export();
+    registerSqlFunctions(db);   // sql.js の export() は接続を開き直し、登録した関数を消す → 登録し直す (⑦-F)
+    fs.writeFileSync(DB_FILE, Buffer.from(data));
+    knownToken = token;
+    fileStamp = stampOfFile();
+  });
+}
+
+/**
+ * メモリが読み直された回数。未保存の変更を await をまたいで抱える処理 (納品履歴の明細 = 100 件ごとに保存) は、
+ * 始めに控えて保存の前に比べる: 変わっていたら、抱えていた変更はもう無い = 「保存した」ことにしない (Codex #1376 R1 #5)
+ */
+export function getDbGeneration() {
+  return memGeneration;
+}
+
+/** 試験用: 初期化の「読んだ後・保存の前」に割り込む (起動と重なった外からの書き込みを再現する)。本番では null のまま */
+export const _testHooks = { afterLoad: null, insideSaveLock: null, stampAlwaysSame: false, afterBackfillInsert: null };
+
+/**
+ * fba.db の保存の競合・読み直し・保存の失敗の例外か (FBA_DB_EXTERNAL_WRITE / FBA_DB_RELOADED / FBA_DB_LOCK_TIMEOUT / FBA_DB_LOCK_ERROR / FBA_DB_SAVE_FAILED / FBA_DB_FILE_TORN) = どれも「その操作は保存されていない」。
+ * 🚨 保存の失敗を警告に落として先へ進む catch は、これだけは投げ直す: 握りつぶすと「保存していないのに成功」を返す (Codex #1376 R2 #4)
+ */
+export const isFbaDbConflict = (e) => !!e && typeof e.code === 'string' && e.code.startsWith('FBA_DB_');
+
+/** 試験・診断用: このプロセスが覚えているファイルの姿と、いまの姿 */
+export function _fileStampState() {
+  return { known: fileStamp, current: stampOfFile(), knownToken, generation: memGeneration };
+}
+
+// ===== Sheet なしのモードの一回限りの移行 (⑦-F) =====
+/** sku_mapping の asin/fnsku を、fba_sku_attrs に無い SKU にだけ入れる (起動時と一回限りの移行で同じ SQL) */
+const SKU_MAPPING_BACKFILL_SQL = `
+    INSERT INTO fba_sku_attrs (amazon_sku, asin, fnsku, source)
+    SELECT m.amazon_sku, m.asin, m.fnsku, 'sheet_backfill'
+    FROM sku_mapping m
+    WHERE m.amazon_sku NOT IN (SELECT amazon_sku FROM fba_sku_attrs)
+  `;
+
+/**
+ * 一回限りの移行で流す backfill (Codex PR R4 / R5 Medium): SKU の突き合わせを fba_norm_sku (= 読み手の normSku と同じ関数) にする。
+ * 🚨 起動時の backfill (上の SKU_MAPPING_BACKFILL_SQL) は大小文字まで同じものだけ見る = 今までどおり (モードなしは変えない)。
+ *    そのままだと Sheet の `Alpha-1` が、attrs の `alpha-1` と別の 2 行目として入り、読み手 (正規化して後勝ち) が古い値を拾う
+ */
+const SKU_MAPPING_BACKFILL_NORM_SQL = `
+    INSERT INTO fba_sku_attrs (amazon_sku, asin, fnsku, source)
+    SELECT m.amazon_sku, m.asin, m.fnsku, 'sheet_backfill'
+    FROM sku_mapping m
+    WHERE fba_norm_sku(m.amazon_sku) NOT IN (SELECT fba_norm_sku(amazon_sku) FROM fba_sku_attrs)
+  `;
+
+/**
+ * fba_sku_attrs で、大小文字・前後の空白だけが違う SKU が 2 行以上ある鍵の一覧 (正規化した鍵・行数・元の SKU)。
+ * 一回限りの移行は、これが 1 件でもあれば印を書かない (どちらの値が正しいか機械では決めない。直し方 = 移行のスクリプトの説明)
+ */
+export function findAttrsCaseCollisions() {
+  return queryAll(`
+    SELECT fba_norm_sku(amazon_sku) AS norm_key, COUNT(*) AS n, group_concat(amazon_sku || '=' || COALESCE(fnsku, '(なし)'), ' / ') AS rows
+    FROM fba_sku_attrs GROUP BY fba_norm_sku(amazon_sku) HAVING COUNT(*) > 1 ORDER BY norm_key`);
+}
+
+/**
+ * miniPC が Render に渡す FNSKU の一覧 (正規化した鍵ごとに 1 行。Codex PR R4 Medium)。
+ * 同じ鍵の行が複数あって FNSKU が食い違えば conflicts に入れる (呼び手は 503 で渡さない)。同じ値なら更新の新しい行を 1 つだけ
+ * @returns {{ rows: {amazon_sku: string, fnsku: string|null}[], conflicts: {norm_key: string, rows: string[]}[] }}
+ */
+export function getFbaSkuAttrsForSync() {
+  const byKey = new Map();
+  const conflicts = new Map();
+  for (const r of queryAll('SELECT amazon_sku, fnsku, updated_at FROM fba_sku_attrs ORDER BY amazon_sku')) {
+    const k = normSku(r.amazon_sku);
+    if (!k) continue;
+    const prev = byKey.get(k);
+    if (!prev) { byKey.set(k, r); continue; }
+    if ((prev.fnsku || null) !== (r.fnsku || null)) {
+      if (!conflicts.has(k)) conflicts.set(k, [`${prev.amazon_sku}=${prev.fnsku || '(なし)'}`]);
+      conflicts.get(k).push(`${r.amazon_sku}=${r.fnsku || '(なし)'}`);
+    } else if (String(r.updated_at || '') > String(prev.updated_at || '')) byKey.set(k, r);
+  }
+  return {
+    rows: [...byKey.entries()].filter(([k]) => !conflicts.has(k)).map(([, r]) => ({ amazon_sku: r.amazon_sku, fnsku: r.fnsku || null })),
+    conflicts: [...conflicts.entries()].map(([norm_key, rows]) => ({ norm_key, rows })),
+  };
+}
+
+/**
+ * 一回限りの移行の印 (fba_migration_marks の 1 行)。無ければ null。
+ * 🚨 表は移行のスクリプトだけが作る (起動時には作らない = モードを使わない間は fba.db の形も今のまま)
+ */
+export function getBackfillMark() {
+  if (!queryOne(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'fba_migration_marks'`)) return null;
+  const r = queryOne('SELECT key, done_at, detail FROM fba_migration_marks WHERE key = ?', [BACKFILL_MARK_KEY]);
+  if (!r) return null;
+  let detail = r.detail;
+  try { detail = JSON.parse(r.detail); } catch { /* 文字列のまま返す */ }
+  return { key: r.key, done_at: r.done_at, detail };
+}
+
+/** fba.db の fba_sheetless_state.sheet_frozen を今の env に合わせる (initDb の中で呼ぶ)。読み手 = Company DB のローダー */
+function writeSheetFrozenState() {
+  const frozen = isSheetlessIoRequested();
+  const has = !!queryOne(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'fba_sheetless_state'`);
+  if (!frozen && !has) return;
+  db.run('CREATE TABLE IF NOT EXISTS fba_sheetless_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)');
+  db.run(`INSERT INTO fba_sheetless_state (key, value, updated_at) VALUES ('sheet_frozen', ?, ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`, [frozen ? '1' : '0', new Date().toISOString()]);
+}
+
+/** 起動時に backfill を流すか = Sheet の入出力を止めていない (FBA_SHEETLESS_MODE / FBA_SHEETLESS_IO が無い) かつ 印が無い (今までどおりの間だけ) */
+function shouldRunStartupBackfill() {
+  return !isSheetlessIoRequested() && !getBackfillMark();
+}
+
+/**
+ * 一回限りの移行: sku_mapping → fba_sku_attrs の backfill を最後に 1 回流し、印を残す (件数と時刻)。
+ * 印があれば、以後の起動では backfill を流さない (モードを外しても流さない)。
+ * 🚨 断る (投げる): モードを使うつもりのとき (code FBA_BACKFILL_MODE_ON)・印がもうあるとき (code FBA_BACKFILL_ALREADY_DONE)。
+ *    やり直す口は作らない (やり直しの手順は scripts/fba-sheetless-backfill-once.mjs の説明)
+ * 🚨 SKU は fba_norm_sku (読み手と同じ正規化) で突き合わせる。流した後に大小文字だけ違う SKU が fba_sku_attrs に残れば断る (code FBA_BACKFILL_ATTRS_COLLISION。Codex PR R4 Medium)
+ * 🚨 空の・違う fba.db に印を付けない (Codex PR R1 Medium 3): sku_mapping が minSkuMappingRows 行より少なければ断る (code FBA_BACKFILL_SOURCE_EMPTY)。
+ *    流した後に「sku_mapping にあって fba_sku_attrs に無い SKU」を数え、0 でなければ巻き戻して断る (code FBA_BACKFILL_VERIFY_FAILED)。印はその後にだけ書く
+ * initDb() の後に呼ぶ。保存は saveToFile (外から書かれていたら例外 = 保存されていない。やり直せば通る)
+ * @param {object} [o]
+ * @param {Date} [o.now]
+ * @param {object} [o.extra]  印に一緒に残す情報 (移行のスクリプトが initDb() の前に数えた件数など)
+ * @param {number} [o.minSkuMappingRows]  sku_mapping の行の下限 (既定 1。移行のスクリプトは既定 100)
+ * @returns {{ done_at: string, sku_mapping_rows: number, attrs_before: number, inserted: number, attrs_after: number, missing_after: number }}
+ */
+export function runSkuMappingBackfillOnce({ now = new Date(), extra = null, minSkuMappingRows = 1 } = {}) {
+  if (!db) throw new Error('initDb() の前には流せない');
+  if (isSheetlessIoRequested()) {
+    throw Object.assign(new Error('Sheet なしのモード (FBA_SHEETLESS_MODE / FBA_SHEETLESS_IO) が入っている間は流さない (sku_mapping の値を使わない約束)。外した状態で流す'), { code: 'FBA_BACKFILL_MODE_ON' });
+  }
+  const mark = getBackfillMark();
+  if (mark) throw Object.assign(new Error(`一回限りの移行はもう済んでいる (${mark.done_at})。二度は流さない`), { code: 'FBA_BACKFILL_ALREADY_DONE', mark });
+  const doneAt = now.toISOString();
+  db.run('BEGIN TRANSACTION');
+  try {
+    const count = (table) => Number(queryOne(`SELECT COUNT(*) AS n FROM ${table}`)?.n || 0);
+    const skuMappingRows = count('sku_mapping');
+    if (skuMappingRows < Math.max(1, Number(minSkuMappingRows) || 1)) {
+      throw Object.assign(new Error(`sku_mapping が ${skuMappingRows} 行しかない (下限 ${minSkuMappingRows})。空の・違う fba.db に印を付けない`), { code: 'FBA_BACKFILL_SOURCE_EMPTY' });
+    }
+    const attrsBefore = count('fba_sku_attrs');
+    db.run(SKU_MAPPING_BACKFILL_NORM_SQL);
+    if (_testHooks.afterBackfillInsert) _testHooks.afterBackfillInsert((sql) => db.run(sql));
+    const missingAfter = Number(queryOne('SELECT COUNT(*) AS n FROM sku_mapping m WHERE fba_norm_sku(m.amazon_sku) NOT IN (SELECT fba_norm_sku(amazon_sku) FROM fba_sku_attrs)')?.n || 0);
+    if (missingAfter !== 0) {
+      throw Object.assign(new Error(`流した後も fba_sku_attrs に無い SKU が ${missingAfter} 件ある。印を付けない (巻き戻した)`), { code: 'FBA_BACKFILL_VERIFY_FAILED' });
+    }
+    // 🚨 大小文字だけ違う SKU が fba_sku_attrs に 2 行以上ある = 読み手がどちらを拾うか決まらない → 印を付けない (Codex PR R4 Medium)
+    const collisions = findAttrsCaseCollisions();
+    if (collisions.length) {
+      throw Object.assign(new Error(`fba_sku_attrs に大小文字だけ違う SKU が ${collisions.length} 組ある。印を付けない (巻き戻した): ${collisions.slice(0, 20).map((c) => c.rows).join(' | ')}`), { code: 'FBA_BACKFILL_ATTRS_COLLISION', collisions });
+    }
+    const attrsAfter = count('fba_sku_attrs');
+    const detail = { sku_mapping_rows: skuMappingRows, attrs_before: attrsBefore, inserted: attrsAfter - attrsBefore, attrs_after: attrsAfter, missing_after: missingAfter, ...(extra || {}) };
+    db.run('CREATE TABLE IF NOT EXISTS fba_migration_marks (key TEXT PRIMARY KEY, done_at TEXT NOT NULL, detail TEXT)');
+    db.run('INSERT INTO fba_migration_marks (key, done_at, detail) VALUES (?, ?, ?)', [BACKFILL_MARK_KEY, doneAt, JSON.stringify(detail)]);
+    db.run('COMMIT');
+    saveToFile();
+    return { done_at: doneAt, ...detail };
+  } catch (e) {
+    rollbackQuiet();
+    throw e;
+  }
+}
+
+/**
+ * runSkuMappingBackfillOnce を、保存の競合 (FBA_DB_EXTERNAL_WRITE = 流している間に常駐のサーバが fba.db を書いた) のときだけやり直す。
+ * 競合のときは saveToFile がファイルを読み直している (こちらの変更は捨てた) ので、もう一度流せば相手の行も残る
+ * @param {object} [o]  runSkuMappingBackfillOnce に渡すもの + attempts (既定 3)・onRetry (試験・ログ用)
+ */
+export function runSkuMappingBackfillOnceRetrying({ attempts = 3, onRetry = () => {}, ...o } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try { return runSkuMappingBackfillOnce(o); }
+    catch (e) {
+      if (!e || e.code !== 'FBA_DB_EXTERNAL_WRITE' || attempt >= attempts) throw e;
+      onRetry(attempt, e);
+    }
+  }
 }
 
 // ===== 初期化 =====
-export async function initDb() {
+/**
+ * 読む → 表をそろえる → 保存。最後の保存で「読んだ後に外から書かれた」と分かったら、最初からやり直す (3 回まで)。
+ * やり直さないと、起動と重なった 1 回の書き込みで初期化が失敗したままになり、FBA の画面が再起動まで 503 になる (Codex #1376 R1 #6)
+ */
+export async function initDb({ skipStartupBackfill = false } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try { return await initDbOnce({ skipStartupBackfill }); }
+    catch (e) {
+      if (!e || e.code !== 'FBA_DB_EXTERNAL_WRITE' || attempt >= 3) throw e;
+      console.warn(`[fba-db] 初期化の途中で fba.db が外から書き換えられた → 読み直してやり直す (${attempt}/3)`);
+    }
+  }
+}
+
+// skipStartupBackfill = 一回限りの移行のスクリプトだけが true にする (大小文字まで同じものだけ見る起動時の backfill で、
+//   大小文字違いの 2 行目を入れないため。常駐のサーバは渡さない = 今までどおり)
+async function initDbOnce({ skipStartupBackfill = false } = {}) {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
   const SQL = await initSqlJs();
+  SQLMod = SQL;
 
-  if (fs.existsSync(DB_FILE)) {
-    const buf = fs.readFileSync(DB_FILE);
-    db = new SQL.Database(buf);
-  } else {
-    db = new SQL.Database();
-  }
+  withFileLock(() => loadFromFileLocked());   // 相手が書いている途中のファイルを読まない
+  if (_testHooks.afterLoad) await _testHooks.afterLoad();
 
   // --- 1. sku_mapping: 商品コード変換（スプシ同期） ---
   db.run(`
@@ -102,12 +417,20 @@ export async function initDb() {
   `);
   // backfill: 既存 sku_mapping の asin/fnsku から未登録 SKU 分だけ初期投入 (非空 attrs は上書きしない)。
   // INSERT ... WHERE NOT EXISTS なので既存 fba_sku_attrs 行には一切触れない。
-  db.run(`
-    INSERT INTO fba_sku_attrs (amazon_sku, asin, fnsku, source)
-    SELECT m.amazon_sku, m.asin, m.fnsku, 'sheet_backfill'
-    FROM sku_mapping m
-    WHERE m.amazon_sku NOT IN (SELECT amazon_sku FROM fba_sku_attrs)
-  `);
+  // 🚨 Sheet なしのモード (⑦-F・Codex 設計 R1 High 3): モードを使うとき・一回限りの移行の印 (fba_migration_marks) があるときは流さない
+  //    (流すと、止めた Sheet の古い値が再起動のたびに戻る)。印は scripts/fba-sheetless-backfill-once.mjs だけが書く。
+  //    モードを使わず印も無い間は今までどおり毎回流す
+  if (!skipStartupBackfill && shouldRunStartupBackfill()) {
+    db.run(SKU_MAPPING_BACKFILL_SQL);
+  } else if (skipStartupBackfill) {
+    console.log('[fba-db] 起動時の sku_mapping → fba_sku_attrs の backfill は流さない (一回限りの移行のスクリプト)');
+  } else {
+    console.log(`[fba-db] 起動時の sku_mapping → fba_sku_attrs の backfill は流さない (${isSheetlessIoRequested() ? 'Sheet なしのモード / 入出力を止めている' : '一回限りの移行の印あり'})`);
+  }
+  // Sheet なしのモード (⑦-F・Codex PR R2 Medium 3): この fba.db の sku_mapping が凍結されているかを fba.db 自身に残す
+  //   (Company DB の毎晩のロード apps/company-db/load/sources.mjs がこの fba.db を読み、凍結中は sku_mapping の値を使わない)。
+  //   🚨 モードを一度も入れていない (表が無い) 間は何も書かない = fba.db の形も今のまま。一度入れた後は外したら '0' に戻す
+  writeSheetFrozenState();
 
   // --- 2. sku_exceptions: FBA優先送りマスタ ---
   db.run(`
@@ -295,6 +618,38 @@ export async function initDb() {
   `);
   db.run('CREATE INDEX IF NOT EXISTS idx_dailysnap_us_date ON daily_snapshots_us(snapshot_date)');
 
+  // --- Company DB へ送る FBA 在庫の版 (market = 'jp' | 'us'。apps/company-db/push/stock-daily.mjs が読む) ---
+  // 🚨 daily_snapshots をそのまま送らない理由 (Codex #1388 R1): daily_snapshots は RESTOCK と PLANNING を混ぜた表で、
+  //   ① RESTOCK に無い SKU の FC 移管中・処理中・出荷待ち は 0 で入る (= 「取れなかった」と「0」が区別できない。RESTOCK が丸ごと取れなかった日も同じ)
+  //   ② 同じ日に取り直すと値が変わる (US は PLANNING だけの回が 3 区分を 0 で上書きする) ③ 行がいつの取得のものか残らない。
+  // → 朝のスナップショット (fba-report-snapshot.js) が、**取得したレポートの行そのもの** から 1 日 1 market = 1 版を作る (saveStockExport)。
+  //   RESTOCK に無い SKU の 3 区分は NULL・版の行と取得時刻は同じ取引で入れ替える・RESTOCK のある版を、無い版で置き換えない。30 日で消す (長期の履歴は Company DB)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cdb_stock_export_days (
+      snapshot_date TEXT NOT NULL,
+      market TEXT NOT NULL,
+      captured_at TEXT NOT NULL,
+      restock_rows INTEGER NOT NULL,
+      planning_rows INTEGER NOT NULL,
+      PRIMARY KEY (snapshot_date, market)
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cdb_stock_export (
+      snapshot_date TEXT NOT NULL,
+      market TEXT NOT NULL,
+      amazon_sku TEXT NOT NULL,
+      fba_available INTEGER NOT NULL,
+      fba_inbound_working INTEGER NOT NULL,
+      fba_inbound_shipped INTEGER NOT NULL,
+      fba_inbound_received INTEGER NOT NULL,
+      fba_fc_transfer INTEGER,
+      fba_fc_processing INTEGER,
+      fba_customer_order INTEGER,
+      PRIMARY KEY (snapshot_date, market, amazon_sku)
+    )
+  `);
+
   // --- 8. non_fba_sales_snapshots: 他CH売上の日次スナップショット（60日保持） ---
   db.run(`
     CREATE TABLE IF NOT EXISTS non_fba_sales_snapshots (
@@ -402,6 +757,11 @@ export async function initDb() {
     ['non_fba_reserve_days', '60'],
     // 長期欠品SKUをFBA欠品タブの「長期(復活余地)」に分類する Amazon推奨数の閾値
     ['oos_amazon_reco_threshold', '11'],
+    // 倉庫在庫の配分 (self-reserve.js)。'equal_days' = FBA と自社出荷を同じ日数分にそろえる / 'off' = 自社ぶんを残さない
+    //   (off でも、同じ NE 商品を複数 SKU が取り合って倉庫在庫を超える歯止めは常にかかる)
+    ['self_reserve_mode', 'equal_days'],
+    ['self_sales_max_age_days', '7'],     // 自社日販 (商品管理リスト) がこの日数より古ければ自社ぶんの上限をかけない
+    ['pending_slip_lookback_days', '10'], // まだ Amazon に出ていない FBA 伝票 (NE CSV) を何日前まで見るか
     // 納品プラン設定
     ['inbound_ship_from_name', ''],
     ['inbound_ship_from_address1', ''],
@@ -484,6 +844,10 @@ export async function initDb() {
   {
     const ehCols = queryAll('PRAGMA table_info(export_history)').map(r => r.name);
     if (!ehCols.includes('sku_list')) db.run(`ALTER TABLE export_history ADD COLUMN sku_list TEXT`);
+    // sku_detail: 出力した時点の Amazon SKU ごとの数と構成 ([{sku, qty, comps: [[ne_code, 構成数]]}] の JSON)。
+    //   出荷待ちの FBA 伝票を「出た数」だけ外すときの換算に使う。いまの構成マスタで換算すると、あとで構成数を
+    //   変えたときに未出荷の分まで外れる (Codex PR レビュー R5 High 1)
+    if (!ehCols.includes('sku_detail')) db.run(`ALTER TABLE export_history ADD COLUMN sku_detail TEXT`);
   }
 
   // --- 14. restock_latest: RESTOCKレポート最新1回分（発注判定の主軸データソース） ---
@@ -534,6 +898,14 @@ export async function initDb() {
       updated_at TEXT DEFAULT (datetime('now','localtime'))
     )
   `);
+
+  // 元データ (Amazon のレポート) を取った時刻。updated_at は「この DB に保存した時刻」なので、Render が miniPC の
+  //   古いデータを今日同期すると「今日」に見える (Codex 2026-09-24 設計レビュー 2 High 1 / PR #1438 R1 High 1)。
+  //   miniPC で取ったときは保存時刻 = 取得時刻、Render へは miniPC の行の updated_at (= miniPC が取った時刻) を運ぶ
+  for (const t of ['restock_latest', 'planning_latest']) {
+    const cols = queryAll(`PRAGMA table_info(${t})`).map(c => c.name);
+    if (!cols.includes('source_fetched_at')) db.run(`ALTER TABLE ${t} ADD COLUMN source_fetched_at TEXT`);
+  }
 
   // --- 16. ever_seen_skus: 過去にFBAで観測したSKU（新規商品タブの判定用） ---
   // ※ユーザー方針により初期は空スタート。RESTOCK/PLANNING取得毎に追記していく
@@ -647,6 +1019,16 @@ export async function initDb() {
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_created_date ON fba_inbound_shipments(created_date)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_status ON fba_inbound_shipments(shipment_status)`);
+  // 出荷済み以降の状態 (LEFT_WAREHOUSE_STATUSES) を「初めて確認した」日本時間。倉庫在庫の配分 (self-reserve.js) が
+  //   「倉庫 CSV を取り込んだ時点で、この納品はもう倉庫を出ていたか」を見るのに使う。作成時刻では出荷の遅れが分からない
+  //   (Codex PR レビュー R4 High 2)。既存行は最後に取り込んだ時刻で埋める (本当の出荷より遅い = 出荷待ちに残す側。
+  //   デプロイ時刻で埋めると、その日の朝の倉庫 CSV では直近の伝票が全部「出荷待ち」に見えてしまう)
+  const inboundCols = queryAll('PRAGMA table_info(fba_inbound_shipments)').map(c => c.name);
+  if (!inboundCols.includes('left_seen_at')) {
+    db.run('ALTER TABLE fba_inbound_shipments ADD COLUMN left_seen_at TEXT');
+    db.run(`UPDATE fba_inbound_shipments SET left_seen_at = COALESCE(updated_at, datetime('now','+9 hours'))
+             WHERE shipment_status IN ${LEFT_STATUS_SQL}`);
+  }
 
   // 明細。qty_shipped は送った数、qty_received は Amazon が受領した数。差が未受領。
   db.run(`
@@ -664,7 +1046,16 @@ export async function initDb() {
   db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_items_sku ON fba_inbound_shipment_items(seller_sku)`);
 
   saveToFile();
+  fbaDbReady = true;
   console.log('[FBA-DB] 初期化完了');
+}
+
+/**
+ * initDb() が最後まで終わったか (読むだけ)。米国FBA在庫補充 (apps/fba-replenishment-us) が日本の表を読む前に確かめる。
+ * 🚨 米国側から initDb() を呼んではいけない (最後に saveToFile() でファイルを書く)。日本の router が起動時に呼ぶのを待つ
+ */
+export function isFbaDbReady() {
+  return fbaDbReady && db !== null;
 }
 
 // ======================================================
@@ -700,19 +1091,20 @@ export function upsertInboundShipments(shipments) {
       db.run(
         `UPDATE fba_inbound_shipments
             SET shipment_name = ?, created_at = ?, created_date = ?, destination_fc = ?,
-                shipment_status = ?, label_prep_type = ?, updated_at = datetime('now','+9 hours')
+                shipment_status = ?, label_prep_type = ?, updated_at = datetime('now','+9 hours'),
+                left_seen_at = CASE WHEN ? IN ${LEFT_STATUS_SQL} THEN COALESCE(left_seen_at, datetime('now','+9 hours')) END
           WHERE shipment_id = ?`,
         [s.ShipmentName || '', createdAt, createdDate, s.DestinationFulfillmentCenterId || '',
-         s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentId]
+         s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentStatus || '', s.ShipmentId]
       );
       updated += 1;
     } else {
       db.run(
         `INSERT INTO fba_inbound_shipments
-           (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status, label_prep_type)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status, label_prep_type, left_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IN ${LEFT_STATUS_SQL} THEN datetime('now','+9 hours') END)`,
         [s.ShipmentId, s.ShipmentName || '', createdAt, createdDate,
-         s.DestinationFulfillmentCenterId || '', s.ShipmentStatus || '', s.LabelPrepType || '']
+         s.DestinationFulfillmentCenterId || '', s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentStatus || '']
       );
       inserted += 1;
     }
@@ -764,7 +1156,7 @@ export function replaceInboundItems(shipmentId, items) {
     );
     db.run('COMMIT');
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
   return { skus: merged.size, shipped, received };
@@ -1038,9 +1430,12 @@ export function importInboundRows(payload) {
       db.run(
         `INSERT INTO fba_inbound_shipments
            (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status,
-            label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at, left_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 CASE WHEN ? IN ${LEFT_STATUS_SQL} THEN datetime('now','+9 hours') END)
          ON CONFLICT(shipment_id) DO UPDATE SET
+           left_seen_at = CASE WHEN excluded.shipment_status IN ${LEFT_STATUS_SQL}
+                               THEN COALESCE(fba_inbound_shipments.left_seen_at, datetime('now','+9 hours')) END,
            shipment_name = excluded.shipment_name,
            created_at = excluded.created_at,
            created_date = excluded.created_date,
@@ -1054,7 +1449,7 @@ export function importInboundRows(payload) {
            updated_at = excluded.updated_at`,
         [s.shipment_id, s.shipment_name || '', s.created_at, s.created_date, s.destination_fc || '',
          s.shipment_status || '', s.label_prep_type || '', s.total_skus ?? 0, s.total_shipped ?? 0,
-         s.total_received ?? 0, s.items_synced_at, s.updated_at]
+         s.total_received ?? 0, s.items_synced_at, s.updated_at, s.shipment_status || '']
       );
 
       // 明細が付いてきたシップメントだけ入れ替える。
@@ -1082,7 +1477,7 @@ export function importInboundRows(payload) {
     }
     db.run('COMMIT');
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
   saveToFile();
@@ -1114,7 +1509,10 @@ export function getInboundSyncCursor() {
  * sql.js はメモリ上の DB なので、明示的に呼ばないとファイルに落ちない。
  * upsert のたびに保存すると 1300 件で遅すぎるため、呼び出し側がまとめて呼ぶ。
  */
-export function flushInboundDb() {
+export function flushInboundDb(expectedGeneration) {
+  if (expectedGeneration !== undefined && expectedGeneration !== memGeneration) {
+    throw Object.assign(new Error('fba.db のメモリが途中で読み直された = 抱えていた未保存の変更はもう無い。この同期は最初からやり直す'), { code: 'FBA_DB_RELOADED' });
+  }
   saveToFile();
 }
 
@@ -1251,7 +1649,7 @@ export function savePlanningData(rows, snapshotDate) {
     saveToFile();
     return rows.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1328,7 +1726,7 @@ export function saveRestockInventoryToDailySnapshot(rows, snapshotDate) {
     saveToFile();
     return { updated, inserted };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1394,7 +1792,7 @@ export function savePlanningDataWithHistory(rows, snapshotDate) {
     saveToFile();
     return rows.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1426,6 +1824,94 @@ export function usSalesOf(p = {}, r = {}) {
  * @param {Array} params.restockRows - normalizeRestockRow 後の配列
  * @param {string} params.snapshotDate - YYYY-MM-DD (JST)
  */
+export const STOCK_EXPORT_KEEP_DAYS = 30;
+
+/**
+ * Company DB へ送る FBA 在庫の版を作る (表の説明は initDb の cdb_stock_export)。1 日 1 market = 1 版。1 取引 + 保存 1 回。
+ *   restockRows = normalizeRestockRow 後 (amazon_sku)・planningRows = normalizePlanningRow 後 (sku)。どちらも「この回に取得した行」そのもの
+ *   - SKU が RESTOCK にあれば 7 区分とも RESTOCK の値 (daily_snapshots と同じ優先順位)。PLANNING にしか無ければ available と入庫の 3 つだけで、
+ *     **FC 移管中・処理中・出荷待ち は NULL** (RESTOCK に載っていない = 分からない。0 ではない)
+ *   - 🚨 **両方のレポートが取れた回だけが「全部取れた版」** (Codex #1388 R2 #2): 出品 SKU の全体は PLANNING にしか無い。PLANNING が取れなかった回に RESTOCK だけで版を作ると、
+ *     RESTOCK に載っていない SKU が版から消え、Company DB の view で在庫 0 に見える → PLANNING が無い回は版を作らない (reason = 'no_planning')。RESTOCK が無い回は「一部だけの版」(restock_rows = 0)
+ *   - 🚨 値は正規化の後の **数そのもの** を検証する (null・NaN・小数・負・文字列は版を作らず例外。`|| 0` で 0 にしない = 「--」のような値を在庫 0 と確定しない。R2 #3)
+ *   - 🚨 SKU は Company DB の受け口と同じ検証 (空・前後の空白・制御文字)。RESTOCK と PLANNING で大文字小文字などの表記だけ違う同じ SKU は 1 行にまとめる (RESTOCK が正)。
+ *     同じレポートの中で表記違いがぶつかるときは、どちらが正しいか決められないので版を作らない (R2 #1)
+ *   - 🚨 **最初に作った版を変えない** (Company DB の側の「先に確定した日は書き換えない」と同じ。同じ日に取り直すたびに版が変わると、確定済みの日と毎朝食い違う)。
+ *     例外は 1 つだけ: RESTOCK の無い版 → RESTOCK のある版 (「分かっていなかったものが分かった」= Company DB の側も partial → complete に上げる)。
+ *     入れ替えるときは、この回の行と取得時刻でまるごと (= 版の値と captured_at は必ず同じ回のもの)
+ * 戻り値 = { saved: boolean, reason?, rows, restockRows, planningRows, capturedAt }
+ */
+export function saveStockExport({ snapshotDate, market, restockRows = [], planningRows = [], capturedAt = new Date().toISOString(), now = new Date() }) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(snapshotDate))) throw new Error(`snapshotDate が不正: ${snapshotDate}`);
+  // 未来の日付は受けない (古い版を消す基準を先送りさせない・未来の版は送り手も送らない。R2 #4)。基準は「いまの JST の日付」
+  const todayJst = new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  if (snapshotDate > todayJst) throw new Error(`snapshotDate が未来 (JST の今日 = ${todayJst}): ${snapshotDate}`);
+  if (market !== 'jp' && market !== 'us') throw new Error(`market が不正: ${market}`);
+  if (typeof capturedAt !== 'string' || Number.isNaN(Date.parse(capturedAt)) || !/(Z|[+-]\d{2}:\d{2})$/.test(capturedAt)) throw new Error(`capturedAt は Z か ±HH:MM つきの ISO 8601: ${capturedAt}`);
+  const count = (sku, name, v) => { if (!isCount(v)) throw new Error(`${String(sku).slice(0, 40)} の ${name} が 0 以上の整数でない: ${String(v).slice(0, 30)}`); return v; };
+  const skuOf = (sku, where) => { if (!isValidCode(sku)) throw new Error(`${where} の SKU が不正 (空・前後の空白・制御文字・200 文字超): ${JSON.stringify(String(sku)).slice(0, 60)}`); return sku; };
+  // 鍵 = core.norm_code の JS 版。🚨 鍵が ASCII のときだけ「鍵が同じ = Company DB でも同じ SKU・鍵が違う = 別の SKU」と言える (ASCII の外は DB の lower() が照合環境しだい・JS の toLowerCase() は İ を 2 文字にする)。
+  //    fba.db の側では DB に聞けない → 鍵が ASCII でない SKU があれば、まとめも別々にもせず、この回の版を作らない (Codex #1388 R3・R4。全角の英数記号・ダッシュ・空白は正規化の後に ASCII になるので通る)
+  const keyOf = (sku, where) => {
+    const key = normCodeKey(sku);
+    if (!isAsciiKey(key)) throw new Error(`${where} の SKU に、Company DB と同じ判定になると保証できない文字 (ASCII 以外) がある: ${JSON.stringify(sku).slice(0, 60)}。この回の版は作らない`);
+    return key;
+  };
+  const byKey = new Map();
+  let nRestock = 0, nPlanning = 0;
+  for (const r of restockRows || []) {
+    if (!r || r.amazon_sku === '' || r.amazon_sku == null) continue;   // SKU の無い行は今までどおり読み飛ばす (レポートの空行)
+    const sku = skuOf(r.amazon_sku, 'RESTOCK'), key = keyOf(sku, 'RESTOCK');
+    if (byKey.has(key)) throw new Error(`RESTOCK の中で、表記違いの SKU がぶつかっている (${byKey.get(key).sku.slice(0, 40)} と ${sku.slice(0, 40)})`);
+    nRestock++;
+    byKey.set(key, { sku, from: 'restock', a: count(sku, 'fba_available', r.fba_available), w: count(sku, 'fba_inbound_working', r.fba_inbound_working), s: count(sku, 'fba_inbound_shipped', r.fba_inbound_shipped),
+      r: count(sku, 'fba_inbound_received', r.fba_inbound_received), x: count(sku, 'fba_fc_transfer', r.fba_fc_transfer), p: count(sku, 'fba_fc_processing', r.fba_fc_processing), c: count(sku, 'fba_customer_order', r.fba_customer_order) });
+  }
+  const planningKeys = new Map();
+  for (const r of planningRows || []) {
+    if (!r || r.sku === '' || r.sku == null) continue;
+    const sku = skuOf(r.sku, 'PLANNING'), key = keyOf(sku, 'PLANNING');
+    if (planningKeys.has(key)) throw new Error(`PLANNING の中で、表記違いの SKU がぶつかっている (${planningKeys.get(key).slice(0, 40)} と ${sku.slice(0, 40)})`);
+    planningKeys.set(key, sku);
+    nPlanning++;
+    if (byKey.has(key)) continue;   // 在庫の列は RESTOCK が正 (daily_snapshots と同じ)。表記だけ違う同じ SKU も RESTOCK の行 1 つにまとめる
+    byKey.set(key, { sku, from: 'planning', a: count(sku, 'fba_available', r.fba_available), w: count(sku, 'fba_inbound_working', r.fba_inbound_working), s: count(sku, 'fba_inbound_shipped', r.fba_inbound_shipped),
+      r: count(sku, 'fba_inbound_received', r.fba_inbound_received), x: null, p: null, c: null });
+  }
+  const bySku = byKey;
+  if (bySku.size === 0) return { saved: false, reason: 'no_rows', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  // 出品 SKU の全体は PLANNING にしか無い → PLANNING が取れなかった回は版を作らない (RESTOCK だけの版は、載っていない SKU を在庫 0 に見せる)
+  if (nPlanning === 0) return { saved: false, reason: 'no_planning', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  const prev = queryOne('SELECT restock_rows FROM cdb_stock_export_days WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+  if (prev && !(prev.restock_rows === 0 && nRestock > 0)) return { saved: false, reason: 'keep_first_version', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run('DELETE FROM cdb_stock_export WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+    for (const v of bySku.values()) {
+      db.run(`INSERT INTO cdb_stock_export (snapshot_date, market, amazon_sku, fba_available, fba_inbound_working, fba_inbound_shipped, fba_inbound_received, fba_fc_transfer, fba_fc_processing, fba_customer_order)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [snapshotDate, market, v.sku, v.a, v.w, v.s, v.r, v.x, v.p, v.c]);
+    }
+    db.run('INSERT OR REPLACE INTO cdb_stock_export_days (snapshot_date, market, captured_at, restock_rows, planning_rows) VALUES (?, ?, ?, ?, ?)', [snapshotDate, market, capturedAt, nRestock, nPlanning]);
+    // 古い版を消す (送り手が見るのは直近 14 日。長期の履歴は Company DB が持つ)。文字列の比較 = YYYY-MM-DD どうし。
+    // 🚨 基準は入力の日付ではなく「いまの JST の日付」(入力の日付で消す範囲が先へ動かない。R2 #4)
+    const limit = new Date(Date.parse(`${todayJst}T00:00:00Z`) - STOCK_EXPORT_KEEP_DAYS * 86400000).toISOString().slice(0, 10);
+    db.run('DELETE FROM cdb_stock_export WHERE snapshot_date < ?', [limit]);
+    db.run('DELETE FROM cdb_stock_export_days WHERE snapshot_date < ?', [limit]);
+    db.run('COMMIT');
+    saveToFile();
+    return { saved: true, rows: bySku.size, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  } catch (e) {
+    rollbackQuiet();
+    throw e;
+  }
+}
+
+export function getStockExportDay(snapshotDate, market) {
+  const day = queryOne('SELECT snapshot_date, market, captured_at, restock_rows, planning_rows FROM cdb_stock_export_days WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+  if (!day) return null;
+  return { ...day, rows: queryAll('SELECT amazon_sku, fba_available, fba_inbound_working, fba_inbound_shipped, fba_inbound_received, fba_fc_transfer, fba_fc_processing, fba_customer_order FROM cdb_stock_export WHERE snapshot_date = ? AND market = ? ORDER BY amazon_sku', [snapshotDate, market]) };
+}
+
 export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snapshotDate }) {
   const today = snapshotDate || new Date().toISOString().slice(0, 10);
 
@@ -1518,7 +2004,7 @@ export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snap
     saveToFile();
     return { inserted, updated };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1527,6 +2013,8 @@ export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snap
  * SKUマッピングを一括更新（スプシ同期）
  */
 export function upsertSkuMappings(mappings) {
+  // Sheet なしのモードでは Sheet の写し (sku_mapping) を書かない (手の口・cron は手前で 410 / 見送り。ここは最後の歯止め)
+  if (isSheetlessIoRequested()) throw Object.assign(new Error('Sheet なしのモード (入出力を止めている) なので sku_mapping (Sheet の写し) には書かない'), { code: 'FBA_SHEETLESS_GONE' });
   db.run('BEGIN TRANSACTION');
   try {
     for (const m of mappings) {
@@ -1553,7 +2041,7 @@ export function upsertSkuMappings(mappings) {
     saveToFile();
     return mappings.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1588,7 +2076,7 @@ export function replaceWarehouseInventory(items) {
     saveToFile();
     return items.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1658,13 +2146,171 @@ function getNonFbaFromPmlMap() {
   return map;
 }
 
+/** 試験用: 商品管理リストの 60 秒メモを捨てる (本番では呼ばない) */
+export function _clearNonFbaCache() {
+  _pmlNonFbaCache = null;
+}
+
+/**
+ * Sheet なしのモードの材料がそろっているか (⑦-F)。06:00 の定期同期の ok の基準と、計算の前の確かめに使う。
+ *   ① env がそろっている (sheetless-mode.js の sheetlessProblems が空)・この fba.db に一回限りの移行の印がある
+ *   ② SKU の対応 (warehouse-mirror の mirror_sku_resolved、source='master') が 1 行以上ある
+ *   ③ 商品管理リストの snapshot (他 CH の販売) が使える (getNonFbaFromPmlMap と同じ判定 = 公開済み ok・行数が合う)
+ * モードを使わないときは { requested: false, ok: true } (何も読まない)
+ * @returns {{ requested: boolean, ok: boolean, reasons: string[], mapping_rows: number|null, pml_rows: number|null }}
+ */
+export function checkSheetlessInputs() {
+  if (!isSheetlessRequested()) return { requested: false, ok: true, reasons: [], mapping_rows: null, pml_rows: null };
+  const reasons = [...sheetlessProblems()];
+  // 🚨 一回限りの移行の印が無い = 最後の backfill が済んでいない (Codex PR R2 Medium 1)。モードを使う前提にする
+  if (!getBackfillMark()) reasons.push('この fba.db に一回限りの移行の印が無い (モードを入れる前に scripts/fba-sheetless-backfill-once.mjs を流す)');
+  let mappingRows = null;
+  try {
+    mappingRows = Number(getMirrorDB().prepare(`SELECT COUNT(*) AS n FROM mirror_sku_resolved WHERE source = 'master'`).get()?.n || 0);
+    if (mappingRows === 0) reasons.push('SKU の対応 (mirror_sku_resolved) が 0 行');
+  } catch (e) {
+    reasons.push(`SKU の対応 (mirror_sku_resolved) を読めない: ${String(e.message).slice(0, 120)}`);
+  }
+  const pml = getNonFbaFromPmlMap();
+  const pmlRows = pml ? pml.size : null;
+  if (!pml) reasons.push('商品管理リストの snapshot (他 CH の販売) が無い・未公開・壊れている');
+  return { requested: true, ok: reasons.length === 0, reasons, mapping_rows: mappingRows, pml_rows: pmlRows };
+}
+
+/**
+ * 計算 (推奨の生成) を止める理由。止めないなら null。
+ * 🚨 Sheet なしのモードで材料が欠けたら、Sheet の値に戻らずに計算を失敗させる (前の結果はそのまま)
+ */
+export function getSheetlessCalcBlock() {
+  const chk = checkSheetlessInputs();
+  if (chk.ok) return null;
+  return `Sheet なしのモード: ${chk.reasons.join(' / ')}。計算しない (Sheet には戻らない・前の結果はそのまま)`;
+}
+
 // 代表 ne_code から non_fba_sales を解決。pmlMap 不在(=snapshot無し)時は sheetRow にフォールバック。
+// (Sheet なしのモードでは sheetRow を渡さない = 0。そのときの計算は getSheetlessCalcBlock で止まっている)
 function resolveNonFba(repNe, sheetRow, pmlMap) {
   if (pmlMap) {
     const p = pmlMap.get(normSku(repNe));
     return { non_fba_sales_7d: p?.n7 || 0, non_fba_sales_30d: p?.n30 || 0 };
   }
   return { non_fba_sales_7d: sheetRow?.non_fba_sales_7d || 0, non_fba_sales_30d: sheetRow?.non_fba_sales_30d || 0 };
+}
+
+// ===== 倉庫在庫の配分 (self-reserve.js) の材料 (2026-09-24) =====
+
+/**
+ * 構成品 (NE 商品コード) ごとの自社出荷 30 日販売。商品管理リストの published snapshot の
+ * 販売数30日_FBA以外 = NE 受注 (有効、FBA納品などの _ignore 店舗を除く、Amazon FBM を含む、セット展開済み)。
+ * 🚨 既存の getNonFbaFromPmlMap は「欠損ならシートへフォールバック」「数値でなければ 0」で、SKU には代表 NE コードの
+ *    値しか渡さない。ここでは構成品ごとに、正常な 0 / 行が無い / 値がおかしい / 古い を分けて返す (Codex 2026-09-24 High 4)
+ * @returns {{ status: 'ok'|'stale'|'unavailable', as_of: string|null, age_days: number|null,
+ *            map: Map<string, number>|null, invalid: string[], error: string|null }}
+ *   map は norm 済みコード → 30 日販売 (0 以上の整数)。map に無いコード = 行が無い (分からない)
+ */
+export function getSelfShipSalesByCode({ maxAgeDays = 7 } = {}) {
+  const out = { status: 'unavailable', as_of: null, age_days: null, map: null, invalid: [], error: null };
+  try {
+    const mdb = getMirrorDB();
+    const pub = mdb.prepare('SELECT run_id, status, row_count, as_of_date, src_velocity_as_of FROM mirror_pml_published WHERE id = 1').get();
+    // partial = 販売データは正常で FBA 在庫だけが古い (build-product-management-snapshot.js の判定)。
+    //   自社日販には使える。failed だけ使わない (Codex PR レビュー R1 Medium 4)
+    if (!pub || !pub.run_id || !['ok', 'partial'].includes(pub.status)) {
+      out.error = `商品管理リストの snapshot が使えない (status=${pub?.status ?? 'なし'})`;
+      return out;
+    }
+    const rows = mdb.prepare('SELECT 商品コード AS code, 販売数30日_FBA以外 AS n30 FROM mirror_pml_snapshot_rows WHERE run_id = ?').all(pub.run_id);
+    if (rows.length === 0 || (pub.row_count != null && rows.length !== pub.row_count)) {
+      out.error = `商品管理リストの snapshot が壊れている (rows=${rows.length} / row_count=${pub.row_count})`;
+      return out;
+    }
+    const map = new Map();
+    for (const r of rows) {
+      const n = Number(r.n30);
+      if (r.n30 === null || r.n30 === '' || !Number.isFinite(n) || n < 0) { out.invalid.push(r.code); continue; }
+      map.set(normSku(r.code), n);
+    }
+    out.as_of = pub.src_velocity_as_of || pub.as_of_date || null;   // 古さは販売データの日付で測る
+    if (out.as_of) {
+      const todayJst = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+      out.age_days = Math.round((Date.parse(todayJst) - Date.parse(out.as_of)) / 86400000);
+    }
+    out.map = map;
+    out.status = (out.age_days !== null && out.age_days > maxAgeDays) ? 'stale' : 'ok';
+  } catch (e) {
+    out.error = `商品管理リストを読めない (${String(e.message).slice(0, 120)})`;
+  }
+  return out;
+}
+
+/**
+ * まだ Amazon に出ていない FBA 伝票 (NE 受注 CSV として出力したもの) を、構成品ごとの数にして返す。
+ * 🚨 NE で起票した FBA 伝票は数日「起票済」のまま = ロジザードに渡っていない → ロジザード CSV の在庫に残っている。
+ *    これを引かないと、同じ在庫を翌日また FBA に配ってしまう (9/24 時点で 9/22・9/23 の伝票 8,569 個が起票済のまま。Codex High 2)。
+ * 出たかどうか = 倉庫 CSV を取り込む前に作られた Amazon の納品 (fba_inbound_shipments) に、
+ *   伝票の Amazon SKU の半分以上が入っているか。取り込み時点でまだ出ていなければ、倉庫 CSV にはまだ残っている。
+ * @returns {{ status: 'ok'|'no_warehouse'|'inbound_stale', slips: object[], byCode: Map<string, number>,
+ *            warehouse_uploaded_at: string|null, inbound_last_synced_at: string|null }}
+ */
+export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now(), warehouseAtMs = undefined } = {}) {
+  // 倉庫 CSV の取り込み時刻・出力履歴の作成時刻は、このプロセスと同じ時計の localtime で保存されている
+  //   → new Date('YYYY-MM-DDTHH:MM:SS') (タイムゾーン無し = ローカル) でそのまま読める
+  const localMs = (t) => new Date(String(t).replace(' ', 'T')).getTime();
+  // Amazon の納品の作成時刻 (名前から取った日本時間 'YYYY-MM-DD HH:MM') / 取り込み時刻 (日本時間)
+  const jstMs = (t) => Date.parse(String(t).slice(0, 16).replace(' ', 'T') + ':00+09:00');
+
+  const wh = queryOne('SELECT MAX(uploaded_at) AS t FROM warehouse_inventory')?.t || null;
+  const shipments = listShipmentsLeftWarehouse(shipmentSinceJstDate(nowMs, lookbackDays)).map((s) => ({
+    atMs: jstMs(s.created_at),
+    leftMs: jstMs(s.left_seen_at),       // 出荷済みを初めて確認した時刻 (日本時間)
+    qty: new Map(Object.entries(s.qty)), // Amazon SKU (norm 済み) → 出荷数
+  }));
+  // Amazon SKU → 構成品 (NE 商品コード) と個数。出た数を伝票の構成品の数に直すのに使う
+  const comps = new Map();
+  for (const m of getSkuMappings()) {
+    let cs = null;
+    try { cs = typeof m.set_components === 'string' ? JSON.parse(m.set_components) : m.set_components; } catch { cs = null; }
+    const list = (Array.isArray(cs) && cs.length > 0)
+      ? cs.filter((c) => c && c.ne_code).map((c) => [normSku(c.ne_code), Number(c.qty) || 1])
+      : (m.ne_code ? [[normSku(m.ne_code), 1]] : []);
+    if (list.length > 0) comps.set(normSku(m.amazon_sku), list);
+  }
+  const lastSync = queryOne('SELECT MAX(updated_at) AS t FROM fba_inbound_shipments')?.t || null;
+  const exports = queryAll(
+    `SELECT id, filename, created_at, file_data, sku_list, sku_detail FROM export_history WHERE type = 'ne_csv' ORDER BY created_at ASC`
+  ).map((e) => ({ ...e, createdMs: localMs(e.created_at) }));
+
+  // 倉庫在庫の時点: ふつうは手動 CSV の取り込み時刻。影の下書きがロジザードの写しで計算するときは、写しの
+  //   「在庫を取った時刻」を渡す (手動 CSV の時刻に戻らない。Codex A2b 設計レビュー Medium 6)
+  const whMs = warehouseAtMs !== undefined ? warehouseAtMs : (wh ? localMs(wh) : null);
+  const out = findPendingSlips({
+    exports, shipments, nowMs, lookbackDays,
+    componentsOf: (sku) => comps.get(sku) || null,
+    warehouseUploadedMs: whMs,
+    inboundLastSyncMs: lastSync ? jstMs(lastSync) : null,
+  });
+  return { ...out, warehouse_uploaded_at: warehouseAtMs !== undefined ? (Number.isFinite(warehouseAtMs) ? new Date(warehouseAtMs).toISOString() : null) : wh, inbound_last_synced_at: lastSync };
+}
+
+/**
+ * 倉庫を出た (出荷済み以降の状態の) Amazon の納品と、その Amazon SKU (norm 済み)。
+ * 🚨 WORKING (作っただけ) / CANCELLED / DELETED は数えない = その伝票は出荷待ちのまま (Codex R3 High 2)
+ * @param {string} sinceJst  作成日 (日本時間) の下限 'YYYY-MM-DD'
+ */
+export function listShipmentsLeftWarehouse(sinceJst) {
+  return queryAll(
+    `SELECT shipment_id, created_at, shipment_status, left_seen_at FROM fba_inbound_shipments
+      WHERE created_date >= ? AND created_at IS NOT NULL AND left_seen_at IS NOT NULL
+        AND shipment_status IN ${LEFT_STATUS_SQL}`,
+    [sinceJst]
+  ).map((s) => {
+    const items = queryAll('SELECT seller_sku, qty_shipped FROM fba_inbound_shipment_items WHERE shipment_id = ?', [s.shipment_id]);
+    return {
+      ...s,
+      skus: items.map((i) => normSku(i.seller_sku)),
+      qty: Object.fromEntries(items.map((i) => [normSku(i.seller_sku), Number(i.qty_shipped) || 0])),
+    };
+  });
 }
 
 // shadow: sheet と pml の non_fba_30d 集計差を log (1時間に1回)。切替前の本番検証用、非破壊。
@@ -1725,7 +2371,7 @@ function buildMirrorRow(amazonSku, compRows, attr, nonFba, registeredAt) {
 }
 
 // SKU/コード正規化 (case 非依存の突き合わせ用、PR4)
-const normSku = (v) => String(v ?? '').trim().toLowerCase();
+const normSku = normSkuKey;   // ⑦-F: SQL の fba_norm_sku と同じ関数 (sheetless-mode.js。中身は今までと同じ trim().toLowerCase())
 
 // 案C: mirror は seller_sku を小文字保存するので、amazon_sku の「元ケース」を FBA 側データから復元する
 // (consumer 無改修で動かすため。recData.find / mappingMap など多数の exact 比較を壊さない)。
@@ -1741,7 +2387,10 @@ function buildAmazonSkuCaseMap() {
     'SELECT amazon_sku FROM planning_latest',
     'SELECT DISTINCT amazon_sku FROM daily_snapshots',
     'SELECT amazon_sku FROM ever_seen_skus',
-    'SELECT amazon_sku FROM sku_mapping',
+    // Sheet なしのモードでは Sheet の写しから大小文字を取らない。代わりに fba_sku_attrs (SP-API のレポートの FNSKU の更新が書く
+    //   = Amazon の元の大小文字) から取る (⑦-F)。🚨 どのレポートにもまだ出ていない SKU は、ここに無ければ小文字のまま
+    //   (モードを入れた後に登録した SKU の元の大小文字は、次の段で Company DB から持ってくる)
+    isSheetlessRequested() ? 'SELECT amazon_sku FROM fba_sku_attrs' : 'SELECT amazon_sku FROM sku_mapping',
   ]) {
     try { for (const r of queryAll(sql)) add(r.amazon_sku); } catch (e) { /* テーブル未作成等は無視 */ }
   }
@@ -1770,8 +2419,10 @@ export function getSkuMappingsFromMirror() {
   // FBA ローカル属性 (sql.js) を norm キーで Map 化して JS join (mirror 小文字 ⇔ 元ケース attrs の取りこぼし防止)
   const attrs = new Map();
   for (const a of queryAll('SELECT amazon_sku, asin, fnsku FROM fba_sku_attrs')) attrs.set(normSku(a.amazon_sku), a);
+  // 🚨 Sheet なしのモードでは sku_mapping を読まない (他 CH の販売は商品管理リストだけ。⑦-F・Codex 設計 R1 High 3)
+  const sheetless = isSheetlessRequested();
   const nonFba = new Map();
-  for (const s of queryAll('SELECT amazon_sku, non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping')) nonFba.set(normSku(s.amazon_sku), s);
+  if (!sheetless) for (const s of queryAll('SELECT amazon_sku, non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping')) nonFba.set(normSku(s.amazon_sku), s);
   // 登録日 (source_created_at) を mirror_sku_master から norm キーで join (1 SKU 1 行)。
   const regAt = new Map();
   try {
@@ -1785,7 +2436,9 @@ export function getSkuMappingsFromMirror() {
   const nonFbaSource = getNonFbaSource();
   const pmlMap = (nonFbaSource === 'pml') ? getNonFbaFromPmlMap() : null;
   if (nonFbaSource === 'pml' && !pmlMap) {
-    console.warn('[FBA] FBA_NONFBA_SOURCE=pml だが商品管理リスト snapshot が未公開/未同期 → sheet にフォールバック');
+    console.warn(sheetless
+      ? '[FBA] Sheet なしのモード: 商品管理リスト snapshot が未公開/未同期 → 他CH販売は 0 のまま (Sheet には戻らない・推奨の計算は止める)'
+      : '[FBA] FBA_NONFBA_SOURCE=pml だが商品管理リスト snapshot が未公開/未同期 → sheet にフォールバック');
   }
   if (nonFbaSource === 'shadow') { try { logNonFbaShadowDiff(bySku, nonFba); } catch (e) { /* best-effort */ } }
 
@@ -1811,8 +2464,10 @@ function getSkuMappingFromMirror(amazonSku) {
   `).all(k);
   if (compRows.length === 0) return null;
   // 補助 join も norm キーで (single も case 非依存に)
-  const attrRows = queryAll('SELECT asin, fnsku FROM fba_sku_attrs WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
-  const nfRows = queryAll('SELECT non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
+  // Sheet なしのモードは読み手 (normSku) と同じ正規化で引く (Codex PR R5 Medium 1)。モードなしは今までどおり
+  const attrRows = queryAll(isSheetlessRequested() ? 'SELECT asin, fnsku FROM fba_sku_attrs WHERE fba_norm_sku(amazon_sku) = ?' : 'SELECT asin, fnsku FROM fba_sku_attrs WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
+  // Sheet なしのモードでは sku_mapping を読まない (⑦-F)
+  const nfRows = isSheetlessRequested() ? [] : queryAll('SELECT non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
   let registeredAt = null;
   try {
     const mr = mdb.prepare('SELECT source_created_at FROM mirror_sku_master WHERE LOWER(TRIM(seller_sku)) = ?').get(k);
@@ -1942,7 +2597,19 @@ function runShadowDiff(sheetRows) {
   }
 }
 
+/**
+ * Sheet なしのモード (⑦-F): 設定がそろっていれば mirror だけを読む。そろっていなければ投げる (Sheet に戻らない)。
+ * モードを使わないときは null (= 呼び出し側は今までどおり)
+ */
+function sheetlessMappingGuard() {
+  if (!isSheetlessRequested()) return null;
+  const problems = sheetlessProblems();
+  if (problems.length) throw sheetlessMisconfigError(problems);
+  return 'mirror';
+}
+
 export function getSkuMappings() {
+  if (sheetlessMappingGuard()) return getSkuMappingsFromMirror();
   const mode = getSkuMappingSource();
   if (mode === 'mirror') return getSkuMappingsFromMirror();
   const sheetRows = getSkuMappingsFromSheet();
@@ -1951,6 +2618,7 @@ export function getSkuMappings() {
 }
 
 export function getSkuMapping(amazonSku) {
+  if (sheetlessMappingGuard()) return getSkuMappingFromMirror(amazonSku);
   const mode = getSkuMappingSource();
   if (mode === 'mirror') return getSkuMappingFromMirror(amazonSku);
   // sheet / shadow: 単票は sheet を返す (差分集計は getSkuMappings 側で TTL 付き実行)
@@ -2035,6 +2703,18 @@ export function getInputFreshness() {
     planning_updated_at: one('SELECT MAX(updated_at) AS v FROM planning_latest'),
     planning_rows: one('SELECT COUNT(*) AS v FROM planning_latest'),
     warehouse_uploaded_at: one('SELECT MAX(uploaded_at) AS v FROM warehouse_inventory'),
+    // miniPC が Amazon のレポートを取った日 (PLANNING の履歴の最新日)。restock_latest.updated_at は Render に
+    //   保存した時刻なので、古いデータを今日同期すると「今日」に見える (Codex 設計レビュー 2 High 1)。関所はこちらを見る
+    planning_snapshot_date: one('SELECT MAX(snapshot_date) AS v FROM daily_snapshots'),
+    // 計算に使う 2 つの表それぞれの「元データを取った時刻」(UTC 'YYYY-MM-DD HH:MM:SS')。1 つでも古い・無いなら関所で止める。
+    //   MIN = いちばん古い行 (全置換なので通常は全行同じ。混ざっていたら古い方で判定する)
+    restock_source_at: one('SELECT MIN(source_fetched_at) AS v FROM restock_latest'),
+    restock_source_missing: one('SELECT COUNT(*) AS v FROM restock_latest WHERE source_fetched_at IS NULL'),
+    planning_source_at: one('SELECT MIN(source_fetched_at) AS v FROM planning_latest'),
+    planning_source_missing: one('SELECT COUNT(*) AS v FROM planning_latest WHERE source_fetched_at IS NULL'),
+    // いちばん新しい行 (未来の時刻が混ざっていないかを 9:40 の自動決定が見る。Codex A2b 設計レビュー Medium 5)
+    restock_source_max: one('SELECT MAX(source_fetched_at) AS v FROM restock_latest'),
+    planning_source_max: one('SELECT MAX(source_fetched_at) AS v FROM planning_latest'),
     warehouse_rows: one('SELECT COUNT(*) AS v FROM warehouse_inventory'),
   };
 }
@@ -2106,8 +2786,8 @@ export function saveRestockLatest(rows) {
           (amazon_sku, fnsku, asin, product_name, fba_available,
            fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
            fba_unfulfillable, units_sold_30d, amazon_recommended_qty,
-           amazon_recommended_date, alert_type, your_price, days_of_supply, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           amazon_recommended_date, alert_type, your_price, days_of_supply, updated_at, source_fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         r.amazon_sku, r.fnsku || null, r.asin || null, r.product_name || null,
         r.fba_available || 0,
@@ -2118,6 +2798,8 @@ export function saveRestockLatest(rows) {
         r.amazon_recommended_qty === null || r.amazon_recommended_qty === undefined ? null : r.amazon_recommended_qty,
         r.amazon_recommended_date || null, r.alert_type || null,
         r.your_price || null, r.days_of_supply || null, now,
+        // 元データを取った時刻: miniPC から来た行なら miniPC の保存時刻 (= 取った時刻)、ここで取ったなら今
+        r.source_fetched_at || r.updated_at || now,
       ]);
       // ever_seen_skus にも記録
       db.run(`
@@ -2130,7 +2812,7 @@ export function saveRestockLatest(rows) {
     saveToFile();
     return { saved: rows.length, skipped: false };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     console.error('[FBA-DB] saveRestockLatest failed:', e.message);
     throw e;
   }
@@ -2174,8 +2856,8 @@ export function savePlanningLatest(rows) {
            featured_offer_price, lowest_price, sales_rank,
            is_seasonal, season_name, short_term_dos, long_term_dos,
            low_inv_fee_applied, low_inv_fee_exempt,
-           estimated_excess_qty, estimated_storage_cost, per_unit_volume, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           estimated_excess_qty, estimated_storage_cost, per_unit_volume, updated_at, source_fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         r.sku || r.amazon_sku,
         r.units_sold_7d ?? null, r.units_sold_60d ?? null, r.units_sold_90d ?? null,
@@ -2185,6 +2867,7 @@ export function savePlanningLatest(rows) {
         r.short_term_dos ?? null, r.long_term_dos ?? null,
         r.low_inv_fee_applied || null, r.low_inv_fee_exempt || null,
         r.estimated_excess_qty ?? null, r.estimated_storage_cost ?? null, r.per_unit_volume ?? null, now,
+        r.source_fetched_at || r.updated_at || now,
       ]);
       // ever_seen_skus にも追記
       const sku = r.sku || r.amazon_sku;
@@ -2200,7 +2883,7 @@ export function savePlanningLatest(rows) {
     saveToFile();
     return { saved: rows.length, skipped: false };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     console.error('[FBA-DB] savePlanningLatest failed:', e.message);
     throw e;
   }
@@ -2269,6 +2952,41 @@ export function getEverStockedSkus() {
   return [...new Set([...fromSnap, ...fromRestock])];
 }
 
+/**
+ * v3-3 (長期欠品の復活・新規出品の「試す候補」) の材料。
+ * 🚨 getEverStockedSkus は読めなかったとき空を返す = 全 SKU が「新規」に見えてしまう。こちらは読めなければ null を返す
+ * @returns {{ everStocked: string[]|null, lastInStock: Map<string, { snapshot_date: string, units_sold_30d: number }>|null,
+ *            hidden: string[]|null, error: string|null }}
+ *   lastInStock = SKU (小文字) → FBA に在庫があった最新の日の行 (units_sold_30d は 30 日の移動集計。足さずに 1 行だけ使う)。
+ *     🚨 売れていた日ではなく「在庫があった最新の日」。その日に売れていなければ 0 のまま返す (昔売れていた日まで飛ばさない。Codex PR #1480 R1 Medium 4)
+ */
+export function getTrialInputs() {
+  const out = { everStocked: null, lastInStock: null, hidden: null, error: null };
+  try {
+    const snap = queryAll(`
+      SELECT DISTINCT amazon_sku FROM daily_snapshots
+      WHERE fba_available > 0 OR fba_inbound_working > 0 OR fba_inbound_shipped > 0 OR fba_inbound_received > 0
+         OR fba_fc_transfer > 0 OR fba_fc_processing > 0 OR fba_customer_order > 0 OR fba_unfulfillable > 0
+         OR (working_first_seen IS NOT NULL AND TRIM(working_first_seen) <> '')`).map(r => r.amazon_sku);
+    const rest = queryAll(`
+      SELECT amazon_sku FROM restock_latest
+      WHERE fba_available > 0 OR fba_inbound_working > 0 OR fba_inbound_shipped > 0 OR fba_inbound_received > 0 OR fba_unfulfillable > 0`)
+      .map(r => r.amazon_sku);
+    out.everStocked = [...new Set([...snap, ...rest])];
+    const rows = queryAll(`
+      SELECT d.amazon_sku, d.snapshot_date, d.units_sold_30d
+      FROM daily_snapshots d
+      JOIN (SELECT amazon_sku, MAX(snapshot_date) AS md FROM daily_snapshots
+            WHERE fba_available > 0 GROUP BY amazon_sku) x
+        ON x.amazon_sku = d.amazon_sku AND x.md = d.snapshot_date`);
+    out.lastInStock = new Map(rows.map(r => [String(r.amazon_sku).trim().toLowerCase(), { snapshot_date: r.snapshot_date, units_sold_30d: Number(r.units_sold_30d) || 0 }]));
+    out.hidden = queryAll('SELECT amazon_sku FROM new_product_hidden').map(r => r.amazon_sku);
+  } catch (e) {
+    out.error = String(e.message).slice(0, 200);
+  }
+  return out;
+}
+
 // ===== 納品計画 =====
 
 export function createShipmentPlan(planDate, items) {
@@ -2291,7 +3009,8 @@ export function createShipmentPlan(planDate, items) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         planId, item.amazon_sku, item.asin || null, item.product_name || null,
-        item.recommended_qty || 0, item.adjusted_qty || item.recommended_qty || 0,
+        // 🚨 補正後 0 は有効な値 (配分で 0 にした行)。|| だと元の推奨数が生き返る (Codex 2026-09-24 High 5)
+        item.recommended_qty || 0, item.adjusted_qty ?? item.recommended_qty ?? 0,
         item.reason || null, item.urgency_score || 0, item.days_of_supply || null,
         item.fba_available || 0, item.fba_inbound || 0, item.warehouse_qty || 0,
         item.alert_type || null, item.alert_message || null,
@@ -2306,7 +3025,7 @@ export function createShipmentPlan(planDate, items) {
     saveToFile();
     return planId;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2372,7 +3091,7 @@ export function saveNonFbaSalesSnapshot(mappings, snapshotDate) {
     saveToFile();
     return mappings.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2382,6 +3101,8 @@ export function saveNonFbaSalesSnapshot(mappings, snapshotDate) {
  * 欠品期間の0を無視して、実力値を返す
  */
 export function getNonFbaMax60d(amazonSku) {
+  // Sheet なしのモードでは Sheet 由来のスナップショットを使わない (⑦-F。止めた Sheet の値が 60 日残るため)
+  if (isSheetlessRequested()) return { max_30d: 0, max_7d: 0 };
   const row = queryOne(`
     SELECT MAX(non_fba_sales_30d) as max_30d, MAX(non_fba_sales_7d) as max_7d
     FROM non_fba_sales_snapshots
@@ -2394,6 +3115,8 @@ export function getNonFbaMax60d(amazonSku) {
  * 全SKUの60日間最大値を一括取得（推奨リスト生成用）
  */
 export function getAllNonFbaMax60d() {
+  // non_fba_sales_snapshots は Sheet の同期 (saveNonFbaSalesSnapshot) だけが書く = Sheet の値。Sheet なしのモードでは使わない (⑦-F)
+  if (isSheetlessRequested()) return [];
   return queryAll(`
     SELECT amazon_sku, MAX(non_fba_sales_30d) as max_30d, MAX(non_fba_sales_7d) as max_7d
     FROM non_fba_sales_snapshots
@@ -2430,7 +3153,7 @@ export function hideStockoutSkuBulk(skus, reason) {
     saveToFile();
     return skus.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2452,7 +3175,7 @@ export function hideNewProductSkuBulk(skus, reason) {
     saveToFile();
     return skus.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2468,6 +3191,7 @@ export function unhideNewProductSku(amazonSku) {
 export function getReplenishmentExcluded() {
   // 商品名/ASIN を sku_mapping から引いて返す (管理画面で「何を除外したか」を商品名で確認できるように)。
   // amazon_sku は必ず返るのでサーバ側の除外セット生成 (.map(r=>r.amazon_sku)) はそのまま動く。
+  if (isSheetlessRequested()) return getReplenishmentExcludedSheetless();
   try {
     return queryAll(`
       SELECT e.amazon_sku, e.reason, e.excluded_at,
@@ -2481,6 +3205,27 @@ export function getReplenishmentExcluded() {
     console.error('[FBA] getReplenishmentExcluded JOIN 失敗、単純SELECTにフォールバック:', e.message);
     return queryAll('SELECT amazon_sku, reason, excluded_at, NULL AS product_name, NULL AS asin FROM replenishment_excluded ORDER BY excluded_at DESC');
   }
+}
+
+/**
+ * Sheet なしのモードの除外一覧 (⑦-F): ASIN は fba_sku_attrs、商品名は mirror_sku_master (マスタの写し) から。sku_mapping は読まない。
+ * 名前が引けなくても一覧は出す (amazon_sku・reason・excluded_at は必ず返る)
+ */
+function getReplenishmentExcludedSheetless() {
+  const rows = queryAll(`
+    SELECT e.amazon_sku, e.reason, e.excluded_at, a.asin AS asin
+    FROM replenishment_excluded e
+    LEFT JOIN fba_sku_attrs a ON fba_norm_sku(e.amazon_sku) = fba_norm_sku(a.amazon_sku)
+    GROUP BY e.amazon_sku
+    ORDER BY e.excluded_at DESC
+  `);
+  const names = new Map();
+  try {
+    for (const r of getMirrorDB().prepare('SELECT seller_sku, 商品名 AS name FROM mirror_sku_master').all()) names.set(normSku(r.seller_sku), r.name || null);
+  } catch (e) {
+    console.warn('[FBA] 除外一覧: mirror_sku_master を読めない (商品名なしで返す):', e.message);
+  }
+  return rows.map((r) => ({ amazon_sku: r.amazon_sku, reason: r.reason, excluded_at: r.excluded_at, product_name: names.get(normSku(r.amazon_sku)) ?? null, asin: r.asin ?? null }));
 }
 
 export function excludeReplenishmentSku(amazonSku, reason) {
@@ -2514,7 +3259,7 @@ export function saveDraft(items, memo) {
     saveToFile();
     return items.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2535,24 +3280,34 @@ export function clearDraft() {
 
 // ===== FNSKU一括更新 =====
 export function updateFnskuBatch(items) {
+  // 🚨 Sheet なしのモードでは fba_sku_attrs だけに書く (sku_mapping は凍結。⑦-F・Codex 設計 R1 High 3)
+  //    ASIN も fba_sku_attrs に書く (Sheet の backfill が止まるので、新しい SKU の ASIN はレポートからしか入らない)。
+  //    item.asin が空なら前の ASIN のまま。モードなしのときは今までどおり ASIN に触らない
+  //    miniPC は計算をしないので FBA_SHEETLESS_IO で同じ書き方にする (Codex PR R1 Medium 1)
+  const writeSheetCopy = !isSheetlessIoRequested();
   db.run('BEGIN TRANSACTION');
   try {
     for (const item of items) {
       if (item.sku && item.fnsku) {
-        db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku, item.sku]);
+        if (writeSheetCopy) db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku, item.sku]);
         // dual-write: mirror モードの正となる fba_sku_attrs にも追従 (falsy は無視 = 旧FNSKU保持)
+        if (writeSheetCopy) {
         db.run(
           `INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source, updated_at)
            VALUES (?, ?, 'restock', datetime('now','localtime'))
            ON CONFLICT(amazon_sku) DO UPDATE SET fnsku=excluded.fnsku, source='restock', updated_at=excluded.updated_at`,
           [item.sku, item.fnsku]
         );
+        } else {
+          upsertAttrsFnskuNormalized(item.sku, item.fnsku, 'restock');
+          writeAttrsAsin(item);
+        }
       }
     }
     db.run('COMMIT');
     saveToFile();
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2563,25 +3318,50 @@ export function updateFnskuBatch(items) {
  * この関数は payload 通りに上書きするので、FNSKUが外された場合も正しく反映される。
  */
 export function syncFnskuBatch(items) {
+  // 🚨 Sheet なしのモードでは fba_sku_attrs だけに書く (sku_mapping は凍結。⑦-F・Codex 設計 R1 High 3)。ASIN も (updateFnskuBatch と同じ)
+  const writeSheetCopy = !isSheetlessIoRequested();
   db.run('BEGIN TRANSACTION');
   try {
     for (const item of items) {
       if (!item.sku) continue;
-      db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku || null, item.sku]);
+      if (writeSheetCopy) db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku || null, item.sku]);
       // dual-write: null も反映 (FNSKU が外れた商品をクリア)。sku_mapping に無い mirror-only SKU でも upsert。
+      if (writeSheetCopy) {
       db.run(
         `INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source, updated_at)
          VALUES (?, ?, 'planning', datetime('now','localtime'))
          ON CONFLICT(amazon_sku) DO UPDATE SET fnsku=excluded.fnsku, source='planning', updated_at=excluded.updated_at`,
         [item.sku, item.fnsku || null]
       );
+      } else {
+        upsertAttrsFnskuNormalized(item.sku, item.fnsku || null, 'planning');
+        writeAttrsAsin(item);
+      }
     }
     db.run('COMMIT');
     saveToFile();
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
+}
+
+/**
+ * Sheet なしのモード (入出力の止め): FNSKU を、大小文字・前後の空白だけ違う既存の行に書く (無ければ新しい行)。
+ * 大小文字違いの 2 行目を作らない (Codex PR R4 Medium)。既存の行の amazon_sku (大小文字) は変えない
+ */
+function upsertAttrsFnskuNormalized(sku, fnsku, source) {
+  db.run(`UPDATE fba_sku_attrs SET fnsku = ?, source = ?, updated_at = datetime('now','localtime') WHERE fba_norm_sku(amazon_sku) = fba_norm_sku(?)`, [fnsku, source, sku]);
+  if (db.getRowsModified() === 0) {
+    db.run(`INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source, updated_at) VALUES (?, ?, ?, datetime('now','localtime'))`, [sku, fnsku, source]);
+  }
+}
+
+/** Sheet なしのモード: レポートの ASIN を fba_sku_attrs に入れる (空なら前の ASIN のまま = COALESCE)。行は直前の upsert で必ずある (鍵は正規化して当てる) */
+function writeAttrsAsin(item) {
+  const asin = String(item.asin ?? '').trim();
+  if (!asin) return;
+  db.run('UPDATE fba_sku_attrs SET asin = COALESCE(?, asin) WHERE fba_norm_sku(amazon_sku) = fba_norm_sku(?)', [asin, item.sku]);
 }
 
 // ===== Amazon仮確定 =====
@@ -2622,7 +3402,7 @@ export function saveProvisionalItems(items) {
     saveToFile();
     return items.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2679,7 +3459,7 @@ export function mergeProvisionalItems(items) {
     saveToFile();
     return items.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2718,12 +3498,14 @@ export function removeProvisionalItem(amazonSku) {
 
 // ===== 出力履歴 =====
 
-export function saveExportHistory(type, filename, itemCount, totalQty, fileData, skuList) {
+export function saveExportHistory(type, filename, itemCount, totalQty, fileData, skuList, skuDetail = null) {
   // skuList: 出力ファイルに含まれる amazon_sku 配列 (再DL時の除外チェック用)。null 可。
+  // skuDetail: 出力した時点の [{sku, qty, comps: [[ne_code, 構成数]]}] (出荷待ち FBA 伝票の換算用)。null 可
   const skuListJson = Array.isArray(skuList) ? JSON.stringify(skuList) : null;
+  const skuDetailJson = Array.isArray(skuDetail) ? JSON.stringify(skuDetail) : null;
   db.run(
-    `INSERT INTO export_history (type, filename, item_count, total_qty, file_data, sku_list) VALUES (?, ?, ?, ?, ?, ?)`,
-    [type, filename, itemCount, totalQty, fileData, skuListJson]
+    `INSERT INTO export_history (type, filename, item_count, total_qty, file_data, sku_list, sku_detail) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [type, filename, itemCount, totalQty, fileData, skuListJson, skuDetailJson]
   );
   // タイプ別に100件を超えたら古いものを削除
   const oldest = queryAll(
@@ -2796,7 +3578,7 @@ export function replaceDodaiMaster(rows, meta = {}) {
     saveToFile();
     return { prev, count: newCount };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }

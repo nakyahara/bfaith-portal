@@ -23,6 +23,8 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { normSku } from '../../../lib/sku-norm.js';
 import { pickByPriority, variationGroupName, FNSKU_SOURCE_PRIORITY } from './engine.mjs';
+import { materialDigest, cleanMaterialText, MATERIAL_ID_RE, MATERIAL_HASH_RE } from '../../warehouse/material-lineage.js';
+import { parseNeCreationDate } from '../../../lib/sku-registered-on.mjs';
 
 const MARKETPLACE_JP = 'A1VC38T7YXB528';
 /**
@@ -35,6 +37,16 @@ function openRo(file) {
   if (!fs.existsSync(file)) return null;
   return new Database(file, { readonly: true, fileMustExist: true });
 }
+/**
+ * 材料の 代表商品コード の状態 (D3。Codex D3-R0 H1): 'value' = 値あり / 'empty' = NE が明示の空を返した (意味の版 src1 の材料の '' だけ) / 'unknown' = 分からない。
+ * 🚨 「自分自身」(代表 = 自分のコード) は value のまま (呼び手が norm で比べて「明示のなし」にする。空でない値は欠落から生まれない)
+ */
+export function representativeStateOf(raw, repSemantics) {
+  if (raw == null) return 'unknown';
+  if (String(raw).trim() !== '') return 'value';
+  return repSemantics === 'src1' ? 'empty' : 'unknown';
+}
+
 function hasTable(db, name) {
   return !!db.prepare("select 1 from sqlite_master where type = 'table' and name = ?").get(name);
 }
@@ -46,6 +58,10 @@ function rows(db, sql, params = []) {
 }
 const s = (v) => (v == null ? null : String(v).trim() || null);
 const n = (v) => (v == null || v === '' || Number.isNaN(Number(v)) ? null : Number(v));
+/** 円 (0 以上の整数)。空・数でない・負は null (0 円にしない) */
+const yen = (v) => { const x = n(v); return x == null || !Number.isFinite(x) || x < 0 ? null : Math.round(x); };
+/** 照合 ② が NE の値を Company DB の形にするときに同じ変換を使う (規則を二重に書かない。Company DB構想 10 §6.1.1 C2) */
+export { s as trimOrNull, yen as yenOrNull };
 /** SQLite の時刻文字列 (ISO / 'YYYY-MM-DD HH:MM:SS' = localtime JST) → ISO。読めなければ null */
 export function toIso(v) {
   const t = s(v); if (!t) return null;
@@ -100,6 +116,18 @@ export function mapWorkerType(kind) {
 }
 export function isJan(v) { return /^\d{8}$|^\d{13}$/.test(String(v || '').trim()); }
 /**
+ * 仕入先コードを 1 つの形に揃える (Company DB構想 10 §9 D)。数字だけのコードは **NE の形 = 4 桁の 0 埋め** ('1' → '0001')。
+ * 発注アプリ (purchase-orders の normSupplierCode) は先頭の 0 を外して持つので、揃えないと同じ仕入先が 2 行になる
+ * (本番 2026-09-24: 83 行 = 実 43 社、40 社が二重)。4 桁より長い数字は先頭の 0 を外すだけ (切り詰めない)。数字以外はそのまま。
+ * 🚨 DB 側の core.canonical_supplier_code() (0025) と同じ規則
+ */
+export function canonicalSupplierCode(v) {
+  const c = String(v ?? '').trim();
+  if (!/^\d+$/.test(c)) return c;
+  const x = c.replace(/^0+(?=\d)/, '');
+  return x.length < 4 ? x.padStart(4, '0') : x;
+}
+/**
  * 出品の構成が「単品 1 個」(構成 1 行・qty=1・その SKU が単品) ならその NE コード。複数個パック・セット (セット SKU × 1 も)・未解決は null。
  * isSingle(code) を渡すと SKU 種別も見る (渡さないと構成の形だけ)
  */
@@ -123,22 +151,35 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     // ── skus / products / costs ← mirror_products ──
     const products = rows(mirror, 'select * from mirror_products');
     src.mirror_products = products.length;
+    const readDigest = { products: materialDigest('products', products) };   // ③a-1: この回が実際に読んだ中身 (下で世代と照らす)
     const skuByNorm = new Map();
+    const repRaw = new Map();   // sku → 材料の 代表商品コード の元の値 (NULL と '' を分けたまま。状態は世代の意味の版を読んでから決める)
+    // 区分を確かめられない材料の行 (広げる道 v8 §8-4・v11: 落とす前の生の行から = {reason, raw_code, code_norm})。
+    //   empty_code = raw_code は元の文字 (null は空の文字)・code_norm は null / unknown_kind = 知らない商品区分 / norm_collision = 正規化で重なる行 (重なった行ごとに 1 つ)
+    plan.kindUnverifiable = [];
+    const kindRawByNorm = new Map();   // code_norm → 元の書き方の集合 (区分の分かる行。正規化の重なりを数える)
     for (const r of products) {
-      const code = s(r['商品コード']); if (!code) continue;
+      const code = s(r['商品コード']);
+      if (!code) { plan.kindUnverifiable.push({ reason: 'empty_code', raw_code: r['商品コード'] == null ? '' : String(r['商品コード']), code_norm: null }); continue; }
       const kind = mapSkuKind(r['商品区分']);
-      if (!kind) { (src.skipped ||= []).push({ table: 'mirror_products', code, reason: `商品区分 ${r['商品区分']}` }); continue; }
+      if (!kind) { (src.skipped ||= []).push({ table: 'mirror_products', code, reason: `商品区分 ${r['商品区分']}` }); plan.kindUnverifiable.push({ reason: 'unknown_kind', raw_code: code, code_norm: normSku(code) }); continue; }
+      if (!kindRawByNorm.has(normSku(code))) kindRawByNorm.set(normSku(code), []);
+      kindRawByNorm.get(normSku(code)).push(code);
       const taxRate = mapTaxRate(r['消費税率']);
       const sc = n(r['売上分類']);
       const sku = {
         code, name: s(r['商品名']) || code, kind, taxRate, taxClass: mapTaxClass(r['税区分'], taxRate),
         handling: mapHandling(r['取扱区分']), salesClass: sc != null && sc >= 1 && sc <= 4 ? sc : null,
-        representativeCode: s(r['代表商品コード']), supplierCode: s(r['仕入先コード']), cost: mapCost(r),
+        representativeCode: s(r['代表商品コード']), supplierCode: s(r['仕入先コード']) ? canonicalSupplierCode(s(r['仕入先コード'])) : s(r['仕入先コード']), cost: mapCost(r),
         shippingCode: s(r['送料コード']), shippingMethod: s(r['配送方法']),
+        // 0027: 円は整数に丸める。負・数でないものは null (0 円と区別する)
+        standardPriceJpy: yen(r['標準売価']), shippingCostJpy: yen(r['送料']),
       };
       plan.skus.push(sku);
+      repRaw.set(sku, r['代表商品コード']);
       skuByNorm.set(normSku(code), sku);
     }
+    for (const [k, list] of kindRawByNorm) if (new Set(list).size > 1) for (const c of list) plan.kindUnverifiable.push({ reason: 'norm_collision', raw_code: c, code_norm: k });
     const knownSku = (code) => skuByNorm.has(normSku(code));
     const isSingleSku = (code) => skuByNorm.get(normSku(code))?.kind === 'single';
 
@@ -164,20 +205,24 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     // ── set components ──
     const comps = hasTable(mirror, 'mirror_set_components') ? rows(mirror, 'select * from mirror_set_components') : [];
     src.mirror_set_components = comps.length;
+    readDigest.set_components = materialDigest('set_components', comps);
     for (const r of comps) plan.setComponents.push({ parentCode: s(r['セット商品コード']), childCode: s(r['構成商品コード']), qty: n(r['数量']) ?? 1, source: 'ne' });
 
     // ── suppliers ──
+    // 🚨 コードは canonicalSupplierCode で揃えてから束ねる (発注アプリ '1' と NE '0001' を同じ仕入先にする)
     const supMap = new Map();   // code_norm → {code, name, ...}
     if (hasTable(mirror, 'po_suppliers')) {
       for (const r of rows(mirror, 'select * from po_suppliers')) {
-        const code = s(r.supplier_code); if (!code) continue;
-        supMap.set(normSku(code), { code, name: s(r.name) || code, orderMethod: s(r.send_method), leadTimeDays: n(r.lead_days) });
+        const code = s(r.supplier_code) ? canonicalSupplierCode(s(r.supplier_code)) : null; if (!code) continue;
+        // 0027: 連絡先 6 列 (切替日までは発注アプリの値に合わせる。空にしたら空にする = coalesce で戻さない)
+        supMap.set(normSku(code), { code, name: s(r.name) || code, orderMethod: s(r.send_method), leadTimeDays: n(r.lead_days),
+          contacts: { emailTo: s(r.email_to), emailCc: s(r.email_cc), contactName: s(r.contact_name), faxNumber: s(r.fax_number), relayTo: s(r.relay_to), orderMemo: s(r.order_memo) } });
       }
       src.po_suppliers = supMap.size;
     }
     if (hasTable(mirror, 'supplier_share_master')) {
       for (const r of rows(mirror, 'select * from supplier_share_master')) {
-        const code = s(r['仕入先コード']); if (!code || supMap.has(normSku(code))) continue;
+        const code = s(r['仕入先コード']) ? canonicalSupplierCode(s(r['仕入先コード'])) : null; if (!code || supMap.has(normSku(code))) continue;
         supMap.set(normSku(code), { code, name: s(r['表示名']) || code });
       }
     }
@@ -190,9 +235,10 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       const vc = rows(mirror, 'select * from po_vendor_code_map');
       src.po_vendor_code_map = vc.length;
       for (const r of vc) {
-        const sc = s(r.supplier_code), pc = s(r.product_code); if (!sc || !pc) continue;
+        const sc = s(r.supplier_code) ? canonicalSupplierCode(s(r.supplier_code)) : null, pc = s(r.product_code); if (!sc || !pc) continue;
         ssKeys.add(`${normSku(sc)}|${normSku(pc)}`);
-        plan.supplierSkus.push({ supplierCode: sc, skuCode: pc, vendorCode: s(r.vendor_code), stockUnitsPerOrderUnit: n(r.qty_per_unit) > 0 && Number.isInteger(n(r.qty_per_unit)) ? n(r.qty_per_unit) : null });
+        // 商品コードは NE の表記に寄せる (発注アプリ 'REVIEW1' / NE 'review1' でも同じ SKU に付く。engine は原文一致で SKU を引くため)
+        plan.supplierSkus.push({ supplierCode: sc, skuCode: skuByNorm.get(normSku(pc))?.code ?? pc, vendorCode: s(r.vendor_code), stockUnitsPerOrderUnit: n(r.qty_per_unit) > 0 && Number.isInteger(n(r.qty_per_unit)) ? n(r.qty_per_unit) : null });
       }
     }
     for (const sku of plan.skus) {
@@ -202,6 +248,104 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       ssKeys.add(k);
       plan.supplierSkus.push({ supplierCode: sku.supplierCode, skuCode: sku.code });
     }
+    // 0027: 代表の仕入先 = NE の商品の仕入先コード。コードが空の商品は入れない (= 夜間ロードは代表の印に触らない・保留)
+    plan.primarySuppliers = plan.skus.filter((sku) => sku.supplierCode).map((sku) => ({ skuCode: sku.code, supplierCode: sku.supplierCode }));
+
+    // 0027: 推奨保有月数 ← 商品管理リストの公開 snapshot (mirror_pml_published + mirror_pml_snapshot_rows)。
+    //   使ってよいのは status が ok / partial で、行数が row_count と合うときだけ (FBA 補充と同じ判定)。使えない日は reorderMonths を付けない = 夜間ロードは触らない
+    //   (取れなかったことを「未登録 (null)」にしない。Codex ②c High)。snapshot に行があって値が空なら null (= 未登録) を付ける。行が無い商品は付けない
+    // ③a-1: この回が読んだ products / set_components の中身を mirror の世代 (miniPC の sync-to-render が付け、受け手が確かめて残した) と照らす。
+    //   matched = 中身が世代と同じ (= miniPC の控えがこの回の材料) / mismatch = 受信のあと Render 側で書き換えられた (会計アプリの税率・売上分類、原価の例外など)
+    //   / no_generation = 世代の記録が無い (古い送り手・記録できなかった受信)。照合 (③a-2) が使ってよいのは matched だけ
+    //   世代の行の形がおかしければ (ID・ハッシュの形) 無いものとして扱い、時刻は制御文字を含めば null にする (PostgreSQL に渡すとロードごと巻き戻る。Codex R2 M-1)
+    const gens = {};
+    if (hasTable(mirror, 'mirror_material_generations')) {
+      const semCol = hasColumn(mirror, 'mirror_material_generations', 'semantics') ? ', semantics' : '';
+      for (const r of rows(mirror, `select entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at${semCol} from mirror_material_generations`)) {
+        if (typeof r.generation_id !== 'string' || !MATERIAL_ID_RE.test(r.generation_id) || typeof r.content_hash !== 'string' || !MATERIAL_HASH_RE.test(r.content_hash)) continue;
+        const t = (v) => cleanMaterialText(v) ?? null;
+        let semantics = null;
+        try { const s = r.semantics ? JSON.parse(r.semantics) : null; semantics = s && typeof s === 'object' && !Array.isArray(s) ? s : null; } catch { /* 形が違う = 版なし */ }
+        gens[r.entity] = { ...r, source_complete_at: t(r.source_complete_at), created_at: t(r.created_at), received_at: t(r.received_at), semantics };
+      }
+    }
+    plan.material = {};
+    for (const entity of ['products', 'set_components']) {
+      const d = readDigest[entity];
+      const g = gens[entity] ?? null;
+      const status = !g ? 'no_generation' : (g.content_hash === d.content_hash && Number(g.row_count) === d.row_count ? 'matched' : 'mismatch');
+      plan.material[entity] = { status, content_hash: d.content_hash, row_count: d.row_count, generation: g };
+    }
+    src.material = Object.fromEntries(Object.entries(plan.material).map(([k, v]) => [k, v.status === 'matched' ? v.generation.generation_id : v.status]));
+    // D3: 代表商品コードの意味の版は、中身が世代と同じ (matched) 材料のときだけ信じる。版が 'src1' でない材料の '' は「不明」(項目の欠落を潰した空かもしれない。Codex D3-R1 H1)
+    const repSemantics = plan.material.products.status === 'matched' ? (plan.material.products.generation?.semantics?.rep ?? null) : null;
+    plan.material.products.repSemantics = repSemantics;
+    for (const sku of plan.skus) sku.representativeState = representativeStateOf(repRaw.get(sku), repSemantics);
+
+    plan.reorder = { available: false, runId: null, reason: null };
+    if (hasTable(mirror, 'mirror_pml_published') && hasTable(mirror, 'mirror_pml_snapshot_rows')) {
+      const pub = rows(mirror, 'select run_id, status, row_count from mirror_pml_published where id = 1')[0];
+      if (!pub || !pub.run_id) plan.reorder.reason = '公開 snapshot が無い';
+      else if (!['ok', 'partial'].includes(pub.status)) plan.reorder.reason = `公開 snapshot の status = ${pub.status}`;
+      else {
+        const snap = rows(mirror, 'select 商品コード as code, 推奨保有月数 as months from mirror_pml_snapshot_rows where run_id = ?', [pub.run_id]);
+        if (pub.row_count != null && snap.length !== Number(pub.row_count)) plan.reorder.reason = `行数が合わない (${snap.length} / row_count ${pub.row_count})`;
+        else {
+          plan.reorder = { available: true, runId: pub.run_id, reason: null };
+          // 正規化すると同じになる行が 2 つ以上ある商品は使わない (どちらの値か決められない)
+          const byCode = new Map(); const dupNorm = new Set();
+          for (const r of snap) { const k = normSku(r.code); if (byCode.has(k)) dupNorm.add(k); else byCode.set(k, r.months); }
+          let bad = 0; let invalid = 0; let dup = 0;
+          for (const sku of plan.skus) {
+            const k = normSku(sku.code);
+            if (!byCode.has(k)) continue;
+            if (dupNorm.has(k)) { dup++; continue; }
+            const raw = byCode.get(k);
+            // 空欄 (null / 空白だけ) = 未登録 → null。数にならない文字は「未登録」にしない = 触らない (既存の値を消さない)
+            if (raw == null || String(raw).trim() === '') { sku.reorderMonths = null; continue; }
+            const m = Number(raw);
+            if (!Number.isFinite(m)) { invalid++; continue; }
+            if (!(m >= 0 && m <= 60)) { bad++; continue; }   // 範囲外は付けない (DB の CHECK で全体を巻き戻さない)
+            sku.reorderMonths = Math.round(m * 10) / 10;
+          }
+          const notes = [];
+          if (bad) notes.push(`範囲外 (0〜60 でない) ${bad} 件`);
+          if (invalid) notes.push(`数でない値 ${invalid} 件`);
+          if (dup) notes.push(`コードが正規化で重なる ${dup} 件`);
+          if (notes.length) plan.reorder.reason = `${notes.join('・')} は付けない`;
+        }
+      }
+    } else plan.reorder.reason = '商品管理リストの snapshot の表が無い';
+    src.reorder = plan.reorder;
+
+    // 0057: 登録日 ← 商品管理リストの公開 snapshot の 登録日 (= miniPC の raw_ne_products.作成日 = NE の goods_creation_date)。
+    //   使ってよい snapshot は推奨保有月数と同じ判定 (status ok / partial・行数が row_count と合う)。使えない日は registeredOn を付けない = 夜間ロードは触らない。
+    //   🚨 mirror_products.new_product_launch_date は使わない (「発売日」として人が手で直せる・NE の作成日より手の値が勝つ = 登録日ではない)。
+    //   値が無い・読めない・未来の日付の商品は付けない (翌晩以降にもう一度見る)。正規化すると同じになる行が 2 つ以上ある商品は使わない
+    plan.registered = { available: false, runId: null, reason: null, withDate: 0, invalid: 0, dup: 0 };
+    if (!plan.reorder.available || !plan.reorder.runId) plan.registered.reason = `snapshot が使えない (${plan.reorder.reason || '材料なし'})`;
+    else if (!hasColumn(mirror, 'mirror_pml_snapshot_rows', '登録日')) plan.registered.reason = 'snapshot に 登録日 の列が無い';
+    else {
+      const today = new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+      const byCode = new Map(); const dupNorm = new Set();
+      for (const r of rows(mirror, 'select 商品コード as code, 登録日 as reg from mirror_pml_snapshot_rows where run_id = ?', [plan.reorder.runId])) {
+        const k = normSku(r.code); if (byCode.has(k)) dupNorm.add(k); else byCode.set(k, r.reg);
+      }
+      const reg = plan.registered;
+      Object.assign(reg, { available: true, runId: plan.reorder.runId });
+      for (const sku of plan.skus) {
+        const k = normSku(sku.code);
+        if (!byCode.has(k)) continue;
+        if (dupNorm.has(k)) { reg.dup++; continue; }
+        const raw = byCode.get(k);
+        if (raw == null || String(raw).trim() === '') continue;   // NE の作成日が無い (セット・例外) = 付けない
+        const d = parseNeCreationDate(raw, today);
+        if (!d) { reg.invalid++; continue; }
+        sku.registeredOn = d;
+        reg.withDate++;
+      }
+    }
+    src.registered = plan.registered;
 
     // ── Amazon listings ← mirror_sku_master + mirror_sku_resolved (+ fees の ASIN, fba.db の ASIN/JAN/FNSKU) ──
     const fees = hasTable(mirror, 'mirror_amazon_sku_fees') ? new Map(rows(mirror, 'select seller_sku, asin from mirror_amazon_sku_fees where asin is not null').map((r) => [normSku(r.seller_sku), s(r.asin)])) : new Map();
@@ -211,7 +355,12 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     const fbaMap = new Map();
     if (fba) {
       try {
-        if (hasTable(fba, 'sku_mapping')) {
+        // Sheet なしのモード (FBA 補充 ⑦-F・Codex PR R2 Medium 3): FBA 補充が sku_mapping (Sheet の写し) を凍結した fba.db なら、その値を一切使わない
+        //   = fba_sheet_import の ASIN / FNSKU の候補・Sheet 由来の JAN・Sheet にだけある出品と構成を作らない (fba_sku_attrs は今までどおり)。
+        //   凍結の印 = fba.db の fba_sheetless_state.sheet_frozen = '1' (FBA 補充が起動時に書く)。印が無い fba.db は今までどおり
+        const sheetFrozen = hasTable(fba, 'fba_sheetless_state') && rows(fba, `select value from fba_sheetless_state where key = 'sheet_frozen'`)[0]?.value === '1';
+        if (sheetFrozen) src.fba_sheet_frozen = true;
+        if (!sheetFrozen && hasTable(fba, 'sku_mapping')) {
           for (const r of rows(fba, 'select amazon_sku, asin, jan, fnsku, ne_code, is_set, logizard_code from sku_mapping')) {
             const k = normSku(r.amazon_sku); if (!k) continue;
             fbaMap.set(k, { ...(fbaMap.get(k) || {}), sheet: { asin: s(r.asin), jan: s(r.jan), fnsku: s(r.fnsku), ne_code: s(r.ne_code) || s(r.logizard_code), is_set: !!r.is_set } });
@@ -232,7 +381,8 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     const resolved = hasTable(mirror, 'mirror_sku_resolved') ? rows(mirror, 'select seller_sku, ne_code, quantity, sort_order from mirror_sku_resolved order by seller_sku, sort_order') : [];
     src.mirror_sku_master = master.length; src.mirror_sku_resolved = resolved.length;
     const compBySeller = new Map();
-    for (const r of resolved) { const k = normSku(r.seller_sku); if (!compBySeller.has(k)) compBySeller.set(k, []); compBySeller.get(k).push({ code: s(r.ne_code), qty: n(r.quantity) ?? 1, resolution: 'imported', evidence: { source: 'm_sku_master' } }); }
+    // 0027 (②c-2): 構成の並び (sort_order) も渡す。「先頭 = 代表の NE コード」に頼る読み手がある (mart の代表 SKU・売上ビュー・FBA 補充)
+    for (const r of resolved) { const k = normSku(r.seller_sku); if (!compBySeller.has(k)) compBySeller.set(k, []); compBySeller.get(k).push({ code: s(r.ne_code), qty: n(r.quantity) ?? 1, sortOrder: n(r.sort_order) ?? 0, resolution: 'imported', evidence: { source: 'm_sku_master' } }); }
     const amazonSeen = new Set();
     const pushAmazon = (sellerSku, title, components, evidenceSource) => {
       const k = normSku(sellerSku); if (!k || amazonSeen.has(k)) return; amazonSeen.add(k);
@@ -267,6 +417,32 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       const comps2 = sheet?.ne_code && !sheet.is_set ? [{ code: sheet.ne_code, qty: 1, resolution: 'imported', evidence: { source: 'fba_sheet' } }] : [];
       pushAmazon(k, null, comps2, sheet ? 'fba_sheet' : 'fba_sku_attrs');
     }
+    // ── 3 つ目: 自社発送 (FBM) の seller SKU = NE の商品コードそのもの (単品かセット。expected-profit の fbmNeCode と同じ規則 = 中原さん 2026-09-08) ──
+    // 🚨 マスタ登録 (m_sku_master) と fba.db は FBA の SKU しか持たない → 自社発送の主力 (hakkap100・hinoki10 など 1,310 種 / 28 日で 12,875 個 = Amazon の 19%) が
+    //    core.listings に無く、注文明細が unresolved_code のまま = 売上日次で SKU に展開できず、見張り W6 の対象からも抜けていた (2026-09-23 に発覚)。
+    //    出どころ = mirror_amazon_sku_fees (最近売れた seller SKU は全部入る。fulfillment_channel は FBA / FBM)。
+    //    FBA なのに NE コードと偶然同じ SKU (実測 1,311 件中 4 件) を誤って結ばないよう **FBM に限る**。FBM でも NE に無いコードは出品を作らない (数だけ報告 = 人が見る)
+    const feesRows = hasTable(mirror, 'mirror_amazon_sku_fees') && hasColumn(mirror, 'mirror_amazon_sku_fees', 'fulfillment_channel') ? rows(mirror, 'select seller_sku, fulfillment_channel from mirror_amazon_sku_fees') : [];
+    // 🚨 正規化 (normSku = 大文字小文字・全角・空白・ダッシュ) で同じ鍵になる別の原文の seller SKU (例: abc が FBM・ＡＢＣ が FBA) は、片方から出品を作ると
+    //    受け口の解決 (正規化で当てる) がもう片方の注文も同じ出品に結ぶ = FBM 限定の守りを迂回する → 原文が 2 つ以上ある鍵は自動では結ばず報告 (人が見る。Codex #1410 R1 #2)。
+    //    マスタ登録 (m_sku_master) の原文も同じ鍵に入れて比べる
+    const rawByNorm = new Map();
+    const addRaw = (raw) => { const k = normSku(raw); if (!k) return; if (!rawByNorm.has(k)) rawByNorm.set(k, new Set()); rawByNorm.get(k).add(s(raw)); };
+    for (const r of feesRows) addRaw(r.seller_sku);
+    for (const r of master) addRaw(r.seller_sku);
+    const fbm = { listed: 0, not_in_ne: 0, fba_or_unknown_unlisted: 0, collided: 0, samples_not_in_ne: [], samples_collided: [] };
+    for (const r of feesRows) {
+      const sellerSku = s(r.seller_sku); const k = normSku(sellerSku); if (!k || amazonSeen.has(k)) continue;
+      const channel = String(r.fulfillment_channel || '').trim().toUpperCase();
+      if (channel !== 'FBM') { fbm.fba_or_unknown_unlisted++; continue; }
+      const raws = rawByNorm.get(k);
+      if (raws && raws.size > 1) { fbm.collided++; if (fbm.samples_collided.length < 10) fbm.samples_collided.push([...raws].sort()); continue; }
+      const sku = skuByNorm.get(k);
+      if (!sku) { fbm.not_in_ne++; if (fbm.samples_not_in_ne.length < 10) fbm.samples_not_in_ne.push(sellerSku); continue; }
+      pushAmazon(sellerSku, sku.name || null, [{ code: sku.code, qty: 1, resolution: sellerSku === sku.code ? 'exact' : 'normalized', evidence: { source: 'fbm_ne_code', seller_sku: sellerSku } }], 'amazon_fees_fbm');
+      fbm.listed++;
+    }
+    src.amazon_fbm = fbm;
 
     // ── 楽天 listings ← mirror_rakuten_sku_map (AM > AL > W の別名を 1 listing にまとめる) ──
     const rk = hasTable(mirror, 'mirror_rakuten_sku_map') ? rows(mirror, 'select rakuten_code, ne_code, source, manage_number from mirror_rakuten_sku_map') : [];

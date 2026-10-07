@@ -14,15 +14,25 @@
 # (function names are case-insensitive and shadow executables) -> CallDepthOverflow. Always call icacls.exe.
 param(
   # Repo checkout to install FROM. Default = production clone. Pass a git worktree path to test an unmerged branch.
-  [string]$Repo = 'C:\Users\bfaith\bfaith-portal'
+  [string]$Repo = 'C:\Users\bfaith\bfaith-portal',
+  # SP-ad KW AI (PR3b): the PERSON who confirmed the Claude plan has NO additional (paid) usage. Writes
+  # bin\ad-kw-ai-config.json inside the protected bin (the runner cannot rewrite its own billing record - Codex #1431 R1 #4).
+  # Omit it to keep an existing record. Without a record the ad runner claims nothing.
+  [string]$AttestAdKwBilling = '',
+  [int]$AdKwMaxJobs = 5
 )
 $ErrorActionPreference = 'Stop'
 $Src   = Join-Path $Repo 'scripts\ph-nightly'
 $Root  = 'C:\tools\ph-nightly'
 $Bin   = Join-Path $Root 'bin'
 $Work  = Join-Path $Root 'work'
+# lease / packet_hash / review material. Deliberately OUTSIDE work\ because work\ grants
+# Claude Read+Write+Edit, so state kept there is readable and forgeable by the session
+# (codex exec review P2). ACLs cannot separate them - claude and phlp both run as $Me.
+$State = Join-Path $Root 'state'
 $Cfg   = Join-Path $Work '.claude'
 $SkillsSrc = Join-Path $Repo '.claude\skills\ph-generate'
+$LpSkillsSrc = Join-Path $Repo '.claude\skills\ph-lp-compose'
 $Me = 'bfaith'
 
 if (-not (Test-Path (Join-Path $Src 'phq.mjs'))) { throw "not a ph-nightly source dir: $Src" }
@@ -72,17 +82,26 @@ $targets = @(
   @{ p = $Cfg;                                          d = $true  },
   @{ p = (Join-Path $Work 'phq');                       d = $false },
   @{ p = (Join-Path $Work 'phreview');                  d = $false },
+  @{ p = (Join-Path $Work 'phlp');                      d = $false },
+  @{ p = (Join-Path $Work 'phlpreview');                d = $false },
   @{ p = (Join-Path $Cfg 'settings.json');              d = $false },
   @{ p = (Join-Path $Bin 'phq.mjs');                    d = $false },
+  @{ p = (Join-Path $Bin 'phlp.mjs');                   d = $false },
+  @{ p = (Join-Path $Bin 'run-lp-compose.ps1');         d = $false },
   @{ p = (Join-Path $Bin 'copy_lint.py');               d = $false },
   @{ p = (Join-Path $Bin 'run-ph-generate.ps1');        d = $false },
-  @{ p = (Join-Path $Bin 'ping.ps1');                   d = $false }
+  @{ p = (Join-Path $Bin 'ping.ps1');                   d = $false },
+  @{ p = (Join-Path $Bin 'ClaudeGuard.ps1');            d = $false },
+  @{ p = (Join-Path $Bin 'ad-kw-ai.mjs');               d = $false },
+  @{ p = (Join-Path $Bin 'cli.cjs');                    d = $false },
+  @{ p = (Join-Path $Bin 'common.cjs');                 d = $false },
+  @{ p = (Join-Path $Bin 'packet.cjs');                 d = $false }
 )
 $updateError = $null
 $reprotectErrors = @()
 try {
   try {
-    New-Item -ItemType Directory -Force -Path $Bin, $Work, $Cfg, (Join-Path $Root 'logs') | Out-Null
+    New-Item -ItemType Directory -Force -Path $Bin, $Work, $Cfg, $State, (Join-Path $Root 'logs') | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.claude\secrets') | Out-Null
 
     # 1) lift denies
@@ -90,13 +109,31 @@ try {
 
     # 2) executable code + shims + settings (all as protected copies)
     Copy-Item -Force (Join-Path $Src 'phq.mjs')              (Join-Path $Bin 'phq.mjs')
+    Copy-Item -Force (Join-Path $Src 'phlp.mjs')             (Join-Path $Bin 'phlp.mjs')          # LP compose (stage 1)
+    Copy-Item -Force (Join-Path $Src 'run-lp-compose.ps1')   (Join-Path $Bin 'run-lp-compose.ps1')
     Copy-Item -Force (Join-Path $Src 'copy_lint.py')         (Join-Path $Bin 'copy_lint.py')   # canonical = AI_reference (miniPC has no G:)
     Copy-Item -Force (Join-Path $Src 'run-ph-generate.ps1')  (Join-Path $Bin 'run-ph-generate.ps1')
     Copy-Item -Force (Join-Path $Repo 'scripts\jobs-monitor\ping.ps1') (Join-Path $Bin 'ping.ps1')
+    Copy-Item -Force (Join-Path $Repo 'scripts\claude-guard\ClaudeGuard.ps1') (Join-Path $Bin 'ClaudeGuard.ps1')   # one Claude at a time (PR3-0)
+    # SP-ad keyword AI (PR3b): the runner + the tool-less Claude caller from product-scout (canonical copy, not forked)
+    Copy-Item -Force (Join-Path $Src 'ad-kw-ai.mjs') (Join-Path $Bin 'ad-kw-ai.mjs')
+    foreach ($f in @('cli.cjs', 'common.cjs', 'packet.cjs')) {
+      Copy-Item -Force (Join-Path $Repo ('scripts\product-idea-scout\ai\' + $f)) (Join-Path $Bin $f)
+    }
+    if ($AttestAdKwBilling) {
+      # written only here, while bin is unprotected; the runner (same user) can read but not rewrite it afterwards
+      $attest = [ordered]@{
+        billing_attestation = [ordered]@{ provider = 'claude'; additional_usage_disabled = $true; checked_by = $AttestAdKwBilling; checked_at = (Get-Date).ToUniversalTime().ToString('o') }
+        max_jobs = $AdKwMaxJobs
+      }
+      [IO.File]::WriteAllText((Join-Path $Bin 'ad-kw-ai-config.json'), ($attest | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+    }
     Copy-Item -Force (Join-Path $Src 'phq')                  (Join-Path $Work 'phq')
     Copy-Item -Force (Join-Path $Src 'phreview')             (Join-Path $Work 'phreview')
+    Copy-Item -Force (Join-Path $Src 'phlp')                 (Join-Path $Work 'phlp')
+    Copy-Item -Force (Join-Path $Src 'phlpreview')           (Join-Path $Work 'phlpreview')
     Copy-Item -Force (Join-Path $Src 'settings.json')        (Join-Path $Cfg 'settings.json')
-    foreach ($f in @('phq', 'phreview')) {
+    foreach ($f in @('phq', 'phreview', 'phlp', 'phlpreview')) {
       $bytes = [IO.File]::ReadAllBytes((Join-Path $Work $f))
       if (@($bytes | Where-Object { $_ -eq 13 }).Count -gt 0) { throw "$f has CRLF line endings (bash shim needs LF; check .gitattributes)" }
     }
@@ -115,6 +152,9 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $skills 'ph-generate') | Out-Null
     Copy-Item -Force -Recurse (Join-Path $SkillsSrc '*') (Join-Path $skills 'ph-generate')
     if (-not (Test-Path (Join-Path $skills 'ph-generate\SKILL.md'))) { throw "skill copy failed: $skills" }
+    New-Item -ItemType Directory -Force -Path (Join-Path $skills 'ph-lp-compose') | Out-Null
+    Copy-Item -Force -Recurse (Join-Path $LpSkillsSrc '*') (Join-Path $skills 'ph-lp-compose')
+    if (-not (Test-Path (Join-Path $skills 'ph-lp-compose\SKILL.md'))) { throw "lp skill copy failed: $skills" }
   } catch {
     $updateError = $_.Exception.Message
   }
@@ -135,8 +175,22 @@ if ($updateError -or $reprotectErrors.Count -gt 0) {
 foreach ($t in $targets) { Assert-Denied $t.p $t.d }
 Assert-Denied (Join-Path $Bin 'phq.mjs') $false                       # inheritance reached files under bin
 Assert-Denied (Join-Path $Bin 'run-ph-generate.ps1') $false
+Assert-Denied (Join-Path $Bin 'ClaudeGuard.ps1') $false
+Assert-Denied (Join-Path $Bin 'ad-kw-ai.mjs') $false
+Assert-Denied (Join-Path $Bin 'cli.cjs') $false
+if (Test-Path (Join-Path $Bin 'ad-kw-ai-config.json')) { Assert-Denied (Join-Path $Bin 'ad-kw-ai-config.json') $false }
+# The ad runner must load from the protected copies only (no runtime dependency on the checkout): import check.
+# The path goes through an env var, not argv: ad-kw-ai.mjs runs its main when argv[1] is itself.
+$env:AD_KW_AI_IMPORT_PATH = (Join-Path $Bin 'ad-kw-ai.mjs')
+& node -e "import('file:///' + process.env.AD_KW_AI_IMPORT_PATH.replace(/\\/g, '/')).then(m => { if (typeof m.runAdKwAi !== 'function') process.exit(2); console.log('ad-kw-ai.mjs loads from bin') }).catch(e => { console.error(e.message); process.exit(1) })"
+if ($LASTEXITCODE -ne 0) { throw 'bin\ad-kw-ai.mjs does not load (cli.cjs / common.cjs / packet.cjs missing?)' }
+Remove-Item Env:\AD_KW_AI_IMPORT_PATH
+# Writable data for the ad runner (not protected): unsent results (pending\) and an empty cwd for claude
+New-Item -ItemType Directory -Force -Path (Join-Path $Root 'ad-kw-ai-data\pending'), (Join-Path $Root 'ad-kw-ai-data\cwd') | Out-Null
 Assert-Denied (Join-Path $Cfg 'settings.json') $false
 Assert-Denied (Join-Path $Cfg 'skills\ph-generate\SKILL.md') $false
+Assert-Denied (Join-Path $Cfg 'skills\ph-lp-compose\SKILL.md') $false
+Assert-Denied (Join-Path $Bin 'phlp.mjs') $false
 
 # 5) scheduled task runs the PROTECTED copy of the runner. bfaith / Interactive (no stored password - same
 #    pattern as MallCsvFetchAll) / RunLevel Limited. Requires bfaith to stay logged on (console).
@@ -151,11 +205,30 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Pr
 $t = Get-ScheduledTask -TaskName $taskName
 if (-not $t) { throw "task $taskName was not registered" }
 
+# 5b) LP compose (stage 1): a person presses a button on the product page and watches the screen, so this
+#     one polls every minute. The poll itself is ONE http call (bin\phlp.mjs queue) - Claude is started
+#     only when there is a request. It takes the shared Claude lock with a SHORT deadline: if a nightly
+#     job holds it, the minute is skipped instead of queuing up behind a 2 h run.
+$lpTaskName = 'PhLpComposeMinutely'
+$lpAction   = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Bin 'run-lp-compose.ps1') + '"')
+$lpTrigger  = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+                -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+# 30 min: the runner's own Claude timeout is 20 min; the rest is for the kill, the model check, the post-check and the ping
+# (the same 20 min here would kill PowerShell before its cleanup - codex #1609 Medium)
+$lpSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) `
+                -MultipleInstances IgnoreNew -RunOnlyIfNetworkAvailable
+Register-ScheduledTask -TaskName $lpTaskName -Action $lpAction -Trigger $lpTrigger -Principal $principal -Settings $lpSettings -Force | Out-Null
+$lpT = Get-ScheduledTask -TaskName $lpTaskName
+if (-not $lpT) { throw "task $lpTaskName was not registered" }
+
 Write-Output "installed:"
 Write-Output ("  bin      : " + $Bin + " (phq.mjs, copy_lint.py, run-ph-generate.ps1, ping.ps1) [write denied for " + $Me + "]")
 Write-Output ("  work     : " + $Work + " (./phq ./phreview [write denied], generated files writable)")
 Write-Output ("  config   : " + $Cfg + " (settings.json + skills copy) [write denied]")
+Write-Output ("  state    : " + $State + " (lease / packet_hash / review material; outside work, denied in settings.json)")
 Write-Output ("  task     : " + $taskName + " daily 02:30 as " + $Me + " (Interactive, Limited) -> bin\run-ph-generate.ps1, state=" + $t.State)
+Write-Output ("  task(LP) : " + $lpTaskName + " every 1 min as " + $Me + " (Interactive, Limited) -> bin\run-lp-compose.ps1, state=" + $lpT.State)
 Write-Output ("  source   : " + $Repo)
 Write-Output ""
 Write-Output "remaining manual steps (once, by a person):"
@@ -163,3 +236,10 @@ Write-Output ("  1. service token : " + (Join-Path $env:USERPROFILE '.claude\sec
 Write-Output ("  2. claude login  : cd " + $Work + " ; claude  ->  /login (subscription account)")
 Write-Output "  3. codex login   : codex login (ChatGPT subscription)"
 Write-Output ("  4. first run     : powershell -NoProfile -ExecutionPolicy Bypass -File " + (Join-Path $Bin 'run-ph-generate.ps1'))
+$adCfg = if (Test-Path (Join-Path $Bin 'ad-kw-ai-config.json')) { 'present (protected)' } else { 'MISSING' }
+Write-Output ("  5. SP-ad KW AI   : billing record bin\ad-kw-ai-config.json = " + $adCfg)
+Write-Output  "                    a person confirms the Claude plan has NO additional (paid) usage, then re-runs:"
+Write-Output  "                    install.ps1 -AttestAdKwBilling '<name>'   (without the record the ad runner claims nothing)"
+Write-Output  "                    then set AD_KW_AI_ENABLED=1 on Render (until then the ad queue pings ok 'disabled')"
+Write-Output  "  6. LP compose    : set PH_LP_COMPOSE_ENABLED=1 on Render, then upload the LP spec (.xlsx) as an admin."
+Write-Output  "                    until both are done run-lp-compose.ps1 exits quietly every minute (server says enabled=false)."

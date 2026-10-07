@@ -5,6 +5,10 @@
  * f_amazon_finance_sku_daily_v1 を月次に rollup して
  * v_amazon_sku_profit_actual_v4 (gross_margin_with_reimbursement_excl_tax) と比較。
  *
+ * 🚨 2026-09-29: 2 つは計算の決まりが違う (原価・ポイント・送料の税・返品の管理手数料・返金の範囲 + 2026-09-30 D-63 の SAFE-T (Other)・補てんの取り消し)。
+ *   A (そのままの差) の横に A2 (決まりの違いを引いた後の差 = amazon-finance-v4-reconcile.js) と B2 (SKU × 月の残り) を出す。
+ *   A2 / B2 の残りが 0 でなければ、どちらかの集計が変わった (本番 1〜9 月は 0 円)
+ *
  * #1-8a の DQ runner との違い:
  *   - 本 script: 人間が読む report (markdown 出力可)、bucket ルール docs と連動
  *   - DQ runner: 機械的 gate (severity / threshold / exit code 1)
@@ -18,6 +22,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
+import { reconcileMonthly, reconcileSkuTop, V4_SKU_HAS_DAILY_SQL } from './amazon-finance-v4-reconcile.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -108,10 +113,12 @@ const topDiff = db.prepare(`
 // 集合差
 const setDiff = db.prepare(`
   WITH daily_sku AS (
-    SELECT DISTINCT substr(date_jst,1,7) AS month_jst, seller_sku FROM f_amazon_finance_sku_daily_v1 ${monthFilterClause}
+    SELECT DISTINCT substr(date_jst,1,7) AS month_jst, seller_sku
+      FROM (SELECT * FROM f_amazon_finance_sku_daily_v1 WHERE source_layer_summary <> 'easy_ship_alloc') ${monthFilterClause}   -- Easy Ship の割り振りだけの行 (2026-09-28) は v4 に無い
   ),
   v4_sku AS (
-    SELECT DISTINCT year_month AS month_jst, seller_sku FROM v_amazon_sku_profit_actual_v4 ${monthFilterClauseV4}
+    SELECT DISTINCT year_month AS month_jst, seller_sku
+      FROM (SELECT * FROM v_amazon_sku_profit_actual_v4 v4 WHERE ${V4_SKU_HAS_DAILY_SQL}) ${monthFilterClauseV4}   -- 納品不備だけの SKU × 月は日次に無い (2026-09-30 D-63)
   ),
   ll AS (
     SELECT v.month_jst, COUNT(*) AS legacy_only
@@ -131,6 +138,17 @@ const setDiff = db.prepare(`
   FROM ll FULL OUTER JOIN dd USING (month_jst)
   ORDER BY 1
 `).all();
+
+// 決まりの違いを引いた後の差 (2026-09-29)
+const aligned = reconcileMonthly(db, { month: monthFilter || null }).map((r) => ({
+  month_jst: r.month, raw_diff: Math.round(r.raw_diff),
+  cogs: Math.round(-(r.cogs_d - r.cogs_v4)), points: Math.round(-r.points), ship_tax: Math.round(-r.ship_tax),
+  refund_commission: Math.round(r.refund_commission), other_refund: Math.round(r.other_refund),
+  safe_t_other: Math.round(r.safe_t_other), retraction: Math.round(r.retraction),
+  resid: Math.round(r.resid), resid_abs: Math.round(r.resid_abs), rev_resid_abs: Math.round(r.rev_resid_abs), long_only_skus: r.long_only_skus,
+  resid_pct: Math.round(r.resid_pct * 1000) / 1000,
+}));
+const skuResid = reconcileSkuTop(db, { month: monthFilter || null, minYen: 1, limit: 20 }).map((r) => ({ month_jst: r.month, seller_sku: r.sku, aligned_d: Math.round(r.cmp_d), aligned_v4: Math.round(r.cmp_v4), resid: Math.round(r.resid), rev_resid: Math.round(r.rev_resid), only_in: r.in_d && r.in_v4 ? '' : [r.in_d ? 'daily' : '', r.in_v4 ? 'v4' : '', r.in_long ? 'long' : ''].filter(Boolean).join('+') }));
 
 // cost_status 内訳
 const costStatus = db.prepare(`
@@ -156,6 +174,21 @@ if (isMarkdown) {
   console.log('|---|---|---|---|---|---|---|');
   for (const r of monthly) {
     console.log(`| ${r.month_jst} | ${r.units_d?.toLocaleString()}/${r.units_v4?.toLocaleString()} | ${r.revenue_d?.toLocaleString()}/${r.revenue_v4?.toLocaleString()} | ${r.cogs_d?.toLocaleString()}/${r.cogs_v4?.toLocaleString()} | ${r.profit_d?.toLocaleString()}/${r.profit_v4?.toLocaleString()} | ${r.profit_diff?.toLocaleString()} | ${r.profit_diff_pct}% |`);
+  }
+
+  console.log('\n## A2. 決まりの違いを引いた後の差 (日次 − v4・利益への効き)\n');
+  console.log('| 月 | そのままの差 | 原価 | ポイント | 送料の税 | 返品の管理手数料 | 返金の範囲 | SAFE-T (Other) | 補てんの取り消し | 残り | SKU ごとの残りの絶対値 | 売上の残りの絶対値 | 縦長の表だけの SKU | 残り % |');
+  console.log('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|');
+  for (const r of aligned) {
+    console.log(`| ${r.month_jst} | ${r.raw_diff.toLocaleString()} | ${r.cogs.toLocaleString()} | ${r.points.toLocaleString()} | ${r.ship_tax.toLocaleString()} | ${r.refund_commission.toLocaleString()} | ${r.other_refund.toLocaleString()} | ${r.safe_t_other.toLocaleString()} | ${r.retraction.toLocaleString()} | ${r.resid.toLocaleString()} | ${r.resid_abs.toLocaleString()} | ${r.rev_resid_abs.toLocaleString()} | ${r.long_only_skus} | ${r.resid_pct}% |`);
+  }
+
+  console.log('\n## B2. SKU x 月で 決まりの違いを引いた後の残り (利益 / 売上) TOP 20 (1 円以上)\n');
+  if (skuResid.length === 0) console.log('(1 円以上の残りのある SKU 無し)');
+  else {
+    console.log('| 月 | SKU | 日次 (揃えた後) | v4 (揃えた後) | 利益の残り | 売上の残り | 片方だけ |');
+    console.log('|---|---|---|---|---|---|---|');
+    for (const r of skuResid) console.log(`| ${r.month_jst} | ${r.seller_sku} | ${r.aligned_d.toLocaleString()} | ${r.aligned_v4.toLocaleString()} | ${r.resid.toLocaleString()} | ${r.rev_resid.toLocaleString()} | ${r.only_in} |`);
   }
 
   console.log('\n## B. SKU x 月で profit 差絶対値 TOP 20\n');
@@ -186,6 +219,10 @@ if (isMarkdown) {
   // 通常出力
   console.log('=== A. 月別合計比較 ===');
   console.table(monthly);
+  console.log('\n=== A2. 決まりの違いを引いた後の差 (日次 − v4・利益への効き。残りが 0 なら一致) ===');
+  console.table(aligned);
+  console.log('\n=== B2. SKU x 月で 決まりの違いを引いた後の残り (利益 / 売上) TOP 20 (1 円以上) ===');
+  if (skuResid.length === 0) console.log('(1 円以上の残りのある SKU 無し)'); else console.table(skuResid);
   console.log('\n=== B. SKU x 月で profit 差絶対値 TOP 20 (>100円) ===');
   console.table(topDiff);
   console.log('\n=== C. 集合差 ===');

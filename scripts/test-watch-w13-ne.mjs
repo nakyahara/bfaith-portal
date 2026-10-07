@@ -1,0 +1,247 @@
+/**
+ * test-watch-w13-ne.mjs — 見張りの W13:ne (マスタの照合 ②NE との照合) を engine ごと通す (Company DB構想 10 §6.1.1 C2 v5-4・v5-5・v6-4 = C2b)
+ *
+ * 固定する契約:
+ *   1 W13 の評価キーは load と ne の 2 つ。ne は全件 JSON の ne 節の items を案件に (差 0 = pass / 差あり = breach・info)
+ *   2 明示の回復: 明細に無い open の案件は recoverable にあるものだけ回復 / held にある = 保持 (理由つき) / どちらにも無い = 保持 (not_confirmed) /
+ *     out_of_scope = 監視期間外 (本当に対象から外れた案件だけ)
+ *   3 ② が判定できない・落ちた・② の節が無い = W13:ne は blocked (案件は全部保持)・W13:load は ① で判定する
+ *   4 証跡と全件 JSON の ② の判定が食い違う・件数が食い違う = blocked
+ *   5 朝の要約: W13:ne の案件は「新・継続」に混ぜず「NE との差 N 件 (新 M)」にまとめる (他の見張りの知らせを埋もれさせない)
+ *   9 ポータルで登録した新商品の NE 登録待ち (out_of_scope の reg_pending) は案件にしない (前に開いた案件は監視対象外)・reg_stale・区分違いは案件・理由と観測に数
+ *   8 W13:old (②b 古い表。④a・#1564 の見直し M-3): breach・overdue = 案件 (old_<列>:<norm>) / 反映待ちだけ = pass (理由つき) / 比べない = pass /
+ *     判定できない・落ちた・節が無い・形が違う・件数が食い違う = blocked (案件は保持) / 翌朝に消えた = 回復
+ * 使い方: node scripts/test-watch-w13-ne.mjs
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'w13ne-'));
+process.env.DATA_DIR = DIR;
+const { PGlite } = await import('@electric-sql/pglite');
+const { applyMigrations, pgliteAdapter } = await import('./company-db/migrate.mjs');
+const REAL = await import('../config/watch-checks.mjs');
+const { runWatch, summarize } = await import('../apps/company-db/watch/engine.mjs');
+const { plannedKeys } = await import('../apps/company-db/watch/checks.mjs');
+
+let passed = 0;
+async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
+const quiet = () => {};
+const SYNC = 'ds_w13ne_1';
+const CONFIG = { ...REAL, CHECKS: [REAL.checkById('W13')] };
+
+let seq = 0;
+/** 照合の実行口が書くのと同じ形 (mc-v2) の全件 JSON と証跡。ne = null なら ② の節なし */
+const OLD_NA = { format: 'mc-old-v1', verdict: 'not_applied', reason: 'load_owned', cols: [], counts: { keys: 0, checked: 0, breach: 0, overdue: 0, lag: 0, held: 0 }, items: [] };
+function evidenceFor(asOf, { ne = {}, neVerdictInEvidence, corruptCount = false, evidenceCount, old = OLD_NA, oldInEvidence } = {}) {
+  const runId = `mc_20260926T000000${String(++seq).padStart(3, '0')}Z_abcdef`;
+  const neItems = ne ? (ne.items || []) : [];
+  const neSec = ne ? { format: ne.format ?? 'mc-ne-v1', verdict: ne.verdict ?? (neItems.length ? 'breach' : 'pass'), blocked_reason: ne.blocked_reason ?? null, error: ne.error ?? null,
+    items: neItems, held: ne.held ?? {}, recoverable: ne.recoverable ?? [], out_of_scope: ne.out_of_scope ?? {},
+    counts: { items: corruptCount ? neItems.length + 1 : neItems.length, ne_skus: 100, by_class: { lag: neItems.length }, decisions: 0, ...(ne.extraCounts || {}) } } : undefined;
+  const res = { format: ne ? 'mc-v2' : 'mc-v1', as_of: asOf, compare_run_id: runId, verdict: 'pass', blocked_reason: null, load: { ingest_run_id: 'load_n1', started_at: `${asOf}T17:00:00Z` },
+    counts: { items: 0, by_type: {}, compared: { value: 1000 } }, items: [], compared: {}, exclusions: {}, finished_at: `${asOf}T22:11:00Z`, ...(neSec ? { ne: neSec } : {}),
+    ...(old ? { old_tables: old } : {}) };
+  const rel = `cdb-master-compare/${asOf}/${runId}.json`;
+  fs.mkdirSync(path.join(DIR, 'cdb-master-compare', asOf), { recursive: true });
+  const buf = Buffer.from(JSON.stringify(res), 'utf8');
+  fs.writeFileSync(path.join(DIR, rel), buf);
+  return { name: 'master-compare', state: 'complete', compare_run_id: runId, as_of: asOf, json_path: rel, sha256: crypto.createHash('sha256').update(buf).digest('hex'),
+    verdict: 'pass', blocked_reason: null, counts: res.counts, load: { ingest_run_id: 'load_n1' }, sync_run_id: SYNC,
+    ...(neSec ? { ne: { verdict: neVerdictInEvidence ?? neSec.verdict, blocked_reason: neSec.blocked_reason, counts: evidenceCount != null ? { ...neSec.counts, items: evidenceCount } : neSec.counts } } : {}),
+    ...(old ? { old_tables: oldInEvidence ?? { verdict: old.verdict, reason: old.reason ?? null, counts: old.counts ?? null } } : {}) };
+}
+const item = (type, norm, cls = 'lag') => ({ type, code: norm, norm, kind: 'single', subject_key: `${type}:${norm}`, classes: [cls], columns: [{ col: 'name', cls, n: 'x', c: 'y' }] });
+const pg = new PGlite(); const db = pgliteAdapter(pg);
+await applyMigrations(db, { log: quiet });
+const evFile = (asOf) => path.join(DIR, 'company-db-evidence', asOf, 'master-compare.json');
+const putEvidence = (asOf, ev) => { fs.mkdirSync(path.dirname(evFile(asOf)), { recursive: true }); fs.writeFileSync(evFile(asOf), JSON.stringify(ev)); };
+const run = (asOf, ev, nowIso, hooks) => { putEvidence(asOf, ev); return runWatch({ db, writer: db, config: CONFIG, asOf, evidence: { 'master-compare': ev }, now: new Date(nowIso), host: 'test', log: quiet, syncRunId: SYNC, hooks }); };
+const res = (r, scope) => r.results.find((x) => x.checkId === 'W13' && x.scopeKey === scope);
+const issues = async (state) => (await db.query("select subject_key from ops.watch_issues where check_id = 'W13' and scope_key = 'ne' and state = $1 order by subject_key", [state])).rows.map((x) => x.subject_key);
+
+await ta('[1] 評価キーは load と ne。ne の差 = breach (info)・案件は scope ne で開く / W13:load は ① で pass', async () => {
+  assert.deepEqual(plannedKeys(CONFIG).map((k) => k.scopeKey), ['load', 'ne', 'old']);
+  const r = await run('2026-09-27', evidenceFor('2026-09-27', { ne: { items: [item('value', 'a'), item('value', 'b', 'incomparable'), item('components', 'c'), item('kind', 'd')] } }), '2026-09-26T23:00:00Z');
+  assert.deepEqual([res(r, 'load').verdict, res(r, 'ne').verdict, res(r, 'ne').severity], ['pass', 'breach', 'info']);
+  assert.deepEqual(await issues('open'), ['components:c', 'kind:d', 'value:a', 'value:b']);
+  assert.match(res(r, 'ne').reason, /NE との差 4 件/);
+});
+
+await ta('[2] 明示の回復: recoverable = 回復 / held = 保持 (理由) / どちらにも無い = 保持 (not_confirmed) / out_of_scope = 監視期間外', async () => {
+  const r = await run('2026-09-28', evidenceFor('2026-09-28', { ne: { items: [], recoverable: ['value:a'], held: { 'value:b': 'incomparable' }, out_of_scope: { 'kind:d': 'exception_item' } } }), '2026-09-27T23:00:00Z');
+  assert.equal(res(r, 'ne').verdict, 'pass');
+  assert.deepEqual(await issues('recovered'), ['value:a']);
+  assert.deepEqual(await issues('out_of_window'), ['kind:d']);
+  assert.deepEqual(await issues('open'), ['components:c', 'value:b']);   // 回復にしない
+  const held = Object.fromEntries(r.notes.held.filter((h) => h.scopeKey === 'ne').map((h) => [h.subjectKey, h.reason]));
+  assert.deepEqual(held, { 'value:b': 'incomparable', 'components:c': 'not_confirmed' });
+});
+
+await ta('[3] ② が判定できない・落ちた・節が無い = W13:ne blocked (案件は保持)・W13:load は判定する', async () => {
+  for (const [ne, re] of [[{ verdict: 'blocked', blocked_reason: 'stale_ne' }, /判定できない \(stale_ne\)/], [{ verdict: 'error', error: 'boom' }, /落ちた \(boom\)/], [null, /節が無い/]]) {
+    const r = await run('2026-09-29', evidenceFor('2026-09-29', { ne }), '2026-09-28T23:00:00Z');
+    assert.equal(res(r, 'load').verdict, 'pass');
+    assert.equal(res(r, 'ne').verdict, 'blocked'); assert.match(res(r, 'ne').reason, re);
+    assert.deepEqual(await issues('open'), ['components:c', 'value:b']);
+  }
+});
+await ta('[3b] ① が判定できない朝でも ② は判定する (評価キーは別)', async () => {
+  const ev = evidenceFor('2026-09-29', { ne: { items: [item('value', 'b', 'incomparable'), item('components', 'c')] } });
+  const j = path.join(DIR, ev.json_path); const x = JSON.parse(fs.readFileSync(j, 'utf8'));
+  x.verdict = 'blocked'; x.blocked_reason = 'material_not_matched';
+  const buf = Buffer.from(JSON.stringify(x), 'utf8'); fs.writeFileSync(j, buf);
+  Object.assign(ev, { verdict: 'blocked', blocked_reason: 'material_not_matched', sha256: crypto.createHash('sha256').update(buf).digest('hex') });
+  const r = await run('2026-09-29', ev, '2026-09-28T23:30:00Z');
+  assert.deepEqual([res(r, 'load').verdict, res(r, 'ne').verdict], ['blocked', 'breach']);
+});
+
+await ta('[4] 証跡と全件 JSON の ② の判定・件数が食い違う = blocked', async () => {
+  let r = await run('2026-09-30', evidenceFor('2026-09-30', { ne: { items: [item('value', 'b')] }, neVerdictInEvidence: 'pass' }), '2026-09-29T23:00:00Z');
+  assert.match(res(r, 'ne').reason, /証跡と食い違う/);
+  r = await run('2026-09-30', evidenceFor('2026-09-30', { ne: { items: [item('value', 'b')] }, corruptCount: true }), '2026-09-29T23:10:00Z');
+  assert.match(res(r, 'ne').reason, /件数が食い違う/);
+  // 証跡の件数だけが違う (全件 JSON は 0 件・証跡は 99 件) = blocked (回復にしない。Codex #1472 R1)
+  r = await run('2026-09-30', evidenceFor('2026-09-30', { ne: { items: [], recoverable: ['value:b', 'components:c'] }, evidenceCount: 99 }), '2026-09-29T23:20:00Z');
+  assert.match(res(r, 'ne').reason, /件数が証跡と食い違う/);
+  assert.deepEqual(await issues('open'), ['components:c', 'value:b']);
+});
+
+await ta('[5] 朝の要約: W13:ne の案件は「NE との差 N 件 (新 M)」にまとめ、「新・継続」と明細に混ぜない', async () => {
+  const r = await run('2026-10-01', evidenceFor('2026-10-01', { ne: { items: [item('value', 'b'), item('components', 'c'), item('value', 'e'), item('value', 'f')] } }), '2026-09-30T23:00:00Z');
+  assert.match(r.lastLine, /異常 1 \(新 0 \/ 継続 0\)/);
+  assert.match(r.lastLine, /NE との差 4 件 \(新 2\)/);
+  assert.doesNotMatch(r.lastLine, /value:e/);
+  // separate が無ければ今までどおり「新」に数える
+  const s = summarize({ asOf: '2026-10-01', planned: [{}, {}], results: r.results, notes: r.notes, deadlineHit: false });
+  assert.match(s.lastLine, /新 2 \/ 継続 2/);
+});
+
+await ta('[6] ② だけが評価の途中で書き変わった = 世代の変化で読み直し、新しい ② を使う / 変わり続けた回は recoverable でも回復にしない', async () => {
+  const d = '2026-10-02';
+  // 1 回目の読みの後に、② だけが別の実行 (value:b が回復・components:c は残る) に差し替わる
+  const next = () => evidenceFor(d, { ne: { items: [item('components', 'c')], recoverable: ['value:b'] } });
+  let r = await run(d, evidenceFor(d, { ne: { items: [item('value', 'b'), item('components', 'c')] } }), '2026-10-01T23:00:00Z', { afterSnapshot: async (n) => { if (n === 1) putEvidence(d, next()); } });
+  assert.equal(r.attempts, 2);
+  assert.deepEqual(res(r, 'ne').items.map((x) => x.subjectKey), ['components:c']);
+  assert.ok((await issues('recovered')).includes('value:b') && (await issues('open')).includes('components:c'));   // 新しい ② の recoverable で value:b が回復 ([5] の value:e・f は保持のまま)
+  // 変わり続ける = 世代が落ち着かない回: recoverable にあっても回復にしない (保持 unstable)
+  await run(d, evidenceFor(d, { ne: { items: [item('components', 'c'), item('value', 'g')] } }), '2026-10-01T23:10:00Z');
+  r = await run(d, evidenceFor(d, { ne: { items: [item('components', 'c')], recoverable: ['value:g'] } }), '2026-10-01T23:20:00Z', { afterSnapshot: async () => { putEvidence(d, evidenceFor(d, { ne: { items: [item('components', 'c')], recoverable: ['value:g'] } })); } });
+  assert.equal(r.unstable, true);
+  assert.ok((await issues('open')).includes('value:g'));
+  assert.ok(r.notes.held.some((h) => h.subjectKey === 'value:g' && h.reason === 'unstable'));
+});
+
+const d0 = '2026-10-03';
+await ta('[7] 要約: 他の見張りの新しい案件・明細は残り、NE との差は別の数 / NE の差だけでも ⚠️ (breach)・② が評価できなければ ❌', async () => {
+  const results = [{ checkId: 'W6', scopeKey: 'all/jp', verdict: 'breach' }, { checkId: 'W13', scopeKey: 'ne', verdict: 'breach' }];
+  const notes = { new: [{ checkId: 'W6', scopeKey: 'all/jp', summary: 'W6 all/jp 111' }, ...Array.from({ length: 300 }, (_, i) => ({ checkId: 'W13', scopeKey: 'ne', summary: `W13 ne value:s${i}` }))],
+    continued: [], recovered: [], outOfWindow: [], held: [] };
+  const sep = REAL.SUMMARY_SEPARATE;
+  const s = summarize({ asOf: d0, planned: [{}, {}], results, notes, deadlineHit: false, separate: sep });
+  assert.match(s.lastLine, /^⚠️ .*異常 2 \(新 1 \/ 継続 0\).*NE との差 300 件 \(新 300\).* — W6 all\/jp 111 \(新\)/);
+  assert.doesNotMatch(s.lastLine, /value:s0/);
+  const onlyNe = summarize({ asOf: d0, planned: [{}], results: [{ checkId: 'W13', scopeKey: 'ne', verdict: 'breach' }], notes: { ...notes, new: notes.new.slice(1) }, deadlineHit: false, separate: sep });
+  assert.match(onlyNe.lastLine, /^⚠️ .*異常 1 \(新 0 \/ 継続 0\)/);
+  const err = summarize({ asOf: d0, planned: [{}], results: [{ checkId: 'W13', scopeKey: 'ne', verdict: 'execution_error', reason: 'x' }], notes: { new: [], continued: [], recovered: [], outOfWindow: [], held: [] }, deadlineHit: false, separate: sep });
+  assert.equal(err.icon, '❌');
+});
+
+await ta('[8] W13:old (②b 古い表): breach・overdue = 案件 / 反映待ちだけ・比べない = pass / 判定できない・節が無い・件数の食い違い = blocked (保持) / 消えた = 回復', async () => {
+  const d = '2026-10-04';
+  const oitem = (col, norm, cls, extra = {}) => ({ code: norm, norm, col, c: 1, generation_value: 1, old: 2, class: cls, why: cls === 'overdue' ? 'past_next_build' : 'generation_had_value', start_at: null, ...extra });
+  const oldOf = (items, extra = {}) => {
+    const n = (c) => items.filter((i) => i.class === c).length;
+    return { format: 'mc-old-v1', verdict: n('breach') + n('overdue') ? 'breach' : n('lag') ? 'lag' : 'pass', reason: null, cols: ['tax_class', 'reorder_months'],
+      counts: { keys: 3000, checked: 6000, breach: n('breach'), overdue: n('overdue'), lag: n('lag'), held: 0 }, items, build: { build_id: 'mpb_x' }, publish: { generation_no: 7 }, ...extra };
+  };
+  const oldIssues = async (state) => (await db.query("select subject_key from ops.watch_issues where check_id = 'W13' and scope_key = 'old' and state = $1 order by subject_key", [state])).rows.map((x) => x.subject_key);
+  let r = await run(d, evidenceFor(d, { old: oldOf([oitem('tax_class', 's-a', 'breach'), oitem('reorder_months', 's-b', 'overdue'), oitem('tax_class', 's-c', 'lag')]) }), '2026-10-03T23:00:00Z');
+  assert.deepEqual([res(r, 'old').verdict, res(r, 'old').severity, res(r, 'load').verdict], ['breach', 'info', 'pass']);
+  assert.match(res(r, 'old').reason, /古い表に C の値が入っていない 2 件 \(世代 7・作り直し mpb_x\)/);
+  assert.deepEqual(await oldIssues('open'), ['old_reorder_months:s-b', 'old_tax_class:s-a']);   // 反映待ち (s-c) は案件にしない
+  // 反映待ちだけ = pass (理由つき)・前の案件は回復
+  r = await run(d, evidenceFor(d, { old: oldOf([oitem('tax_class', 's-c', 'lag')]) }), '2026-10-03T23:10:00Z');
+  assert.deepEqual([res(r, 'old').verdict, res(r, 'old').reason], ['pass', '反映待ち 1 件 (写しの後に C を直した = 翌朝の作り直しで入る)']);
+  assert.deepEqual(await oldIssues('recovered'), ['old_reorder_months:s-b', 'old_tax_class:s-a']);
+  // 判定できない・落ちた・節が無い・形が違う・件数が食い違う・証跡と食い違う = blocked (案件は保持)
+  await run(d, evidenceFor(d, { old: oldOf([oitem('tax_class', 's-d', 'breach')]) }), '2026-10-03T23:20:00Z');
+  const cases = [
+    [{ old: oldOf([], { verdict: 'blocked', reason: 'stale_build' }) }, /判定できない \(stale_build\)/],
+    [{ old: { ...oldOf([]), verdict: 'error', error: 'boom' } }, /落ちた \(boom\)/],
+    [{ old: null }, /節が無い/],
+    [{ old: { ...oldOf([]), format: 'mc-old-v0' } }, /形が違う/],
+    [{ old: { ...oldOf([oitem('tax_class', 's-d', 'breach')]), counts: { breach: 2, overdue: 0, lag: 0 } } }, /件数が食い違う/],
+    [{ old: oldOf([oitem('tax_class', 's-d', 'breach')]), oldInEvidence: { verdict: 'breach', counts: { breach: 0, overdue: 0 } } }, /件数が証跡と食い違う/],
+    [{ old: oldOf([oitem('tax_class', 's-d', 'breach')]), oldInEvidence: { verdict: 'pass', counts: { breach: 1 } } }, /判定が証跡と食い違う/],
+  ];
+  let i = 0;
+  for (const [opt, re] of cases) {
+    r = await run(d, evidenceFor(d, opt), `2026-10-03T23:${30 + i++}:00Z`);
+    assert.equal(res(r, 'old').verdict, 'blocked', JSON.stringify(res(r, 'old')));
+    assert.match(res(r, 'old').reason, re);
+    assert.deepEqual(await oldIssues('open'), ['old_tax_class:s-d']);   // 回復にしない
+  }
+  // 比べない (持ち主が全部 load に戻った) = pass
+  r = await run(d, evidenceFor(d, {}), '2026-10-03T23:50:00Z');
+  assert.deepEqual([res(r, 'old').verdict], ['pass']);
+  assert.match(res(r, 'old').reason, /比べない \(load_owned\)/);
+});
+
+await ta('[9] ポータルで登録した新商品: NE 登録待ち (out_of_scope の reg_pending) は案件にしない・前に開いた案件は監視対象外で閉じる / 日がたった reg_stale・区分違いは案件 / 理由と観測に数', async () => {
+  const d = '2026-10-05';
+  const regIssues = async (state) => (await issues(state)).filter((k) => /:n9/.test(k));
+  // 照合を入れる前の朝 = 登録したばかりの新商品が「NE に無い」差で開いていた
+  await run(d, evidenceFor(d, { ne: { items: [item('only_in_cdb', 'n901', 'spec_undecided'), item('only_in_cdb', 'n903', 'spec_undecided')] } }), '2026-10-04T23:00:00Z');
+  assert.deepEqual(await regIssues('open'), ['only_in_cdb:n901', 'only_in_cdb:n903']);
+  // 今朝: n901 = NE 登録待ち (対象外) / n903 = 登録から 14 日以上 (reg_stale = 案件のまま) / n904 = 区分違い (案件)
+  const ne = { items: [item('only_in_cdb', 'n903', 'reg_stale'), item('kind', 'n904', 'reg_kind_mismatch')], recoverable: [],
+    out_of_scope: { 'only_in_cdb:n901': 'reg_pending', 'value:n901': 'reg_pending', 'only_in_cdb:n902': 'reg_cancelled' },
+    extraCounts: { reg_pending: 1, reg_stale: 1, reg_cancelled: 1, reg_kind_mismatch: 1, reg_partial: 0, reg_failed: 0 } };
+  const r = await run(d, evidenceFor(d, { ne }), '2026-10-04T23:10:00Z');
+  const w = res(r, 'ne');
+  assert.equal(w.verdict, 'breach');
+  assert.deepEqual(w.items.map((x) => x.subjectKey).sort(), ['kind:n904', 'only_in_cdb:n903']);   // NE 登録待ちは件数に入れない
+  assert.equal(w.itemTotal, 2);
+  assert.deepEqual(await regIssues('out_of_window'), ['only_in_cdb:n901']);   // 監視対象外 (reg_pending) で閉じる (回復でも保持でもない)
+  assert.deepEqual(await regIssues('open'), ['kind:n904', 'only_in_cdb:n903']);
+  assert.match(w.reason, /NE との差 2 件 .*NE 登録待ち 1 件 \(差に入れない\)・新商品の区分違い 1/);
+  assert.deepEqual(w.observed.reg, { pending: 1, stale: 1, cancelled: 1, kind_mismatch: 1, partial: 0, failed: 0, rejected: 0 });
+  // 差が無く NE 登録待ちだけの朝 = pass (理由に数)
+  const r2 = await run(d, evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: { 'only_in_cdb:n901': 'reg_pending' }, extraCounts: { reg_pending: 1 } } }), '2026-10-04T23:20:00Z');
+  assert.deepEqual([res(r2, 'ne').verdict, res(r2, 'ne').reason], ['pass', 'NE 登録待ち 1 件 (差に入れない)']);
+  // 照合の確かめ (回の後半) で今日 failed になった = 全件 JSON は確かめの前の数 (0)・証跡の reg_after_check が確かめの後の数 → 理由と観測は後の数 (#1635 Codex R2 Medium)
+  const ev3 = evidenceFor(d, { ne: { items: [], recoverable: [], out_of_scope: { 'only_in_cdb:n901': 'reg_pending' }, extraCounts: { reg_pending: 1, reg_failed: 0, reg_partial: 0, reg_rejected: 0 } } });
+  ev3.ne.reg_after_check = { state: 'ok', reg_failed: 1, reg_partial: 0, reg_rejected: 0 };
+  const r3 = await run(d, ev3, '2026-10-04T23:30:00Z');
+  assert.equal(res(r3, 'ne').reason, 'NE 登録待ち 1 件 (差に入れない)・新商品の取込失敗 1');
+  assert.equal(res(r3, 'ne').observed.reg.failed, 1);
+  // 確かめの後の読み直しを読めない = blocked (確かめの前の数で pass にしない・案件は保持。#1635 Codex R3)
+  const openBefore = await regIssues('open');
+  const ev4 = evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: {}, extraCounts: { reg_pending: 0, reg_failed: 0 } } });
+  ev4.ne.reg_after_check = { state: 'unreadable', reason: 'reread down', check: { failed: 1 } };
+  const r4 = await run(d, ev4, '2026-10-04T23:40:00Z');
+  assert.equal(res(r4, 'ne').verdict, 'blocked');
+  assert.match(res(r4, 'ne').reason, /確かめの後の数を読めない \(reread down\)/);
+  assert.deepEqual(await regIssues('open'), openBefore);
+  // 確かめの後の証跡を書けていない (確かめの前の完了の証跡の pending の印が残った) = blocked・保持 / skipped (確かめが何も変えていない) = 判定する (#1635 Codex R4)
+  const ev5 = evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: {}, extraCounts: { reg_pending: 0 } } });
+  ev5.ne.reg_after_check = { state: 'pending' };
+  const r5 = await run(d, ev5, '2026-10-04T23:50:00Z');
+  assert.deepEqual([res(r5, 'ne').verdict, res(r5, 'ne').reason], ['blocked', '新商品の NE 登録の確かめの後の証跡が書けていない (確かめの前の数のまま)']);
+  assert.deepEqual(await regIssues('open'), openBefore);
+  const ev6 = evidenceFor(d, { ne: { items: [], recoverable: ['only_in_cdb:n903', 'kind:n904'], out_of_scope: {}, extraCounts: { reg_pending: 0 } } });
+  ev6.ne.reg_after_check = { state: 'skipped', reason: 'seal_failed' };
+  const r6 = await run(d, ev6, '2026-10-04T23:55:00Z');
+  assert.equal(res(r6, 'ne').verdict, 'pass');
+  assert.deepEqual(await regIssues('open'), []);   // 回復 (recoverable)
+});
+
+await pg.close();
+try { fs.rmSync(DIR, { recursive: true, force: true }); } catch { /* */ }
+console.log(`\n${passed} 件 PASS`);
+process.exit(process.exitCode || 0);

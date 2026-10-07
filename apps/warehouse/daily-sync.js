@@ -13,6 +13,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
+import { isMonthStartGraceSummary, monthStartEmptyGrace, monthStartGraceDays, prevMonthOf } from './finance-dq-month-mode.js';
+import { publishGateDecision, readPublishGate, gateAfterVerify } from './publish-gate.js';
+import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry-lock.js';
+import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS } from './amazon-finance-months.js';
+import { financeCoordinatorEnabled, settlementStep, financePushStep, FINANCE_COORDINATOR_ENV, legacyGateCheck } from './finance-coordinator-switch.js';
+import { skipAfterCompare, gateRetryJobs, STEP_NAME as NEW_ENTRY_GATE_STEP } from '../company-db/master-compare/new-entry-gate.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -23,6 +29,7 @@ const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.
 // プロセス abort (libuv assertion 等、JS の catch に落ちない死に方) の時だけ残る。
 // 残骸は ①翌朝の起動時に「前回異常終了」として通知 ②bat 側の notify-crash.js が即時通知、の2段で拾う。
 const LOCK_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync.lock.json');
+const RETRY_LOCK_FILE = path.join(PROJECT_DIR, 'data', 'retry-failed-jobs.lock.json');   // retry-failed-jobs.js の lock (retry-lock.js)
 
 // この run が取得した lock の run_id。releaseLock は自分の lock だけ削除する
 // (stale 上書き後に旧 run が完走して新 run の lock を消す事故の防止 — Codex Medium #1)
@@ -81,7 +88,9 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
+// 🚨 Amazon の決済と財務は env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator「Amazon決済と財務」の 1 工程・無ければ今までの 2 工程「Amazon Settlement」→「CompanyDB財務(Amazon)」
+//   (finance-coordinator-switch.js・#1567。走るのはどちらか片方 = retry の対象には両方の名前を載せる)
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -162,7 +171,27 @@ function sleepSync(ms) {
  * @param {object} [opts]
  * @param {boolean} [opts.retryLibuvCrash=false] - true で一過性 libuv クラッシュ時のみ1回再実行
  */
+// Company DB の写しの反映が世代と違う朝 (fetch.mjs --verify-apply の exit 4) = true。その後の m_products・上書き表を読む工程を止める (publish-gate.js。④a・Codex #1564 R1 H4)
+const publishGate = { broken: false };
+// 止めた工程のうち自分で ping を打つもの (台帳の項目) = 通知の前にまとめて fail の ping を打つ
+const publishGatePings = [];
+async function flushPublishGatePings() {
+  if (!publishGatePings.length) return;
+  // 送れなくても daily-sync の通知は止めない (ok が進まない = 監視の締切で気づく)
+  try {
+    const { sendPing } = await import('../../scripts/company-db/lz-daily.mjs');
+    for (const p of publishGatePings.splice(0)) { try { await sendPing(p.jobId, { status: 'fail', note: p.note }); } catch (e) { console.warn(`[DailySync] 止めた工程の ping を送れない (${p.jobId}): ${e.message}`); } }
+  } catch (e) { console.warn(`[DailySync] 止めた工程の ping の送り手を読めない: ${e.message}`); }
+}
+
 function runScript(scriptPath, label, timeoutMs = 600000, { retryLibuvCrash = false } = {}) {
+  // 写しの反映が世代と違う朝は、m_products・上書き表を読む工程を動かさない (⚠️ 見送り・再試行に載せない)
+  const gate = publishGateDecision(scriptPath, publishGate);
+  if (gate.skip) {
+    console.log(`\n=== ${label} ===\n${gate.summary}`);
+    if (gate.pingJobId) publishGatePings.push({ jobId: gate.pingJobId, note: gate.summary.slice(0, 180) });
+    return { success: false, blocked: true, gated: true, summary: gate.summary };
+  }
   const parts = scriptPath.split(' ').filter(Boolean);
   const filePath = path.join(PROJECT_DIR, parts[0]);
   const scriptArgs = parts.slice(1);
@@ -240,6 +269,31 @@ function runScript(scriptPath, label, timeoutMs = 600000, { retryLibuvCrash = fa
     }
   }
 }
+
+/** coordinator (amazon-finance-coverage-run.js) の最後の回の記録から「この daily-sync の回で財務を送ったか」 */
+export function coordinatorPushedFinance(dataDir, runId) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(dataDir, 'amazon-finance-coverage-last.json'), 'utf8'));
+    // 送った (finance_pushed) かつ送信がそろって終わった (finance_push_ok。途中の失敗の朝は比べない = 古い Render との偽の差を数えない。#1567 R3 L2)
+    return !!(j && j.finance_pushed === true && j.finance_push_ok === true && (runId == null || j.daily_sync_run_id === runId));
+  } catch { return false; }
+}
+
+// ─── finance DQ の月初の猶予 (PR #1572。判定は finance-dq-month-mode.js の decideMonthStartEmpty) ───
+// この回のモールの取込が ❌ なら DQ に猶予を禁じる (= 当月 0 行は猶予なしで CRITICAL。取込が止まった朝に 0 行を「月初だから」と通さない)
+// 渡した結果が 1 つでも ❌ (か無い) なら禁じる。Yahoo は月初の前月の build / DQ の結果も一緒に渡す (R2)
+function monthStartGraceFlag(...results) { return results.length > 0 && results.every((r) => r && r.success) ? '' : ' --no-month-start-grace'; }
+// 月初の立ち上がり (PR #1613 R1 Medium): この回の f_sales の再構築が ❌ (打ち切り・見送りを含む) なら、listing_diff_pct の立ち上がりだけを禁じる
+// (比べる相手の f_sales_by_listing が古いと、fact が多い向きになるとは限らない)。whitelist の立ち上がりと 0 行の猶予は取込の結果 (上) だけで決める
+// R2 Medium: f_sales の再構築は NE の取込が ❌ でも流れて ✅ になりうる (古い raw_ne_orders から作り直すだけ)。listing の元の取込の結果も渡し、
+// 1 つでも ❌ (か無い) なら禁じる。元 = Yahoo・au PAY・LINE ギフト・Qoo10 は NE (rebuild-f-sales.js の raw_ne_orders) / 楽天は raw_rakuten_orders
+// (楽天の取込が ❌ の朝は monthStartGraceFlag(rkResult) で立ち上がりごと止まる = ここで渡すのは f_sales だけ)。Qoo10 は listing の立ち上がりを持たない (受けるだけ)
+function listingRampFlag(fSales, ...sources) { return [fSales, ...sources].every((r) => r && r.success) ? '' : ' --no-listing-ramp'; }
+// 1 行ごとの印: 失敗 ❌ / 見送り ⏸️ / warn つきの成功 ⚠️ (月初の猶予の DQ など。R2) / 成功 ✅
+function resultIcon(r) { return r.skipped ? '⏸️' : (r.success ? (r.warn === true ? '⚠️' : '✅') : '❌'); }
+// 月初の猶予で通した DQ (最後の行が「⚠️ 月初の猶予:」) は warn = 見出しを ⚠️ にし、通知が落ちた朝に lock を残す。
+// ほかの ⚠️ (検査の warn つきの合格「⚠️  DQ gate passed with N warning(s)」) は今までどおり warn にしない
+function dqMonthStartWarn(r) { return r.success && isMonthStartGraceSummary(r.summary); }
 
 /** Date を JST (UTC+9) の YYYY-MM-DD に変換 */
 function toJstDate(d) {
@@ -336,6 +390,8 @@ async function main() {
   // JST 固定の業務日付。子プロセスへ env で引き回す (UTC癖回避)
   const businessDate = toJstDate(startTime);
   process.env.WAREHOUSE_BUSINESS_DATE = businessDate;
+  // この回の実行 ID。送り手が証跡 (company-db-evidence) に書き、見張りは同じ ID の証跡だけを採用する (同じ日の手動実行・別の回の証跡で pass にしない。#1403 Codex R1 High)
+  process.env.DAILY_SYNC_RUN_ID = `ds_${startTime.toISOString().replace(/[-:.TZ]/g, '').slice(0, 17)}`;
   const dateStr = businessDate;
   console.log(`[DailySync] 開始: ${startTime.toISOString()} (business_date=${businessDate})`);
 
@@ -354,7 +410,8 @@ async function main() {
       try { prev = prevRaw !== null ? JSON.parse(prevRaw) : null; } catch { /* 破損 = prev null のまま残骸扱い */ }
       // 先行 run が「生きている node プロセス」なら常に中止 (ハング中でも並走は SQLite 直列書き込み前提を壊すので不可)。
       // pid 再利用の誤検知はプロセス名照合で排除。それでも残る場合は通知の手動対応案内で回収する
-      if (prev && prev.pid && isAliveNodeProcess(prev.pid)) {
+      // 🆕 2026-09-29 (#1538): そのプロセスが lock の started_at より前から動いているかも見る = pid が別の node に使い回されても毎朝止まらない
+      if (prev && prev.pid && isAliveNodeSince(prev.pid, prev.started_at)) {
         const msg = `⚠️ *Warehouse日次同期 多重起動を中止* (先行 run: pid=${prev.pid}, started_at=${prev.started_at})\n先行 run がハングしている場合はプロセス終了後に手動削除を: ${LOCK_FILE}`;
         console.error(`[DailySync] ${msg}`);
         await notify(msg);
@@ -386,6 +443,16 @@ async function main() {
     const runId = `${process.pid}-${crypto.randomUUID()}`;
     fs.writeFileSync(LOCK_FILE, JSON.stringify({ run_id: runId, pid: process.pid, started_at: startTime.toISOString(), business_date: businessDate }), { flag: 'wx' });
     myLockRunId = runId;
+    // 自動再試行の回が動いている間は走らない (retry-lock.js と対で、どちらも「自分の lock を書いた後に相手を見る」= 同時に起動しても片方は必ず気づく。#1538 Codex R1 High)。
+    //   daily-sync が優先: 再試行は daily-sync の lock を見たら必ず退く = 最大 60 秒待って、退いたら続ける (完全に同時に起動しても両方退かない。#1538 Codex R3 Medium)
+    const retryRun = await waitOtherRunGone(RETRY_LOCK_FILE);   // 持ち主 = pid が生きている node で、lock より前から動いているプロセス (retry-lock.js の isAliveNodeSince)
+    if (retryRun) {
+      releaseLock();
+      const msg = `⚠️ *Warehouse日次同期 起動を中止* 自動再試行の回が動いている (pid=${retryRun.pid}, started_at=${retryRun.started_at})。終わってから手で流す`;
+      console.error(`[DailySync] ${msg}`);
+      await notify(msg);
+      process.exit(1);
+    }
   } catch (e) {
     if (e.code === 'EEXIST') {
       // 直前の残骸回収と自分の取得の間に別プロセスが lock を取った = 多重起動レース負け
@@ -450,6 +517,33 @@ async function main() {
   // 失敗しても以降のジョブは止めない (❌通知で気付く)。
   const idemResult = runScript('apps/warehouse/test-settlement-idempotency.js', 'Settlement冪等性テスト', 120000);
   results.push({ name: 'Settlement冪等性テスト', ...idemResult });
+  // 決済レポート V2 → V1 の形の並べ直しテスト (2026-09-28。V1 廃止 2026-11-11 に向けて取込を V2 に切り替えた。一時DB・本番DBに触れない)
+  const settleV2TestResult = runScript('apps/warehouse/test-settlement-v2.js', 'Settlement V2 並べ直しテスト', 120000);
+  results.push({ name: 'Settlement V2 並べ直しテスト', ...settleV2TestResult });
+  // 決済の行の重複除去 (出現順つき) テスト (2026-09-28。同じ鍵の本物の別々の行を潰していた = 2 週間ごとに 55〜65 万円の数え落とし。4 か所を一時DBで検証)
+  const settleOccTestResult = runScript('apps/warehouse/test-settlement-dedup-occurrence.js', 'Settlement 重複除去テスト', 300000);
+  results.push({ name: 'Settlement 重複除去テスト', ...settleOccTestResult });
+  // 決済のレポートの一覧 (inventory) の記録のテスト (2026-09-30・D7b-1b の下ごしらえ。取込の後に一覧を記録・取込む行は変えない。一時DB・SP-API は差し替え)
+  const settleInvTestResult = runScript('apps/warehouse/test-settlement-inventory.js', 'Settlement 一覧テスト', 120000);
+  results.push({ name: 'Settlement 一覧テスト', ...settleInvTestResult });
+  // 決済の文書の版 (D-66)・source_revision・読み直す注文・coverage の lease のテスト (2026-10-01・D7b-1b-3。一時DB・本番DBに触れない)
+  const settleDocVerTestResult = runScript('apps/warehouse/test-settlement-document-versions.js', 'Settlement 文書の版テスト', 300000);
+  results.push({ name: 'Settlement 文書の版テスト', ...settleDocVerTestResult });
+  // 日次の財務を作り直す月の決め方のテスト (2026-09-28。当月 + 直近 35 日に決済の行が入った月 = 5 月が半分欠けた再発防止。一時DB)
+  const financeMonthsTestResult = runScript('apps/warehouse/test-amazon-finance-months.js', 'Amazon finance 作り直す月テスト', 120000);
+  results.push({ name: 'Amazon finance 作り直す月テスト', ...financeMonthsTestResult });
+  // アカウント単位の手数料の分け方のテスト (2026-09-28。新しい名前の保管料・長期保管料・返送料 / 知らない名前は ⚠️。一時DB)
+  const accountFeesTestResult = runScript('apps/warehouse/test-amazon-account-fees.js', 'Amazonアカウントフィー テスト', 120000);
+  results.push({ name: 'Amazonアカウントフィー テスト', ...accountFeesTestResult });
+  // Easy Ship の配送料を SKU に割り振るテスト (2026-09-28。日次の財務 + アカウント単位の手数料で二重にも漏れにもならない。一時DB)
+  const easyShipAllocTestResult = runScript('apps/warehouse/test-easy-ship-allocation.js', 'Easy Ship 割り振りテスト', 300000);
+  results.push({ name: 'Easy Ship 割り振りテスト', ...easyShipAllocTestResult });
+  // 日次の財務の値引きの消費税の分 (promotion_tax_jpy) のテスト (2026-09-29。Amazon 分析の税抜で引いた利益で使う。一時DB)
+  const promoTaxTestResult = runScript('apps/warehouse/test-finance-promotion-tax.js', '値引きの税の分テスト', 300000);
+  results.push({ name: '値引きの税の分テスト', ...promoTaxTestResult });
+  // 日次の財務と v4 の突き合わせ (決まりの違いを引くと残り 0・照合の関所 run-amazon-finance-dq.js の判定。2026-09-29。一時DB)
+  const v4ReconcileTestResult = runScript('apps/warehouse/test-amazon-v4-reconcile.js', 'v4 突き合わせテスト', 300000);
+  results.push({ name: 'v4 突き合わせテスト', ...v4ReconcileTestResult });
 
   // raw_*_orders_log 3本のローテ (監査PR-12(b)。保持60日+月次gzアーカイブ。
   // 実測2.3GB/4.5M行の純無限成長を停止。定常時は前日分のみで数秒)
@@ -465,6 +559,12 @@ async function main() {
   if (neResult.success) {
     const snapResult = runScript('apps/warehouse/snapshot-ne-stock.js', 'NE在庫スナップショット', 60000);
     results.push({ name: 'NE在庫snapshot', ...snapResult });
+    // Company DB (Render Postgres) へ NE の在庫の日次 (SKU 単位) を送る (Company DB構想 08 §3.3 ③ = D2b-1)。直近 14 日で Render にまだ無い日だけ・1 日 = 1 要求。
+    // 台帳は持たない (送り済みかは Render に聞く)。先に確定した日は書き換えない = 内容が違う日は ⚠️ に出るだけ。スナップショットが失敗した朝は送らない (今日の元データが無い = ❌ になるだけなので)
+    if (snapResult.success) {
+      const cdbStockNe = runScript('apps/company-db/push/stock-daily.mjs --source ne --days 14', 'Company DB 在庫日次 (NE)', 600000);
+      results.push({ name: 'CompanyDB在庫(NE)', ...cdbStockNe, warn: cdbStockNe.success && isWarnSummary(cdbStockNe.summary) });
+    }
   } else {
     console.log('[DailySync] NE API 失敗のため在庫スナップショットをスキップ');
   }
@@ -498,13 +598,29 @@ async function main() {
     console.log('[DailySync] Amazon SP-API 失敗のため Company DB 注文 push (Amazon) をスキップ');
   }
 
-  // Amazon Settlement Report raw 取得 (Phase 3.1.1)
-  // SP-API getReports で直近 14 日の Settlement を DL → raw_amazon_settlement_lines に append
-  // settlement_refresh_queue へ dirty month 追加 → 後段の mart rebuild が拾う
-  // 14日 = 1〜2 settlements、日次の差分捕捉に十分。timeout は 60 分余裕
-  // (2026-05-07 朝の cron で --days 30 default + 30分 timeout で ETIMEDOUT、過去 90 日分は手動 fetch 済)
-  const settlementResult = runScript('apps/warehouse/fetch-amazon-settlements.js --days 14', 'Amazon Settlement', 3600000);
-  results.push({ name: 'Amazon Settlement', ...settlementResult });
+  // Amazon の決済の取込 + Company DB の Amazon 財務 + 決済のそろい (coverage) = 1 工程 (2026-10-01・D7b-1b-3。設計 = AI_reference CompanyDB構想/13 §3.1)
+  //   前は「Amazon Settlement」(fetch-amazon-settlements.js) と後ろの「CompanyDB財務(Amazon)」(amazon-finance.mjs) の 2 工程 = 別のプロセスで lease を渡す規則が無かった
+  //   → coordinator (amazon-finance-coverage-run.js) が lease を持ち、① 過去の行に文書の版が無ければ ❌ で止まる (重い版付けは夜に手で migrate) ② Render の coverage を updating (失敗なら取込を始めない)
+  //   ③ 順番待ちの初期の印・手で積んだ決済のファイル → SP-API の取込 (V2・一覧を記録) ④ 財務の送信 (世代・token つき・coverage の回は --full) ⑤ 完成の判定 → complete を 1 回として回す。
+  //   財務のバックフィルの完了印の前 = 取込だけ (財務 push: ⏭️) = coverage で一度も回っていないとローカルと Render の両方で言えるときだけ (回った・判定できない = 取込もせず ❌)。
+  //   Render の決済のそろいが 404 / 409 = Render が #1561 / 0050 の前に戻った疑い = ❌ (今までの送り方 (legacy) は消した・#1567 Codex R8)。
+  //   決済の行 → settlement_refresh_queue の月 → 後段の mart rebuild・Amazon finance build が拾う (今までと同じ)。
+  //   ⚠️ = 初期の印が無いなど人が直すまで complete にしない (exit 0)・❌ = 失敗 (retry = 同じ coordinator の 1 回)・終了コード 3 = 取り込めない V2 (規則を足す)
+  //   引数を必ず渡す (runScript は引数なしだと '7' を足す)
+  // 🚨 スイッチ (#1567・finance-coordinator-switch.js): env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator。無ければ今までどおり
+  //   「Amazon Settlement」(fetch-amazon-settlements.js --days 14 = 書く取込) → 後ろの「CompanyDB財務(Amazon)」(amazon-finance.mjs) の 2 工程。
+  //   足すのは定期実行の前のハードゲート (夜に手で実の --full を 1 回) に合格した後・中原さんの指示の後 (台帳 cdb-finance-coordinator-switch・2026-11-30 までにスイッチを消す)
+  const financeCoordinator = financeCoordinatorEnabled();
+  const settleStep = settlementStep({ coordinator: financeCoordinator });
+  console.log(`[DailySync] Amazon の決済と財務: ${financeCoordinator ? 'coordinator (Amazon決済と財務)' : `今までの 2 工程 (${FINANCE_COORDINATOR_ENV} が無い)`}`);
+  // 🚨 一方向 (#1567 Codex R6 High): coordinator に切り替え済み (coverage の世代がある) なのにスイッチが無い朝は、今までの 2 工程を起動しない = ❌ (.env を直す・勝手に coordinator も起動しない)。
+  //   入口 (fetch-amazon-settlements.js / amazon-finance.mjs) も同じ門で止まる (retry・手で流したときも) = ここは朝の要約を分かりやすくするだけ
+  //   証拠 = ローカル (台帳・warehouse.db) と Render の決済のそろいの行の両方・Render を読めない = 判定できない = ❌ (#1567 Codex R7 High 1)
+  const legacyGate = financeCoordinator ? null : await legacyGateCheck({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') });
+  const settlementResult = legacyGate && !legacyGate.allowed
+    ? { success: false, summary: `❌ ${legacyGate.message}` }
+    : runScript(settleStep.cmd, settleStep.label, settleStep.timeoutMs);
+  results.push(financeCoordinator ? { name: settleStep.name, ...settlementResult, warn: settlementResult.success && isWarnSummary(settlementResult.summary) } : { name: settleStep.name, ...settlementResult });
 
   // ABA「Amazon検索用語」週次取込 (セラースプライト置換、aba.db 別建て)
   // 取込済み週は即skip・レポート未公開 (集計中) は正常skip の冪等設計なので毎朝呼んでよい。
@@ -523,9 +639,18 @@ async function main() {
   // v_amazon_sku_profit_actual_v4 view が SKU 別 contribution margin 計算に使う
   const adsProductResult = runScript('apps/warehouse/fetch-amazon-ads.js', 'Amazon Ads (SKU)', 1800000);
   results.push({ name: 'Amazon Ads (SKU)', ...adsProductResult });
+  // Company DB (Render Postgres) へ Amazon SP の広告費の日次を送る (Company DB構想 11 の ②)。取得の記録 (ads_fetch_days) がある日だけ・Render に聞いて違う日だけ・1 日 = 1 要求。
+  // 取込が失敗した朝は送らない (途中の取得を「今朝の値」として送らない)。取込は retry の対象 = 見送った送信も失敗として載せ、取込の再試行が成功した回に送る (retry-failed-jobs.js の UPSTREAM_OF)
+  if (adsProductResult.success) {
+    const cdbAdsResult = runScript('apps/company-db/push/ad-spend.mjs --mall amazon --days 35', 'Company DB 広告費 (Amazon)', 600000);
+    results.push({ name: 'CompanyDB広告費(Amazon)', ...cdbAdsResult, warn: cdbAdsResult.success && isWarnSummary(cdbAdsResult.summary) });
+  } else {
+    console.log('[DailySync] Amazon Ads (SKU) 失敗のため Company DB 広告費 (Amazon) をスキップ (取込の再試行が成功したら送る)');
+    results.push({ name: 'CompanyDB広告費(Amazon)', success: false, summary: '⏭️ skipped (Amazon Ads (SKU) の取込が失敗。取込の再試行が成功したら送る)' });
+  }
 
   // Amazon SKU手数料取得 (v2: batch API + TTL/差分更新)
-  // SP-API getMyFeesEstimates (20件/call、0.5 RPS) で fetch、未キャッシュ + TTL>7日 + 価格乖離大 のみ refresh
+  // SP-API getMyFeesEstimates (20件/call、0.5 RPS) で fetch、未キャッシュ + 期限 (SKU ごとの 6 日周期の枠の日・132 時間の境) + 価格乖離大 のみ refresh
   // 旧版の単発APIで37分タイムアウトしてた問題を解消、通常2-3分で完了 (fetch-amazon-fees.js v2 に rewrite 済)
   // SP-API 失敗時はスキップ (依存関係)、後続は継続
   if (spResult.success) {
@@ -557,6 +682,15 @@ async function main() {
   // SP-API レポート polling のため最大 15 分余裕
   const fbaSnapResult = runScript('apps/warehouse/snapshot-fba-stock.js', 'FBA在庫スナップショット', 900000);
   results.push({ name: 'FBA在庫snapshot', ...fbaSnapResult });
+  // Company DB (Render Postgres) へ FBA の在庫の日次を送る (Company DB構想 08 §3.3 ④ = D2b-2)。NE と同じ送り手 (直近 14 日で Render にまだ無い日だけ・1 日 = 1 要求・台帳なし)。
+  // RESTOCK が取れなかった日は「一部だけ取れた日 (partial)」として、FC 移管中・処理中・出荷待ち を 0 ではなく不明で送る。US は今日の行が無くても失敗にしない。
+  // スナップショットが失敗した朝は送らない (今日の元データが無い = ❌ になるだけ)
+  if (fbaSnapResult.success) {
+    for (const [src, name] of [['fba_jp', 'CompanyDB在庫(FBA)'], ['fba_us', 'CompanyDB在庫(FBA US)']]) {
+      const r = runScript(`apps/company-db/push/stock-daily.mjs --source ${src} --days 14`, `Company DB 在庫日次 (${src})`, 600000);
+      results.push({ name, ...r, warn: r.success && isWarnSummary(r.summary) });
+    }
+  }
 
   // 在庫スナップショット集計 (FBA + 自社倉庫の金額算出 → inv_daily_summary)
   // 上の NE/FBA スナップショットの後に必ず走る (失敗時も結果は no_source で記録)
@@ -584,6 +718,14 @@ async function main() {
     'apps/warehouse/backfill-yahoo-ship-date.js --days 60 --limit 60', 'Yahoo発送日 穴埋め', 300000);
   results.push({ name: 'Yahoo発送日 穴埋め', ...yahooShipDateFill });
   results.push({ name: 'Yahoo', ...yahooResult });
+  // Company DB へ Yahoo の注文を送る (08 §9 D5b-5。raw_yahoo_orders → core.orders。2026-09-26 に D-32 を「入れる」に)。取込が失敗した朝は送らない。
+  // --require-backfilled = 台帳に完了印 (0031 の適用 → 初回の投入 → 突合 → --mark-backfilled) が付くまでは送らずに「バックフィル前」と出す
+  if (yahooResult.success) {
+    const cdbYhResult = runScript('apps/company-db/push/mall-orders.mjs --mall yahoo --incremental --require-backfilled', 'Company DB 注文 push (Yahoo)', 1800000);
+    results.push({ name: 'CompanyDB注文(Yahoo)', ...cdbYhResult });
+  } else {
+    console.log('[DailySync] Yahoo 失敗のため Company DB 注文 push (Yahoo) をスキップ');
+  }
 
   // au PAY マーケット (Wow!manager API、VPS proxy 経由で遅延しやすいため 60 分)
   // Phase 1: aupay-orders.js (受注 API 全フィールド + fail-closed) に移行
@@ -630,6 +772,14 @@ async function main() {
     console.log('[DailySync] LINEギフト 失敗のため Company DB 注文 push (LINE ギフト) をスキップ');
   }
 
+  // ─── Company DB の写し (マスタ正本切替 ④a。設計 = AI_reference CompanyDB構想/15) ───
+  // 持ち主が C (Company DB) の列の値を watcher で読むだけの 1 つの取引で読み、確かめてから warehouse.db の世代の表に入れる (今の世代の印は前にしか進まない)。
+  // すぐ後の m_products 再構築が今の世代を読み、持ち主が C の列だけ C の値を重ねる。今は持ち主が全部 load = 値 0 行の世代 (しくみが毎日通ることの確かめ・m_products は変わらない)。
+  // NE が失敗した朝も取る (次の作り直しで使う)。受け入れない・取れない = ❌ + fail の ping (印は動かない = 作り直しは前の世代。持ち主が C の列があれば作り直しは止まる)。
+  // retry には載せない (m_products の作り直しも retry しない)。ok の ping は m_products 再構築の後の「反映の確かめ」だけ (台帳 cdb-master-publish)
+  const cdbPublishResult = runScript('apps/company-db/publish/fetch.mjs --daily', 'Company DB の写し', 300000);
+  results.push({ name: 'CompanyDB写し', ...cdbPublishResult, warn: cdbPublishResult.success && isWarnSummary(cdbPublishResult.summary) });
+
   // 統合商品マスタ再構築
   // NE 失敗時はスキップ: raw_ne_* が部分状態の可能性がある中で rebuild すると、
   // セット構成の欠落等が staging 件数ゲートを素通りして m_products に固定される (構造監査 H-1)。
@@ -642,14 +792,40 @@ async function main() {
     mProductResult = { success: false, summary: '⏭️ skipped (NE失敗のため、前日データ維持)' };
   }
   results.push({ name: 'm_products', ...mProductResult });
+  // Company DB の写しの反映の確かめ (④a。Codex ④ 設計 R0 #4・R1 H2): 今朝の写しの世代が今朝の作り直しで m_products・上書き表に入ったかを読み直して確かめる。
+  // 確かめられた回だけ ok の ping (台帳 cdb-master-publish)。作り直しを飛ばした朝・写しが受け入れられなかった朝 = ❌ + fail の ping (retry しない)。
+  // 🚨 exit 4 = 古い表の値が世代と違う (持ち主が C の列があるときだけ起きる) = その後の m_products・上書き表を読む工程を全部止める (違う値を配らない。publish-gate.js)
+  const cdbPublishApplyResult = runScript('apps/company-db/publish/fetch.mjs --verify-apply --daily', 'Company DB の写しの反映', 120000);
+  results.push({ name: 'CompanyDB写し反映', ...cdbPublishApplyResult, warn: cdbPublishApplyResult.success && isWarnSummary(cdbPublishApplyResult.summary) });   // ⚠️ = Company DB に無い SKU がある (NE の値のまま)
+  const cdbPublishBroken = !cdbPublishApplyResult.success && cdbPublishApplyResult.exitCode === 4;
+  // ここから後の m_products・上書き表を読む工程は runScript が止める (publish-gate.js の一覧。⚠️ 見送り・自分で ping を打つ工程は fail の ping)
+  //   正 = warehouse.db の門 (cdb_publish_gate。safe / broken / unknown) と exit 4 の両方 (どちらかが「流さない」なら止める。自動再試行・手の更新も同じ門を読む)
+  //   確かめが通らなかった (exit 1・落ちた) のに門が「確かめた safe の行」でない = この回も止める (行が無く全部 load の暗黙の safe で流さない。#1564 Codex R5 Medium)
+  const cdbPublishGateNow = readPublishGate({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') });
+  const cdbPublishGateDecision = gateAfterVerify({ apply: cdbPublishApplyResult, gate: cdbPublishGateNow });
+  publishGate.broken = cdbPublishBroken || cdbPublishGateDecision.broken;
+  publishGate.state = cdbPublishBroken ? 'broken' : cdbPublishGateDecision.state;
+  if (publishGate.broken) console.log(`[DailySync] ⚠️ Company DB の写しの反映の門 = ${publishGate.state} (exit ${cdbPublishApplyResult.exitCode ?? '-'}・${cdbPublishGateDecision.reason}) → m_products・上書き表を読む後の工程を見送る (publish-gate.js)`);
 
   // m_products 変更差分を history に記録 (trigger 廃止 → 差分バッチ化)
   // rebuild-m-products.js の直後に実行 (m_products 確定後の比較)
   const historyResult = runScript('apps/warehouse/record-m-products-history.js', 'm_products 履歴記録');
   results.push({ name: 'm_products_history', ...historyResult });
+  // Company DB (Render Postgres) へ「観測の原価」を送る (D7b-2。設計 = AI_reference CompanyDB構想/13 §3.4・D-57。受け皿 = 0046)。
+  // m_products_history から SKU × 原価の期間を全部作り直し、Render の今の世代の中身と違えば 1 要求 = 1 取引で入れ替える (台帳の連番が世代)。
+  // 🚨 履歴の記録が失敗した朝は送らず、両方を retry に載せる (記録が失敗すると、その日の原価の変化がその後の比較で見えなくなることがある = retry で記録してから送る。Codex #1549 R3 M2)。
+  //   送信の失敗も ❌ = retry に載る (世代と中身で冪等。新しい定期実行は作らない)
+  const cdbObservedResult = historyResult.success
+    ? runScript('apps/company-db/push/sku-cost-observed.mjs --send', 'Company DB 観測の原価', 600000)
+    // 写しの反映が世代と違う朝 (履歴の記録を止めた) = 観測の原価も runScript が止める (⚠️ 見送り。「履歴が失敗」とは言わない。publish-gate.js)
+    : historyResult.gated ? runScript('apps/company-db/push/sku-cost-observed.mjs --send', 'Company DB 観測の原価', 600000)
+      : { success: false, summary: '⏭️ 見送り: m_products 履歴記録が失敗 = retry で記録してから送る' };
+  results.push({ name: 'CompanyDB観測原価', ...cdbObservedResult, warn: cdbObservedResult.success && isWarnSummary(cdbObservedResult.summary) });
 
   // 販売集計テーブル再構築
-  const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築');
+  // 上限 30 分 = retry-failed-jobs.js の JOB_DEFINITIONS と同じ。ふだん 6〜7 分 (読み 2.5〜3 分 + 書き 3〜4 分) で既定の 10 分に近く、
+  // 2026-10-04 は miniPC が重く 10 分 33 秒で打ち切られ、Render 同期・当月の finance DQ・lz-daily まで止まった
+  const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築', 1800000);
   results.push({ name: 'f_sales', ...fSalesResult });
 
   // 販売速度サマリ再構築 (商品管理リスト用: FBA/FBA以外 × 7d/30d)
@@ -659,7 +835,7 @@ async function main() {
 
   // 商品管理リスト スナップショット生成 (在庫集計 + velocity の後)
   // m_products 起点で在庫/販売/利益/発注パラメータを1表に確定し published_run_id を切替。
-  const pmlSnapResult = runScript('apps/warehouse/build-product-management-snapshot.js', '商品管理リスト snapshot');
+  const pmlSnapResult = runScript('apps/warehouse/build-product-management-snapshot.js', '商品管理リスト snapshot');   // 写しの反映が世代と違う朝は runScript が止める
   results.push({ name: 'pml_snapshot', ...pmlSnapResult });
 
   // Amazon Settlement mart 再構築 (Phase 3.5)
@@ -675,7 +851,7 @@ async function main() {
   // 2. mirror_amazon_finance_sku_daily へ sync (chunk POST + ledger 記録)
   //    → entity-driven contract sync、CHUNK_SIZE=3000 (5000 で connection terminated 対策)
   //    → sync 成功時に Render rebuild trigger を内部で POST (現状 noop)
-  // 月初は前月確定値も sync 必要だが MVP は当月のみ (前月処理は将来)。
+  // どの月を作り直すかは下の financeMonths (当月 + 直近 35 日に決済の行が入った月。2026-09-28)。
   const currentMonth = businessDate.slice(0, 7); // 'YYYY-MM'
   // DATA_DIR は env 必須 (memory: feedback_db_path_cwd_dependency.md、cwd fallback で
   // worktree の stray DB 事故を起こした履歴あり、Codex Round 1 #1 対応で fail-fast 化)
@@ -697,55 +873,45 @@ async function main() {
     if (DATA_DIR_ARG.includes(' ')) {
       console.error(`[DailySync] FATAL: DATA_DIR に空白が含まれています (${DATA_DIR_ARG})。runScript の split(' ') 仕様で分解されます`);
     }
-    const amazonFinanceBuildResult = runScript(
-      `scripts/amazon-finance/build-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
-      'Amazon finance build', 600000
-    );
-    results.push({ name: 'Amazon finance build', ...amazonFinanceBuildResult });
-
-    if (amazonFinanceBuildResult.success) {
-      // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
-      if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
-      const amazonFinanceSyncResult = runScript(
-        `apps/warehouse/sync-amazon-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
-        'Amazon finance sync', 600000
-      );
-      results.push({ name: 'Amazon finance sync', ...amazonFinanceSyncResult });
-    } else {
-      // build 失敗 → sync は記録自体しない (Codex Round 1 #2 対応)。
-      // sync を success:false で push + RETRYABLE_JOBS にあると retry-failed-jobs が
-      // build を再実行せずに sync 単独 retry してしまい、古い fact を sync する事故。
-      // build を retryable に残し、sync は build 成功時のみ実行 = sync を retry 対象外にする。
-      console.log(`[DailySync] Amazon finance sync は build 失敗のため記録せず (build retry 後に翌 cron で sync 実行)`);
-    }
-
-    // === Amazon finance 前月分 build+sync (月初の settlement 追い込み反映) ===
-    // settlement は約14日周期で確定するため、月初〜中旬は前月 economic_date の行が
-    // 新規 settlement で増え続ける。従来は当月のみ (「前月処理は将来」TODO) だったため、
-    // 月初に amazon_finance_sku_daily の sync が最大2週間止まって見えていた
-    // (2026-07-07 発覚: 6/29 を最後に 1 週間 no rows in range)。
-    // 毎月 20 日までは前月分も build+sync する (snapshot 原価は UPSERT 不変なので安全)。
-    const dayOfMonth = parseInt(businessDate.slice(8, 10), 10);
-    if (dayOfMonth <= 20) {
-      const prevMonthDate = new Date(Date.UTC(
-        parseInt(currentMonth.slice(0, 4), 10),
-        parseInt(currentMonth.slice(5, 7), 10) - 2, 1
-      ));
-      const prevMonth = `${prevMonthDate.getUTCFullYear()}-${String(prevMonthDate.getUTCMonth() + 1).padStart(2, '0')}`;
-      const prevBuildResult = runScript(
-        `scripts/amazon-finance/build-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${prevMonth}`,
-        'Amazon finance build (前月)', 600000
-      );
-      results.push({ name: 'Amazon finance build (前月)', ...prevBuildResult });
-      if (prevBuildResult.success) {
-        const prevSyncResult = runScript(
-          `apps/warehouse/sync-amazon-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${prevMonth}`,
-          'Amazon finance sync (前月)', 600000
-        );
-        results.push({ name: 'Amazon finance sync (前月)', ...prevSyncResult });
+    // 🚨 どの月を作り直すか (2026-09-28): 当月 + 直近 35 日 (FINANCE_DIRTY_DAYS) に決済の行が入った月 + やり残し (前の回に失敗した月。成功するまで持ち越す)
+    //   = apps/warehouse/amazon-finance-months.js。旧 = 当月 + 毎月 20 日までは前月 (2026-07-07 #453)。それ以前は当月だけで、5 月の日次の財務が半分欠けたままだった
+    //   (5/18〜5/31 の行を含む決済が 6/3 着)。月末をまたぐ決済は翌月 1〜15 日に締まる = 20 日までの余裕が 5 日ほどしかなかった。
+    //   月を決められなければ 当月 + 前月 + やり残し に戻り ⚠️ (止めない・全部 OK には数えない)。
+    //   当月は今まで通り 'Amazon finance build' / 'Amazon finance sync' の名前。ほかの月は名前に月を付ける。
+    //   失敗した月は retry-failed-jobs には載らない (build の --month が動的) = やり残しとして翌朝に持ち越す
+    const plan = planFinanceMonths(process.env.DATA_DIR, { currentMonth });
+    const financeMonths = plan.months;
+    console.log(`[DailySync] Amazon finance を作り直す月: ${financeMonths.join(', ')} (当月 + 直近 ${FINANCE_DIRTY_DAYS} 日に決済の行が入った月 + やり残し)${plan.notes.length ? ' / ' + plan.notes.join(' / ') : ''}`);
+    if (plan.warn) results.push({ name: 'Amazon finance 作り直す月', success: true, warn: true, summary: `⚠️ ${plan.notes.join(' / ')} (作り直した月: ${financeMonths.join(', ')})` });
+    // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
+    if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
+    const financeFailed = [];
+    const financeBuildFailed = [];   // build (SQLite の日次の財務) が失敗した月 = Company DB との突き合わせの比べる側が古い (sync の失敗は SQLite に関係しない)
+    for (const month of financeMonths) {
+      const isCurrent = month === currentMonth;
+      const buildName = isCurrent ? 'Amazon finance build' : `Amazon finance build (${month})`;
+      const syncName = isCurrent ? 'Amazon finance sync' : `Amazon finance sync (${month})`;
+      const buildResult = runScript(`scripts/amazon-finance/build-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${month}`, buildName, 600000);
+      results.push({ name: buildName, ...buildResult });
+      if (buildResult.success) {
+        const syncResult = runScript(`apps/warehouse/sync-amazon-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${month}`, syncName, 600000);
+        results.push({ name: syncName, ...syncResult });
+        if (!syncResult.success) financeFailed.push(month);
       } else {
-        console.log(`[DailySync] Amazon finance sync (前月) は build 失敗のためスキップ`);
+        // build 失敗 → sync は記録自体しない (Codex Round 1 #2 対応)。
+        // sync を success:false で push + RETRYABLE_JOBS にあると retry-failed-jobs が
+        // build を再実行せずに sync 単独 retry してしまい、古い fact を sync する事故。
+        // 失敗した月はやり残しとして翌朝に持ち越す (build + sync が両方通るまで)。
+        financeFailed.push(month);
+        financeBuildFailed.push(month);
+        console.log(`[DailySync] ${syncName} は build 失敗のため記録せず (やり残しとして翌朝に持ち越す)`);
       }
+    }
+    try {
+      const left = writePendingMonths(process.env.DATA_DIR, financeFailed, { attempted: financeMonths });
+      if (left.length) console.log(`[DailySync] Amazon finance のやり残し (翌朝に持ち越す): ${left.join(', ')}`);
+    } catch (e) {
+      results.push({ name: 'Amazon finance 作り直す月', success: true, warn: true, summary: `⚠️ やり残しを書けない (${e.message}) = 失敗した月 ${financeFailed.join(', ') || 'なし'} は 35 日のあいだだけ持ち越す` });
     }
 
     // === Amazon Ads mirror sync (amazon-dashboard PR-A) ===
@@ -780,19 +946,75 @@ async function main() {
     // === Amazon アカウント単位フィー月次 (amazon-dashboard PR-C) ===
     // 保管料/長期在庫追加手数料/返送等の SKU 無しフィーを月次集計して mirror へ。
     // raw settlement は上の fetch-amazon-settlements.js で更新済みの前提 (失敗時も前回分で再集計、冪等)。
+    // ふだん 14 か月。Company DB との突き合わせで月の手数料に差が出た月 (amazon-account-fees-pending.json) があれば その月までさかのぼる (2026-09-29 F2b-2)。
+    //   やり残しは build と sync の両方が通った後にだけ消す (日次の財務のやり残しと同じ約束)
+    let feesPlan;
+    try { feesPlan = accountFeesMonthsBack(process.env.DATA_DIR, { currentMonth }); }
+    catch (e) { feesPlan = { months: ACCOUNT_FEES_BASE_MONTHS, fromMonth: null, pending: [], covered: [], warn: true, notes: [`月の手数料のやり残しを読めない (${e.message})`] }; }
+    // 始まりの月を明示で渡す (daily-sync の途中で月をまたいでも、build / sync の範囲が計画と同じ = covered を消し損ねない。#1534 Codex R3 Medium)
+    const feesRange = feesPlan.fromMonth ? `--from-month ${feesPlan.fromMonth}` : `--months ${feesPlan.months}`;
+    if (feesPlan.notes.length) console.log(`[DailySync] Amazonアカウントフィー: ${feesPlan.notes.join(' / ')}`);
+    if (feesPlan.warn) results.push({ name: 'Amazonアカウントフィー やり残し', success: true, warn: true, summary: `⚠️ ${feesPlan.notes.join(' / ')}` });
     const accountFeesBuildResult = runScript(
-      `apps/warehouse/rebuild-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months 14`,
+      `apps/warehouse/rebuild-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} ${feesRange}`,
       'Amazonアカウントフィー build', 300000
     );
-    results.push({ name: 'Amazonアカウントフィー build', ...accountFeesBuildResult });
+    // 分けられない SKU なしの取引 (名前が変わった手数料の疑い) があれば最後の行が ⚠️ = 成功だが「全部 OK」に数えない (2026-09-28: 7 月から保管料の名前が変わって 0 になっていた)
+    results.push({ name: 'Amazonアカウントフィー build', ...accountFeesBuildResult, warn: accountFeesBuildResult.success && isWarnSummary(accountFeesBuildResult.summary) });
     if (accountFeesBuildResult.success) {
       const accountFeesSyncResult = runScript(
-        `apps/warehouse/sync-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months 14`,
+        `apps/warehouse/sync-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} ${feesRange}`,
         'Amazonアカウントフィー sync', 300000
       );
       results.push({ name: 'Amazonアカウントフィー sync', ...accountFeesSyncResult });
+      if (accountFeesSyncResult.success && feesPlan.covered.length) {
+        try {
+          const left = writePendingMonths(process.env.DATA_DIR, [], { attempted: feesPlan.covered, file: ACCOUNT_FEES_PENDING_FILE });
+          console.log(`[DailySync] Amazonアカウントフィー: やり残し ${feesPlan.covered.join(', ')} を作り直した (残り ${left.join(', ') || 'なし'})`);
+        } catch (e) {
+          results.push({ name: 'Amazonアカウントフィー やり残し', success: true, warn: true, summary: `⚠️ 月の手数料のやり残しを消せない (${e.message}) = 次の朝も同じ月を作り直す` });
+        }
+      }
     } else {
       console.log('[DailySync] Amazonアカウントフィー sync は build 失敗のためスキップ');
+    }
+
+    // === Company DB の Amazon 財務 (F2b-3。設計 = AI_reference CompanyDB構想/12 §5) ===
+    // スイッチが無い朝 (今までどおり): 決済の行を 注文 × 計上日 × SKU × 行の種類 にまとめて Company DB (0043) へ。
+    //   日曜は --full・ほかは --incremental。バックフィルの完了印の前はどちらも「⏭️ バックフィル前」(exit 0)。送信の失敗・送れない鍵 / 行 = ❌ (retry = --full)。拾われない金額 = ⚠️。
+    //   決済の取込 (Amazon Settlement) が失敗した朝は送らない (途中・古い raw を送らない)。見送りも失敗として retry に載せ、取込の再試行が成功した回に送る
+    //   (retry-failed-jobs.js の UPSTREAM_OF。#1536 Codex R1 Medium)。🚨 token の無い chunk = Render は Amazon 財務の complete を無効にする (coordinator の回で作り直す)
+    const pushStep = financePushStep(businessDate, { coordinator: financeCoordinator });
+    let cdbFinanceResult = null;
+    if (pushStep && settlementResult.success) {
+      cdbFinanceResult = runScript(pushStep.cmd, pushStep.label, pushStep.timeoutMs);
+      results.push({ name: pushStep.name, ...cdbFinanceResult, warn: cdbFinanceResult.success && isWarnSummary(cdbFinanceResult.summary) });
+    } else if (pushStep) {
+      cdbFinanceResult = { success: false, summary: '⏭️ skipped (Amazon Settlement の取込が失敗。取込の再試行が成功したら送る)' };
+      results.push({ name: pushStep.name, ...cdbFinanceResult });
+    }
+
+    // === Company DB の Amazon 財務の突き合わせ (F2b-3。設計 = AI_reference CompanyDB構想/12 §5) ===
+    // 🆕 2026-10-01 (D7b-1b-3): スイッチがある朝は、財務の送信は上の「Amazon決済と財務」(coordinator) の中 (無い朝は上の「CompanyDB財務(Amazon)」)。
+    //   ここは送った後の SQLite (日次の財務・月の手数料) と Render を比べるだけ。差の月は日次の財務 / 月の手数料のやり残しに登録 (次の朝の build が作り直す)。
+    //   差が 1 回目 ⚠️・2 回続けば ❌。突き合わせは retry に載せない (差の続いた回数を数えている = retry のたびに数が進む。送信が retry で通った朝は、翌朝の突き合わせで見る)
+    // 突き合わせは実際に送った朝だけ (バックフィル前の「財務 push: ⏭️」・coordinator の失敗の朝は起動しない。#1536 Codex R1 Low)。
+    //   比べる側 (SQLite の日次の財務・月の手数料) の build が今朝失敗していれば比べない = 古い SQLite との偽の差でやり残しと「差が続いた回数」を進めない (#1536 Codex R2 Medium)。
+    //   失敗した build の月はやり残しとして翌朝に作り直される = 翌朝の突き合わせで見る
+    const financeSqliteFresh = financeBuildFailed.length === 0 && accountFeesBuildResult.success;
+    // 送ったかは coordinator の小さな記録 (DATA_DIR/amazon-finance-coverage-last.json) の構造の値で決める (要約の文字で決めない・#1567 R1 L3)。
+    //   同じ daily-sync の回 (DAILY_SYNC_RUN_ID) の記録で finance_pushed = true のときだけ。読めない = 見送る (安全側)
+    //   coordinator が coverage の理由で exit 1 でも、財務を送った朝は突き合わせる (#1567 R2 L2)
+    //   スイッチが無い朝は今までどおり = 送り手の工程が成功し、要約が「⏭️」(バックフィル前) でない朝だけ
+    const financeSent = financeCoordinator
+      ? coordinatorPushedFinance(process.env.DATA_DIR, process.env.DAILY_SYNC_RUN_ID)
+      : !!(cdbFinanceResult && cdbFinanceResult.success && !String(cdbFinanceResult.summary || '').trimStart().startsWith('⏭️'));
+    if (!financeSqliteFresh) console.log(`[DailySync] Company DB Amazon 財務の突き合わせはスキップ (比べる側の build が失敗: 日次の財務 ${financeBuildFailed.join(', ') || 'OK'} / 月の手数料 ${accountFeesBuildResult.success ? 'OK' : '失敗'})`);
+    if (financeSqliteFresh && financeSent) {
+      const cdbFinanceRecResult = runScript('apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled', 'Company DB Amazon 財務 突き合わせ', 600000);
+      results.push({ name: 'CompanyDB財務突合(Amazon)', ...cdbFinanceRecResult, warn: cdbFinanceRecResult.success && isWarnSummary(cdbFinanceRecResult.summary) });
+    } else {
+      console.log('[DailySync] Company DB Amazon 財務の突き合わせはスキップ (送信の失敗・見送り・バックフィル前。送信が retry で通ったら翌朝に見る)');
     }
 
     // === 楽天 finance daily fact (Phase 1a #R-3c、#R-1 + #R-2 + #R-3a 統合) ===
@@ -808,10 +1030,10 @@ async function main() {
 
     if (rakutenFinanceBuildResult.success) {
       const rakutenFinanceDqResult = runScript(
-        `apps/warehouse/run-rakuten-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+        `apps/warehouse/run-rakuten-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}${monthStartGraceFlag(rkResult)}${listingRampFlag(fSalesResult)}`,
         '楽天 finance DQ', 300000
       );
-      results.push({ name: '楽天 finance DQ', ...rakutenFinanceDqResult });
+      results.push({ name: '楽天 finance DQ', ...rakutenFinanceDqResult, warn: dqMonthStartWarn(rakutenFinanceDqResult) });
 
       if (rakutenFinanceDqResult.success) {
         // CHUNK_SIZE は Amazon と共有 (上で 3000 set 済)
@@ -1002,11 +1224,40 @@ async function main() {
     results.push({ name: 'Yahoo finance build', ...yahooFinanceBuildResult });
 
     if (yahooFinanceBuildResult.success) {
+      // 月初の猶予の間は前月も build → DQ → sync する (PR #1572 R1/R2)。Yahoo の build は 1 か月だけ = 前月の終わりの止まり・品質を
+      // 月初に見る機会がほかに無い。当月の DQ (前月の新しさを見る) より先に前月を作り直す。
+      // 前月の build か DQ が ❌ なら、当月の DQ に猶予を禁じる (前月を安全の証拠に使えない朝は 0 行を通さない。R2)。
+      // 前月の DQ が通れば前月も sync する (作り直した前月を Render にも送る = SQLite と Render の前月がずれたままにならない。ほかのモールの 3 か月の sync と同じ)
+      const yahooPrevSteps = [];
+      if (monthStartEmptyGrace(currentMonth, { now: startTime, graceDays: monthStartGraceDays('yahoo', currentMonth) }).grace) {
+        const yahooPrevYm = prevMonthOf(currentMonth);
+        const yahooPrevBuild = runScript(
+          `scripts/yahoo-finance/build-yahoo-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${yahooPrevYm}`,
+          `Yahoo finance build ${yahooPrevYm} (月初の前月)`, 600000
+        );
+        yahooPrevSteps.push(yahooPrevBuild);
+        results.push({ name: `Yahoo finance build ${yahooPrevYm} (月初の前月)`, ...yahooPrevBuild });
+        if (yahooPrevBuild.success) {
+          const yahooPrevDq = runScript(
+            `apps/warehouse/run-yahoo-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${yahooPrevYm}`,
+            `Yahoo finance DQ ${yahooPrevYm} (月初の前月)`, 300000
+          );
+          yahooPrevSteps.push(yahooPrevDq);
+          results.push({ name: `Yahoo finance DQ ${yahooPrevYm} (月初の前月)`, ...yahooPrevDq, warn: dqMonthStartWarn(yahooPrevDq) });
+          if (yahooPrevDq.success) {
+            const yahooPrevSync = runScript(
+              `apps/warehouse/sync-yahoo-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${yahooPrevYm}`,
+              `Yahoo finance sync ${yahooPrevYm} (月初の前月)`, 600000
+            );
+            results.push({ name: `Yahoo finance sync ${yahooPrevYm} (月初の前月)`, ...yahooPrevSync });
+          }
+        }
+      }
       const yahooFinanceDqResult = runScript(
-        `apps/warehouse/run-yahoo-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+        `apps/warehouse/run-yahoo-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}${monthStartGraceFlag(yahooResult, ...yahooPrevSteps)}${listingRampFlag(fSalesResult, neResult)}`,
         'Yahoo finance DQ', 300000
       );
-      results.push({ name: 'Yahoo finance DQ', ...yahooFinanceDqResult });
+      results.push({ name: 'Yahoo finance DQ', ...yahooFinanceDqResult, warn: dqMonthStartWarn(yahooFinanceDqResult) });
 
       if (yahooFinanceDqResult.success) {
         const yahooFinanceSyncResult = runScript(
@@ -1042,10 +1293,10 @@ async function main() {
       });
       for (const ym of aupayRollingMonths) {
         const aupayFinanceDqResult = runScript(
-          `apps/warehouse/run-aupay-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+          `apps/warehouse/run-aupay-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(aupayResult)}${listingRampFlag(fSalesResult, neResult)}`,
           `au PAY finance DQ ${ym}`, 300000
         );
-        results.push({ name: `au PAY finance DQ ${ym}`, ...aupayFinanceDqResult });
+        results.push({ name: `au PAY finance DQ ${ym}`, ...aupayFinanceDqResult, warn: dqMonthStartWarn(aupayFinanceDqResult) });
 
         if (aupayFinanceDqResult.success) {
           const aupayFinanceSyncResult = runScript(
@@ -1082,10 +1333,10 @@ async function main() {
       });
       for (const ym of linegiftRollingMonths) {
         const linegiftFinanceDqResult = runScript(
-          `apps/warehouse/run-linegift-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+          `apps/warehouse/run-linegift-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(linegiftResult)}${listingRampFlag(fSalesResult, neResult)}`,
           `LINEギフト finance DQ ${ym}`, 300000
         );
-        results.push({ name: `LINEギフト finance DQ ${ym}`, ...linegiftFinanceDqResult });
+        results.push({ name: `LINEギフト finance DQ ${ym}`, ...linegiftFinanceDqResult, warn: dqMonthStartWarn(linegiftFinanceDqResult) });
 
         if (linegiftFinanceDqResult.success) {
           const linegiftFinanceSyncResult = runScript(
@@ -1140,10 +1391,10 @@ async function main() {
       });
       for (const ym of qoo10RollingMonths) {
         const qoo10FinanceDqResult = runScript(
-          `apps/warehouse/run-qoo10-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+          `apps/warehouse/run-qoo10-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}${monthStartGraceFlag(qoo10Result)}${listingRampFlag(fSalesResult, neResult)}`,
           `Qoo10 finance DQ ${ym}`, 300000
         );
-        results.push({ name: `Qoo10 finance DQ ${ym}`, ...qoo10FinanceDqResult });
+        results.push({ name: `Qoo10 finance DQ ${ym}`, ...qoo10FinanceDqResult, warn: dqMonthStartWarn(qoo10FinanceDqResult) });
 
         if (qoo10FinanceDqResult.success) {
           const qoo10FinanceSyncResult = runScript(
@@ -1205,7 +1456,9 @@ async function main() {
   let syncResult;
   const fSalesOk = fSalesResult.success;
   const skuMapOk = rakutenSkuMapResult.success;
-  if (fSalesOk && skuMapOk) {
+  if (publishGate.broken) {
+    syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');   // runScript が止める (⚠️ 見送り。publish-gate.js)
+  } else if (fSalesOk && skuMapOk) {
     syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');
   } else {
     const reasons = [];
@@ -1479,10 +1732,44 @@ async function main() {
 
   // ─── retry-state 書き込み (リトライ対象の失敗があれば) ───
 
-  const retryableFailed = results
+  // ─── Company DB の見張り (設計 = AI_reference CompanyDB構想/09。全部の push の後・要約の前) ───
+  // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
+  // 判定 4 値 (pass / breach / blocked / execution_error) で「そろっているか → おかしくないか」を出す。🚨 「行がある = そろっている」と読まない。
+  // 業務の異常を見つけたら exit 0 (⚠️ = warn) = 異常のたびに再実行させない。見張り自身の失敗 (評価できない・DB に届かない) だけ ❌ (retry の対象)。env が無ければ ⏭️ (Dark Launch)
+  // ─── マスタ照合 ①ロードの検証 + ②NE との照合 (Company DB構想 10 §6.1.1 B・C2。見張りの前 = 見張りの W13 がこの証跡を読む) ───
+  // 最新の夜間ロードが実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直して Company DB と比べる (読むだけ)。
+  // 差がある・判定できない は ⚠️ (exit 0)。照合そのものの失敗だけ ❌ (retry。Render同期 が retry で直ったら照合 → 見張りも走らせ直す = RERUN_AFTER)
+  const masterCompareResult = runScript('apps/company-db/master-compare/run.mjs --daily', 'マスタ照合', 300000);
+  results.push({ name: 'マスタ照合', ...masterCompareResult, warn: masterCompareResult.success && isWarnSummary(masterCompareResult.summary) });
+
+  // ─── 新商品の許可 (照合 ② の次の 1 段・計画 newentry_min_plan.md §3 の 2・PR-7。新しい定期実行ではない) ───
+  // その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ = 単品の新商品をポータルで開ける (〜翌日 07:00)。
+  // 照合が失敗・見送り = 流さない (入口は照合の始めで閉じたまま。retry で照合が直ったら RERUN_AFTER でこの段も流す)。照合 ② が判定できない回はこの段が grant を呼ばない。
+  // 接続 COMPANY_DB_NEW_ENTRY_GATE_URL が無い・関数が無い (0058 の前) = 飛ばして要約に一言 (exit 0)。拒まれた = 新しい接続で revoke → 閉じたのを確かめて理由つきで閉・❌
+  // (確かめられない = ⚠️ 状態不明)。失敗した朝の retry は「マスタ照合」からやり直す (下の gateRetryJobs)
+  const newEntryGateSkip = skipAfterCompare(masterCompareResult);
+  if (newEntryGateSkip) results.push(newEntryGateSkip);
+  else {
+    const newEntryGateResult = runScript('apps/company-db/master-compare/new-entry-gate.mjs --daily', NEW_ENTRY_GATE_STEP, 120000);
+    results.push({ name: NEW_ENTRY_GATE_STEP, ...newEntryGateResult, warn: newEntryGateResult.success && isWarnSummary(newEntryGateResult.summary) });
+  }
+
+  // ─── ロジザードの毎日の商品マスタ (影。マスタ正本切替 ③c-1a。設計 = AI_reference CompanyDB構想/10 §6.3「③c 契約 v1〜v3」) ───
+  // Company DB の値で作り、NE の取得の値から作ったもの (GAS と同じ変換と確かめ済み) と突き合わせる。**まだロジザードに取り込まない**。
+  // マスタ照合の後 (その朝の照合の全件 JSON と元のコードの印を使う)。作れた = ✅ / ⚠️ (exit 0)。材料が欠ける = ⏭️ (exit 3 = 失敗として retry に載る)。
+  // 作ること自体の失敗 = ❌ (exit 1・retry)。作れた回だけ lz-daily.mjs が自分で ok の ping (台帳 lz-daily-build)
+  const lzDailyResult = runScript('scripts/company-db/lz-daily.mjs --daily', 'ロジザード毎日の商品マスタ(影)', 300000);
+  results.push({ name: 'ロジザード毎日の商品マスタ(影)', ...lzDailyResult, warn: lzDailyResult.success && isWarnSummary(lzDailyResult.summary) });
+
+  const watchResult = runScript('apps/company-db/watch/run.mjs', 'Company DB 見張り', 300000);
+  results.push({ name: 'CompanyDB見張り', ...watchResult, warn: watchResult.success && isWarnSummary(watchResult.summary) });
+
+  // 「新商品の許可」が失敗した朝は「マスタ照合」も載せる (拒まれた後の revoke で停止の床が進む = 同じ照合の回では開かない。
+  //   retry は新しい照合の回で close → record → grant の順。#1645 Codex R1 Medium・gateRetryJobs)
+  const retryableFailed = gateRetryJobs(results
     // blocked:true は「失敗だが構成不備等で retry しても無駄」なので除外 (Codex Round 3 #medium)
     .filter(r => RETRYABLE_JOBS.includes(r.name) && !r.success && !r.blocked)
-    .map(r => r.name);
+    .map(r => r.name));
 
   let retryStateWritten = false;
   let retryStateError = null;
@@ -1494,6 +1781,7 @@ async function main() {
       fs.writeFileSync(RETRY_STATE_FILE, JSON.stringify({
         run_date: dateStr,
         started_at: startTime.toISOString(),
+        daily_sync_run_id: process.env.DAILY_SYNC_RUN_ID,   // retry の回も同じ ID で証跡を書く (見張りの retry が朝の証跡と結びつく)
         remaining_jobs: retryableFailed,
         retry_count: 0,
         last_attempt_at: null,
@@ -1540,12 +1828,16 @@ async function main() {
   const icon = allOk ? '✅' : '⚠️';
   let msg = `${icon} *Warehouse日次同期 ${dateStr}* (${duration}秒)\n`;
   for (const r of results) {
-    const icon = r.skipped ? '⏸️' : (r.success ? '✅' : '❌');
+    const icon = resultIcon(r);
     msg += `${icon} ${r.name}: ${r.summary}\n`;
   }
   if (retryableFailed.length > 0) {
     if (retryStateWritten) {
-      msg += `\n🔄 自動再試行予定: ${retryableFailed.join(', ')} を本日 8:30 / 10:00 / 11:30 JST に再実行\n`;
+      // 残っている再試行の時刻だけを書く。11:30 を過ぎていれば その日は自動で再試行されない = 手で (翌朝の再試行は別日の state を消す。#1538 Codex R1 High)
+      const slots = remainingRetrySlots(new Date());
+      msg += slots.length
+        ? `\n🔄 自動再試行予定: ${retryableFailed.join(', ')} を本日 ${slots.join(' / ')} JST に再実行\n`
+        : `\n⚠️ 本日の自動再試行 (8:30 / 10:00 / 11:30) の時刻は過ぎている = ${retryableFailed.join(', ')} は自動で再試行されない。手で流す\n`;
     } else {
       msg += `\n⚠️ retry-state 書き込み失敗 (${retryStateError})、自動再試行されません。手動対応必要\n`;
     }
@@ -1571,6 +1863,7 @@ async function main() {
   if (notifyMsg.length > GCHAT_MAX) {
     notifyMsg = notifyMsg.slice(0, GCHAT_MAX) + `\n…[本文を切り詰めました。全文は daily-sync ログ参照]`;
   }
+  await flushPublishGatePings();   // 写しの反映が世代と違う朝に止めた工程の fail の ping (自分で ping を打つ工程だけ)
   const notifyOk = await notify(notifyMsg);
 
   console.log(`[DailySync] 完了: ${endTime.toISOString()}`);

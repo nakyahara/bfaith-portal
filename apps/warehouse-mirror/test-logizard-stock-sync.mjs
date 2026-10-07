@@ -104,6 +104,36 @@ console.log('\n── /api/status に件数と時刻が出る ──');
   eq(s.logizard_stock_count, 1, '件数');
   eq(s.logizard_stock_captured_at, '2026-08-16T04:00:00.000Z', 'captured_at (--logizard-only の送信後検証が使う)');
   ok(!!s.logizard_stock_synced_at, '最終同期時刻');
+  eq(s.logizard_stock_source_at, null, '素性を送らない古い送り手の世代は source_at が null');
+}
+
+console.log('\n── ブロック引当順と世代の素性 (2026-09-25) ──');
+{
+  const CAP = '2026-08-16T06:00:00.000Z';
+  const r = await post({ logizard_stock: {
+    captured_at: CAP, source_at: '2026-08-16T05:40:00.000Z', rows_read: 3, skipped_rows: 1,
+    rows: [row({ ロケ: 'A-0', ブロック引当順: '0' }), row({ ロケ: 'A-2', ブロック引当順: '2' })],
+  } });
+  eq(r.status, 200, '素性つきで受ける');
+  const orders = db.prepare('SELECT ロケ, ブロック引当順 FROM mirror_logizard_stock ORDER BY ロケ').all().map((x) => [x['ロケ'], x['ブロック引当順']]);
+  eq(orders, [['A-0', '0'], ['A-2', '2']], '🚨 ブロック引当順は 0 も 0 のまま保存 (9999 に化けない)');
+  const m = db.prepare('SELECT captured_at, source_at, rows_read, skipped_rows, row_count FROM mirror_logizard_stock_meta WHERE id = 1').get();
+  eq([m.captured_at, m.source_at, m.rows_read, m.skipped_rows, m.row_count], [CAP, '2026-08-16T05:40:00.000Z', 3, 1, 2], '世代の素性が行と同じ世代で入る');
+  const s = await (await fetch(`${base}/api/status`)).json();
+  eq([s.logizard_stock_source_at, s.logizard_stock_rows_read, s.logizard_stock_skipped_rows], ['2026-08-16T05:40:00.000Z', 3, 1], '/api/status に出る');
+}
+{
+  const bad = async (extra, label) => {
+    const r = await post({ logizard_stock: { captured_at: '2026-08-16T07:00:00.000Z', rows: [row()], ...extra } });
+    ok(r.status === 400, `${label} → 400 (実際 ${r.status})`);
+  };
+  await bad({ source_at: '2026-08-16T07:30:00.000Z' }, '在庫を取った時刻が取り込み完了より後');
+  await bad({ source_at: 'きのう' }, '在庫を取った時刻が日時でない');
+  await bad({ rows_read: -1 }, '行数が負');
+  await bad({ skipped_rows: 1.5 }, '読み飛ばし行数が整数でない');
+  eq(count(), 2, '拒否しても既存の世代は残る');
+  const m = db.prepare('SELECT captured_at FROM mirror_logizard_stock_meta WHERE id = 1').get();
+  eq(m.captured_at, '2026-08-16T06:00:00.000Z', '拒否しても世代の素性は前のまま');
 }
 
 await new Promise((r) => server.close(r));

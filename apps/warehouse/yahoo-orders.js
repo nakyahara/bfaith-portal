@@ -10,6 +10,9 @@
  * デフォルト: 直近7日分
  */
 import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseStringPromise } from 'xml2js';
 import { initDB, getDB, updateSyncMeta } from './db.js';
 
@@ -141,8 +144,8 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       total_price, pay_charge, ship_charge, discount, use_point,
       line_id, item_id, title, sub_code,
       unit_price, original_price, quantity, item_tax_ratio, coupon_discount,
-      ingested_at, ship_date, social_gift_type
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ingested_at, ship_date, social_gift_type, mall_coupon_discount
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   const deleteCurrentOrder = db.prepare('DELETE FROM raw_yahoo_orders WHERE order_id = ?');
@@ -152,8 +155,8 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       total_price, pay_charge, ship_charge, discount, use_point,
       line_id, item_id, title, sub_code,
       unit_price, original_price, quantity, item_tax_ratio, coupon_discount,
-      synced_at, ship_date, social_gift_type
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      synced_at, ship_date, social_gift_type, mall_coupon_discount
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   let logCount = 0, currentCount = 0;
@@ -211,6 +214,14 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       const shipCharge = parseFloat(detail.ShipCharge || orderInfo.ShipCharge) || 0;
       const discount = parseFloat(detail.Discount || orderInfo.Discount) || 0;
       const usePoint = parseFloat(detail.UsePoint || orderInfo.UsePoint) || 0;
+      // モールクーポンの値引き額 (2026-09-26 に VPS の Field に足した)。🚨 応答に無い・空なら NULL (= 未取得・値なし。0 にしない。公式の応答例にも空の要素がある) / 数でなければ注文を skip (欠落を 0 にしない)
+      const _mcText = String(detail.TotalMallCouponDiscount ?? orderInfo.TotalMallCouponDiscount ?? '').trim();
+      const mallCouponDiscount = _mcText === '' ? null : (/^\d+(\.\d+)?$/.test(_mcText) ? Number(_mcText) : NaN);
+      if (mallCouponDiscount !== null && !Number.isFinite(mallCouponDiscount)) {
+        console.log(`[Yahoo] skip ${orderId}: TotalMallCouponDiscount が数でない ('${_mcText}')`);
+        skippedInvalid++;
+        continue;
+      }
 
       // 商品明細
       let items = orderInfo.Item || orderInfo.Items?.Item || [];
@@ -223,12 +234,21 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       }
 
       // 明細必須 field validation (item_id / quantity / unit_price のいずれか欠落で注文 skip)
+      // 🚨 取消 (OrderStatus 4) の明細は数量 0 で返る。以前は数量 0 を一律 skip していたため、後から取り消された注文が raw に届かず
+      //   取消前の状態のまま残っていた (2026-09-26 に発覚: 毎朝 10 件前後が「qty=0」で skip。Company DB への Yahoo の注文の送信 #1465 の Codex R1)。
+      //   → 取消の注文だけ数量 0 を受ける。数量が空・数でない・負は取消でも skip (欠落を 0 にしない)
+      //   + 取消でない注文でも、ほかの明細に数量 1 以上があれば、数量 0 の明細は「その明細だけ取り消された」(一部取消) として受ける
+      //     (2026-09-28 に発覚: 完了の注文の 1 明細だけが数量 0 = 合計はほかの明細の和と一致 → skip していたので raw が古いまま = モール負担 null が残り、Yahoo の売上日次の公開を止めていた)。
+      //     数量 0 の明細しか無い取消でない注文は、何が起きたか分からないので今まで通り skip
       let itemValid = true;
+      const cancelledOrder = String(orderStatus).trim() === '4';
+      const hasLiveLine = items.some((it) => /^\d+$/.test(String(it.Quantity ?? '').trim()) && Number(String(it.Quantity).trim()) > 0);
       for (const item of items) {
         const _itemId = item.ItemId || '';
-        const _qty = parseInt(item.Quantity) || 0;
+        const _qtyText = String(item.Quantity ?? '').trim();
+        const _qty = /^\d+$/.test(_qtyText) ? Number(_qtyText) : -1;
         const _price = parseFloat(item.UnitPrice) || 0;
-        if (!_itemId || _qty <= 0 || _price <= 0) {
+        if (!_itemId || _qty < 0 || (_qty === 0 && !cancelledOrder && !hasLiveLine) || _price <= 0) {
           console.log(`[Yahoo] skip ${orderId}: item field empty (item_id='${_itemId}' qty=${_qty} price=${_price})`);
           itemValid = false;
           break;
@@ -260,7 +280,7 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
           totalPrice, payCharge, shipCharge, discount, usePoint,
           lineId, itemId, title, subCode,
           unitPrice, originalPrice, quantity, itemTaxRatio, couponDiscount,
-          ts, shipDate, socialGiftType
+          ts, shipDate, socialGiftType, mallCouponDiscount
         );
         logCount++;
 
@@ -270,7 +290,7 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
           totalPrice, payCharge, shipCharge, discount, usePoint,
           lineId, itemId, title, subCode,
           unitPrice, originalPrice, quantity, itemTaxRatio, couponDiscount,
-          ts, shipDate, socialGiftType
+          ts, shipDate, socialGiftType, mallCouponDiscount
         );
         currentCount++;
       }
@@ -455,10 +475,14 @@ async function main() {
   }
 }
 
-// mall-orders.jsから呼び出せるようにexport
-export { fetchYahoo, backfill };
+// mall-orders.jsから呼び出せるようにexport。insertOrders は試験用 (scripts/test-yahoo-orders-cancel.mjs)
+export { fetchYahoo, backfill, insertOrders };
 
-main().catch(e => {
+// 直接起動のときだけ動く (試験から import しても取得が走らない)。junction / 大文字小文字の違いは realpath で吸収 (retry-failed-jobs.js と同じ形・Codex #1369)
+const realPath = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
+const foldCase = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+const isMain = !!process.argv[1] && foldCase(realPath(process.argv[1])) === foldCase(realPath(fileURLToPath(import.meta.url)));
+if (isMain) main().catch(e => {
   console.error('[Yahoo] エラー:', e.message);
   process.exit(1);
 });

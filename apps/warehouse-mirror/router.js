@@ -13,11 +13,16 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError, logizardStockInitError, skuMapInitError } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError, logizardStockInitError, skuMapInitError, skuMapGenerationInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
 } from '../../lib/rakuten-dd-columns.js';
+import { MATERIAL_ID_RE, MATERIAL_HASH_RE, MATERIAL_COLUMNS, materialDigest, cleanMaterialText, validMaterialSemantics } from '../warehouse/material-lineage.js';
+import {
+  planSkuMapPair, applySkuMapGeneration, SkuMapReject, skuMapRejectBody, readSkuMapState, stateForResponse, SKU_MAP_RECEIVER_CAPABILITY,
+  skuMapReceiverSettings,
+} from './sku-map-generation.js';
 
 // 楽天データダウンロード7種の列合成 (mall-csv-fetcher P1-R3。miniPC側と共有定義)
 const DD_STORE_ALL_COLS = [...STORE_DEVICE_BASE_COLS, ...STORE_BENCH_COLS, ...STORE_DEVICE_OPT_COLS];
@@ -81,9 +86,60 @@ router.use(ensureDB);
 // ─── POST /api/sync ───
 // ミニPCからデータを受信して一括反映
 
+/**
+ * 材料の世代の形を確かめる (③a-1)。products / set_components ごとに、形がおかしい部分は null (= その部分は記録しない)。
+ * 両方おかしければ null。時刻は制御文字を含まない短い文字列か null だけ (それ以外を SQLite に渡すと例外 → 写しの入れ替えごと巻き戻る。Codex R1 High-2。
+ * NUL を含む文字列は SQLite には入るが夜間ロードの PostgreSQL が拒む。Codex R2 M-1)
+ */
+export function validMaterialGeneration(g) {
+  if (!g || typeof g !== 'object' || Array.isArray(g)) return null;
+  if (typeof g.generation_id !== 'string' || !MATERIAL_ID_RE.test(g.generation_id)) return null;
+  const tsOk = (v) => cleanMaterialText(v) !== undefined;
+  if (!tsOk(g.created_at)) return null;
+  const part = (p) => (p && typeof p === 'object' && Number.isInteger(p.row_count) && p.row_count >= 0
+    && typeof p.content_hash === 'string' && MATERIAL_HASH_RE.test(p.content_hash) && tsOk(p.source_complete_at)
+    ? { row_count: p.row_count, content_hash: p.content_hash, source_complete_at: p.source_complete_at ?? null, semantics: validMaterialSemantics(p.semantics) } : null);
+  const products = part(g.products), set_components = part(g.set_components);
+  if (!products && !set_components) return null;
+  return { generation_id: g.generation_id, created_at: g.created_at ?? null, products, set_components };
+}
+
 router.post('/api/sync', requireSyncKey, (req, res) => {
   const db = getMirrorDB();
   const { products, set_components, sales_monthly, sales_daily, meta } = req.body;
+  // 材料の世代 (Company DB構想 10 §6 / ③a-1)。写しの入れ替えは止めない (古い送り手・壊れた世代でも業務は続く)
+  const materialGen = validMaterialGeneration(req.body.material_generation);
+  // 入れ替えた entity ごとの記録の結果 (応答の material_recorded。送り手が「Render 到達済み」の証跡にする。Company DB構想 10 §6.1.1 A3)
+  const materialRecorded = {};
+  /**
+   * 入れ替えと同じ取引で呼ぶ。入れた中身から同じ規則 (material-lineage.js) でハッシュを出し直し、世代と合うときだけ記録する。
+   * 記録できないとき (世代なし = 古い送り手 / 形がおかしい / 中身が合わない / 書けない) は **前の世代の記録を消す**
+   * (消さないと、夜間ロードが今の中身を前の世代として記録してしまう。Codex R1 High-1)
+   */
+  const recordGeneration = (entity, table) => {
+    const g = materialGen?.[entity];
+    let reason = null;
+    if (!g) reason = req.body.material_generation === undefined ? '世代なし (古い送り手)' : '世代の形がおかしい';
+    else {
+      const stored = db.prepare(`SELECT ${MATERIAL_COLUMNS[entity].map((c) => `"${c}"`).join(', ')} FROM ${table}`).all();
+      const d = materialDigest(entity, stored);
+      if (d.row_count !== g.row_count || d.content_hash !== g.content_hash) reason = `入れた中身が世代と合わない (行数 ${d.row_count} / 世代 ${g.row_count})`;
+    }
+    if (!reason) {
+      try {
+        db.prepare(`INSERT INTO mirror_material_generations (entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at, semantics)
+          VALUES (?,?,?,?,?,?,?,?)
+          ON CONFLICT(entity) DO UPDATE SET generation_id = excluded.generation_id, content_hash = excluded.content_hash, row_count = excluded.row_count,
+            source_complete_at = excluded.source_complete_at, created_at = excluded.created_at, received_at = excluded.received_at, semantics = excluded.semantics`)
+          .run(entity, materialGen.generation_id, g.content_hash, g.row_count, g.source_complete_at, materialGen.created_at, now, g.semantics ?? null);
+        materialRecorded[entity] = { recorded: true, generation_id: materialGen.generation_id, content_hash: g.content_hash, row_count: g.row_count };
+        return;
+      } catch (e) { reason = `記録に失敗: ${e.message}`; }
+    }
+    db.prepare('DELETE FROM mirror_material_generations WHERE entity = ?').run(entity);
+    materialRecorded[entity] = { recorded: false, reason };
+    log.push(`material_generation: ${entity} は記録しない (${reason}) → 前の世代の記録を消した`);
+  };
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const log = [];
 
@@ -95,6 +151,42 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     if (others.length > 0) {
       return res.status(400).json({ error: `logizard_stock は単独で送信してください (同時指定: ${others.join(', ')})` });
     }
+  }
+
+  // Amazon SKU の対 (sku_master / sku_resolved) の世代 (PR ⑦-0。Company DB構想 16 §7 H1 / §8 契約 v3)。
+  //   **他の表より先に** 決める = 断るとき (409 / 422 / 503) はこの body の何も書かない (「HTTP は失敗なのに一部だけ反映」を作らない)。
+  //   有効になる前の世代なしは skuMapPlan.mode = 'legacy' で下の旧い分岐が今までどおり扱う (応答も今までどおり)。
+  //   世代つきは SKU の対だけの単独の POST (他の表があれば 422)。2 表・状態・同期の印を 1 つの取引で入れて、ここで応答する (下の表の処理には進まない)
+  const skuMapPlan = planSkuMapPair(db, req.body, { initError: skuMapGenerationInitError });
+  if (skuMapPlan.mode === 'reject') {
+    console.warn(`[Mirror] SKU の対を断った: ${skuMapPlan.code} — ${skuMapPlan.message}`);
+    return res.status(skuMapPlan.status).json(skuMapRejectBody(skuMapPlan));
+  }
+  if (skuMapPlan.mode === 'generation') {
+    let skuMapResult;
+    try {
+      skuMapResult = applySkuMapGeneration(db, skuMapPlan, {
+        syncedAt: now,
+        // 同期の印 (last_sync・meta) は下の表の処理と同じ書き方で、対と同じ取引に (対が入らなければ印も進まない)
+        recordInSameTx: () => {
+          const upsert = db.prepare('INSERT OR REPLACE INTO mirror_sync_status (key, value, updated_at) VALUES (?,?,?)');
+          upsert.run('last_sync', now, now);
+          if (meta) for (const [k, v] of Object.entries(meta)) upsert.run(k, String(v), now);
+        },
+      });
+    } catch (e) {
+      if (e instanceof SkuMapReject && e.status !== 500) {
+        console.warn(`[Mirror] SKU の対を断った: ${e.code} — ${e.message}`);
+        return res.status(e.status).json(skuMapRejectBody({ status: e.status, code: e.code, message: e.message, extra: e.extra }));
+      }
+      const code = e instanceof SkuMapReject ? e.code : 'sku_map_apply_failed';
+      console.error(`[Mirror] SKU の対の世代の反映に失敗 (巻き戻した・何も書いていない): ${code} — ${e.message}`);
+      return res.status(500).json({ error: code, message: e.message, sku_map: { part: 'sku_map', result: 'failed', code, capability: SKU_MAP_RECEIVER_CAPABILITY } });
+    }
+    log.push(`sku_map: ${skuMapResult.result} (世代 ${skuMapResult.generation}・親 ${skuMapResult.master_rows}件・構成 ${skuMapResult.component_rows}件)`);
+    try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
+    console.log('[Mirror] 同期完了 (SKU の対だけ):', log.join(', '));
+    return res.json({ ok: true, log, synced_at: now, sku_map: skuMapResult });
   }
 
   try {
@@ -121,6 +213,7 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
             p.new_product_flag ?? 0, p.new_product_launch_date ?? null,
             now);
         }
+        recordGeneration('products', 'mirror_products');   // 入れ替えと同じ取引
       });
       tx();
       log.push(`products: ${products.length}件`);
@@ -136,6 +229,7 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
         for (const c of set_components) {
           stmt.run(c.セット商品コード, c.構成商品コード, c.数量, c.構成商品名, c.構成商品原価, now);
         }
+        recordGeneration('set_components', 'mirror_set_components');   // 入れ替えと同じ取引
       });
       tx();
       log.push(`set_components: ${set_components.length}件`);
@@ -157,7 +251,8 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     //   過去事故 (2026-05-08〜10 Yahoo proxy regression で mirror 全空 / 2026-05-06 worktree 別 DB 分裂) の再発防止。
     const hasResolved = req.body.sku_resolved !== undefined && Array.isArray(req.body.sku_resolved);
     const hasMaster = req.body.sku_master !== undefined && Array.isArray(req.body.sku_master);
-    if (hasResolved || hasMaster) {
+    // 世代つき (⑦-0) は上で入れ済み / 断り済み。ここは有効になる前の世代なし (legacy) だけ
+    if (skuMapPlan.mode === 'legacy' && (hasResolved || hasMaster)) {
       const resolved = hasResolved ? req.body.sku_resolved : null;
       const masterRows = hasMaster ? req.body.sku_master : null;
       const resolvedClear = req.body.meta?.clear_sku_resolved === true;
@@ -424,6 +519,19 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       if (!Number.isFinite(capturedMs) || capturedMs > Date.now() + 24 * 3600 * 1000) {
         return res.status(400).json({ error: 'logizard_stock.captured_at が日時として不正です (ISO形式・未来すぎない値が必要)' });
       }
+      // 在庫を取った時刻の下限 (無い送り手 = 古い miniPC のコードは null のまま受ける)。未来すぎ・取り込み完了より後は拒否
+      let sourceMs = null;
+      if (p.source_at !== undefined && p.source_at !== null) {
+        sourceMs = typeof p.source_at === 'string' ? Date.parse(p.source_at) : NaN;
+        if (!Number.isFinite(sourceMs) || sourceMs > capturedMs || sourceMs > Date.now() + 5 * 60 * 1000) {
+          return res.status(400).json({ error: `logizard_stock.source_at が不正です (${p.source_at}。取り込み完了 ${p.captured_at} より前・未来でない ISO 日時が必要)` });
+        }
+      }
+      for (const k of ['rows_read', 'skipped_rows']) {
+        if (p[k] !== undefined && p[k] !== null && !(Number.isInteger(p[k]) && p[k] >= 0)) {
+          return res.status(400).json({ error: `logizard_stock.${k} は 0 以上の整数である必要があります (${p[k]})` });
+        }
+      }
       const rows = p.rows;
       // 全置換なので空配列は受けない (取得失敗による全消しの防御。倉庫在庫ゼロは現実に起きない)
       if (rows.length === 0) {
@@ -458,8 +566,8 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
         db.exec('DELETE FROM mirror_logizard_stock');
         const stmt = db.prepare(`INSERT INTO mirror_logizard_stock (
           商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
-          在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, captured_at, synced_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+          在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, ブロック引当順, captured_at, synced_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
         for (const r of rows) {
           stmt.run(
             r['商品ID'], r['商品名'] ?? null, r['バーコード'] ?? null,
@@ -467,9 +575,18 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
             r['有効期限'] ?? null, r['入荷日'] ?? null,
             r['在庫数'], r['引当数'],
             r['ロケ業務区分'] ?? null, r['最終入荷日'] ?? null, r['最終出荷日'] ?? null,
-            r['在庫日'] ?? null, p.captured_at, now
+            r['在庫日'] ?? null,
+            // 0 は有効な引当順 (|| にしない)。空文字は「無い」
+            (r['ブロック引当順'] === undefined || r['ブロック引当順'] === null || r['ブロック引当順'] === '') ? null : String(r['ブロック引当順']),
+            p.captured_at, now
           );
         }
+        // 世代の素性も同じトランザクションで (行と meta がずれた状態を見せない)
+        db.prepare(`INSERT INTO mirror_logizard_stock_meta (id, captured_at, source_at, rows_read, skipped_rows, row_count, synced_at)
+          VALUES (1, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET captured_at = excluded.captured_at, source_at = excluded.source_at,
+            rows_read = excluded.rows_read, skipped_rows = excluded.skipped_rows, row_count = excluded.row_count, synced_at = excluded.synced_at`)
+          .run(p.captured_at, sourceMs === null ? null : new Date(sourceMs).toISOString(), p.rows_read ?? null, p.skipped_rows ?? null, rows.length, now);
       });
       tx();
       log.push(`logizard_stock: ${rows.length}件`);
@@ -678,11 +795,33 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
 
     console.log('[Mirror] 同期完了:', log.join(', '));
-    res.json({ ok: true, log, synced_at: now });
+    res.json({ ok: true, log, synced_at: now, ...(Object.keys(materialRecorded).length ? { material_recorded: materialRecorded } : {}) });
   } catch (e) {
     console.error('[Mirror] 同期エラー:', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─── GET /api/sync/sku-map/state ───
+// 送り手 (⑦-2) が世代つきで送る前に「受け手が世代を分かるか・今の世代はいくつか」を確かめる口 (HTTP 200 だけに頼らない)。
+//   **200 で** capability.sku_map_generations = 1 と format が合うときだけ世代つきで送る。state.generation は 10 進の文字列 (bigint)。
+//   初期化が途中で落ちた・状態が読めない・表が無い = 503 で capability を出さない (世代つきの body も 503 で断る)。
+//   receiver = Render の env (SKU_MAP_ACTIVATION_ALLOWED / SKU_MAP_REQUIRE_GENERATION) の今の値 (手順書の確かめ用)。
+//   Company DB を戻したときの世代の付け直し (max(PG, miniPC, Render) より大きく) にも使う。認証は /api/sync と同じ (x-sync-key)
+router.get('/api/sync/sku-map/state', requireSyncKey, (req, res) => {
+  const db = getMirrorDB();
+  const receiver = skuMapReceiverSettings();
+  if (skuMapGenerationInitError) {
+    return res.status(503).json({ error: 'sku_map_init_failed', message: '世代の表の初期化に失敗している (再起動で直らなければ手順書)', init_error: skuMapGenerationInitError, receiver });
+  }
+  let s;
+  try { s = readSkuMapState(db); } catch (e) {
+    return res.status(503).json({ error: 'sku_map_state_unavailable', message: e.message, receiver });
+  }
+  if (!s.available) {
+    return res.status(503).json({ error: 'sku_map_state_unavailable', message: '世代の状態の表が無い', receiver });
+  }
+  res.json({ ok: true, capability: SKU_MAP_RECEIVER_CAPABILITY, state: stateForResponse(s), receiver });
 });
 
 // ─── Phase 1 #1-4a: POST /api/sync/:entity/chunk (entity-driven contract sync) ───
@@ -748,7 +887,7 @@ function getAmazonFinanceInsert(db) {
         shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy,
         warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
         refund_principal_jpy, reversal_reimbursement_jpy,
-        misc_fee_jpy, other_fee_jpy, other_amount_jpy,
+        misc_fee_jpy, other_fee_jpy, other_amount_jpy, easy_ship_jpy, promotion_tax_jpy, points_jpy,
         unit_cost_snapshot, cost_snapshot_date_jst, latest_unit_cost_reference,
         cogs_amount, profit_amount, is_cost_complete, cost_status,
         source_run_id, source_row_hash, synced_at
@@ -761,7 +900,7 @@ function getAmazonFinanceInsert(db) {
         @shipping_chargeback_jpy, @giftwrap_chargeback_jpy, @promotion_jpy,
         @warehouse_damage_jpy, @warehouse_lost_jpy, @safe_t_jpy,
         @refund_principal_jpy, @reversal_reimbursement_jpy,
-        @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy,
+        @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy, @easy_ship_jpy, @promotion_tax_jpy, @points_jpy,
         @unit_cost_snapshot, @cost_snapshot_date_jst, @latest_unit_cost_reference,
         @cogs_amount, @profit_amount, @is_cost_complete, @cost_status,
         @source_run_id, @source_row_hash, @synced_at
@@ -2938,7 +3077,7 @@ function normalizeRakutenFinanceRow(r) {
 }
 
 // row 列正規化 (mirror_amazon_finance_sku_daily 用)
-function normalizeAmazonFinanceRow(r) {
+export function normalizeAmazonFinanceRow(r) {   // export = 試験用 (test-account-fees-easy-ship.mjs)
   return {
     date_jst: r.date_jst, seller_sku: r.seller_sku, asin_norm: r.asin_norm || '',
     product_name: r.product_name || '',
@@ -2966,6 +3105,9 @@ function normalizeAmazonFinanceRow(r) {
     misc_fee_jpy: r.misc_fee_jpy ?? 0,
     other_fee_jpy: r.other_fee_jpy ?? 0,
     other_amount_jpy: r.other_amount_jpy ?? 0,
+    easy_ship_jpy: r.easy_ship_jpy ?? 0,   // 2026-09-28 (古い miniPC からは来ない = 0)
+    points_jpy: r.points_jpy ?? 0,   // 2026-09-29 (出品者が付けたポイント。古い miniPC からは来ない = 0 = その行の profit_amount もポイントを引いていない)
+    promotion_tax_jpy: r.promotion_tax_jpy ?? null,   // 2026-09-29 (値引きの消費税の分。古い miniPC からは来ない = NULL = 画面で「未取得」)
     unit_cost_snapshot: r.unit_cost_snapshot ?? null,
     cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
     latest_unit_cost_reference: r.latest_unit_cost_reference ?? null,
@@ -3157,7 +3299,7 @@ function normalizeRakutenStoreDailyRow(r) {
 }
 
 // row 列正規化 (mirror_amazon_account_fees_monthly 用、amazon-dashboard PR-C)
-const ACCOUNT_FEE_TYPES = new Set(['storage', 'long_term_storage', 'removal', 'inbound_defect', 'low_inventory', 'subscription', 'other_account_fee']);
+const ACCOUNT_FEE_TYPES = new Set(['storage', 'long_term_storage', 'removal', 'inbound_defect', 'low_inventory', 'subscription', 'easy_ship', 'other_account_fee']);   // easy_ship = 2026-09-28
 function normalizeAmazonAccountFeesRow(r) {
   const feeType = requireAdKey(r, 'fee_type');
   if (!ACCOUNT_FEE_TYPES.has(feeType)) {
@@ -3800,6 +3942,13 @@ router.get('/api/status', (req, res) => {
       status.logizard_stock_count = r.cnt;
       status.logizard_stock_captured_at = r.captured_at;
       status.logizard_stock_synced_at = r.synced_at;
+      // meta が読めなくても件数の検証 (送信後の突き合わせ) は壊さない
+      try {
+        const m = db.prepare('SELECT source_at, rows_read, skipped_rows, row_count FROM mirror_logizard_stock_meta WHERE id = 1').get();
+        status.logizard_stock_source_at = m?.source_at ?? null;
+        status.logizard_stock_rows_read = m?.rows_read ?? null;
+        status.logizard_stock_skipped_rows = m?.skipped_rows ?? null;
+      } catch { status.logizard_stock_source_at = null; }
     } catch {
       status.logizard_stock_count = 0;
     }

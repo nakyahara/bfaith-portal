@@ -13,6 +13,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
+import { createSettlementVersionSchema } from './amazon-settlement-versions.js';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'warehouse.db');
@@ -88,6 +89,23 @@ function createTables() {
     発注残数            INTEGER,
     synced_at           TEXT
   )`);
+  // NE の元の値 (Company DB構想 10 §6.1.1 C1。Codex ③a-2 C-R0 #3): 取込は parseFloat(x) || 0 で空欄と 0 を区別せずに保存する → 元の値を JSON の文字列で残す (neSrc)。
+  //   '""' = 空文字 / '"0"' = 文字列のゼロ / '0' = 数値のゼロ / 'null' = API が null。SQL の NULL = 元の値の記録が無い (足す前の行・その回に取れなかった行)。数値の列から逆算しない
+  addColumnIfMissing('raw_ne_products', '原価_src', 'TEXT');
+  addColumnIfMissing('raw_ne_products', '売価_src', 'TEXT');
+  addColumnIfMissing('raw_ne_products', '消費税率_src', 'TEXT');
+  // 代表商品コード (D3。Codex D3-R0 H1): 取込は (x || '') で保存する = 項目の欠落も空になる → 元の値を残し、「明示の空」(送る形の '') と「不明」(NULL) を分ける
+  addColumnIfMissing('raw_ne_products', '代表商品コード_src', 'TEXT');
+  // NE のコードの元の書き方 (③b-1b。Company DB構想 10 §6.1.1「③b-1b の契約 v3」): NE のコードは大文字・小文字を区別するのに、取込は小文字にして保存する = 元の書き方が raw に残らない。
+  //   取得のたびに、保存 (上書き) の前に書き方の集合を数えて残す (ABC と abc が両方来ても、保存の後では片方しか残らない)。
+  //   kind = single (商品の goods_id) / rep (商品の代表) / set (セットの親) / child (セットの子) / set_rep (セットの代表)。code_norm = raw と同じ小文字のコード。
+  //   spellings = 元の書き方の JSON の配列 (並べ替え済み・重複なし)。書き方を集め終えた印 = ne_code_spelling_marks (取得の完了の印と同じ取引・0 件でも付く)
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_code_spellings (
+    synced_at TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('single', 'rep', 'set', 'child', 'set_rep')), code_norm TEXT NOT NULL, spellings TEXT NOT NULL,
+    PRIMARY KEY (synced_at, kind, code_norm))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS ne_code_spelling_marks (
+    side TEXT NOT NULL CHECK (side IN ('products', 'sets')), synced_at TEXT NOT NULL, version TEXT NOT NULL, rows INTEGER NOT NULL, recorded_at TEXT NOT NULL,
+    PRIMARY KEY (side, synced_at))`);
 
   // 2. NE受注明細（追記蓄積、重複排除）
   db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_orders (
@@ -172,6 +190,12 @@ function createTables() {
     PRIMARY KEY (セット商品コード, 商品コード)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_set_parent ON raw_ne_set_products(セット商品コード)');
+  // NE の元の値 (raw_ne_products と同じ契約。数量は parseInt(x) || 1 で不正と 1 を区別しないため)
+  addColumnIfMissing('raw_ne_set_products', 'セット販売価格_src', 'TEXT');
+  addColumnIfMissing('raw_ne_set_products', '数量_src', 'TEXT');
+  // NE のセット商品の作成日 (set_goods_creation_date。親ごとの値を構成の行それぞれに持つ)。商品管理リストの snapshot の 登録日 (セット) の材料。
+  //   API の取込だけが書く (CSV の取込・古い行は NULL = 分からない)
+  addColumnIfMissing('raw_ne_set_products', '作成日', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_set_child ON raw_ne_set_products(商品コード)');
 
   // 4. ロジザード在庫（全件洗い替え）
@@ -366,6 +390,8 @@ function createTables() {
     const cols = db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
     if (!cols.includes('ship_date')) db.exec(`ALTER TABLE ${t} ADD COLUMN ship_date TEXT`);
     if (!cols.includes('social_gift_type')) db.exec(`ALTER TABLE ${t} ADD COLUMN social_gift_type TEXT`);
+    // 2026-09-26: モールクーポンの値引き額 (TotalMallCouponDiscount)。NULL = 未取得・値なし (この列より前の取込か、応答が空) / 0 = モールクーポンなし
+    if (!cols.includes('mall_coupon_discount')) db.exec(`ALTER TABLE ${t} ADD COLUMN mall_coupon_discount REAL`);
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_order ON raw_yahoo_orders(order_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_date ON raw_yahoo_orders(order_time)');
@@ -788,6 +814,114 @@ function createTables() {
     updated_at        TEXT NOT NULL,
     PRIMARY KEY (セット商品コード, 構成商品コード)
   )`);
+
+  // 16b. m_products_builds — m_products の作り直しの記録 (Company DB構想 10 §6.1.1 / ③a-2 の A1。apps/warehouse/master-material.js)
+  //   rebuild-m-products.js が入れ替えと同じ取引で 1 行書く = 読んだ NE の完了印 (途中で変わった・無い = null + note)・
+  //   送る形 (m_products + raw の代表商品コード) の中身のハッシュ・SKU ごとの採用理由 (JSON)。sync-to-render はハッシュが同じときだけ由来を送る。60 日残す
+  db.exec(`CREATE TABLE IF NOT EXISTS m_products_builds (
+    build_id                   TEXT PRIMARY KEY,
+    daily_sync_run_id          TEXT,
+    started_at                 TEXT NOT NULL,
+    published_at               TEXT NOT NULL,
+    ne_products_complete_at    TEXT,
+    ne_products_mark_note      TEXT,
+    ne_setproducts_complete_at TEXT,
+    ne_setproducts_mark_note   TEXT,
+    products_rows              INTEGER NOT NULL,
+    products_hash              TEXT NOT NULL,
+    set_components_rows        INTEGER NOT NULL,
+    set_components_hash        TEXT NOT NULL,
+    rule_version               TEXT NOT NULL,
+    reason_counts              TEXT NOT NULL,
+    reasons                    TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS ix_m_products_builds_published ON m_products_builds (published_at)');
+  // 作り直しが信用した NE の印の通し番号 (C1。照合 ② は「作り直しの材料 = 比べる NE」を時刻と番号の組で確かめる)。信用しなかった回・前の記録は NULL
+  addColumnIfMissing('m_products_builds', 'ne_products_complete_rev', 'INTEGER');
+  addColumnIfMissing('m_products_builds', 'ne_setproducts_complete_rev', 'INTEGER');
+  // 作り直しが使った Company DB の写しの世代 (④a。持ち主が全部 load の日は、持ち主が同じ今の世代 = 値 0 行)。前の記録・世代が無い回は NULL。
+  //   applied_hash = 入れた後に読み直した「持ち主が C の列の値」のハッシュ (次の工程 fetch.mjs --verify-apply が読み直して同じか確かめる)
+  addColumnIfMissing('m_products_builds', 'cdb_publish_generation_no', 'INTEGER');
+  addColumnIfMissing('m_products_builds', 'cdb_publish_generation_id', 'TEXT');
+  addColumnIfMissing('m_products_builds', 'cdb_publish_content_hash', 'TEXT');
+  addColumnIfMissing('m_products_builds', 'cdb_publish_applied_hash', 'TEXT');
+  // 使った世代の持ち主の設定のハッシュ = 今使っている epoch (この記録は作り直しの取引が通ったときだけ入る = 通らなければ epoch は進まない。Codex R1 H1)
+  addColumnIfMissing('m_products_builds', 'cdb_publish_ownership_hash', 'TEXT');
+  // 16b-2. Company DB の写し (マスタ正本切替 ④a。設計 = AI_reference CompanyDB構想/15 §3。apps/warehouse/master-publish.js)
+  //   書くのは apps/company-db/publish/fetch.mjs (daily-sync の「Company DB の写し」)。持ち主が C の列の値を、確かめてから 1 取引で世代ごとに入れる。
+  //   今の世代 = sync_meta 'cdb_publish_current' (verified のときだけ・前にしか進まない)。読むのは rebuild-m-products.js。14 世代残す (今の世代は消さない)
+  db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_generations (
+    generation_no      INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation_id      TEXT NOT NULL UNIQUE,
+    cdb_read_at        TEXT NOT NULL,
+    version_watermark  INTEGER,
+    watermark_fingerprint TEXT,
+    load_run_id        TEXT,
+    load_commit_seq    INTEGER,
+    ownership          TEXT NOT NULL,
+    ownership_hash     TEXT NOT NULL,
+    row_count          INTEGER NOT NULL,
+    sku_count          INTEGER NOT NULL,
+    content_hash       TEXT NOT NULL,
+    state              TEXT NOT NULL CHECK (state IN ('verified', 'rejected')),
+    reason             TEXT,
+    created_at         TEXT NOT NULL
+  )`);
+  //   value = JSON の文字列。'null' = Company DB でわざと空にした値。col = '_sku' = その SKU が Company DB にあることの行 (持ち主が C の列があるときだけ。
+  //   「C にある SKU の欄が欠けた」(止める) と「C に無い SKU」(NE の値で作る) を分ける)
+  db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_values (
+    generation_no  INTEGER NOT NULL REFERENCES cdb_publish_generations (generation_no) ON DELETE CASCADE,
+    code_norm      TEXT NOT NULL,
+    col            TEXT NOT NULL CHECK (col IN ('_sku', 'name', 'cost', 'standard_price', 'tax_rate', 'tax_class', 'sales_class', 'shipping', 'reorder_months', 'handling', 'primary_supplier')),
+    code           TEXT NOT NULL,
+    sku_kind       TEXT NOT NULL CHECK (sku_kind IN ('single', 'set', 'exception')),
+    value          TEXT NOT NULL,
+    PRIMARY KEY (generation_no, code_norm, col)
+  )`);
+  // 16b'. 写しの反映の門 (④a・#1564 Codex R2 High 2)。後の工程 (daily-sync・自動再試行・商品管理リストの手の更新) を止めるかどうかの正 = この 1 行。
+  //   safe = 流してよい / broken = 古い表が作り直しの世代と違う / unknown = 持ち主が C なのに確かめられていない。
+  //   broken を safe に戻せるのは「入れた後の確かめ」が通った回だけ (fetch.mjs --verify-apply)。遅れ・証跡が読めない回は前の値のまま。
+  //   行が無い = 持ち主が全部 load と分かる (確かめた世代と作り直しが両方ある) ときだけ「流してよい」。apps/warehouse/publish-gate.js
+  //   safe は確かめた作り直し・世代・入れた値のハッシュ・持ち主のハッシュを持つ = 読み手が今と比べ、違えば使わない (#1564 Codex R3 High 2)
+  db.exec(`CREATE TABLE IF NOT EXISTS cdb_publish_gate (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    state          TEXT NOT NULL CHECK (state IN ('safe', 'broken', 'unknown')),
+    reason         TEXT,
+    build_id       TEXT,
+    generation_no  INTEGER,
+    applied_hash   TEXT,
+    ownership_hash TEXT,
+    checked_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+  )`);
+  addColumnIfMissing('cdb_publish_gate', 'applied_hash', 'TEXT');
+  addColumnIfMissing('cdb_publish_gate', 'ownership_hash', 'TEXT');
+  addColumnIfMissing('cdb_publish_generations', 'load_commit_seq', 'INTEGER');
+  // 16b''. C にあるセットの導き方の入力・構成品の行 (#1564 Codex R7 High)。書くのは作り直しの取引 (m_products と一緒に入れ替える)。
+  //   入れた後の確かめ (master-publish.js の verifyApplied) が同じ決め方で導き直して m_products・m_set_components と比べる (持ち主が全部 load = 行が無い)
+  // 16b'''. 区分の持ち主が C で、C = セット・NE = 単品 の SKU = 前の m_products・m_set_components の行のまま にした印 (prev_row = 前の行があった)。
+  //   書くのは作り直しの取引 (区分の持ち主が C のときだけ)。入れた後の確かめ・②b はこの SKU を比べない (master-publish.js)
+  //   snapshot = 固定した時の行と構成の全部 (master-publish.js の kindFrozenSnapshot の形)。入れた後の確かめ・applied_hash が今の行と比べる (#1641 Codex R1 High)
+  db.exec(`CREATE TABLE IF NOT EXISTS m_publish_kind_frozen (
+    code      TEXT PRIMARY KEY,
+    prev_row  INTEGER NOT NULL CHECK (prev_row IN (0, 1)),
+    snapshot  TEXT NOT NULL
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS m_set_publish_expect (
+    set_code        TEXT PRIMARY KEY,
+    args_json       TEXT NOT NULL,
+    components_json TEXT NOT NULL
+  )`);   // 世代が読んだ夜間ロードの commit の番号 (0055。activate が比べる。#1564 Codex R4 Medium 2)
+  // 16c. raw_ne_products / raw_ne_set_products の通し番号 (sync_meta の ne_raw_<kind>_rev)。書き換えた行 1 つにつき 1 増える (INSERT OR REPLACE も 1)。
+  //   どの書き込み口でも同じ取引で増える → NE 取込の完了の印 (ne_api_<kind>_complete_rev) と比べて「印の後に書かれたか」を見分ける (readNeRawRev)
+  for (const [table, kind] of [['raw_ne_products', 'products'], ['raw_ne_set_products', 'setproducts']]) {
+    for (const ev of ['INSERT', 'UPDATE', 'DELETE']) {
+      db.exec(`CREATE TRIGGER IF NOT EXISTS trg_${table}_rev_${ev.toLowerCase()} AFTER ${ev} ON ${table} BEGIN
+        INSERT INTO sync_meta (key, value, updated_at) VALUES ('ne_raw_${kind}_rev', '1', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1, updated_at = datetime('now');
+      END`);
+    }
+  }
 
   // 17. f_sales_by_listing（モール別・ページ単位の日次集計）
   db.exec(`CREATE TABLE IF NOT EXISTS f_sales_by_listing (
@@ -1349,6 +1483,8 @@ function createTables() {
   // 完全prefixで冗長(67MB+INSERTコスト、INV-22) → 作成を廃止。既存DBからの削除は
   // migrate-audit-pr12-cleanup.js が行う (boot時DROPはしない=migration実行を明示化)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_order       ON raw_amazon_settlement_lines(amazon_order_id)`);
+  // 日次の財務を作り直す月 (amazon-finance-months.js: 直近 35 日に入った行の月) を索引だけで引く。無いと 443 万行を毎朝全部読んで 97 秒 (2026-09-28)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_ingested    ON raw_amazon_settlement_lines(ingested_at, year_month_int)`);
 
   // ---- dim: 自動 INSERT で蓄積 ----
   db.exec(`CREATE TABLE IF NOT EXISTS dim_amazon_transaction_type (
@@ -1432,6 +1568,65 @@ function createTables() {
     enqueued_at    TEXT NOT NULL,
     processed_at   TEXT
   )`);
+
+  // ---- 決済のレポートの一覧 (inventory) (2026-09-30・D7b-1b の下ごしらえ) ----
+  // 設計 = AI_reference CompanyDB構想/13 §3.1「決済のレポートの一覧を持つ」「一覧の窓が途切れていないことを証明する」
+  // 書き手 = fetch-amazon-settlements.js (amazon-settlement-inventory.js)。今は記録だけ (読み手は後の coverage)。取込む行には関わらない
+  // 日時は全部 UTC の YYYY-MM-DDTHH:MM:SSZ (API の日時が読めないときだけ元の文字のまま)
+  db.exec(`CREATE TABLE IF NOT EXISTS amazon_settlement_report_inventory_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id          INTEGER NOT NULL,          -- 所属 (後の coverage の証拠の鎖の鍵)。今は 1 / 'amazon' / 'jp' 固定
+    mall                TEXT NOT NULL,
+    scope_key           TEXT NOT NULL,
+    report_type         TEXT NOT NULL,
+    marketplace_id      TEXT,
+    query_created_since TEXT NOT NULL,             -- 最初の要求で明示した createdSince (= createdUntil − 85 日)
+    query_created_until TEXT NOT NULL,             -- 最初の要求で明示した createdUntil (= 回の開始の時刻)
+    started_at          TEXT NOT NULL,
+    list_completed_at   TEXT,                      -- 一覧を読み終えた時刻 (一覧の要求が失敗したら null)
+    completed_at        TEXT,                      -- 取込の繰り返しが最後まで回り、一覧と結果を全部書けた時刻 (途中で落ちた・書けなかったら null)
+    last_page_reached   INTEGER NOT NULL CHECK (last_page_reached IN (0, 1)),   -- 0 = nextToken が残ったまま上限のページで打ち切った / 一覧の失敗
+    page_count          INTEGER NOT NULL,
+    report_count        INTEGER NOT NULL,
+    snapshot_digest     TEXT,                      -- 行の {report_id, processing_status, created_time, data_start_time, data_end_time, report_document_id} を report ID の UTF-8 の順の正規の JSON の SHA-256
+    list_error          TEXT,
+    ingest_error        TEXT,                      -- 取込のループが例外で止まった (completed_at は null)
+    record_error        TEXT,                      -- 一覧・取込の結果を書けなかった (行は無く見出しだけ・completed_at は null)
+    evidence_epoch      INTEGER,                   -- 初期の印 (D-65) を作るたびに採番。null = どの印の鎖にも属さない (今の回は全部 null・積み上げに使わない)
+    coverage_generation INTEGER,                   -- 後の coordinator が入れる (今は null)
+    run_token           TEXT,                      -- 後の coordinator が入れる (今は null)
+    inventory_run_seq   INTEGER NOT NULL UNIQUE,   -- 回の連番 (最新の観測の順 = coverage_generation → inventory_run_seq → last_seen_ordinal)
+    ingest_run_id       TEXT NOT NULL              -- 取込の回の ID (raw_amazon_settlement_*.ingest_run_id と同じ)
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS amazon_settlement_report_inventory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inventory_run_id   INTEGER NOT NULL REFERENCES amazon_settlement_report_inventory_runs(id),
+    report_id          TEXT NOT NULL,
+    report_type        TEXT NOT NULL,
+    processing_status  TEXT,
+    created_time       TEXT,
+    data_start_time    TEXT,                       -- API では任意 = null 可
+    data_end_time      TEXT,
+    report_document_id TEXT,
+    import_result      TEXT NOT NULL DEFAULT 'not_processed'
+      CHECK (import_result IN ('not_processed', 'skipped_not_done', 'skipped_v1', 'imported', 'failed')),
+    import_note        TEXT,                       -- failed の理由など
+    settlement_id      TEXT,                       -- 取込で読めた決済 ID (imported / skipped_v1)
+    source_file_hash   TEXT,                       -- 取込で落としたファイルの SHA-256 (raw の source_file_hash と同じ式)
+    imported_report_document_id TEXT,              -- 取込が実際に落とした文書 ID (取込の一覧は別の要求 = 一覧の行と違うことがある)
+    header_inserted    INTEGER,
+    lines_inserted     INTEGER,
+    last_seen_ordinal  INTEGER NOT NULL,           -- 一覧の並びの 1 始まりの位置 (同じ report ID を 2 回見たら最後の位置)
+    UNIQUE (inventory_run_id, report_id)
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_inventory_report ON amazon_settlement_report_inventory(report_id)`);
+
+  // ---- 決済の文書の版 (D-66)・生の表の版 source_revision・読み直す注文・coverage の lease・初期の印 (D-65) (2026-10-01・D7b-1b-3) ----
+  // 設計 = AI_reference CompanyDB構想/13 §3.1・D-65・D-66。本体 = amazon-settlement-versions.js (表・trigger・view)
+  //   生の表 (headers / lines) に report_document_id / normalization_version / document_version_seq / currency_raw を足す。
+  //   過去の行の版は夜に手で migrate-settlement-document-versions.js --commit が付ける (coordinator は版付けを流さない = 版の無い行があれば ❌ で止まる・#1567 Codex R1 Medium)
+  //   = それまで build・送り手は止まる (黙って行を落とさない)。🚨 初回の initDB は生の表に索引を作る (時間はログ) = pull の後の初回は daily-sync・retry と重ねない別の作業 (R4 Medium 2)
+  createSettlementVersionSchema(db);
 
   // ---- Phase 1 #1-7a: job_locks (concurrency guard)
   // daily-sync / mart rebuild / sync の重複起動防止
@@ -1665,7 +1860,7 @@ function createTables() {
       'f_amazon_account_fees_monthly_v1', 'mirror_amazon_account_fees_monthly',
       'one row = one (date_jst = month start YYYY-MM-01, fee_type) — SKU 無し settlement 行のアカウント単位フィー月次 net',
       '["date_jst","fee_type"]',
-      '{"required":["date_jst","fee_type"],"date_jst_pattern":"^\\d{4}-\\d{2}-01$","fee_type_enum":["storage","long_term_storage","removal","inbound_defect","low_inventory","subscription","other_account_fee"]}',
+      '{"required":["date_jst","fee_type"],"date_jst_pattern":"^\\d{4}-\\d{2}-01$","fee_type_enum":["storage","long_term_storage","removal","inbound_defect","low_inventory","subscription","easy_ship","other_account_fee"]}',
       'scope_clear_per_run', 'insert_or_replace', 1, 'amazon-dashboard',
       strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
       strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -2181,20 +2376,35 @@ function createTables() {
 
   // ---- silver view (always recreate) ----
   db.exec(`DROP VIEW IF EXISTS v_amazon_settlement_unified`);
+  // 🚨 2026-09-28: 同じ決済の中に business_line_key が同じ **本物の別々の行** がある (同じ注文・品物・時刻で 2 行来る。1 決済 約 4,500 行)。
+  //   (決済, 鍵) だけで 1 行にすると 2 週間ごとに 55〜65 万円・約 1,260 個を数え落としていた (全部の行の合計は振込額と 1 円まで一致)。
+  //   → 同じ文書の中の出現順 (occ = その鍵の何行目か) を鍵に足す。同じ文書の同じ行 (過去の膨張の残骸) は DENSE_RANK で同じ occ = 1 行にまとまる。
+  //   層 (sp_api_v1 / v2 / manual_csv) の選び方は今まで通り。rebuild-amazon-settlement-mart.js・rebuild-amazon-account-fees.js・
+  //   sql/amazon/build_f_amazon_finance_sku_daily_v1.sql も同じ形 (4 か所そろえる)
+  //   🚨 前提: 1 文書 = 1 決済の全部 (完全なレポート) で、行番号 (source_line_no) がある。raw に書くのは fetch-amazon-settlements.js だけ (2026-10-01 から coordinator の回の中だけ・手のファイルも同じ関数)
+  //   (SP-API の決済レポート 1 本 = 1 文書。manual_csv の層に書く処理は無い・本番も sp_api_v1 だけ・行番号の空 0 = 2026-09-28)。
+  //   1 つの決済を複数の文書に分けて書く取込 (期間で区切った CSV など) を足すときは、この数え方を見直す (文書ごとの出現順を取るので、分かれた行を 1 行にしてしまう)。
+  //   過去の作り直しと照合のスクリプト (rebuild-amazon-settlement-history.js・#1511) は 2026-09-29 に消した (1〜9 月を作り直し・照合 17/17)。
+  //   また過去を作り直すときは git の履歴から戻す (月の集計 --all → 日次の財務を月ごと → アカウント単位の手数料 → 決済ごとに振込額と照合)
+  // 🆕 2026-10-01 (D-66・D7b-1b-3): 決済ごとに採る文書の版を 1 つ (v_amazon_settlement_selected_documents) にして、**その版の行だけ** を使う
+  //   (前 = 文書をまたいで (決済, 鍵, 出現順) ごとに層 → 新しい順で 1 行 = 新しい文書から消えた行が古い文書から残りえた)。
+  //   出現順 = 同じ版の中の行番号の DENSE_RANK・同じ (鍵, 出現順) の 2 行目以降 = 過去の膨張の残骸 (ingested_at の新しい順 → id の 1 行)。
+  //   5 か所 (ここ・rebuild-amazon-settlement-mart.js・rebuild-amazon-account-fees.js・sql/amazon/build_f_amazon_finance_sku_daily_v1.sql・送り手の amazon-finance-transform.mjs) を同じ形に
   db.exec(`CREATE VIEW v_amazon_settlement_unified AS
-    WITH dedup AS (
+    WITH occ AS (
+      SELECT l.*,
+             DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.document_version_seq ORDER BY l.source_line_no) AS occ
+      FROM raw_amazon_settlement_lines l
+      WHERE (l.document_version_seq, l.source_settlement_id) IN (SELECT document_version_seq, settlement_id FROM v_amazon_settlement_selected_documents)
+    ),
+    dedup AS (
       SELECT
         l.*,
         ROW_NUMBER() OVER (
-          PARTITION BY l.source_settlement_id, l.business_line_key
-          ORDER BY CASE l.source_layer
-                     WHEN 'sp_api_v1' THEN 1
-                     WHEN 'manual_csv' THEN 2
-                     ELSE 3
-                   END,
-                   l.ingested_at DESC
+          PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
+          ORDER BY l.ingested_at DESC, l.id
         ) AS rn
-      FROM raw_amazon_settlement_lines l
+      FROM occ l
     )
     SELECT
       d.id, d.physical_line_hash, d.business_line_key,
@@ -2530,4 +2740,65 @@ export function getStats() {
 
 export function updateSyncMeta(key, value) {
   db.prepare('INSERT OR REPLACE INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)').run(key, value, new Date().toISOString().replace('T', ' ').slice(0, 19));
+}
+
+/**
+ * NE 取込の「最後まで取れた印」(ne_api_<kind>_complete_at / _count) を消す。kind = 'products' | 'setproducts'。
+ * 印 = 「synced_at がこの時刻の行 = NE から最後まで取れた回の集合」(Company DB構想 10 §6 / ③a-1)。
+ * 🚨 raw_ne_products / raw_ne_set_products を書き換える取込 (NE API の途中・CSV) は、書き換えと同じ取引の中で呼ぶ (印が集合と食い違ったまま残らない)
+ */
+export function clearNeCompleteMarks(kind) {
+  if (kind !== 'products' && kind !== 'setproducts') throw new Error(`clearNeCompleteMarks: 知らない種類 ${kind}`);
+  // 取得の件数 (ne_api_<kind>_fetch_counts。広げる道 PR-9 = apps/warehouse/ne-fetch-counts.js) も印と一緒に消す (印より長く残さない)
+  db.prepare('DELETE FROM sync_meta WHERE key IN (?, ?, ?, ?, ?, ?)').run(`ne_api_${kind}_complete_at`, `ne_api_${kind}_complete_count`, `ne_api_${kind}_complete_rev`,
+    `ne_api_${kind}_complete_parents`, `ne_api_${kind}_integrity`, `ne_api_${kind}_fetch_counts`);
+}
+
+/**
+ * NE の元の値を残す形 (raw_ne_* の *_src 列。C1)。undefined (欠落) = SQL の NULL = 記録なし / それ以外 = JSON の文字列 (空文字・文字列のゼロ・数値・null を区別する)。
+ * 🚨 String(v) や v || '' で潰さない
+ */
+export function neSrc(v) {
+  return v === undefined ? null : JSON.stringify(v);
+}
+
+/**
+ * raw_ne_products / raw_ne_set_products の通し番号 (書き換えた行の数だけ増える。トリガー trg_raw_ne_*_rev_*)。kind = 'products' | 'setproducts'。
+ * どの書き込み口 (NE API・CSV・auto-import・これから増えるもの) でも同じ取引の中で増える = 「完了の印を付けた後に誰かが書いたか」を番号で見分ける
+ * (Company DB構想 10 §6.1.1 A1。Codex PR #1453 R1 High-2: 印を消す・書くだけでは、並行する取込の途中のページを見分けられない)
+ */
+export function readNeRawRev(kind) {
+  if (kind !== 'products' && kind !== 'setproducts') throw new Error(`readNeRawRev: 知らない種類 ${kind}`);
+  return Number(db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(`ne_raw_${kind}_rev`)?.value ?? 0);
+}
+
+/** NE のコードの元の書き方の版 (③b-1b)。集め方を変えたら上げる (照合は知っている版の印だけを使う) */
+export const NE_SPELLING_VERSION = 'sp1';
+export const NE_SPELLING_KINDS = Object.freeze({ products: ['single', 'rep'], sets: ['set', 'child', 'set_rep'] });
+/** 書き方の集合を足す (取込のループの中で。保存の前) */
+export function addSpelling(map, norm, raw) {
+  if (!norm) return;
+  if (!map.has(norm)) map.set(norm, new Set());
+  map.get(norm).add(raw);
+}
+/**
+ * 1 回の取得で集めた書き方を残し、集め終えた印を付ける (③b-1b 契約 v3 H1)。side = 'products' | 'sets'。byKind = { kind: Map(norm → Set(元の書き方)) }。
+ * 🚨 取得の完了の印と同じ取引の中で呼ぶ (印だけ・書き方だけ、を作らない)。古い世代は印の新しい 3 つを残して消す (今の世代 = この ts は必ず残る)
+ */
+export function writeCodeSpellings(side, ts, byKind) {
+  const kinds = NE_SPELLING_KINDS[side];
+  if (!kinds) throw new Error(`writeCodeSpellings: 知らない側 ${side}`);
+  // 同じ世代 (同じ秒に 2 回取った) の前の書き方を先に消す = 前の回の書き方が今回の集合に混ざらない
+  db.prepare(`DELETE FROM raw_ne_code_spellings WHERE synced_at = ? AND kind IN (${kinds.map(() => '?').join(', ')})`).run(ts, ...kinds);
+  const ins = db.prepare('INSERT OR REPLACE INTO raw_ne_code_spellings (synced_at, kind, code_norm, spellings) VALUES (?, ?, ?, ?)');
+  let rows = 0;
+  for (const k of kinds) for (const [norm, set] of byKind[k] || new Map()) { ins.run(ts, k, norm, JSON.stringify([...set].sort())); rows++; }
+  db.prepare('INSERT OR REPLACE INTO ne_code_spelling_marks (side, synced_at, version, rows, recorded_at) VALUES (?, ?, ?, ?, ?)')
+    .run(side, ts, NE_SPELLING_VERSION, rows, new Date().toISOString().replace('T', ' ').slice(0, 19));
+  // 今回の世代 (= 今の完了の印) は必ず残す (時計が戻って、今回より新しい時刻の印が 3 つあっても消さない。#1497 Codex R1 Medium)
+  const keep = [...new Set([ts, ...db.prepare('SELECT synced_at FROM ne_code_spelling_marks WHERE side = ? ORDER BY synced_at DESC LIMIT 3').all(side).map((r) => r.synced_at)])];
+  const ph = keep.map(() => '?').join(', ');
+  db.prepare(`DELETE FROM raw_ne_code_spellings WHERE kind IN (${kinds.map(() => '?').join(', ')}) AND synced_at NOT IN (${ph})`).run(...kinds, ...keep);
+  db.prepare(`DELETE FROM ne_code_spelling_marks WHERE side = ? AND synced_at NOT IN (${ph})`).run(side, ...keep);
+  return rows;
 }

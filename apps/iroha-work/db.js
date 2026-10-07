@@ -20,6 +20,7 @@ import { FACILITIES, FACILITY_RENAMES } from './tasks.js';
 import { backfillBatches, backfillStocking } from './batches.js';
 import { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, registerMirror } from '../staff/roster-link.js';
 import { setStaffPin, verifyStaffPin, _clearStaffPinFails } from '../staff/db.js';
+import { normalizeOptionCode, displayCode, materialsOf } from '../../lib/iroha-materials.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -1040,6 +1041,8 @@ export function createTables(db = getMirrorDB()) {
   // (このアプリが先に f_iroha_work_master を SELECT すると no such column になるため)
   if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get()) {
     addCol('f_iroha_work_master', 'video_url', 'TEXT');
+    // 資材の正本 (2026-10-01)。material_code は 1 件目の写し — 詳細は materials.js
+    addCol('f_iroha_work_master', 'materials_json', 'TEXT');
   }
 
   // 「1作業者につき活動中セッション1件」は**DBの制約**で保証する (Codex PR2 #1:
@@ -1440,9 +1443,10 @@ function startSnapshotJson(db, productCode, masterSnapshot) {
   if (masterSnapshot !== undefined) return masterSnapshot == null ? null : JSON.stringify(masterSnapshot);
   const hasWm = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get();
   if (!productCode || !hasWm) return null;
-  const wm = db.prepare('SELECT material_code, storage_container, units_per_container, process_count, note, video_url, version FROM f_iroha_work_master WHERE code_key = ?')
-    .get(String(productCode).trim().toLowerCase());
-  return wm ? JSON.stringify(wm) : null;
+  const wm = db.prepare(`SELECT materials_json, material_code, storage_container, units_per_container, process_count, note, video_url, version
+    FROM f_iroha_work_master WHERE code_key = ?`).get(String(productCode).trim().toLowerCase());
+  // 資材は配列で残す (開始時点の指示を後から読み返すときに小分け袋の指定まで分かるように)
+  return wm ? JSON.stringify({ ...wm, materials: materialsOf(wm) }) : null;
 }
 
 /**
@@ -2162,12 +2166,9 @@ const OPTION_COLS = 'id, kind, code, image_url, sort_order, manual_sort, active'
  */
 const OPTION_ORDER = 'CASE WHEN manual_sort IS NULL THEN 1 ELSE 0 END, manual_sort, sort_order, code';
 
-/** 比較用の正規化: NFKC (全角英数・全角空白→半角) + 連続空白を1つ + trim + 大文字化。表示は入力どおり (Codex R1 #3) */
-export function normalizeOptionCode(code) {
-  return String(code == null ? '' : code).normalize('NFKC').replace(/\s+/g, ' ').trim().toUpperCase();
-}
-/** 表示用の整形 (連続空白を1つ・trim。文字種は変えない) */
-const displayCode = (code) => String(code == null ? '' : code).replace(/\s+/g, ' ').trim();
+// 正規化と表示整形は materials.js に一本化 (資材の配列・候補マスタ・取込で同じキーを使う)。
+// 比較用 = NFKC + 連続空白を1つ + trim + 大文字化。表示は入力どおり (Codex R1 #3)
+export { normalizeOptionCode };
 
 /** 選択肢一覧。kind を省くと全種類、includeInactive で無効も (管理画面用)。並び = よく使う順 (sort_order 昇順 = 使用回数の負数) */
 export function listWorkOptions(kind = null, includeInactive = false) {
@@ -2354,6 +2355,24 @@ export function setWorkOptionImage(id, imageUrl) {
  * (多い順 = 上に出る。手動追加分は 0 = 末尾)
  * @returns {{material:number, container:number, skipped:boolean}} 追加件数
  */
+/**
+ * 資材の使用回数 ({v: 表記, n: 商品数})。materials_json (正本) を読み、未移行の行は material_code で数える。
+ * 同じ商品の中で同じ資材が 2 回出てきても 1 回として数える
+ */
+function materialUsageRows(db) {
+  const counts = new Map();   // 表記 → 商品数
+  for (const r of db.prepare('SELECT materials_json, material_code FROM f_iroha_work_master').all()) {
+    const seen = new Set();
+    for (const m of materialsOf(r)) {
+      const k = normalizeOptionCode(m.code);
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      counts.set(m.code, (counts.get(m.code) || 0) + 1);
+    }
+  }
+  return [...counts.entries()].map(([v, n]) => ({ v, n }));
+}
+
 let seedFingerprint = null;
 export function seedWorkOptionsFromMaster({ force = false } = {}) {
   const db = getDB();
@@ -2367,8 +2386,13 @@ export function seedWorkOptionsFromMaster({ force = false } = {}) {
   const bump = db.prepare('UPDATE f_iroha_work_options SET sort_order = ? WHERE kind = ? AND normalized_code = ?');
   const now = utcNow();
   db.transaction(() => {
-    for (const [kind, col] of [['material', 'material_code'], ['container', 'storage_container']]) {
-      const rows = db.prepare(`SELECT ${col} v, COUNT(*) n FROM f_iroha_work_master WHERE ${col} IS NOT NULL AND TRIM(${col}) <> '' GROUP BY ${col}`).all();
+    for (const kind of ['material', 'container']) {
+      // 保管箱は 1 列。資材は配列 (materials_json) なので JS で数える。
+      // ⭐数えるのは「その資材を使う**商品**の数」— 同じ商品の中で 2 回出てきても 1 回 (Codex)
+      const rows = kind === 'container'
+        ? db.prepare(`SELECT storage_container v, COUNT(*) n FROM f_iroha_work_master
+            WHERE storage_container IS NOT NULL AND TRIM(storage_container) <> '' GROUP BY storage_container`).all()
+        : materialUsageRows(db);
       const merged = new Map();   // normalized → { code (表記: 半角のものを優先、無ければ最初に見たもの), n (合算) }
       for (const r of rows) {
         const c = displayCode(r.v); const k = normalizeOptionCode(c);

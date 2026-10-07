@@ -181,6 +181,7 @@ export async function importImageDbByStatus({
   query = queryDatabaseAll, request = notionRequest, config = getImageDbConfig,
   masterFinder = findPageByManageNumber,
   runId = null,
+  beforeWrite = null,   // 書く直前の確かめ (古い入口の門 legacyWriteFence)。投げたら書かない (Codex #1565 R2 High 1)
 } = {}) {
   const cfg = config();
   const schema = await request(`/databases/${cfg.databaseId}`, { method: 'GET', cfg });
@@ -371,6 +372,7 @@ export async function importImageDbByStatus({
       e.code = 'snapshot_mismatch';
       throw e;
     }
+    if (beforeWrite) await beforeWrite();   // Notion を待っている間に相手が切れた・段階が変わった = 書かない (この後は待たずに書く)
     const run = runId || `img-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
     let processed = 0;
     for (const t of planned) {

@@ -9,7 +9,11 @@
  *   mart_*    — ツール用に加工したデータ（将来）
  */
 import Database from 'better-sqlite3';
+import { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } from './material-tables.js';
 import { createProductScoutTables } from '../product-scout/schema.js';
+import { createSkuMapGenerationTables } from './sku-map-state-schema.js';   // import を持たない部品 (amazon-pricing の書き込む経路の試験がたどる)
+// 統合の view (v_mall_finance_daily_unified) の Amazon の枝が読む表の名前 = 共通の読み口 (F4-1・consumer 'mall-finance-unified-view')。import を持たない部品
+import { financeDailyTable } from '../../lib/amazon-finance-read.js';
 import path from 'path';
 import fs from 'fs';
 import {
@@ -21,6 +25,18 @@ const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'warehouse-mirror.db');
 
 let db = null;
+
+// Amazon の「税込の売上」= mirror_amazon_finance_sku_daily の 1 行の式 (他モールの gross_sales_jpy_incl と同じ意味)。
+//   本体 + 送料 + ギフト包装 (どれも決済の額 = 税抜) + 決済の消費税の実額 (Tax + ShippingTax + GiftWrapTax)。
+//   × 1.10 の推定ではない (軽減税率 8% の商品も正しい)。値引き (promotion)・ポイント・返金・手数料は引かない
+//   (= 楽天・Yahoo!・au PAY の gross_sales_jpy_incl も店のクーポン・ポイント・返金の前)。
+//   🚨 sales_tax_jpy は返金の行の税 (−) も足した正味 = 返金のあった日はその税の分だけ少なく出る (本体の返金は引かない)。
+//   列は表の別名なしで書く (FROM が mirror_amazon_finance_sku_daily 1 つの所・別名の表に同じ名前の列が無い所で使う)。
+//   使う所: v_mall_finance_daily_unified の Amazon の枝 / supplier-sales (仕入先別の売上・公開の口あり)。
+//   2026-10-03 Codex R-F4-1 High 6 (supplier-sales が Amazon だけ本体の税抜を足していた)。
+export const AMAZON_SALES_GROSS_INCL_SQL =
+  '(COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)'
+  + ' + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0))';
 
 // Yahoo!表の初期化失敗を保持 (mirror本体は継続する fail-soft。router が sync 応答に載せる)。
 // 2026-07-12 の本番障害 (#476→#477 revert) の再発防御: 新規表のDDLで落ちても既存モールを道連れにしない
@@ -47,6 +63,11 @@ export let productScoutInitError = null;
 // SKUマップ 2種 (yahoo/aupay) も同様 (価格一括改定ツール PR1、2026-08-28)
 export let skuMapInitError = null;
 
+// Amazon SKU の対 (mirror_sku_master + mirror_sku_resolved) の世代の状態も同様 (PR ⑦-0、2026-10-01)。
+// 作れなくても他の表は続ける。これが立っている間は、確かめる口 (GET /api/sync/sku-map/state) が 503 (capability を出さない)・
+// 世代つきの対も 503 で断る。世代なしの対は今までどおり (表が無い = 一度も有効になっていない。表があって行があれば有効のまま = 409)
+export let skuMapGenerationInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -61,6 +82,7 @@ export function initMirrorDB() {
   logizardStockInitError = null;
   productScoutInitError = null;
   skuMapInitError = null;
+  skuMapGenerationInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -94,33 +116,7 @@ function addColumnIfMissing(table, column, typeClause) {
 
 function createTables() {
   // mirror_products — 統合商品マスタ（m_productsのミラー）
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_products (
-    product_id                INTEGER PRIMARY KEY,
-    商品コード                TEXT UNIQUE NOT NULL,
-    商品名                    TEXT,
-    商品区分                  TEXT NOT NULL,
-    取扱区分                  TEXT,
-    標準売価                  REAL,
-    原価                      REAL,
-    原価ソース                TEXT,
-    原価状態                  TEXT NOT NULL,
-    送料                      REAL,
-    送料コード                TEXT,
-    配送方法                  TEXT,
-    消費税率                  REAL,
-    税区分                    TEXT,
-    在庫数                    INTEGER,
-    引当数                    INTEGER,
-    仕入先コード              TEXT,
-    セット構成品数            INTEGER,
-    売上分類                  INTEGER,
-    代表商品コード            TEXT,
-    seasonality_flag          INTEGER DEFAULT 0,
-    season_months             TEXT,
-    new_product_flag          INTEGER DEFAULT 0,
-    new_product_launch_date   TEXT,
-    updated_at                TEXT NOT NULL
-  )`);
+  db.exec(MIRROR_PRODUCTS_DDL);   // 定義は material-tables.js (照合の ① が控えを戻すときも同じ定義を使う)
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');
   // 商品コードの正規化キーで引く用 (入荷受付チェックの新商品判定。式のままだと 商品コード の索引が
   //  使えず、5秒ごとのポーリングで毎回全表スキャンになる — ロジザード在庫の idx_mlz_sku_norm と同じ理由)
@@ -199,15 +195,22 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_new ON mirror_products(new_product_flag)');
 
   // mirror_set_components — セット構成マスタ
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_set_components (
-    セット商品コード  TEXT NOT NULL,
-    構成商品コード    TEXT NOT NULL,
-    数量              INTEGER NOT NULL DEFAULT 1,
-    構成商品名        TEXT,
-    構成商品原価      REAL,
-    updated_at        TEXT NOT NULL,
-    PRIMARY KEY (セット商品コード, 構成商品コード)
+  db.exec(MIRROR_SET_COMPONENTS_DDL);   // 定義は material-tables.js
+
+  // mirror_material_generations — 今 mirror に入っている products / set_components が miniPC のどの世代か (Company DB構想 10 §6 / ③a-1)。
+  //   /api/sync が mirror を入れ替えたのと同じ取引で更新する (entity ごとに最新 1 行)。夜間ロード (apps/company-db/load) が読んで
+  //   Company DB の ops.load_materials に残す = 毎朝の照合が「Company DB が読んだ写し」を miniPC の控え (DATA_DIR/cdb-material) で特定できる
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_material_generations (
+    entity             TEXT PRIMARY KEY CHECK (entity IN ('products', 'set_components')),
+    generation_id      TEXT NOT NULL,
+    content_hash       TEXT NOT NULL,
+    row_count          INTEGER NOT NULL,
+    source_complete_at TEXT,
+    created_at         TEXT,
+    received_at        TEXT NOT NULL
   )`);
+  // 列の意味の版 (D3: products の代表商品コード = { rep: 'src1' })。送り手が付けたものを JSON で残す。古い送り手 = NULL (夜間ロードは '' を「不明」と読む)
+  addColumnIfMissing('mirror_material_generations', 'semantics', 'TEXT');
 
   // mirror_sku_resolved — SKU紐付け解決済みビューのミラー（v_sku_resolved の結果）
   // 設計:
@@ -249,6 +252,17 @@ function createTables() {
     synced_at          TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mir_sku_master_updated ON mirror_sku_master(source_updated_at)');
+
+  // mirror_sku_map_state — 上の 2 表 (SKU の対) の世代の状態 (PR ⑦-0。Company DB構想 16 §7 H1 / §8 契約 v3)。
+  //   1 行だけ・消せない・世代は下げられない (trigger・名前に版 _v1)。mirror_sku_resolved に構成の時刻の列 (component_created_at / component_updated_at) も足す。
+  //   1 つの取引で作り、最後に列と trigger の定義を照らす (違えば投げる = 初期化の失敗)。
+  //   表の定義 = sku-map-state-schema.js・受け手の決まり = sku-map-generation.js。fail-soft (2026-07-12 障害の教訓: 新しい表の DDL で他の表を道連れにしない)
+  try {
+    createSkuMapGenerationTables(db);
+  } catch (e) {
+    skuMapGenerationInitError = { message: String(e.message || e), code: e.code || null };
+    console.error('[Mirror] SKU の対の世代の表の初期化に失敗 (他の表は続ける・世代つきの対は 503 で断る):', e.message);
+  }
 
   // mirror_inv_daily_summary — 日次在庫スナップショットの集計結果ミラー
   // 元: ミニPC warehouse.db.inv_daily_summary
@@ -511,6 +525,16 @@ function createTables() {
     synced_at                   TEXT NOT NULL,
     PRIMARY KEY (date_jst, seller_sku, asin_norm)
   )`);
+  // 2026-09-28: Easy Ship の配送料 (SKU に割り振った分・税込・費用を正)。既存の表には列を足す
+  // 2026-09-29: 値引きのうち消費税の分 (promotion_tax_jpy。税抜の利益で値引きから除く)
+  //   NULL = まだ送られていない (この列を知らない古い miniPC から来た行・列を足す前の行)。0 と区別して画面で「未取得」と出す (Codex #1522 R1 High)
+  {
+    const have = new Set(db.prepare(`PRAGMA table_info(mirror_amazon_finance_sku_daily)`).all().map((c) => c.name));
+    if (!have.has('easy_ship_jpy')) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN easy_ship_jpy REAL NOT NULL DEFAULT 0`);
+    if (!have.has('promotion_tax_jpy')) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN promotion_tax_jpy REAL`);
+    // 2026-09-29: 出品者が付けたポイント (費用を正・profit_amount で引いている)。足す前の行 = 0 (その行の profit_amount もポイントを引いていない)
+    if (!have.has('points_jpy')) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN points_jpy REAL NOT NULL DEFAULT 0`);
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_date ON mirror_amazon_finance_sku_daily(date_jst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_sku ON mirror_amazon_finance_sku_daily(seller_sku)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_month ON mirror_amazon_finance_sku_daily(substr(date_jst, 1, 7))');
@@ -570,10 +594,11 @@ function createTables() {
   // mirror_amazon_account_fees_monthly — アカウント単位フィー月次 (amazon-dashboard PR-C)
   // SKU に紐付かない保管料/長期在庫追加手数料/返送等。date_jst = 月初日 (YYYY-MM-01)。
   // 金額は Amazon 符号のまま (負 = 費用、Correction/Reversal 込み net)。
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_account_fees_monthly (
+  // 🆕 2026-09-28: fee_type に easy_ship (Easy Ship の配送料) を足した。CHECK は後から変えられない = 古い表なら作り直す (中身は写す・1 取引)
+  const MAAFM_SQL = (name) => `CREATE TABLE IF NOT EXISTS ${name} (
     date_jst        TEXT NOT NULL CHECK(date_jst GLOB '????-??-01'),
     fee_type        TEXT NOT NULL CHECK(fee_type IN (
-      'storage','long_term_storage','removal','inbound_defect','low_inventory','subscription','other_account_fee'
+      'storage','long_term_storage','removal','inbound_defect','low_inventory','subscription','easy_ship','other_account_fee'
     )),
     amount_jpy      REAL NOT NULL DEFAULT 0,
     row_count       INTEGER NOT NULL DEFAULT 0,
@@ -581,7 +606,23 @@ function createTables() {
     source_row_hash TEXT NOT NULL,
     synced_at       TEXT NOT NULL,
     PRIMARY KEY (date_jst, fee_type)
-  )`);
+  )`;
+  const maafmCur = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mirror_amazon_account_fees_monthly'`).get();
+  const maafmDeps = maafmCur ? db.prepare(`SELECT type, name FROM sqlite_master WHERE type IN ('view', 'trigger') AND sql LIKE '%mirror_amazon_account_fees_monthly%'`).all() : [];
+  if (maafmCur && !maafmCur.sql.includes("'easy_ship'") && maafmDeps.length) {
+    // 作り直すと view は壊れ trigger は消える = 作り直さずに残す (easy_ship の送信は 400 で断られ、miniPC の sync が ❌ になって気づく)
+    console.error(`[warehouse-mirror] ⚠️ mirror_amazon_account_fees_monthly を作り直せない (参照する ${maafmDeps.map((d) => `${d.type} ${d.name}`).join(', ')} がある)。easy_ship を受け付けない`);
+  } else if (maafmCur && !maafmCur.sql.includes("'easy_ship'")) {
+    const cols = 'date_jst, fee_type, amount_jpy, row_count, source_run_id, source_row_hash, synced_at';
+    db.transaction(() => {
+      db.exec(MAAFM_SQL('mirror_amazon_account_fees_monthly_new'));
+      db.exec(`INSERT INTO mirror_amazon_account_fees_monthly_new (${cols}) SELECT ${cols} FROM mirror_amazon_account_fees_monthly`);
+      db.exec('DROP TABLE mirror_amazon_account_fees_monthly');
+      db.exec('ALTER TABLE mirror_amazon_account_fees_monthly_new RENAME TO mirror_amazon_account_fees_monthly');
+    })();
+    console.log('[warehouse-mirror] mirror_amazon_account_fees_monthly を作り直した (fee_type に easy_ship)');
+  }
+  db.exec(MAAFM_SQL('mirror_amazon_account_fees_monthly'));
   db.exec('CREATE INDEX IF NOT EXISTS idx_maafm_date ON mirror_amazon_account_fees_monthly(date_jst)');
 
   // mirror_amazon_price_snapshot_daily — カート(Buy Box)価格 日次スナップショット (amazon-dashboard PR-D)
@@ -1229,6 +1270,21 @@ function createTables() {
     db.exec('CREATE INDEX IF NOT EXISTS idx_mlz_barcode ON mirror_logizard_stock(バーコード)');   // stock-botのバーコード完全一致用
     // 商品コードの正規化キーで引く用 (いろは作業アプリの Z/Y ロケ集計。式のままだと 商品ID の索引が使えない — Codex 2026-09-03)
     db.exec('CREATE INDEX IF NOT EXISTS idx_mlz_sku_norm ON mirror_logizard_stock(LOWER(TRIM(商品ID)))');
+    // ブロック引当順 (2026-09-25): FBA 補充が期限のあるロケの引き当て順に使う。無いと棚の順番が変わる
+    const lzCols = db.prepare('PRAGMA table_info(mirror_logizard_stock)').all().map((c) => c.name);
+    if (!lzCols.includes('ブロック引当順')) db.exec('ALTER TABLE mirror_logizard_stock ADD COLUMN ブロック引当順 TEXT');
+    // 世代ごとの素性 (1 行だけ)。captured_at は miniPC の「取り込み完了」時刻で、在庫を取った時刻ではない
+    //   (Codex 2026-09-25 A2 設計レビュー High 1)。source_at = 在庫を取った時刻の下限 = 毎時ランナーがロジザードへ取りに行った時刻 (確かめられない取り込みは null)、
+    //   rows_read / skipped_rows = CSV の行数と、商品 ID が空などで読み飛ばした行数 (全件かどうかの材料)
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_logizard_stock_meta (
+      id            INTEGER PRIMARY KEY CHECK (id = 1),
+      captured_at   TEXT NOT NULL,
+      source_at     TEXT,
+      rows_read     INTEGER,
+      skipped_rows  INTEGER,
+      row_count     INTEGER NOT NULL,
+      synced_at     TEXT NOT NULL
+    )`);
   } catch (e) {
     logizardStockInitError = {
       message: String(e.message || e),
@@ -2548,7 +2604,8 @@ function createTables() {
   //     vw_qoo10_finance_for_reporting の net_settlement alias とは別定義である点に注意)
   //   margin_jpy_for_reporting = 各モールの vw_*_finance_for_reporting と同じ優先順位
   //     (yahoo/aupay=COALESCE(full,partial)、qoo10=confidence次第、rakuten/linegift=単一列、
-  //      amazon=profit_amount)。amazon のみ税抜 → margin_basis で区別
+  //      amazon=税抜で引いた利益 = profit_amount + 課税の手数料 × 1/11 + 値引きの税の分 (Amazon 分析の PROFIT_EX_SQL と同じ・2026-09-29 Codex #1522 R1)。
+  //      amazon のみ税抜 → margin_basis で区別
   //   is_fba / fba_fees_jpy / asin_norm / sales_principal_jpy = amazon 専用 (他モール NULL)
   db.exec('DROP VIEW IF EXISTS v_mall_finance_daily_unified');
   db.exec(`CREATE VIEW v_mall_finance_daily_unified AS
@@ -2558,9 +2615,12 @@ function createTables() {
       NULL AS ne_code,
       product_name,
       CAST(units_net_sold AS INTEGER) AS units_net_sold,
-      COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)
-        + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0) AS sales_gross_jpy_incl,
-      profit_amount AS margin_jpy_for_reporting,
+      ${AMAZON_SALES_GROSS_INCL_SQL} AS sales_gross_jpy_incl,
+      -- 🚨 apps/amazon-dashboard/queries.js の PROFIT_EX_SQL と同じ式 (手数料は決済の額 = 税込 → 1/11 を戻す)。変えるときは両方
+      profit_amount
+        + (COALESCE(commission_jpy,0) + COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) + COALESCE(closing_fee_jpy,0)
+           + COALESCE(shipping_chargeback_jpy,0) + COALESCE(giftwrap_chargeback_jpy,0)) * 0.10 / 1.10
+        + COALESCE(promotion_tax_jpy,0) AS margin_jpy_for_reporting,
       'excl_tax' AS margin_basis,
       NULL AS margin_confidence,
       cost_status,
@@ -2569,7 +2629,7 @@ function createTables() {
       CASE WHEN COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) > 0 THEN 1 ELSE 0 END AS is_fba,
       sales_principal_jpy,
       synced_at
-    FROM mirror_amazon_finance_sku_daily
+    FROM ${financeDailyTable('mall-finance-unified-view')}
     UNION ALL
     SELECT
       date_jst, 'rakuten',
@@ -3092,6 +3152,15 @@ function createGiftsetTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_f_giftset_comp_child ON f_giftset_components(商品コード)');
 }
 
+// 誤出荷の項目訂正履歴テーブルの DDL 結果。null = 正常、文字列 = 失敗理由。
+// 失敗していても mirror 全体は動かす (fail-soft) が、訂正 API はこれを見て断る。
+let misFieldHistoryInitError = null;
+
+/** 誤出荷の項目訂正履歴テーブルが使えるか。使えないときは理由の文字列を返す。 */
+export function getMisFieldHistoryInitError() {
+  return misFieldHistoryInitError;
+}
+
 function createMisShipmentTables() {
   // 正本テーブル (mirror_* と prefix で責任分離、こちらは Render 完結書込)
   db.exec(`
@@ -3222,5 +3291,65 @@ function createMisShipmentTables() {
              ON f_mis_shipments(mix_up_group_id) WHERE mix_up_group_id IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_status_hist
              ON f_mis_shipment_status_history(mis_shipment_id, changed_at)`);
+
+  // 項目の訂正履歴 (append-only)。
+  //
+  // 誤出荷種別 (mis_type) と発見工程 (process_stage) は設計書 v7.3 では
+  // 「起票時に確定して編集不可」だった。2026-09-20 に「画面で何を選んでも
+  // 先頭の選択肢が保存されていた」不具合 (PR #1381) が見つかり、管理者が後から
+  // 直せるようにした。編集不可をやめる以上、誰が何をいつ直したかは必ず残す。
+  //
+  // field_name = 'review_mis_type' / 'review_process_stage' は
+  // 「その項目は確認した (直したか、直す必要が無いと判断した)」印。
+  // old_value / new_value にはそのときの値を入れる。項目ごとに分けているのは、
+  // 片方だけ直したときに、もう片方まで確認済みになってしまわないようにするため。
+  //
+  // 新規表の DDL は fail-soft (2026-07-12 の本番障害の教訓)。ここで落ちても
+  // f_mis_shipments 本体と mirror 全体を道連れにしない。
+  // ただし表だけ出来て trigger が出来ない、のような中途半端な状態で訂正させると
+  // 「書き換えられる履歴」が残ってしまうので、DDL 全体を 1 トランザクションにして
+  // all or nothing にし、失敗したら訂正の入口ごと閉じる (canCorrectFields)。
+  try {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS f_mis_shipment_field_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          mis_shipment_id INTEGER NOT NULL REFERENCES f_mis_shipments(id),
+          field_name TEXT NOT NULL
+            CHECK (field_name IN
+              ('mis_type','process_stage','root_cause_stage','root_cause_note',
+               'reporter_note','review_mis_type','review_process_stage')),
+          old_value TEXT,
+          new_value TEXT,
+          changed_by TEXT NOT NULL,
+          changed_at TEXT NOT NULL
+        )
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_mis_field_history_no_update
+          BEFORE UPDATE ON f_mis_shipment_field_history
+          BEGIN
+            SELECT RAISE(ABORT, 'f_mis_shipment_field_history is append-only (UPDATE forbidden)');
+          END
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_mis_field_history_no_delete
+          BEFORE DELETE ON f_mis_shipment_field_history
+          BEGIN
+            SELECT RAISE(ABORT, 'f_mis_shipment_field_history is append-only (DELETE forbidden)');
+          END
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_field_hist
+                 ON f_mis_shipment_field_history(mis_shipment_id, changed_at)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_field_hist_review
+                 ON f_mis_shipment_field_history(mis_shipment_id, field_name)
+                 WHERE field_name IN ('review_mis_type','review_process_stage')`);
+    })();
+    misFieldHistoryInitError = null;
+  } catch (e) {
+    misFieldHistoryInitError = String((e && e.message) || e);
+    console.error('[warehouse-mirror] f_mis_shipment_field_history の DDL に失敗しました'
+      + ' (誤出荷の項目訂正が使えません):', misFieldHistoryInitError);
+  }
   // ▲▲▲ 誤出荷管理システム ▲▲▲
 }

@@ -24,6 +24,7 @@ import { google } from 'googleapis';
 
 import { getDB, logEvent } from '../db.js';
 import { resolveVariationGroup, getNeCost } from '../lib/variation.js';
+import { existingPageOfDraft } from '../lib/existing-page.js';
 import { imageTrackBlockReason } from '../lib/workflow-progress.js';
 // セットの画像の計画 (§4.7)。「作る」ことにした枠が埋まるまで出品させない
 import { pendingImagePlanSlots } from './set-derive.js';
@@ -32,6 +33,7 @@ import { validatePageInfo, mapNeShippingToRakuten } from '../lib/page-info.js';
 import { buildPcDescriptionHtml } from '../lib/product-info-auto.js';
 // URL の検証は miniPC 側と同じものを使う (別に書くと判定がズレる)
 import { parseRakutenItemUrl } from '../../../lib/rakuten-item-page.js';
+import { resolveListingTax } from './listing-tax.mjs';
 // 配送方法の「値の意味」の正本 (定数と変換はこの1ファイルだけが決める)。
 // db.js のマイグレーションからも使うため、循環参照を避けて lib/ に置いてある
 import {
@@ -139,6 +141,77 @@ export async function listDriveFolderImages(folderId) {
     }
   } while (pageToken);
   return files;
+}
+
+/** 素材画像の一覧の歯止め (商品の画像フォルダの下を辿るだけなので、これを超えるなら別の物を指している) */
+// deadlineMs / maxRequests = 全体の時間と API 呼び出し回数の上限。Drive が止まっていても押した画面をぶら下げない (codex #1593 Medium)
+export const MATERIAL_SCAN_LIMITS = Object.freeze({ maxDepth: 6, maxFolders: 60, maxImages: 500, deadlineMs: 25_000, maxRequests: 200 });
+const FOLDER_ID_RE = /^[-\w]{10,200}$/;
+
+/**
+ * 商品の画像フォルダの**サブフォルダ (何階層下でも)** にある画像 = 素材画像の一覧 (LP 構成 AI・2026-10-02 中原さん)。
+ * **フォルダ直下の画像は含めない** (直下は商品画像 = 白抜き・TOP・2〜20。listDriveFolderImages が読む)。
+ * 並びは「フォルダの道筋 → ファイル名」の順 (同じ材料なら毎回同じ並びになる)。
+ * 🚨 途中で歯止めに当たったら **throw する** (一部だけの一覧を「全部」として渡さない)。
+ * @param {string} folderId 商品の画像フォルダの ID
+ * @param {object} [opts] { drive (試験用), limits }
+ * @returns {Promise<Array<{id:string, name:string, modifiedTime:string|null, folder:string}>>} folder = 'サブ/サブのサブ'
+ */
+export async function listDriveFolderMaterialImages(folderId, { drive = null, limits = MATERIAL_SCAN_LIMITS } = {}) {
+  if (!FOLDER_ID_RE.test(String(folderId || ''))) throw new Error('フォルダの ID の形が不正です');
+  const client = drive || getDriveClient();
+  const L = { ...MATERIAL_SCAN_LIMITS, ...limits };
+  const deadline = Date.now() + L.deadlineMs;
+  let requests = 0;
+  const listAll = async (q, fields) => {
+    const out = [];
+    const seenTokens = new Set();
+    let pageToken;
+    do {
+      const left = deadline - Date.now();
+      if (left <= 0) throw new Error(`素材の一覧が ${Math.round(L.deadlineMs / 1000)} 秒で読み終わりませんでした (Drive が混んでいる可能性)`);
+      if (++requests > L.maxRequests) throw new Error(`素材の一覧で Drive を ${L.maxRequests} 回より多く呼びました (商品の画像フォルダか確認してください)`);
+      const res = await client.files.list({
+        q, fields: `nextPageToken, files(${fields})`, pageSize: 200, orderBy: 'name',
+        supportsAllDrives: true, includeItemsFromAllDrives: true, pageToken,
+      }, { timeout: left });
+      out.push(...(res.data.files || []));
+      pageToken = res.data.nextPageToken;
+      // 同じ次ページを 2 回返されたら進んでいない (止める・一部の一覧で進まない)
+      if (pageToken && seenTokens.has(pageToken)) throw new Error('Drive の一覧のページが進みません');
+      if (pageToken) seenTokens.add(pageToken);
+      if (out.length > L.maxImages) throw new Error(`素材フォルダの中身が ${L.maxImages} 件を超えています (商品の画像フォルダか確認してください)`);
+    } while (pageToken);
+    return out;
+  };
+  const subfolders = (id) => listAll(`'${id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'`, 'id, name');
+  const images = [];
+  const seenFolders = new Set([folderId]);
+  // 幅優先。根 (商品の画像フォルダ) の画像は読まない — サブフォルダから
+  let queue = (await subfolders(folderId)).map((f) => ({ id: f.id, path: String(f.name || '') , depth: 1 }));
+  let visited = 0;
+  while (queue.length) {
+    const next = [];
+    for (const f of queue) {
+      // 形のおかしい ID は止める (飛ばすと一部だけの一覧を「全部」として渡す・codex #1593 Low)。
+      // 一度見たフォルダ (ショートカットの循環など) だけ飛ばす
+      if (!FOLDER_ID_RE.test(String(f.id || ''))) throw new Error('Drive が形のおかしいフォルダ ID を返しました');
+      if (seenFolders.has(f.id)) continue;
+      seenFolders.add(f.id);
+      if (++visited > L.maxFolders) throw new Error(`サブフォルダが ${L.maxFolders} 個を超えています (商品の画像フォルダか確認してください)`);
+      const files = await listAll(`'${f.id}' in parents and trashed = false and mimeType contains 'image/'`, 'id, name, mimeType, modifiedTime');
+      for (const im of files) images.push({ id: im.id, name: String(im.name || ''), modifiedTime: im.modifiedTime || null, folder: f.path });
+      if (images.length > L.maxImages) throw new Error(`素材画像が ${L.maxImages} 枚を超えています (商品の画像フォルダか確認してください)`);
+      if (f.depth < L.maxDepth) {
+        for (const c of await subfolders(f.id)) next.push({ id: c.id, path: f.path + '/' + String(c.name || ''), depth: f.depth + 1 });
+      } else if ((await subfolders(f.id)).length > 0) {
+        throw new Error(`サブフォルダが ${L.maxDepth} 階層より深くあります (商品の画像フォルダか確認してください)`);
+      }
+    }
+    queue = next;
+  }
+  const key = (x) => x.folder + '\u0000' + x.name;
+  return images.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
 }
 
 // ─── サムネイル取得 (アプリ内プロキシ /api/thumb 用) ───
@@ -873,7 +946,10 @@ export function toRmsAttribute(attr, da) {
 /** 楽天の商品ページは画像20枚まで */
 // ─── ジャンル属性辞書 (Genre API、2026-07-28 実証) ───
 // endpoint: miniPC GET /genres/:id/attributes → RMS /es/2.0/navigation/genres/{id}/attributes
-// ⚠️ SELECTIVE 属性の選択肢一覧は API では取れない (自由入力 + RMS 検証に任せる)
+// SELECTIVE 属性の選択肢はこの応答には入っていない。属性ごとの
+//   GET /genres/:id/attributes/:attributeId/dictionaryValues (2026-09-20) で別に取り、
+//   attributes[].options (文字列の配列) に入れる。取れなかった属性は options: null =
+//   画面は今まで通りの自由入力 + 注意書き (選択肢が欠けたセレクトは正しい値を選べなくなるので出さない)
 
 /** RMS の genre attributes 応答をアプリ用に正規化する (pure、テスト可能) */
 export function normalizeGenreAttributes(rmsData) {
@@ -882,6 +958,7 @@ export function normalizeGenreAttributes(rmsData) {
   const attributes = (Array.isArray(g.attributes) ? g.attributes : []).map((a) => {
     const p = a?.properties || {};
     return {
+      id: Number.isFinite(Number(a?.id)) && a?.id != null ? Number(a.id) : null, // 選択肢の取得に使う
       name: String(a?.nameJa || '').trim(),
       dataType: a?.dataType || 'STRING',
       mandatory: p.rmsMandatoryFlg === true,
@@ -927,17 +1004,101 @@ export function getCachedGenreAttributes(db, genreId, { maxAgeMs = null } = {}) 
   };
 }
 
+/** これを超える選択肢はセレクトにしても選べないので持たない (options: null = 自由入力のまま) */
+const SELECTIVE_OPTIONS_MAX = 1000;
+const SELECTIVE_OPTIONS_MAX_PAGES = 20;
+/** 選択肢の取得にかけてよい合計時間。超えたら残りの属性は「取れなかった」にして先へ進む */
+const SELECTIVE_OPTIONS_BUDGET_MS = 60_000;
+
+/**
+ * dictionaryValues の応答から、その属性の選択肢 (表記) を取り出す。形が違えば null。
+ * rawCount = 応答に入っていた件数 (名前が空の行も数える)。ページの終わりの判定は必ずこちらで行う
+ * — 整形後の件数で判定すると、空の名前が 1 件あるだけで「端数 = 最後のページ」と読み違える (Codex R1)
+ */
+export function pickDictionaryValues(rmsData, attributeId) {
+  const list = rmsData?.genre?.attributes;
+  if (!Array.isArray(list)) return null;
+  // 属性 ID が一致したものだけ。1 件しか無いからと別の属性の一覧を採用しない (Codex R2: 違う選択肢のセレクトになる)
+  const hit = list.find((x) => x?.id != null && Number(x.id) === Number(attributeId));
+  if (!hit || !Array.isArray(hit.dictionaryValues)) return null;
+  return {
+    rawCount: hit.dictionaryValues.length,
+    values: hit.dictionaryValues.map((d) => String(d?.nameJa ?? '').trim()).filter(Boolean),
+  };
+}
+
+/** 1 回に頼む件数。page と limit は必ず両方送る (片方だけだと 400 invalidPageAndLimit)。1000 は通る */
+const SELECTIVE_OPTIONS_PAGE_LIMIT = 1000;
+
+/** 楽天の「その先 (そのページ) に値は無い」= 404 + notDictionaryValueFound。miniPC に口が無い 404 (本文が JSON でない) と区別する */
+function isNoMoreDictionaryValues(r) {
+  return r.status === 404 && Array.isArray(r.data?.errors) && r.data.errors.some((e) => e?.code === 'notDictionaryValueFound');
+}
+
+/**
+ * 1 属性ぶんの選択肢を全部取る。**全部そろったと確かめられたときだけ**配列を返し、それ以外は null。
+ * 🚨 途中までの一覧を返さない: 欠けたセレクトは「正しい値が選べない」ので、自由入力より悪い。
+ * 終わりの判定は実応答 (2026-09-20 ジャンル 205761・代表カラーで確認) にもとづく:
+ *   - limit は効く (limit=5 → 5 件) → **こちらが送った limit より少ないページ = 最後のページ**
+ *   - ちょうど満杯のページの次は 404 notDictionaryValueFound → これも「その先は無い」
+ *   - それ以外の失敗 (400・5xx・口が無い 404・形が違う) は「そろった」と言えない → null
+ */
+async function fetchAttributeOptions(genreId, attributeId, { fetcher, timeoutMs, refresh, deadline }) {
+  const seen = new Set();
+  for (let page = 1; page <= SELECTIVE_OPTIONS_MAX_PAGES; page += 1) {
+    // 締切はページごとに見る (1 属性の中で 20 ページ × 30 秒待たない — Codex R1 medium)
+    const left = deadline - Date.now();
+    if (left <= 0) return null;
+    const qs = `page=${page}&limit=${SELECTIVE_OPTIONS_PAGE_LIMIT}${refresh ? '&refresh=1' : ''}`;
+    const r = await fetcher(`/service-api/rakuten-rms/genres/${genreId}/attributes/${attributeId}/dictionaryValues?${qs}`,
+      { timeoutMs: Math.max(1000, Math.min(timeoutMs, left)) });
+    if (isNoMoreDictionaryValues(r)) return [...seen]; // 1 ページ目なら [] = 選択肢が無い属性 (セレクトにしない・取り直さない)
+    if (r.status !== 200) return null;
+    const picked = pickDictionaryValues(r.data, attributeId);
+    if (!picked) return null;
+    const before = seen.size;
+    for (const v of picked.values) seen.add(v);
+    if (page > 1 && picked.rawCount > 0 && seen.size === before) return null; // 同じ一覧の繰り返し = page が効いていない
+    if (seen.size > SELECTIVE_OPTIONS_MAX) return [];  // 失敗ではない (取り直さない)。[] = セレクトにしない
+    if (picked.rawCount < SELECTIVE_OPTIONS_PAGE_LIMIT) return [...seen]; // 件数は整形前で数える (Codex R1)
+  }
+  return null;
+}
+
+/** 選択式の属性に options を入れる (norm を書き換える)。失敗は null にして続ける */
+async function fillSelectiveOptions(norm, { fetcher, timeoutMs, refresh }) {
+  const deadline = Date.now() + SELECTIVE_OPTIONS_BUDGET_MS;
+  let giveUp = false;
+  for (const a of norm.attributes) {
+    if (a.inputMethod !== 'SELECTIVE') continue;
+    a.options = null;
+    if (giveUp || a.id == null) continue;
+    try {
+      a.options = await fetchAttributeOptions(norm.genreId, a.id, { fetcher, timeoutMs: Math.min(timeoutMs, 30_000), refresh, deadline });
+    } catch (e) {
+      a.options = null;
+    }
+    // 1 つ落ちたら残りも同じ理由 (miniPC が古い版で口が無い・楽天が不調・締切) のことが多いので打ち切る
+    if (a.options === null) giveUp = true;
+  }
+}
+
 /**
  * 辞書を取得してキャッシュする (24h 以内のキャッシュがあればそれを返す。force で強制再取得)。
  * @returns {{ok:true, genre}|{ok:false, notFound?:true, error?:string}}
  */
-export async function fetchGenreAttributes(db, genreId, { force = false, fetcher = callWarehouse, timeoutMs = 120_000 } = {}) {
+export async function fetchGenreAttributes(db, genreId, { force = false, retryOptions = false, fetcher = callWarehouse, timeoutMs = 120_000 } = {}) {
   const id = String(genreId ?? '').trim();
   if (!/^\d{1,12}$/.test(id)) return { ok: false, error: 'ジャンルIDは数字で指定してください' };
 
   if (!force) {
     const cached = getCachedGenreAttributes(db, id, { maxAgeMs: GENRE_CACHE_TTL_MS });
-    if (cached) return { ok: true, genre: cached, cached: true };
+    // 選択肢を取る前の版で保存された辞書 (options が無い) は 1 回だけ取り直す。
+    // 取得に失敗した印 (null) は、人が「ジャンル情報を取得」を押したとき (retryOptions) だけやり直す
+    // — 出品・プレビューのたびに失敗する通信を繰り返さない
+    const stale = cached && cached.attributes.some((a) => a.inputMethod === 'SELECTIVE'
+      && (a.options === undefined || (retryOptions && a.options === null)));
+    if (cached && !stale) return { ok: true, genre: cached, cached: true };
   }
 
   const r = await fetcher(`/service-api/rakuten-rms/genres/${id}/attributes${force ? '?refresh=1' : ''}`, { timeoutMs });
@@ -952,6 +1113,9 @@ export async function fetchGenreAttributes(db, genreId, { force = false, fetcher
   }
   const norm = normalizeGenreAttributes(r.data);
   if (!norm) return { ok: false, error: 'ジャンル情報を解釈できませんでした' };
+  // 選択肢が取れなくても辞書そのものは使える (必須判定・IE1002 の検証) ので、ここでは落とさない
+  // 人が押した取り直し (force / retryOptions) は miniPC 側の失敗のキャッシュ (404 = 1h) も通り越す (Codex R1 medium)
+  await fillSelectiveOptions(norm, { fetcher, timeoutMs, refresh: force || retryOptions });
   db.prepare(`
     INSERT INTO ph_genre_attributes (genre_id, genre_name, genre_path, payload_json, fixed_at, fetched_at)
     VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -1239,8 +1403,11 @@ export function skuAttributeGrid(db, draftId, rk, members) {
 
 /**
  * 出品 payload を組み立てる。送れない状態なら reasons を返す (dry_run と live で共通)。
+ * tax = listing-tax.mjs の resolveListingTax の結果 (PR #1565 R1 H5):
+ *   { mode: 'legacy' } = 今までどおり draft_yahoo.tax_rate / { mode: 'cdb', percent } = Company DB の税率 / { mode: 'blocked', reason } = 出品を止める
+ * 🚨 tax を渡さない呼び方は作らない (scripts/test-master-legacy-entries.mjs が呼び手を数える)。渡されなければ止める (fail-closed)
  */
-export function buildItemPayload(db, draftId) {
+export function buildItemPayload(db, draftId, { tax = null } = {}) {
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { ok: false, reasons: ['ドラフトが見つかりません'] };
   const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId) || {};
@@ -1274,6 +1441,18 @@ export function buildItemPayload(db, draftId) {
   const trailingBanners = trailingBannerLocations(effectiveShip.group);
 
   const reasons = [];
+  // 既存の楽天ページに追加する商品 (2026-09-25)。ページはもうあるので出品しない —
+  // 色追加のカードは商品コードが新しい色の SKU なので、出すと**別の新しいページができてしまう**。
+  // 代表商品コードのカードは miniPC が 409 で断るが、理由の分かる形で先に止める
+  const ep = existingPageOfDraft(db, draftId);
+  // 色追加のカードは札の設定に関係なく止める (existingPageOf も常に既存ページを返すが、ここでも列で見る — Codex #1450 R1 high)
+  if (ep.existingPage || draft.added_to_draft_id != null) {
+    const page = draft.added_to_draft_id != null
+      ? db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(draft.added_to_draft_id)?.ne_code
+      : draft.ne_code;
+    reasons.push(`既存の楽天ページ${page ? `「${String(page).toLowerCase()}」` : ''}に追加する商品です。楽天のページは RMS で手で編集してください`
+      + ' (新しいページとして出すなら、商品詳細の基本情報で「楽天ページ」を「新規ページ」にしてから)');
+  }
   // セット派生の仮コードのまま出さない (2026-08-23)。manage_number は登録後に変えられないので、
   // 仮コード (SET-xxx-01) で出すと商品ページを作り直す羽目になる。NE 登録後に本コードへ差し替える
   if (draft.provisional_code === 1) {
@@ -1320,8 +1499,11 @@ export function buildItemPayload(db, draftId) {
     reasons.push(`楽天の商品画像は最大 ${MAX_RAKUTEN_IMAGES} 枚です (商品画像 ${cabinet.length} 枚 + 自動追加バナー ${trailingBanners.length} 枚 — 商品画像を減らしてください)`);
   }
   if (whiteBgId && !whiteBg) reasons.push('白抜き背景画像が R-Cabinet に未転送です (先に「画像を転送」)');
+  // 税率 (PR #1565 R1 H5): 切替で閉じた後は Company DB の税率だけ。決められない・税率の決め方が渡されていない = 止める
+  if (!tax || !['legacy', 'cdb', 'blocked'].includes(tax.mode)) reasons.push('税率の決め方が分かりません (出品を止めました)');
+  else if (tax.mode === 'blocked') reasons.push(tax.reason);
   // 税率は 8% / 10% / 空欄 (=店舗デフォルト10%) 以外を fail-closed で止める (Codex R1 Medium-1)
-  const taxText = String(yahooRow.tax_rate ?? '').trim();
+  const taxText = tax?.mode === 'cdb' ? `${tax.percent}%` : String(yahooRow.tax_rate ?? '').trim();
   if (taxText && !/^(8|10)\s*%?$/.test(taxText)) {
     reasons.push(`税率「${taxText}」が不正です (8% / 10% / 空欄のみ)`);
   }
@@ -1602,7 +1784,7 @@ export function buildItemPayload(db, draftId) {
   };
   const deliveryDateId = String(rk.normal_delivery_date_id ?? '').trim();
 
-  const payment = taxRateToPayment(yahooRow.tax_rate);
+  const payment = taxRateToPayment(tax?.mode === 'cdb' ? `${tax.percent}%` : yahooRow.tax_rate);
 
   // 商品コード (NE商品コード) は SKU管理番号 (variants キー)・商品番号・システム連携用SKU番号の
   // 3ヶ所に同じ表記で入れる (Codex R1 medium: 正規化を1回にして揃える)。
@@ -1745,7 +1927,9 @@ export async function registerItem(draftId, { actor = null } = {}) {
   }
   // Drive 側で画像が差し替わっていたら「未転送」に落として登録を止める (Codex R3 high)
   await refreshDriveModifiedTimes(draftId);
-  const built = buildItemPayload(db, draftId);
+  // 税率: 切替前は今までどおり / 閉じた後は Company DB (決められない = 止める)。PR #1565 R1 H5
+  const draftRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  const built = buildItemPayload(db, draftId, { tax: draftRow ? await resolveListingTax(db, draftRow) : null });
   if (!built.ok) return { ok: false, reasons: built.reasons };
   const mn = String(built.draft.ne_code).trim().toLowerCase();
 

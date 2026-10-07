@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // NE 登録の CSV (新しいデザイン・第 2 段 10/5): 上に 5 つの流れと件数・作れない商品は 🔒 と理由・ファイルごとに「次にやること」を 1 つだけ大きく。
+    // 申告は CSV のファイルを落とすとその場で sha256 を照合する (64 文字を写さない)。送り方 (API) は前と同じ。画面の動き = public/me-regcsv.js
+    const S = summary;
+    const canAct = canApprove && !dbError && !closed && !!S && S.applied;
+    const dis = canAct ? '' : ' disabled';
+    const kindLabel = { products: '単品', sets: 'セット' };
+    const STATE_BADGE = { built: 'warn', issued: 'info', declared: 'info', closed: 'mute' };
+    const CLOSE_BADGE = { finished: 'ok', superseded: 'mute', rejected_all: 'err' };
+    const RESULT_DESC = { ok: ['i-check', 'NE の履歴が「処理成功」で、失敗の件数が無い'], partial: ['i-warn', '「処理成功」でも、メッセージに「N件失敗」がある'], rejected_all: ['i-x', '取り込めなかった'] };
+    const when = (v) => (v ? ui.fmtJst(v, { nowMs }) : '');
+    const shortSha = (s) => (s ? String(s).slice(0, 8) + '…' + String(s).slice(-6) : '');
+    let pipe = null;
+    if (S && S.applied) {
+      const buildable = S.candidates.filter((c) => !c.blockers.length).length;
+      const by = (st) => S.exports.filter((e) => e.state === st);
+      const verifiedItems = S.exports.reduce((a, e) => a + e.items.filter((i) => i.state === 'verified').length, 0);
+      pipe = [
+        { n: '① 作る', t: 'CSV にする', c: buildable, u: '件 作れる', s: `下書き・NE 登録待ち ${S.candidates.length} 件のうち`, hot: buildable > 0 },
+        { n: '② 配る', t: 'ダウンロード', c: by('built').length, u: '件', s: '作って まだ配っていない', hot: by('built').length > 0 },
+        { n: '③ NE で取り込む', t: 'NE の画面で', c: by('issued').length, u: '件 待ち', s: by('issued').length ? 'ファイル ' + by('issued').map((e) => '#' + e.export_id).join('・') : '配ったファイルを取り込んで申告', hot: by('issued').length > 0, ne: true },
+        { n: '④ 申告した', t: '翌朝の照合待ち', c: by('declared').length, u: '件', s: '翌朝の照合で NE と同じか確かめる', hot: false },
+        { n: '⑤ 翌朝の確かめ', t: 'NE と同じだった', c: verifiedItems, u: '商品', s: '最近のファイルの中で · そろえば NE 確認済み', hot: false },
+      ];
+    }
+    const steps = (e) => {
+      const done = (x) => ({ t: x, cls: 'done' });
+      if (e.state === 'built') return [done('作った'), { t: '配る (ダウンロード)', cls: 'cur' }, { t: 'NE で取り込んで申告' }, { t: '翌朝の確かめ' }];
+      if (e.state === 'issued') return [done('作った'), done('配った'), { t: 'NE で取り込んで申告', cls: 'cur' }, { t: '翌朝の確かめ' }];
+      if (e.state === 'declared') return [done('作った'), done('配った'), done('申告した'), { t: '翌朝の確かめ', cls: 'cur' }];
+      if (e.close_reason === 'finished') return [done('作った'), done('配った'), done('申告した'), done('翌朝の確かめ')];
+      return [done('作った'), { t: CLOSE_REASONS[e.close_reason] || '閉じた', cls: 'bad' }];
+    };
+  %>
+  <div class="page" id="rc" data-base="<%= base %>">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">NE 登録の CSV</span></nav>
+    <div class="ph">
+      <div>
+        <h1>NE 登録の CSV</h1>
+        <div class="lead">新商品 (下書き) を NE の「商品一括登録」で取り込む CSV にします。<b style="color:var(--text)">作る → 配る (ダウンロード) → NE で取り込む → 取り込んだと申告 → 翌朝の照合で NE 確認済み</b>。</div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/manual#reg-csv"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
+    </div>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは使えません (<%= closedWhy %>)</div><div class="hint">見るだけです。</div></div></div><% } %>
+    <% if (!canApprove) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= approveMessage %></div></div><% } %>
+    <% if (S && !S.applied) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">NE 登録の CSV の表 (migration 0053) がまだ入っていません。</div></div><% } %>
+    <% if (S && S.applied) { %>
+
+    <section class="panel hud" aria-label="流れと準備">
+      <ol class="pipeline">
+        <% for (const p of pipe) { %><li class="pipe<%= p.hot ? ' hot' : '' %><%= p.c ? '' : ' zero' %><%= p.ne ? ' ne' : '' %>"><div class="pn"><%= p.n %></div><div class="pt"><%= p.t %></div><div class="pc"><%= p.c %><small><%= p.u %></small></div><div class="ps"><%= p.s %></div></li><% } %>
+      </ol>
+      <div class="ready">
+        <% if (S.today) { %><span class="ok"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>今日 (<%= S.today_jst %>) の照合 あり · <%= S.run %></span><% } else { %><span class="err"><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg>今日 (<%= S.today_jst %>) の照合の回がまだ = 作れません<%= S.run ? ' (最後 ' + S.run + ')' : '' %></span><% } %>
+        <% if (S.ne_codes.current) { %><span class="ok"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>NE の元のコード 今日の分</span><% } else { %><span class="err"><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg>NE の元のコード まだ / 古い (作れません)</span><% } %>
+        <% for (const [k, v] of Object.entries(S.verified)) { %>
+          <% if (v.ok) { %><span class="ok"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg><%= kindLabel[k] %>の CSV の形 (<%= v.schema %>) = 実機で確かめた · 本番 (<%= S.max_rows %> 行まで)</span><% } else { %><span class="warn"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><%= kindLabel[k] %>の CSV の形 (<%= v.schema %>) は まだ実機で確かめていない = 試し用 (<%= S.trial_rows %> 行まで)</span><% } %>
+        <% } %>
+      </div>
+      <details class="more"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>CSV の列の見出しと、気をつけること</summary>
+        <div class="body hint">
+          <% for (const [k, v] of Object.entries(S.verified)) { %><div><b style="color:var(--text2)"><%= kindLabel[k] %></b> <span class="mono" style="font-size:12px;overflow-wrap:anywhere"><%= v.header %></span></div><% } %>
+          <div style="margin-top:6px">配った後は、その商品の NE に送る欄 (名前・売価・原価・税率・仕入先・取扱区分・代表・JAN・セットの構成) は直せません。直すときは、そのファイルを「使わない」にして、NE で何をしたかを書いてください。
+          NE の履歴の状態が「処理成功」でも、メッセージに「N件失敗」があれば <b style="color:var(--text)">一部失敗</b> で申告します。</div>
+        </div>
+      </details>
+    </section>
+
+    <section class="panel" aria-labelledby="h-cands">
+      <div class="panel-h"><span class="hico" aria-hidden="true">①</span><h2 id="h-cands">CSV にする商品</h2><span class="sub">下書き · NE 登録待ち</span></div>
+      <% if (!S.candidates.length) { %><div class="empty">下書き・NE 登録待ちの商品はありません。<br>新商品は <a href="<%= base %>/new?kind=single">新商品の登録</a> で下書きにします。</div><% } else { %>
+      <div class="tblwrap">
+        <table class="tbl" id="cands">
+          <caption class="sr">CSV にする商品 (作れるものだけ選べます)</caption>
+          <thead><tr><th scope="col" style="width:44px"><input type="checkbox" class="pick" id="pick-all" aria-label="作れる商品を全部選ぶ"<%= dis %>></th><th scope="col">コード</th><th scope="col">種類</th><th scope="col">登録</th><th scope="col">作れるか</th></tr></thead>
+          <tbody>
+          <% for (const c of S.candidates) { const blocked = c.blockers.length > 0; %>
+            <tr class="<%= blocked ? 'row-del' : '' %>">
+              <td><% if (blocked) { %><span class="sr">選べません</span><% } %><input type="checkbox" class="pick" data-kind="<%= c.kind %>" aria-label="<%= c.code %> を選ぶ" value="<%= c.code %>"<%= blocked || !canAct ? ' disabled' : '' %>></td>
+              <td class="code"><a href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>"><%= c.code %></a></td>
+              <td><span class="b <%= c.kind === 'sets' ? 'vio' : 'mute' %>"><%= kindLabel[c.kind] %></span></td>
+              <td><%= REG_STATES[c.state] || c.state %><% if (c.live) { %><span class="sub">ファイル #<%= c.live.export_id %> (<%= ITEM_STATES[c.live.state] || c.live.state %>)</span><% } %></td>
+              <td>
+                <% for (const b of c.blockers) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= b %></span></div><% } %>
+                <% for (const w of c.warnings) { %><div class="why-wrn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span><%= w %></span></div><% } %>
+                <% if (!c.blockers.length) { %><span class="why-ok"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>作れます<%= c.kind === 'sets' ? ' (構成品は全部 NE 確認済み)' : '' %></span><% } %>
+              </td>
+            </tr>
+          <% } %>
+          </tbody>
+        </table>
+      </div>
+      <div class="buildbar">
+        <button class="btn pri" type="button" data-act="build" data-kind="products"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>選んだ単品 <span data-n="products">0</span> 件の CSV を作る</button>
+        <button class="btn soft" type="button" data-act="build" data-kind="sets"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>選んだセット <span data-n="sets">0</span> 件の CSV を作る</button>
+        <span class="hint">単品とセットは別のファイルになります。セットは構成品が全部 NE 確認済みのときだけ。</span>
+      </div>
+      <div class="msgline" id="build-msg" role="status" aria-live="polite"></div>
+      <% } %>
+    </section>
+
+    <section class="panel" aria-labelledby="h-files">
+      <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-files">ファイル</h2><span class="sub">ファイルごとに「次にやること」を 1 つだけ大きく出します</span></div>
+      <% if (!S.exports.length) { %><div class="empty">まだありません。</div><% } %>
+      <% for (const e of S.exports) { const open = e.state !== 'closed'; %>
+      <article class="filecard exp<%= open ? '' : ' closed' %>" data-id="<%= e.export_id %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-labelledby="ft-<%= e.export_id %>">
+        <div class="fh"><span class="ttl" id="ft-<%= e.export_id %>">ファイル #<%= e.export_id %></span><span class="b <%= e.kind === 'sets' ? 'vio' : 'mute' %>"><%= kindLabel[e.kind] %></span><% if (e.trial) { %><span class="b warn">試し用</span><% } %>
+          <span class="b <%= open ? STATE_BADGE[e.state] : (CLOSE_BADGE[e.close_reason] || 'mute') %>"><% if (open) { %><span class="dot" aria-hidden="true"></span><% } %><%= EXPORT_STATES[e.state] || e.state %><%= e.close_reason ? ` (${CLOSE_REASONS[e.close_reason] || e.close_reason})` : '' %></span></div>
+        <div class="fmeta">
+          <span><%= e.item_count %> 商品 / <%= e.row_count %> 行</span><span class="dotsep" aria-hidden="true"></span>
+          <span><%= e.created_by %> · <%= when(e.created_at) %> に作った</span>
+          <% if (e.issued_at) { %><span class="dotsep" aria-hidden="true"></span><span><%= e.issued_by %> · <%= when(e.issued_at) %> に配った</span><% } %>
+          <% if (e.declared_at) { %><span class="dotsep" aria-hidden="true"></span><span><%= e.declared_by %> · <%= when(e.declared_at) %> に申告</span><% } %>
+          <% if (e.closed_at) { %><span class="dotsep" aria-hidden="true"></span><span><%= when(e.closed_at) %> に閉じた</span><% } %>
+          <span class="dotsep" aria-hidden="true"></span><span class="shabox" title="sha256 <%= e.sha256 %>">sha256 <%= shortSha(e.sha256) %></span><span class="muted">形 <%= e.schema_version %></span>
+          <% if (e.file_name) { %><span class="muted mono" style="font-size:12px"><%= e.file_name %></span><% } %>
+        </div>
+        <ol class="ministeps" aria-label="ファイル #<%= e.export_id %> の進み">
+          <% steps(e).forEach((s, i) => { %><% if (i) { %><li class="arr" aria-hidden="true">›</li><% } %><li class="ms<%= s.cls ? ' ' + s.cls : '' %>"<%- s.cls === 'cur' ? ' aria-current="step"' : '' %>><% if (s.cls === 'done') { %><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg><% } %><%= s.t %></li><% }) %>
+        </ol>
+        <div class="tblwrap">
+          <table class="tbl">
+            <thead><tr><th scope="col">コード</th><th scope="col">状態</th><th scope="col">翌朝の確かめ</th><th scope="col">メモ</th></tr></thead>
+            <tbody>
+            <% for (const i of e.items) { %>
+              <tr><td class="code"><a href="<%= base %>/sku/<%= encodeURIComponent(i.code) %>"><%= i.code %></a></td><td><%= ITEM_STATES[i.state] || i.state %></td>
+                <td><% if (i.last_check) { %><%= CHECK_OUTCOMES[i.last_check.outcome] || i.last_check.outcome %> <span class="muted" style="font-size:12.5px"><%= i.last_check.compare_run_id %></span><% } else { %><span class="muted">まだ</span><% } %>
+                  <% if (i.last_check && i.last_check.detail && i.last_check.detail.compare && i.last_check.detail.compare.cols) { %>
+                    <% for (const [col, x] of Object.entries(i.last_check.detail.compare.cols)) { if (x.ok) continue; %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><span><%= col %>: NE <%= JSON.stringify(x.observed && x.observed.v !== undefined ? x.observed.v : x.observed) %> / 目標 <%= JSON.stringify(x.expected) %></span></div><% } %>
+                  <% } %></td>
+                <td class="muted"><%= i.failed_reason ? `取り込めなかった (${i.failed_reason})` : '' %><%= i.superseded_reason ? `${i.superseded_reason} / ${i.superseded_correction}` : '' %></td></tr>
+            <% } %>
+            </tbody>
+          </table>
+        </div>
+        <% if (open) { %>
+        <div class="acts">
+          <% if (e.state === 'built') { %>
+            <button class="btn pri" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>配る (ダウンロード)</button>
+          <% } else if (e.state === 'issued') { %>
+            <button class="btn pri" type="button" data-act="show-declare" aria-expanded="false" aria-controls="dr-d-<%= e.export_id %>"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>取り込んだと申告</button>
+            <button class="btn" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
+          <% } else { %>
+            <span class="hint">翌朝の照合で NE と同じか確かめます (何もしなくて大丈夫です)</span>
+            <button class="btn sm" type="button" data-act="issue"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
+            <button class="btn sm" type="button" data-act="show-declare" aria-expanded="false" aria-controls="dr-d-<%= e.export_id %>"<%= dis %>>申告をし直す</button>
+          <% } %>
+          <span class="spacer"></span>
+          <button class="btn danger sm" type="button" data-act="show-supersede" aria-expanded="false" aria-controls="dr-s-<%= e.export_id %>"<%= dis %>>このファイルを使わない</button>
+        </div>
+        <% if (e.state !== 'built') { %>
+        <div class="drawer" id="dr-d-<%= e.export_id %>" data-drawer="declare" hidden>
+          <div class="panel-h" style="margin-bottom:6px"><h3 style="font-size:15.5px">取り込んだと申告</h3><span class="sub">NE の画面で取り込んだ結果をそのまま書きます</span></div>
+          <div class="f" style="align-items:start"><div class="lab" style="padding-top:12px">取り込んだファイル</div><div class="ctl col">
+            <label class="drop" data-drop>
+              <span class="fileico"><svg class="ic l" aria-hidden="true"><use href="#i-file"/></svg></span>
+              <span><span class="big" data-drop-t>NE に取り込んだ CSV をここに落とす (押して選んでも)</span><br><span class="hint" data-drop-s>その場で、配ったファイル #<%= e.export_id %> と同じか照合します · 64 文字を写す必要はありません</span></span>
+              <input type="file" accept=".csv,text/csv" data-sha-file aria-label="NE に取り込んだ CSV のファイル (配ったファイル #<%= e.export_id %> と同じか照合します)">
+            </label>
+            <details class="more"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>ファイルが手元に無いとき: sha256 を貼る</summary>
+              <div class="body"><input class="in w-full mono" name="sha256" maxlength="64" autocomplete="off" spellcheck="false" data-dirty-field="declare" data-label="sha256" aria-label="ファイルの sha256 (64 文字)" placeholder="64 文字 (NE に取り込んだファイルのもの)"></div></details>
+          </div></div>
+          <div class="f"><div class="lab" id="lr-<%= e.export_id %>">NE の結果<span class="req">必須</span></div><div class="ctl col"><div class="choices" role="radiogroup" aria-labelledby="lr-<%= e.export_id %>">
+            <% for (const [k, v] of Object.entries(RESULTS)) { const d = RESULT_DESC[k] || ['i-info', '']; %><label class="choice r-<%= k %>"><input type="radio" name="result-<%= e.export_id %>" value="<%= k %>" data-dirty-field="declare" data-label="NE の結果"><span class="ct"><svg class="ic s" aria-hidden="true"><use href="#<%= d[0] %>"/></svg><%= v.replace(/ \(.*\)$/, '') %></span><span class="cs"><%= d[1] %></span></label><% } %>
+          </div></div></div>
+          <div class="f"><label class="lab" for="nem-<%= e.export_id %>">NE のメッセージ</label><div class="ctl"><input class="in w-l" id="nem-<%= e.export_id %>" name="ne_message" maxlength="1000" autocomplete="off" data-dirty-field="declare" data-label="NE のメッセージ" placeholder="例: 1件成功しました。"></div></div>
+          <div class="f"><label class="lab" for="imp-<%= e.export_id %>">取り込んだ時刻<span class="opt">なくてもよい</span></label><div class="ctl"><input class="in w-m" type="datetime-local" step="1" id="imp-<%= e.export_id %>" name="imported_at" data-dirty-field="declare" data-label="取り込んだ時刻"><button class="btn ghost sm" type="button" data-now>いまの時刻を入れる</button><span class="hint">日本時間 · 配った時刻より前・今より後は入れられません</span></div></div>
+          <div class="f"><label class="lab" for="note-<%= e.export_id %>">メモ<span class="opt">なくてもよい</span></label><div class="ctl"><input class="in w-l" id="note-<%= e.export_id %>" name="note" maxlength="500" autocomplete="off" data-dirty-field="declare" data-label="メモ"></div></div>
+          <div class="drawer-foot"><div class="msgline" data-msg role="status" aria-live="polite"></div><button class="btn ghost" type="button" data-act="close-drawer">やめる</button><button class="btn pri" type="button" data-act="declare"<%= dis %>>申告する</button></div>
+        </div>
+        <% } %>
+        <div class="drawer" id="dr-s-<%= e.export_id %>" data-drawer="supersede" hidden>
+          <div class="panel-h" style="margin-bottom:6px"><h3 style="font-size:15.5px">このファイルを使わない</h3><span class="sub">配った後なら、NE で何をしたかも書きます (この後に作り直せます)</span></div>
+          <div class="f"><label class="lab" for="sr-<%= e.export_id %>">理由<span class="req">必須</span></label><div class="ctl"><input class="in w-l" id="sr-<%= e.export_id %>" name="reason" maxlength="500" autocomplete="off" data-dirty-field="supersede" data-label="使わない理由" placeholder="例: 売価を直したい"></div></div>
+          <div class="f"><label class="lab" for="sc-<%= e.export_id %>">NE で何をしたか<span class="req">必須</span></label><div class="ctl"><input class="in w-l" id="sc-<%= e.export_id %>" name="correction" maxlength="500" autocomplete="off" data-dirty-field="supersede" data-label="NE で何をしたか" placeholder="例: NE には取り込んでいない / NE で取り込んだ商品を消した"></div></div>
+          <div class="f wide"><label class="check-row"><input type="checkbox" name="confirm" data-dirty-field="supersede" data-label="NE の状態を確かめた"><span>NE の状態を確かめた (取り込んでいない・取り込んだものは直した / 消した)</span></label></div>
+          <div class="drawer-foot"><div class="msgline" data-msg role="status" aria-live="polite"></div><button class="btn ghost" type="button" data-act="close-drawer">やめる</button><button class="btn danger" type="button" data-act="supersede"<%= dis %>>使わないにする</button></div>
+        </div>
+        <% } else if (e.trial && e.items.length && e.items.every((i) => i.state === 'verified')) { %>
+        <div class="callout info" style="margin:12px 0 0"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">試し用の商品が全部 NE で確かめ済みです</div><div class="hint">実機で NE の画面も見て問題なければ、この形を「実機で確かめた」にします (本番の行数で作れるようになります)。</div></div></div>
+        <div class="acts">
+          <button class="btn pri" type="button" data-act="verified" data-kind="<%= e.kind %>" data-result="ok"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>この形を「実機で確かめた」にする</button>
+          <button class="btn danger sm" type="button" data-act="verified" data-kind="<%= e.kind %>" data-result="ng"<%= dis %>>問題があった (ng)</button>
+        </div>
+        <% } %>
+        <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
+      </article>
+      <% } %>
+    </section>
+    <% } %>
+  </div>
+  <%- include('_footer') %>
+  <% if (S && S.applied) { %><script src="<%= base %>/public/me-regcsv.js?v=<%= assetV %>" defer></script><% } %>
+</body>
+</html>

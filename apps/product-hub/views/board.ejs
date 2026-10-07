@@ -2,6 +2,8 @@
 <style>
   /* かんばん: 列 = 工程、カード = 商品。列は横スクロール、列の中は縦スクロール */
   .kb { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 10px; align-items: flex-start; }
+  /* 表のタブ (NE要対応・📣 広告) ではカンバンを隠す。hidden 属性だけだと上の display:flex が勝って完了列が残る */
+  .kb[hidden] { display: none; }
   .kb-col { flex: 0 0 232px; background: #eef2f7; border-radius: 10px; padding: 8px; }
   .kb-col.system { background: #f1f5f9; border: 1px dashed #cbd5e1; }
   .kb-col-head { display: flex; align-items: baseline; gap: 6px; padding: 2px 4px 8px; }
@@ -25,6 +27,7 @@
   .kb-tag.ne-confirmed { background: #dcfce7; color: #166534; border-color: #86efac; }
   .kb-tag.ne-needs_action { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
   .kb-tag.decision { background: #e0e7ff; color: #3730a3; border-color: #a5b4fc; }
+  .kb-tag.ship-check { background: #fff7ed; color: #9a3412; border-color: #fdba74; font-weight: 700; }
   .kb-tag.setstep { background: #faf5ff; color: #7e22ce; border-color: #ddd6fe; }
   .kb-tab-n { display:inline-block; min-width:16px; padding:0 4px; border-radius:8px; background:#fecaca; color:#991b1b; font-size:11px; }
   .ne-table td { vertical-align: top; }
@@ -46,6 +49,7 @@
   .kb-tag.canva { background: #ecfeff; color: #155e75; border-color: #a5f3fc; }
   /* 🆕 入荷のときに撮ったパッケージ裏面の写真がある (2026-09-18) */
   .kb-tag.backlabel { background: #fff7ed; color: #9a3412; border-color: #fed7aa; font-weight: 600; }
+  .kb-tag.existing-page { background: #ecfeff; color: #0e7490; border-color: #a5f3fc; font-weight: 700; }
   .kb-tag.info-missing { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
   .kb-hold { font-size: 11px; font-weight: 600; color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 4px; padding: 1px 6px; margin: 2px 0; display: inline-block; }
   .kb-hold.kb-aiblock { color: #991b1b; background: #fee2e2; border-color: #ef4444; }
@@ -134,7 +138,7 @@
      TOP は工程を廃止した (2026-08-31) ので、出品ゲートと同じ「枠1 (_top) が登録されているか」で見る */
   .kb-imgtracks { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
   .kb-krow { display: flex; align-items: center; gap: 5px; color: #64748b; }
-  .kb-krow .kb-kname { flex: 0 0 62px; font-weight: 700; color: #475569; }   /* 「トップ画像」が折り返さない幅 */
+  .kb-krow .kb-kname { flex: 0 0 62px; font-weight: 700; color: #475569; }   /* 「トップ画像」「撮影指示書」(全角5文字) が折り返さない幅 */
   .kb-state { flex: 0 0 auto; font-weight: 700; border-radius: 4px; padding: 1px 7px; border: 1px solid; }
   .kb-state.done { background: #dcfce7; color: #166534; border-color: #86efac; }
   .kb-state.todo { background: #fff7ed; color: #b45309; border-color: #fdba74; }
@@ -165,6 +169,26 @@
   .kb-modal-box select, .kb-modal-box input[type="text"] {
     width: 100%; box-sizing: border-box; padding: 6px 8px; font-size: 13px;
     border: 1px solid #cbd5e1; border-radius: 6px; }
+  /* 📣 広告 (2026-09-28)。段階の色 = 未着手 灰 / KW作成済み 黄 / 出稿中 緑 / 停止 濃い灰 */
+  .kb-tag.ad-none { background: #f1f5f9; color: #64748b; border-color: #e2e8f0; }
+  .kb-tag.ad-kw_ready { background: #fef3c7; color: #92400e; border-color: #fcd34d; }
+  .kb-tag.ad-running { background: #dcfce7; color: #166534; border-color: #86efac; font-weight: 700; }
+  .kb-tag.ad-stopped { background: #e2e8f0; color: #334155; border-color: #94a3b8; }
+  .ad-table td { vertical-align: top; font-size: 12px; }
+  .ad-table tr.ad-warn > td { background: #fff7ed; }
+  .ad-warnmsg { color: #b45309; font-weight: 700; margin-top: 4px; }
+  .ad-late { color: #b91c1c; font-weight: 700; }
+  .ad-sub { color: #64748b; font-size: 11px; }
+  .ad-num { font-variant-numeric: tabular-nums; }
+  .ad-live { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+  .ad-live.on { background: #16a34a; }
+  .ad-live.off { background: #cbd5e1; }
+  .ad-hist { margin: 4px 0 0; padding-left: 16px; }
+  .ad-hist li { margin: 2px 0; }
+  .ad-types label { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; }
+  .ad-modal-box textarea { width: 100%; box-sizing: border-box; min-height: 60px; font-size: 13px; padding: 6px 8px;
+    border: 1px solid #cbd5e1; border-radius: 6px; }
+  .ad-stage-opts label { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
 </style>
 
 <%
@@ -202,6 +226,14 @@
     p.set('back', backParam);
     return `/apps/product-hub/detail/${id}?${p.toString()}`;
   };
+  // カードの楽天の状態 (「出品・展開」に落としたとき出品の確認を出すかの判定に使う)。
+  // done / skip = 聞かない。existing = 既存ページに追加する商品 (2026-09-25): RMS で手で直すので聞かない
+  const rkDataOf = (c) => {
+    if (c.rakutenRegisteredAt) return 'done';
+    const st = ((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '';
+    if (st === 'done' || st === 'skip') return st;
+    return c.existingPage ? 'existing' : st;
+  };
 %>
 
 <div class="wrap wide">
@@ -213,7 +245,9 @@
       <a class="kb-tab <%= boardView === 'set' ? 'on' : '' %>" href="<%= boardUrl({ view: 'set' }) %>">🧩 セット工程</a>
       <a class="kb-tab <%= boardView === 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'image' }) %>">🖼 画像で並べる</a>
       <a class="kb-tab <%= boardView === 'ne' ? 'on' : '' %>" href="<%= boardUrl({ view: 'ne' }) %>">📮 NE要対応<% if (typeof neCount !== 'undefined' && neCount > 0) { %> <span class="kb-tab-n"><%= neCount %></span><% } %></a>
+      <a class="kb-tab <%= boardView === 'ad' ? 'on' : '' %>" href="<%= boardUrl({ view: 'ad', assignee: '', filter: '' }) %>">📣 広告</a>
     </span>
+    <% if (boardView !== 'ad') { %>
     <a class="chip <%= !assigneeParam && !unassignedOnly && !checkingOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: '' }) %>">すべて</a>
     <%# 画像ビューは担当者で絞らない (2026-09-13 中原さん決定: 画像の工程は担当者を置かない)。
         「自分のボール」「未割り当て」「担当者で絞る」は全体・単品・セット工程のビューだけに出す
@@ -243,6 +277,7 @@
         <% } %>
       </select>
     <% } %>
+    <% } %><%# /boardView !== 'ad' (広告タブは担当者・確認中で絞らない = 広告の作業は工程の担当と別) %>
     <%# 検索 (2026-08-25 中原さん要望): 商品名・商品コードでカードを即時絞り込み (入力のたび・リロード不要) %>
     <input type="search" id="kb-search" placeholder="🔍 商品名・商品コード"
            style="width:190px; font-size:12px; padding:5px 9px; border:1px solid #cbd5e1; border-radius:8px;">
@@ -277,11 +312,20 @@
             : { state: 'todo', text: 'まだ', note: t.current ? t.current.label : '', stalledDays: t.stalledDays };
       const topDone = !!(c.image && c.image.top && c.image.top.registered);
       // 本番の構成 (2026-09-13 スタッフ要望)。縦列「仮構成」とは別の印なので、素材待ちなど
-      // 別の列にいても 済/まだ が読める。印が無くても ③素材待ちが済んでいれば 済 (composeStateOf)
+      // 別の列にいても 済/まだ が読める。印が無くても ④AI制作が済んでいれば 済 (composeStateOf)
       const cp = (c.image && c.image.compose) || null;
       const compose = !cp ? { state: 'off', text: '—' }
         : cp.excluded ? { state: 'off', text: '対象外' }
           : cp.done ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' };
+      // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない場合がある」
+      // ので、撮影・素材ステータス (商品が届いたか) とは別の行で 済/まだ を出す。
+      // 済 = 画像制作の「カメラ撮影指示URL」が入っている / 撮影不要の商品は作らないので対象外
+      const ci = (c.image && c.image.cameraInstruction) || null;
+      // 🚨 撮影不要を**先に**見る: Notion 取り込みは撮影・素材と撮影指示URL を別々に埋めるので、
+      // 「撮影依頼不要 + 古い撮影指示URL あり」が作れてしまう。URL を先に見ると「済」に出る
+      const camera = !ci ? { state: 'off', text: '—' }
+        : ci.notRequired ? { state: 'off', text: '対象外' }
+          : ci.registered ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' };
       return [
         {
           name: 'トップ画像',
@@ -289,7 +333,14 @@
           ...(topDone ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' }),
         },
         { name: '詳細画像', title: '商品詳細画像 (LP)。楽天登録・A+登録まで来たら「済」', ...detail },
-        { name: '構成', title: '本番の構成ができたか (縦列「仮構成」とは別。詳細画面の画像制作で「構成を済にする」/ ③素材待ちが済んでいれば 済)', ...compose },
+        { name: '構成', title: '本番の構成ができたか (縦列「仮構成」とは別。詳細画面の画像制作で「構成を済にする」/ ④AI制作が済んで ⑤デザイン修正 に移れば 済)', ...compose },
+        {
+          name: '撮影指示書',
+          title: camera.state === 'done' ? '撮影指示書 (カメラ撮影指示URL) が入っています'
+            : camera.state === 'off' && ci ? '撮影不要の商品なので撮影指示書は作りません'
+              : '撮影指示書 (カメラ撮影指示URL) がまだ入っていません。商品を発送していても指示書ができていないことがあります',
+          ...camera,
+        },
       ];
     };
   %>
@@ -354,7 +405,160 @@
     </div>
   <% } %>
 
-  <div class="kb"<%= boardView === 'ne' ? ' hidden' : '' %>>
+  <%# 📣 広告 (2026-09-28 中原さん「広告をかけた商品は何か・どこまでやったかを管理したい」)。
+      自社商品 × Amazon SP広告。段階と「調整した」は人の記録、KW と実績は画面を開いたときに読む。
+      記録と実績が食い違う行は上に集めて橙色にする (段階を実績で自動に書き換えはしない) %>
+  <% if (boardView === 'ad' && adOps) { %>
+    <%
+      const yen = (n) => '¥' + Number(n || 0).toLocaleString('ja-JP');
+      const md = (ymd) => ymd ? `${Number(ymd.slice(5, 7))}/${Number(ymd.slice(8, 10))}` : '';
+      const adSearch = (r) => `${r.name || ''} ${r.neCode || ''} ${r.asin || ''}`.toLowerCase();
+    %>
+    <div class="card" style="margin-top:10px;">
+      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
+        <button type="button" class="chip on ad-filter" data-stage="">すべて <%= adOps.rows.length %></button>
+        <% if (adOps.counts.warn > 0) { %>
+          <button type="button" class="chip ad-filter" data-stage="warn" style="border-color:#fdba74; color:#b45309;">⚠ 記録と実績が違う <%= adOps.counts.warn %></button>
+        <% } %>
+        <% for (const s of ['running', 'kw_ready', 'none', 'stopped']) { %>
+          <button type="button" class="chip ad-filter" data-stage="<%= s %>"><%= adOpsDefs.stageJa[s] %> <%= adOps.counts[s] %></button>
+        <% } %>
+        <span style="flex:1"></span>
+        <span class="muted" style="font-size:11px;">
+          <% if (adOps.actualLatest) { %>
+            実績 = Amazon 広告 (SP) の <%= md(adOps.actualFrom) %>〜<%= md(adOps.actualLatest) %> (<%= adOpsDefs.windowDays %>日)。
+            「表示中」= 直近 <%= adOpsDefs.activeDays %> 日に表示あり
+            <% if (adOps.actualStale) { %><span class="ad-late">・実績が <%= md(adOps.actualLatest) %> で止まっているので食い違いの判定はしていません</span><% } %>
+          <% } else { %>
+            <span class="ad-late">広告の実績がまだ届いていません (食い違いの判定はしていません)</span>
+          <% } %>
+        </span>
+      </div>
+      <% if (!adOps.rows.length) { %>
+        <p class="muted" style="margin:0;">自社商品 (「自社商品」にチェックのある商品) がありません。</p>
+      <% } else { %>
+        <table class="list ad-table">
+          <thead>
+            <tr><th>商品</th><th style="width:190px;">段階</th><th style="width:150px;">SP広告KW</th>
+              <th style="width:230px;">実績 (直近<%= adOpsDefs.windowDays %>日)</th><th style="width:150px;">調整</th><th style="width:170px;">記録</th></tr>
+          </thead>
+          <tbody>
+            <% for (const r of adOps.rows) { %>
+              <tr class="ad-row <%= r.warn ? 'ad-warn' : '' %>" data-ad-draft="<%= r.id %>" data-stage="<%= r.stage %>" data-warn="<%= r.warn ? 1 : 0 %>"
+                  data-search="<%= adSearch(r) %>">
+                <td>
+                  <a href="/apps/product-hub/detail/<%= r.id %>?back=<%= encodeURIComponent(backParam) %>"><%= r.name %></a>
+                  <% if (r.isSet) { %> <span class="kb-tag set">🎁 セット</span><% } %>
+                  <div class="ad-sub">
+                    <code><%= r.neCode %></code>
+                    <% if (r.asin) { %>・<a href="https://www.amazon.co.jp/dp/<%= r.asin %>" target="_blank" rel="noopener noreferrer"><%= r.asin %> ↗</a><% } else { %>・ASIN 未入力<% } %>
+                  </div>
+                  <% if (r.warn) { %><div class="ad-warnmsg">⚠ <%= r.warn %></div><% } %>
+                </td>
+                <td>
+                  <span class="kb-tag ad-<%= r.stage %>"><%= r.stageLabel %></span>
+                  <% if (r.stageOn) { %><span class="ad-sub"><%= md(r.stageOn) %>〜</span><% } %>
+                  <% if (r.campaignTypes.length) { %>
+                    <div class="ad-sub"><%= r.campaignTypes.map((t) => adOpsDefs.typeJa[t]).join('・') %></div>
+                  <% } %>
+                  <% if (r.stageMemo) { %><div class="ad-sub" title="<%= r.stageMemo %>">📝 <%= r.stageMemo.length > 40 ? r.stageMemo.slice(0, 40) + '…' : r.stageMemo %></div><% } %>
+                  <div style="margin-top:4px;">
+                    <button type="button" class="btn btn-sm ad-stage-btn" data-draft="<%= r.id %>" data-name="<%= r.name %>"
+                            data-stage="<%= r.stage %>" data-base="<%= r.stageEventId %>" data-types="<%= r.campaignTypes.join(',') %>" data-on="<%= r.stageOn || '' %>">段階を変える</button>
+                  </div>
+                </td>
+                <td>
+                  <% if (!r.kw) { %>
+                    <span class="ad-sub">未依頼</span>
+                  <% } else { %>
+                    <div>採用 <%= r.kw.adoptedKw %> 語<% if (r.kw.adoptedAsin) { %>・商品ターゲット <%= r.kw.adoptedAsin %><% } %></div>
+                    <div class="ad-sub"><%= r.kw.copiedOn ? `コピー ${md(r.kw.copiedOn)}` : 'まだコピーしていません' %></div>
+                  <% } %>
+                  <a class="ad-sub" href="/apps/product-hub/detail/<%= r.id %>?tab=tab-adkw&back=<%= encodeURIComponent(backParam) %>">SP広告KW を開く →</a>
+                </td>
+                <td class="ad-num">
+                  <% if (!r.linked) { %>
+                    <span class="ad-sub">Amazon の SKU・ASIN が結びつきません (ASIN を入れると実績が出ます)</span>
+                  <% } else if (!r.actual.lastActive) { %>
+                    <span class="ad-sub"><span class="ad-live off"></span>広告の実績なし</span>
+                  <% } else { %>
+                    <div>
+                      <span class="ad-live <%= r.actual.active ? 'on' : 'off' %>"></span><%= r.actual.active ? '表示中' : `最後に表示 ${md(r.actual.lastActive)}` %>
+                    </div>
+                    <div>広告費 <b><%= yen(r.actual.cost) %></b>・売上 <%= yen(r.actual.sales) %></div>
+                    <div class="ad-sub">ACOS <%= r.actual.acos == null ? '—' : r.actual.acos + '%' %>・クリック <%= r.actual.clicks %>・注文 <%= r.actual.units %> 個</div>
+                    <% if (r.actual.campaigns.length) { %>
+                      <details><summary class="ad-sub">キャンペーン <%= r.actual.campaigns.length %></summary>
+                        <ul class="ad-hist">
+                          <% for (const c of r.actual.campaigns) { %>
+                            <li><span class="ad-live <%= c.active ? 'on' : 'off' %>"></span><%= c.name %> <span class="ad-sub"><%= yen(c.cost) %><%= c.status ? `・${c.status}` : '' %></span></li>
+                          <% } %>
+                        </ul>
+                      </details>
+                    <% } %>
+                  <% } %>
+                  <% if (r.waitingActual) { %><div class="ad-sub">出稿後の実績待ち (実績は <%= md(adOps.actualLatest) %> まで・届いたら表示 0 かを判定します)</div><% } %>
+                  <% if (r.skippedSkus) { %><div class="ad-sub" title="構成に別の商品が混ざる SKU (詰め合わせ)・それが混ざる ASIN・2 つ以上の商品に結びつく SKU/ASIN の広告費は、どの商品にも入れていません">詰め合わせ・共有の SKU/ASIN <%= r.skippedSkus %> 件は数えていません<%= r.stage === 'running' && !r.actual.active ? ' (そちらに出ているかもしれないので「表示 0」の警告は出していません)' : '' %></div><% } %>
+                </td>
+                <td>
+                  <% if (r.lastAdjustOn) { %>
+                    <div>最終 <%= md(r.lastAdjustOn) %></div>
+                    <% if (r.lastAdjustMemo) { %><div class="ad-sub" title="<%= r.lastAdjustMemo %>">📝 <%= r.lastAdjustMemo.length > 30 ? r.lastAdjustMemo.slice(0, 30) + '…' : r.lastAdjustMemo %></div><% } %>
+                  <% } else { %><span class="ad-sub">記録なし</span><% } %>
+                  <% if (r.sinceAdjust != null) { %>
+                    <div class="<%= r.adjustStale ? 'ad-late' : 'ad-sub' %>"><%= r.sinceKind === 'adjust' ? '調整から' : '出稿から' %> <%= r.sinceAdjust %> 日</div>
+                  <% } %>
+                  <% if (r.stage === 'running') { %>
+                    <div style="margin-top:4px;"><button type="button" class="btn btn-sm ad-adjust-btn" data-draft="<%= r.id %>" data-name="<%= r.name %>" data-base="<%= r.stageEventId %>">調整した</button></div>
+                  <% } %>
+                </td>
+                <td>
+                  <% if (!r.history.length) { %><span class="ad-sub">まだ記録がありません</span><% } else { %>
+                    <details><summary class="ad-sub">最近の記録 <%= r.history.length %> 件</summary>
+                      <ul class="ad-hist ad-sub">
+                        <% for (const h of r.history) { %>
+                          <li><%= md(h.on) %>
+                            <%= h.kind === 'adjust' ? '調整した' : `→ ${h.stageLabel}` %><%= h.types.length ? `(${h.types.map((t) => adOpsDefs.typeJa[t]).join('・')})` : '' %>
+                            <%= h.memo ? `・${h.memo}` : '' %><%= h.actor ? `・${h.actor}` : '' %></li>
+                        <% } %>
+                      </ul>
+                    </details>
+                  <% } %>
+                </td>
+              </tr>
+            <% } %>
+          </tbody>
+        </table>
+      <% } %>
+    </div>
+
+    <%# 段階 / 調整した の入力 (カードごとに欄を置くと表が読めなくなるので 1 枚だけ置く) %>
+    <div class="kb-modal" id="ad-modal" role="dialog" aria-modal="true" aria-labelledby="ad-modal-title">
+      <div class="kb-modal-box ad-modal-box">
+        <div id="ad-modal-title" style="font-weight:700;"></div>
+        <div class="ad-stage-opts" id="ad-stage-opts">
+          <% for (const s of adOpsDefs.stages) { %>
+            <label><input type="radio" name="ad-stage" value="<%= s %>"> <span class="kb-tag ad-<%= s %>"><%= adOpsDefs.stageJa[s] %></span></label>
+          <% } %>
+        </div>
+        <div class="ad-types" id="ad-types" hidden>
+          <div class="ad-sub" style="margin-bottom:2px;">出したキャンペーン (1 つ以上)</div>
+          <% for (const t of adOpsDefs.types) { %>
+            <label><input type="checkbox" name="ad-type" value="<%= t %>"> <%= adOpsDefs.typeJa[t] %></label>
+          <% } %>
+        </div>
+        <label class="ad-sub"><span id="ad-date-label">やった日</span> <input type="date" id="ad-date" style="font-size:13px;"></label>
+        <label class="ad-sub" id="ad-memo-label">メモ</label>
+        <textarea id="ad-memo" maxlength="500"></textarea>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          <button type="button" class="btn btn-sm" id="ad-cancel">やめる</button>
+          <button type="button" class="btn btn-sm btn-primary" id="ad-save">記録する</button>
+        </div>
+      </div>
+    </div>
+  <% } %>
+
+  <div class="kb"<%= boardView === 'ne' || boardView === 'ad' ? ' hidden' : '' %>>
     <% for (const col of board.columns) { %>
       <div class="kb-col <%= col.role_code ? '' : 'system' %>" data-col="<%= col.code || col.key %>">
         <div class="kb-col-head">
@@ -363,6 +567,8 @@
         </div>
         <div class="kb-col-role">
           <%= col.role_code ? '' : '⚙️ 自動' %><%= col.stall_days ? `${col.role_code ? '' : ' / '}${col.stall_days}日で警告` : '' %>
+          <%# AI情報入力待ちは担当者なら手でも動かせる (2026-09-25)。「自動」だけだと触れない列に見える %>
+          <%= col.code === 'ai_generate' ? ' / 手でも動かせます' : '' %>
         </div>
         <div class="kb-body">
           <% if (col.cards.length === 0) { %>
@@ -376,7 +582,7 @@
                  data-set="<%= c.isSet ? '1' : '' %>"
                  data-current="<%= currentCode || '' %>"
                  <%# 楽天の状態 (2026-09-01): 「出品・展開」に落としたとき、済み/対象外なら出品の確認を出さない %>
-                 data-rk="<%= c.rakutenRegisteredAt ? 'done' : (((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '') %>"
+                 data-rk="<%= rkDataOf(c) %>"
                  data-name="<%= c.name || '' %>"
                  data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
             <label class="kb-pick" title="まとめて移動するカードを選ぶ"><input type="checkbox" class="kb-pick-box" aria-label="まとめて移動するカードを選ぶ"></label>
@@ -399,6 +605,20 @@
                 <div class="kb-hold kb-checking <%= (c.checking.days || 0) >= 7 ? 'long' : '' %>" title="<%= c.checking.note || '' %>">
                   🔍 確認中: <%= c.checking.label %><%= c.checking.days ? ` (${c.checking.days}日)` : '' %>
                 </div>
+              <% } %>
+              <%# 既存の楽天ページへの追加 (カラバリ追加など・2026-09-25 スタッフ要望)。ページ編集は目視・手作業なので、
+                  新規ページのカードと見分けられるようにする。自動判定か人が決めたかは title で分かる %>
+              <%# 📣 広告の段階 (2026-09-28)。未着手は出さない (出品前の商品に札が並ぶだけになる) %>
+              <% if (adStages.get(c.id)) { %>
+                <div class="kb-tags"><span class="kb-tag ad-<%= adStages.get(c.id) %>" title="Amazon SP広告の段階 (📣 広告タブで記録)">📣 <%= adOpsDefs.stageJa[adStages.get(c.id)] %></span></div>
+              <% } %>
+              <%# Company DB の新商品の登録から作ったカードで、発送方法 (送料コード) に楽天の配送方法の対応が無かった (2026-10-01)。
+                  推し量らずに空のまま置いている = 人が選ぶ。楽天の配送方法を保存すると札は消える %>
+              <% if (locals.cdbShippingCheck && locals.cdbShippingCheck.has(c.id)) { %>
+                <div class="kb-tags"><span class="kb-tag ship-check" title="新商品の登録の発送方法 (送料コード) に楽天の配送方法の対応がありません。詳細画面で配送方法を選んでください">⚠ 発送方法 要確認</span></div>
+              <% } %>
+              <% if (c.existingPage) { %>
+                <div class="kb-tags"><span class="kb-tag existing-page" title="<%= c.addedToNeCode ? `出品済みのページ「${c.addedToNeCode}」に NE で色 (SKU) が足されたので出したカードです` : (c.existingPageAuto ? 'NE の同じグループに前からある商品があるので自動で付けました。違うときは商品詳細の基本情報で直せます' : '商品詳細で「既存ページに追加」に設定されています') %>">📄 既存ページ<%= c.addedToNeCode ? `: ${c.addedToNeCode} に色追加` : (c.existingPageAuto ? '' : ' (手動)') %></span></div>
               <% } %>
               <%# 🆕 入荷のときに撮ったパッケージ裏面の写真がある (2026-09-18)。
                   「パッケージ裏面の確認待ち」で止めなくても、カードを開けば実物の表記が読める %>
@@ -519,6 +739,15 @@
                 </div>
               <% } else if (rkMall && rkMall.state === 'skip') { %>
                 <div class="kb-rk kb-rk-skip">🛒 楽天: 対象外</div>
+              <% } else if (c.existingPage) { %>
+                <%# 既存ページに追加する商品 (2026-09-25)。出品ボタンを出すと別ページができる/409 になるので出さない。
+                    直すページは 追加先のカードの商品コード (無ければこのカードの商品コード = 代表商品コード) %>
+                <% const pageCode = c.addedToNeCode || c.ne_code; %>
+                <div class="kb-rk kb-rk-skip">
+                  📄 既存ページに追加: 楽天は RMS でページ「<%= String(pageCode || '').toLowerCase() %>」を手で編集
+                  <% if (typeof rakutenRmsItemUrl === 'function' && pageCode) { %><a href="<%= rakutenRmsItemUrl(pageCode) %>" target="_blank" rel="noopener" class="kb-rk-link">RMS ↗</a><% } %>
+                  <div class="kb-rk-note">済んだら詳細画面の「モール別の展開状況」で楽天を完了に</div>
+                </div>
               <% } else if (rkOutcome === 'running' && !rkStale) { %>
                 <div class="kb-rk kb-rk-busy">⏳ 楽天に出品しています… (画像転送 → 登録)</div>
               <% } else if (rkOutcome === 'unknown' || rkStale) { %>
@@ -583,7 +812,7 @@
                data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>" data-current=""
                <%# 完了列から「出品・展開」へ差し戻したときも、楽天の済み/対象外と商品名を見て確認を出す
                    (2026-09-10 監査: これが無いと商品名が空の確認が出て、対象外の商品にも聞いていた) %>
-               data-rk="<%= c.rakutenRegisteredAt ? 'done' : (((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '') %>"
+               data-rk="<%= rkDataOf(c) %>"
                data-name="<%= c.name || '' %>"
                data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
           <label class="kb-pick" title="まとめて移動するカードを選ぶ"><input type="checkbox" class="kb-pick-box" aria-label="まとめて移動するカードを選ぶ"></label>
@@ -597,6 +826,8 @@
               </div>
             <% } %>
             <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
+            <% if (c.existingPage) { %><div class="kb-tags"><span class="kb-tag existing-page">📄 既存ページ</span></div><% } %>
+            <% if (adStages.get(c.id)) { %><div class="kb-tags"><span class="kb-tag ad-<%= adStages.get(c.id) %>" title="Amazon SP広告の段階 (📣 広告タブで記録)">📣 <%= adOpsDefs.stageJa[adStages.get(c.id)] %></span></div><% } %>
             <div class="kb-card-top">
               <% if (c.card_image_id) { %>
                 <img class="kb-thumb" src="<%= thumbnailUrl(c.card_image_id, 160, c.card_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
@@ -638,7 +869,7 @@
     </div>
   </div>
 
-  <p class="muted" style="margin-top:14px;">
+  <p class="muted" style="margin-top:14px;"<%= boardView === 'ne' || boardView === 'ad' ? ' hidden' : '' %>>
     カードをクリックすると商品の詳細が開き、そこで工程を進められます。
     カードは<strong>ドラッグで動かせます</strong> — 別の列に落とすと工程が進み、同じ列の中で上下に動かすと<strong>並び順</strong>が保存されます (次に開いてもその順のまま)。
     並べ替えた列にあとから入ってきたカードは、いちばん下に付きます (上から順にやれば先に来たものから片付く)。
@@ -1034,6 +1265,8 @@
     const body = col.querySelector('.kb-body');
     const moved = [];
     const errors = [];
+    const blocked = [];
+    const blockedEls = [];
     for (const c of group) {
       // 落とした列に元からいたカードは工程を動かさない (並び順だけ揃える)
       if (c.dataset.fromCol === to) { moved.push(c); continue; }
@@ -1045,7 +1278,15 @@
           }),
         });
         const j = await res.json();
-        if (j.ok) moved.push(c); else errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': ' + (j.error || '移動できませんでした'));
+        if (j.ok) {
+          moved.push(c);
+          // 移動はできたが落とした列に止まらなかったカードも知らせる (1 枚ずつのドロップと同じ理由)
+          if (j.reopenBlocked) {
+            blocked.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 「' + j.reopenBlocked.label + '」を開き直せないため先の工程に進みました ('
+              + j.reopenBlocked.message + ')');
+            blockedEls.push(c);
+          }
+        } else errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': ' + (j.error || '移動できませんでした'));
       } catch (err) {
         errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 通信エラー ' + err.message);
       }
@@ -1061,10 +1302,14 @@
         if (after) after.after(c); else if (ref && ref.parentNode === body) ref.after(c); else body.appendChild(c);
         after = c;
       }
+      // 落とした列に止まらないカード (開き直せなかった) は並び順に残さない。
+      // この後すぐ読み直すので、保存の前に列から外すだけでよい (1 枚ずつのドロップと同じ扱い)
+      for (const c of blockedEls) c.remove();
       await saveOrder(col);
     }
     let msg = '';
     if (errors.length) msg += moved.length + ' 件を移動しました。移動できなかったカード (' + errors.length + ' 件):\n\n' + errors.join('\n');
+    if (blocked.length) msg += (msg ? '\n\n' : '') + '落とした列に止まらなかったカード (' + blocked.length + ' 件):\n\n' + blocked.join('\n');
     // 1 枚ずつ落としたときに出る「楽天に出品しますか」は、まとめて移動では出さない (続けて何件も公開しない)
     if (moved.length && BOARD_VIEW !== 'image' && to === 'listing') {
       msg += (msg ? '\n\n' : '') + 'まとめて移動したときは楽天への出品の確認を出しません。出品は 1 枚ずつ「出品・展開」に落とすか、詳細画面から行ってください';
@@ -1177,6 +1422,7 @@
         return;
       }
       let moved = false;
+      let reopenBlocked = null;
       try {
         const res = await fetch('/apps/product-hub/api/drafts/' + card.dataset.draft + '/board-move', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1188,20 +1434,29 @@
           }),
         });
         const j = await res.json();
-        if (j.ok) moved = true; else alert(j.error || '移動できませんでした');
+        if (j.ok) { moved = true; reopenBlocked = j.reopenBlocked || null; } else alert(j.error || '移動できませんでした');
       } catch (err) {
         alert('通信エラー: ' + err.message);
       }
+      // 落とした列の工程を開き直せなかった = カードは**その先の列**に出る。
+      // 黙っていると、いま直している「落とした列に止まらない」症状と見分けが付かない。
+      // 理由はサーバーの文面をそのまま出す (権限が足りない / 楽天が「対象外」 など)
+      if (moved && reopenBlocked) {
+        alert('移動しました。ただし「' + reopenBlocked.label + '」は開き直せなかったので、'
+          + 'カードはその先の工程に進みます。理由: ' + reopenBlocked.message);
+      }
       // 工程が動いたときだけ、落とした位置を並び順として残す (失敗時に位置だけ残ると
-      // 読み直しで元の列に戻ったカードが変な順で並ぶ)
-      if (moved) await saveOrder(col);
+      // 読み直しで元の列に戻ったカードが変な順で並ぶ)。
+      // 開き直せなかったときは落とした列に止まらないので、その列の並び順は保存しない
+      if (moved && !reopenBlocked) await saveOrder(col);
       // 「出品・展開」に落とした = 楽天に出す番 (2026-09-01 中原さん要望)。工程移動が済んだあとに
       // 確認を出し、OK なら 画像転送 → 公開で登録 まで続ける。取りやめても工程移動は残る。
       // 楽天が済み/対象外の商品 (他モールの展開で戻ってきた等) には聞かない。
       // 列の軸が本流のビュー (全体・単品・セット工程) はどれも同じ「出品・展開」の列なので同じに扱う
       // (2026-09-10 監査: 全体タブ限定だったため、単品タブで落とすと工程だけ動いて出品の確認が出なかった)
+      // 既存ページに追加する商品 (data-rk=existing・2026-09-25) も聞かない — 楽天のページは RMS で手で直す
       if (moved && BOARD_VIEW !== 'image' && to === 'listing'
-          && card.dataset.rk !== 'done' && card.dataset.rk !== 'skip') {
+          && card.dataset.rk !== 'done' && card.dataset.rk !== 'skip' && card.dataset.rk !== 'existing') {
         await listToRakuten(card.dataset.draft, card.dataset.name || '');
       }
       // 成否どちらでも読み直す (成功 = 列とステータスの再描画 / 失敗 = カードを元の位置へ)。
@@ -1285,4 +1540,106 @@
       }
     });
   });
+
+  // ─── 📣 広告 (2026-09-28) ───
+  // 段階のチップ + 検索ボックスで行を絞る / 「段階を変える」「調整した」は 1 枚のダイアログで聞く
+  (function () {
+    const rows = Array.prototype.slice.call(document.querySelectorAll('tr.ad-row'));
+    if (!rows.length) return;
+    let stageFilter = '';
+    const search = document.getElementById('kb-search');
+    function applyAdFilter() {
+      const q = search ? search.value.trim().toLowerCase() : '';
+      rows.forEach(function (tr) {
+        const okStage = !stageFilter || (stageFilter === 'warn' ? tr.dataset.warn === '1' : tr.dataset.stage === stageFilter);
+        const okText = !q || (tr.dataset.search || '').indexOf(q) !== -1;
+        tr.style.display = okStage && okText ? '' : 'none';
+      });
+    }
+    document.querySelectorAll('.ad-filter').forEach(function (b) {
+      b.addEventListener('click', function () {
+        stageFilter = b.dataset.stage || '';
+        document.querySelectorAll('.ad-filter').forEach(function (o) { o.classList.toggle('on', o === b); });
+        applyAdFilter();
+      });
+    });
+    if (search) search.addEventListener('input', applyAdFilter);
+    applyAdFilter();
+
+    const modal = document.getElementById('ad-modal');
+    const title = document.getElementById('ad-modal-title');
+    const stageOpts = document.getElementById('ad-stage-opts');
+    const typesBox = document.getElementById('ad-types');
+    const dateInput = document.getElementById('ad-date');
+    const memo = document.getElementById('ad-memo');
+    const memoLabel = document.getElementById('ad-memo-label');
+    const saveBtn = document.getElementById('ad-save');
+    let ctx = null;   // {mode:'stage'|'adjust', draft, base}
+    function todayJst() { return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10); }
+    function checkedStage() { const r = stageOpts.querySelector('input[name="ad-stage"]:checked'); return r ? r.value : ''; }
+    const dateLabel = document.getElementById('ad-date-label');
+    // 出稿中のまま記録し直す (種類・メモの更新) ときの日付 = 出稿開始日。今の開始日を入れておく =
+    // 触らなければ開始日は変わらない・直せば訂正 (それ以外の段階へ変えるときは「やった日」= 今日)
+    function keepsRunning() { return ctx && ctx.mode === 'stage' && ctx.curStage === 'running' && checkedStage() === 'running'; }
+    function syncDate() {
+      if (!ctx || ctx.mode !== 'stage') { dateLabel.textContent = 'やった日'; return; }
+      const keep = keepsRunning();
+      dateLabel.textContent = keep ? '出稿開始日 (種類・メモだけ直すときは変えない)' : 'やった日';
+      dateInput.value = keep && ctx.startOn ? ctx.startOn : todayJst();
+    }
+    function syncStageUi() {
+      const s = checkedStage();
+      typesBox.hidden = !(ctx && ctx.mode === 'stage' && s === 'running');
+      memoLabel.textContent = ctx && ctx.mode === 'stage' && s === 'stopped' ? '止めた理由 (必須)' : 'メモ (任意)';
+    }
+    stageOpts.addEventListener('change', function () { syncStageUi(); syncDate(); });
+    function open(mode, btn) {
+      ctx = { mode: mode, draft: btn.dataset.draft, base: Number(btn.dataset.base || 0), curStage: btn.dataset.stage || '', startOn: btn.dataset.on || '' };
+      title.textContent = (mode === 'stage' ? '段階を変える: ' : '調整した: ') + (btn.dataset.name || '');
+      stageOpts.hidden = mode !== 'stage';
+      stageOpts.querySelectorAll('input[name="ad-stage"]').forEach(function (r) { r.checked = r.value === btn.dataset.stage; });
+      const types = (btn.dataset.types || '').split(',').filter(Boolean);
+      typesBox.querySelectorAll('input[name="ad-type"]').forEach(function (c) { c.checked = types.indexOf(c.value) !== -1; });
+      dateInput.value = todayJst();
+      dateInput.max = todayJst();
+      memo.value = '';
+      memo.placeholder = mode === 'stage' ? '例: 自動キャンペーンは入札 40 円で開始' : '例: 入札を 40→30 円 / 除外KW を 5 語追加';
+      syncStageUi();
+      syncDate();
+      saveBtn.disabled = false;
+      modal.style.display = 'block';
+    }
+    function close() { modal.style.display = 'none'; ctx = null; }
+    document.querySelectorAll('.ad-stage-btn').forEach(function (b) { b.addEventListener('click', function () { open('stage', b); }); });
+    document.querySelectorAll('.ad-adjust-btn').forEach(function (b) { b.addEventListener('click', function () { open('adjust', b); }); });
+    document.getElementById('ad-cancel').addEventListener('click', close);
+    modal.addEventListener('click', function (e) { if (e.target === modal) close(); });
+    saveBtn.addEventListener('click', async function () {
+      if (!ctx) return;
+      // 段階も調整も、見ていた段階の行 id を送る (別の人が先に変えていたら 409)
+      const body = { kind: ctx.mode, happened_on: dateInput.value, memo: memo.value, base_stage_event_id: ctx.base };
+      if (ctx.mode === 'stage') {
+        body.stage = checkedStage();
+        if (!body.stage) { alert('段階を選んでください'); return; }
+        if (body.stage === 'running') {
+          body.campaign_types = Array.prototype.slice.call(typesBox.querySelectorAll('input[name="ad-type"]:checked')).map(function (c) { return c.value; });
+          if (!body.campaign_types.length) { alert('出したキャンペーンを 1 つ以上選んでください'); return; }
+        }
+        if (body.stage === 'stopped' && !memo.value.trim()) { alert('止めた理由を入れてください'); return; }
+      }
+      saveBtn.disabled = true;
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + ctx.draft + '/ad-ops', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const j = await res.json().catch(function () { return {}; });
+        if (j.ok) { location.reload(); return; }
+        alert(j.error || '記録できませんでした');
+        if (res.status === 409) { location.reload(); return; }
+        saveBtn.disabled = false;
+      } catch (err) {
+        alert('通信に失敗しました'); saveBtn.disabled = false;
+      }
+    });
+  })();
 </script>

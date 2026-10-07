@@ -20,6 +20,7 @@ import fs from 'fs';
 import multer from 'multer';
 import iconv from 'iconv-lite';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
+import { readNeCodesForRequest, resolveLzCode, neCodesStatus } from './ne-codes.js';
 import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition, logizardMirrorLatestCapture, targetRule } from './logic.js';
 import {
   ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand,
@@ -38,6 +39,7 @@ import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js'
 import { computeShortageRisk, shortageSettings, validateShortageSetting, shortageSettingKey, SHORTAGE_DEFAULTS } from './shortage-risk.js';
 import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 import { startFbaAutoRefresh, nextBusinessDay9Jst } from './scheduler.js';
+import { masterLegacyGate, legacyRecheck } from '../../lib/master-legacy-gate.mjs';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
@@ -68,6 +70,10 @@ async function callWarehouse(fullPath, { method = 'GET', timeout = 30000 } = {})
 startFbaAutoRefresh(callWarehouse); // 平日16時 (JST) のFBA在庫自動更新 (土日祝スキップ・Render限定。中原さん要望 2026-08-27)
 
 const router = Router();
+// 🚨 マスタの古い入口の門 (Company DB構想 10 §4 #7・PR #1565 R1 H4)。仕入先 (po_suppliers) を書く API (マスタ管理の仕入先タブ・宛先の CSV・一括取込) は
+//    legacy_open は全部開く。それ以降は列ごとの持ち主 (active ∪ prepared) とその入口の owner_cols で決める (prepare しただけでは閉じない = 閉じ始めるのは frozen にした時点・cancel で再び開き得る) = owner_cols のどれかが C のときだけ閉じる (⑤-3b・列が全部 load の入口は開いたまま)・段階 / 持ち主が読めない = 410 / 503 (切替の手順で書き込み先を Company DB に替えるまで仕入先は見るだけ)。
+//    仕入先でないマスタ (発注条件・資材・属性・先方品番) は止めない (config/master-legacy-entries.mjs の when)
+router.use(masterLegacyGate('purchase-orders'));
 
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
 if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }
@@ -1466,7 +1472,7 @@ router.post('/api/email/mode', (req, res) => {
 });
 
 // 宛先マスタCSV取込 (既存GASスプシ「仕入先ごとの発注メール送信先一覧」の生DL。仕入先名称で突合)
-router.post('/api/email/recipients/csv', upload.single('file'), (req, res) => {
+router.post('/api/email/recipients/csv', upload.single('file'), legacyRecheck('purchase-orders:POST:/api/email/recipients/csv'), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'ファイルがありません' });
     let buf;
@@ -1775,7 +1781,10 @@ const QPU_ERR = `入数は0より大きく${QPU_MAX.toLocaleString('ja-JP')}以�
 
 // 変換コア: 明細 [{vendorCode, vendorName, qty}] → ロジザード貼り付けデータ (手動貼り付け/メール自動取得の共通処理)。
 // lines = 明細を元の順序のまま「左=仕入先 (番号/商品名/数量)・右=弊社 (コード/商品名/入数換算後の入荷予定数/単価)」で返す
-function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
+/**
+ * ne = Company DB の NE の元の書き方 (ne-codes.js readNeCodesForRequest の結果。M6)。無い・読めない = 今の動き
+ */
+function convertShipmentItems(db, supplier, supplierName, items, skipped = [], ne = null) {
   // 対応表の逆引き: 先方番号 → 弊社商品コード (同じ先方番号が複数商品に付いている場合は ambiguous)
   const rev = new Map();
   const mappedByKey = new Map(); // 弊社商品コード → 対応表の行 (仮商品コードとの衝突検出用)
@@ -1805,7 +1814,7 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
     `SELECT id, vendor_code_norm, provisional_product_code, provisional_qty_per_unit FROM po_vendor_code_pending
       WHERE supplier_code=? AND status='pending' AND provisional_product_code IS NOT NULL AND TRIM(provisional_product_code) <> ''`)
     .all(supplier).map(r => [r.vendor_code_norm, r]));
-  const okRows = [], unmatched = [], ambiguous = [], lines = [], qtyInvalid = [], provisionalRows = [], provisionalConflicts = [];
+  const okRows = [], unmatched = [], ambiguous = [], lines = [], qtyInvalid = [], provisionalRows = [], provisionalConflicts = [], caseBlocked = [];
   let totalQty = 0, totalVendorQty = 0;
   for (const it of items) {
     totalVendorQty += it.qty;
@@ -1836,9 +1845,9 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
       const pqty = Math.round(praw);
       const provRow = {
         vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty,
-        productCode: canonicalByKey.get(pkey) || codeByKey.get(pkey) || trimS(prov.provisional_product_code),
+        // 商品コードの優先順 (M6): NE本来表記 (canonical) → Company DB の NE の元の書き方 → PML表記 → 仮コードの入力値
+        ...resolveLzCode({ key: pkey, canonical: canonicalByKey.get(pkey) || null, fallback: codeByKey.get(pkey) || trimS(prov.provisional_product_code), ne }),
         productName: nameByKey.get(pkey) || '',
-        caseVerified: canonicalByKey.has(pkey),
         qtyPerUnit: pqpu, qty: pqty,
         cost: costByKey.has(pkey) ? costByKey.get(pkey) : null,
         provisional: true, provisionalCode: trimS(prov.provisional_product_code), pendingId: prov.id,
@@ -1846,6 +1855,11 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
       if (!Number.isSafeInteger(pqty) || pqty <= 0 || Math.abs(praw - pqty) > 1e-6) {
         qtyInvalid.push({ vendorCode: it.vendorCode, vendorQty: it.qty, productCode: provRow.productCode, qtyPerUnit: pqpu });
         lines.push({ ...provRow, type: 'provisional', qty: null, qtyBad: true });
+        continue;
+      }
+      if (provRow.pasteBlocked) { // NE に大文字・小文字だけ違うコードが 2 つ = どちらの商品か決められない = 貼り付けから外す (M6 v3 H1)
+        caseBlocked.push({ vendorCode: it.vendorCode, productCode: provRow.productCode, qty: pqty, reason: provRow.pasteBlocked });
+        lines.push({ ...provRow, type: 'caseblocked' });
         continue;
       }
       okRows.push(provRow);
@@ -1874,12 +1888,17 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
     const cost = costByKey.get(hit.product_key);
     const row = {
       vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty,
-      // 商品コードの優先順: NE本来表記 (canonical) → PML表記 (小文字化済み) → 対応表の表記
-      productCode: canonicalByKey.get(hit.product_key) || codeByKey.get(hit.product_key) || hit.product_code,
+      // 商品コードの優先順 (M6): NE本来表記 (canonical) → Company DB の NE の元の書き方 → PML表記 (小文字化済み) → 対応表の表記
+      // caseVerified = NE本来表記で出力できたか (canonical か Company DB)
+      ...resolveLzCode({ key: hit.product_key, canonical: canonicalByKey.get(hit.product_key) || null, fallback: codeByKey.get(hit.product_key) || hit.product_code, ne }),
       productName: nameByKey.get(hit.product_key) || '',
-      caseVerified: canonicalByKey.has(hit.product_key), // NE本来表記で出力できたか
       qtyPerUnit: qpu, qty, cost: cost == null ? null : cost,
     };
+    if (row.pasteBlocked) { // NE に大文字・小文字だけ違うコードが 2 つ = 貼り付けから外す (M6 v3 H1)
+      caseBlocked.push({ vendorCode: it.vendorCode, productCode: row.productCode, qty, reason: row.pasteBlocked });
+      lines.push({ type: 'caseblocked', ...row });
+      continue;
+    }
     okRows.push(row);
     lines.push({ type: 'ok', ...row });
     totalQty += qty;
@@ -1893,14 +1912,20 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
     costMissing: okRows.filter(r2 => r2.cost == null).map(r2 => r2.productCode),
     // NE本来表記が未蓄積 (小文字のまま出力)。仮商品コードの行はそもそもNE未登録なので別枠で警告する
     caseUnverified: okRows.filter(r2 => !r2.caseVerified && !r2.provisional).map(r2 => r2.productCode),
+    // Company DB の NE の書き方から分かった注意 (出どころに関係なく) と、貼り付けから外した行 (M6)
+    caseWarnings: lines.filter(l => l.caseWarning).map(l => ({ productCode: l.productCode, reason: l.caseWarning, neCode: l.neCode })),
+    caseBlocked,
+    neCodes: neCodesStatus(ne),
     provisionalRows: provisionalRows.map(r2 => ({ vendorCode: r2.vendorCode, productCode: r2.productCode, qty: r2.qty })),
     provisionalConflicts,
     unmatched, ambiguous, skipped, qtyInvalid,
   };
 }
 
-router.post('/api/inbound-plan/convert', (req, res) => {
+router.post('/api/inbound-plan/convert', async (req, res) => {
   try {
+    // Company DB の NE の元の書き方 (3 秒まで。読めなくても変換は止めない)。台帳などを読む前に待つ (待っている間の変更を取りこぼさない)
+    const ne = await readNeCodesForRequest();
     const db = getDB();
     const supplier = normSupplierCode((req.body || {}).supplier_code);
     if (!supplier) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
@@ -1908,7 +1933,7 @@ router.post('/api/inbound-plan/convert', (req, res) => {
     if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
     const { items, skipped } = parseShipmentLines((req.body || {}).text);
     if (!items.length) return res.status(400).json({ ok: false, error: '解析できる行がありません (出荷明細の「商品コード〜出荷数量」の行を貼り付けてください)', skipped });
-    res.json(convertShipmentItems(db, supplier, sup.name, items, skipped));
+    res.json(convertShipmentItems(db, supplier, sup.name, items, skipped, ne));
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -1926,8 +1951,9 @@ router.get('/api/inbound-plan/mails', (req, res) => {
 });
 
 // メールの解析済み明細を変換 (手動貼り付けと同じ応答形+mailId)
-router.post('/api/inbound-plan/mails/:id/convert', (req, res) => {
+router.post('/api/inbound-plan/mails/:id/convert', async (req, res) => {
   try {
+    const ne = await readNeCodesForRequest();   // メール・対応表を読む前に待つ
     const db = getDB();
     const id = Number(req.params.id);
     const mail = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
@@ -1937,15 +1963,18 @@ router.post('/api/inbound-plan/mails/:id/convert', (req, res) => {
     if (!Array.isArray(items)) return res.status(400).json({ ok: false, error: 'このメールは発注書参照方式です (🔁 変換 (発注書参照) を使ってください)' });
     if (!items.length) return res.status(400).json({ ok: false, error: '解析済みの明細がありません' });
     const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(mail.supplier_code);
-    res.json({ ...convertShipmentItems(db, mail.supplier_code, (sup && sup.name) || mail.supplier_code, items), mailId: id });
+    res.json({ ...convertShipmentItems(db, mail.supplier_code, (sup && sup.name) || mail.supplier_code, items, [], ne), mailId: id });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ─── PO参照変換 (サロンジェ: 出荷明細が無く、こちらの発注書に対応して出荷される) ───
 // orderIds なし → PO選択候補 (残数のあるオープンPO) を返す / あり → 台帳の明細から入荷予定の行を作る。
 // 例外 (欠品/終売) は自動確定しない: 商品コード含有=強一致 (除外提案) / 商品名トークン一致=弱一致 (ハイライトのみ)
-router.post('/api/inbound-plan/mails/:id/po-convert', (req, res) => {
+router.post('/api/inbound-plan/mails/:id/po-convert', async (req, res) => {
   try {
+    // 行を作るとき (orderIds あり) だけ Company DB を読む。台帳 (残数) を読む前に待つ = 待っている間の入荷・減数・取消を取りこぼさない (Codex #1501 R1 Medium)
+    const wantLines = Array.isArray((req.body || {}).orderIds) && (req.body || {}).orderIds.length > 0;
+    const ne = wantLines ? await readNeCodesForRequest() : null;
     const db = getDB();
     const id = Number(req.params.id);
     const mail = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
@@ -1980,7 +2009,7 @@ router.post('/api/inbound-plan/mails/:id/po-convert', (req, res) => {
       if (!o) return res.status(400).json({ ok: false, error: `PO #${oid} はこの仕入先のオープンな発注ではありません (完了済み/別仕入先の可能性)。一覧を更新して選び直してください` });
       chosen.push(o);
     }
-    // 商品ID表記 (canonical=NE本来表記 優先) と PML原価 (PO単価が無い明細の補完用。出所は costSource で明示)
+    // 商品ID表記 (canonical=NE本来表記 優先 → Company DB の NE の元の書き方 (M6。先頭で読んだ ne)) と PML原価 (PO単価が無い明細の補完用。出所は costSource で明示)
     const canonicalByKey = new Map(db.prepare('SELECT product_key, product_code FROM po_product_code_canonical').all()
       .map(r => [r.product_key, r.product_code]));
     const costByKey = new Map(), codeByKey = new Map();
@@ -2023,8 +2052,7 @@ router.post('/api/inbound-plan/mails/:id/po-convert', (req, res) => {
         const pmlCost = costByKey.get(key);
         lines.push({
           orderId: o.id, poNumber: o.poNumber || `#${o.id}`, orderItemId: i.id,
-          productCode: canonicalByKey.get(key) || codeByKey.get(key) || i.product_code,
-          caseVerified: canonicalByKey.has(key),
+          ...resolveLzCode({ key, canonical: canonicalByKey.get(key) || null, fallback: codeByKey.get(key) || i.product_code, ne }),
           productName: i.product_name || '', remaining: i.remaining_qty,
           cost: i.unit_cost != null ? i.unit_cost : (pmlCost != null ? pmlCost : null),
           costSource: i.unit_cost != null ? 'po' : (pmlCost != null ? 'pml' : 'none'),
@@ -2036,6 +2064,9 @@ router.post('/api/inbound-plan/mails/:id/po-convert', (req, res) => {
     res.json({ ok: true, pick: false, mailId: id, supplierCode: supplier, supplierName,
       exceptions, bodyText: parsed.bodyText || '', lines, totalRemaining,
       caseUnverified: lines.filter(l => !l.caseVerified).map(l => l.productCode),
+      caseWarnings: lines.filter(l => l.caseWarning).map(l => ({ productCode: l.productCode, reason: l.caseWarning, neCode: l.neCode })),
+      caseBlocked: lines.filter(l => l.pasteBlocked).map(l => ({ poNumber: l.poNumber, productCode: l.productCode, remaining: l.remaining, reason: l.pasteBlocked })),
+      neCodes: neCodesStatus(ne),
       costMissing: lines.filter(l => l.cost == null).map(l => l.productCode) });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -2697,7 +2728,7 @@ router.delete('/api/masters/:kind/:id', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-router.post('/api/masters/:kind/csv', upload.single('file'), (req, res) => {
+router.post('/api/masters/:kind/csv', upload.single('file'), legacyRecheck('purchase-orders:POST:/api/masters/:kind/csv:suppliers'), (req, res) => {
   const def = MASTER_DEFS[req.params.kind];
   if (!def) return res.status(404).json({ ok: false, error: 'unknown master' });
   if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
@@ -2891,7 +2922,7 @@ function bulkInvalidReason(table, row) {
 }
 const TABLE_LABEL = { materials: '原料グループ', conditions: '発注条件グループ', suppliers: '仕入先', attrs: '商品紐付け', selectable: '選べるセット構成' };
 
-router.post('/api/import', upload.array('files', 12), (req, res) => {
+router.post('/api/import', upload.array('files', 12), legacyRecheck('purchase-orders:POST:/api/import'), (req, res) => {
   if (!req.files || !req.files.length) return res.status(400).json({ ok: false, error: 'CSVファイルを選択してください' });
   const classified = []; const fileErrors = []; const warnings = [];
   const warn = m => { if (warnings.length < 200) warnings.push(m); };
@@ -6178,6 +6209,13 @@ function renderIpResult(j, req) {
             '<td colspan="5"><span class="badge b-warn">⚠ 複数候補</span> ' + esc(l.candidates.join(' / ')) + ' <span class="muted">(📇対応表を確認してください — この行は貼り付けに含まれません)</span></td></tr>';
           return;
         }
+        if (l.type === 'caseblocked') {
+          h += '<tr style="background:#fee2e2">' + left +
+            '<td><b>' + esc(l.productCode) + '</b></td><td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
+            '<td colspan="3"><span class="badge b-warn">⛔ 貼り付けから除外</span> <span class="muted">NE に大文字・小文字だけ違う商品コードが 2 つあり、どちらの商品か決められません。' +
+            'NE とロジザードの画面で確かめて手で入れてください (入荷予定数 ' + (l.qty == null ? '—' : l.qty.toLocaleString('ja-JP')) + ')</span></td></tr>';
+          return;
+        }
         if (l.type === 'badqty') {
           h += '<tr style="background:#fff7e6">' + left +
             '<td>' + esc(l.productCode) + '</td><td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
@@ -6207,6 +6245,7 @@ function renderIpResult(j, req) {
           ' (ロジザードで登録エラーになる場合があります)。<b>ダッシュボードの「📥 NE最新CSVを取込」を一度実行</b>すると全商品の表記が揃います: ' +
           esc(j.caseUnverified.slice(0, 10).join(', ')) + (j.caseUnverified.length > 10 ? ' …' : '') + '</div>';
       }
+      h += caseNotes(j);
       if (j.qtyInvalid && j.qtyInvalid.length) h += '<div class="warn" style="margin-top:6px">⚠️ 入数換算が不正のため貼り付けから除外 ' + j.qtyInvalid.length + '行 — 表の該当行 (⚠換算不正) の入数を直して💾してください</div>';
       if (provCount) {
         h += '<div class="warn" style="margin-top:6px">🕗 <b>仮商品コードで出力 ' + provCount + '行</b> — ' +
@@ -6423,6 +6462,20 @@ function costSrcLabel(l) {
   if (l.costSource === 'pml') return ' <span class="badge b-warn" title="発注時単価が無いためPML原価で補完 (発注後に原価が変わっていないか注意)">PML補完</span>';
   return ' <span class="badge b-warn">単価なし</span>';
 }
+/** 商品コードの大文字・小文字の注意 (M6) と Company DB の読み取りの様子。出荷明細と発注書参照の両方の画面で使う */
+var CASE_REASON = { ne_code_collided: 'NE に大文字・小文字だけ違うコードが 2 つ (貼り付けから除外)', ne_code_invalid: 'NE の書き方が読めない', ne_api_differs: 'NE の今の書き方と違う (これまでの書き方で出力)' };
+function caseNotes(j) {
+  var h = '';
+  var w = j.caseWarnings || [];
+  if (w.length) {
+    h += '<div class="warn" style="margin-top:6px">⚠️ 商品コードの大文字・小文字の注意 ' + w.length + '行 (ロジザードで登録エラー・別の商品になるおそれ。NE とロジザードの画面で確かめてください): ' +
+      w.slice(0, 10).map(function(x){ return esc(x.productCode) + ' (' + esc(CASE_REASON[x.reason] || x.reason) + (x.reason === 'ne_api_differs' && x.neCode ? ' NE=' + esc(x.neCode) : '') + ')'; }).join(', ') + (w.length > 10 ? ' …' : '') + '</div>';
+  }
+  var nc = j.neCodes;
+  if (nc && !nc.ok) h += '<div class="muted" style="margin-top:4px;font-size:11px">ℹ️ Company DB の NE の書き方を読めませんでした (' + esc(nc.reason || '') + ') — これまでの書き方で出しています</div>';
+  else if (nc && nc.stale) h += '<div class="muted" style="margin-top:4px;font-size:11px">ℹ️ Company DB の NE の書き方が 7 日より古いです (照合 ' + esc(nc.mark ? nc.mark.observed_at : '') + ')</div>';
+  return h;
+}
 function renderPoResult(j) {
   IP_PO = j;
   var area = document.getElementById('ipResult');
@@ -6434,14 +6487,16 @@ function renderPoResult(j) {
   }
   h += '<table class="t" style="margin-top:6px"><tr><th>貼付</th><th>発注書</th><th>商品</th><th class="r">残数</th><th class="r">入荷予定数 (編集可)</th><th class="r">仕入単価</th><th>備考</th></tr>';
   j.lines.forEach(function(l, i) {
-    var checked = !(l.exception && l.exception.level === 'strong'); // 強一致のみ既定で除外提案 (人間が確定)
+    var blocked = !!l.pasteBlocked; // NE に大文字・小文字だけ違うコードが 2 つ = 貼り付けから外す・減数の候補にも入れない (M6 v3)
+    var checked = !blocked && !(l.exception && l.exception.level === 'strong'); // 強一致のみ既定で除外提案 (人間が確定)
     var prior = (l.priorAdjustments || []).length
       ? '<div class="muted" style="font-size:11px;color:#b45309">⚠️ 別の出荷連絡 (メール#' + l.priorAdjustments.map(function(a){ return a.mailId; }).join(',#') + ') で減数済み ' +
         l.priorAdjustments.reduce(function(s, a){ return s + a.qty; }, 0) + '個 — 二重減数に注意</div>' : '';
-    h += '<tr data-plrow="' + i + '"' + (l.exception ? ' style="background:#fff7e6"' : '') + '>' +
-      '<td><input type="checkbox" class="plInc" data-pli="' + i + '"' + (checked ? ' checked' : '') + ' style="transform:scale(1.2)"></td>' +
+    h += '<tr data-plrow="' + i + '"' + (blocked ? ' style="background:#fee2e2"' : l.exception ? ' style="background:#fff7e6"' : '') + '>' +
+      '<td><input type="checkbox" class="plInc" data-pli="' + i + '"' + (checked ? ' checked' : '') + (blocked ? ' disabled title="NE に大文字・小文字だけ違う商品コードが 2 つ = 貼り付けできません"' : '') + ' style="transform:scale(1.2)"></td>' +
       '<td class="muted">' + esc(l.poNumber) + '</td>' +
-      '<td><b>' + esc(l.productCode) + '</b><div class="muted" style="font-size:11px">' + esc(String(l.productName || '').slice(0, 40)) + '</div>' + exBadge(l.exception) + prior + '</td>' +
+      '<td><b>' + esc(l.productCode) + '</b><div class="muted" style="font-size:11px">' + esc(String(l.productName || '').slice(0, 40)) + '</div>' + exBadge(l.exception) + prior +
+      (blocked ? '<div style="font-size:11px;color:#b91c1c">⛔ 貼り付けから除外 (NE に大文字・小文字だけ違う商品コードが 2 つ。NE とロジザードの画面で確かめて手で入れる。減数の候補には入れません)</div>' : '') + '</td>' +
       '<td class="r">' + l.remaining.toLocaleString('ja-JP') + '</td>' +
       '<td class="r"><input type="number" class="plQty" data-pli="' + i + '" min="1" max="' + l.remaining + '" step="1" value="' + l.remaining + '" style="width:80px" title="部分出荷 (在庫不足) の場合は実際に出荷される数に減らす"></td>' +
       '<td class="r">' + (l.cost == null ? '—' : yen(l.cost)) + costSrcLabel(l) + '</td>' +
@@ -6458,6 +6513,7 @@ function renderPoResult(j) {
     h += '<div class="warn" style="margin-top:6px">⚠️ ' + j.caseUnverified.length + '行はNE本来の大文字/小文字表記が未確認 (暫定表記で出力。ダッシュボードの「📥 NE最新CSVを取込」で揃います): ' + esc(j.caseUnverified.slice(0, 10).join(', ')) + '</div>';
   }
   if ((j.costMissing || []).length) h += '<div class="warn" style="margin-top:6px">⚠️ 単価不明 (空欄で出力): ' + esc(j.costMissing.join(', ')) + '</div>';
+  h += caseNotes(j);
   h += bodyTextDetails(j.bodyText) + '</div>';
   area.innerHTML = h;
 
@@ -6467,7 +6523,7 @@ function renderPoResult(j) {
       var inc = document.querySelector('.plInc[data-pli="' + i + '"]');
       var qi = document.querySelector('.plQty[data-pli="' + i + '"]');
       var qty = qi ? Number(qi.value) : l.remaining;
-      rows.push({ l: l, included: !!(inc && inc.checked), qty: qty });
+      rows.push({ l: l, included: !!(inc && inc.checked) && !l.pasteBlocked, qty: qty });
     });
     return rows;
   }
@@ -6505,6 +6561,7 @@ function renderPoResult(j) {
     if (st.bad.length) { toast('先に数量の不正な行を直してください'); return; }
     var props = [];
     st.rows.forEach(function(r2, i) {
+      if (r2.l.pasteBlocked) return; // 貼り付けから外した行 = 出荷されないとは限らない = 減数の候補にしない (M6 v3 M2)
       var shortQty = r2.included ? r2.l.remaining - r2.qty : r2.l.remaining;
       if (shortQty <= 0) return;
       props.push({ i: i, l: r2.l, qty: shortQty,

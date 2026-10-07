@@ -25,7 +25,7 @@ import path from 'path';
 await temporaryTestDataDir(import.meta.url, 'iroha-work-test-', { reuseProvided: true });
 
 // ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
-const SW_CACHE = 'iroha-work-shell-v23';
+const SW_CACHE = 'iroha-work-shell-v25';
 
 let pass = 0, fail = 0;
 function ok(cond, label) {
@@ -2533,6 +2533,79 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
             fields: { expiry_seal: '1' }, worker_id: staffP.id, pin: '4649', expect_version: mver() - 1 } });
           ok(sealStale.status === 409, '古い版で送ったら断る (期限シールも他の項目と同じ楽観ロック)');
           ok(sealOf() == null, '断ったので値も変わらない');
+
+          // ── 🧰 資材 2 つ (2026-10-01)。マスタ行が無く、カードのスナップショットにだけ資材が載っている状態で
+          //    **古い画面が material_code だけ送ってきた**とき、2 件目 (小分け袋) を消さない (Codex)
+          {
+            db.prepare("DELETE FROM f_iroha_work_master WHERE code_key = 'size-a'").run();
+            db.prepare('UPDATE f_iroha_tasks SET master_snapshot = ? WHERE id = ?').run(JSON.stringify({
+              materials: [{ code: 'D-8' }, { code: '313ビニール袋', usage: 'inner_pack', units_per_pack: 10 }],
+              material_code: 'D-8', units_per_container: 120,
+            }), t6);
+            clearEnrichCache();
+            const oldStyle = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { material_code: 'D-9' }, worker_id: staffP.id, pin: '4649' } });
+            const mats = JSON.parse(db.prepare("SELECT materials_json FROM f_iroha_work_master WHERE code_key = 'size-a'").get().materials_json);
+            ok(oldStyle.status === 200 && mats.length === 2 && mats[0].code === 'D-9'
+              && mats[1].code === '313ビニール袋' && mats[1].units_per_pack === 10,
+              '🚨古い画面が資材 1 件だけ送っても、カードに載っていた小分け袋は残る');
+            const ev = db.prepare("SELECT from_value, to_value FROM f_iroha_app_events WHERE action = 'master_edit' ORDER BY id DESC LIMIT 1").get();
+            ok(/313ビニール袋/.test(ev.to_value || ''), '🚨操作履歴に資材の中身が残る (あとから戻せる)');
+
+            // 🚨読めない指定は 400 で返す。「変更なし」の 200 で黙って捨てない (Codex 2026-10-01)
+            const verNow = () => db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'size-a'").get().version;
+            const badPer = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { materials: [{ code: 'D-8', usage: 'inner_pack', units_per_pack: 100001 }] },
+              worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+            ok(badPer.status === 400 && badPer.json.error === 'bad_units_per_pack', '小分けの数が大きすぎれば 400');
+            const tooMany = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { materials: [{ code: 'A' }, { code: 'B' }, { code: 'C' }] },
+              worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+            ok(tooMany.status === 400 && tooMany.json.error === 'too_many_materials', '上限を超えたら 400');
+            const badUse = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { materials: [{ code: 'A', usage: 'なんとか' }] },
+              worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+            ok(badUse.status === 400 && badUse.json.error === 'bad_usage', '知らない使い道も 400');
+            // 🚨読めない指定を「空」として受け流すと、登録ずみの資材を全部消す指示に化ける (Codex 2026-10-01)
+            for (const bad of [[{}], [{ code: { x: 1 } }], [{ code: '', usage: 'inner_pack', units_per_pack: 10 }]]) {
+              const r = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+                fields: { materials: bad }, worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+              ok(r.status === 400 && r.json.error === 'bad_material', `読めない資材の指定は 400 (${JSON.stringify(bad)})`);
+            }
+            ok(JSON.parse(db.prepare("SELECT materials_json FROM f_iroha_work_master WHERE code_key = 'size-a'").get().materials_json).length === 2,
+              '断ったので資材はそのまま (全消しになっていない)');
+
+            // 🚨 マスタがまだ資材の答えを持っておらず、カードにだけ資材が載っている状態で「なし」にする
+            {
+              db.prepare("UPDATE f_iroha_work_master SET materials_json = NULL, material_code = NULL WHERE code_key = 'size-a'").run();
+              db.prepare('UPDATE f_iroha_tasks SET master_snapshot = ? WHERE id = ?')
+                .run(JSON.stringify({ materials: [{ code: 'D-8' }], material_code: 'D-8' }), t6);
+              clearEnrichCache();
+              const shown = (await call('GET', '/api/task-previews/' + t6, { cookie })).json.card;
+              ok(shown.master.materials.length === 1, '(前提) マスタが空でもカードの資材が画面に出ている');
+              const clear2 = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+                fields: { materials: [] }, worker_id: staffP.id, pin: '4649', expect_version: verNow() } });
+              clearEnrichCache();
+              const after2 = (await call('GET', '/api/task-previews/' + t6, { cookie })).json.card;
+              ok(clear2.status === 200 && !clear2.json.unchanged
+                && db.prepare("SELECT materials_json FROM f_iroha_work_master WHERE code_key = 'size-a'").get().materials_json === '[]'
+                && after2.master.materials.length === 0,
+                '🚨「なし」が保存され、カードの古い資材が画面から消える (変更なしで黙って終わらない)');
+            }
+
+            // マスタで「資材なし」にしたら、カードの古い資材が復活しない
+            const ver = () => db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'size-a'").get().version;
+            const cleared = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+              fields: { materials: [] }, worker_id: staffP.id, pin: '4649', expect_version: ver() } });
+            clearEnrichCache();
+            const card = (await call('GET', '/api/task-previews/' + t6, { cookie })).json.card;
+            ok(cleared.status === 200 && card.master.materials.length === 0 && card.master.material_code == null,
+              '🚨「資材なし」にしたら、カードの古い資材は復活しない');
+            ok((card.master.missing || []).includes('資材'), '資材なしは「未登録」として数える');
+            // 🚨マスタ行はこの先のテスト (CHECK 制約) が使うので消さない。カード側だけ元に戻す
+            db.prepare('UPDATE f_iroha_tasks SET master_snapshot = NULL WHERE id = ?').run(t6);
+            clearEnrichCache();
+          }
           let sealErr = null;
           try { db.prepare("UPDATE f_iroha_work_master SET expiry_seal = 2 WHERE code_key = 'size-a'").run(); } catch (e) { sealErr = e; }
           ok(sealErr && /CHECK/.test(sealErr.message), '0/1 以外は DB にも入らない (CHECK)');
@@ -4235,7 +4308,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     'ボードのカードでも「途中まで進んでいる」が分かる');
   ok(/'units_per_container'\)/.test(html) && /'storage_container', 'container'/.test(html), '保管箱と入数は別々にタップできる (帯の data-reg が内側で勝つ)');
   // タップした項目だけ出す・ダイアログはスクロールできる・候補は正方形のタイル (中原さん 2026-09-03)
-  ok(/class="mvf" data-f="material_code"/.test(html) && /class="mvf" data-f="storage_container"/.test(html)
+  ok(/class="mvf" data-f="materials"/.test(html) && /class="mvf" data-f="storage_container"/.test(html)
     && /class="mvf" data-f="units_per_container"/.test(html) && /class="mvf" data-f="note"/.test(html), '登録・変更の項目はひとつずつ枠に入っている');
   ok(/el\.hidden = !!mvCtx\.field && el\.dataset\.f !== mvCtx\.field/.test(html), 'タップした項目だけ出す (他は隠す)');
   ok(/\$\('#mvTitle'\)\.textContent = mvCtx\.field/.test(html), '見出しにその項目の名前を出す');
@@ -7299,7 +7372,7 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
   {
     const t1 = mk('cp-1', 9290, 700);
     const a = C.startConsignment({ taskId: t1, batchId: B.listBatchesOfTask(db, t1)[0].id,
-      facilityCode: 'workcenter', qty: 700, expectVersion: v(t1), dueDate: '2026-10-01' });
+      facilityCode: 'workcenter', qty: 700, expectVersion: v(t1), dueDate: '2099-10-01' });
     const t2 = mk('cp-2', 9291, 140);
     const b = C.startConsignment({ taskId: t2, batchId: B.listBatchesOfTask(db, t2)[0].id,
       facilityCode: 'rashinban', qty: 140, expectVersion: v(t2) });
@@ -7322,7 +7395,7 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
     const ra = rowOf(plan, a.consignment.id);
     ok(ra.boxes === 10 && ra.units_per_container === 70, '⭐箱数を出す (700 個 ÷ 70 = 10 箱)');
     ok(ra.qty === 700, '「用意する」の数は渡す予定の数');
-    ok(ra.due_date === '2026-10-01' && ra.overdue === false, '返却の期限も出す');
+    ok(ra.due_date === '2099-10-01' && ra.overdue === false, '返却の期限も出す');
 
     // ⭐数はその段で意味のあるものを出す (1 つで通さない — §AB-7)
     const c2 = C.getConsignment(c.consignment.id);
@@ -7353,6 +7426,20 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
     const row = rowOf(SV.buildConsignPlan(), r0.consignment.id);
     ok(row.storage_container === '20L（山田さん担当）', '文字列はそのまま出す');
     ok(row.material_code === null, '⭐入れ子の JSON は出さない ([object Object] と描かせない)');
+    ok(Array.isArray(row.materials) && row.materials.length === 0, '⭐入れ子は資材の配列にも入れない');
+  }
+
+  // ③-2 🧰 資材が 2 つ (小分けの袋) のカードを預けるとき、渡す前の画面にも両方出す (2026-10-01)
+  {
+    const t = mk('cp-5b', 92951, 70, JSON.stringify({ units_per_container: 70, process_count: 2,
+      storage_container: '20Lコンテナ',
+      materials: [{ code: 'D-8' }, { code: '313ビニール袋', usage: 'inner_pack', units_per_pack: 10 }] }));
+    const r0 = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'rashinban', qty: 70, expectVersion: v(t) });
+    const row = rowOf(SV.buildConsignPlan(), r0.consignment.id);
+    ok(row.materials.length === 2 && row.materials[1].units_per_pack === 10,
+      '🚨預ける前の画面に資材が 2 つとも出る (小分けの数も)');
+    ok(row.material_code === 'D-8', '1 件目は今までどおり material_code にも出る');
   }
 
   // ④ ⭐入口に出す件数
@@ -8595,6 +8682,168 @@ console.log('\n[つかいかた] 📖 マニュアルと実装が食い違って
   const staffSecs = [...man.matchAll(/<section id="(s\d+)"([^>]*)>/g)].filter((m) => /class="staff"/.test(m[2])).map((m) => m[1]);
   ok(staffSecs.includes("s14") && staffSecs.includes("s15"),
     "⭐外部にあずける・分かれたカードの節は職員向けの印が付いている");
+}
+
+console.log('\n[資材 2 つ] 🧰 小分けの袋も登録できる (2026-10-01 中原さん: 10 個ずつ袋に入れる)');
+{
+  const vm = await import('node:vm');
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+
+  // ⭐画面の JS 全体の構文検査。1 つでも壊れると <script> ごと実行されず、ボタンが全部効かなくなる。
+  //   それでも 200 で描画されるのでサーバーのログには出ない (product-hub #1246 と同じ事故の予防)
+  for (const [name, text, isHtml] of [
+    ['index.html', html, true],
+    ['facility.html', fs.readFileSync(new URL('../apps/iroha-work/views/facility.html', import.meta.url), 'utf8'), true],
+    ['sw.js', fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8'), false],
+  ]) {
+    const blocks = isHtml
+      ? [...text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].filter((m) => !/\bsrc\s*=/.test(m[1])).map((m) => m[2])
+      : [text];
+    let err = null;
+    blocks.forEach((code, i) => {
+      try { new vm.Script(code, { filename: `${name}#${i + 1}` }); } catch (e) { err = err || `${name}#${i + 1}: ${e.message}`; }
+    });
+    ok(blocks.length > 0 && !err, `${name} の JS に構文エラーが無い ${err || ''}`);
+  }
+
+  // 複数選択のふるまい (実物の関数を取り出して動かす)
+  const start = html.indexOf('const MAT_MAX = 2;');
+  const end = html.indexOf('// ── 作業のやり方の登録・修正', start);
+  ok(start > 0 && end > start, '(前提) 資材の選択のコードを取り出せる');
+  const fields = { mvMaterial: { value: '[]' }, mvMsg: { textContent: '' }, matPicked: { innerHTML: '' } };
+  const optKey = (s) => String(s == null ? '' : s).normalize('NFKC').replace(/\s+/g, ' ').trim().toUpperCase();
+  const api = new Function('document', 'esc', 'optKey', 'renderOpts', 'OPT_FIELD',
+    html.slice(start, end) + '; return { matList, matUse, matPer, matDrop, pickOptEl, MAT_MAX };')(
+    { getElementById: (id) => fields[id] || { value: '', textContent: '' } },
+    (s) => String(s == null ? '' : s), optKey, () => {}, { material: 'mvMaterial', container: 'mvContainer' });
+  const picked = () => JSON.parse(fields.mvMaterial.value);
+  const tap = (code) => api.pickOptEl({ dataset: { code } }, 'material');
+
+  tap('D-8');
+  ok(picked().length === 1 && picked()[0].code === 'D-8' && picked()[0].usage === 'normal', 'タップで資材を選べる');
+  tap('313ビニール袋');
+  ok(picked().length === 2, '2 つ目も選べる');
+  tap('ほかの袋');
+  ok(picked().length === 2 && /2 つまで/.test(fields.mvMsg.textContent), `${api.MAT_MAX} つを超えては選べない (理由も出す)`);
+  tap('ｄ－８');
+  ok(picked().length === 1 && picked()[0].code === '313ビニール袋',
+    'もう一度タップすると外れる (全角・小文字でも同じ資材とみなす)');
+  api.matUse(0, 1);
+  ok(picked()[0].usage === 'inner_pack', '小分け袋として使う に変えられる');
+  api.matPer(0, '10');
+  ok(picked()[0].units_per_pack === 10, '何個ずつ入れるかを入れられる');
+  api.matPer(0, '');
+  ok(picked()[0].units_per_pack === undefined, '空にすれば未登録に戻る (0 を入れない)');
+  api.matPer(0, '10');
+  api.matUse(0, 0);
+  ok(picked()[0].usage === 'normal' && picked()[0].units_per_pack === undefined,
+    '🚨ふつうに戻したら「何個ずつ」は消える (古い数が画面に残らない)');
+  api.matDrop(0);
+  ok(picked().length === 0, '「外す」で消せる');
+  tap('D-8'); tap('');
+  ok(picked().length === 0, '「なし」で全部外れる');
+
+  // 画面の組み立て (保存の形・詳細の見た目・不足申告)
+  ok(/materials: JSON\.stringify\(matOfMaster\(m\)\)/.test(html), '開いた時点の資材を JSON で持つ (差分だけ送る仕組みに乗せる)');
+  ok(/if \(f === 'materials'\) \{ try \{ fields\[f\] = JSON\.parse/.test(html), '保存するときは配列に戻して送る');
+  ok(/const MV_MAP = \{ materials: 'mvMaterial'/.test(html), '送る項目名は materials (サーバーの正本と同じ名前)');
+  ok(/matThings\(m\) \+/.test(html) && /inner \? '小分けの袋'/.test(html), '詳細では資材ごとにタイルを出す');
+  ok(/この袋に <b class="num">/.test(html) && /⚠ 何個ずつ入れるかが未登録/.test(html),
+    '小分け袋は「この袋に 10 個ずつ入れる」。未登録なら ⚠ を出す');
+  ok(/x\.usage === 'inner_pack' \? '小分けの袋 ' : '資材 '/.test(html), '足りない資材の申告も資材ごとに選べる');
+  const fac = fs.readFileSync(new URL('../apps/iroha-work/views/facility.html', import.meta.url), 'utf8');
+  ok(/Array\.isArray\(w\.materials\)/.test(fac) && /小分けの袋/.test(fac), '外部施設の画面にも資材が 2 つとも出る');
+
+  // 小分けの数は整数だけ (parseInt だと "1.5" が 1 になって、作業の指示が黙って変わる — Codex 2026-10-01)
+  api.pickOptEl({ dataset: { code: '袋' } }, 'material');
+  api.matUse(0, 1);
+  // 1e2 は Number() では 100 = 正しい整数なので受ける (parseInt なら 1 に化けていた)
+  for (const bad of ['1.5', '0', '-3', 'あ', '10.0001']) {
+    api.matPer(0, bad);
+    ok(picked()[0].units_per_pack === undefined, `小分けの数に「${bad}」は入れない (未登録のままにする)`);
+  }
+  api.matPer(0, '1e2');
+  ok(picked()[0].units_per_pack === 100, '1e2 は 100 として入る (parseInt なら 1 に化けていた)');
+  api.matPer(0, '10');
+  ok(picked()[0].units_per_pack === 10, '整数なら入る');
+
+  // 画面とサーバーで上限の数がずれていないか (ずれると「API では 3 件入るのに画面は 2 件まで」になる)
+  const libSrc = fs.readFileSync(new URL('../lib/iroha-materials.js', import.meta.url), 'utf8');
+  const libMax = Number((libSrc.match(/export const MAX_MATERIALS = (\d+);/) || [])[1]);
+  const libPer = Number((libSrc.match(/export const MAX_UNITS_PER_PACK = (\d+);/) || [])[1]);
+  const uiMax = Number((html.match(/const MAT_MAX = (\d+);/) || [])[1]);
+  const uiPer = Number((html.match(/const MAT_PER_MAX = (\d+);/) || [])[1]);
+  ok(libMax === uiMax && libMax === 2, `資材の上限は画面とサーバーで同じ (lib ${libMax} / 画面 ${uiMax})`);
+  ok(libPer === uiPer, `小分けの数の上限も同じ (lib ${libPer} / 画面 ${uiPer})`);
+  ok(/2 つまで/.test(html) && /2 つまで/.test(fs.readFileSync(new URL('../apps/iroha-work/views/manual.html', import.meta.url), 'utf8')),
+    'つかいかたにも同じ数が書いてある');
+
+  // 🚨資材の名前は人が登録した文字列。一覧の要約に生のまま入れない (stored XSS — Codex 2026-10-01)
+  {
+    const escSrc = html.match(/const esc = s => [^\n]+/)[0];
+    const sumSrc = html.match(/function masterSummary\(c\) \{[\s\S]*?\n\}/)[0];
+    const f = new Function(escSrc + '\n' + sumSrc + '; return { esc, masterSummary };')();
+    const evil = '<img src=x onerror=alert(1)>';
+    const out = f.esc(f.masterSummary({ master: { materials: [{ code: evil }], storage_container: null } }));
+    ok(!out.includes('<img') && out.includes('&lt;img'), '一覧の要約は資材の名前をエスケープして出す');
+    ok(/esc\(masterSummary\(c\)\)/.test(html), '呼び出し側で esc を通している');
+  }
+
+  // 保存の経路 (実物の saveMaster を取り出して動かす)
+  {
+    const smSrc = html.match(/async function saveMaster\(\) \{[\s\S]*?\n\}/)[0];
+    const run = async ({ loadOk, response }) => {
+      const els = {
+        mvMsg: { textContent: '' }, mvPin: { value: '', focus() {} }, mvPinRow: { style: {} },
+        mvSave: { disabled: false }, mvCancel: { disabled: false },
+        mvMaterial: { value: JSON.stringify([{ code: 'D-8' }, { code: '袋', usage: 'inner_pack', units_per_pack: 10 }]) },
+        mvContainer: { value: '' }, mvUnits: { value: '' }, mvProcess: { value: '' }, mvNote: { value: '' }, mvSeal: { value: '' },
+      };
+      const blank = { materials: '[]', storage_container: '', units_per_container: '', process_count: '', note: '', expiry_seal: '' };
+      let sentBody = null;
+      const save = new Function('mvSaving', 'worker', 'mvCtx', 'can', 'document', '$', 'apiFetch', 'settleForceClose',
+        'closeOverlay', 'loadState', 'state', 'toast', 'renderOpts', 'renderMatPicked', 'mvValues', 'MV_MAP',
+        smSrc + '; return saveMaster;')(
+        false, { id: 1 }, { cardId: 5, code: 'X-1', version: 2, values: { ...blank }, field: 'materials' },
+        () => true,
+        { getElementById: (id) => els[id] || { value: '', textContent: '' } },
+        (sel) => els[String(sel).replace('#', '')] || { textContent: '', value: '', style: {}, focus() {} },
+        async (url, opt) => { sentBody = JSON.parse(opt.body); return response; },
+        () => {}, () => {}, async () => loadOk, { cards: [] }, () => {}, () => {}, () => {}, () => ({ ...blank }),
+        { materials: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
+          process_count: 'mvProcess', note: 'mvNote', expiry_seal: 'mvSeal' });
+      await save();
+      return { els, sentBody };
+    };
+    const okCase = await run({ loadOk: true, response: { ok: true } });
+    ok(Array.isArray(okCase.sentBody.fields.materials) && okCase.sentBody.fields.materials[1].units_per_pack === 10,
+      '保存では資材を配列で送る (JSON の文字列のまま送らない)');
+    const conflict = await run({ loadOk: false, response: { ok: false, error: 'conflict', message: '他の人が先に更新しました' } });
+    ok(/読み込めませんでした/.test(conflict.els.mvMsg.textContent),
+      '🚨競合のあと最新を取り直せなかったら「最新にしました」と言わない (古い内容で送り直させない)');
+  }
+}
+
+console.log('\n[ボード] 📥 入荷から何日たったか (2026-10-07 中原さん:「〇日前入荷みたいな感じ」)');
+{
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  const src = html.match(/function arrivalAgo\(ymd\) \{[\s\S]*?\r?\n\}/)[0];
+  const fmtMd = new Function(html.match(/function fmtMd\(ymd\) \{[\s\S]*?\r?\n\}/)[0] + '; return fmtMd;')();
+  // 今日 (JST) = 2026-10-07 に固定して動かす。端末の時計ではなくサーバーに合わせた nowMs() を使う
+  const mkAgo = (ms) => new Function('nowMs', 'fmtMd', src + '; return arrivalAgo;')(() => ms, fmtMd);
+  const ago = mkAgo(Date.parse('2026-10-07T12:00:00+09:00'));
+  ok(mkAgo(Date.parse('2026-10-07T00:05:00+09:00'))('2026-10-06') === '昨日入荷'
+    && mkAgo(Date.parse('2026-10-06T23:55:00+09:00'))('2026-10-06') === '今日入荷',
+    '⭐JST の 0 時で日が替わる (UTC の日付で数えない)');
+  ok(!/jstYmd|Date\.now\(\)/.test(src), '⭐端末の時計 (Date.now) ではなく nowMs() で今日を決める (Codex #1647 R1)');
+  ok(ago('2026-10-07') === '今日入荷', '今日の入荷は「今日入荷」');
+  ok(ago('2026-10-06') === '昨日入荷', '前の日は「昨日入荷」');
+  ok(ago('2026-10-02') === '5日前入荷', '5 日前は「5日前入荷」');
+  ok(ago('2026-09-07') === '30日前入荷', '月をまたいでも日数で数える');
+  ok(ago('2026-10-09') === '入荷 10/9', '先の日付 (入荷予定のずれ) はマイナスの日数にせず日付で');
+  ok(ago('不明') === '入荷 不明' && ago('') === '' && ago(null) === '', '日付でなければそのまま・空なら出さない');
+  ok(/c\.arrival \? '📥 ' \+ arrivalAgo\(c\.arrival\) : null,/.test(html.match(/function bcardHtml\(c, status\) \{[\s\S]*?\r?\n\}/)[0]),
+    'ボードのカードに入荷から何日かを出す');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

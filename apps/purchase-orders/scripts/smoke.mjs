@@ -22,6 +22,9 @@ const pmlListRouter = (await imp('apps/product-management-list/router.js')).defa
 const { getDB } = await imp('apps/purchase-orders/db.js');
 const { computeProduct, computeAll, stockConstant, evaluateCondition } = await imp('apps/purchase-orders/logic.js');
 const routerMod = await imp('apps/purchase-orders/router.js');
+// 切替の段階 = legacy_open (マスタの古い入口の門 = 仕入先の書き込みを今までどおり通す。門そのものの試験は scripts/test-master-legacy-gate.mjs)
+(await imp('lib/master-legacy-gate.mjs')).__setLegacyPhaseReader(async () => ({ readable: true, phase: 'legacy_open' }));
+const neMod = await imp('apps/purchase-orders/ne-codes.js'); // M6: Company DB の NE の元の書き方の読み手を差し替える
 const express = (await import('express')).default;
 
 let pass = 0, fail = 0;
@@ -2514,6 +2517,17 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
     ok(r.body.ok && r.body.refreshed === 1, 'prov: 入数つきで更新', r.body);
     r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
     ok(r.body.pasteText === 'sueders-bk\t288\t' && r.body.totalQty === 288, 'prov: 入数換算 (12×24)', r.body.pasteText);
+    // M6: 仮商品コードの行も Company DB の書き方で補う (数量はそのまま) / 衝突は外す
+    neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false, map: new Map([['sueders-bk', { state: 'ok', ne_code: 'SUEDERS-BK' }]]) }));
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
+    ok(r.body.pasteText === 'SUEDERS-BK\t288\t' && r.body.totalQty === 288 && r.body.provisionalRows.length === 1 && r.body.provisionalRows[0].productCode === 'SUEDERS-BK' && r.body.rows[0].caseSource === 'ne_api' &&
+      r.body.caseWarnings.length === 0, 'M6 prov: 仮商品コードの行も Company DB の書き方で補う', { p: r.body.pasteText, rows: r.body.rows, w: r.body.caseWarnings });
+    neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false, map: new Map([['sueders-bk', { state: 'collided', ne_code: null }]]) }));
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
+    ok(r.body.ok && r.body.rowCount === 0 && r.body.pasteText === '' && r.body.totalQty === 0 && r.body.provisionalRows.length === 0 &&
+      r.body.caseBlocked.length === 1 && r.body.caseBlocked[0].qty === 288 && r.body.lines[0].type === 'caseblocked' && r.body.caseWarnings[0].reason === 'ne_code_collided',
+      'M6 prov: 仮商品コードの行も衝突なら貼り付けから外す (数量は残す)', r.body.caseBlocked);
+    neMod.setNeCodeReaderForTest(null);
     // 同じ仮商品コードを別の先方番号に付けるのは拒否 (貼り付けに同じ商品IDが2行出る)
     r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-2', qty: 1, provisionalProductCode: 'sueders-bk' }] });
     ok(r.status === 400 && r.body.error.includes('別の先方番号'), 'prov: 仮商品コードの重複は拒否', r.body.error);
@@ -3100,8 +3114,98 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
     ok(la3 && la3.priorAdjustments.length === 0 && la3.remaining === 10, 'salonge: 逆仕訳済みの減数は警告から消える (残数も復元)', la3 && { p: la3.priorAdjustments, rem: la3.remaining });
   }
 
+  // M6: Company DB で衝突 (NE に大文字・小文字だけ違うコードが 2 つ) の行は貼り付けから外す = 応答の caseBlocked・行の pasteBlocked
+  let jBlockedM6 = null;
+  {
+    const apronKey = db.prepare('SELECT product_key FROM po_order_items WHERE id=?').get(apronItemId).product_key;
+    neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false,
+      map: new Map([[apronKey, { state: 'collided', ne_code: null }]]) }));
+    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1, salPo2] });   // 普通の行と衝突の行が混ざる
+    const lb = (r.body.lines || []).find(l => l.orderItemId === apronItemId);
+    ok(r.body.ok && lb && lb.pasteBlocked === 'ne_code_collided' && lb.caseWarning === 'ne_code_collided' && r.body.caseBlocked.length === 1 &&
+      r.body.caseBlocked[0].remaining === lb.remaining && r.body.neCodes.ok === true && r.body.lines.filter(l => l.pasteBlocked).length === 1,
+      'M6 PO参照: 衝突の行は pasteBlocked + caseBlocked (行と数量は残す)', r.body.caseBlocked);
+    jBlockedM6 = r.body;
+    // 発注書参照でも、覚えた書き方が無い行は Company DB の書き方で補う (残数・単価はそのまま) / ある行は違いの注意 (Codex #1501 R2 Medium)
+    const cupL = r.body.lines.find(l => !l.pasteBlocked);
+    if (cupL) {
+      const ck = cupL.productCode.toLowerCase(), cu = ck.toUpperCase();
+      neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false, map: new Map([[ck, { state: 'ok', ne_code: cu }]]) }));
+      const rq = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1, salPo2] });
+      const c2 = rq.body.lines.find(l => l.orderItemId === cupL.orderItemId);
+      ok(/[a-z]/.test(ck) && c2 && c2.remaining === cupL.remaining && c2.cost === cupL.cost && rq.body.caseBlocked.length === 0 &&
+        (cupL.caseSource === 'fallback' ? (c2.productCode === cu && c2.caseSource === 'ne_api' && c2.caseVerified === true)
+          : (c2.productCode === cupL.productCode && rq.body.caseWarnings.some(w => w.reason === 'ne_api_differs' && w.neCode === cu))),
+        'M6 PO参照: Company DB の書き方で補う / 覚えた書き方があれば違いの注意 (残数・単価はそのまま)', { was: cupL.productCode, src: cupL.caseSource, now: c2 && c2.productCode });
+    } else ok(false, 'M6 PO参照: 材料 (衝突でない行) が無い');
+    neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false,
+      map: new Map([[apronKey, { state: 'collided', ne_code: null }]]) }));
+    // 読み手を待っている間に減数が入った = 応答は減数の後の残数 (台帳は Company DB を読んだ後に読む。Codex #1501 R1 Medium)
+    const remBefore = lb.remaining;
+    neMod.setNeCodeReaderForTest(async () => {
+      const x = await jpS('/api/items/' + apronItemId + '/events', { type: 'shortage', qty: 1, reasonCode: 'supplier_shortage', remainder: { action: 'await_delivery', nextExpectedDate: '2030-01-01' } });
+      if (!x.body.ok) throw new Error('試験の減数に失敗: ' + x.body.error);
+      return { ok: false, reason: 'timeout' };
+    });
+    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
+    const lw = (r.body.lines || []).find(l => l.orderItemId === apronItemId);
+    ok(r.body.ok && lw && lw.remaining === remBefore - 1, 'M6 PO参照: Company DB を待つ間の減数も残数に入る (古い残数を出さない)', lw && { before: remBefore, now: lw.remaining });
+    const evW = db.prepare('SELECT id FROM po_item_events WHERE order_item_id=? ORDER BY id DESC LIMIT 1').get(apronItemId);
+    const rv = await jpS('/api/events/' + evW.id + '/reverse', { note: 'M6 試験の減数を戻す' });
+    ok(rv.body.ok, 'M6 PO参照: 試験の減数を逆仕訳で戻す', rv.body.error);
+    neMod.setNeCodeReaderForTest(null);
+    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
+    ok(r.body.ok && r.body.caseBlocked.length === 0 && r.body.neCodes.ok === false && r.body.neCodes.reason === 'not_configured',
+      'M6 PO参照: Company DB が無い = 今の動き (外す行なし)', r.body.neCodes);
+  }
+
   // UI配信
   const planHtmlS = await (await fetch(base + '/inbound-plan')).text();
+  ok(planHtmlS.includes('if (r2.l.pasteBlocked) return;') && planHtmlS.includes('!!(inc && inc.checked) && !l.pasteBlocked') &&
+    planHtmlS.includes("l.type === 'caseblocked'") && planHtmlS.includes('h += caseNotes(j);'),
+    'M6 画面: 外した行は減数の候補にしない・貼り付けに入れない・出荷明細の⛔行・注意の表示');
+  // 画面の JS を動かす (手作りの DOM): 衝突の行はコピーに入らず、➖減数の候補にも入らない (Codex #1501 R1 Medium)
+  {
+    const vm = await import('node:vm');
+    const scripts = [...planHtmlS.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+    const src = scripts.find(x => x.includes('function renderPoResult'));
+    const els = new Map();
+    const mk = (id) => ({ id, _h: {}, _html: '', value: '', checked: false, disabled: false, style: {}, dataset: {},
+      classList: { contains: () => false, add() {}, remove() {}, toggle() {} },
+      addEventListener(t, fn) { (this._h[t] = this._h[t] || []).push(fn); }, removeEventListener() {}, setAttribute() {}, getAttribute() { return null; },
+      appendChild() {}, removeChild() {}, insertAdjacentHTML() {}, focus() {}, blur() {}, remove() {}, querySelector: () => null, querySelectorAll: () => [], closest: () => null,
+      get innerHTML() { return this._html; }, set innerHTML(v) { this._html = String(v); },
+      get firstElementChild() { return this._first || (this._first = mk(id + ':first')); } });
+    const byId = (id) => { if (!els.has(id)) els.set(id, mk(id)); return els.get(id); };
+    const inputOf = (cls, i) => { const m = byId('ipResult')._html.match(new RegExp('<input[^>]*class="' + cls + '"[^>]*data-pli="' + i + '"[^>]*>'));
+      return m ? { checked: / checked(?=[ >])/.test(m[0]), value: (m[0].match(/value="([^"]*)"/) || [])[1], disabled: / disabled/.test(m[0]) } : null; };
+    let clip = null;
+    const document = { getElementById: byId, createElement: () => mk('new'), body: mk('body'), addEventListener() {}, readyState: 'complete',
+      querySelector: (sel) => { const m = sel.match(/^\.(plInc|plQty)\[data-pli="(\d+)"\]$/); return m ? inputOf(m[1], m[2]) : null; },
+      querySelectorAll: (sel) => sel === '.plShortSel'
+        ? [...byId('plShortArea')._html.matchAll(/<input[^>]*class="plShortSel"[^>]*data-plk="(\d+)"[^>]*>/g)].map(m => ({ checked: / checked/.test(m[0]), getAttribute: () => m[1] }))
+        : [] };
+    const ctx = { document, navigator: { clipboard: { writeText: (t) => { clip = t; return Promise.resolve(); } } }, location: { href: '', search: '', pathname: '/', hash: '' },
+      fetch: () => new Promise(() => {}), setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {}, console: { log() {}, warn() {}, error() {} },
+      localStorage: { getItem: () => null, setItem() {}, removeItem() {} }, sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+      confirm: () => false, alert() {}, URLSearchParams, FormData: class {}, Blob: class {}, history: { replaceState() {}, pushState() {} } };
+    ctx.window = ctx;
+    vm.createContext(ctx);
+    try { vm.runInContext(src, ctx, { timeout: 5000 }); } catch { /* 起動時の処理は偽の DOM で落ちてもよい (関数は先に作られる) */ }
+    ok(typeof ctx.renderPoResult === 'function' && jBlockedM6, 'M6 画面: 発注書参照の画面の JS を読み込めた');
+    ctx.renderPoResult(jBlockedM6);
+    const bl = jBlockedM6.lines.find(l => l.pasteBlocked);
+    const bi = jBlockedM6.lines.indexOf(bl);
+    const cb = inputOf('plInc', bi);
+    ok(cb && cb.checked === false && cb.disabled === true, 'M6 画面: 衝突の行の ☑ は外れていて押せない', cb);
+    for (const fn of byId('plCopy')._h.click || []) fn.call(byId('plCopy'), {});
+    const want = jBlockedM6.lines.filter(l => !l.pasteBlocked && !(l.exception && l.exception.level === 'strong'))
+      .map(l => l.productCode + '\t' + l.remaining + '\t' + (l.cost == null ? '' : l.cost)).join('\n');
+    ok(want !== '' && clip === want && !String(clip).split('\n').some(x => x.split('\t')[0] === bl.productCode), 'M6 画面: コピーに衝突の行が入らない (ほかの行はそのまま)', { clip, want });
+    for (const fn of byId('plShort')._h.click || []) fn.call(byId('plShort'), {});
+    const sa = byId('plShortArea')._html;
+    ok(!sa.includes('<b>' + bl.productCode + '</b>'), 'M6 画面: ➖減数の候補に衝突の行が入らない', sa.slice(0, 300));
+  }
   ok(planHtmlS.includes('data-ippoconv') && planHtmlS.includes('発注書参照') && planHtmlS.includes('renderPoPick') && planHtmlS.includes('サロンジェ'),
     '/inbound-plan サロンジェ PO参照変換UI');
   ok(planHtmlS.includes('apply-adjustments') && planHtmlS.includes('plShort') && planHtmlS.includes('減数の確認'),
@@ -3147,6 +3251,86 @@ console.log('── NE本来表記 (canonical) ──');
   r = await jp4('/api/inbound-plan/convert', { supplier_code: '2', text: 'GOFUN-01-N\tx\t2\n' });
   ok(r.body.ok && r.body.caseUnverified.length === 1 && r.body.rows[0].caseVerified === false,
     'canonical未蓄積の商品は表記未確認として警告リストへ', r.body.caseUnverified);
+}
+
+// ═══ M6: Company DB の NE の元の書き方 (canonical が無いときの予備・衝突は canonical があっても貼り付けから外す) ═══
+console.log('── M6 Company DB の NE の元の書き方 ──');
+{
+  const jp5 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const neOk = (o) => async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false, map: new Map(Object.entries(o)) });
+  const conv2 = () => jp5('/api/inbound-plan/convert', { supplier_code: '2', text: 'GOFUN-01-N\tx\t2\n' });
+  const conv1 = () => jp5('/api/inbound-plan/convert', { supplier_code: '1', text: 'AMC-001\tx\t3\n' });
+  // 既定 (COMPANY_DB_URL が無い) = 今の動き
+  r = await conv2();
+  const before = r.body;
+  ok(before.ok && before.rows[0].productCode === 'gyoumuhandcream60-BI' && before.caseUnverified.length === 1 && before.neCodes.ok === false &&
+    before.neCodes.reason === 'not_configured' && before.caseWarnings.length === 0 && before.caseBlocked.length === 0 && before.rows[0].caseSource === 'fallback',
+    'M6: Company DB が無い = 今の動き (PMLの表記 + 警告)', before.neCodes);
+  // canonical が無い = Company DB の NE の元の書き方 (数量・原価は変わらない)
+  neMod.setNeCodeReaderForTest(neOk({ 'gyoumuhandcream60-bi': { state: 'ok', ne_code: 'GyoumuHandCream60-BI' } }));
+  r = await conv2();
+  ok(r.body.ok && r.body.rows[0].productCode === 'GyoumuHandCream60-BI' && r.body.rows[0].caseSource === 'ne_api' && r.body.rows[0].caseVerified === true &&
+    r.body.caseUnverified.length === 0 && r.body.caseWarnings.length === 0 && r.body.pasteText.startsWith('GyoumuHandCream60-BI\t2\t') &&
+    r.body.totalQty === before.totalQty && r.body.rows[0].cost === before.rows[0].cost && r.body.rows[0].qty === before.rows[0].qty && r.body.neCodes.ok === true,
+    'M6: canonical が無い = Company DB の NE の書き方 (数量・原価は同じ)', r.body.pasteText);
+  // 鍵と違う書き方は使わない (別の商品の書き方) = 今の動き + 注意
+  neMod.setNeCodeReaderForTest(neOk({ 'gyoumuhandcream60-bi': { state: 'ok', ne_code: 'OtherItem-01' } }));
+  r = await conv2();
+  ok(r.body.ok && r.body.rows[0].productCode === 'gyoumuhandcream60-BI' && r.body.caseUnverified.length === 1 && r.body.caseWarnings.length === 1 &&
+    r.body.caseWarnings[0].reason === 'ne_code_invalid', 'M6: 鍵と違う書き方は使わない', r.body.caseWarnings);
+  // canonical がある = canonical のまま (Company DB と違えば注意だけ)
+  neMod.setNeCodeReaderForTest(neOk({ noflyersticker: { state: 'ok', ne_code: 'NoFlyerSticker' } }));
+  r = await conv1();
+  ok(r.body.ok && r.body.rows[0].productCode === 'NOFLYERSTICKER' && r.body.rows[0].caseSource === 'canonical' && r.body.pasteText.startsWith('NOFLYERSTICKER\t3\t') &&
+    r.body.caseWarnings.length === 1 && r.body.caseWarnings[0].reason === 'ne_api_differs' && r.body.caseWarnings[0].neCode === 'NoFlyerSticker',
+    'M6: canonical が優先・Company DB と違えば ne_api_differs の注意', r.body.caseWarnings);
+  // 衝突 = canonical があっても貼り付けから外す (数量は画面に残す)
+  neMod.setNeCodeReaderForTest(neOk({ noflyersticker: { state: 'collided', ne_code: null } }));
+  r = await conv1();
+  ok(r.body.ok && r.body.rowCount === 0 && r.body.pasteText === '' && r.body.totalQty === 0 && r.body.caseBlocked.length === 1 &&
+    r.body.caseBlocked[0].productCode === 'NOFLYERSTICKER' && r.body.caseBlocked[0].qty === 3 && r.body.lines[0].type === 'caseblocked' &&
+    r.body.caseWarnings[0].reason === 'ne_code_collided', 'M6: 衝突は canonical があっても貼り付けから外す', { cb: r.body.caseBlocked, paste: r.body.pasteText });
+  // 読めない (時間切れ) = 今の動き
+  neMod.setNeCodeReaderForTest(async () => ({ ok: false, reason: 'timeout' }));
+  r = await conv2();
+  ok(r.body.ok && r.body.rows[0].productCode === 'gyoumuhandcream60-BI' && r.body.caseUnverified.length === 1 && r.body.neCodes.reason === 'timeout',
+    'M6: 時間切れ = 今の動き (変換は止めない)', r.body.neCodes);
+  // 読み手が投げても変換は止めない
+  neMod.setNeCodeReaderForTest(async () => { throw new Error('boom'); });
+  r = await conv2();
+  ok(r.body.ok && r.body.neCodes.ok === false && r.body.neCodes.reason === 'error' && r.body.rows[0].productCode === 'gyoumuhandcream60-BI',
+    'M6: 読み手の失敗 = 今の動き', r.body.neCodes);
+  // メールの変換も同じ読み手を使う: 実際のコードで補う・衝突で外す (Codex #1501 R2 Medium)
+  neMod.setNeCodeReaderForTest(neOk({}));
+  const amcMailM6 = db.prepare("SELECT id FROM po_shipment_mails WHERE gmail_id='gm-amc-1'").get();
+  if (amcMailM6) {
+    const convM = () => jp5('/api/inbound-plan/mails/' + amcMailM6.id + '/convert');
+    const baseM = (await convM()).body;
+    const tgt = (baseM.rows || []).find(x => !x.provisional);
+    ok(baseM.ok && baseM.neCodes.ok === true && tgt && /[a-z]/.test(tgt.productCode.toLowerCase()), 'M6 メール: 材料 (貼り付けの行がある)', baseM.error || baseM.rows);
+    if (tgt) {
+      const key = tgt.productCode.toLowerCase();
+      // 覚えた書き方がある行は、それと違う書き方を置く (同じなら注意は出ない)
+      const up = tgt.caseSource === 'fallback' || tgt.productCode !== key.toUpperCase() ? key.toUpperCase() : key.charAt(0).toUpperCase() + key.slice(1);
+      neMod.setNeCodeReaderForTest(neOk({ [key]: { state: 'ok', ne_code: up } }));
+      r = await convM();
+      const t2 = r.body.rows.find(x => x.vendorCode === tgt.vendorCode);
+      if (tgt.caseSource === 'fallback') {
+        ok(t2 && t2.productCode === up && t2.caseSource === 'ne_api' && t2.qty === tgt.qty && t2.cost === tgt.cost &&
+          r.body.pasteText.split('\n').includes(up + '\t' + tgt.qty + '\t' + (tgt.cost == null ? '' : tgt.cost)) && r.body.totalQty === baseM.totalQty,
+          'M6 メール: 覚えた書き方が無い行は Company DB の書き方 (数量・原価はそのまま)', t2);
+      } else {
+        ok(up !== tgt.productCode && t2 && t2.productCode === tgt.productCode && t2.caseSource === 'canonical' && r.body.caseWarnings.some(w => w.productCode === tgt.productCode && w.reason === 'ne_api_differs' && w.neCode === up),
+          'M6 メール: 覚えた書き方がある行はそのまま + 違いの注意', r.body.caseWarnings);
+      }
+      neMod.setNeCodeReaderForTest(neOk({ [key]: { state: 'collided', ne_code: null } }));
+      r = await convM();
+      ok(r.body.ok && !r.body.rows.some(x => x.vendorCode === tgt.vendorCode) && r.body.caseBlocked.some(b => b.vendorCode === tgt.vendorCode && b.qty === tgt.qty) &&
+        r.body.totalQty === baseM.totalQty - tgt.qty && !r.body.pasteText.split('\n').some(x => x.split('\t')[0].toLowerCase() === key),
+        'M6 メール: 衝突の行は貼り付けから外す (合計から引く・ほかの行はそのまま)', r.body.caseBlocked);
+    }
+  } else ok(false, 'M6: メールの試験の材料 (gm-amc-1) が無い');
+  neMod.setNeCodeReaderForTest(null);
 }
 
 // ═══ 入庫取込プレビュー + ⚡一括割当 (中原さん要望 2026-07-14) ═══

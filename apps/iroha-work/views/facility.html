@@ -86,10 +86,15 @@ function numsHtml(it) {
 // 作業のしかた。⭐決まった形の項目だけを出す (自由記述は出さない — いろはの中で読む前提で書かれているため)
 function workHtml(w) {
   if (!w) return '';
+  // 資材は複数 (2026-10-01: 10 個ずつ小分けする袋も渡す)。サーバーが登録ずみ候補と完全一致の分だけ返す
+  const mats = Array.isArray(w.materials) ? w.materials : (w.material_code ? [{ code: w.material_code }] : []);
   const rows = [
     ['保管箱', w.storage_container],
     ['1 箱に入れる数', w.units_per_container == null ? null : w.units_per_container + ' 個'],
-    ['資材セット', w.material_code],
+    ...mats.map((m) => [
+      m.usage === 'inner_pack' ? '小分けの袋' : '資材',
+      m.code + (m.usage === 'inner_pack' && m.units_per_pack != null ? '（' + m.units_per_pack + ' 個ずつ入れる）' : ''),
+    ]),
   ].filter(([, v]) => v != null && v !== '');
   if (rows.length === 0) return '';
   return '<div class="work"><h3>作業のしかた</h3>'

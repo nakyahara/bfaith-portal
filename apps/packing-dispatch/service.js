@@ -9,6 +9,7 @@ import {
   ensureSchema, utcIsoNow, norm, buildSkuKey, normProductCode,
   finalizeLine, classifyOrder, shippingMethodMap, mallGroupOf, isLineGift,
   saveAssortDecision, comboKeyOf, listUnregistered, mirrorFreshness,
+  listHiddenUnregistered, hideUnregistered, unhideUnregistered,
   recordAssortUsage, comboKeysByOrderRef, getAssortByCombo, purgeOldUsage,
   COL, MALL_GROUPS, COMBO_KEY_VERSION, AES_NONMAIL_PM,
   LEGACY_METHOD_NAME_ALIASES, AES_NE_CARRIER_ID,
@@ -1271,7 +1272,7 @@ export function purgeExpiredBatches() {
   return expired.length;
 }
 
-export { listUnregistered, mirrorFreshness };
+export { listUnregistered, mirrorFreshness, listHiddenUnregistered, hideUnregistered, unhideUnregistered };
 
 // 商品マスタ検索 (商品コード / 商品名 部分一致、上限 30 件、2026-06-05 中原さん指示)
 // 商品マスタ編集フォームで「商品名から検索」用。mirror_products (NE 商品マスタ) から検索。

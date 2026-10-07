@@ -30,7 +30,7 @@ const CALL_RE = /(?:cron\.schedule|setInterval)\s*\(/g;
  */
 const KNOWN = {
   // ── Render 内の業務ジョブ (台帳登録済み) ──
-  'apps/fba-replenishment/router.js': { count: 1, job: 'fba-daily-sync' },
+  'apps/fba-replenishment/router.js': { count: 2, job: 'fba-daily-sync' }, // 06:00 + 09:40/10:40/11:40 の自動決定 (台帳 fba-decision-draft)
   'apps/inbound-info/sync-job.js': { count: 1, job: 'inbound-info-daily' },
   'apps/mgmt-accounting/router.js': { count: 1, job: 'mgmt-auto-sync' },
   'apps/purchase-orders/email.js': { count: 0, job: 'po-email-dispatcher' }, // setTimeout 再帰なので呼び出しは数えない
@@ -53,8 +53,12 @@ const KNOWN = {
   'apps/biz-ops-overview/notify-job.js': { count: 1, exempt: 'Dark Launch (SALES_NOTIFY_ENABLED)。点火時に要登録' },
   'apps/ai-insights/notify-job.js': { count: 1, exempt: 'Dark Launch (AI_INSIGHTS_NOTIFY_ENABLED)。点火時に要登録' },
   'apps/rakuten-yahoo-sync/services/rys-cron.js': { count: 1, job: 'rys-daily-refresh' }, // Dark Launch のままでも台帳に載せる (締切超過 = 有効化の催促)
-  // 3箇所 = 受信同期 (inquiry-hub-sync: sync+deep) + 送信ワーカー (inquiry-hub-outbox)。台帳は2エントリ
-  'apps/inquiry-hub/sync/cron.js': { count: 3, job: 'inquiry-hub-sync' },
+  // 4箇所 = 受信同期 (inquiry-hub-sync: sync+deep) + 送信ワーカー (inquiry-hub-outbox) + 締め前の通知 (inquiry-hub-cutoff)。台帳は3エントリ
+  'apps/inquiry-hub/sync/cron.js': { count: 4, job: 'inquiry-hub-sync' },
+  // 2箇所 = 入荷受付CSV の Drive 取込 (30 分おき) + 倉庫PCの値札印刷エージェントの生存の中継 (台帳 nefuda-print-agent)。2026-09-25 登録
+  'apps/inbound-check/sync-job.js': { count: 2, job: 'inbound-check-drive-fetch' },
+  // いろはPC のラベル印刷エージェントの生存を中継する (印刷キューの見張り)
+  'apps/iroha-work/print-worker.js': { count: 1, job: 'iroha-label-print-agent' },
   // 2箇所 = 定刻 cron + 6時間毎 staleness (catch-up は setTimeout)。2026-09-05 台帳登録 (7週間 Dark Launch のまま無音だった教訓)
   'apps/render-backup/backup-render.js': { count: 2, job: 'render-backup' },
 
@@ -64,6 +68,8 @@ const KNOWN = {
   'apps/mercari-sync/router.js': { count: 1, exempt: 'メモリ上の一時ジョブの TTL 掃除。止まってもデータは壊れない' },
   'apps/warehouse/job-manager.js': { count: 1, exempt: '実行中ジョブの後片付け。単発ジョブに追随するだけ' },
   'apps/warehouse/job-locks.js': { count: 1, exempt: 'ロックの期限切れ掃除' },
+  'apps/inbound-check/back-label.js': { count: 1, exempt: '裏面ラベル写真の Drive 送信の再試行 (受信の直後にも回る・送信待ちは管理画面に出る)' },
+  'apps/iroha-work/media.js': { count: 1, exempt: 'いろはの作業写真の Drive 送信の再試行 (受信・削除の直後にも回る)' },
   'apps/warehouse/fba-service.js': { count: 1, exempt: 'オンデマンド実行の進捗ポーリング (人の操作起点)' },
   'apps/warehouse-mirror/build-lock.js': { count: 2, exempt: 'ビルド中ロックの延命 heartbeat (処理の一部)' },
   'apps/warehouse-mirror/build-linegift-analytics-mart.js': { count: 1, exempt: '長時間処理内の進捗ログ' },

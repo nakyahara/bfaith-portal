@@ -16,7 +16,7 @@
 import fs from 'fs';
 import path from 'path';
 import iconv from 'iconv-lite';
-import { initDB, getDB, saveToFile, updateSyncMeta } from './db.js';
+import { initDB, getDB, saveToFile, updateSyncMeta, clearNeCompleteMarks, neSrc } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -46,13 +46,15 @@ function parseCsv(text) {
   if (lines.length < 2) return { headers: [], rows: [] };
   const headers = parseRow(lines[0]);
   const rows = [];
+  let rejected = 0;   // 列数が合わず捨てた行 (読み飛ばし件数に入れる。黙って消さない)
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
     const values = parseRow(line);
     if (values.length === headers.length) rows.push(values);
+    else rejected++;
   }
-  return { headers, rows };
+  return { headers, rows, rejected };
 }
 
 function parseRow(line) {
@@ -84,9 +86,11 @@ function importProducts(filePath) {
   const stmt = db.prepare(`INSERT OR REPLACE INTO raw_ne_products (
     商品コード, 商品名, 仕入先コード, 原価, 売価, 取扱区分, 代表商品コード,
     ロケーションコード, 配送業者, 発注ロット単位, 最終仕入日, 商品分類タグ,
-    作成日, 在庫数, 引当数, 最終更新日, 消費税率, 発注残数, synced_at
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    作成日, 在庫数, 引当数, 最終更新日, 消費税率, 発注残数, synced_at, 原価_src, 売価_src, 消費税率_src
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?, ?, ?)`);
   const tx = db.transaction(() => {
+    // CSV で上書きすると NE 取込の「最後まで取れた印」が集合と食い違う → 同じ取引で消す (db.js clearNeCompleteMarks。Company DB構想 10 §6 / ③a-1)
+    clearNeCompleteMarks('products');
     let count = 0;
     for (const row of rows) {
       const code = (row[0]?.trim() || '').toLowerCase();
@@ -94,7 +98,8 @@ function importProducts(filePath) {
       stmt.run(code, row[1]||'', row[2]||'', parseFloat(row[3])||0, parseFloat(row[4])||0,
         row[5]||'', row[6]||'', row[7]||'', row[8]||'', parseInt(row[9])||0,
         row[10]||'', row[11]||'', row[12]||'', parseInt(row[13])||0, parseInt(row[14])||0,
-        row[15]||'', parseFloat(row[16])||0, parseInt(row[17])||0, now());
+        row[15]||'', parseFloat(row[16])||0, parseInt(row[17])||0, now(),
+        neSrc(row[3]), neSrc(row[4]), neSrc(row[16]));   // 元の値 (C1。列が無ければ NULL)
       count++;
     }
     return count;
@@ -144,16 +149,19 @@ function importSetProducts(filePath) {
   const { rows } = readCsvFile(filePath);
   const db = getDB();
   const stmt = db.prepare(`INSERT OR REPLACE INTO raw_ne_set_products (
-    セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, セット在庫数, 代表商品コード, synced_at
-  ) VALUES (?,?,?,?,?,?,?,?)`);
+    セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, セット在庫数, 代表商品コード, synced_at, セット販売価格_src, 数量_src
+  ) VALUES (?,?,?,?,?,?,?,?, ?, ?)`);
   const tx = db.transaction(() => {
+    // CSV で上書きすると NE 取込の「最後まで取れた印」が集合と食い違う → 同じ取引で消す (db.js clearNeCompleteMarks。Company DB構想 10 §6 / ③a-1)
+    clearNeCompleteMarks('setproducts');
     let count = 0;
     for (const row of rows) {
       const setCode = (row[0]?.trim() || '').toLowerCase();
       const childCode = (row[3]?.trim() || '').toLowerCase();
       if (!setCode || !childCode) continue;
       stmt.run(setCode, row[1]||'', parseFloat(row[2])||0, childCode,
-        parseInt(row[4])||1, parseInt(row[5])||0, row[6]||'', now());
+        parseInt(row[4])||1, parseInt(row[5])||0, row[6]||'', now(),
+        neSrc(row[2]), neSrc(row[4]));   // 元の値 (C1。列が無ければ NULL)
       count++;
     }
     return count;
@@ -164,16 +172,18 @@ function importSetProducts(filePath) {
 }
 
 function importLogizard(filePath) {
-  const { headers, rows } = readCsvFile(filePath);
+  const { headers, rows, rejected } = readCsvFile(filePath);
   const db = getDB();
   const col = (name) => headers.indexOf(name);
-  db.exec('DELETE FROM raw_lz_inventory');
   const stmt = db.prepare(`INSERT INTO raw_lz_inventory (
     商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
     在庫数, 引当数, ロケ業務区分, 商品予備項目004, 最終入荷日, 最終出荷日,
     ブロック引当順, 在庫日, synced_at
   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  // 🚨 入れ替え・取り込み時刻・素性を 1 つのトランザクションで (送り手が「新しい在庫 + 前の素性」を読まないように。
+  //    PR #1446 R1 Medium)
   const tx = db.transaction(() => {
+    db.exec('DELETE FROM raw_lz_inventory');
     let count = 0;
     for (const row of rows) {
       const productId = (row[col('商品ID')]?.trim() || '').toLowerCase();
@@ -187,11 +197,18 @@ function importLogizard(filePath) {
         row[col('ブロック引当順')]||'', row[col('在庫日')]||'', now());
       count++;
     }
+    // 取り込み時刻は ISO (送り手の鮮度判定が Date.parse で読む。Z の無い形だと JST の環境で 9 時間ずれる。PR #1446 R1 Medium)
+    const importedAt = new Date().toISOString();
+    updateSyncMeta('logizard_last_import', importedAt);
+    // 素性も残す (残さないと、前の取り込みの値が今回のものとして Render に送られる)。
+    //   フォルダに置かれた CSV は、いつロジザードから取ったか確かめられない → 在庫を取った時刻は空 (不明)
+    updateSyncMeta('logizard_source_at', '');
+    updateSyncMeta('logizard_rows_read', String(rows.length + rejected));
+    updateSyncMeta('logizard_skipped_rows', String(rejected + (rows.length - count)));
+    updateSyncMeta('logizard_source_for', importedAt);
     return count;
   });
-  const count = tx();
-  updateSyncMeta('logizard_last_import', now());
-  return count;
+  return tx();
 }
 
 // ─── ファイル種類判定 ───
