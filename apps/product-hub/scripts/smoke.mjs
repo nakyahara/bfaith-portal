@@ -13436,7 +13436,10 @@ for (const [name, file, data] of renders) {
   // 🚨 同じタブでログアウト→別の人が入ったとき、前の人の試算の選択を効かせない
   check('🚨 配送費の試算: 覚え書きの鍵に「誰の選択か」が入っている (利用者が交代しても混ざらない)',
     /'ph-profit-ship:<%= draft\.id %>:' \+ MINE_WHO/.test(sim)
-    && /const MINE_WHO = '<%= displayName \|\| "" %>';/.test(sim));
+    // 🚨 表示名は data 属性から読む。JS の文字列に埋めると末尾が \ の表示名で
+    //    インラインスクリプトごと壊れる (Codex R18)
+    && /const MINE_WHO = sel\.dataset\.who \|\| '';/.test(sim)
+    && !/MINE_WHO = '<%=/.test(sim));
   check('🚨 配送費の試算: sessionStorage に触るだけで例外になる環境でも画面を描く',
     /try \{ store = window\.sessionStorage; \} catch \(_\) \{ store = null; \}/.test(sim)
     && /store \|\| \{ getItem: \(\) => null/.test(sim));

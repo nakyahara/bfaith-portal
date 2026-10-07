@@ -841,8 +841,11 @@ th.attr-unknown { color: #dc2626; }
                   選択肢は NE の配送方法 (= 送料が決まる方) にする %>
               <div style="margin-top:6px;">
                 <label style="font-size:11px; margin-bottom:2px;" class="muted">配送方法で試算</label>
+                <%# data-who = 覚え書きの鍵に使う「誰の選択か」。JS の文字列に埋めると
+                    表示名の末尾の \ でスクリプトごと壊れるので、属性で渡す (Codex R18) %>
                 <select id="profit-ship-select" style="width:100%; font-size:12px;"
-                        data-current="<%= neCost?.shippingMethod || '' %>"></select>
+                        data-current="<%= neCost?.shippingMethod || '' %>"
+                        data-who="<%= displayName || '' %>"></select>
                 <%# 注記は改行で 3 行に分ける (1 行だと 180 字の薄い字になって結論が埋もれる — Codex R7 P3) %>
                 <div id="profit-ship-note" class="muted" style="font-size:11px; margin-top:2px; white-space:pre-line;"></div>
               </div>
@@ -5369,9 +5372,10 @@ th.attr-unknown { color: #dc2626; }
       let store = null;
       try { store = window.sessionStorage; } catch (_) { store = null; }
       // 🚨 鍵に**誰の選択か**を入れる。商品だけだと、同じタブでログアウト→別の人が入ったときに
-      //    前の人の試算の選択がその人の選択として効いてしまう (Codex R17 P2)
-      //    (EJS の値は文字列の中に置く。外に出すと、この塊をそのまま読む試験が JS として壊れる)
-      const MINE_WHO = '<%= displayName || "" %>';
+      //    前の人の試算の選択がその人の選択として効いてしまう (Codex R17 P2)。
+      //    値は data 属性から読む — JS の文字列に埋めると、末尾が \ の表示名で
+      //    インラインスクリプトごと壊れる (Codex R18)
+      const MINE_WHO = sel.dataset.who || '';
       const mine = profitShipMemory(
         store || { getItem: () => null, setItem: () => {}, removeItem: () => {} },
         'ph-profit-ship:<%= draft.id %>:' + MINE_WHO,
