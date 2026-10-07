@@ -616,6 +616,8 @@ check('delete cascades children',
 const vari = await import('../lib/variation.js');
 // 配送方法の名前の正本 (楽天の配送方法セット一覧の写し)。目安の表がこことズレていないか見る
 const shipLabels = await import('../../price-update/shipping-labels.js');
+// 運送会社・サービスの系統 (佐川=飛脚、ヤマト=クロネコ=宅急便 …)。目安の表の番人に使う
+const shipCost = await import('../../price-update/shipping-cost.js');
 const existingPageMod = await import('../lib/existing-page.js');
 // mirror_products に実データ相当を入れる (rooms = 代表コードだが商品としては実在しない = 本番の93%型)
 const insProd = db.prepare(`INSERT OR REPLACE INTO mirror_products
@@ -2654,10 +2656,13 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
   //    名前の正本は price-update/shipping-labels.js の RAKUTEN_SHIPPING_METHODS
   {
     const labels = shipLabels.RAKUTEN_SHIPPING_METHODS;
+    // 🚨 文字列が含まれるかでは足りない (NE は「佐川急便〜」「ヤマト(発払い)〜」とも書く)。
+    //    price-update の familyOf = **運送会社・サービスの系統**で見る。これが正本
     const bad = Object.entries(vari.RAKUTEN_GROUP_NE_HINTS)
-      .filter(([id, words]) => !words.every((w) => String(labels[id] || '').includes(w)))
-      .map(([id, words]) => `${id}=${labels[id]} ⇔ ${words.join('/')}`);
-    check('🚨 配送費の試算: 目安の語は楽天の配送方法の名前に含まれる (4=ゆうパックに宅急便を当てない)',
+      .filter(([id, words]) => words.some((w) => shipCost.familyOf(w) == null
+        || shipCost.familyOf(w) !== shipCost.familyOf(labels[id])))
+      .map(([id, words]) => `${id}=${labels[id]}(${shipCost.familyOf(labels[id])}) ⇔ ${words.map((w) => `${w}(${shipCost.familyOf(w)})`).join('/')}`);
+    check('🚨 配送費の試算: 目安の語は楽天の配送方法と同じ運送会社の系統 (4=ゆうパックに宅急便を当てない)',
       bad.length === 0, bad.join(' , '));
     // 🚨 「現在使用不可」(2) も**過去に保存された商品は開ける**ので、目安が無いと
     //    その商品だけ試算が配送方法に追従しない (Codex R6 P2)。選べる分だけでは足りない
@@ -2748,6 +2753,16 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     check('配送方法で試算: 楽天の名前が NE に出てこないグループは最多で選ぶ (絞りは効かない)',
       noNarrow['8']?.method === '宅急便60サイズ' && noNarrow['8']?.reason === 'count',
       JSON.stringify(noNarrow['8']));
+    // 🚨 NE の表記は運送会社名でも入る。別名を落とすとその楽天配送方法だけ追従しない (Codex R8 P2)
+    const alias = vari.profitShipPickByGroup([
+      { method: '佐川急便60サイズ', cost: 700, count: 10 },
+      { method: 'ヤマト(発払い)B2v6', cost: 800, count: 10 },
+    ]);
+    check('🚨 配送方法で試算: NE が「佐川急便〜」でも 飛脚宅配便 (3) の候補になる',
+      alias['3']?.method === '佐川急便60サイズ', JSON.stringify(alias['3']));
+    check('🚨 配送方法で試算: NE が「ヤマト(発払い)〜」でも 宅急便 (7/8) の候補になる',
+      alias['7']?.method === 'ヤマト(発払い)B2v6' && alias['8']?.method === 'ヤマト(発払い)B2v6',
+      JSON.stringify(alias['8']));
     // 送料が無い行は画面の選択肢にも無い = 合わせ先にしない (0円で利益を過大に見せない)
     const noCost = vari.profitShipPickByGroup(
       [{ method: '定形なし', cost: null, count: 9 }, { method: '定形あり', cost: 182, count: 1 }], { '1': ['定形'] });
@@ -13094,7 +13109,7 @@ for (const [name, file, data] of renders) {
   check('配送費の試算: 配送費は書き換えられる変数で持つ (固定の const ではない)',
     /let ship = Number\(box\.dataset\.ship\)/.test(sim) && !/const ship = Number\(box\.dataset\.ship\)/.test(sim));
   check('配送費の試算: 配送方法を変えたら利益を再計算する',
-    /sel\.addEventListener\('change', [\s\S]{0,60}apply\(\)/.test(sim) && /ship = Number\(op\.dataset\.cost\)/.test(sim)
+    /sel\.addEventListener\('change', [\s\S]{0,100}apply\(\)/.test(sim) && /ship = Number\(op\.dataset\.cost\)/.test(sim)
     && /function apply\(\)[\s\S]{0,600}render\(\)/.test(sim));
   // 🚨 候補を組み直すだけでは利益が動かない (2026-10-06 中原さん報告)。**選択も合わせる**こと。
   //    配線はソース検査で、決め方と文言は下の切り出しで**入力→出力**で確かめる
@@ -13104,22 +13119,24 @@ for (const [name, file, data] of renders) {
   check('🚨 配送費の試算: 開いたときも保存済みの配送方法に合わせる (保存すると画面は丸ごと読み直される)',
     /build\(\{ follow: neCurrent !== '' \}\);/.test(sim));
   check('配送費の試算: 試算のプルダウンを自分で選び直したら、合わせた注記は消えて選択を覚える',
-    /sel\.addEventListener\('change', \(\) => \{ followed = null; rememberMine\(sel\.value\); apply\(\); \}\)/.test(sim));
+    /sel\.addEventListener\('change', \(\) => \{ followed = null; mine\.remember\(sel\.value, groupOf\(\)\); apply\(\); \}\)/.test(sim));
   check('🚨 配送費の試算: ヤフーだけ変えた (1 → 1y5) ときは合わせ直さず、注記だけ描き直す',
     /if \(g === lastGroup\) \{ apply\(\); return; \}/.test(sim));
   check('配送費の試算: 注記の配送方法名は楽天の正規ラベル (複合選択肢の長い名前にしない)',
     /groupLabel: data\.labels\?\.\[groupOf\(\)\]/.test(sim));
   check('配送費の試算: 楽天の配送方法を変えたら、前に選んだ試算は忘れてその配送方法に合わせる',
-    /forgetMine\(\);[\s\S]{0,40}build\(\{ follow: true \}\);/.test(sim));
+    /mine\.forget\(\);[\s\S]{0,40}build\(\{ follow: true \}\);/.test(sim));
   check('🚨 配送費の試算: 覚えるのはこのタブ限り (sessionStorage) で、NE や出品内容には保存しない',
-    /sessionStorage\.setItem\(MINE_KEY/.test(sim) && !/localStorage/.test(sim));
+    /window\.sessionStorage/.test(sim) && !/localStorage/.test(sim));
   // 🚨 時間で失効させない。長く作業してから保存した人の選択が黙って戻る (Codex R5 P2)
   check('🚨 配送費の試算: 人の試算選択は時間で失効させない (消すのは配送方法を変えたときだけ)',
-    !/MINE_MAX_AGE_MS/.test(sim) && /forgetMine\(\);/.test(sim));
+    !/MAX_AGE/.test(sim) && /mine\.forget\(\);/.test(sim));
   // 🚨 別のタブで配送方法を変えて保存されたら、古い試算選択は捨てる (Codex R6 P2)
   check('🚨 配送費の試算: 覚えるのは「どの配送方法のときの選択か」まで (別タブの変更に負ける)',
-    /group: groupOf\(\)/.test(sim) && /String\(d\.group \?\? ''\) !== String\(group\)/.test(sim)
-    && /remembered: readMine\(group\)/.test(sim));
+    /remembered: mine\.read\(group\)/.test(sim) && /mine\.remember\(sel\.value, groupOf\(\)\)/.test(sim));
+  check('🚨 配送費の試算: sessionStorage に触るだけで例外になる環境でも画面を描く',
+    /try \{ store = window\.sessionStorage; \} catch \(_\) \{ store = null; \}/.test(sim)
+    && /store \|\| \{ getItem: \(\) => null/.test(sim));
   check('配送費の試算: 売価の入力でも従来どおり再計算する',
     /priceInput\.addEventListener\('input', render\)/.test(sim));
   check('配送費の試算: 試算であって NE や出品内容は変えないと画面に書く',
@@ -13190,6 +13207,20 @@ for (const [name, file, data] of renders) {
       n.includes('画面の「定形外」に合わせました') && n.includes('NE は「ネコポス」'), n);
     check('配送方法で試算: 選んだ理由を言い分ける (楽天の名前で絞ったときに「最多」と書かない)',
       n.includes('楽天の名前に合うものの中でいちばん多く使っているもの'), n);
+    {
+      // 🚨 NE の登録値を使ったのに「いちばん多く使っているもの」と書くと理由が逆 (Codex R8 P3)
+      const nePick = vari.profitShipPickByGroup([
+        { method: '定形外規格内（50g以内）', cost: 190, count: 1, isCurrent: true },
+        { method: '定形外規格外（1kg以内）', cost: 510, count: 999 },
+      ], { '1': ['定形'] });
+      const neNote = api.profitShipNoteText({
+        followed: { group: '1', pick: nePick['1'] }, method: nePick['1'].method,
+        groupLabel: '定形外', neCurrent: '定形外規格内（50g以内）', isCurrent: true,
+      });
+      check('🚨 配送方法で試算: NE の登録値を使ったときは理由をそう書く (「最多」と書かない)',
+        neNote.includes('NE に登録されている配送方法を使いました')
+        && !neNote.includes('いちばん多く使っているものを使いました'), neNote);
+    }
     // 🚨 1 行に全部入れると 11px の薄い字で結論が埋もれる (Codex R7 P3)。3 行に分ける
     check('配送方法で試算: 注記は 3 行に分ける (結論 → 候補 → 保存されない)',
       n.split(String.fromCharCode(10)).length === 3
@@ -13210,6 +13241,43 @@ for (const [name, file, data] of renders) {
     check('配送方法で試算: 合わせていないときの文言は今までどおり',
       api.profitShipNoteText({ followed: null, method: 'ネコポス', neCurrent: 'ネコポス', isCurrent: true }) === 'NE に登録されている送料です'
       && api.profitShipNoteText({ followed: null, method: '宅急便60サイズ', neCurrent: 'ネコポス', isCurrent: false }).includes('ここでの変更は試算だけで、NE や出品内容は変わりません'));
+  }
+  {
+    // ─── 人が選んだ試算の配送方法の覚え書き。偽の store で振る舞いを確かめる (Codex R8 P3) ───
+    const mem = new Function(chunk + ' return profitShipMemory;')();
+    const fake = (opts = {}) => {
+      let raw = opts.initial ?? null;
+      return {
+        get raw() { return raw; },
+        getItem: () => { if (opts.readThrows) throw new Error('blocked'); return raw; },
+        setItem: (_k, v) => { if (opts.writeThrows) throw new Error('full'); raw = v; },
+        removeItem: () => { raw = null; },
+      };
+    };
+    {
+      const st = fake();
+      const m = mem(st, 'k');
+      m.remember('定形外規格外（1kg以内）', '1');
+      check('覚え書き: 同じ配送方法なら覚えた便を返す',
+        m.read('1') === '定形外規格外（1kg以内）', String(st.raw));
+      check('🚨 覚え書き: 別の配送方法のときの選択は使わない (別タブで変わった後に勝たせない)',
+        m.read('5') === '');
+      m.forget();
+      check('覚え書き: 忘れたら空', m.read('1') === '' && st.raw === null);
+    }
+    {
+      // 🚨 書けなかったら古い記憶を消す。残すと「いま選んだ便でもない前の便」へ戻る
+      const st = fake({ initial: JSON.stringify({ method: '便A', group: '1' }), writeThrows: true });
+      const m = mem(st, 'k');
+      check('覚え書き: 覚える前は古い便が読める (前提の確認)', m.read('1') === '便A');
+      m.remember('便B', '1');
+      check('🚨 覚え書き: 書けなかったときは古い記憶を消す (前の便へ勝手に戻さない)',
+        m.read('1') === '' && st.raw === null);
+    }
+    {
+      const m = mem(fake({ readThrows: true }), 'k');
+      check('覚え書き: store を読めない環境でも落ちない (覚えないだけ)', m.read('1') === '');
+    }
   }
 }
 

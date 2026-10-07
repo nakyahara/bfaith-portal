@@ -5283,14 +5283,48 @@ th.attr-unknown { color: #dc2626; }
         // 🚨 「大きさで N 通り」とは書かない。候補は配送方法ごとに代表送料 1 件へ畳んである
         //    ので、実際の送料の幅ではない (Codex R4 P2)。
         //    理由は、楽天の名前で絞ったのに「いちばん多く」と書くと実際と逆になる (Codex R6 P3)
-        const why = p.reason === 'label' ? '楽天の名前に合うものの中でいちばん多く使っているもの'
-          : 'いちばん多く使っているもの';
+        const why = p.reason === 'ne' ? 'NE に登録されている配送方法'
+          : (p.reason === 'label' ? '楽天の名前に合うものの中でいちばん多く使っているもの'
+            : 'いちばん多く使っているもの');
         lines.push('候補 ' + p.candidates + ' 件 (送料0円は除く)・代表の送料 '
           + Math.round(p.min).toLocaleString() + '〜' + Math.round(p.max).toLocaleString() + '円 — '
           + why + 'を使いました。違うなら選び直してください');
       }
       lines.push('この選択は試算だけで、NE や出品内容には保存されません');
       return lines.join('\n');
+    }
+    /**
+     * 人が選び直した試算の配送方法の覚え書き (2026-10-06 Codex R4 P1)。
+     * 🚨 ここは**試算だけ**。NE にも出品内容にも保存しない。store は sessionStorage =
+     *    このタブ限り。未保存ガードと違って (a) 読んでも消さない・(b) 時間で失効させない
+     *    (30 分で失効させると、長く作業してから保存した人の選択が黙って戻る — Codex R5 P2)。
+     *    消すのは**人が楽天の配送方法を変えたとき**と、書けなかったときだけ。
+     * ⚠️ タブを複製・window.open すると sessionStorage は初期コピーされる (HTML 仕様) ので
+     *    新しいタブも引き継ぐ。同じ人の同じ商品・同じ配送方法での選択なので許容する。
+     * 画面を触らないので、試験から偽の store を渡して確かめられる
+     */
+    function profitShipMemory(store, key) {
+      const forget = () => { try { store.removeItem(key); } catch (_) { /* 使えない環境は諦める */ } };
+      return {
+        // 🚨 「どの楽天配送方法のときに選んだか」まで見る。方法名だけだと、別のタブで
+        //    配送方法を変えて保存されたあとに古い選択が勝ってしまう (Codex R6 P2)
+        read(group) {
+          try {
+            const d = JSON.parse(store.getItem(key) || 'null');
+            if (!d || String(d.group ?? '') !== String(group)) return '';
+            return String(d.method || '');
+          } catch (_) { return ''; }   // 使えない環境は覚えないだけ
+        },
+        remember(method, group) {
+          try { store.setItem(key, JSON.stringify({ method, group, at: Date.now() })); }
+          catch (_) {
+            // 🚨 書けなかったら**古い記憶を消す** (Codex R8 P3)。残すと、容量超過のあとで
+            //    読み直したときに「前に選んだ別の便」へ勝手に戻る (いま選んだ便でもない)
+            forget();
+          }
+        },
+        forget,
+      };
     }
     (function initProfitShipPicker() {
       const sel = document.getElementById('profit-ship-select');
@@ -5307,31 +5341,14 @@ th.attr-unknown { color: #dc2626; }
       // 複合選択肢 (1y5 等) は楽天側のグループで見る
       const groupOf = () => (rkShip ? String(rkShip.value || '') : '').replace(/y\d+$/, '');
 
-      // 人が選び直した試算の配送方法を、保存の読み直しをまたいで覚える (2026-10-06 Codex R4 P1)。
-      // 🚨 ここは**試算だけ**。NE にも出品内容にも保存しない (sessionStorage = このタブ限り)。
-      //    未保存ガードと違って (a) 読んでも消さない・(b) 時間で失効させない。
-      //    30 分で失効させると、長く作業してから保存した人の選択が黙って代表候補へ戻る
-      //    (Codex R5 P2)。消すのは**人が楽天の配送方法を変えたとき**だけ (= 合わせ直す合図)
-      const MINE_KEY = 'ph-profit-ship:<%= draft.id %>';
-      // 🚨 「どの楽天配送方法のときに選んだか」まで覚える。方法名だけだと、別のタブで
-      //    配送方法を変えて保存されたあとに古い選択が勝ってしまう (Codex R6 P2)。
-      //    ⚠️ タブを複製・window.open したときは sessionStorage が初期コピーされる (HTML 仕様) ので、
-      //    新しいタブもこの選択を引き継ぐ。同じ人の同じ商品・同じ配送方法での選択なので許容する
-      function readMine(group) {
-        try {
-          const d = JSON.parse(sessionStorage.getItem(MINE_KEY) || 'null');
-          if (!d || String(d.group ?? '') !== String(group)) return '';
-          return String(d.method || '');
-        } catch (_) { return ''; }   // 使えない環境は覚えないだけ
-      }
-      const rememberMine = (m) => {
-        try {
-          sessionStorage.setItem(MINE_KEY, JSON.stringify({ method: m, group: groupOf(), at: Date.now() }));
-        } catch (_) { /* 使えない環境は覚えないだけ (次に開くと配送方法に合わせ直す) */ }
-      };
-      const forgetMine = () => {
-        try { sessionStorage.removeItem(MINE_KEY); } catch (_) { /* 諦める */ }
-      };
+      // 人が選んだ試算の配送方法の覚え書き (= profitShipMemory)。sessionStorage を触るだけで
+      // 例外になる環境 (サイトデータを止めている等) があるので、取り出しも try で囲む
+      let store = null;
+      try { store = window.sessionStorage; } catch (_) { store = null; }
+      const mine = profitShipMemory(
+        store || { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+        'ph-profit-ship:<%= draft.id %>',
+      );
 
       function build({ follow = false } = {}) {
         const chosen = sel.value || neCurrent;   // 組み直すと消えるので先に控える
@@ -5366,7 +5383,7 @@ th.attr-unknown { color: #dc2626; }
         }
         const d = decideProfitShip({
           options: data.options, picks: data.picks, group, chosen, neCurrent, follow,
-          remembered: readMine(group),
+          remembered: mine.read(group),
         });
         followed = d.followed;
         sel.value = d.method;
@@ -5386,7 +5403,7 @@ th.attr-unknown { color: #dc2626; }
         render();
       }
       // 自分で選び直したら、合わせた説明は消して、その選択を覚える (人の選択が最後に勝つ)
-      sel.addEventListener('change', () => { followed = null; rememberMine(sel.value); apply(); });
+      sel.addEventListener('change', () => { followed = null; mine.remember(sel.value, groupOf()); apply(); });
       let lastGroup = groupOf();
       if (rkShip) {
         rkShip.addEventListener('change', () => {
@@ -5397,7 +5414,7 @@ th.attr-unknown { color: #dc2626; }
           if (g === lastGroup) { apply(); return; }
           lastGroup = g;
           // 配送方法を変えたのだから、試算もその配送方法に合わせる (前の選択は忘れる)
-          forgetMine();
+          mine.forget();
           build({ follow: true });
         });
       }
