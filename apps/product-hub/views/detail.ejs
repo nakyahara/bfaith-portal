@@ -5364,7 +5364,10 @@ th.attr-unknown { color: #dc2626; }
         // 🚨 サーバーが運送会社の系統で分けた一覧を使う。目安の語の部分一致だと
         //    「ヤマト(ネコポス)」が 宅急便 の「近いもの」に並び、人が選ぶと宅急便なのに
         //    237円 で試算できてしまう (Codex R10 P2)。古い画面向けに語の一致も残す
-        const nearList = data.near?.[group];
+        // 🚨 near がある版なら、そのグループのキーが無くても**空**として扱う。
+        //    語の一致へ戻すと「ヤマト(ネコポス)」が 宅急便 の「近いもの」に並び、
+        //    人が選ぶと宅急便なのに 237円 で試算できてしまう (Codex R11 P2)
+        const nearList = data.near ? (data.near[group] || []) : null;
         const hints = data.hints[group] || [];
         const match = (o) => (nearList ? nearList.includes(o.method) : hints.some((h) => o.method.includes(h)));
         const near = data.options.filter(match);

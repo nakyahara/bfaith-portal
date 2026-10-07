@@ -10580,21 +10580,25 @@ for (const [name, file, data] of renders) {
 }
 
 {
-  // ─── 画面の連続操作 (2026-10-07)。偽の DOM に initProfitShipPicker をそのまま載せて、
-  //     「初期表示 → 自分で選び直す → ヤフーだけ変える → 配送方法を変える → 候補が無い配送方法」
-  //     を続けて動かし、**配送費・注記・再計算の回数**を見る。
-  //     ソース検査と純粋関数だけだと「候補は組み直すが選択が動かない」(今回の報告) や
-  //     ハンドラの二重登録が素通りする (Codex R9 P2) ───
+  // ─── 画面の振る舞い (2026-10-07)。偽の DOM に **利益シミュレーションを丸ごと**
+  //     (initProfitSim + 配送方法ピッカー) 載せて、
+  //     「初期表示 → 自分で選び直す → ヤフーだけ変える → 配送方法を変える →
+  //      当てはまる便が無い配送方法 → 未選択 → 保存の読み直し → 別タブで変わった後」
+  //     を続けて動かし、**画面に出る利益額・配送費・注記**を見る。
+  //     ソース検査と純粋関数だけだと「候補は組み直すが利益が動かない」(今回の報告) や
+  //     ハンドラの二重登録が素通りする (Codex R9 P2 / R11 P3) ───
   const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
-  const from = src.indexOf('    function decideProfitShip(');
-  const to = src.indexOf('    })();', src.indexOf('    (function initProfitShipPicker()'));
-  const chunk = from >= 0 && to > from ? src.slice(from, to + '    })();'.length) : '';
-  check('画面の試算: detail.ejs から配送方法ピッカーを丸ごと切り出せる',
-    chunk.includes('initProfitShipPicker') && chunk.includes('decideProfitShip'), String(chunk.length));
+  const simStart = src.indexOf('  (function initProfitSim() {');
+  const simEnd = src.indexOf('\n  })();', src.indexOf('    (function initProfitShipPicker()'));
+  const chunk = simStart >= 0 && simEnd > simStart ? src.slice(simStart, simEnd + '\n  })();'.length) : '';
+  check('画面の試算: detail.ejs から利益シミュレーションを丸ごと切り出せる',
+    chunk.includes('initProfitSim') && chunk.includes('initProfitShipPicker')
+    && chunk.includes('decideProfitShip'), String(chunk.length));
 
-  const fakeEl = () => {
+  const fakeEl = (extra = {}) => {
     const el = {
       _opts: [], _listeners: {}, value: '', dataset: {}, textContent: '', hidden: false,
+      classList: { toggle() {} },
       replaceChildren() { el._opts = []; },
       appendChild(c) { if (c._group) el._opts.push(...c._opts); else el._opts.push(c); },
       get selectedOptions() { const o = el._opts.find((x) => x.value === el.value); return o ? [o] : []; },
@@ -10602,6 +10606,7 @@ for (const [name, file, data] of renders) {
       addEventListener(t, f) { (el._listeners[t] = el._listeners[t] || []).push(f); },
       fire(t) { for (const f of el._listeners[t] || []) f(); },
       methods: () => el._opts.map((o) => o.value),
+      ...extra,
     };
     return el;
   };
@@ -10609,7 +10614,7 @@ for (const [name, file, data] of renders) {
     let raw = null;
     return { get raw() { return raw; }, getItem: () => raw, setItem: (_k, v) => { raw = v; }, removeItem: () => { raw = null; } };
   };
-  function mount({ options, picks, near, labels, hints, neCurrent, rkValue, store: given }) {
+  function mount({ options, picks, near, labels, hints, neCurrent, rkValue, store: given, price = '2000', tax = '10', ship = '237', cost = '660' }) {
     const sel = fakeEl();
     sel.dataset.current = neCurrent;
     const note = fakeEl();
@@ -10617,32 +10622,39 @@ for (const [name, file, data] of renders) {
     holder.textContent = JSON.stringify({ options, picks, labels, hints, near });
     const rk = fakeEl();
     rk.value = rkValue;
+    const box = fakeEl();
+    Object.assign(box.dataset, { cost, tax, take: '0.9', ship });
+    const priceEl = fakeEl();
+    priceEl.value = price;
+    const amount = fakeEl();
+    const margin = fakeEl();
+    const figs = fakeEl();
+    const body = fakeEl();
     const store = given || fakeStore();
     const byId = {
-      'profit-ship-select': sel, 'profit-ship-note': note,
-      'profit-ship-data': holder, 'rk-shipping-group': rk,
+      'profit-ship-select': sel, 'profit-ship-note': note, 'profit-ship-data': holder,
+      'rk-shipping-group': rk, 'profit-sim': box, 'profit-sim-body': body, 'f-price': priceEl,
+      'profit-sim-figs': figs, 'profit-sim-amount': amount, 'profit-sim-margin': margin,
     };
     const document2 = {
       getElementById: (id) => byId[id] || null,
+      querySelectorAll: () => [],
       createElement: (tag) => (tag === 'optgroup'
         ? { _group: true, _opts: [], label: '', appendChild(c) { this._opts.push(c); } }
         : { value: '', dataset: {}, textContent: '' }),
     };
-    let renders = 0;
-    const api = new Function('document', 'window', 'render', `
-      let ship = NaN;
-      ${chunk}
-      return { getShip: () => ship };
-    `)(document2, { sessionStorage: store }, () => { renders += 1; });
+    new Function('document', 'window', chunk)(document2, { sessionStorage: store });
     return {
-      sel, note, rk, store, api,
-      ship: () => api.getShip(),
-      renders: () => renders,
+      sel, note, rk, store, amount, margin, body, figs,
+      profit: () => amount.textContent,
+      shipCost: () => (body.textContent.match(/配送費([\d,]+)/) || [])[1],
+      setPrice: (v) => { priceEl.value = v; priceEl.fire('input'); },
       pick: (m) => { sel.value = m; sel.fire('change'); },
       setGroup: (v) => { rk.value = v; rk.fire('change'); },
     };
   }
 
+  // 売価 2,000円・原価 660円 (税抜)・税率 10% → 手取り 1,800 − 税込原価 726 − 配送費
   const options = [
     { method: '定形内（50g以内）', cost: 146, count: 12 },
     { method: '定形外規格内（50g以内）', cost: 182, count: 900 },
@@ -10654,13 +10666,16 @@ for (const [name, file, data] of renders) {
   const labels = listing.ALL_SHIPPING_METHOD_GROUPS;
   const picks = vari.profitShipPickByGroup(options, hints, labels);
   const near = vari.profitShipNearByGroup(options, hints, labels);
-  const m = mount({ options, picks, near, labels, hints, neCurrent: 'ネコポス', rkValue: '1y5' });
+  const base0 = { options, picks, near, labels, hints, neCurrent: 'ネコポス' };
+  const m = mount({ ...base0, rkValue: '1y5' });
 
   // ① 開いた直後 = 保存済みの楽天配送方法 (定形外) に合わせる。これが報告そのもの
-  check('🚨 画面の試算: 定形外で保存済みの商品を開くと配送費が定形外のものになる (NEのネコポスのままにしない)',
-    m.ship() === 182 && m.sel.value === '定形外規格内（50g以内）', String(m.ship()));
-  check('画面の試算: 開いた時点で利益を計算し直している', m.renders() >= 1, String(m.renders()));
-  check('画面の試算: 注記は「試算: …」から始まる 3 行', m.note.textContent.split(String.fromCharCode(10)).length === 3
+  check('🚨 画面の試算: 定形外で保存済みの商品を開くと利益額が定形外の送料で出る (NEのネコポスの 837円 にしない)',
+    m.profit() === '892円' && m.shipCost() === '182' && m.sel.value === '定形外規格内（50g以内）',
+    m.profit() + ' / ' + m.body.textContent);
+  check('画面の試算: 利益率も出る (2,000円 で 44.6%)', m.margin.textContent === '44.6%', m.margin.textContent);
+  check('画面の試算: 注記は「試算: …」から始まる 3 行',
+    m.note.textContent.split(String.fromCharCode(10)).length === 3
     && m.note.textContent.startsWith('試算: '), m.note.textContent);
   check('画面の試算: 候補は選択肢として全部並ぶ (絞り込みではなく並べ替え)',
     m.sel.methods().length === options.length, JSON.stringify(m.sel.methods()));
@@ -10668,10 +10683,9 @@ for (const [name, file, data] of renders) {
     m.sel._listeners.change.length === 1 && m.rk._listeners.change.length === 1);
 
   // ② 大きさが違うので自分で選び直す
-  const before = m.renders();
   m.pick('定形外規格外（1kg以内）');
-  check('🚨 画面の試算: 自分で選び直すと配送費が変わって計算し直す',
-    m.ship() === 510 && m.renders() > before, String(m.ship()));
+  check('🚨 画面の試算: 自分で選び直すと利益額が変わる (510円 → 564円)',
+    m.profit() === '564円' && m.shipCost() === '510', m.profit() + ' / ' + m.body.textContent);
   check('画面の試算: 自分で選んだら「合わせました」ではなく今までどおりの注記',
     m.note.textContent.includes('ここでの変更は試算だけで'), m.note.textContent);
   check('画面の試算: 選んだ便をこのタブに覚える (保存の読み直しをまたぐため)',
@@ -10680,40 +10694,71 @@ for (const [name, file, data] of renders) {
   // ③ ヤフーだけ変える (1y5 → 1y8) = 楽天の配送方法は変わっていない
   m.setGroup('1y8');
   check('🚨 画面の試算: ヤフーだけ変えても人の選択を奪わない',
-    m.ship() === 510 && m.sel.value === '定形外規格外（1kg以内）', String(m.ship()));
+    m.profit() === '564円' && m.sel.value === '定形外規格外（1kg以内）', m.profit());
 
   // ④ 配送方法そのものを変える = 試算も合わせる (前の選択は忘れる)
   m.setGroup('5');
-  check('🚨 画面の試算: 配送方法をネコポスに変えると NE の実送料で試算し直す',
-    m.ship() === 237 && m.sel.value === 'ネコポス', String(m.ship()));
+  check('🚨 画面の試算: 配送方法をネコポスに変えると NE の実送料で計算し直す (837円)',
+    m.profit() === '837円' && m.shipCost() === '237' && m.sel.value === 'ネコポス', m.profit());
   check('画面の試算: 配送方法を変えたら前の選択は忘れる', m.store.raw === null, String(m.store.raw));
 
   // ⑤ 当てはまる便が無い配送方法 = 変えない + 理由を出す
   m.setGroup('4');
-  check('🚨 画面の試算: 当てはまる便が無い配送方法では選択を動かさず理由を出す',
-    m.ship() === 237 && m.note.textContent.includes('試算できる NE の配送方法が選択肢にありません'),
+  check('🚨 画面の試算: 当てはまる便が無い配送方法では利益も選択も動かさず理由を出す',
+    m.profit() === '837円' && m.note.textContent.includes('試算できる NE の配送方法が選択肢にありません'),
     m.note.textContent);
 
   // ⑥ 未選択に戻す = 合わせ先が無いだけ。選択は動かさない
   m.setGroup('');
-  check('画面の試算: 未選択 (— 選んでください) に戻しても選択は動かない', m.ship() === 237);
+  check('画面の試算: 未選択 (— 選んでください) に戻しても利益は動かない', m.profit() === '837円');
 
-  // ⑦ 保存 → 読み直し (同じタブ = 同じ sessionStorage)。人が選んだ便が残る
+  // ⑦ 売価を打ち替えれば今までどおり再計算する (#641 からの約束)
+  m.setPrice('3000');
+  check('画面の試算: 売価を打ち替えれば再計算する (3,000円 → 1,737円)',
+    m.profit() === '1,737円', m.profit());
+  m.setPrice('');
+  check('画面の試算: 売価が空なら利益は出さない',
+    m.body.textContent === '売価を入れると利益額・利益率が出ます' && m.figs.hidden === true, m.body.textContent);
+
+  // ⑧ 保存 → 読み直し (同じタブ = 同じ sessionStorage)。人が選んだ便が残る
   const shared = fakeStore();
-  const a = mount({ options, picks, near, labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: shared });
+  const a = mount({ ...base0, rkValue: '1', store: shared });
   check('画面の試算: 覚えた便が無ければ、開いたときは配送方法に合わせる (前提の確認)',
-    a.ship() === 182, String(a.ship()));
+    a.profit() === '892円', a.profit());
   a.pick('定形外規格外（1kg以内）');
-  const b = mount({ options, picks, near, labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: shared });
+  const b = mount({ ...base0, rkValue: '1', store: shared });
   check('🚨 画面の試算: 保存の読み直し後も、人が選んだ便で試算する (最多候補へ戻さない)',
-    b.ship() === 510 && b.sel.value === '定形外規格外（1kg以内）', String(b.ship()));
-  const c = mount({ options, picks, near, labels, hints, neCurrent: 'ネコポス', rkValue: '5', store: shared });
+    b.profit() === '564円' && b.sel.value === '定形外規格外（1kg以内）', b.profit());
+  const c = mount({ ...base0, rkValue: '5', store: shared });
   check('🚨 画面の試算: 別タブで配送方法が変わっていたら古い選択は捨てて合わせ直す',
-    c.ship() === 237 && c.sel.value === 'ネコポス', String(c.ship()));
+    c.profit() === '837円' && c.sel.value === 'ネコポス', c.profit());
+
+  // ⑨ 税率が決まらない商品は利益を出さない (Company DB 切替後)
+  const noTax = mount({ ...base0, rkValue: '1', tax: '' });
+  check('画面の試算: 税率が決まらない商品は利益を出さず、その旨を書く',
+    noTax.body.textContent.includes('税率が決まっていません') && noTax.figs.hidden === true,
+    noTax.body.textContent);
+
+  // ⑩ 🚨 同じ系統の便が 1 件も無いとき、名前だけ重なる別系統の便を「近いもの」に出さない
+  {
+    const yamato = [
+      { method: 'ヤマト(ネコポス)', cost: 237, count: 999, isCurrent: true },
+      { method: '定形外規格内（50g以内）', cost: 182, count: 10 },
+    ];
+    const p2 = vari.profitShipPickByGroup(yamato, hints, labels);
+    const n2 = vari.profitShipNearByGroup(yamato, hints, labels);
+    check('🚨 画面の試算: 宅急便の便が無ければ 楽天=宅急便 の合わせ先は作らない',
+      !('8' in p2), JSON.stringify(p2['8']));
+    const my = mount({ options: yamato, picks: p2, near: n2, labels, hints, neCurrent: 'ヤマト(ネコポス)', rkValue: '8' });
+    check('🚨 画面の試算: 「ヤマト(ネコポス)」を 宅急便 の「近いもの」に出さない (安い送料を選ばせない)',
+      !(n2['8'] || []).includes('ヤマト(ネコポス)')
+      && my.note.textContent.includes('試算できる NE の配送方法が選択肢にありません'),
+      JSON.stringify(n2['8'] || []) + ' / ' + my.note.textContent);
+  }
 
   // ─── 🚨 本番の経路を通して確かめる (Codex R10 P3)。上の試験は picks を自分で作って
   //     渡しているので、router が渡し忘れても落ちない。**実際の GET /detail/:id が描いた
-  //     profit-ship-data** を取り出し、同じピッカーに載せて 182円 になるところまで見る ───
+  //     profit-ship-data** を取り出し、同じピッカーに載せて 892円 になるところまで見る ───
   {
     const express2 = (await import('express')).default;
     const routerMod2 = await import('../router.js');
@@ -10756,8 +10801,8 @@ for (const [name, file, data] of renders) {
       options: dataE2.options, picks: dataE2.picks, near: dataE2.near,
       labels: dataE2.labels, hints: dataE2.hints, neCurrent: 'ネコポス', rkValue: '1',
     });
-    check('🚨 通し確認: 定形外で保存済みの商品を開くと、配送費が 182円 で利益が出る',
-      mE2.ship() === 182, String(mE2.ship()));
+    check('🚨 通し確認: 定形外で保存済みの商品を開くと、利益額が 892円 (配送費 182円) で出る',
+      mE2.profit() === '892円' && mE2.shipCost() === '182', mE2.profit() + ' / ' + mE2.body.textContent);
     server2.close();
     db.prepare('DELETE FROM mirror_products WHERE product_id BETWEEN 99700 AND 99799').run();
   }
