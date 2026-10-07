@@ -39,11 +39,19 @@ import { familyOf } from '../../price-update/shipping-cost.js';
  * 多いと、楽天「宅急便50サイズ以下」の商品がコンパクトの送料で試算されて利益を良く見せる
  * (Codex R19 P1)。page-info.js の mapNeShippingToRakuten も「宅急便コンパクト→宅急便」を
  * 誤マッピングの例として挙げている。
+ * 同じ理由で「飛脚メール便」(宅配便ではない)・「クール便」も分ける (Codex R24)。
+ * 楽天の配送方法の名前にこれらの語は出てこないので、**分けた分は自動では選ばれない** =
+ * 管理画面で割り当てるまで候補にしない (安全側)。足すときは実データの配送方法名を棚卸しする:
+ *   node apps/product-hub/scripts/shipping-map-report.mjs
  */
+const SHIP_SERVICE_QUALIFIERS = ['コンパクト', 'メール便', 'クール'];
+
 export function shipServiceOf(name) {
   const f = familyOf(name);
   if (!f) return null;
-  return /コンパクト/.test(String(name ?? '')) ? `${f}/コンパクト` : f;
+  const n = String(name ?? '');
+  const q = SHIP_SERVICE_QUALIFIERS.find((w) => n.includes(w));
+  return q ? `${f}/${q}` : f;
 }
 export const ALLOWED_TAX_PERCENTS = [8, 10];
 

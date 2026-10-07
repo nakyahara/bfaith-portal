@@ -2773,6 +2773,15 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     check('🚨 配送方法で試算: 宅急便コンパクトは最多でも 宅急便 (7/8) の合わせ先にしない',
       cp['7']?.method === '宅急便60サイズ' && cp['8']?.method === '宅急便60サイズ'
       && cp['8']?.candidates === 1, JSON.stringify(cp['8']));
+    // 🚨 「飛脚メール便」は宅配便ではない。最多でも 飛脚宅配便 (3) に選ばせない (Codex R24)
+    const mail = vari.profitShipPickByGroup([
+      { method: '飛脚メール便', cost: 200, count: 999 },
+      { method: '飛脚宅配便60サイズ', cost: 700, count: 10 },
+    ]);
+    check('🚨 配送方法で試算: 飛脚メール便は最多でも 飛脚宅配便 (3) の合わせ先にしない',
+      mail['3']?.method === '飛脚宅配便60サイズ' && mail['3']?.candidates === 1, JSON.stringify(mail['3']));
+    check('配送方法で試算: クール便も別サービスとして分ける',
+      vari.shipServiceOf('宅急便クール60サイズ') !== vari.shipServiceOf('宅急便60サイズ'));
     check('配送方法で試算: サービスの単位は familyOf + コンパクト等の別サービス',
       vari.shipServiceOf('宅急便コンパクト') !== vari.shipServiceOf('宅急便60サイズ')
       && vari.shipServiceOf('ヤマト(発払い)B2v6') === vari.shipServiceOf('宅急便60サイズ')
@@ -13567,6 +13576,15 @@ for (const [name, file, data] of renders) {
   check('🚨 配送費の試算: sessionStorage に触るだけで例外になる環境でも画面を描く',
     /try \{ store = window\.sessionStorage; \} catch \(_\) \{ store = null; \}/.test(sim)
     && /store \|\| \{ getItem: \(\) => null/.test(sim));
+  // 🚨 「これにする」は配送方法の値を入れるだけでなく **change を送る**。送らないと
+  //    画面の値だけ変わって利益試算が追従しない (Codex R24 P3)
+  {
+    const useNe = src.slice(src.indexOf("const shipUseNe = document.getElementById('rk-ship-use-ne')"));
+    const h = useNe.slice(0, useNe.indexOf('    }') + 5);
+    check('🚨 配送費の試算: 「これにする」は値を入れたあと change を 1 回送る (利益も追従する)',
+      /sel\.value = shipUseNe\.dataset\.group \|\| '';[\s\S]{0,120}sel\.dispatchEvent\(new Event\('change', \{ bubbles: true \}\)\);/.test(h)
+      && (h.match(/dispatchEvent/g) || []).length === 1, h.slice(0, 300));
+  }
   check('配送費の試算: 売価の入力でも従来どおり再計算する',
     /priceInput\.addEventListener\('input', render\)/.test(sim));
   check('配送費の試算: 試算であって NE や出品内容は変えないと画面に書く',
