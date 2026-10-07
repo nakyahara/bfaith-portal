@@ -27,6 +27,8 @@ const ok = (cond, label, detail = '') => { if (cond) { passed++; console.log(`  
 const NON_ENTRY_WRITERS = {
   'apps/warehouse/rebuild-m-products.js': 'm_products の毎朝の作り直し (上書き表と NE から導く。人の入口ではない。切替後は ④ の写し)',
   'apps/warehouse/record-m-products-history.js': 'm_products の履歴の記録 (作り直しの後)',
+  // ⑦-2 PR-A (#1649): Company DB → m_sku_master・m_sku_components の写し。古い入口 (LEGACY_ENTRIES) ではない = 古い入口の門はこの書き手を閉じたり開いたりしない
+  'apps/company-db/publish/amazon-map.mjs': 'Company DB の写しの書き手 (Amazon SKU の対応)。持ち主が company のときだけ・回の鍵 (daily-sync / 再試行 / 手の口 retry-failed-jobs.js --amazon-map-chain) を持つ親の子だけが書く・古い入口ではない',
 };
 
 // ─── ファイルを集める ───
@@ -221,6 +223,8 @@ console.log('── 3. ルートでない書き込みの口 (CLI・定期実行)
   ok(unlisted.length === 0, 'マスタに書く CLI・定期実行は全部 cli / job の入口か、人の入口ではない書き手 (理由つき)', unlisted.join('\n      '));
   // 許す一覧に古い行を残さない (本当にマスタに書くファイルだけ)
   for (const f of Object.keys(NON_ENTRY_WRITERS)) ok(text.has(f) && blocks.some((b) => b.file === f && whyOf(b)), `人の入口ではない書き手 ${f} は本当にマスタに書く (古い行ではない)`);
+  // 人の入口ではない書き手は古い入口の一覧に載らない = 古い入口の門 (master-legacy-gate) がこの書き手を入口として閉じたり開いたりしない
+  for (const f of Object.keys(NON_ENTRY_WRITERS)) ok(!LEGACY_ENTRIES.some((e) => e.file === f || e.writer_file === f), `人の入口ではない書き手 ${f} は古い入口の一覧 (門の対象) に無い`);
 }
 
 console.log('── 4. csv-import.js の mode は全部分けてある ──');
