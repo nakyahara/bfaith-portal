@@ -8,11 +8,14 @@
  *   1 持ち主を読む (DB の active の listing_components.amazon。config は見ない)。load (今の本番) = 何もしない (SQLite を開かない・書かない・exit 0)
  *   2 company = 実行の鍵 (warehouse.db の job_locks 'cdb-amazon-map-publish') を取ってから、watcher の読むだけの 1 取引 (REPEATABLE READ) で
  *     対応 (readCompanyAmazonMapCanon = active だけ・時刻は UTC の ISO・Z・ミリ秒) と変更の記録の最大の番号を読む
- *     (daily-sync・自動再試行・手の CLI は同じこのファイル = 同じ鍵。鍵は PG を読む前から SQLite の commit の後まで持つ)
+ *     (鍵は PG を読む前から SQLite の commit の後まで持つ)
+ *   🚨 書くのは「回の鍵 (daily-sync / 再試行の data/*.lock.json) を持つ親プロセスの子」だけ (#1649 Codex R3 High)。
+ *     daily-sync・自動再試行・手の口 (retry-failed-jobs.js --amazon-map-chain = 再試行と同じ回の鍵を取り、写し → f_sales → 速度 → リスト → Render同期 を一続きで流す) の 3 つは、
+ *     同じ回の鍵で必ずどれか 1 つだけになる。回の鍵を持たない起動 (人が直接このファイルを流す) は書かずに断る (試しの --dry-run だけは流せる)
  *   3 安全弁 (断る = 何も書かない・exit 1): 0 件 / 今の古い表の行数の 90% 未満 / 変更の記録の番号が前の写しより小さい (Company DB をバックアップから戻した?)
  *     / 受け手の決まり (validateSkuMap) に合わない。
- *     意図した大量削除だけは手の CLI の --allow-shrink --expect-hash <今回の Company DB のハッシュ> で通す (0 件と 90% だけ。--daily では使えない)。
- *     復元の後は、止める env (CDB_AMAZON_MAP_PUBLISH_PAUSE=1) を入れて --dry-run で差を人が見る → env を外して --accept-restore --expect-hash で再開 (README)
+ *     意図した大量削除だけは手の口の --allow-shrink --expect-hash <今回の Company DB のハッシュ> で通す (0 件と 90% だけ。--daily では使えない)。
+ *     復元の後は、止める env (CDB_AMAZON_MAP_PUBLISH_PAUSE=1) を入れて --dry-run で差を人が見る → env を外して手の口の --accept-restore --expect-hash で再開 (README)
  *   4 SQLite の 1 取引 (IMMEDIATE) で差だけ入れる (消すのは構成 → 親・入れるのは親 → 構成)。commit の前に読み直してハッシュを照らす (違えば巻き戻す)・
  *     鍵がまだ自分のものかも照らす。sync_meta 'cdb_amazon_map_publish' にハッシュ・行数・変更の記録の番号を残す
  *   5 前の写しの後に古い表が誰かに書き換えられていた (今のハッシュ ≠ 前の写しのハッシュ) = ⚠️ で知らせて、そのまま Company DB の値で上書きする
@@ -20,14 +23,13 @@
  * 作る値: created_by / updated_by (ハッシュの外) は、行を足す・直すときだけ Company DB の registered_by / changed_by を入れる (変わらない行は触らない)
  *
  * 使い方 (miniPC・リポジトリ直下):
- *   node apps/company-db/publish/amazon-map.mjs --daily                         daily-sync・自動再試行の回 (工程「CompanyDB写し(Amazon SKU)」)
- *   node -r dotenv/config apps/company-db/publish/amazon-map.mjs                急ぎのときに手で写す (同じ鍵・同じ安全弁)
- *   node -r dotenv/config apps/company-db/publish/amazon-map.mjs --dry-run      読んで差を数えるだけ (鍵も取らない・書かない。止めている間も流せる)
- *   ... --allow-shrink --expect-hash <H>     意図した大量削除 (0 件・90% 未満) を通す (手だけ。H = --dry-run が出す Company DB のハッシュ)
- *   ... --accept-restore --expect-hash <H>   Company DB を戻した後、差を人が見てから再開 (変更の記録の番号が戻ったのを通す。手だけ)
+ *   node apps/company-db/publish/amazon-map.mjs --daily                         daily-sync・自動再試行の回 (工程「CompanyDB写し(Amazon SKU)」・親が回の鍵を持つ)
+ *   node -r dotenv/config apps/company-db/publish/amazon-map.mjs --dry-run      読んで差を数えるだけ (鍵も取らない・書かない。止めている間も流せる。H = Company DB のハッシュが出る)
+ *   急ぎで写す・意図した大量削除・復元の後の再開 = 手の口 (この下の --chain はその口が付ける。人は直接使わない):
+ *     node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain [--allow-shrink | --accept-restore] [--expect-hash <H>]
  * env: COMPANY_DB_WATCH_URL (watcher) / DATA_DIR (warehouse.db) / CDB_AMAZON_MAP_PUBLISH_PAUSE=1 (止める = ⚠️ 見送り・古い表は前の形のまま)
- * 手の写し (--daily でない) は daily-sync / retry の回が動いている間は断る (鍵の前と後に確かめる)。鍵の順 = 回の鍵 → 写しの鍵 (待たない)。
- * 終わり方: 写した・変わらない・持ち主が load・止めている = exit 0 / 断った・読めない (持ち主が company のはず)・回が動いている (手) = exit 1 (daily-sync の retry に載る) /
+ * 鍵の順 = 回の鍵 (親) → 写しの鍵 (待たない)。
+ * 終わり方: 写した・変わらない・持ち主が load・止めている = exit 0 / 断った・読めない (持ち主が company のはず)・回の鍵を持つ親がいない = exit 1 (daily-sync の retry に載る) /
  *   別の写しが鍵を持っていた = exit 73 (daily-sync はこの朝の f_sales・速度・リスト・Render同期 を流さず retry に残す)。
  *   ping は打たない (台帳 warehouse-daily-sync の 1 工程。成否は daily-sync の要約・retry の通知に出る)
  */
@@ -40,7 +42,7 @@ import { readOwnershipState } from '../load/ownership-state.mjs';
 import { readCompanyAmazonMapCanon, AMAZON_MAP_OWNER_KEY } from '../../../lib/amazon-map-write.mjs';
 import { fromMiniPcRows, skuMapDigest, validateSkuMap, SKU_MAP_HASH_RE, SKU_MAP_CANON_FORMAT } from '../../../lib/sku-map-canonical.js';
 import { acquireLock, releaseLock } from '../../warehouse/job-locks.js';
-import { otherRunAlive } from '../../warehouse/retry-lock.js';
+import Database from 'better-sqlite3';
 
 export const STEP_NAME = 'CompanyDB写し(Amazon SKU)';   // daily-sync の工程の名前 = retry-failed-jobs.js の名前
 export const META_KEY = 'cdb_amazon_map_publish';
@@ -93,10 +95,26 @@ export function validMeta(j) {
 export function readMetaReadonly(dataDir) {
   const file = path.join(dataDir, 'warehouse.db');
   if (!fs.existsSync(file)) return null;
-  return import('better-sqlite3').then(({ default: Database }) => {
-    const db = new Database(file, { readonly: true, fileMustExist: true });
-    try { return readMeta(db); } finally { db.close(); }
-  });
+  const db = new Database(file, { readonly: true, fileMustExist: true });
+  try { return readMeta(db); } finally { db.close(); }
+}
+/**
+ * 持ち主が company だという**肯定の**手がかり (#1649 Codex R3 Medium 2): config (configured) が company = 'config' / 有効な写しの記録がある = 'meta' / 無い = null。
+ *   daily-sync はこれが無い朝、写しの子の異常終了 (timeout・abort・起動の失敗) だけを理由に写しを retry-state に載せない・retry は写しの鎖を効かせない
+ *   (今の本番 = config も記録も load = retry は master と同じ)。読めない記録は肯定の手がかりにしない
+ */
+export function amazonMapHint({ dataDir = process.env.DATA_DIR || '', ownership = MASTER_OWNERSHIP, readMeta: rm = readMetaReadonly } = {}) {
+  if (ownership && ownership[AMAZON_MAP_OWNER_KEY] === 'company') return 'config';
+  let m = null;
+  try { m = dataDir ? rm(dataDir) : null; } catch { m = null; }
+  return m && !m.unreadable && validMeta(m) ? 'meta' : null;
+}
+/**
+ * daily-sync の写しの工程の結果 → retry-state に載せるか。成功・肯定の手がかりがある = そのまま / 失敗で手がかりが無い = blocked (載せない・鎖を動かさない)
+ */
+export function dailyMapResultForRetry(result, hint) {
+  if (!result || result.success || hint) return result;
+  return { ...result, blocked: true, summary: `${String(result.summary || '').slice(0, 300)} / 持ち主が company の手がかりが無い (config も写しの記録も load) = retry に載せない` };
 }
 
 // ─── Company DB ───
@@ -235,11 +253,11 @@ const describe = (c) => `親 +${c.master.inserted} ~${c.master.updated} -${c.mas
 
 /**
  * 1 回分。connect = () => { db, close } (watcher)。getSqlite = 持ち主が company のときだけ呼ぶ (load の朝は SQLite を開かない)。
- * runAlive = 手の写しのときだけ呼ぶ「daily-sync / retry の回の持ち主が動いているか」(動いている = { what, pid, started_at } / いない = null)
- * @returns {{ state: 'not_applied'|'applied'|'unchanged'|'refused'|'dry_run'|'lock_busy'|'run_busy', code, line, counts?, problems?, detail?, digest? }}
+ * runLockHeld = 「回の鍵 (daily-sync / 再試行) を持つのは親プロセスか」(持つ = { what } / 持たない = null)。書く回 (dry-run でない) で持たない = 書かずに断る
+ * @returns {{ state: 'not_applied'|'applied'|'unchanged'|'refused'|'dry_run'|'lock_busy'|'no_run_lock', code, line, counts?, problems?, detail?, digest? }}
  */
 export async function runAmazonMapPublish({ connect, getSqlite, now = () => new Date(), dryRun = false, allowShrink = false, acceptRestore = false, expectHash = null,
-  manual = false, lockTtlMs = LOCK_TTL_MS, beforeCommit = null, afterLock = null, runAlive = () => null }) {
+  manual = false, lockTtlMs = LOCK_TTL_MS, beforeCommit = null, afterLock = null, runLockHeld = () => runLockHeldByParent() }) {
   // 持ち主を読むまでの失敗 (接続・持ち主の記録が壊れている) には印 ownerStage を付ける = 入口 (cli) が手がかりで ❌ / ⚠️ を決める
   const ownerStage = (e) => Object.assign(e instanceof Error ? e : new Error(String(e)), { ownerStage: true });
   let conn;
@@ -258,19 +276,13 @@ export async function runAmazonMapPublish({ connect, getSqlite, now = () => new 
     }
     sqlite = await getSqlite();
     // 2 鍵 (PG の対応を読む前から SQLite の commit の後まで)。試し (--dry-run) は書かない = 鍵も取らない
-    //   鍵の順 = daily-sync / retry の回の鍵 (外) → 写しの鍵 (内)。どれも待たずに取れなければすぐ断る (待ち合わせの輪ができない)。
-    //   手の写し (manual) は回の鍵を取らず、写しの鍵の前と後の 2 回「回が動いていない」を確かめる = 回の f_sales〜Render同期 の間に新しい対応を入れない (#1649 Codex R1 High)
-    const runBusy = () => {
-      const h = manual ? runAlive() : null;
-      return h ? { state: 'run_busy', code: EXIT.error, line: `❌ ${STEP_NAME}: daily-sync / 再試行の回が動いている (${h.what || '回'}・pid ${h.pid}・開始 ${h.started_at}) = 手では写さない (その回の写し → f_sales → Render同期 と混ざらないように。終わってから流す)` } : null;
-    };
+    //   🚨 書くのは回の鍵 (daily-sync / 再試行の data/*.lock.json) を持つ親の子だけ (#1649 Codex R3 High)。daily・retry・手の口 (retry-failed-jobs.js --amazon-map-chain) は
+    //   同じ回の鍵で 1 つずつ = 回の f_sales〜Render同期 の間に別の写しが新しい対応を入れる道が無い。鍵の順 = 回の鍵 (親) → 写しの鍵 (待たない)
     if (!dryRun) {
-      const busy0 = runBusy();
-      if (busy0) return busy0;
+      const held = runLockHeld();
+      if (!held) return { state: 'no_run_lock', code: EXIT.error, line: `❌ ${STEP_NAME}: 回の鍵 (daily-sync / 再試行) を持つ親から起動されていない = 書かない。手で写すのは node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain (写し → f_sales → 速度 → リスト → Render同期 を一続きで)・差を見るのは --dry-run` };
       lock = acquireLock(sqlite, LOCK_NAME, { ttlMs: lockTtlMs });
       if (!lock) return { state: 'lock_busy', code: EXIT.lock_busy, line: `❌ ${STEP_NAME}: 別の写しが動いている (鍵 ${LOCK_NAME}) = 何もしない (show-job-locks.js で確かめる・daily-sync はこの朝の f_sales 以降を retry に残す)` };
-      const busy1 = runBusy();   // 鍵を取る間に回が始まった = 外して (finally) 断る
-      if (busy1) return busy1;
       if (afterLock) await afterLock();
     }
     await db.query('begin transaction isolation level repeatable read read only');
@@ -315,12 +327,13 @@ export async function runAmazonMapPublish({ connect, getSqlite, now = () => new 
 // ─── 入口 ───
 
 export function parseArgs(argv) {
-  const out = { dataDir: null, daily: false, dryRun: false, allowShrink: false, acceptRestore: false, expectHash: null };
+  const out = { dataDir: null, daily: false, chain: false, dryRun: false, allowShrink: false, acceptRestore: false, expectHash: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--data-dir') out.dataDir = argv[++i];
     else if (a === '--daily' || a === '7') out.daily = true;   // '7' = 引数が無いときに daily-sync が足す
     else if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--chain') out.chain = true;   // 手の口 (retry-failed-jobs.js --amazon-map-chain) が付ける = 回の鍵を持つ親の子。人は直接使わない
     else if (a === '--allow-shrink') out.allowShrink = true;
     else if (a === '--accept-restore') out.acceptRestore = true;
     else if (a === '--expect-hash') out.expectHash = String(argv[++i] ?? '');
@@ -328,8 +341,11 @@ export function parseArgs(argv) {
   }
   if (out.expectHash != null && !SKU_MAP_HASH_RE.test(out.expectHash)) throw fail('--expect-hash は 64 桁の 16 進 (--dry-run が出す Company DB のハッシュ)', 'ARGS');
   if ((out.allowShrink || out.acceptRestore) && !out.expectHash) throw fail('--allow-shrink / --accept-restore には --expect-hash <今回の Company DB のハッシュ> が要る (--dry-run で見てから)', 'ARGS');
-  if ((out.allowShrink || out.acceptRestore) && out.daily) throw fail('--allow-shrink / --accept-restore は手で流すときだけ (--daily では使えない)', 'ARGS');
-  if (out.dryRun && (out.allowShrink || out.acceptRestore)) throw fail('--dry-run と --allow-shrink / --accept-restore は一緒に使わない', 'ARGS');
+  if ((out.allowShrink || out.acceptRestore) && !out.chain) throw fail('--allow-shrink / --accept-restore は手の口だけ: node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain --allow-shrink --expect-hash <H>', 'ARGS');
+  if (out.daily && out.chain) throw fail('--daily と --chain は一緒に使わない', 'ARGS');
+  if (out.dryRun && (out.allowShrink || out.acceptRestore || out.chain)) throw fail('--dry-run は読むだけ (--allow-shrink / --accept-restore / --chain と一緒に使わない)', 'ARGS');
+  // 書く回は daily (daily-sync・自動再試行) か chain (手の口) だけ。人が直接書く口は無い (#1649 Codex R3 High)
+  if (!out.dryRun && !out.daily && !out.chain) throw fail('手で写すのは node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain (回の鍵を取って 写し → f_sales → 速度 → リスト → Render同期 を一続きで)。差を見るだけなら --dry-run', 'ARGS');
   return out;
 }
 
@@ -341,7 +357,7 @@ const truthy = (v) => /^(1|true|yes|on)$/i.test(String(v ?? '').trim());
  *   どちらも示さない (今の本番 = 写しを一度も使っていない) = ⚠️ exit 0 (今までの動きを変えない = f_sales の retry を止めない)
  * @param {object} [deps]  試験で差し替える (env・接続・warehouse.db・持ち主の設定・ログ)
  */
-export async function cli(argv, { env = process.env, connectFor = null, openSqlite = null, readHintMeta = null, ownership = MASTER_OWNERSHIP, log = console.log, now = () => new Date(), run = runAmazonMapPublish, beforeCommit = null, afterLock = null, runAlive = null } = {}) {
+export async function cli(argv, { env = process.env, connectFor = null, openSqlite = null, readHintMeta = null, ownership = MASTER_OWNERSHIP, log = console.log, now = () => new Date(), run = runAmazonMapPublish, beforeCommit = null, afterLock = null, runLockHeld = null } = {}) {
   let code = EXIT.error, last = '';
   try {
     const a = parseArgs(argv);
@@ -373,8 +389,8 @@ export async function cli(argv, { env = process.env, connectFor = null, openSqli
         })());
         let r = null, ownerErr = null;
         try {
-          r = await run({ connect, getSqlite, now, dryRun: a.dryRun, allowShrink: a.allowShrink, acceptRestore: a.acceptRestore, expectHash: a.expectHash, manual: !a.daily, beforeCommit, afterLock,
-            runAlive: runAlive || (() => dailyOrRetryRunAlive()) });
+          r = await run({ connect, getSqlite, now, dryRun: a.dryRun, allowShrink: a.allowShrink, acceptRestore: a.acceptRestore, expectHash: a.expectHash, manual: a.chain, beforeCommit, afterLock,
+            runLockHeld: runLockHeld || (() => runLockHeldByParent()) });
         } catch (e) {
           // 持ち主を読む前に落ちた (接続・持ち主の記録が壊れている) = 手がかりで決める / それより後 = ❌
           if (e && e.ownerStage) ownerErr = e;
@@ -399,9 +415,12 @@ export async function cli(argv, { env = process.env, connectFor = null, openSqli
 /** daily-sync / retry の回の lock (リポジトリの data/。daily-sync.js・retry-failed-jobs.js と同じ場所) */
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 export const RUN_LOCK_FILES = Object.freeze({ 'daily-sync': path.join(PROJECT_DIR, 'data', 'daily-sync.lock.json'), '再試行': path.join(PROJECT_DIR, 'data', 'retry-failed-jobs.lock.json') });
-/** daily-sync か retry の回の持ち主が今動いているか (retry-lock.js の otherRunAlive = pid が生きている node で lock より前から動いている)。動いていれば { what, pid, started_at } */
-export function dailyOrRetryRunAlive({ files = RUN_LOCK_FILES, alive = otherRunAlive } = {}) {
-  for (const [what, file] of Object.entries(files)) { const h = alive(file); if (h) return { what, ...h }; }
+/**
+ * 回の鍵 (daily-sync / 再試行の lock) を持つのが親プロセスか = この写しは回の中で起動された (daily-sync・自動再試行・手の口の子)。持つ = { what, pid } / 持たない = null。
+ *   親 = その回の node (execFileSync で直接起動 = 親の pid が lock の pid)。親は子を待っている = 生きている (pid の使い回しは起きない)
+ */
+export function runLockHeldByParent({ files = RUN_LOCK_FILES, ppid = process.ppid, read = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } } } = {}) {
+  for (const [what, file] of Object.entries(files)) { const j = read(file); if (j && Number.isInteger(j.pid) && j.pid === ppid) return { what, pid: j.pid }; }
   return null;
 }
 

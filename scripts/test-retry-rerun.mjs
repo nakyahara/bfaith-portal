@@ -146,7 +146,86 @@ await ta('[4d] 🚨 今の本番 (持ち主 load = 写しは retry に載らな�
   // retry-state の書き方: 鎖の途中のときだけ amazon_map_chain = true (main が残す)
   const src = (await import('node:fs')).readFileSync(new URL('../apps/warehouse/retry-failed-jobs.js', import.meta.url), 'utf8');
   assert.match(src, /amazon_map_chain: results\.amazonChainPending === true,/);
-  assert.match(src, /runRetryRound\(state\.remaining_jobs, \{ publishGate, amazonChain: amazonChainActive\(state\) \}\)/);
+  assert.match(src, /runRetryRound\(state\.remaining_jobs, \{ publishGate, amazonChain: amazonChainActive\(state\) && await amazonHintNow\(\) \}\)/);   // 肯定の手がかりがある日だけ (#1649 Codex R3 Medium 2)
+});
+
+await ta('[6] 手の口 (--amazon-map-chain・#1649 Codex R3 High / Medium 3): 回の鍵を持ったまま 写し → f_sales → 速度 → リスト → Render同期 を一続き・途中で落ちたら先は流さない・写しに手の旗を渡す', async () => {
+  const R = await import('../apps/warehouse/retry-failed-jobs.js');
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amzA-chain-'));
+  const lockFile = path.join(dir, 'retry-failed-jobs.lock.json'), dailySyncLockFile = path.join(dir, 'daily-sync.lock.json');
+  const NOON = new Date('2030-01-10T03:00:00Z');   // 12:00 JST
+  const base = { lockFile, dailySyncLockFile, now: NOON, log: quiet, publishGate: { broken: false }, isAlive: (pid) => pid === process.pid };
+  try {
+    const calls = [];
+    const run = (fails = {}) => (script, name, t, args) => { calls.push([name, args]); return fails[name] ? { success: false, summary: '❌' } : { success: true, summary: '✅' }; };
+    const ok = await R.manualAmazonChain(['--amazon-map-chain', '--allow-shrink', '--expect-hash', 'a'.repeat(64)], { ...base, run: run() });
+    assert.equal(ok.code, 0);
+    assert.deepEqual(calls.map((c) => c[0]), ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期']);
+    assert.deepEqual(calls[0][1], ['--chain', '--allow-shrink', '--expect-hash', 'a'.repeat(64)]);   // 写しには手の旗 (回の鍵を持つ親の子 = --chain)
+    assert.deepEqual(calls[1][1], R.JOB_DEFINITIONS.f_sales.args);
+    assert.equal(fs.existsSync(lockFile), false, '終わったら回の鍵を外す');
+    // 途中 (速度) で落ちる = リスト・Render は流さない
+    calls.length = 0;
+    const ng = await R.manualAmazonChain(['--amazon-map-chain'], { ...base, run: run({ sales_velocity: true }) });
+    assert.equal(ng.code, 1);
+    assert.deepEqual(calls.map((c) => c[0]), ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity']);
+    // 写しが落ちる = 何も流さない
+    calls.length = 0;
+    assert.equal((await R.manualAmazonChain(['--amazon-map-chain'], { ...base, run: run({ 'CompanyDB写し(Amazon SKU)': true }) })).code, 1);
+    assert.deepEqual(calls.map((c) => c[0]), ['CompanyDB写し(Amazon SKU)']);
+    // 写しの反映の門が壊れている = 門の一覧の工程 (f_sales) で止まる
+    calls.length = 0;
+    const g = await R.manualAmazonChain(['--amazon-map-chain'], { ...base, run: run(), publishGate: { broken: true, state: 'broken' } });
+    assert.equal(g.code, 1); assert.deepEqual(calls.map((c) => c[0]), ['CompanyDB写し(Amazon SKU)']);
+    // 知らない引数・07:00 の daily-sync の前 (06:00〜07:00 JST) = 断る (鍵も取らない)
+    calls.length = 0;
+    assert.equal((await R.manualAmazonChain(['--amazon-map-chain', '--daily'], { ...base, run: run() })).reason, 'args');
+    assert.equal((await R.manualAmazonChain(['--amazon-map-chain'], { ...base, run: run(), now: new Date('2030-01-09T21:30:00Z') })).reason, 'quiet_window');   // 06:30 JST
+    assert.equal(R.manualChainQuietReason(new Date('2030-01-09T22:00:00Z')), null);   // 07:00 JST = daily-sync が自分の鍵を取る
+    assert.deepEqual(calls, []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+await ta('[7] 🚨 daily・retry・手の 3 つは同じ回の鍵でどれか 1 つだけ (Codex R3 の順番を再現): 手が先 → retry が退く / retry が先 → 手が退く / daily が動いている → 手が退く・どれも待たない', async () => {
+  const R = await import('../apps/warehouse/retry-failed-jobs.js');
+  const { acquireRetryLock, releaseRetryLock } = await import('../apps/warehouse/retry-lock.js');
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amzA-runlock-'));
+  const lockFile = path.join(dir, 'retry-failed-jobs.lock.json'), dailySyncLockFile = path.join(dir, 'daily-sync.lock.json');
+  const NOON = new Date('2030-01-10T03:00:00Z');
+  const alive = new Set([process.pid]);
+  const isAlive = (pid) => alive.has(pid);
+  const base = { lockFile, dailySyncLockFile, now: NOON, log: quiet, publishGate: { broken: false }, isAlive };
+  try {
+    // 手が先: 写しの最中に retry の回が起動 = retry は回の鍵を取れず退く (retry-state に触らない = runLocked に入らない)
+    let retryTry = null;
+    const r1 = await R.manualAmazonChain(['--amazon-map-chain'], { ...base, run: (s, name) => {
+      if (name === 'CompanyDB写し(Amazon SKU)') retryTry = acquireRetryLock({ lockFile, dailySyncLockFile, isAlive, now: NOON, pid: 99999 });
+      return { success: true, summary: '✅' };
+    } });
+    assert.equal(r1.code, 0);
+    assert.equal(retryTry.ok, false); assert.match(retryTry.reason, /前の再試行の回がまだ動いている/);
+    // retry が先: 手は回の鍵を取れず退く (何も流さない・待たない)
+    alive.add(4242);
+    const held = acquireRetryLock({ lockFile, dailySyncLockFile, isAlive, now: NOON, pid: 4242 });
+    assert.equal(held.ok, true);
+    let ran = 0;
+    const t0 = Date.now();
+    const r2 = await R.manualAmazonChain(['--amazon-map-chain'], { ...base, run: () => { ran++; return { success: true }; } });
+    assert.deepEqual([r2.code, r2.reason, ran], [1, 'locked', 0]);
+    assert.ok(Date.now() - t0 < 5000);
+    releaseRetryLock(held);
+    // daily-sync が動いている: 手は退く
+    alive.add(5151);
+    fs.writeFileSync(dailySyncLockFile, JSON.stringify({ run_id: 'x', pid: 5151, started_at: NOON.toISOString() }));
+    const r3 = await R.manualAmazonChain(['--amazon-map-chain'], { ...base, run: () => { ran++; return { success: true }; } });
+    assert.deepEqual([r3.code, r3.reason, ran], [1, 'daily_sync', 0]);
+    // daily-sync が終わった (持ち主が死んだ) = 流せる
+    alive.delete(5151);
+    const r4 = await R.manualAmazonChain(['--amazon-map-chain'], { ...base, run: () => { ran++; return { success: true }; } });
+    assert.equal(r4.code, 0); assert.equal(ran, 5);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 await ta('[5] 失敗した子の最後の行 (❌ 理由) を要約に残す (Codex #1540 R1 Low)', async () => {

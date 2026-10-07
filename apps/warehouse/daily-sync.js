@@ -813,9 +813,17 @@ async function main() {
   // f_sales (v_sku_resolved を読む) より前 = 今朝の対応で売上を作る。断った (0 件・90% 未満・変更の記録の番号が戻った)・読めない = ❌ = retry に載る
   // (retry-failed-jobs.js: f_sales の上流・写しが retry に載った日だけ「写しの鎖」で f_sales → sales_velocity → pml_snapshot → Render同期 を一段ずつ流す)。
   // 止める = .env の CDB_AMAZON_MAP_PUBLISH_PAUSE=1 (⚠️ 見送り・古い表は前の形のまま)。ping は打たない (台帳 warehouse-daily-sync の 1 工程)
-  const cdbAmazonMapResult = runScript('apps/company-db/publish/amazon-map.mjs --daily', 'Company DB の Amazon SKU の写し', 300000);
+  let cdbAmazonMapResult = runScript('apps/company-db/publish/amazon-map.mjs --daily', 'Company DB の Amazon SKU の写し', 300000);
+  // 失敗した朝: 持ち主が company の肯定の手がかり (config が company・有効な写しの記録) が無ければ retry に載せない (blocked)。
+  //   子の異常終了 (timeout・abort・起動の失敗) で、今の本番 (load) の retry に写しの鎖を持ち込まない (#1649 Codex R3 Medium 2)。読み込めない = そのまま (retry に載る側)
+  if (!cdbAmazonMapResult.success) {
+    try {
+      const AM = await import('../company-db/publish/amazon-map.mjs');
+      cdbAmazonMapResult = AM.dailyMapResultForRetry(cdbAmazonMapResult, AM.amazonMapHint({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') }));
+    } catch (e) { console.warn(`[DailySync] 写しの手がかりを読めない (${e.message}) = 写しの失敗は retry に載せる`); }
+  }
   results.push({ name: 'CompanyDB写し(Amazon SKU)', ...cdbAmazonMapResult, warn: cdbAmazonMapResult.success && isWarnSummary(cdbAmazonMapResult.summary) });
-  // exit 73 = 別の写し (手の CLI) が鍵を持っていた = この朝は f_sales・速度・リスト・Render同期 を流さない。retry-state には写しだけを残す (下流は blocked = 載せない)。
+  // exit 73 = 別の写しが写しの鍵を持っていた (回の鍵で 1 つずつなので普通は起きない・守りの 2 段目) = この朝は f_sales・速度・リスト・Render同期 を流さない。retry-state には写しだけを残す (下流は blocked = 載せない)。
   //   retry で写しが直った回に、写しの鎖 (retry-failed-jobs.js の AMAZON_MAP_CHAIN) が f_sales → 速度 → リスト → Render同期 を一段ずつ流す (#1649 Codex R2 Medium)
   //   (手の写しが f_sales と Render同期 の間に新しい対応を入れると、新しい mirror_sku_* と古い対応の f_sales が一緒に送られる。#1649 Codex R1 High)。
   //   ふつうの安全弁の拒否 (exit 1) は今までどおり流す (古い表は前の対応のまま = 混ざらない)。持ち主 load の今は鍵を取らない = 起きない

@@ -150,9 +150,11 @@ const watcherConnect = (E, { tz = null, counter = null } = {}) => async () => {
   return { db: E.db, close: async () => { await E.pg.query('reset timezone'); await E.pg.query('set default_transaction_read_only = off'); await E.pg.query('set role deploy'); } };
 };
 const sqliteOpener = (counter = null) => async () => { if (counter) counter.n++; return sq; };
-const publish = (E, opts = {}) => P.runAmazonMapPublish({ connect: watcherConnect(E, opts), getSqlite: sqliteOpener(opts.sqCounter), ...opts });
+/** 回の鍵を持つ親から起動された写し (daily-sync・自動再試行・手の口の子) の代わり */
+const HELD = () => ({ what: '試験の回', pid: 1 });
+const publish = (E, opts = {}) => P.runAmazonMapPublish({ connect: watcherConnect(E, opts), getSqlite: sqliteOpener(opts.sqCounter), runLockHeld: HELD, ...opts });
 const cli = (E, argv, { env = {}, ...deps } = {}) => P.cli(argv, { env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: 'postgres://watcher@localhost/x', ...env },
-  connectFor: () => watcherConnect(E), openSqlite: async () => sq, log: quiet, runAlive: () => null, ...deps });
+  connectFor: () => watcherConnect(E), openSqlite: async () => sq, log: quiet, runLockHeld: HELD, ...deps });
 const vFirst = () => sq.prepare('SELECT seller_sku, ne_code, 数量 FROM v_sku_components_first ORDER BY seller_sku').all();
 
 console.log('今の本番 (持ち主 listing_components.amazon = load) は何もしない');
@@ -189,7 +191,8 @@ await ta('[1] 持ち主を読めない: config も前の写しの記録も load 
   const p = await cli(E1, ['--daily'], { env: { [P.PAUSE_ENV]: '1' }, connectFor: () => { throw new Error('つながない'); } });
   assert.equal(p.code, 0); assert.match(p.last, /^⚠️ .*止めている \(CDB_AMAZON_MAP_PUBLISH_PAUSE=1\)/);
   // 引数の誤り
-  for (const argv of [['--daily', '--allow-shrink', '--expect-hash', 'a'.repeat(64)], ['--allow-shrink'], ['--accept-restore'], ['--expect-hash', 'xyz'], ['--dry-run', '--allow-shrink', '--expect-hash', 'a'.repeat(64)], ['--nope']]) {
+  for (const argv of [['--daily', '--allow-shrink', '--expect-hash', 'a'.repeat(64)], ['--allow-shrink'], ['--accept-restore'], ['--expect-hash', 'xyz'], ['--dry-run', '--allow-shrink', '--expect-hash', 'a'.repeat(64)], ['--nope'],
+    [], ['--allow-shrink', '--expect-hash', 'a'.repeat(64)], ['--daily', '--chain'], ['--dry-run', '--chain'], ['--chain', '--allow-shrink']]) {   // 人が直接書く口は無い (#1649 Codex R3 High)
     const x = await cli(E1, argv);
     assert.equal(x.code, 1, argv.join(' ')); assert.match(x.last, /^❌ /);
   }
@@ -281,10 +284,10 @@ await ta('[5] 安全弁: 今の 90% 未満 = 断る (1 バイトも変わらな�
   const c1 = await cli(E, ['--daily']);
   assert.equal(c1.code, 1);
   const h = (await publish(E, { dryRun: true })).digest.content_hash;
-  const bad = await cli(E, ['--allow-shrink', '--expect-hash', 'f'.repeat(64)]);
+  const bad = await cli(E, ['--chain', '--allow-shrink', '--expect-hash', 'f'.repeat(64)]);
   assert.equal(bad.code, 1); assert.match(bad.last, /expect_hash_mismatch/);
   assert.equal(sqSnap(), before);
-  const ok = await cli(E, ['--allow-shrink', '--expect-hash', h]);
+  const ok = await cli(E, ['--chain', '--allow-shrink', '--expect-hash', h]);
   assert.equal(ok.code, 0, ok.last); assert.match(ok.last, /^✅ .*写した .*--allow-shrink/);
   assert.equal(legacyHash(), h);
   assert.deepEqual([P.readMeta(sq).by, P.readMeta(sq).allow_shrink], ['manual', true]);
@@ -298,7 +301,7 @@ await ta('[5] 安全弁: 0 件 = 断る (--allow-shrink でだけ通す = 古い
   assert.ok(r.problems.includes('empty'), r.line);
   assert.equal(sqSnap(), before);
   const h = (await publish(E, { dryRun: true })).digest.content_hash;
-  assert.equal((await cli(E, ['--allow-shrink', '--expect-hash', h])).code, 0);
+  assert.equal((await cli(E, ['--chain', '--allow-shrink', '--expect-hash', h])).code, 0);
   assert.equal(sq.prepare('SELECT COUNT(*) AS n FROM m_sku_master').get().n, 0);
   assert.equal(sq.prepare('SELECT COUNT(*) AS n FROM m_sku_components').get().n, 0);
   // 墓標から戻す (登録し直す) → 普段の写しで戻る (古い表が 0 件 = 90% の比べようが無い)
@@ -328,7 +331,7 @@ await ta('[5] 安全弁: 変更の記録の番号が前の写しより小さい 
   assert.deepEqual([r2.state, r2.problems], ['refused', ['meta_unreadable']]);
   assert.equal(sqSnap(), before2);
   const h = (await publish(E, { dryRun: true })).digest.content_hash;
-  const ok = await cli(E, ['--accept-restore', '--expect-hash', h]);
+  const ok = await cli(E, ['--chain', '--accept-restore', '--expect-hash', h]);
   assert.equal(ok.code, 0, ok.last); assert.match(ok.last, /--accept-restore/);
   const m2 = P.readMeta(sq);
   assert.ok(m2.watermark <= meta.watermark + 1000 && m2.accept_restore === true);
@@ -417,43 +420,65 @@ await ta('[8] 鍵: 別の写しが鍵を持つ = 何もしない (exit 73)・鍵
   assert.equal((await publish(E)).state, 'unchanged');
 });
 
-await ta('[8b] 手の写しは daily-sync / retry の回が動いている間は断る (写しの鍵の前も後も)・daily / retry (--daily) は回の中なので確かめない・鍵の順は 回 → 写し で誰も待たない (#1649 Codex R1 High)', async () => {
-  await save('pr_a001', 'SKU マスタの 1 (回の間)', [{ code: 'a001', qty: 1 }]);
+await ta('[8b] 書くのは回の鍵 (daily-sync / 再試行) を持つ親の子だけ (#1649 Codex R3 High): 親が鍵を持たない起動 (人が直接流す・--daily・--chain でも) = 書かずに断る・試しは流せる・本物の確かめ (親の pid と lock の pid)', async () => {
+  await save('pr_a001', 'SKU マスタの 1 (回の外)', [{ code: 'a001', qty: 1 }]);
   const before = sqSnap();
-  const RUN = { what: 'daily-sync', pid: 4242, started_at: '2030-01-10T07:00:00.000Z' };
-  // 回が動いている = 手は断る (exit 1・鍵も取らない・書かない)
-  const m1 = await cli(E, [], { runAlive: () => RUN });
-  assert.equal(m1.code, 1); assert.match(m1.last, /^❌ .*daily-sync \/ 再試行の回が動いている \(daily-sync・pid 4242/);
+  for (const argv of [['--daily'], ['--chain'], ['--chain', '--allow-shrink', '--expect-hash', 'a'.repeat(64)]]) {
+    const r = await cli(E, argv, { runLockHeld: () => null });
+    assert.equal(r.code, 1, argv.join(' ')); assert.match(r.last, /回の鍵 \(daily-sync \/ 再試行\) を持つ親から起動されていない = 書かない。手で写すのは .*retry-failed-jobs\.js --amazon-map-chain/);
+  }
+  // 差し替えない (本物の確かめ) = この試験のプロセスの親は回の鍵を持たない = 断る
+  const real = await P.cli(['--daily'], { env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: 'postgres://watcher@localhost/x' }, connectFor: () => watcherConnect(E), openSqlite: async () => sq, log: quiet });
+  assert.equal(real.code, 1); assert.match(real.last, /持つ親から起動されていない/);
   assert.equal(sqSnap(), before);
-  // 鍵を取った後に回が始まった (2 回目の確かめ) = 外して断る
-  let n = 0;
-  const m2 = await cli(E, [], { runAlive: () => (n++ === 0 ? null : RUN) });
-  assert.equal(m2.code, 1); assert.match(m2.last, /回が動いている/);
-  assert.equal(n, 2);
-  assert.equal(sqSnap(), before);   // 鍵の行も残らない
-  // 手の試し (--dry-run) は書かない = 回が動いていても流せる / daily (--daily) は回の中 = 確かめない
-  assert.equal((await cli(E, ['--dry-run'], { runAlive: () => RUN })).code, 0);
-  let asked = 0;
-  const dly = await cli(E, ['--daily'], { runAlive: () => { asked++; return RUN; } });
-  assert.deepEqual([dly.code, asked], [0, 0]); assert.match(dly.last, /^✅ .*写した/);
-  // 回と手が同時に来ても待ち合わせの輪にならない: 手が写しの鍵を持つ間の daily の写し = すぐ 73 / 回が動いている間の手 = すぐ 1 (どちらも待たない)
-  const held = acquireLock(sq, P.LOCK_NAME, { ttlMs: 60000 });
-  try {
-    const t0 = Date.now();
-    const [d73, m1b] = await Promise.race([
-      Promise.all([cli(E, ['--daily']), cli(E, [], { runAlive: () => RUN })]),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('待ち合わせが終わらない (輪?)')), 20000)),
-    ]);
-    assert.deepEqual([d73.code, m1b.code], [73, 1]);
-    assert.ok(Date.now() - t0 < 20000);
-  } finally { releaseLock(sq, held); }
-  // 本物の回の lock の読み手: data/ の daily-sync・retry の lock (retry-lock.js の生きている判定)。どちらかが動いていればそれを返す
+  // 試しは読むだけ = 鍵が無くても流せる
+  assert.equal((await cli(E, ['--dry-run'], { runLockHeld: () => null })).code, 0);
+  // 持ち主が load の今は、鍵が無くても何もしない (⏭️ exit 0 = 今の本番の動きのまま) は [1] と [9]
+  // 本物の確かめの部品: lock の pid が親の pid = 持つ / 違う・読めない・無い = 持たない
   const files = { 'daily-sync': 'ds.json', '再試行': 'rt.json' };
-  assert.equal(P.dailyOrRetryRunAlive({ files, alive: () => null }), null);
-  assert.deepEqual(P.dailyOrRetryRunAlive({ files, alive: (f) => (f === 'rt.json' ? { pid: 7, started_at: 'x' } : null) }), { what: '再試行', pid: 7, started_at: 'x' });
+  const read = (m) => (f) => m[f] ?? null;
+  assert.deepEqual(P.runLockHeldByParent({ files, ppid: 42, read: read({ 'rt.json': { pid: 42, token: 't' } }) }), { what: '再試行', pid: 42 });
+  assert.deepEqual(P.runLockHeldByParent({ files, ppid: 42, read: read({ 'ds.json': { pid: 42, run_id: 'r' } }) }), { what: 'daily-sync', pid: 42 });
+  assert.equal(P.runLockHeldByParent({ files, ppid: 42, read: read({ 'ds.json': { pid: 43 }, 'rt.json': { pid: '42' } }) }), null);
+  assert.equal(P.runLockHeldByParent({ files, ppid: 42, read: read({}) }), null);
   assert.ok(/daily-sync\.lock\.json$/.test(P.RUN_LOCK_FILES['daily-sync']) && /retry-failed-jobs\.lock\.json$/.test(P.RUN_LOCK_FILES['再試行']));
   const ds = fs.readFileSync(new URL('../apps/warehouse/daily-sync.js', import.meta.url), 'utf8');
-  assert.ok(ds.includes("path.join(PROJECT_DIR, 'data', 'daily-sync.lock.json')"));   // daily-sync の lock と同じ場所
+  const rt = fs.readFileSync(new URL('../apps/warehouse/retry-failed-jobs.js', import.meta.url), 'utf8');
+  assert.ok(ds.includes("path.join(PROJECT_DIR, 'data', 'daily-sync.lock.json')") && rt.includes("path.join(PROJECT_DIR, 'data', 'retry-failed-jobs.lock.json')"));   // 回の lock と同じ場所
+  // 本物の起動: 回の鍵 (lock の pid) を持つ親が子として写しを起動 = 書く / 持たない親 = 断る (子の process.ppid を本当に見る)
+  const { spawnSync } = await import('node:child_process');
+  const os2 = await import('node:os');
+  const d = fs.mkdtempSync(path.join(os2.tmpdir(), 'amzA-ppid-'));
+  try {
+    const child = path.join(d, 'child.mjs');
+    fs.writeFileSync(child, `import { runLockHeldByParent } from ${JSON.stringify(new URL('../apps/company-db/publish/amazon-map.mjs', import.meta.url).href)};\nconsole.log(JSON.stringify(runLockHeldByParent({ files: { '再試行': process.argv[2] } })));\n`);
+    const lockF = path.join(d, 'retry-failed-jobs.lock.json');
+    fs.writeFileSync(lockF, JSON.stringify({ token: 't', pid: process.pid, started_at: new Date().toISOString() }));
+    const out1 = spawnSync(process.execPath, [child, lockF], { encoding: 'utf8' });
+    assert.deepEqual(JSON.parse(out1.stdout.trim()), { what: '再試行', pid: process.pid }, out1.stderr);
+    fs.writeFileSync(lockF, JSON.stringify({ token: 't', pid: process.pid + 100000, started_at: new Date().toISOString() }));
+    const out2 = spawnSync(process.execPath, [child, lockF], { encoding: 'utf8' });
+    assert.equal(JSON.parse(out2.stdout.trim()), null);
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
+});
+
+await ta('[8c] 肯定の手がかり (#1649 Codex R3 Medium 2): config が company・有効な写しの記録 = あり / どちらも無い・読めない記録 = なし。daily-sync は手がかりが無い朝の写しの失敗 (子の timeout など) を retry に載せない', async () => {
+  const LOAD = { ...ALL_LOAD };
+  assert.equal(P.amazonMapHint({ dataDir: tmp, ownership: { ...LOAD, 'listing_components.amazon': 'company' }, readMeta: () => null }), 'config');
+  assert.equal(P.amazonMapHint({ dataDir: tmp, ownership: LOAD, readMeta: () => null }), null);
+  assert.equal(P.amazonMapHint({ dataDir: tmp, ownership: LOAD, readMeta: () => ({ unreadable: true }) }), null);
+  assert.equal(P.amazonMapHint({ dataDir: tmp, ownership: LOAD, readMeta: () => { throw new Error('x'); } }), null);
+  assert.equal(P.amazonMapHint({ dataDir: tmp, ownership: LOAD }), 'meta');   // 本物: この warehouse.db には有効な記録がある (写した後)
+  assert.equal(P.amazonMapHint({ dataDir: path.join(tmp, 'nothing'), ownership: LOAD }), null);
+  const timeout = { success: false, summary: 'status=null signal=SIGTERM code=ETIMEDOUT elapsed=300s | Command failed', exitCode: null };
+  const r0 = P.dailyMapResultForRetry(timeout, null);
+  assert.deepEqual([r0.success, r0.blocked], [false, true]); assert.match(r0.summary, /retry に載せない/);
+  assert.equal(P.dailyMapResultForRetry(timeout, 'meta'), timeout);
+  const ok = { success: true, summary: '⏭️' };
+  assert.equal(P.dailyMapResultForRetry(ok, null), ok);
+  const ds = fs.readFileSync(new URL('../apps/warehouse/daily-sync.js', import.meta.url), 'utf8');
+  assert.match(ds, /cdbAmazonMapResult = AM\.dailyMapResultForRetry\(cdbAmazonMapResult, AM\.amazonMapHint\(/);
+  assert.ok(ds.indexOf('AM.dailyMapResultForRetry') < ds.indexOf("results.push({ name: 'CompanyDB写し(Amazon SKU)'"));
 });
 
 await ta('[5b] 前の写しの記録の形が壊れている ({}・欄の欠け・型・ハッシュの形・SELECT の失敗) = 読めない = 断る → --accept-restore --expect-hash でだけ通す。行が無い = null (#1649 Codex R1 Medium 3)', async () => {
@@ -477,8 +502,8 @@ await ta('[5b] 前の写しの記録の形が壊れている ({}・欄の欠け�
   assert.deepEqual(P.readMeta({ prepare: () => ({ get: () => undefined }) }), null);
   // --accept-restore --expect-hash でだけ通す (記録は正しい形に書き直される)
   const h = (await publish(E, { dryRun: true })).digest.content_hash;
-  assert.equal((await cli(E, ['--allow-shrink', '--expect-hash', h])).code, 1);
-  const ok = await cli(E, ['--accept-restore', '--expect-hash', h]);
+  assert.equal((await cli(E, ['--chain', '--allow-shrink', '--expect-hash', h])).code, 1);
+  const ok = await cli(E, ['--chain', '--accept-restore', '--expect-hash', h]);
   assert.equal(ok.code, 0, ok.last);
   assert.ok(P.validMeta(P.readMeta(sq)));
   assert.equal((await publish(E)).state, 'unchanged');

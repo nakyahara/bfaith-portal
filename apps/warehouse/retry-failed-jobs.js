@@ -52,7 +52,7 @@ const MAX_RETRY_COUNT = 3;
 //   args 省略時は '7' (rebuild系の日数引数の既存挙動を維持)
 export const JOB_DEFINITIONS = {
   // Company DB の Amazon SKU の対応 → m_sku_master・m_sku_components (⑦-2 PR-A)。毎回 Company DB の今の対応にまるごと合わせる = 再実行安全
-  //   (同じ中身なら変わった行 0)。daily-sync・手の CLI と同じ実行の鍵 (warehouse.db の job_locks) をスクリプトが取る。持ち主が load = 何もしない (exit 0)。
+  //   (同じ中身なら変わった行 0)。書くのは回の鍵を持つ親 (daily-sync・この retry・手の口 --amazon-map-chain) の子だけ・写しの鍵 (job_locks) もスクリプトが取る。持ち主が load = 何もしない (exit 0)。
   //   f_sales の上流 (UPSTREAM_OF)。写しが retry に載った日 = 写しの鎖 (AMAZON_MAP_CHAIN): 直ったら f_sales → sales_velocity → pml_snapshot → Render同期 を一段ずつ流す
   'CompanyDB写し(Amazon SKU)': { script: 'apps/company-db/publish/amazon-map.mjs', args: ['--daily'], timeoutMs: 300000 },
   'f_sales':        { script: 'apps/warehouse/rebuild-f-sales.js',                timeoutMs: 1800000 },
@@ -448,7 +448,78 @@ export function runRetryRound(remainingJobs0, { run = runScript, log = console.l
   return results;
 }
 
+/** 持ち主が company の肯定の手がかりがあるか (amazon-map.mjs の amazonMapHint)。読み込めない = 鎖の印 (retry-state) に従う側 = true */
+async function amazonHintNow() {
+  try { const M = await import('../company-db/publish/amazon-map.mjs'); return !!M.amazonMapHint({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') }); }
+  catch (e) { console.warn(`[Retry] 写しの手がかりを読めない (${e.message}) = retry-state の印に従う`); return true; }
+}
+
+// ─── 手の口: Amazon SKU の写しの鎖だけを流す (⑦-2 PR-A・#1649 Codex R3 High / Medium 3) ───
+/**
+ * 手で写す入口はこれ 1 つ: 再試行と同じ回の鍵 (retry-lock.js・daily-sync の生存も確かめる) を取り、持ったまま
+ *   写し → f_sales → sales_velocity → pml_snapshot → Render同期 を一続きで流す。途中で落ちたらその先は流さない (exit 1)。
+ *   = daily-sync・自動再試行・手の 3 つは同じ回の鍵でどれか 1 つだけ (写しの子は「回の鍵を持つ親」からしか書かない = amazon-map.mjs の runLockHeldByParent)。
+ *   回の鍵を取れない (daily-sync / 再試行が動いている) = 待たずに断る (retry-state にも触らない)。
+ *   06:00〜07:00 (JST) は断る: 長い鎖が 07:00 の daily-sync と重なると、daily-sync は再試行の鍵を 60 秒待って起動をやめる (その朝の全部が抜ける)
+ * 使い方: node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain [--allow-shrink | --accept-restore] [--expect-hash <H>]
+ *   (--allow-shrink / --accept-restore は --expect-hash <H> と一緒。H = apps/company-db/publish/amazon-map.mjs --dry-run が出す Company DB のハッシュ)
+ */
+export const MANUAL_CHAIN_FLAG = '--amazon-map-chain';
+export const MANUAL_CHAIN_QUIET_JST = Object.freeze(['06:00', '07:00']);   // この間は断る (07:00 の daily-sync の前)
+export function parseManualChainArgs(argv) {
+  const mapArgs = ['--chain'];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === MANUAL_CHAIN_FLAG) continue;
+    if (a === '--allow-shrink' || a === '--accept-restore') mapArgs.push(a);
+    else if (a === '--expect-hash') { mapArgs.push(a, String(argv[++i] ?? '')); }
+    else throw new Error(`知らない引数: ${a} (使えるのは --allow-shrink / --accept-restore / --expect-hash <H>)`);
+  }
+  return { mapArgs };
+}
+/** 手の口を断る時間 (JST の HH:MM が MANUAL_CHAIN_QUIET_JST の間) = 理由 / 流してよい = null */
+export function manualChainQuietReason(now = new Date()) {
+  const hm = new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(11, 16);
+  return hm >= MANUAL_CHAIN_QUIET_JST[0] && hm < MANUAL_CHAIN_QUIET_JST[1] ? `いま ${hm} (JST) は 07:00 の daily-sync の前 (${MANUAL_CHAIN_QUIET_JST.join('〜')}) = 流さない (daily-sync が鍵を待って起動をやめるので)` : null;
+}
+/** 写しの鎖を一続きで流す (呼び手が回の鍵を持つ)。途中で落ちた (見送りも) = その先は流さない。写しの反映の門が壊れている = 門の一覧の工程は止まる */
+export function runAmazonChainSteps({ mapArgs = ['--chain'], run = runScript, log = console.log, publishGate = { broken: false } } = {}) {
+  const results = [];
+  for (const job of AMAZON_MAP_CHAIN) {
+    const def = JOB_DEFINITIONS[job];
+    const gate = publishGateDecision(def.script, publishGate);
+    if (gate.skip) { log(`[AmazonChain] ${job} ${gate.summary}`); results.push({ name: job, success: false, blocked: true, gated: true, summary: gate.summary }); break; }
+    const r = run(def.script, job, def.timeoutMs, job === AMAZON_MAP_CHAIN[0] ? mapArgs : def.args);
+    results.push({ name: job, ...r });
+    if (!r || !r.success) { log(`[AmazonChain] ${job} が失敗 = この先 (${AMAZON_MAP_CHAIN.slice(AMAZON_MAP_CHAIN.indexOf(job) + 1).join(' → ') || 'なし'}) は流さない`); break; }
+  }
+  return results;
+}
+/** 手の口の 1 回分 (試験は鍵の場所・時計・起動を差し替える)。戻り値 = { code, results, reason? } */
+export async function manualAmazonChain(argv, { lockFile = RETRY_LOCK_FILE, dailySyncLockFile = DAILY_SYNC_LOCK_FILE, isAlive = undefined, now = new Date(), run = runScript, log = console.log,
+  publishGate = null, acquire = acquireRetryLock, release = releaseRetryLock } = {}) {
+  let parsed;
+  try { parsed = parseManualChainArgs(argv); } catch (e) { log(`❌ Amazon SKU の写しの鎖: ${e.message}`); return { code: 1, results: [], reason: 'args' }; }
+  const quiet = manualChainQuietReason(now);
+  if (quiet) { log(`❌ Amazon SKU の写しの鎖: ${quiet}`); return { code: 1, results: [], reason: 'quiet_window' }; }
+  const lock = acquire({ lockFile, dailySyncLockFile, ...(isAlive ? { isAlive } : {}), now });
+  if (!lock.ok) { log(`❌ Amazon SKU の写しの鎖: 回の鍵を取れない = 流さない (${lock.reason})。daily-sync / 自動再試行が終わってから`); return { code: 1, results: [], reason: lock.dailySync ? 'daily_sync' : 'locked' }; }
+  try {
+    process.env.WAREHOUSE_BUSINESS_DATE = toJstDate(now);
+    const gate = publishGate || readPublishGate({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') });
+    const results = runAmazonChainSteps({ mapArgs: parsed.mapArgs, run, log, publishGate: gate });
+    const ok = results.length === AMAZON_MAP_CHAIN.length && results.every((r) => r.success);
+    log(`${ok ? '✅' : '❌'} Amazon SKU の写しの鎖: ${results.map((r) => `${r.success ? '✅' : '❌'} ${r.name}`).join(' → ')}${ok ? '' : ' (落ちたところから先は流していない)'}`);
+    return { code: ok ? 0 : 1, results };
+  } finally { release(lock); }
+}
+
 async function main() {
+  if (process.argv.includes(MANUAL_CHAIN_FLAG)) {
+    const r = await manualAmazonChain(process.argv.slice(2));
+    process.exitCode = r.code;
+    return;
+  }
   const lock = acquireRetryLock({ lockFile: RETRY_LOCK_FILE, dailySyncLockFile: DAILY_SYNC_LOCK_FILE });
   if (!lock.ok) {
     console.log(`[Retry] 見送り: ${lock.reason}`);
@@ -530,7 +601,8 @@ async function runLocked() {
 
   const publishGate = readPublishGate({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') });
   if (publishGate.broken) console.log(`[Retry] ⚠️ Company DB の写しの反映の門 = ${publishGate.state} (${publishGate.reason}) → m_products・上書き表を読む工程は動かさない`);
-  const results = runRetryRound(state.remaining_jobs, { publishGate, amazonChain: amazonChainActive(state) });
+  // 写しの鎖は「持ち主が company の肯定の手がかり」(config が company・有効な写しの記録) がある日だけ (#1649 Codex R3 Medium 2。今の本番 = 手がかりなし = master と同じ)
+  const results = runRetryRound(state.remaining_jobs, { publishGate, amazonChain: amazonChainActive(state) && await amazonHintNow() });
   // 止めた工程のうち自分で ping を打つもの = fail の ping (送れなくても再試行は続ける)
   for (const r of results.filter((x) => x.gated && x.pingJobId)) {
     try { const { sendPing } = await import('../../scripts/company-db/lz-daily.mjs'); await sendPing(r.pingJobId, { status: 'fail', note: String(r.summary).slice(0, 180) }); }

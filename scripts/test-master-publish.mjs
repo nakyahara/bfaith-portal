@@ -1587,7 +1587,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.match(fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8'), /const cdbPublishGateNow = readPublishGate\(\{ dataDir: process\.env\.DATA_DIR \|\| path\.join\(PROJECT_DIR, 'data'\) \}\);/);
   const rsrc = fs.readFileSync(path.join(ROOT, 'apps/warehouse/retry-failed-jobs.js'), 'utf8');
   assert.match(rsrc, /const publishGate = readPublishGate\(\{ dataDir: process\.env\.DATA_DIR \|\| path\.join\(PROJECT_DIR, 'data'\) \}\);/);
-  assert.match(rsrc, /const results = runRetryRound\(state\.remaining_jobs, \{ publishGate, amazonChain: amazonChainActive\(state\) \}\);/);   // ⑦-2 PR-A: 写しの鎖の回か (門はそのまま渡す)
+  assert.match(rsrc, /const results = runRetryRound\(state\.remaining_jobs, \{ publishGate, amazonChain: amazonChainActive\(state\) && await amazonHintNow\(\) \}\);/);   // ⑦-2 PR-A: 写しの鎖の回か (門はそのまま渡す)
   const fsrc = fs.readFileSync(path.join(ROOT, 'apps/warehouse/fba-service.js'), 'utf8');
   assert.match(fsrc, /runPmlFbaRefresh\(\{ updateProgress, refresh: refreshFbaLive, build: buildProductManagementSnapshot, sync: syncPmlSnapshotOnly,\s*gate: \(\) => readPublishGate\(\{ db: wdb \}\) \}\)/);
   assert.doesNotMatch(fsrc, /await buildProductManagementSnapshot\(\{ fbaSource: 'live' \}\)/);
