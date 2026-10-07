@@ -136,5 +136,17 @@ console.log('\n[5] inbound-check からの参照');
   ok(db.prepare('PRAGMA table_info(f_inbound_check_events)').all().some(c => c.name === 'staff_id'), 'events に staff_id 列');
 }
 
+console.log('\n[6] 管理画面のファビコン');
+{
+  // ブラウザのタブ・ホーム画面で他のポータル画面と見分ける (2026-10-08)。共通の /favicon.png に戻っていないこと
+  const src = fs.readFileSync(new URL('../apps/staff/views/admin.ejs', import.meta.url), 'utf8');
+  ok(src.includes('rel="icon" type="image/png" href="/app-icons/staff-192.png"'), 'タブのアイコン = staff-192.png');
+  ok(src.includes('rel="apple-touch-icon" sizes="180x180" href="/app-icons/staff-180.png"'), 'ホーム画面のアイコン = staff-180.png');
+  ok(!src.includes('href="/favicon.png"'), '共通の favicon.png を使っていない');
+  for (const s of [180, 192, 512]) {
+    ok(fs.existsSync(new URL(`../public/app-icons/staff-${s}.png`, import.meta.url)), `public/app-icons/staff-${s}.png がある`);
+  }
+}
+
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;

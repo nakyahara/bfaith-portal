@@ -103,6 +103,19 @@ const APPS = [
       <circle cx="256" cy="232" r="28" fill="#6741d9"/>
       <circle cx="336" cy="232" r="28" fill="#6741d9"/>`,
   },
+  {
+    slug: 'staff',
+    label: 'スタッフマスタ',
+    bg: ['#10234a', '#060a13'],     // 濃紺 = スタッフマスタ (画面の HUD 地色。ほかは明るい地色なので並べても見分けられる)
+    // 2 人の人影 (前 = シアン・後ろ = 青紫) = 「人の名簿」。画面のアクセント色 (#3ae7ff / #8b9bff) と同じ。
+    // タブの 16px でも残るよう、前の人を大きな面にする (中原さん 2026-10-08「ファビコンも設置して」)
+    art: `
+      <circle cx="350" cy="178" r="62" fill="#8b9bff" opacity="0.85"/>
+      <path d="M244 404 C 244 300, 296 262, 350 262 C 404 262, 456 300, 456 404 Z" fill="#8b9bff" opacity="0.85"/>
+      <circle cx="210" cy="196" r="84" fill="#3ae7ff"/>
+      <path d="M64 430 C 64 318, 132 292, 210 292 C 288 292, 356 318, 356 430 Z" fill="#3ae7ff"/>
+      <path d="M64 452 L448 452" stroke="#3ae7ff" stroke-width="10" stroke-linecap="round" opacity="0.5"/>`,
+  },
 ];
 
 const SIZES = [180, 192, 512];
