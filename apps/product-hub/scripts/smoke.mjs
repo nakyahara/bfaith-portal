@@ -2786,6 +2786,33 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     check('配送方法で試算: サービスそのものを指す語の表は全グループにある',
       Object.keys(listing.ALL_SHIPPING_METHOD_GROUPS).every((id) => vari.RAKUTEN_GROUP_NE_CORE[id]),
       Object.keys(listing.ALL_SHIPPING_METHOD_GROUPS).filter((id) => !vari.RAKUTEN_GROUP_NE_CORE[id]).join(','));
+    {
+      // 🚨 「表にキーがある」だけでは、語が別のものに変わったときに落ちない (Codex R26 P3)。
+      //    楽天の配送方法 1〜9 ごとに代表的な NE の便を 1 件与えて、合わせ先と「近いもの」の
+      //    両方がその便を返すことを表で固定する
+      const expect = {
+        '1': '定形外規格内（50g以内）',
+        '2': 'クリックポスト',
+        '3': '飛脚宅配便60サイズ',
+        '4': 'ゆうパック60サイズ',
+        '5': 'ネコポス',
+        '6': 'クリックポスト',
+        '7': '宅急便60サイズ',
+        '8': '宅急便60サイズ',
+        '9': 'ゆうパケットポスト',
+      };
+      const all = [...new Set(Object.values(expect))].map((m, i) => ({ method: m, cost: 200 + i * 10, count: 1 }));
+      const pAll = vari.profitShipPickByGroup(all);
+      const nAll = vari.profitShipNearByGroup(all);
+      const bad = Object.entries(expect).filter(([g, m]) => pAll[g]?.method !== m || !(nAll[g] || []).includes(m))
+        .map(([g, m]) => `${g}: 期待 ${m} / 合わせ先 ${pAll[g]?.method} / 近いもの ${JSON.stringify(nAll[g])}`);
+      check('🚨 配送方法で試算: 楽天 1〜9 のそれぞれが期待する NE の便に合う (表駆動)',
+        bad.length === 0, bad.join(' | '));
+      // 🚨 ほかのグループの便を拾っていないこと (1 件ずつなので候補は 1 件になる)
+      check('配送方法で試算: どのグループも自分の便だけを候補にする',
+        Object.keys(expect).every((g) => pAll[g]?.candidates === 1),
+        JSON.stringify(Object.fromEntries(Object.entries(pAll).map(([g, v]) => [g, v.candidates]))));
+    }
     // 🚨 運送会社が同じでも**サービスが違えば別**。「宅急便コンパクト」は専用箱の別サービスで
     //    宅急便より安いので、最多でも宅急便の合わせ先にしない (Codex R19 P1)
     const compact = [
@@ -11009,6 +11036,20 @@ for (const [name, file, data] of renders) {
     });
     check('🚨 通し確認: 定形外で保存済みの商品を開くと、利益額が 892円 (配送費 182円) で出る',
       mE2.profit() === '892円' && mE2.shipCost() === '182', mE2.profit() + ' / ' + mE2.body.textContent);
+    // 🚨 試算は画面だけの話。保存されている値も出品 payload も、人が選んだ楽天の
+    //    配送方法 (1 = 定形外) のままで、NE の便名や試算の送料は入らない (Codex R26 P3)
+    {
+      const saved = db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(idE2);
+      check('🚨 通し確認: 試算しても保存されている配送方法は変わらない (1 = 定形外)',
+        saved?.shipping_method_group === '1', JSON.stringify(saved));
+      const payload = listing.buildItemPayload(db, idE2, LEGACY_TAX);
+      const groups = new Set((payload.item?.variants || []).map((v) => v?.shipping?.shippingMethodGroup));
+      check('🚨 通し確認: 出品 payload の配送方法も 1 のまま (NE の便名・試算の送料は入らない)',
+        [...groups].every((g) => g === '1' || g == null)
+        && !JSON.stringify(payload).includes('定形外規格内（50g以内）')
+        && !JSON.stringify(payload).includes('182'),
+        JSON.stringify([...groups]));
+    }
     // 🚨 管理画面の割当 (ph_shipping_method_map) が本番の経路でも効くこと。
     //    router が neShipAssigned を渡し忘れたらここで落ちる (Codex R20 P3)
     db.prepare(`INSERT OR REPLACE INTO ph_shipping_method_map (ne_label, rakuten_group)
