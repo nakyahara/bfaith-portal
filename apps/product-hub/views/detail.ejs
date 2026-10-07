@@ -5201,6 +5201,10 @@ th.attr-unknown { color: #dc2626; }
     const priceInput = document.getElementById('f-price');
     // 配送費は「選んでいる配送方法」で決まる (2026-09-04)。初期値は NE の送料
     let ship = Number(box.dataset.ship);
+    // 🚨 その配送費を**人が選んだ**か (プルダウンで選び直した / その選択を覚えていた)。
+    //    人が選んでいない 0円 で利益を出すと、NE の送料が未入力の商品を
+    //    「送料タダ」として計算して利益を過大に見せる (Codex R27 P1)
+    let shipIsPersonsChoice = false;
     // 利益額・利益率は大きい数字で別枠に出す (2026-09-01)。内訳と未入力メッセージは body 側
     const figs = document.getElementById('profit-sim-figs');
     const amountEl = document.getElementById('profit-sim-amount');
@@ -5209,6 +5213,13 @@ th.attr-unknown { color: #dc2626; }
       if (tax == null || !Number.isFinite(tax)) {
         if (figs) figs.hidden = true;
         body.textContent = '税率が決まっていません (Company DB の税率が決まるまで利益は出しません)';
+        return;
+      }
+      // 🚨 人が選んでいない 0円 (NE の送料が未入力) では利益を出さない (Codex R27 P1)。
+      //    人がその便を選び直したときだけ、今までどおり 0円 で計算する
+      if (!(ship > 0) && !shipIsPersonsChoice) {
+        if (figs) figs.hidden = true;
+        body.textContent = '配送費が決まっていません (NE の送料が 0円 です) — 下で配送方法を選び直すか、NE の送料を直してください';
         return;
       }
       const price = Number(priceInput.value);
@@ -5276,14 +5287,17 @@ th.attr-unknown { color: #dc2626; }
     // 注記。「何の送料で試算しているか」「ほかに何通りあるか」「試算であって保存ではない」を書く
     // (追従した説明で「試算だけ」が消えると、NE の配送方法まで保存されたように読める — Codex R3 P2)
     function profitShipNoteText({ followed, method, cost, groupLabel, neCurrent, neCost, isCurrent }) {
-      if (!followed) {
-        return isCurrent
-          ? 'NE に登録されている送料です'
-          : 'NE は「' + (neCurrent || '未設定') + '」です — ここでの変更は試算だけで、NE や出品内容は変わりません';
-      }
       const label = groupLabel || '選んだ配送方法';
       const yen = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)).toLocaleString() + '円' : '');
       const keep = 'この選択は試算だけで、NE や出品内容には保存されません';
+      // 合わせていないとき (人が選び直した / 追従していない) も、画面の配送方法との関係と
+      // 「保存されない」ことは出す。消すと出品内容に入ったように読める (Codex R27 P3)
+      if (!followed) {
+        const where = groupLabel ? '（画面の配送方法は「' + label + '」）' : '';
+        return isCurrent
+          ? ['NE に登録されている送料で試算しています' + where, keep].join('\n')
+          : ['試算: 「' + method + '」' + yen(cost) + where + '。NE は「' + (neCurrent || '未設定') + '」', keep].join('\n');
+      }
       if (!followed.pick) {
         // 🚨 ここでも「いま何で試算しているか・NE との差・保存されないこと」を出す。
         //    消すと、残っている試算の便が保存されたように読める (Codex R12 P3)。
@@ -5440,6 +5454,8 @@ th.attr-unknown { color: #dc2626; }
         //    現れたときだけ掃除し忘れて、あとで復活する (Codex R22 P2)
         if (rem && rem.kind === 'carry' && follow && data.picks?.[group]) mine.forget();
         followed = d.followed;
+        // 覚えていた「人の選択」を戻したときは、人が選んだものとして扱う (0円でも出す)
+        shipIsPersonsChoice = !!(rem && rem.kind === 'manual' && d.method === rem.method);
         sel.value = d.method;
         apply();
       }
@@ -5459,7 +5475,12 @@ th.attr-unknown { color: #dc2626; }
         render();
       }
       // 自分で選び直したら、合わせた説明は消して、その選択を覚える (人の選択が最後に勝つ)
-      sel.addEventListener('change', () => { followed = null; mine.remember(sel.value, groupOf()); apply(); });
+      sel.addEventListener('change', () => {
+        followed = null;
+        shipIsPersonsChoice = true;   // 人が選んだ = 0円でもその人の判断で計算する
+        mine.remember(sel.value, groupOf());
+        apply();
+      });
       let lastGroup = groupOf();
       if (rkShip) {
         rkShip.addEventListener('change', () => {

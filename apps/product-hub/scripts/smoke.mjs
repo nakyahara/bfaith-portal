@@ -10794,8 +10794,10 @@ for (const [name, file, data] of renders) {
   m.pick('定形外規格外（1kg以内）');
   check('🚨 画面の試算: 自分で選び直すと利益額が変わる (510円 → 564円)',
     m.profit() === '564円' && m.shipCost() === '510', m.profit() + ' / ' + m.body.textContent);
-  check('画面の試算: 自分で選んだら「合わせました」ではなく今までどおりの注記',
-    m.note.textContent.includes('ここでの変更は試算だけで'), m.note.textContent);
+  check('画面の試算: 自分で選んだら「合わせました」ではなく、いまの試算と画面の配送方法を出す',
+    m.note.textContent.includes('試算: 「定形外規格外（1kg以内）」510円（画面の配送方法は「定形外」）')
+    && m.note.textContent.includes('NE は「ネコポス」')
+    && m.note.textContent.includes('試算だけで、NE や出品内容には保存されません'), m.note.textContent);
   check('画面の試算: 選んだ便をこのタブに覚える (保存の読み直しをまたぐため)',
     JSON.parse(m.store.raw || '{}').method === '定形外規格外（1kg以内）', String(m.store.raw));
 
@@ -10975,6 +10977,24 @@ for (const [name, file, data] of renders) {
       && mz.note.textContent.includes('未入力か本当に 0円 か確かめてください')
       && !mz.note.textContent.includes('選択肢にない'), mz.note.textContent);
     check('画面の試算: そのとき利益は NE の送料のまま (0円で計算しない)', mz.profit() === '837円', mz.profit());
+  }
+
+  // ⑪' 🚨 NE の送料が 0円 (未入力) の商品は、人が選ぶまで利益を出さない。
+  //      出すと「送料タダ」として計算して利益を過大に見せる (Codex R27 P1)
+  {
+    const zeroOnly = [{ method: 'ゆうパック60サイズ', cost: 0, count: 1, isCurrent: true }];
+    const mz0 = mount({
+      options: zeroOnly, picks: vari.profitShipPickByGroup(zeroOnly, hints, labels),
+      near: vari.profitShipNearByGroup(zeroOnly, hints, labels),
+      labels, hints, neCurrent: 'ゆうパック60サイズ', rkValue: '4', ship: '0',
+    });
+    check('🚨 画面の試算: NE の送料が 0円 の商品は利益を出さず「配送費が決まっていません」と書く',
+      mz0.figs.hidden === true && mz0.body.textContent.includes('配送費が決まっていません (NE の送料が 0円 です)'),
+      mz0.body.textContent);
+    // 人がその便を選び直したら、その人の判断として 0円 で計算する (決定 C)
+    mz0.pick('ゆうパック60サイズ');
+    check('画面の試算: 人がその 0円 の便を選んだら、今までどおり計算する (1,074円)',
+      mz0.profit() === '1,074円' && mz0.figs.hidden === false, mz0.profit() + ' / ' + mz0.body.textContent);
   }
 
   // ⑫ 🚨 覚え書きの鍵は「商品 × 人」。描いた画面の data-who がそのまま鍵に入る
@@ -13604,17 +13624,21 @@ for (const [name, file, data] of renders) {
   check('配送費の試算: 配送費は書き換えられる変数で持つ (固定の const ではない)',
     /let ship = Number\(box\.dataset\.ship\)/.test(sim) && !/const ship = Number\(box\.dataset\.ship\)/.test(sim));
   check('配送費の試算: 配送方法を変えたら利益を再計算する',
-    /sel\.addEventListener\('change', [\s\S]{0,100}apply\(\)/.test(sim) && /ship = Number\(op\.dataset\.cost\)/.test(sim)
+    /sel\.addEventListener\('change', [\s\S]{0,300}apply\(\)/.test(sim) && /ship = Number\(op\.dataset\.cost\)/.test(sim)
     && /function apply\(\)[\s\S]{0,900}render\(\)/.test(sim));
   // 🚨 候補を組み直すだけでは利益が動かない (2026-10-06 中原さん報告)。**選択も合わせる**こと。
   //    配線はソース検査で、決め方と文言は下の切り出しで**入力→出力**で確かめる
   check('配送費の試算: 楽天の配送方法を変えたら、候補を組み直して試算もその配送方法に合わせる',
     /rkShip\.addEventListener\('change', \(\) => \{[\s\S]{0,600}build\(\{ follow: true \}\);/.test(sim)
-    && /followed = d\.followed;[\s\S]{0,80}sel\.value = d\.method;[\s\S]{0,40}apply\(\);/.test(sim));
+    && /followed = d\.followed;[\s\S]{0,250}sel\.value = d\.method;[\s\S]{0,40}apply\(\);/.test(sim));
   check('🚨 配送費の試算: 開いたときも保存済みの配送方法に合わせる (保存すると画面は丸ごと読み直される)',
     /\n      build\(\{ follow: true \}\);/.test(sim));
   check('配送費の試算: 試算のプルダウンを自分で選び直したら、合わせた注記は消えて選択を覚える',
-    /sel\.addEventListener\('change', \(\) => \{ followed = null; mine\.remember\(sel\.value, groupOf\(\)\); apply\(\); \}\)/.test(sim));
+    /sel\.addEventListener\('change', \(\) => \{\s*followed = null;\s*shipIsPersonsChoice = true;[\s\S]{0,80}mine\.remember\(sel\.value, groupOf\(\)\);\s*apply\(\);\s*\}\)/.test(sim));
+  // 🚨 人が選んでいない 0円 の送料で利益を出さない (NE の送料が未入力の商品 — Codex R27 P1)
+  check('🚨 配送費の試算: 人が選んでいない 0円 の配送費では利益を出さない',
+    /if \(!\(ship > 0\) && !shipIsPersonsChoice\)/.test(sim)
+    && /配送費が決まっていません \(NE の送料が 0円 です\)/.test(sim));
   check('🚨 配送費の試算: ヤフーだけ変えた (1 → 1y5) ときは合わせ直さず、注記だけ描き直す',
     /if \(g === lastGroup\) \{ apply\(\); return; \}/.test(sim));
   check('配送費の試算: 注記の配送方法名は楽天の正規ラベル (複合選択肢の長い名前にしない)',
@@ -13651,8 +13675,10 @@ for (const [name, file, data] of renders) {
   }
   check('配送費の試算: 売価の入力でも従来どおり再計算する',
     /priceInput\.addEventListener\('input', render\)/.test(sim));
+  // 🚨 どの分岐でも「試算だけ・保存されない」と書くこと (Codex R27 P3)
   check('配送費の試算: 試算であって NE や出品内容は変えないと画面に書く',
-    /試算だけで、NE や出品内容は変わりません/.test(sim));
+    /この選択は試算だけで、NE や出品内容には保存されません/.test(sim)
+    && !/ここでの変更は試算だけで/.test(sim));
 }
 
 {
@@ -13754,9 +13780,17 @@ for (const [name, file, data] of renders) {
     check('🚨 配送方法で試算: 当てはまる便が無いときも、いまの試算と「保存されない」を出す',
       miss.includes('試算: 「定形外規格外（1kg以内）」510円') && miss.includes('NE は「ネコポス」')
       && miss.includes('試算だけで、NE や出品内容には保存されません'), miss);
-    check('配送方法で試算: 合わせていないときの文言は今までどおり',
-      api.profitShipNoteText({ followed: null, method: 'ネコポス', neCurrent: 'ネコポス', isCurrent: true }) === 'NE に登録されている送料です'
-      && api.profitShipNoteText({ followed: null, method: '宅急便60サイズ', neCurrent: 'ネコポス', isCurrent: false }).includes('ここでの変更は試算だけで、NE や出品内容は変わりません'));
+    // 🚨 人が選び直したときも「画面の配送方法」と「保存されない」を出す (Codex R27 P3)
+    {
+      const ne = api.profitShipNoteText({ followed: null, method: 'ネコポス', cost: 237, groupLabel: '定形外', neCurrent: 'ネコポス', isCurrent: true });
+      check('🚨 配送方法で試算: NE の便を自分で選んだときも、画面の配送方法と「保存されない」を出す',
+        ne.includes('NE に登録されている送料で試算しています（画面の配送方法は「定形外」）')
+        && ne.includes('試算だけで、NE や出品内容には保存されません'), ne);
+      const other = api.profitShipNoteText({ followed: null, method: '宅急便60サイズ', cost: 538, groupLabel: '定形外', neCurrent: 'ネコポス', isCurrent: false });
+      check('配送方法で試算: 別の便を自分で選んだときは、その便と NE の違いを出す',
+        other.includes('試算: 「宅急便60サイズ」538円（画面の配送方法は「定形外」）。NE は「ネコポス」')
+        && other.includes('試算だけで、NE や出品内容には保存されません'), other);
+    }
   }
   {
     // ─── 人が選んだ試算の配送方法の覚え書き。偽の store で振る舞いを確かめる (Codex R8 P3) ───
