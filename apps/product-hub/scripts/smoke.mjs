@@ -2732,6 +2732,22 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
       && neNamed['1']?.reason === 'ne', JSON.stringify(neNamed['1']));
     check('配送方法で試算: 現在使用不可の 2 (クリックポスト) も合わせ先が決まる',
       vari.profitShipPickByGroup([{ method: 'クリックポスト', cost: 185, count: 5 }])['2']?.method === 'クリックポスト');
+    // 🚨 2 のラベルは「クリックポスト（現在使用不可）」。飾りを落とさないと名前の絞りが効かない
+    const paren = vari.profitShipPickByGroup([
+      { method: 'クリックポスト', cost: 185, count: 1 },
+      { method: 'クリックポスト大型', cost: 400, count: 999 },
+    ], { '2': ['クリックポスト'] });
+    check('配送方法で試算: ラベルの「（現在使用不可）」は落として名前を照合する',
+      paren['2']?.reason === 'label', JSON.stringify(paren['2']));
+    // 楽天の名前が NE の名前に出てこないグループ (8 = 宅急便50サイズ以下) は絞りが効かず、
+    // 今までどおり NE の登録値 → 最多 → 高い方。安全側なのでそれでよい (Codex R7 P2 への答え)
+    const noNarrow = vari.profitShipPickByGroup([
+      { method: '宅急便50サイズ', cost: 479, count: 1 },
+      { method: '宅急便60サイズ', cost: 538, count: 100 },
+    ], { '8': ['宅急便'] });
+    check('配送方法で試算: 楽天の名前が NE に出てこないグループは最多で選ぶ (絞りは効かない)',
+      noNarrow['8']?.method === '宅急便60サイズ' && noNarrow['8']?.reason === 'count',
+      JSON.stringify(noNarrow['8']));
     // 送料が無い行は画面の選択肢にも無い = 合わせ先にしない (0円で利益を過大に見せない)
     const noCost = vari.profitShipPickByGroup(
       [{ method: '定形なし', cost: null, count: 9 }, { method: '定形あり', cost: 182, count: 1 }], { '1': ['定形'] });
@@ -10526,6 +10542,23 @@ for (const [name, file, data] of renders) {
   check('写真が無いボードにはバッジを出さない', !boardPlain.includes('裏面あり'));
 }
 
+{
+  // ─── 配送方法で試算 (2026-10-06/07) が出る分岐・出ない分岐を、描いた HTML で確かめる ───
+  const withPicker = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  const skuVaries = renderedHtml.get('detail.ejs (SKU別原価・売価: costVaries)') || '';
+  check('配送費の試算: 原価も送料もある商品には「配送方法で試算」と合わせ先が埋まる',
+    withPicker.includes('id="profit-ship-select"') && withPicker.includes('配送方法で試算')
+    && withPicker.includes('"picks":{'), String(withPicker.length));
+  check('配送費の試算: 基本情報の注記は「左の配送方法で試算も合わせて計算し直す」',
+    withPicker.includes('変えると左の「配送方法で試算」も合わせて利益を計算し直します'));
+  // 🚨 原価がSKUで異なる商品は対象外 (2026-10-07 中原さんの決定)。嘘の案内を出さないこと
+  check('🚨 配送費の試算: 原価がSKUで異なる商品には「配送方法で試算」を出さない',
+    skuVaries.length > 0 && !skuVaries.includes('id="profit-ship-select"'), String(skuVaries.length));
+  check('🚨 配送費の試算: その商品には「SKU表に NE の送料のまま出る」と書く (追従しないと明示)',
+    skuVaries.includes('NEの送料のまま') && skuVaries.includes('ここの配送方法には追従しません')
+    && !skuVaries.includes('変えると左の「配送方法で試算」も合わせて利益を計算し直します'));
+}
+
 // ─── 白抜き画像の受信箱 (2026-09-14): 画像タブの白抜きの枠にボタン + 選択画面。JS への値は data 属性で渡す ───
 {
   const full = renderedHtml.get('detail.ejs (full/own_brand)') || '';
@@ -13149,14 +13182,22 @@ for (const [name, file, data] of renders) {
     const d = decide({ group: '1', follow: true });
     const n = api.profitShipNoteText({ followed: d.followed, method: d.method, groupLabel: '定形外', neCurrent: 'ネコポス', isCurrent: false });
     check('配送方法で試算: 注記に「何で試算しているか」と候補の件数・代表送料の幅を書く',
-      n.includes('「定形外」に合わせて「定形外規格内（50g以内）」で試算しています')
-      && n.includes('自動で選べる候補 (送料0円は除く) は 2 件') && n.includes('代表の送料 182〜510円')
+      n.includes('試算: 「定形外規格内（50g以内）」182円')
+      && n.includes('候補 2 件 (送料0円は除く)') && n.includes('代表の送料 182〜510円')
       && n.includes('違うなら選び直してください'), n);
     // 🚨 画面の配送方法に合わせて NE を上書きしたのだから、何を上書きしたかを出す (Codex R6 P2)
     check('🚨 配送方法で試算: NE と食い違うときは NE の配送方法も注記に出す',
-      n.includes('NE は「ネコポス」ですが、画面の「定形外」に合わせて'), n);
+      n.includes('画面の「定形外」に合わせました') && n.includes('NE は「ネコポス」'), n);
     check('配送方法で試算: 選んだ理由を言い分ける (楽天の名前で絞ったときに「最多」と書かない)',
       n.includes('楽天の名前に合うものの中でいちばん多く使っているもの'), n);
+    // 🚨 1 行に全部入れると 11px の薄い字で結論が埋もれる (Codex R7 P3)。3 行に分ける
+    check('配送方法で試算: 注記は 3 行に分ける (結論 → 候補 → 保存されない)',
+      n.split(String.fromCharCode(10)).length === 3
+      && n.split(String.fromCharCode(10))[0].startsWith('試算: ')
+      && n.split(String.fromCharCode(10))[2] === 'この選択は試算だけで、NE や出品内容には保存されません',
+      JSON.stringify(n.split(String.fromCharCode(10))));
+    check('配送方法で試算: 注記の改行が画面で効くようにしてある (white-space)',
+      /id="profit-ship-note"[^>]*white-space:pre-line/.test(src));
     // 🚨 候補は配送方法ごとに代表送料 1 件へ畳んである。「大きさで N 通り」= 実送料の幅と
     //    読めてしまう言い方はしない (Codex R4 P2)
     check('配送方法で試算: 注記は「大きさで N 通り」と書かない (実送料の幅ではない)',

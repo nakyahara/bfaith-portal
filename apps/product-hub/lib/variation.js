@@ -524,7 +524,10 @@ export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, l
     //    楽天の名前そのものを含む便があれば**まずそこへ絞る** — NE の登録値を先に見ると、
     //    NE が 定形内 146円 の商品で「定形外に合わせて定形内」になり利益を良く見せる
     //    (Codex R5 P2 / R6 P1)。名前の正本 = RAKUTEN_SHIPPING_METHODS
-    const label = String(labels?.[group] ?? '');
+    //    「クリックポスト（現在使用不可）」のような楽天側だけの飾りは落として照合する。
+    //    楽天の名前が NE の名前に出てこないグループ (8=宅急便50サイズ以下 等) は絞りが効かず、
+    //    今までどおり「NE の登録値 → 最多 → 高い方」に落ちる (安全側なのでそれでよい)
+    const label = String(labels?.[group] ?? '').replace(/（[^）]*）/g, '').trim();
     const named = label ? cand.filter((o) => o.method.includes(label)) : [];
     const pool = named.length ? named : cand;
     // 絞ったあとで NE の登録値 (実送料) → 最多 → 高い方 (利益を実際より良く見せない側)

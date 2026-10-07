@@ -843,7 +843,8 @@ th.attr-unknown { color: #dc2626; }
                 <label style="font-size:11px; margin-bottom:2px;" class="muted">配送方法で試算</label>
                 <select id="profit-ship-select" style="width:100%; font-size:12px;"
                         data-current="<%= neCost?.shippingMethod || '' %>"></select>
-                <div id="profit-ship-note" class="muted" style="font-size:11px; margin-top:2px;"></div>
+                <%# 注記は改行で 3 行に分ける (1 行だと 180 字の薄い字になって結論が埋もれる — Codex R7 P3) %>
+                <div id="profit-ship-note" class="muted" style="font-size:11px; margin-top:2px; white-space:pre-line;"></div>
               </div>
               <script type="application/json" id="profit-ship-data"><%- JSON.stringify({ options: neShippingOptions || [], hints: rakutenGroupNeHints || {}, picks: profitShipPicks || {}, labels: allShippingGroups || {} }).replace(/</g, '\\u003c') %></script>
             <% } %>
@@ -5263,7 +5264,6 @@ th.attr-unknown { color: #dc2626; }
           ? 'NE に登録されている送料です'
           : 'NE は「' + (neCurrent || '未設定') + '」です — ここでの変更は試算だけで、NE や出品内容は変わりません';
       }
-      const tail = '（この配送方法の選択は試算だけで、NE や出品内容には保存されません）';
       const label = groupLabel || '選んだ配送方法';
       if (!followed.pick) {
         // 何も変えていないので「保存されません」は付けない (変えた話をしていない)
@@ -5271,24 +5271,26 @@ th.attr-unknown { color: #dc2626; }
           + ' — 試算の配送方法は変えていません';
       }
       const p = followed.pick;
+      // 🚨 1 行に全部入れると 11px の薄い字で 180 字になり、売価を決めるときに拾うべき結論が
+      //    埋もれる (Codex R7 P3)。結論 → 候補 → 保存されない の 3 行に分ける (white-space:pre-line)
+      const lines = [];
       // 🚨 NE と画面が食い違っているときは NE の配送方法も必ず出す (2026-10-07 中原さんの決定で
       //    画面の配送方法に合わせるので、何を上書きしたのかが分からないと確かめられない — Codex R6 P2)
-      let s = (!p.isNe && neCurrent)
-        ? 'NE は「' + neCurrent + '」ですが、画面の「' + label + '」に合わせて「' + method + '」で試算しています'
-        : '「' + label + '」に合わせて「' + method + '」で試算しています';
-      // 選んだ理由。楽天の名前で絞ったのに「いちばん多く」と書くと実際と逆になる (Codex R6 P3)
-      const why = p.reason === 'ne' ? 'NE の登録値'
-        : (p.reason === 'label' ? '楽天の名前に合うものの中でいちばん多く使っているもの' : 'いちばん多く使っているもの');
+      lines.push('試算: 「' + method + '」' + Math.round(p.cost).toLocaleString() + '円'
+        + '（画面の「' + label + '」に合わせました'
+        + (p.isNe ? '。NE に登録されている送料です' : (neCurrent ? '。NE は「' + neCurrent + '」' : '')) + '）');
       if (p.candidates > 1) {
         // 🚨 「大きさで N 通り」とは書かない。候補は配送方法ごとに代表送料 1 件へ畳んである
-        //    ので、実際の送料の幅ではない (Codex R4 P2)
-        s += ' — 自動で選べる候補 (送料0円は除く) は ' + p.candidates + ' 件 (代表の送料 '
-          + Math.round(p.min).toLocaleString() + '〜' + Math.round(p.max).toLocaleString() + '円) あるので、'
-          + why + 'を使いました。違うなら選び直してください';
-      } else if (p.isNe) {
-        s += ' (NE に登録されている送料です)';
+        //    ので、実際の送料の幅ではない (Codex R4 P2)。
+        //    理由は、楽天の名前で絞ったのに「いちばん多く」と書くと実際と逆になる (Codex R6 P3)
+        const why = p.reason === 'label' ? '楽天の名前に合うものの中でいちばん多く使っているもの'
+          : 'いちばん多く使っているもの';
+        lines.push('候補 ' + p.candidates + ' 件 (送料0円は除く)・代表の送料 '
+          + Math.round(p.min).toLocaleString() + '〜' + Math.round(p.max).toLocaleString() + '円 — '
+          + why + 'を使いました。違うなら選び直してください');
       }
-      return s + tail;
+      lines.push('この選択は試算だけで、NE や出品内容には保存されません');
+      return lines.join('\n');
     }
     (function initProfitShipPicker() {
       const sel = document.getElementById('profit-ship-select');
@@ -5312,7 +5314,9 @@ th.attr-unknown { color: #dc2626; }
       //    (Codex R5 P2)。消すのは**人が楽天の配送方法を変えたとき**だけ (= 合わせ直す合図)
       const MINE_KEY = 'ph-profit-ship:<%= draft.id %>';
       // 🚨 「どの楽天配送方法のときに選んだか」まで覚える。方法名だけだと、別のタブで
-      //    配送方法を変えて保存されたあとに古い選択が勝ってしまう (Codex R6 P2)
+      //    配送方法を変えて保存されたあとに古い選択が勝ってしまう (Codex R6 P2)。
+      //    ⚠️ タブを複製・window.open したときは sessionStorage が初期コピーされる (HTML 仕様) ので、
+      //    新しいタブもこの選択を引き継ぐ。同じ人の同じ商品・同じ配送方法での選択なので許容する
       function readMine(group) {
         try {
           const d = JSON.parse(sessionStorage.getItem(MINE_KEY) || 'null');
