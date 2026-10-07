@@ -185,12 +185,29 @@ await ta('[4f] ⑦-2 PR-C: config が company・DB の active が load (配っ�
   assert.deepEqual(v.calls, ['CompanyDB写し(Amazon SKU)', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   assert.deepEqual(rv.filter((r) => !r.success).map((r) => r.name), ['sales_velocity']);
   assert.equal(rv.amazonChainPending, false);
-  // 写しがまた読めずに落ちた = 鎖のまま (f_sales は上流で止める・次の回も写しから)
+  // 写しがまた読めずに落ちた (#1652 Codex R1 Medium) = 古い表は前のまま = もとの remaining の f_sales・Render同期 は普通に再試行して戻る・写しだけが鎖の未完で残る
   const d = fakeRun({ 'CompanyDB写し(Amazon SKU)': true });
-  const rd = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales'], { run: d.run, log: quiet, amazonChain: true });
-  assert.deepEqual(d.calls, ['CompanyDB写し(Amazon SKU)']);
-  assert.deepEqual(rd.filter((r) => !r.success).map((r) => r.name), ['CompanyDB写し(Amazon SKU)', 'f_sales']);
+  const rd = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: d.run, log: quiet, amazonChain: true });
+  assert.deepEqual(d.calls, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.deepEqual(rd.filter((r) => !r.success).map((r) => r.name), ['CompanyDB写し(Amazon SKU)']);
   assert.equal(rd.amazonChainPending, true);
+  // 次の回 (remaining = 写しだけ・鎖の印): 写しがやっと本当に写せた (✅) = 鎖が f_sales から全部を流し直す
+  const st = { remaining_jobs: rd.filter((r) => !r.success).map((r) => r.name), amazon_map_chain: rd.amazonChainPending };
+  assert.equal(amazonChainActive(st), true);
+  const d2 = fakeRun({ 'warn:CompanyDB写し(Amazon SKU)': '✅ CompanyDB写し(Amazon SKU): 写した (親 +1)' });
+  runRetryRound(st.remaining_jobs, { run: d2.run, log: quiet, amazonChain: true });
+  assert.deepEqual(d2.calls, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  //   ⏭️ (持ち主 load のまま) で直った = 何も書いていない = 流し直さない
+  const d3 = fakeRun({ 'warn:CompanyDB写し(Amazon SKU)': real.last });
+  const rd3 = runRetryRound(st.remaining_jobs, { run: d3.run, log: quiet, amazonChain: true });
+  assert.deepEqual(d3.calls, ['CompanyDB写し(Amazon SKU)']);
+  assert.equal(rd3.amazonChainPending, false);
+  // 鍵待ち (73・持ち主 company で別の写しが書いている途中かも) は今までどおり f_sales を見送る (鎖のまま)
+  const k = { calls: [], run: (s, name) => { k.calls.push(name); return name === 'CompanyDB写し(Amazon SKU)' ? { success: false, summary: '❌ 別の写しが動いている', exitCode: 73 } : { success: true, summary: '✅' }; } };
+  const rk = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales'], { run: k.run, log: quiet, amazonChain: true });
+  assert.deepEqual(k.calls, ['CompanyDB写し(Amazon SKU)']);
+  assert.deepEqual(rk.filter((r) => !r.success).map((r) => r.name), ['CompanyDB写し(Amazon SKU)', 'f_sales']);
+  assert.equal(rk.amazonChainPending, true);
   // 持ち主 company で写した (✅) 回は今までどおり鎖で一段ずつ ([4c] と同じ)
   const c = fakeRun({ 'warn:CompanyDB写し(Amazon SKU)': '✅ CompanyDB写し(Amazon SKU): 変わった行 0 / 対応 1 件' });
   runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: c.run, log: quiet, amazonChain: true });
@@ -299,6 +316,7 @@ await ta('[5] 失敗した子の最後の行 (❌ 理由) を要約に残す (Co
   let r;
   try { r = runScript(path.relative(projectDir, file), '試験', 30000, []); } finally { console.error = origErr; console.log = origLog; }
   assert.equal(r.success, false);
+  assert.equal(r.exitCode, 1);   // 子の exit を残す (写しの鍵待ち 73 を見分ける。#1652 Codex R1 Medium)
   assert.match(r.summary, /^❌ 成果物をポータルに送れない \(unreachable\) \| /);
   // 長い最後の行でも失敗の内容は残る・timeout (stdout なし) は失敗の内容だけ・stdout が空でも
   const long = failSummary({ stdout: `途中\n${'あ'.repeat(500)}`, message: 'Command failed: node x.mjs ETIMEDOUT' });

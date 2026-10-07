@@ -162,6 +162,8 @@ export const UPSTREAM_OF = {
   // Amazon SKU の対応の写し → f_sales (⑦-2 PR-A・Codex 計画 R2 High 2)。写しをこの回で再試行して失敗 = f_sales を作り直さない
   //   (朝の f_sales は前の対応のまま = 古い対応と新しい対応の混ざった回を Render へ送らない。写しが直った回に f_sales から作り直す = RERUN_AFTER)
   //   今の本番 (持ち主 load) は写しがいつも exit 0 = retry に載らない = この組は効かない (今の f_sales の retry は変わらない)
+  //   🆕 #1652 Codex R1 Medium: 写しが鍵待ち (73) 以外で落ちた回は古い表が前のまま = f_sales がもとの remaining にあれば見送らない (runRetryRound の mapFailedOldTables)。
+  //   見送るのは写しが鍵待ち (73) の回だけ (config が company・active が load の朝に watcher が読めず、f_sales も落ちた日に f_sales・Render同期 が戻らない穴を塞ぐ)
   'f_sales': 'CompanyDB写し(Amazon SKU)',
 };
 /**
@@ -286,7 +288,8 @@ export function runScript(scriptPath, label, timeoutMs, args = ['7']) {
     // 失敗の理由は子の最後の行にあることが多い (❌ …) = 残す。子の行 120 字・失敗の内容 (timeout・起動の失敗など) 77 字を別々に残す (Codex #1540 R1 Low・R2 Low)
     const summary = failSummary(e);
     console.error(`[${label}] 失敗の要約: ${summary}`);   // 試行ごとのログにも残す
-    return { success: false, summary };
+    // exitCode = 子の exit (写しの鍵待ち 73 を見分ける。#1652 Codex R1 Medium)。timeout・起動の失敗は null
+    return { success: false, summary, exitCode: Number.isInteger(e?.status) ? e.status : null };
   }
 }
 
@@ -386,6 +389,10 @@ export function runRetryRound(remainingJobs0, { run = runScript, log = console.l
   // 写しの鎖の回か (呼び手が retry-state から決める。渡されない = remaining に写しがあるとき)
   //   🆕 PR-C: この回の写しが ⏭️ (持ち主 load = 何も書いていない) で終わったら、その後は鎖の回ではない (今の本番の retry と同じ = mapWroteNothing)
   let chain = amazonChain ?? remainingJobs.includes(AMAZON_MAP_CHAIN[0]);
+  //   🆕 #1652 Codex R1 Medium: この回の写しが鍵待ち (exit 73) 以外で落ちた = 古い表は前のまま (写しは 1 取引・落ちたら何も書いていない)。
+  //   もとの remaining にある f_sales 以降は古い表のまま普通の retry で流す (上流で見送らない・鎖の見送りもしない)・写しだけを鎖の未完として残す
+  //   (写しが後で本当に写せた回に、鎖が f_sales から全部を流し直す)。鍵待ち (73) は今までどおり見送る (別の写しが書いている途中かもしれない)
+  let mapFailedOldTables = false;
 
   for (const jobName of RETRY_ORDER) {
     if (!remainingJobs.includes(jobName) && !rerun.has(jobName)) continue;
@@ -420,7 +427,7 @@ export function runRetryRound(remainingJobs0, { run = runScript, log = console.l
 
     // 上流 (取込) をこの回で再試行して失敗したら、下流は見送る (次の回へ)
     const blocked = upstreamBlock(jobName, results);
-    if (blocked) {
+    if (blocked && !(mapFailedOldTables && jobName === 'f_sales' && UPSTREAM_OF[jobName] === AMAZON_MAP_CHAIN[0] && remainingJobs.includes(jobName))) {
       log(`[Retry] ${jobName} スキップ (${blocked}、次回再試行)`);
       results.push({ name: jobName, success: false, summary: `⏸️ skipped (${blocked})` });
       continue;
@@ -452,6 +459,12 @@ export function runRetryRound(remainingJobs0, { run = runScript, log = console.l
       chain = false;
       log(`[Retry] ${jobName} は持ち主 load (何も書いていない) = 写しの鎖を外す (f_sales 以降は走らせ直さない)`);
     }
+    // 写しが鍵待ち (73) 以外で落ちた = 古い表は前のまま = この回の残り (もとの remaining の f_sales 以降) は普通の retry。写しだけが鎖の未完で残る (#1652 Codex R1 Medium)
+    if (jobName === AMAZON_MAP_CHAIN[0] && !(result && result.success) && result?.exitCode !== 73) {
+      mapFailedOldTables = true;
+      if (chain) log(`[Retry] ${jobName} 再失敗 (古い表は前のまま) = この回の f_sales 以降は古い表で普通に再試行・写しは鎖の未完で残す`);
+      chain = false;
+    }
     if (chain && result && result.success && chainNext(jobName)) rerun.add(chainNext(jobName));   // 写しの鎖: 成功したら次の一段だけ
   }
   // 写しの鎖の途中 (写しの後) で落ちた = その先の工程を「見送り」の失敗として残す (次の回に鎖のまま落ちたところから流す)
@@ -460,7 +473,7 @@ export function runRetryRound(remainingJobs0, { run = runScript, log = console.l
     const mapFailed = results.some((r) => r.name === AMAZON_MAP_CHAIN[0] && !r.success);   // 写しそのものが落ちた = 次の回も写しから (鎖を最初から流す)
     if (i > 0 && !mapFailed) for (const j of AMAZON_MAP_CHAIN.slice(i + 1)) if (!results.some((r) => r.name === j)) results.push({ name: j, success: false, summary: `⏸️ skipped (${AMAZON_MAP_CHAIN[i]} 失敗・Amazon SKU の写しの鎖)` });
   }
-  results.amazonChainPending = chain && results.some((r) => AMAZON_MAP_CHAIN.includes(r.name) && !r.success);
+  results.amazonChainPending = (chain || mapFailedOldTables) && results.some((r) => AMAZON_MAP_CHAIN.includes(r.name) && !r.success);
   return results;
 }
 

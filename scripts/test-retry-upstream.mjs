@@ -49,13 +49,20 @@ t('🚨 ⑦-2 PR-A (#1649 Codex R1 High / R2 Medium): 写しが鍵待ち (exit 7
   assert.match(dailySync, /\.filter\(r => RETRYABLE_JOBS\.includes\(r\.name\) && !r\.success && !r\.blocked\)/);   // blocked は retry-state に入らない
   assert.ok(retryable.includes('CompanyDB写し(Amazon SKU)'));
 });
-t('🚨 ⑦-2 PR-A: 写しをこの回で再試行して失敗 → f_sales を作り直さない (Render同期 も見送り) / 写しが成功 → f_sales から作り直す / 写しが朝に成功していれば f_sales はそのまま走る', () => {
+t('🚨 ⑦-2 PR-A: 写しをこの回で再試行して鍵待ち (73) → f_sales を作り直さない (Render同期 も見送り) / 鍵待ち以外で失敗 (#1652 Codex R1 Medium) = 古い表のまま f_sales・Render同期 は普通に再試行・写しは残る / 写しが朝に成功していれば f_sales はそのまま走る', () => {
   const started = []; const quiet = () => {};
   const runner = (outcome) => (script, label) => { started.push(label); return outcome[label] ?? { success: true, summary: 'ok' }; };
-  const r1 = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: runner({ 'CompanyDB写し(Amazon SKU)': { success: false, summary: '❌ 断った (shrunk)' } }), log: quiet });
+  const r1 = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: runner({ 'CompanyDB写し(Amazon SKU)': { success: false, summary: '❌ 別の写しが動いている', exitCode: 73 } }), log: quiet });
   assert.deepEqual(started, ['CompanyDB写し(Amazon SKU)']);
   assert.deepEqual(r1.map((x) => [x.name, x.success]), [['CompanyDB写し(Amazon SKU)', false], ['f_sales', false], ['Render同期', false]]);
   assert.equal(r1.find((x) => x.name === 'f_sales').summary, '⏸️ skipped (CompanyDB写し(Amazon SKU) 再失敗)');
+  assert.equal(r1.amazonChainPending, true);
+  started.length = 0;
+  // 鍵待ち以外 (断った・読めない・timeout) = 写しは何も書いていない = f_sales・Render同期 は古い表で普通に再試行。写しだけが残る (鎖の未完)
+  const r1b = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: runner({ 'CompanyDB写し(Amazon SKU)': { success: false, summary: '❌ 断った (shrunk)', exitCode: 1 } }), log: quiet });
+  assert.deepEqual(started, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.deepEqual(r1b.filter((x) => !x.success).map((x) => x.name), ['CompanyDB写し(Amazon SKU)']);
+  assert.equal(r1b.amazonChainPending, true);
   started.length = 0;
   runRetryRound(['f_sales'], { run: runner({}), log: quiet });   // 写しは朝に成功 (remaining に無い) = f_sales はそのまま・今までどおり (鎖でない = 速度・リストを走らせ直さない)
   assert.deepEqual(started, ['f_sales']);
