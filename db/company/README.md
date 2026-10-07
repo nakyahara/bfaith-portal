@@ -65,7 +65,7 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
   - session の設定 = `lock_timeout = 5min`・`statement_timeout = 30min`・`client_connection_check_interval = 1s` (Linux の server だけ。Windows の試験の server では使えないと出して続ける)。ファイルが終われば戻す
   - **記録** = 全部の文が通り、作った index が全部 `indisvalid and indisready and indislive` で属性が期待どおり・消した index が無いときだけ (1 文の取引・🆕 `search_path = pg_catalog, pg_temp` に固定 = Codex R5 M2)。途中で落ちたら記録しない = 次に流すと続きから
   - PGlite (試験) など CIC に対応しない adapter = 同じ文から `concurrently` を外した `create index if not exists` / `drop index if exists` を **ふつうの取引で** 流し、属性の検証は同じに通す (試験の schema は本番と同じ index を持つ)。invalid の回収・lock の待ちは試さない (本物の PG の試験で)
-  - 🚨 **見張り** = migrate の lock を持つ時間が **45 分** を超えたら知らせる (CIC 1 文の `statement_timeout = 30min` で先に切れるはず = 鳴るのは止まっている印)。今は `--list` の ⚠️ だけ (GChat の見張りは後の PR)。CIC は古いスナップショットを待つ = **夜間のバックアップ (REPEATABLE READ の長い取引) の間は流さない**
+  - 🚨 **見張り** = migrate の lock を持つ時間が **45 分** を超えたら知らせる (CIC 1 文の `statement_timeout = 30min` で先に切れるはず = 鳴るのは止まっている印)。`--list` の ⚠️ と、**本番の migrate を流す 1 つのコマンド `scripts/company-db/migrate-watched.mjs` の中の GChat の見張り** (runner は本物の PG の concurrent-index の各文の前に、この run の見張りの heartbeat を必ず確かめ、無ければ流さない = `LOCK_WATCH_REQUIRED`)・朝の保険の W15 (下の「migrate の lock の 45 分の見張り」)。CIC は古いスナップショットを待つ = **夜間のバックアップ (REPEATABLE READ の長い取引) の間は流さない**
 - **空き容量** (concurrent-index の create の各文の前・表示だけにしない) = 予想の index の大きさ = `reltuples × (index の列の pg_stats.avg_width の和 + 式の列は 64 + 16) × 1.3` (列は key と include の両方)。**空き (Render のメトリクスの Disk Capacity − Disk Usage = `apps/company-db/profit/render-metrics.mjs`) が `予想 × 3 + この回に先に作った index の予想 × 3 の和 + 2GB` に満たなければ流さずに exit 1** (メトリクスは最大 2 分古い = 続けて作った分がまだ使用に入っていない・Codex R1 H3)。🆕 **この回に流す全部の未適用の CIC の file の create を最初に集めて 1 回で判定する** (最初の CIC の file の最初の文の前・`予想の合計 × 3 + 2GB`・足りなければ 1 本も作らない・前の回の valid・未記録の index も含める・Codex R5 M1 = 設計 13 v3.13 ⑤ (a)。式は設計の `Σ 予想 + max(予想) × 2 + 2GB` 以上 = 止まる向き。CIC の file が 1 つの回は下の file の判定と同じ = 呼ばない。間の ふつうの file が作る表の index は、その表がまだ無い = 見積もれずに止まる = fail-closed)。file の最初の文の前にも、その file の **全部の create の合計** + この回に先に作った分 (前の回が作って記録の前に落ちた valid の index も含める = メトリクスにまだ出ていないかもしれない・Codex R-D60-v3-14 M4) で 1 回判定する (途中まで作って止まらない・残す)。飛ばす作り済みの index も予約に入れる。止まったら少し待ってもう一度流す。🆕 **容量を読む resource は接続先と同じでなければ流さない** (Codex R1 H2・設計 13 v3.13 ④・`DISK_CHECK_FAILED` の `RESOURCE_MISMATCH/<詳しく>`) = ① `CDB_RENDER_PG_RESOURCE_ID` が接続先 (`COMPANY_DB_URL` / `--url`) の host の最初の名前と同じ (内部 = `dpg-xxxx-a`・外部 = `dpg-xxxx-a.<地域>-postgres.render.com`・pool の host は未確認 = 一致にしない) ② Render の API の名札 (`GET /v1/postgres/{ID}` の `databaseName`・password を含まない) = `current_database()`。🚨 **host の対応はまだ Render に確かめていない** (設計 13 §5 の質問 14) = `RENDER_PG_HOST_MAPPING.confirmed = false` の間は **照合を通さない = CIC の migration は流れない** (`RESOURCE_MISMATCH/HOST_MAPPING_UNCONFIRMED`・Codex R-D60-v3-14 M5)。形の fixture = `scripts/fixtures/render-postgres-hosts.json` (回答で決まったら fixture と定数を同じ PR で直す)。password を返す connection-info は使わない。メトリクスが読めない (`RENDER_API_KEY`・`CDB_RENDER_PG_RESOURCE_ID` が無い・古い・形が違う)・表を一度も ANALYZE していない (reltuples が負・列の pg_stats が無い) ときも流さない (fail-closed・`DISK_CHECK_FAILED`)。人が画面で読んだ空きを渡す道は作らない。dry-run は容量を見ない
 
 - **持ち主の mode** (Codex R-D60-v3-10 H2 = PR 1b の前 / PR 1b 自身 / PR 1b の後) = runner は file ごとに catalog だけで mode を読む (接続の役割が ops の USAGE を失っても読める)
@@ -135,6 +135,31 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 1. `select indexrelid::regclass, indisvalid, indisready from pg_index where not indisvalid;` で invalid を見る
 2. `pg_stat_progress_create_index` と `pg_stat_activity` (`application_name = 'company-db-migrate'`) で前の作りが動いていないかを見る。動いていれば終わるのを待つ (止めるなら人が `pg_cancel_backend`)
 3. runner をもう一度流す (同じ名前の invalid を `drop index concurrently` してから作り直す)。🚨 手で `DROP INDEX` (CONCURRENTLY なし) はしない (表に強い lock)
+
+#### migrate の lock の 45 分の見張り (GChat・本番の migrate は `migrate-watched.mjs` から)
+
+- 設計 13 §3.10 (v3.9「見張り」・v3.12「45 分の見張り」・§5 0b-3 (o)) = migrate の lock (`MIGRATE_LOCK_NAME`) を持つ時間が **45 分** (`MIGRATE_LOCK_ALERT_MINUTES`) を超えたら GChat (要対応スペース = `GCHAT_WEBHOOK_JOBS`)。CIC 1 文は `statement_timeout = 30min` で先に切れるはず = 鳴るのは止まっている印 (ただし file・文が多い回は全体で 45 分を超えうる)
+- **3 層** (PR #1638 Codex R1 / R2): ① 1 つのコマンド `migrate-watched.mjs` ② runner の関門 (heartbeat) ③ 朝の見張り W15
+- **① 本番の migrate は `node scripts\company-db\migrate-watched.mjs` (`--to NNNN` も可) から流す**。中で起きること:
+  0. run ごとの nonce (16 桁の hex) を作り、見張りと migrate の子のプロセスに env `CDB_MIGRATE_WATCH_NONCE` で渡す
+  1. 見張り (`scripts/company-db/migrate-lock-watch.mjs --supervised`) を **detached** の子のプロセスで起動する (接続 = `COMPANY_DB_WATCH_URL` の watcher の役割・読むだけ・lock を取らない・backend を止めない)
+  2. 見張りが最初の見回りで lock が無いことを見て、**GChat の起動の知らせ (🟢) が本当に届いた** (`sendJobsChat` が true) ことを確かめてから ready を返す。届かない (3 回)・3 分で返らない・始める前から別の migrate が lock を持っている・見張りを起動できない = **migrate を始めない** (exit 1)
+  3. それから migrate (`migrate.mjs`・接続 = `COMPANY_DB_URL`) を始める = lock を取る前に見張りが動いている
+  4. migrate の間に見張りが死んだら GChat に知らせ、migrate を始めた時刻から数える見張りを起動し直す (3 回まで)。見張りが「ready から 10 分 lock が現れない」(exit 5) で終わったら起動し直さない
+  5. migrate が終わったら見張りに done を送る → 見張りは lock が無いのを見て終わる (lock が残っていれば外れるまで見張る)
+- **② runner の関門 (heartbeat)**: 見張りは見回りが通るたびに自分の接続の `application_name` を `company-db-migrate-lock-watch:<nonce>:<server の epoch 秒>` に変える。**runner は本物の PG の concurrent-index の各文の前に必ず** (opts で外せない・CLI でもプログラムの直の呼び出しでも)、同じ DB に同じ nonce で 120 秒 (見回り 2 周期) 以内の heartbeat があることを確かめ、無ければ流さない (`LOCK_WATCH_REQUIRED`・記録しない・lock は外れる = 次に `migrate-watched.mjs` で流せば続きから)。= 見張りなし・idle の接続・止まった見張り・別の run の見張り・別の DB の見張りでは流れない。本物の PG の adapter で CONCURRENTLY を外す道 (取引の中) も、取引の前と **取引の中の各文の直前** に確かめる (取引の中の `pg_stat_activity` は写し = 毎回 `pg_stat_clear_snapshot()` で捨ててから読む・止まれば取引ごと巻き戻して記録しない・Codex R3)。外れるのは PGlite の adapter (`lockWatchExempt` = CONCURRENTLY を外して取引の中で流す試験の道) だけ。ふつうの migration・`--list`・`--dry-run`・`--index-expect` は今までどおり `migrate.mjs` を直接でよい
+- 見張りの動き: 60 秒ごとに `pg_locks` を読む。watcher の役割からは runner の `backend_start` が見えない = **lock が無かった直前の見回りの時刻から数える** (長めに数える = 早めに鳴る)。⚠️ 45 分を超えた最初の見回りで 1 回・その後 60 分ごと (送れなければ次の見回りで送り直す)・✅ 鳴った後に外れた・❌ 8 時間の打ち切り (lock が無くても)・❌ DB を 3 回続けて読めない = 「見張れていない」。終わりの知らせ (持ち主が替わった時の「外れた」も) は 5 回・30 秒おきに送り直し、届かなければ exit 3
+- **親 (`migrate-watched`) が死んだとき** (窓を閉じる・Ctrl+C・kill): migrate (detached でない子) は一緒に終わる (Windows の job) = 接続が切れて lock が外れる (CIC は invalid が残りうる = 次に `migrate-watched.mjs` で流すと回収)。見張りは detached で残り、IPC の切れを見て、lock が無ければ ⚠️「親が途中で終わった・lock は無い」を送って終わる (親と migrate がほぼ同時に消えて、同じ見回りで lock も外れていた時も、この知らせを先に = 外れたことも同じ文に・Codex R3) / lock があれば ⚠️ を送って外れるまで見張る (45 分の知らせも出す)。どちらの知らせも 5 回送り直し、届かなければ最後に exit 3。ready から 10 分 lock が一度も現れなければ知らせて終わる (exit 5)。🚨 **見張りも死ぬと誰も知らせない = 次の朝の W15 が lock の残りを拾う** (親が kill されても見張りが残ることは試験 E3。窓を閉じた時・Ctrl+C は試せていない)
+- 終了コード (`migrate-watched.mjs`): 0 = migrate も見張りも済んだ / 1 = migrate が失敗・始めなかった / 2 = 引数・設定 (`COMPANY_DB_URL`・`COMPANY_DB_WATCH_URL`・`GCHAT_WEBHOOK_JOBS`) の誤り / 3 = migrate は済んだが見張りが途中で止まった・終わりの知らせが届かなかった (GChat と log を見る)。接続文字列は引数で受けない (`--url` なし)。見張り: 0 / 1 (8 時間・失敗) / 2 (引数・設定・nonce) / 3 (終わりの知らせが届かない) / 4 (起動の知らせが届かない) / 5 (ready から 10 分 lock が現れない)
+- 見張りは単独では起動しない (試しの `--dry-run` だけ = GChat に送らず文を画面に出す・`--interval-sec`・`--alert-min` を変えられるのも `--dry-run` の時だけ)
+- **③ 朝の保険 = 見張り W15** (毎朝の Company DB 見張り・`config/watch-checks.mjs`) = 見張りの時点で migrate の lock が持たれていれば ⚠️ (持ち主の pid・見張りの接続の有無)。45 分は測れない (毎朝 1 回) = 起動忘れ・見張りの消失・止まった migrate の保険
+- 定期実行ではない (人が本番の migrate を流す時だけ・自分で終わる) = 台帳 (`config/jobs-registry.mjs`) に新しいエントリは無い (W15 は既存の daily-sync の見張りの 1 項目)
+- 試験 = `scripts/test-company-db-migrate-lock-watch.mjs` (時計を差し替えた見張り・1 つのコマンドの順番・heartbeat の契約・runner の関門 + 本物の PG 18.4 と本物の子のプロセス) / W15 = `scripts/test-company-db-watch.mjs` / 本物の PG の CIC を流す試験 (`test-company-db-migrate-lock-pg.mjs`) は本物の見張りと同じ heartbeat (`writeLockWatchHeartbeat`) を出して通す
+
+```
+cd C:\Users\bfaith\bfaith-portal
+node scripts\company-db\migrate-watched.mjs
+```
 
 #### 配り方 = runner を先にマージして配る (古い runner と並ばない)
 

@@ -59,6 +59,7 @@
  *   node scripts/company-db/migrate.mjs --url ... --list                         # 適用状況だけ (lock は取らない・持ち主の pid を出す)
  *   node scripts/company-db/migrate.mjs --url ... --dry-run                      # 何を流すかだけ (try の lock を取る・DDL は流さない・許す文と expect.json を検査)
  *   node scripts/company-db/migrate.mjs --url <使い捨ての DB> --index-expect 0057 # そのファイルの index の属性 (expect.json の中身) を出す
+ *   🆕 concurrent-index の file は 45 分の見張りの heartbeat (env CDB_MIGRATE_WATCH_NONCE の run) が無いと流れない (LOCK_WATCH_REQUIRED) = 本番は node scripts/company-db/migrate-watched.mjs から
  *   (--dir <フォルダ> で migrations のフォルダを変えられる。試験用)
  *   env (concurrent-index の容量): RENDER_API_KEY・CDB_RENDER_PG_RESOURCE_ID (apps/company-db/profit/render-metrics.mjs)
  *
@@ -89,6 +90,22 @@ export const EXPECTED_PG_MAJOR = 18;
  */
 export const CONCURRENT_INDEX_SETTINGS = Object.freeze({ lockTimeout: '5min', statementTimeout: '30min', clientConnectionCheckInterval: '1s' });
 export const MIGRATE_LOCK_ALERT_MINUTES = 45;
+/**
+ * 🆕 45 分の見張り (scripts/company-db/migrate-lock-watch.mjs) の heartbeat (設計 13 §3.10 v3.9「見張り」・PR #1638 Codex R1 / R2 High)。
+ *   - 1 つのコマンド (scripts/company-db/migrate-watched.mjs) が run ごとの nonce (16 桁の hex) を作り、見張りと migrate の子のプロセスに env で渡す
+ *   - 見張りは見回りが通るたびに、自分の接続の application_name を `company-db-migrate-lock-watch:<nonce>:<server の epoch 秒>` に変える
+ *   - runner は **本物の PG の concurrent-index の各文の前に必ず** (opts で外せない)、同じ DB に同じ nonce で epoch が
+ *     LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC 秒以内の接続があることを確かめ、無ければ流さない (LOCK_WATCH_REQUIRED・記録しない)
+ *     = 見張りなし・idle の接続 (見回りをしていない)・止まった見張り・別の run の見張り・別の DB の見張りでは通らない
+ *   - 外れるのは PGlite の adapter (lockWatchExempt = CONCURRENTLY を外して取引の中で流す試験の道) だけ
+ *   application_name は 63 バイトまで = 29 + 1 + 16 + 1 + 10 桁
+ */
+export const MIGRATE_LOCK_WATCH_APPLICATION_NAME = 'company-db-migrate-lock-watch';
+export const LOCK_WATCH_NONCE_ENV = 'CDB_MIGRATE_WATCH_NONCE';
+export const LOCK_WATCH_NONCE_RE = /^[0-9a-f]{16}$/;
+/** heartbeat の新しさ = 見回り (60 秒) の 2 周期。未来の epoch は 5 秒まで (server の時計で書いて読む = ずれない) */
+export const LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC = 120;
+export const LOCK_WATCH_HEARTBEAT_FUTURE_SEC = 5;
 /**
  * 空き容量の関門 (設計 13 §3.10 v3.9):
  *   予想 = reltuples × (index の列の pg_stats.avg_width の和 + 式の列は EXPR_WIDTH + TUPLE_OVERHEAD) × ESTIMATE_FACTOR
@@ -1017,6 +1034,36 @@ async function unlock(db) {
   if (!ok) throw new Error('pg_advisory_unlock が false (持っていなかった)');
 }
 
+/**
+ * 🆕 45 分の見張りの heartbeat を確かめる (上の MIGRATE_LOCK_WATCH_APPLICATION_NAME の注釈)。同じ DB・自分以外・同じ nonce・epoch が新しい接続が 1 つも無ければ
+ * LOCK_WATCH_REQUIRED (noTransaction)。nonce = opts.lockWatchNonce か env CDB_MIGRATE_WATCH_NONCE (無い・形が違う = 止まる)。
+ * application_name と datname はどの役割からも見える (権限の無い役割の見張りの接続を deployer から見ても = 試験 R1)。inTx = 取引の中から呼ぶ (PGlite でない取引の道)
+ * 戻り = { fresh, ageSec }。偽の heartbeat (同じ nonce を知っている別の接続) までは見分けない = 忘れ・死・止まりの守り
+ */
+export async function assertLockWatchFresh(db, { nonce = process.env[LOCK_WATCH_NONCE_ENV], label = '', inTx = false } = {}) {
+  const fail = (why) => Object.assign(new Error(`${label ? `${label}: ` : ''}migrate の lock の 45 分の見張りが動いていない (${why}) = concurrent-index を流さない (記録しない)。` +
+    'scripts/company-db/migrate-watched.mjs から流す (見張りを起動 → GChat に送れたのを確かめてから migrate・見張りが見回るたびに heartbeat を出す)'), { code: 'LOCK_WATCH_REQUIRED', noTransaction: !inTx });
+  if (!LOCK_WATCH_NONCE_RE.test(String(nonce || ''))) throw fail(`run の nonce (env ${LOCK_WATCH_NONCE_ENV}) が無い・形が違う`);
+  // 🆕 Codex R3 M2: 取引の中では pg_stat_activity は取引の最初の読みの写し (backend の状態の cache) のまま = 止まった見張りの古い heartbeat も
+  //   新しい heartbeat も見えない。読む前に毎回 pg_stat_clear_snapshot() で写しを捨てる (取引の外の道は withCatalogPath が新しい取引 = 同じ)
+  const r = await withCatalogPath(db, async () => {
+    await db.query('select pg_catalog.pg_stat_clear_snapshot()');
+    return (await db.query(`
+    with n as (select pg_catalog.floor(extract(epoch from pg_catalog.clock_timestamp()))::pg_catalog.int8 as now_s),
+         e as (select pg_catalog.split_part(a.application_name, ':', 3)::pg_catalog.int8 as epoch
+                 from pg_catalog.pg_stat_activity a
+                where a.datname = pg_catalog.current_database() and a.pid <> pg_catalog.pg_backend_pid()
+                  and a.application_name ~ ('^' || $1::pg_catalog.text || ':' || $2::pg_catalog.text || ':[0-9]{1,12}$'))
+    select pg_catalog.count(e.epoch) filter (where e.epoch between n.now_s - $3::pg_catalog.int8 and n.now_s + $4::pg_catalog.int8)::pg_catalog.int4 as fresh,
+           (n.now_s - pg_catalog.max(e.epoch))::pg_catalog.int8 as newest_age, pg_catalog.count(e.epoch)::pg_catalog.int4 as same_run
+      from n left join e on true group by n.now_s`, [MIGRATE_LOCK_WATCH_APPLICATION_NAME, nonce, LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC, LOCK_WATCH_HEARTBEAT_FUTURE_SEC])).rows[0];
+  }, { inTx });
+  if (!r.fresh) {
+    throw fail(r.same_run ? `この run の見張りの heartbeat が ${r.newest_age} 秒前で古い (${LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC} 秒まで) = 見張りが止まっている` : 'この run の見張りの接続が同じ DB に無い');
+  }
+  return { fresh: r.fresh, ageSec: Number(r.newest_age) };
+}
+
 /** CLI の入口 = lock の中で applyMigrations (流す / dry-run) */
 export function migrateWithLock(db, opts = {}) {
   return withMigrateLock(db, () => applyMigrations(db, opts), { log: opts.lockLog || (() => {}) });
@@ -1121,6 +1168,8 @@ async function applyConcurrentIndexFile(db, f, plan, opts, log, appliedBy, mode,
     }
     for (const st of plan.statements) {
       const key = `${st.schema}.${st.name}`;
+      // 🆕 PR #1638 Codex R2 High: 45 分の見張りの heartbeat が無ければ、この文から先を流さない (本物の PG の CIC の道では必ず・opts で外せない)
+      await assertLockWatchFresh(db, { nonce: opts.lockWatchNonce ?? process.env[LOCK_WATCH_NONCE_ENV], label: f.file });
       if (st.kind === 'create') {
         const running = await buildsInProgress(db, `${st.schema}.${st.table}`);
         if (running.length) throw fail(`${st.schema}.${st.table} の index の作りが別の接続で動いている (pid ${running.map((r) => r.pid).join(', ')}) = 終わるか止まるのを待つ\n  ${CONCURRENT_INDEX_RUNBOOK}`, { reason: 'BUILD_IN_PROGRESS' });
@@ -1169,7 +1218,7 @@ async function applyConcurrentIndexFile(db, f, plan, opts, log, appliedBy, mode,
     // 🆕 Codex R5 M2: 記録も search_path = pg_catalog の取引で (ふつうの file の記録と同じ・前の file が残した search_path に依らない)
     await withCatalogPath(db, () => db.query('insert into ops.schema_migrations (version, name, checksum, applied_by) values ($1, $2, $3, $4)', [f.version, f.name, f.checksum, appliedBy]));
   } catch (e) {
-    const err = ['MIGRATION_FAILED', 'DISK_CHECK_FAILED'].includes(e.code) ? e : fail(e.message, { cause: e });
+    const err = ['MIGRATION_FAILED', 'DISK_CHECK_FAILED', 'LOCK_WATCH_REQUIRED'].includes(e.code) ? e : fail(e.message, { cause: e });
     // invalid が残っていれば回収の手順を添える
     try {
       const left = [];
@@ -1189,7 +1238,7 @@ async function applyConcurrentIndexFile(db, f, plan, opts, log, appliedBy, mode,
 }
 
 /** concurrent-index に対応しない adapter (PGlite) = 同じ文から concurrently を外し、ふつうの取引で流す。属性の検証は同じ */
-async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTimeout, statementTimeout, mode) {
+async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTimeout, statementTimeout, mode, lockWatch = null) {
   log(`apply ${f.file} (concurrent-index を取引の中で・concurrently を外す = この adapter は CIC に対応しない) ...`);
   await db.exec('begin');
   try {
@@ -1203,6 +1252,8 @@ async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTim
     await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
     await setLexerPremiseLocal(db);   // 🆕 Codex R3 High 2: PGlite の道も同じ前提 (concurrent-index の file は新しい形 = legacy の互換は関係ない)
     for (const st of plan.statements) {
+      // 🆕 Codex R3 M2: 本物の PG の adapter で CONCURRENTLY を外す道も、各文の直前に見張りの heartbeat (PGlite の adapter は lockWatch = null)
+      if (lockWatch) await assertLockWatchFresh(db, { nonce: lockWatch.nonce, label: f.file, inTx: true });
       if (st.kind === 'create') {
         const cur = await readIndexAttrs(db, st.schema, st.name, { inTx: true });
         if (cur && cur.notIndex) throw new Error(`${st.schema}.${st.name} は index でない (relkind ${cur.relkind}) = 名前が取られている`);
@@ -1226,7 +1277,8 @@ async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTim
     await db.exec('commit');
   } catch (e) {
     try { await db.exec('rollback'); } catch { /* */ }
-    throw Object.assign(new Error(`${f.file} で失敗 (このファイルは巻き戻した。前のファイルまでは適用済み): ${e.message}`), { code: 'MIGRATION_FAILED', version: f.version, reason: e.reason, cause: e });
+    // 🆕 Codex R3 M2: 見張りの heartbeat で止まった = LOCK_WATCH_REQUIRED のまま (このファイルは巻き戻した・記録しない)
+    throw Object.assign(new Error(`${f.file} で失敗 (このファイルは巻き戻した。前のファイルまでは適用済み): ${e.message}`), { code: e.code === 'LOCK_WATCH_REQUIRED' ? e.code : 'MIGRATION_FAILED', version: f.version, reason: e.reason, cause: e });
   }
 }
 
@@ -1432,7 +1484,14 @@ export async function applyMigrations(db, opts = {}) {
     if (mode.mode === 'owner' && !reachChecked) { await checkRoleAdminReach(db, log, mode.role); reachChecked = true; }   // 同じ回で owner-transition の後
     if (f.concurrentIndex) {
       if (db.supportsConcurrentIndex === true) await applyConcurrentIndexFile(db, f, f.plan, opts, log, appliedBy, mode, diskRun);
-      else await applyConcurrentIndexFileInTx(db, f, f.plan, log, appliedBy, lockTimeout, statementTimeout, mode);
+      else {
+        // 🆕 PR #1638 Codex R2 High: 取引の中の道 (CONCURRENTLY を外す) で見張りを外せるのは PGlite の adapter だけ (本物の PG の adapter で
+        //   supportsConcurrentIndex を false にしても、同じ表に強い lock の create index になる = 見張りの heartbeat を要る)
+        //   🆕 Codex R3 M2: 取引の前に 1 回 + 取引の中の各文の直前にも (取引の中で読む・止まれば取引ごと巻き戻して記録しない)
+        const lockWatch = db.lockWatchExempt === true ? null : { nonce: opts.lockWatchNonce ?? process.env[LOCK_WATCH_NONCE_ENV] };
+        if (lockWatch) await assertLockWatchFresh(db, { nonce: lockWatch.nonce, label: f.file });
+        await applyConcurrentIndexFileInTx(db, f, f.plan, log, appliedBy, lockTimeout, statementTimeout, mode, lockWatch);
+      }
       result.applied.push(f.version);
       continue;
     }
@@ -1555,6 +1614,7 @@ export function pgliteAdapter(pglite) {
     exec: (text) => pglite.exec(text),
     supportsConcurrentIndex: false,
     roleAdminReachExempt: true,   // 🆕 試験だけの superuser の 1 つの session = 到達の検査 (ROLE_ADMIN_REACHABLE) は飛ばす (本番の道 = pgAdapter は持たない)
+    lockWatchExempt: true,        // 🆕 PR #1638 Codex R2: CONCURRENTLY を外す試験の道 = 45 分の見張りの heartbeat は見ない (本番の道 = pgAdapter は持たない)
   };
 }
 

@@ -69,6 +69,8 @@ import {
   unicodeEscapeLiterals, ROLE_GUCS, LEXER_GUCS, OWNER_MODE_FORBIDDEN_GUCS, LEXER_PREMISE,
   lexerPremiseChanges, isOwnerTransitionText, isConcurrentIndexText,
 } from './company-db/migrate.mjs';
+import { LOCK_WATCH_NONCE_ENV } from './company-db/migrate.mjs';
+import { writeLockWatchHeartbeat } from './company-db/migrate-lock-watch.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PINNED_EMBEDDED_PG = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).devDependencies['embedded-postgres'];
@@ -138,6 +140,7 @@ const CI_STMTS = splitSqlStatements(CI_SQL).map((s) => s.sql);
 
 const clients = [];
 let setupError = null;
+let hbTimer = null, hbStop = async () => {};
 try {
   await cluster.initialise();
   await cluster.start();
@@ -147,8 +150,22 @@ try {
   await su.query(`create role ${RUNTIME} login password '${PW}'`);
   await su.query(`create role ${DEPLOYER} login password '${PW}'`);   // 形 B の deployer = 役割の管理・危険な権限に届かない (設計 13 v3.14 ②)
   let dbSeq = 0;
-  const newDb = async () => { const name = `cdb_mig_${hex}_${++dbSeq}`; await su.query(`create database ${name} owner ${OWNER}`); return name; };
   const urlOf = (dbName) => { const x = new URL(suUrl); x.username = OWNER; x.password = PW; x.pathname = `/${dbName}`; return x.toString(); };
+  // 🆕 PR #1638 Codex R2 High: 本物の PG の CIC は 45 分の見張りの heartbeat (同じ run の nonce・120 秒以内) が無いと流れない (runner の既定・外す option は無い)。
+  //   = この試験は本物の見張りと同じ heartbeat (migrate-lock-watch.mjs の writeLockWatchHeartbeat) を DB ごとの接続で 5 秒ごとに出す (新しい DB を作るたび・最大 3 接続 = 直近の DB だけ・max_connections を使い切らない)
+  const HB_NONCE = crypto.randomBytes(8).toString('hex');
+  process.env[LOCK_WATCH_NONCE_ENV] = HB_NONCE;
+  const hbConns = new Map();
+  const hbEnsure = async (dbName) => {
+    if (hbConns.has(dbName)) return;
+    while (hbConns.size >= 3) { const [k, c] = hbConns.entries().next().value; hbConns.delete(k); try { await c.end(); } catch { /* */ } }
+    const c = await openPgClient(urlOf(dbName)); c.on('error', () => {});
+    await writeLockWatchHeartbeat(c, HB_NONCE);
+    hbConns.set(dbName, c);
+  };
+  hbTimer = setInterval(() => { for (const c of hbConns.values()) writeLockWatchHeartbeat(c, HB_NONCE).catch(() => {}); }, 5000);
+  hbStop = async () => { clearInterval(hbTimer); for (const c of hbConns.values()) { try { await c.end(); } catch { /* */ } } hbConns.clear(); };
+  const newDb = async () => { const name = `cdb_mig_${hex}_${++dbSeq}`; await su.query(`create database ${name} owner ${OWNER}`); await hbEnsure(name); return name; };
   const open = async (dbName) => { const c = await openPgClient(urlOf(dbName)); c.on('error', () => {}); clients.push(c); return c; };
   /** その DB で migrate の lock を持っている pid (無ければ []) */
   const lockHolders = async (dbName) => (await su.query(`select l.pid from pg_locks l
@@ -810,7 +827,7 @@ try {
   let roleSeq = 0;
   /** PR 1b の形の owner-transition の file (持ち主の役割を作り・表と記録表の持ち主を移し・印を作る)。makeMarker = false なら印を作らない (壊れた形) */
   // 🆕 設計 13 v3.14 ② = owner の状態の試験は形 B の deployer (DEPLOYER) で流す。DB の持ち主 = DEPLOYER・持ち主の役割は superuser が作って DEPLOYER に SET で付ける
-  const newDepDb = async () => { const name = `cdb_mig_${hex}_${++dbSeq}`; await su.query(`create database ${name} owner ${DEPLOYER}`); return name; };
+  const newDepDb = async () => { const name = `cdb_mig_${hex}_${++dbSeq}`; await su.query(`create database ${name} owner ${DEPLOYER}`); await hbEnsure(name); return name; };
   const urlDep = (dbName) => { const x = new URL(urlOf(dbName)); x.username = DEPLOYER; return x.toString(); };
   const openDep = async (dbName) => { const c = await openPgClient(urlDep(dbName)); c.on('error', () => {}); clients.push(c); return c; };
   const newOwnerRole = async () => { const r = `cdb_owner_${hex}_${++roleSeq}`; await su.query(`create role ${r} nologin`); await su.query(`grant ${r} to ${DEPLOYER} with inherit false, set true`); return r; };
@@ -2043,6 +2060,7 @@ set search_path = r6, public;
   setupError = e;
   console.error('❌ 準備か試験の外で落ちた (飛ばさない): ' + (e.stack || e.message));
 } finally {
+  await hbStop();
   for (const c of clients) { try { await c.end(); } catch { /* */ } }
   for (const d of tmpDirs) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* */ } }
   await stopCluster();
