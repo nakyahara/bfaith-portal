@@ -12,6 +12,8 @@
  *   6 照合 ① の記録の形: company のロードは kind_held が要る・load のロードには無い・代表の保持の理由 kind_held を知っている
  *   7 company: 初めからセット (商品なし) を NE が単品とする = 商品を作らない / 正規化 (広げる道 v5): 名残の product_id があるセット・構成のある単品 = load でも company でも外す・消す /
  *     どのロードの後も「単品 ⇔ product_id あり」「セットでない親に構成なし」の不整合が 0 (load の補助で毎回確かめる)・整合している行は書かない
+ *   8 configured (config/master-ownership.mjs) の skus.sku_kind = company を配っても、ロードは DB の active (本番 10/5 の 13 キー・区分は load) に従う = 区分は NE に合わせる・
+ *     widen の後 (active = configured) は区分を社内のまま (kind_held)。照合 ① の記録の形もロードが記録した持ち主で合う
  * 使い方: node apps/company-db/test-master-sku-kind.mjs (PGlite)
  *         TEST_PG_URL=postgres://...@localhost:port/postgres node apps/company-db/test-master-sku-kind.mjs (本物の PostgreSQL。試験ごとに DB を作って消す。
  *         C:/tmp/pg-embed/run-conc.mjs で使い捨ての PostgreSQL を起動して流せる)
@@ -22,7 +24,8 @@ import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter, openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { runInitialLoad } from './load/engine.mjs';
 import { decisionsProblem, parentDecisionsProblem } from './master-compare/compare-load.mjs';
-import { OWNED_COLUMNS } from '../../config/master-ownership.mjs';
+import { OWNED_COLUMNS, MASTER_OWNERSHIP, companyOwned } from '../../config/master-ownership.mjs';
+import { seedActiveEpoch } from '../../scripts/fixtures/master-epoch.mjs';
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -263,6 +266,41 @@ await ta('[7] company: 初めからセット (商品なし) の SKU を NE が�
     assert.deepEqual([r3.sections.skus.applied, r3.conflicts.filter((c) => /components_on_non_set/.test(c.kind)).length, r3.sections.set_components.notes.some((n) => /正規化/.test(n)), Object.hasOwn(r3, 'normalization')], [0, 0, false, false]);
     const D3 = await decisionsOf(q, r3.run_id);
     assert.deepEqual([Object.hasOwn(D3.set_components, 'normalized_removed'), Object.hasOwn(D3.skus, 'normalized_unlinked')], [false, false]);
+  } finally { await pg.close(); }
+});
+
+await ta('[8] configured の区分 = company を配っても、ロードは DB の active (10/5 の 13 キー・区分 load) に従う = 区分は NE に合わせる / widen の後 (active = configured) は社内の区分のまま', async () => {
+  // 広げる道の手順の 1 (10/7): configured の skus.sku_kind = company。DB の active (本番 = 10/5 の 13 キー) には無い = prepare --widen の足すキーは区分だけ
+  const PROD_ACTIVE_20261005 = { ...ALL_LOAD, ...Object.fromEntries(companyOwned(MASTER_OWNERSHIP).filter((k) => k !== 'skus.sku_kind').map((k) => [k, 'company'])) };
+  assert.equal(MASTER_OWNERSHIP['skus.sku_kind'], 'company');
+  assert.deepEqual(companyOwned(MASTER_OWNERSHIP).filter((k) => PROD_ACTIVE_20261005[k] !== 'company'), ['skus.sku_kind']);
+  const { pg, db, q } = await freshDb();
+  try {
+    await load(db, planOf([...BASE, ['k1', 'single'], ['k8', 'single']], BASE_COMPS), ALL_LOAD);
+    assert.equal(await seedActiveEpoch(db, PROD_ACTIVE_20261005), true);
+    const recorded = async (runId) => (await q("select ownership from ops.load_materials where ingest_run_id = $1 and entity = 'products'", [runId]))[0]?.ownership ?? null;
+    // (1) 配ってから widen まで: 持ち主を渡さない (= 本番の夜間ロードと同じく epoch を読む) = 区分は NE に合わせる・kind_held は無い
+    const r = await load(db, planOf([...BASE, ['k1', 'set'], ['k8', 'single']], [...BASE_COMPS, ['k1', 'a1', 1]]), undefined);
+    assert.equal(r.ownership_epoch.epoch, 'active');
+    assert.ok(!r.company_owned.includes('skus.sku_kind'), JSON.stringify(r.company_owned));
+    assert.equal((await skuRow(q, 'k1')).sku_kind, 'set');
+    assert.deepEqual(await compsOf(q, 'k1'), [['a1', 1]]);
+    assert.ok(!r.conflicts.some((c) => c.kind === 'sku_kind_held'));
+    const own1 = await recorded(r.run_id);
+    assert.equal(own1['skus.sku_kind'], 'load');   // 照合 ①・②・写しが使うロードの記録の持ち主 = active (configured ではない)
+    const D = await decisionsOf(q, r.run_id);
+    assert.ok(!Object.hasOwn(D.skus, 'kind_held'));
+    assert.equal(decisionsProblem(D, { ownership: own1, has0027: true }), null);
+    // (2) widen の後 (active = configured): 区分は社内のまま (NE の単品 → セットを入れない)・食い違いを記録
+    assert.equal(await seedActiveEpoch(db, MASTER_OWNERSHIP), true);
+    const r2 = await load(db, planOf([...BASE, ['k1', 'set'], ['k8', 'set']], [...BASE_COMPS, ['k1', 'a1', 1], ['k8', 'a2', 2]]), undefined);
+    assert.equal(r2.ownership_epoch.epoch, 'active');
+    assert.ok(r2.company_owned.includes('skus.sku_kind'));
+    assert.deepEqual([(await skuRow(q, 'k8')).sku_kind, await compsOf(q, 'k8')], ['single', []]);
+    assert.deepEqual(r2.conflicts.filter((c) => c.kind === 'sku_kind_held'), [{ kind: 'sku_kind_held', code: 'k8', ne_kind: 'set', cdb_kind: 'single' }]);
+    const own2 = await recorded(r2.run_id);
+    assert.equal(own2['skus.sku_kind'], 'company');
+    assert.equal(decisionsProblem(await decisionsOf(q, r2.run_id), { ownership: own2, has0027: true }), null);
   } finally { await pg.close(); }
 });
 

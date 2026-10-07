@@ -50,9 +50,13 @@ await ta('[2] 本番の active の 13 キーは全部 capable・configured の c
   for (const k of companyOwned(MASTER_OWNERSHIP)) assert.ok(COMPANY_CAPABLE.includes(k), `configured が company なのに capable でない: ${k}`);
   // 予定が能力を追い越す = 落とす (products.parent はまだ扱う PR が無い)
   throwsCode(() => validateConfiguredCapable({ ...MASTER_OWNERSHIP, 'products.parent': 'company' }), /products\.parent/);
-  // skus.sku_kind は #1641 で扱える = 予定に入れても能力の中 (configured の値そのものは 'load' のまま)
-  assert.equal(MASTER_OWNERSHIP['skus.sku_kind'], 'load');
+  // skus.sku_kind は #1641 で扱える = 予定に入れても能力の中。10/7 から configured も 'company' (広げる道の手順の 1)
+  assert.equal(MASTER_OWNERSHIP['skus.sku_kind'], 'company');
   assert.deepEqual(configuredBeyondCapable({ ...MASTER_OWNERSHIP, 'skus.sku_kind': 'company' }), []);
+  // prepare --widen の足すキー (configured の company − 本番の active) = skus.sku_kind だけ (0058 の ops.master_widen_allowed_keys の中)・
+  //   active の company を load に戻すキーは無い (0058 の widen_not_additive に当たらない)
+  assert.deepEqual(companyOwned(MASTER_OWNERSHIP).filter((k) => !PROD_ACTIVE_COMPANY_20261005.includes(k)).sort(), ['skus.sku_kind']);
+  assert.deepEqual(PROD_ACTIVE_COMPANY_20261005.filter((k) => MASTER_OWNERSHIP[k] !== 'company'), []);
 });
 
 await ta('[2b] skus.sku_kind を capable に足しても、今の本番 (DB の active = 2026-10-05 の 13 キー) の動きは変わらない: code_behind 0・写しの列・写しの持ち主の確かめ・夜間ロードの区分は load のまま', async () => {
