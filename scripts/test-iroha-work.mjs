@@ -25,7 +25,7 @@ import path from 'path';
 await temporaryTestDataDir(import.meta.url, 'iroha-work-test-', { reuseProvided: true });
 
 // ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
-const SW_CACHE = 'iroha-work-shell-v24';
+const SW_CACHE = 'iroha-work-shell-v25';
 
 let pass = 0, fail = 0;
 function ok(cond, label) {
@@ -7372,7 +7372,7 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
   {
     const t1 = mk('cp-1', 9290, 700);
     const a = C.startConsignment({ taskId: t1, batchId: B.listBatchesOfTask(db, t1)[0].id,
-      facilityCode: 'workcenter', qty: 700, expectVersion: v(t1), dueDate: '2026-10-01' });
+      facilityCode: 'workcenter', qty: 700, expectVersion: v(t1), dueDate: '2099-10-01' });
     const t2 = mk('cp-2', 9291, 140);
     const b = C.startConsignment({ taskId: t2, batchId: B.listBatchesOfTask(db, t2)[0].id,
       facilityCode: 'rashinban', qty: 140, expectVersion: v(t2) });
@@ -7395,7 +7395,7 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
     const ra = rowOf(plan, a.consignment.id);
     ok(ra.boxes === 10 && ra.units_per_container === 70, '⭐箱数を出す (700 個 ÷ 70 = 10 箱)');
     ok(ra.qty === 700, '「用意する」の数は渡す予定の数');
-    ok(ra.due_date === '2026-10-01' && ra.overdue === false, '返却の期限も出す');
+    ok(ra.due_date === '2099-10-01' && ra.overdue === false, '返却の期限も出す');
 
     // ⭐数はその段で意味のあるものを出す (1 つで通さない — §AB-7)
     const c2 = C.getConsignment(c.consignment.id);
@@ -8822,6 +8822,28 @@ console.log('\n[資材 2 つ] 🧰 小分けの袋も登録できる (2026-10-01
     ok(/読み込めませんでした/.test(conflict.els.mvMsg.textContent),
       '🚨競合のあと最新を取り直せなかったら「最新にしました」と言わない (古い内容で送り直させない)');
   }
+}
+
+console.log('\n[ボード] 📥 入荷から何日たったか (2026-10-07 中原さん:「〇日前入荷みたいな感じ」)');
+{
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  const src = html.match(/function arrivalAgo\(ymd\) \{[\s\S]*?\r?\n\}/)[0];
+  const fmtMd = new Function(html.match(/function fmtMd\(ymd\) \{[\s\S]*?\r?\n\}/)[0] + '; return fmtMd;')();
+  // 今日 (JST) = 2026-10-07 に固定して動かす。端末の時計ではなくサーバーに合わせた nowMs() を使う
+  const mkAgo = (ms) => new Function('nowMs', 'fmtMd', src + '; return arrivalAgo;')(() => ms, fmtMd);
+  const ago = mkAgo(Date.parse('2026-10-07T12:00:00+09:00'));
+  ok(mkAgo(Date.parse('2026-10-07T00:05:00+09:00'))('2026-10-06') === '昨日入荷'
+    && mkAgo(Date.parse('2026-10-06T23:55:00+09:00'))('2026-10-06') === '今日入荷',
+    '⭐JST の 0 時で日が替わる (UTC の日付で数えない)');
+  ok(!/jstYmd|Date\.now\(\)/.test(src), '⭐端末の時計 (Date.now) ではなく nowMs() で今日を決める (Codex #1647 R1)');
+  ok(ago('2026-10-07') === '今日入荷', '今日の入荷は「今日入荷」');
+  ok(ago('2026-10-06') === '昨日入荷', '前の日は「昨日入荷」');
+  ok(ago('2026-10-02') === '5日前入荷', '5 日前は「5日前入荷」');
+  ok(ago('2026-09-07') === '30日前入荷', '月をまたいでも日数で数える');
+  ok(ago('2026-10-09') === '入荷 10/9', '先の日付 (入荷予定のずれ) はマイナスの日数にせず日付で');
+  ok(ago('不明') === '入荷 不明' && ago('') === '' && ago(null) === '', '日付でなければそのまま・空なら出さない');
+  ok(/c\.arrival \? '📥 ' \+ arrivalAgo\(c\.arrival\) : null,/.test(html.match(/function bcardHtml\(c, status\) \{[\s\S]*?\r?\n\}/)[0]),
+    'ボードのカードに入荷から何日かを出す');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
