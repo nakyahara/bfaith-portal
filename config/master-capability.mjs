@@ -32,7 +32,7 @@ export const MASTER_OWNER_PROTOCOL = 2;
 
 /**
  * このコードが company として扱えるキー (2026-10-05 の切替で active にした 13 キー + skus.sku_kind)。
- *   skus.sku_kind = #1641 (夜間ロードの守り・正規化・写しの 9 升・照合 ② の区分の分類とゲートの数)。configured (config/master-ownership.mjs) は 'load' のまま
+ *   skus.sku_kind = #1641 (夜間ロードの守り・正規化・写しの 9 升・照合 ② の区分の分類とゲートの数)。configured (config/master-ownership.mjs) も 'company' (10/7・手順の 2。active に入るのは widen の後)
  * 🚨 load のままのキー (products.parent・sku_components・listing_components.amazon・suppliers.* の 4 つ) は、それぞれ扱いの PR で足す
  */
 export const COMPANY_CAPABLE = Object.freeze([

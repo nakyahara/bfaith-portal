@@ -12,14 +12,20 @@
  * 🚨 ここは configured = **次に prepare する予定** (コードに書いた「こうしたい」) だけ。持ち主の正は DB の epoch (active)。
  *    このコードが company として扱えるキー (capable) と持ち主の読み方の版 (protocol) は config/master-capability.mjs (広げる道 PR-0)。
  *    configured の company は capable の中だけ (試験 apps/company-db/test-master-capability.mjs・prepare も断る)。
- *    これを変えてデプロイしても夜間ロード・写し・古い入口の門は変わらない
- *    (夜間ロード・写しは Company DB の epoch = ops.master_ownership_state の active を、古い入口の門は active ∪ prepared を見る。apps/company-db/load/ownership-state.mjs)。
+ *    これを変えてデプロイしても夜間ロード・写し・古い入口の門・画面の保存は変わらない
+ *    (夜間ロード・写しは Company DB の epoch = ops.master_ownership_state の active を、古い入口の門は active ∪ prepared を見る。apps/company-db/load/ownership-state.mjs。
+ *     画面の保存・新商品・NE 登録の CSV・Amazon は広げる道 PR-2 (#1640・protocol 2) から書く取引の中で DB の active を読む = lib/master-owner-gate.mjs)。
+ *    configured を使うのは prepare / prepare --widen (master-ownership-epoch.mjs) が記録する持ち主表と、証跡に出すハッシュ (configured_hash) だけ。
  *    切替の日に人が readiness → prepare → frozen → 書きかけ 0 → 最後の active (全部 load) のロード (prepare をまたいだ古い書き込みの回収) → そのロードの run_id の report の成功 + 照合 ② →
  *    --use-prepared のロード → 写し・確かめ → activate で active にする (AI_reference 17 §4.2 の表が正・#1610)。
- * 🆕 2026-10-05 の切替 (中原さんの決定 10/4・10 §13) で C にする 13 キー = 下の 'company'。写せない・手当ての PR が無い列 (products.parent・skus.sku_kind・
- *    sku_components・listing_components.amazon・suppliers の 5 つ) は 'load' のまま (⑦-2・④b の後)
- * 🆕 2026-10-06 skus.sku_kind は 'company' にしたときの準備だけ済み (値は 'load' のまま。🚨 ここだけ書き換えて配らない = 画面は配ったコードの持ち主表を DB の記録と照らす):
- *    夜間ロード = 既にある SKU の区分を NE に合わせない・NE と区分が違う SKU は conflicts (sku_kind_held)・判断の記録 (decisions.skus.kind_held) に残し、
+ * 🆕 2026-10-05 の切替 (中原さんの決定 10/4・10 §13) で C にした 13 キー = 下の 'company' (skus.sku_kind を除く)。写せない・手当ての PR が無い列 (products.parent・
+ *    sku_components・listing_components.amazon・suppliers の 4 つ) は 'load' のまま (⑦-2・④b の後)
+ * 🆕 2026-10-07 skus.sku_kind = 'company' (広げる道の手順の 1 = configured。中原さんの決定 10/6)。扱いのコードは #1641 (capable)・DB は 0058・画面と門は #1640 で配り済み。
+ *    これを Render と miniPC の両方に配ってから `master-ownership-epoch.mjs prepare --widen --company 1` (足すキー = configured の company − active = skus.sku_kind だけ)
+ *    → … → widen で DB の active に入った時に初めて切り替わる。配ってから widen までの間は DB の active (sku_kind = load) のまま = 今までの動き
+ *    (以前の「ここだけ書き換えて配らない」は protocol 1 の画面が配った config を DB の記録と照らしていた頃の注意。protocol 2 では当てはまらない)。
+ *    company になったときの動き:
+ *    夜間ロード =既にある SKU の区分を NE に合わせない・NE と区分が違う SKU は conflicts (sku_kind_held)・判断の記録 (decisions.skus.kind_held) に残し、
  *    商品の行・束ねの親・セットの構成・構成の観測は社内の区分で決める・区分の最終形の正規化 (load でも) /
  *    写し = 区分も m_products.商品区分 に写す (C 単品・NE セット = 単品として・ほかの食い違い = 前の行のまま。master-publish.js の PUBLISH_COLUMNS.kind) /
  *    照合 ② = 区分の差を判断の一覧に (company_owned・NE は NE の画面で)・生の区分差の数 (sku_kind_raw_mismatch)
@@ -56,7 +62,7 @@ export const MASTER_OWNERSHIP = Object.freeze({
   'products.parent': 'load',          // 代表関係 (親子 = 色違い・サイズ違いの名札)。'company' なら夜間ロードは名札を作らず、親を付けない・変えない・外さない (D3)
   // SKU (core.skus)
   'skus.name': 'company',
-  'skus.sku_kind': 'load',
+  'skus.sku_kind': 'company',            // 区分 (単品 / セット / 例外)。広げる道 (prepare --widen → widen) で DB の active に入れる。'company' なら夜間ロードは既にある SKU の区分を NE に合わせない
   'skus.tax_rate': 'company',
   'skus.tax_class': 'company',
   'skus.handling': 'company',
