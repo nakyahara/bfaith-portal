@@ -15,7 +15,9 @@
  *    これを変えてデプロイしても夜間ロード・写し・古い入口の門・画面の保存は変わらない
  *    (夜間ロード・写しは Company DB の epoch = ops.master_ownership_state の active を、古い入口の門は active ∪ prepared を見る。apps/company-db/load/ownership-state.mjs。
  *     画面の保存・新商品・NE 登録の CSV・Amazon は広げる道 PR-2 (#1640・protocol 2) から書く取引の中で DB の active を読む = lib/master-owner-gate.mjs)。
- *    configured を使うのは prepare / prepare --widen (master-ownership-epoch.mjs) が記録する持ち主表と、証跡に出すハッシュ (configured_hash) だけ。
+ *    configured を読むのは prepare / prepare --widen (master-ownership-epoch.mjs) が記録する持ち主表と、証跡に出すハッシュ (configured_hash)。
+ *    🚨 ただしこのファイルは夜間ロードの規則の指紋 (engine.mjs の LOAD_RULE_FILES) に入る = 変えると夜間ロードの記録・照合 ①・widen の試みの指紋が変わる。
+ *    夜間ロード (Render) とその朝の照合 ① (miniPC) は同じ build でなければならない = 朝の照合の後〜次の夜間ロードの前に両方へ配り、build と configured_hash を両方で確かめる (revert も同じ・Codex #1646 R1)。
  *    切替の日に人が readiness → prepare → frozen → 書きかけ 0 → 最後の active (全部 load) のロード (prepare をまたいだ古い書き込みの回収) → そのロードの run_id の report の成功 + 照合 ② →
  *    --use-prepared のロード → 写し・確かめ → activate で active にする (AI_reference 17 §4.2 の表が正・#1610)。
  * 🆕 2026-10-05 の切替 (中原さんの決定 10/4・10 §13) で C にした 13 キー = 下の 'company' (skus.sku_kind を除く)。写せない・手当ての PR が無い列 (products.parent・
