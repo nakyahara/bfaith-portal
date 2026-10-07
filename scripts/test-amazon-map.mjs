@@ -32,6 +32,10 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import express from 'express';
 import Database from 'better-sqlite3';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS);
 
 const { PGlite } = await import('@electric-sql/pglite');
 const { applyMigrations, pgliteAdapter } = await import('./company-db/migrate.mjs');
@@ -46,7 +50,7 @@ const M = await import('../lib/amazon-map-migrate.mjs');
 const K = await import('../lib/sku-map-canonical.js');
 const CLI = await import('./company-db/amazon-map-migrate.mjs');
 const { MasterWriteError } = await import('../lib/master-write.mjs');
-const { default: router, __setPgClientFactory, __setClock, __setOwnership, __setAmazonChannelsProvider } = await import('../apps/master-edit/router.mjs');
+const { default: router, __setPgClientFactory, __setClock, __setAmazonChannelsProvider } = await import('../apps/master-edit/router.mjs');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -224,6 +228,7 @@ await ta('[1] 0054 は ⑤-1・⑤-2a・⑤-2b (0053) の物を全部残す: 書
 const E = await setupDb();
 await createRoles(E.pg, { watcherPw: 'a', writerPw: 'b' });
 await createMasterEditRoles(E.pg, {});
+await W2.useReal0058(E.pg);   // 広げる道 PR-2: 本物の 0058 (PR-1) の上 (許可なし = 本番の今)
 await load(E.db);
 const { pg, db } = E;
 const q = async (sql, params) => (await db.query(sql, params)).rows;
@@ -272,7 +277,9 @@ assert.equal((await q('select phase from ops.master_cutover_state'))[0].phase, '
 console.log('\n保存');
 await ta('[2] 開いた後でも: MASTER_EDIT_OPEN が無い・持ち主 listing_components.amazon が load・持ち主表が段階の記録と違う = 409', async () => {
   await rejectsWith(save('new_sku1', '名前', [{ code: 'a001', qty: 1 }], { open: false }), 409, 'before_cutover');
-  await rejectsWith(save('new_sku1', '名前', [{ code: 'a001', qty: 1 }], { ownership: { ...ALL_COMPANY, 'listing_components.amazon': 'load' } }), 409, 'before_cutover');
+  // 広げる道 PR-2: 持ち主は DB の active (配った config ではない)。active だけ Amazon を load にした = 段階の記録と違う = 409
+  await W2.setActiveMapOnly(pg, { ...ALL_COMPANY, 'listing_components.amazon': 'load' });
+  try { await rejectsWith(save('new_sku1', '名前', [{ code: 'a001', qty: 1 }]), 409, 'before_cutover'); } finally { await W2.setActiveMapOnly(pg, ALL_COMPANY); }
   // 関数を直接: 持ち主表のハッシュは段階の記録と同じでも、listing_components.amazon が load なら断る (持ち主表の違い = ハッシュが違う = 先に断る)
   const e = await errOf(callFn('save_amazon_sku_map', [uuid(), 'naka@test', null, JSON.stringify({ ...ALL_COMPANY, 'listing_components.amazon': 'load' }), 'a'.repeat(64),
     JSON.stringify({ seller_sku: 'new_sku1', name: 'x', components: [{ sku_id: await skuIdOf('a001'), code: 'a001', qty: 1 }], versions: { listing: null, map: null } })]));
@@ -285,6 +292,7 @@ await ta('[2] ⑤ だけ切り替えて Amazon SKU の持ち主は load のま�
   const E4 = await setupDb();
   await createRoles(E4.pg, { watcherPw: 'a', writerPw: 'b' });
   await createMasterEditRoles(E4.pg, {});
+  await W2.useReal0058(E4.pg);   // 広げる道 PR-2: 本物の 0058 (PR-1) の上 (許可なし = 本番の今)
   await load(E4.db);
   await openCutover(E4, OWN);
   const v = (await A.readAmazonMap(E4.db, 'pr_a001')).versions;
@@ -641,6 +649,7 @@ await ta('[6] 消えた対応 (Codex #1586 R1 High の手当て): 持ち主が t
   const E5 = await setupDb();
   await createRoles(E5.pg, { watcherPw: 'a', writerPw: 'b' });
   await createMasterEditRoles(E5.pg, {});
+  await W2.useReal0058(E5.pg);   // 広げる道 PR-2: 本物の 0058 (PR-1) の上 (許可なし = 本番の今)
   await load(E5.db);
   await openCutover(E5, ALL_COMPANY);
   const v0 = (await A.readAmazonMap(E5.db, 'a004')).versions;
@@ -759,6 +768,7 @@ await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ�
   const E3 = await setupDb();
   await createRoles(E3.pg, { watcherPw: 'a', writerPw: 'b' });
   await createMasterEditRoles(E3.pg, {});
+  await W2.useReal0058(E3.pg);   // 広げる道 PR-2: 本物の 0058 (PR-1) の上 (許可なし = 本番の今)
   await load(E3.db);
   const file = path.join(tmp, 'legacy-apply.db');
   makeLegacy(file, CLEAN_MASTERS, CLEAN_COMPS);
@@ -815,7 +825,7 @@ __setPgClientFactory(async (url) => {
   return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); }, on: () => {} };
 });
 __setClock(() => new Date('2030-01-10T03:00:00Z').getTime());
-__setOwnership(ALL_COMPANY);
+// 持ち主表 = DB の active (広げる道 PR-2)
 __setAmazonChannelsProvider(async () => new Map([['pr_a001', 'FBA'], ['a003', 'FBM'], ['zz_sold', 'FBA'], ['zz_fbm', 'FBM']]));
 const app = express();
 app.set('view engine', 'ejs');
@@ -936,10 +946,11 @@ await ta('[12] 保存・削除の API: 名簿の人だけ・Origin が要る・�
   const page = await call('GET', '/amazon/sku?sku=pr_pack2');
   assert.ok(page.text.includes('いまは保存できません'));
   process.env.MASTER_EDIT_OPEN = '1';
-  __setOwnership({ ...ALL_COMPANY, 'listing_components.amazon': 'load' });
-  const page2 = await call('GET', '/amazon/');   // 持ち主表が段階の記録と違う = 閉じている (帯)
-  assert.ok(page2.text.includes('いまは保存できません'));
-  __setOwnership(ALL_COMPANY);
+  await W2.setActiveMapOnly(pg, { ...ALL_COMPANY, 'listing_components.amazon': 'load' });   // 広げる道 PR-2: DB の active が段階の記録と違う = 閉じている (帯)
+  try {
+    const page2 = await call('GET', '/amazon/');
+    assert.ok(page2.text.includes('いまは保存できません'));
+  } finally { await W2.setActiveMapOnly(pg, ALL_COMPANY); }
 });
 
 await ta('[12] 未登録 (M11): 直近 7 日の Amazon の注文で構成が無い SKU・FBA / FBM で分ける・売上の公開が欠けた日は「未判定」', async () => {

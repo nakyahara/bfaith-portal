@@ -23,6 +23,10 @@ import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.m
 import { createMasterEditRoles } from './company-db/create-master-edit-roles.mjs';
 import { runInitialLoad } from '../apps/company-db/load/engine.mjs';
 import { OWNED_COLUMNS as OWNED_COLUMNS_FOR_BASE } from '../config/master-ownership.mjs';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS);
 // 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
 const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries(OWNED_COLUMNS_FOR_BASE.map((k) => [k, 'load'])));
 
@@ -99,6 +103,7 @@ try {
   });
 
   await createMasterEditRoles(O, { pw: PW });
+  await W2.useReal0058(O);   // 広げる道 PR-2: 本物の 0058 (PR-1) の上 (許可なし = 本番の今)
   const [EA, EB, GR, GM, P, O2] = [await open('master_edit'), await open('master_edit'), await open('master_gate_render'), await open('master_gate_minipc'), await open('master_ops'), await open(null)];
   clients.push(EA, EB, GR, GM, P, O2);
   const [dbA, dbB, dbP] = [EA, EB, P].map(pgAdapter);

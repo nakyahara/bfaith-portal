@@ -364,6 +364,7 @@ const fakeGateDb = ({ hasFn = true, reply = null, calls = [] } = {}) => async ()
     query: async (sql, params) => {
       calls.push({ sql, params });
       if (/to_regprocedure/.test(sql)) return { rows: [{ ok: hasFn }] };
+      if (/to_regclass\('ops\.master_ownership_state'\)/.test(sql)) return { rows: [{ ok: false }] };   // 広げる道 PR-2: 記録の持ち主 = DB の active (表が無い = 全部 load)
       if (/legacy_manifest_hash/.test(sql)) return { rows: [{ h: 'f'.repeat(64) }] };
       if (/record_legacy_gate_ack/.test(sql)) return { rows: [{ r: reply || { ack_id: 7, manifest_hash: 'f'.repeat(64), acked_at: '2026-10-01T00:00:00Z', stopped: params[8] === true } }] };
       throw new Error(`知らない SQL: ${sql}`);
@@ -394,6 +395,50 @@ await t('門の記録: 書く前に確かめる (場所・build の番号・段�
     assert.equal(logs.find((x) => /no_function/.test(x[1]))[0], 'warn');
   } finally { console.warn = w; console.error = e; console.log = l; fs.rmSync(noGit, { recursive: true, force: true }); }
 });
+await t('広げる道 PR-2: 門の記録の 2 版 (PR-1 の 0058 の ops.record_legacy_gate_ack_v2) があればそれで書く = 見た active / prepared のハッシュ・このコードの能力。stale_ownership = 読み直して 1 回だけ', async () => {
+  const OGv = await import('../lib/master-owner-gate.mjs');
+  const { COMPANY_CAPABLE } = await import('../config/master-capability.mjs');
+  const prepMap = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, k === 'skus.sku_kind' || COMPANY_CAPABLE.includes(k) ? 'company' : 'load']));
+  const actMap = { ...(await import('../config/master-ownership.mjs')).MASTER_OWNERSHIP };   // 今の本番の active = configured の 13 キー (COMPANY_CAPABLE は #1641 で 14 キー = 使わない)
+  assert.notEqual(ownershipHash(actMap), ownershipHash(prepMap), 'active (13) と prepared (+ sku_kind) は違う');
+  const calls = [];
+  let staleOnce = true;
+  const v2Db = () => async () => ({
+    db: {
+      query: async (sql, params) => {
+        calls.push({ sql, params });
+        if (/is not null as v2/.test(sql)) return { rows: [{ v2: true }] };
+        if (/to_regprocedure/.test(sql)) return { rows: [{ ok: true }] };
+        if (/to_regclass\('ops\.master_ownership_state'\)/.test(sql)) return { rows: [{ ok: true }] };
+        if (/from ops\.master_ownership_state/.test(sql)) return { rows: [{ active_hash: ownershipHash(actMap), active_map: actMap, activated_at: 'x', activated_by: 't', prepared_hash: ownershipHash(prepMap), prepared_map: prepMap, prepared_at: 'y', prepared_by: 't' }] };
+        if (/legacy_manifest_hash/.test(sql)) return { rows: [{ h: 'f'.repeat(64) }] };
+        if (/record_legacy_gate_ack_v2\(/.test(sql)) {
+          if (staleOnce) { staleOnce = false; throw Object.assign(new Error('stale_ownership: 見た持ち主が今と違う'), { code: 'P0001' }); }
+          return { rows: [{ r: { ack_id: 11, manifest_hash: 'f'.repeat(64), acked_at: 'x', stopped: params[11] === true } }] };
+        }
+        if (/record_legacy_gate_ack\(/.test(sql)) throw new Error('1 版で書いた (2 版があるのに)');
+        throw new Error(`知らない SQL: ${sql}`);
+      },
+    },
+    close: async () => {},
+  });
+  G.__resetLegacyAck(); setPhase('new_open');
+  OGv.__setCapableForTest(null);
+  try {
+    const r = await G.ackLegacyGates({ host: 'render', connect: v2Db(), env: { RENDER_GIT_COMMIT: 'a'.repeat(40), RENDER_INSTANCE_ID: 'srv-2' } });
+    assert.equal(r.state, 'acked', r.detail);
+  } finally { G.__resetLegacyAck(); setPhase('legacy_open'); }
+  const v2 = calls.filter((c) => /record_legacy_gate_ack_v2\(/.test(c.sql));
+  assert.equal(v2.length, 2, 'stale_ownership の後に 1 回だけ書き直す');
+  const [host, , build, , owner, phase, , , activeSeen, preparedSeen, capable, stopped, reason] = v2[1].params;
+  assert.equal(v2[1].params.length, 13);
+  assert.deepEqual([host, build, phase, stopped, reason], ['render', 'a'.repeat(40), 'new_open', false, null]);
+  assert.equal(owner, ownershipHash(actMap)); assert.equal(activeSeen, ownershipHash(actMap));
+  assert.equal(preparedSeen, ownershipHash(prepMap));
+  assert.deepEqual(capable, [...COMPANY_CAPABLE]);
+  assert.equal(calls.filter((c) => /from ops\.master_ownership_state/.test(c.sql)).length, 2, '書き直す前に持ち主を読み直す');
+});
+
 await t('門の記録: ⑤-1 の関数に場所・名札・build・manifest・持ち主表・見た段階・書きかけを渡し、返事 (ack_id・manifest_hash が DB の計算と同じ・acked_at) を確かめてから「書けた」', async () => {
   const calls = [];
   const end = G.beginLegacyWrite('warehouse:POST:/api/shipping');
@@ -408,7 +453,12 @@ await t('門の記録: ⑤-1 の関数に場所・名札・build・manifest・�
   const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
   assert.equal(host, 'render'); assert.match(inst, /^srv-1:\d+:[0-9a-f]{8}$/); assert.equal(build, 'a'.repeat(40));
   assert.deepEqual(JSON.parse(manifest), G.legacyManifest());
-  assert.equal(owner, ownershipHash(MASTER_OWNERSHIP)); assert.equal(phase, 'legacy_open');
+  // 広げる道 PR-2: 記録の持ち主表 = DB の active (この偽の DB は表が無い = 全部 load)。配った config (13 キー) ではない
+  assert.equal(owner, ownershipHash(Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'load'])))); assert.notEqual(owner, ownershipHash(MASTER_OWNERSHIP)); assert.equal(phase, 'legacy_open');
+  assert.equal(G.legacyAckState().owner_hash, owner);
+  const fp = await G.legacyGateFingerprint();
+  assert.equal(fp.owner_hash, owner); assert.equal(fp.configured_hash, ownershipHash(MASTER_OWNERSHIP));
+  assert.ok(Number.isSafeInteger(fp.protocol) && /^[0-9a-f]{64}$/.test(fp.capable_hash));
   assert.equal(n, 1); assert.ok(oldest); assert.equal(stopped, false); assert.equal(reason, null);
   // 返事が違う = 「書けた」にしない
   await quiet(async () => {
@@ -470,6 +520,7 @@ await t('Codex #1565 R3 Medium: 止めるときの競り合い = (1) 段階を�
     db: {
       query: async (sql, params) => {
         if (/to_regprocedure/.test(sql)) return { rows: [{ ok: true }] };
+        if (/to_regclass\('ops\.master_ownership_state'\)/.test(sql)) return { rows: [{ ok: false }] };   // 広げる道 PR-2: 記録の持ち主 = DB の active (表が無い = 全部 load)
         if (/legacy_manifest_hash/.test(sql)) return { rows: [{ h: 'f'.repeat(64) }] };
         if (/record_legacy_gate_ack/.test(sql)) { order.push(params[8] === true ? 'stopped' : 'normal'); return { rows: [{ r: { ack_id: 1, manifest_hash: 'f'.repeat(64), acked_at: 'x', stopped: params[8] === true } }] }; }
         throw new Error(sql);
@@ -682,6 +733,7 @@ await t('Codex #1565 R2 Medium 3: 止めるとき = 記録の書き直しをや�
     db: {
       query: async (sql, params) => {
         if (/to_regprocedure/.test(sql)) return { rows: [{ ok: true }] };
+        if (/to_regclass\('ops\.master_ownership_state'\)/.test(sql)) return { rows: [{ ok: false }] };   // 広げる道 PR-2: 記録の持ち主 = DB の active (表が無い = 全部 load)
         if (/legacy_manifest_hash/.test(sql)) return { rows: [{ h: 'f'.repeat(64) }] };
         if (/record_legacy_gate_ack/.test(sql)) {
           const st = params[8] === true;
@@ -1633,13 +1685,28 @@ await t('E7: product-hub の /new の出し方 (newEntryGate・MASTER_EDIT_OPEN 
   const O = await import('../lib/product-hub-outbox.mjs');
   const allC = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'company']));
   let cdbPhase = 'new_open';
-  O.__setCompanyDbClientFactory(async () => ({ query: async (q) => (/master_cutover_state/.test(q) ? { rows: [{ phase: cdbPhase, owner_hash: ownershipHash(allC), changed_at: 'x', changed_by: 'x' }] } : { rows: [] }), end: async () => {}, on: () => {} }));
-  O.__setGateOwnership(allC);
+  // 広げる道 PR-2: 持ち主表は配った config ではなく、同じ接続で読む DB の active (ops.master_ownership_active_map())
+  let cdbActive = allC;
+  O.__setCompanyDbClientFactory(async () => ({ query: async (q) => (/master_cutover_state/.test(q) ? { rows: [{ phase: cdbPhase, owner_hash: ownershipHash(allC), changed_at: 'x', changed_by: 'x' }] }
+    : /master_ownership_active_map/.test(q) ? (cdbActive === 'unreadable' ? Promise.reject(Object.assign(new Error('permission denied for function master_ownership_active_map'), { code: '42501' })) : { rows: [{ m: cdbActive }] })
+      : { rows: [] }), end: async () => {}, on: () => {} }));
+  const OGx = await import('../lib/master-owner-gate.mjs');
+  OGx.__setCapableForTest(OWNED_COLUMNS);   // 試験の DB は全部の列が C = このコードの能力も全部 (code_behind は下で戻して確かめる)
   const saved = [process.env.MASTER_EDIT_OPEN, process.env.COMPANY_DB_MASTER_EDIT_URL];
   process.env.MASTER_EDIT_OPEN = '1'; process.env.COMPANY_DB_MASTER_EDIT_URL = 'postgres://fake@127.0.0.1:1/x';
   try {
     setOwnerPhase('new_open', [...OWNED_COLUMNS]); G.__resetLegacyGate();
     assert.equal((await O.newEntryGate()).mode, 'guide', '全部 C = 案内');
+    // DB の active を読めない (PR-1 の実行権の前) / 段階の記録と違う / このコードが扱えない C のキー (本番の能力) = 止めている (案内しない)
+    cdbActive = 'unreadable';
+    assert.equal((await quiet(() => O.newEntryGate())).mode, 'paused', 'DB の active を読めない = 止めている');
+    cdbActive = { ...allC, 'skus.name': 'load' };
+    assert.equal((await O.newEntryGate()).mode, 'paused', 'DB の active が段階の記録と違う = 止めている');
+    cdbActive = allC;
+    OGx.__setCapableForTest((await import('../config/master-capability.mjs')).COMPANY_CAPABLE.filter((k) => k !== 'skus.sku_kind'));   // 旧 build (13 キー)。今の COMPANY_CAPABLE は #1641 で skus.sku_kind を含む = 明示して外す (Codex #1640 R6)
+    const cb = await O.newEntryGate();
+    assert.deepEqual([cb.mode, /code_behind: .*skus.sku_kind/.test(cb.error)], ['paused', true], JSON.stringify(cb));
+    OGx.__setCapableForTest(OWNED_COLUMNS);
     setOwnerPhase('new_open', CUT13); G.__resetLegacyGate();
     assert.equal((await O.newEntryGate()).mode, 'legacy', '13 キー = 新しい登録では作れない = 今までの画面');
     let page = await call('GET', '/apps/product-hub/new');
@@ -1656,7 +1723,7 @@ await t('E7: product-hub の /new の出し方 (newEntryGate・MASTER_EDIT_OPEN 
   } finally {
     if (saved[0] === undefined) delete process.env.MASTER_EDIT_OPEN; else process.env.MASTER_EDIT_OPEN = saved[0];
     if (saved[1] === undefined) delete process.env.COMPANY_DB_MASTER_EDIT_URL; else process.env.COMPANY_DB_MASTER_EDIT_URL = saved[1];
-    O.__setCompanyDbClientFactory(null); O.__setGateOwnership(null);
+    O.__setCompanyDbClientFactory(null); OGx.__setCapableForTest(null);
     setPhase('legacy_open'); G.__resetLegacyGate();
   }
 });

@@ -25,9 +25,10 @@ import { OWNED_COLUMNS, MASTER_OWNERSHIP } from './master-ownership.mjs';
 /** 持ち主の読み方の版の説明 (版 → 何ができるコードか)。🚨 足すだけ (前の版の意味を変えない) */
 export const PROTOCOL_HISTORY = Object.freeze({
   1: '画面・新商品・NE 登録の CSV・Amazon・product-hub の案内は、配った config の持ち主表を DB の active と段階の記録に照らす (違えば 409)。古い入口の門は DB の active ∪ prepared',
+  2: '広げる道 PR-2: 書く取引の中で DB の active を読んで持ち主表にする (配った config は見ない)・capable の外の C のキー = 409 code_behind・読めない = 503・新規開始は DB の開放の許可 (ops.new_entry_lease_valid) と非常の止め・門の記録の持ち主表 = DB の active',
 });
 /** このコードの持ち主の読み方の版 */
-export const MASTER_OWNER_PROTOCOL = 1;
+export const MASTER_OWNER_PROTOCOL = 2;
 
 /**
  * このコードが company として扱えるキー (2026-10-05 の切替で active にした 13 キー + skus.sku_kind)。

@@ -40,6 +40,11 @@ import fs from 'node:fs';
 import http from 'node:http';
 import vm from 'node:vm';
 import express from 'express';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+const OWNED_COLUMNS_ALL = (await import('../config/master-ownership.mjs')).OWNED_COLUMNS;
+OG.__setCapableForTest(OWNED_COLUMNS_ALL);
 
 const { PGlite } = await import('@electric-sql/pglite');
 const { applyMigrations, pgliteAdapter } = await import('./company-db/migrate.mjs');
@@ -53,7 +58,7 @@ const C = await import('../lib/master-cutover.mjs');
 // 0055 (④a): company_owner・new_open に進むのは持ち主の epoch が active で段階の持ち主表と同じときだけ = 進める直前に試験で置く
 const EPOCH = (await import('./fixtures/master-epoch.mjs')).epochSeeder();
 const R = await import('../apps/master-edit/read.mjs');
-const { default: router, __setPgClientFactory, __setClock, __setOwnership, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
+const { default: router, __setPgClientFactory, __setClock, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -138,6 +143,7 @@ async function setupDb() {
   await applyMigrations(db, { log: quiet });
   await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
   await createMasterEditRoles(pg, {});
+  await W2.useReal0058(pg);   // 広げる道 PR-2: 本物の 0058 (PR-1) の上 (許可なし = 本番の今)
   const r = await runInitialLoad(db, makePlan(), { log: quiet, runId: 'load_setup', ownership: MASTER_OWNERSHIP, now: LOAD_NOW });
   assert.equal(r.ok, true, r.error);
   await pg.query("update core.suppliers set active = false where code = '0003'");
@@ -462,9 +468,11 @@ await ta('[2] 場所が足りない・古い記録だけ = 拒む → そろえ�
   assert.deepEqual([s.phase, s.owner_hash], ['new_open', h]);
   assert.equal(C.newEntryWritable(s, ALL_COMPANY), true);
   assert.equal(C.newEntryWritable(s, MASTER_OWNERSHIP), false);
-  // 動いているコードの持ち主表が記録と違う = 保存しない (今の本番の持ち主表 = 全部 load のまま動かした)
-  const e = await rejectsWith(save('s001', { name: '直した名前' }, { ownership: MASTER_OWNERSHIP }), 409, 'before_cutover');
+  // DB の active が段階の記録と違う = 保存しない (広げる道 PR-2: 画面は配った config ではなく DB の active を読む = active を全部 load にして確かめる)
+  await W2.setActiveMapOnly(pg, MASTER_OWNERSHIP);
+  const e = await rejectsWith(save('s001', { name: '直した名前' }), 409, 'before_cutover');
   assert.match(e.message, /持ち主表が切替のときの記録と違う/);
+  await W2.setActiveMapOnly(pg, ALL_COMPANY);
   const e2 = await rejectsWith(save('s001', { name: '直した名前' }, { open: false }), 409, 'before_cutover');
   assert.match(e2.message, /保存はまだ開いていません/);
   assert.equal((await skuRow('s001')).name, '単品 1');
@@ -1417,8 +1425,7 @@ const pgFactory = async (url) => {
 };
 __setPgClientFactory(pgFactory);
 __setClock(() => NOW.getTime());
-__setOwnership(ALL_COMPANY);
-__setShippingRatesProvider(async () => RATES);
+__setShippingRatesProvider(async () => RATES);   // 持ち主表 = DB の active (広げる道 PR-2・openCutover が ALL_COMPANY にした)
 const app = express();
 app.set('view engine', 'ejs');
 app.use((req, res, next) => {
@@ -1729,13 +1736,67 @@ await ta('[15] 保存を開いていない (MASTER_EDIT_OPEN なし / 持ち主�
   const body = { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { name: 'x' } };
   assert.deepEqual([(await call('POST', '/api/sku/s001', { body })).status], [409]);
   process.env.MASTER_EDIT_OPEN = '1';
-  __setOwnership(null);   // 本番の持ち主表 (全部 load) = 切替のときの記録と違う
+  // 広げる道 PR-2: DB の active (全部 load) が段階の記録 (ALL_COMPANY) と違う = 閉じる (配った config は見ない)
+  await W2.setActiveMapOnly(pg, MASTER_OWNERSHIP);
   r = await call('GET', '/sku/s001');
   assert.match(r.text, /いまは保存できません \(持ち主表が切替のときの記録と違う\)/); assert.match(r.text, /data-can-save="0"/);
   const res2 = await call('POST', '/api/sku/s001', { body: { ...body, request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) } } });
   assert.deepEqual([res2.status, res2.j.reason], [409, 'before_cutover']);
-  __setOwnership(ALL_COMPANY);
+  await W2.setActiveMapOnly(pg, ALL_COMPANY);
   assert.ok(!/いまは保存できません/.test((await call('GET', '/sku/s001')).text));
+});
+
+await ta('[15b] 広げる道 PR-2: 保存は配った config ではなく DB の active に従う・code_behind / 読めない = 閉じる・段階の鍵の 55P03 は 1 回だけ取り直す', async () => {
+  const { MASTER_OWNERSHIP: CONFIGURED } = await import('../config/master-ownership.mjs');
+  const { COMPANY_CAPABLE } = await import('../config/master-capability.mjs');
+  // (a) 配った config (13 キー = sku_kind・構成・仕入先は load) と DB の active (ALL_COMPANY) は違う → それでも DB に従って保存できる (config を見ていない)
+  assert.notEqual(C.ownershipHash(CONFIGURED), C.ownershipHash(ALL_COMPANY));
+  let r = await call('GET', '/sku/s002');
+  assert.match(r.text, /data-can-save="1"/);
+  let res = await call('POST', '/api/sku/s002', { body: { request_id: uuid(), seen: { token: tokenIn(r.text), event_id: eventIn(r.text) }, values: { name: '単品 2 (DB に従う)' } } });
+  assert.equal(res.status, 200, JSON.stringify(res.j));
+  assert.equal((await skuRow('s002')).name, '単品 2 (DB に従う)');
+  // (b) このコードの能力 = 旧 build (13 キー = 今の COMPANY_CAPABLE から skus.sku_kind を外す・#1641 の後は COMPANY_CAPABLE が 14 キー) に戻す = DB の active (ALL_COMPANY) に扱えない C のキー = 409 code_behind・画面も閉じる・何も書かない
+  OG.__setCapableForTest(COMPANY_CAPABLE.filter((k) => k !== 'skus.sku_kind'));
+  try {
+    r = await call('GET', '/sku/s002');
+    assert.match(r.text, /いまは保存できません \(このサーバーのプログラムが古い/); assert.match(r.text, /data-can-save="0"/);
+    const before = await nEvents();
+    res = await call('POST', '/api/sku/s002', { body: { request_id: uuid(), seen: { token: await tokenOf('s002'), event_id: await lastEvent() }, values: { name: '古い build' } } });
+    assert.deepEqual([res.status, res.j.reason], [409, 'code_behind'], JSON.stringify(res.j));
+    assert.ok(res.j.code_behind.includes('skus.sku_kind') && res.j.code_behind.includes('sku_components'), JSON.stringify(res.j.code_behind));
+    assert.equal(await nEvents(), before);
+    assert.equal((await skuRow('s002')).name, '単品 2 (DB に従う)');
+  } finally { OG.__setCapableForTest(OWNED_COLUMNS_ALL); }
+  // (c) DB の active を読めない (PR-1 の実行権が無い) = 503 owner_unreadable・画面は閉じる (読めないと書く)・何も書かない
+  await W2.revokeActiveMap(pg);
+  try {
+    r = await call('GET', '/sku/s002');
+    assert.match(r.text, /いまは保存できません \(列ごとの持ち主 \(Company DB の切替の記録\) を読めない\)/); assert.match(r.text, /data-can-save="0"/);
+    res = await call('POST', '/api/sku/s002', { body: { request_id: uuid(), seen: { token: await tokenOf('s002'), event_id: await lastEvent() }, values: { name: '読めない' } } });
+    assert.deepEqual([res.status, res.j.reason], [503, 'owner_unreadable'], JSON.stringify(res.j));
+    assert.equal((await skuRow('s002')).name, '単品 2 (DB に従う)');
+  } finally { await W2.grantActiveMap(pg); }
+  // (d) 段階の鍵の 55P03 = 1 回だけ取り直す (2 回目も 55P03 = 投げる = 409 locked)。取り直しで通れば保存できる
+  const fakeLock = (fails) => {
+    let n = 0;
+    return { query: async (t, p) => {
+      if (/pg_advisory_xact_lock_shared\(hashtext\('ops\.master_cutover'\)\)/.test(t) && n++ < fails) throw Object.assign(new Error('lock timeout'), { code: '55P03' });
+      return pg.query(t, p);
+    } };
+  };
+  await pg.query('set role master_edit');
+  try {
+    await pg.query('begin');
+    const got = await OG.lockCutoverSharedInTx(fakeLock(1));
+    assert.equal(got.attempts, 2);
+    await pg.query('rollback');
+    await pg.query('begin');
+    await assert.rejects(() => OG.lockCutoverSharedInTx(fakeLock(2)), (e) => e.code === '55P03');
+    // 取引は続けられる (savepoint で巻き戻した = 前の鍵・取引はそのまま)
+    assert.equal((await pg.query('select 1 as one')).rows[0].one, 1);
+    await pg.query('rollback');
+  } finally { await pg.query('set role deploy'); }
 });
 
 await ta('[15] 書き込み用の接続 (COMPANY_DB_MASTER_EDIT_URL) が無い = 持ち主のロールで読むだけ・保存のボタンなし・API は 503', async () => {
@@ -1875,6 +1936,7 @@ await ta('[16] FBA (JP) の在庫 (10/5): 読み元 = Company DB の在庫の日
   await pg.query('revoke usage on schema snapshots from master_edit');
   assert.equal(fbaTh((await call('GET', '/?kind=single')).text), '読めない', 'schema の usage が無くても例外にしない');
   await createMasterEditRoles(pg, {});
+  await W2.useReal0058(pg);   // 広げる道 PR-2: 本物の 0058 (PR-1) の上 (許可なし = 本番の今)
   r = await call('GET', '/?kind=single');
   assert.equal(fbaCell(r.text, 's001'), '11', '流し直した = 読める');
 });

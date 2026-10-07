@@ -40,6 +40,10 @@ import crypto from 'node:crypto';
 import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.mjs';
 import { createRoles, urlFor } from './company-db/create-watch-roles.mjs';
 import { createMasterEditRoles, GATE_LOGIN_ROLES } from './company-db/create-master-edit-roles.mjs';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS);
 
 const url = process.env.TEST_PG_URL || '';
 if (!url) { console.log('⏭️ TEST_PG_URL が無い (実 PostgreSQL の門の試験は飛ばす。PGlite と偽の読み方の試験は scripts/test-master-legacy-gate.mjs)'); process.exit(0); }
@@ -294,7 +298,9 @@ try {
     assert.equal((await G.ackLegacyGates({ host: 'minipc', env })).state, 'acked');
     const manifest = G.legacyManifest();
     const mh = await C.manifestHashOf(db, manifest);
-    const oh = C.ownershipHash(MASTER_OWNERSHIP);
+    // 広げる道 PR-2: 記録の持ち主表 = 門のログインで読んだ DB の active (この DB は行が無い = 全部 load)。配った config (13 キー) ではない
+    const oh = G.legacyAckState().owner_hash;
+    assert.match(String(oh), /^[0-9a-f]{64}$/); assert.notEqual(oh, C.ownershipHash(MASTER_OWNERSHIP));
     // 2 日前の記録だけのプロセス (落ちて「止めた」を書けなかった) = 黙っている (年齢では外れない = ⑤-1 #1563 R3)
     await M.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, session_role, acked_at)
       values ('minipc', 'old-pc:1:aaaaaaaa', $1, $2, $3, 'legacy_open', 0, 'master_gate_minipc', clock_timestamp() - interval '2 days')`, ['b'.repeat(40), mh, oh]);
@@ -446,6 +452,7 @@ try {
       assert.equal((await G.checkLegacyGate({ entry: 'warehouse:POST:/api/shipping' })).writable, true);
       // ロールの作りを流し直せば付く (流し直しでパスワードは変えない)
       await createMasterEditRoles(M);
+      await W2.useReal0058(M);   // 広げる道 PR-2: 本物の 0058 (PR-1) の上 (許可なし = 本番の今)
       rd = await (await import('./company-db/master-legacy-readiness.mjs')).checkReadiness({ host: 'minipc', env });
       assert.equal(rd.ok, true, rd.lines.join('\n'));
       assert.ok(rd.lines.some((l) => l.includes('列ごとの持ち主を読める')), rd.lines.join('\n'));
