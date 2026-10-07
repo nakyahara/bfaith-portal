@@ -398,6 +398,14 @@ router.get('/detail/:id', (req, res) => {
   }
   // 利益試算の配送方法の選択肢。画面の選択肢と「どれに合わせるか」を同じ並びから決めるので一度だけ作る
   const neShipChoices = profitShipChoices(listNeShippingOptions(db), neCost?.shippingMethod, neCost?.shippingCost);
+  // 管理画面で人が決めた「NE の配送方法 → 楽天の配送方法グループ」の割当。試算の合わせ先では
+  // これを正にする (推測で上書きしない。宅急便コンパクトのような別サービスの誤判定を防ぐ)
+  const neShipAssigned = (() => {
+    try {
+      return Object.fromEntries(db.prepare('SELECT ne_label, rakuten_group FROM ph_shipping_method_map').all()
+        .filter((r) => r.ne_label && r.rakuten_group).map((r) => [String(r.ne_label).trim(), String(r.rakuten_group)]));
+    } catch (_) { return {}; }   // 表が無くても画面は出す
+  })();
   // 切替で閉じた後 = Company DB の税率だけ (決められない = 試算しない)。閉じる前・段階を読めない (見るだけ) は今までどおり (Yahoo 欄 → NE → 10%)
   const cdbTaxForSim = res.locals.taxMode === 'cdb' ? (res.locals.cdbTax || { ok: false, reason: '読めません' }) : null;
   const simTaxPercent = cdbTaxForSim ? (cdbTaxForSim.ok ? cdbTaxForSim.percent : null) : (() => {
@@ -492,9 +500,9 @@ router.get('/detail/:id', (req, res) => {
     rakutenGroupNeHints: RAKUTEN_GROUP_NE_HINTS,
     // 楽天の配送方法を変えたときに試算をどの NE 配送方法へ合わせるか (2026-10-06)。
     // 画面の選択肢 (neShipChoices) から決めるので、画面に無い配送方法は選ばれない
-    profitShipPicks: profitShipPickByGroup(neShipChoices, RAKUTEN_GROUP_NE_HINTS),
-    // 画面で「楽天の指定に近いもの」に集める候補。自動で選ぶ側と同じ分け方 (運送会社の系統)
-    profitShipNear: profitShipNearByGroup(neShipChoices, RAKUTEN_GROUP_NE_HINTS),
+    profitShipPicks: profitShipPickByGroup(neShipChoices, RAKUTEN_GROUP_NE_HINTS, undefined, neShipAssigned),
+    // 画面で「楽天の指定に近いもの」に集める候補。自動で選ぶ側と同じ分け方 (割当 → サービス)
+    profitShipNear: profitShipNearByGroup(neShipChoices, RAKUTEN_GROUP_NE_HINTS, undefined, neShipAssigned),
     skuAttrGrid, skuExemptions,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,

@@ -2763,6 +2763,33 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     check('🚨 配送方法で試算: NE が「ヤマト(発払い)〜」でも 宅急便 (7/8) の候補になる',
       alias['7']?.method === 'ヤマト(発払い)B2v6' && alias['8']?.method === 'ヤマト(発払い)B2v6',
       JSON.stringify(alias['8']));
+    // 🚨 運送会社が同じでも**サービスが違えば別**。「宅急便コンパクト」は専用箱の別サービスで
+    //    宅急便より安いので、最多でも宅急便の合わせ先にしない (Codex R19 P1)
+    const compact = [
+      { method: '宅急便コンパクト', cost: 450, count: 999 },
+      { method: '宅急便60サイズ', cost: 650, count: 10 },
+    ];
+    const cp = vari.profitShipPickByGroup(compact);
+    check('🚨 配送方法で試算: 宅急便コンパクトは最多でも 宅急便 (7/8) の合わせ先にしない',
+      cp['7']?.method === '宅急便60サイズ' && cp['8']?.method === '宅急便60サイズ'
+      && cp['8']?.candidates === 1, JSON.stringify(cp['8']));
+    check('配送方法で試算: サービスの単位は familyOf + コンパクト等の別サービス',
+      vari.shipServiceOf('宅急便コンパクト') !== vari.shipServiceOf('宅急便60サイズ')
+      && vari.shipServiceOf('ヤマト(発払い)B2v6') === vari.shipServiceOf('宅急便60サイズ')
+      && vari.shipServiceOf('よく分からない便') === null,
+      vari.shipServiceOf('宅急便コンパクト') + ' / ' + vari.shipServiceOf('宅急便60サイズ'));
+    // 🚨 管理画面で人が決めた割当 (ph_shipping_method_map) があればそれが正。推測で上書きしない
+    const assignedPick = vari.profitShipPickByGroup(compact, undefined, undefined, { '宅急便コンパクト': '8' });
+    check('🚨 配送方法で試算: 管理画面の割当があればそれに従う (コンパクトを 8 に割り当てたとき)',
+      assignedPick['8']?.method === '宅急便コンパクト' && assignedPick['8']?.candidates === 2,
+      JSON.stringify(assignedPick['8']));
+    check('🚨 配送方法で試算: 別のグループに割り当てられている便は候補にしない',
+      vari.profitShipPickByGroup(compact, undefined, undefined, { '宅急便60サイズ': '7' })['8'] === undefined,
+      JSON.stringify(vari.profitShipPickByGroup(compact, undefined, undefined, { '宅急便60サイズ': '7' })));
+    check('配送方法で試算: 近いものの一覧も割当とサービスで分かれる',
+      !(vari.profitShipNearByGroup(compact)['8'] || []).includes('宅急便コンパクト')
+      && (vari.profitShipNearByGroup(compact, undefined, undefined, { '宅急便コンパクト': '8' })['8'] || []).includes('宅急便コンパクト'),
+      JSON.stringify(vari.profitShipNearByGroup(compact)['8']));
     // 送料が無い行は画面の選択肢にも無い = 合わせ先にしない (0円で利益を過大に見せない)
     const noCost = vari.profitShipPickByGroup(
       [{ method: '定形なし', cost: null, count: 9 }, { method: '定形あり', cost: 182, count: 1 }], { '1': ['定形'] });
@@ -10567,6 +10594,10 @@ for (const [name, file, data] of renders) {
     (withPicker.match(/\(function initProfitSim\(\)/g) || []).length === 1
     && (withPicker.match(/\(function initProfitShipPicker\(\)/g) || []).length === 1
     && (withPicker.match(/id="profit-ship-select"/g) || []).length === 1);
+  // 🚨 鍵に使う「誰の選択か」は描いた画面が渡す (属性が消えると利用者ごとに分かれなくなる)
+  check('🚨 配送費の試算: 「配送方法で試算」に data-who (誰の選択か) が埋まっている',
+    /id="profit-ship-select"[^>]*data-who="smoke"/.test(withPicker),
+    (withPicker.match(/<select id="profit-ship-select"[\s\S]{0,200}/) || [''])[0]);
   check('配送費の試算: 原価も送料もある商品には「配送方法で試算」と合わせ先が埋まる',
     withPicker.includes('id="profit-ship-select"') && withPicker.includes('配送方法で試算')
     && withPicker.includes('"picks":{'), String(withPicker.length));
@@ -10616,12 +10647,19 @@ for (const [name, file, data] of renders) {
     return el;
   };
   const fakeStore = () => {
-    let raw = null;
-    return { get raw() { return raw; }, getItem: () => raw, setItem: (_k, v) => { raw = v; }, removeItem: () => { raw = null; } };
+    const map = new Map();
+    return {
+      get raw() { const k = [...map.keys()][0]; return k === undefined ? null : map.get(k); },
+      keys: () => [...map.keys()],
+      getItem: (k) => (map.has(k) ? map.get(k) : null),
+      setItem: (k, v) => { map.set(k, v); },
+      removeItem: (k) => { map.delete(k); },
+    };
   };
-  function mount({ options, picks, near, labels, hints, neCurrent, rkValue, store: given, price = '2000', tax = '10', ship = '237', cost = '660' }) {
+  function mount({ options, picks, near, labels, hints, neCurrent, rkValue, store: given, who, price = '2000', tax = '10', ship = '237', cost = '660' }) {
     const sel = fakeEl();
     sel.dataset.current = neCurrent;
+    if (who !== undefined) sel.dataset.who = who;
     const note = fakeEl();
     const holder = fakeEl();
     holder.textContent = JSON.stringify({ options, picks, labels, hints, near });
@@ -10818,6 +10856,33 @@ for (const [name, file, data] of renders) {
       !(n2['8'] || []).includes('ヤマト(ネコポス)')
       && my.note.textContent.includes('試算できる NE の配送方法が選択肢にない'),
       JSON.stringify(n2['8'] || []) + ' / ' + my.note.textContent);
+  }
+
+  // ⑪ 🚨 同じ配送方法の便はあるが送料が 0円 だけのとき = 「選択肢にない」ではない
+  {
+    const zero = [
+      { method: 'ネコポス', cost: 237, count: 10, isCurrent: true },
+      { method: 'ゆうパック60サイズ', cost: 0, count: 50 },
+    ];
+    const pz = vari.profitShipPickByGroup(zero, hints, labels);
+    const nz = vari.profitShipNearByGroup(zero, hints, labels);
+    const mz = mount({ options: zero, picks: pz, near: nz, labels, hints, neCurrent: 'ネコポス', rkValue: '4' });
+    check('🚨 画面の試算: 0円の便しか無いときは「選択肢にない」と書かず、0円だからと書く',
+      mz.note.textContent.includes('送料が 0円 (NE に入っていない) ので自動では選んでいません')
+      && !mz.note.textContent.includes('選択肢にない'), mz.note.textContent);
+    check('画面の試算: そのとき利益は NE の送料のまま (0円で計算しない)', mz.profit() === '837円', mz.profit());
+  }
+
+  // ⑫ 🚨 覚え書きの鍵は「商品 × 人」。描いた画面の data-who がそのまま鍵に入る
+  {
+    const stw = fakeStore();
+    const w = mount({ ...base0, rkValue: '1', store: stw, who: 'なかはら' });
+    w.pick('定形外規格外（1kg以内）');
+    check('🚨 画面の試算: 覚え書きの鍵に data-who の値が入る (人ごとに分かれる)',
+      stw.keys().some((k) => k.endsWith(':なかはら')), JSON.stringify(stw.keys()));
+    const other = mount({ ...base0, rkValue: '1', store: stw, who: 'べつのひと' });
+    check('🚨 画面の試算: 別の人が同じタブで開いても前の人の選択は効かない (892円)',
+      other.profit() === '892円', other.profit() + ' / ' + JSON.stringify(stw.keys()));
   }
 
   // ─── 🚨 本番の経路を通して確かめる (Codex R10 P3)。上の試験は picks を自分で作って

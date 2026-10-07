@@ -30,6 +30,21 @@ import { RAKUTEN_SHIPPING_METHODS } from '../../price-update/shipping-labels.js'
 // 運送会社・サービスの系統 (佐川=飛脚 / ヤマト宅急便=クロネコ / ネコポス …)。
 // 目安の語の部分一致だけだと「ヤマト(ネコポス)」が 宅急便 の候補に入ってしまう (Codex R9 P1)
 import { familyOf } from '../../price-update/shipping-cost.js';
+
+/**
+ * 試算の合わせ先を探すときの「同じ配送方法か」の単位 (2026-10-08)。
+ *
+ * familyOf は**運送会社の大枠**までなので、同じ系統の中の別サービスを一緒にしてしまう。
+ * 🚨 「宅急便コンパクト」は専用箱の別サービスで宅急便より安い。在庫全体でコンパクトの方が
+ * 多いと、楽天「宅急便50サイズ以下」の商品がコンパクトの送料で試算されて利益を良く見せる
+ * (Codex R19 P1)。page-info.js の mapNeShippingToRakuten も「宅急便コンパクト→宅急便」を
+ * 誤マッピングの例として挙げている。
+ */
+export function shipServiceOf(name) {
+  const f = familyOf(name);
+  if (!f) return null;
+  return /コンパクト/.test(String(name ?? '')) ? `${f}/コンパクト` : f;
+}
 export const ALLOWED_TAX_PERCENTS = [8, 10];
 
 export function taxToPercent(v) {
@@ -510,7 +525,8 @@ export function profitShipChoices(options, neMethod, neShippingCost) {
  *
  * グループは粒度が粗く送料が一意に決まらない (定形外 → 定形内 / 定形外規格内 / 定形外規格外)
  * ので、1つを選んで試算し、**何で試算しているか・ほかに何通りあるか**を画面に書く:
- *   0) 候補はその楽天配送方法と**同じ運送会社・サービスの系統** (familyOf) の便だけ
+ *   0) 候補は、管理画面の割当 (ph_shipping_method_map) があればそのグループのもの、
+ *      無ければ**同じサービス** (shipServiceOf = 運送会社 + コンパクト等の別サービス) の便だけ
  *   1) NE に登録されている配送方法がそのグループに当てはまるなら**それ** (= 実送料。一番確か)
  *   2) 当てはまらないなら、そのグループの候補のうち**いちばん多く使われている**もの
  *      (同数なら高い方 = 利益を実際より良く見せない側。listNeShippingOptions と同じ倒し方)
@@ -524,20 +540,33 @@ export function profitShipChoices(options, neMethod, neShippingCost) {
  * @param {Record<string,string[]>} hints 楽天グループ → 配送方法名にかかる語
  * @returns {Record<string, {method:string, cost:number, isNe:boolean, from:number, min:number, max:number}>}
  */
-export function profitShipNearByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, labels = RAKUTEN_SHIPPING_METHODS) {
+export function profitShipNearByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, labels = RAKUTEN_SHIPPING_METHODS, assigned = null) {
   const out = {};
   for (const [group, words] of Object.entries(hints || {})) {
-    const family = familyOf(labels?.[group]);
     const near = (choices || [])
-      .filter((o) => o && o.method
-        && (family ? familyOf(o.method) === family : words.some((w) => o.method.includes(w))))
+      .filter((o) => o && o.method && shipBelongsToGroup(o.method, group, words, labels, assigned))
       .map((o) => o.method);
     if (near.length) out[group] = near;
   }
   return out;
 }
 
-export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, labels = RAKUTEN_SHIPPING_METHODS) {
+/**
+ * その NE の配送方法は、この楽天の配送方法グループのものか (2026-10-08)。
+ *   1) 管理画面の割当 (ph_shipping_method_map) があればそれが正。**別のグループに
+ *      割り当てられているものは入れない** (人が決めた対応を推測で上書きしない)
+ *   2) 無ければサービス単位 (shipServiceOf) で同じもの
+ *   3) サービスが分からない楽天配送方法だけ、目安の語の部分一致に落ちる
+ */
+function shipBelongsToGroup(method, group, words, labels, assigned) {
+  const given = assigned ? (assigned[method] ?? assigned.get?.(method)) : undefined;
+  if (given != null && given !== '') return String(given) === String(group);
+  const svc = shipServiceOf(labels?.[group]);
+  if (svc) return shipServiceOf(method) === svc;
+  return (words || []).some((w) => method.includes(w));
+}
+
+export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, labels = RAKUTEN_SHIPPING_METHODS, assigned = null) {
   // ⚠️ Number(null) は 0。null を先に弾かないと「送料0円」の便で試算して利益を過大に見せる
   //    (profitShipChoices / profit.js の computeProfit と同じ注意)
   const num = (v) => (v == null || v === '' ? NaN : Number(v));
@@ -550,8 +579,7 @@ export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, l
     // 🚨 送料 0 円の便は **NE の登録値でも** 自動選択しない (Codex R3 P1 / R4 P1)。
     //    NE の 送料 0 は「無料」ではなく「まだ入っていない」ことが多く、選ぶと利益を
     //    過大に見せる。人が選ぶぶんは今までどおり選択肢に残る (決めるのは人)
-    const family = familyOf(labels?.[group]);
-    const belongs = (o) => (family ? familyOf(o.method) === family : words.some((w) => o.method.includes(w)));
+    const belongs = (o) => shipBelongsToGroup(o.method, group, words, labels, assigned);
     const cand = list.filter((o) => belongs(o) && num(o.cost) > 0);
     if (!cand.length) continue;   // 当てはまる便なし / 0円の便だけ = 画面は何も変えない
     // 🚨 目安の語はゆるいので、楽天「定形外」の候補に **定形内** (別の段・安い) まで入る。

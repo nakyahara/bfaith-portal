@@ -5247,7 +5247,7 @@ th.attr-unknown { color: #dc2626; }
     //
     // 決め方と文言は**画面を触らない純粋関数**にしてある (試験から入力→出力で確かめるため。
     // ソース検査だけだと「候補は組み直すが選択は動かない」今回の不具合を落とせない — Codex R3 P2)
-    function decideProfitShip({ options, picks, group, chosen, neCurrent, follow, remembered }) {
+    function decideProfitShip({ options, picks, group, chosen, neCurrent, follow, remembered, nearCount = 0 }) {
       const has = (v) => !!v && options.some((o) => o.method === v);
       // 「— 選んでください」(未選択) に戻したときは合わせ先が無いだけ。選択は動かさない
       const doFollow = !!follow && group !== '';
@@ -5269,7 +5269,9 @@ th.attr-unknown { color: #dc2626; }
       // 人の選択 (manual) が勝ったときは「合わせた」と言わない (注記が実態と食い違う)。
       // carry は「候補が無いので残した」状態そのものなので、読み直してもその注記を出す
       const claim = doFollow && (!mine || mem.kind === 'carry');
-      return { method, followed: claim ? { group, pick: picked ? pick : null } : null };
+      // nearCount = その配送方法と同じ便が選択肢に何件あるか (0円も数える)。
+      // 注記で「選択肢にない」と「0円だけ」を言い分けるのに使う
+      return { method, followed: claim ? { group, pick: picked ? pick : null, nearCount } : null };
     }
     // 注記。「何の送料で試算しているか」「ほかに何通りあるか」「試算であって保存ではない」を書く
     // (追従した説明で「試算だけ」が消えると、NE の配送方法まで保存されたように読める — Codex R3 P2)
@@ -5284,9 +5286,13 @@ th.attr-unknown { color: #dc2626; }
       const keep = 'この選択は試算だけで、NE や出品内容には保存されません';
       if (!followed.pick) {
         // 🚨 ここでも「いま何で試算しているか・NE との差・保存されないこと」を出す。
-        //    消すと、残っている試算の便が保存されたように読める (Codex R12 P3)
-        return ['試算: 「' + method + '」' + yen(cost)
-          + '（「' + label + '」で試算できる NE の配送方法が選択肢にないので変えていません'
+        //    消すと、残っている試算の便が保存されたように読める (Codex R12 P3)。
+        //    「同じ便はあるが送料が 0円 (未入力) だけ」は別に書く — プルダウンには見えて
+        //    いるので「選択肢にない」だと嘘になる (Codex R19 P3)
+        const why0 = followed.nearCount > 0
+          ? '「' + label + '」の便は送料が 0円 (NE に入っていない) ので自動では選んでいません'
+          : '「' + label + '」で試算できる NE の配送方法が選択肢にないので変えていません';
+        return ['試算: 「' + method + '」' + yen(cost) + '（' + why0
           + (neCurrent && neCurrent !== method ? '。NE は「' + neCurrent + '」' : '') + '）', keep]
           .join('\n');
       }
@@ -5422,7 +5428,7 @@ th.attr-unknown { color: #dc2626; }
         const rem = mine.read(group);
         const d = decideProfitShip({
           options: data.options, picks: data.picks, group, chosen, neCurrent, follow,
-          remembered: rem,
+          remembered: rem, nearCount: near.length,
         });
         // 🚨 使われなかった carry (「候補が無いので残した」記録) は消す。残すと、その系統の便が
         //    また選択肢から消えたときに古い便が復活して利益が勝手に変わる (Codex R16 P2)
