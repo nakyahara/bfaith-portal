@@ -10705,8 +10705,26 @@ for (const [name, file, data] of renders) {
   // ⑤ 当てはまる便が無い配送方法 = 変えない + 理由を出す
   m.setGroup('4');
   check('🚨 画面の試算: 当てはまる便が無い配送方法では利益も選択も動かさず理由を出す',
-    m.profit() === '837円' && m.note.textContent.includes('試算できる NE の配送方法が選択肢にありません'),
+    m.profit() === '837円' && m.note.textContent.includes('試算できる NE の配送方法が選択肢にない')
+    && m.note.textContent.includes('保存されません'),
     m.note.textContent);
+
+  // ⑤' 🚨 候補が無い配送方法に変えたあと保存して読み直しても、残った試算が消えない
+  //     (消えると NE の送料へ戻って利益が勝手に良くなる — Codex R12 P2)
+  {
+    const st5 = fakeStore();
+    const k = mount({ ...base0, rkValue: '1', store: st5 });
+    k.pick('定形外規格外（1kg以内）');
+    k.setGroup('4');   // ゆうパック = 当てはまる便が無い
+    check('画面の試算: 候補が無い配送方法では残した便で試算を続ける (564円)',
+      k.profit() === '564円', k.profit());
+    check('🚨 画面の試算: 残した便も新しい配送方法と組にして覚える',
+      JSON.parse(st5.raw || '{}').method === '定形外規格外（1kg以内）'
+      && JSON.parse(st5.raw || '{}').group === '4', String(st5.raw));
+    const k2 = mount({ ...base0, rkValue: '4', store: st5 });
+    check('🚨 画面の試算: 保存して読み直しても NE の送料 (837円) へ戻らない',
+      k2.profit() === '564円', k2.profit());
+  }
 
   // ⑥ 未選択に戻す = 合わせ先が無いだけ。選択は動かさない
   m.setGroup('');
@@ -10752,7 +10770,7 @@ for (const [name, file, data] of renders) {
     const my = mount({ options: yamato, picks: p2, near: n2, labels, hints, neCurrent: 'ヤマト(ネコポス)', rkValue: '8' });
     check('🚨 画面の試算: 「ヤマト(ネコポス)」を 宅急便 の「近いもの」に出さない (安い送料を選ばせない)',
       !(n2['8'] || []).includes('ヤマト(ネコポス)')
-      && my.note.textContent.includes('試算できる NE の配送方法が選択肢にありません'),
+      && my.note.textContent.includes('試算できる NE の配送方法が選択肢にない'),
       JSON.stringify(n2['8'] || []) + ' / ' + my.note.textContent);
   }
 
@@ -13431,7 +13449,7 @@ for (const [name, file, data] of renders) {
   {
     // 文言: 何の送料で試算しているか・ほかに何通りあるか・**試算であって保存ではない**
     const d = decide({ group: '1', follow: true });
-    const n = api.profitShipNoteText({ followed: d.followed, method: d.method, groupLabel: '定形外', neCurrent: 'ネコポス', isCurrent: false });
+    const n = api.profitShipNoteText({ followed: d.followed, method: d.method, cost: picks['1'].cost, groupLabel: '定形外', neCurrent: 'ネコポス', isCurrent: false });
     check('配送方法で試算: 注記に「何で試算しているか」と候補の件数・代表送料の幅を書く',
       n.includes('試算: 「定形外規格内（50g以内）」182円')
       && n.includes('候補 2 件 (送料0円は除く)') && n.includes('送料 182〜510円')
@@ -13448,7 +13466,7 @@ for (const [name, file, data] of renders) {
         { method: '定形外規格外（1kg以内）', cost: 510, count: 999 },
       ], { '1': ['定形'] });
       const neNote = api.profitShipNoteText({
-        followed: { group: '1', pick: nePick['1'] }, method: nePick['1'].method,
+        followed: { group: '1', pick: nePick['1'] }, method: nePick['1'].method, cost: nePick['1'].cost,
         groupLabel: '定形外', neCurrent: '定形外規格内（50g以内）', isCurrent: true,
       });
       check('🚨 配送方法で試算: NE の登録値を使ったときは理由をそう書く (「最多」と書かない)',
@@ -13469,9 +13487,13 @@ for (const [name, file, data] of renders) {
       !n.includes('通り'), n);
     check('🚨 配送方法で試算: 合わせたときも「試算だけで保存されない」と必ず書く (保存されたと誤解させない)',
       n.includes('試算だけで、NE や出品内容には保存されません'), n);
-    const miss = api.profitShipNoteText({ followed: { group: '9', pick: null }, method: 'ネコポス', groupLabel: 'ゆうパケットパフ', neCurrent: 'ネコポス', isCurrent: true });
+    const miss = api.profitShipNoteText({ followed: { group: '9', pick: null }, method: '定形外規格外（1kg以内）', cost: 510, groupLabel: 'ゆうパケットパフ', neCurrent: 'ネコポス', isCurrent: false });
     check('配送方法で試算: 当てはまる便が無いときは「変えていない」と書く',
-      miss.includes('試算できる NE の配送方法が選択肢にありません') && miss.includes('変えていません'), miss);
+      miss.includes('試算できる NE の配送方法が選択肢にない') && miss.includes('変えていません'), miss);
+    // 🚨 ここでも「いまの試算・NE との差・保存されないこと」を出す (Codex R12 P3)
+    check('🚨 配送方法で試算: 当てはまる便が無いときも、いまの試算と「保存されない」を出す',
+      miss.includes('試算: 「定形外規格外（1kg以内）」510円') && miss.includes('NE は「ネコポス」')
+      && miss.includes('試算だけで、NE や出品内容には保存されません'), miss);
     check('配送方法で試算: 合わせていないときの文言は今までどおり',
       api.profitShipNoteText({ followed: null, method: 'ネコポス', neCurrent: 'ネコポス', isCurrent: true }) === 'NE に登録されている送料です'
       && api.profitShipNoteText({ followed: null, method: '宅急便60サイズ', neCurrent: 'ネコポス', isCurrent: false }).includes('ここでの変更は試算だけで、NE や出品内容は変わりません'));

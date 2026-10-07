@@ -5263,17 +5263,22 @@ th.attr-unknown { color: #dc2626; }
     }
     // 注記。「何の送料で試算しているか」「ほかに何通りあるか」「試算であって保存ではない」を書く
     // (追従した説明で「試算だけ」が消えると、NE の配送方法まで保存されたように読める — Codex R3 P2)
-    function profitShipNoteText({ followed, method, groupLabel, neCurrent, isCurrent }) {
+    function profitShipNoteText({ followed, method, cost, groupLabel, neCurrent, isCurrent }) {
       if (!followed) {
         return isCurrent
           ? 'NE に登録されている送料です'
           : 'NE は「' + (neCurrent || '未設定') + '」です — ここでの変更は試算だけで、NE や出品内容は変わりません';
       }
       const label = groupLabel || '選んだ配送方法';
+      const yen = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)).toLocaleString() + '円' : '');
+      const keep = 'この選択は試算だけで、NE や出品内容には保存されません';
       if (!followed.pick) {
-        // 何も変えていないので「保存されません」は付けない (変えた話をしていない)
-        return '「' + label + '」で試算できる NE の配送方法が選択肢にありません'
-          + ' — 試算の配送方法は変えていません';
+        // 🚨 ここでも「いま何で試算しているか・NE との差・保存されないこと」を出す。
+        //    消すと、残っている試算の便が保存されたように読める (Codex R12 P3)
+        return ['試算: 「' + method + '」' + yen(cost)
+          + '（「' + label + '」で試算できる NE の配送方法が選択肢にないので変えていません'
+          + (neCurrent && neCurrent !== method ? '。NE は「' + neCurrent + '」' : '') + '）', keep]
+          .join('\n');
       }
       const p = followed.pick;
       // 🚨 1 行に全部入れると 11px の薄い字で 180 字になり、売価を決めるときに拾うべき結論が
@@ -5281,7 +5286,7 @@ th.attr-unknown { color: #dc2626; }
       const lines = [];
       // 🚨 NE と画面が食い違っているときは NE の配送方法も必ず出す (2026-10-07 中原さんの決定で
       //    画面の配送方法に合わせるので、何を上書きしたのかが分からないと確かめられない — Codex R6 P2)
-      lines.push('試算: 「' + method + '」' + Math.round(p.cost).toLocaleString() + '円'
+      lines.push('試算: 「' + method + '」' + yen(cost)
         + '（画面の「' + label + '」に合わせました'
         + (p.isNe ? '。NE に登録されている送料です' : (neCurrent ? '。NE は「' + neCurrent + '」' : '')) + '）');
       if (p.candidates > 1) {
@@ -5297,7 +5302,7 @@ th.attr-unknown { color: #dc2626; }
           + Math.round(p.min).toLocaleString() + '〜' + Math.round(p.max).toLocaleString() + '円 — '
           + why + 'を使いました。違うなら選び直してください');
       }
-      lines.push('この選択は試算だけで、NE や出品内容には保存されません');
+      lines.push(keep);
       return lines.join('\n');
     }
     /**
@@ -5408,7 +5413,7 @@ th.attr-unknown { color: #dc2626; }
         if (!op) return;
         ship = Number(op.dataset.cost);
         note.textContent = profitShipNoteText({
-          followed, method: sel.value,
+          followed, method: sel.value, cost: Number(op.dataset.cost),
           // 🚨 楽天側の正規ラベル (「定形外」)。プルダウンの文字をそのまま使うと複合選択肢の
           //    「定形外（ヤフーのみネコポス）」が出て、楽天に送る配送方法と読み違える (Codex R5 P3)
           groupLabel: data.labels?.[groupOf()] || '',
@@ -5430,6 +5435,10 @@ th.attr-unknown { color: #dc2626; }
           // 配送方法を変えたのだから、試算もその配送方法に合わせる (前の選択は忘れる)
           mine.forget();
           build({ follow: true });
+          // 🚨 当てはまる便が無くて**選択を残した**ときは、新しい配送方法と組にして覚える。
+          //    覚えないと、そのまま保存して読み直したときに NE の送料へ戻り、
+          //    利益が勝手に良くなる (Codex R12 P2)
+          if (followed && !followed.pick) mine.remember(sel.value, groupOf());
         });
       }
       // 🚨 開いたときも保存されている楽天の配送方法に合わせる。中原さんの報告は
