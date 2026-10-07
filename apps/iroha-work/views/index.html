@@ -1941,6 +1941,21 @@ function fmtMd(ymd) {
   return m ? Number(m[2]) + '/' + Number(m[3]) : String(ymd || '');
 }
 /**
+ * 入荷日 'YYYY-MM-DD' → 「今日入荷」「昨日入荷」「N日前入荷」(今日は JST)。
+ * ボードのカードで、どれだけ待っているかを日付の引き算なしで分かるように (中原さん 2026-10-07)。
+ * 日付でない・先の日付 (入荷予定のずれ) は M/D のまま
+ */
+function arrivalAgo(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(ymd || ''));
+  if (!m) return ymd ? '入荷 ' + String(ymd) : '';
+  const t = /^(\d{4})-(\d{2})-(\d{2})/.exec(jstYmd(0));
+  const days = Math.round((Date.UTC(+t[1], +t[2] - 1, +t[3]) - Date.UTC(+m[1], +m[2] - 1, +m[3])) / 86400000);
+  if (days < 0) return '入荷 ' + fmtMd(ymd);
+  if (days === 0) return '今日入荷';
+  if (days === 1) return '昨日入荷';
+  return days + '日前入荷';
+}
+/**
  * ⭐職員向けの表示か (Notion リンク・在庫日数・売上・外部出し目安・ラベル待ちの事務項目 — 監修 F-5)。
  * 職員モードで許可リストに入る「計画」の許可を目印にする — 職員モードが終わると enforceWorkerCaps / dropPlanCaps が
  * 落とすので、利用者に切り替えた瞬間に職員向けの表示も消える (描いてから隠さない — 要件 §U-7)
@@ -2155,6 +2170,7 @@ function bcardHtml(c, status) {
     && (boardCols === 'fac' ? stateCan('task.facility.assign') : boardCols === 'when' ? stateCan('task.plan.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
   const meta = [c.qty != null ? c.qty + ' 個' : null,
+    c.arrival ? '📥 ' + arrivalAgo(c.arrival) : null,
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
     c.hold_memo ? '📝 メモ' : null,
     boxesText(c) ? '📦 ' + boxesText(c, { short: true }) : null,
