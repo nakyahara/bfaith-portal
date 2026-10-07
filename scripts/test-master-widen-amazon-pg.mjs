@@ -18,6 +18,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.mjs';
 import { createMasterEditRoles } from './company-db/create-master-edit-roles.mjs';
@@ -118,7 +120,7 @@ async function setupDb(base) {
     }
   };
   await acks();   // manifest を DB に (prepare は「どれかのプロセスが見た一覧」だけ受ける)
-  return { name, O, O2, dbO, dbO2: pgAdapter(O2), WA, dbWA: pgAdapter(WA), q, acks };
+  return { name, url: u.toString(), O, O2, dbO, dbO2: pgAdapter(O2), WA, dbWA: pgAdapter(WA), q, acks };
 }
 
 /** 試みを作って、止める入口・ack・試みの中の 2 つのロードまで揃える。skuKind = prepared のロードの判断の記録 (undefined = 区分の食い違い 0) */
@@ -164,6 +166,16 @@ async function insertAck(E, attempt, fields) {
   const cols = Object.keys(f);
   await E.O.query(`insert into ops.master_legacy_gate_acks (${cols.join(', ')}) values (${cols.map((k, i) => (k === 'capable' ? `$${i + 1}::text[]` : `$${i + 1}`)).join(', ')})`, cols.map((k) => f[k]));
 }
+/** CLI (scripts/company-db/amazon-map-migrate.mjs --apply) を本物のプロセスで流す (#1648 Codex R2 Low 2)。COMPANY_DB_URL = 試験の DB。戻り値 { code, out } */
+const CLI_MIGRATE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'company-db', 'amazon-map-migrate.mjs');
+function cliApply(E, legacyFile, extraArgs = []) {
+  const fba = path.join(path.dirname(legacyFile), 'fba.db');
+  if (!fs.existsSync(fba)) { const d = new Database(fba); d.exec('create table sku_mapping (amazon_sku text)'); d.close(); }
+  const h0 = M.legacyDigest(M.readLegacyAmazonMaps(legacyFile)).content_hash;
+  const r = spawnSync(process.execPath, [CLI_MIGRATE, '--apply', '--expect-hash', h0, '--legacy', legacyFile, '--fba-db', fba, '--actor', 'naka@test', '--yes', ...extraArgs],
+    { env: { ...process.env, COMPANY_DB_URL: E.url }, encoding: 'utf8', timeout: 120000 });
+  return { code: r.status, out: `${r.stdout || ''}${r.stderr || ''}` };
+}
 const phaseErr = (re) => (e) => e.code === 'AMAZON_MAP_MIGRATE_PHASE' && (!re || re.test(e.message));
 /** 消えた対応を 1 件作る (trigger を止めて消す = 0054 の「普通の道では起きない」形) */
 const loseOne = async (c) => {
@@ -185,9 +197,11 @@ try {
   const legacyA = makeLegacy(dirA);
   let AT;   // 本番の試み
 
-  await ta('[M0] 移行の apply: new_open で試みが無い = 断る (AMAZON_MAP_MIGRATE_PHASE)・広げてよいキーは 2 つ・ほかのキーは断る', async () => {
+  await ta('[M0] 移行の apply: new_open で試みが無い = 断る (AMAZON_MAP_MIGRATE_PHASE・CLI も --attempt なしは断る)・広げてよいキーは 2 つ・ほかのキーは断る', async () => {
     assert.deepEqual((await A.q('select ops.master_widen_allowed_keys() as k'))[0].k, [KEY_A, KEY_K]);
     await assert.rejects(migrate(A, legacyA), phaseErr(/--attempt/));                          // 試みを指さない
+    const c0 = cliApply(A, legacyA);                                                             // CLI も (new_open は --attempt が必須 = 断る・何も書かない)
+    assert.equal(c0.code, 1, c0.out); assert.match(c0.out, /--attempt/);
     await assert.rejects(migrate(A, legacyA, crypto.randomUUID()), phaseErr(/attempt_missing/));   // 知らない試み
     await assert.rejects(W.prepareWiden(A.dbO, { companyId: 1, map: { ...WIDEN_A, 'products.status': 'company' }, loaderFingerprint: hex('f'), manifest: MANIFEST, actor: 't' }), /widen_key_not_allowed/);
     assert.equal((await A.q('select count(*)::int as n from core.amazon_sku_maps'))[0].n, 0);
@@ -370,7 +384,7 @@ try {
     assert.equal(r.problems.length, 2, JSON.stringify(r.problems));
   });
 
-  await ta('[M2] 移行は epoch の共有の鍵を取る = 試みの cancel (epoch の排他) を持つ取引の間は待つ・frozen は今までどおり', async () => {
+  await ta('[M2] 移行は epoch の共有の鍵を取る = 試みの cancel (epoch の排他) を持つ取引の間は待つ・frozen は今までどおり (CLI で --attempt なしで通る)', async () => {
     await assert.rejects(migrate(B, legacyB, KCANCELLED), phaseErr(/attempt_not_prepared/));   // 違う試み (cancel した前の試み) を指す = 断る
     await B.O2.query('begin'); await B.O2.query('select pg_advisory_xact_lock(ops.master_ownership_lock_key())');
     const m = launch(migrate(B, legacyB, KA.id));
@@ -384,8 +398,9 @@ try {
     // frozen (今までどおり): 別の DB を frozen にして移行が通る (試みは見ない)
     const F = await setupDb(BASE0);
     await F.O.query('begin'); await F.O.query("select set_config('ops.cutover_protocol', '1', true)"); await F.O.query("update ops.master_cutover_state set phase = 'frozen', owner_hash = null where id = 1"); await F.O.query('commit');
-    const fr = await migrate(F, makeLegacy(path.join(tmp, 'f')));
-    assert.deepEqual([fr.committed, fr.phase, fr.widen_attempt], [true, 'frozen', null]);
+    const fc = cliApply(F, makeLegacy(path.join(tmp, 'f')));                                     // CLI で --attempt なし (#1648 Codex R2 Low 2)
+    assert.equal(fc.code, 0, fc.out); assert.match(fc.out, /✅ 移した \(commit\)/);
+    assert.equal((await F.q("select count(*)::int as n from core.amazon_sku_maps where state = 'active'"))[0].n, 3);
   });
 
   await ta('[KA2] 両方の試み: 移行の後も held が残れば断る (Amazon は通る)・消えた対応も断る / held 0 の試みで両方そろえば widen が通る', async () => {
