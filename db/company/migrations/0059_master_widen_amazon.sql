@@ -13,6 +13,8 @@
 --   3. ops.widen_master_ownership: listing_components.amazon を足すときだけ、写しの証拠に amazon_map (古い表のハッシュ = Company DB のハッシュ・
 --      ハッシュを作った行の数) が要る。行の数は DB が鍵の後に数え直した数 (本体の counts) と同じであること (CLI が同じ取引で鍵の後に読む)
 --   4. ops.widen_amazon_map_counts(会社) = 本体と widen が使う数 (消えた対応・active の対応・その構成の行)
+--   5. (#1648 Codex R1 Medium 1) 判定の共通の部品 ops._widen_attempt_common (試み・段階・epoch・足すだけ・2 版の ack・手の入口の停止) を切り出し、
+--      本体と移行の窓 ops.amazon_map_migration_window (new_open の移行 apply の条件) が同じものを使う
 -- 🚨 全部の関数: search_path = pg_catalog, pg_temp・完全修飾・REVOKE EXECUTE FROM PUBLIC・要るロールだけ grant (0058 と同じ形)。一時の表を使わない
 -- 🚨 作らないもの: 古い表 (miniPC の SQLite) のハッシュを DB で作り直すこと (DB は SQLite を読めない = CLI が鍵の後に読んで照らし、DB は数とハッシュの形を照らす)
 
@@ -34,6 +36,99 @@ create function ops.widen_amazon_map_counts(p_company_id integer) returns jsonb
                                       where m.company_id = p_company_id and m.state = 'active'))
 $$;
 revoke all on function ops.widen_amazon_map_counts(integer) from public;
+
+-- ─── 2a. 🆕 共通の部品 (#1648 Codex R1 Medium 1): 試み・段階・epoch・足すだけ・広げてよいキー・全部のプロセスの 2 版の ack・手の入口の停止。
+--   判定の本体 (check / widen) と移行の窓 (ops.amazon_map_migration_window) が同じものを使う。何も書かない・鍵を取らない・どのロールにも EXECUTE を与えない
+--   戻り値 = { problems: [...], acks: [...], stop_at } (試みが無い = null)
+create function ops._widen_attempt_common(p_widen_prepare_id uuid, p_now timestamptz) returns jsonb
+  language plpgsql stable set search_path = pg_catalog, pg_temp as $$
+declare
+  v_problems text[] := '{}';
+  v_acks     jsonb := '[]'::jsonb;
+  a          ops.master_widen_attempts;
+  st         ops.master_ownership_state;
+  v_phase    text;
+  v_added    text[];
+  v_hosts    text[] := ops.master_cutover_required_hosts();
+  v_fresh    interval := make_interval(mins => ops.master_cutover_ack_fresh_minutes());
+  v_host     text;
+  v_n        integer;
+  k          record;
+  v_want     text[];
+  v_got      text[];
+  v_stop_at  timestamptz;
+begin
+  -- 1. 試み・段階・epoch・足すだけ
+  select * into a from ops.master_widen_attempts w where w.widen_prepare_id = p_widen_prepare_id;
+  if not found then return null; end if;
+  if a.state <> 'prepared' then v_problems := v_problems || format('attempt_not_prepared: 試みの状態が %s', a.state); end if;
+  select c.phase into v_phase from ops.master_cutover_state c where c.id = 1;
+  if v_phase is distinct from 'new_open' then v_problems := v_problems || format('phase_not_new_open: 段階が %s', coalesce(v_phase, '読めない')); end if;
+  select * into st from ops.master_ownership_state s where s.id = 1;
+  if not found then
+    v_problems := v_problems || 'epoch_missing: 持ち主の epoch の行が無い'::text;
+  else
+    if st.prepared_hash is distinct from a.prepared_hash or st.prepared_at is distinct from a.prepared_at then
+      v_problems := v_problems || 'prepared_changed: prepared が試みのものでない (cancel / 別の prepare)'::text;
+    end if;
+    if st.active_hash is distinct from a.active_hash then v_problems := v_problems || 'active_changed: prepare の後に active が変わった'::text; end if;
+    if ops.ownership_hash(st.active_map) is distinct from st.active_hash then v_problems := v_problems || 'epoch_broken: active のハッシュが中身と違う'::text; end if;
+    if st.prepared_map is not null and ops.ownership_hash(st.prepared_map) is distinct from st.prepared_hash then v_problems := v_problems || 'epoch_broken: prepared のハッシュが中身と違う'::text; end if;
+  end if;
+  if ops.ownership_hash(a.prepared_map) is distinct from a.prepared_hash then v_problems := v_problems || 'attempt_broken: 試みの持ち主表のハッシュが中身と違う'::text; end if;
+  select coalesce(array_agg(p.key order by p.key), '{}') into v_added from jsonb_each_text(a.prepared_map) p
+   where p.value = 'company' and (st.active_map ->> p.key) is distinct from 'company';
+  if v_added is distinct from (select array_agg(x order by x) from unnest(a.added_keys) x) then
+    v_problems := v_problems || format('not_additive: 足すキーが試みと違う (今 %s・試み %s)', array_to_string(v_added, ','), array_to_string(a.added_keys, ','));
+  end if;
+  if exists (select 1 from jsonb_each_text(st.active_map) x where x.value = 'company' and (a.prepared_map ->> x.key) is distinct from 'company') then
+    v_problems := v_problems || 'not_additive: prepared が active の company のキーを load に戻す'::text;
+  end if;
+  if not (a.added_keys <@ ops.master_widen_allowed_keys()) then
+    v_problems := v_problems || format('key_not_allowed: 広げてよいのは %s だけ (PR-8 の前)', array_to_string(ops.master_widen_allowed_keys(), ','));
+  end if;
+
+  -- 2. 書き手の ack (全部のプロセス・2 版・prepare の後・書きかけ 0・capable ⊇ 足すキー・試みの manifest・active / prepared を見た)
+  foreach v_host in array v_hosts loop
+    v_n := 0;
+    for k in select distinct on (g.instance_id) g.* from ops.master_legacy_gate_acks g where g.host = v_host order by g.instance_id, g.acked_at desc, g.ack_id desc loop
+      if k.inflight_count <> 0 or k.oldest_inflight_at is not null then
+        v_problems := v_problems || format('ack: %s/%s: 書きかけが %s 件ある', v_host, k.instance_id, k.inflight_count);
+      end if;
+      if k.stopped then continue; end if;
+      if k.acked_at < p_now - v_fresh then
+        v_problems := v_problems || format('ack: %s/%s: 黙っている (最後の記録 %s。止めたプロセスなら stopped の記録を書く)', v_host, k.instance_id, k.acked_at);
+        continue;
+      end if;
+      v_n := v_n + 1;
+      if k.ack_version <> 2 then v_problems := v_problems || format('ack: %s/%s: 記録が 1 版 (active / prepared を見た証拠が無い = 新しい build の門が要る)', v_host, k.instance_id);
+      else
+        if k.acked_at <= a.prepared_at then v_problems := v_problems || format('ack: %s/%s: 記録が prepare の前', v_host, k.instance_id); end if;
+        if k.active_hash_seen is distinct from a.active_hash then v_problems := v_problems || format('ack: %s/%s: 見た active が違う', v_host, k.instance_id); end if;
+        if k.prepared_hash_seen is distinct from a.prepared_hash then v_problems := v_problems || format('ack: %s/%s: 見た prepared が試みのものでない', v_host, k.instance_id); end if;
+        if not (a.added_keys <@ k.capable) then v_problems := v_problems || format('ack: %s/%s: build が足すキー (%s) を company にできない', v_host, k.instance_id, array_to_string(a.added_keys, ',')); end if;
+      end if;
+      if k.manifest_hash is distinct from a.manifest_hash then v_problems := v_problems || format('ack: %s/%s: 古い入口の一覧が試みのものと違う', v_host, k.instance_id); end if;
+      if k.phase_seen is distinct from 'new_open' then v_problems := v_problems || format('ack: %s/%s: 見た段階が %s', v_host, k.instance_id, k.phase_seen); end if;
+      v_acks := v_acks || jsonb_build_array(jsonb_build_object('ack_id', k.ack_id::text, 'host', k.host, 'instance_id', k.instance_id, 'build_id', k.build_id, 'acked_at', k.acked_at));
+    end loop;
+    if v_n = 0 then v_problems := v_problems || format('ack: %s: %s 分以内の記録が無い', v_host, ops.master_cutover_ack_fresh_minutes()); end if;
+  end loop;
+
+  -- 3. 手の入口の停止 = 足すキーに関係する manual の入口と完全一致 (DB の時刻・prepare の後)
+  v_want := ops.widen_required_manual_entries(a.manifest_hash, a.added_keys);
+  select coalesce(array_agg(s.entry_id order by s.entry_id), '{}'), max(s.stopped_at) into v_got, v_stop_at
+    from ops.master_widen_manual_stops s where s.widen_prepare_id = a.widen_prepare_id;
+  if v_got is distinct from v_want then
+    v_problems := v_problems || format('manual_stops: 止めた手の入口 (%s) が要る入口 (%s) と同じでない', array_to_string(v_got, ','), array_to_string(v_want, ','));
+  end if;
+  if exists (select 1 from ops.master_widen_manual_stops s where s.widen_prepare_id = a.widen_prepare_id and s.stopped_at <= a.prepared_at) then
+    v_problems := v_problems || 'manual_stops: 停止の記録が prepare の前'::text;
+  end if;
+  v_stop_at := greatest(coalesce(v_stop_at, a.prepared_at), a.prepared_at);
+  return jsonb_build_object('problems', to_jsonb(v_problems), 'acks', v_acks, 'stop_at', v_stop_at);
+end $$;
+revoke all on function ops._widen_attempt_common(uuid, timestamptz) from public;
 
 -- ─── 2. 判定の本体 (0058 の §10 を置き換え)。何も書かない・鍵を取らない・どのロールにも EXECUTE を与えない (DEFINER の 2 つから呼ぶ) ───
 -- 戻り値 = { ok, problems: [...], counts: {...}, loads: { recovery, prepared } (commit_seq は文字 = JS の Number にしない), acks: [...] }
@@ -70,82 +165,22 @@ declare
   v_kind_added boolean;   -- 0059: skus.sku_kind を足す試み = 区分の判断の記録と最終形を見る
   v_amz_added  boolean;   -- 0059: listing_components.amazon を足す試み = 消えた対応 0・active の対応 1 件以上を見る
   v_amz      jsonb;
+  v_common   jsonb;
 begin
   if p_company_id is distinct from 1 then
     return jsonb_build_object('ok', false, 'problems', jsonb_build_array('unsupported_company: 会社 ' || coalesce(p_company_id::text, 'null') || ' (今は会社 1 だけ)'), 'counts', '{}'::jsonb);
   end if;
-  -- 1. 試み・段階・epoch・足すだけ
+  -- 1〜3. 試み・段階・epoch・足すだけ・ack・手の入口の停止 = 共通の部品 (移行の窓と同じ。#1648 Codex R1 Medium 1)
   select * into a from ops.master_widen_attempts w where w.widen_prepare_id = p_widen_prepare_id;
   if not found then
     return jsonb_build_object('ok', false, 'problems', jsonb_build_array('attempt_missing: 試み ' || coalesce(p_widen_prepare_id::text, 'null') || ' が無い'), 'counts', '{}'::jsonb);
   end if;
   v_kind_added := 'skus.sku_kind' = any(a.added_keys);
   v_amz_added := 'listing_components.amazon' = any(a.added_keys);
-  if a.state <> 'prepared' then v_problems := v_problems || format('attempt_not_prepared: 試みの状態が %s', a.state); end if;
-  select c.phase into v_phase from ops.master_cutover_state c where c.id = 1;
-  if v_phase is distinct from 'new_open' then v_problems := v_problems || format('phase_not_new_open: 段階が %s', coalesce(v_phase, '読めない')); end if;
-  select * into st from ops.master_ownership_state s where s.id = 1;
-  if not found then
-    v_problems := v_problems || 'epoch_missing: 持ち主の epoch の行が無い'::text;
-  else
-    if st.prepared_hash is distinct from a.prepared_hash or st.prepared_at is distinct from a.prepared_at then
-      v_problems := v_problems || 'prepared_changed: prepared が試みのものでない (cancel / 別の prepare)'::text;
-    end if;
-    if st.active_hash is distinct from a.active_hash then v_problems := v_problems || 'active_changed: prepare の後に active が変わった'::text; end if;
-    if ops.ownership_hash(st.active_map) is distinct from st.active_hash then v_problems := v_problems || 'epoch_broken: active のハッシュが中身と違う'::text; end if;
-    if st.prepared_map is not null and ops.ownership_hash(st.prepared_map) is distinct from st.prepared_hash then v_problems := v_problems || 'epoch_broken: prepared のハッシュが中身と違う'::text; end if;
-  end if;
-  if ops.ownership_hash(a.prepared_map) is distinct from a.prepared_hash then v_problems := v_problems || 'attempt_broken: 試みの持ち主表のハッシュが中身と違う'::text; end if;
-  select coalesce(array_agg(p.key order by p.key), '{}') into v_added from jsonb_each_text(a.prepared_map) p
-   where p.value = 'company' and (st.active_map ->> p.key) is distinct from 'company';
-  if v_added is distinct from (select array_agg(x order by x) from unnest(a.added_keys) x) then
-    v_problems := v_problems || format('not_additive: 足すキーが試みと違う (今 %s・試み %s)', array_to_string(v_added, ','), array_to_string(a.added_keys, ','));
-  end if;
-  if exists (select 1 from jsonb_each_text(st.active_map) x where x.value = 'company' and (a.prepared_map ->> x.key) is distinct from 'company') then
-    v_problems := v_problems || 'not_additive: prepared が active の company のキーを load に戻す'::text;
-  end if;
-  if not (a.added_keys <@ ops.master_widen_allowed_keys()) then
-    v_problems := v_problems || format('key_not_allowed: 広げてよいのは %s だけ (PR-8 の前)', array_to_string(ops.master_widen_allowed_keys(), ','));
-  end if;
-
-  -- 2. 書き手の ack (全部のプロセス・2 版・prepare の後・書きかけ 0・capable ⊇ 足すキー・試みの manifest・active / prepared を見た)
-  foreach v_host in array v_hosts loop
-    v_n := 0;
-    for k in select distinct on (g.instance_id) g.* from ops.master_legacy_gate_acks g where g.host = v_host order by g.instance_id, g.acked_at desc, g.ack_id desc loop
-      if k.inflight_count <> 0 or k.oldest_inflight_at is not null then
-        v_problems := v_problems || format('ack: %s/%s: 書きかけが %s 件ある', v_host, k.instance_id, k.inflight_count);
-      end if;
-      if k.stopped then continue; end if;
-      if k.acked_at < v_now - v_fresh then
-        v_problems := v_problems || format('ack: %s/%s: 黙っている (最後の記録 %s。止めたプロセスなら stopped の記録を書く)', v_host, k.instance_id, k.acked_at);
-        continue;
-      end if;
-      v_n := v_n + 1;
-      if k.ack_version <> 2 then v_problems := v_problems || format('ack: %s/%s: 記録が 1 版 (active / prepared を見た証拠が無い = 新しい build の門が要る)', v_host, k.instance_id);
-      else
-        if k.acked_at <= a.prepared_at then v_problems := v_problems || format('ack: %s/%s: 記録が prepare の前', v_host, k.instance_id); end if;
-        if k.active_hash_seen is distinct from a.active_hash then v_problems := v_problems || format('ack: %s/%s: 見た active が違う', v_host, k.instance_id); end if;
-        if k.prepared_hash_seen is distinct from a.prepared_hash then v_problems := v_problems || format('ack: %s/%s: 見た prepared が試みのものでない', v_host, k.instance_id); end if;
-        if not (a.added_keys <@ k.capable) then v_problems := v_problems || format('ack: %s/%s: build が足すキー (%s) を company にできない', v_host, k.instance_id, array_to_string(a.added_keys, ',')); end if;
-      end if;
-      if k.manifest_hash is distinct from a.manifest_hash then v_problems := v_problems || format('ack: %s/%s: 古い入口の一覧が試みのものと違う', v_host, k.instance_id); end if;
-      if k.phase_seen is distinct from 'new_open' then v_problems := v_problems || format('ack: %s/%s: 見た段階が %s', v_host, k.instance_id, k.phase_seen); end if;
-      v_acks := v_acks || jsonb_build_array(jsonb_build_object('ack_id', k.ack_id::text, 'host', k.host, 'instance_id', k.instance_id, 'build_id', k.build_id, 'acked_at', k.acked_at));
-    end loop;
-    if v_n = 0 then v_problems := v_problems || format('ack: %s: %s 分以内の記録が無い', v_host, ops.master_cutover_ack_fresh_minutes()); end if;
-  end loop;
-
-  -- 3. 手の入口の停止 = 足すキーに関係する manual の入口と完全一致 (DB の時刻・prepare の後)
-  v_want := ops.widen_required_manual_entries(a.manifest_hash, a.added_keys);
-  select coalesce(array_agg(s.entry_id order by s.entry_id), '{}'), max(s.stopped_at) into v_got, v_stop_at
-    from ops.master_widen_manual_stops s where s.widen_prepare_id = a.widen_prepare_id;
-  if v_got is distinct from v_want then
-    v_problems := v_problems || format('manual_stops: 止めた手の入口 (%s) が要る入口 (%s) と同じでない', array_to_string(v_got, ','), array_to_string(v_want, ','));
-  end if;
-  if exists (select 1 from ops.master_widen_manual_stops s where s.widen_prepare_id = a.widen_prepare_id and s.stopped_at <= a.prepared_at) then
-    v_problems := v_problems || 'manual_stops: 停止の記録が prepare の前'::text;
-  end if;
-  v_stop_at := greatest(coalesce(v_stop_at, a.prepared_at), a.prepared_at);
+  v_common := ops._widen_attempt_common(p_widen_prepare_id, v_now);
+  select coalesce(array_agg(x.v order by x.i), '{}') into v_problems from jsonb_array_elements_text(v_common -> 'problems') with ordinality as x(v, i);
+  v_acks := v_common -> 'acks';
+  v_stop_at := (v_common ->> 'stop_at')::timestamptz;
 
   -- 4. 試みの中のロード = base より後の commit がちょうど 2 つ (回収 = active → prepared = 試みの prepared・prepared が全体の最新)
   select count(*) into v_ncommits from ops.master_load_commits x where x.commit_seq > a.base_commit_seq;
@@ -264,6 +299,30 @@ begin
 end $$;
 revoke all on function ops._widen_judge(uuid, integer) from public;
 
+-- ─── 2b. 🆕 移行の窓 (#1648 Codex R1 Medium 1): 段階 new_open で amazon-map-migrate.mjs --apply を通してよいか = 共通の部品 (試みが開いている・epoch・
+--   全部のプロセスの 2 版の ack が prepare の後・書きかけ 0・新しい・試みの manifest・active / prepared を見た・capable ⊇ 足すキー・手の入口の停止) +
+--   足すキーに listing_components.amazon。移行の取引の中で鍵の後に呼ぶ (DB の持ち主・どのロールにも EXECUTE を与えない)。戻り値 = { ok, problems, widen_prepare_id, added_keys }
+create function ops.amazon_map_migration_window(p_widen_prepare_id uuid) returns jsonb
+  language plpgsql stable set search_path = pg_catalog, pg_temp as $$
+declare
+  a          ops.master_widen_attempts;
+  v          jsonb;
+  v_problems text[];
+begin
+  select * into a from ops.master_widen_attempts w where w.widen_prepare_id = p_widen_prepare_id;
+  if not found then
+    return jsonb_build_object('ok', false, 'problems', jsonb_build_array('attempt_missing: 試み ' || coalesce(p_widen_prepare_id::text, 'null') || ' が無い'));
+  end if;
+  v := ops._widen_attempt_common(p_widen_prepare_id, clock_timestamp());
+  select coalesce(array_agg(x.v order by x.i), '{}') into v_problems from jsonb_array_elements_text(v -> 'problems') with ordinality as x(v, i);
+  if not ('listing_components.amazon' = any(a.added_keys)) then
+    v_problems := v_problems || format('not_amazon: 試みの足すキー (%s) に listing_components.amazon が無い', array_to_string(a.added_keys, ','));
+  end if;
+  return jsonb_build_object('ok', coalesce(array_length(v_problems, 1), 0) = 0, 'problems', to_jsonb(v_problems), 'widen_prepare_id', a.widen_prepare_id,
+    'added_keys', to_jsonb(a.added_keys), 'acks', v -> 'acks');
+end $$;
+revoke all on function ops.amazon_map_migration_window(uuid) from public;
+
 -- ─── 3. widen (apply・0058 の §11 を置き換え)。DB の持ち主だけ。鍵 = epoch の排他 → 段階の排他 → マスタの書き込みの排他 (自分で取ったことを確かめる) → 判定の本体 →
 --   写しの証拠 (🆕 Amazon を足すときは amazon_map も) → active ← prepared (prepared を消す) → 試みを widened → 出来事 → 段階の owner_hash → 段階の出来事 (同じ取引・G3)
 create or replace function ops.widen_master_ownership(p_widen_prepare_id uuid, p_company_id integer, p_actor text, p_evidence jsonb) returns jsonb
@@ -349,6 +408,8 @@ do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then
     execute 'revoke all on function ops._widen_judge(uuid, integer) from watcher';
     execute 'revoke all on function ops.widen_amazon_map_counts(integer) from watcher';
+    execute 'revoke all on function ops._widen_attempt_common(uuid, timestamptz) from watcher';
+    execute 'revoke all on function ops.amazon_map_migration_window(uuid) from watcher';
     execute 'revoke all on function ops.widen_master_ownership(uuid, integer, text, jsonb) from watcher';
     execute 'grant execute on function ops.widen_check_readonly(uuid, integer) to watcher';
   end if;

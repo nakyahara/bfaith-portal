@@ -7,8 +7,9 @@
  *        区分の食い違い (held) があっても止まらない・区分の数を出さない / 消えた対応 1 件 = 断る / active 0 件 = 断る / 写しの証拠のハッシュ違い・数の違い = 断る /
  *        手の入口 = gas:logizard-sheet-and-sku-map / CLI の check がハッシュを照らす / 揃えば widen が通る (読むだけの判定と同じ数)
  *   [KA] 両方を足す試み: 区分と Amazon の両方を見る (どちらか 1 つでも断る)・揃えば通る
- *   [M]  移行の apply (amazon-map-migrate.mjs) の段階の条件: frozen は今までどおり / new_open は Amazon を足す試みが開いて手の入口を止めた後だけ /
- *        sku_kind だけの試み・試みなし・停止の前・widen の後 = 断る / 移行は epoch の共有の鍵を取る (試みの cancel / widen と並ぶ)
+ *   [M]  移行の apply (amazon-map-migrate.mjs) の段階の条件: frozen は今までどおり / new_open は指した試み (--attempt) が Amazon を足す試みで、
+ *        widen の判定と同じ共通の部品 (全部のプロセスの 2 版の ack が prepare の後・書きかけ 0・新しい・手の入口の停止) が通るときだけ (#1648 Codex R1 Medium 1) /
+ *        試みを指さない・知らない試み・閉じた試み・sku_kind だけの試み・ack が足りない / 古い / 書きかけ・停止の前・widen の後 = 断る / 移行は epoch の共有の鍵を取る
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-widen-amazon-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロールをクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。TEST_PG_URL が無ければ飛ばす
  */
@@ -150,10 +151,19 @@ async function variant(E, id, label, mutate, re) {
     await E.O.query('rollback to savepoint s');
   } finally { await E.O.query('rollback'); }
 }
-const migrate = (E, legacyFile, extra = {}) => {
+const migrate = (E, legacyFile, attemptId = null, extra = {}) => {
   const legacy = M.readLegacyAmazonMaps(legacyFile);
-  return M.runAmazonMapMigration(E.dbO, legacy, { mode: 'apply', expectHash: M.legacyDigest(legacy).content_hash, actor: 'naka@test', sheetOnly: [], ...extra });
+  return M.runAmazonMapMigration(E.dbO, legacy, { mode: 'apply', expectHash: M.legacyDigest(legacy).content_hash, actor: 'naka@test', sheetOnly: [], attemptId, ...extra });
 };
+/** ack の行を直接足す (commit する・試験だけ)。fields = 列の上書き */
+async function insertAck(E, attempt, fields) {
+  const mh = (await E.q('select manifest_hash, active_hash, prepared_hash from ops.master_widen_attempts where widen_prepare_id = $1', [attempt]))[0];
+  const f = { host: 'render', instance_id: 'r-x', build_id: 'b1', manifest_hash: mh.manifest_hash, owner_hash: mh.active_hash, phase_seen: 'new_open', inflight_count: 0, oldest_inflight_at: null,
+    session_role: 'master_gate_render', ack_version: 2, active_hash_seen: mh.active_hash, prepared_hash_seen: mh.prepared_hash, capable: CAPABLE, acked_at: new Date().toISOString(), ...fields };
+  if (f.ack_version === 1) { f.active_hash_seen = null; f.prepared_hash_seen = null; f.capable = null; }
+  const cols = Object.keys(f);
+  await E.O.query(`insert into ops.master_legacy_gate_acks (${cols.join(', ')}) values (${cols.map((k, i) => (k === 'capable' ? `$${i + 1}::text[]` : `$${i + 1}`)).join(', ')})`, cols.map((k) => f[k]));
+}
 const phaseErr = (re) => (e) => e.code === 'AMAZON_MAP_MIGRATE_PHASE' && (!re || re.test(e.message));
 /** 消えた対応を 1 件作る (trigger を止めて消す = 0054 の「普通の道では起きない」形) */
 const loseOne = async (c) => {
@@ -177,7 +187,8 @@ try {
 
   await ta('[M0] 移行の apply: new_open で試みが無い = 断る (AMAZON_MAP_MIGRATE_PHASE)・広げてよいキーは 2 つ・ほかのキーは断る', async () => {
     assert.deepEqual((await A.q('select ops.master_widen_allowed_keys() as k'))[0].k, [KEY_A, KEY_K]);
-    await assert.rejects(migrate(A, legacyA), phaseErr(/試みが無い/));
+    await assert.rejects(migrate(A, legacyA), phaseErr(/--attempt/));                          // 試みを指さない
+    await assert.rejects(migrate(A, legacyA, crypto.randomUUID()), phaseErr(/attempt_missing/));   // 知らない試み
     await assert.rejects(W.prepareWiden(A.dbO, { companyId: 1, map: { ...WIDEN_A, 'products.status': 'company' }, loaderFingerprint: hex('f'), manifest: MANIFEST, actor: 't' }), /widen_key_not_allowed/);
     assert.equal((await A.q('select count(*)::int as n from core.amazon_sku_maps'))[0].n, 0);
   });
@@ -189,7 +200,8 @@ try {
         id = a.widen_prepare_id;
         assert.deepEqual(a.added_keys, [KEY_A]);
         assert.deepEqual(a.required_manual_entries, ['gas:logizard-sheet-and-sku-map']);
-        await assert.rejects(migrate(A, legacyA), phaseErr(/手の入口を止めた記録が無い \(gas:logizard-sheet-and-sku-map/));   // 停止の前 = 窓でない
+        // 停止の前・ack の前 = 窓でない (widen の判定と同じ共通の部品)
+        await assert.rejects(migrate(A, legacyA, a.widen_prepare_id), phaseErr(/記録が prepare の前.*manual_stops: 止めた手の入口 \(\) が要る入口 \(gas:logizard-sheet-and-sku-map\)/));
         await W.recordWidenManualStop(A.dbO, { attemptId: a.widen_prepare_id, entryId: 'gas:logizard-sheet-and-sku-map', stoppedBy: '中原' });
       } });
     assert.equal(AT.id, id);
@@ -203,10 +215,40 @@ try {
   });
 
   await ta('[M1] 移行の apply は試みの窓で通る (H0 と同じ・widen_attempt を返す)・2 回目は断る (EXISTS)', async () => {
-    const r = await migrate(A, legacyA);
+    const r = await migrate(A, legacyA, AT.id);
     assert.equal(r.committed, true); assert.equal(r.subset.match, true); assert.equal(r.widen_attempt, AT.id);
     assert.equal((await A.q("select count(*)::int as n from core.amazon_sku_maps where state = 'active' and origin = 'legacy'"))[0].n, 3);
-    await assert.rejects(migrate(A, legacyA), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
+    await assert.rejects(migrate(A, legacyA, AT.id), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
+  });
+
+  await ta('[M3] 移行の窓 = widen と同じ ack の条件 (#1648 Codex R1 Medium 1): 書きかけ・黙っている (古い)・1 版・prepare の前・見た prepared が違う・capable に無い = 断る / 直せば窓 (= EXISTS まで進む)', async () => {
+    const at = (ms) => new Date(Date.now() + ms).toISOString();
+    const prepAt = (await A.q('select prepared_at from ops.master_widen_attempts where widen_prepare_id = $1', [AT.id]))[0].prepared_at;
+    const cases = [
+      ['書きかけ', { instance_id: 'r-w', inflight_count: 2, oldest_inflight_at: at(-1000) }, /r-w: 書きかけが 2 件/],
+      ['黙っている (古い ack)', { instance_id: 'r-old', acked_at: at(-20 * 60000) }, /r-old: 黙っている/],
+      ['1 版の ack', { instance_id: 'r-v1', ack_version: 1 }, /r-v1: 記録が 1 版/],
+      ['prepare の前の ack', { instance_id: 'r-pre', acked_at: new Date(new Date(prepAt).getTime() - 1000).toISOString() }, /r-pre: 記録が prepare の前/],
+      ['見た prepared が違う', { instance_id: 'r-ph', prepared_hash_seen: hex('d') }, /r-ph: 見た prepared が試みのものでない/],
+      ['capable に Amazon が無い', { instance_id: 'r-cap', capable: [KEY_K] }, /r-cap: build が足すキー .* を company にできない/],
+    ];
+    for (const [label, fields, re] of cases) {
+      await insertAck(A, AT.id, fields);
+      await assert.rejects(migrate(A, legacyA, AT.id), phaseErr(re), label);
+      const w = (await A.q('select ops.amazon_map_migration_window($1::uuid) as r', [AT.id]))[0].r;
+      assert.equal(w.ok, false, label);
+      assert.deepEqual(w.problems, (await check(A, AT.id)).problems.filter((p) => !/^amazon_map|^loads|^material|^decisions|^shape/.test(p)), `${label}: widen の判定と同じ`);
+      // 直す = そのプロセスの新しい記録 (止めたプロセス = stopped)
+      await insertAck(A, AT.id, { instance_id: fields.instance_id, stopped: true, stopped_reason: '試験で止めた', inflight_count: 0, oldest_inflight_at: null, acked_at: at(0) });
+    }
+    // 全部直した = 窓 (= 窓の後の「もう対応がある」まで進む)
+    await assert.rejects(migrate(A, legacyA, AT.id), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
+    assert.equal((await A.q('select ops.amazon_map_migration_window($1::uuid) as r', [AT.id]))[0].r.ok, true);
+    // ack が足りない = 場所 (minipc) の新しい記録が無い (全部止めた記録)
+    await insertAck(A, AT.id, { host: 'minipc', instance_id: 'm-a', session_role: 'master_gate_minipc', stopped: true, stopped_reason: '試験', acked_at: at(0) });
+    await assert.rejects(migrate(A, legacyA, AT.id), phaseErr(/ack: minipc: .* 分以内の記録が無い/));
+    await A.acks(ownershipHash(WIDEN_A), BASE_K);   // 戻す (render・minipc の新しい 2 版)
+    await assert.rejects(migrate(A, legacyA, AT.id), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
   });
 
   await ta('[A2] Amazon だけの試み: 区分の食い違い (held 1 件) があっても通る・数は Amazon の 3 つだけ / 消えた対応 1 件 = 断る / active 0 件 = 断る (読むだけと apply が同じ答え)', async () => {
@@ -270,7 +312,7 @@ try {
     const ev = (await A.q("select detail -> 'evidence' -> 'amazon_map' as m from ops.master_widen_events where widen_prepare_id = $1 and action = 'widen'", [AT.id]))[0].m;
     assert.deepEqual(ev, { legacy_hash: step.result().legacy_hash, company_hash: step.result().company_hash, master_rows: 3, component_rows: 4 });
     assert.equal((await A.q('select ops.sku_kind_locked() as l'))[0].l, true);   // 区分の守りはそのまま
-    await assert.rejects(migrate(A, legacyA), phaseErr(/試みが無い/));            // widen の後 = 試みが無い = 断る (EXISTS より前)
+    await assert.rejects(migrate(A, legacyA, AT.id), phaseErr(/attempt_not_prepared/));   // widen の後 = 閉じた試み = 断る (EXISTS より前)
   });
 
   // ═══ DB-B: sku_kind も Amazon も load (0058 の前提の形) で、sku_kind だけの試み・両方の試み・移行の段階の条件 ═══
@@ -279,6 +321,7 @@ try {
   const legacyB = makeLegacy(dirB);
   const WIDEN_K = { ...BASE0, [KEY_K]: 'company' }, WIDEN_KA = { ...BASE0, [KEY_K]: 'company', [KEY_A]: 'company' };
 
+  let KCANCELLED = null;
   await ta('[K1] sku_kind だけの試み (今までどおり): held 1 件 = 断る・最終形を数える / Amazon の数は見ない (active 0・消えた対応があっても止まらない) / 移行の apply は断る', async () => {
     const K = await readyAttempt(B, { base: BASE0, widen: WIDEN_K, stops: ['ne:set-kind'], skuKind: { format: 'sku-kind-v1', held: ['a002'], unverifiable: [] } });
     assert.deepEqual(K.required_manual_entries, ['ne:set-kind']);
@@ -288,8 +331,9 @@ try {
     assert.deepEqual([r.counts.held, r.counts.single_product_mismatch, r.counts.non_set_parent_components, r.counts.amazon_map_active], [1, 0, 0, undefined]);
     await variant(B, K.id, '最終形 (セットに product_id)', (c) => c.query("update core.skus set product_id = (select p.product_id from core.products p where p.display_code = 'a005') where code = 'aset1'"), /区分と product_id の不整合が 1 件/);
     // 移行: sku_kind だけの試み = 窓でない
-    await assert.rejects(migrate(B, legacyB), phaseErr(/listing_components\.amazon が無い/));
+    await assert.rejects(migrate(B, legacyB, K.id), phaseErr(/not_amazon: .*listing_components\.amazon が無い/));
     await W.cancelWiden(B.dbO, { attemptId: K.id, actor: 't' });
+    KCANCELLED = K.id;
     // held 0 の試みは Amazon の対応が 0 件でも通る (Amazon を足さない)
     const K2 = await readyAttempt(B, { base: BASE0, widen: WIDEN_K, stops: ['ne:set-kind'] });
     const r2 = await check(B, K2.id);
@@ -317,7 +361,7 @@ try {
     KA = await readyAttempt(B, { base: BASE0, widen: WIDEN_KA, stops: ['ne:set-kind'], skuKind: { format: 'sku-kind-v1', held: ['a002'], unverifiable: [] },
       beforeLoads: async (a) => {
         assert.deepEqual(a.required_manual_entries, ['gas:logizard-sheet-and-sku-map', 'ne:set-kind']);
-        await assert.rejects(migrate(B, legacyB), phaseErr(/gas:logizard-sheet-and-sku-map/));   // Amazon の入口を止める前
+        await assert.rejects(migrate(B, legacyB, a.widen_prepare_id), phaseErr(/manual_stops: 止めた手の入口 \(ne:set-kind\)/));   // Amazon の入口を止める前
         await W.recordWidenManualStop(B.dbO, { attemptId: a.widen_prepare_id, entryId: 'gas:logizard-sheet-and-sku-map', stoppedBy: '中原' });
       } });
     const r = await check(B, KA.id);
@@ -327,8 +371,9 @@ try {
   });
 
   await ta('[M2] 移行は epoch の共有の鍵を取る = 試みの cancel (epoch の排他) を持つ取引の間は待つ・frozen は今までどおり', async () => {
+    await assert.rejects(migrate(B, legacyB, KCANCELLED), phaseErr(/attempt_not_prepared/));   // 違う試み (cancel した前の試み) を指す = 断る
     await B.O2.query('begin'); await B.O2.query('select pg_advisory_xact_lock(ops.master_ownership_lock_key())');
-    const m = launch(migrate(B, legacyB));
+    const m = launch(migrate(B, legacyB, KA.id));
     await sleep(600);
     const waited = !m.done;
     await B.O2.query('rollback');

@@ -9,7 +9,8 @@
  *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --legacy-hash --legacy <warehouse.db>
  *   # 切替の日 ③ (段階 frozen の間 か、🆕 段階 new_open で listing_components.amazon を足す広げる道の試みが開いていて手の入口
  *   #   gas:logizard-sheet-and-sku-map を止めた記録がある間だけ (0059・PR-B)・手順書の順番でだけ)。H0 と照らして同じときだけ commit
- *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes
+ *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --attempt <widen_prepare_id> --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes
+ *   🆕 --attempt は apply で要る (#1648 Codex R1 Medium 1・本番の段階は new_open = 指した試みの窓でだけ通る)
  * 影運転の先が本番でないことの確かめ (Codex #1586 R1 M2): 本番の URL (env COMPANY_DB_URL) が要る (無ければ断る)。
  *   ① URL のホスト・ポート・DB 名が本番と同じ = 断る (ユーザー・パスワードは見ない = 別のユーザーでも同じ DB は断る)
  *   ② 両方につないで、DB 名が同じ かつ DB の識別 (pg_control_system() の system_identifier) が同じか読めない = 断る (識別が読めない所では、試し用の DB は本番と違う DB 名にする)
@@ -108,11 +109,12 @@ if (isMain) {
       url = process.env.COMPANY_DB_URL;
       if (!url) throw fail('COMPANY_DB_URL が要る');
       if (!getArg('--actor') || !getArg('--expect-hash')) throw fail('apply は --actor と --expect-hash <H0> が要る');
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(getArg('--attempt') || ''))) throw fail('apply は --attempt <widen_prepare_id> (prepare --widen の試み) が要る');
       if (!args.includes('--yes')) { console.log('--yes が無いので移さない (切替の日の手順書の順番でだけ使う)'); process.exit(0); }
     }
     const client = await openPgClient(url, { application_name: `amazon-map-${mode}` });
     try {
-      const r = await runAmazonMapMigration(pgAdapter(client), legacy, { mode, actor: getArg('--actor') || 'amazon_map_shadow', expectHash: getArg('--expect-hash'), sheetOnly, log: (m) => console.log(m) });
+      const r = await runAmazonMapMigration(pgAdapter(client), legacy, { mode, actor: getArg('--actor') || 'amazon_map_shadow', expectHash: getArg('--expect-hash'), attemptId: getArg('--attempt'), sheetOnly, log: (m) => console.log(m) });
       const out = getArg('--json');
       if (out) fs.writeFileSync(out, JSON.stringify(r, null, 2));
       console.log(`古い表のハッシュ: ${r.legacy_digest.content_hash || r.legacy_digest.error} (親 ${r.legacy_digest.master_rows}・構成 ${r.legacy_digest.component_rows})`);
