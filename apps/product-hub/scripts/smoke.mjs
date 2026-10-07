@@ -10724,6 +10724,28 @@ for (const [name, file, data] of renders) {
     const k2 = mount({ ...base0, rkValue: '4', store: st5 });
     check('🚨 画面の試算: 保存して読み直しても NE の送料 (837円) へ戻らない',
       k2.profit() === '564円', k2.profit());
+    check('🚨 画面の試算: 読み直しても「候補が無いので変えていない」と書き続ける',
+      k2.note.textContent.includes('試算できる NE の配送方法が選択肢にない'), k2.note.textContent);
+    // 🚨 あとで NE にゆうパックの便が入ったら、残していた便ではなくそれに合わせる。
+    //    人が選んだ記録と同じに扱うと、古い便で試算し続けて利益を良く見せる (Codex R13 P1)
+    {
+      const withYp = [...options, { method: 'ゆうパック60サイズ', cost: 810, count: 50 }];
+      const k3 = mount({
+        options: withYp, picks: vari.profitShipPickByGroup(withYp, hints, labels),
+        near: vari.profitShipNearByGroup(withYp, hints, labels),
+        labels, hints, neCurrent: 'ネコポス', rkValue: '4', store: st5,
+      });
+      check('🚨 画面の試算: あとで候補が現れたら、残していた便を捨てて合わせ直す',
+        k3.sel.value === 'ゆうパック60サイズ' && k3.shipCost() === '810', k3.profit() + ' / ' + k3.sel.value);
+    }
+    // 人が自分で選んだ記録は、候補があっても勝つ (carry と混ぜない)
+    {
+      const st6 = fakeStore();
+      const k4 = mount({ ...base0, rkValue: '1', store: st6 });
+      k4.pick('定形外規格外（1kg以内）');
+      const k5 = mount({ ...base0, rkValue: '1', store: st6 });
+      check('画面の試算: 人が選んだ記録は候補があっても勝つ', k5.profit() === '564円', k5.profit());
+    }
   }
 
   // ⑥ 未選択に戻す = 合わせ先が無いだけ。選択は動かさない
@@ -13515,24 +13537,27 @@ for (const [name, file, data] of renders) {
       const m = mem(st, 'k');
       m.remember('定形外規格外（1kg以内）', '1');
       check('覚え書き: 同じ配送方法なら覚えた便を返す',
-        m.read('1') === '定形外規格外（1kg以内）', String(st.raw));
+        m.read('1')?.method === '定形外規格外（1kg以内）' && m.read('1')?.kind === 'manual', String(st.raw));
       check('🚨 覚え書き: 別の配送方法のときの選択は使わない (別タブで変わった後に勝たせない)',
-        m.read('5') === '');
+        m.read('5') === null);
+      m.remember('ネコポス', '1', 'carry');
+      check('覚え書き: 出自 (人が選んだ / 候補が無くて残した) も覚える',
+        m.read('1')?.kind === 'carry', String(st.raw));
       m.forget();
-      check('覚え書き: 忘れたら空', m.read('1') === '' && st.raw === null);
+      check('覚え書き: 忘れたら空', m.read('1') === null && st.raw === null);
     }
     {
       // 🚨 書けなかったら古い記憶を消す。残すと「いま選んだ便でもない前の便」へ戻る
       const st = fake({ initial: JSON.stringify({ method: '便A', group: '1' }), writeThrows: true });
       const m = mem(st, 'k');
-      check('覚え書き: 覚える前は古い便が読める (前提の確認)', m.read('1') === '便A');
+      check('覚え書き: 覚える前は古い便が読める (前提の確認)', m.read('1')?.method === '便A');
       m.remember('便B', '1');
       check('🚨 覚え書き: 書けなかったときは古い記憶を消す (前の便へ勝手に戻さない)',
-        m.read('1') === '' && st.raw === null);
+        m.read('1') === null && st.raw === null);
     }
     {
       const m = mem(fake({ readThrows: true }), 'k');
-      check('覚え書き: store を読めない環境でも落ちない (覚えないだけ)', m.read('1') === '');
+      check('覚え書き: store を読めない環境でも落ちない (覚えないだけ)', m.read('1') === null);
     }
   }
 }

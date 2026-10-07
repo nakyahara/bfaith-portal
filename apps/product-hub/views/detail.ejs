@@ -5249,17 +5249,24 @@ th.attr-unknown { color: #dc2626; }
       // 「— 選んでください」(未選択) に戻したときは合わせ先が無いだけ。選択は動かさない
       const doFollow = !!follow && group !== '';
       const pick = (doFollow && picks ? picks[group] : null) || null;
-      // 🚨 人が自分で選んだ配送方法がいちばん強い。保存すると画面は丸ごと読み直されるので、
-      //    覚えておかないと「大きさが違うので選び直した」が保存のたびに消える (Codex R4 P1)
-      const mine = has(remembered) ? remembered : '';
       const picked = pick && has(pick.method) ? pick.method : '';
+      // 🚨 人が自分で選んだ配送方法 (manual) がいちばん強い。保存すると画面は丸ごと
+      //    読み直されるので、覚えておかないと「大きさが違うので選び直した」が
+      //    保存のたびに消える (Codex R4 P1)。
+      //    「当てはまる便が無いので残した」(carry) は**候補がまだ無いときだけ**使う。
+      //    同じに扱うと、あとで候補が増えても古い便で試算し続ける (Codex R13 P1)
+      const mem = (remembered && typeof remembered === 'object')
+        ? remembered : { method: String(remembered || ''), kind: 'manual' };
+      const mine = (has(mem.method) && (mem.kind !== 'carry' || !picked)) ? mem.method : '';
       // 合わせ先が無ければ 選択中 → NE の登録値 → 先頭。実送料の行を外すと、
       // 開いただけで利益額が代表送料に変わる (#1167 Codex R3 P1)
       const current = options.find((o) => o.isCurrent);
       const want = [chosen, neCurrent].find(has);
       const method = mine || picked || want || current?.method || options[0]?.method || '';
-      // 人の選択が勝ったときは「合わせた」と言わない (注記が実態と食い違う)
-      return { method, followed: doFollow && !mine ? { group, pick: picked ? pick : null } : null };
+      // 人の選択 (manual) が勝ったときは「合わせた」と言わない (注記が実態と食い違う)。
+      // carry は「候補が無いので残した」状態そのものなので、読み直してもその注記を出す
+      const claim = doFollow && (!mine || mem.kind === 'carry');
+      return { method, followed: claim ? { group, pick: picked ? pick : null } : null };
     }
     // 注記。「何の送料で試算しているか」「ほかに何通りあるか」「試算であって保存ではない」を書く
     // (追従した説明で「試算だけ」が消えると、NE の配送方法まで保存されたように読める — Codex R3 P2)
@@ -5323,12 +5330,13 @@ th.attr-unknown { color: #dc2626; }
         read(group) {
           try {
             const d = JSON.parse(store.getItem(key) || 'null');
-            if (!d || String(d.group ?? '') !== String(group)) return '';
-            return String(d.method || '');
-          } catch (_) { return ''; }   // 使えない環境は覚えないだけ
+            if (!d || String(d.group ?? '') !== String(group)) return null;
+            // kind: manual = 人が選び直した / carry = 当てはまる便が無いので残した
+            return { method: String(d.method || ''), kind: d.kind === 'carry' ? 'carry' : 'manual' };
+          } catch (_) { return null; }   // 使えない環境は覚えないだけ
         },
-        remember(method, group) {
-          try { store.setItem(key, JSON.stringify({ method, group, at: Date.now() })); }
+        remember(method, group, kind) {
+          try { store.setItem(key, JSON.stringify({ method, group, kind: kind === 'carry' ? 'carry' : 'manual', at: Date.now() })); }
           catch (_) {
             // 🚨 書けなかったら**古い記憶を消す** (Codex R8 P3)。残すと、容量超過のあとで
             //    読み直したときに「前に選んだ別の便」へ勝手に戻る (いま選んだ便でもない)
@@ -5438,7 +5446,7 @@ th.attr-unknown { color: #dc2626; }
           // 🚨 当てはまる便が無くて**選択を残した**ときは、新しい配送方法と組にして覚える。
           //    覚えないと、そのまま保存して読み直したときに NE の送料へ戻り、
           //    利益が勝手に良くなる (Codex R12 P2)
-          if (followed && !followed.pick) mine.remember(sel.value, groupOf());
+          if (followed && !followed.pick) mine.remember(sel.value, groupOf(), 'carry');
         });
       }
       // 🚨 開いたときも保存されている楽天の配送方法に合わせる。中原さんの報告は
