@@ -27,6 +27,13 @@
  *   G2 外す道は PGlite の adapter (lockWatchExempt) だけ = pgAdapter は持たない・runner に外す opts は無い・heartbeat を書く関数を試験の外で使うのは見張りだけ (grep の縛り)
  *   E3 本物の子のプロセス: 親を kill → 見張りは IPC の切れを見て、lock が無ければ知らせて exit 0 / lock があれば外れるまで見張って ✅
  *   L1 fork / spawn を起動できない (error event) → 未処理の誤りで落ちずに exit 1 に変わる
+ *   🆕 Codex R3:
+ *   P4 親と migrate がほぼ同時に消えた (held → none と親の切れが同じ見回り) → 親の死を先に知らせる (外れたことも同じ文に・45 分の知らせを出していたかも)・exit 0 /
+ *      その知らせが 5 回とも届かない → exit 3
+ *   P5 親が切れた時に lock が残っていた ⚠️ が 5 回とも届かない → 覚えて、外れた後に exit 3 (届けば 0)
+ *   G3 本物の PG の adapter で CONCURRENTLY を外す道 (取引の中) も各文の直前に heartbeat を確かめる = 1 文目の後に heartbeat が古くなると 2 文目の前で止まり、
+ *      取引ごと巻き戻して記録しない (1 文目の index も残らない・lock も残らない) / heartbeat が新しいままなら 2 文とも作って記録する
+ *      (取引の中の pg_stat_activity は写し = pg_stat_clear_snapshot で捨ててから読む。捨てなければ 1 文目の前の新しい heartbeat が見えたままで通ってしまう)
  *   E1 本物の子のプロセス: migrate-watched の本体 + 見張りの CLI (--supervised --dry-run) + migrate.mjs の CLI = 起動の知らせ → migrate → ⚠️ → ✅ → exit 0
  *   E2 本物の子のプロセス: 起動の知らせが届かない (届かない https) → migrate を始めない (記録の表も無い)
  *   C1 CLI: 見張りは単独で起動しない・--url / --alert-min (dry-run でない) は exit 2 / migrate-watched は送り先・接続先が無い・--url・--dry-run で exit 2
@@ -224,6 +231,36 @@ await t('P3 (Codex R2 Medium 2) ready から 10 分 lock が一度も現れな�
   r = await sim(() => null, { supervised: true, noStartMin: 600, maxHours: 2 });
   assert.deepEqual([r.result.outcome, r.result.code], ['max_hours', EXIT.FAIL]);
   assert.match(r.sends.at(-1).text, /打ち切る \(2 時間\): lock は無い/);
+});
+
+await t('P4 (Codex R3 Medium 1) 親と migrate がほぼ同時に消えた (held → none と親の切れが同じ見回り) → 親の死を先に知らせる (外れたことも同じ文に)・exit 0 / 5 回とも届かない → exit 3', async () => {
+  // 鳴る前 (10 分で消える)
+  let gone = false;
+  const tl = (until) => (c) => { if (c >= until * MIN) { gone = true; return null; } return c >= 1 * MIN ? H(831) : null; };
+  let r = await sim(tl(10), { supervised: true, isParentGone: () => gone, priorPoll: { atMs: 0, pid: null } });
+  assert.deepEqual([r.result.outcome, r.result.code, r.sends.length], ['parent_gone', 0, 1]);
+  assert.match(r.sends[0].text, /親 \(migrate-watched\) が途中で終わった.*lock は今は無い \(pid 831 .*がおおよそ 10 分持っていた後に外れた\) = 見張りを終える/);
+  assert.doesNotMatch(r.sends[0].text, /45 分の知らせを出していた/);
+  // 鳴った後 (50 分で消える) = 「45 分の知らせを出していた」も同じ文に
+  gone = false;
+  r = await sim(tl(50), { supervised: true, isParentGone: () => gone, priorPoll: { atMs: 0, pid: null } });
+  assert.deepEqual([r.result.outcome, r.result.code], ['parent_gone', 0]);
+  assert.deepEqual(r.sends.map((x) => x.at / MIN), [45, 50]);
+  assert.match(r.sends[1].text, /親 \(migrate-watched\) が途中で終わった.*45 分の知らせを出していた/);
+  // その知らせが 5 回とも届かない → exit 3
+  gone = false;
+  r = await sim(tl(10), { supervised: true, isParentGone: () => gone, priorPoll: { atMs: 0, pid: null } }, () => false);
+  assert.deepEqual([r.result.outcome, r.result.code, r.sends.length], ['parent_gone', EXIT.NOTIFY_END_FAILED, 5]);
+});
+await t('P5 (Codex R3 Medium 1) 親が切れた時に lock が残っていた ⚠️ が 5 回とも届かない → 覚えて、外れた後に exit 3 / 届けば exit 0', async () => {
+  let gone = false;
+  const tl = (c) => { if (c >= 5 * MIN) gone = true; return c >= 1 * MIN && c < 20 * MIN ? H(841) : null; };
+  let r = await sim(tl, { supervised: true, isParentGone: () => gone, priorPoll: { atMs: 0, pid: null } }, (i, x) => !x.includes('外れるまで見張る'));
+  assert.equal(r.sends.filter((x) => x.text.includes('外れるまで見張る')).length, 5);
+  assert.deepEqual([r.result.outcome, r.result.code, r.result.notifyFailed], ['released', EXIT.NOTIFY_END_FAILED, true]);
+  gone = false;
+  r = await sim(tl, { supervised: true, isParentGone: () => gone, priorPoll: { atMs: 0, pid: null } });
+  assert.deepEqual([r.result.outcome, r.result.code], ['released', 0]);
 });
 
 console.log('— 起動の知らせと親の下の見張り —');
@@ -547,11 +584,60 @@ try {
     assert.equal((src.match(/lockWatchExempt: true/g) || []).length, 1, 'lockWatchExempt: true は pgliteAdapter の 1 か所だけ');
     assert.ok(/export function pgliteAdapter[\s\S]{0,600}lockWatchExempt: true/.test(src));
     assert.ok(!/requireLockWatch|cliRunOptions|skipLockWatch|lockWatchOptional/.test(src), '外す opts の名前が無い');
-    assert.equal((src.match(/await assertLockWatchFresh\(db, \{ nonce: opts\.lockWatchNonce \?\? process\.env\[LOCK_WATCH_NONCE_ENV\], label: f\.file \}\)/g) || []).length, 2, 'CIC の 2 つの道で必ず呼ぶ');
+    // 取引の外の CIC の各文の前 (1)・取引の中の道の前 (1)・取引の中の道の各文の前 (1・inTx) = 3 か所 (🆕 Codex R3 M2)
+    assert.equal((src.match(/await assertLockWatchFresh\(db, \{ nonce: opts\.lockWatchNonce \?\? process\.env\[LOCK_WATCH_NONCE_ENV\], label: f\.file \}\)/g) || []).length, 1, '取引の外の CIC の各文の前');
+    assert.equal((src.match(/if \(lockWatch\) await assertLockWatchFresh\(db, \{ nonce: lockWatch\.nonce, label: f\.file \}\)/g) || []).length, 1, '取引の中の道の前');
+    assert.equal((src.match(/if \(lockWatch\) await assertLockWatchFresh\(db, \{ nonce: lockWatch\.nonce, label: f\.file, inTx: true \}\)/g) || []).length, 1, '取引の中の道の各文の前');
+    assert.ok(/const lockWatch = db\.lockWatchExempt === true \? null : \{ nonce: opts\.lockWatchNonce \?\? process\.env\[LOCK_WATCH_NONCE_ENV\] \}/.test(src), '外すのは lockWatchExempt だけ');
     const hits = [];
     const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (['node_modules', '.git'].includes(e.name)) continue; const q = path.join(d, e.name); if (e.isDirectory()) walk(q); else if (/\.(m?js)$/.test(e.name) && !/^test-/.test(e.name) && fs.readFileSync(q, 'utf8').includes('writeLockWatchHeartbeat')) hits.push(path.relative(ROOT, q).replace(/\\/g, '/')); } };
     for (const d of ['apps', 'lib', 'scripts', 'config']) walk(path.join(ROOT, d));
     assert.deepEqual(hits, ['scripts/company-db/migrate-lock-watch.mjs']);
+  });
+
+  await t('G3 (Codex R3 Medium 2) 本物の PG の adapter で CONCURRENTLY を外す道 (取引の中) も各文の直前に heartbeat を確かめる: 1 文目の後に古くなると 2 文目の前で止まり、取引ごと巻き戻して記録しない / 新しいままなら 2 文とも作る', async () => {
+    const CI2_SQL = '-- migrate:concurrent-index\ncreate index concurrently if not exists t_b2_idx on app.t (b);\ncreate index concurrently if not exists t_a2_idx on app.t (a);\n';
+    await cx.query('create index concurrently if not exists t_b2_idx on app.t (b)');
+    await cx.query('create index concurrently if not exists t_a2_idx on app.t (a)');
+    const EXPECT2 = await buildIndexExpect(pgAdapter(cx), { version: '0002', name: 'idx2', file: '0002_idx2.sql', text: CI2_SQL, concurrentIndex: true });
+    const dir2 = () => mkDir({ '0001_base.sql': BASE, '0002_idx2.sql': CI2_SQL, '0002_idx2.expect.json': JSON.stringify(EXPECT2, null, 2) });
+    const nonce = newRunNonce();
+    /** 1 文目 (t_b2_idx) を流した直後に heartbeat を古くする adapter (取引の中の道) */
+    const staleAfterFirst = (c, hb) => {
+      const base = pgAdapter(c); const seen = [];
+      return { seen, adapter: { ...base, supportsConcurrentIndex: false, exec: async (q) => {
+        const r = await base.exec(q);
+        if (/^\s*create\s+index\s+if\s+not\s+exists\s+t_b2_idx/i.test(q)) { seen.push('b2'); await setAppName(hb, `${WATCH_APPLICATION_NAME}:${nonce}:${(await nowEpoch()) - LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC - 30}`); }
+        if (/^\s*create\s+index\s+if\s+not\s+exists\s+t_a2_idx/i.test(q)) seen.push('a2');
+        return r;
+      } } };
+    };
+    // ① 1 文目の後に古くなる → 2 文目の前で止まる
+    let dbT = await newDb();
+    let c = await open(roleUrl(RUNNER, dbT));
+    let hb = await open(roleUrl(WATCHER, dbT));
+    await writeLockWatchHeartbeat(hb, nonce);   // 新しい heartbeat (1 回だけ・見回りは続けない = 止まった見張り)
+    const x = staleAfterFirst(c, hb);
+    await assert.rejects(migrateWithLock(x.adapter, { dir: dir2(), log: quiet, readDiskMetrics: BIG_DISK, lockWatchNonce: nonce }),
+      (e) => e.code === 'LOCK_WATCH_REQUIRED' && /0002_idx2\.sql/.test(e.message) && /古い/.test(e.message) && /巻き戻した/.test(e.message));
+    assert.deepEqual(x.seen, ['b2'], '2 文目を流していない');
+    assert.deepEqual(await versions(c), ['0001']);
+    assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_b2_idx'), null, '1 文目の index も巻き戻った');
+    assert.equal(await readIndexAttrs(pgAdapter(c), 'app', 't_a2_idx'), null);
+    assert.deepEqual(await describeLockHolder(pgAdapter(su)), []);
+    // ② heartbeat が新しいまま (本物の見張りの読み手で見回る) → 2 文とも作って記録
+    dbT = await newDb();
+    c = await open(roleUrl(RUNNER, dbT));
+    const reader = pgHolderReader(roleUrl(WATCHER, dbT), { nonce });
+    await reader.read();
+    try {
+      const r = await migrateWithLock({ ...pgAdapter(c), supportsConcurrentIndex: false }, { dir: dir2(), log: quiet, readDiskMetrics: BIG_DISK, lockWatchNonce: nonce });
+      assert.deepEqual(r.applied, ['0001', '0002']);
+      assert.ok((await readIndexAttrs(pgAdapter(c), 'app', 't_b2_idx')).valid);
+      assert.ok((await readIndexAttrs(pgAdapter(c), 'app', 't_a2_idx')).valid);
+    } finally { await reader.close(); }
+    await cx.query('drop index concurrently if exists app.t_b2_idx');
+    await cx.query('drop index concurrently if exists app.t_a2_idx');
   });
 
   // ─── 本物の子のプロセス (migrate-watched の本体 + 見張りの CLI + migrate.mjs の CLI) ───

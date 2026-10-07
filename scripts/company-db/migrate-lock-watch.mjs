@@ -217,14 +217,25 @@ export async function runLockWatch(o) {
         log(`${holderLine(cur.lastH)} の lock が外れた (おおよそ ${minText(heldMs)})`);
         const text = `✅ Company DB の migrate の lock (${MIGRATE_LOCK_NAME}) が外れた: ${holderLine(cur.lastH)}・DB ${dbName}・おおよそ ${minText(heldMs)}持っていた\n・結果は migrate の窓の log と \`migrate.mjs --list\` で確かめる (記録されていない file があれば README の回収の手順)`;
         const alerted = cur.alertedAtMs != null;
+        const releasedLine = holderLine(cur.lastH);
         cur = null;
-        if (!h) return finish('released', EXIT.OK, alerted ? text : null);
+        if (!h) {
+          // 🆕 Codex R3 M1: 親と migrate がほぼ同時に消えた (held → none と IPC の切れが同じ見回り) = 親の死を先に知らせる (外れたことも同じ文に)。
+          //   終わりの知らせ = 5 回送り直し、届かなければ exit 3
+          //   (もう「親が途中で終わった・lock がある」を知らせた後 = ふつうの「外れた」)
+          if (isParentGone() && !isParentDone() && !parentGoneNoticed) {
+            log(`親 (migrate-watched) が終わり、${releasedLine} の lock も外れた = 知らせて見張りを終える`);
+            return finish('parent_gone', EXIT.OK, `⚠️ Company DB の migrate の見張りの親 (migrate-watched) が途中で終わった・DB ${dbName}・migrate の lock は今は無い (${releasedLine} がおおよそ ${minText(heldMs)}持っていた後に外れた${alerted ? '・45 分の知らせを出していた' : ''}) = 見張りを終える\n・migrate の窓の log と \`migrate.mjs --list\` で、記録されていない file が無いかを確かめる (README の回収の手順)`);
+          }
+          return finish('released', EXIT.OK, alerted ? text : null);
+        }
         if (alerted && !(await sendTerminal(text))) { earlierNotifyFailed = true; log(`❌ 「外れた」が届かなかった (持ち主が替わった = 見張りは続け、最後に exit ${EXIT.NOTIFY_END_FAILED})`); }
       }
       if (h && isParentGone() && !parentGoneNoticed) {
         parentGoneNoticed = true;
         log(`親 (migrate-watched) が終わった・lock は ${holderLine(h)} が持っている = 外れるまで見張る`);
-        await send(`⚠️ Company DB の migrate の見張りの親 (migrate-watched) が途中で終わった・DB ${dbName}・migrate の lock は ${holderLine(h)} が持っている = 外れるまで見張る (${c.alertMin} 分の知らせも出す)\n・migrate の窓を人が見る`);
+        // 🆕 Codex R3 M1: この知らせも 5 回送り直し、届かなければ覚えて最後に exit 3
+        if (!(await sendTerminal(`⚠️ Company DB の migrate の見張りの親 (migrate-watched) が途中で終わった・DB ${dbName}・migrate の lock は ${holderLine(h)} が持っている = 外れるまで見張る (${c.alertMin} 分の知らせも出す)\n・migrate の窓を人が見る`))) { earlierNotifyFailed = true; log(`❌ 「親が途中で終わった」が届かなかった (見張りは続け、最後に exit ${EXIT.NOTIFY_END_FAILED})`); }
       }
       if (h) {
         everSeen = true;

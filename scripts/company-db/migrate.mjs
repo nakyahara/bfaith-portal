@@ -1044,7 +1044,11 @@ export async function assertLockWatchFresh(db, { nonce = process.env[LOCK_WATCH_
   const fail = (why) => Object.assign(new Error(`${label ? `${label}: ` : ''}migrate の lock の 45 分の見張りが動いていない (${why}) = concurrent-index を流さない (記録しない)。` +
     'scripts/company-db/migrate-watched.mjs から流す (見張りを起動 → GChat に送れたのを確かめてから migrate・見張りが見回るたびに heartbeat を出す)'), { code: 'LOCK_WATCH_REQUIRED', noTransaction: !inTx });
   if (!LOCK_WATCH_NONCE_RE.test(String(nonce || ''))) throw fail(`run の nonce (env ${LOCK_WATCH_NONCE_ENV}) が無い・形が違う`);
-  const r = await withCatalogPath(db, async () => (await db.query(`
+  // 🆕 Codex R3 M2: 取引の中では pg_stat_activity は取引の最初の読みの写し (backend の状態の cache) のまま = 止まった見張りの古い heartbeat も
+  //   新しい heartbeat も見えない。読む前に毎回 pg_stat_clear_snapshot() で写しを捨てる (取引の外の道は withCatalogPath が新しい取引 = 同じ)
+  const r = await withCatalogPath(db, async () => {
+    await db.query('select pg_catalog.pg_stat_clear_snapshot()');
+    return (await db.query(`
     with n as (select pg_catalog.floor(extract(epoch from pg_catalog.clock_timestamp()))::pg_catalog.int8 as now_s),
          e as (select pg_catalog.split_part(a.application_name, ':', 3)::pg_catalog.int8 as epoch
                  from pg_catalog.pg_stat_activity a
@@ -1052,7 +1056,8 @@ export async function assertLockWatchFresh(db, { nonce = process.env[LOCK_WATCH_
                   and a.application_name ~ ('^' || $1::pg_catalog.text || ':' || $2::pg_catalog.text || ':[0-9]{1,12}$'))
     select pg_catalog.count(e.epoch) filter (where e.epoch between n.now_s - $3::pg_catalog.int8 and n.now_s + $4::pg_catalog.int8)::pg_catalog.int4 as fresh,
            (n.now_s - pg_catalog.max(e.epoch))::pg_catalog.int8 as newest_age, pg_catalog.count(e.epoch)::pg_catalog.int4 as same_run
-      from n left join e on true group by n.now_s`, [MIGRATE_LOCK_WATCH_APPLICATION_NAME, nonce, LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC, LOCK_WATCH_HEARTBEAT_FUTURE_SEC])).rows[0], { inTx });
+      from n left join e on true group by n.now_s`, [MIGRATE_LOCK_WATCH_APPLICATION_NAME, nonce, LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC, LOCK_WATCH_HEARTBEAT_FUTURE_SEC])).rows[0];
+  }, { inTx });
   if (!r.fresh) {
     throw fail(r.same_run ? `この run の見張りの heartbeat が ${r.newest_age} 秒前で古い (${LOCK_WATCH_HEARTBEAT_MAX_AGE_SEC} 秒まで) = 見張りが止まっている` : 'この run の見張りの接続が同じ DB に無い');
   }
@@ -1233,7 +1238,7 @@ async function applyConcurrentIndexFile(db, f, plan, opts, log, appliedBy, mode,
 }
 
 /** concurrent-index に対応しない adapter (PGlite) = 同じ文から concurrently を外し、ふつうの取引で流す。属性の検証は同じ */
-async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTimeout, statementTimeout, mode) {
+async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTimeout, statementTimeout, mode, lockWatch = null) {
   log(`apply ${f.file} (concurrent-index を取引の中で・concurrently を外す = この adapter は CIC に対応しない) ...`);
   await db.exec('begin');
   try {
@@ -1247,6 +1252,8 @@ async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTim
     await db.exec(`set local search_path = ${CATALOG_SEARCH_PATH}`);
     await setLexerPremiseLocal(db);   // 🆕 Codex R3 High 2: PGlite の道も同じ前提 (concurrent-index の file は新しい形 = legacy の互換は関係ない)
     for (const st of plan.statements) {
+      // 🆕 Codex R3 M2: 本物の PG の adapter で CONCURRENTLY を外す道も、各文の直前に見張りの heartbeat (PGlite の adapter は lockWatch = null)
+      if (lockWatch) await assertLockWatchFresh(db, { nonce: lockWatch.nonce, label: f.file, inTx: true });
       if (st.kind === 'create') {
         const cur = await readIndexAttrs(db, st.schema, st.name, { inTx: true });
         if (cur && cur.notIndex) throw new Error(`${st.schema}.${st.name} は index でない (relkind ${cur.relkind}) = 名前が取られている`);
@@ -1270,7 +1277,8 @@ async function applyConcurrentIndexFileInTx(db, f, plan, log, appliedBy, lockTim
     await db.exec('commit');
   } catch (e) {
     try { await db.exec('rollback'); } catch { /* */ }
-    throw Object.assign(new Error(`${f.file} で失敗 (このファイルは巻き戻した。前のファイルまでは適用済み): ${e.message}`), { code: 'MIGRATION_FAILED', version: f.version, reason: e.reason, cause: e });
+    // 🆕 Codex R3 M2: 見張りの heartbeat で止まった = LOCK_WATCH_REQUIRED のまま (このファイルは巻き戻した・記録しない)
+    throw Object.assign(new Error(`${f.file} で失敗 (このファイルは巻き戻した。前のファイルまでは適用済み): ${e.message}`), { code: e.code === 'LOCK_WATCH_REQUIRED' ? e.code : 'MIGRATION_FAILED', version: f.version, reason: e.reason, cause: e });
   }
 }
 
@@ -1479,8 +1487,10 @@ export async function applyMigrations(db, opts = {}) {
       else {
         // 🆕 PR #1638 Codex R2 High: 取引の中の道 (CONCURRENTLY を外す) で見張りを外せるのは PGlite の adapter だけ (本物の PG の adapter で
         //   supportsConcurrentIndex を false にしても、同じ表に強い lock の create index になる = 見張りの heartbeat を要る)
-        if (db.lockWatchExempt !== true) await assertLockWatchFresh(db, { nonce: opts.lockWatchNonce ?? process.env[LOCK_WATCH_NONCE_ENV], label: f.file });
-        await applyConcurrentIndexFileInTx(db, f, f.plan, log, appliedBy, lockTimeout, statementTimeout, mode);
+        //   🆕 Codex R3 M2: 取引の前に 1 回 + 取引の中の各文の直前にも (取引の中で読む・止まれば取引ごと巻き戻して記録しない)
+        const lockWatch = db.lockWatchExempt === true ? null : { nonce: opts.lockWatchNonce ?? process.env[LOCK_WATCH_NONCE_ENV] };
+        if (lockWatch) await assertLockWatchFresh(db, { nonce: lockWatch.nonce, label: f.file });
+        await applyConcurrentIndexFileInTx(db, f, f.plan, log, appliedBy, lockTimeout, statementTimeout, mode, lockWatch);
       }
       result.applied.push(f.version);
       continue;
