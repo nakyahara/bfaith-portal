@@ -11,7 +11,7 @@
  *     値は本文の文字のままで整数の safe integer だけ (1073741824.00000001 ほか) / 400 ほか全部の非 200 / 理由の優先 (timeout が先・次に endpoint の順)
  *   🆕 #1600 R2: 本文は自前の厳密な JSON の読み方 (reviver の context.source を使わない = 本番の node:20-slim で動く)。Node 20 でも流す:
  *     npx -y node@20 scripts/test-company-db-render-metrics.mjs
- *   🆕 #1653: apps の下で render-metrics の名前が出るファイルは明示の一覧 (NAME_ONLY_ALLOWED) とちょうど一致し、一覧のファイルではコメントの行だけ。完全な禁止の検査ではない (指定子に名前が文字で無い import は見えない)
+ *   🆕 #1653: apps の下で render-metrics の名前が出るファイルは明示の一覧 (NAME_ONLY_ALLOWED) とちょうど一致し、一覧のファイルでは許した行の文そのものだけ (行の数も一致)。完全な禁止の検査ではない (指定子に名前が文字で無い import は見えない)
  * 実行: node scripts/test-company-db-render-metrics.mjs
  */
 import assert from 'node:assert/strict';
@@ -450,44 +450,34 @@ await t('fixture に鍵らしい文字が無い', async () => {
 });
 
 console.log('使う所はまだ無い (利益の受け口は 503 のまま)');
-// 名前の出る所を明示の一覧で見る (#1653 R2 で方針を変えた: 自前の字句の走査は `n++ / 2` などで読み違え、本物の import を黙って通す形が残った)。
+// 名前の出る所を明示の一覧で見る (#1653 R2 で lexer をやめ、R3 で行の形の判定もやめた: 文字列の中の "/*" でコメントの中と読み違え、本物の import を通した)。
 // ① apps の下 (この部品の自身を除く) で render-metrics という文字を含むファイルの集合が NAME_ONLY_ALLOWED とちょうど一致すること。
-//   一覧に無いファイルに名前が出たら (コメントでも) 落ちる = 人が見て、import でなければ理由を書いて一覧に足す (fail-closed)。
-// ② 一覧のファイルでは、名前を含む行は全部コメントの行 (行頭が // か /* か、ブロックのコメントの中の *) で、コメントの外に名前が出ないこと。
+//   一覧に無いファイルに名前が出たら (コメントでも) 落ちる = 人が見て、import でなければ理由と行を書いて一覧に足す (fail-closed)。
+// ② 一覧のファイルで名前を含む行 (前後の空白を除いた文) の多重集合が、一覧の lines とちょうど一致すること。
+//   知らない行・行の数の違い・文が変わった・消えた、どれも落ちる = 許した行の文そのものだけを通す。人が見て一覧を直す。
 // 🚨 完全な禁止の検査ではない: 指定子に文字として render-metrics が無いもの (import(`./${name}.mjs`)・文字列の連結・変数・\x2d などの escape) は見えない。
-//   ブロックのコメントの中かは行の形で見る簡易な方法 (文字列の中の /* は見分けない)。うっかりの直接の import を止めるための見張り。
+//   うっかりの直接の import を止めるための見張り。
 const NAME_ONLY_ALLOWED = new Map([
-  ['company-db/profit/response-contract.mjs', '契約のコメントで METRICS_REASONS の出どころとして名前を書いているだけ (import しない)'],
+  ['company-db/profit/response-contract.mjs', {
+    reason: '契約のコメントで METRICS_REASONS の出どころとして名前を書いているだけ (import しない)',
+    lines: ['* metrics の client (apps/company-db/profit/render-metrics.mjs の REASONS・PR 2 #1600) の理由のコード。'],
+  }],
 ]);
-// 行の終わりでブロックのコメントの中にいるか (// の後は見ない)
-const blockStateAfter = (line, inBlock) => {
-  for (let i = 0; ;) {
-    if (inBlock) { const c = line.indexOf('*/', i); if (c < 0) return true; inBlock = false; i = c + 2; }
-    else { const o = line.indexOf('/*', i), l = line.indexOf('//', i); if (o < 0 || (l >= 0 && l < o)) return false; inBlock = true; i = o + 2; }
-  }
-};
 // files = [{ rel, text }] (rel は apps/ からの相対・/ 区切り) → 問題の一覧 (空なら ok)
 function renderMetricsNameProblems(files, allowed = NAME_ONLY_ALLOWED) {
   const problems = [];
   const withName = new Set(files.filter((f) => f.text.includes('render-metrics')).map((f) => f.rel));
-  for (const rel of withName) if (!allowed.has(rel)) problems.push(`一覧に無いファイルに名前がある (import でなければ理由を書いて NAME_ONLY_ALLOWED に足す): ${rel}`);
+  for (const rel of withName) if (!allowed.has(rel)) problems.push(`一覧に無いファイルに名前がある (import でなければ理由と行を書いて NAME_ONLY_ALLOWED に足す): ${rel}`);
   for (const rel of allowed.keys()) if (!withName.has(rel)) problems.push(`一覧にあるのに名前が無い (一覧から外す): ${rel}`);
   for (const f of files) {
     if (!allowed.has(f.rel)) continue;
-    let inBlock = false;
-    f.text.split(/\r?\n/).forEach((line, k) => {
-      const startsInBlock = inBlock;
-      inBlock = blockStateAfter(line, inBlock);
-      if (!line.includes('render-metrics')) return;
-      const s = line.trimStart();
-      let comment = null;   // 名前があってよいコメントの部分
-      if (s.startsWith('//')) comment = s;
-      else if (s.startsWith('/*') || (startsInBlock && s.startsWith('*'))) {
-        const close = s.indexOf('*/', s.startsWith('/*') ? 2 : 0);
-        comment = close < 0 ? s : (s.slice(close + 2).trim() === '' ? s.slice(0, close) : null);
-      }
-      if (!comment || !comment.includes('render-metrics')) problems.push(`${f.rel}:${k + 1} 名前がコメントの外にある: ${line.trim()}`);
-    });
+    const count = new Map();
+    for (const line of f.text.split(/\r?\n/)) {
+      const s = line.trim();
+      if (s.includes('render-metrics')) count.set(s, (count.get(s) ?? 0) + 1);
+    }
+    for (const s of allowed.get(f.rel).lines) count.set(s, (count.get(s) ?? 0) - 1);
+    for (const [s, d] of count) if (d !== 0) problems.push(`${f.rel}: 許した行と違う (${d > 0 ? `一覧より ${d} 行多い` : `一覧より ${-d} 行少ない`}): ${s}`);
   }
   return problems;
 }
@@ -504,19 +494,20 @@ const APPS_JS = [];
 const appsFiles = () => APPS_JS
   .map((p) => ({ rel: decodeURIComponent(p.href.slice(APPS_DIR.href.length)), text: fs.readFileSync(p, 'utf8') }))
   .filter((f) => f.rel !== 'company-db/profit/render-metrics.mjs');
-await t('名前の見張りの見分け: 一覧の外は (コメントでも) 落ちる・一覧のファイルはコメントの行だけ通る (#1653 R2)', async () => {
+await t('名前の見張りの見分け: 一覧の外は (コメントでも) 落ちる・一覧のファイルは許した行の文そのものだけ通る (#1653 R2・R3)', async () => {
   const base = appsFiles();
   assert.ok(base.length > 100, `apps の下の JS が ${base.length} 個しか無い`);
   const RC = 'company-db/profit/response-contract.mjs';
   assert.ok(base.some((f) => f.rel === RC), '一覧のファイルが見つからない');
+  assert.deepEqual(renderMetricsNameProblems(base), []);
   const addFile = (rel, text) => [...base, { rel, text }];
   const editRc = (fn) => base.map((f) => (f.rel === RC ? { ...f, text: fn(f.text) } : f));
-  const fails = (files, re, label) => { const p = renderMetricsNameProblems(files); assert.ok(p.length > 0 && p.every((x) => re.test(x)), `${label}: ${JSON.stringify(p)}`); };
+  const fails = (files, re, label) => { const p = renderMetricsNameProblems(files); assert.ok(p.some((x) => re.test(x)), `${label}: ${JSON.stringify(p)}`); };
   // 一覧の外 → 落ちる
   fails(addFile('company-db/other.mjs', '// render-metrics を後で使う\nexport const x = 1;\n'), /一覧に無いファイル/, '一覧の外のコメント');
   fails(addFile('company-db/lazy.mjs', "count++ / 2; import('./render-metrics.mjs'); // it's lazy\n"), /一覧に無いファイル/, 'R2 の例を一覧の外に');
   fails(addFile('company-db/profit/x.mjs', "import /* side effect */ './render-metrics.mjs';\r\n"), /一覧に無いファイル/, '一覧の外の import');
-  // 一覧のファイルのコードの行 → 落ちる
+  // 一覧のファイルに許していない行 → 落ちる (コードの行も、名前のあるコメントの行も)
   for (const add of [
     "import { REASONS } from './render-metrics.mjs';",
     "/* c */ import './render-metrics.mjs';",
@@ -527,15 +518,24 @@ await t('名前の見張りの見分け: 一覧の外は (コメントでも) �
     "/**\r\n * 説明\r\n */ import './render-metrics.mjs';",
     "const k = 2\r\n  * require('./render-metrics').n;",
     "count++ / 2; import('./render-metrics.mjs'); // it's lazy",
-  ]) fails(editRc((s) => `${s}\r\n${add}\r\n`), /名前がコメントの外にある/, add);
-  // 一覧のファイルにコメントの行を足す → 通る
-  for (const add of ['// render-metrics の REASONS と同じ', '/** render-metrics の説明 */', '/*\r\n * render-metrics の説明\r\n */', '  /* render-metrics */']) {
+    // R3 の例: 文字列の中の "/*" の後の、行頭が * の本物の import
+    'const marker = "/*";\r\nconst loaders = {\r\n  *load() { return yield import("./render-metrics.mjs"); },\r\n};',
+    '// render-metrics の REASONS と同じ',
+    '/*\r\n * render-metrics の説明\r\n */',
+  ]) fails(editRc((s) => `${s}\r\n${add}\r\n`), /許した行と違う/, add);
+  // 許した行の文を 1 文字変える → 落ちる / 許した行と同じ文をもう 1 行足す → 落ちる (数が違う)
+  const allowedLine = NAME_ONLY_ALLOWED.get(RC).lines[0];
+  assert.ok(allowedLine.includes('#1600'));
+  fails(editRc((s) => s.split('PR 2 #1600').join('PR 2 #1601')), /許した行と違う/, '許した行の文を 1 文字変える');
+  fails(editRc((s) => `${s}\r\n/**\r\n ${allowedLine}\r\n */\r\n`), /一覧より 1 行多い/, '許した行と同じ文をもう 1 行');
+  // 名前の無いコメントの行を足す → 通る
+  for (const add of ['// REASONS と同じ', '/** 説明 */', '/*\r\n * 説明\r\n */']) {
     assert.deepEqual(renderMetricsNameProblems(editRc((s) => `${s}\r\n${add}\r\n`)), [], add);
   }
   // 一覧のファイルから名前が消えた → 落ちる (一覧はちょうど一致)
   fails(editRc((s) => s.split('render-metrics').join('render_metrics')), /一覧にあるのに名前が無い/, '名前が消えた');
 });
-await t('apps の下で render-metrics の名前が出るのは一覧のファイルのコメントだけ (完全な禁止の検査ではない)・router は 503 の封じ込めのまま', async () => {
+await t('apps の下で render-metrics の名前が出るのは一覧のファイルの許した行だけ (完全な禁止の検査ではない)・router は 503 の封じ込めのまま', async () => {
   assert.deepEqual(renderMetricsNameProblems(appsFiles()), []);
   const router = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
   assert.match(router, /router\.get\(`\/amazon-profit\/\$\{kind\}`, requireSyncKey, \(req, res\) => res\.status\(503\)\.json\(PROFIT_ROUTE_DISABLED\)\)/);
