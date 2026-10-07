@@ -2659,9 +2659,11 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
       .map(([id, words]) => `${id}=${labels[id]} ⇔ ${words.join('/')}`);
     check('🚨 配送費の試算: 目安の語は楽天の配送方法の名前に含まれる (4=ゆうパックに宅急便を当てない)',
       bad.length === 0, bad.join(' , '));
-    check('配送費の試算: 目安は選べる配送方法を全部カバーしている (抜けた分は候補が集まらない)',
-      Object.keys(listing.SHIPPING_METHOD_GROUPS).every((id) => vari.RAKUTEN_GROUP_NE_HINTS[id]),
-      Object.keys(listing.SHIPPING_METHOD_GROUPS).filter((id) => !vari.RAKUTEN_GROUP_NE_HINTS[id]).join(','));
+    // 🚨 「現在使用不可」(2) も**過去に保存された商品は開ける**ので、目安が無いと
+    //    その商品だけ試算が配送方法に追従しない (Codex R6 P2)。選べる分だけでは足りない
+    check('🚨 配送費の試算: 目安は保存されうる配送方法を全部カバーしている (現在使用不可も)',
+      Object.keys(listing.ALL_SHIPPING_METHOD_GROUPS).every((id) => vari.RAKUTEN_GROUP_NE_HINTS[id]),
+      Object.keys(listing.ALL_SHIPPING_METHOD_GROUPS).filter((id) => !vari.RAKUTEN_GROUP_NE_HINTS[id]).join(','));
   }
   {
     // ─── 基本情報の配送方法を変えたら試算もそれに合わせる (2026-10-06 中原さん報告) ───
@@ -2679,8 +2681,9 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     check('配送方法で試算: 楽天「定形外」= いちばん多く使っている定形の便で試算する',
       picks['1']?.method === '定形外規格内（50g以内）' && picks['1']?.cost === 182,
       JSON.stringify(picks['1']));
-    check('配送方法で試算: 当てはまる配送方法の件数と代表送料の幅を返す (画面で選び直させるため)',
-      picks['1']?.candidates === 3 && picks['1']?.min === 146 && picks['1']?.max === 510,
+    // 件数・幅は「楽天の名前で絞ったあとの候補」= 定形内 (別の段) は入らない (Codex R6 P1)
+    check('配送方法で試算: 自動で選べる候補の件数と代表送料の幅を返す (画面で選び直させるため)',
+      picks['1']?.candidates === 2 && picks['1']?.min === 182 && picks['1']?.max === 510,
       JSON.stringify(picks['1']));
     check('🚨 配送方法で試算: NE の登録値が当てはまるグループは代表値でなく NE の実送料を使う',
       picks['5']?.method === 'ネコポス' && picks['5']?.isNe === true && picks['1']?.isNe === false,
@@ -2707,6 +2710,28 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     check('配送方法で試算: 名前が当たる便が無ければ今までどおり最多で選ぶ',
       vari.profitShipPickByGroup([{ method: '定形内（50g以内）', cost: 146, count: 999 }],
         { '1': ['定形'] })['1']?.method === '定形内（50g以内）');
+    // 🚨 NE の登録値が**別の段** (定形内 146円) のときも、楽天が「定形外」なら定形外で試算する。
+    //    NE を先に見ると「定形外に合わせて定形内」になり利益を良く見せる (Codex R6 P1)
+    const neOtherTier = vari.profitShipPickByGroup([
+      { method: '定形内（50g以内）', cost: 146, count: 999, isCurrent: true },
+      { method: '定形外規格内（50g以内）', cost: 182, count: 10 },
+    ], { '1': ['定形'] });
+    check('🚨 配送方法で試算: NE が 定形内 でも、楽天が 定形外 なら定形外の便で試算する',
+      neOtherTier['1']?.method === '定形外規格内（50g以内）' && neOtherTier['1']?.isNe === false
+      && neOtherTier['1']?.reason === 'label', JSON.stringify(neOtherTier['1']));
+    check('配送方法で試算: 絞ったあとの候補だけを件数・幅に数える (定形内は入らない)',
+      neOtherTier['1']?.candidates === 1 && neOtherTier['1']?.min === 182,
+      JSON.stringify(neOtherTier['1']));
+    // 名前が当たる中に NE の登録値があれば、今までどおり実送料を使う
+    const neNamed = vari.profitShipPickByGroup([
+      { method: '定形外規格内（50g以内）', cost: 190, count: 1, isCurrent: true },
+      { method: '定形外規格外（1kg以内）', cost: 510, count: 999 },
+    ], { '1': ['定形'] });
+    check('配送方法で試算: 名前が当たる中に NE の登録値があれば実送料を使う (reason=ne)',
+      neNamed['1']?.method === '定形外規格内（50g以内）' && neNamed['1']?.cost === 190
+      && neNamed['1']?.reason === 'ne', JSON.stringify(neNamed['1']));
+    check('配送方法で試算: 現在使用不可の 2 (クリックポスト) も合わせ先が決まる',
+      vari.profitShipPickByGroup([{ method: 'クリックポスト', cost: 185, count: 5 }])['2']?.method === 'クリックポスト');
     // 送料が無い行は画面の選択肢にも無い = 合わせ先にしない (0円で利益を過大に見せない)
     const noCost = vari.profitShipPickByGroup(
       [{ method: '定形なし', cost: null, count: 9 }, { method: '定形あり', cost: 182, count: 1 }], { '1': ['定形'] });
@@ -13058,6 +13083,10 @@ for (const [name, file, data] of renders) {
   // 🚨 時間で失効させない。長く作業してから保存した人の選択が黙って戻る (Codex R5 P2)
   check('🚨 配送費の試算: 人の試算選択は時間で失効させない (消すのは配送方法を変えたときだけ)',
     !/MINE_MAX_AGE_MS/.test(sim) && /forgetMine\(\);/.test(sim));
+  // 🚨 別のタブで配送方法を変えて保存されたら、古い試算選択は捨てる (Codex R6 P2)
+  check('🚨 配送費の試算: 覚えるのは「どの配送方法のときの選択か」まで (別タブの変更に負ける)',
+    /group: groupOf\(\)/.test(sim) && /String\(d\.group \?\? ''\) !== String\(group\)/.test(sim)
+    && /remembered: readMine\(group\)/.test(sim));
   check('配送費の試算: 売価の入力でも従来どおり再計算する',
     /priceInput\.addEventListener\('input', render\)/.test(sim));
   check('配送費の試算: 試算であって NE や出品内容は変えないと画面に書く',
@@ -13121,8 +13150,13 @@ for (const [name, file, data] of renders) {
     const n = api.profitShipNoteText({ followed: d.followed, method: d.method, groupLabel: '定形外', neCurrent: 'ネコポス', isCurrent: false });
     check('配送方法で試算: 注記に「何で試算しているか」と候補の件数・代表送料の幅を書く',
       n.includes('「定形外」に合わせて「定形外規格内（50g以内）」で試算しています')
-      && n.includes('自動で選べる候補 (送料0円は除く) は 3 件') && n.includes('代表の送料 146〜510円')
+      && n.includes('自動で選べる候補 (送料0円は除く) は 2 件') && n.includes('代表の送料 182〜510円')
       && n.includes('違うなら選び直してください'), n);
+    // 🚨 画面の配送方法に合わせて NE を上書きしたのだから、何を上書きしたかを出す (Codex R6 P2)
+    check('🚨 配送方法で試算: NE と食い違うときは NE の配送方法も注記に出す',
+      n.includes('NE は「ネコポス」ですが、画面の「定形外」に合わせて'), n);
+    check('配送方法で試算: 選んだ理由を言い分ける (楽天の名前で絞ったときに「最多」と書かない)',
+      n.includes('楽天の名前に合うものの中でいちばん多く使っているもの'), n);
     // 🚨 候補は配送方法ごとに代表送料 1 件へ畳んである。「大きさで N 通り」= 実送料の幅と
     //    読めてしまう言い方はしない (Codex R4 P2)
     check('配送方法で試算: 注記は「大きさで N 通り」と書かない (実送料の幅ではない)',

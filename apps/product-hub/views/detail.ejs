@@ -5271,13 +5271,20 @@ th.attr-unknown { color: #dc2626; }
           + ' — 試算の配送方法は変えていません';
       }
       const p = followed.pick;
-      let s = '「' + label + '」に合わせて「' + method + '」で試算しています';
+      // 🚨 NE と画面が食い違っているときは NE の配送方法も必ず出す (2026-10-07 中原さんの決定で
+      //    画面の配送方法に合わせるので、何を上書きしたのかが分からないと確かめられない — Codex R6 P2)
+      let s = (!p.isNe && neCurrent)
+        ? 'NE は「' + neCurrent + '」ですが、画面の「' + label + '」に合わせて「' + method + '」で試算しています'
+        : '「' + label + '」に合わせて「' + method + '」で試算しています';
+      // 選んだ理由。楽天の名前で絞ったのに「いちばん多く」と書くと実際と逆になる (Codex R6 P3)
+      const why = p.reason === 'ne' ? 'NE の登録値'
+        : (p.reason === 'label' ? '楽天の名前に合うものの中でいちばん多く使っているもの' : 'いちばん多く使っているもの');
       if (p.candidates > 1) {
         // 🚨 「大きさで N 通り」とは書かない。候補は配送方法ごとに代表送料 1 件へ畳んである
         //    ので、実際の送料の幅ではない (Codex R4 P2)
         s += ' — 自動で選べる候補 (送料0円は除く) は ' + p.candidates + ' 件 (代表の送料 '
           + Math.round(p.min).toLocaleString() + '〜' + Math.round(p.max).toLocaleString() + '円) あるので、'
-          + (p.isNe ? 'NE の登録値' : 'いちばん多く使っているもの') + 'を使いました。違うなら選び直してください';
+          + why + 'を使いました。違うなら選び直してください';
       } else if (p.isNe) {
         s += ' (NE に登録されている送料です)';
       }
@@ -5304,14 +5311,19 @@ th.attr-unknown { color: #dc2626; }
       //    30 分で失効させると、長く作業してから保存した人の選択が黙って代表候補へ戻る
       //    (Codex R5 P2)。消すのは**人が楽天の配送方法を変えたとき**だけ (= 合わせ直す合図)
       const MINE_KEY = 'ph-profit-ship:<%= draft.id %>';
-      function readMine() {
+      // 🚨 「どの楽天配送方法のときに選んだか」まで覚える。方法名だけだと、別のタブで
+      //    配送方法を変えて保存されたあとに古い選択が勝ってしまう (Codex R6 P2)
+      function readMine(group) {
         try {
           const d = JSON.parse(sessionStorage.getItem(MINE_KEY) || 'null');
-          return d ? String(d.method || '') : '';
+          if (!d || String(d.group ?? '') !== String(group)) return '';
+          return String(d.method || '');
         } catch (_) { return ''; }   // 使えない環境は覚えないだけ
       }
       const rememberMine = (m) => {
-        try { sessionStorage.setItem(MINE_KEY, JSON.stringify({ method: m, at: Date.now() })); } catch (_) { /* 諦める */ }
+        try {
+          sessionStorage.setItem(MINE_KEY, JSON.stringify({ method: m, group: groupOf(), at: Date.now() }));
+        } catch (_) { /* 使えない環境は覚えないだけ (次に開くと配送方法に合わせ直す) */ }
       };
       const forgetMine = () => {
         try { sessionStorage.removeItem(MINE_KEY); } catch (_) { /* 諦める */ }
@@ -5350,7 +5362,7 @@ th.attr-unknown { color: #dc2626; }
         }
         const d = decideProfitShip({
           options: data.options, picks: data.picks, group, chosen, neCurrent, follow,
-          remembered: readMine(),
+          remembered: readMine(group),
         });
         followed = d.followed;
         sel.value = d.method;
