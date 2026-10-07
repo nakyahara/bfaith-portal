@@ -170,6 +170,8 @@
       background: rgba(58, 231, 255, 0.12); box-shadow: 0 0 0 1px rgba(58, 231, 255, 0.10) inset;
     }
     .pill-cb:has(input:focus-visible) { box-shadow: 0 0 0 3px rgba(58, 231, 255, 0.18); }
+    /* 送信中は押せない (応答の順番が入れ替わって画面と DB の役割がずれるのを防ぐ) */
+    .pill-cb:has(input:disabled) { opacity: 0.5; cursor: progress; }
 
     /* --- ボタン --- */
     button {
@@ -270,6 +272,7 @@
     .w-sort { width: 74px; } .w-no { width: 116px; } .w-name { width: 152px; } .w-short { width: 118px; }
     .w-kind { width: 152px; } .w-kana { width: 112px; } .w-mail { width: 178px; } .w-date { width: 142px; } .w-note { width: 200px; }
     .w-state { width: 84px; } .w-role { width: 196px; } .w-pin { width: 112px; } .w-act { width: 128px; }
+    .pin-none { color: #6b7d9d; }
     td.role-col { width: 190px; white-space: nowrap; }
     td.role-col .pill-cb { margin-right: 4px; }
 
@@ -355,7 +358,7 @@
     <div class="st-box hud">
       <h2>
         <span class="h-ico">☰</span>一覧
-        <span class="h-sub">有効 <%= staff.filter(s => s.active).length %> 名 / 全 <%= staff.length %> 名</span>
+        <span class="h-sub">有効 <span id="cntActive"><%= staff.filter(s => s.active).length %></span> 名 / 全 <%= staff.length %> 名</span>
       </h2>
 
       <div class="toolbar">
@@ -365,8 +368,8 @@
         </div>
         <div class="seg" id="segStatus" role="group" aria-label="スタッフの状態で絞り込み">
           <button type="button" data-f="all" class="on" aria-pressed="true">全員 <b><%= staff.length %></b></button>
-          <button type="button" data-f="active" aria-pressed="false">有効 <b><%= staff.filter(s => s.active).length %></b></button>
-          <button type="button" data-f="inactive" aria-pressed="false">無効 <b><%= staff.filter(s => !s.active).length %></b></button>
+          <button type="button" data-f="active" aria-pressed="false">有効 <b id="segActive"><%= staff.filter(s => s.active).length %></b></button>
+          <button type="button" data-f="inactive" aria-pressed="false">無効 <b id="segInactive"><%= staff.filter(s => !s.active).length %></b></button>
         </div>
         <label class="pill-cb"><input type="checkbox" id="detailToggle">詳細列</label>
         <span class="grow"></span>
@@ -406,7 +409,7 @@
                   <label class="pill-cb" title="<%= roleLabels[r] %>"><input type="checkbox" class="role-cb" data-role="<%= r %>" <%= (s.roles || []).includes(r) ? 'checked' : '' %>><%= roleShort[r] %></label>
                 <% } %>
               </td>
-              <td class="nowrap w-pin"><% if (s.kind === 'iroha') { %><span style="color:#6b7d9d">—</span><% } else { %><span class="pin-mark"><%= s.pin_set ? '🔑' : '未' %></span> <button class="btn-sm btn-pin" type="button"><%= s.pin_set ? '再設定' : 'PIN設定' %></button><% } %></td>
+              <td class="nowrap w-pin" data-pin-set="<%= s.pin_set ? 1 : 0 %>"><% if (s.kind === 'iroha') { %><span class="pin-none">—</span><% } else { %><span class="pin-mark"><%= s.pin_set ? '🔑' : '未' %></span> <button class="btn-sm btn-pin" type="button"><%= s.pin_set ? '再設定' : 'PIN設定' %></button><% } %></td>
               <td class="w-sort num"><input name="sort" type="number" value="<%= s.sort %>"></td>
               <td class="col-detail w-kana"><input name="kana" value="<%= s.kana || '' %>"></td>
               <td class="col-detail w-mail"><input name="portal_email" value="<%= s.portal_email || '' %>"></td>
@@ -498,10 +501,101 @@
       syncState();
     });
 
+    // --- 行の書き換え (画面全体を再読込しない) -----------------------------
+    // 🚨 location.reload() は、ほかの行の未保存の編集まで黙って消す (Codex R4 Medium)。
+    //    サーバーの応答 (更新後の 1 行) で、その行だけを書き換える
+    const FIELD_NAMES = ['display_name', 'short_name', 'staff_no', 'kind', 'sort', 'kana', 'portal_email', 'joined_on', 'left_on', 'note'];
+    // 行の中の操作 (保存・役割・PIN・有効/無効) は 1 つずつ。応答の順番が入れ替わって画面と DB がずれるのを防ぐ
+    const rowBusy = tr => tr.dataset.saving === '1' || tr.dataset.op === '1';
+    const anyRowBusy = () => rows().some(tr => pending(tr) || rowBusy(tr));
+    const rowName = tr => tr.querySelector('input[name=display_name]').value;
+    const NET_ERR = '通信できませんでした。もう一度押してください';
+
+    function refreshRowControls(tr) {
+      const busy = rowBusy(tr);
+      tr.querySelector('.btn-save').disabled = busy || !cells(tr).some(x => x.value !== x.dataset.orig);
+      tr.querySelectorAll('.role-cb, .btn-pin, .btn-active').forEach(x => { x.disabled = busy; });
+    }
+
+    // PIN 欄。区分を いろは (利用者) にすると DB 側で PIN が消えるので、保存のたびに応答から描き直す (Codex R4 Medium)
+    function renderPin(tr, s) {
+      const td = tr.querySelector('td.w-pin');
+      td.dataset.pinSet = s.pin_set ? '1' : '0';
+      td.textContent = '';
+      if (s.kind === 'iroha') {
+        const none = document.createElement('span');
+        none.className = 'pin-none'; none.textContent = '—';
+        td.append(none);
+      } else {
+        const mark = document.createElement('span');
+        mark.className = 'pin-mark'; mark.textContent = s.pin_set ? '🔑' : '未';
+        const btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'btn-sm btn-pin'; btn.textContent = s.pin_set ? '再設定' : 'PIN設定';
+        td.append(mark, ' ', btn);
+      }
+      refreshRowControls(tr);
+    }
+
+    // サーバーの 1 行を画面に写す。編集中 (dirty) の欄は入れた値を残し、新しい値との差分として黄色のままにする
+    function applyRow(tr, s) {
+      tr.dataset.version = s.version;
+      tr.dataset.active = s.active ? '1' : '0';
+      tr.classList.toggle('inactive', !s.active);
+      const chip = tr.querySelector('.w-state .chip');
+      chip.className = 'chip ' + (s.active ? 'on' : 'off');
+      chip.textContent = s.active ? '有効' : '無効';
+      const ab = tr.querySelector('.btn-active');
+      ab.dataset.active = s.active ? '0' : '1';
+      ab.textContent = s.active ? '無効' : '有効に';
+      for (const el of cells(tr)) {
+        if (!FIELD_NAMES.includes(el.name)) continue;
+        const v = s[el.name] == null ? '' : String(s[el.name]);
+        const edited = el.value !== el.dataset.orig;
+        el.dataset.orig = v;
+        if (!edited) el.value = v;
+        el.classList.toggle('dirty', el.value !== el.dataset.orig);
+      }
+      if (Array.isArray(s.roles)) tr.querySelectorAll('.role-cb').forEach(cb => { cb.checked = s.roles.includes(cb.dataset.role); });
+      renderPin(tr, s);
+    }
+
+    function refreshCounts() {
+      const act = rows().filter(tr => tr.dataset.active === '1').length;
+      $('#cntActive').textContent = act;
+      $('#segActive').textContent = act;
+      $('#segInactive').textContent = rows().length - act;
+    }
+
+    // 他の人が先に変更していた (version が違う) とき: 最新の 1 行に置き換えて知らせる
+    async function showLatest(tr, j) {
+      let latest = j && j.current;
+      if (!latest) {
+        try { const r = await fetch(BASE + '/api/staff/' + tr.dataset.id); latest = (await r.json()).staff; } catch { latest = null; }
+      }
+      if (latest) {
+        applyRow(tr, latest); refreshCounts(); syncState();
+        msg($('#listMsg'), false, '他の人が先に ' + rowName(tr) + ' を変更していました。最新の内容に置き換えました (あなたが入れた欄は黄色のまま)。確かめてから、もう一度押してください');
+      } else {
+        msg($('#listMsg'), false, '他の人が先に変更していました。ほかの行を保存してから再読込 (F5) してください');
+      }
+    }
+
+    // 行の操作を 1 つ走らせる。通信が切れても必ずボタン・チェックを戻す
+    async function rowOp(tr, fn, onNetFail) {
+      tr.dataset.op = '1';
+      refreshRowControls(tr);
+      try { await fn(); }
+      catch { if (onNetFail) onNetFail(); msg($('#listMsg'), false, NET_ERR); }
+      finally { delete tr.dataset.op; refreshRowControls(tr); }
+    }
+
     // --- 追加 -------------------------------------------------------------
+    // 追加した人を一覧に出すには画面を読み直すしかない。読み直すと未保存の編集が消えるので、
+    // 一覧に未保存・保存中の行があるときは追加させない / 読み直さない (Codex R4 Medium)
     let adding = false;
     $('#addBtn').addEventListener('click', async () => {
       if (adding) return;   // 連打で 2 人できないように、送信そのものを塞ぐ
+      if (anyRowBusy()) return msg($('#addMsg'), false, '一覧に未保存・保存中の行があります。先にその行を保存してから追加してください (追加すると画面を読み直すため)');
       adding = true;
       $('#addBtn').disabled = true;
       const body = { staff_no: $('#n_no').value, display_name: $('#n_name').value, short_name: $('#n_short').value, kind: $('#n_kind').value, joined_on: $('#n_joined').value, portal_email: $('#n_email').value };
@@ -518,49 +612,62 @@
       let rolesOk = false;
       try { rolesOk = (await postJson(BASE + '/api/staff/' + j.staff.id + '/roles', { roles })).j.ok === true; }
       catch { rolesOk = false; }
+      // 追加ボタンは押せないまま (読み直すまで追加した人が一覧に無いので、2 回目の追加を防ぐ)
+      const reloadWhenSafe = (ok, text) => {
+        if (!anyRowBusy()) return location.reload();
+        msg($('#addMsg'), ok, text + ' — 一覧に未保存の行があるので画面を読み直していません。その行を保存してから再読込 (F5) してください');
+      };
       if (!rolesOk) {
         msg($('#addMsg'), false, 'スタッフは追加できましたが、役割の設定に失敗しました。一覧に出たらチェックし直してください');
-        setTimeout(() => location.reload(), 2000);
+        setTimeout(() => reloadWhenSafe(false, j.staff.display_name + ' を追加しました (役割は未設定)'), 2000);
         return;
       }
-      location.reload();
+      reloadWhenSafe(true, j.staff.display_name + ' を追加しました');
     });
 
     // 行ごとの編集: 入力があった行だけ保存を有効化 (未編集行の誤保存を防ぐ)
     rows().forEach(tr => {
       const save = tr.querySelector('.btn-save');
       // 役割は行の「保存」とは独立に、チェックした時点で保存する (version を持たない別テーブルのため)
+      // 🚨 API は役割を丸ごと置き換える。送信中はこの行のチェックを押せなくして、応答の順番の入れ替わりを防ぐ (Codex R4 Medium)
       tr.querySelectorAll('.role-cb').forEach(cb => cb.addEventListener('change', async () => {
+        if (rowBusy(tr)) { cb.checked = !cb.checked; return; }
         const roles = [...tr.querySelectorAll('.role-cb')].filter(x => x.checked).map(x => x.dataset.role);
-        const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id + '/roles', { roles });
-        if (j.ok) msg($('#listMsg'), true, tr.querySelector('input[name=display_name]').value + ' の役割を保存しました');
-        else { msg($('#listMsg'), false, j.message || ('HTTP ' + status)); cb.checked = !cb.checked; }
+        await rowOp(tr, async () => {
+          const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id + '/roles', { roles });
+          if (j.ok) {
+            if (j.staff && Array.isArray(j.staff.roles)) tr.querySelectorAll('.role-cb').forEach(x => { x.checked = j.staff.roles.includes(x.dataset.role); });
+            msg($('#listMsg'), true, rowName(tr) + ' の役割を保存しました');
+          } else { cb.checked = !cb.checked; msg($('#listMsg'), false, j.message || ('HTTP ' + status)); }
+        }, () => { cb.checked = !cb.checked; });
       }));
       cells(tr).forEach(el => {
         el.dataset.orig = el.value;
         el.addEventListener('input', () => {
           el.classList.toggle('dirty', el.value !== el.dataset.orig);
-          refreshSaveBtn();
+          refreshRowControls(tr);
           syncState();
         });
       });
-      const refreshSaveBtn = () => { save.disabled = tr.dataset.saving === '1' || !cells(tr).some(x => x.value !== x.dataset.orig); };
       save.addEventListener('click', async () => {
-        if (tr.dataset.saving === '1') return;   // 連打で同じ expect_version を 2 回送らない (Codex R2 P2)
+        if (rowBusy(tr)) return;   // 連打で同じ expect_version を 2 回送らない (Codex R2 P2)
         const fields = {};
         // 🚨 送った値を控えておく。成功時に「いまの値」を既定値にしてしまうと、応答待ちの間に入れた
         //    変更まで保存済み扱いになり、未保存なのに詳細列が閉じて見えなくなる (Codex R1 P2)
         const sent = new Map();
         cells(tr).forEach(el => { if (el.value !== el.dataset.orig) { fields[el.name] = el.value; sent.set(el, el.value); } });
         if (sent.size === 0) return;
+        // 区分を いろは (利用者) にすると職員PIN は消える (利用者は PIN を持たない)。黙って消さない
+        if (fields.kind === 'iroha' && tr.querySelector('td.w-pin').dataset.pinSet === '1'
+          && !confirm(rowName(tr) + ' を「いろは利用者」にすると、職員PIN は消えます。よろしいですか')) return;
         tr.dataset.saving = '1';
-        refreshSaveBtn(); syncState();
+        refreshRowControls(tr); syncState();
         let res;
         try {
           res = await postJson(BASE + '/api/staff/' + tr.dataset.id, { fields, expect_version: Number(tr.dataset.version) });
         } catch {
           // 通信できなかったときは編集を残したまま伝える (黙って保存済みにしない)
-          delete tr.dataset.saving; refreshSaveBtn(); syncState();
+          delete tr.dataset.saving; refreshRowControls(tr); syncState();
           return msg($('#listMsg'), false, '通信できませんでした。もう一度「保存」を押してください');
         }
         delete tr.dataset.saving;
@@ -571,43 +678,49 @@
             if (sent.has(el)) el.dataset.orig = sent.get(el);
             el.classList.toggle('dirty', el.value !== el.dataset.orig);
           });
-          refreshSaveBtn(); syncState();
+          renderPin(tr, j.staff);
+          refreshRowControls(tr); syncState();
           msg($('#listMsg'), true, j.staff.display_name + ' を保存しました');
         } else if (j.error === 'conflict') {
-          refreshSaveBtn(); syncState();
-          msg($('#listMsg'), false, '他の人が先に変更しました。再読込します'); setTimeout(() => location.reload(), 800);
+          refreshRowControls(tr);
+          await showLatest(tr, j);
         } else {
-          refreshSaveBtn(); syncState();
+          refreshRowControls(tr); syncState();
           msg($('#listMsg'), false, j.message || ('HTTP ' + status));
         }
       });
-      // 職員PIN (いろは在庫化・FBA箱詰め 共通)。役割と同じく行の「保存」とは独立
-      const pinBtn = tr.querySelector('.btn-pin');
-      pinBtn?.addEventListener('click', async () => {
-        const name = tr.querySelector('input[name=display_name]').value;
+      // 職員PIN (いろは在庫化・FBA箱詰め 共通)。役割と同じく行の「保存」とは独立。
+      // ボタンは renderPin で作り直すので、行で受ける
+      tr.addEventListener('click', async e => {
+        if (!e.target.closest('.btn-pin') || rowBusy(tr)) return;
+        const name = rowName(tr);
         const pin = prompt(name + ' の職員PIN (4〜8桁の数字)。いろは在庫化・FBA箱詰めの両方で使います');
         if (pin == null) return;
-        const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id + '/pin', { pin: pin.trim() });
-        if (j.ok) {
-          // PIN の設定は staff.version を進めない。画面ごと再読込すると、ほかの行の未保存の編集まで
-          // 黙って消えるので、その行の印とボタンの文字だけ書き換える (Codex R2 P2)
-          const mark = tr.querySelector('.pin-mark');
-          if (mark) mark.textContent = '🔑';
-          pinBtn.textContent = '再設定';
-          msg($('#listMsg'), true, name + ' の PIN を設定しました');
-        } else msg($('#listMsg'), false, j.message || ('HTTP ' + status));
+        await rowOp(tr, async () => {
+          const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id + '/pin', { pin: pin.trim() });
+          if (j.ok) {
+            // PIN の設定は staff.version を進めない。その行の印とボタンの文字だけ書き換える (Codex R2 P2)
+            renderPin(tr, { kind: null, pin_set: 1 });
+            msg($('#listMsg'), true, name + ' の PIN を設定しました');
+          } else msg($('#listMsg'), false, j.message || ('HTTP ' + status));
+        });
       });
       tr.querySelector('.btn-active').addEventListener('click', async () => {
-        // 未保存の入力がある行は状態変更させない (reload で編集が黙って消えるのを防ぐ — Codex R4 Medium)
+        // 未保存の入力がある行は状態変更させない (隠れた編集と状態変更が混ざらないように)
         // 保存中 (応答待ち) も同じ。save.disabled はこの間 true なので pending() で見る (Codex R2 P2)
         if (pending(tr)) { msg($('#listMsg'), false, tr.dataset.saving === '1' ? 'この行は保存中です。終わってから押してください' : 'この行に未保存の変更があります。先に「保存」してください'); return; }
+        if (rowBusy(tr)) return;
         const active = tr.querySelector('.btn-active').dataset.active === '1';
-        const name = tr.querySelector('input[name=display_name]').value;
+        const name = rowName(tr);
         if (!confirm((active ? '有効に戻します: ' : '無効にします (退職・契約終了。削除はしません): ') + name)) return;
-        const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id + '/active', { active, expect_version: Number(tr.dataset.version) });
-        if (j.ok) location.reload();
-        else if (j.error === 'conflict') { msg($('#listMsg'), false, '他の人が先に変更しました。再読込します'); setTimeout(() => location.reload(), 800); }
-        else msg($('#listMsg'), false, j.message || ('HTTP ' + status));
+        await rowOp(tr, async () => {
+          const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id + '/active', { active, expect_version: Number(tr.dataset.version) });
+          if (j.ok) {
+            applyRow(tr, j.staff); refreshCounts(); syncState();
+            msg($('#listMsg'), true, name + (active ? ' を有効に戻しました' : ' を無効にしました'));
+          } else if (j.error === 'conflict') await showLatest(tr, j);
+          else msg($('#listMsg'), false, j.message || ('HTTP ' + status));
+        });
       });
     });
 
