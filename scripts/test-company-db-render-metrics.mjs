@@ -449,6 +449,12 @@ await t('fixture に鍵らしい文字が無い', async () => {
 });
 
 console.log('使う所はまだ無い (利益の受け口は 503 のまま)');
+// 名前を書いただけ (コメントの参照など) は数えない。import / export from / 動的 import() / require() の指定子だけを見る
+const IMPORTS_RENDER_METRICS = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)['"`][^'"`\n]*render-metrics(?:\.m?js)?['"`]/;
+await t('import の見分け: 指定子だけを数え、コメントの中の名前は数えない', async () => {
+  for (const s of ["import { REASONS } from './render-metrics.mjs';", 'export { readMemory } from "../profit/render-metrics.mjs";', "const m = await import('./render-metrics.mjs');", "const m = require('./render-metrics');", "import './render-metrics.mjs';"]) assert.match(s, IMPORTS_RENDER_METRICS, s);
+  for (const s of [' * metrics の client (apps/company-db/profit/render-metrics.mjs の REASONS) の理由のコード。', '// render-metrics を使う所はまだ無い', "const label = 'render-metrics';"]) assert.doesNotMatch(s, IMPORTS_RENDER_METRICS, s);
+});
 await t('apps の下でこの部品を import している所は無い・router は 503 の封じ込めのまま', async () => {
   const hits = [];
   const walk = (dir) => {
@@ -456,7 +462,7 @@ await t('apps の下でこの部品を import している所は無い・router 
       if (e.name === 'node_modules') continue;
       const p = new URL(e.name + (e.isDirectory() ? '/' : ''), dir);
       if (e.isDirectory()) walk(p);
-      else if (/\.(m?js|cjs)$/.test(e.name) && !p.pathname.endsWith('/profit/render-metrics.mjs') && /render-metrics/.test(fs.readFileSync(p, 'utf8'))) hits.push(p.pathname);
+      else if (/\.(m?js|cjs)$/.test(e.name) && !p.pathname.endsWith('/profit/render-metrics.mjs') && IMPORTS_RENDER_METRICS.test(fs.readFileSync(p, 'utf8'))) hits.push(p.pathname);
     }
   };
   walk(new URL('../apps/', import.meta.url));
