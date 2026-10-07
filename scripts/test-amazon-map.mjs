@@ -759,7 +759,7 @@ await ta('[11] 影運転: 止める項目を数える (無い NE コード・並
   // PR-D (10/8 中原さん「スプレッドシートは使用していないので無視」): Sheet にだけある SKU = 気をつける項目 (数・例は出す)
   assert.deepEqual(r.warnings.sheet_only, { count: 1, samples: [{ seller_sku: 'sheet_only1' }] });
   // #1651 Codex R1 High: 切替の前の夜間ロードが Sheet から作った構成 (sheet_only1 → a005) = 消す予定の数と例 (影運転も同じ取引で消して巻き戻す)
-  assert.deepEqual(r.sheet_only_cleanup, { listings: 1, rows: 1, samples: [{ listing_code: 'sheet_only1', sku: 'a005', qty: 1, resolution: 'imported', source: 'fba_sheet' }], left_after: 0 });
+  assert.deepEqual(r.sheet_only_cleanup, { listings: 1, rows: 1, samples: [{ listing_code: 'sheet_only1', sku: 'a005', qty: 1, resolution: 'imported', source: 'fba_sheet' }], kept_fbm: 0, left_after: 0 });
   assert.equal(r.counts.sheet_only_removed, 1);
   assert.equal(r.subset.skus, 4);
   assert.equal(r.subset.match, true, JSON.stringify(r.subset));
@@ -861,6 +861,10 @@ await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ�
   for (const run of ['after_1', 'after_2']) {
     await load(E3.db, MASTER_OWNERSHIP, makePlan(), run);
     assert.equal(K.skuMapDigest(await A.readCompanyAmazonMapCanon(E3.db)).content_hash, h0, run);
+    // #1651 Codex R2 High 2: 持ち主 load の夜間ロードは Sheet から構成を作り直す (ハッシュは対応のある出品しか見ない = 気づかない)。
+    //   = widen の check / beforeCall が照らす残り (sheetOnlyResidue) が 1 行 = 広げない (本物の PG: test-master-widen-amazon-pg [RC4])
+    assert.equal(await sheetComps(E3.db), 1, run);
+    assert.deepEqual((await M.sheetOnlyResidue(E3.db, ['sheet_only1'])).map((x) => [x.listing_code, x.sku_code, x.kind]), [['sheet_only1', 'a005', 'delete']], run);
   }
   // 持ち主 company で 2 回も同じ
   for (const run of ['after_c1', 'after_c2']) {
@@ -869,7 +873,7 @@ await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ�
   }
 });
 
-await ta('[11] #1651 Codex R1 High: 移行の後、持ち主 company の夜間ロード 2 回でも Sheet にだけある SKU の出品に構成が戻らない', async () => {
+await ta('[11] #1651 Codex R1 High / R2 High 1: 移行は Sheet の構成だけ消す (FBM の完全一致は残す・想定の外の出どころは止める)・持ち主 company の夜間ロード 2 回でも戻らない', async () => {
   const E4 = await setupDb();
   await createRoles(E4.pg, { watcherPw: 'a', writerPw: 'b' });
   await createMasterEditRoles(E4.pg, {});
@@ -881,12 +885,26 @@ await ta('[11] #1651 Codex R1 High: 移行の後、持ち主 company の夜間�
   const h0 = M.legacyDigest(legacy).content_hash;
   await openCutover(E4, ALL_COMPANY, 'frozen');
   assert.equal(await sheetComps(E4.db), 1);
+  // #1651 Codex R2 High 1: 同じ出品に正しい FBM の完全一致 (fbm_ne_code) の行 = 消さない・残っても数えない
+  const lidSheet = "(select listing_id from core.listings where mall = 'amazon' and listing_code = 'sheet_only1')";
+  await E4.db.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type, resolved_by_id, evidence)
+    select 1, ${lidSheet}, sku_id, 1, 1, 'exact', 'system', 't', '{"source":"fbm_ne_code","seller_sku":"sheet_only1"}'::jsonb from core.skus where code = 'a007'`);
+  // 想定の外の自動の出どころ = 消さない = 止める (何も書かない)
+  await E4.db.query(`update core.listing_components set evidence = '{"source":"somewhere"}'::jsonb where listing_id = ${lidSheet} and evidence ->> 'source' = 'fba_sheet'`);
+  await assert.rejects(() => M.runAmazonMapMigration(E4.db, legacy, { mode: 'apply', expectHash: h0, actor: 'naka@test', sheetOnly: ['sheet_only1'] }),
+    (e) => e.code === 'AMAZON_MAP_MIGRATE_BLOCKED' && e.blockers.sheet_only_unknown_source?.count === 1 && !e.blockers.sheet_only_manual);
+  assert.equal(await sheetComps(E4.db), 2);
+  await E4.db.query(`update core.listing_components set evidence = '{"source":"fba_sheet"}'::jsonb where listing_id = ${lidSheet} and evidence ->> 'source' = 'somewhere'`);
   const r = await M.runAmazonMapMigration(E4.db, legacy, { mode: 'apply', expectHash: h0, actor: 'naka@test', sheetOnly: ['sheet_only1'] });
   assert.equal(r.committed, true); assert.equal(r.counts.sheet_only_removed, 1);
-  assert.equal(await sheetComps(E4.db), 0);
+  assert.deepEqual([r.sheet_only_cleanup.rows, r.sheet_only_cleanup.kept_fbm, r.sheet_only_cleanup.left_after], [1, 1, 0]);
+  const fbmLeft = async () => (await E4.db.query(`select k.code, c.evidence ->> 'source' as s from core.listing_components c join core.skus k on k.sku_id = c.sku_id where c.listing_id = ${lidSheet}`)).rows;
+  assert.deepEqual(await fbmLeft(), [{ code: 'a007', s: 'fbm_ne_code' }]);   // Sheet の行だけ消えて FBM の行は残る
+  assert.deepEqual(await M.sheetOnlyResidue(E4.db, ['sheet_only1']), []);   // widen の照らしでも数えない
   for (const run of ['after_c1', 'after_c2']) {
     await load(E4.db, ALL_COMPANY, makePlan(), run);
-    assert.equal(await sheetComps(E4.db), 0, run);
+    assert.deepEqual(await fbmLeft(), [{ code: 'a007', s: 'fbm_ne_code' }], run);
+    assert.deepEqual(await M.sheetOnlyResidue(E4.db, ['sheet_only1']), [], run);
     assert.equal(K.skuMapDigest(await A.readCompanyAmazonMapCanon(E4.db)).content_hash, h0, run);
   }
 });

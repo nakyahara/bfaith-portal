@@ -332,7 +332,7 @@ try {
     await rej({ ...good, master_rows: 3.5 }, /evidence_invalid: ハッシュを作った行の数/);
     // CLI の段: 古い表が違う = 鍵の後に Company DB を読んで照らし、DB の関数を呼ばない (試みは prepared のまま)
     const dirB = path.join(tmp, 'a-changed2');
-    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(makeLegacy(dirB, [...MASTERS, ['zz_new', '後から足した', T1, T1]], [...COMPS, ['zz_new', 'a004', 1, 0, T1, T1]])));
+    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(makeLegacy(dirB, [...MASTERS, ['zz_new', '後から足した', T1, T1]], [...COMPS, ['zz_new', 'a004', 1, 0, T1, T1]])), { sheetOnly: [] });
     await assert.rejects(W.widenOwnership(A.dbO, { attemptId: AT.id, companyId: 1, actor: 't', evidence: AT.ev, beforeCall: step.beforeCall }), (e) => e.code === 'AMAZON_MAP_HASH_MISMATCH');
     assert.equal(step.result().match, false);
     assert.equal((await A.q('select state from ops.master_widen_attempts where widen_prepare_id = $1', [AT.id]))[0].state, 'prepared');
@@ -348,7 +348,7 @@ try {
   await ta('[A5] widen が通る (CLI の段 = 鍵の後にハッシュを照らす)・Amazon が company・sku_kind は company のまま・移行は試みが閉じたら断る', async () => {
     const before = await check(A, AT.id);
     assert.equal(before.ok, true, JSON.stringify(before.problems));
-    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyA));
+    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyA), { sheetOnly: [] });
     const r = await W.widenOwnership(A.dbO, { attemptId: AT.id, companyId: 1, actor: '中原', evidence: AT.ev, beforeCall: step.beforeCall });
     assert.deepEqual([r.widened, r.added_keys], [true, [KEY_A]]);
     assert.deepEqual(r.counts, before.counts);   // 読むだけの判定と同じ数
@@ -476,7 +476,7 @@ try {
     assert.equal(r.ok, true, JSON.stringify(r.problems));
     assert.deepEqual([r.counts.held, r.counts.amazon_map_active, r.counts.single_product_mismatch], [0, 3, 0]);
     await variant(B, KA2.id, '消えた対応 1 件', loseOne, /消えた対応が 1 件/);
-    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyB));
+    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyB), { sheetOnly: [] });
     const w = await W.widenOwnership(B.dbO, { attemptId: KA2.id, companyId: 1, actor: '中原', evidence: KA2.ev, beforeCall: step.beforeCall });
     assert.deepEqual(w.added_keys, [KEY_A, KEY_K]);
     const st = await OS.readOwnershipState(B.dbO);
@@ -520,7 +520,7 @@ try {
     assert.equal(ck.ok, true, JSON.stringify(ck.problems));
     const out = []; const code = await epochCli(['check', '--attempt', C2.id, '--company', '1', '--data-dir', dirC2], { env: { COMPANY_DB_WATCH_URL: 'x' }, connect: async () => ({ db: Cdb.dbWA }), log: (m) => out.push(m) });
     assert.equal(code, 1); assert.ok(JSON.parse(out.join('\n')).problems.some((p) => /amazon_map_hash/.test(p)));
-    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyC2));
+    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyC2), { sheetOnly: [] });
     await assert.rejects(W.widenOwnership(Cdb.dbO, { attemptId: C2.id, companyId: 1, actor: 't', evidence: C2.ev, beforeCall: step.beforeCall }), (e) => e.code === 'AMAZON_MAP_HASH_MISMATCH');
   });
 
@@ -581,26 +581,47 @@ try {
     assert.equal(await cdbHash(Cdb), lhash(legacyC2));
   });
 
-  await ta('[RC4] 合わせ直した後: CLI の check (ハッシュ一致) → widen が通る (Amazon = company) → 窓が閉じた後の reconcile は断る / CLI の --reconcile と --cdb-hash', async () => {
-    const out = []; const code = await epochCli(['check', '--attempt', C2.id, '--company', '1', '--data-dir', dirC2], { env: { COMPANY_DB_WATCH_URL: 'x' }, connect: async () => ({ db: Cdb.dbWA }), log: (m) => out.push(m) });
-    assert.equal(code, 0, out.join('\n'));
+  await ta('[RC4] 合わせ直した後: CLI の check (ハッシュ一致) → widen が通る (Amazon = company) → 窓が閉じた後の reconcile は断る / CLI の --reconcile と --cdb-hash / ' +
+    '#1651 Codex R2 High 2: 移行の後に夜間ロードが Sheet の構成を作り直す → check と widen (鍵の後) が断る → reconcile で消す → 通る (FBM の完全一致は数えない・残す)', async () => {
+    const checkC = async () => { const out = []; const code = await epochCli(['check', '--attempt', C2.id, '--company', '1', '--data-dir', dirC2], { env: { COMPANY_DB_WATCH_URL: 'x' }, connect: async () => ({ db: Cdb.dbWA }), log: (m) => out.push(m) }); return { code, r: JSON.parse(out.join('\n')) }; };
+    // 今の fba.db = Sheet にだけある SKU (10/8 の 2 件目 = 大文字で残る)。移行の後に持ち主 load の夜間ロードが Sheet から作り直した構成 (fba_sheet) と、同じ出品の正しい FBM の完全一致の行
+    const fba = makeFba(dirC2, [SHEET_ONLY_UPPER]);
+    const lc = SHEET_ONLY_UPPER.toLowerCase();
+    const compsC = await seedSheetListing(Cdb, lc, 'a002');
+    await Cdb.O.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type, resolved_by_id, evidence)
+      select 1, l.listing_id, k.sku_id, 1, 1, 'exact', 'system', 'load_t', jsonb_build_object('source', 'fbm_ne_code', 'seller_sku', l.listing_code) from core.listings l, core.skus k
+       where l.mall = 'amazon' and l.listing_code = $1 and k.code = 'a004'`, [lc]);
+    assert.equal(await compsC(), 2);
+    let ck = await checkC();
+    assert.equal(ck.code, 1); assert.equal(ck.r.amazon_map.match, true);
+    assert.deepEqual(ck.r.problems.filter((p) => /sheet_only_left/.test(p)).map((p) => p.replace(/ \(.*$/, '')), ['sheet_only_left: Sheet にだけある SKU の出品に消すべき構成が 1 行残る']);   // FBM の行は数えない
+    // widen (鍵の後の beforeCall): 今の fba.db を読み直して照らす = 断る (DB の関数を呼ばない・試みは prepared のまま)
+    const legacyRead = M.readLegacyAmazonMaps(legacyC2);
+    assert.throws(() => M.amazonWidenEvidenceStep(legacyRead), (e) => e.code === 'AMAZON_MAP_MIGRATE_INVALID');   // 一覧を渡さない = 照らせない = 作らない
+    const stepNg = M.amazonWidenEvidenceStep(legacyRead, { sheetOnly: M.readSheetOnlySkus(fba, legacyRead) });
+    await assert.rejects(W.widenOwnership(Cdb.dbO, { attemptId: C2.id, companyId: 1, actor: '中原', evidence: C2.ev, beforeCall: stepNg.beforeCall }), (e) => e.code === 'AMAZON_MAP_SHEET_ONLY_LEFT' && /1 行残る/.test(e.message));
+    assert.equal((await Cdb.q('select state from ops.master_widen_attempts where widen_prepare_id = $1', [C2.id]))[0].state, 'prepared');
     // CLI (本物のプロセス): --cdb-hash が今のハッシュを出す・--reconcile は 2 回目 = 何も変わらない (commit)
     const hc = spawnSync(process.execPath, [CLI_MIGRATE, '--cdb-hash'], { env: { ...process.env, COMPANY_DB_URL: Cdb.url }, encoding: 'utf8', timeout: 120000 });
     assert.equal(hc.status, 0, hc.stderr); assert.match(hc.stdout, new RegExp(await cdbHash(Cdb)));
     const rc = cliApply(Cdb, legacyC2, ['--reconcile', '--attempt', C2.id, '--expect-cdb-hash', await cdbHash(Cdb)]);
     assert.equal(rc.code, 2, rc.out);   // --apply と --reconcile を一緒に付けた = 引数不正 (cliApply は --apply を付ける)
-    const fba = makeFba(dirC2, [SHEET_ONLY_UPPER]);   // #1651 Codex R1 High: 10/8 の 2 件目 (Sheet に大文字で残る) の出品の構成も reconcile で消す
-    const compsC = await seedSheetListing(Cdb, SHEET_ONLY_UPPER.toLowerCase(), 'a002');
+    // reconcile (CLI) = Sheet の構成だけ消す (FBM の完全一致は残す)
     const rc2 = spawnSync(process.execPath, [CLI_MIGRATE, '--reconcile', '--attempt', C2.id, '--expect-hash', lhash(legacyC2), '--expect-cdb-hash', await cdbHash(Cdb), '--legacy', legacyC2, '--fba-db', fba, '--actor', 'naka@test', '--yes'],
       { env: { ...process.env, COMPANY_DB_URL: Cdb.url }, encoding: 'utf8', timeout: 120000 });
     assert.equal(rc2.status, 0, `${rc2.stdout}${rc2.stderr}`); assert.match(rc2.stdout, /✅ 合わせ直した \(commit\)/);
-    assert.match(rc2.stdout, /Sheet にだけある SKU の出品の自動の構成: 消した 1 行/); assert.equal(await compsC(), 0);
+    assert.match(rc2.stdout, /Sheet にだけある SKU の出品の自動の構成: 消した 1 行 .*FBM の完全一致は残す 1 行・消した後に残る 0 行/);
+    assert.deepEqual(await Cdb.q(`select k.code, c.evidence ->> 'source' as s from core.listing_components c join core.listings l on l.listing_id = c.listing_id join core.skus k on k.sku_id = c.sku_id
+      where l.mall = 'amazon' and l.listing_code = $1`, [lc]), [{ code: 'a004', s: 'fbm_ne_code' }]);
+    ck = await checkC();
+    assert.equal(ck.code, 0, JSON.stringify(ck.r.problems)); assert.equal(ck.r.amazon_map.sheet_only_left, 0);
     const rc3 = spawnSync(process.execPath, [CLI_MIGRATE, '--reconcile', '--expect-hash', lhash(legacyC2), '--legacy', legacyC2, '--fba-db', fba, '--actor', 'naka@test', '--yes'],
       { env: { ...process.env, COMPANY_DB_URL: Cdb.url }, encoding: 'utf8', timeout: 120000 });
     assert.equal(rc3.status, 2, `${rc3.stdout}${rc3.stderr}`);   // --expect-cdb-hash と --attempt が無い
-    // widen
-    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyC2));
+    // widen (今の fba.db を読み直す・FBM の行は残っていても数えない)
+    const step = M.amazonWidenEvidenceStep(legacyRead, { sheetOnly: M.readSheetOnlySkus(fba, legacyRead) });
     const w = await W.widenOwnership(Cdb.dbO, { attemptId: C2.id, companyId: 1, actor: '中原', evidence: C2.ev, beforeCall: step.beforeCall });
+    assert.equal(step.result().sheet_only_left, 0); assert.equal(await compsC(), 1);
     assert.deepEqual([w.widened, w.added_keys, w.counts.amazon_map_active, w.counts.amazon_map_lost], [true, [KEY_A], 3, 0]);
     assert.equal((await OS.readOwnershipState(Cdb.dbO)).active.map[KEY_A], 'company');
     await assert.rejects(reconcile(Cdb, legacyC2, C2.id, { expectCdbHash: await cdbHash(Cdb) }), phaseErr(/attempt_not_prepared/));

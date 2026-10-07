@@ -144,7 +144,7 @@ if (isMain) {
       for (const [k, v] of Object.entries(r.warnings)) console.log(`気をつける: ${k} ${v.count} 件 例 ${JSON.stringify(v.samples.slice(0, 3))}`);
       // #1651 Codex R1 High: Sheet にだけある SKU の出品 (対応なし) の自動の構成 = 移行で消す (影運転も同じ取引で消して巻き戻す)
       const so = r.sheet_only_cleanup;
-      if (so) console.log(`Sheet にだけある SKU の出品の自動の構成: ${r.committed ? '消した' : '消す予定'} ${so.rows} 行 (出品 ${so.listings})${so.rows ? ` 例 ${JSON.stringify(so.samples.slice(0, 3))}` : ''}・消した後に残る ${so.left_after} 行`);
+      if (so) console.log(`Sheet にだけある SKU の出品の自動の構成: ${r.committed ? '消した' : '消す予定'} ${so.rows} 行 (出品 ${so.listings})${so.rows ? ` 例 ${JSON.stringify(so.samples.slice(0, 3))}` : ''}・FBM の完全一致は残す ${so.kept_fbm ?? 0} 行・消した後に残る ${so.left_after} 行`);
       if (r.cdb_before) console.log(`合わせ直す前の Company DB のハッシュ: ${r.cdb_before.content_hash} (対応 ${r.cdb_before.master_rows}・構成 ${r.cdb_before.component_rows})`);
       console.log(r.committed ? (mode === 'reconcile' ? '✅ 合わせ直した (commit)' : '✅ 移した (commit)') : '巻き戻した (影運転)');
       if (!(r.subset.match && r.blocker_total === 0)) process.exitCode = 1;
