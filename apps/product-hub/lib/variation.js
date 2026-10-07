@@ -44,7 +44,34 @@ import { familyOf } from '../../price-update/shipping-cost.js';
  * 管理画面で割り当てるまで候補にしない (安全側)。足すときは実データの配送方法名を棚卸しする:
  *   node apps/product-hub/scripts/shipping-map-report.mjs
  */
-const SHIP_SERVICE_QUALIFIERS = ['コンパクト', 'メール便', 'クール'];
+/**
+ * 同じ運送会社の中の**別サービス**を表す語 (2026-10-08)。通常の宅配便より安いものが多く、
+ * 混ぜると利益を良く見せる。足すときは実データの配送方法名を棚卸しする:
+ *   node apps/product-hub/scripts/shipping-map-report.mjs
+ */
+const SHIP_SERVICE_QUALIFIERS = ['コンパクト', 'クール', 'メール', 'DM便', 'こねこ便', 'タイムサービス'];
+
+/**
+ * 楽天の配送方法グループ → その**サービスそのもの**を指す語 (2026-10-08)。
+ *
+ * 🚨 RAKUTEN_GROUP_NE_HINTS (候補を上に集める目安) は運送会社の名前まで含むゆるい表で、
+ * 自動で試算に使うと「クロネコゆうメール 180円」「クロネコDM便」「ヤマト（こねこ便420）」の
+ * ように**同じ運送会社の安い別サービス**を宅急便の送料として選んでしまう (Codex R24/R25)。
+ * 名前を1つずつ除外して追いかけるのは終わらないので、**その語を必ず含むこと**を条件にする。
+ * ここに無い書き方 (例: ヤマトの「発払い」) は自動では選ばず、
+ * 管理画面の割当 (ph_shipping_method_map) で人が決める = 安全側に倒す。
+ */
+export const RAKUTEN_GROUP_NE_CORE = {
+  '1': ['定形'],                      // 定形内 / 定形外規格内 / 定形外規格外
+  '2': ['クリックポスト'],
+  '3': ['飛脚宅配便', '佐川急便'],
+  '4': ['ゆうパック'],
+  '5': ['ネコポス'],
+  '6': ['クリックポスト'],
+  '7': ['宅急便'],
+  '8': ['宅急便'],
+  '9': ['ゆうパケット'],
+};
 
 export function shipServiceOf(name) {
   const f = familyOf(name);
@@ -567,10 +594,15 @@ export function profitShipNearByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, l
  *   3) サービスが分からない楽天配送方法だけ、目安の語の部分一致に落ちる
  */
 function shipBelongsToGroup(method, group, words, labels, assigned) {
+  // 1) 管理画面の割当があればそれが正 (別のグループに割り当てられているものは入れない)
   const given = assigned ? (assigned[method] ?? assigned.get?.(method)) : undefined;
   if (given != null && given !== '') return String(given) === String(group);
+  // 2) 同じ運送会社の**別サービス** (コンパクト・クール・メール・DM便 …) は入れない
   const svc = shipServiceOf(labels?.[group]);
-  if (svc) return shipServiceOf(method) === svc;
+  if (svc && shipServiceOf(method) !== svc) return false;
+  // 3) そのサービスそのものを指す語を**必ず含む**こと。ここに無い書き方は自動で選ばない
+  const core = RAKUTEN_GROUP_NE_CORE[group];
+  if (core) return core.some((w) => method.includes(w));
   return (words || []).some((w) => method.includes(w));
 }
 

@@ -2760,9 +2760,32 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     ]);
     check('🚨 配送方法で試算: NE が「佐川急便〜」でも 飛脚宅配便 (3) の候補になる',
       alias['3']?.method === '佐川急便60サイズ', JSON.stringify(alias['3']));
-    check('🚨 配送方法で試算: NE が「ヤマト(発払い)〜」でも 宅急便 (7/8) の候補になる',
-      alias['7']?.method === 'ヤマト(発払い)B2v6' && alias['8']?.method === 'ヤマト(発払い)B2v6',
-      JSON.stringify(alias['8']));
+    // 🚨 「ヤマト(発払い)」のように**サービス名を含まない書き方**は自動では選ばない。
+    //    運送会社の名前で拾うと「クロネコゆうメール 180円」まで宅急便の候補になり、
+    //    利益を良く見せる (Codex R24/R25)。こういう書き方は管理画面で割り当てる
+    check('🚨 配送方法で試算: 運送会社の名前だけの書き方は自動では選ばない (管理画面で割り当てる)',
+      alias['7'] === undefined && alias['8'] === undefined, JSON.stringify(alias));
+    check('配送方法で試算: 割り当てれば使われる (ヤマト(発払い) を 8 に割り当てたとき)',
+      vari.profitShipPickByGroup([{ method: 'ヤマト(発払い)B2v6', cost: 800, count: 10 }],
+        undefined, undefined, { 'ヤマト(発払い)B2v6': '8' })['8']?.method === 'ヤマト(発払い)B2v6');
+    // 🚨 同じ運送会社の安い別サービスを宅急便の送料にしない (名前を1つずつ除外しない設計)
+    const cheap = vari.profitShipPickByGroup([
+      { method: 'クロネコゆうメール', cost: 180, count: 999 },
+      { method: 'クロネコDM便', cost: 150, count: 900 },
+      { method: 'ヤマト（こねこ便420）', cost: 420, count: 800 },
+      { method: '宅急便コンパクト', cost: 450, count: 700 },
+      { method: '宅急便60サイズ', cost: 650, count: 10 },
+    ]);
+    check('🚨 配送方法で試算: クロネコゆうメール・DM便・こねこ便・コンパクトは 宅急便 の候補にしない',
+      cheap['8']?.method === '宅急便60サイズ' && cheap['8']?.candidates === 1, JSON.stringify(cheap['8']));
+    check('🚨 配送方法で試算: 「近いもの」にも安い別サービスを混ぜない',
+      JSON.stringify(vari.profitShipNearByGroup([
+        { method: 'クロネコゆうメール', cost: 180, count: 999 },
+        { method: '宅急便60サイズ', cost: 650, count: 10 },
+      ])['8']) === JSON.stringify(['宅急便60サイズ']));
+    check('配送方法で試算: サービスそのものを指す語の表は全グループにある',
+      Object.keys(listing.ALL_SHIPPING_METHOD_GROUPS).every((id) => vari.RAKUTEN_GROUP_NE_CORE[id]),
+      Object.keys(listing.ALL_SHIPPING_METHOD_GROUPS).filter((id) => !vari.RAKUTEN_GROUP_NE_CORE[id]).join(','));
     // 🚨 運送会社が同じでも**サービスが違えば別**。「宅急便コンパクト」は専用箱の別サービスで
     //    宅急便より安いので、最多でも宅急便の合わせ先にしない (Codex R19 P1)
     const compact = [
