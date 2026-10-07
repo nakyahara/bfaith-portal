@@ -11098,7 +11098,28 @@ for (const [name, file, data] of renders) {
     check('🚨 通し確認: 定形外で保存済みの商品を開くと、利益額が 892円 (配送費 182円) で出る',
       mE2.profit() === '892円' && mE2.shipCost() === '182', mE2.profit() + ' / ' + mE2.body.textContent);
     // 🚨 試算は画面だけの話。保存されている値も出品 payload も、人が選んだ楽天の
-    //    配送方法 (1 = 定形外) のままで、NE の便名や試算の送料は入らない (Codex R26 P3)
+    //    配送方法 (1 = 定形外) のままで、NE の便名や試算の送料は入らない (Codex R26 P3)。
+    //    保存の口を**実際に叩いて**から確かめる (読むだけだと自明に通る — Codex R30 P3)
+    {
+      const save = async (body) => {
+        const r = await fetch(`${base2}/api/drafts/${idE2}/rakuten`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        return { status: r.status, json: await r.json() };
+      };
+      // 画面が送るのは楽天の配送方法だけ。試算の便名・送料を混ぜても保存されないこと
+      const r1 = await save({ genre_id: '565004', shipping_method_group: '1' });
+      check('通し確認: 楽天項目の保存は通る (前提の確認)', r1.status === 200, JSON.stringify(r1.json));
+      const r2 = await save({
+        genre_id: '565004', shipping_method_group: '1',
+        profit_ship_method: '定形外規格内（50g以内）', profit_ship_cost: 182,   // 画面は送らない値
+      });
+      check('🚨 通し確認: 試算の便名・送料を送っても保存されない (サーバーが受け付けない)',
+        r2.status === 200
+        && db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(idE2)?.shipping_method_group === '1'
+        && !JSON.stringify(db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(idE2)).includes('定形外規格内'),
+        JSON.stringify(db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(idE2)));
+    }
     {
       const saved = db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(idE2);
       check('🚨 通し確認: 試算しても保存されている配送方法は変わらない (1 = 定形外)',
