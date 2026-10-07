@@ -7,6 +7,8 @@
  *        区分の食い違い (held) があっても止まらない・区分の数を出さない / 消えた対応 1 件 = 断る / active 0 件 = 断る / 写しの証拠のハッシュ違い・数の違い = 断る /
  *        手の入口 = gas:logizard-sheet-and-sku-map / CLI の check がハッシュを照らす / 揃えば widen が通る (読むだけの判定と同じ数)
  *   [KA] 両方を足す試み: 区分と Amazon の両方を見る (どちらか 1 つでも断る)・揃えば通る
+ *   [RC] (#1648 Codex R1 Medium 2) reconcile: 移行 → cancel → 古い表を直す (足す・直す・消す) → 新しい試み → reconcile → check → widen が通る /
+ *        ハッシュ違い・止める項目・窓の外・frozen・portal の行・合わせた後のハッシュ違い = 断る (巻き戻す) / 2 回目は何も書かない / 墓標を戻す / 墓標は lost にならない
  *   [M]  移行の apply (amazon-map-migrate.mjs) の段階の条件: frozen は今までどおり / new_open は指した試み (--attempt) が Amazon を足す試みで、
  *        widen の判定と同じ共通の部品 (全部のプロセスの 2 版の ack が prepare の後・書きかけ 0・新しい・手の入口の停止) が通るときだけ (#1648 Codex R1 Medium 1) /
  *        試みを指さない・知らない試み・閉じた試み・sku_kind だけの試み・ack が足りない / 古い / 書きかけ・停止の前・widen の後 = 断る / 移行は epoch の共有の鍵を取る
@@ -28,6 +30,8 @@ import { runInitialLoad } from '../apps/company-db/load/engine.mjs';
 import * as OS from '../apps/company-db/load/ownership-state.mjs';
 import * as W from '../apps/company-db/load/widen-state.mjs';
 import * as M from '../lib/amazon-map-migrate.mjs';
+import * as A0 from '../lib/amazon-map-write.mjs';
+import * as K0 from '../lib/sku-map-canonical.js';
 import { OWNED_COLUMNS } from '../config/master-ownership.mjs';
 import { ownershipHash, recordLegacyGateAckV2 } from '../lib/master-cutover.mjs';
 import { cli as epochCli } from './company-db/master-ownership-epoch.mjs';
@@ -95,7 +99,7 @@ const dbNames = [];
 const admin = await openPgClient(url);
 const clients = [admin];
 /** 1 つの Company DB (0059 まで・ロール・本物の大きさでない材料のロード・段階 new_open = base) */
-async function setupDb(base) {
+async function setupDb(base, { watcher = true } = {}) {   // watcher のログインは接続の上限がある = 要る DB だけ開く
   const name = `cdb_amzb_${crypto.randomBytes(4).toString('hex')}`;
   await admin.query(`create database ${name}`);
   dbNames.push(name);
@@ -107,7 +111,7 @@ async function setupDb(base) {
   await applyMigrations(dbO, { log: () => {} });
   await createMasterEditRoles(O, { pw: PW });
   await createWatchRoles(O, { watcherPw: WPW.watcher, writerPw: WPW.watch_writer });
-  const [WA, GR, GM] = [await open('watcher'), await open('master_gate_render'), await open('master_gate_minipc')];
+  const [WA, GR, GM] = [watcher ? await open('watcher') : null, await open('master_gate_render'), await open('master_gate_minipc')];
   const r0 = await runInitialLoad(dbO, PLAN, { log: () => {}, runId: `amzb_load_${name}`, host: 'test' });
   assert.equal(r0.ok, true, r0.error);
   await forceNewOpen(dbO, base);
@@ -120,7 +124,7 @@ async function setupDb(base) {
     }
   };
   await acks();   // manifest を DB に (prepare は「どれかのプロセスが見た一覧」だけ受ける)
-  return { name, url: u.toString(), O, O2, dbO, dbO2: pgAdapter(O2), WA, dbWA: pgAdapter(WA), q, acks };
+  return { name, url: u.toString(), O, O2, dbO, dbO2: pgAdapter(O2), WA, dbWA: WA ? pgAdapter(WA) : null, q, acks };
 }
 
 /** 試みを作って、止める入口・ack・試みの中の 2 つのロードまで揃える。skuKind = prepared のロードの判断の記録 (undefined = 区分の食い違い 0) */
@@ -396,7 +400,7 @@ try {
     assert.ok(mr.ok, mr.err?.message);
     assert.equal(mr.ok.committed, true); assert.equal(mr.ok.widen_attempt, KA.id);
     // frozen (今までどおり): 別の DB を frozen にして移行が通る (試みは見ない)
-    const F = await setupDb(BASE0);
+    const F = await setupDb(BASE0, { watcher: false });
     await F.O.query('begin'); await F.O.query("select set_config('ops.cutover_protocol', '1', true)"); await F.O.query("update ops.master_cutover_state set phase = 'frozen', owner_hash = null where id = 1"); await F.O.query('commit');
     const fc = cliApply(F, makeLegacy(path.join(tmp, 'f')));                                     // CLI で --attempt なし (#1648 Codex R2 Low 2)
     assert.equal(fc.code, 0, fc.out); assert.match(fc.out, /✅ 移した \(commit\)/);
@@ -418,6 +422,126 @@ try {
     const st = await OS.readOwnershipState(B.dbO);
     assert.deepEqual([st.active.map[KEY_A], st.active.map[KEY_K]], ['company', 'company']);
     assert.equal((await B.q('select ops.sku_kind_locked() as l'))[0].l, true);
+  });
+
+  try { await B.WA.end(); } catch { /* */ }   // watcher の接続の上限 (DB-B はもう読まない)
+  // ═══ DB-C: 移行の後に cancel → 古い表を直す → 新しい試み → reconcile → check → widen (#1648 Codex R1 Medium 2・中原さんの決定 b) ═══
+  const Cdb = await setupDb(BASE_K);
+  const dirC = path.join(tmp, 'c');
+  const legacyC1 = makeLegacy(dirC);
+  // 古い表の 2 つ目: 足す (pr_new3 = 出品なし)・直す (a003 の数量 2 → 3・名前)・消す (pr_pack2)
+  const MASTERS_C2 = [['pr_a001', 'SKU マスタの 1', T1, T2], ['a003', '単品 3 を FBA でも (直した)', T1, '2026-07-01T00:00:00.000Z'], ['pr_new3', '新しい組 3', T2, T2]];
+  const COMPS_C2 = [['pr_a001', 'a001', 1, 0, T1, T1], ['a003', 'a003', 3, 0, T1, '2026-07-01T00:00:00.000Z'], ['pr_new3', 'a005', 1, 0, T2, T2], ['pr_new3', 'a006', 2, 1, T2, T2]];
+  const dirC2 = path.join(tmp, 'c2');
+  const legacyC2 = makeLegacy(dirC2, MASTERS_C2, COMPS_C2);
+  const cdbHash = async (E) => K0.skuMapDigest(await A0.readCompanyAmazonMapCanon(E.dbO)).content_hash;
+  const lhash = (file) => M.legacyDigest(M.readLegacyAmazonMaps(file)).content_hash;
+  const reconcile = (E, file, attemptId, extra = {}) => M.runAmazonMapMigration(E.dbO, M.readLegacyAmazonMaps(file),
+    { mode: 'reconcile', expectHash: lhash(file), actor: 'naka@test', sheetOnly: [], attemptId, ...extra });
+  let C1, C2;
+
+  await ta('[RC1] reconcile の準備: 移行 → cancel (対応は Company DB に残る) → 古い表を直す → 次の apply は EXISTS で断る (今までどおり) / 窓の外・空の DB の reconcile は断る', async () => {
+    // 空の DB (DB-B の前の形) の reconcile = 合わせ直すものが無い (EMPTY)・窓の外 = PHASE
+    C1 = await readyAttempt(Cdb, { base: BASE_K, widen: { ...BASE_K, [KEY_A]: 'company' }, stops: ['gas:logizard-sheet-and-sku-map'] });
+    await assert.rejects(reconcile(Cdb, legacyC1, C1.id, { expectCdbHash: await cdbHash(Cdb) }), (e) => e.code === 'AMAZON_MAP_RECONCILE_EMPTY');
+    const r = await migrate(Cdb, legacyC1, C1.id);
+    assert.equal(r.committed, true);
+    await W.cancelWiden(Cdb.dbO, { attemptId: C1.id, actor: 't' });
+    assert.equal((await Cdb.q("select count(*)::int as n from core.amazon_sku_maps where state = 'active'"))[0].n, 3);
+    // 窓の外 (cancel した試み・試みを指さない) = 断る
+    await assert.rejects(reconcile(Cdb, legacyC2, C1.id, { expectCdbHash: await cdbHash(Cdb) }), phaseErr(/attempt_not_prepared/));
+    await assert.rejects(reconcile(Cdb, legacyC2, null, { expectCdbHash: await cdbHash(Cdb) }), phaseErr(/--attempt/));
+    // 新しい試み (窓) を開く
+    C2 = await readyAttempt(Cdb, { base: BASE_K, widen: { ...BASE_K, [KEY_A]: 'company' }, stops: ['gas:logizard-sheet-and-sku-map'] });
+    // 今までどおり: 対応がある DB の apply は EXISTS (reconcile のために外していない)
+    await assert.rejects(migrate(Cdb, legacyC2, C2.id), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
+    // 古い表が変わった = 判定は通っても (active 3・lost 0) CLI の check はハッシュ違い = widen できない
+    const ck = await check(Cdb, C2.id);
+    assert.equal(ck.ok, true, JSON.stringify(ck.problems));
+    const out = []; const code = await epochCli(['check', '--attempt', C2.id, '--company', '1', '--data-dir', dirC2], { env: { COMPANY_DB_WATCH_URL: 'x' }, connect: async () => ({ db: Cdb.dbWA }), log: (m) => out.push(m) });
+    assert.equal(code, 1); assert.ok(JSON.parse(out.join('\n')).problems.some((p) => /amazon_map_hash/.test(p)));
+    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyC2));
+    await assert.rejects(W.widenOwnership(Cdb.dbO, { attemptId: C2.id, companyId: 1, actor: 't', evidence: C2.ev, beforeCall: step.beforeCall }), (e) => e.code === 'AMAZON_MAP_HASH_MISMATCH');
+  });
+
+  await ta('[RC2] reconcile が断る: 今の Company DB のハッシュが違う・止める項目・frozen でない窓・portal の行・合わせた後のハッシュが違う (巻き戻す) = どれも何も書かない', async () => {
+    const h0 = await cdbHash(Cdb);
+    await assert.rejects(reconcile(Cdb, legacyC2, C2.id, { expectCdbHash: hex('e') }), (e) => e.code === 'AMAZON_MAP_RECONCILE_CDB_HASH');
+    await assert.rejects(reconcile(Cdb, legacyC2, C2.id, {}), (e) => e.code === 'AMAZON_MAP_MIGRATE_INVALID');   // --expect-cdb-hash が無い
+    const bad = makeLegacy(path.join(tmp, 'c-bad'), [...MASTERS_C2, ['bad_ne', 'NE に無い', T1, T1]], [...COMPS_C2, ['bad_ne', 'nosuch', 1, 0, T1, T1]]);
+    await assert.rejects(reconcile(Cdb, bad, C2.id, { expectCdbHash: h0 }), (e) => e.code === 'AMAZON_MAP_MIGRATE_BLOCKED');
+    const gap = makeLegacy(path.join(tmp, 'c-gap'), MASTERS_C2, COMPS_C2.map((c) => (c[0] === 'pr_new3' && c[1] === 'a006' ? [c[0], c[1], c[2], 2, c[4], c[5]] : c)));
+    await assert.rejects(reconcile(Cdb, gap, C2.id, { expectCdbHash: h0 }), (e) => e.code === 'AMAZON_MAP_MIGRATE_BLOCKED' && !!e.blockers.sort_gap);
+    // portal の行 (load の間は無いはず) = 断る
+    const setOrigin = async (o) => { await Cdb.O2.query('begin'); await Cdb.O2.query("select set_config('core.source_system', 'amazon_map_migration', true)"); await Cdb.O2.query("update core.amazon_sku_maps set origin = $1 where seller_sku = 'pr_a001'", [o]); await Cdb.O2.query('commit'); };
+    await setOrigin('portal');
+    try { await assert.rejects(reconcile(Cdb, legacyC2, C2.id, { expectCdbHash: h0 }), (e) => e.code === 'AMAZON_MAP_RECONCILE_PORTAL'); } finally { await setOrigin('legacy'); }
+    const ev1 = (await Cdb.q('select count(*)::int as n from events.master_change_events'))[0].n;
+    // 合わせた後のハッシュが違う (書いた後に取引の中で 1 行を変える = 試験だけの afterWrite) = 巻き戻す
+    await assert.rejects(reconcile(Cdb, legacyC2, C2.id, { expectCdbHash: h0, afterWrite: (db) => db.query("update core.amazon_sku_maps set name = name || 'x' where seller_sku = 'pr_a001'") }),
+      (e) => e.code === 'AMAZON_MAP_MIGRATE_MISMATCH');
+    assert.equal(await cdbHash(Cdb), h0, '何も書いていない');
+    assert.equal((await Cdb.q('select count(*)::int as n from events.master_change_events'))[0].n, ev1, '巻き戻した = 変更の記録も増えない');
+    // frozen の DB の reconcile = 断る (frozen の道は apply)
+    const F2 = await setupDb(BASE0, { watcher: false });
+    await F2.O.query('begin'); await F2.O.query("select set_config('ops.cutover_protocol', '1', true)"); await F2.O.query("update ops.master_cutover_state set phase = 'frozen', owner_hash = null where id = 1"); await F2.O.query('commit');
+    await assert.rejects(reconcile(F2, legacyC1, C2.id, { expectCdbHash: h0 }), phaseErr(/new_open/));
+  });
+
+  await ta('[RC3] reconcile が通る: 足す・直す・消す (墓標) → Company DB のハッシュ = 今の古い表・消えた対応 0 (墓標は行が残る)・判定 ok / 2 回目は何も書かない / 消した SKU を古い表に戻す = 墓標を戻す', async () => {
+    const r = await reconcile(Cdb, legacyC2, C2.id, { expectCdbHash: await cdbHash(Cdb) });
+    assert.equal(r.committed, true); assert.equal(r.widen_attempt, C2.id);
+    assert.deepEqual([r.counts.maps_inserted, r.counts.maps_updated, r.counts.maps_tombstoned, r.counts.listings_created], [1, 1, 1, 1]);
+    assert.equal(await cdbHash(Cdb), lhash(legacyC2));
+    assert.deepEqual(await Cdb.q("select seller_sku, state, origin, deleted_reason is not null as r from core.amazon_sku_maps order by seller_sku"),
+      [{ seller_sku: 'a003', state: 'active', origin: 'legacy', r: false }, { seller_sku: 'pr_a001', state: 'active', origin: 'legacy', r: false },
+        { seller_sku: 'pr_new3', state: 'active', origin: 'legacy', r: false }, { seller_sku: 'pr_pack2', state: 'deleted', origin: 'legacy', r: true }]);
+    assert.equal((await Cdb.q("select count(*)::int as n from core.listing_components c join core.amazon_sku_maps m using (listing_id) where m.seller_sku = 'pr_pack2'"))[0].n, 0, '墓標に構成は残さない');
+    assert.equal((await Cdb.q('select count(*)::int as n from ops.amazon_map_lost_listings()'))[0].n, 0, '墓標は消えた対応 (lost) にならない');
+    const ck = await check(Cdb, C2.id);
+    assert.equal(ck.ok, true, JSON.stringify(ck.problems));
+    assert.deepEqual([ck.counts.amazon_map_active, ck.counts.amazon_map_lost], [3, 0]);
+    // 2 回目 = 何も書かない (変更の記録も出品の version も増えない)
+    const ev = (await Cdb.q('select count(*)::int as n from events.master_change_events'))[0].n;
+    const ver = await Cdb.q('select listing_id::text as id, version::text as v from core.listings order by 1');
+    const r2 = await reconcile(Cdb, legacyC2, C2.id, { expectCdbHash: await cdbHash(Cdb) });
+    assert.equal(r2.committed, true);
+    assert.deepEqual([r2.counts.maps_inserted, r2.counts.maps_updated, r2.counts.maps_tombstoned, r2.counts.listings_created, r2.counts.updated, r2.counts.inserted, r2.counts.deleted, r2.counts.time_only], [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert.equal((await Cdb.q('select count(*)::int as n from events.master_change_events'))[0].n, ev);
+    assert.deepEqual(await Cdb.q('select listing_id::text as id, version::text as v from core.listings order by 1'), ver);
+    // 消した SKU を古い表に戻す = 墓標を active に戻す (構成も)・ハッシュ一致
+    const dirC3 = path.join(tmp, 'c3');
+    const legacyC3 = makeLegacy(dirC3, [...MASTERS_C2, ['pr_pack2', 'SKU マスタの 2 個組', T1, T1]], [...COMPS_C2, ['pr_pack2', 'a001', 2, 0, T1, T1], ['pr_pack2', 'a002', 1, 1, T1, T2]]);
+    const r3 = await reconcile(Cdb, legacyC3, C2.id, { expectCdbHash: await cdbHash(Cdb) });
+    assert.deepEqual([r3.counts.maps_inserted, r3.counts.maps_updated, r3.counts.maps_tombstoned], [0, 1, 0]);
+    assert.equal(await cdbHash(Cdb), lhash(legacyC3));
+    assert.equal((await Cdb.q("select state from core.amazon_sku_maps where seller_sku = 'pr_pack2'"))[0].state, 'active');
+    // 古い表を C2 に戻して、もう一度合わせる (この後の widen は C2 の古い表で)
+    await reconcile(Cdb, legacyC2, C2.id, { expectCdbHash: await cdbHash(Cdb) });
+    assert.equal(await cdbHash(Cdb), lhash(legacyC2));
+  });
+
+  await ta('[RC4] 合わせ直した後: CLI の check (ハッシュ一致) → widen が通る (Amazon = company) → 窓が閉じた後の reconcile は断る / CLI の --reconcile と --cdb-hash', async () => {
+    const out = []; const code = await epochCli(['check', '--attempt', C2.id, '--company', '1', '--data-dir', dirC2], { env: { COMPANY_DB_WATCH_URL: 'x' }, connect: async () => ({ db: Cdb.dbWA }), log: (m) => out.push(m) });
+    assert.equal(code, 0, out.join('\n'));
+    // CLI (本物のプロセス): --cdb-hash が今のハッシュを出す・--reconcile は 2 回目 = 何も変わらない (commit)
+    const hc = spawnSync(process.execPath, [CLI_MIGRATE, '--cdb-hash'], { env: { ...process.env, COMPANY_DB_URL: Cdb.url }, encoding: 'utf8', timeout: 120000 });
+    assert.equal(hc.status, 0, hc.stderr); assert.match(hc.stdout, new RegExp(await cdbHash(Cdb)));
+    const rc = cliApply(Cdb, legacyC2, ['--reconcile', '--attempt', C2.id, '--expect-cdb-hash', await cdbHash(Cdb)]);
+    assert.equal(rc.code, 2, rc.out);   // --apply と --reconcile を一緒に付けた = 引数不正 (cliApply は --apply を付ける)
+    const fba = path.join(dirC2, 'fba.db');
+    const rc2 = spawnSync(process.execPath, [CLI_MIGRATE, '--reconcile', '--attempt', C2.id, '--expect-hash', lhash(legacyC2), '--expect-cdb-hash', await cdbHash(Cdb), '--legacy', legacyC2, '--fba-db', fba, '--actor', 'naka@test', '--yes'],
+      { env: { ...process.env, COMPANY_DB_URL: Cdb.url }, encoding: 'utf8', timeout: 120000 });
+    assert.equal(rc2.status, 0, `${rc2.stdout}${rc2.stderr}`); assert.match(rc2.stdout, /✅ 合わせ直した \(commit\)/);
+    const rc3 = spawnSync(process.execPath, [CLI_MIGRATE, '--reconcile', '--expect-hash', lhash(legacyC2), '--legacy', legacyC2, '--fba-db', fba, '--actor', 'naka@test', '--yes'],
+      { env: { ...process.env, COMPANY_DB_URL: Cdb.url }, encoding: 'utf8', timeout: 120000 });
+    assert.equal(rc3.status, 2, `${rc3.stdout}${rc3.stderr}`);   // --expect-cdb-hash と --attempt が無い
+    // widen
+    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyC2));
+    const w = await W.widenOwnership(Cdb.dbO, { attemptId: C2.id, companyId: 1, actor: '中原', evidence: C2.ev, beforeCall: step.beforeCall });
+    assert.deepEqual([w.widened, w.added_keys, w.counts.amazon_map_active, w.counts.amazon_map_lost], [true, [KEY_A], 3, 0]);
+    assert.equal((await OS.readOwnershipState(Cdb.dbO)).active.map[KEY_A], 'company');
+    await assert.rejects(reconcile(Cdb, legacyC2, C2.id, { expectCdbHash: await cdbHash(Cdb) }), phaseErr(/attempt_not_prepared/));
   });
 
   await ta('[R] 権限: 0059 の数の関数・判定の本体・widen は watcher から呼べない (42501)・watcher の読むだけの判定は呼べる', async () => {
