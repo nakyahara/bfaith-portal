@@ -509,7 +509,6 @@
     const rowBusy = tr => tr.dataset.saving === '1' || tr.dataset.op === '1';
     const anyRowBusy = () => rows().some(tr => pending(tr) || rowBusy(tr));
     const rowName = tr => tr.querySelector('input[name=display_name]').value;
-    const NET_ERR = '通信できませんでした。もう一度押してください';
 
     function refreshRowControls(tr) {
       const busy = rowBusy(tr);
@@ -566,12 +565,18 @@
       $('#segInactive').textContent = rows().length - act;
     }
 
+    // サーバーにある、いまのその 1 行。読めなければ null
+    async function fetchRow(tr) {
+      try {
+        const r = await fetch(BASE + '/api/staff/' + tr.dataset.id);
+        const j = await r.json();
+        return j && j.ok && j.staff ? j.staff : null;
+      } catch { return null; }
+    }
+
     // 他の人が先に変更していた (version が違う) とき: 最新の 1 行に置き換えて知らせる
     async function showLatest(tr, j) {
-      let latest = j && j.current;
-      if (!latest) {
-        try { const r = await fetch(BASE + '/api/staff/' + tr.dataset.id); latest = (await r.json()).staff; } catch { latest = null; }
-      }
+      const latest = (j && j.current) || await fetchRow(tr);
       if (latest) {
         applyRow(tr, latest); refreshCounts(); syncState();
         msg($('#listMsg'), false, '他の人が先に ' + rowName(tr) + ' を変更していました。最新の内容に置き換えました (あなたが入れた欄は黄色のまま)。確かめてから、もう一度押してください');
@@ -580,12 +585,24 @@
       }
     }
 
+    // 通信が途中で切れたとき。🚨 サーバーには届いて反映済みで、応答だけ消えたこともある (Codex R5 Medium)。
+    //    「失敗した」と決めつけて画面だけ戻すと DB と逆にずれるので、その 1 行を読み直してそろえる
+    async function resyncAfterNetError(tr) {
+      const latest = await fetchRow(tr);
+      if (latest) {
+        applyRow(tr, latest); refreshCounts(); syncState();
+        msg($('#listMsg'), false, '通信が途中で切れました。' + rowName(tr) + ' のいまの登録内容を読み直して表示しています。確かめてから、必要ならもう一度押してください');
+      } else {
+        msg($('#listMsg'), false, '通信できませんでした。反映できたか分からないので、ほかの行を保存してから再読込 (F5) してください');
+      }
+    }
+
     // 行の操作を 1 つ走らせる。通信が切れても必ずボタン・チェックを戻す
     async function rowOp(tr, fn, onNetFail) {
       tr.dataset.op = '1';
       refreshRowControls(tr);
       try { await fn(); }
-      catch { if (onNetFail) onNetFail(); msg($('#listMsg'), false, NET_ERR); }
+      catch { if (onNetFail) onNetFail(); await resyncAfterNetError(tr); }
       finally { delete tr.dataset.op; refreshRowControls(tr); }
     }
 
@@ -657,25 +674,41 @@
         const sent = new Map();
         cells(tr).forEach(el => { if (el.value !== el.dataset.orig) { fields[el.name] = el.value; sent.set(el, el.value); } });
         if (sent.size === 0) return;
-        // 区分を いろは (利用者) にすると職員PIN は消える (利用者は PIN を持たない)。黙って消さない
-        if (fields.kind === 'iroha' && tr.querySelector('td.w-pin').dataset.pinSet === '1'
-          && !confirm(rowName(tr) + ' を「いろは利用者」にすると、職員PIN は消えます。よろしいですか')) return;
         tr.dataset.saving = '1';
         refreshRowControls(tr); syncState();
+        // 区分を いろは (利用者) にすると職員PIN は消える (利用者は PIN を持たない)。黙って消さない。
+        // 🚨 PIN の設定は version を進めないので、画面を開いた後に iPad などで設定された PIN は楽観ロックで
+        //    気づけない。送る直前にその 1 行を読み直して確かめる (Codex R5 Medium)
+        if (fields.kind === 'iroha') {
+          const now = await fetchRow(tr);
+          const stop = why => { delete tr.dataset.saving; refreshRowControls(tr); syncState(); msg($('#listMsg'), false, why); };
+          if (!now) return stop('通信できませんでした。もう一度「保存」を押してください');
+          renderPin(tr, now);
+          if (now.pin_set && !confirm(rowName(tr) + ' を「いろは利用者」にすると、職員PIN は消えます。よろしいですか')) return stop('保存をやめました (PIN は残っています)');
+        }
         let res;
         try {
           res = await postJson(BASE + '/api/staff/' + tr.dataset.id, { fields, expect_version: Number(tr.dataset.version) });
         } catch {
-          // 通信できなかったときは編集を残したまま伝える (黙って保存済みにしない)
-          delete tr.dataset.saving; refreshRowControls(tr); syncState();
-          return msg($('#listMsg'), false, '通信できませんでした。もう一度「保存」を押してください');
+          // 通信できなかったときは編集を残したまま伝える (黙って保存済みにしない)。
+          // 届いて保存済みのこともあるので読み直す。保存済みなら欄の値と DB が同じになり黄色が消える
+          delete tr.dataset.saving;
+          await resyncAfterNetError(tr);
+          refreshRowControls(tr); syncState();
+          return;
         }
         delete tr.dataset.saving;
         const { status, j } = res;
         if (j.ok) {
           tr.dataset.version = j.staff.version;
           cells(tr).forEach(el => {
-            if (sent.has(el)) el.dataset.orig = sent.get(el);
+            if (sent.has(el)) {
+              // サーバーがそろえた値 (空白の除去・メールの小文字・数値) を既定値にする (Codex R5 Low)。
+              // 応答待ちの間に触った欄は、その入力を残して未保存のまま (Codex R1 P2)
+              const v = j.staff[el.name] == null ? '' : String(j.staff[el.name]);
+              if (el.value === sent.get(el)) el.value = v;
+              el.dataset.orig = v;
+            }
             el.classList.toggle('dirty', el.value !== el.dataset.orig);
           });
           renderPin(tr, j.staff);
