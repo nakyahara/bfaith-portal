@@ -182,7 +182,16 @@ await ta('[6] 手の口 (--amazon-map-chain・#1649 Codex R3 High / Medium 3): �
     calls.length = 0;
     assert.equal((await R.manualAmazonChain(['--amazon-map-chain', '--daily'], { ...base, run: run() })).reason, 'args');
     assert.equal((await R.manualAmazonChain(['--amazon-map-chain'], { ...base, run: run(), now: new Date('2030-01-09T21:30:00Z') })).reason, 'quiet_window');   // 06:30 JST
-    assert.equal(R.manualChainQuietReason(new Date('2030-01-09T22:00:00Z')), null);   // 07:00 JST = daily-sync が自分の鍵を取る
+    // 禁止の時間は鎖の最長 (各段の timeout の和) + 余裕を 07:00 から引いた時刻〜07:30 (#1649 Codex R4 High)。境を全部見る (JST = UTC + 9)
+    const jst = (hm) => new Date(`2030-01-09T${String((Number(hm.slice(0, 2)) + 24 - 9) % 24).padStart(2, '0')}:${hm.slice(3)}:00Z`);
+    for (const [hm, blocked] of [['04:29', false], ['04:30', true], ['05:59', true], ['06:30', true], ['07:00', true], ['07:29', true], ['07:30', false], ['12:00', false], ['23:59', false]]) {
+      assert.equal(!!R.manualChainQuietReason(jst(hm)), blocked, hm);
+    }
+    assert.equal(R.MANUAL_CHAIN_MAX_MS, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期'].reduce((n, j) => n + R.JOB_DEFINITIONS[j].timeoutMs, 0));
+    assert.deepEqual(R.MANUAL_CHAIN_QUIET_JST, ['04:30', '07:30']);
+    const toMin = (hm) => Number(hm.slice(0, 2)) * 60 + Number(hm.slice(3));
+    assert.ok(toMin('07:00') - toMin(R.MANUAL_CHAIN_QUIET_JST[0]) >= R.MANUAL_CHAIN_MAX_MS / 60000 + 1, '始めの時刻から最長の鎖が 07:00 (と 60 秒の待ち) より前に終わる');
+    assert.ok(toMin(R.MANUAL_CHAIN_QUIET_JST[1]) > toMin('07:01'), '07:00 の起動と 60 秒の待ちの間も断る');
     assert.deepEqual(calls, []);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

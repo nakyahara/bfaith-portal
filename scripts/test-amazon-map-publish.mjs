@@ -151,10 +151,11 @@ const watcherConnect = (E, { tz = null, counter = null } = {}) => async () => {
 };
 const sqliteOpener = (counter = null) => async () => { if (counter) counter.n++; return sq; };
 /** 回の鍵を持つ親から起動された写し (daily-sync・自動再試行・手の口の子) の代わり */
-const HELD = () => ({ what: '試験の回', pid: 1 });
-const publish = (E, opts = {}) => P.runAmazonMapPublish({ connect: watcherConnect(E, opts), getSqlite: sqliteOpener(opts.sqCounter), runLockHeld: HELD, ...opts });
+const HELD = () => ({ what: '試験の回', pid: 1, token: 't', file: 'x' });
+const STILL = () => true;   // commit の前の確かめ直し (親が生きていて同じ token の回の lock を持つ) の代わり
+const publish = (E, opts = {}) => P.runAmazonMapPublish({ connect: watcherConnect(E, opts), getSqlite: sqliteOpener(opts.sqCounter), runLockHeld: HELD, runLockStill: STILL, ...opts });
 const cli = (E, argv, { env = {}, ...deps } = {}) => P.cli(argv, { env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: 'postgres://watcher@localhost/x', ...env },
-  connectFor: () => watcherConnect(E), openSqlite: async () => sq, log: quiet, runLockHeld: HELD, ...deps });
+  connectFor: () => watcherConnect(E), openSqlite: async () => sq, log: quiet, runLockHeld: HELD, runLockStill: STILL, ...deps });
 const vFirst = () => sq.prepare('SELECT seller_sku, ne_code, 数量 FROM v_sku_components_first ORDER BY seller_sku').all();
 
 console.log('今の本番 (持ち主 listing_components.amazon = load) は何もしない');
@@ -437,8 +438,9 @@ await ta('[8b] 書くのは回の鍵 (daily-sync / 再試行) を持つ親の子
   // 本物の確かめの部品: lock の pid が親の pid = 持つ / 違う・読めない・無い = 持たない
   const files = { 'daily-sync': 'ds.json', '再試行': 'rt.json' };
   const read = (m) => (f) => m[f] ?? null;
-  assert.deepEqual(P.runLockHeldByParent({ files, ppid: 42, read: read({ 'rt.json': { pid: 42, token: 't' } }) }), { what: '再試行', pid: 42 });
-  assert.deepEqual(P.runLockHeldByParent({ files, ppid: 42, read: read({ 'ds.json': { pid: 42, run_id: 'r' } }) }), { what: 'daily-sync', pid: 42 });
+  assert.deepEqual(P.runLockHeldByParent({ files, ppid: 42, read: read({ 'rt.json': { pid: 42, token: 't' } }) }), { what: '再試行', pid: 42, token: 't', file: 'rt.json' });
+  assert.deepEqual(P.runLockHeldByParent({ files, ppid: 42, read: read({ 'ds.json': { pid: 42, run_id: 'r' } }) }), { what: 'daily-sync', pid: 42, token: 'r', file: 'ds.json' });
+  assert.equal(P.runLockHeldByParent({ files, ppid: 42, read: read({ 'rt.json': { pid: 42 } }) }), null);   // token の無い lock = 確かめ直せない = 持たない
   assert.equal(P.runLockHeldByParent({ files, ppid: 42, read: read({ 'ds.json': { pid: 43 }, 'rt.json': { pid: '42' } }) }), null);
   assert.equal(P.runLockHeldByParent({ files, ppid: 42, read: read({}) }), null);
   assert.ok(/daily-sync\.lock\.json$/.test(P.RUN_LOCK_FILES['daily-sync']) && /retry-failed-jobs\.lock\.json$/.test(P.RUN_LOCK_FILES['再試行']));
@@ -455,11 +457,48 @@ await ta('[8b] 書くのは回の鍵 (daily-sync / 再試行) を持つ親の子
     const lockF = path.join(d, 'retry-failed-jobs.lock.json');
     fs.writeFileSync(lockF, JSON.stringify({ token: 't', pid: process.pid, started_at: new Date().toISOString() }));
     const out1 = spawnSync(process.execPath, [child, lockF], { encoding: 'utf8' });
-    assert.deepEqual(JSON.parse(out1.stdout.trim()), { what: '再試行', pid: process.pid }, out1.stderr);
+    assert.deepEqual(JSON.parse(out1.stdout.trim()), { what: '再試行', pid: process.pid, token: 't', file: lockF }, out1.stderr);
     fs.writeFileSync(lockF, JSON.stringify({ token: 't', pid: process.pid + 100000, started_at: new Date().toISOString() }));
     const out2 = spawnSync(process.execPath, [child, lockF], { encoding: 'utf8' });
     assert.equal(JSON.parse(out2.stdout.trim()), null);
   } finally { fs.rmSync(d, { recursive: true, force: true }); }
+});
+
+await ta('[8d] commit の直前に回の鍵を確かめ直す (#1649 Codex R4 Medium): 親が落ちた後に残った子・回が替わった (token が違う)・lock が消えた = commit しない (巻き戻す)', async () => {
+  await save('pr_a001', 'SKU マスタの 1 (親が落ちた)', [{ code: 'a001', qty: 1 }]);
+  const before = sqSnap();
+  await assert.rejects(() => publish(E, { runLockStill: () => false }), (e) => e.code === 'RUN_LOCK_LOST');
+  assert.equal(sqSnap(), before);
+  const c = await cli(E, ['--daily'], { runLockStill: () => false });
+  assert.equal(c.code, 1); assert.match(c.last, /回の鍵を持つ親がもういない/);
+  assert.equal(sqSnap(), before);
+  // 確かめ直しは commit の直前 (読み直しの後) = 始めの照合が通っていても、その後に落ちた親を見つける
+  let asked = 0;
+  await assert.rejects(() => publish(E, { runLockStill: () => { asked++; return false; } }), (e) => e.code === 'RUN_LOCK_LOST');
+  assert.equal(asked, 1);
+  // 部品: 同じ pid・同じ token・pid が生きている = 持つ / token が違う・pid が死んだ・lock が消えた・token が無い = 持たない
+  const held = { what: '再試行', pid: 42, token: 't1', file: 'rt.json' };
+  const rd = (j) => () => j;
+  assert.equal(P.runLockStillHeld(held, { read: rd({ pid: 42, token: 't1' }), alive: () => true }), true);
+  assert.equal(P.runLockStillHeld(held, { read: rd({ pid: 42, token: 't2' }), alive: () => true }), false);
+  assert.equal(P.runLockStillHeld(held, { read: rd({ pid: 42, token: 't1' }), alive: () => false }), false);
+  assert.equal(P.runLockStillHeld(held, { read: rd(null), alive: () => true }), false);
+  assert.equal(P.runLockStillHeld({ ...held, token: null }, { read: rd({ pid: 42 }), alive: () => true }), false);
+  assert.equal(P.runLockStillHeld({ what: 'daily-sync', pid: 42, token: 'r1', file: 'ds.json' }, { read: rd({ pid: 42, run_id: 'r1' }), alive: () => true }), true);
+  // 本物: 終わったプロセス (= 落ちた親) の pid は生きていない = 持たない / 生きている自分の pid = 持つ
+  const { spawnSync } = await import('node:child_process');
+  const os2 = await import('node:os');
+  const d = fs.mkdtempSync(path.join(os2.tmpdir(), 'amzA-dead-'));
+  try {
+    const dead = spawnSync(process.execPath, ['-e', ''], { encoding: 'utf8' }).pid;
+    const lockF = path.join(d, 'retry-failed-jobs.lock.json');
+    fs.writeFileSync(lockF, JSON.stringify({ token: 'tok', pid: dead, started_at: new Date().toISOString() }));
+    assert.equal(P.runLockStillHeld({ what: '再試行', pid: dead, token: 'tok', file: lockF }), false);
+    fs.writeFileSync(lockF, JSON.stringify({ token: 'tok', pid: process.pid, started_at: new Date().toISOString() }));
+    assert.equal(P.runLockStillHeld({ what: '再試行', pid: process.pid, token: 'tok', file: lockF }), true);
+    assert.equal(P.runLockStillHeld({ what: '再試行', pid: process.pid, token: 'other', file: lockF }), false);
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
+  assert.equal((await publish(E)).state, 'applied');
 });
 
 await ta('[8c] 肯定の手がかり (#1649 Codex R3 Medium 2): config が company・有効な写しの記録 = あり / どちらも無い・読めない記録 = なし。daily-sync は手がかりが無い朝の写しの失敗 (子の timeout など) を retry に載せない', async () => {

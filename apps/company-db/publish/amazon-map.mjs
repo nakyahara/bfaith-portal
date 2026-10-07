@@ -207,10 +207,11 @@ export function checkSafety({ canon, digest, legacyCount, meta, watermark, allow
  * SQLite の 1 取引 (IMMEDIATE) で、古い表を canon にまるごと合わせる。commit の前に読み直してハッシュを照らす・鍵がまだ自分のものかを照らす。
  * 違えば投げる (全部巻き戻る = 古い表は前のまま)。
  * @param {object} [p.lock]  acquireLock の戻り値 (鍵の持ち主を照らす。試験は null で照らさない)
+ * @param {() => boolean} [p.stillHeld]  commit の前に「回の鍵を持つ親が生きていて、同じ token の回の lock を持つ」を確かめ直す (違えば巻き戻す。#1649 Codex R4 Medium)
  * @param {(sqlite) => void} [p.beforeCommit]  試験だけ (commit の前に落とす)
  * @returns {{ counts, changed, total_changes, tampered: boolean, legacy_before: object, samples }}
  */
-export function applyCanon(sqlite, { canon, digest, by = new Map(), meta = null, metaValue, lock = null, beforeCommit = null }) {
+export function applyCanon(sqlite, { canon, digest, by = new Map(), meta = null, metaValue, lock = null, beforeCommit = null, stillHeld = null }) {
   return sqlite.transaction(() => {
     const before = readLegacyRows(sqlite);
     let legacyBefore;
@@ -238,6 +239,7 @@ export function applyCanon(sqlite, { canon, digest, by = new Map(), meta = null,
       const h = sqlite.prepare('SELECT holder_id FROM job_locks WHERE job_name = ?').get(lock.jobName)?.holder_id ?? null;
       if (h !== lock.holderId) throw fail('実行の鍵が自分のものでない (時間切れで別の写しに取られた?) = 巻き戻した', 'LOCK_LOST');
     }
+    if (stillHeld && !stillHeld()) throw fail('回の鍵を持つ親がもういない・回の lock が替わった (親が落ちた後に残った子?) = 巻き戻した', 'RUN_LOCK_LOST');
     sqlite.prepare('INSERT INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
       .run(META_KEY, JSON.stringify(metaValue), metaValue.published_at);
     if (beforeCommit) beforeCommit(sqlite);
@@ -257,13 +259,13 @@ const describe = (c) => `親 +${c.master.inserted} ~${c.master.updated} -${c.mas
  * @returns {{ state: 'not_applied'|'applied'|'unchanged'|'refused'|'dry_run'|'lock_busy'|'no_run_lock', code, line, counts?, problems?, detail?, digest? }}
  */
 export async function runAmazonMapPublish({ connect, getSqlite, now = () => new Date(), dryRun = false, allowShrink = false, acceptRestore = false, expectHash = null,
-  manual = false, lockTtlMs = LOCK_TTL_MS, beforeCommit = null, afterLock = null, runLockHeld = () => runLockHeldByParent() }) {
+  manual = false, lockTtlMs = LOCK_TTL_MS, beforeCommit = null, afterLock = null, runLockHeld = () => runLockHeldByParent(), runLockStill = (h) => runLockStillHeld(h) }) {
   // 持ち主を読むまでの失敗 (接続・持ち主の記録が壊れている) には印 ownerStage を付ける = 入口 (cli) が手がかりで ❌ / ⚠️ を決める
   const ownerStage = (e) => Object.assign(e instanceof Error ? e : new Error(String(e)), { ownerStage: true });
   let conn;
   try { conn = await connect(); } catch (e) { throw ownerStage(e); }
   const { db, close } = conn;
-  let lock = null, sqlite = null;
+  let lock = null, sqlite = null, held = null;
   try {
     // 1 持ち主 (鍵の前に読むのは持ち主だけ。load = ここで終わる = SQLite を開かない)
     let owner;
@@ -279,7 +281,7 @@ export async function runAmazonMapPublish({ connect, getSqlite, now = () => new 
     //   🚨 書くのは回の鍵 (daily-sync / 再試行の data/*.lock.json) を持つ親の子だけ (#1649 Codex R3 High)。daily・retry・手の口 (retry-failed-jobs.js --amazon-map-chain) は
     //   同じ回の鍵で 1 つずつ = 回の f_sales〜Render同期 の間に別の写しが新しい対応を入れる道が無い。鍵の順 = 回の鍵 (親) → 写しの鍵 (待たない)
     if (!dryRun) {
-      const held = runLockHeld();
+      held = runLockHeld();
       if (!held) return { state: 'no_run_lock', code: EXIT.error, line: `❌ ${STEP_NAME}: 回の鍵 (daily-sync / 再試行) を持つ親から起動されていない = 書かない。手で写すのは node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain (写し → f_sales → 速度 → リスト → Render同期 を一続きで)・差を見るのは --dry-run` };
       lock = acquireLock(sqlite, LOCK_NAME, { ttlMs: lockTtlMs });
       if (!lock) return { state: 'lock_busy', code: EXIT.lock_busy, line: `❌ ${STEP_NAME}: 別の写しが動いている (鍵 ${LOCK_NAME}) = 何もしない (show-job-locks.js で確かめる・daily-sync はこの朝の f_sales 以降を retry に残す)` };
@@ -311,7 +313,7 @@ export async function runAmazonMapPublish({ connect, getSqlite, now = () => new 
     const metaValue = { format: SKU_MAP_CANON_FORMAT, content_hash: digest.content_hash, master_rows: digest.master_rows, component_rows: digest.component_rows,
       watermark: Number.isSafeInteger(src.watermark) ? src.watermark : null, cdb_read_at: src.cdbReadAt, published_at: t.toISOString(), by: manual ? 'manual' : 'daily',
       ...(allowShrink ? { allow_shrink: true } : {}), ...(acceptRestore ? { accept_restore: true } : {}) };
-    const r = applyCanon(sqlite, { canon: src.canon, digest, by: src.by, meta, metaValue, lock, beforeCommit });
+    const r = applyCanon(sqlite, { canon: src.canon, digest, by: src.by, meta, metaValue, lock, beforeCommit, stillHeld: () => !!runLockStill(held) });
     const warn = r.tampered;
     const state = r.changed ? 'applied' : 'unchanged';
     const line = `${warn ? '⚠️' : '✅'} ${STEP_NAME}: ${r.changed ? `写した (${describe(r.counts)})` : '変わった行 0'} / 対応 ${digest.master_rows} 件・構成 ${digest.component_rows} 行・ハッシュ ${short(digest.content_hash)}`
@@ -357,7 +359,7 @@ const truthy = (v) => /^(1|true|yes|on)$/i.test(String(v ?? '').trim());
  *   どちらも示さない (今の本番 = 写しを一度も使っていない) = ⚠️ exit 0 (今までの動きを変えない = f_sales の retry を止めない)
  * @param {object} [deps]  試験で差し替える (env・接続・warehouse.db・持ち主の設定・ログ)
  */
-export async function cli(argv, { env = process.env, connectFor = null, openSqlite = null, readHintMeta = null, ownership = MASTER_OWNERSHIP, log = console.log, now = () => new Date(), run = runAmazonMapPublish, beforeCommit = null, afterLock = null, runLockHeld = null } = {}) {
+export async function cli(argv, { env = process.env, connectFor = null, openSqlite = null, readHintMeta = null, ownership = MASTER_OWNERSHIP, log = console.log, now = () => new Date(), run = runAmazonMapPublish, beforeCommit = null, afterLock = null, runLockHeld = null, runLockStill = null } = {}) {
   let code = EXIT.error, last = '';
   try {
     const a = parseArgs(argv);
@@ -390,7 +392,7 @@ export async function cli(argv, { env = process.env, connectFor = null, openSqli
         let r = null, ownerErr = null;
         try {
           r = await run({ connect, getSqlite, now, dryRun: a.dryRun, allowShrink: a.allowShrink, acceptRestore: a.acceptRestore, expectHash: a.expectHash, manual: a.chain, beforeCommit, afterLock,
-            runLockHeld: runLockHeld || (() => runLockHeldByParent()) });
+            runLockHeld: runLockHeld || (() => runLockHeldByParent()), ...(runLockStill ? { runLockStill } : {}) });
         } catch (e) {
           // 持ち主を読む前に落ちた (接続・持ち主の記録が壊れている) = 手がかりで決める / それより後 = ❌
           if (e && e.ownerStage) ownerErr = e;
@@ -419,9 +421,25 @@ export const RUN_LOCK_FILES = Object.freeze({ 'daily-sync': path.join(PROJECT_DI
  * 回の鍵 (daily-sync / 再試行の lock) を持つのが親プロセスか = この写しは回の中で起動された (daily-sync・自動再試行・手の口の子)。持つ = { what, pid } / 持たない = null。
  *   親 = その回の node (execFileSync で直接起動 = 親の pid が lock の pid)。親は子を待っている = 生きている (pid の使い回しは起きない)
  */
-export function runLockHeldByParent({ files = RUN_LOCK_FILES, ppid = process.ppid, read = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } } } = {}) {
-  for (const [what, file] of Object.entries(files)) { const j = read(file); if (j && Number.isInteger(j.pid) && j.pid === ppid) return { what, pid: j.pid }; }
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+/** 回の lock の token (再試行 = token・daily-sync = run_id)。無い = null (その回は確かめ直せない = 持たないのと同じ) */
+const runTokenOf = (j) => (j && typeof j.token === 'string' && j.token ? j.token : j && typeof j.run_id === 'string' && j.run_id ? j.run_id : null);
+export function runLockHeldByParent({ files = RUN_LOCK_FILES, ppid = process.ppid, read = readJson } = {}) {
+  for (const [what, file] of Object.entries(files)) {
+    const j = read(file);
+    if (j && Number.isInteger(j.pid) && j.pid === ppid && runTokenOf(j)) return { what, pid: j.pid, token: runTokenOf(j), file };
+  }
   return null;
+}
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return !!(e && e.code === 'EPERM'); } };
+/**
+ * commit の直前の確かめ直し (#1649 Codex R4 Medium): 始めに見つけた回の lock が、今も同じ pid・同じ token で、その pid が生きている。
+ *   親が落ちた (lock が残っていても pid が死んでいる)・回が替わった (token が違う)・lock が消えた = false (呼び手が巻き戻す)
+ */
+export function runLockStillHeld(held, { read = readJson, alive = pidAlive } = {}) {
+  if (!held || !held.file || !held.token) return false;
+  const j = read(held.file);
+  return !!j && j.pid === held.pid && runTokenOf(j) === held.token && alive(held.pid);
 }
 
 const fold = (x) => (process.platform === 'win32' ? x.toLowerCase() : x);

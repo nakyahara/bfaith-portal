@@ -571,7 +571,7 @@ export const JOBS_REGISTRY = [
       + '「CompanyDB写し(Amazon SKU)」が ❌: 要約の理由 = empty・shrunk (墓標が多すぎる? わざとなら手で --dry-run → --allow-shrink --expect-hash <出たハッシュ>) / '
       + 'watermark_backward・meta_unreadable (Company DB を戻した? = db/company/README.md「Amazon SKU の対応の写し」の復元の手順: .env に CDB_AMAZON_MAP_PUBLISH_PAUSE=1 → --dry-run で差を人が見る → env を外して --accept-restore --expect-hash) / '
       + 'invalid_canon (Company DB の対応が受け手の決まりに合わない) / 別の写しが動いている (exit 73 = 別の写しが写しの鍵を持っていた = その朝は f_sales・速度・リスト・Render同期 も見送り retry で写しから流す・show-job-locks.js) / 持ち主を読めない (COMPANY_DB_WATCH_URL・DB に届かない) / 回の鍵を持つ親から起動されていない (写しを直接流した = 手の口から流す)。'
-      + '急ぎで写す = 手の口 node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain (再試行と同じ回の鍵を取り、写し → f_sales → 速度 → リスト → Render同期 を一続き・途中で落ちたら先は流さない。daily-sync / 再試行が動いている間・06:00〜07:00 は断る。写しのファイルを直接流しても書かない = --dry-run だけ)。⚠️ 前の写しの後に古い表が書き換えられていた = 誰が SKU タブ・CSV・GAS で書いたかを見る (Company DB の値で上書き済み)',
+      + '急ぎで写す = 手の口 node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain (再試行と同じ回の鍵を取り、写し → f_sales → 速度 → リスト → Render同期 を一続き・途中で落ちたら先は流さない。daily-sync / 再試行が動いている間・04:30〜07:30 (鎖は最長 70 分 = 07:00 の daily-sync と重ならない) は断る。写しのファイルを直接流しても書かない = --dry-run だけ)。⚠️ 前の写しの後に古い表が書き換えられていた = 誰が SKU タブ・CSV・GAS で書いたかを見る (Company DB の値で上書き済み)',
   },
   {
     id: 'mf-daily-sync',

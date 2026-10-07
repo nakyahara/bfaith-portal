@@ -460,12 +460,23 @@ async function amazonHintNow() {
  *   写し → f_sales → sales_velocity → pml_snapshot → Render同期 を一続きで流す。途中で落ちたらその先は流さない (exit 1)。
  *   = daily-sync・自動再試行・手の 3 つは同じ回の鍵でどれか 1 つだけ (写しの子は「回の鍵を持つ親」からしか書かない = amazon-map.mjs の runLockHeldByParent)。
  *   回の鍵を取れない (daily-sync / 再試行が動いている) = 待たずに断る (retry-state にも触らない)。
- *   06:00〜07:00 (JST) は断る: 長い鎖が 07:00 の daily-sync と重なると、daily-sync は再試行の鍵を 60 秒待って起動をやめる (その朝の全部が抜ける)
+ *   04:30〜07:30 (JST) は断る (#1649 Codex R4 High): 鎖が 07:00 の daily-sync と重なると、daily-sync は再試行の鍵を 60 秒待って起動をやめる (その朝の全部が抜ける)。
+ *     始めの時刻ではなく「鎖の最長 (各段の timeout の和 = 70 分) + 余裕」を 07:00 から引いた時刻から、daily-sync が自分の鍵を取り終える 07:30 までを断る
  * 使い方: node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain [--allow-shrink | --accept-restore] [--expect-hash <H>]
  *   (--allow-shrink / --accept-restore は --expect-hash <H> と一緒。H = apps/company-db/publish/amazon-map.mjs --dry-run が出す Company DB のハッシュ)
  */
 export const MANUAL_CHAIN_FLAG = '--amazon-map-chain';
-export const MANUAL_CHAIN_QUIET_JST = Object.freeze(['06:00', '07:00']);   // この間は断る (07:00 の daily-sync の前)
+/** 鎖の最長 = 各段の timeout の和 (写し 5 分 + f_sales 30 分 + 速度 15 分 + リスト 10 分 + Render 10 分 = 70 分) */
+export const MANUAL_CHAIN_MAX_MS = AMAZON_MAP_CHAIN.reduce((n, j) => n + JOB_DEFINITIONS[j].timeoutMs, 0);
+/** 07:00 の daily-sync (Task Scheduler) と、その起動の 60 秒の待ちに重ならないための余裕 (鍵・門を読む時間・timeout の後の後始末・時計のずれ) */
+export const MANUAL_CHAIN_MARGIN_MS = 80 * 60 * 1000;
+export const DAILY_SYNC_START_JST = '07:00';
+/** daily-sync の起動が遅れても自分の鍵を取り終える時刻 (この後は daily-sync の鍵が生きていれば手の口は鍵で断られる) */
+export const DAILY_SYNC_SETTLED_JST = '07:30';
+const hmToMin = (hm) => Number(hm.slice(0, 2)) * 60 + Number(hm.slice(3, 5));
+const minToHm = (m) => `${String(Math.floor(((m % 1440) + 1440) % 1440 / 60)).padStart(2, '0')}:${String((((m % 1440) + 1440) % 1440) % 60).padStart(2, '0')}`;
+/** 手の口を断る時間 (JST・[始め, 終わり)) = 07:00 − (鎖の最長 + 余裕) 〜 07:30 = 04:30〜07:30。1 か所の定数から計算する */
+export const MANUAL_CHAIN_QUIET_JST = Object.freeze([minToHm(hmToMin(DAILY_SYNC_START_JST) - Math.ceil((MANUAL_CHAIN_MAX_MS + MANUAL_CHAIN_MARGIN_MS) / 60000)), DAILY_SYNC_SETTLED_JST]);
 export function parseManualChainArgs(argv) {
   const mapArgs = ['--chain'];
   for (let i = 0; i < argv.length; i++) {
@@ -480,7 +491,7 @@ export function parseManualChainArgs(argv) {
 /** 手の口を断る時間 (JST の HH:MM が MANUAL_CHAIN_QUIET_JST の間) = 理由 / 流してよい = null */
 export function manualChainQuietReason(now = new Date()) {
   const hm = new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(11, 16);
-  return hm >= MANUAL_CHAIN_QUIET_JST[0] && hm < MANUAL_CHAIN_QUIET_JST[1] ? `いま ${hm} (JST) は 07:00 の daily-sync の前 (${MANUAL_CHAIN_QUIET_JST.join('〜')}) = 流さない (daily-sync が鍵を待って起動をやめるので)` : null;
+  return hm >= MANUAL_CHAIN_QUIET_JST[0] && hm < MANUAL_CHAIN_QUIET_JST[1] ? `いま ${hm} (JST) は 07:00 の daily-sync と重なりうる (${MANUAL_CHAIN_QUIET_JST.join('〜')}・鎖は最長 ${Math.round(MANUAL_CHAIN_MAX_MS / 60000)} 分) = 流さない (daily-sync が鍵を待って起動をやめるので)` : null;
 }
 /** 写しの鎖を一続きで流す (呼び手が回の鍵を持つ)。途中で落ちた (見送りも) = その先は流さない。写しの反映の門が壊れている = 門の一覧の工程は止まる */
 export function runAmazonChainSteps({ mapArgs = ['--chain'], run = runScript, log = console.log, publishGate = { broken: false } } = {}) {

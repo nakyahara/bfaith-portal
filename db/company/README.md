@@ -439,7 +439,7 @@ Company DB の active の対応 → miniPC の古い表 `m_sku_master` + `m_sku_
 - 写しが失敗した朝でも、持ち主が company の**肯定の手がかり** (config が company・有効な写しの記録) が無ければ retry に載せない (子の timeout・abort などで今の本番の retry に写しの鎖を持ち込まない)。retry の写しの鎖も手がかりがある日だけ (#1649 Codex R3 Medium 2)
 ```
 # 急ぎで写す = 手の口 (再試行と同じ回の鍵を取り、写し → f_sales → 速度 → リスト → Render同期 を一続きで流す。途中で落ちたらその先は流さない = exit 1)
-#   daily-sync / 自動再試行が動いている間・06:00〜07:00 (JST・07:00 の daily-sync の前) は待たずに断る。Render の誤った対応もこれで直る (古い表だけを直す口は無い)
+#   daily-sync / 自動再試行が動いている間・04:30〜07:30 (JST・鎖は最長 70 分 = 07:00 の daily-sync と重ならないように) は待たずに断る。Render の誤った対応もこれで直る (古い表だけを直す口は無い)
 node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain
 # 差を数えるだけ (鍵も取らない・書かない。止めている間も流せる。Company DB のハッシュが出る)
 node -r dotenv/config apps/company-db/publish/amazon-map.mjs --dry-run

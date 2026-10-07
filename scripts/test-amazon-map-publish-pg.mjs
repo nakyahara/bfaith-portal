@@ -80,7 +80,7 @@ function makePlan() {
   return { skus: ['p001', 'p002', 'p003', 'p004'].map(single), variationGroups: [], setComponents: [], listings: [], observations: [], physicals: [], compliance: [], workers: [], suppliers: [], supplierSkus: [] };
 }
 /** 入口そのもの (本物の connectWatcher = パスワードでログイン・statement_timeout・読むだけ)。古い表はこの試験の warehouse.db */
-const cliReal = (argv = ['--daily'], deps = {}) => P.cli(argv, { env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: WATCH_URL }, openSqlite: async () => sq, log: quiet, runLockHeld: () => ({ what: '試験の回', pid: 1 }), ...deps });
+const cliReal = (argv = ['--daily'], deps = {}) => P.cli(argv, { env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: WATCH_URL }, openSqlite: async () => sq, log: quiet, runLockHeld: () => ({ what: '試験の回', pid: 1, token: 't', file: 'x' }), runLockStill: () => true, ...deps });
 
 const O = await open(null);
 const clients = [O];
