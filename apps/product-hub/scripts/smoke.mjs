@@ -10885,6 +10885,23 @@ for (const [name, file, data] of renders) {
       JSON.stringify(n2['8'] || []) + ' / ' + my.note.textContent);
   }
 
+  // ⑩' 🚨 NE の配送方法が SKU ごとに割れていて決まらない商品 (送料だけ分かる) も、
+  //      画面の配送方法に合わせる (画面しか手がかりが無い — 2026-10-07 の決定 A)
+  {
+    const split = [
+      { method: 'NEの登録送料 (配送方法は未設定)', cost: 544, count: 0, isCurrent: true },
+      { method: '定形外規格内（50g以内）', cost: 182, count: 900 },
+      { method: '定形外規格外（1kg以内）', cost: 510, count: 40 },
+    ];
+    const ps = vari.profitShipPickByGroup(split, hints, labels);
+    const ns = vari.profitShipNearByGroup(split, hints, labels);
+    const ms = mount({ options: split, picks: ps, near: ns, labels, hints, neCurrent: '', rkValue: '1', ship: '544' });
+    check('🚨 画面の試算: NE の配送方法が決まらない商品も、保存済みの配送方法 (定形外) に合わせる',
+      ms.shipCost() === '182' && ms.profit() === '892円', ms.profit() + ' / ' + ms.body.textContent);
+    check('🚨 画面の試算: そのとき「NE の配送方法は決まっていません (NE の送料は 544円)」と出す',
+      ms.note.textContent.includes('NE の配送方法は決まっていません (NE の送料は 544円)'), ms.note.textContent);
+  }
+
   // ⑪ 🚨 同じ配送方法の便はあるが送料が 0円 だけのとき = 「選択肢にない」ではない
   {
     const zero = [
@@ -10895,7 +10912,8 @@ for (const [name, file, data] of renders) {
     const nz = vari.profitShipNearByGroup(zero, hints, labels);
     const mz = mount({ options: zero, picks: pz, near: nz, labels, hints, neCurrent: 'ネコポス', rkValue: '4' });
     check('🚨 画面の試算: 0円の便しか無いときは「選択肢にない」と書かず、0円だからと書く',
-      mz.note.textContent.includes('送料が 0円 (NE に入っていない) ので自動では選んでいません')
+      mz.note.textContent.includes('送料が 0円 なので自動では選んでいません')
+      && mz.note.textContent.includes('未入力か本当に 0円 か確かめてください')
       && !mz.note.textContent.includes('選択肢にない'), mz.note.textContent);
     check('画面の試算: そのとき利益は NE の送料のまま (0円で計算しない)', mz.profit() === '837円', mz.profit());
   }
@@ -13514,14 +13532,14 @@ for (const [name, file, data] of renders) {
     /let ship = Number\(box\.dataset\.ship\)/.test(sim) && !/const ship = Number\(box\.dataset\.ship\)/.test(sim));
   check('配送費の試算: 配送方法を変えたら利益を再計算する',
     /sel\.addEventListener\('change', [\s\S]{0,100}apply\(\)/.test(sim) && /ship = Number\(op\.dataset\.cost\)/.test(sim)
-    && /function apply\(\)[\s\S]{0,600}render\(\)/.test(sim));
+    && /function apply\(\)[\s\S]{0,900}render\(\)/.test(sim));
   // 🚨 候補を組み直すだけでは利益が動かない (2026-10-06 中原さん報告)。**選択も合わせる**こと。
   //    配線はソース検査で、決め方と文言は下の切り出しで**入力→出力**で確かめる
   check('配送費の試算: 楽天の配送方法を変えたら、候補を組み直して試算もその配送方法に合わせる',
     /rkShip\.addEventListener\('change', \(\) => \{[\s\S]{0,600}build\(\{ follow: true \}\);/.test(sim)
     && /followed = d\.followed;[\s\S]{0,80}sel\.value = d\.method;[\s\S]{0,40}apply\(\);/.test(sim));
   check('🚨 配送費の試算: 開いたときも保存済みの配送方法に合わせる (保存すると画面は丸ごと読み直される)',
-    /build\(\{ follow: neCurrent !== '' \}\);/.test(sim));
+    /\n      build\(\{ follow: true \}\);/.test(sim));
   check('配送費の試算: 試算のプルダウンを自分で選び直したら、合わせた注記は消えて選択を覚える',
     /sel\.addEventListener\('change', \(\) => \{ followed = null; mine\.remember\(sel\.value, groupOf\(\)\); apply\(\); \}\)/.test(sim));
   check('🚨 配送費の試算: ヤフーだけ変えた (1 → 1y5) ときは合わせ直さず、注記だけ描き直す',

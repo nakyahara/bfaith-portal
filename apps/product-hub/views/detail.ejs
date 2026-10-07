@@ -5275,7 +5275,7 @@ th.attr-unknown { color: #dc2626; }
     }
     // 注記。「何の送料で試算しているか」「ほかに何通りあるか」「試算であって保存ではない」を書く
     // (追従した説明で「試算だけ」が消えると、NE の配送方法まで保存されたように読める — Codex R3 P2)
-    function profitShipNoteText({ followed, method, cost, groupLabel, neCurrent, isCurrent }) {
+    function profitShipNoteText({ followed, method, cost, groupLabel, neCurrent, neCost, isCurrent }) {
       if (!followed) {
         return isCurrent
           ? 'NE に登録されている送料です'
@@ -5290,7 +5290,7 @@ th.attr-unknown { color: #dc2626; }
         //    「同じ便はあるが送料が 0円 (未入力) だけ」は別に書く — プルダウンには見えて
         //    いるので「選択肢にない」だと嘘になる (Codex R19 P3)
         const why0 = followed.nearCount > 0
-          ? '「' + label + '」の便は送料が 0円 (NE に入っていない) ので自動では選んでいません'
+          ? '「' + label + '」の便は送料が 0円 なので自動では選んでいません (未入力か本当に 0円 か確かめてください)'
           : '「' + label + '」で試算できる NE の配送方法が選択肢にないので変えていません';
         return ['試算: 「' + method + '」' + yen(cost) + '（' + why0
           + (neCurrent && neCurrent !== method ? '。NE は「' + neCurrent + '」' : '') + '）', keep]
@@ -5302,9 +5302,12 @@ th.attr-unknown { color: #dc2626; }
       const lines = [];
       // 🚨 NE と画面が食い違っているときは NE の配送方法も必ず出す (2026-10-07 中原さんの決定で
       //    画面の配送方法に合わせるので、何を上書きしたのかが分からないと確かめられない — Codex R6 P2)
+      // NE 側の状況: 登録値そのもの / 違う配送方法 / 配送方法が決まらない (SKUで割れている)
+      const neWord = p.isNe ? '。NE に登録されている送料です'
+        : (neCurrent ? '。NE は「' + neCurrent + '」'
+          : (yen(neCost) ? '。NE の配送方法は決まっていません (NE の送料は ' + yen(neCost) + ')' : ''));
       lines.push('試算: 「' + method + '」' + yen(cost)
-        + '（画面の「' + label + '」に合わせました'
-        + (p.isNe ? '。NE に登録されている送料です' : (neCurrent ? '。NE は「' + neCurrent + '」' : '')) + '）');
+        + '（画面の「' + label + '」に合わせました' + neWord + '）');
       if (p.candidates > 1) {
         // 🚨 「大きさで N 通り」とは書かない。候補は配送方法ごとに代表送料 1 件へ畳んである
         //    ので、実際の送料の幅ではない (Codex R4 P2)。
@@ -5446,6 +5449,8 @@ th.attr-unknown { color: #dc2626; }
         ship = Number(op.dataset.cost);
         note.textContent = profitShipNoteText({
           followed, method: sel.value, cost: Number(op.dataset.cost),
+          // NE の実送料 (配送方法名が分からない商品でも、何を上書きしたか出せるように)
+          neCost: data.options.find((o) => o.isCurrent)?.cost,
           // 🚨 楽天側の正規ラベル (「定形外」)。プルダウンの文字をそのまま使うと複合選択肢の
           //    「定形外（ヤフーのみネコポス）」が出て、楽天に送る配送方法と読み違える (Codex R5 P3)
           groupLabel: data.labels?.[groupOf()] || '',
@@ -5476,9 +5481,11 @@ th.attr-unknown { color: #dc2626; }
       // 🚨 開いたときも保存されている楽天の配送方法に合わせる。中原さんの報告は
       //    「定形外にしている」= 保存済みの状態で、**保存すると画面は丸ごと読み直される**ので、
       //    ここで合わせないと保存のたびに NE の送料へ戻ってしまう (Codex R3 P1)。
-      //    NE の配送方法が分からない商品 (バリエーションで名前だけ割れている等) は合わせない —
-      //    実送料が分かっているのに代表送料で上書きしないため (#1167 Codex R3 P1)
-      build({ follow: neCurrent !== '' });
+      //    NE の配送方法が分からない商品 (バリエーションで名前だけ割れている等) も合わせる
+      //    — 画面の配送方法しか手がかりが無いので (2026-10-07 中原さんの決定)。
+      //    何を上書きしたかは注記に「NE の配送方法は決まっていません (NE の送料は ○円)」と出す
+      //    (Codex R23 P2)
+      build({ follow: true });
     })();
 
     render();
