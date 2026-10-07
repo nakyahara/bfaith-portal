@@ -10562,6 +10562,11 @@ for (const [name, file, data] of renders) {
   // ─── 配送方法で試算 (2026-10-06/07) が出る分岐・出ない分岐を、描いた HTML で確かめる ───
   const withPicker = renderedHtml.get('detail.ejs (full/own_brand)') || '';
   const skuVaries = renderedHtml.get('detail.ejs (SKU別原価・売価: costVaries)') || '';
+  // 🚨 初期化は画面に 1 回だけ (2 回描くとハンドラが二重になり人の選択を奪う)
+  check('配送費の試算: 利益シミュレーションと配送方法ピッカーの初期化は画面に1つずつ',
+    (withPicker.match(/\(function initProfitSim\(\)/g) || []).length === 1
+    && (withPicker.match(/\(function initProfitShipPicker\(\)/g) || []).length === 1
+    && (withPicker.match(/id="profit-ship-select"/g) || []).length === 1);
   check('配送費の試算: 原価も送料もある商品には「配送方法で試算」と合わせ先が埋まる',
     withPicker.includes('id="profit-ship-select"') && withPicker.includes('配送方法で試算')
     && withPicker.includes('"picks":{'), String(withPicker.length));
@@ -10737,6 +10742,12 @@ for (const [name, file, data] of renders) {
       });
       check('🚨 画面の試算: あとで候補が現れたら、残していた便を捨てて合わせ直す',
         k3.sel.value === 'ゆうパック60サイズ' && k3.shipCost() === '810', k3.profit() + ' / ' + k3.sel.value);
+      // 🚨 使われなかった記録は消す。残すと、その便がまた選択肢から消えたときに復活する
+      check('🚨 画面の試算: 使われなかった「残した便」の記録は消える (あとで復活しない)',
+        st5.raw === null, String(st5.raw));
+      const k6 = mount({ ...base0, rkValue: '4', store: st5 });
+      check('🚨 画面の試算: 候補が消えても古い便は復活せず NE の送料で試算する (837円)',
+        k6.profit() === '837円' && k6.sel.value === 'ネコポス', k6.profit() + ' / ' + k6.sel.value);
     }
     // 🚨 別タブで配送方法が変わって読み直したあと、また元の配送方法に戻しても
     //    古い選択は復活しない (記録を消しているから — Codex R15 P2)
@@ -13420,7 +13431,8 @@ for (const [name, file, data] of renders) {
     !/MAX_AGE/.test(sim) && /mine\.forget\(\);/.test(sim));
   // 🚨 別のタブで配送方法を変えて保存されたら、古い試算選択は捨てる (Codex R6 P2)
   check('🚨 配送費の試算: 覚えるのは「どの配送方法のときの選択か」まで (別タブの変更に負ける)',
-    /remembered: mine\.read\(group\)/.test(sim) && /mine\.remember\(sel\.value, groupOf\(\)\)/.test(sim));
+    /const rem = mine\.read\(group\);/.test(sim) && /remembered: rem,/.test(sim)
+    && /mine\.remember\(sel\.value, groupOf\(\)\)/.test(sim));
   check('🚨 配送費の試算: sessionStorage に触るだけで例外になる環境でも画面を描く',
     /try \{ store = window\.sessionStorage; \} catch \(_\) \{ store = null; \}/.test(sim)
     && /store \|\| \{ getItem: \(\) => null/.test(sim));

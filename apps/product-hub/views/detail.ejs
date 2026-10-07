@@ -5411,10 +5411,14 @@ th.attr-unknown { color: #dc2626; }
         } else {
           addTo(sel, data.options);
         }
+        const rem = mine.read(group);
         const d = decideProfitShip({
           options: data.options, picks: data.picks, group, chosen, neCurrent, follow,
-          remembered: mine.read(group),
+          remembered: rem,
         });
+        // 🚨 使われなかった carry (「候補が無いので残した」記録) は消す。残すと、その系統の便が
+        //    また選択肢から消えたときに古い便が復活して利益が勝手に変わる (Codex R16 P2)
+        if (rem && rem.kind === 'carry' && d.method !== rem.method) mine.forget();
         followed = d.followed;
         sel.value = d.method;
         apply();
