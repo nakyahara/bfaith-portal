@@ -10961,6 +10961,11 @@ for (const [name, file, data] of renders) {
       ms.shipCost() === '182' && ms.profit() === '892円', ms.profit() + ' / ' + ms.body.textContent);
     check('🚨 画面の試算: そのとき「NE の配送方法は決まっていません (NE の送料は 544円)」と出す',
       ms.note.textContent.includes('NE の配送方法は決まっていません (NE の送料は 544円)'), ms.note.textContent);
+    // 🚨 人が選び直したあとも同じ書き方 (「NE は『未設定』」にしない — Codex R31 P3)
+    ms.pick('定形外規格外（1kg以内）');
+    check('🚨 画面の試算: 人が選び直したあとも「NE の配送方法は決まっていません」のまま',
+      ms.note.textContent.includes('NE の配送方法は決まっていません (NE の送料は 544円)')
+      && !ms.note.textContent.includes('未設定'), ms.note.textContent);
   }
 
   // ⑪ 🚨 同じ配送方法の便はあるが送料が 0円 だけのとき = 「選択肢にない」ではない

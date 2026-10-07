@@ -5290,13 +5290,18 @@ th.attr-unknown { color: #dc2626; }
       const label = groupLabel || '選んだ配送方法';
       const yen = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)).toLocaleString() + '円' : '');
       const keep = 'この選択は試算だけで、NE や出品内容には保存されません';
+      // NE 側の状況。配送方法名が SKU で割れている商品は「未設定」ではなく「決まっていません」
+      // と書く (送料は分かっているので添える — Codex R31 P3)
+      const neWord = neCurrent ? 'NE は「' + neCurrent + '」'
+        : (yen(neCost) ? 'NE の配送方法は決まっていません (NE の送料は ' + yen(neCost) + ')'
+          : 'NE の配送方法は未設定です');
       // 合わせていないとき (人が選び直した / 追従していない) も、画面の配送方法との関係と
       // 「保存されない」ことは出す。消すと出品内容に入ったように読める (Codex R27 P3)
       if (!followed) {
         const where = groupLabel ? '（画面の配送方法は「' + label + '」）' : '';
         return isCurrent
           ? ['NE に登録されている送料で試算しています' + where, keep].join('\n')
-          : ['試算: 「' + method + '」' + yen(cost) + where + '。NE は「' + (neCurrent || '未設定') + '」', keep].join('\n');
+          : ['試算: 「' + method + '」' + yen(cost) + where + '。' + neWord, keep].join('\n');
       }
       if (!followed.pick) {
         // 🚨 ここでも「いま何で試算しているか・NE との差・保存されないこと」を出す。
@@ -5307,7 +5312,7 @@ th.attr-unknown { color: #dc2626; }
           ? '「' + label + '」の便は送料が 0円 なので自動では選んでいません (未入力か本当に 0円 か確かめてください)'
           : '「' + label + '」で試算できる NE の配送方法が選択肢にないので変えていません';
         return ['試算: 「' + method + '」' + yen(cost) + '（' + why0
-          + (neCurrent && neCurrent !== method ? '。NE は「' + neCurrent + '」' : '') + '）', keep]
+          + (neCurrent !== method ? '。' + neWord : '') + '）', keep]
           .join('\n');
       }
       const p = followed.pick;
@@ -5316,12 +5321,9 @@ th.attr-unknown { color: #dc2626; }
       const lines = [];
       // 🚨 NE と画面が食い違っているときは NE の配送方法も必ず出す (2026-10-07 中原さんの決定で
       //    画面の配送方法に合わせるので、何を上書きしたのかが分からないと確かめられない — Codex R6 P2)
-      // NE 側の状況: 登録値そのもの / 違う配送方法 / 配送方法が決まらない (SKUで割れている)
-      const neWord = p.isNe ? '。NE に登録されている送料です'
-        : (neCurrent ? '。NE は「' + neCurrent + '」'
-          : (yen(neCost) ? '。NE の配送方法は決まっていません (NE の送料は ' + yen(neCost) + ')' : ''));
       lines.push('試算: 「' + method + '」' + yen(cost)
-        + '（画面の「' + label + '」に合わせました' + neWord + '）');
+        + '（画面の「' + label + '」に合わせました'
+        + (p.isNe ? '。NE に登録されている送料です' : '。' + neWord) + '）');
       if (p.candidates > 1) {
         // 🚨 「大きさで N 通り」とは書かない。候補は配送方法ごとに代表送料 1 件へ畳んである
         //    ので、実際の送料の幅ではない (Codex R4 P2)。
