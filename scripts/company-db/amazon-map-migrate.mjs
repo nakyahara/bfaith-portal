@@ -19,7 +19,8 @@
  *   ① URL のホスト・ポート・DB 名が本番と同じ = 断る (ユーザー・パスワードは見ない = 別のユーザーでも同じ DB は断る)
  *   ② 両方につないで、DB 名が同じ かつ DB の識別 (pg_control_system() の system_identifier) が同じか読めない = 断る (識別が読めない所では、試し用の DB は本番と違う DB 名にする)
  *   本番に届かない = 断る (確かめられない)。本番には読むだけの 1 文 (current_database など) しか流さない
- * --fba-db は影運転と apply の両方で要る (Sheet にだけある SKU = 切替を止める項目を数える。Codex #1586 R1 M3)。無い・読めない = すぐ断る
+ * --fba-db は影運転と apply (と reconcile) で要る (Sheet にだけある SKU を数える。Codex #1586 R1 M3)。無い・読めない = すぐ断る。
+ *   PR-D (10/8 中原さん「スプレッドシートは使用していないので無視」): Sheet にだけある SKU (sheet_only) は止める項目でなく「気をつける」(数・例は出す・終了コードに効かない)
  * 出すもの: 古い表のハッシュ (H0 の候補)・移せた SKU の古い表 / Company DB のハッシュと一致・切替を止める項目 (blockers・目標は全部 0)・気をつけること・書いた行の数
  * 🚨 古い表 (warehouse.db・fba.db) は読むだけで開く。Render と miniPC の SQLite には書かない (16 §7 M8)
  * 終了コード: 0 = 成功 (影運転は止める項目が 0 件かつハッシュが一致) / 1 = 失敗・止める項目あり・不一致 / 2 = 引数不正・本番を指している
@@ -84,9 +85,9 @@ export async function assertShadowTarget({ targetUrl, productionUrl, openClient 
   }
 }
 
-/** --fba-db (要る・読めること)。Sheet にだけある SKU の一覧 */
+/** --fba-db (要る・読めること)。Sheet にだけある SKU の一覧 (PR-D から気をつける項目 = 止めない) */
 export function sheetOnlyFrom(fbaFile, legacy) {
-  if (!fbaFile) throw fail('--fba-db <fba.db> が要る (Sheet にだけある SKU = 切替を止める項目を数える)');
+  if (!fbaFile) throw fail('--fba-db <fba.db> が要る (Sheet にだけある SKU を数える = 気をつける項目)');
   if (!fs.existsSync(fbaFile)) throw fail(`--fba-db のファイルが無い: ${fbaFile}`);
   try { return readSheetOnlySkus(fbaFile, legacy); } catch (e) { throw fail(`--fba-db が読めない (${fbaFile}): ${e.message}`); }
 }

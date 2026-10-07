@@ -737,7 +737,7 @@ const CLEAN_MASTERS = [['pr_a001', 'SKU マスタの 1', T1, T2], ['pr_pack2', '
 const CLEAN_COMPS = [['pr_a001', 'a001', 1, 0, T1, T1], ['pr_pack2', 'a001', 2, 0, T1, T1], ['pr_pack2', 'a002', 1, 1, T1, T2], ['a003', 'a003', 2, 0, T1, T1],
   ['pr_new1', 'a005', 1, 0, T1, T1], ['pr_new1', 'a006', 3, 1, T2, T2]];
 
-await ta('[11] 影運転: 止める項目を数える (無い NE コード・並びの隙間・構成なし・正規化で重なる seller SKU・大文字・形の違う時刻・親の無い構成・Sheet だけ) ・移せた SKU のハッシュが一致・必ず巻き戻す・古い表は変えない', async () => {
+await ta('[11] 影運転: 止める項目を数える (無い NE コード・並びの隙間・構成なし・正規化で重なる seller SKU・大文字・形の違う時刻・親の無い構成)・Sheet だけ = 気をつける (PR-D)・移せた SKU のハッシュが一致・必ず巻き戻す・古い表は変えない', async () => {
   const E2 = await setupDb();
   await load(E2.db);
   const file = path.join(tmp, 'legacy-shadow.db');
@@ -751,7 +751,10 @@ await ta('[11] 影運転: 止める項目を数える (無い NE コード・並
   const r = await M.runAmazonMapMigration(E2.db, legacy, { mode: 'shadow', sheetOnly: ['sheet_only1'] });
   assert.equal(r.committed, false);
   assert.deepEqual(Object.fromEntries(Object.entries(r.blockers).map(([k, v]) => [k, v.count])),
-    { not_in_company: 1, sort_gap: 1, no_components: 1, seller_sku_collision: 2, timestamp: 1, sheet_only: 1 });
+    { not_in_company: 1, sort_gap: 1, no_components: 1, seller_sku_collision: 2, timestamp: 1 });
+  assert.equal(r.blocker_total, 6);
+  // PR-D (10/8 中原さん「スプレッドシートは使用していないので無視」): Sheet にだけある SKU = 気をつける項目 (数・例は出す)
+  assert.deepEqual(r.warnings.sheet_only, { count: 1, samples: [{ seller_sku: 'sheet_only1' }] });
   assert.equal(r.subset.skus, 4);
   assert.equal(r.subset.match, true, JSON.stringify(r.subset));
   assert.ok(r.legacy_digest.error);   // 形の違う時刻がある = 全体のハッシュは作れない
@@ -762,6 +765,26 @@ await ta('[11] 影運転: 止める項目を数える (無い NE コード・並
   assert.equal(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), bytes0);
   // apply は frozen の間だけ・止める項目があれば断る
   await assert.rejects(() => M.runAmazonMapMigration(E2.db, legacy, { mode: 'apply', expectHash: 'a'.repeat(64), sheetOnly: [] }), /H0/);
+});
+
+await ta('[11] PR-D: Sheet にだけある SKU だけ (ほかは片付いた古い表) = 影運転は止める項目 0・ハッシュ一致 (気をつける項目に数と例)・巻き戻す', async () => {
+  const E2 = await setupDb();
+  await load(E2.db);
+  const file = path.join(tmp, 'legacy-shadow-sheet-only.db');
+  makeLegacy(file, CLEAN_MASTERS, CLEAN_COMPS);
+  const legacy = M.readLegacyAmazonMaps(file);
+  const snap0 = await snapshot(E2.db);
+  const sheetOnly = ['pr_1272115_f_20231217_19336813_0004', 'sheet_only2'];
+  const r = await M.runAmazonMapMigration(E2.db, legacy, { mode: 'shadow', sheetOnly });
+  assert.equal(r.committed, false);
+  assert.deepEqual(r.blockers, {});
+  assert.equal(r.blocker_total, 0); assert.equal(r.blocked_skus, 0);
+  assert.equal(r.subset.skus, 4); assert.equal(r.subset.match, true, JSON.stringify(r.subset));
+  assert.equal(r.legacy_digest.content_hash, r.subset.company.content_hash);
+  assert.deepEqual(r.warnings.sheet_only, { count: 2, samples: sheetOnly.map((s) => ({ seller_sku: s })) });
+  assert.deepEqual(await snapshot(E2.db), snap0);
+  // 一覧を渡さない = 今までどおり断る (0 件と読まない・Codex #1586 R1 M3)
+  await assert.rejects(() => M.runAmazonMapMigration(E2.db, legacy, { mode: 'shadow' }), (e) => e.code === 'AMAZON_MAP_MIGRATE_INVALID');
 });
 
 await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ行は時刻だけ (記録・出品の version を増やさない)・FBM の自動の行は消える・作り直したハッシュ = H0・移行の後の夜間ロード 2 回で構成が変わらない', async () => {
@@ -782,12 +805,18 @@ await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ�
   const fileBad = path.join(tmp, 'legacy-bad.db');
   makeLegacy(fileBad, [...CLEAN_MASTERS, ['empty1', '構成なし', T1, T1]], CLEAN_COMPS);
   const legacyBad = M.readLegacyAmazonMaps(fileBad);
-  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacyBad, { mode: 'apply', expectHash: M.legacyDigest(legacyBad).content_hash, sheetOnly: [] }), (e) => e.code === 'AMAZON_MAP_MIGRATE_BLOCKED');
+  // PR-D: Sheet にだけある SKU があっても、ほかの止める項目 (構成なし) は今までどおり止める。止める項目の一覧に sheet_only は出ない
+  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacyBad, { mode: 'apply', expectHash: M.legacyDigest(legacyBad).content_hash, sheetOnly: ['sheet_only1'] }),
+    (e) => e.code === 'AMAZON_MAP_MIGRATE_BLOCKED' && e.blockers.no_components?.count === 1 && !('sheet_only' in e.blockers) && !/sheet_only/.test(e.message));
+  assert.equal(Number((await E3.db.query('select count(*)::int as n from core.amazon_sku_maps')).rows[0].n), 0);
   // 本物
   const lidPr = (await E3.db.query("select listing_id::text as id, version::text as v from core.listings where listing_code = 'pr_a001'")).rows[0];
   const evBefore = Number((await E3.db.query('select coalesce(max(event_id), 0)::int as n from events.master_change_events')).rows[0].n);
-  const r = await M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, actor: 'naka@test', sheetOnly: [] });
+  // PR-D: Sheet にだけある SKU があっても apply は止まらない (気をつける項目に数と例)
+  const r = await M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, actor: 'naka@test', sheetOnly: ['pr_1272115_f_20231217_19336813_0004'] });
   assert.equal(r.committed, true); assert.equal(r.subset.match, true); assert.equal(r.subset.company.content_hash, h0);
+  assert.equal(r.blocker_total, 0); assert.deepEqual(r.blockers, {});
+  assert.deepEqual(r.warnings.sheet_only, { count: 1, samples: [{ seller_sku: 'pr_1272115_f_20231217_19336813_0004' }] });
   // 同じ = pr_a001 の a001・pr_pack2 の a001 (時刻だけ) / 直した = pr_pack2 の a002 (並び 2 → 1)・a003 (FBM の完全一致の行の数量 1 → 2) / 足した = pr_new1 の 2 行
   assert.deepEqual(r.counts, { listings_created: 1, maps: 4, same: 2, time_only: 2, updated: 2, inserted: 2, deleted: 0 });
   // 同じ行 (pr_a001 の a001) は時刻だけ = 構成・出品の識別の変更の記録なし (0049 の印 = listing_component の全部・listing の INSERT / DELETE / mall・shop_code・listing_code を増やさない)

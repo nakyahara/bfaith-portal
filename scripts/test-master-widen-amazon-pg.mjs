@@ -170,6 +170,17 @@ async function insertAck(E, attempt, fields) {
   const cols = Object.keys(f);
   await E.O.query(`insert into ops.master_legacy_gate_acks (${cols.join(', ')}) values (${cols.map((k, i) => (k === 'capable' ? `$${i + 1}::text[]` : `$${i + 1}`)).join(', ')})`, cols.map((k) => f[k]));
 }
+/** PR-D: 10/8 の影運転で残る見込みの Sheet にだけある SKU (NE コードは空・他販路の売上 0) */
+const SHEET_ONLY_SKU = 'pr_1272115_f_20231217_19336813_0004';
+/** fba.db (Sheet の写し sku_mapping) を古い表の隣に作る。skus = Sheet の SKU (SKU マスタにある SKU を混ぜると数えない) */
+function makeFba(dir, skus) {
+  const fba = path.join(dir, 'fba.db');
+  fs.rmSync(fba, { force: true });
+  const d = new Database(fba); d.exec('create table sku_mapping (amazon_sku text)');
+  for (const s of skus) d.prepare('insert into sku_mapping values (?)').run(s);
+  d.close();
+  return fba;
+}
 /** CLI (scripts/company-db/amazon-map-migrate.mjs --apply) を本物のプロセスで流す (#1648 Codex R2 Low 2)。COMPANY_DB_URL = 試験の DB。戻り値 { code, out } */
 const CLI_MIGRATE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'company-db', 'amazon-map-migrate.mjs');
 function cliApply(E, legacyFile, extraArgs = []) {
@@ -232,9 +243,10 @@ try {
     assert.deepEqual([r.counts.amazon_map_active, r.counts.amazon_map_lost, r.counts.held, r.counts.single_product_mismatch], [0, 0, undefined, undefined]);
   });
 
-  await ta('[M1] 移行の apply は試みの窓で通る (H0 と同じ・widen_attempt を返す)・2 回目は断る (EXISTS)', async () => {
-    const r = await migrate(A, legacyA, AT.id);
+  await ta('[M1] 移行の apply は試みの窓で通る (H0 と同じ・widen_attempt を返す)・Sheet にだけある SKU は止めない (PR-D)・2 回目は断る (EXISTS)', async () => {
+    const r = await migrate(A, legacyA, AT.id, { sheetOnly: [SHEET_ONLY_SKU] });
     assert.equal(r.committed, true); assert.equal(r.subset.match, true); assert.equal(r.widen_attempt, AT.id);
+    assert.equal(r.blocker_total, 0); assert.deepEqual(r.warnings.sheet_only, { count: 1, samples: [{ seller_sku: SHEET_ONLY_SKU }] });
     assert.equal((await A.q("select count(*)::int as n from core.amazon_sku_maps where state = 'active' and origin = 'legacy'"))[0].n, 3);
     await assert.rejects(migrate(A, legacyA, AT.id), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
   });
@@ -402,8 +414,29 @@ try {
     // frozen (今までどおり): 別の DB を frozen にして移行が通る (試みは見ない)
     const F = await setupDb(BASE0, { watcher: false });
     await F.O.query('begin'); await F.O.query("select set_config('ops.cutover_protocol', '1', true)"); await F.O.query("update ops.master_cutover_state set phase = 'frozen', owner_hash = null where id = 1"); await F.O.query('commit');
-    const fc = cliApply(F, makeLegacy(path.join(tmp, 'f')));                                     // CLI で --attempt なし (#1648 Codex R2 Low 2)
+    // PR-D: CLI の影運転 (本物のプロセス) = Sheet にだけある SKU があっても止める項目 0・終了コード 0 (気をつける項目に出す) /
+    //   ほかの止める項目 (構成なし) があれば今までどおり終了コード 1。影運転の先 = F・本番の代わり = DB-A (DB 名が違う = 通る)
+    const dirF = path.join(tmp, 'f');
+    const legacyF = makeLegacy(dirF);
+    const fbaF = makeFba(dirF, [SHEET_ONLY_SKU, 'PR_A001']);   // PR_A001 = 正規化で SKU マスタにある = 数えない
+    const shadow = (legacyFile, fba) => spawnSync(process.execPath, [CLI_MIGRATE, '--shadow', '--db-url', F.url, '--legacy', legacyFile, '--fba-db', fba],
+      { env: { ...process.env, COMPANY_DB_URL: A.url }, encoding: 'utf8', timeout: 120000 });
+    const sh = shadow(legacyF, fbaF);
+    const shOut = `${sh.stdout || ''}${sh.stderr || ''}`;
+    assert.equal(sh.status, 0, shOut);
+    assert.match(shOut, /切替を止める項目: 0 件 \(止まる SKU 0\)/); assert.match(shOut, new RegExp(`気をつける: sheet_only 1 件 例 \\[\\{"seller_sku":"${SHEET_ONLY_SKU}"\\}\\]`));
+    assert.match(shOut, /→ 一致/); assert.match(shOut, /巻き戻した \(影運転\)/);
+    const dirFb = path.join(tmp, 'f-bad');
+    const legacyFb = makeLegacy(dirFb, [...MASTERS, ['empty1', '構成なし', T1, T1]], COMPS);
+    const shb = shadow(legacyFb, makeFba(dirFb, [SHEET_ONLY_SKU]));
+    const shbOut = `${shb.stdout || ''}${shb.stderr || ''}`;
+    assert.equal(shb.status, 1, shbOut);
+    assert.match(shbOut, /切替を止める項目: 1 件 \(止まる SKU 1\)\s+no_components: 1 件/); assert.match(shbOut, /気をつける: sheet_only 1 件/);
+    assert.doesNotMatch(shbOut.split('気をつける')[0], /sheet_only/);   // 止める項目の側には出ない
+    assert.equal((await F.q('select count(*)::int as n from core.amazon_sku_maps'))[0].n, 0);   // 影運転は巻き戻す
+    const fc = cliApply(F, legacyF);                                     // CLI で --attempt なし (#1648 Codex R2 Low 2)・fba.db に Sheet にだけある SKU (PR-D)
     assert.equal(fc.code, 0, fc.out); assert.match(fc.out, /✅ 移した \(commit\)/);
+    assert.match(fc.out, /切替を止める項目: 0 件/); assert.match(fc.out, /気をつける: sheet_only 1 件/);
     assert.equal((await F.q("select count(*)::int as n from core.amazon_sku_maps where state = 'active'"))[0].n, 3);
   });
 

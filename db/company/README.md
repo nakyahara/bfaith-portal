@@ -419,8 +419,11 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --legacy-hash --
 # 切替の日 ③ (段階 frozen の間だけ・止める項目 0・H0 と同じときだけ commit。⑥ の手順書の順番でだけ)
 node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes
 ```
-- `--fba-db` は影運転と apply の両方で要る (無い・読めない・`sku_mapping` の表が無い = すぐ断る。Sheet にだけある SKU を 0 件と読まない・Codex #1586 R1 M3)。識別 (system_identifier) が読めない所では、試し用の DB は本番と違う DB 名にする
-- 止める項目 (目標は全部 0・16 §5 の 4): key (受け手の鍵の決まり)・name_blank・timestamp・qty・no_components・sort_gap・orphan_component・not_in_company (NE に無いコード)・component_collision / seller_sku_collision (正規化で重なる)・ne_code_differs (Company DB の SKU のコードから作る NE コードが違う)・sheet_only
+- `--fba-db` は影運転と apply (と reconcile) で要る (無い・読めない・`sku_mapping` の表が無い = すぐ断る。Sheet にだけある SKU を 0 件と読まない・Codex #1586 R1 M3)。識別 (system_identifier) が読めない所では、試し用の DB は本番と違う DB 名にする
+- 止める項目 (目標は全部 0・16 §5 の 4): key (受け手の鍵の決まり)・name_blank・timestamp・qty・no_components・sort_gap・orphan_component・not_in_company (NE に無いコード)・component_collision / seller_sku_collision (正規化で重なる)・ne_code_differs (Company DB の SKU のコードから作る NE コードが違う)
+- 気をつける項目 (止めない・終了コードに効かない・数と例は出す): exception_sku (例外の SKU を構成品にしている)・**sheet_only** (Sheet にだけある SKU)。
+  sheet_only は 2026-10-08 に止める項目から外した (PR-D・中原さん「スプレッドシートは使用していないので無視」= 本番の FBA は 6/11 から `FBA_SKU_MAPPING_SOURCE=mirror` で Sheet の写しを FBA の対応に使っていない)。
+  Sheet にだけある SKU は今までどおり Company DB に写さない (16 §3 #3)。`--fba-db` を要るままにしたのは、一覧を 0 件と読まずに数と例を出し続けるため (変える所を小さくする)
 - 同じ構成の行は時刻 (created_at / updated_at) だけそろえる = 変更の記録・出品の version を増やさない (0049 の印を増やさない)。FBM の完全一致など古い表に無い行は消す
 - ⑦-2 (写し・世代・FBA の Sheet 無し・台帳) と ⑥ (段階の戻す道) はこの PR に無い
 
