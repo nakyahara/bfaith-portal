@@ -733,6 +733,9 @@ function makeLegacy(file, masters, comps) {
   s.close();
 }
 const T1 = '2026-05-01T01:02:03.456Z'; const T2 = '2026-06-01T00:00:00.000Z';
+/** Sheet にだけある SKU の出品 (fixture の sheet_only1) の構成の行の数 */
+const sheetComps = async (db) => Number((await db.query(`select count(*)::int as n from core.listing_components c join core.listings l on l.listing_id = c.listing_id
+  where l.mall = 'amazon' and l.listing_code = 'sheet_only1'`)).rows[0].n);
 const CLEAN_MASTERS = [['pr_a001', 'SKU マスタの 1', T1, T2], ['pr_pack2', 'SKU マスタの 2 個組', T1, T1], ['a003', '単品 3 を FBA でも', T1, T2], ['pr_new1', '新しい組 (出品なし)', T1, T1]];
 const CLEAN_COMPS = [['pr_a001', 'a001', 1, 0, T1, T1], ['pr_pack2', 'a001', 2, 0, T1, T1], ['pr_pack2', 'a002', 1, 1, T1, T2], ['a003', 'a003', 2, 0, T1, T1],
   ['pr_new1', 'a005', 1, 0, T1, T1], ['pr_new1', 'a006', 3, 1, T2, T2]];
@@ -755,6 +758,9 @@ await ta('[11] 影運転: 止める項目を数える (無い NE コード・並
   assert.equal(r.blocker_total, 6);
   // PR-D (10/8 中原さん「スプレッドシートは使用していないので無視」): Sheet にだけある SKU = 気をつける項目 (数・例は出す)
   assert.deepEqual(r.warnings.sheet_only, { count: 1, samples: [{ seller_sku: 'sheet_only1' }] });
+  // #1651 Codex R1 High: 切替の前の夜間ロードが Sheet から作った構成 (sheet_only1 → a005) = 消す予定の数と例 (影運転も同じ取引で消して巻き戻す)
+  assert.deepEqual(r.sheet_only_cleanup, { listings: 1, rows: 1, samples: [{ listing_code: 'sheet_only1', sku: 'a005', qty: 1, resolution: 'imported', source: 'fba_sheet' }], left_after: 0 });
+  assert.equal(r.counts.sheet_only_removed, 1);
   assert.equal(r.subset.skus, 4);
   assert.equal(r.subset.match, true, JSON.stringify(r.subset));
   assert.ok(r.legacy_digest.error);   // 形の違う時刻がある = 全体のハッシュは作れない
@@ -774,7 +780,7 @@ await ta('[11] PR-D: Sheet にだけある SKU だけ (ほかは片付いた古�
   makeLegacy(file, CLEAN_MASTERS, CLEAN_COMPS);
   const legacy = M.readLegacyAmazonMaps(file);
   const snap0 = await snapshot(E2.db);
-  const sheetOnly = ['pr_1272115_f_20231217_19336813_0004', 'sheet_only2'];
+  const sheetOnly = ['pr_1272115_F_20231217_19336813_0004', 'sheet_only1'];
   const r = await M.runAmazonMapMigration(E2.db, legacy, { mode: 'shadow', sheetOnly });
   assert.equal(r.committed, false);
   assert.deepEqual(r.blockers, {});
@@ -782,7 +788,9 @@ await ta('[11] PR-D: Sheet にだけある SKU だけ (ほかは片付いた古�
   assert.equal(r.subset.skus, 4); assert.equal(r.subset.match, true, JSON.stringify(r.subset));
   assert.equal(r.legacy_digest.content_hash, r.subset.company.content_hash);
   assert.deepEqual(r.warnings.sheet_only, { count: 2, samples: sheetOnly.map((s) => ({ seller_sku: s })) });
-  assert.deepEqual(await snapshot(E2.db), snap0);
+  assert.deepEqual([r.sheet_only_cleanup.rows, r.sheet_only_cleanup.listings, r.sheet_only_cleanup.left_after], [1, 1, 0]);
+  assert.deepEqual(await snapshot(E2.db), snap0);   // 巻き戻した = sheet_only1 の構成も残っている
+  assert.equal(await sheetComps(E2.db), 1);
   // 一覧を渡さない = 今までどおり断る (0 件と読まない・Codex #1586 R1 M3)
   await assert.rejects(() => M.runAmazonMapMigration(E2.db, legacy, { mode: 'shadow' }), (e) => e.code === 'AMAZON_MAP_MIGRATE_INVALID');
 });
@@ -809,16 +817,34 @@ await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ�
   await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacyBad, { mode: 'apply', expectHash: M.legacyDigest(legacyBad).content_hash, sheetOnly: ['sheet_only1'] }),
     (e) => e.code === 'AMAZON_MAP_MIGRATE_BLOCKED' && e.blockers.no_components?.count === 1 && !('sheet_only' in e.blockers) && !/sheet_only/.test(e.message));
   assert.equal(Number((await E3.db.query('select count(*)::int as n from core.amazon_sku_maps')).rows[0].n), 0);
+  // #1651 Codex R1 High: Sheet にだけある SKU の出品に人が確定した行 (manual) = 消せない = 止める (何も書かない)
+  assert.equal(await sheetComps(E3.db), 1);
+  await E3.db.query("update core.listing_components set resolution = 'manual' where listing_id = (select listing_id from core.listings where mall = 'amazon' and listing_code = 'sheet_only1')");
+  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, sheetOnly: ['sheet_only1'] }),
+    (e) => e.code === 'AMAZON_MAP_MIGRATE_BLOCKED' && e.blockers.sheet_only_manual?.count === 1 && /sheet_only_manual/.test(e.message));
+  await E3.db.query("update core.listing_components set resolution = 'imported' where listing_id = (select listing_id from core.listings where mall = 'amazon' and listing_code = 'sheet_only1')");
+  // 消した後に構成が残る (試験だけ afterWrite で足す) = 巻き戻す (後の条件)
+  await assert.rejects(() => M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, sheetOnly: ['sheet_only1'], afterWrite: async (db) => {
+    await db.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type, resolved_by_id, evidence)
+      select 1, l.listing_id, k.sku_id, 1, 0, 'imported', 'system', 't', '{"source":"fba_sheet"}'::jsonb from core.listings l, core.skus k where l.mall = 'amazon' and l.listing_code = 'sheet_only1' and k.code = 'a006'`);
+  } }), (e) => e.code === 'AMAZON_MAP_MIGRATE_SHEET_ONLY_LEFT');
+  assert.equal(Number((await E3.db.query('select count(*)::int as n from core.amazon_sku_maps')).rows[0].n), 0);
+  assert.equal(await sheetComps(E3.db), 1);
   // 本物
   const lidPr = (await E3.db.query("select listing_id::text as id, version::text as v from core.listings where listing_code = 'pr_a001'")).rows[0];
   const evBefore = Number((await E3.db.query('select coalesce(max(event_id), 0)::int as n from events.master_change_events')).rows[0].n);
-  // PR-D: Sheet にだけある SKU があっても apply は止まらない (気をつける項目に数と例)
-  const r = await M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, actor: 'naka@test', sheetOnly: ['pr_1272115_f_20231217_19336813_0004'] });
+  // PR-D: Sheet にだけある SKU があっても apply は止まらない (気をつける項目に数と例)。fixture の sheet_only1 (夜間ロードが Sheet から a005 を作った) を渡す
+  const r = await M.runAmazonMapMigration(E3.db, legacy, { mode: 'apply', expectHash: h0, actor: 'naka@test', sheetOnly: ['sheet_only1', 'pr_1272115_F_20231217_19336813_0004'] });
   assert.equal(r.committed, true); assert.equal(r.subset.match, true); assert.equal(r.subset.company.content_hash, h0);
   assert.equal(r.blocker_total, 0); assert.deepEqual(r.blockers, {});
-  assert.deepEqual(r.warnings.sheet_only, { count: 1, samples: [{ seller_sku: 'pr_1272115_f_20231217_19336813_0004' }] });
+  assert.deepEqual(r.warnings.sheet_only, { count: 2, samples: [{ seller_sku: 'sheet_only1' }, { seller_sku: 'pr_1272115_F_20231217_19336813_0004' }] });
+  // #1651 Codex R1 High: sheet_only1 の自動の構成を消した (移行の書き手の印で記録)
+  assert.deepEqual([r.sheet_only_cleanup.rows, r.sheet_only_cleanup.left_after], [1, 0]);
+  assert.equal(await sheetComps(E3.db), 0);
+  assert.equal(Number((await E3.db.query(`select count(*)::int as n from events.master_change_events where event_id > $1 and entity_type = 'listing_component' and operation = 'DELETE'
+    and source_system = 'amazon_map_migration' and (entity_key ->> 'listing_id')::bigint = (select listing_id from core.listings where mall = 'amazon' and listing_code = 'sheet_only1')`, [evBefore])).rows[0].n), 1);
   // 同じ = pr_a001 の a001・pr_pack2 の a001 (時刻だけ) / 直した = pr_pack2 の a002 (並び 2 → 1)・a003 (FBM の完全一致の行の数量 1 → 2) / 足した = pr_new1 の 2 行
-  assert.deepEqual(r.counts, { listings_created: 1, maps: 4, same: 2, time_only: 2, updated: 2, inserted: 2, deleted: 0 });
+  assert.deepEqual(r.counts, { listings_created: 1, maps: 4, same: 2, time_only: 2, updated: 2, inserted: 2, deleted: 0, sheet_only_removed: 1 });
   // 同じ行 (pr_a001 の a001) は時刻だけ = 構成・出品の識別の変更の記録なし (0049 の印 = listing_component の全部・listing の INSERT / DELETE / mall・shop_code・listing_code を増やさない)
   const ev = (await E3.db.query(`select entity_type, operation, attribute, source_system from events.master_change_events where event_id > $1
     and ((entity_type = 'listing_component' and (entity_key ->> 'listing_id')::bigint = $2) or (entity_type = 'listing' and entity_id = $2))`, [evBefore, lidPr.id])).rows;
@@ -840,6 +866,28 @@ await ta('[11] apply (切替の日 ③): frozen だけ・H0 と同じ・同じ�
   for (const run of ['after_c1', 'after_c2']) {
     await load(E3.db, ALL_COMPANY, makePlan(), run);
     assert.equal(K.skuMapDigest(await A.readCompanyAmazonMapCanon(E3.db)).content_hash, h0, run);
+  }
+});
+
+await ta('[11] #1651 Codex R1 High: 移行の後、持ち主 company の夜間ロード 2 回でも Sheet にだけある SKU の出品に構成が戻らない', async () => {
+  const E4 = await setupDb();
+  await createRoles(E4.pg, { watcherPw: 'a', writerPw: 'b' });
+  await createMasterEditRoles(E4.pg, {});
+  await W2.useReal0058(E4.pg);
+  await load(E4.db);
+  const file = path.join(tmp, 'legacy-apply-sheet.db');
+  makeLegacy(file, CLEAN_MASTERS, CLEAN_COMPS);
+  const legacy = M.readLegacyAmazonMaps(file);
+  const h0 = M.legacyDigest(legacy).content_hash;
+  await openCutover(E4, ALL_COMPANY, 'frozen');
+  assert.equal(await sheetComps(E4.db), 1);
+  const r = await M.runAmazonMapMigration(E4.db, legacy, { mode: 'apply', expectHash: h0, actor: 'naka@test', sheetOnly: ['sheet_only1'] });
+  assert.equal(r.committed, true); assert.equal(r.counts.sheet_only_removed, 1);
+  assert.equal(await sheetComps(E4.db), 0);
+  for (const run of ['after_c1', 'after_c2']) {
+    await load(E4.db, ALL_COMPANY, makePlan(), run);
+    assert.equal(await sheetComps(E4.db), 0, run);
+    assert.equal(K.skuMapDigest(await A.readCompanyAmazonMapCanon(E4.db)).content_hash, h0, run);
   }
 });
 

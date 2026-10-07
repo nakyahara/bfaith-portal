@@ -172,6 +172,19 @@ async function insertAck(E, attempt, fields) {
 }
 /** PR-D: 10/8 の影運転で残る見込みの Sheet にだけある SKU (NE コードは空・他販路の売上 0) */
 const SHEET_ONLY_SKU = 'pr_1272115_f_20231217_19336813_0004';
+/** 10/8 の 2 件目: SKU マスタから消した後に Sheet の写しに大文字で残る (夜間ロードは正規化した小文字の出品を作る) */
+const SHEET_ONLY_UPPER = 'pr_1272115_F_20220221_10927087_0001';
+/**
+ * 切替の前の夜間ロード (持ち主 load) が Sheet にだけある SKU から作った出品と自動の構成 (evidence fba_sheet) を、持ち主の接続で足す (#1651 Codex R1 High)。
+ * 対応 (amazon_sku_maps) は無い = 0054 の書き手の守りの外。戻り値 = その出品の構成の行の数を返す関数
+ */
+async function seedSheetListing(E, listingCode, skuCode) {
+  await E.O.query(`insert into core.listings (company_id, mall, shop_code, listing_code, title, status) values (1, 'amazon', $1, $2, null, 'active')`, [AMZ, listingCode]);
+  await E.O.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type, resolved_by_id, evidence)
+    select 1, l.listing_id, k.sku_id, 1, 0, 'imported', 'system', 'load_t', '{"source":"fba_sheet"}'::jsonb from core.listings l, core.skus k
+     where l.mall = 'amazon' and l.listing_code = $1 and k.code = $2`, [listingCode, skuCode]);
+  return async () => (await E.q(`select count(*)::int as n from core.listing_components c join core.listings l on l.listing_id = c.listing_id where l.mall = 'amazon' and l.listing_code = $1`, [listingCode]))[0].n;
+}
 /** fba.db (Sheet の写し sku_mapping) を古い表の隣に作る。skus = Sheet の SKU (SKU マスタにある SKU を混ぜると数えない) */
 function makeFba(dir, skus) {
   const fba = path.join(dir, 'fba.db');
@@ -244,9 +257,13 @@ try {
   });
 
   await ta('[M1] 移行の apply は試みの窓で通る (H0 と同じ・widen_attempt を返す)・Sheet にだけある SKU は止めない (PR-D)・2 回目は断る (EXISTS)', async () => {
+    const compsA = await seedSheetListing(A, SHEET_ONLY_SKU, 'a002');   // #1651 Codex R1 High: 切替の前の夜間ロードが Sheet から作った構成
+    assert.equal(await compsA(), 1);
     const r = await migrate(A, legacyA, AT.id, { sheetOnly: [SHEET_ONLY_SKU] });
     assert.equal(r.committed, true); assert.equal(r.subset.match, true); assert.equal(r.widen_attempt, AT.id);
     assert.equal(r.blocker_total, 0); assert.deepEqual(r.warnings.sheet_only, { count: 1, samples: [{ seller_sku: SHEET_ONLY_SKU }] });
+    assert.deepEqual([r.counts.sheet_only_removed, r.sheet_only_cleanup.left_after], [1, 0]);   // 段階 new_open (0054 の書き手の守りの中) でも消せる
+    assert.equal(await compsA(), 0);
     assert.equal((await A.q("select count(*)::int as n from core.amazon_sku_maps where state = 'active' and origin = 'legacy'"))[0].n, 3);
     await assert.rejects(migrate(A, legacyA, AT.id), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
   });
@@ -419,6 +436,7 @@ try {
     const dirF = path.join(tmp, 'f');
     const legacyF = makeLegacy(dirF);
     const fbaF = makeFba(dirF, [SHEET_ONLY_SKU, 'PR_A001']);   // PR_A001 = 正規化で SKU マスタにある = 数えない
+    const compsF = await seedSheetListing(F, SHEET_ONLY_SKU, 'a002');   // #1651 Codex R1 High
     const shadow = (legacyFile, fba) => spawnSync(process.execPath, [CLI_MIGRATE, '--shadow', '--db-url', F.url, '--legacy', legacyFile, '--fba-db', fba],
       { env: { ...process.env, COMPANY_DB_URL: A.url }, encoding: 'utf8', timeout: 120000 });
     const sh = shadow(legacyF, fbaF);
@@ -426,6 +444,8 @@ try {
     assert.equal(sh.status, 0, shOut);
     assert.match(shOut, /切替を止める項目: 0 件 \(止まる SKU 0\)/); assert.match(shOut, new RegExp(`気をつける: sheet_only 1 件 例 \\[\\{"seller_sku":"${SHEET_ONLY_SKU}"\\}\\]`));
     assert.match(shOut, /→ 一致/); assert.match(shOut, /巻き戻した \(影運転\)/);
+    assert.match(shOut, /Sheet にだけある SKU の出品の自動の構成: 消す予定 1 行 \(出品 1\) 例 .*"sku":"a002".*・消した後に残る 0 行/);
+    assert.equal(await compsF(), 1);   // 影運転は巻き戻す
     const dirFb = path.join(tmp, 'f-bad');
     const legacyFb = makeLegacy(dirFb, [...MASTERS, ['empty1', '構成なし', T1, T1]], COMPS);
     const shb = shadow(legacyFb, makeFba(dirFb, [SHEET_ONLY_SKU]));
@@ -434,9 +454,16 @@ try {
     assert.match(shbOut, /切替を止める項目: 1 件 \(止まる SKU 1\)\s+no_components: 1 件/); assert.match(shbOut, /気をつける: sheet_only 1 件/);
     assert.doesNotMatch(shbOut.split('気をつける')[0], /sheet_only/);   // 止める項目の側には出ない
     assert.equal((await F.q('select count(*)::int as n from core.amazon_sku_maps'))[0].n, 0);   // 影運転は巻き戻す
+    // #1651 Codex R1 High: 人が確定した行 (manual) = 止める (終了コード 1・何も書かない)
+    await F.O.query(`update core.listing_components set resolution = 'manual' where listing_id = (select listing_id from core.listings where mall = 'amazon' and listing_code = $1)`, [SHEET_ONLY_SKU]);
+    const fm = cliApply(F, legacyF);
+    assert.equal(fm.code, 1, fm.out); assert.match(fm.out, /sheet_only_manual 1/);
+    assert.equal((await F.q('select count(*)::int as n from core.amazon_sku_maps'))[0].n, 0); assert.equal(await compsF(), 1);
+    await F.O.query(`update core.listing_components set resolution = 'imported' where listing_id = (select listing_id from core.listings where mall = 'amazon' and listing_code = $1)`, [SHEET_ONLY_SKU]);
     const fc = cliApply(F, legacyF);                                     // CLI で --attempt なし (#1648 Codex R2 Low 2)・fba.db に Sheet にだけある SKU (PR-D)
     assert.equal(fc.code, 0, fc.out); assert.match(fc.out, /✅ 移した \(commit\)/);
     assert.match(fc.out, /切替を止める項目: 0 件/); assert.match(fc.out, /気をつける: sheet_only 1 件/);
+    assert.match(fc.out, /Sheet にだけある SKU の出品の自動の構成: 消した 1 行 \(出品 1\)/); assert.equal(await compsF(), 0);
     assert.equal((await F.q("select count(*)::int as n from core.amazon_sku_maps where state = 'active'"))[0].n, 3);
   });
 
@@ -562,10 +589,12 @@ try {
     assert.equal(hc.status, 0, hc.stderr); assert.match(hc.stdout, new RegExp(await cdbHash(Cdb)));
     const rc = cliApply(Cdb, legacyC2, ['--reconcile', '--attempt', C2.id, '--expect-cdb-hash', await cdbHash(Cdb)]);
     assert.equal(rc.code, 2, rc.out);   // --apply と --reconcile を一緒に付けた = 引数不正 (cliApply は --apply を付ける)
-    const fba = path.join(dirC2, 'fba.db');
+    const fba = makeFba(dirC2, [SHEET_ONLY_UPPER]);   // #1651 Codex R1 High: 10/8 の 2 件目 (Sheet に大文字で残る) の出品の構成も reconcile で消す
+    const compsC = await seedSheetListing(Cdb, SHEET_ONLY_UPPER.toLowerCase(), 'a002');
     const rc2 = spawnSync(process.execPath, [CLI_MIGRATE, '--reconcile', '--attempt', C2.id, '--expect-hash', lhash(legacyC2), '--expect-cdb-hash', await cdbHash(Cdb), '--legacy', legacyC2, '--fba-db', fba, '--actor', 'naka@test', '--yes'],
       { env: { ...process.env, COMPANY_DB_URL: Cdb.url }, encoding: 'utf8', timeout: 120000 });
     assert.equal(rc2.status, 0, `${rc2.stdout}${rc2.stderr}`); assert.match(rc2.stdout, /✅ 合わせ直した \(commit\)/);
+    assert.match(rc2.stdout, /Sheet にだけある SKU の出品の自動の構成: 消した 1 行/); assert.equal(await compsC(), 0);
     const rc3 = spawnSync(process.execPath, [CLI_MIGRATE, '--reconcile', '--expect-hash', lhash(legacyC2), '--legacy', legacyC2, '--fba-db', fba, '--actor', 'naka@test', '--yes'],
       { env: { ...process.env, COMPANY_DB_URL: Cdb.url }, encoding: 'utf8', timeout: 120000 });
     assert.equal(rc3.status, 2, `${rc3.stdout}${rc3.stderr}`);   // --expect-cdb-hash と --attempt が無い

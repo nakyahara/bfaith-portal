@@ -420,10 +420,16 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --legacy-hash --
 node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes
 ```
 - `--fba-db` は影運転と apply (と reconcile) で要る (無い・読めない・`sku_mapping` の表が無い = すぐ断る。Sheet にだけある SKU を 0 件と読まない・Codex #1586 R1 M3)。識別 (system_identifier) が読めない所では、試し用の DB は本番と違う DB 名にする
-- 止める項目 (目標は全部 0・16 §5 の 4): key (受け手の鍵の決まり)・name_blank・timestamp・qty・no_components・sort_gap・orphan_component・not_in_company (NE に無いコード)・component_collision / seller_sku_collision (正規化で重なる)・ne_code_differs (Company DB の SKU のコードから作る NE コードが違う)
+- 止める項目 (目標は全部 0・16 §5 の 4): key (受け手の鍵の決まり)・name_blank・timestamp・qty・no_components・sort_gap・orphan_component・not_in_company (NE に無いコード)・component_collision / seller_sku_collision (正規化で重なる)・ne_code_differs (Company DB の SKU のコードから作る NE コードが違う)・sheet_only_manual (Sheet にだけある SKU の出品に人が確定した構成 = 移行で消せない)
 - 気をつける項目 (止めない・終了コードに効かない・数と例は出す): exception_sku (例外の SKU を構成品にしている)・**sheet_only** (Sheet にだけある SKU)。
   sheet_only は 2026-10-08 に止める項目から外した (PR-D・中原さん「スプレッドシートは使用していないので無視」= 本番の FBA は 6/11 から `FBA_SKU_MAPPING_SOURCE=mirror` で Sheet の写しを FBA の対応に使っていない)。
   Sheet にだけある SKU は今までどおり Company DB に写さない (16 §3 #3)。`--fba-db` を要るままにしたのは、一覧を 0 件と読まずに数と例を出し続けるため (変える所を小さくする)
+- Sheet にだけある SKU の出品 (対応なし) に、切替の前の夜間ロード (持ち主 load) が Sheet から作った**自動の構成は、移行 (apply / reconcile) の同じ取引で消す** (#1651 Codex R1 High)。
+  残すと持ち主 company の後の夜間ロードは消さず (Sheet の構成を材料にしないだけ)、注文が来たときに違う SKU に売上を結びうる。
+  影運転は消す予定の行の数と例 (`sheet_only_cleanup`・画面の「Sheet にだけある SKU の出品の自動の構成: 消す予定 N 行」) を出す。
+  人が確定した行 (`resolution = manual`) は消さない = 止める項目 `sheet_only_manual`。消した後に構成が残れば巻き戻す (`AMAZON_MAP_MIGRATE_SHEET_ONLY_LEFT`)。
+  🚨 移行の後・持ち主を company にする前に持ち主 load の夜間ロードが流れると、Sheet から構成を作り直す (Sheet の写しが凍結 `fba_sheetless_state.sheet_frozen = 1` でない間)。
+  その間は夜間ロードを止めるか、流れたら reconcile (同じく消す) を流してから広げる
 - 同じ構成の行は時刻 (created_at / updated_at) だけそろえる = 変更の記録・出品の version を増やさない (0049 の印を増やさない)。FBM の完全一致など古い表に無い行は消す
 - ⑦-2 (写し・世代・FBA の Sheet 無し・台帳) と ⑥ (段階の戻す道) はこの PR に無い
 
