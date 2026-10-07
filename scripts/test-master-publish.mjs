@@ -1368,7 +1368,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.deepEqual([row().state, gate().open], ['safe', true]);
   ran.length = 0; calls.length = 0;
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
-  assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.deepEqual(ran, ['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);   // ⑦-2 PR-A: f_sales が直った = 速度・リストも走らせ直す (RERUN_AFTER)
   assert.equal((await P.runPmlFbaRefresh(pml(gate))).pml_run_id, 'r');
   assert.deepEqual([row().build_id, row().generation_no, row().applied_hash, row().ownership_hash],
     [snap().build.build_id, snap().build.cdb_publish_generation_no, snap().build.cdb_publish_applied_hash, snap().build.cdb_publish_ownership_hash]);   // safe は確かめたものを持つ
@@ -1509,7 +1509,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: 1 }, gate: gate() }).broken, false);
   ran.length = 0;
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
-  assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.deepEqual(ran, ['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);   // ⑦-2 PR-A: f_sales が直った = 速度・リストも走らせ直す (RERUN_AFTER)
   db.prepare('DELETE FROM cdb_publish_gate').run();
   assert.equal((await rebuild()).ok, true);
   // (p) 写しが取れない朝 (Company DB に届かない)・NE と作り直しは通った (前の世代で新しい作り直し B1)・確かめは exit 1 (fetch_not_verified) =
@@ -1539,7 +1539,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
     assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: v2.code }, gate: g2 }).broken, false);   // daily-sync は流す
     ran.length = 0; calls.length = 0;
     R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: G.readPublishGate({ dataDir: tmp }) });
-    assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+    assert.deepEqual(ran, ['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);   // ⑦-2 PR-A: f_sales が直った = 速度・リストも走らせ直す (RERUN_AFTER)
     assert.equal((await P.runPmlFbaRefresh(pml(gate))).pml_run_id, 'r');
   } finally { process.env.DAILY_SYNC_RUN_ID = 'ds_test_publish'; }
   // (q) 止めの印 (#1564 Codex R6 Low): warehouse.db を開けない最初の朝 = 印を残す → 開けるようになっても (行が無く全部 load の暗黙の safe でも) 止まったまま →
@@ -1935,17 +1935,19 @@ await ta('[30] セットの導いた値 (原価・税率・税区分・売上分
   await nightly();
 });
 
-await ta('[31] JAN (external_ids.jan・⑤-2b) だけ company の prepare は通る (古い表に置き場所が無い = 写さない列)・Amazon の構成 (listing_components.amazon) は ⑦-2 まで断る (#1564 Codex R7 Medium 2)', async () => {
+await ta('[31] JAN (external_ids.jan・⑤-2b) だけ company の prepare は通る (古い表に置き場所が無い = 写さない列)・Amazon の構成 (listing_components.amazon) も ⑦-2 PR-A から通る (④a は写さない列・写すのは amazon-map.mjs。#1564 Codex R7 Medium 2 の「⑦-2 まで断る」の終わり)', async () => {
   assert.deepEqual(MP.checkPublishOwnership(OWN('external_ids.jan')), []);
   assert.deepEqual(MP.publishCols(OWN('external_ids.jan')), []);   // 写す列は無い
-  assert.deepEqual(MP.checkPublishOwnership(OWN('listing_components.amazon')), ['not_copied:listing_components.amazon']);
+  assert.deepEqual(MP.checkPublishOwnership(OWN('listing_components.amazon')), []);
+  assert.deepEqual(MP.publishCols(OWN('listing_components.amazon')), []);   // ④a の写す列は増えない
   const logs = [];
   const epochCli = (argv, extra = {}) => quietly(() => EP.cli(argv, { env: {}, connect: async () => ({ db: pdb, close: async () => {} }), log: (m) => logs.push(m), ...extra }));
   await q('delete from ops.master_ownership_state');
   assert.equal(await epochCli(['prepare'], { ownership: OWN('external_ids.jan') }), 0, logs.at(-1));
   assert.equal((await OS.readOwnershipState(pdb)).prepared.map['external_ids.jan'], 'company');
-  assert.equal(await epochCli(['prepare'], { ownership: OWN('listing_components.amazon') }), 1);
-  assert.match(logs.at(-1), /not_copied:listing_components\.amazon/);
+  assert.equal(await epochCli(['cancel']), 0);
+  assert.equal(await epochCli(['prepare'], { ownership: OWN('listing_components.amazon') }), 0, logs.at(-1));
+  assert.equal((await OS.readOwnershipState(pdb)).prepared.map['listing_components.amazon'], 'company');
   assert.equal(await epochCli(['cancel']), 0);
   await q('delete from ops.master_ownership_state');
 });
