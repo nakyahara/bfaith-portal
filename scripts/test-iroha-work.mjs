@@ -8829,8 +8829,13 @@ console.log('\n[ボード] 📥 入荷から何日たったか (2026-10-07 中�
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   const src = html.match(/function arrivalAgo\(ymd\) \{[\s\S]*?\r?\n\}/)[0];
   const fmtMd = new Function(html.match(/function fmtMd\(ymd\) \{[\s\S]*?\r?\n\}/)[0] + '; return fmtMd;')();
-  // 今日 (JST) = 2026-10-07 に固定して動かす
-  const ago = new Function('jstYmd', 'fmtMd', src + '; return arrivalAgo;')(() => '2026-10-07', fmtMd);
+  // 今日 (JST) = 2026-10-07 に固定して動かす。端末の時計ではなくサーバーに合わせた nowMs() を使う
+  const mkAgo = (ms) => new Function('nowMs', 'fmtMd', src + '; return arrivalAgo;')(() => ms, fmtMd);
+  const ago = mkAgo(Date.parse('2026-10-07T12:00:00+09:00'));
+  ok(mkAgo(Date.parse('2026-10-07T00:05:00+09:00'))('2026-10-06') === '昨日入荷'
+    && mkAgo(Date.parse('2026-10-06T23:55:00+09:00'))('2026-10-06') === '今日入荷',
+    '⭐JST の 0 時で日が替わる (UTC の日付で数えない)');
+  ok(!/jstYmd|Date\.now\(\)/.test(src), '⭐端末の時計 (Date.now) ではなく nowMs() で今日を決める (Codex #1647 R1)');
   ok(ago('2026-10-07') === '今日入荷', '今日の入荷は「今日入荷」');
   ok(ago('2026-10-06') === '昨日入荷', '前の日は「昨日入荷」');
   ok(ago('2026-10-02') === '5日前入荷', '5 日前は「5日前入荷」');

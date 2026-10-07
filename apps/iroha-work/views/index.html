@@ -1941,14 +1941,15 @@ function fmtMd(ymd) {
   return m ? Number(m[2]) + '/' + Number(m[3]) : String(ymd || '');
 }
 /**
- * 入荷日 'YYYY-MM-DD' → 「今日入荷」「昨日入荷」「N日前入荷」(今日は JST)。
+ * 入荷日 'YYYY-MM-DD' → 「今日入荷」「昨日入荷」「N日前入荷」(今日は JST・サーバーの時計)。
  * ボードのカードで、どれだけ待っているかを日付の引き算なしで分かるように (中原さん 2026-10-07)。
  * 日付でない・先の日付 (入荷予定のずれ) は M/D のまま
  */
 function arrivalAgo(ymd) {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(ymd || ''));
   if (!m) return ymd ? '入荷 ' + String(ymd) : '';
-  const t = /^(\d{4})-(\d{2})-(\d{2})/.exec(jstYmd(0));
+  // 今日はサーバーに合わせた時計で決める (iPad の時計がずれていると 0 時ごろに今日と昨日が入れ替わる — Codex #1647 R1)
+  const t = /^(\d{4})-(\d{2})-(\d{2})/.exec(new Date(nowMs() + 9 * 3600 * 1000).toISOString());
   const days = Math.round((Date.UTC(+t[1], +t[2] - 1, +t[3]) - Date.UTC(+m[1], +m[2] - 1, +m[3])) / 86400000);
   if (days < 0) return '入荷 ' + fmtMd(ymd);
   if (days === 0) return '今日入荷';
