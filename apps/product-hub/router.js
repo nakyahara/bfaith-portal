@@ -65,7 +65,7 @@ import { importImageDbByStatus } from './services/notion-image-import.js';
 import { buildPromptTemplates, composeColorVariations, composeProductInfo } from './lib/prompt-templates.js';
 // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)
 import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-auto.js';
-import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
+import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, profitShipPickByGroup, profitShipNearByGroup, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
 import { existingPageOfDraft, EXISTING_PAGE_CHOICES } from './lib/existing-page.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
@@ -396,6 +396,16 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(draft.id)) {
     skuExemptions[r.sku_code] = r.reason;
   }
+  // 利益試算の配送方法の選択肢。画面の選択肢と「どれに合わせるか」を同じ並びから決めるので一度だけ作る
+  const neShipChoices = profitShipChoices(listNeShippingOptions(db), neCost?.shippingMethod, neCost?.shippingCost);
+  // 管理画面で人が決めた「NE の配送方法 → 楽天の配送方法グループ」の割当。試算の合わせ先では
+  // これを正にする (推測で上書きしない。宅急便コンパクトのような別サービスの誤判定を防ぐ)
+  const neShipAssigned = (() => {
+    try {
+      return Object.fromEntries(db.prepare('SELECT ne_label, rakuten_group FROM ph_shipping_method_map').all()
+        .filter((r) => r.ne_label && r.rakuten_group).map((r) => [String(r.ne_label).trim(), String(r.rakuten_group)]));
+    } catch (_) { return {}; }   // 表が無くても画面は出す
+  })();
   // 切替で閉じた後 = Company DB の税率だけ (決められない = 試算しない)。閉じる前・段階を読めない (見るだけ) は今までどおり (Yahoo 欄 → NE → 10%)
   const cdbTaxForSim = res.locals.taxMode === 'cdb' ? (res.locals.cdbTax || { ok: false, reason: '読めません' }) : null;
   const simTaxPercent = cdbTaxForSim ? (cdbTaxForSim.ok ? cdbTaxForSim.percent : null) : (() => {
@@ -486,8 +496,13 @@ router.get('/detail/:id', (req, res) => {
     neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans, skuSelectorValues,
     // 利益シミュレーションで配送方法を差し替えて試算するための材料 (2026-09-04)。
     // 楽天の配送方法グループとは粒度が違うので NE の配送方法で持つ (lib/variation.js 参照)
-    neShippingOptions: profitShipChoices(listNeShippingOptions(db), neCost?.shippingMethod, neCost?.shippingCost),
+    neShippingOptions: neShipChoices,
     rakutenGroupNeHints: RAKUTEN_GROUP_NE_HINTS,
+    // 楽天の配送方法を変えたときに試算をどの NE 配送方法へ合わせるか (2026-10-06)。
+    // 画面の選択肢 (neShipChoices) から決めるので、画面に無い配送方法は選ばれない
+    profitShipPicks: profitShipPickByGroup(neShipChoices, RAKUTEN_GROUP_NE_HINTS, undefined, neShipAssigned),
+    // 画面で「楽天の指定に近いもの」に集める候補。自動で選ぶ側と同じ分け方 (割当 → サービス)
+    profitShipNear: profitShipNearByGroup(neShipChoices, RAKUTEN_GROUP_NE_HINTS, undefined, neShipAssigned),
     skuAttrGrid, skuExemptions,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
