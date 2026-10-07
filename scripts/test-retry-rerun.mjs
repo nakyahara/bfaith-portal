@@ -10,7 +10,7 @@
  */
 import assert from 'node:assert/strict';
 
-const { runRetryRound, RERUN_AFTER, rerunAfterProblems, RETRY_ORDER, JOB_DEFINITIONS, runScript, failSummary } = await import('../apps/warehouse/retry-failed-jobs.js');
+const { runRetryRound, RERUN_AFTER, rerunAfterProblems, RETRY_ORDER, JOB_DEFINITIONS, runScript, failSummary, AMAZON_MAP_CHAIN, amazonChainActive } = await import('../apps/warehouse/retry-failed-jobs.js');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -21,11 +21,10 @@ const fakeRun = (fails = {}) => { const calls = []; return { calls, run: (script
 await ta('[1] RERUN_AFTER の決まり (定義・順番・下流は上流より後)', async () => {
   assert.deepEqual(rerunAfterProblems(), []);
   assert.deepEqual(RERUN_AFTER['Render同期'], ['マスタ照合']);
-  // ⑦-2 PR-A (Codex 計画 R2 High 2): Amazon SKU の写し → f_sales → sales_velocity / pml_snapshot / Render同期 の鎖
-  assert.deepEqual(RERUN_AFTER['CompanyDB写し(Amazon SKU)'], ['f_sales']);
-  assert.deepEqual([RERUN_AFTER['f_sales'], RERUN_AFTER['sales_velocity'], RERUN_AFTER['pml_snapshot']], [['sales_velocity'], ['pml_snapshot'], ['Render同期']]);   // 直列 (#1649 Codex R1 Medium 2)
-  assert.ok(RETRY_ORDER.indexOf('CompanyDB写し(Amazon SKU)') < RETRY_ORDER.indexOf('f_sales') && RETRY_ORDER.indexOf('f_sales') < RETRY_ORDER.indexOf('sales_velocity')
-    && RETRY_ORDER.indexOf('sales_velocity') < RETRY_ORDER.indexOf('pml_snapshot') && RETRY_ORDER.indexOf('pml_snapshot') < RETRY_ORDER.indexOf('Render同期'));
+  // ⑦-2 PR-A: Amazon SKU の写しの鎖 (写し → f_sales → sales_velocity → pml_snapshot → Render同期) は写しの鎖の回だけ = RERUN_AFTER には載せない (今の本番の retry を変えない。#1649 Codex R2 Medium)
+  assert.deepEqual(Object.keys(RERUN_AFTER), ['Render同期', 'マスタ照合']);
+  assert.deepEqual(AMAZON_MAP_CHAIN, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期']);
+  for (let i = 1; i < AMAZON_MAP_CHAIN.length; i++) { assert.ok(RETRY_ORDER.indexOf(AMAZON_MAP_CHAIN[i - 1]) < RETRY_ORDER.indexOf(AMAZON_MAP_CHAIN[i]), AMAZON_MAP_CHAIN[i]); assert.ok(Object.hasOwn(JOB_DEFINITIONS, AMAZON_MAP_CHAIN[i])); }
   assert.deepEqual(JOB_DEFINITIONS['CompanyDB写し(Amazon SKU)'].args, ['--daily']);
   assert.deepEqual(RERUN_AFTER['マスタ照合'], ['新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);   // 照合が直ったら、新商品の許可 (PR-7) と影運転 (③c-1a) も新しい照合の回で
   assert.ok(RETRY_ORDER.indexOf('マスタ照合') < RETRY_ORDER.indexOf('新商品の許可'));
@@ -81,45 +80,73 @@ await ta('[4b] ⑦-2 PR-A: 朝は写しだけ失敗 (f_sales・Render同期 は�
   const g = fakeRun({ 'CompanyDB写し(Amazon SKU)': true });
   runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: g.run, log: quiet });
   assert.deepEqual(g.calls, ['CompanyDB写し(Amazon SKU)']);
-  // 写しは直ったが作り直した f_sales が失敗 = その後 (速度・リスト・Render同期) は走らせ直さない (f_sales は次の回に残る)
+  // 写しは直ったが作り直した f_sales が失敗 = その後 (速度・リスト・Render同期) は流さず「見送り」で残す (次の回も鎖で f_sales から)
   const h = fakeRun({ f_sales: true });
   const r3 = runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: h.run, log: quiet });
   assert.deepEqual(h.calls, ['CompanyDB写し(Amazon SKU)', 'f_sales']);
-  assert.deepEqual(r3.filter((r) => !r.success).map((r) => r.name), ['f_sales']);
+  assert.deepEqual(r3.filter((r) => !r.success).map((r) => r.name), ['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期']);
+  assert.equal(r3.amazonChainPending, true);
   // 写しの反映の門が壊れている朝 = f_sales 以降は再試行でも動かさない (publish-gate.js。写しそのものは止めない)
   const k = fakeRun();
   const r4 = runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: k.run, log: quiet, publishGate: { broken: true, state: 'broken' } });
   assert.deepEqual(k.calls, ['CompanyDB写し(Amazon SKU)']);
-  assert.deepEqual(r4.map((r) => [r.name, r.success, !!r.gated]), [['CompanyDB写し(Amazon SKU)', true, false], ['f_sales', false, true]]);
+  assert.deepEqual(r4.map((r) => [r.name, r.success, !!r.gated]), [['CompanyDB写し(Amazon SKU)', true, false], ['f_sales', false, true], ['sales_velocity', false, false], ['pml_snapshot', false, false], ['Render同期', false, false]]);
 });
 
-await ta('[4c] f_sales → sales_velocity → pml_snapshot → Render同期 は直列 (#1649 Codex R1 Medium 2): 速度が落ちた / リストが落ちた回はその先を流さない・次の回で落ちたところから最後まで流す', async () => {
-  // 速度が落ちる (走らせ直しの鎖)
+await ta('[4c] 写しの鎖の回 (#1649 Codex R1 Medium 2 / R2 Medium): 写し → f_sales → 速度 → リスト → Render同期 を一段ずつ・途中が落ちたらその先は流さず残す・次の回は落ちたところから一段ずつ', async () => {
+  // 鍵待ち (exit 73) の朝 = retry-state は写しだけ → 写しが直った回に一段ずつ
+  const z = fakeRun();
+  const rz = runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: z.run, log: quiet });
+  assert.deepEqual(z.calls, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.equal(rz.amazonChainPending, false);
+  // 速度が落ちる = リスト・Render は流さず残す
   const a = fakeRun({ sales_velocity: true });
   const ra = runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: a.run, log: quiet });
   assert.deepEqual(a.calls, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity']);
-  assert.deepEqual(ra.filter((r) => !r.success).map((r) => r.name), ['sales_velocity']);
-  // 次の回 = 速度から最後まで
+  assert.deepEqual(ra.filter((r) => !r.success).map((r) => [r.name, r.summary]), [['sales_velocity', '❌ 失敗'], ['pml_snapshot', '⏸️ skipped (sales_velocity 失敗・Amazon SKU の写しの鎖)'], ['Render同期', '⏸️ skipped (sales_velocity 失敗・Amazon SKU の写しの鎖)']]);
+  assert.equal(ra.amazonChainPending, true);
+  // 次の回 (retry-state の amazon_map_chain = true) = 速度から一段ずつ最後まで
+  const state = { remaining_jobs: ra.filter((r) => !r.success).map((r) => r.name), amazon_map_chain: ra.amazonChainPending };
+  assert.equal(amazonChainActive(state), true);
   const a2 = fakeRun();
-  runRetryRound(ra.filter((r) => !r.success).map((r) => r.name), { run: a2.run, log: quiet });
+  runRetryRound(state.remaining_jobs, { run: a2.run, log: quiet, amazonChain: amazonChainActive(state) });
   assert.deepEqual(a2.calls, ['sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
-  // リストが落ちる
+  // 次の回も速度が落ちる = その先は流さない (残る)
+  const a3 = fakeRun({ sales_velocity: true });
+  const ra3 = runRetryRound(state.remaining_jobs, { run: a3.run, log: quiet, amazonChain: true });
+  assert.deepEqual(a3.calls, ['sales_velocity']);
+  assert.deepEqual(ra3.map((r) => [r.name, r.success]), [['sales_velocity', false], ['pml_snapshot', false], ['Render同期', false]]);
+  // リストが落ちる = Render は流さない
   const b = fakeRun({ pml_snapshot: true });
-  const rb = runRetryRound(['f_sales'], { run: b.run, log: quiet });
-  assert.deepEqual(b.calls, ['f_sales', 'sales_velocity', 'pml_snapshot']);
-  assert.deepEqual(rb.filter((r) => !r.success).map((r) => r.name), ['pml_snapshot']);
+  const rb = runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: b.run, log: quiet });
+  assert.deepEqual(b.calls, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot']);
+  assert.deepEqual(rb.filter((r) => !r.success).map((r) => r.name), ['pml_snapshot', 'Render同期']);
   const b2 = fakeRun();
-  runRetryRound(['pml_snapshot'], { run: b2.run, log: quiet });
+  runRetryRound(['pml_snapshot', 'Render同期'], { run: b2.run, log: quiet, amazonChain: true });
   assert.deepEqual(b2.calls, ['pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
-  // 下流が朝から remaining_jobs にある回も、この回で試した上流が落ちたら止まる (見送りの失敗 = 次の回に残る)
-  const c = fakeRun({ sales_velocity: true });
-  const rc = runRetryRound(['sales_velocity', 'pml_snapshot', 'Render同期'], { run: c.run, log: quiet });
-  assert.deepEqual(c.calls, ['sales_velocity']);
-  assert.deepEqual(rc.map((r) => [r.name, r.success, r.summary]), [['sales_velocity', false, '❌ 失敗'], ['pml_snapshot', false, '⏸️ skipped (sales_velocity 再失敗)'], ['Render同期', false, '⏸️ skipped (pml_snapshot 再失敗)']]);
-  const d = fakeRun({ pml_snapshot: true });
-  const rd = runRetryRound(['pml_snapshot', 'Render同期'], { run: d.run, log: quiet });
-  assert.deepEqual(d.calls, ['pml_snapshot']);
-  assert.deepEqual(rd.filter((r) => !r.success).map((r) => r.name), ['pml_snapshot', 'Render同期']);
+  // 写しの鎖の回か: 写しが remaining にある・前の回の印 / どちらも無い = 今までの retry
+  assert.equal(amazonChainActive({ remaining_jobs: ['CompanyDB写し(Amazon SKU)'] }), true);
+  assert.equal(amazonChainActive({ remaining_jobs: ['f_sales', 'Render同期'] }), false);
+  assert.equal(amazonChainActive({ remaining_jobs: ['f_sales'], amazon_map_chain: false }), false);
+  assert.equal(amazonChainActive(null), false);
+});
+
+await ta('[4d] 🚨 今の本番 (持ち主 load = 写しは retry に載らない) の retry は前のまま (#1649 Codex R2 Medium): リスト・速度が落ちても Render同期 は流れる・f_sales が直っても速度・リストを走らせ直さない', async () => {
+  const p = fakeRun({ pml_snapshot: true });
+  const rp = runRetryRound(['pml_snapshot', 'Render同期'], { run: p.run, log: quiet });
+  assert.deepEqual(p.calls, ['pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.deepEqual(rp.filter((r) => !r.success).map((r) => r.name), ['pml_snapshot']);
+  assert.equal(rp.amazonChainPending, false);
+  const v = fakeRun({ sales_velocity: true });
+  runRetryRound(['sales_velocity', 'pml_snapshot', 'Render同期'], { run: v.run, log: quiet });
+  assert.deepEqual(v.calls, ['sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  const f = fakeRun();
+  runRetryRound(['f_sales', 'Render同期'], { run: f.run, log: quiet });
+  assert.deepEqual(f.calls, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  // retry-state の書き方: 鎖の途中のときだけ amazon_map_chain = true (main が残す)
+  const src = (await import('node:fs')).readFileSync(new URL('../apps/warehouse/retry-failed-jobs.js', import.meta.url), 'utf8');
+  assert.match(src, /amazon_map_chain: results\.amazonChainPending === true,/);
+  assert.match(src, /runRetryRound\(state\.remaining_jobs, \{ publishGate, amazonChain: amazonChainActive\(state\) \}\)/);
 });
 
 await ta('[5] 失敗した子の最後の行 (❌ 理由) を要約に残す (Codex #1540 R1 Low)', async () => {

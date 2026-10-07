@@ -811,15 +811,16 @@ async function main() {
   // 持ち主 (DB の active の listing_components.amazon) が company の朝だけ、Company DB の active の対応に m_sku_master・m_sku_components をまるごと合わせる
   // (SQLite の 1 取引で差だけ・読み直してハッシュを照らす)。持ち主が load の今は何もしない (⏭️ exit 0・SQLite を開かない)。
   // f_sales (v_sku_resolved を読む) より前 = 今朝の対応で売上を作る。断った (0 件・90% 未満・変更の記録の番号が戻った)・読めない = ❌ = retry に載る
-  // (retry-failed-jobs.js: f_sales の上流・直ったら f_sales → sales_velocity / pml_snapshot / Render同期 を走らせ直す)。
+  // (retry-failed-jobs.js: f_sales の上流・写しが retry に載った日だけ「写しの鎖」で f_sales → sales_velocity → pml_snapshot → Render同期 を一段ずつ流す)。
   // 止める = .env の CDB_AMAZON_MAP_PUBLISH_PAUSE=1 (⚠️ 見送り・古い表は前の形のまま)。ping は打たない (台帳 warehouse-daily-sync の 1 工程)
   const cdbAmazonMapResult = runScript('apps/company-db/publish/amazon-map.mjs --daily', 'Company DB の Amazon SKU の写し', 300000);
   results.push({ name: 'CompanyDB写し(Amazon SKU)', ...cdbAmazonMapResult, warn: cdbAmazonMapResult.success && isWarnSummary(cdbAmazonMapResult.summary) });
-  // exit 73 = 別の写し (手の CLI) が鍵を持っていた = この朝は f_sales・速度・リスト (と Render同期) を流さず、写し → f_sales → … を retry に残す
+  // exit 73 = 別の写し (手の CLI) が鍵を持っていた = この朝は f_sales・速度・リスト・Render同期 を流さない。retry-state には写しだけを残す (下流は blocked = 載せない)。
+  //   retry で写しが直った回に、写しの鎖 (retry-failed-jobs.js の AMAZON_MAP_CHAIN) が f_sales → 速度 → リスト → Render同期 を一段ずつ流す (#1649 Codex R2 Medium)
   //   (手の写しが f_sales と Render同期 の間に新しい対応を入れると、新しい mirror_sku_* と古い対応の f_sales が一緒に送られる。#1649 Codex R1 High)。
   //   ふつうの安全弁の拒否 (exit 1) は今までどおり流す (古い表は前の対応のまま = 混ざらない)。持ち主 load の今は鍵を取らない = 起きない
   const amazonMapBusy = !cdbAmazonMapResult.success && cdbAmazonMapResult.exitCode === 73;
-  const amazonMapBusySkip = (name) => { console.log(`[DailySync] ${name} 見送り (Amazon SKU の写しが別の写しの鍵待ち = retry で 写し → f_sales → … の順に流す)`); return { success: false, summary: '⏸️ skipped (Amazon SKU の写しが別の写しの鍵待ち = retry で写しから流す)' }; };
+  const amazonMapBusySkip = (name) => { console.log(`[DailySync] ${name} 見送り (Amazon SKU の写しが別の写しの鍵待ち = retry で 写し → f_sales → … の順に流す)`); return { success: false, blocked: true, summary: '⏸️ skipped (Amazon SKU の写しが別の写しの鍵待ち = retry で写しが直った回に順に流す)' }; };
 
   // m_products 変更差分を history に記録 (trigger 廃止 → 差分バッチ化)
   // rebuild-m-products.js の直後に実行 (m_products 確定後の比較)
@@ -1472,6 +1473,8 @@ async function main() {
   const skuMapOk = rakutenSkuMapResult.success;
   if (publishGate.broken) {
     syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');   // runScript が止める (⚠️ 見送り。publish-gate.js)
+  } else if (amazonMapBusy) {
+    syncResult = amazonMapBusySkip('Render同期');   // 写しの鍵待ち = retry の写しの鎖で流す (retry-state に載せない)
   } else if (fSalesOk && skuMapOk) {
     syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');
   } else {

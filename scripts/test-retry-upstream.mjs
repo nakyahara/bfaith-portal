@@ -24,8 +24,7 @@ t('表の整合: 上流も下流も retry の定義と順序にあり、上流�
   }
   // 決済の取込 → 財務の送り手の組 (F2b-3) は、スイッチ CDB_FINANCE_COORDINATOR が無いとき (今までの 2 工程) の組 (#1567)。あるときは coordinator 'Amazon決済と財務' の 1 工程 = この組は走らない
   assert.deepEqual(UPSTREAM_OF, { 'CompanyDB注文(Qoo10)': 'Qoo10', 'CompanyDB広告費(Amazon)': 'Amazon Ads (SKU)', 'CompanyDB財務(Amazon)': 'Amazon Settlement', 'CompanyDB観測原価': 'm_products_history', '新商品の許可': 'マスタ照合',
-    'f_sales': 'CompanyDB写し(Amazon SKU)',   // ⑦-2 PR-A (Codex 計画 R2 High 2)
-    'sales_velocity': 'f_sales', 'pml_snapshot': 'sales_velocity', 'Render同期': 'pml_snapshot' });   // 直列 (#1649 Codex R1 Medium 2)
+    'f_sales': 'CompanyDB写し(Amazon SKU)' });   // ⑦-2 PR-A (Codex 計画 R2 High 2)。速度・リスト・Render の直列は写しの鎖の回だけ (AMAZON_MAP_CHAIN・#1649 Codex R2 Medium)
 });
 t('⑦-2 PR-A: Amazon SKU の対応の写しは 3 か所 (RETRYABLE_JOBS・JOB_DEFINITIONS・RETRY_ORDER) にあり、f_sales より前・daily-sync でも f_sales より前に走る', () => {
   const J = 'CompanyDB写し(Amazon SKU)';
@@ -39,14 +38,16 @@ t('⑦-2 PR-A: Amazon SKU の対応の写しは 3 か所 (RETRYABLE_JOBS・JOB_D
   assert.ok(iApply > 0 && iApply < iMap && iMap < iFsales, 'daily-sync: 写しの反映 → Amazon SKU の写し → f_sales の順');
   assert.match(dailySync, /results\.push\(\{ name: 'CompanyDB写し\(Amazon SKU\)', \.\.\.cdbAmazonMapResult/);
 });
-t('🚨 ⑦-2 PR-A (#1649 Codex R1 High): 写しが鍵待ち (exit 73) の朝は f_sales・速度・リストを流さず失敗として retry に載せる (Render同期 は f_sales 失敗で見送り)。ふつうの拒否 (exit 1) は今までどおり流す', () => {
+t('🚨 ⑦-2 PR-A (#1649 Codex R1 High / R2 Medium): 写しが鍵待ち (exit 73) の朝は f_sales・速度・リスト・Render同期 を流さず、retry-state には写しだけを残す (下流は blocked)。ふつうの拒否 (exit 1) は今までどおり流す', () => {
   assert.match(dailySync, /const amazonMapBusy = !cdbAmazonMapResult\.success && cdbAmazonMapResult\.exitCode === 73;/);
   for (const [v, script] of [['fSalesResult', 'rebuild-f-sales.js'], ['velocityResult', 'rebuild-sales-velocity.js'], ['pmlSnapResult', 'build-product-management-snapshot.js']]) {
     assert.match(dailySync, new RegExp(`const ${v} = amazonMapBusy \\? amazonMapBusySkip\\('[a-z_]+'\\) : runScript\\('apps/warehouse/${script.replace(/\./g, '\\.')}'`), v);
   }
-  assert.match(dailySync, /return \{ success: false, summary: '⏸️ skipped \(Amazon SKU の写しが別の写しの鍵待ち/);   // blocked でない = retry に載る
-  assert.ok(['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'CompanyDB写し(Amazon SKU)'].every((j) => retryable.includes(j)));
-  assert.match(dailySync, /if \(!fSalesOk\) reasons\.push\('f_sales 失敗'\);/);
+  assert.match(dailySync, /return \{ success: false, blocked: true, summary: '⏸️ skipped \(Amazon SKU の写しが別の写しの鍵待ち/);   // blocked = retry-state に載らない (写しの鎖で流す)
+  assert.match(dailySync, /\} else if \(amazonMapBusy\) \{\r?\n\s+syncResult = amazonMapBusySkip\('Render同期'\);/);
+  assert.ok(dailySync.indexOf("} else if (amazonMapBusy) {") < dailySync.indexOf("} else if (fSalesOk && skuMapOk) {"));
+  assert.match(dailySync, /\.filter\(r => RETRYABLE_JOBS\.includes\(r\.name\) && !r\.success && !r\.blocked\)/);   // blocked は retry-state に入らない
+  assert.ok(retryable.includes('CompanyDB写し(Amazon SKU)'));
 });
 t('🚨 ⑦-2 PR-A: 写しをこの回で再試行して失敗 → f_sales を作り直さない (Render同期 も見送り) / 写しが成功 → f_sales から作り直す / 写しが朝に成功していれば f_sales はそのまま走る', () => {
   const started = []; const quiet = () => {};
@@ -56,8 +57,8 @@ t('🚨 ⑦-2 PR-A: 写しをこの回で再試行して失敗 → f_sales を�
   assert.deepEqual(r1.map((x) => [x.name, x.success]), [['CompanyDB写し(Amazon SKU)', false], ['f_sales', false], ['Render同期', false]]);
   assert.equal(r1.find((x) => x.name === 'f_sales').summary, '⏸️ skipped (CompanyDB写し(Amazon SKU) 再失敗)');
   started.length = 0;
-  runRetryRound(['f_sales'], { run: runner({}), log: quiet });   // 写しは朝に成功 (remaining に無い) = f_sales はそのまま
-  assert.deepEqual(started, ['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  runRetryRound(['f_sales'], { run: runner({}), log: quiet });   // 写しは朝に成功 (remaining に無い) = f_sales はそのまま・今までどおり (鎖でない = 速度・リストを走らせ直さない)
+  assert.deepEqual(started, ['f_sales']);
 });
 t('定義と順序の食い違いが無い (定義にあるのに順序に無いジョブは、retry-state に載っても永久に走らない)', () => {
   assert.deepEqual(Object.keys(JOB_DEFINITIONS).filter((j) => !RETRY_ORDER.includes(j)), []);

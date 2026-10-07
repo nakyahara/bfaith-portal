@@ -431,7 +431,7 @@ Company DB の active の対応 → miniPC の古い表 `m_sku_master` + `m_sku_
 - company = 毎回 Company DB の今の active の対応に**まるごと合わせる** (世代は持たない = 何度流しても同じ・2 回目は変わった行 0)。SQLite の 1 取引で差だけ・commit の前に読み直してハッシュ (`sku-map-canon-v1`) を照らす。`sync_meta` の `cdb_amazon_map_publish` にハッシュ・行数・変更の記録の番号
 - 実行の鍵 = warehouse.db の `job_locks` の `cdb-amazon-map-publish` (daily・自動再試行・手の CLI が同じ鍵。PG を読む前から SQLite の commit の後まで)。鍵の順 = daily-sync / 再試行の回の鍵 → 写しの鍵 (どれも待たない = 取れなければすぐ断る)
 - **手の写しは daily-sync / 再試行の回が動いている間は断る** (`data/daily-sync.lock.json`・`data/retry-failed-jobs.lock.json` の持ち主が生きている = 写しの鍵の前と後に確かめる)。回の f_sales〜Render同期 の間に新しい対応を入れない (#1649 Codex R1 High)
-- daily / 再試行の写しが**鍵待ち (exit 73 = 手の写しが鍵を持っていた)** の朝は、f_sales・速度・リスト・Render同期 を流さず retry に残す (写し → f_sales → 速度 → リスト → Render同期 の順に流す)
+- daily / 再試行の写しが**鍵待ち (exit 73 = 手の写しが鍵を持っていた)** の朝は、f_sales・速度・リスト・Render同期 を流さない。retry-state には写しだけを残し、写しが直った回に「写しの鎖」で f_sales → 速度 → リスト → Render同期 を一段ずつ流す (途中で落ちたらその先は流さず残す)。写しの鎖は写しが retry に載った日だけ = 持ち主 load の今の retry は前のまま
 - 断る (古い表は前のまま・❌ exit 1 = retry に載る): 0 件 / 今の古い表の 90% 未満 / 変更の記録の番号が前の写しより小さい / 前の写しの記録 (`sync_meta`) が読めない・形が違う (欄の欠け・型・ハッシュの形) / 受け手の決まり (`validateSkuMap`) に合わない
 - ⚠️ だけ: 前の写しの後に古い表が誰かに書き換えられていた (今のハッシュ ≠ 前の写しのハッシュ) = Company DB の値で上書きする
 - 持ち主を読めない (未設定・届かない) = config か前の写しの記録が company を示せば ❌・どちらも無ければ ⚠️ exit 0 (今の動きのまま = f_sales の retry を止めない)

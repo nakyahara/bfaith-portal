@@ -1368,7 +1368,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.deepEqual([row().state, gate().open], ['safe', true]);
   ran.length = 0; calls.length = 0;
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
-  assert.deepEqual(ran, ['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);   // ⑦-2 PR-A: f_sales が直った = 速度・リストも走らせ直す (RERUN_AFTER)
+  assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   assert.equal((await P.runPmlFbaRefresh(pml(gate))).pml_run_id, 'r');
   assert.deepEqual([row().build_id, row().generation_no, row().applied_hash, row().ownership_hash],
     [snap().build.build_id, snap().build.cdb_publish_generation_no, snap().build.cdb_publish_applied_hash, snap().build.cdb_publish_ownership_hash]);   // safe は確かめたものを持つ
@@ -1509,7 +1509,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: 1 }, gate: gate() }).broken, false);
   ran.length = 0;
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
-  assert.deepEqual(ran, ['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);   // ⑦-2 PR-A: f_sales が直った = 速度・リストも走らせ直す (RERUN_AFTER)
+  assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   db.prepare('DELETE FROM cdb_publish_gate').run();
   assert.equal((await rebuild()).ok, true);
   // (p) 写しが取れない朝 (Company DB に届かない)・NE と作り直しは通った (前の世代で新しい作り直し B1)・確かめは exit 1 (fetch_not_verified) =
@@ -1539,7 +1539,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
     assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: v2.code }, gate: g2 }).broken, false);   // daily-sync は流す
     ran.length = 0; calls.length = 0;
     R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: G.readPublishGate({ dataDir: tmp }) });
-    assert.deepEqual(ran, ['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);   // ⑦-2 PR-A: f_sales が直った = 速度・リストも走らせ直す (RERUN_AFTER)
+    assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
     assert.equal((await P.runPmlFbaRefresh(pml(gate))).pml_run_id, 'r');
   } finally { process.env.DAILY_SYNC_RUN_ID = 'ds_test_publish'; }
   // (q) 止めの印 (#1564 Codex R6 Low): warehouse.db を開けない最初の朝 = 印を残す → 開けるようになっても (行が無く全部 load の暗黙の safe でも) 止まったまま →

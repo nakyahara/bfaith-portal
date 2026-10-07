@@ -53,7 +53,7 @@ const MAX_RETRY_COUNT = 3;
 export const JOB_DEFINITIONS = {
   // Company DB の Amazon SKU の対応 → m_sku_master・m_sku_components (⑦-2 PR-A)。毎回 Company DB の今の対応にまるごと合わせる = 再実行安全
   //   (同じ中身なら変わった行 0)。daily-sync・手の CLI と同じ実行の鍵 (warehouse.db の job_locks) をスクリプトが取る。持ち主が load = 何もしない (exit 0)。
-  //   f_sales の上流 (UPSTREAM_OF)・直ったら f_sales → sales_velocity / pml_snapshot / Render同期 を走らせ直す (RERUN_AFTER。古い対応の売上を Render に送らない)
+  //   f_sales の上流 (UPSTREAM_OF)。写しが retry に載った日 = 写しの鎖 (AMAZON_MAP_CHAIN): 直ったら f_sales → sales_velocity → pml_snapshot → Render同期 を一段ずつ流す
   'CompanyDB写し(Amazon SKU)': { script: 'apps/company-db/publish/amazon-map.mjs', args: ['--daily'], timeoutMs: 300000 },
   'f_sales':        { script: 'apps/warehouse/rebuild-f-sales.js',                timeoutMs: 1800000 },
   'sales_velocity': { script: 'apps/warehouse/rebuild-sales-velocity.js',         timeoutMs: 900000  },
@@ -161,14 +161,23 @@ export const UPSTREAM_OF = {
   '新商品の許可': 'マスタ照合',                     // 照合 ② → 新商品の許可 (PR-7)。照合をこの回で再試行して失敗 = 許可を出さない (入口は照合の始めで閉じたまま)
   // Amazon SKU の対応の写し → f_sales (⑦-2 PR-A・Codex 計画 R2 High 2)。写しをこの回で再試行して失敗 = f_sales を作り直さない
   //   (朝の f_sales は前の対応のまま = 古い対応と新しい対応の混ざった回を Render へ送らない。写しが直った回に f_sales から作り直す = RERUN_AFTER)
+  //   今の本番 (持ち主 load) は写しがいつも exit 0 = retry に載らない = この組は効かない (今の f_sales の retry は変わらない)
   'f_sales': 'CompanyDB写し(Amazon SKU)',
-  // f_sales → sales_velocity → pml_snapshot → Render同期 の直列 (#1649 Codex R1 Medium 2)。この回で上流を試して失敗 (見送りも) = 下流は流さない
-  //   (下流が朝から remaining_jobs にある回も同じ)。Render同期 は商品管理リスト (pml_snapshot) も Render に送る = リストが落ちた回は送らない。
-  //   f_sales・楽天sku_map の再失敗で Render同期 を止めるのは今までどおり runRetryRound の fail-fast
-  'sales_velocity': 'f_sales',
-  'pml_snapshot': 'sales_velocity',
-  'Render同期': 'pml_snapshot',
 };
+/**
+ * Amazon SKU の対応の写しの鎖 (⑦-2 PR-A・#1649 Codex R1 Medium 2 / R2 Medium)。**写しが retry に載った日 (state.amazon_map_chain・remaining に写し) だけ**効く
+ *   = 今の本番 (持ち主 load = 写しは retry に載らない) の retry の動きは今までどおり (sales_velocity・pml_snapshot が落ちても Render同期 は流れる)。
+ *   鎖の中: 1 つが成功したら次だけを足す (走らせ直し) / 前がこの回で落ちた (見送りも) = 流さない / 途中で落ちた = その先を「⏸️ 見送り」の失敗として残し、
+ *   次の回も鎖のまま落ちたところから一段ずつ流す (amazon_map_chain を retry-state に残す)。
+ *   daily-sync は写しが鍵待ち (exit 73) の朝、f_sales〜Render同期 を retry-state に載せない (blocked) = まず写しだけが残り、直った回に鎖で流れる
+ */
+export const AMAZON_MAP_CHAIN = Object.freeze(['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期']);
+const chainPrev = (j) => { const i = AMAZON_MAP_CHAIN.indexOf(j); return i > 0 ? AMAZON_MAP_CHAIN[i - 1] : null; };
+const chainNext = (j) => { const i = AMAZON_MAP_CHAIN.indexOf(j); return i >= 0 && i < AMAZON_MAP_CHAIN.length - 1 ? AMAZON_MAP_CHAIN[i + 1] : null; };
+/** この回が写しの鎖の回か (前の回が鎖の途中で終わった = amazon_map_chain / 写しが remaining にある) */
+export function amazonChainActive(state) {
+  return !!state && (state.amazon_map_chain === true || (Array.isArray(state.remaining_jobs) && state.remaining_jobs.includes(AMAZON_MAP_CHAIN[0])));
+}
 /**
  * 走らせ直しの依存 (Company DB構想 10 §6.1.1 B4。Codex ③a-2 R1 H5・B-R0 #3): 上流が**この回の retry で成功**したら、朝に成功していた下流も走らせ直す。
  *   Render同期 が直った = 照合の材料・到達の証跡が新しくなった → マスタ照合 → 見張り (照合が blocked で exit 0 でも、新しい結果なので見張りは走らせ直す)。
@@ -178,12 +187,7 @@ export const UPSTREAM_OF = {
  *   足した下流の失敗も結果に入る = 次の回の remaining_jobs に残る。下流は RETRY_ORDER で上流より後 (試験 test-retry-rerun.mjs が確かめる)
  */
 export const RERUN_AFTER = {
-  // Amazon SKU の対応の写しが直った (⑦-2 PR-A・Codex 計画 R2 High 2) = 朝に成功していた f_sales も新しい対応で作り直し、その後の販売速度・商品管理リスト・Render同期も
-  //   (新しい mirror_sku_* と古い対応で作った f_sales を同じ回に送らない)。直列 (#1649 Codex R1 Medium 2): 1 つが成功したら次だけを足す = 途中で落ちたらその先は流さない
-  'CompanyDB写し(Amazon SKU)': ['f_sales'],
-  'f_sales': ['sales_velocity'],
-  'sales_velocity': ['pml_snapshot'],
-  'pml_snapshot': ['Render同期'],
+  // 🚨 Amazon SKU の写し → f_sales → … の走らせ直しはここに載せない (写しの鎖の回だけ = AMAZON_MAP_CHAIN。今の本番の retry を変えない)
   'Render同期': ['マスタ照合'],
   'マスタ照合': ['新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り'],
 };
@@ -364,11 +368,13 @@ function deleteState() {
  * 1 回ぶんの再試行 (実行ループ)。remaining_jobs のうち RETRY_ORDER にあるものを順に走らせ、結果 [{name, success, summary}] を返す。
  * main() から切り出しただけで動きは同じ (試験が run を差し替えて、上流の規則が実際のループで効いていることを確かめられるように。Codex #1369 R1 #2)
  */
-export function runRetryRound(remainingJobs0, { run = runScript, log = console.log, rerunAfter = RERUN_AFTER, publishGate = { broken: false } } = {}) {
+export function runRetryRound(remainingJobs0, { run = runScript, log = console.log, rerunAfter = RERUN_AFTER, publishGate = { broken: false }, amazonChain = null } = {}) {
   // 「新商品の許可」は同じ照合の回では開かない (拒まれた後の revoke で停止の床が進む) = 必ず「マスタ照合」からやり直す (#1645 Codex R1 Medium)
   const remainingJobs = gateRetryJobs(remainingJobs0);
   const results = []; // {name, success, summary}
   const rerun = new Set();   // この回で上流が成功したので走らせ直す下流 (RERUN_AFTER)
+  // 写しの鎖の回か (呼び手が retry-state から決める。渡されない = remaining に写しがあるとき)
+  const chain = amazonChain ?? remainingJobs.includes(AMAZON_MAP_CHAIN[0]);
 
   for (const jobName of RETRY_ORDER) {
     if (!remainingJobs.includes(jobName) && !rerun.has(jobName)) continue;
@@ -409,6 +415,17 @@ export function runRetryRound(remainingJobs0, { run = runScript, log = console.l
       continue;
     }
 
+    // 写しの鎖の回: 鎖の前の工程がこの回で落ちた (見送りも) = 流さない (次の回に残す)
+    const prev = chain ? chainPrev(jobName) : null;
+    if (prev) {
+      const pa = results.find((r) => r.name === prev);
+      if (pa && !pa.success) {
+        log(`[Retry] ${jobName} スキップ (${prev} 再失敗・Amazon SKU の写しの鎖、次回再試行)`);
+        results.push({ name: jobName, success: false, summary: `⏸️ skipped (${prev} 再失敗・Amazon SKU の写しの鎖)` });
+        continue;
+      }
+    }
+
     // coordinator の工程は env CDB_FINANCE_COORDINATOR=1 のときだけ (勝手に起動しない。切り替え済みでスイッチが消えた = .env を直す・#1567 Codex R6 High)
     if (jobName === 'Amazon決済と財務' && !financeCoordinatorEnabled()) {
       log(`[Retry] ${jobName} スキップ (${FINANCE_COORDINATOR_ENV} が無い)`);
@@ -419,7 +436,15 @@ export function runRetryRound(remainingJobs0, { run = runScript, log = console.l
     const result = run(def.script, jobName, def.timeoutMs, def.args);
     results.push({ name: jobName, ...result });
     if (result && result.success) for (const d of (Object.hasOwn(rerunAfter, jobName) ? rerunAfter[jobName] : [])) rerun.add(d);
+    if (chain && result && result.success && chainNext(jobName)) rerun.add(chainNext(jobName));   // 写しの鎖: 成功したら次の一段だけ
   }
+  // 写しの鎖の途中 (写しの後) で落ちた = その先の工程を「見送り」の失敗として残す (次の回に鎖のまま落ちたところから流す)
+  if (chain) {
+    const i = AMAZON_MAP_CHAIN.findIndex((j, k) => k > 0 && results.some((r) => r.name === j && !r.success));
+    const mapFailed = results.some((r) => r.name === AMAZON_MAP_CHAIN[0] && !r.success);   // 写しそのものが落ちた = 次の回も写しから (鎖を最初から流す)
+    if (i > 0 && !mapFailed) for (const j of AMAZON_MAP_CHAIN.slice(i + 1)) if (!results.some((r) => r.name === j)) results.push({ name: j, success: false, summary: `⏸️ skipped (${AMAZON_MAP_CHAIN[i]} 失敗・Amazon SKU の写しの鎖)` });
+  }
+  results.amazonChainPending = chain && results.some((r) => AMAZON_MAP_CHAIN.includes(r.name) && !r.success);
   return results;
 }
 
@@ -505,7 +530,7 @@ async function runLocked() {
 
   const publishGate = readPublishGate({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') });
   if (publishGate.broken) console.log(`[Retry] ⚠️ Company DB の写しの反映の門 = ${publishGate.state} (${publishGate.reason}) → m_products・上書き表を読む工程は動かさない`);
-  const results = runRetryRound(state.remaining_jobs, { publishGate });
+  const results = runRetryRound(state.remaining_jobs, { publishGate, amazonChain: amazonChainActive(state) });
   // 止めた工程のうち自分で ping を打つもの = fail の ping (送れなくても再試行は続ける)
   for (const r of results.filter((x) => x.gated && x.pingJobId)) {
     try { const { sendPing } = await import('../../scripts/company-db/lz-daily.mjs'); await sendPing(r.pingJobId, { status: 'fail', note: String(r.summary).slice(0, 180) }); }
@@ -562,6 +587,7 @@ async function runLocked() {
       remaining_jobs: stillFailed,
       retry_count: retryCount,
       last_attempt_at: startedAt.toISOString(),
+      amazon_map_chain: results.amazonChainPending === true,   // 写しの鎖の途中 = 次の回も鎖で流す
     });
     if (justSucceeded.length > 0) {
       let msg = `🔄 *Warehouse自動再試行 ${retryCount}回目: 部分復旧* (${duration}秒)\n`;

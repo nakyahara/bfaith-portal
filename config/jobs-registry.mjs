@@ -552,7 +552,7 @@ export const JOBS_REGISTRY = [
       + '(watcher の読むだけの 1 取引・SQLite の 1 取引で差だけ・commit の前に読み直してハッシュを照らす・sync_meta cdb_amazon_map_publish にハッシュ・行数・変更の記録の番号)。'
       + '持ち主が load の今は何もしない (⏭️ exit 0・SQLite を開かない)。daily・自動再試行・手の CLI は同じ実行の鍵 (warehouse.db の job_locks cdb-amazon-map-publish) を PG を読む前から SQLite の commit の後まで持つ。'
       + '断る (古い表は前のまま・❌ = retry に載る) = 0 件・今の古い表の 90% 未満・変更の記録の番号が前の写しより小さい (Company DB の復元?)・受け手の決まりに合わない。'
-      + 'retry では f_sales の上流 (写しが再失敗 = f_sales を作り直さない)・写しが直ったら f_sales → sales_velocity / pml_snapshot / Render同期 を走らせ直す。'
+      + 'retry では f_sales の上流 (写しが再失敗 = f_sales を作り直さない)。写しが retry に載った日だけ「写しの鎖」= 写しが直ったら f_sales → sales_velocity → pml_snapshot → Render同期 を一段ずつ (途中で落ちたらその先は残す。retry-state の amazon_map_chain)。持ち主 load の今の retry は前のまま。'
       + 'ping は打たない (この台帳の 1 工程)。新しい定期実行は無い)',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
