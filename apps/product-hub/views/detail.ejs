@@ -952,7 +952,9 @@ th.attr-unknown { color: #dc2626; }
               プルダウンの有無とは別 — 混ぜると文が実物と合わない。Codex R4 P3) %>
           <% const shipPickerShown = !!(neCost && !neCost.costVaries && neCost.costExTax != null && neCost.shippingCost != null); %>
           <% if (shipPickerShown) { %>
-            <div class="muted" style="font-size:11px;">※ここは楽天へ送る配送方法です。変えると左の「配送方法で試算」も合わせて利益を計算し直します (送料が複数ある配送方法は選び直せます)</div>
+            <%# 候補が無い配送方法 (NE 側に同じ系統の便が無い) では左に「変えていません」と出るので、
+                ここで言い切らない (左右で食い違う — Codex R9 P3) %>
+            <div class="muted" style="font-size:11px;">※ここは楽天へ送る配送方法です。変えると左の「配送方法で試算」も合わせて利益を計算し直します (対応するNEの配送方法が無いときは左にそう出ます。送料が複数あるものは選び直せます)</div>
           <% } else if (neCost && neCost.costVaries) { %>
             <%# 原価がSKUで異なる商品は「配送方法で試算」が出ない。SKU表の利益は NE の送料のまま %>
             <div class="muted" style="font-size:11px;">※ここは楽天へ送る配送方法です。この商品はSKUごとに原価が違うため、利益は右のSKU表に<strong>NEの送料のまま</strong>出ます (ここの配送方法には追従しません)</div>

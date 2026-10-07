@@ -10566,12 +10566,148 @@ for (const [name, file, data] of renders) {
     && withPicker.includes('"picks":{'), String(withPicker.length));
   check('配送費の試算: 基本情報の注記は「左の配送方法で試算も合わせて計算し直す」',
     withPicker.includes('変えると左の「配送方法で試算」も合わせて利益を計算し直します'));
+  // 🚨 当てはまる NE の便が無い配送方法では左に「変えていません」と出る。
+  //    ここで言い切ると左右で食い違う (Codex R9 P3)
+  check('配送費の試算: 基本情報の注記は「候補が無いときは左にそう出る」まで書く',
+    withPicker.includes('対応するNEの配送方法が無いときは左にそう出ます'));
   // 🚨 原価がSKUで異なる商品は対象外 (2026-10-07 中原さんの決定)。嘘の案内を出さないこと
   check('🚨 配送費の試算: 原価がSKUで異なる商品には「配送方法で試算」を出さない',
     skuVaries.length > 0 && !skuVaries.includes('id="profit-ship-select"'), String(skuVaries.length));
   check('🚨 配送費の試算: その商品には「SKU表に NE の送料のまま出る」と書く (追従しないと明示)',
     skuVaries.includes('NEの送料のまま') && skuVaries.includes('ここの配送方法には追従しません')
     && !skuVaries.includes('変えると左の「配送方法で試算」も合わせて利益を計算し直します'));
+}
+
+{
+  // ─── 画面の連続操作 (2026-10-07)。偽の DOM に initProfitShipPicker をそのまま載せて、
+  //     「初期表示 → 自分で選び直す → ヤフーだけ変える → 配送方法を変える → 候補が無い配送方法」
+  //     を続けて動かし、**配送費・注記・再計算の回数**を見る。
+  //     ソース検査と純粋関数だけだと「候補は組み直すが選択が動かない」(今回の報告) や
+  //     ハンドラの二重登録が素通りする (Codex R9 P2) ───
+  const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+  const from = src.indexOf('    function decideProfitShip(');
+  const to = src.indexOf('    })();', src.indexOf('    (function initProfitShipPicker()'));
+  const chunk = from >= 0 && to > from ? src.slice(from, to + '    })();'.length) : '';
+  check('画面の試算: detail.ejs から配送方法ピッカーを丸ごと切り出せる',
+    chunk.includes('initProfitShipPicker') && chunk.includes('decideProfitShip'), String(chunk.length));
+
+  const fakeEl = () => {
+    const el = {
+      _opts: [], _listeners: {}, value: '', dataset: {}, textContent: '', hidden: false,
+      replaceChildren() { el._opts = []; },
+      appendChild(c) { if (c._group) el._opts.push(...c._opts); else el._opts.push(c); },
+      get selectedOptions() { const o = el._opts.find((x) => x.value === el.value); return o ? [o] : []; },
+      closest() { return { hidden: false }; },
+      addEventListener(t, f) { (el._listeners[t] = el._listeners[t] || []).push(f); },
+      fire(t) { for (const f of el._listeners[t] || []) f(); },
+      methods: () => el._opts.map((o) => o.value),
+    };
+    return el;
+  };
+  const fakeStore = () => {
+    let raw = null;
+    return { get raw() { return raw; }, getItem: () => raw, setItem: (_k, v) => { raw = v; }, removeItem: () => { raw = null; } };
+  };
+  function mount({ options, picks, labels, hints, neCurrent, rkValue, store: given }) {
+    const sel = fakeEl();
+    sel.dataset.current = neCurrent;
+    const note = fakeEl();
+    const holder = fakeEl();
+    holder.textContent = JSON.stringify({ options, picks, labels, hints });
+    const rk = fakeEl();
+    rk.value = rkValue;
+    const store = given || fakeStore();
+    const byId = {
+      'profit-ship-select': sel, 'profit-ship-note': note,
+      'profit-ship-data': holder, 'rk-shipping-group': rk,
+    };
+    const document2 = {
+      getElementById: (id) => byId[id] || null,
+      createElement: (tag) => (tag === 'optgroup'
+        ? { _group: true, _opts: [], label: '', appendChild(c) { this._opts.push(c); } }
+        : { value: '', dataset: {}, textContent: '' }),
+    };
+    let renders = 0;
+    const api = new Function('document', 'window', 'render', `
+      let ship = NaN;
+      ${chunk}
+      return { getShip: () => ship };
+    `)(document2, { sessionStorage: store }, () => { renders += 1; });
+    return {
+      sel, note, rk, store, api,
+      ship: () => api.getShip(),
+      renders: () => renders,
+      pick: (m) => { sel.value = m; sel.fire('change'); },
+      setGroup: (v) => { rk.value = v; rk.fire('change'); },
+    };
+  }
+
+  const options = [
+    { method: '定形内（50g以内）', cost: 146, count: 12 },
+    { method: '定形外規格内（50g以内）', cost: 182, count: 900 },
+    { method: 'ネコポス', cost: 237, count: 3832, isCurrent: true },
+    { method: '定形外規格外（1kg以内）', cost: 510, count: 40 },
+    { method: '宅急便60サイズ', cost: 538, count: 417 },
+  ];
+  const hints = vari.RAKUTEN_GROUP_NE_HINTS;
+  const labels = listing.ALL_SHIPPING_METHOD_GROUPS;
+  const picks = vari.profitShipPickByGroup(options, hints, labels);
+  const m = mount({ options, picks, labels, hints, neCurrent: 'ネコポス', rkValue: '1y5' });
+
+  // ① 開いた直後 = 保存済みの楽天配送方法 (定形外) に合わせる。これが報告そのもの
+  check('🚨 画面の試算: 定形外で保存済みの商品を開くと配送費が定形外のものになる (NEのネコポスのままにしない)',
+    m.ship() === 182 && m.sel.value === '定形外規格内（50g以内）', String(m.ship()));
+  check('画面の試算: 開いた時点で利益を計算し直している', m.renders() >= 1, String(m.renders()));
+  check('画面の試算: 注記は「試算: …」から始まる 3 行', m.note.textContent.split(String.fromCharCode(10)).length === 3
+    && m.note.textContent.startsWith('試算: '), m.note.textContent);
+  check('画面の試算: 候補は選択肢として全部並ぶ (絞り込みではなく並べ替え)',
+    m.sel.methods().length === options.length, JSON.stringify(m.sel.methods()));
+  check('🚨 画面の試算: ハンドラは1つずつ (二重登録で人の選択を奪わない)',
+    m.sel._listeners.change.length === 1 && m.rk._listeners.change.length === 1);
+
+  // ② 大きさが違うので自分で選び直す
+  const before = m.renders();
+  m.pick('定形外規格外（1kg以内）');
+  check('🚨 画面の試算: 自分で選び直すと配送費が変わって計算し直す',
+    m.ship() === 510 && m.renders() > before, String(m.ship()));
+  check('画面の試算: 自分で選んだら「合わせました」ではなく今までどおりの注記',
+    m.note.textContent.includes('ここでの変更は試算だけで'), m.note.textContent);
+  check('画面の試算: 選んだ便をこのタブに覚える (保存の読み直しをまたぐため)',
+    JSON.parse(m.store.raw || '{}').method === '定形外規格外（1kg以内）', String(m.store.raw));
+
+  // ③ ヤフーだけ変える (1y5 → 1y8) = 楽天の配送方法は変わっていない
+  m.setGroup('1y8');
+  check('🚨 画面の試算: ヤフーだけ変えても人の選択を奪わない',
+    m.ship() === 510 && m.sel.value === '定形外規格外（1kg以内）', String(m.ship()));
+
+  // ④ 配送方法そのものを変える = 試算も合わせる (前の選択は忘れる)
+  m.setGroup('5');
+  check('🚨 画面の試算: 配送方法をネコポスに変えると NE の実送料で試算し直す',
+    m.ship() === 237 && m.sel.value === 'ネコポス', String(m.ship()));
+  check('画面の試算: 配送方法を変えたら前の選択は忘れる', m.store.raw === null, String(m.store.raw));
+
+  // ⑤ 当てはまる便が無い配送方法 = 変えない + 理由を出す
+  m.setGroup('4');
+  check('🚨 画面の試算: 当てはまる便が無い配送方法では選択を動かさず理由を出す',
+    m.ship() === 237 && m.note.textContent.includes('試算できる NE の配送方法が選択肢にありません'),
+    m.note.textContent);
+
+  // ⑥ 未選択に戻す = 合わせ先が無いだけ。選択は動かさない
+  m.setGroup('');
+  check('画面の試算: 未選択 (— 選んでください) に戻しても選択は動かない', m.ship() === 237);
+
+  // ⑦ 保存 → 読み直し (同じタブ = 同じ sessionStorage)。人が選んだ便が残る
+  const shared = fakeStore();
+  const a = mount({ options, picks, labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: shared });
+  check('画面の試算: 覚えた便が無ければ、開いたときは配送方法に合わせる (前提の確認)',
+    a.ship() === 182, String(a.ship()));
+  a.pick('定形外規格外（1kg以内）');
+  const b = mount({ options, picks, labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: shared });
+  check('🚨 画面の試算: 保存の読み直し後も、人が選んだ便で試算する (最多候補へ戻さない)',
+    b.ship() === 510 && b.sel.value === '定形外規格外（1kg以内）', String(b.ship()));
+  const c = mount({ options, picks, labels, hints, neCurrent: 'ネコポス', rkValue: '5', store: shared });
+  check('🚨 画面の試算: 別タブで配送方法が変わっていたら古い選択は捨てて合わせ直す',
+    c.ship() === 237 && c.sel.value === 'ネコポス', String(c.ship()));
 }
 
 // ─── 白抜き画像の受信箱 (2026-09-14): 画像タブの白抜きの枠にボタン + 選択画面。JS への値は data 属性で渡す ───
