@@ -5460,8 +5460,10 @@ th.attr-unknown { color: #dc2626; }
         //    終えたので消す。残すと、その便がまた選択肢から消えたときに復活して利益が
         //    勝手に変わる (Codex R16 P2)。
         //    🚨 **選ばれた便が carry と同じ名前でも消す** — 名前で比べると、同名の候補が
-        //    現れたときだけ掃除し忘れて、あとで復活する (Codex R22 P2)
-        if (rem && rem.kind === 'carry' && follow && data.picks?.[group]) mine.forget();
+        //    現れたときだけ掃除し忘れて、あとで復活する (Codex R22 P2)。
+        //    🚨 **使われなかった carry も消す** — 覚えた便が選択肢から消えたときに残すと、
+        //    その便が在庫に戻ったときに勝手に古い便へ戻る (Codex R29 P2)
+        if (rem && rem.kind === 'carry' && (data.picks?.[group] || d.method !== rem.method)) mine.forget();
         followed = d.followed;
         // 覚えていた「人の選択」を戻したときは、人が選んだものとして扱う (0円でも出す)。
         // 🚨 ただし**選んだときの送料と同じ**ときだけ。あとで NE 同期で 0円 に変わった便を

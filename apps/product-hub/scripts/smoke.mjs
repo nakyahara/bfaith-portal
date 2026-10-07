@@ -10979,6 +10979,28 @@ for (const [name, file, data] of renders) {
     check('画面の試算: そのとき利益は NE の送料のまま (0円で計算しない)', mz.profit() === '837円', mz.profit());
   }
 
+  // ⑤'' 🚨 覚えた「残した便」が選択肢から消えたら、その記録も消す。残すと、その便が
+  //      在庫に戻ったときに勝手に古い便へ戻って利益が変わる (Codex R29 P2)
+  {
+    const st10 = fakeStore();
+    const k1 = mount({ ...base0, rkValue: '1', store: st10 });
+    k1.pick('定形外規格外（1kg以内）');
+    k1.setGroup('4');   // 当てはまる便なし → carry として残る
+    check('画面の試算: carry が残っている (前提の確認)',
+      JSON.parse(st10.raw || '{}').kind === 'carry', String(st10.raw));
+    const gone = options.filter((o) => o.method !== '定形外規格外（1kg以内）');
+    const k2 = mount({
+      options: gone, picks: vari.profitShipPickByGroup(gone, hints, labels),
+      near: vari.profitShipNearByGroup(gone, hints, labels),
+      labels, hints, neCurrent: 'ネコポス', rkValue: '4', store: st10,
+    });
+    check('🚨 画面の試算: 覚えた便が選択肢から消えたら記録も消す',
+      st10.raw === null, String(st10.raw) + ' / ' + k2.sel.value);
+    const back = mount({ ...base0, rkValue: '4', store: st10 });
+    check('🚨 画面の試算: その便が在庫に戻っても古い選択へ勝手に戻らない (837円)',
+      back.profit() === '837円' && back.sel.value === 'ネコポス', back.profit() + ' / ' + back.sel.value);
+  }
+
   // ⑪' 🚨 NE の送料が 0円 (未入力) の商品は、人が選ぶまで利益を出さない。
   //      出すと「送料タダ」として計算して利益を過大に見せる (Codex R27 P1)
   {
