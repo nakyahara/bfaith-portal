@@ -10613,6 +10613,12 @@ for (const [name, file, data] of renders) {
   check('🚨 配送費の試算: その商品には「SKU表に NE の送料のまま出る」と書く (追従しないと明示)',
     skuVaries.includes('NEの送料のまま') && skuVaries.includes('ここの配送方法には追従しません')
     && !skuVaries.includes('変えると左の「配送方法で試算」も合わせて利益を計算し直します'));
+  // 🚨 (B) の約束を数で固定する: SKU 表の利益は **NE の送料 (237円)** で計算される。
+  //    ここが「配送方法で試算」の値になったら、注記 (追従しません) が嘘になる
+  check('🚨 配送費の試算: SKU表の各行は NE の送料を持つ (楽天の配送方法ではない)',
+    (skuVaries.match(/data-ship="237"/g) || []).length >= 1
+    && !/data-ship="(182|510|146)"/.test(skuVaries),
+    (skuVaries.match(/data-ship="[^"]*"/g) || []).join(','));
 }
 
 {
@@ -10932,6 +10938,20 @@ for (const [name, file, data] of renders) {
     });
     check('🚨 通し確認: 定形外で保存済みの商品を開くと、利益額が 892円 (配送費 182円) で出る',
       mE2.profit() === '892円' && mE2.shipCost() === '182', mE2.profit() + ' / ' + mE2.body.textContent);
+    // 🚨 管理画面の割当 (ph_shipping_method_map) が本番の経路でも効くこと。
+    //    router が neShipAssigned を渡し忘れたらここで落ちる (Codex R20 P3)
+    db.prepare(`INSERT OR REPLACE INTO ph_shipping_method_map (ne_label, rakuten_group)
+      VALUES ('定形外規格外（1kg以内）', '4')`).run();
+    const htmlE3 = await (await fetch(`${base2}/detail/${idE2}`)).text();
+    const dataE3 = JSON.parse(String((htmlE3.match(holderRe) || [])[1] || '{}').replace(/\\u003c/g, '<'));
+    check('🚨 通し確認: 管理画面の割当が本番の画面に効く (定形外規格外 を ゆうパック に割り当てた)',
+      dataE3.picks?.['4']?.method === '定形外規格外（1kg以内）'
+      && !(dataE3.near?.['1'] || []).includes('定形外規格外（1kg以内）'),
+      JSON.stringify({ g4: dataE3.picks?.['4'], near1: dataE3.near?.['1'] }));
+    check('通し確認: 割り当てを外した便は元のグループの合わせ先から消える',
+      dataE3.picks?.['1']?.method === '定形外規格内（50g以内）' && dataE3.picks['1'].candidates === 1,
+      JSON.stringify(dataE3.picks?.['1']));
+    db.prepare("DELETE FROM ph_shipping_method_map WHERE ne_label = '定形外規格外（1kg以内）'").run();
     server2.close();
     db.prepare('DELETE FROM mirror_products WHERE product_id BETWEEN 99700 AND 99799').run();
   }
