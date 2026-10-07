@@ -501,6 +501,53 @@ await ta('[8d] commit の直前に回の鍵を確かめ直す (#1649 Codex R4 Me
   assert.equal((await publish(E)).state, 'applied');
 });
 
+await ta('[8e] 断る起動は SQLite を開かない・--dry-run は既にある warehouse.db を読むだけで開く (#1649 Codex R5 Medium)', async () => {
+  // 回の鍵を持たない起動 = 開く前に断る (開く口を 1 度も呼ばない)
+  let opened = 0;
+  const r = await cli(E, ['--daily'], { runLockHeld: () => null, openSqlite: async () => { opened++; return sq; } });
+  assert.deepEqual([r.code, opened], [1, 0]); assert.match(r.last, /持つ親から起動されていない/);
+  // 読むだけで開く口: readonly・書けない・無いファイルは作らずに投げる
+  const ro = P.openWarehouseReadonly(tmp);
+  try {
+    assert.equal(ro.readonly, true);
+    assert.throws(() => ro.prepare("INSERT INTO sync_meta (key, value) VALUES ('x', 'y')").run(), /readonly/i);
+  } finally { ro.close(); }
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'amzA-ro-'));
+  try {
+    assert.throws(() => P.openWarehouseReadonly(fresh));
+    assert.equal(fs.existsSync(path.join(fresh, 'warehouse.db')), false);
+    // 本物の入口 (別のプロセス・開く口を差し替えない): 持ち主 company の Company DB の代わりで、断る直接実行と試しを流す = 無い warehouse.db を作らない
+    const child = path.join(fresh, 'child.mjs');
+    fs.writeFileSync(child, [
+      `import { cli } from ${JSON.stringify(new URL('../apps/company-db/publish/amazon-map.mjs', import.meta.url).href)};`,
+      `import { ownershipHash } from ${JSON.stringify(new URL('../lib/master-cutover.mjs', import.meta.url).href)};`,
+      `import { OWNED_COLUMNS } from ${JSON.stringify(new URL('../config/master-ownership.mjs', import.meta.url).href)};`,
+      `const map = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'company']));`,
+      `const db = { query: async (q) => (/to_regclass/.test(q) ? { rows: [{ ok: true }] } : /from ops\\.master_ownership_state/.test(q) ? { rows: [{ active_hash: ownershipHash(map), active_map: map, activated_at: null, activated_by: null, prepared_hash: null, prepared_map: null }] } : { rows: [] }) };`,
+      `const r = await cli(process.argv.slice(3), { env: { DATA_DIR: process.argv[2], COMPANY_DB_WATCH_URL: 'postgres://x' }, connectFor: () => async () => ({ db, close: async () => {} }), log: () => {} });`,
+      `console.log(JSON.stringify(r));`,
+    ].join('\n'));
+    const { spawnSync } = await import('node:child_process');
+    const dataDir = path.join(fresh, 'data');
+    fs.mkdirSync(dataDir);
+    for (const argv of [['--daily'], ['--chain'], ['--dry-run']]) {
+      const out = spawnSync(process.execPath, [child, dataDir, ...argv], { encoding: 'utf8', env: { ...process.env, DATA_DIR: dataDir } });
+      const res = JSON.parse(out.stdout.trim().split('\n').pop());
+      assert.equal(res.code, 1, `${argv} ${out.stderr}`);
+      if (argv[0] !== '--dry-run') assert.match(res.last, /持つ親から起動されていない/);
+      assert.deepEqual(fs.readdirSync(dataDir), [], `${argv}: warehouse.db を作った`);
+    }
+  } finally { fs.rmSync(fresh, { recursive: true, force: true }); }
+  // 試しは今の warehouse.db を書かない (ファイルの中身が同じ)
+  sq.pragma('wal_checkpoint(TRUNCATE)');
+  const sha = () => crypto.createHash('sha256').update(fs.readFileSync(WH_FILE)).digest('hex');
+  const h0 = sha();
+  const dr = await P.cli(['--dry-run'], { env: { DATA_DIR: tmp, COMPANY_DB_WATCH_URL: 'postgres://watcher@localhost/x' }, connectFor: () => watcherConnect(E), log: quiet });
+  assert.equal(dr.code, 0, dr.last); assert.match(dr.last, /試し・書かない/);
+  sq.pragma('wal_checkpoint(TRUNCATE)');
+  assert.equal(sha(), h0);
+});
+
 await ta('[8c] 肯定の手がかり (#1649 Codex R3 Medium 2): config が company・有効な写しの記録 = あり / どちらも無い・読めない記録 = なし。daily-sync は手がかりが無い朝の写しの失敗 (子の timeout など) を retry に載せない', async () => {
   const LOAD = { ...ALL_LOAD };
   assert.equal(P.amazonMapHint({ dataDir: tmp, ownership: { ...LOAD, 'listing_components.amazon': 'company' }, readMeta: () => null }), 'config');

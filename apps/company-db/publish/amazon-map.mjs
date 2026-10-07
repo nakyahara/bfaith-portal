@@ -98,6 +98,10 @@ export function readMetaReadonly(dataDir) {
   const db = new Database(file, { readonly: true, fileMustExist: true });
   try { return readMeta(db); } finally { db.close(); }
 }
+/** warehouse.db を読むだけで開く (試し = --dry-run。ファイルが無い = 投げる = 作らない) */
+export function openWarehouseReadonly(dataDir) {
+  return new Database(path.join(dataDir, 'warehouse.db'), { readonly: true, fileMustExist: true });
+}
 /**
  * 持ち主が company だという**肯定の**手がかり (#1649 Codex R3 Medium 2): config (configured) が company = 'config' / 有効な写しの記録がある = 'meta' / 無い = null。
  *   daily-sync はこれが無い朝、写しの子の異常終了 (timeout・abort・起動の失敗) だけを理由に写しを retry-state に載せない・retry は写しの鎖を効かせない
@@ -276,17 +280,18 @@ export async function runAmazonMapPublish({ connect, getSqlite, now = () => new 
     if (owner.owner !== 'company') {
       return { state: 'not_applied', code: EXIT.ok, line: `⏭️ ${STEP_NAME}: 持ち主が load (Company DB の active) = 写さない (古い表は今のまま)` };
     }
-    sqlite = await getSqlite();
     // 2 鍵 (PG の対応を読む前から SQLite の commit の後まで)。試し (--dry-run) は書かない = 鍵も取らない
     //   🚨 書くのは回の鍵 (daily-sync / 再試行の data/*.lock.json) を持つ親の子だけ (#1649 Codex R3 High)。daily・retry・手の口 (retry-failed-jobs.js --amazon-map-chain) は
     //   同じ回の鍵で 1 つずつ = 回の f_sales〜Render同期 の間に別の写しが新しい対応を入れる道が無い。鍵の順 = 回の鍵 (親) → 写しの鍵 (待たない)
+    //   回の鍵の確かめは SQLite を開く前 (断る起動は warehouse.db を開かない = initDB の表づくりも走らない。#1649 Codex R5 Medium)
     if (!dryRun) {
       held = runLockHeld();
       if (!held) return { state: 'no_run_lock', code: EXIT.error, line: `❌ ${STEP_NAME}: 回の鍵 (daily-sync / 再試行) を持つ親から起動されていない = 書かない。手で写すのは node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain (写し → f_sales → 速度 → リスト → Render同期 を一続きで)・差を見るのは --dry-run` };
+      sqlite = await getSqlite();
       lock = acquireLock(sqlite, LOCK_NAME, { ttlMs: lockTtlMs });
       if (!lock) return { state: 'lock_busy', code: EXIT.lock_busy, line: `❌ ${STEP_NAME}: 別の写しが動いている (鍵 ${LOCK_NAME}) = 何もしない (show-job-locks.js で確かめる・daily-sync はこの朝の f_sales 以降を retry に残す)` };
       if (afterLock) await afterLock();
-    }
+    } else sqlite = await getSqlite();   // 試し = 呼び手が読むだけで開く (cli = openWarehouseReadonly)
     await db.query('begin transaction isolation level repeatable read read only');
     let src;
     try { src = await readAmazonMapSource(db); } finally { try { await db.query('rollback'); } catch { /* */ } }
@@ -384,12 +389,15 @@ export async function cli(argv, { env = process.env, connectFor = null, openSqli
       if (!url) ({ code, last } = await unreadable('未設定 COMPANY_DB_WATCH_URL'));
       else {
         const connect = connectFor ? connectFor(url) : async () => (await import('../master-compare/run.mjs')).connectWatcher(url);
-        const getSqlite = async () => (openSqlite ? openSqlite(dataDir) : (async () => {
+        // 試し (--dry-run) = 既にある warehouse.db を読むだけで開く (initDB を通さない = 表づくり・view の作り直しもしない。無ければ作らずに断る。#1649 Codex R5 Medium)
+        let readonlyDb = null;
+        const getSqlite = async () => (openSqlite ? openSqlite(dataDir) : a.dryRun ? (readonlyDb = openWarehouseReadonly(dataDir)) : (async () => {
           if (a.dataDir) process.env.DATA_DIR = dataDir;   // db.js は import の時に DATA_DIR を読む (この後で初めて import する)
           const { initDB } = await import('../../warehouse/db.js');
           return initDB();
         })());
         let r = null, ownerErr = null;
+        try {
         try {
           r = await run({ connect, getSqlite, now, dryRun: a.dryRun, allowShrink: a.allowShrink, acceptRestore: a.acceptRestore, expectHash: a.expectHash, manual: a.chain, beforeCommit, afterLock,
             runLockHeld: runLockHeld || (() => runLockHeldByParent()), ...(runLockStill ? { runLockStill } : {}) });
@@ -398,6 +406,7 @@ export async function cli(argv, { env = process.env, connectFor = null, openSqli
           if (e && e.ownerStage) ownerErr = e;
           else throw e;
         }
+        } finally { if (readonlyDb) { try { readonlyDb.close(); } catch { /* */ } } }
         if (ownerErr) ({ code, last } = await unreadable(String(ownerErr.message || ownerErr).replace(/\s+/g, ' ').slice(0, 160)));
         else {
           code = r.code; last = r.line;
