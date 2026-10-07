@@ -174,6 +174,16 @@ export const UPSTREAM_OF = {
 export const AMAZON_MAP_CHAIN = Object.freeze(['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期']);
 const chainPrev = (j) => { const i = AMAZON_MAP_CHAIN.indexOf(j); return i > 0 ? AMAZON_MAP_CHAIN[i - 1] : null; };
 const chainNext = (j) => { const i = AMAZON_MAP_CHAIN.indexOf(j); return i >= 0 && i < AMAZON_MAP_CHAIN.length - 1 ? AMAZON_MAP_CHAIN[i + 1] : null; };
+/**
+ * 写しが「持ち主 load = 何も書いていない」(amazon-map.mjs の not_applied = ⏭️ の行) で終わったか (⑦-2 PR-C)。
+ *   config (configured) が company・DB の active が load の間 (配ってから widen まで) は、持ち主を読めない朝の写しが config を手がかりに ❌ = retry に載り、
+ *   写しの鎖が効く。retry で持ち主を読めて ⏭️ で直った回は古い表が前のまま = その後は鎖の回でない (今の本番の retry と同じ: f_sales 以降を走らせ直さない・
+ *   鎖の見送りもしない・retry-state の鎖の印も消える。朝の f_sales・Render同期 は同じ古い表で作った)。
+ *   鎖が要るのは持ち主が company の朝 (鍵待ち exit 73 で f_sales 以降を見送った朝) だけ。その後に load に戻る道は無い (widen は戻せない) = これに当たらない。
+ *   行の形は試験 (test-retry-rerun.mjs [4f]) が amazon-map.mjs の本物の行で確かめる
+ */
+export const MAP_NOT_APPLIED_RE = /^⏭️ CompanyDB写し\(Amazon SKU\): 持ち主が load/;
+export const mapWroteNothing = (r) => !!r && r.success === true && MAP_NOT_APPLIED_RE.test(String(r.summary || '').trim());
 /** この回が写しの鎖の回か (前の回が鎖の途中で終わった = amazon_map_chain / 写しが remaining にある) */
 export function amazonChainActive(state) {
   return !!state && (state.amazon_map_chain === true || (Array.isArray(state.remaining_jobs) && state.remaining_jobs.includes(AMAZON_MAP_CHAIN[0])));
@@ -374,7 +384,8 @@ export function runRetryRound(remainingJobs0, { run = runScript, log = console.l
   const results = []; // {name, success, summary}
   const rerun = new Set();   // この回で上流が成功したので走らせ直す下流 (RERUN_AFTER)
   // 写しの鎖の回か (呼び手が retry-state から決める。渡されない = remaining に写しがあるとき)
-  const chain = amazonChain ?? remainingJobs.includes(AMAZON_MAP_CHAIN[0]);
+  //   🆕 PR-C: この回の写しが ⏭️ (持ち主 load = 何も書いていない) で終わったら、その後は鎖の回ではない (今の本番の retry と同じ = mapWroteNothing)
+  let chain = amazonChain ?? remainingJobs.includes(AMAZON_MAP_CHAIN[0]);
 
   for (const jobName of RETRY_ORDER) {
     if (!remainingJobs.includes(jobName) && !rerun.has(jobName)) continue;
@@ -436,6 +447,11 @@ export function runRetryRound(remainingJobs0, { run = runScript, log = console.l
     const result = run(def.script, jobName, def.timeoutMs, def.args);
     results.push({ name: jobName, ...result });
     if (result && result.success) for (const d of (Object.hasOwn(rerunAfter, jobName) ? rerunAfter[jobName] : [])) rerun.add(d);
+    // 写しが ⏭️ (持ち主 load = 古い表に何も書いていない) = この回は鎖の回でなくなる (f_sales 以降を走らせ直さない・鎖の見送りもしない・retry-state の鎖の印も消える。PR-C)
+    if (chain && jobName === AMAZON_MAP_CHAIN[0] && mapWroteNothing(result)) {
+      chain = false;
+      log(`[Retry] ${jobName} は持ち主 load (何も書いていない) = 写しの鎖を外す (f_sales 以降は走らせ直さない)`);
+    }
     if (chain && result && result.success && chainNext(jobName)) rerun.add(chainNext(jobName));   // 写しの鎖: 成功したら次の一段だけ
   }
   // 写しの鎖の途中 (写しの後) で落ちた = その先の工程を「見送り」の失敗として残す (次の回に鎖のまま落ちたところから流す)

@@ -177,11 +177,20 @@ await ta('[1] 持ち主が load (記録の行が無い DB・10/5 の 13 キー�
 await ta('[1] 持ち主を読めない: config も前の写しの記録も load = ⚠️ exit 0 (retry に載せない) / config が company・記録がある = ❌ exit 1。止める env = ⚠️ exit 0 (試しは流せる)', async () => {
   const before = sqSnap();
   const down = () => async () => { throw Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5432'), { code: 'ECONNREFUSED' }); };
-  const a = await cli(E1, ['--daily'], { connectFor: down, readHintMeta: async () => null });
+  // config も load (⑦-2 PR-C の前の config) = ⚠️ exit 0
+  const a = await cli(E1, ['--daily'], { connectFor: down, readHintMeta: async () => null, ownership: ALL_LOAD });
   assert.equal(a.code, 0); assert.match(a.last, /^⚠️ .*持ち主を読めない .*ECONNREFUSED.*config も前の写しの記録も load/);
-  const b = await cli(E1, ['--daily'], { env: { COMPANY_DB_WATCH_URL: '' }, readHintMeta: async () => null });
+  const b = await cli(E1, ['--daily'], { env: { COMPANY_DB_WATCH_URL: '' }, readHintMeta: async () => null, ownership: ALL_LOAD });
   assert.equal(b.code, 0); assert.match(b.last, /^⚠️ .*未設定 COMPANY_DB_WATCH_URL/);
-  const c = await cli(E1, ['--daily'], { connectFor: down, readHintMeta: async () => ({ content_hash: 'x' }) });
+  // ⑦-2 PR-C (10/8) からの本物の config (configured の Amazon = company) = 配ってから widen までの間 (DB の active は load) も、読めない朝は ❌ exit 1 (retry に載る)。
+  //   文は「widen の前は active が load のこともある」と添える。持ち主を読めた朝は ⏭️ exit 0 のまま (上の [1])
+  assert.equal((await import('../config/master-ownership.mjs')).MASTER_OWNERSHIP['listing_components.amazon'], 'company');
+  const a2 = await cli(E1, ['--daily'], { connectFor: down, readHintMeta: async () => null });
+  assert.equal(a2.code, 1); assert.match(a2.last, /^❌ .*持ち主を読めない .*ECONNREFUSED.*config が company。widen の前 \(配ってから widen まで\) なら DB の active は load のこともある/);
+  const b2 = await cli(E1, ['--daily'], { env: { COMPANY_DB_WATCH_URL: '' }, readHintMeta: async () => null });
+  assert.equal(b2.code, 1); assert.match(b2.last, /^❌ .*未設定 COMPANY_DB_WATCH_URL/);
+  assert.equal(P.amazonMapHint({ dataDir: tmp, readMeta: () => null }), 'config');   // 既定 = 本物の config
+  const c = await cli(E1, ['--daily'], { connectFor: down, readHintMeta: async () => ({ content_hash: 'x' }), ownership: ALL_LOAD });
   assert.equal(c.code, 1); assert.match(c.last, /^❌ .*前に写した記録がある/);
   const d = await cli(E1, ['--daily'], { connectFor: down, readHintMeta: async () => null, ownership: { ...ALL_LOAD, 'listing_components.amazon': 'company' } });
   assert.equal(d.code, 1); assert.match(d.last, /config が company/);

@@ -816,6 +816,7 @@ async function main() {
   let cdbAmazonMapResult = runScript('apps/company-db/publish/amazon-map.mjs --daily', 'Company DB の Amazon SKU の写し', 300000);
   // 失敗した朝: 持ち主が company の肯定の手がかり (config が company・有効な写しの記録) が無ければ retry に載せない (blocked)。
   //   子の異常終了 (timeout・abort・起動の失敗) で、今の本番 (load) の retry に写しの鎖を持ち込まない (#1649 Codex R3 Medium 2)。読み込めない = そのまま (retry に載る側)
+  //   🆕 ⑦-2 PR-C から config が company = 手がかりあり (配ってから widen までも)。retry で写しが ⏭️ (持ち主 load) で直れば鎖は外れる (retry-failed-jobs.js の mapWroteNothing)
   if (!cdbAmazonMapResult.success) {
     try {
       const AM = await import('../company-db/publish/amazon-map.mjs');

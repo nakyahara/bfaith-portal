@@ -20,13 +20,22 @@
  *    夜間ロード (Render) とその朝の照合 ① (miniPC) は同じ build でなければならない = 朝の照合の後〜次の夜間ロードの前に両方へ配り、build と configured_hash を両方で確かめる (revert も同じ・Codex #1646 R1)。
  *    切替の日に人が readiness → prepare → frozen → 書きかけ 0 → 最後の active (全部 load) のロード (prepare をまたいだ古い書き込みの回収) → そのロードの run_id の report の成功 + 照合 ② →
  *    --use-prepared のロード → 写し・確かめ → activate で active にする (AI_reference 17 §4.2 の表が正・#1610)。
- * 🆕 2026-10-05 の切替 (中原さんの決定 10/4・10 §13) で C にした 13 キー = 下の 'company' (skus.sku_kind を除く)。写せない・手当ての PR が無い列 (products.parent・
- *    sku_components・listing_components.amazon・suppliers の 4 つ) は 'load' のまま (⑦-2・④b の後)
+ * 🆕 2026-10-05 の切替 (中原さんの決定 10/4・10 §13) で C にした 13 キー = 下の 'company' (skus.sku_kind・listing_components.amazon を除く)。写せない・手当ての PR が無い列
+ *    (products.parent・sku_components・suppliers の 3 つ) は 'load' のまま (④b の後)
  * 🆕 2026-10-07 skus.sku_kind = 'company' (広げる道の手順の 1 = configured。中原さんの決定 10/6)。扱いのコードは #1641 (capable)・DB は 0058・画面と門は #1640 で配り済み。
- *    これを Render と miniPC の両方に配ってから `master-ownership-epoch.mjs prepare --widen --company 1` (足すキー = configured の company − active = skus.sku_kind だけ)
- *    → … → widen で DB の active に入った時に初めて切り替わる。配ってから widen までの間は DB の active (sku_kind = load) のまま = 今までの動き
+ *    10/7 13:48 に widen 済み = DB の active も company (active は 14 キー)。
  *    (以前の「ここだけ書き換えて配らない」は protocol 1 の画面が配った config を DB の記録と照らしていた頃の注意。protocol 2 では当てはまらない)。
- *    company になったときの動き:
+ * 🆕 2026-10-08 listing_components.amazon = 'company' (Amazon SKU の対応 ⑦-2 PR-C = configured)。扱いのコードは ⑦-1 と ⑦-2 PR-A (#1649・capable・古い表への写し)・
+ *    DB の広げる許可は PR-B (#1648・0059)。これを Render と miniPC の両方に配ってから `master-ownership-epoch.mjs prepare --widen --company 1`
+ *    (足すキー = configured の company − active = listing_components.amazon だけ) → stop-manual gas:logizard-sheet-and-sku-map → … → amazon-map-migrate.mjs apply → widen で
+ *    DB の active に入った時に初めて切り替わる。配ってから widen までの間は DB の active (Amazon = load) のまま = 夜間ロード・写し・画面・門は今までの動き。
+ *    🚨 ただ 1 つ: 毎朝の「CompanyDB写し(Amazon SKU)」(apps/company-db/publish/amazon-map.mjs) は、持ち主を**読めない**朝だけ config を「company の肯定の手がかり」に使う
+ *    (amazonMapHint) = 配ってから widen までの間も、watcher に届かない朝は ⚠️ exit 0 ではなく ❌ exit 1 (retry に載る)。持ち主を読めた朝は ⏭️ exit 0 のまま。
+ *    retry で写しが ⏭️ (持ち主 load = 何も書いていない) で直った回は、写しの鎖で f_sales 以降を走らせ直さない (retry-failed-jobs.js の mapWroteNothing)。
+ *    戻し方: prepare --widen の前 = この行を 'load' に戻して配る (DB は何も変わっていない。配る時刻の条件は上と同じ) /
+ *    prepare --widen の後・widen の前 = 先に master-ownership-epoch.mjs cancel (prepared を消す・古い入口が開き直る。移行 (amazon-map-migrate.mjs apply) の後なら
+ *    対応は Company DB に残る = 次の試みは --reconcile で合わせ直す・#1648) → 必要ならこの行を戻す / widen の後 = 戻す道は無い (narrow は PR-8。config を戻しても active は変わらない)
+ *    company になったとき (区分) の動き:
  *    夜間ロード =既にある SKU の区分を NE に合わせない・NE と区分が違う SKU は conflicts (sku_kind_held)・判断の記録 (decisions.skus.kind_held) に残し、
  *    商品の行・束ねの親・セットの構成・構成の観測は社内の区分で決める・区分の最終形の正規化 (load でも) /
  *    写し = 区分も m_products.商品区分 に写す (C 単品・NE セット = 単品として・ほかの食い違い = 前の行のまま。master-publish.js の PUBLISH_COLUMNS.kind) /
@@ -71,8 +80,10 @@ export const MASTER_OWNERSHIP = Object.freeze({
   // 行ごと
   'sku_costs': 'company',                // 原価 (有効期間の付け替え)。'company' なら夜間ロードは原価の行を作らない・閉じない
   'sku_components': 'load',           // セット構成。'company' なら夜間ロードは構成を足さない・直さない・消さない (manual は今も守られる)
-  'listing_components.amazon': 'load',// Amazon SKU ↔ NE コード (FBA のマップ。D-43)。'company' なら SKU マスタ・Sheet の構成は材料にしない (FBM の完全一致は対応の無い出品にだけ続ける・
-                                      //   出品そのもの・ASIN・FNSKU は続ける)。対応 (core.amazon_sku_maps・0054) がある出品は持ち主によらず触らない (16 §7 M10・⑦-1)
+  'listing_components.amazon': 'company', // Amazon SKU ↔ NE コード (FBA のマップ。D-43)。広げる道 (prepare --widen → widen) で DB の active に入れる (⑦-2 PR-C・10/8)。
+                                      //   'company' なら夜間ロードは SKU マスタ・Sheet の構成を材料にしない (FBM の完全一致は対応の無い出品にだけ続ける・出品そのもの・ASIN・FNSKU は続ける)・
+                                      //   毎朝の写し (amazon-map.mjs) が Company DB の対応を m_sku_master・m_sku_components に写す。
+                                      //   対応 (core.amazon_sku_maps・0054) がある出品は持ち主によらず触らない (16 §7 M10・⑦-1)
   // 仕入先 (core.suppliers)
   'suppliers.name': 'load',
   'suppliers.order_method': 'load',

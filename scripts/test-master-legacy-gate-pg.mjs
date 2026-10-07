@@ -497,7 +497,8 @@ try {
       assert.equal(entered, true, '古い書き込みが門を通った');
       // (2) 別の接続で prepare = 待たない (epoch の鍵と段階の鍵は別 = 古い書き込みは prepare をまたげる)
       const t0 = Date.now();
-      await OS.prepareOwnership(db, { map: MASTER_OWNERSHIP, actor: 'test' });
+      //   持ち主表 = configured から Amazon を外したもの (10/8 から configured は Amazon も company = ⑦-2 PR-C。ここは「C でない列の入口 (Amazon SKU) は開いたまま」を見る)
+      await OS.prepareOwnership(db, { map: { ...MASTER_OWNERSHIP, 'listing_components.amazon': 'load' }, actor: 'test' });
       assert.ok(Date.now() - t0 < 3000, `prepare が待った ${Date.now() - t0}ms`);
       // legacy_open の間は prepared があっても入口は開いている → frozen にした瞬間に 13 キーの入口だけ閉じる
       assert.equal((await G.checkLegacyGate({ entry: 'cli:csv-import.js:exception_genka' })).writable, true, 'legacy_open = 開く');

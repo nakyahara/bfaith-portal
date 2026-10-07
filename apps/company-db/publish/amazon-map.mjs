@@ -105,7 +105,9 @@ export function openWarehouseReadonly(dataDir) {
 /**
  * 持ち主が company だという**肯定の**手がかり (#1649 Codex R3 Medium 2): config (configured) が company = 'config' / 有効な写しの記録がある = 'meta' / 無い = null。
  *   daily-sync はこれが無い朝、写しの子の異常終了 (timeout・abort・起動の失敗) だけを理由に写しを retry-state に載せない・retry は写しの鎖を効かせない
- *   (今の本番 = config も記録も load = retry は master と同じ)。読めない記録は肯定の手がかりにしない
+ *   (PR-A の頃の本番 = config も記録も load = retry は master と同じ)。読めない記録は肯定の手がかりにしない。
+ *   🆕 PR-C (10/8) から config が company = 配ってから widen までの間 (DB の active は load) も手がかりあり = 写しの失敗は retry に載る。
+ *   その retry で写しが ⏭️ (持ち主 load) で直ったら、鎖は f_sales 以降を走らせ直さない (retry-failed-jobs.js の mapWroteNothing)
  */
 export function amazonMapHint({ dataDir = process.env.DATA_DIR || '', ownership = MASTER_OWNERSHIP, readMeta: rm = readMetaReadonly } = {}) {
   if (ownership && ownership[AMAZON_MAP_OWNER_KEY] === 'company') return 'config';
@@ -382,7 +384,7 @@ export async function cli(argv, { env = process.env, connectFor = null, openSqli
       };
       const unreadable = async (why) => {
         const h = await hint();
-        if (h) return { code: EXIT.error, last: `❌ ${STEP_NAME}: 持ち主を読めない (${why}) = 写さない・古い表は前のまま (持ち主は company のはず = ${h === 'config' ? 'config が company' : '前に写した記録がある'})` };
+        if (h) return { code: EXIT.error, last: `❌ ${STEP_NAME}: 持ち主を読めない (${why}) = 写さない・古い表は前のまま (持ち主は company のはず = ${h === 'config' ? 'config が company。widen の前 (配ってから widen まで) なら DB の active は load のこともある' : '前に写した記録がある'})` };
         return { code: EXIT.ok, last: `⚠️ ${STEP_NAME}: 持ち主を読めない (${why}) = 写さない (config も前の写しの記録も load = 今の動きのまま)` };
       };
       const url = (env.COMPANY_DB_WATCH_URL || '').trim();
