@@ -12,6 +12,9 @@ await temporaryTestRoot(import.meta.url);
  * 検証 (Codex #1379 R5):
  *   4. サーバーには届いて反映済みで応答だけ消えた → 画面を DB とそろえる (届く前に切れた場合だけでなく)
  *      / 保存後はサーバーがそろえた値を出す / 画面を開いた後に別の端末で設定された PIN も、消す前に確かめる
+ * 検証 (Codex #1379 R6):
+ *   5. 反映後に本文だけ壊れた応答も読み直す / 保存の読み直しが終わるまで行は「保存中」のまま
+ *      / 追加の応答が消えたら「もう一度」と言わずに読み直しへ (2 人目を作らない)
  */
 import fs from 'fs';
 import os from 'os';
@@ -234,6 +237,67 @@ try {
     ok(!!byNo('20241001').pin_set && byNo('20241001').kind !== 'iroha', '「やめる」なら PIN も区分もそのまま');
     ok(await r.locator('.pin-mark').textContent() === '🔑', 'PIN 欄も 🔑 に直る');
     ok(await r.locator('select[name=kind]').evaluate(el => el.classList.contains('dirty')) && !(await r.locator('.btn-save').isDisabled()), '区分の変更は未保存のまま残り、保存を押し直せる');
+    ok(await notReloaded(), 'ここまで画面を読み直していない');
+  }
+  console.log('\n[5] 本文だけ壊れた応答 / 読み直し中の守り / 追加の応答が消えた');
+  {
+    await open();
+    // 反映後に本文だけ壊れた (ヘッダーは 200)
+    const r = row('20250701');
+    const of = r.locator('.role-cb[data-role=office]');
+    ok(!(await of.isChecked()), '前提: 田中 美波は事務なし');
+    await page.route('**/roles', async route => { await route.fetch(); await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":tr' }); });
+    await clearMsg();   // 前の操作の表示が残っていると、応答を待たずに進んでしまう
+    await of.check({ force: true });
+    await page.waitForFunction(() => /通信が途中で切れました/.test(document.querySelector('#listMsg').textContent));
+    await page.unroute('**/roles');
+    ok(byNo('20250701').roles.includes('office') && await of.isChecked(), '本文が壊れても読み直して、画面と DB の役割が同じ');
+    // Render の 502 (HTML) は「結果不明」として読み直す
+    await page.route('**/roles', route => route.fulfill({ status: 502, contentType: 'text/html', body: '<html>Bad Gateway</html>' }));
+    await clearMsg();   // 前の操作の表示が残っていると、応答を待たずに進んでしまう
+    await of.uncheck({ force: true });
+    await page.waitForFunction(() => /通信が途中で切れました/.test(document.querySelector('#listMsg').textContent));
+    await page.unroute('**/roles');
+    ok(byNo('20250701').roles.includes('office') && await of.isChecked(), '502 でも読み直して、届いていなければチェックは元のまま');
+
+    // 保存の通信が切れたあと、読み直しが終わるまで行は「保存中」
+    const t = row('20250201');
+    const tid = byNo('20250201').id;
+    const isRow = u => new URL(u).pathname === '/apps/staff/api/staff/' + tid;
+    let release;
+    const gate = new Promise(res => { release = res; });
+    await page.route(isRow, async route => {
+      if (route.request().method() === 'POST') return route.abort();
+      await gate; return route.continue();
+    });
+    await t.locator('input[name=short_name]').fill('おおば');
+    const gotGet = page.waitForRequest(req => isRow(req.url()) && req.method() === 'GET');
+    await t.locator('.btn-save').click();
+    await gotGet;
+    await t.locator('input[name=sort]').fill('85');   // 読み直しを待っている間に、別の欄を触る
+    ok(await t.locator('.btn-save').isDisabled() && await t.locator('.btn-active').isDisabled()
+      && await t.locator('.role-cb[data-role=office]').isDisabled(), '読み直しが終わるまで、保存・有効/無効・役割を押せない');
+    await clearMsg();
+    release();
+    await page.waitForFunction(() => /通信が途中で切れました/.test(document.querySelector('#listMsg').textContent));
+    await page.unroute(isRow);
+    ok(!(await t.locator('.btn-save').isDisabled()) && !(await t.locator('.btn-active').isDisabled()), '読み直しのあと押せるように戻る');
+    ok(await t.locator('input[name=sort]').inputValue() === '85' && await t.locator('input[name=short_name]').inputValue() === 'おおば', '待っている間に入れた値も、届かなかった値も残る (未保存)');
+    ok(!byNo('20250201').short_name, 'DB には届いていない');
+    await clearMsg();
+    await t.locator('.btn-save').click();
+    await page.waitForFunction(() => /を保存しました/.test(document.querySelector('#listMsg').textContent));
+    ok(byNo('20250201').short_name === 'おおば' && byNo('20250201').sort === 85, 'もう一度「保存」で両方とも保存できる');
+
+    // 追加の応答が消えた (届いて追加済み) → 「もう一度」と言わず、ボタンも戻さない
+    const isAdd = u => new URL(u).pathname === '/apps/staff/api/staff';
+    await page.route(isAdd, async route => { await route.fetch(); await route.abort(); });
+    await page.fill('#n_no', '20261009'); await page.fill('#n_name', '試験 花子');
+    await page.click('#addBtn');
+    await page.waitForFunction(() => /追加できたか分かりません/.test(document.querySelector('#addMsg').textContent));
+    await page.unroute(isAdd);
+    ok(!!byNo('20261009'), '前提: DB には追加されている');
+    ok(await page.locator('#addBtn').isDisabled(), '追加ボタンは押せないまま (2 人目を作らない)');
     ok(await notReloaded(), 'ここまで画面を読み直していない');
   }
   ok(pageErrors.length === 0, `画面の JS エラーなし${pageErrors.length ? ': ' + pageErrors.join(' / ') : ''}`);

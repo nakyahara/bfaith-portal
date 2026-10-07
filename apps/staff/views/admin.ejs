@@ -432,7 +432,17 @@
   <script>
     const BASE = <%- JSON.stringify(base) %>;
     const $ = s => document.querySelector(s);
-    const postJson = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }).then(async r => ({ status: r.status, j: await r.json().catch(() => ({})) }));
+    // 🚨 応答の本文が読めないとき (途中で切れた・Render の 502 の HTML など)、反映できたかは分からない。
+    //    {} にして「失敗」扱いにすると読み直さずに画面だけ戻すので、通信の失敗と同じに投げる (Codex R6 Medium)。
+    //    4xx はサーバーが断った = 反映していないので、読めなくても失敗として返す
+    const postJson = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }).then(async r => {
+      let j;
+      try { j = await r.json(); } catch {
+        if (r.ok || r.status >= 500) throw new Error('response unreadable (' + r.status + ')');
+        j = {};
+      }
+      return { status: r.status, j };
+    });
     const msg = (el, ok, text) => { el.className = 'msg ' + (ok ? 'ok' : 'err'); el.textContent = text; };
     const rows = () => [...document.querySelectorAll('table.st tbody tr')];
     // 行の入力欄 (役割のチェックボックスは別 API なので常に除く)
@@ -618,7 +628,10 @@
       const body = { staff_no: $('#n_no').value, display_name: $('#n_name').value, short_name: $('#n_short').value, kind: $('#n_kind').value, joined_on: $('#n_joined').value, portal_email: $('#n_email').value };
       let status, j;
       try { ({ status, j } = await postJson(BASE + '/api/staff', body)); }
-      catch { adding = false; $('#addBtn').disabled = false; return msg($('#addMsg'), false, '通信できませんでした。もう一度押してください'); }
+      catch {
+        // 🚨 届いて追加済みのこともある。ボタンは戻さず、読み直して一覧で確かめてもらう (Codex R6 Low)
+        return msg($('#addMsg'), false, '通信が途中で切れたので、追加できたか分かりません。画面を読み直して (F5)、一覧に出ていないか確かめてから追加し直してください');
+      }
       if (!j.ok) { adding = false; $('#addBtn').disabled = false; return msg($('#addMsg'), false, j.message || ('HTTP ' + status)); }
       const roles = [];
       if ($('#n_warehouse').checked) roles.push('warehouse');
@@ -692,8 +705,10 @@
         } catch {
           // 通信できなかったときは編集を残したまま伝える (黙って保存済みにしない)。
           // 届いて保存済みのこともあるので読み直す。保存済みなら欄の値と DB が同じになり黄色が消える
-          delete tr.dataset.saving;
+          // 読み直しが終わるまで「保存中」のまま。先に外すと、その間に別の操作を始められ、
+          // 遅れて届いた読み直しが新しい操作の結果を古い値で上書きする (Codex R6 Medium)
           await resyncAfterNetError(tr);
+          delete tr.dataset.saving;
           refreshRowControls(tr); syncState();
           return;
         }
@@ -715,8 +730,10 @@
           refreshRowControls(tr); syncState();
           msg($('#listMsg'), true, j.staff.display_name + ' を保存しました');
         } else if (j.error === 'conflict') {
-          refreshRowControls(tr);
+          tr.dataset.saving = '1';   // 最新の行を読み直す間も、ほかの操作を始めさせない
           await showLatest(tr, j);
+          delete tr.dataset.saving;
+          refreshRowControls(tr); syncState();
         } else {
           refreshRowControls(tr); syncState();
           msg($('#listMsg'), false, j.message || ('HTTP ' + status));
