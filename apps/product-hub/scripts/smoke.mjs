@@ -10738,6 +10738,19 @@ for (const [name, file, data] of renders) {
       check('🚨 画面の試算: あとで候補が現れたら、残していた便を捨てて合わせ直す',
         k3.sel.value === 'ゆうパック60サイズ' && k3.shipCost() === '810', k3.profit() + ' / ' + k3.sel.value);
     }
+    // 🚨 別タブで配送方法が変わって読み直したあと、また元の配送方法に戻しても
+    //    古い選択は復活しない (記録を消しているから — Codex R15 P2)
+    {
+      const st7 = fakeStore();
+      const g1 = mount({ ...base0, rkValue: '1', store: st7 });
+      g1.pick('定形外規格外（1kg以内）');
+      const g5 = mount({ ...base0, rkValue: '5', store: st7 });   // 別タブでネコポスに変えて保存
+      check('画面の試算: 別タブで変わった後は合わせ直す (前提の確認)', g5.profit() === '837円', g5.profit());
+      const g1b = mount({ ...base0, rkValue: '1', store: st7 });  // また定形外に戻して保存
+      check('🚨 画面の試算: 定形外に戻しても古い選択は復活しない (892円 = 合わせ先)',
+        g1b.profit() === '892円' && g1b.sel.value === '定形外規格内（50g以内）', g1b.profit());
+    }
+
     // 人が自分で選んだ記録は、候補があっても勝つ (carry と混ぜない)
     {
       const st6 = fakeStore();
@@ -13538,8 +13551,8 @@ for (const [name, file, data] of renders) {
       m.remember('定形外規格外（1kg以内）', '1');
       check('覚え書き: 同じ配送方法なら覚えた便を返す',
         m.read('1')?.method === '定形外規格外（1kg以内）' && m.read('1')?.kind === 'manual', String(st.raw));
-      check('🚨 覚え書き: 別の配送方法のときの選択は使わない (別タブで変わった後に勝たせない)',
-        m.read('5') === null);
+      check('🚨 覚え書き: 別の配送方法のときの選択は使わず、記録そのものを消す',
+        m.read('5') === null && st.raw === null, String(st.raw));
       m.remember('ネコポス', '1', 'carry');
       check('覚え書き: 出自 (人が選んだ / 候補が無くて残した) も覚える',
         m.read('1')?.kind === 'carry', String(st.raw));

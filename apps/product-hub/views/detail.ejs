@@ -5330,7 +5330,10 @@ th.attr-unknown { color: #dc2626; }
         read(group) {
           try {
             const d = JSON.parse(store.getItem(key) || 'null');
-            if (!d || String(d.group ?? '') !== String(group)) return null;
+            if (!d) return null;
+            // 🚨 配送方法が違う記録は**消す** (無視するだけだと、別のタブで配送方法を戻した
+            //    ときに古い選択が復活して利益が勝手に変わる — Codex R15 P2)
+            if (String(d.group ?? '') !== String(group)) { forget(); return null; }
             // kind: manual = 人が選び直した / carry = 当てはまる便が無いので残した
             return { method: String(d.method || ''), kind: d.kind === 'carry' ? 'carry' : 'manual' };
           } catch (_) { return null; }   // 使えない環境は覚えないだけ
