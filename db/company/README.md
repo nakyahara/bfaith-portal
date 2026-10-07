@@ -424,6 +424,29 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
 - 同じ構成の行は時刻 (created_at / updated_at) だけそろえる = 変更の記録・出品の version を増やさない (0049 の印を増やさない)。FBM の完全一致など古い表に無い行は消す
 - ⑦-2 (写し・世代・FBA の Sheet 無し・台帳) と ⑥ (段階の戻す道) はこの PR に無い
 
+### Amazon SKU の対応の写し (⑦-2 PR-A。16 §2・最小の計画 10/7)
+Company DB の active の対応 → miniPC の古い表 `m_sku_master` + `m_sku_components` (= f_sales・想定利益・手数料・Render の mirror → FBA 補充・GAS が今のまま読む)。
+コード = `apps/company-db/publish/amazon-map.mjs`・daily-sync の工程「CompanyDB写し(Amazon SKU)」(「Company DB の写しの反映」の直後・f_sales の前。台帳 = warehouse-daily-sync の 1 工程・ping なし)。
+- **持ち主が load (今の本番) の間は何もしない** (⏭️ exit 0・SQLite を開かない)。持ち主 = DB の active の `listing_components.amazon` (config は見ない)
+- company = 毎回 Company DB の今の active の対応に**まるごと合わせる** (世代は持たない = 何度流しても同じ・2 回目は変わった行 0)。SQLite の 1 取引で差だけ・commit の前に読み直してハッシュ (`sku-map-canon-v1`) を照らす。`sync_meta` の `cdb_amazon_map_publish` にハッシュ・行数・変更の記録の番号
+- 実行の鍵 = warehouse.db の `job_locks` の `cdb-amazon-map-publish` (daily・自動再試行・手の CLI が同じ鍵。PG を読む前から SQLite の commit の後まで)
+- 断る (古い表は前のまま・❌ = retry に載る): 0 件 / 今の古い表の 90% 未満 / 変更の記録の番号が前の写しより小さい / 受け手の決まり (`validateSkuMap`) に合わない
+- ⚠️ だけ: 前の写しの後に古い表が誰かに書き換えられていた (今のハッシュ ≠ 前の写しのハッシュ) = Company DB の値で上書きする
+- 持ち主を読めない (未設定・届かない) = config か前の写しの記録が company を示せば ❌・どちらも無ければ ⚠️ exit 0 (今の動きのまま = f_sales の retry を止めない)
+```
+# 急ぎで写す (同じ鍵・同じ安全弁)
+node -r dotenv/config apps/company-db/publish/amazon-map.mjs
+# 差を数えるだけ (鍵も取らない・書かない。止めている間も流せる。Company DB のハッシュが出る)
+node -r dotenv/config apps/company-db/publish/amazon-map.mjs --dry-run
+# 意図した大量削除 (0 件・90% 未満) を通す (手だけ。H = 直前の --dry-run のハッシュ。違えば断る)
+node -r dotenv/config apps/company-db/publish/amazon-map.mjs --allow-shrink --expect-hash <H>
+```
+**Company DB をバックアップから戻したとき (写しを止めて差を人が見る)**
+1. 戻す**前に** miniPC の `.env` に `CDB_AMAZON_MAP_PUBLISH_PAUSE=1` を足す (写しは ⚠️ 見送り・古い表は前の形のまま。daily-sync は止まらない)
+2. 戻した後 `--dry-run` で差 (足す・直す・消す seller SKU) を見る。古い表 (= 戻す前の最後の写し) にあって Company DB に無い対応は、戻したことで消えた登録 = 画面で入れ直すか決める
+3. 入れ直しが済んだら `.env` から env を外し、`--dry-run` のハッシュで `--accept-restore --expect-hash <H>` (変更の記録の番号が戻ったのを通す。0 件・90% 未満も要るなら `--allow-shrink` も)
+4. 次の朝の daily-sync から普段どおり (記録した番号は今回のものになる)
+
 ### 商品の登録日 (0057・2026-10-05 中原さんの要望)
 `core.skus.registered_on` (JST の日付) と `registered_on_source` (`ne` = NE の作成日 / `portal` = ポータルで登録した日 / `first_seen` = 夜間ロードが初めて見た日)。両方空か両方あり・2000 年より前は入らない・**一度入った値は変えない** (trigger `trg_skus_registered_on_fixed`。空 → 値 だけ通す)。画面のロール master_edit には列の UPDATE 権限なし。
 - **列の既定値は無い** (= 空)。書き手が明示する: 新商品の登録の関数 `ops.register_new_sku` (0057 で作り直し = SKU の INSERT に `v_today`・`portal` を足しただけ) / 夜間ロード (NE の作成日・新しいセットと例外は初めて見た日・作成日の無い単品は空)。古い夜間ロードのプロセスや戻したコードの INSERT (2 つの列を書かない) は空 = 次の晩に NE の作成日で埋まる (portal で確定しない・#1617 Codex R1 Medium)

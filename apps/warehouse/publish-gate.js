@@ -250,6 +250,7 @@ export const PUBLISH_GATED_SCRIPTS = Object.freeze({
 /** 止めない工程 → 理由 */
 export const PUBLISH_UNGATED_SCRIPTS = Object.freeze({
   'apps/company-db/publish/fetch.mjs': 'この確かめそのもの',
+  'apps/company-db/publish/amazon-map.mjs': 'Company DB の Amazon SKU の対応を m_sku_master・m_sku_components に写すだけ (⑦-2 PR-A。商品マスタ・上書き表は読まない)',
   'apps/warehouse/rebuild-amazon-settlement-mart.js': '決済の明細だけを読む',
   'apps/warehouse/sync-amazon-ads-daily.js': '広告費だけ',
   'apps/warehouse/sync-amazon-price-snapshot.js': 'カート価格だけ',

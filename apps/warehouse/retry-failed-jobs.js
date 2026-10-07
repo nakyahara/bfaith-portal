@@ -51,6 +51,10 @@ const MAX_RETRY_COUNT = 3;
 //   f_sales のみ retry 時は 30分 (初回 10分でタイムアウトした場合の余裕)
 //   args 省略時は '7' (rebuild系の日数引数の既存挙動を維持)
 export const JOB_DEFINITIONS = {
+  // Company DB の Amazon SKU の対応 → m_sku_master・m_sku_components (⑦-2 PR-A)。毎回 Company DB の今の対応にまるごと合わせる = 再実行安全
+  //   (同じ中身なら変わった行 0)。daily-sync・手の CLI と同じ実行の鍵 (warehouse.db の job_locks) をスクリプトが取る。持ち主が load = 何もしない (exit 0)。
+  //   f_sales の上流 (UPSTREAM_OF)・直ったら f_sales → sales_velocity / pml_snapshot / Render同期 を走らせ直す (RERUN_AFTER。古い対応の売上を Render に送らない)
+  'CompanyDB写し(Amazon SKU)': { script: 'apps/company-db/publish/amazon-map.mjs', args: ['--daily'], timeoutMs: 300000 },
   'f_sales':        { script: 'apps/warehouse/rebuild-f-sales.js',                timeoutMs: 1800000 },
   'sales_velocity': { script: 'apps/warehouse/rebuild-sales-velocity.js',         timeoutMs: 900000  },
   'pml_snapshot':   { script: 'apps/warehouse/build-product-management-snapshot.js', timeoutMs: 600000 },
@@ -139,7 +143,7 @@ export const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'm_products_history', 'CompanyDB観測原価', 'Amazon決済と財務', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'CompanyDB広告費(Amazon)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'DBバックアップ', 'CompanyDB見張り'];
+export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'm_products_history', 'CompanyDB観測原価', 'Amazon決済と財務', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'CompanyDB広告費(Amazon)', 'Amazon手数料', 'ABA検索ワード', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'DBバックアップ', 'CompanyDB見張り'];
 
 /**
  * 上流 (取込) → 下流 (その取込の結果を使うジョブ)。下流は、**同じ回で上流を再試行して失敗したら走らせない** (古い・途中の raw を送らない)。
@@ -155,6 +159,9 @@ export const UPSTREAM_OF = {
   'CompanyDB財務(Amazon)': 'Amazon Settlement',   // 決済の取込 → Company DB の Amazon 財務 (F2b-3。#1536 Codex R1)。スイッチが無いときだけ走る (あるときは coordinator の 1 工程 = 組は無い)
   'CompanyDB観測原価': 'm_products_history',       // 原価の履歴の記録 → Company DB の観測の原価 (D7b-2。#1549 Codex R3 M2)
   '新商品の許可': 'マスタ照合',                     // 照合 ② → 新商品の許可 (PR-7)。照合をこの回で再試行して失敗 = 許可を出さない (入口は照合の始めで閉じたまま)
+  // Amazon SKU の対応の写し → f_sales (⑦-2 PR-A・Codex 計画 R2 High 2)。写しをこの回で再試行して失敗 = f_sales を作り直さない
+  //   (朝の f_sales は前の対応のまま = 古い対応と新しい対応の混ざった回を Render へ送らない。写しが直った回に f_sales から作り直す = RERUN_AFTER)
+  'f_sales': 'CompanyDB写し(Amazon SKU)',
 };
 /**
  * 走らせ直しの依存 (Company DB構想 10 §6.1.1 B4。Codex ③a-2 R1 H5・B-R0 #3): 上流が**この回の retry で成功**したら、朝に成功していた下流も走らせ直す。
@@ -165,6 +172,10 @@ export const UPSTREAM_OF = {
  *   足した下流の失敗も結果に入る = 次の回の remaining_jobs に残る。下流は RETRY_ORDER で上流より後 (試験 test-retry-rerun.mjs が確かめる)
  */
 export const RERUN_AFTER = {
+  // Amazon SKU の対応の写しが直った (⑦-2 PR-A・Codex 計画 R2 High 2) = 朝に成功していた f_sales も新しい対応で作り直し、その後の販売速度・商品管理リスト・Render同期も
+  //   (新しい mirror_sku_* と古い対応で作った f_sales を同じ回に送らない)。f_sales が再失敗 = Render同期 は見送り (下の fail-fast)
+  'CompanyDB写し(Amazon SKU)': ['f_sales'],
+  'f_sales': ['sales_velocity', 'pml_snapshot', 'Render同期'],
   'Render同期': ['マスタ照合'],
   'マスタ照合': ['新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り'],
 };

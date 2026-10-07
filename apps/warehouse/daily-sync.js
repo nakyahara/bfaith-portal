@@ -88,7 +88,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
 // 🚨 Amazon の決済と財務は env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator「Amazon決済と財務」の 1 工程・無ければ今までの 2 工程「Amazon Settlement」→「CompanyDB財務(Amazon)」
 //   (finance-coordinator-switch.js・#1567。走るのはどちらか片方 = retry の対象には両方の名前を載せる)
 
@@ -806,6 +806,15 @@ async function main() {
   publishGate.broken = cdbPublishBroken || cdbPublishGateDecision.broken;
   publishGate.state = cdbPublishBroken ? 'broken' : cdbPublishGateDecision.state;
   if (publishGate.broken) console.log(`[DailySync] ⚠️ Company DB の写しの反映の門 = ${publishGate.state} (exit ${cdbPublishApplyResult.exitCode ?? '-'}・${cdbPublishGateDecision.reason}) → m_products・上書き表を読む後の工程を見送る (publish-gate.js)`);
+
+  // ─── Company DB の Amazon SKU の対応の写し (⑦-2 PR-A。設計 = AI_reference CompanyDB構想/16 §2・最小の計画 10/7) ───
+  // 持ち主 (DB の active の listing_components.amazon) が company の朝だけ、Company DB の active の対応に m_sku_master・m_sku_components をまるごと合わせる
+  // (SQLite の 1 取引で差だけ・読み直してハッシュを照らす)。持ち主が load の今は何もしない (⏭️ exit 0・SQLite を開かない)。
+  // f_sales (v_sku_resolved を読む) より前 = 今朝の対応で売上を作る。断った (0 件・90% 未満・変更の記録の番号が戻った)・読めない = ❌ = retry に載る
+  // (retry-failed-jobs.js: f_sales の上流・直ったら f_sales → sales_velocity / pml_snapshot / Render同期 を走らせ直す)。
+  // 止める = .env の CDB_AMAZON_MAP_PUBLISH_PAUSE=1 (⚠️ 見送り・古い表は前の形のまま)。ping は打たない (台帳 warehouse-daily-sync の 1 工程)
+  const cdbAmazonMapResult = runScript('apps/company-db/publish/amazon-map.mjs --daily', 'Company DB の Amazon SKU の写し', 300000);
+  results.push({ name: 'CompanyDB写し(Amazon SKU)', ...cdbAmazonMapResult, warn: cdbAmazonMapResult.success && isWarnSummary(cdbAmazonMapResult.summary) });
 
   // m_products 変更差分を history に記録 (trigger 廃止 → 差分バッチ化)
   // rebuild-m-products.js の直後に実行 (m_products 確定後の比較)

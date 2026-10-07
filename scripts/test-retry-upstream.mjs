@@ -23,7 +23,31 @@ t('表の整合: 上流も下流も retry の定義と順序にあり、上流�
     assert.ok(RETRY_ORDER.indexOf(up) < RETRY_ORDER.indexOf(down), `${up} が ${down} より後に走る`);
   }
   // 決済の取込 → 財務の送り手の組 (F2b-3) は、スイッチ CDB_FINANCE_COORDINATOR が無いとき (今までの 2 工程) の組 (#1567)。あるときは coordinator 'Amazon決済と財務' の 1 工程 = この組は走らない
-  assert.deepEqual(UPSTREAM_OF, { 'CompanyDB注文(Qoo10)': 'Qoo10', 'CompanyDB広告費(Amazon)': 'Amazon Ads (SKU)', 'CompanyDB財務(Amazon)': 'Amazon Settlement', 'CompanyDB観測原価': 'm_products_history', '新商品の許可': 'マスタ照合' });
+  assert.deepEqual(UPSTREAM_OF, { 'CompanyDB注文(Qoo10)': 'Qoo10', 'CompanyDB広告費(Amazon)': 'Amazon Ads (SKU)', 'CompanyDB財務(Amazon)': 'Amazon Settlement', 'CompanyDB観測原価': 'm_products_history', '新商品の許可': 'マスタ照合',
+    'f_sales': 'CompanyDB写し(Amazon SKU)' });   // ⑦-2 PR-A (Codex 計画 R2 High 2)
+});
+t('⑦-2 PR-A: Amazon SKU の対応の写しは 3 か所 (RETRYABLE_JOBS・JOB_DEFINITIONS・RETRY_ORDER) にあり、f_sales より前・daily-sync でも f_sales より前に走る', () => {
+  const J = 'CompanyDB写し(Amazon SKU)';
+  assert.ok(retryable.includes(J));
+  assert.deepEqual(JOB_DEFINITIONS[J], { script: 'apps/company-db/publish/amazon-map.mjs', args: ['--daily'], timeoutMs: 300000 });
+  assert.ok(fs.existsSync(path.join(root, JOB_DEFINITIONS[J].script)));
+  assert.ok(RETRY_ORDER.indexOf(J) >= 0 && RETRY_ORDER.indexOf(J) === RETRY_ORDER.indexOf('f_sales') - 1, '写しは f_sales の直前');
+  const iMap = dailySync.indexOf("runScript('apps/company-db/publish/amazon-map.mjs --daily'");
+  const iApply = dailySync.indexOf("runScript('apps/company-db/publish/fetch.mjs --verify-apply --daily'");
+  const iFsales = dailySync.indexOf("runScript('apps/warehouse/rebuild-f-sales.js'");
+  assert.ok(iApply > 0 && iApply < iMap && iMap < iFsales, 'daily-sync: 写しの反映 → Amazon SKU の写し → f_sales の順');
+  assert.match(dailySync, /results\.push\(\{ name: 'CompanyDB写し\(Amazon SKU\)', \.\.\.cdbAmazonMapResult/);
+});
+t('🚨 ⑦-2 PR-A: 写しをこの回で再試行して失敗 → f_sales を作り直さない (Render同期 も見送り) / 写しが成功 → f_sales から作り直す / 写しが朝に成功していれば f_sales はそのまま走る', () => {
+  const started = []; const quiet = () => {};
+  const runner = (outcome) => (script, label) => { started.push(label); return outcome[label] ?? { success: true, summary: 'ok' }; };
+  const r1 = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: runner({ 'CompanyDB写し(Amazon SKU)': { success: false, summary: '❌ 断った (shrunk)' } }), log: quiet });
+  assert.deepEqual(started, ['CompanyDB写し(Amazon SKU)']);
+  assert.deepEqual(r1.map((x) => [x.name, x.success]), [['CompanyDB写し(Amazon SKU)', false], ['f_sales', false], ['Render同期', false]]);
+  assert.equal(r1.find((x) => x.name === 'f_sales').summary, '⏸️ skipped (CompanyDB写し(Amazon SKU) 再失敗)');
+  started.length = 0;
+  runRetryRound(['f_sales'], { run: runner({}), log: quiet });   // 写しは朝に成功 (remaining に無い) = f_sales はそのまま
+  assert.deepEqual(started, ['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
 });
 t('定義と順序の食い違いが無い (定義にあるのに順序に無いジョブは、retry-state に載っても永久に走らない)', () => {
   assert.deepEqual(Object.keys(JOB_DEFINITIONS).filter((j) => !RETRY_ORDER.includes(j)), []);
