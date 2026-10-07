@@ -5368,9 +5368,13 @@ th.attr-unknown { color: #dc2626; }
       // 例外になる環境 (サイトデータを止めている等) があるので、取り出しも try で囲む
       let store = null;
       try { store = window.sessionStorage; } catch (_) { store = null; }
+      // 🚨 鍵に**誰の選択か**を入れる。商品だけだと、同じタブでログアウト→別の人が入ったときに
+      //    前の人の試算の選択がその人の選択として効いてしまう (Codex R17 P2)
+      //    (EJS の値は文字列の中に置く。外に出すと、この塊をそのまま読む試験が JS として壊れる)
+      const MINE_WHO = '<%= displayName || "" %>';
       const mine = profitShipMemory(
         store || { getItem: () => null, setItem: () => {}, removeItem: () => {} },
-        'ph-profit-ship:<%= draft.id %>',
+        'ph-profit-ship:<%= draft.id %>:' + MINE_WHO,
       );
 
       function build({ follow = false } = {}) {

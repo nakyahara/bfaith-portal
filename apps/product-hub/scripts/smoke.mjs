@@ -13433,6 +13433,10 @@ for (const [name, file, data] of renders) {
   check('🚨 配送費の試算: 覚えるのは「どの配送方法のときの選択か」まで (別タブの変更に負ける)',
     /const rem = mine\.read\(group\);/.test(sim) && /remembered: rem,/.test(sim)
     && /mine\.remember\(sel\.value, groupOf\(\)\)/.test(sim));
+  // 🚨 同じタブでログアウト→別の人が入ったとき、前の人の試算の選択を効かせない
+  check('🚨 配送費の試算: 覚え書きの鍵に「誰の選択か」が入っている (利用者が交代しても混ざらない)',
+    /'ph-profit-ship:<%= draft\.id %>:' \+ MINE_WHO/.test(sim)
+    && /const MINE_WHO = '<%= displayName \|\| "" %>';/.test(sim));
   check('🚨 配送費の試算: sessionStorage に触るだけで例外になる環境でも画面を描く',
     /try \{ store = window\.sessionStorage; \} catch \(_\) \{ store = null; \}/.test(sim)
     && /store \|\| \{ getItem: \(\) => null/.test(sim));
@@ -13548,13 +13552,14 @@ for (const [name, file, data] of renders) {
   {
     // ─── 人が選んだ試算の配送方法の覚え書き。偽の store で振る舞いを確かめる (Codex R8 P3) ───
     const mem = new Function(chunk + ' return profitShipMemory;')();
+    // 鍵ごとに別の場所に入る (利用者ごとに鍵を分ける話を確かめるため)。raw は鍵 'k' の中身
     const fake = (opts = {}) => {
-      let raw = opts.initial ?? null;
+      const map = new Map(opts.initial ? [['k', opts.initial]] : []);
       return {
-        get raw() { return raw; },
-        getItem: () => { if (opts.readThrows) throw new Error('blocked'); return raw; },
-        setItem: (_k, v) => { if (opts.writeThrows) throw new Error('full'); raw = v; },
-        removeItem: () => { raw = null; },
+        get raw() { return map.has('k') ? map.get('k') : null; },
+        getItem: (k) => { if (opts.readThrows) throw new Error('blocked'); return map.has(k) ? map.get(k) : null; },
+        setItem: (k, v) => { if (opts.writeThrows) throw new Error('full'); map.set(k, v); },
+        removeItem: (k) => { map.delete(k); },
       };
     };
     {
@@ -13583,6 +13588,15 @@ for (const [name, file, data] of renders) {
     {
       const m = mem(fake({ readThrows: true }), 'k');
       check('覚え書き: store を読めない環境でも落ちない (覚えないだけ)', m.read('1') === null);
+    }
+    {
+      // 🚨 鍵が違えば読めない = 利用者が交代しても前の人の選択が効かない (Codex R17 P2)
+      const st = fake();
+      const a = mem(st, 'ph-profit-ship:42:aさん');
+      const b = mem(st, 'ph-profit-ship:42:bさん');
+      a.remember('定形外規格外（1kg以内）', '1');
+      check('覚え書き: 同じ人・同じ商品なら読める', a.read('1')?.method === '定形外規格外（1kg以内）');
+      check('🚨 覚え書き: 別の人の鍵では読めない (同じ商品・同じ配送方法でも)', b.read('1') === null);
     }
   }
 }
