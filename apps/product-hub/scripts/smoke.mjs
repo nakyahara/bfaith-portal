@@ -9785,7 +9785,8 @@ const renders = [
     genreDict: { genreId: '205761', genreName: '入浴剤', genrePath: '美容・コスメ > 入浴剤', fixedAt: null, fetchedAt: '2026-07-28T00:00:00Z', attributes: [{ name: 'ブランド名', mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 3, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' }] },
     neCost: { costExTax: 660, shippingCost: 237, shippingMethod: 'ネコポス', taxPercent: 10 }, profitSim: { profit: 189, marginPct: 14.8, costIncTax: 726 }, simTaxPercent: 10, profitTakeRate: 0.9,
     shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: detailShipOptions, rakutenGroupNeHints: detailShipHints,
-    profitShipPicks: vari.profitShipPickByGroup(detailShipOptions, detailShipHints), yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '1y5', ...pageInfoVars,
+    profitShipPicks: vari.profitShipPickByGroup(detailShipOptions, detailShipHints),
+    profitShipNear: vari.profitShipNearByGroup(detailShipOptions, detailShipHints), yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '1y5', ...pageInfoVars,
     // 商品ページ表記: 化粧品 + NE推測の配送で全分岐を描かせる
     pageInfo: { product_type: 'cosmetics', content_volume: '50ml', size_text: null, ingredients: '水', usage_notes: null, origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品', seller_name: 'メーカーA', importer_name: '輸入者B', food_name: null, food_ingredients: null, food_expiry: null, food_storage: null },
     pageInfoHtml: '<table><tr><td>x</td></tr></table>',
@@ -10439,7 +10440,7 @@ for (const [name, file, data] of renders) {
       {
         thumbnailUrl, fileViewUrl, shopCatSyncState: null,
         // 楽天の配送方法を変えたとき利益試算をどれに合わせるか (2026-10-06)。既定 = 合わせ先なし
-        profitShipPicks: {},
+        profitShipPicks: {}, profitShipNear: {},
         // 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18)。既定 = 無し。
         //    「ある」ときの見え方は fixture 側で上書きする
         backLabelPhotos: [], backLabelOcrEnabled: false,
@@ -10608,12 +10609,12 @@ for (const [name, file, data] of renders) {
     let raw = null;
     return { get raw() { return raw; }, getItem: () => raw, setItem: (_k, v) => { raw = v; }, removeItem: () => { raw = null; } };
   };
-  function mount({ options, picks, labels, hints, neCurrent, rkValue, store: given }) {
+  function mount({ options, picks, near, labels, hints, neCurrent, rkValue, store: given }) {
     const sel = fakeEl();
     sel.dataset.current = neCurrent;
     const note = fakeEl();
     const holder = fakeEl();
-    holder.textContent = JSON.stringify({ options, picks, labels, hints });
+    holder.textContent = JSON.stringify({ options, picks, labels, hints, near });
     const rk = fakeEl();
     rk.value = rkValue;
     const store = given || fakeStore();
@@ -10652,7 +10653,8 @@ for (const [name, file, data] of renders) {
   const hints = vari.RAKUTEN_GROUP_NE_HINTS;
   const labels = listing.ALL_SHIPPING_METHOD_GROUPS;
   const picks = vari.profitShipPickByGroup(options, hints, labels);
-  const m = mount({ options, picks, labels, hints, neCurrent: 'ネコポス', rkValue: '1y5' });
+  const near = vari.profitShipNearByGroup(options, hints, labels);
+  const m = mount({ options, picks, near, labels, hints, neCurrent: 'ネコポス', rkValue: '1y5' });
 
   // ① 開いた直後 = 保存済みの楽天配送方法 (定形外) に合わせる。これが報告そのもの
   check('🚨 画面の試算: 定形外で保存済みの商品を開くと配送費が定形外のものになる (NEのネコポスのままにしない)',
@@ -10698,16 +10700,67 @@ for (const [name, file, data] of renders) {
 
   // ⑦ 保存 → 読み直し (同じタブ = 同じ sessionStorage)。人が選んだ便が残る
   const shared = fakeStore();
-  const a = mount({ options, picks, labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: shared });
+  const a = mount({ options, picks, near, labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: shared });
   check('画面の試算: 覚えた便が無ければ、開いたときは配送方法に合わせる (前提の確認)',
     a.ship() === 182, String(a.ship()));
   a.pick('定形外規格外（1kg以内）');
-  const b = mount({ options, picks, labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: shared });
+  const b = mount({ options, picks, near, labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: shared });
   check('🚨 画面の試算: 保存の読み直し後も、人が選んだ便で試算する (最多候補へ戻さない)',
     b.ship() === 510 && b.sel.value === '定形外規格外（1kg以内）', String(b.ship()));
-  const c = mount({ options, picks, labels, hints, neCurrent: 'ネコポス', rkValue: '5', store: shared });
+  const c = mount({ options, picks, near, labels, hints, neCurrent: 'ネコポス', rkValue: '5', store: shared });
   check('🚨 画面の試算: 別タブで配送方法が変わっていたら古い選択は捨てて合わせ直す',
     c.ship() === 237 && c.sel.value === 'ネコポス', String(c.ship()));
+
+  // ─── 🚨 本番の経路を通して確かめる (Codex R10 P3)。上の試験は picks を自分で作って
+  //     渡しているので、router が渡し忘れても落ちない。**実際の GET /detail/:id が描いた
+  //     profit-ship-data** を取り出し、同じピッカーに載せて 182円 になるところまで見る ───
+  {
+    const express2 = (await import('express')).default;
+    const routerMod2 = await import('../router.js');
+    const app2 = express2();
+    app2.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
+    app2.use('/ph', routerMod2.default);
+    const server2 = app2.listen(0);
+    const base2 = `http://127.0.0.1:${server2.address().port}/ph`;
+    // 在庫全体 (候補の母数)。この商品は NE=ネコポス 237円 だが、楽天では「定形外」で出す
+    db.prepare('DELETE FROM mirror_products WHERE product_id BETWEEN 99700 AND 99799').run();
+    const insE2 = db.prepare(`INSERT INTO mirror_products
+      (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 原価, 送料, 配送方法, 消費税率, updated_at)
+      VALUES (?, ?, 'x', '1', '取扱中', 'ok', ?, ?, ?, 0.1, '2026-10-07T00:00:00Z')`);
+    insE2.run(99700, 'E2E-SHIP', 660, 237, 'ネコポス');
+    insE2.run(99701, 'e2e-f1', 100, 182, '定形外規格内（50g以内）');
+    insE2.run(99702, 'e2e-f2', 100, 182, '定形外規格内（50g以内）');
+    insE2.run(99703, 'e2e-f3', 100, 510, '定形外規格外（1kg以内）');
+    insE2.run(99704, 'e2e-f4', 100, 146, '定形内（50g以内）');
+    const idE2 = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, price, created_by)
+      VALUES ('E2E-SHIP', '配送追従の通し確認', 2000, 'smoke')
+    `).run().lastInsertRowid);
+    // 楽天の配送方法は「定形外」(1) で保存済み = 中原さんの報告の状態
+    db.prepare('INSERT INTO draft_rakuten (draft_id, shipping_method_group) VALUES (?, ?)').run(idE2, '1');
+
+    const htmlE2 = await (await fetch(`${base2}/detail/${idE2}`)).text();
+    const holderRe = /<script type="application\/json" id="profit-ship-data">([\s\S]*?)<\/script>/;
+    const rawE2 = (htmlE2.match(holderRe) || [])[1];
+    check('🚨 通し確認: 本番の GET /detail/:id が「配送方法で試算」の材料を埋めている',
+      !!rawE2 && htmlE2.includes('id="profit-ship-select"'), String(rawE2 || '').slice(0, 120));
+    const dataE2 = JSON.parse(String(rawE2 || '{}').replace(/\\u003c/g, '<'));
+    check('🚨 通し確認: 楽天「定形外」の合わせ先が NE の定形の便になっている (router が渡している)',
+      dataE2.picks?.['1']?.method === '定形外規格内（50g以内）' && dataE2.picks['1'].cost === 182,
+      JSON.stringify(dataE2.picks?.['1']));
+    check('通し確認: 近いものの一覧も系統で分かれている (ネコポスは定形外に入らない)',
+      Array.isArray(dataE2.near?.['1']) && dataE2.near['1'].includes('定形外規格内（50g以内）')
+      && !dataE2.near['1'].includes('ネコポス'), JSON.stringify(dataE2.near?.['1']));
+    // 本番が描いた材料をそのままピッカーに載せる = 画面で見える数字
+    const mE2 = mount({
+      options: dataE2.options, picks: dataE2.picks, near: dataE2.near,
+      labels: dataE2.labels, hints: dataE2.hints, neCurrent: 'ネコポス', rkValue: '1',
+    });
+    check('🚨 通し確認: 定形外で保存済みの商品を開くと、配送費が 182円 で利益が出る',
+      mE2.ship() === 182, String(mE2.ship()));
+    server2.close();
+    db.prepare('DELETE FROM mirror_products WHERE product_id BETWEEN 99700 AND 99799').run();
+  }
 }
 
 // ─── 白抜き画像の受信箱 (2026-09-14): 画像タブの白抜きの枠にボタン + 選択画面。JS への値は data 属性で渡す ───
@@ -13336,7 +13389,7 @@ for (const [name, file, data] of renders) {
     const n = api.profitShipNoteText({ followed: d.followed, method: d.method, groupLabel: '定形外', neCurrent: 'ネコポス', isCurrent: false });
     check('配送方法で試算: 注記に「何で試算しているか」と候補の件数・代表送料の幅を書く',
       n.includes('試算: 「定形外規格内（50g以内）」182円')
-      && n.includes('候補 2 件 (送料0円は除く)') && n.includes('代表の送料 182〜510円')
+      && n.includes('候補 2 件 (送料0円は除く)') && n.includes('送料 182〜510円')
       && n.includes('違うなら選び直してください'), n);
     // 🚨 画面の配送方法に合わせて NE を上書きしたのだから、何を上書きしたかを出す (Codex R6 P2)
     check('🚨 配送方法で試算: NE と食い違うときは NE の配送方法も注記に出す',

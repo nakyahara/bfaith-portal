@@ -65,7 +65,7 @@ import { importImageDbByStatus } from './services/notion-image-import.js';
 import { buildPromptTemplates, composeColorVariations, composeProductInfo } from './lib/prompt-templates.js';
 // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)
 import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-auto.js';
-import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, profitShipPickByGroup, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
+import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, profitShipPickByGroup, profitShipNearByGroup, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
 import { existingPageOfDraft, EXISTING_PAGE_CHOICES } from './lib/existing-page.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
@@ -493,6 +493,8 @@ router.get('/detail/:id', (req, res) => {
     // 楽天の配送方法を変えたときに試算をどの NE 配送方法へ合わせるか (2026-10-06)。
     // 画面の選択肢 (neShipChoices) から決めるので、画面に無い配送方法は選ばれない
     profitShipPicks: profitShipPickByGroup(neShipChoices, RAKUTEN_GROUP_NE_HINTS),
+    // 画面で「楽天の指定に近いもの」に集める候補。自動で選ぶ側と同じ分け方 (運送会社の系統)
+    profitShipNear: profitShipNearByGroup(neShipChoices, RAKUTEN_GROUP_NE_HINTS),
     skuAttrGrid, skuExemptions,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,

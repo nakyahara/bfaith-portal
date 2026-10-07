@@ -846,7 +846,7 @@ th.attr-unknown { color: #dc2626; }
                 <%# 注記は改行で 3 行に分ける (1 行だと 180 字の薄い字になって結論が埋もれる — Codex R7 P3) %>
                 <div id="profit-ship-note" class="muted" style="font-size:11px; margin-top:2px; white-space:pre-line;"></div>
               </div>
-              <script type="application/json" id="profit-ship-data"><%- JSON.stringify({ options: neShippingOptions || [], hints: rakutenGroupNeHints || {}, picks: profitShipPicks || {}, labels: allShippingGroups || {} }).replace(/</g, '\\u003c') %></script>
+              <script type="application/json" id="profit-ship-data"><%- JSON.stringify({ options: neShippingOptions || [], hints: rakutenGroupNeHints || {}, picks: profitShipPicks || {}, near: profitShipNear || {}, labels: allShippingGroups || {} }).replace(/</g, '\\u003c') %></script>
             <% } %>
           </div>
         </div>
@@ -951,7 +951,10 @@ th.attr-unknown { color: #dc2626; }
           <%# 「配送方法で試算」のプルダウンが出る条件そのもの (税率は利益額が出るかの条件で、
               プルダウンの有無とは別 — 混ぜると文が実物と合わない。Codex R4 P3) %>
           <% const shipPickerShown = !!(neCost && !neCost.costVaries && neCost.costExTax != null && neCost.shippingCost != null); %>
-          <% if (shipPickerShown) { %>
+          <% if (shipPickerShown && simTaxPercent == null) { %>
+            <%# 税率が決まらない商品は配送方法だけ合わせる (利益額は左で止まっている — Codex R10 P3) %>
+            <div class="muted" style="font-size:11px;">※ここは楽天へ送る配送方法です。変えると左の「配送方法で試算」も合わせますが、<strong>税率が決まるまで利益額は出ません</strong></div>
+          <% } else if (shipPickerShown) { %>
             <%# 候補が無い配送方法 (NE 側に同じ系統の便が無い) では左に「変えていません」と出るので、
                 ここで言い切らない (左右で食い違う — Codex R9 P3) %>
             <div class="muted" style="font-size:11px;">※ここは楽天へ送る配送方法です。変えると左の「配送方法で試算」も合わせて利益を計算し直します (対応するNEの配送方法が無いときは左にそう出ます。送料が複数あるものは選び直せます)</div>
@@ -5288,7 +5291,9 @@ th.attr-unknown { color: #dc2626; }
         const why = p.reason === 'ne' ? 'NE に登録されている配送方法'
           : (p.reason === 'label' ? '楽天の名前に合うものの中でいちばん多く使っているもの'
             : 'いちばん多く使っているもの');
-        lines.push('候補 ' + p.candidates + ' 件 (送料0円は除く)・代表の送料 '
+        // min/max には**その商品の実送料**が混ざる (profitShipChoices が現在行を実値に置換する)
+        // ので「代表の送料」とは書かない (Codex R10 P3)
+        lines.push('候補 ' + p.candidates + ' 件 (送料0円は除く)・送料 '
           + Math.round(p.min).toLocaleString() + '〜' + Math.round(p.max).toLocaleString() + '円 — '
           + why + 'を使いました。違うなら選び直してください');
       }
@@ -5333,7 +5338,7 @@ th.attr-unknown { color: #dc2626; }
       const note = document.getElementById('profit-ship-note');
       const holder = document.getElementById('profit-ship-data');
       if (!sel || !holder) return;
-      let data = { options: [], hints: {}, picks: {}, labels: {} };
+      let data = { options: [], hints: {}, picks: {}, near: {}, labels: {} };
       try { data = JSON.parse(holder.textContent) || data; } catch (e) { /* 無ければ選択肢なし */ }
       if (!data.options.length) { sel.closest('div').hidden = true; return; }
       const neCurrent = sel.dataset.current || '';
@@ -5355,9 +5360,13 @@ th.attr-unknown { color: #dc2626; }
       function build({ follow = false } = {}) {
         const chosen = sel.value || neCurrent;   // 組み直すと消えるので先に控える
         const group = groupOf();
-        // 楽天で選んでいるグループに関係しそうな配送方法を上のグループに集める
+        // 楽天で選んでいるグループに関係しそうな配送方法を上のグループに集める。
+        // 🚨 サーバーが運送会社の系統で分けた一覧を使う。目安の語の部分一致だと
+        //    「ヤマト(ネコポス)」が 宅急便 の「近いもの」に並び、人が選ぶと宅急便なのに
+        //    237円 で試算できてしまう (Codex R10 P2)。古い画面向けに語の一致も残す
+        const nearList = data.near?.[group];
         const hints = data.hints[group] || [];
-        const match = (o) => hints.some((h) => o.method.includes(h));
+        const match = (o) => (nearList ? nearList.includes(o.method) : hints.some((h) => o.method.includes(h)));
         const near = data.options.filter(match);
         const rest = data.options.filter((o) => !match(o));
         sel.replaceChildren();

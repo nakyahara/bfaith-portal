@@ -492,6 +492,16 @@ export function profitShipChoices(options, neMethod, neShippingCost) {
 }
 
 /**
+ * 楽天の配送方法グループ → その系統の NE の配送方法 (画面で候補を上に集めるのに使う)。
+ *
+ * 🚨 目安の語の**部分一致で集めてはいけない**。「ヤマト(ネコポス)」が 宅急便 (7/8) の
+ * 「楽天の指定に近いもの」に並び、人がそれを選ぶと宅急便なのに 237円 で試算できてしまう
+ * (Codex R9 P1 / R10 P2)。自動で選ぶ側 (profitShipPickByGroup) と同じ familyOf で分ける。
+ *
+ * @returns {Record<string, string[]>} 楽天グループ → NE の配送方法名 (画面の選択肢と同じ並び)
+ */
+
+/**
  * 楽天の配送方法グループ → 利益試算で使う NE の配送方法 (2026-10-06 中原さん報告)。
  *
  * 背景: #1167 で「配送方法で試算」を足したが、**基本情報の配送方法を変えても利益が動かない**
@@ -514,6 +524,19 @@ export function profitShipChoices(options, neMethod, neShippingCost) {
  * @param {Record<string,string[]>} hints 楽天グループ → 配送方法名にかかる語
  * @returns {Record<string, {method:string, cost:number, isNe:boolean, from:number, min:number, max:number}>}
  */
+export function profitShipNearByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, labels = RAKUTEN_SHIPPING_METHODS) {
+  const out = {};
+  for (const [group, words] of Object.entries(hints || {})) {
+    const family = familyOf(labels?.[group]);
+    const near = (choices || [])
+      .filter((o) => o && o.method
+        && (family ? familyOf(o.method) === family : words.some((w) => o.method.includes(w))))
+      .map((o) => o.method);
+    if (near.length) out[group] = near;
+  }
+  return out;
+}
+
 export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, labels = RAKUTEN_SHIPPING_METHODS) {
   // ⚠️ Number(null) は 0。null を先に弾かないと「送料0円」の便で試算して利益を過大に見せる
   //    (profitShipChoices / profit.js の computeProfit と同じ注意)
