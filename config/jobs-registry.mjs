@@ -474,6 +474,14 @@ export const JOBS_REGISTRY = [
       + '最新の夜間ロード (Render・02:00) が実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直し、Company DB (watcher で読むだけ) と比べる = ロードの検証。'
       + '全件 JSON = DATA_DIR/cdb-master-compare/<日付>/ (35 日)・証跡 master-compare (始めに実行中で前の結果を無効に)。見張りの W13 が読む。差がある・判定できないは ⚠️ (exit 0)・照合そのものの失敗だけ ❌。'
       + 'retry: Render同期 が retry で直ったら マスタ照合 → 見張り も走らせ直す (retry-failed-jobs.js の RERUN_AFTER)。新しい定期実行ではない) が走る。'
+      + '🆕 2026-10 (PR-7・計画 newentry_min_plan.md §3 の 2): 「マスタ照合」の直後に「新商品の許可」(apps/company-db/master-compare/new-entry-gate.mjs --daily。新しい定期実行ではない・この台帳の ping に乗る)。'
+      + 'その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease(\'single\', 回) を呼ぶ (0058・ログイン new_entry_gate = miniPC の .env の COMPANY_DB_NEW_ENTRY_GATE_URL)。'
+      + '許可が出た = 単品の新商品をポータルで開ける (〜翌日 07:00 JST・要約に「🆕 新商品の入口: 開」)。照合 ② は始めに入口を閉じ (close_new_entry_for_compare)、最後にゲートの結果を 1 行書く (record_new_entry_gate) = 照合が失敗した日は閉じたまま。'
+      + 'マスタ照合が失敗・見送り = この段は流さない (⏭️・retry で照合が直ったら RERUN_AFTER で流す)。照合 ② が判定できない・落ちた = grant を呼ばず revoke (閉・exit 0)。'
+      + '接続が無い = 「未設定」・関数が無い (0058 の前) = 「0058 の前」で飛ばす (exit 0 = 毎朝の処理を止めない)。「閉」と出すのは新しい接続で閉じたのを確かめたときだけ。widen の前で拒まれた = ⏸️ 閉 (準備中・exit 0)。'
+      + 'ほかで拒まれた (kind_gate が 0 でない・最終形・今日でない・停止の床・回の不一致) = 新しい接続で revoke → new_entry_lease_valid = false を確かめてから理由つきで「閉」❌。'
+      + 'grant の応答が切れた・返り値が壊れた・閉じたのを確かめられない = 「⚠️ 状態不明 (開いている可能性)」❌。'
+      + '失敗した朝の retry は「マスタ照合」も載せて、新しい照合の回 (close → record) から許可を出し直す (同じ回は停止の床で二度と開かない = 人が直せば同じ日に開く)。'
       + '自動再試行 (Retry1〜3) は 2026-09-29 から 1 回ずつしか動かない (apps/warehouse/retry-lock.js = data/retry-failed-jobs.lock.json)。前の回・朝の daily-sync がまだ動いていれば見送り、retry-state があれば ⏸️ を通知 (最後の 11:30 を見送った日は残りを人が確かめる)。'
       + '全部の push の後に「Company DB 見張り」(apps/company-db/watch/run.mjs。設計 = AI_reference CompanyDB構想/09。今朝の push の証跡 (DATA_DIR/company-db-evidence) と Render の完了の印を読み、'
       + '在庫の取込の完了 W1 / 欠測 W2 / 在庫の差 W3 / 注文の取込 W7 / 売上日次の公開 W9 ほか (W1〜W15 = config/watch-checks.mjs) を 4 値 (pass / breach / blocked / execution_error) で判定。結果は ops.watch_runs / watch_results / watch_issues (0023)。'
@@ -545,7 +553,14 @@ export const JOBS_REGISTRY = [
     anchor_minute_jst: 0,
     grace_hours: 7, // retry3 (11:30) + 実行時間 + 余裕。14:00までに ok が無ければ締切超過
     lifecycle: 'permanent',
-    runbook: 'logs/daily-sync-*.log を確認。個別ジョブ再実行は reference_daily_sync_manual_job_rerun (node -r dotenv/config)',
+    runbook: 'logs/daily-sync-*.log を確認。個別ジョブ再実行は reference_daily_sync_manual_job_rerun (node -r dotenv/config)。'
+      + '「新商品の許可」が閉: 要約の理由を見る。未設定 = miniPC の .env に COMPANY_DB_NEW_ENTRY_GATE_URL (ログイン new_entry_gate = scripts/company-db/create-master-edit-roles.mjs が作る・パスワードは中原さんだけ) を 1 行足す / '
+      + '関数が無い = 0058 の前 / 準備中 = widen の前 (sku_kind_not_company・not_widened) / kind_gate・shape = 照合 ② の要約と全件 JSON (DATA_DIR/cdb-master-compare/<日付>/) で区分の差を直す → retry か、手で「マスタ照合 → 新商品の許可」の順に流す / '
+      + '⚠️ 状態不明 = 開いている可能性 = すぐ DB の持ち主か new_entry_gate で ops.revoke_new_entry_lease(\'single\', 理由) → ops.new_entry_lease_valid(\'single\') が false を確かめる / '
+      + 'compare_run_mismatch = 照合 ② がゲートの結果を書けなかった (マスタ照合の要約の「新商品のゲートの記録」) / 照合が完了していない = マスタ照合を先に直す。'
+      + '手で流す = 必ず「マスタ照合」(node -r dotenv/config apps/company-db/master-compare/run.mjs --daily) → 「新商品の許可」(node -r dotenv/config apps/company-db/master-compare/new-entry-gate.mjs --daily) の順 '
+      + '(許可だけを流し直しても同じ照合の回は停止の床で拒まれる。DAILY_SYNC_RUN_ID が無い回は手で流した照合の証跡 master-compare.manual を読む・DB が一番新しい結果の行の回と同じかを確かめる)。'
+      + '急いで閉じる = DB の持ち主か new_entry_gate で ops.revoke_new_entry_lease(\'single\', 理由) (非常の止めは MASTER_NEW_ENTRY_STOP=1)',
   },
   {
     id: 'mf-daily-sync',

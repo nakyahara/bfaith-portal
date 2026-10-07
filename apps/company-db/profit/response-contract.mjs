@@ -166,12 +166,15 @@ const NO_ROLLBACK_ROW = new Map([...CANCEL_MAP, CANCEL_UNCLASSIFIED].map((r) => 
  *     ⑤ どれにも当たらない = CANCEL_UNCLASSIFIED (知らない段も)
  * send_rollback は別に決める (#1615 Codex R1 M1): sqlstate が NO_ROLLBACK_SQLSTATES (25P04) なら ⓪〜⑤ のどれでも false
  *   (例 = 印 client_disconnect × 25P04 → 応答なし・ROLLBACK なし / 知らない印 × 25P04 → 表に無い組の 503・ROLLBACK なし)
+ * 🆕 #1615 Codex R2 Low: 入力そのものが object でない (null・undefined・配列・文字・数・関数) = 段も sqlstate も印も読めない = 知らない印と同じく
+ *   CANCEL_UNCLASSIFIED (例外を投げない・null = 「取り消しでない」にもしない = 読めない入力をほかの経路に回さず安全な固定の 503 に)
  */
-export function classifyCancellation(x = {}) {
+export function classifyCancellation(x) {
+  if (!isObj(x)) return CANCEL_UNCLASSIFIED;
   const row = classifyCancellationRow(x);
   return row && NO_ROLLBACK_SQLSTATES.includes(x.sqlstate) ? NO_ROLLBACK_ROW.get(row) : row;
 }
-function classifyCancellationRow({ stage, sqlstate = null, mark = null } = {}) {
+function classifyCancellationRow({ stage, sqlstate = null, mark = null }) {
   const hasMark = mark != null;
   const source = hasMark ? mark.source : 'unmarked';
   if (hasMark && (!CANCELLATION_SOURCES.includes(source) || source === 'unmarked')) return CANCEL_UNCLASSIFIED;
@@ -212,10 +215,21 @@ export const PROFIT_503_BODY_KEYS = Object.freeze(['ok', 'code', 'error', 'reaso
  *   どれか)。reason が無い・列挙に無いときも PROFIT_INTERNAL / APP_UNEXPECTED にする (reason も failed_months も無い PARTIAL_FAILED を作らない)
  */
 export const REASON_REQUIRED_CODES = Object.freeze([FAILED_MONTHS_CODE]);
+const isYm = (m) => typeof m === 'string' && YM_RE.test(m);
+/**
+ * 🆕 #1615 Codex R2 Low: 配列の **全部の位置** が月の形か (疎な配列の穴 = hole も 1 つの要素として見る)。
+ *   every / forEach は穴を飛ばす = ['2026-07', <穴>] を通して JSON で ["2026-07", null] になる本文を作れた。添字で 0〜length-1 を全部見る
+ *   (穴は undefined = 違反)。Array.from でなく添字にするのは、length だけ大きい疎な配列 (length 2^32-1) でも最初の穴ですぐ止めるため
+ */
+const allYm = (a) => {
+  if (!Array.isArray(a) || a.length === 0) return false;
+  for (let i = 0; i < a.length; i++) if (!isYm(a[i])) return false;
+  return true;
+};
 export function build503Body(code, reason, failedMonths) {
   const c = Object.hasOwn(PROFIT_503_ERRORS, code) ? code : 'PROFIT_INTERNAL';
   if (c === FAILED_MONTHS_CODE) {
-    const ok = Array.isArray(failedMonths) && failedMonths.length > 0 && failedMonths.every((m) => typeof m === 'string' && YM_RE.test(m));
+    const ok = allYm(failedMonths);
     const months = ok ? [...new Set(failedMonths)].sort() : [];
     const reasonOk = typeof reason === 'string' && PROFIT_503_REASONS[c].includes(reason);
     if (!ok || months.length > MAX_MONTHS || !reasonOk) return build503Body('PROFIT_INTERNAL', 'APP_UNEXPECTED');
@@ -776,11 +790,13 @@ export function validate503Body(body, request) {
     }
     const fm = body.failed_months;
     if (!Array.isArray(fm) || fm.length === 0) { errs.push('$.failed_months: 止まった月の配列 (1 つ以上) が無い'); return errs; }
-    if (fm.length > MAX_MONTHS) errs.push(`$.failed_months: ${fm.length} 個 (上限 ${MAX_MONTHS})`);
-    fm.forEach((m, k) => {
-      if (typeof m !== 'string' || !YM_RE.test(m)) errs.push(`$.failed_months[${k}]: 'YYYY-MM' の形でない (値・行・例外の文を入れない)`);
+    // 🆕 #1615 Codex R2 Low: 長すぎる配列は要素を見ない (length だけ大きい疎な配列で止まらない) / 要素は添字で全部の位置を見る (forEach は疎な配列の穴を飛ばす)
+    if (fm.length > MAX_MONTHS) { errs.push(`$.failed_months: ${fm.length} 個 (上限 ${MAX_MONTHS})`); return errs; }
+    for (let k = 0; k < fm.length; k++) {
+      const m = fm[k];
+      if (!isYm(m)) errs.push(`$.failed_months[${k}]: 'YYYY-MM' の形でない (値・行・例外の文を入れない・穴も)`);
       else if (k > 0 && !(typeof fm[k - 1] === 'string' && fm[k - 1] < m)) errs.push(`$.failed_months[${k}]: 月の厳密な昇順でない (重複・順の違い)`);
-    });
+    }
     if (request != null) {
       const touched = isValidDate(request.from) && isValidDate(request.to) && request.from <= request.to ? monthsOf(request.from, request.to).map((x) => x.month_start.slice(0, 7)) : null;
       if (!touched) errs.push('request: from / to が日付でない・逆');

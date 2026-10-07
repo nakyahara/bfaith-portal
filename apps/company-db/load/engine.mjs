@@ -64,6 +64,8 @@ export function loadRuleFingerprint(root = fileURLToPath(new URL('../../../', im
   for (const rel of LOAD_RULE_FILES) h.update(rel).update('\0').update(fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\n/g, '\n')).update('\0');
   return h.digest('hex');
 }
+/** 判断の記録の skus.sku_kind の形の版 (広げる道 v8。widen が DB で数える = 形を変えたら上げる) */
+export const SKU_KIND_DECISION_FORMAT = 'sku-kind-v1';
 /** 判断の記録 (0030 の ops.load_decisions) の形の版。中身を変えたら上げる (照合は知らない版なら blocked) */
 export const LOAD_DECISIONS_FORMAT = 'ld-v1';
 export const LOAD_DECISIONS_KEEP_DAYS = 60;
@@ -280,12 +282,49 @@ export async function runInitialLoad(db, plan, opts = {}) {
     }
     const isAcceptedCode = (code) => code != null && seenNorm.get(normSku(code)) === code;
 
+    // ── 1.5 区分 (skus.sku_kind) の持ち主 (Company DB構想 10 §5.2・「広げる道」の準備) ──
+    //   'load' (今) = 何もしない (区分は NE に合わせる = 下の s.kind のまま。読む文も増やさない)。
+    //   'company' = 既にある SKU の区分は Company DB のまま (NE に合わせない)。NE と社内で区分が違う SKU (kindHeld) は黙って上書きも無視もしない =
+    //     report.conflicts (sku_kind_held)・skus の notes・判断の記録 (decisions.skus.kind_held) に残し、照合 ② は判断の一覧に出す。
+    //     区分で動きが変わる所 (商品の行・束ねの親・セットの構成・構成の観測・商品に付ける属性) は社内の区分で決め、
+    //     NE の区分の形の材料 (セットの構成など) を社内の区分の違う SKU に入れない (安全側 = 社内の行を変えない方。NE を NE の画面で直すまで待つ)
+    const kindOwned = loadOwns('skus.sku_kind');
+    const kindHeld = new Map();   // code_norm → { code, ne_kind, cdb_kind } (持ち主が company で、NE と社内の区分が違う既にある SKU)
+    if (!kindOwned) {
+      const norms = accepted.map((s) => normSku(s.code));
+      const cdbKind = new Map();
+      for (let i = 0; i < norms.length; i += 5000) {
+        for (const r of (await db.query('select code_norm, sku_kind from core.skus where company_id = $1 and code_norm = any($2::text[])', [COMPANY_ID, norms.slice(i, i + 5000)])).rows) cdbKind.set(r.code_norm, r.sku_kind);
+      }
+      for (const s of accepted) {
+        const ck = cdbKind.get(normSku(s.code));
+        if (ck !== undefined && ck !== s.kind) kindHeld.set(normSku(s.code), { code: s.code, ne_kind: s.kind, cdb_kind: ck });
+      }
+      for (const x of kindHeld.values()) report.conflicts.push({ kind: 'sku_kind_held', code: x.code, ne_kind: x.ne_kind, cdb_kind: x.cdb_kind });
+      skuSec.notes.push(`区分: Company DB が正 (NE と区分が違う ${kindHeld.size} 件は社内の区分のまま・食い違いとして記録)`);
+    }
+    /** その SKU を夜間ロードが扱う区分 (持ち主が company で既にある SKU = 社内の区分 / それ以外 = 材料 (NE) の区分) */
+    const kindOf = (s) => kindHeld.get(normSku(s.code))?.cdb_kind ?? s.kind;
+    const isKindHeld = (s) => kindHeld.has(normSku(s.code));
+
     // ── 2. products (単品 SKU に 1:1)。skus の CHECK (単品は product 必須) があるので product を先に作る ──
     decisions.skus = { accepted: accepted.length, skipped: skuSec.skipped.map((x) => [x.code ?? null, x.reason_code ?? 'unknown', x.winner ?? null]) };
+    // 区分が company のときだけ: NE と社内で区分が違う SKU (照合 ① ② が説明に使う。load のときは書かない)
+    if (!kindOwned) decisions.skus.kind_held = [...kindHeld.values()].map((x) => [x.code, x.ne_kind, x.cdb_kind]);
+    // 区分の記録 (広げる道 v11 §8-4。widen が DB で数える = 形を固定。行の format は ld-v1 のまま・payload.sku_kind.format で版を持つ)。毎回 (load でも company でも):
+    //   held = 区分の持ち主が company で、材料の区分と社内の区分が違った SKU のコード (文字) の配列 (load のときは空の配列) /
+    //   unverifiable = 区分を確かめられない材料の行 [{reason, raw_code, code_norm}] (sources.mjs が落とす前の生の行から作る。材料を読まない plan = 空の配列)
+    decisions.skus.sku_kind = {
+      format: SKU_KIND_DECISION_FORMAT,
+      held: [...kindHeld.values()].map((x) => x.code).sort(),
+      unverifiable: (plan.kindUnverifiable || []).map((x) => ({ reason: x.reason, raw_code: x.raw_code, code_norm: x.code_norm })),
+    };
+    // 区分が違う SKU (kindHeld) の商品の行は作らない・直さない (NE が単品・社内がセット = 単品の商品を作らない / NE がセット・社内が単品 = セットの値で単品の商品を直さない)
     const prodSec = section(report, 'products', accepted.filter((s) => s.kind === 'single').length);
+    for (const s of accepted) if (s.kind === 'single' && isKindHeld(s)) prodSec.skipped.push({ code: s.code, reason: `区分が NE (単品) と社内 (${kindOf(s)}) で違う = 商品の行は触らない`, reason_code: 'kind_held' });
     const existing = new Map((await db.query('select s.code_norm, s.product_id from core.skus s where s.company_id = $1 and s.product_id is not null', [COMPANY_ID])).rows.map((r) => [r.code_norm, Number(r.product_id)]));
     const productIdBySku = new Map(existing);
-    const toCreate = accepted.filter((s) => s.kind === 'single' && !existing.has(normSku(s.code)));
+    const toCreate = accepted.filter((s) => s.kind === 'single' && !isKindHeld(s) && !existing.has(normSku(s.code)));
     const toCreateSet = new Set(toCreate);
     const created = await insertMany(db, 'core.products', ['company_id', 'display_code', 'name', 'sales_class', 'status', 'created_by_type', 'created_by_id'],
       toCreate.map((s) => ({ company_id: COMPANY_ID, display_code: s.code, name: s.name || s.code, sales_class: s.salesClass ?? null, status: s.handling === 'discontinued' ? 'discontinued' : 'active', created_by_type: 'system', created_by_id: runId })),
@@ -293,7 +332,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     for (const r of created) productIdBySku.set(normSku(r.display_code), Number(r.product_id));
     prodSec.applied = created.length;
     // 既存 product の名前・状態・分類の追随は 1 文で (逐次 UPDATE を避ける)。持ち主が 'company' の列は直さない
-    const upd = accepted.filter((s) => s.kind === 'single' && !toCreateSet.has(s) && productIdBySku.has(normSku(s.code)));
+    const upd = accepted.filter((s) => s.kind === 'single' && !isKindHeld(s) && !toCreateSet.has(s) && productIdBySku.has(normSku(s.code)));
     const prodCols = [['name', 'v.name', 'products.name'], ['sales_class', 'v.sc', 'products.sales_class'], ['status', 'v.st', 'products.status']].filter(([, , k]) => loadOwns(k));
     let prodUpdated = 0;
     for (let i = 0; prodCols.length && i < upd.length; i += CHUNK) {
@@ -306,10 +345,25 @@ export async function runInitialLoad(db, plan, opts = {}) {
     }
     prodSec.applied += prodUpdated; prodSec.same = upd.length - prodUpdated;
 
+    // 正規化の前に、外す product_id を全部数える (最終の区分が単品でないのに商品が付いている SKU)。証拠 = report.normalization・判断の記録 (件数・hash・全件)。
+    //   整合している (0 件) なら何も足さない = report・記録の形は今までと同じ
+    const normEvidence = (rows) => ({ count: rows.length, sha256: crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex'), rows });
+    {
+      const unlink = accepted.filter((s) => kindOf(s) !== 'single' && existing.has(normSku(s.code))).map((s) => [s.code, kindOf(s), existing.get(normSku(s.code))])
+        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+      if (unlink.length) {
+        (report.normalization ||= {}).product_unlinked = normEvidence(unlink);
+        decisions.skus.normalized_unlinked = normEvidence(unlink);
+        skuSec.notes.push(`区分の正規化: 単品でない SKU ${unlink.length} 件の product_id を外す (商品の行は消さない)`);
+      }
+    }
     // ── 3. skus (upsert by company + code_norm。単品は product_id つき) ──
     const skuRows = accepted.map((s) => ({
-      company_id: COMPANY_ID, product_id: s.kind === 'single' ? productIdBySku.get(normSku(s.code)) : null,
+      company_id: COMPANY_ID, product_id: kindOf(s) === 'single' ? productIdBySku.get(normSku(s.code)) : null,
       ...skuValuesForLoad(s),   // 照合の ① と共用する規則 (0027 の列を含む)
+      // 区分が違う SKU (kindHeld) = 社内の区分で出す (on conflict の SET には入らない = 社内の値のまま)。
+      //   🚨 NE の区分 (単品・product なし) のまま出すと、既にある行でも INSERT の候補の行の CHECK (単品は product 必須) でロード全体が落ちる
+      ...(isKindHeld(s) ? { sku_kind: kindOf(s) } : {}),
       // 0057: 新しく作る行の登録日 (既にある行は on conflict で触らない = 下の「空の行だけ埋める」で)。2 つの列は明示する (列の既定値は空。書かない古いコードの INSERT も空 = 次の晩に NE の作成日で埋まる)
       ...registeredOnForNew(s, jstToday),
       created_by_type: 'system', created_by_id: runId,
@@ -319,7 +373,9 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // 🚨 WHERE で UPDATE しなかった行は RETURNING に出ないので、sku_id は後で読み直す
     const skuSet = SKU_OWNED_COLUMNS
       .filter(([c, k]) => loadOwns(k) && (has0027 || !SKU_0027_COLUMNS.includes(c))).map(([c]) => [c, `excluded.${c}`]);
-    skuSet.push(['product_id', 'coalesce(core.skus.product_id, excluded.product_id)']);
+    // 最終の区分 (持ち主が load = NE の区分 / company = 社内の区分。excluded.sku_kind = kindOf) で product_id を正規化する (広げる道 v5・Codex R5):
+    //   単品 = 今の商品を保つ (無ければ付ける) / セット・例外 = 外す (前の区分の名残の商品を付けたままにしない)。商品の行そのものは消さない
+    skuSet.push(['product_id', "case when excluded.sku_kind = 'single' then coalesce(core.skus.product_id, excluded.product_id) end"]);
     const returned = await insertMany(db, 'core.skus', ['company_id', 'product_id', 'sku_kind', 'code', 'name', 'tax_rate', 'tax_class', 'handling',
       ...(has0027 ? ['standard_price_jpy', 'shipping_code', 'shipping_method', 'shipping_cost_jpy'] : []), ...(has0057 ? ['registered_on', 'registered_on_source'] : []),
       'created_by_type', 'created_by_id'], skuRows, {
@@ -367,7 +423,10 @@ export async function runInitialLoad(db, plan, opts = {}) {
         ? `登録日: 空だった ${filled} 件を NE の作成日で埋めた (NE の作成日あり ${reg.length} 件・snapshot ${ra.runId}${ra.invalid ? '・読めない日付 ' + ra.invalid + ' 件' : ''}${ra.dup ? '・コードが正規化で重なる ' + ra.dup + ' 件' : ''})`
         : `登録日: NE の作成日は見送り (${ra.reason || '材料なし'})`);
     }
-    const productIdOf = (code) => (isAcceptedCode(code) ? productIdBySku.get(normSku(code)) : undefined);
+    // 最終の区分 (持ち主が load = NE の区分 / company = 社内の区分) が単品の SKU だけ商品 (product) に付ける
+    //   (前の区分の名残の product_id があったセット・例外に、観測・物理属性・成分を付けない。上の upsert で product_id も外した)
+    const acceptedKind = new Map(accepted.map((s) => [normSku(s.code), kindOf(s)]));
+    const productIdOf = (code) => (isAcceptedCode(code) && acceptedKind.get(normSku(code)) === 'single' ? productIdBySku.get(normSku(code)) : undefined);
     const productIdsInRun = [...new Set(accepted.map((s) => productIdOf(s.code)).filter(Boolean))];
     log(`skus: ${skuSec.applied} (skip ${skuSec.skipped.length}), products: new ${created.length} / updated ${prodUpdated}`);
     // 0052 (Company DB構想 14 ⑤-2a・契約 v3 H3): 登録の状態。切替の日の backfill の後は、NE から新しく作った SKU を同じ取引で quarantined (要確認) にする
@@ -425,7 +484,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
         const status = kids.some((c) => acceptedByNorm.get(normSku(c))?.handling === 'active') ? 'active' : 'discontinued';
         const own = isAcceptedCode(g.code) ? acceptedByNorm.get(k) : null;
         if (own) {   // 代表コードが SKU として実在する → その商品の product を親に (名前は商品のものなので触らない)
-          if (own.kind !== 'single') { skipGroup(gi, g.code, `代表コードが ${own.kind} の SKU (名札にしない)`, 'rep_not_single'); report.conflicts.push({ kind: 'variation_parent_not_single', representative: g.code, sku_kind: own.kind, children: kids.length }); continue; }
+          if (kindOf(own) !== 'single') { skipGroup(gi, g.code, `代表コードが ${kindOf(own)} の SKU (名札にしない)`, 'rep_not_single'); report.conflicts.push({ kind: 'variation_parent_not_single', representative: g.code, sku_kind: kindOf(own), children: kids.length }); continue; }
           const pid = productIdOf(own.code);
           if (!pid) { skipGroup(gi, g.code, '代表コードの product が無い', 'rep_no_product'); continue; }
           parentPidOfGroup.set(gi, pid); vgSec.same++; continue;
@@ -469,7 +528,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
       rep_semantics: plan.material?.products?.repSemantics ?? null,
     };
     const canUnlink = has0036 && repTrust.matched && !!repTrust.source_complete_at && repTrust.rep_semantics === 'src1';
-    const singles = parentOwned ? accepted.filter((s) => s.kind === 'single' && productIdOf(s.code)) : [];
+    // 区分が違う SKU (kindHeld) は子にしない (NE が単品でも社内がセット = 単品の親子を付けない / NE がセット = もともと子でない)。判断の記録では held (kind_held) に入れる
+    const singles = parentOwned ? accepted.filter((s) => s.kind === 'single' && !isKindHeld(s) && productIdOf(s.code)) : [];
     const singlePids = new Set(singles.map((s) => productIdOf(s.code)));
     // 子の product ごとに、まとまりの行 (どのまとまり・子の原文) を集める。子が採用した単品でなければ理由つき skip
     const entriesByChild = new Map();
@@ -624,6 +684,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
         for (const r of (await db.query('select product_id, display_code from core.products where product_id = any($1::bigint[])', [refIds.slice(i, i + 5000)])).rows) disp.set(Number(r.product_id), r.display_code ?? null);
       }
       const targets = [], held = [];
+      // 区分が違う SKU (NE は単品) = 照合 ① の網羅 (材料の単品 = targets ∪ held) のため held に。親子は触らないので今の親は記録しない
+      for (const s of accepted) if (s.kind === 'single' && isKindHeld(s)) held.push([s.code, 'kind_held', null, null, null]);
       for (const s of singles) {
         const pid = productIdOf(s.code); const x = act.get(pid); const c = cur.get(pid) || { pp: null, by: null };
         if (x.a === 'hold') held.push([s.code, x.reason, c.pp, c.pp != null ? (disp.get(c.pp) ?? null) : null, c.by]);
@@ -638,12 +700,34 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // ── 4. sku_components (完全に読めた親だけ plan に合わせる。manual は残し、数量が違えば conflict) ──
     // 持ち主が Company DB なら構成には触らない (予定 0 件 = 足さない・直さない・消さない)
     const planSetComponents = loadOwns('sku_components') ? plan.setComponents : [];
+    let normalizedComponents = null;   // 正規化で消した構成 (判断の記録に)
     const compSec = section(report, 'set_components', planSetComponents.length);
     if (!loadOwns('sku_components')) compSec.notes.push(`Company DB が正: 構成 ${plan.setComponents.length} 行は見送り`);
+    // 正規化 (広げる道 v5・Codex R5): セットでない親 (最終の区分 = 単品・例外) の構成を消す (manual も。区分がセットでない SKU に構成は無い)。
+    //   持ち主が company の構成は消さない = 数を conflicts に残す (区分と構成の持ち主を一緒に切り替える前提)。整合している行には何もしない
+    {
+      // 消す前に全件を読む (preflight)。証拠 = report.normalization・判断の記録 (件数・hash・全件 = [親のコード, 子のコード, 数量, source, 親の区分])
+      const bad = (await db.query(`select p.code as parent, ch.code as child, c.qty, c.source, p.sku_kind from core.sku_components c join core.skus p on p.sku_id = c.parent_sku_id
+        join core.skus ch on ch.sku_id = c.child_sku_id where p.company_id = $1 and p.sku_kind <> 'set' order by p.code_norm, ch.code_norm`, [COMPANY_ID])).rows
+        .map((r) => [r.parent, r.child, Number(r.qty), r.source, r.sku_kind]);
+      if (bad.length && loadOwns('sku_components')) {
+        const del = await db.query("delete from core.sku_components c using core.skus p where p.sku_id = c.parent_sku_id and p.company_id = $1 and p.sku_kind <> 'set'", [COMPANY_ID]);
+        if ((del.rowCount ?? bad.length) !== bad.length) throw Object.assign(new Error(`区分の正規化: 消す予定 ${bad.length} 行に対して ${del.rowCount} 行 (巻き戻す)`), { code: 'LOAD_NORMALIZE_MISMATCH' });
+        const ev = normEvidence(bad);
+        (report.normalization ||= {}).components_removed = ev;
+        normalizedComponents = ev;
+        compSec.notes.push(`セットでない親の構成 ${bad.length} 行を消した (区分の正規化)`);
+        report.conflicts.push({ kind: 'components_on_non_set_removed', count: bad.length, sha256: ev.sha256 });
+      } else if (bad.length) report.conflicts.push({ kind: 'components_on_non_set_kept', count: bad.length, sha256: normEvidence(bad).sha256, rows: bad });
+    }
     const compCand = []; const compKeys = new Set(); const parentsWithSkip = new Set();
     for (const c of planSetComponents) {
       const p = skuIdOf(c.parentCode); const ch = skuIdOf(c.childCode);
       if (!p) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '親 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_parent' }); continue; }
+      // 構成は最終の区分がセットの親だけ (正規化)。区分が違う親 (kindHeld) で社内がセットでない = NE のセットの構成を社内の単品・例外に入れない
+      const heldKind = kindHeld.get(normSku(c.parentCode));
+      if (heldKind && heldKind.cdb_kind !== 'set') { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `親の区分が NE (${heldKind.ne_kind}) と社内 (${heldKind.cdb_kind}) で違う = 構成は触らない`, reason_code: 'kind_held', _p: p, ...(ch ? { _ch: ch } : {}) }); parentsWithSkip.add(p); continue; }
+      if (acceptedKind.get(normSku(c.parentCode)) !== 'set') { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `親の区分がセットでない (${acceptedKind.get(normSku(c.parentCode))}) = 構成を入れない`, reason_code: 'parent_not_set', _p: p, ...(ch ? { _ch: ch } : {}) }); parentsWithSkip.add(p); continue; }
       if (!ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_child', _p: p }); parentsWithSkip.add(p); continue; }
       if (p === ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '自分自身', reason_code: 'self', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
       const k = `${p}|${ch}`; if (compKeys.has(k)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '重複', reason_code: 'duplicate', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; } compKeys.add(k);
@@ -694,6 +778,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
         prune_parents: pruneParents.map((p) => [parentCode.get(p) ?? null, Number(p)]),
         rows: [...compRows.map((r) => [r._parent, r._child, Number(r.qty), 'load']), ...compManualSame.map((r) => [r._parent, r._child, Number(r.qty), 'manual_same'])],
         manual_kept_on_prune: manualKeptOnPrune,
+        // 区分の正規化で消した構成 (セットでない親。件数・hash・全件)。消していない回は書かない (記録の形は今までと同じ)
+        ...(normalizedComponents ? { normalized_removed: normalizedComponents } : {}),
         // 4 つめ = 保持状態 (held) と、manual_qty_mismatch なら manual の数量・材料の数量 (照合 ② は記録と今の差が一致したときだけ説明済みにする。Codex C2-R1 ① / C2-R2 H1)
         skipped: compSec.skipped.map((x) => [x.parent ?? null, x.child ?? null, x.reason_code ?? 'unknown',
           x.reason_code === 'manual_qty_mismatch' ? { manual_qty: x.manual_qty, plan_qty: x.plan_qty, held: heldOf(x) } : { held: heldOf(x) }]),
@@ -706,7 +792,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     //   持ち主が 'load' の間は上の 4. が今までどおり core.sku_components を NE に合わせる (観測は残すだけ)。
     //   持ち主が 'company' になったら 4. は構成に触らない = 観測と、commit の後の依頼の昇格・食い違い (promoteComponentRequest) だけ
     //   🚨 並び (sort) は材料の行の順 (NE の API の順が rowid で運ばれたもの = NE の取得に並びの列は無い)
-    report.set_observations = await recordSetObservations(db, plan, { runId });
+    report.set_observations = await recordSetObservations(db, plan, { runId, kindHeld });
     if (report.set_observations.note) compSec.notes.push(report.set_observations.note);
 
     // ── 5. sku_costs (有効行と違うときだけ付け替え) ──
@@ -1341,7 +1427,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       await db.query(MASTER_WRITE_EXCLUSIVE_LOCK_SQL);
       const c = (await db.query(`insert into ops.master_load_commits (ingest_run_id, epoch, ownership_hash, host) values ($1, $2, $3, $4) returning commit_seq::text as seq`,
         [runId, report.ownership_epoch?.epoch ?? 'explicit', ownershipHashOf(ownership), opts.host || null])).rows[0];
-      report.load_commit_seq = Number(c.seq);
+      report.load_commit_seq = c.seq;   // bigint の番号は文字のまま (2^53 を超えても丸めない。広げる道 PR-1・設計 v10 §7.1 の 5)
     }
     if (dryRun) { await db.exec('rollback'); log('dry-run: 全部やってから巻き戻した'); }
     else { await db.exec('commit'); log('commit'); }
@@ -1395,8 +1481,11 @@ export const SET_OBSERVATION_MAX_AGE_MS = 35 * 3600000;
  *   上げる候補は集合で 1 回に計算する (観測ごとの相関の副問い合わせをしない・Medium 2)。時間 (ms) を返す
  * 🚨 ロードの取引の冒頭でマスタの書き込みの鍵 (core.master_write_lock_key) を排他で取った後に呼ぶ。0050 の関数がセットの SKU ごとの鍵を取る (昇格と同じ鍵)
  * 失敗してもロードは止めない (savepoint で戻して note に残す)。戻り値 = { state, run_id, complete, requested, sets, skipped, excluded: { 理由: 件数 }, candidates: [observation_id], ms, note }
+ * 区分の持ち主が company (kindHeld が空でない) = NE ではセットなのに社内の区分がセットでない SKU は観測の対象 (requested) から外す (kind_held に件数)。
+ *   社内のセットではない = 構成の依頼・食い違いの相手がいない。「入れられないセット」に数えると、区分を NE の画面で直すまで毎晩すべての構成の依頼が上がらない
+ *   (1 件で全部を止めない)。食い違いそのものは夜間ロードの conflicts (sku_kind_held) と照合 ② の kind で出る
  */
-async function recordSetObservations(db, plan, { runId }) {
+async function recordSetObservations(db, plan, { runId, kindHeld = new Map() }) {
   const has = (await db.query("select to_regprocedure('ops.record_ne_set_observations(jsonb)') is not null as ok")).rows[0].ok;
   if (!has) return { state: 'not_applied', note: '構成の観測: 0050 (ops.record_ne_set_observations) が未適用 (見送り)' };
   const m = plan.material?.set_components;
@@ -1411,8 +1500,11 @@ async function recordSetObservations(db, plan, { runId }) {
   if (!rawHash) return { state: 'skipped', run_id: g.generation_id, note: '構成の観測: 材料の中身のハッシュが無い = 見送り' };
   // NE のセット = 材料の構成の行の親 + 商品の材料のセット (構成の行が 0 のセットは行の親に出ない = 数えないと完全に見える・#1571 Codex R1 Medium 1)
   const byParent = new Map();
+  const notCdbSet = (code) => { const h = kindHeld.get(normSku(code)); return !!h && h.cdb_kind !== 'set'; };
+  const kindHeldSets = new Set();
   for (const c of plan.setComponents || []) {
     const pc = String(c.parentCode ?? '');
+    if (normSku(pc) && notCdbSet(pc)) { kindHeldSets.add(normSku(pc)); continue; }
     if (!byParent.has(pc)) byParent.set(pc, []);
     byParent.get(pc).push(c);
   }
@@ -1421,6 +1513,7 @@ async function recordSetObservations(db, plan, { runId }) {
   const allSets = new Set([...byParent.keys()].map((pc) => normSku(pc)));
   const zeroRow = [];
   for (const s of plan.skus || []) {
+    if (s && s.kind === 'set' && normSku(s.code ?? '') && notCdbSet(s.code)) { kindHeldSets.add(normSku(s.code)); continue; }
     if (s && s.kind === 'set' && normSku(s.code ?? '') && !allSets.has(normSku(s.code))) { allSets.add(normSku(s.code)); zeroRow.push(String(s.code)); }
   }
   // Company DB の SKU の種類 (この取引で入れた行も見える)
@@ -1467,6 +1560,7 @@ async function recordSetObservations(db, plan, { runId }) {
     await db.query('release savepoint set_observations');
     return { state: r.state, run_id: g.generation_id, observed_at: observedAt, complete, requested: allSets.size, sets: r.sets ?? sets.length,
       skipped: excluded.length + Number(r.skipped ?? 0), excluded: byReason, candidates: cands, ms: { record: t1 - t0, candidates: Date.now() - t1 },
+      ...(kindHeldSets.size ? { kind_held: kindHeldSets.size } : {}),
       ...(excluded.length ? { note: `構成の観測: 入れられないセット ${excluded.length} 件 (${Object.entries(byReason).map(([k, v]) => `${k} ${v}`).join('・')}) = 完全な回にしない (構成の依頼を上げない)` } : {}) };
   } catch (e) {
     await db.query('rollback to savepoint set_observations');

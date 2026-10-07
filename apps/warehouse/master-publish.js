@@ -43,6 +43,17 @@ export const PUBLISH_COLUMNS = Object.freeze({
   reorder_months: 'skus.reorder_months',
   handling: 'skus.handling',
   primary_supplier: 'supplier_skus.is_primary',
+  // 区分 (単品 / セット / 例外) → m_products.商品区分 (正本 = 10 の表の「商品区分」の行。KIND_TO_M で NE の語に)。
+  //   区分が NE と違う SKU (設計 = 広げる道 v3 §4.1 b・v4 の表。C の区分 3 × NE の区分 3 の 9 升):
+  //     区分が同じ 3 升 = 今までどおり (C の値を写す)
+  //     C = 単品・NE = セット (kind_c_single_ne_set) = 単品の行にして C の値を写す・構成 (m_set_components) は写さない (行を作らない・構成品数は空)
+  //     ほかの 5 升 (C = セット・NE = 単品 / 例外を含む 4 升) (kind_c_set_ne_single_frozen) = その SKU は前の m_products・m_set_components の行のまま
+  //       (fail-closed。構成 sku_components は写さない列 = セットの行を作れない・例外の所属は設計 v4 で決める)。前の行が無い = 載せない (非掲載)。
+  //       どれも毎朝 ⚠️ で知らせる・NE を C の区分に直すと翌朝から写る
+  //   持ち主が load の今は写さない (列に入らない = 何も変わらない)
+  //   🚨 区分の値の行は世代に作らない = 世代の行の sku_kind (どの行にもある・_sku の行も) が C の区分 (entriesOfRows の e.kind)。
+  //   warehouse.db の世代の表 (cdb_publish_values の col の CHECK) も世代の形も変えない
+  kind: 'skus.sku_kind',
 });
 /** 写さなくてよい列 (理由つき)。ここに無い列を company にしたら ④a は止める (写し忘れで「C が正なのに古い表は NE」を作らない。Codex R1 H1) */
 export const NO_OLD_TABLE_COPY = Object.freeze({
@@ -78,7 +89,7 @@ const TAX_CLASSES = ['STANDARD_10', 'REDUCED_8', 'MIXED', 'UNKNOWN'];
  *   単品 = 全部 / セット = 税率・税区分・売上分類・取扱区分は構成品から導く (要らない) / 例外 = 売上分類は Company DB に置く場所が無い (要らない)
  */
 const NOT_REQUIRED = { 単品: [], セット: ['tax_rate', 'tax_class', 'sales_class', 'handling'], 例外: ['sales_class'] };
-export const requiredCols = (kind, cols) => cols.filter((c) => !(NOT_REQUIRED[kind] || []).includes(c));
+export const requiredCols = (kind, cols) => cols.filter((c) => c !== 'kind' && !(NOT_REQUIRED[kind] || []).includes(c));   // 区分は値の欄ではなく行の sku_kind
 /** 列の組 (m_products の値の取り出し・今までの理由の列・持ち主の列) */
 const GROUPS = [
   ['name', (v) => v.name, ['name'], ['name']],
@@ -154,6 +165,8 @@ export function validPublishValue(col, v) {
  * 同じ norm になるコードが 2 つ以上あり、その SKU が C にある = 1 つの C の値を何件にも配らない (Codex R0 #10)
  * 種類が食い違う SKU (NE で セット → 単品 にしたのに C はまだセット など) = その SKU だけ写さない (NE の値のまま)・kindMismatch に数えて知らせる
  *   (1 行の食い違いで作り直し全部を止めない。#1564 の見直し M-5。食い違いそのものは照合 ② の kind で出る)
+ *   🆕 区分の持ち主が C (cols に kind): C = 単品・NE = セット = 除かない (kindCSingleNeSet。要る列は C の区分 = 単品で決める) /
+ *     ほかの食い違い (C = セット・NE = 単品・例外を含む升) = 除く (kindFrozen = 前の行のまま・前の行が無ければ載せない)
  * @param {Map<string, string>} codes  m_products のコード → 商品区分 (単品 / セット / 例外)
  * @param {Map<string, { v: object }>} entries  code_norm → 世代の値 (_sku の行で C にある SKU は全部入る)
  * @returns {{ missing: Array<[string, string]>, collided: string[][], notInCdb: number, notInCdbCodes: string[], kindMismatch: number, kindMismatchCodes: string[], kindMismatchNorms: Set<string> }}
@@ -165,19 +178,30 @@ export function completeness(codes, entries, cols) {
   const missing = [];
   const notIn = [];
   const kindMis = [];
+  const kindSingleNeSet = [];
+  const kindFrozen = [];
+  const copyKind = (cols || []).includes('kind');
   for (const [code, kind] of codes) {
     const e = entries.get(normSku(code));
     if (!e) { notIn.push(code); continue; }
-    if (kindDiffers(e, kind)) { kindMis.push(code); continue; }
-    for (const col of requiredCols(kind, cols)) if (!Object.hasOwn(e.v, col)) missing.push([code, col]);
+    if (kindDiffers(e, kind)) {
+      if (!copyKind) { kindMis.push(code); continue; }
+      if (!(e.kind === 'single' && kind === 'セット')) { kindFrozen.push(code); continue; }   // C = セット・NE = 単品 / 例外を含む = 前の行のまま
+      kindSingleNeSet.push(code);                                                            // C = 単品・NE = セット = 単品として写す
+    }
+    for (const col of requiredCols(copyKind ? targetKind(e, kind) : kind, cols)) if (!Object.hasOwn(e.v, col)) missing.push([code, col]);
   }
   return { missing, collided, notInCdb: notIn.length, notInCdbCodes: notIn.sort().slice(0, NOT_IN_CDB_SAMPLES),
-    kindMismatch: kindMis.length, kindMismatchCodes: [...kindMis].sort().slice(0, NOT_IN_CDB_SAMPLES), kindMismatchNorms: new Set(kindMis.map((c) => normSku(c))) };
+    kindMismatch: kindMis.length, kindMismatchCodes: [...kindMis].sort().slice(0, NOT_IN_CDB_SAMPLES), kindMismatchNorms: new Set(kindMis.map((c) => normSku(c))),
+    kindCSingleNeSet: kindSingleNeSet.length, kindCSingleNeSetCodes: [...kindSingleNeSet].sort().slice(0, NOT_IN_CDB_SAMPLES),
+    kindFrozen: kindFrozen.length, kindFrozenCodes: [...kindFrozen].sort().slice(0, NOT_IN_CDB_SAMPLES), kindFrozenAll: [...kindFrozen].sort(), kindFrozenNorms: new Set(kindFrozen.map((c) => normSku(c))) };
 }
 /** Company DB の SKU の種類 → m_products の商品区分 */
 export const KIND_TO_M = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
 /** C の種類と m_products (今朝の NE) の商品区分が違う (種類が分からない = 違うとは言わない) */
 export const kindDiffers = (e, mKind) => !!e && Object.hasOwn(KIND_TO_M, e.kind) && KIND_TO_M[e.kind] !== mKind;
+/** 区分の持ち主が C のときに m_products に入れる商品区分 (C の区分。知らない区分 = 今までの区分) */
+export const targetKind = (e, mKind) => (e && Object.hasOwn(KIND_TO_M, e.kind) ? KIND_TO_M[e.kind] : mKind);
 /** entries から norms を除いた写し (種類が食い違う SKU = C に無いのと同じに扱う) */
 export function withoutNorms(entries, norms) {
   if (!norms || !norms.size) return entries;
@@ -285,6 +309,14 @@ export function mergeReasons(code, kind, neV, v, reasons, { cells = null, genera
 }
 
 /**
+ * 作り直しの理由: 区分の持ち主が C で、今までの区分 (NE の表の形) と違う C の区分を m_products に入れた (照合 ② が由来を読む・mergeReasons と同じ形)
+ */
+export function kindReason(code, mKind, toKind, { cdbKind = null, generationNo = null } = {}) {
+  return { code, kind: toKind, col: 'kind', reason: 'company_owned', owner_key: 'skus.sku_kind',
+    cdb_value: cdbKind ? { kind: cdbKind } : null, value: toKind, ne_value: mKind, generation_no: generationNo };
+}
+
+/**
  * 列ごとに「C の値か、今までの値か」を決める道具。
  * @param {object} p
  * @param {object} p.ownership   持ち主の設定 (config/master-ownership.mjs。試験は差し替える)
@@ -294,7 +326,8 @@ export function mergeReasons(code, kind, neV, v, reasons, { cells = null, genera
  * @returns problem = 持ち主が C の列があるのに使えない = 作り直しを止める:
  *   ownership_not_supported (一緒に切り替える組が違う・④a が写さない列が company) / no_generation / not_verified / hash_mismatch /
  *   ownership_mismatch (別の epoch の世代は使わない) / value_missing (m_products に入れるコード × 要る列の欄が欠ける = NE の値で黙って埋めない) /
- *   target_norm_collision (m_products の 2 つ以上のコードが同じ C の SKU に当たる = 1 つの C の値を何件にも配らない)
+ *   target_norm_collision (m_products の 2 つ以上のコードが同じ C の SKU に当たる = 1 つの C の値を何件にも配らない) /
+ * 区分の持ち主が C で C = セット・NE = 単品 / 例外を含む食い違いの SKU = 止めない・その SKU だけ前の行のまま (frozenCodes。呼び手が前の行を写す・無ければ載せない)
  */
 export function makePublishResolver({ ownership, publication = null, staged = new Map(), taxRates = [] }) {
   const cols = publishCols(ownership);
@@ -308,7 +341,8 @@ export function makePublishResolver({ ownership, publication = null, staged = ne
     active: false, cols, problem: null, problemDetail: null, publication, ownership,
     // 持ち主が全部 load でも、持ち主が同じ今の世代 (値 0 行) を記録に残す (毎日しくみが通ったことの跡)。別の epoch の世代は「使った」と書かない
     generation: cols.length === 0 ? genInfo : null,
-    of: () => null, peek: () => null, owns: () => false, has: () => false, stagedCodes: () => [], expect: () => {}, expectComponent: () => {}, expected: null,
+    of: () => null, peek: () => null, owns: () => false, has: () => false, stagedCodes: () => [], expect: () => {}, expectComponent: () => {}, expected: null, kindOf: (code, mKind) => mKind,
+    frozenCodes: () => [], forget: () => {},
     overlay: (code, neV) => neV, stats: () => ({ used: 0, not_in_ne: 0, not_in_cdb: 0, not_in_cdb_codes: [], kind_mismatch: 0, kind_mismatch_codes: [] }),
   };
   const fail = (problem, problemDetail = null) => ({ ...inactive, generation: null, problem, problemDetail });
@@ -325,7 +359,8 @@ export function makePublishResolver({ ownership, publication = null, staged = ne
   if (comp.collided.length) return fail('target_norm_collision', { count: comp.collided.length, samples: comp.collided.slice(0, 5) });
   if (comp.missing.length) return fail('value_missing', { count: comp.missing.length, samples: comp.missing.slice(0, 5) });
   // 種類が食い違う SKU = C に無いのと同じ (写さない・NE の値のまま・確かめも NE の値を待つ)
-  const entries = withoutNorms(publication.entries, comp.kindMismatchNorms);
+  // C = セット・NE = 単品 / 例外を含む食い違い (区分の持ち主が C) = 写さない (前の行のまま。呼び手が frozenCodes の前の行を写す)
+  const entries = withoutNorms(withoutNorms(publication.entries, comp.kindMismatchNorms), comp.kindFrozenNorms);
   const stagedNorms = new Set([...staged.keys()].map((c) => normSku(c)));
   const used = new Set();
   const categoryOf = (rate) => taxRates.find((t) => t.decimal === rate)?.category ?? 'UNKNOWN';
@@ -344,6 +379,19 @@ export function makePublishResolver({ ownership, publication = null, staged = ne
     },
     /** of と同じ (数えない) */
     peek: (code) => entries.get(normSku(code)) ?? null,
+    /**
+     * m_products に入れる商品区分。区分の持ち主が C で C にある SKU = C の区分 (NE と違っても) / それ以外 = 今までの区分 (mKind = NE の表の形)。
+     * 呼び手 (rebuild-m-products.js) は区分が今までと違う SKU を、C の区分の形で作る (構成の行・構成品から導く値を使わない)
+     */
+    kindOf(code, mKind) {
+      if (!ownSet.has('kind')) return mKind;
+      const e = entries.get(normSku(code));
+      return e ? targetKind(e, mKind) : mKind;
+    },
+    /** C = セット・NE = 単品 / 例外を含む食い違い の m_products のコード (前の行のまま。呼び手が前の m_products・m_set_components の行を写す・無ければ載せない) */
+    frozenCodes: () => [...staged.keys()].filter((c) => comp.kindFrozenNorms.has(normSku(c))),
+    /** 前の行を写した SKU = 「今までの決め方の値」を確かめない (expect を外す) */
+    forget(code) { expected.delete(code); for (const k of [...expectedComps.keys()]) if (k.startsWith(`${code}|`)) expectedComps.delete(k); },
     /**
      * 1 つの SKU の値 (今までの決め方の値 neV) に C の値を重ねる。C に無ければ neV をそのまま返す。
      * set = true (セット): 税率・税区分・売上分類・取扱区分は構成品から導く (呼び手が C の構成品で導き直して neV に入れて渡す)。
@@ -384,7 +432,10 @@ export function makePublishResolver({ ownership, publication = null, staged = ne
     stats() {
       let notInNe = 0;
       for (const k of entries.keys()) if (!stagedNorms.has(k)) notInNe++;
-      return { used: used.size, not_in_ne: notInNe, not_in_cdb: comp.notInCdb, not_in_cdb_codes: comp.notInCdbCodes, kind_mismatch: comp.kindMismatch, kind_mismatch_codes: comp.kindMismatchCodes };
+      return { used: used.size, not_in_ne: notInNe, not_in_cdb: comp.notInCdb, not_in_cdb_codes: comp.notInCdbCodes, kind_mismatch: comp.kindMismatch, kind_mismatch_codes: comp.kindMismatchCodes,
+        // 区分の持ち主が C のときだけ: NE と区分が違うのに C の区分で写した SKU (持ち主が load の今は出ない = 記録の形は今までと同じ)
+        ...(ownSet.has('kind') ? { kind_c_single_ne_set: comp.kindCSingleNeSet, kind_c_single_ne_set_codes: comp.kindCSingleNeSetCodes,
+          kind_c_set_ne_single_frozen: comp.kindFrozen, kind_c_set_ne_single_frozen_codes: comp.kindFrozenCodes } : {}) };
     },
   };
   return r;
@@ -481,6 +532,33 @@ export function writeSetPublishExpect(db, rows) {
   const ins = db.prepare('INSERT INTO m_set_publish_expect (set_code, args_json, components_json) VALUES (?, ?, ?)');
   for (const r of rows) ins.run(r.code, JSON.stringify(r.args), JSON.stringify(r.components));
 }
+/** 前の行のまま の SKU の snapshot に入れる列 (m_products は product_id = 入れ替えで振り直す番号 を除く全部・m_set_components は全部) */
+export const KIND_FROZEN_MP_COLS = Object.freeze(['商品コード', '商品名', '商品区分', '取扱区分', '標準売価', '原価', '原価ソース', '原価状態', '送料', '送料コード', '配送方法',
+  '消費税率', '税区分', '在庫数', '引当数', '仕入先コード', 'セット構成品数', '売上分類', 'seasonality_flag', 'season_months', 'new_product_flag', 'new_product_launch_date', 'updated_at']);
+export const KIND_FROZEN_MSC_COLS = Object.freeze(['セット商品コード', '構成商品コード', '数量', '構成商品名', '構成商品原価', 'updated_at']);
+/**
+ * 1 つのコードの m_products の行と m_set_components の構成の行 (全部) の正準な形 (JSON の文字列)。行が無い = product null。
+ * tables = 読む表 (作り直しは入れ替えの前の main の表 = 固定する行・確かめは今の表)
+ */
+export function kindFrozenSnapshot(db, code, { products = 'm_products', components = 'm_set_components' } = {}) {
+  const q = (cols) => cols.map((c) => `"${c}"`).join(', ');
+  const p = db.prepare(`SELECT ${q(KIND_FROZEN_MP_COLS)} FROM ${products} WHERE 商品コード = ?`).raw().get(code) ?? null;
+  const cs = db.prepare(`SELECT ${q(KIND_FROZEN_MSC_COLS)} FROM ${components} WHERE セット商品コード = ? ORDER BY 構成商品コード`).raw().all(code);
+  return JSON.stringify({ product: p, components: cs });
+}
+/** 前の行のまま (prev = true) / 載せない (prev = false) にした SKU と固定した時の snapshot (作り直しの取引で m_products と一緒に入れ替える。区分の持ち主が C のときだけ書く) */
+export function writeKindFrozen(db, rows) {
+  db.exec('DELETE FROM m_publish_kind_frozen');
+  const ins = db.prepare('INSERT INTO m_publish_kind_frozen (code, prev_row, snapshot) VALUES (?, ?, ?)');
+  for (const r of rows) ins.run(r.code, r.prev ? 1 : 0, r.snapshot);
+}
+/** 前の行のまま / 載せない にした SKU の印 [{code, prev_row, snapshot}] (表が無い = 空) */
+export function readKindFrozen(db) {
+  try { return db.prepare('SELECT code, prev_row, snapshot FROM m_publish_kind_frozen ORDER BY code').all(); } catch (e) {
+    if (/no such table/.test(String(e && e.message))) return [];
+    throw e;
+  }
+}
 /** 作り直しが残したセットの導き方の入力・構成品の行 (表が無い = 空) */
 function readSetPublishExpect(db) {
   try {
@@ -491,7 +569,7 @@ function readSetPublishExpect(db) {
     throw e;
   }
 }
-export function verifyApplied(db, { publication, ownership, taxRates = [], expected = null, maxProblems = 20 }) {
+export function verifyApplied(db, { publication, ownership, taxRates = [], expected = null, maxProblems = 20, kindCopied = null }) {
   const cols = publishCols(ownership);
   const out = { ok: true, problems: [], counts: { keys: 0, checked: 0, derived: 0, not_in_ne: 0, not_in_cdb: 0, unchanged: 0, kind_mismatch: 0, mixed_sets: 0 }, not_in_cdb_codes: [],
     kind_mismatch_codes: [], mixed_set_codes: [], applied_hash: null };
@@ -503,7 +581,7 @@ export function verifyApplied(db, { publication, ownership, taxRates = [], expec
   const ownSet = new Set(cols);
   const categoryOf = (rate) => taxRates.find((t) => t.decimal === rate)?.category ?? 'UNKNOWN';
   const lower = (x) => (typeof x === 'string' ? x.toLowerCase() : null);
-  const rows = db.prepare('SELECT 商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価ソース, 原価状態, 送料, 送料コード, 配送方法, 消費税率, 税区分, 仕入先コード, 売上分類 FROM m_products').all();
+  const rows = db.prepare(`SELECT 商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価ソース, 原価状態, 送料, 送料コード, 配送方法, 消費税率, 税区分, 仕入先コード, 売上分類${ownSet.has('kind') ? ', セット構成品数' : ''} FROM m_products`).all();
   const group = (sql) => { const m = new Map(); for (const r of db.prepare(sql).all()) { const k = lower(r.sku); if (!k) continue; if (!m.has(k)) m.set(k, []); m.get(k).push(r); } return m; };
   const reorder = ownSet.has('reorder_months') ? group('SELECT sku, 推奨保有月数 FROM m_reorder_setting') : new Map();
   const eg = ownSet.has('cost') ? group('SELECT sku, genka FROM exception_genka') : new Map();
@@ -524,7 +602,27 @@ export function verifyApplied(db, { publication, ownership, taxRates = [], expec
   // 種類が食い違う SKU = 写していない (NE の値のまま) = 比べない (#1564 の見直し M-5)
   out.counts.kind_mismatch = comp.kindMismatch;
   out.kind_mismatch_codes = comp.kindMismatchCodes;
-  const entries = withoutNorms(allEntries, comp.kindMismatchNorms);
+  // 区分の持ち主が C = 区分も写した (m_products の商品区分 = C の区分のはず。違えば下の cols の kind の確かめで落ちる)。
+  //   kindCopied = 区分は比べないが、作り直しが区分を写したか (②b = 世代の持ち主から。前の行のまま (frozen) の SKU を比べない)
+  const copyKind = kindCopied ?? ownSet.has('kind');
+  // C = セット・NE = 単品 / 例外を含む食い違い で前の行のまま にした SKU (作り直しが m_publish_kind_frozen に残す) = 世代の値とは比べない。
+  //   代わりに固定した時の snapshot (行・構成の全部。載せない = 行も構成も無い) と今を比べ、ハッシュに入れる (印を残したまま行を書き換えた = 見つかる。#1641 Codex R1 High)
+  const frozenRows = copyKind ? readKindFrozen(db) : [];
+  const frozen = new Set(frozenRows.map((f) => f.code));
+  for (const f of frozenRows) {
+    let want;
+    try { want = JSON.parse(f.snapshot); } catch { want = null; }
+    const got = JSON.parse(kindFrozenSnapshot(db, f.code));
+    out.counts.checked++;
+    lines.push(JSON.stringify([f.code, 'kind_frozen', f.prev_row, got]));
+    if (!want || !same(want, got) || (f.prev_row === 1) !== (got.product != null)) bad(f.code, 'kind_frozen', want, got);
+  }
+  if (copyKind) { out.counts.kind_frozen = 0; out.kind_frozen_codes = []; }
+  const entries = withoutNorms(withoutNorms(withoutNorms(allEntries, comp.kindMismatchNorms), comp.kindFrozenNorms), new Set([...frozen].map((c) => normSku(c))));
+  if (copyKind) {
+    const fz = [...new Set([...frozen, ...comp.kindFrozenAll])].filter((c) => codes.has(c)).sort();
+    out.counts.kind_frozen = fz.length; out.kind_frozen_codes = fz.slice(0, NOT_IN_CDB_SAMPLES);
+  }
   // C にあるセットの構成品に C に無い (NE にしか無い) 単品がある = 導いた値に C と NE の値が混ざる = 知らせる (止めない。#1564 の見直し L-2)
   {
     const mixed = new Set();
@@ -546,9 +644,17 @@ export function verifyApplied(db, { publication, ownership, taxRates = [], expec
     if (!e || collidedCodes.has(code)) continue;
     matched.add(k); out.counts.keys++;
     const kind = m.商品区分; const isSet = kind === 'セット';
+    // 構成品から導いたセット = NE のセットの表から作ったセット (構成の行がある)。区分の持ち主が C で、NE の単品を C のセットとして写した行は
+    //   構成の行が無い = C の値をそのまま比べる。持ち主が load の今は今までどおり (セット = 導いたセット)
+    const derivedSet = isSet && (!copyKind || setCompRows.has(lower(code)));
+    // 区分 (持ち主が C の世代だけ) = C の区分 (NE と違っても)・C の区分が単品・例外なら構成の行が無い (構成品数も空)。区分は値の欄でなく世代の行の sku_kind
+    if (ownSet.has('kind')) {
+      check('kind', KIND_TO_M[e.kind] ?? null, kind);
+      if (e.kind !== 'set') check('kind_components', [0, null], [(setCompRows.get(lower(code)) || []).length, m.セット構成品数 ?? null]);
+    }
     // C にあるセット = 導いた値 (原価・税率・税区分・売上分類・取扱区分) を同じ決め方で導き直して m_products と比べる・構成品の行 (コード・数量・名前・原価) を比べる。
     //   どちらもハッシュに入れる (作り直しの後に書き換えられた = applied_hash が変わる)
-    if (isSet && (cols.some((c) => SET_DERIVED_COLS.includes(c)) || cols.includes('name'))) {
+    if (derivedSet && (cols.some((c) => SET_DERIVED_COLS.includes(c)) || cols.includes('name'))) {
       const ex = setExpect.get(code);
       if (!ex) bad(code, 'set_expect', 'row', 'missing');
       else {
@@ -578,7 +684,7 @@ export function verifyApplied(db, { publication, ownership, taxRates = [], expec
         case 'name': check(col, c, m.商品名); break;
         case 'standard_price': check(col, c, m.標準売価); break;
         case 'cost': {
-          if (isSet && (!c || c.source === 'set_calc')) out.counts.derived++;
+          if (derivedSet && (!c || c.source === 'set_calc')) out.counts.derived++;
           else { const x = costFromCdb(c); check(col, [x.genka, x.genkaSource, x.genkaStatus], [m.原価, m.原価ソース, m.原価状態]); }
           // 例外原価の行: 原価が空なら行が無い・値なら同じ値 (Codex R1 H3)
           const eRows = (eg.get(lower(code)) || []).map((r) => r.genka);
@@ -586,11 +692,11 @@ export function verifyApplied(db, { publication, ownership, taxRates = [], expec
           break;
         }
         case 'tax_rate':
-          if (isSet) { out.counts.derived++; break; }
+          if (derivedSet) { out.counts.derived++; break; }
           check(col, c, m.消費税率);
           if (!ownSet.has('tax_class')) check('tax_class', categoryOf(c), m.税区分);
           break;
-        case 'tax_class': if (isSet) out.counts.derived++; else check(col, c ?? 'UNKNOWN', m.税区分); break;
+        case 'tax_class': if (derivedSet) out.counts.derived++; else check(col, c ?? 'UNKNOWN', m.税区分); break;
         case 'sales_class': if (kind !== '単品') out.counts.derived++; else check(col, c, m.売上分類); break;
         case 'shipping': {
           const want = [c.cost_jpy, c.code, c.method];
@@ -604,7 +710,7 @@ export function verifyApplied(db, { publication, ownership, taxRates = [], expec
           check(col, c == null ? [] : [c], c == null ? vals : (vals.length ? [...new Set(vals)] : []));   // 空 = 行が無い / 値 = 行があって全部その値
           break;
         }
-        case 'handling': if (isSet) out.counts.derived++; else check(col, c, mapHandling(m.取扱区分)); break;
+        case 'handling': if (derivedSet) out.counts.derived++; else check(col, c, mapHandling(m.取扱区分)); break;
         case 'primary_supplier': {
           const t = m.仕入先コード == null ? '' : String(m.仕入先コード).trim();
           check(col, c == null ? null : normSku(c), t ? normSku(canonicalSupplierCode(t)) : null);

@@ -33,6 +33,12 @@
  *   master_gate_render (Render の ⑤-3 の古い入口の門 env COMPANY_DB_MASTER_GATE_RENDER_URL) / master_gate_minipc (miniPC の門 env COMPANY_DB_MASTER_GATE_MINIPC_URL)。
  *   DB の関数がログインのロールと記録の場所 (host) を照らす = Render のログインで minipc を名乗れない
  * 構成の依頼を上げる (promoteComponentRequest) のは夜間ロード = 表の持ち主のロール (COMPANY_DB_URL)
+ * 🆕 0058 (広げる道 PR-1): new_entry_gate (NOINHERIT のログイン・開く前のゲート env COMPANY_DB_NEW_ENTRY_GATE_URL = miniPC の .env・中原さんが入れる):
+ *   新商品の開放の許可を出す / 取り消す (ops.grant_new_entry_lease / revoke_new_entry_lease) と、取り消した後に閉じたことを確かめる ops.new_entry_lease_valid の実行だけ。
+ *   表は読まない (ゲートの診断の表の読み取りは watcher)。
+ *   master_edit には active の持ち主表 (ops.master_ownership_active_map)・許可の表示用 (ops.new_entry_lease_valid)・鍵の入口 (ops.acquire_new_entry_locks)・
+ *   配ったファイル (ops.ne_reg_file)、master_gate には門の記録の 2 版の実行を足す。
+ *   広げる道の DB の持ち主の関数 (prepare / widen / cancel / 停止 / 保守の印 / private の _ の関数) はだれにも渡さない
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
  *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
@@ -50,18 +56,18 @@ import { urlFor } from './create-watch-roles.mjs';
 /** 場所ごとの門のログイン (DB の関数 ops.record_legacy_gate_ack は session_user = 'master_gate_' || host を求める) */
 export const GATE_LOGIN_ROLES = Object.freeze({ render: 'master_gate_render', minipc: 'master_gate_minipc' });
 /** ログインできるロール (パスワードを持つ) */
-export const MASTER_LOGIN_ROLES = Object.freeze(['master_edit', 'master_gate_minipc', 'master_gate_render', 'master_observer', 'master_ops']);
+export const MASTER_LOGIN_ROLES = Object.freeze(['master_edit', 'master_gate_minipc', 'master_gate_render', 'master_observer', 'master_ops', 'new_entry_gate']);
 /** まとめのロール (ログインできない・パスワードなし) */
 export const MASTER_GROUP_ROLES = Object.freeze(['master_gate']);
 export const MASTER_EDIT_ROLES = Object.freeze([...MASTER_LOGIN_ROLES, ...MASTER_GROUP_ROLES].sort());
-const CONN_LIMIT = { master_edit: 5, master_ops: 2, master_observer: 2, master_gate_render: 8, master_gate_minipc: 8 };   // 門: プロセス・CLI が同時に記録を書く (⑤-3)
+const CONN_LIMIT = { master_edit: 5, master_ops: 2, master_observer: 2, master_gate_render: 8, master_gate_minipc: 8, new_entry_gate: 2 };   // 門: プロセス・CLI が同時に記録を書く (⑤-3)
 /** まとめのロールのメンバー (INHERIT = まとめのロールの権限をそのまま使う) */
 const MEMBER_OF = { master_gate_render: 'master_gate', master_gate_minipc: 'master_gate' };
 /** ロールごとの設定 (master_edit = 画面の接続と同じ値。apps/master-edit/router.mjs の connect) */
 const ROLE_SETTINGS = {
   master_edit: { statement_timeout: '20s', lock_timeout: '10s', idle_in_transaction_session_timeout: '60s' },
   master_gate_render: { statement_timeout: '20s' }, master_gate_minipc: { statement_timeout: '20s' },
-  master_observer: { statement_timeout: '20s' }, master_ops: { statement_timeout: '20s' },
+  master_observer: { statement_timeout: '20s' }, master_ops: { statement_timeout: '20s' }, new_entry_gate: { statement_timeout: '20s' },
 };
 /** 画面が読む表 */
 export const MASTER_EDIT_SELECT = [
@@ -127,6 +133,24 @@ export const ACK_FUNCTION = 'ops.record_legacy_gate_ack(text, text, text, jsonb,
 export const LOCK_SUPPLIERS_FUNCTION = 'core.lock_suppliers_for_share(bigint[])';
 /** 画面の保存を始める (段階・持ち主表を DB で確かめて、取引の行を書く。これの後でないと画面のロールは書けない・#1563 R3 M2) */
 export const BEGIN_WRITE_FUNCTION = 'ops.begin_master_write(uuid, text, text, jsonb, text, bigint, text, text, jsonb)';
+/** 0058 (広げる道 PR-1): 画面のロールが実行する (表は読ませない = SECURITY DEFINER の関数の EXECUTE だけ・R1 H4)。無い DB (0058 の前) では付けない。
+ *   new_entry_lease_valid は画面の表示用の読むだけ (保存の強制は register_new_sku などの DB の関数の中) */
+export const WIDEN_EDIT_FUNCTIONS = Object.freeze(['ops.master_ownership_active_map()', 'ops.new_entry_lease_valid(text)', 'ops.ne_reg_file(bigint)', 'ops.acquire_new_entry_locks(text)']);
+/** 0058 (§3.9 の 3・R16 H1): ops.ne_reg_exports の file_bytes を owner でない全部のロールから外す (表の SELECT → 列ごと)。「表に GRANT」の後に毎回流す = 流し直しても戻らない */
+export const RESTRICT_FILE_BYTES_SQL = "do $$ begin if to_regprocedure('ops.restrict_ne_reg_file_bytes()') is not null then perform ops.restrict_ne_reg_file_bytes(); end if; end $$";
+/** 0058: 門の記録の 2 版 (active / prepared を見た・capable)。master_gate に実行だけ */
+export const ACK_V2_FUNCTION = 'ops.record_legacy_gate_ack_v2(text, text, text, jsonb, text, text, integer, timestamptz, text, text, text[], boolean, text)';
+/** 0058 (§3.7): 開放の許可を出す / 取り消す = NOINHERIT のログイン new_entry_gate だけ (watch_writer には渡さない = 照合のコード 1 本で証拠から開放まで完結しない) */
+export const LEASE_GATE_FUNCTIONS = Object.freeze(['ops.grant_new_entry_lease(text, text)', 'ops.revoke_new_entry_lease(text, text)']);
+/** 0058 (#1645): new_entry_gate も取り消した後に閉じたことを確かめる (読むだけ)。WIDEN_EDIT_FUNCTIONS の 1 つ = master_edit にも付く */
+export const LEASE_VALID_FUNCTION = 'ops.new_entry_lease_valid(text)';
+/** 0058: だれにも渡さない (DB の持ち主だけ = prepare / cancel / 停止 / widen / 保守の印 / 判定の本体 / private の _ の関数 / trigger と部品) */
+export const WIDEN_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.prepare_master_widen(integer, jsonb, text, jsonb, text)', 'ops.cancel_master_widen(uuid, text)',
+  'ops.record_widen_manual_stop(uuid, text, text, text)', 'ops.widen_master_ownership(uuid, integer, text, jsonb)', 'ops._widen_judge(uuid, integer)',
+  'ops.begin_master_maintenance(text)', 'ops.master_maintenance_active()', 'ops.stop_new_entry_for_restore(text)',
+  'ops._new_entry_lease_ok(text)', 'ops._require_new_entry_lease(text)', 'ops.ne_code_seen(text)', 'ops._new_entry_gate_problems(text, bigint)', 'ops._new_entry_lease_shared_locks()',
+  'ops.sku_kind_locked()', 'ops.sku_kind_shape_counts(integer)', 'ops.assert_sku_kind_shape_after_restore()', 'ops.session_is_db_owner()',
+  'core.guard_sku_kind_locked()', 'core.check_sku_kind_shape()', 'ops.guard_master_ownership_widen()', 'ops.guard_new_entry_gate_results()', 'ops.restrict_ne_reg_file_bytes()']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -192,6 +216,19 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   //   付いていない = 門は legacy_open 以外で「持ち主を読めない」= 全部閉じる (fail-closed)
   s.push(`do $$ begin if to_regclass('ops.master_ownership_state') is not null then execute 'revoke all on ops.master_ownership_state from ${all}'; execute 'grant select on ops.master_ownership_state to master_gate'; end if; end $$`);
   s.push(`grant execute on function ${ACK_FUNCTION} to master_gate`);
+  // 0058 (広げる道 PR-1): 関数がある DB だけ (0058 の前は付けない = 流し直すと付く)。前に付けた実行権を外してから付け直す
+  const ifFn = (sig, body) => `do $$ begin if to_regprocedure('${sig}') is not null then ${body} end if; end $$`;
+  for (const f of [...WIDEN_EDIT_FUNCTIONS, ACK_V2_FUNCTION, ...LEASE_GATE_FUNCTIONS, ...WIDEN_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of WIDEN_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
+  // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
+  //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、
+  //   LEASE_GATE_FUNCTIONS には入れない (入れると上の revoke の対象が増える)。上の revoke の後にここで 1 行足す
+  s.push('grant usage on schema ops to new_entry_gate');
+  for (const f of LEASE_GATE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to new_entry_gate';`));
+  s.push(ifFn(LEASE_VALID_FUNCTION, `execute 'grant execute on function ${LEASE_VALID_FUNCTION} to new_entry_gate';`));
+  // 0058: 上の「画面が読む表」の GRANT (ops.ne_reg_exports の表の SELECT) の後に、file_bytes を外して列ごとに付け直す (byte 列は ops.ne_reg_file だけ)
+  s.push(RESTRICT_FILE_BYTES_SQL);
   return s;
 }
 
@@ -253,6 +290,7 @@ export function parseRotateArgs(argv) {
 const ENV_OF = {
   master_edit: ['COMPANY_DB_MASTER_EDIT_URL', 'Render (apps/master-edit)'],
   master_ops: ['COMPANY_DB_MASTER_OPS_URL', '切替の段階を進める手の操作'],
+  new_entry_gate: ['COMPANY_DB_NEW_ENTRY_GATE_URL', '開く前のゲート (0058・miniPC の .env・開放の許可を出す / 取り消す・閉じたかを読むだけ)'],
   master_observer: ['COMPANY_DB_MASTER_OBSERVER_URL', '⑤-2 の夜間ロード (NE の観測)'],
   master_gate_render: ['COMPANY_DB_MASTER_GATE_RENDER_URL', 'Render の ⑤-3 の古い入口の門 (Render の env)'],
   master_gate_minipc: ['COMPANY_DB_MASTER_GATE_MINIPC_URL', 'miniPC の ⑤-3 の古い入口の門 (miniPC の .env)'],

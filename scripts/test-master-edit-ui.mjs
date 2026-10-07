@@ -44,6 +44,10 @@ import express from 'express';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS);
 
 if (process.env.MASTER_EDIT_UI_SKIP === '1') { console.log('⏭️ MASTER_EDIT_UI_SKIP=1 = 画面の JS の試験 (test-master-edit-ui) を飛ばす'); process.exit(0); }
 let chromium;
@@ -69,7 +73,7 @@ const { seedActiveEpoch } = await import('./fixtures/master-epoch.mjs');
 // 発注アプリの台帳・ロジザードの写し (warehouse-mirror.db) = 使い捨ての DATA_DIR (router を読み込む前に。warehouse-mirror/db.js は読み込んだ時に DATA_DIR を決める)
 const DATA_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'meux-ui-'));
 process.env.DATA_DIR = DATA_TMP;
-const { default: router, __setPgClientFactory, __setOwnership, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
+const { default: router, __setPgClientFactory, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
 const { __clearStockCache } = await import('../apps/master-edit/extras.mjs');
 const { __clearSearchTokens } = await import('../apps/master-edit/search-token.mjs');
 
@@ -89,6 +93,7 @@ const db = pgliteAdapter(pg);
 await applyMigrations(db, { log: quiet });
 await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
 await createMasterEditRoles(pg, {});
+await W2.useReal0058(pg, { leases: ['single', 'set'], futureSetLease: true });   // 広げる道 PR-2: 本物の 0058 の上で試験の許可を置く (この DB は構成も C = セットの許可は将来の形)
 const sku = (code, name, kind, taxRate, salesClass, cost) => ({
   code, name, kind, taxRate, taxClass: taxRate === 0.08 ? 'REDUCED_8' : 'STANDARD_10', handling: 'active', salesClass,
   cost: { jpy: cost, source: kind === 'set' ? 'set_calc' : 'ne', status: 'COMPLETE' }, standardPriceJpy: 1000, shippingCode: 'S02', shippingMethod: '宅急便', shippingCostJpy: 520, reorderMonths: 2,
@@ -125,6 +130,7 @@ const bp = (await pg.query('select * from ops.registration_backfill_plan()')).ro
 await as('master_ops', () => pg.query('select ops.backfill_sku_registrations($1, $2, $3)', [bp.sku_count, bp.snapshot_hash, 'naka@test']));
 await toPhase('company_owner');
 await toPhase('new_open');
+await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(db, { withSet: true });   // 0058: 単品の新商品は DB の関数が開放の許可を確かめる = 試験の許可を置く (PR-2: セットの画面は JS の門がセットの許可も見る = 将来の形の許可も)
 // ── 発注アプリの台帳 (注文残) とロジザードの写し (在庫) の見本 (PR2) ──
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 const mirrorDb = initMirrorDB();
@@ -186,7 +192,7 @@ __setPgClientFactory(async (url) => {
   await pg.query(`set role ${/master_edit@/.test(url) ? 'master_edit' : 'deploy'}`);
   return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); release(); }, on: () => {} };
 });
-__setOwnership(ALL);
+// 持ち主表 = DB の active (広げる道 PR-2)
 __setShippingRatesProvider(async () => RATES);
 const app = express();
 app.set('view engine', 'ejs');
@@ -767,7 +773,7 @@ await ta('[24] FBA (JP) の在庫 (10/5): 一覧の列 (参考・灰色)・見�
     assert.match(await p.textContent('#ref-fba-when'), /読めない \(画面のロールに FBA の在庫を読む権限がまだ無い/);
     assert.equal(await p.locator('#ref-fba-parts').count(), 0);
     assert.equal(await p.textContent('#ref-stock'), '15');
-  } finally { await createMasterEditRoles(pg, {}); }
+  } finally { await createMasterEditRoles(pg, {}); await W2.useReal0058(pg, { leases: ['single', 'set'], futureSetLease: true }); }
   await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001' }));
   assert.equal((await cells(p))[0].fba, '24', '流し直した = 読める');
 });
@@ -1266,6 +1272,8 @@ await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウ
   await pg.query('insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, now(), 0)', [run]);
   const codes = (await pg.query("select code_norm from core.skus where code_norm <> 'ui-new-1'")).rows.map((r) => r.code_norm);
   await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: run, entries: codes.map((c) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: c, spellings: [c] })) })]);
+  // 0058: 本番と同じく、その照合の回の封 → ゲートの許可 (配る = 許可の回と NE のコードの回が同じときだけ・配ったファイルは配った時の許可の間だけ渡す)
+  await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(db, { runId: run, withSet: true });
   try {
     await p.goto(B + '/reg-csv');
     const pick = p.locator('input.pick[value="ui-new-1"]');

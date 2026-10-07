@@ -33,6 +33,10 @@ import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.m
 import { createMasterEditRoles } from './company-db/create-master-edit-roles.mjs';
 import { runInitialLoad } from '../apps/company-db/load/engine.mjs';
 import { OWNED_COLUMNS as OWNED_COLUMNS_FOR_BASE } from '../config/master-ownership.mjs';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS);
 // 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
 const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries(OWNED_COLUMNS_FOR_BASE.map((k) => [k, 'load'])));
 
@@ -81,6 +85,7 @@ try {
   const dbM = pgAdapter(M);
   await applyMigrations(dbM, { log: () => {} });
   await createMasterEditRoles(M, { pw: PW });
+  await W2.useReal0058(M, { leases: ['single', 'set'], futureSetLease: true });   // 広げる道 PR-2: 本物の 0058 の上で試験の許可を置く (この DB は構成も C = セットの許可は将来の形)
   const [A, B, P, GR, GM, O2] = [await open('master_edit'), await open('master_edit'), await open('master_ops'), await open('master_gate_render'), await open('master_gate_minipc'), await open(null)];
   clients.push(A, B, P, GR, GM, O2);
   const [dbA, dbB, dbP, dbO2] = [A, B, P, O2].map(pgAdapter);
@@ -151,6 +156,7 @@ try {
     assert.equal((await q("select count(*)::int as n from core.skus where code = 'bf-1'"))[0].n, 0);
     await toNewOpen();
     assert.equal((await q('select phase from ops.master_cutover_state'))[0].phase, 'new_open');
+    await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(dbM, { withSet: true });   // 0058: 新商品の入口は今朝の照合のゲートの許可 (lease) があるときだけ開く
   });
 
   await ta('[4] 遅らせた制約の trigger は commit のときに効く (取引の中では見えている・同じ取引で状態の行を作れば通る)・画面のロールも同じ', async () => {

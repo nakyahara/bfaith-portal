@@ -28,6 +28,10 @@ import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
 import Database from 'better-sqlite3';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS);
 
 const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'regdate-'));
 process.env.DATA_DIR = DATA_DIR;
@@ -42,7 +46,7 @@ const { runInitialLoad, registeredOnForNew } = await import('../apps/company-db/
 const { parseNeCreationDate, listOrderBy, hasRegisteredOn } = await import('../lib/sku-registered-on.mjs');
 const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
 const R = await import('../apps/master-edit/read.mjs');
-const { default: router, __setPgClientFactory, __setClock, __setOwnership } = await import('../apps/master-edit/router.mjs');
+const { default: router, __setPgClientFactory, __setClock } = await import('../apps/master-edit/router.mjs');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -139,6 +143,7 @@ await ta('[M] 0057 の前の DB: 夜間ロードは止まらない (見送りの
 await applyMigrations(db, { log: quiet });
 await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
 await createMasterEditRoles(pg, {});
+await W2.useReal0058(pg, { leases: ['single', 'set'], futureSetLease: true });   // 広げる道 PR-2: 本物の 0058 の上で試験の許可を置く (この DB は構成も C = セットの許可は将来の形)
 
 await ta('[D] DDL: 既にある行は空・列を書かない INSERT (古い夜間ロードの形) = 空・CHECK・一度入ったら変えない・画面のロールは UPDATE できない', async () => {
   assert.equal(await hasRegisteredOn(db), true);
@@ -308,7 +313,7 @@ __setPgClientFactory(async (url) => {
   return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); }, on: () => {} };
 });
 __setClock(() => LOAD_NOW.getTime());
-__setOwnership(MASTER_OWNERSHIP);
+// 持ち主表 = DB の active (広げる道 PR-2・この DB は切替の前 = 見るだけ)
 const app = express();
 app.set('view engine', 'ejs');
 app.use((req, res, next) => { req.session = { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: ['master-edit'] }; next(); });

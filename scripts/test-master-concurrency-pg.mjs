@@ -514,7 +514,7 @@ try {
     assert.deepEqual(rl.ok.company_owned, ['skus.tax_class']);   // 読んだ epoch (古い active) のまま書き終わった
     const ra = await act.promise;
     assert.equal(ra.err && ra.err.code, 'LOAD_AFTER_EVIDENCE', ra.err ? ra.err.message : 'activate が通ってしまった');
-    assert.deepEqual([ra.err.last_load, ra.err.last_commit_seq], ['load_pg_ep1', evidenceLoad + 1]);   // 番号 = commit の順 (証拠のロードの次)
+    assert.deepEqual([ra.err.last_load, ra.err.last_commit_seq], ['load_pg_ep1', String(BigInt(evidenceLoad) + 1n)]);   // 番号 = commit の順 (証拠のロードの次)
     const st = await OS.readOwnershipState(pgAdapter(M));
     assert.deepEqual([st.active.hash, st.prepared.hash], [before.active.hash, OS.ownershipHashOf(otherMap)]);   // active は変わらない
     // 証拠を取り直した (prepared のロードから) activate は通る・その後のロードは新しい active を読む (取引の中で読む)

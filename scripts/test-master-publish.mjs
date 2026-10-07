@@ -50,6 +50,9 @@
  *     夜間ロードは足した列を load で動かす
  *  30 セットの導いた値・構成品の行 (コード・数量・C の名前・原価) も入れた後の確かめで比べる (同じ決め方で導き直す・ハッシュに入る) = 書き換え = broken (R7 High)・印を消せない確かめは通らない (R7 Medium 1)
  *  31 JAN だけ company の prepare は通る (写さない列)・Amazon の構成は断る (R7 Medium 2)
+ *  32 区分 (skus.sku_kind) の持ち主が C: prepare → 明示のロード → 写し → 作り直し → 確かめ → activate / C = 単品・NE = セットは C の区分・C の値で写す (構成の行なし) / C = セット・NE = 単品はその SKU だけ前の行のまま /
+ *     夜間ロードは区分を NE に戻さない / f_sales のセット展開・商品管理リストが壊れない / load に戻すと NE の区分
+ *  33 区分の持ち主が C の 9 升 (C 3 × NE 3) の期待値・前の行が無い = 載せない・確かめ・②b・下流 3 系統 (f_sales・商品管理リスト・router)
  *  29 最後に commit したロード = DB が振る番号の順 (0055 の ops.master_load_commits。送り手の時計・場所では決めない・数で並べる)・dry-run は番号なし・
  *     0055 の前の毎晩のロード (番号の行が無い) = 最初の朝はそれを使う (commit_seq = null。R5 Low)・
  *     写しは場所を問わず最後のロード・番号の表は足すだけ (#1564 Codex R4 Medium 2・High)
@@ -136,6 +139,7 @@ const count = (t, where = '1 = 1', ...p) => db.prepare(`SELECT COUNT(*) AS n FRO
 // ── Company DB (PGlite) と Render の mirror (一時) ──
 const pg = new PGlite(); const pdb = pgliteAdapter(pg);
 await applyMigrations(pdb, { log: quiet });
+await pdb.query("select set_config('ops.widen_protocol', '1', false)");   // 0058 (G5): この試験は持ち主の epoch を直接置く = 同じ印 (G5 そのものは scripts/test-master-widen.mjs が見る)
 const q = async (sql, p) => (await pdb.query(sql, p)).rows;
 /** m_products を Render の mirror に送った状態にする (送り手と受け手と同じ: 中身と、中身から出し直したハッシュの世代) */
 function publishMirror() {
@@ -931,7 +935,7 @@ await ta('[17] 持ち主の epoch (0055): config を書き換えただけでは�
   const lastCommit = await OS.latestLoadCommit(pdb);   // 証拠の世代が読んだ夜間ロード (= 今の最後のロード = HTTP の明示のロード)
   const lastLoad = lastCommit.commit_seq;
   assert.deepEqual(db.prepare('SELECT load_run_id, load_commit_seq FROM cdb_publish_generations WHERE generation_no = ?').get(g.generation_no),
-    { load_run_id: hl.run_id, load_commit_seq: lastLoad });   // 世代に commit の番号
+    { load_run_id: hl.run_id, load_commit_seq: Number(lastLoad) });   // 世代に commit の番号
   assert.deepEqual([evidence().load_run_id, evidence().load_commit_seq], [hl.run_id, lastLoad]);   // 証跡にも
   await assert.rejects(OS.activateOwnership(noCutover, { expectHash: ownHash, expectPreparedAt: (await OS.readOwnershipState(pdb)).prepared.prepared_at, expectLoadCommitSeq: lastLoad, actor: 't', evidence: {} }),
     (e) => e.code === 'CUTOVER_STATE_MISSING');
@@ -951,7 +955,7 @@ await ta('[17] 持ち主の epoch (0055): config を書き換えただけでは�
   await q("update ops.master_ownership_state set prepared_at = prepared_at - interval '1 millisecond' where id = 1");
   assert.equal((await OS.readOwnershipState(pdb)).prepared.prepared_at, pAt);
   // 証拠の世代の後に夜間ロードが入った (最後のロードが証拠のロードでない) = active にしない (#1564 Codex R3 High 1。並んだときの順は本物の PostgreSQL の試験 [21])
-  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadCommitSeq: lastLoad - 1, actor: 't', evidence: {} }),
+  await assert.rejects(OS.activateOwnership(pdb, { expectHash: ownHash, expectPreparedAt: pAt, expectLoadCommitSeq: String(BigInt(lastLoad) - 1n), actor: 't', evidence: {} }),
     (e) => e.code === 'LOAD_AFTER_EVIDENCE' && e.last_load === hl.run_id && e.last_commit_seq === lastLoad);
   assert.equal((await OS.readOwnershipState(pdb)).active.hash, allHash);
   // prepare より前に Company DB を読んだ世代 = active にしない (#1564 の見直し L-1)
@@ -1345,7 +1349,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   const ran = [];
   const run = (script, name) => { ran.push(name); return { success: true, summary: 'ok' }; };
   const res = R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
-  assert.deepEqual(ran, ['マスタ照合', 'CompanyDB見張り']);
+  assert.deepEqual(ran, ['マスタ照合', '新商品の許可', 'CompanyDB見張り']);
   assert.deepEqual(res.filter((x) => x.gated).map((x) => [x.name, x.blocked, x.pingJobId]),
     [['f_sales', true, null], ['Render同期', true, null], ['ロジザード毎日の商品マスタ(影)', true, 'lz-daily-build']]);
   assert.ok(res.filter((x) => x.gated).every((x) => /^⚠️ 見送り: Company DB の写しの反映が世代と違う .*門 cdb_publish_gate = broken/.test(x.summary)), JSON.stringify(res));
@@ -1364,7 +1368,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.deepEqual([row().state, gate().open], ['safe', true]);
   ran.length = 0; calls.length = 0;
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
-  assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   assert.equal((await P.runPmlFbaRefresh(pml(gate))).pml_run_id, 'r');
   assert.deepEqual([row().build_id, row().generation_no, row().applied_hash, row().ownership_hash],
     [snap().build.build_id, snap().build.cdb_publish_generation_no, snap().build.cdb_publish_applied_hash, snap().build.cdb_publish_ownership_hash]);   // safe は確かめたものを持つ
@@ -1395,7 +1399,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.deepEqual([G.gateOfDb(db).state, G.gateOfDb(db).reason], ['unknown', 'safe_row_stale:applied_changed_now']);
   ran.length = 0; calls.length = 0;
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
-  assert.deepEqual(ran, ['マスタ照合', 'CompanyDB見張り']);
+  assert.deepEqual(ran, ['マスタ照合', '新商品の許可', 'CompanyDB見張り']);
   await assert.rejects(P.runPmlFbaRefresh(pml(gate)), (e) => e.code === 'PUBLISH_BROKEN');
   assert.deepEqual(calls, []);
   db.prepare('UPDATE m_products SET 原価 = ? WHERE 商品コード = ?').run(origCost2, 's-ne');
@@ -1460,7 +1464,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.match(row().reason, /^verify_apply_crashed: 落ちた/);
   ran.length = 0; calls.length = 0;
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
-  assert.deepEqual(ran, ['マスタ照合', 'CompanyDB見張り']);
+  assert.deepEqual(ran, ['マスタ照合', '新商品の許可', 'CompanyDB見張り']);
   await assert.rejects(P.runPmlFbaRefresh(pml(gate)), (e) => e.code === 'PUBLISH_BROKEN');
   assert.deepEqual(calls, []);
   //     daily-sync の判断: 確かめが exit 1 で門が暗黙の safe = 止める / 門が確かめた safe の行 = 流す / exit 4 = broken
@@ -1505,7 +1509,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: 1 }, gate: gate() }).broken, false);
   ran.length = 0;
   R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: gate() });
-  assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   db.prepare('DELETE FROM cdb_publish_gate').run();
   assert.equal((await rebuild()).ok, true);
   // (p) 写しが取れない朝 (Company DB に届かない)・NE と作り直しは通った (前の世代で新しい作り直し B1)・確かめは exit 1 (fetch_not_verified) =
@@ -1535,7 +1539,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
     assert.equal(G.gateAfterVerify({ apply: { success: false, exitCode: v2.code }, gate: g2 }).broken, false);   // daily-sync は流す
     ran.length = 0; calls.length = 0;
     R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: G.readPublishGate({ dataDir: tmp }) });
-    assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+    assert.deepEqual(ran, ['f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
     assert.equal((await P.runPmlFbaRefresh(pml(gate))).pml_run_id, 'r');
   } finally { process.env.DAILY_SYNC_RUN_ID = 'ds_test_publish'; }
   // (q) 止めの印 (#1564 Codex R6 Low): warehouse.db を開けない最初の朝 = 印を残す → 開けるようになっても (行が無く全部 load の暗黙の safe でも) 止まったまま →
@@ -1548,7 +1552,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
     assert.equal(G.gateAfterVerify({ apply: { success: true, exitCode: 0 }, gate: G.readPublishGate({ dataDir: tmp }) }).broken, true);
     ran.length = 0; calls.length = 0;
     R.runRetryRound(['f_sales', 'Render同期', 'マスタ照合'], { run, log: quiet, publishGate: G.readPublishGate({ dataDir: tmp }) });
-    assert.deepEqual(ran, ['マスタ照合', 'CompanyDB見張り']);
+    assert.deepEqual(ran, ['マスタ照合', '新商品の許可', 'CompanyDB見張り']);
     await assert.rejects(P.runPmlFbaRefresh(pml(gate)), (e) => e.code === 'PUBLISH_BROKEN');
     assert.deepEqual(calls, []);
   };
@@ -1821,19 +1825,19 @@ await ta('[28] 持ち主表のハッシュは 1 つの式 (load の列は数え�
 await ta('[29] 最後に commit したロード = DB が振る番号の順 (送り手の時計・場所では決めない)・番号の表は足すだけ・写しは場所を問わず最後のロード (#1564 Codex R4 Medium 2・High)', async () => {
   const a = await loadNow();
   const b = await loadNow();
-  assert.equal(b.load_commit_seq, a.load_commit_seq + 1);
+  assert.equal(b.load_commit_seq, String(BigInt(a.load_commit_seq) + 1n));   // 番号は文字 (bigint を Number にしない・広げる道 PR-1)
   // b の送り手の時計が遅れていた (時刻は a より前) = 時刻では a が後に見えるが、commit は b が後 = 番号で b
   await q("update ops.ingest_runs set started_at = started_at - interval '1 day', finished_at = finished_at - interval '1 day' where ingest_run_id = $1", [b.run_id]);
   const last = await OS.latestLoadCommit(pdb);
   assert.deepEqual([last.ingest_run_id, last.commit_seq, last.epoch], [b.run_id, b.load_commit_seq, b.ownership_epoch.epoch]);
   // 番号は数で並べる (文字で並べると '9' が '10' より後になる。この試験では番号が 2 桁を越えている)
-  assert.ok(b.load_commit_seq >= 10, String(b.load_commit_seq));
-  assert.equal(last.commit_seq, Number((await q('select max(commit_seq)::text as m from ops.master_load_commits'))[0].m));
+  assert.ok(BigInt(b.load_commit_seq) >= 10n, String(b.load_commit_seq));
+  assert.equal(last.commit_seq, (await q('select max(commit_seq)::text as m from ops.master_load_commits'))[0].m);
   assert.equal((await F.selectPublishLoad(pdb)).ingest_run_id, b.run_id);
   // 場所: 毎晩の cron (render-nightly) より後に別の場所で commit したロード = 写しはそれを使う (照合 ① の毎晩の回は cron のまま)
   const other = await runInitialLoad(pdb, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: `load_pub_${++loadN}`, host: 'render' });
   assert.equal(other.ok, true, other.error);
-  assert.deepEqual([(await F.selectPublishLoad(pdb)).ingest_run_id, (await F.selectPublishLoad(pdb)).commit_seq], [other.run_id, b.load_commit_seq + 1]);
+  assert.deepEqual([(await F.selectPublishLoad(pdb)).ingest_run_id, (await F.selectPublishLoad(pdb)).commit_seq], [other.run_id, String(BigInt(b.load_commit_seq) + 1n)]);
   // dry-run は番号を取らない (巻き戻す)
   const dry = await runInitialLoad(pdb, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: `load_pub_${++loadN}`, host: 'render-nightly', dryRun: true });
   assert.equal(dry.load_commit_seq, undefined);
@@ -1851,8 +1855,8 @@ await ta('[29] 最後に commit したロード = DB が振る番号の順 (送�
     assert.deepEqual([first.ingest_run_id, first.commit_seq, first.host], ['load_before_0055', null, 'render-nightly']);
     // 0055 の後の最初の本適用のロード = 番号 1 = それを使う
     const next = await runInitialLoad(pdb3, buildPlanFromRender({ dataDir: mirrorDir, log: quiet }), { log: quiet, runId: 'load_after_0055', host: 'render-nightly' });
-    assert.equal(next.load_commit_seq, 1);
-    assert.deepEqual([(await F.selectPublishLoad(pdb3)).ingest_run_id, (await F.selectPublishLoad(pdb3)).commit_seq], ['load_after_0055', 1]);
+    assert.equal(next.load_commit_seq, '1');
+    assert.deepEqual([(await F.selectPublishLoad(pdb3)).ingest_run_id, (await F.selectPublishLoad(pdb3)).commit_seq], ['load_after_0055', '1']);
   } finally { await pg3.close(); }
   // 足すだけ
   await assert.rejects(q("update ops.master_load_commits set host = 'x'"), /足すだけ/);   // 番号そのものは identity (always) = 書き換えられない
@@ -1944,6 +1948,261 @@ await ta('[31] JAN (external_ids.jan・⑤-2b) だけ company の prepare は通
   assert.match(logs.at(-1), /not_copied:listing_components\.amazon/);
   assert.equal(await epochCli(['cancel']), 0);
   await q('delete from ops.master_ownership_state');
+});
+
+await ta('[32] 区分 (skus.sku_kind) の持ち主が C: prepare → 明示のロード → 写し → 作り直し → 確かめ → activate が通る / C = 単品・NE = セット = C の区分・C の値 (構成の行を作らない) / C = セット・NE = 単品 = その SKU は前の行のまま (fail-closed・前の行が無い = 載せない・NE を直すと写る) / 夜間ロードは区分を NE に戻さない / 商品区分を読む業務 (f_sales のセット展開・商品管理リスト) が壊れない / load に戻すと NE の区分', async () => {
+  const own = OWN('skus.sku_kind', 'skus.name', 'products.name');
+  assert.deepEqual(MP.checkPublishOwnership(own), []);   // 区分は写す列 = prepare できる
+  assert.deepEqual(MP.publishCols(own), ['name', 'kind']);
+  assert.deepEqual(MP.publishCols(MASTER_OWNERSHIP), []);   // load の今は写さない
+  const logs = [];
+  const epochCli = (argv, extra = {}) => quietly(() => EP.cli(argv, { env: { DATA_DIR: tmp }, connect: async () => ({ db: pdb, close: async () => {} }), openSqlite: async () => db,
+    log: (m) => logs.push(m), ...extra }));
+  // 準備: 全部 load で作り直し → mirror → 夜間ロード (C も NE と同じ区分)
+  await setActive(MASTER_OWNERSHIP);
+  addNe('s-kind1', 'NE の単品 K', 40);
+  assert.equal((await fetchGen(MASTER_OWNERSHIP)).state, 'verified');
+  assert.equal((await rebuild()).ok, true);
+  publishMirror();
+  await loadNow();
+  // C で区分を変える (ポータルの区分の編集の代わり): s-kind1 を単品 → セット (前の区分の product_id は残る = Codex の指摘の形)・
+  //   set-g をセット → 単品 (商品を作って付け、構成は外す)
+  await q("update core.skus set sku_kind = 'set', name = 'C のセット K' where code = 's-kind1'");
+  const pid = (await q("insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'set-g', 'C の単品 G', 'active', 'human', 'test') returning product_id"))[0].product_id;
+  await q("delete from core.sku_components where parent_sku_id = (select sku_id from core.skus where code = 'set-g')");
+  await q("update core.skus set sku_kind = 'single', product_id = $1, name = 'C の単品 G', handling = 'active' where code = 'set-g'", [pid]);
+  const kindOf = async (code) => (await q('select sku_kind, product_id::text as product_id from core.skus where code = $1', [code]))[0];
+  const before = { k1: await kindOf('s-kind1'), g: await kindOf('set-g') };
+  assert.ok(before.k1.product_id != null);   // セットに前の区分の product_id が残った形
+  // 切替の日の順: prepare → 明示のロード (prepared の持ち主) = 区分は社内のまま・食い違いは判断の記録に
+  assert.equal(await epochCli(['prepare'], { ownership: own }), 0, logs.at(-1));
+  const hl = await loadViaHttp({ usePrepared: true });
+  // 区分は社内のまま・セットの名残の product_id は外す (正規化)・単品 set-g の商品はそのまま
+  assert.deepEqual([await kindOf('s-kind1'), await kindOf('set-g')], [{ sku_kind: 'set', product_id: null }, before.g]);
+  assert.equal((await q("select count(*)::int as n from core.sku_components where parent_sku_id = (select sku_id from core.skus where code = 'set-g')"))[0].n, 0);   // NE のセットの構成を C の単品に入れない
+  const dk = (await q("select payload from ops.load_decisions where ingest_run_id = $1 and section = 'skus'", [hl.run_id]))[0].payload.kind_held;
+  assert.deepEqual([...dk].sort(), [['s-kind1', 'single', 'set'], ['set-g', 'set', 'single']]);
+  // C = セット・NE = 単品 で前の m_products の行が無い SKU (C だけでセットとして作った・NE は単品で新しく登録) も作る
+  await q("insert into core.skus (company_id, sku_kind, code, name, handling) values (1, 'set', 's-kind2', 'C のセット 2', 'active')");
+  addNe('s-kind2', 'NE の単品 2', 30);
+  const prevK1 = db.prepare('SELECT 商品名, 商品区分, 原価, 標準売価 FROM m_products WHERE 商品コード = ?').get('s-kind1');
+  // 写し = prepared の世代 (区分の列あり)。区分の違う SKU は止めない・知らせる
+  const g = await fetchGen(MASTER_OWNERSHIP);
+  assert.deepEqual([g.state, g.evidence.company_owned, g.evidence.epochs.generation.kind, g.evidence.kind_c_single_ne_set, g.evidence.kind_c_set_ne_single_frozen, g.evidence.kind_mismatch],
+    ['verified', ['name', 'kind'], 'prepared', { count: 1, codes: ['set-g'] }, { count: 1, codes: ['s-kind1'] }, { count: 0, codes: [] }], JSON.stringify(g.problems));
+  assert.match(g.line, /^⚠️ .*社内は単品・NE はセットの SKU 1 件は単品として写す .*set-g.*社内と NE で区分が違う SKU 1 件は前の行のまま .*s-kind1/);
+  // 作り直し: C = 単品・NE = セット (set-g) = 単品の行・C の値・構成の行を作らない / C = セット・NE = 単品 (s-kind1) = 前の行のまま (fail-closed) /
+  //   前の行が無い (s-kind2) = 載せない
+  const r = await rebuild();
+  assert.equal(r.ok, true, JSON.stringify(r.checks));
+  assert.deepEqual([r.publish.stats.kind_c_single_ne_set_codes, r.publish.stats.kind_c_set_ne_single_frozen_codes, r.publish.stats.kind_mismatch], [['set-g'], ['s-kind1', 's-kind2'], 0]);
+  assert.ok(r.warn.some((w) => /社内は単品・NE はセットの SKU 1 件は単品として写した.*set-g/.test(w)), JSON.stringify(r.warn));
+  assert.ok(r.warn.some((w) => /区分が違う SKU 2 件は前の行のまま.*前の行が無い 1 件は載せない \(s-kind2\).*s-kind1, s-kind2/.test(w)), JSON.stringify(r.warn));
+  assert.deepEqual([mp('set-g').商品区分, mp('set-g').商品名, mp('set-g').セット構成品数], ['単品', 'C の単品 G', null]);
+  assert.equal(count('m_set_components', "セット商品コード = 'set-g'"), 0);
+  assert.deepEqual(db.prepare('SELECT 商品名, 商品区分, 原価, 標準売価 FROM m_products WHERE 商品コード = ?').get('s-kind1'), prevK1);   // 前の行のまま (C の名前も入れない)
+  assert.equal(mp('s-kind2'), undefined);   // 前の行が無い = 載せない (NE の値の行も残さない)
+  assert.deepEqual(db.prepare('SELECT code, prev_row FROM m_publish_kind_frozen ORDER BY code').all(), [{ code: 's-kind1', prev_row: 1 }, { code: 's-kind2', prev_row: 0 }]);
+  const kr0 = snap().reasons.filter((x) => x.col === 'kind').map((x) => [x.code, x.reason, x.value]).sort();
+  assert.deepEqual(kr0, [['s-kind1', 'kind_c_set_ne_single_frozen', 'previous_row'], ['s-kind2', 'kind_c_set_ne_single_frozen', 'omitted'], ['set-g', 'company_owned', '単品']]);
+  // 入れた後の確かめも通る (前の行のまま の SKU は比べない)
+  const va0 = await F.runVerifyApply({ sqlite: db, dataDir: tmp, taxRates: TAX_RATES });
+  assert.deepEqual([va0.state, va0.evidence.apply.counts.kind_frozen], ['verified', 1], JSON.stringify(va0.problems));
+  // NE を直す (NE の画面で s-kind1 をセットに = セットの表に行)・s-kind2 は NE から消す = 翌朝の写し・作り直しで C の区分・C の値
+  db.prepare("INSERT OR REPLACE INTO raw_ne_set_products (セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, synced_at) VALUES ('s-kind1', 'NE のセット K', 300, 's-ne', 2, ?)").run(FX.T1);
+  db.prepare("DELETE FROM raw_ne_products WHERE 商品コード = 's-kind2'").run();
+  FX.markComplete(db, readNeRawRev);
+  await q("delete from core.skus where code = 's-kind2'");
+  const g2 = await fetchGen(MASTER_OWNERSHIP);
+  assert.deepEqual([g2.state, g2.evidence.kind_c_single_ne_set, g2.evidence.kind_c_set_ne_single_frozen], ['verified', { count: 1, codes: ['set-g'] }, { count: 0, codes: [] }], JSON.stringify(g2.problems));
+  const r2 = await rebuild();
+  assert.equal(r2.ok, true, JSON.stringify(r2.checks));
+  assert.deepEqual([r2.publish.stats.kind_c_single_ne_set, r2.publish.stats.kind_c_set_ne_single_frozen], [1, 0]);
+  assert.deepEqual([mp('s-kind1').商品区分, mp('s-kind1').商品名, count('m_set_components', "セット商品コード = 's-kind1'")], ['セット', 'C のセット K', 1]);   // 区分が同じセット = 今までどおり (構成の行・導いた値)
+  assert.equal(count('m_publish_kind_frozen'), 0);
+  const kr = snap().reasons.filter((x) => x.col === 'kind');
+  assert.deepEqual(kr.map((x) => [x.code, x.reason, x.owner_key, x.cdb_value, x.ne_value, x.value]), [['set-g', 'company_owned', 'skus.sku_kind', { kind: 'single' }, 'セット', '単品']]);
+  // 入れた後の確かめ (次の工程) も通る・activate できる
+  const va = await F.runVerifyApply({ sqlite: db, dataDir: tmp, taxRates: TAX_RATES });
+  assert.deepEqual([va.state, va.evidence.apply.epoch], ['verified', 'prepared'], JSON.stringify(va.problems));
+  // わざと壊す: 作り直しの後に区分・構成の行が書き換えられた = 確かめで見つかる (戻す)
+  db.prepare("UPDATE m_products SET 商品区分 = 'セット' WHERE 商品コード = 'set-g'").run();
+  const bad = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES });
+  assert.ok(bad.problems.some((p) => p.code === 'set-g' && p.col === 'kind'), JSON.stringify(bad.problems));
+  db.prepare("UPDATE m_products SET 商品区分 = '単品' WHERE 商品コード = 'set-g'").run();
+  db.prepare("INSERT INTO m_set_components (セット商品コード, 構成商品コード, 数量, 構成商品名, 構成商品原価, updated_at) VALUES ('set-g', 's-sc3', 2, 'x', 45, 'x')").run();
+  const bad2 = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES });
+  assert.ok(bad2.problems.some((p) => p.code === 'set-g' && p.col === 'kind_components'), JSON.stringify(bad2.problems));
+  db.prepare("DELETE FROM m_set_components WHERE セット商品コード = 'set-g'").run();
+  await setCutoverPhase('frozen');
+  try { assert.equal(await epochCli(['activate']), 0, logs.at(-1)); } finally { await setCutoverPhase('legacy_open'); }
+  // 次の夜 (active = 区分も C): mirror は C の区分の m_products = ロードの材料も C の区分 = 食い違いの記録は空・区分は社内のまま
+  publishMirror();
+  const lr = await loadNow();
+  assert.deepEqual([lr.company_owned.includes('skus.sku_kind'), (await kindOf('s-kind1')).sku_kind, (await kindOf('set-g')).sku_kind], [true, 'set', 'single']);
+  assert.ok(!lr.conflicts.some((c) => c.kind === 'sku_kind_held'), JSON.stringify(lr.conflicts.filter((c) => c.kind === 'sku_kind_held')));
+  // 商品区分を読む業務: f_sales (Amazon の注文のセット展開は 商品区分 = セット かつ 構成の行があるときだけ) = C の単品は展開しない (直接の販売)・ほかのセットは今までどおり展開
+  db.exec('CREATE TABLE IF NOT EXISTS raw_rakuten_orders (order_number TEXT, order_date TEXT, order_status INTEGER, item_number TEXT, item_name TEXT, price_tax_incl REAL, units INTEGER, delete_item_flag INTEGER)');
+  const { rebuildFSales } = await import('../apps/warehouse/rebuild-f-sales.js');
+  const insOrder = db.prepare("INSERT INTO raw_sp_orders (amazon_order_id, purchase_date, order_status, seller_sku, title, quantity, item_price, synced_at) VALUES (?, '2026-10-01T10:00:00Z', 'Shipped', ?, 't', ?, 1000, 'x')");
+  insOrder.run('k-order-1', 'set-g', 3); insOrder.run('k-order-2', 's-kind1', 2); insOrder.run('k-order-3', 'set-a', 1);
+  await quietly(() => rebuildFSales());
+  const fs1 = (code) => db.prepare("SELECT SUM(数量) AS q, SUM(直接販売数) AS d, SUM(セット経由数) AS s FROM f_sales_by_product WHERE 日付 = '2026-10-01' AND 商品コード = ?").get(code);
+  assert.deepEqual([fs1('set-g'), fs1('s-sc3').q], [{ q: 3, d: 3, s: 0 }, null]);   // C の単品 = そのまま (NE の構成品 s-sc3 に展開しない)
+  assert.equal(fs1('s-ne').s, 6);   // set-a (s-ne × 2) と s-kind1 (s-ne × 2 × 2) は展開
+  db.prepare("DELETE FROM raw_sp_orders WHERE amazon_order_id LIKE 'k-order-%'").run();
+  await quietly(() => rebuildFSales());
+  // 商品管理リスト (登録日に 商品区分 = セット を使う) も作れる・区分は C
+  const { buildProductManagementSnapshot } = await import('../apps/warehouse/build-product-management-snapshot.js');
+  const pml = await quietly(() => buildProductManagementSnapshot());
+  const pr = (code) => db.prepare('SELECT 商品区分 FROM product_management_snapshot_rows WHERE run_id = ? AND 商品コード = ?').get(pml.run_id, code);
+  assert.deepEqual([pr('set-g').商品区分, pr('s-kind1').商品区分], ['単品', 'セット']);
+  // warehouse の画面の API (商品区分で絞る「未登録」の一覧) も C の区分で動く: 原価の未登録は単品だけ = C の単品 set-g も対象・セット s-kind1 は対象外
+  const wr = await import('../apps/warehouse/router.js'); const router = wr.default || wr.router;
+  const callGet = (routePath, query) => new Promise((resolve, reject) => {
+    const layer = router.stack.find((l) => l.route && l.route.path === routePath && l.route.methods.get);
+    const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json(b) { resolve({ status: this.statusCode, body: b }); }, setHeader() {}, set() { return this; } };
+    try { const x = layer.route.stack[0].handle({ query, body: {}, params: {}, headers: {}, session: {} }, res, reject); if (x && typeof x.catch === 'function') x.catch(reject); } catch (e) { reject(e); }
+  });
+  db.prepare("UPDATE m_products SET 原価 = NULL, 原価状態 = 'MISSING' WHERE 商品コード IN ('set-g', 's-kind1')").run();
+  const miss = await callGet('/api/missing/prioritized', { type: 'genka' });
+  assert.equal(miss.status, 200);
+  const missCodes = miss.body.rows.map((x) => x.商品コード);
+  assert.deepEqual([missCodes.includes('set-g'), missCodes.includes('s-kind1')], [true, false]);
+  assert.equal(miss.body.rows.find((x) => x.商品コード === 'set-g').商品区分, '単品');
+  // 持ち主を load に戻す = 写しも作り直しも NE の区分・夜間ロードも NE の区分に合わせる (今までどおり)
+  await nightly();   // 持ち主を load に (夜間ロードの記録した持ち主 = 写しの持ち主)
+  assert.equal((await fetchGen(MASTER_OWNERSHIP)).state, 'verified');
+  assert.equal((await rebuild()).ok, true);
+  assert.deepEqual([mp('set-g').商品区分, count('m_set_components', "セット商品コード = 'set-g'")], ['セット', 1]);
+  publishMirror();
+  await loadNow();
+  assert.deepEqual([(await kindOf('s-kind1')).sku_kind, (await kindOf('set-g')).sku_kind], ['set', 'set']);
+  db.prepare("DELETE FROM raw_ne_set_products WHERE セット商品コード = 's-kind1'").run();
+  db.prepare("DELETE FROM raw_ne_products WHERE 商品コード = 's-kind1'").run();
+  FX.markComplete(db, readNeRawRev);
+  assert.equal((await rebuild()).ok, true);
+});
+
+await ta('[33] 区分の持ち主が C の 9 升 (C の区分 3 × NE の区分 3): 同じ = 写す / C 単品・NE セット = 単品として写す (構成なし) / ほか 5 升 (C セット・NE 単品・例外を含む 4 升) = 前の行のまま (構成も)・前の行が無い = 載せない / 確かめ・下流 3 系統 (f_sales・商品管理リスト・router)', async () => {
+  const own = OWN('skus.sku_kind', 'skus.name', 'products.name');
+  // NE の区分 (単品 = 商品の表 / セット = セットの表 / 例外 = exception_genka だけ) を 9 升 + 前の行の無い 1 件に
+  const CELLS = [   // [コード, C の区分, NE の区分]
+    ['q-ss', 'single', 'single'], ['q-st', 'single', 'set'], ['q-sx', 'single', 'exception'],
+    ['q-ts', 'set', 'single'], ['q-tt', 'set', 'set'], ['q-tx', 'set', 'exception'],
+    ['q-xs', 'exception', 'single'], ['q-xt', 'exception', 'set'], ['q-xx', 'exception', 'exception'],
+  ];
+  const putNe = (code, k) => {
+    db.prepare('DELETE FROM raw_ne_products WHERE 商品コード = ?').run(code);
+    db.prepare('DELETE FROM raw_ne_set_products WHERE セット商品コード = ?').run(code);
+    db.prepare('DELETE FROM exception_genka WHERE sku = ?').run(code);
+    if (k === 'single') addNe(code, `NE ${code}`, 50);
+    if (k === 'set') db.prepare("INSERT INTO raw_ne_set_products (セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, synced_at) VALUES (?, ?, 500, 's-ne', 3, ?)").run(code, `NE ${code}`, FX.T1);
+    if (k === 'exception') db.prepare("INSERT INTO exception_genka (sku, genka, 商品名, synced_at) VALUES (?, 77, ?, 'x')").run(code, `NE ${code}`);
+    FX.markComplete(db, readNeRawRev);
+  };
+  // 1 日目 (全部 load): NE を C の区分にして作り直し・夜間ロード = C に C の区分の SKU ができる (前の m_products の行も C の区分)
+  for (const [code, ck] of CELLS) putNe(code, ck);
+  await nightly();
+  assert.equal((await fetchGen(MASTER_OWNERSHIP)).state, 'verified');
+  assert.equal((await rebuild()).ok, true);
+  publishMirror();
+  await nightly();
+  const kinds = async () => Object.fromEntries((await q("select code, sku_kind from core.skus where code like 'q-%' order by code")).map((r) => [r.code, r.sku_kind]));
+  assert.deepEqual(await kinds(), Object.fromEntries(CELLS.map(([c, ck]) => [c, ck])));
+  for (const [code] of CELLS) await setName(code, `C ${code}`, { productToo: CELLS.find((x) => x[0] === code)[1] === 'single' });
+  // 前の行が無い C のセット (NE は今朝から単品)
+  await q("insert into core.skus (company_id, sku_kind, code, name, handling) values (1, 'set', 'q-new', 'C q-new', 'active')");
+  const prev = Object.fromEntries(CELLS.map(([c]) => [c, db.prepare('SELECT 商品名, 商品区分, 原価, 原価ソース, 消費税率, 取扱区分, セット構成品数, updated_at FROM m_products WHERE 商品コード = ?').get(c)]));
+  const prevComps = (c) => db.prepare('SELECT 構成商品コード, 数量 FROM m_set_components WHERE セット商品コード = ? ORDER BY 構成商品コード').all(c);
+  const prevC = Object.fromEntries(CELLS.map(([c]) => [c, prevComps(c)]));
+  // 2 日目: NE の区分を変える (NE の画面で)・持ち主 = 区分も C
+  for (const [code, , nk] of CELLS) putNe(code, nk);
+  putNe('q-new', 'single');
+  await nightly(own);   // 材料 (前の m_products) は C の区分 = 区分は社内のまま
+  assert.deepEqual(await kinds(), { ...Object.fromEntries(CELLS.map(([c, ck]) => [c, ck])), 'q-new': 'set' });
+  const g = await fetchGen(MASTER_OWNERSHIP);
+  assert.equal(g.state, 'verified', JSON.stringify(g.problems));
+  assert.deepEqual([g.evidence.kind_c_single_ne_set.codes, g.evidence.kind_c_set_ne_single_frozen.codes], [['q-st'], ['q-sx', 'q-ts', 'q-tx', 'q-xs', 'q-xt']]);
+  const r = await rebuild();
+  assert.equal(r.ok, true, JSON.stringify(r.checks));
+  assert.deepEqual([r.publish.stats.kind_c_single_ne_set_codes, r.publish.stats.kind_c_set_ne_single_frozen_codes, r.publish.stats.kind_mismatch],
+    [['q-st'], ['q-new', 'q-sx', 'q-ts', 'q-tx', 'q-xs', 'q-xt'], 0]);
+  const row = (c) => db.prepare('SELECT 商品名, 商品区分, 原価, 原価ソース, 消費税率, 取扱区分, セット構成品数, updated_at FROM m_products WHERE 商品コード = ?').get(c);
+  // 同じ 3 升 = C の区分・C の名前
+  assert.deepEqual([row('q-ss').商品区分, row('q-ss').商品名, row('q-tt').商品区分, row('q-tt').商品名, row('q-xx').商品区分, row('q-xx').商品名], ['単品', 'C q-ss', 'セット', 'C q-tt', '例外', 'C q-xx']);
+  assert.deepEqual(prevComps('q-tt'), [{ 構成商品コード: 's-ne', 数量: 3 }]);
+  // C 単品・NE セット = 単品・C の名前・構成なし
+  assert.deepEqual([row('q-st').商品区分, row('q-st').商品名, row('q-st').セット構成品数, prevComps('q-st')], ['単品', 'C q-st', null, []]);
+  // ほか 5 升 = 前の行のまま (時刻も)・前の構成のまま
+  for (const c of ['q-sx', 'q-ts', 'q-tx', 'q-xs', 'q-xt']) { assert.deepEqual(row(c), prev[c], c); assert.deepEqual(prevComps(c), prevC[c], c); }
+  assert.equal(row('q-new'), undefined);   // 前の行が無い = 載せない
+  assert.deepEqual(db.prepare("SELECT code, prev_row FROM m_publish_kind_frozen ORDER BY code").all().map((x) => [x.code, x.prev_row]),
+    [['q-new', 0], ['q-sx', 1], ['q-ts', 1], ['q-tx', 1], ['q-xs', 1], ['q-xt', 1]]);
+  const reasons = snap().reasons.filter((x) => x.col === 'kind' && x.code.startsWith('q-')).map((x) => [x.code, x.reason, x.cdb_value?.kind, x.ne_value, x.value]).sort();
+  assert.deepEqual(reasons, [['q-new', 'kind_c_set_ne_single_frozen', 'set', '単品', 'omitted'], ['q-st', 'company_owned', 'single', 'セット', '単品'],
+    ['q-sx', 'kind_c_set_ne_single_frozen', 'single', '例外', 'previous_row'], ['q-ts', 'kind_c_set_ne_single_frozen', 'set', '単品', 'previous_row'],
+    ['q-tx', 'kind_c_set_ne_single_frozen', 'set', '例外', 'previous_row'], ['q-xs', 'kind_c_set_ne_single_frozen', 'exception', '単品', 'previous_row'],
+    ['q-xt', 'kind_c_set_ne_single_frozen', 'exception', 'セット', 'previous_row']]);
+  // 入れた後の確かめ = 通る (前の行のまま の SKU は比べない・数える)・②b も前の行のままを差にしない
+  const va = await F.runVerifyApply({ sqlite: db, dataDir: tmp, taxRates: TAX_RATES });
+  assert.deepEqual([va.state, va.evidence.apply.counts.kind_frozen], ['verified', 5], JSON.stringify(va.problems));
+  const v2 = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: OWN('skus.name', 'products.name'), taxRates: TAX_RATES, maxProblems: Infinity, kindCopied: true });
+  assert.ok(!v2.problems.some((x) => String(x.code).startsWith('q-')), JSON.stringify(v2.problems.filter((x) => String(x.code).startsWith('q-'))));
+  // わざと壊す: 前の行のまま の印が消えた = 前の行と C の名前が違う = 確かめで見つかる
+  const keepFrozen = db.prepare('SELECT * FROM m_publish_kind_frozen').all();
+  db.exec('DELETE FROM m_publish_kind_frozen');
+  const v3 = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES, maxProblems: Infinity });
+  assert.ok(v3.problems.some((x) => x.code === 'q-ts' || x.code === 'q-xs'), JSON.stringify(v3.problems.slice(0, 5)));
+  for (const f of keepFrozen) db.prepare('INSERT INTO m_publish_kind_frozen (code, prev_row, snapshot) VALUES (?, ?, ?)').run(f.code, f.prev_row, f.snapshot);
+  // わざと壊す (#1641 Codex R1 High): 印を残したまま、前の行のまま の商品の行 (名前・原価)・構成の行を書き換える / 載せない SKU の行を足す = 確かめで見つかり・ハッシュも変わる
+  const vOk = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES, maxProblems: Infinity });
+  assert.equal(vOk.ok, true, JSON.stringify(vOk.problems.slice(0, 3)));
+  const tamper = [
+    ["UPDATE m_products SET 商品名 = '書き換え' WHERE 商品コード = 'q-ts'", "UPDATE m_products SET 商品名 = ? WHERE 商品コード = 'q-ts'", prev['q-ts'].商品名, 'q-ts'],
+    ["UPDATE m_products SET 原価 = 1 WHERE 商品コード = 'q-xs'", "UPDATE m_products SET 原価 = ? WHERE 商品コード = 'q-xs'", prev['q-xs'].原価, 'q-xs'],
+    ["UPDATE m_set_components SET 数量 = 9 WHERE セット商品コード = 'q-ts'", "UPDATE m_set_components SET 数量 = ? WHERE セット商品コード = 'q-ts'", prevC['q-ts'][0].数量, 'q-ts'],
+    ["INSERT INTO m_products (商品コード, 商品名, 商品区分, 原価状態, updated_at) VALUES ('q-new', '足した', 'セット', 'MISSING', 'x')", "DELETE FROM m_products WHERE 商品コード = 'q-new'", undefined, 'q-new'],
+  ];
+  assert.ok(prevC['q-ts'].length > 0);   // q-ts の前の行はセット (構成つき)
+  for (const [bad, undo, val, code] of tamper) {
+    db.prepare(bad).run();
+    const vb = MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES, maxProblems: Infinity });
+    assert.ok(vb.problems.some((x) => x.code === code && x.col === 'kind_frozen'), `${bad}: ${JSON.stringify(vb.problems.slice(0, 3))}`);
+    assert.notEqual(vb.applied_hash, vOk.applied_hash, bad);
+    if (val === undefined) db.prepare(undo).run(); else db.prepare(undo).run(val);
+  }
+  assert.equal(MP.verifyApplied(db, { publication: MP.readCurrentPublish(db), ownership: own, taxRates: TAX_RATES, maxProblems: Infinity }).applied_hash, vOk.applied_hash);
+  // 下流 3 系統: f_sales (Amazon の注文のセット展開) / 商品管理リスト / router の未登録一覧
+  db.exec('CREATE TABLE IF NOT EXISTS raw_rakuten_orders (order_number TEXT, order_date TEXT, order_status INTEGER, item_number TEXT, item_name TEXT, price_tax_incl REAL, units INTEGER, delete_item_flag INTEGER)');
+  const { rebuildFSales } = await import('../apps/warehouse/rebuild-f-sales.js');
+  const ins = db.prepare("INSERT INTO raw_sp_orders (amazon_order_id, purchase_date, order_status, seller_sku, title, quantity, item_price, synced_at) VALUES (?, '2026-10-02T10:00:00Z', 'Shipped', ?, 't', 1, 100, 'x')");
+  for (const [code] of [...CELLS, ['q-new']]) ins.run(`q-order-${code}`, code);
+  await quietly(() => rebuildFSales());
+  const fsq = (code) => db.prepare("SELECT SUM(直接販売数) AS d, SUM(セット経由数) AS s FROM f_sales_by_product WHERE 日付 = '2026-10-02' AND 商品コード = ?").get(code);
+  assert.deepEqual([fsq('q-st'), fsq('q-ss'), fsq('q-tt'), fsq('q-new')], [{ d: 1, s: 0 }, { d: 1, s: 0 }, { d: null, s: null }, { d: null, s: null }]);   // C 単品は展開しない・C セットは展開・載せない SKU は売上に出ない (Amazon の対応なし)
+  assert.ok(fsq('s-ne').s >= 3);   // q-tt (s-ne × 3) は展開
+  for (const c of ['q-ts', 'q-xt']) assert.deepEqual(fsq(c), prev[c].商品区分 === 'セット' ? { d: null, s: null } : { d: 1, s: 0 }, c);   // 前の行のまま = 前の区分で展開
+  db.prepare("DELETE FROM raw_sp_orders WHERE amazon_order_id LIKE 'q-order-%'").run();
+  await quietly(() => rebuildFSales());
+  const { buildProductManagementSnapshot } = await import('../apps/warehouse/build-product-management-snapshot.js');
+  const pml = await quietly(() => buildProductManagementSnapshot());
+  const pr = (code) => db.prepare('SELECT 商品区分 FROM product_management_snapshot_rows WHERE run_id = ? AND 商品コード = ?').get(pml.run_id, code)?.商品区分 ?? null;
+  assert.deepEqual(['q-ss', 'q-st', 'q-tt', 'q-xx', 'q-ts', 'q-xs', 'q-new'].map(pr), ['単品', '単品', 'セット', '例外', prev['q-ts'].商品区分, prev['q-xs'].商品区分, null]);
+  db.prepare("UPDATE m_products SET 原価 = NULL, 原価状態 = 'MISSING' WHERE 商品コード IN ('q-st', 'q-tt')").run();   // 原価の未登録は単品だけ
+  const wr = await import('../apps/warehouse/router.js'); const router = wr.default || wr.router;
+  const layer = router.stack.find((l) => l.route && l.route.path === '/api/missing/prioritized' && l.route.methods.get);
+  const miss = await new Promise((resolve, reject) => { const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json(b) { resolve({ status: this.statusCode, body: b }); }, setHeader() {}, set() { return this; } };
+    try { const x = layer.route.stack[0].handle({ query: { type: 'genka' }, body: {}, params: {}, headers: {}, session: {} }, res, reject); if (x && typeof x.catch === 'function') x.catch(reject); } catch (e) { reject(e); } });
+  assert.equal(miss.status, 200);
+  const mk = Object.fromEntries(miss.body.rows.filter((x) => x.商品コード.startsWith('q-')).map((x) => [x.商品コード, x.商品区分]));
+  assert.deepEqual([mk['q-st'], mk['q-tt'], mk['q-new']], ['単品', undefined, undefined]);   // C 単品 (NE セット) は単品の一覧に・C セットは出ない
+  // 後片付け: 全部 load に戻して NE からも消す
+  await nightly();
+  for (const [code] of [...CELLS, ['q-new']]) { db.prepare('DELETE FROM raw_ne_products WHERE 商品コード = ?').run(code); db.prepare('DELETE FROM raw_ne_set_products WHERE セット商品コード = ?').run(code); db.prepare('DELETE FROM exception_genka WHERE sku = ?').run(code); }
+  FX.markComplete(db, readNeRawRev);
+  assert.equal((await fetchGen(MASTER_OWNERSHIP)).state, 'verified');
+  assert.equal((await rebuild()).ok, true);
 });
 
 await pg.close();

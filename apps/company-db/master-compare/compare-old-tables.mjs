@@ -104,7 +104,8 @@ export async function compareOldTables({ db, dataDir, asOfJst, syncRunId = null,
     const entries = await readCdbOldCols(db, out.cols);
     const own = Object.fromEntries(out.cols.map((c) => [PUBLISH_COLUMNS[c], 'company']));
     const rates = taxRates || (await import('../../warehouse/rebuild-m-products.js')).TAX_RATES;
-    const v = verifyApplied(sqlite, { publication: { entries }, ownership: own, taxRates: rates, maxProblems: Infinity });
+    // 区分の持ち主が C の世代 = 作り直しが区分を写した (構成の行の無い C のセットは C の値をそのまま = 導いたセットとして読まない)。区分そのものは ② の kind で比べる
+    const v = verifyApplied(sqlite, { publication: { entries }, ownership: own, taxRates: rates, maxProblems: Infinity, kindCopied: ownership['skus.sku_kind'] === 'company' });
     Object.assign(out.counts, { keys: v.counts.keys, checked: v.counts.checked, derived: v.counts.derived, not_in_cdb: v.counts.not_in_cdb, not_in_ne: v.counts.not_in_ne });
     // ── 4. 分ける (世代にあった値 = breach / 写しの後に直した = lag・期限は台帳) ──
     const release = (() => { try { return acquireLock(pendingDir(dataDir, OLD_RESULT_DIR)); } catch { return null; } })();

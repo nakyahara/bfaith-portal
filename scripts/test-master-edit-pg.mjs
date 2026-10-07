@@ -44,6 +44,10 @@ import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.m
 import { createMasterEditRoles } from './company-db/create-master-edit-roles.mjs';
 import { runInitialLoad } from '../apps/company-db/load/engine.mjs';
 import { OWNED_COLUMNS as OWNED_COLUMNS_FOR_BASE } from '../config/master-ownership.mjs';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS);
 // 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
 const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries(OWNED_COLUMNS_FOR_BASE.map((k) => [k, 'load'])));
 
@@ -86,6 +90,7 @@ try {
   const dbO = pgAdapter(O);
   await applyMigrations(dbO, { log: () => {} });
   await createMasterEditRoles(O, { pw: PW });
+  await W2.useReal0058(O, { leases: ['single', 'set'], futureSetLease: true });   // 広げる道 PR-2: 本物の 0058 の上で試験の許可を置く (この DB は構成も C = セットの許可は将来の形)
   const [A, B, GR, GM, P, V, O2] = [await open('master_edit'), await open('master_edit'), await open('master_gate_render'), await open('master_gate_minipc'),
     await open('master_ops'), await open('master_observer'), await open(null)];
   clients.push(A, B, GR, GM, P, V, O2);
@@ -145,6 +150,7 @@ try {
   { const p = (await dbP.query('select * from ops.registration_backfill_plan()')).rows[0]; await dbP.query('select ops.backfill_sku_registrations($1, $2, $3)', [p.sku_count, p.snapshot_hash, 't@test']); }
   await C.advanceCutoverPhase(dbP, { to: 'new_open', actor: 't@test', evidence: { expected_builds: builds, manifest_hash: mh, owner_hash: h } });
   assert.equal((await O.query('select phase from ops.master_cutover_state')).rows[0].phase, 'new_open');
+  await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(dbO, { withSet: true });   // 0058: 新商品の入口は今朝の照合のゲートの許可 (lease) があるときだけ開く
 
   const tokenOf = async (code) => W.editTokenOf(await W.readCurrent(dbO, (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0].id, '2030-01-10'));
   const save = (db, code, values, { token, requestId = crypto.randomUUID(), beforeCommit, open = true } = {}) =>
@@ -518,6 +524,7 @@ try {
   const RUN = 'mc_20300110T000000000Z_aaaaaa';
   await O.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, '2030-01-10T00:00:00Z', 0)`, [RUN]);
   await O.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: RUN, entries: ['p001', 'p002', 'p003', 'p004', 'ps01'].map((c) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: c, spellings: [c] })) })]);
+  await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(dbO, { runId: RUN, withSet: true });   // 0058: 配るは「NE のコードの回 = 許可の回」(本番と同じ = その照合の回の許可)
   const rates = new Map([['S01', { method: 'ゆうパケット', cost: 210 }]]);
   await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew', card: { create: false },
     values: { name: '新しい単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', cost: { jpy: '300' } } },
@@ -588,6 +595,100 @@ try {
     const sess = await q("select s.actor_id, s.db_user, s.operation, d.status from ops.master_write_sessions s join ops.master_edit_requests d on d.request_id = s.request_id where s.request_id::text = $1", [ev.request_id]);
     assert.deepEqual([ev.actor_id, sess.map((s) => [s.actor_id, s.db_user, s.operation, s.status])], ['boss@test', [['boss@test', 'master_edit', 'reg_csv_declare', 'done']]]);
   });
+  await ta('[20b] 広げる道 PR-2 (Codex #1640 R2 Medium 3): 初めて配る (built → issued) は許可の共有の鍵を SKU・CSV の鍵より前に取る = 取り消し (許可の排他の鍵) と順に並ぶ・配った後の再送は許可の鍵を取らない', async () => {
+    const OGx = await import('../lib/master-owner-gate.mjs');
+    const o = { ownership: ALL_COMPANY, open: true, nowMs: NOW.getTime() };
+    for (const c of ['pnew3', 'pnew4']) {
+      await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: c, card: { create: false },
+        values: { name: `新しい単品 ${c}`, standard_price: '1700', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', cost: { jpy: '320' } } },
+      { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });
+    }
+    const x = await G.buildRegExport(dbA, { actor: 'boss@test', kind: 'products', codes: ['pnew3'], requestId: crypto.randomUUID() }, o);
+    const y = await G.buildRegExport(dbA, { actor: 'boss@test', kind: 'products', codes: ['pnew4'], requestId: crypto.randomUUID() }, o);
+    const revokeLike = async (hold) => {   // 0058 の revoke / 照合 ② の始めに閉じる・結果の記録と同じ鍵 (許可の排他)
+      await O.query('begin');
+      await O.query(`select pg_advisory_xact_lock(ops.new_entry_lease_lock_key('single'))`);   // 0058 の鍵の関数 (持ち主は呼べる) = 鍵の数を試験に書かない
+      await hold();
+      await O.query('commit');
+    };
+    // (a) 配っている途中 (commit の前) = 取り消しは許可の鍵で待つ (配り終えてから閉じる)
+    const g = gate();
+    const a = launch(G.issueRegExport(dbA, { actor: 'boss@test', exportId: x.export.export_id }, { ...o, beforeCommit: g.wait }));
+    await sleep(300);
+    const rv = launch(revokeLike(async () => {}));
+    await sleep(500);
+    assert.equal(rv.done, false, '取り消しは配っている途中の取引を待つ');
+    g.open();
+    const ra = await a.promise;
+    assert.equal(ra.ok?.export?.state, 'issued', ra.err?.message);
+    { const x = await rv.promise; assert.ok(!x.err, x.err && x.err.message); }
+    // (b) 取り消しが先に許可の鍵を持っている = 初めて配るは許可の鍵で待つ。その間 SKU の鍵は取っていない (同じ商品の保存は待たずに通る)
+    const held = gate();
+    const r2 = launch(revokeLike(held.wait));
+    await sleep(300);
+    const b = launch(G.issueRegExport(dbA, { actor: 'boss@test', exportId: y.export.export_id }, o));
+    await sleep(500);
+    assert.equal(b.done, false, '初めて配るは許可の鍵で待つ');
+    const sv = await save(dbB, 'pnew4', { reorder_months: '3' }, { token: await tokenOf('pnew4') });
+    assert.equal(sv.ok, true, '許可の鍵を待っている間は SKU の鍵を持っていない = 同じ商品の保存は待たない');
+    // 配った後の再送 (もう issued の x) は許可の鍵を取らない = 取り消しが鍵を持っていても待たない
+    const again = await G.issueRegExport(dbB, { actor: 'boss@test', exportId: x.export.export_id }, o);
+    assert.equal(again.already, true);
+    held.open();
+    { const x = await r2.promise; assert.ok(!x.err, x.err && x.err.message); }
+    const rb = await b.promise;
+    assert.equal(rb.ok?.export?.state, 'issued', rb.err?.message);
+    assert.equal(OGx.ACQUIRE_NEW_ENTRY_LOCKS_FN, 'ops.acquire_new_entry_locks(text)');
+  });
+
+  await ta('[20c] 広げる道 PR-2 (Codex #1640 R3 Medium 1): 新規開始の鍵 (許可の共有の鍵) は段階の鍵より前 = 0058 と同じ順。許可を排他で持つ取引 (取り消し・照合 ② の始めに閉じる) が段階の鍵 (排他) を取っても deadlock しない', async () => {
+    const o = { ownership: ALL_COMPANY, open: true, nowMs: NOW.getTime() };
+    await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew5', card: { create: false },
+      values: { name: '新しい単品 pnew5', standard_price: '1700', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', cost: { jpy: '320' } } },
+    { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });
+    const held = gate();
+    let gotCutover = null;
+    // 許可を排他で持つ → (作る取引が許可の鍵で待っている間に) 段階の鍵を排他で取る = 作る取引が段階の鍵を先に持っていれば deadlock / 待ち
+    const holder = launch((async () => {
+      await O.query('begin');
+      await O.query(`select pg_advisory_xact_lock(ops.new_entry_lease_lock_key('single'))`);
+      await held.wait();
+      await O.query(`set local lock_timeout = '3s'`);
+      try { await O.query(`select pg_advisory_xact_lock(hashtext('ops.master_cutover'))`); gotCutover = true; } catch (e) { gotCutover = e.code || e.message; }
+      await O.query('commit');
+    })());
+    await sleep(300);
+    const b = launch(G.buildRegExport(dbA, { actor: 'boss@test', kind: 'products', codes: ['pnew5'], requestId: crypto.randomUUID() }, o));
+    await sleep(500);
+    assert.equal(b.done, false, '作る取引は許可の鍵で待つ');
+    held.open();
+    { const x = await holder.promise; assert.ok(!x.err, x.err && x.err.message); }
+    assert.equal(gotCutover, true, '許可を持つ側は段階の鍵を取れる (作る取引は段階の鍵を持たずに待っていた)');
+    const rb = await b.promise;
+    assert.ok(rb.ok?.export?.export_id, rb.err?.message);
+    // 初めて配る (built → issued) も同じ順 (新規開始の鍵 → 段階)
+    const held2 = gate();
+    let gotCutover2 = null;
+    const holder2 = launch((async () => {
+      await O.query('begin');
+      await O.query(`select pg_advisory_xact_lock(ops.new_entry_lease_lock_key('single'))`);
+      await held2.wait();
+      await O.query(`set local lock_timeout = '3s'`);
+      try { await O.query(`select pg_advisory_xact_lock(hashtext('ops.master_cutover'))`); gotCutover2 = true; } catch (e) { gotCutover2 = e.code || e.message; }
+      await O.query('commit');
+    })());
+    await sleep(300);
+    const c = launch(G.issueRegExport(dbA, { actor: 'boss@test', exportId: rb.ok.export.export_id }, o));
+    await sleep(500);
+    assert.equal(c.done, false, '初めて配るは許可の鍵で待つ');
+    held2.open();
+    { const x = await holder2.promise; assert.ok(!x.err, x.err && x.err.message); }
+    assert.equal(gotCutover2, true, '初めて配るも段階の鍵を持たずに待っていた');
+    const rc = await c.promise;
+    assert.equal(rc.ok?.export?.state, 'issued', rc.err?.message);
+    await G.supersedeRegExport(dbA, { actor: 'boss@test', exportId: rb.ok.export.export_id, reason: '試験', correction: 'NE には取り込んでいない', confirm: true }, o);
+  });
+
   await ta('[21] FBA の在庫 (10/5): master_edit のログインで在庫の日次の 2 つの表を読める (分割の親を通して)・読むだけ (書けない・分割の子・mart・ほかの在庫の表・分割を作る関数は 42501)', async () => {
     const { ingestStockDay } = await import('../apps/company-db/ingest/stock-daily.mjs');
     const F = await import('../apps/master-edit/fba-stock.mjs');

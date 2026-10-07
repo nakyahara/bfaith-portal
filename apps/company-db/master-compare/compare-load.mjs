@@ -30,7 +30,8 @@ export const ITEM_TYPES = Object.freeze(['missing', 'value', 'cost', 'primary_su
 export const DECISION_SECTIONS = Object.freeze(['skus', 'sku_costs', 'set_components', 'primary_suppliers']);
 /** 代表 (親子) の保持の理由コード (夜間ロード engine.mjs の D3。知らない理由の記録は形の崩れ) */
 export const PARENT_HOLD_REASONS = Object.freeze(['manual', 'unknown_owner', 'material_untrusted', 'mass_unlink_guard', 'rep_unknown', 'rep_not_single', 'rep_ambiguous',
-  'rep_collided', 'rep_no_product', 'rep_unresolved', 'no_accepted_child', 'parent_conflict', 'loop']);
+  'rep_collided', 'rep_no_product', 'rep_unresolved', 'no_accepted_child', 'parent_conflict', 'loop',
+  'kind_held']);   // 区分の持ち主が company で、NE (単品) と社内の区分が違う SKU (親子は触らない)
 export const subjectKey = (type, codeNorm) => `${type}:${codeNorm}`;
 export const jstDateOf = (iso) => new Date(Date.parse(iso) + 9 * 3600000).toISOString().slice(0, 10);
 
@@ -65,6 +66,21 @@ export function decisionsProblem(D, { ownership, has0027 }) {
   if (!p || typeof p.applied !== 'boolean') return 'primary_suppliers';
   if (p.applied && (!arrOf(p.targets, (x) => Array.isArray(x) && isStr(x[0]) && isStr(x[1])) || !arrOf(p.unresolved, (x) => Array.isArray(x) && isStr(x[2])))) return 'primary_suppliers';
   if (!p.applied && !isStr(p.reason_code)) return 'primary_suppliers';
+  // 区分の持ち主が company のロードだけ、NE と社内で区分が違う SKU の記録 [コード, NE の区分, 社内の区分] がある (load のロードには無い)
+  const KINDS = ['single', 'set', 'exception'];
+  // 区分の記録 (広げる道 v8)。この版の前のロードには無い = 見ない。あれば形どおりか (held / unverifiable は配列・件数と一致・持ち主と一致)
+  if (s.sku_kind !== undefined) {
+    const k = s.sku_kind;
+    const UNV = ['empty_code', 'unknown_kind', 'norm_collision'];
+    if (!k || k.format !== 'sku-kind-v1' || Object.keys(k).sort().join() !== 'format,held,unverifiable' || !Array.isArray(k.held) || !Array.isArray(k.unverifiable)
+      || !k.held.every((x) => isStr(x))
+      || !k.unverifiable.every((x) => x && Object.keys(x).sort().join() === 'code_norm,raw_code,reason' && isStr(x.raw_code) && UNV.includes(x.reason)
+        && (x.reason === 'empty_code' ? x.code_norm === null : isStr(x.code_norm) && x.code_norm !== ''))
+      || (ownership['skus.sku_kind'] !== 'company' && k.held.length)) return 'skus_sku_kind';
+  }
+  if (ownership['skus.sku_kind'] === 'company'
+    ? !arrOf(s.kind_held, (x) => Array.isArray(x) && x.length === 3 && isStr(x[0]) && KINDS.includes(x[1]) && KINDS.includes(x[2]) && x[1] !== x[2])
+    : s.kind_held !== undefined) return 'skus_kind_held';
   // ロードした回の持ち主・条件と整合 (持ち主が load なのに「見送った」、company なのに「書いた」は形がおかしい)
   if (c.owned !== (ownership['sku_costs'] === 'load')) return 'sku_costs_owner';
   if (k.owned !== (ownership['sku_components'] === 'load')) return 'set_components_owner';

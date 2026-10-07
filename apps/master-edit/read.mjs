@@ -6,7 +6,6 @@
  *   セットの売上分類は保存していない (読むときに lib/master-set-rules.js で導く) ので、売上分類の「未入力」だけは JS で絞る
  *   登録の状態 (0052・⑤-2a) = 下書き・NE 登録待ち・NE 確認済み・配る対象・利用可・要確認・やめた。行が無い = 切替の前の商品 (backfill の前)
  */
-import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
 import { backorderOf, backorderKeys, stockOf, buildableOf } from './extras.mjs';
@@ -470,7 +469,8 @@ export async function listCounts(db, { now = new Date() } = {}) {
 }
 
 /** 1 つの SKU の画面 (B・C) に出すもの。無ければ null。open = env MASTER_EDIT_OPEN (切替の段階 new_open と両方で欄が開く) */
-export async function readSkuPage(db, code, { now = new Date(), ownership = MASTER_OWNERSHIP, open = false } = {}) {
+/** ownership = 画面の持ち主 (DB の active・router が読む。null = 読めない = 欄は全部閉じる)・open = MASTER_EDIT_OPEN かつ持ち主を読めた (code_behind でない) */
+export async function readSkuPage(db, code, { now = new Date(), ownership = null, open = false } = {}) {
   const today = jstDate(now);
   // 画面の値と「その間の変更」の起点は同じ瞬間に読む (読む取引を 1 つに)
   await db.query('begin isolation level repeatable read read only');
@@ -512,7 +512,7 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = MAST
       cur, costs, suppliers, activeSuppliers, jan, usedIn, usedInCount, amazon, csvRows, today, card, regItems, recent, locks, registered,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
-      fields: fieldOwnership(cur.sku_kind, ownership, open && newEntryWritable(phase, ownership)),
+      fields: fieldOwnership(cur.sku_kind, ownership || {}, open && !!ownership && newEntryWritable(phase, ownership)),
       breaches,
       phase,
       token: editTokenOf(cur),

@@ -40,6 +40,10 @@ import crypto from 'node:crypto';
 import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.mjs';
 import { createRoles, urlFor } from './company-db/create-watch-roles.mjs';
 import { createMasterEditRoles, GATE_LOGIN_ROLES } from './company-db/create-master-edit-roles.mjs';
+// 広げる道 PR-2: 画面は DB の active に従う。試験の DB は全部の列を company にする = このコードの能力も全部 (code_behind の試験だけ戻す)
+const W2 = await import('./fixtures/master-widen-pr1.mjs');
+const OG = await import('../lib/master-owner-gate.mjs');
+OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS);
 
 const url = process.env.TEST_PG_URL || '';
 if (!url) { console.log('⏭️ TEST_PG_URL が無い (実 PostgreSQL の門の試験は飛ばす。PGlite と偽の読み方の試験は scripts/test-master-legacy-gate.mjs)'); process.exit(0); }
@@ -75,7 +79,7 @@ try {
   await createRoles(M, { watcherPw: 'w-pw', writerPw: 'ww-pw' });
   // ⑤-1 のロールの作り (本物の scripts/company-db/create-master-edit-roles.mjs = まとめの master_gate (ログインなし) と場所ごとのログイン)。
   // 試験は門のログインのパスワードだけ決めて渡す (ほかのロールは作りに任せる)
-  await createMasterEditRoles(M, { pw: Object.fromEntries(Object.values(GATE_LOGIN_ROLES).map((r) => [r, `${r}-pw`])) });
+  await createMasterEditRoles(M, { pw: { ...Object.fromEntries(Object.values(GATE_LOGIN_ROLES).map((r) => [r, `${r}-pw`])), new_entry_gate: 'new_entry_gate-pw' } });
   const gateUrl = (h) => urlFor(u.toString(), `master_gate_${h}`, `master_gate_${h}-pw`);
   process.env.COMPANY_DB_WATCH_URL = urlFor(u.toString(), 'watcher', 'w-pw');   // --stop の確かめ (見るだけ) に使う。門の段階の読みには使わない
   process.env.COMPANY_DB_MASTER_GATE_MINIPC_URL = gateUrl('minipc');
@@ -185,7 +189,8 @@ try {
   // ─── 門の記録 (場所ごとの門のログイン・⑤-1 の本物の関数) ───
   await G.closeLegacyGatePool();
   await sleep(300);   // 閉じた接続が pg_stat_activity から消えるまで
-  const env = { ...process.env, RENDER_GIT_COMMIT: 'b'.repeat(40), RENDER_INSTANCE_ID: 'pg-test' };
+  // 0058 (広げる道 PR-1): miniPC の配る前の確かめは新商品の開く前のゲートのログイン (new_entry_gate) も見る
+  const env = { ...process.env, RENDER_GIT_COMMIT: 'b'.repeat(40), RENDER_INSTANCE_ID: 'pg-test', COMPANY_DB_NEW_ENTRY_GATE_URL: urlFor(u.toString(), 'new_entry_gate', 'new_entry_gate-pw') };
   await ta('[8] 門の記録: miniPC の門のログイン (master_gate_minipc) で ⑤-1 の関数に書く・返事を確かめる・段階の読みもこのログイン', async () => {
     G.__resetLegacyAck();
     const before = await ackCount();
@@ -250,6 +255,12 @@ try {
     let r = await checkReadiness({ host: 'minipc', env });
     assert.equal(r.ok, true, r.lines.join('\n'));
     assert.ok(r.lines.some((l) => l.includes('黙っているプロセスは無い')), r.lines.join('\n'));
+    assert.ok(r.lines.some((l) => l.includes('新商品の開く前のゲートのログイン = new_entry_gate')), r.lines.join('\n'));
+    // 0058 の後に new_entry_gate の URL が無い / 別の役 = 足りない (本番の手順の抜けを先に見つける)
+    r = await checkReadiness({ host: 'minipc', env: { ...env, COMPANY_DB_NEW_ENTRY_GATE_URL: '' } });
+    assert.equal(r.ok, false); assert.ok(r.problems.some((x) => /開く前のゲートのログインが無い/.test(x)), r.lines.join('\n'));
+    r = await checkReadiness({ host: 'minipc', env: { ...env, COMPANY_DB_NEW_ENTRY_GATE_URL: gateUrl('minipc') } });
+    assert.equal(r.ok, false); assert.ok(r.problems.some((x) => /期待 new_entry_gate/.test(x)), r.lines.join('\n'));
     r = await checkReadiness({ host: 'render', env: { ...env, COMPANY_DB_MASTER_GATE_RENDER_URL: gateUrl('minipc') } });
     assert.equal(r.ok, false); assert.ok(r.problems.some((x) => /master_gate_minipc/.test(x) && /期待 master_gate_render/.test(x)), r.lines.join('\n'));
     r = await checkReadiness({ host: 'minipc', env: { COMPANY_DB_WATCH_URL: process.env.COMPANY_DB_WATCH_URL } });
@@ -287,7 +298,9 @@ try {
     assert.equal((await G.ackLegacyGates({ host: 'minipc', env })).state, 'acked');
     const manifest = G.legacyManifest();
     const mh = await C.manifestHashOf(db, manifest);
-    const oh = C.ownershipHash(MASTER_OWNERSHIP);
+    // 広げる道 PR-2: 記録の持ち主表 = 門のログインで読んだ DB の active (この DB は行が無い = 全部 load)。配った config (13 キー) ではない
+    const oh = G.legacyAckState().owner_hash;
+    assert.match(String(oh), /^[0-9a-f]{64}$/); assert.notEqual(oh, C.ownershipHash(MASTER_OWNERSHIP));
     // 2 日前の記録だけのプロセス (落ちて「止めた」を書けなかった) = 黙っている (年齢では外れない = ⑤-1 #1563 R3)
     await M.query(`insert into ops.master_legacy_gate_acks (host, instance_id, build_id, manifest_hash, owner_hash, phase_seen, inflight_count, session_role, acked_at)
       values ('minipc', 'old-pc:1:aaaaaaaa', $1, $2, $3, 'legacy_open', 0, 'master_gate_minipc', clock_timestamp() - interval '2 days')`, ['b'.repeat(40), mh, oh]);
@@ -439,6 +452,7 @@ try {
       assert.equal((await G.checkLegacyGate({ entry: 'warehouse:POST:/api/shipping' })).writable, true);
       // ロールの作りを流し直せば付く (流し直しでパスワードは変えない)
       await createMasterEditRoles(M);
+      await W2.useReal0058(M);   // 広げる道 PR-2: 本物の 0058 (PR-1) の上 (許可なし = 本番の今)
       rd = await (await import('./company-db/master-legacy-readiness.mjs')).checkReadiness({ host: 'minipc', env });
       assert.equal(rd.ok, true, rd.lines.join('\n'));
       assert.ok(rd.lines.some((l) => l.includes('列ごとの持ち主を読める')), rd.lines.join('\n'));

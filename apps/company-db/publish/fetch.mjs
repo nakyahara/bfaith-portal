@@ -36,7 +36,7 @@ import { writeEvidence, readEvidence } from '../push/evidence.mjs';
 import { selectNightlyLoad, COMPANY_ID } from '../master-compare/compare-load.mjs';
 import {
   publishCols, ownershipSorted, ownershipHash, publishContentHash, validPublishValue, currentGenerationNo, makeGenerationId, readCurrentPublish, verifyApplied,
-  checkPublishOwnership, completeness, entriesOfRows, PRESENCE_COL,
+  checkPublishOwnership, completeness, entriesOfRows, PRESENCE_COL, NOT_IN_CDB_SAMPLES, KIND_TO_M,
   costFromCdb, handlingFromCdb, supplierFromCdb, PUBLISH_0027_COLUMNS, PUBLISH_CURRENT_KEY, PUBLISH_KEEP_GENERATIONS, SKU_KINDS, readPublishGeneration,
 } from '../../warehouse/master-publish.js';
 import { latestBuild, publishOfBuild } from '../../warehouse/master-material.js';
@@ -102,7 +102,7 @@ export async function readPublishSource(db, { prevWatermark = null } = {}) {
  *   切替の日に HTTP (remote-load.mjs load --apply --use-prepared → router の startLoad = host 'render') で流した prepared のロードも、
  *   毎晩の cron (host 'render-nightly') も、後に commit した方が写しの世代になる (照合 ① の selectNightlyLoad は毎晩の cron だけ = 別の目的)。
  *   番号の行がまだ無い (0055 の前・0055 の後に一度も本適用のロードが無い) = 今までどおり毎晩の cron の最新 (commit_seq = null)
- * @returns {{ ingest_run_id, started_at, finished_at, host, commit_seq: number|null, epoch?: string }|null}
+ * @returns {{ ingest_run_id, started_at, finished_at, host, commit_seq: string|null, epoch?: string }|null}  commit_seq = bigint の 10 進の文字 (Number にしない)
  */
 export async function selectPublishLoad(db) {
   const last = await latestLoadCommit(db);
@@ -144,6 +144,7 @@ export function publishValueOf(s, col, source) {
     case 'reorder_months': return s.reorder_months ?? null;
     case 'handling': return s.handling;
     case 'primary_supplier': { const p = source.primary.get(s.code_norm) || []; return p.length === 1 ? p[0] : p.length === 0 ? null : { multiple: p }; }
+    // 区分 (kind) は値の行を作らない = どの行にもある sku_kind が C の区分 (master-publish.js の PUBLISH_COLUMNS.kind)
     default: return undefined;
   }
 }
@@ -183,7 +184,7 @@ export function buildGeneration({ source, ownership, now = new Date() }) {
  * @param {object|null} p.prev  今の世代 (verified) の行
  * @param {Map<string, string>|null} [p.current]  今の m_products のコード → 商品区分 (完全さ = このコード × 要る列の欄が全部あるか。Codex R1 H1)
  */
-export function verifyGeneration({ prev, next, source, current = null }) {
+export function verifyGeneration({ prev, next, source, current = null, neSets = null, neSingles = null }) {
   const problems = [...(next.problems || [])];
   const detail = {};
   // 持ち主が全部 load (値 0 行の世代) = 写す値が無い = 値の前提 (単品の商品・変更の記録・夜間ロードの持ち主) が欠けても受け入れる。
@@ -230,6 +231,25 @@ export function verifyGeneration({ prev, next, source, current = null }) {
       detail.not_in_cdb = { count: c.notInCdb, codes: c.notInCdbCodes };
       // NE と C で種類が違う SKU = その SKU だけ写さない (NE の値のまま)。知らせるだけ (#1564 の見直し M-5)
       detail.kind_mismatch = { count: c.kindMismatch, codes: c.kindMismatchCodes };
+      // 区分の持ち主が C: NE と区分が違う SKU も C の区分で写す (止めない・知らせる)。持ち主が load の今は出さない
+      // 区分の持ち主が C のときだけ (止めない・知らせる): C = 単品・NE = セット = 単品として写す / C = セット・NE = 単品 = 前の行のまま (NE をセットに直すまで)。
+      //   NE がセットか = 今の NE の取得のセットの表 (neSets。今の m_products は前の朝の NE)
+      if ((next.cols || []).includes('kind')) {
+        let single = null, frozen = c.kindFrozenAll;
+        if (neSets) {   // 今の m_products (前の朝・C の区分を写した後) でなく、今の NE の取得と比べる (NE の区分 = セットの表 > 商品の表 > どちらにも無い = 例外)
+          single = []; frozen = [];
+          const neKindOf = (code) => (neSets.has(code) ? 'set' : neSingles && neSingles.has(code) ? 'single' : 'exception');
+          for (const code of new Set([...current.keys()].map((x) => String(x).toLowerCase()))) {
+            const e = entries.get(normSku(code)); if (!e || !Object.hasOwn(KIND_TO_M, e.kind)) continue;
+            const nk = neKindOf(code);
+            if (nk === e.kind) continue;
+            if (e.kind === 'single' && nk === 'set') single.push(code); else frozen.push(code);
+          }
+          single.sort(); frozen.sort();
+        }
+        detail.kind_c_single_ne_set = single ? { count: single.length, codes: single.slice(0, NOT_IN_CDB_SAMPLES) } : { count: c.kindCSingleNeSet, codes: c.kindCSingleNeSetCodes };
+        detail.kind_c_set_ne_single_frozen = { count: frozen.length, codes: frozen.slice(0, NOT_IN_CDB_SAMPLES) };
+      }
       if (c.collided.length) { problems.push('target_norm_collision'); detail.target_norm_collision = { count: c.collided.length, samples: c.collided.slice(0, 5) }; }
     }
   }
@@ -385,7 +405,15 @@ export async function runPublish({ db = null, connect = null, sqlite, dataDir, o
     const epoch = generationEpoch(source);
     const gen = buildGeneration({ source, ownership: epoch.map, now });
     const current = new Map(sqlite.prepare('SELECT 商品コード, 商品区分 FROM m_products').all().map((r) => [r.商品コード, r.商品区分]));
-    const { problems, detail } = verifyGeneration({ prev, next: gen, source, current });
+    // NE のセットの表 (今の取得) にあるコード = NE がセット (区分の持ち主が C のときの fail-closed の判断に使う)
+    let neSets = null, neSingles = null;
+    if (gen.cols.includes('kind')) {
+      try {
+        neSets = new Set(sqlite.prepare('SELECT DISTINCT LOWER(セット商品コード) AS c FROM raw_ne_set_products').all().map((r) => r.c));
+        neSingles = new Set(sqlite.prepare('SELECT DISTINCT LOWER(商品コード) AS c FROM raw_ne_products').all().map((r) => r.c));
+      } catch { neSets = null; neSingles = null; }
+    }
+    const { problems, detail } = verifyGeneration({ prev, next: gen, source, current, neSets, neSingles });
     let shadow;
     try { shadow = shadowCounts(sqlite, source); } catch (e) { shadow = { error: String(e && e.message).slice(0, 160) }; }
     const base = {
@@ -394,6 +422,7 @@ export async function runPublish({ db = null, connect = null, sqlite, dataDir, o
       prev_generation_no: prev ? prev.generation_no : null, shadow,
       not_in_cdb: detail.not_in_cdb ?? { count: 0, codes: [] },
       kind_mismatch: detail.kind_mismatch ?? { count: 0, codes: [] },
+      ...(detail.kind_c_single_ne_set ? { kind_c_single_ne_set: detail.kind_c_single_ne_set, kind_c_set_ne_single_frozen: detail.kind_c_set_ne_single_frozen } : {}),
       // 持ち主の epoch (Codex R1 H1): 手元の設定 / この世代 (用意した) / 今使っている (最後に通った作り直しが使った世代の持ち主)
       epochs: { configured: ownershipHash(configured), generation: { kind: epoch.kind, hash: gen.ownership_hash },
         active: source.ownershipState?.active?.hash ?? null, prepared: source.ownershipState?.prepared?.hash ?? null, state: source.ownershipState?.state ?? null,
@@ -423,9 +452,11 @@ export async function runPublish({ db = null, connect = null, sqlite, dataDir, o
     const sh = shadow && !shadow.error ? `・全部 C にしたら違う列の数 ${Object.values(shadow.by_col).reduce((a, b) => a + b, 0)}・C にしか無い ${shadow.not_in_ne}` : '';
     const nic = base.not_in_cdb, kmc = base.kind_mismatch;
     return { state: 'verified', generation_no: st.generation_no, problems: [], evidence,
-      line: `${nic.count || kmc.count ? '⚠️' : '✅'} Company DB の写し: 世代 ${st.generation_no} (値 ${gen.row_count} 行・SKU ${gen.sku_count}・${colsText}${sh})`
+      line: `${nic.count || kmc.count || base.kind_c_single_ne_set?.count || base.kind_c_set_ne_single_frozen?.count ? '⚠️' : '✅'} Company DB の写し: 世代 ${st.generation_no} (値 ${gen.row_count} 行・SKU ${gen.sku_count}・${colsText}${sh})`
         + (nic.count ? ` / Company DB に無い SKU ${nic.count} 件は NE の値のまま (${nic.codes.join(', ')})` : '')
-        + (kmc.count ? ` / NE と Company DB で種類が違う SKU ${kmc.count} 件は NE の値のまま (${kmc.codes.join(', ')})` : '') };
+        + (kmc.count ? ` / NE と Company DB で種類が違う SKU ${kmc.count} 件は NE の値のまま (${kmc.codes.join(', ')})` : '')
+        + (base.kind_c_single_ne_set?.count ? ` / 社内は単品・NE はセットの SKU ${base.kind_c_single_ne_set.count} 件は単品として写す (構成は写さない・${base.kind_c_single_ne_set.codes.join(', ')})` : '')
+        + (base.kind_c_set_ne_single_frozen?.count ? ` / 社内と NE で区分が違う SKU ${base.kind_c_set_ne_single_frozen.count} 件は前の行のまま (社内がセット・NE が単品 / 例外を含む。前の行が無ければ載せない・${base.kind_c_set_ne_single_frozen.codes.join(', ')})` : '') };
   } catch (e) {
     try { save({ state: 'failed', error: String(e && e.message).slice(0, 300) }); } catch { /* 書けなくても元の失敗を投げる */ }
     throw e;
