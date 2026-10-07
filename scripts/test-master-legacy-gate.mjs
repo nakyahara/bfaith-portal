@@ -399,7 +399,8 @@ await t('広げる道 PR-2: 門の記録の 2 版 (PR-1 の 0058 の ops.record_
   const OGv = await import('../lib/master-owner-gate.mjs');
   const { COMPANY_CAPABLE } = await import('../config/master-capability.mjs');
   const prepMap = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, k === 'skus.sku_kind' || COMPANY_CAPABLE.includes(k) ? 'company' : 'load']));
-  const actMap = { ...(await import('../config/master-ownership.mjs')).MASTER_OWNERSHIP };   // 今の本番の active = configured の 13 キー (COMPANY_CAPABLE は #1641 で 14 キー = 使わない)
+  // 今の本番の active = 10/5 の 13 キー = configured から区分を外したもの (10/7 から configured は区分も company = 広げる道の手順の 1。COMPANY_CAPABLE は #1641 で 14 キー = 使わない)
+  const actMap = { ...(await import('../config/master-ownership.mjs')).MASTER_OWNERSHIP, 'skus.sku_kind': 'load' };
   assert.notEqual(ownershipHash(actMap), ownershipHash(prepMap), 'active (13) と prepared (+ sku_kind) は違う');
   const calls = [];
   let staleOnce = true;
@@ -1473,11 +1474,11 @@ const setOwnerPhase = (phase, company) => G.__setLegacyPhaseReader(async () => (
   : { readable: true, phase, owner: company === 'unreadable' ? { readable: false, error: '試験: 持ち主を読めない' } : { readable: true, company } }));
 const closedBy13 = (e) => (e.owner_match === 'all' ? e.owner_cols.every((k) => CUT13.includes(k)) : e.owner_cols.some((k) => CUT13.includes(k)));
 
-await t('E0: configured (config/master-ownership.mjs) = 13 キーだけ C・④a の写しが扱える組 (一緒に切り替える組・写せない列が無い)', async () => {
-  assert.deepEqual(companyOwned(MASTER_OWNERSHIP).sort(), [...CUT13].sort());
+await t('E0: configured (config/master-ownership.mjs) = 13 キー + skus.sku_kind (10/7・広げる道の手順の 1) だけ C・④a の写しが扱える組 (一緒に切り替える組・写せない列が無い)', async () => {
+  assert.deepEqual(companyOwned(MASTER_OWNERSHIP).sort(), [...CUT13, 'skus.sku_kind'].sort());
   const { checkPublishOwnership } = await import('../apps/warehouse/master-publish.js');
   assert.deepEqual(checkPublishOwnership(MASTER_OWNERSHIP), []);
-  for (const k of ['products.parent', 'skus.sku_kind', 'sku_components', 'listing_components.amazon', 'suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days', 'suppliers.contacts']) {
+  for (const k of ['products.parent', 'sku_components', 'listing_components.amazon', 'suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days', 'suppliers.contacts']) {
     assert.equal(MASTER_OWNERSHIP[k], 'load', k);
   }
 });
