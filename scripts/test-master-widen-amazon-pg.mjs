@@ -1,0 +1,381 @@
+/**
+ * test-master-widen-amazon-pg.mjs — 0059 (広げる道で listing_components.amazon を足す・Amazon SKU の対応の PR-B) を実 PostgreSQL の独立した接続と本物のロールで確かめる
+ *
+ * 固定する契約:
+ *   [K]  skus.sku_kind だけを足す試み (今までどおり): 区分の判断の記録 (held)・最終形を見る / Amazon の対応の数は見ない (active 0・消えた対応があっても止まらない)
+ *   [A]  listing_components.amazon だけを足す試み (sku_kind はもう company):
+ *        区分の食い違い (held) があっても止まらない・区分の数を出さない / 消えた対応 1 件 = 断る / active 0 件 = 断る / 写しの証拠のハッシュ違い・数の違い = 断る /
+ *        手の入口 = gas:logizard-sheet-and-sku-map / CLI の check がハッシュを照らす / 揃えば widen が通る (読むだけの判定と同じ数)
+ *   [KA] 両方を足す試み: 区分と Amazon の両方を見る (どちらか 1 つでも断る)・揃えば通る
+ *   [M]  移行の apply (amazon-map-migrate.mjs) の段階の条件: frozen は今までどおり / new_open は Amazon を足す試みが開いて手の入口を止めた後だけ /
+ *        sku_kind だけの試み・試みなし・停止の前・widen の後 = 断る / 移行は epoch の共有の鍵を取る (試みの cancel / widen と並ぶ)
+ * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-widen-amazon-pg.mjs
+ *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロールをクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。TEST_PG_URL が無ければ飛ばす
+ */
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.mjs';
+import { createMasterEditRoles } from './company-db/create-master-edit-roles.mjs';
+import { createRoles as createWatchRoles } from './company-db/create-watch-roles.mjs';
+import { runInitialLoad } from '../apps/company-db/load/engine.mjs';
+import * as OS from '../apps/company-db/load/ownership-state.mjs';
+import * as W from '../apps/company-db/load/widen-state.mjs';
+import * as M from '../lib/amazon-map-migrate.mjs';
+import { OWNED_COLUMNS } from '../config/master-ownership.mjs';
+import { ownershipHash, recordLegacyGateAckV2 } from '../lib/master-cutover.mjs';
+import { cli as epochCli } from './company-db/master-ownership-epoch.mjs';
+import { forceNewOpen, fakeLoad, hex } from './fixtures/master-widen.mjs';
+
+const url = process.env.TEST_PG_URL || '';
+if (!url) { console.log('⏭️ TEST_PG_URL が無い (0059 の実 PostgreSQL の試験は飛ばす)'); process.exit(0); }
+const u0 = new URL(url);
+if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(u0.hostname)) { console.error('localhost 以外の PostgreSQL には流さない'); process.exit(2); }
+
+let passed = 0;
+async function ta(name, fn) {
+  const t = Date.now();
+  try { await fn(); passed++; console.log(`  ok  ${name} (${Date.now() - t} ms)`); } catch (e) { console.error(`  NG  ${name} (${Date.now() - t} ms)\n      ${e.stack || e.message}`); process.exitCode = 1; }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const launch = (p) => { const s = { done: false }; s.promise = p.then((r) => { s.done = true; return { ok: r }; }, (e) => { s.done = true; return { err: e }; }); return s; };
+const errOf = async (c, sql, p) => { try { await c.query(sql, p); } catch (e) { return e; } return null; };
+
+const AMZ = 'main@A1VC38T7YXB528';
+const KEY_A = 'listing_components.amazon', KEY_K = 'skus.sku_kind';
+const ALL_LOAD = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'load']));
+const BASE0 = { ...ALL_LOAD, 'skus.name': 'company', 'products.name': 'company' };   // sku_kind も Amazon も load
+const BASE_K = { ...BASE0, [KEY_K]: 'company' };                                     // 10/7 の本番の形 (sku_kind は widen 済み)
+const MANIFEST = { schema: 'test', entries: [{ id: 'warehouse.register.post', kind: 'code' }, { id: 'ne:item-screen', kind: 'manual', owner_cols: ['skus.name'] },
+  { id: 'ne:set-kind', kind: 'manual', owner_cols: [KEY_K] }, { id: 'gas:logizard-sheet-and-sku-map', kind: 'manual', owner_cols: [KEY_A, 'skus.name', 'external_ids.jan'] }] };
+const CAPABLE = [KEY_A, KEY_K, 'skus.name', 'products.name'];
+const ROLES = ['master_edit', 'master_gate_render', 'master_gate_minipc', 'master_ops', 'master_observer', 'new_entry_gate'];
+const PW = Object.fromEntries(ROLES.map((r) => [r, `t_${crypto.randomBytes(12).toString('hex')}`]));
+const WPW = { watcher: `w_${crypto.randomBytes(12).toString('hex')}`, watch_writer: `ww_${crypto.randomBytes(12).toString('hex')}` };
+
+const single = (code) => ({ code, name: code, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 3, cost: { jpy: 100, source: 'ne', status: 'COMPLETE' } });
+const setOf = (code) => ({ code, name: code, kind: 'set', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: null, cost: { jpy: 200, source: 'set_calc', status: 'COMPLETE' } });
+const amazonListing = (listingCode, comps, evidenceSource) => ({ mall: 'amazon', shopCode: AMZ, marketplaceId: 'A1VC38T7YXB528', listingCode, title: listingCode, status: 'active', components: comps,
+  asinCandidates: [], fnskuCandidates: [], evidenceSource });
+const fbm = (code) => [{ code, qty: 1, resolution: 'exact', evidence: { source: 'fbm_ne_code' } }];
+const PLAN = {
+  skus: [...['a001', 'a002', 'a003', 'a004', 'a005', 'a006'].map(single), setOf('aset1')],
+  variationGroups: [], setComponents: [{ parentCode: 'aset1', childCode: 'a001', qty: 3, source: 'ne' }],
+  listings: [amazonListing('pr_a001', [{ code: 'a001', qty: 1, sortOrder: 0, resolution: 'imported', evidence: { source: 'm_sku_master' } }], 'mirror_sku_master'),
+    amazonListing('a003', fbm('a003'), 'amazon_fees_fbm'), amazonListing('a004', fbm('a004'), 'amazon_fees_fbm')],
+  observations: [], physicals: [], compliance: [], workers: [], suppliers: [{ code: '0001', name: 'AMC' }], supplierSkus: [],
+};
+
+// 古い表 (miniPC の warehouse.db の SKU マスタ・db.js と同じ形)
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'amzB-widen-'));
+const T1 = '2026-05-01T01:02:03.456Z', T2 = '2026-06-01T00:00:00.000Z';
+const MASTERS = [['pr_a001', 'SKU マスタの 1', T1, T2], ['pr_pack2', 'SKU マスタの 2 個組', T1, T1], ['a003', '単品 3 を FBA でも', T1, T2]];
+const COMPS = [['pr_a001', 'a001', 1, 0, T1, T1], ['pr_pack2', 'a001', 2, 0, T1, T1], ['pr_pack2', 'a002', 1, 1, T1, T2], ['a003', 'a003', 2, 0, T1, T1]];
+function makeLegacy(dir, masters = MASTERS, comps = COMPS) {
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'warehouse.db');
+  fs.rmSync(file, { force: true });
+  const s = new Database(file);
+  s.exec(`CREATE TABLE m_sku_master (seller_sku TEXT NOT NULL PRIMARY KEY, 商品名 TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, created_by TEXT, updated_by TEXT);
+    CREATE TABLE m_sku_components (seller_sku TEXT NOT NULL, ne_code TEXT NOT NULL, 数量 INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (seller_sku, ne_code));`);
+  for (const m of masters) s.prepare('insert into m_sku_master values (?, ?, ?, ?, ?, ?)').run(m[0], m[1], m[2], m[3], 'legacy@test', null);
+  for (const c of comps) s.prepare('insert into m_sku_components values (?, ?, ?, ?, ?, ?)').run(...c);
+  s.close();
+  return file;
+}
+
+const dbNames = [];
+const admin = await openPgClient(url);
+const clients = [admin];
+/** 1 つの Company DB (0059 まで・ロール・本物の大きさでない材料のロード・段階 new_open = base) */
+async function setupDb(base) {
+  const name = `cdb_amzb_${crypto.randomBytes(4).toString('hex')}`;
+  await admin.query(`create database ${name}`);
+  dbNames.push(name);
+  const u = new URL(url); u.pathname = `/${name}`;
+  const roleUrl = (role, pw) => { const x = new URL(u.toString()); x.username = role; x.password = pw; return x.toString(); };
+  const open = async (role) => { const c = await openPgClient(role ? roleUrl(role, PW[role] ?? WPW[role]) : u.toString()); c.on('error', (e) => console.error(`[pg ${role || 'owner'}] ${e.message}`)); clients.push(c); return c; };
+  const O = await open(null), O2 = await open(null);
+  const dbO = pgAdapter(O);
+  await applyMigrations(dbO, { log: () => {} });
+  await createMasterEditRoles(O, { pw: PW });
+  await createWatchRoles(O, { watcherPw: WPW.watcher, writerPw: WPW.watch_writer });
+  const [WA, GR, GM] = [await open('watcher'), await open('master_gate_render'), await open('master_gate_minipc')];
+  const r0 = await runInitialLoad(dbO, PLAN, { log: () => {}, runId: `amzb_load_${name}`, host: 'test' });
+  assert.equal(r0.ok, true, r0.error);
+  await forceNewOpen(dbO, base);
+  const q = async (sql, p) => (await O.query(sql, p)).rows;
+  const dbGate = { render: pgAdapter(GR), minipc: pgAdapter(GM) };
+  const acks = async (prepared = null, active = base) => {
+    for (const [host, inst] of [['render', 'r-a'], ['minipc', 'm-a']]) {
+      await recordLegacyGateAckV2(dbGate[host], { host, instanceId: inst, buildId: 'b1', manifest: MANIFEST, ownership: active, phaseSeen: 'new_open',
+        activeHashSeen: (await q('select active_hash from ops.master_ownership_state'))[0].active_hash, preparedHashSeen: prepared, capable: CAPABLE });
+    }
+  };
+  await acks();   // manifest を DB に (prepare は「どれかのプロセスが見た一覧」だけ受ける)
+  return { name, O, O2, dbO, dbO2: pgAdapter(O2), WA, dbWA: pgAdapter(WA), q, acks };
+}
+
+/** 試みを作って、止める入口・ack・試みの中の 2 つのロードまで揃える。skuKind = prepared のロードの判断の記録 (undefined = 区分の食い違い 0) */
+async function readyAttempt(E, { base, widen, stops, skuKind = undefined, beforeLoads = null }) {
+  const a = await W.prepareWiden(E.dbO, { companyId: 1, map: widen, loaderFingerprint: hex('f'), manifest: MANIFEST, actor: 't' });
+  for (const entryId of stops) await W.recordWidenManualStop(E.dbO, { attemptId: a.widen_prepare_id, entryId, stoppedBy: '中原' });
+  if (beforeLoads) await beforeLoads(a);
+  const last = (await E.q('select max(stopped_at) as t from ops.master_widen_manual_stops where widen_prepare_id = $1', [a.widen_prepare_id]))[0].t;
+  const stopAt = new Date(last ?? a.prepared_at);
+  await E.acks(ownershipHash(widen));
+  const at = new Date(stopAt.getTime() + 1000).toISOString();
+  const recovery = await fakeLoad(E.dbO, { epoch: 'active', hash: ownershipHash(base), completeAt: at });
+  const prepared = await fakeLoad(E.dbO, { epoch: 'prepared', hash: ownershipHash(widen), completeAt: at, skuKind });
+  return { ...a, id: a.widen_prepare_id, recovery, prepared, ev: { load_commit_seq: prepared.commitSeq, build_id: 'b1', generation_id: 'g1', generation_no: 1 } };
+}
+const check = (E, id) => W.widenCheck(E.dbWA, { attemptId: id, companyId: 1 });
+const has = (r, re) => r.problems.some((x) => re.test(x));
+/** 取引の中で mutate してから、読むだけの判定と apply の答えを比べる (apply は拒まれる = 取引ごと巻き戻す) */
+async function variant(E, id, label, mutate, re) {
+  await E.O.query('begin');
+  try {
+    await mutate(E.O);
+    const r = (await E.O.query('select ops.widen_check_readonly($1::uuid, 1) as r', [id])).rows[0].r;
+    assert.equal(r.ok, false, `${label}: 通ってしまった`);
+    assert.ok(has(r, re), `${label}: ${JSON.stringify(r.problems)}`);
+    await E.O.query('savepoint s');
+    const e = await errOf(E.O, "select ops.widen_master_ownership($1::uuid, 1, 't', $2::jsonb)", [id, JSON.stringify({ load_commit_seq: '0', build_id: 'b', generation_id: 'g' })]);
+    assert.ok(e && /widen_rejected/.test(e.message), `${label}: apply ${e?.message}`);
+    assert.deepEqual(JSON.parse(e.detail).problems, r.problems, `${label}: 読むだけの判定と apply の答えが違う`);
+    await E.O.query('rollback to savepoint s');
+  } finally { await E.O.query('rollback'); }
+}
+const migrate = (E, legacyFile, extra = {}) => {
+  const legacy = M.readLegacyAmazonMaps(legacyFile);
+  return M.runAmazonMapMigration(E.dbO, legacy, { mode: 'apply', expectHash: M.legacyDigest(legacy).content_hash, actor: 'naka@test', sheetOnly: [], ...extra });
+};
+const phaseErr = (re) => (e) => e.code === 'AMAZON_MAP_MIGRATE_PHASE' && (!re || re.test(e.message));
+/** 消えた対応を 1 件作る (trigger を止めて消す = 0054 の「普通の道では起きない」形) */
+const loseOne = async (c) => {
+  await c.query('alter table core.amazon_sku_maps disable trigger user');
+  await c.query("delete from core.amazon_sku_maps where seller_sku = 'pr_pack2'");
+  await c.query('alter table core.amazon_sku_maps enable trigger user');
+};
+/** active の対応を全部墓標にする (移行の書き手の印で・deferred の不変条件は commit の前なので巻き戻す取引の中だけ) */
+const tombAll = async (c) => {
+  await c.query("select set_config('core.source_system', 'amazon_map_migration', true), set_config('core.actor_type', 'system', true), set_config('core.actor_id', 't', true)");
+  await c.query("update core.amazon_sku_maps set state = 'deleted', deleted_at = now(), deleted_by = 't', deleted_reason = '試験'");
+};
+
+try {
+  // ═══ DB-A: 10/7 の本番の形 (sku_kind は company・Amazon は load) で Amazon だけを足す ═══
+  const A = await setupDb(BASE_K);
+  const WIDEN_A = { ...BASE_K, [KEY_A]: 'company' };
+  const dirA = path.join(tmp, 'a');
+  const legacyA = makeLegacy(dirA);
+  let AT;   // 本番の試み
+
+  await ta('[M0] 移行の apply: new_open で試みが無い = 断る (AMAZON_MAP_MIGRATE_PHASE)・広げてよいキーは 2 つ・ほかのキーは断る', async () => {
+    assert.deepEqual((await A.q('select ops.master_widen_allowed_keys() as k'))[0].k, [KEY_A, KEY_K]);
+    await assert.rejects(migrate(A, legacyA), phaseErr(/試みが無い/));
+    await assert.rejects(W.prepareWiden(A.dbO, { companyId: 1, map: { ...WIDEN_A, 'products.status': 'company' }, loaderFingerprint: hex('f'), manifest: MANIFEST, actor: 't' }), /widen_key_not_allowed/);
+    assert.equal((await A.q('select count(*)::int as n from core.amazon_sku_maps'))[0].n, 0);
+  });
+
+  await ta('[A1] Amazon だけの試み: 止める手の入口 = gas:logizard-sheet-and-sku-map・停止の前の移行は断る・停止の後は通る (試みの窓)・移行の前の判定 = active 0 件で断る', async () => {
+    let id = null;
+    AT = await readyAttempt(A, { base: BASE_K, widen: WIDEN_A, stops: [], skuKind: { format: 'sku-kind-v1', held: ['a002'], unverifiable: [] },
+      beforeLoads: async (a) => {
+        id = a.widen_prepare_id;
+        assert.deepEqual(a.added_keys, [KEY_A]);
+        assert.deepEqual(a.required_manual_entries, ['gas:logizard-sheet-and-sku-map']);
+        await assert.rejects(migrate(A, legacyA), phaseErr(/手の入口を止めた記録が無い \(gas:logizard-sheet-and-sku-map/));   // 停止の前 = 窓でない
+        await W.recordWidenManualStop(A.dbO, { attemptId: a.widen_prepare_id, entryId: 'gas:logizard-sheet-and-sku-map', stoppedBy: '中原' });
+      } });
+    assert.equal(AT.id, id);
+    // ne:set-kind はこの試みの入口でない = 記録できない
+    await assert.rejects(W.recordWidenManualStop(A.dbO, { attemptId: AT.id, entryId: 'ne:set-kind', stoppedBy: 't' }), /entry_not_required/);
+    const r = await check(A, AT.id);
+    assert.equal(r.ok, false);
+    assert.ok(has(r, /active の対応が 0 件/), JSON.stringify(r.problems));
+    assert.ok(!has(r, /decisions|shape/), `区分の検査で止まらない: ${JSON.stringify(r.problems)}`);
+    assert.deepEqual([r.counts.amazon_map_active, r.counts.amazon_map_lost, r.counts.held, r.counts.single_product_mismatch], [0, 0, undefined, undefined]);
+  });
+
+  await ta('[M1] 移行の apply は試みの窓で通る (H0 と同じ・widen_attempt を返す)・2 回目は断る (EXISTS)', async () => {
+    const r = await migrate(A, legacyA);
+    assert.equal(r.committed, true); assert.equal(r.subset.match, true); assert.equal(r.widen_attempt, AT.id);
+    assert.equal((await A.q("select count(*)::int as n from core.amazon_sku_maps where state = 'active' and origin = 'legacy'"))[0].n, 3);
+    await assert.rejects(migrate(A, legacyA), (e) => e.code === 'AMAZON_MAP_MIGRATE_EXISTS');
+  });
+
+  await ta('[A2] Amazon だけの試み: 区分の食い違い (held 1 件) があっても通る・数は Amazon の 3 つだけ / 消えた対応 1 件 = 断る / active 0 件 = 断る (読むだけと apply が同じ答え)', async () => {
+    const r = await check(A, AT.id);
+    assert.equal(r.ok, true, JSON.stringify(r.problems));
+    assert.deepEqual([r.counts.amazon_map_active, r.counts.amazon_map_active_components, r.counts.amazon_map_lost], [3, 4, 0]);
+    assert.equal(r.counts.held, undefined); assert.equal(r.counts.single_product_mismatch, undefined);
+    await variant(A, AT.id, '消えた対応 1 件', loseOne, /消えた対応が 1 件/);
+    await variant(A, AT.id, 'active 0 件', tombAll, /active の対応が 0 件/);
+  });
+
+  await ta('[A3] CLI の check: 古い表と Company DB のハッシュを照らす (同じ = ok・古い表を変えた = ok: false・DATA_DIR が無い = ok: false)', async () => {
+    const run = async (args) => { const out = []; const code = await epochCli(['check', '--attempt', AT.id, '--company', '1', ...args], { env: { COMPANY_DB_WATCH_URL: 'postgres://watcher@localhost/x' }, connect: async () => ({ db: A.dbWA }), log: (m) => out.push(m) }); return { code, r: JSON.parse(out.join('\n')) }; };
+    let x = await run(['--data-dir', dirA]);
+    assert.equal(x.code, 0, JSON.stringify(x.r.problems)); assert.equal(x.r.amazon_map.match, true);
+    assert.equal(x.r.amazon_map.legacy_hash, M.legacyDigest(M.readLegacyAmazonMaps(legacyA)).content_hash);
+    const dirB = path.join(tmp, 'a-changed');
+    makeLegacy(dirB, MASTERS, COMPS.map((c) => (c[0] === 'a003' ? [c[0], c[1], 3, c[3], c[4], c[5]] : c)));   // 古い表だけ数量が違う
+    x = await run(['--data-dir', dirB]);
+    assert.equal(x.code, 1); assert.ok(has(x.r, /amazon_map_hash: 古い表 .* のハッシュが違う/), JSON.stringify(x.r.problems));
+    x = await run([]);
+    assert.equal(x.code, 1); assert.ok(has(x.r, /amazon_map_hash: 照らせない .*DATA_DIR/), JSON.stringify(x.r.problems));
+  });
+
+  await ta('[A4] widen の写しの証拠: amazon_map が無い・ハッシュの形・古い表 ≠ Company DB・行の数が DB と違う = 断る / CLI の段 (鍵の後に読む) で古い表が違えば DB を呼ばずに断る', async () => {
+    const H = M.legacyDigest(M.readLegacyAmazonMaps(legacyA)).content_hash;
+    const good = { legacy_hash: H, company_hash: H, master_rows: 3, component_rows: 4 };
+    const rej = (amazon_map, re) => assert.rejects(W.widenOwnership(A.dbO, { attemptId: AT.id, companyId: 1, actor: 't', evidence: { ...AT.ev, ...(amazon_map === undefined ? {} : { amazon_map }) } }), re);
+    await rej(undefined, /evidence_invalid: Amazon SKU の対応を足すには/);
+    await rej({ ...good, legacy_hash: 'x' }, /evidence_invalid: Amazon SKU の対応を足すには/);
+    await rej({ ...good, company_hash: hex('e') }, /evidence_invalid: 古い表のハッシュ .* と違う/);
+    await rej({ ...good, master_rows: 2 }, /evidence_invalid: ハッシュを作った行の数/);
+    await rej({ ...good, component_rows: '5' }, /evidence_invalid: ハッシュを作った行の数/);
+    await rej({ ...good, master_rows: 3.5 }, /evidence_invalid: ハッシュを作った行の数/);
+    // CLI の段: 古い表が違う = 鍵の後に Company DB を読んで照らし、DB の関数を呼ばない (試みは prepared のまま)
+    const dirB = path.join(tmp, 'a-changed2');
+    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(makeLegacy(dirB, [...MASTERS, ['zz_new', '後から足した', T1, T1]], [...COMPS, ['zz_new', 'a004', 1, 0, T1, T1]])));
+    await assert.rejects(W.widenOwnership(A.dbO, { attemptId: AT.id, companyId: 1, actor: 't', evidence: AT.ev, beforeCall: step.beforeCall }), (e) => e.code === 'AMAZON_MAP_HASH_MISMATCH');
+    assert.equal(step.result().match, false);
+    assert.equal((await A.q('select state from ops.master_widen_attempts where widen_prepare_id = $1', [AT.id]))[0].state, 'prepared');
+    // 鍵の後に読んだ = 夜間ロード (epoch の共有の鍵) の最中は 5 秒で諦める (読む前に)
+    await A.O2.query('begin'); await A.O2.query('select pg_advisory_xact_lock_shared(ops.master_ownership_lock_key())');
+    let called = false;
+    try {
+      await assert.rejects(W.widenOwnership(A.dbO, { attemptId: AT.id, companyId: 1, actor: 't', evidence: AT.ev, lockTimeout: '500ms', beforeCall: async () => { called = true; return {}; } }), (e) => e.code === '55P03');
+    } finally { await A.O2.query('commit'); }
+    assert.equal(called, false, '鍵を取れないときは Company DB を読まない');
+  });
+
+  await ta('[A5] widen が通る (CLI の段 = 鍵の後にハッシュを照らす)・Amazon が company・sku_kind は company のまま・移行は試みが閉じたら断る', async () => {
+    const before = await check(A, AT.id);
+    assert.equal(before.ok, true, JSON.stringify(before.problems));
+    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyA));
+    const r = await W.widenOwnership(A.dbO, { attemptId: AT.id, companyId: 1, actor: '中原', evidence: AT.ev, beforeCall: step.beforeCall });
+    assert.deepEqual([r.widened, r.added_keys], [true, [KEY_A]]);
+    assert.deepEqual(r.counts, before.counts);   // 読むだけの判定と同じ数
+    assert.equal(step.result().match, true);
+    const st = await OS.readOwnershipState(A.dbO);
+    assert.deepEqual([st.active.map[KEY_A], st.active.map[KEY_K], st.prepared], ['company', 'company', null]);
+    assert.deepEqual(await A.q('select phase, owner_hash from ops.master_cutover_state'), [{ phase: 'new_open', owner_hash: ownershipHash(WIDEN_A) }]);
+    const ev = (await A.q("select detail -> 'evidence' -> 'amazon_map' as m from ops.master_widen_events where widen_prepare_id = $1 and action = 'widen'", [AT.id]))[0].m;
+    assert.deepEqual(ev, { legacy_hash: step.result().legacy_hash, company_hash: step.result().company_hash, master_rows: 3, component_rows: 4 });
+    assert.equal((await A.q('select ops.sku_kind_locked() as l'))[0].l, true);   // 区分の守りはそのまま
+    await assert.rejects(migrate(A, legacyA), phaseErr(/試みが無い/));            // widen の後 = 試みが無い = 断る (EXISTS より前)
+  });
+
+  // ═══ DB-B: sku_kind も Amazon も load (0058 の前提の形) で、sku_kind だけの試み・両方の試み・移行の段階の条件 ═══
+  const B = await setupDb(BASE0);
+  const dirB = path.join(tmp, 'b');
+  const legacyB = makeLegacy(dirB);
+  const WIDEN_K = { ...BASE0, [KEY_K]: 'company' }, WIDEN_KA = { ...BASE0, [KEY_K]: 'company', [KEY_A]: 'company' };
+
+  await ta('[K1] sku_kind だけの試み (今までどおり): held 1 件 = 断る・最終形を数える / Amazon の数は見ない (active 0・消えた対応があっても止まらない) / 移行の apply は断る', async () => {
+    const K = await readyAttempt(B, { base: BASE0, widen: WIDEN_K, stops: ['ne:set-kind'], skuKind: { format: 'sku-kind-v1', held: ['a002'], unverifiable: [] } });
+    assert.deepEqual(K.required_manual_entries, ['ne:set-kind']);
+    const r = await check(B, K.id);
+    assert.equal(r.ok, false);
+    assert.deepEqual(r.problems, ['decisions: sku_kind.held が 1 件 (区分の食い違いが残っている = 0 だけ)']);
+    assert.deepEqual([r.counts.held, r.counts.single_product_mismatch, r.counts.non_set_parent_components, r.counts.amazon_map_active], [1, 0, 0, undefined]);
+    await variant(B, K.id, '最終形 (セットに product_id)', (c) => c.query("update core.skus set product_id = (select p.product_id from core.products p where p.display_code = 'a005') where code = 'aset1'"), /区分と product_id の不整合が 1 件/);
+    // 移行: sku_kind だけの試み = 窓でない
+    await assert.rejects(migrate(B, legacyB), phaseErr(/listing_components\.amazon が無い/));
+    await W.cancelWiden(B.dbO, { attemptId: K.id, actor: 't' });
+    // held 0 の試みは Amazon の対応が 0 件でも通る (Amazon を足さない)
+    const K2 = await readyAttempt(B, { base: BASE0, widen: WIDEN_K, stops: ['ne:set-kind'] });
+    const r2 = await check(B, K2.id);
+    assert.equal(r2.ok, true, JSON.stringify(r2.problems));
+    assert.equal((await B.q('select count(*)::int as n from core.amazon_sku_maps'))[0].n, 0);
+    // 消えた対応が 1 件あっても sku_kind だけの試みは止まらない (Amazon の数を見ない)
+    await B.O.query('begin');
+    try {
+      await B.O.query("select set_config('core.source_system', 'amazon_map_migration', true), set_config('core.actor_type', 'system', true), set_config('core.actor_id', 't', true)");
+      await B.O.query(`insert into core.amazon_sku_maps (listing_id, company_id, seller_sku, name, state, origin, registered_at, changed_at)
+        select listing_id, 1, 'pr_a001', 'x', 'active', 'legacy', now(), now() from core.listings where listing_code = 'pr_a001'`);
+      await B.O.query('set constraints all immediate');   // deferred の不変条件を先に流す (待っている trigger があると alter table できない)
+      await B.O.query('alter table core.amazon_sku_maps disable trigger user');
+      await B.O.query("delete from core.amazon_sku_maps where seller_sku = 'pr_a001'");
+      await B.O.query('alter table core.amazon_sku_maps enable trigger user');
+      assert.equal((await B.O.query('select count(*)::int as n from ops.amazon_map_lost_listings()')).rows[0].n, 1);
+      const r3 = (await B.O.query('select ops.widen_check_readonly($1::uuid, 1) as r', [K2.id])).rows[0].r;
+      assert.equal(r3.ok, true, JSON.stringify(r3.problems)); assert.equal(r3.counts.amazon_map_lost, undefined);
+    } finally { await B.O.query('rollback'); }
+    await W.cancelWiden(B.dbO, { attemptId: K2.id, actor: 't' });
+  });
+
+  let KA;
+  await ta('[KA1] 両方の試み: 止める入口 2 つ・片方だけ止めた移行は断る・区分 (held) と Amazon (active 0) の両方で断る', async () => {
+    KA = await readyAttempt(B, { base: BASE0, widen: WIDEN_KA, stops: ['ne:set-kind'], skuKind: { format: 'sku-kind-v1', held: ['a002'], unverifiable: [] },
+      beforeLoads: async (a) => {
+        assert.deepEqual(a.required_manual_entries, ['gas:logizard-sheet-and-sku-map', 'ne:set-kind']);
+        await assert.rejects(migrate(B, legacyB), phaseErr(/gas:logizard-sheet-and-sku-map/));   // Amazon の入口を止める前
+        await W.recordWidenManualStop(B.dbO, { attemptId: a.widen_prepare_id, entryId: 'gas:logizard-sheet-and-sku-map', stoppedBy: '中原' });
+      } });
+    const r = await check(B, KA.id);
+    assert.equal(r.ok, false);
+    assert.ok(has(r, /held が 1 件/) && has(r, /active の対応が 0 件/), JSON.stringify(r.problems));
+    assert.equal(r.problems.length, 2, JSON.stringify(r.problems));
+  });
+
+  await ta('[M2] 移行は epoch の共有の鍵を取る = 試みの cancel (epoch の排他) を持つ取引の間は待つ・frozen は今までどおり', async () => {
+    await B.O2.query('begin'); await B.O2.query('select pg_advisory_xact_lock(ops.master_ownership_lock_key())');
+    const m = launch(migrate(B, legacyB));
+    await sleep(600);
+    const waited = !m.done;
+    await B.O2.query('rollback');
+    const mr = await m.promise;
+    assert.equal(waited, true, '移行は epoch の排他の鍵を待つ');
+    assert.ok(mr.ok, mr.err?.message);
+    assert.equal(mr.ok.committed, true); assert.equal(mr.ok.widen_attempt, KA.id);
+    // frozen (今までどおり): 別の DB を frozen にして移行が通る (試みは見ない)
+    const F = await setupDb(BASE0);
+    await F.O.query('begin'); await F.O.query("select set_config('ops.cutover_protocol', '1', true)"); await F.O.query("update ops.master_cutover_state set phase = 'frozen', owner_hash = null where id = 1"); await F.O.query('commit');
+    const fr = await migrate(F, makeLegacy(path.join(tmp, 'f')));
+    assert.deepEqual([fr.committed, fr.phase, fr.widen_attempt], [true, 'frozen', null]);
+  });
+
+  await ta('[KA2] 両方の試み: 移行の後も held が残れば断る (Amazon は通る)・消えた対応も断る / held 0 の試みで両方そろえば widen が通る', async () => {
+    let r = await check(B, KA.id);
+    assert.deepEqual(r.problems, ['decisions: sku_kind.held が 1 件 (区分の食い違いが残っている = 0 だけ)']);
+    await W.cancelWiden(B.dbO, { attemptId: KA.id, actor: 't' });
+    const KA2 = await readyAttempt(B, { base: BASE0, widen: WIDEN_KA, stops: ['gas:logizard-sheet-and-sku-map', 'ne:set-kind'] });
+    r = await check(B, KA2.id);
+    assert.equal(r.ok, true, JSON.stringify(r.problems));
+    assert.deepEqual([r.counts.held, r.counts.amazon_map_active, r.counts.single_product_mismatch], [0, 3, 0]);
+    await variant(B, KA2.id, '消えた対応 1 件', loseOne, /消えた対応が 1 件/);
+    const step = M.amazonWidenEvidenceStep(M.readLegacyAmazonMaps(legacyB));
+    const w = await W.widenOwnership(B.dbO, { attemptId: KA2.id, companyId: 1, actor: '中原', evidence: KA2.ev, beforeCall: step.beforeCall });
+    assert.deepEqual(w.added_keys, [KEY_A, KEY_K]);
+    const st = await OS.readOwnershipState(B.dbO);
+    assert.deepEqual([st.active.map[KEY_A], st.active.map[KEY_K]], ['company', 'company']);
+    assert.equal((await B.q('select ops.sku_kind_locked() as l'))[0].l, true);
+  });
+
+  await ta('[R] 権限: 0059 の数の関数・判定の本体・widen は watcher から呼べない (42501)・watcher の読むだけの判定は呼べる', async () => {
+    for (const sql of ['select ops.widen_amazon_map_counts(1)', "select ops._widen_judge(gen_random_uuid(), 1)", "select ops.widen_master_ownership(gen_random_uuid(), 1, 'w', '{}'::jsonb)"]) {
+      const e = await errOf(A.WA, sql);
+      assert.equal(e?.code, '42501', `${sql}: ${e?.code} ${e?.message}`);
+    }
+    const r = (await A.WA.query('select ops.widen_check_readonly(gen_random_uuid(), 1) as r')).rows[0].r;
+    assert.equal(r.ok, false); assert.match(r.problems[0], /attempt_missing/);
+    const pub = await A.q(`select p.proname, has_function_privilege('public', p.oid, 'execute') as pub, p.prosecdef as d, array_to_string(p.proconfig, ',') as c
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'ops' and p.proname in ('widen_amazon_map_counts', '_widen_judge', 'widen_master_ownership', 'master_widen_allowed_keys') order by 1`);
+    for (const f of pub) { assert.equal(f.pub, false, f.proname); assert.equal(f.c, 'search_path=pg_catalog, pg_temp', f.proname); }
+    assert.deepEqual(pub.map((f) => [f.proname, f.d]), [['_widen_judge', false], ['master_widen_allowed_keys', false], ['widen_amazon_map_counts', false], ['widen_master_ownership', true]]);
+  });
+} finally {
+  for (const c of clients.slice(1)) { try { await c.end(); } catch { /* */ } }
+  for (const n of dbNames) { try { await admin.query(`drop database if exists ${n} with (force)`); } catch (e) { console.error(`DB を消せない ${n}: ${e.message}`); } }
+  try { await admin.end(); } catch { /* */ }
+  try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* */ }
+}
+console.log(`\n${passed} 件 ok${process.exitCode ? ' (NG あり)' : ''}`);

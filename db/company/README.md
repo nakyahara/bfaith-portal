@@ -2283,3 +2283,14 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 材料の世代の取得の時刻は `YYYY-MM-DDTHH:mm:ssZ` (`apps/warehouse/material-lineage.js` が NE の印を直す)・夜間ロードの番号 (commit_seq) は JS でも文字のまま (bigint)
 
 **マージの後の手順 (🚨 まだ流さない = migrate は中原さんの指示の後に dry-run → 本適用)** (🚨 widen の CLI (`master-ownership-epoch.mjs prepare --widen` ほか) は #1641 ((Y) = COMPANY_CAPABLE と ④a の写しに skus.sku_kind を足す) のマージの後まで流さない。DB の関数も直接呼ばない。復元は widen の後のダンプだけ = 区分の持ち主が company の DB に load のときのダンプは戻せない `RESTORE_KIND_OWNER_REGRESSION`・復元すると新商品の許可は全部取り消される = 次の照合 ② の後に開く): migrate → `create-master-edit-roles.mjs` (new_entry_gate を作る・パスワードはその画面だけ = miniPC の .env の `COMPANY_DB_NEW_ENTRY_GATE_URL`) → `create-watch-roles.mjs` (照合 ② の始めに閉じる・結果の記録・読むだけの判定) → `master-legacy-readiness.mjs --host minipc` (new_entry_gate のログインを確かめる)。試験 = `node scripts/test-master-widen.mjs` (PGlite・test:company-db) / `scripts/test-master-widen-pg.mjs`・`scripts/test-master-widen-locks-pg.mjs` (本物の PG・test:master-edit の最後・TEST_PG_URL)。新商品の CSV の期限・許可 = `scripts/test-master-reg-csv.mjs` の [W1]・[W2]
+
+### 広げる道で Amazon SKU の対応を足す (0059・Amazon SKU の対応の PR-B・2026-10-07。計画 = amazon_min_plan.md §2 PR-B。🚨 番号は仮 = マージの直前に空き番号へ)
+
+- 広げてよいキー = `listing_components.amazon` と `skus.sku_kind` (`ops.master_widen_allowed_keys()`)。判定の本体 `ops._widen_judge` を置き換え:
+  - **区分の判断の記録 (held・unverifiable・形の版) と最終形は `skus.sku_kind` を足す試みのときだけ** 見る (sku_kind がもう company の後に Amazon だけを足す日は、区分の食い違いがあっても止まらない)
+  - **`listing_components.amazon` を足す試みのときだけ**: 消えた対応 (`ops.amazon_map_lost_listings()`) 0 件・active の対応 1 件以上 (= 移行が済んだ)。数は `ops.widen_amazon_map_counts(1)` (DB の持ち主だけ)
+  - check (`ops.widen_check_readonly`) と widen は今までどおり同じ本体 = 同じ判定を両方で流し直す。ほかの判定 (ack・手の入口の停止・試みの中の 2 つのロード・材料) は全部の試みで今までどおり
+- **widen の写しの証拠** (Amazon を足すときだけ): `amazon_map` = 古い表 (miniPC の `m_sku_master` / `m_sku_components`) のハッシュ = Company DB の読み直しのハッシュ・行の数が DB の数え直しと同じ。CLI (`master-ownership-epoch.mjs widen`) が 3 つの排他の鍵を取った後に同じ取引で Company DB を読んで照らす (違えば DB を呼ばない)。`check` も照らす (`--data-dir` / DATA_DIR の warehouse.db・読むだけ)
+- **移行の apply** (`amazon-map-migrate.mjs --apply`) = 段階 frozen (今までどおり) か、段階 new_open で **Amazon を足す試みが開いていて、手の入口 `gas:logizard-sheet-and-sku-map` を止めた記録がある間だけ**。epoch の共有の鍵を先に取る (試みの cancel / widen は移行の commit を待つ)。H0 の確かめは今までどおり
+- 止める手の入口 = `gas:logizard-sheet-and-sku-map` (stop-manual)。SKU タブ・SKU の CSV・API・`cli:import-sku-master.js` は門の記録 (ack) で止まる入口 = stop-manual には書かない
+- 当て方 (🚨 まだ流さない): `migrate.mjs --dry-run` (0059 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい (新しい関数はだれにも渡さない・流しても同じ)。試験 = `scripts/test-master-widen-amazon-pg.mjs` (本物の PG・test:master-edit の最後)

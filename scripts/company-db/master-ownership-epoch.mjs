@@ -24,13 +24,17 @@
  *   5b. check --attempt <id> --company 1   : widen と同じ判定を読むだけで (COMPANY_DB_WATCH_URL でも可)
  *   6. widen --attempt <id> --company 1    : 写しの証拠 (activate と同じ) を集めて DB の関数 ops.widen_master_ownership (lock_timeout 5 秒)
  *   途中で止める = cancel (開いている試みがあれば試みを cancelled に・prepared を消す。次の prepare は新しい試み・新しい base)
+ * 🆕 0059 (Amazon SKU の対応の PR-B): 足すキーに listing_components.amazon がある試みは、check と widen が古い表 (DATA_DIR の warehouse.db の
+ *   m_sku_master / m_sku_components) と Company DB (active の対応) の写しの決まった並べ方のハッシュを照らす (違えば check は ok: false・widen はしない)。
+ *   widen は 3 つの排他の鍵を取った後に同じ取引で Company DB を読み、ハッシュと行の数を写しの証拠 (amazon_map) に入れる = DB が鍵の後に数え直して照らす。
+ *   止める手の入口 = gas:logizard-sheet-and-sku-map (SKU タブ・SKU の CSV・API・cli:import-sku-master.js は門の記録 (ack) で止まる入口)
  *
  * 使い方 (miniPC):
  *   node scripts/company-db/master-ownership-epoch.mjs status
  *   node scripts/company-db/master-ownership-epoch.mjs prepare  [--actor 名前]
  *   node scripts/company-db/master-ownership-epoch.mjs prepare --widen --company 1 [--actor 名前]
  *   node scripts/company-db/master-ownership-epoch.mjs stop-manual --attempt <id> --entry <入口の id> --by <止めた人> [--note メモ]
- *   node scripts/company-db/master-ownership-epoch.mjs check --attempt <id> --company 1
+ *   node scripts/company-db/master-ownership-epoch.mjs check --attempt <id> --company 1 [--data-dir D]   (Amazon を足す試みは DATA_DIR / --data-dir の warehouse.db が要る)
  *   node scripts/company-db/master-ownership-epoch.mjs widen --attempt <id> --company 1 [--actor 名前] [--data-dir D]
  *   node scripts/company-db/master-ownership-epoch.mjs activate [--actor 名前] [--data-dir D]
  *   node scripts/company-db/master-ownership-epoch.mjs cancel   [--actor 名前] [--attempt <id>]
@@ -40,6 +44,7 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MASTER_OWNERSHIP, validateOwnership } from '../../config/master-ownership.mjs';
 import { configuredBeyondCapable, capabilityFingerprint, COMPANY_CAPABLE } from '../../config/master-capability.mjs';
@@ -94,8 +99,19 @@ export function activationEvidence({ sqlite, dataDir, prepared, now = new Date()
 const COMMANDS = ['status', 'prepare', 'activate', 'cancel', 'stop-manual', 'check', 'widen'];
 const READ_ONLY = new Set(['status', 'check']);
 
+/** Amazon SKU の対応の持ち主表のキー (lib/amazon-map-migrate.mjs の AMAZON_MAP_WIDEN_KEY と同じ) */
+const AMAZON_KEY = 'listing_components.amazon';
+
+/** 古い表 (SKU マスタ) を読む。sqlite (開いた warehouse.db) があればそれから・無ければ dataDir の warehouse.db を読むだけで開く */
+async function readLegacyDefault({ dataDir, sqlite }) {
+  const M = await import('../../lib/amazon-map-migrate.mjs');
+  if (sqlite) return M.readLegacyAmazonMapsFrom(sqlite);
+  if (!dataDir) throw new Error('DATA_DIR (--data-dir) が無い = 古い表 (warehouse.db) を読めない');
+  return M.readLegacyAmazonMaps(path.join(dataDir, 'warehouse.db'));
+}
+
 export async function cli(argv, { env = process.env, connect = null, openSqlite = null, log = console.log, ownership = MASTER_OWNERSHIP, now = new Date(),
-  capable = COMPANY_CAPABLE, loaderFingerprint = undefined, manifest = undefined } = {}) {
+  capable = COMPANY_CAPABLE, loaderFingerprint = undefined, manifest = undefined, readLegacy = readLegacyDefault } = {}) {
   const cmd = argv[0];
   const argAfter = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
   const actor = argAfter('--actor') || `${os.userInfo().username}@${os.hostname()}`;
@@ -112,6 +128,17 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
   try {
     if (cmd === 'check') {
       const r = await widenCheck(c.db, { attemptId, companyId });
+      // 🆕 0059: Amazon の対応を足す試み = 古い表と Company DB のハッシュも照らす (読むだけ・鍵は取らない。widen は鍵の後にもう一度)
+      if (r && Array.isArray(r.added_keys) && r.added_keys.includes(AMAZON_KEY)) {
+        try {
+          const M = await import('../../lib/amazon-map-migrate.mjs');
+          const legacy = await readLegacy({ dataDir: (argAfter('--data-dir') || env.DATA_DIR || '').trim(), sqlite: null });
+          r.amazon_map = await M.amazonMapHashEvidence(c.db, legacy);
+          if (!r.amazon_map.match) { r.ok = false; r.problems = [...(r.problems || []), `amazon_map_hash: 古い表 ${r.amazon_map.legacy_hash || r.amazon_map.error} と Company DB ${r.amazon_map.company_hash || r.amazon_map.error} のハッシュが違う`]; }
+        } catch (e) {
+          r.ok = false; r.problems = [...(r.problems || []), `amazon_map_hash: 照らせない (${String(e && e.message).slice(0, 200)})`];
+        }
+      }
       log(JSON.stringify(r, null, 1));
       return r && r.ok === true ? 0 : 1;
     }
@@ -174,9 +201,14 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
     const e = activationEvidence({ sqlite, dataDir, prepared: st.prepared, now, taxRates: TAX_RATES });
     if (!e.ok) { log(`❌ ${cmd === 'widen' ? '広げない' : 'active にしない'}: 確かめがそろっていない (${e.problems.join('・')})`); return 1; }
     if (cmd === 'widen') {
+      // 🆕 0059: Amazon の対応を足す試み = 古い表を読んでおき、鍵の後に同じ取引で Company DB を読んでハッシュを照らす (違えば広げない)
+      const open = await readOpenWidenAttempt(c.db);
+      const amazon = !!open && open.widen_prepare_id === attemptId && (open.added_keys || []).includes(AMAZON_KEY);
+      const step = amazon ? (await import('../../lib/amazon-map-migrate.mjs')).amazonWidenEvidenceStep(await readLegacy({ dataDir, sqlite })) : null;
       // 判定は DB (ops.widen_master_ownership が鍵の後に本体を呼ぶ)。夜間ロードの最中は 5 秒で諦める (lock_timeout)
-      const r = await widenOwnership(c.db, { attemptId, companyId, actor, evidence: { ...e.evidence, prepared_at: st.prepared.prepared_at } });
-      log(`✅ 広げた: ${r.added_keys.join(', ')} = company (active = ${r.active_hash}・段階は new_open のまま・ロード ${r.loads?.recovery?.commit_seq} → ${r.loads?.prepared?.commit_seq})。今夜から夜間ロードはこの持ち主`);
+      const r = await widenOwnership(c.db, { attemptId, companyId, actor, evidence: { ...e.evidence, prepared_at: st.prepared.prepared_at }, beforeCall: step ? step.beforeCall : null });
+      const amz = step ? step.result() : null;
+      log(`✅ 広げた: ${r.added_keys.join(', ')} = company (active = ${r.active_hash}・段階は new_open のまま・ロード ${r.loads?.recovery?.commit_seq} → ${r.loads?.prepared?.commit_seq})${amz ? `・Amazon の対応のハッシュ ${amz.company_hash} (対応 ${amz.master_rows}・構成 ${amz.component_rows}) = 古い表と同じ` : ''}。今夜から夜間ロードはこの持ち主`);
       return 0;
     }
     // 証拠を集めたときの prepare (ハッシュと時刻) を渡す = 行の鍵の後に比べる (その間に prepare し直されたら断る)

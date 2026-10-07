@@ -7,7 +7,8 @@
  *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --shadow --db-url <試し用の DB の URL> --legacy <warehouse.db> --fba-db <fba.db> [--json out.json]
  *   # 古い表のハッシュ (H0) だけ出す (DB に触らない)
  *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --legacy-hash --legacy <warehouse.db>
- *   # 切替の日 ③ (段階 frozen の間だけ・手順書の順番でだけ)。H0 と照らして同じときだけ commit
+ *   # 切替の日 ③ (段階 frozen の間 か、🆕 段階 new_open で listing_components.amazon を足す広げる道の試みが開いていて手の入口
+ *   #   gas:logizard-sheet-and-sku-map を止めた記録がある間だけ (0059・PR-B)・手順書の順番でだけ)。H0 と照らして同じときだけ commit
  *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes
  * 影運転の先が本番でないことの確かめ (Codex #1586 R1 M2): 本番の URL (env COMPANY_DB_URL) が要る (無ければ断る)。
  *   ① URL のホスト・ポート・DB 名が本番と同じ = 断る (ユーザー・パスワードは見ない = 別のユーザーでも同じ DB は断る)
