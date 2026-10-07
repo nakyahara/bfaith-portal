@@ -10789,6 +10789,27 @@ for (const [name, file, data] of renders) {
       // 🚨 使われなかった記録は消す。残すと、その便がまた選択肢から消えたときに復活する
       check('🚨 画面の試算: 使われなかった「残した便」の記録は消える (あとで復活しない)',
         st5.raw === null, String(st5.raw));
+      // 🚨 合わせ先が carry と**同じ名前**でも消す。名前で比べると掃除し忘れて、あとで
+      //    その便が選択肢から消えたときに復活する (Codex R22 P2)
+      {
+        const st8 = fakeStore();
+        const same = [...options, { method: 'ゆうパック60サイズ', cost: 810, count: 50 }];
+        const pSame = vari.profitShipPickByGroup(same, hints, labels);
+        const nSame = vari.profitShipNearByGroup(same, hints, labels);
+        // ゆうパック60サイズ を carry として覚えている状態を作る
+        const c0 = mount({ options: same, picks: pSame, near: nSame, labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: st8 });
+        c0.pick('ゆうパック60サイズ');
+        c0.setGroup('5');   // 別のグループへ (carry ではなく manual のまま忘れられる)
+        st8.setItem('ph-profit-ship:<%= draft.id %>:', JSON.stringify({ method: 'ゆうパック60サイズ', group: '4', kind: 'carry' }));
+        const c1 = mount({ options: same, picks: pSame, near: nSame, labels, hints, neCurrent: 'ネコポス', rkValue: '4', store: st8 });
+        check('画面の試算: 合わせ先が同じ名前なら、その便で試算する (前提の確認)',
+          c1.sel.value === 'ゆうパック60サイズ', c1.sel.value);
+        check('🚨 画面の試算: 合わせ先と同じ名前の carry も消す (あとで復活しない)',
+          st8.raw === null, String(st8.raw));
+        const c2 = mount({ ...base0, rkValue: '4', store: st8 });   // 候補が消えた状態
+        check('🚨 画面の試算: そのあと候補が消えても NE の送料で試算する (837円)',
+          c2.profit() === '837円', c2.profit() + ' / ' + c2.sel.value);
+      }
       const k6 = mount({ ...base0, rkValue: '4', store: st5 });
       check('🚨 画面の試算: 候補が消えても古い便は復活せず NE の送料で試算する (837円)',
         k6.profit() === '837円' && k6.sel.value === 'ネコポス', k6.profit() + ' / ' + k6.sel.value);

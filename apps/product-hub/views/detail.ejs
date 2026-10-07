@@ -5430,9 +5430,12 @@ th.attr-unknown { color: #dc2626; }
           options: data.options, picks: data.picks, group, chosen, neCurrent, follow,
           remembered: rem, nearCount: near.length,
         });
-        // 🚨 使われなかった carry (「候補が無いので残した」記録) は消す。残すと、その系統の便が
-        //    また選択肢から消えたときに古い便が復活して利益が勝手に変わる (Codex R16 P2)
-        if (rem && rem.kind === 'carry' && d.method !== rem.method) mine.forget();
+        // 🚨 その配送方法に合わせ先ができたら carry (「候補が無いので残した」記録) は役目を
+        //    終えたので消す。残すと、その便がまた選択肢から消えたときに復活して利益が
+        //    勝手に変わる (Codex R16 P2)。
+        //    🚨 **選ばれた便が carry と同じ名前でも消す** — 名前で比べると、同名の候補が
+        //    現れたときだけ掃除し忘れて、あとで復活する (Codex R22 P2)
+        if (rem && rem.kind === 'carry' && follow && data.picks?.[group]) mine.forget();
         followed = d.followed;
         sel.value = d.method;
         apply();
