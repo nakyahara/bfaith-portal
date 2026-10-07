@@ -570,8 +570,8 @@ export const JOBS_REGISTRY = [
       + '急いで閉じる = DB の持ち主か new_entry_gate で ops.revoke_new_entry_lease(\'single\', 理由) (非常の止めは MASTER_NEW_ENTRY_STOP=1)。'
       + '「CompanyDB写し(Amazon SKU)」が ❌: 要約の理由 = empty・shrunk (墓標が多すぎる? わざとなら手で --dry-run → --allow-shrink --expect-hash <出たハッシュ>) / '
       + 'watermark_backward・meta_unreadable (Company DB を戻した? = db/company/README.md「Amazon SKU の対応の写し」の復元の手順: .env に CDB_AMAZON_MAP_PUBLISH_PAUSE=1 → --dry-run で差を人が見る → env を外して --accept-restore --expect-hash) / '
-      + 'invalid_canon (Company DB の対応が受け手の決まりに合わない) / 別の写しが動いている (show-job-locks.js) / 持ち主を読めない (COMPANY_DB_WATCH_URL・DB に届かない)。'
-      + '急ぎで写す = node -r dotenv/config apps/company-db/publish/amazon-map.mjs (同じ鍵・同じ安全弁)。⚠️ 前の写しの後に古い表が書き換えられていた = 誰が SKU タブ・CSV・GAS で書いたかを見る (Company DB の値で上書き済み)',
+      + 'invalid_canon (Company DB の対応が受け手の決まりに合わない) / 別の写しが動いている (exit 73 = 手の写しが鍵を持っていた = その朝は f_sales・速度・リスト・Render同期 も見送り retry で写しから流す・show-job-locks.js) / 持ち主を読めない (COMPANY_DB_WATCH_URL・DB に届かない)。'
+      + '急ぎで写す = node -r dotenv/config apps/company-db/publish/amazon-map.mjs (同じ鍵・同じ安全弁。daily-sync / 再試行の回が動いている間は断る = 終わってから)。⚠️ 前の写しの後に古い表が書き換えられていた = 誰が SKU タブ・CSV・GAS で書いたかを見る (Company DB の値で上書き済み)',
   },
   {
     id: 'mf-daily-sync',

@@ -24,7 +24,8 @@ t('表の整合: 上流も下流も retry の定義と順序にあり、上流�
   }
   // 決済の取込 → 財務の送り手の組 (F2b-3) は、スイッチ CDB_FINANCE_COORDINATOR が無いとき (今までの 2 工程) の組 (#1567)。あるときは coordinator 'Amazon決済と財務' の 1 工程 = この組は走らない
   assert.deepEqual(UPSTREAM_OF, { 'CompanyDB注文(Qoo10)': 'Qoo10', 'CompanyDB広告費(Amazon)': 'Amazon Ads (SKU)', 'CompanyDB財務(Amazon)': 'Amazon Settlement', 'CompanyDB観測原価': 'm_products_history', '新商品の許可': 'マスタ照合',
-    'f_sales': 'CompanyDB写し(Amazon SKU)' });   // ⑦-2 PR-A (Codex 計画 R2 High 2)
+    'f_sales': 'CompanyDB写し(Amazon SKU)',   // ⑦-2 PR-A (Codex 計画 R2 High 2)
+    'sales_velocity': 'f_sales', 'pml_snapshot': 'sales_velocity', 'Render同期': 'pml_snapshot' });   // 直列 (#1649 Codex R1 Medium 2)
 });
 t('⑦-2 PR-A: Amazon SKU の対応の写しは 3 か所 (RETRYABLE_JOBS・JOB_DEFINITIONS・RETRY_ORDER) にあり、f_sales より前・daily-sync でも f_sales より前に走る', () => {
   const J = 'CompanyDB写し(Amazon SKU)';
@@ -37,6 +38,15 @@ t('⑦-2 PR-A: Amazon SKU の対応の写しは 3 か所 (RETRYABLE_JOBS・JOB_D
   const iFsales = dailySync.indexOf("runScript('apps/warehouse/rebuild-f-sales.js'");
   assert.ok(iApply > 0 && iApply < iMap && iMap < iFsales, 'daily-sync: 写しの反映 → Amazon SKU の写し → f_sales の順');
   assert.match(dailySync, /results\.push\(\{ name: 'CompanyDB写し\(Amazon SKU\)', \.\.\.cdbAmazonMapResult/);
+});
+t('🚨 ⑦-2 PR-A (#1649 Codex R1 High): 写しが鍵待ち (exit 73) の朝は f_sales・速度・リストを流さず失敗として retry に載せる (Render同期 は f_sales 失敗で見送り)。ふつうの拒否 (exit 1) は今までどおり流す', () => {
+  assert.match(dailySync, /const amazonMapBusy = !cdbAmazonMapResult\.success && cdbAmazonMapResult\.exitCode === 73;/);
+  for (const [v, script] of [['fSalesResult', 'rebuild-f-sales.js'], ['velocityResult', 'rebuild-sales-velocity.js'], ['pmlSnapResult', 'build-product-management-snapshot.js']]) {
+    assert.match(dailySync, new RegExp(`const ${v} = amazonMapBusy \\? amazonMapBusySkip\\('[a-z_]+'\\) : runScript\\('apps/warehouse/${script.replace(/\./g, '\\.')}'`), v);
+  }
+  assert.match(dailySync, /return \{ success: false, summary: '⏸️ skipped \(Amazon SKU の写しが別の写しの鍵待ち/);   // blocked でない = retry に載る
+  assert.ok(['f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'CompanyDB写し(Amazon SKU)'].every((j) => retryable.includes(j)));
+  assert.match(dailySync, /if \(!fSalesOk\) reasons\.push\('f_sales 失敗'\);/);
 });
 t('🚨 ⑦-2 PR-A: 写しをこの回で再試行して失敗 → f_sales を作り直さない (Render同期 も見送り) / 写しが成功 → f_sales から作り直す / 写しが朝に成功していれば f_sales はそのまま走る', () => {
   const started = []; const quiet = () => {};

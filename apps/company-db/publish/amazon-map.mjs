@@ -26,7 +26,9 @@
  *   ... --allow-shrink --expect-hash <H>     意図した大量削除 (0 件・90% 未満) を通す (手だけ。H = --dry-run が出す Company DB のハッシュ)
  *   ... --accept-restore --expect-hash <H>   Company DB を戻した後、差を人が見てから再開 (変更の記録の番号が戻ったのを通す。手だけ)
  * env: COMPANY_DB_WATCH_URL (watcher) / DATA_DIR (warehouse.db) / CDB_AMAZON_MAP_PUBLISH_PAUSE=1 (止める = ⚠️ 見送り・古い表は前の形のまま)
- * 終わり方: 写した・変わらない・持ち主が load・止めている = exit 0 / 断った・読めない (持ち主が company のはず)・鍵が取れない = exit 1 (daily-sync の retry に載る)。
+ * 手の写し (--daily でない) は daily-sync / retry の回が動いている間は断る (鍵の前と後に確かめる)。鍵の順 = 回の鍵 → 写しの鍵 (待たない)。
+ * 終わり方: 写した・変わらない・持ち主が load・止めている = exit 0 / 断った・読めない (持ち主が company のはず)・回が動いている (手) = exit 1 (daily-sync の retry に載る) /
+ *   別の写しが鍵を持っていた = exit 73 (daily-sync はこの朝の f_sales・速度・リスト・Render同期 を流さず retry に残す)。
  *   ping は打たない (台帳 warehouse-daily-sync の 1 工程。成否は daily-sync の要約・retry の通知に出る)
  */
 import 'dotenv/config';
@@ -38,6 +40,7 @@ import { readOwnershipState } from '../load/ownership-state.mjs';
 import { readCompanyAmazonMapCanon, AMAZON_MAP_OWNER_KEY } from '../../../lib/amazon-map-write.mjs';
 import { fromMiniPcRows, skuMapDigest, validateSkuMap, SKU_MAP_HASH_RE, SKU_MAP_CANON_FORMAT } from '../../../lib/sku-map-canonical.js';
 import { acquireLock, releaseLock } from '../../warehouse/job-locks.js';
+import { otherRunAlive } from '../../warehouse/retry-lock.js';
 
 export const STEP_NAME = 'CompanyDB写し(Amazon SKU)';   // daily-sync の工程の名前 = retry-failed-jobs.js の名前
 export const META_KEY = 'cdb_amazon_map_publish';
@@ -46,7 +49,9 @@ export const LOCK_TTL_MS = 20 * 60 * 1000;
 export const PAUSE_ENV = 'CDB_AMAZON_MAP_PUBLISH_PAUSE';
 /** 今の古い表の行数に比べてこれより少ない = 読み落とし・大量の墓標を疑う (意図したものは --allow-shrink) */
 export const SHRINK_MIN_RATIO = 0.9;
-export const EXIT = Object.freeze({ ok: 0, error: 1 });
+/** lock_busy = 73 (EX_CANTCREAT・job-locks.js の決まり) = 別の写しが鍵を持っていた。daily-sync はこの朝の f_sales 以降 (速度・リスト・Render同期) を流さず retry に残す
+ *   (手の写しが f_sales と Render同期 の間に新しい対応を入れると、新しい mirror_sku_* と古い対応の f_sales が一緒に送られる。#1649 Codex R1 High)。2・3・4 は使わない (retry・daily-sync が別の意味に読む) */
+export const EXIT = Object.freeze({ ok: 0, error: 1, lock_busy: 73 });
 const SAMPLE = 10;
 
 const fail = (message, code) => Object.assign(new Error(message), { code });
@@ -64,12 +69,25 @@ export function legacyDigestOf(sqlite) {
   const legacy = readLegacyRows(sqlite);
   try { return { ...skuMapDigest(fromMiniPcRows(legacy)), error: null }; } catch (e) { return { content_hash: null, master_rows: legacy.masterRows.length, component_rows: legacy.componentRows.length, error: e.message }; }
 }
-/** 前の写しの記録 (sync_meta)。無い = null / 読めない = { unreadable: true } */
+/**
+ * 前の写しの記録 (sync_meta)。**行が無いときだけ null**。
+ * SELECT の失敗・JSON の不正・要る欄の欠け・型やハッシュの形の不正 = { unreadable: true } (安全弁で断る = --accept-restore --expect-hash でだけ通す。#1649 Codex R1 Medium 3)
+ *   要る欄 = format (sku-map-canon-v1)・content_hash (64 桁の 16 進)・master_rows / component_rows (0 以上の整数)・watermark (整数か null = 変更の記録の表が無い DB)・published_at (文字)
+ */
 export function readMeta(sqlite) {
-  let v;
-  try { v = sqlite.prepare('SELECT value FROM sync_meta WHERE key = ?').get(META_KEY)?.value; } catch { return null; }
-  if (v == null || v === '') return null;
-  try { const j = JSON.parse(v); return j && typeof j === 'object' ? j : { unreadable: true }; } catch { return { unreadable: true }; }
+  let row;
+  try { row = sqlite.prepare('SELECT value FROM sync_meta WHERE key = ?').get(META_KEY); } catch { return { unreadable: true }; }
+  if (row === undefined) return null;
+  let j;
+  try { j = JSON.parse(row.value); } catch { return { unreadable: true }; }
+  return validMeta(j) ? j : { unreadable: true };
+}
+const nonNegInt = (v) => Number.isSafeInteger(v) && v >= 0;
+/** 前の写しの記録の形が正しいか */
+export function validMeta(j) {
+  return !!j && typeof j === 'object' && !Array.isArray(j) && j.format === SKU_MAP_CANON_FORMAT && typeof j.content_hash === 'string' && SKU_MAP_HASH_RE.test(j.content_hash)
+    && nonNegInt(j.master_rows) && nonNegInt(j.component_rows)
+    && Object.hasOwn(j, 'watermark') && (j.watermark === null || nonNegInt(j.watermark)) && typeof j.published_at === 'string' && j.published_at !== '';
 }
 /** warehouse.db を読むだけで開いて前の写しの記録を読む (持ち主が読めないときの手がかり。ファイルが無い = null) */
 export function readMetaReadonly(dataDir) {
@@ -217,10 +235,11 @@ const describe = (c) => `親 +${c.master.inserted} ~${c.master.updated} -${c.mas
 
 /**
  * 1 回分。connect = () => { db, close } (watcher)。getSqlite = 持ち主が company のときだけ呼ぶ (load の朝は SQLite を開かない)。
- * @returns {{ state: 'not_applied'|'applied'|'unchanged'|'refused'|'dry_run'|'lock_busy', code, line, counts?, problems?, detail?, digest? }}
+ * runAlive = 手の写しのときだけ呼ぶ「daily-sync / retry の回の持ち主が動いているか」(動いている = { what, pid, started_at } / いない = null)
+ * @returns {{ state: 'not_applied'|'applied'|'unchanged'|'refused'|'dry_run'|'lock_busy'|'run_busy', code, line, counts?, problems?, detail?, digest? }}
  */
 export async function runAmazonMapPublish({ connect, getSqlite, now = () => new Date(), dryRun = false, allowShrink = false, acceptRestore = false, expectHash = null,
-  manual = false, lockTtlMs = LOCK_TTL_MS, beforeCommit = null, afterLock = null }) {
+  manual = false, lockTtlMs = LOCK_TTL_MS, beforeCommit = null, afterLock = null, runAlive = () => null }) {
   // 持ち主を読むまでの失敗 (接続・持ち主の記録が壊れている) には印 ownerStage を付ける = 入口 (cli) が手がかりで ❌ / ⚠️ を決める
   const ownerStage = (e) => Object.assign(e instanceof Error ? e : new Error(String(e)), { ownerStage: true });
   let conn;
@@ -239,9 +258,19 @@ export async function runAmazonMapPublish({ connect, getSqlite, now = () => new 
     }
     sqlite = await getSqlite();
     // 2 鍵 (PG の対応を読む前から SQLite の commit の後まで)。試し (--dry-run) は書かない = 鍵も取らない
+    //   鍵の順 = daily-sync / retry の回の鍵 (外) → 写しの鍵 (内)。どれも待たずに取れなければすぐ断る (待ち合わせの輪ができない)。
+    //   手の写し (manual) は回の鍵を取らず、写しの鍵の前と後の 2 回「回が動いていない」を確かめる = 回の f_sales〜Render同期 の間に新しい対応を入れない (#1649 Codex R1 High)
+    const runBusy = () => {
+      const h = manual ? runAlive() : null;
+      return h ? { state: 'run_busy', code: EXIT.error, line: `❌ ${STEP_NAME}: daily-sync / 再試行の回が動いている (${h.what || '回'}・pid ${h.pid}・開始 ${h.started_at}) = 手では写さない (その回の写し → f_sales → Render同期 と混ざらないように。終わってから流す)` } : null;
+    };
     if (!dryRun) {
+      const busy0 = runBusy();
+      if (busy0) return busy0;
       lock = acquireLock(sqlite, LOCK_NAME, { ttlMs: lockTtlMs });
-      if (!lock) return { state: 'lock_busy', code: EXIT.error, line: `❌ ${STEP_NAME}: 別の写しが動いている (鍵 ${LOCK_NAME}) = 何もしない (show-job-locks.js で確かめる)` };
+      if (!lock) return { state: 'lock_busy', code: EXIT.lock_busy, line: `❌ ${STEP_NAME}: 別の写しが動いている (鍵 ${LOCK_NAME}) = 何もしない (show-job-locks.js で確かめる・daily-sync はこの朝の f_sales 以降を retry に残す)` };
+      const busy1 = runBusy();   // 鍵を取る間に回が始まった = 外して (finally) 断る
+      if (busy1) return busy1;
       if (afterLock) await afterLock();
     }
     await db.query('begin transaction isolation level repeatable read read only');
@@ -312,7 +341,7 @@ const truthy = (v) => /^(1|true|yes|on)$/i.test(String(v ?? '').trim());
  *   どちらも示さない (今の本番 = 写しを一度も使っていない) = ⚠️ exit 0 (今までの動きを変えない = f_sales の retry を止めない)
  * @param {object} [deps]  試験で差し替える (env・接続・warehouse.db・持ち主の設定・ログ)
  */
-export async function cli(argv, { env = process.env, connectFor = null, openSqlite = null, readHintMeta = null, ownership = MASTER_OWNERSHIP, log = console.log, now = () => new Date(), run = runAmazonMapPublish, beforeCommit = null, afterLock = null } = {}) {
+export async function cli(argv, { env = process.env, connectFor = null, openSqlite = null, readHintMeta = null, ownership = MASTER_OWNERSHIP, log = console.log, now = () => new Date(), run = runAmazonMapPublish, beforeCommit = null, afterLock = null, runAlive = null } = {}) {
   let code = EXIT.error, last = '';
   try {
     const a = parseArgs(argv);
@@ -344,7 +373,8 @@ export async function cli(argv, { env = process.env, connectFor = null, openSqli
         })());
         let r = null, ownerErr = null;
         try {
-          r = await run({ connect, getSqlite, now, dryRun: a.dryRun, allowShrink: a.allowShrink, acceptRestore: a.acceptRestore, expectHash: a.expectHash, manual: !a.daily, beforeCommit, afterLock });
+          r = await run({ connect, getSqlite, now, dryRun: a.dryRun, allowShrink: a.allowShrink, acceptRestore: a.acceptRestore, expectHash: a.expectHash, manual: !a.daily, beforeCommit, afterLock,
+            runAlive: runAlive || (() => dailyOrRetryRunAlive()) });
         } catch (e) {
           // 持ち主を読む前に落ちた (接続・持ち主の記録が壊れている) = 手がかりで決める / それより後 = ❌
           if (e && e.ownerStage) ownerErr = e;
@@ -364,6 +394,15 @@ export async function cli(argv, { env = process.env, connectFor = null, openSqli
   last = String(last).replace(/\s+/g, ' ');
   log(last);
   return { code, last };
+}
+
+/** daily-sync / retry の回の lock (リポジトリの data/。daily-sync.js・retry-failed-jobs.js と同じ場所) */
+const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+export const RUN_LOCK_FILES = Object.freeze({ 'daily-sync': path.join(PROJECT_DIR, 'data', 'daily-sync.lock.json'), '再試行': path.join(PROJECT_DIR, 'data', 'retry-failed-jobs.lock.json') });
+/** daily-sync か retry の回の持ち主が今動いているか (retry-lock.js の otherRunAlive = pid が生きている node で lock より前から動いている)。動いていれば { what, pid, started_at } */
+export function dailyOrRetryRunAlive({ files = RUN_LOCK_FILES, alive = otherRunAlive } = {}) {
+  for (const [what, file] of Object.entries(files)) { const h = alive(file); if (h) return { what, ...h }; }
+  return null;
 }
 
 const fold = (x) => (process.platform === 'win32' ? x.toLowerCase() : x);

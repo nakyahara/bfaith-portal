@@ -23,7 +23,7 @@ await ta('[1] RERUN_AFTER の決まり (定義・順番・下流は上流より�
   assert.deepEqual(RERUN_AFTER['Render同期'], ['マスタ照合']);
   // ⑦-2 PR-A (Codex 計画 R2 High 2): Amazon SKU の写し → f_sales → sales_velocity / pml_snapshot / Render同期 の鎖
   assert.deepEqual(RERUN_AFTER['CompanyDB写し(Amazon SKU)'], ['f_sales']);
-  assert.deepEqual(RERUN_AFTER['f_sales'], ['sales_velocity', 'pml_snapshot', 'Render同期']);
+  assert.deepEqual([RERUN_AFTER['f_sales'], RERUN_AFTER['sales_velocity'], RERUN_AFTER['pml_snapshot']], [['sales_velocity'], ['pml_snapshot'], ['Render同期']]);   // 直列 (#1649 Codex R1 Medium 2)
   assert.ok(RETRY_ORDER.indexOf('CompanyDB写し(Amazon SKU)') < RETRY_ORDER.indexOf('f_sales') && RETRY_ORDER.indexOf('f_sales') < RETRY_ORDER.indexOf('sales_velocity')
     && RETRY_ORDER.indexOf('sales_velocity') < RETRY_ORDER.indexOf('pml_snapshot') && RETRY_ORDER.indexOf('pml_snapshot') < RETRY_ORDER.indexOf('Render同期'));
   assert.deepEqual(JOB_DEFINITIONS['CompanyDB写し(Amazon SKU)'].args, ['--daily']);
@@ -91,6 +91,35 @@ await ta('[4b] ⑦-2 PR-A: 朝は写しだけ失敗 (f_sales・Render同期 は�
   const r4 = runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: k.run, log: quiet, publishGate: { broken: true, state: 'broken' } });
   assert.deepEqual(k.calls, ['CompanyDB写し(Amazon SKU)']);
   assert.deepEqual(r4.map((r) => [r.name, r.success, !!r.gated]), [['CompanyDB写し(Amazon SKU)', true, false], ['f_sales', false, true]]);
+});
+
+await ta('[4c] f_sales → sales_velocity → pml_snapshot → Render同期 は直列 (#1649 Codex R1 Medium 2): 速度が落ちた / リストが落ちた回はその先を流さない・次の回で落ちたところから最後まで流す', async () => {
+  // 速度が落ちる (走らせ直しの鎖)
+  const a = fakeRun({ sales_velocity: true });
+  const ra = runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: a.run, log: quiet });
+  assert.deepEqual(a.calls, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity']);
+  assert.deepEqual(ra.filter((r) => !r.success).map((r) => r.name), ['sales_velocity']);
+  // 次の回 = 速度から最後まで
+  const a2 = fakeRun();
+  runRetryRound(ra.filter((r) => !r.success).map((r) => r.name), { run: a2.run, log: quiet });
+  assert.deepEqual(a2.calls, ['sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  // リストが落ちる
+  const b = fakeRun({ pml_snapshot: true });
+  const rb = runRetryRound(['f_sales'], { run: b.run, log: quiet });
+  assert.deepEqual(b.calls, ['f_sales', 'sales_velocity', 'pml_snapshot']);
+  assert.deepEqual(rb.filter((r) => !r.success).map((r) => r.name), ['pml_snapshot']);
+  const b2 = fakeRun();
+  runRetryRound(['pml_snapshot'], { run: b2.run, log: quiet });
+  assert.deepEqual(b2.calls, ['pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  // 下流が朝から remaining_jobs にある回も、この回で試した上流が落ちたら止まる (見送りの失敗 = 次の回に残る)
+  const c = fakeRun({ sales_velocity: true });
+  const rc = runRetryRound(['sales_velocity', 'pml_snapshot', 'Render同期'], { run: c.run, log: quiet });
+  assert.deepEqual(c.calls, ['sales_velocity']);
+  assert.deepEqual(rc.map((r) => [r.name, r.success, r.summary]), [['sales_velocity', false, '❌ 失敗'], ['pml_snapshot', false, '⏸️ skipped (sales_velocity 再失敗)'], ['Render同期', false, '⏸️ skipped (pml_snapshot 再失敗)']]);
+  const d = fakeRun({ pml_snapshot: true });
+  const rd = runRetryRound(['pml_snapshot', 'Render同期'], { run: d.run, log: quiet });
+  assert.deepEqual(d.calls, ['pml_snapshot']);
+  assert.deepEqual(rd.filter((r) => !r.success).map((r) => r.name), ['pml_snapshot', 'Render同期']);
 });
 
 await ta('[5] 失敗した子の最後の行 (❌ 理由) を要約に残す (Codex #1540 R1 Low)', async () => {

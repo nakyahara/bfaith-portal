@@ -7,7 +7,7 @@
  *   1 切替の前 (持ち主 load): 入口 (cli --daily) を本物の watcher のログインで流す = ⏭️ exit 0・古い表を開かない
  *   2 移行 (H0) → 切替 → 写し = 変わった行 0・ハッシュ = H0
  *   3 watcher のロールの既定の時差が東京でも、写した古い表のハッシュ = UTC の session で読んだ Company DB のハッシュ
- *   4 別々の接続で 2 つの写しが並ぶ: 後の方は鍵で断られる (exit 1・書かない)・前の方は鍵の後に読んだ Company DB を写す
+ *   4 別々の接続で 2 つの写しが並ぶ: 後の方は鍵で断られる (exit 73・書かない)・前の方は鍵の後に読んだ Company DB を写す
  *   5 watcher のログインは対応を書けない
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:<port>/postgres node scripts/test-amazon-map-publish-pg.mjs
  *   (この PC では C:/tmp/pg-embed の使い捨ての PostgreSQL の起動役が TEST_PG_URL を渡す)
@@ -153,7 +153,7 @@ try {
     } finally { await O.query('alter role watcher reset timezone'); }
   });
 
-  await ta('[4] 別々の接続で 2 つの写しが並ぶ: 後の方は鍵で断られる (exit 1・書かない)・前の方は鍵の後に読んだ Company DB を写す', async () => {
+  await ta('[4] 別々の接続で 2 つの写しが並ぶ: 後の方は鍵で断られる (exit 73・書かない)・前の方は鍵の後に読んだ Company DB を写す', async () => {
     let release; const held = new Promise((r) => { release = r; });
     let entered; const inLock = new Promise((r) => { entered = r; });
     const first = cliReal(['--daily'], { afterLock: async () => { entered(); await held; } });
@@ -161,7 +161,7 @@ try {
     await save('pr_a001', 'SKU マスタの 1 (鍵の間に直した)', [{ code: 'p001', qty: 1 }]);
     const before = sqSnap();
     const second = await cliReal(['--daily']);
-    assert.equal(second.code, 1); assert.match(second.last, /別の写しが動いている/);
+    assert.equal(second.code, 73); assert.match(second.last, /別の写しが動いている/);   // 73 = daily-sync は f_sales 以降を retry に残す
     assert.equal(sqSnap(), before);
     release();
     const r1 = await first;

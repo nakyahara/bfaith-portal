@@ -162,6 +162,12 @@ export const UPSTREAM_OF = {
   // Amazon SKU の対応の写し → f_sales (⑦-2 PR-A・Codex 計画 R2 High 2)。写しをこの回で再試行して失敗 = f_sales を作り直さない
   //   (朝の f_sales は前の対応のまま = 古い対応と新しい対応の混ざった回を Render へ送らない。写しが直った回に f_sales から作り直す = RERUN_AFTER)
   'f_sales': 'CompanyDB写し(Amazon SKU)',
+  // f_sales → sales_velocity → pml_snapshot → Render同期 の直列 (#1649 Codex R1 Medium 2)。この回で上流を試して失敗 (見送りも) = 下流は流さない
+  //   (下流が朝から remaining_jobs にある回も同じ)。Render同期 は商品管理リスト (pml_snapshot) も Render に送る = リストが落ちた回は送らない。
+  //   f_sales・楽天sku_map の再失敗で Render同期 を止めるのは今までどおり runRetryRound の fail-fast
+  'sales_velocity': 'f_sales',
+  'pml_snapshot': 'sales_velocity',
+  'Render同期': 'pml_snapshot',
 };
 /**
  * 走らせ直しの依存 (Company DB構想 10 §6.1.1 B4。Codex ③a-2 R1 H5・B-R0 #3): 上流が**この回の retry で成功**したら、朝に成功していた下流も走らせ直す。
@@ -173,9 +179,11 @@ export const UPSTREAM_OF = {
  */
 export const RERUN_AFTER = {
   // Amazon SKU の対応の写しが直った (⑦-2 PR-A・Codex 計画 R2 High 2) = 朝に成功していた f_sales も新しい対応で作り直し、その後の販売速度・商品管理リスト・Render同期も
-  //   (新しい mirror_sku_* と古い対応で作った f_sales を同じ回に送らない)。f_sales が再失敗 = Render同期 は見送り (下の fail-fast)
+  //   (新しい mirror_sku_* と古い対応で作った f_sales を同じ回に送らない)。直列 (#1649 Codex R1 Medium 2): 1 つが成功したら次だけを足す = 途中で落ちたらその先は流さない
   'CompanyDB写し(Amazon SKU)': ['f_sales'],
-  'f_sales': ['sales_velocity', 'pml_snapshot', 'Render同期'],
+  'f_sales': ['sales_velocity'],
+  'sales_velocity': ['pml_snapshot'],
+  'pml_snapshot': ['Render同期'],
   'Render同期': ['マスタ照合'],
   'マスタ照合': ['新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り'],
 };

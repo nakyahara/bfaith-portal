@@ -815,6 +815,11 @@ async function main() {
   // 止める = .env の CDB_AMAZON_MAP_PUBLISH_PAUSE=1 (⚠️ 見送り・古い表は前の形のまま)。ping は打たない (台帳 warehouse-daily-sync の 1 工程)
   const cdbAmazonMapResult = runScript('apps/company-db/publish/amazon-map.mjs --daily', 'Company DB の Amazon SKU の写し', 300000);
   results.push({ name: 'CompanyDB写し(Amazon SKU)', ...cdbAmazonMapResult, warn: cdbAmazonMapResult.success && isWarnSummary(cdbAmazonMapResult.summary) });
+  // exit 73 = 別の写し (手の CLI) が鍵を持っていた = この朝は f_sales・速度・リスト (と Render同期) を流さず、写し → f_sales → … を retry に残す
+  //   (手の写しが f_sales と Render同期 の間に新しい対応を入れると、新しい mirror_sku_* と古い対応の f_sales が一緒に送られる。#1649 Codex R1 High)。
+  //   ふつうの安全弁の拒否 (exit 1) は今までどおり流す (古い表は前の対応のまま = 混ざらない)。持ち主 load の今は鍵を取らない = 起きない
+  const amazonMapBusy = !cdbAmazonMapResult.success && cdbAmazonMapResult.exitCode === 73;
+  const amazonMapBusySkip = (name) => { console.log(`[DailySync] ${name} 見送り (Amazon SKU の写しが別の写しの鍵待ち = retry で 写し → f_sales → … の順に流す)`); return { success: false, summary: '⏸️ skipped (Amazon SKU の写しが別の写しの鍵待ち = retry で写しから流す)' }; };
 
   // m_products 変更差分を history に記録 (trigger 廃止 → 差分バッチ化)
   // rebuild-m-products.js の直後に実行 (m_products 確定後の比較)
@@ -834,17 +839,17 @@ async function main() {
   // 販売集計テーブル再構築
   // 上限 30 分 = retry-failed-jobs.js の JOB_DEFINITIONS と同じ。ふだん 6〜7 分 (読み 2.5〜3 分 + 書き 3〜4 分) で既定の 10 分に近く、
   // 2026-10-04 は miniPC が重く 10 分 33 秒で打ち切られ、Render 同期・当月の finance DQ・lz-daily まで止まった
-  const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築', 1800000);
+  const fSalesResult = amazonMapBusy ? amazonMapBusySkip('f_sales') : runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築', 1800000);
   results.push({ name: 'f_sales', ...fSalesResult });
 
   // 販売速度サマリ再構築 (商品管理リスト用: FBA/FBA以外 × 7d/30d)
   // m_products / v_sku_resolved / raw受注 が揃った後に実行。
-  const velocityResult = runScript('apps/warehouse/rebuild-sales-velocity.js', 'sales velocity 再構築');
+  const velocityResult = amazonMapBusy ? amazonMapBusySkip('sales_velocity') : runScript('apps/warehouse/rebuild-sales-velocity.js', 'sales velocity 再構築');
   results.push({ name: 'sales_velocity', ...velocityResult });
 
   // 商品管理リスト スナップショット生成 (在庫集計 + velocity の後)
   // m_products 起点で在庫/販売/利益/発注パラメータを1表に確定し published_run_id を切替。
-  const pmlSnapResult = runScript('apps/warehouse/build-product-management-snapshot.js', '商品管理リスト snapshot');   // 写しの反映が世代と違う朝は runScript が止める
+  const pmlSnapResult = amazonMapBusy ? amazonMapBusySkip('pml_snapshot') : runScript('apps/warehouse/build-product-management-snapshot.js', '商品管理リスト snapshot');   // 写しの反映が世代と違う朝は runScript が止める
   results.push({ name: 'pml_snapshot', ...pmlSnapResult });
 
   // Amazon Settlement mart 再構築 (Phase 3.5)
