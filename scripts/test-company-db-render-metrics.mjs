@@ -11,7 +11,7 @@
  *     値は本文の文字のままで整数の safe integer だけ (1073741824.00000001 ほか) / 400 ほか全部の非 200 / 理由の優先 (timeout が先・次に endpoint の順)
  *   🆕 #1600 R2: 本文は自前の厳密な JSON の読み方 (reviver の context.source を使わない = 本番の node:20-slim で動く)。Node 20 でも流す:
  *     npx -y node@20 scripts/test-company-db-render-metrics.mjs
- *   🆕 #1653: 「apps の下で import している所は無い」は JS を字句に分けて (コメントは捨て・文字列は 1 字句) import の指定子だけを見る。完全な禁止の検査ではない (指定子に名前が文字で無いものは見えない)
+ *   🆕 #1653: apps の下で render-metrics の名前が出るファイルは明示の一覧 (NAME_ONLY_ALLOWED) とちょうど一致し、一覧のファイルではコメントの行だけ。完全な禁止の検査ではない (指定子に名前が文字で無い import は見えない)
  * 実行: node scripts/test-company-db-render-metrics.mjs
  */
 import assert from 'node:assert/strict';
@@ -450,93 +450,48 @@ await t('fixture に鍵らしい文字が無い', async () => {
 });
 
 console.log('使う所はまだ無い (利益の受け口は 503 のまま)');
-// 名前を書いただけ (コメント・文字列の中) は数えない。JS を字句に分けて (コメントは捨て、文字列・テンプレート文字列は 1 つの字句)、
-// 意味のある字句の並びで import の指定子だけを見る (#1653 R1: 正規表現ではコメント・文字列の中の import 文に当たり、間にコメントのある本物を取りこぼした)。
-// 🚨 完全な禁止の検査ではない: 指定子に文字として render-metrics が無いもの (import(`./${name}.mjs`)・文字列の連結・変数・\x2d などの escape) は見つけられない。
-//   うっかりの直接の import を止めるための見張り。字句が壊れたら (閉じない文字列・コメント・正規表現・括弧) 例外を投げる = 黙って通さない。
-const ID_START = /(?:[\p{ID_Start}$_]|\\u[0-9a-fA-F]{4}|\\u\{[0-9a-fA-F]+\})(?:[\p{ID_Continue}$\p{Join_Control}]|\\u[0-9a-fA-F]{4}|\\u\{[0-9a-fA-F]+\})*/uy;
-const NUMBER = /(?:0[xXoObB][0-9a-fA-F_]+n?|(?:\d[\d_]*\.?[\d_]*|\.\d[\d_]*)(?:[eE][+-]?\d[\d_]*)?n?)/y;
-const LINE_END = /[\n\r\p{Zl}\p{Zp}]/u;
-// この字句の後の / は正規表現の始まり (演算子・開き括弧・区切りの後、または式の前に来る keyword の後)。) ] と名前・数・文字列の後は割り算
-const REGEX_AFTER_WORD = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else', 'yield', 'await']);
-const regexAllowedAfter = (tok) => !tok || (tok.type === 'punct' ? !(tok.value === ')' || tok.value === ']') : tok.type === 'name' && REGEX_AFTER_WORD.has(tok.value));
-function lexJs(src) {
-  const tokens = [];
-  const stack = [];      // { の入れ子: null = ふつうの {、字句 = テンプレート文字列の ${ (閉じたら続きの文字列を読む)
-  let i = 0, last = null;
-  const fail = (msg) => { const line = src.slice(0, i).split('\n').length; throw new Error(`${msg} (${line} 行目)`); };
-  const push = (tok) => { tokens.push(tok); last = tok; };
-  const readQuasi = (tok) => {  // ` の後か } の後から、` で閉じるか ${ が来るまで
-    for (;;) {
-      if (i >= src.length) fail('テンプレート文字列が閉じていない');
-      const c = src[i];
-      if (c === '\\') { tok.value += src.slice(i, i + 2); i += 2; continue; }
-      if (c === '`') { i++; last = tok; return; }
-      if (c === '$' && src[i + 1] === '{') { i += 2; stack.push(tok); last = { type: 'punct', value: '${' }; return; }
-      tok.value += c; i++;
-    }
-  };
-  if (src.startsWith('#!')) { while (i < src.length && !LINE_END.test(src[i])) i++; }
-  while (i < src.length) {
-    const c = src[i];
-    if (/\s/.test(c)) { i++; continue; }
-    if (c === '/' && src[i + 1] === '/') { while (i < src.length && !LINE_END.test(src[i])) i++; continue; }
-    if (c === '/' && src[i + 1] === '*') { const end = src.indexOf('*/', i + 2); if (end < 0) fail('ブロックのコメントが閉じていない'); i = end + 2; continue; }
-    if (c === '/') {
-      if (!regexAllowedAfter(last)) { push({ type: 'punct', value: '/' }); i++; continue; }
-      let inClass = false;
-      for (i++; ; i++) {
-        if (i >= src.length || LINE_END.test(src[i])) fail('正規表現の literal が閉じていない');
-        if (src[i] === '\\') { i++; if (i >= src.length || LINE_END.test(src[i])) fail('正規表現の literal が閉じていない'); continue; }
-        if (src[i] === '[') inClass = true;
-        else if (src[i] === ']') inClass = false;
-        else if (src[i] === '/' && !inClass) break;
-      }
-      i++;
-      ID_START.lastIndex = i; if (ID_START.exec(src)) i = ID_START.lastIndex;  // flags
-      push({ type: 'regex' });
-      continue;
-    }
-    if (c === '\'' || c === '"') {
-      let value = '';
-      for (i++; ; i++) {
-        if (i >= src.length || src[i] === '\n' || src[i] === '\r') fail('文字列が閉じていない');
-        if (src[i] === c) break;
-        if (src[i] === '\\') { value += src[i]; i++; if (src[i] === '\r' && src[i + 1] === '\n') i++; else value += src[i] ?? ''; continue; }
-        value += src[i];
-      }
-      i++;
-      push({ type: 'string', value });
-      continue;
-    }
-    if (c === '`') { const tok = { type: 'string', value: '' }; i++; push(tok); readQuasi(tok); continue; }
-    if (c === '{') { stack.push(null); push({ type: 'punct', value: '{' }); i++; continue; }
-    if (c === '}') {
-      if (!stack.length) fail('閉じ括弧 } が多い');
-      const tpl = stack.pop(); i++;
-      if (tpl) readQuasi(tpl); else push({ type: 'punct', value: '}' });
-      continue;
-    }
-    ID_START.lastIndex = i;
-    if (ID_START.exec(src)) { push({ type: 'name', value: src.slice(i, ID_START.lastIndex) }); i = ID_START.lastIndex; continue; }
-    NUMBER.lastIndex = i;
-    if (/[\d.]/.test(c) && NUMBER.exec(src) && NUMBER.lastIndex > i) { push({ type: 'number' }); i = NUMBER.lastIndex; continue; }
-    if ('()[];,.:?=!<>+-*%&|^~@#'.includes(c)) { push({ type: 'punct', value: c }); i++; continue; }
-    fail(`読めない文字 U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`);
+// 名前の出る所を明示の一覧で見る (#1653 R2 で方針を変えた: 自前の字句の走査は `n++ / 2` などで読み違え、本物の import を黙って通す形が残った)。
+// ① apps の下 (この部品の自身を除く) で render-metrics という文字を含むファイルの集合が NAME_ONLY_ALLOWED とちょうど一致すること。
+//   一覧に無いファイルに名前が出たら (コメントでも) 落ちる = 人が見て、import でなければ理由を書いて一覧に足す (fail-closed)。
+// ② 一覧のファイルでは、名前を含む行は全部コメントの行 (行頭が // か /* か、ブロックのコメントの中の *) で、コメントの外に名前が出ないこと。
+// 🚨 完全な禁止の検査ではない: 指定子に文字として render-metrics が無いもの (import(`./${name}.mjs`)・文字列の連結・変数・\x2d などの escape) は見えない。
+//   ブロックのコメントの中かは行の形で見る簡易な方法 (文字列の中の /* は見分けない)。うっかりの直接の import を止めるための見張り。
+const NAME_ONLY_ALLOWED = new Map([
+  ['company-db/profit/response-contract.mjs', '契約のコメントで METRICS_REASONS の出どころとして名前を書いているだけ (import しない)'],
+]);
+// 行の終わりでブロックのコメントの中にいるか (// の後は見ない)
+const blockStateAfter = (line, inBlock) => {
+  for (let i = 0; ;) {
+    if (inBlock) { const c = line.indexOf('*/', i); if (c < 0) return true; inBlock = false; i = c + 2; }
+    else { const o = line.indexOf('/*', i), l = line.indexOf('//', i); if (o < 0 || (l >= 0 && l < o)) return false; inBlock = true; i = o + 2; }
   }
-  if (stack.length) fail(stack.at(-1) ? 'テンプレート文字列の ${ が閉じていない' : '{ が閉じていない');
-  return tokens;
+};
+// files = [{ rel, text }] (rel は apps/ からの相対・/ 区切り) → 問題の一覧 (空なら ok)
+function renderMetricsNameProblems(files, allowed = NAME_ONLY_ALLOWED) {
+  const problems = [];
+  const withName = new Set(files.filter((f) => f.text.includes('render-metrics')).map((f) => f.rel));
+  for (const rel of withName) if (!allowed.has(rel)) problems.push(`一覧に無いファイルに名前がある (import でなければ理由を書いて NAME_ONLY_ALLOWED に足す): ${rel}`);
+  for (const rel of allowed.keys()) if (!withName.has(rel)) problems.push(`一覧にあるのに名前が無い (一覧から外す): ${rel}`);
+  for (const f of files) {
+    if (!allowed.has(f.rel)) continue;
+    let inBlock = false;
+    f.text.split(/\r?\n/).forEach((line, k) => {
+      const startsInBlock = inBlock;
+      inBlock = blockStateAfter(line, inBlock);
+      if (!line.includes('render-metrics')) return;
+      const s = line.trimStart();
+      let comment = null;   // 名前があってよいコメントの部分
+      if (s.startsWith('//')) comment = s;
+      else if (s.startsWith('/*') || (startsInBlock && s.startsWith('*'))) {
+        const close = s.indexOf('*/', s.startsWith('/*') ? 2 : 0);
+        comment = close < 0 ? s : (s.slice(close + 2).trim() === '' ? s.slice(0, close) : null);
+      }
+      if (!comment || !comment.includes('render-metrics')) problems.push(`${f.rel}:${k + 1} 名前がコメントの外にある: ${line.trim()}`);
+    });
+  }
+  return problems;
 }
-// import 'x' / import ( 'x' ) / … from 'x' (import・export の両方) / require ( 'x' ) の 'x' に render-metrics があれば当たり
-function importsRenderMetrics(src) {
-  const tk = lexJs(src);
-  const isSpec = (tok) => tok?.type === 'string' && tok.value.includes('render-metrics');
-  const isPunct = (tok, v) => tok?.type === 'punct' && tok.value === v;
-  return tk.some((tok, k) => tok.type === 'name' && (
-    (tok.value === 'import' && (isSpec(tk[k + 1]) || (isPunct(tk[k + 1], '(') && isSpec(tk[k + 2]))))
-    || (tok.value === 'from' && isSpec(tk[k + 1]))
-    || (tok.value === 'require' && isPunct(tk[k + 1], '(') && isSpec(tk[k + 2]))));
-}
+const APPS_DIR = new URL('../apps/', import.meta.url);
 const APPS_JS = [];
 (function walk(dir) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -545,66 +500,43 @@ const APPS_JS = [];
     if (e.isDirectory()) walk(p);
     else if (/\.(m?js|cjs)$/.test(e.name)) APPS_JS.push(p);
   }
-})(new URL('../apps/', import.meta.url));
-await t('import の見分け: 本物の import は数え、コメント・文字列の中は数えない (字句で見る・#1653 R1 の 6 例ほか)', async () => {
-  const yes = [
+})(APPS_DIR);
+const appsFiles = () => APPS_JS
+  .map((p) => ({ rel: decodeURIComponent(p.href.slice(APPS_DIR.href.length)), text: fs.readFileSync(p, 'utf8') }))
+  .filter((f) => f.rel !== 'company-db/profit/render-metrics.mjs');
+await t('名前の見張りの見分け: 一覧の外は (コメントでも) 落ちる・一覧のファイルはコメントの行だけ通る (#1653 R2)', async () => {
+  const base = appsFiles();
+  assert.ok(base.length > 100, `apps の下の JS が ${base.length} 個しか無い`);
+  const RC = 'company-db/profit/response-contract.mjs';
+  assert.ok(base.some((f) => f.rel === RC), '一覧のファイルが見つからない');
+  const addFile = (rel, text) => [...base, { rel, text }];
+  const editRc = (fn) => base.map((f) => (f.rel === RC ? { ...f, text: fn(f.text) } : f));
+  const fails = (files, re, label) => { const p = renderMetricsNameProblems(files); assert.ok(p.length > 0 && p.every((x) => re.test(x)), `${label}: ${JSON.stringify(p)}`); };
+  // 一覧の外 → 落ちる
+  fails(addFile('company-db/other.mjs', '// render-metrics を後で使う\nexport const x = 1;\n'), /一覧に無いファイル/, '一覧の外のコメント');
+  fails(addFile('company-db/lazy.mjs', "count++ / 2; import('./render-metrics.mjs'); // it's lazy\n"), /一覧に無いファイル/, 'R2 の例を一覧の外に');
+  fails(addFile('company-db/profit/x.mjs', "import /* side effect */ './render-metrics.mjs';\r\n"), /一覧に無いファイル/, '一覧の外の import');
+  // 一覧のファイルのコードの行 → 落ちる
+  for (const add of [
     "import { REASONS } from './render-metrics.mjs';",
-    'export { readMemory } from "../profit/render-metrics.mjs";',
-    "const m = await import('./render-metrics.mjs');",
-    "const m = require('./render-metrics');",
-    "import './render-metrics.mjs';",
-    // R1 の取りこぼし 3 例 (間にコメント)
-    "import /* side effect */ './render-metrics.mjs';",
-    "export * from /* reason */ './render-metrics.mjs';",
-    "await import /* lazy */ ('./render-metrics.mjs');",
-    // R1 Low: 複数行の static import・export * from・backtick の import()
-    "import {\n  fetchPostgresMetrics,\n  REASONS,\n} from './render-metrics.mjs';",
-    "import {\r\n  a, // 行のコメント\r\n  b,\r\n} from\r\n  '../profit/render-metrics.mjs';",
-    "export * from './render-metrics.mjs';",
-    "export * as rm from '../company-db/profit/render-metrics.mjs';",
+    "/* c */ import './render-metrics.mjs';",
+    "/* render-metrics の REASONS */ import { REASONS } from './render-metrics.mjs';",
+    "export * from /* x */ './render-metrics.mjs';",
     'const m = await import(`./render-metrics.mjs`);',
-    'const m = await import(`./${area}/render-metrics.mjs`);',
-    // 引用符を含む正規表現の literal の後の本物 (正規表現を文字列と読み違えると取りこぼす)
-    "/'/.test(x); import './render-metrics.mjs';",
-    "if (/[\"'/]/.test(x)) y = 1;\nimport('./render-metrics.mjs');",
-    // 割り算の後の本物 (割り算を正規表現と読み違えると取りこぼす)
-    "const half = total / 2, q = \"'\"; import('./render-metrics.mjs');",
-    // テンプレート文字列の ${ } の入れ子の後の本物
-    "const s = `a ${b ? `x${'}'}` : '{'} z`; import './render-metrics.mjs';",
-    "#!/usr/bin/env node\nconst rm = require( /* c */ '../profit/render-metrics.mjs' );",
-    // 文字列の中の escape した引用符の後の本物
-    "const q = 'it\\'s', d = \"a \\\" b\"; import './render-metrics.mjs';",
-  ];
-  const no = [
-    '/**\n * metrics の client (apps/company-db/profit/render-metrics.mjs の REASONS) の理由のコード。\n */',
-    '// render-metrics を使う所はまだ無い',
-    "const label = 'render-metrics';",
-    // R1 の誤検知 3 例 (コメント・文字列の中の import 文)
-    "// example: import './render-metrics.mjs'",
-    "const docs = \"import './render-metrics.mjs'\";",
-    "/* export * from './render-metrics.mjs' */",
-    "/**\n * import { REASONS } from './render-metrics.mjs';\n */\nexport const x = 1;",
-    'const s = `import(\'./render-metrics.mjs\')`;',
-    "const s = `${'`'} import './render-metrics.mjs'`;",
-    "const re = /'/; // import './render-metrics.mjs'",
-    "const re = /import '.\\/render-metrics.mjs'/;",
-    "import { x } from './other.mjs'; const name = 'render-metrics';",
-    "const m = await import('./other.mjs'); log('render-metrics');",
-  ];
-  for (const s of yes) assert.equal(importsRenderMetrics(s), true, s);
-  for (const s of no) assert.equal(importsRenderMetrics(s), false, s);
-  // 字句が壊れたら例外 (黙って「無い」にしない)
-  for (const s of ["const s = 'abc;\nimport './render-metrics.mjs';", '/* 閉じない', 'const s = `abc ${x', 'const re = /abc\n;', 'f(); }']) assert.throws(() => importsRenderMetrics(s), /閉じていない|多い/, s);
+    "import {\r\n  REASONS,\r\n} from './render-metrics.mjs';",
+    "/**\r\n * 説明\r\n */ import './render-metrics.mjs';",
+    "const k = 2\r\n  * require('./render-metrics').n;",
+    "count++ / 2; import('./render-metrics.mjs'); // it's lazy",
+  ]) fails(editRc((s) => `${s}\r\n${add}\r\n`), /名前がコメントの外にある/, add);
+  // 一覧のファイルにコメントの行を足す → 通る
+  for (const add of ['// render-metrics の REASONS と同じ', '/** render-metrics の説明 */', '/*\r\n * render-metrics の説明\r\n */', '  /* render-metrics */']) {
+    assert.deepEqual(renderMetricsNameProblems(editRc((s) => `${s}\r\n${add}\r\n`)), [], add);
+  }
+  // 一覧のファイルから名前が消えた → 落ちる (一覧はちょうど一致)
+  fails(editRc((s) => s.split('render-metrics').join('render_metrics')), /一覧にあるのに名前が無い/, '名前が消えた');
 });
-await t('apps の下の .js / .mjs / .cjs が全部 字句に分けられる (壊れたら試験が落ちる = 黙って通さない)', async () => {
-  assert.ok(APPS_JS.length > 100, `apps の下の JS が ${APPS_JS.length} 個しか無い`);
-  const errors = [];
-  for (const p of APPS_JS) { try { lexJs(fs.readFileSync(p, 'utf8')); } catch (e) { errors.push(`${p.pathname}: ${e.message}`); } }
-  assert.deepEqual(errors, []);
-});
-await t('apps の下でこの部品を import している所は無い (字句で見た指定子・完全な禁止の検査ではない)・router は 503 の封じ込めのまま', async () => {
-  const hits = APPS_JS.filter((p) => !p.pathname.endsWith('/profit/render-metrics.mjs') && importsRenderMetrics(fs.readFileSync(p, 'utf8'))).map((p) => p.pathname);
-  assert.deepEqual(hits, []);
+await t('apps の下で render-metrics の名前が出るのは一覧のファイルのコメントだけ (完全な禁止の検査ではない)・router は 503 の封じ込めのまま', async () => {
+  assert.deepEqual(renderMetricsNameProblems(appsFiles()), []);
   const router = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
   assert.match(router, /router\.get\(`\/amazon-profit\/\$\{kind\}`, requireSyncKey, \(req, res\) => res\.status\(503\)\.json\(PROFIT_ROUTE_DISABLED\)\)/);
 });
