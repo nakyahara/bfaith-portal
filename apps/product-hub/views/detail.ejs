@@ -5219,7 +5219,7 @@ th.attr-unknown { color: #dc2626; }
       //    人がその便を選び直したときだけ、今までどおり 0円 で計算する
       if (!(ship > 0) && !shipIsPersonsChoice) {
         if (figs) figs.hidden = true;
-        body.textContent = '配送費が決まっていません (NE の送料が 0円 です) — 下で配送方法を選び直すか、NE の送料を直してください';
+        body.textContent = '配送費が 0円 のため利益を出していません — 下で配送方法を選び直すか、NE の送料を直してください';
         return;
       }
       const price = Number(priceInput.value);
@@ -5360,12 +5360,21 @@ th.attr-unknown { color: #dc2626; }
             // 🚨 配送方法が違う記録は**消す** (無視するだけだと、別のタブで配送方法を戻した
             //    ときに古い選択が復活して利益が勝手に変わる — Codex R15 P2)
             if (String(d.group ?? '') !== String(group)) { forget(); return null; }
-            // kind: manual = 人が選び直した / carry = 当てはまる便が無いので残した
-            return { method: String(d.method || ''), kind: d.kind === 'carry' ? 'carry' : 'manual' };
+            // kind: manual = 人が選び直した / carry = 当てはまる便が無いので残した。
+            // cost = 選んだときの送料 (あとで NE 同期で変わったら「その人が選んだ額」ではない)
+            return {
+              method: String(d.method || ''), kind: d.kind === 'carry' ? 'carry' : 'manual',
+              cost: d.cost == null || d.cost === '' ? null : Number(d.cost),
+            };
           } catch (_) { return null; }   // 使えない環境は覚えないだけ
         },
-        remember(method, group, kind) {
-          try { store.setItem(key, JSON.stringify({ method, group, kind: kind === 'carry' ? 'carry' : 'manual', at: Date.now() })); }
+        remember(method, group, kind, cost) {
+          try {
+            store.setItem(key, JSON.stringify({
+              method, group, kind: kind === 'carry' ? 'carry' : 'manual',
+              cost: cost == null ? null : Number(cost), at: Date.now(),
+            }));
+          }
           catch (_) {
             // 🚨 書けなかったら**古い記憶を消す** (Codex R8 P3)。残すと、容量超過のあとで
             //    読み直したときに「前に選んだ別の便」へ勝手に戻る (いま選んだ便でもない)
@@ -5454,8 +5463,12 @@ th.attr-unknown { color: #dc2626; }
         //    現れたときだけ掃除し忘れて、あとで復活する (Codex R22 P2)
         if (rem && rem.kind === 'carry' && follow && data.picks?.[group]) mine.forget();
         followed = d.followed;
-        // 覚えていた「人の選択」を戻したときは、人が選んだものとして扱う (0円でも出す)
-        shipIsPersonsChoice = !!(rem && rem.kind === 'manual' && d.method === rem.method);
+        // 覚えていた「人の選択」を戻したときは、人が選んだものとして扱う (0円でも出す)。
+        // 🚨 ただし**選んだときの送料と同じ**ときだけ。あとで NE 同期で 0円 に変わった便を
+        //    「人が 0円 を選んだ」と誤解して利益を出さない (Codex R28 P1)
+        const nowCost = Number(data.options.find((o) => o.method === d.method)?.cost);
+        shipIsPersonsChoice = !!(rem && rem.kind === 'manual' && d.method === rem.method
+          && rem.cost != null && Number(rem.cost) === nowCost);
         sel.value = d.method;
         apply();
       }
@@ -5478,7 +5491,7 @@ th.attr-unknown { color: #dc2626; }
       sel.addEventListener('change', () => {
         followed = null;
         shipIsPersonsChoice = true;   // 人が選んだ = 0円でもその人の判断で計算する
-        mine.remember(sel.value, groupOf());
+        mine.remember(sel.value, groupOf(), 'manual', Number(sel.selectedOptions[0]?.dataset.cost));
         apply();
       });
       let lastGroup = groupOf();
@@ -5496,7 +5509,9 @@ th.attr-unknown { color: #dc2626; }
           // 🚨 当てはまる便が無くて**選択を残した**ときは、新しい配送方法と組にして覚える。
           //    覚えないと、そのまま保存して読み直したときに NE の送料へ戻り、
           //    利益が勝手に良くなる (Codex R12 P2)
-          if (followed && !followed.pick) mine.remember(sel.value, groupOf(), 'carry');
+          if (followed && !followed.pick) {
+            mine.remember(sel.value, groupOf(), 'carry', Number(sel.selectedOptions[0]?.dataset.cost));
+          }
         });
       }
       // 🚨 開いたときも保存されている楽天の配送方法に合わせる。中原さんの報告は

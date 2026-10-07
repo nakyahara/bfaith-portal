@@ -10989,12 +10989,31 @@ for (const [name, file, data] of renders) {
       labels, hints, neCurrent: 'ゆうパック60サイズ', rkValue: '4', ship: '0',
     });
     check('🚨 画面の試算: NE の送料が 0円 の商品は利益を出さず「配送費が決まっていません」と書く',
-      mz0.figs.hidden === true && mz0.body.textContent.includes('配送費が決まっていません (NE の送料が 0円 です)'),
+      mz0.figs.hidden === true && mz0.body.textContent.includes('配送費が 0円 のため利益を出していません'),
       mz0.body.textContent);
     // 人がその便を選び直したら、その人の判断として 0円 で計算する (決定 C)
     mz0.pick('ゆうパック60サイズ');
     check('画面の試算: 人がその 0円 の便を選んだら、今までどおり計算する (1,074円)',
       mz0.profit() === '1,074円' && mz0.figs.hidden === false, mz0.profit() + ' / ' + mz0.body.textContent);
+  }
+
+  // ⑪'' 🚨 正額で選んだ便が、あとで NE 同期で 0円 になったら「人が 0円 を選んだ」とみなさない
+  {
+    const st9 = fakeStore();
+    const a9 = mount({ ...base0, rkValue: '1', store: st9 });
+    a9.pick('定形外規格外（1kg以内）');            // 510円 のときに人が選んだ
+    check('画面の試算: 選んだときの送料も覚える', JSON.parse(st9.raw || '{}').cost === 510, String(st9.raw));
+    const zeroed = options.map((o) => (o.method === '定形外規格外（1kg以内）' ? { ...o, cost: 0 } : o));
+    const b9 = mount({
+      options: zeroed, picks: vari.profitShipPickByGroup(zeroed, hints, labels),
+      near: vari.profitShipNearByGroup(zeroed, hints, labels),
+      labels, hints, neCurrent: 'ネコポス', rkValue: '1', store: st9,
+    });
+    check('🚨 画面の試算: 選んだ便が 0円 に変わっていたら利益を出さない (「0円を選んだ」とみなさない)',
+      b9.figs.hidden === true && b9.body.textContent.includes('配送費が 0円 のため利益を出していません'),
+      b9.body.textContent);
+    b9.pick('定形外規格外（1kg以内）');            // いまの 0円 を人が選び直せば出す
+    check('画面の試算: いまの 0円 を人が選び直したら計算する (1,074円)', b9.profit() === '1,074円', b9.profit());
   }
 
   // ⑫ 🚨 覚え書きの鍵は「商品 × 人」。描いた画面の data-who がそのまま鍵に入る
@@ -13630,15 +13649,22 @@ for (const [name, file, data] of renders) {
   //    配線はソース検査で、決め方と文言は下の切り出しで**入力→出力**で確かめる
   check('配送費の試算: 楽天の配送方法を変えたら、候補を組み直して試算もその配送方法に合わせる',
     /rkShip\.addEventListener\('change', \(\) => \{[\s\S]{0,600}build\(\{ follow: true \}\);/.test(sim)
-    && /followed = d\.followed;[\s\S]{0,250}sel\.value = d\.method;[\s\S]{0,40}apply\(\);/.test(sim));
+    && /followed = d\.followed;[\s\S]{0,600}sel\.value = d\.method;[\s\S]{0,40}apply\(\);/.test(sim));
   check('🚨 配送費の試算: 開いたときも保存済みの配送方法に合わせる (保存すると画面は丸ごと読み直される)',
     /\n      build\(\{ follow: true \}\);/.test(sim));
   check('配送費の試算: 試算のプルダウンを自分で選び直したら、合わせた注記は消えて選択を覚える',
-    /sel\.addEventListener\('change', \(\) => \{\s*followed = null;\s*shipIsPersonsChoice = true;[\s\S]{0,80}mine\.remember\(sel\.value, groupOf\(\)\);\s*apply\(\);\s*\}\)/.test(sim));
+    /sel\.addEventListener\('change', \(\) => \{\s*followed = null;\s*shipIsPersonsChoice = true;[\s\S]{0,140}mine\.remember\(sel\.value, groupOf\(\), 'manual', Number\(sel\.selectedOptions\[0\]\?\.dataset\.cost\)\);\s*apply\(\);\s*\}\)/.test(sim));
   // 🚨 人が選んでいない 0円 の送料で利益を出さない (NE の送料が未入力の商品 — Codex R27 P1)
   check('🚨 配送費の試算: 人が選んでいない 0円 の配送費では利益を出さない',
     /if \(!\(ship > 0\) && !shipIsPersonsChoice\)/.test(sim)
-    && /配送費が決まっていません \(NE の送料が 0円 です\)/.test(sim));
+    && /配送費が 0円 のため利益を出していません/.test(sim));
+  // 🚨 試算のプルダウンの値が楽天の保存 payload に混ざらないこと (混ぜると出品内容が変わる)
+  {
+    const collect = src.slice(src.indexOf('function collectRakutenFields('));
+    const body = collect.slice(0, collect.indexOf('\n  }') + 4);
+    check('🚨 配送費の試算: 楽天項目の収集は試算のプルダウンを読まない (保存に混ざらない)',
+      !/profit-ship/.test(body) && !/profitShip/.test(body), String(body.length));
+  }
   check('🚨 配送費の試算: ヤフーだけ変えた (1 → 1y5) ときは合わせ直さず、注記だけ描き直す',
     /if \(g === lastGroup\) \{ apply\(\); return; \}/.test(sim));
   check('配送費の試算: 注記の配送方法名は楽天の正規ラベル (複合選択肢の長い名前にしない)',
@@ -13653,7 +13679,7 @@ for (const [name, file, data] of renders) {
   // 🚨 別のタブで配送方法を変えて保存されたら、古い試算選択は捨てる (Codex R6 P2)
   check('🚨 配送費の試算: 覚えるのは「どの配送方法のときの選択か」まで (別タブの変更に負ける)',
     /const rem = mine\.read\(group\);/.test(sim) && /remembered: rem,/.test(sim)
-    && /mine\.remember\(sel\.value, groupOf\(\)\)/.test(sim));
+    && /mine\.remember\(sel\.value, groupOf\(\), 'manual'/.test(sim));
   // 🚨 同じタブでログアウト→別の人が入ったとき、前の人の試算の選択を効かせない
   check('🚨 配送費の試算: 覚え書きの鍵に「誰の選択か」が入っている (利用者が交代しても混ざらない)',
     /'ph-profit-ship:<%= draft\.id %>:' \+ MINE_WHO/.test(sim)
@@ -13811,6 +13837,9 @@ for (const [name, file, data] of renders) {
       m.remember('定形外規格外（1kg以内）', '1');
       check('覚え書き: 同じ配送方法なら覚えた便を返す',
         m.read('1')?.method === '定形外規格外（1kg以内）' && m.read('1')?.kind === 'manual', String(st.raw));
+      m.remember('定形外規格外（1kg以内）', '1', 'manual', 510);
+      check('🚨 覚え書き: 選んだときの送料も覚える (あとで 0円 に変わったのを見分けるため)',
+        m.read('1')?.cost === 510, String(st.raw));
       check('🚨 覚え書き: 別の配送方法のときの選択は使わず、記録そのものを消す',
         m.read('5') === null && st.raw === null, String(st.raw));
       m.remember('ネコポス', '1', 'carry');
