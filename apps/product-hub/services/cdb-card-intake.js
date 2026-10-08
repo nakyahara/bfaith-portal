@@ -60,13 +60,15 @@ function checkPayload(event) {
   if (p.schema !== event.schema_version) throw fail('payload の版が知らせの版と違う');
   const skuId = Number(event.sku_id);
   if (!/^[1-9][0-9]{0,15}$/.test(String(event.sku_id ?? '')) || !Number.isSafeInteger(skuId)) throw fail(`知らせの SKU の番号が不正: ${event.sku_id}`);
+  // 🆕 0064 (Company DB構想 20 §③): 大文字も使える。カードの ne_code = 打ったとおり (原文)・カードを探す鍵 = 小文字 (LOWER(TRIM(ne_code)) と同じ)
   const code = String(p.code ?? '').trim();
-  if (!/^[a-z0-9_-]{1,30}$/.test(code)) throw fail(`商品コードが不正: ${p.code}`);
+  if (!/^[A-Za-z0-9_-]{1,30}$/.test(code)) throw fail(`商品コードが不正: ${p.code}`);
+  const codeKey = code.toLowerCase();
   const name = String(p.name ?? '').trim();
   if (!name) throw fail('名前が空');
   const eventId = String(event.event_id ?? '');
   if (!/^[0-9a-f-]{36}$/.test(eventId)) throw fail(`event_id が不正: ${event.event_id}`);
-  return { p, skuId, code, name, eventId };
+  return { p, skuId, code, codeKey, name, eventId };
 }
 
 /**
@@ -74,10 +76,10 @@ function checkPayload(event) {
  * 失敗 (SQLite の誤り・不正な payload) は throw = Postgres 側で failed (後でもう一度)
  */
 export function applyCdbCardEvent(event, { db = getDB() } = {}) {
-  const { p, skuId, code, name, eventId } = checkPayload(event);
+  const { p, skuId, code, codeKey, name, eventId } = checkPayload(event);
   return db.transaction(() => {
-    // 同じ商品コードのカードを最初に全部数える (一意の index が無い DB でも 2 枚以上を 1 枚と見ない。前の答えを使い回す前にも見る)
-    const ids = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(code).map((x) => x.id);
+    // 同じ商品コードのカードを最初に全部数える (一意の index が無い DB でも 2 枚以上を 1 枚と見ない。前の答えを使い回す前にも見る)。鍵 = 小文字 (大文字小文字だけ違うカードも同じコード)
+    const ids = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(codeKey).map((x) => x.id);
     const seen = db.prepare('SELECT * FROM ph_cdb_card_events WHERE event_id = ?').get(eventId);
     const record = (outcome, draftId, conflictId, ship) => db.prepare(`
       INSERT INTO ph_cdb_card_events (event_id, cdb_sku_id, ne_code, outcome, draft_id, conflict_draft_id, shipping_status, shipping_code, shipping_method)
@@ -248,16 +250,16 @@ function fillEmptyCardFields(db, id, p) {
  * 戻り値 { outcome: 'linked', draft_id, already, applied: [欄], not_applied: [{ field, label, card, entered }] }
  */
 export function linkCdbCardToExisting(event, { draftId, actor = ACTOR, db = getDB() } = {}) {
-  const { skuId, code, eventId } = checkPayload(event);
+  const { skuId, code, codeKey, eventId } = checkPayload(event);
   const id = Number(draftId);
   if (!Number.isSafeInteger(id) || id <= 0) throw fail(`結ぶカードの番号が不正: ${draftId}`);
   return db.transaction(() => {
     const d = db.prepare('SELECT id, ne_code, cdb_sku_id FROM product_drafts WHERE id = ?').get(id);
     if (!d) throw fail(`カード #${id} がもうありません`);
-    if (String(d.ne_code || '').trim().toLowerCase() !== code) throw fail(`カード #${id} の商品コード (${d.ne_code}) が ${code} と違います`);
+    if (String(d.ne_code || '').trim().toLowerCase() !== codeKey) throw fail(`カード #${id} の商品コード (${d.ne_code}) が ${code} と違います`);
     if (d.cdb_sku_id != null && Number(d.cdb_sku_id) !== skuId) throw fail(`カード #${id} はもう別の商品 (SKU ${d.cdb_sku_id}) に結ばれています`);
     // 同じ商品コードのカードが、このカードの 1 枚だけか (一意の index が無い DB でも = 取引の中で全部数える。PR #1566 Codex R2 Medium)
-    const same = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(code).map((x) => x.id);
+    const same = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(codeKey).map((x) => x.id);
     if (same.length !== 1 || same[0] !== id) {
       throw Object.assign(fail(`同じ商品コード ${code} のカードが product-hub に ${same.length} 枚 (${same.map((x) => '#' + x).join('・')}) あります。どれに結ぶか決められないので結びません (1 枚に片付けてから)`),
         { ambiguous: true, draft_ids: same });

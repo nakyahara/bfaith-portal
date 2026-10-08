@@ -665,11 +665,13 @@ await ta('[7] 形の誤り (400): 名前・売価・税率・分類・月数・�
   assert.equal(e.extra.field, 'shipping_code');
 });
 
-await ta('[7] 新しい商品コードの形 (⑤-2 で使う): 小文字の英数字・- _・30 字まで・大文字は禁止・前後の空白・SET- で始まらない', () => {
-  for (const ok of ['abc-01', 'a_b', '0', 'x'.repeat(30)]) assert.deepEqual(W.validateNewSkuCode(ok), { ok: true, code: ok, message: null }, ok);
+await ta('[7] 新しい商品コードの形 (⑤-2 で使う): 英数字 (🆕 0064 = 大文字も・打ったとおりを返す)・- _・30 字まで・前後の空白・set- で始まらない (大文字小文字を問わず)', () => {
+  for (const ok of ['abc-01', 'a_b', '0', 'x'.repeat(30), 'Abc', 'ABC-01', 'hakama-WH-90', 'X'.repeat(30), 'Set_1', 'sets-1']) assert.deepEqual(W.validateNewSkuCode(ok), { ok: true, code: ok, message: null }, ok);
   const bad = (v, re) => { const r = W.validateNewSkuCode(v); assert.equal(r.ok, false, String(v)); assert.match(r.message, re); };
-  bad('', /入れて/); bad(null, /入れて/); bad(' abc', /空白/); bad('Abc', /大文字/); bad('ABC-01', /大文字/);
-  bad('abc 01', /使える文字/); bad('ａｂｃ', /使える文字/); bad('x'.repeat(31), /30 字/); bad('abc.01', /使える文字/); bad('set-abc', /set-/);
+  bad('', /入れて/); bad(null, /入れて/); bad(' abc', /空白/); bad('ABC ', /空白/);
+  bad('abc 01', /使える文字/); bad('ａｂｃ', /使える文字/); bad('ＡＢＣ', /使える文字/); bad('x'.repeat(31), /30 字/); bad('X'.repeat(31), /30 字/); bad('abc.01', /使える文字/);
+  bad('set-abc', /set-/); bad('SET-abc', /set-/); bad('Set-ABC', /set-/);
+  assert.equal(W.NEW_SKU_CODE_RE.source, '^[A-Za-z0-9_-]{1,30}$', 'DB (0064 の ops.new_sku_code_problem・ops.ne_reg_build) と同じ形');
 });
 
 console.log('\nセットの導く値');

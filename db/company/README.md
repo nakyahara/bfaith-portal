@@ -2363,3 +2363,12 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - `ops.transition_sku_registration` に「draft → ne_pending を照合の確かめ (system・ne_compare) で」の道だけ足す (根拠 = 申告なしの verified の確かめ・同じ照合の回・配った後の取得。関数が自分で読む)
 - 品目の状態の地図に issued → verified / partial。`ck_nri_declared` = import_declared だけ申告の試みが要る (前からの行は満たす)
 - 当て方 (🚨 まだ流さない): コードを先に出しても壊れない (0063 の前の DB = 今までどおり in_ne_undeclared を残すだけ・要約の ℹ️ は出ない) が、画面は「申告しなくてよい」と書く = **migration は Render のデプロイと同じ日に** → `migrate.mjs --dry-run` (0063 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい (新しい関数 `ops.ne_reg_auto_block` はだれにも渡さない = migration が public から外す・照合の確かめの grant は migration が流し直す)
+### 新しい商品コードに大文字も使える (0064・2026-10-08 夜 中原さんの答え 9 = b。Company DB構想 20 §③・§⑩ PR-1。番号 = 0063 の後・マージの順で振り直す)
+
+- 決まり = **中の鍵は norm (小文字)・外へは打ったとおり (原文)**。形 = `^[A-Za-z0-9_-]{1,30}$`・`set-` で始めない (大文字小文字を問わず)・前後の空白なし。例 `hakama-WH-90` (NE の「選択肢つき商品の登録」= 代表 + 選択肢番号)
+  - 重なりの確かめ (Company DB の SKU・product の display_code・NE で見たコード・消した SKU のコード)・新しいコードの鍵 (`core.new_code:<norm>`)・product-hub のカードを探す鍵 = norm のまま
+  - core.skus.code / products.display_code・NE 登録の CSV の syohin_code・品目の ne_code・カードの知らせの code・product-hub のカードの ne_code = 原文。NE の取得は今までどおり小文字で持ち、元の書き方は 0041 の `ops.master_ne_codes` (ロジザード用 CSV・入荷予定はそこから書く = NE に入る前は出さない)
+- `ops.ne_reg_export_items.ne_code` の CHECK (0053 = 小文字だけ) を `ck_nri_ne_code` = `^[A-Za-z0-9_-]{1,30}$` かつ `lower(ne_code) = code_norm` に (0041 の ne_csv_export_rows と同じ形)。前からの行は満たす (満たさない行があれば migration が先に止まる)
+- `ops.new_sku_code_problem`・`ops.ne_reg_build` (どちらも 0058 の版) を create or replace。0058 の本文との差は形の行 1 行 + 注記 1 行だけ (`scripts/test-master-register.mjs` の [G-0064] が機械で確かめる)。署名・security definer・search_path・権限は同じ
+- アプリ: `validateNewSkuCode` (lib/master-write.mjs)・`NEW_CODE_RE` (lib/master-reg-csv.mjs)・新商品の画面 (me-new.js・new.ejs)・product-hub のカードの取り込み (`cdb-card-intake.js` = 原文で作り・小文字で探す)・つかいかた。契約の試験 = `scripts/test-master-reg-csv.mjs` の [U1] (登録 → カード → CSV → NE の取得 (0041) → 3 者一致 → ロジザード用 CSV・入荷予定)
+- 当て方 (🚨 まだ流さない): どちらが先でも壊れない (コードが先 = 大文字は DB が `code_shape` で断る = 画面は 409 で何も書かない / migration が先 = 画面・API が先に断る) → `migrate.mjs --dry-run` (0064 だけが出る) → 中原さんの OK → 本適用 → Render のデプロイ。ロールの script は流し直さなくてよい
