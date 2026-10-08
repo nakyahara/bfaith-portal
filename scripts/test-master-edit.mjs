@@ -74,6 +74,8 @@ const rejectsWith = async (p, status, reason) => {
 };
 const pgCode = async (p) => { try { await p; return 'ok'; } catch (e) { return e.code || e.message; } };
 /** 一覧の HTML の、その商品の行の data-col の欄の字 (タグを除く)。列の位置に頼らない */
+/** 一覧の見出しの列の並び (data-c = 列の id。出さない列 (hidden) も入る) */
+const headIds = (html) => [...(/<thead>([\s\S]*?)<\/thead>/.exec(html) || ['', ''])[1].matchAll(/<th [^>]*data-c="([^"]+)"/g)].map((m) => m[1]);
 const colCell = (html, code, col) => {
   const tr = html.split('<tr>').find((x) => x.includes(`href="sku/${code}"`));
   assert.ok(tr, `一覧に ${code} の行が無い`);
@@ -1426,6 +1428,12 @@ const pgFactory = async (url) => {
 __setPgClientFactory(pgFactory);
 __setClock(() => NOW.getTime());
 __setShippingRatesProvider(async () => RATES);   // 持ち主表 = DB の active (広げる道 PR-2・openCutover が ALL_COMPANY にした)
+{
+  // 一覧の列の設定 (10/8 PR1・人ごと) の置き場 = 使い捨ての SQLite (本番 = Render の warehouse-mirror.db)。列の設定そのものの試験は test-master-list.mjs
+  const { default: Database } = await import('better-sqlite3');
+  const prefsDb = new Database(':memory:');
+  (await import('../apps/master-edit/view-prefs.mjs')).__setViewPrefsDbProvider(async () => prefsDb);
+}
 const app = express();
 app.set('view engine', 'ejs');
 app.use((req, res, next) => {
@@ -2121,7 +2129,12 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   const listOrder = (html) => [...html.matchAll(/<a class="rowlink" href="sku\/([^"]+)"/g)].map((m) => decodeURIComponent(m[1]));
   // ── 区分の列 (単品 / セット (構成品の数) / 例外)・区分の札で絞った一覧と同じ ──
   let r = await call('GET', '/');
-  assert.match(r.text, /<th scope="col" style="width:74px" id="th-kind">区分<\/th><th scope="col" style="width:150px">状態<\/th>/, '区分は名前の後・状態の前');
+  {
+    // 10/8 PR1: 見出しは列の設定で描く (見出しを押すと並び替え = リンク)。いつもの列の並び = 名前 → 区分 → 状態
+    const ids = headIds(r.text);
+    assert.deepEqual([ids.indexOf('kind') - ids.indexOf('name'), ids.indexOf('state') - ids.indexOf('kind')], [1, 1], '区分は名前の後・状態の前');
+    assert.match(r.text, /<th scope="col" class="sortable" style="width:74px" data-c="kind" id="th-kind"><a class="sorth" href="\?sort=kind" title="押すと 区分の単品 → セット → 例外 \(全件で並べ替え\)"><span class="lbl">区分<\/span>/);
+  }
   assert.equal(colCell(r.text, 's001', 'kind'), '単品');
   assert.match(colCell(r.text, 'set001', 'kind'), /^セット \d+ 品$/);
   const allCodes = listOrder(r.text);
@@ -2138,7 +2151,8 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   const kinds = byKind.map((c) => colCell(r.text, c, 'kind').split(' ')[0]);
   const rank = { 単品: 0, セット: 1, 例外: 2 };
   for (let i = 1; i < kinds.length; i++) assert.ok(rank[kinds[i - 1]] < rank[kinds[i]] || (rank[kinds[i - 1]] === rank[kinds[i]] && byKind[i - 1] < byKind[i]), `${byKind[i - 1]} → ${byKind[i]}`);
-  assert.match(r.text, /<b aria-current="true">区分の順 \(単品・セット・例外\)<\/b>/);
+  assert.match(r.text, /並び: <b>区分<\/b> 単品 → セット → 例外<\/span>/);
+  assert.match(r.text, /data-c="kind" aria-sort="ascending" id="th-kind"><a class="sorth" href="\?sort=kind&amp;dir=desc"/, '並べている見出し = aria-sort・もう一度押すと逆の順');
   // コードのコピーのボタン (行ごと・読み上げの名前)・全部コピー・CSV のリンク (今の絞り込みのまま。offset は付けない)
   r = await call('GET', '/?kind=single&sort=kind&offset=0');
   assert.match(r.text, /<a class="rowlink" href="sku\/s001">s001<\/a><button type="button" class="copybtn" data-copy="s001" aria-label="商品コード s001 をコピー" title="コピー">/);
@@ -2260,7 +2274,12 @@ await ta('[20] 利益 (1 個あたり・参考・10/6): 一覧の列・並び (�
   const rowHtml = (html, code) => html.split('<tr>').find((x) => x.includes(`href="sku/${code}"`));
   // ── 一覧の列 ──
   let r = await call('GET', '/');
-  assert.match(r.text, /<th scope="col" class="n" style="width:74px">税<\/th><th scope="col" class="n" style="width:92px" id="th-profit" title="[^"]*売価の 10%[^"]*">利益<span class="thsub">1 個・参考<\/span><\/th><th scope="col" class="n" style="width:74px" id="th-profit-rate">利益率<\/th>/, '利益・利益率の列は税の後');
+  {
+    const ids = headIds(r.text);
+    assert.deepEqual([ids.indexOf('profit') - ids.indexOf('tax'), ids.indexOf('rate') - ids.indexOf('profit')], [1, 1], '利益・利益率の列は税の後');
+    assert.match(r.text, /<th scope="col" class="n sortable" style="width:92px" title="[^"]*売価の 10%[^"]*" data-c="profit" id="th-profit"><a class="sorth" href="\?sort=profit" title="押すと 利益の小さい順 \(全件で並べ替え\) · [^"]*"><svg class="ic arr" aria-hidden="true"><use href="#i-sortup"\/><\/svg><span class="lbl">利益<span class="thsub">1 個・参考<\/span><\/span><\/a><\/th>/);
+    assert.match(r.text, /data-c="rate" id="th-profit-rate"><a class="sorth" href="\?sort=rate"/);
+  }
   const codes = listOrder(r.text);
   assert.ok(codes.length >= 8);
   let nNone = 0; let nTmp = 0;
@@ -2287,9 +2306,9 @@ await ta('[20] 利益 (1 個あたり・参考・10/6): 一覧の列・並び (�
   assert.ok(noCost, '原価の無い商品がある');
   assert.match(rowHtml(r.text, noCost), /title="原価が未登録なので計算できません"/);
   // ── 並び: 利益の少ない順・利益率の低い順 (計算できない = 最後・その中はコード順) ──
-  for (const [sort, key, label] of [['profit_asc', 'profit', '利益の少ない順'], ['rate_asc', 'rate', '利益率の低い順']]) {
+  for (const [sort, key, label] of [['profit_asc', 'profit', '利益'], ['rate_asc', 'rate', '利益率']]) {
     r = await call('GET', '/?sort=' + sort);
-    assert.match(r.text, new RegExp(`<b aria-current="true">${label}</b>`));
+    assert.match(r.text, new RegExp(`並び: <b>${label}</b> 小さい順</span>`), '古い URL (profit_asc・rate_asc) = 小さい順に読み替える');
     const ord = listOrder(r.text);
     assert.deepEqual([...ord].sort(), [...codes].sort(), `${sort}: 同じ商品・並びだけ違う`);
     const vals = ord.map((c) => (hand.get(c) ? hand.get(c)[key] : null));
@@ -2305,7 +2324,7 @@ await ta('[20] 利益 (1 個あたり・参考・10/6): 一覧の列・並び (�
     assert.ok(ordSingle.length >= 3);
     assert.deepEqual(ordSingle, ord.filter((c) => ordSingle.includes(c)));
   }
-  assert.equal(R.normalizeFilters({ sort: 'profit_asc' }).sort, 'profit_asc');
+  assert.deepEqual([R.normalizeFilters({ sort: 'profit_asc' }).sort, R.normalizeFilters({ sort: 'profit_asc' }).dir], ['profit', ''], '古い URL = 利益の小さい順');
   assert.equal(R.normalizeFilters({ sort: 'profit_desc' }).sort, '', '知らない並びは捨てる');
   // ── CSV の 2 列 (一覧と同じ数・計算できない = 空・並びも同じ) ──
   const got = await fetch(BASE + '/list.csv?sort=profit_asc', { headers: { 'x-test-session': 'editor' } });

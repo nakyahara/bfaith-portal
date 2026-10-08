@@ -77,7 +77,8 @@ await ta('[P] NE の作成日の読み方 (形・無い日付・2000 年より�
   assert.equal(listOrderBy('reg_desc', { hasColumn: false }), 's.code_norm');
   assert.equal(listOrderBy('x'), 's.code_norm');
   assert.equal(listOrderBy('kind', { hasColumn: false }), "case s.sku_kind when 'single' then 0 when 'set' then 1 else 2 end, s.code_norm", '区分の順は登録日の列が無くても使える');
-  assert.equal(R.normalizeFilters({ sort: 'reg_desc' }).sort, 'reg_desc');
+  // 10/8 PR1: 並びは列の id + 向き。古い URL の reg_desc = 登録日の新しい順に読み替える
+  assert.deepEqual([R.normalizeFilters({ sort: 'reg_desc' }).sort, R.normalizeFilters({ sort: 'reg_desc' }).dir], ['reg', 'desc']);
   assert.equal(R.normalizeFilters({ sort: 'constructor' }).sort, '');
   assert.equal(R.normalizeFilters({}).sort, '');
 });
@@ -339,17 +340,18 @@ await ta('[V1] 一覧の「登録日の新しい順」: 新しい順・空は最
 await ta('[V2] 一覧の画面: 登録日の列 (出どころは title)・並びの切り替え・絞り込みに並びが残る', async () => {
   let r = await get('/');
   assert.equal(r.status, 200);
-  assert.ok(r.text.includes('<th scope="col" style="width:96px">登録日</th>'));
-  assert.ok(r.text.includes('<td class="muted" title="NE の作成日">2024/03/15</td>'), '登録日の列');
-  assert.ok(r.text.includes('<td class="muted">—</td>'), '分からない登録日 = —');
-  assert.ok(r.text.includes('<b aria-current="true">コード順</b>') && r.text.includes('<a href="?sort=reg_desc">登録日の新しい順</a>'));
+  assert.ok(r.text.includes('<th scope="col" class="sortable" style="width:96px" data-c="reg"><a class="sorth" href="?sort=reg" title="押すと 登録日の古い順 (全件で並べ替え)">'), '登録日の見出し = 押すと並び替え (10/8 PR1)');
+  assert.ok(r.text.includes('<td class="muted" data-col="reg" title="NE の作成日">2024/03/15</td>'), '登録日の列');
+  assert.ok(r.text.includes('<td class="muted" data-col="reg">—</td>'), '分からない登録日 = —');
+  assert.ok(r.text.includes('並び: <b>コード</b> 0→9・A→Z の順</span>'));
   assert.ok(r.text.indexOf('sku/r001') < r.text.indexOf('sku/r010'));
   assert.ok(r.text.includes('title="ポータルで登録"') && r.text.includes('title="夜間ロードで初めて見た日"'));
-  r = await get('/?sort=reg_desc&kind=single');
-  assert.ok(r.text.includes('<b aria-current="true">登録日の新しい順</b>') && r.text.includes('<a href="?kind=single">コード順</a>'));
+  r = await get('/?sort=reg_desc&kind=single');   // 古い URL = 登録日の新しい順
+  assert.ok(r.text.includes('並び: <b>登録日</b> 新しい順</span>') && r.text.includes('data-c="code"><a class="sorth" href="?kind=single"'));
+  assert.ok(r.text.includes('data-c="reg" aria-sort="descending"><a class="sorth" href="?kind=single&amp;sort=reg"'), 'もう一度押すと古い順');
   assert.ok(r.text.indexOf('sku/r010') < r.text.indexOf('sku/r001') && r.text.indexOf('sku/r001') < r.text.indexOf('sku/r003'));
-  assert.ok(r.text.includes('<input type="hidden" name="sort" value="reg_desc">'), '検索の欄・もっと絞るの form が並びを残す');
-  assert.ok(r.text.includes('href="?kind=set&amp;sort=reg_desc"') || r.text.includes('href="?sort=reg_desc&amp;kind=set"') || /href="\?[^"]*sort=reg_desc[^"]*"[^>]*>[^<]*<\/a>/.test(r.text), '札のリンクが並びを残す');
+  assert.ok(r.text.includes('<input type="hidden" name="sort" value="reg">') && r.text.includes('<input type="hidden" name="dir" value="desc">'), '検索の欄・もっと絞るの form が並びを残す');
+  assert.ok(/href="\?kind=set&(amp;)?sort=reg&(amp;)?dir=desc"/.test(r.text), '札のリンクが並びを残す');
 });
 
 await ta('[V3] 単品の画面の見出しに登録日と出どころ・分からない = —', async () => {
@@ -395,28 +397,29 @@ await ta('[C] 並び × ページ送り × 詳細検索: 登録日の新しい�
   let r = await get('/?' + new URLSearchParams({ name: 'ページ', reg_from: '2026-01-03', sort: 'reg_desc' }));
   assert.equal(r.status, 200);
   assert.deepEqual(codesOf(r.text), want.slice(0, 100));
-  assert.ok(r.text.includes('<b aria-current="true">登録日の新しい順</b>'));
+  assert.ok(r.text.includes('並び: <b>登録日</b> 新しい順</span>'));
   assert.ok(r.text.includes('id="adv-regdate"') && r.text.includes('name="reg_from" value="2026-01-03"'), '詳細検索の板に登録日の範囲');
   let next = nextOf(r.text);
-  assert.ok(next && /sort=reg_desc/.test(next) && /reg_from=2026-01-03/.test(next) && /offset=100/.test(next), next);
+  assert.ok(next && /sort=reg&dir=desc/.test(next) && /reg_from=2026-01-03/.test(next) && /offset=100/.test(next), next);
   r = await get('/' + next);
   assert.deepEqual(codesOf(r.text), want.slice(100));
   // 札のリンク・もっと絞るのフォーム・詳細検索のフォーム・絞る欄が並びを引き継ぐ
-  assert.ok(/<a class="chip[^"]*" href="\?[^"]*sort=reg_desc[^"]*"[^>]*>[^]*?セット/.test(r.text), '区分の札');
-  assert.equal((r.text.match(/<input type="hidden" name="sort" value="reg_desc">/g) || []).length, 3, '絞る欄・もっと絞る・詳細検索の 3 つのフォーム');
+  assert.ok(/<a class="chip[^"]*" href="\?[^"]*sort=reg&(amp;)?dir=desc[^"]*"[^>]*>[^]*?セット/.test(r.text), '区分の札');
+  assert.equal((r.text.match(/<input type="hidden" name="sort" value="reg">/g) || []).length, 3, '絞る欄・もっと絞る・詳細検索の 3 つのフォーム');
+  assert.equal((r.text.match(/<input type="hidden" name="dir" value="desc">/g) || []).length, 3, '向きも 3 つのフォームに');
   // 列: 登録日・在庫・(注文残)・対応が必要 が一緒に出る
-  assert.ok(/<th scope="col" style="width:96px">登録日<\/th>[^]*在庫<span class="thsub">/.test(r.text));
+  assert.ok(/<th [^>]*data-c="reg"[^]*在庫<span class="thsub">/.test(r.text));
   // ?s= の印 (長い詳細検索の条件): 並びは印の外の URL・登録日の範囲は印の中。ページ送りも印と並びを引き継ぐ
   const origin = new URL(BASE).origin;
   const pr = await fetch(BASE + '/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json', Origin: origin }, body: JSON.stringify({ name: 'ページ', reg_from: '2026-01-03', sort: 'reg_desc' }) });
   const pj = await pr.json();
   assert.equal(pr.status, 200, JSON.stringify(pj));
   const u = new URL(pj.url, BASE);
-  assert.deepEqual([u.searchParams.get('sort'), u.searchParams.get('reg_from'), u.searchParams.get('name'), !!u.searchParams.get('s')], ['reg_desc', null, null, true]);
+  assert.deepEqual([u.searchParams.get('sort'), u.searchParams.get('dir'), u.searchParams.get('reg_from'), u.searchParams.get('name'), !!u.searchParams.get('s')], ['reg', 'desc', null, null, true]);
   r = await get('/' + u.search);
   assert.deepEqual(codesOf(r.text), want.slice(0, 100));
   next = nextOf(r.text);
-  assert.ok(next && /[?&]s=/.test(next) && /sort=reg_desc/.test(next) && !/reg_from=/.test(next) && /offset=100/.test(next), next);
+  assert.ok(next && /[?&]s=/.test(next) && /sort=reg&dir=desc/.test(next) && !/reg_from=/.test(next) && /offset=100/.test(next), next);
   r = await get('/' + next);
   assert.deepEqual(codesOf(r.text), want.slice(100));
   // 印のときの「もっと絞る」は印と並びを引き継ぐ

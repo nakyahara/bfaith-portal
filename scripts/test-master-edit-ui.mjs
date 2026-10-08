@@ -207,6 +207,7 @@ const B = `http://127.0.0.1:${server.address().port}/apps/master-edit`;
 
 let passed = 0;
 async function ta(name, fn, viewport = { width: 1440, height: 900 }, scale = 1) {
+  if (process.env.MASTER_EDIT_UI_ONLY && !name.includes(process.env.MASTER_EDIT_UI_ONLY)) return;   // 1 つだけ流す (目で見る・直すとき)。CI では付けない
   const ctx = await browser.newContext({ viewport, deviceScaleFactor: scale, locale: 'ja-JP' });
   const p = await ctx.newPage();
   const errors = [];
@@ -695,7 +696,8 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td[data-col="po"]').count(), 0, '注文残のセルは描かない (隠すだけでなく)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
     // URL に po=1 を付けても、注文残のある商品だけに絞らない (どの商品に注文残があるかを出さない)
@@ -1590,8 +1592,9 @@ await ta('[50] 利益 (セット・10/6): セットの売価・セットの原�
   await p.goto(B + '/');
   const cell = (code, col) => p.evaluate(([c, k]) => { const a = [...document.querySelectorAll('#list-tbl a.rowlink')].find((x) => x.textContent === c); return a ? a.closest('tr').querySelector(`td[data-col="${k}"]`).textContent.replace(/\s+/g, ' ').trim() : null; }, [code, col]);
   assert.equal(await p.textContent('#th-profit'), '利益1 個・参考');
-  await Promise.all([p.waitForNavigation(), p.click('.tbl-top a:has-text("利益の少ない順")')]);
-  assert.match(p.url(), /sort=profit_asc/);
+  await Promise.all([p.waitForNavigation(), p.click('#th-profit a.sorth')]);   // 10/8 PR1: 見出しを押す = 利益の小さい順
+  assert.match(p.url(), /sort=profit(&|$)/);
+  assert.equal(await p.getAttribute('#th-profit', 'aria-sort'), 'ascending');
   assert.equal(await cell('z030', 'profit'), '237');
   assert.equal(await cell('z030', 'profit-rate'), '23.7%');
   assert.equal(await p.textContent('#list-tbl tbody tr:first-child a.rowlink'), 'z039', '赤字が一番上');
@@ -1682,6 +1685,134 @@ for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { wi
     assert.ok(sw <= cw + 1, `ページが横にはみ出さない ${sw} > ${cw}`);
   }, vp);
 }
+
+// ── 一覧の列・見出しの並び替え (10/8 PR1・見本 masterlist_mock)。MASTER_EDIT_UI_LIST_SHOTS=フォルダ = 見本と同じ状態の写しを残す (PR の目視用) ──
+const LIST_SHOTS = process.env.MASTER_EDIT_UI_LIST_SHOTS || '';
+const shownHeads = (p) => p.$$eval('#list-tbl thead th', (ths) => ths.filter((th) => !th.hidden).map((th) => th.getAttribute('data-c')));
+const prefsPost = (p, body) => p.evaluate(async (b) => { const r = await fetch('api/view-prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }); return { status: r.status, j: await r.json() }; }, body);
+const { DEFAULT_VIEW: LIST_DEFAULT } = await import('../apps/master-edit/list-columns.mjs');
+await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑↓ / つまみで並べ替え = 表がすぐ変わる・「未保存」・保存 → 別の窓 (別の PC) でも同じ・初期に戻す・Esc で閉じる', async (p) => {
+  await p.goto(B + '/');
+  assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);   // 前の試験の設定を消す
+  await p.goto(B + '/?q=' + encodeURIComponent('単品'));
+  assert.deepEqual(await shownHeads(p), LIST_DEFAULT.shown, 'いつもの列 (仕入先は出さない)');
+  assert.equal(await p.textContent('#colcnt'), '16/17');
+  assert.equal(await p.isVisible('#list-tbl tbody tr:first-child .sup-sub'), true, '仕入先の列が無い = 名前の下に「仕入先」');
+  // 板を開く: コードは外せない・↑↓ も押せない・FBA などは「並べられない」
+  await p.click('#colbtn');
+  assert.equal(await p.isVisible('#colpanel'), true);
+  assert.equal(await p.getAttribute('#colbtn', 'aria-expanded'), 'true');
+  assert.equal(await p.isDisabled('#collist li[data-id="code"] input'), true);
+  assert.equal(await p.isDisabled('#collist li[data-id="code"] [data-mv="1"]'), true);
+  assert.equal(await p.isDisabled('#collist li[data-id="name"] [data-mv="-1"]'), true, 'コードより上には行かない');
+  assert.match(await p.textContent('#collist li[data-id="fba"]'), /並べられない/);
+  assert.equal(await p.isDisabled('#cp-save'), true, '変えていない = 保存は押せない');
+  // 出さない: 状態 → 表から消える (見出しも行も)・「未保存」
+  await p.click('#collist li[data-id="state"] input');
+  assert.ok(!(await shownHeads(p)).includes('state'));
+  assert.equal(await p.isHidden('#list-tbl tbody tr:first-child td[data-col="state"]'), true);
+  assert.match(await p.getAttribute('#colbtn', 'class'), /unsaved/);
+  // 出す: 仕入先 → 表に出る・名前の下の「仕入先」の字は消える
+  await p.click('#collist li[data-id="sup"] input');
+  assert.ok((await shownHeads(p)).includes('sup'));
+  assert.equal(await p.isHidden('#list-tbl tbody tr:first-child .sup-sub'), true);
+  assert.match(await p.textContent('#list-tbl tbody tr:first-child td[data-col="sup"]'), /0001\s*AMC/);
+  // ↑ で仕入先をコードのすぐ後ろへ (押した後もそのボタンにフォーカス = 続けて押せる)
+  for (let i = 0; i < 20 && (await shownHeads(p))[1] !== 'sup'; i++) await p.click('#collist li[data-id="sup"] [data-mv="-1"]');
+  assert.deepEqual((await shownHeads(p)).slice(0, 3), ['code', 'sup', 'name']);
+  assert.equal(await p.evaluate(() => document.activeElement.closest('li')?.getAttribute('data-id')), 'sup');
+  assert.deepEqual(await p.$$eval('#list-tbl tbody tr:first-child td', (tds) => tds.filter((td) => !td.hidden).slice(0, 3).map((td) => td.getAttribute('data-col'))), ['code', 'sup', 'name'], '行のセルも同じ並び');
+  // つまみで動かす (売価を名前の前へ)
+  await p.dragAndDrop('#collist li[data-id="price"] .grip', '#collist li[data-id="name"]');
+  assert.deepEqual((await shownHeads(p)).slice(0, 4), ['code', 'sup', 'price', 'name']);
+  assert.equal(await p.textContent('#colcnt'), '16/17');
+  if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1280_cols.png` });
+  // 保存 → 「未保存」が消える・別の窓 (= 別の PC。同じログイン) で開いても同じ列
+  await p.click('#cp-save');
+  await p.waitForFunction(() => !document.querySelector('#colbtn').classList.contains('unsaved'));
+  assert.match(await p.textContent('#toast-t'), /列を保存しました \(中原 さんの設定 · 会社と家の PC で同じ\)/);
+  const want = await shownHeads(p);
+  const c2 = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'ja-JP' });
+  const p2 = await c2.newPage();
+  await p2.goto(B + '/');
+  assert.deepEqual(await shownHeads(p2), want, '別の窓でも同じ列 (サーバーに保存)');
+  assert.equal(await p2.evaluate(() => document.querySelector('#colbtn').classList.contains('unsaved')), false);
+  await c2.close();
+  // Esc で閉じる (列のボタンにフォーカスが戻る)
+  await p.keyboard.press('Escape');
+  assert.equal(await p.isHidden('#colpanel'), true);
+  assert.equal(await active(p), 'colbtn');
+  // 初期に戻す = いつもの列 (まだ保存していない) → 保存 = いつもの列 (設定を消す)
+  await p.click('#colbtn');
+  await p.click('#cp-reset');
+  assert.deepEqual(await shownHeads(p), LIST_DEFAULT.shown);
+  assert.match(await p.getAttribute('#colbtn', 'class'), /unsaved/);
+  await p.click('#cp-save');
+  await p.waitForFunction(() => !document.querySelector('#colbtn').classList.contains('unsaved'));
+  assert.match(await p.textContent('#toast-t'), /いつもの列にしました/);
+  await p.goto(B + '/');
+  assert.deepEqual(await shownHeads(p), LIST_DEFAULT.shown);
+  // 板の外を押すと閉じる
+  await p.click('#colbtn');
+  await p.mouse.click(5, 300);
+  assert.equal(await p.isHidden('#colpanel'), true);
+});
+await ta('[53] 一覧の見出しで並び替え (10/8 PR1): 押す = 全件で昇順 (aria-sort)・もう一度 = 降順・表の上の「並び」・横に送ってもコードの列が残る・行のどこを押しても開く (Ctrl = 別のタブ)', async (p, ctx) => {
+  await p.goto(B + '/?q=' + encodeURIComponent('単品'));
+  if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1280_list.png` });
+  await Promise.all([p.waitForNavigation(), p.click('#list-tbl th[data-c="name"] a.sorth')]);
+  assert.match(p.url(), /[?&]sort=name(&|$)/);
+  assert.equal(await p.getAttribute('#list-tbl th[data-c="name"]', 'aria-sort'), 'ascending');
+  assert.match(await p.textContent('#sortnow'), /並び: 名前 あいうえお・ABC 順/);
+  assert.equal(await p.locator('#list-tbl th[aria-sort]').count(), 1);
+  const names = await p.$$eval('#list-tbl tbody td[data-col="name"] .nm', (xs) => xs.map((x) => x.textContent));
+  assert.deepEqual(names, [...names].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), '名前の順 (文字の番号の順)');
+  await Promise.all([p.waitForNavigation(), p.click('#list-tbl th[data-c="name"] a.sorth')]);
+  assert.match(p.url(), /sort=name&dir=desc/);
+  assert.equal(await p.getAttribute('#list-tbl th[data-c="name"]', 'aria-sort'), 'descending');
+  assert.match(await p.textContent('#sortnow'), /並び: 名前 逆の順/);
+  // 原価の大きい順 (2 回押す)・絞り込みはそのまま
+  await Promise.all([p.waitForNavigation(), p.click('#list-tbl th[data-c="cost"] a.sorth')]);
+  await Promise.all([p.waitForNavigation(), p.click('#list-tbl th[data-c="cost"] a.sorth')]);
+  assert.match(p.url(), /sort=cost&dir=desc/);
+  assert.match(p.url(), /q=/);
+  const costs = await p.$$eval('#list-tbl tbody td[data-col="cost"]', (xs) => xs.map((x) => Number(x.textContent.replace(/[^0-9]/g, ''))));
+  assert.deepEqual(costs, [...costs].sort((a, b) => b - a), '原価の大きい順');
+  if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1280_sorted.png` });
+  // 横に送る: コードの列は左に残る・影が出る・送った列はコードの列の下を通る (塗ってある)
+  await p.setViewportSize({ width: 1024, height: 768 });
+  await p.$eval('#tblwrap', (w) => { w.scrollLeft = 600; w.dispatchEvent(new Event('scroll')); });
+  const [wl, cl, nl] = await p.evaluate(() => [document.querySelector('#tblwrap').getBoundingClientRect().left, document.querySelector('#list-tbl tbody tr:first-child td.c-code').getBoundingClientRect().left, document.querySelector('#list-tbl tbody tr:first-child td[data-col="name"]').getBoundingClientRect().left]);
+  assert.ok(Math.abs(cl - wl) <= 2, `コードの列が左に残る (${cl} / ${wl})`);
+  assert.ok(nl < wl, '名前の列は左へ送られた');
+  assert.equal(await p.evaluate(() => document.querySelector('#tblwrap').classList.contains('scrolled')), true);
+  const onTop = await p.evaluate(() => { const td = document.querySelector('#list-tbl tbody tr:first-child td.c-code'); const r = td.getBoundingClientRect(); const el = document.elementFromPoint(r.left + 20, r.top + r.height / 2); return td.contains(el); });
+  assert.equal(onTop, true, 'コードの列の上に送った列が重ならない');
+  if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1024_scrolled.png` });
+  await p.$eval('#tblwrap', (w) => { w.scrollLeft = 0; });
+  // 行のどこを押しても開く (売価の欄・名前の欄)・Ctrl = 別のタブ (今の画面のまま)
+  const code = (await p.textContent('#list-tbl tbody tr:nth-child(2) a.rowlink')).trim();
+  const [popup] = await Promise.all([ctx.waitForEvent('page'), p.click('#list-tbl tbody tr:nth-child(2) td[data-col="price"]', { modifiers: ['Control'] })]);
+  await popup.waitForLoadState();
+  assert.match(popup.url(), new RegExp(`/sku/${code}$`));
+  await popup.close();
+  assert.match(p.url(), /sort=cost/, 'Ctrl のときは今の画面のまま');
+  await Promise.all([p.waitForNavigation(), p.click('#list-tbl tbody tr:nth-child(2) td[data-col="name"]')]);
+  assert.match(p.url(), new RegExp(`/sku/${code}$`));
+});
+await ta('[54] 一覧の列の板 (狭い画面 390): 下から出る・板ははみ出さない', async (p) => {
+  await p.goto(B + '/?q=' + encodeURIComponent('単品'));
+  const spill = () => p.evaluate(() => [...document.querySelectorAll('body *')].filter((e) => e.offsetParent !== null && e.getBoundingClientRect().right > innerWidth + 1 && !e.closest('.tblwrap')).map((e) => (e.id ? '#' + e.id : e.tagName.toLowerCase() + '.' + [...e.classList].join('.')) + ':' + Math.round(e.getBoundingClientRect().right)).slice(0, 12));
+  // 🚨 この画面は前から 390 幅では上の帯・詳細検索の欄がはみ出す (携帯向けに作っていない・この PR の外)。ここでは「列の板がはみ出しを増やさない」を見る
+  const before = await spill();
+  await p.click('#colbtn');
+  await p.waitForTimeout(300);
+  assert.deepEqual(await spill(), before, '列の板を開いてもはみ出す物は増えない');
+  assert.deepEqual((await spill()).filter((x) => /colpanel|collist|cp-/.test(x)), []);   // 出てくる動き (0.15 秒・4px 上がる) が終わってから測る
+  const r = await p.evaluate(() => { const b = document.querySelector('#colpanel').getBoundingClientRect(); return { left: b.left, right: b.right, bottom: b.bottom, vw: innerWidth, vh: innerHeight }; });
+  assert.ok(r.left <= 1 && r.right >= r.vw - 1 && Math.abs(r.bottom - r.vh) <= 1, JSON.stringify(r));
+  if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/390_cols.png` });
+}, { width: 390, height: 844 });
 
 // 拡大 125% / 150% = 画面の CSS の幅が 1/1.25・1/1.5 になる。MASTER_EDIT_UI_SHOTS=フォルダ を付けると、そのフォルダに写しを残す (目で見る用)
 const SHOTS = process.env.MASTER_EDIT_UI_SHOTS || '';

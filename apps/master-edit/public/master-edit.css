@@ -860,3 +860,69 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 .pf-notes { font-size: 13px; color: var(--warn); }
 .fx.warnx { background: var(--warn-bg); border-color: rgba(255, 200, 87, 0.45); color: var(--warn); }
 @media (max-width: 1100px) { .pfhead { grid-template-columns: auto auto; } .pf-next { grid-column: 1 / -1; } }
+
+/* ---------- 一覧: 列の選択・見出しで並び替え・左のコードの列を残す (10/8 PR1・見本 masterlist_mock) ---------- */
+#list-page { --row-bg: #0d1526; --row-hover: #102036; --row-sel: #0f2a3a; --stick-code-left: 0px; }
+#list-page .tbl-top { position: relative; gap: 10px 14px; }
+#list-page .tbl-top .right { flex-wrap: wrap; gap: 8px; }
+.sortnow { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255, 255, 255, 0.03); color: var(--text2); }
+.sortnow .ic { color: var(--accent); width: 14px; height: 14px; }
+.sortnow b { font-size: 13.5px; }
+.colbtn .cnt { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.colbtn.unsaved { border-color: rgba(255, 200, 87, 0.6); }
+.colbtn.unsaved::after { content: "未保存"; font-size: 10.5px; color: #2a1e00; background: var(--warn); border-radius: 4px; padding: 0 5px; line-height: 16px; }
+.newtag { font-size: 10.5px; font-weight: 700; color: #04202b; background: var(--accent); border-radius: 4px; padding: 0 5px; line-height: 16px; letter-spacing: 0.04em; }
+/* 表: 行の色はセルに置く (左のコードの列は横に送っても残る = 下の文字が透けないように塗る) */
+#list-tbl td { background: var(--row-bg); }
+#list-tbl.click tbody tr:hover td { background: var(--row-hover); }
+#list-tbl tbody tr.kb td, #list-tbl tbody tr:focus-within td { background: var(--row-sel); }
+#list-tbl tbody tr.kb td.c-code, #list-tbl tbody tr:focus-within td.c-code { box-shadow: inset 3px 0 0 var(--accent); }
+#list-tbl .c-code { position: sticky; left: var(--stick-code-left); z-index: 2; }
+#list-tbl thead th.c-code { z-index: 4; }
+#tblwrap.scrolled #list-tbl .c-code { box-shadow: 8px 0 12px -8px rgba(0, 0, 0, 0.8); }
+#tblwrap.scrolled #list-tbl tbody tr.kb td.c-code, #tblwrap.scrolled #list-tbl tbody tr:focus-within td.c-code { box-shadow: inset 3px 0 0 var(--accent), 8px 0 12px -8px rgba(0, 0, 0, 0.8); }
+/* 見出しを押して並べる (リンク = 押すと並べ直した一覧を読む) */
+#list-tbl th.sortable { padding: 0; vertical-align: bottom; }
+#list-tbl .sorth { display: flex; align-items: center; gap: 6px; width: 100%; padding: 10px 12px; color: var(--muted); text-decoration: none; letter-spacing: 0.06em; }
+#list-tbl th.n .sorth { justify-content: flex-end; }
+#list-tbl .sorth:hover { color: #fff; background: rgba(58, 231, 255, 0.06); text-decoration: none; }
+#list-tbl .sorth:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
+#list-tbl .sorth .lbl { display: flex; flex-direction: column; }
+#list-tbl .sorth .arr { width: 14px; height: 14px; opacity: 0; transition: opacity 0.12s; color: var(--faint); flex: none; }
+#list-tbl .sorth:hover .arr, #list-tbl .sorth:focus-visible .arr { opacity: 0.8; }
+#list-tbl th[aria-sort] .sorth { color: var(--accent); }
+#list-tbl th[aria-sort] .sorth .arr { opacity: 1; color: var(--accent); }
+#list-tbl th[aria-sort]::after { content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+#list-tbl.show-sup .sup-sub { display: none; }
+#list-tbl .supc { font-size: 12.5px; color: var(--muted); }
+#list-tbl.loading tbody { opacity: 0.35; transition: opacity 0.1s; }
+/* 列の板 (右上の「列」から・狭い画面は下から出る) */
+.colpanel { position: absolute; z-index: 60; top: calc(100% + 8px); right: 0; width: 380px; max-width: calc(100vw - 32px); border-radius: 14px; border: 1px solid rgba(58, 231, 255, 0.5); background: #0a111f; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65); animation: rise 0.15s ease-out; display: flex; flex-direction: column; max-height: min(640px, calc(100vh - 140px)); }
+.colpanel .cp-h { display: flex; align-items: center; gap: 8px; padding: 12px 14px 8px; }
+.colpanel .cp-h > .ic { color: var(--accent); }
+.colpanel .cp-h h3 { font-size: 15px; color: var(--text); letter-spacing: 0; }
+.colpanel .cp-h .close { margin-left: auto; }
+.colpanel .cp-sub { padding: 0 14px 8px; font-size: 12.5px; color: var(--muted); }
+.collist { list-style: none; margin: 0; overflow-y: auto; min-height: 0; flex: 1 1 auto; padding: 0 8px; display: grid; gap: 3px; }
+.collist li { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 9px; border: 1px solid transparent; font-size: 14px; color: var(--text2); background: rgba(255, 255, 255, 0.02); }
+.collist li:hover { border-color: var(--line); }
+.collist li.off { color: var(--faint); background: transparent; }
+.collist li.dragging { opacity: 0.4; }
+.collist li.over { border-color: var(--accent); box-shadow: 0 -2px 0 var(--accent); }
+.collist .grip { cursor: grab; color: var(--faint); width: 18px; display: grid; place-items: center; font-size: 14px; letter-spacing: -2px; user-select: none; flex: none; }
+.collist label { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; cursor: pointer; }
+.collist input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); flex: none; margin: 0; }
+.collist .lock, .collist .nosort { font-size: 11.5px; color: var(--faint); display: inline-flex; gap: 4px; align-items: center; }
+.collist .lock .ic { width: 13px; height: 13px; }
+.collist .iconbtn { width: 28px; height: 28px; flex: none; }
+.cp-who { display: flex; align-items: center; gap: 8px; padding: 8px 14px 0; font-size: 12.5px; color: var(--muted); }
+.cp-who .avatar { width: 22px; height: 22px; font-size: 11px; flex: none; }
+.cp-warn { display: flex; gap: 6px; align-items: center; margin: 8px 14px 0; font-size: 12.5px; color: var(--warn); }
+.cp-foot { display: flex; gap: 8px; align-items: center; padding: 10px 14px 12px; border-top: 1px solid var(--line); margin-top: 8px; flex-wrap: wrap; }
+.cp-foot .sp { flex: 1; }
+@media (max-width: 760px) {
+  #list-page .tbl-top .keys { display: none; }
+  #list-page .tbl-top .right { margin-left: 0; width: 100%; }
+  #list-page .panel { backdrop-filter: none; }   /* blur があると下から出す板 (fixed) が板の中に閉じこめられる */
+  .colpanel { position: fixed; top: auto; bottom: 0; left: 0; right: 0; width: 100%; max-width: none; border-radius: 18px 18px 0 0; max-height: 80vh; z-index: 120; }
+}
