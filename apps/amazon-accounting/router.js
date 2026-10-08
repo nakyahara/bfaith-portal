@@ -10,6 +10,7 @@
 import { Router } from 'express';
 import multer from 'multer';
 import fs from 'fs';
+import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
 import { normalizeYearMonth } from '../../lib/jst-date.js';
@@ -384,14 +385,20 @@ router.post('/upload', upload.single('file'), (req, res) => {
   }
 
   // /confirm でサーバ側の真値として使うため集計結果も保管 (Codex 3R #1: 改竄防御)
-  const canConfirm = unresolved.length === 0 && unresolvedTax.length === 0 && conflicts.length === 0;
+  // 未登録SKUは確定を止めない (米国版と同じ): その行は 10%・その他/未分類・原価0円で集計に入っている。
+  // 件数は unresolved_count として確定データに残し、画面で警告する。税率未登録・セット解決エラーは引き続き止める
+  const canConfirm = unresolvedTax.length === 0 && conflicts.length === 0;
+  // uploadId: 同じ月を別タブ・別の人が上げ直したとき、画面で見た集計と違うものを確定しないための照合キー
+  const uploadId = crypto.randomUUID();
   evidenceStore.set(yearMonth, {
+    uploadId,
     detail: detailCsv,
     summary: summaryCsv,
     serverState: {
       totalRows: parsedRows.length,
       resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'adjustment_no_master' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
       unresolvedCount: unresolved.length,
+      unresolvedSkus: unresolved,
       unresolvedTaxCount: unresolvedTax.length,
       conflictsCount: conflicts.length,
       canConfirm,
@@ -400,13 +407,14 @@ router.post('/upload', upload.single('file'), (req, res) => {
   });
 
   res.json({
+    uploadId,
     yearMonth,
     totalRows: parsedRows.length,
     resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'adjustment_no_master' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
     unresolvedSkus: unresolved,
     unresolvedTaxCount,
     unresolvedTax,
-    canConfirm: unresolved.length === 0 && unresolvedTax.length === 0 && conflicts.length === 0,
+    canConfirm,
     conflicts,
     byTax,
     bySegment,
@@ -512,6 +520,8 @@ function renderPage() {
 
       <div id="unresolvedCard" class="card" style="display:none">
         <h2>⚠️ 未登録SKU</h2>
+        <p class="meta">以下のSKUは商品マスタに見つかりません。<b>税率10%・セグメント「その他/未分類」・原価0円として集計に含めたまま確定できます。</b>
+          8%の商品が混ざっていると税率別・MF連携の金額がずれるため、気になる場合はミニPC管理画面で登録し、翌朝7時の同期後にCSVを再アップロードしてください。</p>
         <div id="unresolvedList"></div>
       </div>
 
@@ -629,15 +639,17 @@ function renderPage() {
       document.getElementById('uploadStatus').textContent = '';
 
       // 概要
-      let summaryHtml = '<div class="' + (data.canConfirm ? 'ok' : 'warn') + '">';
+      const hasUnresolved = data.unresolvedSkus.length > 0;
+      let summaryHtml = '<div class="' + (data.canConfirm && !hasUnresolved ? 'ok' : 'warn') + '">';
       summaryHtml += '<b>対象年月: ' + esc(data.yearMonth) + '</b><br>';
       summaryHtml += '総行数: ' + data.totalRows + ' / SKU解決済: ' + data.resolvedCount + ' / 未登録SKU: ' + data.unresolvedSkus.length + '件';
       if (data.unresolvedTax && data.unresolvedTax.length > 0) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTax.length + '商品</span>';
       if (data.conflicts && data.conflicts.length > 0) summaryHtml += ' / <span class="negative">セット解決エラー: ' + data.conflicts.length + '件</span>';
-      if (data.canConfirm) summaryHtml += '<br><b style="color:#27ae60">✅ 全て解決済み — 確定可能</b>';
+      // 未登録SKUは確定を止めない (10%・その他/未分類・原価0円で集計に入る)。止めるのは税率未登録とセット解決エラーだけ
+      if (data.canConfirm && hasUnresolved) summaryHtml += '<br><b style="color:#d68910">⚠️ 未登録SKUあり（10%・その他/未分類・原価0円で集計に含まれます） — 確定可能</b>';
+      else if (data.canConfirm) summaryHtml += '<br><b style="color:#27ae60">✅ 全て解決済み — 確定可能</b>';
       else {
         const reasons = [];
-        if (data.unresolvedSkus.length > 0) reasons.push('未登録SKU');
         if (data.unresolvedTax && data.unresolvedTax.length > 0) reasons.push('税率未登録');
         if (data.conflicts && data.conflicts.length > 0) reasons.push('セット解決エラー');
         summaryHtml += '<br><b style="color:#e74c3c">❌ ' + reasons.join('・') + 'あり — 確定不可</b>';
@@ -980,10 +992,14 @@ function renderPage() {
     async function doConfirm() {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
       if (!lastData.canConfirm) {
-        alert('未登録SKU・税率未登録・セット解決エラーが残っています。確定できません。');
+        alert('税率未登録・セット解決エラーが残っています。確定できません。');
         return;
       }
-      if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
+      let msg = lastData.yearMonth + ' の集計を確定しますか？';
+      if (lastData.unresolvedSkus.length > 0) {
+        msg += '\\n\\n⚠️ 未登録SKU ' + lastData.unresolvedSkus.length + '件があります（税率10%・その他/未分類・原価0円で集計に含まれます）';
+      }
+      if (!confirm(msg)) return;
       const btn = document.getElementById('confirmBtn');
       btn.disabled = true;
       btn.textContent = '保存中...';
@@ -994,6 +1010,7 @@ function renderPage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             yearMonth: lastData.yearMonth,
+            uploadId: lastData.uploadId,
             adCost,
             csvFilename: document.getElementById('csvFile').files[0]?.name || '',
           }),
@@ -1039,9 +1056,21 @@ function renderPage() {
           html += '<span><b>' + esc(row.year_month) + '</b> — 商品売上(税込): \\u00a5' + Math.round(hdrSales).toLocaleString()
             + ' / 合計: \\u00a5' + Math.round(hdrTotal).toLocaleString()
             + (ad ? ' / 広告費: \\u00a5' + ad.toLocaleString() : '')
+            + (row.unresolved_count > 0 ? ' <span style="color:#d68910">⚠️ 未登録SKU ' + Number(row.unresolved_count) + '件のまま確定</span>' : '')
             + ' <span class="meta">（' + esc(row.confirmed_at || '') + '）</span></span>';
           html += '<span class="arrow">&#9654;</span></div>';
           html += '<div class="acc-body" id="acc-' + i + '">';
+
+          // 未登録SKUのまま確定した内訳 (税率10%・その他/未分類・原価0円で入っている)
+          const unres = Array.isArray(row.unresolved_skus) ? row.unresolved_skus : [];
+          if (unres.length) {
+            html += '<h3 style="font-size:13px;color:#d68910;margin-bottom:4px">⚠️ 未登録SKUのまま確定した内訳（税率10%・その他/未分類・原価0円）</h3>';
+            html += '<table><tr><th>SKU</th><th>商品名</th><th>出現数</th><th>金額合計</th></tr>';
+            for (const u of unres) {
+              html += '<tr><td>' + esc(u.sku || '') + '</td><td>' + esc(String(u.name || '').slice(0, 60)) + '</td><td class="num">' + (Number(u.count) || 0) + '</td><td class="num">' + fmt(Number(u.amount) || 0) + '</td></tr>';
+            }
+            html += '</table>';
+          }
 
           // MF連携用 税込み集計（データがある場合のみ）
           const hasMf = mf && Object.keys(mf).length > 0 && (mf['合計'] || 0) !== 0;
@@ -1263,7 +1292,7 @@ function renderPage() {
       <h2>5. 税率別集計</h2>
       <table class="m-tbl">
         <tr><th>分類</th><th>条件</th></tr>
-        <tr><td><b>10%</b></td><td>消費税率=0.10 の商品、または税率未登録の商品（10%仮扱い）</td></tr>
+        <tr><td><b>10%</b></td><td>消費税率=0.10 の商品、または未登録SKU・SKUなし行（10%仮扱い）</td></tr>
         <tr><td><b>8%</b></td><td>消費税率=0.08 の商品</td></tr>
       </table>
       <div class="note">トランザクション種類が「振込み」の行は集計から除外されます。「注文外料金」はマスタ照合せず「その他」へ。「調整」（FBA在庫補償など）はマスタ照合を試み、Amazon独自採番SKUで照合できないものだけ「その他」に集計されます（確定はブロックしません）。</div>
@@ -1359,7 +1388,7 @@ function renderPage() {
         <li>CSV金額のカンマ区切り（例: <code>3,200</code>）は自動除去されます</li>
         <li>税率未登録の商品は<b>税率別集計から除外</b>（税率未登録リストに表示、確定不可）</li>
         <li>原価0の商品は「原価ゼロ警告」タブに一覧表示</li>
-        <li>未登録SKUがあると確定不可（先にミニPC管理画面で登録）</li>
+        <li>未登録SKUがあっても確定できます（税率10%・その他/未分類・原価0円で集計に含まれ、過去の確定データに「未登録SKU ◯件のまま確定」と出ます）。8%の商品が混ざると税率別・MF連携の金額がずれるので、気になる場合は先にミニPC管理画面で登録</li>
         <li>2022/7〜2026/2のヒストリカルデータは旧スプレッドシートから移行済み</li>
       </ul>
     </div>
@@ -1391,7 +1420,7 @@ router.get('/evidence/:type/:yearMonth', (req, res) => {
 
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
-  const { yearMonth, adCost, csvFilename } = req.body;
+  const { yearMonth, adCost, csvFilename, uploadId } = req.body;
 
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
 
@@ -1400,9 +1429,11 @@ router.post('/confirm', (req, res) => {
   if (!cached || !cached.serverState) {
     return res.status(400).json({ error: 'アップロード結果が見つかりません。CSVを再アップロードしてください' });
   }
+  if (!uploadId || uploadId !== cached.uploadId) {
+    return res.status(409).json({ error: 'この月は画面を開いた後に別のアップロードで上書きされました。CSVを再アップロードして内容を確かめてから確定してください' });
+  }
   const s = cached.serverState;
   if (!s.canConfirm) {
-    if (s.unresolvedCount > 0) return res.status(400).json({ error: '未登録SKUが残っているため確定できません' });
     if (s.unresolvedTaxCount > 0) return res.status(400).json({ error: '税率未登録があるため確定できません' });
     if (s.conflictsCount > 0) return res.status(400).json({ error: 'セット解決エラー(税率/分類混在・構成品欠損・数量不正・マップ先商品欠損)があるため確定できません' });
     return res.status(400).json({ error: '確定不可状態です' });
@@ -1412,12 +1443,13 @@ router.post('/confirm', (req, res) => {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
     db.prepare(`INSERT OR REPLACE INTO mart_amazon_monthly_summary
       (year_month, total_rows, resolved_count, unresolved_count,
-       by_tax, by_segment, excluded, mf_row, ad_cost, confirmed_at, csv_filename)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+       by_tax, by_segment, excluded, mf_row, ad_cost, confirmed_at, csv_filename, unresolved_skus)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       yearMonth, s.totalRows, s.resolvedCount, s.unresolvedCount,
       JSON.stringify(s.byTax), JSON.stringify(s.bySegment), JSON.stringify(s.excluded),
-      JSON.stringify(s.mfRow), adCost || 0, now, csvFilename || ''
+      JSON.stringify(s.mfRow), adCost || 0, now, csvFilename || '',
+      s.unresolvedSkus.length ? JSON.stringify(s.unresolvedSkus) : null
     );
 
     db.prepare(`INSERT INTO mart_amazon_upload_log
@@ -1433,6 +1465,12 @@ router.post('/confirm', (req, res) => {
 
 // ─── GET /history — 過去月一覧 ───
 
+// unresolved_skus 列 (JSON 配列 or NULL) を配列に。壊れていても履歴一覧は落とさない
+function parseJsonArray(text) {
+  if (!text) return [];
+  try { const v = JSON.parse(text); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+
 router.get('/history', (req, res) => {
   const db = getMirrorDB();
   try {
@@ -1443,6 +1481,7 @@ router.get('/history', (req, res) => {
       by_segment: JSON.parse(r.by_segment || '{}'),
       excluded: JSON.parse(r.excluded || '{}'),
       mf_row: JSON.parse(r.mf_row || '{}'),
+      unresolved_skus: parseJsonArray(r.unresolved_skus),
     }));
     res.json(parsed);
   } catch (e) {
@@ -1463,6 +1502,7 @@ router.get('/history/:yearMonth', (req, res) => {
       by_segment: JSON.parse(row.by_segment || '{}'),
       excluded: JSON.parse(row.excluded || '{}'),
       mf_row: JSON.parse(row.mf_row || '{}'),
+      unresolved_skus: parseJsonArray(row.unresolved_skus),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
