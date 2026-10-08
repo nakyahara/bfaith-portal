@@ -264,6 +264,24 @@ try {
       try { await L.query('rollback'); } catch { /* commit 済み */ }
       await setActiveOwnershipInDb(M, ALL_COMPANY);
     }
+    // 逆順のデッドロックが無い: 保存が代表を変える取引 (マスタの書き込み 共有 → SKU → 親子 排他 → CSV) が SKU の鍵を持っている間に照合の確かめが始まる →
+    //   確かめは SKU の鍵で待ち (親子の鍵はまだ持たない)、保存は親子の鍵 (排他) を取れて終わる → 確かめも終わる (40P01 なし)
+    const S = await open(null); clients.push(S);
+    try {
+      await S.query('begin');
+      await S.query('select pg_advisory_xact_lock_shared(core.master_write_lock_key())');
+      await S.query(`select pg_advisory_xact_lock(hashtextextended('core.sku:' || $1::text, 0))`, [await skuIdOf('lk-p')]);
+      const chk2 = launch(WW2.query('select ops.record_ne_registration_check($1) as r', [RUNP]).then((r) => r.rows[0].r));
+      await sleep(500);
+      assert.equal(chk2.done, false, '確かめは保存の SKU の鍵を待つ');
+      const par = launch(S.query('select pg_advisory_xact_lock(core.parent_lock_key())'));
+      await sleep(2500);   // deadlock_timeout (1 秒) より長く待つ = 逆順なら PostgreSQL が 40P01 で片方を落とす
+      assert.equal(par.done, true, '保存は親子の鍵 (排他) を取れる (確かめは親子の鍵をまだ持っていない)');
+      assert.ok(par.ok, par.err && par.err.message);
+      await S.query('commit');
+      const r2 = await chk2.promise;
+      assert.ok(r2.ok, `確かめも終わる (deadlock なし): ${r2.err && `${r2.err.code} ${r2.err.message}`}`);
+    } finally { try { await S.query('rollback'); } catch { /* */ } }
   });
 
   await ta('[18a] アプリの鍵の入口 ops.acquire_new_entry_locks (PR-2 Codex R3): §3.10 の 2 (許可・種類の順に全部) を共有で取り、取引の終わりまで持つ・戻り値 = 今の許可が有効か', async () => {
