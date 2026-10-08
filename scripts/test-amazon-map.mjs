@@ -194,7 +194,7 @@ await ta('[1] 同じ材料の夜間ロード (全部 load・legacy_open): 0053 �
 
 await ta('[1] 0054 は ⑤-1・⑤-2a・⑤-2b (0053) の物を全部残す: 書いてよい (表・書き方) の行・約束 / 保存の記録の操作・変更の記録の種類 (名前も)・SKU が要る操作', async () => {
   const E53 = await setupDb({ to: '0053' });
-  const E54 = await setupDb();
+  const E54 = await setupDb({ to: '0054' });   // 0054 の物と比べる (0061 = 新商品の代表が reg_parent_set の行・操作を足す = 0054 の確かめに混ぜない)
   const allowedRows = async (E) => {
     const src = (await E.db.query(`select pg_get_functiondef('ops.master_write_allowed(text, text, text)'::regprocedure) as d`)).rows[0].d;
     return [...src.matchAll(/\('([a-z_]+)', '([a-z_.]+)', '(INSERT|UPDATE|DELETE)'\)/g)].map((m) => `${m[1]} ${m[2]} ${m[3]}`).sort();
