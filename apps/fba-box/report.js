@@ -204,7 +204,7 @@ export function buildRunReport(runId) {
     .map((r) => ({ groupId: r.groupId, group: groupName.get(r.groupId) || '', planNo: r.planNo, fnsku: r.fnsku, sku: r.sku, name: r.name, placed: r.placed }));
 
   const out = {
-    run: { id: run.id, title: run.title, status: run.status, deliveryDate: run.delivery_date || null, doneAt: run.done_at || null, staUploadedAt: run.sta_uploaded_at || null },
+    run: { id: run.id, sourceRunId: run.source_run_id ?? null, title: run.title, status: run.status, deliveryDate: run.delivery_date || null, doneAt: run.done_at || null, staUploadedAt: run.sta_uploaded_at || null },
     limitKg: limitG != null ? limitG / 1000 : null,
     totals, groups: groupsOut, planBoxes, changes, pendingRows, expiries, expiryMissing,
   };
