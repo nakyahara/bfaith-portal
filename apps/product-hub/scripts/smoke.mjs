@@ -6321,7 +6321,33 @@ let wfSetParentId = null;
         wfp.setStepState(idDone, 'imgd_material', { state: 'todo' }, 'smoke', { isAdmin: true });
         const rReopened = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'inhouse' });
         check('撮影判定: ③ を戻せば撮影が要るへ変えられる', rReopened.status === 200 && ipDone().shoot_mode === 'inhouse' && ipDone().material_status === null, JSON.stringify(rReopened));
+        // 画面が見ていた判定 (expected) と今の値が違えば 409。押したのと同じ判定に既になっていれば送り直しとして通す (Codex PR-A 名指し4 M)
+        const rStale = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'photographer', expected: 'none' });
+        const rSame = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'inhouse', expected: 'none' });
+        const rBadExp = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'photographer', expected: 'x' });
+        check('🚨 撮影判定: ほかの人が先に変えていたら (expected が違う) 409 で上書きしない',
+          rStale.status === 409 && /ほかの人/.test(rStale.json?.error || '') && ipDone().shoot_mode === 'inhouse', JSON.stringify([rStale, ipDone()]));
+        check('撮影判定: 押したのと同じ判定に既になっていれば expected が古くても 200 (送り直し)・expected の値が不正なら 400',
+          rSame.status === 200 && rSame.json?.changed === false && rBadExp.status === 400, JSON.stringify([rSame, rBadExp]));
+        const rOk = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'photographer', expected: 'inhouse' });
+        check('撮影判定: expected が今の値と合えば変えられる', rOk.status === 200 && ipDone().shoot_mode === 'photographer', JSON.stringify(rOk));
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDone);
+
+        // 🚨 ③ を素材完了で完了したあと、保存ボタン (古いタブの一括保存を含む) で素材ステータスを崩させない (Codex PR-A 名指し4 High)
+        const idDone2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('DRV-SHOOT-DONE2', '自社③完了2', 'smoke', 1)`).run().lastInsertRowid);
+        wfp.ensureProgress(db, idDone2);
+        dbmod.upsertImageProduction(db, idDone2, { material_status: 'ready' });
+        wfp.setStepState(idDone2, 'imgd_material', { state: 'done' }, 'smoke', { isAdmin: true });
+        const mat2 = () => db.prepare('SELECT material_status FROM draft_image_production WHERE draft_id = ?').get(idDone2)?.material_status;
+        const rBreak = await call('POST', `/api/drafts/${idDone2}/image-production`, { material_status: 'shipped', status: '古いタブ' });
+        const rBreakNull = await call('POST', `/api/drafts/${idDone2}/image-production`, { material_status: '' });
+        check('🚨 ③完了後: 保存ボタンで素材ステータスを ③ の条件を満たさない値 (商品発送済み・未設定) にするのは 409',
+          rBreak.status === 409 && rBreakNull.status === 409 && mat2() === 'ready' && /③素材待ち/.test(rBreak.json?.error || ''), JSON.stringify([rBreak, rBreakNull, mat2()]));
+        const rKeep = await call('POST', `/api/drafts/${idDone2}/image-production`, { material_status: 'ready', status: '素材そのまま' });
+        const rNr2 = await call('POST', `/api/drafts/${idDone2}/image-production`, { material_status: 'not_required' });
+        check('③完了後: 素材ステータスが変わらない保存・条件を満たす値 (撮影不要) への保存は通る',
+          rKeep.status === 200 && rNr2.status === 200 && mat2() === 'not_required', JSON.stringify([rKeep, rNr2]));
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDone2);
       }
 
       // 🚨 毎起動の旧 Notion 値の埋め戻しが、撮影判定でそろえた素材ステータスを上書きしない (Codex PR-A 名指し2 High)
@@ -6425,6 +6451,7 @@ let wfSetParentId = null;
         'shoot-req-copy': fakeEl(), 'shoot-req-msg': fakeEl(), 'shoot-mode-msg': fakeEl(),
         'ip-camera-url': fakeEl({ value: '' }), 'import-folder-url': fakeEl({ value: FOLDER }),
         'f-name': fakeEl({ value: 'マイタケ粉末 50g' }),
+        'shoot-mode-box': fakeEl({ dataset: { current: 'inhouse' } }),
       };
       const modeBtns = ['none', 'inhouse', 'photographer'].map((m) => fakeEl({ dataset: { shootMode: m }, attrs: { 'aria-checked': m === 'inhouse' ? 'true' : 'false' } }));
       const doc = { getElementById: (id) => els[id] || null, querySelectorAll: (q) => (q === '[data-shoot-mode]' ? modeBtns : []) };
@@ -6491,11 +6518,15 @@ let wfSetParentId = null;
       check('🚨 画面の JS: 「撮影不要」の保存が断られた・届かなかったときは、打った URL を消さない (Codex PR-A 名指し3 M)',
         posts.length === 2 && els['ip-camera-url'].value === SHEET && reloads.length === 2 && reloads.every((x) => x[0].ok === false),
         JSON.stringify([els['ip-camera-url'].value, reloads]));
+      check('画面の JS: 送るときは画面が見ていた判定 (expected) を添え、失敗したらボタンを押せる状態に戻す (Codex PR-A 名指し4 M)',
+        posts.every((p) => p[1].expected === 'inhouse') && modeBtns.every((b) => b.disabled === false), JSON.stringify(posts));
       postMode = 'ok';
       await modeBtns[0].fire('click');
       check('画面の JS: 確認して保存できたら、未保存の URL を元の値に戻してから読み直す',
         asked.length === 4 && els['ip-camera-url'].value === '' && posts.length === 3 && posts[2][0] === '/apps/product-hub/api/drafts/7/shoot-mode'
         && posts[2][1].mode === 'none' && reloads.length === 3 && reloads[2][0].ok === true, JSON.stringify([posts, reloads]));
+      check('画面の JS: 保存できたら読み直すまで 3 つとも押せないまま (続けて押させない)', modeBtns.every((b) => b.disabled === true));
+      modeBtns.forEach((b) => { b.disabled = false; });
       await modeBtns[2].fire('click');
       check('画面の JS: 撮影が要る判定は確認なしで送る (URL を消さない向き)', asked.length === 4 && posts.length === 4 && posts[3][1].mode === 'photographer');
       check('画面の JS: ボタンの処理は 1 つずつ (二重登録しない)', modeBtns.every((b) => b.count('click') === 1) && els['shoot-req-copy'].count('click') === 1);

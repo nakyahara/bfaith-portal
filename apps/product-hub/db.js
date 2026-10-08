@@ -2635,6 +2635,20 @@ export function materialAlignedToShootMode(mode, material) {
 }
 
 /**
+ * ③素材待ち が完了済みなのに、変えた後の撮影判定・素材ステータスでは ③ の完了条件を満たさなくなるか。
+ * 完了ゲート (workflow-progress.js の setStepState) は完了にする瞬間しか見ないので、完了したあとで値を
+ * 崩す側 (撮影判定の変更・画像制作情報の保存) がこれで止める — Codex PR-A 名指し3/4 High。
+ * 条件はゲートと同じ: 撮影が要る判定なら素材完了 / 自社商品なら素材完了か撮影不要 / それ以外は問わない
+ */
+export function materialStepWouldBreak(db, draftId, { shootMode, material }) {
+  const st = db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_material'`).get(draftId);
+  if (st?.state !== 'done') return false;
+  if (shootMode === 'inhouse' || shootMode === 'photographer') return material !== 'ready';
+  const ownBrand = db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(draftId)?.own_brand === 1;
+  return ownBrand && material !== 'ready' && material !== 'not_required';
+}
+
+/**
  * 撮影判定を変える (2026-10-08 画像制作の新フロー)。null = 未判定に戻す。
  * 撮影・素材ステータスもそろえる — ③素材待ち の完了条件とボードの「撮影指示書 対象外」はそちらを見ているため:
  *   撮影不要 にした → 素材ステータスが「素材完了」でなければ「撮影不要」にする
@@ -2644,13 +2658,20 @@ export function materialAlignedToShootMode(mode, material) {
  *   同じ判定でも素材ステータスが食い違っていれば (別の経路で入った値)、そろえ直して changed=true
  * @returns {{changed: boolean, material_status: string|null}}
  */
-export function setShootMode(db, draftId, mode, { actor = null } = {}) {
+export function setShootMode(db, draftId, mode, { actor = null, expected } = {}) {
   const m = mode == null ? null : String(mode);
   if (m !== null && !SHOOT_MODE_CODES.has(m)) throw new Error('撮影判定の値が不正です');
   const id = Number(draftId);
   const run = db.transaction(() => {
     db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
     const cur = db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(id);
+    // expected = 画面が見ていた判定 (undefined なら照らさない)。ほかの人・別のタブが先に変えていたら上書きしない。
+    // 押したのと同じ判定に既になっているなら、それは送り直しなので通す (Codex PR-A 名指し4 M)
+    if (expected !== undefined && (cur.shoot_mode ?? null) !== (expected ?? null) && (cur.shoot_mode ?? null) !== m) {
+      const err = new Error(`ほかの人 (または別の画面) が撮影判定を「${cur.shoot_mode ? SHOOT_MODE_LABELS[cur.shoot_mode] : '未判定'}」に変えています。画面を読み直してから選んでください`);
+      err.code = 'shoot_mode_conflict';
+      throw err;
+    }
     const before = cur.material_status ?? null;
     let material = materialAlignedToShootMode(m, before);
     // 「撮影不要」から未判定に戻した = 撮影不要と決めたのを取り消した。そろえた素材ステータスも取り消す
@@ -2667,16 +2688,11 @@ export function setShootMode(db, draftId, mode, { actor = null } = {}) {
     // 🚨 ③素材待ち を「撮影不要」で完了したあとに「撮影が要る」へ変えると、素材が無いのに ③ は完了のまま
     //    ④ 以降へ進んでしまう (完了ゲートは完了にする瞬間しか見ない)。変えた後の値で ③ の完了条件を
     //    満たさなくなるなら変えずに止め、先に ③ へ戻してもらう (Codex PR-A 名指し3 High)
-    const matStep = db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_material'`).get(id);
-    if (matStep?.state === 'done') {
-      const ownBrand = db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(id)?.own_brand === 1;
+    if (materialStepWouldBreak(db, id, { shootMode: m, material })) {
       const needShoot = m === 'inhouse' || m === 'photographer';
-      const passes = needShoot ? material === 'ready' : (!ownBrand || material === 'ready' || material === 'not_required');
-      if (!passes) {
-        const err = new Error(`③素材待ち はもう完了しています。${needShoot ? '撮影する' : '撮影判定を取り消す'}なら、先にボードでカードを ③素材待ち に戻してから撮影判定を変えてください`);
-        err.code = 'material_step_done';
-        throw err;
-      }
+      const err = new Error(`③素材待ち はもう完了しています。${needShoot ? '撮影する' : '撮影判定を取り消す'}なら、先にボードでカードを ③素材待ち に戻してから撮影判定を変えてください`);
+      err.code = 'material_step_done';
+      throw err;
     }
     db.prepare(`
       UPDATE draft_image_production

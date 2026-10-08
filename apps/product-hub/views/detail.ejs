@@ -1687,7 +1687,7 @@ th.attr-unknown { color: #dc2626; }
           <p class="muted" style="font-size:12px; margin:0 0 6px;">AI の LP構成はまだ使えません。下の「その他の項目」の ChatGPT 定型文 (📝 商品分析) から作れます</p>
           <% } %>
           <%# 撮影判定 (2026-10-08)。押した時点で保存 (POST /shoot-mode)。「撮影不要」なら撮影・素材ステータスもそろえる %>
-          <div class="field" id="shoot-mode-box" style="margin-top:8px;">
+          <div class="field" id="shoot-mode-box" style="margin-top:8px;" data-current="<%= ip.shoot_mode || '' %>">
             <label>撮影判定 <span class="muted" style="font-weight:400">(押すとすぐ保存します。「撮影不要」にすると撮影・素材ステータスも「撮影不要」になります)</span></label>
             <div class="ipf-seg" role="radiogroup" aria-label="撮影判定">
               <% for (const sm of imageFlow.shootModes) { %>
@@ -5929,9 +5929,16 @@ th.attr-unknown { color: #dc2626; }
         if (dropCam && !deps.confirm('撮影指示書の URL が保存されていません。「撮影不要」にすると、いま入れた URL は消えます。よろしいですか？')) return;
         const msg = doc.getElementById('shoot-mode-msg');
         if (msg) msg.textContent = '保存しています…';
+        // 送っている間は 3 つとも押させない (続けて押すと後から届いたほうが黙って勝つ — Codex PR-A 名指し4 M)
+        const allBtns = doc.querySelectorAll('[data-shoot-mode]');
+        allBtns.forEach(function (b) { b.disabled = true; });
+        // 画面が見ていた判定を添える。ほかの人が先に変えていたらサーバが 409 で止める
+        const modeBox = doc.getElementById('shoot-mode-box');
+        const shown = modeBox && modeBox.dataset.current ? modeBox.dataset.current : null;
         let json;
-        try { json = await deps.post(deps.base + '/shoot-mode', { mode: btn.dataset.shootMode }); }
+        try { json = await deps.post(deps.base + '/shoot-mode', { mode: btn.dataset.shootMode, expected: shown }); }
         catch (e) { json = { ok: false, error: '通信できませんでした' }; }
+        if (!json.ok) allBtns.forEach(function (b) { b.disabled = false; });
         if (!json.ok && msg) msg.textContent = '保存できませんでした: ' + (json.error || '');
         // 欄を元の値に戻すのは保存できたときだけ (失敗したら判定は変わらないので、打った URL を残す — 名指し3 M)
         if (json.ok && dropCam) cam.value = cam.defaultValue || '';

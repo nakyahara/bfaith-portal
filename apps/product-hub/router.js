@@ -19,7 +19,7 @@ import {
   getDB, logEvent, gateReasons, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
-  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, setShootMode, SHOOT_MODES, SHOOT_MODE_CODES, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
+  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, setShootMode, materialStepWouldBreak, SHOOT_MODES, SHOOT_MODE_CODES, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, MATERIAL_STATUS_LABELS, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
@@ -1469,7 +1469,13 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     // 撮影判定と食い違う素材ステータスは保存しない (古いタブからの保存も同じ)。変えたいなら撮影判定のほうで選ばせる
     //   撮影が要る なのに「撮影不要」→ 撮影しないまま ③素材待ち を通れてしまう — Codex PR-A 名指し High
     //   撮影不要 なのに「撮影不要 / 素材完了」以外 → 撮影不要と出ているのに ③ が閉じられない — Codex PR-A R2 P2
-    const sm = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.shoot_mode;
+    const ipNow = db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(draft.id) || {};
+    const sm = ipNow.shoot_mode;
+    // ③素材待ち を完了したあとで、③ の条件を満たさない値へ変える保存 (古いタブの一括保存を含む) は 409。
+    // 値が変わらない保存は通す — Codex PR-A 名指し4 High
+    if (materialVal !== (ipNow.material_status ?? null) && materialStepWouldBreak(db, draft.id, { shootMode: sm ?? null, material: materialVal })) {
+      return res.status(409).json({ ok: false, error: `③素材待ち はもう完了しているので、撮影・素材ステータスを「${MATERIAL_STATUS_LABELS[materialVal] || '未設定'}」にはできません。戻すなら、先にボードでカードを ③素材待ち に戻してください (画面を読み直すと今の値が出ます)` });
+    }
     if ((sm === 'inhouse' || sm === 'photographer') && materialVal === 'not_required') {
       return res.status(400).json({ ok: false, error: `撮影判定が「${sm === 'inhouse' ? '社内撮影' : 'カメラマン撮影'}」なので、撮影・素材ステータスを「撮影不要」にはできません。撮影が要らないなら、撮影判定で「撮影不要」を押してください (画面を読み直すと今の値が出ます)` });
     }
@@ -1570,16 +1576,22 @@ router.post('/api/drafts/:id/shoot-mode', (req, res) => {
     return res.status(403).json({ ok: false, error: '撮影判定を変えられるのは 画像登録者・画像作成承認者 の担当者か管理者だけです' });
   }
   // 文字列の決まった値か null (未判定に戻す) だけ受ける。欠落・typo を「未判定」に倒さない
+  const validMode = (v) => v === null || (typeof v === 'string' && SHOOT_MODE_CODES.has(v));
   const mode = req.body?.mode;
-  if (!(mode === null || (typeof mode === 'string' && SHOOT_MODE_CODES.has(mode)))) {
+  if (!validMode(mode)) {
     return res.status(400).json({ ok: false, error: 'mode は none / inhouse / photographer / null で指定してください' });
+  }
+  // expected = 画面が表示していた判定 (省略可)。違っていたら 409 (ほかの人が先に変えた)
+  const hasExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expected');
+  if (hasExpected && !validMode(req.body.expected)) {
+    return res.status(400).json({ ok: false, error: 'expected は none / inhouse / photographer / null で指定してください' });
   }
   let r;
   try {
-    r = setShootMode(getDB(), draft.id, mode, { actor: actorOf(req) });
+    r = setShootMode(getDB(), draft.id, mode, { actor: actorOf(req), expected: hasExpected ? req.body.expected : undefined });
   } catch (e) {
-    // ③素材待ち を完了したあとで素材が要る判定に変えようとした (先に ③ へ戻してもらう)
-    if (e?.code === 'material_step_done') return res.status(409).json({ ok: false, error: e.message });
+    // ③素材待ち を完了したあとで素材が要る判定に変えようとした (先に ③ へ戻してもらう) / ほかの人が先に変えた
+    if (e?.code === 'material_step_done' || e?.code === 'shoot_mode_conflict') return res.status(409).json({ ok: false, error: e.message });
     throw e;
   }
   res.json({ ok: true, changed: r.changed, shoot_mode: mode, material_status: r.material_status });
