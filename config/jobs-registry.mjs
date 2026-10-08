@@ -555,8 +555,9 @@ export const JOBS_REGISTRY = [
       + 'retry では f_sales の上流 (写しが再失敗 = f_sales を作り直さない)。写しが retry に載った日だけ「写しの鎖」= 写しが直ったら f_sales → sales_velocity → pml_snapshot → Render同期 を一段ずつ (途中で落ちたらその先は残す。retry-state の amazon_map_chain)。'
       + '🆕 ⑦-2 PR-C (#1652) を配った後: 持ち主を読めない朝 (watcher に届かない・COMPANY_DB_WATCH_URL が無い・子の異常終了) は config (configured の listing_components.amazon = company) を手がかりに ❌ = retry に載る '
       + '(配ってから widen までの DB の active が load の間も。持ち主を読めた朝は ⏭️ exit 0 のまま)。retry で写しが ⏭️ (持ち主 load = 何も書いていない) で直った回は鎖を外す '
-      + '(retry-failed-jobs.js の mapWroteNothing = f_sales 以降・照合・新商品の許可を走らせ直さない)。写しが鍵待ち (73) 以外で落ちた回は古い表が前のまま = '
-      + 'もとの remaining の f_sales・Render同期 などは古い表で普通に再試行し、写しだけを鎖の未完で残す (写しが後で本当に写せた回に鎖が f_sales から全部を流し直す)。鍵待ち (73) の回だけ f_sales 以降を見送る。'
+      + '(retry-failed-jobs.js の mapWroteNothing = f_sales 以降・照合・新商品の許可を走らせ直さない)。写しが落ちた回は写しの前後の写しの記録 (warehouse.db の sync_meta cdb_amazon_map_publish) を比べる (#1652 Codex R2): '
+      + '前のままと確かめられた = 古い表は前のまま = もとの remaining の f_sales・Render同期 などは古い表で普通に再試行し、写しだけを鎖の未完で残す (写しが後で本当に写せた回に鎖が f_sales から全部を流し直す) / '
+      + '記録が変わった (commit の後の終了処理で timeout・異常終了) = 写せた扱い (⚠️) で f_sales から鎖を流す / 鍵待ち (73)・記録を読めない = その回は f_sales・sales_velocity・pml_snapshot・Render同期 を流さない。'
       + 'ping は打たない (この台帳の 1 工程)。新しい定期実行は無い)',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',

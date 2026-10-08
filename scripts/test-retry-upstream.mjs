@@ -55,11 +55,11 @@ t('🚨 ⑦-2 PR-A: 写しをこの回で再試行して鍵待ち (73) → f_sal
   const r1 = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: runner({ 'CompanyDB写し(Amazon SKU)': { success: false, summary: '❌ 別の写しが動いている', exitCode: 73 } }), log: quiet });
   assert.deepEqual(started, ['CompanyDB写し(Amazon SKU)']);
   assert.deepEqual(r1.map((x) => [x.name, x.success]), [['CompanyDB写し(Amazon SKU)', false], ['f_sales', false], ['Render同期', false]]);
-  assert.equal(r1.find((x) => x.name === 'f_sales').summary, '⏸️ skipped (CompanyDB写し(Amazon SKU) 再失敗)');
+  assert.equal(r1.find((x) => x.name === 'f_sales').summary, '⏸️ skipped (写しが鍵待ち (73)・Amazon SKU の写しの鎖)');
   assert.equal(r1.amazonChainPending, true);
   started.length = 0;
   // 鍵待ち以外 (断った・読めない・timeout) = 写しは何も書いていない = f_sales・Render同期 は古い表で普通に再試行。写しだけが残る (鎖の未完)
-  const r1b = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: runner({ 'CompanyDB写し(Amazon SKU)': { success: false, summary: '❌ 断った (shrunk)', exitCode: 1 } }), log: quiet });
+  const r1b = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: runner({ 'CompanyDB写し(Amazon SKU)': { success: false, summary: '❌ 断った (shrunk)', exitCode: 1 } }), log: quiet, readMapMeta: () => ({ value: '{"same":1}' }) });   // 写しの記録が前のまま = 確かめられた
   assert.deepEqual(started, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   assert.deepEqual(r1b.filter((x) => !x.success).map((x) => x.name), ['CompanyDB写し(Amazon SKU)']);
   assert.equal(r1b.amazonChainPending, true);

@@ -10,7 +10,7 @@
  */
 import assert from 'node:assert/strict';
 
-const { runRetryRound, RERUN_AFTER, rerunAfterProblems, RETRY_ORDER, JOB_DEFINITIONS, runScript, failSummary, AMAZON_MAP_CHAIN, amazonChainActive, mapWroteNothing, MAP_NOT_APPLIED_RE } = await import('../apps/warehouse/retry-failed-jobs.js');
+const { runRetryRound, RERUN_AFTER, rerunAfterProblems, RETRY_ORDER, JOB_DEFINITIONS, runScript, failSummary, AMAZON_MAP_CHAIN, amazonChainActive, mapWroteNothing, MAP_NOT_APPLIED_RE, mapOutcome, readMapPublishMeta, MAP_META_KEY } = await import('../apps/warehouse/retry-failed-jobs.js');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -185,9 +185,11 @@ await ta('[4f] ⑦-2 PR-C: config が company・DB の active が load (配っ�
   assert.deepEqual(v.calls, ['CompanyDB写し(Amazon SKU)', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   assert.deepEqual(rv.filter((r) => !r.success).map((r) => r.name), ['sales_velocity']);
   assert.equal(rv.amazonChainPending, false);
-  // 写しがまた読めずに落ちた (#1652 Codex R1 Medium) = 古い表は前のまま = もとの remaining の f_sales・Render同期 は普通に再試行して戻る・写しだけが鎖の未完で残る
+  // 写しがまた読めずに落ちた・写しの記録が前のままと確かめられた (#1652 Codex R1 Medium / R2 High) = 古い表は前のまま =
+  //   もとの remaining の f_sales・Render同期 は普通に再試行して戻る・写しだけが鎖の未完で残る
+  const SAME = () => ({ value: '{"content_hash":"前の写し","published_at":"2026-10-08T00:00:00.000Z"}' });
   const d = fakeRun({ 'CompanyDB写し(Amazon SKU)': true });
-  const rd = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: d.run, log: quiet, amazonChain: true });
+  const rd = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: d.run, log: quiet, amazonChain: true, readMapMeta: SAME });
   assert.deepEqual(d.calls, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   assert.deepEqual(rd.filter((r) => !r.success).map((r) => r.name), ['CompanyDB写し(Amazon SKU)']);
   assert.equal(rd.amazonChainPending, true);
@@ -202,12 +204,66 @@ await ta('[4f] ⑦-2 PR-C: config が company・DB の active が load (配っ�
   const rd3 = runRetryRound(st.remaining_jobs, { run: d3.run, log: quiet, amazonChain: true });
   assert.deepEqual(d3.calls, ['CompanyDB写し(Amazon SKU)']);
   assert.equal(rd3.amazonChainPending, false);
-  // 鍵待ち (73・持ち主 company で別の写しが書いている途中かも) は今までどおり f_sales を見送る (鎖のまま)
+  // 鍵待ち (73・持ち主 company で別の写しが書いている途中かも) は今までどおり f_sales を見送る (鎖のまま)・Render同期 も流さない (R2 High)
   const k = { calls: [], run: (s, name) => { k.calls.push(name); return name === 'CompanyDB写し(Amazon SKU)' ? { success: false, summary: '❌ 別の写しが動いている', exitCode: 73 } : { success: true, summary: '✅' }; } };
-  const rk = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales'], { run: k.run, log: quiet, amazonChain: true });
+  const rk = runRetryRound(['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期'], { run: k.run, log: quiet, amazonChain: true, readMapMeta: SAME });
   assert.deepEqual(k.calls, ['CompanyDB写し(Amazon SKU)']);
-  assert.deepEqual(rk.filter((r) => !r.success).map((r) => r.name), ['CompanyDB写し(Amazon SKU)', 'f_sales']);
+  assert.deepEqual(rk.filter((r) => !r.success).map((r) => r.name), ['CompanyDB写し(Amazon SKU)', 'f_sales', 'Render同期']);
   assert.equal(rk.amazonChainPending, true);
+  // 🚨 #1652 Codex R2 High の順番: 前の回 = 写しが落ち、f_sales だけ古い対応で戻り、Render同期 が落ちた → この回の remaining = 写し・Render同期 だけ
+  const REM = ['CompanyDB写し(Amazon SKU)', 'Render同期'];
+  const timeoutFail = { success: false, summary: '❌ … | spawnSync node ETIMEDOUT', exitCode: null };
+  const runWith = (mapResult) => { const c = []; return { c, run: (s, name) => { c.push(name); return name === 'CompanyDB写し(Amazon SKU)' ? mapResult : { success: true, summary: '✅' }; } }; };
+  //   (a) 写しが commit の後の終了処理で timeout (写しの記録が変わった) = 古い表はもう新しい対応 = 写せた扱い (⚠️) で f_sales から鎖を流す (古い f_sales で Render同期 しない)
+  let n = 0;
+  const changed = () => ({ value: `{"content_hash":"h","published_at":"2026-10-08T0${n++}:00:00.000Z"}` });
+  const ta1 = runWith(timeoutFail);
+  const ra1 = runRetryRound(REM, { run: ta1.run, log: quiet, amazonChain: true, readMapMeta: changed });
+  assert.deepEqual(ta1.c, ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  const m1 = ra1.find((r) => r.name === 'CompanyDB写し(Amazon SKU)');
+  assert.equal(m1.success, true); assert.equal(m1.committed_after_failure, true); assert.match(m1.summary, /^⚠️ .*写し終わっていた/);
+  assert.equal(ra1.amazonChainPending, false);
+  //   (a') 鎖の印が無い回 (amazonChain = false) でも、commit 済みなら f_sales から流す
+  const ta1b = runWith(timeoutFail);
+  runRetryRound(REM, { run: ta1b.run, log: quiet, amazonChain: false, readMapMeta: changed });
+  assert.deepEqual(ta1b.c.slice(0, 5), ['CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', 'Render同期']);
+  //   (b) 前のままと確かめられた = 古い表は前のまま = Render同期 は古い表 (f_sales も古い対応) で普通に再試行・写しは残る
+  const tb = runWith(timeoutFail);
+  const rb2 = runRetryRound(REM, { run: tb.run, log: quiet, amazonChain: true, readMapMeta: SAME });
+  assert.deepEqual(tb.c, ['CompanyDB写し(Amazon SKU)', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.deepEqual(rb2.filter((r) => !r.success).map((r) => r.name), ['CompanyDB写し(Amazon SKU)']);
+  assert.equal(rb2.amazonChainPending, true);
+  //   (c) 読めない (前か後) = 分からない = 推測しない = Render同期 を流さない (73 と同じ)・写しと Render同期 が残る
+  for (const reader of [() => ({ unreadable: true }), (() => { let i = 0; return () => (i++ === 0 ? SAME() : { unreadable: true }); })(), (() => { let i = 0; return () => (i++ === 0 ? { unreadable: true } : SAME()); })()]) {
+    const tc = runWith(timeoutFail);
+    const rc = runRetryRound(REM, { run: tc.run, log: quiet, amazonChain: true, readMapMeta: reader });
+    assert.deepEqual(tc.c, ['CompanyDB写し(Amazon SKU)']);
+    assert.deepEqual(rc.filter((r) => !r.success).map((r) => [r.name, r.summary]), [['CompanyDB写し(Amazon SKU)', timeoutFail.summary], ['Render同期', '⏸️ skipped (写しの結果が分からない (写しの記録を読めない)・Amazon SKU の写しの鎖)']]);
+    assert.equal(rc.amazonChainPending, true);
+  }
+  //   既定の読み手 = 本物の warehouse.db の sync_meta (無い = 読めない)・前後の比べ方
+  assert.equal(MAP_META_KEY, (await import('../apps/company-db/publish/amazon-map.mjs')).META_KEY);
+  assert.equal(readMapPublishMeta({ dataDir: 'C:/nonexistent-amzC-r2' }).unreadable, true);
+  {
+    const os = await import('node:os'); const path = await import('node:path'); const fs = await import('node:fs');
+    const { createRequire } = await import('node:module');
+    const Database = createRequire(import.meta.url)('better-sqlite3');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amzC-meta-'));
+    try {
+      const w = new Database(path.join(dir, 'warehouse.db'));
+      w.exec('CREATE TABLE sync_meta (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)');
+      const before = readMapPublishMeta({ dataDir: dir });
+      assert.deepEqual(before, { value: null });
+      w.prepare('INSERT INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)').run(MAP_META_KEY, '{"published_at":"x"}', 'x');
+      const after = readMapPublishMeta({ dataDir: dir });
+      w.close();
+      assert.deepEqual(after, { value: '{"published_at":"x"}' });
+      assert.equal(mapOutcome(before, after), 'committed');
+      assert.equal(mapOutcome(after, after), 'unchanged');
+      assert.equal(mapOutcome(before, { unreadable: true }), 'unknown');
+      assert.equal(mapOutcome(null, after), 'unknown');
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
   // 持ち主 company で写した (✅) 回は今までどおり鎖で一段ずつ ([4c] と同じ)
   const c = fakeRun({ 'warn:CompanyDB写し(Amazon SKU)': '✅ CompanyDB写し(Amazon SKU): 変わった行 0 / 対応 1 件' });
   runRetryRound(['CompanyDB写し(Amazon SKU)'], { run: c.run, log: quiet, amazonChain: true });
