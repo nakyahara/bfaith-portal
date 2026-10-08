@@ -639,6 +639,14 @@ export const MATERIAL_STATUSES = [
 ];
 export const MATERIAL_STATUS_CODES = new Set(MATERIAL_STATUSES.map((m) => m.code));
 export const MATERIAL_STATUS_LABELS = Object.fromEntries(MATERIAL_STATUSES.map((m) => [m.code, m.label]));
+/** 撮影判定 (2026-10-08 画像制作の新フロー)。sub = ボタンの下に出す一言 */
+export const SHOOT_MODES = [
+  { code: 'none', label: '撮影不要', sub: '今ある素材で作る' },
+  { code: 'inhouse', label: '社内撮影', sub: 'スマホ・自然光でOK' },
+  { code: 'photographer', label: 'カメラマン撮影', sub: '外注・スタイリング込み' },
+];
+export const SHOOT_MODE_CODES = new Set(SHOOT_MODES.map((m) => m.code));
+export const SHOOT_MODE_LABELS = Object.fromEntries(SHOOT_MODES.map((m) => [m.code, m.label]));
 /** 旧 Notion 5 値 (shipping_status) → material_status の写像 */
 export const SHIPPING_TO_MATERIAL = {
   '撮影依頼不要': 'not_required', '撮影商品未発送': 'not_shipped', '撮影商品発送手配済み': 'shipped',
@@ -1981,6 +1989,13 @@ export function initProductHubDB() {
     //   田中さんが構成を作り、すり合わせを見える形にして大輔さんに制作意図を伝える
     ['top_compose_text', 'ALTER TABLE draft_image_production ADD COLUMN top_compose_text TEXT'],
     ['top_ref_url', 'ALTER TABLE draft_image_production ADD COLUMN top_ref_url TEXT'],
+    // 2026-10-08 スタッフ要望 (画像制作の新フロー): 編集データ (PSD 等) のリンクと撮影判定。
+    //   shoot_mode = NULL (未判定) / 'none' 撮影不要 / 'inhouse' 社内撮影 / 'photographer' カメラマン撮影。
+    //   画像タブの「画像制作情報を保存」では書かない (専用の口 setShootMode だけ。素材ステータスをそろえるため)
+    ['edit_data_url', 'ALTER TABLE draft_image_production ADD COLUMN edit_data_url TEXT'],
+    ['shoot_mode', "ALTER TABLE draft_image_production ADD COLUMN shoot_mode TEXT CHECK (shoot_mode IN ('none', 'inhouse', 'photographer'))"],
+    ['shoot_mode_at', 'ALTER TABLE draft_image_production ADD COLUMN shoot_mode_at TEXT'],
+    ['shoot_mode_by', 'ALTER TABLE draft_image_production ADD COLUMN shoot_mode_by TEXT'],
   ];
   for (const [col, sql] of ipAlters) {
     if (ipCols.has(col)) continue;
@@ -2607,6 +2622,39 @@ export function setImageWorkflowState(db, draftId, state, { note = null, actor =
 }
 
 /**
+ * 撮影判定を変える (2026-10-08 画像制作の新フロー)。null = 未判定に戻す。
+ * 撮影・素材ステータスもそろえる — ③素材待ち の完了条件とボードの「撮影指示書 対象外」はそちらを見ているため:
+ *   撮影不要 にした → 素材ステータスが「素材完了」でなければ「撮影不要」にする
+ *   撮影が要る にした → 素材ステータスが「撮影不要」なら未設定に戻す (撮影不要のまま ③ を通さない)
+ * 冪等: 同じ判定なら changed=false でイベントも残さない
+ * @returns {{changed: boolean, material_status: string|null}}
+ */
+export function setShootMode(db, draftId, mode, { actor = null } = {}) {
+  const m = mode == null ? null : String(mode);
+  if (m !== null && !SHOOT_MODE_CODES.has(m)) throw new Error('撮影判定の値が不正です');
+  const id = Number(draftId);
+  const run = db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
+    const cur = db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(id);
+    if ((cur.shoot_mode ?? null) === m) return { changed: false, material_status: cur.material_status ?? null };
+    let material = cur.material_status ?? null;
+    if (m === 'none' && material !== 'ready') material = 'not_required';
+    else if ((m === 'inhouse' || m === 'photographer') && material === 'not_required') material = null;
+    db.prepare(`
+      UPDATE draft_image_production
+      SET shoot_mode = ?, shoot_mode_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), shoot_mode_by = ?,
+          material_status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = ?
+    `).run(m, actor, material, id);
+    const materialNote = material !== (cur.material_status ?? null)
+      ? ` (撮影・素材ステータス: ${MATERIAL_STATUS_LABELS[cur.material_status] || '未設定'} → ${MATERIAL_STATUS_LABELS[material] || '未設定'})` : '';
+    logEvent(db, id, 'shoot_mode_changed', `撮影判定を「${m ? SHOOT_MODE_LABELS[m] : '未判定'}」に${materialNote}`, actor);
+    return { changed: true, material_status: material };
+  });
+  return run();
+}
+
+/**
  * 「確認中」を立てる / 理由・メモを差し替える (2026-08-31)。
  *
  * status も工程も動かさない。効くのは 2 つだけ:
@@ -2689,6 +2737,7 @@ const IMAGE_PRODUCTION_FIELDS = [
   'back_info_text', 'back_info_updated_at', 'back_info_updated_by',   // 2026-09-10 裏面情報 (任意)
   'compose_status', 'compose_updated_at', 'compose_updated_by',   // 2026-09-13 本番の構成の 済/まだ
   'top_compose_text', 'top_ref_url',   // 2026-09-13 TOP画像の構成と参考・ラフの URL
+  'edit_data_url',   // 2026-10-08 編集データ (PSD 等) のリンク
 ];
 
 /** draft_image_production の upsert (部分更新)。undefined の項目は今の値を残し、null は消す */

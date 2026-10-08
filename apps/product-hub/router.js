@@ -19,7 +19,7 @@ import {
   getDB, logEvent, gateReasons, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
-  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
+  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, setShootMode, SHOOT_MODES, SHOOT_MODE_CODES, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
@@ -543,8 +543,19 @@ router.get('/detail/:id', (req, res) => {
     lpCompose: lpComposeInitialState(db, draft),
     // 「🖼 画像を作る」(段階2・2026-10-04)。同じく最初の表示をここで作る
     lpImage: lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }),
+    // 画像制作の新フロー (2026-10-08): 撮影判定の 3 択と、撮影依頼文の宛先
+    imageFlow: { shootModes: SHOOT_MODES, mention: shootRequestMention() },
   });
 });
+
+/**
+ * 撮影依頼文の 1 行目 (宛先)。2026-10-08 スタッフのラフは「@つくば」。
+ * env PH_SHOOT_REQUEST_MENTION で変えられる (空にすると宛先の行を入れない)
+ */
+function shootRequestMention(env = process.env) {
+  if (env.PH_SHOOT_REQUEST_MENTION === undefined) return '@つくば';
+  return String(env.PH_SHOOT_REQUEST_MENTION).trim().slice(0, 60);
+}
 
 // ─── API: ドラフト作成/更新 ───────────────────────────────
 
@@ -1443,6 +1454,11 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (topRefVal && !isHttpUrl(topRefVal)) {
     return res.status(400).json({ ok: false, error: '参考・ラフのURL形式が不正です (http/https)' });
   }
+  // 編集データ (PSD 等) のリンク (2026-10-08 画像制作の新フロー)
+  const editDataVal = b.edit_data_url !== undefined ? cleanText(b.edit_data_url, 1000) : undefined;
+  if (editDataVal && !isHttpUrl(editDataVal)) {
+    return res.status(400).json({ ok: false, error: '編集データリンクのURL形式が不正です (http/https)' });
+  }
   // 画像工程 v2 (2026-08-26): 撮影・素材ステータスは安定コードだけ受ける / 商品情報は変更時に更新者・日時を残す
   let materialVal;
   if (b.material_status !== undefined) {
@@ -1491,6 +1507,7 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     // TOP画像の構成 (簡単なもの) と参考・ラフの URL (2026-09-13)
     top_compose_text: clean(b.top_compose_text, 2000),
     top_ref_url: topRefVal,
+    edit_data_url: editDataVal,
     material_status: materialVal,
     product_info_text: infoVal,
     product_info_updated_at: infoAt,
@@ -1532,6 +1549,23 @@ router.post('/api/drafts/:id/image-hold', (req, res) => {
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
+});
+
+// 撮影判定 (2026-10-08 画像制作の新フロー)。押した時点で保存する (保存ボタンを待たない)。
+// 撮影・素材ステータスもサーバでそろえる (setShootMode)。工程は動かさない
+router.post('/api/drafts/:id/shoot-mode', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '撮影判定を変えられるのは 画像登録者・画像作成承認者 の担当者か管理者だけです' });
+  }
+  // 文字列の決まった値か null (未判定に戻す) だけ受ける。欠落・typo を「未判定」に倒さない
+  const mode = req.body?.mode;
+  if (!(mode === null || (typeof mode === 'string' && SHOOT_MODE_CODES.has(mode)))) {
+    return res.status(400).json({ ok: false, error: 'mode は none / inhouse / photographer / null で指定してください' });
+  }
+  const r = setShootMode(getDB(), draft.id, mode, { actor: actorOf(req) });
+  res.json({ ok: true, changed: r.changed, shoot_mode: mode, material_status: r.material_status });
 });
 
 // 本番の構成の 済 / まだ (2026-09-13 スタッフ要望)。縦列 ②仮構成 (imgd_compose) とは別に持つ —
