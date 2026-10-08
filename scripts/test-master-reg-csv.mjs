@@ -1199,7 +1199,7 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
       added: [
         "-- 🆕 0065 (ne-reg-single-v2・中原さん 10/8 夜): JAN は NE に送らない (Company DB の JAN は残す) = JAN の列は常に empty・JAN の数とチェック数字で止めない",
         "coalesce(v_taxc, ''), coalesce(v_hand, ''), v_parc, 'empty'));"] },
-    'ops.ne_reg_build': { base: '0058_master_widen.sql',
+    'ops.ne_reg_build': { base: '0064_uppercase_new_codes.sql',
       removed: [
         "if not ((v_kind = 'products' and v_schema ~ '^ne-reg-single-v[0-9]+$' and v_header like 'syohin_code,%')",
         "or (v_kind = 'sets' and v_schema ~ '^ne-reg-set-v[0-9]+$' and v_header like 'set_syohin_code,%')) then",
@@ -1229,7 +1229,7 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
         "raise exception 'schema_not_buildable: ファイル % の形の版 % はもう配らない (%)。使わないにして作り直す', p_export_id, e.schema_version,",
         "coalesce(ops.ne_reg_schema_rule(e.schema_version) ->> 'why', '知らない版') using errcode = 'P0001';",
         "end if;"] },
-    'ops.record_ne_registration_check': { base: '0063_ne_reg_auto_verify_issued.sql',
+    'ops.record_ne_registration_check': { base: '0064_uppercase_new_codes.sql',
       removed: [
         "-- 鍵: SKU ごと (sku_id の順・保存と同じ鍵) → CSV の鍵",
         "perform ops.ne_reg_lock_skus((select pg_catalog.array_agg(t.sku_id) from ops.v_ne_reg_targets t",
@@ -1237,8 +1237,8 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
         "for it in select i.*, e.declared_at as export_declared_at, e.issued_at as export_issued_at",
         "v_out := case when (v_cmp -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;",
         "v_out := case when (v_cmp -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;",
-        "'not_imported', v_late, 'auto_block', v_block, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));",
-        "return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs);"],
+        "'not_imported', v_late, 'auto_block', v_block, 'spelling', v_spell, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));",
+        "return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs, 'case_mismatch', v_case);"],
       added: [
         "v_cdb      jsonb;",
         "v_drift    jsonb := '[]'::jsonb;",
@@ -1259,7 +1259,7 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
         "v_out := case when (v_cmp -> 'ok') = 'true'::jsonb and (v_cdb -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;",
         "v_cdb := ops.ne_reg_cdb_compare(it.expected, it.sku_id);   -- 🆕 0065: 3 者一致 (期待値 = NE の観測 = 今の Company DB)",
         "v_out := case when (v_cmp -> 'ok') = 'true'::jsonb and (v_cdb -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;",
-        "'not_imported', v_late, 'auto_block', v_block, 'cdb', v_cdb, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));",
+        "'not_imported', v_late, 'auto_block', v_block, 'spelling', v_spell, 'cdb', v_cdb, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));",
         "-- 🆕 0065: 門の無い版の最初の確かめ = 実機の確かめ (schema_verified) に記録だけ (その版の記録がまだ 1 つも無いとき)",
         "if (ops.ne_reg_schema_rule(it.export_schema) -> 'trial_gate') = 'false'::jsonb",
         "and not exists (select 1 from ops.ne_csv_verified v where v.kind = it.export_kind and v.col = 'new_registration' and v.encoding = 'utf8'",
@@ -1270,7 +1270,7 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
         "if v_out = 'partial' and (v_cmp -> 'ok') = 'true'::jsonb and (v_cdb -> 'ok') is distinct from 'true'::jsonb then",
         "v_drift := v_drift || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('code', it.ne_code, 'export_id', it.export_id::text, 'cols', v_cdb -> 'cols'));   -- 🆕 0065",
         "end if;",
-        "return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs, 'cdb_drift', v_drift);"] },
+        "return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs, 'case_mismatch', v_case, 'cdb_drift', v_drift);"] },
   };
   for (const [name, want] of Object.entries(WANT)) {
     const prev = MIG_FILES.filter((x) => x < F0065 && fnDefIn(x, name)).pop();

@@ -18,12 +18,13 @@
 --                              🚨 まだ作らない (まとまりの表と関数 = PR-5 で開く)。版の名前と決まりだけここで固定する
 --        ne-reg-set-v1       = セット。今までどおり (試し用 5 行までの門あり)
 --   3. ops.ne_reg_canonical (0053 の置き換え): 単品の JAN の列を常に empty に (JAN の確かめで止めない)
---   4. ops.ne_reg_build (0058 の置き換え): 形の版の確かめを ops.ne_reg_schema_rule に・作れない版は schema_not_buildable・門の無い版は試し用にしない
+--   4. ops.ne_reg_build (0064 の置き換え): 形の版の確かめを ops.ne_reg_schema_rule に・作れない版は schema_not_buildable・門の無い版は試し用にしない
 --   4b. ops.ne_reg_issue (0058 の置き換え): 初めて配るのは作れる版だけ (0065 の前に作って配っていない v1 は配らない)。配った後の道は今までどおり
 --   5. ops.ne_reg_cdb_compare = 期待値と今の Company DB の値を比べる (単品の代表 (親)。まとまりの PR で効く・関数の形はここで)
---   6. ops.record_ne_registration_check (0063 の置き換え): verified = NE の観測が期待値と合う かつ 今の Company DB も期待値と合う (3 者一致)。
+--   6. ops.record_ne_registration_check (0064 の置き換え): verified = NE の観測が期待値と合う かつ 今の Company DB も期待値と合う (3 者一致)。
 --        NE は合うが Company DB が違う = partial (起きないはずの事故 = 答えの cdb_drift で知らせる)・門の無い版の最初の確かめ = schema_verified の記録だけ。
---        鍵 = マスタの書き込み (共有) → 確かめ → SKU → 親子 (共有) → CSV (夜間ロード・代表の変更が終わってから、その後の値で比べる)
+--        鍵 = マスタの書き込み (共有) → 確かめ → SKU → 親子 (共有) → CSV → NE のコード (共有・0064) (夜間ロード・代表の変更が終わってから、その後の値で比べる)。
+--        0064 の NE の元の書き方の確かめ (ops.ne_reg_spelling_problem・書き方が違う / 分からない = 比べない) はそのまま
 --   7. 「一度でも配った」の守り: ops.sku_ever_issued (ファイルの issued_at = 一度付いたら動かない・品目は消さない = 追記だけの証跡) と
 --        core.guard_parent_after_issue (core.products の代表 (親) を、その商品の SKU の CSV を一度でも配った後は変えない・外さない)。
 --        products.parent の持ち主 (DB の active) が company のときだけ見る (load の間は夜間ロードが NE の代表を写す = 止めない)
@@ -179,9 +180,9 @@ end $$;
 
 revoke all on function ops.ne_reg_canonical(bigint, date) from public;
 
--- ─── 4. NE 登録の CSV を作る (0058 の置き換え・引数は同じ) ───
+-- ─── 4. NE 登録の CSV を作る (0064 の置き換え・引数は同じ) ───
 /**
- * 0058 と同じ (鍵の順・許可・NE のコード・行と確かめる値の照らし直し・印とハッシュ・約束) で、変えたのは形の版の確かめと試し用だけ:
+ * 0064 と同じ (鍵の順・許可・NE のコード・大文字のコードの確かめ・行と確かめる値の照らし直し・印とハッシュ・約束) で、変えたのは形の版の確かめと試し用だけ:
  *   🆕 0065: 種類・見出し・作れる版かは ops.ne_reg_schema_rule (作れない版 = schema_not_buildable)・門の無い版 (single-v2・variation-v1) は試し用にしない
  */
 create or replace function ops.ne_reg_build(p jsonb, p_bytes bytea) returns jsonb
@@ -296,7 +297,8 @@ begin
     if v_sku.sku_kind is distinct from (case v_kind when 'products' then 'single' else 'set' end) then
       raise exception 'not_ready: % は % でない', v_sku.code, v_kind using errcode = 'P0001';
     end if;
-    if v_sku.code !~ '^[a-z0-9_-]{1,30}$' then raise exception 'not_ready: % は新しいコードの形でない', v_sku.code using errcode = 'P0001'; end if;
+    -- 🆕 0064: 大文字も (CSV には打ったとおりの書き方を書く・品目の ne_code の CHECK も同じ形)
+    if v_sku.code !~ '^[A-Za-z0-9_-]{1,30}$' then raise exception 'not_ready: % は新しいコードの形でない', v_sku.code using errcode = 'P0001'; end if;
     select r.state into v_reg from ops.master_registrations r where r.sku_id = v_sku.sku_id for share;
     if v_reg is null or v_reg not in ('draft', 'ne_pending') then
       raise exception 'not_ready: % の登録の状態が % (下書き・NE 登録待ちだけ)', v_sku.code, coalesce(v_reg, 'なし') using errcode = 'P0001';
@@ -487,9 +489,9 @@ begin
 end $$;
 revoke all on function ops.ne_reg_cdb_compare(jsonb, bigint) from public;
 
--- ─── 6. 翌朝の照合の確かめ (0063 の置き換え・引数は同じ) ───
+-- ─── 6. 翌朝の照合の確かめ (0064 の置き換え・引数は同じ) ───
 /**
- * 0063 と同じ (受け取り・観測・申告あり / なしの道・自動にしない品目・知らせ・鍵の順) で、変えたのは:
+ * 0064 と同じ (受け取り・観測・申告あり / なしの道・自動にしない品目・NE の元の書き方・知らせ・鍵の順) で、変えたのは:
  *   🆕 0065 3 者一致: 比べる = NE の観測が期待値と全部の列で合う (ops.ne_reg_compare) かつ 今の Company DB が期待値と合う (ops.ne_reg_cdb_compare) = verified。
  *     NE は合うが Company DB が違う = partial + 答えの cdb_drift (起きないはずの事故 = 知らせる)。記録の detail に cdb
  *   🆕 0065 鍵 (#1664 Codex R1 High): 最初にマスタの書き込みの鍵 (共有) = 夜間ロード (排他) の commit を待ってから比べる。SKU の鍵の後・CSV の鍵の前に親子の鍵 (共有)
@@ -498,7 +500,8 @@ revoke all on function ops.ne_reg_cdb_compare(jsonb, bigint) from public;
  *     (書く接続の statement_timeout 60 秒を超えたら、その朝の確かめは失敗 = 何も書かない・翌朝に確かめ直す)
  *   🆕 0065 schema_verified: 門の無い版 (ops.ne_reg_schema_rule の trial_gate = false) の品目を初めて verified にしたとき、その版の実機の確かめの記録が
  *     まだ 1 つも無ければ ok を 1 行残す (verified_by = ne_compare・記録だけ = 作る門には使わない)
- * 戻り値 { compare_run_id, counts, not_imported, not_imported_days, needs_declaration, cdb_drift: [{ code, export_id, cols }] }
+ *   0064 の NE の元の書き方の確かめ (ops.ne_reg_spelling_problem = 違う / 分からない = 比べない・答えの case_mismatch) はそのまま (3 者一致はその後に比べた品目だけ)
+ * 戻り値 { compare_run_id, counts, not_imported, not_imported_days, needs_declaration, case_mismatch (0064), cdb_drift: [{ code, export_id, cols }] }
  */
 create or replace function ops.record_ne_registration_check(p_run text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
@@ -518,6 +521,8 @@ declare
   v_block    text;
   v_needs    jsonb := '[]'::jsonb;
   v_reg      text;
+  v_spell    text;                  -- 🆕 0064: NE の元の書き方の問題 (null = 比べてよい)
+  v_case     jsonb := '[]'::jsonb;  -- 🆕 0064: 書き方が違う / 分からないので比べなかった品目
   v_cdb      jsonb;
   v_drift    jsonb := '[]'::jsonb;
   v_sid      bigint;
@@ -540,6 +545,8 @@ begin
   end loop;
   perform pg_catalog.pg_advisory_xact_lock_shared(core.parent_lock_key());
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_csv'));
+  -- 🆕 0064: NE の元の書き方 (0041) を読む鍵 (共有・書き手 ops.record_ne_codes と並ぶ)。鍵の順 = 確かめ → SKU → CSV → NE のコード (ops.ne_reg_build と同じ)
+  perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.ne_codes'));
   for it in select i.*, e.declared_at as export_declared_at, e.issued_at as export_issued_at, e.kind as export_kind, e.schema_version as export_schema, e.header as export_header
               from ops.ne_reg_export_items i join ops.ne_reg_exports e on e.export_id = i.export_id
              where i.state in ('issued', 'import_declared', 'partial')
@@ -552,6 +559,7 @@ begin
     v_cdb := null;
     v_late := false;
     v_block := null;
+    v_spell := ops.ne_reg_spelling_problem(it.ne_code, it.code_norm, p_run);   -- 🆕 0064
     -- 申告あり = 申告の時刻から (0053 のまま)・申告なし = 配った時刻から (0063)
     v_basis := case when it.attempt_id is not null then 'declared' else 'issued' end;
     if v_basis = 'declared' then
@@ -561,6 +569,8 @@ begin
         v_out := 'waiting';
       elsif (v_obs -> 'present') is distinct from 'true'::jsonb then
         v_out := case when h.absence_trusted then 'failed' else 'waiting' end;
+      elsif v_spell is not null then
+        v_out := 'case_hold';   -- 🆕 0064: NE のコードの書き方が配ったコード (原文) と違う / 分からない = 比べない (状態を進めない)
       else
         v_cmp := ops.ne_reg_compare(it.expected, v_obs);
         v_cdb := ops.ne_reg_cdb_compare(it.expected, it.sku_id);   -- 🆕 0065: 3 者一致 (期待値 = NE の観測 = 今の Company DB)
@@ -574,6 +584,8 @@ begin
       elsif (v_obs -> 'present') is distinct from 'true'::jsonb then
         v_out := 'waiting';   -- 申告が無い = 「取り込めなかった」と決めない
         v_late := h.absence_trusted and v_fetched > it.export_issued_at + pg_catalog.make_interval(days => v_days);
+      elsif v_spell is not null then
+        v_out := 'case_hold';   -- 🆕 0064: NE のコードの書き方が配ったコード (原文) と違う / 分からない = 比べない (状態を進めない)
       else
         v_cmp := ops.ne_reg_compare(it.expected, v_obs);
         v_cdb := ops.ne_reg_cdb_compare(it.expected, it.sku_id);   -- 🆕 0065: 3 者一致 (期待値 = NE の観測 = 今の Company DB)
@@ -585,10 +597,15 @@ begin
         end if;
       end if;
     end if;
+    if v_out = 'case_hold' then   -- 🆕 0064: 記録は待ち (waiting)・答えの case_mismatch に出す (照合の朝の要約)
+      v_out := 'waiting';
+      v_case := v_case || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('code', it.ne_code, 'export_id', it.export_id::text, 'reason', v_spell,
+        'ne_spellings', (select x.spellings from ops.master_ne_codes x where x.code_norm = it.code_norm and x.kind = 'product')));
+    end if;
     insert into ops.ne_reg_checks (compare_run_id, item_id, sku_id, fetched_at, outcome, detail)
       values (p_run, it.item_id, it.sku_id, v_fetched, v_out,
               pg_catalog.jsonb_build_object('state_before', it.state, 'basis', v_basis, 'compare', v_cmp, 'present', v_obs -> 'present', 'trusted', v_obs -> 'trusted',
-                'not_imported', v_late, 'auto_block', v_block, 'cdb', v_cdb, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));
+                'not_imported', v_late, 'auto_block', v_block, 'spelling', v_spell, 'cdb', v_cdb, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));
     if v_out = 'verified' then
       update ops.ne_reg_export_items set state = 'verified', verified_run = p_run, verified_at = pg_catalog.now(), state_changed_at = pg_catalog.now(), state_changed_by = 'ne_compare'
        where item_id = it.item_id;
@@ -629,7 +646,7 @@ begin
   update ops.ne_reg_exports e set state = 'closed', closed_at = pg_catalog.now(), closed_by = 'ne_compare', close_reason = 'finished'
    where e.state in ('issued', 'declared')
      and not exists (select 1 from ops.ne_reg_export_items i where i.export_id = e.export_id and i.state in ('built', 'issued', 'import_declared', 'partial'));
-  return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs, 'cdb_drift', v_drift);
+  return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs, 'case_mismatch', v_case, 'cdb_drift', v_drift);
 end $$;
 
 revoke all on function ops.record_ne_registration_check(text) from public;
