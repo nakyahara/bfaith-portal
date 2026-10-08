@@ -6276,6 +6276,8 @@ th.attr-unknown { color: #dc2626; }
         statusEl.textContent = '依頼できたか分かりません。もう一度押してください (二重にはなりません)';
       }
     });
+    // LP構成を直して保存したら、作る枚数・取り置き・押せるかを取り直す (PR-B・Codex PR-B 名指し M)
+    document.addEventListener('ph:lp-edit-saved', () => { if (!posting) poll(); });
     render(state);
   })();
   // 🤖 構成をAIに作らせる (段階1・PR1-d)。

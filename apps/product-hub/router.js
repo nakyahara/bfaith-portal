@@ -4076,7 +4076,11 @@ function lpcEditOf(db, st) {
 // 画像ごとに 役割・見出し・キャッチコピー・本文 を直し、TOP / FV 以外を並べ替え・追加・削除する。
 // 直した構成は ⑦ に書き戻して別の表に追記する (AI の出力は書き換えない)。画像生成と lp-tool のコピーはそれを読む
 
-/** いま効いている構成の画像の並び (見るのは誰でも) */
+/**
+ * いま効いている構成の画像の並び。**見るのは誰でも** (決めたこと)。
+ * AI の構成 (GET /lp-compose の output_text) も詳細画面も商品ハブの全員が見られる。直した版だけ隠す理由が無く、
+ * 撮影・デザインの担当が画像を作る前に読む物なので隠すと困る。直す (PUT) のは画像制作情報を触れる人だけ
+ */
 router.get('/api/drafts/:id/lp-edit', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
@@ -4194,6 +4198,11 @@ router.post('/api/drafts/:id/lp-images', async (req, res) => {
     catch (e) {
       console.error('[product-hub] lp-image ref times:', draft.id, String(e?.message || e).slice(0, 300));
       return res.status(502).json({ ok: false, code: 'refs_unavailable', error: '参考画像の情報を Drive から読めませんでした — もう一度押してください' });
+    }
+    // 🚨 Drive を待っている間に LP構成が直されて、参考にする画像が変わっていたら受け付けない (取り直していない日時で固定しない)。
+    //    ここから受付までは同期 (better-sqlite3) なので、この後に構成が変わることはない (Codex PR-B 名指し M)
+    if (lpImageRefCandidates(db, draft).some((id) => !Object.prototype.hasOwnProperty.call(refTimes, id))) {
+      return res.status(409).json({ ok: false, code: 'not_ready', error: 'LP構成が直されて参考にする画像が変わりました — もう一度押してください' });
     }
   }
   const r = requestLpImageJob(db, { draft, folderId, idempotencyKey: key, actor: actorOf(req), refTimes });

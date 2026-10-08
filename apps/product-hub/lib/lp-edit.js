@@ -204,7 +204,8 @@ function fieldError(key, v) {
   if (CONTROL_RE.test(v)) return `${label}に使えない制御文字が入っています`;
   if (v.length > FIELD_MAX[key]) return `${label}は ${FIELD_MAX[key]} 文字までです (いま ${v.length} 文字)`;
   if (/^\s*#/m.test(v)) return `${label}の行の先頭に # は使えません (見出しと区別できなくなります)`;
-  if (key === 'role' && v === '') return '役割を入れてください';
+  // 役割は必須。「なし」は空と同じ (⑦ の空の印なので、役割の無い画像になる・Codex PR-B 名指し L)
+  if (key === 'role' && (v === '' || v === NONE)) return '役割を入れてください';
   return null;
 }
 
@@ -290,7 +291,7 @@ const posInt = (v) => {
 export function latestDoneComposeJob(db, draftId) {
   const id = posInt(draftId);
   if (!id) return null;
-  return db.prepare(`SELECT j.id, j.draft_id, j.status, j.output_text, j.created_at, j.completed_at, g.model_check
+  return db.prepare(`SELECT j.*, g.model_check
     FROM ph_lp_compose_jobs j JOIN ph_lp_compose_generations g ON g.job_id = j.id
     WHERE j.draft_id = ? AND j.status = 'done' AND g.model_check = 'match'
       AND j.output_text IS NOT NULL AND TRIM(j.output_text) <> ''

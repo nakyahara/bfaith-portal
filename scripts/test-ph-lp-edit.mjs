@@ -169,6 +169,7 @@ console.log('④ 決まり (TOP / FV は固定・知らない uid・枚数・文
   ok(/2〜10 枚/.test(errOf([s[0]]) || ''), '1 枚は断る');
   const bad = (patch, k = 2) => errOf(s.map((x, i) => (i === k ? { ...x, ...patch } : x))) || '';
   ok(/役割を入れてください/.test(bad({ role: '  ' })), '役割は空にできない');
+  ok(/役割を入れてください/.test(bad({ role: 'なし' })), '役割を「なし」にもできない (⑦ の空の印)');
   ok(/行の先頭に # は使えません/.test(bad({ body: '玄関\n# 3枚目｜偽物' })), '🚨 行頭の # は断る (見出しと区別できなくなる)');
   ok(/行の先頭に # は使えません/.test(bad({ title: '#1位' })), '見出しの # も断る');
   ok(/見出しは 120 文字まで/.test(bad({ title: 'あ'.repeat(121) })), '長すぎる見出しは断る');
@@ -327,6 +328,24 @@ console.log('⑦ 画像生成 (lp-image) が編集版を読む');
   const E = compose(HAKKA, { draft: D.draft });
   db.prepare(`UPDATE ph_lp_compose_jobs SET packet_json = json_set(packet_json, '$.images', json('[]')) WHERE id = ?`).run(E.jobId);
   eq(li.imageStateFor(db, { draft: D.draft, folderId: FOLDER, env: ENV }).planned_count, 3, '作り直した構成は AI の本文 (3 枚)');
+
+  // 作り直しが失敗した・作っている途中 → 人が直した前の構成から作れる (一覧と画像生成が同じ構成を見る・Codex PR-B 名指し H)
+  const G = compose(FIVE);
+  db.prepare(`UPDATE ph_lp_compose_jobs SET packet_json = json_set(packet_json, '$.images', json('[]')) WHERE id = ?`).run(G.jobId);
+  const sg = le.editStateFor(db, G.draft, { canEdit: true });
+  const sendG = sg.slots.map((x) => ({ uid: x.uid, role: x.role, title: x.title, copy: x.copy, body: x.body, shoot: x.shoot }));
+  le.saveEdit(db, { draft: G.draft, baseJobId: G.jobId, baseEditId: null, slots: sendG.slice(0, 4), actor: 't' });
+  const images = [{ file_id: 'FILEIDWHITE01', role: 'white_bg', modified_time: '2026-10-01T00:00:00.000Z' }];
+  const rq2 = lp.requestJob(db, { draft: G.draft, spec, idempotencyKey: 'key-edit-fail-1', actor: 't', productInfo: 'ハッカ油', colorVariations: '', images, now: T0 });
+  ok(rq2.ok && li.imageBlockReason(db, { draft: G.draft, folderId: FOLDER, env: ENV }) === null
+    && li.imageStateFor(db, { draft: G.draft, folderId: FOLDER, env: ENV }).planned_count === 4, '🚨 AI が作り直している途中でも、直した構成 (4 枚) から作れる');
+  const cl = lp.claimJob(db, { runnerRunId: 'run-edit-fail-1', maxImages: 16, now: T0 });
+  lp.failJob(db, cl.job.job_id, { leaseToken: cl.job.lease_token, code: 'images_unavailable', message: 'x', now: T0 });
+  ok(db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(rq2.job.id).status === 'failed', '(作り直しは失敗した)');
+  ok(li.imageBlockReason(db, { draft: G.draft, folderId: FOLDER, env: ENV }) === null
+    && li.imageStateFor(db, { draft: G.draft, folderId: FOLDER, env: ENV }).planned_count === 4, '🚨 作り直しが失敗しても、直した構成 (4 枚) から作れる');
+  const rq3 = li.requestImageJob(db, { draft: G.draft, folderId: FOLDER, idempotencyKey: 'edit-img-fail1', actor: 't', refTimes: {}, env: ENV });
+  ok(rq3.ok && rq3.job.compose_job_id === G.jobId, '受付は直した構成の依頼に付く');
 }
 
 // ─── 画面の口 (router) ────────────────────────────────────
@@ -697,6 +716,25 @@ console.log('⑩ 「AI が作った構成」の箱 (lpc) — 直した版を出�
   await el('lpc-copy-ai').fire('click');
   ok(clip[clip.length - 1] === HAKKA, '「AI の初稿をコピー」は AI の生の出力 (測定用)');
   ok(/通っています/.test(el('lpc-lint').textContent), 'lint の行も直した版の結果');
+
+  // 「画像を作る」の箱 (lpi) も、保存の知らせで作る枚数・取り置きを取り直す (Codex PR-B 名指し M)
+  const lpiSrc = detailSrc.slice(detailSrc.indexOf('  (function initLpImages() {'), detailSrc.indexOf('  (function initLpCompose() {'));
+  ok(lpiSrc.length > 500 && !lpiSrc.includes('<%'), '画像の箱の JS を切り出せる');
+  const P = compose(FIVE);
+  db.prepare(`UPDATE ph_lp_compose_jobs SET packet_json = json_set(packet_json, '$.images', json('[]')) WHERE id = ?`).run(P.jobId);
+  els.clear();
+  el('lpi').dataset = { draftId: String(P.draft.id) };
+  el('lpi-json').textContent = JSON.stringify((await api('GET', `/api/drafts/${P.draft.id}/lp-images`)).json);
+  const docLs2 = {};
+  const doc2 = { getElementById: el, hidden: false, createElement: () => ({ style: {}, appendChild() {} }),
+    addEventListener: (t, fn) => { (docLs2[t] = docLs2[t] || []).push(fn); } };
+  new Function('document', 'fetch', 'window', lpiSrc)(doc2, fakeFetch, { crypto: null, confirm: () => true });
+  ok(/5 枚/.test(el('lpi-btn').textContent), '開いたときは 5 枚');
+  const cp = (await api('GET', `/api/drafts/${P.draft.id}/lp-edit`)).json;
+  await api('PUT', `/api/drafts/${P.draft.id}/lp-edit`, { body: { base_job_id: cp.base_job_id, base_edit_id: null, slots: sendFrom(cp).slice(0, 3) } });
+  for (const fn of docLs2['ph:lp-edit-saved'] || []) fn({});
+  await new Promise((r) => setTimeout(r, 300));
+  ok(/3 枚/.test(el('lpi-btn').textContent), '🚨 LP構成を保存したら「画像を作る」の枚数が直した構成 (3 枚) になる', el('lpi-btn').textContent);
 }
 
 server.close();

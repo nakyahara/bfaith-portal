@@ -26,7 +26,7 @@
 import { parseConstructionDoc } from './lp-parser.js';
 import { logEvent } from '../db.js';
 // 構成の本文は「効いている構成」(人が直した編集版があればそれ・画像制作の新フロー PR-B) を読む
-import { composeTextOf } from './lp-edit.js';
+import { composeTextOf, latestDoneComposeJob } from './lp-edit.js';
 
 export const LP_IMAGE_MODELS = ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'];
 // xhigh / max は使わない (検討 §5: max は medium の 16 倍・作り込むほどデザイン修正が増える)
@@ -208,11 +208,14 @@ export function buildImagePlan({ outputText, packet, quality = DEFAULT_LP_IMAGE_
   return { images: out, error: null };
 }
 
-/** いちばん新しい LP 構成の依頼 (draft ごと) と、その実モデル確認 */
+/**
+ * いちばん新しい「できた」LP 構成 (done・実モデル一致) と、その実モデル確認。
+ * 🚨 LP構成の一覧 (lib/lp-edit.js の「効いている構成」) と同じ構成を見る (画像制作の新フロー PR-B)。
+ *    いちばん新しい依頼そのものを見ていたときは、作り直しが失敗・確認待ちのあいだ、人が直した前の構成から
+ *    画像を作れなかった (Codex PR-B 名指し H)
+ */
 function latestComposeJob(db, draftId) {
-  return db.prepare(`SELECT j.*, g.model_check FROM ph_lp_compose_jobs j
-    LEFT JOIN ph_lp_compose_generations g ON g.job_id = j.id
-    WHERE j.draft_id = ? ORDER BY j.id DESC LIMIT 1`).get(draftId) || null;
+  return latestDoneComposeJob(db, draftId);
 }
 
 /** 依頼のキーの形 (二重クリック対策のキー)。router が Drive を読む前に確かめる */
