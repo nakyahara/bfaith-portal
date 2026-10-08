@@ -79,7 +79,8 @@ const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + n
 const quiet = () => {};
 const H = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const CLOSED_FUNCTIONS = revokeSigs();
-const KEEP = HEAVY_ENTRY_MANIFEST.filter((e) => e.cls !== 'revoke').map((e) => e.sig);
+// 🆕 0066: 0056 より後の migration で足した関数 (since) は、この試験 (0055 → 0056) の対象の外
+const KEEP = HEAVY_ENTRY_MANIFEST.filter((e) => e.cls !== 'revoke' && !(e.since && e.since > '0056')).map((e) => e.sig);
 const FILE_0056 = path.join(DEFAULT_DIR, '0056_amazon_profit_fn_revoke.sql');
 const SQL_0056 = fs.readFileSync(FILE_0056, 'utf8');
 
