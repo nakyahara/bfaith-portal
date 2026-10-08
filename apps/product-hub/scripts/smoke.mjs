@@ -6675,6 +6675,8 @@ let wfSetParentId = null;
       const fakeSheets = { spreadsheets: {
         get: async (p) => {
           await hit('sget');
+          // タブの様子を読んだ直後 (batchUpdate を送る前) に、ほかの人の操作を割り込ませる口
+          if (g.onSget) { const fn = g.onSget; g.onSget = null; fn(p); }
           const f = g.files.get(p.spreadsheetId);
           return { data: { sheets: f.tabs.map((t) => ({ properties: { sheetId: t.sheetId, title: t.title, gridProperties: { rowCount: 1000, columnCount: 26 } },
             developerMetadata: (t.meta || []).map((m) => ({ metadataKey: m.key, metadataValue: m.value })) })) } };
@@ -6904,10 +6906,14 @@ let wfSetParentId = null;
       check('🚨 撮影指示書: 次に押すと、前に作ったファイルを印 (appProperties) で拾い直す (2 つ作らない)',
         r.status === 200 && filesIn().length === before + 1 && ipF().camera_instruction_url === r.json?.url && tabOf(g.files.get(ipF().shoot_sheet_file_id), '依頼文'),
         JSON.stringify([r, filesIn().length]));
-      // 前に作ったファイルがごみ箱に → 作り直して URL を替える
+      // 前に作ったファイルがごみ箱に → 作り直して URL を替える。作った直後 (タブを読む前) に人が足したタブは消さない
       g.files.get(ipF().shoot_sheet_file_id).trashed = true;
       const oldF = ipF().shoot_sheet_file_id;
+      g.onSget = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 9, title: '人がすぐ足したタブ', values: [['x']] });
       r = await call('POST', `/api/drafts/${idF}/shoot-sheet`, {});
+      const fNew = g.files.get(ipF().shoot_sheet_file_id);
+      check('🚨 撮影指示書: 作ったばかりでも、最初の「シート1」だけ消し、作った直後に人が足したタブは消さない (Codex PR-D 名指し2 L)',
+        !!tabOf(fNew, '人がすぐ足したタブ') && !tabOf(fNew, 'シート1'), JSON.stringify(fNew.tabs.map((t) => t.title)));
       check('撮影指示書: 前に作ったファイルがごみ箱に入っていたら作り直し、新しい URL を入れる',
         r.status === 200 && r.json?.created === true && ipF().shoot_sheet_file_id !== oldF && ipF().camera_instruction_url === URL_OF(ipF().shoot_sheet_file_id), JSON.stringify(r));
 
@@ -6960,6 +6966,38 @@ let wfSetParentId = null;
       check('🚨 撮影指示書: 作っている間に LP構成ができ直したら 409 で止める (古い構成で書かない)', r.status === 409 && g.batches === batchesBefore, JSON.stringify(r));
       r = await sheetCall();
       check('撮影指示書: 押し直せば今の材料で書く', r.status === 200 && g.files.get(f1.id).name === '撮影指示書_DRV-SHEET（社内撮影）');
+      // 🚨 タブの様子を読んだ後 (送る直前) に変わったもの: どれも batchUpdate を送らない (Codex PR-D 名指し2 High / M)
+      {
+        const b0 = g.batches;
+        g.onSget = () => db.prepare(`UPDATE draft_image_production SET shoot_mode = 'photographer' WHERE draft_id = ?`).run(idS);
+        r = await sheetCall();
+        check('🚨 撮影指示書: タブを読んだ後・送る直前に撮影判定が変わったら送らない (409)', r.status === 409 && g.batches === b0, JSON.stringify(r));
+        db.prepare(`UPDATE draft_image_production SET shoot_mode = 'inhouse' WHERE draft_id = ?`).run(idS);
+        g.onSget = () => db.prepare('UPDATE draft_image_production SET shoot_sheet_lease_token = ? WHERE draft_id = ?').run('someone-else', idS);
+        r = await sheetCall();
+        check('🚨 撮影指示書: 送る直前に印がほかの処理のものになっていたら (期限切れで取り直された) 送らない・記録しない',
+          r.status === 409 && g.batches === b0 && /取りやめ/.test(r.json?.error || ''), JSON.stringify(r));
+        db.prepare('UPDATE draft_image_production SET shoot_sheet_lease_token = NULL, shoot_sheet_lease_until = NULL WHERE draft_id = ?').run(idS);
+        // 新しい構成 (done) の実モデル確認が待っている間に一致になった: 依頼の id・状態は同じでも材料が変わる
+        const jPend = addJob(idS, 'done', lpText.replace(/(# 2枚目｜[^\n]*[\s\S]*?## 使用素材\n)[^\n]*/, '$1撮影（瓶のアップ）'));
+        db.prepare('UPDATE ph_lp_compose_generations SET model_check = NULL WHERE job_id = ?').run(jPend);
+        g.onSget = () => db.prepare(`UPDATE ph_lp_compose_generations SET model_check = 'match' WHERE job_id = ?`).run(jPend);
+        r = await sheetCall();
+        check('🚨 撮影指示書: 待っている間に新しい構成の実モデル確認が一致になったら (材料が変わる) 送らない (Codex PR-D 名指し2 M)',
+          r.status === 409 && g.batches === b0, JSON.stringify(r));
+        r = await sheetCall();
+        check('撮影指示書: 押し直せば新しい構成の材料で書く', r.status === 200 && tabOf(g.files.get(f1.id), '撮影指示').values.some((row) => row[2] === '瓶のアップ'),
+          JSON.stringify(tabOf(g.files.get(f1.id), '撮影指示').values.slice(7)));
+      }
+      // 🚨 古いタブの「画像制作情報を保存」: 開いたときの指示書の URL を添えて、今と違えば 409 (作った URL を空で消さない)
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: '', camera_instruction_url_expected: '', status: '古いタブ' });
+      check('🚨 撮影指示書: 作る前に開いた古い画面の保存 (指示書の URL が空のまま) は 409・作った URL は消えない (Codex PR-D 名指し2 M)',
+        r.status === 409 && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify([r, ipS().camera_instruction_url]));
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: URL_OF(f1.id), camera_instruction_url_expected: URL_OF(f1.id) });
+      check('撮影指示書: 今の URL を見ている画面の保存は通る', r.status === 200 && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(r));
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: '', camera_instruction_url_expected: 5 });
+      check('撮影指示書: camera_instruction_url_expected が文字でなければ 400', r.status === 400);
+
       // 作っている最中の印 (DB): ほかのプロセスが作っている間は 409・期限切れの印は取り直せる
       db.prepare('UPDATE draft_image_production SET shoot_sheet_lease_token = ?, shoot_sheet_lease_until = ? WHERE draft_id = ?').run('other-proc', new Date(Date.now() + 60_000).toISOString(), idS);
       r = await sheetCall();

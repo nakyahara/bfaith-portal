@@ -115,6 +115,9 @@ export async function createSpreadsheetInFolder({ drive }, { folderId, title, ap
   return { id };
 }
 
+/** 新しいスプレッドシートに最初からあるタブの名前 (言語ごと) */
+const DEFAULT_TAB_RE = /^(シート|Sheet)\s*1$/;
+
 /** 書き込み係が作ったタブの印 (developer metadata のキー)。この印のあるタブだけを「自分のタブ」として消す・書き換える */
 export const OWNED_TAB_KEY = 'phOwnedTab';
 
@@ -146,9 +149,11 @@ const rowData = (row) => ({ values: row.map((c) => ({ userEnteredValue: { string
  * @param {string} [o.title]  ファイル名 (違っていれば付け直す。撮影の種類を変えたとき)
  * @param {Array<{name: string, rows: string[][], format?: object}>} o.tabs  書くタブ (この順に並べる)
  * @param {string[]} [o.removeTabs]  あれば消すタブ名 (自分が作るタブのうち、今回は要らないもの)
- * @param {boolean} [o.fresh]  この呼び出しで作ったばかりのファイル
+ * @param {boolean} [o.fresh]  この呼び出しで作ったばかりのファイル (最初からある空の「シート1」を消す)
+ * @param {Function} [o.beforeWrite]  batchUpdate を送る直前に呼ぶ確認 (throw すれば送らない)。
+ *   呼び手が「待っている間に材料・持ち主が変わっていないか」を見る口 (Codex PR-D 名指し2 High)
  */
-export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title, tabs, removeTabs = [], fresh = false }) {
+export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title, tabs, removeTabs = [], fresh = false, beforeWrite = null }) {
   const opt = { timeout: GOOGLE_TIMEOUT_MS };
   const got = await sheets.spreadsheets.get({
     spreadsheetId,
@@ -219,11 +224,15 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
       } });
     });
   });
-  // 3. 要らないタブを消す (足した後 = 最後の 1 枚を消して失敗しない)。印のある自分のタブだけ。作ったばかりなら最初の「シート1」も
+  // 3. 要らないタブを消す (足した後 = 最後の 1 枚を消して失敗しない)。印のある自分のタブだけ。
+  //    作ったばかりなら、最初からある空のタブ (sheetId 0 の「シート1 / Sheet1」) も。それ以外の印の無いタブは
+  //    作ったばかりでも消さない (作った直後に人が足したタブを消さない — Codex PR-D 名指し2 L)
   for (const p of existing) {
     if (wanted.has(p.title)) continue;
-    if (fresh || (p.owned && removeTabs.includes(p.title))) requests.push({ deleteSheet: { sheetId: p.sheetId } });
+    const initialTab = fresh && !p.owned && Number(p.sheetId) === 0 && DEFAULT_TAB_RE.test(String(p.title || ''));
+    if (initialTab || (p.owned && removeTabs.includes(p.title))) requests.push({ deleteSheet: { sheetId: p.sheetId } });
   }
+  if (beforeWrite) beforeWrite();
   await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } }, opt);
 
   // 4. ファイル名 (違うときだけ)。中身とは別の呼び出しだが、失敗しても中身は新しい版のまま (名前だけ古い)

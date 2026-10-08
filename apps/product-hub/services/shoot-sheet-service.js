@@ -17,7 +17,7 @@
  */
 import {
   getDB, logEvent, recordShootSheet, getShootMention, shootSheetRevision, assertShootSheetRevision,
-  acquireShootSheetLease, releaseShootSheetLease,
+  acquireShootSheetLease, releaseShootSheetLease, assertShootSheetLease,
 } from '../db.js';
 import { parseDriveLink } from '../lib/drive-link.js';
 import { effectiveCompose } from '../lib/lp-edit.js';
@@ -125,7 +125,7 @@ export async function createOrUpdateShootSheet(draftId, { cuts: givenCuts = null
   }
   if (!token) return { ok: false, status: 409, code: 'busy', error: 'いまこの商品の撮影指示書を作っています。終わるまで待ってください' };
   try {
-    return await run(db, id, { givenCuts, mention, actor, replaceManualUrl });
+    return await run(db, id, { givenCuts, mention, actor, replaceManualUrl, token });
   } catch (e) {
     // ここに来るのは DB の失敗など想定外のもの。Google の失敗は run の中で理由にしている
     console.error('[product-hub] 撮影指示書:', e);
@@ -135,7 +135,17 @@ export async function createOrUpdateShootSheet(draftId, { cuts: givenCuts = null
   }
 }
 
-async function run(db, id, { givenCuts, mention, actor, replaceManualUrl }) {
+/**
+ * いまの材料の hash (LP構成から拾うときだけ)。版 (shootSheetRevision) は LP構成の依頼・編集版の動きを見るが、
+ * 実モデル確認・AI の撮影判定の切り替わりまでは見ないので、材料そのものも比べる (Codex PR-D 名指し2 M)
+ */
+function autoMaterialHashNow(db, id) {
+  const d = db.prepare('SELECT id, ne_code, name, drive_folder_url FROM product_drafts WHERE id = ?').get(id);
+  const ip = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(id) || {};
+  return shootSheetMaterialHash(materialOf(d, ip.shoot_mode ?? null, shootSheetCutsFor(db, d).cuts));
+}
+
+async function run(db, id, { givenCuts, mention, actor, replaceManualUrl, token }) {
   const draft = db.prepare('SELECT id, ne_code, name, drive_folder_url FROM product_drafts WHERE id = ?').get(id);
   if (!draft) return { ok: false, status: 404, code: 'not_found', error: '商品が見つかりません' };
   const ip = db.prepare('SELECT shoot_mode, camera_instruction_url, shoot_sheet_file_id FROM draft_image_production WHERE draft_id = ?').get(id) || {};
@@ -165,6 +175,14 @@ async function run(db, id, { givenCuts, mention, actor, replaceManualUrl }) {
   const mat = materialOf(draft, shootMode, material.cuts);
   const hash = shootSheetMaterialHash(mat);
   const mentionUsed = typeof mention === 'string' ? mention : getShootMention(db).value;
+  // 書く直前と記録するときの確認: 版・材料 (LP構成から拾うとき)・印がまだ自分のものか
+  const stillSame = () => {
+    assertShootSheetRevision(db, id, revision);
+    if (material.source === 'auto' && autoMaterialHashNow(db, id) !== hash) {
+      throw Object.assign(new Error('作っている間に LP構成 (AI の撮影判定・直した構成) が変わりました。画面を読み直して、もう一度押してください (指示書の URL は変えていません)'), { code: 'shoot_sheet_conflict' });
+    }
+    assertShootSheetLease(db, id, token);
+  };
 
   let fileId = null;
   let created = false;
@@ -185,10 +203,10 @@ async function run(db, id, { givenCuts, mention, actor, replaceManualUrl }) {
     const url = spreadsheetUrl(fileId);
     const requestText = shootRequestBody({ mention: mentionUsed, productName: mat.productName, sheetUrl: url, folderUrl: mat.folderUrl });
     const built = buildShootSheet({ ...mat, requestText });
-    // 書く直前にもう一度版を見る (Google を待っている間に変わった材料で、既にある指示書を上書きしない)
-    assertShootSheetRevision(db, id, revision);
+    // 書く直前 (タブの様子を読んだ後・送る直前) にもう一度見る (Google を待っている間に変わった材料で、既にある指示書を上書きしない)
+    stillSame();
     await writeSpreadsheet(clients, {
-      spreadsheetId: fileId, title: built.title, tabs: built.sheets, fresh: created,
+      spreadsheetId: fileId, title: built.title, tabs: built.sheets, fresh: created, beforeWrite: stillSame,
       // 自分が作るタブのうち今回は要らないもの (カメラマン撮影 → 社内撮影 にしたときの「依頼文」)。印のあるタブだけ消える
       removeTabs: MANAGED_SHEETS.filter((n) => !built.sheets.some((t) => t.name === n)),
     });
@@ -202,7 +220,7 @@ async function run(db, id, { givenCuts, mention, actor, replaceManualUrl }) {
 
   const url = spreadsheetUrl(fileId);
   try {
-    recordShootSheet(db, id, { url, fileId, hash, source: material.source, actor, created: created || fileId !== prevFileId, expectedRevision: revision });
+    recordShootSheet(db, id, { url, fileId, hash, source: material.source, actor, created: created || fileId !== prevFileId, expectedRevision: revision, verify: stillSame });
   } catch (e) {
     if (e?.code === 'shoot_sheet_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     throw e;

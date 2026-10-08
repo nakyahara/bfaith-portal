@@ -2843,6 +2843,19 @@ export function acquireShootSheetLease(db, draftId, { ms = 180_000, now = Date.n
   })();
 }
 
+/**
+ * 印がまだ自分のものか (token が同じで期限内) を見て、期限を延ばす。違えば conflict を投げる。
+ * 期限が切れて別の処理が取り直した後に、止まっていた古い処理が書き戻さないため (Codex PR-D 名指し2 High)
+ */
+export function assertShootSheetLease(db, draftId, token, { ms = 180_000, now = Date.now() } = {}) {
+  const r = db.prepare(`UPDATE draft_image_production SET shoot_sheet_lease_until = ?
+    WHERE draft_id = ? AND shoot_sheet_lease_token = ? AND shoot_sheet_lease_until >= ?`)
+    .run(new Date(now + ms).toISOString(), Number(draftId), token, new Date(now).toISOString());
+  if (r.changes !== 1) {
+    throw Object.assign(new Error('時間がかかりすぎたため、この撮影指示書の作成は取りやめました (ほかの処理が始まっています)。画面を読み直してから、もう一度押してください'), { code: 'shoot_sheet_conflict' });
+  }
+}
+
 /** 印を返す (自分の token のときだけ) */
 export function releaseShootSheetLease(db, draftId, token) {
   db.prepare(`UPDATE draft_image_production SET shoot_sheet_lease_token = NULL, shoot_sheet_lease_until = NULL
@@ -2857,7 +2870,7 @@ export function releaseShootSheetLease(db, draftId, token) {
  *   LP構成・指示書の URL が変わっていたら、書かずに conflict を投げる (後から終わったほうが黙って勝たない)。
  * 撮影判定が「撮影が要る」でなくなっていても書かない (撮影不要の商品に指示書を付けない)
  */
-export function recordShootSheet(db, draftId, { url, fileId, hash, source, actor = null, created, expectedRevision }) {
+export function recordShootSheet(db, draftId, { url, fileId, hash, source, actor = null, created, expectedRevision, verify = null }) {
   const id = Number(draftId);
   return db.transaction(() => {
     db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
@@ -2866,6 +2879,8 @@ export function recordShootSheet(db, draftId, { url, fileId, hash, source, actor
       throw Object.assign(new Error('作っている間に撮影判定が変わりました (撮影が要る判定ではなくなりました)。指示書の URL には入れていません'), { code: 'shoot_sheet_conflict' });
     }
     if (expectedRevision !== undefined) assertShootSheetRevision(db, id, expectedRevision);
+    // 呼び手の確認 (印がまだ自分のものか・材料が変わっていないか)。同じトランザクションの中で見る
+    if (verify) verify();
     db.prepare(`
       UPDATE draft_image_production
       SET camera_instruction_url = ?, shoot_sheet_file_id = ?, shoot_sheet_hash = ?, shoot_sheet_source = ?,

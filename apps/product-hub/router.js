@@ -1461,6 +1461,17 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (urlVal && !isHttpUrl(urlVal)) {
     return res.status(400).json({ ok: false, error: '撮影指示URLの形式が不正です (http/https)' });
   }
+  // 画面が見ていた指示書の URL (camera_instruction_url_expected) と今の値が違えば 409。別のタブで撮影指示書を
+  // 自動で作った (PR-D) 後に、古い画面の値で戻さない (Codex PR-D 名指し2 M)。省略可 (古い画面)
+  if (urlVal !== undefined && Object.prototype.hasOwnProperty.call(b, 'camera_instruction_url_expected')) {
+    if (typeof b.camera_instruction_url_expected !== 'string') {
+      return res.status(400).json({ ok: false, error: 'camera_instruction_url_expected は文字で指定してください' });
+    }
+    const nowUrl = String(db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.camera_instruction_url || '').trim();
+    if (nowUrl !== b.camera_instruction_url_expected.trim()) {
+      return res.status(409).json({ ok: false, error: 'ほかの人 (または別の画面) が撮影指示書の URL を変えています (撮影指示書を作った など)。画面を読み直してから保存してください' });
+    }
+  }
   const canvaVal = b.canva_url !== undefined ? cleanText(b.canva_url, 1000) : undefined;
   if (canvaVal && !isHttpUrl(canvaVal)) {
     return res.status(400).json({ ok: false, error: 'CanvaリンクのURL形式が不正です (http/https)' });

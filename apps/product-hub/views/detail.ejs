@@ -5967,6 +5967,8 @@ th.attr-unknown { color: #dc2626; }
         aplus_content: document.getElementById('ip-aplus').value,
         aplus_related: document.getElementById('ip-aplus-related').value,
         camera_instruction_url: cameraUrlForSave(document),
+        // 指示書の URL を送るときは、画面が見ていた値を添える (別のタブで撮影指示書を作った後の古い画面で消さない — Codex PR-D 名指し2 M)
+        ...(cameraUrlForSave(document) !== undefined ? { camera_instruction_url_expected: cameraUrlShownAtLoad(document) } : {}),
         shipping_status: document.getElementById('ip-shipping').value,
         reference_collection: document.getElementById('ip-refcol').value,
         designer: document.getElementById('ip-designer').value,
@@ -6031,7 +6033,14 @@ th.attr-unknown { color: #dc2626; }
     const sec = doc.getElementById('ipf-step-shoot');
     const el = doc.getElementById('ip-camera-url');
     if (!el || (sec && sec.hidden)) return undefined;
+    // 開いたときから変えていなければ送らない (撮影指示書の自動作成 PR-D: 別のタブで作った URL を、古い画面の空欄で消さない)
+    if (el.defaultValue !== undefined && String(el.value || '').trim() === String(el.defaultValue || '').trim()) return undefined;
     return el.value;
+  }
+  /** 画面を開いたときの撮影指示書の URL (保存で添える。サーバが今の値と比べる) */
+  function cameraUrlShownAtLoad(doc) {
+    const el = doc.getElementById('ip-camera-url');
+    return el ? String(el.defaultValue || '') : '';
   }
   /**
    * 「画像制作情報を保存」で送る撮影・素材ステータス。画面を開いたときから変えていなければ送らない —

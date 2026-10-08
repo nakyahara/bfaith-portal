@@ -219,6 +219,12 @@ function fakeSheets(initialTabs, { failBatch = false } = {}) {
   const g3 = fakeSheets([{ title: '撮影指示' }]);
   await throwsAsync('🚨 書くタブと同じ名前の、人が作ったタブ (印なし) があれば止める (上書きしない)', () => writeSpreadsheet(g3, { spreadsheetId: 'S1', tabs: inh.sheets }), '人が作った');
   ok(!g3.calls.some((c) => c[0] === 'batchUpdate'), '止めたときは何も送らない');
+  const g5 = fakeSheets([{ title: 'シート1' }, { title: '人のメモ' }]);
+  await writeSpreadsheet(g5, { spreadsheetId: 'S1', tabs: inh.sheets, fresh: true });
+  ok(g5.reqs().filter((r) => r.deleteSheet).map((r) => r.deleteSheet.sheetId).join() === '0', '作ったばかりでも消すのは最初の「シート1」(sheetId 0) だけ (人がすぐ足したタブは残す)');
+  const g6 = fakeSheets([{ title: '撮影指示', owned: true }]);
+  await throwsAsync('送る直前の確認 (beforeWrite) が断れば throw', () => writeSpreadsheet(g6, { spreadsheetId: 'S1', tabs: inh.sheets, beforeWrite: () => { throw new Error('変わった'); } }), '変わった');
+  ok(g6.calls.some((c) => c[0] === 'get') && !g6.calls.some((c) => c[0] === 'batchUpdate'), '🚨 送る直前の確認はタブを読んだ後に呼び、断ったら batchUpdate を送らない');
   const g4 = fakeSheets([{ title: '撮影指示', owned: true }], { failBatch: true });
   await throwsAsync('batchUpdate が失敗したら throw (呼び手が URL を書かない)', () => writeSpreadsheet(g4, { spreadsheetId: 'S1', title: 'x', tabs: inh.sheets }), 'Backend');
   ok(!g4.calls.some((c) => c[0] === 'driveUpdate'), '失敗したら名前も付け直さない');
