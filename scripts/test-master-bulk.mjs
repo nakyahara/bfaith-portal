@@ -536,14 +536,16 @@ await ta('[10] 一覧の描画 (本物の router): 左のチェック・帯と�
   assert.equal(css.status, 200);
   // 空の一覧の colspan (列が 1 つ多い。この人は発注アプリの利用権が無い = 注文残の列なし = 15 + 1)
   const e = await call('GET', '/?q=' + encodeURIComponent('ないないない'));
-  assert.match(e.text, /<td colspan="16" class="muted"/);
+  assert.equal(Number(/<td colspan="(\d+)" class="muted"/.exec(e.text)[1]), (e.text.match(/<th scope="col"/g) || []).length, '列の数 (チェックの列も入れて)');
+  assert.ok(e.text.includes('class="c-chk"'));
   // 名簿にない人 = 左のチェックも帯も出さない
   const v = await call('GET', '/', { session: 'viewer' });
   assert.equal(v.status, 200);
   assert.ok(!v.text.includes('rowck') && !v.text.includes('id="bk-selbar"') && !v.text.includes('me-bulk.js'), '名簿にない人');
   assert.match(v.text, /<a class="rowlink" href="sku\/a001"/);
   const ve = await call('GET', '/?q=' + encodeURIComponent('ないないない'), { session: 'viewer' });
-  assert.match(ve.text, /<td colspan="15" class="muted"/);
+  assert.equal(Number(/<td colspan="(\d+)" class="muted"/.exec(ve.text)[1]), (ve.text.match(/<th scope="col"/g) || []).length);
+  assert.ok(!ve.text.includes('class="c-chk"'));
   // 保存を開いていない = 出さない
   process.env.MASTER_EDIT_OPEN = '0';
   try {

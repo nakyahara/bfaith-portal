@@ -1688,7 +1688,8 @@ for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { wi
 
 // ── 一覧の列・見出しの並び替え (10/8 PR1・見本 masterlist_mock)。MASTER_EDIT_UI_LIST_SHOTS=フォルダ = 見本と同じ状態の写しを残す (PR の目視用) ──
 const LIST_SHOTS = process.env.MASTER_EDIT_UI_LIST_SHOTS || '';
-const shownHeads = (p) => p.$$eval('#list-tbl thead th', (ths) => ths.filter((th) => !th.hidden).map((th) => th.getAttribute('data-c')));
+// 列の板の列 (data-c) だけ。まとめて変えるの左のチェックの列 (PR2・.c-chk) は板の外 = 数えない
+const shownHeads = (p) => p.$$eval('#list-tbl thead th[data-c]', (ths) => ths.filter((th) => !th.hidden).map((th) => th.getAttribute('data-c')));
 const prefsPost = (p, body) => p.evaluate(async (b) => { const r = await fetch('api/view-prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }); return { status: r.status, j: await r.json() }; }, body);
 const { DEFAULT_VIEW: LIST_DEFAULT } = await import('../apps/master-edit/list-columns.mjs');
 await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑↓ / つまみで並べ替え = 表がすぐ変わる・「未保存」・保存 → 別の窓 (別の PC) でも同じ・初期に戻す・Esc で閉じる', async (p) => {
@@ -1721,7 +1722,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   for (let i = 0; i < 20 && (await shownHeads(p))[1] !== 'sup'; i++) await p.click('#collist li[data-id="sup"] [data-mv="-1"]');
   assert.deepEqual((await shownHeads(p)).slice(0, 3), ['code', 'sup', 'name']);
   assert.equal(await p.evaluate(() => document.activeElement.closest('li')?.getAttribute('data-id')), 'sup');
-  assert.deepEqual(await p.$$eval('#list-tbl tbody tr:first-child td', (tds) => tds.filter((td) => !td.hidden).slice(0, 3).map((td) => td.getAttribute('data-col'))), ['code', 'sup', 'name'], '行のセルも同じ並び');
+  assert.deepEqual(await p.$$eval('#list-tbl tbody tr:first-child td:not(.c-chk)', (tds) => tds.filter((td) => !td.hidden).slice(0, 3).map((td) => td.getAttribute('data-col'))), ['code', 'sup', 'name'], '行のセルも同じ並び');
   // つまみで動かす (売価を名前の前へ)
   await p.dragAndDrop('#collist li[data-id="price"] .grip', '#collist li[data-id="name"]');
   assert.deepEqual((await shownHeads(p)).slice(0, 4), ['code', 'sup', 'price', 'name']);
@@ -1783,7 +1784,9 @@ await ta('[53] 一覧の見出しで並び替え (10/8 PR1): 押す = 全件で�
   await p.setViewportSize({ width: 1024, height: 768 });
   await p.$eval('#tblwrap', (w) => { w.scrollLeft = 600; w.dispatchEvent(new Event('scroll')); });
   const [wl, cl, nl] = await p.evaluate(() => [document.querySelector('#tblwrap').getBoundingClientRect().left, document.querySelector('#list-tbl tbody tr:first-child td.c-code').getBoundingClientRect().left, document.querySelector('#list-tbl tbody tr:first-child td[data-col="name"]').getBoundingClientRect().left]);
-  assert.ok(Math.abs(cl - wl) <= 2, `コードの列が左に残る (${cl} / ${wl})`);
+  // 左のチェックの列 (まとめて変える・PR2・名簿の人だけ) があれば、コードの列はその幅だけ右に残る
+  const chkW = await p.evaluate(() => { const c = document.querySelector('#list-tbl tbody tr:first-child td.c-chk'); return c ? c.getBoundingClientRect().width : 0; });
+  assert.ok(Math.abs(cl - wl - chkW) <= 2, `コードの列が左に残る (${cl} / ${wl} + ${chkW})`);
   assert.ok(nl < wl, '名前の列は左へ送られた');
   assert.equal(await p.evaluate(() => document.querySelector('#tblwrap').classList.contains('scrolled')), true);
   const onTop = await p.evaluate(() => { const td = document.querySelector('#list-tbl tbody tr:first-child td.c-code'); const r = td.getBoundingClientRect(); const el = document.elementFromPoint(r.left + 20, r.top + r.height / 2); return td.contains(el); });
