@@ -452,6 +452,24 @@ console.log('⑧ API (GET / PUT・権限・409・lint)');
   const htmlX = (await api('GET', `/detail/${R.draft.id}`, { headers: { Accept: 'text/html' } })).text;
   const embX = htmlX.match(/id="lpe-json">([\s\S]*?)<\/script>/)[1];
   ok(!embX.includes('</script') && JSON.parse(embX).slots[2].body.includes('</script>'), '🚨 埋め込みの JSON で </script> を潰す (画面が途中で切れない)');
+
+  // 古いタブの「画像を作る」: 見ていた LP構成の版が今と違えば受け付けない (Codex PR-B 名指し R3 H)
+  const Q = compose(FIVE);
+  db.prepare(`UPDATE ph_lp_compose_jobs SET packet_json = json_set(packet_json, '$.images', json('[]')) WHERE id = ?`).run(Q.jobId);
+  const v1 = (await api('GET', `/api/drafts/${Q.draft.id}/lp-images`)).json.compose_version;
+  ok(v1 === `${Q.jobId}:`, '画像の状態に LP構成の版 (依頼:編集版) が付く');
+  const htmlQ = (await api('GET', `/detail/${Q.draft.id}`, { headers: { Accept: 'text/html' } })).text;
+  ok(JSON.parse(htmlQ.match(/id="lpi-json">([\s\S]*?)<\/script>/)[1]).compose_version === v1, '詳細画面の最初の状態にも版が付く');
+  const sq = (await api('GET', `/api/drafts/${Q.draft.id}/lp-edit`)).json;
+  const pq = await api('PUT', `/api/drafts/${Q.draft.id}/lp-edit`, { headers: AS_IMAGE, body: { base_job_id: sq.base_job_id, base_edit_id: null, slots: sendFrom(sq).slice(0, 3) } });
+  const old = await api('POST', `/api/drafts/${Q.draft.id}/lp-images`, { body: { idempotency_key: 'stale-tab-0001', compose_version: v1 } });
+  ok(old.status === 409 && /ほかのタブかほかの人に直されました/.test(old.json.error)
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_lp_image_jobs WHERE draft_id = ?').get(Q.draft.id).n === 0, '🚨 古い版を見ていた画面からは作らない (409・依頼は作らない)');
+  const v2 = (await api('GET', `/api/drafts/${Q.draft.id}/lp-images`)).json.compose_version;
+  ok(v2 === `${Q.jobId}:${pq.json.base_edit_id}`, '保存のあとは新しい版');
+  const okq = await api('POST', `/api/drafts/${Q.draft.id}/lp-images`, { body: { idempotency_key: 'fresh-tab-0001', compose_version: v2 } });
+  ok(okq.status === 200 && db.prepare('SELECT COUNT(*) AS n FROM ph_lp_images i JOIN ph_lp_image_jobs j ON j.id = i.image_job_id WHERE j.draft_id = ?').get(Q.draft.id).n === 3,
+    '今の版を見ていれば受け付ける (直した 3 枚)');
 }
 
 // ─── 画面の JS (偽の document) ─────────────────────────────
@@ -612,7 +630,8 @@ console.log('⑨ 画面の JS: 一覧を描く・並べ替え・追加・削除�
   const ui3 = F.initLpEdit(D3.doc, realDeps({
     put: async (u, body) => { await fetch(u, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); throw new Error('net'); },
   }));
-  D3.type(st3.slots[2].uid, 'copy', '切れても保存できていた');
+  // 前後の空白・CRLF はサーバがそろえて保存する。そろえた形で比べる (Codex PR-B 名指し R3 M)
+  D3.type(st3.slots[2].uid, 'copy', '  切れても\r\n保存できていた  ');
   D3.click('save');
   await settle(ui3);
   ok(ui3.state().msg === 'LP構成を保存しました' && !D3.shown('lpe-dirty'), '🚨 応答が来なくても、サーバの構成が送ったものと同じなら保存できていたとみなす');
@@ -738,13 +757,29 @@ console.log('⑩ 「AI が作った構成」の箱 (lpc) — 直した版を出�
   const docLs2 = {};
   const doc2 = { getElementById: el, hidden: false, createElement: () => ({ style: {}, appendChild() {} }),
     addEventListener: (t, fn) => { (docLs2[t] = docLs2[t] || []).push(fn); } };
-  new Function('document', 'fetch', 'window', lpiSrc)(doc2, fakeFetch, { crypto: null, confirm: () => true });
+  const lpiPosts = [];
+  const fakeFetch2 = async (u, opts) => {
+    if (opts && opts.method === 'POST') {
+      const body = JSON.parse(opts.body);
+      lpiPosts.push(body);
+      const r = await api('POST', u.replace('/apps/product-hub', ''), { body });
+      return { status: r.status, json: async () => r.json };
+    }
+    return fakeFetch(u);
+  };
+  new Function('document', 'fetch', 'window', lpiSrc)(doc2, fakeFetch2, { crypto: null, confirm: () => true });
   ok(/5 枚/.test(el('lpi-btn').textContent), '開いたときは 5 枚');
   const cp = (await api('GET', `/api/drafts/${P.draft.id}/lp-edit`)).json;
   await api('PUT', `/api/drafts/${P.draft.id}/lp-edit`, { body: { base_job_id: cp.base_job_id, base_edit_id: null, slots: sendFrom(cp).slice(0, 3) } });
   for (const fn of docLs2['ph:lp-edit-saved'] || []) fn({});
   await new Promise((r) => setTimeout(r, 300));
   ok(/3 枚/.test(el('lpi-btn').textContent), '🚨 LP構成を保存したら「画像を作る」の枚数が直した構成 (3 枚) になる', el('lpi-btn').textContent);
+  // 押すと、画面が見ている構成の版を添える
+  const ver = le.effectiveComposeText(db, P.draft.id);
+  await el('lpi-btn').fire('click');
+  await new Promise((r) => setTimeout(r, 200));
+  ok(lpiPosts.length === 1 && lpiPosts[0].compose_version === `${ver.job_id}:${ver.edit_id}`, '🚨 「画像を作る」は画面が見ている LP構成の版を添えて送る', JSON.stringify(lpiPosts));
+  ok(db.prepare('SELECT COUNT(*) AS n FROM ph_lp_image_jobs WHERE draft_id = ?').get(P.draft.id).n === 1, '(版が合っているので受け付ける)');
 }
 
 server.close();

@@ -6261,7 +6261,8 @@ th.attr-unknown { color: #dc2626; }
         const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ idempotency_key: idemKey }),
+          // 画面が見ている LP構成の版を添える (違えばサーバが断る・PR-B)
+          body: JSON.stringify({ idempotency_key: idemKey, compose_version: state.compose_version }),
         });
         const json = await res.json().catch(() => null);
         posting = false;
@@ -6623,6 +6624,20 @@ th.attr-unknown { color: #dc2626; }
     };
   }
   function lpeDirty(S) { return JSON.stringify(lpeForSave(S.slots)) !== S.saved; }
+  /**
+   * サーバが保存するときと同じそろえ方 (改行を LF に・前後の空白を落とす・見出し/キャッチコピー/本文の「なし」は空欄)。
+   * 通信が切れたあとに「送ったものがもう保存されているか」を比べるときに使う (Codex PR-B 名指し R3 M)
+   */
+  function lpeCanon(slots) {
+    return JSON.stringify(lpeForSave(slots).map(function (s) {
+      const c = { uid: s.uid, shoot: s.shoot };
+      LPE_FIELDS.forEach(function (f) {
+        const t = String(s[f[0]] == null ? '' : s[f[0]]).replace(/\r\n?/g, '\n').trim();
+        c[f[0]] = f[0] !== 'role' && t === 'なし' ? '' : t;
+      });
+      return c;
+    }));
+  }
   function lpeIndex(S, uid) { for (let i = 0; i < S.slots.length; i++) { if (S.slots[i].uid === uid) return i; } return -1; }
   function lpeMovable(S, i) { return !!S.slots[i] && S.slots[i].kind === 'point'; }
   /**
@@ -6793,7 +6808,7 @@ th.attr-unknown { color: #dc2626; }
       if (json && (json.code === 'conflict' || json.code === 'network')) {
         let now = null;
         try { now = await deps.get(url); } catch (e) { now = null; }
-        if (now && now.ok !== false && now.available && JSON.stringify(lpeForSave(lpeFromServer(now, S).slots)) === JSON.stringify(sent)) {
+        if (now && now.ok !== false && now.available && lpeCanon(lpeFromServer(now, S).slots) === lpeCanon(sent)) {
           S = lpeFromServer(now, S);
           lastJob = S.base_job_id;
           S.msg = 'LP構成を保存しました';

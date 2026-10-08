@@ -544,7 +544,8 @@ router.get('/detail/:id', (req, res) => {
     // 画面はこの後 5 秒おきに GET /api/drafts/:id/lp-compose を叩いて更新する
     lpCompose: lpComposeInitialState(db, draft),
     // 「🖼 画像を作る」(段階2・2026-10-04)。同じく最初の表示をここで作る
-    lpImage: lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }),
+    // compose_version = 画面が見ている LP構成の版。押したときに添え、違えば受け付けない (PR-B)
+    lpImage: { ...lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }), compose_version: lpComposeVersion(db, draft) },
     // LP構成の確認・修正 (2026-10-09 PR-B)。直せるのは画像制作情報を触れる人だけ (見るのは誰でも)
     lpEdit: lpEditStateFor(db, draft, { canEdit: canEditImageProduction(req) }),
     // 画像制作の新フロー (2026-10-08): 撮影判定の 3 択と、撮影依頼文の宛先
@@ -4170,7 +4171,7 @@ router.get('/api/drafts/:id/lp-images', (req, res) => {
   const st = lpImageStateFor(getDB(), { draft, folderId: lpImageFolderId(draft) });
   // 作っている途中なのに作る係が休んでいる (再起動の後・期限切れの片付け待ち) なら起こす。kick は重ねて呼んでも 1 本だけ
   if (st.job && ['queued', 'running'].includes(st.job.status) && !lpImageWorker.isRunning()) lpImageTick();
-  res.json({ ok: true, ...st });
+  res.json({ ok: true, ...st, compose_version: lpComposeVersion(getDB(), draft) });
 });
 
 /** 作る (誰でも押せる)。body: { idempotency_key }。同じキーの再送は前の依頼を返す */
@@ -4189,6 +4190,12 @@ router.post('/api/drafts/:id/lp-images', async (req, res) => {
     if (blocked) return res.status(409).json({ ok: false, code: 'not_ready', error: blocked });
     // Drive を待つ前の構成の版 (どの構成のどの編集版か)。待っている間に直されたら受け付けない (下)
     const composeVer = lpComposeVersion(db, draft);
+    // 🚨 画面が見ていた版 (compose_version) と違えば受け付けない — 別のタブ・ほかの人が LP構成を直した後の古い画面から、
+    //    見ていない構成・枚数で作らない (Codex PR-B 名指し R3 H)。送らない古い画面はこの検査を通る (同じキーの再送は上で前の依頼を返す)
+    const seen = req.body?.compose_version;
+    if (typeof seen === 'string' && seen !== composeVer) {
+      return res.status(409).json({ ok: false, code: 'not_ready', error: 'LP構成がほかのタブかほかの人に直されました — 画面の枚数・内容を確かめてから、もう一度押してください' });
+    }
     try { refTimes = await lpImageRefTimes(lpImageRefCandidates(db, draft)); }
     catch (e) {
       console.error('[product-hub] lp-image ref times:', draft.id, String(e?.message || e).slice(0, 300));
@@ -4207,7 +4214,7 @@ router.post('/api/drafts/:id/lp-images', async (req, res) => {
     return res.status(status).json({ ok: false, code: r.code, error: r.error });
   }
   lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
-  res.json({ ok: true, created: r.created, ...lpImageStateFor(db, { draft, folderId }) });
+  res.json({ ok: true, created: r.created, ...lpImageStateFor(db, { draft, folderId }), compose_version: lpComposeVersion(db, draft) });
 });
 
 /**
