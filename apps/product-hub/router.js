@@ -19,7 +19,7 @@ import {
   getDB, logEvent, gateReasons, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
-  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
+  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, setShootMode, materialStepWouldBreak, SHOOT_MODES, SHOOT_MODE_CODES, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, MATERIAL_STATUS_LABELS, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
@@ -543,8 +543,19 @@ router.get('/detail/:id', (req, res) => {
     lpCompose: lpComposeInitialState(db, draft),
     // 「🖼 画像を作る」(段階2・2026-10-04)。同じく最初の表示をここで作る
     lpImage: lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }),
+    // 画像制作の新フロー (2026-10-08): 撮影判定の 3 択と、撮影依頼文の宛先
+    imageFlow: { shootModes: SHOOT_MODES, mention: shootRequestMention() },
   });
 });
+
+/**
+ * 撮影依頼文の 1 行目 (宛先)。2026-10-08 スタッフのラフは「@つくば」。
+ * env PH_SHOOT_REQUEST_MENTION で変えられる (空にすると宛先の行を入れない)
+ */
+function shootRequestMention(env = process.env) {
+  if (env.PH_SHOOT_REQUEST_MENTION === undefined) return '@つくば';
+  return String(env.PH_SHOOT_REQUEST_MENTION).trim().slice(0, 60);
+}
 
 // ─── API: ドラフト作成/更新 ───────────────────────────────
 
@@ -1443,12 +1454,48 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (topRefVal && !isHttpUrl(topRefVal)) {
     return res.status(400).json({ ok: false, error: '参考・ラフのURL形式が不正です (http/https)' });
   }
+  // 編集データ (PSD 等) のリンク (2026-10-08 画像制作の新フロー)
+  const editDataVal = b.edit_data_url !== undefined ? cleanText(b.edit_data_url, 1000) : undefined;
+  if (editDataVal && !isHttpUrl(editDataVal)) {
+    return res.status(400).json({ ok: false, error: '編集データリンクのURL形式が不正です (http/https)' });
+  }
   // 画像工程 v2 (2026-08-26): 撮影・素材ステータスは安定コードだけ受ける / 商品情報は変更時に更新者・日時を残す
   let materialVal;
   if (b.material_status !== undefined) {
     materialVal = cleanText(b.material_status, 40) || null;
     if (materialVal && !MATERIAL_STATUS_CODES.has(materialVal)) {
       return res.status(400).json({ ok: false, error: '撮影・素材ステータスの値が不正です' });
+    }
+    // 撮影判定と食い違う素材ステータスは保存しない (古いタブからの保存も同じ)。変えたいなら撮影判定のほうで選ばせる
+    //   撮影が要る なのに「撮影不要」→ 撮影しないまま ③素材待ち を通れてしまう — Codex PR-A 名指し High
+    //   撮影不要 なのに「撮影不要 / 素材完了」以外 → 撮影不要と出ているのに ③ が閉じられない — Codex PR-A R2 P2
+    const ipNow = db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(draft.id) || {};
+    const sm = ipNow.shoot_mode;
+    // 画面が見ていた撮影判定 (shoot_mode_expected) と今の判定が違えば 409。別タブで「撮影不要 → 社内撮影」に
+    // 変えて素材完了を外したのに、古いタブの素材完了で戻されるのを防ぐ (Codex PR-A 名指し7 High)。省略可 (古い画面)
+    if (Object.prototype.hasOwnProperty.call(b, 'shoot_mode_expected')) {
+      const exp = b.shoot_mode_expected;
+      if (!(exp === null || (typeof exp === 'string' && SHOOT_MODE_CODES.has(exp)))) {
+        return res.status(400).json({ ok: false, error: 'shoot_mode_expected の値が不正です' });
+      }
+      if ((sm ?? null) !== exp) {
+        return res.status(409).json({ ok: false, error: 'ほかの人 (または別の画面) が撮影判定を変えています。画面を読み直してから、撮影・素材ステータスを選び直してください' });
+      }
+    } else if (sm) {
+      // 判定を添えてこない保存 (この変更より前に開いた画面など) は、撮影判定のある商品では素材ステータスを変えさせない。
+      // どの判定を見て選んだ値か分からないので、そろえた値を古い値で戻しうる (Codex PR-A R8 P1)。判定の無い商品は今までどおり
+      return res.status(409).json({ ok: false, error: '画面が古いので撮影・素材ステータスを保存できません。画面を読み直してから保存してください' });
+    }
+    // ③素材待ち を完了したあとで、③ の条件を満たさない値へ変える保存 (古いタブの一括保存を含む) は 409。
+    // 値が変わらない保存は通す — Codex PR-A 名指し4 High
+    if (materialVal !== (ipNow.material_status ?? null) && materialStepWouldBreak(db, draft.id, { shootMode: sm ?? null, material: materialVal })) {
+      return res.status(409).json({ ok: false, error: `③素材待ち はもう完了しているので、撮影・素材ステータスを「${MATERIAL_STATUS_LABELS[materialVal] || '未設定'}」にはできません。戻すなら、先にボードでカードを ③素材待ち に戻してください (画面を読み直すと今の値が出ます)` });
+    }
+    if ((sm === 'inhouse' || sm === 'photographer') && materialVal === 'not_required') {
+      return res.status(400).json({ ok: false, error: `撮影判定が「${sm === 'inhouse' ? '社内撮影' : 'カメラマン撮影'}」なので、撮影・素材ステータスを「撮影不要」にはできません。撮影が要らないなら、撮影判定で「撮影不要」を押してください (画面を読み直すと今の値が出ます)` });
+    }
+    if (sm === 'none' && materialVal !== 'not_required' && materialVal !== 'ready') {
+      return res.status(400).json({ ok: false, error: '撮影判定が「撮影不要」なので、撮影・素材ステータスは「撮影不要」か「素材完了」だけにできます。撮影するなら、撮影判定で「社内撮影」か「カメラマン撮影」を押してください (画面を読み直すと今の値が出ます)' });
     }
   }
   let infoVal; let infoAt; let infoBy;
@@ -1491,6 +1538,7 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     // TOP画像の構成 (簡単なもの) と参考・ラフの URL (2026-09-13)
     top_compose_text: clean(b.top_compose_text, 2000),
     top_ref_url: topRefVal,
+    edit_data_url: editDataVal,
     material_status: materialVal,
     product_info_text: infoVal,
     product_info_updated_at: infoAt,
@@ -1532,6 +1580,36 @@ router.post('/api/drafts/:id/image-hold', (req, res) => {
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
+});
+
+// 撮影判定 (2026-10-08 画像制作の新フロー)。押した時点で保存する (保存ボタンを待たない)。
+// 撮影・素材ステータスもサーバでそろえる (setShootMode)。工程は動かさない
+router.post('/api/drafts/:id/shoot-mode', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '撮影判定を変えられるのは 画像登録者・画像作成承認者 の担当者か管理者だけです' });
+  }
+  // 文字列の決まった値か null (未判定に戻す) だけ受ける。欠落・typo を「未判定」に倒さない
+  const validMode = (v) => v === null || (typeof v === 'string' && SHOOT_MODE_CODES.has(v));
+  const mode = req.body?.mode;
+  if (!validMode(mode)) {
+    return res.status(400).json({ ok: false, error: 'mode は none / inhouse / photographer / null で指定してください' });
+  }
+  // expected = 画面が表示していた判定 (省略可)。違っていたら 409 (ほかの人が先に変えた)
+  const hasExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expected');
+  if (hasExpected && !validMode(req.body.expected)) {
+    return res.status(400).json({ ok: false, error: 'expected は none / inhouse / photographer / null で指定してください' });
+  }
+  let r;
+  try {
+    r = setShootMode(getDB(), draft.id, mode, { actor: actorOf(req), expected: hasExpected ? req.body.expected : undefined });
+  } catch (e) {
+    // ③素材待ち を完了したあとで素材が要る判定に変えようとした (先に ③ へ戻してもらう) / ほかの人が先に変えた
+    if (e?.code === 'material_step_done' || e?.code === 'shoot_mode_conflict') return res.status(409).json({ ok: false, error: e.message });
+    throw e;
+  }
+  res.json({ ok: true, changed: r.changed, shoot_mode: mode, material_status: r.material_status });
 });
 
 // 本番の構成の 済 / まだ (2026-09-13 スタッフ要望)。縦列 ②仮構成 (imgd_compose) とは別に持つ —
