@@ -74,7 +74,7 @@ RUN_ID="lp-$RANDOM$RANDOM"
   **スタッフの ChatGPT 版にも同じ文が貼られる** (くらべっこを公平にするため)。画像の扱いはこれに従う。
   ここに書いていない画像の扱い方を自分で足さない
 - **`shoot_instruction`** … **撮影判定**の指示 (画像制作の新フロー・2026-10-09)。⑦ を書き終えてから使う (手順 4b)。
-  `null` (サーバが古い) なら撮影判定は書かない
+  `null` (サーバが古い) なら撮影判定は書かない (`shoot-<ID>.json` も作らず、`--shoot` も付けない)
 
 `job: null` なら仕事なし。終了する。
 
@@ -152,7 +152,8 @@ img-12-7.jpg (素材1・使用イメージ/玄関.jpg): 玄関の床に向けて
 ```
 
 サーバが見ること (`./phlp lint --shoot` で同じ検査を先に受けられる):
-- キーはこの形のものだけ。`recommended` は `none` / `inhouse` / `photographer`、`reason` は空でない (400 字まで)
+- キーはこの形のものだけで、**どの画像も 8 つのキーを全部書く**。`recommended` は `none` / `inhouse` / `photographer`、`reason` は空でない (400 字まで)。文字の前後に空白・改行を入れない
+- `needs_shoot: false` の画像は cut 以下を全部 `""` にする
 - `images` は **⑦ の画像見出しの N と 1 対 1** (足りない・余計な番号・重複は通らない)。`no` は数、`needs_shoot` は true/false
 - `needs_shoot: true` の画像は `cut` と `composition` が要る
 - `recommended` が `none` なのに撮影が要る画像がある / `inhouse`・`photographer` なのに 1 枚も無い は通らない

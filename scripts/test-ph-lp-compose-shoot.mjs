@@ -52,13 +52,13 @@ const goodShoot = () => ({
 
 console.log('① 形の検査 (lib/lp-shoot.js・純粋関数)');
 {
-  const v = shootLib.validateShootJudgement({ ...goodShoot(), reason: '  理由です  ' }, { imageNos: [0, 1, 2] });
+  const v = shootLib.validateShootJudgement(goodShoot(), { imageNos: [0, 1, 2] });
   ok(v.ok, '正しい形は通る');
   eq(v.value.images.map((x) => x.no), [0, 1, 2], '画像は番号順にそろえて保存する');
-  eq(v.value.reason, '理由です', '理由の前後の空白は落とす');
+  eq(v.value.reason, goodShoot().reason, '理由は送られたまま保存する');
   eq(Object.keys(v.value.images[0]), ['no', 'needs_shoot', 'cut', 'composition', 'props', 'background', 'tone', 'ng'], '画像ごとの項目はこの順');
-  const noCut = shootLib.validateShootJudgement({ recommended: 'none', reason: 'r', images: [{ no: 0, needs_shoot: false }, { no: 1, needs_shoot: false }] }, { imageNos: [0, 1] });
-  ok(noCut.ok && noCut.value.images[0].cut === '', '撮影が要らない画像は cut 以下を省いてよい (空文字で保存)');
+  const noneOk = shootLib.validateShootJudgement({ recommended: 'none', reason: 'r', images: [0, 1].map((no) => ({ no, needs_shoot: false, ...blankCut })) }, { imageNos: [0, 1] });
+  ok(noneOk.ok, '撮影不要のおすすめ (全部 needs_shoot: false・cut 以下は "") は通る');
 
   const bad = (raw, why, nos = [0, 1, 2]) => {
     const r = shootLib.validateShootJudgement(raw, { imageNos: nos });
@@ -82,6 +82,13 @@ console.log('① 形の検査 (lib/lp-shoot.js・純粋関数)');
   bad(withImage({ no: '2' }), 'no が文字列');
   bad(withImage({ no: 1.5 }), 'no が小数');
   bad(withImage({ no: 0 }), 'no が重複');
+  // 🚨 欠け・前後の空白・食い違いを直して受けない (送られた値と保存する値を同じにする・Codex PR-C 名指し1 M)
+  bad({ ...goodShoot(), reason: '  理由です  ' }, '理由の前後に空白 (trim して受けない)');
+  bad({ ...goodShoot(), reason: '理由です\n' }, '理由の後ろに改行');
+  { const g = goodShoot(); delete g.images[1].cut; bad(g, '撮影が要らない画像でも cut が欠けている (補わない)'); }
+  { const g = goodShoot(); delete g.images[0].ng; bad(g, '撮影が要る画像の ng が欠けている'); }
+  bad(withImage({ cut: ' 玄関の手元' }), 'カット名の前に空白');
+  bad(withImage({ cut: '商品を撮影' }, 1), '🚨 撮影が要らない画像に撮影指示が書いてある (食い違い)');
   // 構成と照らさない使い方 (imageNos なし) でも、番号の型は見る (照らす側に頼らない)
   for (const [no, why] of [['2', '文字列'], [1.5, '小数'], [-1, '負'], [100, '大きすぎる'], [null, 'null']]) {
     const r = shootLib.validateShootJudgement(withImage({ no }, 2), {});
@@ -206,6 +213,15 @@ console.log('④ 壊れた撮影判定 → 構成は受け付け、撮影判定�
   eq(lp.latestShootJudgement(db, d.id), { job_id: r.jobId, available: false, recommended: null, reason: null, images: [], missing: 'invalid' },
     '読み口は「AI の判定なし (形が違った)」');
 
+  {
+    // 🚨 大きすぎる判定どうしでも、中身が違えば別の結果 (「使えない」1 つに畳まない・Codex PR-C 名指し1 M)
+    const dd = mkDraft();
+    const rr = reserveFor(dd);
+    const first = accept(rr, { shoot: { ...goodShoot(), reason: 'x'.repeat(50_000) } });
+    ok(first.ok && first.shoot.status === 'invalid', '前提: 大きすぎる判定は invalid');
+    ok(accept(rr, { shoot: { ...goodShoot(), reason: 'x'.repeat(50_000) } }).already === true, '同じ大きすぎる判定の再送は保存済みを返す');
+    eq(accept(rr, { shoot: { ...goodShoot(), reason: 'y'.repeat(60_000) } }).code, 'already_finalized', '🚨 別の大きすぎる判定の再送は上書きしない');
+  }
   for (const [label, shoot] of [
     ['大きすぎる', { ...goodShoot(), reason: 'x'.repeat(50_000) }],
     ['文字列', 'inhouse'],

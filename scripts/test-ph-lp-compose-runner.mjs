@@ -397,6 +397,25 @@ console.log('⑪ 撮影判定 (PR-C) — あり / なし / 形が違う のど�
   };
   const row = (jobId) => db.prepare('SELECT status, output_text, shoot_json, shoot_error FROM ph_lp_compose_jobs WHERE id = ?').get(jobId);
 
+  // 撮影判定の指示を返さないサーバ (Render のデプロイ前に miniPC を新しくした場合) を、packet から指示を抜いて模す。
+  // claim は shoot_instruction: null を出す → スキルは撮影判定を書かない (--shoot も付けない)
+  {
+    const dOld = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-SH-OLDSRV', 'ハッカ油スプレー 100ml', 'test')`).run().lastInsertRowid);
+    const rOld = lp.requestJob(db, {
+      draft: db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(dOld), spec, productInfo: '天然ハッカ油。', colorVariations: '',
+      images: [{ file_id: 'FILEIDSHOLD1' }], idempotencyKey: 'runner-shoot-oldsrv', actor: 'nakahara@x',
+    });
+    const p = JSON.parse(rOld.job.packet_json);
+    delete p.shoot_instruction;
+    db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ? WHERE id = ?').run(JSON.stringify(p), lp.sha256(lp.canonicalJson(p)), rOld.job.id);
+    const cOld = await phlpWith({ PH_LP_RUN_ID: 'lpr-20261009-shoot-oldsrv' }, 'claim', '--run', 'x');
+    ok(cOld.json?.job_id === rOld.job.id && cOld.json.shoot_instruction === null && typeof cOld.json.instruction === 'string',
+      '撮影判定の指示が無いサーバでも claim でき、shoot_instruction は null (撮影判定を書かない合図)');
+    await phlp('release', String(rOld.job.id), '--reason', '試験の片付け');
+    await phlp('clean', String(rOld.job.id));
+    db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(rOld.job.id);
+  }
+
   const a = await prep('LP-SH-BAD', 'FILEIDSHBAD1');
   fs.writeFileSync(path.join(work, `shoot-${a.id}.json`), JSON.stringify({ ...SHOOT_OK, images: SHOOT_OK.images.slice(1) }), 'utf8');
   const ra = await phlp('result', a.id, '--accepted', '--file', `out-${a.id}.md`, '--lint', `lint-${a.id}.json`, '--rounds', '1', '--shoot', `shoot-${a.id}.json`);

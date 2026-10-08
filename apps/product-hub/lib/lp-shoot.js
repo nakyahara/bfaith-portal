@@ -62,6 +62,8 @@ export const SHOOT_JUDGE_INSTRUCTION = [
   '- needs_shoot が true の画像は、撮影指示書の材料として cut (カット名)・composition (構図)・props (小物)・background (背景)・tone (トーン・光)・ng (撮ってはいけないこと) を書く。cut と composition は必ず書く',
   '- needs_shoot が false の画像は cut 以下を空文字 "" にする',
   '',
+  '- どの画像も 8 つのキー (no・needs_shoot・cut・composition・props・background・tone・ng) を全部書く。文字の前後に空白や改行を入れない',
+  '',
   '形 (この形以外のキーを足さない):',
   '{"recommended":"none|inhouse|photographer","reason":"…","images":[{"no":0,"needs_shoot":false,"cut":"","composition":"","props":"","background":"","tone":"","ng":""}, …]}',
   '- recommended が "none" なら needs_shoot が true の画像を入れない。"inhouse" か "photographer" なら 1 つ以上入れる',
@@ -113,9 +115,11 @@ export function validateShootJudgement(raw, { imageNos = null } = {}) {
   if (typeof rec !== 'string' || !SHOOT_RECOMMENDATIONS.includes(rec)) {
     err(`recommended は ${SHOOT_RECOMMENDATIONS.join(' / ')} のどれかです`);
   }
-  const reason = typeof raw.reason === 'string' ? raw.reason.trim() : null;
+  // 🚨 前後の空白も直さずに受けない (送られた値と保存する値を同じにする・Codex PR-C 名指し1 M)
+  const reason = typeof raw.reason === 'string' ? raw.reason : null;
   if (reason === null) err('reason は文字列です');
-  else if (!reason) err('reason が空です (人が読んで決めるための理由を書いてください)');
+  else if (!reason.trim()) err('reason が空です (人が読んで決めるための理由を書いてください)');
+  else if (reason !== reason.trim()) err('reason の前後に空白・改行があります');
   else if (reason.length > SHOOT_REASON_MAX) err(`reason は ${SHOOT_REASON_MAX} 文字までです (${reason.length} 文字)`);
   else if (CONTROL_RE.test(reason)) err('reason に制御文字があります');
 
@@ -138,17 +142,19 @@ export function validateShootJudgement(raw, { imageNos = null } = {}) {
       if (images.some((x) => x.no === im.no)) { err(`${at}.no = ${im.no} が 2 回あります`); return; }
       if (typeof im.needs_shoot !== 'boolean') { err(`${at}.needs_shoot は true か false です`); return; }
       const row = { no: im.no, needs_shoot: im.needs_shoot };
+      // 🚨 6 項目は全部要る (欠けたものを '' で補わない)。前後の空白も直さずに受けない (Codex PR-C 名指し1 M)
       for (const f of SHOOT_CUT_FIELDS) {
         const v = im[f];
-        if (v === undefined) { row[f] = ''; continue; }
-        if (typeof v !== 'string') { err(`${at}.${f} は文字列です`); row[f] = ''; continue; }
-        const t = v.trim();
-        if (t.length > SHOOT_FIELD_MAX) err(`${at}.${f} は ${SHOOT_FIELD_MAX} 文字までです`);
-        if (CONTROL_RE.test(t)) err(`${at}.${f} に制御文字があります`);
-        row[f] = t;
+        if (typeof v !== 'string') { err(`${at}.${f} は文字列です (撮影が要らない画像は "")`); row[f] = ''; continue; }
+        if (v !== v.trim()) err(`${at}.${f} の前後に空白・改行があります`);
+        if (v.length > SHOOT_FIELD_MAX) err(`${at}.${f} は ${SHOOT_FIELD_MAX} 文字までです`);
+        if (CONTROL_RE.test(v)) err(`${at}.${f} に制御文字があります`);
+        row[f] = v;
       }
       // 撮影が要る画像は、撮影指示書に何を撮るかが要る (空のカットを指示書に並べない)
       if (im.needs_shoot && (!row.cut || !row.composition)) err(`${at} (${im.no}枚目) は撮影が要るので cut と composition を書いてください`);
+      // 撮影が要らない画像に撮影指示が書いてあるのは食い違い (どちらを信じて指示書に載せるか決められない)
+      if (!im.needs_shoot && SHOOT_CUT_FIELDS.some((f) => row[f] !== '')) err(`${at} (${im.no}枚目) は撮影が要らないので cut 以下を "" にしてください`);
       images.push(row);
     });
   }

@@ -30,7 +30,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
 import { lintComposition, lintSummary } from './lp-lint.js';
 import { PRODUCT_ANALYSIS_INSTRUCTION } from './prompt-templates.js';
-import { SHOOT_JUDGE_INSTRUCTION, SHOOT_RAW_MAX, validateShootForComposition } from './lp-shoot.js';
+import { SHOOT_JUDGE_INSTRUCTION, validateShootForComposition } from './lp-shoot.js';
 
 /*
  * 書き込みを伴うトランザクションは `.immediate()` で回す (コード R11)。
@@ -801,9 +801,13 @@ export function submitResult(db, generationId, {
   let shootHash = null;
   if (shootSent) {
     // 🚨 canonicalJson は JSON にできない値 (循環参照) でスタックを溢れさせるので、先に JSON にできるかを見る (lint と同じ作法)。
-    //    大きすぎる・JSON にできないものも結果は断らない (撮影判定だけ使わない)。hash は「使えない」1 つにまとめる
-    const s = jsonOrNull(shoot, SHOOT_RAW_MAX);
-    shootHash = s === false ? 'unusable' : sha256(canonicalJson(JSON.parse(s)));
+    //    JSON にできないものも結果は断らない (撮影判定だけ使わない)。
+    // 🚨 大きすぎるものも**中身から** hash を作る — 「使えない」1 つに畳むと、別々の大きすぎる判定の再送が
+    //    同じ結果と見なされる (Codex PR-C 名指し1 M)。大きさは保存できるかだけに使う (検査は lp-shoot.js)。
+    //    HTTP の本文は express.json の上限 (1MB) で抑えられている
+    let s;
+    try { s = JSON.stringify(shoot); } catch { s = undefined; }
+    shootHash = typeof s === 'string' ? sha256(canonicalJson(JSON.parse(s))) : 'unserializable';
   }
   // 🚨 receipt も hash の対象に入れる。入れないと「画像の証跡だけ違う再送」を
   //    同じ結果と見なして保存済みを返してしまう (コード R2 #1)。finalized_at は毎回変わるので入れない
