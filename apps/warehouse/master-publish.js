@@ -60,8 +60,10 @@ export const NO_OLD_TABLE_COPY = Object.freeze({
   'products.name': 'skus.name と一緒に切り替える (m_products の商品名は skus.name から)',
   'products.status': 'skus.handling と一緒に切り替える (m_products の取扱区分は skus.handling から)',
   // ⑤-2b (0053): JAN は古い表 (m_products・横の表) に置き場所が無い = 写すものが無い。JAN の正は Company DB の external_ids と
-  //   ⑤-2b の JAN の記録・NE 登録の CSV の道 (#1564 Codex R7 Medium 2)。listing_components.amazon は ⑦-2 まで止める (ここに足さない)
+  //   ⑤-2b の JAN の記録・NE 登録の CSV の道 (#1564 Codex R7 Medium 2)
   'external_ids.jan': '古い表に JAN の置き場所が無い (正 = Company DB の external_ids・⑤-2b の JAN の記録と NE 登録の CSV)',
+  // ⑦-2 PR-A: Amazon SKU の対応は m_products でなく m_sku_master・m_sku_components に写す = ④a の世代には入れない (別の工程が写す)
+  'listing_components.amazon': '⑦-2 が写す (apps/company-db/publish/amazon-map.mjs = daily-sync の「CompanyDB写し(Amazon SKU)」が m_sku_master・m_sku_components へ。④a の m_products には置き場所が無い)',
 });
 /** 一緒に切り替える組 (持ち主が違うと、同じものの 2 つの値の片方だけが C になる) */
 export const CO_SWITCH_GROUPS = Object.freeze([['products.name', 'skus.name'], ['products.status', 'skus.handling'], ['skus.tax_rate', 'skus.tax_class']]);

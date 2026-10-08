@@ -970,10 +970,10 @@ for (const mall of ['aupay', 'linegift', 'qoo10']) {
       && src.includes(`...${v}, warn: dqMonthStartWarn(${v}) }`));
   }
   check('daily-sync (R1 Medium): f_sales の再構築 (fSalesResult) は当月の finance DQ より前に流れる',
-    src.indexOf("const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js'") > 0 && src.indexOf("const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js'") < src.indexOf('run-rakuten-finance-dq.js --data-dir'));
+    src.indexOf("const fSalesResult = amazonMapBusy ? amazonMapBusySkip('f_sales') : runScript('apps/warehouse/rebuild-f-sales.js'") > 0 && src.indexOf("const fSalesResult = amazonMapBusy ? amazonMapBusySkip('f_sales') : runScript('apps/warehouse/rebuild-f-sales.js'") < src.indexOf('run-rakuten-finance-dq.js --data-dir'));
   check('daily-sync (R2 Medium): NE の取込 (neResult) は main の上の段で f_sales より前に流れ、f_sales は NE の結果に関係なく流れる (= f_sales ✅ でも元の NE は古いことがある → NE の結果も渡す前提)',
-    src.includes("\n  const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');") && src.includes("\n  const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js'")
-    && src.indexOf("const neResult = runScript('apps/warehouse/ne-api.js sync'") < src.indexOf("const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js'"));
+    src.includes("\n  const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');") && src.includes("\n  const fSalesResult = amazonMapBusy ? amazonMapBusySkip('f_sales') : runScript('apps/warehouse/rebuild-f-sales.js'")
+    && src.indexOf("const neResult = runScript('apps/warehouse/ne-api.js sync'") < src.indexOf("const fSalesResult = amazonMapBusy ? amazonMapBusySkip('f_sales') : runScript('apps/warehouse/rebuild-f-sales.js'"));
   check('rebuild-f-sales (R2 Medium): Yahoo・au PAY・LINE ギフト・Qoo10 の listing は raw_ne_orders から・楽天は raw_rakuten_orders から (NE の行から楽天を除く)',
     (() => { const fs2 = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/rebuild-f-sales.js'), 'utf8').replace(/\r\n/g, '\n');
       return /rakutenListingRows = db\.prepare\(`[^`]*FROM raw_rakuten_orders/.test(fs2) && /neListingRows = db\.prepare\(`[^`]*FROM raw_ne_orders o[^`]*NOT IN \('_ignore', 'amazon_fbm', 'rakuten'\)/.test(fs2); })());

@@ -31,12 +31,15 @@ export const PROTOCOL_HISTORY = Object.freeze({
 export const MASTER_OWNER_PROTOCOL = 2;
 
 /**
- * このコードが company として扱えるキー (2026-10-05 の切替で active にした 13 キー + skus.sku_kind)。
+ * このコードが company として扱えるキー (2026-10-05 の切替で active にした 13 キー + skus.sku_kind + listing_components.amazon)。
  *   skus.sku_kind = #1641 (夜間ロードの守り・正規化・写しの 9 升・照合 ② の区分の分類とゲートの数)。configured (config/master-ownership.mjs) も 'company' (10/7・手順の 2。active に入るのは widen の後)
- * 🚨 load のままのキー (products.parent・sku_components・listing_components.amazon・suppliers.* の 4 つ) は、それぞれ扱いの PR で足す
+ *   listing_components.amazon = ⑦-1 (表・保存・画面・夜間ロードの守り・移行) + ⑦-2 PR-A (古い表 m_sku_master・m_sku_components への写し =
+ *     apps/company-db/publish/amazon-map.mjs・④a は写さない列として通す)。configured はまだ 'load' (PR-C で 'company')・DB の広げる許可は PR-B (0059)
+ * 🚨 load のままのキー (products.parent・sku_components・suppliers.* の 3 つ) は、それぞれ扱いの PR で足す
  */
 export const COMPANY_CAPABLE = Object.freeze([
   'external_ids.jan',
+  'listing_components.amazon',
   'products.name',
   'products.sales_class',
   'products.status',

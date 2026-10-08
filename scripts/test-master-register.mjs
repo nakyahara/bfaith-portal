@@ -1465,8 +1465,8 @@ const { COMPANY_CAPABLE } = await import('../config/master-capability.mjs');
 const { MASTER_OWNERSHIP: CONFIGURED } = await import('../config/master-ownership.mjs');
 /** 本番の active (10/5 の 13 キー・skus.sku_kind は load)。WIDENED = widen の後 (sku_kind も company) = 10/7 からの configured (広げる道の手順の 1) */
 const PROD13 = Object.freeze({ ...CONFIGURED, 'skus.sku_kind': 'load' });   // 🚨 COMPANY_CAPABLE から作らない (#1641 で skus.sku_kind が入った = 14 キー・Codex #1640 R6 Medium)
-/** 旧 build (widen の前の能力 = 13 キー) = 今の COMPANY_CAPABLE から skus.sku_kind を明示して外す */
-const OLD_CAPABLE = Object.freeze(COMPANY_CAPABLE.filter((k) => k !== 'skus.sku_kind'));
+/** 旧 build (widen の前の能力 = 13 キー) = 今の COMPANY_CAPABLE から skus.sku_kind と listing_components.amazon (⑦-2 PR-A で入った) を明示して外す */
+const OLD_CAPABLE = Object.freeze(COMPANY_CAPABLE.filter((k) => k !== 'skus.sku_kind' && k !== 'listing_components.amazon'));
 const WIDENED = Object.freeze({ ...PROD13, 'skus.sku_kind': 'company' });
 const snap = async () => one(`select (select count(*) from core.skus)::int as s, (select count(*) from ops.master_registrations)::int as r, (select count(*) from events.master_change_events)::int as e,
   (select count(*) from ops.product_hub_outbox)::int as o`);

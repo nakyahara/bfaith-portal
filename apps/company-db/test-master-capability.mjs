@@ -72,6 +72,30 @@ await ta('[2b] skus.sku_kind を capable に足しても、今の本番 (DB の 
   assert.deepEqual([codeBehindKeys(widened), MP.checkPublishOwnership(widened), MP.publishCols(widened).includes('kind')], [[], [], true]);
 });
 
+await ta('[2c] ⑦-2 PR-A: listing_components.amazon を capable に足す = 写し (amazon-map.mjs) と同じ PR。configured は load のまま (PR-C)・今の本番の動きは変わらない・Amazon を company にした持ち主表でも ④a の写しは止まらない', async () => {
+  const MP = await import('../warehouse/master-publish.js');
+  const F = await import('./publish/fetch.mjs');
+  assert.ok(COMPANY_CAPABLE.includes('listing_components.amazon'));
+  assert.equal(MASTER_OWNERSHIP['listing_components.amazon'], 'load');   // configured は PR-C で変える
+  const active = { ...ALL_LOAD, ...Object.fromEntries(PROD_ACTIVE_COMPANY_20261005.map((k) => [k, 'company'])) };
+  // 今の本番 (Amazon = load): 足す前の能力と同じ答え
+  assert.deepEqual(codeBehindKeys(active), []);
+  assert.deepEqual(codeBehindKeys(active, COMPANY_CAPABLE.filter((k) => k !== 'listing_components.amazon')), []);
+  assert.deepEqual(MP.checkPublishOwnership(active), []);
+  // Amazon を company にした持ち主表 (PR-B・PR-C の後の広げる道): 能力 = 扱える・④a = 写さない列として通す (ownership_not_supported にならない)・④a の列は増えない
+  const widened = { ...active, 'skus.sku_kind': 'company', 'listing_components.amazon': 'company' };
+  assert.deepEqual(codeBehindKeys(widened), []);
+  assert.deepEqual(MP.checkPublishOwnership(widened), []);
+  assert.ok(Object.hasOwn(MP.NO_OLD_TABLE_COPY, 'listing_components.amazon'));
+  assert.match(MP.NO_OLD_TABLE_COPY['listing_components.amazon'], /amazon-map\.mjs/);
+  assert.deepEqual(MP.publishCols(widened), MP.publishCols({ ...widened, 'listing_components.amazon': 'load' }));
+  const src = { cdbReadAt: '2030-01-01T00:00:00.000000Z', has0027: true, skus: [], costs: new Map(), primary: new Map(), watermark: 1, load: { ingest_run_id: 'x' } };
+  const gen = F.buildGeneration({ source: src, ownership: widened });
+  assert.deepEqual([gen.problems, gen.ownership_problems], [[], []]);
+  // configured を Amazon = company にしても能力の外に出ない (PR-C の 1 行が通る)
+  assert.deepEqual(configuredBeyondCapable({ ...MASTER_OWNERSHIP, 'listing_components.amazon': 'company' }), []);
+});
+
 await ta('[3] code_behind: capable の外の company のキー (知らないキーも)・load は見ない', async () => {
   assert.deepEqual(codeBehindKeys(ALL_LOAD), []);
   assert.deepEqual(codeBehindKeys({ ...ALL_LOAD, 'products.parent': 'company', 'skus.name': 'company' }), ['products.parent']);

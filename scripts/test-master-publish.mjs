@@ -1587,7 +1587,7 @@ await ta('[24] 止めるかどうかの正 = warehouse.db の門 (safe / broken 
   assert.match(fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8'), /const cdbPublishGateNow = readPublishGate\(\{ dataDir: process\.env\.DATA_DIR \|\| path\.join\(PROJECT_DIR, 'data'\) \}\);/);
   const rsrc = fs.readFileSync(path.join(ROOT, 'apps/warehouse/retry-failed-jobs.js'), 'utf8');
   assert.match(rsrc, /const publishGate = readPublishGate\(\{ dataDir: process\.env\.DATA_DIR \|\| path\.join\(PROJECT_DIR, 'data'\) \}\);/);
-  assert.match(rsrc, /const results = runRetryRound\(state\.remaining_jobs, \{ publishGate \}\);/);
+  assert.match(rsrc, /const results = runRetryRound\(state\.remaining_jobs, \{ publishGate, amazonChain: amazonChainActive\(state\) && await amazonHintNow\(\) \}\);/);   // ⑦-2 PR-A: 写しの鎖の回か (門はそのまま渡す)
   const fsrc = fs.readFileSync(path.join(ROOT, 'apps/warehouse/fba-service.js'), 'utf8');
   assert.match(fsrc, /runPmlFbaRefresh\(\{ updateProgress, refresh: refreshFbaLive, build: buildProductManagementSnapshot, sync: syncPmlSnapshotOnly,\s*gate: \(\) => readPublishGate\(\{ db: wdb \}\) \}\)/);
   assert.doesNotMatch(fsrc, /await buildProductManagementSnapshot\(\{ fbaSource: 'live' \}\)/);
@@ -1935,17 +1935,19 @@ await ta('[30] セットの導いた値 (原価・税率・税区分・売上分
   await nightly();
 });
 
-await ta('[31] JAN (external_ids.jan・⑤-2b) だけ company の prepare は通る (古い表に置き場所が無い = 写さない列)・Amazon の構成 (listing_components.amazon) は ⑦-2 まで断る (#1564 Codex R7 Medium 2)', async () => {
+await ta('[31] JAN (external_ids.jan・⑤-2b) だけ company の prepare は通る (古い表に置き場所が無い = 写さない列)・Amazon の構成 (listing_components.amazon) も ⑦-2 PR-A から通る (④a は写さない列・写すのは amazon-map.mjs。#1564 Codex R7 Medium 2 の「⑦-2 まで断る」の終わり)', async () => {
   assert.deepEqual(MP.checkPublishOwnership(OWN('external_ids.jan')), []);
   assert.deepEqual(MP.publishCols(OWN('external_ids.jan')), []);   // 写す列は無い
-  assert.deepEqual(MP.checkPublishOwnership(OWN('listing_components.amazon')), ['not_copied:listing_components.amazon']);
+  assert.deepEqual(MP.checkPublishOwnership(OWN('listing_components.amazon')), []);
+  assert.deepEqual(MP.publishCols(OWN('listing_components.amazon')), []);   // ④a の写す列は増えない
   const logs = [];
   const epochCli = (argv, extra = {}) => quietly(() => EP.cli(argv, { env: {}, connect: async () => ({ db: pdb, close: async () => {} }), log: (m) => logs.push(m), ...extra }));
   await q('delete from ops.master_ownership_state');
   assert.equal(await epochCli(['prepare'], { ownership: OWN('external_ids.jan') }), 0, logs.at(-1));
   assert.equal((await OS.readOwnershipState(pdb)).prepared.map['external_ids.jan'], 'company');
-  assert.equal(await epochCli(['prepare'], { ownership: OWN('listing_components.amazon') }), 1);
-  assert.match(logs.at(-1), /not_copied:listing_components\.amazon/);
+  assert.equal(await epochCli(['cancel']), 0);
+  assert.equal(await epochCli(['prepare'], { ownership: OWN('listing_components.amazon') }), 0, logs.at(-1));
+  assert.equal((await OS.readOwnershipState(pdb)).prepared.map['listing_components.amazon'], 'company');
   assert.equal(await epochCli(['cancel']), 0);
   await q('delete from ops.master_ownership_state');
 });

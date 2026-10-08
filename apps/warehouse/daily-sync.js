@@ -88,7 +88,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
 // 🚨 Amazon の決済と財務は env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator「Amazon決済と財務」の 1 工程・無ければ今までの 2 工程「Amazon Settlement」→「CompanyDB財務(Amazon)」
 //   (finance-coordinator-switch.js・#1567。走るのはどちらか片方 = retry の対象には両方の名前を載せる)
 
@@ -807,6 +807,29 @@ async function main() {
   publishGate.state = cdbPublishBroken ? 'broken' : cdbPublishGateDecision.state;
   if (publishGate.broken) console.log(`[DailySync] ⚠️ Company DB の写しの反映の門 = ${publishGate.state} (exit ${cdbPublishApplyResult.exitCode ?? '-'}・${cdbPublishGateDecision.reason}) → m_products・上書き表を読む後の工程を見送る (publish-gate.js)`);
 
+  // ─── Company DB の Amazon SKU の対応の写し (⑦-2 PR-A。設計 = AI_reference CompanyDB構想/16 §2・最小の計画 10/7) ───
+  // 持ち主 (DB の active の listing_components.amazon) が company の朝だけ、Company DB の active の対応に m_sku_master・m_sku_components をまるごと合わせる
+  // (SQLite の 1 取引で差だけ・読み直してハッシュを照らす)。持ち主が load の今は何もしない (⏭️ exit 0・SQLite を開かない)。
+  // f_sales (v_sku_resolved を読む) より前 = 今朝の対応で売上を作る。断った (0 件・90% 未満・変更の記録の番号が戻った)・読めない = ❌ = retry に載る
+  // (retry-failed-jobs.js: f_sales の上流・写しが retry に載った日だけ「写しの鎖」で f_sales → sales_velocity → pml_snapshot → Render同期 を一段ずつ流す)。
+  // 止める = .env の CDB_AMAZON_MAP_PUBLISH_PAUSE=1 (⚠️ 見送り・古い表は前の形のまま)。ping は打たない (台帳 warehouse-daily-sync の 1 工程)
+  let cdbAmazonMapResult = runScript('apps/company-db/publish/amazon-map.mjs --daily', 'Company DB の Amazon SKU の写し', 300000);
+  // 失敗した朝: 持ち主が company の肯定の手がかり (config が company・有効な写しの記録) が無ければ retry に載せない (blocked)。
+  //   子の異常終了 (timeout・abort・起動の失敗) で、今の本番 (load) の retry に写しの鎖を持ち込まない (#1649 Codex R3 Medium 2)。読み込めない = そのまま (retry に載る側)
+  if (!cdbAmazonMapResult.success) {
+    try {
+      const AM = await import('../company-db/publish/amazon-map.mjs');
+      cdbAmazonMapResult = AM.dailyMapResultForRetry(cdbAmazonMapResult, AM.amazonMapHint({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data') }));
+    } catch (e) { console.warn(`[DailySync] 写しの手がかりを読めない (${e.message}) = 写しの失敗は retry に載せる`); }
+  }
+  results.push({ name: 'CompanyDB写し(Amazon SKU)', ...cdbAmazonMapResult, warn: cdbAmazonMapResult.success && isWarnSummary(cdbAmazonMapResult.summary) });
+  // exit 73 = 別の写しが写しの鍵を持っていた (回の鍵で 1 つずつなので普通は起きない・守りの 2 段目) = この朝は f_sales・速度・リスト・Render同期 を流さない。retry-state には写しだけを残す (下流は blocked = 載せない)。
+  //   retry で写しが直った回に、写しの鎖 (retry-failed-jobs.js の AMAZON_MAP_CHAIN) が f_sales → 速度 → リスト → Render同期 を一段ずつ流す (#1649 Codex R2 Medium)
+  //   (手の写しが f_sales と Render同期 の間に新しい対応を入れると、新しい mirror_sku_* と古い対応の f_sales が一緒に送られる。#1649 Codex R1 High)。
+  //   ふつうの安全弁の拒否 (exit 1) は今までどおり流す (古い表は前の対応のまま = 混ざらない)。持ち主 load の今は鍵を取らない = 起きない
+  const amazonMapBusy = !cdbAmazonMapResult.success && cdbAmazonMapResult.exitCode === 73;
+  const amazonMapBusySkip = (name) => { console.log(`[DailySync] ${name} 見送り (Amazon SKU の写しが別の写しの鍵待ち = retry で 写し → f_sales → … の順に流す)`); return { success: false, blocked: true, summary: '⏸️ skipped (Amazon SKU の写しが別の写しの鍵待ち = retry で写しが直った回に順に流す)' }; };
+
   // m_products 変更差分を history に記録 (trigger 廃止 → 差分バッチ化)
   // rebuild-m-products.js の直後に実行 (m_products 確定後の比較)
   const historyResult = runScript('apps/warehouse/record-m-products-history.js', 'm_products 履歴記録');
@@ -825,17 +848,17 @@ async function main() {
   // 販売集計テーブル再構築
   // 上限 30 分 = retry-failed-jobs.js の JOB_DEFINITIONS と同じ。ふだん 6〜7 分 (読み 2.5〜3 分 + 書き 3〜4 分) で既定の 10 分に近く、
   // 2026-10-04 は miniPC が重く 10 分 33 秒で打ち切られ、Render 同期・当月の finance DQ・lz-daily まで止まった
-  const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築', 1800000);
+  const fSalesResult = amazonMapBusy ? amazonMapBusySkip('f_sales') : runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築', 1800000);
   results.push({ name: 'f_sales', ...fSalesResult });
 
   // 販売速度サマリ再構築 (商品管理リスト用: FBA/FBA以外 × 7d/30d)
   // m_products / v_sku_resolved / raw受注 が揃った後に実行。
-  const velocityResult = runScript('apps/warehouse/rebuild-sales-velocity.js', 'sales velocity 再構築');
+  const velocityResult = amazonMapBusy ? amazonMapBusySkip('sales_velocity') : runScript('apps/warehouse/rebuild-sales-velocity.js', 'sales velocity 再構築');
   results.push({ name: 'sales_velocity', ...velocityResult });
 
   // 商品管理リスト スナップショット生成 (在庫集計 + velocity の後)
   // m_products 起点で在庫/販売/利益/発注パラメータを1表に確定し published_run_id を切替。
-  const pmlSnapResult = runScript('apps/warehouse/build-product-management-snapshot.js', '商品管理リスト snapshot');   // 写しの反映が世代と違う朝は runScript が止める
+  const pmlSnapResult = amazonMapBusy ? amazonMapBusySkip('pml_snapshot') : runScript('apps/warehouse/build-product-management-snapshot.js', '商品管理リスト snapshot');   // 写しの反映が世代と違う朝は runScript が止める
   results.push({ name: 'pml_snapshot', ...pmlSnapResult });
 
   // Amazon Settlement mart 再構築 (Phase 3.5)
@@ -1458,6 +1481,8 @@ async function main() {
   const skuMapOk = rakutenSkuMapResult.success;
   if (publishGate.broken) {
     syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');   // runScript が止める (⚠️ 見送り。publish-gate.js)
+  } else if (amazonMapBusy) {
+    syncResult = amazonMapBusySkip('Render同期');   // 写しの鍵待ち = retry の写しの鎖で流す (retry-state に載せない)
   } else if (fSalesOk && skuMapOk) {
     syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');
   } else {
