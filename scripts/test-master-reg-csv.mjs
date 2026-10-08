@@ -117,6 +117,9 @@ const materialOf = (genId, completeAt) => ({
  * 1 つの Company DB: migration・ロール・夜間ロード・切替 (⑤-1 の本物の関数: 場所ごとの門のログインが記録 → 運用のロール master_ops が証拠つきで 1 段ずつ。
  * frozen で backfill (master_ops)・company_owner から全部 company のハッシュ)・今日の照合の回と NE の元のコード
  */
+/** 0065 の 1 つ前の migration の番号 (0065 の前の DB で ne-reg-single-v1 のファイルを作る = #1664 Codex R1 Medium の移行の試験) */
+const PRE_0065 = fs.readdirSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations'))
+  .filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) < '0065').map((x) => x.slice(0, 4)).sort().pop();
 async function setupDb() {
   const pg = new PGlite();
   const sessionUser = (await pg.query('select session_user::text as u')).rows[0].u;   // 試験の接続のログイン (superuser)。門のログインから戻るときに使う
@@ -124,7 +127,7 @@ async function setupDb() {
   await pg.query(`alter database ${(await pg.query('select current_database() as d')).rows[0].d} owner to deploy`);
   await pg.query('set role deploy');
   const db = pgliteAdapter(pg);
-  await applyMigrations(db, { log: quiet });
+  await applyMigrations(db, { log: quiet, to: PRE_0065 });   // 🆕 0065 の移行の試験: 0065 の前まで (v1 のファイルを作ってから 0065 を当てる = [V5])
   await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
   await createMasterEditRoles(pg, {});
   await W2.useReal0058(pg, { leases: ['single', 'set'], futureSetLease: true });   // 広げる道 PR-2: 本物の 0058 の上で試験の許可を置く (この DB は構成も C = セットの許可は将来の形)
@@ -242,6 +245,55 @@ const ok = (v) => ({ st: 'ok', v });
 const obsSingle = (code, over = {}) => ({ code_norm: code, present: true, trusted: true, kind: 'single', cols: {
   name: ok('新しい単品'), supplier: ok('0001'), cost: ok(300), price: ok(1500), tax_rate: ok(0.1), handling: ok('active'), parent: ok(null), ...over } });
 
+// ── 🆕 0065 (#1664 Codex R1 Medium) の移行: 0065 の前の DB で ne-reg-single-v1 のファイルを作る (配っていない 1 つ・配った 1 つ) → 0065 を当てる ──
+//   setupDb は 0065 の前 (PRE_0065) まで当てた。v1 は前の DB の関数 (0053 の ops.ne_reg_canonical = JAN を送る・0058 の ops.ne_reg_build / ops.ne_reg_issue) で作る
+await reg('single', 'old-v1-built', single({ name: '前の版 配っていない' }));
+await save('old-v1-built', { jan: jan13('490000000081') });
+await reg('single', 'old-v1-issued', single({ name: '前の版 配った' }));
+async function buildV1(code) {
+  const id = await skuId(code);
+  const canon = (await one('select ops.ne_reg_canonical($1, $2::date) as c', [id, TODAY])).c;
+  assert.deepEqual(canon.blockers, [], code);
+  const spec = { ...G.REG_SCHEMAS.products, schema: 'ne-reg-single-v1' };
+  const mark = (await one('select compare_run_id from ops.master_ne_code_mark')).compare_run_id;
+  return (await inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY,
+    kind: 'products', schema_version: 'ne-reg-single-v1', header: spec.header.join(','), ne_codes_run: mark, cost_day: TODAY,
+    items: [{ sku_id: id, expected: canon.expected, rows: canon.cells }] }), G.buildRegCsv(spec, canon.cells.map((r) => r.map(String))).bytes]))).rows[0].r;
+}
+const V1_BUILT = await buildV1('old-v1-built');
+const V1_ISSUED = await buildV1('old-v1-issued');
+assert.equal((await one('select cells from ops.ne_reg_export_rows where export_id = $1', [V1_BUILT.export_id])).cells[8], jan13('490000000081'), '前の版は JAN を送る');
+assert.equal((await issue(V1_ISSUED.export_id)).export.state, 'issued');
+assert.equal((await one("select count(*)::int as n from ops.ne_reg_exports where schema_version = 'ne-reg-single-v1'")).n, 2);
+await applyMigrations(db, { log: quiet });   // ここで 0065
+assert.ok((await one("select to_regprocedure('ops.ne_reg_schema_rule(text)') is not null as ok")).ok, '0065 を当てた');
+
+await ta('[V5] 0065 の前に作った v1 のファイル (#1664 Codex R1 Medium): 配っていない (built) v1 = 0065 の後は初めて配れない (409 schema_not_buildable・何も変えない・使わないにして v2 で作り直す) / 配った (issued) v1 = 0065 の後も再ダウンロード・もう一度配る (already)・申告・翌朝の確かめは今までどおり', async () => {
+  const e1 = await rejectsWith(issue(V1_BUILT.export_id), 409, 'schema_not_buildable');
+  assert.match(e1.message, /ne-reg-single-v1/);
+  await pgErr(inSession(() => pg.query('select ops.ne_reg_issue($1::uuid, $2, $3::jsonb, $4::bigint) as r', [uuid(), 'boss@test', OWN, V1_BUILT.export_id])), /schema_not_buildable/);
+  assert.deepEqual([(await expOf(V1_BUILT.export_id)).state, (await itemsOf(V1_BUILT.export_id)).map((i) => i.state)], ['built', ['built']], '何も変えない');
+  assert.equal((await G.regExportFile(db, V1_BUILT.export_id)).bytes, null, '配っていないファイルは渡さない');
+  await supersede(V1_BUILT.export_id);
+  const re = await build('products', ['old-v1-built']);
+  const reRow = (await one('select cells from ops.ne_reg_export_rows where export_id = $1', [re.export.export_id])).cells;
+  assert.deepEqual([(await expOf(re.export.export_id)).schema_version, reRow[8]], ['ne-reg-single-v2', 'empty'], '作り直す = v2 (JAN は送らない)');
+  await supersede(re.export.export_id);
+  // 配った v1 = 版を見ない道は今までどおり
+  const f = await G.regExportFile(db, V1_ISSUED.export_id);
+  assert.ok(f.bytes && f.sha256 === V1_ISSUED.sha256, '再ダウンロード');
+  assert.equal((await issue(V1_ISSUED.export_id)).already, true, 'もう一度配る = そのまま');
+  const d = await declare(V1_ISSUED.export_id, V1_ISSUED.sha256, 'ok');
+  assert.deepEqual(d.ne_pending, ['old-v1-issued']);
+  const r = await newRun();
+  const c = await check(r, [obsSingle('old-v1-issued', { name: ok('前の版 配った') })]);
+  assert.deepEqual(c.counts, { verified: 1 });
+  assert.deepEqual([(await itemsOf(V1_ISSUED.export_id))[0].state, await regOf('old-v1-issued')], ['verified', 'ne_confirmed']);
+  assert.equal((await q("select 1 from ops.ne_csv_verified where converter_version = 'ne-reg-single-v1' and verified_by = 'ne_compare'")).length, 0, '門のある前の版は記録を自動で残さない');
+});
+
+/** [V5] (0065 の前の v1 のファイルと作り直し) の後のファイルの数 = [C1]〜[C2b] の「何も作っていない」の基準 */
+const EXP_BEFORE_C = (await one('select count(*)::int as n from ops.ne_reg_exports')).n;
 // ── 新商品 (下書き) ──
 await reg('single', 'new-a', single());
 await save('new-a', { jan: J1 });   // 新商品の JAN = 登録の後に商品の画面で (JAN の約束)
@@ -261,7 +313,7 @@ await ta('[C1] 門: 切替の後でないと作れない (MASTER_EDIT_OPEN な�
   await rejectsWith(build('products', ['new-a', 'NEW-A']), 400);
   await rejectsWith(as(E, 'master_edit', () => G.buildRegExport(db, { actor: 'boss@test', kind: 'products', codes: ['new-a'], requestId: 'x' }, opts())), 400);
   await rejectsWith(build('sets', ['new-a']), 400);
-  assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, 0);
+  assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, EXP_BEFORE_C);   // 0065: [V5] の前の版のファイルの後
 });
 
 await ta('[C2] 止まる理由: 原価が無い・構成品が NE 確認済みでない・NE にもうあるコード (止める = already_in_ne)・1 つでも止まれば作らない', async () => {
@@ -276,7 +328,7 @@ await ta('[C2] 止まる理由: 原価が無い・構成品が NE 確認済み�
   await recordNeCodes(pg, 'mc_20300110T010000000Z_cccccc', ['new-dup']);
   e = await rejectsWith(build('products', ['new-dup']), 409, 'already_in_ne');
   assert.match(e.message, /new-dup/);
-  assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, 0);
+  assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, EXP_BEFORE_C);   // 0065: [V5] の前の版のファイルの後
   const s = await G.regSummary(db, { nowMs: NOW_MS });
   const dup = s.candidates.find((c) => c.code === 'new-dup');
   assert.equal(dup.stop, 'already_in_ne');
@@ -302,7 +354,7 @@ await ta('[C2b] 2026-10-08: 発送方法なしの単品は止まる理由に出�
   assert.deepEqual([c.state, c.blockers], ['draft', ['代表の仕入先が決まっていない (NE の「設定なし」は 9999)']]);
   const e = await rejectsWith(build('products', ['new-nosup']), 409, 'not_ready');
   assert.match(JSON.stringify(e.extra.items), /代表の仕入先が決まっていない/);
-  assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, 0);
+  assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, EXP_BEFORE_C);   // 0065: [V5] の前の版のファイルの後
   // 商品の画面で代表の仕入先を入れる (今の保存の道) = 止まる理由が消える
   await save('new-nosup', { primary_supplier: '0001' });
   s = await G.regSummary(db, { nowMs: NOW_MS });
@@ -1133,7 +1185,7 @@ await ta('[V1] 0065 形の版の決まり: lib の REG_SCHEMA_RULES = DB の ops
   assert.match(rec[1].note, /記録だけ/);
 });
 
-await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版との差は決めた所だけ (ops.ne_reg_canonical = JAN を empty に・ops.ne_reg_build = 版の決まりと試し用・ops.record_ne_registration_check = 3 者一致と記録だけ)・後の migration が作り直していない・権限', async () => {
+await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版との差は決めた所だけ (ops.ne_reg_canonical = JAN を empty に・ops.ne_reg_build = 版の決まりと試し用・ops.ne_reg_issue = 初めて配るのは作れる版だけ・ops.record_ne_registration_check = 3 者一致・記録だけ・夜間ロードの鍵)・後の migration が作り直していない・権限', async () => {
   assert.ok(F0065, '0065 の file');
   const WANT = {
     'ops.ne_reg_canonical': { base: '0053_ne_registration_csv.sql',
@@ -1168,8 +1220,20 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
         "end if;",
         "-- 実機の確かめの門 (種類 × 形の版 × 見出し・最後の記録が ok)。確かめていない = 試し用 (5 行まで)。🆕 0065: 門の無い版 (single-v2・variation-v1) は試し用にしない",
         "v_trial := (v_rule -> 'trial_gate') = 'true'::jsonb and not v_verified;"] },
+    'ops.ne_reg_issue': { base: '0058_master_widen.sql',
+      removed: [
+],
+      added: [
+        "-- 🆕 0065 (#1664 Codex R1 Medium): 初めて配る (built → issued) のは、今作れる版のファイルだけ (0065 の前に作って配っていない v1 = JAN を送る版を後から配らない)",
+        "if (ops.ne_reg_schema_rule(e.schema_version) -> 'buildable') is distinct from 'true'::jsonb then",
+        "raise exception 'schema_not_buildable: ファイル % の形の版 % はもう配らない (%)。使わないにして作り直す', p_export_id, e.schema_version,",
+        "coalesce(ops.ne_reg_schema_rule(e.schema_version) ->> 'why', '知らない版') using errcode = 'P0001';",
+        "end if;"] },
     'ops.record_ne_registration_check': { base: '0063_ne_reg_auto_verify_issued.sql',
       removed: [
+        "-- 鍵: SKU ごと (sku_id の順・保存と同じ鍵) → CSV の鍵",
+        "perform ops.ne_reg_lock_skus((select pg_catalog.array_agg(t.sku_id) from ops.v_ne_reg_targets t",
+        "where t.code_norm in (select o.code_norm from ops.ne_reg_compare_observations o where o.compare_run_id = p_run)));",
         "for it in select i.*, e.declared_at as export_declared_at, e.issued_at as export_issued_at",
         "v_out := case when (v_cmp -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;",
         "v_out := case when (v_cmp -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;",
@@ -1178,6 +1242,17 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
       added: [
         "v_cdb      jsonb;",
         "v_drift    jsonb := '[]'::jsonb;",
+        "v_sid      bigint;",
+        "-- 🆕 0065 (#1664 Codex R1 High): 最初にマスタの書き込みの鍵 (共有)。夜間ロード (排他・取引の冒頭) が書き終わって commit するまで待つ = 3 者一致の Company DB の値は",
+        "--   ロードの後の値 (READ COMMITTED: 鍵の後の文は新しい snapshot)。鍵の順 = マスタの書き込み → 確かめ → SKU → 親子 (共有) → CSV (保存・登録・CSV の関数と同じ向き)",
+        "perform pg_catalog.pg_advisory_xact_lock_shared(core.master_write_lock_key());",
+        "-- 鍵: SKU ごと (sku_id の順・保存と同じ鍵) → 🆕 0065: 親子の鍵 (共有。保存が代表を変える順 = SKU → 親子 (排他) → CSV と同じ・代表を書く取引の後の値で比べる) → CSV の鍵",
+        "for v_sid in select distinct t.sku_id from ops.v_ne_reg_targets t",
+        "where t.sku_id is not null and t.code_norm in (select o.code_norm from ops.ne_reg_compare_observations o where o.compare_run_id = p_run) order by 1 loop",
+        "perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || v_sid::text, 0));",
+        "end loop;",
+        "perform pg_catalog.pg_advisory_xact_lock_shared(core.parent_lock_key());",
+        "perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_csv'));",
         "for it in select i.*, e.declared_at as export_declared_at, e.issued_at as export_issued_at, e.kind as export_kind, e.schema_version as export_schema, e.header as export_header",
         "v_cdb := null;",
         "v_cdb := ops.ne_reg_cdb_compare(it.expected, it.sku_id);   -- 🆕 0065: 3 者一致 (期待値 = NE の観測 = 今の Company DB)",
@@ -1209,6 +1284,7 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
       has_function_privilege('watch_writer', $1::regprocedure, 'execute') as ww, (select prosecdef from pg_proc where oid = $1::regprocedure) as d,
       (select array_to_string(proconfig, ',') from pg_proc where oid = $1::regprocedure) as c`, [sig]);
   assert.deepEqual(await priv('ops.ne_reg_build(jsonb, bytea)'), { pub: false, me: true, ww: false, d: true, c: 'search_path=pg_catalog, pg_temp' });
+  assert.deepEqual(await priv('ops.ne_reg_issue(uuid, text, jsonb, bigint)'), { pub: false, me: true, ww: false, d: true, c: 'search_path=pg_catalog, pg_temp' });
   assert.deepEqual(await priv('ops.record_ne_registration_check(text)'), { pub: false, me: false, ww: true, d: true, c: 'search_path=pg_catalog, pg_temp' });
   assert.deepEqual(await priv('ops.ne_reg_canonical(bigint, date)'), { pub: false, me: false, ww: false, d: true, c: 'search_path=pg_catalog, pg_temp' });
   for (const sig of ['ops.ne_reg_schema_rule(text)', 'ops.ne_reg_cdb_compare(jsonb, bigint)', 'ops.sku_ever_issued(bigint)']) {

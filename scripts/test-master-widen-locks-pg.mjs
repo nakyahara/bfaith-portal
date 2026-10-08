@@ -5,7 +5,7 @@
  *   A = 配る (アプリ lib/master-reg-csv.mjs の issueRegExport = 初めて配るだけ ops.acquire_new_entry_locks を段階の鍵より前に・画面のロール master_edit)
  *   B = 配る (DB の関数 ops.ne_reg_issue を master_edit で直接呼ぶ = アプリの鍵なし)
  *   C = 照合 ② の始めに閉じる (ops.close_new_entry_for_compare・watch_writer = 許可の排他)
- *   D = 照合の確かめ (0053 の ops.record_ne_registration_check・watch_writer = ne_reg_check → SKU → CSV)
+ *   D = 照合の確かめ (ops.record_ne_registration_check・watch_writer = 🆕 0065: マスタの書き込み (共有) → ne_reg_check → SKU → 親子 (共有) → CSV)
  *   F = CSV を作る (DB の関数 ops.ne_reg_build を master_edit で直接 = request → 許可 → 段階 → マスタの書き込み → SKU → CSV)
  *   G = CSV を作る (アプリ buildRegExport = request → 許可 → 段階 → マスタの書き込み → SKU → CSV → NE のコード → ops.ne_reg_build)
  *   R = 新商品の登録 (アプリ registerNewSku = request → 許可 → 段階 → マスタの書き込み → 新しいコード → ops.register_new_sku)
@@ -16,6 +16,7 @@
  *   (= 小さい番号へ戻らない) を確かめる → 鍵を放す → deadlock (40P01) なしに終わる (閉じた後の配るは new_entry_closed)。
  * あわせて: ops.acquire_new_entry_locks の鍵とモード・ops.ne_reg_file も許可の共有の鍵を返すまで持つ (R19)・照合 ② の始めに閉じるのは配る取引を待つ・
  *   結果を書く前に落ちた再実行では開かない。
+ * 🆕 0065 (#1664 Codex R1 High) [22]: 夜間ロードが代表を書く直前で止まっている間、照合の確かめは待ち、ロードの後の Company DB の値で 3 者一致を比べる。
  * 使い方: TEST_PG_URL=postgres://… node scripts/test-master-widen-locks-pg.mjs (localhost だけ・使い捨ての DB を作って消す)
  */
 import assert from 'node:assert/strict';
@@ -123,9 +124,11 @@ try {
   // §3.10 の鍵の番号 (key → 番号)。request・SKU の鍵は回ごとに足す
   const keyRow = await one(`select hashtext('ops.new_entry_lease:single')::bigint::text as l1, hashtext('ops.new_entry_lease:set')::bigint::text as l2,
       hashtext('ops.master_cutover')::bigint::text as cut, core.master_write_lock_key()::text as mw,
-      hashtext('ops.ne_reg_check')::bigint::text as chk, hashtext('ops.ne_csv')::bigint::text as csv, hashtext('ops.ne_codes')::bigint::text as nec`);
-  const NUM = new Map([[keyRow.l1, 2], [keyRow.l2, 2], [keyRow.cut, 4], [keyRow.mw, 5], [keyRow.chk, 6], [keyRow.csv, 8], [keyRow.nec, 9]]);
-  const KEY = { 2: keyRow.l1, 4: keyRow.cut, 5: keyRow.mw, 6: keyRow.chk, 8: keyRow.csv, 9: keyRow.nec };
+      hashtext('ops.ne_reg_check')::bigint::text as chk, hashtext('ops.ne_csv')::bigint::text as csv, hashtext('ops.ne_codes')::bigint::text as nec,
+      core.parent_lock_key()::text as par`);
+  // 🆕 0065 (#1664 Codex R1 High): 親子の鍵 (0036) = SKU (7) の後・CSV (8) の前 (保存が代表を変える順 = SKU → 親子 → CSV と同じ) = 7.5
+  const NUM = new Map([[keyRow.l1, 2], [keyRow.l2, 2], [keyRow.cut, 4], [keyRow.mw, 5], [keyRow.chk, 6], [keyRow.par, 7.5], [keyRow.csv, 8], [keyRow.nec, 9]]);
+  const KEY = { 2: keyRow.l1, 4: keyRow.cut, 5: keyRow.mw, 6: keyRow.chk, 7.5: keyRow.par, 8: keyRow.csv, 9: keyRow.nec };
   const skuKey = async (id) => (await one(`select hashtextextended('core.sku:' || $1::text, 0)::text as k`, [id])).k;
   const addSku = async (code) => { const k = await skuKey(await skuIdOf(code)); NUM.set(k, 7); return k; };
   const addRequest = async (rid) => { const k = (await one(`select hashtextextended('ops.ne_reg_request:' || $1::text, 0)::text as k`, [rid])).k; NUM.set(k, 1); return k; };
@@ -208,6 +211,61 @@ try {
   const pathV = () => NG2.query("select ops.revoke_new_entry_lease('single', '試験: 鍵の順の取り消し') as r").then((r) => r.rows[0].r);
 
   let n = 0;
+  await ta('[22] 0065 (#1664 Codex R1 High): 夜間ロードが代表 (親) を書く直前で止まっている間、照合の確かめ (3 者一致) はマスタの書き込みの鍵で待ち、ロードの commit の後の Company DB の値で比べる (古い値で verified にしない)', async () => {
+    const { setActiveOwnershipInDb } = await import('./fixtures/master-widen-pr1.mjs');
+    // 下書きの lk-p に代表 s001 (単品の代表) を付けて配る (期待値の代表 = s001)
+    await reg('lk-p');
+    const parentSql = `update core.products set parent_product_id = (select k.product_id from core.skus k where k.code = $2) where product_id = (select product_id from core.skus where code = $1)`;
+    await M.query('begin');
+    await M.query(`select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())`);
+    await M.query(parentSql, ['lk-p', 's001']);
+    await M.query('commit');
+    const ep = await build('lk-p');
+    await G.issueRegExport(dbE3, { actor: 'boss@test', exportId: ep.export_id }, opts);
+    const expParent = (await one(`select i.expected -> 'values' ->> 'parent' as p from ops.ne_reg_export_items i where i.export_id = $1`, [ep.export_id])).p;
+    assert.equal(expParent, 's001');
+    // 照合の回 (NE の観測 = 配った値どおり・代表 s001)。ほかの生きている品目は「信用できない観測」= 待ち
+    const RUNP = 'mc_20300109T000000022Z_cccccc';
+    await M.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, '2030-01-09T00:00:00Z', 0)`, [RUNP]);
+    const snap = (await WW.query('select ops.snapshot_ne_reg_targets($1) as r', [RUNP])).rows[0].r;
+    const okc = (v) => ({ st: 'ok', v });
+    const at = new Date(Date.now() + 60000).toISOString();
+    const observations = snap.targets.map((t) => (t.code_norm === 'lk-p'
+      ? { code_norm: 'lk-p', present: true, trusted: true, kind: 'single', cols: { name: okc('鍵の順 lk-p'), supplier: okc('0001'), cost: okc(300), price: okc(1500), tax_rate: okc(0.1), handling: okc('active'), parent: okc('s001') } }
+      : { code_norm: t.code_norm, present: true, trusted: false, kind: t.sku_kind, cols: {} }));
+    assert.ok(observations.some((o) => o.code_norm === 'lk-p'));
+    const w = (await WW.query('select ops.record_ne_registration_observations($1::jsonb) as r', [JSON.stringify({ compare_run_id: RUNP,
+      fetch: { generation_id: 'gen_locks_p', products_rev: '7', sets_rev: '8', raw_hash: 'b'.repeat(64) }, products_at: at, sets_at: at, absence_trusted: true, observations })])).rows[0].r;
+    await WW.query('select ops.seal_ne_registration_run($1, $2, $3)', [RUNP, w.observation_hash, 'f'.repeat(64)]);
+    // 持ち主 load の間の夜間ロード (代表を NE から写す道) = マスタの書き込み (排他) → 親子 (排他) を取り、代表を書く直前で止まる
+    await setActiveOwnershipInDb(M, { ...ALL_COMPANY, 'products.parent': 'load' });
+    const L = await open(null); clients.push(L);
+    try {
+      await L.query('begin');
+      await L.query('select pg_advisory_xact_lock(core.master_write_lock_key())');
+      await L.query(`select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())`);
+      const chk = launch(WW2.query('select ops.record_ne_registration_check($1) as r', [RUNP]).then((r) => r.rows[0].r));
+      await sleep(800);
+      assert.equal(chk.done, false, '照合の確かめはロードの取引を待つ');
+      const waitKey = (await one(`select ((classid::bigint << 32) | objid::bigint)::text as k from pg_locks where locktype = 'advisory' and objsubid = 1 and not granted and pid = $1`, [PID.D]))?.k;
+      assert.equal(waitKey, keyRow.mw, '待っているのはマスタの書き込みの鍵 (共有)');
+      // ロードが代表を NE の値 (ここでは s002 = 配った値と違う) に書いて commit
+      await L.query(parentSql, ['lk-p', 's002']);
+      await L.query('commit');
+      const r = await chk.promise;
+      assert.ok(r.ok, r.err && r.err.message);
+      const lkp = r.ok.cdb_drift.find((x) => x.code === 'lk-p');
+      assert.ok(lkp, `ロードの後の Company DB の代表 (s002) で比べた = 3 者一致でない ${JSON.stringify(r.ok)}`);
+      assert.deepEqual(lkp.cols.parent, { ok: false, expected: 's001', cdb: 's002' });
+      assert.equal(r.ok.counts.verified ?? 0, 0, '古い値 (s001) で verified にしない');
+      const it = await one(`select i.state, r2.state as reg from ops.ne_reg_export_items i join ops.master_registrations r2 on r2.sku_id = i.sku_id where i.export_id = $1`, [ep.export_id]);
+      assert.deepEqual([it.state, it.reg], ['partial', 'draft']);
+    } finally {
+      try { await L.query('rollback'); } catch { /* commit 済み */ }
+      await setActiveOwnershipInDb(M, ALL_COMPANY);
+    }
+  });
+
   await ta('[18a] アプリの鍵の入口 ops.acquire_new_entry_locks (PR-2 Codex R3): §3.10 の 2 (許可・種類の順に全部) を共有で取り、取引の終わりまで持つ・戻り値 = 今の許可が有効か', async () => {
     await E1.query('begin');
     assert.equal((await E1.query("select ops.acquire_new_entry_locks('single') as v")).rows[0].v, true);
@@ -219,7 +277,7 @@ try {
     assert.deepEqual((await locksOf()).A.held, []);
   });
   await ta('[18] 鍵の順 (§3.10・PR-2 Codex R4): 9 つの道 (配る = アプリ / DB を直接・照合 ② の始めに閉じる・照合の確かめ・CSV を作る = DB を直接 / アプリ (PR-2)・登録 = アプリ (PR-2) / DB を直接・許可の取り消し) を、鍵ごとの barrier と始める順を変えて交差させる = どの道も小さい番号の鍵へ戻らない・deadlock なし・全部終わる (閉じた後の配るは new_entry_closed)', async () => {
-    const BARRIERS = [2, 4, 5, 6, 7, 8, 9];
+    const BARRIERS = [2, 4, 5, 6, 7, 7.5, 8, 9];   // 🆕 0065: 7.5 = 親子の鍵 (排他 = 夜間ロード・代表を変える保存の代わり)
     const ORDERS = [['A', 'B', 'C', 'D', 'F', 'G', 'R', 'S', 'V'], ['C', 'V', 'D', 'A', 'R', 'F', 'S', 'B', 'G'], ['F', 'S', 'B', 'G', 'D', 'C', 'V', 'A', 'R']];
     for (const b of BARRIERS) {
       for (const order of ORDERS) {
@@ -270,6 +328,9 @@ try {
     assert.ok(LOG.some((x) => x.path === 'B' && x.waiting >= 4 && x.held.includes(2)), 'DB の関数を直接呼んでも許可の鍵を段階の鍵より先に取る');
     assert.ok(LOG.some((x) => x.path === 'F' && x.waiting === 4 && x.held.includes(1) && x.held.includes(2)), 'CSV を作る DB の関数は request → 許可の鍵を持って段階の鍵で待つ (R4)');
     assert.ok(LOG.some((x) => x.path === 'D' && x.waiting === 6), '照合の確かめは ne_reg_check の鍵で待つ (許可の鍵は取らない)');
+    // 🆕 0065 (#1664 Codex R1 High): 照合の確かめは最初にマスタの書き込みの鍵 (共有) で夜間ロード (排他) を待つ (何も持たずに)・SKU の後・CSV の前に親子の鍵 (共有) で待つ
+    assert.ok(LOG.some((x) => x.path === 'D' && x.waiting === 5 && x.held.length === 0), '照合の確かめはマスタの書き込みの鍵で待つ (何も持たずに)');
+    assert.ok(LOG.some((x) => x.path === 'D' && x.waiting === 7.5 && x.held.includes(5) && x.held.includes(6) && !x.held.includes(8)), '照合の確かめは書き込み・確かめの鍵を持って親子の鍵で待つ (CSV の鍵より前)');
     // 🆕 PR-2 の道も小さい番号へ戻らない (上の assertMonotonic) うえで、それぞれの鍵の順で実際に待った
     assert.ok(LOG.some((x) => x.path === 'G' && x.waiting >= 4 && x.held.includes(1) && x.held.includes(2)), 'アプリの作るは request → 許可の鍵を持って段階の鍵より後ろで待つ');
     assert.ok(LOG.some((x) => x.path === 'R' && x.waiting >= 4 && x.held.includes(1) && x.held.includes(2)), 'アプリの登録は request → 許可の鍵を持って段階の鍵より後ろで待つ');

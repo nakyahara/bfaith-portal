@@ -19,9 +19,11 @@
 --        ne-reg-set-v1       = セット。今までどおり (試し用 5 行までの門あり)
 --   3. ops.ne_reg_canonical (0053 の置き換え): 単品の JAN の列を常に empty に (JAN の確かめで止めない)
 --   4. ops.ne_reg_build (0058 の置き換え): 形の版の確かめを ops.ne_reg_schema_rule に・作れない版は schema_not_buildable・門の無い版は試し用にしない
+--   4b. ops.ne_reg_issue (0058 の置き換え): 初めて配るのは作れる版だけ (0065 の前に作って配っていない v1 は配らない)。配った後の道は今までどおり
 --   5. ops.ne_reg_cdb_compare = 期待値と今の Company DB の値を比べる (単品の代表 (親)。まとまりの PR で効く・関数の形はここで)
 --   6. ops.record_ne_registration_check (0063 の置き換え): verified = NE の観測が期待値と合う かつ 今の Company DB も期待値と合う (3 者一致)。
---        NE は合うが Company DB が違う = partial (起きないはずの事故 = 答えの cdb_drift で知らせる)・門の無い版の最初の確かめ = schema_verified の記録だけ
+--        NE は合うが Company DB が違う = partial (起きないはずの事故 = 答えの cdb_drift で知らせる)・門の無い版の最初の確かめ = schema_verified の記録だけ。
+--        鍵 = マスタの書き込み (共有) → 確かめ → SKU → 親子 (共有) → CSV (夜間ロード・代表の変更が終わってから、その後の値で比べる)
 --   7. 「一度でも配った」の守り: ops.sku_ever_issued (ファイルの issued_at = 一度付いたら動かない・品目は消さない = 追記だけの証跡) と
 --        core.guard_parent_after_issue (core.products の代表 (親) を、その商品の SKU の CSV を一度でも配った後は変えない・外さない)。
 --        products.parent の持ち主 (DB の active) が company のときだけ見る (load の間は夜間ロードが NE の代表を写す = 止めない)
@@ -386,6 +388,80 @@ begin
 end $$;
 
 
+-- ─── 4b. 配る (0058 の置き換え・引数は同じ) ───
+/**
+ * 0058 と同じ (許可・NE のコードの確かめ・配った時刻と許可の印) で、変えたのは初めて配るときの形の版の確かめだけ:
+ *   🆕 0065 (#1664 Codex R1 Medium): built → issued は、形の版の決まりがあって作れる版 (buildable) のファイルだけ。0065 の前に作って配っていない
+ *   ne-reg-single-v1 (JAN を送る版) は配らない = schema_not_buildable (使わないにして v2 で作り直す)。
+ *   もう配ったファイル (issued / declared) の再ダウンロード (ops.ne_reg_file)・申告・照合・使わないは版を見ない = 今までどおり
+ */
+create or replace function ops.ne_reg_issue(p_request_id uuid, p_actor_id text, p_ownership jsonb, p_export_id bigint) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  e         ops.ne_reg_exports%rowtype;
+  v_gone    text[];
+  v_result  jsonb;
+  v_lease   bigint;
+  v_run     text;
+  v_mark    text;
+  v_now     timestamptz;
+begin
+  perform ops._new_entry_lease_shared_locks();   -- 🆕 0058 §3.10: 段階の鍵より前に許可の共有の鍵 (直接呼んでもアプリと同じ順。request の鍵は呼び手 = アプリが先に取る)
+  if ops.reg_actor_problem(p_actor_id, null) is not null then raise exception 'invalid_input: 配る人 (actor) の形が違う' using errcode = '22023'; end if;
+  perform ops.reg_write_gate(p_ownership);
+  e := ops.ne_reg_lock_export(p_export_id);
+  if e.state = 'closed' then raise exception 'closed: ファイル % は閉じている (%)', p_export_id, e.close_reason using errcode = 'P0001'; end if;
+  if e.state <> 'built' then return pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'state', e.state, 'already', true); end if;
+  -- 🆕 0065 (#1664 Codex R1 Medium): 初めて配る (built → issued) のは、今作れる版のファイルだけ (0065 の前に作って配っていない v1 = JAN を送る版を後から配らない)
+  if (ops.ne_reg_schema_rule(e.schema_version) -> 'buildable') is distinct from 'true'::jsonb then
+    raise exception 'schema_not_buildable: ファイル % の形の版 % はもう配らない (%)。使わないにして作り直す', p_export_id, e.schema_version,
+      coalesce(ops.ne_reg_schema_rule(e.schema_version) ->> 'why', '知らない版') using errcode = 'P0001';
+  end if;
+  select pg_catalog.array_agg(i.ne_code order by i.item_id) into v_gone
+    from ops.ne_reg_export_items i left join ops.master_registrations r on r.sku_id = i.sku_id
+   where i.export_id = p_export_id and (i.state <> 'built' or r.state is null or r.state not in ('draft', 'ne_pending'));
+  perform ops.open_reg_write('reg_csv_issue', p_request_id, p_actor_id, null, p_ownership, null, null, null,
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'reg_csv_issue', 'export_id', p_export_id, 'sha256', e.sha256)),
+    pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'sku_ids', ops.ne_reg_export_skus(p_export_id)));
+  if v_gone is not null then
+    update ops.ne_reg_export_items set state = 'superseded', superseded_reason = pg_catalog.left('配る前に使えなくなった商品がある (' || pg_catalog.array_to_string(v_gone, '・') || ')', 500),
+           superseded_correction = 'まだ配っていない (NE には何もしていない)。作り直す', state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id
+     where export_id = p_export_id and state = 'built';
+    update ops.ne_reg_exports set state = 'closed', closed_at = pg_catalog.now(), closed_by = p_actor_id, close_reason = 'superseded' where export_id = p_export_id;
+    v_result := pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'state', 'closed', 'refused', true, 'reason', 'item_superseded', 'codes', pg_catalog.to_jsonb(v_gone));
+  else
+    -- 🆕 0058 (v13 §3.8): 初回の built → issued (初めて配る) だけ許可を確かめる (もう配った・閉じる道は要らない)
+    perform ops._require_new_entry_lease(case when e.kind = 'products' then 'single' else 'set' end);   -- セットはセットの許可 (#1644 Codex R1 Medium 2)
+    -- 🆕 0058 (v17 §3.9 R16 M5): 配った時の許可と、その許可を出した朝の照合の回を export に残す (ops.ne_reg_file が「配った時の許可がまだ有効」を見る)。
+    --   セットの CSV はセット専用の許可が要る (上の _require_new_entry_lease)。本番の grant は single だけ = セットは閉じたまま (#1644 Codex R1 Medium 2 / R2 Low)
+    select l.lease_id, l.compare_run_id into v_lease, v_run from ops.master_new_entry_leases l
+     where l.kind = case when e.kind = 'products' then 'single' else 'set' end order by l.lease_id desc limit 1;
+    -- 🆕 0058 (v15 §3.9): 配る直前に、その時の NE のコード (最新の照合の回) と履歴の両方に無いことをもう一度確かめる (build の後の新しい取得で見えたコードを配らない)
+    perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.ne_codes'));
+    -- 🆕 0058 (R16 M5): 確かめる NE のコードは許可を出した朝の照合の回のもの (ops.master_ne_code_mark.compare_run_id = 許可の compare_run_id)。違えば ne_codes_stale
+    if e.kind = 'products' then
+      select m.compare_run_id into v_mark from ops.master_ne_code_mark m where m.id = 1;
+      if v_mark is distinct from v_run then
+        raise exception 'ne_codes_stale: NE のコードの回 (%) が許可を出した照合の回 (%) と違う = 配らない (新しい照合とゲートの後に)', coalesce(v_mark, 'なし'), coalesce(v_run, 'なし') using errcode = 'P0001';
+      end if;
+    end if;
+    select pg_catalog.array_agg(k.code order by k.code) into v_gone from ops.ne_reg_export_items i join core.skus k on k.sku_id = i.sku_id
+     where i.export_id = p_export_id and i.state = 'built'
+       and ops.ne_code_seen(k.code_norm);   -- 商品のコードも代表のコードも (登録の時と同じ範囲・#1640 R5)
+    if v_gone is not null then
+      raise exception 'already_in_ne: コード % は NE にもうある (build の後に見えた) = 配らない (使わないにして作り直す)', pg_catalog.array_to_string(v_gone, '・') using errcode = 'P0001';
+    end if;
+    -- 確かめから issued_at までを同じ取引で。issued_at = 実際の時刻 (取引の始めでない = 2 時間の窓と翌朝の取り込みの時刻の比べに使う)
+    v_now := pg_catalog.clock_timestamp();
+    update ops.ne_reg_export_items set state = 'issued', state_changed_at = v_now, state_changed_by = p_actor_id where export_id = p_export_id and state = 'built';
+    update ops.ne_reg_exports set state = 'issued', issued_at = v_now, issued_by = p_actor_id, lease_id = v_lease, lease_compare_run_id = v_run where export_id = p_export_id;
+    v_result := pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'state', 'issued', 'already', false);
+  end if;
+  perform ops.close_reg_write(v_result, 'reg-csv #' || p_export_id);
+  return v_result;
+end $$;
+
+
 -- ─── 5. 期待値と今の Company DB の値を比べる (3 者一致の 3 つ目) ───
 --   単品 = 代表 (親) = 親の display_code の norm (親なし = null。ops.ne_reg_canonical の期待値と同じ作り方) / セット = 比べない (ok)。
 --   まとまり (PR-5) の子の代表も同じ列 (期待値の parent = まとまりのコードの norm)。戻り値 { ok, cols: { parent: { ok, expected, cdb } } }
@@ -416,6 +492,10 @@ revoke all on function ops.ne_reg_cdb_compare(jsonb, bigint) from public;
  * 0063 と同じ (受け取り・観測・申告あり / なしの道・自動にしない品目・知らせ・鍵の順) で、変えたのは:
  *   🆕 0065 3 者一致: 比べる = NE の観測が期待値と全部の列で合う (ops.ne_reg_compare) かつ 今の Company DB が期待値と合う (ops.ne_reg_cdb_compare) = verified。
  *     NE は合うが Company DB が違う = partial + 答えの cdb_drift (起きないはずの事故 = 知らせる)。記録の detail に cdb
+ *   🆕 0065 鍵 (#1664 Codex R1 High): 最初にマスタの書き込みの鍵 (共有) = 夜間ロード (排他) の commit を待ってから比べる。SKU の鍵の後・CSV の鍵の前に親子の鍵 (共有)
+ *     = 代表を書く取引 (保存 = SKU → 親子 (排他) → CSV・夜間ロード = 書き込み (排他) → 親子 (排他)) と同じ向き。鍵の後の文は新しい snapshot (READ COMMITTED) = 書いた後の値で比べる。
+ *     夜間ロード (02:00 JST・6〜10 秒) と毎朝の照合 (daily-sync 07:00〜) は普段は重ならない。手で流したロードと重なったときだけ、照合がロードの終わりまで待つ
+ *     (書く接続の statement_timeout 60 秒を超えたら、その朝の確かめは失敗 = 何も書かない・翌朝に確かめ直す)
  *   🆕 0065 schema_verified: 門の無い版 (ops.ne_reg_schema_rule の trial_gate = false) の品目を初めて verified にしたとき、その版の実機の確かめの記録が
  *     まだ 1 つも無ければ ok を 1 行残す (verified_by = ne_compare・記録だけ = 作る門には使わない)
  * 戻り値 { compare_run_id, counts, not_imported, not_imported_days, needs_declaration, cdb_drift: [{ code, export_id, cols }] }
@@ -440,8 +520,12 @@ declare
   v_reg      text;
   v_cdb      jsonb;
   v_drift    jsonb := '[]'::jsonb;
+  v_sid      bigint;
 begin
   if p_run is null or p_run !~ '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$' then raise exception 'invalid_input: compare_run_id の形が違う: %', p_run using errcode = '22023'; end if;
+  -- 🆕 0065 (#1664 Codex R1 High): 最初にマスタの書き込みの鍵 (共有)。夜間ロード (排他・取引の冒頭) が書き終わって commit するまで待つ = 3 者一致の Company DB の値は
+  --   ロードの後の値 (READ COMMITTED: 鍵の後の文は新しい snapshot)。鍵の順 = マスタの書き込み → 確かめ → SKU → 親子 (共有) → CSV (保存・登録・CSV の関数と同じ向き)
+  perform pg_catalog.pg_advisory_xact_lock_shared(core.master_write_lock_key());
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_reg_check'));
   select * into rc from ops.ne_reg_compare_receipts r where r.compare_run_id = p_run;
   if not found then raise exception 'not_sealed: 照合の回 % は最後まで終わった受け取りが無い = 確かめない', p_run using errcode = 'P0001'; end if;
@@ -449,9 +533,13 @@ begin
   if h.observation_hash is distinct from rc.observation_hash or ops.ne_reg_observation_hash(p_run) is distinct from rc.observation_hash then
     raise exception 'receipt_mismatch: 照合の回 % の観測が受け取りと違う', p_run using errcode = 'P0001';
   end if;
-  -- 鍵: SKU ごと (sku_id の順・保存と同じ鍵) → CSV の鍵
-  perform ops.ne_reg_lock_skus((select pg_catalog.array_agg(t.sku_id) from ops.v_ne_reg_targets t
-                                 where t.code_norm in (select o.code_norm from ops.ne_reg_compare_observations o where o.compare_run_id = p_run)));
+  -- 鍵: SKU ごと (sku_id の順・保存と同じ鍵) → 🆕 0065: 親子の鍵 (共有。保存が代表を変える順 = SKU → 親子 (排他) → CSV と同じ・代表を書く取引の後の値で比べる) → CSV の鍵
+  for v_sid in select distinct t.sku_id from ops.v_ne_reg_targets t
+                where t.sku_id is not null and t.code_norm in (select o.code_norm from ops.ne_reg_compare_observations o where o.compare_run_id = p_run) order by 1 loop
+    perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || v_sid::text, 0));
+  end loop;
+  perform pg_catalog.pg_advisory_xact_lock_shared(core.parent_lock_key());
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_csv'));
   for it in select i.*, e.declared_at as export_declared_at, e.issued_at as export_issued_at, e.kind as export_kind, e.schema_version as export_schema, e.header as export_header
               from ops.ne_reg_export_items i join ops.ne_reg_exports e on e.export_id = i.export_id
              where i.state in ('issued', 'import_declared', 'partial')

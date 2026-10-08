@@ -2373,6 +2373,8 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   門の無い版は最初から 1,000 行まで (中原さん「ためしは要らない」)。最初の品目が翌朝 3 者一致になったら、照合の確かめが `ops.ne_csv_verified` に ok を 1 行だけ残す (verified_by = ne_compare・記録だけ = 門にしない)
 - **3 者一致** (`ops.record_ne_registration_check` を 0063 から置き換え): verified = NE の観測が期待値と全部の列で合う (`ops.ne_reg_compare`) かつ 今の Company DB の値が期待値と合う (`ops.ne_reg_cdb_compare` = 単品の代表 (親)・まとまりの PR で効く)。
   NE は合うが Company DB が違う = partial + 答えの `cdb_drift` → 照合の朝の要約に ⚠️「NE は配った値と合うが Company DB の代表 (親) が違う」(起きないはずの事故)
+  鍵 (#1664 Codex R1 High) = マスタの書き込み (共有・最初) → 確かめ → SKU → 親子 (共有) → CSV。夜間ロード (書き込み 排他 → 親子 排他) が代表を書いている途中なら commit を待ち、その後の値で比べる (古い値で verified にしない)。保存の代表の変更 (書き込み 共有 → SKU → 親子 排他 → CSV) と同じ向き = 逆順のデッドロックなし (本物の PG の鍵の順の試験 [18]・[22])。夜間ロードは 02:00 JST・6〜10 秒、毎朝の照合は daily-sync 07:00〜 = 普段は重ならない。手で流したロードと重なったときだけ照合が数秒待つ (書く接続の statement_timeout 60 秒を超えたらその朝の確かめは失敗 = 何も書かない・翌朝に確かめ直す)
+- **配る** (`ops.ne_reg_issue` を 0058 から置き換え・#1664 Codex R1 Medium): 初めて配る (built → issued) のは作れる版 (buildable) のファイルだけ = 0065 の前に作って配っていない v1 は 409 `schema_not_buildable` (使わないにして v2 で作り直す)。配った v1 の再ダウンロード・申告・照合・使わないは今までどおり
 - **一度でも配った商品の代表 (親) は変えない**: `ops.sku_ever_issued` (その SKU を含むファイルに `issued_at` がある = 追記だけの証跡・品目が後で superseded / failed でも残る) と `core.guard_parent_after_issue`
   (core.products の BEFORE UPDATE OF parent_product_id・どのロールでも・`products.parent` の DB の active が company のときだけ = load の間は夜間ロードが NE の代表を写す道を止めない)。
   画面 = 保存の 6d で 409 `parent_frozen`・商品の画面の代表の欄は 🔒 (`lib/master-write.mjs` の `parentFrozenExports`)
