@@ -1528,6 +1528,17 @@ export function initProductHubDB() {
   if (lpJobCols.size > 0 && !lpJobCols.has('images_served_json')) {
     db.exec("ALTER TABLE ph_lp_compose_jobs ADD COLUMN images_served_json TEXT NOT NULL DEFAULT '[]'");
   }
+  // LP 構成: AI の撮影判定 (画像制作の新フロー PR-C・2026-10-09)。構成と一緒に実行役が送る別の欄 (shoot_json)。
+  //   shoot_json  = 形を検査して通ったものだけ (lib/lp-shoot.js の validateShootJudgement の value)
+  //   shoot_error = 送られてきたが形が違ったので使わなかった理由 (構成は受け付ける・撮影判定だけ「AI の判定なし」)
+  //   両方 NULL = 送られてこなかった (撮影判定を知らない古い実行役)
+  // ⑦の本文 (output_text) には足さない — lint と lp-parser (配信元の写し) に触らないため
+  if (lpJobCols.size > 0 && !lpJobCols.has('shoot_json')) {
+    db.exec('ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_json TEXT');
+  }
+  if (lpJobCols.size > 0 && !lpJobCols.has('shoot_error')) {
+    db.exec('ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_error TEXT');
+  }
   // LP 構成: 実際に本回答を書いたモデル (2026-10-02・codex exec review #1591 High)。
   // model = 頼んだモデル (reserve)。こちらはランナーが stream-json の assistant.message.model を読んで後から付ける。
   // model_check: match / mismatch / unknown (NULL = まだ付いていない)。一度付けたら書き換えない

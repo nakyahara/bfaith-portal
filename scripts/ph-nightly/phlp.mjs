@@ -8,7 +8,7 @@
  * なぜあるか: Claude Code に curl/node/python を許可すると deny は迂回でき、トークンを読ませられる。
  * そこで **Claude にはこの CLI (と ./phlpreview) だけを許可し、トークンはこの中でしか扱わない**。
  *   - HTTP の相手は service-api 固定 (Base URL・メソッド・パスをここで決める)。任意 URL へは送れない
- *   - **ファイル引数は作業ディレクトリ直下の決まった名前だけ** (out-<ID>.md / lint-<ID>.json / reason-<ID>.txt)。
+ *   - **ファイル引数は作業ディレクトリ直下の決まった名前だけ** (out-<ID>.md / lint-<ID>.json / reason-<ID>.txt / shoot-<ID>.json)。
  *     パス区切りを含む名前・symlink は拒否 → トークンや .env をこの CLI 経由で読ませない
  *   - 画像は `./phlp images <ID>` でしか落とせない。**保存先も img-<ID>-<n>.jpg 固定**。
  *     サーバ側も「その依頼の packet に固定済みの画像」しか配らないので、任意の画像は取れない
@@ -20,11 +20,14 @@
  *   ./phlp claim   --run RUN_ID                     1 件 claim (材料 + 仕様書の全文)
  *   ./phlp images  ID                               その依頼の商品画像を img-ID-1.jpg … に落とす
  *   ./phlp reserve ID                               **AI を呼ぶ前に必ず**予約する (モデルはランナーが決める)
- *   ./phlp lint    ID --file out-ID.md              構成を lint する (サーバが正本・何度でも呼べる)
- *   ./phlp result  ID --accepted --file out-ID.md [--lint lint-ID.json] [--rounds N]
- *   ./phlp result  ID --rejected --reason-file reason-ID.txt [--file out-ID.md] [--lint lint-ID.json] [--rounds N]
+ *   ./phlp lint    ID --file out-ID.md [--shoot shoot-ID.json]
+ *                                                   構成を lint する (サーバが正本・何度でも呼べる)。--shoot で撮影判定も同じ検査を受ける
+ *   ./phlp result  ID --accepted --file out-ID.md [--lint lint-ID.json] [--rounds N] [--shoot shoot-ID.json]
+ *   ./phlp result  ID --rejected --reason-file reason-ID.txt [--file out-ID.md] [--lint lint-ID.json] [--rounds N] [--shoot shoot-ID.json]
  *     (--rejected でも書いた構成があれば --file で渡す。チェックを通らなかった構成として画面に出し、人が判断する)
  *     (--lint は参考値。受け取るかどうかは**サーバ側の lint** で決まる)
+ *     (--shoot は AI の撮影判定 (画像制作の新フロー PR-C)。⑦の本文には足さず、別の欄 shoot_json で送る。
+ *      形が違っていてもサーバは構成を受け付け、撮影判定だけ使わない)
  *   ./phlp fail    ID --code CODE --message "text"  予約の**前**だけ (生成できない材料)
  *   ./phlp release ID --reason "text"               予約の**前**だけ (一時障害)
  *   ./phlp clean   ID                               その依頼の一時ファイルを消す (rm は使えない)
@@ -46,6 +49,7 @@ const REASON_MAX = 1000;
 const OUT_MAX = 200_000;
 const LINT_MAX = 100_000;
 const REVIEW_MAX = 400_000;                 // 検品に渡す構成案の上限 (バイト)
+const SHOOT_FILE_MAX = 100_000;             // 撮影判定のファイルの上限 (バイト・整形した JSON でも収まる。中身の上限はサーバが見る)
 const SEEN_MAX = 20_000;                    // 画像から読み取ったことの上限 (バイト)
 const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 const FAIL_CODES = ['SPEC_UNREADABLE', 'MATERIAL_TOO_THIN', 'IMAGES_UNAVAILABLE', 'OTHER'];
@@ -59,6 +63,7 @@ const FIXED = {
   out: (id) => `out-${id}.md`,
   lint: (id) => `lint-${id}.json`,
   reason: (id) => `reason-${id}.txt`,
+  shoot: (id) => `shoot-${id}.json`,
 };
 const ID_RE = /^[1-9]\d*$/;
 
@@ -237,6 +242,9 @@ async function cmdClaim(opt) {
     //    指示文がスタッフ側と違うと、段階1 の A/B が「同じ入力の比較」にならない。
     //    仕様書と齠齬したときは**仕様書が正本** (この文自身がそう言っている)
     instruction: job.packet.instruction || null,
+    // 撮影判定の指示 (画像制作の新フロー PR-C)。⑦を書き終えてから shoot-<ID>.json に JSON で書き、
+    // lint と result に --shoot で渡す。🚨 ⑦の本文には足さない (上の instruction とは別の指示)
+    shoot_instruction: job.packet.shoot_instruction || null,
     next: `./phlp images ${job.job_id}`,
   });
 }
@@ -306,10 +314,32 @@ async function cmdLint(id, opt) {
   const lease = loadLease(id);
   const output = fs.readFileSync(safePath(opt.file, 'out', id), 'utf8');
   if (output.length > OUT_MAX) die(`構成が大きすぎます (${OUT_MAX} 文字まで)`);
-  const r = await api('POST', `/lp-compose/jobs/${id}/lint`, { lease_token: lease.lease_token, output });
+  const shoot = opt.shoot ? readShoot(opt.shoot, id) : undefined;
+  const r = await api('POST', `/lp-compose/jobs/${id}/lint`, {
+    lease_token: lease.lease_token, output, ...(shoot !== undefined ? { shoot_json: shoot } : {}),
+  });
   out(r.json);
-  // lint が通っていない = コマンドとしても失敗 (通ったつもりで先へ進ませない)
+  // lint が通っていない = コマンドとしても失敗 (通ったつもりで先へ進ませない)。
+  // 撮影判定を渡したなら、それが通らないときも失敗にする (直してから result を出す)
   if (r.status !== 200 || r.json?.lint?.ok !== true) fail(1);
+  if (shoot !== undefined && r.status === 200) {
+    // 撮影判定を見ない古いサーバ (Render のデプロイ前) は shoot を返さない。そこで失敗にすると、
+    // 直しようの無い「通らない」で Claude が回り続けるので、知らせるだけにする
+    if (!r.json?.shoot) process.stderr.write('phlp: サーバが撮影判定の検査を返しませんでした (サーバが古い可能性)。撮影判定の検査は飛ばします (構成の lint の結果はそのまま使えます)\n');
+    else if (r.json.shoot.ok !== true) fail(1);
+  }
+}
+
+/**
+ * 撮影判定 (shoot-<ID>.json) を読む。**その依頼の決まった名前だけ** (safePath)。
+ * JSON として読めなければ送らずに止める — 出す前なら直せる (result を出した後は直せない)。
+ * 形の検査 (おすすめ・理由・画像ごと) はサーバが正本 (./phlp lint --shoot で先に確かめられる)
+ */
+function readShoot(name, id) {
+  const p = safePath(name, 'shoot', id);
+  if (fs.statSync(p).size > SHOOT_FILE_MAX) die(`撮影判定が大きすぎます (${SHOOT_FILE_MAX} バイトまで)`);
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
+  catch { die(`${name} が JSON ではありません (直すか、--shoot を外して出してください)`); }
 }
 
 async function cmdResult(id, opt) {
@@ -354,6 +384,8 @@ async function cmdResult(id, opt) {
   //    自分で {"ok":true} と書いてもサーバが 422 で断る
   const rounds = opt.rounds === undefined ? null : Number.parseInt(String(opt.rounds), 10);
   if (rounds !== null && (!Number.isInteger(rounds) || rounds < 0 || rounds > 10)) die('--rounds は 0〜10 です');
+  // AI の撮影判定 (PR-C)。無ければ送らない (サーバは「AI の判定なし」として構成だけ受け付ける)
+  const shoot = opt.shoot ? readShoot(opt.shoot, id) : undefined;
 
   // Ὢ8 証跡は**送らない**。サーバが画像を配ったときに自分で記録している。
   //    作業ディレクトリのファイルは Claude のセッションが Write できるので、
@@ -364,6 +396,7 @@ async function cmdResult(id, opt) {
     packet_hash: lease.packet_hash,
     verdict: accepted ? 'accepted' : 'rejected',
     output, lint, review_rounds: rounds, reason,
+    ...(shoot !== undefined ? { shoot_json: shoot } : {}),
   });
   out(r.json);
   if (r.status !== 200) fail(1);
@@ -464,7 +497,7 @@ function cmdClean(id) {
   const removed = [];
   const names = [
     `spec-${id}.md`, `imgs-${id}.json`, `seen-${id}.md`,
-    `out-${id}.md`, `lint-${id}.json`, `reason-${id}.txt`, `_lp_review_${id}.md`,
+    `out-${id}.md`, `lint-${id}.json`, `reason-${id}.txt`, `_lp_review_${id}.md`, `shoot-${id}.json`,
     ...Array.from({ length: MAX_IMAGES }, (_, i) => `img-${id}-${i + 1}.jpg`),
   ];
   for (const n of names) {

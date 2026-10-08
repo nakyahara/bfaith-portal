@@ -4326,9 +4326,13 @@ serviceApiRouter.post('/lp-compose/generations/:gid/result', (req, res) => {
     reviewRounds: req.body?.review_rounds,
     receipt: req.body?.receipt,
     reason: cleanText(req.body?.reason, 1000),
+    // AI の撮影判定 (画像制作の新フロー PR-C)。送らない古い実行役は undefined のまま (今までどおり通る)。
+    // 形の検査は lib (lp-shoot.js) が構成と照らして行う。壊れていても結果は断らない (撮影判定だけ使わない)
+    shoot: req.body?.shoot_json,
   });
   if (!r.ok) return lpComposeFail(res, r);
-  res.json({ ok: true, status: r.status, already: !!r.already, receipt: r.receipt });
+  // shoot = 撮影判定をどう扱ったか (saved / invalid / ignored / not_sent)。実行役のログに残る
+  res.json({ ok: true, status: r.status, already: !!r.already, receipt: r.receipt, shoot: r.shoot });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
@@ -4346,9 +4350,11 @@ serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
 serviceApiRouter.post('/lp-compose/jobs/:id/lint', express.json({ limit: '1mb' }), (req, res) => {
   const r = lintLpComposeForJob(getDB(), lpIdParam(req.params.id), {
     leaseToken: rawField(req.body?.lease_token, 100), output: req.body?.output,
+    // 撮影判定 (PR-C) も出す前に確かめられる。結果を受け取るときと同じ検査 (構成の lint とは別に返す)
+    shoot: req.body?.shoot_json,
   });
   if (!r.ok) return lpComposeFail(res, r);
-  res.json({ ok: true, lint: r.lint });
+  res.json({ ok: true, lint: r.lint, ...(r.shoot ? { shoot: r.shoot } : {}) });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {

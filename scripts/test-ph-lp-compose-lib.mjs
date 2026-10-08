@@ -110,7 +110,10 @@ console.log('②b 🚨 指示文はスタッフの定型文と同じもの 1 つ
   const staff = pt.buildProductAnalysisPrompt({ name: 'ハッカ油スプレー 100ml' }, { product_info_text: '天然ハッカ油' }, '');
   ok(staff.includes(packet.instruction),
     '🚨 スタッフの定型文に同じ文がそのまま入っている (二重に持っていない)');
-  eq(packet.packet_version, 4, 'packet の版が上がっている (形が変わった・4 = 素材画像)');
+  eq(packet.packet_version, 5, 'packet の版が上がっている (形が変わった・4 = 素材画像・5 = 撮影判定の指示 PR-C)');
+  // 🚨 撮影判定の指示は別の欄 (PR-C)。構成の指示文 (スタッフと共有の正本) には混ぜない
+  ok(typeof packet.shoot_instruction === 'string' && packet.shoot_instruction.includes('needs_shoot')
+    && !packet.instruction.includes('撮影判定'), '🚨 撮影判定の指示は shoot_instruction に入り、構成の指示文 (instruction) は変わらない');
   // 指示文も packet_hash の中 = 後から差し替えられない
   const again = lp.buildPacket({
     draft: dA, productInfo: packet.product_info, colorVariations: packet.color_variations,
@@ -712,7 +715,7 @@ console.log('⑭ 素材画像 = 画像フォルダの下のフォルダの画像
   const rM = lp.requestJob(db, args(dM, lp.latestSpec(db), 'key-mat-1', { now: min(4000), images: [...products, ...materials, { file_id: 'FILEIDPROD00', role: 'material', name: 'dup.jpg' }] }));
   ok(rM.ok, '受け付ける');
   const pM = JSON.parse(rM.job.packet_json);
-  eq(pM.packet_version, 4, 'packet の版 = 4 (素材が入った)');
+  eq(pM.packet_version, 5, 'packet の版 = 5 (4 で素材が入った・5 は撮影判定の指示)');
   eq(pM.images.length, 16, '🚨 商品 6 + 素材 10 = 16 枚');
   eqj(pM.images.slice(0, 6).map((im) => im.role), ['white_bg', 'slot:1', 'slot:2', 'slot:3', 'slot:4', 'slot:5'], '先に商品画像 (6 枚まで・7 枚目は入らない)');
   eqj(pM.images.slice(6).map((im) => im.role), Array.from({ length: 10 }, (_, i) => 'material:' + (i + 1)), '続けて素材 (material:1〜10 を振り直す)');
