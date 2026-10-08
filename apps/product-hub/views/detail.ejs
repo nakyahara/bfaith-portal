@@ -1666,12 +1666,20 @@ th.attr-unknown { color: #dc2626; }
             <div id="lpc-meas" hidden class="muted" style="font-size:11px; margin-top:4px; font-family:ui-monospace, monospace; word-break:break-all;"></div>
             <div id="lpc-result" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
               <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
-                <strong style="font-size:13px;">AI が作った構成 (⑦ AI画像生成プロンプト)</strong>
+                <strong style="font-size:13px;" id="lpc-result-title">AI が作った構成 (⑦ AI画像生成プロンプト)</strong>
                 <button type="button" class="btn btn-primary btn-sm" id="lpc-copy">コピー</button>
                 <a class="btn btn-sm" id="lpc-open" href="#" target="_blank" rel="noopener">lp-tool を開く</a>
                 <span class="muted" id="lpc-copy-result" style="font-size:12px;"></span>
               </div>
               <div class="muted" id="lpc-lint" style="font-size:11px; margin-bottom:6px;"></div>
+              <%# 人が直した版 (下の「LP構成」で保存したもの)・作り直しの前の構成を出しているときの知らせ (PR-B)。
+                  AI の初稿 (直す前) は消さずに残っているので、測定 (くらべっこ) 用にコピーできる。
+                  🚨 hidden を付ける要素に display を直に書かない (書くと hidden が効かずに出っぱなしになる) %>
+              <div id="lpc-edited" hidden style="font-size:11px; margin-bottom:6px; color:#1d4ed8;">
+                <span id="lpc-edited-note"></span>
+                <button type="button" class="btn btn-sm" id="lpc-copy-ai" hidden>AI の初稿をコピー (測定用)</button>
+                <span class="muted" id="lpc-copy-ai-result"></span>
+              </div>
               <textarea id="lpc-text" rows="16" readonly style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
               <div class="muted" style="font-size:11px; margin-top:4px;">
                 🚨 <strong>そのまま使わないでください。</strong>初稿です。中身を読んでから lp-tool に貼ってください
@@ -1682,6 +1690,38 @@ th.attr-unknown { color: #dc2626; }
           <%# 🚨 `<` は必ず潰す。本文は **AI が書いたもの** なので `</script>` を含みうる。
               潰さないとそこで script が閉じて、以降の画面が丸ごと壊れる (prompt-templates-json と同じ作り) %>
           <script type="application/json" id="lpc-json"><%- JSON.stringify(lpCompose).replace(/</g, '\\u003c') %></script>
+          <%# LP構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09・スタッフ要望 ③)。
+              画像ごとに 役割・見出し・キャッチコピー・本文 を直し、TOP と 1枚目 (FV) 以外を並べ替え・追加・削除する。
+              保存は「LP構成を保存」を押したときだけ (サーバの lint を通ったら)。中身は画面の JS (initLpEdit) が描く。
+              構成がまだ無いときは隠しておき、AI の構成ができたら JS が読み込んで出す %>
+          <% if (typeof lpEdit !== 'undefined' && lpEdit) { %>
+          <style>
+            .lpe-head { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:12px; color:#475569; margin-bottom:6px; }
+            .lpe-slot { border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin:4px 0; }
+            .lpe-slot.fixed { background:#f8fafc; }
+            .lpe-slot > summary { display:flex; gap:8px; align-items:center; padding:6px 8px; cursor:pointer; list-style:none; }
+            .lpe-slot > summary::-webkit-details-marker { display:none; }
+            .lpe-no { min-width:44px; font-weight:700; font-size:12px; color:#1e293b; }
+            .lpe-role { font-size:11px; color:#64748b; max-width:30%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+            .lpe-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
+            .lpe-chip { border:1px solid #cbd5e1; border-radius:999px; padding:1px 8px; font-size:11px; background:#f1f5f9; cursor:pointer; white-space:nowrap; }
+            .lpe-chip.need { background:#fef3c7; border-color:#f59e0b; color:#92400e; }
+            .lpe-acts { display:flex; gap:2px; }
+            .lpe-ib { border:1px solid #cbd5e1; background:#fff; border-radius:6px; width:26px; height:24px; cursor:pointer; }
+            .lpe-ib:disabled { opacity:.35; cursor:default; }
+            .lpe-fixed { font-size:11px; color:#64748b; white-space:nowrap; }
+            .lpe-body { padding:6px 10px 10px; display:grid; grid-template-columns:1fr; gap:4px; }
+            .lpe-body label { font-size:11px; color:#475569; margin:4px 0 0; }
+            .lpe-body textarea { width:100%; font-size:13px; }
+            .lpe-rule { font-size:11px; background:#f8fafc; border:1px dashed #cbd5e1; border-radius:6px; padding:4px 6px; }
+            .lpe-warn { color:#b45309; }
+            .lpe-stale, .lpe-undo { font-size:12px; background:#fffbeb; border:1px solid #fcd34d; border-radius:6px; padding:4px 8px; margin:6px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+            .lpe-dirty { color:#b45309; font-size:12px; }
+          </style>
+          <div id="lpe" class="field" style="margin-top:8px;" data-url="/apps/product-hub/api/drafts/<%= draft.id %>/lp-edit" <%= lpEdit.available ? '' : 'hidden' %>></div>
+          <%# `<` は潰す (役割・見出しは AI と人が書いたもの。`</script>` で画面が壊れないように) %>
+          <script type="application/json" id="lpe-json"><%- JSON.stringify(lpEdit).replace(/</g, '\\u003c') %></script>
+          <% } %>
           <% } %>
           <% if (!lpCompose.enabled) { %>
           <p class="muted" style="font-size:12px; margin:0 0 6px;">AI の LP構成はまだ使えません。下の「その他の項目」の ChatGPT 定型文 (📝 商品分析) から作れます</p>
@@ -6221,7 +6261,8 @@ th.attr-unknown { color: #dc2626; }
         const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ idempotency_key: idemKey }),
+          // 画面が見ている LP構成の版を添える (違えばサーバが断る・PR-B)
+          body: JSON.stringify({ idempotency_key: idemKey, compose_version: state.compose_version }),
         });
         const json = await res.json().catch(() => null);
         posting = false;
@@ -6237,6 +6278,8 @@ th.attr-unknown { color: #dc2626; }
         statusEl.textContent = '依頼できたか分かりません。もう一度押してください (二重にはなりません)';
       }
     });
+    // LP構成を直して保存したら、作る枚数・取り置き・押せるかを取り直す (PR-B・Codex PR-B 名指し M)
+    document.addEventListener('ph:lp-edit-saved', () => { if (!posting) poll(); });
     render(state);
   })();
   // 🤖 構成をAIに作らせる (段階1・PR1-d)。
@@ -6266,6 +6309,10 @@ th.attr-unknown { color: #dc2626; }
     const draftReasonEl = document.getElementById('lpc-draft-reason');
     const guideEl = document.getElementById('lpc-guide');
     const guideTextEl = document.getElementById('lpc-guide-text');
+    const resultTitleEl = document.getElementById('lpc-result-title');
+    const editedEl = document.getElementById('lpc-edited');
+    const editedNoteEl = document.getElementById('lpc-edited-note');
+    const copyAiEl = document.getElementById('lpc-copy-ai');
 
     const RUNNING = ['queued', 'running'];
     let timer = null;
@@ -6305,6 +6352,24 @@ th.attr-unknown { color: #dc2626; }
     const checkingModel = (job) => !!job && !!job.model && !job.model_check
       && (job.status === 'done' || (job.status === 'failed' && job.error_code === 'rejected' && job.has_draft === true));
     // lpc-checking:end
+
+    // lpc-shown:start (試験がここを切り出して動かす・scripts/test-ph-lp-edit.mjs)
+    // 箱に出す本文 = 効いている構成 (サーバの lp_effective・画像制作の新フロー PR-B)。いちばん新しいできた構成 (実モデル一致) の、
+    // 人が直した版があればそちら — コピーも lp-tool もこれを使う (画像生成・下の LP構成の一覧と同じ構成)。
+    // 作り直しが途中・失敗のときも、前にできた構成を出す (コピーできなくならないように・Codex PR-B 名指し R2 M)。
+    // 🚨 AI の初稿 (ph_lp_compose_jobs.output_text) は書き換わらない。AI の初稿は「AI の初稿をコピー」で取れる
+    function lpcShown(s) {
+      const e = s && s.lp_effective;
+      if (!e || typeof e.text !== 'string' || !e.text) return null;
+      const edited = e.source === 'edit';
+      const latest = !!s.job && s.job.id === e.job_id;
+      const notes = [];
+      if (!latest) notes.push('作り直しの前にできた構成 (依頼 ' + e.job_id + ') を出しています');
+      if (edited) notes.push('人が直した版 (' + String(e.edited_at || '').slice(0, 16).replace('T', ' ') + ' ' + (e.edited_by || '') + ') です');
+      if (notes.length) notes.push('コピー・lp-tool・画像生成はこれを使います');
+      return { text: e.text, aiText: e.ai_text || '', jobId: e.job_id, edited: edited, latest: latest, note: notes.join('。') };
+    }
+    // lpc-shown:end
 
     // lpc-images-text:start (試験がここを切り出して動かす・scripts/test-ph-lp-compose-ui.mjs)
     // AI に渡す画像の並び。作っている間・確認待ちの間はその依頼で渡した画像だけ。終わった後は
@@ -6390,11 +6455,18 @@ th.attr-unknown { color: #dc2626; }
         statusEl.textContent = '';
       }
 
-      const done = !!job && job.status === 'done' && job.output_text;
+      // 効いている構成を出す (人が直した版があればそちら。コピー・lp-tool もこれ)。AI の初稿は測定用に別のボタンで取る (PR-B)
+      const shown = lpcShown(s);
+      const done = !!shown;
       resultEl.hidden = !done;
+      editedEl.hidden = !(shown && shown.note);
+      copyAiEl.hidden = !(shown && shown.edited);
       if (done) {
-        if (textEl.value !== job.output_text) textEl.value = job.output_text;
-        lintEl.textContent = lintLine(job.lint);
+        if (textEl.value !== shown.text) textEl.value = shown.text;
+        resultTitleEl.textContent = shown.edited ? 'LP構成 (人が直した版・⑦ AI画像生成プロンプト)' : 'AI が作った構成 (⑦ AI画像生成プロンプト)';
+        editedNoteEl.textContent = shown.note;
+        lintEl.textContent = shown.edited ? 'lint: 通っています (人が直した版・保存のときにサーバが確かめました)'
+          : (shown.latest ? lintLine(job.lint) : '');
         const q = new URLSearchParams({ product_code: root.dataset.neCode || '', product_name: root.dataset.name || '' });
         openEl.href = LP_TOOL + '?' + q.toString();
       }
@@ -6436,6 +6508,8 @@ th.attr-unknown { color: #dc2626; }
       }
 
       if (running || checkingModel(job)) schedule(); else stop();
+      // 下の「LP構成」(initLpEdit) に、効いている構成がどれかを知らせる。新しい構成ができたら一覧を読み直す
+      document.dispatchEvent(new CustomEvent('ph:lp-compose-state', { detail: { job_id: shown ? shown.jobId : null, done: done } }));
     }
 
     function stop() { if (timer) { clearTimeout(timer); timer = null; } }
@@ -6500,6 +6574,16 @@ th.attr-unknown { color: #dc2626; }
       try { await navigator.clipboard.writeText(textEl.value); copyResultEl.textContent = 'コピーしました。lp-tool に貼ってください'; }
       catch (e) { textEl.select(); copyResultEl.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
     });
+    // AI の初稿 (人が直す前)。段階1 の測定 (AI の構成と人の構成のくらべっこ) はこちらで比べる
+    document.getElementById('lpc-copy-ai').addEventListener('click', async () => {
+      const r = document.getElementById('lpc-copy-ai-result');
+      const sh = lpcShown(state);
+      const raw = sh ? sh.aiText : '';
+      try { await navigator.clipboard.writeText(raw); r.textContent = 'AI の初稿をコピーしました'; }
+      catch (e) { r.textContent = 'コピーできませんでした'; }
+    });
+    // 下の「LP構成」で保存したら、ここの本文も読み直す (コピー・lp-tool に直した版を渡す)
+    document.addEventListener('ph:lp-edit-saved', () => { stop(); poll(); });
 
     // 裏に回って戻ってきたら、待たずに 1 回見る。
     // 🚨 待機中の setTimeout を**先に消す**。消さないと表裏を行き来するたびに
@@ -6509,6 +6593,305 @@ th.attr-unknown { color: #dc2626; }
     });
 
     render(state);
+  })();
+  /* @lp-edit:start — LP構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09・スタッフ要望 ③)。
+     scripts/test-ph-lp-edit.mjs がこの間を切り出して、偽の document で動かして試す (EJS の値はここに書かない)。
+     決め方 (並べ替え・追加・削除・元に戻す・要撮影) は lpeAction、描くのは lpeHtml、つなぎ込みは initLpEdit。
+     🚨 判定の正本はサーバ (lib/lp-edit.js)。画面は押せない操作を出さないだけで、保存のときにサーバがもう一度確かめる */
+  const LPE_FIELDS = [['role', '役割', 1], ['title', '見出し', 1], ['copy', 'キャッチコピー', 2], ['body', '本文（任意）', 3]];
+  function lpeEsc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function lpeLabel(i) { return i === 0 ? 'TOP' : i + '枚目'; }
+  /** 送る形 (並び順のまま)。サーバは uid で元の画像か追加した画像かを見分ける */
+  function lpeForSave(slots) {
+    return slots.map(function (s) { return { uid: s.uid, role: s.role, title: s.title, copy: s.copy, body: s.body, shoot: s.shoot === true }; });
+  }
+  /** サーバの状態 (GET / 保存の応答) → 画面の状態。saved = 保存済みの並び (未保存の印はこれと比べる) */
+  function lpeFromServer(st, prev) {
+    const slots = (st && Array.isArray(st.slots) ? st.slots : []).map(function (s) {
+      return { uid: s.uid, kind: s.kind, role: s.role || '', title: s.title || '', copy: s.copy || '', body: s.body || '', shoot: s.shoot === true };
+    });
+    return {
+      available: !!(st && st.available), can_edit: !!(st && st.can_edit), max: (st && st.max_images) || 10,
+      base_job_id: st && st.base_job_id != null ? st.base_job_id : null,
+      base_edit_id: st && st.base_edit_id != null ? st.base_edit_id : null,
+      edited_by: (st && st.edited_by) || '', edited_at: (st && st.edited_at) || '', image_stale: !!(st && st.image_stale),
+      image_limit: st && Number.isInteger(st.image_limit) ? st.image_limit : null,
+      slots: slots, saved: JSON.stringify(lpeForSave(slots)),
+      open: prev && prev.open ? prev.open : {}, undo: null, msg: '', saving: false, conflict: false, focus: null, newer: false,
+    };
+  }
+  function lpeDirty(S) { return JSON.stringify(lpeForSave(S.slots)) !== S.saved; }
+  /**
+   * サーバが保存するときと同じそろえ方 (改行を LF に・前後の空白を落とす・見出し/キャッチコピー/本文の「なし」は空欄)。
+   * 通信が切れたあとに「送ったものがもう保存されているか」を比べるときに使う (Codex PR-B 名指し R3 M)
+   */
+  function lpeCanon(slots) {
+    return JSON.stringify(lpeForSave(slots).map(function (s) {
+      const c = { uid: s.uid, shoot: s.shoot };
+      LPE_FIELDS.forEach(function (f) {
+        const t = String(s[f[0]] == null ? '' : s[f[0]]).replace(/\r\n?/g, '\n').trim();
+        c[f[0]] = f[0] !== 'role' && t === 'なし' ? '' : t;
+      });
+      return c;
+    }));
+  }
+  function lpeIndex(S, uid) { for (let i = 0; i < S.slots.length; i++) { if (S.slots[i].uid === uid) return i; } return -1; }
+  function lpeMovable(S, i) { return !!S.slots[i] && S.slots[i].kind === 'point'; }
+  /**
+   * 並べ替え・追加・削除・元に戻す・要撮影の切り替え。TOP と 1枚目 (FV) は動かさない・消さない (ほかの画像もその上へは行けない)。
+   * 変えたら true。削除は 1 つ前まで「元に戻す」で戻せる (保存するまでサーバには届かない)
+   */
+  function lpeAction(S, act, uid, newUid) {
+    const sl = S.slots;
+    const i = lpeIndex(S, uid);
+    if (act === 'up' && lpeMovable(S, i) && lpeMovable(S, i - 1)) { const t = sl[i - 1]; sl[i - 1] = sl[i]; sl[i] = t; return true; }
+    if (act === 'down' && lpeMovable(S, i) && lpeMovable(S, i + 1)) { const t = sl[i + 1]; sl[i + 1] = sl[i]; sl[i] = t; return true; }
+    if (act === 'del' && lpeMovable(S, i)) {
+      const rm = sl.splice(i, 1)[0];
+      S.undo = { slot: rm, index: i, label: lpeLabel(i) };
+      return true;
+    }
+    if (act === 'undo' && S.undo) {
+      if (sl.length >= S.max) return false;
+      // 消したときの位置へ (その後に並べ替えて短くなっていたら末尾)。TOP・FV より前には戻さない
+      const at = Math.max(2, Math.min(S.undo.index, sl.length));
+      sl.splice(at, 0, S.undo.slot);
+      S.undo = null;
+      return true;
+    }
+    if (act === 'add' && newUid) {
+      if (sl.length >= S.max) return false;
+      // ラフの newSlot と同じ初期値。構図・素材・NG はサーバが雛形で埋める (画面で直すのは画像に載せる文字だけ)
+      sl.push({ uid: newUid, kind: 'point', role: '特長', title: '新しい画像', copy: '', body: '', shoot: false });
+      S.open[newUid] = true;
+      S.focus = newUid;
+      return true;
+    }
+    if (act === 'shoot' && sl[i]) { sl[i].shoot = !sl[i].shoot; return true; }
+    return false;
+  }
+  /** 一覧を描く (HTML の文字列)。AI と人が書いた文字は全部 lpeEsc を通す */
+  function lpeHtml(S) {
+    const ro = !S.can_edit || S.saving;
+    const n = S.slots.length;
+    const dirty = lpeDirty(S);
+    let h = '<div class="lpe-head"><b>LP構成（' + n + '枚）</b><span>行を開くと、画像に載せる文字を確認・修正できます</span>'
+      + '<span class="muted">' + (S.base_edit_id != null
+        ? '人が直した版 (' + lpeEsc(String(S.edited_at).slice(0, 16).replace('T', ' ')) + ' ' + lpeEsc(S.edited_by) + ')'
+        : 'AI が作ったまま') + '</span></div>';
+    if (S.image_stale) h += '<div class="lpe-stale">⚠️ 画像を作ったあとで LP構成が変わりました。もう一度「画像を作る」と反映されます</div>';
+    // 「画像を作る」で作るのは先頭の何枚か (重要度：高 は 8 枚・ほかは 1枚目だけ)。構成はそれより多く持てるので知らせる
+    if (S.image_limit === 1) h += '<div class="muted" style="font-size:11px;">「画像を作る」で作るのは 1枚目 (FV) だけです (重要度：高 の商品は先頭から複数枚)</div>';
+    else if (S.image_limit && n > S.image_limit) h += '<div class="muted" style="font-size:11px;">「画像を作る」で作るのは ' + lpeLabel(0) + ' から ' + (S.image_limit - 1) + '枚目 までの ' + S.image_limit + ' 枚です。それより後ろの画像は AI では作りません</div>';
+    if (S.newer) {
+      h += '<div class="lpe-stale"><span>AI が新しい LP構成を作りました。いまの直しは新しい構成には入りません</span>'
+        + '<button type="button" class="btn btn-sm" data-act="reload">新しい構成を読み込む</button></div>';
+    }
+    if (!S.can_edit) h += '<div class="muted" style="font-size:11px;">見るだけです。直せるのは 画像登録者・画像作成承認者 の担当者か管理者です</div>';
+    h += '<div class="lpe-slots">';
+    S.slots.forEach(function (s, i) {
+      const isP = s.kind === 'point';
+      const L = lpeLabel(i);
+      const u = lpeEsc(s.uid);
+      h += '<details class="lpe-slot' + (isP ? '' : ' fixed') + '" data-uid="' + u + '"' + (S.open[s.uid] ? ' open' : '') + '><summary>'
+        + '<span class="lpe-no">' + L + '</span>'
+        + '<span class="lpe-role" id="lpe-role-' + u + '">' + lpeEsc(s.role) + '</span>'
+        + '<span class="lpe-title" id="lpe-title-' + u + '"><b>' + lpeEsc(s.title) + '</b></span>'
+        + '<button type="button" class="lpe-chip' + (s.shoot ? ' need' : '') + '" data-act="shoot" data-uid="' + u + '"' + (ro ? ' disabled' : '')
+        + ' title="押すと「撮影不要／要撮影」を切り替えます">' + (s.shoot ? '要撮影' : '撮影不要') + '</button>';
+      if (isP) {
+        h += '<span class="lpe-acts">'
+          + '<button type="button" class="lpe-ib" data-act="up" data-uid="' + u + '" aria-label="' + L + 'を上へ"' + (ro || !lpeMovable(S, i - 1) ? ' disabled' : '') + '>↑</button>'
+          + '<button type="button" class="lpe-ib" data-act="down" data-uid="' + u + '" aria-label="' + L + 'を下へ"' + (ro || !lpeMovable(S, i + 1) ? ' disabled' : '') + '>↓</button>'
+          + '<button type="button" class="lpe-ib" data-act="del" data-uid="' + u + '" aria-label="' + L + 'を削除"' + (ro ? ' disabled' : '') + '>×</button></span>';
+      } else {
+        h += '<span class="lpe-fixed" title="TOP と 1枚目（FV）は位置が固定で、削除できません">固定</span>';
+      }
+      h += '</summary><div class="lpe-body">';
+      if (s.kind === 'top') {
+        h += '<div class="lpe-rule">楽天のTOP画像ルール: テキスト占有率20%以下・枠線なし。文字は見出しとキャッチコピーの短いものだけにしてください。'
+          + '<b class="lpe-warn" id="lpe-warn-' + u + '"' + (String(s.body).trim() ? '' : ' hidden') + '>本文が入っているため、20%を超えるおそれがあります。</b></div>';
+      }
+      if (s.kind === 'fv') h += '<div class="lpe-rule">FV は LP の1枚目です。TOP とは別の画像として作ります。</div>';
+      LPE_FIELDS.forEach(function (f) {
+        const id = 'lpe-f-' + u + '-' + f[0];
+        h += '<label for="' + id + '">' + f[1] + '</label><textarea id="' + id + '" rows="' + f[2] + '" data-uid="' + u + '" data-k="' + f[0] + '"'
+          + (ro ? ' readonly' : '') + (f[0] === 'body' ? ' placeholder="画像に載せる短い説明文。なければ空欄"' : '') + '>' + lpeEsc(s[f[0]]) + '</textarea>';
+      });
+      h += '</div></details>';
+    });
+    h += '</div><div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px;">'
+      + '<button type="button" class="btn btn-sm" data-act="add"' + (ro || n >= S.max ? ' disabled' : '') + '>＋ 画像を追加</button>'
+      + '<span class="muted" style="font-size:11px;">TOP と 1枚目（FV）は位置が固定です' + (n >= S.max ? '・画像は ' + S.max + ' 枚までです' : '') + '</span></div>';
+    if (S.undo) {
+      h += '<div class="lpe-undo"><span>' + lpeEsc(S.undo.label) + '「' + lpeEsc(S.undo.slot.title || S.undo.slot.role) + '」を削除しました (まだ保存していません)</span>'
+        + '<button type="button" class="btn btn-sm" data-act="undo"' + (ro ? ' disabled' : '') + '>元に戻す</button></div>';
+    }
+    if (S.can_edit) {
+      h += '<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px;">'
+        + '<button type="button" class="btn btn-primary btn-sm" id="lpe-save" data-act="save"' + (S.saving || !dirty ? ' disabled' : '') + '>'
+        + (S.saving ? '保存しています…' : 'LP構成を保存') + '</button>'
+        + '<span class="lpe-dirty" id="lpe-dirty"' + (dirty ? '' : ' hidden') + '>● 未保存の変更があります</span>'
+        + (S.conflict ? '<button type="button" class="btn btn-sm" data-act="reload">読み直す</button>' : '')
+        + '</div>';
+    }
+    h += '<div class="muted" id="lpe-msg" style="font-size:12px; margin-top:4px; white-space:pre-wrap;">' + lpeEsc(S.msg) + '</div>';
+    return h;
+  }
+  /** 画面のつなぎ込み。deps = { get, put, confirm, onSaved, newUid } (試験では偽物を渡す) */
+  function initLpEdit(doc, deps) {
+    const root = doc.getElementById('lpe');
+    const holder = doc.getElementById('lpe-json');
+    if (!root || !holder) return null;
+    let first = null;
+    try { first = JSON.parse(holder.textContent); } catch (e) { return null; }
+    const url = root.dataset.url;
+    let S = lpeFromServer(first, null);
+    let lastJob = S.base_job_id;
+    const newUid = deps.newUid || function () { return 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); };
+    function render() {
+      // 構成がまだ無い (AI がまだ作っていない) ときは出さない
+      root.hidden = !S.available;
+      root.innerHTML = S.available ? lpeHtml(S) : '';
+      if (S.focus) {
+        const f = doc.getElementById('lpe-f-' + S.focus + '-title');
+        if (f && f.focus) { f.focus(); if (f.select) f.select(); }
+        S.focus = null;
+      }
+    }
+    // 打っている間は描き直さない (描き直すと入力欄の位置が飛ぶ)。行の見出し・TOP の注意・未保存の印だけ合わせる
+    function touch(uid) {
+      const s = S.slots[lpeIndex(S, uid)];
+      if (s) {
+        const r = doc.getElementById('lpe-role-' + uid); if (r) r.textContent = s.role;
+        const t = doc.getElementById('lpe-title-' + uid); if (t) t.innerHTML = '<b>' + lpeEsc(s.title) + '</b>';
+        const w = doc.getElementById('lpe-warn-' + uid); if (w) w.hidden = !String(s.body).trim();
+      }
+      const dirty = lpeDirty(S);
+      const d = doc.getElementById('lpe-dirty'); if (d) d.hidden = !dirty;
+      const b = doc.getElementById('lpe-save'); if (b) b.disabled = S.saving || !dirty;
+    }
+    async function load(msg) {
+      let json = null;
+      try { json = await deps.get(url); } catch (e) { json = null; }
+      if (!json || json.ok === false) {
+        S.msg = '読み込めませんでした: ' + ((json && json.error) || '通信できませんでした');
+        render();
+        return false;
+      }
+      S = lpeFromServer(json, S);
+      lastJob = S.base_job_id;
+      S.msg = msg || '';
+      render();
+      return true;
+    }
+    async function save() {
+      if (S.saving || !S.can_edit) return;
+      const sent = lpeForSave(S.slots);
+      const body = { base_job_id: S.base_job_id, base_edit_id: S.base_edit_id, slots: sent };
+      S.saving = true; S.msg = '保存しています…'; render();
+      let json;
+      try { json = await deps.put(url, body); }
+      catch (e) { json = { ok: false, code: 'network', error: '通信できませんでした (保存できたか分かりません。もう一度押すと確かめます)' }; }
+      S.saving = false;
+      if (json && json.ok) {
+        // 保存できたら読み直した状態 (サーバの応答) に替える。番号・未保存の印もそこから
+        S = lpeFromServer(json, S);
+        lastJob = S.base_job_id;
+        S.msg = json.changed === false ? '変更はありませんでした' : 'LP構成を保存しました';
+        render();
+        if (deps.onSaved) deps.onSaved(json);
+        return;
+      }
+      // 版が変わっていた (古いタブ・2 人同時・通信が切れたが実は保存できていた)。
+      // いまの構成が送ったものと同じなら保存できていたとみなし、違えば読み直しを促す (黙って上書きしない)
+      if (json && (json.code === 'conflict' || json.code === 'network')) {
+        let now = null;
+        try { now = await deps.get(url); } catch (e) { now = null; }
+        if (now && now.ok !== false && now.available && lpeCanon(lpeFromServer(now, S).slots) === lpeCanon(sent)) {
+          S = lpeFromServer(now, S);
+          lastJob = S.base_job_id;
+          S.msg = 'LP構成を保存しました';
+          render();
+          if (deps.onSaved) deps.onSaved(now);
+          return;
+        }
+      }
+      S.msg = '保存できませんでした: ' + ((json && json.error) || '');
+      S.conflict = !!json && (json.code === 'conflict' || json.code === 'not_ready');
+      render();
+    }
+    root.addEventListener('click', function (e) {
+      const b = e.target && e.target.closest ? e.target.closest('[data-act]') : null;
+      if (!b) return;
+      // 行の見出し (summary) の中のボタンで、行が開いたり閉じたりしないように
+      if (e.preventDefault) e.preventDefault();
+      const act = b.dataset.act;
+      if (act === 'save') { save(); return; }
+      if (act === 'reload') {
+        if (lpeDirty(S) && !deps.confirm('保存していない直しを捨てて、読み直しますか？')) return;
+        load('読み直しました');
+        return;
+      }
+      if (!S.can_edit || S.saving) return;
+      const changed = lpeAction(S, act, b.dataset.uid, act === 'add' ? newUid() : null);
+      if (!changed && (act === 'undo' || act === 'add')) S.msg = '画像は ' + S.max + ' 枚までです (TOP を含む)。ほかの画像を消してからにしてください';
+      else if (changed) S.msg = '';
+      render();
+    });
+    root.addEventListener('input', function (e) {
+      const t = e.target;
+      if (!t || !t.dataset || !t.dataset.uid || !t.dataset.k || !S.can_edit || S.saving) return;
+      const s = S.slots[lpeIndex(S, t.dataset.uid)];
+      if (!s || LPE_FIELDS.every(function (f) { return f[0] !== t.dataset.k; })) return;
+      s[t.dataset.k] = t.value;
+      touch(t.dataset.uid);
+    });
+    // 開いている行を覚える (並べ替えなどで描き直しても閉じない)。toggle は泡立たないので capture で拾う
+    root.addEventListener('toggle', function (e) {
+      const d = e.target;
+      if (!d || !d.dataset || !d.dataset.uid) return;
+      if (d.open) S.open[d.dataset.uid] = true; else delete S.open[d.dataset.uid];
+    }, true);
+    render();
+    return {
+      isDirty: function () { return S.available && lpeDirty(S); },
+      state: function () { return S; },
+      /** 上の「AI が作った構成」の箱に新しい構成が出たら読み直す (直している途中なら知らせるだけで、捨てない) */
+      composeChanged: function (jobId) {
+        if (!jobId || jobId === lastJob) return Promise.resolve(false);
+        lastJob = jobId;
+        if (S.available && lpeDirty(S)) { S.newer = true; render(); return Promise.resolve(false); }
+        return load('');
+      },
+    };
+  }
+  /* @lp-edit:end */
+  (function wireLpEdit() {
+    const lpe = initLpEdit(document, {
+      get: async function (url) { const r = await fetch(url, { headers: { Accept: 'application/json' } }); return r.json(); },
+      put: async function (url, body) {
+        const r = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        return r.json();
+      },
+      confirm: function (m) { return window.confirm(m); },
+      // 上の箱 (lpc) の本文・コピーも直した版に替える
+      onSaved: function () { document.dispatchEvent(new CustomEvent('ph:lp-edit-saved')); },
+    });
+    if (!lpe) return;
+    document.addEventListener('ph:lp-compose-state', function (e) {
+      if (e.detail && e.detail.done) lpe.composeChanged(e.detail.job_id);
+    });
+    // 保存していない直しがあるまま離れるときは止める (読み直しの関所 phKeep はこの一覧を退避しない)
+    window.addEventListener('beforeunload', function (ev) {
+      if (!lpe.isDirty()) return;
+      ev.preventDefault();
+      ev.returnValue = '';
+    });
   })();
   // 定型文ボタン (画像工程 v2)。文面はサーバー (lib/prompt-templates.js) が組み立て、画面は表示とコピーだけ
   (function initPromptButtons() {

@@ -1500,6 +1500,29 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_ph_ai_usage_month ON ph_ai_usage(kind, month);
   `);
 
+  // LP 構成の編集版 (画像制作の新フロー PR-B・2026-10-09。lib/lp-edit.js)。
+  // 人が画面で直した構成を ⑦ の全文に書き戻したもの。**追記だけ** — 保存のたびに新しい行。
+  // 🚨 AI の生の出力 (ph_lp_compose_jobs.output_text) は書き換えない (段階1 の測定の材料)。だから別の表。
+  //    効いている構成 = いちばん新しい done の job への、いちばん新しい行 (無ければ AI の本文)。
+  //    draft には外部キーを張らない (ph_lp_compose_jobs と同じ・下書きを消しても実験の記録を残す)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_lp_compose_edits (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id     INTEGER NOT NULL,
+      base_job_id  INTEGER NOT NULL REFERENCES ph_lp_compose_jobs(id),  -- どの AI の構成を直したか
+      slots_json   TEXT NOT NULL,          -- 画像の並び [{uid, kind, name, role, title, copy, body, shoot, block}]
+      output_text  TEXT NOT NULL,          -- 組み直した ⑦ の全文 (サーバの lint を通ったもの)
+      edited_by    TEXT NOT NULL,
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_edits_job ON ph_lp_compose_edits(base_job_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_edits_draft ON ph_lp_compose_edits(draft_id, id DESC);
+    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_compose_edits_no_update BEFORE UPDATE ON ph_lp_compose_edits
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_compose_edits は追記専用です (直すときは新しい行として入れてください)'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_compose_edits_no_delete BEFORE DELETE ON ph_lp_compose_edits
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_compose_edits は追記専用です'); END;
+  `);
+
   // LP 構成: 実行役へ配った画像の記録 (PR1-b で追加。PR1-a でデプロイ済みの DB にも入れる)
   const lpJobCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_jobs)').all().map((c) => c.name));
   if (lpJobCols.size > 0 && !lpJobCols.has('images_served_json')) {
