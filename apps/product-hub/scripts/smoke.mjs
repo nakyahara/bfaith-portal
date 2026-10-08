@@ -6263,21 +6263,24 @@ let wfSetParentId = null;
       wf.setStaffActive(sfImg, false);
 
       // 🚨 撮影が要ると判定したのに、保存ボタン (古いタブを含む) で素材ステータスを「撮影不要」にはできない
-      r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'not_required' });
+      r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'not_required', shoot_mode_expected: 'inhouse' });
       check('🚨 撮影判定が「社内撮影」のまま、保存ボタンで撮影・素材ステータスを「撮影不要」にはできない (撮影しないまま ③ を通さない・Codex PR-A High)',
         r.status === 400 && ipSf().material_status !== 'not_required' && /撮影判定/.test(r.json?.error || ''), JSON.stringify([r, ipSf()]));
-      r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'shipped' });
+      const rNoExp = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'shipped' });
+      check('🚨 撮影判定のある商品で、判定を添えない素材ステータスの保存 (この変更より前に開いた画面) は 409 (Codex PR-A R8 P1)',
+        rNoExp.status === 409 && ipSf().material_status !== 'shipped' && /画面が古い/.test(rNoExp.json?.error || ''), JSON.stringify([rNoExp, ipSf()]));
+      r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'shipped', shoot_mode_expected: 'inhouse' });
       check('撮影判定が「社内撮影」でも、撮影不要以外の素材ステータスは保存できる', r.status === 200 && ipSf().material_status === 'shipped', JSON.stringify(r));
       // 逆向き: 撮影不要と判定したのに、保存ボタンで撮影の途中の値にすると ③ が閉じられなくなる (Codex PR-A R2 P2)
       await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'none' });
       const noneStatuses = [];
       for (const v of ['shipped', 'shooting', 'not_shipped', 'internal_prep', '']) {
-        noneStatuses.push((await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: v })).status);
+        noneStatuses.push((await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: v, shoot_mode_expected: 'none' })).status);
       }
       check('🚨 撮影判定が「撮影不要」なら、保存ボタンで素材ステータスを撮影不要・素材完了以外にはできない (Codex PR-A R2 P2)',
         noneStatuses.every((s) => s === 400) && ipSf().material_status === 'not_required', JSON.stringify([noneStatuses, ipSf()]));
-      r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'ready' });
-      const rNr = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'not_required', status: 'メモ' });
+      r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'ready', shoot_mode_expected: 'none' });
+      const rNr = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'not_required', status: 'メモ', shoot_mode_expected: 'none' });
       check('撮影判定が「撮影不要」でも、素材完了・撮影不要は保存できる', r.status === 200 && rNr.status === 200 && ipSf().material_status === 'not_required', JSON.stringify([r, rNr]));
       r = await call('POST', `/api/drafts/${idSf}/image-production`, { status: '素材を送らない保存' });
       check('素材ステータスを送らない保存は撮影判定に関係なく通る', r.status === 200, JSON.stringify(r));
