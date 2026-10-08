@@ -181,7 +181,7 @@ try {
   const pathD = () => WW2.query('select ops.record_ne_registration_check($1) as r', [RUNC]).then((r) => r.rows[0].r);
   const HEADER = 'syohin_code,syohin_name,sire_code,genka_tnk,baika_tnk,tax_rate,toriatukai_kbn,daihyo_syohin_code,jan_code';
   const pathF = (rid, skuId) => E4.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [JSON.stringify({ request_id: rid, actor: 'boss@test', ownership: ALL_COMPANY, reason: null,
-    kind: 'products', schema_version: 'ne-reg-single-v1', header: HEADER, ne_codes_run: RUN1, cost_day: new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10),
+    kind: 'products', schema_version: 'ne-reg-single-v2', header: HEADER,   // 0065: 作れる単品の版 (v1 は鍵の前に schema_not_buildable) ne_codes_run: RUN1, cost_day: new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10),
     items: [{ sku_id: skuId, expected: {}, rows: [['x']] }] }), Buffer.from('x')]).then((r) => r.rows[0].r);
   // 許可を開け直す (本番と同じ: NE のコードの回 → 照合 ② の始めに閉じる → 結果 → その回で grant)
   let reopenN = 0;

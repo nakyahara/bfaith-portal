@@ -224,9 +224,13 @@ export function notImportedNote(ne) {
   const codesOf = (list, label) => list.slice(0, 5).map((x) => x && x.code && (label ? `${x.code} ${label(x)}` : x.code)).filter(Boolean).join('・') + (list.length > 5 ? ` ほか ${list.length - 5}` : '');
   const parts = [];
   const ni = w && Array.isArray(w.not_imported) ? w.not_imported : [];
-  if (ni.length) parts.push(`ℹ️ 配ってから ${w.not_imported_days ?? 3} 日たっても NE に無い (取り込まれていないらしい) ${ni.length} 件 (${codesOf(ni)})`);
+  // 0065 (設計 v7 §⑤): NE の取り込みが「N件失敗」だったのに申告しないと、入らなかった商品は待ちのまま (作り直せない) = 申告を促す
+  if (ni.length) parts.push(`ℹ️ 配ってから ${w.not_imported_days ?? 3} 日たっても NE に無い (取り込まれていないらしい) ${ni.length} 件 (${codesOf(ni)})。NE の結果が「N件失敗」なら元のファイルで「一部失敗」を申告`);
   const nd = w && Array.isArray(w.needs_declaration) ? w.needs_declaration : [];
   if (nd.length) parts.push(`ℹ️ NE にあるが自動では確かめない (取り込んだと申告すると確かめる) ${nd.length} 件 (${codesOf(nd, (x) => AUTO_BLOCK_JA[x.reason] || x.reason)})`);
+  // 0065 3 者一致: NE は配った値と合うが、今の Company DB の値 (代表 (親)) が違う = 起きないはずの事故 (配った後に代表は変えない) = 知らせる
+  const cd = w && Array.isArray(w.cdb_drift) ? w.cdb_drift : [];
+  if (cd.length) parts.push(`⚠️ NE は配った値と合うが Company DB の代表 (親) が違う (確認済みにしない) ${cd.length} 件 (${codesOf(cd)})`);
   return parts.length ? parts.join('・') : null;
 }
 /**
@@ -409,6 +413,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       seal: result.ne.registrations.seal ?? null, counts: result.ne.registrations.written?.counts ?? null,
       not_imported: Array.isArray(result.ne.registrations.written?.not_imported) ? result.ne.registrations.written.not_imported.length : null,   // 0063: 配ってから日がたっても NE に無い (知らせるだけ)
       needs_declaration: Array.isArray(result.ne.registrations.written?.needs_declaration) ? result.ne.registrations.written.needs_declaration.length : null,   // 0063: NE にあるが申告が要る
+      cdb_drift: Array.isArray(result.ne.registrations.written?.cdb_drift) ? result.ne.registrations.written.cdb_drift.length : null,   // 0065: NE は合うが Company DB が違う (3 者一致でない)
       write_error: result.ne.registrations.write_error ?? null } : null);
     evidence = {
       state: 'complete', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt, finished_at: result.finished_at,

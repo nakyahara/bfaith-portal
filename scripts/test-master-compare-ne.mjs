@@ -1495,6 +1495,12 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   assert.match(sl, /^⚠️ ②: 区分が NE と違う SKU 1 件/);
   assert.match(sl, /ℹ️ 配ってから 3 日たっても NE に無い \(取り込まれていないらしい\) 1 件 \(n901\)/);
   assert.match(sl, /ℹ️ NE にあるが自動では確かめない \(取り込んだと申告すると確かめる\) 1 件 \(j001 JAN\)/);
+  // 0065 (設計 v7 §⑤): 「N件失敗」なら申告を促す・3 者一致でない (NE は合うが Company DB の代表が違う) = ⚠️ で知らせる・証跡に数
+  assert.match(sl, /\(n901\)。NE の結果が「N件失敗」なら元のファイルで「一部失敗」を申告/);
+  assert.doesNotMatch(sl, /Company DB の代表/);
+  const sl2 = neSum({ ...syn, registrations: { written: { ...syn.registrations.written, cdb_drift: [{ code: 'p001', export_id: '9', cols: { parent: { ok: false } } }] } } });
+  assert.match(sl2, /⚠️ NE は配った値と合うが Company DB の代表 \(親\) が違う \(確認済みにしない\) 1 件 \(p001\)/);
+  assert.equal(z.evidence.ne.registrations.cdb_drift, 0);
   const ev5 = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
   assert.deepEqual([ev5.ne.reg_after_check.reg_failed, ev5.ne.reg_after_check.reg_partial], [2, 2]);
   // W13:ne は証跡の確かめの後の数を理由と観測に使う
