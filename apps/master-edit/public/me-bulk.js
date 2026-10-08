@@ -130,6 +130,13 @@
       save(); paint();
     });
   });
+  // チェックの欄のどこを押しても、その行のチェックを押したのと同じ (当たりを大きく。行を開くのは PR1 の me-list.js がこの欄では止める)
+  var listTbl = $('#list-tbl');
+  if (listTbl) listTbl.addEventListener('click', function (e) {
+    var td = e.target.closest && e.target.closest('td.c-chk');
+    if (!td || e.target.closest('label, input')) return;
+    var box = $('.rowck', td); if (box) box.click();
+  });
   var headCk = $('#ck-page');
   if (headCk) headCk.addEventListener('click', function () {
     var on = headCk.checked;

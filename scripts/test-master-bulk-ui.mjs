@@ -8,6 +8,7 @@
  *     Enter を続けて押しても保存しない (High 1)・合計 = 選んだ + 一緒に変わるセット (M2)・保存 → 結果 → 閉じると一覧を読み直して変えた行が光る
  *   5 だめな分は直し方ごと (M7)・選び直せる分だけ選び直す (1 件の画面で直す分は入れない)
  *   6 390 幅: 帯と引き出しが画面に収まる・横にスワイプの案内 (M8)・ページが横にはみ出さない
+ *   7 PR1 (列の選択・見出しで並び替え) と一緒: チェックの列は列の板に関係なく左端・並べ替えで選択が残る・横に送っても残る・チェックの欄では行が開かない
  * 使い方: node scripts/test-master-bulk-ui.mjs   (Playwright / Chromium が無い = 失敗。飛ばすのは MASTER_EDIT_UI_SKIP=1)
  */
 import assert from 'node:assert/strict';
@@ -39,6 +40,7 @@ const { forceNewOpen } = await import('./fixtures/master-widen.mjs');
 const W = await import('../lib/master-write.mjs');
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mlist2-bulk-ui-'));
 const { default: router, __setPgClientFactory, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
+(await import('../apps/warehouse-mirror/db.js')).initMirrorDB();   // 列の設定 (PR1・人ごと) の保存先 = 使い捨ての DATA_DIR の写し
 
 const quiet = () => {};
 const ALL = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'company']));
@@ -290,6 +292,66 @@ await ta('[6] 390 幅: 帯と引き出しが画面に収まる・横にスワイ
   assert.equal(await p.isHidden('#bk-drawer'), true);
   await p.click('#bk-clear');
 }, { width: 390, height: 844 });
+
+await ta('[7] PR1 と一緒: チェックの列は列の板の設定に関係なく左端 (板に出ない・名前を隠して保存しても)・見出しで並べ替えても選択が残る (聞かない)・横に送ってもチェックとコードが残る・行を押すと開く / チェックの欄では開かない', async (p) => {
+  await p.goto(q('エプロン'));
+  await ck(p, 'a001').click(); await ck(p, 'a002').click();
+  // 列の板: チェックの列は板に出ない (隠せない・動かせない)。名前を隠して保存 → 読み直してもチェックの列は左端・次がコード
+  await p.click('#colbtn');
+  assert.equal(await p.locator('#collist li[data-id="chk"]').count(), 0, '板にチェックの列は無い');
+  await p.click('#collist li[data-id="name"] input');
+  for (let i = 0; i < 6; i++) await p.click('#collist li[data-id="price"] [data-mv="-1"]').catch(() => {});
+  await p.click('#cp-save');
+  await p.waitForFunction(() => !document.querySelector('#colbtn').classList.contains('unsaved'));
+  await p.keyboard.press('Escape');
+  await p.reload();
+  const heads = await p.$$eval('#list-tbl thead th', (ths) => ths.filter((t) => !t.hidden).map((t) => t.getAttribute('data-c') || t.getAttribute('data-col')));
+  assert.deepEqual(heads.slice(0, 3), ['chk', 'code', 'price'], `見出し ${heads.join(',')}`);
+  assert.ok(!heads.includes('name'), '名前は隠した');
+  const firstCells = await p.$$eval('#list-tbl tbody tr:first-child > td', (tds) => tds.filter((t) => !t.hidden).slice(0, 2).map((t) => t.getAttribute('data-col')));
+  assert.deepEqual(firstCells, ['chk', 'code']);
+  assert.equal(await n(p), '2', '列を変えて読み直しても選択は残る');
+  // 見出しで並べ替え (PR1 = サーバーで並べた一覧を読む) = 同じ絞り込み = 選択が残る・「残す / 外す」を聞かない
+  await Promise.all([p.waitForNavigation(), p.click('#list-tbl th[data-c="price"] a.sorth')]);
+  await Promise.all([p.waitForNavigation(), p.click('#list-tbl th[data-c="price"] a.sorth')]);
+  assert.match(p.url(), /dir=desc/);
+  assert.equal(await n(p), '2'); assert.equal(await p.isHidden('#bk-prev'), true);
+  assert.equal(await ck(p, 'a001').isChecked(), true);
+  // 横に送る: チェックとコードの列が左に残る (コード = チェックの幅だけ右)
+  await p.setViewportSize({ width: 700, height: 900 });
+  const sc = await p.evaluate(() => { const w = document.getElementById('tblwrap'); w.scrollLeft = 400; return w.scrollLeft; });
+  assert.ok(sc > 0, '横に送れる幅');
+  await p.waitForTimeout(100);
+  const pos = await p.evaluate(() => {
+    const w = document.getElementById('tblwrap').getBoundingClientRect();
+    const tr = document.querySelector('#list-tbl tbody tr');
+    const c = tr.querySelector('td.c-chk').getBoundingClientRect(); const k = tr.querySelector('td[data-col="code"]').getBoundingClientRect();
+    const hc = document.querySelector('#list-tbl thead th.c-chk').getBoundingClientRect(); const hk = document.querySelector('#list-tbl thead th[data-c="code"]').getBoundingClientRect();
+    return { w: w.left, c: c.left, k: k.left, hc: hc.left, hk: hk.left };
+  });
+  assert.ok(Math.abs(pos.c - pos.w) <= 2 && Math.abs(pos.k - pos.w - 46) <= 2, JSON.stringify(pos));
+  assert.ok(Math.abs(pos.hc - pos.c) <= 1 && Math.abs(pos.hk - pos.k) <= 1, `見出しと行がずれない ${JSON.stringify(pos)}`);
+  await p.evaluate(() => { document.getElementById('tblwrap').scrollLeft = 0; });
+  await p.setViewportSize({ width: 1440, height: 900 });
+  // 行を押す: チェックの欄 (チェックの外のすき間も) では開かない・チェックの欄を押すと選ぶ / 外す・ほかの欄では開く (PR1)
+  const url0 = p.url();
+  const cell = await p.locator('#list-tbl tbody tr:has(.rowck[data-code="a003"]) td.c-chk').boundingBox();
+  await p.mouse.click(cell.x + 2, cell.y + 1);   // 欄の角 (チェックの外) = その行を選ぶ (当たりを大きく)・開かない
+  await p.waitForTimeout(400);
+  assert.equal(p.url(), url0, 'チェックの欄のすき間では開かない');
+  assert.equal(await n(p), '3'); assert.equal(await ck(p, 'a003').isChecked(), true);
+  await ck(p, 'a003').click();
+  await p.waitForTimeout(400);
+  assert.equal(p.url(), url0, 'チェックを押しても開かない');
+  assert.equal(await n(p), '2');
+  await Promise.all([p.waitForURL(/\/sku\/a004$/), p.click('#list-tbl tbody tr:has(.rowck[data-code="a004"]) td[data-col="price"]')]);
+  // 列の設定をいつもに戻す (この人の設定)
+  await p.goto(q('エプロン'));
+  await p.click('#colbtn'); await p.click('#cp-reset'); await p.click('#cp-save');
+  await p.waitForFunction(() => !document.querySelector('#colbtn').classList.contains('unsaved'));
+  await p.keyboard.press('Escape');
+  await p.click('#bk-clear');
+});
 
 await browser.close();
 server.close();
