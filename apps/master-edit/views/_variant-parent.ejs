@@ -1,0 +1,43 @@
+<%
+  // 色違い・サイズ違いの代表 (0061・2026-10-08 中原さんの決定 a)。新商品の登録 (vp.mode = 'new') と、下書きの単品の商品の画面 (vp.mode = 'sku') で同じ部品。
+  //   選んだ代表は NE 登録の CSV の代表商品コードの列に入る (Company DB の親には書かない = 夜間ロードが NE から付ける)。画面の動き = public/me-variant.js
+  //   vp = { mode, can (選べる), current (lib/master-reg-parent.mjs の readRegistrationParent か null), self (登録する商品のコード・新商品は null) }
+  const vpH = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const vpCur = vp.current && vp.current.code ? vp.current : null;
+  const vpDis = vp.can ? '' : ' disabled';
+  const vpKids = (c) => c.children ? '色違い・サイズ違い ' + c.children + ' 品 (' + c.sample.join('・') + (c.children > c.sample.length ? ' ほか' : '') + ')' : 'まだ色違いなし';
+  const vpNe = (c) => !c.ne || !c.ne.known ? '<span class="b mute">NE: 確かめられない</span>' : c.ne.ok ? '<span class="b ok"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>NE にある (' + vpH(c.ne.ne_code) + ')</span>' : '<span class="b err">NE にまだ無い</span>';
+%>
+<div class="f wide vp" data-row="variation_parent" id="vp" data-base="<%= base %>" data-mode="<%= vp.mode %>" data-can="<%= vp.can ? '1' : '0' %>" data-self="<%= vp.self || '' %>" data-seen="<%= vpCur ? vpCur.code : '' %>" style="align-items:start">
+  <div class="lab" id="lab-vp" style="padding-top:8px">色違い・サイズ違い<span class="opt">あれば</span></div>
+  <div class="ctl col" style="gap:10px;width:100%">
+    <div class="seg" role="group" id="vp-mode" aria-labelledby="lab-vp" data-value="<%= vpCur ? 'has' : 'none' %>">
+      <button type="button" data-v="none" aria-pressed="<%= vpCur ? 'false' : 'true' %>"<%- vpCur ? '' : ' class="on"' %><%= vpDis %>>ひとつだけの商品</button>
+      <button type="button" data-v="has" aria-pressed="<%= vpCur ? 'true' : 'false' %>"<%- vpCur ? ' class="on"' : '' %><%= vpDis %>>ほかの商品の色違い・サイズ違い</button>
+    </div>
+    <div class="vp-pick" id="vp-pick"<%= vpCur ? '' : ' hidden' %>>
+      <div class="vp-chosen" id="vp-chosen"<%= vpCur ? '' : ' hidden' %> aria-live="polite">
+        <% if (vpCur) { %>
+        <span class="vp-ico" aria-hidden="true"><svg class="ic"><use href="#i-layers"/></svg></span>
+        <span class="vp-main"><span class="vp-code mono"><%= vpCur.code %></span> <span class="vp-name"><%= vpCur.name || '' %></span>
+          <span class="vp-sub"><%= vpCur.kind === 'tag' ? '名札 (まとまり)' : vpCur.kind === 'single' ? '単品が代表' : 'Company DB に見つからない' %> · <%= vpKids(vpCur) %></span></span>
+        <span class="vp-side"><%- vpNe(vpCur) %></span>
+        <% } %>
+      </div>
+      <div class="vp-search" id="vp-search"<%= vpCur ? ' hidden' : '' %>>
+        <span class="vp-in"><svg class="ic s" aria-hidden="true"><use href="#i-search"/></svg><input class="in" id="vp-q" type="search" autocomplete="off" spellcheck="false" maxlength="60"
+          role="combobox" aria-expanded="false" aria-controls="vp-list" aria-autocomplete="list" aria-describedby="vp-help" aria-label="代表を探す (名札・兄弟の商品コード・名前)"
+          placeholder="兄弟の商品コード・名札・名前を 2 文字から"<%= vpDis %>></span>
+        <ul class="vp-list" id="vp-list" role="listbox" aria-label="代表の候補" hidden></ul>
+      </div>
+      <div class="vp-acts">
+        <button type="button" class="btn sm" id="vp-change"<%= vpCur ? '' : ' hidden' %><%= vpDis %>>別の代表にする</button>
+        <% if (vp.mode === 'sku') { %><button type="button" class="btn sm pri" id="vp-save" disabled>代表を保存</button><% } %>
+        <span class="fmsg" id="vp-msg" role="status" aria-live="polite"></span>
+      </div>
+    </div>
+    <span class="hint" id="vp-help">選んだ代表は NE 登録の CSV の「代表商品コード」に入ります (NE にある代表だけ) · 兄弟の商品コードを打つと、その商品のまとまり (名札) が出ます · 最初の色違いのときは元の商品 (単品) を選ぶ</span>
+    <% if (vp.mode === 'sku' && vpCur && vpCur.cdb_parent) { %><span class="hint"><%= vpCur.matches ? '✓ NE から来た代表 (夜間の取り込み) と同じです' : '⚠ NE から来た代表 (' + vpCur.cdb_parent + ') と違います。翌朝の照合 ② で確かめます' %></span><% } %>
+    <input type="hidden" id="f-variation_parent" value="<%= vpCur ? vpCur.code : '' %>"<% if (vp.mode === 'new') { %> data-field="variation_parent" data-dirty-field="variation_parent" data-label="色違い・サイズ違いの代表"<% } %>>
+  </div>
+</div>

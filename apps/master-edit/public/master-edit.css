@@ -926,3 +926,30 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
   #list-page .panel { backdrop-filter: none; }   /* blur があると下から出す板 (fixed) が板の中に閉じこめられる */
   .colpanel { position: fixed; top: auto; bottom: 0; left: 0; right: 0; width: 100%; max-width: none; border-radius: 18px 18px 0 0; max-height: 80vh; z-index: 120; }
 }
+
+/* ---------- 色違い・サイズ違いの代表 (0061・views/_variant-parent.ejs・public/me-variant.js) ---------- */
+.vp .vp-pick { display: grid; gap: 8px; width: 100%; max-width: 760px; }
+.vp .vp-pick[hidden], .vp .vp-search[hidden], .vp .vp-chosen[hidden], .vp .vp-list[hidden] { display: none; }
+.vp .vp-search { position: relative; }
+.vp .vp-in { display: flex; align-items: center; gap: 8px; padding: 0 10px; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--panel-deep); }
+.vp .vp-in:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+.vp .vp-in .in { border: 0; background: transparent; box-shadow: none; flex: 1; min-width: 0; height: 40px; padding: 0; }
+.vp .vp-list { list-style: none; margin: 6px 0 0; padding: 4px; max-height: 340px; overflow: auto; border-radius: 12px; border: 1px solid var(--line-strong); background: var(--panel-deep); box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45); }
+.vp .vp-opt, .vp .vp-chosen { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 9px; }
+.vp .vp-opt { cursor: pointer; border: 1px solid transparent; }
+.vp .vp-opt.on { border-color: rgba(58, 231, 255, 0.55); background: var(--accent-bg); }
+.vp .vp-opt.off { cursor: not-allowed; opacity: 0.55; }
+.vp .vp-empty { padding: 10px; color: var(--muted); font-size: 13.5px; }
+.vp .vp-chosen { border: 1px solid rgba(46, 230, 168, 0.40); background: var(--ok-bg); }
+.vp .vp-ico { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; color: var(--ok); border: 1px solid rgba(46, 230, 168, 0.40); }
+.vp .vp-kind { font-size: 11.5px; font-weight: 700; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--line-strong); color: var(--text2); }
+.vp .vp-kind.tag { color: var(--accent); border-color: rgba(58, 231, 255, 0.45); }
+.vp .vp-main { min-width: 0; }
+.vp .vp-code { color: var(--accent); font-size: 14px; }
+.vp .vp-name { color: var(--text); }
+.vp .vp-sub { display: block; color: var(--muted); font-size: 12.5px; margin-top: 2px; overflow-wrap: anywhere; }
+.vp .vp-acts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+@media (max-width: 640px) {
+  .vp .vp-opt, .vp .vp-chosen { grid-template-columns: auto 1fr; }
+  .vp .vp-side { grid-column: 2; }
+}

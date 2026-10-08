@@ -435,7 +435,7 @@
   function collect() {
     var values = {};
     var keys = isSet ? ['name', 'standard_price', 'shipping_code', 'reorder_months', 'handling_own', 'set_sales_class_override']
-      : ['name', 'standard_price', 'shipping_code', 'tax_rate', 'sales_class', 'primary_supplier', 'reorder_months', 'expiry_managed', 'inbound_date_managed'];
+      : ['name', 'standard_price', 'shipping_code', 'tax_rate', 'sales_class', 'primary_supplier', 'reorder_months', 'expiry_managed', 'inbound_date_managed', 'variation_parent'];
     keys.forEach(function (k) { var v = fieldValue(k); if (v !== undefined && v !== '') values[k] = v; });
     if (isSet) {
       values.components = components();

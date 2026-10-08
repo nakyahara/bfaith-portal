@@ -139,6 +139,10 @@ export const WIDEN_EDIT_FUNCTIONS = Object.freeze(['ops.master_ownership_active_
 /** 0058 (§3.9 の 3・R16 H1): ops.ne_reg_exports の file_bytes を owner でない全部のロールから外す (表の SELECT → 列ごと)。「表に GRANT」の後に毎回流す = 流し直しても戻らない */
 export const RESTRICT_FILE_BYTES_SQL = "do $$ begin if to_regprocedure('ops.restrict_ne_reg_file_bytes()') is not null then perform ops.restrict_ne_reg_file_bytes(); end if; end $$";
 /** 0058: 門の記録の 2 版 (active / prepared を見た・capable)。master_gate に実行だけ */
+/** 0061 (新商品の代表 = 色違い・サイズ違い・2026-10-08): 代表を決める / 外す関数 (画面のロール) と、登録の代表の表 (読むだけ)。守りの trigger の関数は持ち主だけ */
+export const REG_PARENT_EDIT_FUNCTIONS = Object.freeze(['ops.set_registration_parent(uuid, text, text, jsonb, bigint, text, text)']);
+export const REG_PARENT_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_registration_parents()']);
+export const REG_PARENT_SELECT = Object.freeze(['ops.registration_parents']);
 export const ACK_V2_FUNCTION = 'ops.record_legacy_gate_ack_v2(text, text, text, jsonb, text, text, integer, timestamptz, text, text, text[], boolean, text)';
 /** 0058 (§3.7): 開放の許可を出す / 取り消す = NOINHERIT のログイン new_entry_gate だけ (watch_writer には渡さない = 照合のコード 1 本で証拠から開放まで完結しない) */
 export const LEASE_GATE_FUNCTIONS = Object.freeze(['ops.grant_new_entry_lease(text, text)', 'ops.revoke_new_entry_lease(text, text)']);
@@ -228,6 +232,10 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   s.push('grant usage on schema ops to new_entry_gate');
   for (const f of LEASE_GATE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to new_entry_gate';`));
   s.push(ifFn(LEASE_VALID_FUNCTION, `execute 'grant execute on function ${LEASE_VALID_FUNCTION} to new_entry_gate';`));
+  // 0061 (新商品の代表): 関数・表がある DB だけ (0061 の前は付けない = 流し直すと付く)。前に付けた権限を外してから付け直す
+  for (const f of [...REG_PARENT_EDIT_FUNCTIONS, ...REG_PARENT_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of REG_PARENT_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  for (const t of REG_PARENT_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   // 0058: 上の「画面が読む表」の GRANT (ops.ne_reg_exports の表の SELECT) の後に、file_bytes を外して列ごとに付け直す (byte 列は ops.ne_reg_file だけ)
   s.push(RESTRICT_FILE_BYTES_SQL);
   return s;

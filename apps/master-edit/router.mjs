@@ -53,6 +53,7 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
+import { searchVariationParents, setRegistrationParent } from '../../lib/master-reg-parent.mjs';
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
@@ -569,6 +570,23 @@ router.get('/api/code-check', (req, res) => withPgApi(res, async (db) => {
   if (code.length > 60) return res.status(400).json({ ok: false, error: '長すぎます' });
   res.json(await checkNewCodeInDb(db, code));
 }));
+
+// 0061: 色違い・サイズ違いの代表の候補 (名札・まとまりに入っていない単品。NE にあるか・子の数つき)。self = 登録する商品 (出さない)
+router.get('/api/variation-parents', (req, res) => withPgApi(res, async (db) => {
+  const q = String(req.query.q ?? '');
+  if (q.length > 60) return res.status(400).json({ ok: false, error: '長すぎます' });
+  res.json({ ok: true, items: await searchVariationParents(db, q, { self: req.query.self ? String(req.query.self).slice(0, 60) : null }) });
+}));
+// 0061: 下書きの単品の代表を決める / 外す (NE 登録の CSV の代表の列に入る。Company DB の親には書かない = 持ち主は NE)
+router.post('/api/sku/:code/variation-parent', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    res.json(await setRegistrationParent(db, { actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, code: req.params.code,
+      seen: b.seen ?? null, parent: b.parent ?? null, reason: b.reason ?? null }, { open: isOpen() }));
+  }, 'write');
+});
 
 router.post('/api/new', (req, res) => {
   const gate = editorGate(req);

@@ -242,6 +242,8 @@
         <section class="panel" id="p-basic" aria-labelledby="h-basic">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-tag"/></svg></span><h2 id="h-basic">基本</h2><span class="sub">代表 (名前と取扱は上の見出しのところで直します)</span></div>
           <%- row('parent_code', '代表 (親)', '<input class="in w-s mono" id="f-parent_code" autocomplete="off" placeholder="なし" ' + meta('parent_code') + ' value="' + h(c.parent_code || '') + '">', c.parent_code ? c.parent_code + ' ' + (c.parent_name || '') : 'なし', { forId: 'f-parent_code', mono: false, hint: h((c.parent_name ? c.parent_name + ' · ' : '') + (c.parent_set_by === 'manual' ? '人が決めた · ' : c.parent_set_by === 'load' ? 'NE から · ' : '')) + '親の商品のコード · 空 = 代表なし' }) %>
+          <%# 0061: 新商品 (下書きの単品) の色違い・サイズ違いの代表 = NE 登録の CSV の代表商品コードに入る (上の「代表 (親)」= NE から来た Company DB の親とは別) %>
+          <% if (page.regParent && (reg === 'draft' || page.regParent.code)) { %><%- include('_variant-parent', { vp: { mode: 'sku', can: canSave && reg === 'draft' && !page.locks.regExports.length, current: page.regParent, self: c.code } }) %><% } %>
         </section>
       <% } else { %>
         <% if (c.component_request) { const rq = c.component_request; const curMap = new Map(c.components.map((x) => [x.code, x.qty])); const reqMap = new Map(rq.rows.map((x) => [x.code, x.qty]));
@@ -517,6 +519,7 @@
   </div>
   <%- include('_footer') %>
   <% if (page) { %><script src="<%= base %>/public/me-sku.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && page.regParent && (reg === 'draft' || page.regParent.code)) { %><script src="<%= base %>/public/me-variant.js?v=<%= assetV %>" defer></script><% } %>
   <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
 </body>

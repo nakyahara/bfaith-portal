@@ -20,6 +20,7 @@ import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs
 import { latestRun } from '../master-decisions/decide.mjs';
 import { readCardEvent } from '../../lib/product-hub-outbox.mjs';
 import { regItemsOfSku } from '../../lib/master-reg-csv.mjs';
+import { readRegistrationParent } from '../../lib/master-reg-parent.mjs';
 import { hasRegisteredOn, parseNeCreationDate, REGISTERED_ON_SOURCES } from '../../lib/sku-registered-on.mjs';
 import { normalizeSort, sortColumnOf } from './list-columns.mjs';
 import { masterProfit } from '../../lib/profit-estimate.js';
@@ -546,8 +547,10 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = null
       ? (await db.query('select registered_on::text as date, registered_on_source as source from core.skus where sku_id = $1', [id])).rows[0] : null;
     if (registered) registered.label = registered.source ? (REGISTERED_ON_SOURCES[registered.source] || registered.source) : null;
     locks.futureCost = await readFutureCostLocks(db, cur, today);
+    // 0061: 新商品の色違い・サイズ違いの代表 (NE に登録する予定・単品だけ。0061 の前の DB = null)
+    const regParent = cur.sku_kind === 'single' ? await readRegistrationParent(db, id) : null;
     return {
-      cur, costs, suppliers, activeSuppliers, jan, usedIn, usedInCount, amazon, csvRows, today, card, regItems, recent, locks, registered,
+      cur, costs, suppliers, activeSuppliers, jan, usedIn, usedInCount, amazon, csvRows, today, card, regItems, recent, locks, registered, regParent,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
       fields: fieldOwnership(cur.sku_kind, ownership || {}, open && !!ownership && newEntryWritable(phase, ownership)),
@@ -631,7 +634,9 @@ export async function readNewPage(db) {
   const activeSuppliers = await selectableSuppliers(db);
   const backfillDone = (await regclass(db, 'ops.master_registration_backfill'))
     ? Number((await db.query('select count(*)::int as n from ops.master_registration_backfill')).rows[0].n) === 1 : false;
-  return { phase, activeSuppliers, backfillDone };
+  // 0061: 色違い・サイズ違いの代表の欄 (0061 の前の DB = 出さない)
+  const regParentReady = await regclass(db, 'ops.registration_parents');
+  return { phase, activeSuppliers, backfillDone, regParentReady };
 }
 
 /** 構成品を足すときの引き当て (コード → 名前・種類・税率・分類・原価・取扱) */

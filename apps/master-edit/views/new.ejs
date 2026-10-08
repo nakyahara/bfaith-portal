@@ -63,6 +63,8 @@
               <span class="hint" style="flex-basis:100%">小文字の英字・数字・- _ だけ (30 字まで)・大文字は使えません・使ったことのないコード · 打つとその場で確かめます</span></div></div>
           <div class="f" data-row="name"><label class="lab" for="f-name">名前<span class="req">必須</span></label>
             <div class="ctl"><input class="in w-l" id="f-name" maxlength="255" autocomplete="off" data-field="name" data-dirty-field="name" data-label="名前" placeholder="例: 北海道産 小豆 こしあん 500g"<%= dis %>><span class="hint">資材の印 (_白ビ袋 など) は付けない</span></div></div>
+          <%# 0061: 色違い・サイズ違いの代表 (単品だけ・あれば)。NE 登録の CSV の代表商品コードに入る %>
+          <% if (!isSet && page.regParentReady) { %><%- include('_variant-parent', { vp: { mode: 'new', can: canSave, current: null, self: null } }) %><% } %>
         </section>
 
         <% if (isSet) { %>
@@ -227,5 +229,6 @@
   </div>
   <%- include('_footer') %>
   <% if (page) { %><script src="<%= base %>/public/me-new.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && !isSet && page.regParentReady) { %><script src="<%= base %>/public/me-variant.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>
