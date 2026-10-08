@@ -433,6 +433,20 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
   (widen は鍵を取った後に fba.db を読んで続けて Company DB を読む = 鍵を待つ間に fba.db が変わっても見落とさない・#1651 Codex R4 High)
   (`sheet_only_has_components` / `AMAZON_MAP_SHEET_ONLY_HAS_COMPONENTS`・fba.db が読めない = 通さない)。人が見て決めてから widen。
   Amazon の構成 (`listing_components.amazon`) を company にする **activate (frozen の道) は断る** = widen の道だけ (`master-ownership-epoch.mjs`)
+- **残る危なさ (受け入れ・中原さん 2026-10-08 = a 人の手順で防ぐ・#1651 Codex R5 High)**: widen が鍵の後に fba.db を読み直してから commit するまでの一瞬に、
+  FBA の Sheet の写し (fba.db の `sku_mapping`) が更新され、**かつ** 新しく Sheet にだけある SKU になった出品に Company DB の構成がある、が同時に起きたときだけ見落とす
+  (読み手は fba.db の書き手のファイルの鍵 `fba.db.lockdb` に参加していない)。受け入れる理由 = Sheet は FBA の対応に使っていない (`FBA_SKU_MAPPING_SOURCE=mirror`)・今の本番では該当 0 行
+- **切替の日 (Amazon を足す widen) の手順に足す 2 つ** (上の残る危なさを人の手順で防ぐ):
+  ① **widen は、FBA の Sheet の写しが書かれる時間を避けて昼に流す**。`sku_mapping` の行を足す / 消すのは `syncSkuMappings` (`apps/fba-replenishment/sheets-sync.js` → `db.js` の INSERT) だけで、呼ぶのは
+     (a) Render の毎朝 06:00 JST の cron (`apps/fba-replenishment/router.js`・台帳 `fba-daily-sync`・Render だけ = Render の fba.db) /
+     (b) FBA 補充の画面の「SKUマッピング同期」ボタン (`POST /api/sync-sku-mappings`) / (c) miniPC の `POST /service-api/fba/sync-sku-mappings` (手の口・定期の呼び手は無い)。
+     FNSKU の更新 (`db.js` の `UPDATE sku_mapping SET fnsku`) は今ある行を直すだけ = Sheet にだけある SKU は増えない。Sheet なしのモード (`FBA_SHEETLESS_IO=1`) では (b)(c) は 410。
+     → 06:00 の前後と夜間ロードの時間を避け、widen の間は (b)(c) を押さない
+  ② **widen のすぐ後に、Sheet にだけある出品 (対応・墓標なし) に Company DB の構成が無いかをもう一度確かめる** (残っていたら人が止めて片付ける)。miniPC のリポジトリ直下の PowerShell で 1 行 (今ある読むだけの関数だけ・watcher で読む):
+     ```
+     node -r dotenv/config --input-type=module -e "const M=await import('./lib/amazon-map-migrate.mjs');const {openPgClient,pgAdapter}=await import('./scripts/company-db/migrate.mjs');const d=process.env.DATA_DIR||'data';const s=M.readSheetOnlySkus(d+'/fba.db',M.readLegacyAmazonMaps(d+'/warehouse.db'));console.log('Sheet にだけある SKU: '+JSON.stringify(s));const c=await openPgClient(process.env.COMPANY_DB_WATCH_URL);const r=await M.sheetOnlyComponents(pgAdapter(c),s);console.log('その出品の構成: '+r.length+' 行 '+JSON.stringify(r));await c.end()"
+     ```
+     「その出品の構成: 0 行」なら良い。1 行以上 = 人が見て決める (持ち主はもう company = 夜間ロードは消さない)
 - 同じ構成の行は時刻 (created_at / updated_at) だけそろえる = 変更の記録・出品の version を増やさない (0049 の印を増やさない)。FBM の完全一致など古い表に無い行は消す
 - ⑦-2 (写し・世代・FBA の Sheet 無し・台帳) と ⑥ (段階の戻す道) はこの PR に無い
 
