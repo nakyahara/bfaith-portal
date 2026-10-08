@@ -990,8 +990,10 @@ await ta('[G-0064] 大文字のコード (0064): ops.new_sku_code_problem・ops.
       "    if v_sku.code !~ '^[A-Za-z0-9_-]{1,30}$' then raise exception 'not_ready: % は新しいコードの形でない', v_sku.code using errcode = 'P0001'; end if;",
       '-- 🆕 0064: 大文字も (CSV には打ったとおりの書き方'],
   ]) {
-    // 元にする版 = 0058 (0058 と 0064 の間に作り直していない)。0064 の後の作り直し (0065 = #1664) は 0064 の版から写す = その試験 (test-master-reg-csv.mjs [V2]) が差を確かめる
-    for (const file of files.filter((x) => x.slice(0, 4) > '0058' && x.slice(0, 4) < '0064')) {
+    // 元にする版 = 0058 (0058 の後に作り直したのは 0064 だけ)。例外は名指しの 1 つだけ: ops.ne_reg_build の 0065 (#1664) = 0064 の版から写す = その中身は
+    //   test-master-reg-csv.mjs の [V2] が 0064 との差で確かめる。ops.new_sku_code_problem は例外なし (後の作り直しは全部拒む)
+    const allowLater = head === 'create or replace function ops.ne_reg_build(' ? ['0065_ne_reg_csv_versions.sql'] : [];
+    for (const file of files.filter((x) => x.slice(0, 4) > '0058' && x.slice(0, 4) !== '0064' && !allowLater.includes(x))) {
       assert.ok(!re.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も ${head} を作り直している = 0064 の元にする定義を見直す`);
     }
     const a = fnOf('0058_master_widen.sql', head).split('\n'); const b = fnOf('0064_uppercase_new_codes.sql', head).split('\n');
@@ -1008,7 +1010,8 @@ await ta('[G-0064] 大文字のコード (0064): ops.new_sku_code_problem・ops.
   // 🆕 (#1667 Codex R1 High) 照合の確かめ ops.record_ne_registration_check = 0063 の本文 + NE の元の書き方を確かめる行だけ (0063 の後・0064 の外で作り直していない)
   {
     const head = 'create or replace function ops.record_ne_registration_check(';
-    for (const file of files.filter((x) => x.slice(0, 4) > '0063' && x.slice(0, 4) < '0064')) {
+    // 0063 の後に作り直したのは 0064 だけ。例外は名指しの 0065 (#1664・0064 の版から写す = test-master-reg-csv.mjs の [V2] が 0064 との差で確かめる)
+    for (const file of files.filter((x) => x.slice(0, 4) > '0063' && x.slice(0, 4) !== '0064' && x !== '0065_ne_reg_csv_versions.sql')) {
       assert.ok(!/function\s+ops\.record_ne_registration_check\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も照合の確かめを作り直している = 0064 の元にする定義を見直す`);
     }
     const a = fnOf('0063_ne_reg_auto_verify_issued.sql', head).split('\n'); const b = fnOf('0064_uppercase_new_codes.sql', head).split('\n');
