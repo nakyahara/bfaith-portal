@@ -87,6 +87,7 @@
           <form method="get" action="" class="row2">
             <% if (filters.q) { %><input type="hidden" name="q" value="<%= filters.q %>"><% } %>
             <% if (filters.sort) { %><input type="hidden" name="sort" value="<%= filters.sort %>"><% } %>
+            <% if (filters.dir) { %><input type="hidden" name="dir" value="<%= filters.dir %>"><% } %>
             <% if (filters.s) { %><input type="hidden" name="s" value="<%= filters.s %>"><% } else { for (const k of ADV_KEYS) { if (filters[k] && !['state'].includes(k)) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } } %>
             <label>区分 <select class="in" name="kind"><option value="">全部</option><% for (const [k, v] of Object.entries(KINDS)) { %><option value="<%= k %>"<%= filters.kind === k ? ' selected' : '' %>><%= v %></option><% } %></select></label>
             <label>状態 <select class="in" name="state"><option value="">全部</option><% for (const [k, v] of Object.entries(STATES)) { %><option value="<%= k %>"<%= filters.state === k ? ' selected' : '' %>><%= k === 'available' ? '取扱中' : v %></option><% } %></select></label>
@@ -106,7 +107,7 @@
           <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>詳細検索 (商品コードを複数・JAN・仕入先・代表・名前・原価・売価・登録日・在庫・注文残)<% if (advOn) { %> <span class="b info">使っている</span><% } %></summary>
           <%# 長い条件 (商品コード 500 件など) は画面の JS が POST api/search で印にして ?s=<印> で開く (GET の URL は HTTP 431 になる)。JS が無いときは今までどおり GET %>
           <form method="get" action="" class="adv-grid" id="adv-form" data-api="api/search">
-            <% for (const k of ['q', 'missing', 'reg', 'card', 'diff', 'sort']) { if (filters[k]) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } %>
+            <% for (const k of ['q', 'missing', 'reg', 'card', 'diff', 'sort', 'dir']) { if (filters[k]) { %><input type="hidden" name="<%= k %>" value="<%= filters[k] %>"><% } } %>
             <label class="adv-codes"><span class="lab">商品コード (複数)</span>
               <textarea class="in" name="codes" id="adv-codes" rows="5" spellcheck="false" placeholder="Excel の列をそのまま貼り付け&#10;(改行・カンマ・空白・タブで区切る)&#10;ぴったり当てる · 大文字小文字・全角半角は同じ"><%= filters.codes %></textarea>
               <span class="hint"><%= MULTI_MAX %> 件まで · 見つからないコードは一覧の上に出ます</span></label>
@@ -145,11 +146,31 @@
     <% if (data.notFound && data.notFound.length) { %><div class="callout warn" id="not-found" role="status"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= data.notFound.length %> 件 見つからない</div><div class="hint mono" style="color:var(--text2)"><%= data.notFound.slice(0, 60).join(', ') %><%= data.notFound.length > 60 ? ' ほか ' + (data.notFound.length - 60) + ' 件' : '' %></div></div></div><% } %>
     <% if (data.multiCut) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">複数の欄は <%= MULTI_MAX %> 件までを使いました (それより後は使っていません)</div></div><% } %>
 
+    <%
+      // ── 列 (10/8 PR1): 人ごとの列の設定 (出す列・並び) で描く。出さない列も描いて hidden にする (列の板で出し入れ・並べ替えを読み直しなしですぐ見せる・ちらつかない)。
+      //   注文残は発注アプリの利用権がある人だけ (無い人には列ごと描かない)。コードはいつも左端 (横に送っても残る)
+      const lv = listView || { ok: true, view: DEFAULT_VIEW, saved: false };
+      const colOrder = lv.view.order.filter((id) => !(poDenied && id === 'po'));
+      const colShown = new Set(lv.view.shown);
+      const COLS = Object.fromEntries(LIST_COLUMNS.map((c) => [c.id, c]));
+      const nShown = colOrder.filter((id) => colShown.has(id)).length;
+      // ── 並び (サーバーが全件で並べる)。見出しを押す = その列の昇順 / 今その列の昇順なら降順 ──
+      const sortCol = filters.sort || 'code';
+      const sortDesc = filters.dir === 'desc';
+      const canSort = (c) => !!c.sort && !(c.id === 'reg' && !data.registeredOnAvailable);
+      const sortHref = (id) => {
+        const toDesc = sortCol === id && !sortDesc;
+        return hrefWith({ sort: id === 'code' ? '' : id, dir: toDesc ? 'desc' : '' });
+      };
+      const curCol = COLS[sortCol];
+      const curWords = SORT_WORDS[curCol.sort] || SORT_WORDS.text;
+      const supShown = colShown.has('sup');
+    %>
     <div class="panel">
-      <div class="tbl-top">
-        <span><b><%= data.total.toLocaleString('ja-JP') %></b> 件</span><span class="dotsep" aria-hidden="true"></span>
-        <span>絞る欄で <span class="kbd">Enter</span> = 絞る · コードを押すか <span class="kbd">↑</span><span class="kbd">↓</span> で選んで <span class="kbd">Enter</span> で開く</span>
-        <% if (data.sorts) { %><span class="dotsep" aria-hidden="true"></span><span>並び <% for (const [k, v] of Object.entries(data.sorts)) { %><% if ((filters.sort || '') === k) { %><b aria-current="true"><%= v %></b><% } else if (k === 'reg_desc' && !data.registeredOnAvailable) { %><% } else { %><a href="<%= hrefWith({ sort: k }) %>"><%= v %></a><% } %> <% } %></span><% } %>
+      <div class="tbl-top" id="tbl-top">
+        <span><b><%= data.total.toLocaleString('ja-JP') %></b> 件</span>
+        <span class="sortnow" id="sortnow" title="並べるのは全部の件数 (このページだけではなく)。空の値は向きに関係なく最後・同じ値はコード順"><svg class="ic" aria-hidden="true"><use href="#<%= sortDesc ? 'i-sortdown' : 'i-sortup' %>"/></svg>並び: <b><%= curCol.label %></b> <%= curWords[sortDesc ? 1 : 0] %></span>
+        <span class="keys">見出しを押すと並び替え · 絞る欄で <span class="kbd">Enter</span> = 絞る · コードを押すか <span class="kbd">↑</span><span class="kbd">↓</span> で選んで <span class="kbd">Enter</span> で開く</span>
         <span class="right">
           <%
             // 絞った一覧の全件 (ページ分けに関係なく) = 今の絞り込み (札・絞る欄・詳細検索の印 ?s=・並び) のまま。上限 = exportMax 件
@@ -161,12 +182,25 @@
           <button type="button" class="btn sm ghost" id="copy-all" data-url="api/codes<%= qsTail %>" data-n="<%= data.total %>"<%= overMax ? ' disabled' : '' %> title="<%= exTitle || '絞った一覧の商品コードを全部 (ページに関係なく・1 行 1 つ) コピー' %>"><svg class="ic s" aria-hidden="true"><use href="#i-copy"/></svg>コードを全部コピー (<%= data.total.toLocaleString('ja-JP') %> 件)</button>
           <% if (overMax) { %><span class="btn sm ghost" id="csv-link" aria-disabled="true" title="<%= exTitle %>"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>CSV</span><% } else { %><a class="btn sm ghost" id="csv-link" href="list.csv<%= qsTail %>" download title="絞った一覧を全部 (ページに関係なく) CSV で (Excel で開ける・UTF-8)"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>CSV (<%= data.total.toLocaleString('ja-JP') %> 件)</a><% } %>
           <% } %>
-          <span><span class="fx">計算</span> = 構成品から計算した値 · <span class="fx warnx">仮</span> = 税率か送料が未入力のまま計算した利益</span>
+          <button type="button" class="btn sm colbtn" id="colbtn" aria-haspopup="dialog" aria-expanded="false" aria-controls="colpanel" title="一覧に出す列を選ぶ・並べ替える (<%= displayName || username %> さんの設定・会社と家の PC で同じ)"><svg class="ic s" aria-hidden="true"><use href="#i-cols"/></svg>列 <span class="cnt" id="colcnt"><%= nShown %>/<%= colOrder.length %></span></button>
+          <span id="fx-legend"><span class="fx">計算</span> = 構成品から計算した値 · <span class="fx warnx">仮</span> = 税率か送料が未入力のまま計算した利益</span>
         </span>
+        <div class="colpanel" id="colpanel" role="dialog" aria-labelledby="cp-title" hidden>
+          <div class="cp-h"><svg class="ic" aria-hidden="true"><use href="#i-cols"/></svg><h3 id="cp-title">一覧に出す列</h3><button class="iconbtn close" type="button" id="cp-x" aria-label="閉じる (Esc)"><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg></button></div>
+          <div class="cp-sub">チェックで出す・出さない · つまみ ⋮⋮ を動かすか ↑↓ で並べ替え。表はすぐ変わります (保存するまではこの画面だけ)。</div>
+          <ul class="collist" id="collist" aria-label="列"></ul>
+          <div class="cp-who"><span class="avatar" aria-hidden="true"><%= String(displayName || username || '?').trim().charAt(0) %></span><span><%= displayName || username %> さんの設定 · 会社の PC と家の PC で同じになります</span></div>
+          <% if (!lv.ok) { %><div class="cp-warn" id="cp-unreadable"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><%= lv.error %></div><% } %>
+          <div class="cp-foot">
+            <button type="button" class="btn sm ghost" id="cp-reset"><svg class="ic s" aria-hidden="true"><use href="#i-undo"/></svg>初期に戻す</button>
+            <span class="sp"></span>
+            <button type="button" class="btn sm pri" id="cp-save"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>この列で保存</button>
+          </div>
+        </div>
       </div>
-      <div class="tblwrap">
-        <table class="tbl click" id="list-tbl">
-          <caption class="sr">商品・セットの一覧 (<%= data.total %> 件)</caption>
+      <div class="tblwrap" id="tblwrap">
+        <table class="tbl click<%= supShown ? ' show-sup' : '' %>" id="list-tbl">
+          <caption class="sr">商品・セットの一覧 (<%= data.total %> 件・並び: <%= curCol.label %> <%= curWords[sortDesc ? 1 : 0] %>)</caption>
           <%
             const st = extras && extras.stock, bo = extras && extras.backorders;
             const stSub = !st || !st.ok ? '読めない' : (st.stale ? '古い ' : '') + ui.fmtJst(st.asOf, { nowMs }).replace(/^.*\) /, '');
@@ -186,37 +220,68 @@
               : '売れた数 (7 日 / 30 日) · ' + ui.fmtDay(sa.asOf) + ' まで (7 日 = ' + ui.fmtDay(sa.from7).replace(/ \(.\)$/, '') + '〜・30 日 = ' + ui.fmtDay(sa.from30).replace(/ \(.\)$/, '') + '〜・今日は入れない)'
                 + (sa.stale ? ' (前日までの数になっていない = 古い)' : '')
                 + ' · 参考 · 商品管理リスト・発注アプリと同じ数 (注文日・キャンセルを除く・全部のモール = NE の受注 + Amazon FBA) · セットで売れた分は構成品の数に入る';
+            // 見出しの材料 (列ごと): 下の小さい字・class・title
+            const refCls = (r) => (!r || !r.ok ? ' bad' : r.stale ? ' stale' : '');
+            const headOf = {
+              profit: { title: '1 個あたりの参考の利益 = 売価 − 手数料 (売価の ' + Math.round(PF.PLATFORM_FEE_RATES.standard * 1000) / 10 + '%) − 原価 × (1 + 税率) − 送料 (自社の計算用)。モールごとの手数料・送料の違いは入れていません' },
+              stock: { sub: stSub, cls: refCls(st), title: stTitle },
+              sup: { title: '代表の仕入先 (セットは構成品の仕入先)' },
+              fba: { sub: fbSub, cls: refCls(fb), title: fbTitle },
+              sold: { sub: saSub, cls: refCls(sa), title: saTitle },
+              po: { sub: !bo || !bo.ok ? '読めない' : '発注', cls: !bo || !bo.ok ? ' bad' : '', title: !bo || !bo.ok ? '発注アプリの台帳を読めない' : '発注アプリの注文残 (発注したがまだ入庫していない数)' },
+            };
           %>
-          <thead><tr><th scope="col" style="width:130px">コード</th><th scope="col" style="min-width:260px">名前</th><th scope="col" style="width:74px" id="th-kind">区分</th><th scope="col" style="width:150px">状態</th><th scope="col" style="width:96px">登録日</th><th scope="col" class="n" style="width:84px">売価</th><th scope="col" class="n" style="width:112px">原価</th><th scope="col" class="n" style="width:74px">税</th><th scope="col" class="n" style="width:92px" id="th-profit" title="1 個あたりの参考の利益 = 売価 − 手数料 (売価の <%= Math.round(PF.PLATFORM_FEE_RATES.standard * 1000) / 10 %>%) − 原価 × (1 + 税率) − 送料 (自社の計算用)。モールごとの手数料・送料の違いは入れていません">利益<span class="thsub">1 個・参考</span></th><th scope="col" class="n" style="width:74px" id="th-profit-rate">利益率</th><th scope="col" style="width:120px">売上分類</th><th scope="col" class="n ref<%= !st || !st.ok ? ' bad' : st.stale ? ' stale' : '' %>" style="width:86px" title="<%= stTitle %>" id="th-stock">在庫<span class="thsub"><%= stSub %></span></th><th scope="col" class="n ref<%= !fb || !fb.ok ? ' bad' : fb.stale ? ' stale' : '' %>" style="width:92px" title="<%= fbTitle %>" id="th-fba">FBA (JP)<span class="thsub"><%= fbSub %></span></th><th scope="col" class="n ref<%= !sa || !sa.ok ? ' bad' : sa.stale ? ' stale' : '' %>" style="width:96px" title="<%= saTitle %>" id="th-sales">売れた 7日/30日<span class="thsub"><%= saSub %></span></th><% if (!poDenied) { %><th scope="col" class="n ref<%= !bo || !bo.ok ? ' bad' : '' %>" style="width:76px" title="<%= !bo || !bo.ok ? '発注アプリの台帳を読めない' : '発注アプリの注文残 (発注したがまだ入庫していない数)' %>">注文残<span class="thsub"><%= !bo || !bo.ok ? '読めない' : '発注' %></span></th><% } %><th scope="col" style="width:150px">対応が必要</th></tr></thead>
+          <thead><tr><% for (const id of colOrder) {
+            const c = COLS[id]; const h = headOf[id] || {};
+            const cls = [c.num ? 'n' : '', c.ref ? 'ref' + (h.cls || '') : '', id === 'code' ? 'c-code' : '', canSort(c) ? 'sortable' : ''].filter(Boolean).join(' ');
+            const sub = h.sub != null ? h.sub : c.sub;
+            const on = canSort(c) && sortCol === id;
+            const words = SORT_WORDS[c.sort] || SORT_WORDS.text;
+            const nextWord = on && !sortDesc ? words[1] : words[0];
+          %><th scope="col"<%- cls ? ' class="' + cls + '"' : '' %> style="<%= c.width %>"<% if (h.title) { %> title="<%= h.title %>"<% } %> data-c="<%= id %>"<%- colShown.has(id) ? '' : ' hidden' %><%- on ? ' aria-sort="' + (sortDesc ? 'descending' : 'ascending') + '"' : '' %><%- c.th ? ' id="' + c.th + '"' : '' %>><% if (canSort(c)) { %><a class="sorth" href="<%= sortHref(id) %>" title="押すと <%= c.label %>の<%= nextWord %> (全件で並べ替え)<%= h.title ? ' · ' + h.title : '' %>"><% if (c.num) { %><svg class="ic arr" aria-hidden="true"><use href="#<%= on && sortDesc ? 'i-sortdown' : 'i-sortup' %>"/></svg><% } %><span class="lbl"><%= c.label %><% if (c.isNew) { %> <span class="newtag" aria-hidden="true">新</span><% } %><% if (sub) { %><span class="thsub"><%= sub %></span><% } %></span><% if (!c.num) { %><svg class="ic arr" aria-hidden="true"><use href="#<%= on && sortDesc ? 'i-sortdown' : 'i-sortup' %>"/></svg><% } %></a><% } else { %><%= c.label %><% if (sub) { %><span class="thsub"><%= sub %></span><% } %><% } %></th><% } %></tr></thead>
           <tbody>
-            <% if (!data.rows.length) { %><tr><td colspan="<%= poDenied ? 15 : 16 %>" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
+            <% if (!data.rows.length) { %><tr><td colspan="<%= colOrder.length %>" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
             <% for (const r of data.rows) { const isSet = r.kind === 'set'; %>
             <tr>
-              <td data-col="code"><span class="codecell"><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a><button type="button" class="copybtn" data-copy="<%= r.code %>" aria-label="商品コード <%= r.code %> をコピー" title="コピー"><svg class="ic s" aria-hidden="true"><use href="#i-copy"/></svg></button></span></td>
-              <td><span class="nm"><%= r.name %></span><span class="sub"><% if (isSet) { %><% } else if (r.kind === 'exception') { %>例外の SKU (NE に無い)<% } else { %><%= r.primary_supplier ? '仕入先 ' + r.primary_supplier : '代表の仕入先なし' %><% } %></span></td>
-              <td data-col="kind"><% if (isSet) { %><span class="b info kind">セット</span><span class="sub kindn" title="構成品の数"><svg class="ic s" aria-hidden="true" style="vertical-align:-2px"><use href="#i-box"/></svg> <%= r.comp_count %> 品</span><% } else if (r.kind === 'exception') { %><span class="b warn kind">例外</span><% } else { %><span class="b mute kind">単品</span><% } %></td>
-              <td>
+              <% for (const id of colOrder) { const hide = colShown.has(id) ? '' : ' hidden'; %>
+              <% if (id === 'code') { %><td class="c-code" data-col="code"><span class="codecell"><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a><button type="button" class="copybtn" data-copy="<%= r.code %>" aria-label="商品コード <%= r.code %> をコピー" title="コピー"><svg class="ic s" aria-hidden="true"><use href="#i-copy"/></svg></button></span></td>
+              <% } else if (id === 'name') { %><td data-col="name"<%= hide %>><span class="nm"><%= r.name %></span><% if (isSet) { %><% } else if (r.kind === 'exception') { %><span class="sub">例外の SKU (NE に無い)</span><% } else { %><span class="sub sup-sub"><%= r.primary_supplier ? '仕入先 ' + r.primary_supplier : '代表の仕入先なし' %></span><% } %></td>
+              <% } else if (id === 'kind') { %><td data-col="kind"<%= hide %>><% if (isSet) { %><span class="b info kind">セット</span><span class="sub kindn" title="構成品の数"><svg class="ic s" aria-hidden="true" style="vertical-align:-2px"><use href="#i-box"/></svg> <%= r.comp_count %> 品</span><% } else if (r.kind === 'exception') { %><span class="b warn kind">例外</span><% } else { %><span class="b mute kind">単品</span><% } %></td>
+              <% } else if (id === 'state') { %><td data-col="state"<%= hide %>>
                 <% if (r.state === 'discontinued') { %><span class="b mute">中止</span><% } else { %><span class="b ok"><span class="dot" aria-hidden="true"></span>取扱中</span><% } %>
                 <% if (r.reg_state !== 'none' && r.reg_state !== 'available') { %><span class="b <%= REG_BADGE[r.reg_state] || 'mute' %>" style="margin-top:4px"><%= REG_STATES[r.reg_state] || r.reg_state %></span><% } %>
               </td>
-              <td class="muted"<%- r.registered_on_source ? ' title="' + (REGISTERED_ON_SOURCES_LABEL[r.registered_on_source] || r.registered_on_source) + '"' : '' %>><%= r.registered_on ? r.registered_on.replace(/-/g, '/') : '—' %></td>
-              <td class="n"><%= fmt.yen(r.standard_price) %></td>
-              <td class="n"><% if (r.cost == null) { %><span class="b err">未入力</span><% } else { %><%= fmt.yen(r.cost) %><% if (r.cost_derived) { %><span class="fx">計算</span><% } %><% } %></td>
-              <td class="n"><% if (r.tax_rate == null) { %><span class="b warn">未入力</span><% } else { %><%= fmt.tax(r.tax_rate) %>%<% if (r.tax_derived) { %><span class="fx">計算</span><% } %><% } %></td>
-              <% const pd = r.profit_detail; const pnote = PF.profitNoteWords(r.profit_notes); %>
-              <td class="n" data-col="profit"><% if (r.profit == null) { %><span class="muted" title="<%= r.profit_reason %>">—</span><% } else { %><span class="pf<%= r.profit < 0 ? ' neg' : '' %>" title="<%= PF.profitLine(pd) %><%= pnote.length ? ' · ' + pnote.join(' · ') : '' %>"><%= PF.fmtProfitYen(r.profit) %></span><% if (pnote.length) { %><span class="fx warnx" title="<%= pnote.join(' · ') %>">仮</span><% } %><% } %></td>
-              <td class="n" data-col="profit-rate"><% if (r.profit_rate == null) { %><span class="muted">—</span><% } else { %><span class="pf<%= r.profit_rate < 0 ? ' neg' : '' %>"><%= PF.fmtProfitRate(r.profit_rate) %></span><% } %></td>
-              <td><% if (r.sales_class == null) { %><% if (r.kind !== 'exception') { %><span class="b warn">未入力</span><% } %><% } else { %><%= SALES[r.sales_class] || r.sales_class %><% if (r.sales_derived) { %><span class="fx">計算</span><% } %><% } %></td>
-              <td class="n ref" data-col="stock"><% if (isSet) { %><% if (r.buildable != null) { %><span title="構成品の在庫から作れる数 (参考)"><%= r.buildable.toLocaleString('ja-JP') %></span><span class="fx">作れる</span><% } %><% } else if (r.stock != null) { %><%= r.stock ? r.stock.toLocaleString('ja-JP') : '0' %><% } else { %><span class="muted">—</span><% } %></td>
-              <td class="n ref" data-col="fba"><% if (r.fba != null) { %><%= r.fba.toLocaleString('ja-JP') %><% if (!r.fba_row) { %><span class="fx" title="その日の FBA のレポートに、この SKU 1 個だけの出品の行が無い (販売可能 0 と数える)">出品なし</span><% } %><% } else { %><span class="muted">—</span><% } %></td>
-              <td class="n ref" data-col="sales"><% const sq = r.sales; if (sq && !sq.missing && !isSet) { %><span title="7 日 <%= sq.d7.toLocaleString('ja-JP') %> (FBA <%= sq.d7fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d7other.toLocaleString('ja-JP') %>) / 30 日 <%= sq.d30.toLocaleString('ja-JP') %> (FBA <%= sq.d30fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d30other.toLocaleString('ja-JP') %>)"><%= sq.d7.toLocaleString('ja-JP') %> / <%= sq.d30.toLocaleString('ja-JP') %></span><% } else if (sq && isSet) { %><span class="muted" title="セットで売れた分は構成品の数に入る (商品管理リスト・発注アプリと同じ数え方)">—</span><% } else if (sq) { %><span class="muted" title="商品管理リストに無い商品 (NE にまだ無いなど)">—</span><% } else { %><span class="muted">—</span><% } %></td>
-              <% if (!poDenied) { %><td class="n ref" data-col="po"><% if (r.backorder) { %><%= r.backorder.toLocaleString('ja-JP') %><% } else if (r.backorder == null) { %><span class="muted">—</span><% } %></td><% } %>
-              <td><div class="flags"><% for (const f of r.flags) { %><span class="b <%= FLAG_BADGE[f] || 'mute' %>"><%= f %></span><% } %></div></td>
+              <% } else if (id === 'reg') { %><td class="muted" data-col="reg"<%= hide %><%- r.registered_on_source ? ' title="' + (REGISTERED_ON_SOURCES_LABEL[r.registered_on_source] || r.registered_on_source) + '"' : '' %>><%= r.registered_on ? r.registered_on.replace(/-/g, '/') : '—' %></td>
+              <% } else if (id === 'price') { %><td class="n" data-col="price"<%= hide %>><%= fmt.yen(r.standard_price) %></td>
+              <% } else if (id === 'cost') { %><td class="n" data-col="cost"<%= hide %>><% if (r.cost == null) { %><span class="b err">未入力</span><% } else { %><%= fmt.yen(r.cost) %><% if (r.cost_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <% } else if (id === 'tax') { %><td class="n" data-col="tax"<%= hide %>><% if (r.tax_rate == null) { %><span class="b warn">未入力</span><% } else { %><%= fmt.tax(r.tax_rate) %>%<% if (r.tax_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <% } else if (id === 'profit') { const pd = r.profit_detail; const pnote = PF.profitNoteWords(r.profit_notes); %><td class="n" data-col="profit"<%= hide %>><% if (r.profit == null) { %><span class="muted" title="<%= r.profit_reason %>">—</span><% } else { %><span class="pf<%= r.profit < 0 ? ' neg' : '' %>" title="<%= PF.profitLine(pd) %><%= pnote.length ? ' · ' + pnote.join(' · ') : '' %>"><%= PF.fmtProfitYen(r.profit) %></span><% if (pnote.length) { %><span class="fx warnx" title="<%= pnote.join(' · ') %>">仮</span><% } %><% } %></td>
+              <% } else if (id === 'rate') { %><td class="n" data-col="profit-rate"<%= hide %>><% if (r.profit_rate == null) { %><span class="muted">—</span><% } else { %><span class="pf<%= r.profit_rate < 0 ? ' neg' : '' %>"><%= PF.fmtProfitRate(r.profit_rate) %></span><% } %></td>
+              <% } else if (id === 'sales_class') { %><td data-col="sales_class"<%= hide %>><% if (r.sales_class == null) { %><% if (r.kind !== 'exception') { %><span class="b warn">未入力</span><% } %><% } else { %><%= SALES[r.sales_class] || r.sales_class %><% if (r.sales_derived) { %><span class="fx">計算</span><% } %><% } %></td>
+              <% } else if (id === 'stock') { %><td class="n ref" data-col="stock"<%= hide %>><% if (isSet) { %><% if (r.buildable != null) { %><span title="構成品の在庫から作れる数 (参考)"><%= r.buildable.toLocaleString('ja-JP') %></span><span class="fx">作れる</span><% } %><% } else if (r.stock != null) { %><%= r.stock ? r.stock.toLocaleString('ja-JP') : '0' %><% } else { %><span class="muted">—</span><% } %></td>
+              <% } else if (id === 'sup') { %><td data-col="sup"<%= hide %>><% if (isSet) { %><span class="muted" title="セットの仕入先は構成品の仕入先">構成品から</span><% } else if (r.primary_supplier) { %><span class="supc mono"><%= r.primary_supplier %></span> <%= r.primary_supplier_name || '' %><% } else { %><span class="muted"<%- r.kind === 'exception' ? '' : ' title="代表の仕入先なし"' %>>—</span><% } %></td>
+              <% } else if (id === 'fba') { %><td class="n ref" data-col="fba"<%= hide %>><% if (r.fba != null) { %><%= r.fba.toLocaleString('ja-JP') %><% if (!r.fba_row) { %><span class="fx" title="その日の FBA のレポートに、この SKU 1 個だけの出品の行が無い (販売可能 0 と数える)">出品なし</span><% } %><% } else { %><span class="muted">—</span><% } %></td>
+              <% } else if (id === 'sold') { %><td class="n ref" data-col="sales"<%= hide %>><% const sq = r.sales; if (sq && !sq.missing && !isSet) { %><span title="7 日 <%= sq.d7.toLocaleString('ja-JP') %> (FBA <%= sq.d7fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d7other.toLocaleString('ja-JP') %>) / 30 日 <%= sq.d30.toLocaleString('ja-JP') %> (FBA <%= sq.d30fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d30other.toLocaleString('ja-JP') %>)"><%= sq.d7.toLocaleString('ja-JP') %> / <%= sq.d30.toLocaleString('ja-JP') %></span><% } else if (sq && isSet) { %><span class="muted" title="セットで売れた分は構成品の数に入る (商品管理リスト・発注アプリと同じ数え方)">—</span><% } else if (sq) { %><span class="muted" title="商品管理リストに無い商品 (NE にまだ無いなど)">—</span><% } else { %><span class="muted">—</span><% } %></td>
+              <% } else if (id === 'po') { %><td class="n ref" data-col="po"<%= hide %>><% if (r.backorder) { %><%= r.backorder.toLocaleString('ja-JP') %><% } else if (r.backorder == null) { %><span class="muted">—</span><% } %></td>
+              <% } else if (id === 'flags') { %><td data-col="flags"<%= hide %>><div class="flags"><% for (const f of r.flags) { %><span class="b <%= FLAG_BADGE[f] || 'mute' %>"><%= f %></span><% } %></div></td>
+              <% } %>
+              <% } %>
             </tr>
             <% } %>
           </tbody>
         </table>
       </div>
+      <%
+        // 列の板 (public/me-list.js) に渡す値: 列の名前・今の設定・いつもの列・保存してあるか
+        const cfg = {
+          columns: colOrder.map((id) => ({ id, cell: COLS[id].cell, label: COLS[id].label, fixed: !!COLS[id].fixed, sortable: canSort(COLS[id]), isNew: !!COLS[id].isNew })),
+          // 設定は全部の列のまま渡す (注文残を出せない人も、注文残の出す・出さないを保存し直しで消さない)。板に出すのは columns の列だけ
+          view: { order: [...lv.view.order], shown: [...lv.view.shown] },
+          defaultView: { order: [...DEFAULT_VIEW.order], shown: [...DEFAULT_VIEW.shown] },
+          saved: !!lv.saved, readable: !!lv.ok, who: displayName || username || '',
+        };
+      %>
+      <script type="application/json" id="me-list-cfg"><%- JSON.stringify(cfg).replace(/</g, '\\u003c') %></script>
       <div class="pager">
         <% if (data.offset > 0) { %><a class="btn sm" href="<%= pageHref(Math.max(0, data.offset - data.limit)) %>">← 前の <%= data.limit %> 件</a><% } %>
         <% if (data.total) { %><span><%= (data.offset + 1).toLocaleString('ja-JP') %>〜<%= (data.offset + data.rows.length).toLocaleString('ja-JP') %> 件目</span><% } %>
@@ -226,5 +291,6 @@
     <p class="hint">登録の札 = 新商品の登録の進み (札が無い = 登録済み・切替の前からある商品)。Amazon SKU の対応は左の「Amazon SKU」で見ます。</p>
   </div>
   <%- include('_footer') %>
+  <script src="<%= base %>/public/me-list.js?v=<%= assetV %>" defer></script>
 </body>
 </html>

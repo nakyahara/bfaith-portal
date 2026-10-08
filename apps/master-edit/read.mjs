@@ -20,7 +20,8 @@ import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs
 import { latestRun } from '../master-decisions/decide.mjs';
 import { readCardEvent } from '../../lib/product-hub-outbox.mjs';
 import { regItemsOfSku } from '../../lib/master-reg-csv.mjs';
-import { hasRegisteredOn, LIST_SORTS, listOrderBy, parseNeCreationDate, REGISTERED_ON_SOURCES } from '../../lib/sku-registered-on.mjs';
+import { hasRegisteredOn, parseNeCreationDate, REGISTERED_ON_SOURCES } from '../../lib/sku-registered-on.mjs';
+import { normalizeSort, sortColumnOf } from './list-columns.mjs';
 import { masterProfit } from '../../lib/profit-estimate.js';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
@@ -45,13 +46,32 @@ const KNOWN_COST = new Set(['COMPLETE', 'OVERRIDDEN']);
 const num = (v) => (v == null ? null : Number(v));
 
 /**
- * 利益 (1 個あたり・参考) の並び (10/6 中原さん「利益の計算も入れてほしい」)。並びの SQL (listOrderBy) はコード順のまま読み、
- * 絞った全件の利益を lib/profit-estimate.js の masterProfit (= price-update と同じ estimateGross) で出して JS で並べる (式を SQL に 2 つ目として書かない)。
- * 計算できない商品 (原価・売価が無い) は最後 (その中はコード順)
+ * 一覧の並び (10/8 PR1「見出しを押して並び替え」)。URL = ?sort=<列の id>&dir=asc|desc (list-columns.mjs)。並べるのはサーバー (ページ分けの前・全件で)。
+ *   SQL で並べる列 = 下の SQL_SORTS (式は決まった文字だけ = 人の入力を SQL に入れない)。
+ *   JS で並べる列 = JS_SORTS: 利益・利益率 (lib/profit-estimate.js の masterProfit = 式を SQL に 2 つ目として書かない)・売上分類 (セットは構成品から導く)・
+ *     在庫 (ロジザードの写し・セットは作れる数)。SQL はコード順で読み、絞った全件の値を出して並べ直す (同じ値・空はコード順のまま)。
+ *   空 (分からない・計算できない) は向きに関係なく最後・同じ値はコード順 (昇順)。FBA・売れた数・注文残・対応が必要は並べない (全件を読まないと並べられない)。
+ *   名前・仕入先は collate "C" (文字の番号の順 = DB の言語の設定に左右されない・どこで流しても同じ並び)
  */
-export const PROFIT_SORTS = Object.freeze({ profit_asc: '利益の少ない順', rate_asc: '利益率の低い順' });
-export const SORTS = Object.freeze({ ...LIST_SORTS, ...PROFIT_SORTS });
-const isProfitSort = (sort) => Object.prototype.hasOwnProperty.call(PROFIT_SORTS, sort);
+const SQL_SORTS = Object.freeze({
+  name: 's.name collate "C"',
+  kind: "case s.sku_kind when 'single' then 0 when 'set' then 1 else 2 end",
+  state: "case when s.handling = 'discontinued' then 1 else 0 end",
+  reg: 's.registered_on',
+  price: 's.standard_price_jpy',
+  tax: 's.tax_rate',
+  cost: "case when c.cost_status in ('COMPLETE', 'OVERRIDDEN') then c.cost_jpy end",
+  sup: 'ps.code collate "C"',
+});
+const JS_SORTS = Object.freeze(['profit', 'rate', 'sales_class', 'stock']);
+/** ① の読みの ORDER BY (決まった式と向きだけ)。hasRegOn = 登録日の列がある DB (無い = コード順) */
+export function listOrderSql(sort, dir, { hasRegOn = true } = {}) {
+  const d = dir === 'desc' ? 'desc' : 'asc';
+  const col = sortColumnOf(sort);
+  if (col === 'code') return `s.code_norm ${d}`;
+  if (!Object.prototype.hasOwnProperty.call(SQL_SORTS, col) || (col === 'reg' && !hasRegOn)) return 's.code_norm';
+  return `${SQL_SORTS[col]} ${d} nulls last, s.code_norm`;
+}
 /**
  * 一覧の行の利益 (1 個あたり・参考)。売価 = 標準売価 (税込)・原価 = その日の原価 (決まっている = COMPLETE / OVERRIDDEN だけ。足りないセットは「原価が未登録」)・
  * 税率 = SKU の税率 (セットは構成品から導いた値)・配送料 = 自社の計算用の送料 (shipping_cost_jpy)・手数料 = 売価の 10% (PLATFORM_FEE_RATES.standard)
@@ -103,7 +123,8 @@ export function normalizeFilters(q = {}) {
     reg: pick(String(q.reg ?? ''), REG_STATES),
     card: pick(String(q.card ?? ''), CARD_FILTERS),
     diff: q.diff === '1' ? '1' : '',
-    sort: pick(String(q.sort ?? ''), SORTS),   // 0057: '' = コード順 / reg_desc = 登録日の新しい順 (① の SQL の order by = ページ分けの前) / 利益の並び (10/6) = JS で並べる
+    // 並び (10/8 PR1): sort = 列の id ('' = コード)・dir = 'desc' か '' (昇順)。古い URL (reg_desc・kind・profit_asc・rate_asc) も読み替える。知らない列 = コード順
+    ...normalizeSort(q.sort, q.dir),
     // 詳細検索 (10/5 中原さん「NE の商品詳細検索のような」)。複数の欄は 1 行 1 つの文字に (URL に載る形)
     codes: multiText(q.codes), jans: multiText(q.jans), sups: multiText(q.sups), parents: multiText(q.parents),
     name: String(q.name ?? '').trim().slice(0, 200),   // POST の入口の上限 (SEARCH_VALUE_MAX.name = 200) と同じ (#1620 Codex R3 Low)
@@ -171,10 +192,11 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   if (f.missing === 'shipping') where.push('s.shipping_code is null');
   if (f.missing === 'reorder') where.push('s.reorder_months is null');
   let costCte = '';
-  const profitSort = isProfitSort(f.sort);
-  if (f.missing === 'cost' || f.cost_min || f.cost_max || profitSort) {
+  const jsSort = JS_SORTS.includes(f.sort) ? f.sort : null;
+  const profitSort = jsSort === 'profit' || jsSort === 'rate';
+  if (f.missing === 'cost' || f.cost_min || f.cost_max || profitSort || f.sort === 'cost') {
     params.push(today);
-    costCte = `with c as (${costTodaySql(params.length)}) `;
+    costCte = `c as (${costTodaySql(params.length)})`;
     if (f.missing === 'cost') where.push(`coalesce(c.cost_status not in ('COMPLETE', 'OVERRIDDEN'), true)`);
     // 原価の範囲 = 一覧に出す原価 (その日の原価で、決まっている = COMPLETE / OVERRIDDEN) だけ。未入力は範囲に入らない
     if (f.cost_min) { params.push(Number(f.cost_min)); where.push(`c.cost_status in ('COMPLETE', 'OVERRIDDEN') and c.cost_jpy >= $${params.length}`); }
@@ -274,13 +296,18 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   const jsFiltered = f.missing === 'sales' || !!f.sales || !!stockRange;
   const scanCap = mode === 'page' ? null : (jsFiltered ? Math.max(EXPORT_SCAN_MAX, max) : max) + 1;
   tick();
-  const keys = (await db.query(`${costCte}select s.sku_id::text as sku_id, s.code, s.sku_kind, s.set_sales_class_override, p.sales_class
+  // 仕入先の並び = 代表の仕入先のコード (一覧の「仕入先」の列・名前の下の字と同じ選び方 = 代表が 2 つあればコードの小さい方)
+  const supCte = f.sort === 'sup' ? `ps as (select distinct on (x.sku_id) x.sku_id, sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id
+       where x.is_primary order by x.sku_id, sp.code)` : '';
+  const ctes = [costCte, supCte].filter(Boolean);
+  const keys = (await db.query(`${ctes.length ? `with ${ctes.join(', ')} ` : ''}select s.sku_id::text as sku_id, s.code, s.code_norm, s.sku_kind, s.set_sales_class_override, p.sales_class
       ${profitSort ? ', s.standard_price_jpy::text as standard_price, s.tax_rate::text as tax_rate, s.shipping_cost_jpy::text as shipping_cost, c.cost_jpy::text as cost_jpy, c.cost_status' : ''}
       from core.skus s
       left join core.products p on p.product_id = s.product_id
       ${costCte ? 'left join c on c.sku_id = s.sku_id' : ''}
+      ${supCte ? 'left join ps on ps.sku_id = s.sku_id' : ''}
      where ${where.join(' and ')}
-     order by ${listOrderBy(f.sort, { alias: 's', hasColumn: hasRegOn })}${scanCap ? ` limit ${scanCap}` : ''}`, params)).rows;
+     order by ${jsSort ? 's.code_norm' : listOrderSql(f.sort, f.dir, { hasRegOn })}${scanCap ? ` limit ${scanCap}` : ''}`, params)).rows;
   tick();
   // 読みの上限に届いた = それ以上ある (JS で絞った後の数は分からない = 上限を超える扱い)
   if (scanCap && keys.length >= scanCap) return { tooMany: true, atLeast: true, total: keys.length - 1, max, filters: f, notFound, multiCut };
@@ -298,8 +325,8 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   const salesOf = (r, comp) => (r.sku_kind === 'set' ? deriveSetSalesClassCdb(r.set_sales_class_override, comp.get(r.sku_id) || []) : num(r.sales_class));
   let matched = keys;
   let compClasses = null;
-  // 売上分類の未入力・売上分類で絞る = セットは構成品から導く (保存していない) ので、絞った全部のセットを導いてから JS で絞る
-  if (f.missing === 'sales' || f.sales) {
+  // 売上分類の未入力・売上分類で絞る・売上分類で並べる = セットは構成品から導く (保存していない) ので、絞った全部のセットを導いてから JS で
+  if (f.missing === 'sales' || f.sales || jsSort === 'sales_class') {
     compClasses = await compClassesOf(keys.filter((r) => r.sku_kind === 'set').map((r) => r.sku_id));
     if (f.missing === 'sales') matched = matched.filter((r) => salesOf(r, compClasses) == null && r.sku_kind !== 'exception');
     if (f.sales) matched = matched.filter((r) => salesOf(r, compClasses) === Number(f.sales));
@@ -316,26 +343,37 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     return m;
   };
   let compsOf = null;
-  if (stockRange && extras.stock && extras.stock.ok) {
-    // セットは表示と同じ「作れる数」で範囲に入るか (作れる数が決まらない = 構成が無い は入れない)。ページ分けの前
+  if ((stockRange || jsSort === 'stock') && extras.stock && extras.stock.ok) {
+    // セットは表示と同じ「作れる数」で範囲に入るか (作れる数が決まらない = 構成が無い は入れない)・在庫で並べる。ページ分けの前
     compsOf = await compsOfSets(matched.filter((r) => r.sku_kind === 'set').map((r) => r.sku_id));
-    matched = matched.filter((r) => {
-      if (r.sku_kind !== 'set') return true;
-      const b = buildableOf(extras.stock, compsOf.get(r.sku_id));
-      return b != null && b >= stockRange.lo && b <= stockRange.hi;
-    });
+    if (stockRange) {
+      matched = matched.filter((r) => {
+        if (r.sku_kind !== 'set') return true;
+        const b = buildableOf(extras.stock, compsOf.get(r.sku_id));
+        return b != null && b >= stockRange.lo && b <= stockRange.hi;
+      });
+    }
   }
-  // 利益の並び (10/6): 絞った全件の利益を同じ関数で出して並べる (ページ分けの前・codes / all も同じ並び)。計算できない = 最後 (コード順のまま)
-  if (profitSort) {
-    const key = f.sort === 'rate_asc' ? 'rate' : 'profit';
-    const val = new Map(matched.map((r) => {
+  // JS で並べる列 (利益 10/6・売上分類・在庫 10/8): 絞った全件の値を一覧に出すのと同じ関数で出して並べる (ページ分けの前・codes / all も同じ並び)。
+  //   空 (計算できない・読めない) = 向きに関係なく最後・同じ値はコード順 (① の読みのコード順のまま = 安定した並べ替え)
+  if (jsSort) {
+    const profitOf = (r, key) => {
       const pr = rowProfit({ standard_price: num(r.standard_price), cost: KNOWN_COST.has(r.cost_status) ? Number(r.cost_jpy) : null, tax_rate: num(r.tax_rate), shipping_cost: num(r.shipping_cost) });
-      return [r.sku_id, pr.ok && Number.isFinite(pr[key]) ? pr[key] : null];
-    }));
+      return pr.ok && Number.isFinite(pr[key]) ? pr[key] : null;
+    };
+    const valueOf = {
+      profit: (r) => profitOf(r, 'profit'),
+      rate: (r) => profitOf(r, 'rate'),
+      sales_class: (r) => salesOf(r, compClasses),
+      // 在庫 = 一覧に出す値 (単品・例外 = そのコードの在庫・写しに無い = 0 / セット = 作れる数・構成が無い = 空)。読めない = 全部空 (= コード順)
+      stock: (r) => (!extras.stock || !extras.stock.ok ? null : r.sku_kind === 'set' ? buildableOf(extras.stock, compsOf && compsOf.get(r.sku_id)) : stockOf(extras.stock, r.code_norm)),
+    }[jsSort];
+    const sign = f.dir === 'desc' ? -1 : 1;
+    const val = new Map(matched.map((r) => { const v = valueOf(r); return [r.sku_id, v == null || !Number.isFinite(Number(v)) ? null : Number(v)]; }));
     matched = [...matched].sort((a, b) => {
       const x = val.get(a.sku_id); const y = val.get(b.sku_id);
       if (x == null || y == null) return (x == null) - (y == null);
-      return x - y;
+      return (x - y) * sign;
     });
   }
   tick();
@@ -425,7 +463,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
     ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
   tick();
-  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut, sorts: SORTS, registeredOnAvailable: hasRegOn };
+  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut, registeredOnAvailable: hasRegOn };
 }
 
 /**

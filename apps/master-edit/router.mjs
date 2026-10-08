@@ -10,7 +10,9 @@
  *     このコードが扱えない C のキーが active にある = 409 code_behind・読めない = 503。新商品・NE 登録の CSV の build / 未配布の issue は、さらに DB の開放の許可 (lease)・非常の止め MASTER_NEW_ENTRY_STOP)
  *    **かつ** env MASTER_EDIT_OPEN = 1 (Codex ⑤-R0 High 1・R1 H1)。どれかが欠ければ、名簿の人でも保存は 409「切替前」(lib/master-write.mjs)。
  *    MASTER_EDIT_ENABLED は画面を載せるだけ (見るだけ)
- *   GET  /                   一覧 (画面 A)。?q=&kind=&state=&missing=&diff=1&offset=
+ *   GET  /                   一覧 (画面 A)。?q=&kind=&state=&missing=&diff=1&offset=&sort=<列>&dir=asc|desc (並べるのはサーバー・全件で)
+ *   GET  /api/view-prefs     自分の列の設定 (出す列・並び) { ok, view, saved, default }
+ *   POST /api/view-prefs     自分の列の設定を保存 { order: [列], shown: [列] } (いつもの列と同じ = 消す)。鍵 = セッションのメール (人の名前は受けない)
  *   GET  /manual             つかいかた
  *   GET  /sku/:code          1 つの商品 (単品 = 画面 B / セット = 画面 C)
  *   GET  /sku/:code/history  変更の記録
@@ -56,6 +58,8 @@ import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
 import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError } from './read.mjs';
 import { buildListCsv, csvFileName } from './list-csv.mjs';
+import { LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, ViewPrefsInputError } from './list-columns.mjs';
+import { readViewPrefs, saveViewPrefs } from './view-prefs.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
@@ -387,7 +391,10 @@ router.get('/', (req, res) => {
     const data = db && !searchExpired ? await listSkus(db, filters, { now: new Date(clock()), extras }) : empty;
     const phase = await readPhaseView(db);
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max });
+    // 列の設定 (人ごと・Render の SQLite)。読めない = いつもの列 (一覧は出す)
+    const listView = await readViewPrefs(req.session?.email);
+    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max,
+      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW });
   });
 });
 /**
@@ -411,7 +418,7 @@ router.post('/api/search', (req, res) => {
   const f = normalizeFilters(b);
   const cond = Object.fromEntries(ADV_KEYS.filter((k) => f[k]).map((k) => [k, f[k]]));
   if (Buffer.byteLength(JSON.stringify(cond)) > SEARCH_COND_MAX_BYTES) return tooLarge(`検索の条件が大きすぎます (全部で ${SEARCH_COND_MAX_BYTES / 1024}KB まで。複数の欄を分けて検索してください)`);
-  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff', 'sort'].filter((k) => f[k]).map((k) => [k, f[k]]));
+  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff', 'sort', 'dir'].filter((k) => f[k]).map((k) => [k, f[k]]));
   const qs = new URLSearchParams({ ...rest, ...(Object.keys(cond).length ? { s: putSearch(cond, clock()) } : {}) }).toString();
   res.json({ ok: true, url: `${req.baseUrl}/${qs ? `?${qs}` : ''}` });
 });
@@ -451,11 +458,11 @@ router.get('/api/codes', (req, res) => {
   return withPgApi(res, async (db) => {
   const { filters, searchExpired, poOk } = listQuery(req);
   if (searchExpired) return res.status(410).json({ ok: false, error: '条件の期限が切れました。検索し直してください' });
-  // 在庫の範囲・注文残ありで絞っているときは、一覧と同じ参考の値で絞る (中身は読まない)
+  // 在庫の範囲・注文残ありで絞っている・在庫で並べているときは、一覧と同じ参考の値で絞る・並べる (中身は読まない)
   let data;
   const tdb = deadlineDb(db, deadline);
   try {
-    const extras = filters.stock_min || filters.stock_max || filters.po ? await listExtras(tdb, poOk, deadline) : {};
+    const extras = filters.stock_min || filters.stock_max || filters.po || filters.sort === 'stock' ? await listExtras(tdb, poOk, deadline) : {};
     data = await listSkus(tdb, filters, { now: new Date(clock()), extras, mode: 'codes', max: EXPORT_LIMITS.max, deadline });
   } catch (e) {
     // 接続の待ちのタイムアウトと同じ形 (reason = timeout。#1627 Codex R3 Low)
@@ -466,6 +473,26 @@ router.get('/api/codes', (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, codes: data.codes, total: data.total });
   }, 'read', { deadline });
+});
+/**
+ * 列の設定 (10/8 PR1・人ごと)。読み書きは自分の分だけ = 鍵はセッションのメール (本文・URL に人の名前を受けない)。
+ * 書くのは一覧を見られる人なら誰でも (自分の見え方だけ・Company DB には書かない)。POST は /api/ の守り (Origin が Host と同じ・JSON) を通る
+ */
+router.get('/api/view-prefs', async (req, res) => {
+  const r = await readViewPrefs(req.session?.email);
+  res.set('Cache-Control', 'no-store');
+  res.status(r.ok ? 200 : 503).json({ ok: r.ok, view: r.view, saved: r.saved, default: DEFAULT_VIEW, ...(r.ok ? {} : { error: r.error }) });
+});
+router.post('/api/view-prefs', async (req, res) => {
+  try {
+    const r = await saveViewPrefs(req.session?.email, req.body, { nowMs: clock() });
+    res.json({ ok: true, view: r.view, saved: r.saved });
+  } catch (e) {
+    if (e instanceof ViewPrefsInputError) return res.status(400).json({ ok: false, error: e.message, reason: 'invalid_input' });
+    if (e && e.status === 403) return res.status(403).json({ ok: false, error: e.message, reason: 'no_email' });
+    console.error(`[master-edit] 列の設定を保存できない: ${e && e.message}`);
+    res.status(503).json({ ok: false, error: '列の設定を保存できませんでした (置き場に書けない)。少し待ってからもう一度', reason: 'store_unavailable' });
+  }
 });
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), ui2: true, nav: 'manual', MAX_COMPONENTS }));
 
