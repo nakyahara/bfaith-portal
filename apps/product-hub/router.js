@@ -1466,13 +1466,15 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     if (materialVal && !MATERIAL_STATUS_CODES.has(materialVal)) {
       return res.status(400).json({ ok: false, error: '撮影・素材ステータスの値が不正です' });
     }
-    // 撮影判定で「撮影が要る」としたのに「撮影不要」で保存すると、撮影しないまま ③素材待ち を通れてしまう
-    // (古いタブからの保存も同じ)。撮影不要にするなら撮影判定のほうで選ばせる — Codex PR-A 名指し High
-    if (materialVal === 'not_required') {
-      const sm = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.shoot_mode;
-      if (sm === 'inhouse' || sm === 'photographer') {
-        return res.status(400).json({ ok: false, error: `撮影判定が「${sm === 'inhouse' ? '社内撮影' : 'カメラマン撮影'}」なので、撮影・素材ステータスを「撮影不要」にはできません。撮影が要らないなら、撮影判定で「撮影不要」を押してください (画面を読み直すと今の値が出ます)` });
-      }
+    // 撮影判定と食い違う素材ステータスは保存しない (古いタブからの保存も同じ)。変えたいなら撮影判定のほうで選ばせる
+    //   撮影が要る なのに「撮影不要」→ 撮影しないまま ③素材待ち を通れてしまう — Codex PR-A 名指し High
+    //   撮影不要 なのに「撮影不要 / 素材完了」以外 → 撮影不要と出ているのに ③ が閉じられない — Codex PR-A R2 P2
+    const sm = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.shoot_mode;
+    if ((sm === 'inhouse' || sm === 'photographer') && materialVal === 'not_required') {
+      return res.status(400).json({ ok: false, error: `撮影判定が「${sm === 'inhouse' ? '社内撮影' : 'カメラマン撮影'}」なので、撮影・素材ステータスを「撮影不要」にはできません。撮影が要らないなら、撮影判定で「撮影不要」を押してください (画面を読み直すと今の値が出ます)` });
+    }
+    if (sm === 'none' && materialVal !== 'not_required' && materialVal !== 'ready') {
+      return res.status(400).json({ ok: false, error: '撮影判定が「撮影不要」なので、撮影・素材ステータスは「撮影不要」か「素材完了」だけにできます。撮影するなら、撮影判定で「社内撮影」か「カメラマン撮影」を押してください (画面を読み直すと今の値が出ます)' });
     }
   }
   let infoVal; let infoAt; let infoBy;

@@ -6265,6 +6265,20 @@ let wfSetParentId = null;
         r.status === 400 && ipSf().material_status !== 'not_required' && /撮影判定/.test(r.json?.error || ''), JSON.stringify([r, ipSf()]));
       r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'shipped' });
       check('撮影判定が「社内撮影」でも、撮影不要以外の素材ステータスは保存できる', r.status === 200 && ipSf().material_status === 'shipped', JSON.stringify(r));
+      // 逆向き: 撮影不要と判定したのに、保存ボタンで撮影の途中の値にすると ③ が閉じられなくなる (Codex PR-A R2 P2)
+      await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'none' });
+      const noneStatuses = [];
+      for (const v of ['shipped', 'shooting', 'not_shipped', 'internal_prep', '']) {
+        noneStatuses.push((await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: v })).status);
+      }
+      check('🚨 撮影判定が「撮影不要」なら、保存ボタンで素材ステータスを撮影不要・素材完了以外にはできない (Codex PR-A R2 P2)',
+        noneStatuses.every((s) => s === 400) && ipSf().material_status === 'not_required', JSON.stringify([noneStatuses, ipSf()]));
+      r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'ready' });
+      const rNr = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'not_required', status: 'メモ' });
+      check('撮影判定が「撮影不要」でも、素材完了・撮影不要は保存できる', r.status === 200 && rNr.status === 200 && ipSf().material_status === 'not_required', JSON.stringify([r, rNr]));
+      r = await call('POST', `/api/drafts/${idSf}/image-production`, { status: '素材を送らない保存' });
+      check('素材ステータスを送らない保存は撮影判定に関係なく通る', r.status === 200, JSON.stringify(r));
+      await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'inhouse' });
       db.prepare(`UPDATE draft_image_production SET material_status = NULL WHERE draft_id = ?`).run(idSf);
 
       // 編集データリンク: 保存ボタン (image-production) で保存。http(s) だけ・送らなければ消えない
