@@ -20,8 +20,10 @@ import {
   acquireShootSheetLease, releaseShootSheetLease,
 } from '../db.js';
 import { parseDriveLink } from '../lib/drive-link.js';
+import { effectiveCompose } from '../lib/lp-edit.js';
+import { latestShootJudgement } from '../lib/lp-compose.js';
 import {
-  buildShootSheet, cutsFromComposeText, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
+  buildShootSheet, cutsFromComposeText, cutsFromSlots, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
   spreadsheetUrl, MANAGED_SHEETS, SHOOT_SHEET_MODES,
 } from '../lib/shoot-sheet.js';
 import {
@@ -44,26 +46,32 @@ export function shootSheetConfigured() {
 }
 
 /**
- * ⭐ 撮影指示書の材料 (カット) の差し込み口。**材料を変えるときはこの関数の中身だけを替える**。
+ * ⭐ 撮影指示書の材料 (カット) の差し込み口。**材料を変えるときはこの関数の中身だけを替える**
+ * (画面の「LP構成が変わりました」(材料の hash) も API もこの関数しか見ていない)。
  *
- * 今 (PR-D 時点) = 「今ある情報で組む」最小版: いちばん新しい「できた」LP構成 (⑦ テキスト・lp-compose の job の
- *   output_text) の各画像ブロックの `## 使用素材` に「撮影」が出てくる画像を要撮影とみなし、
- *   構図・小物・背景・トーン・NG を見出しから拾う (lib/shoot-sheet.js の cutsFromComposeText)。
- *
- * 🔁 PR-B (LP構成の編集版 ph_lp_compose_edits.slots_json の「要撮影」) と PR-C (AI の shoot_json の
- *    カットごとの構図/小物/背景/トーン/NG) がマージされたら、ここを次の順に差し替える:
- *      1. 編集版 (いちばん新しい構成の、いちばん新しい編集版) の slots_json で「要撮影」の画像を決める
- *      2. その画像のカットの中身は shoot_json から取る (無ければ今の見出しから拾う方式で埋める)
- *    戻り値の形 ({ cuts, source }) と cuts の欄 (lib/shoot-sheet.js の CUT_FIELDS) は変えない —
- *    画面の「LP構成が変わりました」(材料の hash) も API もこの関数しか見ていない
- * @returns {{cuts: Array, source: 'lp'|'none', composeJobId: number|null}}
+ * 構成 = 効いている構成 (PR-B の lp-edit の effectiveCompose: いちばん新しいできた構成の、いちばん新しい編集版。
+ *   編集版が無ければ AI の構成)。その画像の並びで、
+ *   - 要撮影か = 編集版の slots_json の shoot (人が直した値) が正本。編集版が無ければ AI の撮影判定 (PR-C の
+ *     latestShootJudgement・その構成のもので、実モデル一致のときだけ) の needs_shoot。AI の判定も無ければ
+ *     ブロックの `## 使用素材` に「撮影」が出てくるかで推定
+ *   - カットの中身 = AI の撮影判定 (元の画像の番号で引く = 並べ替え・追加してもずれない)。無い画像はブロックの見出しから拾う
+ *   (組み立ては lib/shoot-sheet.js の cutsFromSlots。純粋関数で試している)
+ * 構成がパーサで読めない (画面で直せない) ときは、本文から推定する最小版 (cutsFromComposeText) で組む
+ * @returns {{cuts: Array, source: 'lp'|'none', composeJobId: number|null, editId: number|null}}
  */
 export function shootSheetCutsFor(db, draft) {
-  const job = db.prepare(`SELECT id, output_text FROM ph_lp_compose_jobs
-    WHERE draft_id = ? AND status = 'done' AND output_text IS NOT NULL AND TRIM(output_text) <> ''
-    ORDER BY id DESC LIMIT 1`).get(Number(draft?.id));
-  if (!job) return { cuts: [], source: 'none', composeJobId: null };
-  return { cuts: cutsFromComposeText(job.output_text), source: 'lp', composeJobId: job.id };
+  const eff = effectiveCompose(db, draft?.id);
+  if (!eff) return { cuts: [], source: 'none', composeJobId: null, editId: null };
+  const editId = eff.edit ? eff.edit.id : null;
+  if (eff.error || !Array.isArray(eff.slots)) {
+    return { cuts: cutsFromComposeText(eff.text), source: 'lp', composeJobId: eff.job.id, editId };
+  }
+  // 編集版の要撮影が読めたか (slots_json が壊れていると、lp-edit は e<編集版>x<番号> の uid を振って shoot=false にする)
+  const hasEditShoot = !!eff.edit && eff.slots.every((sl) => !/^e\d+x\d+$/.test(String(sl.uid)));
+  // AI の撮影判定は、効いている構成と同じ構成 (job) のものだけ使う (新しい構成を AI が作り直している途中なら使わない)
+  const judge = latestShootJudgement(db, draft.id);
+  const aiImages = judge && judge.available && judge.job_id === eff.job.id ? judge.images : null;
+  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages }), source: 'lp', composeJobId: eff.job.id, editId };
 }
 
 const folderIdOf = (draft) => {

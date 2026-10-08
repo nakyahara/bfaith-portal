@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   buildShootSheet, shootSheetTitle, cutsFromComposeText, mentionsShoot, cutNameFrom, sectionText,
-  validateCutsInput, normalizeCuts, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
+  validateCutsInput, normalizeCuts, cutsFromSlots, aiNoOfUid, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
   spreadsheetUrl, CUT_COLUMNS, MAX_CUTS,
 } from '../apps/product-hub/lib/shoot-sheet.js';
 import {
@@ -113,6 +113,41 @@ ok(mentionsShoot('撮影: x') && !mentionsShoot('撮影不要') && !mentionsShoo
 ok(cutNameFrom('撮影: 使用シーン・素材2') === '使用シーン' && cutNameFrom('撮影（粉末アップ）') === '粉末アップ' && cutNameFrom('撮影：料理') === '料理', 'カット名を取れる (区切りの前まで)');
 ok(cutNameFrom('撮影する') === null, '名前が書いていなければ null (画像名で埋める)');
 ok(sectionText('## A\nx\n## B\ny', /^B$/) === 'y' && sectionText('## A\nx', /^Z$/) === '', '見出しの中身 (無ければ空)');
+
+console.log('⑦-2 B の並び (編集版の要撮影) と C の判定 (AI の撮影指示) を合わせる');
+{
+  const blk = (mat, extra = '') => ['## 画像の役割', '特長', '## メイン見出し', '見出し', '## 商品配置', 'ブロックの構図', '## 使用素材', mat, '## NG事項', 'ブロックのNG', extra].join('\n').split('\n');
+  const ai = [
+    { no: 0, needs_shoot: false, cut: '', composition: '', props: '', background: '', tone: '', ng: '' },
+    { no: 1, needs_shoot: false, cut: '', composition: '', props: '', background: '', tone: '', ng: '' },
+    { no: 2, needs_shoot: true, cut: 'AIカット2', composition: 'AI構図2', props: 'AI小物2', background: 'AI背景2', tone: 'AIトーン2', ng: 'AI NG2' },
+  ];
+  const slotsAi = [
+    { uid: 'a0', no: 0, name: 'サムネイル', role: 'TOP', title: '', lines: blk('提供された実物商品画像') },
+    { uid: 'a1', no: 1, name: 'FV', role: 'FV', title: 'FVの見出し', lines: blk('撮影: 手元') },
+    { uid: 'a2', no: 2, name: '成分', role: '特長', title: '成分の見出し', lines: blk('提供された実物商品画像') },
+  ];
+  ok(aiNoOfUid('a2') === 2 && aiNoOfUid('nAbc') === null && aiNoOfUid('e3x1') === null && aiNoOfUid('a') === null, 'uid から AI の構成での番号 (a<番号> だけ)');
+  const c0 = cutsFromSlots({ slots: slotsAi, hasEditShoot: false, aiImages: null });
+  ok(c0.length === 1 && c0[0].label === '1枚目｜FV' && c0[0].cut === '手元' && c0[0].composition === 'ブロックの構図' && c0[0].title === 'FVの見出し',
+    '編集版も AI の判定も無い: 使用素材の「撮影」で推定し、中身はブロックから', JSON.stringify(c0));
+  const c1 = cutsFromSlots({ slots: slotsAi, hasEditShoot: false, aiImages: ai });
+  ok(c1.length === 1 && c1[0].label === '2枚目｜成分' && c1[0].cut === 'AIカット2' && c1[0].composition === 'AI構図2' && c1[0].props === 'AI小物2'
+    && c1[0].background === 'AI背景2' && c1[0].tone === 'AIトーン2' && c1[0].ng === 'AI NG2' && c1[0].role === '特長' && c1[0].title === '成分の見出し',
+  'AI の判定があれば要撮影は needs_shoot (使用素材の推定より優先)・中身 6 項目は AI・役割と見出しは構成', JSON.stringify(c1));
+  // 編集版: 足した画像 (nNew) を 2枚目に入れて、AI の 2枚目 (a2) を 3枚目に。要撮影は人の値
+  const slotsEdit = [
+    { ...slotsAi[0], shoot: false }, { ...slotsAi[1], shoot: false },
+    { uid: 'nNew', no: 2, name: '使い方', role: '使い方', title: '足した見出し', lines: blk('提供された実物商品画像'), shoot: true },
+    { ...slotsAi[2], no: 3, shoot: true },
+  ];
+  const c2 = cutsFromSlots({ slots: slotsEdit, hasEditShoot: true, aiImages: ai });
+  ok(c2.length === 2 && c2[0].label === '2枚目｜使い方' && c2[0].cut === '使い方' && c2[0].composition === 'ブロックの構図' && c2[0].title === '足した見出し',
+    '🚨 足した画像 (AI の判定なし) はブロックから拾う — 今の番号 2 で AI の 2枚目の中身を付けない', JSON.stringify(c2[0]));
+  ok(c2[1].label === '3枚目｜成分' && c2[1].cut === 'AIカット2' && c2[1].no === 2, '🚨 並べ替えた画像は元の画像 (uid a2) で AI の判定を引く (今の番号 3)', JSON.stringify(c2[1]));
+  const c3 = cutsFromSlots({ slots: slotsEdit.map((x) => ({ ...x, shoot: x.uid === 'a1' })), hasEditShoot: true, aiImages: ai });
+  ok(c3.length === 1 && c3[0].label === '1枚目｜FV' && c3[0].cut === '手元', '人が要撮影にした画像 (AI は不要と判定) はブロックから拾う・AI が要るとした画像も人が外せば出ない', JSON.stringify(c3));
+}
 
 console.log('⑧ 作れない理由');
 ok(/社内撮影/.test(shootSheetBlockReason({ shootMode: 'none', folderId: 'F', configured: true }) || '')

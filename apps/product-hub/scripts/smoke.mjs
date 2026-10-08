@@ -6726,9 +6726,17 @@ let wfSetParentId = null;
       check('撮影指示書: (前提) 試験用の LP構成に撮影の素材を書けた', lpText !== fixture);
       const specId = Number(db.prepare(`INSERT INTO ph_lp_specs (kind, title, body, hash, sheet_titles_json, imported_by) VALUES ('product_analysis', 'SS', 'b', ?, '[]', 'smoke')`).run(`ss-spec-${Date.now()}`).lastInsertRowid);
       let jobSeq = 0;
-      const addJob = (draftId, status, text) => db.prepare(`INSERT INTO ph_lp_compose_jobs
-        (draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, spec_id, spec_hash, requested_by, measurement_deadline_at, output_text)
-        VALUES (?, ?, ?, '{}', 'p', 1, ?, 'h', 'smoke', '2026-10-09T00:00:00Z', ?)`).run(draftId, `ss-key-${++jobSeq}`, status, specId, text);
+      // できた構成 = done + 実モデル一致の生成 (lp-edit の「効いている構成」と同じ条件)
+      const addJob = (draftId, status, text, shootJson = null) => {
+        const jid = Number(db.prepare(`INSERT INTO ph_lp_compose_jobs
+          (draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, spec_id, spec_hash, requested_by, measurement_deadline_at, output_text, shoot_json)
+          VALUES (?, ?, ?, '{}', 'p', 1, ?, 'h', 'smoke', '2026-10-09T00:00:00Z', ?, ?)`).run(draftId, `ss-key-${++jobSeq}`, status, specId, text, shootJson).lastInsertRowid);
+        if (status === 'done') {
+          db.prepare(`INSERT INTO ph_lp_compose_generations (job_id, packet_hash, lease_token, status, model, prompt_version, reserved_day, model_check)
+            VALUES (?, 'p', ?, 'accepted', 'claude-opus-5-5', 'lp-compose-v1', '2026-10-09', 'match')`).run(jid, `lt-${jid}`);
+        }
+        return jid;
+      };
 
       const idS = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET', 'ハッカ油スプレー 100ml', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
       addJob(idS, 'done', lpText);
@@ -6980,6 +6988,59 @@ let wfSetParentId = null;
       check('撮影指示書: その回の宛先を空にすれば、依頼文のタブも宛先の行なし', r.status === 200 && tabOf(g.files.get(f1.id), '依頼文').values[0][0] === 'お世話になっています。');
       await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'inhouse' });
       await sheetCall();
+
+      // ── 材料 = B (人が直した構成の要撮影) と C (AI の撮影判定)。番号ではなく元の画像で引く ──
+      {
+        const lpEditMod = await import('../lib/lp-edit.js');
+        const idB = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET-B', 'ハッカ油 B', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
+        await call('POST', `/api/drafts/${idB}/shoot-mode`, { mode: 'inhouse' });
+        const blank = { cut: '', composition: '', props: '', background: '', tone: '', ng: '' };
+        const shootJson = JSON.stringify({ recommended: 'inhouse', reason: '2枚目の成分の写真が無い', images: [
+          { no: 0, needs_shoot: false, ...blank }, { no: 1, needs_shoot: false, ...blank },
+          { no: 2, needs_shoot: true, cut: 'AIのカット', composition: 'AIの構図', props: 'AIの小物', background: 'AIの背景', tone: 'AIのトーン', ng: 'AIのNG' }] });
+        // AI の構成: 1枚目の使用素材に「撮影」とあるが、AI の判定は「2枚目だけ要撮影」
+        const jobB = addJob(idB, 'done', lpText, shootJson);
+        const cutsB = () => ssv.shootSheetCutsFor(db, { id: idB });
+        let cb = cutsB();
+        check('撮影指示書の材料: AI の撮影判定があれば、要撮影は AI の needs_shoot (使用素材からの推定より優先)・中身も AI の判定',
+          cb.cuts.length === 1 && cb.cuts[0].label.startsWith('2枚目') && cb.cuts[0].cut === 'AIのカット' && cb.cuts[0].composition === 'AIの構図'
+          && cb.cuts[0].props === 'AIの小物' && cb.cuts[0].ng === 'AIのNG', JSON.stringify(cb));
+        // 人が直した構成 (B): 画像を 1 枚足して 2枚目に入れ、AI の 2枚目を 3枚目に。要撮影は足した画像と元の 2枚目
+        const st = lpEditMod.editStateFor(db, { id: idB }, { canEdit: true });
+        check('撮影指示書の材料: (前提) B の構成の一覧が読める', st.available === true && st.slots.length === 3, JSON.stringify(st).slice(0, 300));
+        const [s0, s1, s2] = st.slots;
+        const plain = (x, shoot) => ({ uid: x.uid, role: x.role, title: x.title, copy: x.copy, body: x.body, shoot });
+        const saved = lpEditMod.saveEdit(db, { draft: { id: idB }, baseJobId: jobB, baseEditId: null, actor: 'smoke',
+          slots: [plain(s0, false), plain(s1, false), { uid: 'nNew1', role: '使い方', title: '手元の使い方', copy: '', body: '', shoot: true }, plain(s2, true)] });
+        check('撮影指示書の材料: (前提) B の編集版を保存できる', saved.ok === true, JSON.stringify(saved));
+        cb = cutsB();
+        check('🚨 撮影指示書の材料: 編集版があれば、要撮影は人が直した値 (slots_json の shoot) が正本',
+          cb.cuts.length === 2 && cb.editId === saved.edit_id, JSON.stringify(cb));
+        check('🚨 撮影指示書の材料: 並べ替えた画像には、元の画像 (uid) で AI の判定を引く (今の番号 3枚目 でも AI の 2枚目の中身)',
+          cb.cuts[1]?.label.startsWith('3枚目') && cb.cuts[1]?.cut === 'AIのカット' && cb.cuts[1]?.composition === 'AIの構図', JSON.stringify(cb.cuts[1]));
+        check('🚨 撮影指示書の材料: 足した画像 (AI の判定が無い) はブロックから拾い、AI の別の画像の中身を付けない',
+          cb.cuts[0]?.label.startsWith('2枚目') && cb.cuts[0]?.cut !== 'AIのカット' && cb.cuts[0]?.composition !== 'AIの構図' && cb.cuts[0]?.title === '手元の使い方', JSON.stringify(cb.cuts[0]));
+        // 人が「要撮影」を外したら指示書から抜ける (AI が要ると言っていても)
+        const st2 = lpEditMod.editStateFor(db, { id: idB }, { canEdit: true });
+        const saved2 = lpEditMod.saveEdit(db, { draft: { id: idB }, baseJobId: jobB, baseEditId: saved.edit_id, actor: 'smoke',
+          slots: st2.slots.map((x) => plain(x, false)) });
+        cb = cutsB();
+        check('撮影指示書の材料: 人が全部「撮影不要」にしたら、AI が要ると言っていてもカットは 0', saved2.ok === true && cb.cuts.length === 0, JSON.stringify([saved2, cb]));
+        // 画面: 編集版を直したら「更新が要る」(材料の hash)
+        const rB = await call('POST', `/api/drafts/${idB}/shoot-sheet`, {});
+        const st3 = lpEditMod.editStateFor(db, { id: idB }, { canEdit: true });
+        lpEditMod.saveEdit(db, { draft: { id: idB }, baseJobId: jobB, baseEditId: saved2.edit_id, actor: 'smoke', slots: st3.slots.map((x, i) => plain(x, i === 3)) });
+        const pgB = await pageOf(idB);
+        check('画面: LP構成の編集版で要撮影を直したら「撮影指示書を更新」を出す', rB.status === 200 && pgB.includes('id="shoot-sheet-stale"'), JSON.stringify(rB));
+        // AI が構成を作り直している途中 (いちばん新しい依頼が queued) なら、前の構成の AI の判定は使わない
+        // (編集版の要撮影はそのまま効く。中身はブロックから)
+        addJob(idB, 'queued', null);
+        cb = cutsB();
+        check('撮影指示書の材料: AI が作り直している途中なら AI の判定の中身は使わない (編集版の要撮影は効く・中身はブロックから)',
+          cb.cuts.length === 1 && cb.cuts[0].label.startsWith('3枚目') && cb.cuts[0].cut !== 'AIのカット' && cb.cuts[0].composition !== 'AIの構図', JSON.stringify(cb));
+        db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ? AND status = 'queued'`).run(idB);
+        // 編集版は追記専用 (消せない) なので、この商品は残す (ほかの試験は商品コードで引かない)
+      }
 
       // ── 撮影依頼文のいつもの宛先 (管理者が画面で変える・2026-10-09 中原さん決定) ──
       const setM = (body) => call('POST', '/api/settings/shoot-mention', body);

@@ -2804,15 +2804,18 @@ export function setShootMode(db, draftId, mode, { actor = null, expected } = {})
 /**
  * 撮影指示書の材料と置き場の「版」(2026-10-09 PR-D)。作り始めたときの版と、Google に書く直前・記録するときの版を比べ、
  * 違えば書かない / 記録しない (Google を待っている間に変わったものを、古い材料で黙って上書きしない — Codex PR-D 名指し High)。
- * 中身 = 撮影判定・画像フォルダ・商品名・商品コード・いちばん新しいできた LP構成・撮影指示書の URL とファイル ID
+ * 中身 = 撮影判定・画像フォルダ・商品名・商品コード・撮影指示書の URL とファイル ID・LP構成 (いちばん新しい依頼とその状態・
+ *   いちばん新しい編集版 (PR-B))。LP構成は「材料に効くか」を細かく見ず、依頼か編集版が動いたら版が変わったとみなす (安全側)
  */
 export function shootSheetRevision(db, draftId) {
   const id = Number(draftId);
   const d = db.prepare('SELECT ne_code, name, drive_folder_url FROM product_drafts WHERE id = ?').get(id) || {};
   const ip = db.prepare('SELECT shoot_mode, camera_instruction_url, shoot_sheet_file_id FROM draft_image_production WHERE draft_id = ?').get(id) || {};
-  const job = db.prepare(`SELECT id FROM ph_lp_compose_jobs WHERE draft_id = ? AND status = 'done' AND output_text IS NOT NULL AND TRIM(output_text) <> '' ORDER BY id DESC LIMIT 1`).get(id);
+  const job = db.prepare('SELECT id, status FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(id);
+  let editId = null;
+  try { editId = db.prepare('SELECT MAX(id) m FROM ph_lp_compose_edits WHERE draft_id = ?').get(id)?.m ?? null; } catch (_) { /* 表が無い古い DB */ }
   return JSON.stringify([d.ne_code ?? null, d.name ?? null, d.drive_folder_url ?? null, ip.shoot_mode ?? null,
-    ip.camera_instruction_url ?? null, ip.shoot_sheet_file_id ?? null, job ? job.id : null]);
+    ip.camera_instruction_url ?? null, ip.shoot_sheet_file_id ?? null, job ? job.id : null, job ? job.status : null, editId]);
 }
 
 const SHOOT_SHEET_CONFLICT_MESSAGE = '作っている間に、撮影判定・画像フォルダ・商品名・LP構成・撮影指示書の URL のどれかが変わりました。画面を読み直して、もう一度押してください (指示書の URL は変えていません)';

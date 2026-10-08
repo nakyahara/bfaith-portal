@@ -201,8 +201,40 @@ const firstSection = (block, res) => {
   return '';
 };
 
+/** 画像ブロックの使用素材に撮影が出てくるか (編集版・AI の判定が無いときの推定) */
+export function blockMentionsShoot(blockText) {
+  return mentionsShoot(sectionText(blockText, /^使用素材$/));
+}
+
 /**
- * ⑦形式の LP構成から、`## 使用素材` に「撮影」が出てくる画像を要撮影のカットとして拾う。
+ * 画像ブロック (⑦ の `# N枚目｜名前` の下) から、撮影指示書の 1 カットぶんを見出しで拾う。
+ * AI の撮影判定 (PR-C) が無い画像を埋める最小版
+ * @param {string} blockText  ブロックの中身 (見出しの行は含めなくてよい)
+ * @param {{label: string, name?: string}} o  label = 使う画像 (N枚目｜名前)
+ */
+export function cutFromBlock(blockText, { label, name = '' }) {
+  const block = str(blockText);
+  const material = sectionText(block, /^使用素材$/);
+  return {
+    label,
+    cut: cutNameFrom(material) || cellText(name, 100) || label,
+    composition: firstSection(block, FIELD_HEADINGS.composition),
+    props: firstSection(block, FIELD_HEADINGS.props),
+    background: firstSection(block, FIELD_HEADINGS.background),
+    tone: firstSection(block, FIELD_HEADINGS.tone),
+    ng: firstSection(block, FIELD_HEADINGS.ng),
+    role: sectionText(block, /^画像の役割$/),
+    title: sectionText(block, /^メイン見出し$/),
+  };
+}
+
+const imgLabel = (no, name) => {
+  const n = cellText(name, 100);
+  return `${Number.isInteger(no) ? no + '枚目' : '?枚目'}${n ? '｜' + n : ''}`;
+};
+
+/**
+ * ⑦形式の LP構成から、`## 使用素材` に「撮影」が出てくる画像を要撮影のカットとして拾う (編集版も AI の判定も無いときの推定)。
  * 構成が読めなければ空配列 (指示書は空の表で作れる)
  */
 export function cutsFromComposeText(outputText) {
@@ -211,20 +243,46 @@ export function cutsFromComposeText(outputText) {
   const cuts = [];
   for (const im of (doc && doc.images) || []) {
     const block = str(im.rawBlockText);
-    const material = sectionText(block, /^使用素材$/);
-    if (!mentionsShoot(material)) continue;
-    const name = cellText(im.name, 100);
-    const label = `${Number.isInteger(im.no) ? im.no + '枚目' : '?枚目'}${name ? '｜' + name : ''}`;
+    if (!blockMentionsShoot(block)) continue;
+    cuts.push(cutFromBlock(block, { label: imgLabel(im.no, im.name), name: im.name }));
+  }
+  return normalizeCuts(cuts);
+}
+
+/** AI の構成のままの画像の uid (a0, a1 …) → AI の構成での番号。追加した画像 (n…) などは null */
+export function aiNoOfUid(uid) {
+  const m = /^a(\d{1,2})$/.exec(str(uid));
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * 撮影指示書のカットを、いまの LP構成の並び (PR-B) と AI の撮影判定 (PR-C) から組む (純粋関数)。
+ *   - 要撮影か: 編集版の「要撮影」(人が直した値) が正本 (hasEditShoot)。編集版が無ければ AI の needs_shoot、
+ *     AI の判定も無ければ使用素材に「撮影」が出てくるかで推定
+ *   - カットの中身 (カット名・構図・小物・背景・トーン・NG): AI の判定のその画像 (needs_shoot で中身があるもの)。
+ *     無い画像 (人が要撮影にした・追加した画像) はブロックの見出しから拾う
+ *   🚨 AI の判定は「AI の構成での番号」で付いている。編集版で並べ替え・追加した画像は番号がずれるので、
+ *      **今の番号ではなく元の画像 (uid の a<元の番号>) で引く**。追加した画像 (n…) には AI の判定は無い
+ * @param {{slots: Array<{uid, no, name, role, title, lines: string[], shoot?: boolean}>, hasEditShoot: boolean,
+ *          aiImages: Array<{no, needs_shoot, cut, composition, props, background, tone, ng}>|null}} o
+ */
+export function cutsFromSlots({ slots, hasEditShoot, aiImages }) {
+  const aiByNo = new Map((Array.isArray(aiImages) ? aiImages : []).map((x) => [x.no, x]));
+  const cuts = [];
+  for (const [i, sl] of (Array.isArray(slots) ? slots : []).entries()) {
+    const block = (Array.isArray(sl.lines) ? sl.lines : []).join('\n');
+    const origNo = aiNoOfUid(sl.uid);
+    const ai = origNo != null ? aiByNo.get(origNo) || null : null;
+    const needs = hasEditShoot ? sl.shoot === true : (aiImages ? !!(ai && ai.needs_shoot) : blockMentionsShoot(block));
+    if (!needs) continue;
+    const no = Number.isInteger(sl.no) ? sl.no : i;
+    const fromBlock = cutFromBlock(block, { label: imgLabel(no, sl.name), name: sl.name });
+    const useAi = ai && ai.needs_shoot && str(ai.cut).trim();
     cuts.push({
-      label,
-      cut: cutNameFrom(material) || name || label,
-      composition: firstSection(block, FIELD_HEADINGS.composition),
-      props: firstSection(block, FIELD_HEADINGS.props),
-      background: firstSection(block, FIELD_HEADINGS.background),
-      tone: firstSection(block, FIELD_HEADINGS.tone),
-      ng: firstSection(block, FIELD_HEADINGS.ng),
-      role: sectionText(block, /^画像の役割$/),
-      title: sectionText(block, /^メイン見出し$/),
+      ...fromBlock,
+      ...(useAi ? { cut: ai.cut, composition: ai.composition, props: ai.props, background: ai.background, tone: ai.tone, ng: ai.ng } : {}),
+      role: str(sl.role) || fromBlock.role,
+      title: str(sl.title) || fromBlock.title,
     });
   }
   return normalizeCuts(cuts);
