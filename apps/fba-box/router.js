@@ -1045,6 +1045,8 @@ function renderReport(req, res, runId, { from }) {
   const rep = buildRunReport(runId);
   if (!rep) return res.status(404).send('納品回が見つかりません');
   res.render(path.join(__dirname, 'views/report'), { rep, base: BASE, from, canAdmin: hasSessionAccess(req),
+    // 完了した回からも納品ピッキング PDF を開けるように (中原さん 2026-10-08)。出す・出さないは作業中の回と同じ判定
+    pickingPdfUrl: pickingPdfUrlOf({ status: rep.run.status, source_run_id: rep.run.sourceRunId }),
     notify: rep.run.status === 'done' ? { job: getRunDoneNotify(runId), webhookSet: !!process.env[WEBHOOK_ENV] } : null,
     printedAt: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) });
 }

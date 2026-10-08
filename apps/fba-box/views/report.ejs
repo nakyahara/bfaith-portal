@@ -29,6 +29,7 @@
   .chip.done{background:var(--ok-fill);color:var(--ok)} .chip.active{background:var(--amber-fill);color:var(--amber)} .chip.other{background:var(--well);color:var(--sub)}
   .top .when{color:var(--sub);font-size:.85rem}
   .top .sp{flex:1}
+  .top a.pick{color:var(--accent);text-decoration:none;font-weight:700;border:1px solid var(--accent);border-radius:8px;padding:5px 10px;font-size:.9rem}
   .top button{border:0;background:var(--accent);color:#fff;font-weight:700;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:.9rem}
   main{max-width:1100px;margin:0 auto;padding:14px 14px 60px}
   .lead{color:var(--sub);margin:2px 0 12px}
@@ -107,7 +108,7 @@
     .cno{display:none} .noin{display:block;color:var(--sub)}
   }
   @media print{
-    .top button,.copy,.top a.back,.notify,.morehead button,.morehead .hint{display:none}
+    .top button,.copy,.top a.back,.top a.pick,.notify,.morehead button,.morehead .hint{display:none}
     .top{position:static;border:none}
     body{background:#fff;font-size:12px}
     section.grp{break-inside:avoid-page;border:none;padding:0}
@@ -131,6 +132,7 @@
   <span class="chip <%= statusCls %>"><%= statusJa %></span>
   <% if (rep.run.doneAt) { %><span class="when">完了 <%= jst(rep.run.doneAt) %></span><% } %>
   <span class="sp"></span>
+  <% if (pickingPdfUrl) { %><a class="pick" href="<%= pickingPdfUrl %>" target="_blank" rel="noopener">📄 ピッキング</a><% } %>
   <button type="button" onclick="window.print()">🖨 印刷</button>
 </header>
 <main>
