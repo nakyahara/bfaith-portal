@@ -1487,6 +1487,14 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   assert.deepEqual((z.result.ne.registrations.written.not_imported || []).map((x) => x.code), ['n901'], JSON.stringify(z.result.ne.registrations.written));
   assert.match(z.line, /ℹ️ 配ってから 3 日たっても NE に無い \(取り込まれていないらしい\) 1 件 \(n901\)/);
   assert.equal(z.evidence.ne.registrations.not_imported, 1);
+  // 区分違いがある朝 (登録の不一致なし) も 0061 の知らせを消さない (#1659 Codex R1 Medium)
+  const { neSummary: neSum } = await import('../apps/company-db/master-compare/run.mjs');
+  const syn = { verdict: 'breach', counts: { items: 1 }, sku_kind_raw_mismatch: { alert: true, count: 1, codes: ['k001'] },
+    registrations: { written: { not_imported: [{ code: 'n901' }], not_imported_days: 3, needs_declaration: [{ code: 'j001', reason: 'jan_not_compared' }] } } };
+  const sl = neSum(syn);
+  assert.match(sl, /^⚠️ ②: 区分が NE と違う SKU 1 件/);
+  assert.match(sl, /ℹ️ 配ってから 3 日たっても NE に無い \(取り込まれていないらしい\) 1 件 \(n901\)/);
+  assert.match(sl, /ℹ️ NE にあるが自動では確かめない \(取り込んだと申告すると確かめる\) 1 件 \(j001 JAN\)/);
   const ev5 = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
   assert.deepEqual([ev5.ne.reg_after_check.reg_failed, ev5.ne.reg_after_check.reg_partial], [2, 2]);
   // W13:ne は証跡の確かめの後の数を理由と観測に使う

@@ -527,6 +527,54 @@ await ta('[C8b] 申告なし (0061・中原さん 10/8 a): 配った → 申告�
   await supersede(rg.export.export_id);
 });
 
+await ta('[C8c] 申告なしでも自動にしない (#1659 Codex R1 High 1・High 2): 単品の JAN を送った・セット (税率・行の順は NE の取得に無い)・配った時の許可の印が無い = NE で比べた列が全部合っても in_ne_undeclared (状態は変えない・needs_declaration)・申告すると 0053 のまま確かめる', async () => {
+  // 単品の JAN だけが違っても (NE の取得に JAN が無い = 比べられない) 確認済みにしない
+  const JX = jan13('490000000077');
+  await reg('single', 'auto-j', single({ name: '新しい単品 J' }));
+  await save('auto-j', { jan: JX });
+  const rj = await build('products', ['auto-j']);
+  const jf = Buffer.from((await one('select file_bytes from ops.ne_reg_exports where export_id = $1', [rj.export.export_id])).file_bytes).toString('utf8');
+  assert.ok(jf.includes(JX), 'CSV に JAN を送った');
+  await issue(rj.export.export_id);
+  const r1 = await newRun();
+  let c = await check(r1, [obsSingle('auto-j', { name: ok('新しい単品 J') })]);
+  assert.deepEqual([c.counts, c.needs_declaration], [{ in_ne_undeclared: 1 }, [{ code: 'auto-j', export_id: String(rj.export.export_id), reason: 'jan_not_compared' }]]);
+  assert.deepEqual([(await itemsOf(rj.export.export_id))[0].state, await regOf('auto-j')], ['issued', 'draft']);
+  const d1 = (await one('select detail from ops.ne_reg_checks where compare_run_id = $1', [r1])).detail;
+  assert.deepEqual([d1.auto_block, d1.compare.ok], ['jan_not_compared', true], '比べた列は全部合っていても');
+  await pgErr(pg.query(`select ops.transition_sku_registration($1, 'ne_pending', 'system', 'ne_compare', null, '{}'::jsonb)`, [await skuId('auto-j')]), /no_evidence/);
+  // 申告すると 0053 のまま確かめる (申告の後の取得で全部の列が合う = verified + NE 確認済み)
+  await declare(rj.export.export_id, rj.export.sha256, 'ok');
+  const r2 = await newRun();
+  c = await check(r2, [obsSingle('auto-j', { name: ok('新しい単品 J') })]);
+  assert.deepEqual([c.counts, c.needs_declaration], [{ verified: 1 }, []]);
+  assert.equal(await regOf('auto-j'), 'ne_confirmed');
+
+  // セット: 名前・売価・構成品と数量が全部合っても (税率・行の順は比べられない) 確認済みにしない
+  await reg('set', 'auto-set', { name: '自動のセット', standard_price: '2600', shipping_code: 'S02', components: [{ code: 's001', qty: 2 }, { code: 's002', qty: 1 }] });
+  const rs = await build('sets', ['auto-set']);
+  await issue(rs.export.export_id);
+  const r3 = await newRun();
+  c = await check(r3, [{ code_norm: 'auto-set', present: true, trusted: true, kind: 'set', cols: { name: ok('自動のセット'), price: ok(2600) },
+    children: [{ code_norm: 's001', st: 'ok', v: 2 }, { code_norm: 's002', st: 'ok', v: 1 }] }]);
+  assert.deepEqual([c.counts, c.needs_declaration.map((x) => [x.code, x.reason])], [{ in_ne_undeclared: 1 }, [['auto-set', 'set_not_compared']]]);
+  assert.deepEqual([(await itemsOf(rs.export.export_id))[0].state, await regOf('auto-set')], ['issued', 'draft']);
+  assert.equal((await one('select detail from ops.ne_reg_checks where compare_run_id = $1', [r3])).detail.compare.ok, true);
+  await supersede(rs.export.export_id);
+
+  // 配った時の許可の印 (0058 の lease_id) が無い前からの issued の行 (持ち主のロールで 0058 の前の形を作る) = 自動にしない
+  await reg('single', 'auto-l', single({ name: '新しい単品 L' }));
+  const rl = await build('products', ['auto-l']);
+  await pg.query(`update ops.ne_reg_export_items set state = 'issued' where export_id = $1`, [rl.export.export_id]);
+  await pg.query(`update ops.ne_reg_exports set state = 'issued', issued_at = now(), issued_by = 't' where export_id = $1`, [rl.export.export_id]);
+  assert.equal((await one('select lease_id from ops.ne_reg_exports where export_id = $1', [rl.export.export_id])).lease_id, null);
+  const r4 = await newRun();
+  c = await check(r4, [obsSingle('auto-l', { name: ok('新しい単品 L') })]);
+  assert.deepEqual([c.counts, c.needs_declaration.map((x) => [x.code, x.reason])], [{ in_ne_undeclared: 1 }, [['auto-l', 'no_issue_lease']]]);
+  assert.deepEqual([(await itemsOf(rl.export.export_id))[0].state, await regOf('auto-l')], ['issued', 'draft']);
+  await supersede(rl.export.export_id);
+});
+
 await ta('[C9] セット: 構成品が全部 NE 確認済み・構成品 1 つで 1 行 (並び = 依頼のとおり)・同じ取得の構成品が全部合うときだけ verified', async () => {
   const r = await build('sets', ['new-set']);
   const id = r.export.export_id;

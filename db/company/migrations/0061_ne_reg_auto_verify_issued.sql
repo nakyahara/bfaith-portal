@@ -10,6 +10,19 @@
 --   申告は sha256 で「配ったファイルそのものを取り込んだ」と結んでいた。申告なしでは「配った時刻 (ops.ne_reg_exports.issued_at) より後に取った
 --   NE の完全な取得で、全部の列が配った値 (expected = ファイルの行と同じ中身・0053 の ops.ne_reg_expected_problem が作るときに照らした) と合う」で確かめる。
 --   全部の列が合う = そのファイルの値が NE に入っている (どの経路で入ったかは問わない = 結果が同じなら NE 確認済みでよい)。
+-- 🆕 #1659 Codex R1 High 1・High 2 (自動で確かめる品目を絞る = ops.ne_reg_auto_block):
+--   ・NE の完全な取得 (apps/warehouse/ne-api.js の商品・セット商品の取得の項目) に、単品の JAN・セットの税率・セットの行の順は無い = 比べられない。
+--     比べられない列に値を送った品目は自動にしない (申告 = 任意のボタンで sha256 を結ぶと、0053 のまま確かめる):
+--       単品で JAN の欄が「empty」でない = jan_not_compared / セット (税率は必ず送る・行の順も比べられない) = set_not_compared
+--   ・0058 の配った時の許可の印 (ne_reg_exports.lease_id・lease_compare_run_id) が無い、前からの issued の行 = no_issue_lease
+--   ・CSV の行が読めない = no_row
+--   自動にしない品目が NE にある = in_ne_undeclared (0053 と同じ・状態は変えない) + 答えの needs_declaration (照合の要約に ℹ️)
+-- 残る危なさ (受け入れ・取り込みの証明はしない。中原さんの 10/6 の決定 = 「その日に NE の画面で同じコードの商品を直接作る (決まり違反)」と
+--   「保存しておいた古い CSV をもう一度取り込む」の危なさを受け入れた、と同じ種類):
+--   ・朝の完全な取得の後から配るまでに、別の経路で同じコード・同じ値の商品が NE に作られた
+--   ・今のファイルを取り込まずに、前に保存した古いファイルを配った後に取り込んだ
+--   ・(0058 の印の無い前からの issued の行 = 上の no_issue_lease で自動にしない)
+--   どれも翌朝の観測は同じ形 = 区別できない。比べた全部の列が配った値と同じなので、NE の中身は登録どおり
 -- なにを (申告した品目 = import_declared / 申告の後の partial の扱いは 0053 のまま変えない):
 --   1. ops.record_ne_registration_check を置き換える。配ったが申告していない品目 (issued・申告なしの partial = attempt_id が null) も確かめる:
 --        取得が配った時刻より前 (同じ時刻も) = 比べない (waiting)
@@ -45,6 +58,25 @@ create or replace function ops.ne_reg_item_transition_allowed(p_from text, p_to 
     'partial>verified', 'partial>failed', 'partial>superseded'])
 $$;
 
+-- ─── 0. 申告なしで自動で確かめてよいか (#1659 Codex R1 High 1・High 2)。null = よい / 理由 ───
+--   set_not_compared = セット (税率・行の順は NE の取得に無い) / no_issue_lease = 0058 の配った時の許可の印が無い /
+--   no_row = CSV の行が読めない / jan_not_compared = 単品の JAN の欄に値を送った (JAN は NE の取得に無い)。品目が無い = no_item
+create function ops.ne_reg_auto_block(p_item_id bigint) returns text language sql stable set search_path = pg_catalog, pg_temp as $$
+  select coalesce((
+    select case
+             when i.sku_kind <> 'single' then 'set_not_compared'
+             when e.lease_id is null or e.lease_compare_run_id is null then 'no_issue_lease'
+             when r.export_id is null or pg_catalog.jsonb_typeof(r.cells) is distinct from 'array' then 'no_row'
+             when pg_catalog.array_position(pg_catalog.string_to_array(e.header, ','), 'jan_code') is not null
+                  and (r.cells ->> (pg_catalog.array_position(pg_catalog.string_to_array(e.header, ','), 'jan_code') - 1)) is distinct from 'empty' then 'jan_not_compared'
+             else '' end
+      from ops.ne_reg_export_items i
+      join ops.ne_reg_exports e on e.export_id = i.export_id
+      left join ops.ne_reg_export_rows r on r.export_id = i.export_id and r.row_no = i.row_from
+     where i.item_id = p_item_id), 'no_item')
+$$;
+revoke all on function ops.ne_reg_auto_block(bigint) from public;
+
 -- ─── 1. 翌朝の照合の確かめ (0053 の置き換え) ───
 /**
  * 3. 確かめる (回の番号だけ・1 回 = 1 つの取引)。受け取りのある回だけ。観測・取得の時刻・「無い」を信じてよいかは関数が残した記録から読む
@@ -54,11 +86,12 @@ $$;
  *     申告の前の取得・信用できない観測 = waiting / 申告の後の完全な取得に無い = failed (not_in_ne・「無い」を信じてよいときだけ) / ある = 比べる
  *   申告なし (issued・申告なしの partial = attempt_id が null。0061):
  *     配った時刻より前の取得・信用できない観測 = waiting / 無い = waiting (failed にしない。配ってから 3 日 (v_days) を過ぎた取得で
- *     「無い」を信じてよいときは not_imported に出す) / ある = 比べる
+ *     「無い」を信じてよいときは not_imported に出す) / ある = 比べる。ただし ops.ne_reg_auto_block が理由を返す品目 (セット・JAN を送った・
+ *     配った時の印が無い) は in_ne_undeclared のまま (状態は変えない・needs_declaration に出す = 申告すると 0053 のまま確かめる)
  *   比べる = 全部の列が合えば verified (+ 登録の状態 draft → ne_pending (申告なしのときだけ) → ne_confirmed = ops.transition_sku_registration が
  *     この確かめの記録を自分で読む)・違う列があれば partial
  * 同じ回の同じ商品は 1 回だけ (再送 = 何もしない)。鍵の順 = 確かめの鍵 → SKU ごと (sku_id の順) → CSV の鍵 → 行
- * 戻り値 { compare_run_id, counts: { outcome: 件数 }, not_imported: [{ code, export_id, issued_at, days }], not_imported_days }
+ * 戻り値 { compare_run_id, counts: { outcome: 件数 }, not_imported: [{ code, export_id, issued_at, days }], not_imported_days, needs_declaration: [{ code, export_id, reason }] }
  */
 create or replace function ops.record_ne_registration_check(p_run text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
@@ -75,6 +108,8 @@ declare
   v_days     constant integer := 3;   -- 配ってから何日たっても NE に無ければ「取り込まれていないらしい」と知らせるか (要約だけ・失敗にしない)
   v_counts   jsonb := '{}'::jsonb;
   v_missing  jsonb := '[]'::jsonb;
+  v_block    text;
+  v_needs    jsonb := '[]'::jsonb;
   v_reg      text;
 begin
   if p_run is null or p_run !~ '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$' then raise exception 'invalid_input: compare_run_id の形が違う: %', p_run using errcode = '22023'; end if;
@@ -98,6 +133,7 @@ begin
     v_fetched := case when it.sku_kind = 'set' then h.sets_at else h.products_at end;
     v_cmp := null;
     v_late := false;
+    v_block := null;
     -- 申告あり = 申告の時刻から (0053 のまま)・申告なし = 配った時刻から (0061)
     v_basis := case when it.attempt_id is not null then 'declared' else 'issued' end;
     if v_basis = 'declared' then
@@ -121,13 +157,18 @@ begin
         v_late := h.absence_trusted and v_fetched > it.export_issued_at + pg_catalog.make_interval(days => v_days);
       else
         v_cmp := ops.ne_reg_compare(it.expected, v_obs);
-        v_out := case when (v_cmp -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;
+        v_block := nullif(ops.ne_reg_auto_block(it.item_id), '');
+        if v_block is not null then
+          v_out := 'in_ne_undeclared';   -- 比べられない列を送った / 配った時の印が無い = 自動にしない (申告すると 0053 のまま確かめる)
+        else
+          v_out := case when (v_cmp -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;
+        end if;
       end if;
     end if;
     insert into ops.ne_reg_checks (compare_run_id, item_id, sku_id, fetched_at, outcome, detail)
       values (p_run, it.item_id, it.sku_id, v_fetched, v_out,
               pg_catalog.jsonb_build_object('state_before', it.state, 'basis', v_basis, 'compare', v_cmp, 'present', v_obs -> 'present', 'trusted', v_obs -> 'trusted',
-                'not_imported', v_late, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));
+                'not_imported', v_late, 'auto_block', v_block, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));
     if v_out = 'verified' then
       update ops.ne_reg_export_items set state = 'verified', verified_run = p_run, verified_at = pg_catalog.now(), state_changed_at = pg_catalog.now(), state_changed_by = 'ne_compare'
        where item_id = it.item_id;
@@ -145,6 +186,9 @@ begin
     elsif v_out = 'failed' then
       update ops.ne_reg_export_items set state = 'failed', failed_reason = 'not_in_ne', state_changed_at = pg_catalog.now(), state_changed_by = 'ne_compare' where item_id = it.item_id;
     end if;
+    if v_out = 'in_ne_undeclared' then
+      v_needs := v_needs || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('code', it.ne_code, 'export_id', it.export_id::text, 'reason', v_block));
+    end if;
     if v_late then
       v_missing := v_missing || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('code', it.ne_code, 'export_id', it.export_id::text, 'issued_at', it.export_issued_at,
         'days', pg_catalog.floor(pg_catalog.date_part('epoch', v_fetched - it.export_issued_at) / 86400)::integer));
@@ -155,7 +199,7 @@ begin
   update ops.ne_reg_exports e set state = 'closed', closed_at = pg_catalog.now(), closed_by = 'ne_compare', close_reason = 'finished'
    where e.state in ('issued', 'declared')
      and not exists (select 1 from ops.ne_reg_export_items i where i.export_id = e.export_id and i.state in ('built', 'issued', 'import_declared', 'partial'));
-  return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days);
+  return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs);
 end $$;
 revoke all on function ops.record_ne_registration_check(text) from public;
 
@@ -221,6 +265,7 @@ begin
         join ops.ne_reg_exports e on e.export_id = i.export_id
        where c.sku_id = p_sku_id and c.outcome = 'verified' and i.state = 'verified' and i.verified_run = c.compare_run_id and i.attempt_id is null
          and e.issued_at is not null and c.fetched_at > e.issued_at
+         and ops.ne_reg_auto_block(i.item_id) = ''   -- 自動で確かめてよい品目だけ (単品・JAN を送っていない・配った時の許可の印がある)
          and exists (select 1 from ops.master_compare_runs m where m.compare_run_id = c.compare_run_id)
        order by c.check_id desc limit 1
        for share of i;

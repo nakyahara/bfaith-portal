@@ -2337,6 +2337,14 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   - NE に無い = waiting (申告が無い = failed にしない)。配ってから 3 日を過ぎた取得 (「無い」を信じてよいとき) でも無い = 答えの `not_imported` に出す → 照合の朝の要約 (② の行) に ℹ️「配ってから 3 日たっても NE に無い (取り込まれていないらしい)」(失敗にしない・状態も変えない)
   - NE にある = 全部の列が合えば verified (登録 draft → ne_pending → ne_confirmed・どちらも system / ne_compare)・違う列があれば partial (登録は下書きのまま・翌朝もう一度比べる)
 - 申告した品目 (import_declared・申告の後の partial) は 0053 のまま (申告の時刻から・無ければ failed)。申告のボタンは残す (一部失敗・全部だめを知らせたいとき = 任意)
+- **自動にしない品目** (`ops.ne_reg_auto_block`・#1659 Codex R1 High 1・High 2): NE の完全な取得 (`apps/warehouse/ne-api.js` の項目) に単品の JAN・セットの税率・セットの行の順が無い = 比べられない。
+  比べられない列に値を送った品目 = 単品で JAN の欄が `empty` でない (jan_not_compared)・セット (set_not_compared)、と 0058 の配った時の許可の印 (`lease_id`・`lease_compare_run_id`) が無い前からの行 (no_issue_lease) は、
+  NE にあっても `in_ne_undeclared` のまま (状態は変えない)・答えの `needs_declaration` → 要約に ℹ️「NE にあるが自動では確かめない (取り込んだと申告すると確かめる)」。申告すると 0053 のまま確かめる
+- **残る危なさ (受け入れ・取り込みの証明はしない)**: 次の 3 つは翌朝の観測が同じ形になり区別できない (比べた全部の列は配った値と同じ = NE の中身は登録どおり)。
+  中原さんの 10/6 の決定 (「その日に NE の画面で同じコードの商品を直接作る (決まり違反)」と「保存しておいた古い CSV をもう一度取り込む」の危なさを受け入れる) と同じ種類として受け入れる
+  - 朝の完全な取得の後から配るまでに、別の経路で同じコード・同じ値の商品が NE に作られた
+  - 今のファイルを取り込まずに、前に保存した古いファイルを配った後に取り込んだ
+  - 0058 の発行時の印が無い前からの issued の行 (→ no_issue_lease で自動にしない = 申告で進める)
 - `ops.transition_sku_registration` に「draft → ne_pending を照合の確かめ (system・ne_compare) で」の道だけ足す (根拠 = 申告なしの verified の確かめ・同じ照合の回・配った後の取得。関数が自分で読む)
 - 品目の状態の地図に issued → verified / partial。`ck_nri_declared` = import_declared だけ申告の試みが要る (前からの行は満たす)
 - 当て方 (🚨 まだ流さない): コードを先に出しても壊れない (0061 の前の DB = 今までどおり in_ne_undeclared を残すだけ・要約の ℹ️ は出ない) が、画面は「申告しなくてよい」と書く = **migration は Render のデプロイと同じ日に** → `migrate.mjs --dry-run` (0061 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい (新しい関数は無い・照合の確かめの grant は migration が流し直す)
