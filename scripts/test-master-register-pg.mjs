@@ -187,6 +187,20 @@ try {
     assert.equal((await q("select count(*)::int as n from core.skus where code = 'race-1'"))[0].n, 1);
   });
 
+  await ta('[1b] 🆕 0064: 大文字と小文字だけ違うコード (Race-UP-1 / race-up-1) を 2 人が同時に登録 = 鍵は norm (小文字) = 後の人は待ち、前の人の commit の後に 409 code_taken・SKU の code は前の人の打ったとおり', async () => {
+    const g = gate();
+    const a = launch(reg(dbA, 'Race-UP-1', { beforeCommit: g.wait }));
+    await sleep(300);
+    const b = launch(reg(dbB, 'race-up-1'));
+    await sleep(500);
+    assert.equal(b.done, false, 'B は norm のコードの鍵で待つ');
+    g.open();
+    assert.ok((await a.promise).ok, (await a.promise).err?.message);
+    const rb = await b.promise;
+    assert.equal(rb.err?.reason, 'code_taken', rb.err?.message);
+    assert.deepEqual(await q("select code, code_norm from core.skus where code_norm = 'race-up-1'"), [{ code: 'Race-UP-1', code_norm: 'race-up-1' }]);
+  });
+
   await ta('[2a] 登録が先 (commit の前) に夜間ロードが同じコードを入れる = ロードはマスタの書き込みの鍵で待って同じ行に重ね、状態は draft のまま', async () => {
     const g = gate();
     const a = launch(reg(dbA, 'lr-1', { beforeCommit: g.wait }));
