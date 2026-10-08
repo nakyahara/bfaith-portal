@@ -2,6 +2,7 @@
 <html lang="ja">
 <head>
   <%- include('_head') %>
+  <% if (locals.bulk && bulk.on) { %><link rel="stylesheet" href="<%= base %>/public/me-bulk.css?v=<%= assetV %>"><% } %>
 </head>
 <body>
   <%- include('_header') %>
@@ -231,7 +232,8 @@
               po: { sub: !bo || !bo.ok ? '読めない' : '発注', cls: !bo || !bo.ok ? ' bad' : '', title: !bo || !bo.ok ? '発注アプリの台帳を読めない' : '発注アプリの注文残 (発注したがまだ入庫していない数)' },
             };
           %>
-          <thead><tr><% for (const id of colOrder) {
+          <% const bk = !!(locals.bulk && bulk.on); /* まとめて変える (PR2) = 左のチェックの列。列の板の列 (LIST_COLUMNS) に入れない = 隠せない・動かせない・いつも左端 */ %>
+          <thead><tr><% if (bk) { %><th scope="col" class="c-chk" data-col="chk"><label class="chkcell" title="このページの <%= data.rows.length %> 件を全部選ぶ / 外す"><input type="checkbox" class="ck" id="ck-page" aria-label="このページの <%= data.rows.length %> 件を全部選ぶ"<%= data.rows.length ? '' : ' disabled' %>></label><span class="thsub">このページ</span></th><% } %><% for (const id of colOrder) {
             const c = COLS[id]; const h = headOf[id] || {};
             const cls = [c.num ? 'n' : '', c.ref ? 'ref' + (h.cls || '') : '', id === 'code' ? 'c-code' : '', canSort(c) ? 'sortable' : ''].filter(Boolean).join(' ');
             const sub = h.sub != null ? h.sub : c.sub;
@@ -240,9 +242,10 @@
             const nextWord = on && !sortDesc ? words[1] : words[0];
           %><th scope="col"<%- cls ? ' class="' + cls + '"' : '' %> style="<%= c.width %>"<% if (h.title) { %> title="<%= h.title %>"<% } %> data-c="<%= id %>"<%- colShown.has(id) ? '' : ' hidden' %><%- on ? ' aria-sort="' + (sortDesc ? 'descending' : 'ascending') + '"' : '' %><%- c.th ? ' id="' + c.th + '"' : '' %>><% if (canSort(c)) { %><a class="sorth" href="<%= sortHref(id) %>" title="押すと <%= c.label %>の<%= nextWord %> (全件で並べ替え)<%= h.title ? ' · ' + h.title : '' %>"><% if (c.num) { %><svg class="ic arr" aria-hidden="true"><use href="#<%= on && sortDesc ? 'i-sortdown' : 'i-sortup' %>"/></svg><% } %><span class="lbl"><%= c.label %><% if (c.isNew) { %> <span class="newtag" aria-hidden="true">新</span><% } %><% if (sub) { %><span class="thsub"><%= sub %></span><% } %></span><% if (!c.num) { %><svg class="ic arr" aria-hidden="true"><use href="#<%= on && sortDesc ? 'i-sortdown' : 'i-sortup' %>"/></svg><% } %></a><% } else { %><%= c.label %><% if (sub) { %><span class="thsub"><%= sub %></span><% } %><% } %></th><% } %></tr></thead>
           <tbody>
-            <% if (!data.rows.length) { %><tr><td colspan="<%= colOrder.length %>" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
+            <% if (!data.rows.length) { %><tr><td colspan="<%= colOrder.length + (bk ? 1 : 0) %>" class="muted" style="text-align:center;padding:30px"><%= dbError ? '読めません' : '当てはまる商品がありません' %></td></tr><% } %>
             <% for (const r of data.rows) { const isSet = r.kind === 'set'; %>
             <tr>
+              <% if (bk) { %><td class="c-chk" data-col="chk"><label class="chkcell"><input type="checkbox" class="ck rowck" data-code="<%= r.code %>" data-kind="<%= r.kind %>" data-state="<%= r.state %>" aria-label="<%= r.code %> を選ぶ"></label></td><% } %>
               <% for (const id of colOrder) { const hide = colShown.has(id) ? '' : ' hidden'; %>
               <% if (id === 'code') { %><td class="c-code" data-col="code"><span class="codecell"><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a><button type="button" class="copybtn" data-copy="<%= r.code %>" aria-label="商品コード <%= r.code %> をコピー" title="コピー"><svg class="ic s" aria-hidden="true"><use href="#i-copy"/></svg></button></span></td>
               <% } else if (id === 'name') { %><td data-col="name"<%= hide %>><span class="nm"><%= r.name %></span><% if (isSet) { %><% } else if (r.kind === 'exception') { %><span class="sub">例外の SKU (NE に無い)</span><% } else { %><span class="sub sup-sub"><%= r.primary_supplier ? '仕入先 ' + r.primary_supplier : '代表の仕入先なし' %></span><% } %></td>
@@ -290,6 +293,8 @@
     </div>
     <p class="hint">登録の札 = 新商品の登録の進み (札が無い = 登録済み・切替の前からある商品)。Amazon SKU の対応は左の「Amazon SKU」で見ます。</p>
   </div>
+  <% if (bk) { %><%- include('_bulk', { bulkCfg: { total: data.total, exportMax, codesUrl: 'api/codes' + qsTail, pageRows: data.rows.length,
+    fkey: JSON.stringify(Object.entries(keep).filter(([k]) => k !== 'sort' && k !== 'dir').sort(([a], [b]) => (a < b ? -1 : 1))) } }) %><% } %>
   <%- include('_footer') %>
   <script src="<%= base %>/public/me-list.js?v=<%= assetV %>" defer></script>
 </body>

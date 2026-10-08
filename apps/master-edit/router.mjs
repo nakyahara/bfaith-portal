@@ -56,7 +56,8 @@ import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFE
 import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError } from './read.mjs';
+import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
+import { bulkInspect, bulkPreview, bulkApplyChunk, editableOf, BULK_MAX, BULK_CHUNK, COST_REASONS, FIX_GROUPS } from './bulk.mjs';
 import { buildListCsv, csvFileName } from './list-csv.mjs';
 import { LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, ViewPrefsInputError } from './list-columns.mjs';
 import { readViewPrefs, saveViewPrefs } from './view-prefs.mjs';
@@ -393,8 +394,11 @@ router.get('/', (req, res) => {
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
     // 列の設定 (人ごと・Render の SQLite)。読めない = いつもの列 (一覧は出す)
     const listView = await readViewPrefs(req.session?.email);
-    res.render(view('index.ejs'), { ...pageLocals(req, phase), ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max,
-      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW });
+    const locals = pageLocals(req, phase);
+    // まとめて変える (PR2): 書ける人 (名簿) で、保存を開いていて、Company DB を読めたときだけ左のチェックを出す
+    const bulk = { on: !!db && locals.canEdit && !locals.closed, max: BULK_MAX, chunk: BULK_CHUNK, costReasons: COST_REASONS, groups: FIX_GROUPS, multiMax: MULTI_MAX };
+    res.render(view('index.ejs'), { ...locals, ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max,
+      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk });
   });
 });
 /**
@@ -724,6 +728,42 @@ router.get('/api/reg-csv/exports/:id/file', (req, res) => {
     res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
     res.set('X-Content-SHA256', f.sha256);
     res.send(f.bytes);
+  }, 'write');
+});
+
+// ─── 一覧で選んで、まとめて 1 つの項目を変える (10/8・PR2・apps/master-edit/bulk.mjs) ───
+//   書ける人 (名簿) だけ = 確かめ (inspect / preview) も名簿の人だけ。保存は 1 件ずつ今の saveSku (門・記録・版は 1 件の保存と同じ)
+/** 画面の持ち主 (DB の active) と段階から、種類ごと・欄ごとの「書ける」(見せ方だけ。保存は lib の門が取引の中で読み直す) */
+async function bulkEditable(db) {
+  const phase = await readCutoverPhase(db);
+  return editableOf(phase, await screenOwner(db), isOpen());
+}
+router.post('/api/bulk/inspect', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  return withPgApi(res, async (db) => {
+    const editable = await bulkEditable(db);
+    res.set('Cache-Control', 'no-store');
+    res.json(await bulkInspect(db, req.body || {}, { now: new Date(clock()), editable, suppliers: await selectableSuppliers(db) }));
+  });
+});
+router.post('/api/bulk/preview', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  return withPgApi(res, async (db) => {
+    const editable = await bulkEditable(db);
+    res.set('Cache-Control', 'no-store');
+    // 確かめの切符 (保存はこの切符の中身だけ) = 確かめた人のメールを入れる
+    res.json(await bulkPreview(db, req.body || {}, { now: new Date(clock()), editable, suppliers: await selectableSuppliers(db), actor: String(req.session.email).trim().toLowerCase() }));
+  });
+});
+router.post('/api/bulk/apply', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    res.json(await bulkApplyChunk(db, { ...b, actor: String(req.session.email).trim().toLowerCase() },
+      { open: isOpen(), now: clockOverridden ? new Date(clock()) : undefined }));
   }, 'write');
 });
 

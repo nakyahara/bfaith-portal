@@ -25,7 +25,7 @@ import { normalizeSort, sortColumnOf } from './list-columns.mjs';
 import { masterProfit } from '../../lib/profit-estimate.js';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
-async function selectableSuppliers(db) {
+export async function selectableSuppliers(db) {
   const hasReg = await regclass(db, 'ops.supplier_registrations');
   return (await db.query(`select s.code, s.name from core.suppliers s where s.company_id = $1 and s.active
      ${hasReg ? "and not exists (select 1 from ops.supplier_registrations r where r.supplier_id = s.supplier_id and r.state <> 'ne_confirmed')" : ''} order by s.code`, [COMPANY_ID])).rows;

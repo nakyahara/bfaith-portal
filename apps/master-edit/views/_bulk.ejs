@@ -1,0 +1,47 @@
+<%#
+  まとめて変える (PR2・10/8 中原さん「見本どおりで OK」)。一覧 (index.ejs) の下に置く: 選んだときの帯 + 右から出る引き出し + 画面の JS (public/me-bulk.js)。
+  渡すもの = bulk (router: on・max・chunk・costReasons・groups・multiMax) と bulkCfg (index.ejs: 件数・絞った全部のコードの URL・絞り込みの鍵・ページ)
+%>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M6.3 7.3a8 8 0 1 0 11.4 0"/></symbol>
+  <symbol id="i-chevl" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-redo" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></symbol>
+</svg>
+<div class="bk-selbar" id="bk-selbar" role="region" aria-label="選んだ商品" hidden>
+  <div class="bk-count"><b id="bk-n">0</b><span>件 選択中</span></div>
+  <div class="bk-mid">
+    <span class="bk-where" id="bk-where"></span>
+    <button type="button" class="btn sm ghost" id="bk-sel-page" hidden></button>
+    <button type="button" class="btn sm ghost" id="bk-sel-all" hidden></button>
+    <button type="button" class="btn sm ghost" id="bk-show" hidden title="選んだ商品だけを一覧に出す (詳細検索の商品コード)">選んだものだけ表示</button>
+    <span class="bk-limit" id="bk-limit" hidden></span>
+  </div>
+  <div class="bk-prev" id="bk-prev" role="alert" hidden>
+    <svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><span id="bk-prev-t"></span>
+    <button type="button" class="btn sm soft" id="bk-prev-keep">残す</button>
+    <button type="button" class="btn sm ghost" id="bk-prev-drop">外す</button>
+  </div>
+  <button type="button" class="btn sm ghost bk-clear" id="bk-clear"><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg>選ぶのをやめる</button>
+  <button type="button" class="btn pri lg bk-go" id="bk-go">まとめて変える<svg class="ic" aria-hidden="true"><use href="#i-arrow"/></svg></button>
+</div>
+<div class="bk-scrim" id="bk-scrim" hidden></div>
+<aside class="bk-drawer" id="bk-drawer" role="dialog" aria-modal="true" aria-labelledby="bk-title" hidden>
+  <div class="bk-head">
+    <h2 id="bk-title" tabindex="-1">まとめて変える</h2>
+    <span class="b info" id="bk-dcount"></span>
+    <button class="iconbtn bk-x" type="button" id="bk-x" aria-label="閉じる (Esc)"><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg></button>
+  </div>
+  <ol class="bk-steps" id="bk-steps">
+    <li data-s="1"><span class="no">1</span><span class="t">何を変える</span></li>
+    <li data-s="2"><span class="no">2</span><span class="t">新しい値</span></li>
+    <li data-s="3"><span class="no">3</span><span class="t">前と後を確かめる</span></li>
+    <li data-s="4"><span class="no">4</span><span class="t">保存・結果</span></li>
+  </ol>
+  <div class="bk-body" id="bk-body"></div>
+  <div class="bk-foot" id="bk-foot"></div>
+</aside>
+<script type="application/json" id="me-bulk"><%- JSON.stringify({
+  max: bulk.max, chunk: bulk.chunk, costReasons: bulk.costReasons, groups: bulk.groups, multiMax: bulk.multiMax,
+  total: bulkCfg.total, codesUrl: bulkCfg.codesUrl, fkey: bulkCfg.fkey, pageRows: bulkCfg.pageRows, overMax: bulkCfg.total > bulkCfg.exportMax,
+}).replace(/</g, '\\u003c') %></script>
+<script src="<%= base %>/public/me-bulk.js?v=<%= assetV %>" defer></script>

@@ -576,7 +576,7 @@ const cells = (p) => p.$eval('#list-tbl', (tbl) => {
   const iS = h.findIndex((x) => x.startsWith('在庫'));
   const iP = h.findIndex((x) => x.startsWith('注文残'));
   const iF = h.findIndex((x) => x.startsWith('FBA'));
-  return [...tbl.querySelectorAll('tbody tr')].map((tr) => { const t = [...tr.children].map((td) => td.textContent.replace(/\s+/g, ' ').trim()); return { code: t[0], stock: iS < 0 ? undefined : t[iS], po: iP < 0 ? undefined : t[iP], fba: iF < 0 ? undefined : t[iF] }; });
+  return [...tbl.querySelectorAll('tbody tr')].map((tr) => { const t = [...tr.children].map((td) => td.textContent.replace(/\s+/g, ' ').trim()); return { code: tr.querySelector('td[data-col="code"]').textContent.replace(/\s+/g, ' ').trim(), stock: iS < 0 ? undefined : t[iS], po: iP < 0 ? undefined : t[iP], fba: iF < 0 ? undefined : t[iF] }; });
 });
 const advGo = async (p, fill) => {
   await p.goto(B + '/');
@@ -696,7 +696,7 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible:not(.c-chk)').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない)');
     assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td[data-col="po"]').count(), 0, '注文残のセルは描かない (隠すだけでなく)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
@@ -1649,11 +1649,11 @@ for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { wi
     await p.waitForFunction(() => document.querySelector('.page').getAnimations().every((a) => a.playState !== 'running'));
     if (SHOTDIR) await p.screenshot({ path: `${SHOTDIR}/一覧_${label}_上.png` });
     const pos = () => p.evaluate(() => {
-      const th = document.querySelector('#list-tbl thead th'); const r = th.getBoundingClientRect();
+      const th = document.querySelector('#list-tbl thead th:not(.c-chk)'); const r = th.getBoundingClientRect();   // 左のチェックの列 (まとめて変える・PR2) の次 = コード
       // 見えている所 (表の囲いの左から 40px) で、見出しの行の高さの真ん中 = 一番上に見えているのが見出しか (横に送っても)
       const wr = th.closest('.tblwrap').getBoundingClientRect();
       const hit = document.elementFromPoint(wr.left + 40, r.top + r.height / 2);
-      const td = document.querySelector('#list-tbl tbody tr td');
+      const td = document.querySelector('#list-tbl tbody tr td:not(.c-chk)');
       return { top: r.top, left: r.left, tdLeft: td.getBoundingClientRect().left, hdr: document.querySelector('.hdr').getBoundingClientRect().bottom, seen: !!(hit && hit.closest('thead')), text: th.textContent.trim() };
     });
     const before = await pos();
