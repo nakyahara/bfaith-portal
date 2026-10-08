@@ -2344,3 +2344,22 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - アプリの決まり (`lib/master-write.mjs` の `logizardLockOf`・保存の 6c = 409 `logizard_locked`) と同じ。持ち主のキーは無い (load / company の取り合いが無い列)。段階・MASTER_EDIT_OPEN・DB の active・約束 (0051) の門はほかの欄と同じ
 - 列の update の権限 = `scripts/company-db/create-master-edit-roles.mjs` の MASTER_EDIT_WRITE (core.products に expiry_managed, inbound_date_managed を足した)
 - 当て方 (🚨 まだ流さない): 0061 の後。`migrate.mjs --dry-run` (0062 だけが出る) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (権限を足す。流し直す前は画面の保存が DB の permission denied = 500 で断られ、何も書かない) → コードを出す
+### NE 登録の CSV の「取り込んだと申告」をなくす (0063・2026-10-08 中原さんの決定 a。番号 = 0061 (#1661)・0062 (#1662) の後)
+
+- 申告 (sha256・結果) をしなくても、翌朝の照合 ② の `ops.record_ne_registration_check` が、配った (issued) だけの品目も確かめる。結び付け = **配った時刻 (`ne_reg_exports.issued_at`) より後に取った NE の完全な取得で、全部の列が配った値 (expected) と合う**
+  - 取得が配った時刻より前 (同じ時刻も) = 比べない (waiting)・観測が信用できない = waiting
+  - NE に無い = waiting (申告が無い = failed にしない)。配ってから 3 日を過ぎた取得 (「無い」を信じてよいとき) でも無い = 答えの `not_imported` に出す → 照合の朝の要約 (② の行) に ℹ️「配ってから 3 日たっても NE に無い (取り込まれていないらしい)」(失敗にしない・状態も変えない)
+  - NE にある = 全部の列が合えば verified (登録 draft → ne_pending → ne_confirmed・どちらも system / ne_compare)・違う列があれば partial (登録は下書きのまま・翌朝もう一度比べる)
+- 申告した品目 (import_declared・申告の後の partial) は 0053 のまま (申告の時刻から・無ければ failed)。申告のボタンは残す (一部失敗・全部だめを知らせたいとき = 任意)
+- 申告なしの照合で partial になった品目に後から申告 (#1659 Codex R2 High): `ops.ne_reg_declare` を置き換え、ok / partial = その品目に試み (attempt_id) を結ぶ (状態は partial のまま・登録 draft → ne_pending・以後は申告の時刻から比べる)・rejected_all = その品目も failed
+- **自動にしない品目** (`ops.ne_reg_auto_block`・#1659 Codex R1 High 1・High 2): NE の完全な取得 (`apps/warehouse/ne-api.js` の項目) に単品の JAN・セットの税率・セットの行の順が無い = 比べられない。
+  比べられない列に値を送った品目 = 単品で JAN の欄が `empty` でない (jan_not_compared)・セット (set_not_compared)、と 0058 の配った時の許可の印 (`lease_id`・`lease_compare_run_id`) が無い前からの行 (no_issue_lease) は、
+  NE にあっても `in_ne_undeclared` のまま (状態は変えない)・答えの `needs_declaration` → 要約に ℹ️「NE にあるが自動では確かめない (取り込んだと申告すると確かめる)」。申告すると 0053 のまま確かめる
+- **残る危なさ (受け入れ・取り込みの証明はしない)**: 次の 3 つは翌朝の観測が同じ形になり区別できない (比べた全部の列は配った値と同じ = NE の中身は登録どおり)。
+  中原さんの 10/6 の決定 (「その日に NE の画面で同じコードの商品を直接作る (決まり違反)」と「保存しておいた古い CSV をもう一度取り込む」の危なさを受け入れる) と同じ種類として受け入れる
+  - 朝の完全な取得の後から配るまでに、別の経路で同じコード・同じ値の商品が NE に作られた
+  - 今のファイルを取り込まずに、前に保存した古いファイルを配った後に取り込んだ
+  - 0058 の発行時の印が無い前からの issued の行 (→ no_issue_lease で自動にしない = 申告で進める)
+- `ops.transition_sku_registration` に「draft → ne_pending を照合の確かめ (system・ne_compare) で」の道だけ足す (根拠 = 申告なしの verified の確かめ・同じ照合の回・配った後の取得。関数が自分で読む)
+- 品目の状態の地図に issued → verified / partial。`ck_nri_declared` = import_declared だけ申告の試みが要る (前からの行は満たす)
+- 当て方 (🚨 まだ流さない): コードを先に出しても壊れない (0063 の前の DB = 今までどおり in_ne_undeclared を残すだけ・要約の ℹ️ は出ない) が、画面は「申告しなくてよい」と書く = **migration は Render のデプロイと同じ日に** → `migrate.mjs --dry-run` (0063 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい (新しい関数 `ops.ne_reg_auto_block` はだれにも渡さない = migration が public から外す・照合の確かめの grant は migration が流し直す)

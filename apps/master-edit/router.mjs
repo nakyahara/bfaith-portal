@@ -95,9 +95,12 @@ const SEARCH_COND_MAX_BYTES = 64 * 1024;
 const SEARCH_LABELS = Object.freeze({ codes: '商品コード', parents: '代表 (親) の商品コード', sups: '仕入先コード', jans: 'JAN', name: '商品名', q: '絞る欄' });
 
 /** NE 登録の CSV の画面の言葉 */
-const REG_EXPORT_STATES = Object.freeze({ built: '作った (まだ配っていない)', issued: '配った (取り込み待ち)', declared: '取り込んだと申告', closed: '閉じた' });
+const REG_EXPORT_STATES = Object.freeze({ built: '作った (まだ配っていない)', issued: '配った (NE に取り込んだら、翌朝自動で確かめます)', declared: '取り込んだと申告', closed: '閉じた' });
 const REG_CLOSE_REASONS = Object.freeze({ superseded: '使わない', rejected_all: '全部だめ', finished: '全部の商品が終わった' });
-const REG_CHECK_OUTCOMES = Object.freeze({ verified: 'NE で確かめた', partial: '違う列がある', failed: '取り込めなかった', waiting: '待ち', in_ne_undeclared: 'NE にある (申告がまだ)' });
+// in_ne_undeclared = NE にあるが自動では確かめない (0063 の ops.ne_reg_auto_block: セット・JAN を送った・配った時の印が無い) = 取り込んだと申告すると確かめる
+const REG_CHECK_OUTCOMES = Object.freeze({ verified: 'NE で確かめた', partial: '違う列がある', failed: '取り込めなかった', waiting: '待ち', in_ne_undeclared: 'NE にある (申告すると確かめます)' });
+const REG_AUTO_BLOCKS = Object.freeze({ jan_not_compared: 'JAN を送った (NE の取得に JAN が無く、自動では比べられない)', set_not_compared: 'セット (税率・行の順は NE の取得に無く、自動では比べられない)',
+  no_issue_lease: '配った時の許可の印が無い (前からのファイル)', no_row: 'CSV の行が読めない', no_item: '品目が無い' });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const view = (name) => path.join(__dirname, 'views', name);
@@ -693,7 +696,7 @@ router.get('/reg-csv', (req, res) => withPgPage(req, res, async (db, dbError) =>
   const gate = approverGate(req);
   res.render(view('reg-csv.ejs'), {
     ...pageLocals(req, phase), nav: 'regcsv', dbError, summary, canApprove: gate.ok, approveMessage: gate.message || '',
-    REG_STATES, ITEM_STATES: REG_ITEM_STATES, RESULTS: REG_RESULTS, EXPORT_STATES: REG_EXPORT_STATES, CLOSE_REASONS: REG_CLOSE_REASONS, CHECK_OUTCOMES: REG_CHECK_OUTCOMES,
+    REG_STATES, ITEM_STATES: REG_ITEM_STATES, RESULTS: REG_RESULTS, EXPORT_STATES: REG_EXPORT_STATES, CLOSE_REASONS: REG_CLOSE_REASONS, CHECK_OUTCOMES: REG_CHECK_OUTCOMES, AUTO_BLOCKS: REG_AUTO_BLOCKS,
   });
 }));
 router.get('/api/reg-csv/summary', (req, res) => withPgApi(res, async (db) => res.json({ ok: true, ...(await regSummary(db, { nowMs: clock() })) })));

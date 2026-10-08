@@ -25,17 +25,17 @@
       pipe = [
         { n: '① 作る', t: 'CSV にする', c: buildable, u: '件 作れる', s: `下書き・NE 登録待ち ${S.candidates.length} 件のうち`, hot: buildable > 0 },
         { n: '② 配る', t: 'ダウンロード', c: by('built').length, u: '件', s: '作って まだ配っていない', hot: by('built').length > 0 },
-        { n: '③ NE で取り込む', t: 'NE の画面で', c: by('issued').length, u: '件 待ち', s: by('issued').length ? 'ファイル ' + by('issued').map((e) => '#' + e.export_id).join('・') : '配ったファイルを取り込んで申告', hot: by('issued').length > 0, ne: true },
-        { n: '④ 申告した', t: '翌朝の照合待ち', c: by('declared').length, u: '件', s: '翌朝の照合で NE と同じか確かめる', hot: false },
+        { n: '③ NE で取り込む', t: 'NE の画面で', c: by('issued').length, u: '件 待ち', s: by('issued').length ? 'ファイル ' + by('issued').map((e) => '#' + e.export_id).join('・') + ' · 取り込めば翌朝自動で確かめる' : '配ったファイルを NE で取り込む (申告はしなくてよい)', hot: by('issued').length > 0, ne: true },
+        { n: '④ 申告 (任意)', t: '一部失敗を知らせる', c: by('declared').length, u: '件', s: 'しなくても翌朝の照合で確かめる', hot: false },
         { n: '⑤ 翌朝の確かめ', t: 'NE と同じだった', c: verifiedItems, u: '商品', s: '最近のファイルの中で · そろえば NE 確認済み', hot: false },
       ];
     }
     const steps = (e) => {
       const done = (x) => ({ t: x, cls: 'done' });
-      if (e.state === 'built') return [done('作った'), { t: '配る (ダウンロード)', cls: 'cur' }, { t: 'NE で取り込んで申告' }, { t: '翌朝の確かめ' }];
-      if (e.state === 'issued') return [done('作った'), done('配った'), { t: 'NE で取り込んで申告', cls: 'cur' }, { t: '翌朝の確かめ' }];
-      if (e.state === 'declared') return [done('作った'), done('配った'), done('申告した'), { t: '翌朝の確かめ', cls: 'cur' }];
-      if (e.close_reason === 'finished') return [done('作った'), done('配った'), done('申告した'), done('翌朝の確かめ')];
+      if (e.state === 'built') return [done('作った'), { t: '配る (ダウンロード)', cls: 'cur' }, { t: 'NE で取り込む' }, { t: '翌朝の確かめ (自動)' }];
+      if (e.state === 'issued') return [done('作った'), done('配った'), { t: 'NE で取り込む', cls: 'cur' }, { t: '翌朝の確かめ (自動)' }];
+      if (e.state === 'declared') return [done('作った'), done('配った'), done('申告した'), { t: '翌朝の確かめ (自動)', cls: 'cur' }];
+      if (e.close_reason === 'finished') return [done('作った'), done('配った'), ...(e.declared_at ? [done('申告した')] : []), done('翌朝の確かめ')];
       return [done('作った'), { t: CLOSE_REASONS[e.close_reason] || '閉じた', cls: 'bad' }];
     };
   %>
@@ -44,7 +44,7 @@
     <div class="ph">
       <div>
         <h1>NE 登録の CSV</h1>
-        <div class="lead">新商品 (下書き) を NE の「商品一括登録」で取り込む CSV にします。<b style="color:var(--text)">作る → 配る (ダウンロード) → NE で取り込む → 取り込んだと申告 → 翌朝の照合で NE 確認済み</b>。</div>
+        <div class="lead">新商品 (下書き) を NE の「商品一括登録」で取り込む CSV にします。<b style="color:var(--text)">作る → 配る (ダウンロード) → NE で取り込む → 翌朝の照合が自動で確かめて NE 確認済み</b>。「取り込んだと申告」はしなくて大丈夫です。</div>
       </div>
       <div class="ph-actions"><a class="btn" href="<%= base %>/manual#reg-csv"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
     </div>
@@ -69,7 +69,7 @@
         <div class="body hint">
           <% for (const [k, v] of Object.entries(S.verified)) { %><div><b style="color:var(--text2)"><%= kindLabel[k] %></b> <span class="mono" style="font-size:12px;overflow-wrap:anywhere"><%= v.header %></span></div><% } %>
           <div style="margin-top:6px">配った後は、その商品の NE に送る欄 (名前・売価・原価・税率・仕入先・取扱区分・代表・JAN・セットの構成) は直せません。直すときは、そのファイルを「使わない」にして、NE で何をしたかを書いてください。
-          NE の履歴の状態が「処理成功」でも、メッセージに「N件失敗」があれば <b style="color:var(--text)">一部失敗</b> で申告します。</div>
+          申告はしなくても、翌朝の照合が配った値と NE を全部の列で比べて確かめます。NE の履歴の状態が「処理成功」でも、メッセージに「N件失敗」があったときは <b style="color:var(--text)">一部失敗</b> を申告して知らせられます (任意)。</div>
         </div>
       </details>
     </section>
@@ -133,6 +133,8 @@
             <% for (const i of e.items) { %>
               <tr><td class="code"><a href="<%= base %>/sku/<%= encodeURIComponent(i.code) %>"><%= i.code %></a></td><td><%= ITEM_STATES[i.state] || i.state %></td>
                 <td><% if (i.last_check) { %><%= CHECK_OUTCOMES[i.last_check.outcome] || i.last_check.outcome %> <span class="muted" style="font-size:12.5px"><%= i.last_check.compare_run_id %></span><% } else { %><span class="muted">まだ</span><% } %>
+                  <% if (i.last_check && i.last_check.detail && i.last_check.detail.auto_block) { %><div class="why-wrn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>自動では確かめません: <%= (typeof AUTO_BLOCKS !== 'undefined' && AUTO_BLOCKS[i.last_check.detail.auto_block]) || i.last_check.detail.auto_block %> = 「取り込んだと申告 (任意)」をすると翌朝確かめます</span></div><% } %>
+                  <% if (i.last_check && i.last_check.detail && i.last_check.detail.not_imported === true) { %><div class="why-wrn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>配ってから日がたっても NE に無い = 取り込まれていないらしい (NE で取り込むか、使わないにする)</span></div><% } %>
                   <% if (i.last_check && i.last_check.detail && i.last_check.detail.compare && i.last_check.detail.compare.cols) { %>
                     <% for (const [col, x] of Object.entries(i.last_check.detail.compare.cols)) { if (x.ok) continue; %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><span><%= col %>: NE <%= JSON.stringify(x.observed && x.observed.v !== undefined ? x.observed.v : x.observed) %> / 目標 <%= JSON.stringify(x.expected) %></span></div><% } %>
                   <% } %></td>
@@ -146,8 +148,9 @@
           <% if (e.state === 'built') { %>
             <button class="btn pri" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>配る (ダウンロード)</button>
           <% } else if (e.state === 'issued') { %>
-            <button class="btn pri" type="button" data-act="show-declare" aria-expanded="false" aria-controls="dr-d-<%= e.export_id %>"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>取り込んだと申告</button>
+            <span class="hint">NE に取り込んだら、翌朝の照合で自動で確かめます (申告はしなくて大丈夫です)</span>
             <button class="btn" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
+            <button class="btn sm" type="button" data-act="show-declare" aria-expanded="false" aria-controls="dr-d-<%= e.export_id %>"<%= dis %>>取り込んだと申告 (任意)</button>
           <% } else { %>
             <span class="hint">翌朝の照合で NE と同じか確かめます (何もしなくて大丈夫です)</span>
             <button class="btn sm" type="button" data-act="issue"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
@@ -158,7 +161,7 @@
         </div>
         <% if (e.state !== 'built') { %>
         <div class="drawer" id="dr-d-<%= e.export_id %>" data-drawer="declare" hidden>
-          <div class="panel-h" style="margin-bottom:6px"><h3 style="font-size:15.5px">取り込んだと申告</h3><span class="sub">NE の画面で取り込んだ結果をそのまま書きます</span></div>
+          <div class="panel-h" style="margin-bottom:6px"><h3 style="font-size:15.5px">取り込んだと申告 (任意)</h3><span class="sub">しなくても翌朝の照合で確かめます。一部失敗・全部だめを知らせたいときに、NE の画面の結果をそのまま書きます</span></div>
           <div class="f" style="align-items:start"><div class="lab" style="padding-top:12px">取り込んだファイル</div><div class="ctl col">
             <label class="drop" data-drop>
               <span class="fileico"><svg class="ic l" aria-hidden="true"><use href="#i-file"/></svg></span>

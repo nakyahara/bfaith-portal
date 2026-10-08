@@ -180,7 +180,8 @@ export function neSummary(ne) {
   const rt = regTrouble(ne);
   // 区分の差 (区分の持ち主が C) と新商品の登録の不一致は両方とも先頭に (片方で片方を隠さない。区分を先に)
   const kt = kindTrouble(ne);
-  if (rt || kt) return `⚠️ ②: ${[kt, rt].filter(Boolean).join(" / ")} — 差 ${ne.counts?.items ?? 0} 件${rt ? regSummary(ne) : ""}`;
+  // 0063 の知らせ (配ってから日がたっても NE に無い・NE にあるが申告が要る) は区分違いの朝も出す (#1659 Codex R1 Medium = rt が無いと消えていた)
+  if (rt || kt) { const an = notImportedNote(ne); return `⚠️ ②: ${[kt, rt].filter(Boolean).join(" / ")} — 差 ${ne.counts?.items ?? 0} 件${rt ? regSummary(ne) : an ? `・${an}` : ""}`; }
   const b = ne.counts?.by_class || {};
   const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
   // 基準 (D2) を照らさなかった回 (NE の取得と CDB の読みが 4 時間超) は ⚠️ にしないが、続くと基準が貯まらないので見えるようにする
@@ -191,13 +192,16 @@ export function neSummary(ne) {
 }
 /**
  * ポータルで登録した新商品で NE に無いもの (差にしない NE 登録待ち・日がたった reg_stale は差の件数にも入る)。0 件なら何も足さない。
- * 登録の状態を読めない朝 = 待ちを分けていない (差に含む) と書く
+ * 登録の状態を読めない朝 = 待ちを分けていない (差に含む) と書く。
+ * 0063: 配ったが申告していない商品は照合の確かめが自動で NE 確認済みにする。配ってから日がたっても NE に無い商品は確かめの答えの not_imported で
+ *   「取り込まれていないらしい」を ℹ️ で足す (失敗にはしない)
  */
 const STAGE_JA = { before_issue: 'CSV を配る前', issued: '配った', declared: '取り込んだ申告の後', failed: '取り込めていない', rejected: 'NE が全部拒んだ', partial: '中身が違う', verified: '確かめ済み' };
 export function regSummary(ne) {
+  const ni = notImportedNote(ne);
   const rp = ne && ne.reg_pending;
-  if (!rp) return '';
-  if (rp.state === 'unreadable') return '・NE 登録待ちを読めない (差に含む)';
+  if (!rp) return ni ? `・${ni}` : '';
+  if (rp.state === 'unreadable') return `・NE 登録待ちを読めない (差に含む)${ni ? `・${ni}` : ''}`;
   const c = ne.counts || {};
   const parts = [];
   if (c.reg_pending) {
@@ -206,7 +210,24 @@ export function regSummary(ne) {
     parts.push(`NE 登録待ち ${c.reg_pending} 件 (差に入れない${st ? `。${st}` : ''})`);
   }
   if (c.reg_stale) parts.push(`登録から ${rp.stale_days} 日以上 NE に無い ${c.reg_stale} 件 (差)`);
+  if (ni) parts.push(ni);
   return parts.length ? `・${parts.join('・')}` : '';
+}
+/**
+ * 0063 の確かめの答えの知らせ (知らせるだけ = 照合は失敗にしない)。無ければ null。コードは 5 件まで
+ *   not_imported = 配ってから日がたっても NE に無い (申告なし・「無い」を信じてよい取得) = 取り込まれていないらしい
+ *   needs_declaration = NE にあるが自動で確かめない (セット・JAN を送った・配った時の印が無い = #1659 Codex R1) = 申告すると確かめる
+ */
+const AUTO_BLOCK_JA = { jan_not_compared: 'JAN', set_not_compared: 'セット', no_issue_lease: '配った時の印なし', no_row: '行なし', no_item: '品目なし' };
+export function notImportedNote(ne) {
+  const w = ne && ne.registrations && ne.registrations.written;
+  const codesOf = (list, label) => list.slice(0, 5).map((x) => x && x.code && (label ? `${x.code} ${label(x)}` : x.code)).filter(Boolean).join('・') + (list.length > 5 ? ` ほか ${list.length - 5}` : '');
+  const parts = [];
+  const ni = w && Array.isArray(w.not_imported) ? w.not_imported : [];
+  if (ni.length) parts.push(`ℹ️ 配ってから ${w.not_imported_days ?? 3} 日たっても NE に無い (取り込まれていないらしい) ${ni.length} 件 (${codesOf(ni)})`);
+  const nd = w && Array.isArray(w.needs_declaration) ? w.needs_declaration : [];
+  if (nd.length) parts.push(`ℹ️ NE にあるが自動では確かめない (取り込んだと申告すると確かめる) ${nd.length} 件 (${codesOf(nd, (x) => AUTO_BLOCK_JA[x.reason] || x.reason)})`);
+  return parts.length ? parts.join('・') : null;
 }
 /**
  * 確かめ (record_ne_registration_check) の後に登録の段階を読み直す (照合の読む接続・読み取りだけの短い取引)。
@@ -385,7 +406,10 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     Object.assign(result, { compare_run_id: compareRunId, started_at: startedAt, finished_at: new Date().toISOString() });
     j = writeResultJson(dataDir, asOf, compareRunId, result);
     const regEvidence = () => (result.ne && result.ne.registrations ? { targets: result.ne.registrations.targets ?? null, write: result.ne.registrations.write ?? null,
-      seal: result.ne.registrations.seal ?? null, counts: result.ne.registrations.written?.counts ?? null, write_error: result.ne.registrations.write_error ?? null } : null);
+      seal: result.ne.registrations.seal ?? null, counts: result.ne.registrations.written?.counts ?? null,
+      not_imported: Array.isArray(result.ne.registrations.written?.not_imported) ? result.ne.registrations.written.not_imported.length : null,   // 0063: 配ってから日がたっても NE に無い (知らせるだけ)
+      needs_declaration: Array.isArray(result.ne.registrations.written?.needs_declaration) ? result.ne.registrations.written.needs_declaration.length : null,   // 0063: NE にあるが申告が要る
+      write_error: result.ne.registrations.write_error ?? null } : null);
     evidence = {
       state: 'complete', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt, finished_at: result.finished_at,
       json_path: j.rel, sha256: j.sha256, bytes: j.bytes, format: result.format,
