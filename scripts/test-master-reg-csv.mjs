@@ -575,6 +575,46 @@ await ta('[C8c] 申告なしでも自動にしない (#1659 Codex R1 High 1・Hi
   await supersede(rl.export.export_id);
 });
 
+await ta('[C8d] 申告なしの照合で partial になった後の任意の申告 (#1659 Codex R2 High): ok / partial = その品目に試みを結ぶ (登録 → NE 登録待ち・以後は申告の時刻から比べる)・rejected_all = その品目も failed (後で値が合っても確認済みにしない)', async () => {
+  const autoPartial = async (code) => {
+    await reg('single', code, single({ name: `単品 ${code}` }));
+    const r = await build('products', [code]);
+    await issue(r.export.export_id);
+    const run = await newRun();
+    const c = await check(run, [obsSingle(code, { name: ok(`単品 ${code}`), price: ok(1499) })]);
+    assert.deepEqual([c.counts, (await itemsOf(r.export.export_id))[0].state, await regOf(code)], [{ partial: 1 }, 'partial', 'draft'], code);
+    return r.export;
+  };
+  const attOf = async (id) => (await one('select attempt_id::text as a from ops.ne_reg_export_items where export_id = $1', [id])).a;
+  for (const result of ['ok', 'partial']) {
+    const code = `auto-d${result}`;
+    const ex = await autoPartial(code);
+    const d = await declare(ex.export_id, ex.sha256, result, { msg: result === 'ok' ? '1件成功しました。' : '0件成功、1件失敗しました。' });
+    assert.deepEqual([d.state, d.ne_pending], ['declared', [code]], result);
+    const att = (await one('select attempt_id::text as a from ops.ne_reg_attempts where export_id = $1 order by attempt_id desc limit 1', [ex.export_id])).a;
+    assert.deepEqual([(await itemsOf(ex.export_id))[0].state, await attOf(ex.export_id), await regOf(code)], ['partial', att, 'ne_pending'], `${result}: 品目に試みを結ぶ`);
+    const ev = await one("select e.evidence, e.actor_type from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = $1 and e.to_state = 'ne_pending'", [code]);
+    assert.deepEqual([ev.actor_type, String(ev.evidence.attempt_id)], ['human', att]);
+    // 申告の後の取得で全部の列が合う = verified + NE 確認済み (申告の道)
+    const run = await newRun();
+    const c = await check(run, [obsSingle(code, { name: ok(`単品 ${code}`) })]);
+    assert.deepEqual([c.counts, (await itemsOf(ex.export_id))[0].state, await regOf(code)], [{ verified: 1 }, 'verified', 'ne_confirmed'], result);
+    assert.equal((await one('select detail from ops.ne_reg_checks where compare_run_id = $1', [run])).detail.basis, 'declared');
+  }
+  // 全部だめ = その品目も failed・ファイルは閉じる・後で NE の値が合っても確認済みにしない (下書きのまま)・作り直せる
+  const ex = await autoPartial('auto-drej');
+  const x = await declare(ex.export_id, ex.sha256, 'rejected_all', { msg: '0件成功、1件失敗しました。' });
+  assert.deepEqual([x.state, x.failed], ['closed', 1]);
+  assert.deepEqual((await itemsOf(ex.export_id)).map((i) => [i.state, i.failed_reason]), [['failed', 'rejected_all']]);
+  const run = await newRun();
+  const c = await check(run, [], {});
+  assert.deepEqual(c.counts, {}, '全部だめの品目は確かめ待ちに入らない');
+  assert.deepEqual([(await itemsOf(ex.export_id))[0].state, await regOf('auto-drej')], ['failed', 'draft']);
+  const again = await build('products', ['auto-drej']);
+  assert.ok(again.export.export_id > ex.export_id, '作り直せる');
+  await supersede(again.export.export_id);
+});
+
 await ta('[C9] セット: 構成品が全部 NE 確認済み・構成品 1 つで 1 行 (並び = 依頼のとおり)・同じ取得の構成品が全部合うときだけ verified', async () => {
   const r = await build('sets', ['new-set']);
   const id = r.export.export_id;

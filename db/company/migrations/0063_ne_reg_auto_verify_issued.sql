@@ -38,7 +38,9 @@
 --   3. 品目の状態の地図 (ops.ne_reg_item_transition_allowed) に issued → verified / issued → partial を足す
 --   4. ops.ne_reg_export_items の ck_nri_declared を「import_declared は申告の試みが要る」にゆるめる (verified / partial は申告なしでもよい)。
 --      前からの行は前の CHECK (もっと強い) を満たしている = 新しい CHECK も満たす (表は小さい = 確かめの読みは短い)
---   ・ops.ne_reg_checks の outcome の in_ne_undeclared は前からの記録のために残す (新しくは書かない)
+--   ・ops.ne_reg_checks の outcome の in_ne_undeclared は、自動にしない品目 (ops.ne_reg_auto_block) が NE にあるときに書く (0053 と同じ意味 = 申告すると確かめる)
+--   5. ops.ne_reg_declare を置き換える (#1659 Codex R2 High): 申告なしの照合で partial になった品目にも申告を結ぶ (ok / partial = attempt_id・rejected_all = failed)。
+--      ops.transition_sku_registration の人の道 (ne_pending) の根拠に「申告を結んだ partial」を足す
 --   ・ops.registration_transition_allowed (0052 の地図) は変えない (draft → ne_pending → ne_confirmed は前からある)
 -- 🚨 security definer の関数は search_path = pg_catalog, pg_temp・名前は全部 schema つき・一時の表を使わない・public の実行権なし (0053 / 0058 と同じ)。
 --    create or replace は今の権限を残す = 下の権限の節は 0053 と同じ grant を流し直すだけ
@@ -203,11 +205,81 @@ begin
 end $$;
 revoke all on function ops.record_ne_registration_check(text) from public;
 
+-- ─── 5. 取り込んだと申告 (0053 の置き換え・#1659 Codex R2 High) ───
+/**
+ * 取り込んだと申告する。sha256 = ファイルの記録と同じ (trigger も見る)・申告した人・時刻 (関数の now)・結果・NE のメッセージ。
+ * ok / partial = 商品 issued → import_declared・登録の状態 draft → ne_pending (ops.transition_sku_registration が、この試みの記録を自分で読む) /
+ * rejected_all = 商品 failed・ファイルを閉じる。申告したファイルにもう一度 = 試みを足すだけ。約束 = reg_csv_declare (相手 = このファイル)
+ * 🆕 0063 (#1659 Codex R2 High): 申告なしの照合で issued → partial になった品目 (attempt_id が null) も申告に結ぶ =
+ *   ok / partial = その品目に試み (attempt_id) を付ける (状態は partial のまま・以後は申告の時刻から比べる)・登録 draft → ne_pending /
+ *   rejected_all = その品目も failed (rejected_all)。ほかは 0053 と同じ (鍵の順・約束・security definer・search_path)
+ */
+create or replace function ops.ne_reg_declare(p_request_id uuid, p_actor_id text, p_ownership jsonb, p_export_id bigint, p_sha256 text, p_result text,
+                                   p_ne_message text, p_imported_at timestamptz, p_note text) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  e        ops.ne_reg_exports%rowtype;
+  v_att    bigint;
+  v_at     timestamptz;
+  v_sku    bigint;
+  v_moved  text[] := '{}';
+  v_code   text;
+  v_failed integer;
+  v_result jsonb;
+begin
+  if ops.reg_actor_problem(p_actor_id, null) is not null then raise exception 'invalid_input: 申告する人 (actor) の形が違う' using errcode = '22023'; end if;
+  if coalesce(p_sha256, '') !~ '^[0-9a-f]{64}$' then raise exception 'invalid_input: sha256 (64 桁) が要る' using errcode = '22023'; end if;
+  if p_result is null or p_result not in ('ok', 'partial', 'rejected_all') then raise exception 'invalid_input: 結果は ok / partial / rejected_all' using errcode = '22023'; end if;
+  if p_ne_message is not null and (pg_catalog.length(p_ne_message) > 1000 or p_ne_message ~ '[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]') then
+    raise exception 'invalid_input: NE のメッセージは 1,000 字まで (制御文字なし)' using errcode = '22023';
+  end if;
+  if p_note is not null and (pg_catalog.length(p_note) > 500 or p_note ~ '[[:cntrl:]]') then raise exception 'invalid_input: メモは 500 字まで' using errcode = '22023'; end if;
+  perform ops.reg_write_gate(p_ownership);
+  e := ops.ne_reg_lock_export(p_export_id);
+  if e.sha256 <> p_sha256 then raise exception 'sha256_mismatch: sha256 がファイル % の記録と違う', p_export_id using errcode = 'P0001'; end if;
+  if e.state = 'built' then raise exception 'not_issued: 先に配る (ダウンロード)' using errcode = 'P0001'; end if;
+  if e.state = 'closed' then raise exception 'closed: ファイル % は閉じている (%)', p_export_id, e.close_reason using errcode = 'P0001'; end if;
+  if p_imported_at is not null and (p_imported_at > pg_catalog.now() or p_imported_at < e.issued_at - interval '1 minute') then
+    raise exception 'invalid_input: 取り込んだ時刻が配った時刻と今の間でない' using errcode = '22023';
+  end if;
+  perform ops.open_reg_write('reg_csv_declare', p_request_id, p_actor_id, null, p_ownership, null, null, null,
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'reg_csv_declare', 'export_id', p_export_id, 'sha256', p_sha256, 'result', p_result, 'ne_message', p_ne_message,
+      'imported_at', p_imported_at, 'note', p_note)),
+    pg_catalog.jsonb_build_object('export_id', p_export_id::text, 'sku_ids', ops.ne_reg_export_skus(p_export_id)));
+  insert into ops.ne_reg_attempts (export_id, sha256, declared_by, imported_at, result, ne_message, note)
+    values (p_export_id, p_sha256, p_actor_id, p_imported_at, p_result, p_ne_message, p_note) returning attempt_id, declared_at into v_att, v_at;
+  if e.state = 'declared' then
+    v_result := pg_catalog.jsonb_build_object('state', 'declared', 'attempt_id', v_att::text, 'first_declared_at', e.declared_at, 'again', true);
+  elsif p_result = 'rejected_all' then
+    update ops.ne_reg_export_items set state = 'failed', failed_reason = 'rejected_all', state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id
+     where export_id = p_export_id and (state = 'issued' or (state = 'partial' and attempt_id is null));   -- 🆕 0063: 申告なしの照合の partial も
+    get diagnostics v_failed = row_count;
+    update ops.ne_reg_exports set state = 'closed', closed_at = pg_catalog.now(), closed_by = p_actor_id, close_reason = 'rejected_all' where export_id = p_export_id;
+    v_result := pg_catalog.jsonb_build_object('state', 'closed', 'attempt_id', v_att::text, 'failed', v_failed);
+  else
+    update ops.ne_reg_export_items set state = 'import_declared', attempt_id = v_att, state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id
+     where export_id = p_export_id and state = 'issued';
+    -- 🆕 0063: 申告なしの照合で partial になった品目にも、この試みを結ぶ (状態は partial のまま = 翌朝から申告の時刻の後の取得で比べ直す)
+    update ops.ne_reg_export_items set attempt_id = v_att, state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id
+     where export_id = p_export_id and state = 'partial' and attempt_id is null;
+    update ops.ne_reg_exports set state = 'declared', declared_at = v_at, declared_by = p_actor_id where export_id = p_export_id;
+    for v_sku, v_code in select i.sku_id, i.ne_code from ops.ne_reg_export_items i join ops.master_registrations r on r.sku_id = i.sku_id
+                          where i.export_id = p_export_id and i.state in ('import_declared', 'partial') and i.attempt_id = v_att and r.state = 'draft' order by i.sku_id loop
+      perform ops.transition_sku_registration(v_sku, 'ne_pending', 'human', p_actor_id, 'NE に新規登録の CSV を取り込んだ', '{}'::jsonb, p_request_id::text);
+      v_moved := v_moved || v_code;
+    end loop;
+    v_result := pg_catalog.jsonb_build_object('state', 'declared', 'attempt_id', v_att::text, 'ne_pending', pg_catalog.to_jsonb(v_moved));
+  end if;
+  perform ops.close_reg_write(v_result, 'reg-csv #' || p_export_id);
+  return v_result;
+end $$;
+revoke all on function ops.ne_reg_declare(uuid, text, jsonb, bigint, text, text, text, timestamptz, text) from public;
+
 -- ─── 2. 登録の状態の関数 (0053 の置き換え・引数は同じ) ───
 /**
  * ne_pending・ne_confirmed の根拠は、関数が 0053 の記録から自分で読んで鍵を取る (呼び手の渡す根拠の JSON は信じない = 渡したら拒む caller_evidence)。
  * distributable / available は ④ まで not_ready のまま。
- *   ne_pending   ← (人) この SKU の新規登録の CSV の品目が import_declared・その試み (結果 ok / partial・sha256 = ファイルの記録) がある (0053 のまま)
+ *   ne_pending   ← (人) この SKU の新規登録の CSV の品目が import_declared (🆕 0063: か、申告を結んだ partial)・その試み (結果 ok / partial・sha256 = ファイルの記録) がある
  *                ← (system・0063) 下書きから: この SKU の照合の確かめ (ops.ne_reg_checks) が verified・その品目が verified で同じ照合の回・
  *                  申告なし (attempt_id が null)・回の記録がある = 申告をしなかった品目を照合が確かめた (照合の確かめの中だけが通る道)
  *   ne_confirmed ← ne_pending から: この SKU の照合の確かめ (ops.ne_reg_checks) が verified・その品目が verified で同じ照合の回・回の記録がある (system)
@@ -248,7 +320,7 @@ begin
         from ops.ne_reg_export_items i
         join ops.ne_reg_exports e on e.export_id = i.export_id
         join ops.ne_reg_attempts a on a.attempt_id = i.attempt_id and a.export_id = i.export_id
-       where i.sku_id = p_sku_id and i.state = 'import_declared' and e.state = 'declared' and a.sha256 = e.sha256 and a.result in ('ok', 'partial')
+       where i.sku_id = p_sku_id and i.state in ('import_declared', 'partial') and e.state = 'declared' and a.sha256 = e.sha256 and a.result in ('ok', 'partial')   -- 🆕 0063: 申告を結んだ partial も
        order by i.item_id desc limit 1
        for share of i, e;
       if not found then
