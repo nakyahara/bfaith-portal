@@ -384,7 +384,9 @@ router.post('/upload', upload.single('file'), (req, res) => {
   }
 
   // /confirm でサーバ側の真値として使うため集計結果も保管 (Codex 3R #1: 改竄防御)
-  const canConfirm = unresolved.length === 0 && unresolvedTax.length === 0 && conflicts.length === 0;
+  // 未登録SKUは確定を止めない (米国版と同じ): その行は 10%・その他/未分類・原価0円で集計に入っている。
+  // 件数は unresolved_count として確定データに残し、画面で警告する。税率未登録・セット解決エラーは引き続き止める
+  const canConfirm = unresolvedTax.length === 0 && conflicts.length === 0;
   evidenceStore.set(yearMonth, {
     detail: detailCsv,
     summary: summaryCsv,
@@ -406,7 +408,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
     unresolvedSkus: unresolved,
     unresolvedTaxCount,
     unresolvedTax,
-    canConfirm: unresolved.length === 0 && unresolvedTax.length === 0 && conflicts.length === 0,
+    canConfirm,
     conflicts,
     byTax,
     bySegment,
@@ -512,6 +514,8 @@ function renderPage() {
 
       <div id="unresolvedCard" class="card" style="display:none">
         <h2>⚠️ 未登録SKU</h2>
+        <p class="meta">以下のSKUは商品マスタに見つかりません。<b>税率10%・セグメント「その他/未分類」・原価0円として集計に含めたまま確定できます。</b>
+          8%の商品が混ざっていると税率別・MF連携の金額がずれるため、気になる場合はミニPC管理画面で登録し、翌朝7時の同期後にCSVを再アップロードしてください。</p>
         <div id="unresolvedList"></div>
       </div>
 
@@ -629,15 +633,17 @@ function renderPage() {
       document.getElementById('uploadStatus').textContent = '';
 
       // 概要
-      let summaryHtml = '<div class="' + (data.canConfirm ? 'ok' : 'warn') + '">';
+      const hasUnresolved = data.unresolvedSkus.length > 0;
+      let summaryHtml = '<div class="' + (data.canConfirm && !hasUnresolved ? 'ok' : 'warn') + '">';
       summaryHtml += '<b>対象年月: ' + esc(data.yearMonth) + '</b><br>';
       summaryHtml += '総行数: ' + data.totalRows + ' / SKU解決済: ' + data.resolvedCount + ' / 未登録SKU: ' + data.unresolvedSkus.length + '件';
       if (data.unresolvedTax && data.unresolvedTax.length > 0) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTax.length + '商品</span>';
       if (data.conflicts && data.conflicts.length > 0) summaryHtml += ' / <span class="negative">セット解決エラー: ' + data.conflicts.length + '件</span>';
-      if (data.canConfirm) summaryHtml += '<br><b style="color:#27ae60">✅ 全て解決済み — 確定可能</b>';
+      // 未登録SKUは確定を止めない (10%・その他/未分類・原価0円で集計に入る)。止めるのは税率未登録とセット解決エラーだけ
+      if (data.canConfirm && hasUnresolved) summaryHtml += '<br><b style="color:#d68910">⚠️ 未登録SKUあり（10%・その他/未分類・原価0円で集計に含まれます） — 確定可能</b>';
+      else if (data.canConfirm) summaryHtml += '<br><b style="color:#27ae60">✅ 全て解決済み — 確定可能</b>';
       else {
         const reasons = [];
-        if (data.unresolvedSkus.length > 0) reasons.push('未登録SKU');
         if (data.unresolvedTax && data.unresolvedTax.length > 0) reasons.push('税率未登録');
         if (data.conflicts && data.conflicts.length > 0) reasons.push('セット解決エラー');
         summaryHtml += '<br><b style="color:#e74c3c">❌ ' + reasons.join('・') + 'あり — 確定不可</b>';
@@ -980,10 +986,14 @@ function renderPage() {
     async function doConfirm() {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
       if (!lastData.canConfirm) {
-        alert('未登録SKU・税率未登録・セット解決エラーが残っています。確定できません。');
+        alert('税率未登録・セット解決エラーが残っています。確定できません。');
         return;
       }
-      if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
+      let msg = lastData.yearMonth + ' の集計を確定しますか？';
+      if (lastData.unresolvedSkus.length > 0) {
+        msg += '\\n\\n⚠️ 未登録SKU ' + lastData.unresolvedSkus.length + '件があります（税率10%・その他/未分類・原価0円で集計に含まれます）';
+      }
+      if (!confirm(msg)) return;
       const btn = document.getElementById('confirmBtn');
       btn.disabled = true;
       btn.textContent = '保存中...';
@@ -1039,6 +1049,7 @@ function renderPage() {
           html += '<span><b>' + esc(row.year_month) + '</b> — 商品売上(税込): \\u00a5' + Math.round(hdrSales).toLocaleString()
             + ' / 合計: \\u00a5' + Math.round(hdrTotal).toLocaleString()
             + (ad ? ' / 広告費: \\u00a5' + ad.toLocaleString() : '')
+            + (row.unresolved_count > 0 ? ' <span style="color:#d68910">⚠️ 未登録SKU ' + Number(row.unresolved_count) + '件のまま確定</span>' : '')
             + ' <span class="meta">（' + esc(row.confirmed_at || '') + '）</span></span>';
           html += '<span class="arrow">&#9654;</span></div>';
           html += '<div class="acc-body" id="acc-' + i + '">';
@@ -1263,7 +1274,7 @@ function renderPage() {
       <h2>5. 税率別集計</h2>
       <table class="m-tbl">
         <tr><th>分類</th><th>条件</th></tr>
-        <tr><td><b>10%</b></td><td>消費税率=0.10 の商品、または税率未登録の商品（10%仮扱い）</td></tr>
+        <tr><td><b>10%</b></td><td>消費税率=0.10 の商品、または未登録SKU・SKUなし行（10%仮扱い）</td></tr>
         <tr><td><b>8%</b></td><td>消費税率=0.08 の商品</td></tr>
       </table>
       <div class="note">トランザクション種類が「振込み」の行は集計から除外されます。「注文外料金」はマスタ照合せず「その他」へ。「調整」（FBA在庫補償など）はマスタ照合を試み、Amazon独自採番SKUで照合できないものだけ「その他」に集計されます（確定はブロックしません）。</div>
@@ -1359,7 +1370,7 @@ function renderPage() {
         <li>CSV金額のカンマ区切り（例: <code>3,200</code>）は自動除去されます</li>
         <li>税率未登録の商品は<b>税率別集計から除外</b>（税率未登録リストに表示、確定不可）</li>
         <li>原価0の商品は「原価ゼロ警告」タブに一覧表示</li>
-        <li>未登録SKUがあると確定不可（先にミニPC管理画面で登録）</li>
+        <li>未登録SKUがあっても確定できます（税率10%・その他/未分類・原価0円で集計に含まれ、過去の確定データに「未登録SKU ◯件のまま確定」と出ます）。8%の商品が混ざると税率別・MF連携の金額がずれるので、気になる場合は先にミニPC管理画面で登録</li>
         <li>2022/7〜2026/2のヒストリカルデータは旧スプレッドシートから移行済み</li>
       </ul>
     </div>
@@ -1402,7 +1413,6 @@ router.post('/confirm', (req, res) => {
   }
   const s = cached.serverState;
   if (!s.canConfirm) {
-    if (s.unresolvedCount > 0) return res.status(400).json({ error: '未登録SKUが残っているため確定できません' });
     if (s.unresolvedTaxCount > 0) return res.status(400).json({ error: '税率未登録があるため確定できません' });
     if (s.conflictsCount > 0) return res.status(400).json({ error: 'セット解決エラー(税率/分類混在・構成品欠損・数量不正・マップ先商品欠損)があるため確定できません' });
     return res.status(400).json({ error: '確定不可状態です' });

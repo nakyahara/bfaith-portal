@@ -172,3 +172,35 @@ test('③セグメント別集計CSVダウンロード: ヘッダーと行の列
   assert.equal(oldOther[iEasy + 2], '');
   assert.equal(Number(oldOther[iTotal]), -950);
 });
+
+test('④未登録SKUがあっても確定ボタンは押せる: 概要は「確定可能」の警告・確定の確認文に件数・過去データに「のまま確定」', async () => {
+  const script = await fetchInlineScript();
+  const { ctx, el } = makeContext([{ ...HISTORY[0], unresolved_count: 2 }, HISTORY[1]]);
+  const asked = [];
+  ctx.confirm = msg => { asked.push(msg); return false; };
+  vm.runInNewContext(script, ctx, { filename: 'inline.js' });
+  ctx.showResult({ ...uploadData, unresolvedSkus: [{ sku: 'sku-new', name: '新商品', count: 1, amount: 450 }, { sku: 'sku-new2', name: '新商品2', count: 1, amount: 100 }] });
+  assert.equal(el('confirmBtn').disabled, false);
+  const summary = el('summary').innerHTML;
+  assert.match(summary, /未登録SKUあり（10%・その他\/未分類・原価0円で集計に含まれます） — 確定可能/);
+  assert.doesNotMatch(summary, /確定不可/);
+  assert.equal(el('unresolvedCard').style.display, 'block');
+  await ctx.doConfirm();
+  assert.equal(asked.length, 1);
+  assert.match(asked[0], /未登録SKU 2件があります/);
+  await ctx.loadHistory();
+  const html = el('historyList').innerHTML;
+  assert.equal((html.match(/のまま確定/g) || []).length, 1); // unresolved_count > 0 の月だけ
+  assert.match(html, /未登録SKU 2件のまま確定/);
+});
+
+test('⑤税率未登録があれば確定ボタンは押せない (未登録SKUは理由に出さない)', async () => {
+  const script = await fetchInlineScript();
+  const { ctx, el } = makeContext([]);
+  vm.runInNewContext(script, ctx, { filename: 'inline.js' });
+  ctx.showResult({ ...uploadData, canConfirm: false,
+    unresolvedSkus: [{ sku: 'sku-new', name: '新商品', count: 1, amount: 450 }],
+    unresolvedTax: [{ 商品コード: 'x', sku: 'x', 商品名: 'x', 数量合計: 1, 売上合計: 1, count: 1 }] });
+  assert.equal(el('confirmBtn').disabled, true);
+  assert.match(el('summary').innerHTML, /❌ 税率未登録あり — 確定不可/);
+});
