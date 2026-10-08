@@ -261,9 +261,10 @@ export function composeEdit(cur, submitted) {
     }
     const kind = slotKind(i);
     const lines = known ? applyFields(known.lines, values, known) : newSlotLines(values);
-    const roleChanged = !known || values.role !== shownValue('role', known.role);
+    // `# N枚目｜名前` の名前は元のまま (直すのは 4 見出しの中身だけ・番号だけ振り直す — Codex PR-B 名指し R2 M)。
+    // 名前を作るのは追加した画像だけ (役割から)
     const name = kind === 'top' ? 'サムネイル' : kind === 'fv' ? 'FV'
-      : (roleChanged ? headingNameFromRole(values.role) : known.name);
+      : (known ? known.name : headingNameFromRole(values.role));
     // 番号も名前も変わらなければ見出しの行は元のまま (読む→そのまま書くで元と同じ)
     const headingLine = known && known.no === i && known.name === name ? known.headingLine : `# ${i}枚目｜${name}`;
     if (!known) summary.added += 1;
@@ -325,6 +326,8 @@ export function effectiveComposeText(db, draftId) {
   return {
     job_id: job.id, edit_id: edit ? edit.id : null,
     text: edit ? edit.output_text : job.output_text,
+    // AI の初稿 (直す前)。段階1 の測定 (くらべっこ) はこちらで比べる
+    ai_text: job.output_text,
     source: edit ? 'edit' : 'ai',
     edited_by: edit ? edit.edited_by : null, edited_at: edit ? edit.created_at : null,
   };
@@ -359,11 +362,14 @@ export function effectiveCompose(db, draftId) {
 /**
  * 画像を作ったあとで構成が変わったか (「生成後に構成が変わりました」の印)。
  * いちばん新しい画像の依頼が、どの構成のどの版で作られたかを時刻で割り出して、いまの本文と比べる
- * (ph_lp_image_jobs は画像生成 (PR-E) の持ち場なので列は足さない)
+ * (ph_lp_image_jobs は画像生成 (PR-E) の持ち場なので列は足さない)。
+ * 1 枚もできなかった依頼 (failed / cancelled) は数えない — 直した構成で作り直したつもりが失敗していたら、
+ * Drive にあるのは前の構成の画像のまま (Codex PR-B 名指し R2 L)
  */
 export function imageStaleFor(db, draftId, eff) {
   if (!eff || !eff.job) return false;
-  const img = db.prepare('SELECT compose_job_id, created_at FROM ph_lp_image_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(posInt(draftId));
+  const img = db.prepare(`SELECT compose_job_id, created_at FROM ph_lp_image_jobs
+    WHERE draft_id = ? AND status NOT IN ('failed','cancelled') ORDER BY id DESC LIMIT 1`).get(posInt(draftId));
   if (!img) return false;
   if (img.compose_job_id !== eff.job.id) return true;
   const then = db.prepare(`SELECT output_text FROM ph_lp_compose_edits WHERE base_job_id = ? AND created_at <= ?

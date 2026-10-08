@@ -79,7 +79,7 @@ import {
 } from './lib/lp-image.js';
 import { Readable } from 'node:stream';
 // LP 構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09)。ロジックは lib/lp-edit.js
-import { editStateFor as lpEditStateFor, saveEdit as saveLpEdit, latestEditFor as latestLpEditFor } from './lib/lp-edit.js';
+import { editStateFor as lpEditStateFor, saveEdit as saveLpEdit, effectiveComposeText as lpEffectiveComposeText } from './lib/lp-edit.js';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
@@ -3978,10 +3978,9 @@ function lpComposeInitialState(db, draft) {
   //    ここだけ effectiveProductInfo を渡すと、**裏面情報だけの商品が
   //    画面ではずっと押せない** (API では押せる) という食い違いになる。
   const { productInfo, images } = lpComposeMaterial(db, draft);
-  const st = lpComposeStateFor(db, draft.id);
   return {
-    ...st,
-    lp_edit: lpcEditOf(db, st),
+    ...lpComposeStateFor(db, draft.id),
+    lp_effective: lpEffectiveComposeText(db, draft.id),
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
     image_plan: lpComposeImagePlan(images),
@@ -4042,12 +4041,12 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
   const db = getDB();
   const spec = latestLpSpec(db, 'product_analysis');
   const { productInfo, images } = lpComposeMaterial(db, draft);
-  const st = lpComposeStateFor(db, draft.id);
   res.json({
     ok: true,
-    ...st,
-    // 人が直した版 (あれば)。「AI が作った構成」の箱はこちらを出し、コピー・lp-tool にもこちらを渡す
-    lp_edit: lpcEditOf(db, st),
+    ...lpComposeStateFor(db, draft.id),
+    // 効いている構成 (いちばん新しいできた構成・人が直した版があればそちら)。「AI が作った構成」の箱はこれを出し、
+    // コピー・lp-tool にもこれを渡す (画像生成・LP構成の一覧と同じ構成。作り直しが途中・失敗でも前にできた構成を出す)
+    lp_effective: lpEffectiveComposeText(db, draft.id),
     // 押せるか。押せない理由はそのまま画面に出す
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
@@ -4058,18 +4057,6 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
     spec: lpSpecSummary(db, 'product_analysis'),
   });
 });
-
-/**
- * 「AI が作った構成」の箱 (lpc) に添える、人が直した版 (画像制作の新フロー PR-B)。
- * 箱が本文を出すのは「いちばん新しい依頼が done・実モデル一致」のときだけなので、その依頼への編集版だけを返す。
- * 🚨 AI の生の出力 (job.output_text) はそのまま残す (段階1 の測定の材料)
- */
-function lpcEditOf(db, st) {
-  const job = st && st.job;
-  if (!job || job.status !== 'done' || !job.output_text) return null;
-  const e = latestLpEditFor(db, job.id);
-  return e ? { base_job_id: e.base_job_id, edit_id: e.id, output_text: e.output_text, edited_by: e.edited_by, edited_at: e.created_at } : null;
-}
 
 // ─── 画面: LP構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09) ─────────
 // 正本 = AI_reference『商品ハブ_画像制作の新フロー_設計_20261008.md』§3.1。ロジックは lib/lp-edit.js。
@@ -4158,6 +4145,12 @@ const lpImageTick = () => lpImageWorker.kick().catch((e) => console.error('[prod
 // 定期の見回り (setInterval) は置かない — 画面が作っている間 5 秒おきに状況を見に来るので、そのときに起こす (#1612 R2)
 if (process.env.PH_LP_IMAGE_ENABLED === '1') setTimeout(lpImageTick, 15_000).unref();
 
+/** 効いている構成の版 (構成の依頼 ID・編集版 ID)。構成がまだ無ければ空 */
+function lpComposeVersion(db, draft) {
+  const e = lpEffectiveComposeText(db, draft.id);
+  return e ? e.job_id + ':' + (e.edit_id || '') : '';
+}
+
 /** 参考画像の Drive の更新日時をいま取り直す (受付時に固定する値・#1612 R2 Medium)。取れなければ throw */
 async function lpImageRefTimes(fileIds) {
   const drive = getDriveWriteClient();
@@ -4194,15 +4187,18 @@ router.post('/api/drafts/:id/lp-images', async (req, res) => {
   if (!prior) {
     const blocked = lpImageBlockReason(db, { draft, folderId });
     if (blocked) return res.status(409).json({ ok: false, code: 'not_ready', error: blocked });
+    // Drive を待つ前の構成の版 (どの構成のどの編集版か)。待っている間に直されたら受け付けない (下)
+    const composeVer = lpComposeVersion(db, draft);
     try { refTimes = await lpImageRefTimes(lpImageRefCandidates(db, draft)); }
     catch (e) {
       console.error('[product-hub] lp-image ref times:', draft.id, String(e?.message || e).slice(0, 300));
       return res.status(502).json({ ok: false, code: 'refs_unavailable', error: '参考画像の情報を Drive から読めませんでした — もう一度押してください' });
     }
-    // 🚨 Drive を待っている間に LP構成が直されて、参考にする画像が変わっていたら受け付けない (取り直していない日時で固定しない)。
-    //    ここから受付までは同期 (better-sqlite3) なので、この後に構成が変わることはない (Codex PR-B 名指し M)
-    if (lpImageRefCandidates(db, draft).some((id) => !Object.prototype.hasOwnProperty.call(refTimes, id))) {
-      return res.status(409).json({ ok: false, code: 'not_ready', error: 'LP構成が直されて参考にする画像が変わりました — もう一度押してください' });
+    // 🚨 Drive を待っている間に LP構成が直された・作り直されたら受け付けない — 取り直していない参考画像の日時で固定したり、
+    //    押したときと違う本文・枚数で作ったりしない。ここから受付までは同期 (better-sqlite3) なので、この後に構成は変わらない
+    //    (Codex PR-B 名指し R1・R2 M)
+    if (lpComposeVersion(db, draft) !== composeVer) {
+      return res.status(409).json({ ok: false, code: 'not_ready', error: 'LP構成が直されました — 内容を確かめてから、もう一度押してください' });
     }
   }
   const r = requestLpImageJob(db, { draft, folderId, idempotencyKey: key, actor: actorOf(req), refTimes });

@@ -1672,11 +1672,12 @@ th.attr-unknown { color: #dc2626; }
                 <span class="muted" id="lpc-copy-result" style="font-size:12px;"></span>
               </div>
               <div class="muted" id="lpc-lint" style="font-size:11px; margin-bottom:6px;"></div>
-              <%# 人が直した版 (下の「LP構成」で保存したもの・PR-B) を出しているときの知らせ。
-                  AI の初稿 (直す前) は消さずに残っているので、測定 (くらべっこ) 用にコピーできる %>
-              <div id="lpc-edited" hidden style="font-size:11px; margin-bottom:6px; color:#1d4ed8; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <%# 人が直した版 (下の「LP構成」で保存したもの)・作り直しの前の構成を出しているときの知らせ (PR-B)。
+                  AI の初稿 (直す前) は消さずに残っているので、測定 (くらべっこ) 用にコピーできる。
+                  🚨 hidden を付ける要素に display を直に書かない (書くと hidden が効かずに出っぱなしになる) %>
+              <div id="lpc-edited" hidden style="font-size:11px; margin-bottom:6px; color:#1d4ed8;">
                 <span id="lpc-edited-note"></span>
-                <button type="button" class="btn btn-sm" id="lpc-copy-ai">AI の初稿をコピー (測定用)</button>
+                <button type="button" class="btn btn-sm" id="lpc-copy-ai" hidden>AI の初稿をコピー (測定用)</button>
                 <span class="muted" id="lpc-copy-ai-result"></span>
               </div>
               <textarea id="lpc-text" rows="16" readonly style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
@@ -6310,6 +6311,7 @@ th.attr-unknown { color: #dc2626; }
     const resultTitleEl = document.getElementById('lpc-result-title');
     const editedEl = document.getElementById('lpc-edited');
     const editedNoteEl = document.getElementById('lpc-edited-note');
+    const copyAiEl = document.getElementById('lpc-copy-ai');
 
     const RUNNING = ['queued', 'running'];
     let timer = null;
@@ -6351,18 +6353,20 @@ th.attr-unknown { color: #dc2626; }
     // lpc-checking:end
 
     // lpc-shown:start (試験がここを切り出して動かす・scripts/test-ph-lp-edit.mjs)
-    // 箱に出す本文。人が直した版 (画像制作の新フロー PR-B) がこの依頼にあればそちら — コピーも lp-tool もこれを使う。
-    // 🚨 AI の初稿 (job.output_text) は書き換わらない。直した版は別の表で、AI の初稿は「AI の初稿をコピー」で取れる
+    // 箱に出す本文 = 効いている構成 (サーバの lp_effective・画像制作の新フロー PR-B)。いちばん新しいできた構成 (実モデル一致) の、
+    // 人が直した版があればそちら — コピーも lp-tool もこれを使う (画像生成・下の LP構成の一覧と同じ構成)。
+    // 作り直しが途中・失敗のときも、前にできた構成を出す (コピーできなくならないように・Codex PR-B 名指し R2 M)。
+    // 🚨 AI の初稿 (ph_lp_compose_jobs.output_text) は書き換わらない。AI の初稿は「AI の初稿をコピー」で取れる
     function lpcShown(s) {
-      const job = s && s.job;
-      if (!job || job.status !== 'done' || !job.output_text) return null;
-      const e = s.lp_edit && s.lp_edit.base_job_id === job.id && typeof s.lp_edit.output_text === 'string' && s.lp_edit.output_text
-        ? s.lp_edit : null;
-      if (!e) return { text: job.output_text, edited: false, note: '' };
-      return {
-        text: e.output_text, edited: true,
-        note: '人が直した版 (' + String(e.edited_at || '').slice(0, 16).replace('T', ' ') + ' ' + (e.edited_by || '') + ') を出しています。コピー・lp-tool・画像生成はこちらを使います',
-      };
+      const e = s && s.lp_effective;
+      if (!e || typeof e.text !== 'string' || !e.text) return null;
+      const edited = e.source === 'edit';
+      const latest = !!s.job && s.job.id === e.job_id;
+      const notes = [];
+      if (!latest) notes.push('作り直しの前にできた構成 (依頼 ' + e.job_id + ') を出しています');
+      if (edited) notes.push('人が直した版 (' + String(e.edited_at || '').slice(0, 16).replace('T', ' ') + ' ' + (e.edited_by || '') + ') です');
+      if (notes.length) notes.push('コピー・lp-tool・画像生成はこれを使います');
+      return { text: e.text, aiText: e.ai_text || '', jobId: e.job_id, edited: edited, latest: latest, note: notes.join('。') };
     }
     // lpc-shown:end
 
@@ -6450,16 +6454,18 @@ th.attr-unknown { color: #dc2626; }
         statusEl.textContent = '';
       }
 
-      // 人が直した版があればそちらを出す (コピー・lp-tool もこちら)。AI の初稿は測定用に別のボタンで取る (PR-B)
+      // 効いている構成を出す (人が直した版があればそちら。コピー・lp-tool もこれ)。AI の初稿は測定用に別のボタンで取る (PR-B)
       const shown = lpcShown(s);
       const done = !!shown;
       resultEl.hidden = !done;
-      editedEl.hidden = !(shown && shown.edited);
+      editedEl.hidden = !(shown && shown.note);
+      copyAiEl.hidden = !(shown && shown.edited);
       if (done) {
         if (textEl.value !== shown.text) textEl.value = shown.text;
         resultTitleEl.textContent = shown.edited ? 'LP構成 (人が直した版・⑦ AI画像生成プロンプト)' : 'AI が作った構成 (⑦ AI画像生成プロンプト)';
         editedNoteEl.textContent = shown.note;
-        lintEl.textContent = shown.edited ? 'lint: 通っています (人が直した版・保存のときにサーバが確かめました)' : lintLine(job.lint);
+        lintEl.textContent = shown.edited ? 'lint: 通っています (人が直した版・保存のときにサーバが確かめました)'
+          : (shown.latest ? lintLine(job.lint) : '');
         const q = new URLSearchParams({ product_code: root.dataset.neCode || '', product_name: root.dataset.name || '' });
         openEl.href = LP_TOOL + '?' + q.toString();
       }
@@ -6501,8 +6507,8 @@ th.attr-unknown { color: #dc2626; }
       }
 
       if (running || checkingModel(job)) schedule(); else stop();
-      // 下の「LP構成」(initLpEdit) に知らせる。新しい構成ができたら一覧を読み直す
-      document.dispatchEvent(new CustomEvent('ph:lp-compose-state', { detail: { job_id: job ? job.id : null, done: done } }));
+      // 下の「LP構成」(initLpEdit) に、効いている構成がどれかを知らせる。新しい構成ができたら一覧を読み直す
+      document.dispatchEvent(new CustomEvent('ph:lp-compose-state', { detail: { job_id: shown ? shown.jobId : null, done: done } }));
     }
 
     function stop() { if (timer) { clearTimeout(timer); timer = null; } }
@@ -6570,7 +6576,8 @@ th.attr-unknown { color: #dc2626; }
     // AI の初稿 (人が直す前)。段階1 の測定 (AI の構成と人の構成のくらべっこ) はこちらで比べる
     document.getElementById('lpc-copy-ai').addEventListener('click', async () => {
       const r = document.getElementById('lpc-copy-ai-result');
-      const raw = state && state.job && state.job.output_text ? state.job.output_text : '';
+      const sh = lpcShown(state);
+      const raw = sh ? sh.aiText : '';
       try { await navigator.clipboard.writeText(raw); r.textContent = 'AI の初稿をコピーしました'; }
       catch (e) { r.textContent = 'コピーできませんでした'; }
     });

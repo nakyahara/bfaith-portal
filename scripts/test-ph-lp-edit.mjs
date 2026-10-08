@@ -140,11 +140,14 @@ console.log('③ 並べ替え・削除のあとの番号・構図はブロック
   ok(before === after, '🚨 動かした画像 (使用シーン) のブロックの中身は 1 文字も変わらない (構図・素材・NG を持ち越す)');
   ok(!r.text.includes('# 共通NG事項\n') || r.text.endsWith(FIVE.slice(FIVE.indexOf('# 共通NG事項'))), '共通の尻 (共通NG・生成後チェック) は元のまま');
   ok(r.text.startsWith(FIVE.slice(0, FIVE.indexOf('# 0枚目'))), '共通の頭は元のまま');
-  // 役割を変えると point の見出しの名前も変わる。TOP / FV の名前は変わらない
+  // 役割を変えても `# N枚目｜名前` の名前は元のまま (直すのは 4 見出しの中身だけ)
   const s2 = sendOf(cur); s2[2].role = '使い方｜玄関'; s2[0].role = '検索結果のサムネイル'; s2[1].role = 'ファーストビュー';
   const r2 = le.composeEdit(cur, s2);
-  eq(headingsOf(r2.text).slice(0, 3), ['# 0枚目｜サムネイル', '# 1枚目｜FV', '# 2枚目｜使い方／玄関'], '役割を変えると point の名前も変わる (区切り記号は外す)・TOP / FV は固定');
-  ok(lintOk(r2.text).ok, '役割を変えても lint を通る');
+  eq(headingsOf(r2.text).slice(0, 3), ['# 0枚目｜サムネイル', '# 1枚目｜FV', '# 2枚目｜使用シーン'], '🚨 役割を変えても見出しの名前は元のまま (TOP / FV も)');
+  ok(lintOk(r2.text).ok && parseConstructionDoc(r2.text).images[2].imageRole === '使い方｜玄関', '役割は ## 画像の役割 に入り、lint を通る');
+  // 足した画像の名前は役割から (区切り記号は外す)
+  const r2b = le.composeEdit(cur, [...sendOf(cur), { uid: 'nname', role: '比較｜他社', title: 'x', copy: '', body: '', shoot: false }]);
+  ok(headingsOf(r2b.text)[5] === '# 5枚目｜比較／他社' && lintOk(r2b.text).ok, '足した画像の名前は役割から (区切り記号は外す)');
   // 最後の画像を真ん中へ (尻の前の空行の扱い)
   const r3 = le.composeEdit(cur, [s[0], s[1], s[4], s[2], s[3]]);
   ok(r3.ok && lintOk(r3.text).ok && headingsOf(r3.text)[2] === '# 2枚目｜よくある質問', '最後の画像を前に動かしても lint を通る');
@@ -291,6 +294,9 @@ console.log('⑥ 画像を作ったあとで構成が変わった印');
   send[2].title = '直した見出し';
   le.saveEdit(db, { draft: C.draft, baseJobId: st.base_job_id, baseEditId: null, slots: send, actor: 't', now: T0 + 20_000 });
   ok(le.editStateFor(db, C.draft).image_stale === true, '🚨 画像を作ったあとで直すと「生成後に構成が変わりました」');
+  db.prepare(`INSERT INTO ph_lp_image_jobs (draft_id, compose_job_id, idempotency_key, status, model, quality, size, created_at)
+    VALUES (?, ?, 'k-failed', 'failed', 'gpt-image-2.5-flare', 'medium', '1200x1200', ?)`).run(C.draft.id, C.jobId, new Date(T0 + 25_000).toISOString());
+  ok(le.editStateFor(db, C.draft).image_stale === true, '🚨 直した後の依頼が 1 枚もできなかった (failed) なら、印は消えない');
   insImg(T0 + 30_000);
   ok(le.editStateFor(db, C.draft).image_stale === false, '直した構成でもう一度作れば印は消える');
   const st2 = le.editStateFor(db, C.draft, { canEdit: true });
@@ -409,8 +415,9 @@ console.log('⑧ API (GET / PUT・権限・409・lint)');
 
   // lpc (「AI が作った構成」の箱) の状態に、直した版が添えられる
   const lpc = await api('GET', `/api/drafts/${R.draft.id}/lp-compose`);
-  ok(lpc.json.lp_edit && lpc.json.lp_edit.base_job_id === R.jobId && lpc.json.lp_edit.output_text.includes('担当者が直した見出し')
-    && lpc.json.job.output_text === FIVE, '🚨 lp-compose の状態: 直した版を添える (AI の本文はそのまま)');
+  ok(lpc.json.lp_effective && lpc.json.lp_effective.job_id === R.jobId && lpc.json.lp_effective.source === 'edit'
+    && lpc.json.lp_effective.text.includes('担当者が直した見出し') && lpc.json.lp_effective.ai_text === FIVE
+    && lpc.json.job.output_text === FIVE, '🚨 lp-compose の状態: 効いている構成 (直した版) を添える (AI の本文はそのまま)');
   // 画像生成の本番の口 (受付まで)
   const im = await api('GET', `/api/drafts/${R.draft.id}/lp-images`);
   ok(im.json.planned_count === 5 && im.json.blocked === null, '画像の状態: 編集版の枚数');
@@ -670,12 +677,15 @@ console.log('⑩ 「AI が作った構成」の箱 (lpc) — 直した版を出�
   const shownSrc = lpcSrc.slice(lpcSrc.indexOf('// lpc-shown:start'), lpcSrc.indexOf('// lpc-shown:end'));
   const lpcShown = new Function(shownSrc + '\nreturn lpcShown;')();
   const job = { id: 7, status: 'done', output_text: 'AI の本文' };
-  eq(lpcShown({ job }).text, 'AI の本文', '直した版が無ければ AI の本文');
-  const e = { base_job_id: 7, edit_id: 3, output_text: '直した本文', edited_by: 'a@x', edited_at: '2026-10-09T01:02:03Z' };
-  const sh = lpcShown({ job, lp_edit: e });
-  ok(sh.text === '直した本文' && sh.edited && sh.note.includes('2026-10-09 01:02') && sh.note.includes('a@x'), '直した版があればそちら (いつ・誰)');
-  eq(lpcShown({ job: { ...job, id: 8 }, lp_edit: e }).text, 'AI の本文', '🚨 別の構成 (作り直す前) への直しは使わない');
-  eq(lpcShown({ job: { ...job, status: 'running' }, lp_edit: e }), null, 'できていなければ出さない');
+  const ai = { job_id: 7, edit_id: null, text: 'AI の本文', ai_text: 'AI の本文', source: 'ai' };
+  const s0 = lpcShown({ job, lp_effective: ai });
+  ok(s0.text === 'AI の本文' && !s0.edited && s0.note === '', '直した版が無ければ AI の本文 (知らせなし)');
+  const e = { job_id: 7, edit_id: 3, text: '直した本文', ai_text: 'AI の本文', source: 'edit', edited_by: 'a@x', edited_at: '2026-10-09T01:02:03Z' };
+  const sh = lpcShown({ job, lp_effective: e });
+  ok(sh.text === '直した本文' && sh.aiText === 'AI の本文' && sh.edited && sh.note.includes('2026-10-09 01:02') && sh.note.includes('a@x'), '直した版があればそちら (いつ・誰・AI の初稿も持つ)');
+  const sr = lpcShown({ job: { id: 8, status: 'running' }, lp_effective: e });
+  ok(sr && sr.text === '直した本文' && !sr.latest && /作り直しの前にできた構成 \(依頼 7\)/.test(sr.note), '🚨 作り直しが途中・失敗でも、前にできた構成 (直した版) を出す・そう知らせる');
+  eq(lpcShown({ job }), null, '効いている構成が無ければ出さない');
 
   // 箱の JS を丸ごと偽の document で動かす
   const els = new Map();
