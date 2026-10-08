@@ -34,7 +34,8 @@
  *   node scripts/company-db/master-ownership-epoch.mjs prepare  [--actor 名前]
  *   node scripts/company-db/master-ownership-epoch.mjs prepare --widen --company 1 [--actor 名前]
  *   node scripts/company-db/master-ownership-epoch.mjs stop-manual --attempt <id> --entry <入口の id> --by <止めた人> [--note メモ]
- *   node scripts/company-db/master-ownership-epoch.mjs check --attempt <id> --company 1 [--data-dir D]   (Amazon を足す試みは DATA_DIR / --data-dir の warehouse.db が要る)
+ *   node scripts/company-db/master-ownership-epoch.mjs check --attempt <id> --company 1 [--data-dir D]   (Amazon を足す試みは DATA_DIR / --data-dir の warehouse.db と fba.db が要る。
+ *     fba.db = Sheet にだけある SKU の出品に構成が 1 行も無いかを照らす・#1651。widen も鍵の後に同じく照らす。Amazon を company にする activate は断る)
  *   node scripts/company-db/master-ownership-epoch.mjs widen --attempt <id> --company 1 [--actor 名前] [--data-dir D]
  *   node scripts/company-db/master-ownership-epoch.mjs activate [--actor 名前] [--data-dir D]
  *   node scripts/company-db/master-ownership-epoch.mjs cancel   [--actor 名前] [--attempt <id>]
@@ -110,8 +111,19 @@ async function readLegacyDefault({ dataDir, sqlite }) {
   return M.readLegacyAmazonMaps(path.join(dataDir, 'warehouse.db'));
 }
 
+/**
+ * 今の fba.db (Sheet の写し) の Sheet にだけある SKU を読む (#1651)。dataDir が無ければ warehouse/db.js と同じ既定 (cwd/data)。
+ * 読めない (ファイル・sku_mapping の表が無い) = 投げる = 照らせない = 広げない
+ */
+async function readSheetOnlyDefault({ dataDir, legacy }) {
+  const M = await import('../../lib/amazon-map-migrate.mjs');
+  const file = path.join(dataDir || path.join(process.cwd(), 'data'), 'fba.db');
+  if (!fs.existsSync(file)) throw new Error(`fba.db が無い = Sheet にだけある SKU を読めない: ${file}`);
+  return M.readSheetOnlySkus(file, legacy);
+}
+
 export async function cli(argv, { env = process.env, connect = null, openSqlite = null, log = console.log, ownership = MASTER_OWNERSHIP, now = new Date(),
-  capable = COMPANY_CAPABLE, loaderFingerprint = undefined, manifest = undefined, readLegacy = readLegacyDefault } = {}) {
+  capable = COMPANY_CAPABLE, loaderFingerprint = undefined, manifest = undefined, readLegacy = readLegacyDefault, readSheetOnly = readSheetOnlyDefault } = {}) {
   const cmd = argv[0];
   const argAfter = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
   const actor = argAfter('--actor') || `${os.userInfo().username}@${os.hostname()}`;
@@ -132,9 +144,18 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
       if (r && Array.isArray(r.added_keys) && r.added_keys.includes(AMAZON_KEY)) {
         try {
           const M = await import('../../lib/amazon-map-migrate.mjs');
-          const legacy = await readLegacy({ dataDir: (argAfter('--data-dir') || env.DATA_DIR || '').trim(), sqlite: null });
+          const dataDirC = (argAfter('--data-dir') || env.DATA_DIR || '').trim();
+          const legacy = await readLegacy({ dataDir: dataDirC, sqlite: null });
           r.amazon_map = await M.amazonMapHashEvidence(c.db, legacy);
           if (!r.amazon_map.match) { r.ok = false; r.problems = [...(r.problems || []), `amazon_map_hash: 古い表 ${r.amazon_map.legacy_hash || r.amazon_map.error} と Company DB ${r.amazon_map.company_hash || r.amazon_map.error} のハッシュが違う`]; }
+          // 🆕 #1651: 今の fba.db の Sheet にだけある SKU の出品 (対応なし) に構成が 1 行でもある = ok: false (出どころによらない・人が見て決める。widen も鍵の後に同じく照らす)
+          try {
+            const rows = await M.freshSheetOnlyComponents(c.db, () => readSheetOnly({ dataDir: dataDirC, legacy }));   // widen と同じ読み方 (fba.db を読んで続けて Company DB)
+            r.amazon_map.sheet_only_components = rows.length;
+            if (rows.length) { r.ok = false; r.problems = [...(r.problems || []), `sheet_only_has_components: Sheet にだけある SKU の出品に構成が ${rows.length} 行ある (${rows.slice(0, 3).map((x) => `${x.listing_code}→${x.sku_code} (${x.source ?? '?'})`).join('・')})。人が見て決めてから`]; }
+          } catch (e) {
+            r.ok = false; r.problems = [...(r.problems || []), `sheet_only_has_components: 照らせない (${String(e && e.message).slice(0, 200)})`];
+          }
         } catch (e) {
           r.ok = false; r.problems = [...(r.problems || []), `amazon_map_hash: 照らせない (${String(e && e.message).slice(0, 200)})`];
         }
@@ -195,6 +216,12 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
     }
     // activate / widen = 写しの証拠を集める
     if (!st.prepared) { log('❌ prepared が無い'); return 1; }
+    // #1651 Codex R3 Medium: Amazon の構成 (listing_components.amazon) を company にするのは widen の道だけ (Sheet にだけある SKU の出品の構成を鍵の後に照らすのは widen)。
+    //   activate の道は断る (今は prepare も not_copied で断る = 二重の守り。⑦-2 で prepare を開けても activate では足さない)
+    if (cmd === 'activate' && st.prepared.map[AMAZON_KEY] === 'company' && st.active.map[AMAZON_KEY] !== 'company') {
+      log(`❌ active にしない: ${AMAZON_KEY} を company にするのは widen の道 (prepare --widen → check → widen) だけ (#1651)`);
+      return 1;
+    }
     const dataDir = (argAfter('--data-dir') || env.DATA_DIR || '').trim();
     const sqlite = openSqlite ? await openSqlite(dataDir) : await (async () => { if (argAfter('--data-dir')) process.env.DATA_DIR = dataDir; const { initDB } = await import('../../apps/warehouse/db.js'); return initDB(); })();
     const { TAX_RATES } = await import('../../apps/warehouse/rebuild-m-products.js');
@@ -204,7 +231,12 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
       // 🆕 0059: Amazon の対応を足す試み = 古い表を読んでおき、鍵の後に同じ取引で Company DB を読んでハッシュを照らす (違えば広げない)
       const open = await readOpenWidenAttempt(c.db);
       const amazon = !!open && open.widen_prepare_id === attemptId && (open.added_keys || []).includes(AMAZON_KEY);
-      const step = amazon ? (await import('../../lib/amazon-map-migrate.mjs')).amazonWidenEvidenceStep(await readLegacy({ dataDir, sqlite })) : null;
+      //   #1651: 鍵の後に今の fba.db を読み直し (鍵の前の一覧は使わない = R4 High)、その出品 (対応なし) に構成が 1 行も無いかも照らす (ある = 広げない・読めない = 広げない)
+      let step = null;
+      if (amazon) {
+        const legacy = await readLegacy({ dataDir, sqlite });
+        step = (await import('../../lib/amazon-map-migrate.mjs')).amazonWidenEvidenceStep(legacy, { readSheetOnly: () => readSheetOnly({ dataDir, legacy }) });
+      }
       // 判定は DB (ops.widen_master_ownership が鍵の後に本体を呼ぶ)。夜間ロードの最中は 5 秒で諦める (lock_timeout)
       const r = await widenOwnership(c.db, { attemptId, companyId, actor, evidence: { ...e.evidence, prepared_at: st.prepared.prepared_at }, beforeCall: step ? step.beforeCall : null });
       const amz = step ? step.result() : null;
