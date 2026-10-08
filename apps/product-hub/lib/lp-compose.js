@@ -805,9 +805,15 @@ export function submitResult(db, generationId, {
     // 🚨 大きすぎるものも**中身から** hash を作る — 「使えない」1 つに畳むと、別々の大きすぎる判定の再送が
     //    同じ結果と見なされる (Codex PR-C 名指し1 M)。大きさは保存できるかだけに使う (検査は lp-shoot.js)。
     //    HTTP の本文は express.json の上限 (1MB) で抑えられている
+    // 🚨 canonicalJson は再帰なので、深く入れ子にした値 (JSON.stringify は通る深さ) でスタックを溢れさせる。
+    //    例外にすると結果が 500 になり、予約が reserved のまま残って構成ごと needs_review に落ちる (Codex PR-C 名指し2 High)。
+    //    溢れたら JSON の文字列そのものの hash にする (キーの順で別物になりうるが、同じ本文の再送は同じ hash)
     let s;
     try { s = JSON.stringify(shoot); } catch { s = undefined; }
-    shootHash = typeof s === 'string' ? sha256(canonicalJson(JSON.parse(s))) : 'unserializable';
+    if (typeof s !== 'string') shootHash = 'unserializable';
+    else {
+      try { shootHash = sha256(canonicalJson(JSON.parse(s))); } catch { shootHash = 'raw:' + sha256(s); }
+    }
   }
   // 🚨 receipt も hash の対象に入れる。入れないと「画像の証跡だけ違う再送」を
   //    同じ結果と見なして保存済みを返してしまう (コード R2 #1)。finalized_at は毎回変わるので入れない

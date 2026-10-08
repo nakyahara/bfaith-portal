@@ -222,6 +222,19 @@ console.log('④ 壊れた撮影判定 → 構成は受け付け、撮影判定�
     ok(accept(rr, { shoot: { ...goodShoot(), reason: 'x'.repeat(50_000) } }).already === true, '同じ大きすぎる判定の再送は保存済みを返す');
     eq(accept(rr, { shoot: { ...goodShoot(), reason: 'y'.repeat(60_000) } }).code, 'already_finalized', '🚨 別の大きすぎる判定の再送は上書きしない');
   }
+  {
+    // 🚨 深い入れ子 (JSON.stringify は通るが再帰の canonicalJson は溢れる) でも 500 にせず、構成は done (Codex PR-C 名指し2 High)
+    const deep = () => { const root = { ...goodShoot(), extra: {} }; let c = root.extra; for (let i = 0; i < 20_000; i++) { c.a = {}; c = c.a; } return root; };
+    const dd = mkDraft();
+    const rr = reserveFor(dd);
+    let rs = null;
+    try { rs = accept(rr, { shoot: deep() }); } catch (e) { rs = { thrown: String(e.message).slice(0, 80) }; }
+    ok(rs?.ok && rs.status === 'done' && rs.shoot?.status === 'invalid', `🚨 深い入れ子の撮影判定でも例外にならず、構成は done (${JSON.stringify(rs?.thrown || rs?.shoot?.status)})`);
+    ok(jobRow(rr.jobId).status === 'done' && db.prepare('SELECT status FROM ph_lp_compose_generations WHERE id = ?').get(rr.gid).status === 'accepted', '予約も確定している (reserved のまま残らない)');
+    let again = null;
+    try { again = accept(rr, { shoot: deep() }); } catch (e) { again = { thrown: String(e.message).slice(0, 80) }; }
+    ok(again?.already === true, '同じ深い入れ子の再送は保存済みを返す');
+  }
   for (const [label, shoot] of [
     ['大きすぎる', { ...goodShoot(), reason: 'x'.repeat(50_000) }],
     ['文字列', 'inhouse'],
