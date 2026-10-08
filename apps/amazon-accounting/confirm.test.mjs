@@ -50,8 +50,8 @@ async function upload(lines) {
   fd.append('file', new Blob([[q(HDR), ...lines].join('\r\n')], { type: 'text/csv' }), 'payment.csv');
   return (await fetch(base + '/upload', { method: 'POST', body: fd })).json();
 }
-async function confirmMonth(yearMonth) {
-  const r = await fetch(base + '/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ yearMonth, adCost: 0, csvFilename: 'payment.csv' }) });
+async function confirmMonth(yearMonth, uploadId) {
+  const r = await fetch(base + '/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ yearMonth, uploadId, adCost: 0, csvFilename: 'payment.csv' }) });
   return { status: r.status, body: await r.json() };
 }
 
@@ -70,12 +70,18 @@ test('未登録SKUがあっても確定できる: 10%・その他/未分類・�
   assert.equal(data.bySegment['other'].原価合計, 0);
   assert.equal(data.bySegment['1'].原価合計, 200);
 
-  const { status, body } = await confirmMonth('2026-07');
+  assert.ok(data.uploadId);
+  const { status, body } = await confirmMonth('2026-07', data.uploadId);
   assert.equal(status, 200, JSON.stringify(body));
   assert.equal(body.ok, true);
-  const saved = db.prepare('SELECT unresolved_count, by_segment FROM mart_amazon_monthly_summary WHERE year_month = ?').get('2026-07');
+  const saved = db.prepare('SELECT unresolved_count, unresolved_skus, by_segment FROM mart_amazon_monthly_summary WHERE year_month = ?').get('2026-07');
   assert.equal(saved.unresolved_count, 1);
+  // 何を 10%・原価0円で入れたかの内訳が確定データに残る
+  assert.deepEqual(JSON.parse(saved.unresolved_skus), [{ sku: 'sku-new', name: '未登録の新商品', count: 1, amount: 450 }]);
   assert.equal(JSON.parse(saved.by_segment).other.商品売上, 500);
+  // 過去の確定データ (GET /history) でも内訳が配列で返る
+  const hist = await (await fetch(base + '/history')).json();
+  assert.deepEqual(hist.find(h => h.year_month === '2026-07').unresolved_skus.map(u => u.sku), ['sku-new']);
 });
 
 test('税率未登録は引き続き確定できない', async () => {
@@ -86,8 +92,27 @@ test('税率未登録は引き続き確定できない', async () => {
   assert.equal(data.yearMonth, '2026-08');
   assert.equal(data.unresolvedTax.length, 1);
   assert.equal(data.canConfirm, false);
-  const { status, body } = await confirmMonth('2026-08');
+  const { status, body } = await confirmMonth('2026-08', data.uploadId);
   assert.equal(status, 400);
   assert.match(body.error, /税率未登録/);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM mart_amazon_monthly_summary WHERE year_month = ?').get('2026-08').n, 0);
+});
+
+test('同じ月を後から上げ直されたら、先に見ていた画面からは確定できない (409)', async () => {
+  const first = await upload([order('2026/09/03', 'SKU-A', '登録済み商品', 1, 500, 450)]);
+  const second = await upload([
+    order('2026/09/03', 'SKU-A', '登録済み商品', 1, 500, 450),
+    order('2026/09/04', 'SKU-NEW2', '別の新商品', 1, 300, 270),
+  ]);
+  assert.equal(first.unresolvedSkus.length, 0);
+  assert.equal(second.unresolvedSkus.length, 1);
+  const stale = await confirmMonth('2026-09', first.uploadId);
+  assert.equal(stale.status, 409);
+  assert.match(stale.body.error, /上書き/);
+  const none = await confirmMonth('2026-09', undefined);
+  assert.equal(none.status, 409);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM mart_amazon_monthly_summary WHERE year_month = ?').get('2026-09').n, 0);
+  const ok = await confirmMonth('2026-09', second.uploadId);
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  assert.equal(db.prepare('SELECT unresolved_count FROM mart_amazon_monthly_summary WHERE year_month = ?').get('2026-09').unresolved_count, 1);
 });

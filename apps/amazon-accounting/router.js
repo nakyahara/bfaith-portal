@@ -10,6 +10,7 @@
 import { Router } from 'express';
 import multer from 'multer';
 import fs from 'fs';
+import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
 import { normalizeYearMonth } from '../../lib/jst-date.js';
@@ -387,13 +388,17 @@ router.post('/upload', upload.single('file'), (req, res) => {
   // 未登録SKUは確定を止めない (米国版と同じ): その行は 10%・その他/未分類・原価0円で集計に入っている。
   // 件数は unresolved_count として確定データに残し、画面で警告する。税率未登録・セット解決エラーは引き続き止める
   const canConfirm = unresolvedTax.length === 0 && conflicts.length === 0;
+  // uploadId: 同じ月を別タブ・別の人が上げ直したとき、画面で見た集計と違うものを確定しないための照合キー
+  const uploadId = crypto.randomUUID();
   evidenceStore.set(yearMonth, {
+    uploadId,
     detail: detailCsv,
     summary: summaryCsv,
     serverState: {
       totalRows: parsedRows.length,
       resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'adjustment_no_master' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
       unresolvedCount: unresolved.length,
+      unresolvedSkus: unresolved,
       unresolvedTaxCount: unresolvedTax.length,
       conflictsCount: conflicts.length,
       canConfirm,
@@ -402,6 +407,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   });
 
   res.json({
+    uploadId,
     yearMonth,
     totalRows: parsedRows.length,
     resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'adjustment_no_master' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
@@ -1004,6 +1010,7 @@ function renderPage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             yearMonth: lastData.yearMonth,
+            uploadId: lastData.uploadId,
             adCost,
             csvFilename: document.getElementById('csvFile').files[0]?.name || '',
           }),
@@ -1053,6 +1060,17 @@ function renderPage() {
             + ' <span class="meta">（' + esc(row.confirmed_at || '') + '）</span></span>';
           html += '<span class="arrow">&#9654;</span></div>';
           html += '<div class="acc-body" id="acc-' + i + '">';
+
+          // 未登録SKUのまま確定した内訳 (税率10%・その他/未分類・原価0円で入っている)
+          const unres = Array.isArray(row.unresolved_skus) ? row.unresolved_skus : [];
+          if (unres.length) {
+            html += '<h3 style="font-size:13px;color:#d68910;margin-bottom:4px">⚠️ 未登録SKUのまま確定した内訳（税率10%・その他/未分類・原価0円）</h3>';
+            html += '<table><tr><th>SKU</th><th>商品名</th><th>出現数</th><th>金額合計</th></tr>';
+            for (const u of unres) {
+              html += '<tr><td>' + esc(u.sku || '') + '</td><td>' + esc(String(u.name || '').slice(0, 60)) + '</td><td class="num">' + (Number(u.count) || 0) + '</td><td class="num">' + fmt(Number(u.amount) || 0) + '</td></tr>';
+            }
+            html += '</table>';
+          }
 
           // MF連携用 税込み集計（データがある場合のみ）
           const hasMf = mf && Object.keys(mf).length > 0 && (mf['合計'] || 0) !== 0;
@@ -1402,7 +1420,7 @@ router.get('/evidence/:type/:yearMonth', (req, res) => {
 
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
-  const { yearMonth, adCost, csvFilename } = req.body;
+  const { yearMonth, adCost, csvFilename, uploadId } = req.body;
 
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
 
@@ -1410,6 +1428,9 @@ router.post('/confirm', (req, res) => {
   const cached = evidenceStore.get(yearMonth);
   if (!cached || !cached.serverState) {
     return res.status(400).json({ error: 'アップロード結果が見つかりません。CSVを再アップロードしてください' });
+  }
+  if (!uploadId || uploadId !== cached.uploadId) {
+    return res.status(409).json({ error: 'この月は画面を開いた後に別のアップロードで上書きされました。CSVを再アップロードして内容を確かめてから確定してください' });
   }
   const s = cached.serverState;
   if (!s.canConfirm) {
@@ -1422,12 +1443,13 @@ router.post('/confirm', (req, res) => {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
     db.prepare(`INSERT OR REPLACE INTO mart_amazon_monthly_summary
       (year_month, total_rows, resolved_count, unresolved_count,
-       by_tax, by_segment, excluded, mf_row, ad_cost, confirmed_at, csv_filename)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+       by_tax, by_segment, excluded, mf_row, ad_cost, confirmed_at, csv_filename, unresolved_skus)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       yearMonth, s.totalRows, s.resolvedCount, s.unresolvedCount,
       JSON.stringify(s.byTax), JSON.stringify(s.bySegment), JSON.stringify(s.excluded),
-      JSON.stringify(s.mfRow), adCost || 0, now, csvFilename || ''
+      JSON.stringify(s.mfRow), adCost || 0, now, csvFilename || '',
+      s.unresolvedSkus.length ? JSON.stringify(s.unresolvedSkus) : null
     );
 
     db.prepare(`INSERT INTO mart_amazon_upload_log
@@ -1443,6 +1465,12 @@ router.post('/confirm', (req, res) => {
 
 // ─── GET /history — 過去月一覧 ───
 
+// unresolved_skus 列 (JSON 配列 or NULL) を配列に。壊れていても履歴一覧は落とさない
+function parseJsonArray(text) {
+  if (!text) return [];
+  try { const v = JSON.parse(text); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+
 router.get('/history', (req, res) => {
   const db = getMirrorDB();
   try {
@@ -1453,6 +1481,7 @@ router.get('/history', (req, res) => {
       by_segment: JSON.parse(r.by_segment || '{}'),
       excluded: JSON.parse(r.excluded || '{}'),
       mf_row: JSON.parse(r.mf_row || '{}'),
+      unresolved_skus: parseJsonArray(r.unresolved_skus),
     }));
     res.json(parsed);
   } catch (e) {

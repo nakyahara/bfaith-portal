@@ -1818,6 +1818,9 @@ function createTables() {
     confirmed_at      TEXT NOT NULL,
     csv_filename      TEXT
   )`);
+  // 未登録SKUのまま確定した月の内訳 (SKU・名称・行数・金額の JSON 配列)。確定後に何を 10%・原価0円で
+  // 入れたかを追えるよう残す (2026-10-08: 未登録SKUで確定を止めないようにしたため)
+  addColumnIfMissing('mart_amazon_monthly_summary', 'unresolved_skus', 'TEXT');
 
   // mart_amazon_upload_log — アップロード履歴
   db.exec(`CREATE TABLE IF NOT EXISTS mart_amazon_upload_log (
