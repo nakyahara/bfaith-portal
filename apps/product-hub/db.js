@@ -2664,6 +2664,20 @@ export function setShootMode(db, draftId, mode, { actor = null } = {}) {
         `撮影判定「${m ? SHOOT_MODE_LABELS[m] : '未判定'}」に合わせて撮影・素材ステータスを直した (${MATERIAL_STATUS_LABELS[before] || '未設定'} → ${MATERIAL_STATUS_LABELS[material] || '未設定'})`, actor);
       return { changed: true, material_status: material };
     }
+    // 🚨 ③素材待ち を「撮影不要」で完了したあとに「撮影が要る」へ変えると、素材が無いのに ③ は完了のまま
+    //    ④ 以降へ進んでしまう (完了ゲートは完了にする瞬間しか見ない)。変えた後の値で ③ の完了条件を
+    //    満たさなくなるなら変えずに止め、先に ③ へ戻してもらう (Codex PR-A 名指し3 High)
+    const matStep = db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_material'`).get(id);
+    if (matStep?.state === 'done') {
+      const ownBrand = db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(id)?.own_brand === 1;
+      const needShoot = m === 'inhouse' || m === 'photographer';
+      const passes = needShoot ? material === 'ready' : (!ownBrand || material === 'ready' || material === 'not_required');
+      if (!passes) {
+        const err = new Error(`③素材待ち はもう完了しています。${needShoot ? '撮影する' : '撮影判定を取り消す'}なら、先にボードでカードを ③素材待ち に戻してから撮影判定を変えてください`);
+        err.code = 'material_step_done';
+        throw err;
+      }
+    }
     db.prepare(`
       UPDATE draft_image_production
       SET shoot_mode = ?, shoot_mode_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), shoot_mode_by = ?,

@@ -5925,16 +5925,16 @@ th.attr-unknown { color: #dc2626; }
         //    未保存の退避が隠れた欄に戻る。次に別の項目を保存すると見えない URL まで保存される
         //    (Codex PR-A 名指し2 M)。先に聞いて、捨てるなら欄を元の値に戻してから送る
         const cam = doc.getElementById('ip-camera-url');
-        if (btn.dataset.shootMode === 'none' && cam && String(cam.value || '').trim() !== String(cam.defaultValue || '').trim()) {
-          if (!deps.confirm('撮影指示書の URL が保存されていません。「撮影不要」にすると、いま入れた URL は消えます。よろしいですか？')) return;
-          cam.value = cam.defaultValue || '';
-        }
+        const dropCam = btn.dataset.shootMode === 'none' && cam && String(cam.value || '').trim() !== String(cam.defaultValue || '').trim();
+        if (dropCam && !deps.confirm('撮影指示書の URL が保存されていません。「撮影不要」にすると、いま入れた URL は消えます。よろしいですか？')) return;
         const msg = doc.getElementById('shoot-mode-msg');
         if (msg) msg.textContent = '保存しています…';
         let json;
         try { json = await deps.post(deps.base + '/shoot-mode', { mode: btn.dataset.shootMode }); }
         catch (e) { json = { ok: false, error: '通信できませんでした' }; }
         if (!json.ok && msg) msg.textContent = '保存できませんでした: ' + (json.error || '');
+        // 欄を元の値に戻すのは保存できたときだけ (失敗したら判定は変わらないので、打った URL を残す — 名指し3 M)
+        if (json.ok && dropCam) cam.value = cam.defaultValue || '';
         deps.showAndReload(json, '撮影判定を保存しました');
       });
     });

@@ -1574,7 +1574,14 @@ router.post('/api/drafts/:id/shoot-mode', (req, res) => {
   if (!(mode === null || (typeof mode === 'string' && SHOOT_MODE_CODES.has(mode)))) {
     return res.status(400).json({ ok: false, error: 'mode は none / inhouse / photographer / null で指定してください' });
   }
-  const r = setShootMode(getDB(), draft.id, mode, { actor: actorOf(req) });
+  let r;
+  try {
+    r = setShootMode(getDB(), draft.id, mode, { actor: actorOf(req) });
+  } catch (e) {
+    // ③素材待ち を完了したあとで素材が要る判定に変えようとした (先に ③ へ戻してもらう)
+    if (e?.code === 'material_step_done') return res.status(409).json({ ok: false, error: e.message });
+    throw e;
+  }
   res.json({ ok: true, changed: r.changed, shoot_mode: mode, material_status: r.material_status });
 });
 
