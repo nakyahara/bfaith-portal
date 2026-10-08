@@ -164,7 +164,7 @@
       p = post('/api/reg-csv/exports/' + id + '/issue', {}).then(function (r) {
         if (!r.ok || r.j.refused) { say(cardMsg, r.j.refused ? '使わないにした商品があるので配れません (ファイルを閉じました)。作り直してください' : errText(r.j, r.status), false); b.disabled = false; return; }
         download(id);
-        setTimeout(function () { finish('ファイル #' + id + ' を配りました (ダウンロード)。NE の「商品一括登録」で取り込んで、結果をここで申告してください'); }, 1200);
+        setTimeout(function () { finish('ファイル #' + id + ' を配りました (ダウンロード)。NE の「商品一括登録」で取り込んでください。翌朝の照合で自動で確かめます (申告はしなくて大丈夫です)'); }, 1200);
       });
     } else if (act === 'declare') {
       var res = $('input[type=radio]:checked', drawer);

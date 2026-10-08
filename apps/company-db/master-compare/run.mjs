@@ -191,13 +191,16 @@ export function neSummary(ne) {
 }
 /**
  * ポータルで登録した新商品で NE に無いもの (差にしない NE 登録待ち・日がたった reg_stale は差の件数にも入る)。0 件なら何も足さない。
- * 登録の状態を読めない朝 = 待ちを分けていない (差に含む) と書く
+ * 登録の状態を読めない朝 = 待ちを分けていない (差に含む) と書く。
+ * 0061: 配ったが申告していない商品は照合の確かめが自動で NE 確認済みにする。配ってから日がたっても NE に無い商品は確かめの答えの not_imported で
+ *   「取り込まれていないらしい」を ℹ️ で足す (失敗にはしない)
  */
 const STAGE_JA = { before_issue: 'CSV を配る前', issued: '配った', declared: '取り込んだ申告の後', failed: '取り込めていない', rejected: 'NE が全部拒んだ', partial: '中身が違う', verified: '確かめ済み' };
 export function regSummary(ne) {
+  const ni = notImportedNote(ne);
   const rp = ne && ne.reg_pending;
-  if (!rp) return '';
-  if (rp.state === 'unreadable') return '・NE 登録待ちを読めない (差に含む)';
+  if (!rp) return ni ? `・${ni}` : '';
+  if (rp.state === 'unreadable') return `・NE 登録待ちを読めない (差に含む)${ni ? `・${ni}` : ''}`;
   const c = ne.counts || {};
   const parts = [];
   if (c.reg_pending) {
@@ -206,7 +209,19 @@ export function regSummary(ne) {
     parts.push(`NE 登録待ち ${c.reg_pending} 件 (差に入れない${st ? `。${st}` : ''})`);
   }
   if (c.reg_stale) parts.push(`登録から ${rp.stale_days} 日以上 NE に無い ${c.reg_stale} 件 (差)`);
+  if (ni) parts.push(ni);
   return parts.length ? `・${parts.join('・')}` : '';
+}
+/**
+ * 配ってから日がたっても NE に無い新商品 (0061 の確かめの答え not_imported = 申告なし・「無い」を信じてよい取得)。無ければ null。
+ * 知らせるだけ (状態は待ちのまま・照合は失敗にしない)。コードは 5 件まで
+ */
+export function notImportedNote(ne) {
+  const w = ne && ne.registrations && ne.registrations.written;
+  const list = w && Array.isArray(w.not_imported) ? w.not_imported : [];
+  if (!list.length) return null;
+  const codes = list.slice(0, 5).map((x) => x && x.code).filter(Boolean).join('・') + (list.length > 5 ? ` ほか ${list.length - 5}` : '');
+  return `ℹ️ 配ってから ${w.not_imported_days ?? 3} 日たっても NE に無い (取り込まれていないらしい) ${list.length} 件 (${codes})`;
 }
 /**
  * 確かめ (record_ne_registration_check) の後に登録の段階を読み直す (照合の読む接続・読み取りだけの短い取引)。
@@ -385,7 +400,9 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     Object.assign(result, { compare_run_id: compareRunId, started_at: startedAt, finished_at: new Date().toISOString() });
     j = writeResultJson(dataDir, asOf, compareRunId, result);
     const regEvidence = () => (result.ne && result.ne.registrations ? { targets: result.ne.registrations.targets ?? null, write: result.ne.registrations.write ?? null,
-      seal: result.ne.registrations.seal ?? null, counts: result.ne.registrations.written?.counts ?? null, write_error: result.ne.registrations.write_error ?? null } : null);
+      seal: result.ne.registrations.seal ?? null, counts: result.ne.registrations.written?.counts ?? null,
+      not_imported: Array.isArray(result.ne.registrations.written?.not_imported) ? result.ne.registrations.written.not_imported.length : null,   // 0061: 配ってから日がたっても NE に無い (知らせるだけ)
+      write_error: result.ne.registrations.write_error ?? null } : null);
     evidence = {
       state: 'complete', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt, finished_at: result.finished_at,
       json_path: j.rel, sha256: j.sha256, bytes: j.bytes, format: result.format,

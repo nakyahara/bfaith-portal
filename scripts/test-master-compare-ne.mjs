@@ -1482,6 +1482,11 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   assert.deepEqual([z.ne.counts.reg_failed, z.ne.counts.reg_partial], [1, 1]);   // 全件 JSON = 確かめの前 (n905・n906 だけ)
   assert.deepEqual([z.ne.reg_after_check.state, z.ne.reg_after_check.reg_failed, z.ne.reg_after_check.reg_partial, z.ne.reg_after_check.reg_rejected], ['ok', 2, 2, 1]);
   assert.match(z.line, /^⚠️ ②: 新商品の NE 登録の不一致 \(区分 \(単品・セット\) 違い 1 件・取り込んだと申告したのに NE に無い 2 件・NE が取り込みを全部拒んだ \(CSV を作り直す\) 1 件・NE の中身が登録と違う 2 件\)/);
+  // 0061: 配っただけ (申告なし) の n901 は NE に無い = 待ち (failed にしない)・配ってから 3 日を過ぎた取得 = 要約に ℹ️ で知らせる (失敗にしない)
+  assert.equal(await itemState('n901'), 'issued');
+  assert.deepEqual((z.result.ne.registrations.written.not_imported || []).map((x) => x.code), ['n901'], JSON.stringify(z.result.ne.registrations.written));
+  assert.match(z.line, /ℹ️ 配ってから 3 日たっても NE に無い \(取り込まれていないらしい\) 1 件 \(n901\)/);
+  assert.equal(z.evidence.ne.registrations.not_imported, 1);
   const ev5 = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', '2030-08-20', 'master-compare.json'), 'utf8'));
   assert.deepEqual([ev5.ne.reg_after_check.reg_failed, ev5.ne.reg_after_check.reg_partial], [2, 2]);
   // W13:ne は証跡の確かめの後の数を理由と観測に使う

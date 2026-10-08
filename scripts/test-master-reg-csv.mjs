@@ -425,14 +425,17 @@ await ta('[C7] 翌朝の確かめ (単品): 申告の前の取得 = 待ち・違
   await save('new-a', { name: '新しい単品' });
 });
 
-await ta('[C8] 無い・信じられない・申告の前に NE にある: 申告の後の完全な取得に無い = failed (「無い」を信じてよいときだけ)・配っただけで NE にある = 記録だけ', async () => {
+await ta('[C8] 無い・信じられない・配る前の取得: 配った時刻より前の取得 = 比べない (待ち)・申告の後の完全な取得に無い = failed (「無い」を信じてよいときだけ)', async () => {
   const r = await build('products', ['new-b']);
   const id = r.export.export_id;
   await issue(id);
   const r1 = await newRun();
-  let c = await check(r1, [obsSingle('new-b', { name: ok('新しい単品 B') })]);
-  assert.deepEqual(c.counts, { in_ne_undeclared: 1 });
-  assert.deepEqual((await itemsOf(id)).map((i) => i.state), ['issued']);
+  // 0061: 配った時刻より前の NE の取得は、全部の列が合っていても比べない (配ったファイルを取り込んだ証拠にならない)
+  let c = await check(r1, [obsSingle('new-b', { name: ok('新しい単品 B') })], { productsAt: new Date(Date.now() - 3600000).toISOString() });
+  assert.deepEqual(c.counts, { waiting: 1 });
+  assert.deepEqual(c.not_imported, []);
+  assert.deepEqual([(await itemsOf(id)).map((i) => i.state), await regOf('new-b')], [['issued'], 'draft']);
+  assert.equal((await one('select detail from ops.ne_reg_checks where compare_run_id = $1', [r1])).detail.basis, 'issued');
   await declare(id, r.export.sha256, 'ok');
   const r2 = await newRun();
   c = await check(r2, [{ code_norm: 'new-b', present: false, trusted: true, kind: null }], { absenceTrusted: false });
@@ -448,6 +451,80 @@ await ta('[C8] 無い・信じられない・申告の前に NE にある: 申�
   const again = await build('products', ['new-b']);
   assert.ok(again.export.export_id > id, '取り込めなかった商品は作り直せる');
   await supersede(again.export.export_id);
+});
+
+await ta('[C8b] 申告なし (0061・中原さん 10/8 a): 配った → 申告しない → 翌朝の照合が確かめる = NE に無い = 待ち (failed にしない・3 日を過ぎたら not_imported で知らせる)・違う列 = partial・全部合う = verified + 下書き → NE 登録待ち → NE 確認済み', async () => {
+  await reg('single', 'auto-e', single({ name: '新しい単品 E' }));
+  const r = await build('products', ['auto-e']);
+  const id = r.export.export_id;
+  await issue(id);
+  const issuedAt = new Date((await one('select issued_at from ops.ne_reg_exports where export_id = $1', [id])).issued_at).getTime();
+  const absent = { code_norm: 'auto-e', present: false, trusted: true, kind: null };
+  // NE に無い = 申告が無いので「取り込めなかった」と決めない (「無い」を信じてよい取得でも待ち)
+  const r1 = await newRun();
+  let c = await check(r1, [absent]);
+  assert.deepEqual([c.counts, c.not_imported, c.not_imported_days], [{ waiting: 1 }, [], 3]);
+  assert.deepEqual([(await itemsOf(id))[0].state, await regOf('auto-e')], ['issued', 'draft']);
+  // 信用できない観測 = 待ち (NE にあっても比べない)
+  const r2 = await newRun();
+  c = await check(r2, [{ ...obsSingle('auto-e', { name: ok('新しい単品 E') }), trusted: false }]);
+  assert.deepEqual([c.counts, (await itemsOf(id))[0].state], [{ waiting: 1 }, 'issued']);
+  // 配ってから 3 日を過ぎた取得でも無い = 待ちのまま・not_imported で知らせる (「無い」を信じてよい取得のときだけ)
+  const late = new Date(issuedAt + 4 * 86400e3).toISOString();
+  const r3 = await newRun();
+  c = await check(r3, [absent], { absenceTrusted: false, productsAt: late });
+  assert.deepEqual([c.counts, c.not_imported], [{ waiting: 1 }, []], '「無い」を信じられない取得では知らせない');
+  const r3b = await newRun();
+  c = await check(r3b, [absent], { productsAt: new Date(issuedAt + 2.5 * 86400e3).toISOString() });
+  assert.deepEqual([c.counts, c.not_imported], [{ waiting: 1 }, []], '3 日の前は知らせない');
+  const r4 = await newRun();
+  c = await check(r4, [absent], { productsAt: late });
+  assert.deepEqual(c.counts, { waiting: 1 });
+  assert.deepEqual(c.not_imported.map((x) => [x.code, x.export_id, x.days]), [['auto-e', String(id), 4]]);
+  assert.deepEqual([(await itemsOf(id))[0].state, await regOf('auto-e')], ['issued', 'draft'], '知らせるだけ (状態は変えない)');
+  assert.equal((await one('select detail from ops.ne_reg_checks where compare_run_id = $1', [r4])).detail.not_imported, true);
+  // NE にあるが違う列 = partial (登録は下書きのまま)
+  const r5 = await newRun();
+  c = await check(r5, [obsSingle('auto-e', { name: ok('新しい単品 E'), cost: ok(301) })]);
+  assert.deepEqual(c.counts, { partial: 1 });
+  assert.deepEqual([(await itemsOf(id))[0].state, await regOf('auto-e')], ['partial', 'draft']);
+  const d5 = (await one('select detail from ops.ne_reg_checks where compare_run_id = $1', [r5])).detail;
+  assert.deepEqual([d5.basis, d5.state_before, d5.compare.cols.cost.ok], ['issued', 'issued', false]);
+  // 照合の確かめの道 (system) は、申告なしで verified の確かめが無いうちは通らない (持ち主のロールで直接呼んでも)
+  const eId = await skuId('auto-e');
+  await pgErr(pg.query(`select ops.transition_sku_registration($1, 'ne_pending', 'system', 'ne_compare', null, '{}'::jsonb)`, [eId]), /no_evidence/);
+  // 直した (NE で全部の列が合った) = verified + 下書き → NE 登録待ち → NE 確認済み (どちらも system・ne_compare・根拠 = この確かめ)・ファイルを閉じる
+  const r6 = await newRun();
+  c = await check(r6, [obsSingle('auto-e', { name: ok('新しい単品 E') })]);
+  assert.deepEqual(c.counts, { verified: 1 });
+  assert.deepEqual([(await itemsOf(id))[0].state, await regOf('auto-e')], ['verified', 'ne_confirmed']);
+  const evs = await q("select e.from_state, e.to_state, e.actor_type, e.actor_id, e.evidence from ops.master_registration_events e where e.sku_id = $1 and e.to_state in ('ne_pending', 'ne_confirmed') order by e.event_id", [eId]);
+  assert.deepEqual(evs.map((e) => [e.from_state, e.to_state, e.actor_type, e.actor_id, e.evidence.compare_run_id]),
+    [['draft', 'ne_pending', 'system', 'ne_compare', r6], ['ne_pending', 'ne_confirmed', 'system', 'ne_compare', r6]]);
+  assert.equal(evs[0].evidence.declared, false);
+  assert.ok(Date.parse(evs[0].evidence.fetched_at) > Date.parse(evs[0].evidence.issued_at), '根拠 = 配った後の取得');
+  assert.deepEqual([(await expOf(id)).state, (await expOf(id)).close_reason], ['closed', 'finished']);
+  assert.equal((await q('select 1 from ops.ne_reg_attempts where export_id = $1', [id])).length, 0, '申告は無い');
+  // 同じ回をもう一度 = 何もしない
+  c = await check(r6, [obsSingle('auto-e', { name: ok('新しい単品 E') })]);
+  assert.deepEqual(c.counts, {});
+  // 1 回で全部合う (partial を通らない) = issued → verified
+  await reg('single', 'auto-f', single({ name: '新しい単品 F' }));
+  const rf = await build('products', ['auto-f']);
+  await issue(rf.export.export_id);
+  const r7 = await newRun();
+  c = await check(r7, [obsSingle('auto-f', { name: ok('新しい単品 F') })]);
+  assert.deepEqual([c.counts, (await itemsOf(rf.export.export_id))[0].state, await regOf('auto-f')], [{ verified: 1 }, 'verified', 'ne_confirmed']);
+  // 人の道 (human) で申告なしの NE 登録待ちにはできない (申告の記録が要る = 0053 のまま)・照合でない system の人も拒む
+  await reg('single', 'auto-g', single({ name: '新しい単品 G' }));
+  const gId = await skuId('auto-g');
+  await pgErr(pg.query(`select ops.transition_sku_registration($1, 'ne_pending', 'human', 'x@test', null, '{}'::jsonb)`, [gId]), /no_evidence/);
+  await pgErr(pg.query(`select ops.transition_sku_registration($1, 'ne_pending', 'system', 'someone', null, '{}'::jsonb)`, [gId]), /no_evidence/);
+  // 品目の守り: 申告なしの import_declared は作れない (CHECK)
+  const rg = await build('products', ['auto-g']);
+  await issue(rg.export.export_id);
+  await pgErr(pg.query(`update ops.ne_reg_export_items set state = 'import_declared' where export_id = $1`, [rg.export.export_id]), /ck_nri_declared/);
+  await supersede(rg.export.export_id);
 });
 
 await ta('[C9] セット: 構成品が全部 NE 確認済み・構成品 1 つで 1 行 (並び = 依頼のとおり)・同じ取得の構成品が全部合うときだけ verified', async () => {

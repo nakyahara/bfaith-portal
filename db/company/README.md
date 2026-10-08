@@ -2330,3 +2330,13 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 既にある行は変えない (0060 の前の下書きで代表の仕入先が空の単品はそのまま = 商品の画面で入れる。NE 登録の CSV は今までどおり「代表の仕入先が決まっていない」で止まる)
 - NE 登録の CSV (`ops.ne_reg_build` など)・照合 ② は変えない (単品の CSV `ne-reg-single-v1` に発送方法・送料の列は無い・照合も送料を比べない)
 - 当て方 (🚨 まだ流さない): コードを先に出しても動く (0060 の前の DB = 発送方法なしの登録は DB が `invalid_value: 送料コードと発送方法` で断る = 画面は 400・何も書かない。代表の仕入先は画面・API が先に断る) → `migrate.mjs --dry-run` (0060 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい
+### NE 登録の CSV の「取り込んだと申告」をなくす (0061・2026-10-08 中原さんの決定 a。🚨 番号は仮 = #1657 の 0060 の後・マージの直前に空き番号へ)
+
+- 申告 (sha256・結果) をしなくても、翌朝の照合 ② の `ops.record_ne_registration_check` が、配った (issued) だけの品目も確かめる。結び付け = **配った時刻 (`ne_reg_exports.issued_at`) より後に取った NE の完全な取得で、全部の列が配った値 (expected) と合う**
+  - 取得が配った時刻より前 (同じ時刻も) = 比べない (waiting)・観測が信用できない = waiting
+  - NE に無い = waiting (申告が無い = failed にしない)。配ってから 3 日を過ぎた取得 (「無い」を信じてよいとき) でも無い = 答えの `not_imported` に出す → 照合の朝の要約 (② の行) に ℹ️「配ってから 3 日たっても NE に無い (取り込まれていないらしい)」(失敗にしない・状態も変えない)
+  - NE にある = 全部の列が合えば verified (登録 draft → ne_pending → ne_confirmed・どちらも system / ne_compare)・違う列があれば partial (登録は下書きのまま・翌朝もう一度比べる)
+- 申告した品目 (import_declared・申告の後の partial) は 0053 のまま (申告の時刻から・無ければ failed)。申告のボタンは残す (一部失敗・全部だめを知らせたいとき = 任意)
+- `ops.transition_sku_registration` に「draft → ne_pending を照合の確かめ (system・ne_compare) で」の道だけ足す (根拠 = 申告なしの verified の確かめ・同じ照合の回・配った後の取得。関数が自分で読む)
+- 品目の状態の地図に issued → verified / partial。`ck_nri_declared` = import_declared だけ申告の試みが要る (前からの行は満たす)
+- 当て方 (🚨 まだ流さない): コードを先に出しても壊れない (0061 の前の DB = 今までどおり in_ne_undeclared を残すだけ・要約の ℹ️ は出ない) が、画面は「申告しなくてよい」と書く = **migration は Render のデプロイと同じ日に** → `migrate.mjs --dry-run` (0061 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい (新しい関数は無い・照合の確かめの grant は migration が流し直す)
