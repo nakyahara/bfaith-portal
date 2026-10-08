@@ -1293,6 +1293,18 @@ export function initProductHubDB() {
       value TEXT
     );
 
+    -- 画面から変える設定 (ph_intake_state に置く値) の変更の記録 (2026-10-09 撮影依頼文のいつもの宛先)。
+    -- 誰がいつ何から何に変えたか。追記だけ
+    CREATE TABLE IF NOT EXISTS ph_setting_events (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      key        TEXT NOT NULL,
+      old_value  TEXT,
+      new_value  TEXT,
+      actor      TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_setting_events_key ON ph_setting_events(key, id);
+
     -- かんばんの手動並び順 (2026-08-28 中原さん要望: 「動かしたカードは自由に順番を変えたい」)。
     -- 既定は「停滞日数の多い順 → 登録順」だが、それだと現場で決めた「今日はこの順でやる」が
     -- 保存されず、動かしても読み直すたびに元へ戻ってしまう。
@@ -2049,6 +2061,17 @@ export function initProductHubDB() {
     ['shoot_mode', "ALTER TABLE draft_image_production ADD COLUMN shoot_mode TEXT CHECK (shoot_mode IN ('none', 'inhouse', 'photographer'))"],
     ['shoot_mode_at', 'ALTER TABLE draft_image_production ADD COLUMN shoot_mode_at TEXT'],
     ['shoot_mode_by', 'ALTER TABLE draft_image_production ADD COLUMN shoot_mode_by TEXT'],
+    // 2026-10-09 画像制作の新フロー PR-D: ポータルが自動で作った撮影指示書 (スプレッドシート)。
+    //   file_id … 作ったファイル (更新はこのファイルを上書き = URL は変わらない)
+    //   hash    … 作ったときの材料の hash (今の材料と違えば「LP構成が変わりました → 更新」を出す)
+    //   source  … 材料の出どころ ('auto' = LP構成から拾った / 'request' = API で渡されたカット)。'request' は今の材料と比べない
+    //   URL は camera_instruction_url に入れる (ボードの「撮影指示書 済」がそのまま動く)。
+    //   画像タブの「画像制作情報を保存」では書かない (recordShootSheet だけが書く)
+    ['shoot_sheet_file_id', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_file_id TEXT'],
+    ['shoot_sheet_hash', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_hash TEXT'],
+    ['shoot_sheet_source', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_source TEXT'],
+    ['shoot_sheet_at', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_at TEXT'],
+    ['shoot_sheet_by', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_by TEXT'],
   ];
   for (const [col, sql] of ipAlters) {
     if (ipCols.has(col)) continue;
@@ -2771,6 +2794,82 @@ export function setShootMode(db, draftId, mode, { actor = null, expected } = {})
     return { changed: true, material_status: material };
   });
   return run();
+}
+
+/**
+ * 撮影指示書 (スプレッドシート) を作った / 上書きしたことを記録する (2026-10-09 画像制作の新フロー PR-D)。
+ * camera_instruction_url と file_id・材料の hash を **1 トランザクションで** 書く (片方だけ書かれた状態を作らない)。
+ *
+ * expected = 作り始めたときに見ていた値 { url, fileId }。Google を待っている間に、ほかの人が指示書の URL を
+ *   手で貼り替えた / 別のタブで作り直した、なら書かずに conflict を投げる (後から終わったほうが黙って勝たない)。
+ * 撮影判定が「撮影が要る」でなくなっていても書かない (撮影不要の商品に指示書を付けない)
+ */
+export function recordShootSheet(db, draftId, { url, fileId, hash, source, actor = null, created, expected }) {
+  const id = Number(draftId);
+  return db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
+    const cur = db.prepare('SELECT shoot_mode, camera_instruction_url, shoot_sheet_file_id FROM draft_image_production WHERE draft_id = ?').get(id);
+    if (cur.shoot_mode !== 'inhouse' && cur.shoot_mode !== 'photographer') {
+      throw Object.assign(new Error('作っている間に撮影判定が変わりました (撮影が要る判定ではなくなりました)。スプレッドシートはできていますが、指示書の URL には入れていません'), { code: 'shoot_sheet_conflict' });
+    }
+    if (expected && (String(cur.camera_instruction_url ?? '') !== String(expected.url ?? '') || String(cur.shoot_sheet_file_id ?? '') !== String(expected.fileId ?? ''))) {
+      throw Object.assign(new Error('作っている間に、ほかの人 (または別の画面) が撮影指示書を変えました。画面を読み直してから、もう一度押してください'), { code: 'shoot_sheet_conflict' });
+    }
+    db.prepare(`
+      UPDATE draft_image_production
+      SET camera_instruction_url = ?, shoot_sheet_file_id = ?, shoot_sheet_hash = ?, shoot_sheet_source = ?,
+          shoot_sheet_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), shoot_sheet_by = ?,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = ?
+    `).run(url, fileId, hash, source, actor, id);
+    logEvent(db, id, created ? 'shoot_sheet_created' : 'shoot_sheet_updated',
+      `撮影指示書を${created ? '作成' : '更新'}: ${url}`, actor);
+    return { changed: true };
+  })();
+}
+
+// ─── 撮影依頼文のいつもの宛先 (2026-10-09 中原さん決定) ───
+// 管理者が「担当者・工程の設定」で変える。DB に値が無ければ env PH_SHOOT_REQUEST_MENTION → 既定「@つくば」。
+// 空文字を保存した = 宛先の行を入れない (env を空にしたのと同じ意味)。null で消す = 初期値 (env / 既定) に戻す
+export const SHOOT_MENTION_KEY = 'shoot_request_mention';
+export const SHOOT_MENTION_DEFAULT = '@つくば';
+export const SHOOT_MENTION_MAX = 60;
+
+/** 宛先の値の検査。1 行・60 文字まで。前後の空白は落とす。@returns {{value: string|null, error: string|null}} */
+export function normalizeShootMention(v) {
+  if (v === null) return { value: null, error: null };
+  if (typeof v !== 'string') return { value: null, error: '宛先は文字で指定してください (初期値に戻すときは null)' };
+  if (/[\u0000-\u001f\u007f\u2028\u2029]/.test(v)) return { value: null, error: '宛先に改行やタブは入れられません (1 行で書いてください)' };
+  const t = v.trim();
+  if (t.length > SHOOT_MENTION_MAX) return { value: null, error: `宛先は ${SHOOT_MENTION_MAX} 文字までです` };
+  return { value: t, error: null };
+}
+
+/** いまのいつもの宛先。source = 'db' | 'env' | 'default' */
+export function getShootMention(db, env = process.env) {
+  const row = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(SHOOT_MENTION_KEY);
+  const last = db.prepare('SELECT actor, created_at FROM ph_setting_events WHERE key = ? ORDER BY id DESC LIMIT 1').get(SHOOT_MENTION_KEY) || null;
+  const envMention = env.PH_SHOOT_REQUEST_MENTION === undefined ? null : String(env.PH_SHOOT_REQUEST_MENTION).trim().slice(0, SHOOT_MENTION_MAX);
+  const initial = envMention ?? SHOOT_MENTION_DEFAULT;
+  if (row && row.value != null) {
+    return { value: String(row.value), source: 'db', initial, initialSource: envMention != null ? 'env' : 'default', updatedAt: last?.created_at || null, updatedBy: last?.actor || null };
+  }
+  return { value: initial, source: envMention != null ? 'env' : 'default', initial, initialSource: envMention != null ? 'env' : 'default', updatedAt: last?.created_at || null, updatedBy: last?.actor || null };
+}
+
+/** いつもの宛先を変える (管理者だけ = 呼び手が見る)。同じ値なら changed=false で記録もしない */
+export function setShootMention(db, value, { actor = null } = {}) {
+  const n = normalizeShootMention(value);
+  if (n.error) throw Object.assign(new Error(n.error), { status: 400 });
+  return db.transaction(() => {
+    const row = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(SHOOT_MENTION_KEY);
+    const before = row ? row.value : null;
+    if (before === n.value && (row != null) === (n.value != null)) return { changed: false };
+    if (n.value === null) db.prepare('DELETE FROM ph_intake_state WHERE key = ?').run(SHOOT_MENTION_KEY);
+    else db.prepare('INSERT INTO ph_intake_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(SHOOT_MENTION_KEY, n.value);
+    db.prepare('INSERT INTO ph_setting_events (key, old_value, new_value, actor) VALUES (?, ?, ?, ?)').run(SHOOT_MENTION_KEY, before, n.value, actor);
+    return { changed: true };
+  })();
 }
 
 /**

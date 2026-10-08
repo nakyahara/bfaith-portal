@@ -385,9 +385,51 @@
       <% } %>
     </details>
   </div>
+
+  <!-- ═══ 撮影依頼文のいつもの宛先 (2026-10-09 中原さん決定) ═══ -->
+  <div class="card" id="shoot-mention-card">
+    <h2>📷 撮影依頼文のいつもの宛先</h2>
+    <p class="muted" style="margin:0 0 8px;">
+      商品の画像タブ「撮影指示書」の撮影依頼文の 1 行目 (Google Chat のメンション)。商品の画面ではその回だけ直せます (保存はされません)。
+      空にして保存すると宛先の行を入れません。
+    </p>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <input type="text" id="shoot-mention-input" value="<%= shootMention.value %>" maxlength="60" style="max-width:240px;" placeholder="(宛先なし)" <%= isAdmin ? '' : 'disabled' %>>
+      <% if (isAdmin) { %>
+        <button class="btn btn-sm" id="shoot-mention-save">保存</button>
+        <% if (shootMention.source === 'db') { %><button class="btn btn-sm" id="shoot-mention-reset">初期値 (<%= shootMention.initial || '宛先なし' %>) に戻す</button><% } %>
+      <% } %>
+      <span class="muted" id="shoot-mention-result"></span>
+    </div>
+    <div class="mini" style="margin-top:4px;">
+      <% if (shootMention.source === 'db') { %>画面で設定した値<% if (shootMention.updatedAt) { %> (<%= String(shootMention.updatedAt).slice(0, 16).replace('T', ' ') %> <%= shootMention.updatedBy || '' %>)<% } %>
+      <% } else if (shootMention.source === 'env') { %>初期値 (Render の PH_SHOOT_REQUEST_MENTION)
+      <% } else { %>初期値<% } %>
+      <% if (!isAdmin) { %> ・ 変えられるのは管理者だけです<% } %>
+    </div>
+  </div>
 </div>
 
 <script>
+  // 撮影依頼文のいつもの宛先 (管理者だけ。サーバも管理者でなければ 403)
+  (function initShootMention() {
+    const input = document.getElementById('shoot-mention-input');
+    const save = document.getElementById('shoot-mention-save');
+    const reset = document.getElementById('shoot-mention-reset');
+    const out = document.getElementById('shoot-mention-result');
+    async function send(mention) {
+      if (out) out.textContent = '保存しています…';
+      const res = await fetch('/apps/product-hub/api/settings/shoot-mention', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mention: mention }),
+      });
+      const j = await res.json().catch(function () { return { ok: false, error: '応答を解釈できません' }; });
+      if (!j.ok) { if (out) out.textContent = '保存できませんでした: ' + (j.error || ''); return; }
+      if (out) out.textContent = j.changed ? '保存しました' : '変わっていません';
+      setTimeout(function () { location.reload(); }, 600);
+    }
+    if (save && input) save.addEventListener('click', function () { send(input.value); });
+    if (reset) reset.addEventListener('click', function () { send(null); });
+  })();
   async function post(url, body) {
     const res = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),

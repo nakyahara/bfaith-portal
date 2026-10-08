@@ -1754,19 +1754,44 @@ th.attr-unknown { color: #dc2626; }
             <script type="application/json" id="shoot-rec-json"><%- JSON.stringify((typeof lpCompose !== 'undefined' && lpCompose && lpCompose.shoot) || null).replace(/</g, '\\u003c') %></script>
           </div>
         </section>
-        <%# 3 撮影指示書 (要撮影のときだけ)。スプレッドシートの自動作成は次の段階 (設計 §3.4)。今は作った URL を貼る %>
+        <%# 3 撮影指示書 (要撮影のときだけ)。ポータルがスプレッドシートを作る (2026-10-09 PR-D・設計 §3.4)。手で作った URL を貼ってもよい %>
         <section class="ipf-step" id="ipf-step-shoot" <%= ipfShowShoot ? '' : 'hidden' %>>
         <h3 class="ipf-h"><span class="ipf-no">3</span>撮影指示書</h3>
+        <%# 商品の画像フォルダにスプレッドシートを作り、URL を下の欄に入れる。画面の動きは initShootSheet (@shoot-sheet)。
+            材料は LP構成 (services/shoot-sheet-service.js の shootSheetCutsFor) %>
+        <div class="field" id="shoot-sheet" data-ours="<%= shootSheet.ours ? '1' : '0' %>">
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <button type="button" class="btn <%= shootSheet.ours ? '' : 'btn-primary' %> btn-sm" id="shoot-sheet-btn" <%= shootSheet.blocked ? 'disabled' : '' %>><%= shootSheet.ours ? '撮影指示書を更新' : '撮影指示書を作成 (スプレッドシート)' %></button>
+            <% if (shootSheet.ours) { %><a href="<%= shootSheet.url %>" target="_blank" rel="noopener" class="btn btn-sm" id="shoot-sheet-open">開く ↗</a><% } %>
+            <span class="muted" id="shoot-sheet-msg" style="font-size:12px;"><%= shootSheet.blocked || '' %></span>
+          </div>
+          <% if (shootSheet.ours && shootSheet.stale) { %>
+            <div id="shoot-sheet-stale" style="margin-top:4px; padding:4px 8px; border-radius:6px; background:#fef3c7; border:1px solid #f59e0b; font-size:12px;">LP構成 (または撮影判定・商品名・画像フォルダ) が変わりました。「撮影指示書を更新」で反映してください</div>
+          <% } %>
+          <div class="muted" style="font-size:11px; margin-top:4px;">
+            <% if (shootSheet.ours) { %>作成・更新: <%= String(shootSheet.at || '').slice(0, 16).replace('T', ' ') %> <%= shootSheet.by || '' %> ・<% } %>
+            <% if (shootSheet.source === 'none') { %>LP構成がまだ無いので、カットの表は空で作ります (スプレッドシートで書き足せます)
+            <% } else if (shootSheet.cutsCount) { %>LP構成から撮るカット <%= shootSheet.cutsCount %> 点: <%= shootSheet.cutLabels.join(' / ') %>
+            <% } else { %>LP構成の「使用素材」に撮影が要る画像が見つからないので、カットの表は空で作ります (スプレッドシートで書き足せます)<% } %>
+            ・ 置き場は商品の画像フォルダ。更新すると、スプレッドシートで直した内容は上書きされます
+          </div>
+        </div>
         <div class="field">
           <label>撮影指示書の URL <span class="muted" style="font-weight:400">(スプレッドシート。「画像制作情報を保存」で保存)</span></label>
           <div style="display:flex; gap:6px; align-items:center;">
             <input type="url" id="ip-camera-url" style="flex:1;" value="<%= ip.camera_instruction_url || '' %>" placeholder="https://docs.google.com/spreadsheets/...">
-            <% if (ip.camera_instruction_url) { %><a href="<%= ip.camera_instruction_url %>" target="_blank" rel="noopener" class="btn btn-sm">開く ↗</a><% } %>
+            <% if (ip.camera_instruction_url && !shootSheet.ours) { %><a href="<%= ip.camera_instruction_url %>" target="_blank" rel="noopener" class="btn btn-sm">開く ↗</a><% } %>
           </div>
         </div>
         <%# 撮影依頼文 (Google Chat に貼る)。宛先・商品名・撮影指示書・画像フォルダの URL を差し込む。組み立ては buildShootRequestText %>
         <div class="field" id="shoot-req" data-mention="<%= imageFlow.mention %>" data-name="<%= draft.name || '' %>">
           <label>撮影依頼文 <span class="muted" style="font-weight:400">(コピーして Google Chat に貼る。URL は自動で入ります)</span></label>
+          <%# 宛先はその回だけ直せる (保存しない)。いつもの宛先は管理者が「担当者・工程の設定」で変える (2026-10-09 中原さん決定) %>
+          <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:4px;">
+            <label for="shoot-req-mention" style="margin:0; font-weight:400; font-size:12px;">宛先</label>
+            <input type="text" id="shoot-req-mention" value="<%= imageFlow.mention %>" maxlength="60" style="width:200px;" placeholder="(宛先なし)">
+            <span class="muted" style="font-size:11px;">この回だけ変えられます (保存しません)。いつもの宛先は管理者が <a href="/apps/product-hub/staff#shoot-mention-card">担当者・工程の設定</a> で変えます</span>
+          </div>
           <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
             <button type="button" class="btn btn-primary btn-sm" id="shoot-req-copy">撮影依頼文をコピー</button>
             <span class="muted" id="shoot-req-msg" style="font-size:12px;"></span>
@@ -6094,15 +6119,17 @@ th.attr-unknown { color: #dc2626; }
       // 欄があって空なら空のまま (描いたときの古い名前で送らない — 名指し2 M)。欄が無い画面だけ描いたときの名前
       const nameEl = doc.getElementById('f-name');
       const modeBox = doc.getElementById('shoot-mode-box');
+      // 宛先はその回だけ直せる欄から (初期値 = いつもの宛先・保存はしない — 2026-10-09 中原さん決定)。欄が無い画面だけ描いたときの値
+      const mentionEl = doc.getElementById('shoot-req-mention');
       const r = buildShootRequestText({
         shootMode: modeBox ? (modeBox.dataset.current || null) : null,
-        mention: box.dataset.mention, productName: nameEl ? nameEl.value : box.dataset.name,
+        mention: mentionEl ? mentionEl.value : box.dataset.mention, productName: nameEl ? nameEl.value : box.dataset.name,
         sheetUrl: valueOf('ip-camera-url'), folderUrl: valueOf('import-folder-url'),
       });
       area.value = r.text;
       return r;
     }
-    ['ip-camera-url', 'import-folder-url', 'f-name'].forEach(function (id) {
+    ['ip-camera-url', 'import-folder-url', 'f-name', 'shoot-req-mention'].forEach(function (id) {
       const el = doc.getElementById(id);
       if (el) el.addEventListener('input', refresh);
     });
@@ -6212,6 +6239,54 @@ th.attr-unknown { color: #dc2626; }
   window.phShootRec = shootRec;
   initImageFlow(document, { post: post, showAndReload: showAndReload, base: BASE, clipboard: navigator.clipboard, confirm: function (m) { return window.confirm(m); },
     onShootModeChanged: function () { shootRec.refresh(); } });
+  /* @shoot-sheet:start — 撮影指示書 (スプレッドシート) の作成・更新ボタン (2026-10-09 画像制作の新フロー PR-D)。
+     smoke がこの間を切り出して、偽の document で動かして試す (EJS の値はここに書かない) */
+  /** 画面のつなぎ込み。deps = { post, showAndReload, base, confirm } (smoke では偽物を渡す) */
+  function initShootSheet(doc, deps) {
+    const box = doc.getElementById('shoot-sheet');
+    const btn = doc.getElementById('shoot-sheet-btn');
+    const msg = doc.getElementById('shoot-sheet-msg');
+    if (!box || !btn) return null;
+    let busy = false;
+    const say = function (t) { if (msg) msg.textContent = t; };
+    const send = async function (body) {
+      try { return await deps.post(deps.base + '/shoot-sheet', body); }
+      catch (e) { return { ok: false, error: '通信できませんでした' }; }
+    };
+    btn.addEventListener('click', async function () {
+      // 作っている間は押させない (二重押しで 2 回送らない。サーバも同じ商品は 1 本ずつ)
+      if (busy || btn.disabled) return;
+      const ours = box.dataset.ours === '1';
+      // 指示書の URL を打って保存していない: 作ると欄は作った URL になる。打った URL を黙って捨てない
+      const cam = doc.getElementById('ip-camera-url');
+      const camDirty = !!cam && String(cam.value || '').trim() !== String(cam.defaultValue || '').trim();
+      if (camDirty && !deps.confirm('撮影指示書の URL に保存していない入力があります。撮影指示書を作ると、その入力は捨てて、作ったスプレッドシートの URL を入れます。よろしいですか？')) return;
+      // 上書きは、スプレッドシートで人が直した内容を消す
+      if (ours && !deps.confirm('撮影指示書を今の LP構成で上書きします (URL は変わりません)。スプレッドシートで直した内容は消えます。よろしいですか？')) return;
+      busy = true;
+      btn.disabled = true;
+      say(ours ? '更新しています…' : '作成しています… (10〜20 秒かかります)');
+      let json = await send({});
+      // 手で貼った指示書の URL が入っている: 置き換えてよいかを聞いてから送り直す
+      if (!json.ok && json.code === 'manual_url') {
+        if (deps.confirm(json.error)) json = await send({ replace_manual: true });
+        else json = { ok: false, cancelled: true };
+      }
+      busy = false;
+      if (!json.ok) {
+        btn.disabled = false;
+        say(json.cancelled ? '置き換えをやめました (手で貼った URL のままです)' : '作れませんでした: ' + (json.error || ''));
+        return;
+      }
+      // 打っていた URL は捨てる (読み直しで未保存として戻さない)。欄には読み直しで作った URL が出る
+      if (camDirty) cam.value = cam.defaultValue || '';
+      say(json.created ? '撮影指示書を作りました' : '撮影指示書を更新しました');
+      deps.showAndReload(json, json.created ? '撮影指示書を作りました (画像フォルダの中)' : '撮影指示書を更新しました');
+    });
+    return { isBusy: function () { return busy; } };
+  }
+  /* @shoot-sheet:end */
+  initShootSheet(document, { post: post, showAndReload: showAndReload, base: BASE, confirm: function (m) { return window.confirm(m); } });
   // 🆕 入荷のときに撮った裏面の写真を AI に文字起こしさせる (2026-09-18)。
   //    ⭐**保存しない** — 読み取った文章を欄に入れるだけで、保存するかは人が決める。
   //      AI の読み違いを黙って正本 (back_info_text) に入れないため
