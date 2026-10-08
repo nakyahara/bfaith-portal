@@ -5897,9 +5897,13 @@ th.attr-unknown { color: #dc2626; }
     const name = String((o && o.productName) || '').trim();
     const sheet = String((o && o.sheetUrl) || '').trim();
     const folder = String((o && o.folderUrl) || '').trim();
+    // 空と、http(s) で始まらない値 (保存前の打ち間違い・javascript: など) はコピーさせない — Codex PR-A 名指し L
+    const isWebUrl = function (v) { return /^https?:\/\/[^\s]+$/i.test(v); };
     const missing = [];
     if (!sheet) missing.push('撮影指示書の URL');
+    else if (!isWebUrl(sheet)) missing.push('撮影指示書の URL (https:// で始まる形)');
     if (!folder) missing.push('画像フォルダの URL');
+    else if (!isWebUrl(folder)) missing.push('画像フォルダの URL (https:// で始まる形)');
     const lines = [];
     if (mention) lines.push(mention);
     lines.push('お世話になっています。', '下記商品の商品撮影をお願いします。', '',
@@ -5930,14 +5934,16 @@ th.attr-unknown { color: #dc2626; }
     if (!box || !area) return { refresh: function () { return null; } };
     const valueOf = function (id) { const el = doc.getElementById(id); return el ? el.value : ''; };
     function refresh() {
+      // 商品名は基本情報タブで読み直さずに直せるので、いまの欄の値を使う (無ければ描いたときの名前) — Codex PR-A 名指し M
+      const nameNow = String(valueOf('f-name') || '').trim();
       const r = buildShootRequestText({
-        mention: box.dataset.mention, productName: box.dataset.name,
+        mention: box.dataset.mention, productName: nameNow || box.dataset.name,
         sheetUrl: valueOf('ip-camera-url'), folderUrl: valueOf('import-folder-url'),
       });
       area.value = r.text;
       return r;
     }
-    ['ip-camera-url', 'import-folder-url'].forEach(function (id) {
+    ['ip-camera-url', 'import-folder-url', 'f-name'].forEach(function (id) {
       const el = doc.getElementById(id);
       if (el) el.addEventListener('input', refresh);
     });

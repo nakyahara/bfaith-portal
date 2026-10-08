@@ -2626,6 +2626,7 @@ export function setImageWorkflowState(db, draftId, state, { note = null, actor =
  * 撮影・素材ステータスもそろえる — ③素材待ち の完了条件とボードの「撮影指示書 対象外」はそちらを見ているため:
  *   撮影不要 にした → 素材ステータスが「素材完了」でなければ「撮影不要」にする
  *   撮影が要る にした → 素材ステータスが「撮影不要」なら未設定に戻す (撮影不要のまま ③ を通さない)
+ *   撮影不要 から未判定に戻した → 同じく「撮影不要」なら未設定に戻す
  * 冪等: 同じ判定なら changed=false でイベントも残さない
  * @returns {{changed: boolean, material_status: string|null}}
  */
@@ -2640,6 +2641,9 @@ export function setShootMode(db, draftId, mode, { actor = null } = {}) {
     let material = cur.material_status ?? null;
     if (m === 'none' && material !== 'ready') material = 'not_required';
     else if ((m === 'inhouse' || m === 'photographer') && material === 'not_required') material = null;
+    // 「撮影不要」から未判定に戻した = 撮影不要と決めたのを取り消した。そろえた素材ステータスも取り消す
+    // (未判定なのに ③素材待ち を通れる状態を残さない — Codex PR-A R1 P2)
+    else if (m === null && cur.shoot_mode === 'none' && material === 'not_required') material = null;
     db.prepare(`
       UPDATE draft_image_production
       SET shoot_mode = ?, shoot_mode_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), shoot_mode_by = ?,

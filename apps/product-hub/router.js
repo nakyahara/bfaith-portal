@@ -1466,6 +1466,14 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     if (materialVal && !MATERIAL_STATUS_CODES.has(materialVal)) {
       return res.status(400).json({ ok: false, error: '撮影・素材ステータスの値が不正です' });
     }
+    // 撮影判定で「撮影が要る」としたのに「撮影不要」で保存すると、撮影しないまま ③素材待ち を通れてしまう
+    // (古いタブからの保存も同じ)。撮影不要にするなら撮影判定のほうで選ばせる — Codex PR-A 名指し High
+    if (materialVal === 'not_required') {
+      const sm = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.shoot_mode;
+      if (sm === 'inhouse' || sm === 'photographer') {
+        return res.status(400).json({ ok: false, error: `撮影判定が「${sm === 'inhouse' ? '社内撮影' : 'カメラマン撮影'}」なので、撮影・素材ステータスを「撮影不要」にはできません。撮影が要らないなら、撮影判定で「撮影不要」を押してください (画面を読み直すと今の値が出ます)` });
+      }
+    }
   }
   let infoVal; let infoAt; let infoBy;
   let backVal; let backAt; let backBy;

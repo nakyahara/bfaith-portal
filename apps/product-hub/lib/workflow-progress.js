@@ -1710,6 +1710,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT workflow_state FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_workflow_state,
       (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
       (SELECT material_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS material_status,
+      (SELECT shoot_mode FROM draft_image_production ip WHERE ip.draft_id = d.id) AS shoot_mode,
       (SELECT canva_url FROM draft_image_production ip WHERE ip.draft_id = d.id) AS canva_url,
       ${/* 撮影指示書 (カメラ撮影指示URL) が作られたか (2026-10-01 スタッフ要望。カードの「撮影指示書：まだ／済」)。
             「商品を発送していても指示書ができていない」を拾うための印なので、
@@ -1859,9 +1860,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     // 撮影指示書 (2026-10-01 スタッフ要望)。「商品を発送していても指示書ができていない」ことが
     // あるので、撮影・素材ステータスとは別に 済/まだ を出す。済 = カメラ撮影指示URL が入っている。
     // 撮影不要の商品は作る必要が無いので「対象外」(まだ のまま残すと仕入れ商品が軒並み まだ になる)
+    // 撮影判定 (2026-10-08) があればそれが正本 (撮影不要 + 素材完了 の商品も「対象外」)。
+    // 判定の無い商品 (それより前の商品) だけ従来どおり撮影・素材ステータスで見る — Codex PR-A 名指し M
     cameraInstruction: {
       registered: d.has_camera_instruction === 1,
-      notRequired: d.material_status === 'not_required',
+      notRequired: d.shoot_mode ? d.shoot_mode === 'none' : d.material_status === 'not_required',
     },
   });
 

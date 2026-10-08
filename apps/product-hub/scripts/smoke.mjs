@@ -5933,6 +5933,12 @@ let wfSetParentId = null;
       dbmod.upsertImageProduction(db, idV2, { camera_instruction_url: 'https://docs.google.com/spreadsheets/d/old/edit' });
       check('撮影指示書: 撮影不要 + 古い URL でも 撮影不要 の印が立つ (画面は対象外を先に出す)',
         ciOf()?.notRequired === true && ciOf()?.registered === true, JSON.stringify(ciOf()));
+      // 撮影判定 (2026-10-08) があればそれが正本。詳細画面が指示書の段を隠す条件とそろえる (Codex PR-A 名指し M)
+      db.prepare(`UPDATE draft_image_production SET shoot_mode = 'none', material_status = 'ready', camera_instruction_url = NULL WHERE draft_id = ?`).run(idV2);
+      check('撮影指示書: 撮影判定「撮影不要」なら、素材完了でも 対象外', ciOf()?.notRequired === true, JSON.stringify(ciOf()));
+      db.prepare(`UPDATE draft_image_production SET shoot_mode = 'inhouse' WHERE draft_id = ?`).run(idV2);
+      check('撮影指示書: 撮影判定が「社内撮影」なら まだ (素材ステータスに依らない)', ciOf()?.notRequired === false, JSON.stringify(ciOf()));
+      db.prepare(`UPDATE draft_image_production SET shoot_mode = NULL WHERE draft_id = ?`).run(idV2);
       dbmod.upsertImageProduction(db, idV2, { material_status: 'ready', camera_instruction_url: null });
     }
     // 楽天登録済みの既存商品には詳細 v2 も自動 done で入る
@@ -6226,6 +6232,17 @@ let wfSetParentId = null;
         badStatuses.every((s) => s === 400) && ipSf().shoot_mode === 'inhouse', JSON.stringify([badStatuses, ipSf()]));
       r = await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: null });
       check('撮影判定: null で未判定に戻せる', r.status === 200 && ipSf().shoot_mode === null && evSf().at(-1).includes('「未判定」'), JSON.stringify(ipSf()));
+      check('撮影判定: 撮影が要るから未判定に戻しても「素材完了」は残す', ipSf().material_status === 'ready', JSON.stringify(ipSf()));
+      db.prepare(`UPDATE draft_image_production SET material_status = NULL WHERE draft_id = ?`).run(idSf);
+      await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'none' });
+      r = await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: null });
+      check('🚨 撮影判定: 「撮影不要」から未判定に戻すと、そろえた「撮影不要」も未設定に戻す (未判定のまま ③ を通さない・Codex R1 P2)',
+        r.status === 200 && ipSf().shoot_mode === null && ipSf().material_status === null && r.json?.material_status === null, JSON.stringify([r, ipSf()]));
+      // 撮影判定より前から人が「撮影不要」にしていた商品は、未判定のままなら触らない
+      db.prepare(`UPDATE draft_image_production SET material_status = 'not_required' WHERE draft_id = ?`).run(idSf);
+      r = await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: null });
+      check('撮影判定: 未判定のまま未判定を送っても、人が付けた素材ステータスは消さない', r.json?.changed === false && ipSf().material_status === 'not_required');
+      db.prepare(`UPDATE draft_image_production SET material_status = NULL WHERE draft_id = ?`).run(idSf);
 
       // 権限: 管理者ではなく実際に押す役割で確かめる (画像登録者は押せる・役割なしは 403)
       const sfNoRole = wf.createStaff({ name: '撮影判定 役割なし', kind: 'internal', portal_email: 'shoot-norole@b-faith.biz' });
@@ -6241,6 +6258,14 @@ let wfSetParentId = null;
       check('撮影判定: 画像登録者 (管理者でない) は押せる', rImg.status === 200 && ipSf().shoot_mode === 'inhouse', JSON.stringify([rImg, ipSf()]));
       wf.setStaffActive(sfNoRole, false);
       wf.setStaffActive(sfImg, false);
+
+      // 🚨 撮影が要ると判定したのに、保存ボタン (古いタブを含む) で素材ステータスを「撮影不要」にはできない
+      r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'not_required' });
+      check('🚨 撮影判定が「社内撮影」のまま、保存ボタンで撮影・素材ステータスを「撮影不要」にはできない (撮影しないまま ③ を通さない・Codex PR-A High)',
+        r.status === 400 && ipSf().material_status !== 'not_required' && /撮影判定/.test(r.json?.error || ''), JSON.stringify([r, ipSf()]));
+      r = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'shipped' });
+      check('撮影判定が「社内撮影」でも、撮影不要以外の素材ステータスは保存できる', r.status === 200 && ipSf().material_status === 'shipped', JSON.stringify(r));
+      db.prepare(`UPDATE draft_image_production SET material_status = NULL WHERE draft_id = ?`).run(idSf);
 
       // 編集データリンク: 保存ボタン (image-production) で保存。http(s) だけ・送らなければ消えない
       r = await call('POST', `/api/drafts/${idSf}/image-production`, { edit_data_url: 'https://drive.google.com/file/d/psd-1/view' });
@@ -6322,6 +6347,7 @@ let wfSetParentId = null;
         'shoot-req-text': fakeEl({ attrs: { readonly: '' } }),
         'shoot-req-copy': fakeEl(), 'shoot-req-msg': fakeEl(), 'shoot-mode-msg': fakeEl(),
         'ip-camera-url': fakeEl({ value: '' }), 'import-folder-url': fakeEl({ value: FOLDER }),
+        'f-name': fakeEl({ value: 'マイタケ粉末 50g' }),
       };
       const modeBtns = ['none', 'inhouse', 'photographer'].map((m) => fakeEl({ dataset: { shootMode: m }, attrs: { 'aria-checked': m === 'inhouse' ? 'true' : 'false' } }));
       const doc = { getElementById: (id) => els[id] || null, querySelectorAll: (q) => (q === '[data-shoot-mode]' ? modeBtns : []) };
@@ -6349,6 +6375,20 @@ let wfSetParentId = null;
       await new Promise((res) => setTimeout(res, 0));
       check('画面の JS: クリップボードが使えなければ選択して手でコピーさせる',
         els['shoot-req-text'].selected === 1 && !els['shoot-req-text'].hasAttr('readonly') && els['shoot-req-msg'].textContent.includes('選択しました'));
+      clipOk = true;
+      els['f-name'].value = 'マイタケ粉末 100g';
+      await els['f-name'].fire('input');
+      check('🚨 画面の JS: 基本情報で商品名を直すと、依頼文の商品名も今の名前になる (読み直し前でも・Codex PR-A M)',
+        els['shoot-req-text'].value.includes('【商品名】マイタケ粉末 100g') && !els['shoot-req-text'].value.includes('50g'), els['shoot-req-text'].value);
+      const copiedBefore = copied.length;
+      els['ip-camera-url'].value = 'htps://docs.google.com/x';
+      await els['ip-camera-url'].fire('input');
+      await els['shoot-req-copy'].fire('click');
+      els['ip-camera-url'].value = 'javascript:alert(1)';
+      await els['ip-camera-url'].fire('input');
+      await els['shoot-req-copy'].fire('click');
+      check('画面の JS: http(s) で始まらない URL はコピーしない (打ち間違い・javascript: を送らない・Codex PR-A L)',
+        copied.length === copiedBefore && els['shoot-req-msg'].textContent.includes('https:// で始まる形'), els['shoot-req-msg'].textContent);
       await modeBtns[1].fire('click');
       check('画面の JS: いま選ばれている撮影判定を押しても送らない', posts.length === 0);
       await modeBtns[0].fire('click');
