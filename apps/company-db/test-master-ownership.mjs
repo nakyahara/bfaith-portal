@@ -58,11 +58,13 @@ const setComps = async () => (await q("select c.qty from core.sku_components c j
 const amzComps = async () => (await q("select lc.qty, lc.resolution from core.listing_components lc join core.listings l on l.listing_id = lc.listing_id where l.mall = 'amazon' and l.listing_code = 'pr_own001'")).map((r) => [Number(r.qty), r.resolution]);
 const supplier = async () => (await q("select name, order_method, lead_time_days from core.suppliers where code = '0001'"))[0];
 
-await ta('[1] 既定 (epoch の行が無い = 全部 load): SQLite の値で作る。report.company_owned は空。configured (13 キー + skus.sku_kind が company) を書き換えただけでは変わらない', async () => {
+await ta('[1] 既定 (epoch の行が無い = 全部 load): SQLite の値で作る。report.company_owned は空。configured (13 キー + skus.sku_kind + listing_components.amazon が company) を書き換えただけでは変わらない', async () => {
   // ⑤-3b の PR: configured は 10/5 の 13 キーが company。夜間ロードは epoch (0055 の active。行が無い = 全部 load) を読む = マージしても結果は変わらない
   //   10/7: configured の skus.sku_kind も company (広げる道の手順の 1) = 14 キー。それでも夜間ロードは epoch を読む = 区分も NE に合わせたまま
-  assert.equal(companyOwned(MASTER_OWNERSHIP).length, 14);
+  //   10/8: configured の listing_components.amazon も company (⑦-2 PR-C) = 15 キー。それでも夜間ロードは epoch を読む = Amazon の構成も SKU マスタ・Sheet から作ったまま (下の amzComps)
+  assert.equal(companyOwned(MASTER_OWNERSHIP).length, 15);
   assert.equal(MASTER_OWNERSHIP['skus.sku_kind'], 'company');
+  assert.equal(MASTER_OWNERSHIP['listing_components.amazon'], 'company');
   const r = await run(makePlan(), 'own_1');
   assert.deepEqual(r.company_owned, []);
   assert.deepEqual(await sku('own001'), { name: 'NE の名前 1', tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', pname: 'NE の名前 1', sales_class: 3, status: 'active' });

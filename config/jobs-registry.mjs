@@ -552,7 +552,12 @@ export const JOBS_REGISTRY = [
       + '(watcher の読むだけの 1 取引・SQLite の 1 取引で差だけ・commit の前に読み直してハッシュを照らす・sync_meta cdb_amazon_map_publish にハッシュ・行数・変更の記録の番号)。'
       + '持ち主が load の今は何もしない (⏭️ exit 0・SQLite を開かない)。daily・自動再試行・手の CLI は同じ実行の鍵 (warehouse.db の job_locks cdb-amazon-map-publish) を PG を読む前から SQLite の commit の後まで持つ。'
       + '断る (古い表は前のまま・❌ = retry に載る) = 0 件・今の古い表の 90% 未満・変更の記録の番号が前の写しより小さい (Company DB の復元?)・受け手の決まりに合わない。'
-      + 'retry では f_sales の上流 (写しが再失敗 = f_sales を作り直さない)。写しが retry に載った日だけ「写しの鎖」= 写しが直ったら f_sales → sales_velocity → pml_snapshot → Render同期 を一段ずつ (途中で落ちたらその先は残す。retry-state の amazon_map_chain)。持ち主 load の今の retry は前のまま。'
+      + 'retry では f_sales の上流 (写しが再失敗 = f_sales を作り直さない)。写しが retry に載った日だけ「写しの鎖」= 写しが直ったら f_sales → sales_velocity → pml_snapshot → Render同期 を一段ずつ (途中で落ちたらその先は残す。retry-state の amazon_map_chain)。'
+      + '🆕 ⑦-2 PR-C (#1652) を配った後: 持ち主を読めない朝 (watcher に届かない・COMPANY_DB_WATCH_URL が無い・子の異常終了) は config (configured の listing_components.amazon = company) を手がかりに ❌ = retry に載る '
+      + '(配ってから widen までの DB の active が load の間も。持ち主を読めた朝は ⏭️ exit 0 のまま)。retry で写しが ⏭️ (持ち主 load = 何も書いていない) で直った回は鎖を外す '
+      + '(retry-failed-jobs.js の mapWroteNothing = f_sales 以降・照合・新商品の許可を走らせ直さない)。写しが落ちた回は写しの前後の写しの記録 (warehouse.db の sync_meta cdb_amazon_map_publish) を比べる (#1652 Codex R2): '
+      + '前のままと確かめられた = 古い表は前のまま = もとの remaining の f_sales・Render同期 などは古い表で普通に再試行し、写しだけを鎖の未完で残す (写しが後で本当に写せた回に鎖が f_sales から全部を流し直す) / '
+      + '記録が変わった (commit の後の終了処理で timeout・異常終了) = 写せた扱い (⚠️) で f_sales から鎖を流す / 鍵待ち (73)・記録を読めない = その回は f_sales・sales_velocity・pml_snapshot・Render同期 を流さない。'
       + 'ping は打たない (この台帳の 1 工程)。新しい定期実行は無い)',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
@@ -561,6 +566,9 @@ export const JOBS_REGISTRY = [
     grace_hours: 7, // retry3 (11:30) + 実行時間 + 余裕。14:00までに ok が無ければ締切超過
     lifecycle: 'permanent',
     runbook: 'logs/daily-sync-*.log を確認。個別ジョブ再実行は reference_daily_sync_manual_job_rerun (node -r dotenv/config)。'
+      + '「CompanyDB写し(Amazon SKU)」が ❌「持ち主を読めない … config が company」の朝 (⑦-2 PR-C の後) = まず watcher (COMPANY_DB_WATCH_URL・Render の DB) を直す。'
+      + 'Amazon の widen の前 (DB の active が load) なら写しは何もしないので、直った後の retry は ⏭️ で終わり鎖は動かない。f_sales・Render同期 は古い表のまま普通に retry される。'
+      + '写しを急いで流すのは node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain (写し → f_sales → 速度 → リスト → Render同期 を一続き)。'
       + '「新商品の許可」が閉: 要約の理由を見る。未設定 = miniPC の .env に COMPANY_DB_NEW_ENTRY_GATE_URL (ログイン new_entry_gate = scripts/company-db/create-master-edit-roles.mjs が作る・パスワードは中原さんだけ) を 1 行足す / '
       + '関数が無い = 0058 の前 / 準備中 = widen の前 (sku_kind_not_company・not_widened) / kind_gate・shape = 照合 ② の要約と全件 JSON (DATA_DIR/cdb-master-compare/<日付>/) で区分の差を直す → retry か、手で「マスタ照合 → 新商品の許可」の順に流す / '
       + '⚠️ 状態不明 = 開いている可能性 = すぐ DB の持ち主か new_entry_gate で ops.revoke_new_entry_lease(\'single\', 理由) → ops.new_entry_lease_valid(\'single\') が false を確かめる / '

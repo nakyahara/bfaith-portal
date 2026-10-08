@@ -1463,8 +1463,9 @@ await ta('[X2] 復元 (夜間のバックアップ): backfill の後の DB は�
 console.log('\n広げる道 PR-2 (DB の active に従う・二層の門)');
 const { COMPANY_CAPABLE } = await import('../config/master-capability.mjs');
 const { MASTER_OWNERSHIP: CONFIGURED } = await import('../config/master-ownership.mjs');
-/** 本番の active (10/5 の 13 キー・skus.sku_kind は load)。WIDENED = widen の後 (sku_kind も company) = 10/7 からの configured (広げる道の手順の 1) */
-const PROD13 = Object.freeze({ ...CONFIGURED, 'skus.sku_kind': 'load' });   // 🚨 COMPANY_CAPABLE から作らない (#1641 で skus.sku_kind が入った = 14 キー・Codex #1640 R6 Medium)
+/** 10/5 の本番の active (13 キー・skus.sku_kind と listing_components.amazon は load)。WIDENED = 区分の widen の後 (sku_kind も company = 10/7 13:48 からの本番の active)。
+ *  configured = WIDENED + listing_components.amazon (10/8・⑦-2 PR-C。Amazon の widen の後の持ち主表) */
+const PROD13 = Object.freeze({ ...CONFIGURED, 'skus.sku_kind': 'load', 'listing_components.amazon': 'load' });   // 🚨 COMPANY_CAPABLE から作らない (#1641 で skus.sku_kind・⑦-2 PR-A で Amazon が入った = 15 キー・Codex #1640 R6 Medium)
 /** 旧 build (widen の前の能力 = 13 キー) = 今の COMPANY_CAPABLE から skus.sku_kind と listing_components.amazon (⑦-2 PR-A で入った) を明示して外す */
 const OLD_CAPABLE = Object.freeze(COMPANY_CAPABLE.filter((k) => k !== 'skus.sku_kind' && k !== 'listing_components.amazon'));
 const WIDENED = Object.freeze({ ...PROD13, 'skus.sku_kind': 'company' });
@@ -1492,8 +1493,9 @@ await ta('[W1] 今の本番と同じ DB (active = 13 キー・許可なし。con
   assert.equal(Object.values(PROD13).filter((v) => v === 'company').length, 13, '本番の active = 13 キー');
   assert.equal(PROD13['skus.sku_kind'], 'load');
   assert.notEqual(C.ownershipHash(WIDENED), C.ownershipHash(PROD13), 'widen の前後で持ち主表が違う');
-  assert.equal(C.ownershipHash(WIDENED), C.ownershipHash(CONFIGURED), 'configured = widen の後の持ち主表 (10/7・広げる道の手順の 1)');
+  assert.equal(C.ownershipHash({ ...WIDENED, 'listing_components.amazon': 'company' }), C.ownershipHash(CONFIGURED), 'configured = 区分と Amazon の widen の後の持ち主表 (10/7・10/8)');
   assert.notEqual(C.ownershipHash(PROD13), C.ownershipHash(CONFIGURED), '配ってから widen までの間 = DB の active と configured は違う (画面は DB の active に従う)');
+  assert.notEqual(C.ownershipHash(WIDENED), C.ownershipHash(CONFIGURED), '今の本番 (区分だけ widen 済み) と configured (Amazon も) も違う = 画面は DB の active に従う');
   await withDbOwner(PROD13, {}, async () => {
     const r = await saveName('s001', '13 キーの保存');
     assert.equal(r.ok, true);
@@ -1519,8 +1521,10 @@ await ta('[W1] 今の本番と同じ DB (active = 13 キー・許可なし。con
   oldCreation = { readable: true, writable: false };
 });
 
-await ta('[W2] DB の active に skus.sku_kind が入る (widen の後 = active と configured が同じ) = DB に従って単品だけ開く・許可 / 非常の止め / 関数なし / 読めない / code_behind・セットは閉じたまま', async () => {
-  assert.equal(CONFIGURED['skus.sku_kind'], 'company', 'configured (配った config) も company = widen の後は active と同じ (画面は config を見ていない = W1)');
+await ta('[W2] DB の active に skus.sku_kind が入る (区分の widen の後 = 10/7 からの本番。configured は Amazon も company = Amazon の widen の前) = DB に従って単品だけ開く・許可 / 非常の止め / 関数なし / 読めない / code_behind・セットは閉じたまま', async () => {
+  assert.equal(CONFIGURED['skus.sku_kind'], 'company', 'configured (配った config) も company (画面は config を見ていない = W1)');
+  assert.equal(CONFIGURED['listing_components.amazon'], 'company');
+  assert.equal(WIDENED['listing_components.amazon'], 'load', '今の本番の active の Amazon は load (Amazon の widen の前)');
   const cap = [...COMPANY_CAPABLE].sort();   // 今のコードの能力 (#1641 で skus.sku_kind を含む)
   assert.ok(cap.includes('skus.sku_kind'));
   await withDbOwner(WIDENED, { capable: cap }, async () => {

@@ -271,9 +271,14 @@ await ta('[7] company: 初めからセット (商品なし) の SKU を NE が�
 
 await ta('[8] configured の区分 = company を配っても、ロードは DB の active (10/5 の 13 キー・区分 load) に従う = 区分は NE に合わせる / widen の後 (active = configured) は社内の区分のまま', async () => {
   // 広げる道の手順の 1 (10/7): configured の skus.sku_kind = company。DB の active (本番 = 10/5 の 13 キー) には無い = prepare --widen の足すキーは区分だけ
-  const PROD_ACTIVE_20261005 = { ...ALL_LOAD, ...Object.fromEntries(companyOwned(MASTER_OWNERSHIP).filter((k) => k !== 'skus.sku_kind').map((k) => [k, 'company'])) };
-  assert.equal(MASTER_OWNERSHIP['skus.sku_kind'], 'company');
-  assert.deepEqual(companyOwned(MASTER_OWNERSHIP).filter((k) => PROD_ACTIVE_20261005[k] !== 'company'), ['skus.sku_kind']);
+  //   🚨 変わる configured から作らない (#1652 Codex R1 Low): 10/5 の 13 キー (履歴の固定値)・10/7 13:48 の区分の widen の後の 14 キー (固定値)
+  const KEYS_20261005 = ['external_ids.jan', 'products.name', 'products.sales_class', 'products.status', 'sku_costs', 'skus.handling', 'skus.name',
+    'skus.reorder_months', 'skus.shipping', 'skus.standard_price', 'skus.tax_class', 'skus.tax_rate', 'supplier_skus.is_primary'];
+  const PROD_ACTIVE_20261005 = Object.freeze({ ...ALL_LOAD, ...Object.fromEntries(KEYS_20261005.map((k) => [k, 'company'])) });
+  const ACTIVE_20261007 = Object.freeze({ ...PROD_ACTIVE_20261005, 'skus.sku_kind': 'company' });   // 区分の widen の後 (Amazon は load のまま)
+  assert.equal(companyOwned(PROD_ACTIVE_20261005).length, 13);
+  assert.equal(MASTER_OWNERSHIP['skus.sku_kind'], 'company');   // configured (10/7〜)
+  assert.ok(companyOwned(MASTER_OWNERSHIP).filter((k) => PROD_ACTIVE_20261005[k] !== 'company').includes('skus.sku_kind'));
   const { pg, db, q } = await freshDb();
   try {
     await load(db, planOf([...BASE, ['k1', 'single'], ['k8', 'single']], BASE_COMPS), ALL_LOAD);
@@ -291,8 +296,8 @@ await ta('[8] configured の区分 = company を配っても、ロードは DB �
     const D = await decisionsOf(q, r.run_id);
     assert.ok(!Object.hasOwn(D.skus, 'kind_held'));
     assert.equal(decisionsProblem(D, { ownership: own1, has0027: true }), null);
-    // (2) widen の後 (active = configured): 区分は社内のまま (NE の単品 → セットを入れない)・食い違いを記録
-    assert.equal(await seedActiveEpoch(db, MASTER_OWNERSHIP), true);
+    // (2) 区分の widen の後 (active = 10/7 の 14 キー): 区分は社内のまま (NE の単品 → セットを入れない)・食い違いを記録
+    assert.equal(await seedActiveEpoch(db, ACTIVE_20261007), true);
     const r2 = await load(db, planOf([...BASE, ['k1', 'set'], ['k8', 'set']], [...BASE_COMPS, ['k1', 'a1', 1], ['k8', 'a2', 2]]), undefined);
     assert.equal(r2.ownership_epoch.epoch, 'active');
     assert.ok(r2.company_owned.includes('skus.sku_kind'));
