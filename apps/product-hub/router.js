@@ -78,6 +78,8 @@ import {
   imageBlockReason as lpImageBlockReason, imageRefCandidates as lpImageRefCandidates, validImageRequestKey as lpImageValidKey,
 } from './lib/lp-image.js';
 import { Readable } from 'node:stream';
+// LP 構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09)。ロジックは lib/lp-edit.js
+import { editStateFor as lpEditStateFor, saveEdit as saveLpEdit, latestEditFor as latestLpEditFor } from './lib/lp-edit.js';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
@@ -543,6 +545,8 @@ router.get('/detail/:id', (req, res) => {
     lpCompose: lpComposeInitialState(db, draft),
     // 「🖼 画像を作る」(段階2・2026-10-04)。同じく最初の表示をここで作る
     lpImage: lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }),
+    // LP構成の確認・修正 (2026-10-09 PR-B)。直せるのは画像制作情報を触れる人だけ (見るのは誰でも)
+    lpEdit: lpEditStateFor(db, draft, { canEdit: canEditImageProduction(req) }),
     // 画像制作の新フロー (2026-10-08): 撮影判定の 3 択と、撮影依頼文の宛先
     imageFlow: { shootModes: SHOOT_MODES, mention: shootRequestMention() },
   });
@@ -3974,8 +3978,10 @@ function lpComposeInitialState(db, draft) {
   //    ここだけ effectiveProductInfo を渡すと、**裏面情報だけの商品が
   //    画面ではずっと押せない** (API では押せる) という食い違いになる。
   const { productInfo, images } = lpComposeMaterial(db, draft);
+  const st = lpComposeStateFor(db, draft.id);
   return {
-    ...lpComposeStateFor(db, draft.id),
+    ...st,
+    lp_edit: lpcEditOf(db, st),
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
     image_plan: lpComposeImagePlan(images),
@@ -4036,9 +4042,12 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
   const db = getDB();
   const spec = latestLpSpec(db, 'product_analysis');
   const { productInfo, images } = lpComposeMaterial(db, draft);
+  const st = lpComposeStateFor(db, draft.id);
   res.json({
     ok: true,
-    ...lpComposeStateFor(db, draft.id),
+    ...st,
+    // 人が直した版 (あれば)。「AI が作った構成」の箱はこちらを出し、コピー・lp-tool にもこちらを渡す
+    lp_edit: lpcEditOf(db, st),
     // 押せるか。押せない理由はそのまま画面に出す
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
@@ -4048,6 +4057,51 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
   });
+});
+
+/**
+ * 「AI が作った構成」の箱 (lpc) に添える、人が直した版 (画像制作の新フロー PR-B)。
+ * 箱が本文を出すのは「いちばん新しい依頼が done・実モデル一致」のときだけなので、その依頼への編集版だけを返す。
+ * 🚨 AI の生の出力 (job.output_text) はそのまま残す (段階1 の測定の材料)
+ */
+function lpcEditOf(db, st) {
+  const job = st && st.job;
+  if (!job || job.status !== 'done' || !job.output_text) return null;
+  const e = latestLpEditFor(db, job.id);
+  return e ? { base_job_id: e.base_job_id, edit_id: e.id, output_text: e.output_text, edited_by: e.edited_by, edited_at: e.created_at } : null;
+}
+
+// ─── 画面: LP構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09) ─────────
+// 正本 = AI_reference『商品ハブ_画像制作の新フロー_設計_20261008.md』§3.1。ロジックは lib/lp-edit.js。
+// 画像ごとに 役割・見出し・キャッチコピー・本文 を直し、TOP / FV 以外を並べ替え・追加・削除する。
+// 直した構成は ⑦ に書き戻して別の表に追記する (AI の出力は書き換えない)。画像生成と lp-tool のコピーはそれを読む
+
+/** いま効いている構成の画像の並び (見るのは誰でも) */
+router.get('/api/drafts/:id/lp-edit', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  res.json(lpEditStateFor(getDB(), draft, { canEdit: canEditImageProduction(req) }));
+});
+
+/**
+ * 保存する。body: { base_job_id, base_edit_id, slots: [{uid, role, title, copy, body, shoot}...並び順] }。
+ * サーバの lint を通ったときだけ保存。画面が見ていた版が今と違えば 409 (古いタブ・2 人同時で上書きしない)
+ */
+router.put('/api/drafts/:id/lp-edit', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  // 撮影判定・画像制作情報と同じ人だけ (画像の中身を決める値なので誰でもは書けない)
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, code: 'forbidden', error: 'LP構成を直せるのは 画像登録者・画像作成承認者 の担当者か管理者だけです (担当者・工程で役割を確認してください)' });
+  }
+  const db = getDB();
+  const b = req.body || {};
+  const r = saveLpEdit(db, { draft, baseJobId: b.base_job_id, baseEditId: b.base_edit_id, slots: b.slots, actor: actorOf(req) });
+  if (!r.ok) {
+    const status = r.code === 'conflict' || r.code === 'not_ready' ? 409 : 400;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error, errors: r.errors || null });
+  }
+  res.json({ ...lpEditStateFor(db, draft, { canEdit: true }), changed: r.changed });
 });
 
 // ─── 画面: LP 画像を作る (段階2・2026-10-04 中原さん) ─────────────

@@ -10744,6 +10744,8 @@ for (const [name, file, data] of renders) {
         materialStatuses: dbmod.MATERIAL_STATUSES,
         // 画像制作の新フロー (2026-10-08): router は詳細画面に常に渡す
         imageFlow: { shootModes: dbmod.SHOOT_MODES, mention: '@つくば' },
+        // LP構成の確認・修正 (2026-10-09 PR-B)。router は詳細画面に常に渡す。既定 = 構成がまだ無い (一覧は隠れる)
+        lpEdit: { ok: true, available: false, can_edit: false, max_images: 10, min_images: 2, reason: 'LP構成がまだできていません' },
         // 📄 LP構成の仕様書の取り込みカード (段階1・PR1-e)。router は一覧画面に常に渡す。
         // 既定 = 機能オン・いまの版あり (admin に出る形)。機能オフ・未取込の見え方は
         // 「index.ejs (LP仕様書: 機能オフ)」「(まだ取り込まれていない)」の fixture で上書きする
