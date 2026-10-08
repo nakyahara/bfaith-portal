@@ -1,6 +1,6 @@
 ---
 name: ph-lp-compose
-description: product-hub の「構成をAIに作らせる」の実行役 — claim → 商品画像を見る → ⑦AI画像生成プロンプトを書く → lint → Codex検品 → 反映 → 書き戻す。「LP構成を作って」「ph-lp-compose」で起動。ランナー (scripts/ph-nightly/run-lp-compose.ps1) からも同じ手順で走る
+description: product-hub の「構成をAIに作らせる」の実行役 — claim → 商品画像を見る → ⑦AI画像生成プロンプトを書く → lint → Codex検品 → 反映 → 撮影判定を書く → 書き戻す。「LP構成を作って」「ph-lp-compose」で起動。ランナー (scripts/ph-nightly/run-lp-compose.ps1) からも同じ手順で走る
 ---
 
 # product-hub LP 構成の AI 生成 (段階1・2026-10-01)
@@ -27,9 +27,10 @@ description: product-hub の「構成をAIに作らせる」の実行役 — cla
 ./phlp images  ID                             画像 (商品 + 素材) を img-ID-1.jpg … に落とす
                                               (枚数は claim の packet で決まる。落とせない枚があれば失敗する)
 ./phlp reserve ID                             🚨 **構成を書き始める前に必ず**
-./phlp lint    ID --file out-ID.md             lint (サーバが正本・AI 枠を使わないので何度でも)
-./phlp result  ID --accepted --file out-ID.md --lint lint-ID.json --rounds N
-./phlp result  ID --rejected --reason-file reason-ID.txt --file out-ID.md --lint lint-ID.json --rounds N
+./phlp lint    ID --file out-ID.md --shoot shoot-ID.json
+                                              lint (サーバが正本・AI 枠を使わないので何度でも)。撮影判定も同じ検査を受ける
+./phlp result  ID --accepted --file out-ID.md --lint lint-ID.json --rounds N --shoot shoot-ID.json
+./phlp result  ID --rejected --reason-file reason-ID.txt --file out-ID.md --lint lint-ID.json --rounds N --shoot shoot-ID.json
 ./phlp fail    ID --code CODE --message "…"   予約の**前**だけ
 ./phlp release ID --reason "…"                予約の**前**だけ (一時障害)
 ./phlp clean   ID                             一時ファイルを消す (rm は使えない)
@@ -72,6 +73,8 @@ RUN_ID="lp-$RANDOM$RANDOM"
 - 🚨 **`packet.image_guide`** … **添付画像の説明** (何枚目が何の画像か・画像の使い方)。
   **スタッフの ChatGPT 版にも同じ文が貼られる** (くらべっこを公平にするため)。画像の扱いはこれに従う。
   ここに書いていない画像の扱い方を自分で足さない
+- **`shoot_instruction`** … **撮影判定**の指示 (画像制作の新フロー・2026-10-09)。⑦ を書き終えてから使う (手順 4b)。
+  `null` (サーバが古い) なら撮影判定は書かない (`shoot-<ID>.json` も作らず、`--shoot` も付けない)
 
 `job: null` なら仕事なし。終了する。
 
@@ -173,6 +176,9 @@ img-12-7.jpg (素材1・使用イメージ/玄関.jpg): 玄関の床に向けて
 
 lint を通したら、その JSON を `lint-<ID>.json` に保存しておく (`result` に渡す)。
 
+`--shoot` を付けると応答に `shoot: {ok, errors}` も出る (構成の `lint` とは別)。`shoot.ok` が false なら
+`errors` を読んで `shoot-<ID>.json` を直す (コマンドも exit 1 になる)。構成の lint の結果はそれで変わらない。
+
 ### 6. Codex で検品 → 反映 (最大 2 巡)
 
 `_lp_review_<ID>.md` に `out-<ID>.md` の全文を書き出してから:
@@ -191,8 +197,10 @@ critical / high の指摘があれば `out-<ID>.md` を直して、`_lp_review_<
 🚨 **2 巡で critical / high が消えなければ、そこで打ち切って `rejected`**:
 
 ```bash
-./phlp result <ID> --rejected --reason-file reason-<ID>.txt --file out-<ID>.md --lint lint-<ID>.json --rounds 2
+./phlp result <ID> --rejected --reason-file reason-<ID>.txt --file out-<ID>.md --lint lint-<ID>.json --rounds 2 --shoot shoot-<ID>.json
 ```
+
+(撮影判定は手順 6b のとおり最後の構成で書いてから `--shoot` で渡す。書けなければ `--shoot` を外す)
 
 🚨 **書いた構成 (`out-<ID>.md`) があれば必ず `--file` で渡す** (2026-10-04 中原さん)。
 チェックを通らなかった構成として画面に出し、使えるかどうかは人が決める (くらべっこなので捨てない)。
@@ -201,14 +209,52 @@ critical / high の指摘があれば `out-<ID>.md` を直して、`_lp_review_<
 `reason-<ID>.txt` には「何が通らなかったか」を具体的に書く (1000 字まで・画面で構成の横に出る)。
 **これは失敗ではなく測定結果。** 正直に書く。
 
+### 6b. 撮影判定を書く (`shoot-<ID>.json`・検品と直しが終わってから)
+
+🚨 **検品 (手順 6) と直しが終わった最後の `out-<ID>.md` で書く。** 先に書くと、検品で構成を直したときに
+撮影判定だけ古い構成のまま残る。書いた後に `out-<ID>.md` を直したら、撮影判定も作り直して `./phlp lint --shoot` をやり直す。
+
+claim で来た **`shoot_instruction`** に従って、その構成の画像を作るのに撮影が要るかを判定し、
+**JSON だけ**を `shoot-<ID>.json` に書く。スタッフはこれを「AIのおすすめ」と理由として画面で見て、撮影判定を自分で決める
+(画面は自動では書き換えない)。画像ごとの撮影指示 (cut 以下) は撮影指示書の材料になる。
+
+🚨 **⑦ の本文 (`out-<ID>.md`) に撮影判定を書かない。** 本文に足すと lint と lp-tool のパーサーが落ちる。
+🚨 **撮影判定のために構成を変えない。** 構成は `instruction` (スタッフと同じ指示文) だけで決める。
+
+```json
+{"recommended":"inhouse","reason":"2枚目 の写真 (使用シーン) がありません。卓上の簡単なカットなので社内撮影で足ります。",
+ "images":[
+  {"no":0,"needs_shoot":false,"cut":"","composition":"","props":"","background":"","tone":"","ng":""},
+  {"no":1,"needs_shoot":false,"cut":"","composition":"","props":"","background":"","tone":"","ng":""},
+  {"no":2,"needs_shoot":true,"cut":"玄関でスプレーする手元","composition":"斜め上から手元と商品","props":"玄関マット","background":"白い玄関の床","tone":"自然光・明るめ","ng":"顔を写さない"}]}
+```
+
+サーバが見ること (`./phlp lint --shoot` で同じ検査を先に受けられる):
+- キーはこの形のものだけで、**どの画像も 8 つのキーを全部書く**。`recommended` は `none` / `inhouse` / `photographer`、`reason` は空でない (400 字まで)。文字の前後に空白・改行を入れない
+- `needs_shoot: false` の画像は cut 以下を全部 `""` にする
+- `images` は **⑦ の画像見出しの N と 1 対 1** (足りない・余計な番号・重複は通らない)。`no` は数、`needs_shoot` は true/false
+- `needs_shoot: true` の画像は `cut` と `composition` が要る
+- `recommended` が `none` なのに撮影が要る画像がある / `inhouse`・`photographer` なのに 1 枚も無い は通らない
+
+判定の材料は**見た画像と ⑦ の「使用素材」だけ**。素材画像に無い写真を「ある」ことにしない。
+```bash
+./phlp lint <ID> --file out-<ID>.md --shoot shoot-<ID>.json
+```
+
+撮影判定が通らなくても**構成の結果は出せる** — 直せなければ `--shoot` を外して出す (画面は「AI の判定なし」になるだけ)。
+
 ### 7. 書き戻す
 
 ```bash
-./phlp result <ID> --accepted --file out-<ID>.md --lint lint-<ID>.json --rounds 1
+./phlp result <ID> --accepted --file out-<ID>.md --lint lint-<ID>.json --rounds 1 --shoot shoot-<ID>.json
 ./phlp clean  <ID>
 ```
 
 🚨 **`--lint` は accepted に必須**で、中身の `ok` が `true` でなければ通らない (CLI もサーバも断る)。
+
+応答の `shoot.status` が撮影判定の扱い: `saved` (保存した) / `invalid` (形が違ったので使わない・構成は受け付けた) /
+`not_sent` (`--shoot` を付けなかった)。`shoot-<ID>.json` が JSON として読めなければ CLI が送らずに止める
+(直すか `--shoot` を外して出し直す)。
 
 画像の証跡 (どの画像を実際に見たか) は **サーバが配ったときに自分で記録している**。
 自分で書く必要はないし、**書いても使われない** — `imgs-<ID>.json` を手で作っても通らない。
@@ -235,6 +281,8 @@ critical / high の指摘があれば `out-<ID>.md` を直して、`_lp_review_<
 - 🚨 予約の後に `fail` / `release` を使う (→ `result --rejected`)
 - 🚨 材料に無い事実 (効果・数値・認証・受賞) を書く
 - 🚨 lint が通らないまま `--accepted` を出す (CLI とサーバの両方で止まる)
+- 🚨 撮影判定を ⑦ の本文に書く / 撮影判定のために構成を変える (撮影判定は `shoot-<ID>.json` だけ)
+- 🚨 撮影判定が通らないことを理由に構成を `rejected` にする (撮影判定は外して出せばよい)
 - 🚨 lint を自分で書いて「通ったこと」にする (正本は `./phlp lint`。サーバが自分でもう一度見る)
 - 🚨 `imgs-<ID>.json` を手で作って「画像を見たこと」にする (サーバの記録を見るので通らない)
 - 一時ファイルを残したまま依頼を離れる

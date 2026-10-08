@@ -136,6 +136,8 @@ import {
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
   lpComposeImageRef, recordImageServed as recordLpComposeImageServed, imagePlan as lpComposeImagePlan, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_PRODUCT_IMAGES as LP_COMPOSE_MAX_PRODUCT_IMAGES,
   lintForJob as lintLpComposeForJob,
+  // AI の撮影判定 (画像制作の新フロー PR-C)。「おすすめにする」がいまのおすすめかを照らす
+  latestShootJudgement,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
@@ -1606,6 +1608,20 @@ router.post('/api/drafts/:id/shoot-mode', (req, res) => {
   const hasExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expected');
   if (hasExpected && !validMode(req.body.expected)) {
     return res.status(400).json({ ok: false, error: 'expected は none / inhouse / photographer / null で指定してください' });
+  }
+  // 「おすすめにする」から来たとき (ai_job_id = 画面が見ていた AI の構成の依頼)。PR-C・Codex 名指し3 M:
+  // 構成が終わった画面はポーリングを止めるので、別のタブで作り直されても古いおすすめが残る。
+  // 古いおすすめをそのまま保存しないよう、いまの AI のおすすめ (いちばん新しい構成) と同じかを確かめる。
+  // 3 択のボタンを直接押したとき (ai_job_id なし) は今どおり (人が決めた判定は AI と違ってよい)
+  if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'ai_job_id')) {
+    const aiJob = req.body.ai_job_id;
+    if (!Number.isSafeInteger(aiJob) || aiJob <= 0) {
+      return res.status(400).json({ ok: false, error: 'ai_job_id の値が不正です' });
+    }
+    const now = latestShootJudgement(getDB(), draft.id);
+    if (!now || !now.available || now.job_id !== aiJob || now.recommended !== mode) {
+      return res.status(409).json({ ok: false, error: 'AI のおすすめが新しくなっています (LP構成が作り直されたなど)。画面を読み直してから選んでください' });
+    }
   }
   let r;
   try {
@@ -4326,9 +4342,13 @@ serviceApiRouter.post('/lp-compose/generations/:gid/result', (req, res) => {
     reviewRounds: req.body?.review_rounds,
     receipt: req.body?.receipt,
     reason: cleanText(req.body?.reason, 1000),
+    // AI の撮影判定 (画像制作の新フロー PR-C)。送らない古い実行役は undefined のまま (今までどおり通る)。
+    // 形の検査は lib (lp-shoot.js) が構成と照らして行う。壊れていても結果は断らない (撮影判定だけ使わない)
+    shoot: req.body?.shoot_json,
   });
   if (!r.ok) return lpComposeFail(res, r);
-  res.json({ ok: true, status: r.status, already: !!r.already, receipt: r.receipt });
+  // shoot = 撮影判定をどう扱ったか (saved / invalid / ignored / not_sent)。実行役のログに残る
+  res.json({ ok: true, status: r.status, already: !!r.already, receipt: r.receipt, shoot: r.shoot });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
@@ -4346,9 +4366,11 @@ serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
 serviceApiRouter.post('/lp-compose/jobs/:id/lint', express.json({ limit: '1mb' }), (req, res) => {
   const r = lintLpComposeForJob(getDB(), lpIdParam(req.params.id), {
     leaseToken: rawField(req.body?.lease_token, 100), output: req.body?.output,
+    // 撮影判定 (PR-C) も出す前に確かめられる。結果を受け取るときと同じ検査 (構成の lint とは別に返す)
+    shoot: req.body?.shoot_json,
   });
   if (!r.ok) return lpComposeFail(res, r);
-  res.json({ ok: true, lint: r.lint });
+  res.json({ ok: true, lint: r.lint, ...(r.shoot ? { shoot: r.shoot } : {}) });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {

@@ -1552,6 +1552,11 @@ th.attr-unknown { color: #dc2626; }
           .ipf-seg-btn { flex:1; min-width:120px; display:flex; flex-direction:column; align-items:flex-start; gap:2px; padding:8px 10px; border:1px solid #cbd5e1; border-radius:8px; background:#fff; cursor:pointer; text-align:left; }
           .ipf-seg-btn.on { border-color:#2563eb; background:#eff6ff; box-shadow:0 0 0 1px #2563eb inset; }
           .ipf-seg-btn .muted { font-size:11px; }
+          /* AI のおすすめの札 (PR-C)。hidden 属性を display で上書きしないよう [hidden] を明示する */
+          .ipf-rec { display:inline-block; margin-top:2px; font-size:10px; font-weight:700; color:#fff; background:#16a34a; border-radius:999px; padding:1px 7px; }
+          .ipf-rec-box { margin-top:6px; padding:6px 8px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0; font-size:12px; display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap; }
+          .ipf-rec-box.none { background:#f8fafc; border-color:#e2e8f0; color:#64748b; }
+          .ipf-rec[hidden], .ipf-rec-box[hidden], .ipf-rec-box [hidden] { display:none; }
           .ipf-more { margin:10px 0; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#f8fafc; }
           .ipf-more > summary { cursor:pointer; color:#475569; font-size:13px; }
         </style>
@@ -1731,13 +1736,22 @@ th.attr-unknown { color: #dc2626; }
             <label>撮影判定 <span class="muted" style="font-weight:400">(押すとすぐ保存します。「撮影不要」にすると撮影・素材ステータスも「撮影不要」になります)</span></label>
             <div class="ipf-seg" role="radiogroup" aria-label="撮影判定">
               <% for (const sm of imageFlow.shootModes) { %>
-                <button type="button" role="radio" class="ipf-seg-btn<%= ip.shoot_mode === sm.code ? ' on' : '' %>" aria-checked="<%= ip.shoot_mode === sm.code ? 'true' : 'false' %>" data-shoot-mode="<%= sm.code %>"><b><%= sm.label %></b><span class="muted"><%= sm.sub %></span></button>
+                <button type="button" role="radio" class="ipf-seg-btn<%= ip.shoot_mode === sm.code ? ' on' : '' %>" aria-checked="<%= ip.shoot_mode === sm.code ? 'true' : 'false' %>" data-shoot-mode="<%= sm.code %>"><b><%= sm.label %></b><span class="muted"><%= sm.sub %></span><span class="ipf-rec" data-shoot-rec-badge="<%= sm.code %>" hidden>AIのおすすめ</span></button>
               <% } %>
             </div>
             <div class="muted" id="shoot-mode-msg" style="font-size:11px; margin-top:4px;">
               <% if (ip.shoot_mode) { %>最終更新: <%= String(ip.shoot_mode_at || '').slice(0, 16).replace('T', ' ') %> <%= ip.shoot_mode_by || '' %>
               <% } else { %>まだ判定していません。LP構成を見て、撮影が要るかを選んでください<% } %>
             </div>
+            <%# AI のおすすめと理由 (画像制作の新フロー PR-C・2026-10-09)。いちばん新しい AI の構成についた撮影判定を出す。
+                🚨 撮影判定は自動で書き換えない — 人が押して決める。「おすすめにする」は上のボタンを押すのと同じ (/shoot-mode に送るだけ)。
+                中身は画面の JS (@shoot-rec) が入れる。構成ができたらポーリング (GET /lp-compose の shoot) で入れ直す %>
+            <div id="shoot-rec" class="ipf-rec-box" hidden>
+              <span id="shoot-rec-text" style="flex:1; min-width:200px; white-space:pre-wrap;"></span>
+              <button type="button" class="btn btn-sm" id="shoot-rec-adopt" hidden>おすすめにする</button>
+            </div>
+            <%# 🚨 理由は AI が書いた文なので `</script>` を含みうる。`<` を潰す (lpc-json と同じ作り) %>
+            <script type="application/json" id="shoot-rec-json"><%- JSON.stringify((typeof lpCompose !== 'undefined' && lpCompose && lpCompose.shoot) || null).replace(/</g, '\\u003c') %></script>
           </div>
         </section>
         <%# 3 撮影指示書 (要撮影のときだけ)。スプレッドシートの自動作成は次の段階 (設計 §3.4)。今は作った URL を貼る %>
@@ -6013,6 +6027,9 @@ th.attr-unknown { color: #dc2626; }
     // 撮影判定: 押した時点で保存して読み直す (素材ステータスもサーバがそろえるので、画面で値を作らない)
     doc.querySelectorAll('[data-shoot-mode]').forEach(function (btn) {
       btn.addEventListener('click', async function () {
+        // 「おすすめにする」(@shoot-rec) から押されたときだけ 1 回付く。サーバがいまの AI のおすすめと照らす (PR-C)
+        const aiJobId = btn.dataset.aiJobId ? Number(btn.dataset.aiJobId) : null;
+        delete btn.dataset.aiJobId;
         if (btn.getAttribute('aria-checked') === 'true') return;
         // 🚨 撮影指示書の URL を打って保存していないまま「撮影不要」にすると、読み直しで段が隠れ、
         //    未保存の退避が隠れた欄に戻る。次に別の項目を保存すると見えない URL まで保存される
@@ -6029,7 +6046,9 @@ th.attr-unknown { color: #dc2626; }
         const modeBox = doc.getElementById('shoot-mode-box');
         const shown = modeBox && modeBox.dataset.current ? modeBox.dataset.current : null;
         let json;
-        try { json = await deps.post(deps.base + '/shoot-mode', { mode: btn.dataset.shootMode, expected: shown }); }
+        const body = { mode: btn.dataset.shootMode, expected: shown };
+        if (aiJobId) body.ai_job_id = aiJobId;
+        try { json = await deps.post(deps.base + '/shoot-mode', body); }
         catch (e) { json = { ok: false, error: '通信できませんでした' }; }
         if (!json.ok) allBtns.forEach(function (b) { b.disabled = false; });
         if (!json.ok && msg) msg.textContent = '保存できませんでした: ' + (json.error || '');
@@ -6045,6 +6064,8 @@ th.attr-unknown { color: #dc2626; }
             if (b.classList) b.classList.toggle('on', on);
             b.disabled = false;
           });
+          // AI のおすすめの文 (いまの判定との違い) も、読み直しを待たずにそろえる (PR-C)
+          if (deps.onShootModeChanged) deps.onShootModeChanged(btn.dataset.shootMode);
         }
         deps.showAndReload(json, '撮影判定を保存しました');
       });
@@ -6097,7 +6118,86 @@ th.attr-unknown { color: #dc2626; }
     return { refresh: refresh };
   }
   /* @image-flow:end */
-  initImageFlow(document, { post: post, showAndReload: showAndReload, base: BASE, clipboard: navigator.clipboard, confirm: function (m) { return window.confirm(m); } });
+  /* @shoot-rec:start — AI の撮影判定 (画像制作の新フロー PR-C・2026-10-09): 撮影判定の箱の「AIのおすすめ」と理由。
+     試験 (scripts/test-ph-lp-compose-shoot.mjs) がこの間を切り出して、偽の document で動かす (EJS の値はここに書かない) */
+  /**
+   * 撮影判定の箱に出す中身を決める (画面に依らない純粋関数)。
+   * j = サーバの shoot (lib/lp-compose.js の shootSummaryFor。使える構成が無ければ null)
+   * current = いま保存されている撮影判定 (未判定は null)
+   * 🚨 撮影判定は**自動で書き換えない** — 決めるのは人。「おすすめにする」は 3 択のボタンを押すのと同じ
+   */
+  function shootRecView(j, current) {
+    const LABEL = { none: '撮影不要', inhouse: '社内撮影', photographer: 'カメラマン撮影' };
+    if (!j) return { show: false, recommended: null, adopt: false, text: '' };
+    if (!j.available || !LABEL[j.recommended]) {
+      return {
+        show: true, recommended: null, adopt: false, none: true,
+        text: j.missing === 'invalid'
+          ? 'AI の撮影判定はありません (AI が出した判定の形が正しくなかったので使っていません)。LP構成を見て選んでください'
+          : 'AI の撮影判定はありません (撮影判定を出す前の仕組みで作った構成です。作り直すと出ます)。LP構成を見て選んでください',
+      };
+    }
+    const NL = String.fromCharCode(10);
+    const same = current === j.recommended;
+    const tail = same ? ''
+      : (current ? NL + '(いまの判定は「' + (LABEL[current] || current) + '」です。おすすめに合わせるかは人が決めます)'
+        : NL + '(まだ判定していません。おすすめでよければ「おすすめにする」か上のボタンを押してください)');
+    return {
+      show: true, recommended: j.recommended, adopt: !same, none: false,
+      text: 'AIのおすすめ: ' + LABEL[j.recommended] + ' — ' + String(j.reason || '') + tail,
+    };
+  }
+  /**
+   * 撮影判定の箱に描く。札 (AIのおすすめ) はおすすめのボタンにだけ出す。理由は textContent で入れる (AI の文なので HTML にしない)
+   * @returns {{ refresh: function, update: function(object|null) }}
+   */
+  function initShootRec(doc) {
+    const box = doc.getElementById('shoot-mode-box');
+    const rec = doc.getElementById('shoot-rec');
+    const textEl = doc.getElementById('shoot-rec-text');
+    const adopt = doc.getElementById('shoot-rec-adopt');
+    const holder = doc.getElementById('shoot-rec-json');
+    let judgement = null;
+    try { judgement = holder ? JSON.parse(holder.textContent || 'null') : null; } catch (e) { judgement = null; }
+    function refresh() {
+      if (!box || !rec || !textEl) return null;
+      const v = shootRecView(judgement, box.dataset.current || null);
+      rec.hidden = !v.show;
+      if (rec.classList) rec.classList.toggle('none', !!v.none);
+      textEl.textContent = v.text;
+      if (adopt) { adopt.hidden = !v.adopt; adopt.dataset.mode = v.recommended || ''; }
+      doc.querySelectorAll('[data-shoot-rec-badge]').forEach(function (b) {
+        b.hidden = !v.recommended || b.dataset.shootRecBadge !== v.recommended;
+      });
+      return v;
+    }
+    // 「おすすめにする」= おすすめのボタンを押す。保存・確認・別タブとの食い違い (expected)・③素材待ちとの整合は
+    // すべて 3 択のボタンの処理 (initImageFlow → POST /shoot-mode) をそのまま通す (ここで別の送り方をしない)
+    if (adopt) {
+      adopt.addEventListener('click', function () {
+        const mode = adopt.dataset.mode;
+        if (!mode) return;
+        const target = Array.prototype.slice.call(doc.querySelectorAll('[data-shoot-mode]'))
+          .filter(function (b) { return b.dataset.shootMode === mode; })[0];
+        if (!target || target.disabled || target.getAttribute('aria-checked') === 'true') return;
+        // どの構成のおすすめを選んだかを添える (別のタブで作り直されていたらサーバが 409 で止める・Codex PR-C 名指し3 M)
+        if (judgement && judgement.job_id) target.dataset.aiJobId = String(judgement.job_id);
+        target.click();
+      });
+    }
+    refresh();
+    return {
+      refresh: refresh,
+      // 構成のポーリング (GET /lp-compose) の応答の shoot で入れ直す。undefined (古い応答) は何もしない
+      update: function (j) { if (j === undefined) return null; judgement = j; return refresh(); },
+    };
+  }
+  /* @shoot-rec:end */
+  // AI のおすすめ (PR-C)。構成のポーリング (initLpCompose) からも入れ直すので window に置く
+  const shootRec = initShootRec(document);
+  window.phShootRec = shootRec;
+  initImageFlow(document, { post: post, showAndReload: showAndReload, base: BASE, clipboard: navigator.clipboard, confirm: function (m) { return window.confirm(m); },
+    onShootModeChanged: function () { shootRec.refresh(); } });
   // 🆕 入荷のときに撮った裏面の写真を AI に文字起こしさせる (2026-09-18)。
   //    ⭐**保存しない** — 読み取った文章を欄に入れるだけで、保存するかは人が決める。
   //      AI の読み違いを黙って正本 (back_info_text) に入れないため
@@ -6401,6 +6501,8 @@ th.attr-unknown { color: #dc2626; }
 
     function render(s) {
       state = s;
+      // 撮影判定の箱の「AIのおすすめ」も、構成ができたらここで入れ直す (画像制作の新フロー PR-C)
+      if (window.phShootRec) window.phShootRec.update(s.shoot);
       const job = s.job;
       const blocked = s.blocked;
       const running = !!job && RUNNING.includes(job.status);
