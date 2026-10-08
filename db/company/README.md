@@ -2321,3 +2321,12 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 止める手の入口 = `gas:logizard-sheet-and-sku-map` (stop-manual)。SKU タブ・SKU の CSV・API・`cli:import-sku-master.js` は門の記録 (ack) で止まる入口 = stop-manual には書かない
 - **やり直し (reconcile・#1648 Codex R1 Medium 2・中原さんの決定 b)**: 移行の後に試みを cancel すると、対応は Company DB に残る (0054 は DELETE を断る)・次の `--apply` は今までどおり EXISTS で断る。古い入口が開いて古い表が変わった後は、新しい試み (prepare → stop-manual → 全部のプロセスの 2 版の ack) の窓で `amazon-map-migrate.mjs --cdb-hash` (今の Company DB の写しのハッシュ・読むだけ) → `--reconcile --attempt <id> --expect-hash <古い表> --expect-cdb-hash <今の Company DB>` で、origin = legacy の対応を今の古い表に合わせ直す (足す・直す・墓標を戻す・古い表から消えた対応は構成を消して墓標)。使えるのは段階 new_open の Amazon を足す試みの窓 (`ops.amazon_map_migration_window`) で持ち主が load の間だけ (frozen は不可)・origin = portal の行があれば断る・止める項目は apply と同じ・鍵の後に今の Company DB のハッシュを照らす・合わせた後の Company DB のハッシュ = 古い表のハッシュのときだけ commit (1 つの取引)。同じ古い表で 2 回流しても何も書かない。墓標は行が残る = 消えた対応 (lost) にならない・widen の判定 (active 1 件以上) と CLI の check / widen のハッシュの一致はそのまま通る
 - 当て方 (🚨 まだ流さない): `migrate.mjs --dry-run` (0059 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい (新しい関数はだれにも渡さない・流しても同じ)。試験 = `scripts/test-master-widen-amazon-pg.mjs` (本物の PG・test:master-edit の最後)
+### 新商品の登録の必須の欄 (0060・2026-10-08 中原さんの頼み。🚨 番号は仮 = マージの直前に空き番号へ)
+
+- `ops.register_new_sku` (0058 の版) を create or replace で置き換える。0058 の本文との差は 3 か所だけ (`scripts/test-master-register.mjs` の [G-0060] が機械で確かめる)。署名・security definer・search_path・権限は同じ
+  - **単品は代表の仕入先が要る** (NE の商品マスタで必須の項目): `supplier_id` が無い単品 = `invalid_value: 単品は代表の仕入先が要る`。セットは今までどおり付けない
+  - **発送方法 (送料コード) は無くてよい** (届いてサイズを見てから商品の画面で入れる): 送料コード・発送方法 (名前)・送料の 3 つとも null を許す (0027 の「null = 未登録」= NE から来た既存の商品と同じ形)。片方だけ・送料だけは今までどおり断る。カードの写しの送料も 3 つとも null
+  - 発送方法が無いときは結果の「気をつけること」に 1 行
+- 既にある行は変えない (0060 の前の下書きで代表の仕入先が空の単品はそのまま = 商品の画面で入れる。NE 登録の CSV は今までどおり「代表の仕入先が決まっていない」で止まる)
+- NE 登録の CSV (`ops.ne_reg_build` など)・照合 ② は変えない (単品の CSV `ne-reg-single-v1` に発送方法・送料の列は無い・照合も送料を比べない)
+- 当て方 (🚨 まだ流さない): コードを先に出しても動く (0060 の前の DB = 発送方法なしの登録は DB が `invalid_value: 送料コードと発送方法` で断る = 画面は 400・何も書かない。代表の仕入先は画面・API が先に断る) → `migrate.mjs --dry-run` (0060 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい
