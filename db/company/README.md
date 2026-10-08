@@ -2338,3 +2338,9 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   - ロジザードの有効期限の管理は 0052 から boolean が要る = 関数は変えない (画面・サーバーが「選ばないと なし」をやめた)。入荷日の管理は今までどおり無くてよい (null = 不明)
 - 既にある行は変えない (0061 の前の下書きで売上分類・推奨保有月数が空の単品はそのまま = 商品の画面で入れる)。NE 登録の CSV・照合 ② は変えない (どれも CSV の列に無い)
 - 当て方 (🚨 まだ流さない): コードを先に出しても動く (0061 の前の DB = 関数は空を許すが、画面・API が先に断る) → `migrate.mjs --dry-run` (0061 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい
+### 商品の画面で、下書きの間だけロジザードの 2 つを直す (0062・2026-10-08 中原さん「下書きの状態なら、ロジザードの期限管理の情報とかも編集できるようにする」。🚨 番号は仮)
+
+- `core.guard_master_edit_logizard_flags` + `trg_master_edit_logizard_flags` (core.products の BEFORE UPDATE OF expiry_managed, inbound_date_managed)。画面のロール master_edit が変えるときだけ見る: その商品の SKU が全部 登録の状態 = 下書き で、NE 登録の CSV を配った品目 (issued / import_declared / partial / verified) が無いときだけ通す。それ以外・入荷日の管理を空 (不明) に戻す = 42501 `logizard_locked`。ほかのロールは今までどおり (夜間ロードはこの 2 列を書かない = 0027)
+- アプリの決まり (`lib/master-write.mjs` の `logizardLockOf`・保存の 6c = 409 `logizard_locked`) と同じ。持ち主のキーは無い (load / company の取り合いが無い列)。段階・MASTER_EDIT_OPEN・DB の active・約束 (0051) の門はほかの欄と同じ
+- 列の update の権限 = `scripts/company-db/create-master-edit-roles.mjs` の MASTER_EDIT_WRITE (core.products に expiry_managed, inbound_date_managed を足した)
+- 当て方 (🚨 まだ流さない): 0061 の後。`migrate.mjs --dry-run` (0062 だけが出る) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (権限を足す。流し直す前は画面の保存が DB の permission denied = 500 で断られ、何も書かない) → コードを出す

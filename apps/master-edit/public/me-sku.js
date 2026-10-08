@@ -388,7 +388,7 @@
   // 保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度保存するときは新しい番号
   var requestId = uuid();
   var FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
-    : ['name', 'handling', 'parent_code', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan'];
+    : ['name', 'handling', 'parent_code', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)
   function collect() {
     var values = {};
     FIELDS.forEach(function (f) {
@@ -436,7 +436,14 @@
     if (j.no_change) { r.innerHTML = '<div class="result"><div class="rt">変わった項目がありません (何も保存していません)</div></div>'; return; }
   }
   /** 保存が通った返事の中身 (変えた項目・計算し直した値・NE でやること・気をつけること) */
-  function changeText(c) { var hf = c.field === 'handling' || c.field === 'handling_own'; return String(c.label) + ': ' + show(hf ? HANDLING[c.from] || c.from : c.from) + ' → ' + show(hf ? HANDLING[c.to] || c.to : c.to); }
+  // ロジザードの管理 (true / false / null) は あり / なし / 不明 の言葉で
+  var FLAG = function (v) { return v === true ? 'あり' : v === false ? 'なし' : '不明'; };
+  function changeText(c) {
+    var hf = c.field === 'handling' || c.field === 'handling_own';
+    var lf = c.field === 'expiry_managed' || c.field === 'inbound_date_managed';
+    var w = function (v) { return hf ? HANDLING[v] || v : lf ? FLAG(v) : v; };
+    return String(c.label) + ': ' + show(w(c.from)) + ' → ' + show(w(c.to));
+  }
   function changeLine(c) { return esc(changeText(c)); }
   function savedHtml(j) {
     var changed = Array.isArray(j.changed) ? j.changed : [];

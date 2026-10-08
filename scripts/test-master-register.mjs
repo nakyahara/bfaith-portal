@@ -1501,6 +1501,39 @@ await ta('[H5] 衝突の画面: 「既存のカードをこの商品に結ぶ」
   ph.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_product_drafts_ne_norm ON product_drafts(LOWER(TRIM(ne_code)))');
 });
 
+await ta('[H6] 商品の画面 (2026-10-08 中原さん): 下書きならロジザードの有効期限・入荷日の管理を切り替えで直せる (前からある商品は 🔒 と理由)・出品カードの欄は product-hub のカードへ (カードがある = 開くボタン / 無い = ボードで探す)・画面の JS が送る', async () => {
+  // web-9 = [H5] で下書きで登録・カードを結んだ (done)
+  let page = await call('GET', '/apps/master-edit/sku/web-9');
+  assert.equal(page.status, 200);
+  const sc = await checkScripts(page.text, 0);
+  const skuJs = sc.find((x) => x.includes("'expiry_managed', 'inbound_date_managed'")) || '';
+  assert.ok(skuJs, '商品の画面の JS がロジザードの 2 つを送らない');
+  assert.match(page.text, /<div class="seg" role="group" aria-labelledby="lab-expiry_managed" data-field="expiry_managed"[^>]*data-value="0"/);
+  assert.match(page.text, /<div class="seg" role="group" aria-labelledby="lab-inbound_date_managed" data-field="inbound_date_managed"[^>]*data-value=""/, '入荷日の管理 = 不明 (選んでいない)');
+  assert.match(page.text, /id="lab-expiry_managed">ロジザードの有効期限の管理</);
+  assert.match(page.text, /下書きの間だけ直せます/);
+  const draftId = draftOf('web-9').id;
+  assert.match(page.text, new RegExp('id="card-open" href="/apps/product-hub/detail/' + draftId + '"'), '出品カードを開くボタン');
+  for (const t of ['公式ページ URL', 'Amazon URL', 'ASIN', '参考 URL', 'セット商品を作るか', 'Yahoo!売価・配送方法・カテゴリ・path']) assert.ok(page.text.includes('<span class="linkchip">' + t + '</span>'), t);
+  // 前からある商品 (s001 = 下書きでない) = 🔒 の値と理由・切り替えは無い・カードはボードで探す
+  page = await call('GET', '/apps/master-edit/sku/s001');
+  await checkScripts(page.text, 0);
+  assert.ok(!/data-field="expiry_managed"/.test(page.text), '下書きでない商品に切り替えを出さない');
+  assert.match(page.text, /data-row="expiry_managed"[\s\S]{0,600}ロジザードが正 \(ここで直せるのは新商品の下書きの間だけ\)/);
+  assert.match(page.text, /id="card-board" href="\/apps\/product-hub\/"/);
+  // 名簿の外の人 = 見るだけ (切り替えを出さない)
+  page = await call('GET', '/apps/master-edit/sku/web-9', { session: 'viewer' });
+  assert.ok(!/data-field="expiry_managed"/.test(page.text));
+  // API: 下書きの web-9 は保存できる (画面と同じ道)・s001 は 409 logizard_locked
+  const tok = (t) => (/data-token="([0-9a-f]{64})"/.exec(t) || [])[1];
+  page = await call('GET', '/apps/master-edit/sku/web-9');
+  const ok = await call('POST', '/apps/master-edit/api/sku/web-9', { body: { request_id: uuid(), seen: { token: tok(page.text) }, values: { expiry_managed: '1' } } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.j)); assert.deepEqual(ok.j.changed.map((c) => [c.field, c.from, c.to]), [['expiry_managed', false, true]]);
+  page = await call('GET', '/apps/master-edit/sku/s001');
+  const ng = await call('POST', '/apps/master-edit/api/sku/s001', { body: { request_id: uuid(), seen: { token: tok(page.text) }, values: { expiry_managed: '1' } } });
+  assert.deepEqual([ng.status, ng.j.reason], [409, 'logizard_locked']);
+});
+
 console.log('\nproduct-hub (新規作成の入口・ボード)');
 
 let phCalls = 0;
