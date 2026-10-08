@@ -150,7 +150,8 @@ export const WIDEN_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.prepare_master_wid
   'ops.begin_master_maintenance(text)', 'ops.master_maintenance_active()', 'ops.stop_new_entry_for_restore(text)',
   'ops._new_entry_lease_ok(text)', 'ops._require_new_entry_lease(text)', 'ops.ne_code_seen(text)', 'ops._new_entry_gate_problems(text, bigint)', 'ops._new_entry_lease_shared_locks()',
   'ops.sku_kind_locked()', 'ops.sku_kind_shape_counts(integer)', 'ops.assert_sku_kind_shape_after_restore()', 'ops.session_is_db_owner()',
-  'core.guard_sku_kind_locked()', 'core.check_sku_kind_shape()', 'ops.guard_master_ownership_widen()', 'ops.guard_new_entry_gate_results()', 'ops.restrict_ne_reg_file_bytes()']);
+  'core.guard_sku_kind_locked()', 'core.check_sku_kind_shape()', 'ops.guard_master_ownership_widen()', 'ops.guard_new_entry_gate_results()', 'ops.restrict_ne_reg_file_bytes()',
+  'ops.widen_amazon_map_counts(integer)', 'ops._widen_attempt_common(uuid, timestamptz)', 'ops.amazon_map_migration_window(uuid)']);   // 0059 (Amazon の対応の数 = 判定の本体と widen だけが使う)
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;

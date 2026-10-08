@@ -7,8 +7,14 @@
  *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --shadow --db-url <試し用の DB の URL> --legacy <warehouse.db> --fba-db <fba.db> [--json out.json]
  *   # 古い表のハッシュ (H0) だけ出す (DB に触らない)
  *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --legacy-hash --legacy <warehouse.db>
- *   # 切替の日 ③ (段階 frozen の間だけ・手順書の順番でだけ)。H0 と照らして同じときだけ commit
- *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes
+ *   # 切替の日 ③ (段階 frozen の間 か、🆕 段階 new_open で listing_components.amazon を足す広げる道の試みが開いていて手の入口
+ *   #   gas:logizard-sheet-and-sku-map を止めた記録がある間だけ (0059・PR-B)・手順書の順番でだけ)。H0 と照らして同じときだけ commit
+ *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect-hash <H0> --legacy <warehouse.db> --fba-db <fba.db> --actor <人のメール> --yes [--attempt <widen_prepare_id>]
+ *   🆕 --attempt は段階 new_open の apply で必須 (#1648 Codex R1 Medium 1・指した試みの窓でだけ通る = lib の migrationWidenWindow が DB で照らす)。frozen の apply は今までどおり要らない
+ *   # 🆕 移行の後に試みを cancel して古い表が変わったときのやり直し (#1648 Codex R1 Medium 2・中原さんの決定 b)。段階 new_open の Amazon を足す試みの窓だけ (--attempt 必須)
+ *   #   今の Company DB の写しのハッシュを出す (読むだけ) → 古い表のハッシュと一緒に渡す。origin = legacy の対応を古い表に合わせ直す (消えた対応は墓標)・合わせた後 = 古い表のハッシュのときだけ commit
+ *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --cdb-hash
+ *   node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --reconcile --attempt <widen_prepare_id> --expect-hash <古い表のハッシュ> --expect-cdb-hash <今の Company DB のハッシュ> --legacy <warehouse.db> --fba-db <fba.db> --actor <人> --yes
  * 影運転の先が本番でないことの確かめ (Codex #1586 R1 M2): 本番の URL (env COMPANY_DB_URL) が要る (無ければ断る)。
  *   ① URL のホスト・ポート・DB 名が本番と同じ = 断る (ユーザー・パスワードは見ない = 別のユーザーでも同じ DB は断る)
  *   ② 両方につないで、DB 名が同じ かつ DB の識別 (pg_control_system() の system_identifier) が同じか読めない = 断る (識別が読めない所では、試し用の DB は本番と違う DB 名にする)
@@ -23,6 +29,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from './migrate.mjs';
 import { readLegacyAmazonMaps, readSheetOnlySkus, legacyDigest, runAmazonMapMigration } from '../../lib/amazon-map-migrate.mjs';
+import { readCompanyAmazonMapCanon } from '../../lib/amazon-map-write.mjs';
+import { skuMapDigest } from '../../lib/sku-map-canonical.js';
 
 const fail = (message, code = 'AMAZON_MAP_MIGRATE_ARGS') => Object.assign(new Error(message), { code });
 
@@ -88,6 +96,17 @@ if (isMain) {
   const args = process.argv.slice(2);
   const getArg = (f) => { const i = args.indexOf(f); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; };
   try {
+    if (args.includes('--cdb-hash')) {
+      // 今の Company DB の写し (active の対応) のハッシュ = reconcile の --expect-cdb-hash (読むだけ・古い表は要らない)
+      const u = process.env.COMPANY_DB_URL || process.env.COMPANY_DB_WATCH_URL;
+      if (!u) throw fail('COMPANY_DB_URL (または COMPANY_DB_WATCH_URL) が要る');
+      const client = await openPgClient(u, { application_name: 'amazon-map-cdb-hash' });
+      try {
+        const d = skuMapDigest(await readCompanyAmazonMapCanon(pgAdapter(client)));
+        console.log(`今の Company DB の写しのハッシュ: ${d.content_hash} (対応 ${d.master_rows}・構成 ${d.component_rows})`);
+      } finally { await client.end(); }
+      process.exit(0);
+    }
     const legacyFile = getArg('--legacy');
     if (!legacyFile || !fs.existsSync(legacyFile)) throw fail('--legacy <miniPC の warehouse.db> が要る');
     const legacy = readLegacyAmazonMaps(legacyFile);
@@ -96,8 +115,9 @@ if (isMain) {
       console.log(d.content_hash ? `古い表のハッシュ (H0 の候補): ${d.content_hash} (親 ${d.master_rows}・構成 ${d.component_rows})` : `古い表の形が写しの決まりに合わない: ${d.error}`);
       process.exit(d.content_hash ? 0 : 1);
     }
-    const mode = args.includes('--apply') ? 'apply' : args.includes('--shadow') ? 'shadow' : null;
-    if (!mode) throw fail('--shadow か --apply か --legacy-hash を付ける');
+    const mode = args.includes('--reconcile') ? 'reconcile' : args.includes('--apply') ? 'apply' : args.includes('--shadow') ? 'shadow' : null;
+    if (!mode) throw fail('--shadow か --apply か --reconcile か --legacy-hash か --cdb-hash を付ける');
+    if (args.includes('--reconcile') && args.includes('--apply')) throw fail('--apply と --reconcile は一緒に付けない');
     const sheetOnly = sheetOnlyFrom(getArg('--fba-db'), legacy);
     let url;
     if (mode === 'shadow') {
@@ -106,19 +126,21 @@ if (isMain) {
     } else {
       url = process.env.COMPANY_DB_URL;
       if (!url) throw fail('COMPANY_DB_URL が要る');
-      if (!getArg('--actor') || !getArg('--expect-hash')) throw fail('apply は --actor と --expect-hash <H0> が要る');
+      if (!getArg('--actor') || !getArg('--expect-hash')) throw fail(`${mode} は --actor と --expect-hash <古い表のハッシュ> が要る`);
+      if (mode === 'reconcile' && (!getArg('--expect-cdb-hash') || !getArg('--attempt'))) throw fail('reconcile は --expect-cdb-hash <今の Company DB のハッシュ (--cdb-hash)> と --attempt <widen_prepare_id> が要る');
       if (!args.includes('--yes')) { console.log('--yes が無いので移さない (切替の日の手順書の順番でだけ使う)'); process.exit(0); }
     }
     const client = await openPgClient(url, { application_name: `amazon-map-${mode}` });
     try {
-      const r = await runAmazonMapMigration(pgAdapter(client), legacy, { mode, actor: getArg('--actor') || 'amazon_map_shadow', expectHash: getArg('--expect-hash'), sheetOnly, log: (m) => console.log(m) });
+      const r = await runAmazonMapMigration(pgAdapter(client), legacy, { mode, actor: getArg('--actor') || 'amazon_map_shadow', expectHash: getArg('--expect-hash'), expectCdbHash: getArg('--expect-cdb-hash'), attemptId: getArg('--attempt'), sheetOnly, log: (m) => console.log(m) });
       const out = getArg('--json');
       if (out) fs.writeFileSync(out, JSON.stringify(r, null, 2));
       console.log(`古い表のハッシュ: ${r.legacy_digest.content_hash || r.legacy_digest.error} (親 ${r.legacy_digest.master_rows}・構成 ${r.legacy_digest.component_rows})`);
       console.log(`移せた SKU ${r.subset.skus}: 古い表 ${r.subset.legacy.content_hash || r.subset.legacy.error} / Company DB ${r.subset.company.content_hash || r.subset.company.error} → ${r.subset.match ? '一致' : '不一致'}`);
       console.log(`切替を止める項目: ${r.blocker_total} 件 (止まる SKU ${r.blocked_skus})${Object.entries(r.blockers).map(([k, v]) => `\n  ${k}: ${v.count} 件 例 ${JSON.stringify(v.samples.slice(0, 3))}`).join('')}`);
       for (const [k, v] of Object.entries(r.warnings)) console.log(`気をつける: ${k} ${v.count} 件 例 ${JSON.stringify(v.samples.slice(0, 3))}`);
-      console.log(r.committed ? '✅ 移した (commit)' : '巻き戻した (影運転)');
+      if (r.cdb_before) console.log(`合わせ直す前の Company DB のハッシュ: ${r.cdb_before.content_hash} (対応 ${r.cdb_before.master_rows}・構成 ${r.cdb_before.component_rows})`);
+      console.log(r.committed ? (mode === 'reconcile' ? '✅ 合わせ直した (commit)' : '✅ 移した (commit)') : '巻き戻した (影運転)');
       if (!(r.subset.match && r.blocker_total === 0)) process.exitCode = 1;
     } finally { await client.end(); }
   } catch (e) {

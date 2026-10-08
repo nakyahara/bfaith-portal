@@ -45,16 +45,30 @@ export async function widenCheck(db, { attemptId, companyId }) {
   return (await one(db, 'select ops.widen_check_readonly($1::uuid, $2::integer) as r', [attemptId, companyId])).r;
 }
 
+/** widen の DB の関数と同じ順の 3 つの排他の鍵 (epoch → 段階 → マスタの書き込み)。同じ取引で先に取っても関数の中の取り直しは待たない */
+export const WIDEN_LOCK_SQLS = Object.freeze([
+  'select pg_advisory_xact_lock(ops.master_ownership_lock_key())',
+  `select pg_advisory_xact_lock(hashtext('ops.master_cutover'))`,
+  'select pg_advisory_xact_lock(core.master_write_lock_key())',
+]);
+
 /**
  * widen (apply)。取引の中で lock_timeout (既定 5 秒) を置いてから DB の関数を呼ぶ (夜間ロードの最中は 5 秒で諦める = 55P03)。
  * evidence = 写しの証拠 (activationEvidence と同じ・load_commit_seq は文字)
+ * 🆕 0059: beforeCall = 同じ取引で 3 つの排他の鍵を (関数と同じ順に) 取った後に呼ぶ async (db) => 足す証拠 (Amazon の対応を足す日の古い表と Company DB のハッシュ)。
+ *   鍵の後に読む = 読んでから widen の判定までに対応が変わらない (DB は証拠の行の数を鍵の後に数え直して照らす)
  */
-export async function widenOwnership(db, { attemptId, companyId, actor, evidence, lockTimeout = '5s' }) {
+export async function widenOwnership(db, { attemptId, companyId, actor, evidence, lockTimeout = '5s', beforeCall = null }) {
   if (!/^[0-9]{1,3}(ms|s)$/.test(lockTimeout)) throw Object.assign(new Error(`lockTimeout の形が違う: ${lockTimeout}`), { code: 'BAD_LOCK_TIMEOUT' });
   await db.query('begin');
   try {
     await db.query(`set local lock_timeout = '${lockTimeout}'`);
-    const r = (await one(db, 'select ops.widen_master_ownership($1::uuid, $2::integer, $3, $4::jsonb) as r', [attemptId, companyId, actor, JSON.stringify(evidence)])).r;
+    let ev = evidence;
+    if (beforeCall) {
+      for (const sql of WIDEN_LOCK_SQLS) await db.query(sql);
+      ev = { ...evidence, ...(await beforeCall(db)) };
+    }
+    const r = (await one(db, 'select ops.widen_master_ownership($1::uuid, $2::integer, $3, $4::jsonb) as r', [attemptId, companyId, actor, JSON.stringify(ev)])).r;
     await db.query('commit');
     return r;
   } catch (e) { try { await db.query('rollback'); } catch { /* */ } throw e; }
