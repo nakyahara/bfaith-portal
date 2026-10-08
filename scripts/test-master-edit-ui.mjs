@@ -576,7 +576,7 @@ const cells = (p) => p.$eval('#list-tbl', (tbl) => {
   const iS = h.findIndex((x) => x.startsWith('在庫'));
   const iP = h.findIndex((x) => x.startsWith('注文残'));
   const iF = h.findIndex((x) => x.startsWith('FBA'));
-  return [...tbl.querySelectorAll('tbody tr')].map((tr) => { const t = [...tr.children].map((td) => td.textContent.replace(/\s+/g, ' ').trim()); return { code: t[0], stock: iS < 0 ? undefined : t[iS], po: iP < 0 ? undefined : t[iP], fba: iF < 0 ? undefined : t[iF] }; });
+  return [...tbl.querySelectorAll('tbody tr')].map((tr) => { const t = [...tr.children].map((td) => td.textContent.replace(/\s+/g, ' ').trim()); return { code: tr.querySelector('td[data-col="code"]').textContent.replace(/\s+/g, ' ').trim(), stock: iS < 0 ? undefined : t[iS], po: iP < 0 ? undefined : t[iP], fba: iF < 0 ? undefined : t[iF] }; });
 });
 const advGo = async (p, fill) => {
   await p.goto(B + '/');
@@ -696,7 +696,7 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible:not(.c-chk)').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない)');
     assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td[data-col="po"]').count(), 0, '注文残のセルは描かない (隠すだけでなく)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
@@ -1649,11 +1649,11 @@ for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { wi
     await p.waitForFunction(() => document.querySelector('.page').getAnimations().every((a) => a.playState !== 'running'));
     if (SHOTDIR) await p.screenshot({ path: `${SHOTDIR}/一覧_${label}_上.png` });
     const pos = () => p.evaluate(() => {
-      const th = document.querySelector('#list-tbl thead th'); const r = th.getBoundingClientRect();
+      const th = document.querySelector('#list-tbl thead th:not(.c-chk)'); const r = th.getBoundingClientRect();   // 左のチェックの列 (まとめて変える・PR2) の次 = コード
       // 見えている所 (表の囲いの左から 40px) で、見出しの行の高さの真ん中 = 一番上に見えているのが見出しか (横に送っても)
       const wr = th.closest('.tblwrap').getBoundingClientRect();
       const hit = document.elementFromPoint(wr.left + 40, r.top + r.height / 2);
-      const td = document.querySelector('#list-tbl tbody tr td');
+      const td = document.querySelector('#list-tbl tbody tr td:not(.c-chk)');
       return { top: r.top, left: r.left, tdLeft: td.getBoundingClientRect().left, hdr: document.querySelector('.hdr').getBoundingClientRect().bottom, seen: !!(hit && hit.closest('thead')), text: th.textContent.trim() };
     });
     const before = await pos();
@@ -1688,7 +1688,8 @@ for (const [label, vp] of [['1440', { width: 1440, height: 900 }], ['1280', { wi
 
 // ── 一覧の列・見出しの並び替え (10/8 PR1・見本 masterlist_mock)。MASTER_EDIT_UI_LIST_SHOTS=フォルダ = 見本と同じ状態の写しを残す (PR の目視用) ──
 const LIST_SHOTS = process.env.MASTER_EDIT_UI_LIST_SHOTS || '';
-const shownHeads = (p) => p.$$eval('#list-tbl thead th', (ths) => ths.filter((th) => !th.hidden).map((th) => th.getAttribute('data-c')));
+// 列の板の列 (data-c) だけ。まとめて変えるの左のチェックの列 (PR2・.c-chk) は板の外 = 数えない
+const shownHeads = (p) => p.$$eval('#list-tbl thead th[data-c]', (ths) => ths.filter((th) => !th.hidden).map((th) => th.getAttribute('data-c')));
 const prefsPost = (p, body) => p.evaluate(async (b) => { const r = await fetch('api/view-prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }); return { status: r.status, j: await r.json() }; }, body);
 const { DEFAULT_VIEW: LIST_DEFAULT } = await import('../apps/master-edit/list-columns.mjs');
 await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑↓ / つまみで並べ替え = 表がすぐ変わる・「未保存」・保存 → 別の窓 (別の PC) でも同じ・初期に戻す・Esc で閉じる', async (p) => {
@@ -1721,7 +1722,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   for (let i = 0; i < 20 && (await shownHeads(p))[1] !== 'sup'; i++) await p.click('#collist li[data-id="sup"] [data-mv="-1"]');
   assert.deepEqual((await shownHeads(p)).slice(0, 3), ['code', 'sup', 'name']);
   assert.equal(await p.evaluate(() => document.activeElement.closest('li')?.getAttribute('data-id')), 'sup');
-  assert.deepEqual(await p.$$eval('#list-tbl tbody tr:first-child td', (tds) => tds.filter((td) => !td.hidden).slice(0, 3).map((td) => td.getAttribute('data-col'))), ['code', 'sup', 'name'], '行のセルも同じ並び');
+  assert.deepEqual(await p.$$eval('#list-tbl tbody tr:first-child td:not(.c-chk)', (tds) => tds.filter((td) => !td.hidden).slice(0, 3).map((td) => td.getAttribute('data-col'))), ['code', 'sup', 'name'], '行のセルも同じ並び');
   // つまみで動かす (売価を名前の前へ)
   await p.dragAndDrop('#collist li[data-id="price"] .grip', '#collist li[data-id="name"]');
   assert.deepEqual((await shownHeads(p)).slice(0, 4), ['code', 'sup', 'price', 'name']);
@@ -1783,7 +1784,9 @@ await ta('[53] 一覧の見出しで並び替え (10/8 PR1): 押す = 全件で�
   await p.setViewportSize({ width: 1024, height: 768 });
   await p.$eval('#tblwrap', (w) => { w.scrollLeft = 600; w.dispatchEvent(new Event('scroll')); });
   const [wl, cl, nl] = await p.evaluate(() => [document.querySelector('#tblwrap').getBoundingClientRect().left, document.querySelector('#list-tbl tbody tr:first-child td.c-code').getBoundingClientRect().left, document.querySelector('#list-tbl tbody tr:first-child td[data-col="name"]').getBoundingClientRect().left]);
-  assert.ok(Math.abs(cl - wl) <= 2, `コードの列が左に残る (${cl} / ${wl})`);
+  // 左のチェックの列 (まとめて変える・PR2・名簿の人だけ) があれば、コードの列はその幅だけ右に残る
+  const chkW = await p.evaluate(() => { const c = document.querySelector('#list-tbl tbody tr:first-child td.c-chk'); return c ? c.getBoundingClientRect().width : 0; });
+  assert.ok(Math.abs(cl - wl - chkW) <= 2, `コードの列が左に残る (${cl} / ${wl} + ${chkW})`);
   assert.ok(nl < wl, '名前の列は左へ送られた');
   assert.equal(await p.evaluate(() => document.querySelector('#tblwrap').classList.contains('scrolled')), true);
   const onTop = await p.evaluate(() => { const td = document.querySelector('#list-tbl tbody tr:first-child td.c-code'); const r = td.getBoundingClientRect(); const el = document.elementFromPoint(r.left + 20, r.top + r.height / 2); return td.contains(el); });

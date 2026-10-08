@@ -154,7 +154,7 @@
 
   /* ---------- 行のどこを押しても開く (コードの列を横に残すと、リンクの当たりがコードの欄だけになるため) ---------- */
   function rowLink(e) {
-    if (e.target.closest('a, button, input, label, select, textarea, summary')) return null;
+    if (e.target.closest('a, button, input, label, select, textarea, summary, .c-chk')) return null;   // .c-chk = まとめて変えるの左のチェックの欄 (欄のすき間を押しても開かない)
     var tr = e.target.closest('tbody tr'); if (!tr || !tbl.contains(tr)) return null;
     return $('a.rowlink', tr);
   }
