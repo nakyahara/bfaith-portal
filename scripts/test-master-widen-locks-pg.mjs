@@ -107,13 +107,17 @@ try {
   const ex = await build('lk-x');
   await G.issueRegExport(dbE3, { actor: 'boss@test', exportId: ex.export_id }, opts);
   await G.declareRegExport(dbE3, { actor: 'boss@test', exportId: ex.export_id, sha256: ex.sha256, result: 'ok', neMessage: '1件成功しました。' }, opts);
+  // 🆕 0061: 配っただけ (申告なし) の商品 Y も同じ回で確かめる = D は Y の登録の状態を draft → ne_pending → ne_confirmed に進める (同じ鍵の順の中で)
+  await reg('lk-y');
+  const ey = await build('lk-y');
+  await G.issueRegExport(dbE3, { actor: 'boss@test', exportId: ey.export_id }, opts);
   await M.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, '2030-01-09T00:00:00Z', 0)`, [RUNC]);
   await WW.query('select ops.snapshot_ne_reg_targets($1)', [RUNC]);
   const okc = (v) => ({ st: 'ok', v });
   const at = new Date(Date.now() + 60000).toISOString();
   const obs = await WW.query('select ops.record_ne_registration_observations($1::jsonb) as r', [JSON.stringify({ compare_run_id: RUNC,
     fetch: { generation_id: 'gen_locks', products_rev: '7', sets_rev: '8', raw_hash: 'a'.repeat(64) }, products_at: at, sets_at: at, absence_trusted: true,
-    observations: [{ code_norm: 'lk-x', present: true, trusted: true, kind: 'single', cols: { name: okc('鍵の順 lk-x'), supplier: okc('0001'), cost: okc(300), price: okc(1500), tax_rate: okc(0.1), handling: okc('active'), parent: okc(null) } }] })]);
+    observations: ['lk-x', 'lk-y'].map((c) => ({ code_norm: c, present: true, trusted: true, kind: 'single', cols: { name: okc(`鍵の順 ${c}`), supplier: okc('0001'), cost: okc(300), price: okc(1500), tax_rate: okc(0.1), handling: okc('active'), parent: okc(null) } })) })]);
   await WW.query('select ops.seal_ne_registration_run($1, $2, $3)', [RUNC, obs.rows[0].r.observation_hash, 'e'.repeat(64)]);
 
   // §3.10 の鍵の番号 (key → 番号)。request・SKU の鍵は回ごとに足す
@@ -129,6 +133,7 @@ try {
   const addEditRequest = async (rid) => { const k = (await one(`select hashtextextended('ops.master_edit_request:' || $1::text, 0)::text as k`, [rid])).k; NUM.set(k, 1); return k; };
   const addNewCode = async (code) => { const k = (await one(`select hashtextextended('core.new_code:' || core.norm_code($1), 0)::text as k`, [code])).k; NUM.set(k, 7); return k; };
   await addSku('lk-x');
+  await addSku('lk-y');
   /** pg_locks の advisory (bigint の鍵 = objsubid 1) を道ごとに: { held: [番号], waiting: 番号 | null, unknown: [鍵] } */
   const locksOf = async () => {
     const rows = await q(`select pid, granted, ((classid::bigint << 32) | objid::bigint)::text as key from pg_locks where locktype = 'advisory' and objsubid = 1 and pid = any($1::int[])`,
@@ -270,6 +275,13 @@ try {
     assert.ok(LOG.some((x) => x.path === 'S' && x.waiting >= 4 && x.held.includes(2)), 'DB の登録の関数を直接呼んでも許可の鍵を段階の鍵より先に取る');
     assert.ok(LOG.some((x) => x.path === 'V' && x.waiting === 2 && x.held.length === 0), '許可の取り消しは許可の排他の鍵で待つ (何も持たずに)');
     assert.deepEqual(LOG.filter((x) => x.unknown > 0), [], '表に無い advisory の鍵を持って待つ道が無い (持っている鍵は全部 §3.10 の番号で比べた)');
+    // 🆕 0061: D (照合の確かめ) が申告した X も、申告なしの Y も NE 確認済みにした (Y = 下書き → NE 登録待ち → NE 確認済み・system)
+    const regs = await M.query(`select s.code, r.state, i.state as item_state, i.attempt_id is null as undeclared from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id
+      join ops.ne_reg_export_items i on i.sku_id = r.sku_id where s.code in ('lk-x', 'lk-y') order by s.code`);
+    assert.deepEqual(regs.rows.map((x) => [x.code, x.state, x.item_state, x.undeclared]), [['lk-x', 'ne_confirmed', 'verified', false], ['lk-y', 'ne_confirmed', 'verified', true]]);
+    const evy = await M.query(`select e.from_state, e.to_state, e.actor_type, e.actor_id from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id
+      where s.code = 'lk-y' and e.to_state in ('ne_pending', 'ne_confirmed') order by e.event_id`);
+    assert.deepEqual(evy.rows.map((x) => [x.from_state, x.to_state, x.actor_type, x.actor_id]), [['draft', 'ne_pending', 'system', 'ne_compare'], ['ne_pending', 'ne_confirmed', 'system', 'ne_compare']]);
   });
 
   await ta('[18b] ops.ne_reg_file は許可の共有の鍵を返すまで持つ (R19): 取り消し (排他) は渡し終えるのを待つ・取り消しの後は渡さない', async () => {
