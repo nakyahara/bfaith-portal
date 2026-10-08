@@ -1490,8 +1490,11 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   // 区分違いがある朝 (登録の不一致なし) も 0063 の知らせを消さない (#1659 Codex R1 Medium)
   const { neSummary: neSum } = await import('../apps/company-db/master-compare/run.mjs');
   const syn = { verdict: 'breach', counts: { items: 1 }, sku_kind_raw_mismatch: { alert: true, count: 1, codes: ['k001'] },
-    registrations: { written: { not_imported: [{ code: 'n901' }], not_imported_days: 3, needs_declaration: [{ code: 'j001', reason: 'jan_not_compared' }] } } };
+    registrations: { written: { not_imported: [{ code: 'n901' }], not_imported_days: 3, needs_declaration: [{ code: 'j001', reason: 'jan_not_compared' }],
+      case_mismatch: [{ code: 'Up-ABC-1', reason: 'case_mismatch', ne_spellings: ['up-abc-1'] }, { code: 'Up-X-2', reason: 'spelling_not_recorded', ne_spellings: null }] } } };
   const sl = neSum(syn);
+  // 🆕 0064 (#1667 Codex R1 High): NE のコードの書き方が配ったコード (原文) と違う / 確かめられない = 確かめない = ⚠️ で出す
+  assert.ok(sl.includes('⚠️ NE のコードの書き方 (大文字・小文字) が配ったコードと違う・確かめられない = 確かめない 2 件 (Up-ABC-1 NE の書き方が違う NE は up-abc-1・Up-X-2 書き方を確かめられない)'), sl);
   assert.match(sl, /^⚠️ ②: 区分が NE と違う SKU 1 件/);
   assert.match(sl, /ℹ️ 配ってから 3 日たっても NE に無い \(取り込まれていないらしい\) 1 件 \(n901\)/);
   assert.match(sl, /ℹ️ NE にあるが自動では確かめない \(取り込んだと申告すると確かめる\) 1 件 \(j001 JAN\)/);

@@ -168,13 +168,18 @@ export function applyCdbCardEvent(event, { db = getDB() } = {}) {
   })();
 }
 
-/** セットの構成品をカードに (同じ品は 1 行・並び = 入れた順)。前からある行は消さない (INSERT OR IGNORE) */
+/**
+ * セットの構成品をカードに (同じ品は 1 行・並び = 入れた順)。前からある行は消さない (INSERT OR IGNORE)
+ * 🆕 0064 (#1667 Codex R1 Medium): 構成品のコードは原文 (Company DB の SKU の code) で入れる。同じ品かは小文字で見る (services/set-derive.js と同じ)
+ */
 function writeSetMembers(db, draftId, components) {
   const list = Array.isArray(components) ? components : [];
+  const seen = new Set();
   list.forEach((c, i) => {
-    const code = String(c?.code ?? '').trim().toLowerCase();
+    const code = String(c?.code ?? '').trim();
     const qty = Number(c?.qty);
-    if (!code || !Number.isInteger(qty) || qty < 1 || qty > 999) return;
+    if (!code || !Number.isInteger(qty) || qty < 1 || qty > 999 || seen.has(code.toLowerCase())) return;
+    seen.add(code.toLowerCase());
     db.prepare('INSERT OR IGNORE INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, ?)').run(draftId, code, qty, i);
   });
 }
@@ -266,6 +271,13 @@ export function linkCdbCardToExisting(event, { draftId, actor = ACTOR, db = getD
     }
     const other = db.prepare('SELECT id FROM product_drafts WHERE cdb_sku_id = ? AND id <> ?').get(skuId, id);
     if (other) throw fail(`この商品はもう別のカード #${other.id} に結ばれています`);
+    // 🆕 0064 (#1667 Codex R1 Medium): 人が結ぶと決めた取引で、カードの商品コードを Company DB の原文にそろえる (大文字小文字・前後の空白だけ違う = 同じ norm)。
+    //   NE に登録するのは Company DB の原文 = カードが前の書き方のままだと、カードと NE のコードが食い違う
+    const respelled = String(d.ne_code ?? '') !== code;
+    if (respelled) {
+      db.prepare(`UPDATE product_drafts SET ne_code = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`).run(code, id);
+      logEvent(db, id, 'cdb_card_code_spelling', `商品コードの書き方を Company DB の ${code} にそろえた (前 = ${d.ne_code})`, actor);
+    }
     const already = d.cdb_sku_id != null;
     if (!already) {
       const u = db.prepare(`UPDATE product_drafts SET cdb_sku_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND cdb_sku_id IS NULL`).run(skuId, id);
@@ -282,7 +294,7 @@ export function linkCdbCardToExisting(event, { draftId, actor = ACTOR, db = getD
       ON CONFLICT(event_id) DO UPDATE SET outcome = 'linked', draft_id = excluded.draft_id, conflict_draft_id = NULL,
         applied_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(eventId, skuId, code, id);
-    return { outcome: 'linked', draft_id: id, already, applied: fill.applied, not_applied: fill.not_applied };
+    return { outcome: 'linked', draft_id: id, already, applied: fill.applied, not_applied: fill.not_applied, respelled };
   })();
 }
 

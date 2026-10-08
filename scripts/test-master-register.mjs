@@ -976,7 +976,7 @@ await ta('[G-0061] 登録の関数の作り直し (0061): 0060 の本文との�
      from pg_proc where oid = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)'::regprocedure`), { pub: false, me: true, d: true });
 });
 
-await ta('[G-0064] 大文字のコード (0064): ops.new_sku_code_problem・ops.ne_reg_build の作り直しは 0058 の本文との違いが「形の行」と「🆕 0064 の注記 1 行」だけ・権限はそのまま・NE 登録の CSV の品目の ne_code の CHECK は大文字も (小文字にして code_norm)', async () => {
+await ta('[G-0064] 大文字のコード (0064): ops.new_sku_code_problem・ops.ne_reg_build の作り直しは 0058 の本文との違いが「形の行」と「🆕 0064 の注記 1 行」だけ・照合の確かめは 0063 の本文 + NE の書き方の確かめの行だけ・権限はそのまま・NE 登録の CSV の品目の ne_code の CHECK は大文字も (小文字にして code_norm)', async () => {
   const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
   const fnOf = (file, head) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf(head); assert.ok(i >= 0, `${file}: ${head}`); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
   const files = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x));
@@ -1004,6 +1004,34 @@ await ta('[G-0064] 大文字のコード (0064): ops.new_sku_code_problem・ops.
     assert.equal(i, a.length, `0058 の ${head} の行が 0064 に全部同じ順で残っていない`);
     assert.deepEqual(changed, [newLine], `${head}: 変えたのは形の行だけ`);
     assert.deepEqual(added.map((l) => l.trim().slice(0, note.length)), [note], `${head}: 足したのは注記 1 行だけ`);
+  }
+  // 🆕 (#1667 Codex R1 High) 照合の確かめ ops.record_ne_registration_check = 0063 の本文 + NE の元の書き方を確かめる行だけ (0063 の後・0064 の外で作り直していない)
+  {
+    const head = 'create or replace function ops.record_ne_registration_check(';
+    for (const file of files.filter((x) => x.slice(0, 4) > '0063' && x.slice(0, 4) !== '0064')) {
+      assert.ok(!/function\s+ops\.record_ne_registration_check\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も照合の確かめを作り直している = 0064 の元にする定義を見直す`);
+    }
+    const a = fnOf('0063_ne_reg_auto_verify_issued.sql', head).split('\n'); const b = fnOf('0064_uppercase_new_codes.sql', head).split('\n');
+    const CHANGED = new Map([
+      ["                'not_imported', v_late, 'auto_block', v_block, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));",
+        "                'not_imported', v_late, 'auto_block', v_block, 'spelling', v_spell, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));"],
+      ["  return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs);",
+        "  return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs, 'case_mismatch', v_case);"],
+    ]);
+    const changed = []; const added = []; let i = 0;
+    for (const line of b) {
+      if (i < a.length && line === a[i]) i++;
+      else if (i < a.length && CHANGED.get(a[i]) === line) { changed.push(line); i++; }
+      else added.push(line.trim());
+    }
+    assert.equal(i, a.length, '0063 の照合の確かめの行が 0064 に全部同じ順で残っていない');
+    assert.deepEqual(changed, [...CHANGED.values()], '変えたのは記録の detail と答えの 2 行だけ');
+    const want = ['v_spell    text;', "v_case     jsonb := '[]'::jsonb;", '-- 🆕 0064: NE の元の書き方 (0041) を読む鍵', "perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.ne_codes'));",
+      'v_spell := ops.ne_reg_spelling_problem(it.ne_code, it.code_norm, p_run);', 'elsif v_spell is not null then', "v_out := 'case_hold';", 'elsif v_spell is not null then', "v_out := 'case_hold';",
+      "if v_out = 'case_hold' then", "v_out := 'waiting';", 'v_case := v_case || pg_catalog.jsonb_build_array(', "'ne_spellings', (select x.spellings", 'end if;'];
+    assert.deepEqual(added.map((l, k) => l.slice(0, want[k]?.length ?? 0)), want, '足したのは書き方の確かめの行だけ');
+    assert.deepEqual(await one(`select has_function_privilege('public', oid, 'execute') as pub, has_function_privilege('watch_writer', oid, 'execute') as ww, prosecdef as d,
+       array_to_string(proconfig, ',') as c from pg_proc where oid = 'ops.record_ne_registration_check(text)'::regprocedure`), { pub: false, ww: true, d: true, c: 'search_path=pg_catalog, pg_temp' });
   }
   // 権限 (create or replace = 今の権限のまま): public は実行できない・画面のロールは実行できる・security definer
   for (const sig of ['ops.new_sku_code_problem(text)', 'ops.ne_reg_build(jsonb, bytea)']) {
@@ -1358,7 +1386,7 @@ await ta('[O11] 🆕 0064 大文字のコードのカード (Company DB構想 20
   assert.deepEqual([PH.applyCdbCardEvent({ event_id: r.card.event_id, sku_id: r.sku_id, schema_version: 'ph-card-v1', payload }).replayed,
     PH.applyCdbCardEvent({ event_id: uuid(), sku_id: r.sku_id, schema_version: 'ph-card-v1', payload }).outcome], [true, 'linked']);
   assert.equal(ph.prepare("SELECT COUNT(*) AS c FROM product_drafts WHERE LOWER(TRIM(ne_code)) = 'up-card-1'").get().c, 1);
-  // 2. 前から product-hub に小文字の同じコードのカード = 衝突 (増やさない)・人が結ぶ = 小文字で確かめて結ぶ (カードの ne_code は前のまま)
+  // 2. 前から product-hub に小文字の同じコードのカード = 衝突 (増やさない)・人が結ぶ = 小文字で確かめて結ぶ・カードの ne_code を Company DB の原文にそろえる (#1667 Codex R1 Medium)
   const r2 = await reg('single', 'Up-Conf-1', single({ name: '大文字の衝突の単品' }));
   ph.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('up-conf-1', '前からの小文字のカード', 'someone')`).run();
   const old = draftOf('up-conf-1');
@@ -1367,7 +1395,18 @@ await ta('[O11] 🆕 0064 大文字のコードのカード (Company DB構想 20
   assert.equal((await outboxOf('Up-Conf-1')).result.conflict_draft_id, old.id);
   const out = await asEditor(() => O.linkCardToExisting(db, (ev, o) => PH.linkCdbCardToExisting(ev, o), { skuId: r2.sku_id, actor: 'naka@test', expectedDraftId: old.id }));
   assert.deepEqual([out.ok, out.draft_id], [true, old.id]);
-  assert.deepEqual([draftOf('up-conf-1').ne_code, String(draftOf('up-conf-1').cdb_sku_id)], ['up-conf-1', r2.sku_id]);
+  assert.deepEqual([draftOf('up-conf-1').id, draftOf('up-conf-1').ne_code, String(draftOf('up-conf-1').cdb_sku_id)], [old.id, 'Up-Conf-1', r2.sku_id]);
+  assert.match(ph.prepare("SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'cdb_card_code_spelling'").get(old.id).detail, /Up-Conf-1 にそろえた \(前 = up-conf-1\)/);
+  // もう一度結んでも (済んだ = already) 書き方はそのまま・記録は増えない
+  const again = PH.linkCdbCardToExisting({ event_id: r2.card.event_id, sku_id: r2.sku_id, schema_version: 'ph-card-v1', payload: (await one('select payload from ops.product_hub_outbox where event_id = $1', [r2.card.event_id])).payload }, { draftId: old.id, actor: 'naka@test' });
+  assert.deepEqual([again.already, again.respelled], [true, false]);
+  assert.equal(ph.prepare("SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'cdb_card_code_spelling'").get(old.id).c, 1);
+  // 2b. セットのカードの構成品 = 原文で入れる・同じ品は小文字で 1 行 (#1667 Codex R1 Medium)
+  const setSku = '9990001';   // SQLite だけの試験 (Company DB の SKU に結ばない番号)
+  const setPayload = { ...payload, code: 'Up-Set-Card-1', kind: 'set', name: '大文字の構成のセット', components: [{ code: 'Up-Mem-1', qty: 2 }, { code: 'up-mem-1', qty: 1 }, { code: 'mem-2', qty: 1 }] };
+  const sc = PH.applyCdbCardEvent({ event_id: uuid(), sku_id: setSku, schema_version: 'ph-card-v1', payload: setPayload });
+  assert.equal(sc.outcome, 'created', JSON.stringify(sc));
+  assert.deepEqual(ph.prepare('SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort').all(sc.draft_id), [{ member_ne_code: 'Up-Mem-1', qty: 2 }, { member_ne_code: 'mem-2', qty: 1 }]);
   // 3. 形: 使えない文字は取り込まない (大文字は通る)
   assert.throws(() => PH.applyCdbCardEvent({ event_id: uuid(), sku_id: r.sku_id, schema_version: 'ph-card-v1', payload: { ...payload, code: 'Up.Card' } }), /商品コードが不正/);
 });

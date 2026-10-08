@@ -1288,6 +1288,72 @@ await ta('[U1] 大文字の単品 = 中の鍵は norm・外へは原文: 登録 
   const neMap = { ok: true, map: new Map(nc.rows.map((x) => [String(x.code_norm), { state: x.state, ne_code: x.ne_code }])) };
   assert.deepEqual((({ productCode, caseSource, caseWarning }) => ({ productCode, caseSource, caseWarning }))(PO.resolveLzCode({ key: NORM, fallback: NORM, ne: neMap })),
     { productCode: CODE, caseSource: 'ne_api', caseWarning: null });
+  assert.deepEqual(c.case_mismatch, [], 'NE の書き方 = 配ったコード');
+  // ⑦ Amazon SKU の対応の写し (miniPC の m_sku_components.ne_code・#1667 Codex R1 Low) = norm の内部の鍵: miniPC の raw_ne_products.商品コード (NE の取得 = 小文字) と結び、
+  //   SQLite の CHECK も小文字だけ = NE のコードとして外へ出す値ではない → 小文字で写す (原文は Company DB の core.skus.code と 0041 にある)
+  const A = await import('../lib/amazon-map-write.mjs');
+  const K = await import('../lib/sku-map-canonical.js');
+  const AM = await import('../lib/amazon-map-migrate.mjs');
+  const v0 = (await A.readAmazonMap(db, 'amz-up-abc-1')).versions;
+  await as(E, 'master_edit', () => A.saveAmazonMap(db, { actor: 'naka@test', requestId: uuid(), sellerSku: 'amz-up-abc-1', name: NAME, components: [{ code: CODE, qty: 1 }], reason: 'テスト', seen: { versions: v0 } },
+    { ownership: ALL_COMPANY, open: true }));
+  const canon = await A.readCompanyAmazonMapCanon(db, { sellerSkus: ['amz-up-abc-1'] });
+  assert.deepEqual(canon.components.map((x) => [x.seller_sku, x.ne_code]), [['amz-up-abc-1', NORM]]);
+  assert.deepEqual([AM.neCodeOfSku(CODE), K.validateSkuMap(canon)], [NORM, []]);
+  assert.match(K.skuMapKeyProblem(CODE), /大文字/, '受け手 (miniPC の SQLite) は原文を受けない = norm の鍵');
+});
+
+await ta('[U2] 🆕 照合 ② は NE の元の書き方 (0041・同じ回) = 品目の ne_code (原文) を確かめてから比べる (#1667 Codex R1 High): 配った Up-NIM-1 が取り込まれず NE に up-nim-1 が手で作られた = 値が合っても verified にしない (待ち・case_mismatch)・小文字の品目も NE の書き方が違えば同じ・0041 の無い回は大文字の品目だけ待ち (小文字は今までどおり)・ちゃんと取り込まれたら verified', async () => {
+  const base = ['s001', 's002', 's003', 's004', 's005', 's006', 's007', 'set001', 'new-dup', 'new-x1'];
+  /** NE の取得の書き方 (照合の resolveNeCodes) → 0041 (ops.record_ne_codes) + 後の試験のための許可 */
+  const recordSpellings = async (run, at, extra) => {
+    await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, $2, 0)`, [run, at]);
+    const rows = [...base.map((c) => ({ kind: 'single', code_norm: c, spellings: JSON.stringify([c]) })), { kind: 'rep', code_norm: 'grp1', spellings: JSON.stringify(['GRP1']) },
+      { kind: 'single', code_norm: 'up-abc-1', spellings: JSON.stringify(['Up-ABC-1']) },
+      ...extra.map((s) => ({ kind: 'single', code_norm: s.toLowerCase(), spellings: JSON.stringify([s]) }))];
+    await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: run, entries: CNE.resolveNeCodes({ ok: true, rows }).entries })]);
+    await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(pgliteAdapter(pg), { runId: run, withSet: true });
+  };
+  /** 回の始まりの写しの全部に観測を送る: obs にある商品 = NE にある (目標どおりの値)・ほか = 信用できない (状態を変えない) */
+  const checkAll = async (run, obs) => {
+    const targets = (await snapTargets(run)).targets;
+    for (const n of Object.keys(obs)) assert.ok(targets.some((x) => x.code_norm === n), `${n} が写しに無い`);
+    return check(run, targets.map((x) => (obs[x.code_norm] ? obsSingle(x.code_norm, { name: ok(obs[x.code_norm]) }) : { code_norm: x.code_norm, present: false, trusted: false, kind: null })), { snapshot: false });
+  };
+  const caseOf = (c, code) => (c.case_mismatch || []).find((x) => x.code === code);
+  const spellingOf = async (run, code) => (await one('select c.outcome, c.detail ->> \'spelling\' as spelling from ops.ne_reg_checks c join core.skus s on s.sku_id = c.sku_id where c.compare_run_id = $1 and s.code = $2', [run, code]));
+  await reg('single', 'Up-NIM-1', single({ name: '取り込まれなかった大文字' }));
+  await reg('single', 'low-cm-1', single({ name: '取り込まれなかった小文字' }));
+  const bU = await build('products', ['Up-NIM-1']); await issue(bU.export.export_id);
+  const bL = await build('products', ['low-cm-1']); await issue(bL.export.export_id);
+  // ① 翌朝: NE に大文字小文字だけ違う商品が手で作られていた (up-nim-1 / LOW-CM-1)。値は全部配ったとおり = 書き方が違うので比べない
+  const R1 = 'mc_20300110T130000000Z_0a5810';
+  await recordSpellings(R1, '2030-01-10T13:00:00Z', ['up-nim-1', 'LOW-CM-1']);
+  let c = await checkAll(R1, { 'up-nim-1': '取り込まれなかった大文字', 'low-cm-1': '取り込まれなかった小文字' });
+  assert.equal(c.counts.verified, undefined, JSON.stringify(c));
+  assert.deepEqual(caseOf(c, 'Up-NIM-1'), { code: 'Up-NIM-1', export_id: String(bU.export.export_id), reason: 'case_mismatch', ne_spellings: ['up-nim-1'] });
+  assert.deepEqual(caseOf(c, 'low-cm-1'), { code: 'low-cm-1', export_id: String(bL.export.export_id), reason: 'case_mismatch', ne_spellings: ['LOW-CM-1'] });
+  for (const [code, id] of [['Up-NIM-1', bU.export.export_id], ['low-cm-1', bL.export.export_id]]) {
+    assert.deepEqual([(await itemsOf(id))[0].state, await regOf(code)], ['issued', 'draft'], `${code}: 状態を進めない`);
+    assert.deepEqual(await spellingOf(R1, code), { outcome: 'waiting', spelling: 'case_mismatch' });
+  }
+  // ② 0041 の無い回 (この回に NE のコードを書けなかった): 大文字の品目 = 書き方を確かめられない = 待ち / 小文字だけの品目 = 今までどおり比べる (前からの単品の自動の確かめを止めない)
+  const R2 = await newRun();
+  c = await checkAll(R2, { 'up-nim-1': '取り込まれなかった大文字', 'low-cm-1': '取り込まれなかった小文字' });
+  assert.deepEqual([caseOf(c, 'Up-NIM-1')?.reason, caseOf(c, 'low-cm-1')], ['spelling_not_recorded', undefined], JSON.stringify(c));
+  assert.deepEqual([(await itemsOf(bU.export.export_id))[0].state, await regOf('Up-NIM-1')], ['issued', 'draft']);
+  assert.deepEqual([(await itemsOf(bL.export.export_id))[0].state, await regOf('low-cm-1')], ['verified', 'ne_confirmed'], '小文字の品目は 0041 の無い回も今までどおり (受け入れた危なさ = 0063 と同じ種類)');
+  assert.deepEqual(await spellingOf(R2, 'Up-NIM-1'), { outcome: 'waiting', spelling: 'spelling_not_recorded' });
+  // ③ 手の商品を片付けて CSV を取り込んだ (NE の書き方 = Up-NIM-1) = verified + NE 確認済み
+  const R3 = 'mc_20300110T140000000Z_0a5811';
+  await recordSpellings(R3, '2030-01-10T14:00:00Z', ['Up-NIM-1', 'low-cm-1']);
+  c = await checkAll(R3, { 'up-nim-1': '取り込まれなかった大文字' });
+  assert.equal(c.counts.verified, 1, JSON.stringify(c)); assert.deepEqual(c.case_mismatch, []);
+  assert.deepEqual([(await itemsOf(bU.export.export_id))[0].state, await regOf('Up-NIM-1')], ['verified', 'ne_confirmed']);
+  assert.deepEqual(await spellingOf(R3, 'Up-NIM-1'), { outcome: 'verified', spelling: null });
+  // 部品の関数はだれにも渡さない (照合の確かめの中だけ)
+  assert.deepEqual(await one(`select has_function_privilege('watch_writer', 'ops.ne_reg_spelling_problem(text, text, text)', 'execute') as w,
+    has_function_privilege('master_edit', 'ops.ne_reg_spelling_problem(text, text, text)', 'execute') as m`), { w: false, m: false });
 });
 
 await ta('[J1] JAN を足す・外す = 変更の記録 (人・request_id・出どころ・理由)・SKU と商品の version が変わる・編集の印が変わる', async () => {

@@ -13,8 +13,18 @@
 --      前からの行は小文字だけ = ne_code = code = code_norm (形の確かめの後に作った品目) = 新しい CHECK を満たす (満たさない行があれば先に止める)
 --   2. ops.new_sku_code_problem (0058 の版) を create or replace: 形の行だけを変える (scripts/test-master-register.mjs の [G-0064] が 0058 の本文との差を機械で確かめる)
 --   3. ops.ne_reg_build (0058 の版) を create or replace: コードの形の確かめの行だけを変える (同じ試験)
+--   4. 🆕 (#1667 Codex R1 High) 翌朝の照合の確かめ ops.record_ne_registration_check (0063 の版) を create or replace:
+--      観測は code_norm (小文字) で選ぶ = 配った Up-ABC-1 が取り込まれず、NE に up-abc-1 が手で作られても値が合えば verified に進んでいた。
+--      → 比べる前に、同じ照合の回の NE の元の書き方 (0041 の ops.master_ne_codes・kind = product) が品目の ne_code (原文) と完全に同じかを
+--        ops.ne_reg_spelling_problem で確かめる。違う / 分からない = 状態を進めない (記録は waiting・detail.spelling に理由)・答えの case_mismatch に出す
+--        (照合の朝の要約 = apps/company-db/master-compare/run.mjs の notImportedNote)。足した行・変えた行は [G-0064] が 0063 の本文と機械で照らす
+--      🚨 0041 の元の書き方が無いとき (この回に 0041 を書けなかった・品目のコードが 0041 に無い・invalid) の扱い = 品目が小文字だけのコード (ne_code = code_norm) なら
+--         今までどおり比べる (前からの単品の自動の確かめを止めない。NE の取得はコードを小文字で持つ = 小文字のコードは書き方の取り違えが「NE の画面で大文字で作った」
+--         決まり違反のときだけ = 0063 で受け入れた危なさと同じ種類)。大文字を含む品目は比べない (書き方を確かめられないまま原文の取り込みを認めない = 待ち)。
+--         0041 に書き方があって違う (case_mismatch)・2 つ以上 (case_collided) は大文字小文字によらず比べない
 -- 変えないもの: 登録の関数 ops.register_new_sku (形は ops.new_sku_code_problem に任せている)・NE の取得 (コードは小文字で保存・元の書き方は 0041 の ops.master_ne_codes)・
---   照合 ② の確かめ (code_norm で結ぶ)・ロジザード用 CSV / 入荷予定 (0041 の元の書き方で書く = NE に入る前は出さない)
+--   ロジザード用 CSV / 入荷予定 (0041 の元の書き方で書く = NE に入る前は出さない)・miniPC の Amazon SKU の写し (m_sku_components.ne_code = norm の内部の鍵・
+--   raw_ne_products.商品コード (小文字) と結ぶ・SQLite の CHECK で小文字 = lib/amazon-map-write.mjs のまま)
 -- 🚨 security definer の関数は search_path = pg_catalog, pg_temp・名前は全部 schema つき・一時の表を使わない (0058 の本文のまま)。
 --    create or replace は今の権限を残す (画面のロール master_edit の実行権は scripts/company-db/create-master-edit-roles.mjs のまま = ロールの script は流し直さなくてよい)
 -- 🚨 この migration は商品・SKU・登録・CSV の値を何も変えない (変わるのは次の新商品の登録から)
@@ -256,3 +266,159 @@ begin
   return v_result;
 end $$;
 revoke all on function ops.ne_reg_build(jsonb, bytea) from public;
+
+-- ─── 4. 翌朝の照合の確かめ: NE の元の書き方 = 品目の ne_code (原文) を確かめてから比べる (#1667 Codex R1 High) ───
+/**
+ * 品目の NE の書き方の問題。null = 比べてよい / 理由:
+ *   case_mismatch = この回の 0041 に書き方が 1 つあって品目の ne_code (原文) と違う (例: 配った Up-ABC-1・NE には up-abc-1)
+ *   case_collided = この回の 0041 で書き方が 2 つ以上 (どれが配った商品か決められない)
+ *   spelling_not_recorded / spelling_invalid = 書き方が分からない (この回に 0041 が無い・品目のコードが 0041 に無い / invalid)。
+ *     品目が小文字だけのコード (ne_code = code_norm) なら null (今までどおり比べる = 前からの単品の自動の確かめを止めない)・大文字を含む品目だけ理由を返す
+ * 呼び手 (ops.record_ne_registration_check) が NE のコードの鍵 (共有) を取ってから呼ぶ。読むだけ
+ */
+create function ops.ne_reg_spelling_problem(p_ne_code text, p_code_norm text, p_run text) returns text
+  language sql stable set search_path = pg_catalog, pg_temp as $$
+  select case
+    when (select m.compare_run_id from ops.master_ne_code_mark m where m.id = 1) is distinct from p_run
+      then case when p_ne_code is distinct from p_code_norm then 'spelling_not_recorded' end
+    else (select case
+                   when c.state = 'ok' and c.ne_code = p_ne_code then null
+                   when c.state = 'ok' then 'case_mismatch'
+                   when c.state = 'collided' then 'case_collided'
+                   when p_ne_code is distinct from p_code_norm then coalesce('spelling_' || c.state, 'spelling_not_recorded')
+                 end
+            from (select 1) one left join ops.master_ne_codes c on c.code_norm = p_code_norm and c.kind = 'product')
+  end
+$$;
+revoke all on function ops.ne_reg_spelling_problem(text, text, text) from public;
+
+create or replace function ops.record_ne_registration_check(p_run text) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  h          ops.ne_reg_compare_runs%rowtype;
+  rc         ops.ne_reg_compare_receipts%rowtype;
+  it         record;
+  v_obs      jsonb;
+  v_fetched  timestamptz;
+  v_cmp      jsonb;
+  v_out      text;
+  v_basis    text;
+  v_late     boolean;
+  v_days     constant integer := 3;   -- 配ってから何日たっても NE に無ければ「取り込まれていないらしい」と知らせるか (要約だけ・失敗にしない)
+  v_counts   jsonb := '{}'::jsonb;
+  v_missing  jsonb := '[]'::jsonb;
+  v_block    text;
+  v_needs    jsonb := '[]'::jsonb;
+  v_reg      text;
+  v_spell    text;                  -- 🆕 0064: NE の元の書き方の問題 (null = 比べてよい)
+  v_case     jsonb := '[]'::jsonb;  -- 🆕 0064: 書き方が違う / 分からないので比べなかった品目
+begin
+  if p_run is null or p_run !~ '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$' then raise exception 'invalid_input: compare_run_id の形が違う: %', p_run using errcode = '22023'; end if;
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_reg_check'));
+  select * into rc from ops.ne_reg_compare_receipts r where r.compare_run_id = p_run;
+  if not found then raise exception 'not_sealed: 照合の回 % は最後まで終わった受け取りが無い = 確かめない', p_run using errcode = 'P0001'; end if;
+  select * into h from ops.ne_reg_compare_runs r where r.compare_run_id = p_run;
+  if h.observation_hash is distinct from rc.observation_hash or ops.ne_reg_observation_hash(p_run) is distinct from rc.observation_hash then
+    raise exception 'receipt_mismatch: 照合の回 % の観測が受け取りと違う', p_run using errcode = 'P0001';
+  end if;
+  -- 鍵: SKU ごと (sku_id の順・保存と同じ鍵) → CSV の鍵
+  perform ops.ne_reg_lock_skus((select pg_catalog.array_agg(t.sku_id) from ops.v_ne_reg_targets t
+                                 where t.code_norm in (select o.code_norm from ops.ne_reg_compare_observations o where o.compare_run_id = p_run)));
+  -- 🆕 0064: NE の元の書き方 (0041) を読む鍵 (共有・書き手 ops.record_ne_codes と並ぶ)。鍵の順 = 確かめ → SKU → CSV → NE のコード (ops.ne_reg_build と同じ)
+  perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.ne_codes'));
+  for it in select i.*, e.declared_at as export_declared_at, e.issued_at as export_issued_at
+              from ops.ne_reg_export_items i join ops.ne_reg_exports e on e.export_id = i.export_id
+             where i.state in ('issued', 'import_declared', 'partial')
+               and i.code_norm in (select o.code_norm from ops.ne_reg_compare_observations o where o.compare_run_id = p_run)
+             order by i.sku_id for update of i loop
+    if exists (select 1 from ops.ne_reg_checks c where c.compare_run_id = p_run and c.item_id = it.item_id) then continue; end if;
+    select o.observation into v_obs from ops.ne_reg_compare_observations o where o.compare_run_id = p_run and o.code_norm = it.code_norm;
+    v_fetched := case when it.sku_kind = 'set' then h.sets_at else h.products_at end;
+    v_cmp := null;
+    v_late := false;
+    v_block := null;
+    v_spell := ops.ne_reg_spelling_problem(it.ne_code, it.code_norm, p_run);   -- 🆕 0064
+    -- 申告あり = 申告の時刻から (0053 のまま)・申告なし = 配った時刻から (0063)
+    v_basis := case when it.attempt_id is not null then 'declared' else 'issued' end;
+    if v_basis = 'declared' then
+      if it.export_declared_at is null or v_fetched <= it.export_declared_at then
+        v_out := 'waiting';
+      elsif (v_obs -> 'trusted') is distinct from 'true'::jsonb then
+        v_out := 'waiting';
+      elsif (v_obs -> 'present') is distinct from 'true'::jsonb then
+        v_out := case when h.absence_trusted then 'failed' else 'waiting' end;
+      elsif v_spell is not null then
+        v_out := 'case_hold';   -- 🆕 0064: NE のコードの書き方が配ったコード (原文) と違う / 分からない = 比べない (状態を進めない)
+      else
+        v_cmp := ops.ne_reg_compare(it.expected, v_obs);
+        v_out := case when (v_cmp -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;
+      end if;
+    else
+      if it.export_issued_at is null or v_fetched <= it.export_issued_at then
+        v_out := 'waiting';   -- 配る前の取得 = 比べない
+      elsif (v_obs -> 'trusted') is distinct from 'true'::jsonb then
+        v_out := 'waiting';
+      elsif (v_obs -> 'present') is distinct from 'true'::jsonb then
+        v_out := 'waiting';   -- 申告が無い = 「取り込めなかった」と決めない
+        v_late := h.absence_trusted and v_fetched > it.export_issued_at + pg_catalog.make_interval(days => v_days);
+      elsif v_spell is not null then
+        v_out := 'case_hold';   -- 🆕 0064: NE のコードの書き方が配ったコード (原文) と違う / 分からない = 比べない (状態を進めない)
+      else
+        v_cmp := ops.ne_reg_compare(it.expected, v_obs);
+        v_block := nullif(ops.ne_reg_auto_block(it.item_id), '');
+        if v_block is not null then
+          v_out := 'in_ne_undeclared';   -- 比べられない列を送った / 配った時の印が無い = 自動にしない (申告すると 0053 のまま確かめる)
+        else
+          v_out := case when (v_cmp -> 'ok') = 'true'::jsonb then 'verified' else 'partial' end;
+        end if;
+      end if;
+    end if;
+    if v_out = 'case_hold' then   -- 🆕 0064: 記録は待ち (waiting)・答えの case_mismatch に出す (照合の朝の要約)
+      v_out := 'waiting';
+      v_case := v_case || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('code', it.ne_code, 'export_id', it.export_id::text, 'reason', v_spell,
+        'ne_spellings', (select x.spellings from ops.master_ne_codes x where x.code_norm = it.code_norm and x.kind = 'product')));
+    end if;
+    insert into ops.ne_reg_checks (compare_run_id, item_id, sku_id, fetched_at, outcome, detail)
+      values (p_run, it.item_id, it.sku_id, v_fetched, v_out,
+              pg_catalog.jsonb_build_object('state_before', it.state, 'basis', v_basis, 'compare', v_cmp, 'present', v_obs -> 'present', 'trusted', v_obs -> 'trusted',
+                'not_imported', v_late, 'auto_block', v_block, 'spelling', v_spell, 'fetch_generation', h.fetch_generation, 'raw_hash', h.raw_hash, 'evidence_sha256', rc.evidence_sha256));
+    if v_out = 'verified' then
+      update ops.ne_reg_export_items set state = 'verified', verified_run = p_run, verified_at = pg_catalog.now(), state_changed_at = pg_catalog.now(), state_changed_by = 'ne_compare'
+       where item_id = it.item_id;
+      select r.state into v_reg from ops.master_registrations r where r.sku_id = it.sku_id;
+      -- 申告なし = 下書きのまま → 照合の確かめで NE 登録待ちを通って NE 確認済みに (根拠は関数がこの確かめの記録から読む)
+      if v_reg = 'draft' and v_basis = 'issued' then
+        perform ops.transition_sku_registration(it.sku_id, 'ne_pending', 'system', 'ne_compare', null, '{}'::jsonb, null);
+        v_reg := 'ne_pending';
+      end if;
+      if v_reg = 'ne_pending' then
+        perform ops.transition_sku_registration(it.sku_id, 'ne_confirmed', 'system', 'ne_compare', null, '{}'::jsonb, null);
+      end if;
+    elsif v_out = 'partial' and it.state in ('issued', 'import_declared') then
+      update ops.ne_reg_export_items set state = 'partial', state_changed_at = pg_catalog.now(), state_changed_by = 'ne_compare' where item_id = it.item_id;
+    elsif v_out = 'failed' then
+      update ops.ne_reg_export_items set state = 'failed', failed_reason = 'not_in_ne', state_changed_at = pg_catalog.now(), state_changed_by = 'ne_compare' where item_id = it.item_id;
+    end if;
+    if v_out = 'in_ne_undeclared' then
+      v_needs := v_needs || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('code', it.ne_code, 'export_id', it.export_id::text, 'reason', v_block));
+    end if;
+    if v_late then
+      v_missing := v_missing || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('code', it.ne_code, 'export_id', it.export_id::text, 'issued_at', it.export_issued_at,
+        'days', pg_catalog.floor(pg_catalog.date_part('epoch', v_fetched - it.export_issued_at) / 86400)::integer));
+    end if;
+    v_counts := v_counts || pg_catalog.jsonb_build_object(v_out, coalesce((v_counts ->> v_out)::integer, 0) + 1);
+  end loop;
+  -- 全部の商品が終わったファイルは閉じる
+  update ops.ne_reg_exports e set state = 'closed', closed_at = pg_catalog.now(), closed_by = 'ne_compare', close_reason = 'finished'
+   where e.state in ('issued', 'declared')
+     and not exists (select 1 from ops.ne_reg_export_items i where i.export_id = e.export_id and i.state in ('built', 'issued', 'import_declared', 'partial'));
+  return pg_catalog.jsonb_build_object('compare_run_id', p_run, 'counts', v_counts, 'not_imported', v_missing, 'not_imported_days', v_days, 'needs_declaration', v_needs, 'case_mismatch', v_case);
+end $$;
+revoke all on function ops.record_ne_registration_check(text) from public;
+
+-- 権限 (0063 と同じ形)。create or replace は今の権限を残す = 照合の確かめは watch_writer だけ (流し直し)・新しい部品はだれにも渡さない
+do $$ begin
+  if exists (select 1 from pg_roles where rolname = 'watch_writer') then
+    execute 'grant execute on function ops.record_ne_registration_check(text) to watch_writer';
+  end if;
+end $$;

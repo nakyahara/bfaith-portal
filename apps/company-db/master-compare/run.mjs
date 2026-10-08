@@ -217,8 +217,11 @@ export function regSummary(ne) {
  * 0063 の確かめの答えの知らせ (知らせるだけ = 照合は失敗にしない)。無ければ null。コードは 5 件まで
  *   not_imported = 配ってから日がたっても NE に無い (申告なし・「無い」を信じてよい取得) = 取り込まれていないらしい
  *   needs_declaration = NE にあるが自動で確かめない (セット・JAN を送った・配った時の印が無い = #1659 Codex R1) = 申告すると確かめる
+ *   🆕 case_mismatch (0064・#1667 Codex R1 High) = NE のコードの書き方 (0041) が配ったコード (原文) と違う / 分からない = 比べない (状態を進めない)。⚠️ で出す
+ *     (配った大文字のコードが取り込まれず、NE で大文字小文字だけ違う商品が作られた など = NE の画面で確かめる)
  */
 const AUTO_BLOCK_JA = { jan_not_compared: 'JAN', set_not_compared: 'セット', no_issue_lease: '配った時の印なし', no_row: '行なし', no_item: '品目なし' };
+const SPELLING_JA = { case_mismatch: 'NE の書き方が違う', case_collided: 'NE に書き方が 2 つ以上', spelling_not_recorded: '書き方を確かめられない', spelling_invalid: '書き方が読めない' };
 export function notImportedNote(ne) {
   const w = ne && ne.registrations && ne.registrations.written;
   const codesOf = (list, label) => list.slice(0, 5).map((x) => x && x.code && (label ? `${x.code} ${label(x)}` : x.code)).filter(Boolean).join('・') + (list.length > 5 ? ` ほか ${list.length - 5}` : '');
@@ -227,6 +230,8 @@ export function notImportedNote(ne) {
   if (ni.length) parts.push(`ℹ️ 配ってから ${w.not_imported_days ?? 3} 日たっても NE に無い (取り込まれていないらしい) ${ni.length} 件 (${codesOf(ni)})`);
   const nd = w && Array.isArray(w.needs_declaration) ? w.needs_declaration : [];
   if (nd.length) parts.push(`ℹ️ NE にあるが自動では確かめない (取り込んだと申告すると確かめる) ${nd.length} 件 (${codesOf(nd, (x) => AUTO_BLOCK_JA[x.reason] || x.reason)})`);
+  const cm = w && Array.isArray(w.case_mismatch) ? w.case_mismatch : [];
+  if (cm.length) parts.push(`⚠️ NE のコードの書き方 (大文字・小文字) が配ったコードと違う・確かめられない = 確かめない ${cm.length} 件 (${codesOf(cm, (x) => `${SPELLING_JA[x.reason] || x.reason}${Array.isArray(x.ne_spellings) && x.ne_spellings.length ? ` NE は ${x.ne_spellings.join('/')}` : ''}`)})`);
   return parts.length ? parts.join('・') : null;
 }
 /**
@@ -409,6 +414,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       seal: result.ne.registrations.seal ?? null, counts: result.ne.registrations.written?.counts ?? null,
       not_imported: Array.isArray(result.ne.registrations.written?.not_imported) ? result.ne.registrations.written.not_imported.length : null,   // 0063: 配ってから日がたっても NE に無い (知らせるだけ)
       needs_declaration: Array.isArray(result.ne.registrations.written?.needs_declaration) ? result.ne.registrations.written.needs_declaration.length : null,   // 0063: NE にあるが申告が要る
+      case_mismatch: Array.isArray(result.ne.registrations.written?.case_mismatch) ? result.ne.registrations.written.case_mismatch.length : null,   // 0064: NE のコードの書き方が配ったコードと違う
       write_error: result.ne.registrations.write_error ?? null } : null);
     evidence = {
       state: 'complete', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt, finished_at: result.finished_at,
