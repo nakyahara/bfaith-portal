@@ -6225,6 +6225,14 @@ let wfSetParentId = null;
       check('撮影判定: 「素材完了」は撮影不要にしても書き換えない', afterNoneReady === 'ready', JSON.stringify([afterNoneReady, ipSf()]));
       check('🚨 撮影判定: 撮影不要の「素材完了」は、撮影が要るに変えたら未設定に戻す (これから撮る素材はまだ無い・Codex PR-A 名指し6 High)',
         ipSf().shoot_mode === 'inhouse' && ipSf().material_status === null, JSON.stringify(ipSf()));
+      // 🚨 ③ が未完了でも、未判定を経由して撮影不要の素材完了を撮影が要るへ持ち越さない (名指し8 High)
+      await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'none' });
+      db.prepare(`UPDATE draft_image_production SET material_status = 'ready' WHERE draft_id = ?`).run(idSf);
+      await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: null });
+      const viaNullMat = ipSf().material_status;
+      await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'inhouse' });
+      check('🚨 撮影判定: 撮影不要 + 素材完了 → 未判定 → 社内撮影 でも素材完了は残らない',
+        viaNullMat === null && ipSf().shoot_mode === 'inhouse' && ipSf().material_status === null, JSON.stringify([viaNullMat, ipSf()]));
       // 撮影が要る判定のまま撮影の素材が揃った (素材完了) 状態を作る (以降の試験の前提)
       db.prepare(`UPDATE draft_image_production SET material_status = 'ready' WHERE draft_id = ?`).run(idSf);
       const badStatuses = [];
@@ -6320,6 +6328,10 @@ let wfSetParentId = null;
           rDoneShoot.status === 409 && rDoneNull.status === 409 && /③素材待ち/.test(rDoneShoot.json?.error || '')
           && ipDone().shoot_mode === 'none' && ipDone().material_status === 'not_required', JSON.stringify([rDoneShoot, rDoneNull, ipDone()]));
         db.prepare(`UPDATE draft_image_production SET material_status = 'ready' WHERE draft_id = ?`).run(idDone);
+        // 🚨 未判定を経由しても撮影不要の素材完了を持ち越させない (none/ready → null → photographer・Codex PR-A 名指し8 High)
+        const rViaNull = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: null });
+        check('🚨 撮影判定: 撮影不要の素材完了で ③ を完了したあと、未判定に戻すのも 409 (未判定を経由した持ち越しを防ぐ)',
+          rViaNull.status === 409 && ipDone().shoot_mode === 'none' && ipDone().material_status === 'ready', JSON.stringify([rViaNull, ipDone()]));
         const rDoneReady = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'photographer' });
         check('🚨 撮影判定: 撮影不要の素材完了で ③ を完了したあとも、撮影が要るへは変えられない (409・撮影の素材はまだ無い・名指し6 High)',
           rDoneReady.status === 409 && ipDone().shoot_mode === 'none' && ipDone().material_status === 'ready', JSON.stringify([rDoneReady, ipDone()]));

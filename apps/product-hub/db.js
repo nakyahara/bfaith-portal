@@ -2676,7 +2676,9 @@ export function setShootMode(db, draftId, mode, { actor = null, expected } = {})
     let material = materialAlignedToShootMode(m, before);
     // 「撮影不要」から未判定に戻した = 撮影不要と決めたのを取り消した。そろえた素材ステータスも取り消す
     // (未判定なのに ③素材待ち を通れる状態を残さない — Codex PR-A R1 P2)
-    if (m === null && cur.shoot_mode === 'none' && material === 'not_required') material = null;
+    // 撮影不要のときの素材完了 (今ある素材で揃った) も同じ。残すと「未判定 → 撮影が要る」を経由して、撮影前の
+    // 素材完了を持ち越せてしまう (Codex PR-A 名指し8 High)
+    if (m === null && cur.shoot_mode === 'none' && (material === 'not_required' || material === 'ready')) material = null;
     // 「撮影不要」のときの素材完了は「今ある素材で揃った」という意味。撮影が要るに変えたら、これから撮る素材は
     // まだ無いので未設定に戻す (古い素材完了を撮影済みの印として持ち越さない — Codex PR-A 名指し6 High)。
     // ③ が完了済みなら下の materialStepWouldBreak で 409 になり、先に ③ へ戻してもらう
