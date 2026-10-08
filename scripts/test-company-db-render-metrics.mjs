@@ -11,6 +11,7 @@
  *     値は本文の文字のままで整数の safe integer だけ (1073741824.00000001 ほか) / 400 ほか全部の非 200 / 理由の優先 (timeout が先・次に endpoint の順)
  *   🆕 #1600 R2: 本文は自前の厳密な JSON の読み方 (reviver の context.source を使わない = 本番の node:20-slim で動く)。Node 20 でも流す:
  *     npx -y node@20 scripts/test-company-db-render-metrics.mjs
+ *   🆕 #1653: apps の下で render-metrics の名前が出るファイルは明示の一覧 (NAME_ONLY_ALLOWED) とちょうど一致し、一覧のファイルでは許した行の文そのものだけ (行の数も一致)。完全な禁止の検査ではない (指定子に名前が文字で無い import は見えない)
  * 実行: node scripts/test-company-db-render-metrics.mjs
  */
 import assert from 'node:assert/strict';
@@ -449,18 +450,93 @@ await t('fixture に鍵らしい文字が無い', async () => {
 });
 
 console.log('使う所はまだ無い (利益の受け口は 503 のまま)');
-await t('apps の下でこの部品を import している所は無い・router は 503 の封じ込めのまま', async () => {
-  const hits = [];
-  const walk = (dir) => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (e.name === 'node_modules') continue;
-      const p = new URL(e.name + (e.isDirectory() ? '/' : ''), dir);
-      if (e.isDirectory()) walk(p);
-      else if (/\.(m?js|cjs)$/.test(e.name) && !p.pathname.endsWith('/profit/render-metrics.mjs') && /render-metrics/.test(fs.readFileSync(p, 'utf8'))) hits.push(p.pathname);
+// 名前の出る所を明示の一覧で見る (#1653 R2 で lexer をやめ、R3 で行の形の判定もやめた: 文字列の中の "/*" でコメントの中と読み違え、本物の import を通した)。
+// ① apps の下 (この部品の自身を除く) で render-metrics という文字を含むファイルの集合が NAME_ONLY_ALLOWED とちょうど一致すること。
+//   一覧に無いファイルに名前が出たら (コメントでも) 落ちる = 人が見て、import でなければ理由と行を書いて一覧に足す (fail-closed)。
+// ② 一覧のファイルで名前を含む行 (前後の空白を除いた文) の多重集合が、一覧の lines とちょうど一致すること。
+//   知らない行・行の数の違い・文が変わった・消えた、どれも落ちる = 許した行の文そのものだけを通す。人が見て一覧を直す。
+// 🚨 完全な禁止の検査ではない: 指定子に文字として render-metrics が無いもの (import(`./${name}.mjs`)・文字列の連結・変数・\x2d などの escape) は見えない。
+//   うっかりの直接の import を止めるための見張り。
+const NAME_ONLY_ALLOWED = new Map([
+  ['company-db/profit/response-contract.mjs', {
+    reason: '契約のコメントで METRICS_REASONS の出どころとして名前を書いているだけ (import しない)',
+    lines: ['* metrics の client (apps/company-db/profit/render-metrics.mjs の REASONS・PR 2 #1600) の理由のコード。'],
+  }],
+]);
+// files = [{ rel, text }] (rel は apps/ からの相対・/ 区切り) → 問題の一覧 (空なら ok)
+function renderMetricsNameProblems(files, allowed = NAME_ONLY_ALLOWED) {
+  const problems = [];
+  const withName = new Set(files.filter((f) => f.text.includes('render-metrics')).map((f) => f.rel));
+  for (const rel of withName) if (!allowed.has(rel)) problems.push(`一覧に無いファイルに名前がある (import でなければ理由と行を書いて NAME_ONLY_ALLOWED に足す): ${rel}`);
+  for (const rel of allowed.keys()) if (!withName.has(rel)) problems.push(`一覧にあるのに名前が無い (一覧から外す): ${rel}`);
+  for (const f of files) {
+    if (!allowed.has(f.rel)) continue;
+    const count = new Map();
+    for (const line of f.text.split(/\r?\n/)) {
+      const s = line.trim();
+      if (s.includes('render-metrics')) count.set(s, (count.get(s) ?? 0) + 1);
     }
-  };
-  walk(new URL('../apps/', import.meta.url));
-  assert.deepEqual(hits, []);
+    for (const s of allowed.get(f.rel).lines) count.set(s, (count.get(s) ?? 0) - 1);
+    for (const [s, d] of count) if (d !== 0) problems.push(`${f.rel}: 許した行と違う (${d > 0 ? `一覧より ${d} 行多い` : `一覧より ${-d} 行少ない`}): ${s}`);
+  }
+  return problems;
+}
+const APPS_DIR = new URL('../apps/', import.meta.url);
+const APPS_JS = [];
+(function walk(dir) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (e.name === 'node_modules') continue;
+    const p = new URL(e.name + (e.isDirectory() ? '/' : ''), dir);
+    if (e.isDirectory()) walk(p);
+    else if (/\.(m?js|cjs)$/.test(e.name)) APPS_JS.push(p);
+  }
+})(APPS_DIR);
+const appsFiles = () => APPS_JS
+  .map((p) => ({ rel: decodeURIComponent(p.href.slice(APPS_DIR.href.length)), text: fs.readFileSync(p, 'utf8') }))
+  .filter((f) => f.rel !== 'company-db/profit/render-metrics.mjs');
+await t('名前の見張りの見分け: 一覧の外は (コメントでも) 落ちる・一覧のファイルは許した行の文そのものだけ通る (#1653 R2・R3)', async () => {
+  const base = appsFiles();
+  assert.ok(base.length > 100, `apps の下の JS が ${base.length} 個しか無い`);
+  const RC = 'company-db/profit/response-contract.mjs';
+  assert.ok(base.some((f) => f.rel === RC), '一覧のファイルが見つからない');
+  assert.deepEqual(renderMetricsNameProblems(base), []);
+  const addFile = (rel, text) => [...base, { rel, text }];
+  const editRc = (fn) => base.map((f) => (f.rel === RC ? { ...f, text: fn(f.text) } : f));
+  const fails = (files, re, label) => { const p = renderMetricsNameProblems(files); assert.ok(p.some((x) => re.test(x)), `${label}: ${JSON.stringify(p)}`); };
+  // 一覧の外 → 落ちる
+  fails(addFile('company-db/other.mjs', '// render-metrics を後で使う\nexport const x = 1;\n'), /一覧に無いファイル/, '一覧の外のコメント');
+  fails(addFile('company-db/lazy.mjs', "count++ / 2; import('./render-metrics.mjs'); // it's lazy\n"), /一覧に無いファイル/, 'R2 の例を一覧の外に');
+  fails(addFile('company-db/profit/x.mjs', "import /* side effect */ './render-metrics.mjs';\r\n"), /一覧に無いファイル/, '一覧の外の import');
+  // 一覧のファイルに許していない行 → 落ちる (コードの行も、名前のあるコメントの行も)
+  for (const add of [
+    "import { REASONS } from './render-metrics.mjs';",
+    "/* c */ import './render-metrics.mjs';",
+    "/* render-metrics の REASONS */ import { REASONS } from './render-metrics.mjs';",
+    "export * from /* x */ './render-metrics.mjs';",
+    'const m = await import(`./render-metrics.mjs`);',
+    "import {\r\n  REASONS,\r\n} from './render-metrics.mjs';",
+    "/**\r\n * 説明\r\n */ import './render-metrics.mjs';",
+    "const k = 2\r\n  * require('./render-metrics').n;",
+    "count++ / 2; import('./render-metrics.mjs'); // it's lazy",
+    // R3 の例: 文字列の中の "/*" の後の、行頭が * の本物の import
+    'const marker = "/*";\r\nconst loaders = {\r\n  *load() { return yield import("./render-metrics.mjs"); },\r\n};',
+    '// render-metrics の REASONS と同じ',
+    '/*\r\n * render-metrics の説明\r\n */',
+  ]) fails(editRc((s) => `${s}\r\n${add}\r\n`), /許した行と違う/, add);
+  // 許した行の文を 1 文字変える → 落ちる / 許した行と同じ文をもう 1 行足す → 落ちる (数が違う)
+  const allowedLine = NAME_ONLY_ALLOWED.get(RC).lines[0];
+  assert.ok(allowedLine.includes('#1600'));
+  fails(editRc((s) => s.split('PR 2 #1600').join('PR 2 #1601')), /許した行と違う/, '許した行の文を 1 文字変える');
+  fails(editRc((s) => `${s}\r\n/**\r\n ${allowedLine}\r\n */\r\n`), /一覧より 1 行多い/, '許した行と同じ文をもう 1 行');
+  // 名前の無いコメントの行を足す → 通る
+  for (const add of ['// REASONS と同じ', '/** 説明 */', '/*\r\n * 説明\r\n */']) {
+    assert.deepEqual(renderMetricsNameProblems(editRc((s) => `${s}\r\n${add}\r\n`)), [], add);
+  }
+  // 一覧のファイルから名前が消えた → 落ちる (一覧はちょうど一致)
+  fails(editRc((s) => s.split('render-metrics').join('render_metrics')), /一覧にあるのに名前が無い/, '名前が消えた');
+});
+await t('apps の下で render-metrics の名前が出るのは一覧のファイルの許した行だけ (完全な禁止の検査ではない)・router は 503 の封じ込めのまま', async () => {
+  assert.deepEqual(renderMetricsNameProblems(appsFiles()), []);
   const router = fs.readFileSync(new URL('../apps/company-db/router.mjs', import.meta.url), 'utf8');
   assert.match(router, /router\.get\(`\/amazon-profit\/\$\{kind\}`, requireSyncKey, \(req, res\) => res\.status\(503\)\.json\(PROFIT_ROUTE_DISABLED\)\)/);
 });
