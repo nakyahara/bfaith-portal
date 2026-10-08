@@ -430,6 +430,7 @@ node -r dotenv/config scripts/company-db/amazon-map-migrate.mjs --apply --expect
   **2026-10-08 08:40 の本番 (watcher で読んだ) = 2 件の出品 (listing 17230 = `…_0004`・14904 = 練り香水の大文字 / 小文字の名前) とも構成 0 行 = 止まらない**。将来 1 件でも出たら人が見て決める
 - 移行の後・持ち主を company にする前に持ち主 load の夜間ロードが流れると、Sheet から構成を作ることがある (Sheet の写しが凍結 `fba_sheetless_state.sheet_frozen = 1` でない間)。
   ハッシュは対応のある出品しか見ない = 気づかない → **widen の check と widen (3 つの鍵の後の beforeCall) が今の fba.db (DATA_DIR) を読み直し、同じ「構成が 1 行でもある」を照らして断る**
+  (widen は鍵を取った後に fba.db を読んで続けて Company DB を読む = 鍵を待つ間に fba.db が変わっても見落とさない・#1651 Codex R4 High)
   (`sheet_only_has_components` / `AMAZON_MAP_SHEET_ONLY_HAS_COMPONENTS`・fba.db が読めない = 通さない)。人が見て決めてから widen。
   Amazon の構成 (`listing_components.amazon`) を company にする **activate (frozen の道) は断る** = widen の道だけ (`master-ownership-epoch.mjs`)
 - 同じ構成の行は時刻 (created_at / updated_at) だけそろえる = 変更の記録・出品の version を増やさない (0049 の印を増やさない)。FBM の完全一致など古い表に無い行は消す

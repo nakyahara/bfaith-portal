@@ -150,7 +150,7 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
           if (!r.amazon_map.match) { r.ok = false; r.problems = [...(r.problems || []), `amazon_map_hash: 古い表 ${r.amazon_map.legacy_hash || r.amazon_map.error} と Company DB ${r.amazon_map.company_hash || r.amazon_map.error} のハッシュが違う`]; }
           // 🆕 #1651: 今の fba.db の Sheet にだけある SKU の出品 (対応なし) に構成が 1 行でもある = ok: false (出どころによらない・人が見て決める。widen も鍵の後に同じく照らす)
           try {
-            const rows = await M.sheetOnlyComponents(c.db, await readSheetOnly({ dataDir: dataDirC, legacy }));
+            const rows = await M.freshSheetOnlyComponents(c.db, () => readSheetOnly({ dataDir: dataDirC, legacy }));   // widen と同じ読み方 (fba.db を読んで続けて Company DB)
             r.amazon_map.sheet_only_components = rows.length;
             if (rows.length) { r.ok = false; r.problems = [...(r.problems || []), `sheet_only_has_components: Sheet にだけある SKU の出品に構成が ${rows.length} 行ある (${rows.slice(0, 3).map((x) => `${x.listing_code}→${x.sku_code} (${x.source ?? '?'})`).join('・')})。人が見て決めてから`]; }
           } catch (e) {
@@ -231,11 +231,11 @@ export async function cli(argv, { env = process.env, connect = null, openSqlite 
       // 🆕 0059: Amazon の対応を足す試み = 古い表を読んでおき、鍵の後に同じ取引で Company DB を読んでハッシュを照らす (違えば広げない)
       const open = await readOpenWidenAttempt(c.db);
       const amazon = !!open && open.widen_prepare_id === attemptId && (open.added_keys || []).includes(AMAZON_KEY);
-      //   #1651: 今の fba.db の Sheet にだけある SKU も読み、鍵の後にその出品 (対応なし) に構成が 1 行も無いかも照らす (ある = 広げない・読めない = 広げない)
+      //   #1651: 鍵の後に今の fba.db を読み直し (鍵の前の一覧は使わない = R4 High)、その出品 (対応なし) に構成が 1 行も無いかも照らす (ある = 広げない・読めない = 広げない)
       let step = null;
       if (amazon) {
         const legacy = await readLegacy({ dataDir, sqlite });
-        step = (await import('../../lib/amazon-map-migrate.mjs')).amazonWidenEvidenceStep(legacy, { sheetOnly: await readSheetOnly({ dataDir, legacy }) });
+        step = (await import('../../lib/amazon-map-migrate.mjs')).amazonWidenEvidenceStep(legacy, { readSheetOnly: () => readSheetOnly({ dataDir, legacy }) });
       }
       // 判定は DB (ops.widen_master_ownership が鍵の後に本体を呼ぶ)。夜間ロードの最中は 5 秒で諦める (lock_timeout)
       const r = await widenOwnership(c.db, { attemptId, companyId, actor, evidence: { ...e.evidence, prepared_at: st.prepared.prepared_at }, beforeCall: step ? step.beforeCall : null });
