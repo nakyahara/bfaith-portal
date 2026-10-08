@@ -1733,6 +1733,58 @@ await ta('[L3] 期限つきのファイルの取得 (PR-1 の ops.ne_reg_file・
   await supersede(x.export.export_id);
 });
 
+await ta('[LZ1] 2026-10-08 中原さん: 商品の画面でロジザードの有効期限・入荷日の管理を直せるのは下書きの間 (NE 登録の CSV を配る前) だけ・変更の記録・版・作っただけ (built) は直せる・配った後 / 下書きでない = 409 logizard_locked・DB (0062) も同じ', async () => {
+  await reg('single', 'new-lz1', single({ name: 'LZ1', expiry_managed: '0' }));
+  const lzProduct = async (code) => one('select p.product_id::text as id, p.expiry_managed, p.inbound_date_managed from core.products p join core.skus s on s.product_id = p.product_id where s.code = $1', [code]);
+  // 下書き = 直せる: 商品の行・変更の記録 (人・request_id・理由)・編集の印が変わる
+  const t0 = await tokenOf('new-lz1');
+  const rid = uuid();
+  const r = await save('new-lz1', { expiry_managed: '1', inbound_date_managed: '1' }, { requestId: rid, reason: '期限あり' });
+  assert.deepEqual(r.changed.map((c) => [c.field, c.from, c.to]), [['expiry_managed', false, true], ['inbound_date_managed', null, true]]);
+  assert.deepEqual(r.ne_steps, [], 'NE へ送らない欄 = NE でやることは無い');
+  assert.deepEqual(await lzProduct('new-lz1').then((x) => [x.expiry_managed, x.inbound_date_managed]), [true, true]);
+  const ev = await q("select attribute, actor_id, reason_text from events.master_change_events where request_id = $1 and entity_type = 'product' order by attribute", [rid]);
+  assert.deepEqual(ev.map((x) => x.attribute), ['expiry_managed', 'inbound_date_managed']);
+  assert.ok(ev.every((x) => x.actor_id === 'naka@test' && x.reason_text === '期限あり'), JSON.stringify(ev));
+  assert.notEqual(await tokenOf('new-lz1'), t0, '編集の印が変わる');
+  // 版: 古い編集の印 = 409 version_conflict / 形: 空・ほかの値 = 400 / 同じ値 = 変わりなし
+  await rejectsWith(as(E, 'master_edit', () => W.saveSku(db, { actor: 'naka@test', requestId: uuid(), code: 'new-lz1', reason: null, seen: { token: t0 }, values: { expiry_managed: '0' } },
+    { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES })), 409, 'version_conflict');
+  for (const v of [{ inbound_date_managed: '' }, { expiry_managed: 'maybe' }]) await rejectsWith(save('new-lz1', v), 400, 'invalid_input');
+  assert.equal((await save('new-lz1', { expiry_managed: '1' })).no_change, true);
+  // 作っただけ (built) = 直せる (NE 登録の CSV の列に無い = ファイルも閉じない)
+  const x = await build('products', ['new-lz1']);
+  assert.equal((await save('new-lz1', { expiry_managed: '0' })).ok, true);
+  assert.deepEqual((await itemsOf(x.export.export_id)).map((i) => i.state), ['built'], '作っただけのファイルはそのまま');
+  // 配った (issued) = 409 logizard_locked・何も変わらない・ほかの欄 (推奨保有月数) は今までどおり直せる
+  await issue(x.export.export_id);
+  const e = await rejectsWith(save('new-lz1', { expiry_managed: '1' }), 409, 'logizard_locked');
+  assert.match(e.message, new RegExp('#' + x.export.export_id)); assert.equal(e.extra.field, 'expiry_managed');
+  const e2 = await rejectsWith(save('new-lz1', { inbound_date_managed: '0', reorder_months: '2' }), 409, 'logizard_locked');
+  assert.equal(e2.extra.field, 'inbound_date_managed');
+  assert.deepEqual(await lzProduct('new-lz1').then((p) => [p.expiry_managed, p.inbound_date_managed]), [false, true]);
+  assert.equal((await save('new-lz1', { reorder_months: '2' })).ok, true);
+  // 画面と保存は同じ決まり (logizardLockOf)
+  const lk = await W.logizardLockOf(db, await W.readCurrent(db, await skuId('new-lz1'), TODAY));
+  assert.deepEqual([lk.why, lk.exports], ['reg', [String(x.export.export_id)]]);
+  // DB (0062): 画面のロールが保存の約束の中で直接書いても、配った後は断る / 持ち主 (夜間ロード・運用) は今までどおり
+  const p1 = await lzProduct('new-lz1');
+  const sid1 = await skuId('new-lz1');
+  await code42501(asFakeSession('sku_edit', () => pg.query('update core.products set expiry_managed = true where product_id = $1', [p1.id]), { skuId: sid1, products: [p1.id] }), /logizard_locked/);
+  await pg.query('begin'); await pg.query('update core.products set expiry_managed = true where product_id = $1', [p1.id]); await pg.query('rollback');
+  // 下書きでない (登録をやめた) = 断る (アプリ・DB)。下書き = DB も通す。入荷日の管理を空 (不明) に戻すのは下書きでも断る
+  await reg('single', 'new-lz2', single({ name: 'LZ2', expiry_managed: '1', inbound_date_managed: '1' }));
+  const p2 = await lzProduct('new-lz2'); const sid2 = await skuId('new-lz2');
+  await asFakeSession('sku_edit', () => pg.query('update core.products set expiry_managed = false where product_id = $1', [p2.id]), { skuId: sid2, products: [p2.id] });
+  await code42501(asFakeSession('sku_edit', () => pg.query('update core.products set inbound_date_managed = null where product_id = $1', [p2.id]), { skuId: sid2, products: [p2.id] }), /空 \(不明\) に戻さない/);
+  const lkLoaded = await W.logizardLockOf(db, await W.readCurrent(db, await skuId('s001'), TODAY));
+  assert.equal(lkLoaded.why, 'state', '前からある商品 (下書きでない) = ロジザードが正');
+  await rejectsWith(save('s001', { expiry_managed: '1' }), 409, 'logizard_locked');
+  await code42501(asFakeSession('sku_edit', async () => { const pid = (await one("select product_id::text as id from core.skus where code = 's001'")).id; return pg.query('update core.products set expiry_managed = true where product_id = $1', [pid]); },
+    { skuId: await skuId('s001'), products: [(await one("select product_id::text as id from core.skus where code = 's001'")).id] }), /logizard_locked/);
+  await supersede(x.export.export_id);
+});
+
 try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch { /* Windows で開いたままのことがある */ }
 console.log(`\n${passed} 件 ok`);
 if (process.exitCode) console.log('NG があります');

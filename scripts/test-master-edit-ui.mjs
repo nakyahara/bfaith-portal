@@ -1027,6 +1027,24 @@ await ta('[35b] 新商品の登録 (2026-10-08 中原さん): 発送方法を選
   assert.equal((await pg.query("select count(*)::int as n from core.supplier_skus x join core.skus s on s.sku_id = x.sku_id where s.code = 'ui-noship-1' and x.is_primary")).rows[0].n, 1);
 });
 
+await ta('[35c] 商品の画面 (2026-10-08 中原さん): 下書き ([35b] の ui-noship-1) はロジザードの有効期限・入荷日の管理を切り替えで直せる (未保存・前 → 後・保存・知らせ)・前からある商品 (s001) は 🔒 と理由・出品カードの板', async (p) => {
+  await p.goto(B + '/sku/ui-noship-1');
+  assert.equal(await p.getAttribute('#p-logi [data-field="expiry_managed"]', 'data-value'), '0');
+  await p.click('[data-field="expiry_managed"] button[data-v="1"]');
+  await p.click('[data-field="inbound_date_managed"] button[data-v="1"]');
+  assert.equal(await dirty(p), 2);
+  assert.match(await p.textContent('#save-diff'), /ロジザードの有効期限の管理[\s\S]*ロジザードの入荷日の管理/);
+  await p.click('#save');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /ロジザードの有効期限の管理: なし → あり/);
+  assert.deepEqual((await pg.query("select p.expiry_managed, p.inbound_date_managed from core.products p join core.skus s on s.product_id = p.product_id where s.code = 'ui-noship-1'")).rows[0], { expiry_managed: true, inbound_date_managed: true });
+  assert.equal(await p.getAttribute('[data-field="expiry_managed"]', 'data-value'), '1', '読み直した後は保存した値');
+  assert.ok(await p.isVisible('#p-card'), '出品カードの板');
+  await p.goto(B + '/sku/s001');
+  assert.equal(await p.locator('[data-field="expiry_managed"]').count(), 0, '下書きでない = 切り替えを出さない');
+  assert.match(await p.textContent('[data-row="expiry_managed"]'), /ロジザードが正/);
+});
+
 await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない・構成品のコードで名前と計算の見込み (8% と 10% = 8%・分類は小さい番号・原価の合計)・並べ替えで読み上げの名前・あと N つ', async (p) => {
   // ui-new-1 ([35] で登録) の売上分類を空にする = 「売上分類が未入力の構成品」(0061 の前の下書き・NE から来た空の商品と同じ形。下で導けない構成に使う)
   await pg.query("update core.products set sales_class = null where display_code = 'ui-new-1'");

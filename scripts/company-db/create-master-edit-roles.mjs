@@ -87,7 +87,8 @@ export const FBA_STOCK_SELECT = Object.freeze(['snapshots.stock_capture_days', '
 /** 保存の経路で書く表・列 (lib/master-write.mjs の saveSku)。insert も列を絞る */
 export const MASTER_EDIT_WRITE = [
   ['update (name, tax_rate, tax_class, handling, standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy, reorder_months, set_sales_class_override, handling_own)', 'core.skus'],
-  ['update (name, status, sales_class, parent_product_id, parent_set_by)', 'core.products'],
+  // 🆕 0062 (2026-10-08): ロジザードの最初の値 (expiry_managed / inbound_date_managed) は下書きの間だけ (DB の trigger trg_master_edit_logizard_flags が断る)
+  ['update (name, status, sales_class, parent_product_id, parent_set_by, expiry_managed, inbound_date_managed)', 'core.products'],
   ['insert (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id), update (is_primary)', 'core.supplier_skus'],
   ['insert (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, reason, created_by_type, created_by_id), update (valid_to), delete', 'core.sku_costs'],
   ['insert (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, error, started_at)', 'ops.master_edit_requests'],

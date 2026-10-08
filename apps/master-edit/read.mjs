@@ -14,7 +14,7 @@ import { salesOfCodes } from './sales-qty.mjs';
 import { checkDeadline, ListTimeoutError } from './deadline.mjs';
 import { normProductCode } from '../purchase-orders/db.js';
 import { TOKEN_RE } from './search-token.mjs';
-import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES } from '../../lib/master-write.mjs';
+import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES, logizardLockOf } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
@@ -541,6 +541,8 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = null
     // 最近の変更 (画面の右の「最近の変更」と見出しの「最後に直した人」)。新しい順
     const recent = (await changesSince(db, { skuId: id, productId: cur.product_id, sinceEventId: null, limit: 30 })).reverse();
     const locks = await readFieldLocks(db, cur);
+    // ロジザードの最初の値 (有効期限・入荷日の管理) を直せない理由 (直せる = null・下書きの間だけ。保存の確かめと同じ logizardLockOf)
+    locks.logizard = cur.sku_kind === 'single' ? await logizardLockOf(db, cur) : null;
     // 0057: 登録日 (見出しに出すだけ。保存の確かめ = editTokenOf には入れない)。0057 の前の DB = null
     const registered = (await hasRegisteredOn(db))
       ? (await db.query('select registered_on::text as date, registered_on_source as source from core.skus where sku_id = $1', [id])).rows[0] : null;

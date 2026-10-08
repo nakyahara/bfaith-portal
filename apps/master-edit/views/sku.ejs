@@ -145,7 +145,7 @@
     <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= closedWhy %>)</div><div class="hint">見るだけです。切替日までは、この商品の正は NE・/register です。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
     <% if (c.sku_kind === 'exception') { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">例外の SKU (NE に無い商品) はこの画面では直せません。</div></div><% } %>
-    <% if (reg === 'draft' && !page.locks.regExports.length) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">下書きです (新商品の登録)</div><div class="hint">NE・ロジザードへの登録はまだです。値はこの画面で直せます。NE への登録は「NE 登録の CSV」で行います。</div></div><a class="btn sm" href="<%= base %>/reg-csv">NE 登録の CSV を開く</a></div><% } %>
+    <% if (reg === 'draft' && !page.locks.regExports.length) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">下書きです (新商品の登録)</div><div class="hint">NE・ロジザードへの登録はまだです。値はこの画面で直せます (ロジザードの有効期限・入荷日の管理も、NE 登録の CSV を配るまでは直せます)。NE への登録は「NE 登録の CSV」で行います。</div></div><a class="btn sm" href="<%= base %>/reg-csv">NE 登録の CSV を開く</a></div><% } %>
     <% if (cancelled) { %><div class="callout warn" id="cancelled-band"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">この商品は登録をやめました (やめた)</div><div class="hint">登録をやめた商品は直せません (見るだけです)。使うときは、新しい商品として登録し直してください。</div></div></div><% } %>
     <% if (reg === 'quarantined') { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">要確認</div><div class="hint">切替の後に夜間の処理が NE で見つけた、登録の記録の無い商品です。業務ではまだ使えません。</div></div></div><% } %>
     <% if (page.locks.regExports.length) { %>
@@ -223,7 +223,16 @@
           <%- row('reorder_months', '推奨保有月数', '<span class="stepper"><button type="button" data-step="-1" aria-label="1 か月へらす">−</button><input id="f-reorder_months" inputmode="decimal" autocomplete="off" ' + meta('reorder_months') + ' data-unit=" か月" value="' + h(c.reorder_months ?? '') + '" placeholder="—"><button type="button" data-step="1" aria-label="1 か月ふやす">＋</button></span><span class="unit">か月</span>', c.reorder_months == null ? '未入力' : c.reorder_months + ' か月', { forId: 'f-reorder_months', hint: '発注の目安に使います (0〜60・小数は 1 桁まで)' }) %>
           <% if (c.sku_kind === 'single') { %>
             <%- row('jan', 'JAN', '<div class="ctl col" style="gap:6px;width:100%"><div class="tokens" id="jan-tokens" role="group" aria-labelledby="lab-jan">' + page.jan.map((j) => '<span class="tok" data-jan="' + h(j) + '"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>' + h(j) + '<button type="button" aria-label="JAN ' + h(j) + ' を外す">×</button></span>').join('') + '<input id="jan-in" inputmode="numeric" autocomplete="off" aria-label="JAN を足す (8 桁か 13 桁)" placeholder="JAN を足す (8 桁か 13 桁) → Enter"></div><input type="hidden" id="f-jan" ' + meta('jan') + ' value="' + h(page.jan.join(', ')) + '"><span class="fmsg" id="jan-msg" aria-live="polite"></span><span class="hint">桁とチェック数字をその場で確かめます · ほかの商品の JAN は入れられません · 5 つまで · ロジザード・product-hub でも使います。NE の JAN は NE の画面で</span></div>', page.jan.length ? page.jan.join('・') : 'なし', { mono: true }) %>
-            <div class="f"><div class="lab">ロジザード</div><div class="ctl"><%- lockval('有効期限の管理 ' + (c.expiry_managed ? 'あり' : 'なし') + ' · 入荷日の管理 ' + (c.inbound_date_managed == null ? '不明' : (c.inbound_date_managed ? 'あり' : 'なし'))) %><span class="hint">ロジザードが正 (ここでは見るだけ)</span></div></div>
+            <%# ロジザードの最初の値 (2026-10-08 中原さん「下書きの状態なら、ロジザードの期限管理の情報とかも編集できるように」): 下書き かつ NE 登録の CSV を配る前だけ直せる。
+                配った後・NE 登録待ちより先はロジザードが正 = 🔒 で理由を出す (保存も 409 logizard_locked・DB も 0062 で断る) %>
+            <% const LG = page.locks.logizard; const flagText = (v) => (v == null ? '不明' : v ? 'あり' : 'なし');
+               const lgWhy = !LG ? '' : LG.why === 'reg' ? 'NE 登録の CSV (ファイル ' + LG.exports.map((x) => '#' + x).join('・') + ') を配ったので、ロジザードが正 (ロジザードの画面で直す)' : 'ロジザードが正 (ここで直せるのは新商品の下書きの間だけ)'; %>
+            <% for (const [f, label, hint] of [['expiry_managed', 'ロジザードの有効期限の管理', '賞味期限・使用期限のある商品は あり'], ['inbound_date_managed', 'ロジザードの入荷日の管理', '']]) { const can = editable(f) && !LG; %>
+            <div class="f" data-row="<%= f %>"><div class="lab" id="lab-<%= f %>"><%= label %></div><div class="ctl">
+              <% if (can) { %><%- seg(f, c[f] == null ? '' : (c[f] ? '1' : '0'), [['0', 'なし'], ['1', 'あり']]) %><% if (c[f] == null) { %><span class="misslabel"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ決めていません</span><% } %><span class="hint">下書きの間だけ直せます · NE 登録の CSV を配った後はロジザードが正<%= hint ? ' · ' + hint : '' %></span>
+              <% } else { %><%- lockval(flagText(c[f])) %><%- LG ? '<span class="lockwhy">' + h(lgWhy) + '</span>' : lockWhy(f) %><% } %>
+            </div></div>
+            <% } %>
           <% } %>
         </section>
 
@@ -372,6 +381,19 @@
           </div>
         </details>
       <% } %>
+        <%# 出品カードの欄 (2026-10-08 中原さん「新規登録で入れる項目は商品の画面でも変更できるように」): 公式ページ URL・Amazon URL・ASIN・参考 URL・セット商品を作るか・Yahoo! は
+            登録のあと product-hub のカードが正 (この画面に写しを持たない = 2 つの正を作らない)。ここではどれがカードにあるかを見せ、カードへ飛ぶ %>
+        <% const pcr = page.card && page.card.result ? page.card.result : {}; const cardId = page.card && page.card.status === 'done' && pcr.draft_id ? pcr.draft_id : null; %>
+        <section class="panel" id="p-card" aria-labelledby="h-card">
+          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-tag"/></svg></span><h2 id="h-card">出品カード (product-hub)</h2><span class="sub">URL・ASIN・Yahoo! はカードで直します</span></div>
+          <div class="f wide" data-row="card"><div class="lab">カードにある欄</div><div class="ctl col" style="gap:8px">
+            <span class="cardfields"><% for (const t of ['公式ページ URL', 'Amazon URL', 'ASIN', '参考 URL', ...(isSet ? [] : ['セット商品を作るか']), 'Yahoo!売価・配送方法・カテゴリ・path']) { %><span class="linkchip"><%= t %></span><% } %></span>
+            <% if (cardId) { %><a class="btn soft" id="card-open" href="/apps/product-hub/detail/<%= cardId %>" target="_blank" rel="noopener"><svg class="ic" aria-hidden="true"><use href="#i-ext"/></svg>product-hub でカードを開いて直す</a>
+            <% } else if (page.card) { %><span class="hint" id="card-wait">カードはまだできていません (<%= CARD_STATUS_LABELS[page.card.status] || page.card.status %>)。右の「この商品の登録」で作り直せます。できたらここにカードを開くボタンが出ます。</span>
+            <% } else { %><a class="btn soft" id="card-board" href="/apps/product-hub/" target="_blank" rel="noopener"><svg class="ic" aria-hidden="true"><use href="#i-ext"/></svg>product-hub のボードで <%= c.code %> のカードを探す</a><span class="hint">この商品は登録のときにカードを作っていません (NE から来た商品・「作らない」を選んだ商品)</span><% } %>
+            <span class="hint">登録の画面で入れた値は、登録のあと product-hub のカードに入ります。それからはカードが正です (ここに写しは持ちません)</span>
+          </div></div>
+        </section>
       </div>
 
       <aside class="side" aria-label="保存と関わり">
