@@ -453,7 +453,7 @@ await ta('[12] 変わった項目が無い保存 (6 → 6.0) の後は未保存�
 await ta('[13] 登録をやめた商品は、カードの操作 (もう一度作る) も出さない', async (p) => {
   const MR = await import('../lib/master-register.mjs');
   await as('master_edit', () => MR.registerNewSku(db, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'ui-card-1',
-    values: { name: 'カードの試験', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001' }, card: { create: true } },
+    values: { name: 'カードの試験', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', sales_class: '3', expiry_managed: '0', reorder_months: '1' }, card: { create: true } },
   { ownership: ALL, open: true, shippingRates: RATES }));
   await p.goto(B + '/sku/ui-card-1');
   assert.equal(await p.locator('#card-retry').count(), 1, '下書きのうちは出す (名簿の人)');
@@ -936,6 +936,11 @@ await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP �
 });
 
 // ─── 第 2 段 (10/5): 新商品の登録・Amazon SKU・NE 登録の CSV・変更の記録 を新しいデザインに ───
+/** 🆕 0061 (2026-10-08 中原さん): 下書きの保存で要る欄 = 単品の売上分類・ロジザードの有効期限の管理・推奨保有月数 / セットの推奨保有月数 */
+const fillReq = async (p, { set = false } = {}) => {
+  if (!set) { await p.click('#f-sales_class button[data-v="3"]'); await p.click('#f-expiry button[data-v="0"]'); }
+  await p.fill('#f-reorder_months', '1');
+};
 const skuRow = async (code) => (await pg.query('select s.name, s.standard_price_jpy::int as price, s.tax_rate::float8 as tax, s.shipping_code from core.skus s where s.code = $1', [code])).rows[0];
 const mapOf = async (sku) => (await pg.query('select m.name, m.state from core.amazon_sku_maps m where m.seller_sku = $1', [sku])).rows[0];
 
@@ -944,9 +949,9 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   await Promise.all([p.waitForNavigation(), p.click('.ph-actions a:has-text("新しい単品")')]);
   assert.match(p.url(), /new\?kind=single$/);
   assert.equal(await dirty(p), 0);
-  assert.match(await p.textContent('#remain'), /あと\s*5\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*8\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
-  assert.match(await p.textContent('#save'), /あと 5 つ: 商品コード/);
+  assert.match(await p.textContent('#save'), /あと 8 つ: 商品コード/);
   await p.fill('#reason', '理由だけ');
   assert.equal(await dirty(p), 0, '保存の理由は数えない');
   await p.click('#checklist button:has-text("税率")');
@@ -962,13 +967,17 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   await p.waitForSelector('#code-msg.ok');
   await p.fill('#f-name', 'UI 新商品 1');
   await p.fill('#f-standard_price', '1280');
-  assert.match(await p.textContent('#save'), /あと 2 つ: 税率/);
+  assert.match(await p.textContent('#save'), /あと 5 つ: 税率/);
   await p.click('#f-tax_rate button[data-v="0.08"]');
   // 2026-10-08 中原さん: 代表の仕入先は ① (必須)・発送方法は ③ (あとでも可) = 発送方法を選んでも保存できない
   await p.selectOption('#shipping', 'S02');
-  assert.match(await p.textContent('#save'), /あと 1 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 4 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true, '代表の仕入先が無い = 押せない');
   await p.selectOption('#f-primary_supplier', '0001');
+  // 🆕 0061: 売上分類・推奨保有月数・ロジザードの有効期限の管理もそろうまで押せない
+  assert.match(await p.textContent('#save'), /あと 3 つ: 売上分類/);
+  assert.equal(await p.isDisabled('#save'), true);
+  await fillReq(p);
   assert.match(await p.textContent('#remain'), /下書きを保存できます/);
   assert.equal(await p.isDisabled('#save'), false);
   assert.equal(await p.locator('#jump a.todo').count(), 0, '飛び先の帯に黄色が残らない');
@@ -1006,9 +1015,10 @@ await ta('[35b] 新商品の登録 (2026-10-08 中原さん): 発送方法を選
   await p.fill('#f-name', '発送方法なしの単品');
   await p.fill('#f-standard_price', '990');
   await p.click('#f-tax_rate button[data-v="0.1"]');
-  assert.match(await p.textContent('#save'), /あと 1 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 4 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true);
   await p.selectOption('#f-primary_supplier', '0001');
+  await fillReq(p);
   assert.match(await p.textContent('#remain'), /下書きを保存できます/);
   assert.match(await p.textContent('#checklist'), /発送方法 \(届いてからでも可\)/);
   assert.equal(await p.locator('#checklist li.need').count(), 0, '発送方法は ① に無い');
@@ -1017,10 +1027,30 @@ await ta('[35b] 新商品の登録 (2026-10-08 中原さん): 発送方法を選
   assert.equal((await pg.query("select count(*)::int as n from core.supplier_skus x join core.skus s on s.sku_id = x.sku_id where s.code = 'ui-noship-1' and x.is_primary")).rows[0].n, 1);
 });
 
+await ta('[35c] 商品の画面 (2026-10-08 中原さん): 下書き ([35b] の ui-noship-1) はロジザードの有効期限・入荷日の管理を切り替えで直せる (未保存・前 → 後・保存・知らせ)・前からある商品 (s001) は 🔒 と理由・出品カードの板', async (p) => {
+  await p.goto(B + '/sku/ui-noship-1');
+  assert.equal(await p.getAttribute('#p-logi [data-field="expiry_managed"]', 'data-value'), '0');
+  await p.click('[data-field="expiry_managed"] button[data-v="1"]');
+  await p.click('[data-field="inbound_date_managed"] button[data-v="1"]');
+  assert.equal(await dirty(p), 2);
+  assert.match(await p.textContent('#save-diff'), /ロジザードの有効期限の管理[\s\S]*ロジザードの入荷日の管理/);
+  await p.click('#save');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /ロジザードの有効期限の管理: なし → あり/);
+  assert.deepEqual((await pg.query("select p.expiry_managed, p.inbound_date_managed from core.products p join core.skus s on s.product_id = p.product_id where s.code = 'ui-noship-1'")).rows[0], { expiry_managed: true, inbound_date_managed: true });
+  assert.equal(await p.getAttribute('[data-field="expiry_managed"]', 'data-value'), '1', '読み直した後は保存した値');
+  assert.ok(await p.isVisible('#p-card'), '出品カードの板');
+  await p.goto(B + '/sku/s001');
+  assert.equal(await p.locator('[data-field="expiry_managed"]').count(), 0, '下書きでない = 切り替えを出さない');
+  assert.match(await p.textContent('[data-row="expiry_managed"]'), /ロジザードが正/);
+});
+
 await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない・構成品のコードで名前と計算の見込み (8% と 10% = 8%・分類は小さい番号・原価の合計)・並べ替えで読み上げの名前・あと N つ', async (p) => {
+  // ui-new-1 ([35] で登録) の売上分類を空にする = 「売上分類が未入力の構成品」(0061 の前の下書き・NE から来た空の商品と同じ形。下で導けない構成に使う)
+  await pg.query("update core.products set sales_class = null where display_code = 'ui-new-1'");
   await p.goto(B + '/new?kind=set');
   assert.equal(await dirty(p), 0, '空の 2 行は数えない');
-  assert.match(await p.textContent('#remain'), /あと\s*4\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*5\s*つ/);
   const rows = p.locator('#comp-rows tr.comp-row');
   await rows.nth(0).locator('.c-code').fill('s001');
   await rows.nth(0).locator('.c-code').press('Enter');
@@ -1034,7 +1064,7 @@ await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない�
   assert.equal(await dirty(p), 1, '構成は 1 件 (中身どうし)');
   await rows.nth(1).locator('button[data-act="up"]').click();
   assert.equal(await rows.nth(0).locator('.c-qty').getAttribute('aria-label'), '1 行目 (s003) の数');
-  assert.match(await p.textContent('#remain'), /あと\s*3\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*4\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
   // 売上分類の上書き (#1628 Codex R1 M2): 構成品から導ける (3 と 1 = 1) 間は押せない
   const ovr = p.locator('#f-set_sales_class_override');
@@ -1067,6 +1097,7 @@ await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない�
   await p.fill('#f-name', '照合中の試験');
   await p.fill('#f-standard_price', '1500');
   await p.selectOption('#shipping', 'S02');
+  await fillReq(p, { set: true });
   await rows.nth(0).locator('.c-code').fill('ui-new-1');
   await rows.nth(0).locator('.c-code').press('Tab');
   await p.waitForFunction(() => /UI 新商品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
@@ -1098,6 +1129,7 @@ await ta('[40] 新商品の登録 (#1628 Codex R2 M2): カードを作らない�
   await p.click('#f-tax_rate button[data-v="0.1"]');
   await p.selectOption('#shipping', 'S01');
   await p.selectOption('#f-primary_supplier', '0001');
+  await fillReq(p);
   await p.click('#save');
   await p.waitForSelector('.result.err');
   assert.match(await p.textContent('.result.err'), /URL/);
@@ -1148,6 +1180,7 @@ await ta('[42] 新商品 (#1628 Codex R3 M2): 「作らない」の理由の欄�
   await p.click('#f-tax_rate button[data-v="0.1"]');
   await p.selectOption('#shipping', 'S01');
   await p.selectOption('#f-primary_supplier', '0001');
+  await fillReq(p);
   await p.click('#save');
   await p.waitForSelector('.result.err');
   assert.match(await p.textContent('.result.err'), /作らない理由を選んでください/);
@@ -1216,6 +1249,7 @@ await ta('[44] 新商品 (#1628 Codex R4 M2): カードを作らない + Yahoo! 
   await p.click('#f-tax_rate button[data-v="0.1"]');
   await p.selectOption('#shipping', 'S01');
   await p.selectOption('#f-primary_supplier', '0001');
+  await fillReq(p);
   await p.click('#save');
   assert.match(await p.textContent('#msg'), /Yahoo!売価は 1 円以上/);
   assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), true, 'Yahoo! の欄を開く');
@@ -1358,6 +1392,7 @@ await ta('[45] 新商品 (#1628 Codex R5 L1): Yahoo! の 1 行に 2 つある欄
   await p.click('#f-tax_rate button[data-v="0.1"]');
   await p.selectOption('#shipping', 'S01');
   await p.selectOption('#f-primary_supplier', '0001');
+  await fillReq(p);
   for (const [id, val, re] of [['y-price-sagawa', 'abc', /Yahoo!売価 \(佐川\)/], ['y-path', 'a\tb', /Yahoo!path/]]) {
     await p.evaluate(() => { document.getElementById('sec-yahoo').open = true; });
     await p.fill('#' + id, val);

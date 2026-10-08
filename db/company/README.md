@@ -2330,7 +2330,21 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 既にある行は変えない (0060 の前の下書きで代表の仕入先が空の単品はそのまま = 商品の画面で入れる。NE 登録の CSV は今までどおり「代表の仕入先が決まっていない」で止まる)
 - NE 登録の CSV (`ops.ne_reg_build` など)・照合 ② は変えない (単品の CSV `ne-reg-single-v1` に発送方法・送料の列は無い・照合も送料を比べない)
 - 当て方 (🚨 まだ流さない): コードを先に出しても動く (0060 の前の DB = 発送方法なしの登録は DB が `invalid_value: 送料コードと発送方法` で断る = 画面は 400・何も書かない。代表の仕入先は画面・API が先に断る) → `migrate.mjs --dry-run` (0060 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい
-### NE 登録の CSV の「取り込んだと申告」をなくす (0063・2026-10-08 中原さんの決定 a。🚨 番号は仮 = 0061 (#1661)・0062 (#1662) の後・マージの直前に空き番号へ)
+### 新商品の登録 = 下書きの保存で要る欄を足す (0061・2026-10-08 中原さん「下書き保存時にわかる内容だから必須にする」。🚨 番号は仮 = マージの直前に空き番号へ。#1659・#1616 も 0061 を使っている)
+
+- `ops.register_new_sku` (0060 の版) を create or replace で置き換える。0060 の本文との差は 2 か所 (4 行) だけ (`scripts/test-master-register.mjs` の [G-0061] が機械で確かめる)。署名・security definer・search_path・権限は同じ
+  - **単品は売上分類が要る** (1〜4): 無い = `invalid_value: 単品は売上分類が要る`。セットは今までどおり構成品から導く・導けないときだけ上書きが要る (`set_underivable`)
+  - **推奨保有月数が要る** (単品もセットも・0〜60・0 はよい): 無い = `invalid_value: 推奨保有月数が要る`
+  - ロジザードの有効期限の管理は 0052 から boolean が要る = 関数は変えない (画面・サーバーが「選ばないと なし」をやめた)。入荷日の管理は今までどおり無くてよい (null = 不明)
+- 既にある行は変えない (0061 の前の下書きで売上分類・推奨保有月数が空の単品はそのまま = 商品の画面で入れる)。NE 登録の CSV・照合 ② は変えない (どれも CSV の列に無い)
+- 当て方 (🚨 まだ流さない): コードを先に出しても動く (0061 の前の DB = 関数は空を許すが、画面・API が先に断る) → `migrate.mjs --dry-run` (0061 だけが出る) → 中原さんの OK → 本適用。ロールの script は流し直さなくてよい
+### 商品の画面で、下書きの間だけロジザードの 2 つを直す (0062・2026-10-08 中原さん「下書きの状態なら、ロジザードの期限管理の情報とかも編集できるようにする」。🚨 番号は仮)
+
+- `core.guard_master_edit_logizard_flags` + `trg_master_edit_logizard_flags` (core.products の BEFORE UPDATE OF expiry_managed, inbound_date_managed)。画面のロール master_edit が変えるときだけ見る: その商品の SKU が全部 登録の状態 = 下書き で、NE 登録の CSV を配った品目 (issued / import_declared / partial / verified) が無いときだけ通す。それ以外・入荷日の管理を空 (不明) に戻す = 42501 `logizard_locked`。ほかのロールは今までどおり (夜間ロードはこの 2 列を書かない = 0027)
+- アプリの決まり (`lib/master-write.mjs` の `logizardLockOf`・保存の 6c = 409 `logizard_locked`) と同じ。持ち主のキーは無い (load / company の取り合いが無い列)。段階・MASTER_EDIT_OPEN・DB の active・約束 (0051) の門はほかの欄と同じ
+- 列の update の権限 = `scripts/company-db/create-master-edit-roles.mjs` の MASTER_EDIT_WRITE (core.products に expiry_managed, inbound_date_managed を足した)
+- 当て方 (🚨 まだ流さない): 0061 の後。`migrate.mjs --dry-run` (0062 だけが出る) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (権限を足す。流し直す前は画面の保存が DB の permission denied = 500 で断られ、何も書かない) → コードを出す
+### NE 登録の CSV の「取り込んだと申告」をなくす (0063・2026-10-08 中原さんの決定 a。番号 = 0061 (#1661)・0062 (#1662) の後)
 
 - 申告 (sha256・結果) をしなくても、翌朝の照合 ② の `ops.record_ne_registration_check` が、配った (issued) だけの品目も確かめる。結び付け = **配った時刻 (`ne_reg_exports.issued_at`) より後に取った NE の完全な取得で、全部の列が配った値 (expected) と合う**
   - 取得が配った時刻より前 (同じ時刻も) = 比べない (waiting)・観測が信用できない = waiting

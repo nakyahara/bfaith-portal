@@ -191,11 +191,14 @@ async function makeDraftSku(code) {
     return id;
   });
 }
+// 🆕 0061 (2026-10-08 中原さん): 下書きの保存で要る欄 (単品の売上分類・有効期限の管理・推奨保有月数 / セットの推奨保有月数)。試験が入れていなければ足す (外す試験は undefined ではなく null を明示)
+const REQ_NEW = { single: { sales_class: '3', expiry_managed: '0', reorder_months: '1' }, set: { reorder_months: '1' } };
+const withReq = (kind, values) => (values && typeof values === 'object' && !Array.isArray(values) ? { ...(REQ_NEW[kind] || {}), ...values } : values);
 const reg = (kind, code, values, card = {}, o = {}) => asEditor(() => R.registerNewSku(db, {
-  actor: o.actor ?? 'Naka@Test', requestId: o.requestId ?? uuid(), kind, code, reason: o.reason ?? null, values, card,
+  actor: o.actor ?? 'Naka@Test', requestId: o.requestId ?? uuid(), kind, code, reason: o.reason ?? null, values: withReq(kind, values), card,
 }, { ownership: o.ownership ?? ALL_COMPANY, open: o.open ?? true, now: NOW, shippingRates: o.shippingRates === undefined ? RATES : o.shippingRates, beforeCommit: o.beforeCommit }));
 // 単品は代表の仕入先が要る (2026-10-08 中原さん・NE で必須)。0001 = 取引中 (初めのロードの仕入先 = NE 登録済み)
-const single = (over = {}) => ({ name: '新しい単品', standard_price: '1,980', shipping_code: 'S01', tax_rate: '10', primary_supplier: '1', ...over });
+const single = (over = {}) => ({ name: '新しい単品', standard_price: '1,980', shipping_code: 'S01', tax_rate: '10', primary_supplier: '1', sales_class: '3', expiry_managed: '0', reorder_months: '1', ...over });
 
 console.log('登録の状態 (0052)');
 
@@ -595,10 +598,18 @@ await ta('[R7] セットの導く値が決まらない = 登録しない (上書
   assert.match(e.extra.blockers.join(' '), /s003 の原価/);
   e = await rejectsWith(reg('set', 'new-set-2', { name: 'x', standard_price: '1000', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }], set_sales_class_override: '2' }), 400);
   assert.match(e.message, /上書きはできません/);
-  const r = await reg('set', 'new-set-2', { name: 'x', standard_price: '1000', shipping_code: 'S01', components: [{ code: 's003', qty: 1 }], exception_cost: { jpy: '90', reason: '見積' } }, { create: false });
+  // 2026-10-08 中原さん: 新規登録の原価に理由の欄は無い = 例外原価も { jpy } だけで通り、記録の理由は「新商品の登録」
+  const r = await reg('set', 'new-set-2', { name: 'x', standard_price: '1000', shipping_code: 'S01', components: [{ code: 's003', qty: 1 }], exception_cost: { jpy: '90' } }, { create: false });
   assert.deepEqual([r.cost, r.card], [{ jpy: 90, source: 'manual' }, null]);
   assert.equal((await one(`select count(*)::int as n from ops.product_hub_outbox where sku_id = $1`, [r.sku_id])).n, 0);
-  assert.equal((await one(`select cost_status from core.sku_costs where sku_id = $1`, [r.sku_id])).cost_status, 'OVERRIDDEN');
+  assert.deepEqual(await one(`select cost_status, reason from core.sku_costs where sku_id = $1`, [r.sku_id]), { cost_status: 'OVERRIDDEN', reason: '新商品の登録' });
+});
+
+await ta('[R7b] 新規登録の原価の理由はサーバーが固定 (「新商品の登録」)・前の画面が理由を送ってきても使わない (断りもしない)', async () => {
+  const r = await reg('single', 'new-oldui', single({ cost: { jpy: '70', reason: '前の画面の理由' } }), {}, { reason: '保存の理由' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(await q(`select c.cost_jpy::int as jpy, c.reason from core.sku_costs c join core.skus k on k.sku_id = c.sku_id where k.code = 'new-oldui'`),
+    [{ jpy: 70, reason: '新商品の登録' }]);
 });
 
 await ta('[R8] 巻き戻った登録は何も残さない (SKU・状態・知らせ・原価)・失敗の記録だけ残る', async () => {
@@ -676,7 +687,7 @@ const regEntry = (code, over = {}) => ({
   kind: 'single', code, started_at: null,
   product: { name: '直接の単品', sales_class: 3, expiry_managed: false, inbound_date_managed: null },
   sku: { name: '直接の単品', tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', standard_price_jpy: 1000, shipping_code: 'S01', shipping_method: 'ゆうパケット',
-    shipping_cost_jpy: 210, reorder_months: null, set_sales_class_override: null, handling_own: null },
+    shipping_cost_jpy: 210, reorder_months: 1, set_sales_class_override: null, handling_own: null },
   supplier_id: SUP1, cost: null, component_request: null, card: null, ...over,
 });
 const setEntry = (code, rows) => regEntry(code, { kind: 'set', product: null, supplier_id: null, sku: { ...regEntry(code).sku, name: '直接のセット', handling_own: 'active' },
@@ -845,7 +856,7 @@ await ta('[G4] 画面のロールが登録の関数を直接呼んで値を偽�
 await ta('[G-0060] 登録の関数の作り直し (0060): 0058 の本文との違いは「単品の代表の仕入先」「発送方法なし」「気をつけることの 1 行」の 3 か所だけ・権限はそのまま', async () => {
   const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
   const fnOf = (file) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf('create or replace function ops.register_new_sku('); assert.ok(i >= 0, file); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
-  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0058' && x.slice(0, 4) !== '0060');
+  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0058' && !['0060', '0061'].includes(x.slice(0, 4)));
   for (const file of later) assert.ok(!/function\s+ops\.register_new_sku\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), file + ' も登録の関数を作り直している = 0060 の元にする定義を見直す');
   const a = fnOf('0058_master_widen.sql').split('\n'); const b = fnOf('0060_master_register_required_fields.sql').split('\n');
   // 差 = 0060 で足した行だけ (0058 の行は全部同じ順で残る。変えたのは送料の確かめの if → elsif の 1 行)
@@ -869,6 +880,72 @@ await ta('[G-0060] 登録の関数の作り直し (0060): 0058 の本文との�
     "case when v_ship_c is null then '発送方法 (送料コード) はまだです",
   ].map((x) => x.slice(0, 30)));
   // 権限 (create or replace = 0052 の revoke・master_edit の grant がそのまま)
+  assert.deepEqual(await one(`select has_function_privilege('public', oid, 'execute') as pub, has_function_privilege('master_edit', oid, 'execute') as me, prosecdef as d
+     from pg_proc where oid = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)'::regprocedure`), { pub: false, me: true, d: true });
+});
+
+await ta('[R-0061] 下書きの保存で要る欄 (2026-10-08 中原さん): 単品の売上分類・ロジザードの有効期限の管理・推奨保有月数 / セットの推奨保有月数が無い = 400 (その欄・何も書かない)・セットの売上分類は要らない・入荷日の管理は無くてよい・有効期限の管理は選んだ値のまま', async () => {
+  const base = { name: '必須の試験', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '1' };
+  for (const [label, values, field] of [
+    ['売上分類が無い', { ...base, expiry_managed: '0', reorder_months: '1' }, 'sales_class'],
+    ['売上分類が空の文字 (前の画面の「あとで」)', { ...base, sales_class: '', expiry_managed: '0', reorder_months: '1' }, 'sales_class'],
+    ['有効期限の管理が無い', { ...base, sales_class: '3', reorder_months: '1' }, 'expiry_managed'],
+    ['有効期限の管理が空', { ...base, sales_class: '3', expiry_managed: '', reorder_months: '1' }, 'expiry_managed'],
+    ['推奨保有月数が無い', { ...base, sales_class: '3', expiry_managed: '0' }, 'reorder_months'],
+    ['推奨保有月数が空', { ...base, sales_class: '3', expiry_managed: '0', reorder_months: ' ' }, 'reorder_months'],
+  ]) {
+    // reg は無い欄を足す = R.registerNewSku を直に呼ぶ
+    const e = await rejectsWith(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'single', code: 'r61-x', values, card: {} },
+      { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES })), 400, 'invalid_input');
+    assert.equal(e.extra.field, field, label);
+  }
+  // セット: 推奨保有月数が無い = 400 / 売上分類 (上書き) は要らない (構成品から導ける)
+  const eSet = await rejectsWith(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'set', code: 'r61-set-x',
+    values: { name: 'x', standard_price: '1000', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }, card: { create: false } },
+  { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES })), 400, 'invalid_input');
+  assert.equal(eSet.extra.field, 'reorder_months');
+  assert.equal(await skuId('r61-x'), undefined); assert.equal(await skuId('r61-set-x'), undefined);
+  // 通る: 有効期限の管理 = あり / 入荷日の管理なし (null = 不明)・推奨保有月数 0 (持たない)・売上分類 4
+  const r1 = await reg('single', 'r61-ok-1', { ...base, name: '必須の試験 1', sales_class: '4', expiry_managed: '1', reorder_months: '0' }, { create: false });
+  assert.deepEqual(await one(`select p.sales_class, p.expiry_managed, p.inbound_date_managed, s.reorder_months::float8 as m from core.skus s join core.products p on p.product_id = s.product_id where s.sku_id = $1`, [r1.sku_id]),
+    { sales_class: 4, expiry_managed: true, inbound_date_managed: null, m: 0 });
+  const r2 = await reg('single', 'r61-ok-2', { ...base, name: '必須の試験 2', sales_class: '1', expiry_managed: '0', inbound_date_managed: '1', reorder_months: '2.5' }, { create: false });
+  assert.deepEqual(await one(`select p.sales_class, p.expiry_managed, p.inbound_date_managed, s.reorder_months::float8 as m from core.skus s join core.products p on p.product_id = s.product_id where s.sku_id = $1`, [r2.sku_id]),
+    { sales_class: 1, expiry_managed: false, inbound_date_managed: true, m: 2.5 });
+  const r3 = await reg('set', 'r61-set-ok', { name: '必須の試験のセット', standard_price: '3000', shipping_code: 'S01', reorder_months: '3', components: [{ code: 's001', qty: 2 }] }, { create: false });
+  assert.deepEqual(await one('select reorder_months::float8 as m, set_sales_class_override as o from core.skus where sku_id = $1', [r3.sku_id]), { m: 3, o: null });
+});
+
+await ta('[G-0061] 登録の関数の作り直し (0061): 0060 の本文との違いは「推奨保有月数が要る」「単品の売上分類が要る」の 2 か所 (4 行) だけ・DB を直接呼んでも空は断る・権限はそのまま', async () => {
+  const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
+  const fnOf = (file) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf('create or replace function ops.register_new_sku('); assert.ok(i >= 0, file); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
+  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0061');
+  for (const file of later) assert.ok(!/function\s+ops\.register_new_sku\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), file + ' も登録の関数を作り直している = 0061 の元にする定義を見直す');
+  const a = fnOf('0060_master_register_required_fields.sql').split('\n'); const b = fnOf('0061_master_register_require_class_months.sql').split('\n');
+  const added = []; let i = 0;
+  for (const line of b) { if (i < a.length && line === a[i]) i++; else added.push(line); }
+  assert.equal(i, a.length, '0060 の行が 0061 に全部同じ順で残っていない');
+  assert.deepEqual(added.map((l) => l.trim().slice(0, 40)), [
+    '-- 🆕 0061 (中原さん 2026-10-08): 推奨保有月数は要る (単品もセ',
+    "if v_reorder is null then raise exception 'invalid_value: 推奨保",
+    '-- 🆕 0061 (中原さん 2026-10-08): 単品は売上分類が要る (「あとで」',
+    "if v_sales is null then raise exception 'invalid_value: 単品は売上",
+  ].map((x) => x.slice(0, 40)));
+  // 直接呼んでも空は断る (画面のロール・取引は巻き戻す)
+  const s001 = Number(await skuId('s001'));
+  const goodCost = { jpy: 200, source: 'set_calc', status: 'COMPLETE', valid_from: TODAY, reason: '構成品から計算' };
+  for (const [label, entry, re] of [
+    ['単品の売上分類が無い', { ...regEntry('g61-1'), product: { ...regEntry('g61-1').product, sales_class: null } }, /^invalid_value: 単品は売上分類が要る/],
+    ['単品の推奨保有月数が無い', { ...regEntry('g61-2'), sku: { ...regEntry('g61-2').sku, reorder_months: null } }, /^invalid_value: 推奨保有月数が要る/],
+    ['単品の有効期限の管理が無い (0052 から)', { ...regEntry('g61-3'), product: { ...regEntry('g61-3').product, expiry_managed: null } }, /^invalid_value: 有効期限の管理/],
+    ['セットの推奨保有月数が無い', (() => { const e = setEntry('g61-4', [{ sku_id: s001, code: 's001', qty: 2, sort: 1 }]); return { ...e, cost: goodCost, sku: { ...e.sku, reorder_months: null } }; })(), /^invalid_value: 推奨保有月数が要る/],
+  ]) {
+    const e = await editorTx(() => callReg(uuid(), entry));
+    assert.ok(e instanceof Error, label + ': 断らなかった'); assert.match(String(e.message), re, label);
+  }
+  // セットは売上分類 (product) を持たない = 今までどおり通る (推奨保有月数があれば)
+  const okSet = await editorTx(async () => { const e = setEntry('g61-5', [{ sku_id: s001, code: 's001', qty: 2, sort: 1 }]); return (await callReg(uuid(), { ...e, cost: goodCost })).rows[0].r; });
+  assert.ok(!(okSet instanceof Error), okSet && okSet.message);
   assert.deepEqual(await one(`select has_function_privilege('public', oid, 'execute') as pub, has_function_privilege('master_edit', oid, 'execute') as me, prosecdef as d
      from pg_proc where oid = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)'::regprocedure`), { pub: false, me: true, d: true });
 });
@@ -1282,10 +1359,32 @@ await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・
   assert.match(r.text, /for="shipping">発送方法<span class="opt">あとでも可<\/span>/);
   assert.match(newJs, /id: 'primary_supplier', sec: 'sec-tax', t: '代表の仕入先', ok: [^}]*level: 1 \}/);
   assert.match(newJs, /id: 'shipping_code', sec: 'sec-ship', [^}]*level: 3 \}/);
+  // 2026-10-08 中原さん「新規登録の際に原価に理由入れる項目は不要」: 原価の欄はあり・原価の理由の欄は無い・画面の JS も理由を送らない (保存の理由 id="reason" は残る)
+  assert.match(r.text, /id="cost-jpy"/); assert.match(r.text, /<span class="hint">今日から<\/span>/); assert.match(r.text, /id="reason"/);
+  assert.ok(!r.text.includes('id="cost-reason"') && !r.text.includes('原価の理由'), '単品の画面に原価の理由の欄がある');
+  assert.ok(!/cost-reason/.test(newJs), '画面の JS が原価の理由を読んでいる');
+  assert.match(newJs, /values\.cost = \{ jpy: val\('cost-jpy'\) \}/); assert.match(newJs, /values\.exception_cost = \{ jpy: val\('xcost-jpy'\) \}/);
+  // 🆕 0061 (2026-10-08 中原さん「下書き保存時にわかる内容だから必須にする」): 売上分類 (「あとで」は無い)・推奨保有月数・ロジザードの有効期限の管理 (初めは選んでいない) = 必須で ①。入荷日の管理は今までどおり
+  const segOf = (id) => (new RegExp('<div class="seg" role="group" id="' + id + '"[^>]*>([\\s\\S]*?)</div>').exec(r.text) || [])[0] || '';
+  assert.match(r.text, /id="lab-f-sales_class">売上分類<span class="req">必須<\/span>/);
+  assert.ok(segOf('f-sales_class') && !segOf('f-sales_class').includes('data-v=""') && !segOf('f-sales_class').includes('あとで'), '売上分類に「あとで」が残っている: ' + segOf('f-sales_class'));
+  assert.match(r.text, /for="f-reorder_months">推奨保有月数<span class="req">必須<\/span>/);
+  assert.match(r.text, /id="lab-f-expiry">ロジザードの有効期限の管理<span class="req">必須<\/span>/);
+  assert.match(segOf('f-expiry'), /data-value=""/, '有効期限の管理が初めから選ばれている');
+  assert.ok(!/class="on"|aria-pressed="true"/.test(segOf('f-expiry')), '有効期限の管理のボタンが初めから押されている');
+  assert.match(segOf('f-inbound'), /data-value="0"/, '入荷日の管理は今までどおり (初めは なし)');
+  assert.ok(!/id="lab-f-inbound">[^<]*<span class="req"/.test(r.text), '入荷日の管理は必須にしない');
+  for (const [id, sec] of [['sales_class', 'sec-tax'], ['reorder_months', 'sec-ship'], ['expiry_managed', 'sec-ship']]) assert.match(newJs, new RegExp("id: '" + id + "', sec: '" + sec + "', [^}]*level: 1 \\}"), id + ' が ① に無い');
+  assert.match(newJs, /if \(!isSet\) list\.push\(\{ id: 'sales_class'/, 'セットの売上分類は ① に入れない (構成品から)');
+  assert.match(newJs, /if \(!isSet\) list\.push\(\{ id: 'expiry_managed'/);
   r = await call('GET', '/apps/master-edit/new?kind=set');
   await checkScripts(r.text, 0);
+  assert.match(r.text, /id="xcost-jpy"/);
+  assert.ok(!r.text.includes('id="xcost-reason"') && !r.text.includes('例外原価の理由'), 'セットの画面に例外原価の理由の欄がある');
   assert.match(r.text, /id="comp-rows"/); assert.ok(!r.text.includes('セット商品を作るか'), 'セットに「セット商品を作るか」を出さない');
   assert.ok(!r.text.includes('有効期限の管理'), 'セットにロジザードの欄を出さない');
+  assert.match(r.text, /for="f-reorder_months">推奨保有月数<span class="req">必須<\/span>/, 'セットも推奨保有月数は必須 (0061)');
+  assert.ok(!r.text.includes('id="f-sales_class"'), 'セットに売上分類の切り替えは無い (構成品から・例外のときだけ上書き)');
   delete process.env.MASTER_EDIT_OPEN;
   r = await call('GET', '/apps/master-edit/new?kind=single');
   assert.match(r.text, /切替前です/); assert.match(r.text, /data-can-save="0"/); assert.match(r.text, /id="save" disabled/);
@@ -1302,7 +1401,7 @@ await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・
 });
 
 await ta('[H2] 登録の API: 名簿・Origin・形の誤り 400・成功で product-hub のカードを同じ要求の中で作る・押し直しは前の結果', async () => {
-  const body = { request_id: uuid(), kind: 'single', code: 'web-1', reason: '画面から', values: { name: '画面の単品', standard_price: '1500', shipping_code: 'S02', tax_rate: '0.08', primary_supplier: '0001', expiry_managed: '0', inbound_date_managed: '1' },
+  const body = { request_id: uuid(), kind: 'single', code: 'web-1', reason: '画面から', values: { name: '画面の単品', standard_price: '1500', shipping_code: 'S02', tax_rate: '0.08', primary_supplier: '0001', sales_class: '3', reorder_months: '1', expiry_managed: '0', inbound_date_managed: '1' },
     card: { create: true, official_url: 'https://maker.example/web1', reference_urls: ['https://ref.example/w'], set_decision: { decision: 'create', reason_text: '2 個セット' }, yahoo: { price: '', delivery_label: '' } } };
   assert.equal((await call('POST', '/apps/master-edit/api/new', { body, session: 'viewer' })).status, 403);
   assert.equal((await call('POST', '/apps/master-edit/api/new', { body, origin: false })).j.error, 'origin_mismatch');
@@ -1326,7 +1425,7 @@ await ta('[H2] 登録の API: 名簿・Origin・形の誤り 400・成功で pro
 
 await ta('[H3] カードが作れなかった登録: 登録は成功・「カード作成待ち」・商品の画面の箱ともう一度 (名簿の人だけ)・コードの確かめ', async () => {
   applierMode = 'boom';
-  const body = { request_id: uuid(), kind: 'single', code: 'web-2', values: { name: '画面の単品 2', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001' }, card: {} };
+  const body = { request_id: uuid(), kind: 'single', code: 'web-2', values: { name: '画面の単品 2', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', sales_class: '3', expiry_managed: '0', reorder_months: '1' }, card: {} };
   const r = await call('POST', '/apps/master-edit/api/new', { body });
   assert.equal(r.status, 200, r.text);
   assert.deepEqual([r.j.card.status, r.j.card_label, r.j.card.error], ['failed', 'カード作成待ち (失敗)', 'SQLite に書けない']);
@@ -1369,7 +1468,7 @@ await ta('[H4] 一覧: 登録の列・絞り込み (下書き・要確認・状�
 await ta('[H5] 衝突の画面: 「既存のカードをこの商品に結ぶ」が出る・名簿の人だけ・押すと done・もう一度押しても同じ', async () => {
   ph.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('web-9', '前からのカード', 'someone')`).run();
   const old = draftOf('web-9');
-  const body = { request_id: uuid(), kind: 'single', code: 'web-9', values: { name: '衝突する単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001' }, card: {} };
+  const body = { request_id: uuid(), kind: 'single', code: 'web-9', values: { name: '衝突する単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', sales_class: '3', expiry_managed: '0', reorder_months: '1' }, card: {} };
   const r = await call('POST', '/apps/master-edit/api/new', { body });
   assert.deepEqual([r.status, r.j.card.status], [200, 'conflict']);
   let page = await call('GET', '/apps/master-edit/sku/web-9');
@@ -1400,6 +1499,39 @@ await ta('[H5] 衝突の画面: 「既存のカードをこの商品に結ぶ」
   // 片付け: 重なりを消して一意の index を張り直す (ほかの試験は index のある DB)
   ph.prepare('DELETE FROM product_drafts WHERE id = ?').run(dupIds[1]);
   ph.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_product_drafts_ne_norm ON product_drafts(LOWER(TRIM(ne_code)))');
+});
+
+await ta('[H6] 商品の画面 (2026-10-08 中原さん): 下書きならロジザードの有効期限・入荷日の管理を切り替えで直せる (前からある商品は 🔒 と理由)・出品カードの欄は product-hub のカードへ (カードがある = 開くボタン / 無い = ボードで探す)・画面の JS が送る', async () => {
+  // web-9 = [H5] で下書きで登録・カードを結んだ (done)
+  let page = await call('GET', '/apps/master-edit/sku/web-9');
+  assert.equal(page.status, 200);
+  const sc = await checkScripts(page.text, 0);
+  const skuJs = sc.find((x) => x.includes("'expiry_managed', 'inbound_date_managed'")) || '';
+  assert.ok(skuJs, '商品の画面の JS がロジザードの 2 つを送らない');
+  assert.match(page.text, /<div class="seg" role="group" aria-labelledby="lab-expiry_managed" data-field="expiry_managed"[^>]*data-value="0"/);
+  assert.match(page.text, /<div class="seg" role="group" aria-labelledby="lab-inbound_date_managed" data-field="inbound_date_managed"[^>]*data-value=""/, '入荷日の管理 = 不明 (選んでいない)');
+  assert.match(page.text, /id="lab-expiry_managed">ロジザードの有効期限の管理</);
+  assert.match(page.text, /下書きの間だけ直せます/);
+  const draftId = draftOf('web-9').id;
+  assert.match(page.text, new RegExp('id="card-open" href="/apps/product-hub/detail/' + draftId + '"'), '出品カードを開くボタン');
+  for (const t of ['公式ページ URL', 'Amazon URL', 'ASIN', '参考 URL', 'セット商品を作るか', 'Yahoo!売価・配送方法・カテゴリ・path']) assert.ok(page.text.includes('<span class="linkchip">' + t + '</span>'), t);
+  // 前からある商品 (s001 = 下書きでない) = 🔒 の値と理由・切り替えは無い・カードはボードで探す
+  page = await call('GET', '/apps/master-edit/sku/s001');
+  await checkScripts(page.text, 0);
+  assert.ok(!/data-field="expiry_managed"/.test(page.text), '下書きでない商品に切り替えを出さない');
+  assert.match(page.text, /data-row="expiry_managed"[\s\S]{0,600}ロジザードが正 \(ここで直せるのは新商品の下書きの間だけ\)/);
+  assert.match(page.text, /id="card-board" href="\/apps\/product-hub\/"/);
+  // 名簿の外の人 = 見るだけ (切り替えを出さない)
+  page = await call('GET', '/apps/master-edit/sku/web-9', { session: 'viewer' });
+  assert.ok(!/data-field="expiry_managed"/.test(page.text));
+  // API: 下書きの web-9 は保存できる (画面と同じ道)・s001 は 409 logizard_locked
+  const tok = (t) => (/data-token="([0-9a-f]{64})"/.exec(t) || [])[1];
+  page = await call('GET', '/apps/master-edit/sku/web-9');
+  const ok = await call('POST', '/apps/master-edit/api/sku/web-9', { body: { request_id: uuid(), seen: { token: tok(page.text) }, values: { expiry_managed: '1' } } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.j)); assert.deepEqual(ok.j.changed.map((c) => [c.field, c.from, c.to]), [['expiry_managed', false, true]]);
+  page = await call('GET', '/apps/master-edit/sku/s001');
+  const ng = await call('POST', '/apps/master-edit/api/sku/s001', { body: { request_id: uuid(), seen: { token: tok(page.text) }, values: { expiry_managed: '1' } } });
+  assert.deepEqual([ng.status, ng.j.reason], [409, 'logizard_locked']);
 });
 
 console.log('\nproduct-hub (新規作成の入口・ボード)');

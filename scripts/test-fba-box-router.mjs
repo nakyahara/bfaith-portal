@@ -541,6 +541,22 @@ await t('iPad: 完了した回の結果 GET /runs/:id/result — 端末 Cookie �
   const adm = await (await call('GET', `/admin/runs/${pkRunId}/report`, { session: 'user', device: false, raw: true })).text();
   assert.ok(adm.includes('‹ 管理画面') && adm.includes('管理画面 (Excel 出力)') && adm.includes('本社の Google チャットへの知らせ'), '本社から開いたときは管理画面へ戻る・同じ知らせ欄');
 });
+await t('完了した回の結果・本社向け一覧にも納品ピッキング PDF (PDF が残っていれば出す・無ければ出さない — 中原さん 2026-10-08)', async () => {
+  assert.equal(db.getDB().prepare('SELECT status FROM fbx_runs WHERE id = ?').get(pkRunId).status, 'done', '完了した回で確かめる');
+  const pdf = path.join(tmp, 'picking-prep-pdf', '501.pdf');
+  const ipadOf = async () => (await (await call('GET', `/runs/${pkRunId}/result`, { raw: true })).text());
+  const admOf = async () => (await (await call('GET', `/admin/runs/${pkRunId}/report`, { session: 'user', device: false, raw: true })).text());
+  assert.ok(!(await ipadOf()).includes('📄 ピッキング') && !(await admOf()).includes('📄 ピッキング'), 'PDF が無い (40 件の保持から外れた) 回はボタンなし');
+  fs.mkdirSync(path.dirname(pdf), { recursive: true });
+  fs.writeFileSync(pdf, '%PDF-1.4 test');
+  try {
+    for (const [who, html] of [['iPad の結果', await ipadOf()], ['本社向け一覧', await admOf()]]) {
+      assert.ok(html.includes('<a class="pick" href="/print/picking/501/pdf" target="_blank" rel="noopener">📄 ピッキング</a>'), who + ' に PDF への入口');
+    }
+    // 管理画面の納品回一覧も、完了した回にボタン
+    assert.ok((await (await fetch(`${BASE}/admin`, { headers: { 'x-test-session': 'admin' } })).text()).includes('href="/print/picking/501/pdf"'), '管理画面の一覧 (完了)');
+  } finally { fs.rmSync(pdf, { force: true }); }
+});
 await t('もう一度送る POST /api/runs/:id/notify/resend — 端末から送れる【再送】/ 操作 ID なし 400 / 同じ操作の押し直しは 1 回 / 届いた直後は 429 / Origin なし 403 / 未登録 401 / 通知先が無ければ 409 / 完了していない回は 409', async () => {
   process.env[notify.WEBHOOK_ENV] = 'https://chat.example/fba-box';
   const sent = [];

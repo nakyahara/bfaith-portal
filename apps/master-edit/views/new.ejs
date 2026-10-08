@@ -93,8 +93,7 @@
                   <% for (const [k, v] of Object.entries(SALES)) { %><option value="<%= k %>"><%= v %></option><% } %>
                 </select><span class="hint" id="override-hint">構成品から導けないときだけ (未入力・輸出 4 と 1〜3 の混在)</span></div></div>
               <div class="f" data-row="exception_cost"><label class="lab" for="xcost-jpy">例外原価</label>
-                <div class="ctl"><span class="yen"><input class="in w-s" id="xcost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="exception_cost" data-label="例外原価" placeholder="0"<%= dis %>></span><span class="unit">円</span>
-                  <input class="in w-m" id="xcost-reason" maxlength="200" autocomplete="off" aria-label="例外原価の理由" placeholder="理由 (例外原価を入れるときは必要)"<%= dis %>><span class="hint">空なら構成品の原価の合計</span></div></div>
+                <div class="ctl"><span class="yen"><input class="in w-s" id="xcost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="exception_cost" data-label="例外原価" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">空なら構成品の原価の合計</span></div></div>
             </div>
           </details>
         </section>
@@ -106,8 +105,7 @@
             <div class="ctl"><span class="yen"><input class="in w-s" id="f-standard_price" inputmode="numeric" autocomplete="off" data-field="standard_price" data-dirty-field="standard_price" data-label="売価" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">標準売価 · 税込</span></div></div>
           <% if (!isSet) { %>
           <div class="f" data-row="cost"><label class="lab" for="cost-jpy">原価<span class="opt">あとでも可</span></label>
-            <div class="ctl"><span class="yen"><input class="in w-s" id="cost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="cost" data-label="原価" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">今日から</span>
-              <input class="in w-m" id="cost-reason" maxlength="200" autocomplete="off" aria-label="原価の理由" placeholder="理由 (空なら「新商品の登録」)"<%= dis %>></div></div>
+            <div class="ctl"><span class="yen"><input class="in w-s" id="cost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="cost" data-label="原価" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">今日から</span></div></div>
           <% } %>
         </section>
 
@@ -116,8 +114,9 @@
           <div class="panel-h"><span class="stepno" data-step="sec-tax" aria-hidden="true"><%= no('sec-tax') %></span><h2 id="h-tax">税・分類・仕入先</h2></div>
           <div class="f" data-row="tax_rate"><div class="lab" id="lab-f-tax_rate">税率<span class="req">必須</span></div>
             <div class="ctl"><%- seg('f-tax_rate', 'tax_rate', '', [['0.08', '8%', '軽減 · 食品'], ['0.1', '10%', '標準']], '税率') %><span class="misslabel" id="tax-miss"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ選んでいません</span></div></div>
-          <div class="f" data-row="sales_class"><div class="lab" id="lab-f-sales_class">売上分類<span class="opt">あとでも可</span></div>
-            <div class="ctl"><%- seg('f-sales_class', 'sales_class', '', [...Object.entries(SALES).map(([k, v]) => [k, v]), ['', 'あとで']], '売上分類') %></div></div>
+          <%# 売上分類は下書きの保存で要る (2026-10-08 中原さん「下書き保存時にわかる内容だから必須にする」= 「あとで」は無い) %>
+          <div class="f" data-row="sales_class"><div class="lab" id="lab-f-sales_class">売上分類<span class="req">必須</span></div>
+            <div class="ctl"><%- seg('f-sales_class', 'sales_class', '', Object.entries(SALES).map(([k, v]) => [k, v]), '売上分類') %><span class="misslabel" id="sales-miss"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ選んでいません</span></div></div>
           <div class="f" data-row="primary_supplier"><label class="lab" for="f-primary_supplier">代表の仕入先<span class="req">必須</span></label>
             <div class="ctl"><select class="in w-m" id="f-primary_supplier" data-field="primary_supplier" data-dirty-field="primary_supplier" data-label="代表の仕入先"<%= dis %>>
               <option value="">(選ぶ)</option>
@@ -138,12 +137,15 @@
               <span class="hint">届いてサイズを見てから決めるときは空のまま (あとで商品の画面で入れる) · 送料コード → 方法と金額は送料の表から · product-hub の楽天の配送方法は対応表から (無ければカードに「要確認」)</span>
               <% } else { %><span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg>送料の表が読めません</span><% } %>
             </div></div>
-          <div class="f" data-row="reorder_months"><label class="lab" for="f-reorder_months">推奨保有月数<span class="opt">あとでも可</span></label>
-            <div class="ctl"><span class="stepper"><button type="button" data-step="-1" aria-label="1 か月へらす"<%= dis %>>−</button><input id="f-reorder_months" inputmode="decimal" autocomplete="off" data-field="reorder_months" data-dirty-field="reorder_months" data-label="推奨保有月数" placeholder="—"<%= dis %>><button type="button" data-step="1" aria-label="1 か月ふやす"<%= dis %>>＋</button></span><span class="unit">か月</span></div></div>
+          <%# 推奨保有月数・ロジザードの有効期限の管理は下書きの保存で要る (2026-10-08 中原さん)。有効期限の管理は初めから選んだ形にしない (選ぶまで保存できない)。入荷日の管理は今までどおり %>
+          <div class="f" data-row="reorder_months"><label class="lab" for="f-reorder_months">推奨保有月数<span class="req">必須</span></label>
+            <div class="ctl"><span class="stepper"><button type="button" data-step="-1" aria-label="1 か月へらす"<%= dis %>>−</button><input id="f-reorder_months" inputmode="decimal" autocomplete="off" data-field="reorder_months" data-dirty-field="reorder_months" data-label="推奨保有月数" placeholder="—"<%= dis %>><button type="button" data-step="1" aria-label="1 か月ふやす"<%= dis %>>＋</button></span><span class="unit">か月</span><span class="hint">0〜60 (小数は 1 桁まで) · 持たない商品は 0</span></div></div>
           <% if (!isSet) { %>
-          <div class="f" data-row="expiry_managed"><div class="lab">ロジザード</div>
-            <div class="ctl"><span class="hint" id="lab-f-expiry" style="color:var(--text2)">有効期限の管理</span><%- seg('f-expiry', 'expiry_managed', '0', [['0', 'なし'], ['1', 'あり']], '有効期限の管理') %>
-              <span class="hint" id="lab-f-inbound" style="color:var(--text2);margin-left:8px">入荷日の管理</span><%- seg('f-inbound', 'inbound_date_managed', '0', [['0', 'なし'], ['1', 'あり']], '入荷日の管理') %>
+          <div class="f" data-row="expiry_managed"><div class="lab" id="lab-f-expiry">ロジザードの有効期限の管理<span class="req">必須</span></div>
+            <div class="ctl"><%- seg('f-expiry', 'expiry_managed', '', [['0', 'なし'], ['1', 'あり']], '有効期限の管理') %><span class="misslabel" id="expiry-miss"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ選んでいません</span>
+              <span class="hint">賞味期限・使用期限のある商品は あり · ロジザードの最初の値 (あとはロジザードが正)</span></div></div>
+          <div class="f" data-row="inbound_date_managed"><div class="lab" id="lab-f-inbound">ロジザードの入荷日の管理</div>
+            <div class="ctl"><%- seg('f-inbound', 'inbound_date_managed', '0', [['0', 'なし'], ['1', 'あり']], '入荷日の管理') %>
               <span class="hint">最初の値だけ · あとはロジザードが正</span></div></div>
           <% } %>
         </section>

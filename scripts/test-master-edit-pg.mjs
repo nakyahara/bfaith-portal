@@ -527,7 +527,7 @@ try {
   await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(dbO, { runId: RUN, withSet: true });   // 0058: 配るは「NE のコードの回 = 許可の回」(本番と同じ = その照合の回の許可)
   const rates = new Map([['S01', { method: 'ゆうパケット', cost: 210 }]]);
   await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew', card: { create: false },
-    values: { name: '新しい単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', cost: { jpy: '300' } } },
+    values: { name: '新しい単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', sales_class: '3', expiry_managed: '0', reorder_months: '1', cost: { jpy: '300' } } },
   { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });   // 原価の始まり = DB の東京の今日 (0052)
 
   await ta('[18] NE 登録の CSV を作る取引の途中は、同じ商品の保存が SKU の鍵で待つ → 作った後に保存 = そのファイル (まだ配っていない) を使わないにして保存する', async () => {
@@ -567,7 +567,7 @@ try {
   await ta('[20] 同じファイルの申告が 2 つ並ぶ (画面のロール・DB の関数) = 後の方は鍵で待ち、前の方の後に「もう一度」(試みを足すだけ)・NE 登録待ちへは 1 回だけ', async () => {
     // 代表の仕入先 = 0003 ([12] で作った・使える。0002 は [9] で止めた)
     await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew2', card: { create: false },
-      values: { name: '新しい単品 2', standard_price: '1600', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', cost: { jpy: '310' } } },
+      values: { name: '新しい単品 2', standard_price: '1600', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', sales_class: '3', expiry_managed: '0', reorder_months: '1', cost: { jpy: '310' } } },
     { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });   // 原価の始まり = DB の東京の今日 (0052)
     const o = { ownership: ALL_COMPANY, open: true, nowMs: NOW.getTime() };
     const b0 = await G.buildRegExport(dbA, { actor: 'boss@test', kind: 'products', codes: ['pnew2'], requestId: crypto.randomUUID() }, o);
@@ -600,7 +600,7 @@ try {
     const o = { ownership: ALL_COMPANY, open: true, nowMs: NOW.getTime() };
     for (const c of ['pnew3', 'pnew4']) {
       await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: c, card: { create: false },
-        values: { name: `新しい単品 ${c}`, standard_price: '1700', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', cost: { jpy: '320' } } },
+        values: { name: `新しい単品 ${c}`, standard_price: '1700', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', sales_class: '3', expiry_managed: '0', reorder_months: '1', cost: { jpy: '320' } } },
       { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });
     }
     const x = await G.buildRegExport(dbA, { actor: 'boss@test', kind: 'products', codes: ['pnew3'], requestId: crypto.randomUUID() }, o);
@@ -644,7 +644,7 @@ try {
   await ta('[20c] 広げる道 PR-2 (Codex #1640 R3 Medium 1): 新規開始の鍵 (許可の共有の鍵) は段階の鍵より前 = 0058 と同じ順。許可を排他で持つ取引 (取り消し・照合 ② の始めに閉じる) が段階の鍵 (排他) を取っても deadlock しない', async () => {
     const o = { ownership: ALL_COMPANY, open: true, nowMs: NOW.getTime() };
     await R.registerNewSku(dbA, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code: 'pnew5', card: { create: false },
-      values: { name: '新しい単品 pnew5', standard_price: '1700', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', cost: { jpy: '320' } } },
+      values: { name: '新しい単品 pnew5', standard_price: '1700', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0003', sales_class: '3', expiry_managed: '0', reorder_months: '1', cost: { jpy: '320' } } },
     { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: rates });
     const held = gate();
     let gotCutover = null;
