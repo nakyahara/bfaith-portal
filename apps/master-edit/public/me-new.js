@@ -439,8 +439,9 @@
     keys.forEach(function (k) { var v = fieldValue(k); if (v !== undefined && v !== '') values[k] = v; });
     if (isSet) {
       values.components = components();
-      if (val('xcost-jpy')) values.exception_cost = { jpy: val('xcost-jpy'), reason: val('xcost-reason') };
-    } else if (val('cost-jpy')) values.cost = { jpy: val('cost-jpy'), reason: val('cost-reason') };
+      // 原価の理由は送らない (新規登録では要らない・サーバーが「新商品の登録」を入れる = 2026-10-08 中原さん)
+      if (val('xcost-jpy')) values.exception_cost = { jpy: val('xcost-jpy') };
+    } else if (val('cost-jpy')) values.cost = { jpy: val('cost-jpy') };
     var card = {
       create: cardOn(),
       official_url: val('official-url'), amazon_url: val('amazon-url'), asin: val('asin'),

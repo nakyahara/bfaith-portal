@@ -595,10 +595,18 @@ await ta('[R7] セットの導く値が決まらない = 登録しない (上書
   assert.match(e.extra.blockers.join(' '), /s003 の原価/);
   e = await rejectsWith(reg('set', 'new-set-2', { name: 'x', standard_price: '1000', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }], set_sales_class_override: '2' }), 400);
   assert.match(e.message, /上書きはできません/);
-  const r = await reg('set', 'new-set-2', { name: 'x', standard_price: '1000', shipping_code: 'S01', components: [{ code: 's003', qty: 1 }], exception_cost: { jpy: '90', reason: '見積' } }, { create: false });
+  // 2026-10-08 中原さん: 新規登録の原価に理由の欄は無い = 例外原価も { jpy } だけで通り、記録の理由は「新商品の登録」
+  const r = await reg('set', 'new-set-2', { name: 'x', standard_price: '1000', shipping_code: 'S01', components: [{ code: 's003', qty: 1 }], exception_cost: { jpy: '90' } }, { create: false });
   assert.deepEqual([r.cost, r.card], [{ jpy: 90, source: 'manual' }, null]);
   assert.equal((await one(`select count(*)::int as n from ops.product_hub_outbox where sku_id = $1`, [r.sku_id])).n, 0);
-  assert.equal((await one(`select cost_status from core.sku_costs where sku_id = $1`, [r.sku_id])).cost_status, 'OVERRIDDEN');
+  assert.deepEqual(await one(`select cost_status, reason from core.sku_costs where sku_id = $1`, [r.sku_id]), { cost_status: 'OVERRIDDEN', reason: '新商品の登録' });
+});
+
+await ta('[R7b] 新規登録の原価の理由はサーバーが固定 (「新商品の登録」)・前の画面が理由を送ってきても使わない (断りもしない)', async () => {
+  const r = await reg('single', 'new-oldui', single({ cost: { jpy: '70', reason: '前の画面の理由' } }), {}, { reason: '保存の理由' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(await q(`select c.cost_jpy::int as jpy, c.reason from core.sku_costs c join core.skus k on k.sku_id = c.sku_id where k.code = 'new-oldui'`),
+    [{ jpy: 70, reason: '新商品の登録' }]);
 });
 
 await ta('[R8] 巻き戻った登録は何も残さない (SKU・状態・知らせ・原価)・失敗の記録だけ残る', async () => {
@@ -1282,8 +1290,15 @@ await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・
   assert.match(r.text, /for="shipping">発送方法<span class="opt">あとでも可<\/span>/);
   assert.match(newJs, /id: 'primary_supplier', sec: 'sec-tax', t: '代表の仕入先', ok: [^}]*level: 1 \}/);
   assert.match(newJs, /id: 'shipping_code', sec: 'sec-ship', [^}]*level: 3 \}/);
+  // 2026-10-08 中原さん「新規登録の際に原価に理由入れる項目は不要」: 原価の欄はあり・原価の理由の欄は無い・画面の JS も理由を送らない (保存の理由 id="reason" は残る)
+  assert.match(r.text, /id="cost-jpy"/); assert.match(r.text, /<span class="hint">今日から<\/span>/); assert.match(r.text, /id="reason"/);
+  assert.ok(!r.text.includes('id="cost-reason"') && !r.text.includes('原価の理由'), '単品の画面に原価の理由の欄がある');
+  assert.ok(!/cost-reason/.test(newJs), '画面の JS が原価の理由を読んでいる');
+  assert.match(newJs, /values\.cost = \{ jpy: val\('cost-jpy'\) \}/); assert.match(newJs, /values\.exception_cost = \{ jpy: val\('xcost-jpy'\) \}/);
   r = await call('GET', '/apps/master-edit/new?kind=set');
   await checkScripts(r.text, 0);
+  assert.match(r.text, /id="xcost-jpy"/);
+  assert.ok(!r.text.includes('id="xcost-reason"') && !r.text.includes('例外原価の理由'), 'セットの画面に例外原価の理由の欄がある');
   assert.match(r.text, /id="comp-rows"/); assert.ok(!r.text.includes('セット商品を作るか'), 'セットに「セット商品を作るか」を出さない');
   assert.ok(!r.text.includes('有効期限の管理'), 'セットにロジザードの欄を出さない');
   delete process.env.MASTER_EDIT_OPEN;
