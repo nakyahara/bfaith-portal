@@ -6222,8 +6222,11 @@ let wfSetParentId = null;
       r = await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'none' });
       const afterNoneReady = ipSf().material_status;
       r = await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'inhouse' });
-      check('撮影判定: 「素材完了」は撮影不要でも撮影が要るでも書き換えない',
-        afterNoneReady === 'ready' && ipSf().material_status === 'ready', JSON.stringify([afterNoneReady, ipSf()]));
+      check('撮影判定: 「素材完了」は撮影不要にしても書き換えない', afterNoneReady === 'ready', JSON.stringify([afterNoneReady, ipSf()]));
+      check('🚨 撮影判定: 撮影不要の「素材完了」は、撮影が要るに変えたら未設定に戻す (これから撮る素材はまだ無い・Codex PR-A 名指し6 High)',
+        ipSf().shoot_mode === 'inhouse' && ipSf().material_status === null, JSON.stringify(ipSf()));
+      // 撮影が要る判定のまま撮影の素材が揃った (素材完了) 状態を作る (以降の試験の前提)
+      db.prepare(`UPDATE draft_image_production SET material_status = 'ready' WHERE draft_id = ?`).run(idSf);
       const badStatuses = [];
       for (const body of [{}, { mode: 'Inhouse' }, { mode: '' }, { mode: 'none ' }, { mode: 1 }, { mode: true }, { mode: ['none'] }]) {
         badStatuses.push((await call('POST', `/api/drafts/${idSf}/shoot-mode`, body)).status);
@@ -6315,8 +6318,13 @@ let wfSetParentId = null;
           && ipDone().shoot_mode === 'none' && ipDone().material_status === 'not_required', JSON.stringify([rDoneShoot, rDoneNull, ipDone()]));
         db.prepare(`UPDATE draft_image_production SET material_status = 'ready' WHERE draft_id = ?`).run(idDone);
         const rDoneReady = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'photographer' });
-        check('撮影判定: 素材完了なら ③ が完了していても撮影が要るへ変えられる (③ の条件を満たしたまま)',
-          rDoneReady.status === 200 && ipDone().shoot_mode === 'photographer', JSON.stringify(rDoneReady));
+        check('🚨 撮影判定: 撮影不要の素材完了で ③ を完了したあとも、撮影が要るへは変えられない (409・撮影の素材はまだ無い・名指し6 High)',
+          rDoneReady.status === 409 && ipDone().shoot_mode === 'none' && ipDone().material_status === 'ready', JSON.stringify([rDoneReady, ipDone()]));
+        // 撮影が要る判定のまま素材完了で ③ を完了した商品は、もう一方の撮影へ変えても ③ の条件を満たす
+        db.prepare(`UPDATE draft_image_production SET shoot_mode = 'inhouse', material_status = 'ready' WHERE draft_id = ?`).run(idDone);
+        const rInToPh = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'photographer' });
+        check('撮影判定: 撮影が要る同士 (社内撮影 → カメラマン撮影) の変更は素材完了のまま通る',
+          rInToPh.status === 200 && ipDone().shoot_mode === 'photographer' && ipDone().material_status === 'ready', JSON.stringify(rInToPh));
         db.prepare(`UPDATE draft_image_production SET shoot_mode = 'none', material_status = 'not_required' WHERE draft_id = ?`).run(idDone);
         wfp.setStepState(idDone, 'imgd_material', { state: 'todo' }, 'smoke', { isAdmin: true });
         const rReopened = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'inhouse' });
@@ -6440,6 +6448,14 @@ let wfSetParentId = null;
       check('🚨 保存: 撮影指示書の段が隠れていれば URL を送らない (undefined = サーバは今の値を残す)・見えていれば送る',
         flow.cameraUrlForSave(camDoc(true)) === undefined && flow.cameraUrlForSave(camDoc(false)) === 'https://docs.google.com/spreadsheets/d/stash/edit'
         && JSON.stringify({ camera_instruction_url: flow.cameraUrlForSave(camDoc(true)) }) === '{}');
+      // 撮影・素材ステータスは開いたときから変えたときだけ送る (古いタブで新しい値を戻さない・名指し6 M)
+      const matDoc = (value, initial) => ({ getElementById: (id) => (id === 'ip-material'
+        ? { value, options: ['', 'shipped', 'ready'].map((v) => ({ value: v, defaultSelected: v === initial })) } : null) });
+      const flowMat = new Function(flowChunk + '\nreturn materialForSave;')();
+      check('🚨 保存: 撮影・素材ステータスは変えていなければ送らない・変えたら送る (未設定から/未設定へも)',
+        flowMat(matDoc('shipped', 'shipped')) === undefined && flowMat(matDoc('ready', 'shipped')) === 'ready'
+        && flowMat(matDoc('', '')) === undefined && flowMat(matDoc('ready', '')) === 'ready' && flowMat(matDoc('', 'ready')) === '');
+      check('保存の JS: 画像制作情報の保存は materialForSave を通す', /material_status: materialForSave\(document\)/.test(detailSrc));
       check('保存の JS: 画像制作情報の保存は cameraUrlForSave を通す (欄の値を直接送らない)',
         /camera_instruction_url: cameraUrlForSave\(document\)/.test(detailSrc) && !/camera_instruction_url: document\.getElementById\('ip-camera-url'\)\.value/.test(detailSrc));
 
@@ -6453,6 +6469,8 @@ let wfSetParentId = null;
           fire: async (t) => { for (const fn of ls[t] || []) await fn(); },
           count: (t) => (ls[t] || []).length,
           getAttribute: (k) => (k in attrs ? attrs[k] : null),
+          setAttribute: (k, v) => { attrs[k] = String(v); },
+          classList: { toggle: () => {} },
           removeAttribute: (k) => { delete attrs[k]; },
           hasAttr: (k) => k in attrs,
           select() { this.selected += 1; },
@@ -6545,8 +6563,12 @@ let wfSetParentId = null;
       check('画面の JS: 確認して保存できたら、未保存の URL を元の値に戻してから読み直す',
         asked.length === 4 && els['ip-camera-url'].value === '' && posts.length === 3 && posts[2][0] === '/apps/product-hub/api/drafts/7/shoot-mode'
         && posts[2][1].mode === 'none' && reloads.length === 3 && reloads[2][0].ok === true, JSON.stringify([posts, reloads]));
-      check('画面の JS: 保存できたら読み直すまで 3 つとも押せないまま (続けて押させない)', modeBtns.every((b) => b.disabled === true));
-      modeBtns.forEach((b) => { b.disabled = false; });
+      check('🚨 画面の JS: 保存できたら、読み直す前に画面の判定 (data-current・押された状態) を新しい値にそろえる (読み直しが止められても古い判定で依頼を出させない・名指し6 M)',
+        els['shoot-mode-box'].dataset.current === 'none' && modeBtns[0].getAttribute('aria-checked') === 'true'
+        && modeBtns[1].getAttribute('aria-checked') === 'false' && modeBtns.every((b) => b.disabled === false),
+        JSON.stringify([els['shoot-mode-box'].dataset.current, modeBtns.map((b) => b.getAttribute('aria-checked'))]));
+      await els['shoot-req-copy'].fire('click');
+      check('画面の JS: そろえた後は「撮影不要」としてコピーを止める', els['shoot-req-msg'].textContent.includes('撮影依頼は出せません'));
       await modeBtns[2].fire('click');
       check('画面の JS: 撮影が要る判定は確認なしで送る (URL を消さない向き)', asked.length === 4 && posts.length === 4 && posts[3][1].mode === 'photographer');
       check('画面の JS: ボタンの処理は 1 つずつ (二重登録しない)', modeBtns.every((b) => b.count('click') === 1) && els['shoot-req-copy'].count('click') === 1);

@@ -5877,7 +5877,7 @@ th.attr-unknown { color: #dc2626; }
         edit_data_url: document.getElementById('ip-edit-data-url').value,
         top_compose_text: document.getElementById('ip-top-compose').value,
         top_ref_url: document.getElementById('ip-top-ref-url').value,
-        material_status: document.getElementById('ip-material').value,
+        material_status: materialForSave(document),
         ...productInfoPayload(),
         back_info_text: document.getElementById('ip-back-info').value,
       });
@@ -5932,6 +5932,17 @@ th.attr-unknown { color: #dc2626; }
     if (!el || (sec && sec.hidden)) return undefined;
     return el.value;
   }
+  /**
+   * 「画像制作情報を保存」で送る撮影・素材ステータス。画面を開いたときから変えていなければ送らない —
+   * 別のタブ・撮影判定で変わった新しい値を、開いたときの古い値で戻さない (Codex PR-A 名指し6 M)
+   */
+  function materialForSave(doc) {
+    const el = doc.getElementById('ip-material');
+    if (!el) return undefined;
+    const opts = el.options ? Array.prototype.slice.call(el.options) : [];
+    const init = opts.filter(function (o) { return o.defaultSelected; })[0];
+    return el.value === (init ? init.value : '') ? undefined : el.value;
+  }
   /** 画面のつなぎ込み。deps = { post, showAndReload, base, clipboard, confirm } (smoke では偽物を渡す) */
   function initImageFlow(doc, deps) {
     // 撮影判定: 押した時点で保存して読み直す (素材ステータスもサーバがそろえるので、画面で値を作らない)
@@ -5959,6 +5970,17 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok && msg) msg.textContent = '保存できませんでした: ' + (json.error || '');
         // 欄を元の値に戻すのは保存できたときだけ (失敗したら判定は変わらないので、打った URL を残す — 名指し3 M)
         if (json.ok && dropCam) cam.value = cam.defaultValue || '';
+        if (json.ok) {
+          // 読み直しが離脱確認で止められても、画面が古い判定のまま残らないよう先にそろえる
+          // (撮影依頼文のコピー・次に送る expected はこの値を見る — Codex PR-A 名指し6 M)
+          if (modeBox) modeBox.dataset.current = btn.dataset.shootMode;
+          allBtns.forEach(function (b) {
+            const on = b === btn;
+            b.setAttribute('aria-checked', on ? 'true' : 'false');
+            if (b.classList) b.classList.toggle('on', on);
+            b.disabled = false;
+          });
+        }
         deps.showAndReload(json, '撮影判定を保存しました');
       });
     });
