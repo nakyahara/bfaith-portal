@@ -182,9 +182,10 @@ async function save(code, values, { ownership = ALL_COMPANY, reason = 'テスト
   return as(E, 'master_edit', () => W.saveSku(db, { actor: 'naka@test', requestId, code, reason, seen, values }, { ownership, open: true, now: NOW, shippingRates: RATES }));
 }
 /** 新商品の登録 (⑤-2a)。原価の始まりは DB の東京の今日 (0052 の ops.register_new_sku が now() で確かめる) = 本当の今日 (画面の今日 2030-01-10 より前 = その日の原価にも出る) */
-const reg = (kind, code, values, o = {}) => as(E, 'master_edit', () => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind, code, values, card: { create: false } },
+// 🆕 0061 (2026-10-08 中原さん): 下書きの保存で要る欄。セットは推奨保有月数 (単品は single() が入れる)
+const reg = (kind, code, values, o = {}) => as(E, 'master_edit', () => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind, code, values: kind === 'set' ? { reorder_months: '1', ...values } : values, card: { create: false } },
   { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: RATES, ...o }));
-const single = (over = {}) => ({ name: '新しい単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', cost: { jpy: '300' }, ...over });
+const single = (over = {}) => ({ name: '新しい単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', sales_class: '3', expiry_managed: '0', reorder_months: '1', cost: { jpy: '300' }, ...over });
 const opts = (o = {}) => ({ ownership: ALL_COMPANY, open: true, nowMs: NOW_MS, ...o });
 /** 仕入先の道 (lib/master-supplier.mjs) の持ち主表 = 切替の後 (全部 company) */
 const SOPT = { ownership: ALL_COMPANY };
@@ -265,7 +266,7 @@ await ta('[C2] 止まる理由: 原価が無い・構成品が NE 確認済み�
   let e = await rejectsWith(build('products', ['new-a', 'new-nocost']), 409, 'not_ready');
   assert.deepEqual(e.extra.items.map((x) => x.code), ['new-nocost']);
   assert.ok(e.extra.items[0].blockers.some((b) => /原価/.test(b)), JSON.stringify(e.extra.items));
-  await reg('set', 'new-set-draft', { name: '下書きの単品のセット', standard_price: '2000', shipping_code: 'S02', components: [{ code: 'new-a', qty: 1 }], set_sales_class_override: '3' });
+  await reg('set', 'new-set-draft', { name: '下書きの単品のセット', standard_price: '2000', shipping_code: 'S02', components: [{ code: 'new-a', qty: 1 }] });   // 0061: 下書きの単品にも売上分類がある = 構成品から導ける (上書きは要らない)
   e = await rejectsWith(build('sets', ['new-set-draft']), 409, 'not_ready');
   assert.ok(e.extra.items[0].blockers.some((b) => /new-a が NE 確認済みでない/.test(b)), JSON.stringify(e.extra.items));
   await reg('single', 'new-dup', single({ name: 'NE にもうある' }));
@@ -756,7 +757,7 @@ await ta('[C16] 状態の関数の根拠の照らし直し (持ち主が状態�
   await supersede(rx.export.export_id);
   // 5. セットの構成品が NE 確認済みでない = 作る関数も止める (NE の元のコードにはあっても・lib の確かめを通さずに呼んでも)
   await reg('single', 'new-s1', single({ name: 'S1' }));
-  await reg('set', 'new-sd', { name: '下書きの構成品のセット', standard_price: '2000', shipping_code: 'S02', components: [{ code: 'new-s1', qty: 1 }], set_sales_class_override: '3' });
+  await reg('set', 'new-sd', { name: '下書きの構成品のセット', standard_price: '2000', shipping_code: 'S02', components: [{ code: 'new-s1', qty: 1 }] });   // 0061: 構成品から導ける
   const run5 = 'mc_20300110T030000000Z_eeeeee';
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, '2030-01-10T03:00:00Z', 0)`, [run5]);
   await recordNeCodes(pg, run5, ['new-dup', 'new-m', 'new-s1']);
