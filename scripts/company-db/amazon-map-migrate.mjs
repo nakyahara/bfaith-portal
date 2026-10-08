@@ -21,8 +21,7 @@
  *   本番に届かない = 断る (確かめられない)。本番には読むだけの 1 文 (current_database など) しか流さない
  * --fba-db は影運転と apply (と reconcile) で要る (Sheet にだけある SKU を数える。Codex #1586 R1 M3)。無い・読めない = すぐ断る。
  *   PR-D (10/8 中原さん「スプレッドシートは使用していないので無視」): Sheet にだけある SKU (sheet_only) は止める項目でなく「気をつける」(数・例は出す・終了コードに効かない)。
- *   その出品 (対応なし) に切替の前の夜間ロードが Sheet から作った自動の構成は、移行の同じ取引で消す (影運転は消す予定の数と例)。人が確定した行 (manual) は止める項目
- *   sheet_only_manual。消した後に残れば巻き戻す (#1651 Codex R1 High)
+ *   ただしその出品 (対応なし) に Company DB の構成が 1 行でもあれば止める項目 sheet_only_has_components (出どころによらない・何も消さない = 人が見て決める・#1651)
  * 出すもの: 古い表のハッシュ (H0 の候補)・移せた SKU の古い表 / Company DB のハッシュと一致・切替を止める項目 (blockers・目標は全部 0)・気をつけること・書いた行の数
  * 🚨 古い表 (warehouse.db・fba.db) は読むだけで開く。Render と miniPC の SQLite には書かない (16 §7 M8)
  * 終了コード: 0 = 成功 (影運転は止める項目が 0 件かつハッシュが一致) / 1 = 失敗・止める項目あり・不一致 / 2 = 引数不正・本番を指している
@@ -142,9 +141,6 @@ if (isMain) {
       console.log(`移せた SKU ${r.subset.skus}: 古い表 ${r.subset.legacy.content_hash || r.subset.legacy.error} / Company DB ${r.subset.company.content_hash || r.subset.company.error} → ${r.subset.match ? '一致' : '不一致'}`);
       console.log(`切替を止める項目: ${r.blocker_total} 件 (止まる SKU ${r.blocked_skus})${Object.entries(r.blockers).map(([k, v]) => `\n  ${k}: ${v.count} 件 例 ${JSON.stringify(v.samples.slice(0, 3))}`).join('')}`);
       for (const [k, v] of Object.entries(r.warnings)) console.log(`気をつける: ${k} ${v.count} 件 例 ${JSON.stringify(v.samples.slice(0, 3))}`);
-      // #1651 Codex R1 High: Sheet にだけある SKU の出品 (対応なし) の自動の構成 = 移行で消す (影運転も同じ取引で消して巻き戻す)
-      const so = r.sheet_only_cleanup;
-      if (so) console.log(`Sheet にだけある SKU の出品の自動の構成: ${r.committed ? '消した' : '消す予定'} ${so.rows} 行 (出品 ${so.listings})${so.rows ? ` 例 ${JSON.stringify(so.samples.slice(0, 3))}` : ''}・FBM の完全一致は残す ${so.kept_fbm ?? 0} 行・消した後に残る ${so.left_after} 行`);
       if (r.cdb_before) console.log(`合わせ直す前の Company DB のハッシュ: ${r.cdb_before.content_hash} (対応 ${r.cdb_before.master_rows}・構成 ${r.cdb_before.component_rows})`);
       console.log(r.committed ? (mode === 'reconcile' ? '✅ 合わせ直した (commit)' : '✅ 移した (commit)') : '巻き戻した (影運転)');
       if (!(r.subset.match && r.blocker_total === 0)) process.exitCode = 1;
