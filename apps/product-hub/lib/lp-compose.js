@@ -120,6 +120,41 @@ export function canonicalJson(v) {
   return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`;
 }
 
+/**
+ * canonicalJson と同じ考え方 (キーの順を固定) の直列化を、**再帰せずに**行う (撮影判定の再送 hash 用・PR-C)。
+ * 外から来た JSON は深く入れ子にできるので、再帰の直列化はスタックを溢れさせる (Codex PR-C 名指し2 High・3 M)。
+ * 同じ値が 2 回出てくる (循環参照など・HTTP の JSON では起きない) ときは null
+ */
+export function canonicalJsonFlat(root) {
+  const out = [];
+  const stack = [{ v: root }];
+  const seen = new WeakSet();
+  while (stack.length) {
+    const t = stack.pop();
+    if ('s' in t) { out.push(t.s); continue; }
+    const v = t.v;
+    if (v === null || typeof v !== 'object') {
+      const j = JSON.stringify(v);
+      out.push(j === undefined ? 'null' : j);
+      continue;
+    }
+    if (seen.has(v)) return null;
+    seen.add(v);
+    const parts = [];
+    if (Array.isArray(v)) {
+      parts.push({ s: '[' });
+      v.forEach((x, i) => { if (i) parts.push({ s: ',' }); parts.push({ v: x }); });
+      parts.push({ s: ']' });
+    } else {
+      parts.push({ s: '{' });
+      Object.keys(v).sort().forEach((k, i) => { parts.push({ s: (i ? ',' : '') + JSON.stringify(k) + ':' }); parts.push({ v: v[k] }); });
+      parts.push({ s: '}' });
+    }
+    for (let i = parts.length - 1; i >= 0; i--) stack.push(parts[i]);
+  }
+  return out.join('');
+}
+
 /** JST の日付 (1 日の上限を数える単位。夜間と手動が同じ境界を使う) */
 function jstDay(now) {
   return new Date(now + 9 * 3600_000).toISOString().slice(0, 10);
@@ -800,20 +835,13 @@ export function submitResult(db, generationId, {
   const shootSent = shoot !== undefined && shoot !== null;
   let shootHash = null;
   if (shootSent) {
-    // 🚨 canonicalJson は JSON にできない値 (循環参照) でスタックを溢れさせるので、先に JSON にできるかを見る (lint と同じ作法)。
-    //    JSON にできないものも結果は断らない (撮影判定だけ使わない)。
-    // 🚨 大きすぎるものも**中身から** hash を作る — 「使えない」1 つに畳むと、別々の大きすぎる判定の再送が
-    //    同じ結果と見なされる (Codex PR-C 名指し1 M)。大きさは保存できるかだけに使う (検査は lp-shoot.js)。
-    //    HTTP の本文は express.json の上限 (1MB) で抑えられている
-    // 🚨 canonicalJson は再帰なので、深く入れ子にした値 (JSON.stringify は通る深さ) でスタックを溢れさせる。
-    //    例外にすると結果が 500 になり、予約が reserved のまま残って構成ごと needs_review に落ちる (Codex PR-C 名指し2 High)。
-    //    溢れたら JSON の文字列そのものの hash にする (キーの順で別物になりうるが、同じ本文の再送は同じ hash)
-    let s;
-    try { s = JSON.stringify(shoot); } catch { s = undefined; }
-    if (typeof s !== 'string') shootHash = 'unserializable';
-    else {
-      try { shootHash = sha256(canonicalJson(JSON.parse(s))); } catch { shootHash = 'raw:' + sha256(s); }
-    }
+    // 撮影判定がどんな形でも結果は断らない (撮影判定だけ使わない)。hash は**中身から**作る:
+    // 🚨 「使えない」1 つに畳むと、別々の壊れた判定の再送が同じ結果と見なされる (Codex PR-C 名指し1・3 M)。
+    //    大きさは保存できるかだけに使う (検査は lp-shoot.js)。HTTP の本文は express.json の上限 (1MB) で抑えられている
+    // 🚨 再帰しない直列化 (canonicalJsonFlat) を使う — canonicalJson も JSON.stringify (Node 20 系) も再帰なので、
+    //    深く入れ子にした値でスタックが溢れ、結果が 500 → 予約が reserved のまま構成ごと needs_review に落ちる (名指し2 High・3 M)
+    const s = canonicalJsonFlat(shoot);
+    shootHash = s === null ? 'unserializable' : sha256(s);
   }
   // 🚨 receipt も hash の対象に入れる。入れないと「画像の証跡だけ違う再送」を
   //    同じ結果と見なして保存済みを返してしまう (コード R2 #1)。finalized_at は毎回変わるので入れない

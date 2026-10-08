@@ -234,6 +234,15 @@ console.log('④ 壊れた撮影判定 → 構成は受け付け、撮影判定�
     let again = null;
     try { again = accept(rr, { shoot: deep() }); } catch (e) { again = { thrown: String(e.message).slice(0, 80) }; }
     ok(again?.already === true, '同じ深い入れ子の再送は保存済みを返す');
+    const deeper = deep(); let c = deeper.extra; while (c.a) c = c.a; c.b = 1;
+    let other = null;
+    try { other = accept(rr, { shoot: deeper }); } catch (e) { other = { thrown: String(e.message).slice(0, 80) }; }
+    eq(other?.code, 'already_finalized', '🚨 中身の違う深い入れ子の再送は上書きしない (「使えない」1 つに畳まない・Codex PR-C 名指し3 M)');
+    // 再帰しない直列化は、ふつうの値では canonicalJson と同じ
+    const sample = { b: [1, { y: 'あ', x: null }], a: true, c: 'x"y' };
+    eq(lp.canonicalJsonFlat(sample), lp.canonicalJson(sample), '再帰しない直列化はふつうの値で canonicalJson と同じ');
+    const cyc = { a: 1 }; cyc.self = cyc;
+    eq(lp.canonicalJsonFlat(cyc), null, '循環参照は null (例外にしない)');
   }
   for (const [label, shoot] of [
     ['大きすぎる', { ...goodShoot(), reason: 'x'.repeat(50_000) }],
@@ -414,16 +423,32 @@ console.log('⑪ 権限 — 実際に押す役割 (画像登録者) で「おす
   session = { email: 'shoot-prc-none@b-faith.biz', role: 'user' };
   const html = await (await fetch(`${base}/detail/${dHttp.id}`)).text();
   ok(html.includes('id="shoot-rec-json">{'), '役割が無くても AI のおすすめは見える (読むだけ)');
-  const rNo = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'inhouse', expected: null });
+  const aiJob = lp.latestShootJudgement(db, dHttp.id).job_id;
+  const rNo = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'inhouse', expected: null, ai_job_id: aiJob });
   eq(rNo.status, 403, '役割が無い人は「おすすめにする」(= /shoot-mode) で変えられない');
   session = { email: 'shoot-prc-img@b-faith.biz', role: 'user' };
-  const rImg = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'inhouse', expected: null });
-  ok(rImg.status === 200 && rImg.json.shoot_mode === 'inhouse', '画像登録者 (管理者でない) は おすすめを選べる');
+  // 🚨 古いタブ: 画面が見ていたおすすめ (ai_job_id) が今の AI のおすすめと違えば 409 (Codex PR-C 名指し3 M)
+  const ipOf = () => db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(dHttp.id) || {};
+  const rOldJob = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'inhouse', expected: null, ai_job_id: aiJob - 1 });
+  ok(rOldJob.status === 409 && /おすすめが新しく/.test(rOldJob.json?.error || '') && !ipOf().shoot_mode, `🚨 前の構成のおすすめ (別の job) は保存しない (${rOldJob.status})`);
+  const rOtherMode = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'none', expected: null, ai_job_id: aiJob });
+  ok(rOtherMode.status === 409 && !ipOf().shoot_mode, '🚨 「おすすめにする」なのにおすすめと違う判定は保存しない');
+  const rBadId = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'inhouse', expected: null, ai_job_id: String(aiJob) });
+  ok(rBadId.status === 400 && !ipOf().shoot_mode, 'ai_job_id は数だけ (文字列は 400)');
+  const rImg = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'inhouse', expected: null, ai_job_id: aiJob });
+  ok(rImg.status === 200 && rImg.json.shoot_mode === 'inhouse', '画像登録者 (管理者でない) は いまのおすすめを選べる');
   const rStale = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'none', expected: null });
   eq(rStale.status, 409, '🚨 古い画面 (未判定のつもり) からの送信は 409 (別タブとの食い違いは今どおり止まる)');
+  const rHuman = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'photographer', expected: 'inhouse' });
+  ok(rHuman.status === 200 && ipOf().shoot_mode === 'photographer', '3 択を直接押す (ai_job_id なし) なら AI と違う判定も今どおり選べる');
   session = { email: 'nakahara@x', role: 'admin' };
-  const ip = db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(dHttp.id);
-  eq(ip.shoot_mode, 'inhouse', '判定は人が押したものだけ');
+  eq(ipOf().shoot_mode, 'photographer', '判定は人が押したものだけ');
+  // 作り直しを頼んだら (使える構成が無い) おすすめにするは通らない
+  const fileId = db.prepare('SELECT drive_file_id FROM draft_images WHERE draft_id = ?').get(dHttp.id).drive_file_id;
+  const redo = lp.requestJob(db, { draft: dHttp, spec, productInfo: 'x', colorVariations: '', images: [{ file_id: fileId }], idempotencyKey: 'shoot-key-redo-http', actor: 't@x' });
+  const rRedo = await call('POST', `/api/drafts/${dHttp.id}/shoot-mode`, { mode: 'inhouse', expected: 'photographer', ai_job_id: aiJob });
+  ok(rRedo.status === 409 && ipOf().shoot_mode === 'photographer', '🚨 作り直しを頼んだ後の古いおすすめも保存しない');
+  db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(redo.job.id);
   // AI のおすすめが出ても撮影判定は自動で書き換わらない
   const dAuto = mkDraft();
   const rA = reserveFor(dAuto);
@@ -520,8 +545,8 @@ console.log('⑫ 画面の JS (@shoot-rec) — 偽の document で動かす');
   ok(!a.els['shoot-rec-text'].innerHTMLSet, '🚨 理由は textContent で入れる (AI の文を HTML にしない)');
   await a.els['shoot-rec-adopt'].click();
   await settle();
-  eq(a.posts, [['/apps/product-hub/api/drafts/9/shoot-mode', { mode: 'inhouse', expected: null }]],
-    '🚨 「おすすめにする」= 社内撮影のボタンを押すのと同じ送り方 (expected つき・/shoot-mode)');
+  eq(a.posts, [['/apps/product-hub/api/drafts/9/shoot-mode', { mode: 'inhouse', expected: null, ai_job_id: 1 }]],
+    '🚨 「おすすめにする」= 社内撮影のボタンを押すのと同じ送り方 (expected つき・/shoot-mode) + どの構成のおすすめか (ai_job_id)');
   ok(a.els['shoot-mode-box'].dataset.current === 'inhouse' && a.modeBtns[1].getAttribute('aria-checked') === 'true', '保存できたら画面の判定も社内撮影');
   ok(a.els['shoot-rec-adopt'].hidden === true && !/まだ判定/.test(a.els['shoot-rec-text'].textContent), '選んだら「おすすめにする」は消え、文もそろう (読み直しを待たない)');
   eq(a.reloads.length, 1, '読み直しは今どおり 1 回');
@@ -538,6 +563,12 @@ console.log('⑫ 画面の JS (@shoot-rec) — 偽の document で動かす');
     '🚨 送れなかったら判定は変えない (画面も撮影不要のまま・expected は画面が見ていた判定)');
   ok(/保存できませんでした/.test(b.els['shoot-mode-msg'].textContent), '送れなかった理由を出す');
   ok(b.els['shoot-rec-adopt'].hidden === false, '送れなかったら「おすすめにする」は残る');
+  // 「おすすめにする」の印は 1 回だけ。その後に 3 択を直接押したら ai_job_id は付かない (人の判定は AI と違ってよい)
+  b.setPost('ok');
+  await b.modeBtns[1].click();
+  await settle();
+  ok(b.posts.length === 2 && b.posts[1][1].mode === 'inhouse' && !('ai_job_id' in b.posts[1][1]),
+    '🚨 「おすすめにする」が失敗した後に同じボタンを直接押しても ai_job_id は付かない (印は 1 回だけ)');
 
   // ポーリングで入れ直す
   const c = build(null, null);

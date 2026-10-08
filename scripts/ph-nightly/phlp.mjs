@@ -338,8 +338,28 @@ async function cmdLint(id, opt) {
 function readShoot(name, id) {
   const p = safePath(name, 'shoot', id);
   if (fs.statSync(p).size > SHOOT_FILE_MAX) die(`撮影判定が大きすぎます (${SHOOT_FILE_MAX} バイトまで)`);
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
+  let v;
+  try { v = JSON.parse(fs.readFileSync(p, 'utf8')); }
   catch { die(`${name} が JSON ではありません (直すか、--shoot を外して出してください)`); }
+  // 🚨 深く入れ子にした JSON は送る前の JSON.stringify (Node 20 系は再帰) でスタックを溢れさせ、
+  //    result が一度も届かないまま予約が残って構成ごと needs_review に落ちる (Codex PR-C 名指し3 High)。
+  //    撮影判定の正しい形は 4 段 (判定 → images → 画像 → 値) なので、それより深ければ送らずに止める
+  if (depthOf(v) > SHOOT_MAX_DEPTH) die(`${name} の入れ子が深すぎます (撮影判定の形ではありません。直すか、--shoot を外して出してください)`);
+  return v;
+}
+const SHOOT_MAX_DEPTH = 6;
+/** 入れ子の深さ (再帰しない。深い値でもここでは溢れない) */
+function depthOf(root) {
+  let max = 0;
+  const stack = [[root, 1]];
+  while (stack.length) {
+    const [v, d] = stack.pop();
+    if (v === null || typeof v !== 'object') continue;
+    if (d > max) max = d;
+    if (max > SHOOT_MAX_DEPTH) return max;
+    for (const x of Object.values(v)) stack.push([x, d + 1]);
+  }
+  return max;
 }
 
 async function cmdResult(id, opt) {

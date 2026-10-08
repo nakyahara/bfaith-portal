@@ -224,6 +224,10 @@ console.log('⑤b lint — サーバが正本。出す前に自分で直せる (
   fs.writeFileSync(path.join(work, `shoot-${other}.json`), JSON.stringify(SHOOT_OK), 'utf8');
   eq((await phlp('lint', jid, '--file', `out-${jid}.md`, '--shoot', `shoot-${other}.json`)).code, 2, '🚨 他の依頼の撮影判定は読まない');
   eq((await phlp('lint', jid, '--file', `out-${jid}.md`, '--shoot', `../shoot-${jid}.json`)).code, 2, '🚨 パス付きの撮影判定は読まない');
+  // 🚨 深く入れ子にした JSON は送る前に止める (送るときの JSON.stringify が溢れて result が届かないのを防ぐ・Codex PR-C 名指し3 High)
+  fs.writeFileSync(path.join(work, `shoot-${jid}.json`), '{"recommended":"inhouse","extra":' + '{"a":'.repeat(5000) + '1' + '}'.repeat(5000) + '}', 'utf8');
+  const lsDeep = await phlp('lint', jid, '--file', `out-${jid}.md`, '--shoot', `shoot-${jid}.json`);
+  ok(lsDeep.code === 2 && /入れ子が深すぎます/.test(lsDeep.err), '🚨 入れ子が深すぎる撮影判定は送らずに止める (--shoot を外せば構成は出せる)');
 }
 
 console.log('⑥ result — lint と証跡はサーバが見る');

@@ -6027,6 +6027,9 @@ th.attr-unknown { color: #dc2626; }
     // 撮影判定: 押した時点で保存して読み直す (素材ステータスもサーバがそろえるので、画面で値を作らない)
     doc.querySelectorAll('[data-shoot-mode]').forEach(function (btn) {
       btn.addEventListener('click', async function () {
+        // 「おすすめにする」(@shoot-rec) から押されたときだけ 1 回付く。サーバがいまの AI のおすすめと照らす (PR-C)
+        const aiJobId = btn.dataset.aiJobId ? Number(btn.dataset.aiJobId) : null;
+        delete btn.dataset.aiJobId;
         if (btn.getAttribute('aria-checked') === 'true') return;
         // 🚨 撮影指示書の URL を打って保存していないまま「撮影不要」にすると、読み直しで段が隠れ、
         //    未保存の退避が隠れた欄に戻る。次に別の項目を保存すると見えない URL まで保存される
@@ -6043,7 +6046,9 @@ th.attr-unknown { color: #dc2626; }
         const modeBox = doc.getElementById('shoot-mode-box');
         const shown = modeBox && modeBox.dataset.current ? modeBox.dataset.current : null;
         let json;
-        try { json = await deps.post(deps.base + '/shoot-mode', { mode: btn.dataset.shootMode, expected: shown }); }
+        const body = { mode: btn.dataset.shootMode, expected: shown };
+        if (aiJobId) body.ai_job_id = aiJobId;
+        try { json = await deps.post(deps.base + '/shoot-mode', body); }
         catch (e) { json = { ok: false, error: '通信できませんでした' }; }
         if (!json.ok) allBtns.forEach(function (b) { b.disabled = false; });
         if (!json.ok && msg) msg.textContent = '保存できませんでした: ' + (json.error || '');
@@ -6174,7 +6179,10 @@ th.attr-unknown { color: #dc2626; }
         if (!mode) return;
         const target = Array.prototype.slice.call(doc.querySelectorAll('[data-shoot-mode]'))
           .filter(function (b) { return b.dataset.shootMode === mode; })[0];
-        if (target && !target.disabled && target.getAttribute('aria-checked') !== 'true') target.click();
+        if (!target || target.disabled || target.getAttribute('aria-checked') === 'true') return;
+        // どの構成のおすすめを選んだかを添える (別のタブで作り直されていたらサーバが 409 で止める・Codex PR-C 名指し3 M)
+        if (judgement && judgement.job_id) target.dataset.aiJobId = String(judgement.job_id);
+        target.click();
       });
     }
     refresh();

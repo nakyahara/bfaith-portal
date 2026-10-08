@@ -1,6 +1,6 @@
 ---
 name: ph-lp-compose
-description: product-hub の「構成をAIに作らせる」の実行役 — claim → 商品画像を見る → ⑦AI画像生成プロンプトを書く → 撮影判定を書く → lint → Codex検品 → 反映 → 書き戻す。「LP構成を作って」「ph-lp-compose」で起動。ランナー (scripts/ph-nightly/run-lp-compose.ps1) からも同じ手順で走る
+description: product-hub の「構成をAIに作らせる」の実行役 — claim → 商品画像を見る → ⑦AI画像生成プロンプトを書く → lint → Codex検品 → 反映 → 撮影判定を書く → 書き戻す。「LP構成を作って」「ph-lp-compose」で起動。ランナー (scripts/ph-nightly/run-lp-compose.ps1) からも同じ手順で走る
 ---
 
 # product-hub LP 構成の AI 生成 (段階1・2026-10-01)
@@ -134,37 +134,10 @@ img-12-7.jpg (素材1・使用イメージ/玄関.jpg): 玄関の床に向けて
 分かっていない項目は仕様書の決まりに従って「未確認」「要確認」とし、
 そもそも商品に存在しない項目は**見出しごと省く**。
 
-### 4b. 撮影判定を書く (`shoot-<ID>.json`)
-
-⑦ を書き終えたら、claim で来た **`shoot_instruction`** に従って、その構成の画像を作るのに撮影が要るかを判定し、
-**JSON だけ**を `shoot-<ID>.json` に書く。スタッフはこれを「AIのおすすめ」と理由として画面で見て、撮影判定を自分で決める
-(画面は自動では書き換えない)。画像ごとの撮影指示 (cut 以下) は撮影指示書の材料になる。
-
-🚨 **⑦ の本文 (`out-<ID>.md`) に撮影判定を書かない。** 本文に足すと lint と lp-tool のパーサーが落ちる。
-🚨 **撮影判定のために構成を変えない。** 構成は `instruction` (スタッフと同じ指示文) だけで決める。
-
-```json
-{"recommended":"inhouse","reason":"2枚目 の写真 (使用シーン) がありません。卓上の簡単なカットなので社内撮影で足ります。",
- "images":[
-  {"no":0,"needs_shoot":false,"cut":"","composition":"","props":"","background":"","tone":"","ng":""},
-  {"no":1,"needs_shoot":false,"cut":"","composition":"","props":"","background":"","tone":"","ng":""},
-  {"no":2,"needs_shoot":true,"cut":"玄関でスプレーする手元","composition":"斜め上から手元と商品","props":"玄関マット","background":"白い玄関の床","tone":"自然光・明るめ","ng":"顔を写さない"}]}
-```
-
-サーバが見ること (`./phlp lint --shoot` で同じ検査を先に受けられる):
-- キーはこの形のものだけで、**どの画像も 8 つのキーを全部書く**。`recommended` は `none` / `inhouse` / `photographer`、`reason` は空でない (400 字まで)。文字の前後に空白・改行を入れない
-- `needs_shoot: false` の画像は cut 以下を全部 `""` にする
-- `images` は **⑦ の画像見出しの N と 1 対 1** (足りない・余計な番号・重複は通らない)。`no` は数、`needs_shoot` は true/false
-- `needs_shoot: true` の画像は `cut` と `composition` が要る
-- `recommended` が `none` なのに撮影が要る画像がある / `inhouse`・`photographer` なのに 1 枚も無い は通らない
-
-判定の材料は**見た画像と ⑦ の「使用素材」だけ**。素材画像に無い写真を「ある」ことにしない。
-撮影判定が通らなくても**構成の結果は出せる** — 直せなければ `--shoot` を外して出す (画面は「AI の判定なし」になるだけ)。
-
 ### 5. lint (サーバが見る)
 
 ```bash
-./phlp lint <ID> --file out-<ID>.md --shoot shoot-<ID>.json
+./phlp lint <ID> --file out-<ID>.md
 ```
 
 🚨 **lint の正本はサーバ側**。自分で `{"ok": true}` と書いても通らない。
@@ -227,12 +200,48 @@ critical / high の指摘があれば `out-<ID>.md` を直して、`_lp_review_<
 ./phlp result <ID> --rejected --reason-file reason-<ID>.txt --file out-<ID>.md --lint lint-<ID>.json --rounds 2 --shoot shoot-<ID>.json
 ```
 
+(撮影判定は手順 6b のとおり最後の構成で書いてから `--shoot` で渡す。書けなければ `--shoot` を外す)
+
 🚨 **書いた構成 (`out-<ID>.md`) があれば必ず `--file` で渡す** (2026-10-04 中原さん)。
 チェックを通らなかった構成として画面に出し、使えるかどうかは人が決める (くらべっこなので捨てない)。
 書けなかった (out が無い) ときだけ `--file` を付けない。
 
 `reason-<ID>.txt` には「何が通らなかったか」を具体的に書く (1000 字まで・画面で構成の横に出る)。
 **これは失敗ではなく測定結果。** 正直に書く。
+
+### 6b. 撮影判定を書く (`shoot-<ID>.json`・検品と直しが終わってから)
+
+🚨 **検品 (手順 6) と直しが終わった最後の `out-<ID>.md` で書く。** 先に書くと、検品で構成を直したときに
+撮影判定だけ古い構成のまま残る。書いた後に `out-<ID>.md` を直したら、撮影判定も作り直して `./phlp lint --shoot` をやり直す。
+
+claim で来た **`shoot_instruction`** に従って、その構成の画像を作るのに撮影が要るかを判定し、
+**JSON だけ**を `shoot-<ID>.json` に書く。スタッフはこれを「AIのおすすめ」と理由として画面で見て、撮影判定を自分で決める
+(画面は自動では書き換えない)。画像ごとの撮影指示 (cut 以下) は撮影指示書の材料になる。
+
+🚨 **⑦ の本文 (`out-<ID>.md`) に撮影判定を書かない。** 本文に足すと lint と lp-tool のパーサーが落ちる。
+🚨 **撮影判定のために構成を変えない。** 構成は `instruction` (スタッフと同じ指示文) だけで決める。
+
+```json
+{"recommended":"inhouse","reason":"2枚目 の写真 (使用シーン) がありません。卓上の簡単なカットなので社内撮影で足ります。",
+ "images":[
+  {"no":0,"needs_shoot":false,"cut":"","composition":"","props":"","background":"","tone":"","ng":""},
+  {"no":1,"needs_shoot":false,"cut":"","composition":"","props":"","background":"","tone":"","ng":""},
+  {"no":2,"needs_shoot":true,"cut":"玄関でスプレーする手元","composition":"斜め上から手元と商品","props":"玄関マット","background":"白い玄関の床","tone":"自然光・明るめ","ng":"顔を写さない"}]}
+```
+
+サーバが見ること (`./phlp lint --shoot` で同じ検査を先に受けられる):
+- キーはこの形のものだけで、**どの画像も 8 つのキーを全部書く**。`recommended` は `none` / `inhouse` / `photographer`、`reason` は空でない (400 字まで)。文字の前後に空白・改行を入れない
+- `needs_shoot: false` の画像は cut 以下を全部 `""` にする
+- `images` は **⑦ の画像見出しの N と 1 対 1** (足りない・余計な番号・重複は通らない)。`no` は数、`needs_shoot` は true/false
+- `needs_shoot: true` の画像は `cut` と `composition` が要る
+- `recommended` が `none` なのに撮影が要る画像がある / `inhouse`・`photographer` なのに 1 枚も無い は通らない
+
+判定の材料は**見た画像と ⑦ の「使用素材」だけ**。素材画像に無い写真を「ある」ことにしない。
+```bash
+./phlp lint <ID> --file out-<ID>.md --shoot shoot-<ID>.json
+```
+
+撮影判定が通らなくても**構成の結果は出せる** — 直せなければ `--shoot` を外して出す (画面は「AI の判定なし」になるだけ)。
 
 ### 7. 書き戻す
 
