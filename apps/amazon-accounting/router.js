@@ -1502,6 +1502,7 @@ router.get('/history/:yearMonth', (req, res) => {
       by_segment: JSON.parse(row.by_segment || '{}'),
       excluded: JSON.parse(row.excluded || '{}'),
       mf_row: JSON.parse(row.mf_row || '{}'),
+      unresolved_skus: parseJsonArray(row.unresolved_skus),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });

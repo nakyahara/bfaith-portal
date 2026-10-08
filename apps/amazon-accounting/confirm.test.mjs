@@ -82,6 +82,8 @@ test('未登録SKUがあっても確定できる: 10%・その他/未分類・�
   // 過去の確定データ (GET /history) でも内訳が配列で返る
   const hist = await (await fetch(base + '/history')).json();
   assert.deepEqual(hist.find(h => h.year_month === '2026-07').unresolved_skus.map(u => u.sku), ['sku-new']);
+  const one = await (await fetch(base + '/history/2026-07')).json();
+  assert.deepEqual(one.unresolved_skus.map(u => u.sku), ['sku-new']); // 単月の口も配列で返す
 });
 
 test('税率未登録は引き続き確定できない', async () => {
