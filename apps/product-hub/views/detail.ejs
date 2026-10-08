@@ -5867,7 +5867,7 @@ th.attr-unknown { color: #dc2626; }
         production_type: document.getElementById('ip-type').value,
         aplus_content: document.getElementById('ip-aplus').value,
         aplus_related: document.getElementById('ip-aplus-related').value,
-        camera_instruction_url: document.getElementById('ip-camera-url').value,
+        camera_instruction_url: cameraUrlForSave(document),
         shipping_status: document.getElementById('ip-shipping').value,
         reference_collection: document.getElementById('ip-refcol').value,
         designer: document.getElementById('ip-designer').value,
@@ -5906,6 +5906,12 @@ th.attr-unknown { color: #dc2626; }
     else if (!isWebUrl(sheet)) missing.push('撮影指示書の URL (https:// で始まる形)');
     if (!folder) missing.push('画像フォルダの URL');
     else if (!isWebUrl(folder)) missing.push('画像フォルダの URL (https:// で始まる形)');
+    // 撮影判定が「撮影が要る」でなければ依頼を出させない (古い指示書 URL が残っていて段が見えている商品でも。
+    // ボードは「撮影指示書 対象外」なのに依頼だけ飛ぶのを防ぐ — Codex PR-A 名指し5 M)
+    const needShoot = o && (o.shootMode === 'inhouse' || o.shootMode === 'photographer');
+    const blocked = needShoot ? null
+      : (o && o.shootMode === 'none' ? '撮影判定が「撮影不要」なので、撮影依頼は出せません'
+        : '撮影判定がまだです。「社内撮影」か「カメラマン撮影」を選んでからコピーしてください');
     const lines = [];
     if (mention) lines.push(mention);
     lines.push('お世話になっています。', '下記商品の商品撮影をお願いします。', '',
@@ -5913,7 +5919,18 @@ th.attr-unknown { color: #dc2626; }
       '【撮影指示書】', sheet || '(未登録)', '',
       '【商品画像フォルダ】', folder || '(未登録)', '',
       'よろしくお願いいたします。');
-    return { ok: missing.length === 0, missing: missing, text: lines.join(nl) };
+    return { ok: !blocked && missing.length === 0, blocked: blocked, missing: missing, text: lines.join(nl) };
+  }
+  /**
+   * 「画像制作情報を保存」で送る撮影指示書の URL。段が隠れているとき (撮影不要・未判定で URL も無い) は送らない —
+   * 見えない欄に未保存の退避 (別タブで撮影不要にされた後など) が戻っていても保存しない (Codex PR-A 名指し5 M)。
+   * undefined は JSON に載らない = サーバは今の値を残す
+   */
+  function cameraUrlForSave(doc) {
+    const sec = doc.getElementById('ipf-step-shoot');
+    const el = doc.getElementById('ip-camera-url');
+    if (!el || (sec && sec.hidden)) return undefined;
+    return el.value;
   }
   /** 画面のつなぎ込み。deps = { post, showAndReload, base, clipboard, confirm } (smoke では偽物を渡す) */
   function initImageFlow(doc, deps) {
@@ -5954,7 +5971,9 @@ th.attr-unknown { color: #dc2626; }
       // 商品名は基本情報タブで読み直さずに直せるので、いまの欄の値を使う — Codex PR-A 名指し M。
       // 欄があって空なら空のまま (描いたときの古い名前で送らない — 名指し2 M)。欄が無い画面だけ描いたときの名前
       const nameEl = doc.getElementById('f-name');
+      const modeBox = doc.getElementById('shoot-mode-box');
       const r = buildShootRequestText({
+        shootMode: modeBox ? (modeBox.dataset.current || null) : null,
         mention: box.dataset.mention, productName: nameEl ? nameEl.value : box.dataset.name,
         sheetUrl: valueOf('ip-camera-url'), folderUrl: valueOf('import-folder-url'),
       });
@@ -5972,7 +5991,7 @@ th.attr-unknown { color: #dc2626; }
         const r = refresh();
         if (!r.ok) {
           // 欠けたまま貼ると、カメラマンが指示書や写真の置き場を探すことになる
-          if (copyMsg) copyMsg.textContent = r.missing.join('・') + ' が未登録です。入れてからコピーしてください';
+          if (copyMsg) copyMsg.textContent = r.blocked || (r.missing.join('・') + ' が未登録です。入れてからコピーしてください');
           return;
         }
         const fallback = function () {

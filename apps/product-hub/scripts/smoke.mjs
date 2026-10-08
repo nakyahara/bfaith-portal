@@ -6418,17 +6418,30 @@ let wfSetParentId = null;
       const detailSrc = fs.readFileSync(path.join(__dirname, '..', 'views', 'detail.ejs'), 'utf8');
       const flowChunk = detailSrc.slice(detailSrc.indexOf('/* @image-flow:start'), detailSrc.indexOf('/* @image-flow:end */'));
       check('画面の JS: 撮影依頼の部分を切り出せる', flowChunk.length > 200 && !flowChunk.includes('<%'));
-      const flow = new Function(flowChunk + '\nreturn { buildShootRequestText, initImageFlow };')();
+      const flow = new Function(flowChunk + '\nreturn { buildShootRequestText, initImageFlow, cameraUrlForSave };')();
       const SHEET = 'https://docs.google.com/spreadsheets/d/1Xk/edit';
-      const full = flow.buildShootRequestText({ mention: '@つくば', productName: 'マイタケ粉末 50g', sheetUrl: ` ${SHEET} `, folderUrl: FOLDER });
+      const full = flow.buildShootRequestText({ shootMode: 'inhouse', mention: '@つくば', productName: 'マイタケ粉末 50g', sheetUrl: ` ${SHEET} `, folderUrl: FOLDER });
       check('撮影依頼文: ラフの文面どおり (宛先・挨拶・商品名・指示書・画像フォルダ・締め)',
         full.ok === true && full.text === ['@つくば', 'お世話になっています。', '下記商品の商品撮影をお願いします。', '',
           '【商品名】マイタケ粉末 50g', '', '【撮影指示書】', SHEET, '', '【商品画像フォルダ】', FOLDER, '', 'よろしくお願いいたします。'].join('\n'),
         JSON.stringify(full));
-      const noFolder = flow.buildShootRequestText({ mention: '', productName: 'x', sheetUrl: SHEET, folderUrl: '  ' });
+      const noFolder = flow.buildShootRequestText({ shootMode: 'photographer', mention: '', productName: 'x', sheetUrl: SHEET, folderUrl: '  ' });
       check('撮影依頼文: 画像フォルダが無ければ ok=false・何が無いかを返す・宛先が空なら宛先の行を入れない',
         noFolder.ok === false && noFolder.missing.join() === '画像フォルダの URL' && noFolder.text.startsWith('お世話になっています。')
         && noFolder.text.includes('【商品画像フォルダ】\n(未登録)'), JSON.stringify(noFolder));
+      const fullArgs = { mention: '@つくば', productName: 'マイタケ粉末 50g', sheetUrl: SHEET, folderUrl: FOLDER };
+      const asNone = flow.buildShootRequestText({ ...fullArgs, shootMode: 'none' });
+      const asUnjudged = flow.buildShootRequestText({ ...fullArgs, shootMode: null });
+      check('🚨 撮影依頼文: 撮影判定が「撮影不要」・未判定なら、URL が揃っていても ok=false (古い指示書 URL で依頼を出させない・Codex PR-A 名指し5 M)',
+        asNone.ok === false && /撮影不要/.test(asNone.blocked || '') && asUnjudged.ok === false && /撮影判定がまだ/.test(asUnjudged.blocked || ''),
+        JSON.stringify([asNone, asUnjudged]));
+      // 保存で送る指示書 URL: 段が隠れていれば送らない (見えない欄に戻った未保存の退避を保存しない・名指し5 M)
+      const camDoc = (hidden, withSec = true) => ({ getElementById: (id) => (id === 'ipf-step-shoot' ? (withSec ? { hidden } : null) : id === 'ip-camera-url' ? { value: 'https://docs.google.com/spreadsheets/d/stash/edit' } : null) });
+      check('🚨 保存: 撮影指示書の段が隠れていれば URL を送らない (undefined = サーバは今の値を残す)・見えていれば送る',
+        flow.cameraUrlForSave(camDoc(true)) === undefined && flow.cameraUrlForSave(camDoc(false)) === 'https://docs.google.com/spreadsheets/d/stash/edit'
+        && JSON.stringify({ camera_instruction_url: flow.cameraUrlForSave(camDoc(true)) }) === '{}');
+      check('保存の JS: 画像制作情報の保存は cameraUrlForSave を通す (欄の値を直接送らない)',
+        /camera_instruction_url: cameraUrlForSave\(document\)/.test(detailSrc) && !/camera_instruction_url: document\.getElementById\('ip-camera-url'\)\.value/.test(detailSrc));
 
       // 偽の DOM: id で引ける要素と、撮影判定のボタン 3 つ
       const fakeEl = (init = {}) => {
@@ -6504,6 +6517,13 @@ let wfSetParentId = null;
         copied.length === copiedBefore && els['shoot-req-msg'].textContent.includes('商品名') && !els['shoot-req-text'].value.includes('マイタケ'),
         els['shoot-req-msg'].textContent + ' / ' + els['shoot-req-text'].value);
       els['f-name'].value = 'マイタケ粉末 50g';
+      // 撮影判定が「撮影不要」の画面 (古い指示書 URL で段が見えている商品) ではコピーしない
+      els['shoot-mode-box'].dataset.current = 'none';
+      await els['shoot-req-copy'].fire('click');
+      check('🚨 画面の JS: 撮影判定が「撮影不要」ならコピーせず理由を出す (Codex PR-A 名指し5 M)',
+        copied.length === copiedBefore && els['shoot-req-msg'].textContent.includes('撮影依頼は出せません'),
+        els['shoot-req-msg'].textContent);
+      els['shoot-mode-box'].dataset.current = 'inhouse';
       await modeBtns[1].fire('click');
       check('画面の JS: いま選ばれている撮影判定を押しても送らない', posts.length === 0);
       // 🚨 指示書の URL が未保存のまま「撮影不要」 → 先に聞く。やめたら送らない (Codex PR-A 名指し2 M)
