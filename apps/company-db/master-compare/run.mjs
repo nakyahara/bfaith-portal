@@ -145,7 +145,7 @@ function summaryLine12(r) {
   // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)
   const two = neSummary(r.ne);
   const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state) || r.ne.decisions_write === 'failed' || r.ne.decisions_write === 'not_configured'
-    || baselineTrouble(r.ne) || regTrouble(r.ne) || kindTrouble(r.ne);
+    || baselineTrouble(r.ne) || regTrouble(r.ne) || kindTrouble(r.ne) || spellingTrouble(r.ne);
   return bad ? `${two} / ${one}` : `${one} / ${two}`;
 }
 /** 区分の持ち主が C で、完全な NE の取得と Company DB の区分が違う SKU がある (差を残す承認でも消えない) = 要約の先頭に ⚠️ (重大。広げる道 v8・Codex R8) */
@@ -180,8 +180,10 @@ export function neSummary(ne) {
   const rt = regTrouble(ne);
   // 区分の差 (区分の持ち主が C) と新商品の登録の不一致は両方とも先頭に (片方で片方を隠さない。区分を先に)
   const kt = kindTrouble(ne);
+  // 🆕 0064 (#1667 Codex R2 Medium): NE のコードの書き方の問題 (確かめを待ちにした新商品) だけの朝も先頭に ⚠️ (✅ で始めると daily-sync の isWarnSummary が全部 OK に数える)
+  const st = spellingTrouble(ne);
   // 0063 の知らせ (配ってから日がたっても NE に無い・NE にあるが申告が要る) は区分違いの朝も出す (#1659 Codex R1 Medium = rt が無いと消えていた)
-  if (rt || kt) { const an = notImportedNote(ne); return `⚠️ ②: ${[kt, rt].filter(Boolean).join(" / ")} — 差 ${ne.counts?.items ?? 0} 件${rt ? regSummary(ne) : an ? `・${an}` : ""}`; }
+  if (rt || kt || st) { const an = notImportedNote(ne); return `⚠️ ②: ${[kt, rt, st].filter(Boolean).join(" / ")} — 差 ${ne.counts?.items ?? 0} 件${rt ? regSummary(ne) : an ? `・${an}` : ""}`; }
   const b = ne.counts?.by_class || {};
   const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
   // 基準 (D2) を照らさなかった回 (NE の取得と CDB の読みが 4 時間超) は ⚠️ にしないが、続くと基準が貯まらないので見えるようにする
@@ -217,7 +219,7 @@ export function regSummary(ne) {
  * 0063 の確かめの答えの知らせ (知らせるだけ = 照合は失敗にしない)。無ければ null。コードは 5 件まで
  *   not_imported = 配ってから日がたっても NE に無い (申告なし・「無い」を信じてよい取得) = 取り込まれていないらしい
  *   needs_declaration = NE にあるが自動で確かめない (セット・JAN を送った・配った時の印が無い = #1659 Codex R1) = 申告すると確かめる
- *   🆕 case_mismatch (0064・#1667 Codex R1 High) = NE のコードの書き方 (0041) が配ったコード (原文) と違う / 分からない = 比べない (状態を進めない)。⚠️ で出す
+ *   🆕 case_mismatch (0064・#1667 Codex R1 High) = NE のコードの書き方 (0041) が配ったコード (原文) と違う / 分からない = 比べない (状態を進めない)。ここでは出さず spellingTrouble が先頭の ⚠️ に出す (R2 Medium)
  *     (配った大文字のコードが取り込まれず、NE で大文字小文字だけ違う商品が作られた など = NE の画面で確かめる)
  */
 const AUTO_BLOCK_JA = { jan_not_compared: 'JAN', set_not_compared: 'セット', no_issue_lease: '配った時の印なし', no_row: '行なし', no_item: '品目なし' };
@@ -230,8 +232,6 @@ export function notImportedNote(ne) {
   if (ni.length) parts.push(`ℹ️ 配ってから ${w.not_imported_days ?? 3} 日たっても NE に無い (取り込まれていないらしい) ${ni.length} 件 (${codesOf(ni)})`);
   const nd = w && Array.isArray(w.needs_declaration) ? w.needs_declaration : [];
   if (nd.length) parts.push(`ℹ️ NE にあるが自動では確かめない (取り込んだと申告すると確かめる) ${nd.length} 件 (${codesOf(nd, (x) => AUTO_BLOCK_JA[x.reason] || x.reason)})`);
-  const cm = w && Array.isArray(w.case_mismatch) ? w.case_mismatch : [];
-  if (cm.length) parts.push(`⚠️ NE のコードの書き方 (大文字・小文字) が配ったコードと違う・確かめられない = 確かめない ${cm.length} 件 (${codesOf(cm, (x) => `${SPELLING_JA[x.reason] || x.reason}${Array.isArray(x.ne_spellings) && x.ne_spellings.length ? ` NE は ${x.ne_spellings.join('/')}` : ''}`)})`);
   return parts.length ? parts.join('・') : null;
 }
 /**
@@ -247,6 +247,17 @@ export async function regAfterCheck(db, ne, checkCounts) {
       return { state: 'ok', check: checkCounts, ...regTroubleCounts(fresh, new Set((ne.reg_pending?.kind_mismatch || []).map((e) => e.norm))) };
     } finally { try { await db.query('rollback'); } catch { /* */ } }
   } catch (e) { return { state: 'unreadable', check: checkCounts, reason: String(e && e.message).slice(0, 200) }; }
+}
+/**
+ * 🆕 0064 (#1667 Codex R1 High・R2 Medium): 照合の確かめの答えの case_mismatch = NE のコードの書き方 (0041) が配ったコード (原文) と違う / 確かめられない = 確かめない (状態を進めない)。
+ * 無ければ null。neSummary と summaryLine12 の両方がこれで ⚠️ を先頭にする (daily-sync の isWarnSummary は先頭の ⚠️ だけを見る)。コードは 5 件まで
+ */
+export function spellingTrouble(ne) {
+  const w = ne && ne.registrations && ne.registrations.written;
+  const cm = w && Array.isArray(w.case_mismatch) ? w.case_mismatch : [];
+  if (!cm.length) return null;
+  const one = (x) => `${x.code} ${SPELLING_JA[x.reason] || x.reason}${Array.isArray(x.ne_spellings) && x.ne_spellings.length ? ` NE は ${x.ne_spellings.join('/')}` : ''}`;
+  return `NE のコードの書き方 (大文字・小文字) が配ったコードと違う・確かめられない = 確かめない ${cm.length} 件 (${cm.slice(0, 5).map(one).join('・')}${cm.length > 5 ? ` ほか ${cm.length - 5}` : ''})`;
 }
 /** 確かめの後の読み直しを読めない (確かめが状態を進めたかもしれない = 確かめの前の数で ✅ にしない)。確かめの内訳は参考に出す */
 export function regAfterCheckTrouble(ne) {
