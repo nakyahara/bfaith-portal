@@ -76,6 +76,7 @@ import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFaile
 import {
   requestImageJob as requestLpImageJob, imageStateFor as lpImageStateFor, createLpImageWorker, openaiGenerateImage,
   imageBlockReason as lpImageBlockReason, imageRefCandidates as lpImageRefCandidates, validImageRequestKey as lpImageValidKey,
+  requestImageRegen as requestLpImageRegen, setImageChecked as setLpImageChecked, fullJobConflict as lpImageFullJobConflict,
 } from './lib/lp-image.js';
 import { Readable } from 'node:stream';
 // LP 構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09)。ロジックは lib/lp-edit.js
@@ -548,7 +549,8 @@ router.get('/detail/:id', (req, res) => {
     lpCompose: lpComposeInitialState(db, draft),
     // 「🖼 画像を作る」(段階2・2026-10-04)。同じく最初の表示をここで作る
     // compose_version = 画面が見ている LP構成の版。押したときに添え、違えば受け付けない (PR-B)
-    lpImage: { ...lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }), compose_version: lpComposeVersion(db, draft) },
+    // can_edit = 押せる人か (PR-E)・compose_version = 画面が見ている LP構成の版 (PR-B) は lpImageStateForReq が付ける
+    lpImage: lpImageStateForReq(req, db, draft),
     // LP構成の確認・修正 (2026-10-09 PR-B)。直せるのは画像制作情報を触れる人だけ (見るのは誰でも)
     lpEdit: lpEditStateFor(db, draft, { canEdit: canEditImageProduction(req), imageLimit: lpImageLimitForPriority(draft.image_priority) }),
     // 画像制作の新フロー (2026-10-08): 撮影判定の 3 択と、撮影依頼文の宛先
@@ -4185,24 +4187,49 @@ async function lpImageRefTimes(fileIds) {
 router.get('/api/drafts/:id/lp-images', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  const st = lpImageStateFor(getDB(), { draft, folderId: lpImageFolderId(draft) });
+  const st = lpImageStateForReq(req, getDB(), draft);
   // 作っている途中なのに作る係が休んでいる (再起動の後・期限切れの片付け待ち) なら起こす。kick は重ねて呼んでも 1 本だけ
-  if (st.job && ['queued', 'running'].includes(st.job.status) && !lpImageWorker.isRunning()) lpImageTick();
-  res.json({ ok: true, ...st, compose_version: lpComposeVersion(getDB(), draft) });
+  // 1 枚ずつの作り直し (別の job) が待っているときも同じ (PR-E)
+  if (((st.job && ['queued', 'running'].includes(st.job.status)) || st.regen_running) && !lpImageWorker.isRunning()) lpImageTick();
+  res.json({ ok: true, ...st });
 });
 
-/** 作る (誰でも押せる)。body: { idempotency_key }。同じキーの再送は前の依頼を返す */
+/**
+ * 画像を作る・作り直す・確認する のは画像制作の操作 (お金を使う・確認は ⑤ の目印) なので、
+ * 画像制作情報と同じく 画像登録者・画像作成承認者 の担当者か管理者だけ (画像制作の新フロー PR-E)
+ */
+const LP_IMAGE_FORBIDDEN = '画像の生成・作り直し・確認は 画像登録者・画像作成承認者 の担当者か管理者だけです (担当者・工程で役割を確認してください)';
+/** 画面に渡す状態 + 押せる人か (押せない人にはボタンを押せない形で出す) + 画面が見ている LP構成の版 (PR-B) */
+function lpImageStateForReq(req, db, draft) {
+  return { ...lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }), can_edit: canEditImageProduction(req), compose_version: lpComposeVersion(db, draft) };
+}
+
+/** 作る (画像制作の役割の人)。body: { idempotency_key }。同じキーの再送は前の依頼を返す */
 router.post('/api/drafts/:id/lp-images', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
+  if (!canEditImageProduction(req)) return res.status(403).json({ ok: false, code: 'forbidden', error: LP_IMAGE_FORBIDDEN });
   const db = getDB();
   const folderId = lpImageFolderId(draft);
   // 押せない理由があれば Drive を読まずに断る (同じキーの再送は requestLpImageJob が前の依頼を返す)
   const key = req.body?.idempotency_key;
   if (!lpImageValidKey(key)) return res.status(400).json({ ok: false, code: 'bad_request', error: 'idempotency_key の形が不正です' });
   const prior = db.prepare('SELECT 1 FROM ph_lp_image_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draft.id, key);
+  // expected_job_id = 画面が見ていた最新の依頼 (latest_job_id・全部作る / 1 枚の作り直し・無ければ null)。今と違えば 409 (古いタブ・2 人同時で全部をもう一度作らない)
+  const hasExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expected_job_id');
+  const expectedJobId = hasExpected ? req.body.expected_job_id : undefined;
+  if (hasExpected && expectedJobId !== null && !(Number.isSafeInteger(expectedJobId) && expectedJobId > 0)) {
+    return res.status(400).json({ ok: false, code: 'bad_request', error: 'expected_job_id は依頼の番号か null で指定してください' });
+  }
   let refTimes = null;
   if (!prior) {
+    // expected_job_id を送ってこない画面 (この変更より前に開いた古いタブ) は、もう作った依頼があるなら受けない
+    // (別のタブが作った後に全部をもう一度作らない・Codex 名指し4 H)。まだ 1 度も作っていなければ重ねようがないので通す
+    if (!hasExpected && lpImageFullJobConflict(db, draft.id, null)) {
+      return res.status(409).json({ ok: false, code: 'conflict', error: '画面が古いので受け付けませんでした。画面を読み直してから押してください' });
+    }
+    const conflict = lpImageFullJobConflict(db, draft.id, expectedJobId);
+    if (conflict) return res.status(409).json({ ok: false, code: 'conflict', error: conflict });
     const blocked = lpImageBlockReason(db, { draft, folderId });
     if (blocked) return res.status(409).json({ ok: false, code: 'not_ready', error: blocked });
     // Drive を待つ前の構成の版 (どの構成のどの編集版か)。待っている間に直されたら受け付けない (下)
@@ -4225,13 +4252,48 @@ router.post('/api/drafts/:id/lp-images', async (req, res) => {
       return res.status(409).json({ ok: false, code: 'not_ready', error: 'LP構成が直されました — 内容を確かめてから、もう一度押してください' });
     }
   }
-  const r = requestLpImageJob(db, { draft, folderId, idempotencyKey: key, actor: actorOf(req), refTimes });
+  const r = requestLpImageJob(db, { draft, folderId, idempotencyKey: key, actor: actorOf(req), refTimes, expectedJobId });
   if (!r.ok) {
-    const status = r.code === 'already_running' || r.code === 'not_ready' ? 409 : 400;
+    const status = r.code === 'already_running' || r.code === 'not_ready' || r.code === 'conflict' ? 409 : 400;
     return res.status(status).json({ ok: false, code: r.code, error: r.error });
   }
   lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
-  res.json({ ok: true, created: r.created, ...lpImageStateFor(db, { draft, folderId }), compose_version: lpComposeVersion(db, draft) });
+  res.json({ ok: true, created: r.created, ...lpImageStateForReq(req, db, draft) });
+});
+
+/**
+ * 1 枚だけ作り直す (画像制作の新フロー PR-E)。:imageId = 画面が出していた「いちばん新しい版」の行。
+ * body: { idempotency_key }。受付で固めた prompt と参考画像で作り直し、Drive の「AI初稿」に新しいファイル (v2, v3…) で保存する。
+ * 予算は全部作るときと同じ台帳を通る (作る係が 1 枚分を取り置いてから呼ぶ)。参考画像の照らし合わせも作る係がする
+ */
+router.post('/api/drafts/:id/lp-images/:imageId/regenerate', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) return res.status(403).json({ ok: false, code: 'forbidden', error: LP_IMAGE_FORBIDDEN });
+  const db = getDB();
+  const r = requestLpImageRegen(db, {
+    draft, imageId: req.params.imageId, folderId: lpImageFolderId(draft), idempotencyKey: req.body?.idempotency_key, actor: actorOf(req),
+  });
+  if (!r.ok) {
+    const status = r.code === 'not_found' ? 404 : r.code === 'bad_request' ? 400 : 409;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error });
+  }
+  lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
+  res.json({ ok: true, created: r.created, ...lpImageStateForReq(req, db, draft) });
+});
+
+/** 1 枚の「確認」を付ける / 外す。body: { checked: true|false }。:imageId = 画面が出していた版 */
+router.post('/api/drafts/:id/lp-images/:imageId/check', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) return res.status(403).json({ ok: false, code: 'forbidden', error: LP_IMAGE_FORBIDDEN });
+  const db = getDB();
+  const r = setLpImageChecked(db, { draft, imageId: req.params.imageId, checked: req.body?.checked, actor: actorOf(req) });
+  if (!r.ok) {
+    const status = r.code === 'not_found' ? 404 : r.code === 'bad_request' ? 400 : 409;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error });
+  }
+  res.json({ ok: true, changed: r.changed, ...lpImageStateForReq(req, db, draft) });
 });
 
 /**

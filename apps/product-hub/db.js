@@ -1552,6 +1552,25 @@ export function initProductHubDB() {
   if (lpGenCols.size > 0 && !lpGenCols.has('model_checked_at')) {
     db.exec('ALTER TABLE ph_lp_compose_generations ADD COLUMN model_checked_at TEXT');
   }
+  // LP 画像: 1 枚ずつの作り直しと「確認済み」(画像制作の新フロー PR-E・2026-10-09 スタッフ要望 ⑤)。
+  //   作り直し = 新しい job (regen_of_image_id = 作り直す元の画像 = 全部作ったときの行) に 1 枚だけの行を作る。
+  //   受付で固めた prompt・参考画像・取り置き額は元の行から写す (構成を読み直さない)。
+  //   version = 何版目 (全部作ったときが 1)。Drive には新しいファイルで保存し、前の版は消さない。
+  //   checked_at / checked_by = その版を人が「確認」した (作り直しを受け付けたら外す)
+  // 同じ DB を開くプロセスが同時に起動しても落ちないよう、duplicate column だけは成功扱い (ipAlters と同じ作法・Codex 名指し4 M)
+  const lpImgJobCols = new Set(db.prepare('PRAGMA table_info(ph_lp_image_jobs)').all().map((c) => c.name));
+  const lpImgCols = new Set(db.prepare('PRAGMA table_info(ph_lp_images)').all().map((c) => c.name));
+  const lpImgAlters = [
+    [lpImgJobCols, 'regen_of_image_id', 'ALTER TABLE ph_lp_image_jobs ADD COLUMN regen_of_image_id INTEGER REFERENCES ph_lp_images(id) ON DELETE CASCADE'],
+    [lpImgCols, 'version', 'ALTER TABLE ph_lp_images ADD COLUMN version INTEGER NOT NULL DEFAULT 1'],
+    [lpImgCols, 'checked_at', 'ALTER TABLE ph_lp_images ADD COLUMN checked_at TEXT'],
+    [lpImgCols, 'checked_by', 'ALTER TABLE ph_lp_images ADD COLUMN checked_by TEXT'],
+  ];
+  for (const [cols, col, sql] of lpImgAlters) {
+    if (cols.size === 0 || cols.has(col)) continue;
+    try { db.exec(sql); } catch (e) { if (!/duplicate column/i.test(String(e?.message || ''))) throw e; }
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ph_lp_image_jobs_regen ON ph_lp_image_jobs(regen_of_image_id)');
 
   // 既存 DB へのカラム追加 (warehouse-mirror/db.js の addColumnIfMissing と同方針の冪等 ALTER)
   const draftCols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));

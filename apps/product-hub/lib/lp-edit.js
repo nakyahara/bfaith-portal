@@ -368,9 +368,16 @@ export function effectiveCompose(db, draftId) {
  * Drive にあるのは前の構成の画像のまま (Codex PR-B 名指し R2 L)
  */
 export function imageStaleFor(db, draftId, eff) {
+  // 1 枚の作り直し (PR-E・regen_of_image_id あり) は、元の「全部作る」依頼の受付で固めた指示のまま作る。
+  // なので手がかりは「全部作る」の依頼 (構成と時刻) だけにし、作り直しの依頼そのものは見ない。
+  // 全部作るが 1 枚もできなかった (failed) 依頼でも、その画像を作り直してできていれば、Drive にあるのはその依頼の指示の画像
+  // なので手がかりにする (Codex PR-E 名指し6 M)
   if (!eff || !eff.job) return false;
-  const img = db.prepare(`SELECT compose_job_id, created_at FROM ph_lp_image_jobs
-    WHERE draft_id = ? AND status NOT IN ('failed','cancelled') ORDER BY id DESC LIMIT 1`).get(posInt(draftId));
+  const img = db.prepare(`SELECT j.compose_job_id, j.created_at FROM ph_lp_image_jobs j
+    WHERE j.draft_id = ? AND j.regen_of_image_id IS NULL AND j.status <> 'cancelled'
+      AND (j.status <> 'failed' OR EXISTS (SELECT 1 FROM ph_lp_images r JOIN ph_lp_image_jobs rj ON rj.id = r.image_job_id
+        WHERE r.status = 'done' AND rj.regen_of_image_id IN (SELECT id FROM ph_lp_images WHERE image_job_id = j.id)))
+    ORDER BY j.id DESC LIMIT 1`).get(posInt(draftId));
   if (!img) return false;
   if (img.compose_job_id !== eff.job.id) return true;
   const then = db.prepare(`SELECT output_text FROM ph_lp_compose_edits WHERE base_job_id = ? AND created_at <= ?

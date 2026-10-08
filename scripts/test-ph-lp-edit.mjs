@@ -202,6 +202,8 @@ function compose(output, { draft = null, check = 'claude-opus-5-5' } = {}) {
     const id = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, drive_folder_url, image_priority, created_by) VALUES (?, ?, ?, ?, 't')`)
       .run('LPEDIT' + seqNo, NAME, 'https://drive.google.com/drive/folders/' + FOLDER, '自社商品（重要度：高）').lastInsertRowid);
     draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(id);
+    // 画像生成 (PR-E) は撮影判定が決まっていないと作れない。ここで作る商品は「撮影不要」
+    dbmod.setShootMode(db, id, 'none', { actor: 't' });
   }
   const images = [{ file_id: 'FILEIDWHITE01', role: 'white_bg', modified_time: '2026-10-01T00:00:00.000Z' }];
   const r = lp.requestJob(db, { draft, spec, idempotencyKey: 'key-edit-' + seqNo, actor: 't', productInfo: 'ハッカ油', colorVariations: '', images, now: T0 });
@@ -720,7 +722,7 @@ console.log('⑩ 「AI が作った構成」の箱 (lpc) — 直した版を出�
     if (!els.has(id)) {
       const ls = {};
       els.set(id, { id, value: '', textContent: '', hidden: false, disabled: false, dataset: {}, style: {}, href: '',
-        addEventListener: (t, fn) => { (ls[t] = ls[t] || []).push(fn); }, fire: async (t) => { for (const fn of ls[t] || []) await fn({}); }, select() {} });
+        addEventListener: (t, fn) => { (ls[t] = ls[t] || []).push(fn); }, fire: async (t) => { for (const fn of ls[t] || []) await fn({}); }, select() {}, appendChild() {} });
     }
     return els.get(id);
   };
@@ -755,7 +757,8 @@ console.log('⑩ 「AI が作った構成」の箱 (lpc) — 直した版を出�
   ok(/通っています/.test(el('lpc-lint').textContent), 'lint の行も直した版の結果');
 
   // 「画像を作る」の箱 (lpi) も、保存の知らせで作る枚数・取り置きを取り直す (Codex PR-B 名指し M)
-  const lpiSrc = detailSrc.slice(detailSrc.indexOf('  (function initLpImages() {'), detailSrc.indexOf('  (function initLpCompose() {'));
+  // 画像の箱の JS は PR-E で印 (@lp-image-ui) の間に移った。切り出して initLpImages に偽の document と送り口を渡す
+  const lpiSrc = detailSrc.slice(detailSrc.indexOf('/* @lp-image-ui:start'), detailSrc.indexOf('/* @lp-image-ui:end */'));
   ok(lpiSrc.length > 500 && !lpiSrc.includes('<%'), '画像の箱の JS を切り出せる');
   const P = compose(FIVE);
   db.prepare(`UPDATE ph_lp_compose_jobs SET packet_json = json_set(packet_json, '$.images', json('[]')) WHERE id = ?`).run(P.jobId);
@@ -763,19 +766,20 @@ console.log('⑩ 「AI が作った構成」の箱 (lpc) — 直した版を出�
   el('lpi').dataset = { draftId: String(P.draft.id) };
   el('lpi-json').textContent = JSON.stringify((await api('GET', `/api/drafts/${P.draft.id}/lp-images`)).json);
   const docLs2 = {};
-  const doc2 = { getElementById: el, hidden: false, createElement: () => ({ style: {}, appendChild() {} }),
+  const doc2 = { getElementById: el, hidden: false, createElement: () => ({ style: {}, dataset: {}, appendChild() {}, addEventListener() {} }),
     addEventListener: (t, fn) => { (docLs2[t] = docLs2[t] || []).push(fn); } };
   const lpiPosts = [];
-  const fakeFetch2 = async (u, opts) => {
+  const fetchJson2 = async (u, opts) => {
     if (opts && opts.method === 'POST') {
-      const body = JSON.parse(opts.body);
-      lpiPosts.push(body);
-      const r = await api('POST', u.replace('/apps/product-hub', ''), { body });
-      return { status: r.status, json: async () => r.json };
+      lpiPosts.push(opts.body);
+      const r = await api('POST', u.replace('/apps/product-hub', ''), { body: opts.body });
+      return { status: r.status, json: r.json };
     }
-    return fakeFetch(u);
+    const r = await api('GET', u.replace('/apps/product-hub', ''));
+    return { status: r.status, json: r.json };
   };
-  new Function('document', 'fetch', 'window', lpiSrc)(doc2, fakeFetch2, { crypto: null, confirm: () => true });
+  new Function(lpiSrc + String.fromCharCode(10) + 'return initLpImages;')()(doc2, { fetchJson: fetchJson2, confirm: () => true, setTimer: () => 0, clearTimer: () => {},
+    newKey: () => 'lpe-img-key-0001', isHidden: () => false });
   ok(/5 枚/.test(el('lpi-btn').textContent), '開いたときは 5 枚');
   const cp = (await api('GET', `/api/drafts/${P.draft.id}/lp-edit`)).json;
   await api('PUT', `/api/drafts/${P.draft.id}/lp-edit`, { body: { base_job_id: cp.base_job_id, base_edit_id: null, slots: sendFrom(cp).slice(0, 3) } });
