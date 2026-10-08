@@ -2,11 +2,12 @@
  * Google スプレッドシートを作って書く (汎用。撮影指示書 PR-D・デザイナー修正依頼書 PR-F で使う)。2026-10-09
  *
  * - 置き場 = Drive の指定フォルダ (共有ドライブ)。files.create で mimeType = スプレッドシートを作る
- * - 中身の差し替え = 指定したタブ名ごとに clear → values.batchUpdate。**ファイルは作り直さない = URL は変わらない**
+ * - 中身の差し替え = 指定したタブの中身を消して書き直す (1 回の batchUpdate)。**ファイルは作り直さない = URL は変わらない**
  * - 書式 = 太字の行・網かけの行・列幅・折り返し・固定行 (spreadsheets.batchUpdate)
  *
- * 🚨 値は必ず valueInputOption = 'RAW' で書く (呼び手が選べないようにしてある)。
+ * 🚨 値は必ず userEnteredValue.stringValue で書く (呼び手が選べないようにしてある = RAW と同じく文字のまま)。
  *    材料は AI の出力と人の入力なので、`=IMPORTXML(...)` `=HYPERLINK(...)` のような値を数式として評価させない
+ * 🚨 中身の差し替えは spreadsheets.batchUpdate 1 回 (途中で失敗しても、前の版のまま = 空の指示書を残さない)
  *
  * 認証: 既存のサービスアカウント (env GOOGLE_SERVICE_ACCOUNT_KEY・base64 JSON)。スコープは drive
  *   (Sheets API は drive スコープでも呼べる。フォルダへの作成に drive が要るので 1 つにまとめる)。
@@ -38,6 +39,7 @@ export function getSheetsWriteClients(env = process.env) {
 
 /** Google の失敗を、画面に出せる日本語の理由にする (どこを直せばいいかが分かる文) */
 export function explainGoogleError(e) {
+  if (e?.code === 'tab_conflict') return e.message;
   const status = Number(e?.code || e?.status || e?.response?.status) || null;
   const raw = String(e?.message || e || '');
   const msg = raw.length > ERROR_MAX_LEN ? raw.slice(0, ERROR_MAX_LEN) + '…' : raw;
@@ -113,93 +115,118 @@ export async function createSpreadsheetInFolder({ drive }, { folderId, title, ap
   return { id };
 }
 
-/** シート名を A1 記法の範囲に (`'` は `''` に) */
-const a1Sheet = (name) => `'${String(name).replace(/'/g, "''")}'`;
+/** 書き込み係が作ったタブの印 (developer metadata のキー)。この印のあるタブだけを「自分のタブ」として消す・書き換える */
+export const OWNED_TAB_KEY = 'phOwnedTab';
+
+/** 人が作った同じ名前のタブがあるので書けない (黙って上書きしない) */
+export class TabConflictError extends Error {
+  constructor(name) {
+    super(`スプレッドシートに、人が作った「${name}」というタブがあります。そのタブの名前を変えてから、もう一度押してください (上書きしないため)`);
+    this.code = 'tab_conflict';
+  }
+}
+
+/** 1 行ぶんのセル。値は stringValue = 文字のまま (数式・数値として解釈させない) */
+const rowData = (row) => ({ values: row.map((c) => ({ userEnteredValue: { stringValue: c == null ? '' : String(c) } })) });
 
 /**
  * スプレッドシートの中身を差し替える。
+ * 🚨 タブの足し引き・値の消去と書き込み・書式を **spreadsheets.batchUpdate 1 回** にまとめる。
+ *    batchUpdate は 1 回の中の要求をまとめて適用する (どれかが失敗すれば全部が適用されない) ので、
+ *    「消した後の書き込みで失敗して、済の指示書が空になる」が起きない (Codex PR-D 名指し High)
+ * 🚨 値は userEnteredValue.stringValue で書く = 数式として評価させない (`=IMPORTXML(...)` も文字のまま)
+ *
+ * タブの持ち主: 書き込み係が足したタブには developer metadata の印 (OWNED_TAB_KEY) を付ける。
+ *   - 書くタブが既にあり、印が無い (人が作った同じ名前のタブ) → TabConflictError (上書きしない)
+ *   - removeTabs のタブは、印があるときだけ消す (人が作った同じ名前のタブは消さない)
+ *   - fresh (この呼び出しで作ったばかり) のときだけ、最初からある「シート1」などを消す
  * @param {{sheets, drive}} clients
  * @param {object} o
  * @param {string} o.spreadsheetId
  * @param {string} [o.title]  ファイル名 (違っていれば付け直す。撮影の種類を変えたとき)
  * @param {Array<{name: string, rows: string[][], format?: object}>} o.tabs  書くタブ (この順に並べる)
- * @param {string[]} [o.removeTabs]  あれば消すタブ名 (自分が作るタブのうち、今回は要らないもの)。人が足したタブは消さない
- * @param {boolean} [o.fresh]  作ったばかり (最初からある「シート1」を消す)
+ * @param {string[]} [o.removeTabs]  あれば消すタブ名 (自分が作るタブのうち、今回は要らないもの)
+ * @param {boolean} [o.fresh]  この呼び出しで作ったばかりのファイル
  */
 export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title, tabs, removeTabs = [], fresh = false }) {
   const opt = { timeout: GOOGLE_TIMEOUT_MS };
-  const got = await sheets.spreadsheets.get({ spreadsheetId, fields: 'sheets.properties(sheetId,title,index)' }, opt);
-  const existing = (got?.data?.sheets || []).map((s) => s.properties || {});
+  const got = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets(properties(sheetId,title,index,gridProperties(rowCount,columnCount)),developerMetadata(metadataKey,metadataValue))',
+  }, opt);
+  const existing = (got?.data?.sheets || []).map((s) => ({
+    ...(s.properties || {}),
+    owned: (s.developerMetadata || []).some((m) => m && m.metadataKey === OWNED_TAB_KEY),
+  }));
   const byTitle = new Map(existing.map((p) => [p.title, p]));
   const wanted = new Set(tabs.map((t) => t.name));
+  let nextId = Math.max(0, ...existing.map((p) => Number(p.sheetId) || 0)) + 1;
 
-  // 1. 足りないタブを足し、要らないタブを消す (足してから消す = 最後の 1 枚を消して失敗しない)
-  const structure = [];
-  for (const t of tabs) if (!byTitle.has(t.name)) structure.push({ addSheet: { properties: { title: t.name } } });
-  for (const p of existing) {
-    if (wanted.has(p.title)) continue;
-    if (fresh || removeTabs.includes(p.title)) structure.push({ deleteSheet: { sheetId: p.sheetId } });
-  }
-  if (structure.length) {
-    const r = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: structure } }, opt);
-    for (const rep of r?.data?.replies || []) {
-      const p = rep?.addSheet?.properties;
-      if (p) byTitle.set(p.title, p);
+  const requests = [];
+  const ids = new Map();
+  // 1. 足りないタブを足す (sheetId はこちらで決める = 同じ batchUpdate の中で続けて書ける)。印も付ける
+  for (const t of tabs) {
+    const width = Math.max(1, ...t.rows.map((r) => r.length));
+    const cur = byTitle.get(t.name);
+    if (cur) {
+      if (!cur.owned && !fresh) throw new TabConflictError(t.name);
+      ids.set(t.name, cur.sheetId);
+      // 行・列が足りなければ広げる (人が行を消していても書ける)
+      const g = cur.gridProperties || {};
+      if (Number(g.rowCount) && g.rowCount < t.rows.length) requests.push({ appendDimension: { sheetId: cur.sheetId, dimension: 'ROWS', length: t.rows.length - g.rowCount } });
+      if (Number(g.columnCount) && g.columnCount < width) requests.push({ appendDimension: { sheetId: cur.sheetId, dimension: 'COLUMNS', length: width - g.columnCount } });
+      continue;
     }
+    const sheetId = nextId++;
+    ids.set(t.name, sheetId);
+    requests.push({ addSheet: { properties: { sheetId, title: t.name, gridProperties: { rowCount: Math.max(100, t.rows.length + 20), columnCount: Math.max(26, width) } } } });
+    requests.push({ createDeveloperMetadata: { developerMetadata: {
+      metadataKey: OWNED_TAB_KEY, metadataValue: t.name, location: { sheetId }, visibility: 'DOCUMENT',
+    } } });
   }
-  const sheetIdOf = (name) => {
-    const p = byTitle.get(name);
-    if (!p || p.sheetId == null) throw new Error(`タブ「${name}」を用意できませんでした`);
-    return p.sheetId;
-  };
-
-  // 2. 値: タブごとに消してから書く (前の版の行が残らない)。RAW = 数式として評価させない
-  await sheets.spreadsheets.values.batchClear({ spreadsheetId, requestBody: { ranges: tabs.map((t) => a1Sheet(t.name)) } }, opt);
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      valueInputOption: 'RAW',
-      data: tabs.map((t) => ({ range: `${a1Sheet(t.name)}!A1`, majorDimension: 'ROWS', values: t.rows.map((row) => row.map((c) => (c == null ? '' : String(c)))) })),
-    },
-  }, opt);
-
-  // 3. 書式: 一度まっさらにしてから付け直す (前の版の太字が別の行に残らない)
-  const fmt = [];
+  // 2. 値: タブの中身を消してから A1 から書く (前の版の行が残らない)。書式もまっさらにしてから付け直す
   tabs.forEach((t, index) => {
-    const sheetId = sheetIdOf(t.name);
+    const sheetId = ids.get(t.name);
     const f = t.format || {};
     const width = Math.max(1, ...t.rows.map((r) => r.length));
-    fmt.push({ updateSheetProperties: { properties: { sheetId, index, gridProperties: { frozenRowCount: Number(f.frozenRows) || 0 } }, fields: 'index,gridProperties.frozenRowCount' } });
-    fmt.push({ repeatCell: {
+    requests.push({ updateCells: { range: { sheetId }, fields: 'userEnteredValue,userEnteredFormat' } });
+    requests.push({ updateCells: { start: { sheetId, rowIndex: 0, columnIndex: 0 }, rows: t.rows.map(rowData), fields: 'userEnteredValue' } });
+    requests.push({ updateSheetProperties: { properties: { sheetId, index, gridProperties: { frozenRowCount: Number(f.frozenRows) || 0 } }, fields: 'index,gridProperties.frozenRowCount' } });
+    requests.push({ repeatCell: {
       range: { sheetId },
       cell: { userEnteredFormat: { wrapStrategy: f.wrap ? 'WRAP' : 'OVERFLOW_CELL', verticalAlignment: 'TOP' } },
       fields: 'userEnteredFormat',
     } });
     for (const row of f.boldRows || []) {
-      fmt.push({ repeatCell: {
+      requests.push({ repeatCell: {
         range: { sheetId, startRowIndex: row, endRowIndex: row + 1, startColumnIndex: 0, endColumnIndex: width },
         cell: { userEnteredFormat: { textFormat: { bold: true } } },
         fields: 'userEnteredFormat.textFormat.bold',
       } });
     }
     for (const row of f.shadedRows || []) {
-      fmt.push({ repeatCell: {
+      requests.push({ repeatCell: {
         range: { sheetId, startRowIndex: row, endRowIndex: row + 1, startColumnIndex: 0, endColumnIndex: width },
         cell: { userEnteredFormat: { backgroundColor: { red: 0.93, green: 0.95, blue: 0.97 } } },
         fields: 'userEnteredFormat.backgroundColor',
       } });
     }
     (f.columnWidths || []).forEach((px, i) => {
-      fmt.push({ updateDimensionProperties: {
+      requests.push({ updateDimensionProperties: {
         range: { sheetId, dimension: 'COLUMNS', startIndex: i, endIndex: i + 1 },
         properties: { pixelSize: Number(px) || 100 },
         fields: 'pixelSize',
       } });
     });
   });
-  if (fmt.length) await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: fmt } }, opt);
+  // 3. 要らないタブを消す (足した後 = 最後の 1 枚を消して失敗しない)。印のある自分のタブだけ。作ったばかりなら最初の「シート1」も
+  for (const p of existing) {
+    if (wanted.has(p.title)) continue;
+    if (fresh || (p.owned && removeTabs.includes(p.title))) requests.push({ deleteSheet: { sheetId: p.sheetId } });
+  }
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } }, opt);
 
-  // 4. ファイル名 (違うときだけ)
+  // 4. ファイル名 (違うときだけ)。中身とは別の呼び出しだが、失敗しても中身は新しい版のまま (名前だけ古い)
   if (title && drive) {
     const meta = await drive.files.get({ fileId: spreadsheetId, fields: 'name', supportsAllDrives: true }, opt);
     if (meta?.data?.name !== title) {

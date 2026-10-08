@@ -122,21 +122,14 @@ ok(/GOOGLE_SERVICE_ACCOUNT_KEY/.test(shootSheetBlockReason({ shootMode: 'photogr
 ok(shootSheetBlockReason({ shootMode: 'inhouse', folderId: 'F', configured: true }) === null, '揃えば null');
 
 console.log('⑨ 書き込み係 (偽の Google)');
-function fakeSheets(initialTabs) {
+// tabs = [{ title, owned }]。送った要求を記録するだけ (適用の正しさは smoke の偽物が見る)
+function fakeSheets(initialTabs, { failBatch = false } = {}) {
   const calls = [];
-  let nextId = 100;
-  const tabs = initialTabs.map((t, i) => ({ sheetId: i, title: t, index: i }));
+  const tabs = initialTabs.map((t, i) => ({ sheetId: i, title: t.title, owned: !!t.owned }));
   const sheets = { spreadsheets: {
-    get: async (p) => { calls.push(['get', p]); return { data: { sheets: tabs.map((t) => ({ properties: { ...t } })) } }; },
-    batchUpdate: async (p) => {
-      calls.push(['batchUpdate', p]);
-      const replies = p.requestBody.requests.map((r) => {
-        if (r.addSheet) { const t = { sheetId: nextId++, title: r.addSheet.properties.title }; tabs.push(t); return { addSheet: { properties: t } }; }
-        if (r.deleteSheet) { tabs.splice(tabs.findIndex((t) => t.sheetId === r.deleteSheet.sheetId), 1); }
-        return {};
-      });
-      return { data: { replies } };
-    },
+    get: async (p) => { calls.push(['get', p]); return { data: { sheets: tabs.map((t) => ({ properties: { sheetId: t.sheetId, title: t.title, gridProperties: { rowCount: 5, columnCount: 3 } },
+      developerMetadata: t.owned ? [{ metadataKey: 'phOwnedTab', metadataValue: t.title }] : [] })) } }; },
+    batchUpdate: async (p) => { calls.push(['batchUpdate', p]); if (failBatch) throw Object.assign(new Error('Backend Error'), { code: 500 }); return { data: { replies: [] } }; },
     values: {
       batchClear: async (p) => { calls.push(['batchClear', p]); return {}; },
       batchUpdate: async (p) => { calls.push(['valuesBatchUpdate', p]); return {}; },
@@ -147,44 +140,53 @@ function fakeSheets(initialTabs) {
     get: async (p) => { calls.push(['driveGet', p]); return { data: { name } }; },
     update: async (p) => { calls.push(['driveUpdate', p]); name = p.requestBody.name; return { data: {} }; },
   } };
-  return { sheets, drive, calls, tabs, nameOf: () => name };
+  const reqs = () => calls.filter((c) => c[0] === 'batchUpdate').flatMap((c) => c[1].requestBody.requests);
+  return { sheets, drive, calls, reqs, nameOf: () => name };
 }
 {
-  const g = fakeSheets(['シート1']);
+  const g = fakeSheets([{ title: 'シート1' }]);
   await writeSpreadsheet(g, { spreadsheetId: 'S1', title: ph.title, tabs: ph.sheets, fresh: true });
-  const st = g.calls.find((c) => c[0] === 'batchUpdate')[1].requestBody.requests;
-  ok(st.filter((r) => r.addSheet).map((r) => r.addSheet.properties.title).join() === '撮影指示,依頼文' && st.some((r) => r.deleteSheet && r.deleteSheet.sheetId === 0),
-    '作ったばかり: 「撮影指示」「依頼文」を足し、最初からある「シート1」を消す (足してから消す)', JSON.stringify(st));
-  ok(st.findIndex((r) => r.deleteSheet) > st.findIndex((r) => r.addSheet), '消すのは足した後 (最後の 1 枚を消して失敗しない)');
-  const vb = g.calls.find((c) => c[0] === 'valuesBatchUpdate')[1].requestBody;
-  ok(vb.valueInputOption === 'RAW', '🚨 値は RAW で書く (数式として評価させない)');
-  ok(vb.data[0].range === "'撮影指示'!A1" && JSON.stringify(vb.data[0].values) === JSON.stringify(ph.sheets[0].rows) && vb.data[1].range === "'依頼文'!A1",
-    'タブごとに A1 から全行を書く', JSON.stringify(vb.data.map((d) => d.range)));
-  const bc2 = g.calls.find((c) => c[0] === 'batchClear')[1].requestBody.ranges;
-  ok(bc2.join() === "'撮影指示','依頼文'" && g.calls.findIndex((c) => c[0] === 'batchClear') < g.calls.findIndex((c) => c[0] === 'valuesBatchUpdate'),
-    '書く前にタブの中身を消す (前の版の行が残らない)');
-  const fmt = g.calls.filter((c) => c[0] === 'batchUpdate')[1][1].requestBody.requests;
-  const mainId = g.tabs.find((t) => t.title === '撮影指示').sheetId;
-  ok(fmt.some((r) => r.updateSheetProperties && r.updateSheetProperties.properties.sheetId === mainId && r.updateSheetProperties.properties.gridProperties.frozenRowCount === 7),
-    '書式: 撮影指示のタブは 7 行目まで固定');
-  ok(fmt.some((r) => r.repeatCell && r.repeatCell.range.sheetId === mainId && r.repeatCell.range.startRowIndex === 6 && r.repeatCell.cell.userEnteredFormat.textFormat?.bold === true),
-    '書式: 表の見出し行を太字');
-  ok(fmt.filter((r) => r.updateDimensionProperties && r.updateDimensionProperties.range.sheetId === mainId).length === 8, '書式: 8 列の幅');
-  ok(fmt.findIndex((r) => r.repeatCell && !r.repeatCell.range.startRowIndex && r.repeatCell.fields === 'userEnteredFormat') < fmt.findIndex((r) => r.repeatCell && r.repeatCell.cell.userEnteredFormat.textFormat),
-    '書式: まっさらにしてから太字を付け直す (前の版の太字を残さない)');
+  const rq = g.reqs();
+  ok(g.calls.filter((c) => c[0] === 'batchUpdate').length === 1 && !g.calls.some((c) => c[0] === 'batchClear' || c[0] === 'valuesBatchUpdate'),
+    '🚨 タブの足し引き・値の消去と書き込み・書式は batchUpdate 1 回 (途中で失敗して空の指示書を残さない)', JSON.stringify(g.calls.map((c) => c[0])));
+  const adds = rq.filter((r) => r.addSheet).map((r) => r.addSheet.properties);
+  ok(adds.map((p) => p.title).join() === '撮影指示,依頼文' && adds.every((p) => Number.isInteger(p.sheetId) && p.sheetId > 0) && new Set(adds.map((p) => p.sheetId)).size === 2,
+    '作ったばかり: 「撮影指示」「依頼文」を足す (sheetId をこちらで決めて、同じ要求の中で書く)', JSON.stringify(adds));
+  ok(rq.filter((r) => r.createDeveloperMetadata).map((r) => r.createDeveloperMetadata.developerMetadata).every((m) => m.metadataKey === 'phOwnedTab' && adds.some((p) => p.sheetId === m.location.sheetId))
+    && rq.filter((r) => r.createDeveloperMetadata).length === 2, '足したタブに印 (developer metadata) を付ける');
+  ok(rq.some((r) => r.deleteSheet && r.deleteSheet.sheetId === 0) && rq.findIndex((r) => r.deleteSheet) > rq.findIndex((r) => r.addSheet) && rq.findIndex((r) => r.deleteSheet) === rq.length - 1,
+    '作ったばかりなら最初からある「シート1」を、足した後 (最後) に消す');
+  const mainId = adds[0].sheetId;
+  const writes = rq.filter((r) => r.updateCells && r.updateCells.rows);
+  const cells = writes.flatMap((w) => w.updateCells.rows.flatMap((row) => row.values));
+  ok(cells.length > 0 && cells.every((c) => Object.keys(c.userEnteredValue).join() === 'stringValue'), '🚨 値は stringValue だけ (数式・数値として評価させない)');
+  ok(writes[0].updateCells.start.sheetId === mainId && writes[0].updateCells.start.rowIndex === 0 && writes[0].updateCells.rows.map((r) => r.values.map((c) => c.userEnteredValue.stringValue)).join('|') === ph.sheets[0].rows.join('|'),
+    'タブごとに A1 から全行を書く');
+  const clearIdx = rq.findIndex((r) => r.updateCells && r.updateCells.range && r.updateCells.range.sheetId === mainId && /userEnteredValue/.test(r.updateCells.fields));
+  ok(clearIdx >= 0 && clearIdx < rq.indexOf(writes[0]), '書く前にタブの中身を消す (前の版の行が残らない)');
+  ok(rq.some((r) => r.updateSheetProperties && r.updateSheetProperties.properties.sheetId === mainId && r.updateSheetProperties.properties.gridProperties.frozenRowCount === 7), '書式: 撮影指示のタブは 7 行目まで固定');
+  ok(rq.some((r) => r.repeatCell && r.repeatCell.range.sheetId === mainId && r.repeatCell.range.startRowIndex === 6 && r.repeatCell.cell.userEnteredFormat.textFormat?.bold === true), '書式: 表の見出し行を太字');
+  ok(rq.filter((r) => r.updateDimensionProperties && r.updateDimensionProperties.range.sheetId === mainId).length === 8, '書式: 8 列の幅');
   ok(g.nameOf() === ph.title, 'ファイル名が違えば付け直す');
 }
 {
-  const g = fakeSheets(['撮影指示', '依頼文', '人のメモ']);
+  const g = fakeSheets([{ title: '撮影指示', owned: true }, { title: '依頼文', owned: true }, { title: '人のメモ' }]);
   await writeSpreadsheet(g, { spreadsheetId: 'S1', title: inh.title, tabs: inh.sheets, removeTabs: ['依頼文'] });
-  ok(g.tabs.map((t) => t.title).join() === '撮影指示,人のメモ', '更新: 要らなくなった自分のタブ (依頼文) だけ消し、人が足したタブは残す', g.tabs.map((t) => t.title).join());
-  ok(!g.calls.some((c) => c[0] === 'batchUpdate' && c[1].requestBody.requests.some((r) => r.addSheet)), '更新: あるタブは足さない');
-  const vb = g.calls.find((c) => c[0] === 'valuesBatchUpdate')[1].requestBody;
-  ok(vb.data.length === 1 && vb.data[0].range === "'撮影指示'!A1", '更新: 書くのは自分のタブだけ (人のメモには書かない)');
-  const g2 = fakeSheets(['撮影指示']);
-  await writeSpreadsheet(g2, { spreadsheetId: 'S1', title: 'x', tabs: [{ name: "it's", rows: [['a']] }] });
-  ok(g2.calls.find((c) => c[0] === 'valuesBatchUpdate')[1].requestBody.data[0].range === "'it''s'!A1", "タブ名の ' は '' にして範囲を書く");
-  ok(g2.tabs.some((t) => t.title === '撮影指示'), 'fresh でなければ指定外のタブは消さない');
+  const rq = g.reqs();
+  ok(rq.filter((r) => r.deleteSheet).map((r) => r.deleteSheet.sheetId).join() === '1', '更新: 要らなくなった自分のタブ (印のある依頼文) だけ消し、人が足したタブは残す');
+  ok(!rq.some((r) => r.addSheet), '更新: あるタブは足さない');
+  ok(rq.filter((r) => r.updateCells).every((r) => (r.updateCells.range || r.updateCells.start).sheetId === 0), '更新: 書くのは自分のタブだけ (人のメモには触らない)');
+  ok(rq.some((r) => r.appendDimension && r.appendDimension.dimension === 'ROWS') && rq.some((r) => r.appendDimension && r.appendDimension.dimension === 'COLUMNS'),
+    '行・列が足りなければ広げる (人が行を消していても書ける)');
+  const g2 = fakeSheets([{ title: '撮影指示', owned: true }, { title: '依頼文' }]);
+  await writeSpreadsheet(g2, { spreadsheetId: 'S1', title: inh.title, tabs: inh.sheets, removeTabs: ['依頼文'] });
+  ok(!g2.reqs().some((r) => r.deleteSheet), '🚨 同じ名前でも印の無いタブ (人が作った「依頼文」) は消さない');
+  const g3 = fakeSheets([{ title: '撮影指示' }]);
+  await throwsAsync('🚨 書くタブと同じ名前の、人が作ったタブ (印なし) があれば止める (上書きしない)', () => writeSpreadsheet(g3, { spreadsheetId: 'S1', tabs: inh.sheets }), '人が作った');
+  ok(!g3.calls.some((c) => c[0] === 'batchUpdate'), '止めたときは何も送らない');
+  const g4 = fakeSheets([{ title: '撮影指示', owned: true }], { failBatch: true });
+  await throwsAsync('batchUpdate が失敗したら throw (呼び手が URL を書かない)', () => writeSpreadsheet(g4, { spreadsheetId: 'S1', title: 'x', tabs: inh.sheets }), 'Backend');
+  ok(!g4.calls.some((c) => c[0] === 'driveUpdate'), '失敗したら名前も付け直さない');
 }
 {
   const listed = [];

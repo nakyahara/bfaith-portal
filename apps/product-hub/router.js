@@ -24,7 +24,7 @@ import {
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
 // 撮影指示書 (スプレッドシート) の自動作成と、撮影依頼文のいつもの宛先 (2026-10-09 画像制作の新フロー PR-D)
-import { getShootMention, setShootMention } from './db.js';
+import { getShootMention, setShootMention, normalizeShootMention } from './db.js';
 import { createOrUpdateShootSheet, shootSheetStateFor } from './services/shoot-sheet-service.js';
 import { validateCutsInput } from './lib/shoot-sheet.js';
 // 夜間自動化 (2026-08-28): 人の確認待ち + 文字数ガード
@@ -1645,7 +1645,9 @@ router.post('/api/drafts/:id/shoot-mode', (req, res) => {
 // 撮影指示書 (スプレッドシート) を作る / 上書きする (2026-10-09 画像制作の新フロー PR-D・設計 §3.4)。
 // 撮影判定が 社内撮影 / カメラマン撮影 で、画像フォルダがあるときだけ。無ければ作り、あれば同じファイルを上書き (URL は変えない)。
 // できたときだけ URL を撮影指示書の欄 (camera_instruction_url) に入れる = ボードの「撮影指示書 済」がそのまま動く。
-// body: { cuts?: [...] (渡せばそれで作る。無ければ LP構成から拾う), replace_manual?: true (手で貼った URL を置き換えてよい) }
+// body: { cuts?: [...] (渡せばそれで作る。無ければ LP構成から拾う),
+//         mention?: '宛先' (画面のその回だけの宛先。依頼文のタブに入れる。省略ならいつもの宛先),
+//         replace_manual_url?: 'URL' (手で貼った URL を置き換えてよいと確かめたときの、その URL。今の URL と同じときだけ置き換える) }
 router.post('/api/drafts/:id/shoot-sheet', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
@@ -1659,11 +1661,20 @@ router.post('/api/drafts/:id/shoot-sheet', async (req, res) => {
     if (v.error) return res.status(400).json({ ok: false, error: v.error });
     cuts = v.cuts;
   }
-  if (b.replace_manual !== undefined && typeof b.replace_manual !== 'boolean') {
-    return res.status(400).json({ ok: false, error: 'replace_manual は true / false で指定してください' });
+  // 宛先はいつもの宛先と同じ検査 (1 行・60 文字まで)。null / 省略はいつもの宛先
+  let mention = null;
+  if (b.mention !== undefined && b.mention !== null) {
+    const m = normalizeShootMention(b.mention);
+    if (m.error) return res.status(400).json({ ok: false, error: m.error });
+    mention = m.value;
   }
-  const r = await createOrUpdateShootSheet(draft.id, { cuts, actor: actorOf(req), replaceManual: b.replace_manual === true });
-  if (!r.ok) return res.status(r.status || 500).json({ ok: false, code: r.code, error: r.error });
+  if (b.replace_manual_url !== undefined && b.replace_manual_url !== null && (typeof b.replace_manual_url !== 'string' || b.replace_manual_url.length > 1000)) {
+    return res.status(400).json({ ok: false, error: 'replace_manual_url は置き換える URL (文字) で指定してください' });
+  }
+  const r = await createOrUpdateShootSheet(draft.id, {
+    cuts, mention, actor: actorOf(req), replaceManualUrl: typeof b.replace_manual_url === 'string' ? b.replace_manual_url.trim() : null,
+  });
+  if (!r.ok) return res.status(r.status || 500).json({ ok: false, code: r.code, error: r.error, ...(r.manual_url ? { manual_url: r.manual_url } : {}) });
   res.json(r);
 });
 

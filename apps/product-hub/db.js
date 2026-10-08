@@ -1298,8 +1298,10 @@ export function initProductHubDB() {
     CREATE TABLE IF NOT EXISTS ph_setting_events (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       key        TEXT NOT NULL,
-      old_value  TEXT,
+      old_value  TEXT,             -- 変える前に効いていた値 (DB に無ければ env / 既定の値)
+      old_source TEXT,             -- その出どころ 'db' | 'env' | 'default'
       new_value  TEXT,
+      new_source TEXT,
       actor      TEXT,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
@@ -2062,6 +2064,7 @@ export function initProductHubDB() {
     ['shoot_mode_at', 'ALTER TABLE draft_image_production ADD COLUMN shoot_mode_at TEXT'],
     ['shoot_mode_by', 'ALTER TABLE draft_image_production ADD COLUMN shoot_mode_by TEXT'],
     // 2026-10-09 画像制作の新フロー PR-D: ポータルが自動で作った撮影指示書 (スプレッドシート)。
+    //   lease_token / lease_until … 作っている最中の印 (同じ商品を 2 本同時に作らない。プロセスをまたいでも効く)
     //   file_id … 作ったファイル (更新はこのファイルを上書き = URL は変わらない)
     //   hash    … 作ったときの材料の hash (今の材料と違えば「LP構成が変わりました → 更新」を出す)
     //   source  … 材料の出どころ ('auto' = LP構成から拾った / 'request' = API で渡されたカット)。'request' は今の材料と比べない
@@ -2072,6 +2075,8 @@ export function initProductHubDB() {
     ['shoot_sheet_source', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_source TEXT'],
     ['shoot_sheet_at', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_at TEXT'],
     ['shoot_sheet_by', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_by TEXT'],
+    ['shoot_sheet_lease_token', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_lease_token TEXT'],
+    ['shoot_sheet_lease_until', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_lease_until TEXT'],
   ];
   for (const [col, sql] of ipAlters) {
     if (ipCols.has(col)) continue;
@@ -2797,24 +2802,67 @@ export function setShootMode(db, draftId, mode, { actor = null, expected } = {})
 }
 
 /**
+ * 撮影指示書の材料と置き場の「版」(2026-10-09 PR-D)。作り始めたときの版と、Google に書く直前・記録するときの版を比べ、
+ * 違えば書かない / 記録しない (Google を待っている間に変わったものを、古い材料で黙って上書きしない — Codex PR-D 名指し High)。
+ * 中身 = 撮影判定・画像フォルダ・商品名・商品コード・いちばん新しいできた LP構成・撮影指示書の URL とファイル ID
+ */
+export function shootSheetRevision(db, draftId) {
+  const id = Number(draftId);
+  const d = db.prepare('SELECT ne_code, name, drive_folder_url FROM product_drafts WHERE id = ?').get(id) || {};
+  const ip = db.prepare('SELECT shoot_mode, camera_instruction_url, shoot_sheet_file_id FROM draft_image_production WHERE draft_id = ?').get(id) || {};
+  const job = db.prepare(`SELECT id FROM ph_lp_compose_jobs WHERE draft_id = ? AND status = 'done' AND output_text IS NOT NULL AND TRIM(output_text) <> '' ORDER BY id DESC LIMIT 1`).get(id);
+  return JSON.stringify([d.ne_code ?? null, d.name ?? null, d.drive_folder_url ?? null, ip.shoot_mode ?? null,
+    ip.camera_instruction_url ?? null, ip.shoot_sheet_file_id ?? null, job ? job.id : null]);
+}
+
+const SHOOT_SHEET_CONFLICT_MESSAGE = '作っている間に、撮影判定・画像フォルダ・商品名・LP構成・撮影指示書の URL のどれかが変わりました。画面を読み直して、もう一度押してください (指示書の URL は変えていません)';
+
+/** 版が変わっていたら conflict を投げる (Google に書く直前と、記録するときに呼ぶ) */
+export function assertShootSheetRevision(db, draftId, expectedRevision) {
+  if (shootSheetRevision(db, draftId) !== expectedRevision) {
+    throw Object.assign(new Error(SHOOT_SHEET_CONFLICT_MESSAGE), { code: 'shoot_sheet_conflict' });
+  }
+}
+
+/**
+ * 作っている最中の印を取る (同じ商品を同時に 2 本作らない。DB に持つのでプロセスをまたいでも効く — Codex PR-D 名指し M)。
+ * 期限 (既定 3 分) を過ぎた印は、止まったプロセスの残りとみなして取り直せる。@returns {string|null} 取れたら token
+ */
+export function acquireShootSheetLease(db, draftId, { ms = 180_000, now = Date.now() } = {}) {
+  const id = Number(draftId);
+  const token = `${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const until = new Date(now + ms).toISOString();
+  return db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
+    const r = db.prepare(`UPDATE draft_image_production SET shoot_sheet_lease_token = ?, shoot_sheet_lease_until = ?
+      WHERE draft_id = ? AND (shoot_sheet_lease_until IS NULL OR shoot_sheet_lease_until < ?)`).run(token, until, id, new Date(now).toISOString());
+    return r.changes === 1 ? token : null;
+  })();
+}
+
+/** 印を返す (自分の token のときだけ) */
+export function releaseShootSheetLease(db, draftId, token) {
+  db.prepare(`UPDATE draft_image_production SET shoot_sheet_lease_token = NULL, shoot_sheet_lease_until = NULL
+    WHERE draft_id = ? AND shoot_sheet_lease_token = ?`).run(Number(draftId), token);
+}
+
+/**
  * 撮影指示書 (スプレッドシート) を作った / 上書きしたことを記録する (2026-10-09 画像制作の新フロー PR-D)。
  * camera_instruction_url と file_id・材料の hash を **1 トランザクションで** 書く (片方だけ書かれた状態を作らない)。
  *
- * expected = 作り始めたときに見ていた値 { url, fileId }。Google を待っている間に、ほかの人が指示書の URL を
- *   手で貼り替えた / 別のタブで作り直した、なら書かずに conflict を投げる (後から終わったほうが黙って勝たない)。
+ * expectedRevision = 作り始めたときの版 (shootSheetRevision)。Google を待っている間に撮影判定・画像フォルダ・商品名・
+ *   LP構成・指示書の URL が変わっていたら、書かずに conflict を投げる (後から終わったほうが黙って勝たない)。
  * 撮影判定が「撮影が要る」でなくなっていても書かない (撮影不要の商品に指示書を付けない)
  */
-export function recordShootSheet(db, draftId, { url, fileId, hash, source, actor = null, created, expected }) {
+export function recordShootSheet(db, draftId, { url, fileId, hash, source, actor = null, created, expectedRevision }) {
   const id = Number(draftId);
   return db.transaction(() => {
     db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
-    const cur = db.prepare('SELECT shoot_mode, camera_instruction_url, shoot_sheet_file_id FROM draft_image_production WHERE draft_id = ?').get(id);
+    const cur = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(id);
     if (cur.shoot_mode !== 'inhouse' && cur.shoot_mode !== 'photographer') {
-      throw Object.assign(new Error('作っている間に撮影判定が変わりました (撮影が要る判定ではなくなりました)。スプレッドシートはできていますが、指示書の URL には入れていません'), { code: 'shoot_sheet_conflict' });
+      throw Object.assign(new Error('作っている間に撮影判定が変わりました (撮影が要る判定ではなくなりました)。指示書の URL には入れていません'), { code: 'shoot_sheet_conflict' });
     }
-    if (expected && (String(cur.camera_instruction_url ?? '') !== String(expected.url ?? '') || String(cur.shoot_sheet_file_id ?? '') !== String(expected.fileId ?? ''))) {
-      throw Object.assign(new Error('作っている間に、ほかの人 (または別の画面) が撮影指示書を変えました。画面を読み直してから、もう一度押してください'), { code: 'shoot_sheet_conflict' });
-    }
+    if (expectedRevision !== undefined) assertShootSheetRevision(db, id, expectedRevision);
     db.prepare(`
       UPDATE draft_image_production
       SET camera_instruction_url = ?, shoot_sheet_file_id = ?, shoot_sheet_hash = ?, shoot_sheet_source = ?,
@@ -2865,9 +2913,13 @@ export function setShootMention(db, value, { actor = null } = {}) {
     const row = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(SHOOT_MENTION_KEY);
     const before = row ? row.value : null;
     if (before === n.value && (row != null) === (n.value != null)) return { changed: false };
+    // 記録は「効いていた値 → 効く値」と出どころ (DB に無いときも、そのときの env / 既定の実際の値で残す — Codex PR-D 名指し L)
+    const was = getShootMention(db);
     if (n.value === null) db.prepare('DELETE FROM ph_intake_state WHERE key = ?').run(SHOOT_MENTION_KEY);
     else db.prepare('INSERT INTO ph_intake_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(SHOOT_MENTION_KEY, n.value);
-    db.prepare('INSERT INTO ph_setting_events (key, old_value, new_value, actor) VALUES (?, ?, ?, ?)').run(SHOOT_MENTION_KEY, before, n.value, actor);
+    const now = getShootMention(db);
+    db.prepare('INSERT INTO ph_setting_events (key, old_value, old_source, new_value, new_source, actor) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(SHOOT_MENTION_KEY, was.value, was.source, now.value, now.source, actor);
     return { changed: true };
   })();
 }

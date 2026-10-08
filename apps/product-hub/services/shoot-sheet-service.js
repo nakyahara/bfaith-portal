@@ -9,10 +9,16 @@
  *   - 前に作ったファイル (shoot_sheet_file_id) が使えれば、そのファイルを上書きする (URL は変わらない)
  *   - DB に書く前に止まった場合も、作ったファイルには appProperties (phShootSheetDraft = 商品の ID) を付けてあるので、
  *     次に押したときフォルダの中から拾い直す (2 つ作らない)。名前では探さない (人が手作りした同名のシートを上書きしない)
- *   - 同じ商品への同時の押下はプロセスの中で 1 本だけ (2 本目は 409。Render は 1 プロセス)
- * 失敗しても camera_instruction_url は書かない (Google の処理が全部通ったときだけ記録する)
+ *   - 同じ商品への同時の押下は 1 本だけ (DB の印 = プロセスをまたいでも効く。2 本目は 409)
+ * 競合: 作り始めたときの「版」(撮影判定・画像フォルダ・商品名・LP構成・指示書の URL) を、作る前・書く直前・記録するときに比べ、
+ *   違えば止める (古い材料で上書きしない・後から終わったほうが黙って勝たない)
+ * 失敗しても camera_instruction_url は書かない (Google の処理が全部通ったときだけ記録する)。
+ *   中身の差し替えは 1 回の batchUpdate なので、途中で失敗しても前の版のまま (空の指示書を残さない)
  */
-import { getDB, logEvent, recordShootSheet, getShootMention } from '../db.js';
+import {
+  getDB, logEvent, recordShootSheet, getShootMention, shootSheetRevision, assertShootSheetRevision,
+  acquireShootSheetLease, releaseShootSheetLease,
+} from '../db.js';
 import { parseDriveLink } from '../lib/drive-link.js';
 import {
   buildShootSheet, cutsFromComposeText, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
@@ -92,35 +98,41 @@ export function shootSheetStateFor(db, draft, ip) {
   };
 }
 
-// 同じ商品への同時の押下をプロセスの中で 1 本にする
-const inFlight = new Set();
-
 /**
  * 撮影指示書を作る (無ければ) / 上書きする (あれば)。reject しない (結果は outcome で返す)
  * @param {object} o
  * @param {Array} [o.cuts]  API で渡されたカット (検査済み)。無ければ shootSheetCutsFor
- * @param {boolean} [o.replaceManual]  手で貼った URL を自動で作る指示書に置き換えてよい (画面で確かめた)
- * @returns {Promise<{ok: true, url, created: boolean, cuts: number, source}|{ok: false, status: number, code: string, error: string}>}
+ * @param {string|null} [o.mention]  その回だけの宛先 (検査済み)。null / 省略ならいつもの宛先
+ * @param {string|null} [o.replaceManualUrl]  手で貼った URL を置き換えてよい、と画面で確かめたときの「その URL」。
+ *   今の URL と同じときだけ置き換える (確かめた後に別の URL に貼り替えられていたら、もう一度聞く — Codex PR-D 名指し M)
+ * @returns {Promise<{ok: true, url, created: boolean, cuts: number, source}|{ok: false, status: number, code: string, error: string, manual_url?: string}>}
  */
-export async function createOrUpdateShootSheet(draftId, { cuts: givenCuts = null, actor = null, replaceManual = false, db = getDB() } = {}) {
+export async function createOrUpdateShootSheet(draftId, { cuts: givenCuts = null, mention = null, actor = null, replaceManualUrl = null, db = getDB() } = {}) {
   const id = Number(draftId);
-  if (inFlight.has(id)) return { ok: false, status: 409, code: 'busy', error: 'いまこの商品の撮影指示書を作っています。終わるまで待ってください' };
-  inFlight.add(id);
+  // 作っている最中の印 (DB)。同じ商品の 2 本目は 409 (二重押し・2 人同時・プロセスをまたいでも)
+  let token = null;
+  try { token = acquireShootSheetLease(db, id); } catch (e) {
+    console.error('[product-hub] 撮影指示書の印:', e);
+    return { ok: false, status: 500, code: 'error', error: '撮影指示書を作れませんでした (サーバーの失敗。Render のログを確認してください)' };
+  }
+  if (!token) return { ok: false, status: 409, code: 'busy', error: 'いまこの商品の撮影指示書を作っています。終わるまで待ってください' };
   try {
-    return await run(db, id, { givenCuts, actor, replaceManual });
+    return await run(db, id, { givenCuts, mention, actor, replaceManualUrl });
   } catch (e) {
     // ここに来るのは DB の失敗など想定外のもの。Google の失敗は run の中で理由にしている
     console.error('[product-hub] 撮影指示書:', e);
     return { ok: false, status: 500, code: 'error', error: '撮影指示書を作れませんでした (サーバーの失敗。Render のログを確認してください)' };
   } finally {
-    inFlight.delete(id);
+    try { releaseShootSheetLease(db, id, token); } catch (_) { /* 期限が来れば取り直せる */ }
   }
 }
 
-async function run(db, id, { givenCuts, actor, replaceManual }) {
+async function run(db, id, { givenCuts, mention, actor, replaceManualUrl }) {
   const draft = db.prepare('SELECT id, ne_code, name, drive_folder_url FROM product_drafts WHERE id = ?').get(id);
   if (!draft) return { ok: false, status: 404, code: 'not_found', error: '商品が見つかりません' };
   const ip = db.prepare('SELECT shoot_mode, camera_instruction_url, shoot_sheet_file_id FROM draft_image_production WHERE draft_id = ?').get(id) || {};
+  // 作り始めたときの版。Google に書く直前と記録するときに、これと比べる
+  const revision = shootSheetRevision(db, id);
   const shootMode = ip.shoot_mode ?? null;
   const folderId = folderIdOf(draft);
   let clients = null;
@@ -133,9 +145,9 @@ async function run(db, id, { givenCuts, actor, replaceManual }) {
   const prevUrl = String(ip.camera_instruction_url || '').trim();
   const prevFileId = ip.shoot_sheet_file_id || null;
   const ours = !!prevFileId && prevUrl === spreadsheetUrl(prevFileId);
-  // 手で貼った指示書の URL を黙って差し替えない。画面で確かめてから replace_manual で送り直してもらう
-  if (prevUrl && !ours && !replaceManual) {
-    return { ok: false, status: 409, code: 'manual_url',
+  // 手で貼った指示書の URL を黙って差し替えない。画面で確かめてから、確かめた URL を添えて送り直してもらう
+  if (prevUrl && !ours && replaceManualUrl !== prevUrl) {
+    return { ok: false, status: 409, code: 'manual_url', manual_url: prevUrl,
       error: `撮影指示書の URL に、手で貼ったもの (${prevUrl.slice(0, 120)}) が入っています。自動で作る撮影指示書に置き換えますか？ (手で貼ったスプレッドシートは消しません。URL の欄だけ差し替えます)` };
   }
 
@@ -144,41 +156,45 @@ async function run(db, id, { givenCuts, actor, replaceManual }) {
     : (() => { const m = shootSheetCutsFor(db, draft); return { cuts: m.cuts, source: 'auto' }; })();
   const mat = materialOf(draft, shootMode, material.cuts);
   const hash = shootSheetMaterialHash(mat);
+  const mentionUsed = typeof mention === 'string' ? mention : getShootMention(db).value;
 
   let fileId = null;
   let created = false;
   try {
     // 1. 前に作ったファイルが使えればそれ (消された・ごみ箱・別フォルダに移ったなら作り直す)
     if (prevFileId && (await spreadsheetUsable(clients, { fileId: prevFileId, folderId })).usable) fileId = prevFileId;
-    // 2. DB に書く前に止まったファイルを拾い直す
-    let fresh = false;
+    // 2. DB に書く前に止まったファイルを拾い直す (既にあるファイル = 人が足したタブがありうるので fresh にしない)
     if (!fileId) {
       const found = await findSpreadsheetByAppProperty(clients, { folderId, key: APP_PROP_KEY, value: String(id) });
-      if (found) { fileId = found.id; fresh = true; }
+      if (found) fileId = found.id;
     }
-    // 3. 無ければ作る
+    // 3. 無ければ作る (作る前にも版を見る = 待っている間に変わっていれば作らない)
     if (!fileId) {
+      assertShootSheetRevision(db, id, revision);
       const c = await createSpreadsheetInFolder(clients, { folderId, title: buildShootSheet({ ...mat, requestText: '' }).title, appProperties: { [APP_PROP_KEY]: String(id) } });
-      fileId = c.id; fresh = true; created = true;
+      fileId = c.id; created = true;
     }
     const url = spreadsheetUrl(fileId);
-    const requestText = shootRequestBody({ mention: getShootMention(db).value, productName: mat.productName, sheetUrl: url, folderUrl: mat.folderUrl });
+    const requestText = shootRequestBody({ mention: mentionUsed, productName: mat.productName, sheetUrl: url, folderUrl: mat.folderUrl });
     const built = buildShootSheet({ ...mat, requestText });
+    // 書く直前にもう一度版を見る (Google を待っている間に変わった材料で、既にある指示書を上書きしない)
+    assertShootSheetRevision(db, id, revision);
     await writeSpreadsheet(clients, {
-      spreadsheetId: fileId, title: built.title, tabs: built.sheets, fresh,
-      // 自分が作るタブのうち今回は要らないもの (カメラマン撮影 → 社内撮影 にしたときの「依頼文」)
+      spreadsheetId: fileId, title: built.title, tabs: built.sheets, fresh: created,
+      // 自分が作るタブのうち今回は要らないもの (カメラマン撮影 → 社内撮影 にしたときの「依頼文」)。印のあるタブだけ消える
       removeTabs: MANAGED_SHEETS.filter((n) => !built.sheets.some((t) => t.name === n)),
     });
   } catch (e) {
+    if (e?.code === 'shoot_sheet_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     const reason = explainGoogleError(e);
     try { logEvent(db, id, 'shoot_sheet_failed', reason.slice(0, 500), actor); } catch (_) { /* 記録の失敗で結果を変えない */ }
+    if (e?.code === 'tab_conflict') return { ok: false, status: 409, code: 'tab_conflict', error: reason };
     return { ok: false, status: 502, code: 'google', error: `撮影指示書を作れませんでした: ${reason}` };
   }
 
   const url = spreadsheetUrl(fileId);
   try {
-    recordShootSheet(db, id, { url, fileId, hash, source: material.source, actor, created: created || fileId !== prevFileId,
-      expected: { url: ip.camera_instruction_url ?? null, fileId: prevFileId } });
+    recordShootSheet(db, id, { url, fileId, hash, source: material.source, actor, created: created || fileId !== prevFileId, expectedRevision: revision });
   } catch (e) {
     if (e?.code === 'shoot_sheet_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     throw e;

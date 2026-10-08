@@ -6266,10 +6266,14 @@ th.attr-unknown { color: #dc2626; }
       busy = true;
       btn.disabled = true;
       say(ours ? '更新しています…' : '作成しています… (10〜20 秒かかります)');
-      let json = await send({});
-      // 手で貼った指示書の URL が入っている: 置き換えてよいかを聞いてから送り直す
+      // 依頼文のタブには、画面の撮影依頼文と同じ宛先 (その回だけ直した欄の値) を入れる — Codex PR-D 名指し M
+      const mentionEl = doc.getElementById('shoot-req-mention');
+      const base = mentionEl ? { mention: String(mentionEl.value || '') } : {};
+      let json = await send(base);
+      // 手で貼った指示書の URL が入っている: 置き換えてよいかを聞いてから、確かめた URL を添えて送り直す
+      // (確かめた後に別の URL に貼り替えられていたら、サーバがもう一度 409 で止める)
       if (!json.ok && json.code === 'manual_url') {
-        if (deps.confirm(json.error)) json = await send({ replace_manual: true });
+        if (deps.confirm(json.error)) json = await send(Object.assign({}, base, { replace_manual_url: json.manual_url }));
         else json = { ok: false, cancelled: true };
       }
       busy = false;
