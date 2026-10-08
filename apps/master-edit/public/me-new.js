@@ -5,6 +5,8 @@
  *   - 上の飛び先の帯 = 区切りごとに ① が足りていれば緑・足りなければ黄色
  *   - 保存の送り方は前と同じ (POST /api/new { request_id, kind, code, reason, values, card })。
  *     🆕 2026-10-08 中原さん: 単品の代表の仕入先は ① (必須)・発送方法は ③ (あとでも可・届いてサイズを見てから)。サーバー (lib/master-register.mjs) と DB (0060) も同じ決まり
+ *     🆕 2026-10-08 中原さん「下書き保存時にわかる内容だから必須にする」: 単品の売上分類 (「あとで」は無い)・推奨保有月数・単品のロジザードの有効期限の管理 (初めは選んでいない) も ①。
+ *     サーバー (lib/master-register.mjs) と DB (0061) も同じ決まり。セットの売上分類は構成品から (今までどおり)
  *   - 保存が通ったら、できた商品の画面へ移る (今の画面の履歴を置き換える = 戻る 1 回で前の画面)。商品の画面の上に結果を 1 回だけ出す
  */
 (function () {
@@ -69,6 +71,8 @@
   function segVal(id) { var s = document.getElementById(id); return s ? s.getAttribute('data-value') || '' : ''; }
   function cardOn() { return segVal('card-create') !== '0'; }
   function priceOk(id) { var v = half(val(id)).replace(/,/g, ''); return /^\d+$/.test(v) && Number(v) >= 1; }
+  /** 推奨保有月数の形 (サーバーの PARSERS.reorder_months と同じ: 0〜60・小数は 1 桁まで) */
+  function monthsOk() { var v = half(val('f-reorder_months')); return /^\d{1,2}(\.\d)?$/.test(v) && Number(v) <= 60; }
   /** 項目 = { id, sec, t (名前), ok, focus (セレクタ), level 1|2|3 } */
   function items() {
     var code = $('#code').value;
@@ -86,6 +90,11 @@
     list.push({ id: 'standard_price', sec: 'sec-money', t: '売価', ok: priceOk('f-standard_price'), focus: '#f-standard_price', level: 1 });
     if (!isSet) list.push({ id: 'tax_rate', sec: 'sec-tax', t: '税率', ok: !!segVal('f-tax_rate'), focus: '#f-tax_rate button', level: 1 });
     if (!isSet) list.push({ id: 'primary_supplier', sec: 'sec-tax', t: '代表の仕入先', ok: !!val('f-primary_supplier'), focus: '#f-primary_supplier', level: 1 });
+    // 🆕 2026-10-08 中原さん「下書き保存時にわかる内容だから必須にする」: 単品の売上分類・推奨保有月数 (単品もセットも)・単品のロジザードの有効期限の管理は ①。
+    //   セットの売上分類は構成品から導く (導けないときだけ「例外のとき」の上書き = 保存でサーバーが確かめる) = ここには足さない
+    if (!isSet) list.push({ id: 'sales_class', sec: 'sec-tax', t: '売上分類', ok: !!segVal('f-sales_class'), focus: '#f-sales_class button', level: 1 });
+    list.push({ id: 'reorder_months', sec: 'sec-ship', t: '推奨保有月数 (0〜60)', ok: monthsOk(), focus: '#f-reorder_months', level: 1 });
+    if (!isSet) list.push({ id: 'expiry_managed', sec: 'sec-ship', t: 'ロジザードの有効期限の管理', ok: !!segVal('f-expiry'), focus: '#f-expiry button', level: 1 });
     if (!isSet) list.push({ id: 'cost', sec: 'sec-money', t: '原価 (1 円以上)', ok: priceOk('cost-jpy'), focus: '#cost-jpy', level: 2 });
     if (cardOn()) {
       list.push({ id: 'amazon', sec: 'sec-card', t: 'Amazon URL か ASIN', ok: !!(val('amazon-url') || val('asin')), focus: '#amazon-url', level: 3 });
@@ -132,8 +141,12 @@
       a.classList.toggle('todo', todo); a.classList.toggle('done', mine.length > 0 && !todo);
       var st = $('[data-step="' + sec + '"]'); if (st) st.classList.toggle('done', mine.length > 0 && !todo);
     });
-    var tm = $('#tax-miss'); if (tm) tm.hidden = !!segVal('f-tax_rate');
-    var row = $('[data-row="tax_rate"]'); if (row) row.classList.toggle('missing', !segVal('f-tax_rate'));
+    // 選ぶまで「まだ選んでいません」を出す切り替え (税率・売上分類・ロジザードの有効期限の管理)
+    [['tax-miss', 'f-tax_rate', 'tax_rate'], ['sales-miss', 'f-sales_class', 'sales_class'], ['expiry-miss', 'f-expiry', 'expiry_managed']].forEach(function (m) {
+      var on = !!segVal(m[1]);
+      var tm = document.getElementById(m[0]); if (tm) tm.hidden = on;
+      var row = $('[data-row="' + m[2] + '"]'); if (row && document.getElementById(m[1])) row.classList.toggle('missing', !on);
+    });
     // 未保存
     var d = dirtyEls();
     var names = [];

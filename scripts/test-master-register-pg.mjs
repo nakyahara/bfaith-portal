@@ -91,7 +91,7 @@ try {
   const [dbA, dbB, dbP, dbO2] = [A, B, P, O2].map(pgAdapter);
   const dbGate = { render: pgAdapter(GR), minipc: pgAdapter(GM) };
   const reg = (db, code, { requestId = crypto.randomUUID(), beforeCommit, card = {} } = {}) => R.registerNewSku(db, {
-    actor: 'naka@test', requestId, kind: 'single', code, values: { name: `新商品 ${code}`, standard_price: '1000', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001' }, card,
+    actor: 'naka@test', requestId, kind: 'single', code, values: { name: `新商品 ${code}`, standard_price: '1000', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', sales_class: '3', expiry_managed: '0', reorder_months: '1' }, card,
   }, { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES, beforeCommit });
   const r0 = await runInitialLoad(dbM, planOf(), { log: () => {}, runId: 'load_pg_1', now: new Date('2030-01-05T03:00:00Z') });
   assert.equal(r0.ok, true, r0.error);
@@ -287,7 +287,7 @@ try {
     const sup1 = (await q(`select supplier_id::text as id from core.suppliers where code = '0001'`))[0].id;
     const entry = (code, over = {}) => ({ kind: 'single', code, started_at: null, product: { name: code, sales_class: 3, expiry_managed: false, inbound_date_managed: null },
       sku: { name: code, tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', standard_price_jpy: 1000, shipping_code: 'S01', shipping_method: 'ゆうパケット', shipping_cost_jpy: 210,
-        reorder_months: null, set_sales_class_override: null, handling_own: null }, supplier_id: sup1, cost: null, component_request: null, card: null, ...over });
+        reorder_months: 1, set_sales_class_override: null, handling_own: null }, supplier_id: sup1, cost: null, component_request: null, card: null, ...over });
     const call = (rid, e) => A.query('select ops.register_new_sku($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r', [rid, 'naka@test', '本物のログインの試験', JSON.stringify(ALL_COMPANY), 'e'.repeat(64), JSON.stringify(e)]);
     // 関数の中の書き込みも 0051 の guard が見る (取引停止の仕入先を代表にする = 業務の約束で断る)
     await M.query(`insert into core.suppliers (company_id, code, name, active) values (1, '0099', '止めた仕入先', false) on conflict do nothing`);

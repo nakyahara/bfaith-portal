@@ -95,7 +95,7 @@ try {
   const [dbE1, dbE2, dbE3] = [E1, E2, E3].map(pgAdapter);
   const pidOf = async (c) => (await c.query('select pg_backend_pid() as p')).rows[0].p;
   const PID = { A: await pidOf(E1), B: await pidOf(E2), C: await pidOf(WW), D: await pidOf(WW2), F: await pidOf(E4), G: await pidOf(E5), R: await pidOf(E6), S: await pidOf(E7), V: await pidOf(NG2) };
-  const single = (name) => ({ name, standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', cost: { jpy: '300' } });
+  const single = (name) => ({ name, standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', sales_class: '3', expiry_managed: '0', reorder_months: '1', cost: { jpy: '300' } });
   const reg = (code) => R.registerNewSku(dbE3, { actor: 'naka@test', requestId: crypto.randomUUID(), kind: 'single', code, values: single(`鍵の順 ${code}`), card: { create: false } },
     { ownership: ALL_COMPANY, open: true, now: new Date(), shippingRates: RATES });
   const opts = { ownership: ALL_COMPANY, open: true, nowMs: NOW_MS };
@@ -196,7 +196,7 @@ try {
   const SUP0001 = (await one("select supplier_id::text as id from core.suppliers where code = '0001'")).id;   // 単品は代表の仕入先が要る (0060)
   const DIRECT_ENTRY = (code) => ({ kind: 'single', code, started_at: null, product: { name: '直接の単品', sales_class: 3, expiry_managed: false, inbound_date_managed: null },
     sku: { name: '直接の単品', tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', standard_price_jpy: 1000, shipping_code: 'S01', shipping_method: 'ゆうパケット',
-      shipping_cost_jpy: 210, reorder_months: null, set_sales_class_override: null, handling_own: null }, supplier_id: SUP0001, cost: null, component_request: null, card: null });
+      shipping_cost_jpy: 210, reorder_months: 1, set_sales_class_override: null, handling_own: null }, supplier_id: SUP0001, cost: null, component_request: null, card: null });
   const pathS = (code) => E7.query('select ops.register_new_sku($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r',
     [crypto.randomUUID(), 'naka@test', '直接の試験', OWN, 'e'.repeat(64), JSON.stringify(DIRECT_ENTRY(code))]).then((r) => r.rows[0].r);
   const pathV = () => NG2.query("select ops.revoke_new_entry_lease('single', '試験: 鍵の順の取り消し') as r").then((r) => r.rows[0].r);
