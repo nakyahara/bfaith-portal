@@ -2686,6 +2686,12 @@ export function setShootMode(db, draftId, mode, { actor = null, expected } = {})
     if ((cur.shoot_mode ?? null) === m) {
       // 同じ判定の送り直し。食い違いが残っていればここで直す (別の経路で入った値を押し直しで戻せるように — Codex PR-A 名指し2 High)
       if (material === before) return { changed: false, material_status: before };
+      // 直した値で ③ の完了条件を満たさなくなるなら、ここでも止めて先に ③ へ戻してもらう (Codex PR-A 名指し9 M)
+      if (materialStepWouldBreak(db, id, { shootMode: m, material })) {
+        const err = new Error('③素材待ち はもう完了しています。撮影・素材ステータスを直すなら、先にボードでカードを ③素材待ち に戻してください');
+        err.code = 'material_step_done';
+        throw err;
+      }
       db.prepare(`UPDATE draft_image_production SET material_status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE draft_id = ?`).run(material, id);
       logEvent(db, id, 'shoot_mode_changed',
         `撮影判定「${m ? SHOOT_MODE_LABELS[m] : '未判定'}」に合わせて撮影・素材ステータスを直した (${MATERIAL_STATUS_LABELS[before] || '未設定'} → ${MATERIAL_STATUS_LABELS[material] || '未設定'})`, actor);

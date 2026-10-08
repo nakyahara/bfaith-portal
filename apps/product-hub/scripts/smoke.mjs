@@ -6352,6 +6352,14 @@ let wfSetParentId = null;
           rStale.status === 409 && /ほかの人/.test(rStale.json?.error || '') && ipDone().shoot_mode === 'inhouse', JSON.stringify([rStale, ipDone()]));
         check('撮影判定: 押したのと同じ判定に既になっていれば expected が古くても 200 (送り直し)・expected の値が不正なら 400',
           rSame.status === 200 && rSame.json?.changed === false && rBadExp.status === 400, JSON.stringify([rSame, rBadExp]));
+        // 同じ判定の送り直しで食い違いを直すときも、③ 完了済みで条件を崩すなら 409 (名指し9 M)
+        wfp.setStepState(idDone, 'imgd_material', { state: 'done' }, 'smoke', { isAdmin: true, bypassGates: true });
+        db.prepare(`UPDATE draft_image_production SET material_status = 'not_required' WHERE draft_id = ?`).run(idDone);
+        const rRepairDone = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'inhouse' });
+        check('🚨 撮影判定: ③ 完了済みなら、同じ判定の送り直しでの直しも ③ の条件を崩すときは 409 (素材なしで ④ へ進ませない・名指し9 M)',
+          rRepairDone.status === 409 && ipDone().material_status === 'not_required', JSON.stringify([rRepairDone, ipDone()]));
+        wfp.setStepState(idDone, 'imgd_material', { state: 'todo' }, 'smoke', { isAdmin: true });
+        db.prepare(`UPDATE draft_image_production SET material_status = NULL WHERE draft_id = ?`).run(idDone);
         const rOk = await call('POST', `/api/drafts/${idDone}/shoot-mode`, { mode: 'photographer', expected: 'inhouse' });
         check('撮影判定: expected が今の値と合えば変えられる', rOk.status === 200 && ipDone().shoot_mode === 'photographer', JSON.stringify(rOk));
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDone);
