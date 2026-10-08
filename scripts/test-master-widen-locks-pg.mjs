@@ -107,7 +107,7 @@ try {
   const ex = await build('lk-x');
   await G.issueRegExport(dbE3, { actor: 'boss@test', exportId: ex.export_id }, opts);
   await G.declareRegExport(dbE3, { actor: 'boss@test', exportId: ex.export_id, sha256: ex.sha256, result: 'ok', neMessage: '1件成功しました。' }, opts);
-  // 🆕 0061: 配っただけ (申告なし) の商品 Y も同じ回で確かめる = D は Y の登録の状態を draft → ne_pending → ne_confirmed に進める (同じ鍵の順の中で)
+  // 🆕 0063: 配っただけ (申告なし) の商品 Y も同じ回で確かめる = D は Y の登録の状態を draft → ne_pending → ne_confirmed に進める (同じ鍵の順の中で)
   await reg('lk-y');
   const ey = await build('lk-y');
   await G.issueRegExport(dbE3, { actor: 'boss@test', exportId: ey.export_id }, opts);
@@ -275,7 +275,7 @@ try {
     assert.ok(LOG.some((x) => x.path === 'S' && x.waiting >= 4 && x.held.includes(2)), 'DB の登録の関数を直接呼んでも許可の鍵を段階の鍵より先に取る');
     assert.ok(LOG.some((x) => x.path === 'V' && x.waiting === 2 && x.held.length === 0), '許可の取り消しは許可の排他の鍵で待つ (何も持たずに)');
     assert.deepEqual(LOG.filter((x) => x.unknown > 0), [], '表に無い advisory の鍵を持って待つ道が無い (持っている鍵は全部 §3.10 の番号で比べた)');
-    // 🆕 0061: D (照合の確かめ) が申告した X も、申告なしの Y も NE 確認済みにした (Y = 下書き → NE 登録待ち → NE 確認済み・system)
+    // 🆕 0063: D (照合の確かめ) が申告した X も、申告なしの Y も NE 確認済みにした (Y = 下書き → NE 登録待ち → NE 確認済み・system)
     const regs = await M.query(`select s.code, r.state, i.state as item_state, i.attempt_id is null as undeclared from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id
       join ops.ne_reg_export_items i on i.sku_id = r.sku_id where s.code in ('lk-x', 'lk-y') order by s.code`);
     assert.deepEqual(regs.rows.map((x) => [x.code, x.state, x.item_state, x.undeclared]), [['lk-x', 'ne_confirmed', 'verified', false], ['lk-y', 'ne_confirmed', 'verified', true]]);

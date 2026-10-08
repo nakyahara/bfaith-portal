@@ -1,4 +1,4 @@
--- 0061: 新商品の NE 登録の CSV = 「取り込んだと申告」をしなくても、翌朝の照合 ② が配ったファイルの商品を確かめて NE 確認済みにする (2026-10-08。中原さんの決定 a)
+-- 0063: 新商品の NE 登録の CSV = 「取り込んだと申告」をしなくても、翌朝の照合 ② が配ったファイルの商品を確かめて NE 確認済みにする (2026-10-08。中原さんの決定 a)
 -- 🚨 前提 = 0053 (⑤-2b の表と関数)・0058 (配る道の許可)。どちらも本番に適用済み。番号はマージの順で振り直す (中身は番号に依らない)
 --
 -- なぜ:
@@ -84,7 +84,7 @@ revoke all on function ops.ne_reg_auto_block(bigint) from public;
  * 生きている商品 (issued / import_declared / partial) ごとに:
  *   申告あり (import_declared・申告の後の partial = attempt_id がある) = 0053 のまま:
  *     申告の前の取得・信用できない観測 = waiting / 申告の後の完全な取得に無い = failed (not_in_ne・「無い」を信じてよいときだけ) / ある = 比べる
- *   申告なし (issued・申告なしの partial = attempt_id が null。0061):
+ *   申告なし (issued・申告なしの partial = attempt_id が null。0063):
  *     配った時刻より前の取得・信用できない観測 = waiting / 無い = waiting (failed にしない。配ってから 3 日 (v_days) を過ぎた取得で
  *     「無い」を信じてよいときは not_imported に出す) / ある = 比べる。ただし ops.ne_reg_auto_block が理由を返す品目 (セット・JAN を送った・
  *     配った時の印が無い) は in_ne_undeclared のまま (状態は変えない・needs_declaration に出す = 申告すると 0053 のまま確かめる)
@@ -134,7 +134,7 @@ begin
     v_cmp := null;
     v_late := false;
     v_block := null;
-    -- 申告あり = 申告の時刻から (0053 のまま)・申告なし = 配った時刻から (0061)
+    -- 申告あり = 申告の時刻から (0053 のまま)・申告なし = 配った時刻から (0063)
     v_basis := case when it.attempt_id is not null then 'declared' else 'issued' end;
     if v_basis = 'declared' then
       if it.export_declared_at is null or v_fetched <= it.export_declared_at then
@@ -208,7 +208,7 @@ revoke all on function ops.record_ne_registration_check(text) from public;
  * ne_pending・ne_confirmed の根拠は、関数が 0053 の記録から自分で読んで鍵を取る (呼び手の渡す根拠の JSON は信じない = 渡したら拒む caller_evidence)。
  * distributable / available は ④ まで not_ready のまま。
  *   ne_pending   ← (人) この SKU の新規登録の CSV の品目が import_declared・その試み (結果 ok / partial・sha256 = ファイルの記録) がある (0053 のまま)
- *                ← (system・0061) 下書きから: この SKU の照合の確かめ (ops.ne_reg_checks) が verified・その品目が verified で同じ照合の回・
+ *                ← (system・0063) 下書きから: この SKU の照合の確かめ (ops.ne_reg_checks) が verified・その品目が verified で同じ照合の回・
  *                  申告なし (attempt_id が null)・回の記録がある = 申告をしなかった品目を照合が確かめた (照合の確かめの中だけが通る道)
  *   ne_confirmed ← ne_pending から: この SKU の照合の確かめ (ops.ne_reg_checks) が verified・その品目が verified で同じ照合の回・回の記録がある (system)
  *                  quarantined から: NE で見つけた商品の照合の結果の表はまだ無い = not_ready
@@ -257,7 +257,7 @@ begin
       v_ev := pg_catalog.jsonb_build_object('export_id', v_rec.export_id, 'item_id', v_rec.item_id, 'attempt_id', v_rec.attempt_id, 'sha256', v_rec.sha256,
                                             'result', v_rec.result, 'declared_by', v_rec.declared_by, 'declared_at', v_rec.declared_at);
     elsif p_to = 'ne_pending' then
-      -- 🆕 0061: 申告をしなかった品目を、配った後の NE の完全な取得で照合が確かめた (system・ne_compare だけ)
+      -- 🆕 0063: 申告をしなかった品目を、配った後の NE の完全な取得で照合が確かめた (system・ne_compare だけ)
       if p_actor_id <> 'ne_compare' then raise exception 'no_evidence: 申告なしの NE 登録待ちは翌朝の照合 (ne_compare) の確かめで' using errcode = '22023'; end if;
       select c.check_id, c.compare_run_id, c.item_id, i.export_id, c.fetched_at, e.issued_at into v_rec
         from ops.ne_reg_checks c
@@ -302,7 +302,7 @@ begin
 end $$;
 revoke all on function ops.transition_sku_registration(bigint, text, text, text, text, jsonb, text) from public;
 
-comment on view ops.v_ne_reg_targets is '翌朝の照合 ② が NE の完全な取得の値を送る新規登録の商品 (0053・0061 から配っただけ (issued) の商品も確かめる)';
+comment on view ops.v_ne_reg_targets is '翌朝の照合 ② が NE の完全な取得の値を送る新規登録の商品 (0053・0063 から配っただけ (issued) の商品も確かめる)';
 
 -- ─── 権限 (0053 と同じ形)。create or replace は今の権限を残す = 照合の確かめは watch_writer だけ (流し直し)・新しい部品はだれにも渡さない ───
 do $$ begin

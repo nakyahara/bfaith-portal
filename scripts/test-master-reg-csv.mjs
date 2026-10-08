@@ -430,7 +430,7 @@ await ta('[C8] 無い・信じられない・配る前の取得: 配った時刻
   const id = r.export.export_id;
   await issue(id);
   const r1 = await newRun();
-  // 0061: 配った時刻より前の NE の取得は、全部の列が合っていても比べない (配ったファイルを取り込んだ証拠にならない)
+  // 0063: 配った時刻より前の NE の取得は、全部の列が合っていても比べない (配ったファイルを取り込んだ証拠にならない)
   let c = await check(r1, [obsSingle('new-b', { name: ok('新しい単品 B') })], { productsAt: new Date(Date.now() - 3600000).toISOString() });
   assert.deepEqual(c.counts, { waiting: 1 });
   assert.deepEqual(c.not_imported, []);
@@ -453,7 +453,7 @@ await ta('[C8] 無い・信じられない・配る前の取得: 配った時刻
   await supersede(again.export.export_id);
 });
 
-await ta('[C8b] 申告なし (0061・中原さん 10/8 a): 配った → 申告しない → 翌朝の照合が確かめる = NE に無い = 待ち (failed にしない・3 日を過ぎたら not_imported で知らせる)・違う列 = partial・全部合う = verified + 下書き → NE 登録待ち → NE 確認済み', async () => {
+await ta('[C8b] 申告なし (0063・中原さん 10/8 a): 配った → 申告しない → 翌朝の照合が確かめる = NE に無い = 待ち (failed にしない・3 日を過ぎたら not_imported で知らせる)・違う列 = partial・全部合う = verified + 下書き → NE 登録待ち → NE 確認済み', async () => {
   await reg('single', 'auto-e', single({ name: '新しい単品 E' }));
   const r = await build('products', ['auto-e']);
   const id = r.export.export_id;
