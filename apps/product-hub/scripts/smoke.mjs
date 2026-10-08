@@ -6358,6 +6358,19 @@ let wfSetParentId = null;
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDone2);
       }
 
+      // 🚨 古いタブ: 撮影不要で素材完了 → 別タブで社内撮影に変更 (素材は未設定に戻る) → 古いタブが素材完了で保存 (Codex PR-A 名指し7 High)
+      await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'none' });
+      db.prepare(`UPDATE draft_image_production SET material_status = 'ready' WHERE draft_id = ?`).run(idSf);
+      await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'inhouse' });
+      const rOldTab = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'ready', shoot_mode_expected: 'none' });
+      check('🚨 古いタブ: 画面が見ていた撮影判定 (撮影不要) と今 (社内撮影) が違えば、素材完了の保存は 409 (撮影前に ③ を通さない)',
+        rOldTab.status === 409 && ipSf().material_status === null && /撮影判定を変えています/.test(rOldTab.json?.error || ''), JSON.stringify([rOldTab, ipSf()]));
+      const rNewTab = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'ready', shoot_mode_expected: 'inhouse' });
+      const rBadTab = await call('POST', `/api/drafts/${idSf}/image-production`, { material_status: 'shipped', shoot_mode_expected: 'x' });
+      check('古いタブ: 撮影判定が画面と同じなら保存できる・shoot_mode_expected の値が不正なら 400',
+        rNewTab.status === 200 && ipSf().material_status === 'ready' && rBadTab.status === 400, JSON.stringify([rNewTab, rBadTab]));
+      db.prepare(`UPDATE draft_image_production SET material_status = NULL WHERE draft_id = ?`).run(idSf);
+
       // 🚨 毎起動の旧 Notion 値の埋め戻しが、撮影判定でそろえた素材ステータスを上書きしない (Codex PR-A 名指し2 High)
       db.prepare(`UPDATE draft_image_production SET shipping_status = '撮影依頼不要', material_status = NULL WHERE draft_id = ?`).run(idSf);
       const idLegacyShip = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SHOOT-LEGACY', '旧Notion', 'smoke')`).run().lastInsertRowid);
@@ -6455,7 +6468,25 @@ let wfSetParentId = null;
       check('🚨 保存: 撮影・素材ステータスは変えていなければ送らない・変えたら送る (未設定から/未設定へも)',
         flowMat(matDoc('shipped', 'shipped')) === undefined && flowMat(matDoc('ready', 'shipped')) === 'ready'
         && flowMat(matDoc('', '')) === undefined && flowMat(matDoc('ready', '')) === 'ready' && flowMat(matDoc('', 'ready')) === '');
-      check('保存の JS: 画像制作情報の保存は materialForSave を通す', /material_status: materialForSave\(document\)/.test(detailSrc));
+      const flowExtra = new Function(flowChunk + '\nreturn { shootModeShown, revealHiddenCameraDraft };')();
+      const camDraftDoc = (hidden, value, def) => {
+        const sec = { hidden };
+        return { sec, getElementById: (id) => (id === 'ipf-step-shoot' ? sec : id === 'ip-camera-url' ? { value, defaultValue: def } : null) };
+      };
+      const dHidden = camDraftDoc(true, 'https://docs.google.com/spreadsheets/d/stash/edit', '');
+      const dSame = camDraftDoc(true, '', '');
+      const dShown = camDraftDoc(false, 'https://x', '');
+      check('🚨 保存: 隠れた撮影指示書の段に未保存の入力があれば段を開いて止める (保存済み扱いで黙って消さない・名指し7 M)',
+        flowExtra.revealHiddenCameraDraft(dHidden) === true && dHidden.sec.hidden === false
+        && flowExtra.revealHiddenCameraDraft(dSame) === false && dSame.sec.hidden === true && flowExtra.revealHiddenCameraDraft(dShown) === false);
+      check('保存: 画面の撮影判定 (未判定は null) を読む',
+        flowExtra.shootModeShown({ getElementById: () => ({ dataset: { current: 'inhouse' } }) }) === 'inhouse'
+        && flowExtra.shootModeShown({ getElementById: () => ({ dataset: { current: '' } }) }) === null);
+      const saveSrc = detailSrc.slice(detailSrc.indexOf("saveIpBtn.addEventListener('click'"), detailSrc.indexOf('/* @image-flow:start'));
+      check('保存の JS: 画像制作情報の保存は materialForSave を通し、送るときは画面の撮影判定を添える・隠れた未保存の確認は退避より先',
+        /material_status: materialSend/.test(saveSrc) && /const materialSend = materialForSave\(document\)/.test(saveSrc)
+        && /shoot_mode_expected: shootModeShown\(document\)/.test(saveSrc)
+        && saveSrc.indexOf('revealHiddenCameraDraft(document)') > 0 && saveSrc.indexOf('revealHiddenCameraDraft(document)') < saveSrc.indexOf('phKeep.saving('));
       check('保存の JS: 画像制作情報の保存は cameraUrlForSave を通す (欄の値を直接送らない)',
         /camera_instruction_url: cameraUrlForSave\(document\)/.test(detailSrc) && !/camera_instruction_url: document\.getElementById\('ip-camera-url'\)\.value/.test(detailSrc));
 

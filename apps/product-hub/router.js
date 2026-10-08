@@ -1471,6 +1471,17 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     //   撮影不要 なのに「撮影不要 / 素材完了」以外 → 撮影不要と出ているのに ③ が閉じられない — Codex PR-A R2 P2
     const ipNow = db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(draft.id) || {};
     const sm = ipNow.shoot_mode;
+    // 画面が見ていた撮影判定 (shoot_mode_expected) と今の判定が違えば 409。別タブで「撮影不要 → 社内撮影」に
+    // 変えて素材完了を外したのに、古いタブの素材完了で戻されるのを防ぐ (Codex PR-A 名指し7 High)。省略可 (古い画面)
+    if (Object.prototype.hasOwnProperty.call(b, 'shoot_mode_expected')) {
+      const exp = b.shoot_mode_expected;
+      if (!(exp === null || (typeof exp === 'string' && SHOOT_MODE_CODES.has(exp)))) {
+        return res.status(400).json({ ok: false, error: 'shoot_mode_expected の値が不正です' });
+      }
+      if ((sm ?? null) !== exp) {
+        return res.status(409).json({ ok: false, error: 'ほかの人 (または別の画面) が撮影判定を変えています。画面を読み直してから、撮影・素材ステータスを選び直してください' });
+      }
+    }
     // ③素材待ち を完了したあとで、③ の条件を満たさない値へ変える保存 (古いタブの一括保存を含む) は 409。
     // 値が変わらない保存は通す — Codex PR-A 名指し4 High
     if (materialVal !== (ipNow.material_status ?? null) && materialStepWouldBreak(db, draft.id, { shootMode: sm ?? null, material: materialVal })) {

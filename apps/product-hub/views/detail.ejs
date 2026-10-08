@@ -5860,7 +5860,13 @@ th.attr-unknown { color: #dc2626; }
   const saveIpBtn = document.getElementById('save-ip-btn');
   if (saveIpBtn) {
     saveIpBtn.addEventListener('click', async () => {
+      // 隠れた撮影指示書の段に未保存の入力が戻っている (別タブで撮影不要にされた後など) なら、黙って捨てず見せて止める
+      if (revealHiddenCameraDraft(document)) {
+        result.textContent = '撮影指示書の URL に保存していない入力があります (撮影判定は今「撮影不要」か未判定です)。段を開いたので、残すか消すかを決めてから保存してください';
+        return;
+      }
       const snap = phKeep ? phKeep.saving(['image']) : null;
+      const materialSend = materialForSave(document);
       const json = await post(BASE + '/image-production', {
         status: document.getElementById('ip-status').value,
         importance_tier: document.getElementById('ip-tier').value,
@@ -5877,7 +5883,9 @@ th.attr-unknown { color: #dc2626; }
         edit_data_url: document.getElementById('ip-edit-data-url').value,
         top_compose_text: document.getElementById('ip-top-compose').value,
         top_ref_url: document.getElementById('ip-top-ref-url').value,
-        material_status: materialForSave(document),
+        material_status: materialSend,
+        // 素材ステータスを送るときは、画面が見ていた撮影判定も添える (別タブで判定が変わっていたらサーバが 409)
+        ...(materialSend !== undefined ? { shoot_mode_expected: shootModeShown(document) } : {}),
         ...productInfoPayload(),
         back_info_text: document.getElementById('ip-back-info').value,
       });
@@ -5936,6 +5944,23 @@ th.attr-unknown { color: #dc2626; }
    * 「画像制作情報を保存」で送る撮影・素材ステータス。画面を開いたときから変えていなければ送らない —
    * 別のタブ・撮影判定で変わった新しい値を、開いたときの古い値で戻さない (Codex PR-A 名指し6 M)
    */
+  /** 画面が表示している撮影判定 (未判定は null) */
+  function shootModeShown(doc) {
+    const box = doc.getElementById('shoot-mode-box');
+    return box && box.dataset.current ? box.dataset.current : null;
+  }
+  /**
+   * 撮影指示書の段が隠れているのに、欄に保存していない入力がある (未保存の退避が戻った) なら段を開いて true —
+   * 保存で送らない欄を「保存した」扱いにして、次の読み直しで黙って消さない (Codex PR-A 名指し7 M)
+   */
+  function revealHiddenCameraDraft(doc) {
+    const sec = doc.getElementById('ipf-step-shoot');
+    const el = doc.getElementById('ip-camera-url');
+    if (!sec || !el || !sec.hidden) return false;
+    if (String(el.value || '').trim() === String(el.defaultValue || '').trim()) return false;
+    sec.hidden = false;
+    return true;
+  }
   function materialForSave(doc) {
     const el = doc.getElementById('ip-material');
     if (!el) return undefined;
