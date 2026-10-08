@@ -80,6 +80,7 @@ import {
 import { Readable } from 'node:stream';
 // LP 構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09)。ロジックは lib/lp-edit.js
 import { editStateFor as lpEditStateFor, saveEdit as saveLpEdit, effectiveComposeText as lpEffectiveComposeText } from './lib/lp-edit.js';
+import { imageLimitForPriority as lpImageLimitForPriority } from './lib/lp-image.js';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
@@ -547,7 +548,7 @@ router.get('/detail/:id', (req, res) => {
     // compose_version = 画面が見ている LP構成の版。押したときに添え、違えば受け付けない (PR-B)
     lpImage: { ...lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }), compose_version: lpComposeVersion(db, draft) },
     // LP構成の確認・修正 (2026-10-09 PR-B)。直せるのは画像制作情報を触れる人だけ (見るのは誰でも)
-    lpEdit: lpEditStateFor(db, draft, { canEdit: canEditImageProduction(req) }),
+    lpEdit: lpEditStateFor(db, draft, { canEdit: canEditImageProduction(req), imageLimit: lpImageLimitForPriority(draft.image_priority) }),
     // 画像制作の新フロー (2026-10-08): 撮影判定の 3 択と、撮影依頼文の宛先
     imageFlow: { shootModes: SHOOT_MODES, mention: shootRequestMention() },
   });
@@ -4072,7 +4073,7 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
 router.get('/api/drafts/:id/lp-edit', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  res.json(lpEditStateFor(getDB(), draft, { canEdit: canEditImageProduction(req) }));
+  res.json(lpEditStateFor(getDB(), draft, { canEdit: canEditImageProduction(req), imageLimit: lpImageLimitForPriority(draft.image_priority) }));
 });
 
 /**
@@ -4093,7 +4094,7 @@ router.put('/api/drafts/:id/lp-edit', (req, res) => {
     const status = r.code === 'conflict' || r.code === 'not_ready' ? 409 : 400;
     return res.status(status).json({ ok: false, code: r.code, error: r.error, errors: r.errors || null });
   }
-  res.json({ ...lpEditStateFor(db, draft, { canEdit: true }), changed: r.changed });
+  res.json({ ...lpEditStateFor(db, draft, { canEdit: true, imageLimit: lpImageLimitForPriority(draft.image_priority) }), changed: r.changed });
 });
 
 // ─── 画面: LP 画像を作る (段階2・2026-10-04 中原さん) ─────────────

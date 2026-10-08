@@ -46,8 +46,9 @@ const NONE = 'なし';
 const UID_RE = /^[a-z][A-Za-z0-9_-]{0,39}$/;
 /** 画面が新しく足した画像の uid (n で始まる)。それ以外の知らない uid は受け付けない */
 const NEW_UID_RE = /^n[A-Za-z0-9_-]{1,39}$/;
+// C0 (改行・タブ以外)・DEL・C1・行区切り (U+2028/2029)。コピー・画像の prompt に見えない文字が混ざらないように (Codex PR-B 名指し R4 L)
 // eslint-disable-next-line no-control-regex
-const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u2028\u2029]/;
 
 const normalize = (s) => String(s == null ? '' : s).replace(/\r\n?/g, '\n');
 /** 画面に出す値 (前後の空白を落とし、「なし」は空欄) */
@@ -378,8 +379,10 @@ export function imageStaleFor(db, draftId, eff) {
 }
 
 /** 画面 (GET と保存の応答・詳細画面の最初の表示) に出す状態 */
-export function editStateFor(db, draft, { canEdit = false } = {}) {
-  const base = { ok: true, can_edit: !!canEdit, max_images: MAX_IMAGES, min_images: MIN_IMAGES };
+export function editStateFor(db, draft, { canEdit = false, imageLimit = null } = {}) {
+  // image_limit = 「画像を作る」で作る枚数の上限 (lp-image の imageLimitForPriority。重要度：高 は先頭 8 枚・ほかは 1枚目だけ)。
+  // 構成は lint に合わせて 10 枚まで持てるので、画面で「ここから後ろは画像を作らない」と知らせる (Codex PR-B 名指し R4 M)
+  const base = { ok: true, can_edit: !!canEdit, max_images: MAX_IMAGES, min_images: MIN_IMAGES, image_limit: Number.isInteger(imageLimit) ? imageLimit : null };
   const eff = effectiveCompose(db, draft?.id);
   if (!eff) return { ...base, available: false, reason: 'LP構成がまだできていません (「🤖 構成をAIに作らせる」で作ると、ここで直せます)' };
   const common = {

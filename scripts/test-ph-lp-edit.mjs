@@ -177,6 +177,7 @@ console.log('④ 決まり (TOP / FV は固定・知らない uid・枚数・文
   ok(/行の先頭に # は使えません/.test(bad({ title: '#1位' })), '見出しの # も断る');
   ok(/見出しは 120 文字まで/.test(bad({ title: 'あ'.repeat(121) })), '長すぎる見出しは断る');
   ok(/制御文字/.test(bad({ copy: 'a\u0007b' })), '制御文字は断る');
+  ok(/制御文字/.test(bad({ body: 'a\u0085b' })) && /制御文字/.test(bad({ body: 'a\u009Bb' })) && /制御文字/.test(bad({ title: 'a\u2028b' })), 'C1 制御文字・行区切りも断る');
   ok(/true \/ false/.test(bad({ shoot: 'yes' })), '要撮影は true / false だけ');
   ok(/文字で送って/.test(bad({ body: null })), '4 項目は文字で送る');
   ok(/uid\) の形が不正/.test(bad({ uid: '<x>' })), 'uid の形が違えば断る');
@@ -573,6 +574,12 @@ console.log('⑨ 画面の JS: 一覧を描く・並べ替え・追加・削除�
   ok(D.click('undo'), '元に戻す');
   eq(ui.state().slots.map((s) => s.uid), [u0, u1, u2, u4, u3], '🚨 消した位置に戻る');
   ok(!H().includes('data-act="undo"'), '戻したら「元に戻す」は消える');
+  ok(!H().includes('それより後ろの画像は AI では作りません'), '8 枚以下なら知らせない');
+  // 重要度が高くない商品は 1枚目 (FV) だけ作る — そう知らせる
+  db.prepare(`UPDATE product_drafts SET image_priority = '仕入商品（重要度：低）' WHERE id = ?`).run(R.draft.id);
+  const low = (await api('GET', `/api/drafts/${R.draft.id}/lp-edit`)).json;
+  db.prepare(`UPDATE product_drafts SET image_priority = '自社商品（重要度：高）' WHERE id = ?`).run(R.draft.id);
+  ok(low.image_limit === 1 && F.lpeHtml(F.lpeFromServer(low, null)).includes('作るのは 1枚目 (FV) だけです'), '重要度が高くなければ「1枚目 (FV) だけ」と知らせる');
   // 追加
   ok(D.click('add'), '＋ 画像を追加');
   const added = ui.state().slots[5];
@@ -585,6 +592,7 @@ console.log('⑨ 画面の JS: 一覧を描く・並べ替え・追加・削除�
   // 上限
   ok(D.click('add') && D.click('add') && D.click('add') && D.click('add'), 'さらに 4 枚 (10 枚)');
   ok(H().includes('LP構成（10枚）') && !D.click('add') && H().includes('画像は 10 枚までです'), '🚨 10 枚 (lint の上限) で追加できない');
+  ok(st.image_limit === 8 && H().includes('TOP から 7枚目 までの 8 枚です。それより後ろの画像は AI では作りません'), '🚨 「画像を作る」が作るのは先頭 8 枚 (重要度：高) と知らせる');
   D.fire('click', { closest: () => ({ dataset: { act: 'add' } }) });
   ok(ui.state().slots.length === 10 && /10 枚まで/.test(ui.state().msg), '🚨 押された知らせが来ても 11 枚目は足さない (理由を出す)');
   ok(D.click('del', 'nui5') && D.click('del', 'nui4') && D.click('del', 'nui3') && D.click('del', 'nui2'), '足しすぎた分を消す');

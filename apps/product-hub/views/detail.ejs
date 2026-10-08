@@ -6619,6 +6619,7 @@ th.attr-unknown { color: #dc2626; }
       base_job_id: st && st.base_job_id != null ? st.base_job_id : null,
       base_edit_id: st && st.base_edit_id != null ? st.base_edit_id : null,
       edited_by: (st && st.edited_by) || '', edited_at: (st && st.edited_at) || '', image_stale: !!(st && st.image_stale),
+      image_limit: st && Number.isInteger(st.image_limit) ? st.image_limit : null,
       slots: slots, saved: JSON.stringify(lpeForSave(slots)),
       open: prev && prev.open ? prev.open : {}, undo: null, msg: '', saving: false, conflict: false, focus: null, newer: false,
     };
@@ -6683,6 +6684,9 @@ th.attr-unknown { color: #dc2626; }
         ? '人が直した版 (' + lpeEsc(String(S.edited_at).slice(0, 16).replace('T', ' ')) + ' ' + lpeEsc(S.edited_by) + ')'
         : 'AI が作ったまま') + '</span></div>';
     if (S.image_stale) h += '<div class="lpe-stale">⚠️ 画像を作ったあとで LP構成が変わりました。もう一度「画像を作る」と反映されます</div>';
+    // 「画像を作る」で作るのは先頭の何枚か (重要度：高 は 8 枚・ほかは 1枚目だけ)。構成はそれより多く持てるので知らせる
+    if (S.image_limit === 1) h += '<div class="muted" style="font-size:11px;">「画像を作る」で作るのは 1枚目 (FV) だけです (重要度：高 の商品は先頭から複数枚)</div>';
+    else if (S.image_limit && n > S.image_limit) h += '<div class="muted" style="font-size:11px;">「画像を作る」で作るのは ' + lpeLabel(0) + ' から ' + (S.image_limit - 1) + '枚目 までの ' + S.image_limit + ' 枚です。それより後ろの画像は AI では作りません</div>';
     if (S.newer) {
       h += '<div class="lpe-stale"><span>AI が新しい LP構成を作りました。いまの直しは新しい構成には入りません</span>'
         + '<button type="button" class="btn btn-sm" data-act="reload">新しい構成を読み込む</button></div>';
