@@ -8,7 +8,8 @@
   // 新商品の登録 (画面 D)。新しいデザイン (第 2 段 10/5): 上から順に入れる 1 ページ・上に飛び先の帯・右に「下書き保存まで あと N つ」。
   // 保存の送り方 (POST /api/new) と中身は前と同じ。画面の動き = public/me-new.js
   const isSet = kind === 'set';
-  const canSave = !!page && canEdit && !dbError && !entryClosed && !!shippingRates;
+  // 送料の表が読めなくても下書きはできる (発送方法は必須でない・2026-10-08 中原さん。選んだときだけサーバーが送料の表で確かめる)
+  const canSave = !!page && canEdit && !dbError && !entryClosed;
   const dis = canSave ? '' : ' disabled';
   const SALES = { 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' };
   // 切り替えボタン (税率・売上分類・ロジザード・取扱・カード・セット商品)。押された状態は aria-pressed・見出し (lab-…) と結ぶ
@@ -40,7 +41,7 @@
     <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
     <% if (page && entryClosed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">切替前です (<%= entryWhy || ('段階: ' + phaseText) %>)</div><div class="hint">新商品はまだ NE・product-hub で登録します。この画面は見るだけです (登録を押しても「切替前」で断られ、何も変わりません)。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
-    <% if (page && !shippingRates) { %><div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">送料の表が読めないので、発送方法を選べません (登録できません)</div><div class="hint">少し待ってから画面を開き直してください。</div></div></div><% } %>
+    <% if (page && !shippingRates) { %><div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">送料の表が読めないので、発送方法を選べません</div><div class="hint">発送方法は空のまま下書きにして、あとで商品の画面で入れられます。いま選ぶときは、少し待ってから画面を開き直してください。</div></div></div><% } %>
 
     <% if (page) { %>
     <form class="edit" id="f" novalidate data-kind="<%= kind %>" data-can-save="<%= canSave ? '1' : '0' %>">
@@ -117,24 +118,24 @@
             <div class="ctl"><%- seg('f-tax_rate', 'tax_rate', '', [['0.08', '8%', '軽減 · 食品'], ['0.1', '10%', '標準']], '税率') %><span class="misslabel" id="tax-miss"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ選んでいません</span></div></div>
           <div class="f" data-row="sales_class"><div class="lab" id="lab-f-sales_class">売上分類<span class="opt">あとでも可</span></div>
             <div class="ctl"><%- seg('f-sales_class', 'sales_class', '', [...Object.entries(SALES).map(([k, v]) => [k, v]), ['', 'あとで']], '売上分類') %></div></div>
-          <div class="f" data-row="primary_supplier"><label class="lab" for="f-primary_supplier">代表の仕入先<span class="opt">あとでも可</span></label>
+          <div class="f" data-row="primary_supplier"><label class="lab" for="f-primary_supplier">代表の仕入先<span class="req">必須</span></label>
             <div class="ctl"><select class="in w-m" id="f-primary_supplier" data-field="primary_supplier" data-dirty-field="primary_supplier" data-label="代表の仕入先"<%= dis %>>
-              <option value="">(あとで)</option>
+              <option value="">(選ぶ)</option>
               <% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"><%= s.code %> <%= s.name %></option><% } %>
-            </select><a class="hint" href="/apps/purchase-orders" target="_blank" rel="noopener">先方品番・入数・ロットは 発注アプリ ↗</a></div></div>
+            </select><span class="hint">NE で必須の項目です</span><a class="hint" href="/apps/purchase-orders" target="_blank" rel="noopener">先方品番・入数・ロットは 発注アプリ ↗</a></div></div>
         </section>
         <% } %>
 
         <section class="panel" id="sec-ship" aria-labelledby="h-ship">
           <div class="panel-h"><span class="stepno" data-step="sec-ship" aria-hidden="true"><%= no('sec-ship') %></span><h2 id="h-ship">発送</h2></div>
-          <div class="f" data-row="shipping_code"><label class="lab" for="shipping">発送方法<span class="req">必須</span></label>
+          <div class="f" data-row="shipping_code"><label class="lab" for="shipping">発送方法<span class="opt">あとでも可</span></label>
             <div class="ctl">
               <% if (shippingRates) { %>
               <select class="in w-m" id="shipping" data-field="shipping_code" data-dirty-field="shipping_code" data-label="発送方法"<%= dis %>>
-                <option value="">(選ぶ)</option>
+                <option value="">(あとで)</option>
                 <% for (const r of shippingRates) { %><option value="<%= r.code %>"><%= r.code %> <%= r.method || '' %> / <%= fmt.yen(r.cost) %> 円</option><% } %>
               </select>
-              <span class="hint">送料コード → 方法と金額は送料の表から · product-hub の楽天の配送方法は対応表から (無ければカードに「要確認」)</span>
+              <span class="hint">届いてサイズを見てから決めるときは空のまま (あとで商品の画面で入れる) · 送料コード → 方法と金額は送料の表から · product-hub の楽天の配送方法は対応表から (無ければカードに「要確認」)</span>
               <% } else { %><span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg>送料の表が読めません</span><% } %>
             </div></div>
           <div class="f" data-row="reorder_months"><label class="lab" for="f-reorder_months">推奨保有月数<span class="opt">あとでも可</span></label>

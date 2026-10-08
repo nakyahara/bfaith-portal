@@ -3,7 +3,8 @@
  *   - 未保存の数 = data-dirty-field を付けた欄だけ (保存の理由・種類の札・全体から探す は数えない)。セットの構成は「構成の中身どうし」をくらべる
  *   - 右の「下書き保存まで あと N つ」= ① 下書きに要る (これがそろうまで保存のボタンは押せない) ② NE 登録の CSV までに要る ③ 出品カードに要る (② ③ は止めない)
  *   - 上の飛び先の帯 = 区切りごとに ① が足りていれば緑・足りなければ黄色
- *   - 保存の送り方は前と同じ (POST /api/new { request_id, kind, code, reason, values, card })。サーバーの確かめは変えていない
+ *   - 保存の送り方は前と同じ (POST /api/new { request_id, kind, code, reason, values, card })。
+ *     🆕 2026-10-08 中原さん: 単品の代表の仕入先は ① (必須)・発送方法は ③ (あとでも可・届いてサイズを見てから)。サーバー (lib/master-register.mjs) と DB (0060) も同じ決まり
  *   - 保存が通ったら、できた商品の画面へ移る (今の画面の履歴を置き換える = 戻る 1 回で前の画面)。商品の画面の上に結果を 1 回だけ出す
  */
 (function () {
@@ -84,14 +85,13 @@
     if (isSet && salesFromComp != null && val('f-set_sales_class_override')) list.push({ id: 'override', sec: 'sec-comp', t: '売上分類の上書きを空にする (構成品から導けます)', ok: false, focus: '#f-set_sales_class_override', level: 1 });
     list.push({ id: 'standard_price', sec: 'sec-money', t: '売価', ok: priceOk('f-standard_price'), focus: '#f-standard_price', level: 1 });
     if (!isSet) list.push({ id: 'tax_rate', sec: 'sec-tax', t: '税率', ok: !!segVal('f-tax_rate'), focus: '#f-tax_rate button', level: 1 });
-    list.push({ id: 'shipping_code', sec: 'sec-ship', t: '発送方法', ok: !!val('shipping'), focus: '#shipping', level: 1 });
-    if (!isSet) {
-      list.push({ id: 'cost', sec: 'sec-money', t: '原価 (1 円以上)', ok: priceOk('cost-jpy'), focus: '#cost-jpy', level: 2 });
-      list.push({ id: 'primary_supplier', sec: 'sec-tax', t: '代表の仕入先', ok: !!val('f-primary_supplier'), focus: '#f-primary_supplier', level: 2 });
-    }
+    if (!isSet) list.push({ id: 'primary_supplier', sec: 'sec-tax', t: '代表の仕入先', ok: !!val('f-primary_supplier'), focus: '#f-primary_supplier', level: 1 });
+    if (!isSet) list.push({ id: 'cost', sec: 'sec-money', t: '原価 (1 円以上)', ok: priceOk('cost-jpy'), focus: '#cost-jpy', level: 2 });
     if (cardOn()) {
       list.push({ id: 'amazon', sec: 'sec-card', t: 'Amazon URL か ASIN', ok: !!(val('amazon-url') || val('asin')), focus: '#amazon-url', level: 3 });
       list.push({ id: 'official', sec: 'sec-card', t: '公式ページ URL', ok: !!val('official-url'), focus: '#official-url', level: 3 });
+      // 発送方法 = 出品カードの楽天の配送方法に使う (届いてサイズを見てから商品の画面で入れてもよい)
+      list.push({ id: 'shipping_code', sec: 'sec-ship', t: '発送方法 (届いてからでも可)', ok: !!val('shipping'), focus: '#shipping', level: 3 });
       if (!isSet) list.push({ id: 'set_plan', sec: 'sec-card', t: 'セット商品を作るか', ok: !!segVal('set-plan'), focus: '#set-plan button', level: 3 });
     }
     return list;

@@ -91,7 +91,7 @@ try {
   const [dbA, dbB, dbP, dbO2] = [A, B, P, O2].map(pgAdapter);
   const dbGate = { render: pgAdapter(GR), minipc: pgAdapter(GM) };
   const reg = (db, code, { requestId = crypto.randomUUID(), beforeCommit, card = {} } = {}) => R.registerNewSku(db, {
-    actor: 'naka@test', requestId, kind: 'single', code, values: { name: `新商品 ${code}`, standard_price: '1000', shipping_code: 'S01', tax_rate: '10' }, card,
+    actor: 'naka@test', requestId, kind: 'single', code, values: { name: `新商品 ${code}`, standard_price: '1000', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001' }, card,
   }, { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES, beforeCommit });
   const r0 = await runInitialLoad(dbM, planOf(), { log: () => {}, runId: 'load_pg_1', now: new Date('2030-01-05T03:00:00Z') });
   assert.equal(r0.ok, true, r0.error);
@@ -283,9 +283,11 @@ try {
     assert.equal(await codeOf(A, `insert into ops.product_hub_outbox (company_id, sku_id, kind, schema_version, payload, payload_hash, request_id, created_by)
       values (1, $1, 'card_create', 'ph-card-v1', '{}'::jsonb, $2, $3::uuid, 'naka@test')`, [p1, 'e'.repeat(64), crypto.randomUUID()]), '42501');
     assert.equal(await codeOf(A, 'select ops.create_sku_registration($1, $2)', [p1, 'naka@test']), '42501');
+    // 単品は代表の仕入先が要る (0060・2026-10-08 中原さん)
+    const sup1 = (await q(`select supplier_id::text as id from core.suppliers where code = '0001'`))[0].id;
     const entry = (code, over = {}) => ({ kind: 'single', code, started_at: null, product: { name: code, sales_class: 3, expiry_managed: false, inbound_date_managed: null },
       sku: { name: code, tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', standard_price_jpy: 1000, shipping_code: 'S01', shipping_method: 'ゆうパケット', shipping_cost_jpy: 210,
-        reorder_months: null, set_sales_class_override: null, handling_own: null }, supplier_id: null, cost: null, component_request: null, card: null, ...over });
+        reorder_months: null, set_sales_class_override: null, handling_own: null }, supplier_id: sup1, cost: null, component_request: null, card: null, ...over });
     const call = (rid, e) => A.query('select ops.register_new_sku($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r', [rid, 'naka@test', '本物のログインの試験', JSON.stringify(ALL_COMPANY), 'e'.repeat(64), JSON.stringify(e)]);
     // 関数の中の書き込みも 0051 の guard が見る (取引停止の仕入先を代表にする = 業務の約束で断る)
     await M.query(`insert into core.suppliers (company_id, code, name, active) values (1, '0099', '止めた仕入先', false) on conflict do nothing`);
@@ -297,7 +299,7 @@ try {
     const today = (await q("select (now() at time zone 'Asia/Tokyo')::date::text as d"))[0].d;
     const p1n = Number(p1);
     const sku = entry('x').sku;
-    const setE = (code, skuOver = {}, rows = [{ sku_id: p1n, code: 'p001', qty: 1, sort: 1 }]) => entry(code, { kind: 'set', product: null,
+    const setE = (code, skuOver = {}, rows = [{ sku_id: p1n, code: 'p001', qty: 1, sort: 1 }]) => entry(code, { kind: 'set', product: null, supplier_id: null,
       sku: { ...sku, name: code, handling_own: 'active', ...skuOver }, component_request: { rows, rows_hash: 'f'.repeat(64), reason: 'x' },
       cost: { jpy: 1, source: 'manual', status: 'OVERRIDDEN', valid_from: today, reason: '例外' } });
     const card = (code, price) => O.cardEventOf(O.buildCardPayload({ code, kind: 'single', name: code, price, shipping: { code: 'S01', method: 'ゆうパケット', cost_jpy: 210 }, card: {}, components: [], actor: 'naka@test' }));
@@ -312,11 +314,22 @@ try {
       ['カードの売価が違う', entry('g8-f8', { card: card('g8-f8', 5) }), /invalid_value: カードの知らせ/],
       ['呼び手の結果 (ok:false)', entry('g8-f9', { result: { ok: false, code: 'other' } }), /invalid_input: 登録の結果/],
       ['カードの知らない欄', entry('g8-f10', { card: O.cardEventOf({ ...card('g8-f10', 1000).payload, '\uE000': 1 }) }), /invalid_value: カードの知らせ/],
+      ['単品に代表の仕入先が無い (0060)', entry('g8-f11', { supplier_id: null }), /invalid_value: 単品は代表の仕入先が要る/],
+      ['送料コードが無いのに送料 (0060)', entry('g8-f12', { sku: { ...sku, name: 'g8-f12', shipping_code: null, shipping_method: null } }), /invalid_value: 送料コードが無いのに送料/],
     ]) {
       await A.query('begin');
       await assert.rejects(() => call(crypto.randomUUID(), e), (er) => re.test(er.message), label);
       await A.query('rollback');
     }
+    // 🆕 0060: 発送方法なし (3 つとも null) は本物のログインでも通る = 送料の列は空・気をつけることに 1 行・代表の仕入先は入る
+    const ridN = crypto.randomUUID();
+    await A.query('begin');
+    const rN = (await call(ridN, entry('g8-n1', { sku: { ...sku, name: 'g8-n1', shipping_code: null, shipping_method: null, shipping_cost_jpy: null } }))).rows[0].r;
+    await A.query('commit');
+    assert.deepEqual(rN.shipping, { code: null, method: null, cost_jpy: null });
+    assert.ok(rN.warnings.some((w) => /^発送方法 \(送料コード\) はまだです/.test(w)), JSON.stringify(rN.warnings));
+    assert.deepEqual((await q("select shipping_code, shipping_method, shipping_cost_jpy from core.skus where code = 'g8-n1'"))[0], { shipping_code: null, shipping_method: null, shipping_cost_jpy: null });
+    assert.deepEqual((await q('select supplier_id::text as id from core.supplier_skus where sku_id = $1 and is_primary', [rN.sku_id])).map((x) => x.id), [sup1]);
     // 偽の hash を渡しても、DB が作った hash を書く (取り込みの確かめと同じ形)
     const ridH = crypto.randomUUID();
     await A.query('begin');

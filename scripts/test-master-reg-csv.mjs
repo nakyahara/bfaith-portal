@@ -242,7 +242,7 @@ const obsSingle = (code, over = {}) => ({ code_norm: code, present: true, truste
 // ── 新商品 (下書き) ──
 await reg('single', 'new-a', single());
 await save('new-a', { jan: J1 });   // 新商品の JAN = 登録の後に商品の画面で (JAN の約束)
-await reg('single', 'new-b', single({ name: '新しい単品 B' }));
+await reg('single', 'new-b', single({ name: '新しい単品 B', shipping_code: undefined }));   // 発送方法なし (2026-10-08 中原さん: 必須でない) = [C3] で CSV にする
 await reg('single', 'new-nocost', single({ cost: undefined }));
 await reg('set', 'new-set', { name: '新しいセット', standard_price: '2500', shipping_code: 'S02', components: [{ code: 's001', qty: 1 }, { code: 's002', qty: 2 }] });
 
@@ -280,6 +280,32 @@ await ta('[C2] 止まる理由: 原価が無い・構成品が NE 確認済み�
   assert.ok(s.candidates.find((c) => c.code === 'new-a').blockers.length === 0, JSON.stringify(s.candidates));
 });
 
+await ta('[C2b] 2026-10-08: 発送方法なしの単品は止まる理由に出ない・代表の仕入先が空の前からの下書き (0060 の前に登録) は「代表の仕入先が決まっていない」で止まる (画面・候補は壊れない)・商品の画面で入れれば消える', async () => {
+  let s = await G.regSummary(db, { nowMs: NOW_MS });
+  assert.deepEqual(s.candidates.find((c) => c.code === 'new-b').blockers, [], JSON.stringify(s.candidates));
+  // 0060 の前の下書き = 代表の仕入先の行が無い単品 (今の登録の関数では作れない = 作ってから行を外す。持ち主の取引だけ trigger を止める)
+  await reg('single', 'new-nosup', single({ name: '仕入先なしの前からの下書き' }));
+  const id = await skuId('new-nosup');
+  await pg.query('begin');
+  try {
+    await pg.query('reset role');
+    await pg.query('set local session_replication_role = replica');
+    await pg.query('delete from core.supplier_skus where sku_id = $1', [id]);
+    await pg.query('commit');
+  } catch (err) { await pg.query('rollback'); throw err; } finally { await pg.query('set role deploy'); }
+  assert.equal((await one('select count(*)::int as n from core.supplier_skus where sku_id = $1', [id])).n, 0);
+  s = await G.regSummary(db, { nowMs: NOW_MS });
+  const c = s.candidates.find((x) => x.code === 'new-nosup');
+  assert.deepEqual([c.state, c.blockers], ['draft', ['代表の仕入先が決まっていない (NE の「設定なし」は 9999)']]);
+  const e = await rejectsWith(build('products', ['new-nosup']), 409, 'not_ready');
+  assert.match(JSON.stringify(e.extra.items), /代表の仕入先が決まっていない/);
+  assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, 0);
+  // 商品の画面で代表の仕入先を入れる (今の保存の道) = 止まる理由が消える
+  await save('new-nosup', { primary_supplier: '0001' });
+  s = await G.regSummary(db, { nowMs: NOW_MS });
+  assert.deepEqual(s.candidates.find((x) => x.code === 'new-nosup').blockers, []);
+});
+
 let EXA = null;
 await ta('[C3] 単品のファイル: 見出し・行 (空欄なし: JAN / 代表)・UTF-8・BOM なし・CRLF・sha256・形の版・payload hash・印・試し用・同じ番号 = 同じファイル', async () => {
   const rid = uuid();
@@ -293,6 +319,9 @@ await ta('[C3] 単品のファイル: 見出し・行 (空欄なし: JAN / 代�
   assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'), e.sha256);
   assert.notEqual(bytes[0], 0xef, 'BOM が無い');
   assert.equal(bytes.toString('utf8'), `${e.header}\r\nnew-a,新しい単品,0001,300,1500,10,0,empty,${J1}\r\nnew-b,新しい単品 B,0001,300,1500,10,0,empty,empty\r\n`);
+  // new-b は発送方法なし (送料の 3 つが空) = 単品の CSV に発送方法の列は無い = 行は発送方法のある new-a と同じ形 (2026-10-08 中原さん: 必須にしない)
+  assert.deepEqual(await one(`select shipping_code, shipping_method, shipping_cost_jpy from core.skus where code = 'new-b'`), { shipping_code: null, shipping_method: null, shipping_cost_jpy: null });
+  assert.ok(!/haiso|souryo|hasou|delivery/i.test(e.header), '単品の CSV に発送方法・送料の列は無い');
   assert.ok(!/zaiko_su|visible_flg/.test(bytes.toString('utf8')));
   assert.deepEqual((await itemsOf(EXA)).map((x) => [x.code, x.state]), [['new-a', 'built'], ['new-b', 'built']]);
   const it = await one("select expected, item_token, snapshot_hash from ops.ne_reg_export_items where export_id = $1 and code_norm = 'new-a'", [EXA]);

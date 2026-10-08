@@ -194,7 +194,8 @@ async function makeDraftSku(code) {
 const reg = (kind, code, values, card = {}, o = {}) => asEditor(() => R.registerNewSku(db, {
   actor: o.actor ?? 'Naka@Test', requestId: o.requestId ?? uuid(), kind, code, reason: o.reason ?? null, values, card,
 }, { ownership: o.ownership ?? ALL_COMPANY, open: o.open ?? true, now: NOW, shippingRates: o.shippingRates === undefined ? RATES : o.shippingRates, beforeCommit: o.beforeCommit }));
-const single = (over = {}) => ({ name: '新しい単品', standard_price: '1,980', shipping_code: 'S01', tax_rate: '10', ...over });
+// 単品は代表の仕入先が要る (2026-10-08 中原さん・NE で必須)。0001 = 取引中 (初めのロードの仕入先 = NE 登録済み)
+const single = (over = {}) => ({ name: '新しい単品', standard_price: '1,980', shipping_code: 'S01', tax_rate: '10', primary_supplier: '1', ...over });
 
 console.log('登録の状態 (0052)');
 
@@ -447,14 +448,18 @@ await ta('[R1] 段階 new_open でも、持ち主が load (今の本番の持ち
   assert.equal(await skuId('new-a1'), undefined);
 });
 
-await ta('[R2] 形の誤り (400): コード (大文字・set-・空白)・名前・売価・発送方法・単品の税率・種類に無い項目・URL・ASIN・セットの判断・Yahoo! の配送方法 / カテゴリ・構成', async () => {
+await ta('[R2] 形の誤り (400): コード (大文字・set-・空白)・名前・売価・単品の代表の仕入先・単品の税率・種類に無い項目・URL・ASIN・セットの判断・Yahoo! の配送方法 / カテゴリ・構成', async () => {
   const b = async (kind, code, values, card, re) => { const e = await rejectsWith(reg(kind, code, values, card), 400); if (re) assert.match(e.message, re); return e; };
   await b('single', 'New-A1', single(), {}, /大文字/);
   await b('single', 'set-abc', single(), {}, /set-/);
   await b('single', ' abc', single(), {}, /空白/);
   await b('single', 'abc', single({ name: '' }), {}, /名前/);
   await b('single', 'abc', single({ standard_price: '' }), {}, /売価/);
-  await b('single', 'abc', single({ shipping_code: '' }), {}, /発送方法/);
+  // 2026-10-08 中原さん: 単品の代表の仕入先は必須 (NE で必須)。空・欄なしの両方を断る (DB の手前 = 何も書かない)。発送方法は必須でない = [R2b]
+  assert.equal((await b('single', 'abc', single({ primary_supplier: '' }), {}, /^代表の仕入先を選んでください/)).extra.field, 'primary_supplier');
+  assert.equal((await b('single', 'abc', (({ primary_supplier, ...x }) => x)(single()), {}, /^代表の仕入先を選んでください/)).extra.field, 'primary_supplier');
+  assert.throws(() => R.parseRegisterRequest({ actor: 'naka@test', requestId: uuid(), kind: 'single', code: 'abc', values: single({ primary_supplier: '  ' }) }), /代表の仕入先を選んでください/);
+  assert.equal(R.parseRegisterRequest({ actor: 'naka@test', requestId: uuid(), kind: 'single', code: 'abc', values: single({ shipping_code: '' }) }).values.shipping_code, null);
   await b('single', 'abc', single({ tax_rate: '' }), {}, /税率/);
   await b('single', 'abc', { ...single(), components: [{ code: 's001', qty: 1 }] }, {}, /単品の登録では/);
   await b('set', 'abc', { name: 'x', standard_price: '1', shipping_code: 'S01', tax_rate: '10', components: [{ code: 's001', qty: 1 }] }, {}, /セットの登録では/);
@@ -477,6 +482,29 @@ await ta('[R2] 形の誤り (400): コード (大文字・set-・空白)・名�
   await b('set', 'abc', { name: 'x', standard_price: '1', shipping_code: 'S01', components: [{ code: 'tx-2', qty: 1 }] }, {}, /入れ子|やめた/);
   await rejectsWith(reg('single', 'abc', single(), {}, { shippingRates: null }), 503, 'shipping_rates_unavailable');
   assert.equal(await skuId('abc'), undefined);
+});
+
+await ta('[R2b] 発送方法なし (2026-10-08 中原さん): 単品もセットも下書きにできる (送料の 3 つは空・送料の表が読めなくてもよい)・気をつけることに 1 行・選べば今までどおり', async () => {
+  const r = await reg('single', 'noship-1', single({ shipping_code: '' }), { create: false }, { shippingRates: null });
+  assert.equal(r.state, 'draft');
+  assert.deepEqual(r.shipping, { code: null, method: null, cost_jpy: null });
+  assert.ok(r.warnings.some((w) => /^発送方法 \(送料コード\) はまだです/.test(w)), JSON.stringify(r.warnings));
+  assert.deepEqual(await one(`select shipping_code, shipping_method, shipping_cost_jpy from core.skus where code = 'noship-1'`), { shipping_code: null, shipping_method: null, shipping_cost_jpy: null });
+  assert.deepEqual(await q(`select p.code from core.supplier_skus x join core.suppliers p on p.supplier_id = x.supplier_id where x.sku_id = $1 and x.is_primary`, [r.sku_id]), [{ code: '0001' }]);
+  assert.deepEqual(await regOf('noship-1'), { state: 'draft', origin: 'new_entry', gen: null });
+  // 欄が無い (画面が送らない) も同じ
+  const r1 = await reg('single', 'noship-2', (({ shipping_code, ...x }) => x)(single()), { create: false });
+  assert.deepEqual(r1.shipping, { code: null, method: null, cost_jpy: null });
+  // セットも (代表の仕入先は付けない)
+  const st = await reg('set', 'noship-set-1', { name: '発送方法なしのセット', standard_price: '3000', components: [{ code: 's002', qty: 1 }] }, { create: false });
+  assert.deepEqual([st.kind, st.state, st.shipping], ['set', 'draft', { code: null, method: null, cost_jpy: null }]);
+  assert.equal((await one('select count(*)::int as n from core.supplier_skus where sku_id = $1', [st.sku_id])).n, 0);
+  // 選べば今までどおり (送料の表で確かめる・気をつけることは出ない・表が読めなければ 503)
+  const r2 = await reg('single', 'ship-1', single({ shipping_code: 'S02' }), { create: false });
+  assert.deepEqual(r2.shipping, { code: 'S02', method: '宅急便', cost_jpy: 520 });
+  assert.ok(!r2.warnings.some((w) => /発送方法/.test(w)), JSON.stringify(r2.warnings));
+  await rejectsWith(reg('single', 'ship-2', single(), { create: false }, { shippingRates: null }), 503, 'shipping_rates_unavailable');
+  assert.equal(await skuId('ship-2'), undefined);
 });
 
 await ta('[R3] コードの検査 (409): Company DB にある・代表の名札・NE の元のコード (0041)・前に使って消したコード', async () => {
@@ -642,15 +670,16 @@ await ta('[G1] DB の守りが見る列の持ち主のキー (ops.master_edit_ow
   }
 });
 
-/** 登録の関数を直接呼ぶ (画面を通らない = 画面のロールが関数だけで何ができるか)。entry は関数の形 (0052 の 8d) */
+/** 登録の関数を直接呼ぶ (画面を通らない = 画面のロールが関数だけで何ができるか)。entry は関数の形 (0052 の 8d)。単品は代表の仕入先が要る (0060) */
+const SUP1 = (await one(`select supplier_id::text as id from core.suppliers where code = '0001'`)).id;
 const regEntry = (code, over = {}) => ({
   kind: 'single', code, started_at: null,
   product: { name: '直接の単品', sales_class: 3, expiry_managed: false, inbound_date_managed: null },
   sku: { name: '直接の単品', tax_rate: 0.1, tax_class: 'STANDARD_10', handling: 'active', standard_price_jpy: 1000, shipping_code: 'S01', shipping_method: 'ゆうパケット',
     shipping_cost_jpy: 210, reorder_months: null, set_sales_class_override: null, handling_own: null },
-  supplier_id: null, cost: null, component_request: null, card: null, ...over,
+  supplier_id: SUP1, cost: null, component_request: null, card: null, ...over,
 });
-const setEntry = (code, rows) => regEntry(code, { kind: 'set', product: null, sku: { ...regEntry(code).sku, name: '直接のセット', handling_own: 'active' },
+const setEntry = (code, rows) => regEntry(code, { kind: 'set', product: null, supplier_id: null, sku: { ...regEntry(code).sku, name: '直接のセット', handling_own: 'active' },
   component_request: { rows, rows_hash: 'f'.repeat(64), reason: '直接の試験' } });
 const callReg = (rid, entry, { actor = 'naka@test', ownership = ALL_COMPANY } = {}) =>
   pg.query('select ops.register_new_sku($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r', [rid, actor, '直接の試験', JSON.stringify(ownership), 'e'.repeat(64), JSON.stringify(entry)]);
@@ -753,7 +782,11 @@ await ta('[G4] 画面のロールが登録の関数を直接呼んで値を偽�
   const goodCost = { jpy: 200, source: 'set_calc', status: 'COMPLETE', valid_from: TODAY, reason: '構成品から計算' };
   const set1 = (code, over = {}, sku = {}) => { const e = setEntry(code, setRows); return { ...e, cost: goodCost, ...over, sku: { ...e.sku, ...sku } }; };
   // 正しい形は通る (取引は巻き戻す)
-  for (const e of [one1('g4-a', { card: cardOf('g4-a', 'single', '直接の単品', 1000) }), set1('g4-b', { card: cardOf('g4-b', 'set', '直接のセット', 1000, [{ code: 's001', qty: 2 }]) })]) {
+  // 🆕 0060: 発送方法なし (3 つとも null) も通る (カードの写しの送料も 3 つとも null)
+  const noShip = { shipping_code: null, shipping_method: null, shipping_cost_jpy: null };
+  const cardNoShip = O.cardEventOf(O.buildCardPayload({ code: 'g4-c', kind: 'single', name: '直接の単品', price: 1000, shipping: { code: null, method: null, cost_jpy: null }, card: {}, components: [], actor: 'naka@test' }));
+  for (const e of [one1('g4-a', { card: cardOf('g4-a', 'single', '直接の単品', 1000) }), set1('g4-b', { card: cardOf('g4-b', 'set', '直接のセット', 1000, [{ code: 's001', qty: 2 }]) }),
+    one1('g4-c', { card: cardNoShip }, noShip), set1('g4-d', {}, noShip)]) {
     const r = await editorTx(async () => (await callReg(uuid(), e)).rows[0].r);
     assert.ok(!(r instanceof Error), `${e.code}: ${r && r.message}`);
   }
@@ -765,6 +798,11 @@ await ta('[G4] 画面のロールが登録の関数を直接呼んで値を偽�
     ['商品と SKU の名前が違う', one1('g4-3b', { product: { ...regEntry('g4-3b').product, name: '別の名前' } }), /^invalid_value: 商品の名前/],
     ['売価 0', one1('g4-4', {}, { standard_price_jpy: 0 }), /^invalid_value: 売価/],
     ['発送方法が無い', one1('g4-5', {}, { shipping_method: null }), /^invalid_value: 送料コードと発送方法/],
+    ['送料コードだけ無い', one1('g4-5b', {}, { shipping_code: null }), /^invalid_value: 送料コードと発送方法/],
+    ['送料コードが無いのに送料', one1('g4-5c', {}, { ...noShip, shipping_cost_jpy: 210 }), /^invalid_value: 送料コードが無いのに送料/],
+    ['送料コードが空の文字', one1('g4-5d', {}, { shipping_code: '', shipping_method: '' }), /^invalid_value: 送料コードと発送方法/],
+    ['単品に代表の仕入先が無い (0060)', one1('g4-5e', { supplier_id: null }), /^invalid_value: 単品は代表の仕入先が要る/],
+    ['カードの送料が SKU と違う (発送方法なし)', one1('g4-5f', { card: cardOf('g4-5f', 'single', '直接の単品', 1000) }, noShip), /^invalid_value: カードの知らせ/],
     ['単品の原価が set_calc', one1('g4-6', { cost: manual('COMPLETE', TODAY, 'set_calc') }), /^invalid_value: 単品の原価/],
     ['単品の原価が MISSING', one1('g4-7', { cost: manual('MISSING') }), /^invalid_value: 単品の原価/],
     ['原価の始まりが先の日', one1('g4-8', { cost: manual('COMPLETE', '2099-01-01') }), /^invalid_value: 原価は/],
@@ -802,6 +840,37 @@ await ta('[G4] 画面のロールが登録の関数を直接呼んで値を偽�
   assert.equal(done.result.request_payload_hash, 'e'.repeat(64));
   assert.deepEqual(await one('select tax_rate::float8 as t, tax_class, handling from core.skus where sku_id = $1', [r.sku_id]), { t: 0.1, tax_class: 'STANDARD_10', handling: 'active' });
   assert.deepEqual(await one('select cost_jpy::int as j, cost_source as s, valid_from::text as f from core.sku_costs where sku_id = $1', [r.sku_id]), { j: 200, s: 'set_calc', f: TODAY });
+});
+
+await ta('[G-0060] 登録の関数の作り直し (0060): 0058 の本文との違いは「単品の代表の仕入先」「発送方法なし」「気をつけることの 1 行」の 3 か所だけ・権限はそのまま', async () => {
+  const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
+  const fnOf = (file) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf('create or replace function ops.register_new_sku('); assert.ok(i >= 0, file); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
+  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0058' && x.slice(0, 4) !== '0060');
+  for (const file of later) assert.ok(!/function\s+ops\.register_new_sku\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), file + ' も登録の関数を作り直している = 0060 の元にする定義を見直す');
+  const a = fnOf('0058_master_widen.sql').split('\n'); const b = fnOf('0060_master_register_required_fields.sql').split('\n');
+  // 差 = 0060 で足した行だけ (0058 の行は全部同じ順で残る。変えたのは送料の確かめの if → elsif の 1 行)
+  const added = []; let i = 0;
+  for (const line of b) {
+    if (i < a.length && line === a[i]) i++;
+    else if (i < a.length && line === a[i].replace("  if jsonb_typeof(v_s -> 'shipping_code')", "  elsif jsonb_typeof(v_s -> 'shipping_code')")) { added.push(line); i++; }
+    else added.push(line);
+  }
+  assert.equal(i, a.length, '0058 の行が 0060 に全部同じ順で残っていない');
+  assert.deepEqual(added.map((l) => l.trim().slice(0, 30)), [
+    '-- 🆕 0060 (中原さん 2026-10-08): 単品は代表の仕入先が要る',
+    "if v_kind = 'single' and v_supplier is null then raise exception",
+    '-- 🆕 0060 (中原さん 2026-10-08): 発送方法は無くてよい',
+    '--   ある = 今までどおり送料コードと発送方法 (名前) の両方が要る',
+    "if coalesce(jsonb_typeof(v_s -> 'shipping_code'), 'null')",
+    "if coalesce(jsonb_typeof(v_s -> 'shipping_cost_jpy'), 'null')",
+    "raise exception 'invalid_value: 送料コードが無いのに送料がある'",
+    'end if;',
+    "elsif jsonb_typeof(v_s -> 'shipping_code') is distinct from",
+    "case when v_ship_c is null then '発送方法 (送料コード) はまだです",
+  ].map((x) => x.slice(0, 30)));
+  // 権限 (create or replace = 0052 の revoke・master_edit の grant がそのまま)
+  assert.deepEqual(await one(`select has_function_privilege('public', oid, 'execute') as pub, has_function_privilege('master_edit', oid, 'execute') as me, prosecdef as d
+     from pg_proc where oid = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)'::regprocedure`), { pub: false, me: true, d: true });
 });
 
 await ta('[G5] 保存の記録の結果は DB の値だけで作る (呼び手の result は断る・Codex R4 Medium)・カードの知らせの欄の名前は決まった ASCII だけ (Codex R4 Low)', async () => {
@@ -1208,6 +1277,11 @@ await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・
   }
   assert.match(r.text, /data-can-save="1"/); assert.ok(!/切替前です/.test(r.text));
   assert.match(r.text, /S03 謎の便 \/ 300 円/);
+  // 2026-10-08 中原さん: 代表の仕入先 = 必須・発送方法 = あとでも可 (画面の JS の ① / ③ も同じ)
+  assert.match(r.text, /for="f-primary_supplier">代表の仕入先<span class="req">必須<\/span>/);
+  assert.match(r.text, /for="shipping">発送方法<span class="opt">あとでも可<\/span>/);
+  assert.match(newJs, /id: 'primary_supplier', sec: 'sec-tax', t: '代表の仕入先', ok: [^}]*level: 1 \}/);
+  assert.match(newJs, /id: 'shipping_code', sec: 'sec-ship', [^}]*level: 3 \}/);
   r = await call('GET', '/apps/master-edit/new?kind=set');
   await checkScripts(r.text, 0);
   assert.match(r.text, /id="comp-rows"/); assert.ok(!r.text.includes('セット商品を作るか'), 'セットに「セット商品を作るか」を出さない');
@@ -1228,11 +1302,15 @@ await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・
 });
 
 await ta('[H2] 登録の API: 名簿・Origin・形の誤り 400・成功で product-hub のカードを同じ要求の中で作る・押し直しは前の結果', async () => {
-  const body = { request_id: uuid(), kind: 'single', code: 'web-1', reason: '画面から', values: { name: '画面の単品', standard_price: '1500', shipping_code: 'S02', tax_rate: '0.08', expiry_managed: '0', inbound_date_managed: '1' },
+  const body = { request_id: uuid(), kind: 'single', code: 'web-1', reason: '画面から', values: { name: '画面の単品', standard_price: '1500', shipping_code: 'S02', tax_rate: '0.08', primary_supplier: '0001', expiry_managed: '0', inbound_date_managed: '1' },
     card: { create: true, official_url: 'https://maker.example/web1', reference_urls: ['https://ref.example/w'], set_decision: { decision: 'create', reason_text: '2 個セット' }, yahoo: { price: '', delivery_label: '' } } };
   assert.equal((await call('POST', '/apps/master-edit/api/new', { body, session: 'viewer' })).status, 403);
   assert.equal((await call('POST', '/apps/master-edit/api/new', { body, origin: false })).j.error, 'origin_mismatch');
   assert.equal((await call('POST', '/apps/master-edit/api/new', { body: { ...body, request_id: uuid(), code: 'Web-1' } })).status, 400);
+  // 代表の仕入先が無い = 400 (画面と同じ文・その欄)・何も書かない
+  const noSup = await call('POST', '/apps/master-edit/api/new', { body: { ...body, request_id: uuid(), values: (({ primary_supplier, ...x }) => x)(body.values) } });
+  assert.equal(noSup.status, 400, noSup.text); assert.match(noSup.text, /代表の仕入先を選んでください/);
+  assert.equal(await skuId('web-1'), undefined);
   const ok = await call('POST', '/apps/master-edit/api/new', { body });
   assert.equal(ok.status, 200, ok.text);
   assert.deepEqual([ok.j.state, ok.j.card.status, ok.j.card_label], ['draft', 'done', 'カード作成済み']);
@@ -1248,7 +1326,7 @@ await ta('[H2] 登録の API: 名簿・Origin・形の誤り 400・成功で pro
 
 await ta('[H3] カードが作れなかった登録: 登録は成功・「カード作成待ち」・商品の画面の箱ともう一度 (名簿の人だけ)・コードの確かめ', async () => {
   applierMode = 'boom';
-  const body = { request_id: uuid(), kind: 'single', code: 'web-2', values: { name: '画面の単品 2', standard_price: '1500', shipping_code: 'S01', tax_rate: '10' }, card: {} };
+  const body = { request_id: uuid(), kind: 'single', code: 'web-2', values: { name: '画面の単品 2', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001' }, card: {} };
   const r = await call('POST', '/apps/master-edit/api/new', { body });
   assert.equal(r.status, 200, r.text);
   assert.deepEqual([r.j.card.status, r.j.card_label, r.j.card.error], ['failed', 'カード作成待ち (失敗)', 'SQLite に書けない']);
@@ -1285,13 +1363,13 @@ await ta('[H4] 一覧: 登録の列・絞り込み (下書き・要確認・状�
   assert.equal(r.status, 200);
   assert.ok(r.text.includes('sku/s002"') && !r.text.includes('sku/web-2"'), '利用可 × カード作成待ち');
   const m = await call('GET', '/apps/master-edit/manual');
-  for (const word of ['新商品を登録する', '大文字は使えません', '発送方法 要確認', 'カード作成待ち', '下書き']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
+  for (const word of ['新商品を登録する', '大文字は使えません', '発送方法 要確認', 'カード作成待ち', '下書き', '単品の税率と<b>代表の仕入先</b>', '<b>発送方法は必須ではありません</b>']) assert.ok(m.text.includes(word), `つかいかたに「${word}」が無い`);
 });
 
 await ta('[H5] 衝突の画面: 「既存のカードをこの商品に結ぶ」が出る・名簿の人だけ・押すと done・もう一度押しても同じ', async () => {
   ph.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('web-9', '前からのカード', 'someone')`).run();
   const old = draftOf('web-9');
-  const body = { request_id: uuid(), kind: 'single', code: 'web-9', values: { name: '衝突する単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10' }, card: {} };
+  const body = { request_id: uuid(), kind: 'single', code: 'web-9', values: { name: '衝突する単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001' }, card: {} };
   const r = await call('POST', '/apps/master-edit/api/new', { body });
   assert.deepEqual([r.status, r.j.card.status], [200, 'conflict']);
   let page = await call('GET', '/apps/master-edit/sku/web-9');

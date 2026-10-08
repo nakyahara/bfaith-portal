@@ -964,7 +964,11 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   await p.fill('#f-standard_price', '1280');
   assert.match(await p.textContent('#save'), /あと 2 つ: 税率/);
   await p.click('#f-tax_rate button[data-v="0.08"]');
+  // 2026-10-08 中原さん: 代表の仕入先は ① (必須)・発送方法は ③ (あとでも可) = 発送方法を選んでも保存できない
   await p.selectOption('#shipping', 'S02');
+  assert.match(await p.textContent('#save'), /あと 1 つ: 代表の仕入先/);
+  assert.equal(await p.isDisabled('#save'), true, '代表の仕入先が無い = 押せない');
+  await p.selectOption('#f-primary_supplier', '0001');
   assert.match(await p.textContent('#remain'), /下書きを保存できます/);
   assert.equal(await p.isDisabled('#save'), false);
   assert.equal(await p.locator('#jump a.todo').count(), 0, '飛び先の帯に黄色が残らない');
@@ -974,7 +978,6 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   assert.match(await p.textContent('#checklist'), /カードを作らない/);
   // ② (NE 登録の CSV まで) も入れる
   await p.fill('#cost-jpy', '500');
-  await p.selectOption('#f-primary_supplier', '0001');
   assert.ok(await dirty(p) >= 6, String(await dirty(p)));
   // 離れるときの確認 (左の列・種類の札)
   await p.click('.rail a[aria-label="つかいかた"]');
@@ -996,10 +999,28 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   assert.match(p.url(), /master-edit\/$/, '戻る 1 回で一覧 (入力の途中の画面へは戻らない)');
 });
 
+await ta('[35b] 新商品の登録 (2026-10-08 中原さん): 発送方法を選ばなくても下書きにできる (③ に「あとでも可」)・代表の仕入先が無いと押せない', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await p.fill('#code', 'ui-noship-1');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', '発送方法なしの単品');
+  await p.fill('#f-standard_price', '990');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  assert.match(await p.textContent('#save'), /あと 1 つ: 代表の仕入先/);
+  assert.equal(await p.isDisabled('#save'), true);
+  await p.selectOption('#f-primary_supplier', '0001');
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  assert.match(await p.textContent('#checklist'), /発送方法 \(届いてからでも可\)/);
+  assert.equal(await p.locator('#checklist li.need').count(), 0, '発送方法は ① に無い');
+  await Promise.all([p.waitForURL(/\/sku\/ui-noship-1$/), p.click('#save')]);
+  assert.deepEqual(await skuRow('ui-noship-1'), { name: '発送方法なしの単品', price: 990, tax: 0.1, shipping_code: null });
+  assert.equal((await pg.query("select count(*)::int as n from core.supplier_skus x join core.skus s on s.sku_id = x.sku_id where s.code = 'ui-noship-1' and x.is_primary")).rows[0].n, 1);
+});
+
 await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない・構成品のコードで名前と計算の見込み (8% と 10% = 8%・分類は小さい番号・原価の合計)・並べ替えで読み上げの名前・あと N つ', async (p) => {
   await p.goto(B + '/new?kind=set');
   assert.equal(await dirty(p), 0, '空の 2 行は数えない');
-  assert.match(await p.textContent('#remain'), /あと\s*5\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*4\s*つ/);
   const rows = p.locator('#comp-rows tr.comp-row');
   await rows.nth(0).locator('.c-code').fill('s001');
   await rows.nth(0).locator('.c-code').press('Enter');
@@ -1013,7 +1034,7 @@ await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない�
   assert.equal(await dirty(p), 1, '構成は 1 件 (中身どうし)');
   await rows.nth(1).locator('button[data-act="up"]').click();
   assert.equal(await rows.nth(0).locator('.c-qty').getAttribute('aria-label'), '1 行目 (s003) の数');
-  assert.match(await p.textContent('#remain'), /あと\s*4\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*3\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
   // 売上分類の上書き (#1628 Codex R1 M2): 構成品から導ける (3 と 1 = 1) 間は押せない
   const ovr = p.locator('#f-set_sales_class_override');
@@ -1076,6 +1097,7 @@ await ta('[40] 新商品の登録 (#1628 Codex R2 M2): カードを作らない�
   await p.fill('#f-standard_price', '900');
   await p.click('#f-tax_rate button[data-v="0.1"]');
   await p.selectOption('#shipping', 'S01');
+  await p.selectOption('#f-primary_supplier', '0001');
   await p.click('#save');
   await p.waitForSelector('.result.err');
   assert.match(await p.textContent('.result.err'), /URL/);
@@ -1125,6 +1147,7 @@ await ta('[42] 新商品 (#1628 Codex R3 M2): 「作らない」の理由の欄�
   await p.fill('#f-standard_price', '700');
   await p.click('#f-tax_rate button[data-v="0.1"]');
   await p.selectOption('#shipping', 'S01');
+  await p.selectOption('#f-primary_supplier', '0001');
   await p.click('#save');
   await p.waitForSelector('.result.err');
   assert.match(await p.textContent('.result.err'), /作らない理由を選んでください/);
@@ -1192,6 +1215,7 @@ await ta('[44] 新商品 (#1628 Codex R4 M2): カードを作らない + Yahoo! 
   await p.fill('#f-standard_price', '800');
   await p.click('#f-tax_rate button[data-v="0.1"]');
   await p.selectOption('#shipping', 'S01');
+  await p.selectOption('#f-primary_supplier', '0001');
   await p.click('#save');
   assert.match(await p.textContent('#msg'), /Yahoo!売価は 1 円以上/);
   assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), true, 'Yahoo! の欄を開く');
@@ -1333,6 +1357,7 @@ await ta('[45] 新商品 (#1628 Codex R5 L1): Yahoo! の 1 行に 2 つある欄
   await p.fill('#f-standard_price', '800');
   await p.click('#f-tax_rate button[data-v="0.1"]');
   await p.selectOption('#shipping', 'S01');
+  await p.selectOption('#f-primary_supplier', '0001');
   for (const [id, val, re] of [['y-price-sagawa', 'abc', /Yahoo!売価 \(佐川\)/], ['y-path', 'a\tb', /Yahoo!path/]]) {
     await p.evaluate(() => { document.getElementById('sec-yahoo').open = true; });
     await p.fill('#' + id, val);
