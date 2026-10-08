@@ -2487,9 +2487,11 @@ export function migrateDetailTrackV2(db) {
     for (const [code, from, to] of [['img_production_top', 20, 51], ['img_register_top', 30, 52], ['img_approve_top', 40, 62]]) {
       db.prepare('UPDATE ph_steps SET sort = ? WHERE code = ? AND sort = ?').run(to, code, from);
     }
-    // 3. 旧 Notion 5 値 → 撮影・素材ステータス (空のときだけ。毎起動で冪等)
+    // 3. 旧 Notion 5 値 → 撮影・素材ステータス (空のときだけ。毎起動で冪等)。
+    //    撮影判定 (2026-10-08) がある商品は触らない — 社内撮影にして未設定へ戻した素材を、旧値の
+    //    「撮影依頼不要」で毎起動「撮影不要」に戻してしまう (Codex PR-A 名指し2 High)
     for (const [from, to] of Object.entries(SHIPPING_TO_MATERIAL)) {
-      db.prepare('UPDATE draft_image_production SET material_status = ? WHERE material_status IS NULL AND shipping_status = ?').run(to, from);
+      db.prepare('UPDATE draft_image_production SET material_status = ? WHERE material_status IS NULL AND shoot_mode IS NULL AND shipping_status = ?').run(to, from);
     }
     // v2 に切り替えた日時 (初回だけ記録。①の「商品情報必須」の境目に使う)
     db.prepare('INSERT OR IGNORE INTO ph_intake_state (key, value) VALUES (?, ?)').run(IMAGE_TRACK_V2_KEY, new Date().toISOString());
@@ -2622,12 +2624,24 @@ export function setImageWorkflowState(db, draftId, state, { note = null, actor =
 }
 
 /**
+ * 撮影判定に合う撮影・素材ステータス (setShootMode と同じ決まり。未判定なら今の値のまま)。
+ *   撮影不要 → 素材完了 以外は「撮影不要」 / 撮影が要る → 「撮影不要」なら未設定
+ */
+export function materialAlignedToShootMode(mode, material) {
+  const cur = material ?? null;
+  if (mode === 'none') return cur === 'ready' ? 'ready' : 'not_required';
+  if ((mode === 'inhouse' || mode === 'photographer') && cur === 'not_required') return null;
+  return cur;
+}
+
+/**
  * 撮影判定を変える (2026-10-08 画像制作の新フロー)。null = 未判定に戻す。
  * 撮影・素材ステータスもそろえる — ③素材待ち の完了条件とボードの「撮影指示書 対象外」はそちらを見ているため:
  *   撮影不要 にした → 素材ステータスが「素材完了」でなければ「撮影不要」にする
  *   撮影が要る にした → 素材ステータスが「撮影不要」なら未設定に戻す (撮影不要のまま ③ を通さない)
  *   撮影不要 から未判定に戻した → 同じく「撮影不要」なら未設定に戻す
- * 冪等: 同じ判定なら changed=false でイベントも残さない
+ * 冪等: 同じ判定で素材ステータスも合っていれば changed=false でイベントも残さない。
+ *   同じ判定でも素材ステータスが食い違っていれば (別の経路で入った値)、そろえ直して changed=true
  * @returns {{changed: boolean, material_status: string|null}}
  */
 export function setShootMode(db, draftId, mode, { actor = null } = {}) {
@@ -2637,21 +2651,27 @@ export function setShootMode(db, draftId, mode, { actor = null } = {}) {
   const run = db.transaction(() => {
     db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
     const cur = db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(id);
-    if ((cur.shoot_mode ?? null) === m) return { changed: false, material_status: cur.material_status ?? null };
-    let material = cur.material_status ?? null;
-    if (m === 'none' && material !== 'ready') material = 'not_required';
-    else if ((m === 'inhouse' || m === 'photographer') && material === 'not_required') material = null;
+    const before = cur.material_status ?? null;
+    let material = materialAlignedToShootMode(m, before);
     // 「撮影不要」から未判定に戻した = 撮影不要と決めたのを取り消した。そろえた素材ステータスも取り消す
     // (未判定なのに ③素材待ち を通れる状態を残さない — Codex PR-A R1 P2)
-    else if (m === null && cur.shoot_mode === 'none' && material === 'not_required') material = null;
+    if (m === null && cur.shoot_mode === 'none' && material === 'not_required') material = null;
+    if ((cur.shoot_mode ?? null) === m) {
+      // 同じ判定の送り直し。食い違いが残っていればここで直す (別の経路で入った値を押し直しで戻せるように — Codex PR-A 名指し2 High)
+      if (material === before) return { changed: false, material_status: before };
+      db.prepare(`UPDATE draft_image_production SET material_status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE draft_id = ?`).run(material, id);
+      logEvent(db, id, 'shoot_mode_changed',
+        `撮影判定「${m ? SHOOT_MODE_LABELS[m] : '未判定'}」に合わせて撮影・素材ステータスを直した (${MATERIAL_STATUS_LABELS[before] || '未設定'} → ${MATERIAL_STATUS_LABELS[material] || '未設定'})`, actor);
+      return { changed: true, material_status: material };
+    }
     db.prepare(`
       UPDATE draft_image_production
       SET shoot_mode = ?, shoot_mode_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), shoot_mode_by = ?,
           material_status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE draft_id = ?
     `).run(m, actor, material, id);
-    const materialNote = material !== (cur.material_status ?? null)
-      ? ` (撮影・素材ステータス: ${MATERIAL_STATUS_LABELS[cur.material_status] || '未設定'} → ${MATERIAL_STATUS_LABELS[material] || '未設定'})` : '';
+    const materialNote = material !== before
+      ? ` (撮影・素材ステータス: ${MATERIAL_STATUS_LABELS[before] || '未設定'} → ${MATERIAL_STATUS_LABELS[material] || '未設定'})` : '';
     logEvent(db, id, 'shoot_mode_changed', `撮影判定を「${m ? SHOOT_MODE_LABELS[m] : '未判定'}」に${materialNote}`, actor);
     return { changed: true, material_status: material };
   });

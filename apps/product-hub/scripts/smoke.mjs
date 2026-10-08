@@ -6281,6 +6281,48 @@ let wfSetParentId = null;
       await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'inhouse' });
       db.prepare(`UPDATE draft_image_production SET material_status = NULL WHERE draft_id = ?`).run(idSf);
 
+      // 🚨 ③素材待ち のゲート: 撮影が要ると判定した商品は仕入商品でも素材完了まで閉じない (Codex PR-A 名指し2 High)
+      {
+        const idGate = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('DRV-SHOOT-GATE', '仕入れゲート', 'smoke', 0)`).run().lastInsertRowid);
+        wfp.ensureProgress(db, idGate);
+        const matState = () => db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_material'`).get(idGate)?.state;
+        const tryDone = () => { try { wfp.setStepState(idGate, 'imgd_material', { state: 'done' }, 'smoke', { isAdmin: true }); return null; } catch (e) { return e; } };
+        dbmod.setShootMode(db, idGate, 'photographer', { actor: 'smoke' });
+        dbmod.upsertImageProduction(db, idGate, { material_status: 'shipped' });
+        const eShip = tryDone();
+        check('🚨 ③ゲート: 仕入商品でも「カメラマン撮影」なら、素材が揃うまで ③素材待ち を完了にできない',
+          eShip && /撮影判定が「カメラマン撮影」/.test(eShip.message) && matState() !== 'done', String(eShip?.message));
+        dbmod.upsertImageProduction(db, idGate, { material_status: 'ready' });
+        check('③ゲート: 素材完了にすれば完了にできる', tryDone() === null && matState() === 'done');
+        // 判定の無い仕入商品は今までどおり (素材ステータスなしでも工程だけ進む)
+        const idGate2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('DRV-SHOOT-GATE2', '仕入れゲート2', 'smoke', 0)`).run().lastInsertRowid);
+        wfp.ensureProgress(db, idGate2);
+        let eLegacy = null;
+        try { wfp.setStepState(idGate2, 'imgd_material', { state: 'done' }, 'smoke', { isAdmin: true }); } catch (e) { eLegacy = e; }
+        check('③ゲート: 撮影判定の無い仕入商品は今までどおり素材ステータスなしで完了にできる', eLegacy === null, String(eLegacy?.message));
+        db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idGate, idGate2);
+      }
+
+      // 🚨 毎起動の旧 Notion 値の埋め戻しが、撮影判定でそろえた素材ステータスを上書きしない (Codex PR-A 名指し2 High)
+      db.prepare(`UPDATE draft_image_production SET shipping_status = '撮影依頼不要', material_status = NULL WHERE draft_id = ?`).run(idSf);
+      const idLegacyShip = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SHOOT-LEGACY', '旧Notion', 'smoke')`).run().lastInsertRowid);
+      db.prepare(`INSERT INTO draft_image_production (draft_id, shipping_status) VALUES (?, '撮影依頼不要')`).run(idLegacyShip);
+      dbmod.migrateDetailTrackV2(db);
+      check('🚨 起動時の埋め戻し: 撮影判定が「社内撮影」の商品は、旧値「撮影依頼不要」で「撮影不要」に戻さない',
+        ipSf().shoot_mode === 'inhouse' && ipSf().material_status === null, JSON.stringify(ipSf()));
+      check('起動時の埋め戻し: 撮影判定の無い商品は今までどおり旧値から埋める',
+        db.prepare('SELECT material_status FROM draft_image_production WHERE draft_id = ?').get(idLegacyShip)?.material_status === 'not_required');
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idLegacyShip);
+      db.prepare(`UPDATE draft_image_production SET shipping_status = NULL WHERE draft_id = ?`).run(idSf);
+
+      // 同じ判定の送り直しで、別の経路で入った食い違いを直す (Codex PR-A 名指し2 High)
+      db.prepare(`UPDATE draft_image_production SET material_status = 'not_required' WHERE draft_id = ?`).run(idSf);
+      r = await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'inhouse' });
+      check('撮影判定: 同じ判定の送り直しでも、食い違った素材ステータス (社内撮影 + 撮影不要) は未設定に直す',
+        r.status === 200 && r.json?.changed === true && ipSf().material_status === null && evSf().at(-1).includes('合わせて'), JSON.stringify([r, ipSf(), evSf().at(-1)]));
+      r = await call('POST', `/api/drafts/${idSf}/shoot-mode`, { mode: 'inhouse' });
+      check('撮影判定: 合っていれば送り直しても changed=false', r.json?.changed === false);
+
       // 編集データリンク: 保存ボタン (image-production) で保存。http(s) だけ・送らなければ消えない
       r = await call('POST', `/api/drafts/${idSf}/image-production`, { edit_data_url: 'https://drive.google.com/file/d/psd-1/view' });
       check('編集データリンク: 保存できる', r.status === 200 && ipSf().edit_data_url === 'https://drive.google.com/file/d/psd-1/view', JSON.stringify([r, ipSf()]));
@@ -6346,7 +6388,7 @@ let wfSetParentId = null;
         const ls = {};
         const attrs = { ...(init.attrs || {}) };
         return {
-          value: init.value ?? '', textContent: '', dataset: { ...(init.dataset || {}) }, selected: 0,
+          value: init.value ?? '', defaultValue: init.value ?? '', textContent: '', dataset: { ...(init.dataset || {}) }, selected: 0,
           addEventListener: (t, fn) => { (ls[t] = ls[t] || []).push(fn); },
           fire: async (t) => { for (const fn of ls[t] || []) await fn(); },
           count: (t) => (ls[t] || []).length,
@@ -6367,11 +6409,13 @@ let wfSetParentId = null;
       const doc = { getElementById: (id) => els[id] || null, querySelectorAll: (q) => (q === '[data-shoot-mode]' ? modeBtns : []) };
       const posts = []; const reloads = []; const copied = [];
       let clipOk = true;
+      const asked = []; let confirmAnswer = false;
       flow.initImageFlow(doc, {
         base: '/apps/product-hub/api/drafts/7',
         post: async (url, body) => { posts.push([url, body]); return { ok: true }; },
         showAndReload: (json, m) => reloads.push([json, m]),
         clipboard: { writeText: (t) => { copied.push(t); return clipOk ? Promise.resolve() : Promise.reject(new Error('denied')); } },
+        confirm: (m) => { asked.push(m); return confirmAnswer; },
       });
       check('画面の JS: 読み込み直後に撮影依頼文が入る (指示書が無いので (未登録))',
         els['shoot-req-text'].value.includes('【商品名】マイタケ粉末 50g') && els['shoot-req-text'].value.includes('【撮影指示書】\n(未登録)'));
@@ -6403,12 +6447,28 @@ let wfSetParentId = null;
       await els['shoot-req-copy'].fire('click');
       check('画面の JS: http(s) で始まらない URL はコピーしない (打ち間違い・javascript: を送らない・Codex PR-A L)',
         copied.length === copiedBefore && els['shoot-req-msg'].textContent.includes('https:// で始まる形'), els['shoot-req-msg'].textContent);
+      // 商品名が空なら、描いたときの古い名前で送らずに止める (Codex PR-A 名指し2 M)
+      els['ip-camera-url'].value = SHEET;
+      els['f-name'].value = '  ';
+      await els['f-name'].fire('input');
+      await els['shoot-req-copy'].fire('click');
+      check('🚨 画面の JS: 基本情報の商品名を空にしたら、古い商品名で依頼文を作らずコピーもしない',
+        copied.length === copiedBefore && els['shoot-req-msg'].textContent.includes('商品名') && !els['shoot-req-text'].value.includes('マイタケ'),
+        els['shoot-req-msg'].textContent + ' / ' + els['shoot-req-text'].value);
+      els['f-name'].value = 'マイタケ粉末 50g';
       await modeBtns[1].fire('click');
       check('画面の JS: いま選ばれている撮影判定を押しても送らない', posts.length === 0);
+      // 🚨 指示書の URL が未保存のまま「撮影不要」 → 先に聞く。やめたら送らない (Codex PR-A 名指し2 M)
       await modeBtns[0].fire('click');
-      check('画面の JS: 撮影判定のボタンは押した値を /shoot-mode に送って読み直す',
-        posts.length === 1 && posts[0][0] === '/apps/product-hub/api/drafts/7/shoot-mode' && posts[0][1].mode === 'none'
-        && reloads.length === 1 && reloads[0][0].ok === true, JSON.stringify([posts, reloads]));
+      check('🚨 画面の JS: 未保存の指示書 URL があるまま「撮影不要」を押すと確認し、やめたら送らない (URL も残す)',
+        asked.length === 1 && posts.length === 0 && els['ip-camera-url'].value === SHEET, JSON.stringify([asked, posts]));
+      confirmAnswer = true;
+      await modeBtns[0].fire('click');
+      check('画面の JS: 確認して進めたら、未保存の URL を元の値に戻してから「撮影不要」を送り、読み直す',
+        asked.length === 2 && els['ip-camera-url'].value === '' && posts.length === 1 && posts[0][0] === '/apps/product-hub/api/drafts/7/shoot-mode'
+        && posts[0][1].mode === 'none' && reloads.length === 1 && reloads[0][0].ok === true, JSON.stringify([posts, reloads]));
+      await modeBtns[2].fire('click');
+      check('画面の JS: 撮影が要る判定は確認なしで送る (URL を消さない向き)', asked.length === 2 && posts.length === 2 && posts[1][1].mode === 'photographer');
       check('画面の JS: ボタンの処理は 1 つずつ (二重登録しない)', modeBtns.every((b) => b.count('click') === 1) && els['shoot-req-copy'].count('click') === 1);
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSf);
     }

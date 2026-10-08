@@ -1004,11 +1004,20 @@ export function setStepState(
     // ③ の材料チェックは自社商品だけ (仕入商品で詳細を作る場合は工程だけ進める)。⑥の順序は全商品。
     // ① (撮影・素材ステータス + 商品情報) の条件は 2026-09-13 スタッフ要望で外した — 情報入力が済んでいないと
     // ボードで ②仮構成 へ動かせず、撮影依頼のための仮構成を先に作れなかった
-    const ownBrandDraft = code === 'imgd_material'
-      ? db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(id)?.own_brand === 1 : false;
+    // 撮影判定 (2026-10-08) で「撮影が要る」とした商品は、仕入商品でも撮影の素材が揃うまで ③ を閉じない
+    // (人が撮影すると決めたのに素材なしで ④AI制作 へ進ませない — Codex PR-A 名指し2 High)。
+    // 判定の無い仕入商品は今までどおり工程だけ進める
+    const matRow = code === 'imgd_material'
+      ? db.prepare(`SELECT d.own_brand, ip.shoot_mode FROM product_drafts d
+          LEFT JOIN draft_image_production ip ON ip.draft_id = d.id WHERE d.id = ?`).get(id) : null;
+    const ownBrandDraft = matRow?.own_brand === 1;
+    const shootNeeded = matRow?.shoot_mode === 'inhouse' || matRow?.shoot_mode === 'photographer';
     // bypassGates = 移行 (Notion 画像DB 取り込み等) が「Notion 側で既に済んでいる段階」を写すときだけ。画面・D&D は必ずゲートを通る
-    if (!bypassGates && state === 'done' && ((ownBrandDraft && code === 'imgd_material') || code === 'imgd_review_2')) {
+    if (!bypassGates && state === 'done' && (((ownBrandDraft || shootNeeded) && code === 'imgd_material') || code === 'imgd_review_2')) {
       const ip = db.prepare('SELECT material_status FROM draft_image_production WHERE draft_id = ?').get(id) || {};
+      if (code === 'imgd_material' && shootNeeded && ip.material_status !== 'ready') {
+        throw badRequest(`完了にはまだ足りません: 撮影判定が「${matRow.shoot_mode === 'inhouse' ? '社内撮影' : 'カメラマン撮影'}」なので、撮影の素材が揃ってから撮影・素材ステータスを「素材完了」にしてください (いまは「${MATERIAL_STATUS_LABELS[ip.material_status] || '未設定'}」)`);
+      }
       if (code === 'imgd_material' && ip.material_status !== 'ready' && ip.material_status !== 'not_required') {
         throw badRequest(`完了にはまだ足りません: 撮影・素材ステータスが「${MATERIAL_STATUS_LABELS[ip.material_status] || '未設定'}」です (素材完了 か 撮影不要 にしてください)`);
       }

@@ -329,7 +329,8 @@ export async function importImageDbByStatus({
     if (rec.status && blank(ipCur.status)) plan.ip.status = rec.status;
     // 撮影商品発送 → 撮影・素材ステータス (v2 の安定コード)。空のときだけ
     const mat = rec.shipping_status ? SHIPPING_TO_MATERIAL[rec.shipping_status] : null;
-    if (mat && blank(ipCur.material_status)) plan.ip.material_status = mat;
+    // 撮影判定 (2026-10-08) がある商品は判定が正本なので埋めない (社内撮影にして未設定へ戻したのを「撮影不要」で上書きしない)
+    if (mat && blank(ipCur.material_status) && !ipCur.shoot_mode) plan.ip.material_status = mat;
 
     // 工程
     const sp = planStepsFor(rec.status);
