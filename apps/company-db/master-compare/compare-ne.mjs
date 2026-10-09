@@ -21,7 +21,7 @@ import { readEvidence } from '../push/evidence.mjs';
 import { planFromSnapshot, subjectKey, sameValue } from './compare-load.mjs';
 import { evaluateBaseline } from './baseline.mjs';
 import { readNeFetchCounts } from '../../warehouse/ne-fetch-counts.js';
-import { parentObservations, repSpellingsOf, fetchTimeRfc3339 } from './parent-gate.mjs';
+import { parentObservations, parentObsTrust, repSpellingsOf, fetchTimeRfc3339 } from './parent-gate.mjs';
 
 export const NE_FORMAT = 'mc-ne-v1';
 /** NE の取扱区分で知っている語 (2026-09-26 の実データ。これ以外は invalid = 照合しない。今のロードの mapHandling は知らない語も discontinued にする) */
@@ -402,6 +402,41 @@ export function resolveNeCodes(sp) {
  *   intBlocked = 取込で保持した商品 (norm → 理由) / absenceUntrusted = 行が落ちた (「NE の表に無い」を根拠にしない) / componentsUntrusted = 構成の行が落ちた (C1 の形)
  *   🆕 0068: drift-list (代表のずれの一覧) も同じ決まりで読む
  */
+/**
+ * 区分のゲートの integrity_untrusted の数え (広げる道 v11 §3.6.4・#1642)。🆕 #1676 Codex R4: compare-ne と drift-list の同じ数え。
+ *   P・S の行で空のコード・形の壊れた行 (セットの子が空)・取込の整合で保持した SKU (intBlocked) の行の数 + 今朝の取得が落とした行・重なり。読めない種類 = 1 (fail-closed)
+ * @returns {{ badRowNorms: Set<string>, integrityRows: number, fetchState: object }}
+ */
+export function neIntegrityRows(ne, intBlocked) {
+  const blank = (v) => !String(v ?? '').trim();
+  const badRowNorms = new Set();
+  let integrityRows = 0;
+  for (const r of ne.products) {
+    const k = normSku(r.code);
+    if (blank(r.code) || !k || intBlocked.has(k)) { integrityRows++; if (k) badRowNorms.add(k); }
+  }
+  for (const r of ne.sets) {
+    const k = normSku(r.parent);
+    if (blank(r.parent) || !k || blank(r.child) || intBlocked.has(k)) { integrityRows++; if (k) badRowNorms.add(k); }
+  }
+  // 今朝の取得の件数 (#1642)。読めない種類 = 1 (fail-closed)
+  const fc = ne.fetchCounts || { ok: false };
+  let fetchUntrusted = 0;
+  const fetchState = { ok: !!fc.ok, fetch_fingerprint: fc.fetch_fingerprint ?? null, ...(fc.error ? { error: fc.error } : {}), ...(fc.fetch_fingerprint_mismatch ? { fetch_fingerprint_mismatch: true } : {}) };
+  for (const kind of ['products', 'setproducts']) {
+    const r = fc[kind];
+    if (r && r.ok) {
+      const c = r.counts;
+      const dropped = c.dropped_no_code + c.dropped_missing_fields, dup = c.write_attempts - c.stored_rows;
+      fetchUntrusted += dropped + dup;
+      fetchState[kind] = { ok: true, dropped_no_code: c.dropped_no_code, dropped_missing_fields: c.dropped_missing_fields, overwritten: dup, complete_at: c.complete_at };
+    } else { fetchUntrusted += 1; fetchState[kind] = { ok: false, reason: r ? r.reason : (fc.error ? 'error' : 'unreadable') }; }
+  }
+  if (!fc.ok && fc.fetch_fingerprint_mismatch && fetchUntrusted === 0) fetchUntrusted = 1;   // 2 つの取得の版が違う = 信用しない
+  integrityRows += fetchUntrusted;
+  return { badRowNorms, integrityRows, fetchState };
+}
+
 export function neIntegrity(M) {
   let ip, is;
   try { ip = JSON.parse(M.ne_api_products_integrity); is = JSON.parse(M.ne_api_setproducts_integrity); } catch { return null; }
@@ -624,7 +659,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   // ── 5. 取込の整合 (C1 + C2) ──
   const integ = neIntegrity(M);
   if (!integ) return block('no_integrity', { raw_diffs: rawDiffs() });
-  const { is, c2Form, intBlocked, absenceUntrusted, componentsUntrusted } = integ;
+  const { is, c2Form, intBlocked, absenceUntrusted, componentsUntrusted } = integ;   // integ = 代表の観測の信用の許可の一覧にも渡す (#1676 Codex R4)
   pre.integrity = { blocked_skus: intBlocked.size, absence_untrusted: absenceUntrusted, components_untrusted: componentsUntrusted, form: c2Form ? 'c2' : 'c1' };
   // ── 6. 昨夜のロード (P4) と台帳 ──
   const p4 = !!loadCtx && (loadVerdict === 'pass' || loadVerdict === 'breach');
@@ -1193,33 +1228,10 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     const P = new Set(ne.products.map((r) => normSku(r.code)).filter(Boolean));
     const S = new Set(ne.sets.map((r) => normSku(r.parent)).filter(Boolean));
     const E = new Set((ne.exceptions || []).map((c) => normSku(c)).filter(Boolean));
-    const badRowNorms = new Set();
-    let integrityRows = 0;
-    for (const r of ne.products) {
-      const k = normSku(r.code);
-      if (blank(r.code) || !k || intBlocked.has(k)) { integrityRows++; if (k) badRowNorms.add(k); }
-    }
-    for (const r of ne.sets) {
-      const k = normSku(r.parent);
-      if (blank(r.parent) || !k || blank(r.child) || intBlocked.has(k)) { integrityRows++; if (k) badRowNorms.add(k); }
-    }
+    // 🆕 #1676 Codex R4: 数え方は neIntegrityRows に移した (drift-list も同じ数え = 代表の観測の信用の許可の一覧の kind_gate)
+    const { badRowNorms, integrityRows, fetchState } = neIntegrityRows(ne, intBlocked);
     // 区分を決められない code_norm = 今の母集合では必ず 0 (所属で必ず決まる。壊れたセットの行は integrity_untrusted だけに数える。Codex R13 Low)
     const unknown = new Set();
-    // 今朝の取得の件数 (#1642)。読めない種類 = 1 (fail-closed)
-    const fc = ne.fetchCounts || { ok: false };
-    let fetchUntrusted = 0;
-    const fetchState = { ok: !!fc.ok, fetch_fingerprint: fc.fetch_fingerprint ?? null, ...(fc.error ? { error: fc.error } : {}), ...(fc.fetch_fingerprint_mismatch ? { fetch_fingerprint_mismatch: true } : {}) };
-    for (const kind of ['products', 'setproducts']) {
-      const r = fc[kind];
-      if (r && r.ok) {
-        const c = r.counts;
-        const dropped = c.dropped_no_code + c.dropped_missing_fields, dup = c.write_attempts - c.stored_rows;
-        fetchUntrusted += dropped + dup;
-        fetchState[kind] = { ok: true, dropped_no_code: c.dropped_no_code, dropped_missing_fields: c.dropped_missing_fields, overwritten: dup, complete_at: c.complete_at };
-      } else { fetchUntrusted += 1; fetchState[kind] = { ok: false, reason: r ? r.reason : (fc.error ? 'error' : 'unreadable') }; }
-    }
-    if (!fc.ok && fc.fetch_fingerprint_mismatch && fetchUntrusted === 0) fetchUntrusted = 1;   // 2 つの取得の版が違う = 信用しない
-    integrityRows += fetchUntrusted;
     out.fetch_counts = fetchState;
     const affected = new Set([...badRowNorms, ...intBlocked.keys(), ...nCollided, ...unknown].filter((k) => cdb.skuByNorm.has(k)));
     const codes = [];
@@ -1248,9 +1260,11 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   // 🆕 0068 (設計 20 v7 §②・§⑥ PR-6): 代表 (親) の生の数えの元 = 同じ完全な取得の観測 (JSON には入れない。run.mjs が封の後に ops.record_parent_gate で DB に数えさせる)
   //   代表の名前空間の元の書き方 (raw_ne_code_spellings・商品コードが空で落とした行の代表も) が 2 つ以上 = 衝突 (#1676 Codex R1 High)。
   //   台帳を読めない回は「読めない」と理由を持たせる = run.mjs は記録しない (#1676 Codex R2 High)
-  //   行が落ちた取得 (C1 の形のセットの行の欠け = どのセットか特定できない・コードの無い行・C2 の親の欠け) = 記録しない (#1676 Codex R3 High 2)
-  const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], complete: !absenceUntrusted,
-      incompleteReason: componentsUntrusted ? 'c1_set_rows_dropped' : 'ne_rows_dropped', repSpellings: repSpellingsOf(neCodes) }),
+  //   🆕 #1676 Codex R4: 信用 = 許可の一覧 (parentObsTrust): 取得の件数・取込の整合 (行の落ち・C1 のセットの行の欠け)・区分のゲートの integrity_untrusted・台帳。
+  //   全部が明示的に ok のときだけ complete (どれか 1 つでも = 記録しない)
+  const repSp = repSpellingsOf(neCodes);
+  const trust = parentObsTrust({ fetch_counts: ne.fetchCounts, integrity: integ, kind_gate: out.kind_gate, rep_spellings: repSp });
+  const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], trust, repSpellings: repSp }),
     fetch: { ...neFetchIdentity(marks, ne), products_complete_at: fetchTimeRfc3339(marks.products.at), setproducts_complete_at: fetchTimeRfc3339(marks.sets.at) },
     material_generation_id: out.generation ? out.generation.generation_id : null };
   out.parent_obs = { rows: parentObs.obs.rows.length, untrusted: parentObs.obs.untrusted.length, rep_collided: parentObs.obs.rep_collided.length, rep_spellings: parentObs.obs.rep_spellings,

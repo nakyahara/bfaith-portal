@@ -122,7 +122,7 @@ const putRecord = async (c, over) => {
 const mirrorObs = async (E) => {
   const rows = await E.q(`select k.code_norm, nullif(core.norm_code(pp.display_code), '') as rep, pp.display_code as raw from core.skus k
     left join core.products p on p.product_id = k.product_id left join core.products pp on pp.product_id = p.parent_product_id where k.sku_kind = 'single' order by 1`);
-  return { format: 'parent-obs-v1', complete: true, untrusted: [], rep_spellings: { state: 'ok' }, rows: rows.map((r) => [r.code_norm, 'single', 'ok', r.rep ?? null, r.rep ? r.raw : null]) };
+  return { format: 'parent-obs-v1', complete: true, untrusted: [], rep_spellings: { state: 'ok' }, trust: { fetch_counts: 'ok', integrity: 'ok', kind_gate_integrity: 'ok', rep_spellings: 'ok' }, rows: rows.map((r) => [r.code_norm, 'single', 'ok', r.rep ?? null, r.rep ? r.raw : null]) };
 };
 
 try {
@@ -177,7 +177,11 @@ try {
     const f = { generation_id: 'ne_w1c', raw_hash: hex('1'), products_complete_at: new Date().toISOString(), setproducts_complete_at: new Date().toISOString() };
     const base = await mirrorObs(E);
     for (const [obs, re] of [[{ ...base, rep_spellings: { state: 'unavailable', reason: 'invalid_rep_spellings:1' } }, /spellings_unavailable/],
-      [{ ...base, complete: false, incomplete_reason: 'c1_set_rows_dropped' }, /ne_rows_dropped/]]) {
+      [{ ...base, complete: false, incomplete_reason: 'c1_set_rows_dropped' }, /ne_untrusted/],
+      // 🆕 #1676 Codex R4: 取得の件数 (no_record・unreadable・not_this_fetch・fingerprint 不一致)・一覧に無い印 = 断る
+      ...['fetch_counts_unavailable:products:no_record', 'fetch_counts_unavailable:setproducts:unreadable', 'fetch_counts_unavailable:products:not_this_fetch', 'fetch_counts_fingerprint_mismatch']
+        .map((why) => [{ ...base, complete: false, incomplete_reason: why, trust: { ...base.trust, fetch_counts: why } }, /ne_untrusted/]),
+      [{ ...base, trust: { ...base.trust, 'unknown:fake_marker': 'unknown_signal' } }, /ne_untrusted/]]) {
       const e = await errOf(E.WW, 'select ops.record_parent_gate($1, $2::jsonb, $3, $4, $5::jsonb)', [runId(), JSON.stringify(f), GEN, hex('2'), JSON.stringify(obs)]);
       assert.match(e?.message ?? '', re);
     }

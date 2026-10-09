@@ -95,6 +95,7 @@ export async function seedParentGate(db, { runId, obs = null, materialGeneration
         from core.skus k left join core.products p on p.product_id = k.product_id left join core.products pp on pp.product_id = p.parent_product_id
        where k.company_id = 1 and k.sku_kind in ('single', 'set') order by k.code_norm`)).rows;
     return { format: 'parent-obs-v1', complete: true, untrusted: [], rep_spellings: { state: 'ok' },
+      trust: { fetch_counts: 'ok', integrity: 'ok', kind_gate_integrity: 'ok', rep_spellings: 'ok' },   // 🆕 #1676 Codex R4: 照合の許可の一覧 (全部 ok)
       rows: rows.map((r) => (r.sku_kind === 'set' ? [r.code_norm, 'set', null, null, null] : [r.code_norm, 'single', 'ok', r.rep ?? null, r.rep ? r.raw : null])) };
   };
   const when = at || new Date(Date.now() - 1000).toISOString();

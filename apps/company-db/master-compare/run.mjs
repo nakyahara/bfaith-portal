@@ -30,7 +30,7 @@ import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteF
 import { readDecisionLedger, writeDecisions, writeNeCodes, connectDecisionWriter, snapshotRegTargets, writeRegistrationObservations, sealRegistrationRun, runRegistrationCheck } from './decisions.mjs';
 import { readBaseline, writeBaseline, holdAllDirections } from './baseline.mjs';
 import { compareOldTables, oldTablesSummary, oldTablesBad, OLD_FORMAT } from './compare-old-tables.mjs';
-import { recordParentGate, parentTrouble, parentNote, parentEnforced, fetchTimeRfc3339 } from './parent-gate.mjs';
+import { recordParentGate, parentGateUnrecorded, parentTrouble, parentNote, parentEnforced, fetchTimeRfc3339 } from './parent-gate.mjs';
 export { fetchTimeRfc3339 };   // 🆕 0068: parent-gate.mjs に移した (compare-ne からも使う = 読み込みの輪を作らない)
 
 export const EVIDENCE_NAME = 'master-compare';
@@ -502,6 +502,9 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     //   (持ち主が company なら 0 でない朝・記録できない朝は新しい NE 登録の CSV が閉じる)。照合そのものは失敗にしない (要約の先頭に ⚠️)
     if (result.ne && result.ne.verdict !== 'error' && result.ne.verdict !== 'blocked' && parentObs) {
       result.ne.parent_gate = await recordParentGate(writerDb || connectWriter ? writer : null, { compareRunId, parentObs, evidenceSha256: j.sha256, readDb: db });
+    } else if (result.ne) {
+      // 🆕 #1676 Codex R4 Medium: ② が代表の観測を作る前に止まった (blocked / error) = 記録しない。持ち主を読んで知らせる (company = ⚠️ 閉じた / load = ℹ️ / 0068 の前 = 黙る)
+      result.ne.parent_gate = await parentGateUnrecorded(db, result.ne.verdict === 'error' ? 'ne_error' : result.ne.verdict === 'blocked' ? `ne_blocked:${result.ne.blocked_reason ?? ''}` : 'no_obs');
     }
     } finally { await closeWriter(); }
     pruneResults(dataDir, { now });

@@ -365,7 +365,9 @@ await ta('[9] 取込の整合: dup_codes の SKU は全部保持 / C1 の形の�
   r = (await compare(days[10])).result.ne;
   assert.equal(r.prerequisites.integrity.form, 'c1');
   assert.equal(r.held['components:s001'], 'ne_dropped_rows');
-  assert.deepEqual([r.parent_obs.complete, r.parent_obs.incomplete_reason], [false, 'c1_set_rows_dropped'], '🆕 0068 (#1676 Codex R3 High 2): C1 のセットの行の欠け = 代表の数えを記録しない回');
+  // 🆕 0068 (#1676 Codex R3 High 2・R4): C1 のセットの行の欠け = 代表の数えを記録しない回 (許可の一覧の取込の整合が c1_set_rows_dropped)
+  assert.equal(r.parent_obs.complete, false);
+  assert.ok(r.parent_obs.incomplete_reason.split(',').includes('c1_set_rows_dropped'), r.parent_obs.incomplete_reason);
   disjoint(r);
 });
 

@@ -17,8 +17,8 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { readNeSide, nModelOf, neIntegrity, resolveNeCodes } from './compare-ne.mjs';
-import { parentObservations, readParentCounts, repSpellingsOf, PARENT_COUNT_KEYS, PARENT_COUNT_JA } from './parent-gate.mjs';
+import { readNeSide, nModelOf, neIntegrity, neIntegrityRows, resolveNeCodes } from './compare-ne.mjs';
+import { parentObservations, parentObsTrust, readParentCounts, repSpellingsOf, PARENT_COUNT_KEYS, PARENT_COUNT_JA } from './parent-gate.mjs';
 
 /**
  * 一覧を作る (読むだけ)。ne = readNeSide の結果・db = watcher の接続 ({ query })。
@@ -38,11 +38,10 @@ export async function driftList({ ne, db }) {
   // 🆕 #1676 Codex R2 High: 代表の名前空間の書き方の台帳を読めない = 数えない (空 = 「衝突なし」と読まない)
   const sp = repSpellingsOf(resolveNeCodes(ne.spellings));
   if (sp.state !== 'ok') throw new Error(`NE のコードの元の書き方 (代表) を読めない (${sp.reason}) = 数えない (書き方の衝突を見落とす。NE の取得の後に集め終えた印を確かめる)`);
-  // 🆕 #1676 Codex R3 High 2: NE の取得で行が落ちた (どのコードがセットか・取得に無いかを特定できない) = 数えない
-  if (integ.absenceUntrusted) {
-    throw new Error(`NE の取得で行が落ちた (${integ.componentsUntrusted ? 'c1_set_rows_dropped' : 'ne_rows_dropped'}) = 数えない (どのコードか特定できない。取込の整合 ne_api_*_integrity を確かめて取り直す)`);
-  }
-  const obs = parentObservations(nm, { untrusted: [...collided, ...integ.intBlocked.keys()], complete: true, repSpellings: sp });
+  // 🆕 #1676 Codex R3 High 2・R4: 照合 ② と同じ許可の一覧 (取得の件数・取込の整合・区分のゲートの integrity_untrusted・台帳) の全部が ok のときだけ数える
+  const trust = parentObsTrust({ fetch_counts: ne.fetchCounts, integrity: integ, kind_gate: { integrity_untrusted: neIntegrityRows(ne, integ.intBlocked).integrityRows }, rep_spellings: sp });
+  if (!trust.complete) throw new Error(`NE の取得を確かめられない (${trust.reasons.join(', ')}) = 数えない (どのコードか特定できない。取得の件数・取込の整合を確かめて取り直す)`);
+  const obs = parentObservations(nm, { untrusted: [...collided, ...integ.intBlocked.keys()], trust, repSpellings: sp });
   const r = await readParentCounts(db, obs, { detail: true });
   return { ne_fetch: { products_complete_at: M.ne_api_products_complete_at, setproducts_complete_at: M.ne_api_setproducts_complete_at,
     rows_dropped: integ.absenceUntrusted }, ...r };

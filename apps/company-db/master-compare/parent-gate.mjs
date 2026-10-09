@@ -29,14 +29,16 @@ export function fetchTimeRfc3339(t) {
 /**
  * NE の完全な取得 (nModelOf の m = norm → { code, kind, cols.parent = repState, repRaw }) → DB に渡す観測。
  *   rows = [code_norm, 'single', 'ok' | 'unknown', 代表の norm (親なし・自分自身 = null), 代表の原文] / セット = [code_norm, 'set', null, null, null]
- *   untrusted = 正規化の衝突・取込の整合で保持した商品 (DB は「比べられない」に数える)・complete = 行が落ちていない取得
+ *   untrusted = 正規化の衝突・取込の整合で保持した商品 (DB は「比べられない」に数える)
+ *   complete・trust = 🆕 #1676 Codex R4: parentObsTrust (許可の一覧) の答え。trust = { 確かめの名前: 'ok' | 理由 }・complete = 全部 'ok' のときだけ true。
+ *     trust を渡さない = 確かめていない = complete:false (既定は閉じる)
  *   rep_collided = 🆕 #1676 Codex R1 High: NE のコードの元の書き方 (raw_ne_code_spellings の代表の名前空間) で書き方が 2 つ以上の代表 (DB は「曖昧」に数える)。
  *     代表の原文 (rows の 5 つめ) は compare-ne の repRawOf = 代表商品コード_src から戻した元の書き方 (保存の値は小文字)
  *   rep_spellings = 🆕 #1676 Codex R2 High: その台帳を読めたか ({ state: 'ok' } / { state: 'unavailable', reason })。読めない回の rep_collided の空は「衝突なし」ではない
  *     = 照合は記録しない (DB の ops.record_parent_gate も断る)・drift-list は止まる。渡されない = 読めない (not_read) に倒す
  *   🚨 長すぎるコード (200 字超) は送らない (= DB では「取得に無い」= 比べられない)・長すぎる代表は unknown (比べられない)
  */
-export function parentObservations(nm, { untrusted = [], complete = false, incompleteReason = null, repSpellings = { state: 'unavailable', reason: 'not_read', collided: [] } } = {}) {
+export function parentObservations(nm, { untrusted = [], trust = null, repSpellings = { state: 'unavailable', reason: 'not_read', collided: [] } } = {}) {
   const rows = [];
   for (const [norm, n] of [...nm].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
     if (!norm || norm.length > MAX_CODE) continue;
@@ -51,9 +53,73 @@ export function parentObservations(nm, { untrusted = [], complete = false, incom
   const okSp = !!repSpellings && repSpellings.state === 'ok';
   const rc = okSp ? [...new Set([...(repSpellings.collided || [])].filter((x) => typeof x === 'string' && x && x.length <= MAX_CODE))].sort() : [];
   const sp = okSp ? { state: 'ok' } : { state: 'unavailable', reason: String((repSpellings && repSpellings.reason) || 'not_read').slice(0, 100) };
-  // 🆕 #1676 Codex R3 High 2: 行が落ちた取得 (complete = false) は理由を持たせる (c1_set_rows_dropped = C1 の形のセットの行の欠け / ne_rows_dropped) = 記録しない
-  const inc = complete ? {} : { incomplete_reason: String(incompleteReason || 'ne_rows_dropped').slice(0, 100) };
-  return { format: PARENT_OBS_FORMAT, complete: !!complete, ...inc, untrusted: u, rep_collided: rc, rep_spellings: sp, rows };
+  // 🆕 #1676 Codex R4: 信用 = 許可の一覧の全部が明示的に ok のときだけ complete (渡さない = 確かめていない = 閉じる)
+  const tr = trust && typeof trust === 'object' && trust.checks ? trust : parentObsTrust({ rep_spellings: repSpellings });
+  const complete = tr.complete === true;
+  const inc = complete ? {} : { incomplete_reason: tr.reasons.join(',').slice(0, 100) || 'not_checked' };
+  return { format: PARENT_OBS_FORMAT, complete, ...inc, trust: { ...tr.checks }, untrusted: u, rep_collided: rc, rep_spellings: sp, rows };
+}
+
+/**
+ * 🆕 #1676 Codex R4: 親の観測の信用 = 許可の一覧 (allowlist)。全部の確かめが**明示的に ok** のときだけ complete。どれか 1 つでも false / 未定義 / 読めない = 閉じる。
+ *   知らない印 (一覧に無い入力の鍵) が渡された = 一覧に足すまでは閉じる (既定は閉じる)。DB の ops.record_parent_gate も同じ一覧 (trust の鍵の集合 = 全部 'ok') で断る。
+ *   入力 (signals):
+ *     fetch_counts = 今朝の取得の件数 (readNeFetchCounts の答え): 単品・セットとも ok・同じ取得 (fingerprint 一致)・落とした行 0・重なり 0
+ *     integrity    = 取込の整合 (compare-ne の neIntegrity の答え): 読める・行が落ちていない (absenceUntrusted / C1 のセットの行の欠けが無い)
+ *     kind_gate    = 照合 ② の区分のゲートの数 (integrity_untrusted = 0 = 新商品の許可と同じ厳しさ)
+ *     rep_spellings = NE のコードの元の書き方 (代表) の台帳 (repSpellingsOf の答え) が ok
+ * 戻り値 { complete, checks: { fetch_counts, integrity, kind_gate_integrity, rep_spellings, (知らない印) }, reasons: [ok でない確かめの理由] }
+ */
+export const PARENT_TRUST_INPUTS = Object.freeze(['fetch_counts', 'integrity', 'kind_gate', 'rep_spellings']);
+export const PARENT_TRUST_KEYS = Object.freeze(['fetch_counts', 'integrity', 'kind_gate_integrity', 'rep_spellings']);
+const isCount = (v) => Number.isInteger(v) && v >= 0;
+const TRUST_CHECKS = Object.freeze({
+  fetch_counts: (s) => {
+    const fc = s.fetch_counts;
+    if (!fc || typeof fc !== 'object') return 'fetch_counts_unreadable';
+    if (fc.fetch_fingerprint_mismatch) return 'fetch_counts_fingerprint_mismatch';
+    for (const kind of ['products', 'setproducts']) {
+      const r = fc[kind];
+      if (!r || r.ok !== true) return `fetch_counts_unavailable:${kind}:${(r && r.reason) || 'unreadable'}`;
+      const c = r.counts || {};
+      if (![c.dropped_no_code, c.dropped_missing_fields, c.write_attempts, c.stored_rows].every(isCount)) return `fetch_counts_invalid:${kind}`;
+      if (c.dropped_no_code + c.dropped_missing_fields !== 0) return `fetch_rows_dropped:${kind}`;
+      if (c.write_attempts !== c.stored_rows) return `fetch_rows_overwritten:${kind}`;
+    }
+    if (fc.ok !== true) return 'fetch_counts_unavailable';
+    if (!fc.fetch_fingerprint || fc.products.counts.fetch_fingerprint !== fc.fetch_fingerprint || fc.setproducts.counts.fetch_fingerprint !== fc.fetch_fingerprint) {
+      return 'fetch_counts_fingerprint_mismatch';
+    }
+    return 'ok';
+  },
+  integrity: (s) => {
+    const i = s.integrity;
+    if (!i || typeof i !== 'object') return 'integrity_unreadable';
+    if (i.componentsUntrusted !== false) return 'c1_set_rows_dropped';
+    if (i.absenceUntrusted !== false) return 'ne_rows_dropped';
+    return 'ok';
+  },
+  kind_gate_integrity: (s) => (s.kind_gate && s.kind_gate.integrity_untrusted === 0 ? 'ok' : `kind_gate_integrity_untrusted:${s.kind_gate ? s.kind_gate.integrity_untrusted : 'none'}`),
+  rep_spellings: (s) => (s.rep_spellings && s.rep_spellings.state === 'ok' ? 'ok' : `rep_spellings_unavailable:${(s.rep_spellings && s.rep_spellings.reason) || 'none'}`),
+});
+export function parentObsTrust(signals = {}) {
+  const checks = {};
+  for (const k of PARENT_TRUST_KEYS) {
+    let v; try { v = TRUST_CHECKS[k](signals || {}); } catch { v = `${k}_unreadable`; }
+    checks[k] = typeof v === 'string' && v ? v.slice(0, 100) : `${k}_unreadable`;
+  }
+  for (const k of Object.keys(signals || {})) if (!PARENT_TRUST_INPUTS.includes(k)) checks[`unknown:${k}`.slice(0, 100)] = 'unknown_signal';   // 一覧に無い印 = 閉じる
+  const reasons = Object.entries(checks).filter(([, v]) => v !== 'ok').map(([k, v]) => (k.startsWith('unknown:') ? k : v));
+  return { complete: reasons.length === 0, checks, reasons };
+}
+/** 観測の信用の確かめ (DB の ops.record_parent_gate と同じ決まり): complete = true・trust の鍵 = 許可の一覧と同じ・全部 'ok'。問題の一覧 (空 = ok) */
+export function trustProblems(obs) {
+  const t = obs && obs.trust;
+  if (!obs || obs.complete !== true) return [String((obs && obs.incomplete_reason) || 'not_complete')];
+  if (!t || typeof t !== 'object') return ['trust_missing'];
+  const keys = Object.keys(t).sort();
+  if (keys.join(',') !== [...PARENT_TRUST_KEYS].sort().join(',')) return [`trust_keys:${keys.join('|')}`.slice(0, 100)];
+  return keys.filter((k) => t[k] !== 'ok').map((k) => String(t[k]));
 }
 
 /**
@@ -113,11 +179,11 @@ export async function recordParentGate(getWriter, { compareRunId, parentObs, evi
   if (!parentObs.material_generation_id || !f.generation_id || !f.raw_hash || !f.products_complete_at || !f.setproducts_complete_at) {
     return withCounts({ state: 'no_fetch' });
   }
-  // 🆕 #1676 Codex R3 High 2: NE の取得で行が落ちた回 (どのコードがセットか・取得に無いかを特定できない) = 記録しない (理由を分ける)
-  const untrustedFetch = parentObs.obs.complete !== true;
-  if (!spOk || untrustedFetch) {
+  // 🆕 #1676 Codex R3 High 2・R4: 観測の信用 = 許可の一覧の全部が ok のときだけ記録する (取得の件数・取込の整合・区分のゲート・台帳。DB も同じ一覧で断る)
+  const tp = trustProblems(parentObs.obs);
+  if (!spOk || tp.length) {
     if (readDb) { try { if (!(await readDb.query(FN_RECORD)).rows[0].ok) return { state: 'not_applied' }; } catch { /* 有無が分からない = 記録しないことは同じ */ } }
-    if (untrustedFetch) return withCounts({ state: 'ne_untrusted', reason: parentObs.obs.incomplete_reason || 'ne_rows_dropped' });
+    if (spOk) return withCounts({ state: 'ne_untrusted', reason: tp.join(',').slice(0, 100) });
     return withCounts({ state: 'no_spellings', reason: (sp && sp.reason) || 'not_read' });
   }
   if (!getWriter) {
@@ -137,6 +203,16 @@ export async function recordParentGate(getWriter, { compareRunId, parentObs, evi
   } catch (e) { return withCounts({ state: 'failed', stage: 'record', error: msg(e) }); }
 }
 
+/**
+ * 🆕 #1676 Codex R4 Medium: 照合 ② が代表の観測を作る前に blocked / error になった回 = 記録しない。0068 の有無と門の状態 (持ち主) を読んで no_obs に付ける
+ *   (company = ⚠️「記録できない・新しい CSV は閉じた」/ load = ℹ️ / 0068 の前 = not_applied = 黙る / 読めない = 持ち主が分からない = company と同じ ⚠️)
+ */
+export async function parentGateUnrecorded(readDb, reason) {
+  const why = String(reason || 'no_obs').slice(0, 100);
+  if (!readDb) return { state: 'no_obs', reason: why };
+  try { if (!(await readDb.query(FN_RECORD)).rows[0].ok) return { state: 'not_applied' }; } catch (e) { return { state: 'no_obs', reason: why, state_error: msg(e) }; }
+  try { const g = await readGateState(readDb); return { state: 'no_obs', reason: why, owner: ownerOf(g), gate: g }; } catch (e) { return { state: 'no_obs', reason: why, state_error: msg(e) }; }
+}
 const sumOf = (counts) => (counts && typeof counts === 'object' ? PARENT_COUNT_KEYS.reduce((a, k) => a + (Number(counts[k]) || 0), 0) : null);
 const detailOf = (counts) => PARENT_COUNT_KEYS.filter((k) => Number(counts[k]) > 0).map((k) => `${PARENT_COUNT_JA[k]} ${counts[k]}`).join('・');
 const codesOf = (samples) => {
@@ -145,7 +221,8 @@ const codesOf = (samples) => {
   return all.length ? `: ${all.slice(0, 5).join(', ')}${all.length > 5 ? ' ほか' : ''}` : '';
 };
 const STATE_JA = { not_configured: '書く接続が無い (COMPANY_DB_WATCH_WRITER_URL)', failed: '書けない', no_fetch: '取得の世代・時刻・材料の世代が無い',
-  no_spellings: 'NE のコードの元の書き方 (代表) を読めない', ne_untrusted: 'NE の取得で行が落ちた (どのコードか特定できない)' };
+  no_spellings: 'NE のコードの元の書き方 (代表) を読めない', ne_untrusted: 'NE の取得を確かめられない (取得の件数・取込の整合・区分のゲートの許可の一覧)',
+  no_obs: '照合 ② が代表の観測を作る前に止まった' };
 
 /**
  * 代表の持ち主が company (DB の active) = 門が閉じる側 (記録 / 読み直しの答えの owner・門の状態)。
@@ -168,7 +245,7 @@ const recordWhy = (p) => `${STATE_JA[p.state] || p.state}${p.error ? `: ${String
  */
 export function parentTrouble(ne) {
   const p = ne && ne.parent_gate;
-  if (!p || p.state === 'not_applied' || p.state === 'no_obs') return null;
+  if (!p || p.state === 'not_applied') return null;   // 🆕 #1676 Codex R4 Medium: 黙るのは 0068 の前だけ (no_obs = ② が観測を作る前に止まった朝も知らせる)
   const enforced = parentEnforced(ne);
   const total = sumOf(p.counts);
   const drift = total > 0 ? `代表 (親) が NE とずれた単品 ${total} 件 (${detailOf(p.counts)}${codesOf(p.samples)})` : null;
@@ -183,6 +260,6 @@ export function parentTrouble(ne) {
 /** 持ち主が load の間に数えを記録できなかった朝の一言 (ℹ️・要約の後ろ)。書く接続の無い朝 (試験・設定の前) は黙る */
 export function parentNote(ne) {
   const p = ne && ne.parent_gate;
-  if (!p || parentEnforced(ne) || ['ok', 'not_applied', 'no_obs', 'not_configured'].includes(p.state)) return null;
+  if (!p || parentEnforced(ne) || ['ok', 'not_applied', 'not_configured'].includes(p.state)) return null;
   return `ℹ️ 代表 (親) の数えを記録できない (${recordWhy(p)}・持ち主は夜間ロード = CSV は閉じない)`;
 }
