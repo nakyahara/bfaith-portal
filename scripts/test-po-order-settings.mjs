@@ -120,6 +120,7 @@ await ta('[S1] 印 (seen): 無い = 428・行が無いのに印あり / 行が�
   // R1 Medium 1: 空の fields・変える列が fields に無い = 断る (別の画面の変更を上書きしない)
   const c1 = counts();
   assert.equal(w({ fields: {} }, 'po-bind', { condition_id: null }), '400 invalid_input');
+  assert.equal(w({ fields: {} }, 'po-bind', {}), '400 invalid_input', '変える列が無くても空の fields は断る');
   assert.equal(w({ fields: { material_group_id: null } }, 'po-bind', { condition_id: null }), '400 invalid_input');
   assert.equal(w({ fields: { condition_id: 'c1' } }, 'po-bind', { condition_id: null, material_group_id: 'm1' }), '400 invalid_input');
   assert.deepEqual(counts(), c1);
