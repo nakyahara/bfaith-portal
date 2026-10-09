@@ -958,7 +958,7 @@ await ta('[26] 代表 (親子。D3b): lag → 一致 / 代表がセット = held
   const hc = parentCols(x.ne, 'c003')[0];
   assert.deepEqual([hc.cls, hc.explained?.reason_code], ['held_by_load', 'rep_not_single'], JSON.stringify(hc));
   const dc = x.ne.decisions.find((d) => d.subject_key === 'parent:c003');
-  assert.deepEqual([dc.col, dc.cls, dc.reason_kind, dc.print.reason?.reason_code, dc.resolutions], ['parent', 'held_by_load', 'held_by_load', 'rep_not_single', ['fix_input', 'accept_difference']]);
+  assert.deepEqual([dc.col, dc.cls, dc.reason_kind, dc.print.reason?.reason_code, dc.resolutions], ['parent', 'held_by_load', 'held_by_load', 'rep_not_single', ['fix_input']]);   // 🆕 0068: 代表は「差を残す」を選べない
   // 保持の後に人が親を変えた (記録した親・帰属と違う) = unexplained (同じ回をもう一度照らす)
   const g1 = Number((await db.query("select product_id from core.products where display_code = 'GRP1' or display_code = 'grp1' limit 1")).rows[0].product_id);
   await asParentWriter(async () => db.query("update core.products set parent_product_id = $2, parent_set_by = 'manual' where product_id = $1", [await pidOfCode('c003'), g1]));
@@ -971,7 +971,7 @@ await ta('[26] 代表 (親子。D3b): lag → 一致 / 代表がセット = held
   const mc = parentCols(x.ne, 'c003')[0];
   assert.deepEqual([mc.cls, mc.explained?.reason], ['rule', 'parent_manual'], JSON.stringify(mc));
   const dm = x.ne.decisions.find((d) => d.subject_key === 'parent:c003');
-  assert.deepEqual([dm.reason_kind, dm.resolutions, dm.proposal.op], ['parent_manual', ['accept_difference', 'fix_ne', 'fix_cdb'], 'decide_manual_priority']);
+  assert.deepEqual([dm.reason_kind, dm.resolutions, dm.proposal.op], ['parent_manual', ['fix_ne', 'fix_cdb'], 'decide_manual_priority']);   // 🆕 0068: 代表は「差を残す」を選べない
   assert.equal(x.ne.held['parent:d004'], 'incomparable');
   // 最後に一致した値 (0037): 代表の単位が書かれる・差には方向
   const bl = (await db.query("select count(*)::int as n, count(*) filter (where value = 'null'::jsonb)::int as none from ops.master_ne_baseline where col = 'parent'")).rows[0];

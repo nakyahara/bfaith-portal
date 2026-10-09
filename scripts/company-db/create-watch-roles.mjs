@@ -71,6 +71,10 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   for (const f of secdefFunctions) if (/^ops\.(record_new_entry_gate|close_new_entry_for_compare)\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
   //   0058: watcher は広げる道の読むだけの判定 (ops.widen_check_readonly)・許可の表示用 (ops.new_entry_lease_valid) を実行できる (判定の本体・apply・許可を出す関数は渡さない)
   for (const f of secdefFunctions) if (/^ops\.(widen_check_readonly|new_entry_lease_valid)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
+  //   🆕 0068 (代表の数えと門 PR-6): 照合 ② の代表 (親) の生の数えの記録 (ops.record_parent_gate) = watch_writer が関数だけで書く /
+  //   生の数え (ops.parent_raw_gate = drift-list・要約の読み直し)・門の状態 (ops.parent_gate_state) = watcher が読むだけ
+  for (const f of secdefFunctions) if (/^ops\.record_parent_gate\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
+  for (const f of secdefFunctions) if (/^ops\.(parent_raw_gate|parent_gate_state)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
   //   0058: 保守の印の表は「ops の全部の表」の select から外す (印の UUID を読ませない・G24)
   s.push(`do $$ begin if to_regclass('ops.master_maintenance_marks') is not null then execute 'revoke all on ops.master_maintenance_marks from watcher, watch_writer'; end if; end $$`);
   //   0058 (§3.9 の 3・R16 H1): 「全部の表に GRANT」の後に、配った CSV の byte 列 (ops.ne_reg_exports.file_bytes) を外して列ごとに付け直す (流し直しても戻らない)

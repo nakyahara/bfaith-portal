@@ -21,6 +21,7 @@ import { readEvidence } from '../push/evidence.mjs';
 import { planFromSnapshot, subjectKey, sameValue } from './compare-load.mjs';
 import { evaluateBaseline } from './baseline.mjs';
 import { readNeFetchCounts } from '../../warehouse/ne-fetch-counts.js';
+import { parentObservations, fetchTimeRfc3339 } from './parent-gate.mjs';
 
 export const NE_FORMAT = 'mc-ne-v1';
 /** NE の取扱区分で知っている語 (2026-09-26 の実データ。これ以外は invalid = 照合しない。今のロードの mapHandling は知らない語も discontinued にする) */
@@ -181,13 +182,20 @@ export function decisionPrint({ norm, kind, col, child = null, problem, owner, r
   return { code_norm: norm, sku_kind: kind, col, child, problem, owner: owner ?? null, reason_kind: reasonKind,
     reason: reasonKind === 'manual' ? { child: reason?.child ?? null, manual_qty: reason?.manual_qty ?? null, ne_qty: reason?.ne_qty ?? null }
       : reasonKind === 'held_by_load' ? { reason_code: reason?.reason_code ?? null } : reasonForPrint(reason),
-    n_state: n_state ?? null, n: n ?? null, c: c ?? null, proposal, semantic: `${reasonKind}@${versions[reasonKind] ?? 1}` };
+    n_state: n_state ?? null, n: n ?? null, c: c ?? null, proposal, semantic: `${reasonKind}@${versions[reasonKind] ?? 1}${col === 'parent' ? PARENT_SEMANTIC_SUFFIX : ''}` };
 }
+/**
+ * 🆕 0068 (設計 20 v7 §②・§⑥ PR-6): 代表 (親) の列の候補の意味の版の印。代表の差は「差を残す」(accept_difference) で閉じない = 選べる解決から外した。
+ *   前の候補 (選べる解決に accept_difference が入ったまま・不変) と別の指紋にする = 前の承認 (差を残す・直す) は新しい候補には効かない (もう一度判断する)
+ */
+export const PARENT_SEMANTIC_SUFFIX = '+parent_raw@1';
 /**
  * 判断の候補で選べる解決 (設計 10 §6.1.1 D1 契約 v3)。accept_difference = 差を残す (承認で案件を閉じる) / fix_ne・fix_cdb = 目標値つきで直す (目標に届くまで閉じない) /
  * fix_input = 作り直し・材料を直す / spec = 仕様を決める (どちらも自動では完了しない)
  */
-export function resolutionsFor({ cls, reasonKind, incomparableNoValue = false, hasC = false }) {
+export function resolutionsFor({ cls, reasonKind, incomparableNoValue = false, hasC = false, col = null }) {
+  // 🆕 0068 (設計 20 v7 §②): 代表 (親) の差は「差を残す」で閉じない (生の数えを承認で減らさない・DB の承認の trigger も断る)
+  if (col === 'parent') return resolutionsFor({ cls, reasonKind, incomparableNoValue, hasC }).filter((r) => r !== 'accept_difference');
   if (incomparableNoValue) return ['fix_ne'];
   if (cls === 'spec_undecided') return ['spec', 'accept_difference'];
   // 登録から NE に出てこない新商品 = 直すのはこの画面の外 (マスタの入力の「NE 登録の CSV」で NE に取り込む・やめるなら登録をやめる)。
@@ -379,6 +387,28 @@ export function resolveNeCodes(sp) {
   return { ok: true, entries };
 }
 
+/**
+ * 取込の整合 (C1 + C2) = sync_meta の ne_api_*_integrity。読めない・形が違う = null (照合 ② は blocked no_integrity)。
+ *   intBlocked = 取込で保持した商品 (norm → 理由) / absenceUntrusted = 行が落ちた (「NE の表に無い」を根拠にしない) / componentsUntrusted = 構成の行が落ちた (C1 の形)
+ *   🆕 0068: drift-list (代表のずれの一覧) も同じ決まりで読む
+ */
+export function neIntegrity(M) {
+  let ip, is;
+  try { ip = JSON.parse(M.ne_api_products_integrity); is = JSON.parse(M.ne_api_setproducts_integrity); } catch { return null; }
+  const okInt = ip && Array.isArray(ip.dup_codes) && Number.isFinite(ip.dropped_no_code) && is && Array.isArray(is.parent_conflicts) && Array.isArray(is.pair_dups) && Number.isFinite(is.dropped_missing_key);
+  if (!okInt) return null;
+  const c2Form = Number.isFinite(is.dropped_missing_parent) && Array.isArray(is.missing_child_parents);
+  const intBlocked = new Map();   // norm → 理由
+  for (const c of ip.dup_codes) intBlocked.set(normSku(c), 'dup_code');
+  for (const c of is.parent_conflicts) intBlocked.set(normSku(c), 'parent_conflict');
+  for (const d of is.pair_dups) intBlocked.set(normSku(d.parent), 'pair_dup');
+  if (c2Form) for (const c of is.missing_child_parents) intBlocked.set(normSku(c), 'missing_child');
+  // どの行が落ちたか分からない = 「NE の表に無い」を根拠にする判定を止める
+  const absenceUntrusted = ip.dropped_no_code > 0 || (c2Form ? is.dropped_missing_parent > 0 : is.dropped_missing_key > 0);
+  const componentsUntrusted = !c2Form && is.dropped_missing_key > 0;
+  return { ip, is, c2Form, intBlocked, absenceUntrusted, componentsUntrusted };
+}
+
 /** sync_meta の時刻 ('YYYY-MM-DD HH:MM:SS' = UTC。db.js の now()) → JST の日付 */
 export const jstDateOfUtcText = (t) => {
   const ms = Date.parse(`${String(t).replace(' ', 'T')}Z`);
@@ -397,7 +427,7 @@ export const generationTime = (id) => {
  * セットの子どうしの衝突は親を collided に
  * @returns {{ m: Map, collided: Set }}
  */
-function nModelOf(ne) {
+export function nModelOf(ne) {
   const m = new Map();
   const collided = new Set();
   // 衝突は、商品の表・セットの表の親の**全部の表記**で先に調べる (セットの表にあるコードの商品の行を捨てる前に。同じ表記が両方にあるのは正常。Codex #1464 R4 の確認 High)
@@ -415,7 +445,7 @@ function nModelOf(ne) {
     m.set(norm, { code: r.code, kind: 'single', cols: {
       name: textState(r.name, 'name'), handling: textState(r.handling, 'handling'), tax_rate: numState(r.tax_src, 'tax'),
       standard_price_jpy: numState(r.price_src, 'yen'), cost: numState(r.cost_src, 'yen'), primary_supplier: textState(r.supplier, 'supplier'),
-      parent: repState(r.rep, r.rep_src ?? null, r.code) } });
+      parent: repState(r.rep, r.rep_src ?? null, r.code) }, repRaw: r.rep == null ? null : (String(r.rep).trim() || null) });   // repRaw = 🆕 0068 代表の原文 (書き方の衝突)
   }
   for (const r of ne.sets) {
     const norm = normSku(r.parent); if (!norm) continue;
@@ -582,19 +612,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   const arrivalOf = (st) => (st === 'recorded' ? 'confirmed' : st === 'unconfirmed' ? 'unknown' : 'not_delivered');
   pre.arrival = { products: arrivalOf(ev.entities.products?.status), set_components: arrivalOf(ev.entities.set_components?.status) };
   // ── 5. 取込の整合 (C1 + C2) ──
-  let ip, is;
-  try { ip = JSON.parse(M.ne_api_products_integrity); is = JSON.parse(M.ne_api_setproducts_integrity); } catch { return block('no_integrity', { raw_diffs: rawDiffs() }); }
-  const okInt = ip && Array.isArray(ip.dup_codes) && Number.isFinite(ip.dropped_no_code) && is && Array.isArray(is.parent_conflicts) && Array.isArray(is.pair_dups) && Number.isFinite(is.dropped_missing_key);
-  if (!okInt) return block('no_integrity', { raw_diffs: rawDiffs() });
-  const c2Form = Number.isFinite(is.dropped_missing_parent) && Array.isArray(is.missing_child_parents);
-  const intBlocked = new Map();   // norm → 理由
-  for (const c of ip.dup_codes) intBlocked.set(normSku(c), 'dup_code');
-  for (const c of is.parent_conflicts) intBlocked.set(normSku(c), 'parent_conflict');
-  for (const d of is.pair_dups) intBlocked.set(normSku(d.parent), 'pair_dup');
-  if (c2Form) for (const c of is.missing_child_parents) intBlocked.set(normSku(c), 'missing_child');
-  // どの行が落ちたか分からない = 「NE の表に無い」を根拠にする判定を止める
-  const absenceUntrusted = ip.dropped_no_code > 0 || (c2Form ? is.dropped_missing_parent > 0 : is.dropped_missing_key > 0);
-  const componentsUntrusted = !c2Form && is.dropped_missing_key > 0;
+  const integ = neIntegrity(M);
+  if (!integ) return block('no_integrity', { raw_diffs: rawDiffs() });
+  const { is, c2Form, intBlocked, absenceUntrusted, componentsUntrusted } = integ;
   pre.integrity = { blocked_skus: intBlocked.size, absence_untrusted: absenceUntrusted, components_untrusted: componentsUntrusted, form: c2Form ? 'c2' : 'c1' };
   // ── 6. 昨夜のロード (P4) と台帳 ──
   const p4 = !!loadCtx && (loadVerdict === 'pass' || loadVerdict === 'breach');
@@ -1018,7 +1038,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       out.decisions.push({ subject_key: it.subject_key, code: it.code, norm: it.norm, code_norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, cls: col.cls, reason_kind: reasonKind,
         n_state: col.n_state ?? null, n: col.n ?? null, c: col.c ?? null, t_today: col.t_today ?? null, reason, proposal, decision_status: 'pending',
         fingerprint, approval_fingerprint: fingerprint, print, semantic: print.semantic,
-        resolutions: resolutionsFor({ cls: col.cls, reasonKind, incomparableNoValue, hasC: proposal.op === 'set_ne_value' }) });   // 提案できる値が無い (空・0) = NE を直すは値を入れて
+        resolutions: resolutionsFor({ cls: col.cls, reasonKind, incomparableNoValue, hasC: proposal.op === 'set_ne_value', col: col.col }) });   // 提案できる値が無い (空・0) = NE を直すは値を入れて
     }
   }
   // ── 11. 判断の台帳 (D1 契約 v3): 列の分類はそのまま・判断の状態を重ねる / 差を残す承認だけで埋まった案件を閉じる / 直す承認の完了を目標の単位で確かめる ──
@@ -1044,7 +1064,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       const it = items[i];
       const nonMatch = it.columns.filter((c) => c.cls !== 'match');
       if (!nonMatch.length || nonMatch.some((c) => c.cls === 'blocked' || c.cls === 'incomparable')) continue;
-      if (nonMatch.every((c) => c.decision === 'approved:accept_difference')) { out.out_of_scope[it.subject_key] = 'approved_exception'; items.splice(i, 1); }
+      // 🆕 0068: 代表 (親) の列は「差を残す」で閉じない (前からの承認が残っていても・設計 20 v7 §②)
+      if (nonMatch.every((c) => c.decision === 'approved:accept_difference' && c.col !== 'parent')) { out.out_of_scope[it.subject_key] = 'approved_exception'; items.splice(i, 1); }
     }
     // 直す承認の完了 = 目標の単位の値が承認した目標値と等しいときだけ (n と c の一致では完了にしない。Codex D-R1 H1・H2)
     const unitOf = (tg) => { const s = String(tg && tg.subject_key || ''); const at = s.indexOf(':'); return at > 0 ? s.slice(at + 1) : null; };
@@ -1214,7 +1235,12 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     fetch: { ...neFetchIdentity(marks, ne), products_rev: String(marks.products.rev), sets_rev: String(marks.sets.rev) },
   }) : null;
   out.registrations = regObs ? { targets: regTargets.length, observations: regObs.observations.length, present: regObs.observations.filter((o) => o.present).length } : { state: 'not_applied' };
-  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes, regObs };
+  // 🆕 0068 (設計 20 v7 §②・§⑥ PR-6): 代表 (親) の生の数えの元 = 同じ完全な取得の観測 (JSON には入れない。run.mjs が封の後に ops.record_parent_gate で DB に数えさせる)
+  const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], complete: !absenceUntrusted }),
+    fetch: { ...neFetchIdentity(marks, ne), products_complete_at: fetchTimeRfc3339(marks.products.at), setproducts_complete_at: fetchTimeRfc3339(marks.sets.at) },
+    material_generation_id: out.generation ? out.generation.generation_id : null };
+  out.parent_obs = { rows: parentObs.obs.rows.length, untrusted: parentObs.obs.untrusted.length, complete: parentObs.obs.complete };
+  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes, regObs, parentObs };
 }
 
 /**

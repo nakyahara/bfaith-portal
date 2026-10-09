@@ -266,6 +266,9 @@ assert.equal((await one('select cells from ops.ne_reg_export_rows where export_i
 assert.equal((await issue(V1_ISSUED.export_id)).export.state, 'issued');
 assert.equal((await one("select count(*)::int as n from ops.ne_reg_exports where schema_version = 'ne-reg-single-v1'")).n, 2);
 await applyMigrations(db, { log: quiet });   // ここで 0065
+// 🆕 0068: この DB は products.parent も company = 代表の数えの門が効く。0068 の前に置いた許可の照合の回の数え (NE = Company DB = 0) も置く (本番 = 翌朝の照合 ② が残す)
+{ const g = (await db.query('select compare_run_id from ops.new_entry_gate_results order by result_id desc limit 1')).rows[0];
+  if (g) await (await import('./fixtures/master-widen.mjs')).seedParentGate(db, { runId: g.compare_run_id }); }
 assert.ok((await one("select to_regprocedure('ops.ne_reg_schema_rule(text)') is not null as ok")).ok, '0065 を当てた');
 
 await ta('[V5] 0065 の前に作った v1 のファイル (#1664 Codex R1 Medium): 配っていない (built) v1 = 0065 の後は初めて配れない (409 schema_not_buildable・何も変えない・使わないにして v2 で作り直す) / 配った (issued) v1 = 0065 の後も再ダウンロード・もう一度配る (already)・申告・翌朝の確かめは今までどおり', async () => {
