@@ -86,7 +86,7 @@ import { Readable } from 'node:stream';
 import { editStateFor as lpEditStateFor, saveEdit as saveLpEdit, effectiveComposeText as lpEffectiveComposeText } from './lib/lp-edit.js';
 import { imageLimitForPriority as lpImageLimitForPriority } from './lib/lp-image.js';
 // デザイナー修正依頼書 (スプレッドシート) の自動作成 (画像制作の新フロー PR-F・2026-10-09)
-import { createOrUpdateDesignerSheet, designerSheetStateFor, DESIGNER_SHEET_FORBIDDEN } from './services/designer-sheet-service.js';
+import { createOrUpdateDesignerSheet, designerSheetStateFor, revokeAllDesignerShares, DESIGNER_SHEET_FORBIDDEN } from './services/designer-sheet-service.js';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
@@ -3151,12 +3151,15 @@ router.post('/api/notion-import-by-status', legacyHandler(async (req, res) => {
 
 // 取り込んだテストデータの掃除。**取り込み由来だけ**削除可 (ポータル起点の商品は消させない)。
 // Notion 側のカードには一切触らない (ポータル DB の行を消すだけ)。
-router.post('/api/drafts/:id/delete', (req, res) => {
+router.post('/api/drafts/:id/delete', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   if (!isNotionImported(draft)) {
     return res.status(400).json({ ok: false, error: '削除できるのはNotion取り込み由来のドラフトだけです' });
   }
+  // デザイナー修正依頼書 (PR-F) のために公開した画像は、消す前に公開を外す (消すと画面から外せなくなる)。外せなければ消さない
+  const unshared = await revokeAllDesignerShares(draft.id);
+  if (!unshared.ok) return res.status(409).json({ ok: false, error: unshared.error + '。商品は削除していません' });
   const db = getDB();
   // draft_events は append-only (削除 trigger) なので消さない。孤児として監査ログに残す
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft.id);

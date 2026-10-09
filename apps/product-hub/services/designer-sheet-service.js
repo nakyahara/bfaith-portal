@@ -25,7 +25,7 @@
  */
 import { getDB, logEvent } from '../db.js';
 import { parseDriveLink } from '../lib/drive-link.js';
-import { fieldsOfBlock } from '../lib/lp-edit.js';
+import { fieldsOfBlock, readComposition } from '../lib/lp-edit.js';
 import { imageStateFor } from '../lib/lp-image.js';
 import { spreadsheetUrl } from '../lib/shoot-sheet.js';
 import {
@@ -78,15 +78,34 @@ function currentImagesOf(cards) {
 function rolesFromPrompts(db, rootIds) {
   const out = new Map();
   const marker = '【この画像の指示: ';
+  let byNo = null;
   for (const rid of rootIds) {
-    const prompt = db.prepare('SELECT prompt FROM ph_lp_images WHERE id = ?').get(rid)?.prompt || '';
+    const im = db.prepare(`SELECT i.prompt, i.no, j.compose_job_id, j.created_at FROM ph_lp_images i JOIN ph_lp_image_jobs j ON j.id = i.image_job_id WHERE i.id = ?`).get(rid) || {};
+    const prompt = im.prompt || '';
     const i = prompt.indexOf(marker);
-    if (i < 0) continue;
-    const nl = prompt.indexOf('\n', i);
-    if (nl < 0) continue;
-    const f = fieldsOfBlock(prompt.slice(nl + 1).split('\n'));
-    out.set(rid, { role: f.role || '', title: f.title || '' });
+    const nl = i >= 0 ? prompt.indexOf('\n', i) : -1;
+    if (nl >= 0) {
+      const f = fieldsOfBlock(prompt.slice(nl + 1).split('\n'));
+      out.set(rid, { role: f.role || '', title: f.title || '' });
+      continue;
+    }
+    // prompt が上限 (30,000 文字) で切れて「この画像の指示」が無い (共通の決まりがとても長い構成) →
+    // 受付のときに効いていた構成 (その時刻までのいちばん新しい編集版・無ければ AI の構成) から番号で引く (Codex PR-F 名指し2 中)
+    if (!byNo) byNo = rolesAtRequest(db, im);
+    const hit = byNo.get(im.no);
+    if (hit) out.set(rid, hit);
   }
+  return out;
+}
+
+/** 受付のときに効いていた構成の、画像番号 → 役割と見出し (prompt から読めないときの代わり) */
+function rolesAtRequest(db, { compose_job_id: jobId, created_at: at } = {}) {
+  const out = new Map();
+  if (!jobId) return out;
+  const edit = db.prepare('SELECT output_text FROM ph_lp_compose_edits WHERE base_job_id = ? AND created_at <= ? ORDER BY id DESC LIMIT 1').get(jobId, at);
+  const text = edit ? edit.output_text : db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(jobId)?.output_text;
+  const r = text ? readComposition(text) : null;
+  if (r && r.ok) for (const sl of r.slots) out.set(sl.no, { role: sl.role || '', title: sl.title || '' });
   return out;
 }
 
@@ -116,7 +135,8 @@ export function designerSheetStateFor(db, draft, { lpState = null, canEdit = fal
   const m = materialOf(db, draft, lpState);
   const exists = !!(row && row.file_id);
   const blocked = designerSheetBlockReason({ configured: designerSheetConfigured(), folderId: folderIdOf(draft), job: m.job, cards: m.cards });
-  const unrevoked = exists ? sharesOutside(db, Number(draft.id), recordedFiles(db, Number(draft.id))).length : 0;
+  // 依頼書に載っていないのに公開したままの画像 (作成前でも数える = 作成が途中で止まった分 — Codex PR-F 名指し2 高)
+  const unrevoked = draft?.id ? sharesOutside(db, Number(draft.id), recordedFiles(db, Number(draft.id))).length : 0;
   return {
     can_edit: !!canEdit,
     exists,
@@ -202,7 +222,7 @@ export function explainShareError(e) {
  *    付けた直後に止まった・記録の書き込みで失敗した、でも次の回・外すときに「ポータルが付けた公開」と分かる
  *    (記録の無い公開 = 人が付けたもの、と見て外さないので、先に記録しないと外せない公開が残る)。
  * もう公開されていれば付けない。そのとき、ポータルの記録 (付けようとしていた行を含む) があればポータルのもの、無ければ人が付けたもの
- * @returns {Promise<number|null>}  この回で記録した行の ID (付けようとした = 失敗したら外す対象)。付けなかったら null
+ * @returns {Promise<number|null>}  この回で記録した行の ID。付けなかったら null
  */
 async function shareImage(db, drive, { draftId, fileId, imageId, actor }) {
   const opt = { timeout: GOOGLE_TIMEOUT_MS };
@@ -218,16 +238,13 @@ async function shareImage(db, drive, { draftId, fileId, imageId, actor }) {
   if (mine) db.prepare(`UPDATE ph_designer_sheet_shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoke_error = 'gone' WHERE id = ?`).run(mine.id);
   const sid = Number(db.prepare(`INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, NULL, ?, ?)`)
     .run(draftId, fileId, imageId, actor).lastInsertRowid);
-  try {
-    // allowFileDiscovery: false = 検索には出さない (リンクを知っている人だけ)。通知メールは anyone には送られない
-    const r = await drive.permissions.create({
-      fileId, supportsAllDrives: true, fields: 'id',
-      requestBody: { type: 'anyone', role: 'reader', allowFileDiscovery: false },
-    }, opt);
-    if (r?.data?.id) db.prepare('UPDATE ph_designer_sheet_shares SET permission_id = ? WHERE id = ?').run(String(r.data.id), sid);
-  } catch (e) {
-    throw Object.assign(e, { shareRowId: sid });
-  }
+  // allowFileDiscovery: false = 検索には出さない (リンクを知っている人だけ)。通知メールは anyone には送られない。
+  // 失敗しても付けようとしていた行は残す (付いたか分からない) — 呼び手が「記録の依頼書に載っていない公開」として外す
+  const r = await drive.permissions.create({
+    fileId, supportsAllDrives: true, fields: 'id',
+    requestBody: { type: 'anyone', role: 'reader', allowFileDiscovery: false },
+  }, opt);
+  if (r?.data?.id) db.prepare('UPDATE ph_designer_sheet_shares SET permission_id = ? WHERE id = ?').run(String(r.data.id), sid);
   return sid;
 }
 
@@ -268,6 +285,22 @@ const sharesOutside = (db, id, keep) => db.prepare('SELECT * FROM ph_designer_sh
   .all(id).filter((s) => !keep.has(s.drive_file_id));
 /** 記録してある依頼書に載っている画像のファイル (公開を残すもの) */
 const recordedFiles = (db, id) => new Set((safeJson(rowOf(db, id)?.images_json) || []).map((im) => String(im.drive_file_id)));
+
+/**
+ * 商品を消す前に、その商品の画像に付けた公開を全部外す (Codex PR-F 名指し2 高: 商品が消えると画面から外せなくなる)。
+ * 公開が無ければ Google に触らない。@returns {Promise<{ok: boolean, remaining: number, error?: string}>}
+ */
+export async function revokeAllDesignerShares(draftId, { db = getDB() } = {}) {
+  const id = Number(draftId);
+  const active = sharesOutside(db, id, new Set());
+  if (!active.length) return { ok: true, remaining: 0 };
+  let clients = null;
+  try { clients = makeClients(); } catch (_) { clients = null; }
+  if (!clients) return { ok: false, remaining: active.length, error: 'Google のサービスアカウントが使えないので、デザイナー修正依頼書のために公開した画像の公開を外せません' };
+  await revokeShares(db, clients.drive, active);
+  const remaining = sharesOutside(db, id, new Set()).length;
+  return remaining ? { ok: false, remaining, error: `デザイナー修正依頼書のために公開した画像 ${remaining} 枚の公開を外せませんでした (少し待ってからもう一度押してください)` } : { ok: true, remaining: 0 };
+}
 
 // ─── 作る / 作り直す ─────────
 
@@ -326,20 +359,16 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
   const keepFiles = new Set(images.map((im) => String(im.drive_file_id)));
 
   // 1. 画像を公開する (依頼書を作る前。断られたら依頼書を作らない = 中途半端なシートを残さない)
-  const sharedNow = [];
   try {
     for (const im of images) {
-      const sid = await shareImage(db, clients.drive, { draftId: id, fileId: im.drive_file_id, imageId: im.current_id, actor });
-      if (sid) sharedNow.push(sid);
+      await shareImage(db, clients.drive, { draftId: id, fileId: im.drive_file_id, imageId: im.current_id, actor });
       // 1 枚ごとに印の期限を延ばす (8 枚 × Google の待ちで 3 分を超えても、別の処理に印を取られない — Codex PR-F 名指し1 中)
       assertLease(db, id, token);
     }
   } catch (e) {
-    if (e?.shareRowId) sharedNow.push(e.shareRowId);
-    // この回で付けた (付けようとした) 公開のうち、記録してある依頼書に載っていないものは外す (作らなかった依頼書のために公開したままにしない)
-    const keep = recordedFiles(db, id);
-    const undo = sharedNow.length ? db.prepare(`SELECT * FROM ph_designer_sheet_shares WHERE id IN (${sharedNow.map(() => '?').join(',')})`).all(...sharedNow).filter((s) => !keep.has(s.drive_file_id)) : [];
-    await revokeShares(db, clients.drive, undo);
+    // 記録してある依頼書に載っていない公開は全部外す (作らなかった依頼書のために公開したままにしない)。
+    // この回のものに限らない — 前の回が公開した直後に止まった分も、ここで片付く (Codex PR-F 名指し2 高)
+    await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)));
     if (e?.code === 'designer_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     const reason = explainShareError(e);
     try { logEvent(db, id, 'designer_sheet_failed', reason.slice(0, 500), actor); } catch (_) { /* 記録の失敗で結果を変えない */ }
@@ -367,7 +396,8 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
     // 3. 人が書いた修正指示を読み戻す (作ったばかりなら無い)。読めない形 (見出しを消した) なら上書きしない
     let previous = null;
     if (!created) {
-      const cur = await readOwnedTabValues(clients, { spreadsheetId: fileId, name: DESIGNER_TAB, render: 'FORMULA' });
+      // 範囲はタブ全体 (A1:Z2000 のように区切ると、その外へ動かした修正指示を「無い」と見て消す — Codex PR-F 名指し2 高)
+      const cur = await readOwnedTabValues(clients, { spreadsheetId: fileId, name: DESIGNER_TAB, render: 'FORMULA', range: null });
       if (cur.exists && cur.owned) {
         const files = rootOfFileMap(db, id);
         const back = readBackNotes(cur.values, { rootOfFile: (fid) => files.get(String(fid)) ?? null });
@@ -386,12 +416,8 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
       onWritten: () => { wrote = true; },
     });
   } catch (e) {
-    // 書く前に止まったら、この回で付けた公開のうち、記録してある依頼書に載っていないものは外す
-    if (!wrote) {
-      const keep = recordedFiles(db, id);
-      const undo = sharedNow.length ? db.prepare(`SELECT * FROM ph_designer_sheet_shares WHERE id IN (${sharedNow.map(() => '?').join(',')})`).all(...sharedNow).filter((s) => !keep.has(s.drive_file_id)) : [];
-      await revokeShares(db, clients.drive, undo);
-    }
+    // 書く前に止まったら、記録してある依頼書に載っていない公開は外す (書いた後なら、シートが新しい画像を出しているので外さない)
+    if (!wrote) await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)));
     if (e?.code === 'designer_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     if (e?.code === 'unreadable') return { ok: false, status: 409, code: 'unreadable', error: e.message };
     const reason = explainGoogleError(e);

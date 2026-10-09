@@ -6701,8 +6701,9 @@ th.attr-unknown { color: #dc2626; }
       updateLabel: busy ? '作り直しています…' : (st.stale ? '最新の画像で作り直す' : '作り直す'),
       updateDisabled: !st.can_edit || !!st.blocked || !!busy,
       updateTitle: reason || '最新の画像でシートを書き直します (書いた修正指示は同じ画像の行に残ります)',
-      // 押せない理由は、押すボタンがあるときだけ出す (作成済みで最新なら何も出さない)
-      reason: (!exists || st.stale) ? reason : '',
+      // 押せない理由は、押すボタンがあるときだけ出す (作成済みで最新なら何も出さない)。
+      // 作成前に公開したままの画像 (作成が途中で止まった) があれば知らせる (作成を押すと片付く)
+      reason: [(!exists || st.stale) ? reason : '', !exists && Number(st.unrevoked) > 0 ? '前の作成が途中で止まり、公開 (リンクを知っている人は閲覧可) したままの画像が ' + Number(st.unrevoked) + ' 枚あります。作成を押すと片付けます' : ''].filter(Boolean).join('\n'),
     };
   }
   /**
@@ -6750,7 +6751,7 @@ th.attr-unknown { color: #dc2626; }
       if (busy || !st) return;
       const wasExisting = !!st.exists;
       busy = true;
-      msg = wasExisting ? '作り直しています… (10〜30 秒かかります。終わるまでシートの修正指示は書かないでください)' : '作成しています… (10〜30 秒かかります)';
+      msg = wasExisting ? '作り直しています… (10〜30 秒かかります。終わるまでシートを触らないでください)' : '作成しています… (10〜30 秒かかります)';
       render();
       let r = null;
       // 画面が見ていた依頼書と画像の並びを添える (別のタブ・ほかの人が先に作った / 画像を作り直した後の古い画面ならサーバが止める)

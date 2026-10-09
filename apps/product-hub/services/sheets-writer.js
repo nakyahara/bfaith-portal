@@ -308,8 +308,10 @@ export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, rang
   const owned = (tab.developerMetadata || []).some((m) => m && m.metadataKey === OWNED_TAB_KEY);
   if (!owned) return { exists: true, owned: false, values: null };
   // タブ名は自分で決めた名前 (引用符を含まない) なので、そのまま範囲に入れる
+  const tabRef = `'${String(name).replace(/'/g, "''")}'`;
   const r = await sheets.spreadsheets.values.get({
-    spreadsheetId, range: `'${String(name).replace(/'/g, "''")}'!${range}`, valueRenderOption: render === 'FORMULA' ? 'FORMULA' : 'FORMATTED_VALUE', majorDimension: 'ROWS',
+    // range: null = タブ全体 (使っている範囲を全部返す)
+    spreadsheetId, range: range ? `${tabRef}!${range}` : tabRef, valueRenderOption: render === 'FORMULA' ? 'FORMULA' : 'FORMATTED_VALUE', majorDimension: 'ROWS',
   }, opt);
   return { exists: true, owned: true, values: Array.isArray(r?.data?.values) ? r.data.values : [] };
 }

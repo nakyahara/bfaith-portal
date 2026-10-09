@@ -155,6 +155,12 @@ export function readBackNotes(values, { rootOfFile = null } = {}) {
     return { ok: true, byKey, orphans, layout: null };
   }
   const head = rows[headerIdx];
+  // 見出しが 2 つある列 (人が同じ名前の列を足した) は、どちらが本物か分からない → 上書きしない (Codex PR-F 名指し2 高)
+  const dup = [(c) => c === H_NOTE, (c) => c.startsWith(H_KEY_PREFIX), (c) => c === H_IMAGE, (c) => c === H_VERSION]
+    .find((pred) => head.filter((c) => pred(c.trim())).length > 1);
+  if (dup) {
+    return { ok: false, error: `デザイナー修正依頼書の見出しの行に、同じ名前の列が 2 つあります (「${H_NOTE}」「${H_KEY_PREFIX}」「${H_IMAGE}」「${H_VERSION}」は 1 つずつ)。書いた内容を消さないため、作り直していません。足した列の見出しの名前を変えてから押してください` };
+  }
   const col = (pred, fallback) => { const i = head.findIndex((c) => pred(c.trim())); return i >= 0 ? i : fallback; };
   const noteCol = col((c) => c === H_NOTE, -1);
   const keyCol = col((c) => c.startsWith(H_KEY_PREFIX), -1);

@@ -108,6 +108,9 @@ const IMG = (root, cur, no, ver = 1, extra = {}) => ({ root_id: root, current_id
   const noHead = vals.filter((_, i) => i !== 2);
   back = ds.readBackNotes(noHead);
   ok(!back.ok && /見出しの行が見つかりません/.test(back.error), '🚨 見出しの行が無い (どこが修正指示か分からない) シートは読めない = 上書きしない');
+  const dupHead = vals.map((r, i) => (i === 2 ? [r[0], r[1], '修正指示', ...r.slice(2)] : [r[0], r[1], '', ...r.slice(2)]));
+  back = ds.readBackNotes(dupHead);
+  ok(!back.ok && /同じ名前の列が 2 つ/.test(back.error), '🚨 「修正指示」の見出しが 2 つ (人が同じ名前の列を足した) なら、どちらが本物か分からないので上書きしない (Codex 名指し2 高)');
   ok(ds.readBackNotes([]).ok && ds.readBackNotes(null).ok && ds.readBackNotes([['', '']]).ok, '空のタブ・タブなしは読める (戻すものなし)');
 
   // 管理番号と画像の照らし合わせ (読み戻しは FORMULA = 画像の列は式そのもの)
@@ -298,13 +301,18 @@ const fakeSheets = { spreadsheets: {
     get: async (p) => {
       await hit('vget', p);
       const f = fileOrThrow(p.spreadsheetId);
-      const title = /^'(.+)'!/.exec(p.range)?.[1];
+      const title = /^'(.+?)'(?:!|$)/.exec(p.range)?.[1];
+      g.lastRange = p.range;
+      const box = /!([A-Z]+)(\d+):([A-Z]+)(\d+)$/.exec(p.range);
+      const colNo = (a) => [...a].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0);
+      const lim = box ? { r0: Number(box[2]) - 1, r1: Number(box[4]), c0: colNo(box[1]) - 1, c1: colNo(box[3]) } : null;
       const t = f.tabs.find((x) => x.title === title);
       if (!t) throw gErr(400, 'Unable to parse range: ' + p.range);
       // 本物と同じく、後ろの空のセル・空の行は返さない
       // FORMULA なら式のセルは式そのもの (本物と同じ)
       const asFormula = p.valueRenderOption === 'FORMULA';
-      const rows = t.values.map((r, ri) => { const a = r.map((v, ci) => (asFormula && t.formulas[ri]?.[ci] != null ? t.formulas[ri][ci] : v)); while (a.length && a[a.length - 1] === '') a.pop(); return a; });
+      const rows = t.values.map((r, ri) => { const a = r.map((v, ci) => (asFormula && t.formulas[ri]?.[ci] != null ? t.formulas[ri][ci] : v)); while (a.length && a[a.length - 1] === '') a.pop(); return a; })
+        .map((a, ri) => (lim ? (ri >= lim.r0 && ri < lim.r1 ? a.slice(lim.c0, lim.c1) : []) : a));
       while (rows.length && rows[rows.length - 1].length === 0) rows.pop();
       return { data: { values: rows } };
     },
@@ -532,6 +540,26 @@ const A = makeComposed({ code: 'maitakep50' });
     humanWrites(F.id, `img-${cards2[1].root_id}`, 'ロゴを右上に\n背景をもう少し明るく');
     humanWrites(F.id, `img-${cards2[2].root_id}`, '');
   }
+  // 人が左に 26 列を足して、全部が AA 列より右へ動いた → タブ全体を読むので、修正指示は残る (A1:Z2000 で読むと空に見えて消していた)
+  {
+    const tW = tabOf(F.id);
+    tW.values = tW.values.map((r) => [...Array(26).fill(''), ...r]);
+    tW.formulas = tW.formulas.map((r) => [...Array(26).fill(null), ...r]);
+    const rjW = regen(A, cardsOf(A)[1].head_id); finishJob(rjW);
+    const rW = await press(A);
+    ok(rW.status === 200 && g.lastRange === `'${ds.DESIGNER_TAB}'` && noteOfKey(F.id, `img-${cards2[0].root_id}`)?.note === 'TOP の文字を大きく' && noteOfKey(F.id, `img-${cards2[1].root_id}`)?.note === 'ロゴを右上に\n背景をもう少し明るく',
+      '🚨 読み戻しはタブ全体 (範囲で区切らない) — 列を足して右へ動いた修正指示も読んで残す (Codex 名指し2 高)', JSON.stringify([rW.json, g.lastRange]));
+  }
+  // prompt が上限で切れて「この画像の指示」が無い → 受付のときの構成から役割を引く
+  {
+    const rootTop = cardsOf(A)[0].root_id;
+    const keepPrompt = db.prepare('SELECT prompt FROM ph_lp_images WHERE id = ?').get(rootTop).prompt;
+    db.prepare('UPDATE ph_lp_images SET prompt = ? WHERE id = ?').run(keepPrompt.slice(0, keepPrompt.indexOf('【この画像の指示')), rootTop);
+    const rjP = regen(A, cardsOf(A)[0].head_id); finishJob(rjP);
+    const rP = await press(A);
+    ok(rP.status === 200 && tabOf(F.id).values[3][0] === '0枚目 (TOP)｜楽天検索結果用TOP画像／商品認識', 'prompt が切れていても、受付のときの構成から役割を引く (Codex 名指し2 中)', tabOf(F.id).values[3][0]);
+    db.prepare('UPDATE ph_lp_images SET prompt = ? WHERE id = ?').run(keepPrompt, rootTop);
+  }
   // 全部作り直す (別の画像になる) → 修正指示は下に残す
   const j2 = fullJob(A);
   st = stateNow(A);
@@ -557,6 +585,18 @@ const A = makeComposed({ code: 'maitakep50' });
   ok(!publicFiles().includes(newV2), '🚨 書かなかったときは、この回で付けた公開を外す (依頼書に載らない画像を公開したままにしない)');
   tabOf(F.id).values = JSON.parse(keepVals);
 
+  // 人が「修正指示」の列をもう 1 つ足した → 上書きしない
+  {
+    const tD = tabOf(F.id);
+    const hi = tD.values.findIndex((x) => x.includes('修正指示'));
+    const keepD = JSON.stringify([tD.values, tD.formulas]);
+    tD.values = tD.values.map((x, i) => [...x.slice(0, 2), i === hi ? '修正指示' : '', ...x.slice(2)]);
+    tD.formulas = tD.formulas.map((x) => [...x.slice(0, 2), null, ...x.slice(2)]);
+    const bD = g.batches;
+    const rD = await press(A);
+    ok(rD.status === 409 && rD.json.code === 'unreadable' && g.batches === bD, '🚨 (本番の経路) 「修正指示」の列が 2 つあれば上書きしない');
+    [tD.values, tD.formulas] = JSON.parse(keepD);
+  }
   // 人が同じ名前のタブを作った (印なし) → 上書きしない
   const ownTab = tabOf(F.id);
   ownTab.meta = [];
@@ -658,6 +698,36 @@ console.log('③ 共有ドライブの設定でリンク共有ができない');
   const pcDuring = g.log.filter((x) => x === 'plist').length - nPC;
   db.prepare('UPDATE ph_designer_sheets SET lease_token = NULL, lease_until = NULL WHERE draft_id = ?').run(B.id);
   ok(r.status === 409 && /時間がかかりすぎた/.test(r.json.error) && g.batches === bP && !publicFiles().includes(f6) && pcDuring === 1, '🚨 公開の途中で印を別の処理に取られたら、残りの画像は公開せずに止める (1 枚ごとに印を確かめる・付けた公開は外す・書かない)', JSON.stringify(r.json));
+}
+
+{
+  const E = makeComposed();
+  finishJob(fullJob(E));
+  const fe = cardsOf(E).map((c) => c.current.drive_file_id);
+  // 前の回: 1 枚目を公開して記録した直後にプロセスが止まった (依頼書は無い)
+  g.files.get(fe[0]).perms.push({ id: 'anyoneWithLink', type: 'anyone', role: 'reader' });
+  db.prepare('INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, ?, NULL, ?)').run(E.id, fe[0], 'anyoneWithLink', 't');
+  const stE = stateNow(E);
+  ok(stE.exists === false && stE.unrevoked === 1, '🚨 作成前でも、公開したままの画像 (作成が途中で止まった) を数える (Codex 名指し2 高)');
+  // 今回は 2 枚目で断られる → 前の回の 1 枚目も含めて片付ける
+  g.fail.pcreate = { err: gErr(403, 'Sharing outside the shared drive is not allowed', 'teamDriveDomainUsersOnlyRestriction'), when: (q) => q.fileId === fe[1], once: true };
+  let rE = await press(E);
+  ok(rE.status === 409 && rE.json.code === 'share_blocked' && !fe.some((f) => publicFiles().includes(f)) && stateNow(E).unrevoked === 0,
+    '🚨 作れなかったときは、記録の依頼書に載っていない公開を全部外す (前の回が残した分も)', JSON.stringify(publicFiles().filter((f) => fe.includes(f))));
+  // 商品を消す: 公開を外してから消す。外せなければ消さない
+  rE = await press(E);
+  ok(rE.status === 200 && fe.every((f) => publicFiles().includes(f)), '(前提) 依頼書ができて 3 枚公開');
+  db.prepare('UPDATE product_drafts SET source = ? WHERE id = ?').run(dbmod.SOURCE_NOTION_IMPORT, E.id);
+  g.fail.pdelete = { err: gErr(500, 'Backend Error'), once: true };
+  let del = await post(`/api/drafts/${E.id}/delete`, {});
+  ok(del.status === 409 && /公開を外せませんでした/.test(del.json.error) && db.prepare('SELECT id FROM product_drafts WHERE id = ?').get(E.id), '🚨 商品を消す前に公開を外す — 外せなければ消さない (Codex 名指し2 高)', JSON.stringify(del));
+  del = await post(`/api/drafts/${E.id}/delete`, {});
+  ok(del.status === 200 && !fe.some((f) => publicFiles().includes(f)) && !db.prepare('SELECT id FROM product_drafts WHERE id = ?').get(E.id) && sharesOf(E).every((x) => x.revoked_at),
+    '公開を外せたら商品を消す (公開の記録は残す)');
+  const noShare = db.prepare(`INSERT INTO product_drafts (ne_code, name, source, created_by) VALUES ('DS-DEL', 'x', ?, 't')`).run(dbmod.SOURCE_NOTION_IMPORT).lastInsertRowid;
+  const nLog = g.log.length;
+  del = await post(`/api/drafts/${noShare}/delete`, {});
+  ok(del.status === 200 && g.log.length === nLog, '公開が無い商品は Google に触らずに消す (今までどおり)');
 }
 
 console.log('④ 二重押し・2 人同時・待っている間の変化');
