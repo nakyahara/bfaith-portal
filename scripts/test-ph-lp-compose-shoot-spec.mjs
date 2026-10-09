@@ -536,11 +536,26 @@ console.log('⑧ 撮影指示書 (PR-D) — 仕様書の形 (v2) なら AI の�
   for (const mode of ['photographer', null]) {
     setMode(dV2, mode);
     const mm = svcMod.shootSheetCutsFor(db, dV2);
-    ok(/撮影判定を AI のおすすめと違う区分/.test(mm.summary.send_targets) && !mm.summary.conclusion
-      && mm.cuts.length === 1 && mm.cuts[0].content === '玄関でスプレーする手元' && mm.cuts[0].target === '',
-    `撮影判定が ${mode} (AI は社内撮影): 概要は要確認・カットは構成からの拾い方 (LP に無いカットや撮影対象は載せない) (${JSON.stringify(mm.cuts.map((x) => x.content))})`);
+    // この構成の使用素材には「撮影」が無いので、本文から拾い直すとカットは 0 (AI のカット・LP に無いカットは載せない)
+    ok(/撮影判定を AI のおすすめと違う区分/.test(mm.summary.send_targets) && !mm.summary.conclusion && mm.cuts.length === 0,
+      `撮影判定が ${mode} (AI は社内撮影): 概要は要確認・AI のカットは使わず構成の本文から拾い直す (${JSON.stringify(mm.cuts.map((x) => x.content))})`);
   }
   setMode(dV2, 'inhouse');
+  {
+    // 🚨 AI が「追加撮影不要」→ 人が「社内撮影」: AI の要撮影 (全部 false) ではなく、構成の本文 (使用素材の「撮影」) から拾う (Codex PR-C2 base 8 P1)
+    const OUT2 = OUT.replace(/## 使用素材\n提供された実物商品画像(?![\s\S]*## 使用素材)/, '## 使用素材\n撮影: 玄関の手元');
+    ok(OUT2 !== OUT, '前提: 2枚目の使用素材に「撮影」を書いた構成');
+    const dN = mkDraft();
+    const rN = reserveFor(dN);
+    const resN = lp.submitResult(db, rN.gid, { packetHash: rN.packetHash, verdict: 'accepted', output: OUT2, lint: { ok: true }, reviewRounds: 1, shoot: noneV2() });
+    matchModel(rN.run);
+    ok(resN.ok && resN.shoot.status === 'saved', `前提: AI は追加撮影不要 (${resN.error || JSON.stringify(resN.shoot)})`);
+    setMode(dN, 'inhouse');
+    const mN = svcMod.shootSheetCutsFor(db, dN);
+    eq(mN.cuts.map((x) => x.content), ['玄関の手元'], '人が社内撮影にしたら、構成の本文の「撮影」から拾ったカットが撮影指示書に載る (0 カットにしない)');
+    setMode(dN, 'none');
+    ok(/要確認/.test(svcMod.shootSheetCutsFor(db, dN).summary.send_targets) === false, 'AI と同じ「撮影不要」なら概要は AI のまま (撮影指示書は作れないが)');
+  }
   const dE = mkDraft();
   setMode(dE, 'inhouse');
   const rE = reserveFor(dE);

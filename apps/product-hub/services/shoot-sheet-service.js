@@ -82,18 +82,21 @@ export function shootSheetCutsFor(db, draft) {
   const v2 = sameJob && judge.format === 2;
   // AI のカット・概要をそのまま使えないとき (Codex PR-C2 名指し4・6 M):
   //   - 人が撮影判定を AI のおすすめと違う区分にした (社内撮影 ↔ カメラマン撮影 など。カット数・送付対象は区分ごとに決まる)
-  //     → 概要は要確認・カットは構成からの拾い方 (v1 と同じ対応づけ)
+  //     → 概要は要確認・カットは構成の本文から拾う (使用素材の「撮影」・AI の判定が無いときと同じ)
   //   - 編集版はあるが要撮影 (slots_json) が読めない (元の画像の uid で AI のカットを引けない) → 同上
   //   - 人が編集版で要撮影を変えた (概要は AI が要撮影とした画像のためのもの) → 概要だけ要確認 (カットは画像ごとに引けるので AI のまま)
   const shootMode = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.shoot_mode ?? null;
   const modeChanged = v2 && shootMode !== judge.recommended;
   const editBroken = !!eff.edit && !hasEditShoot;
   const aiCuts = v2 && !modeChanged && !editBroken ? judge.cuts : null;
+  // 🚨 使わないときは AI の要撮影 (images) も使わない — 構成の本文 (使用素材の「撮影」) から拾い直す (Codex PR-C2 base 8 P1:
+  //    AI が「撮影不要」とした後に人が社内撮影にすると、AI の needs_shoot が全部 false のままでカットが 0 になった)
+  const aiImagesForCuts = v2 && (modeChanged || editBroken) ? null : aiImages;
   const summary = !v2 ? {}
     : modeChanged ? { ...SUMMARY_MODE_CHANGED }
       : (editBroken || !aiSummaryStillValid({ slots: eff.slots, hasEditShoot, aiImages })) ? { ...SUMMARY_NEEDS_REVIEW }
         : { ...judge.summary };
-  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages, aiCuts }), summary, source: 'lp', composeJobId: eff.job.id, editId };
+  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages: aiImagesForCuts, aiCuts }), summary, source: 'lp', composeJobId: eff.job.id, editId };
 }
 
 const folderIdOf = (draft) => {
