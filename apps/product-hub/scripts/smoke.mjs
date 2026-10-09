@@ -7097,6 +7097,19 @@ let wfSetParentId = null;
       r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: '', camera_instruction_url_expected: 5 });
       check('撮影指示書: camera_instruction_url_expected が文字でなければ 400', r.status === 400);
 
+      // 🚨 書いた後に記録できなかった (ここでは記録のときに商品名が変わった) → 商品名を元に戻しても (ABA)「更新が要る」を出す (名指し7 M)
+      {
+        const nameNow = db.prepare('SELECT name FROM product_drafts WHERE id = ?').get(idS).name;
+        g.onBatch = () => db.prepare('UPDATE product_drafts SET name = ? WHERE id = ?').run(nameNow + ' 改', idS);
+        r = await sheetCall();
+        db.prepare('UPDATE product_drafts SET name = ? WHERE id = ?').run(nameNow, idS);
+        const pgA = await pageOf();
+        check('🚨 撮影指示書: 書いた後に記録できなかったら、材料が元に戻っても「更新が要る」を出し続ける',
+          r.status === 409 && !!ipS().shoot_sheet_writing_at && pgA.includes('id="shoot-sheet-stale"'), JSON.stringify([r, ipS().shoot_sheet_writing_at]));
+        r = await sheetCall();
+        check('撮影指示書: 更新して記録できたら「更新が要る」は消える', r.status === 200 && ipS().shoot_sheet_writing_at == null && !(await pageOf()).includes('id="shoot-sheet-stale"'));
+      }
+
       // 作っている最中の印 (DB): ほかのプロセスが作っている間は 409・期限切れの印は取り直せる
       db.prepare('UPDATE draft_image_production SET shoot_sheet_lease_token = ?, shoot_sheet_lease_until = ? WHERE draft_id = ?').run('other-proc', new Date(Date.now() + 60_000).toISOString(), idS);
       r = await sheetCall();

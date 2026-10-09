@@ -2077,6 +2077,9 @@ export function initProductHubDB() {
     ['shoot_sheet_by', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_by TEXT'],
     ['shoot_sheet_lease_token', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_lease_token TEXT'],
     ['shoot_sheet_lease_until', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_lease_until TEXT'],
+    // writing_at … Google に送る直前に立て、記録できたときだけ下ろす。立ったままなら、シートの中身と記録 (hash) が
+    //   食い違っているかもしれないので画面は「更新が要る」を出す (書いた後に止まった・競合で記録しなかった — Codex PR-D 名指し7 M)
+    ['shoot_sheet_writing_at', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_writing_at TEXT'],
   ];
   for (const [col, sql] of ipAlters) {
     if (ipCols.has(col)) continue;
@@ -2856,6 +2859,11 @@ export function assertShootSheetLease(db, draftId, token, { ms = 180_000, now = 
   }
 }
 
+/** Google に送る直前に「書いている」を立てる (記録できたときだけ recordShootSheet が下ろす) */
+export function markShootSheetWriting(db, draftId) {
+  db.prepare(`UPDATE draft_image_production SET shoot_sheet_writing_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE draft_id = ?`).run(Number(draftId));
+}
+
 /** 印を返す (自分の token のときだけ) */
 export function releaseShootSheetLease(db, draftId, token) {
   db.prepare(`UPDATE draft_image_production SET shoot_sheet_lease_token = NULL, shoot_sheet_lease_until = NULL
@@ -2884,7 +2892,7 @@ export function recordShootSheet(db, draftId, { url, fileId, hash, source, actor
     db.prepare(`
       UPDATE draft_image_production
       SET camera_instruction_url = ?, shoot_sheet_file_id = ?, shoot_sheet_hash = ?, shoot_sheet_source = ?,
-          shoot_sheet_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), shoot_sheet_by = ?,
+          shoot_sheet_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), shoot_sheet_by = ?, shoot_sheet_writing_at = NULL,
           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE draft_id = ?
     `).run(url, fileId, hash, source, actor, id);

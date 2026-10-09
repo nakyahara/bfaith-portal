@@ -17,7 +17,7 @@
  */
 import {
   getDB, logEvent, recordShootSheet, getShootMention, shootSheetRevision, assertShootSheetRevision,
-  acquireShootSheetLease, releaseShootSheetLease, assertShootSheetLease,
+  acquireShootSheetLease, releaseShootSheetLease, assertShootSheetLease, markShootSheetWriting,
 } from '../db.js';
 import { parseDriveLink } from '../lib/drive-link.js';
 import { effectiveCompose } from '../lib/lp-edit.js';
@@ -97,8 +97,9 @@ export function shootSheetStateFor(db, draft, ip) {
   let source = 'none';
   try { ({ cuts, source } = shootSheetCutsFor(db, draft)); } catch (e) { console.error('[product-hub] 撮影指示書の材料:', e?.message || e); }
   // 材料が変わったか: LP構成から作ったものだけ比べる (API で渡されたカットで作ったものは比べようがない)
-  const stale = ours && ip?.shoot_sheet_source === 'auto' && !!SHOOT_SHEET_MODES[shootMode]
-    && ip?.shoot_sheet_hash !== shootSheetMaterialHash(materialOf(draft, shootMode, cuts));
+  // 書いた後に記録できなかった (writing_at が立ったまま) ときも出す — 中身と記録の hash が食い違っているかもしれない
+  const stale = ours && !!SHOOT_SHEET_MODES[shootMode]
+    && (!!ip?.shoot_sheet_writing_at || (ip?.shoot_sheet_source === 'auto' && ip?.shoot_sheet_hash !== shootSheetMaterialHash(materialOf(draft, shootMode, cuts))));
   return {
     ours, url: ours ? url : null, fileId: ours ? fileId : null, manualUrl: !ours && url ? url : null,
     at: ours ? ip?.shoot_sheet_at || null : null, by: ours ? ip?.shoot_sheet_by || null : null,
@@ -227,6 +228,7 @@ async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, 
           { code: 'recovered_file', fileId });
         }
         stillSame();
+        markShootSheetWriting(db, id);
       },
       // 自分が作るタブのうち今回は要らないもの (カメラマン撮影 → 社内撮影 にしたときの「依頼文」)。印のあるタブだけ消える
       removeTabs: MANAGED_SHEETS.filter((n) => !built.sheets.some((t) => t.name === n)),
