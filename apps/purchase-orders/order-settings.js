@@ -12,7 +12,10 @@
  *
  * 先に読んだ値の確かめ (seen): 画面を開いたときの updated_at (行が無かった = null) を送る。その間にほかの人が直していたら 409 stale (何も書かない)。
  *   発注画面のグループの紐付け (一部の列だけ直す) は seen.fields = 画面が見ていた列の値で確かめる。
- *   新商品の登録の 2 つめの書き込み (Company DB の登録が通った後) だけは 'overwrite' (新しいコード = 前の値は無い・同じ request_id のやり直しは同じ値の上書き)。
+ *   新商品の登録の 2 つめの書き込み (Company DB の登録が通った後) = writeRegistrationOrderSettings: 「行がまだ無い」(updated_at null) を確かめ、
+ *   ② の完了を request_id + 商品で po_order_settings_requests に 1 回だけ記録する。同じ request_id のやり直し = 前の結果を返すだけ
+ *   (その後に直した値を戻さない・Codex #1674 R1 High 1)。ほかの画面がもう行を作っていた = 409 (① 成功・② 失敗の知らせ)。
+ *   印を見ない書き込みは無い ('validate-only' は確かめ (dry-run) だけ)。
  * 1 回の書き込み = 1 つの即時の取引 (BEGIN IMMEDIATE): 新しいグループを作る → 商品の行 → 記録。途中で断ったら何も残らない。
  *
  * 発注ロット (order_lot) = 発注のすすめる数をこの数の倍数にそろえる数 (logic.js computeProduct の N)。
@@ -20,7 +23,8 @@
  *   po_settings.order_lot_source は 'ne' (今までどおり NE の値)。写したら 'app' = 発注アプリの order_lot だけを見る (NE の値は使わない)。
  */
 import { getDB, normSupplierCode, normProductCode } from './db.js';
-import { audit, getSetting } from './ledger.js';
+import { createHash } from 'crypto';
+import { audit, getSetting, stableStringify } from './ledger.js';
 
 /** 商品ごとの列 (po_product_attrs) */
 export const ATTR_FIELDS = Object.freeze(['order_lot', 'condition_id', 'material_group_id', 'capacity_per_unit', 'case_group', 'case_lot']);
@@ -188,10 +192,13 @@ function staleError(what, cur) {
 }
 const seenRequired = () => new OrderSettingsError(428, 'seen_required', '画面を開いたときの値 (seen) がありません。画面を開き直してから保存してください (ほかの人の変更を上書きしないため)');
 
-/** seen = { updated_at: 文字 | null (行が無かった) } / { fields: { 列: 値 } } / 'overwrite' (新商品の登録だけ) */
-function checkSeen(seen, cur, what, { allowOverwrite = false } = {}) {
-  if (seen === 'overwrite') {
-    if (!allowOverwrite) throw seenRequired();
+/**
+ * seen = { updated_at: 文字 | null (行が無かった) } / { fields: { 列: 値 } } / 'validate-only' (確かめ (dry-run) だけ・書かない)。
+ * fields = 1 件以上・変える列 (patchKeys) は全部 fields に要る (空の fields や別の列だけで通さない・Codex #1674 R1 Medium 1)
+ */
+function checkSeen(seen, cur, what, { patchKeys = [], dryRun = false } = {}) {
+  if (seen === 'validate-only') {
+    if (!dryRun) throw seenRequired();
     return;
   }
   if (!seen || typeof seen !== 'object' || Array.isArray(seen)) throw seenRequired();
@@ -202,6 +209,10 @@ function checkSeen(seen, cur, what, { allowOverwrite = false } = {}) {
     return;
   }
   if (seen.fields && typeof seen.fields === 'object' && !Array.isArray(seen.fields)) {
+    if (!Object.keys(seen.fields).length) throw bad('seen.fields が空です (変える列を画面が見ていた値で送ってください)', 'seen');
+    for (const k of patchKeys) {
+      if (!Object.hasOwn(seen.fields, k)) throw bad(`seen.fields に「${k}」がありません (変える列は全部、画面が見ていた値を送ってください)`, 'seen');
+    }
     for (const [k, v] of Object.entries(seen.fields)) {
       if (!ATTR_FIELDS.includes(k)) throw bad(`seen の「${k}」は発注の設定の項目ではありません`, 'seen');
       if (!sameVal(cur ? cur[k] : null, v)) throw staleError(what, cur);
@@ -238,7 +249,7 @@ function actorOf(input) {
  *   patch: { order_lot?, condition_id?, material_group_id?, capacity_per_unit?, case_group?, case_lot? } (本文に無い列は今のまま),
  *   newCondition?: { condition_id, display_name, condition_type, unit, condition_value, maker_name? } (作ってからその ID を選ぶ),
  *   newMaterial?: { group_id, name, min_order_qty?, unit? },
- *   seen: { updated_at } | { fields } | 'overwrite' (新商品の登録だけ),
+ *   seen: { updated_at } | { fields } | 'validate-only' (dry-run だけ),
  *   supplierCode?: 代表の仕入先 (マスタの入力から = 渡す。発注条件グループはこの仕入先のものだけ選べる・新しく作るグループの仕入先) / undefined = 確かめない (発注アプリの画面),
  *   actor, actorType?, via ('po-admin' | 'po-bind' | 'master-edit:new' | 'master-edit:sku'), requestId?,
  * }
@@ -246,6 +257,21 @@ function actorOf(input) {
  * 戻り値 = { ok: true, changed, row (書いた後の行 | null), created: { condition, material }, dryRun? }
  */
 export function writeOrderSettings(input, { dryRun = false } = {}) {
+  const { db, run } = buildWrite(input, { dryRun });
+  if (!dryRun) return db.transaction(run).immediate();
+  // 確かめだけ = 同じ取引で全部やってから巻き戻す (確かめの決まりが書き込みとずれない)
+  const DRY = 'po-order-settings-dry-run';
+  try {
+    db.transaction(() => { const out = run(); const e = new Error(DRY); e.dry = out; throw e; }).immediate();
+  } catch (e) {
+    if (e && e.message === DRY && e.dry) return { ...e.dry, dryRun: true };
+    throw e;
+  }
+  throw new Error('unreachable');
+}
+
+/** 形を確かめて、取引の中で走らせる関数を作る (writeOrderSettings と writeRegistrationOrderSettings が同じものを使う) */
+function buildWrite(input, { dryRun = false } = {}) {
   const who = actorOf(input || {});
   const code = textIn(input.code, { label: '商品コード', field: 'code', max: 60 });
   if (!code) throw bad('商品コードがありません', 'code');
@@ -258,12 +284,12 @@ export function writeOrderSettings(input, { dryRun = false } = {}) {
   const checkSupplier = input.supplierCode !== undefined;
   const supplier = checkSupplier ? normSupplierCode(input.supplierCode) : null;
   if (newCondition && checkSupplier && !supplier) throw bad('代表の仕入先が無いので、発注条件グループを作れません (先に代表の仕入先を)', 'new_condition');
-  const allowOverwrite = who.via === 'master-edit:new';
+  const patchKeys = Object.keys(patch);
 
   const db = getDB();
   const run = () => {
     const cur = attrsRow(db, key);
-    checkSeen(input.seen, cur, `この商品 (${code}) の発注の設定`, { allowOverwrite });
+    checkSeen(input.seen, cur, `この商品 (${code}) の発注の設定`, { patchKeys, dryRun });
     const created = { condition: false, material: false };
     // 1. 新しいグループ (同じ中身が既にある = 前の同じ登録のやり直し = 作らずにそれを使う。中身が違う = 409)
     if (newCondition) {
@@ -329,16 +355,44 @@ export function writeOrderSettings(input, { dryRun = false } = {}) {
       detail: { via: who.via, code, before, after: pickAttrs(merged), created_groups: created } });
     return { ok: true, changed: true, row: attrsRow(db, key), created };
   };
-  if (!dryRun) return db.transaction(run).immediate();
-  // 確かめだけ = 同じ取引で全部やってから巻き戻す (確かめの決まりが書き込みとずれない)
-  const DRY = 'po-order-settings-dry-run';
-  try {
-    db.transaction(() => { const out = run(); const e = new Error(DRY); e.dry = out; throw e; }).immediate();
-  } catch (e) {
-    if (e && e.message === DRY && e.dry) return { ...e.dry, dryRun: true };
-    throw e;
-  }
-  throw new Error('unreachable');
+  return { db, run, key };
+}
+
+/** 新商品の登録の ② がもう済んだか (request_id)。済んでいる = 登録の前の確かめもしない (前の結果を返すだけなので) */
+export function registrationOrderDone(requestId) {
+  if (!requestId) return false;
+  return !!getDB().prepare('SELECT 1 FROM po_order_settings_requests WHERE request_id=?').get(String(requestId));
+}
+
+/**
+ * 新商品の登録の ② (Company DB の登録が通った後に発注アプリへ)。1 つの即時の取引で:
+ *   1. 同じ request_id の記録がある = 同じ商品・同じ中身なら前の結果を返す (書かない = その後に直した値を戻さない)・違えば 409 request_id_reused
+ *   2. 無い = 「行がまだ無い」(updated_at null) を確かめて書く (ほかの画面がもう作っていた = 409 stale・記録しない)
+ *   3. 書いたら request_id + 商品 + 中身のハッシュ + 結果を記録する
+ * input = writeOrderSettings と同じ (seen・via は使わない = 'master-edit:new' と「行が無い」)・requestId は必須
+ */
+export function writeRegistrationOrderSettings(input) {
+  const requestId = String((input && input.requestId) ?? '').trim();
+  if (!requestId || requestId.length > 200) throw bad('登録の番号 (request_id) がありません', 'request_id');
+  const { db, run, key } = buildWrite({ ...input, via: 'master-edit:new', seen: { updated_at: null }, requestId });
+  const hash = createHash('sha256').update(stableStringify({
+    key, patch: input.patch ?? null, newCondition: input.newCondition ?? null, newMaterial: input.newMaterial ?? null,
+    supplier: input.supplierCode === undefined ? null : normSupplierCode(input.supplierCode),
+  })).digest('hex');
+  return db.transaction(() => {
+    const prev = db.prepare('SELECT * FROM po_order_settings_requests WHERE request_id=?').get(requestId);
+    if (prev) {
+      if (prev.product_key !== key || prev.payload_hash !== hash) {
+        throw new OrderSettingsError(409, 'request_id_reused', '同じ登録の番号 (request_id) で違う発注の設定が来ました。何も保存していません。画面を開き直してください');
+      }
+      return { ...JSON.parse(prev.result_json), replayed: true };
+    }
+    const out = run();
+    const result = { ok: true, changed: out.changed, created: out.created };
+    db.prepare('INSERT INTO po_order_settings_requests (request_id, product_key, payload_hash, result_json, actor, created_at) VALUES (?,?,?,?,?,?)')
+      .run(requestId, key, hash, JSON.stringify(result), String(input.actor ?? ''), new Date().toISOString());
+    return { ...result, row: out.row, replayed: false };
+  }).immediate();
 }
 
 /**
