@@ -329,7 +329,8 @@ export async function importImageDbByStatus({
     if (rec.status && blank(ipCur.status)) plan.ip.status = rec.status;
     // 撮影商品発送 → 撮影・素材ステータス (v2 の安定コード)。空のときだけ
     const mat = rec.shipping_status ? SHIPPING_TO_MATERIAL[rec.shipping_status] : null;
-    if (mat && blank(ipCur.material_status)) plan.ip.material_status = mat;
+    // 撮影判定 (2026-10-08) がある商品は判定が正本なので埋めない (社内撮影にして未設定へ戻したのを「撮影不要」で上書きしない)
+    if (mat && blank(ipCur.material_status) && !ipCur.shoot_mode) plan.ip.material_status = mat;
 
     // 工程
     const sp = planStepsFor(rec.status);
@@ -467,6 +468,11 @@ function applyPlan(db, rec, plan, { actor, runId }) {
       const ipCur = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draftId) || {};
       const filledNow = Object.keys(plan.ip).filter((k) => !blank(ipCur[k]));
       if (filledNow.length > 0) throw new Error(`プレビュー後に画像制作情報 (${filledNow.join('/')}) が入力されました。再プレビューしてください`);
+      // プレビュー後に撮影判定 (2026-10-08) が付いたら、旧値の素材ステータスは判定と食い違いうるので書かない
+      // (判定が素材ステータスの正本 — Codex PR-A 名指し3 M)
+      if (plan.ip.material_status !== undefined && ipCur.shoot_mode) {
+        throw new Error('プレビュー後に撮影判定が付きました。再プレビューしてください');
+      }
       upsertImageProduction(db, draftId, plan.ip);
     }
 

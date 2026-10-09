@@ -360,6 +360,93 @@ export function migrateAdKwCheckConstraints(db) {
   return { migrated: plan.map((p) => p[0]) };
 }
 
+// ─── LP 構成の仕様書の表 (段階1・2026-10-01)。初回作成と、kind の CHECK を広げる作り直し (migrateLpSpecsKindCheck) の両方で使う ───
+// kind: product_analysis = LP制作システム (構成を書く) / initial_judge = 新商品初動判定 (撮影判定・画像制作の新フロー PR-C2 2026-10-09)
+const LP_SPECS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind              TEXT NOT NULL CHECK (kind IN ('product_analysis', 'initial_judge')),
+      title             TEXT NOT NULL,
+      body              TEXT NOT NULL,          -- 全タブをテキスト化したもの
+      hash              TEXT NOT NULL,          -- body の sha256
+      sheet_titles_json TEXT NOT NULL DEFAULT '[]',
+      imported_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      imported_by       TEXT NOT NULL
+    );`;
+const LP_SPECS_COLS = 'id, kind, title, body, hash, sheet_titles_json, imported_at, imported_by';
+const LP_SPECS_INDEXES = [
+  'CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_specs_hash ON ph_lp_specs(kind, hash);',
+  'CREATE INDEX IF NOT EXISTS idx_ph_lp_specs_kind ON ph_lp_specs(kind, id DESC);',
+];
+const LP_SPECS_TRIGGERS = [
+  `CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_update BEFORE UPDATE ON ph_lp_specs
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (更新は新しい行として入れてください)'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_delete BEFORE DELETE ON ph_lp_specs
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (job が版を参照しています)'); END;`,
+];
+
+/**
+ * ph_lp_compose_jobs に shoot_spec_id / shoot_spec_hash を足す (画像制作の新フロー PR-C2)。cols = 呼び手が読んだ今の列。
+ * 2 つのプロセスが同時に起動すると、両方が「無い」と見て片方の ALTER が duplicate column で落ちる。それだけは許す
+ * (起動を止めない・lpImgAlters と同じ作法・Codex PR-C2 名指し6 M)
+ */
+export function addLpJobShootSpecColumns(db, cols) {
+  for (const [col, sql] of [
+    ['shoot_spec_id', 'ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_spec_id INTEGER'],
+    ['shoot_spec_hash', 'ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_spec_hash TEXT'],
+  ]) {
+    if (cols.size === 0 || cols.has(col)) continue;
+    try { db.exec(sql); } catch (e) { if (!/duplicate column/i.test(String(e?.message || ''))) throw e; }
+  }
+}
+
+/**
+ * 仕様書の表 (ph_lp_specs) の kind の CHECK を、段階1 の ('product_analysis') から
+ * ('product_analysis', 'initial_judge') に広げる (画像制作の新フロー PR-C2・2026-10-09)。
+ * SQLite は CHECK を ALTER できないので、migrateAdKwCheckConstraints と同じ公式手順
+ * (新しい表を作る → 行をコピー → 旧表を DROP → 改名 → 索引とトリガーを作り直す) を 1 トランザクションで行う。
+ * 🚨 旧表を先に改名しない (ph_lp_compose_jobs.spec_id の FK の定義が追随して壊れる)。id は明示コピーで保つ
+ *    (job が spec_id で版を指している)。DROP は追記専用のトリガーを起こさない (暗黙の DELETE はトリガーを起こさない)。
+ *    行数・採番 (sqlite_sequence)・外部キーを確かめ、違えば例外で ROLLBACK。二度目以降は定義が新しいので何もしない (冪等)
+ * @returns {{migrated: boolean}}
+ */
+export function migrateLpSpecsKindCheck(db) {
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_lp_specs'").get()?.sql || '';
+  if (!/CHECK \(kind IN \('product_analysis'\)\)/.test(sql)) return { migrated: false };
+  const fkWas = db.pragma('foreign_keys', { simple: true });
+  db.pragma('foreign_keys = OFF');   // DROP/改名の間だけ。トランザクションの外でしか変えられない
+  const seqOf = () => db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'ph_lp_specs'").get()?.seq ?? null;
+  try {
+    db.transaction(() => {
+      const tmp = 'ph_lp_specs__new';
+      db.exec(`DROP TABLE IF EXISTS ${tmp}`);
+      db.exec(LP_SPECS_DDL(tmp));
+      const before = db.prepare('SELECT COUNT(*) AS n FROM ph_lp_specs').get().n;
+      const seqBefore = seqOf();
+      db.exec(`INSERT INTO ${tmp} (${LP_SPECS_COLS}) SELECT ${LP_SPECS_COLS} FROM ph_lp_specs`);
+      db.exec('DROP TABLE ph_lp_specs');
+      db.exec(`ALTER TABLE ${tmp} RENAME TO ph_lp_specs`);   // sqlite_sequence の name も追随する
+      for (const ix of LP_SPECS_INDEXES) db.exec(ix);
+      for (const tg of LP_SPECS_TRIGGERS) db.exec(tg);
+      const after = db.prepare('SELECT COUNT(*) AS n FROM ph_lp_specs').get().n;
+      if (before !== after) throw new Error(`ph_lp_specs の作り直しで行数が変わった (${before} → ${after})`);
+      // 採番の上限を保つ (id を再利用させない — 古い job の spec_id が別の版を指さないように)
+      const seqNow = seqOf();
+      const seqWant = Math.max(seqBefore ?? 0, seqNow ?? 0);
+      if (seqWant > 0) {
+        if (seqNow == null) db.prepare("INSERT INTO sqlite_sequence (name, seq) VALUES ('ph_lp_specs', ?)").run(seqWant);
+        else if (seqNow < seqWant) db.prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = 'ph_lp_specs'").run(seqWant);
+      }
+      const fkErrors = db.pragma('foreign_key_check');
+      if (fkErrors.length) throw new Error(`作り直し後に外部キーの不整合: ${JSON.stringify(fkErrors.slice(0, 3))}`);
+    })();
+  } finally {
+    db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
+  }
+  console.log('[product-hub] LP 構成の仕様書の表 (ph_lp_specs) の kind に initial_judge (新商品初動判定) を足した');
+  return { migrated: true };
+}
+
 // 「自社商品」の重要度は own_brand チェックと連動する (2026-08-24 中原さん要望)
 export const OWN_BRAND_IMAGE_PRIORITY = '自社商品（重要度：高）';
 // 画像制作の管理項目 (撮影・素材 / Canva / 依頼文 / 保留 / 定型文) は重要度に関係なく全商品で使える
@@ -639,6 +726,14 @@ export const MATERIAL_STATUSES = [
 ];
 export const MATERIAL_STATUS_CODES = new Set(MATERIAL_STATUSES.map((m) => m.code));
 export const MATERIAL_STATUS_LABELS = Object.fromEntries(MATERIAL_STATUSES.map((m) => [m.code, m.label]));
+/** 撮影判定 (2026-10-08 画像制作の新フロー)。sub = ボタンの下に出す一言 */
+export const SHOOT_MODES = [
+  { code: 'none', label: '撮影不要', sub: '今ある素材で作る' },
+  { code: 'inhouse', label: '社内撮影', sub: 'スマホ・自然光でOK' },
+  { code: 'photographer', label: 'カメラマン撮影', sub: '外注・スタイリング込み' },
+];
+export const SHOOT_MODE_CODES = new Set(SHOOT_MODES.map((m) => m.code));
+export const SHOOT_MODE_LABELS = Object.fromEntries(SHOOT_MODES.map((m) => [m.code, m.label]));
 /** 旧 Notion 5 値 (shipping_status) → material_status の写像 */
 export const SHIPPING_TO_MATERIAL = {
   '撮影依頼不要': 'not_required', '撮影商品未発送': 'not_shipped', '撮影商品発送手配済み': 'shipped',
@@ -787,6 +882,29 @@ export function migrateCompositeShippingGroups(db) {
     console.log(`[product-hub] 配送方法の複合選択肢を ${moved} 件分解しました (楽天ID + ヤフー別扱いフラグ)`);
   }
   return moved;
+}
+
+/**
+ * デザイナー修正依頼書 (PR-F) の表を今の形にそろえる (PR-F の途中の版で作った DB 向け)。initProductHubDB から呼ぶ。何度呼んでもよい
+ */
+export function migrateDesignerSheetTables(db) {
+  // writing_images_json … Google に送った画像の一覧 (書いている途中で止まったら、片付けでこの画像の公開を残す)
+  const dsCols = new Set(db.prepare('PRAGMA table_info(ph_designer_sheets)').all().map((c) => c.name));
+  if (!dsCols.has('writing_images_json')) db.exec('ALTER TABLE ph_designer_sheets ADD COLUMN writing_images_json TEXT');
+  // PR-F の途中の版は permission_id が NOT NULL だった (付ける前に ID なしで記録できない) → 作り直して移す
+  const pid = db.prepare('PRAGMA table_info(ph_designer_sheet_shares)').all().find((c) => c.name === 'permission_id');
+  if (pid && pid.notnull) {
+    db.transaction(() => {
+      db.exec(`ALTER TABLE ph_designer_sheet_shares RENAME TO ph_designer_sheet_shares_old;
+        CREATE TABLE ph_designer_sheet_shares (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER NOT NULL, drive_file_id TEXT NOT NULL, permission_id TEXT,
+          image_id INTEGER, shared_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), shared_by TEXT, revoked_at TEXT, revoke_error TEXT);
+        INSERT INTO ph_designer_sheet_shares (id, draft_id, drive_file_id, permission_id, image_id, shared_at, shared_by, revoked_at, revoke_error)
+          SELECT id, draft_id, drive_file_id, permission_id, image_id, shared_at, shared_by, revoked_at, revoke_error FROM ph_designer_sheet_shares_old;
+        DROP TABLE ph_designer_sheet_shares_old;
+        CREATE INDEX IF NOT EXISTS idx_ph_designer_sheet_shares_draft ON ph_designer_sheet_shares(draft_id, revoked_at);`);
+    })();
+  }
 }
 
 export function initProductHubDB() {
@@ -1285,6 +1403,20 @@ export function initProductHubDB() {
       value TEXT
     );
 
+    -- 画面から変える設定 (ph_intake_state に置く値) の変更の記録 (2026-10-09 撮影依頼文のいつもの宛先)。
+    -- 誰がいつ何から何に変えたか。追記だけ
+    CREATE TABLE IF NOT EXISTS ph_setting_events (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      key        TEXT NOT NULL,
+      old_value  TEXT,             -- 変える前に効いていた値 (DB に無ければ env / 既定の値)
+      old_source TEXT,             -- その出どころ 'db' | 'env' | 'default'
+      new_value  TEXT,
+      new_source TEXT,
+      actor      TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_setting_events_key ON ph_setting_events(key, id);
+
     -- かんばんの手動並び順 (2026-08-28 中原さん要望: 「動かしたカードは自由に順番を変えたい」)。
     -- 既定は「停滞日数の多い順 → 登録順」だが、それだと現場で決めた「今日はこの順でやる」が
     -- 保存されず、動かしても読み直すたびに元へ戻ってしまう。
@@ -1322,26 +1454,15 @@ export function initProductHubDB() {
     -- 仕様書のスナップショット。**追記専用** — 一度入れた行は書き換えない (Codex R3 #3)。
     -- job は「最新版」ではなく受付時の spec_id を持ち、claim で hash を照合する。
     -- こうしないと、依頼から claim までに仕様書が差し替わると packet_hash が同じまま中身が変わる。
-    CREATE TABLE IF NOT EXISTS ph_lp_specs (
-      id                INTEGER PRIMARY KEY AUTOINCREMENT,
-      kind              TEXT NOT NULL CHECK (kind IN ('product_analysis')),
-      title             TEXT NOT NULL,
-      body              TEXT NOT NULL,          -- 全タブをテキスト化したもの
-      hash              TEXT NOT NULL,          -- body の sha256
-      sheet_titles_json TEXT NOT NULL DEFAULT '[]',
-      imported_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      imported_by       TEXT NOT NULL
-    );
+    -- 定義は LP_SPECS_DDL (kind は product_analysis = LP制作システム / initial_judge = 新商品初動判定・PR-C2)。
+    -- CHECK を広げる作り直し (migrateLpSpecsKindCheck) と同じ定義を使う
+    ${LP_SPECS_DDL('ph_lp_specs')}
     -- 同じ中身を上げ直しても行が増えない (= 版が無駄に進まない)
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_specs_hash ON ph_lp_specs(kind, hash);
-    CREATE INDEX IF NOT EXISTS idx_ph_lp_specs_kind ON ph_lp_specs(kind, id DESC);
+    ${LP_SPECS_INDEXES.join(' ')}
     -- 「追記専用」を宣言でなく DB で担保する (Codex R4 #4)。
     -- 宣言だけだと通常の UPDATE で中身を差し替えられ、spec_hash の照合が通ったまま
     -- AI への実効入力が変わる = job の再現性が失われる。
-    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_update BEFORE UPDATE ON ph_lp_specs
-      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (更新は新しい行として入れてください)'); END;
-    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_delete BEFORE DELETE ON ph_lp_specs
-      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (job が版を参照しています)'); END;
+    ${LP_SPECS_TRIGGERS.join(' ')}
 
     -- 🚨 draft_id に FK / ON DELETE CASCADE を張らない (Codex R3 #5)。
     --    段階1 は測定が目的なので、draft を普通に消しただけで実験記録が消えては困る。
@@ -1492,11 +1613,87 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_ph_ai_usage_month ON ph_ai_usage(kind, month);
   `);
 
+  // LP 構成の編集版 (画像制作の新フロー PR-B・2026-10-09。lib/lp-edit.js)。
+  // 人が画面で直した構成を ⑦ の全文に書き戻したもの。**追記だけ** — 保存のたびに新しい行。
+  // 🚨 AI の生の出力 (ph_lp_compose_jobs.output_text) は書き換えない (段階1 の測定の材料)。だから別の表。
+  //    効いている構成 = いちばん新しい done の job への、いちばん新しい行 (無ければ AI の本文)。
+  //    draft には外部キーを張らない (ph_lp_compose_jobs と同じ・下書きを消しても実験の記録を残す)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_lp_compose_edits (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id     INTEGER NOT NULL,
+      base_job_id  INTEGER NOT NULL REFERENCES ph_lp_compose_jobs(id),  -- どの AI の構成を直したか
+      slots_json   TEXT NOT NULL,          -- 画像の並び [{uid, kind, name, role, title, copy, body, shoot, block}]
+      output_text  TEXT NOT NULL,          -- 組み直した ⑦ の全文 (サーバの lint を通ったもの)
+      edited_by    TEXT NOT NULL,
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_edits_job ON ph_lp_compose_edits(base_job_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_ph_lp_compose_edits_draft ON ph_lp_compose_edits(draft_id, id DESC);
+    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_compose_edits_no_update BEFORE UPDATE ON ph_lp_compose_edits
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_compose_edits は追記専用です (直すときは新しい行として入れてください)'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_compose_edits_no_delete BEFORE DELETE ON ph_lp_compose_edits
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_compose_edits は追記専用です'); END;
+  `);
+
+  // デザイナー修正依頼書 (画像制作の新フロー PR-F・2026-10-09。services/designer-sheet-service.js)。
+  //   ph_designer_sheets       … 商品ごとに 1 行。作ったスプレッドシート (file_id / url)・作ったときの画像の並びの hash・
+  //                              作っている最中の印 (lease。同じ商品を 2 本同時に作らない・プロセスをまたいでも効く)・
+  //                              writing_at (Google に送る直前に立て、記録できたら下ろす。立ったままなら「作り直しが要る」)
+  //   ph_designer_sheet_shares … 依頼書に載せるために画像ファイルに付けた「リンクを知っている人は閲覧可」の権限 (後で外せるように)。
+  //                              ポータルが付けたものだけ記録する (前から付いていた共有は外さない)
+  // 撮影指示書 (PR-D) の列 (draft_image_production.shoot_sheet_*) とは混ぜない (別の書類)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_designer_sheets (
+      draft_id      INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
+      file_id       TEXT,
+      url           TEXT,
+      images_hash   TEXT,                -- 作ったときの画像の並び (lib/designer-sheet.js の designerImagesHash)
+      images_json   TEXT,                -- 作ったときに載せた画像 [{root_id, current_id, drive_file_id, version}] (公開を残すファイルの正本)
+      image_count   INTEGER,
+      created_at    TEXT,
+      created_by    TEXT,
+      updated_at    TEXT,
+      updated_by    TEXT,
+      writing_at    TEXT,
+      lease_token   TEXT,
+      lease_until   TEXT
+    );
+    CREATE TABLE IF NOT EXISTS ph_designer_sheet_shares (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id       INTEGER NOT NULL,     -- 商品を消しても記録は残す (Drive の共有は残るので、外すときの手がかり)
+      drive_file_id  TEXT NOT NULL,
+      permission_id  TEXT,                 -- NULL = 付けようとしている (付ける前に記録する。付けた直後に止まってもポータルのものと分かる)
+      image_id       INTEGER,              -- ph_lp_images.id (載せた版の行)
+      shared_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      shared_by      TEXT,
+      revoked_at     TEXT,                 -- 外した (依頼書から外れた古い版)。NULL = まだ公開中
+      revoke_error   TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_designer_sheet_shares_draft ON ph_designer_sheet_shares(draft_id, revoked_at);
+  `);
+  migrateDesignerSheetTables(db);
+
   // LP 構成: 実行役へ配った画像の記録 (PR1-b で追加。PR1-a でデプロイ済みの DB にも入れる)
   const lpJobCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_jobs)').all().map((c) => c.name));
   if (lpJobCols.size > 0 && !lpJobCols.has('images_served_json')) {
     db.exec("ALTER TABLE ph_lp_compose_jobs ADD COLUMN images_served_json TEXT NOT NULL DEFAULT '[]'");
   }
+  // LP 構成: AI の撮影判定 (画像制作の新フロー PR-C・2026-10-09)。構成と一緒に実行役が送る別の欄 (shoot_json)。
+  //   shoot_json  = 形を検査して通ったものだけ (lib/lp-shoot.js の validateShootJudgement の value)
+  //   shoot_error = 送られてきたが形が違ったので使わなかった理由 (構成は受け付ける・撮影判定だけ「AI の判定なし」)
+  //   両方 NULL = 送られてこなかった (撮影判定を知らない古い実行役)
+  // ⑦の本文 (output_text) には足さない — lint と lp-parser (配信元の写し) に触らないため
+  if (lpJobCols.size > 0 && !lpJobCols.has('shoot_json')) {
+    db.exec('ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_json TEXT');
+  }
+  if (lpJobCols.size > 0 && !lpJobCols.has('shoot_error')) {
+    db.exec('ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_error TEXT');
+  }
+  // LP 構成: 受付時に固めた撮影判定の仕様書「新商品初動判定」の版 (画像制作の新フロー PR-C2)。LP制作システムの spec_id / spec_hash と同じく
+  // packet の外にも持ち、claim で packet と突き合わせる (packet だけ書き換えて別の版を渡させない・Codex PR-C2 名指し5 M)。
+  // 仕様書を取り込む前の依頼・PR-C (版 5) の依頼は両方 NULL
+  addLpJobShootSpecColumns(db, lpJobCols);
   // LP 構成: 実際に本回答を書いたモデル (2026-10-02・codex exec review #1591 High)。
   // model = 頼んだモデル (reserve)。こちらはランナーが stream-json の assistant.message.model を読んで後から付ける。
   // model_check: match / mismatch / unknown (NULL = まだ付いていない)。一度付けたら書き換えない
@@ -1510,6 +1707,25 @@ export function initProductHubDB() {
   if (lpGenCols.size > 0 && !lpGenCols.has('model_checked_at')) {
     db.exec('ALTER TABLE ph_lp_compose_generations ADD COLUMN model_checked_at TEXT');
   }
+  // LP 画像: 1 枚ずつの作り直しと「確認済み」(画像制作の新フロー PR-E・2026-10-09 スタッフ要望 ⑤)。
+  //   作り直し = 新しい job (regen_of_image_id = 作り直す元の画像 = 全部作ったときの行) に 1 枚だけの行を作る。
+  //   受付で固めた prompt・参考画像・取り置き額は元の行から写す (構成を読み直さない)。
+  //   version = 何版目 (全部作ったときが 1)。Drive には新しいファイルで保存し、前の版は消さない。
+  //   checked_at / checked_by = その版を人が「確認」した (作り直しを受け付けたら外す)
+  // 同じ DB を開くプロセスが同時に起動しても落ちないよう、duplicate column だけは成功扱い (ipAlters と同じ作法・Codex 名指し4 M)
+  const lpImgJobCols = new Set(db.prepare('PRAGMA table_info(ph_lp_image_jobs)').all().map((c) => c.name));
+  const lpImgCols = new Set(db.prepare('PRAGMA table_info(ph_lp_images)').all().map((c) => c.name));
+  const lpImgAlters = [
+    [lpImgJobCols, 'regen_of_image_id', 'ALTER TABLE ph_lp_image_jobs ADD COLUMN regen_of_image_id INTEGER REFERENCES ph_lp_images(id) ON DELETE CASCADE'],
+    [lpImgCols, 'version', 'ALTER TABLE ph_lp_images ADD COLUMN version INTEGER NOT NULL DEFAULT 1'],
+    [lpImgCols, 'checked_at', 'ALTER TABLE ph_lp_images ADD COLUMN checked_at TEXT'],
+    [lpImgCols, 'checked_by', 'ALTER TABLE ph_lp_images ADD COLUMN checked_by TEXT'],
+  ];
+  for (const [cols, col, sql] of lpImgAlters) {
+    if (cols.size === 0 || cols.has(col)) continue;
+    try { db.exec(sql); } catch (e) { if (!/duplicate column/i.test(String(e?.message || ''))) throw e; }
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ph_lp_image_jobs_regen ON ph_lp_image_jobs(regen_of_image_id)');
 
   // 既存 DB へのカラム追加 (warehouse-mirror/db.js の addColumnIfMissing と同方針の冪等 ALTER)
   const draftCols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));
@@ -1981,6 +2197,30 @@ export function initProductHubDB() {
     //   田中さんが構成を作り、すり合わせを見える形にして大輔さんに制作意図を伝える
     ['top_compose_text', 'ALTER TABLE draft_image_production ADD COLUMN top_compose_text TEXT'],
     ['top_ref_url', 'ALTER TABLE draft_image_production ADD COLUMN top_ref_url TEXT'],
+    // 2026-10-08 スタッフ要望 (画像制作の新フロー): 編集データ (PSD 等) のリンクと撮影判定。
+    //   shoot_mode = NULL (未判定) / 'none' 撮影不要 / 'inhouse' 社内撮影 / 'photographer' カメラマン撮影。
+    //   画像タブの「画像制作情報を保存」では書かない (専用の口 setShootMode だけ。素材ステータスをそろえるため)
+    ['edit_data_url', 'ALTER TABLE draft_image_production ADD COLUMN edit_data_url TEXT'],
+    ['shoot_mode', "ALTER TABLE draft_image_production ADD COLUMN shoot_mode TEXT CHECK (shoot_mode IN ('none', 'inhouse', 'photographer'))"],
+    ['shoot_mode_at', 'ALTER TABLE draft_image_production ADD COLUMN shoot_mode_at TEXT'],
+    ['shoot_mode_by', 'ALTER TABLE draft_image_production ADD COLUMN shoot_mode_by TEXT'],
+    // 2026-10-09 画像制作の新フロー PR-D: ポータルが自動で作った撮影指示書 (スプレッドシート)。
+    //   lease_token / lease_until … 作っている最中の印 (同じ商品を 2 本同時に作らない。プロセスをまたいでも効く)
+    //   file_id … 作ったファイル (更新はこのファイルを上書き = URL は変わらない)
+    //   hash    … 作ったときの材料の hash (今の材料と違えば「LP構成が変わりました → 更新」を出す)
+    //   source  … 材料の出どころ ('auto' = LP構成から組んだ。今はこれだけ。ほかの出どころを足すときに見分ける)
+    //   URL は camera_instruction_url に入れる (ボードの「撮影指示書 済」がそのまま動く)。
+    //   画像タブの「画像制作情報を保存」では書かない (recordShootSheet だけが書く)
+    ['shoot_sheet_file_id', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_file_id TEXT'],
+    ['shoot_sheet_hash', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_hash TEXT'],
+    ['shoot_sheet_source', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_source TEXT'],
+    ['shoot_sheet_at', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_at TEXT'],
+    ['shoot_sheet_by', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_by TEXT'],
+    ['shoot_sheet_lease_token', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_lease_token TEXT'],
+    ['shoot_sheet_lease_until', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_lease_until TEXT'],
+    // writing_at … Google に送る直前に立て、記録できたときだけ下ろす。立ったままなら、シートの中身と記録 (hash) が
+    //   食い違っているかもしれないので画面は「更新が要る」を出す (書いた後に止まった・競合で記録しなかった — Codex PR-D 名指し7 M)
+    ['shoot_sheet_writing_at', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_writing_at TEXT'],
   ];
   for (const [col, sql] of ipAlters) {
     if (ipCols.has(col)) continue;
@@ -2104,6 +2344,13 @@ export function initProductHubDB() {
     migrateAdKwCheckConstraints(db);
   } catch (e) {
     console.error('[product-hub] SP広告KW の表の作り直しに失敗 (旧い定義のまま動く。競合 ASIN の追加と「完全一致＋フレーズ一致」の採用は失敗する):', e.message);
+  }
+  // LP 構成の仕様書の表に 新商品初動判定 (initial_judge) を足す (画像制作の新フロー PR-C2)。既に新しい定義なら何もしない。
+  // 🚨 失敗しても起動は止めない。旧い定義のままだと 新商品初動判定 の取り込みだけが CHECK で失敗する (撮影判定は PR-C の決まりのまま動く)
+  try {
+    migrateLpSpecsKindCheck(db);
+  } catch (e) {
+    console.error('[product-hub] LP 構成の仕様書の表の作り直しに失敗 (旧い定義のまま動く。新商品初動判定の取り込みは失敗する):', e.message);
   }
 
   // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
@@ -2472,9 +2719,11 @@ export function migrateDetailTrackV2(db) {
     for (const [code, from, to] of [['img_production_top', 20, 51], ['img_register_top', 30, 52], ['img_approve_top', 40, 62]]) {
       db.prepare('UPDATE ph_steps SET sort = ? WHERE code = ? AND sort = ?').run(to, code, from);
     }
-    // 3. 旧 Notion 5 値 → 撮影・素材ステータス (空のときだけ。毎起動で冪等)
+    // 3. 旧 Notion 5 値 → 撮影・素材ステータス (空のときだけ。毎起動で冪等)。
+    //    撮影判定 (2026-10-08) がある商品は触らない — 社内撮影にして未設定へ戻した素材を、旧値の
+    //    「撮影依頼不要」で毎起動「撮影不要」に戻してしまう (Codex PR-A 名指し2 High)
     for (const [from, to] of Object.entries(SHIPPING_TO_MATERIAL)) {
-      db.prepare('UPDATE draft_image_production SET material_status = ? WHERE material_status IS NULL AND shipping_status = ?').run(to, from);
+      db.prepare('UPDATE draft_image_production SET material_status = ? WHERE material_status IS NULL AND shoot_mode IS NULL AND shipping_status = ?').run(to, from);
     }
     // v2 に切り替えた日時 (初回だけ記録。①の「商品情報必須」の境目に使う)
     db.prepare('INSERT OR IGNORE INTO ph_intake_state (key, value) VALUES (?, ?)').run(IMAGE_TRACK_V2_KEY, new Date().toISOString());
@@ -2607,6 +2856,255 @@ export function setImageWorkflowState(db, draftId, state, { note = null, actor =
 }
 
 /**
+ * 撮影判定に合う撮影・素材ステータス (setShootMode と同じ決まり。未判定なら今の値のまま)。
+ *   撮影不要 → 素材完了 以外は「撮影不要」 / 撮影が要る → 「撮影不要」なら未設定
+ */
+export function materialAlignedToShootMode(mode, material) {
+  const cur = material ?? null;
+  if (mode === 'none') return cur === 'ready' ? 'ready' : 'not_required';
+  if ((mode === 'inhouse' || mode === 'photographer') && cur === 'not_required') return null;
+  return cur;
+}
+
+/**
+ * ③素材待ち が完了済みなのに、変えた後の撮影判定・素材ステータスでは ③ の完了条件を満たさなくなるか。
+ * 完了ゲート (workflow-progress.js の setStepState) は完了にする瞬間しか見ないので、完了したあとで値を
+ * 崩す側 (撮影判定の変更・画像制作情報の保存) がこれで止める — Codex PR-A 名指し3/4 High。
+ * 条件はゲートと同じ: 撮影が要る判定なら素材完了 / 自社商品なら素材完了か撮影不要 / それ以外は問わない
+ */
+export function materialStepWouldBreak(db, draftId, { shootMode, material }) {
+  const st = db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_material'`).get(draftId);
+  if (st?.state !== 'done') return false;
+  if (shootMode === 'inhouse' || shootMode === 'photographer') return material !== 'ready';
+  const ownBrand = db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(draftId)?.own_brand === 1;
+  return ownBrand && material !== 'ready' && material !== 'not_required';
+}
+
+/**
+ * 撮影判定を変える (2026-10-08 画像制作の新フロー)。null = 未判定に戻す。
+ * 撮影・素材ステータスもそろえる — ③素材待ち の完了条件とボードの「撮影指示書 対象外」はそちらを見ているため:
+ *   撮影不要 にした → 素材ステータスが「素材完了」でなければ「撮影不要」にする
+ *   撮影が要る にした → 素材ステータスが「撮影不要」なら未設定に戻す (撮影不要のまま ③ を通さない)
+ *   撮影不要 から未判定に戻した → 同じく「撮影不要」なら未設定に戻す
+ * 冪等: 同じ判定で素材ステータスも合っていれば changed=false でイベントも残さない。
+ *   同じ判定でも素材ステータスが食い違っていれば (別の経路で入った値)、そろえ直して changed=true
+ * @returns {{changed: boolean, material_status: string|null}}
+ */
+export function setShootMode(db, draftId, mode, { actor = null, expected } = {}) {
+  const m = mode == null ? null : String(mode);
+  if (m !== null && !SHOOT_MODE_CODES.has(m)) throw new Error('撮影判定の値が不正です');
+  const id = Number(draftId);
+  const run = db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
+    const cur = db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(id);
+    // expected = 画面が見ていた判定 (undefined なら照らさない)。ほかの人・別のタブが先に変えていたら上書きしない。
+    // 押したのと同じ判定に既になっているなら、それは送り直しなので通す (Codex PR-A 名指し4 M)
+    if (expected !== undefined && (cur.shoot_mode ?? null) !== (expected ?? null) && (cur.shoot_mode ?? null) !== m) {
+      const err = new Error(`ほかの人 (または別の画面) が撮影判定を「${cur.shoot_mode ? SHOOT_MODE_LABELS[cur.shoot_mode] : '未判定'}」に変えています。画面を読み直してから選んでください`);
+      err.code = 'shoot_mode_conflict';
+      throw err;
+    }
+    const before = cur.material_status ?? null;
+    let material = materialAlignedToShootMode(m, before);
+    // 「撮影不要」から未判定に戻した = 撮影不要と決めたのを取り消した。そろえた素材ステータスも取り消す
+    // (未判定なのに ③素材待ち を通れる状態を残さない — Codex PR-A R1 P2)
+    // 撮影不要のときの素材完了 (今ある素材で揃った) も同じ。残すと「未判定 → 撮影が要る」を経由して、撮影前の
+    // 素材完了を持ち越せてしまう (Codex PR-A 名指し8 High)
+    if (m === null && cur.shoot_mode === 'none' && (material === 'not_required' || material === 'ready')) material = null;
+    // 「撮影不要」のときの素材完了は「今ある素材で揃った」という意味。撮影が要るに変えたら、これから撮る素材は
+    // まだ無いので未設定に戻す (古い素材完了を撮影済みの印として持ち越さない — Codex PR-A 名指し6 High)。
+    // ③ が完了済みなら下の materialStepWouldBreak で 409 になり、先に ③ へ戻してもらう
+    if ((m === 'inhouse' || m === 'photographer') && cur.shoot_mode === 'none' && material === 'ready') material = null;
+    if ((cur.shoot_mode ?? null) === m) {
+      // 同じ判定の送り直し。食い違いが残っていればここで直す (別の経路で入った値を押し直しで戻せるように — Codex PR-A 名指し2 High)
+      if (material === before) return { changed: false, material_status: before };
+      // 直した値で ③ の完了条件を満たさなくなるなら、ここでも止めて先に ③ へ戻してもらう (Codex PR-A 名指し9 M)
+      if (materialStepWouldBreak(db, id, { shootMode: m, material })) {
+        const err = new Error('③素材待ち はもう完了しています。撮影・素材ステータスを直すなら、先にボードでカードを ③素材待ち に戻してください');
+        err.code = 'material_step_done';
+        throw err;
+      }
+      db.prepare(`UPDATE draft_image_production SET material_status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE draft_id = ?`).run(material, id);
+      logEvent(db, id, 'shoot_mode_changed',
+        `撮影判定「${m ? SHOOT_MODE_LABELS[m] : '未判定'}」に合わせて撮影・素材ステータスを直した (${MATERIAL_STATUS_LABELS[before] || '未設定'} → ${MATERIAL_STATUS_LABELS[material] || '未設定'})`, actor);
+      return { changed: true, material_status: material };
+    }
+    // 🚨 ③素材待ち を「撮影不要」で完了したあとに「撮影が要る」へ変えると、素材が無いのに ③ は完了のまま
+    //    ④ 以降へ進んでしまう (完了ゲートは完了にする瞬間しか見ない)。変えた後の値で ③ の完了条件を
+    //    満たさなくなるなら変えずに止め、先に ③ へ戻してもらう (Codex PR-A 名指し3 High)
+    if (materialStepWouldBreak(db, id, { shootMode: m, material })) {
+      const needShoot = m === 'inhouse' || m === 'photographer';
+      const err = new Error(`③素材待ち はもう完了しています。${needShoot ? '撮影する' : '撮影判定を取り消す'}なら、先にボードでカードを ③素材待ち に戻してから撮影判定を変えてください`);
+      err.code = 'material_step_done';
+      throw err;
+    }
+    db.prepare(`
+      UPDATE draft_image_production
+      SET shoot_mode = ?, shoot_mode_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), shoot_mode_by = ?,
+          material_status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = ?
+    `).run(m, actor, material, id);
+    const materialNote = material !== before
+      ? ` (撮影・素材ステータス: ${MATERIAL_STATUS_LABELS[before] || '未設定'} → ${MATERIAL_STATUS_LABELS[material] || '未設定'})` : '';
+    logEvent(db, id, 'shoot_mode_changed', `撮影判定を「${m ? SHOOT_MODE_LABELS[m] : '未判定'}」に${materialNote}`, actor);
+    return { changed: true, material_status: material };
+  });
+  return run();
+}
+
+/**
+ * 撮影指示書の材料と置き場の「版」(2026-10-09 PR-D)。作り始めたときの版と、Google に書く直前・記録するときの版を比べ、
+ * 違えば書かない / 記録しない (Google を待っている間に変わったものを、古い材料で黙って上書きしない — Codex PR-D 名指し High)。
+ * 中身 = 撮影判定・画像フォルダ・商品名・商品コード・撮影指示書の URL とファイル ID・LP構成 (いちばん新しい依頼とその状態・
+ *   いちばん新しい編集版 (PR-B))。LP構成は「材料に効くか」を細かく見ず、依頼か編集版が動いたら版が変わったとみなす (安全側)
+ */
+export function shootSheetRevision(db, draftId) {
+  const id = Number(draftId);
+  const d = db.prepare('SELECT ne_code, name, drive_folder_url FROM product_drafts WHERE id = ?').get(id) || {};
+  const ip = db.prepare('SELECT shoot_mode, camera_instruction_url, shoot_sheet_file_id FROM draft_image_production WHERE draft_id = ?').get(id) || {};
+  const job = db.prepare('SELECT id, status FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(id);
+  let editId = null;
+  try { editId = db.prepare('SELECT MAX(id) m FROM ph_lp_compose_edits WHERE draft_id = ?').get(id)?.m ?? null; } catch (_) { /* 表が無い古い DB */ }
+  return JSON.stringify([d.ne_code ?? null, d.name ?? null, d.drive_folder_url ?? null, ip.shoot_mode ?? null,
+    ip.camera_instruction_url ?? null, ip.shoot_sheet_file_id ?? null, job ? job.id : null, job ? job.status : null, editId]);
+}
+
+const SHOOT_SHEET_CONFLICT_MESSAGE = '作っている間に、撮影判定・画像フォルダ・商品名・LP構成・撮影指示書の URL のどれかが変わりました。画面を読み直して、もう一度押してください (指示書の URL は変えていません)';
+
+/** 版が変わっていたら conflict を投げる (Google に書く直前と、記録するときに呼ぶ) */
+export function assertShootSheetRevision(db, draftId, expectedRevision) {
+  if (shootSheetRevision(db, draftId) !== expectedRevision) {
+    throw Object.assign(new Error(SHOOT_SHEET_CONFLICT_MESSAGE), { code: 'shoot_sheet_conflict' });
+  }
+}
+
+/**
+ * 作っている最中の印を取る (同じ商品を同時に 2 本作らない。DB に持つのでプロセスをまたいでも効く — Codex PR-D 名指し M)。
+ * 期限 (既定 3 分) を過ぎた印は、止まったプロセスの残りとみなして取り直せる。@returns {string|null} 取れたら token
+ */
+export function acquireShootSheetLease(db, draftId, { ms = 180_000, now = Date.now() } = {}) {
+  const id = Number(draftId);
+  const token = `${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const until = new Date(now + ms).toISOString();
+  return db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
+    const r = db.prepare(`UPDATE draft_image_production SET shoot_sheet_lease_token = ?, shoot_sheet_lease_until = ?
+      WHERE draft_id = ? AND (shoot_sheet_lease_until IS NULL OR shoot_sheet_lease_until < ?)`).run(token, until, id, new Date(now).toISOString());
+    return r.changes === 1 ? token : null;
+  })();
+}
+
+/**
+ * 印がまだ自分のものか (token が同じで期限内) を見て、期限を延ばす。違えば conflict を投げる。
+ * 期限が切れて別の処理が取り直した後に、止まっていた古い処理が書き戻さないため (Codex PR-D 名指し2 High)
+ */
+export function assertShootSheetLease(db, draftId, token, { ms = 180_000, now = Date.now() } = {}) {
+  const r = db.prepare(`UPDATE draft_image_production SET shoot_sheet_lease_until = ?
+    WHERE draft_id = ? AND shoot_sheet_lease_token = ? AND shoot_sheet_lease_until >= ?`)
+    .run(new Date(now + ms).toISOString(), Number(draftId), token, new Date(now).toISOString());
+  if (r.changes !== 1) {
+    throw Object.assign(new Error('時間がかかりすぎたため、この撮影指示書の作成は取りやめました (ほかの処理が始まっています)。画面を読み直してから、もう一度押してください'), { code: 'shoot_sheet_conflict' });
+  }
+}
+
+/** Google に送る直前に「書いている」を立てる (記録できたときだけ recordShootSheet が下ろす) */
+export function markShootSheetWriting(db, draftId) {
+  db.prepare(`UPDATE draft_image_production SET shoot_sheet_writing_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE draft_id = ?`).run(Number(draftId));
+}
+
+/** 印を返す (自分の token のときだけ) */
+export function releaseShootSheetLease(db, draftId, token) {
+  db.prepare(`UPDATE draft_image_production SET shoot_sheet_lease_token = NULL, shoot_sheet_lease_until = NULL
+    WHERE draft_id = ? AND shoot_sheet_lease_token = ?`).run(Number(draftId), token);
+}
+
+/**
+ * 撮影指示書 (スプレッドシート) を作った / 上書きしたことを記録する (2026-10-09 画像制作の新フロー PR-D)。
+ * camera_instruction_url と file_id・材料の hash を **1 トランザクションで** 書く (片方だけ書かれた状態を作らない)。
+ *
+ * expectedRevision = 作り始めたときの版 (shootSheetRevision)。Google を待っている間に撮影判定・画像フォルダ・商品名・
+ *   LP構成・指示書の URL が変わっていたら、書かずに conflict を投げる (後から終わったほうが黙って勝たない)。
+ * 撮影判定が「撮影が要る」でなくなっていても書かない (撮影不要の商品に指示書を付けない)
+ */
+export function recordShootSheet(db, draftId, { url, fileId, hash, source, actor = null, created, expectedRevision, verify = null }) {
+  const id = Number(draftId);
+  return db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
+    const cur = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(id);
+    if (cur.shoot_mode !== 'inhouse' && cur.shoot_mode !== 'photographer') {
+      throw Object.assign(new Error('作っている間に撮影判定が変わりました (撮影が要る判定ではなくなりました)。指示書の URL には入れていません'), { code: 'shoot_sheet_conflict' });
+    }
+    if (expectedRevision !== undefined) assertShootSheetRevision(db, id, expectedRevision);
+    // 呼び手の確認 (印がまだ自分のものか・材料が変わっていないか)。同じトランザクションの中で見る
+    if (verify) verify();
+    db.prepare(`
+      UPDATE draft_image_production
+      SET camera_instruction_url = ?, shoot_sheet_file_id = ?, shoot_sheet_hash = ?, shoot_sheet_source = ?,
+          shoot_sheet_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), shoot_sheet_by = ?, shoot_sheet_writing_at = NULL,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = ?
+    `).run(url, fileId, hash, source, actor, id);
+    logEvent(db, id, created ? 'shoot_sheet_created' : 'shoot_sheet_updated',
+      `撮影指示書を${created ? '作成' : '更新'}: ${url}`, actor);
+    return { changed: true };
+  })();
+}
+
+// ─── 撮影依頼文のいつもの宛先 (2026-10-09 中原さん決定) ───
+// 管理者が「担当者・工程の設定」で変える。DB に値が無ければ env PH_SHOOT_REQUEST_MENTION → 既定「@つくば」。
+// 空文字を保存した = 宛先の行を入れない (env を空にしたのと同じ意味)。null で消す = 初期値 (env / 既定) に戻す
+export const SHOOT_MENTION_KEY = 'shoot_request_mention';
+export const SHOOT_MENTION_DEFAULT = '@つくば';
+export const SHOOT_MENTION_MAX = 60;
+
+/** 宛先の値の検査。1 行・60 文字まで。前後の空白は落とす。@returns {{value: string|null, error: string|null}} */
+export function normalizeShootMention(v) {
+  if (v === null) return { value: null, error: null };
+  if (typeof v !== 'string') return { value: null, error: '宛先は文字で指定してください (初期値に戻すときは null)' };
+  if (/[\u0000-\u001f\u007f\u2028\u2029]/.test(v)) return { value: null, error: '宛先に改行やタブは入れられません (1 行で書いてください)' };
+  const t = v.trim();
+  if (t.length > SHOOT_MENTION_MAX) return { value: null, error: `宛先は ${SHOOT_MENTION_MAX} 文字までです` };
+  return { value: t, error: null };
+}
+
+/** いまのいつもの宛先。source = 'db' | 'env' | 'default' */
+export function getShootMention(db, env = process.env) {
+  const row = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(SHOOT_MENTION_KEY);
+  const last = db.prepare('SELECT actor, created_at FROM ph_setting_events WHERE key = ? ORDER BY id DESC LIMIT 1').get(SHOOT_MENTION_KEY) || null;
+  // env も画面と同じ検査 (1 行・60 文字)。通らなければ既定に倒す (依頼文に複数行を差し込ませない — Codex PR-D 名指し5 L)
+  let envMention = null;
+  if (env.PH_SHOOT_REQUEST_MENTION !== undefined) {
+    const n = normalizeShootMention(String(env.PH_SHOOT_REQUEST_MENTION));
+    if (n.error) console.warn(`[product-hub] PH_SHOOT_REQUEST_MENTION が使えないので既定の宛先にします: ${n.error}`);
+    else envMention = n.value;
+  }
+  const initial = envMention ?? SHOOT_MENTION_DEFAULT;
+  if (row && row.value != null) {
+    return { value: String(row.value), source: 'db', initial, initialSource: envMention != null ? 'env' : 'default', updatedAt: last?.created_at || null, updatedBy: last?.actor || null };
+  }
+  return { value: initial, source: envMention != null ? 'env' : 'default', initial, initialSource: envMention != null ? 'env' : 'default', updatedAt: last?.created_at || null, updatedBy: last?.actor || null };
+}
+
+/** いつもの宛先を変える (管理者だけ = 呼び手が見る)。同じ値なら changed=false で記録もしない */
+export function setShootMention(db, value, { actor = null } = {}) {
+  const n = normalizeShootMention(value);
+  if (n.error) throw Object.assign(new Error(n.error), { status: 400 });
+  return db.transaction(() => {
+    const row = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(SHOOT_MENTION_KEY);
+    const before = row ? row.value : null;
+    if (before === n.value && (row != null) === (n.value != null)) return { changed: false };
+    // 記録は「効いていた値 → 効く値」と出どころ (DB に無いときも、そのときの env / 既定の実際の値で残す — Codex PR-D 名指し L)
+    const was = getShootMention(db);
+    if (n.value === null) db.prepare('DELETE FROM ph_intake_state WHERE key = ?').run(SHOOT_MENTION_KEY);
+    else db.prepare('INSERT INTO ph_intake_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(SHOOT_MENTION_KEY, n.value);
+    const now = getShootMention(db);
+    db.prepare('INSERT INTO ph_setting_events (key, old_value, old_source, new_value, new_source, actor) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(SHOOT_MENTION_KEY, was.value, was.source, now.value, now.source, actor);
+    return { changed: true };
+  })();
+}
+
+/**
  * 「確認中」を立てる / 理由・メモを差し替える (2026-08-31)。
  *
  * status も工程も動かさない。効くのは 2 つだけ:
@@ -2689,6 +3187,7 @@ const IMAGE_PRODUCTION_FIELDS = [
   'back_info_text', 'back_info_updated_at', 'back_info_updated_by',   // 2026-09-10 裏面情報 (任意)
   'compose_status', 'compose_updated_at', 'compose_updated_by',   // 2026-09-13 本番の構成の 済/まだ
   'top_compose_text', 'top_ref_url',   // 2026-09-13 TOP画像の構成と参考・ラフの URL
+  'edit_data_url',   // 2026-10-08 編集データ (PSD 等) のリンク
 ];
 
 /** draft_image_production の upsert (部分更新)。undefined の項目は今の値を残し、null は消す */

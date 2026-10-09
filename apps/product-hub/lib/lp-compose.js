@@ -30,6 +30,9 @@ import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
 import { lintComposition, lintSummary } from './lp-lint.js';
 import { PRODUCT_ANALYSIS_INSTRUCTION } from './prompt-templates.js';
+import {
+  SHOOT_JUDGE_INSTRUCTION, SHOOT_SPEC_INSTRUCTION, validateShootForComposition, shootFormatOfPacket, shootReadModel, shootWarnings,
+} from './lp-shoot.js';
 
 /*
  * 書き込みを伴うトランザクションは `.immediate()` で回す (コード R11)。
@@ -45,7 +48,17 @@ import { PRODUCT_ANALYSIS_INSTRUCTION } from './prompt-templates.js';
 //    画像の選び方が変わったので、測定は版ごとに分けて数えられる
 // 4: 素材画像 (商品の画像フォルダのサブフォルダの画像・role = material:N・name / folder つき) と
 //    materials_omitted を入れた (2026-10-02 中原さん)
-export const PACKET_VERSION = 4;
+// 5: 撮影判定の指示文 (shoot_instruction) を入れた (画像制作の新フロー PR-C・2026-10-09)。
+//    構成の指示文 (instruction) は変えていない。古い版の依頼は claim で packet_outdated にする (押し直し)
+// 6: 撮影判定の仕様書「新商品初動判定」(shoot_spec = {id, kind, hash}・取り込まれていなければ null) を入れた
+//    (画像制作の新フロー PR-C2・2026-10-09)。あれば shoot_instruction は SHOOT_SPEC_INSTRUCTION (形 v2)、
+//    無ければ今までどおり SHOOT_JUDGE_INSTRUCTION (形 v1)。構成の指示文 (instruction) は変えていない
+export const PACKET_VERSION = 6;
+/**
+ * claim で受ける packet の版。5 (PR-C) は 6 から shoot_spec を除いただけ (= 仕様書を取り込む前の 6 と同じ材料) なので受ける
+ * (デプロイの時点で待っている PR-C の依頼を、押し直しにしない・Codex PR-C2 名指し1 M)。4 以下は今どおり packet_outdated
+ */
+export const ACCEPTED_PACKET_VERSIONS = [5, PACKET_VERSION];
 export const PROMPT_VERSION = 'lp-compose-v1';
 export const LEASE_MIN = 40;
 /** 測定の合格ライン (設計 §7.2)。受付時に created_at + これで deadline を固定する */
@@ -66,7 +79,12 @@ export const REASON_MAX = 1000;
 /** 1 日の AI 呼び出しの上限。段階1 は 10 件の測定なので小さく始める (env で上げられる) */
 const DEFAULT_DAILY_CAP = 20;
 
-export const SPEC_KINDS = ['product_analysis'];
+/**
+ * 仕様書の種類。product_analysis = LP制作システム (構成を書く・段階1) /
+ * initial_judge = 新商品初動判定 (撮影判定・画像制作の新フロー PR-C2)。どちらも一覧画面から .xlsx で取り込む (admin)
+ */
+export const SPEC_KINDS = ['product_analysis', 'initial_judge'];
+export const SPEC_KIND_LABELS = { product_analysis: 'LP制作システム', initial_judge: '新商品初動判定' };
 export const JOB_STATUSES = ['queued', 'running', 'done', 'needs_review', 'failed', 'cancelled'];
 /** 人が次に何をするかが変わる終端だけ。cancelled は画面に出さない */
 export const TERMINAL_STATUSES = ['done', 'needs_review', 'failed', 'cancelled'];
@@ -115,6 +133,41 @@ export function canonicalJson(v) {
   if (v === null || typeof v !== 'object') return JSON.stringify(v);
   if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
   return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`;
+}
+
+/**
+ * canonicalJson と同じ考え方 (キーの順を固定) の直列化を、**再帰せずに**行う (撮影判定の再送 hash 用・PR-C)。
+ * 外から来た JSON は深く入れ子にできるので、再帰の直列化はスタックを溢れさせる (Codex PR-C 名指し2 High・3 M)。
+ * 同じ値が 2 回出てくる (循環参照など・HTTP の JSON では起きない) ときは null
+ */
+export function canonicalJsonFlat(root) {
+  const out = [];
+  const stack = [{ v: root }];
+  const seen = new WeakSet();
+  while (stack.length) {
+    const t = stack.pop();
+    if ('s' in t) { out.push(t.s); continue; }
+    const v = t.v;
+    if (v === null || typeof v !== 'object') {
+      const j = JSON.stringify(v);
+      out.push(j === undefined ? 'null' : j);
+      continue;
+    }
+    if (seen.has(v)) return null;
+    seen.add(v);
+    const parts = [];
+    if (Array.isArray(v)) {
+      parts.push({ s: '[' });
+      v.forEach((x, i) => { if (i) parts.push({ s: ',' }); parts.push({ v: x }); });
+      parts.push({ s: ']' });
+    } else {
+      parts.push({ s: '{' });
+      Object.keys(v).sort().forEach((k, i) => { parts.push({ s: (i ? ',' : '') + JSON.stringify(k) + ':' }); parts.push({ v: v[k] }); });
+      parts.push({ s: '}' });
+    }
+    for (let i = parts.length - 1; i >= 0; i--) stack.push(parts[i]);
+  }
+  return out.join('');
 }
 
 /** JST の日付 (1 日の上限を数える単位。夜間と手動が同じ境界を使う) */
@@ -237,6 +290,16 @@ export function specSummary(db, kind = 'product_analysis') {
   };
 }
 
+/**
+ * 仕様書の行の hash を**中身から**計算し直して照らす (claim で使う。保存済みの hash を信じない・コード R7 #1 と同じ考え方)
+ */
+function specRowIntact(row) {
+  if (!row) return false;
+  try {
+    return sha256(canonicalJson({ body: row.body, sheet_titles: JSON.parse(row.sheet_titles_json || '[]') })) === row.hash;
+  } catch { return false; }
+}
+
 // ─── 受付 ────────────────────────────────────────────────
 
 /**
@@ -340,7 +403,7 @@ export function buildImageGuide(images, materialsOmitted = 0) {
   return lines.join('\n');
 }
 
-export function buildPacket({ draft, productInfo, colorVariations, images = [], spec }) {
+export function buildPacket({ draft, productInfo, colorVariations, images = [], spec, shootSpec = null }) {
   const { images: imgs, materialsOmitted } = normalizeImagesDetail(images);
   const packet = {
     packet_version: PACKET_VERSION,
@@ -351,6 +414,15 @@ export function buildPacket({ draft, productInfo, colorVariations, images = [], 
     //    「指示文の差」なのか分からなくなる。
     //    packet に入れる = 受付時に固定され、packet_hash で守られる
     instruction: PRODUCT_ANALYSIS_INSTRUCTION,
+    // 撮影判定の指示 (PR-C)。🚨 上の instruction (スタッフと共有の正本) には混ぜない —
+    //    混ぜると構成の指示文がスタッフ版と違ってしまい、くらべっこが「同じ入力の比較」でなくなる。
+    //    結果は ⑦ の本文ではなく別の欄 (shoot_json) で受け取る (lib/lp-shoot.js)
+    // PR-C2: 仕様書「新商品初動判定」が取り込まれていれば、それで判定させる (決まりは仕様書が正本・形 v2)。
+    //    取り込まれていなければ PR-C の簡単な決まり (形 v1) のまま (取り込む前に壊れない)
+    shoot_instruction: shootSpec ? SHOOT_SPEC_INSTRUCTION : SHOOT_JUDGE_INSTRUCTION,
+    // その版 (受付時に固定)。本文は packet に入れず、claim で id から引いて hash を照らす (LP制作システムの spec_id と同じ作法)。
+    // 追記専用の表なので id の中身は変わらない。packet に 3 万字を複製しない
+    shoot_spec: shootSpec ? { id: Number(shootSpec.id), kind: shootSpec.kind, hash: shootSpec.hash } : null,
     draft_id: Number(draft.id),
     ne_code: trim(draft.ne_code, 100),
     name: trim(draft.name, 300),
@@ -443,7 +515,10 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     if (!specRow || specRow.kind !== 'product_analysis' || exact(spec?.hash, SHA256_RE) !== specRow.hash) {
       return { code: 'bad_request', error: '仕様書の版が見つかりません (取り込み直してください)' };
     }
-    const { packet, hash } = buildPacket({ draft: { ...draft, id: draftId }, productInfo, colorVariations, images, spec: specRow });
+    // 撮影判定の仕様書 (新商品初動判定・PR-C2) は受付の瞬間の最新版を固める (画面からは渡さない — 押した人が選ぶものではない)。
+    // 取り込まれていなければ null (PR-C の簡単な決まりで判定する)
+    const shootSpecRow = latestSpec(db, 'initial_judge');
+    const { packet, hash } = buildPacket({ draft: { ...draft, id: draftId }, productInfo, colorVariations, images, spec: specRow, shootSpec: shootSpecRow });
     recoverExpired(db, now);
     const live = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND status IN ('queued','running')`).get(draftId);
     if (live) return { code: 'already_running', error: 'この商品の構成をいま作っています', job: live };
@@ -458,9 +533,10 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     try {
       id = Number(db.prepare(`INSERT INTO ph_lp_compose_jobs
         (draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, spec_id, spec_hash,
-         requested_by, measurement_deadline_at, created_at, updated_at)
-        VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(draftId, key, JSON.stringify(packet), hash, PACKET_VERSION, specId, specRow.hash, a, deadline, nowS, nowS).lastInsertRowid);
+         shoot_spec_id, shoot_spec_hash, requested_by, measurement_deadline_at, created_at, updated_at)
+        VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(draftId, key, JSON.stringify(packet), hash, PACKET_VERSION, specId, specRow.hash,
+          shootSpecRow ? shootSpecRow.id : null, shootSpecRow ? shootSpecRow.hash : null, a, deadline, nowS, nowS).lastInsertRowid);
     } catch (e) {
       // SELECT と INSERT の間に別の接続が入った (二重クリック・リトライ)。
       // 例外にせず、相手が作った行 / 動いている依頼を返す (コード R1 #3)
@@ -531,15 +607,26 @@ export function recoverExpired(db, now = Date.now()) {
 }
 
 /** キューの要約 (実行役の「仕事なし」判定・監視用) */
-export function queueSummary(db, now = Date.now()) {
+/**
+ * @param {{shootSpec?: boolean}} opts shootSpec = 問い合わせた実行役が撮影判定の仕様書 (新商品初動判定) を受け取れるか (PR-C2)。
+ *   受け取れない (古い phlp) なら、仕様書つきの依頼は claimable に数えない — claim で掴ませないので、数えるとランナーが
+ *   毎分 Claude を空で起動してしまう (Codex PR-C2 名指し2 M)。数えなかった分は waiting_runner_update に出す
+ */
+export function queueSummary(db, now = Date.now(), { shootSpec = false } = {}) {
   return db.transaction(() => {
     recoverExpired(db, now);
     const c = (sql, ...a) => db.prepare(sql).get(...a).n;
+    // 🚨 json_valid を先に見る — 壊れた packet が 1 行でもあると json_extract が例外になり、queue ごと落ちて後ろの正常な依頼も止まる
+    //    (Codex PR-C2 名指し3 M)。壊れた行は数えておき、claim が packet_tampered で落とす (今までどおり)
+    const withSpec = c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued'
+      AND CASE WHEN json_valid(packet_json) THEN json_extract(packet_json, '$.shoot_spec') END IS NOT NULL`);
+    const queued = c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued'`);
     return {
       enabled: lpComposeEnabled(),
       // ランナーはこれを claude --model に渡す (claude を起動する前に知る必要がある)
       model: lpComposeModel(),
-      claimable: c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued'`),
+      claimable: shootSpec === true ? queued : queued - withSpec,
+      waiting_runner_update: shootSpec === true ? 0 : withSpec,
       running: c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'running'`),
       needs_review: c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'needs_review'`),
       reserved_today: c('SELECT COUNT(*) AS n FROM ph_lp_compose_generations WHERE reserved_day = ?', jstDay(now)),
@@ -555,7 +642,7 @@ export function queueSummary(db, now = Date.now()) {
  *    合わなければ job を failed にして次へ (Codex R3 #3)。
  * @returns {{ok:true, job:object|null}|{code:string, error:string}}
  */
-export function claimJob(db, { runnerRunId, maxImages, now = Date.now() } = {}) {
+export function claimJob(db, { runnerRunId, maxImages, shootSpec = false, now = Date.now() } = {}) {
   if (!lpComposeEnabled()) return { code: 'disabled', error: 'PH_LP_COMPOSE_ENABLED が無効です' };
   // モデルの設定が読めなければ掴まない (掴むと AI を呼ぶ手前の reserve で断られ、依頼が無駄に失敗する)
   if (!lpComposeModel()) return { code: 'bad_config', error: MODEL_CONFIG_ERROR };
@@ -563,25 +650,38 @@ export function claimJob(db, { runnerRunId, maxImages, now = Date.now() } = {}) 
   //    それより多い依頼を掴ませると、6 枚目までしか見ずに AI 枠を使い、証跡が足りず受け取れない (needs_review)。
   //    掴まずに queued のまま残す (新しい phlp を置けば次の分で拾う)
   const cap = Math.min(posInt(maxImages) || MAX_PRODUCT_IMAGES, MAX_IMAGES);
+  // 🚨 撮影判定の仕様書 (新商品初動判定) を受け取れる実行役か (PR-C2)。言わない古い phlp は仕様書をファイルに落とせず、
+  //    指示 (shoot-spec-<ID>.md を読む) に従えないまま「仕様書で判定した」形の撮影判定を出しうる。
+  //    仕様書を固めた依頼は掴ませない (queued のまま残す。新しい phlp を置けば次の分で拾う — 素材の codex #1593 と同じ作法)
+  const canShootSpec = shootSpec === true;
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
     recoverExpired(db, now);
     const skipped = [];
+    let skippedShootSpec = 0;
     for (let guard = 0; guard < 50; guard++) {
       const job = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE status = 'queued'
         AND id NOT IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT 1`).get(JSON.stringify(skipped));
       if (!job) {
-        return skipped.length
-          ? { ok: true, job: null, too_many_images: skipped.length,
-            error: `この実行役は扱えない依頼があります (画像が ${cap} 枚より多い / 素材つき)。miniPC で install.ps1 を流して phlp を新しくしてください` }
-          : { ok: true, job: null };
+        if (!skipped.length) return { ok: true, job: null };
+        const tooMany = skipped.length - skippedShootSpec;
+        return {
+          ok: true, job: null,
+          ...(tooMany ? { too_many_images: tooMany } : {}),
+          ...(skippedShootSpec ? { needs_shoot_spec: skippedShootSpec } : {}),
+          error: skippedShootSpec
+            ? 'この実行役は扱えない依頼があります (撮影判定の仕様書「新商品初動判定」を受け取れない古い phlp)。miniPC で install.ps1 を流して phlp を新しくしてください'
+            : `この実行役は扱えない依頼があります (画像が ${cap} 枚より多い / 素材つき)。miniPC で install.ps1 を流して phlp を新しくしてください`,
+        };
       }
       try {
-        const imgs = JSON.parse(job.packet_json).images || [];
+        const pk = JSON.parse(job.packet_json);
+        const imgs = pk.images || [];
         // 🚨 枚数を言わない古い phlp には、6 枚以下でも素材つきの依頼を掴ませない (codex #1593 R2 Medium)。
         //    古い phlp とスキルは素材も添付画像の説明も知らないので、素材を商品の手本として扱ってしまう
         const legacy = !posInt(maxImages);
         if (imgs.length > cap || (legacy && imgs.some((im) => isMaterialRole(im?.role)))) { skipped.push(job.id); continue; }
+        if (pk.shoot_spec && !canShootSpec) { skipped.push(job.id); skippedShootSpec++; continue; }
       } catch { /* 壊れた packet は下の照合で failed にする */ }
       // 🚨 claim は「材料を AI に渡す瞬間」= 材料固定という設計の芯が試される所。
       //    保存済みの hash を信じず、**中身から計算し直して**照合する (コード R7 #1)。
@@ -593,10 +693,15 @@ export function claimJob(db, { runnerRunId, maxImages, now = Date.now() } = {}) 
           // 🚨 packet と job 行の**突き合わせ**も要る (コード R8 #1)。
           //    それぞれの hash が個別に正しくても、job の spec_id / spec_hash だけ書き換えれば
           //    「受付時とは別の仕様書」を渡せてしまう
+          // 撮影判定の仕様書 (PR-C2) も job の列と突き合わせる (packet だけ書き換えて別の有効な版を渡させない・Codex PR-C2 名指し5 M)。
+          // 無い依頼 (取り込む前・版 5) は両方 null
+          const ss = p.shoot_spec || null;
           return p.draft_id === job.draft_id
             && p.packet_version === job.packet_version
             && p.spec_id === job.spec_id
-            && p.spec_hash === job.spec_hash;
+            && p.spec_hash === job.spec_hash
+            && (ss ? ss.id : null) === (job.shoot_spec_id ?? null)
+            && (ss ? ss.hash : null) === (job.shoot_spec_hash ?? null);
         } catch { return false; }
       })();
       if (!packetOk) {
@@ -611,7 +716,7 @@ export function claimJob(db, { runnerRunId, maxImages, now = Date.now() } = {}) 
       //    版が上がる = 渡す材料の形が変わった。v1 には instruction が入っていないので、
       //    そのまま渡すと**スタッフと違う指示文で作ったものが測定に混ざる** (設計 §5 / §7.1)。
       //    自動で作り直さない — 人がもう一度ボタンを押す (渡した材料を勝手に差し替えない)。
-      if (job.packet_version !== PACKET_VERSION) {
+      if (!ACCEPTED_PACKET_VERSIONS.includes(job.packet_version)) {
         db.prepare(`UPDATE ph_lp_compose_jobs
           SET status = 'failed', error_code = 'packet_outdated', error = ?,
               updated_at = ?, completed_at = COALESCE(completed_at, ?)
@@ -620,13 +725,7 @@ export function claimJob(db, { runnerRunId, maxImages, now = Date.now() } = {}) 
         continue;
       }
       const spec = db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(job.spec_id);
-      const specOk = spec
-        && spec.hash === job.spec_hash
-        && (() => {
-          try {
-            return sha256(canonicalJson({ body: spec.body, sheet_titles: JSON.parse(spec.sheet_titles_json || '[]') })) === spec.hash;
-          } catch { return false; }
-        })();
+      const specOk = spec && spec.kind === 'product_analysis' && spec.hash === job.spec_hash && specRowIntact(spec);
       if (!specOk) {
         // まだ queued なので status の条件は 'queued'。running を条件にすると 1 行も動かず、
         // 同じ job を掴み続けて claim が空回りする
@@ -636,6 +735,21 @@ export function claimJob(db, { runnerRunId, maxImages, now = Date.now() } = {}) 
           WHERE id = ? AND status = 'queued'`)
           .run('受付時の仕様書の版が見つからない (取り込み直してからもう一度依頼してください)', nowS, nowS, job.id);
         continue;
+      }
+      // 撮影判定の仕様書 (新商品初動判定・PR-C2)。LP制作システムと同じく、受付時の id で引いて hash を中身から照らす
+      let shootSpec = null;
+      const shootRef = JSON.parse(job.packet_json).shoot_spec || null;   // packet は上で照合済み (JSON として読める)
+      if (shootRef) {
+        const row = posInt(shootRef.id) ? db.prepare('SELECT * FROM ph_lp_specs WHERE id = ?').get(shootRef.id) : null;
+        if (!row || row.kind !== 'initial_judge' || row.hash !== shootRef.hash || !specRowIntact(row)) {
+          db.prepare(`UPDATE ph_lp_compose_jobs
+            SET status = 'failed', error_code = 'spec_changed', error = ?,
+                updated_at = ?, completed_at = COALESCE(completed_at, ?)
+            WHERE id = ? AND status = 'queued'`)
+            .run('受付時の撮影判定の仕様書 (新商品初動判定) の版が見つからない (取り込み直してからもう一度依頼してください)', nowS, nowS, job.id);
+          continue;
+        }
+        shootSpec = row;
       }
       const token = randomBytes(16).toString('hex');
       const until = new Date(now + LEASE_MIN * 60_000).toISOString();
@@ -658,6 +772,8 @@ export function claimJob(db, { runnerRunId, maxImages, now = Date.now() } = {}) 
           prompt_version: PROMPT_VERSION,
           model: lpComposeModel(),
           spec: { id: spec.id, kind: spec.kind, title: spec.title, hash: spec.hash, body: spec.body },
+          // 撮影判定の仕様書「新商品初動判定」の全文 (PR-C2)。無い依頼は null (PR-C の簡単な決まりで判定する)
+          shoot_spec: shootSpec ? { id: shootSpec.id, kind: shootSpec.kind, title: shootSpec.title, hash: shootSpec.hash, body: shootSpec.body } : null,
         },
       };
     }
@@ -731,10 +847,14 @@ export function reserveGeneration(db, jobId, { leaseToken, model, promptVersion,
  *
  * **確定済み + 同じ payload の再送は保存済みの receipt を返す** (通信断のリトライで二重に書かない)。
  * lease が切れていても受ける — AI 枠は既に消費しているので、結果は取りこぼさない (④)。
- * @returns {{ok:true, status:string, already:boolean}|{code:string, error:string}}
+ *
+ * `shoot` = AI の撮影判定 (画像制作の新フロー PR-C・service-api の shoot_json)。送らない古い実行役は undefined。
+ * 🚨 **撮影判定が壊れていても結果は断らない** — 構成 (段階1 の測定対象) を巻き込んで落とさない。
+ *    形が違えば撮影判定だけ使わず (shoot_error に理由)、構成は今までどおり受け付ける
+ * @returns {{ok:true, status:string, already:boolean, shoot:object}|{code:string, error:string}}
  */
 export function submitResult(db, generationId, {
-  packetHash, verdict, output = null, lint = null, reviewRounds = null, receipt = null, reason = null, now = Date.now(),
+  packetHash, verdict, output = null, lint = null, reviewRounds = null, receipt = null, reason = null, shoot = undefined, now = Date.now(),
 } = {}) {
   const nowS = new Date(now).toISOString();
   const v = trim(verdict, 20);
@@ -785,10 +905,24 @@ export function submitResult(db, generationId, {
     }
   }
   const reasonText = trim(reason, REASON_MAX);
+  // 撮影判定 (PR-C)。null も「送らなかった」と同じ (phlp は --shoot が無ければ載せない)
+  const shootSent = shoot !== undefined && shoot !== null;
+  let shootHash = null;
+  if (shootSent) {
+    // 撮影判定がどんな形でも結果は断らない (撮影判定だけ使わない)。hash は**中身から**作る:
+    // 🚨 「使えない」1 つに畳むと、別々の壊れた判定の再送が同じ結果と見なされる (Codex PR-C 名指し1・3 M)。
+    //    大きさは保存できるかだけに使う (検査は lp-shoot.js)。HTTP の本文は express.json の上限 (1MB) で抑えられている
+    // 🚨 再帰しない直列化 (canonicalJsonFlat) を使う — canonicalJson も JSON.stringify (Node 20 系) も再帰なので、
+    //    深く入れ子にした値でスタックが溢れ、結果が 500 → 予約が reserved のまま構成ごと needs_review に落ちる (名指し2 High・3 M)
+    const s = canonicalJsonFlat(shoot);
+    shootHash = s === null ? 'unserializable' : sha256(s);
+  }
   // 🚨 receipt も hash の対象に入れる。入れないと「画像の証跡だけ違う再送」を
   //    同じ結果と見なして保存済みを返してしまう (コード R2 #1)。finalized_at は毎回変わるので入れない
+  // 撮影判定は**送られたときだけ**入れる — 送らない古い実行役の再送が、この版で別の hash にならないように
   const payloadHash = sha256(canonicalJson({
     verdict: v, output: out, lint: lintJson, review_rounds: rounds, reason: reasonText,
+    ...(shootSent ? { shoot: shootHash } : {}),
   }));
   return db.transaction(() => {
     const gen = db.prepare('SELECT * FROM ph_lp_compose_generations WHERE id = ?').get(posInt(generationId));
@@ -800,7 +934,7 @@ export function submitResult(db, generationId, {
       // 同じ結果の再送 = 保存済みの receipt を返す (リトライで二重に書かない)
       if (gen.payload_hash === payloadHash) {
         const job = jobById(db, gen.job_id);
-        return { ok: true, status: job?.status || gen.status, already: true, receipt: JSON.parse(gen.receipt_json || 'null') };
+        return { ok: true, status: job?.status || gen.status, already: true, receipt: JSON.parse(gen.receipt_json || 'null'), shoot: shootReceipt(job, shootSent) };
       }
       return { code: 'already_finalized', error: 'この予約は確定済みです (別の内容では上書きできません)' };
     }
@@ -874,6 +1008,17 @@ export function submitResult(db, generationId, {
     let runnerLint = null;
     try { runnerLint = lintJson ? JSON.parse(lintJson) : null; } catch { runnerLint = null; }
     const storedLint = v === 'accepted' ? packStoredLint(serverLint, runnerLint) : lintJson;
+    // 撮影判定 (PR-C): 構成を残すとき (accepted・残す下書き) だけ、**その構成の画像と照らして**保存する。
+    // 構成が残らない rejected には付けない (何の画像の判定か分からない)
+    const composed = v === 'accepted' ? out : rejectedDraft;
+    let shootJson = null;
+    let shootError = null;
+    if (shootSent && composed) {
+      // 依頼が求める形 (仕様書「新商品初動判定」を固めた依頼は v2・それ以外は v1・PR-C2) で見る
+      const sv = validateShootForComposition(shoot, composed, { format: packetShootFormat(job) });
+      if (sv.ok) shootJson = JSON.stringify(sv.value);
+      else shootError = sv.errors.join(' / ').slice(0, 1000);
+    }
     const receiptObj = {
       verdict: v, review_rounds: rounds, model: gen.model, prompt_version: gen.prompt_version,
       finalized_at: nowS,
@@ -891,17 +1036,19 @@ export function submitResult(db, generationId, {
       ? db.prepare(`UPDATE ph_lp_compose_jobs
           SET status = 'done', output_text = ?, output_hash = ?, lint_json = ?, review_rounds = ?,
               error_code = NULL, error = NULL, lease_token = NULL, lease_until = NULL,
+              shoot_json = ?, shoot_error = ?,
               updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
           WHERE id = ? AND status IN ('running', 'needs_review')`)
-        .run(out, sha256(out), storedLint, rounds, nowS, nowS, nowS, job.id).changes
+        .run(out, sha256(out), storedLint, rounds, shootJson, shootError, nowS, nowS, nowS, job.id).changes
       : db.prepare(`UPDATE ph_lp_compose_jobs
           SET status = 'failed', lint_json = ?, review_rounds = ?, error_code = 'rejected', error = ?,
               output_text = ?, output_hash = ?,
               lease_token = NULL, lease_until = NULL,
+              shoot_json = ?, shoot_error = ?,
               updated_at = ?, completed_at = COALESCE(completed_at, ?), finalized_at = ?
           WHERE id = ? AND status IN ('running', 'needs_review')`)
         .run(storedLint, rounds, reasonText || '検品で通らなかった', rejectedDraft, rejectedDraft ? sha256(rejectedDraft) : null,
-          nowS, nowS, nowS, job.id).changes;
+          shootJson, shootError, nowS, nowS, nowS, job.id).changes;
 
     if (genCh !== 1 || jobCh !== 1) {
       throw new Error(`lp-compose: 結果の確定で行が動かなかった (generation=${genCh} job=${jobCh})`);
@@ -918,11 +1065,37 @@ export function submitResult(db, generationId, {
       } else if (!gen.model_check) {
         logEvent(db, job.draft_id, 'lp_compose_result', `依頼 ${job.id} (${rounds ?? '?'} 巡・モデル確認待ち)`, 'ph-lp-compose');
       }
-      return { ok: true, status: gen.model_check && gen.model_check !== 'match' ? 'needs_review' : 'done', already: false, receipt: receiptObj };
+      return { ok: true, status: gen.model_check && gen.model_check !== 'match' ? 'needs_review' : 'done', already: false, receipt: receiptObj,
+        shoot: shootReceipt({ shoot_json: shootJson, shoot_error: shootError }, shootSent) };
     }
     logEvent(db, job.draft_id, 'lp_compose_rejected', `依頼 ${job.id}: ${trim(reason, 200)}`, 'ph-lp-compose');
-    return { ok: true, status: 'failed', already: false, receipt: receiptObj };
+    return { ok: true, status: 'failed', already: false, receipt: receiptObj, shoot: shootReceipt({ shoot_json: shootJson, shoot_error: shootError }, shootSent) };
   }).immediate();
+}
+
+/** その依頼に固めた撮影判定の仕様書 (新商品初動判定) の本文。警告 (shootWarnings) が仕様書に書いてある決まりだけを出すのに使う */
+function shootSpecTextOf(db, job) {
+  const id = posInt(job?.shoot_spec_id);
+  if (!id) return '';
+  const row = db.prepare('SELECT body, hash, kind FROM ph_lp_specs WHERE id = ?').get(id);
+  return row && row.kind === 'initial_judge' && row.hash === job.shoot_spec_hash ? String(row.body || '') : '';
+}
+
+/** 依頼の packet が求める撮影判定の形 (1 | 2)。読めなければ 1 */
+function packetShootFormat(job) {
+  try { return shootFormatOfPacket(JSON.parse(job.packet_json)); } catch { return 1; }
+}
+
+/**
+ * 撮影判定をどう扱ったか (実行役に返す)。実行役のログに残り、壊れていたら次から直せるように理由も返す。
+ *   saved = 保存した / invalid = 形が違ったので使わない (構成は受け付けた) /
+ *   ignored = 構成が残らない結果なので使わない / not_sent = 送られてこなかった
+ */
+function shootReceipt(row, sent) {
+  if (!sent) return { status: 'not_sent' };
+  if (row?.shoot_json) return { status: 'saved' };
+  if (row?.shoot_error) return { status: 'invalid', error: String(row.shoot_error) };
+  return { status: 'ignored' };
 }
 
 /**
@@ -1013,9 +1186,12 @@ function packStoredLint(serverLint, runnerLint) {
  * これが無いと、実行役は `result --accepted` を出して断られるまで lint 結果を知れず、
  * その 1 回で generation を使い切ってしまう。**測定の目的は「直せたか」ではなく
  * 「どこまで書けたか」**なので、lint 自体は何度でも回せてよい (AI 枠を消費しない)。
- * @returns {{ok:true, lint:object}|{code:string, error:string}}
+ *
+ * `shoot` (撮影判定・PR-C) を渡すと、結果を受け取るときと**同じ検査**も返す (`shoot: {ok, errors}`)。
+ * 構成の lint (`lint`) とは別に返す — 撮影判定が通らなくても構成の lint の結果は変わらない
+ * @returns {{ok:true, lint:object, shoot?:object}|{code:string, error:string}}
  */
-export function lintForJob(db, jobId, { leaseToken, output, now = Date.now() } = {}) {
+export function lintForJob(db, jobId, { leaseToken, output, shoot = undefined, now = Date.now() } = {}) {
   const nowS = new Date(now).toISOString();
   const l = liveLease(db, posInt(jobId), leaseToken, nowS);
   if (l.code) return l;
@@ -1025,7 +1201,11 @@ export function lintForJob(db, jobId, { leaseToken, output, now = Date.now() } =
   let packetName = null;
   try { packetName = JSON.parse(l.job.packet_json).name || null; } catch { packetName = null; }
   try {
-    return { ok: true, lint: lintSummary(lintComposition(out, { productName: packetName })) };
+    const lint = lintSummary(lintComposition(out, { productName: packetName }));
+    if (shoot === undefined || shoot === null) return { ok: true, lint };
+    const sv = validateShootForComposition(shoot, out, { format: packetShootFormat(l.job) });
+    // warnings = 仕様書の運用ルールの知らせ (通らないわけではない・PR-C2)。実行役が仕様書を読み直して直せるように返す
+    return { ok: true, lint, shoot: sv.ok ? { ok: true, errors: [], warnings: shootWarnings(sv.value, { specText: shootSpecTextOf(db, l.job) }) } : { ok: false, errors: sv.errors, warnings: [] } };
   } catch (e) {
     return { code: 'lint_failed', error: `lint を実行できませんでした: ${String(e?.message || e).slice(0, 200)}` };
   }
@@ -1186,6 +1366,68 @@ function closeUncheckedModels(db, now) {
 
 // ─── 画面 ────────────────────────────────────────────────
 
+/** AI の判定が無いときの読み口の形 (項目はそろえて、中身は空) */
+function emptyShootJudgement(jobId, missing) {
+  return {
+    job_id: jobId, available: false, format: null, recommended: null, reason: null,
+    summary: { judgement: '', shooter: '', open_required: '', send_targets: '', purpose: '', finish: '', usage: '', conclusion: '' },
+    cuts: [], cut_count: 0, images: [], warnings: [], missing,
+  };
+}
+
+/**
+ * いちばん新しい構成についた AI の撮影判定 (画像制作の新フロー PR-C)。撮影指示書 (PR-D) と画面が読む。
+ *
+ * 「いちばん新しい構成」= lib/lp-image.js の latestComposeJob と同じ: その商品の**最新の依頼**が
+ * done かつ実モデル一致で本文があるときだけ。新しい依頼が動いている・失敗した間は、古い構成の判定を出さない
+ * (画像生成と同じく、作り直しを頼んだら前の構成は「今の構成」ではない)。
+ *
+ * 形は仕様書「新商品初動判定」の撮影依頼書連携データに合わせた v2 (PR-C2・lib/lp-shoot.js の shootReadModel)。
+ * PR-C の形 (v1) で保存済みの行も v2 の形に寄せて返す (v1 に無い項目は "")。
+ * @returns {null|{job_id:number, available:boolean, format:1|2|null, recommended:string|null, reason:string|null,
+ *   summary:{judgement, shooter, open_required, send_targets, purpose, finish, usage, conclusion},
+ *   cuts:Array<{no, priority, expression_type, variation, target, content, purpose, finish, usage, open_required, reference_theme, lp_image_nos, notice, required_notice}>, cut_count:number,
+ *   images:Array<{no:number, needs_shoot:boolean, cut:string, composition:string, props:string, background:string, tone:string, ng:string}>,
+ *   warnings:string[], missing:null|'not_sent'|'invalid'}}
+ *   null = 使える構成がまだ無い。available=false = 構成はあるが AI の判定が無い
+ *   (missing: not_sent = 撮影判定を出さない古い実行役で作った / invalid = 形が違ったので使わなかった)
+ *   summary・cuts の項目名は撮影指示書 (PR-D・lib/shoot-sheet.js) の SUMMARY_FIELDS・CUT_FIELDS と同じ (撮影指示書がそのまま使う)。
+ *   images は PR-C の形のまま (v1 の判定から撮影指示書を作るときの材料。v2 では cut・composition にその画像を使うカットから入れる)
+ */
+export function latestShootJudgement(db, draftId) {
+  const id = posInt(draftId);
+  if (!id) return null;
+  const job = db.prepare(`SELECT j.id, j.status, j.output_text, j.shoot_json, j.shoot_error, j.packet_json, j.shoot_spec_id, j.shoot_spec_hash, g.model_check
+    FROM ph_lp_compose_jobs j LEFT JOIN ph_lp_compose_generations g ON g.job_id = j.id
+    WHERE j.draft_id = ? ORDER BY j.id DESC LIMIT 1`).get(id);
+  if (!job || job.status !== 'done' || job.model_check !== 'match' || !trim(job.output_text)) return null;
+  let value = null;
+  if (job.shoot_json) {
+    // 保存した形をもう一度通す (DB を直接触られて壊れたものを、人が決める材料として出さない)。
+    // 形は依頼 (packet) が求める形で見る (保存のときと同じ。DB を直接触って別の形に替えたものを出さない)
+    try {
+      const again = validateShootForComposition(JSON.parse(job.shoot_json), job.output_text, { format: packetShootFormat(job) });
+      value = again.ok ? again.value : null;
+    } catch { value = null; }
+  }
+  if (!value) return emptyShootJudgement(job.id, job.shoot_json || job.shoot_error ? 'invalid' : 'not_sent');
+  return { job_id: job.id, available: true, ...shootReadModel(value, { specText: shootSpecTextOf(db, job) }), missing: null };
+}
+
+/**
+ * 画面 (撮影判定の箱) に渡す分だけ。画像ごとの要否は画面に出さない (構成の一覧は PR-B の持ち場)。
+ * PR-C2: 開封要否・カット数・撮影用送付対象・仕様書の運用ルールの知らせ (warnings) も短く出す
+ * (カットの中身は撮影指示書 PR-D の役目なので出さない)
+ */
+export function shootSummaryFor(db, draftId) {
+  const j = latestShootJudgement(db, draftId);
+  if (!j) return null;
+  return {
+    job_id: j.job_id, available: j.available, format: j.format, recommended: j.recommended, reason: j.reason,
+    open_required: j.summary.open_required, cut_count: j.cut_count, send_targets: j.summary.send_targets, warnings: j.warnings, missing: j.missing,
+  };
+}
+
 /**
  * 詳細画面に出す状態。ポーリングで 5 秒おきに叩かれるので軽く保つ
  * (done のときだけ output_text を返す)。
@@ -1195,7 +1437,11 @@ export function jobStateFor(db, draftId, { now = Date.now() } = {}) {
   const job = db.prepare('SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(posInt(draftId));
   // いま押したら使われるモデル (ボタンに出す)
   const cfg = lpComposeModel();   // 読めない設定なら null (ボタンは requestBlockReason で押せない)
-  const current = { enabled: lpComposeEnabled(), model: cfg, model_label: cfg ? modelLabel(cfg) : null };
+  const current = {
+    enabled: lpComposeEnabled(), model: cfg, model_label: cfg ? modelLabel(cfg) : null,
+    // AI の撮影判定 (PR-C)。構成ができたらポーリングの応答で撮影判定の箱にも出す
+    shoot: shootSummaryFor(db, draftId),
+  };
   if (!job) return { ...current, job: null };
   // この依頼で**実際に予約された**モデル。予約前 (待ち・画像なしで止まった等) は null
   const gen = db.prepare(`SELECT model, actual_model, model_check FROM ph_lp_compose_generations

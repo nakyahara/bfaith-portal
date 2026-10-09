@@ -19,10 +19,13 @@ import {
   getDB, logEvent, gateReasons, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
-  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
+  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, setShootMode, materialStepWouldBreak, SHOOT_MODES, SHOOT_MODE_CODES, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, MATERIAL_STATUS_LABELS, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
+// 撮影指示書 (スプレッドシート) の自動作成と、撮影依頼文のいつもの宛先 (2026-10-09 画像制作の新フロー PR-D)
+import { getShootMention, setShootMention, normalizeShootMention } from './db.js';
+import { createOrUpdateShootSheet, shootSheetStateFor } from './services/shoot-sheet-service.js';
 // 夜間自動化 (2026-08-28): 人の確認待ち + 文字数ガード
 import {
   validateAiOutputLength, GENERATION_BLOCK_CODES, GENERATION_BLOCK_REASON_MAX,
@@ -76,8 +79,26 @@ import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFaile
 import {
   requestImageJob as requestLpImageJob, imageStateFor as lpImageStateFor, createLpImageWorker, openaiGenerateImage,
   imageBlockReason as lpImageBlockReason, imageRefCandidates as lpImageRefCandidates, validImageRequestKey as lpImageValidKey,
+  requestImageRegen as requestLpImageRegen, setImageChecked as setLpImageChecked, fullJobConflict as lpImageFullJobConflict,
 } from './lib/lp-image.js';
 import { Readable } from 'node:stream';
+// LP 構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09)。ロジックは lib/lp-edit.js
+import { editStateFor as lpEditStateFor, saveEdit as saveLpEdit, effectiveComposeText as lpEffectiveComposeText } from './lib/lp-edit.js';
+import { imageLimitForPriority as lpImageLimitForPriority } from './lib/lp-image.js';
+// デザイナー修正依頼書 (スプレッドシート) の自動作成 (画像制作の新フロー PR-F・2026-10-09)
+import { createOrUpdateDesignerSheet, designerSheetStateFor, revokeAllDesignerShares, sweepDesignerShares, DESIGNER_SHEET_FORBIDDEN } from './services/designer-sheet-service.js';
+// デザイナー修正依頼書のために公開したまま、依頼書に載っていない画像を、起動の 1 分あとと、その後 30 分おきに片付ける
+// (作っている途中でプロセスが止まると後片付けが動かない・外すのに一度失敗した公開も押されるまで残る — Codex PR-F 名指し3 高・名指し5 中)。
+// 鍵が無い (試験・未設定) なら何もしない
+if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+  const sweep = () => sweepDesignerShares()
+    .then((r) => { if (r.revoked) console.log(`[product-hub] デザイナー修正依頼書: 公開したままの画像 ${r.revoked} 枚を片付けました`); })
+    .catch((e) => console.error('[product-hub] デザイナー修正依頼書の公開の片付け:', e?.message || e));
+  const t = setTimeout(sweep, 60_000);
+  const iv = setInterval(sweep, 30 * 60_000);
+  if (t.unref) t.unref();
+  if (iv.unref) iv.unref();
+}
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
@@ -126,13 +147,15 @@ import {
 } from './lib/ad-kw-ai.js';
 // LP 構成の AI 生成 (段階1)。正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』
 import {
-  lpComposeEnabled, importSpec as importLpSpec, latestSpec as latestLpSpec, specSummary as lpSpecSummary,
+  lpComposeEnabled, importSpec as importLpSpec, latestSpec as latestLpSpec, specSummary as lpSpecSummary, SPEC_KIND_LABELS as LP_SPEC_KIND_LABELS,
   requestJob as requestLpComposeJob, requestBlockReason as lpComposeBlockReason, requestPrecheck as lpComposeRequestPrecheck,
   queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
   lpComposeImageRef, recordImageServed as recordLpComposeImageServed, imagePlan as lpComposeImagePlan, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_PRODUCT_IMAGES as LP_COMPOSE_MAX_PRODUCT_IMAGES,
   lintForJob as lintLpComposeForJob,
+  // AI の撮影判定 (画像制作の新フロー PR-C)。「おすすめにする」がいまのおすすめかを照らす
+  latestShootJudgement,
 } from './lib/lp-compose.js';
 import { assertXlsxExpandsSafely, XlsxTooLargeError } from './lib/xlsx-guard.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
@@ -266,8 +289,9 @@ router.get('/list', (req, res) => {
     maxRegisterCodes: MAX_REGISTER_CODES,
     intake: intakeStatus(),
     isAdmin: req.session?.role === 'admin',
-    // LP 構成の AI 生成 (段階1) の仕様書。admin にだけ出すカードで使う
-    lpSpec: { enabled: lpComposeEnabled(), spec: lpSpecSummary(db, 'product_analysis') },
+    // LP 構成の AI 生成 (段階1) の仕様書。admin にだけ出すカードで使う。
+    // shootSpec = 撮影判定の仕様書「新商品初動判定」(画像制作の新フロー PR-C2)。同じカードで種類を選んで取り込む
+    lpSpec: { enabled: lpComposeEnabled(), spec: lpSpecSummary(db, 'product_analysis'), shootSpec: lpSpecSummary(db, 'initial_judge') },
     shopCategoryCount: countActiveShopCategories(db),
     maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
     // 広げる道 PR-6 (門 product-hub:screen:/list。今までどおりなら空):
@@ -542,9 +566,26 @@ router.get('/detail/:id', (req, res) => {
     // 画面はこの後 5 秒おきに GET /api/drafts/:id/lp-compose を叩いて更新する
     lpCompose: lpComposeInitialState(db, draft),
     // 「🖼 画像を作る」(段階2・2026-10-04)。同じく最初の表示をここで作る
-    lpImage: lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }),
+    // compose_version = 画面が見ている LP構成の版。押したときに添え、違えば受け付けない (PR-B)
+    // can_edit = 押せる人か (PR-E)・compose_version = 画面が見ている LP構成の版 (PR-B) は lpImageStateForReq が付ける
+    lpImage: lpImageStateForReq(req, db, draft),
+    // LP構成の確認・修正 (2026-10-09 PR-B)。直せるのは画像制作情報を触れる人だけ (見るのは誰でも)
+    lpEdit: lpEditStateFor(db, draft, { canEdit: canEditImageProduction(req), imageLimit: lpImageLimitForPriority(draft.image_priority) }),
+    // 画像制作の新フロー (2026-10-08): 撮影判定の 3 択と、撮影依頼文の宛先
+    imageFlow: { shootModes: SHOOT_MODES, mention: shootRequestMention(db) },
+    // 撮影指示書 (スプレッドシート) の自動作成 (2026-10-09 PR-D): ボタンの出し分けと「LP構成が変わりました」
+    shootSheet: shootSheetStateFor(db, draft, imageProduction),
   });
 });
+
+/**
+ * 撮影依頼文の 1 行目 (いつもの宛先)。2026-10-08 スタッフのラフは「@つくば」。
+ * 2026-10-09〜 管理者が「担当者・工程の設定」で変える (DB)。DB に値が無ければ env PH_SHOOT_REQUEST_MENTION → 既定「@つくば」。
+ * 空にすると宛先の行を入れない。詳細画面ではその回だけ欄で直せる (保存はしない)
+ */
+function shootRequestMention(db = getDB()) {
+  return getShootMention(db).value;
+}
 
 // ─── API: ドラフト作成/更新 ───────────────────────────────
 
@@ -1434,6 +1475,22 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (urlVal && !isHttpUrl(urlVal)) {
     return res.status(400).json({ ok: false, error: '撮影指示URLの形式が不正です (http/https)' });
   }
+  // 指示書の URL を変える保存は、画面が見ていた値 (camera_instruction_url_expected) が要る。今の値と違えば 409。
+  // 別のタブで撮影指示書を自動で作った (PR-D) 後に、古い画面の値で戻さない (Codex PR-D 名指し2/3 M)。
+  // 値が変わらない保存 (今と同じ URL を送ってきた) は添えなくても通す。比べるのは保存と同じトランザクションの中 (名指し8 M)
+  const hasCamExp = Object.prototype.hasOwnProperty.call(b, 'camera_instruction_url_expected');
+  if (urlVal !== undefined && hasCamExp && typeof b.camera_instruction_url_expected !== 'string') {
+    return res.status(400).json({ ok: false, error: 'camera_instruction_url_expected は文字で指定してください' });
+  }
+  const cameraUrlConflict = () => {
+    if (urlVal === undefined) return null;
+    const nowUrl = String(db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.camera_instruction_url || '').trim();
+    if (String(urlVal || '').trim() === nowUrl) return null;
+    if (!hasCamExp) return '画面が古いので撮影指示書の URL を保存できません。画面を読み直してから保存してください';
+    if (nowUrl !== b.camera_instruction_url_expected.trim()) return 'ほかの人 (または別の画面) が撮影指示書の URL を変えています (撮影指示書を作った など)。画面を読み直してから保存してください';
+    return null;
+  };
+  { const msg = cameraUrlConflict(); if (msg) return res.status(409).json({ ok: false, error: msg }); }
   const canvaVal = b.canva_url !== undefined ? cleanText(b.canva_url, 1000) : undefined;
   if (canvaVal && !isHttpUrl(canvaVal)) {
     return res.status(400).json({ ok: false, error: 'CanvaリンクのURL形式が不正です (http/https)' });
@@ -1443,12 +1500,48 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (topRefVal && !isHttpUrl(topRefVal)) {
     return res.status(400).json({ ok: false, error: '参考・ラフのURL形式が不正です (http/https)' });
   }
+  // 編集データ (PSD 等) のリンク (2026-10-08 画像制作の新フロー)
+  const editDataVal = b.edit_data_url !== undefined ? cleanText(b.edit_data_url, 1000) : undefined;
+  if (editDataVal && !isHttpUrl(editDataVal)) {
+    return res.status(400).json({ ok: false, error: '編集データリンクのURL形式が不正です (http/https)' });
+  }
   // 画像工程 v2 (2026-08-26): 撮影・素材ステータスは安定コードだけ受ける / 商品情報は変更時に更新者・日時を残す
   let materialVal;
   if (b.material_status !== undefined) {
     materialVal = cleanText(b.material_status, 40) || null;
     if (materialVal && !MATERIAL_STATUS_CODES.has(materialVal)) {
       return res.status(400).json({ ok: false, error: '撮影・素材ステータスの値が不正です' });
+    }
+    // 撮影判定と食い違う素材ステータスは保存しない (古いタブからの保存も同じ)。変えたいなら撮影判定のほうで選ばせる
+    //   撮影が要る なのに「撮影不要」→ 撮影しないまま ③素材待ち を通れてしまう — Codex PR-A 名指し High
+    //   撮影不要 なのに「撮影不要 / 素材完了」以外 → 撮影不要と出ているのに ③ が閉じられない — Codex PR-A R2 P2
+    const ipNow = db.prepare('SELECT shoot_mode, material_status FROM draft_image_production WHERE draft_id = ?').get(draft.id) || {};
+    const sm = ipNow.shoot_mode;
+    // 画面が見ていた撮影判定 (shoot_mode_expected) と今の判定が違えば 409。別タブで「撮影不要 → 社内撮影」に
+    // 変えて素材完了を外したのに、古いタブの素材完了で戻されるのを防ぐ (Codex PR-A 名指し7 High)。省略可 (古い画面)
+    if (Object.prototype.hasOwnProperty.call(b, 'shoot_mode_expected')) {
+      const exp = b.shoot_mode_expected;
+      if (!(exp === null || (typeof exp === 'string' && SHOOT_MODE_CODES.has(exp)))) {
+        return res.status(400).json({ ok: false, error: 'shoot_mode_expected の値が不正です' });
+      }
+      if ((sm ?? null) !== exp) {
+        return res.status(409).json({ ok: false, error: 'ほかの人 (または別の画面) が撮影判定を変えています。画面を読み直してから、撮影・素材ステータスを選び直してください' });
+      }
+    } else if (sm) {
+      // 判定を添えてこない保存 (この変更より前に開いた画面など) は、撮影判定のある商品では素材ステータスを変えさせない。
+      // どの判定を見て選んだ値か分からないので、そろえた値を古い値で戻しうる (Codex PR-A R8 P1)。判定の無い商品は今までどおり
+      return res.status(409).json({ ok: false, error: '画面が古いので撮影・素材ステータスを保存できません。画面を読み直してから保存してください' });
+    }
+    // ③素材待ち を完了したあとで、③ の条件を満たさない値へ変える保存 (古いタブの一括保存を含む) は 409。
+    // 値が変わらない保存は通す — Codex PR-A 名指し4 High
+    if (materialVal !== (ipNow.material_status ?? null) && materialStepWouldBreak(db, draft.id, { shootMode: sm ?? null, material: materialVal })) {
+      return res.status(409).json({ ok: false, error: `③素材待ち はもう完了しているので、撮影・素材ステータスを「${MATERIAL_STATUS_LABELS[materialVal] || '未設定'}」にはできません。戻すなら、先にボードでカードを ③素材待ち に戻してください (画面を読み直すと今の値が出ます)` });
+    }
+    if ((sm === 'inhouse' || sm === 'photographer') && materialVal === 'not_required') {
+      return res.status(400).json({ ok: false, error: `撮影判定が「${sm === 'inhouse' ? '社内撮影' : 'カメラマン撮影'}」なので、撮影・素材ステータスを「撮影不要」にはできません。撮影が要らないなら、撮影判定で「撮影不要」を押してください (画面を読み直すと今の値が出ます)` });
+    }
+    if (sm === 'none' && materialVal !== 'not_required' && materialVal !== 'ready') {
+      return res.status(400).json({ ok: false, error: '撮影判定が「撮影不要」なので、撮影・素材ステータスは「撮影不要」か「素材完了」だけにできます。撮影するなら、撮影判定で「社内撮影」か「カメラマン撮影」を押してください (画面を読み直すと今の値が出ます)' });
     }
   }
   let infoVal; let infoAt; let infoBy;
@@ -1475,6 +1568,8 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   // 保存・台帳同期・イベントを 1 トランザクションに (途中終了で product-hub だけ更新される状態を作らない — Codex PR1 R1 H1)
   try {
   db.transaction(() => {
+  // 先に見た後で変わっていないか (別のプロセスが撮影指示書を記録した直後など)。変わっていれば保存しない
+  { const msg = cameraUrlConflict(); if (msg) throw Object.assign(new Error(msg), { code: 'camera_url_conflict' }); }
   upsertImageProduction(db, draft.id, {
     status: clean(b.status, 100),
     importance_tier: clean(b.importance_tier, 100),
@@ -1491,6 +1586,7 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     // TOP画像の構成 (簡単なもの) と参考・ラフの URL (2026-09-13)
     top_compose_text: clean(b.top_compose_text, 2000),
     top_ref_url: topRefVal,
+    edit_data_url: editDataVal,
     material_status: materialVal,
     product_info_text: infoVal,
     product_info_updated_at: infoAt,
@@ -1505,6 +1601,7 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   logEvent(db, draft.id, 'image_production_updated', changedLabels.length ? `${changedLabels.join('・')}を更新` : null, actorOf(req));
   })();
   } catch (e) {
+    if (e?.code === 'camera_url_conflict') return res.status(409).json({ ok: false, error: e.message });
     console.error('[product-hub] image-production save failed (rolled back):', e);
     return res.status(500).json({ ok: false, error: '保存できませんでした (商品リンク台帳への同期で失敗。Render ログを確認してください)' });
   }
@@ -1532,6 +1629,97 @@ router.post('/api/drafts/:id/image-hold', (req, res) => {
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
+});
+
+// 撮影判定 (2026-10-08 画像制作の新フロー)。押した時点で保存する (保存ボタンを待たない)。
+// 撮影・素材ステータスもサーバでそろえる (setShootMode)。工程は動かさない
+router.post('/api/drafts/:id/shoot-mode', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '撮影判定を変えられるのは 画像登録者・画像作成承認者 の担当者か管理者だけです' });
+  }
+  // 文字列の決まった値か null (未判定に戻す) だけ受ける。欠落・typo を「未判定」に倒さない
+  const validMode = (v) => v === null || (typeof v === 'string' && SHOOT_MODE_CODES.has(v));
+  const mode = req.body?.mode;
+  if (!validMode(mode)) {
+    return res.status(400).json({ ok: false, error: 'mode は none / inhouse / photographer / null で指定してください' });
+  }
+  // expected = 画面が表示していた判定 (省略可)。違っていたら 409 (ほかの人が先に変えた)
+  const hasExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expected');
+  if (hasExpected && !validMode(req.body.expected)) {
+    return res.status(400).json({ ok: false, error: 'expected は none / inhouse / photographer / null で指定してください' });
+  }
+  // 「おすすめにする」から来たとき (ai_job_id = 画面が見ていた AI の構成の依頼)。PR-C・Codex 名指し3 M:
+  // 構成が終わった画面はポーリングを止めるので、別のタブで作り直されても古いおすすめが残る。
+  // 古いおすすめをそのまま保存しないよう、いまの AI のおすすめ (いちばん新しい構成) と同じかを確かめる。
+  // 3 択のボタンを直接押したとき (ai_job_id なし) は今どおり (人が決めた判定は AI と違ってよい)
+  if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'ai_job_id')) {
+    const aiJob = req.body.ai_job_id;
+    if (!Number.isSafeInteger(aiJob) || aiJob <= 0) {
+      return res.status(400).json({ ok: false, error: 'ai_job_id の値が不正です' });
+    }
+    const now = latestShootJudgement(getDB(), draft.id);
+    if (!now || !now.available || now.job_id !== aiJob || now.recommended !== mode) {
+      return res.status(409).json({ ok: false, error: 'AI のおすすめが新しくなっています (LP構成が作り直されたなど)。画面を読み直してから選んでください' });
+    }
+  }
+  let r;
+  try {
+    r = setShootMode(getDB(), draft.id, mode, { actor: actorOf(req), expected: hasExpected ? req.body.expected : undefined });
+  } catch (e) {
+    // ③素材待ち を完了したあとで素材が要る判定に変えようとした (先に ③ へ戻してもらう) / ほかの人が先に変えた
+    if (e?.code === 'material_step_done' || e?.code === 'shoot_mode_conflict') return res.status(409).json({ ok: false, error: e.message });
+    throw e;
+  }
+  res.json({ ok: true, changed: r.changed, shoot_mode: mode, material_status: r.material_status });
+});
+
+// 撮影指示書 (スプレッドシート) を作る / 上書きする (2026-10-09 画像制作の新フロー PR-D・設計 §3.4)。
+// 撮影判定が 社内撮影 / カメラマン撮影 で、画像フォルダがあるときだけ。無ければ作り、あれば同じファイルを上書き (URL は変えない)。
+// できたときだけ URL を撮影指示書の欄 (camera_instruction_url) に入れる = ボードの「撮影指示書 済」がそのまま動く。
+// 材料 (カット) はサーバが LP構成から組む (shootSheetCutsFor)。呼び手からは受けない (cuts を送ると 400)。
+// body: { mention?: '宛先' (画面のその回だけの宛先。依頼文のタブに入れる。省略ならいつもの宛先),
+//         replace_manual_url?: 'URL' (手で貼った URL を置き換えてよいと確かめたときの、その URL。今の URL と同じときだけ置き換える),
+//         overwrite_file_id?: 'ID' (既にある撮影指示書を上書きしてよいと確かめたときの、そのファイルの ID。上書きには必ず要る),
+//         seen_url: 'URL' (必須。画面を開いたときの撮影指示書の URL・無ければ空。今と違えば 409) }
+router.post('/api/drafts/:id/shoot-sheet', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '撮影指示書を作れるのは 画像登録者・画像作成承認者 の担当者か管理者だけです' });
+  }
+  const b = req.body || {};
+  // 正本の LP構成と違う中身を書かせない (古い画面・直接の呼び出し — Codex PR-D 名指し3 M)
+  if (b.cuts !== undefined) {
+    return res.status(400).json({ ok: false, error: '撮影指示書の中身 (cuts) は送れません。LP構成から作ります (LP構成を直してから押してください)' });
+  }
+  // 宛先はいつもの宛先と同じ検査 (1 行・60 文字まで)。null / 省略はいつもの宛先
+  let mention = null;
+  if (b.mention !== undefined && b.mention !== null) {
+    const m = normalizeShootMention(b.mention);
+    if (m.error) return res.status(400).json({ ok: false, error: m.error });
+    mention = m.value;
+  }
+  if (b.replace_manual_url !== undefined && b.replace_manual_url !== null && (typeof b.replace_manual_url !== 'string' || b.replace_manual_url.length > 1000)) {
+    return res.status(400).json({ ok: false, error: 'replace_manual_url は置き換える URL (文字) で指定してください' });
+  }
+  if (b.overwrite_file_id !== undefined && b.overwrite_file_id !== null && (typeof b.overwrite_file_id !== 'string' || !/^[A-Za-z0-9_-]{5,200}$/.test(b.overwrite_file_id))) {
+    return res.status(400).json({ ok: false, error: 'overwrite_file_id はファイルの ID で指定してください' });
+  }
+  // 画面を開いたときの撮影指示書の URL (必須)。今と違えば 409 (古い画面から押した)
+  if (typeof b.seen_url !== 'string' || b.seen_url.length > 1000) {
+    return res.status(400).json({ ok: false, error: 'seen_url (画面を開いたときの撮影指示書の URL。無ければ空) を指定してください' });
+  }
+  const r = await createOrUpdateShootSheet(draft.id, {
+    mention, actor: actorOf(req), replaceManualUrl: typeof b.replace_manual_url === 'string' ? b.replace_manual_url.trim() : null,
+    overwriteFileId: typeof b.overwrite_file_id === 'string' ? b.overwrite_file_id : null, seenUrl: b.seen_url,
+  });
+  if (!r.ok) {
+    return res.status(r.status || 500).json({ ok: false, code: r.code, error: r.error,
+      ...(r.manual_url ? { manual_url: r.manual_url } : {}), ...(r.file_id ? { file_id: r.file_id } : {}) });
+  }
+  res.json(r);
 });
 
 // 本番の構成の 済 / まだ (2026-09-13 スタッフ要望)。縦列 ②仮構成 (imgd_compose) とは別に持つ —
@@ -2975,12 +3163,15 @@ router.post('/api/notion-import-by-status', legacyHandler(async (req, res) => {
 
 // 取り込んだテストデータの掃除。**取り込み由来だけ**削除可 (ポータル起点の商品は消させない)。
 // Notion 側のカードには一切触らない (ポータル DB の行を消すだけ)。
-router.post('/api/drafts/:id/delete', (req, res) => {
+router.post('/api/drafts/:id/delete', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   if (!isNotionImported(draft)) {
     return res.status(400).json({ ok: false, error: '削除できるのはNotion取り込み由来のドラフトだけです' });
   }
+  // デザイナー修正依頼書 (PR-F) のために公開した画像は、消す前に公開を外す (消すと画面から外せなくなる)。外せなければ消さない
+  const unshared = await revokeAllDesignerShares(draft.id);
+  if (!unshared.ok) return res.status(409).json({ ok: false, error: unshared.error + '。商品は削除していません' });
   const db = getDB();
   // draft_events は append-only (削除 trigger) なので消さない。孤児として監査ログに残す
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft.id);
@@ -3113,7 +3304,25 @@ router.get('/staff', (req, res) => {
     staffKinds: STAFF_KINDS,
     staffColors: STAFF_COLORS,
     myEmail: (req.session?.email || '').toLowerCase(),
+    // 撮影依頼文のいつもの宛先 (2026-10-09)。変えられるのは管理者だけ
+    shootMention: getShootMention(getDB()),
   });
+});
+
+// 撮影依頼文のいつもの宛先を変える (2026-10-09 中原さん決定)。管理者だけ。
+// body: { mention: '文字' (空文字 = 宛先の行なし) | null (初期値 = env / 既定「@つくば」に戻す) }
+router.post('/api/settings/shoot-mention', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  if (!req.body || !Object.prototype.hasOwnProperty.call(req.body, 'mention')) {
+    return res.status(400).json({ ok: false, error: 'mention を指定してください (初期値に戻すときは null)' });
+  }
+  try {
+    const r = setShootMention(getDB(), req.body.mention, { actor: actorOf(req) });
+    res.json({ ok: true, changed: r.changed, ...getShootMention(getDB()) });
+  } catch (e) {
+    if (e?.status === 400) return res.status(400).json({ ok: false, error: e.message });
+    throw e;
+  }
 });
 
 router.post('/api/staff', (req, res) => {
@@ -3841,6 +4050,7 @@ async function lpSpecWorkbookToText(buf) {
 /**
  * 仕様書を上げる。Content-Type: application/octet-stream で .xlsx の生バイトを送る。
  * 種類と名前はクエリ (?kind=product_analysis&title=...)。
+ * kind = product_analysis (LP制作システム) / initial_judge (新商品初動判定・撮影判定・PR-C2)。知らない種類は lib が bad_kind で断る
  */
 router.post('/api/lp-specs',
   express.raw({ type: 'application/octet-stream', limit: LP_SPEC_MAX_BYTES + 1024 * 1024 }),
@@ -3867,9 +4077,10 @@ router.post('/api/lp-specs',
       return res.status(400).json({ ok: false, code: 'bad_xlsx', error: '.xlsx として読めません (ダウンロードし直してください)' });
     }
     const db = getDB();
+    const kind = cleanText(req.query?.kind, 40) || 'product_analysis';
     const r = importLpSpec(db, {
-      kind: cleanText(req.query?.kind, 40) || 'product_analysis',
-      title: cleanText(req.query?.title, 200) || 'LP制作システム',
+      kind,
+      title: cleanText(req.query?.title, 200) || (Object.prototype.hasOwnProperty.call(LP_SPEC_KIND_LABELS, kind) ? LP_SPEC_KIND_LABELS[kind] : 'LP制作システム'),
       body: parsed.body, sheetTitles: parsed.sheetTitles, actor: actorOf(req),
     });
     if (!r.ok) {
@@ -3898,6 +4109,7 @@ function lpComposeInitialState(db, draft) {
   const { productInfo, images } = lpComposeMaterial(db, draft);
   return {
     ...lpComposeStateFor(db, draft.id),
+    lp_effective: lpEffectiveComposeText(db, draft.id),
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
     image_plan: lpComposeImagePlan(images),
@@ -3961,6 +4173,9 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
   res.json({
     ok: true,
     ...lpComposeStateFor(db, draft.id),
+    // 効いている構成 (いちばん新しいできた構成・人が直した版があればそちら)。「AI が作った構成」の箱はこれを出し、
+    // コピー・lp-tool にもこれを渡す (画像生成・LP構成の一覧と同じ構成。作り直しが途中・失敗でも前にできた構成を出す)
+    lp_effective: lpEffectiveComposeText(db, draft.id),
     // 押せるか。押せない理由はそのまま画面に出す
     blocked: lpComposeBlockReason({ draft, productInfo, spec, images }),
     // いま押したら AI に渡す画像の並び (白抜き → 1 TOP → …)。スタッフ版にも同じ画像を添付する (codex #1592 High)
@@ -3970,6 +4185,43 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
   });
+});
+
+// ─── 画面: LP構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09) ─────────
+// 正本 = AI_reference『商品ハブ_画像制作の新フロー_設計_20261008.md』§3.1。ロジックは lib/lp-edit.js。
+// 画像ごとに 役割・見出し・キャッチコピー・本文 を直し、TOP / FV 以外を並べ替え・追加・削除する。
+// 直した構成は ⑦ に書き戻して別の表に追記する (AI の出力は書き換えない)。画像生成と lp-tool のコピーはそれを読む
+
+/**
+ * いま効いている構成の画像の並び。**見るのは誰でも** (決めたこと)。
+ * AI の構成 (GET /lp-compose の output_text) も詳細画面も商品ハブの全員が見られる。直した版だけ隠す理由が無く、
+ * 撮影・デザインの担当が画像を作る前に読む物なので隠すと困る。直す (PUT) のは画像制作情報を触れる人だけ
+ */
+router.get('/api/drafts/:id/lp-edit', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  res.json(lpEditStateFor(getDB(), draft, { canEdit: canEditImageProduction(req), imageLimit: lpImageLimitForPriority(draft.image_priority) }));
+});
+
+/**
+ * 保存する。body: { base_job_id, base_edit_id, slots: [{uid, role, title, copy, body, shoot}...並び順] }。
+ * サーバの lint を通ったときだけ保存。画面が見ていた版が今と違えば 409 (古いタブ・2 人同時で上書きしない)
+ */
+router.put('/api/drafts/:id/lp-edit', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  // 撮影判定・画像制作情報と同じ人だけ (画像の中身を決める値なので誰でもは書けない)
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, code: 'forbidden', error: 'LP構成を直せるのは 画像登録者・画像作成承認者 の担当者か管理者だけです (担当者・工程で役割を確認してください)' });
+  }
+  const db = getDB();
+  const b = req.body || {};
+  const r = saveLpEdit(db, { draft, baseJobId: b.base_job_id, baseEditId: b.base_edit_id, slots: b.slots, actor: actorOf(req) });
+  if (!r.ok) {
+    const status = r.code === 'conflict' || r.code === 'not_ready' ? 409 : 400;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error, errors: r.errors || null });
+  }
+  res.json({ ...lpEditStateFor(db, draft, { canEdit: true, imageLimit: lpImageLimitForPriority(draft.image_priority) }), changed: r.changed });
 });
 
 // ─── 画面: LP 画像を作る (段階2・2026-10-04 中原さん) ─────────────
@@ -4022,6 +4274,12 @@ const lpImageTick = () => lpImageWorker.kick().catch((e) => console.error('[prod
 // 定期の見回り (setInterval) は置かない — 画面が作っている間 5 秒おきに状況を見に来るので、そのときに起こす (#1612 R2)
 if (process.env.PH_LP_IMAGE_ENABLED === '1') setTimeout(lpImageTick, 15_000).unref();
 
+/** 効いている構成の版 (構成の依頼 ID・編集版 ID)。構成がまだ無ければ空 */
+function lpComposeVersion(db, draft) {
+  const e = lpEffectiveComposeText(db, draft.id);
+  return e ? e.job_id + ':' + (e.edit_id || '') : '';
+}
+
 /** 参考画像の Drive の更新日時をいま取り直す (受付時に固定する値・#1612 R2 Medium)。取れなければ throw */
 async function lpImageRefTimes(fileIds) {
   const drive = getDriveWriteClient();
@@ -4038,39 +4296,149 @@ async function lpImageRefTimes(fileIds) {
 router.get('/api/drafts/:id/lp-images', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  const st = lpImageStateFor(getDB(), { draft, folderId: lpImageFolderId(draft) });
+  const st = lpImageStateForReq(req, getDB(), draft);
   // 作っている途中なのに作る係が休んでいる (再起動の後・期限切れの片付け待ち) なら起こす。kick は重ねて呼んでも 1 本だけ
-  if (st.job && ['queued', 'running'].includes(st.job.status) && !lpImageWorker.isRunning()) lpImageTick();
+  // 1 枚ずつの作り直し (別の job) が待っているときも同じ (PR-E)
+  if (((st.job && ['queued', 'running'].includes(st.job.status)) || st.regen_running) && !lpImageWorker.isRunning()) lpImageTick();
   res.json({ ok: true, ...st });
 });
 
-/** 作る (誰でも押せる)。body: { idempotency_key }。同じキーの再送は前の依頼を返す */
+/**
+ * 画像を作る・作り直す・確認する のは画像制作の操作 (お金を使う・確認は ⑤ の目印) なので、
+ * 画像制作情報と同じく 画像登録者・画像作成承認者 の担当者か管理者だけ (画像制作の新フロー PR-E)
+ */
+const LP_IMAGE_FORBIDDEN = '画像の生成・作り直し・確認は 画像登録者・画像作成承認者 の担当者か管理者だけです (担当者・工程で役割を確認してください)';
+/** 画面に渡す状態 + 押せる人か (押せない人にはボタンを押せない形で出す) + 画面が見ている LP構成の版 (PR-B) */
+function lpImageStateForReq(req, db, draft) {
+  const st = lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) });
+  const canEdit = canEditImageProduction(req);
+  // デザイナー修正依頼書 (PR-F) の状態も載せる (画像ができた・作り直したのをポーリングで拾ってボタンを押せるようにする)。
+  // 依頼書の状態が読めなくても画像の箱は出す
+  let designerSheet = null;
+  try { designerSheet = designerSheetStateFor(db, draft, { lpState: st, canEdit }); }
+  catch (e) { console.error('[product-hub] デザイナー修正依頼書の状態:', e?.message || e); }
+  return { ...st, can_edit: canEdit, compose_version: lpComposeVersion(db, draft), designer_sheet: designerSheet };
+}
+
+/** 作る (画像制作の役割の人)。body: { idempotency_key }。同じキーの再送は前の依頼を返す */
 router.post('/api/drafts/:id/lp-images', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
+  if (!canEditImageProduction(req)) return res.status(403).json({ ok: false, code: 'forbidden', error: LP_IMAGE_FORBIDDEN });
   const db = getDB();
   const folderId = lpImageFolderId(draft);
   // 押せない理由があれば Drive を読まずに断る (同じキーの再送は requestLpImageJob が前の依頼を返す)
   const key = req.body?.idempotency_key;
   if (!lpImageValidKey(key)) return res.status(400).json({ ok: false, code: 'bad_request', error: 'idempotency_key の形が不正です' });
   const prior = db.prepare('SELECT 1 FROM ph_lp_image_jobs WHERE draft_id = ? AND idempotency_key = ?').get(draft.id, key);
+  // expected_job_id = 画面が見ていた最新の依頼 (latest_job_id・全部作る / 1 枚の作り直し・無ければ null)。今と違えば 409 (古いタブ・2 人同時で全部をもう一度作らない)
+  const hasExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expected_job_id');
+  const expectedJobId = hasExpected ? req.body.expected_job_id : undefined;
+  if (hasExpected && expectedJobId !== null && !(Number.isSafeInteger(expectedJobId) && expectedJobId > 0)) {
+    return res.status(400).json({ ok: false, code: 'bad_request', error: 'expected_job_id は依頼の番号か null で指定してください' });
+  }
   let refTimes = null;
   if (!prior) {
+    // expected_job_id を送ってこない画面 (この変更より前に開いた古いタブ) は、もう作った依頼があるなら受けない
+    // (別のタブが作った後に全部をもう一度作らない・Codex 名指し4 H)。まだ 1 度も作っていなければ重ねようがないので通す
+    if (!hasExpected && lpImageFullJobConflict(db, draft.id, null)) {
+      return res.status(409).json({ ok: false, code: 'conflict', error: '画面が古いので受け付けませんでした。画面を読み直してから押してください' });
+    }
+    const conflict = lpImageFullJobConflict(db, draft.id, expectedJobId);
+    if (conflict) return res.status(409).json({ ok: false, code: 'conflict', error: conflict });
     const blocked = lpImageBlockReason(db, { draft, folderId });
     if (blocked) return res.status(409).json({ ok: false, code: 'not_ready', error: blocked });
+    // Drive を待つ前の構成の版 (どの構成のどの編集版か)。待っている間に直されたら受け付けない (下)
+    const composeVer = lpComposeVersion(db, draft);
+    // 🚨 画面が見ていた版 (compose_version) と違えば受け付けない — 別のタブ・ほかの人が LP構成を直した後の古い画面から、
+    //    見ていない構成・枚数で作らない (Codex PR-B 名指し R3 H)。送らない古い画面はこの検査を通る (同じキーの再送は上で前の依頼を返す)
+    const seen = req.body?.compose_version;
+    if (typeof seen === 'string' && seen !== composeVer) {
+      return res.status(409).json({ ok: false, code: 'not_ready', error: 'LP構成がほかのタブかほかの人に直されました — 画面の枚数・内容を確かめてから、もう一度押してください' });
+    }
     try { refTimes = await lpImageRefTimes(lpImageRefCandidates(db, draft)); }
     catch (e) {
       console.error('[product-hub] lp-image ref times:', draft.id, String(e?.message || e).slice(0, 300));
       return res.status(502).json({ ok: false, code: 'refs_unavailable', error: '参考画像の情報を Drive から読めませんでした — もう一度押してください' });
     }
+    // 🚨 Drive を待っている間に LP構成が直された・作り直されたら受け付けない — 取り直していない参考画像の日時で固定したり、
+    //    押したときと違う本文・枚数で作ったりしない。ここから受付までは同期 (better-sqlite3) なので、この後に構成は変わらない
+    //    (Codex PR-B 名指し R1・R2 M)
+    if (lpComposeVersion(db, draft) !== composeVer) {
+      return res.status(409).json({ ok: false, code: 'not_ready', error: 'LP構成が直されました — 内容を確かめてから、もう一度押してください' });
+    }
   }
-  const r = requestLpImageJob(db, { draft, folderId, idempotencyKey: key, actor: actorOf(req), refTimes });
+  const r = requestLpImageJob(db, { draft, folderId, idempotencyKey: key, actor: actorOf(req), refTimes, expectedJobId });
   if (!r.ok) {
-    const status = r.code === 'already_running' || r.code === 'not_ready' ? 409 : 400;
+    const status = r.code === 'already_running' || r.code === 'not_ready' || r.code === 'conflict' ? 409 : 400;
     return res.status(status).json({ ok: false, code: r.code, error: r.error });
   }
   lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
-  res.json({ ok: true, created: r.created, ...lpImageStateFor(db, { draft, folderId }) });
+  res.json({ ok: true, created: r.created, ...lpImageStateForReq(req, db, draft) });
+});
+
+/**
+ * 1 枚だけ作り直す (画像制作の新フロー PR-E)。:imageId = 画面が出していた「いちばん新しい版」の行。
+ * body: { idempotency_key }。受付で固めた prompt と参考画像で作り直し、Drive の「AI初稿」に新しいファイル (v2, v3…) で保存する。
+ * 予算は全部作るときと同じ台帳を通る (作る係が 1 枚分を取り置いてから呼ぶ)。参考画像の照らし合わせも作る係がする
+ */
+router.post('/api/drafts/:id/lp-images/:imageId/regenerate', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) return res.status(403).json({ ok: false, code: 'forbidden', error: LP_IMAGE_FORBIDDEN });
+  const db = getDB();
+  const r = requestLpImageRegen(db, {
+    draft, imageId: req.params.imageId, folderId: lpImageFolderId(draft), idempotencyKey: req.body?.idempotency_key, actor: actorOf(req),
+  });
+  if (!r.ok) {
+    const status = r.code === 'not_found' ? 404 : r.code === 'bad_request' ? 400 : 409;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error });
+  }
+  lpImageWorker.kick().catch((e) => console.error('[product-hub] lp-image worker:', e?.message || e));
+  res.json({ ok: true, created: r.created, ...lpImageStateForReq(req, db, draft) });
+});
+
+/** 1 枚の「確認」を付ける / 外す。body: { checked: true|false }。:imageId = 画面が出していた版 */
+router.post('/api/drafts/:id/lp-images/:imageId/check', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) return res.status(403).json({ ok: false, code: 'forbidden', error: LP_IMAGE_FORBIDDEN });
+  const db = getDB();
+  const r = setLpImageChecked(db, { draft, imageId: req.params.imageId, checked: req.body?.checked, actor: actorOf(req) });
+  if (!r.ok) {
+    const status = r.code === 'not_found' ? 404 : r.code === 'bad_request' ? 400 : 409;
+    return res.status(status).json({ ok: false, code: r.code, error: r.error });
+  }
+  res.json({ ok: true, changed: r.changed, ...lpImageStateForReq(req, db, draft) });
+});
+
+/**
+ * デザイナー修正依頼書 (スプレッドシート) を作る / 最新の画像で作り直す (画像制作の新フロー PR-F・2026-10-09・スタッフ要望 ⑥)。
+ * 生成した全画像 (各画像の最新のできた版) を TOP から順に =IMAGE() で貼り、修正指示の列は空欄 (作り直すときは人が書いた修正指示を
+ * 同じ画像の行に戻す)。置き場は商品の画像フォルダ。全部の画像ができてから作れる。中身はサーバが組む (呼び手から画像は受けない)。
+ * 画像ファイルには「リンクを知っている人は閲覧可」を付ける (共有ドライブの設定で断られたら依頼書を作らずに理由を返す)。
+ * body: { seen_file_id: '' | 'ID' (必須。画面を開いたときの依頼書のファイル。今と違えば 409),
+ *         seen_images_hash: '…' (必須。画面が見ていた画像の並び = designer_sheet.images_hash。今と違えば 409) }
+ * 工程・ボード (⑤デザイン修正) は動かさない
+ */
+router.post('/api/drafts/:id/designer-sheet', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) return res.status(403).json({ ok: false, code: 'forbidden', error: DESIGNER_SHEET_FORBIDDEN });
+  const b = req.body || {};
+  if (typeof b.seen_file_id !== 'string' || !/^([A-Za-z0-9_-]{5,200})?$/.test(b.seen_file_id)) {
+    return res.status(400).json({ ok: false, code: 'bad_request', error: 'seen_file_id (画面を開いたときの依頼書のファイル ID。無ければ空) を指定してください' });
+  }
+  if (typeof b.seen_images_hash !== 'string' || !/^[0-9a-f]{64}$/.test(b.seen_images_hash)) {
+    return res.status(400).json({ ok: false, code: 'bad_request', error: 'seen_images_hash (画面が見ていた画像の並び) を指定してください' });
+  }
+  const r = await createOrUpdateDesignerSheet(draft.id, { actor: actorOf(req), seenFileId: b.seen_file_id, seenImagesHash: b.seen_images_hash });
+  const db = getDB();
+  const fresh = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id) || draft;
+  let state = null;
+  try { state = designerSheetStateFor(db, fresh, { canEdit: true }); } catch (e) { console.error('[product-hub] デザイナー修正依頼書の状態:', e?.message || e); }
+  if (!r.ok) return res.status(r.status || 500).json({ ok: false, code: r.code, error: r.error, designer_sheet: state });
+  res.json({ ...r, designer_sheet: state });
 });
 
 /**
@@ -4136,15 +4504,22 @@ const rawField = (v, maxLen) => (typeof v === 'string' && v.length <= maxLen ? v
 const lpIdParam = (v) => (typeof v === 'string' && /^[1-9]\d*$/.test(v) ? Number(v) : 0);
 
 serviceApiRouter.get('/lp-compose/queue', (req, res) => {
-  res.json({ ok: true, queue: lpComposeQueueSummary(getDB()) });
+  // shoot_spec=1 = 撮影判定の仕様書を受け取れる実行役 (新しい phlp)。言わない古い phlp には、掴めない仕様書つきの依頼を数えない (PR-C2)
+  res.json({ ok: true, queue: lpComposeQueueSummary(getDB(), Date.now(), { shootSpec: req.query?.shoot_spec === '1' }) });
 });
 
 serviceApiRouter.post('/lp-compose/claim', (req, res) => {
   // max_images = 実行役が落とせる画像の枚数 (言わない古い phlp は 6 枚まで扱い・codex #1593 Medium)
-  const r = claimLpComposeJob(getDB(), { runnerRunId: cleanText(req.body?.runner_run_id, 80), maxImages: req.body?.max_images });
+  // shoot_spec = 撮影判定の仕様書 (新商品初動判定) を受け取れる実行役か (true だけ。言わない古い phlp には仕様書つきの依頼を掴ませない・PR-C2)
+  const r = claimLpComposeJob(getDB(), {
+    runnerRunId: cleanText(req.body?.runner_run_id, 80), maxImages: req.body?.max_images, shootSpec: req.body?.shoot_spec === true,
+  });
   if (!r.ok) return lpComposeFail(res, r);
   // exhausted = 壊れた依頼が並んでいて 50 回掴めなかった (「仕事なし」と区別する)
-  res.json({ ok: true, job: r.job, exhausted: r.exhausted || undefined, too_many_images: r.too_many_images || undefined, error: r.error || undefined });
+  res.json({
+    ok: true, job: r.job, exhausted: r.exhausted || undefined, too_many_images: r.too_many_images || undefined,
+    needs_shoot_spec: r.needs_shoot_spec || undefined, error: r.error || undefined,
+  });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/reserve', (req, res) => {
@@ -4181,9 +4556,13 @@ serviceApiRouter.post('/lp-compose/generations/:gid/result', (req, res) => {
     reviewRounds: req.body?.review_rounds,
     receipt: req.body?.receipt,
     reason: cleanText(req.body?.reason, 1000),
+    // AI の撮影判定 (画像制作の新フロー PR-C)。送らない古い実行役は undefined のまま (今までどおり通る)。
+    // 形の検査は lib (lp-shoot.js) が構成と照らして行う。壊れていても結果は断らない (撮影判定だけ使わない)
+    shoot: req.body?.shoot_json,
   });
   if (!r.ok) return lpComposeFail(res, r);
-  res.json({ ok: true, status: r.status, already: !!r.already, receipt: r.receipt });
+  // shoot = 撮影判定をどう扱ったか (saved / invalid / ignored / not_sent)。実行役のログに残る
+  res.json({ ok: true, status: r.status, already: !!r.already, receipt: r.receipt, shoot: r.shoot });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
@@ -4201,9 +4580,11 @@ serviceApiRouter.post('/lp-compose/jobs/:id/fail', (req, res) => {
 serviceApiRouter.post('/lp-compose/jobs/:id/lint', express.json({ limit: '1mb' }), (req, res) => {
   const r = lintLpComposeForJob(getDB(), lpIdParam(req.params.id), {
     leaseToken: rawField(req.body?.lease_token, 100), output: req.body?.output,
+    // 撮影判定 (PR-C) も出す前に確かめられる。結果を受け取るときと同じ検査 (構成の lint とは別に返す)
+    shoot: req.body?.shoot_json,
   });
   if (!r.ok) return lpComposeFail(res, r);
-  res.json({ ok: true, lint: r.lint });
+  res.json({ ok: true, lint: r.lint, ...(r.shoot ? { shoot: r.shoot } : {}) });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/release', (req, res) => {

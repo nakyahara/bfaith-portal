@@ -1539,6 +1539,29 @@ th.attr-unknown { color: #dc2626; }
             <button class="btn" id="image-hold-btn" data-on-hold="1">画像制作を保留</button>
           <% } %>
         </div>
+        <%# 画像制作の新フロー (2026-10-08 スタッフのラフ): 1 商品情報 → 2 仮LP構成と撮影判定 → 3 撮影指示書 (要撮影のときだけ)
+            → 4 AI画像生成 → 管理項目。あまり使わない項目は消さずに「その他の項目」に畳む (データ・ボードの表示はそのまま) %>
+        <% const ipfNeedsShoot = ip.shoot_mode === 'inhouse' || ip.shoot_mode === 'photographer'; %>
+        <%# 撮影判定より前から指示書の URL が入っている商品もある。見えなくなると直せないので、そのときも出す %>
+        <% const ipfShowShoot = ipfNeedsShoot || String(ip.camera_instruction_url || '').trim() !== ''; %>
+        <style>
+          .ipf-step { margin-top:12px; padding-top:10px; border-top:1px solid #e2e8f0; }
+          .ipf-h { display:flex; align-items:center; gap:8px; font-size:15px; margin:0 0 8px; }
+          .ipf-no { display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:50%; background:#1e293b; color:#fff; font-size:12px; }
+          .ipf-seg { display:flex; gap:6px; flex-wrap:wrap; }
+          .ipf-seg-btn { flex:1; min-width:120px; display:flex; flex-direction:column; align-items:flex-start; gap:2px; padding:8px 10px; border:1px solid #cbd5e1; border-radius:8px; background:#fff; cursor:pointer; text-align:left; }
+          .ipf-seg-btn.on { border-color:#2563eb; background:#eff6ff; box-shadow:0 0 0 1px #2563eb inset; }
+          .ipf-seg-btn .muted { font-size:11px; }
+          /* AI のおすすめの札 (PR-C)。hidden 属性を display で上書きしないよう [hidden] を明示する */
+          .ipf-rec { display:inline-block; margin-top:2px; font-size:10px; font-weight:700; color:#fff; background:#16a34a; border-radius:999px; padding:1px 7px; }
+          .ipf-rec-box { margin-top:6px; padding:6px 8px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0; font-size:12px; display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap; }
+          .ipf-rec-box.none { background:#f8fafc; border-color:#e2e8f0; color:#64748b; }
+          .ipf-rec[hidden], .ipf-rec-box[hidden], .ipf-rec-box [hidden] { display:none; }
+          .ipf-more { margin:10px 0; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#f8fafc; }
+          .ipf-more > summary { cursor:pointer; color:#475569; font-size:13px; }
+        </style>
+        <section class="ipf-step" id="ipf-step-info">
+        <h3 class="ipf-h"><span class="ipf-no">1</span>商品情報</h3>
         <%# 画像工程 v2 (2026-08-26): 1.5 商品情報 (手入力) と ChatGPT 用の定型文ボタン %>
         <div class="field" style="padding:8px 10px; border-radius:8px; background:#f0f9ff; border:1px solid #bae6fd;">
           <label>商品情報 <span class="muted" style="font-weight:400">(商品説明タブの説明文から自動で入ります。直して保存するとそちらが優先。下の定型文の材料)</span></label>
@@ -1594,24 +1617,10 @@ th.attr-unknown { color: #dc2626; }
           <% if (ip.back_info_updated_at) { %>
             <div class="muted" style="font-size:11px;">最終更新: <%= String(ip.back_info_updated_at).slice(0, 16).replace('T', ' ') %> <%= ip.back_info_updated_by || '' %></div>
           <% } %>
-          <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap; align-items:center;">
-            <button type="button" class="btn prompt-btn" data-kind="initialJudge" <%= promptTemplates.available ? '' : 'disabled' %>>🧪 初動判定を準備</button>
-            <button type="button" class="btn prompt-btn" data-kind="productAnalysis" <%= promptTemplates.available ? '' : 'disabled' %>>📝 商品分析を準備</button>
-            <button type="button" class="btn prompt-btn" data-kind="simpleLp" <%= promptTemplates.available ? '' : 'disabled' %>>🖼 簡易LPを準備</button>
-            <span class="muted" style="font-size:12px;"><%= promptTemplates.available ? 'ChatGPT に貼る定型文を作ります (コピーして商品画像を添付。保存前の編集は反映されません)' : promptTemplates.reason %></span>
-          </div>
-          <div id="prompt-modal" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
-            <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
-              <strong id="prompt-title"></strong>
-              <button type="button" class="btn btn-primary" id="prompt-copy-btn">コピー</button>
-              <button type="button" class="btn" id="prompt-close-btn">閉じる</button>
-              <span class="muted" id="prompt-copy-result" style="font-size:12px;"></span>
-            </div>
-            <%# 2026-09-10: 補足情報の欄は廃止 (新しい定型文に補足情報の枠が無い)。
-                足したいことがあれば下の本文をそのまま直してからコピーする %>
-            <textarea id="prompt-text" rows="16" style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
-          </div>
         </div>
+        </section>
+        <section class="ipf-step" id="ipf-step-lp">
+        <h3 class="ipf-h"><span class="ipf-no">2</span>仮LP構成と撮影判定</h3>
           <%# 🤖 構成をAIに作らせる (段階1・PR1-d)。既存の「📝 商品分析を準備」は残す (退避路)。
               押す = キューに積むだけ。書き戻した構成は**ここに出るだけ**で、
               人がコピーして lp-tool に貼るところまでは変わらない %>
@@ -1662,12 +1671,20 @@ th.attr-unknown { color: #dc2626; }
             <div id="lpc-meas" hidden class="muted" style="font-size:11px; margin-top:4px; font-family:ui-monospace, monospace; word-break:break-all;"></div>
             <div id="lpc-result" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
               <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
-                <strong style="font-size:13px;">AI が作った構成 (⑦ AI画像生成プロンプト)</strong>
+                <strong style="font-size:13px;" id="lpc-result-title">AI が作った構成 (⑦ AI画像生成プロンプト)</strong>
                 <button type="button" class="btn btn-primary btn-sm" id="lpc-copy">コピー</button>
                 <a class="btn btn-sm" id="lpc-open" href="#" target="_blank" rel="noopener">lp-tool を開く</a>
                 <span class="muted" id="lpc-copy-result" style="font-size:12px;"></span>
               </div>
               <div class="muted" id="lpc-lint" style="font-size:11px; margin-bottom:6px;"></div>
+              <%# 人が直した版 (下の「LP構成」で保存したもの)・作り直しの前の構成を出しているときの知らせ (PR-B)。
+                  AI の初稿 (直す前) は消さずに残っているので、測定 (くらべっこ) 用にコピーできる。
+                  🚨 hidden を付ける要素に display を直に書かない (書くと hidden が効かずに出っぱなしになる) %>
+              <div id="lpc-edited" hidden style="font-size:11px; margin-bottom:6px; color:#1d4ed8;">
+                <span id="lpc-edited-note"></span>
+                <button type="button" class="btn btn-sm" id="lpc-copy-ai" hidden>AI の初稿をコピー (測定用)</button>
+                <span class="muted" id="lpc-copy-ai-result"></span>
+              </div>
               <textarea id="lpc-text" rows="16" readonly style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
               <div class="muted" style="font-size:11px; margin-top:4px;">
                 🚨 <strong>そのまま使わないでください。</strong>初稿です。中身を読んでから lp-tool に貼ってください
@@ -1678,21 +1695,211 @@ th.attr-unknown { color: #dc2626; }
           <%# 🚨 `<` は必ず潰す。本文は **AI が書いたもの** なので `</script>` を含みうる。
               潰さないとそこで script が閉じて、以降の画面が丸ごと壊れる (prompt-templates-json と同じ作り) %>
           <script type="application/json" id="lpc-json"><%- JSON.stringify(lpCompose).replace(/</g, '\\u003c') %></script>
+          <%# LP構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09・スタッフ要望 ③)。
+              画像ごとに 役割・見出し・キャッチコピー・本文 を直し、TOP と 1枚目 (FV) 以外を並べ替え・追加・削除する。
+              保存は「LP構成を保存」を押したときだけ (サーバの lint を通ったら)。中身は画面の JS (initLpEdit) が描く。
+              構成がまだ無いときは隠しておき、AI の構成ができたら JS が読み込んで出す %>
+          <% if (typeof lpEdit !== 'undefined' && lpEdit) { %>
+          <style>
+            .lpe-head { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:12px; color:#475569; margin-bottom:6px; }
+            .lpe-slot { border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin:4px 0; }
+            .lpe-slot.fixed { background:#f8fafc; }
+            .lpe-slot > summary { display:flex; gap:8px; align-items:center; padding:6px 8px; cursor:pointer; list-style:none; }
+            .lpe-slot > summary::-webkit-details-marker { display:none; }
+            .lpe-no { min-width:44px; font-weight:700; font-size:12px; color:#1e293b; }
+            .lpe-role { font-size:11px; color:#64748b; max-width:30%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+            .lpe-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
+            .lpe-chip { border:1px solid #cbd5e1; border-radius:999px; padding:1px 8px; font-size:11px; background:#f1f5f9; cursor:pointer; white-space:nowrap; }
+            .lpe-chip.need { background:#fef3c7; border-color:#f59e0b; color:#92400e; }
+            .lpe-acts { display:flex; gap:2px; }
+            .lpe-ib { border:1px solid #cbd5e1; background:#fff; border-radius:6px; width:26px; height:24px; cursor:pointer; }
+            .lpe-ib:disabled { opacity:.35; cursor:default; }
+            .lpe-fixed { font-size:11px; color:#64748b; white-space:nowrap; }
+            .lpe-body { padding:6px 10px 10px; display:grid; grid-template-columns:1fr; gap:4px; }
+            .lpe-body label { font-size:11px; color:#475569; margin:4px 0 0; }
+            .lpe-body textarea { width:100%; font-size:13px; }
+            .lpe-rule { font-size:11px; background:#f8fafc; border:1px dashed #cbd5e1; border-radius:6px; padding:4px 6px; }
+            .lpe-warn { color:#b45309; }
+            .lpe-stale, .lpe-undo { font-size:12px; background:#fffbeb; border:1px solid #fcd34d; border-radius:6px; padding:4px 8px; margin:6px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+            .lpe-dirty { color:#b45309; font-size:12px; }
+          </style>
+          <div id="lpe" class="field" style="margin-top:8px;" data-url="/apps/product-hub/api/drafts/<%= draft.id %>/lp-edit" <%= lpEdit.available ? '' : 'hidden' %>></div>
+          <%# `<` は潰す (役割・見出しは AI と人が書いたもの。`</script>` で画面が壊れないように) %>
+          <script type="application/json" id="lpe-json"><%- JSON.stringify(lpEdit).replace(/</g, '\\u003c') %></script>
           <% } %>
+          <% } %>
+          <% if (!lpCompose.enabled) { %>
+          <p class="muted" style="font-size:12px; margin:0 0 6px;">AI の LP構成はまだ使えません。下の「その他の項目」の ChatGPT 定型文 (📝 商品分析) から作れます</p>
+          <% } %>
+          <%# 撮影判定 (2026-10-08)。押した時点で保存 (POST /shoot-mode)。「撮影不要」なら撮影・素材ステータスもそろえる %>
+          <div class="field" id="shoot-mode-box" style="margin-top:8px;" data-current="<%= ip.shoot_mode || '' %>">
+            <label>撮影判定 <span class="muted" style="font-weight:400">(押すとすぐ保存します。「撮影不要」にすると撮影・素材ステータスも「撮影不要」になります)</span></label>
+            <div class="ipf-seg" role="radiogroup" aria-label="撮影判定">
+              <% for (const sm of imageFlow.shootModes) { %>
+                <button type="button" role="radio" class="ipf-seg-btn<%= ip.shoot_mode === sm.code ? ' on' : '' %>" aria-checked="<%= ip.shoot_mode === sm.code ? 'true' : 'false' %>" data-shoot-mode="<%= sm.code %>"><b><%= sm.label %></b><span class="muted"><%= sm.sub %></span><span class="ipf-rec" data-shoot-rec-badge="<%= sm.code %>" hidden>AIのおすすめ</span></button>
+              <% } %>
+            </div>
+            <div class="muted" id="shoot-mode-msg" style="font-size:11px; margin-top:4px;">
+              <% if (ip.shoot_mode) { %>最終更新: <%= String(ip.shoot_mode_at || '').slice(0, 16).replace('T', ' ') %> <%= ip.shoot_mode_by || '' %>
+              <% } else { %>まだ判定していません。LP構成を見て、撮影が要るかを選んでください<% } %>
+            </div>
+            <%# AI のおすすめと理由 (画像制作の新フロー PR-C・2026-10-09)。いちばん新しい AI の構成についた撮影判定を出す。
+                🚨 撮影判定は自動で書き換えない — 人が押して決める。「おすすめにする」は上のボタンを押すのと同じ (/shoot-mode に送るだけ)。
+                中身は画面の JS (@shoot-rec) が入れる。構成ができたらポーリング (GET /lp-compose の shoot) で入れ直す %>
+            <div id="shoot-rec" class="ipf-rec-box" hidden>
+              <span id="shoot-rec-text" style="flex:1; min-width:200px; white-space:pre-wrap;"></span>
+              <button type="button" class="btn btn-sm" id="shoot-rec-adopt" hidden>おすすめにする</button>
+            </div>
+            <%# 🚨 理由は AI が書いた文なので `</script>` を含みうる。`<` を潰す (lpc-json と同じ作り) %>
+            <script type="application/json" id="shoot-rec-json"><%- JSON.stringify((typeof lpCompose !== 'undefined' && lpCompose && lpCompose.shoot) || null).replace(/</g, '\\u003c') %></script>
+          </div>
+        </section>
+        <%# 3 撮影指示書 (要撮影のときだけ)。ポータルがスプレッドシートを作る (2026-10-09 PR-D・設計 §3.4)。手で作った URL を貼ってもよい %>
+        <section class="ipf-step" id="ipf-step-shoot" <%= ipfShowShoot ? '' : 'hidden' %>>
+        <h3 class="ipf-h"><span class="ipf-no">3</span>撮影指示書</h3>
+        <%# 商品の画像フォルダにスプレッドシートを作り、URL を下の欄に入れる。画面の動きは initShootSheet (@shoot-sheet)。
+            材料は LP構成 (services/shoot-sheet-service.js の shootSheetCutsFor) %>
+        <div class="field" id="shoot-sheet" data-ours="<%= shootSheet.ours ? '1' : '0' %>" data-seen-url="<%= ip.camera_instruction_url || '' %>" data-file-id="<%= shootSheet.ours ? (shootSheet.fileId || '') : '' %>">
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <button type="button" class="btn <%= shootSheet.ours ? '' : 'btn-primary' %> btn-sm" id="shoot-sheet-btn" <%= shootSheet.blocked ? 'disabled' : '' %>><%= shootSheet.ours ? '撮影指示書を更新' : '撮影指示書を作成 (スプレッドシート)' %></button>
+            <% if (shootSheet.ours) { %><a href="<%= shootSheet.url %>" target="_blank" rel="noopener" class="btn btn-sm" id="shoot-sheet-open">開く ↗</a><% } %>
+            <span class="muted" id="shoot-sheet-msg" style="font-size:12px;"><%= shootSheet.blocked || '' %></span>
+          </div>
+          <% if (shootSheet.ours && shootSheet.stale) { %>
+            <div id="shoot-sheet-stale" style="margin-top:4px; padding:4px 8px; border-radius:6px; background:#fef3c7; border:1px solid #f59e0b; font-size:12px;">LP構成 (または撮影判定・商品名・画像フォルダ) が変わりました。「撮影指示書を更新」で反映してください</div>
+          <% } %>
+          <div class="muted" style="font-size:11px; margin-top:4px;">
+            <% if (shootSheet.ours) { %>作成・更新: <%= String(shootSheet.at || '').slice(0, 16).replace('T', ' ') %> <%= shootSheet.by || '' %> ・<% } %>
+            <% if (shootSheet.source === 'none') { %>LP構成がまだ無いので、カットの表は空で作ります (スプレッドシートで書き足せます)
+            <% } else if (shootSheet.cutsCount) { %>LP構成から撮るカット <%= shootSheet.cutsCount %> 点: <%= shootSheet.cutLabels.join(' / ') %>
+            <% } else { %>LP構成の「使用素材」に撮影が要る画像が見つからないので、カットの表は空で作ります (スプレッドシートで書き足せます)<% } %>
+            ・ 置き場は商品の画像フォルダ。更新すると、スプレッドシートで直した内容は上書きされます
+          </div>
+        </div>
+        <div class="field">
+          <label>撮影指示書の URL <span class="muted" style="font-weight:400">(スプレッドシート。「画像制作情報を保存」で保存)</span></label>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <input type="url" id="ip-camera-url" style="flex:1;" value="<%= ip.camera_instruction_url || '' %>" placeholder="https://docs.google.com/spreadsheets/...">
+            <% if (ip.camera_instruction_url && !shootSheet.ours) { %><a href="<%= ip.camera_instruction_url %>" target="_blank" rel="noopener" class="btn btn-sm">開く ↗</a><% } %>
+          </div>
+        </div>
+        <%# 撮影依頼文 (Google Chat に貼る)。宛先・商品名・撮影指示書・画像フォルダの URL を差し込む。組み立ては buildShootRequestText %>
+        <div class="field" id="shoot-req" data-mention="<%= imageFlow.mention %>" data-name="<%= draft.name || '' %>">
+          <label>撮影依頼文 <span class="muted" style="font-weight:400">(コピーして Google Chat に貼る。URL は自動で入ります)</span></label>
+          <%# 宛先はその回だけ直せる (保存しない)。いつもの宛先は管理者が「担当者・工程の設定」で変える (2026-10-09 中原さん決定) %>
+          <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:4px;">
+            <label for="shoot-req-mention" style="margin:0; font-weight:400; font-size:12px;">宛先</label>
+            <input type="text" id="shoot-req-mention" value="<%= imageFlow.mention %>" maxlength="60" style="width:200px;" placeholder="(宛先なし)">
+            <span class="muted" style="font-size:11px;">この回だけ変えられます (保存しません)。いつもの宛先は管理者が <a href="/apps/product-hub/staff#shoot-mention-card">担当者・工程の設定</a> で変えます</span>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <button type="button" class="btn btn-primary btn-sm" id="shoot-req-copy">撮影依頼文をコピー</button>
+            <span class="muted" id="shoot-req-msg" style="font-size:12px;"></span>
+          </div>
+          <textarea id="shoot-req-text" rows="11" readonly style="width:100%; font-size:12px; margin-top:4px;"></textarea>
+        </div>
+        </section>
+        <section class="ipf-step" id="ipf-step-gen">
+        <h3 class="ipf-h"><span class="ipf-no"><%= ipfShowShoot ? '4' : '3' %></span>AI画像生成</h3>
           <%# 🖼 画像を作る (段階2・2026-10-04 中原さん)。できた構成から gpt-image-2.5 で画像を作り、
               商品の画像フォルダの中の「AI初稿」に保存する。人が押したときだけ・月の上限つき %>
           <% if (typeof lpImage !== 'undefined' && lpImage && lpImage.enabled) { %>
           <div id="lpi" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0;"
                data-draft-id="<%= draft.id %>">
+            <%# 作れる条件 (PR-E): 仮LP構成と撮影判定 / (撮影が要るなら) 素材が揃った。中身は画面の JS が lpi-json から入れる %>
+            <ul id="lpi-checks" style="list-style:none; padding:0; margin:0 0 6px; font-size:12px;"></ul>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
               <button type="button" class="btn" id="lpi-btn">🖼 画像を作る</button>
-              <span class="muted" id="lpi-status" style="font-size:12px;"></span>
+              <span class="muted" id="lpi-meta" style="font-size:11px;"></span>
             </div>
-            <div class="muted" id="lpi-meta" style="font-size:11px; margin-top:4px;"></div>
+            <div class="muted" id="lpi-status" style="font-size:12px; margin-top:4px;"></div>
+            <div id="lpi-head" hidden>
+              <div style="display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; margin-top:10px; font-size:12px;">
+                <b>生成した画像</b>
+                <span id="lpi-count"></span>
+                <span class="muted" id="lpi-checked"></span>
+                <a id="lpi-folder" href="#" target="_blank" rel="noopener" hidden>Drive で開く (AI初稿) ↗</a>
+              </div>
+            </div>
+            <div id="lpi-stale" hidden style="margin-top:6px; padding:4px 8px; border-radius:6px; background:#fef3c7; font-size:12px;">
+              画像を作ったあとで LP構成が変わりました。もう一度全部作ると反映されます (1 枚の再生成は前の指示のままです)
+            </div>
             <div id="lpi-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px; margin-top:8px;"></div>
+            <p class="muted" style="font-size:11px; margin:6px 0 0;">画像は画像フォルダの「AI初稿」に保存します (楽天・Amazon の商品画像には入れません)。再生成した画像は v2, v3… の新しいファイルになり、前の版も残ります。</p>
+          </div>
+          <%# デザイナー修正依頼書 (2026-10-09 PR-F・スタッフ要望 ⑥)。生成した全画像を TOP から順に貼ったスプレッドシートを商品の画像フォルダに作る。
+              中身は画面の JS (initDesignerSheet・@designer-sheet) が lpi-json の designer_sheet から入れる (画像のポーリングでも入れ直す) %>
+          <div id="dsheet" class="field" hidden style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;"
+               data-draft-id="<%= draft.id %>">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <div style="flex:1; min-width:220px;">
+                <b id="dsheet-title">デザイナー修正依頼書</b>
+                <div class="muted" id="dsheet-meta" style="font-size:11px;"></div>
+              </div>
+              <button type="button" class="btn btn-primary btn-sm" id="dsheet-create">デザイナー修正依頼書を作成</button>
+              <a id="dsheet-open" class="btn btn-sm" href="#" target="_blank" rel="noopener" hidden>開く ↗</a>
+            </div>
+            <div id="dsheet-stale" hidden style="margin-top:6px; padding:4px 8px; border-radius:6px; background:#fef3c7; border:1px solid #f59e0b; font-size:12px;">
+              <%# hidden で消すので、この div 自身に display を書かない (書くと hidden が効かない) %>
+              <span id="dsheet-stale-text"></span>
+              <button type="button" class="btn btn-sm" id="dsheet-update" style="margin-left:6px;">最新の画像で作り直す</button>
+            </div>
+            <div class="muted" id="dsheet-msg" style="font-size:12px; margin-top:4px; white-space:pre-wrap;"></div>
+            <p class="muted" style="font-size:11px; margin:4px 0 0;">修正指示はスプレッドシートの「修正指示」の列に書きます。作り直しても、書いた修正指示は同じ画像の行に残ります。画像を表示するため、載せる画像 (各画像の最新の版) だけを「リンクを知っている人は閲覧可」にします。</p>
           </div>
           <script type="application/json" id="lpi-json"><%- JSON.stringify(lpImage).replace(/</g, '\\u003c') %></script>
           <% } %>
+          <% if (!(typeof lpImage !== 'undefined' && lpImage && lpImage.enabled)) { %>
+          <p class="muted" style="font-size:12px; margin:0;">AI の画像生成はまだ使えません (Render の設定待ち)</p>
+          <% } %>
+        </section>
+        <section class="ipf-step" id="ipf-step-manage">
+        <h3 class="ipf-h">画像制作の管理項目</h3>
+        <div class="field" style="display:flex; gap:12px;">
+          <div style="flex:1">
+            <label>撮影・素材ステータス <span class="muted" style="font-weight:400">(③素材待ちは 素材完了 か 撮影不要 で完了。撮影判定で「撮影不要」にするとそろいます)</span></label>
+            <select id="ip-material" style="width:100%;">
+              <option value="">未設定</option>
+              <% for (const m of materialStatuses) { %>
+                <option value="<%= m.code %>" <%= ip.material_status === m.code ? 'selected' : '' %>><%= m.label %></option>
+              <% } %>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>Canva リンク (制作中のデザイン)</label>
+          <input type="url" id="ip-canva-url" value="<%= ip.canva_url || '' %>" placeholder="https://canva.link/...">
+          <% if (ip.canva_url) { %><a href="<%= ip.canva_url %>" target="_blank" rel="noopener" class="muted" style="font-size:12px;">開く ↗</a><% } %>
+        </div>
+        <%# 編集データ (PSD 等) のリンク (2026-10-08 スタッフのラフ) %>
+        <div class="field">
+          <label>編集データリンク <span class="muted" style="font-weight:400">(PSD などの編集データ)</span></label>
+          <input type="url" id="ip-edit-data-url" value="<%= ip.edit_data_url || '' %>" placeholder="https://drive.google.com/...">
+          <% if (ip.edit_data_url) { %><a href="<%= ip.edit_data_url %>" target="_blank" rel="noopener" class="muted" style="font-size:12px;">開く ↗</a><% } %>
+        </div>
+        <%# あまり使わない項目 (2026-10-08 スタッフ要望で畳む)。データは消さない — ボード・他画面が読む列もある。
+            ここの欄も下の「画像制作情報を保存」で一緒に保存される %>
+        <details class="ipf-more" id="ipf-more">
+          <summary>その他の項目 (あまり使わない・ChatGPT の定型文)</summary>
+          <div class="muted" style="font-size:11px; margin:6px 0;">ここの欄も下の「画像制作情報を保存」で一緒に保存されます</div>
+          <%# AI が止まったときの予備の道 (ChatGPT に貼る定型文)。段階1 の測定 (くらべっこ) でも使う %>
+          <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap; align-items:center;">
+            <button type="button" class="btn prompt-btn" data-kind="initialJudge" <%= promptTemplates.available ? '' : 'disabled' %>>🧪 初動判定を準備</button>
+            <button type="button" class="btn prompt-btn" data-kind="productAnalysis" <%= promptTemplates.available ? '' : 'disabled' %>>📝 商品分析を準備</button>
+            <button type="button" class="btn prompt-btn" data-kind="simpleLp" <%= promptTemplates.available ? '' : 'disabled' %>>🖼 簡易LPを準備</button>
+            <span class="muted" style="font-size:12px;"><%= promptTemplates.available ? 'ChatGPT に貼る定型文を作ります (コピーして商品画像を添付。保存前の編集は反映されません)' : promptTemplates.reason %></span>
+          </div>
+          <div id="prompt-modal" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
+            <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+              <strong id="prompt-title"></strong>
+              <button type="button" class="btn btn-primary" id="prompt-copy-btn">コピー</button>
+              <button type="button" class="btn" id="prompt-close-btn">閉じる</button>
+              <span class="muted" id="prompt-copy-result" style="font-size:12px;"></span>
+            </div>
+            <%# 2026-09-10: 補足情報の欄は廃止 (新しい定型文に補足情報の枠が無い)。
+                足したいことがあれば下の本文をそのまま直してからコピーする %>
+            <textarea id="prompt-text" rows="16" style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
+          </div>
         <script type="application/json" id="prompt-templates-json"><%- JSON.stringify(promptTemplates).replace(/</g, '\\u003c') %></script>
         <%# 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列「仮構成」とは別。ボードのカードに「構成：まだ／済」で出る %>
         <div class="field" style="padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;">
@@ -1711,15 +1918,6 @@ th.attr-unknown { color: #dc2626; }
           <% } %>
         </div>
         <div class="field" style="display:flex; gap:12px;">
-          <div style="flex:1">
-            <label>撮影・素材ステータス <span class="muted" style="font-weight:400">(撮影要否を判断して設定 / ③素材待ちは 素材完了 か 撮影不要 で完了)</span></label>
-            <select id="ip-material" style="width:100%;">
-              <option value="">未設定</option>
-              <% for (const m of materialStatuses) { %>
-                <option value="<%= m.code %>" <%= ip.material_status === m.code ? 'selected' : '' %>><%= m.label %></option>
-              <% } %>
-            </select>
-          </div>
           <div style="flex:1">
             <label>ステータス <span class="muted" style="font-weight:400">(メモ用。工程は上の工程パネルが正)</span></label>
             <input type="text" id="ip-status" list="dl-ip-status" value="<%= ip.status || '' %>">
@@ -1775,15 +1973,6 @@ th.attr-unknown { color: #dc2626; }
             <datalist id="dl-ip-composer"><option value="田中美祐"><option value="大川さん"><option value="中原大輔"></datalist>
           </div>
         </div>
-        <div class="field">
-          <label>カメラ撮影指示URL</label>
-          <input type="url" id="ip-camera-url" value="<%= ip.camera_instruction_url || '' %>" placeholder="https://docs.google.com/spreadsheets/...">
-        </div>
-        <div class="field">
-          <label>Canva リンク (制作中のデザイン)</label>
-          <input type="url" id="ip-canva-url" value="<%= ip.canva_url || '' %>" placeholder="https://canva.link/...">
-          <% if (ip.canva_url) { %><a href="<%= ip.canva_url %>" target="_blank" rel="noopener" class="muted" style="font-size:12px;">開く ↗</a><% } %>
-        </div>
         <%# TOP画像の構成 (2026-09-13 スタッフ要望)。TOP作成から完了までを円滑にするため、詳細画像 (LP) と同じく
             TOP画像も田中さんが簡単な構成を作る。テキストの構成と参考・ラフの URL を並べて、すり合わせを見える形にし
             大輔さんに制作意図を伝える %>
@@ -1810,7 +1999,9 @@ th.attr-unknown { color: #dc2626; }
           </div>
           <textarea id="ip-request" rows="6"><%= ip.request_text || '' %></textarea>
         </div>
+        </details>
         <button class="btn btn-primary" id="save-ip-btn">画像制作情報を保存</button>
+        </section>
     </div>
   </div>
   </div><!-- /tab-images -->
@@ -5782,23 +5973,34 @@ th.attr-unknown { color: #dc2626; }
   const saveIpBtn = document.getElementById('save-ip-btn');
   if (saveIpBtn) {
     saveIpBtn.addEventListener('click', async () => {
+      // 隠れた撮影指示書の段に未保存の入力が戻っている (別タブで撮影不要にされた後など) なら、黙って捨てず見せて止める
+      if (revealHiddenCameraDraft(document)) {
+        result.textContent = '撮影指示書の URL に保存していない入力があります (撮影判定は今「撮影不要」か未判定です)。段を開いたので、残すか消すかを決めてから保存してください';
+        return;
+      }
       const snap = phKeep ? phKeep.saving(['image']) : null;
+      const materialSend = materialForSave(document);
       const json = await post(BASE + '/image-production', {
         status: document.getElementById('ip-status').value,
         importance_tier: document.getElementById('ip-tier').value,
         production_type: document.getElementById('ip-type').value,
         aplus_content: document.getElementById('ip-aplus').value,
         aplus_related: document.getElementById('ip-aplus-related').value,
-        camera_instruction_url: document.getElementById('ip-camera-url').value,
+        camera_instruction_url: cameraUrlForSave(document),
+        // 指示書の URL を送るときは、画面が見ていた値を添える (別のタブで撮影指示書を作った後の古い画面で消さない — Codex PR-D 名指し2 M)
+        ...(cameraUrlForSave(document) !== undefined ? { camera_instruction_url_expected: cameraUrlShownAtLoad(document) } : {}),
         shipping_status: document.getElementById('ip-shipping').value,
         reference_collection: document.getElementById('ip-refcol').value,
         designer: document.getElementById('ip-designer').value,
         page_composer: document.getElementById('ip-composer').value,
         request_text: document.getElementById('ip-request').value,
         canva_url: document.getElementById('ip-canva-url').value,
+        edit_data_url: document.getElementById('ip-edit-data-url').value,
         top_compose_text: document.getElementById('ip-top-compose').value,
         top_ref_url: document.getElementById('ip-top-ref-url').value,
-        material_status: document.getElementById('ip-material').value,
+        material_status: materialSend,
+        // 素材ステータスを送るときは、画面が見ていた撮影判定も添える (別タブで判定が変わっていたらサーバが 409)
+        ...(materialSend !== undefined ? { shoot_mode_expected: shootModeShown(document) } : {}),
         ...productInfoPayload(),
         back_info_text: document.getElementById('ip-back-info').value,
       });
@@ -5806,6 +6008,342 @@ th.attr-unknown { color: #dc2626; }
       showAndReload(json, '画像制作情報を保存しました');
     });
   }
+  /* @image-flow:start — 画像制作の新フロー (2026-10-08): 撮影依頼文と撮影判定。
+     smoke がこの間を切り出して、偽の document で動かして試す (EJS の値はここに書かない) */
+  /**
+   * 撮影依頼文 (Google Chat に貼る)。スタッフのラフの文面どおり。
+   * URL が欠けていたら ok=false (コピーさせない) と、何が欠けているか
+   */
+  function buildShootRequestText(o) {
+    const nl = String.fromCharCode(10);
+    const mention = String((o && o.mention) || '').trim();
+    const name = String((o && o.productName) || '').trim();
+    const sheet = String((o && o.sheetUrl) || '').trim();
+    const folder = String((o && o.folderUrl) || '').trim();
+    // 空と、http(s) で始まらない値 (保存前の打ち間違い・javascript: など) はコピーさせない — Codex PR-A 名指し L
+    const isWebUrl = function (v) { return /^https?:\/\/[^\s]+$/i.test(v); };
+    const missing = [];
+    // 商品名が無い依頼文は、どの商品の撮影か分からない — Codex PR-A 名指し2 M
+    if (!name) missing.push('商品名');
+    if (!sheet) missing.push('撮影指示書の URL');
+    else if (!isWebUrl(sheet)) missing.push('撮影指示書の URL (https:// で始まる形)');
+    if (!folder) missing.push('画像フォルダの URL');
+    else if (!isWebUrl(folder)) missing.push('画像フォルダの URL (https:// で始まる形)');
+    // 撮影判定が「撮影が要る」でなければ依頼を出させない (古い指示書 URL が残っていて段が見えている商品でも。
+    // ボードは「撮影指示書 対象外」なのに依頼だけ飛ぶのを防ぐ — Codex PR-A 名指し5 M)
+    const needShoot = o && (o.shootMode === 'inhouse' || o.shootMode === 'photographer');
+    const blocked = needShoot ? null
+      : (o && o.shootMode === 'none' ? '撮影判定が「撮影不要」なので、撮影依頼は出せません'
+        : '撮影判定がまだです。「社内撮影」か「カメラマン撮影」を選んでからコピーしてください');
+    const lines = [];
+    if (mention) lines.push(mention);
+    lines.push('お世話になっています。', '下記商品の商品撮影をお願いします。', '',
+      '【商品名】' + (name || '(商品名が未入力です)'), '',
+      '【撮影指示書】', sheet || '(未登録)', '',
+      '【商品画像フォルダ】', folder || '(未登録)', '',
+      'よろしくお願いいたします。');
+    return { ok: !blocked && missing.length === 0, blocked: blocked, missing: missing, text: lines.join(nl) };
+  }
+  /**
+   * 「画像制作情報を保存」で送る撮影指示書の URL。段が隠れているとき (撮影不要・未判定で URL も無い) は送らない —
+   * 見えない欄に未保存の退避 (別タブで撮影不要にされた後など) が戻っていても保存しない (Codex PR-A 名指し5 M)。
+   * undefined は JSON に載らない = サーバは今の値を残す
+   */
+  function cameraUrlForSave(doc) {
+    const sec = doc.getElementById('ipf-step-shoot');
+    const el = doc.getElementById('ip-camera-url');
+    if (!el || (sec && sec.hidden)) return undefined;
+    // 開いたときから変えていなければ送らない (撮影指示書の自動作成 PR-D: 別のタブで作った URL を、古い画面の空欄で消さない)
+    if (el.defaultValue !== undefined && String(el.value || '').trim() === String(el.defaultValue || '').trim()) return undefined;
+    return el.value;
+  }
+  /** 画面を開いたときの撮影指示書の URL (保存で添える。サーバが今の値と比べる) */
+  function cameraUrlShownAtLoad(doc) {
+    const el = doc.getElementById('ip-camera-url');
+    return el ? String(el.defaultValue || '') : '';
+  }
+  /**
+   * 「画像制作情報を保存」で送る撮影・素材ステータス。画面を開いたときから変えていなければ送らない —
+   * 別のタブ・撮影判定で変わった新しい値を、開いたときの古い値で戻さない (Codex PR-A 名指し6 M)
+   */
+  /** 画面が表示している撮影判定 (未判定は null) */
+  function shootModeShown(doc) {
+    const box = doc.getElementById('shoot-mode-box');
+    return box && box.dataset.current ? box.dataset.current : null;
+  }
+  /**
+   * 撮影指示書の段が隠れているのに、欄に保存していない入力がある (未保存の退避が戻った) なら段を開いて true —
+   * 保存で送らない欄を「保存した」扱いにして、次の読み直しで黙って消さない (Codex PR-A 名指し7 M)
+   */
+  function revealHiddenCameraDraft(doc) {
+    const sec = doc.getElementById('ipf-step-shoot');
+    const el = doc.getElementById('ip-camera-url');
+    if (!sec || !el || !sec.hidden) return false;
+    if (String(el.value || '').trim() === String(el.defaultValue || '').trim()) return false;
+    sec.hidden = false;
+    return true;
+  }
+  function materialForSave(doc) {
+    const el = doc.getElementById('ip-material');
+    if (!el) return undefined;
+    const opts = el.options ? Array.prototype.slice.call(el.options) : [];
+    const init = opts.filter(function (o) { return o.defaultSelected; })[0];
+    return el.value === (init ? init.value : '') ? undefined : el.value;
+  }
+  /** 画面のつなぎ込み。deps = { post, showAndReload, base, clipboard, confirm } (smoke では偽物を渡す) */
+  function initImageFlow(doc, deps) {
+    // 撮影判定: 押した時点で保存して読み直す (素材ステータスもサーバがそろえるので、画面で値を作らない)
+    doc.querySelectorAll('[data-shoot-mode]').forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        // 「おすすめにする」(@shoot-rec) から押されたときだけ 1 回付く。サーバがいまの AI のおすすめと照らす (PR-C)
+        const aiJobId = btn.dataset.aiJobId ? Number(btn.dataset.aiJobId) : null;
+        delete btn.dataset.aiJobId;
+        if (btn.getAttribute('aria-checked') === 'true') return;
+        // 🚨 撮影指示書の URL を打って保存していないまま「撮影不要」にすると、読み直しで段が隠れ、
+        //    未保存の退避が隠れた欄に戻る。次に別の項目を保存すると見えない URL まで保存される
+        //    (Codex PR-A 名指し2 M)。先に聞いて、捨てるなら欄を元の値に戻してから送る
+        const cam = doc.getElementById('ip-camera-url');
+        const dropCam = btn.dataset.shootMode === 'none' && cam && String(cam.value || '').trim() !== String(cam.defaultValue || '').trim();
+        if (dropCam && !deps.confirm('撮影指示書の URL が保存されていません。「撮影不要」にすると、いま入れた URL は消えます。よろしいですか？')) return;
+        const msg = doc.getElementById('shoot-mode-msg');
+        if (msg) msg.textContent = '保存しています…';
+        // 送っている間は 3 つとも押させない (続けて押すと後から届いたほうが黙って勝つ — Codex PR-A 名指し4 M)
+        const allBtns = doc.querySelectorAll('[data-shoot-mode]');
+        allBtns.forEach(function (b) { b.disabled = true; });
+        // 画面が見ていた判定を添える。ほかの人が先に変えていたらサーバが 409 で止める
+        const modeBox = doc.getElementById('shoot-mode-box');
+        const shown = modeBox && modeBox.dataset.current ? modeBox.dataset.current : null;
+        let json;
+        const body = { mode: btn.dataset.shootMode, expected: shown };
+        if (aiJobId) body.ai_job_id = aiJobId;
+        try { json = await deps.post(deps.base + '/shoot-mode', body); }
+        catch (e) { json = { ok: false, error: '通信できませんでした' }; }
+        if (!json.ok) allBtns.forEach(function (b) { b.disabled = false; });
+        if (!json.ok && msg) msg.textContent = '保存できませんでした: ' + (json.error || '');
+        // 欄を元の値に戻すのは保存できたときだけ (失敗したら判定は変わらないので、打った URL を残す — 名指し3 M)
+        if (json.ok && dropCam) cam.value = cam.defaultValue || '';
+        if (json.ok) {
+          // 読み直しが離脱確認で止められても、画面が古い判定のまま残らないよう先にそろえる
+          // (撮影依頼文のコピー・次に送る expected はこの値を見る — Codex PR-A 名指し6 M)
+          if (modeBox) modeBox.dataset.current = btn.dataset.shootMode;
+          allBtns.forEach(function (b) {
+            const on = b === btn;
+            b.setAttribute('aria-checked', on ? 'true' : 'false');
+            if (b.classList) b.classList.toggle('on', on);
+            b.disabled = false;
+          });
+          // AI のおすすめの文 (いまの判定との違い) も、読み直しを待たずにそろえる (PR-C)
+          if (deps.onShootModeChanged) deps.onShootModeChanged(btn.dataset.shootMode);
+        }
+        deps.showAndReload(json, '撮影判定を保存しました');
+      });
+    });
+    // 撮影依頼文: URL の欄を直したらその場で組み直す (保存前の値でもよい — 貼る URL は同じ)
+    const box = doc.getElementById('shoot-req');
+    const area = doc.getElementById('shoot-req-text');
+    if (!box || !area) return { refresh: function () { return null; } };
+    const valueOf = function (id) { const el = doc.getElementById(id); return el ? el.value : ''; };
+    function refresh() {
+      // 商品名は基本情報タブで読み直さずに直せるので、いまの欄の値を使う — Codex PR-A 名指し M。
+      // 欄があって空なら空のまま (描いたときの古い名前で送らない — 名指し2 M)。欄が無い画面だけ描いたときの名前
+      const nameEl = doc.getElementById('f-name');
+      const modeBox = doc.getElementById('shoot-mode-box');
+      // 宛先はその回だけ直せる欄から (初期値 = いつもの宛先・保存はしない — 2026-10-09 中原さん決定)。欄が無い画面だけ描いたときの値
+      const mentionEl = doc.getElementById('shoot-req-mention');
+      const r = buildShootRequestText({
+        shootMode: modeBox ? (modeBox.dataset.current || null) : null,
+        mention: mentionEl ? mentionEl.value : box.dataset.mention, productName: nameEl ? nameEl.value : box.dataset.name,
+        sheetUrl: valueOf('ip-camera-url'), folderUrl: valueOf('import-folder-url'),
+      });
+      area.value = r.text;
+      return r;
+    }
+    ['ip-camera-url', 'import-folder-url', 'f-name', 'shoot-req-mention'].forEach(function (id) {
+      const el = doc.getElementById(id);
+      if (el) el.addEventListener('input', refresh);
+    });
+    const copyBtn = doc.getElementById('shoot-req-copy');
+    const copyMsg = doc.getElementById('shoot-req-msg');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', function () {
+        const r = refresh();
+        if (!r.ok) {
+          // 欠けたまま貼ると、カメラマンが指示書や写真の置き場を探すことになる
+          if (copyMsg) copyMsg.textContent = r.blocked || (r.missing.join('・') + ' が未登録です。入れてからコピーしてください');
+          return;
+        }
+        const fallback = function () {
+          area.removeAttribute('readonly');
+          area.select();
+          if (copyMsg) copyMsg.textContent = '選択しました。Ctrl+C (⌘C) でコピーしてください';
+        };
+        try {
+          deps.clipboard.writeText(r.text).then(function () {
+            if (copyMsg) copyMsg.textContent = '撮影依頼文をコピーしました';
+          }, fallback);
+        } catch (e) { fallback(); }
+      });
+    }
+    refresh();
+    return { refresh: refresh };
+  }
+  /* @image-flow:end */
+  /* @shoot-rec:start — AI の撮影判定 (画像制作の新フロー PR-C・2026-10-09): 撮影判定の箱の「AIのおすすめ」と理由。
+     試験 (scripts/test-ph-lp-compose-shoot.mjs) がこの間を切り出して、偽の document で動かす (EJS の値はここに書かない) */
+  /**
+   * 撮影判定の箱に出す中身を決める (画面に依らない純粋関数)。
+   * j = サーバの shoot (lib/lp-compose.js の shootSummaryFor。使える構成が無ければ null)
+   * current = いま保存されている撮影判定 (未判定は null)
+   * 🚨 撮影判定は**自動で書き換えない** — 決めるのは人。「おすすめにする」は 3 択のボタンを押すのと同じ
+   */
+  function shootRecView(j, current) {
+    const LABEL = { none: '撮影不要', inhouse: '社内撮影', photographer: 'カメラマン撮影' };
+    if (!j) return { show: false, recommended: null, adopt: false, text: '' };
+    if (!j.available || !LABEL[j.recommended]) {
+      return {
+        show: true, recommended: null, adopt: false, none: true,
+        text: j.missing === 'invalid'
+          ? 'AI の撮影判定はありません (AI が出した判定の形が正しくなかったので使っていません)。LP構成を見て選んでください'
+          : 'AI の撮影判定はありません (撮影判定を出す前の仕組みで作った構成です。作り直すと出ます)。LP構成を見て選んでください',
+      };
+    }
+    const NL = String.fromCharCode(10);
+    const same = current === j.recommended;
+    const tail = same ? ''
+      : (current ? NL + '(いまの判定は「' + (LABEL[current] || current) + '」です。おすすめに合わせるかは人が決めます)'
+        : NL + '(まだ判定していません。おすすめでよければ「おすすめにする」か上のボタンを押してください)');
+    return {
+      show: true, recommended: j.recommended, adopt: !same, none: false,
+      text: 'AIのおすすめ: ' + LABEL[j.recommended] + ' — ' + String(j.reason || '') + shootRecDetail(j) + tail,
+    };
+  }
+  /**
+   * 仕様書「新商品初動判定」で判定したもの (format 2・PR-C2) だけ、開封要否・カット数・撮影用送付対象を 1 行で添える。
+   * カットの中身は撮影指示書 (PR-D) の役目なのでここには出さない。warnings = 仕様書の運用ルールの知らせ (強制はしない)。
+   * PR-C の形 (format 1) には無い項目なので何も足さない
+   */
+  function shootRecDetail(j) {
+    if (!j || j.format !== 2) return '';
+    const NL = String.fromCharCode(10);
+    const parts = [];
+    if (j.open_required) parts.push('開封: ' + j.open_required);
+    if (j.recommended !== 'none') parts.push('撮影カット: ' + (Number(j.cut_count) || 0) + ' カット');
+    if (j.recommended !== 'none' && j.send_targets) parts.push('撮影用送付対象: ' + j.send_targets);
+    const warns = Array.isArray(j.warnings) ? j.warnings.filter(function (w) { return typeof w === 'string' && w; }) : [];
+    return (parts.length ? NL + parts.join(' ／ ') : '') + warns.map(function (w) { return NL + '⚠ ' + w; }).join('');
+  }
+  /**
+   * 撮影判定の箱に描く。札 (AIのおすすめ) はおすすめのボタンにだけ出す。理由は textContent で入れる (AI の文なので HTML にしない)
+   * @returns {{ refresh: function, update: function(object|null) }}
+   */
+  function initShootRec(doc) {
+    const box = doc.getElementById('shoot-mode-box');
+    const rec = doc.getElementById('shoot-rec');
+    const textEl = doc.getElementById('shoot-rec-text');
+    const adopt = doc.getElementById('shoot-rec-adopt');
+    const holder = doc.getElementById('shoot-rec-json');
+    let judgement = null;
+    try { judgement = holder ? JSON.parse(holder.textContent || 'null') : null; } catch (e) { judgement = null; }
+    function refresh() {
+      if (!box || !rec || !textEl) return null;
+      const v = shootRecView(judgement, box.dataset.current || null);
+      rec.hidden = !v.show;
+      if (rec.classList) rec.classList.toggle('none', !!v.none);
+      textEl.textContent = v.text;
+      if (adopt) { adopt.hidden = !v.adopt; adopt.dataset.mode = v.recommended || ''; }
+      doc.querySelectorAll('[data-shoot-rec-badge]').forEach(function (b) {
+        b.hidden = !v.recommended || b.dataset.shootRecBadge !== v.recommended;
+      });
+      return v;
+    }
+    // 「おすすめにする」= おすすめのボタンを押す。保存・確認・別タブとの食い違い (expected)・③素材待ちとの整合は
+    // すべて 3 択のボタンの処理 (initImageFlow → POST /shoot-mode) をそのまま通す (ここで別の送り方をしない)
+    if (adopt) {
+      adopt.addEventListener('click', function () {
+        const mode = adopt.dataset.mode;
+        if (!mode) return;
+        const target = Array.prototype.slice.call(doc.querySelectorAll('[data-shoot-mode]'))
+          .filter(function (b) { return b.dataset.shootMode === mode; })[0];
+        if (!target || target.disabled || target.getAttribute('aria-checked') === 'true') return;
+        // どの構成のおすすめを選んだかを添える (別のタブで作り直されていたらサーバが 409 で止める・Codex PR-C 名指し3 M)
+        if (judgement && judgement.job_id) target.dataset.aiJobId = String(judgement.job_id);
+        target.click();
+      });
+    }
+    refresh();
+    return {
+      refresh: refresh,
+      // 構成のポーリング (GET /lp-compose) の応答の shoot で入れ直す。undefined (古い応答) は何もしない
+      update: function (j) { if (j === undefined) return null; judgement = j; return refresh(); },
+    };
+  }
+  /* @shoot-rec:end */
+  // AI のおすすめ (PR-C)。構成のポーリング (initLpCompose) からも入れ直すので window に置く
+  const shootRec = initShootRec(document);
+  window.phShootRec = shootRec;
+  initImageFlow(document, { post: post, showAndReload: showAndReload, base: BASE, clipboard: navigator.clipboard, confirm: function (m) { return window.confirm(m); },
+    onShootModeChanged: function () { shootRec.refresh(); } });
+  /* @shoot-sheet:start — 撮影指示書 (スプレッドシート) の作成・更新ボタン (2026-10-09 画像制作の新フロー PR-D)。
+     smoke がこの間を切り出して、偽の document で動かして試す (EJS の値はここに書かない) */
+  /** 画面のつなぎ込み。deps = { post, showAndReload, base, confirm } (smoke では偽物を渡す) */
+  function initShootSheet(doc, deps) {
+    const box = doc.getElementById('shoot-sheet');
+    const btn = doc.getElementById('shoot-sheet-btn');
+    const msg = doc.getElementById('shoot-sheet-msg');
+    if (!box || !btn) return null;
+    let busy = false;
+    const say = function (t) { if (msg) msg.textContent = t; };
+    const send = async function (body) {
+      try { return await deps.post(deps.base + '/shoot-sheet', body); }
+      catch (e) { return { ok: false, error: '通信できませんでした' }; }
+    };
+    btn.addEventListener('click', async function () {
+      // 作っている間は押させない (二重押しで 2 回送らない。サーバも同じ商品は 1 本ずつ)
+      if (busy || btn.disabled) return;
+      const ours = box.dataset.ours === '1';
+      // 指示書の URL を打って保存していない: 作ると欄は作った URL になる。打った URL を黙って捨てない
+      const cam = doc.getElementById('ip-camera-url');
+      const camDirty = !!cam && String(cam.value || '').trim() !== String(cam.defaultValue || '').trim();
+      if (camDirty && !deps.confirm('撮影指示書の URL に保存していない入力があります。撮影指示書を作ると、その入力は捨てて、作ったスプレッドシートの URL を入れます。よろしいですか？')) return;
+      // 上書きは、スプレッドシートで人が直した内容を消す
+      if (ours && !deps.confirm('撮影指示書を今の LP構成で上書きします (URL は変わりません)。スプレッドシートで直した内容は消えます。よろしいですか？')) return;
+      busy = true;
+      btn.disabled = true;
+      say(ours ? '更新しています…' : '作成しています… (10〜20 秒かかります)');
+      // 依頼文のタブには、画面の撮影依頼文と同じ宛先 (その回だけ直した欄の値) を入れる — Codex PR-D 名指し M
+      const mentionEl = doc.getElementById('shoot-req-mention');
+      // 画面を開いたときの指示書の URL を添える (別のタブで作った・貼り替えた後の古い画面ならサーバが止める)。
+      // 作成済みの指示書の更新は、上で確かめたのでそのファイルを添える (無いとサーバがもう一度確かめさせる)
+      const base = { seen_url: String(box.dataset.seenUrl || '') };
+      if (ours && box.dataset.fileId) base.overwrite_file_id = box.dataset.fileId;
+      if (mentionEl) base.mention = String(mentionEl.value || '');
+      let json = await send(base);
+      // 手で貼った指示書の URL が入っている: 置き換えてよいかを聞いてから、確かめた URL を添えて送り直す
+      // (確かめた後に別の URL に貼り替えられていたら、サーバがもう一度 409 で止める)
+      if (!json.ok && json.code === 'manual_url') {
+        if (deps.confirm(json.error)) json = await send(Object.assign(base, { replace_manual_url: json.manual_url }));
+        else json = { ok: false, cancelled: true };
+      }
+      // 前に作りかけた撮影指示書が画像フォルダにある (人が直しているかもしれない): 上書きしてよいかを聞いてから、そのファイルを添えて送り直す
+      if (!json.ok && json.code === 'recovered_file') {
+        if (deps.confirm(json.error)) json = await send(Object.assign(base, { overwrite_file_id: json.file_id }));
+        else json = { ok: false, cancelled: true };
+      }
+      busy = false;
+      if (!json.ok) {
+        btn.disabled = false;
+        say(json.cancelled ? 'やめました (撮影指示書は変えていません)' : '作れませんでした: ' + (json.error || ''));
+        return;
+      }
+      // 打っていた URL は捨てる (読み直しで未保存として戻さない)。欄には読み直しで作った URL が出る
+      if (camDirty) cam.value = cam.defaultValue || '';
+      say(json.created ? '撮影指示書を作りました' : '撮影指示書を更新しました');
+      deps.showAndReload(json, json.created ? '撮影指示書を作りました (画像フォルダの中)' : '撮影指示書を更新しました');
+    });
+    return { isBusy: function () { return busy; } };
+  }
+  /* @shoot-sheet:end */
+  initShootSheet(document, { post: post, showAndReload: showAndReload, base: BASE, confirm: function (m) { return window.confirm(m); } });
   // 🆕 入荷のときに撮った裏面の写真を AI に文字起こしさせる (2026-09-18)。
   //    ⭐**保存しない** — 読み取った文章を欄に入れるだけで、保存するかは人が決める。
   //      AI の読み違いを黙って正本 (back_info_text) に入れないため
@@ -5866,127 +6404,409 @@ th.attr-unknown { color: #dc2626; }
     });
   })();
   // 🖼 画像を作る (段階2・2026-10-04)。押す → サーバの作る係が 1 枚ずつ作って Drive の「AI初稿」へ。
-  // 画面は作っている間 5 秒おきに状況を見て、できた画像からサムネイルを並べる
-  (function initLpImages() {
-    const root = document.getElementById('lpi');
-    const holder = document.getElementById('lpi-json');
-    if (!root || !holder) return;
+  // 画面は作っている間 5 秒おきに状況を見て、できた画像からカードを並べる。
+  // 画像制作の新フロー PR-E (2026-10-09): 作れる条件のチェックリスト・1 枚ずつ「確認」「再生成」・確認済み N/M
+  /* @lp-image-ui:start — test-ph-lp-image.mjs がこの間を切り出して、偽の document で動かして試す (EJS の値はここに書かない) */
+  const LPI_STATUS_TEXT = { queued: '待ち', running: '作っています…', done: 'できました', failed: '作れませんでした', skipped: '作っていません' };
+  const LPI_FORBIDDEN = '画像の生成・作り直し・確認は 画像登録者・画像作成承認者 の担当者か管理者だけです';
+  const lpiYen = (n) => Math.round(Number(n) || 0).toLocaleString() + ' 円';
+  const lpiLabel = (c) => (c.no === 0 ? '0枚目 (TOP)' : c.no != null ? c.no + '枚目' : c.seq + '番目');
+  /** 何かを作っている途中か (全部作る依頼 / 1 枚の作り直し)。途中なら 5 秒おきに見に行く */
+  function lpiRunning(s) {
+    const job = s && s.job;
+    return (!!job && (job.status === 'queued' || job.status === 'running')) || !!(s && s.regen_running)
+      || ((s && s.cards) || []).some((c) => c.pending);
+  }
+  /**
+   * 1 枚のカードの見え方 (画面に依らない)。busy = その 1 枚の依頼を送っている途中
+   */
+  function lpiCardView(c, s, busy) {
+    const canEdit = !!(s && s.can_edit);
+    const cur = c.current;
+    const remaking = c.pending && c.head_version > 1;
+    let checkTitle = '';
+    if (!canEdit) checkTitle = LPI_FORBIDDEN;
+    else if (c.pending) checkTitle = 'できてから確認できます';
+    else if (!cur) checkTitle = 'まだできていない画像は確認できません';
+    else if (c.checked) checkTitle = '確認済み: ' + (cur.checked_by || '') + ' ' + String(cur.checked_at || '').slice(0, 16).replace('T', ' ') + ' (押すと外します)';
+    else checkTitle = 'この画像を確認したら押します';
+    return {
+      rootId: c.root_id,
+      label: lpiLabel(c),
+      role: c.name || '',
+      versionText: cur && cur.version > 1 ? 'v' + cur.version : '',
+      imgSrc: cur && !c.pending ? '/apps/product-hub/api/thumb/' + encodeURIComponent(cur.drive_file_id) + '?w=320' : '',
+      openUrl: cur ? 'https://drive.google.com/file/d/' + encodeURIComponent(cur.drive_file_id) + '/view' : '',
+      placeholder: c.pending ? (remaking ? '作り直しています…' : (LPI_STATUS_TEXT[c.head_status] || c.head_status))
+        : (cur ? '' : (LPI_STATUS_TEXT[c.head_status] || c.head_status)),
+      // 新しい版が作れなかった (前の版はそのまま出す) / 1 枚もできなかった
+      error: !c.pending && c.head_error ? (cur ? '作り直せませんでした: ' : '') + c.head_error : '',
+      checked: !!c.checked,
+      checkLabel: c.checked ? '✓ 確認済み' : '確認',
+      checkDisabled: !canEdit || !cur || c.pending || !!busy,
+      checkTitle,
+      regenLabel: remaking ? '作成中…' : '再生成 (約 ' + lpiYen(c.regen_est_jpy) + ')',
+      regenDisabled: !canEdit || c.pending || !!c.regen_blocked || !!busy,
+      regenTitle: !canEdit ? LPI_FORBIDDEN : (c.regen_blocked || 'この 1 枚だけ作り直す (受付のときの指示と参考画像で。前の版は Drive に残ります・取り置き 約 ' + lpiYen(c.regen_est_jpy) + ')'),
+    };
+  }
+  /** カード以外の見え方 (ボタンの文字・押せない理由・チェックリスト・確認済み N/M) */
+  function lpiView(s, posting) {
+    const job = s.job;
+    const running = lpiRunning(s);
+    const cards = s.cards || [];
+    const checks = (s.checklist || []).map((x) => ({ ok: !!x.ok, text: x.text }));
+    const allOk = checks.every((x) => x.ok);
+    // 押したときに取り置く額 (安全側の見込み・保証ではない)。実際はふつうもっと安い
+    const est = Number(s.planned_reserve_jpy) || 0;
+    const fullRunning = !!job && (job.status === 'queued' || job.status === 'running');
+    // 出来ぐあいはカードの最新の版で見る (失敗した 1 枚を作り直せたら「できました」)。費用は作り直しの分も足す
+    const flow = s.flow_status || (job && job.status);
+    const cost = s.flow_cost_jpy != null ? Number(s.flow_cost_jpy) : (job ? Number(job.cost_jpy) || 0 : 0);
+    const mainLabel = fullRunning ? '🖼 画像を作っています…'
+      : (job ? '🖼 もう一度画像を作る (全部' + (est ? '・' + s.planned_count + ' 枚・取り置き 約 ' + lpiYen(est) : '') + ')'
+        : '🖼 画像を作る' + (est ? ' (' + s.planned_count + ' 枚・取り置き 約 ' + lpiYen(est) + ')' : ''));
+    let statusText;
+    if (!s.can_edit) statusText = LPI_FORBIDDEN;
+    else if (s.blocked && !running) statusText = (allOk ? '' : '上のチェックがそろうと押せます。') + s.blocked;
+    else if (!job) statusText = '押すと、できた構成から画像を作って画像フォルダの「AI初稿」に保存します (1 枚 1 分くらい)';
+    else {
+      const total = (job.images || []).length;
+      const done = (job.images || []).filter((im) => im.status === 'done').length;
+      statusText = fullRunning ? '画像を作っています… (' + done + ' / ' + total + ' 枚)'
+        : running ? '1 枚作り直しています…'
+        : flow === 'done' ? '画像を押すと Drive で開きます。気になる 1 枚は「再生成」で作り直せます'
+        : flow === 'partial' ? '一部だけできました' + (job.error ? ' — ' + job.error : '') + '。できなかった 1 枚は「再生成」で作れます'
+        : '作れませんでした' + (job.error ? ': ' + job.error : '');
+    }
+    const withImage = cards.filter((c) => c.current).length;
+    return {
+      running,
+      checks,
+      mainLabel,
+      mainDisabled: !s.can_edit || !!s.blocked || fullRunning || running || !!posting,
+      statusText,
+      metaText: (s.model ? s.model + ' / 品質 ' + s.quality + '・' : '') + '今月 ' + lpiYen(s.used_jpy) + ' / 上限 ' + lpiYen(s.budget_jpy)
+        + (job && cost ? '・この画像で ' + lpiYen(cost) : ''),
+      showHead: !!job && cards.length > 0,
+      countText: 'できました (' + withImage + ' / ' + cards.length + ' 枚)',
+      checkedText: '確認済み ' + (Number(s.checked_count) || 0) + ' / ' + (Number(s.checkable_count) || 0),
+      folderUrl: job && job.ai_folder_id ? 'https://drive.google.com/drive/folders/' + encodeURIComponent(job.ai_folder_id) : '',
+      stale: !!s.compose_changed,
+    };
+  }
+  /**
+   * 画面を動かす。deps = { fetchJson(url, {method, body}) → Promise<{status, json}>, confirm, setTimer, clearTimer, newKey, isHidden }
+   * (試験は偽物を渡す。本番は下の呼び出しが fetch / window.confirm / setTimeout を渡す)
+   */
+  function initLpImages(doc, deps) {
+    const root = doc.getElementById('lpi');
+    const holder = doc.getElementById('lpi-json');
+    if (!root || !holder) return null;
     let state = null;
-    try { state = JSON.parse(holder.textContent); } catch (e) { return; }
-    const draftId = root.dataset.draftId;
-    const btn = document.getElementById('lpi-btn');
-    const statusEl = document.getElementById('lpi-status');
-    const metaEl = document.getElementById('lpi-meta');
-    const gridEl = document.getElementById('lpi-grid');
-    const RUNNING = ['queued', 'running'];
-    const STATUS_TEXT = { queued: '待ち', running: '作っています…', done: 'できました', failed: '作れませんでした', skipped: '作っていません' };
+    try { state = JSON.parse(holder.textContent); } catch (e) { return null; }
+    const api = '/apps/product-hub/api/drafts/' + root.dataset.draftId + '/lp-images';
+    const $ = (id) => doc.getElementById(id);
+    const btn = $('lpi-btn');
+    const statusEl = $('lpi-status');
+    const metaEl = $('lpi-meta');
+    const gridEl = $('lpi-grid');
+    const checksEl = $('lpi-checks');
+    const headEl = $('lpi-head');
+    const staleEl = $('lpi-stale');
     let timer = null;
     let posting = false;
     let idemKey = null;
-    const newKey = () => (window.crypto?.randomUUID ? window.crypto.randomUUID()
-      : 'lpi-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
-    const yen = (n) => Math.round(Number(n) || 0).toLocaleString() + ' 円';
+    const regenKeys = {};        // 1 枚ごとの作り直しのキー (届いたか分からないときは同じキーで送り直す = 二重にならない)
+    const busy = {};             // 送っている途中の 1 枚 (root_id)
+    let cardMsg = {};            // 1 枚ごとの断られた理由 (root_id → 文)
+    let mainMsg = '';            // 「全部作る」が断られた理由。最新を取り直して描き直しても消さない (次に押すまで出す)
 
-    function tile(im) {
-      const box = document.createElement('div');
-      box.style.cssText = 'border:1px solid #e2e8f0; border-radius:8px; padding:4px; background:#fff; font-size:11px;';
-      const title = document.createElement('div');
-      title.style.cssText = 'font-weight:600; margin-bottom:2px;';
-      title.textContent = (im.no != null ? im.no + '枚目' : im.seq + '番目') + (im.name ? '｜' + im.name : '');
-      box.appendChild(title);
-      if (im.status === 'done' && im.drive_file_id) {
-        const a = document.createElement('a');
-        a.href = 'https://drive.google.com/file/d/' + encodeURIComponent(im.drive_file_id) + '/view';
-        a.target = '_blank'; a.rel = 'noopener';
-        const img = document.createElement('img');
-        img.src = '/apps/product-hub/api/thumb/' + encodeURIComponent(im.drive_file_id) + '?w=320';
-        img.alt = title.textContent; img.loading = 'lazy';
-        img.style.cssText = 'width:100%; aspect-ratio:1/1; object-fit:contain; background:#f8fafc; border-radius:6px;';
+    function el(tag, css, text) {
+      const e = doc.createElement(tag);
+      if (css) e.style.cssText = css;
+      if (text != null) e.textContent = text;
+      return e;
+    }
+    function card(c) {
+      const v = lpiCardView(c, state, busy[c.root_id]);
+      const box = el('div', 'border:1px solid ' + (v.checked ? '#86efac' : '#e2e8f0') + '; border-radius:8px; padding:4px; background:#fff; font-size:11px;');
+      box.dataset.rootId = String(c.root_id);
+      if (v.imgSrc) {
+        const a = el('a');
+        a.href = v.openUrl; a.target = '_blank'; a.rel = 'noopener'; a.title = 'Drive で開く';
+        const img = el('img', 'width:100%; aspect-ratio:1/1; object-fit:contain; background:#f8fafc; border-radius:6px;');
+        img.src = v.imgSrc; img.alt = v.label + ' ' + v.role; img.loading = 'lazy';
         a.appendChild(img);
         box.appendChild(a);
       } else {
-        const ph = document.createElement('div');
-        ph.style.cssText = 'width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; background:#f8fafc; border-radius:6px; color:#64748b; text-align:center; padding:4px;';
-        ph.textContent = STATUS_TEXT[im.status] || im.status;
-        box.appendChild(ph);
+        box.appendChild(el('div', 'width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; background:#f8fafc; border-radius:6px; color:#64748b; text-align:center; padding:4px;', v.placeholder));
       }
-      if (im.error) {
-        const er = document.createElement('div');
-        er.style.cssText = 'color:#b45309; margin-top:2px; white-space:pre-wrap;';
-        er.textContent = im.error;
-        box.appendChild(er);
+      const meta = el('div', 'display:flex; gap:4px; align-items:baseline; margin-top:3px; flex-wrap:wrap;');
+      meta.appendChild(el('b', '', v.label));
+      meta.appendChild(el('span', 'color:#475569;', v.role));
+      if (v.versionText) meta.appendChild(el('span', 'color:#94a3b8;', v.versionText));
+      box.appendChild(meta);
+      if (v.openUrl) {
+        const open = el('a', 'font-size:11px;', 'Drive で開く ↗');
+        open.href = v.openUrl; open.target = '_blank'; open.rel = 'noopener';
+        box.appendChild(open);
       }
+      const act = el('div', 'display:flex; gap:4px; margin-top:3px; flex-wrap:wrap;');
+      const cb = el('button', '', v.checkLabel);
+      cb.type = 'button'; cb.className = 'btn btn-sm'; cb.disabled = v.checkDisabled; cb.title = v.checkTitle;
+      cb.dataset.lpiAct = 'check';
+      cb.addEventListener('click', () => toggleCheck(c));
+      const rb = el('button', '', v.regenLabel);
+      rb.type = 'button'; rb.className = 'btn btn-sm'; rb.disabled = v.regenDisabled; rb.title = v.regenTitle;
+      rb.dataset.lpiAct = 'regen';
+      rb.addEventListener('click', () => regen(c));
+      act.appendChild(cb); act.appendChild(rb);
+      box.appendChild(act);
+      if (v.error) box.appendChild(el('div', 'color:#b45309; margin-top:2px; white-space:pre-wrap;', v.error));
+      if (cardMsg[c.root_id]) box.appendChild(el('div', 'color:#b91c1c; margin-top:2px; white-space:pre-wrap;', cardMsg[c.root_id]));
       return box;
     }
 
     function render(s) {
       state = s;
-      const job = s.job;
-      const running = !!job && RUNNING.includes(job.status);
-      // 押したときに取り置く額 (安全側の見込み・保証ではない)。実際はふつうもっと安い
-      const est = Number(s.planned_reserve_jpy) || 0;
-      btn.disabled = !!s.blocked || running || posting;
-      btn.textContent = running ? '🖼 画像を作っています…' : (job ? '🖼 もう一度画像を作る' : '🖼 画像を作る') + (est ? ' (' + s.planned_count + ' 枚・取り置き 約 ' + yen(est) + ')' : '');
-      metaEl.textContent = (s.model ? s.model + ' / 品質 ' + s.quality + '・' : '')
-        + '今月 ' + yen(s.used_jpy) + ' / 上限 ' + yen(s.budget_jpy)
-        + (job && job.cost_jpy ? '・この画像で ' + yen(job.cost_jpy) : '');
-      if (s.blocked && !running) statusEl.textContent = s.blocked;
-      else if (!job) statusEl.textContent = '押すと、できた構成から画像を作って画像フォルダの「AI初稿」に保存します (1 枚 1 分くらい)';
-      else {
-        const done = (job.images || []).filter((im) => im.status === 'done').length;
-        const total = (job.images || []).length;
-        statusEl.textContent = running ? '画像を作っています… (' + done + ' / ' + total + ' 枚)'
-          : job.status === 'done' ? 'できました (' + done + ' / ' + total + ' 枚)。画像を押すと Drive で開きます'
-          : job.status === 'partial' ? '一部だけできました (' + done + ' / ' + total + ' 枚)' + (job.error ? ' — ' + job.error : '')
-          : '作れませんでした' + (job.error ? ': ' + job.error : '');
+      const v = lpiView(s, posting);
+      checksEl.textContent = '';
+      for (const x of v.checks) {
+        const li = el('li', 'color:' + (x.ok ? '#166534' : '#64748b') + ';', (x.ok ? '✓ ' : '・ ') + x.text);
+        li.dataset.ok = x.ok ? '1' : '0';
+        checksEl.appendChild(li);
       }
+      btn.disabled = v.mainDisabled;
+      btn.textContent = v.mainLabel;
+      metaEl.textContent = v.metaText;
+      statusEl.textContent = mainMsg ? mainMsg + ' — ' + v.statusText : v.statusText;
+      headEl.hidden = !v.showHead;
+      $('lpi-count').textContent = v.countText;
+      $('lpi-checked').textContent = v.checkedText;
+      const folder = $('lpi-folder');
+      folder.hidden = !v.folderUrl;
+      folder.href = v.folderUrl || '#';
+      staleEl.hidden = !v.stale;
       gridEl.textContent = '';
-      for (const im of (job && job.images) || []) gridEl.appendChild(tile(im));
-      if (running) schedule(); else stop();
+      for (const c of s.cards || []) gridEl.appendChild(card(c));
+      // 取り直した状態を画像の箱の外 (デザイナー修正依頼書・PR-F) にも渡す
+      if (deps.onState) deps.onState(s);
+      if (v.running) schedule(); else stop();
     }
-    function stop() { if (timer) { clearTimeout(timer); timer = null; } }
-    function schedule() { stop(); timer = setTimeout(poll, 5000); }
+    function stop() { if (timer) { deps.clearTimer(timer); timer = null; } }
+    function schedule() { stop(); timer = deps.setTimer(poll, 5000); }
     async function poll() {
       stop();
-      if (document.hidden) { schedule(); return; }
+      if (deps.isHidden && deps.isHidden()) { schedule(); return; }
       try {
-        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', { headers: { Accept: 'application/json' } });
-        const json = await res.json();
-        if (json && json.ok) { render(json); return; }
+        const r = await deps.fetchJson(api);
+        if (r.json && r.json.ok) { render(r.json); return; }
       } catch (e) { /* 一時的な通信断。次の回で拾う */ }
       schedule();
+    }
+    /** 1 枚の依頼を送る (作り直し・確認)。断られたらそのカードに理由を出し、最新の状況を取り直す */
+    async function sendCard(c, url, body, onFail) {
+      busy[c.root_id] = true;
+      delete cardMsg[c.root_id];
+      render(state);
+      let r = null;
+      try { r = await deps.fetchJson(url, { method: 'POST', body }); }
+      catch (e) { r = null; }
+      delete busy[c.root_id];
+      if (r && r.json && r.json.ok) { render(r.json); return true; }
+      cardMsg[c.root_id] = r ? ((r.json && r.json.error) || '送れませんでした') : '届いたか分かりません。もう一度押してください (二重にはなりません)';
+      if (onFail) onFail(r);
+      render(state);
+      // ほかの人・別のタブが先に変えた / 作っている途中なら、最新の状況を取り直して出す
+      if (r && r.status === 409) await poll();   // 待ってから返す (押した後の画面が決まってから次の操作)
+      return false;
+    }
+    function regen(c) {
+      if (busy[c.root_id]) return;
+      if (!regenKeys[c.head_id]) regenKeys[c.head_id] = deps.newKey();
+      return sendCard(c, api + '/' + c.head_id + '/regenerate', { idempotency_key: regenKeys[c.head_id] }, (r) => {
+        // 断られた (4xx) ならキーを捨てる。届いたか分からない (通信断・5xx) ならキーを残して同じキーで送り直す
+        if (r && r.status >= 400 && r.status < 500) delete regenKeys[c.head_id];
+      });
+    }
+    function toggleCheck(c) {
+      if (busy[c.root_id] || !c.current) return;
+      return sendCard(c, api + '/' + c.current.id + '/check', { checked: !c.checked });
     }
     btn.addEventListener('click', async () => {
       if (posting) return;
       const est = Number(state.planned_reserve_jpy) || 0;
-      // 作り直しはお金がかかるので確かめる
-      if (state.job && !window.confirm('もう一度作ります。月の枠から約 ' + yen(est) + ' を取り置きます (見込み・実際はふつうもっと少ない。前の画像は Drive に残ります)。作りますか？')) return;
+      // 全部の作り直しはお金がかかるので確かめる
+      if (state.job && !deps.confirm('もう一度全部作ります。月の枠から約 ' + lpiYen(est) + ' を取り置きます (見込み・実際はふつうもっと少ない。前の画像は Drive に残りますが、「確認済み」は新しい画像で付け直しです)。作りますか？')) return;
       posting = true;
+      mainMsg = '';
       btn.disabled = true;
       statusEl.textContent = '依頼しています…';
-      if (!idemKey) idemKey = newKey();
-      try {
-        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ idempotency_key: idemKey }),
-        });
-        const json = await res.json().catch(() => null);
-        posting = false;
-        if (json && json.ok) { idemKey = null; render(json); return; }
-        statusEl.textContent = (json && json.error) || '依頼できませんでした';
-        if (res.status === 409 || res.status === 400) idemKey = null;
-        btn.disabled = !!state.blocked;
-        // 別のタブで作っている最中などは、最新の状況を取り直して出す (#1612 R1 Low)
-        if (res.status === 409) poll();
-      } catch (e) {
-        posting = false;
+      if (!idemKey) idemKey = deps.newKey();
+      let r = null;
+      // 画面が見ていた「全部作る」の依頼 (PR-E) と LP構成の版 (PR-B) も送る (ほかの人・別のタブが先に変えていたら 409 で止まる)
+      try { r = await deps.fetchJson(api, { method: 'POST', body: { idempotency_key: idemKey, expected_job_id: state.latest_job_id != null ? state.latest_job_id : null, compose_version: state.compose_version } }); }
+      catch (e) { r = null; }
+      posting = false;
+      if (r && r.json && r.json.ok) { idemKey = null; render(r.json); return; }
+      if (!r) {
         btn.disabled = false;
         statusEl.textContent = '依頼できたか分かりません。もう一度押してください (二重にはなりません)';
+        return;
       }
+      mainMsg = (r.json && r.json.error) || '依頼できませんでした';
+      statusEl.textContent = mainMsg;
+      if (r.status >= 400 && r.status < 500) idemKey = null;
+      btn.disabled = lpiView(state, false).mainDisabled;
+      // 別のタブで作っている最中などは、最新の状況を取り直して出す (#1612 R1 Low)
+      if (r.status === 409) await poll();
     });
+    // LP構成を直して保存したら、作る枚数・取り置き・押せるかを取り直す (PR-B・Codex PR-B 名指し M)
+    if (doc.addEventListener) doc.addEventListener('ph:lp-edit-saved', () => { if (!posting) poll(); });
     render(state);
-  })();
+    return { render, poll, state: () => state };
+  }
+  /* @lp-image-ui:end */
+  // デザイナー修正依頼書 (2026-10-09 画像制作の新フロー PR-F)。生成した全画像を貼ったスプレッドシートを作る / 最新の画像で作り直す
+  /* @designer-sheet:start — test-ph-designer-sheet.mjs がこの間を切り出して、偽の document で動かして試す (EJS の値はここに書かない) */
+  const DSHEET_FORBIDDEN = 'デザイナー修正依頼書を作れるのは 画像登録者・画像作成承認者 の担当者か管理者だけです';
+  /** 見え方 (画面に依らない)。st = サーバの designer_sheet・busy = 送っている途中 */
+  function dsheetView(st, busy) {
+    if (!st) return { hidden: true };
+    const exists = !!st.exists;
+    const total = Number(st.total) || 0;
+    const reason = !st.can_edit ? DSHEET_FORBIDDEN : (st.blocked || '');
+    const when = String(st.at || '').slice(0, 16).replace('T', ' ');
+    return {
+      hidden: false,
+      title: exists ? st.title : 'デザイナー修正依頼書',
+      meta: exists
+        ? when + ' 作成' + (st.by ? ' (' + st.by + ')' : '') + ' ・ ' + (Number(st.count) || 0) + '枚 ・ 保存先: 商品の画像フォルダ'
+        : '生成した全' + (total ? total + '枚' : '画像') + 'を TOP から順に貼ったスプレッドシートを作り、商品の画像フォルダに保存します。修正指示はスプレッドシートに書いてください',
+      showCreate: !exists,
+      createLabel: busy ? '作成中…' : 'デザイナー修正依頼書を作成',
+      // 全部の画像ができてから (押せない理由はサーバが決める = API と同じ判定)
+      createDisabled: !st.can_edit || !!st.blocked || !!busy,
+      createTitle: reason,
+      openUrl: exists && st.url ? st.url : '',
+      // 作成済みなら「作り直す」はいつも出す (依頼書を Drive で消した・移した ときに画面から直せるように — Codex PR-F 名指し1 中)。
+      // 作り直しが要る (作成後に作り直した画像・記録できなかった・公開を外せていない) ときだけ目立たせる
+      showStale: exists,
+      staleWarn: exists && !!st.stale,
+      staleText: !st.stale ? '依頼書が開けない (Drive で消した・移した) ときや、もう一度作りたいときは'
+        : st.interrupted ? '前回の作り直しが最後まで記録できませんでした。'
+        : Number(st.unrevoked) > 0 ? '依頼書から外れた画像 ' + Number(st.unrevoked) + ' 枚の公開 (リンクを知っている人は閲覧可) を外せていません。'
+        : '作成後に作り直した画像があります。',
+      updateLabel: busy ? '作り直しています…' : (st.stale ? '最新の画像で作り直す' : '作り直す'),
+      updateDisabled: !st.can_edit || !!st.blocked || !!busy,
+      updateTitle: reason || '最新の画像でシートを書き直します (書いた修正指示は同じ画像の行に残ります)',
+      // 押せない理由は、押すボタンがあるときだけ出す (作成済みで最新なら何も出さない)。
+      // 作成前に公開したままの画像 (作成が途中で止まった) があれば知らせる (作成を押すと片付く)
+      reason: [(!exists || st.stale) ? reason : '', !exists && Number(st.unrevoked) > 0 ? '前の作成が途中で止まり、公開 (リンクを知っている人は閲覧可) したままの画像が ' + Number(st.unrevoked) + ' 枚あります。作成を押すと片付けます' : ''].filter(Boolean).join('\n'),
+    };
+  }
+  /**
+   * 画面のつなぎ込み。deps = { fetchJson(url, {method, body}) → Promise<{status, json}> } (試験は偽物を渡す)。
+   * 状態は lpi-json の designer_sheet。画像のポーリング (initLpImages の onState) からも update で入れ直す
+   */
+  function initDesignerSheet(doc, deps) {
+    const root = doc.getElementById('dsheet');
+    const holder = doc.getElementById('lpi-json');
+    if (!root || !holder) return null;
+    let st = null;
+    try { st = JSON.parse(holder.textContent).designer_sheet || null; } catch (e) { return null; }
+    const $ = (id) => doc.getElementById(id);
+    const api = '/apps/product-hub/api/drafts/' + root.dataset.draftId;
+    let busy = false;
+    let msg = '';
+    function render() {
+      const v = dsheetView(st, busy);
+      root.hidden = !!v.hidden;
+      if (v.hidden) return;
+      $('dsheet-title').textContent = v.title;
+      $('dsheet-meta').textContent = v.meta;
+      const create = $('dsheet-create');
+      create.hidden = !v.showCreate;
+      create.textContent = v.createLabel;
+      create.disabled = v.createDisabled;
+      create.title = v.createTitle;
+      const open = $('dsheet-open');
+      open.hidden = !v.openUrl;
+      open.href = v.openUrl || '#';
+      const staleBox = $('dsheet-stale');
+      staleBox.hidden = !v.showStale;
+      staleBox.style.background = v.staleWarn ? '#fef3c7' : 'transparent';
+      staleBox.style.borderColor = v.staleWarn ? '#f59e0b' : '#e2e8f0';
+      staleBox.dataset.warn = v.staleWarn ? '1' : '0';
+      $('dsheet-stale-text').textContent = v.staleText;
+      const upd = $('dsheet-update');
+      upd.textContent = v.updateLabel;
+      upd.disabled = v.updateDisabled;
+      upd.title = v.updateTitle;
+      $('dsheet-msg').textContent = [msg, v.reason].filter(Boolean).join('\n');
+    }
+    async function send() {
+      // 二重押しで 2 回送らない (サーバも同じ商品は 1 本ずつ)
+      if (busy || !st) return;
+      const wasExisting = !!st.exists;
+      busy = true;
+      msg = wasExisting ? '作り直しています… (10〜30 秒かかります。終わるまでシートを触らないでください)' : '作成しています… (10〜30 秒かかります)';
+      render();
+      let r = null;
+      // 画面が見ていた依頼書と画像の並びを添える (別のタブ・ほかの人が先に作った / 画像を作り直した後の古い画面ならサーバが止める)
+      try { r = await deps.fetchJson(api + '/designer-sheet', { method: 'POST', body: { seen_file_id: st.file_id || '', seen_images_hash: st.images_hash || '' } }); }
+      catch (e) { r = null; }
+      busy = false;
+      const j = r && r.json;
+      if (j && j.designer_sheet) st = j.designer_sheet;
+      if (j && j.ok) {
+        msg = (j.created ? 'デザイナー修正依頼書を作りました' : 'デザイナー修正依頼書を最新の画像で作り直しました')
+          + (j.carried ? ' (書いてあった修正指示 ' + j.carried + ' 件は同じ画像の行に残しました)' : '')
+          + (j.orphaned ? ' — 行き先の無い修正指示 ' + j.orphaned + ' 件はシートの下に残しました' : '');
+      } else if (!r) {
+        msg = '通信できませんでした。もう一度押してください (二重には作りません)';
+      } else {
+        msg = '作れませんでした: ' + ((j && j.error) || '');
+      }
+      render();
+      if (r && r.status === 409 && deps.refresh) deps.refresh();
+    }
+    // 押せない状態 (理由あり・送っている途中) のボタンは送らない
+    $('dsheet-create').addEventListener('click', function () { if (!$('dsheet-create').disabled) return send(); });
+    $('dsheet-update').addEventListener('click', function () { if (!$('dsheet-update').disabled) return send(); });
+    render();
+    return {
+      // 画像のポーリングの応答で入れ直す。送っている途中は待つ (送った結果で描き直す)。undefined (古い応答) は何もしない
+      update: function (next) { if (next === undefined || busy) return; st = next; render(); },
+      state: function () { return st; },
+      isBusy: function () { return busy; },
+    };
+  }
+  /* @designer-sheet:end */
+  const designerSheet = initDesignerSheet(document, {
+    fetchJson: async (url, opt) => {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(opt.body) });
+      return { status: res.status, json: await res.json().catch(() => null) };
+    },
+    // 断られた (古い画面・画像が変わった) ときは画像の箱も取り直す (見ていない画像で作らせない)
+    refresh: () => { if (lpiCtl) lpiCtl.poll(); },
+  });
+  const lpiCtl = initLpImages(document, {
+    onState: (s) => { if (designerSheet && s) designerSheet.update(s.designer_sheet); },
+    fetchJson: async (url, opt) => {
+      const res = await fetch(url, opt && opt.method === 'POST'
+        ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(opt.body) }
+        : { headers: { Accept: 'application/json' } });
+      return { status: res.status, json: await res.json().catch(() => null) };
+    },
+    confirm: (m) => window.confirm(m),
+    setTimer: (fn, ms) => setTimeout(fn, ms),
+    clearTimer: (t) => clearTimeout(t),
+    newKey: () => (window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID()
+      : 'lpi-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10)),
+    isHidden: () => document.hidden,
+  });
   // 🤖 構成をAIに作らせる (段階1・PR1-d)。
   // 画面がするのは「押す」「状況を見る」「出す」だけ。判定も lint もサーバー側。
   // 書き戻した構成は**ここに出るだけ**で、lp-tool へは人がコピーして貼る。
@@ -6014,6 +6834,10 @@ th.attr-unknown { color: #dc2626; }
     const draftReasonEl = document.getElementById('lpc-draft-reason');
     const guideEl = document.getElementById('lpc-guide');
     const guideTextEl = document.getElementById('lpc-guide-text');
+    const resultTitleEl = document.getElementById('lpc-result-title');
+    const editedEl = document.getElementById('lpc-edited');
+    const editedNoteEl = document.getElementById('lpc-edited-note');
+    const copyAiEl = document.getElementById('lpc-copy-ai');
 
     const RUNNING = ['queued', 'running'];
     let timer = null;
@@ -6054,6 +6878,24 @@ th.attr-unknown { color: #dc2626; }
       && (job.status === 'done' || (job.status === 'failed' && job.error_code === 'rejected' && job.has_draft === true));
     // lpc-checking:end
 
+    // lpc-shown:start (試験がここを切り出して動かす・scripts/test-ph-lp-edit.mjs)
+    // 箱に出す本文 = 効いている構成 (サーバの lp_effective・画像制作の新フロー PR-B)。いちばん新しいできた構成 (実モデル一致) の、
+    // 人が直した版があればそちら — コピーも lp-tool もこれを使う (画像生成・下の LP構成の一覧と同じ構成)。
+    // 作り直しが途中・失敗のときも、前にできた構成を出す (コピーできなくならないように・Codex PR-B 名指し R2 M)。
+    // 🚨 AI の初稿 (ph_lp_compose_jobs.output_text) は書き換わらない。AI の初稿は「AI の初稿をコピー」で取れる
+    function lpcShown(s) {
+      const e = s && s.lp_effective;
+      if (!e || typeof e.text !== 'string' || !e.text) return null;
+      const edited = e.source === 'edit';
+      const latest = !!s.job && s.job.id === e.job_id;
+      const notes = [];
+      if (!latest) notes.push('作り直しの前にできた構成 (依頼 ' + e.job_id + ') を出しています');
+      if (edited) notes.push('人が直した版 (' + String(e.edited_at || '').slice(0, 16).replace('T', ' ') + ' ' + (e.edited_by || '') + ') です');
+      if (notes.length) notes.push('コピー・lp-tool・画像生成はこれを使います');
+      return { text: e.text, aiText: e.ai_text || '', jobId: e.job_id, edited: edited, latest: latest, note: notes.join('。') };
+    }
+    // lpc-shown:end
+
     // lpc-images-text:start (試験がここを切り出して動かす・scripts/test-ph-lp-compose-ui.mjs)
     // AI に渡す画像の並び。作っている間・確認待ちの間はその依頼で渡した画像だけ。終わった後は
     // 「この依頼で渡した画像」(測定はこちら) と「もう一度押すと渡す画像」(いまの画像タブ) の両方
@@ -6084,6 +6926,8 @@ th.attr-unknown { color: #dc2626; }
 
     function render(s) {
       state = s;
+      // 撮影判定の箱の「AIのおすすめ」も、構成ができたらここで入れ直す (画像制作の新フロー PR-C)
+      if (window.phShootRec) window.phShootRec.update(s.shoot);
       const job = s.job;
       const blocked = s.blocked;
       const running = !!job && RUNNING.includes(job.status);
@@ -6138,11 +6982,18 @@ th.attr-unknown { color: #dc2626; }
         statusEl.textContent = '';
       }
 
-      const done = !!job && job.status === 'done' && job.output_text;
+      // 効いている構成を出す (人が直した版があればそちら。コピー・lp-tool もこれ)。AI の初稿は測定用に別のボタンで取る (PR-B)
+      const shown = lpcShown(s);
+      const done = !!shown;
       resultEl.hidden = !done;
+      editedEl.hidden = !(shown && shown.note);
+      copyAiEl.hidden = !(shown && shown.edited);
       if (done) {
-        if (textEl.value !== job.output_text) textEl.value = job.output_text;
-        lintEl.textContent = lintLine(job.lint);
+        if (textEl.value !== shown.text) textEl.value = shown.text;
+        resultTitleEl.textContent = shown.edited ? 'LP構成 (人が直した版・⑦ AI画像生成プロンプト)' : 'AI が作った構成 (⑦ AI画像生成プロンプト)';
+        editedNoteEl.textContent = shown.note;
+        lintEl.textContent = shown.edited ? 'lint: 通っています (人が直した版・保存のときにサーバが確かめました)'
+          : (shown.latest ? lintLine(job.lint) : '');
         const q = new URLSearchParams({ product_code: root.dataset.neCode || '', product_name: root.dataset.name || '' });
         openEl.href = LP_TOOL + '?' + q.toString();
       }
@@ -6184,6 +7035,8 @@ th.attr-unknown { color: #dc2626; }
       }
 
       if (running || checkingModel(job)) schedule(); else stop();
+      // 下の「LP構成」(initLpEdit) に、効いている構成がどれかを知らせる。新しい構成ができたら一覧を読み直す
+      document.dispatchEvent(new CustomEvent('ph:lp-compose-state', { detail: { job_id: shown ? shown.jobId : null, done: done } }));
     }
 
     function stop() { if (timer) { clearTimeout(timer); timer = null; } }
@@ -6248,6 +7101,16 @@ th.attr-unknown { color: #dc2626; }
       try { await navigator.clipboard.writeText(textEl.value); copyResultEl.textContent = 'コピーしました。lp-tool に貼ってください'; }
       catch (e) { textEl.select(); copyResultEl.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
     });
+    // AI の初稿 (人が直す前)。段階1 の測定 (AI の構成と人の構成のくらべっこ) はこちらで比べる
+    document.getElementById('lpc-copy-ai').addEventListener('click', async () => {
+      const r = document.getElementById('lpc-copy-ai-result');
+      const sh = lpcShown(state);
+      const raw = sh ? sh.aiText : '';
+      try { await navigator.clipboard.writeText(raw); r.textContent = 'AI の初稿をコピーしました'; }
+      catch (e) { r.textContent = 'コピーできませんでした'; }
+    });
+    // 下の「LP構成」で保存したら、ここの本文も読み直す (コピー・lp-tool に直した版を渡す)
+    document.addEventListener('ph:lp-edit-saved', () => { stop(); poll(); });
 
     // 裏に回って戻ってきたら、待たずに 1 回見る。
     // 🚨 待機中の setTimeout を**先に消す**。消さないと表裏を行き来するたびに
@@ -6257,6 +7120,305 @@ th.attr-unknown { color: #dc2626; }
     });
 
     render(state);
+  })();
+  /* @lp-edit:start — LP構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09・スタッフ要望 ③)。
+     scripts/test-ph-lp-edit.mjs がこの間を切り出して、偽の document で動かして試す (EJS の値はここに書かない)。
+     決め方 (並べ替え・追加・削除・元に戻す・要撮影) は lpeAction、描くのは lpeHtml、つなぎ込みは initLpEdit。
+     🚨 判定の正本はサーバ (lib/lp-edit.js)。画面は押せない操作を出さないだけで、保存のときにサーバがもう一度確かめる */
+  const LPE_FIELDS = [['role', '役割', 1], ['title', '見出し', 1], ['copy', 'キャッチコピー', 2], ['body', '本文（任意）', 3]];
+  function lpeEsc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function lpeLabel(i) { return i === 0 ? 'TOP' : i + '枚目'; }
+  /** 送る形 (並び順のまま)。サーバは uid で元の画像か追加した画像かを見分ける */
+  function lpeForSave(slots) {
+    return slots.map(function (s) { return { uid: s.uid, role: s.role, title: s.title, copy: s.copy, body: s.body, shoot: s.shoot === true }; });
+  }
+  /** サーバの状態 (GET / 保存の応答) → 画面の状態。saved = 保存済みの並び (未保存の印はこれと比べる) */
+  function lpeFromServer(st, prev) {
+    const slots = (st && Array.isArray(st.slots) ? st.slots : []).map(function (s) {
+      return { uid: s.uid, kind: s.kind, role: s.role || '', title: s.title || '', copy: s.copy || '', body: s.body || '', shoot: s.shoot === true };
+    });
+    return {
+      available: !!(st && st.available), can_edit: !!(st && st.can_edit), max: (st && st.max_images) || 10,
+      base_job_id: st && st.base_job_id != null ? st.base_job_id : null,
+      base_edit_id: st && st.base_edit_id != null ? st.base_edit_id : null,
+      edited_by: (st && st.edited_by) || '', edited_at: (st && st.edited_at) || '', image_stale: !!(st && st.image_stale),
+      image_limit: st && Number.isInteger(st.image_limit) ? st.image_limit : null,
+      slots: slots, saved: JSON.stringify(lpeForSave(slots)),
+      open: prev && prev.open ? prev.open : {}, undo: null, msg: '', saving: false, conflict: false, focus: null, newer: false,
+    };
+  }
+  function lpeDirty(S) { return JSON.stringify(lpeForSave(S.slots)) !== S.saved; }
+  /**
+   * サーバが保存するときと同じそろえ方 (改行を LF に・前後の空白を落とす・見出し/キャッチコピー/本文の「なし」は空欄)。
+   * 通信が切れたあとに「送ったものがもう保存されているか」を比べるときに使う (Codex PR-B 名指し R3 M)
+   */
+  function lpeCanon(slots) {
+    return JSON.stringify(lpeForSave(slots).map(function (s) {
+      const c = { uid: s.uid, shoot: s.shoot };
+      LPE_FIELDS.forEach(function (f) {
+        const t = String(s[f[0]] == null ? '' : s[f[0]]).replace(/\r\n?/g, '\n').trim();
+        c[f[0]] = f[0] !== 'role' && t === 'なし' ? '' : t;
+      });
+      return c;
+    }));
+  }
+  function lpeIndex(S, uid) { for (let i = 0; i < S.slots.length; i++) { if (S.slots[i].uid === uid) return i; } return -1; }
+  function lpeMovable(S, i) { return !!S.slots[i] && S.slots[i].kind === 'point'; }
+  /**
+   * 並べ替え・追加・削除・元に戻す・要撮影の切り替え。TOP と 1枚目 (FV) は動かさない・消さない (ほかの画像もその上へは行けない)。
+   * 変えたら true。削除は 1 つ前まで「元に戻す」で戻せる (保存するまでサーバには届かない)
+   */
+  function lpeAction(S, act, uid, newUid) {
+    const sl = S.slots;
+    const i = lpeIndex(S, uid);
+    if (act === 'up' && lpeMovable(S, i) && lpeMovable(S, i - 1)) { const t = sl[i - 1]; sl[i - 1] = sl[i]; sl[i] = t; return true; }
+    if (act === 'down' && lpeMovable(S, i) && lpeMovable(S, i + 1)) { const t = sl[i + 1]; sl[i + 1] = sl[i]; sl[i] = t; return true; }
+    if (act === 'del' && lpeMovable(S, i)) {
+      const rm = sl.splice(i, 1)[0];
+      S.undo = { slot: rm, index: i, label: lpeLabel(i) };
+      return true;
+    }
+    if (act === 'undo' && S.undo) {
+      if (sl.length >= S.max) return false;
+      // 消したときの位置へ (その後に並べ替えて短くなっていたら末尾)。TOP・FV より前には戻さない
+      const at = Math.max(2, Math.min(S.undo.index, sl.length));
+      sl.splice(at, 0, S.undo.slot);
+      S.undo = null;
+      return true;
+    }
+    if (act === 'add' && newUid) {
+      if (sl.length >= S.max) return false;
+      // ラフの newSlot と同じ初期値。構図・素材・NG はサーバが雛形で埋める (画面で直すのは画像に載せる文字だけ)
+      sl.push({ uid: newUid, kind: 'point', role: '特長', title: '新しい画像', copy: '', body: '', shoot: false });
+      S.open[newUid] = true;
+      S.focus = newUid;
+      return true;
+    }
+    if (act === 'shoot' && sl[i]) { sl[i].shoot = !sl[i].shoot; return true; }
+    return false;
+  }
+  /** 一覧を描く (HTML の文字列)。AI と人が書いた文字は全部 lpeEsc を通す */
+  function lpeHtml(S) {
+    const ro = !S.can_edit || S.saving;
+    const n = S.slots.length;
+    const dirty = lpeDirty(S);
+    let h = '<div class="lpe-head"><b>LP構成（' + n + '枚）</b><span>行を開くと、画像に載せる文字を確認・修正できます</span>'
+      + '<span class="muted">' + (S.base_edit_id != null
+        ? '人が直した版 (' + lpeEsc(String(S.edited_at).slice(0, 16).replace('T', ' ')) + ' ' + lpeEsc(S.edited_by) + ')'
+        : 'AI が作ったまま') + '</span></div>';
+    if (S.image_stale) h += '<div class="lpe-stale">⚠️ 画像を作ったあとで LP構成が変わりました。もう一度「画像を作る」と反映されます</div>';
+    // 「画像を作る」で作るのは先頭の何枚か (重要度：高 は 8 枚・ほかは 1枚目だけ)。構成はそれより多く持てるので知らせる
+    if (S.image_limit === 1) h += '<div class="muted" style="font-size:11px;">「画像を作る」で作るのは 1枚目 (FV) だけです (重要度：高 の商品は先頭から複数枚)</div>';
+    else if (S.image_limit && n > S.image_limit) h += '<div class="muted" style="font-size:11px;">「画像を作る」で作るのは ' + lpeLabel(0) + ' から ' + (S.image_limit - 1) + '枚目 までの ' + S.image_limit + ' 枚です。それより後ろの画像は AI では作りません</div>';
+    if (S.newer) {
+      h += '<div class="lpe-stale"><span>AI が新しい LP構成を作りました。いまの直しは新しい構成には入りません</span>'
+        + '<button type="button" class="btn btn-sm" data-act="reload">新しい構成を読み込む</button></div>';
+    }
+    if (!S.can_edit) h += '<div class="muted" style="font-size:11px;">見るだけです。直せるのは 画像登録者・画像作成承認者 の担当者か管理者です</div>';
+    h += '<div class="lpe-slots">';
+    S.slots.forEach(function (s, i) {
+      const isP = s.kind === 'point';
+      const L = lpeLabel(i);
+      const u = lpeEsc(s.uid);
+      h += '<details class="lpe-slot' + (isP ? '' : ' fixed') + '" data-uid="' + u + '"' + (S.open[s.uid] ? ' open' : '') + '><summary>'
+        + '<span class="lpe-no">' + L + '</span>'
+        + '<span class="lpe-role" id="lpe-role-' + u + '">' + lpeEsc(s.role) + '</span>'
+        + '<span class="lpe-title" id="lpe-title-' + u + '"><b>' + lpeEsc(s.title) + '</b></span>'
+        + '<button type="button" class="lpe-chip' + (s.shoot ? ' need' : '') + '" data-act="shoot" data-uid="' + u + '"' + (ro ? ' disabled' : '')
+        + ' title="押すと「撮影不要／要撮影」を切り替えます">' + (s.shoot ? '要撮影' : '撮影不要') + '</button>';
+      if (isP) {
+        h += '<span class="lpe-acts">'
+          + '<button type="button" class="lpe-ib" data-act="up" data-uid="' + u + '" aria-label="' + L + 'を上へ"' + (ro || !lpeMovable(S, i - 1) ? ' disabled' : '') + '>↑</button>'
+          + '<button type="button" class="lpe-ib" data-act="down" data-uid="' + u + '" aria-label="' + L + 'を下へ"' + (ro || !lpeMovable(S, i + 1) ? ' disabled' : '') + '>↓</button>'
+          + '<button type="button" class="lpe-ib" data-act="del" data-uid="' + u + '" aria-label="' + L + 'を削除"' + (ro ? ' disabled' : '') + '>×</button></span>';
+      } else {
+        h += '<span class="lpe-fixed" title="TOP と 1枚目（FV）は位置が固定で、削除できません">固定</span>';
+      }
+      h += '</summary><div class="lpe-body">';
+      if (s.kind === 'top') {
+        h += '<div class="lpe-rule">楽天のTOP画像ルール: テキスト占有率20%以下・枠線なし。文字は見出しとキャッチコピーの短いものだけにしてください。'
+          + '<b class="lpe-warn" id="lpe-warn-' + u + '"' + (String(s.body).trim() ? '' : ' hidden') + '>本文が入っているため、20%を超えるおそれがあります。</b></div>';
+      }
+      if (s.kind === 'fv') h += '<div class="lpe-rule">FV は LP の1枚目です。TOP とは別の画像として作ります。</div>';
+      LPE_FIELDS.forEach(function (f) {
+        const id = 'lpe-f-' + u + '-' + f[0];
+        h += '<label for="' + id + '">' + f[1] + '</label><textarea id="' + id + '" rows="' + f[2] + '" data-uid="' + u + '" data-k="' + f[0] + '"'
+          + (ro ? ' readonly' : '') + (f[0] === 'body' ? ' placeholder="画像に載せる短い説明文。なければ空欄"' : '') + '>' + lpeEsc(s[f[0]]) + '</textarea>';
+      });
+      h += '</div></details>';
+    });
+    h += '</div><div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px;">'
+      + '<button type="button" class="btn btn-sm" data-act="add"' + (ro || n >= S.max ? ' disabled' : '') + '>＋ 画像を追加</button>'
+      + '<span class="muted" style="font-size:11px;">TOP と 1枚目（FV）は位置が固定です' + (n >= S.max ? '・画像は ' + S.max + ' 枚までです' : '') + '</span></div>';
+    if (S.undo) {
+      h += '<div class="lpe-undo"><span>' + lpeEsc(S.undo.label) + '「' + lpeEsc(S.undo.slot.title || S.undo.slot.role) + '」を削除しました (まだ保存していません)</span>'
+        + '<button type="button" class="btn btn-sm" data-act="undo"' + (ro ? ' disabled' : '') + '>元に戻す</button></div>';
+    }
+    if (S.can_edit) {
+      h += '<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px;">'
+        + '<button type="button" class="btn btn-primary btn-sm" id="lpe-save" data-act="save"' + (S.saving || !dirty ? ' disabled' : '') + '>'
+        + (S.saving ? '保存しています…' : 'LP構成を保存') + '</button>'
+        + '<span class="lpe-dirty" id="lpe-dirty"' + (dirty ? '' : ' hidden') + '>● 未保存の変更があります</span>'
+        + (S.conflict ? '<button type="button" class="btn btn-sm" data-act="reload">読み直す</button>' : '')
+        + '</div>';
+    }
+    h += '<div class="muted" id="lpe-msg" style="font-size:12px; margin-top:4px; white-space:pre-wrap;">' + lpeEsc(S.msg) + '</div>';
+    return h;
+  }
+  /** 画面のつなぎ込み。deps = { get, put, confirm, onSaved, newUid } (試験では偽物を渡す) */
+  function initLpEdit(doc, deps) {
+    const root = doc.getElementById('lpe');
+    const holder = doc.getElementById('lpe-json');
+    if (!root || !holder) return null;
+    let first = null;
+    try { first = JSON.parse(holder.textContent); } catch (e) { return null; }
+    const url = root.dataset.url;
+    let S = lpeFromServer(first, null);
+    let lastJob = S.base_job_id;
+    const newUid = deps.newUid || function () { return 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); };
+    function render() {
+      // 構成がまだ無い (AI がまだ作っていない) ときは出さない
+      root.hidden = !S.available;
+      root.innerHTML = S.available ? lpeHtml(S) : '';
+      if (S.focus) {
+        const f = doc.getElementById('lpe-f-' + S.focus + '-title');
+        if (f && f.focus) { f.focus(); if (f.select) f.select(); }
+        S.focus = null;
+      }
+    }
+    // 打っている間は描き直さない (描き直すと入力欄の位置が飛ぶ)。行の見出し・TOP の注意・未保存の印だけ合わせる
+    function touch(uid) {
+      const s = S.slots[lpeIndex(S, uid)];
+      if (s) {
+        const r = doc.getElementById('lpe-role-' + uid); if (r) r.textContent = s.role;
+        const t = doc.getElementById('lpe-title-' + uid); if (t) t.innerHTML = '<b>' + lpeEsc(s.title) + '</b>';
+        const w = doc.getElementById('lpe-warn-' + uid); if (w) w.hidden = !String(s.body).trim();
+      }
+      const dirty = lpeDirty(S);
+      const d = doc.getElementById('lpe-dirty'); if (d) d.hidden = !dirty;
+      const b = doc.getElementById('lpe-save'); if (b) b.disabled = S.saving || !dirty;
+    }
+    async function load(msg) {
+      let json = null;
+      try { json = await deps.get(url); } catch (e) { json = null; }
+      if (!json || json.ok === false) {
+        S.msg = '読み込めませんでした: ' + ((json && json.error) || '通信できませんでした');
+        render();
+        return false;
+      }
+      S = lpeFromServer(json, S);
+      lastJob = S.base_job_id;
+      S.msg = msg || '';
+      render();
+      return true;
+    }
+    async function save() {
+      if (S.saving || !S.can_edit) return;
+      const sent = lpeForSave(S.slots);
+      const body = { base_job_id: S.base_job_id, base_edit_id: S.base_edit_id, slots: sent };
+      S.saving = true; S.msg = '保存しています…'; render();
+      let json;
+      try { json = await deps.put(url, body); }
+      catch (e) { json = { ok: false, code: 'network', error: '通信できませんでした (保存できたか分かりません。もう一度押すと確かめます)' }; }
+      S.saving = false;
+      if (json && json.ok) {
+        // 保存できたら読み直した状態 (サーバの応答) に替える。番号・未保存の印もそこから
+        S = lpeFromServer(json, S);
+        lastJob = S.base_job_id;
+        S.msg = json.changed === false ? '変更はありませんでした' : 'LP構成を保存しました';
+        render();
+        if (deps.onSaved) deps.onSaved(json);
+        return;
+      }
+      // 版が変わっていた (古いタブ・2 人同時・通信が切れたが実は保存できていた)。
+      // いまの構成が送ったものと同じなら保存できていたとみなし、違えば読み直しを促す (黙って上書きしない)
+      if (json && (json.code === 'conflict' || json.code === 'network')) {
+        let now = null;
+        try { now = await deps.get(url); } catch (e) { now = null; }
+        if (now && now.ok !== false && now.available && lpeCanon(lpeFromServer(now, S).slots) === lpeCanon(sent)) {
+          S = lpeFromServer(now, S);
+          lastJob = S.base_job_id;
+          S.msg = 'LP構成を保存しました';
+          render();
+          if (deps.onSaved) deps.onSaved(now);
+          return;
+        }
+      }
+      S.msg = '保存できませんでした: ' + ((json && json.error) || '');
+      S.conflict = !!json && (json.code === 'conflict' || json.code === 'not_ready');
+      render();
+    }
+    root.addEventListener('click', function (e) {
+      const b = e.target && e.target.closest ? e.target.closest('[data-act]') : null;
+      if (!b) return;
+      // 行の見出し (summary) の中のボタンで、行が開いたり閉じたりしないように
+      if (e.preventDefault) e.preventDefault();
+      const act = b.dataset.act;
+      if (act === 'save') { save(); return; }
+      if (act === 'reload') {
+        if (lpeDirty(S) && !deps.confirm('保存していない直しを捨てて、読み直しますか？')) return;
+        load('読み直しました');
+        return;
+      }
+      if (!S.can_edit || S.saving) return;
+      const changed = lpeAction(S, act, b.dataset.uid, act === 'add' ? newUid() : null);
+      if (!changed && (act === 'undo' || act === 'add')) S.msg = '画像は ' + S.max + ' 枚までです (TOP を含む)。ほかの画像を消してからにしてください';
+      else if (changed) S.msg = '';
+      render();
+    });
+    root.addEventListener('input', function (e) {
+      const t = e.target;
+      if (!t || !t.dataset || !t.dataset.uid || !t.dataset.k || !S.can_edit || S.saving) return;
+      const s = S.slots[lpeIndex(S, t.dataset.uid)];
+      if (!s || LPE_FIELDS.every(function (f) { return f[0] !== t.dataset.k; })) return;
+      s[t.dataset.k] = t.value;
+      touch(t.dataset.uid);
+    });
+    // 開いている行を覚える (並べ替えなどで描き直しても閉じない)。toggle は泡立たないので capture で拾う
+    root.addEventListener('toggle', function (e) {
+      const d = e.target;
+      if (!d || !d.dataset || !d.dataset.uid) return;
+      if (d.open) S.open[d.dataset.uid] = true; else delete S.open[d.dataset.uid];
+    }, true);
+    render();
+    return {
+      isDirty: function () { return S.available && lpeDirty(S); },
+      state: function () { return S; },
+      /** 上の「AI が作った構成」の箱に新しい構成が出たら読み直す (直している途中なら知らせるだけで、捨てない) */
+      composeChanged: function (jobId) {
+        if (!jobId || jobId === lastJob) return Promise.resolve(false);
+        lastJob = jobId;
+        if (S.available && lpeDirty(S)) { S.newer = true; render(); return Promise.resolve(false); }
+        return load('');
+      },
+    };
+  }
+  /* @lp-edit:end */
+  (function wireLpEdit() {
+    const lpe = initLpEdit(document, {
+      get: async function (url) { const r = await fetch(url, { headers: { Accept: 'application/json' } }); return r.json(); },
+      put: async function (url, body) {
+        const r = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        return r.json();
+      },
+      confirm: function (m) { return window.confirm(m); },
+      // 上の箱 (lpc) の本文・コピーも直した版に替える
+      onSaved: function () { document.dispatchEvent(new CustomEvent('ph:lp-edit-saved')); },
+    });
+    if (!lpe) return;
+    document.addEventListener('ph:lp-compose-state', function (e) {
+      if (e.detail && e.detail.done) lpe.composeChanged(e.detail.job_id);
+    });
+    // 保存していない直しがあるまま離れるときは止める (読み直しの関所 phKeep はこの一覧を退避しない)
+    window.addEventListener('beforeunload', function (ev) {
+      if (!lpe.isDirty()) return;
+      ev.preventDefault();
+      ev.returnValue = '';
+    });
   })();
   // 定型文ボタン (画像工程 v2)。文面はサーバー (lib/prompt-templates.js) が組み立て、画面は表示とコピーだけ
   (function initPromptButtons() {
@@ -7367,6 +8529,7 @@ th.attr-unknown { color: #dc2626; }
       { id: 'ip-composer', label: 'ページ構成', route: 'image', button: 'save-ip-btn' },
       { id: 'ip-request', label: '制作依頼の文面', route: 'image', button: 'save-ip-btn' },
       { id: 'ip-canva-url', label: 'Canva URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-edit-data-url', label: '編集データリンク', route: 'image', button: 'save-ip-btn' },
       { id: 'ip-top-compose', label: 'TOP画像の構成', route: 'image', button: 'save-ip-btn' },
       { id: 'ip-top-ref-url', label: 'TOP画像の参考URL', route: 'image', button: 'save-ip-btn' },
       { id: 'ip-material', label: '素材の状態', route: 'image', button: 'save-ip-btn' },
