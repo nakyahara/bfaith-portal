@@ -6629,6 +6629,762 @@ let wfSetParentId = null;
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSf);
     }
 
+    // ── 画像制作の新フロー PR-D (2026-10-09): 撮影指示書 (スプレッドシート) の自動作成・更新と、撮影依頼文の宛先 ──
+    // 実際の Google には繋がない。Drive と Sheets の偽物 (フォルダ・ファイル・タブ・セルを持つ) を差し込んで、本番の経路を叩く
+    {
+      const ssv = await import('../services/shoot-sheet-service.js');
+      const ssl = await import('../lib/shoot-sheet.js');
+      delete process.env.PH_SHOOT_REQUEST_MENTION;
+      const FID = '1ShootFolderAbCdEfGhIjKlMnOp';
+      const FOLDER = `https://drive.google.com/drive/folders/${FID}`;
+      // ── 偽の Google ──
+      const g = { files: new Map(), seq: 0, fail: {}, delay: 0, log: [], cellKinds: new Set(), batches: 0 };
+      const gErr = (code, msg) => Object.assign(new Error(msg), { code });
+      const hit = async (op) => {
+        g.log.push(op);
+        if (g.delay) await new Promise((res) => setTimeout(res, g.delay));
+        if (g.fail[op]) { const e = g.fail[op]; if (e.once) delete g.fail[op]; throw e.err; }
+      };
+      const fakeDrive = { files: {
+        list: async (p) => {
+          await hit('list');
+          const folder = /'([^']+)' in parents/.exec(p.q)?.[1];
+          const ap = /appProperties has \{ key='([^']+)' and value='([^']+)' \}/.exec(p.q);
+          const files = [...g.files.values()].filter((f) => !f.trashed && f.parents.includes(folder)
+            && (!ap || (f.appProperties || {})[ap[1]] === ap[2]));
+          return { data: { files: files.map((f) => ({ id: f.id, name: f.name })) } };
+        },
+        get: async (p) => {
+          await hit('get');
+          const f = g.files.get(p.fileId);
+          if (!f) throw gErr(404, 'File not found');
+          return { data: { id: f.id, name: f.name, trashed: !!f.trashed, parents: f.parents, mimeType: f.mimeType } };
+        },
+        create: async (p) => {
+          await hit('create');
+          const id = `SS${String(++g.seq).padStart(6, '0')}`;
+          g.files.set(id, { id, name: p.requestBody.name, mimeType: p.requestBody.mimeType, parents: p.requestBody.parents, appProperties: p.requestBody.appProperties || {},
+            tabs: [{ sheetId: 0, title: 'シート1', values: [] }], perms: p.requestBody.permissions || null });
+          return { data: { id } };
+        },
+        update: async (p) => { await hit('update'); const uf = g.files.get(p.fileId); if ('name' in p.requestBody) uf.name = p.requestBody.name; if ('trashed' in p.requestBody) uf.trashed = p.requestBody.trashed; return { data: {} }; },
+      } };
+      const tabOf = (f, title) => f.tabs.find((t) => t.title === title);
+      // 撮影依頼書のタブ (仕様書 Ver1.3.11 の「概要 + 1 カット 1 ブロック」)。label の行の値 (同じ label の n 番目)
+      const MAIN = '撮影依頼書';
+      const valOf = (tab, label, nth = 0) => ((tab?.values || []).filter((row) => row[0] === label)[nth] || [])[1];
+      // Sheets の偽物: batchUpdate は 1 回の要求を全部適用するか、どれかが不正なら何も適用しない (本物と同じ)。
+      // 値は updateCells のセル (userEnteredValue の種類を記録する = stringValue 以外で書いていないかを見る)
+      const fakeSheets = { spreadsheets: {
+        get: async (p) => {
+          await hit('sget');
+          // ほかの人の操作を割り込ませる口: onSgetBefore = 読む前 (読んだ一覧に入る) / onSget = 読んだ直後 (読んだ一覧には入らない。送る前に起きる)
+          if (g.onSgetBefore) { const fn = g.onSgetBefore; g.onSgetBefore = null; fn(p); }
+          const f = g.files.get(p.spreadsheetId);
+          const snap = { data: { sheets: f.tabs.map((t) => ({ properties: { sheetId: t.sheetId, title: t.title, gridProperties: { rowCount: 1000, columnCount: 26 } },
+            developerMetadata: (t.meta || []).map((m) => ({ metadataKey: m.key, metadataValue: m.value })),
+            ...(p.includeGridData ? { data: [{ rowData: t.values.map((row) => ({ values: row.map((v) => ({ userEnteredValue: v === '' ? undefined : { stringValue: v } })) })) }] } : {}) })) } };
+          if (g.onSget) { const fn = g.onSget; g.onSget = null; fn(p); }
+          return snap;
+        },
+        batchUpdate: async (p) => {
+          await hit('sbatch');
+          const f = g.files.get(p.spreadsheetId);
+          const tabs = f.tabs.map((t) => ({ ...t, values: t.values.map((r) => r.slice()), meta: (t.meta || []).slice() }));
+          const find = (id) => { const t = tabs.find((x) => x.sheetId === id); if (!t) throw gErr(400, `No grid with id: ${id}`); return t; };
+          for (const r of p.requestBody.requests) {
+            if (r.addSheet) {
+              const pr = r.addSheet.properties;
+              if (tabs.some((t) => t.title === pr.title || t.sheetId === pr.sheetId)) throw gErr(400, `A sheet with the name "${pr.title}" already exists`);
+              tabs.push({ sheetId: pr.sheetId, title: pr.title, values: [], meta: [] });
+            } else if (r.createDeveloperMetadata) {
+              const m = r.createDeveloperMetadata.developerMetadata;
+              find(m.location.sheetId).meta.push({ key: m.metadataKey, value: m.metadataValue });
+            } else if (r.updateCells) {
+              const u = r.updateCells;
+              if (u.range) { const t = find(u.range.sheetId); if (/userEnteredValue/.test(u.fields)) t.values = []; }
+              else {
+                const t = find(u.start.sheetId);
+                t.values = u.rows.map((row) => (row.values || []).map((c) => { const k = Object.keys(c.userEnteredValue || {}); k.forEach((x) => g.cellKinds.add(x)); return c.userEnteredValue?.stringValue ?? ''; }));
+              }
+            } else if (r.updateSheetProperties) {
+              const pr = r.updateSheetProperties.properties;
+              find(pr.sheetId).frozen = pr.gridProperties.frozenRowCount;
+            } else if (r.deleteSheet) {
+              find(r.deleteSheet.sheetId);
+              tabs.splice(tabs.findIndex((t) => t.sheetId === r.deleteSheet.sheetId), 1);
+            } else if (r.repeatCell || r.updateDimensionProperties || r.appendDimension) {
+              find((r.repeatCell?.range || r.updateDimensionProperties?.range || r.appendDimension).sheetId);
+            } else throw gErr(400, 'unknown request ' + Object.keys(r).join());
+          }
+          if (!tabs.length) throw gErr(400, 'You can\'t remove all the sheets in a document.');
+          f.tabs = tabs;
+          g.batches += 1;
+          // 書けた直後 (記録する前) に、ほかの人の操作を割り込ませる口
+          if (g.onBatch) { const fn = g.onBatch; g.onBatch = null; fn(p); }
+          return { data: { replies: [] } };
+        },
+      } };
+      let clientsOn = true;
+      ssv.__setShootSheetClientsForTest(() => (clientsOn ? { drive: fakeDrive, sheets: fakeSheets } : null));
+      const filesIn = () => [...g.files.values()].filter((f) => !f.trashed && f.parents.includes(FID));
+      const URL_OF = (id) => `https://docs.google.com/spreadsheets/d/${id}/edit`;
+
+      // LP構成 (できた job): 1枚目の使用素材に「撮影」
+      const fixture = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'scripts', 'fixtures', 'lp-compose', 'v22-3images-hakka.md'), 'utf8');
+      const lpText = fixture.replace(/(# 1枚目｜FV[\s\S]*?## 使用素材\n)提供された実物商品画像/, '$1撮影: 使用シーン・提供された実物商品画像');
+      check('撮影指示書: (前提) 試験用の LP構成に撮影の素材を書けた', lpText !== fixture);
+      const specId = Number(db.prepare(`INSERT INTO ph_lp_specs (kind, title, body, hash, sheet_titles_json, imported_by) VALUES ('product_analysis', 'SS', 'b', ?, '[]', 'smoke')`).run(`ss-spec-${Date.now()}`).lastInsertRowid);
+      let jobSeq = 0;
+      // できた構成 = done + 実モデル一致の生成 (lp-edit の「効いている構成」と同じ条件)
+      const addJob = (draftId, status, text, shootJson = null) => {
+        const jid = Number(db.prepare(`INSERT INTO ph_lp_compose_jobs
+          (draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, spec_id, spec_hash, requested_by, measurement_deadline_at, output_text, shoot_json)
+          VALUES (?, ?, ?, '{}', 'p', 1, ?, 'h', 'smoke', '2026-10-09T00:00:00Z', ?, ?)`).run(draftId, `ss-key-${++jobSeq}`, status, specId, text, shootJson).lastInsertRowid);
+        if (status === 'done') {
+          db.prepare(`INSERT INTO ph_lp_compose_generations (job_id, packet_hash, lease_token, status, model, prompt_version, reserved_day, model_check)
+            VALUES (?, 'p', ?, 'accepted', 'claude-opus-5-5', 'lp-compose-v1', '2026-10-09', 'match')`).run(jid, `lt-${jid}`);
+        }
+        return jid;
+      };
+
+      const idS = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET', 'ハッカ油スプレー 100ml', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
+      addJob(idS, 'done', lpText);
+      const ipS = () => db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(idS) || {};
+      const evS = (ev) => db.prepare('SELECT detail FROM draft_events WHERE draft_id = ? AND event = ? ORDER BY id').all(idS, ev).map((e) => e.detail);
+      // 画面と同じ送り方: 開いたときの指示書の URL (seen_url) と、作成済みの指示書ならそのファイル (overwrite_file_id = 上書きを確かめた)
+      const sheetFor = (id, body = {}) => {
+        const cur = db.prepare('SELECT camera_instruction_url, shoot_sheet_file_id FROM draft_image_production WHERE draft_id = ?').get(id) || {};
+        const curUrl = String(cur.camera_instruction_url || '').trim();
+        const isOurs = !!cur.shoot_sheet_file_id && curUrl === URL_OF(cur.shoot_sheet_file_id);
+        return call('POST', `/api/drafts/${id}/shoot-sheet`, { seen_url: curUrl, ...(isOurs ? { overwrite_file_id: cur.shoot_sheet_file_id } : {}), ...body });
+      };
+      const sheetCall = (body = {}) => sheetFor(idS, body);
+      const pageOf = async (id = idS) => (await fetch(`${base}/detail/${id}`)).text();
+
+      // 作れないとき: 未判定・撮影不要・画像フォルダなし・サービスアカウント未設定。どれも URL を書かず、Google にも触らない
+      r = await sheetCall();
+      check('撮影指示書: 撮影判定が未判定なら 400 (理由を返す・URL は書かない・Google に触らない)',
+        r.status === 400 && /社内撮影/.test(r.json?.error || '') && ipS().camera_instruction_url == null && g.log.length === 0, JSON.stringify([r, g.log]));
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'none' });
+      r = await sheetCall();
+      check('撮影指示書: 撮影不要なら 400', r.status === 400 && g.files.size === 0, JSON.stringify(r));
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'inhouse' });
+      db.prepare('UPDATE product_drafts SET drive_folder_url = NULL WHERE id = ?').run(idS);
+      r = await sheetCall();
+      check('撮影指示書: 画像フォルダが無ければ 400 (置き場が無い)', r.status === 400 && /画像フォルダ/.test(r.json?.error || '') && g.files.size === 0, JSON.stringify(r));
+      db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run(FOLDER, idS);
+      clientsOn = false;
+      r = await sheetCall();
+      let pg = await pageOf();
+      check('🚨 撮影指示書: サービスアカウントが未設定なら作らずに理由を返す (fail-closed)・画面のボタンも押せない',
+        r.status === 503 && /GOOGLE_SERVICE_ACCOUNT_KEY/.test(r.json?.error || '') && ipS().camera_instruction_url == null
+        && /id="shoot-sheet-btn" disabled>/.test(pg) && pg.includes('GOOGLE_SERVICE_ACCOUNT_KEY'), JSON.stringify(r));
+      clientsOn = true;
+
+      // 権限: 管理者ではなく実際に押す役割で (画像登録者は作れる・役割なしは 403)
+      const ssNoRole = wf.createStaff({ name: '指示書 役割なし', kind: 'internal', portal_email: 'sheet-norole@b-faith.biz' });
+      const ssImg = wf.createStaff({ name: '指示書 画像登録者', kind: 'internal', portal_email: 'sheet-img@b-faith.biz' });
+      db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'image')`).run(ssImg);
+      const sessionBefore = smokeSession;
+      smokeSession = { email: 'sheet-norole@b-faith.biz', displayName: '役割なし', role: 'user' };
+      const rNo = await sheetCall();
+      check('撮影指示書: 画像の役割が無い担当者は 403 (作らない)', rNo.status === 403 && g.files.size === 0, JSON.stringify(rNo));
+      // 材料の hash は「作ったとき」の値 — 画面が出す材料と同じ関数で比べる
+      const materialBefore = ipS().material_status;
+      smokeSession = { email: 'sheet-img@b-faith.biz', displayName: '画像登録者', role: 'user' };
+      r = await sheetCall();
+      smokeSession = sessionBefore;
+      const f1 = filesIn()[0];
+      check('撮影指示書: 画像登録者 (管理者でない) が押すと、商品の画像フォルダにスプレッドシートができる',
+        r.status === 200 && r.json?.created === true && filesIn().length === 1 && f1.mimeType === 'application/vnd.google-apps.spreadsheet', JSON.stringify([r, filesIn()]));
+      check('撮影指示書: URL を撮影指示書の欄 (camera_instruction_url) に入れ、ファイル ID・材料の hash・作った人を残す',
+        ipS().camera_instruction_url === URL_OF(f1.id) && r.json?.url === URL_OF(f1.id) && ipS().shoot_sheet_file_id === f1.id
+        && /^[0-9a-f]{64}$/.test(ipS().shoot_sheet_hash || '') && ipS().shoot_sheet_source === 'auto' && ipS().shoot_sheet_by === 'sheet-img@b-faith.biz', JSON.stringify(ipS()));
+      check('撮影指示書: ファイル名は 撮影指示書_<商品コード>（社内撮影）・印 (appProperties) 付き・リンク共有は付けない',
+        f1.name === '撮影指示書_DRV-SHEET（社内撮影）' && f1.appProperties.phShootSheetDraft === String(idS) && f1.perms == null, JSON.stringify(f1));
+      const main1 = tabOf(f1, MAIN);
+      check('撮影指示書: 1 タブ目「撮影依頼書」に概要とカットのブロック (LP構成の 1枚目の使用シーン) が入る・最初の「シート1」は消える・社内撮影に依頼文のタブは無い',
+        !!main1 && f1.tabs.length === 1 && main1.values[0][0] === '撮影依頼書' && valOf(main1, '商品名') === 'ハッカ油スプレー 100ml' && valOf(main1, '商品コード') === 'DRV-SHEET'
+        && valOf(main1, '撮影担当') === '社内撮影' && valOf(main1, '撮影カット数') === '1カット' && main1.values.some((row) => row[0] === 'カット1（必須）')
+        && valOf(main1, '撮影内容') === '使用シーン' && valOf(main1, '参考イメージ') === '' && main1.frozen === 0,
+        JSON.stringify(f1.tabs));
+      check('🚨 撮影指示書: 値は文字 (stringValue) だけで書く (数式・数値として評価させない)', g.cellKinds.size === 1 && g.cellKinds.has('stringValue'), JSON.stringify([...g.cellKinds]));
+      check('撮影指示書: 自分で足したタブには印 (developer metadata) を付ける', (main1?.meta || []).some((m) => m.key === 'phOwnedTab'), JSON.stringify(main1?.meta));
+      check('撮影指示書: 操作の履歴に「撮影指示書を作成」が残る', evS('shoot_sheet_created').length === 1 && evS('shoot_sheet_created')[0].includes(f1.id));
+      check('🚨 撮影指示書: 撮影判定・撮影・素材ステータスには触らない (③素材待ちの決まりはそのまま)',
+        ipS().shoot_mode === 'inhouse' && ipS().material_status === materialBefore, JSON.stringify(ipS()));
+
+      // 画面 (本番の router で描く): 作成済みなら「開く ↗」「撮影指示書を更新」・依頼文に URL が入る
+      pg = await pageOf();
+      check('画面: 作成済みなら「撮影指示書を更新」と「開く ↗」(作ったファイル)・URL の欄に作った URL',
+        pg.includes('>撮影指示書を更新</button>') && pg.includes(`href="${URL_OF(f1.id)}" target="_blank" rel="noopener" class="btn btn-sm" id="shoot-sheet-open"`)
+        && pg.includes(`id="ip-camera-url" style="flex:1;" value="${URL_OF(f1.id)}"`) && !pg.includes('id="shoot-sheet-stale"'));
+      check('画面: LP構成から拾ったカットを出す', pg.includes('LP構成から撮るカット 1 点: 1枚目｜FV 使用シーン'));
+      check('画面: 作ったファイルを指しているときは、URL の欄の横の「開く ↗」は重ねて出さない',
+        (pg.match(new RegExp(`href="${URL_OF(f1.id)}"`, 'g')) || []).length === 1);
+
+      // 🚨 古い画面 (作る前に開いた「作成」の画面) から押した: 今の URL と違うので Google に触らずに 409 (Codex PR-D 名指し5 High)
+      {
+        const b0 = g.batches; const l0 = g.log.length;
+        r = await sheetCall({ seen_url: '' });
+        check('🚨 撮影指示書: 開いたときの URL (seen_url) が今と違う古い画面からは 409・Google に触らない',
+          r.status === 409 && r.json?.code === 'stale_screen' && g.batches === b0 && g.log.length === l0, JSON.stringify(r));
+        r = await call('POST', `/api/drafts/${idS}/shoot-sheet`, {});
+        check('撮影指示書: seen_url が無ければ 400', r.status === 400);
+        r = await sheetCall({ overwrite_file_id: undefined });
+        check('🚨 撮影指示書: 作成済みの指示書を、確かめたファイル (overwrite_file_id) なしで書き換えようとすると 409 (直接の呼び出しで人の直しを消さない)',
+          r.status === 409 && r.json?.code === 'recovered_file' && g.batches === b0, JSON.stringify(r));
+      }
+
+      // 二度押し: 同じファイルを上書き (URL は変わらない・2 つ作らない)
+      r = await sheetCall();
+      check('🚨 撮影指示書: もう一度押すと同じファイルを上書き (2 つ作らない・URL は変わらない)',
+        r.status === 200 && r.json?.created === false && filesIn().length === 1 && ipS().camera_instruction_url === URL_OF(f1.id) && evS('shoot_sheet_updated').length === 1,
+        JSON.stringify([r, filesIn().map((f) => f.id)]));
+      // 同時に 2 回 (二重クリック・2 人同時): 1 本だけ通す
+      g.delay = 20;
+      const [ra, rb] = await Promise.all([sheetCall(), sheetCall()]);
+      g.delay = 0;
+      check('🚨 撮影指示書: 同時に 2 回押されても 1 本だけ (もう 1 本は 409「作っています」)・ファイルは 1 つ',
+        [ra.status, rb.status].sort().join() === '200,409' && /作っています/.test((ra.status === 409 ? ra : rb).json?.error || '') && filesIn().length === 1,
+        JSON.stringify([ra, rb]));
+
+      // LP構成が変わった → 画面に「更新が要る」→ 更新で消える
+      addJob(idS, 'done', lpText.replace(/(# 2枚目｜[^\n]*[\s\S]*?## 使用素材\n)[^\n]*/, '$1撮影（成分アップ）'));
+      pg = await pageOf();
+      check('画面: LP構成が変わったら「LP構成が変わりました → 撮影指示書を更新」を出す', pg.includes('id="shoot-sheet-stale"') && pg.includes('LP構成から撮るカット 2 点'));
+      r = await sheetCall();
+      pg = await pageOf();
+      check('撮影指示書: 更新すると今の LP構成のカット (2 点) が入り、「更新が要る」は消える (URL はそのまま)',
+        r.status === 200 && valOf(tabOf(g.files.get(f1.id), MAIN), '撮影カット数') === '2カット' && valOf(tabOf(g.files.get(f1.id), MAIN), '撮影内容', 1) === '成分アップ'
+        && !pg.includes('id="shoot-sheet-stale"') && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(tabOf(g.files.get(f1.id), MAIN).values));
+      // 動いている途中 (queued) の job は材料にしない (できた構成だけ)
+      addJob(idS, 'queued', null);
+      pg = await pageOf();
+      check('撮影指示書: AI が作り直している途中の構成は材料にしない (できた構成のまま・更新が要るにならない)', !pg.includes('id="shoot-sheet-stale"'));
+      db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ? AND status = 'queued'`).run(idS);
+
+      // カメラマン撮影 → 名前を付け直し・2 タブ目「依頼文」。人が足したタブは残す
+      g.files.get(f1.id).tabs.push({ sheetId: 77, title: '人のメモ', values: [['メモ']] });
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'photographer' });
+      pg = await pageOf();
+      check('画面: 撮影の種類を変えたら「更新が要る」を出す', pg.includes('id="shoot-sheet-stale"'));
+      r = await sheetCall();
+      const f1b = g.files.get(f1.id);
+      const reqTab = tabOf(f1b, '依頼文');
+      check('撮影指示書: カメラマン撮影に変えて更新すると、名前が（カメラマン撮影）になり 2 タブ目「依頼文」ができる (同じファイル)',
+        r.status === 200 && f1b.name === '撮影指示書_DRV-SHEET（カメラマン撮影）' && !!reqTab && filesIn().length === 1, JSON.stringify(f1b.tabs.map((t) => t.title)));
+      check('撮影指示書: 依頼文のタブは画面の依頼文と同じ文面 (宛先・商品名・指示書の URL・画像フォルダ)',
+        reqTab && reqTab.values.map((x) => x[0]).join('\n') === ssl.shootRequestBody({ mention: '@つくば', productName: 'ハッカ油スプレー 100ml', sheetUrl: URL_OF(f1.id), folderUrl: FOLDER }),
+        JSON.stringify(reqTab?.values));
+      check('撮影指示書: 人が足したタブ (人のメモ) は消さない・書き換えない', JSON.stringify(tabOf(f1b, '人のメモ')?.values) === '[["メモ"]]');
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'inhouse' });
+      r = await sheetCall();
+      check('撮影指示書: 社内撮影に戻すと「依頼文」のタブを消し、名前も戻す (人のメモは残す)',
+        r.status === 200 && !tabOf(f1b, '依頼文') && !!tabOf(f1b, '人のメモ') && f1b.name === '撮影指示書_DRV-SHEET（社内撮影）', JSON.stringify(f1b.tabs.map((t) => t.title)));
+
+      // 数式の注入: 材料は AI の出力 (LP構成)。= + @ で始まる値も文字のまま入る
+      const evilText = lpText.replace(/(# 1枚目｜FV[\s\S]*?## 装飾・演出\n)[^\n]*/, '$1+1')
+        .replace(/(# 1枚目｜FV[\s\S]*?## 使用素材\n)[^\n]*/, '$1撮影: =1+1')
+        .replace(/(# 1枚目｜FV[\s\S]*?## NG事項\n)[^\n]*/, '$1@SUM(A1)');
+      check('撮影指示書: (前提) 数式のような材料の LP構成を作れた', evilText.includes('撮影: =1+1') && evilText.includes('\n@SUM(A1)'));
+      addJob(idS, 'done', evilText);
+      r = await sheetCall();
+      const evTab = tabOf(f1b, MAIN);
+      check('🚨 撮影指示書: = + @ で始まる材料も文字のまま (stringValue) — 数式にしない',
+        r.status === 200 && valOf(evTab, '撮影内容') === '=1+1' && valOf(evTab, '注意') === '@SUM(A1)' && /小物：\+1/.test(valOf(evTab, '完成イメージ') || '')
+        && g.cellKinds.size === 1 && g.cellKinds.has('stringValue'), JSON.stringify(evTab?.values));
+      addJob(idS, 'done', lpText);
+      r = await sheetCall();
+      const badCuts = [];
+      for (const body of [{ cuts: [] }, { cuts: [{ cut: '古いタブのカット' }] }, { replace_manual_url: 5 }, { mention: '@a\n@b' }, { mention: 'x'.repeat(61) }, { overwrite_file_id: "x' or" }]) badCuts.push((await sheetCall(body)).status);
+      check('🚨 撮影指示書: 中身 (cuts) は送れない (正本の LP構成と違う中身を書かせない・名指し3 M)・replace_manual_url / overwrite_file_id の形が違う・宛先が 2 行/61 文字以上なら 400',
+        r.status === 200 && badCuts.every((s) => s === 400) && !tabOf(f1b, MAIN).values.flat().includes('古いタブのカット'), JSON.stringify(badCuts));
+
+      // 手で貼った URL: 黙って差し替えない (409 → 確かめた URL を添えて送り直す)
+      const MANUAL = 'https://docs.google.com/spreadsheets/d/manual-by-hand/edit';
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: MANUAL });
+      check('🚨 撮影指示書: 指示書の URL を変える保存で、開いたときの値を添えない (古い画面・直接の呼び出し) は 409 (名指し3 M)',
+        r.status === 409 && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(r));
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: URL_OF(f1.id), status: '同じ URL' });
+      check('撮影指示書: 同じ URL を送るだけの保存は、開いたときの値を添えなくても通る', r.status === 200);
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: MANUAL, camera_instruction_url_expected: URL_OF(f1.id) });
+      pg = await pageOf();
+      check('画面: 指示書の URL を手で貼り替えたら「撮影指示書を作成」に戻る (作ったファイルを指していない)', r.status === 200 && pg.includes('>撮影指示書を作成 (スプレッドシート)</button>'));
+      r = await sheetCall();
+      check('🚨 撮影指示書: 手で貼った URL があれば 409 (manual_url) で止め、URL は変えない',
+        r.status === 409 && r.json?.code === 'manual_url' && ipS().camera_instruction_url === MANUAL && /手で貼った/.test(r.json?.error || ''), JSON.stringify(r));
+      check('撮影指示書: 409 には今の手で貼った URL を添える (画面が確かめる URL)', r.json?.manual_url === MANUAL);
+      r = await sheetCall({ replace_manual_url: 'https://docs.google.com/spreadsheets/d/other-hand/edit' });
+      check('🚨 撮影指示書: 確かめた URL と今の URL が違えば (確かめた後に貼り替えられた) もう一度 409・URL は変えない',
+        r.status === 409 && r.json?.code === 'manual_url' && ipS().camera_instruction_url === MANUAL, JSON.stringify(r));
+      const b409 = g.batches;
+      r = await sheetCall({ replace_manual_url: MANUAL });
+      check('🚨 撮影指示書: 手で貼った URL を置き換えてよくても、前に作ったファイル (画面に出ていない) を上書きするときはもう一度確かめる (recovered_file・名指し4 M)',
+        r.status === 409 && r.json?.code === 'recovered_file' && r.json?.file_id === f1.id && g.batches === b409 && ipS().camera_instruction_url === MANUAL, JSON.stringify(r));
+      r = await sheetCall({ replace_manual_url: MANUAL, overwrite_file_id: f1.id });
+      check('撮影指示書: 置き換えてよいと確かめた URL と、上書きしてよいファイルを添えれば、前に作ったファイルを上書きして URL を戻す (新しく作らない)',
+        r.status === 200 && ipS().camera_instruction_url === URL_OF(f1.id) && filesIn().length === 1, JSON.stringify(r));
+
+      // Google の失敗: URL を書かない・理由を返す・履歴に残す
+      const idF = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET-F', '失敗用', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
+      await call('POST', `/api/drafts/${idF}/shoot-mode`, { mode: 'photographer' });
+      const ipF = () => db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(idF) || {};
+      g.fail.create = { once: true, err: gErr(403, 'The caller does not have permission') };
+      r = await sheetFor(idF, {});
+      check('🚨 撮影指示書: Google が権限で断ったら 502 + 直し方 (コンテンツ管理者)・URL もファイル ID も書かない・履歴に失敗',
+        r.status === 502 && /コンテンツ管理者/.test(r.json?.error || '') && ipF().camera_instruction_url == null && ipF().shoot_sheet_file_id == null
+        && db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'shoot_sheet_failed'`).get(idF).c === 1, JSON.stringify([r, ipF()]));
+      // 作った後の書き込み (batchUpdate) で失敗 → URL は書かない。作ったファイルは消さずに残し、次に押すと印で拾い直す
+      const before = filesIn().length;
+      g.fail.sbatch = { once: true, err: gErr(500, 'Backend Error') };
+      r = await sheetFor(idF, {});
+      check('🚨 撮影指示書: ファイルを作った後の書き込みで失敗しても URL は書かない (中途半端に記録しない)・作ったファイルは消さない (自動でごみ箱に入れない・名指し8 M)',
+        r.status === 502 && ipF().camera_instruction_url == null && filesIn().length === before + 1, JSON.stringify([r, ipF()]));
+      const orphan = filesIn().find((f) => f.appProperties.phShootSheetDraft === String(idF));
+      orphan.tabs.push({ sheetId: 55, title: '人のメモ2', values: [['途中で足したメモ']] });
+      r = await sheetFor(idF, {});
+      check('🚨 撮影指示書: 拾い直したファイル (前に作ったもの) の、人が足したタブは消さない (作ったばかりではないので)',
+        r.status === 200 && JSON.stringify(tabOf(orphan, '人のメモ2')?.values) === '[["途中で足したメモ"]]', JSON.stringify([r, orphan.tabs.map((t) => t.title)]));
+      check('🚨 撮影指示書: 次に押すと、前に作ったファイルを印 (appProperties) で拾い直す (2 つ作らない・指示書のタブがまだ無いので確かめずに書く)',
+        r.status === 200 && filesIn().length === before + 1 && ipF().shoot_sheet_file_id === orphan.id && ipF().camera_instruction_url === r.json?.url && tabOf(orphan, '依頼文'),
+        JSON.stringify([r, filesIn().length]));
+      // 作っただけで書く前に止めた (送る直前に商品名が変わった) ファイルも消さない。次に押すと拾い直して 1 つのまま
+      {
+        const idT = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET-T', '片付け用', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
+        await call('POST', `/api/drafts/${idT}/shoot-mode`, { mode: 'inhouse' });
+        g.onSget = () => db.prepare('UPDATE product_drafts SET name = ? WHERE id = ?').run('片付け用 改', idT);
+        r = await sheetFor(idT);
+        const made = () => [...g.files.values()].filter((f) => f.appProperties.phShootSheetDraft === String(idT));
+        check('撮影指示書: 作っただけで書く前に止めたら 409・URL は書かない・ファイルはごみ箱に入れない',
+          r.status === 409 && made().length === 1 && !made()[0].trashed
+          && db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(idT)?.camera_instruction_url == null, JSON.stringify([r, made().map((f) => f.trashed)]));
+        r = await sheetFor(idT);
+        check('撮影指示書: 押し直せば残ったファイルを拾い直して書く (2 つ作らない)', r.status === 200 && made().length === 1 && made()[0].id === r.json?.url.split('/d/')[1].split('/')[0]);
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idT);
+      }
+
+      // 🚨 書いた後・記録する前に止まった (ここでは記録のときに版が変わった) 撮影指示書: 次に押すと拾い直すが、
+      //    もう指示書のタブ (印つき) があるので、上書きしてよいかを聞く (人が直しているかもしれない・名指し3 M)
+      {
+        const idR = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET-R', '拾い直し用', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
+        await call('POST', `/api/drafts/${idR}/shoot-mode`, { mode: 'inhouse' });
+        const ipR = () => db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(idR) || {};
+        g.onBatch = () => db.prepare('UPDATE product_drafts SET name = ? WHERE id = ?').run('拾い直し用 改', idR);
+        r = await sheetFor(idR, {});
+        const orphanR = filesIn().find((f) => f.appProperties.phShootSheetDraft === String(idR));
+        check('撮影指示書: (前提) 書いた後に記録で止まった (409・URL なし・ファイルは書けている)',
+          r.status === 409 && ipR().camera_instruction_url == null && !!orphanR && !!tabOf(orphanR, MAIN), JSON.stringify(r));
+        tabOf(orphanR, MAIN).values.push(['人が直した行', 'x']);
+        const bR = g.batches;
+        r = await sheetFor(idR, {});
+        check('🚨 撮影指示書: 拾い直したファイルに指示書のタブがあれば、上書きせずに 409 (recovered_file) で確かめる',
+          r.status === 409 && r.json?.code === 'recovered_file' && r.json?.file_id === orphanR.id && g.batches === bR
+          && tabOf(orphanR, MAIN).values.some((row) => row[0] === '人が直した行') && ipR().camera_instruction_url == null, JSON.stringify(r));
+        r = await sheetFor(idR, { overwrite_file_id: 'SS999999' });
+        check('撮影指示書: 確かめたファイルと違う ID なら、もう一度 409', r.status === 409 && r.json?.code === 'recovered_file');
+        r = await sheetFor(idR, { overwrite_file_id: orphanR.id });
+        check('撮影指示書: 確かめたファイルの ID を添えれば、そのファイルを上書きして記録する (2 つ作らない)',
+          r.status === 200 && ipR().camera_instruction_url === URL_OF(orphanR.id) && filesIn().filter((f) => f.appProperties.phShootSheetDraft === String(idR)).length === 1, JSON.stringify(r));
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idR);
+      }
+
+      // 🚨 作ったばかりのファイルに、人が「撮影指示」という同じ名前のタブをすぐ作った: 上書きしない (名指し4 M)
+      {
+        g.files.get(ipF().shoot_sheet_file_id).trashed = true;
+        g.onSgetBefore = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 7, title: MAIN, values: [['人がすぐ書いた']] });
+        r = await sheetFor(idF, {});
+        const fx = filesIn().filter((f) => f.appProperties.phShootSheetDraft === String(idF)).at(-1);
+        check('🚨 撮影指示書: 作ったばかりでも、人がすぐ作った同じ名前のタブ (印なし) は上書きせず 409・ファイルも片付けない',
+          r.status === 409 && r.json?.code === 'tab_conflict' && JSON.stringify(tabOf(fx, MAIN)?.values) === '[["人がすぐ書いた"]]', JSON.stringify(r));
+        fx.trashed = true;
+        // 読んだ後・送る前に人が同じ名前のタブを作った: Google が batchUpdate を断る (400) → 片付ける前に読み直して、人のタブがあるので残す
+        g.onSget = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 8, title: MAIN, values: [['読んだ後に書いた']] });
+        r = await sheetFor(idF, {});
+        const fy = [...g.files.values()].filter((f) => f.appProperties.phShootSheetDraft === String(idF)).at(-1);
+        check('🚨 撮影指示書: 読んだ後に人がタブを作って書き込みが断られても、読み直して人のタブがあればファイルをごみ箱に入れない (名指し6 M)',
+          r.status === 502 && fy !== fx && !fy.trashed && JSON.stringify(tabOf(fy, MAIN)?.values) === '[["読んだ後に書いた"]]', JSON.stringify([r, fy?.trashed]));
+        fy.trashed = true;
+      }
+
+      // 前に作ったファイルがごみ箱に → 作り直して URL を替える。作った直後 (タブを読む前) に人が足したタブは消さない
+      g.files.get(ipF().shoot_sheet_file_id).trashed = true;
+      const oldF = ipF().shoot_sheet_file_id;
+      g.onSget = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 9, title: '人がすぐ足したタブ', values: [['x']] });
+      r = await sheetFor(idF, {});
+      const fNew = g.files.get(ipF().shoot_sheet_file_id);
+      check('🚨 撮影指示書: 作ったばかりでも、最初の「シート1」だけ消し、作った直後に人が足したタブは消さない (Codex PR-D 名指し2 L)',
+        !!tabOf(fNew, '人がすぐ足したタブ') && !tabOf(fNew, 'シート1'), JSON.stringify(fNew.tabs.map((t) => t.title)));
+      check('撮影指示書: 前に作ったファイルがごみ箱に入っていたら作り直し、新しい URL を入れる',
+        r.status === 200 && r.json?.created === true && ipF().shoot_sheet_file_id !== oldF && ipF().camera_instruction_url === URL_OF(ipF().shoot_sheet_file_id), JSON.stringify(r));
+
+      // Google を待っている間に変わった: 後から終わったほうが黙って勝たない
+      g.delay = 30;
+      const pending = sheetFor(idF, {});
+      await new Promise((res) => setTimeout(res, 10));
+      db.prepare('UPDATE draft_image_production SET camera_instruction_url = ? WHERE draft_id = ?').run(MANUAL, idF);
+      r = await pending;
+      g.delay = 0;
+      check('🚨 撮影指示書: 作っている間にほかの人が指示書の URL を貼り替えたら 409 (貼られた URL を上書きしない)',
+        r.status === 409 && ipF().camera_instruction_url === MANUAL, JSON.stringify([r, ipF().camera_instruction_url]));
+      db.prepare('UPDATE draft_image_production SET camera_instruction_url = ? WHERE draft_id = ?').run(URL_OF(ipF().shoot_sheet_file_id), idF);
+      g.delay = 30;
+      const pending2 = sheetFor(idF, {});
+      await new Promise((res) => setTimeout(res, 10));
+      await call('POST', `/api/drafts/${idF}/shoot-mode`, { mode: 'none' });
+      const urlBefore = ipF().camera_instruction_url;
+      r = await pending2;
+      g.delay = 0;
+      check('🚨 撮影指示書: 作っている間に撮影判定が「撮影不要」になったら 409 (記録しない)',
+        r.status === 409 && /撮影判定/.test(r.json?.error || '') && ipF().camera_instruction_url === urlBefore, JSON.stringify(r));
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idF);
+
+      // 🚨 更新の途中で Google が失敗しても、済の指示書を空にしない (batchUpdate 1 回 = 全部か何もしないか — Codex PR-D 名指し High)
+      const before1 = JSON.stringify(tabOf(g.files.get(f1.id), MAIN).values);
+      g.fail.sbatch = { once: true, err: gErr(500, 'Backend Error') };
+      r = await sheetCall();
+      check('🚨 撮影指示書: 更新の書き込みで失敗しても、前の版の中身はそのまま (空にしない)・URL もそのまま',
+        r.status === 502 && JSON.stringify(tabOf(g.files.get(f1.id), MAIN).values) === before1 && before1.length > 50 && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(r));
+      // 🚨 待っている間に撮影判定 (撮影が要る同士) が変わった: 古い材料で上書きしない (Codex PR-D 名指し High)
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'photographer' });
+      await sheetCall();
+      const nameBefore = g.files.get(f1.id).name;
+      const batchesBefore = g.batches;
+      g.delay = 30;
+      const pend3 = sheetCall();
+      await new Promise((res) => setTimeout(res, 10));
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'inhouse' });
+      r = await pend3;
+      g.delay = 0;
+      check('🚨 撮影指示書: 作っている間に撮影判定が変わったら (カメラマン → 社内) 409 で止め、古い材料でシートを書かない',
+        r.status === 409 && r.json?.code === 'conflict' && g.batches === batchesBefore && g.files.get(f1.id).name === nameBefore, JSON.stringify([r, g.batches - batchesBefore]));
+      g.delay = 30;
+      const pend4 = sheetCall();
+      await new Promise((res) => setTimeout(res, 10));
+      addJob(idS, 'done', lpText);
+      r = await pend4;
+      g.delay = 0;
+      check('🚨 撮影指示書: 作っている間に LP構成ができ直したら 409 で止める (古い構成で書かない)', r.status === 409 && g.batches === batchesBefore, JSON.stringify(r));
+      r = await sheetCall();
+      check('撮影指示書: 押し直せば今の材料で書く', r.status === 200 && g.files.get(f1.id).name === '撮影指示書_DRV-SHEET（社内撮影）');
+      // 🚨 タブの様子を読んだ後 (送る直前) に変わったもの: どれも batchUpdate を送らない (Codex PR-D 名指し2 High / M)
+      {
+        const b0 = g.batches;
+        g.onSget = () => db.prepare(`UPDATE draft_image_production SET shoot_mode = 'photographer' WHERE draft_id = ?`).run(idS);
+        r = await sheetCall();
+        check('🚨 撮影指示書: タブを読んだ後・送る直前に撮影判定が変わったら送らない (409)', r.status === 409 && g.batches === b0, JSON.stringify(r));
+        db.prepare(`UPDATE draft_image_production SET shoot_mode = 'inhouse' WHERE draft_id = ?`).run(idS);
+        g.onSget = () => db.prepare('UPDATE draft_image_production SET shoot_sheet_lease_token = ? WHERE draft_id = ?').run('someone-else', idS);
+        r = await sheetCall();
+        check('🚨 撮影指示書: 送る直前に印がほかの処理のものになっていたら (期限切れで取り直された) 送らない・記録しない',
+          r.status === 409 && g.batches === b0 && /取りやめ/.test(r.json?.error || ''), JSON.stringify(r));
+        db.prepare('UPDATE draft_image_production SET shoot_sheet_lease_token = NULL, shoot_sheet_lease_until = NULL WHERE draft_id = ?').run(idS);
+        // 新しい構成 (done) の実モデル確認が待っている間に一致になった: 依頼の id・状態は同じでも材料が変わる
+        const jPend = addJob(idS, 'done', lpText.replace(/(# 2枚目｜[^\n]*[\s\S]*?## 使用素材\n)[^\n]*/, '$1撮影（瓶のアップ）'));
+        db.prepare('UPDATE ph_lp_compose_generations SET model_check = NULL WHERE job_id = ?').run(jPend);
+        g.onSget = () => db.prepare(`UPDATE ph_lp_compose_generations SET model_check = 'match' WHERE job_id = ?`).run(jPend);
+        r = await sheetCall();
+        check('🚨 撮影指示書: 待っている間に新しい構成の実モデル確認が一致になったら (材料が変わる) 送らない (Codex PR-D 名指し2 M)',
+          r.status === 409 && g.batches === b0, JSON.stringify(r));
+        r = await sheetCall();
+        check('撮影指示書: 押し直せば新しい構成の材料で書く', r.status === 200 && tabOf(g.files.get(f1.id), MAIN).values.some((row) => row[0] === '撮影内容' && row[1] === '瓶のアップ'),
+          JSON.stringify(tabOf(g.files.get(f1.id), MAIN).values));
+      }
+      // 🚨 古いタブの「画像制作情報を保存」: 開いたときの指示書の URL を添えて、今と違えば 409 (作った URL を空で消さない)
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: '', camera_instruction_url_expected: '', status: '古いタブ' });
+      check('🚨 撮影指示書: 作る前に開いた古い画面の保存 (指示書の URL が空のまま) は 409・作った URL は消えない (Codex PR-D 名指し2 M)',
+        r.status === 409 && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify([r, ipS().camera_instruction_url]));
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: URL_OF(f1.id), camera_instruction_url_expected: URL_OF(f1.id) });
+      check('撮影指示書: 今の URL を見ている画面の保存は通る', r.status === 200 && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(r));
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: '', camera_instruction_url_expected: 5 });
+      check('撮影指示書: camera_instruction_url_expected が文字でなければ 400', r.status === 400);
+
+      // 🚨 書いた後に記録できなかった (ここでは記録のときに商品名が変わった) → 商品名を元に戻しても (ABA)「更新が要る」を出す (名指し7 M)
+      {
+        const nameNow = db.prepare('SELECT name FROM product_drafts WHERE id = ?').get(idS).name;
+        g.onBatch = () => db.prepare('UPDATE product_drafts SET name = ? WHERE id = ?').run(nameNow + ' 改', idS);
+        r = await sheetCall();
+        db.prepare('UPDATE product_drafts SET name = ? WHERE id = ?').run(nameNow, idS);
+        const pgA = await pageOf();
+        check('🚨 撮影指示書: 書いた後に記録できなかったら、材料が元に戻っても「更新が要る」を出し続ける',
+          r.status === 409 && !!ipS().shoot_sheet_writing_at && pgA.includes('id="shoot-sheet-stale"'), JSON.stringify([r, ipS().shoot_sheet_writing_at]));
+        r = await sheetCall();
+        check('撮影指示書: 更新して記録できたら「更新が要る」は消える', r.status === 200 && ipS().shoot_sheet_writing_at == null && !(await pageOf()).includes('id="shoot-sheet-stale"'));
+      }
+
+      // 作っている最中の印 (DB): ほかのプロセスが作っている間は 409・期限切れの印は取り直せる
+      db.prepare('UPDATE draft_image_production SET shoot_sheet_lease_token = ?, shoot_sheet_lease_until = ? WHERE draft_id = ?').run('other-proc', new Date(Date.now() + 60_000).toISOString(), idS);
+      r = await sheetCall();
+      check('🚨 撮影指示書: ほかのプロセスが作っている (DB の印が期限内) なら 409・Google に触らない', r.status === 409 && r.json?.code === 'busy', JSON.stringify(r));
+      db.prepare('UPDATE draft_image_production SET shoot_sheet_lease_until = ? WHERE draft_id = ?').run(new Date(Date.now() - 1000).toISOString(), idS);
+      r = await sheetCall();
+      check('撮影指示書: 期限の切れた印 (止まったプロセスの残り) は取り直して作れる・終わったら印を返す',
+        r.status === 200 && ipS().shoot_sheet_lease_token == null && ipS().shoot_sheet_lease_until == null, JSON.stringify([r, ipS().shoot_sheet_lease_token]));
+      // 人が作った同じ名前のタブ (「依頼文」) は上書きしない
+      g.files.get(f1.id).tabs.push({ sheetId: 66, title: '依頼文', values: [['人が書いた依頼']] });
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'photographer' });
+      r = await sheetCall();
+      check('🚨 撮影指示書: 人が作った同じ名前のタブ (印なし) があれば 409 で止め、そのタブを書き換えない',
+        r.status === 409 && r.json?.code === 'tab_conflict' && JSON.stringify(tabOf(g.files.get(f1.id), '依頼文').values) === '[["人が書いた依頼"]]', JSON.stringify(r));
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'inhouse' });
+      r = await sheetCall();
+      check('🚨 撮影指示書: 社内撮影の更新でも、人が作った「依頼文」タブ (印なし) は消さない',
+        r.status === 200 && !!tabOf(g.files.get(f1.id), '依頼文'), JSON.stringify(g.files.get(f1.id).tabs.map((t) => t.title)));
+      g.files.get(f1.id).tabs = g.files.get(f1.id).tabs.filter((t) => t.sheetId !== 66);
+      // その回だけの宛先: 依頼文のタブにも入る (いつもの宛先は変えない)
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'photographer' });
+      r = await sheetCall({ mention: '  @その回 ' });
+      check('🚨 撮影指示書: 画面でその回だけ直した宛先が、依頼文のタブにも入る (いつもの宛先は変わらない・Codex PR-D 名指し M)',
+        r.status === 200 && tabOf(g.files.get(f1.id), '依頼文').values[0][0] === '@その回' && dbmod.getShootMention(db).value === '@つくば', JSON.stringify(tabOf(g.files.get(f1.id), '依頼文')?.values?.[0]));
+      r = await sheetCall({ mention: '' });
+      check('撮影指示書: その回の宛先を空にすれば、依頼文のタブも宛先の行なし', r.status === 200 && tabOf(g.files.get(f1.id), '依頼文').values[0][0] === 'お世話になっています。');
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'inhouse' });
+      await sheetCall();
+
+      // ── 材料 = B (人が直した構成の要撮影) と C (AI の撮影判定)。番号ではなく元の画像で引く ──
+      {
+        const lpEditMod = await import('../lib/lp-edit.js');
+        const idB = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET-B', 'ハッカ油 B', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
+        await call('POST', `/api/drafts/${idB}/shoot-mode`, { mode: 'inhouse' });
+        const blank = { cut: '', composition: '', props: '', background: '', tone: '', ng: '' };
+        const shootJson = JSON.stringify({ recommended: 'inhouse', reason: '2枚目の成分の写真が無い', images: [
+          { no: 0, needs_shoot: false, ...blank }, { no: 1, needs_shoot: false, ...blank },
+          { no: 2, needs_shoot: true, cut: 'AIのカット', composition: 'AIの構図', props: 'AIの小物', background: 'AIの背景', tone: 'AIのトーン', ng: 'AIのNG' }] });
+        // AI の構成: 1枚目の使用素材に「撮影」とあるが、AI の判定は「2枚目だけ要撮影」
+        const jobB = addJob(idB, 'done', lpText, shootJson);
+        const cutsB = () => ssv.shootSheetCutsFor(db, { id: idB });
+        let cb = cutsB();
+        check('撮影指示書の材料: AI の撮影判定があれば、要撮影は AI の needs_shoot (使用素材からの推定より優先)・中身も AI の判定',
+          cb.cuts.length === 1 && cb.cuts[0].lp_image.startsWith('2枚目') && cb.cuts[0].content === 'AIのカット'
+          && cb.cuts[0].finish === 'AIの構図／小物：AIの小物／背景：AIの背景／トーン：AIのトーン' && cb.cuts[0].notice === 'AIのNG', JSON.stringify(cb));
+        // 人が直した構成 (B): 画像を 1 枚足して 2枚目に入れ、AI の 2枚目を 3枚目に。要撮影は足した画像と元の 2枚目
+        const st = lpEditMod.editStateFor(db, { id: idB }, { canEdit: true });
+        check('撮影指示書の材料: (前提) B の構成の一覧が読める', st.available === true && st.slots.length === 3, JSON.stringify(st).slice(0, 300));
+        const [s0, s1, s2] = st.slots;
+        const plain = (x, shoot) => ({ uid: x.uid, role: x.role, title: x.title, copy: x.copy, body: x.body, shoot });
+        const saved = lpEditMod.saveEdit(db, { draft: { id: idB }, baseJobId: jobB, baseEditId: null, actor: 'smoke',
+          slots: [plain(s0, false), plain(s1, false), { uid: 'nNew1', role: '使い方', title: '手元の使い方', copy: '', body: '', shoot: true }, plain(s2, true)] });
+        check('撮影指示書の材料: (前提) B の編集版を保存できる', saved.ok === true, JSON.stringify(saved));
+        cb = cutsB();
+        check('🚨 撮影指示書の材料: 編集版があれば、要撮影は人が直した値 (slots_json の shoot) が正本',
+          cb.cuts.length === 2 && cb.editId === saved.edit_id, JSON.stringify(cb));
+        check('🚨 撮影指示書の材料: 並べ替えた画像には、元の画像 (uid) で AI の判定を引く (今の番号 3枚目 でも AI の 2枚目の中身)',
+          cb.cuts[1]?.lp_image.startsWith('3枚目') && cb.cuts[1]?.content === 'AIのカット' && cb.cuts[1]?.finish.startsWith('AIの構図'), JSON.stringify(cb.cuts[1]));
+        check('🚨 撮影指示書の材料: 足した画像 (AI の判定が無い) はブロックから拾い、AI の別の画像の中身を付けない',
+          cb.cuts[0]?.lp_image.startsWith('2枚目') && cb.cuts[0]?.content !== 'AIのカット' && !String(cb.cuts[0]?.finish).includes('AIの構図'), JSON.stringify(cb.cuts[0]));
+        // 人が「要撮影」を外したら指示書から抜ける (AI が要ると言っていても)
+        const st2 = lpEditMod.editStateFor(db, { id: idB }, { canEdit: true });
+        const saved2 = lpEditMod.saveEdit(db, { draft: { id: idB }, baseJobId: jobB, baseEditId: saved.edit_id, actor: 'smoke',
+          slots: st2.slots.map((x) => plain(x, false)) });
+        cb = cutsB();
+        check('撮影指示書の材料: 人が全部「撮影不要」にしたら、AI が要ると言っていてもカットは 0', saved2.ok === true && cb.cuts.length === 0, JSON.stringify([saved2, cb]));
+        // 画面: 編集版を直したら「更新が要る」(材料の hash)
+        const rB = await sheetFor(idB, {});
+        const st3 = lpEditMod.editStateFor(db, { id: idB }, { canEdit: true });
+        lpEditMod.saveEdit(db, { draft: { id: idB }, baseJobId: jobB, baseEditId: saved2.edit_id, actor: 'smoke', slots: st3.slots.map((x, i) => plain(x, i === 3)) });
+        const pgB = await pageOf(idB);
+        check('画面: LP構成の編集版で要撮影を直したら「撮影指示書を更新」を出す', rB.status === 200 && pgB.includes('id="shoot-sheet-stale"'), JSON.stringify(rB));
+        // AI が構成を作り直している途中 (いちばん新しい依頼が queued) なら、前の構成の AI の判定は使わない
+        // (編集版の要撮影はそのまま効く。中身はブロックから)
+        addJob(idB, 'queued', null);
+        cb = cutsB();
+        check('撮影指示書の材料: AI が作り直している途中なら AI の判定の中身は使わない (編集版の要撮影は効く・中身はブロックから)',
+          cb.cuts.length === 1 && cb.cuts[0].lp_image.startsWith('3枚目') && cb.cuts[0].content !== 'AIのカット' && !String(cb.cuts[0].finish).includes('AIの構図'), JSON.stringify(cb));
+        db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ? AND status = 'queued'`).run(idB);
+        // 編集版は追記専用 (消せない) なので、この商品は残す (ほかの試験は商品コードで引かない)
+      }
+
+      // ── 撮影依頼文のいつもの宛先 (管理者が画面で変える・2026-10-09 中原さん決定) ──
+      const setM = (body) => call('POST', '/api/settings/shoot-mention', body);
+      smokeSession = { email: 'sheet-img@b-faith.biz', displayName: '画像登録者', role: 'user' };
+      const rNotAdmin = await setM({ mention: '@しずおか' });
+      smokeSession = sessionBefore;
+      check('🚨 宛先: いつもの宛先を変えられるのは管理者だけ (画像登録者でも 403・値は変わらない)',
+        rNotAdmin.status === 403 && dbmod.getShootMention(db).value === '@つくば', JSON.stringify(rNotAdmin));
+      const badM = [];
+      for (const body of [{ mention: '@a\n@b' }, { mention: 'x'.repeat(61) }, { mention: 3 }, {}, { mention: '@a\tb' }]) badM.push((await setM(body)).status);
+      check('宛先: 改行・タブ入り・61 文字以上・文字でない・指定なしは 400', badM.every((s) => s === 400) && dbmod.getShootMention(db).source === 'default', JSON.stringify(badM));
+      r = await setM({ mention: '  @しずおか ' });
+      const ev1 = db.prepare(`SELECT * FROM ph_setting_events WHERE key = 'shoot_request_mention' ORDER BY id DESC LIMIT 1`).get() || {};
+      check('宛先: 管理者は変えられる (前後の空白は落とす)・誰がいつ、効いていた値 (既定の @つくば) から何に変えたかを残す',
+        r.status === 200 && r.json?.value === '@しずおか' && r.json?.source === 'db'
+        && ev1.new_value === '@しずおか' && ev1.new_source === 'db' && ev1.old_value === '@つくば' && ev1.old_source === 'default' && !!ev1.actor, JSON.stringify([r, ev1]));
+      r = await setM({ mention: '@しずおか' });
+      check('宛先: 同じ値なら changed=false で記録も増やさない',
+        r.json?.changed === false && db.prepare(`SELECT COUNT(*) c FROM ph_setting_events WHERE key = 'shoot_request_mention'`).get().c === 1);
+      pg = await pageOf();
+      check('画面: 詳細の依頼文の宛先の欄の初期値は、いつもの宛先 (DB の値)',
+        pg.includes('id="shoot-req-mention" value="@しずおか"') && pg.includes('data-mention="@しずおか"'));
+      await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'photographer' });
+      r = await sheetCall();
+      check('撮影指示書: 依頼文のタブの宛先もいつもの宛先 (DB の値)', r.status === 200 && tabOf(g.files.get(f1.id), '依頼文').values[0][0] === '@しずおか');
+      process.env.PH_SHOOT_REQUEST_MENTION = '@env';
+      check('宛先: DB に値があれば env より優先', dbmod.getShootMention(db).value === '@しずおか');
+      r = await setM({ mention: '' });
+      check('宛先: 空にすると宛先の行なし (DB に空として持つ)', r.status === 200 && r.json?.value === '' && r.json?.source === 'db');
+      pg = await pageOf();
+      check('画面: いつもの宛先が空なら欄も空', pg.includes('id="shoot-req-mention" value=""'));
+      r = await setM({ mention: null });
+      check('宛先: null で初期値に戻す (DB に無ければ env → 既定「@つくば」の順は今どおり)・記録は戻した先の実際の値 (env の値)',
+        r.status === 200 && r.json?.value === '@env' && r.json?.source === 'env'
+        && db.prepare(`SELECT new_value, new_source FROM ph_setting_events WHERE key = 'shoot_request_mention' ORDER BY id DESC LIMIT 1`).get()?.new_value === '@env');
+      delete process.env.PH_SHOOT_REQUEST_MENTION;
+      check('宛先: env も無ければ既定「@つくば」', dbmod.getShootMention(db).value === '@つくば' && dbmod.getShootMention(db).source === 'default');
+      process.env.PH_SHOOT_REQUEST_MENTION = '@担当\n【撮影指示書】別の文';
+      check('🚨 宛先: env の値も 1 行・60 文字の検査を通す (複数行なら既定に倒す・名指し5 L)', dbmod.getShootMention(db).value === '@つくば' && dbmod.getShootMention(db).source === 'default');
+      delete process.env.PH_SHOOT_REQUEST_MENTION;
+      check('宛先: 変えた記録が 3 件 (しずおか → 空 → 初期値)',
+        db.prepare(`SELECT COUNT(*) c FROM ph_setting_events WHERE key = 'shoot_request_mention'`).get().c === 3);
+      await setM({ mention: '@しずおか' });
+      const staffPg = await (await fetch(`${base}/staff`)).text();
+      check('画面: 担当者・工程の設定に「いつもの宛先」の欄 (管理者は保存・初期値に戻すボタン)',
+        staffPg.includes('id="shoot-mention-card"') && staffPg.includes('id="shoot-mention-input" value="@しずおか"') && staffPg.includes('id="shoot-mention-save"') && staffPg.includes('id="shoot-mention-reset"'));
+      smokeSession = { email: 'sheet-img@b-faith.biz', displayName: '画像登録者', role: 'user' };
+      const staffPgUser = await (await fetch(`${base}/staff`)).text();
+      smokeSession = sessionBefore;
+      check('画面: 管理者でない人には宛先の欄を触らせない (保存ボタンなし・欄は disabled)',
+        staffPgUser.includes('id="shoot-mention-input" value="@しずおか" maxlength="60" style="max-width:240px;" placeholder="(宛先なし)" disabled') && !staffPgUser.includes('id="shoot-mention-save"'));
+      await setM({ mention: null });
+
+      // ── 画面の JS (偽の DOM) ──
+      const detailSrc = fs.readFileSync(path.join(__dirname, '..', 'views', 'detail.ejs'), 'utf8');
+      const flowChunk = detailSrc.slice(detailSrc.indexOf('/* @image-flow:start'), detailSrc.indexOf('/* @image-flow:end */'));
+      const flow = new Function(flowChunk + '\nreturn { buildShootRequestText, initImageFlow };')();
+      const same = { mention: '@つくば', productName: 'ハッカ油スプレー 100ml', sheetUrl: URL_OF('X1'), folderUrl: FOLDER };
+      check('撮影依頼文: 画面の依頼文 (buildShootRequestText) とスプレッドシートの依頼文 (shootRequestBody) は 1 文字も違わない',
+        flow.buildShootRequestText({ ...same, shootMode: 'photographer' }).text === ssl.shootRequestBody(same)
+        && flow.buildShootRequestText({ ...same, mention: '', shootMode: 'inhouse' }).text === ssl.shootRequestBody({ ...same, mention: '' }));
+      const fakeEl = (init = {}) => {
+        const ls = {};
+        return {
+          value: init.value ?? '', defaultValue: init.value ?? '', textContent: '', disabled: !!init.disabled, dataset: { ...(init.dataset || {}) },
+          addEventListener: (t, fn) => { (ls[t] = ls[t] || []).push(fn); },
+          fire: async (t) => { for (const fn of ls[t] || []) await fn(); },
+          count: (t) => (ls[t] || []).length,
+          getAttribute: () => null, setAttribute: () => {}, removeAttribute: () => {}, classList: { toggle: () => {} }, select() {},
+        };
+      };
+      // 宛先の欄 (その回だけ): 欄の値で依頼文を組み直す。保存はしない (送らない)
+      {
+        const els = {
+          'shoot-req': fakeEl({ dataset: { mention: '@つくば', name: 'ハッカ油' } }), 'shoot-req-text': fakeEl(), 'shoot-req-copy': fakeEl(), 'shoot-req-msg': fakeEl(),
+          'shoot-req-mention': fakeEl({ value: '@つくば' }), 'ip-camera-url': fakeEl({ value: URL_OF('X1') }), 'import-folder-url': fakeEl({ value: FOLDER }),
+          'f-name': fakeEl({ value: 'ハッカ油' }), 'shoot-mode-box': fakeEl({ dataset: { current: 'photographer' } }),
+        };
+        const doc = { getElementById: (id) => els[id] || null, querySelectorAll: () => [] };
+        const posts = []; const copied = [];
+        flow.initImageFlow(doc, { base: '/b', post: async (u, b) => { posts.push([u, b]); return { ok: true }; }, showAndReload: () => {},
+          clipboard: { writeText: (t) => { copied.push(t); return Promise.resolve(); } }, confirm: () => true });
+        check('画面の JS: 依頼文の 1 行目は宛先の欄の値', els['shoot-req-text'].value.split('\n')[0] === '@つくば');
+        els['shoot-req-mention'].value = '@しずおか';
+        await els['shoot-req-mention'].fire('input');
+        check('画面の JS: 宛先の欄を直すと、その場で依頼文の宛先が変わる', els['shoot-req-text'].value.split('\n')[0] === '@しずおか' && !els['shoot-req-text'].value.includes('@つくば'));
+        await els['shoot-req-copy'].fire('click');
+        await new Promise((res) => setTimeout(res, 0));
+        check('画面の JS: コピーするのは直した宛先の依頼文・宛先は保存しない (何も送らない)', copied.length === 1 && copied[0].startsWith('@しずおか\n') && posts.length === 0);
+        els['shoot-req-mention'].value = '   ';
+        await els['shoot-req-mention'].fire('input');
+        check('画面の JS: 宛先の欄を空にすると宛先の行なし', els['shoot-req-text'].value.startsWith('お世話になっています。'));
+        check('画面の JS: 宛先の欄の処理は 1 つだけ', els['shoot-req-mention'].count('input') === 1);
+      }
+      // 撮影指示書のボタン (@shoot-sheet)
+      const sheetChunk = detailSrc.slice(detailSrc.indexOf('/* @shoot-sheet:start'), detailSrc.indexOf('/* @shoot-sheet:end */'));
+      check('画面の JS: 撮影指示書の部分を切り出せる (EJS の値を含まない)', sheetChunk.length > 200 && !sheetChunk.includes('<%'));
+      const initShootSheet = new Function(sheetChunk + '\nreturn initShootSheet;')();
+      const mkSheetUi = ({ ours = false, cam = '', camNow = cam, replies = [], answers = [], mention } = {}) => {
+        const els = { 'shoot-sheet': fakeEl({ dataset: { ours: ours ? '1' : '0', seenUrl: ours ? 'https://docs.google.com/spreadsheets/d/F0/edit' : '', fileId: ours ? 'F0' : '' } }), 'shoot-sheet-btn': fakeEl(), 'shoot-sheet-msg': fakeEl(), 'ip-camera-url': fakeEl({ value: cam }) };
+        if (mention !== undefined) els['shoot-req-mention'] = fakeEl({ value: mention });
+        els['ip-camera-url'].value = camNow;
+        const st = { posts: [], reloads: [], asked: [], gate: null };
+        const doc = { getElementById: (id) => els[id] || null };
+        const api = initShootSheet(doc, {
+          base: '/apps/product-hub/api/drafts/9',
+          post: async (u, b) => { st.posts.push([u, b]); if (st.gate) await st.gate; const x = replies.shift(); if (x instanceof Error) throw x; return x || { ok: true, created: true }; },
+          showAndReload: (j, m) => st.reloads.push([j, m]),
+          confirm: (m) => { st.asked.push(m); return answers.length ? answers.shift() : true; },
+        });
+        return { els, st, api };
+      };
+      {
+        const u = mkSheetUi({ replies: [{ ok: true, created: true, url: URL_OF('N1') }] });
+        let open; u.st.gate = new Promise((res) => { open = res; });
+        const p1 = u.els['shoot-sheet-btn'].fire('click');
+        await new Promise((res) => setTimeout(res, 0));
+        check('画面の JS: 押すと POST /shoot-sheet を 1 回送り、終わるまでボタンを押せなくして「作成しています…」',
+          u.st.posts.length === 1 && u.st.posts[0][0] === '/apps/product-hub/api/drafts/9/shoot-sheet' && JSON.stringify(u.st.posts[0][1]) === '{"seen_url":""}'
+          && u.els['shoot-sheet-btn'].disabled === true && /作成しています/.test(u.els['shoot-sheet-msg'].textContent));
+        // 2 回目は待たずに様子を見る (押せてしまう実装でも試験が止まらないように)
+        const p2 = u.els['shoot-sheet-btn'].fire('click');
+        await new Promise((res) => setTimeout(res, 0));
+        check('🚨 画面の JS: 作っている間にもう一度押しても送らない (二重押し)', u.st.posts.length === 1, u.st.posts.length);
+        open(); await p1; await p2;
+        check('画面の JS: できたら読み直す (読み直すと URL の欄・依頼文に作った URL が入る)', u.st.reloads.length === 1 && u.st.reloads[0][0].ok === true && /作りました/.test(u.st.reloads[0][1]));
+        check('画面の JS: 作成では上書きの確認を出さない', u.st.asked.length === 0);
+      }
+      {
+        const u = mkSheetUi({ replies: [{ ok: false, code: 'google', error: '書き込みの権限がありません' }] });
+        await u.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 失敗したら理由を出してボタンを戻す (読み直さない)',
+          u.els['shoot-sheet-msg'].textContent === '作れませんでした: 書き込みの権限がありません' && u.els['shoot-sheet-btn'].disabled === false && u.st.reloads.length === 0);
+        const u2 = mkSheetUi({ replies: [new Error('net')] });
+        await u2.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 通信できなかったときも理由を出してボタンを戻す', /通信できませんでした/.test(u2.els['shoot-sheet-msg'].textContent) && u2.els['shoot-sheet-btn'].disabled === false);
+      }
+      {
+        const u = mkSheetUi({ ours: true, answers: [false] });
+        await u.els['shoot-sheet-btn'].fire('click');
+        check('🚨 画面の JS: 更新は「スプレッドシートで直した内容は消えます」と確かめ、やめたら送らない',
+          u.st.asked.length === 1 && /直した内容は消えます/.test(u.st.asked[0]) && u.st.posts.length === 0);
+        const u2 = mkSheetUi({ ours: true, replies: [{ ok: true, created: false }] });
+        await u2.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 確かめて更新できたら「更新しました」で読み直す', u2.st.posts.length === 1 && /更新しました/.test(u2.st.reloads[0]?.[1] || ''));
+        check('🚨 画面の JS: 更新では、開いたときの URL と、確かめたファイル (overwrite_file_id) を添える',
+          u2.st.posts[0][1].seen_url === 'https://docs.google.com/spreadsheets/d/F0/edit' && u2.st.posts[0][1].overwrite_file_id === 'F0', JSON.stringify(u2.st.posts));
+      }
+      {
+        const u = mkSheetUi({ mention: '@その回', replies: [{ ok: false, code: 'manual_url', manual_url: 'https://h1', error: '手で貼ったものが入っています。置き換えますか？' }, { ok: true, created: false }], answers: [true] });
+        await u.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 手で貼った URL があると言われたら確かめて、確かめた URL (replace_manual_url) と同じ宛先を添えて送り直す',
+          u.st.asked[0] === '手で貼ったものが入っています。置き換えますか？' && u.st.posts.length === 2 && u.st.posts[1][1].replace_manual_url === 'https://h1'
+          && u.st.posts[1][1].mention === '@その回' && u.st.reloads.length === 1, JSON.stringify(u.st.posts));
+        check('画面の JS: 作るときは画面の宛先の欄 (その回だけ) の値を送る', u.st.posts[0][1].mention === '@その回');
+        const ur = mkSheetUi({ replies: [{ ok: false, code: 'recovered_file', file_id: 'F1', error: '前に作りかけた撮影指示書があります。上書きしますか？' }, { ok: true, created: false }], answers: [true] });
+        await ur.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 前に作りかけた撮影指示書があると言われたら確かめて、そのファイルの ID (overwrite_file_id) を添えて送り直す',
+          ur.st.asked[0].includes('上書きしますか') && ur.st.posts.length === 2 && ur.st.posts[1][1].overwrite_file_id === 'F1' && ur.st.reloads.length === 1, JSON.stringify(ur.st.posts));
+        const ur2 = mkSheetUi({ replies: [{ ok: false, code: 'recovered_file', file_id: 'F1', error: '上書きしますか？' }], answers: [false] });
+        await ur2.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 上書きをやめたら送り直さない', ur2.st.posts.length === 1 && /やめました/.test(ur2.els['shoot-sheet-msg'].textContent));
+        const u2 = mkSheetUi({ replies: [{ ok: false, code: 'manual_url', error: '置き換えますか？' }], answers: [false] });
+        await u2.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 置き換えをやめたら送り直さず「やめました」', u2.st.posts.length === 1 && /やめました/.test(u2.els['shoot-sheet-msg'].textContent) && u2.els['shoot-sheet-btn'].disabled === false);
+      }
+      {
+        const u = mkSheetUi({ cam: '', camNow: 'https://docs.google.com/spreadsheets/d/typed/edit', answers: [false] });
+        await u.els['shoot-sheet-btn'].fire('click');
+        check('🚨 画面の JS: 指示書の URL に保存していない入力があれば確かめ、やめたら送らない (打った URL を残す)',
+          u.st.asked.length === 1 && /保存していない入力/.test(u.st.asked[0]) && u.st.posts.length === 0 && u.els['ip-camera-url'].value.includes('typed'));
+        const u2 = mkSheetUi({ cam: '', camNow: 'https://docs.google.com/spreadsheets/d/typed/edit', replies: [{ ok: false, error: 'x' }] });
+        await u2.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 作れなかったときは打った URL を消さない', u2.els['ip-camera-url'].value.includes('typed'));
+        const u3 = mkSheetUi({ cam: '', camNow: 'https://docs.google.com/spreadsheets/d/typed/edit', replies: [{ ok: true, created: true }] });
+        await u3.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 作れたら打っていた URL は元に戻す (読み直しで未保存として戻さない)', u3.els['ip-camera-url'].value === '' && u3.st.reloads.length === 1);
+      }
+      {
+        const u = mkSheetUi();
+        u.els['shoot-sheet-btn'].disabled = true;
+        await u.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 押せない状態 (作れない理由あり) のボタンは送らない・処理は 1 つだけ', u.st.posts.length === 0 && u.els['shoot-sheet-btn'].count('click') === 1);
+      }
+
+      ssv.__setShootSheetClientsForTest(null);
+      wf.setStaffActive(ssNoRole, false);
+      wf.setStaffActive(ssImg, false);
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idS);
+    }
+
     // 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。工程は動かさず、印と履歴だけ残す
     const idCmp = Number(db.prepare(`
       INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-COMPOSE-API', '構成API', 'smoke')
@@ -10216,6 +10972,8 @@ const staffBase = {
   overview: wf.workflowOverview(),
   staffKinds: dbmod.STAFF_KINDS, staffColors: dbmod.STAFF_COLORS,
   myEmail: 'tanaka@b-faith.biz',
+  // 撮影依頼文のいつもの宛先 (2026-10-09)。router は常に渡す
+  shootMention: { value: '@つくば', source: 'default', initial: '@つくば', initialSource: 'default', updatedAt: null, updatedBy: null },
 };
 renders.push(
   ['staff.ejs (admin)', 'staff.ejs', { ...staffBase, isAdmin: true }],
@@ -10746,6 +11504,8 @@ for (const [name, file, data] of renders) {
         imageFlow: { shootModes: dbmod.SHOOT_MODES, mention: '@つくば' },
         // LP構成の確認・修正 (2026-10-09 PR-B)。router は詳細画面に常に渡す。既定 = 構成がまだ無い (一覧は隠れる)
         lpEdit: { ok: true, available: false, can_edit: false, max_images: 10, min_images: 2, reason: 'LP構成がまだできていません' },
+        // 撮影指示書の自動作成 (2026-10-09 PR-D): router は詳細画面に常に渡す。既定 = まだ作っていない・作れない (撮影判定なし)
+        shootSheet: { ours: false, url: null, manualUrl: null, at: null, by: null, stale: false, blocked: '撮影判定が「社内撮影」か「カメラマン撮影」のときに作れます', cutsCount: 0, cutLabels: [], source: 'none' },
         // 📄 LP構成の仕様書の取り込みカード (段階1・PR1-e)。router は一覧画面に常に渡す。
         // 既定 = 機能オン・いまの版あり (admin に出る形)。機能オフ・未取込の見え方は
         // 「index.ejs (LP仕様書: 機能オフ)」「(まだ取り込まれていない)」の fixture で上書きする

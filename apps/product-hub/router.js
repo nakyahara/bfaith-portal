@@ -23,6 +23,9 @@ import {
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
+// 撮影指示書 (スプレッドシート) の自動作成と、撮影依頼文のいつもの宛先 (2026-10-09 画像制作の新フロー PR-D)
+import { getShootMention, setShootMention, normalizeShootMention } from './db.js';
+import { createOrUpdateShootSheet, shootSheetStateFor } from './services/shoot-sheet-service.js';
 // 夜間自動化 (2026-08-28): 人の確認待ち + 文字数ガード
 import {
   validateAiOutputLength, GENERATION_BLOCK_CODES, GENERATION_BLOCK_REASON_MAX,
@@ -554,17 +557,19 @@ router.get('/detail/:id', (req, res) => {
     // LP構成の確認・修正 (2026-10-09 PR-B)。直せるのは画像制作情報を触れる人だけ (見るのは誰でも)
     lpEdit: lpEditStateFor(db, draft, { canEdit: canEditImageProduction(req), imageLimit: lpImageLimitForPriority(draft.image_priority) }),
     // 画像制作の新フロー (2026-10-08): 撮影判定の 3 択と、撮影依頼文の宛先
-    imageFlow: { shootModes: SHOOT_MODES, mention: shootRequestMention() },
+    imageFlow: { shootModes: SHOOT_MODES, mention: shootRequestMention(db) },
+    // 撮影指示書 (スプレッドシート) の自動作成 (2026-10-09 PR-D): ボタンの出し分けと「LP構成が変わりました」
+    shootSheet: shootSheetStateFor(db, draft, imageProduction),
   });
 });
 
 /**
- * 撮影依頼文の 1 行目 (宛先)。2026-10-08 スタッフのラフは「@つくば」。
- * env PH_SHOOT_REQUEST_MENTION で変えられる (空にすると宛先の行を入れない)
+ * 撮影依頼文の 1 行目 (いつもの宛先)。2026-10-08 スタッフのラフは「@つくば」。
+ * 2026-10-09〜 管理者が「担当者・工程の設定」で変える (DB)。DB に値が無ければ env PH_SHOOT_REQUEST_MENTION → 既定「@つくば」。
+ * 空にすると宛先の行を入れない。詳細画面ではその回だけ欄で直せる (保存はしない)
  */
-function shootRequestMention(env = process.env) {
-  if (env.PH_SHOOT_REQUEST_MENTION === undefined) return '@つくば';
-  return String(env.PH_SHOOT_REQUEST_MENTION).trim().slice(0, 60);
+function shootRequestMention(db = getDB()) {
+  return getShootMention(db).value;
 }
 
 // ─── API: ドラフト作成/更新 ───────────────────────────────
@@ -1455,6 +1460,22 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (urlVal && !isHttpUrl(urlVal)) {
     return res.status(400).json({ ok: false, error: '撮影指示URLの形式が不正です (http/https)' });
   }
+  // 指示書の URL を変える保存は、画面が見ていた値 (camera_instruction_url_expected) が要る。今の値と違えば 409。
+  // 別のタブで撮影指示書を自動で作った (PR-D) 後に、古い画面の値で戻さない (Codex PR-D 名指し2/3 M)。
+  // 値が変わらない保存 (今と同じ URL を送ってきた) は添えなくても通す。比べるのは保存と同じトランザクションの中 (名指し8 M)
+  const hasCamExp = Object.prototype.hasOwnProperty.call(b, 'camera_instruction_url_expected');
+  if (urlVal !== undefined && hasCamExp && typeof b.camera_instruction_url_expected !== 'string') {
+    return res.status(400).json({ ok: false, error: 'camera_instruction_url_expected は文字で指定してください' });
+  }
+  const cameraUrlConflict = () => {
+    if (urlVal === undefined) return null;
+    const nowUrl = String(db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.camera_instruction_url || '').trim();
+    if (String(urlVal || '').trim() === nowUrl) return null;
+    if (!hasCamExp) return '画面が古いので撮影指示書の URL を保存できません。画面を読み直してから保存してください';
+    if (nowUrl !== b.camera_instruction_url_expected.trim()) return 'ほかの人 (または別の画面) が撮影指示書の URL を変えています (撮影指示書を作った など)。画面を読み直してから保存してください';
+    return null;
+  };
+  { const msg = cameraUrlConflict(); if (msg) return res.status(409).json({ ok: false, error: msg }); }
   const canvaVal = b.canva_url !== undefined ? cleanText(b.canva_url, 1000) : undefined;
   if (canvaVal && !isHttpUrl(canvaVal)) {
     return res.status(400).json({ ok: false, error: 'CanvaリンクのURL形式が不正です (http/https)' });
@@ -1532,6 +1553,8 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   // 保存・台帳同期・イベントを 1 トランザクションに (途中終了で product-hub だけ更新される状態を作らない — Codex PR1 R1 H1)
   try {
   db.transaction(() => {
+  // 先に見た後で変わっていないか (別のプロセスが撮影指示書を記録した直後など)。変わっていれば保存しない
+  { const msg = cameraUrlConflict(); if (msg) throw Object.assign(new Error(msg), { code: 'camera_url_conflict' }); }
   upsertImageProduction(db, draft.id, {
     status: clean(b.status, 100),
     importance_tier: clean(b.importance_tier, 100),
@@ -1563,6 +1586,7 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   logEvent(db, draft.id, 'image_production_updated', changedLabels.length ? `${changedLabels.join('・')}を更新` : null, actorOf(req));
   })();
   } catch (e) {
+    if (e?.code === 'camera_url_conflict') return res.status(409).json({ ok: false, error: e.message });
     console.error('[product-hub] image-production save failed (rolled back):', e);
     return res.status(500).json({ ok: false, error: '保存できませんでした (商品リンク台帳への同期で失敗。Render ログを確認してください)' });
   }
@@ -1634,6 +1658,53 @@ router.post('/api/drafts/:id/shoot-mode', (req, res) => {
     throw e;
   }
   res.json({ ok: true, changed: r.changed, shoot_mode: mode, material_status: r.material_status });
+});
+
+// 撮影指示書 (スプレッドシート) を作る / 上書きする (2026-10-09 画像制作の新フロー PR-D・設計 §3.4)。
+// 撮影判定が 社内撮影 / カメラマン撮影 で、画像フォルダがあるときだけ。無ければ作り、あれば同じファイルを上書き (URL は変えない)。
+// できたときだけ URL を撮影指示書の欄 (camera_instruction_url) に入れる = ボードの「撮影指示書 済」がそのまま動く。
+// 材料 (カット) はサーバが LP構成から組む (shootSheetCutsFor)。呼び手からは受けない (cuts を送ると 400)。
+// body: { mention?: '宛先' (画面のその回だけの宛先。依頼文のタブに入れる。省略ならいつもの宛先),
+//         replace_manual_url?: 'URL' (手で貼った URL を置き換えてよいと確かめたときの、その URL。今の URL と同じときだけ置き換える),
+//         overwrite_file_id?: 'ID' (既にある撮影指示書を上書きしてよいと確かめたときの、そのファイルの ID。上書きには必ず要る),
+//         seen_url: 'URL' (必須。画面を開いたときの撮影指示書の URL・無ければ空。今と違えば 409) }
+router.post('/api/drafts/:id/shoot-sheet', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '撮影指示書を作れるのは 画像登録者・画像作成承認者 の担当者か管理者だけです' });
+  }
+  const b = req.body || {};
+  // 正本の LP構成と違う中身を書かせない (古い画面・直接の呼び出し — Codex PR-D 名指し3 M)
+  if (b.cuts !== undefined) {
+    return res.status(400).json({ ok: false, error: '撮影指示書の中身 (cuts) は送れません。LP構成から作ります (LP構成を直してから押してください)' });
+  }
+  // 宛先はいつもの宛先と同じ検査 (1 行・60 文字まで)。null / 省略はいつもの宛先
+  let mention = null;
+  if (b.mention !== undefined && b.mention !== null) {
+    const m = normalizeShootMention(b.mention);
+    if (m.error) return res.status(400).json({ ok: false, error: m.error });
+    mention = m.value;
+  }
+  if (b.replace_manual_url !== undefined && b.replace_manual_url !== null && (typeof b.replace_manual_url !== 'string' || b.replace_manual_url.length > 1000)) {
+    return res.status(400).json({ ok: false, error: 'replace_manual_url は置き換える URL (文字) で指定してください' });
+  }
+  if (b.overwrite_file_id !== undefined && b.overwrite_file_id !== null && (typeof b.overwrite_file_id !== 'string' || !/^[A-Za-z0-9_-]{5,200}$/.test(b.overwrite_file_id))) {
+    return res.status(400).json({ ok: false, error: 'overwrite_file_id はファイルの ID で指定してください' });
+  }
+  // 画面を開いたときの撮影指示書の URL (必須)。今と違えば 409 (古い画面から押した)
+  if (typeof b.seen_url !== 'string' || b.seen_url.length > 1000) {
+    return res.status(400).json({ ok: false, error: 'seen_url (画面を開いたときの撮影指示書の URL。無ければ空) を指定してください' });
+  }
+  const r = await createOrUpdateShootSheet(draft.id, {
+    mention, actor: actorOf(req), replaceManualUrl: typeof b.replace_manual_url === 'string' ? b.replace_manual_url.trim() : null,
+    overwriteFileId: typeof b.overwrite_file_id === 'string' ? b.overwrite_file_id : null, seenUrl: b.seen_url,
+  });
+  if (!r.ok) {
+    return res.status(r.status || 500).json({ ok: false, code: r.code, error: r.error,
+      ...(r.manual_url ? { manual_url: r.manual_url } : {}), ...(r.file_id ? { file_id: r.file_id } : {}) });
+  }
+  res.json(r);
 });
 
 // 本番の構成の 済 / まだ (2026-09-13 スタッフ要望)。縦列 ②仮構成 (imgd_compose) とは別に持つ —
@@ -3215,7 +3286,25 @@ router.get('/staff', (req, res) => {
     staffKinds: STAFF_KINDS,
     staffColors: STAFF_COLORS,
     myEmail: (req.session?.email || '').toLowerCase(),
+    // 撮影依頼文のいつもの宛先 (2026-10-09)。変えられるのは管理者だけ
+    shootMention: getShootMention(getDB()),
   });
+});
+
+// 撮影依頼文のいつもの宛先を変える (2026-10-09 中原さん決定)。管理者だけ。
+// body: { mention: '文字' (空文字 = 宛先の行なし) | null (初期値 = env / 既定「@つくば」に戻す) }
+router.post('/api/settings/shoot-mention', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  if (!req.body || !Object.prototype.hasOwnProperty.call(req.body, 'mention')) {
+    return res.status(400).json({ ok: false, error: 'mention を指定してください (初期値に戻すときは null)' });
+  }
+  try {
+    const r = setShootMention(getDB(), req.body.mention, { actor: actorOf(req) });
+    res.json({ ok: true, changed: r.changed, ...getShootMention(getDB()) });
+  } catch (e) {
+    if (e?.status === 400) return res.status(400).json({ ok: false, error: e.message });
+    throw e;
+  }
 });
 
 router.post('/api/staff', (req, res) => {
