@@ -24,6 +24,12 @@
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
  *   POST /api/sku/:code/card-retry  カードの取り込みをもう一度 (名簿の人・衝突 / 失敗の知らせも試す)
  *   POST /api/sku/:code/card-link   衝突を解く = 既存のカード (同じ商品コード) をこの商品に結ぶ (名簿の人。PR #1566 R1 M6)
+ *   ── 発注の設定 (10/9・発注アプリの po_* に書く・apps/master-edit/order-settings.mjs → apps/purchase-orders/order-settings.js の 1 つの部品) ──
+ *   POST /api/new の order_settings = { order_lot?, condition_id?, material_group_id?, capacity_per_unit?, case_group?, case_lot?, new_condition?, new_material? } (単品だけ):
+ *        ① の前に形・グループ・代表の仕入先を確かめる (誤り = 400 / 409・何も書かない) → ① Company DB の登録 → 通ったら ② 発注アプリに書く。
+ *        ② だけ失敗 = 登録は成功のまま・応答の order_settings = { ok: false, error } (画面は「商品の画面で入れてください」)。同じ request_id のやり直しでも ② をもう一度 (同じ値の上書き)
+ *   POST /api/sku/:code/order-settings  商品の画面の「発注の設定を保存」{ request_id, seen: { updated_at }, values: {...} } (Company DB の保存とは別・開いたときの印が違えば 409)
+ *   書ける人 = 名簿 (MASTER_EDITORS) かつ 発注アプリの利用権。Company DB の切替の門は見ない (発注アプリのマスタ管理と同じく、いつでも)
  *   ── Amazon SKU の対応 (⑦-1・0054・Company DB構想 16。保存を開く門は上と同じ + 持ち主 listing_components.amazon が 'company') ──
  *   GET  /amazon/            一覧 (Company DB の対応・墓標も)。?q=&state=&offset=
  *   GET  /amazon/sku?sku=    1 つの seller SKU (見る・直す・墓標にする・墓標から戻す)。対応が無ければ「新しい対応」(今の構成は夜間ロードの写しとして見せる)
@@ -67,6 +73,8 @@ import { readSalesRun, readSalesSku } from './sales-qty.mjs';
 import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
+import { writeOrderSettings, writeRegistrationOrderSettings, registrationOrderDone, OrderSettingsError } from '../purchase-orders/order-settings.js';
+import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody } from './order-settings.mjs';
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
@@ -194,6 +202,9 @@ async function applyCard(ev) {
   const m = await import('../product-hub/services/cdb-card-intake.js');
   return m.applyCdbCardEvent(ev);
 }
+/** 発注の設定の書き込み (新商品の登録の ② = Company DB の登録の後)。本番 = 発注アプリの部品 (request_id で 1 回だけ)。試験は差し替える (② だけ失敗する) */
+let orderWriter = writeRegistrationOrderSettings;
+export function __setOrderWriter(fn) { orderWriter = fn || writeRegistrationOrderSettings; }
 /** 衝突を解く (既存のカードに結ぶ)。本番 = cdb-card-intake.js の linkCdbCardToExisting。試験は差し替える */
 let cardLinker = null;
 export function __setCardLinker(fn) { cardLinker = fn || null; }
@@ -526,6 +537,8 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
       || (!(page && page.backfillDone) ? '切替の手順の「既存の商品の登録の状態 (backfill)」がまだ' : ''),
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     yahooDeliveries: Object.values(SHIPPING_METHOD_GROUPS), setPlanChoices: SET_PLAN_CHOICES, setDecisionReasons: SET_DECISION_REASONS,
+    // 発注の設定 (発注アプリ・単品だけ。発注アプリはセットを扱わない)
+    orderSettings: kind === 'single' ? orderScreen(req, editorGate(req), null) : null,
   });
 }));
 
@@ -551,6 +564,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   res.render(view('sku.ejs'), {
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null, extras,
+    // 発注の設定 (発注アプリ・単品だけ)。発注条件グループは代表の仕入先のものだけ選べる
+    orderSettings: page && page.cur.sku_kind === 'single' ? orderScreen(req, editorGate(req), page.cur.code, { supplier: page.cur.primary_supplier || null }) : null,
   });
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -577,18 +592,80 @@ router.post('/api/new', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
   const b = req.body || {};
+  // 発注の設定 (発注アプリ): ① Company DB の登録の前に全部確かめる (グループがあるか・代表の仕入先のグループか・新しいグループの ID など)。
+  //   誤り = ここで断る (Company DB にも発注アプリにも何も書かない)。確かめは発注アプリの部品の dry-run = 書くときと同じ決まり
+  let order = null;
+  let orderInput = null;
+  try { order = orderInputOf(b.order_settings); } catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
+  if (order) {
+    if (b.kind !== 'single') return res.status(400).json({ ok: false, error: 'セットには発注の設定がありません (発注アプリはセットを扱わず、構成品で発注します)', reason: 'order_settings_set', field: 'order_settings' });
+    const og = orderWriteGate(req, gate);
+    if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason, field: 'order_settings' });
+    orderInput = { code: b.code, ...order, supplierCode: b.values && b.values.primary_supplier != null ? b.values.primary_supplier : null,
+      actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id };
+    // ② がもう済んだ request_id (やり直し) = 前の結果を返すだけなので確かめない。まだ = 形・グループ・仕入先を確かめる (印 = validate-only・書かない)
+    try { if (!registrationOrderDone(b.request_id)) writeOrderSettings({ ...orderInput, via: 'master-edit:new', seen: 'validate-only' }, { dryRun: true }); }
+    catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
+  }
   return withPgApi(res, async (db) => {
     const r = await registerNewSku(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined });
+    // ② 発注アプリに書く (① が通った後だけ = 登録の誤りはここに来ない)。同じ request_id のやり直し (replayed) でももう一度 (同じ値の上書き = 何度でも同じ)。
+    //   失敗しても登録は成功のまま (outbox は使わない = 10/9 中原さん Q4 a)。画面は「商品の画面で入れてください」
+    let orderResult = null;
+    if (orderInput) {
+      try {
+        const w = orderWriter({ ...orderInput, code: r.code || b.code });
+        orderResult = { ok: true, changed: !!w.changed, created: w.created || null, replayed: !!w.replayed };
+      } catch (e) {
+        console.error(`[master-edit] 発注の設定だけ保存できなかった (${b.code}): ${e && e.message}`);
+        const already = e instanceof OrderSettingsError && e.reason === 'stale';
+        orderResult = { ok: false, reason: (e && e.reason) || 'error',
+          error: already ? 'この商品の発注の設定は発注アプリにもう作られていました (ほかの画面)。上書きしていません。商品の画面で確かめてください'
+            : e instanceof OrderSettingsError ? e.message : '発注アプリに書けませんでした' };
+      }
+    }
     // カードは保存の後で 1 回だけ試す (同じ取引ではない = 失敗しても登録はできている。ボードを開いたとき・「もう一度」で続きを)
     let card = r.card || null;
     if (card && card.status !== 'done') {
       const t = await tryCard(db, { eventId: card.event_id });
       if (t) card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null };
     }
-    res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null });
+    res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null, ...(orderInput ? { order_settings: orderResult } : {}) });
   }, 'write');
+});
+
+/**
+ * 商品の画面の「発注の設定を保存」(発注アプリに書く。Company DB の保存とは別)。
+ * 本文 = { request_id?, seen: { updated_at (開いたときの印・行が無かった = null) }, values: { order_lot, condition_id, ... , new_condition?, new_material? } }
+ * 商品は Company DB で確かめる (ある・単品・代表の仕入先 = 発注条件グループはその仕入先のものだけ)。読むだけの接続
+ */
+router.post('/api/sku/:code/order-settings', (req, res) => {
+  const gate = editorGate(req);
+  const og = orderWriteGate(req, gate);
+  if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason });
+  const b = req.body || {};
+  let order;
+  try { order = orderInputOf(b.values == null ? {} : b.values, { allowEmpty: true }); }
+  catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
+  return withPgApi(res, async (db) => {
+    const sku = (await db.query(`select s.code, s.sku_kind, (select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id
+         where x.sku_id = s.sku_id and x.is_primary order by sp.code limit 1) as primary_supplier
+       from core.skus s where s.company_id = 1 and s.code_norm = core.norm_code($1)`, [String(req.params.code || '')])).rows[0];
+    if (!sku) return res.status(404).json({ ok: false, error: `商品コード ${req.params.code} は Company DB にありません` });
+    if (sku.sku_kind !== 'single') return res.status(400).json({ ok: false, error: '発注の設定は単品だけです (発注アプリはセットを扱わず、構成品で発注します)', reason: 'order_settings_set' });
+    try {
+      const w = writeOrderSettings({ code: sku.code, ...order, seen: b.seen, supplierCode: sku.primary_supplier ?? null,
+        actor: String(req.session.email).trim().toLowerCase(), via: 'master-edit:sku', requestId: b.request_id ?? null });
+      const row = w.row ? { order_lot: w.row.order_lot, condition_id: w.row.condition_id, material_group_id: w.row.material_group_id, capacity_per_unit: w.row.capacity_per_unit,
+        case_group: w.row.case_group, case_lot: w.row.case_lot, updated_at: w.row.updated_at } : null;
+      res.json({ ok: true, changed: w.changed, row, created: w.created });
+    } catch (e) {
+      if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e));
+      throw e;
+    }
+  });
 });
 
 router.post('/api/sku/:code/card-retry', (req, res) => {

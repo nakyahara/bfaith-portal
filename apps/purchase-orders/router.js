@@ -40,6 +40,9 @@ import { computeShortageRisk, shortageSettings, validateShortageSetting, shortag
 import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 import { startFbaAutoRefresh, nextBusinessDay9Jst } from './scheduler.js';
 import { masterLegacyGate, legacyRecheck } from '../../lib/master-legacy-gate.mjs';
+import {
+  writeOrderSettings, clearProductLinks, writeGroup, deleteGroup, OrderSettingsError, ATTR_FIELDS, hasLinkage, orderLotSource,
+} from './order-settings.js';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
@@ -2577,7 +2580,15 @@ const DELETE_REF_CHECKS = {
   },
 };
 
-// アコーディオンからのグループ紐付け (既存attrsの容量/ケース等を保持したまま条件/原料だけ更新)
+/** 発注の設定の部品 (order-settings.js) の誤り → 応答 (400 / 409 stale・group_id_taken / 428 seen_required)。それ以外は 500 */
+function sendOrderSettingsError(res, e) {
+  if (e instanceof OrderSettingsError) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, ...e.extra });
+  console.error('[purchase-orders] 発注の設定の書き込みエラー:', e && e.stack || e);
+  return res.status(500).json({ ok: false, error: e && e.message || 'サーバーエラー' });
+}
+
+// アコーディオンからのグループ紐付け (既存attrsの容量/ケース等を保持したまま条件/原料だけ更新)。
+// 書き込みは order-settings.js の 1 つの部品 (マスタの入力と同じ確かめ・記録)。seen.fields = 画面が見ていた紐付け (その間にほかの人が直していたら 409)
 router.post('/api/attrs/bind', (req, res) => {
   try {
     const b = req.body || {};
@@ -2588,21 +2599,12 @@ router.post('/api/attrs/bind', (req, res) => {
     if (!loadPml().rows.some(r => normProductCode(r['商品コード']) === key)) {
       return res.status(400).json({ ok: false, error: `商品がPMLに存在しません: ${code}` });
     }
-    const db = getDB();
-    const cur = db.prepare('SELECT * FROM po_product_attrs WHERE product_key=?').get(key) || {};
-    const row = {
-      product_key: key, product_code: cur.product_code || code,
-      condition_id: 'condition_id' in b ? (trimS(b.condition_id) || null) : (cur.condition_id || null),
-      material_group_id: 'material_group_id' in b ? (trimS(b.material_group_id) || null) : (cur.material_group_id || null),
-      capacity_per_unit: cur.capacity_per_unit != null ? cur.capacity_per_unit : null,
-      case_group: cur.case_group || null,
-      case_lot: cur.case_lot != null ? cur.case_lot : null,
-    };
-    const err = MASTER_DEFS.attrs.validate(row);
-    if (err) return res.status(400).json({ ok: false, error: err });
-    upsertMasterRow(MASTER_DEFS.attrs, row);
-    res.json({ ok: true, row });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+    const patch = {};
+    if ('condition_id' in b) patch.condition_id = b.condition_id;
+    if ('material_group_id' in b) patch.material_group_id = b.material_group_id;
+    const r = writeOrderSettings({ code, patch, seen: b.seen, actor: actorOf(req), via: 'po-bind' });
+    res.json({ ok: true, row: r.row });
+  } catch (e) { sendOrderSettingsError(res, e); }
 });
 
 function upsertMasterRow(def, row) {
@@ -2642,20 +2644,26 @@ router.get('/api/masters/:kind', (req, res) => {
       const out = [];
       for (const [key, { r, active }] of pmlByKey) {
         const a = byKey.get(key);
-        if (!a && !active) continue; // 未紐付け×取扱中止はノイズなので出さない (紐付け済みなら残す)
+        // 未紐付け×取扱中止はノイズなので出さない (紐付け済みなら残す)。発注ロットだけの行 (NE から写した) は紐付けではない
+        if (!hasLinkage(a) && !active) continue;
         out.push({
           product_key: key, product_code: a ? a.product_code : String(r['商品コード']).trim(),
+          order_lot: a ? a.order_lot : null,
           condition_id: a ? a.condition_id : null, material_group_id: a ? a.material_group_id : null,
           capacity_per_unit: a ? a.capacity_per_unit : null, case_group: a ? a.case_group : null,
           case_lot: a ? a.case_lot : null,
           商品名: r['商品名'] || '', 仕入先名: supName.get(normSupplierCode(r['仕入先'])) || '',
-          linked: !!a, active,
+          linked: hasLinkage(a), active,
+          // 保存のときに送る「開いたときの印」(行が無い = null = まだ無いこと。その間にほかの人が作った・直した = 409)
+          updated_at: a ? a.updated_at : null,
         });
       }
-      // attrsにあるがPMLに無い商品 (コード改廃等) も消さずに出す
+      // attrsにあるがPMLに無い商品 (コード改廃等) も消さずに出す。マスタの入力で登録した新商品 (created_via = master-edit:*) は
+      // NE に登録されて翌朝の商品管理リストに載るまでの間 =「NE 登録待ち」(コード改廃の「PML外」と分ける)
       for (const a of rows) {
         if (pmlByKey.has(a.product_key)) continue;
-        out.push({ ...a, 商品名: '', 仕入先名: '', linked: true, active: false, pmlMissing: true });
+        out.push({ ...a, 商品名: '', 仕入先名: '', linked: hasLinkage(a), active: false, pmlMissing: true,
+          neWaiting: /^master-edit:/.test(String(a.created_via || '')) });
       }
       // 商品コード順 (ロケール非依存のバイナリ順、Codex attrs-R1 Low)
       out.sort((x, y) => (x.product_key < y.product_key ? -1 : x.product_key > y.product_key ? 1 : 0));
@@ -2677,18 +2685,39 @@ router.get('/api/masters/:kind', (req, res) => {
 router.post('/api/masters/:kind', (req, res) => {
   const def = MASTER_DEFS[req.params.kind];
   if (!def) return res.status(404).json({ ok: false, error: 'unknown master' });
+  // 発注の設定 (商品紐付け・発注条件グループ・原料グループ) は order-settings.js の 1 つの部品を通す
+  // (マスタの入力 /apps/master-edit と同じ確かめ・po_audit_log に記録・開いたときの印 seen が違えば 409)
+  if (req.params.kind === 'attrs') {
+    try {
+      const b = req.body || {};
+      const code = trimS(b.product_code);
+      if (!code) return res.status(400).json({ ok: false, error: '商品コード必須' });
+      const patch = {};
+      // 1 行まるごと (今までどおり: 送らなかった紐付けの列は空にする)。発注ロットは送ったときだけ (発注ロットの列を知らない前の画面で消さない)
+      for (const k of ATTR_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(b, k)) patch[k] = b[k];
+        else if (k !== 'order_lot') patch[k] = null;
+      }
+      const r = writeOrderSettings({ code, patch, seen: b.seen, actor: actorOf(req), via: 'po-admin' });
+      // 商品紐付け: 未紐付け商品の「全部空欄のまま保存」で空のattrs行 (=紐付け済み扱い) を作らせない
+      // (全商品既定表示で未紐付け行も保存ボタンを持つため。既存行の全空更新は従来どおり許容、Codex attrs-R1 High)
+      if (!r.row) return res.status(400).json({ ok: false, error: '発注ロット・グループ・容量・ケースが全て空です (空のままでは紐付けになりません)' });
+      return res.json({ ok: true, row: r.row, changed: r.changed });
+    } catch (e) { return sendOrderSettingsError(res, e); }
+  }
+  if (req.params.kind === 'conditions' || req.params.kind === 'materials') {
+    try {
+      const row = def.fromBody(req.body || {});
+      const err = def.validate(row);
+      if (err) return res.status(400).json({ ok: false, error: err });
+      const r = writeGroup(req.params.kind, row, { seen: (req.body || {}).seen, actor: actorOf(req), via: 'po-admin' });
+      return res.json({ ok: true, row: r.row, changed: r.changed });
+    } catch (e) { return sendOrderSettingsError(res, e); }
+  }
   try {
     const row = def.fromBody(req.body || {});
     const err = def.validate(row);
     if (err) return res.status(400).json({ ok: false, error: err });
-    // 商品紐付け: 未紐付け商品の「全部空欄のまま保存」で空のattrs行 (=紐付け済み扱い) を作らせない
-    // (全商品既定表示で未紐付け行も保存ボタンを持つため。既存行の全空更新は従来どおり許容、Codex attrs-R1 High)
-    if (req.params.kind === 'attrs'
-      && row.condition_id == null && row.material_group_id == null && row.capacity_per_unit == null
-      && row.case_group == null && row.case_lot == null
-      && !getDB().prepare('SELECT 1 FROM po_product_attrs WHERE product_key=?').get(row.product_key)) {
-      return res.status(400).json({ ok: false, error: 'グループ・容量・ケースが全て空です (空のままでは紐付けになりません)' });
-    }
     // 仕入先の発注方法を変えたとき、変更前に作られた未送信ジョブ (予約/失敗) は作成時の添付 (CSV/PDF) のまま
     // なので送信直前の突合で止まる (email.js channelMismatchOf)。保存時にも件数を返して「取消して新規送信」を促す
     let warning = null;
@@ -2716,6 +2745,17 @@ router.post('/api/masters/:kind', (req, res) => {
 router.delete('/api/masters/:kind/:id', (req, res) => {
   const def = MASTER_DEFS[req.params.kind];
   if (!def) return res.status(404).json({ ok: false, error: 'unknown master' });
+  // 発注の設定 (order-settings.js): ?seen=<開いたときの updated_at> が今と違えば 409。
+  // 商品紐付けの「削除」= 紐付け (グループ・容量・ケース) を外す。発注ロットは残す (消すと発注のすすめる数が出なくなる)
+  const seen = { updated_at: req.query.seen == null ? null : String(req.query.seen) };
+  if (req.params.kind === 'attrs') {
+    try { return res.json(clearProductLinks({ code: req.params.id, seen, actor: actorOf(req), via: 'po-admin' })); }
+    catch (e) { return sendOrderSettingsError(res, e); }
+  }
+  if (req.params.kind === 'conditions' || req.params.kind === 'materials') {
+    try { return res.json(deleteGroup(req.params.kind, req.params.id, { seen, actor: actorOf(req), via: 'po-admin' })); }
+    catch (e) { return sendOrderSettingsError(res, e); }
+  }
   try {
     const id = def.normId ? def.normId(req.params.id) : req.params.id;
     const refCheck = DELETE_REF_CHECKS[req.params.kind];
@@ -3270,7 +3310,7 @@ router.get('/api/attrs/unlinked', (req, res) => {
     for (const r of rows) {
       if (String(r['取扱区分'] || '') !== '取扱中') continue;
       const key = normProductCode(r['商品コード']);
-      if (attrs.has(key)) continue;
+      if (hasLinkage(attrs.get(key))) continue;   // 発注ロットだけの行 (NE から写した) は紐付けではない
       const reg = r['登録日'] ? String(r['登録日']).slice(0, 10) : '';
       const regTs = reg ? Date.parse(reg + 'T00:00:00+09:00') : NaN;
       const isRecent = since != null && !Number.isNaN(regTs) && regTs >= since;
@@ -3292,7 +3332,28 @@ router.get('/api/attrs/unlinked', (req, res) => {
          OR (a.material_group_id IS NOT NULL AND a.material_group_id<>'' AND g.group_id IS NULL)
       LIMIT 500
     `).all();
-    res.json({ ok: true, totalUnlinked: all.length, recentCount, days, count: filtered.length, rows: filtered.slice(0, 500), danglingCount: dangling.length, dangling });
+    // 発注ロットの知らせ (NE の値を写して発注アプリの値だけを使うようになった後 = order_lot_source 'app'):
+    //   lotMissing = 取扱中・セットでないのに発注アプリの発注ロットが空 (すすめる数が出ない。NE にはある商品も = NE だけで登録した新商品など)
+    //   lotDiff    = NE のロット (朝の商品管理リスト + その日の NE CSV) と発注アプリの値が違う (NE だけで直したロットに気づく)
+    const lotSource = orderLotSource();
+    const lotMissing = []; const lotDiff = [];
+    if (lotSource === 'app') {
+      const seenKey = new Set();
+      for (const r of rows) {
+        if (String(r['商品区分'] || '').trim() === 'セット') continue;
+        const key = normProductCode(r['商品コード']);
+        if (seenKey.has(key)) continue;
+        seenKey.add(key);
+        const a = attrs.get(key);
+        const app = a && a.order_lot != null ? Number(a.order_lot) : null;
+        const ne = Number(r['発注ロット単位']) > 0 ? Number(r['発注ロット単位']) : null;
+        const item = { code: r['商品コード'], name: r['商品名'] || '', supplier: normSupplierCode(r['仕入先']), app, ne };
+        if (app == null && String(r['取扱区分'] || '') === '取扱中') lotMissing.push(item);
+        else if (app != null && ne != null && app !== ne) lotDiff.push(item);
+      }
+    }
+    res.json({ ok: true, totalUnlinked: all.length, recentCount, days, count: filtered.length, rows: filtered.slice(0, 500), danglingCount: dangling.length, dangling,
+      lotSource, lotMissingCount: lotMissing.length, lotMissing: lotMissing.slice(0, 500), lotDiffCount: lotDiff.length, lotDiff: lotDiff.slice(0, 500) });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -4836,7 +4897,8 @@ document.addEventListener('click', function(ev) {
   if (gadd && byCode[gadd]) {
     var gk = ev.target.getAttribute('data-gkey');
     var body = { product_code: byCode[gadd].code };
-    if (gk.slice(0, 2) === 'c:') body.condition_id = gk.slice(2); else body.material_group_id = gk.slice(2);
+    if (gk.slice(0, 2) === 'c:') { body.condition_id = gk.slice(2); body.seen = { fields: { condition_id: byCode[gadd].conditionId || null } }; }
+    else { body.material_group_id = gk.slice(2); body.seen = { fields: { material_group_id: byCode[gadd].materialGroupId || null } }; }
     // このアコーディオンの持ち主 (再描画後に開き直す)
     var ownerTr = ev.target.closest('tr.accrow');
     var prevTr = ownerTr && ownerTr.previousElementSibling;
@@ -4940,7 +5002,9 @@ document.addEventListener('click', function(ev) {
     ev.target.disabled = true;
     fetch('/apps/purchase-orders/api/attrs/bind', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ product_code: byCode[bcode] ? byCode[bcode].code : bcode, condition_id: condSel, material_group_id: matSel }),
+      body: JSON.stringify({ product_code: byCode[bcode] ? byCode[bcode].code : bcode, condition_id: condSel, material_group_id: matSel,
+        // 画面が見ていた紐付け (その間にほかの人・マスタの入力が直していたら 409 = 上書きしない)
+        seen: { fields: { condition_id: byCode[bcode] ? (byCode[bcode].conditionId || null) : null, material_group_id: byCode[bcode] ? (byCode[bcode].materialGroupId || null) : null } } }),
     }).then(function(r){ return r.json(); }).then(function(j) {
       ev.target.disabled = false;
       if (!j.ok) { toast('エラー: ' + j.error); return; }
@@ -8353,7 +8417,7 @@ var GRP = 'suppliers';
 var SUBTAB = 'conditions'; // 発注条件グループ内で最後に見ていたサブタブ
 var GRP_HINTS = {
   suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📄PDFメール/📠FAX/🌐WEB/📨社内転送)、FAX番号 (eFax送信用)・社内転送先をここで設定します。',
-  conditions: '📦 商品をどの発注条件・原料グループで発注するかの設定と、スプレッドシートCSVの一括取込。新商品の紐付け漏れチェックもここ。',
+  conditions: '📦 商品をどの発注条件・原料グループで発注するか・発注ロット (すすめる数をこの倍数に) の設定と、スプレッドシートCSVの一括取込。新商品の紐付け漏れチェックもここ。マスタの入力 (新商品の登録・商品の画面) からも同じ値を入れられます (ほかの人が先に直していたら保存せずに知らせます)。マスタの入力で登録してまだ NE に無い商品は「NE 登録待ち」。',
   vendormap: '📇 自社商品コードと先方管理番号 (アメージングクラフト/ビーフリーの発注書に載る番号) の対応をここで管理します。',
   barcode: '🏷️ 自社商品 (AMC製造×売上分類1) のラベルにAmazonバーコード (FNSKU) が印字設定済みかをここで管理します。未登録/未設定の商品は発注時に印字依頼が必要。',
   mail: '📧 発注書メールの送信モード (dry-run/本番)・差出情報・文面テンプレ・宛先マスタの一括取込。📠FAX送信 (eFax) も同じモード・テンプレを使います (件名・本文が送付状になります)。',
@@ -8390,6 +8454,7 @@ var DEFS = {
     { k: 'group_id', l: '原料グループID', pk: 1 }, { k: 'name', l: '原料グループ名' }, { k: 'min_order_qty', l: '最低発注量', num: 1 }, { k: 'unit', l: '単位' } ] },
   attrs: { title: '商品紐付け', cols: [
     { k: 'product_code', l: '商品コード', pk: 1 }, { k: '商品名', l: '商品名', ro: 1 }, { k: '仕入先名', l: '仕入先', ro: 1 },
+    { k: 'order_lot', l: '発注ロット (すすめる数をこの倍数に)', num: 1 },
     { k: 'condition_id', l: '発注条件グループ (名前で検索可)', dl: 'conds' }, { k: 'material_group_id', l: '原料グループ (名前で検索可)', dl: 'mats' },
     { k: 'capacity_per_unit', l: '容量/個', num: 1 }, { k: 'case_group', l: 'ケースグループ' }, { k: 'case_lot', l: 'ケースロット', num: 1 } ] },
   selectable: { title: '選べるセット構成商品 (在庫+注残≦最低在庫で要発注入り。最低在庫 空欄=既定10)', cols: [
@@ -8495,6 +8560,9 @@ document.addEventListener('change', function(ev) {
   var hint = t.parentNode && t.parentNode.querySelector('[data-sendfrom]');
   if (hint) hint.textContent = sendFromText(t.value);
 });
+// 発注の設定のタブ (order-settings.js を通る = 保存・削除に開いたときの印 seen を送る)
+var SEEN_TABS = { attrs: 1, conditions: 1, materials: 1 };
+function seenOfRow(tr) { var u = tr ? tr.getAttribute('data-upd') : null; return { updated_at: u ? u : null }; }
 var FILT_Q = {};        // タブごとの絞り込み文字列 (保存→再描画してもフィルタを維持する、中原さん要望 2026-07-16)
 var ATTR_VIEW = 'all';  // 商品紐付けタブのチップ: all / unlinked / linked
 var SCROLL_RESTORE = null; // {tab, y} 保存/削除→再描画後にスクロール位置を戻す (同じタブのときだけ)
@@ -8533,6 +8601,8 @@ function render(rows) {
   }).join('') + '<td><button class="pri sm" id="btnAdd">追加</button></td></tr>';
   rows.forEach(function(r) {
     var attrsMeta = TAB === 'attrs' ? ' data-linked="' + (r.linked ? '1' : '0') + '"' : '';
+    // 開いたときの印 (保存・削除で送る。その間にほかの人 (マスタの入力も) が直していたら 409 = 上書きしない)
+    if (SEEN_TABS[TAB]) attrsMeta += ' data-upd="' + esc(r.updated_at || '') + '"';
     // 検索用テキストを行生成時に正規化して埋め込む (グループはID+名前の両方で当たるように)
     var searchTxt = def.cols.map(function(c) {
       var v = r[c.k];
@@ -8542,9 +8612,10 @@ function render(rows) {
       if (c.pk) {
         var badge = '';
         if (TAB === 'attrs') {
-          if (!r.linked) badge = ' <span class="badge b-warn" title="どのグループにも未紐付け (グループ対象外の商品はそのままでOK)">未紐付け</span>';
+          if (r.pmlMissing && r.neWaiting) badge = ' <span class="badge b-draft" title="マスタの入力で登録した新商品。NE に登録されて翌朝の商品管理リストに載るまでの間">NE 登録待ち</span>';
           else if (r.pmlMissing) badge = ' <span class="badge b-draft" title="PML (商品管理リスト) に見つからない商品 (コード改廃?)">PML外</span>';
-          else if (!r.active) badge = ' <span class="badge b-draft">取扱中止</span>';
+          if (!r.linked) badge += ' <span class="badge b-warn" title="どのグループにも未紐付け (グループ対象外の商品はそのままでOK)">未紐付け</span>';
+          else if (!r.pmlMissing && !r.active) badge += ' <span class="badge b-draft">取扱中止</span>';
         }
         return '<td>' + esc(r[c.k] == null ? '' : r[c.k]) + badge + '</td>';
       }
@@ -8586,6 +8657,22 @@ function renderUnlinked(j) {
     h += '<table class="t"><thead><tr><th>商品コード</th><th>未登録の発注条件グループ</th><th>未登録の原料グループ</th></tr></thead><tbody>';
     dg.forEach(function(r){ h += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.missCond || '—') + '</td><td>' + esc(r.missMat || '—') + '</td></tr>'; });
     h += '</tbody></table>';
+  }
+  // 発注ロットの知らせ (NE のロットを写して発注アプリの値だけを使うようになった後)
+  if (j.lotSource === 'app') {
+    var lm = j.lotMissing || [], ld = j.lotDiff || [];
+    if (lm.length) {
+      h += '<div class="warn" style="margin-top:18px">⚠️ 発注ロットが空の取扱中の商品が ' + j.lotMissingCount + ' 件あります (発注のすすめる数が出ません)。商品紐付けタブかマスタの入力の商品の画面で入れてください</div>';
+      h += '<table class="t"><thead><tr><th>商品コード</th><th>商品名</th><th>仕入先</th><th class="r">NE のロット (参考)</th></tr></thead><tbody>';
+      lm.forEach(function(r){ h += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.supplier) + '</td><td class="r">' + esc(r.ne == null ? '—' : r.ne) + '</td></tr>'; });
+      h += '</tbody></table>';
+    }
+    if (ld.length) {
+      h += '<div class="warn" style="margin-top:18px">ℹ️ NE のロットと発注アプリの発注ロットが違う商品が ' + j.lotDiffCount + ' 件あります。発注のすすめる数は発注アプリの値を使っています (NE だけで直したロットなら、発注アプリも直してください)</div>';
+      h += '<table class="t"><thead><tr><th>商品コード</th><th>商品名</th><th>仕入先</th><th class="r">発注アプリ</th><th class="r">NE</th></tr></thead><tbody>';
+      ld.forEach(function(r){ h += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.supplier) + '</td><td class="r">' + esc(r.app) + '</td><td class="r">' + esc(r.ne) + '</td></tr>'; });
+      h += '</tbody></table>';
+    }
   }
   document.getElementById('tabBody').innerHTML = h;
   document.getElementById('uDays').addEventListener('change', function(ev){ loadUnlinked(ev.target.value); });
@@ -8986,6 +9073,7 @@ document.addEventListener('click', function(ev) {
       var el = document.getElementById('new_' + c.k);
       b[c.k] = c.dl ? normGroupVal(c.dl, el.value) : el.value;
     });
+    if (SEEN_TABS[TAB]) b.seen = { updated_at: null };   // 追加 = まだ無いこと (同じ ID・同じ商品がもうある = 409)
     post(b);
     return;
   }
@@ -9000,14 +9088,16 @@ document.addEventListener('click', function(ev) {
       def2.cols.forEach(function(c){ if (c.k === k) col = c; });
       b2[k] = (col && col.dl) ? normGroupVal(col.dl, raw) : raw;
     });
+    if (SEEN_TABS[TAB]) b2.seen = seenOfRow(tr);
     post(b2);
     return;
   }
   var rmKey = t.getAttribute && t.getAttribute('data-rm');
   if (rmKey != null) {
-    if (!confirm('削除しますか? ' + rmKey)) return;
+    if (!confirm(TAB === 'attrs' ? '紐付け (グループ・容量・ケース) を外しますか? ' + rmKey + '\\n(発注ロットは残ります)' : '削除しますか? ' + rmKey)) return;
     var rmTab = TAB; // 応答前のタブ切替対策 (postと同じ)
-    fetch('/apps/purchase-orders/api/masters/' + rmTab + '/' + encodeURIComponent(rmKey), { method: 'DELETE' })
+    var rmSeen = SEEN_TABS[rmTab] ? '?seen=' + encodeURIComponent(seenOfRow(t.closest('tr')).updated_at || '') : '';
+    fetch('/apps/purchase-orders/api/masters/' + rmTab + '/' + encodeURIComponent(rmKey) + rmSeen, { method: 'DELETE' })
       .then(function(r){ return r.json(); }).then(function(j) {
         if (j.ok) {
           toast('削除しました');
@@ -9015,7 +9105,10 @@ document.addEventListener('click', function(ev) {
           if (TAB !== rmTab) return;
           SCROLL_RESTORE = { tab: rmTab, y: window.scrollY };
           load();
-        } else toast(j.error);
+        } else {
+          alert('❌ ' + (j.error || '削除できませんでした'));
+          if (j.reason === 'stale' && TAB === rmTab) load();   // ほかの人が先に直した = 今の値を出し直す
+        }
       });
   }
 });
@@ -9039,6 +9132,12 @@ function post(b) {
     } else {
       // 保存失敗は alert で止める (2.8秒のトーストだけだと見逃し、「変えたのに保存されない」に見える。2026-08-31)。
       // 行の内容はそのまま残るので、直してもう一度「保存」できる
+      if (j.reason === 'stale') {
+        // ほかの人 (マスタの入力の画面も) が先に直した = 何も保存していない。今の値を出し直す (入れた値は消える = 見てから入れ直す)
+        alert('❌ 保存できませんでした\\n\\n' + j.error);
+        if (TAB === reqTab) { SCROLL_RESTORE = { tab: reqTab, y: window.scrollY }; load(); }
+        return;
+      }
       alert('❌ 保存できませんでした\\n\\n' + (j.error || '不明なエラー') + '\\n\\n(この行の入力内容はそのまま残っています。指摘された欄を直して、もう一度「保存」を押してください)');
     }
   }).catch(function(e) {

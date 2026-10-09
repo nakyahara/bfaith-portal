@@ -17,6 +17,9 @@
  *       設定 target_rule='v1' で旧式へ即時ロールバックできる。
  *   推奨発注量      = lots = (P×V − (S+B))/N を N(発注ロット単位)で丸め  (= (P-L)×V/N と同値)
  *                     lots > 1 → ROUND(lots)*N / lots <= 1 → ROUNDUP(lots)*N (最低1ロット)
+ *     ※N の出どころ (10/9 中原さん): po_settings.order_lot_source = 'app' なら発注アプリの po_product_attrs.order_lot だけ
+ *       (NE の値は使わない。空 = すすめる数が出ない)。未設定 / 'ne' = 今までどおり NE の goods_lot (商品管理リスト・NE CSV の上書き)。
+ *       NE の値を一度だけ写す手順 = scripts/copy-ne-order-lot.mjs (写した最後に 'app' に切り替える)。式は withOrderLot 1 か所
  *   掘り起こし対象 (v2) = 取扱中 かつ 在庫0 かつ 注残0 かつ 販売0 (販売実績消失。中原さん定義 2026-07-14:
  *     他社の値下げで価格が合わず仕入を控えた商品を、一定期間後に再販できるか調べるためのステータス)
  *     ※旧シートは取扱中止も掘り起こしに含めていたが、本アプリは「取扱中」のみに絞る (ノイズ除去)
@@ -30,6 +33,7 @@
  */
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { getSetting, audit } from './ledger.js';
+import { orderLotSource } from './order-settings.js';
 
 const PML_COLS = [
   '商品コード', '商品名', '仕入先', '取扱区分', '商品区分', '売上分類',
@@ -54,6 +58,16 @@ export function stockConstant(m) {
 /** 要発注判定ルール (po_settings target_rule)。既定 'v2'。'v1' = 旧式 (0 < L <= M) へのロールバック用 */
 export function targetRule() {
   return getSetting('target_rule') === 'v1' ? 'v1' : 'v2';
+}
+
+/**
+ * 発注ロット (N) を出どころに合わせた行にする (computeAll が computeProduct の前に 1 回だけ通す)。
+ *   source = 'app': 発注アプリの order_lot だけ (attr が無い・空 = null = すすめる数が出ない。NE の値・NE CSV の上書きは使わない)
+ *   source = 'ne' : 行のまま (NE の goods_lot。写す前の今までどおり)
+ */
+export function withOrderLot(r, attr, source) {
+  if (source !== 'app') return r;
+  return { ...r, '発注ロット単位': attr && attr.order_lot != null ? attr.order_lot : null };
 }
 
 /**
@@ -417,12 +431,13 @@ export function computeAll() {
   maybeRefreshFromLogizardMirror();
   // PML(+NEオーバーレイ)・マスタ・直近発注を1つの read transaction で読む (途中の書き込みと混在させない、Codex R2 Low)
   const db = getDB();
-  const { pub, rows, overlay, masters, recentIssued, ledgerZan, boDates, useLedgerZan, rule } = db.transaction(() => ({
+  const { pub, rows, overlay, masters, recentIssued, ledgerZan, boDates, useLedgerZan, rule, lotSource } = db.transaction(() => ({
     ...loadPmlMerged(), masters: loadMasters(), recentIssued: loadRecentIssued(), ledgerZan: loadLedgerBackorders(),
     boDates: loadBackorderRequestedDates(),
     // 既定 'app' = アプリ台帳。設定 backorder_source='ne' で旧挙動 (NE CSVの発注残数) へ戻せる
     useLedgerZan: getSetting('backorder_source') !== 'ne',
     rule: targetRule(),
+    lotSource: orderLotSource(),
   }))();
   const products = [];
   const bySupplier = new Map();
@@ -431,7 +446,8 @@ export function computeAll() {
   for (const r of rows) {
     // セット商品は発注・在庫管理の対象外 (在庫は構成品側)。全商品情報にも出さない (中原さん 2026-07-14)
     if (String(r['商品区分'] || '').trim() === 'セット') continue;
-    const p = computeProduct(r, useLedgerZan ? (ledgerZan.get(normProductCode(r['商品コード'])) || 0) : undefined, rule);
+    const rowKey = normProductCode(r['商品コード']);
+    const p = computeProduct(withOrderLot(r, masters.attrs.get(rowKey), lotSource), useLedgerZan ? (ledgerZan.get(rowKey) || 0) : undefined, rule);
     if (p.holdMonthsMissing) ruleStats.holdMonthsMissing++;
     if (p.targetV2 && !p.targetV1) {
       ruleStats.addedCount++;
@@ -487,7 +503,7 @@ export function computeAll() {
     g.estAmount = Math.round(g.targets.reduce((s, p) => s + (p.recQty || 0) * p.cost, 0));
   }
   ruleStats.addedAmount = Math.round(ruleStats.addedAmount);
-  return { pub, overlay, products, bySupplier, masters, ruleStats };
+  return { pub, overlay, products, bySupplier, masters, ruleStats, lotSource };
 }
 
 /**

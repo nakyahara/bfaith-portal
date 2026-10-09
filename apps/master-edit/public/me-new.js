@@ -465,7 +465,11 @@
       var plan = segVal('set-plan');
       if (plan) card.set_decision = { decision: plan, reason_code: plan === 'none' ? val('set-reason') : '', reason_text: val('set-text') };
     }
-    return { request_id: requestId, kind: P.kind, code: $('#code').value, reason: val('reason'), values: values, card: card };
+    var out = { request_id: requestId, kind: P.kind, code: $('#code').value, reason: val('reason'), values: values, card: card };
+    // 発注の設定 (発注アプリ・単品だけ・public/me-order.js)。何も入れていない = 送らない (発注アプリに何も書かない)
+    var po = !isSet && ME.orderSettings ? ME.orderSettings.collect() : null;
+    if (po) out.order_settings = po;
+    return out;
   }
 
   /* ---------- 登録 ---------- */
@@ -520,6 +524,8 @@
           msg('登録しました (下書き)。' + code + ' の画面を開いています…', 'ok');
           var warns = (x.j.warnings || []).slice();
           if (x.j.card && x.j.card.status !== 'done') warns.push('product-hub の出品カード: ' + (x.j.card_label || x.j.card.status) + ' (商品の画面の「カードをもう一度作る」か、product-hub のボードを開くと作り直します)');
+          // 登録は成功・発注アプリへの書き込み (②) だけ失敗 = 商品の画面の「発注の設定」で入れ直す
+          if (x.j.order_settings && !x.j.order_settings.ok) warns.push('発注の設定だけ保存できませんでした (' + (x.j.order_settings.error || '発注アプリに書けない') + ')。商品の画面の「発注の設定」で入れてください');
           try { sessionStorage.setItem(NOTE_KEY, JSON.stringify({ code: String(code), at: Date.now(), j: { replayed: !!x.j.replayed, changed: [], derived: [], ne_steps: x.j.ne_steps || [], warnings: warns } })); } catch (e) { /* 置けない = 知らせを出さないだけ */ }
           var url = BASE + '/sku/' + encodeURIComponent(code);
           if (ME.replacePage) ME.replacePage(url); else location.replace(url);
