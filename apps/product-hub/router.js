@@ -85,6 +85,20 @@ import { Readable } from 'node:stream';
 // LP 構成の確認・修正 (画像制作の新フロー PR-B・2026-10-09)。ロジックは lib/lp-edit.js
 import { editStateFor as lpEditStateFor, saveEdit as saveLpEdit, effectiveComposeText as lpEffectiveComposeText } from './lib/lp-edit.js';
 import { imageLimitForPriority as lpImageLimitForPriority } from './lib/lp-image.js';
+// デザイナー修正依頼書 (スプレッドシート) の自動作成 (画像制作の新フロー PR-F・2026-10-09)
+import { createOrUpdateDesignerSheet, designerSheetStateFor, revokeAllDesignerShares, sweepDesignerShares, DESIGNER_SHEET_FORBIDDEN } from './services/designer-sheet-service.js';
+// デザイナー修正依頼書のために公開したまま、依頼書に載っていない画像を、起動の 1 分あとと、その後 30 分おきに片付ける
+// (作っている途中でプロセスが止まると後片付けが動かない・外すのに一度失敗した公開も押されるまで残る — Codex PR-F 名指し3 高・名指し5 中)。
+// 鍵が無い (試験・未設定) なら何もしない
+if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+  const sweep = () => sweepDesignerShares()
+    .then((r) => { if (r.revoked) console.log(`[product-hub] デザイナー修正依頼書: 公開したままの画像 ${r.revoked} 枚を片付けました`); })
+    .catch((e) => console.error('[product-hub] デザイナー修正依頼書の公開の片付け:', e?.message || e));
+  const t = setTimeout(sweep, 60_000);
+  const iv = setInterval(sweep, 30 * 60_000);
+  if (t.unref) t.unref();
+  if (iv.unref) iv.unref();
+}
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
@@ -3149,12 +3163,15 @@ router.post('/api/notion-import-by-status', legacyHandler(async (req, res) => {
 
 // 取り込んだテストデータの掃除。**取り込み由来だけ**削除可 (ポータル起点の商品は消させない)。
 // Notion 側のカードには一切触らない (ポータル DB の行を消すだけ)。
-router.post('/api/drafts/:id/delete', (req, res) => {
+router.post('/api/drafts/:id/delete', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   if (!isNotionImported(draft)) {
     return res.status(400).json({ ok: false, error: '削除できるのはNotion取り込み由来のドラフトだけです' });
   }
+  // デザイナー修正依頼書 (PR-F) のために公開した画像は、消す前に公開を外す (消すと画面から外せなくなる)。外せなければ消さない
+  const unshared = await revokeAllDesignerShares(draft.id);
+  if (!unshared.ok) return res.status(409).json({ ok: false, error: unshared.error + '。商品は削除していません' });
   const db = getDB();
   // draft_events は append-only (削除 trigger) なので消さない。孤児として監査ログに残す
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft.id);
@@ -4293,7 +4310,14 @@ router.get('/api/drafts/:id/lp-images', (req, res) => {
 const LP_IMAGE_FORBIDDEN = '画像の生成・作り直し・確認は 画像登録者・画像作成承認者 の担当者か管理者だけです (担当者・工程で役割を確認してください)';
 /** 画面に渡す状態 + 押せる人か (押せない人にはボタンを押せない形で出す) + 画面が見ている LP構成の版 (PR-B) */
 function lpImageStateForReq(req, db, draft) {
-  return { ...lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) }), can_edit: canEditImageProduction(req), compose_version: lpComposeVersion(db, draft) };
+  const st = lpImageStateFor(db, { draft, folderId: lpImageFolderId(draft) });
+  const canEdit = canEditImageProduction(req);
+  // デザイナー修正依頼書 (PR-F) の状態も載せる (画像ができた・作り直したのをポーリングで拾ってボタンを押せるようにする)。
+  // 依頼書の状態が読めなくても画像の箱は出す
+  let designerSheet = null;
+  try { designerSheet = designerSheetStateFor(db, draft, { lpState: st, canEdit }); }
+  catch (e) { console.error('[product-hub] デザイナー修正依頼書の状態:', e?.message || e); }
+  return { ...st, can_edit: canEdit, compose_version: lpComposeVersion(db, draft), designer_sheet: designerSheet };
 }
 
 /** 作る (画像制作の役割の人)。body: { idempotency_key }。同じキーの再送は前の依頼を返す */
@@ -4386,6 +4410,35 @@ router.post('/api/drafts/:id/lp-images/:imageId/check', (req, res) => {
     return res.status(status).json({ ok: false, code: r.code, error: r.error });
   }
   res.json({ ok: true, changed: r.changed, ...lpImageStateForReq(req, db, draft) });
+});
+
+/**
+ * デザイナー修正依頼書 (スプレッドシート) を作る / 最新の画像で作り直す (画像制作の新フロー PR-F・2026-10-09・スタッフ要望 ⑥)。
+ * 生成した全画像 (各画像の最新のできた版) を TOP から順に =IMAGE() で貼り、修正指示の列は空欄 (作り直すときは人が書いた修正指示を
+ * 同じ画像の行に戻す)。置き場は商品の画像フォルダ。全部の画像ができてから作れる。中身はサーバが組む (呼び手から画像は受けない)。
+ * 画像ファイルには「リンクを知っている人は閲覧可」を付ける (共有ドライブの設定で断られたら依頼書を作らずに理由を返す)。
+ * body: { seen_file_id: '' | 'ID' (必須。画面を開いたときの依頼書のファイル。今と違えば 409),
+ *         seen_images_hash: '…' (必須。画面が見ていた画像の並び = designer_sheet.images_hash。今と違えば 409) }
+ * 工程・ボード (⑤デザイン修正) は動かさない
+ */
+router.post('/api/drafts/:id/designer-sheet', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) return res.status(403).json({ ok: false, code: 'forbidden', error: DESIGNER_SHEET_FORBIDDEN });
+  const b = req.body || {};
+  if (typeof b.seen_file_id !== 'string' || !/^([A-Za-z0-9_-]{5,200})?$/.test(b.seen_file_id)) {
+    return res.status(400).json({ ok: false, code: 'bad_request', error: 'seen_file_id (画面を開いたときの依頼書のファイル ID。無ければ空) を指定してください' });
+  }
+  if (typeof b.seen_images_hash !== 'string' || !/^[0-9a-f]{64}$/.test(b.seen_images_hash)) {
+    return res.status(400).json({ ok: false, code: 'bad_request', error: 'seen_images_hash (画面が見ていた画像の並び) を指定してください' });
+  }
+  const r = await createOrUpdateDesignerSheet(draft.id, { actor: actorOf(req), seenFileId: b.seen_file_id, seenImagesHash: b.seen_images_hash });
+  const db = getDB();
+  const fresh = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id) || draft;
+  let state = null;
+  try { state = designerSheetStateFor(db, fresh, { canEdit: true }); } catch (e) { console.error('[product-hub] デザイナー修正依頼書の状態:', e?.message || e); }
+  if (!r.ok) return res.status(r.status || 500).json({ ok: false, code: r.code, error: r.error, designer_sheet: state });
+  res.json({ ...r, designer_sheet: state });
 });
 
 /**
