@@ -252,6 +252,7 @@ claim で来た **`shoot_instruction`** に従って、その構成の画像を�
   `variation`・`open_required` は `shoot_instruction` に書いてある値のどれか。カットの `no` は 1 からの連番
 - `none` なら `cuts` は `[]`・`send_targets`・`purpose`・`finish`・`usage` は `""`・`needs_shoot` はすべて false。
   `inhouse`・`photographer` なら `cuts` を 1 つ以上・その 4 項目は空にしない
+- 全体の `open_required` はカットの開封要否のまとめ (全部 `不要` → `不要` / 全部 `必要` → `必要` / 混ざる → `一部必要`)。`none` なら `不要`
 - `images` は **⑦ の画像見出しの N と 1 対 1** で `{no, needs_shoot}` だけ。**画像とカットは両向きで合わせる**:
   `lp_image_nos` に入れた画像は `needs_shoot: true`、`needs_shoot: true` の画像はどれかのカットの `lp_image_nos` に入れる
 - 項目名は撮影指示書 (スプレッドシート) の項目と同じ。カットと概要はそのまま撮影指示書に載る

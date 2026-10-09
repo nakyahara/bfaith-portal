@@ -615,7 +615,10 @@ export function queueSummary(db, now = Date.now(), { shootSpec = false } = {}) {
   return db.transaction(() => {
     recoverExpired(db, now);
     const c = (sql, ...a) => db.prepare(sql).get(...a).n;
-    const withSpec = c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued' AND json_extract(packet_json, '$.shoot_spec') IS NOT NULL`);
+    // 🚨 json_valid を先に見る — 壊れた packet が 1 行でもあると json_extract が例外になり、queue ごと落ちて後ろの正常な依頼も止まる
+    //    (Codex PR-C2 名指し3 M)。壊れた行は数えておき、claim が packet_tampered で落とす (今までどおり)
+    const withSpec = c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued'
+      AND CASE WHEN json_valid(packet_json) THEN json_extract(packet_json, '$.shoot_spec') END IS NOT NULL`);
     const queued = c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued'`);
     return {
       enabled: lpComposeEnabled(),

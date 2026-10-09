@@ -383,6 +383,14 @@ export function validateShootJudgementV2(raw, { imageNos = null } = {}) {
         else if (!im.needs_shoot) err(`カット ${c.no} は ${n}枚目 に使うのに、${n}枚目 の needs_shoot が false です`);
       }
     }
+    // 開封要否の食い違い (Codex PR-C2 名指し3 M): 撮影しないのに開封が要る / 全体とカットが合わない は、どちらを信じて準備するか決められない。
+    //   全体はカットのまとめ = 全部 不要 → 不要 / 全部 必要 → 必要 / 混ざる → 一部必要
+    if (rec === 'none' && raw.open_required !== '不要') err('recommended が none (追加撮影不要) なので open_required (開封要否) は "不要" です');
+    if (shooting && cuts.length > 0) {
+      const need = cuts.filter((c) => c.open_required === '必要').length;
+      const want = need === 0 ? '不要' : need === cuts.length ? '必要' : '一部必要';
+      if (raw.open_required !== want) err(`open_required (開封要否) が カットの開封要否と合いません (カットから見ると "${want}"。全部 不要 → 不要 / 全部 必要 → 必要 / 混ざる → 一部必要)`);
+    }
     for (const im of images) {
       if (im.needs_shoot && !cuts.some((c) => c.lp_image_nos.includes(im.no))) err(`${im.no}枚目 は needs_shoot が true なのに、${im.no}枚目 に使うカットがありません (lp_image_nos に ${im.no} を入れる)`);
     }
@@ -511,6 +519,7 @@ export const SHOOT_SPEC_INSTRUCTION = [
   'サーバが形を検査します (./phlp lint --shoot で先に確かめられます):',
   '- recommended が "none" なら cuts は [] で、send_targets・purpose・finish・usage は ""、needs_shoot はすべて false',
   '- "inhouse" か "photographer" なら cuts を 1 つ以上書き、send_targets・purpose・finish・usage は空にしない',
+  '- open_required (全体) はカットの開封要否のまとめ: 全部 "不要" なら "不要" / 全部 "必要" なら "必要" / 混ざれば "一部必要"。"none" なら "不要"',
   '- 画像とカットは両向きで合わせる: lp_image_nos に入れた画像は needs_shoot を true にし、needs_shoot が true の画像はどれかのカットの lp_image_nos に入れる',
   `- 文字は ${SHOOT_FIELD_MAX} 字まで (conclusion は ${SHOOT_V2_CONCLUSION_MAX} 字まで)。文字の前後に空白や改行を入れない。無い値は "" (lp_image_nos だけは [])`,
   '- 材料に無い素材を「ある」ことにしない。色名・種類名が分からなければ「要確認」と書く',

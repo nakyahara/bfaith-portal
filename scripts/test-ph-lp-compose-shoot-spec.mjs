@@ -175,6 +175,14 @@ console.log('③ 形 v2 の検査 (lib/lp-shoot.js・純粋関数)');
   bad({ ...goodV2(), recommended: '社内撮影' }, '撮影判定が日本語 (none / inhouse / photographer だけ)');
   bad({ ...goodV2(), open_required: 'いいえ' }, '開封要否が列挙値でない');
   bad({ ...goodV2(), open_required: '不要 ' }, '開封要否の後ろに空白');
+  bad({ ...noneV2(), open_required: '必要' }, '🚨 追加撮影不要なのに開封が要る (食い違い・Codex PR-C2 名指し3)');
+  bad({ ...goodV2(), open_required: '必要' }, '🚨 カットは全部 開封不要なのに全体が 必要 (食い違い)');
+  {
+    const mixed = { ...goodV2(), cuts: [cutOf(1, { open_required: '必要' }), cutOf(2, { lp_image_nos: [] })] };
+    bad({ ...mixed, open_required: '必要' }, '🚨 カットの開封が混ざるのに全体が 必要 (一部必要 のはず)');
+    ok(sh.validateShootJudgementV2({ ...mixed, open_required: '一部必要' }, { imageNos: [0, 1, 2] }).ok, 'カットの開封が混ざれば全体は 一部必要');
+    ok(sh.validateShootJudgementV2({ ...mixed, cuts: mixed.cuts.map((c) => ({ ...c, open_required: '必要' })), open_required: '必要' }, { imageNos: [0, 1, 2] }).ok, '全部 必要 なら全体も 必要');
+  }
   bad({ ...goodV2(), conclusion: '' }, '判定の結論が空');
   bad({ ...goodV2(), conclusion: 'あ'.repeat(sh.SHOOT_V2_CONCLUSION_MAX + 1) }, '判定の結論が長すぎる');
   bad({ ...goodV2(), send_targets: '' }, '🚨 撮影するのに撮影用送付対象が空');
@@ -522,6 +530,15 @@ console.log('⑤ queue — 古い phlp には、掴めない仕様書つきの�
   const qNew = lp.queueSummary(db, Date.now(), { shootSpec: true });
   ok(qOld.claimable === 0 && qOld.waiting_runner_update === 1, `🚨 古い phlp の問い合わせ: claimable 0・waiting_runner_update 1 (${JSON.stringify([qOld.claimable, qOld.waiting_runner_update])})`);
   ok(qNew.claimable === 1 && qNew.waiting_runner_update === 0, '新しい phlp (shoot_spec=1) には数える');
+  // 🚨 壊れた packet が並んでいても queue は落ちない (json_extract の例外で後ろの依頼まで止めない・Codex PR-C2 名指し3 M)
+  const dB = mkDraft();
+  const rB = request(dB, 'ss-key-queue-broken');
+  db.prepare(`UPDATE ph_lp_compose_jobs SET packet_json = '{' WHERE id = ?`).run(rB.job.id);
+  let qb = null;
+  try { qb = lp.queueSummary(db); } catch (e) { qb = { thrown: e.message }; }
+  ok(qb && !qb.thrown && qb.claimable === 1 && qb.waiting_runner_update === 1, `🚨 壊れた packet があっても queue は返る (壊れた行は claim が落とすので数える) (${JSON.stringify(qb).slice(0, 120)})`);
+  const clB = lp.claimJob(db, { runnerRunId: 'run-broken', maxImages: 16 });
+  ok(clB.job === null && jobRow(rB.job.id).error_code === 'packet_tampered' && jobRow(req.job.id).status === 'queued', '壊れた依頼は claim が落とし、仕様書つきの依頼は古い phlp に掴ませない (今どおり)');
   cancel(req.job.id);
 }
 
