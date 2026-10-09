@@ -6675,11 +6675,14 @@ let wfSetParentId = null;
       const fakeSheets = { spreadsheets: {
         get: async (p) => {
           await hit('sget');
-          // タブの様子を読んだ直後 (batchUpdate を送る前) に、ほかの人の操作を割り込ませる口
-          if (g.onSget) { const fn = g.onSget; g.onSget = null; fn(p); }
+          // ほかの人の操作を割り込ませる口: onSgetBefore = 読む前 (読んだ一覧に入る) / onSget = 読んだ直後 (読んだ一覧には入らない。送る前に起きる)
+          if (g.onSgetBefore) { const fn = g.onSgetBefore; g.onSgetBefore = null; fn(p); }
           const f = g.files.get(p.spreadsheetId);
-          return { data: { sheets: f.tabs.map((t) => ({ properties: { sheetId: t.sheetId, title: t.title, gridProperties: { rowCount: 1000, columnCount: 26 } },
-            developerMetadata: (t.meta || []).map((m) => ({ metadataKey: m.key, metadataValue: m.value })) })) } };
+          const snap = { data: { sheets: f.tabs.map((t) => ({ properties: { sheetId: t.sheetId, title: t.title, gridProperties: { rowCount: 1000, columnCount: 26 } },
+            developerMetadata: (t.meta || []).map((m) => ({ metadataKey: m.key, metadataValue: m.value })),
+            ...(p.includeGridData ? { data: [{ rowData: t.values.map((row) => ({ values: row.map((v) => ({ userEnteredValue: v === '' ? undefined : { stringValue: v } })) })) }] } : {}) })) } };
+          if (g.onSget) { const fn = g.onSget; g.onSget = null; fn(p); }
+          return snap;
         },
         batchUpdate: async (p) => {
           await hit('sbatch');
@@ -6987,12 +6990,19 @@ let wfSetParentId = null;
       // 🚨 作ったばかりのファイルに、人が「撮影指示」という同じ名前のタブをすぐ作った: 上書きしない (名指し4 M)
       {
         g.files.get(ipF().shoot_sheet_file_id).trashed = true;
-        g.onSget = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 7, title: '撮影指示', values: [['人がすぐ書いた']] });
+        g.onSgetBefore = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 7, title: '撮影指示', values: [['人がすぐ書いた']] });
         r = await sheetFor(idF, {});
         const fx = filesIn().filter((f) => f.appProperties.phShootSheetDraft === String(idF)).at(-1);
-        check('🚨 撮影指示書: 作ったばかりでも、人がすぐ作った同じ名前のタブ (印なし) は上書きせず 409',
+        check('🚨 撮影指示書: 作ったばかりでも、人がすぐ作った同じ名前のタブ (印なし) は上書きせず 409・ファイルも片付けない',
           r.status === 409 && r.json?.code === 'tab_conflict' && JSON.stringify(tabOf(fx, '撮影指示')?.values) === '[["人がすぐ書いた"]]', JSON.stringify(r));
         fx.trashed = true;
+        // 読んだ後・送る前に人が同じ名前のタブを作った: Google が batchUpdate を断る (400) → 片付ける前に読み直して、人のタブがあるので残す
+        g.onSget = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 8, title: '撮影指示', values: [['読んだ後に書いた']] });
+        r = await sheetFor(idF, {});
+        const fy = [...g.files.values()].filter((f) => f.appProperties.phShootSheetDraft === String(idF)).at(-1);
+        check('🚨 撮影指示書: 読んだ後に人がタブを作って書き込みが断られても、読み直して人のタブがあればファイルをごみ箱に入れない (名指し6 M)',
+          r.status === 502 && fy !== fx && !fy.trashed && JSON.stringify(tabOf(fy, '撮影指示')?.values) === '[["読んだ後に書いた"]]', JSON.stringify([r, fy?.trashed]));
+        fy.trashed = true;
       }
 
       // 前に作ったファイルがごみ箱に → 作り直して URL を替える。作った直後 (タブを読む前) に人が足したタブは消さない

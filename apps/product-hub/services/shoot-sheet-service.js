@@ -28,7 +28,7 @@ import {
 } from '../lib/shoot-sheet.js';
 import {
   getSheetsWriteClients, explainGoogleError, findSpreadsheetByAppProperty, spreadsheetUsable,
-  createSpreadsheetInFolder, writeSpreadsheet,
+  createSpreadsheetInFolder, writeSpreadsheet, isUntouchedNewSpreadsheet,
 } from './sheets-writer.js';
 
 const APP_PROP_KEY = 'phShootSheetDraft';
@@ -194,7 +194,6 @@ async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, 
   let created = false;
   let recovered = false;
   let written = false;
-  let sawHumanTab = false;
   try {
     // 1. 前に作ったファイルが使えればそれ (消された・ごみ箱・別フォルダに移ったなら作り直す)
     //    指示書の URL が手で貼り替えられている (ours でない) ときは、前に作ったファイルは画面に出ていない =
@@ -219,7 +218,6 @@ async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, 
     await writeSpreadsheet(clients, {
       spreadsheetId: fileId, title: built.title, tabs: built.sheets, fresh: created,
       beforeWrite: ({ existing }) => {
-        sawHumanTab = existing.some((t) => !t.owned && !(Number(t.sheetId) === 0 && /^(シート|Sheet)\s*1$/.test(String(t.title || ''))));
         // 既にある指示書 (指示書のタブ = 印つきがある) を書き換えるときは、画面で確かめたファイルの ID が要る。人が直しているかもしれない
         // (拾い直したファイル・URL を手で貼り替えた後の前のファイル・古い画面・直接の呼び出し — Codex PR-D 名指し3/4/5)
         if (!created && overwriteFileId !== fileId && existing.some((t) => t.owned)) {
@@ -237,8 +235,9 @@ async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, 
   } catch (e) {
     // この呼び出しで作っただけで中身を書けなかったファイル (送る前に止めた) はごみ箱へ。残すと、画像フォルダを変えた後などに
     // 次の押下で 2 つ目ができる (Codex PR-D 名指し5 M)。片付けに失敗しても結果は変えない (同じフォルダなら印で拾い直せる)
-    // 人が足したタブがあるファイル (作った直後に足された・同じ名前のタブで止めた) は片付けない (人の作業をごみ箱に入れない)
-    if (created && !written && !sawHumanTab && e?.code !== 'tab_conflict') {
+    // 片付ける前に読み直して、最初の空の「シート1」だけのとき (誰も触っていない) に限る。読み直せなければ片付けない
+    // (読んだ後に人が足したタブ・応答が失われただけで書けていた中身を、ごみ箱に入れない — Codex PR-D 名指し6 M)
+    if (created && !written && await isUntouchedNewSpreadsheet(clients, fileId)) {
       try { await clients.drive.files.update({ fileId, requestBody: { trashed: true }, supportsAllDrives: true }, { timeout: 20_000 }); } catch (_) { /* 拾い直せる */ }
     }
     if (e?.code === 'shoot_sheet_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };

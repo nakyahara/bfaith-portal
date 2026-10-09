@@ -14,7 +14,7 @@ import {
   spreadsheetUrl, CUT_COLUMNS, MAX_CUTS,
 } from '../apps/product-hub/lib/shoot-sheet.js';
 import {
-  writeSpreadsheet, formulaCell, findSpreadsheetByAppProperty, spreadsheetUsable, createSpreadsheetInFolder,
+  writeSpreadsheet, formulaCell, isUntouchedNewSpreadsheet, findSpreadsheetByAppProperty, spreadsheetUsable, createSpreadsheetInFolder,
   explainGoogleError, getSheetsWriteClients,
 } from '../apps/product-hub/services/sheets-writer.js';
 
@@ -270,6 +270,20 @@ function fakeSheets(initialTabs, { failBatch = false } = {}) {
   ok((await spreadsheetUsable({ drive }, { fileId: 'MOVED0', folderId: 'FOLDER1' })).reason === 'moved', '別のフォルダに移ったファイルは使えない (今の画像フォルダに作る)');
   ok((await spreadsheetUsable({ drive }, { fileId: 'GOOD00', folderId: 'FOLDER1' })).usable === true, '同じフォルダのファイルは使う');
   await throwsAsync('404 以外の失敗 (権限・障害) は作り直さずに失敗にする', () => spreadsheetUsable({ drive }, { fileId: 'BOOM00', folderId: 'FOLDER1' }), 'Backend');
+}
+
+{
+  const sheetsOf = (list, { fail = false } = {}) => ({ spreadsheets: { get: async (p) => {
+    if (fail) throw new Error('timeout');
+    if (!p.includeGridData) throw new Error('値まで読んでいない');
+    return { data: { sheets: list } };
+  } } });
+  const blank = { properties: { sheetId: 0, title: 'シート1' }, data: [{ rowData: [] }] };
+  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([blank]) }, 'S') === true, '片付けてよい = 最初の空の「シート1」1 枚だけ');
+  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([blank, { properties: { sheetId: 5, title: '人のメモ' } }]) }, 'S') === false, '人のタブがあれば片付けない');
+  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([{ ...blank, data: [{ rowData: [{ values: [{ userEnteredValue: { stringValue: 'x' } }] }] }] }]) }, 'S') === false, '「シート1」に何か書いてあれば片付けない');
+  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([{ ...blank, developerMetadata: [{ metadataKey: 'phOwnedTab' }] }]) }, 'S') === false, '印があれば (書けていた) 片付けない');
+  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([], { fail: true }) }, 'S') === false, '読み直せなければ片付けない');
 }
 
 console.log('⑩ 失敗の理由 (画面に出す文)');

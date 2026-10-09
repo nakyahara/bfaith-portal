@@ -115,6 +115,29 @@ export async function createSpreadsheetInFolder({ drive }, { folderId, title, ap
   return { id };
 }
 
+/**
+ * 作ったばかりで誰も触っていないか (最初からある空の「シート1」1 枚だけ・印も値も無い) を**いま読み直して**確かめる。
+ * 片付け (ごみ箱へ) の前に呼ぶ。読めなければ false (= 片付けない。人が足したタブ・書けていた中身を巻き込まない)
+ */
+export async function isUntouchedNewSpreadsheet({ sheets }, spreadsheetId) {
+  try {
+    const got = await sheets.spreadsheets.get({
+      spreadsheetId, includeGridData: true, ranges: ['A1:Z200'],
+      fields: 'sheets(properties(sheetId,title),developerMetadata(metadataKey),data(rowData(values(userEnteredValue))))',
+    }, { timeout: GOOGLE_TIMEOUT_MS });
+    const list = got?.data?.sheets || [];
+    if (list.length !== 1) return false;
+    const sh = list[0];
+    const p = sh.properties || {};
+    if (Number(p.sheetId) !== 0 || !DEFAULT_TAB_RE.test(String(p.title || ''))) return false;
+    if ((sh.developerMetadata || []).length) return false;
+    const hasValue = (sh.data || []).some((d) => (d.rowData || []).some((r) => (r.values || []).some((v) => v && v.userEnteredValue && Object.keys(v.userEnteredValue).length)));
+    return !hasValue;
+  } catch (_) {
+    return false;
+  }
+}
+
 /** 新しいスプレッドシートに最初からあるタブの名前 (言語ごと) */
 const DEFAULT_TAB_RE = /^(シート|Sheet)\s*1$/;
 
