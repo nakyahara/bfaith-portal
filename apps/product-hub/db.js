@@ -386,6 +386,21 @@ const LP_SPECS_TRIGGERS = [
 ];
 
 /**
+ * ph_lp_compose_jobs に shoot_spec_id / shoot_spec_hash を足す (画像制作の新フロー PR-C2)。cols = 呼び手が読んだ今の列。
+ * 2 つのプロセスが同時に起動すると、両方が「無い」と見て片方の ALTER が duplicate column で落ちる。それだけは許す
+ * (起動を止めない・lpImgAlters と同じ作法・Codex PR-C2 名指し6 M)
+ */
+export function addLpJobShootSpecColumns(db, cols) {
+  for (const [col, sql] of [
+    ['shoot_spec_id', 'ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_spec_id INTEGER'],
+    ['shoot_spec_hash', 'ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_spec_hash TEXT'],
+  ]) {
+    if (cols.size === 0 || cols.has(col)) continue;
+    try { db.exec(sql); } catch (e) { if (!/duplicate column/i.test(String(e?.message || ''))) throw e; }
+  }
+}
+
+/**
  * 仕様書の表 (ph_lp_specs) の kind の CHECK を、段階1 の ('product_analysis') から
  * ('product_analysis', 'initial_judge') に広げる (画像制作の新フロー PR-C2・2026-10-09)。
  * SQLite は CHECK を ALTER できないので、migrateAdKwCheckConstraints と同じ公式手順
@@ -1617,12 +1632,7 @@ export function initProductHubDB() {
   // LP 構成: 受付時に固めた撮影判定の仕様書「新商品初動判定」の版 (画像制作の新フロー PR-C2)。LP制作システムの spec_id / spec_hash と同じく
   // packet の外にも持ち、claim で packet と突き合わせる (packet だけ書き換えて別の版を渡させない・Codex PR-C2 名指し5 M)。
   // 仕様書を取り込む前の依頼・PR-C (版 5) の依頼は両方 NULL
-  if (lpJobCols.size > 0 && !lpJobCols.has('shoot_spec_id')) {
-    db.exec('ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_spec_id INTEGER');
-  }
-  if (lpJobCols.size > 0 && !lpJobCols.has('shoot_spec_hash')) {
-    db.exec('ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_spec_hash TEXT');
-  }
+  addLpJobShootSpecColumns(db, lpJobCols);
   // LP 構成: 実際に本回答を書いたモデル (2026-10-02・codex exec review #1591 High)。
   // model = 頼んだモデル (reserve)。こちらはランナーが stream-json の assistant.message.model を読んで後から付ける。
   // model_check: match / mismatch / unknown (NULL = まだ付いていない)。一度付けたら書き換えない

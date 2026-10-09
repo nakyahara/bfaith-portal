@@ -103,6 +103,14 @@ const db = dbmod.initProductHubDB();
   eq(dbmod.migrateLpSpecsKindCheck(mem), { migrated: false }, '二度目は何もしない (冪等)');
   mem.close();
 }
+{
+  // 2 つのプロセスが同時に起動した: 古い列の見え方 (shoot_spec_* が無い) のまま、もう片方が足し終えた表に ALTER する
+  const cols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_jobs)').all().map((c) => c.name));
+  ok(cols.has('shoot_spec_id') && cols.has('shoot_spec_hash'), '起動で job に shoot_spec_id / shoot_spec_hash が足されている');
+  let threw = null;
+  try { dbmod.addLpJobShootSpecColumns(db, new Set(['id'])); } catch (e) { threw = e.message; }
+  eq(threw, null, '🚨 もう足されていた (duplicate column) なら起動を止めない (Codex PR-C2 名指し6 M)');
+}
 
 const lp = await import('../apps/product-hub/lib/lp-compose.js');
 const sh = await import('../apps/product-hub/lib/lp-shoot.js');
@@ -496,6 +504,8 @@ console.log('⑧ 撮影指示書 (PR-D) — 仕様書の形 (v2) なら AI の�
 
   // 本番の経路: shootSheetCutsFor (service) が v2 の判定から カット + 概要 を返す
   const svcMod = await import('../apps/product-hub/services/shoot-sheet-service.js');
+  const setMode = (d, mode) => db.prepare('UPDATE draft_image_production SET shoot_mode = ? WHERE draft_id = ?').run(mode, d.id);
+  setMode(dV2, 'inhouse');   // 人が AI のおすすめ (社内撮影) を選んだ
   const m = svcMod.shootSheetCutsFor(db, dV2);
   eq(m.cuts.map((x) => [x.content, x.lp_image ? x.lp_image.split('｜')[0] : '']), [['玄関でスプレーする手元', '2枚目'], ['ボトルを手に持ったサイズ感', '']],
     '🚨 shootSheetCutsFor: AI のカット (LP に無いカットも) を撮影指示書の材料にする');
@@ -515,7 +525,17 @@ console.log('⑧ 撮影指示書 (PR-D) — 仕様書の形 (v2) なら AI の�
   ok(!sheet.aiSummaryStillValid({ slots: [...slots.map((x) => ({ ...x, shoot: x.uid !== 'a0' })), { uid: 'nNew', no: 3, name: '使い方', lines: [], shoot: true }], hasEditShoot: true, aiImages: J.images }),
     '🚨 AI と同じ画像に加えて、足した画像を要撮影にしたなら使わない (AI の概要はその画像を知らない)');
   const le = await import('../apps/product-hub/lib/lp-edit.js');
+  // 🚨 人が撮影判定を AI のおすすめと違う区分にしたら、AI の概要とカットは使わない (カット数・送付対象は区分ごと・Codex PR-C2 名指し6 M)
+  for (const mode of ['photographer', null]) {
+    setMode(dV2, mode);
+    const mm = svcMod.shootSheetCutsFor(db, dV2);
+    ok(/撮影判定を AI のおすすめと違う区分/.test(mm.summary.send_targets) && !mm.summary.conclusion
+      && mm.cuts.length === 1 && mm.cuts[0].content === '玄関でスプレーする手元' && mm.cuts[0].target === '',
+    `撮影判定が ${mode} (AI は社内撮影): 概要は要確認・カットは構成からの拾い方 (LP に無いカットや撮影対象は載せない) (${JSON.stringify(mm.cuts.map((x) => x.content))})`);
+  }
+  setMode(dV2, 'inhouse');
   const dE = mkDraft();
+  setMode(dE, 'inhouse');
   const rE = reserveFor(dE);
   accept(rE, { shoot: goodV2() });
   matchModel(rE.run);
@@ -539,6 +559,14 @@ console.log('⑧ 撮影指示書 (PR-D) — 仕様書の形 (v2) なら AI の�
   const after2 = svcMod.shootSheetCutsFor(db, dE);
   ok(sv2.ok && /要確認/.test(after2.summary.send_targets) && !after2.summary.open_required && !after2.summary.conclusion,
     `🚨 人が要撮影を 2枚目 → 1枚目 に変えたら、AI の送付対象・開封要否・結論は使わず「要確認」 (${JSON.stringify(after2.summary).slice(0, 120)})`);
+  // 🚨 編集版の要撮影 (slots_json) が読めない (壊れた JSON・数が合わない・uid が不正): AI の概要もカットも使わない (Codex PR-C2 名指し6 M)
+  const lastEdit = db.prepare('SELECT * FROM ph_lp_compose_edits WHERE draft_id = ? ORDER BY id DESC LIMIT 1').get(dE.id);
+  for (const [label, sj] of [['壊れた JSON', '{'], ['数が合わない', JSON.stringify(JSON.parse(lastEdit.slots_json).slice(0, 2))], ['uid が不正', JSON.stringify(JSON.parse(lastEdit.slots_json).map((x) => ({ ...x, uid: '../x' })))]]) {
+    db.prepare('INSERT INTO ph_lp_compose_edits (draft_id, base_job_id, slots_json, output_text, edited_by) VALUES (?, ?, ?, ?, ?)').run(dE.id, lastEdit.base_job_id, sj, lastEdit.output_text, 'broken@x');
+    const mb = svcMod.shootSheetCutsFor(db, dE);
+    ok(/要確認/.test(mb.summary.send_targets) && !mb.summary.conclusion && !mb.cuts.some((x) => x.content === 'ボトルを手に持ったサイズ感'),
+      `編集版の要撮影が読めない (${label}): AI の概要・カット (LP に無いカットも) を使わない (${JSON.stringify(mb.cuts.map((x) => x.content))})`);
+  }
 }
 
 console.log('② PR-C の版 (5) の依頼は claim でそのまま受ける (デプロイで待っている依頼を押し直しにしない)');

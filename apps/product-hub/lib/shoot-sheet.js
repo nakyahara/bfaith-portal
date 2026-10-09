@@ -403,6 +403,10 @@ export function aiSummaryStillValid({ slots, hasEditShoot, aiImages }) {
 export const SUMMARY_NEEDS_REVIEW = Object.freeze({
   send_targets: '要確認（LP構成の要撮影を人が直したので、AI が決めた撮影用送付対象は使っていません）',
 });
+/** 撮影判定を AI のおすすめと違う区分にしたときの概要 (カット数・送付対象は区分ごとに決まるので AI の値を使わない・Codex PR-C2 名指し6 M) */
+export const SUMMARY_MODE_CHANGED = Object.freeze({
+  send_targets: '要確認（撮影判定を AI のおすすめと違う区分にしたので、AI が決めた撮影用送付対象・カットは使っていません）',
+});
 
 /**
  * 撮影指示書を作れない理由 (画面のボタンと API で同じ判定)。null なら作れる

@@ -24,7 +24,7 @@ import { effectiveCompose } from '../lib/lp-edit.js';
 import { latestShootJudgement } from '../lib/lp-compose.js';
 import {
   buildShootSheet, cutsFromComposeText, cutsFromSlots, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
-  spreadsheetUrl, MANAGED_SHEETS, SHOOT_SHEET_MODES, SHOOT_JUDGEMENT_LABELS, aiSummaryStillValid, SUMMARY_NEEDS_REVIEW,
+  spreadsheetUrl, MANAGED_SHEETS, SHOOT_SHEET_MODES, SHOOT_JUDGEMENT_LABELS, aiSummaryStillValid, SUMMARY_NEEDS_REVIEW, SUMMARY_MODE_CHANGED,
 } from '../lib/shoot-sheet.js';
 import {
   getSheetsWriteClients, explainGoogleError, findSpreadsheetByAppProperty, spreadsheetUsable,
@@ -80,10 +80,19 @@ export function shootSheetCutsFor(db, draft) {
   const aiImages = sameJob ? judge.images : null;
   // 仕様書の形 (v2・PR-C2) なら AI のカットと概要をそのまま使う。PR-C の形 (v1) は images からの対応づけ (cutsFromSlots の中)
   const v2 = sameJob && judge.format === 2;
-  const aiCuts = v2 ? judge.cuts : null;
-  // 概要は AI が要撮影とした画像のためのもの。人が編集版で要撮影を変えていたら使わない (送付対象は要確認に・Codex PR-C2 名指し4 M)
+  // AI のカット・概要をそのまま使えないとき (Codex PR-C2 名指し4・6 M):
+  //   - 人が撮影判定を AI のおすすめと違う区分にした (社内撮影 ↔ カメラマン撮影 など。カット数・送付対象は区分ごとに決まる)
+  //     → 概要は要確認・カットは構成からの拾い方 (v1 と同じ対応づけ)
+  //   - 編集版はあるが要撮影 (slots_json) が読めない (元の画像の uid で AI のカットを引けない) → 同上
+  //   - 人が編集版で要撮影を変えた (概要は AI が要撮影とした画像のためのもの) → 概要だけ要確認 (カットは画像ごとに引けるので AI のまま)
+  const shootMode = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.shoot_mode ?? null;
+  const modeChanged = v2 && shootMode !== judge.recommended;
+  const editBroken = !!eff.edit && !hasEditShoot;
+  const aiCuts = v2 && !modeChanged && !editBroken ? judge.cuts : null;
   const summary = !v2 ? {}
-    : aiSummaryStillValid({ slots: eff.slots, hasEditShoot, aiImages }) ? { ...judge.summary } : { ...SUMMARY_NEEDS_REVIEW };
+    : modeChanged ? { ...SUMMARY_MODE_CHANGED }
+      : (editBroken || !aiSummaryStillValid({ slots: eff.slots, hasEditShoot, aiImages })) ? { ...SUMMARY_NEEDS_REVIEW }
+        : { ...judge.summary };
   return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages, aiCuts }), summary, source: 'lp', composeJobId: eff.job.id, editId };
 }
 
