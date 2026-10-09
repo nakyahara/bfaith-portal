@@ -39,6 +39,8 @@
  *   master_edit には active の持ち主表 (ops.master_ownership_active_map)・許可の表示用 (ops.new_entry_lease_valid)・鍵の入口 (ops.acquire_new_entry_locks)・
  *   配ったファイル (ops.ne_reg_file)、master_gate には門の記録の 2 版の実行を足す。
  *   広げる道の DB の持ち主の関数 (prepare / widen / cancel / 停止 / 保守の印 / private の _ の関数) はだれにも渡さない
+ * 🆕 0066 (Company DB構想 20 の PR-3・知らせの名前空間): master_edit に名前空間つきで借りる関数 (ops.claim_outbox_events) の実行を足す。
+ *   まとまりの知らせを書く部品 (ops.enqueue_group_snapshot)・形 / 値の確かめ・insert の trigger はだれにも渡さない
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
  *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
@@ -153,6 +155,12 @@ export const WIDEN_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.prepare_master_wid
   'ops.sku_kind_locked()', 'ops.sku_kind_shape_counts(integer)', 'ops.assert_sku_kind_shape_after_restore()', 'ops.session_is_db_owner()',
   'core.guard_sku_kind_locked()', 'core.check_sku_kind_shape()', 'ops.guard_master_ownership_widen()', 'ops.guard_new_entry_gate_results()', 'ops.restrict_ne_reg_file_bytes()',
   'ops.widen_amazon_map_counts(integer)', 'ops._widen_attempt_common(uuid, timestamptz)', 'ops.amazon_map_migration_window(uuid)']);   // 0059 (Amazon の対応の数 = 判定の本体と widen だけが使う)
+/** 🆕 0066 (Company DB構想 20 の PR-3・知らせの名前空間): 画面のロールが実行する = 名前空間つきで借りる (PR-4 の product-hub のまとまりのカードの取り込みが使う)。
+ *   無い DB (0066 の前) では付けない (流し直すと付く)。今の取り込み (ops.claim_card_events) は SKU の知らせだけを借りる = 付けなくても今の動きは変わらない */
+export const OUTBOX_NS_EDIT_FUNCTIONS = Object.freeze(['ops.claim_outbox_events(text, text, text, uuid, bigint, integer, integer, integer)']);
+/** 🆕 0066: だれにも渡さない (まとまりの知らせを書く部品 = PR-5 のまとまりの関数の中だけ・形 / 値の確かめ・insert の trigger) */
+export const OUTBOX_NS_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.enqueue_group_snapshot(bigint, integer, jsonb, uuid, text)', 'ops.group_snapshot_shape_problem(jsonb)',
+  'ops.group_snapshot_problem(smallint, bigint, integer, jsonb)', 'ops.guard_product_hub_outbox_group()']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -222,6 +230,9 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   const ifFn = (sig, body) => `do $$ begin if to_regprocedure('${sig}') is not null then ${body} end if; end $$`;
   for (const f of [...WIDEN_EDIT_FUNCTIONS, ACK_V2_FUNCTION, ...LEASE_GATE_FUNCTIONS, ...WIDEN_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of WIDEN_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0066 (知らせの名前空間): 関数がある DB だけ。前に付けた実行権を外してから付け直す
+  for (const f of [...OUTBOX_NS_EDIT_FUNCTIONS, ...OUTBOX_NS_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of OUTBOX_NS_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、

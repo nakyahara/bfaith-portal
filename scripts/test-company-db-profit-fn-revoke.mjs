@@ -31,7 +31,9 @@ const db = pgliteAdapter(pg);
 const q = async (sql, p) => (await pg.query(sql, p)).rows;
 const FILE_0056 = path.join(DEFAULT_DIR, '0056_amazon_profit_fn_revoke.sql');
 const REVOKE = revokeSigs();
-const KEEP = HEAVY_ENTRY_MANIFEST.filter((e) => e.cls !== 'revoke').map((e) => e.sig);
+// 🆕 0066: 0056 より後の migration で足した関数 (since) は、この試験 (0055 → 0056) の対象の外
+const KEEP = HEAVY_ENTRY_MANIFEST.filter((e) => e.cls !== 'revoke' && !(e.since && e.since > '0056')).map((e) => e.sig);
+const AT_0056 = HEAVY_ENTRY_MANIFEST.filter((e) => !(e.since && e.since > '0056'));
 
 // 本番と同じ順: watcher は 0047 / 0049 / 0050 より前からある (create-watch-roles.mjs が作った) = その migration が watcher に EXECUTE を付けた。
 // profit_reader はまだ本番に無いが、あれば外すことを見る (0055 の後に明示の GRANT を付けておく)
@@ -103,9 +105,9 @@ await t('superuser (PGlite の接続 = 試験の持ち主) は今も呼べる = 
   assert.equal((await q(`select count(*)::int as n from mart.amazon_profit_daily_range(1::smallint, 'amazon', 'jp', '2026-06-01', '2026-06-01')`))[0].n, 0);
 });
 await t('2 回流しても同じ (0056 の本文をもう一度 = 例外なし・全部の manifest の関数の権限の表が同じ / 実行器は 0 本)', async () => {
-  const before = {}; for (const e of HEAVY_ENTRY_MANIFEST) before[e.sig] = await aclText(e.sig);
+  const before = {}; for (const e of AT_0056) before[e.sig] = await aclText(e.sig);
   await pg.exec(fs.readFileSync(FILE_0056, 'utf8'));
-  for (const e of HEAVY_ENTRY_MANIFEST) assert.equal(await aclText(e.sig), before[e.sig], e.sig);
+  for (const e of AT_0056) assert.equal(await aclText(e.sig), before[e.sig], e.sig);
   assert.equal((await applyMigrations(db, { log: quiet, to: '0056' })).applied.length, 0);
   assert.deepEqual(await heavyEntryFindings(db), []);
 });

@@ -71,6 +71,7 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   { sig: 'snapshots.ensure_month_partitions_for(text[], date, date)', cls: 'light', public: true, reason: '月の partition を作る DDL の補助 (default から移す行はその月だけ)' },
   { sig: 'ops.cutover_ts_between(text, timestamp with time zone, timestamp with time zone)', cls: 'light', public: true, reason: '文字の時刻の判定 (表を読まない)' },
   { sig: 'ops.claim_card_events(text, text, uuid, bigint, integer, integer, integer)', cls: 'light', public: false, reason: 'カードの出来事を件数の上限つきで借りる (SECURITY DEFINER・PUBLIC なし)' },
+  { sig: 'ops.claim_outbox_events(text, text, text, uuid, bigint, integer, integer, integer)', cls: 'light', public: false, since: '0066', reason: '名前空間つきの知らせを件数の上限つきで借りる (0066・SECURITY DEFINER・PUBLIC なし)' },
 ]);
 
 export const MANIFEST_CLASSES = Object.freeze(['revoke', 'guard_later', 'light']);
@@ -137,7 +138,7 @@ export async function heavyCandidates(db) {
 
 /**
  * 問題の一覧 (空 = 期待どおり)。読むだけ (pg_proc・pg_roles)。
- *   ① manifest の形 (署名の重なり・分け方・理由) と、全部の署名が DB にある
+ *   ① manifest の形 (署名の重なり・分け方・理由) と、全部の署名が DB にある (🆕 since = 足した migration。その migration をまだ流していない DB では無くてよい)
  *   ② revoke = 権限の表が空 (null = 既定 = 持ち主 + PUBLIC も不可)・PUBLIC と superuser でない全部の役割で has_function_privilege が false
  *   ③ guard_later / light = PUBLIC が呼べるかが manifest のとおり (この PR で変えていない・あとから閉じたら manifest を直す)
  *   ④ 見つける規則にかかる関数が全部 manifest にある
@@ -151,8 +152,13 @@ export async function heavyEntryFindings(db) {
     if (!MANIFEST_CLASSES.includes(e.cls)) findings.push(`manifest の分け方が不正: ${e.sig} (${e.cls})`);
     if (!e.reason) findings.push(`manifest の理由が無い: ${e.sig}`);
     if (e.cls !== 'revoke' && typeof e.public !== 'boolean') findings.push(`manifest に PUBLIC の期待が無い: ${e.sig}`);
+    if (e.since != null && (e.cls === 'revoke' || !/^\d{4}$/.test(e.since))) findings.push(`manifest の since が不正: ${e.sig} (${e.since})`);
     const o = (await q('select to_regprocedure($1)::oid::text as o', [e.sig]))[0].o;
-    if (o == null) { findings.push(`manifest の関数が DB に無い: ${e.sig}`); continue; }
+    if (o == null) {
+      // 🆕 0066: since = その migration で足した関数。まだ流していない DB (配ってから migration の本適用までの間・前の版の試験) では「無い」を問題にしない
+      if (e.since && !(await q('select exists (select 1 from ops.schema_migrations where version = $1) as ok', [e.since]))[0].ok) continue;
+      findings.push(`manifest の関数が DB に無い: ${e.sig}`); continue;
+    }
     if (seen.has(o)) findings.push(`manifest に同じ関数が 2 回: ${e.sig}`);
     seen.add(o); oidOf.set(e.sig, o);
   }
