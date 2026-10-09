@@ -279,15 +279,18 @@ export function shootFormatOfPacket(packet) {
  * (v1 = PR-C の形の検査は変えない)
  */
 // eslint-disable-next-line no-control-regex
-const V2_INVISIBLE_RE = /[\u0080-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const V2_INVISIBLE_RE = /[\u0080-\u009f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/;
+/** 1 行の項目に入れない文字 (改行・タブ・行区切り)。別の項目や警告のように見せさせない (Codex PR-C2 名指し7 L)。判定の結論だけは改行してよい */
+const V2_LINEBREAK_RE = /[\t\n\v\f\r\u2028\u2029]/;
 
 /** 文字の項目を 1 つ見る (前後の空白・長さ・制御文字)。問題が無ければ null */
-function textProblem(v, { max, required, at }) {
+function textProblem(v, { max, required, at, multiline = false }) {
   if (typeof v !== 'string') return `${at} は文字列です`;
   if (v !== v.trim()) return `${at} の前後に空白・改行があります`;
   if (required && !v) return `${at} が空です`;
   if (v.length > max) return `${at} は ${max} 文字までです (${v.length} 文字)`;
-  if (CONTROL_RE.test(v) || V2_INVISIBLE_RE.test(v)) return `${at} に制御文字 (表示の向きを変える文字なども) があります`;
+  if (CONTROL_RE.test(v) || V2_INVISIBLE_RE.test(v)) return `${at} に制御文字 (表示の向きを変える文字・幅の無い文字なども) があります`;
+  if (!multiline && V2_LINEBREAK_RE.test(v)) return `${at} に改行・タブがあります (1 行で書く)`;
   return null;
 }
 
@@ -311,7 +314,7 @@ export function validateShootJudgementV2(raw, { imageNos = null } = {}) {
   const rec = raw.recommended;
   if (typeof rec !== 'string' || !SHOOT_RECOMMENDATIONS.includes(rec)) err(`recommended は ${SHOOT_RECOMMENDATIONS.join(' / ')} のどれかです`);
   const shooting = rec === 'inhouse' || rec === 'photographer';
-  const p = textProblem(raw.conclusion, { max: SHOOT_V2_CONCLUSION_MAX, required: true, at: 'conclusion (判定の結論)' });
+  const p = textProblem(raw.conclusion, { max: SHOOT_V2_CONCLUSION_MAX, required: true, at: 'conclusion (判定の結論)', multiline: true });
   if (p) err(p);
   if (typeof raw.open_required !== 'string' || !SHOOT_OPEN_VALUES.includes(raw.open_required)) err(`open_required (開封要否) は ${SHOOT_OPEN_VALUES.join(' / ')} のどれかです`);
   for (const [k, label] of SHOOT_V2_SUMMARY_FIELDS) {
@@ -425,13 +428,16 @@ export function validateShootJudgementV2(raw, { imageNos = null } = {}) {
  * 仕様書の運用ルールのうち、**強制はせず知らせるだけ**のもの (画面と `./phlp lint --shoot` に出す)。
  * 🚨 ここに決まりを増やさない — 仕様書が変わるたびにコードを直すことになる。判定は AI が仕様書に従ってする。
  * いまは「カメラマン撮影は 5 カット単位」(仕様書の最終チェック・担当者向け手順 5) だけ。v1 (PR-C の形) には出さない
- * (撮影指示書のシートにも同じ知らせが出る = lib/shoot-sheet.js の cutCountWarning)
+ * (撮影指示書のシートにも同じ知らせが出る = lib/shoot-sheet.js の cutCountWarning)。
+ * 🚨 **その依頼に固めた仕様書の本文 (specText) が「5カット単位」と言っているときだけ**出す (Codex PR-C2 名指し7 M)。
+ *    仕様書から決まりが消えたら、コードを直さなくても警告も消える (古い決まりでスタッフに直させない)
  */
-export function shootWarnings(value) {
+export const PHOTOGRAPHER_UNIT_RE = /5\s*カット単位/;
+export function shootWarnings(value, { specText = '' } = {}) {
   const out = [];
   if (!value || !Array.isArray(value.cuts) || value.format === 1) return out;
   const n = value.cuts.length;
-  if (value.recommended === 'photographer' && n % 5 !== 0) {
+  if (value.recommended === 'photographer' && n % 5 !== 0 && PHOTOGRAPHER_UNIT_RE.test(String(specText || ''))) {
     out.push(`カメラマン撮影は 5 カット単位です (仕様書「新商品初動判定」) が、${n} カットです`);
   }
   return out;
@@ -451,7 +457,7 @@ const blankV2Cut = () => Object.fromEntries(SHOOT_V2_CUT_FIELDS.map(([k]) => [k,
  * v1 (PR-C の形で保存済みの行) は v2 の形に寄せる: 撮影が要る画像を 1 カットずつ (撮影内容 = cut・完成イメージ = composition・
  * 注意 = ng) にし、v1 に無い項目は ""
  */
-export function shootReadModel(value) {
+export function shootReadModel(value, { specText = '' } = {}) {
   if (!value) return null;
   const v2 = Array.isArray(value.cuts);
   let cuts;
@@ -484,7 +490,7 @@ export function shootReadModel(value) {
     cut_count: cuts.length,
     images,
   };
-  model.warnings = shootWarnings(model);
+  model.warnings = shootWarnings(model, { specText });
   return model;
 }
 
@@ -529,7 +535,7 @@ export const SHOOT_SPEC_INSTRUCTION = [
   '- "inhouse" か "photographer" なら cuts を 1 つ以上書き、send_targets・purpose・finish・usage は空にしない',
   '- open_required (全体) はカットの開封要否のまとめ: 全部 "不要" なら "不要" / 全部 "必要" なら "必要" / 混ざれば "一部必要"。"none" なら "不要"',
   '- 画像とカットは両向きで合わせる: lp_image_nos に入れた画像は needs_shoot を true にし、needs_shoot が true の画像はどれかのカットの lp_image_nos に入れる',
-  `- 文字は ${SHOOT_FIELD_MAX} 字まで (conclusion は ${SHOOT_V2_CONCLUSION_MAX} 字まで)。文字の前後に空白や改行を入れない。無い値は "" (lp_image_nos だけは [])`,
+  `- 文字は ${SHOOT_FIELD_MAX} 字まで (conclusion は ${SHOOT_V2_CONCLUSION_MAX} 字まで)。文字の前後に空白や改行を入れない。conclusion 以外は 1 行で書く (改行・タブを入れない)。無い値は "" (lp_image_nos だけは [])`,
   '- 材料に無い素材を「ある」ことにしない。色名・種類名が分からなければ「要確認」と書く',
   '- lint の warnings は仕様書の運用ルールの知らせです (通らないわけではありません)。仕様書を読み直して、直すべきなら直してください',
   '',

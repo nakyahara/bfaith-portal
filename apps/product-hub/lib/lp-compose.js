@@ -1073,6 +1073,14 @@ export function submitResult(db, generationId, {
   }).immediate();
 }
 
+/** その依頼に固めた撮影判定の仕様書 (新商品初動判定) の本文。警告 (shootWarnings) が仕様書に書いてある決まりだけを出すのに使う */
+function shootSpecTextOf(db, job) {
+  const id = posInt(job?.shoot_spec_id);
+  if (!id) return '';
+  const row = db.prepare('SELECT body, hash, kind FROM ph_lp_specs WHERE id = ?').get(id);
+  return row && row.kind === 'initial_judge' && row.hash === job.shoot_spec_hash ? String(row.body || '') : '';
+}
+
 /** 依頼の packet が求める撮影判定の形 (1 | 2)。読めなければ 1 */
 function packetShootFormat(job) {
   try { return shootFormatOfPacket(JSON.parse(job.packet_json)); } catch { return 1; }
@@ -1197,7 +1205,7 @@ export function lintForJob(db, jobId, { leaseToken, output, shoot = undefined, n
     if (shoot === undefined || shoot === null) return { ok: true, lint };
     const sv = validateShootForComposition(shoot, out, { format: packetShootFormat(l.job) });
     // warnings = 仕様書の運用ルールの知らせ (通らないわけではない・PR-C2)。実行役が仕様書を読み直して直せるように返す
-    return { ok: true, lint, shoot: sv.ok ? { ok: true, errors: [], warnings: shootWarnings(sv.value) } : { ok: false, errors: sv.errors, warnings: [] } };
+    return { ok: true, lint, shoot: sv.ok ? { ok: true, errors: [], warnings: shootWarnings(sv.value, { specText: shootSpecTextOf(db, l.job) }) } : { ok: false, errors: sv.errors, warnings: [] } };
   } catch (e) {
     return { code: 'lint_failed', error: `lint を実行できませんでした: ${String(e?.message || e).slice(0, 200)}` };
   }
@@ -1389,7 +1397,7 @@ function emptyShootJudgement(jobId, missing) {
 export function latestShootJudgement(db, draftId) {
   const id = posInt(draftId);
   if (!id) return null;
-  const job = db.prepare(`SELECT j.id, j.status, j.output_text, j.shoot_json, j.shoot_error, j.packet_json, g.model_check
+  const job = db.prepare(`SELECT j.id, j.status, j.output_text, j.shoot_json, j.shoot_error, j.packet_json, j.shoot_spec_id, j.shoot_spec_hash, g.model_check
     FROM ph_lp_compose_jobs j LEFT JOIN ph_lp_compose_generations g ON g.job_id = j.id
     WHERE j.draft_id = ? ORDER BY j.id DESC LIMIT 1`).get(id);
   if (!job || job.status !== 'done' || job.model_check !== 'match' || !trim(job.output_text)) return null;
@@ -1403,7 +1411,7 @@ export function latestShootJudgement(db, draftId) {
     } catch { value = null; }
   }
   if (!value) return emptyShootJudgement(job.id, job.shoot_json || job.shoot_error ? 'invalid' : 'not_sent');
-  return { job_id: job.id, available: true, ...shootReadModel(value), missing: null };
+  return { job_id: job.id, available: true, ...shootReadModel(value, { specText: shootSpecTextOf(db, job) }), missing: null };
 }
 
 /**

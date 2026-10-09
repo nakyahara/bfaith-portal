@@ -165,9 +165,12 @@ console.log('③ 形 v2 の検査 (lib/lp-shoot.js・純粋関数)');
   ok(sh.validateShootJudgementV2(photo, { imageNos: [0, 1, 2] }).ok, 'カメラマン撮影 5 カットは通る');
   const photo7 = { ...photo, cuts: [1, 2, 3, 4, 5, 6, 7].map((n) => cutOf(n, { lp_image_nos: n === 1 ? [2] : [] })) };
   ok(sh.validateShootJudgementV2(photo7, { imageNos: [0, 1, 2] }).ok, '🚨 カメラマン撮影 7 カットも通る (5 カット単位は仕様書の運用ルール = 強制しない)');
-  eq(sh.shootWarnings(sh.validateShootJudgementV2(photo7, { imageNos: [0, 1, 2] }).value), ['カメラマン撮影は 5 カット単位です (仕様書「新商品初動判定」) が、7 カットです'], '代わりに警告を出す');
-  eq(sh.shootWarnings(sh.validateShootJudgementV2(photo, { imageNos: [0, 1, 2] }).value), [], '5 カットなら警告なし');
-  eq(sh.shootWarnings(sh.validateShootJudgementV2(goodV2(), { imageNos: [0, 1, 2] }).value), [], '社内撮影には 5 カットの警告を出さない');
+  const SPEC5 = '| カメラマン最低5カット | 撮影判定が③カメラマン撮影になった場合、撮影枚数は5カット単位で運用する。';
+  eq(sh.shootWarnings(sh.validateShootJudgementV2(photo7, { imageNos: [0, 1, 2] }).value, { specText: SPEC5 }), ['カメラマン撮影は 5 カット単位です (仕様書「新商品初動判定」) が、7 カットです'], '代わりに警告を出す (仕様書に「5カット単位」があるとき)');
+  eq(sh.shootWarnings(sh.validateShootJudgementV2(photo7, { imageNos: [0, 1, 2] }).value, { specText: '| カメラマン | 必要な枚数だけ撮る。' }), [],
+    '🚨 その依頼の仕様書から「5カット単位」が消えていたら警告も出さない (古い決まりでスタッフに直させない・Codex PR-C2 名指し7 M)');
+  eq(sh.shootWarnings(sh.validateShootJudgementV2(photo, { imageNos: [0, 1, 2] }).value, { specText: SPEC5 }), [], '5 カットなら警告なし');
+  eq(sh.shootWarnings(sh.validateShootJudgementV2(goodV2(), { imageNos: [0, 1, 2] }).value, { specText: SPEC5 }), [], '社内撮影には 5 カットの警告を出さない');
 
   const bad = (raw, why, nos = [0, 1, 2]) => {
     const r = sh.validateShootJudgementV2(raw, { imageNos: nos });
@@ -198,6 +201,10 @@ console.log('③ 形 v2 の検査 (lib/lp-shoot.js・純粋関数)');
   bad({ ...goodV2(), finish: 'a' + String.fromCharCode(1) }, '完成イメージに制御文字');
   bad({ ...goodV2(), send_targets: '商品A\u0085商品B' }, '🚨 C1 制御文字 (U+0085 は改行に見える・Codex PR-C2 名指し4 L)');
   bad({ ...goodV2(), conclusion: '確認\u202Eです' }, '🚨 表示の向きを変える文字 (U+202E)');
+  bad({ ...goodV2(), send_targets: 'ブラック (1本)\n⚠ 要再確認' }, '🚨 1 行の項目に改行 (別の警告のように見せさせない・Codex PR-C2 名指し7 L)');
+  bad(withCut({ target: 'ブラック\u2028(1本)' }), '🚨 1 行の項目に行区切り (U+2028)');
+  bad(withCut({ content: '手元\u200Bの写真' }), '🚨 幅の無い文字 (U+200B)');
+  ok(sh.validateShootJudgementV2({ ...goodV2(), conclusion: '社内撮影で足ります。\n2枚目の手元だけ撮ります。' }, { imageNos: [0, 1, 2] }).ok, '判定の結論は改行してよい');
   bad(withCut({ target: 'ブラック\u2066(1本)' }), '🚨 カットにも表示の向きを変える文字 (U+2066)');
   bad({ ...noneV2(), send_targets: 'ブラック (1本)' }, '🚨 追加撮影不要なのに撮影用送付対象がある (食い違い)');
   bad({ ...noneV2(), cuts: [cutOf(1, { lp_image_nos: [] })] }, '🚨 追加撮影不要なのに撮影カットがある (食い違い)');
@@ -331,7 +338,7 @@ let dV1, rV1;
 }
 
 console.log('① 仕様書「新商品初動判定」を取り込む (追記専用・種類ごとの最新版)');
-const JUDGE_BODY = '## 使い方\n新商品初動判定｜社内共有版\n\n## システム本文\n' + '判定ロジック。'.repeat(3000);
+const JUDGE_BODY = '## 使い方\n新商品初動判定｜社内共有版\n\n## システム本文\nカメラマン最低5カット\t撮影判定が③カメラマン撮影になった場合、撮影枚数は5カット単位で運用する。\n' + '判定ロジック。'.repeat(3000);
 const judge = lp.importSpec(db, { kind: 'initial_judge', title: '新商品初動判定', body: JUDGE_BODY, sheetTitles: ['使い方', 'システム本文'], actor: 'admin@x' });
 {
   ok(judge.ok && judge.created && judge.spec.kind === 'initial_judge', '取り込める (kind = initial_judge)');

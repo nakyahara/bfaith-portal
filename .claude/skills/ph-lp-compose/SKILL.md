@@ -247,7 +247,7 @@ claim で来た **`shoot_instruction`** に従って、その構成の画像を�
 ```
 
 サーバが見ること (`./phlp lint --shoot` で同じ検査を先に受けられる):
-- キーはこの形のものだけで、**どの項目も省略しない** (無い値は `""`、`lp_image_nos` だけは配列で LP に無いカットなら `[]`)
+- キーはこの形のものだけで、**どの項目も省略しない** (無い値は `""`、`lp_image_nos` だけは配列で LP に無いカットなら `[]`)。`conclusion` 以外は 1 行 (改行・タブを入れない)
 - `recommended` は `none` / `inhouse` / `photographer`。`open_required` は `不要` / `必要` / `一部必要`。カットの `priority`・`expression_type`・
   `variation`・`open_required` は `shoot_instruction` に書いてある値のどれか。カットの `no` は 1 からの連番
 - `none` なら `cuts` は `[]`・`send_targets`・`purpose`・`finish`・`usage` は `""`・`needs_shoot` はすべて false。
