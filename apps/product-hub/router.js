@@ -1663,7 +1663,8 @@ router.post('/api/drafts/:id/shoot-mode', (req, res) => {
 // 材料 (カット) はサーバが LP構成から組む (shootSheetCutsFor)。呼び手からは受けない (cuts を送ると 400)。
 // body: { mention?: '宛先' (画面のその回だけの宛先。依頼文のタブに入れる。省略ならいつもの宛先),
 //         replace_manual_url?: 'URL' (手で貼った URL を置き換えてよいと確かめたときの、その URL。今の URL と同じときだけ置き換える),
-//         overwrite_file_id?: 'ID' (前に作りかけた撮影指示書を上書きしてよいと確かめたときの、そのファイルの ID) }
+//         overwrite_file_id?: 'ID' (既にある撮影指示書を上書きしてよいと確かめたときの、そのファイルの ID。上書きには必ず要る),
+//         seen_url: 'URL' (必須。画面を開いたときの撮影指示書の URL・無ければ空。今と違えば 409) }
 router.post('/api/drafts/:id/shoot-sheet', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
@@ -1688,9 +1689,13 @@ router.post('/api/drafts/:id/shoot-sheet', async (req, res) => {
   if (b.overwrite_file_id !== undefined && b.overwrite_file_id !== null && (typeof b.overwrite_file_id !== 'string' || !/^[A-Za-z0-9_-]{5,200}$/.test(b.overwrite_file_id))) {
     return res.status(400).json({ ok: false, error: 'overwrite_file_id はファイルの ID で指定してください' });
   }
+  // 画面を開いたときの撮影指示書の URL (必須)。今と違えば 409 (古い画面から押した)
+  if (typeof b.seen_url !== 'string' || b.seen_url.length > 1000) {
+    return res.status(400).json({ ok: false, error: 'seen_url (画面を開いたときの撮影指示書の URL。無ければ空) を指定してください' });
+  }
   const r = await createOrUpdateShootSheet(draft.id, {
     mention, actor: actorOf(req), replaceManualUrl: typeof b.replace_manual_url === 'string' ? b.replace_manual_url.trim() : null,
-    overwriteFileId: typeof b.overwrite_file_id === 'string' ? b.overwrite_file_id : null,
+    overwriteFileId: typeof b.overwrite_file_id === 'string' ? b.overwrite_file_id : null, seenUrl: b.seen_url,
   });
   if (!r.ok) {
     return res.status(r.status || 500).json({ ok: false, code: r.code, error: r.error,

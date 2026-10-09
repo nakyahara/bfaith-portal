@@ -129,15 +129,28 @@ export class TabConflictError extends Error {
   }
 }
 
-/** 1 行ぶんのセル。値は stringValue = 文字のまま (数式・数値として解釈させない) */
-const rowData = (row) => ({ values: row.map((c) => ({ userEnteredValue: { stringValue: c == null ? '' : String(c) } })) });
+/**
+ * 式のセル (PR-F のデザイナー修正依頼書の `=IMAGE("…")` など)。**呼び手が自分で組んだ式だけ**に使う —
+ * AI の出力・人の入力をそのまま入れない (それは文字のセル = 普通の string で渡す)
+ */
+export const formulaCell = (formula) => {
+  const f = String(formula || '');
+  if (!f.startsWith('=')) throw new Error('式は = で始めてください');
+  return { __formula: f };
+};
+/** 1 セル。文字は stringValue = 文字のまま (数式・数値として解釈させない)。formulaCell() だけが式になる */
+const cellData = (c) => (c && typeof c === 'object' && typeof c.__formula === 'string'
+  ? { userEnteredValue: { formulaValue: c.__formula } }
+  : { userEnteredValue: { stringValue: c == null ? '' : String(c) } });
+const rowData = (row) => ({ values: row.map(cellData) });
 
 /**
  * スプレッドシートの中身を差し替える。
  * 🚨 タブの足し引き・値の消去と書き込み・書式を **spreadsheets.batchUpdate 1 回** にまとめる。
  *    batchUpdate は 1 回の中の要求をまとめて適用する (どれかが失敗すれば全部が適用されない) ので、
  *    「消した後の書き込みで失敗して、済の指示書が空になる」が起きない (Codex PR-D 名指し High)
- * 🚨 値は userEnteredValue.stringValue で書く = 数式として評価させない (`=IMPORTXML(...)` も文字のまま)
+ * 🚨 値は userEnteredValue.stringValue で書く = 数式として評価させない (`=IMPORTXML(...)` も文字のまま)。
+ *    式にしたいセルだけ formulaCell('=IMAGE("…")') で渡す (呼び手が自分で組んだ式に限る)
  *
  * タブの持ち主: 書き込み係が足したタブには developer metadata の印 (OWNED_TAB_KEY) を付ける。
  *   - 書くタブが既にあり、印が無い (人が作った同じ名前のタブ) → TabConflictError (上書きしない。作ったばかりのファイルでも)
@@ -153,7 +166,7 @@ const rowData = (row) => ({ values: row.map((c) => ({ userEnteredValue: { string
  * @param {Function} [o.beforeWrite]  batchUpdate を送る直前に呼ぶ確認 ({ existing: [{sheetId, title, owned}] } を渡す。throw すれば送らない)。
  *   呼び手が「待っている間に材料・持ち主が変わっていないか」を見る口 (Codex PR-D 名指し2 High)
  */
-export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title, tabs, removeTabs = [], fresh = false, beforeWrite = null }) {
+export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title, tabs, removeTabs = [], fresh = false, beforeWrite = null, onWritten = null }) {
   const opt = { timeout: GOOGLE_TIMEOUT_MS };
   const got = await sheets.spreadsheets.get({
     spreadsheetId,
@@ -217,6 +230,14 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
         fields: 'userEnteredFormat.backgroundColor',
       } });
     }
+    // 行の高さ (PR-F: 画像を出す行を高くする)。[{ start, end, px }] (start 以上 end 未満の行)
+    for (const rh of f.rowHeights || []) {
+      requests.push({ updateDimensionProperties: {
+        range: { sheetId, dimension: 'ROWS', startIndex: Number(rh.start) || 0, endIndex: Number(rh.end) || (Number(rh.start) || 0) + 1 },
+        properties: { pixelSize: Number(rh.px) || 21 },
+        fields: 'pixelSize',
+      } });
+    }
     (f.columnWidths || []).forEach((px, i) => {
       requests.push({ updateDimensionProperties: {
         range: { sheetId, dimension: 'COLUMNS', startIndex: i, endIndex: i + 1 },
@@ -235,6 +256,7 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
   }
   if (beforeWrite) beforeWrite({ existing: existing.map((p) => ({ sheetId: p.sheetId, title: p.title, owned: p.owned })) });
   await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } }, opt);
+  if (onWritten) onWritten();
 
   // 4. ファイル名 (違うときだけ)。中身とは別の呼び出しだが、失敗しても中身は新しい版のまま (名前だけ古い)
   if (title && drive) {

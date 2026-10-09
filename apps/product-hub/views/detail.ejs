@@ -1759,7 +1759,7 @@ th.attr-unknown { color: #dc2626; }
         <h3 class="ipf-h"><span class="ipf-no">3</span>撮影指示書</h3>
         <%# 商品の画像フォルダにスプレッドシートを作り、URL を下の欄に入れる。画面の動きは initShootSheet (@shoot-sheet)。
             材料は LP構成 (services/shoot-sheet-service.js の shootSheetCutsFor) %>
-        <div class="field" id="shoot-sheet" data-ours="<%= shootSheet.ours ? '1' : '0' %>">
+        <div class="field" id="shoot-sheet" data-ours="<%= shootSheet.ours ? '1' : '0' %>" data-seen-url="<%= ip.camera_instruction_url || '' %>" data-file-id="<%= shootSheet.ours ? (shootSheet.fileId || '') : '' %>">
           <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
             <button type="button" class="btn <%= shootSheet.ours ? '' : 'btn-primary' %> btn-sm" id="shoot-sheet-btn" <%= shootSheet.blocked ? 'disabled' : '' %>><%= shootSheet.ours ? '撮影指示書を更新' : '撮影指示書を作成 (スプレッドシート)' %></button>
             <% if (shootSheet.ours) { %><a href="<%= shootSheet.url %>" target="_blank" rel="noopener" class="btn btn-sm" id="shoot-sheet-open">開く ↗</a><% } %>
@@ -6277,7 +6277,11 @@ th.attr-unknown { color: #dc2626; }
       say(ours ? '更新しています…' : '作成しています… (10〜20 秒かかります)');
       // 依頼文のタブには、画面の撮影依頼文と同じ宛先 (その回だけ直した欄の値) を入れる — Codex PR-D 名指し M
       const mentionEl = doc.getElementById('shoot-req-mention');
-      const base = mentionEl ? { mention: String(mentionEl.value || '') } : {};
+      // 画面を開いたときの指示書の URL を添える (別のタブで作った・貼り替えた後の古い画面ならサーバが止める)。
+      // 作成済みの指示書の更新は、上で確かめたのでそのファイルを添える (無いとサーバがもう一度確かめさせる)
+      const base = { seen_url: String(box.dataset.seenUrl || '') };
+      if (ours && box.dataset.fileId) base.overwrite_file_id = box.dataset.fileId;
+      if (mentionEl) base.mention = String(mentionEl.value || '');
       let json = await send(base);
       // 手で貼った指示書の URL が入っている: 置き換えてよいかを聞いてから、確かめた URL を添えて送り直す
       // (確かめた後に別の URL に貼り替えられていたら、サーバがもう一度 409 で止める)

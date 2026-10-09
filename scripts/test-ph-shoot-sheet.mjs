@@ -14,7 +14,7 @@ import {
   spreadsheetUrl, CUT_COLUMNS, MAX_CUTS,
 } from '../apps/product-hub/lib/shoot-sheet.js';
 import {
-  writeSpreadsheet, findSpreadsheetByAppProperty, spreadsheetUsable, createSpreadsheetInFolder,
+  writeSpreadsheet, formulaCell, findSpreadsheetByAppProperty, spreadsheetUsable, createSpreadsheetInFolder,
   explainGoogleError, getSheetsWriteClients,
 } from '../apps/product-hub/services/sheets-writer.js';
 
@@ -231,6 +231,15 @@ function fakeSheets(initialTabs, { failBatch = false } = {}) {
   let seen = null;
   await writeSpreadsheet(g7, { spreadsheetId: 'S1', tabs: inh.sheets, beforeWrite: (ctx) => { seen = ctx; } });
   ok(JSON.stringify(seen && seen.existing.map((t) => [t.title, t.owned])) === '[["撮影指示",true],["人のメモ",false]]', '送る直前の確認には、今あるタブと印の有無を渡す (拾い直したファイルに指示書があるかを呼び手が見る)', JSON.stringify(seen));
+  // PR-F (デザイナー修正依頼書) 向け: 呼び手が組んだ式だけ式のセル・行の高さ
+  const g9 = fakeSheets([{ title: 'シート1' }]);
+  await writeSpreadsheet(g9, { spreadsheetId: 'S1', fresh: true, tabs: [{ name: '修正依頼', rows: [['画像', '修正指示'], [formulaCell('=IMAGE("https://drive.google.com/thumbnail?id=abc")'), '=人の入力']], format: { rowHeights: [{ start: 1, end: 2, px: 200 }] } }] });
+  const w9 = g9.reqs().filter((r) => r.updateCells && r.updateCells.rows)[0].updateCells.rows;
+  ok(w9[1].values[0].userEnteredValue.formulaValue === '=IMAGE("https://drive.google.com/thumbnail?id=abc")' && w9[1].values[1].userEnteredValue.stringValue === '=人の入力' && !('formulaValue' in w9[1].values[1].userEnteredValue),
+    '式のセルは formulaCell() で渡したものだけ (= で始まる普通の文字は文字のまま)', JSON.stringify(w9));
+  ok(g9.reqs().some((r) => r.updateDimensionProperties && r.updateDimensionProperties.range.dimension === 'ROWS' && r.updateDimensionProperties.range.startIndex === 1 && r.updateDimensionProperties.properties.pixelSize === 200), '行の高さを指定できる');
+  let threwF = false; try { formulaCell('IMAGE(x)'); } catch { threwF = true; }
+  ok(threwF, '式は = で始まるものだけ');
   const g4 = fakeSheets([{ title: '撮影指示', owned: true }], { failBatch: true });
   await throwsAsync('batchUpdate が失敗したら throw (呼び手が URL を書かない)', () => writeSpreadsheet(g4, { spreadsheetId: 'S1', title: 'x', tabs: inh.sheets }), 'Backend');
   ok(!g4.calls.some((c) => c[0] === 'driveUpdate'), '失敗したら名前も付け直さない');

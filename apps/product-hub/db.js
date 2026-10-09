@@ -2915,7 +2915,13 @@ export function normalizeShootMention(v) {
 export function getShootMention(db, env = process.env) {
   const row = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(SHOOT_MENTION_KEY);
   const last = db.prepare('SELECT actor, created_at FROM ph_setting_events WHERE key = ? ORDER BY id DESC LIMIT 1').get(SHOOT_MENTION_KEY) || null;
-  const envMention = env.PH_SHOOT_REQUEST_MENTION === undefined ? null : String(env.PH_SHOOT_REQUEST_MENTION).trim().slice(0, SHOOT_MENTION_MAX);
+  // env も画面と同じ検査 (1 行・60 文字)。通らなければ既定に倒す (依頼文に複数行を差し込ませない — Codex PR-D 名指し5 L)
+  let envMention = null;
+  if (env.PH_SHOOT_REQUEST_MENTION !== undefined) {
+    const n = normalizeShootMention(String(env.PH_SHOOT_REQUEST_MENTION));
+    if (n.error) console.warn(`[product-hub] PH_SHOOT_REQUEST_MENTION が使えないので既定の宛先にします: ${n.error}`);
+    else envMention = n.value;
+  }
   const initial = envMention ?? SHOOT_MENTION_DEFAULT;
   if (row && row.value != null) {
     return { value: String(row.value), source: 'db', initial, initialSource: envMention != null ? 'env' : 'default', updatedAt: last?.created_at || null, updatedBy: last?.actor || null };
