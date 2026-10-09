@@ -6891,8 +6891,12 @@ let wfSetParentId = null;
       r = await sheetCall({ replace_manual_url: 'https://docs.google.com/spreadsheets/d/other-hand/edit' });
       check('🚨 撮影指示書: 確かめた URL と今の URL が違えば (確かめた後に貼り替えられた) もう一度 409・URL は変えない',
         r.status === 409 && r.json?.code === 'manual_url' && ipS().camera_instruction_url === MANUAL, JSON.stringify(r));
+      const b409 = g.batches;
       r = await sheetCall({ replace_manual_url: MANUAL });
-      check('撮影指示書: 置き換えてよいと確かめた URL を添えれば、前に作ったファイルを上書きして URL を戻す (新しく作らない)',
+      check('🚨 撮影指示書: 手で貼った URL を置き換えてよくても、前に作ったファイル (画面に出ていない) を上書きするときはもう一度確かめる (recovered_file・名指し4 M)',
+        r.status === 409 && r.json?.code === 'recovered_file' && r.json?.file_id === f1.id && g.batches === b409 && ipS().camera_instruction_url === MANUAL, JSON.stringify(r));
+      r = await sheetCall({ replace_manual_url: MANUAL, overwrite_file_id: f1.id });
+      check('撮影指示書: 置き換えてよいと確かめた URL と、上書きしてよいファイルを添えれば、前に作ったファイルを上書きして URL を戻す (新しく作らない)',
         r.status === 200 && ipS().camera_instruction_url === URL_OF(f1.id) && filesIn().length === 1, JSON.stringify(r));
 
       // Google の失敗: URL を書かない・理由を返す・履歴に残す
@@ -6941,6 +6945,17 @@ let wfSetParentId = null;
         check('撮影指示書: 確かめたファイルの ID を添えれば、そのファイルを上書きして記録する (2 つ作らない)',
           r.status === 200 && ipR().camera_instruction_url === URL_OF(orphanR.id) && filesIn().filter((f) => f.appProperties.phShootSheetDraft === String(idR)).length === 1, JSON.stringify(r));
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idR);
+      }
+
+      // 🚨 作ったばかりのファイルに、人が「撮影指示」という同じ名前のタブをすぐ作った: 上書きしない (名指し4 M)
+      {
+        g.files.get(ipF().shoot_sheet_file_id).trashed = true;
+        g.onSget = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 7, title: '撮影指示', values: [['人がすぐ書いた']] });
+        r = await call('POST', `/api/drafts/${idF}/shoot-sheet`, {});
+        const fx = filesIn().filter((f) => f.appProperties.phShootSheetDraft === String(idF)).at(-1);
+        check('🚨 撮影指示書: 作ったばかりでも、人がすぐ作った同じ名前のタブ (印なし) は上書きせず 409',
+          r.status === 409 && r.json?.code === 'tab_conflict' && JSON.stringify(tabOf(fx, '撮影指示')?.values) === '[["人がすぐ書いた"]]', JSON.stringify(r));
+        fx.trashed = true;
       }
 
       // 前に作ったファイルがごみ箱に → 作り直して URL を替える。作った直後 (タブを読む前) に人が足したタブは消さない

@@ -140,7 +140,7 @@ const rowData = (row) => ({ values: row.map((c) => ({ userEnteredValue: { string
  * 🚨 値は userEnteredValue.stringValue で書く = 数式として評価させない (`=IMPORTXML(...)` も文字のまま)
  *
  * タブの持ち主: 書き込み係が足したタブには developer metadata の印 (OWNED_TAB_KEY) を付ける。
- *   - 書くタブが既にあり、印が無い (人が作った同じ名前のタブ) → TabConflictError (上書きしない)
+ *   - 書くタブが既にあり、印が無い (人が作った同じ名前のタブ) → TabConflictError (上書きしない。作ったばかりのファイルでも)
  *   - removeTabs のタブは、印があるときだけ消す (人が作った同じ名前のタブは消さない)
  *   - fresh (この呼び出しで作ったばかり) のときだけ、最初からある「シート1」などを消す
  * @param {{sheets, drive}} clients
@@ -174,7 +174,8 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
     const width = Math.max(1, ...t.rows.map((r) => r.length));
     const cur = byTitle.get(t.name);
     if (cur) {
-      if (!cur.owned && !fresh) throw new TabConflictError(t.name);
+      // 作ったばかりでも、印の無い同じ名前のタブは人が作ったもの (作った直後に足された) — 上書きしない (Codex PR-D 名指し4 M)
+      if (!cur.owned) throw new TabConflictError(t.name);
       ids.set(t.name, cur.sheetId);
       // 行・列が足りなければ広げる (人が行を消していても書ける)
       const g = cur.gridProperties || {};

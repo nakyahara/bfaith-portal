@@ -190,7 +190,9 @@ async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, 
   let recovered = false;
   try {
     // 1. 前に作ったファイルが使えればそれ (消された・ごみ箱・別フォルダに移ったなら作り直す)
-    if (prevFileId && (await spreadsheetUsable(clients, { fileId: prevFileId, folderId })).usable) fileId = prevFileId;
+    //    指示書の URL が手で貼り替えられている (ours でない) ときは、前に作ったファイルは画面に出ていない =
+    //    上書きの確認が出ていないので、拾い直しと同じく確かめる (Codex PR-D 名指し4 M)
+    if (prevFileId && (await spreadsheetUsable(clients, { fileId: prevFileId, folderId })).usable) { fileId = prevFileId; recovered = !ours; }
     // 2. DB に書く前に止まったファイルを拾い直す (既にあるファイル = 人が足したタブがありうるので fresh にしない)
     if (!fileId) {
       const found = await findSpreadsheetByAppProperty(clients, { folderId, key: APP_PROP_KEY, value: String(id) });
