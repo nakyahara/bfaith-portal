@@ -884,6 +884,29 @@ export function migrateCompositeShippingGroups(db) {
   return moved;
 }
 
+/**
+ * デザイナー修正依頼書 (PR-F) の表を今の形にそろえる (PR-F の途中の版で作った DB 向け)。initProductHubDB から呼ぶ。何度呼んでもよい
+ */
+export function migrateDesignerSheetTables(db) {
+  // writing_images_json … Google に送った画像の一覧 (書いている途中で止まったら、片付けでこの画像の公開を残す)
+  const dsCols = new Set(db.prepare('PRAGMA table_info(ph_designer_sheets)').all().map((c) => c.name));
+  if (!dsCols.has('writing_images_json')) db.exec('ALTER TABLE ph_designer_sheets ADD COLUMN writing_images_json TEXT');
+  // PR-F の途中の版は permission_id が NOT NULL だった (付ける前に ID なしで記録できない) → 作り直して移す
+  const pid = db.prepare('PRAGMA table_info(ph_designer_sheet_shares)').all().find((c) => c.name === 'permission_id');
+  if (pid && pid.notnull) {
+    db.transaction(() => {
+      db.exec(`ALTER TABLE ph_designer_sheet_shares RENAME TO ph_designer_sheet_shares_old;
+        CREATE TABLE ph_designer_sheet_shares (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER NOT NULL, drive_file_id TEXT NOT NULL, permission_id TEXT,
+          image_id INTEGER, shared_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), shared_by TEXT, revoked_at TEXT, revoke_error TEXT);
+        INSERT INTO ph_designer_sheet_shares (id, draft_id, drive_file_id, permission_id, image_id, shared_at, shared_by, revoked_at, revoke_error)
+          SELECT id, draft_id, drive_file_id, permission_id, image_id, shared_at, shared_by, revoked_at, revoke_error FROM ph_designer_sheet_shares_old;
+        DROP TABLE ph_designer_sheet_shares_old;
+        CREATE INDEX IF NOT EXISTS idx_ph_designer_sheet_shares_draft ON ph_designer_sheet_shares(draft_id, revoked_at);`);
+    })();
+  }
+}
+
 export function initProductHubDB() {
   if (initialized) return getMirrorDB();
   const db = getMirrorDB();
@@ -1649,6 +1672,7 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_ph_designer_sheet_shares_draft ON ph_designer_sheet_shares(draft_id, revoked_at);
   `);
+  migrateDesignerSheetTables(db);
 
   // LP 構成: 実行役へ配った画像の記録 (PR1-b で追加。PR1-a でデプロイ済みの DB にも入れる)
   const lpJobCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_jobs)').all().map((c) => c.name));

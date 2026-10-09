@@ -116,6 +116,12 @@ const IMG = (root, cur, no, ver = 1, extra = {}) => ({ root_id: root, current_id
   fakeHead[4][2] = '修正指示';           // 本文にちょうど「修正指示」と書いた
   back = ds.readBackNotes(fakeHead);
   ok(!back.ok && /見出しの行が見つかりません/.test(back.error), '🚨 本文に「修正指示」と書いた行を見出しと取り違えない (見出しは 修正指示・管理番号・AI生成画像 がそろった行 — Codex 名指し4 中)');
+  const twoHeads = [vals[0], ['', ...vals[2]], ...vals.slice(1)];
+  back = ds.readBackNotes(twoHeads);
+  ok(!back.ok && /見出しの行 .* が 2 つ/.test(back.error), '🚨 見出しの行が 2 つ (コピーして 1 列ずらした) → どちらの列が本物か分からないので上書きしない (Codex 名指し7 高)', JSON.stringify(back));
+  const withOrphan = [...vals, [], [ds.ORPHAN_HEADING, '', '全体をもっと明るく', '', '', '']];
+  back = ds.readBackNotes(withOrphan);
+  ok(back.ok && back.orphans.some((o) => o.note === '全体をもっと明るく'), '🚨 「前の依頼書の修正指示」の見出しの行に書いた修正指示も消さずに残す (Codex 名指し7 中)', JSON.stringify(back.orphans));
   const dupHead = vals.map((r, i) => (i === 2 ? [r[0], r[1], '修正指示', ...r.slice(2)] : [r[0], r[1], '', ...r.slice(2)]));
   back = ds.readBackNotes(dupHead);
   ok(!back.ok && /同じ名前の列が 2 つ/.test(back.error), '🚨 「修正指示」の見出しが 2 つ (人が同じ名前の列を足した) なら、どちらが本物か分からないので上書きしない (Codex 名指し2 高)');
@@ -192,6 +198,23 @@ const IMG = (root, cur, no, ver = 1, extra = {}) => ({ root_id: root, current_id
 }
 
 // ════════════════════════════════════════════════════════════════
+{
+  const calls = [];
+  const fake = { sheets: { spreadsheets: {
+    get: async () => ({ data: { sheets: [{ properties: { sheetId: 5, title: 'T', gridProperties: { rowCount: 6000, columnCount: 26 } }, developerMetadata: [{ metadataKey: 'phOwnedTab', metadataValue: 'T' }] }] } }),
+    batchUpdate: async (q) => { calls.push(q); return { data: {} }; },
+  } } };
+  const rows = [['見出し'], ['a', sw.KEEP_CELL, 'b'], ['c', sw.KEEP_CELL, 'd'], ['e']];
+  await sw.writeSpreadsheet(fake, { spreadsheetId: 'S', tabs: [{ name: 'T', rows, clearRows: 5000, clearCols: 6 }] });
+  const rq = calls[0].requestBody.requests;
+  const vals = rq.filter((r) => r.updateCells && !/userEnteredFormat/.test(r.updateCells.fields));
+  ok(vals.length <= 8 && vals.some((r) => r.updateCells.range && r.updateCells.range.startRowIndex === 3 && r.updateCells.range.endRowIndex === 5000),
+    '🚨 KEEP のあるタブで前の版が 5,000 行あっても、KEEP の無い行はまとめて消す (1 行ずつの要求にしない — Codex base R7 P1)', String(vals.length));
+  const touches = (r, row, col) => (r.updateCells.start ? (row >= r.updateCells.start.rowIndex && row < r.updateCells.start.rowIndex + r.updateCells.rows.length && col >= r.updateCells.start.columnIndex && col < r.updateCells.start.columnIndex + r.updateCells.rows[row - r.updateCells.start.rowIndex].values.length) : (row >= r.updateCells.range.startRowIndex && row < r.updateCells.range.endRowIndex && col >= r.updateCells.range.startColumnIndex && col < r.updateCells.range.endColumnIndex));
+  ok(!vals.some((r) => touches(r, 1, 1) || touches(r, 2, 1)) && vals.some((r) => touches(r, 1, 2)) && vals.some((r) => touches(r, 1, 5))
+    && !vals.some((r) => r.updateCells.range && r.updateCells.range.startRowIndex <= 1 && r.updateCells.range.endRowIndex > 1), 'KEEP のセルは消しも書きもしない');
+}
+
 console.log('② 本番の経路 (router・偽の Google)');
 // ════════════════════════════════════════════════════════════════
 const spec = lp.importSpec(db, { kind: 'product_analysis', title: 'LP制作システム', body: '本文 V2.2', sheetTitles: ['出力形式'], actor: 't' }).spec;
@@ -355,7 +378,23 @@ const fakeSheets = { spreadsheets: {
         find(m.location.sheetId).meta.push({ key: m.metadataKey, value: m.metadataValue });
       } else if (r.updateCells) {
         const u = r.updateCells;
-        if (u.range) { const t = find(u.range.sheetId); if (/userEnteredValue/.test(u.fields)) { t.values = []; t.formulas = []; } }
+        if (u.range) {
+          const t = find(u.range.sheetId);
+          if (/userEnteredValue/.test(u.fields)) {
+            const rg = u.range;
+            if (rg.startRowIndex == null) { t.values = []; t.formulas = []; }
+            else {
+              // 範囲 (四角) の中だけ消す (外のセル = KEEP の修正指示は残る)
+              g.rectClears = (g.rectClears || 0) + 1;
+              for (let ri = rg.startRowIndex; ri < Math.min(rg.endRowIndex, t.values.length); ri++) {
+                for (let ci = rg.startColumnIndex; ci < rg.endColumnIndex; ci++) {
+                  if (t.values[ri] && ci < t.values[ri].length) t.values[ri][ci] = '';
+                  if (t.formulas[ri] && ci < t.formulas[ri].length) t.formulas[ri][ci] = null;
+                }
+              }
+            }
+          }
+        }
         else {
           const t = find(u.start.sheetId);
           // start の位置から書く (送らなかったセル = KEEP はいまの値のまま)
@@ -587,8 +626,14 @@ const A = makeComposed({ code: 'maitakep50' });
     const rB = await press(A);
     ok(rB.status === 502 && publicFiles().includes(newFile) && tabOf(F.id).formulas[5][1].includes(newFile) && rowOf(A).writing_at != null && stateNow(A).stale === true,
       '🚨 送った後の失敗は「書けていない」と決めつけない — シートが出している新しい画像の公開は外さない (Codex 名指し5 中)', JSON.stringify(rB.json));
+    // 返事が来なかった後で、同じ画像をさらに作り直した (v 次) → 片付けは「今の画像」ではなく、シートに送った画像の公開を残す
+    const rjB3 = regen(A, cardsOf(A)[2].head_id); finishJob(rjB3);
+    await svc.sweepDesignerShares({ db });
+    ok(publicFiles().includes(newFile) && JSON.parse(rowOf(A).writing_images_json || '[]').includes(newFile),
+      '🚨 書いている途中で止まった商品の片付けは、送った画像 (記録した一覧) の公開を残す (シートが出している — Codex 名指し7 高)');
     const rB2 = await press(A);
-    ok(rB2.status === 200 && rowOf(A).writing_at == null && stateNow(A).stale === false, '押し直せば記録できる');
+    ok(rB2.status === 200 && rowOf(A).writing_at == null && rowOf(A).writing_images_json == null && stateNow(A).stale === false && !publicFiles().includes(newFile),
+      '押し直せば記録でき、外れた画像の公開も外れる');
   }
   // 読み戻した後 (書く直前の読み直しの前) に、人が行を入れ替えた・列を足した → 書かない (修正指示を消さない・付け違えない)
   {
@@ -644,6 +689,11 @@ const A = makeComposed({ code: 'maitakep50' });
     const rjP = regen(A, cardsOf(A)[0].head_id); finishJob(rjP);
     const rP = await press(A);
     ok(rP.status === 200 && tabOf(F.id).values[3][0] === '0枚目 (TOP)｜楽天検索結果用TOP画像／商品認識', 'prompt が切れていても、受付のときの構成から役割を引く (Codex 名指し2 中)', tabOf(F.id).values[3][0]);
+    // 共通の決まりの中に「【この画像の指示: 例】」と例が書かれていても、その画像の見出しと同じものを探すので取り違えない
+    db.prepare('UPDATE ph_lp_images SET prompt = ? WHERE id = ?').run('【この画像の指示: 例】\n## 画像の役割\n偽の役割\n\n' + keepPrompt, rootTop);
+    const rjP3 = regen(A, cardsOf(A)[0].head_id); finishJob(rjP3);
+    const rP3 = await press(A);
+    ok(rP3.status === 200 && tabOf(F.id).values[3][0] === '0枚目 (TOP)｜楽天検索結果用TOP画像／商品認識', '🚨 prompt の中の例の「この画像の指示」と取り違えない (Codex 名指し7 低)', tabOf(F.id).values[3][0]);
     // 「この画像の指示」はあるが、上限 (30,000 文字) まであって途中で切れている → 受付の構成から
     const mi = keepPrompt.indexOf('【この画像の指示');
     const partial = keepPrompt.slice(mi, keepPrompt.indexOf('## 画像の役割', mi) + '## 画像の役割\n楽天検'.length);
@@ -758,6 +808,9 @@ console.log('③ 共有ドライブの設定でリンク共有ができない');
   g.fail.pcreate = { err: gErr(403, 'Insufficient permissions for this file', 'insufficientFilePermissions'), once: true };
   r = await press(B);
   ok(r.status === 502 && r.json.code === 'google' && /コンテンツ管理者/.test(r.json.error), 'サービスアカウントの権限不足は別の理由 (コンテンツ管理者に)');
+  g.fail.pcreate = { err: gErr(403, 'Rate limit exceeded', 'userRateLimitExceeded'), once: true };
+  r = await press(B);
+  ok(r.status === 502 && r.json.code === 'google' && /少し待って/.test(r.json.error) && !/共有ドライブの設定/.test(r.json.error), '403 でも回数の上限 (userRateLimitExceeded) は「少し待って」(共有ドライブの設定と言わない — Codex 名指し7 低)');
   g.fail.pcreate = { err: gErr(429, 'Rate Limit Exceeded'), once: true };
   r = await press(B);
   ok(r.status === 502 && /少し待って/.test(r.json.error), '回数の上限は「少し待って」');
@@ -888,16 +941,17 @@ console.log('③ 共有ドライブの設定でリンク共有ができない');
     ok(publicFiles().includes(f2), '作っている最中の商品の公開は片付けない');
     db.prepare('UPDATE ph_designer_sheets SET lease_token = NULL, lease_until = NULL WHERE draft_id = ?').run(E2.id);
     // 書いている途中で止まった (writing_at) 商品も触らない (シートが新しい画像を出しているかもしれない)
-    db.prepare("UPDATE ph_designer_sheets SET writing_at = '2026-10-09T00:00:00Z' WHERE draft_id = ?").run(E2.id);
+    // 送った画像 (writing_images_json) = f2。シートはこれを出しているかもしれない
+    db.prepare("UPDATE ph_designer_sheets SET writing_at = '2026-10-09T00:00:00Z', writing_images_json = ? WHERE draft_id = ?").run(JSON.stringify([f2]), E2.id);
     sw = await svc.sweepDesignerShares({ db });
-    ok(publicFiles().includes(f2), '書いている途中で止まった商品でも、今の画像の公開は片付けない (シートが出しているかもしれない)');
+    ok(publicFiles().includes(f2), '書いている途中で止まった商品でも、送った画像の公開は片付けない (シートが出しているかもしれない)');
     // 同じ商品の古い版 (記録の依頼書にも今の画像にも無い) の公開は外す
     const oldV = 'DRVOLDVER0001';
     g.files.set(oldV, { id: oldV, name: 'old.png', mimeType: 'image/png', parents: ['AIFOLDER'], perms: [{ id: 'anyoneWithLink', type: 'anyone', role: 'reader' }] });
     db.prepare('INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, ?, NULL, ?)').run(E2.id, oldV, 'anyoneWithLink', 't');
     sw = await svc.sweepDesignerShares({ db });
     ok(!publicFiles().includes(oldV) && publicFiles().includes(f2), '🚨 書いている途中で止まった商品も、どちらの版のシートにも載っていない古い版の公開は外す (Codex 名指し5 高)');
-    db.prepare('UPDATE ph_designer_sheets SET writing_at = NULL WHERE draft_id = ?').run(E2.id);
+    db.prepare('UPDATE ph_designer_sheets SET writing_at = NULL, writing_images_json = NULL WHERE draft_id = ?').run(E2.id);
     sw = await svc.sweepDesignerShares({ db });
     ok(!publicFiles().includes(f2) && sw.revoked >= 1 && stateNow(E2).unrevoked === 0 && rowOf(E2).lease_token == null,
       '🚨 起動のあとの片付けで、依頼書に載っていない公開を外す (だれも押さなくても — Codex 名指し3 高)', JSON.stringify(sw));
@@ -1094,6 +1148,25 @@ console.log('⑥ 画面の JS (印の間を切り出して偽の document で動
   els['lpi-json']._text = JSON.stringify({ enabled: true });
   ctl = ui.initDesignerSheet(doc, { fetchJson });
   ok(els.dsheet.hidden === true, '状態が無い (古いサーバ) なら箱を出さない');
+}
+
+console.log('⑦ DB の移行 (PR-F の途中の版で作った表)');
+{
+  db.exec(`ALTER TABLE ph_designer_sheet_shares RENAME TO tmp_shares;
+    CREATE TABLE ph_designer_sheet_shares (id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER NOT NULL, drive_file_id TEXT NOT NULL, permission_id TEXT NOT NULL,
+      image_id INTEGER, shared_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), shared_by TEXT, revoked_at TEXT, revoke_error TEXT);
+    INSERT INTO ph_designer_sheet_shares SELECT * FROM tmp_shares WHERE permission_id IS NOT NULL;
+    DROP TABLE tmp_shares;
+    ALTER TABLE ph_designer_sheets DROP COLUMN writing_images_json;`);
+  const nBefore = db.prepare('SELECT COUNT(*) AS n FROM ph_designer_sheet_shares').get().n;
+  dbmod.migrateDesignerSheetTables(db);
+  dbmod.migrateDesignerSheetTables(db);
+  const pid = db.prepare('PRAGMA table_info(ph_designer_sheet_shares)').all().find((c) => c.name === 'permission_id');
+  const cols = db.prepare('PRAGMA table_info(ph_designer_sheets)').all().map((c) => c.name);
+  ok(pid && pid.notnull === 0 && cols.includes('writing_images_json') && db.prepare('SELECT COUNT(*) AS n FROM ph_designer_sheet_shares').get().n === nBefore && nBefore > 0,
+    '🚨 途中の版の表 (permission_id NOT NULL・writing_images_json なし) を今の形にそろえる・記録は残す・何度呼んでもよい (Codex 名指し7 中)');
+  db.prepare('INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id) VALUES (1, ?, NULL)').run('DRVMIGRATE001');
+  ok(true, '移行の後は ID なしの行を入れられる');
 }
 
 server.close();

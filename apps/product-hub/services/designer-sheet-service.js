@@ -82,9 +82,13 @@ function rolesFromPrompts(db, rootIds) {
   const marker = '【この画像の指示: ';
   let byNo = null;
   for (const rid of rootIds) {
-    const im = db.prepare(`SELECT i.prompt, i.no, j.compose_job_id, j.created_at FROM ph_lp_images i JOIN ph_lp_image_jobs j ON j.id = i.image_job_id WHERE i.id = ?`).get(rid) || {};
+    const im = db.prepare(`SELECT i.prompt, i.no, i.seq, i.name, j.compose_job_id, j.created_at FROM ph_lp_images i JOIN ph_lp_image_jobs j ON j.id = i.image_job_id WHERE i.id = ?`).get(rid) || {};
     const prompt = im.prompt || '';
-    const i = prompt.indexOf(marker);
+    // lp-image の buildImagePlan が付けた見出しと同じ形 (番号｜名前 60 文字) を探す。共通の決まりの中に例として
+    // 「【この画像の指示: …】」が書かれていても取り違えない (Codex PR-F 名指し7 低)
+    const head = `${marker}${im.no === 0 ? '0枚目' : (im.no != null ? im.no + '枚目' : im.seq + '番目')}｜${String(im.name || '').trim().slice(0, 60)}】\n`;
+    const hi = prompt.indexOf(head);
+    const i = hi >= 0 ? hi : -1;
     const nl = i >= 0 ? prompt.indexOf('\n', i) : -1;
     // 上限 (lp-image の PROMPT_MAX = 30,000 文字) まであるなら途中で切れているかもしれない (役割の途中・見出しの前で切れる) → 下の代わりの引き方
     if (nl >= 0 && prompt.length < PROMPT_MAX_LEN) {
@@ -215,6 +219,10 @@ export function explainShareError(e) {
   const raw = String(e?.message || e || '').slice(0, 300);
   if (status === 404) return `依頼書に載せる画像のファイルが Drive に見つかりません (消された・移された)。その画像を「再生成」してから押してください (${raw})`;
   if (['insufficientFilePermissions', 'teamDriveMembershipRequired', 'appNotAuthorizedToFile'].includes(reason) || status === 401 || status === 429 || !status) return explainGoogleError(e);
+  // 回数の上限 (403 でも返る) は一時的なもの — 少し待てば通る (Codex PR-F 名指し7 低)
+  if (/rateLimitExceeded|userRateLimitExceeded|sharingRateLimitExceeded|dailyLimitExceeded|quotaExceeded/.test(reason)) {
+    return `Google の呼び出し回数の上限に当たりました。少し待ってからもう一度押してください (${reason}: ${raw})`;
+  }
   if (status === 400 || status === 403) return `${SHARE_BLOCKED_MESSAGE} (${reason || status}: ${raw})`;
   return explainGoogleError(e);
 }
@@ -352,12 +360,12 @@ export async function sweepDesignerShares({ db = getDB(), now = null } = {}) {
   let revoked = 0;
   for (const id of ids) {
     const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(id);
-    // 残す公開 = 記録の依頼書の画像。書いている途中で止まった (writing_at) 商品は、シートが今の画像を出しているかもしれないので
-    // 今の画像 (作り直すと載せるもの) も残す — 両方のほかは、どちらの版のシートにも載っていない (Codex PR-F 名指し5 高)
+    // 残す公開 = 記録の依頼書の画像。書いている途中で止まった (writing_at) 商品は、シートが送った画像を出しているかもしれないので
+    // 送った画像 (writing_images_json) も残す — 両方のほかは、どちらの版のシートにも載っていない (Codex PR-F 名指し5・7 高)
     const keepOf = () => {
       const keep = recordedFiles(db, id);
       const row = rowOf(db, id);   // その都度読み直す (印を取る前後で変わりうる — Codex PR-F 名指し6 中)
-      if (row && row.writing_at && draft) { try { for (const im of materialOf(db, draft).images) keep.add(String(im.drive_file_id)); } catch (_) { /* 読めなければ記録の画像だけ */ } }
+      if (row && row.writing_at) for (const f of safeJson(row.writing_images_json) || []) keep.add(String(f));
       return keep;
     };
     const left = sharesOutside(db, id, keepOf());
@@ -522,7 +530,11 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
       beforeWrite: () => {
         stillSame();
         sending = true;
-        db.prepare(`UPDATE ph_designer_sheets SET writing_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE draft_id = ?`).run(id);
+        // 送る画像の一覧も記録する (返事が来ずに止まったら、シートはこの画像を出しているかもしれない = 片付けで残す — Codex PR-F 名指し7 高)。
+        // 前の回も書いている途中で止まっていたら、その一覧も残す (どちらがシートに載っているか分からない)
+        const prevWriting = row.writing_at ? (safeJson(rowOf(db, id)?.writing_images_json) || []) : [];
+        const sendingFiles = [...new Set([...prevWriting, ...keepFiles])];
+        db.prepare(`UPDATE ph_designer_sheets SET writing_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), writing_images_json = ? WHERE draft_id = ?`).run(JSON.stringify(sendingFiles), id);
       },
       onWritten: () => { wrote = true; },
     });
@@ -532,7 +544,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
     // Google が断った (400/401/403/404/409/429 = 適用されていないと分かる) なら、送らなかったのと同じ (書いている印も前のまま — Codex PR-F 名指し6 高)
     if (sending && !wrote && [400, 401, 403, 404, 409, 429].includes(statusOf(e))) {
       sending = false;
-      if (!row.writing_at) db.prepare('UPDATE ph_designer_sheets SET writing_at = NULL WHERE draft_id = ?').run(id);
+      if (!row.writing_at) db.prepare('UPDATE ph_designer_sheets SET writing_at = NULL, writing_images_json = NULL WHERE draft_id = ?').run(id);
     }
     if (!wrote) {
       const keep = recordedFiles(db, id);
@@ -557,7 +569,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
       db.prepare(`UPDATE ph_designer_sheets SET file_id = ?, url = ?, images_hash = ?, images_json = ?, image_count = ?,
           created_at = CASE WHEN ? OR created_at IS NULL THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE created_at END,
           created_by = CASE WHEN ? OR created_by IS NULL THEN ? ELSE created_by END,
-          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_by = ?, writing_at = NULL
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_by = ?, writing_at = NULL, writing_images_json = NULL
         WHERE draft_id = ?`).run(fileId, url, m.hash,
         JSON.stringify(images.map((im) => ({ root_id: im.root_id, current_id: im.current_id, drive_file_id: im.drive_file_id, version: im.version }))),
         images.length, isNew ? 1 : 0, isNew ? 1 : 0, actor, actor, id);

@@ -147,7 +147,12 @@ export function readBackNotes(values, { rootOfFile = null } = {}) {
   if (values == null) return { ok: true, byKey, orphans, layout: null };
   const rows = Array.isArray(values) ? values.map((r) => (Array.isArray(r) ? r.map(str) : [])) : [];
   // 見出しの行 = 「修正指示」「管理番号」「AI生成画像」がそろった行 (修正指示の本文に「修正指示」と書かれた行を見出しと取り違えない — Codex PR-F 名指し4 中)
-  const headerIdx = rows.findIndex((r) => r.some((c) => c.trim() === H_NOTE) && r.some((c) => c.trim().startsWith(H_KEY_PREFIX)) && r.some((c) => c.trim() === H_IMAGE));
+  const isHeader = (r) => r.some((c) => c.trim() === H_NOTE) && r.some((c) => c.trim().startsWith(H_KEY_PREFIX)) && r.some((c) => c.trim() === H_IMAGE);
+  const headerIdx = rows.findIndex(isHeader);
+  // 見出しの行が 2 つ (人が見出しをコピーした) は、どちらの列が本物か分からない → 上書きしない (Codex PR-F 名指し7 高)
+  if (headerIdx >= 0 && rows.some((r, i) => i !== headerIdx && isHeader(r))) {
+    return { ok: false, error: `デザイナー修正依頼書に見出しの行 (「${H_NOTE}」「${H_IMAGE}」「${H_KEY_PREFIX}」) が 2 つあります。書いた内容を消さないため、作り直していません。コピーした見出しの行を消してから押してください` };
+  }
   if (headerIdx < 0) {
     // 人が書いたものがあるかもしれないのに、どこが修正指示か分からない → 上書きしない
     if (rows.some((r) => r.some((c) => c.trim()))) {
@@ -175,9 +180,15 @@ export function readBackNotes(values, { rootOfFile = null } = {}) {
   rows.forEach((r, idx) => {
     if (idx === headerIdx) return;
     const label = str(r[labelCol]);
-    if (label.startsWith(ORPHAN_HEADING_HEAD)) { inOrphans = true; return; }
     const note = str(r[noteCol]);
     const version = verCol >= 0 ? str(r[verCol]) : '';
+    // 「前の依頼書の修正指示」の見出しの行 (ポータルが書いた見出し = 文言が同じで、管理番号・画像の無い行)。
+    // その行の修正指示の欄に人が書いていれば、行き先なしとして残す (読み飛ばして消さない — Codex PR-F 名指し7 中)
+    if (label.trim() === ORPHAN_HEADING && !(keyCol >= 0 && str(r[keyCol]).trim()) && !(imageCol >= 0 && str(r[imageCol]).trim())) {
+      inOrphans = true;
+      if (note.trim()) orphans.push({ label: '(「前の依頼書の修正指示」の見出しの行に書いたもの)', note, version });
+      return;
+    }
     // 「前の依頼書の修正指示」より下でも、管理番号と画像が合う行 (画像の行を下へ動かした) は画像の行として読む (Codex PR-F 名指し6 中)
     const m = keyCol >= 0 ? KEY_RE.exec(str(r[keyCol]).trim()) : null;
     let id = m ? Number(m[1]) : null;

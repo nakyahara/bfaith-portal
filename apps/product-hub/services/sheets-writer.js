@@ -223,7 +223,19 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
       requests.push({ updateCells: { range: { sheetId }, fields: 'userEnteredFormat' } });
       const h = Math.max(t.rows.length, Number(t.clearRows) || 0);
       const w = Math.max(width, Number(t.clearCols) || 0);
-      for (let r = 0; r < h; r++) {
+      const hasKeep = (r) => (t.rows[r] || []).some(isKeep);
+      // KEEP の無い行はひと続きごとに「範囲を消す + まとめて書く」の 2 要求 (前の版が何千行あっても要求の数が増えない — Codex PR-F base R7 P1)。
+      // KEEP のある行 (画像の行・数行) だけ、KEEP 以外のセルをひと続きで書く
+      for (let r = 0; r < h;) {
+        if (!hasKeep(r)) {
+          let e = r;
+          while (e < h && !hasKeep(e)) e++;
+          requests.push({ updateCells: { range: { sheetId, startRowIndex: r, endRowIndex: e, startColumnIndex: 0, endColumnIndex: w }, fields: 'userEnteredValue' } });
+          const data = t.rows.slice(r, Math.min(e, t.rows.length));
+          if (data.length) requests.push({ updateCells: { start: { sheetId, rowIndex: r, columnIndex: 0 }, rows: data.map(rowData), fields: 'userEnteredValue' } });
+          r = e;
+          continue;
+        }
         const row = t.rows[r] || [];
         let seg = null;
         for (let c = 0; c <= w; c++) {
@@ -232,6 +244,7 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
           if (seg) requests.push({ updateCells: { start: { sheetId, rowIndex: r, columnIndex: seg.c }, rows: [{ values: seg.cells }], fields: 'userEnteredValue' } });
           seg = null;
         }
+        r++;
       }
     }
     requests.push({ updateSheetProperties: { properties: { sheetId, index, gridProperties: { frozenRowCount: Number(f.frozenRows) || 0 } }, fields: 'index,gridProperties.frozenRowCount' } });
