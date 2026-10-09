@@ -63,7 +63,8 @@ revoke all on function ops.parent_structure_counts(integer) from public;
 /**
  * p_ne = 照合 ② が NE の完全な取得から作った観測 (apps/company-db/master-compare/parent-gate.mjs の parentObservations):
  *   { format: 'parent-obs-v1', complete: boolean (行が落ちていない取得), untrusted: [code_norm] (正規化の衝突・取込の整合で保持した商品),
- *     rows: [[code_norm, kind ('single' | 'set'), rep_state ('ok' | 'unknown'), rep_norm (親なし = null), rep_raw (代表の原文)]] (セットは後ろの 3 つが null) }
+ *     rep_collided (任意): [代表の norm] (NE のコードの元の書き方 = raw_ne_code_spellings の代表の名前空間で書き方が 2 つ以上 = 曖昧。#1676 Codex R1 High),
+ *     rows: [[code_norm, kind ('single' | 'set'), rep_state ('ok' | 'unknown'), rep_norm (親なし = null), rep_raw (代表の元の書き方 = 代表商品コード_src から)]] (セットは後ろの 3 つが null) }
  * 数える対象 (判定表・上の行から): 単品 (sku_kind = single) だけ (セット・例外は外す = excluded)。
  *   品目の最新が partial = 数える / 登録 cancelled = 外す / quarantined = 数える /
  *   draft・ne_pending: 品目が verified = 数える・issued / import_declared = 外す (登録の確かめ = 3 者一致で見る)・failed = 外す (復旧中)・
@@ -109,6 +110,10 @@ begin
   if exists (select 1 from pg_catalog.jsonb_array_elements(p_ne -> 'untrusted') u where pg_catalog.jsonb_typeof(u) <> 'string' or pg_catalog.length(u #>> '{}') not between 1 and 200) then
     raise exception 'invalid_input: untrusted は code_norm の文字の配列' using errcode = '22023';
   end if;
+  if p_ne ? 'rep_collided' and (pg_catalog.jsonb_typeof(p_ne -> 'rep_collided') is distinct from 'array'
+     or exists (select 1 from pg_catalog.jsonb_array_elements(p_ne -> 'rep_collided') u where pg_catalog.jsonb_typeof(u) <> 'string' or pg_catalog.length(u #>> '{}') not between 1 and 200)) then
+    raise exception 'invalid_input: rep_collided は代表の norm の文字の配列' using errcode = '22023';
+  end if;
 
   with obs0 as materialized (
     select x ->> 0 as code_norm, x ->> 1 as kind, x ->> 2 as rep_state, x ->> 3 as rep_norm, x ->> 4 as rep_raw
@@ -116,7 +121,8 @@ begin
   dup as (select o.code_norm from obs0 o group by o.code_norm having pg_catalog.count(*) > 1),
   obs as (select distinct on (o.code_norm) o.* from obs0 o order by o.code_norm, o.kind),
   untr as (select u.v as code_norm from pg_catalog.jsonb_array_elements_text(p_ne -> 'untrusted') u(v) union select d.code_norm from dup d),
-  rep_coll as (select o.rep_norm from obs0 o where o.kind = 'single' and o.rep_norm is not null group by o.rep_norm having pg_catalog.count(distinct o.rep_raw) > 1),
+  rep_coll as (select o.rep_norm from obs0 o where o.kind = 'single' and o.rep_norm is not null group by o.rep_norm having pg_catalog.count(distinct o.rep_raw) > 1
+               union select u.v from pg_catalog.jsonb_array_elements_text(coalesce(p_ne -> 'rep_collided', '[]'::jsonb)) u(v)),
   cand as (
     select z.norm, pg_catalog.count(distinct z.product_id) as n from (
       select core.norm_code(p.display_code) as norm, p.product_id from core.products p where p.company_id = p_company_id and p.display_code is not null

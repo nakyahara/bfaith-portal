@@ -1099,6 +1099,7 @@ await ta('[28] NE の元のコード (③b-1b): 書き方を集め終えた印�
     [['collided', null], ['ok', 'b002'], ['collided', null], ['ok', 'F006'], ['ok', 'S001'], ['ok', 'GRP1'], ['collided', null]]);   // a001 = 単品 A001 と子 a001 の違い
   assert.equal(c['rep|a001'], undefined);   // 名札は別の名前空間
   assert.deepEqual(x.ne.ne_codes.counts, { ok: 7, collided: 3, invalid: 0 });
+  assert.equal(x.ne.parent_obs.rep_collided, 1, '🆕 0068 (#1676 Codex R1 High): 代表の名前空間で書き方が 2 つ以上 (grp2) = 代表の数えの観測に入れる (曖昧)');
   // 次の日: 商品の側だけ集め終えた (セットの側の世代に印が無い) = 書かない = 前の回のまま
   const prev = x.result.compare_run_id;
   x = await day('2030-04-03', { ne: NEc, spellings: { products: full.products } });

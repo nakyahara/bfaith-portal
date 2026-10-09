@@ -30,9 +30,11 @@ export function fetchTimeRfc3339(t) {
  * NE の完全な取得 (nModelOf の m = norm → { code, kind, cols.parent = repState, repRaw }) → DB に渡す観測。
  *   rows = [code_norm, 'single', 'ok' | 'unknown', 代表の norm (親なし・自分自身 = null), 代表の原文] / セット = [code_norm, 'set', null, null, null]
  *   untrusted = 正規化の衝突・取込の整合で保持した商品 (DB は「比べられない」に数える)・complete = 行が落ちていない取得
+ *   rep_collided = 🆕 #1676 Codex R1 High: NE のコードの元の書き方 (raw_ne_code_spellings の代表の名前空間) で書き方が 2 つ以上の代表 (DB は「曖昧」に数える)。
+ *     代表の原文 (rows の 5 つめ) は compare-ne の repRawOf = 代表商品コード_src から戻した元の書き方 (保存の値は小文字)
  *   🚨 長すぎるコード (200 字超) は送らない (= DB では「取得に無い」= 比べられない)・長すぎる代表は unknown (比べられない)
  */
-export function parentObservations(nm, { untrusted = [], complete = false } = {}) {
+export function parentObservations(nm, { untrusted = [], complete = false, repCollided = [] } = {}) {
   const rows = [];
   for (const [norm, n] of [...nm].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
     if (!norm || norm.length > MAX_CODE) continue;
@@ -44,7 +46,13 @@ export function parentObservations(nm, { untrusted = [], complete = false } = {}
     rows.push([norm, 'single', ok ? 'ok' : 'unknown', rep, raw]);
   }
   const u = [...new Set([...untrusted].filter((x) => typeof x === 'string' && x && x.length <= MAX_CODE))].sort();
-  return { format: PARENT_OBS_FORMAT, complete: !!complete, untrusted: u, rows };
+  const rc = [...new Set([...repCollided].filter((x) => typeof x === 'string' && x && x.length <= MAX_CODE))].sort();
+  return { format: PARENT_OBS_FORMAT, complete: !!complete, untrusted: u, rep_collided: rc, rows };
+}
+
+/** compare-ne の resolveNeCodes の答え → 代表の名前空間で書き方が 2 つ以上の norm (読めない回 = 空 = rows の原文だけで見る) */
+export function repCollisionsOf(neCodes) {
+  return neCodes && neCodes.ok ? neCodes.entries.filter((e) => e.kind === 'rep' && e.state === 'collided').map((e) => e.code_norm) : [];
 }
 
 const msg = (e) => String((e && e.message) || e).replace(/\s+/g, ' ').slice(0, 200);
@@ -55,12 +63,18 @@ const FN_RECORD = "select to_regprocedure('ops.record_parent_gate(text, jsonb, t
  * @param {{ query: Function }} db  watcher の接続 (pg の adapter / PGlite)
  */
 export async function readParentCounts(db, obs, { detail = false } = {}) {
+  const g = await readGateState(db);
   await db.query('begin transaction read only');
   try {
-    const r = (await db.query('select ops.parent_raw_gate(1, $1::jsonb, $2) as r, ops.parent_gate_state() as g', [JSON.stringify(obs), !!detail])).rows[0];
-    return { ...r.r, owner: r.g && r.g.enforced ? 'company' : 'load', gate: r.g };
+    const r = (await db.query('select ops.parent_raw_gate(1, $1::jsonb, $2) as r', [JSON.stringify(obs), !!detail])).rows[0];
+    return { ...r.r, owner: ownerOf(g), gate: g };
   } finally { try { await db.query('rollback'); } catch { /* */ } }
 }
+/** 門の状態だけ (軽い・重い数えと別に読む = 数えが落ちても持ち主は分かる。#1676 Codex R1 Medium) */
+export async function readGateState(db) {
+  return (await db.query('select ops.parent_gate_state() as g')).rows[0].g;
+}
+const ownerOf = (g) => (g && typeof g.enforced === 'boolean' ? (g.enforced ? 'company' : 'load') : undefined);
 
 /**
  * 照合 ② の最後に 1 回 (結果の JSON を書いた後 = evidenceSha256)。照合そのものは失敗にしない (状態を返す)。
@@ -73,7 +87,10 @@ export async function recordParentGate(getWriter, { compareRunId, parentObs, evi
   if (!parentObs || !parentObs.obs) return { state: 'no_obs' };
   const withCounts = async (out) => {
     if (!readDb || out.state === 'not_applied') return out;
-    try { return { ...out, ...(await readParentCounts(readDb, parentObs.obs)) }; } catch (e) { return { ...out, read_error: msg(e) }; }
+    // 門の状態 (持ち主) を先に別に読む = 重い数えの読み直しが落ちても「持ち主は夜間ロード」と取り違えない (#1676 Codex R1 Medium)
+    let base = out;
+    try { const g = await readGateState(readDb); base = { ...out, owner: ownerOf(g), gate: g }; } catch (e) { base = { ...out, state_error: msg(e) }; }
+    try { return { ...base, ...(await readParentCounts(readDb, parentObs.obs)) }; } catch (e) { return { ...base, read_error: msg(e) }; }
   };
   const f = parentObs.fetch || {};
   if (!parentObs.material_generation_id || !f.generation_id || !f.raw_hash || !f.products_complete_at || !f.setproducts_complete_at) {
@@ -105,11 +122,17 @@ const codesOf = (samples) => {
 };
 const STATE_JA = { not_configured: '書く接続が無い (COMPANY_DB_WATCH_WRITER_URL)', failed: '書けない', no_fetch: '取得の世代・時刻・材料の世代が無い' };
 
-/** 代表の持ち主が company (DB の active) = 門が閉じる側 (記録 / 読み直しの答えの owner・門の状態) */
+/**
+ * 代表の持ち主が company (DB の active) = 門が閉じる側 (記録 / 読み直しの答えの owner・門の状態)。
+ *   🆕 #1676 Codex R1 Medium: 持ち主が分からない (記録も門の状態の読み直しも落ちた) = company と同じに倒す (「持ち主は夜間ロード」と言わない)
+ */
 export function parentEnforced(ne) {
   const p = ne && ne.parent_gate;
-  return !!p && (p.owner === 'company' || !!(p.gate && p.gate.enforced === true));
+  if (!p) return false;
+  if (p.owner === 'company' || (p.gate && p.gate.enforced === true)) return true;
+  return !ownerKnown(p);
 }
+const ownerKnown = (p) => p.owner === 'load' || p.owner === 'company' || (!!p.gate && typeof p.gate.enforced === 'boolean');
 const CLOSED_JA = '新しい NE 登録の CSV (作る・配る) は閉じた (夜間ロードは済んだ・配ったファイルの申告・照合・取り込めなかった商品だけの作り直し・廃止はできる)';
 const recordWhy = (p) => `${STATE_JA[p.state] || p.state}${p.error ? `: ${String(p.error).slice(0, 80)}` : ''}`;
 
@@ -125,7 +148,7 @@ export function parentTrouble(ne) {
   const total = sumOf(p.counts);
   const drift = total > 0 ? `代表 (親) が NE とずれた単品 ${total} 件 (${detailOf(p.counts)}${codesOf(p.samples)})` : null;
   if (p.state !== 'ok') {
-    if (enforced) return `代表 (親) の数えを記録できない (${recordWhy(p)})${drift ? `・${drift}` : ''} → ${CLOSED_JA}`;
+    if (enforced) return `代表 (親) の数えを記録できない (${recordWhy(p)}${ownerKnown(p) ? '' : '・持ち主が分からない = company と同じに扱う'})${drift ? `・${drift}` : ''} → ${CLOSED_JA}`;
     return drift ? `${drift}・知らせだけ (代表の持ち主は夜間ロード = CSV は閉じない・広げる前に 0 にする)・一覧 = drift-list.mjs` : null;
   }
   if (!drift) return null;

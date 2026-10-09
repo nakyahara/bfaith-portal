@@ -180,7 +180,7 @@ await ta('[P2] 観測の形の確かめ (形が違えば全部断る・22023)・
     obsOf([['m01', 'single', 'ok', 'grpa']]), obsOf(['m01']), obsOf([[1, 'single', 'ok', null, null]]), obsOf([['', 'single', 'ok', null, null]]),
     obsOf([['m01', 'exception', 'ok', null, null]]), obsOf([['m01', 'set', 'ok', null, null]]), obsOf([['m01', 'single', 'maybe', null, null]]),
     obsOf([['m01', 'single', 'unknown', 'grpa', 'grpA']]), obsOf([['m01', 'single', 'ok', 'grpa', null]]), obsOf([['m01', 'single', 'ok', 'x'.repeat(201), 'x']]),
-    obsOf([['m01', 'single', 'ok', '', 'grpA']]), obsOf([['m01', 'single', 'ok', 'grpa', '']]), obsOf([S('m01')], { untrusted: [1] }),
+    obsOf([['m01', 'single', 'ok', '', 'grpA']]), obsOf([['m01', 'single', 'ok', 'grpa', '']]), obsOf([S('m01')], { untrusted: [1] }), { ...NE1, rep_collided: 'grpa' }, { ...NE1, rep_collided: [1] }, { ...NE1, rep_collided: [''] },
   ];
   for (const o of bad) {
     const e = await errOf(gate(E, o));
@@ -318,7 +318,7 @@ await ta('[P7] JS: 観測 (nModelOf → parentObservations)・選べる解決・
     sets: [{ parent: 's01', name: 's', child: 'a01', price_src: '1', qty_src: '1' }] };
   const { m, collided } = nModelOf(ne);
   const obs = parentObservations(m, { untrusted: [...collided], complete: true });
-  assert.deepEqual(obs, { format: 'parent-obs-v1', complete: true, untrusted: ['x1'], rows: [
+  assert.deepEqual(obs, { format: 'parent-obs-v1', complete: true, untrusted: ['x1'], rep_collided: [], rows: [
     ['a01', 'single', 'ok', 'grpa', 'GrpA'], ['a02', 'single', 'ok', null, null], ['a03', 'single', 'ok', null, null], ['a04', 'single', 'unknown', null, null],
     ['a05', 'single', 'ok', 'grpa', 'grpa'], ['s01', 'set', null, null, null], ['x1', 'single', 'ok', null, null]] });
   // 長すぎるコード・代表 = 送らない / 比べられない
@@ -480,6 +480,53 @@ await ta('[P10] 関数の作り直し: 0059 の版との差は決めた所だけ
     }
     for (const later of files.filter((x) => x > F)) assert.equal(defIn(later, name), null, `${later} も ${name} を作り直している = この試験の元を見直す`);
   }
+});
+
+await ta('[P11] (#1676 Codex R1 High) 本番の保存の形 = 代表は小文字 (代表商品コード)・元の書き方は 代表商品コード_src (JSON): GRPA と grpA は書き方の衝突 = parent_ambiguous / NE のコードの元の書き方 (raw_ne_code_spellings の代表の名前空間) の衝突も同じ', async () => {
+  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dropped_no_code: 0 }),
+    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
+  // 本番の ne-api.js の保存 = 代表商品コード は toLowerCase・代表商品コード_src = JSON.stringify(元の値)
+  const stored = (code, original) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1',
+    rep: original == null ? '' : String(original).toLowerCase(), rep_src: JSON.stringify(original ?? '') });
+  const neOf = (products, spellings) => ({ hasSrc: true, meta: { ne_api_products_complete_at: '2030-01-01 00:00:00', ne_api_setproducts_complete_at: '2030-01-01 00:00:00', ...integ },
+    products, sets: [], ...(spellings ? { spellings } : {}) });
+  // m01・m02 は社内の親 grpA (一致の形)。NE の代表の元の書き方が grpA と GRPA = 衝突 = 曖昧 (どちらの名札か決められない)
+  const r = await driftList({ ne: neOf([stored('m01', 'grpA'), stored('m02', 'GRPA')]), db: E.db });
+  const cls = Object.fromEntries(r.items.map((x) => [x.code, `${x.class}:${x.reason}`]));
+  assert.equal(cls.m01, 'parent_ambiguous:ne_rep_spellings'); assert.equal(cls.m02, 'parent_ambiguous:ne_rep_spellings');
+  assert.deepEqual(r.items.filter((x) => ['m01', 'm02'].includes(x.code)).map((x) => x.ne_parent).sort(), ['GRPA', 'grpA'], '一覧の NE の代表 = 元の書き方');
+  // 同じ書き方 = 衝突しない (今までどおり一致)
+  const r2 = await driftList({ ne: neOf([stored('m01', 'grpA'), stored('m02', 'grpA')]), db: E.db });
+  assert.equal(r2.items.find((x) => ['m01', 'm02'].includes(x.code)), undefined);
+  // 照合が読む NE の元の書き方 (代表の名前空間) に 2 つ以上の書き方 (商品コードが空で落とした行の代表など) = 衝突 = 曖昧
+  const sp = { ok: true, rows: [{ kind: 'rep', code_norm: 'grpa', spellings: JSON.stringify(['GRPA', 'grpA']) }, { kind: 'single', code_norm: 'm01', spellings: JSON.stringify(['m01']) }] };
+  const r3 = await driftList({ ne: neOf([stored('m01', 'grpA'), stored('m02', 'grpA')], sp), db: E.db });
+  assert.equal(Object.fromEntries(r3.items.map((x) => [x.code, x.reason])).m01, 'ne_rep_spellings');
+  // 元の値 (_src) が読めない古い行は小文字の値を使う (今までどおり)
+  const { m } = nModelOf({ products: [{ ...stored('z9', 'Q1'), rep_src: 'x{' }], sets: [] });
+  assert.equal(m.get('z9').repRaw, 'q1');
+});
+
+await ta('[P12] (#1676 Codex R1 Medium) 持ち主が company で記録も重い数えの読み直しも落ちた朝 = 門の状態だけは別に読む → ⚠️ 閉じた / 門の状態も読めない = 持ち主が分からない = company と同じ ⚠️ (「持ち主は夜間ロード」と言わない)', async () => {
+  const parentObs = { obs: NE1, fetch: FETCH(), material_generation_id: 'mat_x' };
+  const writer = async () => ({ query: async (sql) => { if (/to_regprocedure/.test(sql)) return { rows: [{ ok: true }] }; throw new Error('canceling statement due to statement timeout'); } });
+  const readDb = (stateOk) => ({ query: async (sql) => {
+    if (/^(begin|rollback)/.test(sql)) return { rows: [] };
+    if (/parent_raw_gate/.test(sql)) throw new Error('canceling statement due to statement timeout');
+    if (/parent_gate_state/.test(sql)) { if (!stateOk) throw new Error('connection lost'); return { rows: [{ g: { enforced: true, open: false, problems: ['x'] } }] }; }
+    return { rows: [{ ok: true }] };
+  } });
+  const a = await recordParentGate(writer, { compareRunId: runId(), parentObs, evidenceSha256: hex('e'), readDb: readDb(true) });
+  assert.deepEqual([a.state, a.owner, a.gate?.enforced], ['failed', 'company', true]);
+  assert.match(a.read_error, /statement timeout/);
+  assert.match(parentTrouble({ parent_gate: a }), /代表 \(親\) の数えを記録できない .*→ 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+  assert.equal(parentNote({ parent_gate: a }), null);
+  const b = await recordParentGate(writer, { compareRunId: runId(), parentObs, evidenceSha256: hex('e'), readDb: readDb(false) });
+  assert.deepEqual([b.state, b.owner, b.gate], ['failed', undefined, undefined]);
+  assert.match(parentTrouble({ parent_gate: b }), /代表 \(親\) の数えを記録できない .*持ち主が分からない.*→ 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+  assert.equal(parentNote({ parent_gate: b }), null, '持ち主が分からない朝に「持ち主は夜間ロード」と言わない');
+  // 書く接続が無く読み直しもできない朝も同じ (持ち主が分からない = ⚠️)
+  assert.match(parentTrouble({ parent_gate: { state: 'not_configured' } }), /持ち主が分からない/);
 });
 
 await E.pg.close();

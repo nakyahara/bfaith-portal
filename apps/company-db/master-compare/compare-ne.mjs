@@ -21,7 +21,7 @@ import { readEvidence } from '../push/evidence.mjs';
 import { planFromSnapshot, subjectKey, sameValue } from './compare-load.mjs';
 import { evaluateBaseline } from './baseline.mjs';
 import { readNeFetchCounts } from '../../warehouse/ne-fetch-counts.js';
-import { parentObservations, fetchTimeRfc3339 } from './parent-gate.mjs';
+import { parentObservations, repCollisionsOf, fetchTimeRfc3339 } from './parent-gate.mjs';
 
 export const NE_FORMAT = 'mc-ne-v1';
 /** NE の取扱区分で知っている語 (2026-09-26 の実データ。これ以外は invalid = 照合しない。今のロードの mapHandling は知らない語も discontinued にする) */
@@ -138,6 +138,16 @@ export function repState(raw, src, code) {
   let v; try { v = src == null ? undefined : JSON.parse(src); } catch { v = undefined; }
   if (typeof v === 'string' && v.trim() === '') return { raw: 'value', validity: 'ok', value: null };
   return { raw: 'unknown', validity: 'invalid', value: null };
+}
+/**
+ * 🆕 0068 (#1676 Codex R1 High): 代表の元の書き方。本番の取込 (ne-api.js) は 代表商品コード を小文字にして保存し、元の値は 代表商品コード_src (JSON.stringify) に残す
+ *   = 元の書き方は _src から戻す (GRP と grp を同じにしない = 書き方の衝突 = parent_ambiguous)。_src が読めない古い行だけ保存した値 (小文字)
+ */
+export function repRawOf(raw, src) {
+  let v; try { v = src == null ? undefined : JSON.parse(src); } catch { v = undefined; }
+  if (typeof v === 'string' && v.trim()) return v.trim();
+  const t = raw == null ? '' : String(raw).trim();
+  return t || null;
 }
 /** 材料の代表 (t_today / t_load): 他のコード = norm / 自分自身・明示の空 = null (親なし) / 不明 = PRESERVE (ロードは触らない) */
 function repOfPlan(s) {
@@ -445,7 +455,7 @@ export function nModelOf(ne) {
     m.set(norm, { code: r.code, kind: 'single', cols: {
       name: textState(r.name, 'name'), handling: textState(r.handling, 'handling'), tax_rate: numState(r.tax_src, 'tax'),
       standard_price_jpy: numState(r.price_src, 'yen'), cost: numState(r.cost_src, 'yen'), primary_supplier: textState(r.supplier, 'supplier'),
-      parent: repState(r.rep, r.rep_src ?? null, r.code) }, repRaw: r.rep == null ? null : (String(r.rep).trim() || null) });   // repRaw = 🆕 0068 代表の原文 (書き方の衝突)
+      parent: repState(r.rep, r.rep_src ?? null, r.code) }, repRaw: repRawOf(r.rep, r.rep_src ?? null) });   // repRaw = 🆕 0068 代表の元の書き方 (書き方の衝突)
   }
   for (const r of ne.sets) {
     const norm = normSku(r.parent); if (!norm) continue;
@@ -1236,10 +1246,11 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   }) : null;
   out.registrations = regObs ? { targets: regTargets.length, observations: regObs.observations.length, present: regObs.observations.filter((o) => o.present).length } : { state: 'not_applied' };
   // 🆕 0068 (設計 20 v7 §②・§⑥ PR-6): 代表 (親) の生の数えの元 = 同じ完全な取得の観測 (JSON には入れない。run.mjs が封の後に ops.record_parent_gate で DB に数えさせる)
-  const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], complete: !absenceUntrusted }),
+  //   代表の名前空間の元の書き方 (raw_ne_code_spellings・商品コードが空で落とした行の代表も) が 2 つ以上 = 衝突 (#1676 Codex R1 High)
+  const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], complete: !absenceUntrusted, repCollided: repCollisionsOf(neCodes) }),
     fetch: { ...neFetchIdentity(marks, ne), products_complete_at: fetchTimeRfc3339(marks.products.at), setproducts_complete_at: fetchTimeRfc3339(marks.sets.at) },
     material_generation_id: out.generation ? out.generation.generation_id : null };
-  out.parent_obs = { rows: parentObs.obs.rows.length, untrusted: parentObs.obs.untrusted.length, complete: parentObs.obs.complete };
+  out.parent_obs = { rows: parentObs.obs.rows.length, untrusted: parentObs.obs.untrusted.length, rep_collided: parentObs.obs.rep_collided.length, complete: parentObs.obs.complete };
   return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes, regObs, parentObs };
 }
 
