@@ -178,7 +178,8 @@ export function readBackNotes(values, { rootOfFile = null } = {}) {
     if (label.startsWith(ORPHAN_HEADING_HEAD)) { inOrphans = true; return; }
     const note = str(r[noteCol]);
     const version = verCol >= 0 ? str(r[verCol]) : '';
-    const m = !inOrphans && keyCol >= 0 ? KEY_RE.exec(str(r[keyCol]).trim()) : null;
+    // 「前の依頼書の修正指示」より下でも、管理番号と画像が合う行 (画像の行を下へ動かした) は画像の行として読む (Codex PR-F 名指し6 中)
+    const m = keyCol >= 0 ? KEY_RE.exec(str(r[keyCol]).trim()) : null;
     let id = m ? Number(m[1]) : null;
     if (id && rootOfFile) {
       const fm = imageCol >= 0 ? IMAGE_FILE_RE.exec(str(r[imageCol])) : null;

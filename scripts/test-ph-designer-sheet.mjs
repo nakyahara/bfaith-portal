@@ -140,6 +140,10 @@ const IMG = (root, cur, no, ver = 1, extra = {}) => ({ root_id: root, current_id
     const noImg = fv.map((r) => r.slice()); noImg[3][1] = '';
     bk = ds.readBackNotes(noImg, { rootOfFile: rof });
     ok(!bk.byKey.has(10) && bk.orphans.some((o) => o.note === 'TOP の文字を大きく'), '画像のセルを消された行は照らせないので「行き先なし」');
+    const below = [...fv.slice(0, 3), fv[4], fv[5], [], [ds.ORPHAN_HEADING], ['前の', '', '前からの指示', 'v1', '', ''], fv[3]];
+    bk = ds.readBackNotes(below, { rootOfFile: rof });
+    ok(bk.byKey.get(10)?.note === 'TOP の文字を大きく' && bk.orphans.map((o) => o.note).join() === '前からの指示',
+      '🚨 「前の依頼書の修正指示」より下へ動かした画像の行も、管理番号と画像が合えば同じ画像の行として読む (Codex 名指し6 中)', JSON.stringify([[...bk.byKey], bk.orphans]));
     // KEEP: 同じ行・同じ列なら修正指示のセルを書かない (読み戻した後に書いた分を消さない)
     bk = ds.readBackNotes(fv, { rootOfFile: rof });
     const kb = ds.buildDesignerSheet({ productCode: 'C', productName: 'n', previous: bk, images: [IMG(10, 10, 0), IMG(11, 21, 1, 2), IMG(12, 12, 2)] });
@@ -365,6 +369,10 @@ const fakeSheets = { spreadsheets: {
           }));
           g.cellWrites = (g.cellWrites || 0) + 1;
         }
+      } else if (r.updateSheetProperties && /title/.test(r.updateSheetProperties.fields)) {
+        const t = find(r.updateSheetProperties.properties.sheetId);
+        if (tabs.some((x) => x !== t && x.title === r.updateSheetProperties.properties.title)) throw gErr(400, 'duplicate title');
+        t.title = r.updateSheetProperties.properties.title;
       } else if (r.updateSheetProperties || r.repeatCell || r.updateDimensionProperties || r.appendDimension) {
         find((r.updateSheetProperties?.properties || r.repeatCell?.range || r.updateDimensionProperties?.range || r.appendDimension).sheetId);
         if (r.updateDimensionProperties && r.updateDimensionProperties.range.dimension === 'ROWS') {
@@ -560,6 +568,17 @@ const A = makeComposed({ code: 'maitakep50' });
     humanWrites(F.id, `img-${cards2[1].root_id}`, 'ロゴを右上に\n背景をもう少し明るく');
     humanWrites(F.id, `img-${cards2[2].root_id}`, '');
   }
+  // 送ったが Google が断った (403 = 書けていないと分かる) → 送らなかったのと同じ (今回の画像の公開は外す・作り直しが要る、は出さない)
+  {
+    const rjD = regen(A, cardsOf(A)[2].head_id); finishJob(rjD);
+    const newD = cardsOf(A)[2].current.drive_file_id;
+    g.fail.sbatch = { err: gErr(403, 'The caller does not have permission'), once: true };
+    const rD = await press(A);
+    ok(rD.status === 502 && !publicFiles().includes(newD) && rowOf(A).writing_at == null && !tabOf(F.id).formulas[5][1].includes(newD),
+      '🚨 Google が書き込みを断った (403) ときは、シートは前のまま = 今回載せようとした画像の公開を外し、書いている印も残さない (Codex 名指し6 高)', JSON.stringify([rD.json, rowOf(A).writing_at]));
+    const rD2 = await press(A);
+    ok(rD2.status === 200 && publicFiles().includes(newD), '押し直せば作れる');
+  }
   // 送った後に返事が来なかった (Google 側では書けている) → 今回載せた画像の公開は外さない・作り直しが要る、を出す
   {
     const rjB = regen(A, cardsOf(A)[2].head_id); finishJob(rjB);
@@ -590,22 +609,22 @@ const A = makeComposed({ code: 'maitakep50' });
     const rX3 = await press(A);
     ok(rX3.status === 200 && noteOfKey(F.id, `img-${cards2[1].root_id}`).note === 'ロゴを右上に\n背景をもう少し明るく', 'シートを触り終えてから押せば作り直せる (修正指示は残る)');
   }
-  // 人が「デザイナー修正依頼」のタブの名前を変えた → 名前を変えたタブ (印で分かる) から修正指示を読み、新しいタブに書く
+  // 人が「デザイナー修正依頼」のタブの名前を変えた → 印で自分のタブと分かる。名前を元に戻して同じタブに書く (コピーを作らない)
   {
     const tR = tabOf(F.id);
     tR.title = '旧 依頼 (田中)';
-    const rjR = regen(A, cards2[0].head_id); finishJob(rjR);
+    const nTabs = F.tabs.length;
+    const rjR = regen(A, cardsOf(A)[0].head_id); finishJob(rjR);
     const rR = await press(A);
-    ok(rR.status === 200 && rR.json.carried === 2 && rR.json.kept === 0 && noteOfKey(F.id, `img-${cards2[0].root_id}`)?.note === 'TOP の文字を大きく'
-      && F.tabs.some((x) => x.title === '旧 依頼 (田中)'), '🚨 タブの名前を変えられても、修正指示は新しい「デザイナー修正依頼」のタブに引き継ぐ (名前を変えたタブは残す — Codex 名指し3 中)', JSON.stringify(rR.json));
-    // もう一度名前を変える → 名前を変えた自分のタブが 2 枚 = どれが今の依頼書か分からない → 止める
-    const tR2 = tabOf(F.id);
-    tR2.title = '旧 依頼 (2)';
+    ok(rR.status === 200 && rR.json.carried === 2 && !!tabOf(F.id) && !F.tabs.some((x) => x.title === '旧 依頼 (田中)') && F.tabs.length === nTabs && noteOfKey(F.id, `img-${cards2[0].root_id}`)?.note === 'TOP の文字を大きく',
+      '🚨 タブの名前を変えられても、印で自分のタブと分かる — 名前を元に戻して同じタブに書く (修正指示は残る・コピーを作らないので古いタブへの書き込みを落とさない — Codex 名指し3・6 中)', JSON.stringify(rR.json));
+    // 人がタブをコピーした (印も写る) → どれが今の依頼書か分からない → 止める
+    const tNow = tabOf(F.id);
+    F.tabs.push({ ...tNow, sheetId: 99, title: 'デザイナー修正依頼 のコピー', values: tNow.values.map((x) => x.slice()), formulas: tNow.formulas.map((x) => x.slice()), meta: tNow.meta.slice() });
     const bR = g.batches;
     const rR2 = await press(A);
-    ok(rR2.status === 409 && rR2.json.code === 'unreadable' && /複数あります/.test(rR2.json.error) && g.batches === bR, '🚨 名前を変えた依頼のタブが 2 枚 → どれが今のか分からないので作り直さない (空のタブを作らない — Codex 名指し4 中)', JSON.stringify(rR2.json));
-    F.tabs = F.tabs.filter((x) => x.title !== '旧 依頼 (田中)');
-    tR2.title = ds.DESIGNER_TAB;
+    ok(rR2.status === 409 && rR2.json.code === 'unreadable' && /2 枚あります/.test(rR2.json.error) && g.batches === bR, '🚨 印の付いたタブが 2 枚 (コピーした) → どれが今のか分からないので作り直さない (片方の修正指示を黙って落とさない)', JSON.stringify(rR2.json));
+    F.tabs = F.tabs.filter((x) => x.sheetId !== 99);
   }
   // 人が左に 26 列を足して、全部が AA 列より右へ動いた → タブ全体を読むので、修正指示は残る (A1:Z2000 で読むと空に見えて消していた)
   {
@@ -678,9 +697,24 @@ const A = makeComposed({ code: 'maitakep50' });
   ok(r.status === 409 && r.json.code === 'tab_conflict' && /人が作った/.test(r.json.error), '🚨 印の無い同じ名前のタブ (人が作った) は上書きしない');
   ownTab.meta = [{ key: 'phOwnedTab', value: ds.DESIGNER_TAB }];
 
+  // 画像フォルダを変えた → 新しいフォルダに作り、前のフォルダの依頼書から修正指示を引き継ぐ (前の依頼書は消さない)
+  {
+    const FID2 = '1MovedFolderAbCdEfGhIjKlMnOp';
+    humanWrites(F.id, `img-${cardsOf(A)[1].root_id}`, 'フォルダを変えても残る');
+    db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run(`https://drive.google.com/drive/folders/${FID2}`, A.id);
+    const rM = await press(A);
+    const newF = rowOf(A).file_id;
+    ok(rM.status === 200 && rM.json.created === true && newF !== F.id && g.files.get(newF).parents.includes(FID2) && noteOfKey(newF, `img-${cardsOf(A)[1].root_id}`)?.note === 'フォルダを変えても残る' && !g.files.get(F.id).trashed,
+      '🚨 画像フォルダを変えたら、新しいフォルダに作って前の依頼書の修正指示を引き継ぐ (Codex 名指し6 高)', JSON.stringify(rM.json));
+    // 元に戻す (以降の試験は前の依頼書で続ける)
+    db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run(FOLDER, A.id);
+    g.files.delete(newF);
+    humanWrites(F.id, `img-${cardsOf(A)[1].root_id}`, '');
+    db.prepare('UPDATE ph_designer_sheets SET file_id = ?, url = ? WHERE draft_id = ?').run(F.id, `https://docs.google.com/spreadsheets/d/${F.id}/edit`, A.id);
+  }
   // 書いた後に記録できなかった (writing_at が立ったまま) → 作り直しが要る
   r = await press(A);
-  ok(r.status === 200 && r.json.carried === 0, '(前提) 作り直せる');
+  ok(r.status === 200 && r.json.carried === 0, '(前提) 作り直せる', JSON.stringify(r.json));
   db.prepare("UPDATE ph_designer_sheets SET writing_at = '2026-10-09T00:00:00Z' WHERE draft_id = ?").run(A.id);
   st = await stateOf(A);
   ok(st.stale === true && st.interrupted === true, '書いた後に記録できなかった (writing_at が立ったまま) なら「作り直しが要る」を出す');
@@ -752,15 +786,17 @@ console.log('③ 共有ドライブの設定でリンク共有ができない');
   const f4 = cardsOf(B)[2].current.drive_file_id;
   g.failAfterCreate = true;
   r = await press(B);
-  ok(r.status === 502 && !publicFiles().includes(f4) && sharesOf(B).filter((x) => x.drive_file_id === f4).every((x) => x.revoked_at),
-    '🚨 公開が付いたのに返事が来なかった → 付ける前に記録していたので、外して閉じる (記録の無い公開を残さない — Codex 名指し1 高)', JSON.stringify([r, sharesOf(B).filter((x) => x.drive_file_id === f4)]));
+  ok(r.status === 502 && publicFiles().includes(f4) && sharesOf(B).filter((x) => x.drive_file_id === f4).every((x) => x.revoked_at && x.revoke_error === 'unknown_owner')
+    && evOf(B, 'designer_sheet_share_unknown').length === 1,
+    '🚨 公開が付いたのに返事が来なかった → 付ける前に記録していたので気づけるが、その間に人が付けたのかもしれないので外さず、履歴に残す (Codex 名指し6 中)', JSON.stringify([r, sharesOf(B).filter((x) => x.drive_file_id === f4)]));
+  g.files.get(f4).perms = g.files.get(f4).perms.filter((x) => x.type !== 'anyone');   // (片付け) 人が Drive で外した
   // 前の回が「付けようとしていた行」(ID なし) のまま止まり、いま公開が付いている (止まった後に人が付けたのかもしれない)
   // → ポータルのものと決めつけない: 記録は閉じて履歴に残し、公開は外さない (Codex 名指し4 / base P2)
   g.files.get(f4).perms.push({ id: 'anyoneWithLink', type: 'anyone', role: 'reader' });
   db.prepare('INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, NULL, NULL, ?)').run(B.id, f4, 't');
   r = await press(B);
   ok(r.status === 200 && sharesOf(B).filter((x) => x.drive_file_id === f4).every((x) => x.revoked_at && (x.permission_id == null)) && sharesOf(B).some((x) => x.drive_file_id === f4 && x.revoke_error === 'unknown_owner')
-    && evOf(B, 'designer_sheet_share_unknown').length === 1, '🚨 前の回の「付けようとしていた行」と、いまある公開を結び付けない (持ち主の分からない公開として閉じ、履歴に残す)', JSON.stringify(sharesOf(B).filter((x) => x.drive_file_id === f4)));
+    && evOf(B, 'designer_sheet_share_unknown').length === 2, '🚨 前の回の「付けようとしていた行」と、いまある公開を結び付けない (持ち主の分からない公開として閉じ、履歴に残す)', JSON.stringify(sharesOf(B).filter((x) => x.drive_file_id === f4)));
   const rj5 = regen(B, cardsOf(B)[2].head_id); finishJob(rj5);
   r = await press(B);
   ok(r.status === 200 && publicFiles().includes(f4), '🚨 持ち主の分からない公開は、依頼書から外れても外さない (人が付けたものかもしれない)');

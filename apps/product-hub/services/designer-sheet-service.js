@@ -244,7 +244,7 @@ const closeShare = (db, rowId, why) => db.prepare(`UPDATE ph_designer_sheet_shar
  * もう公開されていれば付けない。そのとき、ポータルが ID を記録した公開ならポータルのもの、それ以外は人が付けたもの (外さない)。
  * 🚨 前の回の「付けようとしていた行」(ID が NULL) は、いまある公開と結び付けない (Codex PR-F 名指し4 / base P2:
  *    止まった後に人が公開を付けたのかもしれず、ポータルが付けたと証明できない)。持ち主の分からない公開として閉じ、履歴に残す
- * @returns {Promise<number|null>}  この回で記録した行の ID (付けようとした行。失敗したら throw の shareRowId)。付けなかったら null
+ * @returns {Promise<number|null>}  この回で記録した行の ID。付けなかったら null
  */
 async function shareImage(db, drive, { draftId, fileId, imageId, actor }) {
   const perms = await listAllPermissions(drive, fileId);
@@ -259,17 +259,13 @@ async function shareImage(db, drive, { draftId, fileId, imageId, actor }) {
   if (mine && mine.permission_id) closeShare(db, mine.id, 'gone');
   const sid = Number(db.prepare(`INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, NULL, ?, ?)`)
     .run(draftId, fileId, imageId, actor).lastInsertRowid);
-  try {
-    // allowFileDiscovery: false = 検索には出さない (リンクを知っている人だけ)。通知メールは anyone には送られない
-    const r = await drive.permissions.create({
-      fileId, supportsAllDrives: true, fields: 'id',
-      requestBody: { type: 'anyone', role: 'reader', allowFileDiscovery: false },
-    }, { timeout: GOOGLE_TIMEOUT_MS });
-    if (r?.data?.id) db.prepare('UPDATE ph_designer_sheet_shares SET permission_id = ? WHERE id = ?').run(String(r.data.id), sid);
-  } catch (e) {
-    // 付いたか分からない。この回の行なので、呼び手が外すときに「いまある anyone の公開」を外してよい (この回で付けようとしたもの)
-    throw Object.assign(e, { shareRowId: sid });
-  }
+  // allowFileDiscovery: false = 検索には出さない (リンクを知っている人だけ)。通知メールは anyone には送られない。
+  // 失敗したら (返事が来なかった = 付いたか分からない) 行は ID なしのまま残り、外すときに「持ち主の分からない公開」として扱う
+  const r = await drive.permissions.create({
+    fileId, supportsAllDrives: true, fields: 'id',
+    requestBody: { type: 'anyone', role: 'reader', allowFileDiscovery: false },
+  }, { timeout: GOOGLE_TIMEOUT_MS });
+  if (r?.data?.id) db.prepare('UPDATE ph_designer_sheet_shares SET permission_id = ? WHERE id = ?').run(String(r.data.id), sid);
   return sid;
 }
 function unknownOwnerEvent(db, draftId, fileId, actor) {
@@ -279,11 +275,12 @@ function unknownOwnerEvent(db, draftId, fileId, actor) {
 }
 
 /**
- * 公開を外す (記録してある、ポータルが付けたものだけ)。
- * @param {Set<number>} [adopt]  この回で付けようとした行 (ID が NULL でも、いまある anyone の公開はこの回が付けたものとして外す)。
- *   それ以外の ID が NULL の行 (前の回で止まった) は、いまの公開と結び付けない = 外さずに「持ち主の分からない公開」として閉じる
+ * 公開を外す (記録してある、ポータルが付けた = API が返した ID のあるものだけ)。
+ * ID が NULL の行 (付ける返事が来なかった・付ける前後に止まった) は、いまある公開と結び付けない
+ * (その間に人が付けたのかもしれない — Codex PR-F 名指し4・6 / base R4)。公開が無ければ閉じ、あれば
+ * 「持ち主の分からない公開」として閉じて履歴に残す (外さない)
  */
-async function revokeShares(db, drive, shares, { adopt = new Set() } = {}) {
+async function revokeShares(db, drive, shares) {
   let revoked = 0;
   for (const s of shares) {
     try {
@@ -291,8 +288,9 @@ async function revokeShares(db, drive, shares, { adopt = new Set() } = {}) {
       if (!permissionId) {
         const anyone = (await listAllPermissions(drive, s.drive_file_id)).find((p) => p && p.type === 'anyone');
         if (!anyone) { closeShare(db, s.id, 'not_shared'); revoked += 1; continue; }
-        if (!adopt.has(s.id)) { closeShare(db, s.id, 'unknown_owner'); unknownOwnerEvent(db, s.draft_id, s.drive_file_id, null); continue; }
-        permissionId = anyone.id;
+        closeShare(db, s.id, 'unknown_owner');
+        unknownOwnerEvent(db, s.draft_id, s.drive_file_id, null);
+        continue;
       }
       await drive.permissions.delete({ fileId: s.drive_file_id, permissionId, supportsAllDrives: true }, { timeout: GOOGLE_TIMEOUT_MS });
       closeShare(db, s.id, null);
@@ -345,7 +343,7 @@ export async function revokeAllDesignerShares(draftId, { db = getDB() } = {}) {
  * 出しているかもしれない) 商品は触らない (後者は画面に「作り直しが要る」が出て、作り直すと片付く)
  * @returns {Promise<{drafts: number, revoked: number}>}
  */
-export async function sweepDesignerShares({ db = getDB(), now = Date.now() } = {}) {
+export async function sweepDesignerShares({ db = getDB(), now = null } = {}) {
   let clients = null;
   try { clients = makeClients(); } catch (_) { clients = null; }
   if (!clients) return { drafts: 0, revoked: 0 };
@@ -353,12 +351,12 @@ export async function sweepDesignerShares({ db = getDB(), now = Date.now() } = {
   let drafts = 0;
   let revoked = 0;
   for (const id of ids) {
-    const row = rowOf(db, id);
     const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(id);
     // 残す公開 = 記録の依頼書の画像。書いている途中で止まった (writing_at) 商品は、シートが今の画像を出しているかもしれないので
     // 今の画像 (作り直すと載せるもの) も残す — 両方のほかは、どちらの版のシートにも載っていない (Codex PR-F 名指し5 高)
     const keepOf = () => {
       const keep = recordedFiles(db, id);
+      const row = rowOf(db, id);   // その都度読み直す (印を取る前後で変わりうる — Codex PR-F 名指し6 中)
       if (row && row.writing_at && draft) { try { for (const im of materialOf(db, draft).images) keep.add(String(im.drive_file_id)); } catch (_) { /* 読めなければ記録の画像だけ */ } }
       return keep;
     };
@@ -366,7 +364,8 @@ export async function sweepDesignerShares({ db = getDB(), now = Date.now() } = {
     if (!left.length) continue;
     // 商品が消えている (記録だけ残った) ときは印の行が作れない (外部キー) ので、印なしで外す
     const exists = !!draft;
-    const token = exists ? acquireLease(db, id, { now }) : 'none';
+    // 印は商品ごとに今の時刻で取る (前の商品で時間がかかっても、取った瞬間から期限切れにしない — Codex PR-F 名指し6 中)
+    const token = exists ? acquireLease(db, id, { now: now ?? Date.now() }) : 'none';
     if (!token) continue;
     try {
       revoked += await revokeShares(db, clients.drive, sharesOutside(db, id, keepOf()));
@@ -437,20 +436,16 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
   const keepFiles = new Set(images.map((im) => String(im.drive_file_id)));
 
   // 1. 画像を公開する (依頼書を作る前。断られたら依頼書を作らない = 中途半端なシートを残さない)
-  // この回で付けようとした行 (外すときに、ID が無くても「この回が付けた公開」として外してよいもの)
-  const adopt = new Set();
   try {
     for (const im of images) {
-      const sid = await shareImage(db, clients.drive, { draftId: id, fileId: im.drive_file_id, imageId: im.current_id, actor });
-      if (sid) adopt.add(sid);
+      await shareImage(db, clients.drive, { draftId: id, fileId: im.drive_file_id, imageId: im.current_id, actor });
       // 1 枚ごとに印の期限を延ばす (8 枚 × Google の待ちで 3 分を超えても、別の処理に印を取られない — Codex PR-F 名指し1 中)
       assertLease(db, id, token);
     }
   } catch (e) {
-    if (e?.shareRowId) adopt.add(e.shareRowId);
     // 記録してある依頼書に載っていない公開は全部外す (作らなかった依頼書のために公開したままにしない)。
     // この回のものに限らない — 前の回が公開した直後に止まった分も、ここで片付く (Codex PR-F 名指し2 高)
-    await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)), { adopt });
+    await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)));
     if (e?.code === 'designer_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     const reason = explainShareError(e);
     try { logEvent(db, id, 'designer_sheet_failed', reason.slice(0, 500), actor); } catch (_) { /* 記録の失敗で結果を変えない */ }
@@ -466,7 +461,14 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
   let built = null;
   try {
     const prevFileId = row.file_id || null;
-    if (prevFileId && (await spreadsheetUsable(clients, { fileId: prevFileId, folderId })).usable) fileId = prevFileId;
+    // 画像フォルダを変えた (前の依頼書は別のフォルダ) ときは、新しいフォルダに作り、前の依頼書から修正指示を読んで引き継ぐ
+    // (前の依頼書は消さない — Codex PR-F 名指し6 高)
+    let notesFrom = null;
+    if (prevFileId) {
+      const u = await spreadsheetUsable(clients, { fileId: prevFileId, folderId });
+      if (u.usable) fileId = prevFileId;
+      else if (u.reason === 'moved') notesFrom = prevFileId;
+    }
     if (!fileId) {
       const found = await findSpreadsheetByAppProperty(clients, { folderId, key: APP_PROP_KEY, value: String(id) });
       if (found) fileId = found.id;
@@ -479,19 +481,28 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
     // 3. 人が書いた修正指示を読み戻す (作ったばかりなら無い)。読めない形 (見出しを消した) なら上書きしない
     let previous = null;
     // 範囲はタブ全体 (A1:Z2000 のように区切ると、その外へ動かした修正指示を「無い」と見て消す — Codex PR-F 名指し2 高)
-    const readNow = () => readOwnedTabValues(clients, { spreadsheetId: fileId, name: DESIGNER_TAB, render: 'FORMULA', range: null });
+    // 修正指示を読むファイル = 書くファイル (作ったばかりなら、フォルダを変える前の依頼書。無ければ読まない)
+    const src = created ? notesFrom : fileId;
+    const readNow = () => readOwnedTabValues(clients, { spreadsheetId: src, name: DESIGNER_TAB, render: 'FORMULA', range: null });
     let firstRead = null;
-    if (!created) {
-      const cur = await readNow();
+    if (src) {
+      let cur = await readNow();
       if (cur.ambiguous) {
-        throw Object.assign(new Error(`名前を変えたデザイナー修正依頼のタブが複数あります (${cur.ambiguous.join('・')})。どれが今の依頼書か分からないので作り直していません。今の依頼書のタブの名前を「${DESIGNER_TAB}」に戻してから押してください`), { code: 'unreadable' });
+        throw Object.assign(new Error(`「${DESIGNER_TAB}」の印の付いたタブが ${cur.ambiguous.length} 枚あります (${cur.ambiguous.join('・')}。タブをコピーした?)。どれが今の依頼書か分からないので作り直していません。要らないほうのタブを消してから押してください`), { code: 'unreadable' });
+      }
+      // 人がタブの名前を変えた (書くファイルのタブ): 名前を元に戻して、同じタブに書く (コピーを作らない = 古いタブへの書き込みを落とさない — Codex PR-F 名指し6 中)
+      if (cur.renamedFrom && src === fileId) {
+        await clients.sheets.spreadsheets.batchUpdate({ spreadsheetId: fileId, requestBody: { requests: [
+          { updateSheetProperties: { properties: { sheetId: cur.sheetId, title: DESIGNER_TAB }, fields: 'title' } },
+        ] } }, { timeout: GOOGLE_TIMEOUT_MS });
+        cur = await readNow();
       }
       if (cur.exists && cur.owned) {
         const files = rootOfFileMap(db, id);
         const back = readBackNotes(cur.values, { rootOfFile: (fid) => files.get(String(fid)) ?? null });
         if (!back.ok) throw Object.assign(new Error(back.error), { code: 'unreadable' });
-        // 名前を変えられた自分のタブから読んだ: 書くのは新しい「デザイナー修正依頼」のタブなので、セルに触らずに残す (KEEP) は使えない
-        previous = cur.renamedFrom ? { ...back, layout: null } : back;
+        // 前のフォルダの依頼書から読んだ (書くのは新しいファイル) ときは、セルに触らずに残す (KEEP) は使えない
+        previous = src !== fileId ? { ...back, layout: null } : back;
         firstRead = JSON.stringify([cur.renamedFrom || null, cur.values]);
       }
     }
@@ -518,10 +529,15 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
   } catch (e) {
     // 書く前に止まったら、記録してある依頼書に載っていない公開は外す (書いた後なら、シートが新しい画像を出しているので外さない)。
     // 送った後の失敗 (返事が来なかった) は、Google 側で書けているかもしれないので、今回載せた画像の公開は残す (Codex PR-F 名指し5 中)
+    // Google が断った (400/401/403/404/409/429 = 適用されていないと分かる) なら、送らなかったのと同じ (書いている印も前のまま — Codex PR-F 名指し6 高)
+    if (sending && !wrote && [400, 401, 403, 404, 409, 429].includes(statusOf(e))) {
+      sending = false;
+      if (!row.writing_at) db.prepare('UPDATE ph_designer_sheets SET writing_at = NULL WHERE draft_id = ?').run(id);
+    }
     if (!wrote) {
       const keep = recordedFiles(db, id);
       if (sending) for (const f of keepFiles) keep.add(f);
-      await revokeShares(db, clients.drive, sharesOutside(db, id, keep), { adopt });
+      await revokeShares(db, clients.drive, sharesOutside(db, id, keep));
     }
     if (e?.code === 'designer_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     if (e?.code === 'unreadable') return { ok: false, status: 409, code: 'unreadable', error: e.message };
@@ -555,7 +571,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
 
   // 5. 依頼書から外れた古い版の公開を外す (失敗しても依頼書はできている。記録に残して次に外し直す)
   let revoked = 0;
-  try { revoked = await revokeShares(db, clients.drive, sharesOutside(db, id, keepFiles), { adopt }); }
+  try { revoked = await revokeShares(db, clients.drive, sharesOutside(db, id, keepFiles)); }
   catch (e) { console.error('[product-hub] デザイナー修正依頼書の公開を外す:', e?.message || e); }
   return { ok: true, url, created: isNew, count: images.length, carried: built.carried, orphaned: built.orphaned, kept: built.kept, revoked };
 }

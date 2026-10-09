@@ -296,7 +296,8 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
  * 値は画面に見えている文字 (FORMATTED_VALUE・式のセルは式の結果 = =IMAGE は空)。render: 'FORMULA' なら式のセルは式そのもの。
  * @returns {Promise<{exists: false}|{exists: true, owned: boolean, values: string[][]|null}>}
  *   owned=false (人が作った同じ名前のタブ) は読まない (書くときに writeSpreadsheet が TabConflictError で止める)。
- *   renamedFrom = その名前のタブが無く、印の名前が同じ自分のタブ (人が名前を変えた) から読んだときの、いまの名前
+ *   renamedFrom = その名前のタブが無く、印の名前が同じ自分のタブ (人が名前を変えた) から読んだときの、いまの名前。
+ *   ambiguous = 印の名前が同じ自分のタブが 2 枚以上 (タブの名前の一覧。読まない)
  */
 export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, range = 'A1:Z2000', render = 'FORMATTED_VALUE' }) {
   const opt = { timeout: GOOGLE_TIMEOUT_MS };
@@ -307,13 +308,13 @@ export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, rang
   const all = got?.data?.sheets || [];
   let tab = all.find((s) => s?.properties?.title === name);
   let renamedFrom = null;
+  // 印 (作ったときの名前) が同じ自分のタブ。2 枚以上 (タブをコピーした) は、どれが今の依頼書か分からない → 呼び手が止める
+  // (片方だけ読むと、もう片方に書いた修正指示を黙って落とす — Codex PR-F 名指し4・6 中)
+  const mine = all.filter((s) => (s.developerMetadata || []).some((m) => m && m.metadataKey === OWNED_TAB_KEY && m.metadataValue === name));
+  if (mine.length > 1) return { exists: true, owned: true, ambiguous: mine.map((s) => s.properties.title), values: null };
   if (!tab) {
-    // 人がタブの名前を変えた: 印 (作ったときの名前) が同じ自分のタブが 1 枚だけなら、そこから読む (Codex PR-F 名指し3 中)。
-    // 書くのは元の名前の新しいタブ (名前を変えたタブはそのまま残す)
-    const mine = all.filter((s) => (s.developerMetadata || []).some((m) => m && m.metadataKey === OWNED_TAB_KEY && m.metadataValue === name));
+    // 人がタブの名前を変えた: 印が同じ自分のタブ (1 枚) から読む (Codex PR-F 名指し3 中)。呼び手は名前を元に戻してから書く
     if (!mine.length) return { exists: false };
-    // 2 枚以上 (名前を変えて作り直したのをもう一度名前を変えた) は、どれが今の依頼書か分からない → 呼び手が止める (Codex PR-F 名指し4 中)
-    if (mine.length > 1) return { exists: true, owned: true, ambiguous: mine.map((s) => s.properties.title), values: null };
     tab = mine[0];
     renamedFrom = tab.properties.title;
   }
@@ -325,5 +326,5 @@ export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, rang
     // range: null = タブ全体 (使っている範囲を全部返す)
     spreadsheetId, range: range ? `${tabRef}!${range}` : tabRef, valueRenderOption: render === 'FORMULA' ? 'FORMULA' : 'FORMATTED_VALUE', majorDimension: 'ROWS',
   }, opt);
-  return { exists: true, owned: true, renamedFrom, values: Array.isArray(r?.data?.values) ? r.data.values : [] };
+  return { exists: true, owned: true, renamedFrom, sheetId: tab.properties.sheetId, values: Array.isArray(r?.data?.values) ? r.data.values : [] };
 }
