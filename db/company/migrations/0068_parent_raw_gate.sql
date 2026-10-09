@@ -65,7 +65,8 @@ revoke all on function ops.parent_structure_counts(integer) from public;
  *   { format: 'parent-obs-v1', complete: boolean (行が落ちていない取得), untrusted: [code_norm] (正規化の衝突・取込の整合で保持した商品),
  *     rep_collided (任意): [代表の norm] (NE のコードの元の書き方 = raw_ne_code_spellings の代表の名前空間で書き方が 2 つ以上 = 曖昧。#1676 Codex R1 High),
  *     rep_spellings: { state: 'ok' } / { state: 'unavailable', reason } (その台帳を読めたか。読めない回の rep_collided の空は「衝突なし」ではない =
- *       ops.record_parent_gate は記録しない (spellings_unavailable)。#1676 Codex R2 High),
+ *       ops.record_parent_gate は記録しない (spellings_unavailable)。#1676 Codex R2 High・代表に 1 件でも invalid も unavailable = R3 High 1),
+ *     incomplete_reason (complete = false のとき): c1_set_rows_dropped / ne_rows_dropped (行が落ちた取得 = 記録しない (ne_rows_dropped)。#1676 Codex R3 High 2),
  *     rows: [[code_norm, kind ('single' | 'set'), rep_state ('ok' | 'unknown'), rep_norm (親なし = null), rep_raw (代表の元の書き方 = 代表商品コード_src から)]] (セットは後ろの 3 つが null) }
  * 数える対象 (判定表・上の行から): 単品 (sku_kind = single) だけ (セット・例外は外す = excluded)。
  *   品目の最新が partial = 数える / 登録 cancelled = 外す / quarantined = 数える /
@@ -303,6 +304,10 @@ begin
   -- 🆕 #1676 Codex R2 High: 書き方の台帳 (代表) を読めない回は記録しない = 0 件の記録で門・widen を開けない (一番新しい記録は前の回のまま)
   if (p_ne #>> '{rep_spellings,state}') is distinct from 'ok' then
     raise exception 'spellings_unavailable: NE のコードの元の書き方 (代表) を読めない回 (%) の代表の数えは残さない (書き方の衝突を見落とす)', p_ne #>> '{rep_spellings,reason}' using errcode = 'P0001';
+  end if;
+  -- 🆕 #1676 Codex R3 High 2: NE の取得で行が落ちた回 (C1 の形のセットの行の欠け・コードの無い行 ほか = どのコードがセットか・取得に無いかを特定できない) は記録しない
+  if (p_ne -> 'complete') is distinct from 'true'::jsonb then
+    raise exception 'ne_rows_dropped: NE の取得で行が落ちた回 (%) の代表の数えは残さない (どのコードか特定できない)', coalesce(left(p_ne ->> 'incomplete_reason', 100), 'ne_rows_dropped') using errcode = 'P0001';
   end if;
   v_owner := case when ops.parent_gate_enforced() then 'company' else 'load' end;
   perform pg_catalog.set_config('ops.parent_gate_protocol', '1', true);

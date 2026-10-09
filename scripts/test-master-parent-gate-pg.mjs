@@ -173,6 +173,19 @@ try {
     assert.ok(has(r, /parent_gate: 代表の数えの記録 .* が prepared のロード .* の前/), JSON.stringify(r.problems));
   });
 
+  await ta('[W1c] (#1676 Codex R3 High 1・2) prepared のロードの後の照合が確かめられない回 (代表の書き方に invalid・NE の取得で行が落ちた) = 記録を作らない (watch_writer でも SQL が断る) = widen は止まったまま', async () => {
+    const f = { generation_id: 'ne_w1c', raw_hash: hex('1'), products_complete_at: new Date().toISOString(), setproducts_complete_at: new Date().toISOString() };
+    const base = await mirrorObs(E);
+    for (const [obs, re] of [[{ ...base, rep_spellings: { state: 'unavailable', reason: 'invalid_rep_spellings:1' } }, /spellings_unavailable/],
+      [{ ...base, complete: false, incomplete_reason: 'c1_set_rows_dropped' }, /ne_rows_dropped/]]) {
+      const e = await errOf(E.WW, 'select ops.record_parent_gate($1, $2::jsonb, $3, $4, $5::jsonb)', [runId(), JSON.stringify(f), GEN, hex('2'), JSON.stringify(obs)]);
+      assert.match(e?.message ?? '', re);
+    }
+    const r = await check(E, AT.id);
+    assert.equal(r.ok, false);
+    assert.ok(has(r, /parent_gate: 代表の数えの記録 .* が prepared のロード .* の前/), JSON.stringify(r.problems));
+  });
+
   await ta('[W2] widen の判定: 6 つの数え・prepared のロードの前・材料の世代・停止の前の取得・構造 = 断る (読むだけと apply が同じ) / 揃えば widen が通る', async () => {
     // 照合 ② (封をした回) = prepared のロードの後・同じ材料の世代・停止の後の取得・NE = Company DB (数え 0)。本番 = run.mjs が watch_writer で
     const f = { generation_id: 'ne_w2', raw_hash: hex('1'), products_complete_at: new Date().toISOString(), setproducts_complete_at: new Date().toISOString() };

@@ -38,7 +38,11 @@ export async function driftList({ ne, db }) {
   // 🆕 #1676 Codex R2 High: 代表の名前空間の書き方の台帳を読めない = 数えない (空 = 「衝突なし」と読まない)
   const sp = repSpellingsOf(resolveNeCodes(ne.spellings));
   if (sp.state !== 'ok') throw new Error(`NE のコードの元の書き方 (代表) を読めない (${sp.reason}) = 数えない (書き方の衝突を見落とす。NE の取得の後に集め終えた印を確かめる)`);
-  const obs = parentObservations(nm, { untrusted: [...collided, ...integ.intBlocked.keys()], complete: !integ.absenceUntrusted, repSpellings: sp });
+  // 🆕 #1676 Codex R3 High 2: NE の取得で行が落ちた (どのコードがセットか・取得に無いかを特定できない) = 数えない
+  if (integ.absenceUntrusted) {
+    throw new Error(`NE の取得で行が落ちた (${integ.componentsUntrusted ? 'c1_set_rows_dropped' : 'ne_rows_dropped'}) = 数えない (どのコードか特定できない。取込の整合 ne_api_*_integrity を確かめて取り直す)`);
+  }
+  const obs = parentObservations(nm, { untrusted: [...collided, ...integ.intBlocked.keys()], complete: true, repSpellings: sp });
   const r = await readParentCounts(db, obs, { detail: true });
   return { ne_fetch: { products_complete_at: M.ne_api_products_complete_at, setproducts_complete_at: M.ne_api_setproducts_complete_at,
     rows_dropped: integ.absenceUntrusted }, ...r };

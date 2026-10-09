@@ -36,7 +36,7 @@ export function fetchTimeRfc3339(t) {
  *     = 照合は記録しない (DB の ops.record_parent_gate も断る)・drift-list は止まる。渡されない = 読めない (not_read) に倒す
  *   🚨 長すぎるコード (200 字超) は送らない (= DB では「取得に無い」= 比べられない)・長すぎる代表は unknown (比べられない)
  */
-export function parentObservations(nm, { untrusted = [], complete = false, repSpellings = { state: 'unavailable', reason: 'not_read', collided: [] } } = {}) {
+export function parentObservations(nm, { untrusted = [], complete = false, incompleteReason = null, repSpellings = { state: 'unavailable', reason: 'not_read', collided: [] } } = {}) {
   const rows = [];
   for (const [norm, n] of [...nm].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
     if (!norm || norm.length > MAX_CODE) continue;
@@ -51,15 +51,21 @@ export function parentObservations(nm, { untrusted = [], complete = false, repSp
   const okSp = !!repSpellings && repSpellings.state === 'ok';
   const rc = okSp ? [...new Set([...(repSpellings.collided || [])].filter((x) => typeof x === 'string' && x && x.length <= MAX_CODE))].sort() : [];
   const sp = okSp ? { state: 'ok' } : { state: 'unavailable', reason: String((repSpellings && repSpellings.reason) || 'not_read').slice(0, 100) };
-  return { format: PARENT_OBS_FORMAT, complete: !!complete, untrusted: u, rep_collided: rc, rep_spellings: sp, rows };
+  // 🆕 #1676 Codex R3 High 2: 行が落ちた取得 (complete = false) は理由を持たせる (c1_set_rows_dropped = C1 の形のセットの行の欠け / ne_rows_dropped) = 記録しない
+  const inc = complete ? {} : { incomplete_reason: String(incompleteReason || 'ne_rows_dropped').slice(0, 100) };
+  return { format: PARENT_OBS_FORMAT, complete: !!complete, ...inc, untrusted: u, rep_collided: rc, rep_spellings: sp, rows };
 }
 
 /**
  * compare-ne の resolveNeCodes の答え → 代表の名前空間の書き方の台帳の状態 (#1676 Codex R2 High)。
  *   読めた = { state: 'ok', collided: [書き方が 2 つ以上の代表の norm] } / 読めない (未収集・行の数が違う・知らない版 ほか) = { state: 'unavailable', reason }
+ *   🆕 #1676 Codex R3 High 1: 代表が 1 件でも invalid (壊れた記録・全角・正規化の不一致 = 書き方を確かめられない) = 台帳全体を unavailable (理由 invalid_rep_spellings:件数)
+ *     = その回は記録しない (保守的。次の正常な回で開く)
  */
 export function repSpellingsOf(neCodes) {
   if (!neCodes || !neCodes.ok) return { state: 'unavailable', reason: (neCodes && neCodes.reason) || 'not_read', collided: [] };
+  const invalid = neCodes.entries.filter((e) => e.kind === 'rep' && e.state === 'invalid').length;
+  if (invalid > 0) return { state: 'unavailable', reason: `invalid_rep_spellings:${invalid}`, collided: [] };
   return { state: 'ok', collided: neCodes.entries.filter((e) => e.kind === 'rep' && e.state === 'collided').map((e) => e.code_norm) };
 }
 
@@ -107,8 +113,11 @@ export async function recordParentGate(getWriter, { compareRunId, parentObs, evi
   if (!parentObs.material_generation_id || !f.generation_id || !f.raw_hash || !f.products_complete_at || !f.setproducts_complete_at) {
     return withCounts({ state: 'no_fetch' });
   }
-  if (!spOk) {
+  // 🆕 #1676 Codex R3 High 2: NE の取得で行が落ちた回 (どのコードがセットか・取得に無いかを特定できない) = 記録しない (理由を分ける)
+  const untrustedFetch = parentObs.obs.complete !== true;
+  if (!spOk || untrustedFetch) {
     if (readDb) { try { if (!(await readDb.query(FN_RECORD)).rows[0].ok) return { state: 'not_applied' }; } catch { /* 有無が分からない = 記録しないことは同じ */ } }
+    if (untrustedFetch) return withCounts({ state: 'ne_untrusted', reason: parentObs.obs.incomplete_reason || 'ne_rows_dropped' });
     return withCounts({ state: 'no_spellings', reason: (sp && sp.reason) || 'not_read' });
   }
   if (!getWriter) {
@@ -136,7 +145,7 @@ const codesOf = (samples) => {
   return all.length ? `: ${all.slice(0, 5).join(', ')}${all.length > 5 ? ' ほか' : ''}` : '';
 };
 const STATE_JA = { not_configured: '書く接続が無い (COMPANY_DB_WATCH_WRITER_URL)', failed: '書けない', no_fetch: '取得の世代・時刻・材料の世代が無い',
-  no_spellings: 'NE のコードの元の書き方 (代表) を読めない' };
+  no_spellings: 'NE のコードの元の書き方 (代表) を読めない', ne_untrusted: 'NE の取得で行が落ちた (どのコードか特定できない)' };
 
 /**
  * 代表の持ち主が company (DB の active) = 門が閉じる側 (記録 / 読み直しの答えの owner・門の状態)。

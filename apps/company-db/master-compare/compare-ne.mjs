@@ -1248,11 +1248,13 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   // 🆕 0068 (設計 20 v7 §②・§⑥ PR-6): 代表 (親) の生の数えの元 = 同じ完全な取得の観測 (JSON には入れない。run.mjs が封の後に ops.record_parent_gate で DB に数えさせる)
   //   代表の名前空間の元の書き方 (raw_ne_code_spellings・商品コードが空で落とした行の代表も) が 2 つ以上 = 衝突 (#1676 Codex R1 High)。
   //   台帳を読めない回は「読めない」と理由を持たせる = run.mjs は記録しない (#1676 Codex R2 High)
-  const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], complete: !absenceUntrusted, repSpellings: repSpellingsOf(neCodes) }),
+  //   行が落ちた取得 (C1 の形のセットの行の欠け = どのセットか特定できない・コードの無い行・C2 の親の欠け) = 記録しない (#1676 Codex R3 High 2)
+  const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], complete: !absenceUntrusted,
+      incompleteReason: componentsUntrusted ? 'c1_set_rows_dropped' : 'ne_rows_dropped', repSpellings: repSpellingsOf(neCodes) }),
     fetch: { ...neFetchIdentity(marks, ne), products_complete_at: fetchTimeRfc3339(marks.products.at), setproducts_complete_at: fetchTimeRfc3339(marks.sets.at) },
     material_generation_id: out.generation ? out.generation.generation_id : null };
   out.parent_obs = { rows: parentObs.obs.rows.length, untrusted: parentObs.obs.untrusted.length, rep_collided: parentObs.obs.rep_collided.length, rep_spellings: parentObs.obs.rep_spellings,
-    complete: parentObs.obs.complete };
+    complete: parentObs.obs.complete, incomplete_reason: parentObs.obs.incomplete_reason ?? null };
   return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes, regObs, parentObs };
 }
 
