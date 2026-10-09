@@ -27,6 +27,7 @@ import {
   IMAGE_HEADING_RE, BLOCK_HEADING_RE, SUB_HEADING_RE, sameHeading,
 } from './lp-lint.js';
 import { logEvent } from '../db.js';
+import { validateShootForComposition, shootFormatOfPacket } from './lp-shoot.js';
 
 /** 画面で直す 4 項目 (画面の名前 → ⑦ の見出し)。設計 §3.1 の対応表 */
 export const EDIT_FIELDS = [
@@ -337,6 +338,20 @@ export function effectiveComposeText(db, draftId) {
 const safeJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
 /**
+ * その構成 (job) についた AI の撮影判定の「画像ごとの要撮影」(AI の番号 → true/false)。無い・読めなければ null。
+ * 編集版がまだ無い構成の要撮影の初めの値に使う (画像制作の新フロー PR-C2・Codex 名指し5 M):
+ * 初めの値が「全部 撮影不要」だと、並べ替えただけで保存しても AI が要撮影とした画像が「撮影不要」として記録され、
+ * 撮影指示書から AI のカットが落ちる。読み方は latestShootJudgement と同じ (依頼の形で検査し直す)
+ */
+export function aiNeedsShootOf(job) {
+  if (!job || !job.shoot_json) return null;
+  try {
+    const v = validateShootForComposition(JSON.parse(job.shoot_json), job.output_text, { format: shootFormatOfPacket(safeJson(job.packet_json)) });
+    return v.ok ? new Map(v.value.images.map((im) => [im.no, im.needs_shoot === true])) : null;
+  } catch { return null; }
+}
+
+/**
  * 効いている構成を画像の並びにして返す (uid と要撮影つき)。
  * uid: AI の構成は a0, a1 …、編集版は保存したときの uid (slots_json)。要撮影も slots_json から
  * @returns {null|{job, edit, text, error?, head?, tail?, slots?}}
@@ -352,10 +367,12 @@ export function effectiveCompose(db, draftId) {
   const metaOk = Array.isArray(meta) && meta.length === r.slots.length
     && meta.every((m, i) => m && UID_RE.test(String(m.uid || '')) && m.kind === r.slots[i].kind)
     && new Set(meta.map((m) => m.uid)).size === meta.length;
+  // 編集版が無ければ、要撮影の初めの値は AI の撮影判定 (a<番号> の番号で引く)。編集版があれば人の値 (slots_json)
+  const aiNeeds = edit ? null : aiNeedsShootOf(job);
   const slots = r.slots.map((s, i) => ({
     ...s,
     uid: metaOk ? meta[i].uid : (edit ? `e${edit.id}x${i}` : `a${i}`),
-    shoot: metaOk ? meta[i].shoot === true : false,
+    shoot: metaOk ? meta[i].shoot === true : (!edit && aiNeeds ? aiNeeds.get(i) === true : false),
   }));
   return { job, edit, text, head: r.head, tail: r.tail, slots };
 }

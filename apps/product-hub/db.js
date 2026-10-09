@@ -1614,6 +1614,15 @@ export function initProductHubDB() {
   if (lpJobCols.size > 0 && !lpJobCols.has('shoot_error')) {
     db.exec('ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_error TEXT');
   }
+  // LP 構成: 受付時に固めた撮影判定の仕様書「新商品初動判定」の版 (画像制作の新フロー PR-C2)。LP制作システムの spec_id / spec_hash と同じく
+  // packet の外にも持ち、claim で packet と突き合わせる (packet だけ書き換えて別の版を渡させない・Codex PR-C2 名指し5 M)。
+  // 仕様書を取り込む前の依頼・PR-C (版 5) の依頼は両方 NULL
+  if (lpJobCols.size > 0 && !lpJobCols.has('shoot_spec_id')) {
+    db.exec('ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_spec_id INTEGER');
+  }
+  if (lpJobCols.size > 0 && !lpJobCols.has('shoot_spec_hash')) {
+    db.exec('ALTER TABLE ph_lp_compose_jobs ADD COLUMN shoot_spec_hash TEXT');
+  }
   // LP 構成: 実際に本回答を書いたモデル (2026-10-02・codex exec review #1591 High)。
   // model = 頼んだモデル (reserve)。こちらはランナーが stream-json の assistant.message.model を読んで後から付ける。
   // model_check: match / mismatch / unknown (NULL = まだ付いていない)。一度付けたら書き換えない

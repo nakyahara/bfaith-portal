@@ -533,9 +533,10 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     try {
       id = Number(db.prepare(`INSERT INTO ph_lp_compose_jobs
         (draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, spec_id, spec_hash,
-         requested_by, measurement_deadline_at, created_at, updated_at)
-        VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(draftId, key, JSON.stringify(packet), hash, PACKET_VERSION, specId, specRow.hash, a, deadline, nowS, nowS).lastInsertRowid);
+         shoot_spec_id, shoot_spec_hash, requested_by, measurement_deadline_at, created_at, updated_at)
+        VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(draftId, key, JSON.stringify(packet), hash, PACKET_VERSION, specId, specRow.hash,
+          shootSpecRow ? shootSpecRow.id : null, shootSpecRow ? shootSpecRow.hash : null, a, deadline, nowS, nowS).lastInsertRowid);
     } catch (e) {
       // SELECT と INSERT の間に別の接続が入った (二重クリック・リトライ)。
       // 例外にせず、相手が作った行 / 動いている依頼を返す (コード R1 #3)
@@ -692,10 +693,15 @@ export function claimJob(db, { runnerRunId, maxImages, shootSpec = false, now = 
           // 🚨 packet と job 行の**突き合わせ**も要る (コード R8 #1)。
           //    それぞれの hash が個別に正しくても、job の spec_id / spec_hash だけ書き換えれば
           //    「受付時とは別の仕様書」を渡せてしまう
+          // 撮影判定の仕様書 (PR-C2) も job の列と突き合わせる (packet だけ書き換えて別の有効な版を渡させない・Codex PR-C2 名指し5 M)。
+          // 無い依頼 (取り込む前・版 5) は両方 null
+          const ss = p.shoot_spec || null;
           return p.draft_id === job.draft_id
             && p.packet_version === job.packet_version
             && p.spec_id === job.spec_id
-            && p.spec_hash === job.spec_hash;
+            && p.spec_hash === job.spec_hash
+            && (ss ? ss.id : null) === (job.shoot_spec_id ?? null)
+            && (ss ? ss.hash : null) === (job.shoot_spec_hash ?? null);
         } catch { return false; }
       })();
       if (!packetOk) {

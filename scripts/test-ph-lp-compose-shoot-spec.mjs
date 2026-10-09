@@ -369,16 +369,23 @@ let dV2, rV2;
 
 console.log('② 渡す前の照合 — 受付時の仕様書と違えば渡さない (spec_changed)');
 {
-  const tamper = (mutate, why) => {
+  const tamper = (mutate, why, { alsoJobRow = true, code = 'spec_changed' } = {}) => {
     const d = mkDraft();
     const req = request(d, `ss-key-tamper-${seq}`);
     const p = JSON.parse(req.job.packet_json);
     mutate(p);
-    // packet の hash も作り直す (packet だけ見ていては気づけない書き換え)
+    // packet の hash も作り直す (packet だけ見ていては気づけない書き換え)。alsoJobRow = job の列 (shoot_spec_id / hash) も合わせて書き換える
     db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ? WHERE id = ?').run(JSON.stringify(p), lp.sha256(lp.canonicalJson(p)), req.job.id);
+    if (alsoJobRow) db.prepare('UPDATE ph_lp_compose_jobs SET shoot_spec_id = ?, shoot_spec_hash = ? WHERE id = ?').run(p.shoot_spec.id, p.shoot_spec.hash, req.job.id);
     const cl = lp.claimJob(db, { runnerRunId: 'run-tamper', maxImages: 16, shootSpec: true });
-    ok(cl.job === null && jobRow(req.job.id).error_code === 'spec_changed', `🚨 ${why} → 渡さずに spec_changed`);
+    ok(cl.job === null && jobRow(req.job.id).error_code === code, `🚨 ${why} → 渡さずに ${code} (${jobRow(req.job.id).error_code})`);
   };
+  eq([jobRow(rV2.jobId).shoot_spec_id, jobRow(rV2.jobId).shoot_spec_hash], [judge.spec.id, judge.spec.hash], '受付時の仕様書の版は job の列にも残す (LP制作システムの spec_id / spec_hash と同じ)');
+  {
+    const newest = lp.latestSpec(db, 'initial_judge');
+    ok(newest.id !== judge.spec.id, '前提: 別の有効な版がある');
+    tamper((p) => { p.shoot_spec.id = judge.spec.id; p.shoot_spec.hash = judge.spec.hash; }, '🚨 packet だけを別の有効な版に差し替えた (job の列と合わない・Codex PR-C2 名指し5)', { alsoJobRow: false, code: 'packet_tampered' });
+  }
   tamper((p) => { p.shoot_spec.hash = 'f'.repeat(64); }, '仕様書の hash が版と違う');
   tamper((p) => { p.shoot_spec.id = spec.id; p.shoot_spec.hash = spec.hash; }, '仕様書の id が LP制作システムの版を指す (種類が違う)');
   tamper((p) => { p.shoot_spec.id = 99999; }, '仕様書の版が無い');
@@ -513,8 +520,18 @@ console.log('⑧ 撮影指示書 (PR-D) — 仕様書の形 (v2) なら AI の�
   accept(rE, { shoot: goodV2() });
   matchModel(rE.run);
   const stE = le.editStateFor(db, dE, { canEdit: true });
+  eq(stE.slots.map((x) => x.shoot), [false, false, true], '🚨 編集版がまだ無い構成の要撮影の初めの値は AI の判定 (全部「撮影不要」で始めない・Codex PR-C2 名指し5 M)');
+  {
+    // 画面の値をそのまま保存 (文字だけ直した) しても、AI のカットと概要が撮影指示書に残る
+    const asIs = stE.slots.map((x) => ({ uid: x.uid, role: x.role, title: x.title + '!', copy: x.copy, body: x.body, shoot: x.shoot }));
+    const sv0 = le.saveEdit(db, { draft: dE, baseJobId: stE.base_job_id, baseEditId: stE.base_edit_id, slots: asIs, actor: 'staff@x' });
+    const after0 = svcMod.shootSheetCutsFor(db, dE);
+    ok(sv0.ok && after0.cuts.some((x) => x.content === '玄関でスプレーする手元') && after0.summary.send_targets === 'ハッカ油スプレー 100ml (1本)',
+      `🚨 画面の要撮影をそのまま保存しても AI のカット・概要は落ちない (${sv0.error || ''})`);
+  }
   const send = (fn) => stE.slots.map((x) => ({ uid: x.uid, role: x.role, title: x.title, copy: x.copy, body: x.body, shoot: fn(x.uid) }));
-  const sv1 = le.saveEdit(db, { draft: dE, baseJobId: stE.base_job_id, baseEditId: stE.base_edit_id, slots: send((u) => u === 'a2'), actor: 'staff@x' });
+  const st1E = le.editStateFor(db, dE, { canEdit: true });
+  const sv1 = le.saveEdit(db, { draft: dE, baseJobId: st1E.base_job_id, baseEditId: st1E.base_edit_id, slots: send((u) => u === 'a2').map((x) => ({ ...x, copy: x.copy + '。' })), actor: 'staff@x' });
   const after1 = svcMod.shootSheetCutsFor(db, dE);
   ok(sv1.ok && after1.summary.send_targets === 'ハッカ油スプレー 100ml (1本)', `編集版で要撮影が AI と同じなら AI の概要を使う (${sv1.error || ''})`);
   const st2 = le.editStateFor(db, dE, { canEdit: true });
@@ -530,7 +547,8 @@ console.log('② PR-C の版 (5) の依頼は claim でそのまま受ける (�
   const req = request(d, 'ss-key-v5');
   const p = JSON.parse(req.job.packet_json);
   delete p.shoot_spec; p.packet_version = 5; p.shoot_instruction = sh.SHOOT_JUDGE_INSTRUCTION;
-  db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 5 WHERE id = ?').run(JSON.stringify(p), lp.sha256(lp.canonicalJson(p)), req.job.id);
+  // 版 5 の行 (PR-C で作った依頼) は shoot_spec_id / hash の列が NULL
+  db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 5, shoot_spec_id = NULL, shoot_spec_hash = NULL WHERE id = ?').run(JSON.stringify(p), lp.sha256(lp.canonicalJson(p)), req.job.id);
   const old = lp.claimJob(db, { runnerRunId: 'run-v5-old', maxImages: 16 });
   eq(old.job?.job_id, req.job.id, '🚨 版 5 の依頼は古い phlp でも掴める (仕様書が無い = PR-C と同じ)');
   ok(old.job.shoot_spec === null && old.job.packet.shoot_instruction === sh.SHOOT_JUDGE_INSTRUCTION, '撮影判定は PR-C の決まり (v1)');
@@ -543,7 +561,7 @@ console.log('② PR-C の版 (5) の依頼は claim でそのまま受ける (�
   const r4 = request(d4, 'ss-key-v4');
   const p4 = JSON.parse(r4.job.packet_json);
   delete p4.shoot_spec; delete p4.shoot_instruction; p4.packet_version = 4;
-  db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 4 WHERE id = ?').run(JSON.stringify(p4), lp.sha256(lp.canonicalJson(p4)), r4.job.id);
+  db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 4, shoot_spec_id = NULL, shoot_spec_hash = NULL WHERE id = ?').run(JSON.stringify(p4), lp.sha256(lp.canonicalJson(p4)), r4.job.id);
   const c4 = lp.claimJob(db, { runnerRunId: 'run-v4', maxImages: 16, shootSpec: true });
   ok(c4.job === null && jobRow(r4.job.id).error_code === 'packet_outdated', '版 4 以下は今どおり packet_outdated');
 }
