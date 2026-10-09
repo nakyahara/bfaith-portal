@@ -37,6 +37,8 @@ import {
 } from './sheets-writer.js';
 
 const APP_PROP_KEY = 'phDesignerSheetDraft';
+/** lp-image の prompt の上限 (PROMPT_MAX)。これに達している prompt は途中で切れている */
+const PROMPT_MAX_LEN = 30_000;
 const LEASE_MS = 180_000;
 const GOOGLE_TIMEOUT_MS = 20_000;
 export const DESIGNER_SHEET_FORBIDDEN = 'デザイナー修正依頼書を作れるのは 画像登録者・画像作成承認者 の担当者か管理者だけです';
@@ -84,7 +86,8 @@ function rolesFromPrompts(db, rootIds) {
     const prompt = im.prompt || '';
     const i = prompt.indexOf(marker);
     const nl = i >= 0 ? prompt.indexOf('\n', i) : -1;
-    if (nl >= 0) {
+    // 上限 (lp-image の PROMPT_MAX = 30,000 文字) まであるなら途中で切れているかもしれない (役割の途中・見出しの前で切れる) → 下の代わりの引き方
+    if (nl >= 0 && prompt.length < PROMPT_MAX_LEN) {
       const f = fieldsOfBlock(prompt.slice(nl + 1).split('\n'));
       out.set(rid, { role: f.role || '', title: f.title || '' });
       continue;
@@ -217,60 +220,99 @@ export function explainShareError(e) {
 }
 
 /**
+ * ファイルの権限を全部読む (共有ドライブでは 1 ページ 100 件まで。続きは nextPageToken — Codex PR-F 名指し4 高:
+ * 先頭のページだけでは anyone の公開を見落とし、付いているのに「無い」と見て記録を閉じていた)
+ */
+async function listAllPermissions(drive, fileId) {
+  const out = [];
+  let pageToken;
+  for (let page = 0; page < 50; page++) {
+    const r = await drive.permissions.list({ fileId, supportsAllDrives: true, pageSize: 100, fields: 'nextPageToken, permissions(id,type,role)', ...(pageToken ? { pageToken } : {}) }, { timeout: GOOGLE_TIMEOUT_MS });
+    out.push(...(r?.data?.permissions || []));
+    pageToken = r?.data?.nextPageToken;
+    if (!pageToken) return out;
+  }
+  throw new Error('権限の一覧が多すぎて読み切れませんでした');
+}
+const closeShare = (db, rowId, why) => db.prepare(`UPDATE ph_designer_sheet_shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoke_error = ? WHERE id = ?`).run(why, rowId);
+
+/**
  * ファイルに「リンクを知っている人は閲覧可」を付ける。
  * 🚨 付ける**前に**「付けようとしている」行 (permission_id = NULL) を記録する (Codex PR-F 名指し1 高):
  *    付けた直後に止まった・記録の書き込みで失敗した、でも次の回・外すときに「ポータルが付けた公開」と分かる
  *    (記録の無い公開 = 人が付けたもの、と見て外さないので、先に記録しないと外せない公開が残る)。
- * もう公開されていれば付けない。そのとき、ポータルの記録 (付けようとしていた行を含む) があればポータルのもの、無ければ人が付けたもの
- * @returns {Promise<number|null>}  この回で記録した行の ID。付けなかったら null
+ * もう公開されていれば付けない。そのとき、ポータルが ID を記録した公開ならポータルのもの、それ以外は人が付けたもの (外さない)。
+ * 🚨 前の回の「付けようとしていた行」(ID が NULL) は、いまある公開と結び付けない (Codex PR-F 名指し4 / base P2:
+ *    止まった後に人が公開を付けたのかもしれず、ポータルが付けたと証明できない)。持ち主の分からない公開として閉じ、履歴に残す
+ * @returns {Promise<number|null>}  この回で記録した行の ID (付けようとした行。失敗したら throw の shareRowId)。付けなかったら null
  */
 async function shareImage(db, drive, { draftId, fileId, imageId, actor }) {
-  const opt = { timeout: GOOGLE_TIMEOUT_MS };
-  const list = await drive.permissions.list({ fileId, supportsAllDrives: true, fields: 'permissions(id,type,role)' }, opt);
-  const hit = (list?.data?.permissions || []).find((p) => p && p.type === 'anyone');
+  const perms = await listAllPermissions(drive, fileId);
+  const hit = perms.find((p) => p && p.type === 'anyone');
   const mine = db.prepare('SELECT * FROM ph_designer_sheet_shares WHERE draft_id = ? AND drive_file_id = ? AND revoked_at IS NULL ORDER BY id DESC LIMIT 1').get(draftId, fileId);
-  if (hit) {
-    // 前の回で付けた直後に止まった (付けようとしていた行のまま) → ポータルが付けた公開として ID を埋める
-    if (mine && !mine.permission_id) db.prepare('UPDATE ph_designer_sheet_shares SET permission_id = ? WHERE id = ?').run(String(hit.id), mine.id);
-    return null;
+  if (mine && !mine.permission_id) {
+    closeShare(db, mine.id, hit ? 'unknown_owner' : 'not_shared');
+    if (hit) unknownOwnerEvent(db, draftId, fileId, actor);
   }
+  if (hit) return null;
   // 記録はあるのに公開が無い (人が Drive で外した) → その記録は外れたものとして閉じる
-  if (mine) db.prepare(`UPDATE ph_designer_sheet_shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoke_error = 'gone' WHERE id = ?`).run(mine.id);
+  if (mine && mine.permission_id) closeShare(db, mine.id, 'gone');
   const sid = Number(db.prepare(`INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, NULL, ?, ?)`)
     .run(draftId, fileId, imageId, actor).lastInsertRowid);
-  // allowFileDiscovery: false = 検索には出さない (リンクを知っている人だけ)。通知メールは anyone には送られない。
-  // 失敗しても付けようとしていた行は残す (付いたか分からない) — 呼び手が「記録の依頼書に載っていない公開」として外す
-  const r = await drive.permissions.create({
-    fileId, supportsAllDrives: true, fields: 'id',
-    requestBody: { type: 'anyone', role: 'reader', allowFileDiscovery: false },
-  }, opt);
-  if (r?.data?.id) db.prepare('UPDATE ph_designer_sheet_shares SET permission_id = ? WHERE id = ?').run(String(r.data.id), sid);
+  try {
+    // allowFileDiscovery: false = 検索には出さない (リンクを知っている人だけ)。通知メールは anyone には送られない
+    const r = await drive.permissions.create({
+      fileId, supportsAllDrives: true, fields: 'id',
+      requestBody: { type: 'anyone', role: 'reader', allowFileDiscovery: false },
+    }, { timeout: GOOGLE_TIMEOUT_MS });
+    if (r?.data?.id) db.prepare('UPDATE ph_designer_sheet_shares SET permission_id = ? WHERE id = ?').run(String(r.data.id), sid);
+  } catch (e) {
+    // 付いたか分からない。この回の行なので、呼び手が外すときに「いまある anyone の公開」を外してよい (この回で付けようとしたもの)
+    throw Object.assign(e, { shareRowId: sid });
+  }
   return sid;
 }
+function unknownOwnerEvent(db, draftId, fileId, actor) {
+  try {
+    logEvent(db, draftId, 'designer_sheet_share_unknown', `画像 ${fileId} に「リンクを知っている人は閲覧可」の公開があります。前の作成が途中で止まった後なので、ポータルが付けたものか分かりません (外していません)。要らなければ Drive で外してください`, actor);
+  } catch (_) { /* 記録の失敗で止めない */ }
+}
 
-/** 公開を外す (記録してある、ポータルが付けたものだけ)。外せた / もう無い (404) なら revoked_at を入れる */
-async function revokeShares(db, drive, shares) {
+/**
+ * 公開を外す (記録してある、ポータルが付けたものだけ)。
+ * @param {Set<number>} [adopt]  この回で付けようとした行 (ID が NULL でも、いまある anyone の公開はこの回が付けたものとして外す)。
+ *   それ以外の ID が NULL の行 (前の回で止まった) は、いまの公開と結び付けない = 外さずに「持ち主の分からない公開」として閉じる
+ */
+async function revokeShares(db, drive, shares, { adopt = new Set() } = {}) {
   let revoked = 0;
   for (const s of shares) {
     try {
       let permissionId = s.permission_id;
       if (!permissionId) {
-        // 付けようとしていた行 (付けられたか分からない): いまの公開を見て、あれば外す・無ければ閉じる
-        const list = await drive.permissions.list({ fileId: s.drive_file_id, supportsAllDrives: true, fields: 'permissions(id,type,role)' }, { timeout: GOOGLE_TIMEOUT_MS });
-        permissionId = (list?.data?.permissions || []).find((p) => p && p.type === 'anyone')?.id || null;
-        if (!permissionId) {
-          db.prepare(`UPDATE ph_designer_sheet_shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoke_error = 'not_shared' WHERE id = ?`).run(s.id);
-          revoked += 1;
-          continue;
-        }
+        const anyone = (await listAllPermissions(drive, s.drive_file_id)).find((p) => p && p.type === 'anyone');
+        if (!anyone) { closeShare(db, s.id, 'not_shared'); revoked += 1; continue; }
+        if (!adopt.has(s.id)) { closeShare(db, s.id, 'unknown_owner'); unknownOwnerEvent(db, s.draft_id, s.drive_file_id, null); continue; }
+        permissionId = anyone.id;
       }
       await drive.permissions.delete({ fileId: s.drive_file_id, permissionId, supportsAllDrives: true }, { timeout: GOOGLE_TIMEOUT_MS });
-      db.prepare(`UPDATE ph_designer_sheet_shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoke_error = NULL WHERE id = ?`).run(s.id);
+      closeShare(db, s.id, null);
       revoked += 1;
     } catch (e) {
       if (statusOf(e) === 404) {
-        db.prepare(`UPDATE ph_designer_sheet_shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoke_error = 'not_found' WHERE id = ?`).run(s.id);
-        revoked += 1;
+        // 404 は「その権限が無い」のほかに「ファイルが見えない」でも返る (Codex PR-F 名指し4 中)。一覧を読めて、その権限が無いと分かったときだけ閉じる。
+        // ファイルごと見えない (消された・サービスアカウントが入れない) ときは、確かめようがないので閉じて履歴に残す (画面と削除が止まり続けないように)
+        let why = 'file_not_visible';
+        try { if (!(await listAllPermissions(drive, s.drive_file_id)).some((p) => p && (p.id === s.permission_id || p.type === 'anyone'))) why = 'not_found'; else why = null; }
+        catch (_) { why = 'file_not_visible'; }
+        if (why) {
+          closeShare(db, s.id, why);
+          if (why === 'file_not_visible') {
+            try { logEvent(db, s.draft_id, 'designer_sheet_share_unverified', `画像 ${s.drive_file_id} が Drive で見えないので、公開を外せたか確かめられません (記録は閉じました)`, null); } catch (_) { /* 止めない */ }
+          }
+          revoked += 1;
+          continue;
+        }
+        db.prepare('UPDATE ph_designer_sheet_shares SET revoke_error = ? WHERE id = ?').run('権限の削除が 404 なのに、公開が残っています', s.id);
       } else {
         // 外せなければ記録に残す (公開のまま)。次に作ったときに外し直す
         db.prepare('UPDATE ph_designer_sheet_shares SET revoke_error = ? WHERE id = ?').run(explainGoogleError(e).slice(0, 300), s.id);
@@ -394,16 +436,20 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
   const keepFiles = new Set(images.map((im) => String(im.drive_file_id)));
 
   // 1. 画像を公開する (依頼書を作る前。断られたら依頼書を作らない = 中途半端なシートを残さない)
+  // この回で付けようとした行 (外すときに、ID が無くても「この回が付けた公開」として外してよいもの)
+  const adopt = new Set();
   try {
     for (const im of images) {
-      await shareImage(db, clients.drive, { draftId: id, fileId: im.drive_file_id, imageId: im.current_id, actor });
+      const sid = await shareImage(db, clients.drive, { draftId: id, fileId: im.drive_file_id, imageId: im.current_id, actor });
+      if (sid) adopt.add(sid);
       // 1 枚ごとに印の期限を延ばす (8 枚 × Google の待ちで 3 分を超えても、別の処理に印を取られない — Codex PR-F 名指し1 中)
       assertLease(db, id, token);
     }
   } catch (e) {
+    if (e?.shareRowId) adopt.add(e.shareRowId);
     // 記録してある依頼書に載っていない公開は全部外す (作らなかった依頼書のために公開したままにしない)。
     // この回のものに限らない — 前の回が公開した直後に止まった分も、ここで片付く (Codex PR-F 名指し2 高)
-    await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)));
+    await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)), { adopt });
     if (e?.code === 'designer_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     const reason = explainShareError(e);
     try { logEvent(db, id, 'designer_sheet_failed', reason.slice(0, 500), actor); } catch (_) { /* 記録の失敗で結果を変えない */ }
@@ -435,6 +481,9 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
     let firstRead = null;
     if (!created) {
       const cur = await readNow();
+      if (cur.ambiguous) {
+        throw Object.assign(new Error(`名前を変えたデザイナー修正依頼のタブが複数あります (${cur.ambiguous.join('・')})。どれが今の依頼書か分からないので作り直していません。今の依頼書のタブの名前を「${DESIGNER_TAB}」に戻してから押してください`), { code: 'unreadable' });
+      }
       if (cur.exists && cur.owned) {
         const files = rootOfFileMap(db, id);
         const back = readBackNotes(cur.values, { rootOfFile: (fid) => files.get(String(fid)) ?? null });
@@ -465,7 +514,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
     });
   } catch (e) {
     // 書く前に止まったら、記録してある依頼書に載っていない公開は外す (書いた後なら、シートが新しい画像を出しているので外さない)
-    if (!wrote) await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)));
+    if (!wrote) await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)), { adopt });
     if (e?.code === 'designer_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     if (e?.code === 'unreadable') return { ok: false, status: 409, code: 'unreadable', error: e.message };
     if (e?.code === 'sheet_changed') return { ok: false, status: 409, code: 'sheet_changed', error: e.message };
@@ -498,7 +547,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
 
   // 5. 依頼書から外れた古い版の公開を外す (失敗しても依頼書はできている。記録に残して次に外し直す)
   let revoked = 0;
-  try { revoked = await revokeShares(db, clients.drive, sharesOutside(db, id, keepFiles)); }
+  try { revoked = await revokeShares(db, clients.drive, sharesOutside(db, id, keepFiles), { adopt }); }
   catch (e) { console.error('[product-hub] デザイナー修正依頼書の公開を外す:', e?.message || e); }
   return { ok: true, url, created: isNew, count: images.length, carried: built.carried, orphaned: built.orphaned, kept: built.kept, revoked };
 }

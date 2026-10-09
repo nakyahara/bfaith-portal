@@ -108,6 +108,11 @@ const IMG = (root, cur, no, ver = 1, extra = {}) => ({ root_id: root, current_id
   const noHead = vals.filter((_, i) => i !== 2);
   back = ds.readBackNotes(noHead);
   ok(!back.ok && /見出しの行が見つかりません/.test(back.error), '🚨 見出しの行が無い (どこが修正指示か分からない) シートは読めない = 上書きしない');
+  const fakeHead = vals.map((r) => r.slice());
+  fakeHead[2][2] = 'コメント';           // 見出しの「修正指示」を書き換えた
+  fakeHead[4][2] = '修正指示';           // 本文にちょうど「修正指示」と書いた
+  back = ds.readBackNotes(fakeHead);
+  ok(!back.ok && /見出しの行が見つかりません/.test(back.error), '🚨 本文に「修正指示」と書いた行を見出しと取り違えない (見出しは 修正指示・管理番号・AI生成画像 がそろった行 — Codex 名指し4 中)');
   const dupHead = vals.map((r, i) => (i === 2 ? [r[0], r[1], '修正指示', ...r.slice(2)] : [r[0], r[1], '', ...r.slice(2)]));
   back = ds.readBackNotes(dupHead);
   ok(!back.ok && /同じ名前の列が 2 つ/.test(back.error), '🚨 「修正指示」の見出しが 2 つ (人が同じ名前の列を足した) なら、どちらが本物か分からないので上書きしない (Codex 名指し2 高)');
@@ -260,7 +265,17 @@ const fakeDrive = {
     update: async (p) => { await hit('update', p); const f = fileOrThrow(p.fileId); if ('name' in p.requestBody) f.name = p.requestBody.name; return { data: {} }; },
   },
   permissions: {
-    list: async (p) => { await hit('plist', p); if (g.onPlist) { const fn = g.onPlist; g.onPlist = null; fn(p); } const f = fileOrThrow(p.fileId); return { data: { permissions: f.perms.map((x) => ({ id: x.id, type: x.type, role: x.role })) } }; },
+    list: async (p) => {
+      await hit('plist', p);
+      if (g.onPlist) { const fn = g.onPlist; g.onPlist = null; fn(p); }
+      const f = fileOrThrow(p.fileId);
+      // 本物と同じく 1 ページ 100 件まで (pageSize を省くとさらに少ないこともある)。続きは nextPageToken
+      const size = Math.min(100, Number(p.pageSize) || 20);
+      const from = Number(p.pageToken || 0);
+      if (from) g.log.push('plist-page' + (from / size + 1));
+      const all = f.perms.map((x) => ({ id: x.id, type: x.type, role: x.role }));
+      return { data: { permissions: all.slice(from, from + size), ...(from + size < all.length ? { nextPageToken: String(from + size) } : {}) } };
+    },
     create: async (p) => {
       await hit('pcreate', p);
       const f = fileOrThrow(p.fileId);
@@ -568,7 +583,14 @@ const A = makeComposed({ code: 'maitakep50' });
     const rR = await press(A);
     ok(rR.status === 200 && rR.json.carried === 2 && rR.json.kept === 0 && noteOfKey(F.id, `img-${cards2[0].root_id}`)?.note === 'TOP の文字を大きく'
       && F.tabs.some((x) => x.title === '旧 依頼 (田中)'), '🚨 タブの名前を変えられても、修正指示は新しい「デザイナー修正依頼」のタブに引き継ぐ (名前を変えたタブは残す — Codex 名指し3 中)', JSON.stringify(rR.json));
+    // もう一度名前を変える → 名前を変えた自分のタブが 2 枚 = どれが今の依頼書か分からない → 止める
+    const tR2 = tabOf(F.id);
+    tR2.title = '旧 依頼 (2)';
+    const bR = g.batches;
+    const rR2 = await press(A);
+    ok(rR2.status === 409 && rR2.json.code === 'unreadable' && /複数あります/.test(rR2.json.error) && g.batches === bR, '🚨 名前を変えた依頼のタブが 2 枚 → どれが今のか分からないので作り直さない (空のタブを作らない — Codex 名指し4 中)', JSON.stringify(rR2.json));
     F.tabs = F.tabs.filter((x) => x.title !== '旧 依頼 (田中)');
+    tR2.title = ds.DESIGNER_TAB;
   }
   // 人が左に 26 列を足して、全部が AA 列より右へ動いた → タブ全体を読むので、修正指示は残る (A1:Z2000 で読むと空に見えて消していた)
   {
@@ -588,6 +610,13 @@ const A = makeComposed({ code: 'maitakep50' });
     const rjP = regen(A, cardsOf(A)[0].head_id); finishJob(rjP);
     const rP = await press(A);
     ok(rP.status === 200 && tabOf(F.id).values[3][0] === '0枚目 (TOP)｜楽天検索結果用TOP画像／商品認識', 'prompt が切れていても、受付のときの構成から役割を引く (Codex 名指し2 中)', tabOf(F.id).values[3][0]);
+    // 「この画像の指示」はあるが、上限 (30,000 文字) まであって途中で切れている → 受付の構成から
+    const mi = keepPrompt.indexOf('【この画像の指示');
+    const partial = keepPrompt.slice(mi, keepPrompt.indexOf('## 画像の役割', mi) + '## 画像の役割\n楽天検'.length);
+    db.prepare('UPDATE ph_lp_images SET prompt = ? WHERE id = ?').run('x'.repeat(30_000 - partial.length) + partial, rootTop);
+    const rjP2 = regen(A, cardsOf(A)[0].head_id); finishJob(rjP2);
+    const rP2 = await press(A);
+    ok(rP2.status === 200 && tabOf(F.id).values[3][0] === '0枚目 (TOP)｜楽天検索結果用TOP画像／商品認識', 'prompt が上限まであって「この画像の指示」の途中で切れていても、受付の構成から引く (Codex 名指し4 低)', tabOf(F.id).values[3][0]);
     db.prepare('UPDATE ph_lp_images SET prompt = ? WHERE id = ?').run(keepPrompt, rootTop);
   }
   // 全部作り直す (別の画像になる) → 修正指示は下に残す
@@ -710,14 +739,53 @@ console.log('③ 共有ドライブの設定でリンク共有ができない');
   r = await press(B);
   ok(r.status === 502 && !publicFiles().includes(f4) && sharesOf(B).filter((x) => x.drive_file_id === f4).every((x) => x.revoked_at),
     '🚨 公開が付いたのに返事が来なかった → 付ける前に記録していたので、外して閉じる (記録の無い公開を残さない — Codex 名指し1 高)', JSON.stringify([r, sharesOf(B).filter((x) => x.drive_file_id === f4)]));
-  // 前の回が付けた直後にプロセスごと止まった (付けようとしていた行のまま・公開は付いている) → ポータルのものとして引き取り、後で外せる
+  // 前の回が「付けようとしていた行」(ID なし) のまま止まり、いま公開が付いている (止まった後に人が付けたのかもしれない)
+  // → ポータルのものと決めつけない: 記録は閉じて履歴に残し、公開は外さない (Codex 名指し4 / base P2)
   g.files.get(f4).perms.push({ id: 'anyoneWithLink', type: 'anyone', role: 'reader' });
   db.prepare('INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, NULL, NULL, ?)').run(B.id, f4, 't');
   r = await press(B);
-  ok(r.status === 200 && sharesOf(B).some((x) => x.drive_file_id === f4 && x.permission_id === 'anyoneWithLink' && !x.revoked_at), '付けようとしていた行のまま止まった公開は、ポータルのものとして ID を埋める');
+  ok(r.status === 200 && sharesOf(B).filter((x) => x.drive_file_id === f4).every((x) => x.revoked_at && (x.permission_id == null)) && sharesOf(B).some((x) => x.drive_file_id === f4 && x.revoke_error === 'unknown_owner')
+    && evOf(B, 'designer_sheet_share_unknown').length === 1, '🚨 前の回の「付けようとしていた行」と、いまある公開を結び付けない (持ち主の分からない公開として閉じ、履歴に残す)', JSON.stringify(sharesOf(B).filter((x) => x.drive_file_id === f4)));
   const rj5 = regen(B, cardsOf(B)[2].head_id); finishJob(rj5);
   r = await press(B);
-  ok(r.status === 200 && !publicFiles().includes(f4), 'それも依頼書から外れたら外す');
+  ok(r.status === 200 && publicFiles().includes(f4), '🚨 持ち主の分からない公開は、依頼書から外れても外さない (人が付けたものかもしれない)');
+  // 片付けの側でも同じ: 前の回の ID なしの行は外さない
+  const rjU = regen(B, cardsOf(B)[2].head_id); finishJob(rjU);
+  const fU = cardsOf(B)[2].current.drive_file_id;
+  g.files.get(fU).perms.push({ id: 'anyoneWithLink', type: 'anyone', role: 'reader' });
+  db.prepare('INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, NULL, NULL, ?)').run(B.id, fU, 't');
+  const rjU2 = regen(B, cardsOf(B)[2].head_id); finishJob(rjU2);
+  await svc.sweepDesignerShares({ db });
+  ok(publicFiles().includes(fU) && sharesOf(B).some((x) => x.drive_file_id === fU && x.revoke_error === 'unknown_owner'), '起動のあとの片付けも、前の回の ID なしの行の公開は外さない');
+  r = await press(B);
+  ok(r.status === 200, '(前提) 作り直せる');
+  // 権限の一覧の 2 ページ目に公開がある (共有ドライブは 1 ページ 100 件) → 見落とさない
+  {
+    // 依頼書に載っている (公開中の) 画像の権限が 150 件あり、公開 (anyone) は 2 ページ目
+    const fp = cardsOf(B)[0].current.drive_file_id;
+    const f = g.files.get(fp);
+    f.perms = [...Array.from({ length: 150 }, (_, k) => ({ id: 'u' + k, type: 'user', role: 'reader' })), ...f.perms];
+    const rowsBefore = sharesOf(B).filter((x) => x.drive_file_id === fp && !x.revoked_at).length;
+    const nCreate = g.log.filter((x) => x === 'pcreate').length;
+    r = await press(B);
+    ok(r.status === 200 && g.log.includes('plist-page2') && g.log.filter((x) => x === 'pcreate').length === nCreate
+      && sharesOf(B).filter((x) => x.drive_file_id === fp && !x.revoked_at).length === rowsBefore && rowsBefore === 1,
+      '🚨 権限の一覧は全部のページを読む (2 ページ目の公開を見落として「公開が無い」と記録を閉じ、付け直さない — Codex 名指し4 高)', JSON.stringify(r.json));
+    f.perms = f.perms.filter((x) => x.type !== 'user');
+  }
+  // 公開を外すと 404: その権限が無い (もう外れている) なら閉じる / 公開が残っているなら閉じない
+  {
+    const rjH = regen(B, cardsOf(B)[1].head_id); finishJob(rjH);
+    const fh = db.prepare('SELECT drive_file_id FROM ph_designer_sheet_shares WHERE draft_id = ? AND revoked_at IS NULL AND drive_file_id NOT IN (SELECT ? ) ORDER BY id').all(B.id, cardsOf(B)[1].current.drive_file_id)
+      .map((x) => x.drive_file_id).find((id) => !cardsOf(B).some((c) => c.current.drive_file_id === id));
+    g.fail.pdelete = { err: gErr(404, 'File not found'), once: true };
+    r = await press(B);
+    const rowH = sharesOf(B).filter((x) => x.drive_file_id === fh).at(-1);
+    ok(r.status === 200 && fh && rowH.revoked_at == null && /404/.test(rowH.revoke_error || '') && stateNow(B).unrevoked === 1,
+      '🚨 削除が 404 でも公開が残っているなら閉じない (404 はファイルが見えないときにも返る — Codex 名指し4 中)', JSON.stringify(rowH));
+    r = await press(B);
+    ok(r.status === 200 && !publicFiles().includes(fh) && stateNow(B).unrevoked === 0, '押せば外し直す');
+  }
   // 1 枚ごとに印の期限を延ばす = 公開の途中で印を取られたら止める
   const rj6 = regen(B, cardsOf(B)[0].head_id); finishJob(rj6);
   const f6 = cardsOf(B)[0].current.drive_file_id;

@@ -146,7 +146,8 @@ export function readBackNotes(values, { rootOfFile = null } = {}) {
   const orphans = [];
   if (values == null) return { ok: true, byKey, orphans, layout: null };
   const rows = Array.isArray(values) ? values.map((r) => (Array.isArray(r) ? r.map(str) : [])) : [];
-  const headerIdx = rows.findIndex((r) => r.some((c) => c.trim() === H_NOTE));
+  // 見出しの行 = 「修正指示」「管理番号」「AI生成画像」がそろった行 (修正指示の本文に「修正指示」と書かれた行を見出しと取り違えない — Codex PR-F 名指し4 中)
+  const headerIdx = rows.findIndex((r) => r.some((c) => c.trim() === H_NOTE) && r.some((c) => c.trim().startsWith(H_KEY_PREFIX)) && r.some((c) => c.trim() === H_IMAGE));
   if (headerIdx < 0) {
     // 人が書いたものがあるかもしれないのに、どこが修正指示か分からない → 上書きしない
     if (rows.some((r) => r.some((c) => c.trim()))) {

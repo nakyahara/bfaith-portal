@@ -311,7 +311,9 @@ export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, rang
     // 人がタブの名前を変えた: 印 (作ったときの名前) が同じ自分のタブが 1 枚だけなら、そこから読む (Codex PR-F 名指し3 中)。
     // 書くのは元の名前の新しいタブ (名前を変えたタブはそのまま残す)
     const mine = all.filter((s) => (s.developerMetadata || []).some((m) => m && m.metadataKey === OWNED_TAB_KEY && m.metadataValue === name));
-    if (mine.length !== 1) return { exists: false };
+    if (!mine.length) return { exists: false };
+    // 2 枚以上 (名前を変えて作り直したのをもう一度名前を変えた) は、どれが今の依頼書か分からない → 呼び手が止める (Codex PR-F 名指し4 中)
+    if (mine.length > 1) return { exists: true, owned: true, ambiguous: mine.map((s) => s.properties.title), values: null };
     tab = mine[0];
     renamedFrom = tab.properties.title;
   }
