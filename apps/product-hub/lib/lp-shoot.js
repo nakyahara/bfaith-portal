@@ -273,13 +273,21 @@ export function shootFormatOfPacket(packet) {
   return packet && packet.shoot_spec ? 2 : 1;
 }
 
+/**
+ * v2 で足して断る見えない文字 (Codex PR-C2 名指し4 L): C1 制御文字 (U+0080〜U+009F・U+0085 は改行に見える) と、
+ * 表示の向きを変える文字 (U+200E/F・U+202A〜U+202E・U+2066〜U+2069)。撮影指示書と画面で表示を偽装させない
+ * (v1 = PR-C の形の検査は変えない)
+ */
+// eslint-disable-next-line no-control-regex
+const V2_INVISIBLE_RE = /[\u0080-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+
 /** 文字の項目を 1 つ見る (前後の空白・長さ・制御文字)。問題が無ければ null */
 function textProblem(v, { max, required, at }) {
   if (typeof v !== 'string') return `${at} は文字列です`;
   if (v !== v.trim()) return `${at} の前後に空白・改行があります`;
   if (required && !v) return `${at} が空です`;
   if (v.length > max) return `${at} は ${max} 文字までです (${v.length} 文字)`;
-  if (CONTROL_RE.test(v)) return `${at} に制御文字があります`;
+  if (CONTROL_RE.test(v) || V2_INVISIBLE_RE.test(v)) return `${at} に制御文字 (表示の向きを変える文字なども) があります`;
   return null;
 }
 

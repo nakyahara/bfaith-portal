@@ -381,6 +381,30 @@ export function cutsFromSlots({ slots, hasEditShoot, aiImages, aiCuts = null }) 
 }
 
 /**
+ * AI の概要 (撮影用送付対象・開封要否・撮影目的・完成イメージ・使用用途・判定の結論) を撮影指示書にそのまま使ってよいか (PR-C2)。
+ * 概要は AI が「自分が要撮影とした画像」のために決めたもの。人が編集版で要撮影を変えた (AI と違う画像を要撮影にした・
+ * 要撮影を外した・足した画像を要撮影にした) なら、送付対象などが今のカットと合わない — 違う商品を撮影先へ送りかねない
+ * (Codex PR-C2 名指し4 M)。編集版が無い (= 要撮影は AI の値) なら使ってよい
+ * @param {{slots: Array<{uid, shoot?: boolean}>, hasEditShoot: boolean, aiImages: Array<{no, needs_shoot}>|null}} o
+ */
+export function aiSummaryStillValid({ slots, hasEditShoot, aiImages }) {
+  if (!hasEditShoot) return true;
+  const aiNeeded = new Set((Array.isArray(aiImages) ? aiImages : []).filter((x) => x && x.needs_shoot).map((x) => x.no));
+  const nowNeeded = new Set();
+  for (const sl of Array.isArray(slots) ? slots : []) {
+    if (sl.shoot !== true) continue;
+    const n = aiNoOfUid(sl.uid);
+    if (n == null) return false;   // 人が足した画像を要撮影にした (AI の概要はこの画像を知らない)
+    nowNeeded.add(n);
+  }
+  return nowNeeded.size === aiNeeded.size && [...nowNeeded].every((n) => aiNeeded.has(n));
+}
+/** AI の概要を使えないときの撮影指示書の概要 (送付対象は人が決める) */
+export const SUMMARY_NEEDS_REVIEW = Object.freeze({
+  send_targets: '要確認（LP構成の要撮影を人が直したので、AI が決めた撮影用送付対象は使っていません）',
+});
+
+/**
  * 撮影指示書を作れない理由 (画面のボタンと API で同じ判定)。null なら作れる
  * @param {{shootMode, folderId, configured: boolean}} o
  */

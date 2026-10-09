@@ -188,6 +188,9 @@ console.log('③ 形 v2 の検査 (lib/lp-shoot.js・純粋関数)');
   bad({ ...goodV2(), send_targets: '' }, '🚨 撮影するのに撮影用送付対象が空');
   bad({ ...goodV2(), purpose: ' 目的' }, '撮影目的の前に空白 (trim して受けない)');
   bad({ ...goodV2(), finish: 'a' + String.fromCharCode(1) }, '完成イメージに制御文字');
+  bad({ ...goodV2(), send_targets: '商品A\u0085商品B' }, '🚨 C1 制御文字 (U+0085 は改行に見える・Codex PR-C2 名指し4 L)');
+  bad({ ...goodV2(), conclusion: '確認\u202Eです' }, '🚨 表示の向きを変える文字 (U+202E)');
+  bad(withCut({ target: 'ブラック\u2066(1本)' }), '🚨 カットにも表示の向きを変える文字 (U+2066)');
   bad({ ...noneV2(), send_targets: 'ブラック (1本)' }, '🚨 追加撮影不要なのに撮影用送付対象がある (食い違い)');
   bad({ ...noneV2(), cuts: [cutOf(1, { lp_image_nos: [] })] }, '🚨 追加撮影不要なのに撮影カットがある (食い違い)');
   bad({ ...noneV2(), images: [{ no: 0, needs_shoot: false }, { no: 1, needs_shoot: false }, { no: 2, needs_shoot: true }] }, '🚨 追加撮影不要なのに撮影が要る画像がある');
@@ -496,6 +499,29 @@ console.log('⑧ 撮影指示書 (PR-D) — 仕様書の形 (v2) なら AI の�
     `シートに 撮影用送付対象・撮影対象・社内撮影の推奨 が出る (${flat.slice(0, 12).join(' / ')})`);
   const mV1 = svcMod.shootSheetCutsFor(db, dV1);
   eq(mV1.summary, {}, 'v1 の判定の商品は概要を渡さない (今までどおり)');
+
+  // 🚨 人が編集版で要撮影を変えたら、AI の概要 (送付対象など) は使わない (違う商品を撮影先へ送らない・Codex PR-C2 名指し4 M)
+  ok(sheet.aiSummaryStillValid({ slots: edited, hasEditShoot: false, aiImages: J.images }), '編集版が無ければ AI の概要を使う');
+  ok(sheet.aiSummaryStillValid({ slots: slots.map((x) => ({ ...x, shoot: x.uid !== 'a0' })).reverse(), hasEditShoot: true, aiImages: J.images }), '並べ替えただけ (要撮影は AI と同じ) なら使う');
+  ok(!sheet.aiSummaryStillValid({ slots: edited, hasEditShoot: true, aiImages: J.images }), '要撮影を外した・足した画像を要撮影にした なら使わない');
+  ok(!sheet.aiSummaryStillValid({ slots: slots.map((x) => ({ ...x, shoot: true })), hasEditShoot: true, aiImages: J.images }), 'AI が要らないとした画像を要撮影にしたなら使わない');
+  ok(!sheet.aiSummaryStillValid({ slots: [...slots.map((x) => ({ ...x, shoot: x.uid !== 'a0' })), { uid: 'nNew', no: 3, name: '使い方', lines: [], shoot: true }], hasEditShoot: true, aiImages: J.images }),
+    '🚨 AI と同じ画像に加えて、足した画像を要撮影にしたなら使わない (AI の概要はその画像を知らない)');
+  const le = await import('../apps/product-hub/lib/lp-edit.js');
+  const dE = mkDraft();
+  const rE = reserveFor(dE);
+  accept(rE, { shoot: goodV2() });
+  matchModel(rE.run);
+  const stE = le.editStateFor(db, dE, { canEdit: true });
+  const send = (fn) => stE.slots.map((x) => ({ uid: x.uid, role: x.role, title: x.title, copy: x.copy, body: x.body, shoot: fn(x.uid) }));
+  const sv1 = le.saveEdit(db, { draft: dE, baseJobId: stE.base_job_id, baseEditId: stE.base_edit_id, slots: send((u) => u === 'a2'), actor: 'staff@x' });
+  const after1 = svcMod.shootSheetCutsFor(db, dE);
+  ok(sv1.ok && after1.summary.send_targets === 'ハッカ油スプレー 100ml (1本)', `編集版で要撮影が AI と同じなら AI の概要を使う (${sv1.error || ''})`);
+  const st2 = le.editStateFor(db, dE, { canEdit: true });
+  const sv2 = le.saveEdit(db, { draft: dE, baseJobId: st2.base_job_id, baseEditId: st2.base_edit_id, slots: send((u) => u === 'a1'), actor: 'staff@x' });
+  const after2 = svcMod.shootSheetCutsFor(db, dE);
+  ok(sv2.ok && /要確認/.test(after2.summary.send_targets) && !after2.summary.open_required && !after2.summary.conclusion,
+    `🚨 人が要撮影を 2枚目 → 1枚目 に変えたら、AI の送付対象・開封要否・結論は使わず「要確認」 (${JSON.stringify(after2.summary).slice(0, 120)})`);
 }
 
 console.log('② PR-C の版 (5) の依頼は claim でそのまま受ける (デプロイで待っている依頼を押し直しにしない)');

@@ -24,7 +24,7 @@ import { effectiveCompose } from '../lib/lp-edit.js';
 import { latestShootJudgement } from '../lib/lp-compose.js';
 import {
   buildShootSheet, cutsFromComposeText, cutsFromSlots, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
-  spreadsheetUrl, MANAGED_SHEETS, SHOOT_SHEET_MODES, SHOOT_JUDGEMENT_LABELS,
+  spreadsheetUrl, MANAGED_SHEETS, SHOOT_SHEET_MODES, SHOOT_JUDGEMENT_LABELS, aiSummaryStillValid, SUMMARY_NEEDS_REVIEW,
 } from '../lib/shoot-sheet.js';
 import {
   getSheetsWriteClients, explainGoogleError, findSpreadsheetByAppProperty, spreadsheetUsable,
@@ -81,7 +81,9 @@ export function shootSheetCutsFor(db, draft) {
   // 仕様書の形 (v2・PR-C2) なら AI のカットと概要をそのまま使う。PR-C の形 (v1) は images からの対応づけ (cutsFromSlots の中)
   const v2 = sameJob && judge.format === 2;
   const aiCuts = v2 ? judge.cuts : null;
-  const summary = v2 ? { ...judge.summary } : {};
+  // 概要は AI が要撮影とした画像のためのもの。人が編集版で要撮影を変えていたら使わない (送付対象は要確認に・Codex PR-C2 名指し4 M)
+  const summary = !v2 ? {}
+    : aiSummaryStillValid({ slots: eff.slots, hasEditShoot, aiImages }) ? { ...judge.summary } : { ...SUMMARY_NEEDS_REVIEW };
   return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages, aiCuts }), summary, source: 'lp', composeJobId: eff.job.id, editId };
 }
 
