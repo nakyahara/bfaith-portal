@@ -133,7 +133,7 @@ import {
 } from './lib/ad-kw-ai.js';
 // LP 構成の AI 生成 (段階1)。正本 = AI_reference『商品ハブ_LP構成AI生成_段階1設計_20260930.md』
 import {
-  lpComposeEnabled, importSpec as importLpSpec, latestSpec as latestLpSpec, specSummary as lpSpecSummary,
+  lpComposeEnabled, importSpec as importLpSpec, latestSpec as latestLpSpec, specSummary as lpSpecSummary, SPEC_KIND_LABELS as LP_SPEC_KIND_LABELS,
   requestJob as requestLpComposeJob, requestBlockReason as lpComposeBlockReason, requestPrecheck as lpComposeRequestPrecheck,
   queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
@@ -275,8 +275,9 @@ router.get('/list', (req, res) => {
     maxRegisterCodes: MAX_REGISTER_CODES,
     intake: intakeStatus(),
     isAdmin: req.session?.role === 'admin',
-    // LP 構成の AI 生成 (段階1) の仕様書。admin にだけ出すカードで使う
-    lpSpec: { enabled: lpComposeEnabled(), spec: lpSpecSummary(db, 'product_analysis') },
+    // LP 構成の AI 生成 (段階1) の仕様書。admin にだけ出すカードで使う。
+    // shootSpec = 撮影判定の仕様書「新商品初動判定」(画像制作の新フロー PR-C2)。同じカードで種類を選んで取り込む
+    lpSpec: { enabled: lpComposeEnabled(), spec: lpSpecSummary(db, 'product_analysis'), shootSpec: lpSpecSummary(db, 'initial_judge') },
     shopCategoryCount: countActiveShopCategories(db),
     maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
     // 広げる道 PR-6 (門 product-hub:screen:/list。今までどおりなら空):
@@ -4032,6 +4033,7 @@ async function lpSpecWorkbookToText(buf) {
 /**
  * 仕様書を上げる。Content-Type: application/octet-stream で .xlsx の生バイトを送る。
  * 種類と名前はクエリ (?kind=product_analysis&title=...)。
+ * kind = product_analysis (LP制作システム) / initial_judge (新商品初動判定・撮影判定・PR-C2)。知らない種類は lib が bad_kind で断る
  */
 router.post('/api/lp-specs',
   express.raw({ type: 'application/octet-stream', limit: LP_SPEC_MAX_BYTES + 1024 * 1024 }),
@@ -4058,9 +4060,10 @@ router.post('/api/lp-specs',
       return res.status(400).json({ ok: false, code: 'bad_xlsx', error: '.xlsx として読めません (ダウンロードし直してください)' });
     }
     const db = getDB();
+    const kind = cleanText(req.query?.kind, 40) || 'product_analysis';
     const r = importLpSpec(db, {
-      kind: cleanText(req.query?.kind, 40) || 'product_analysis',
-      title: cleanText(req.query?.title, 200) || 'LP制作システム',
+      kind,
+      title: cleanText(req.query?.title, 200) || (Object.prototype.hasOwnProperty.call(LP_SPEC_KIND_LABELS, kind) ? LP_SPEC_KIND_LABELS[kind] : 'LP制作システム'),
       body: parsed.body, sheetTitles: parsed.sheetTitles, actor: actorOf(req),
     });
     if (!r.ok) {
@@ -4453,10 +4456,16 @@ serviceApiRouter.get('/lp-compose/queue', (req, res) => {
 
 serviceApiRouter.post('/lp-compose/claim', (req, res) => {
   // max_images = 実行役が落とせる画像の枚数 (言わない古い phlp は 6 枚まで扱い・codex #1593 Medium)
-  const r = claimLpComposeJob(getDB(), { runnerRunId: cleanText(req.body?.runner_run_id, 80), maxImages: req.body?.max_images });
+  // shoot_spec = 撮影判定の仕様書 (新商品初動判定) を受け取れる実行役か (true だけ。言わない古い phlp には仕様書つきの依頼を掴ませない・PR-C2)
+  const r = claimLpComposeJob(getDB(), {
+    runnerRunId: cleanText(req.body?.runner_run_id, 80), maxImages: req.body?.max_images, shootSpec: req.body?.shoot_spec === true,
+  });
   if (!r.ok) return lpComposeFail(res, r);
   // exhausted = 壊れた依頼が並んでいて 50 回掴めなかった (「仕事なし」と区別する)
-  res.json({ ok: true, job: r.job, exhausted: r.exhausted || undefined, too_many_images: r.too_many_images || undefined, error: r.error || undefined });
+  res.json({
+    ok: true, job: r.job, exhausted: r.exhausted || undefined, too_many_images: r.too_many_images || undefined,
+    needs_shoot_spec: r.needs_shoot_spec || undefined, error: r.error || undefined,
+  });
 });
 
 serviceApiRouter.post('/lp-compose/jobs/:id/reserve', (req, res) => {

@@ -17,7 +17,7 @@
  *
  * 使い方 (作業ディレクトリ = C:\tools\ph-nightly\work で `./phlp <cmd>`):
  *   ./phlp queue                                    キューの内訳 (仕事があるか)
- *   ./phlp claim   --run RUN_ID                     1 件 claim (材料 + 仕様書の全文)
+ *   ./phlp claim   --run RUN_ID                     1 件 claim (材料 + 仕様書の全文。撮影判定の仕様書「新商品初動判定」があれば shoot-spec-ID.md にも落とす)
  *   ./phlp images  ID                               その依頼の商品画像を img-ID-1.jpg … に落とす
  *   ./phlp reserve ID                               **AI を呼ぶ前に必ず**予約する (モデルはランナーが決める)
  *   ./phlp lint    ID --file out-ID.md [--shoot shoot-ID.json]
@@ -49,7 +49,9 @@ const REASON_MAX = 1000;
 const OUT_MAX = 200_000;
 const LINT_MAX = 100_000;
 const REVIEW_MAX = 400_000;                 // 検品に渡す構成案の上限 (バイト)
-const SHOOT_FILE_MAX = 100_000;             // 撮影判定のファイルの上限 (バイト・整形した JSON でも収まる。中身の上限はサーバが見る)
+// 撮影判定のファイルの上限 (バイト・整形した JSON でも収まる。中身の上限はサーバが見る)。
+// 仕様書「新商品初動判定」の形 (v2・PR-C2) はカット一覧を持つので、サーバの上限 (6 万字 ≒ 日本語で 18 万バイト) が入る大きさにした
+const SHOOT_FILE_MAX = 300_000;
 const SEEN_MAX = 20_000;                    // 画像から読み取ったことの上限 (バイト)
 const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 const FAIL_CODES = ['SPEC_UNREADABLE', 'MATERIAL_TOO_THIN', 'IMAGES_UNAVAILABLE', 'OTHER'];
@@ -191,11 +193,13 @@ async function cmdClaim(opt) {
   const run = String(process.env.PH_LP_RUN_ID || opt.run || '').trim();
   if (!run) die('--run RUN_ID が要ります');
   // max_images = この CLI が落とせる枚数。サーバはそれより多い依頼を掴ませない (古い phlp は送らない = 6 枚扱い)
-  const r = await api('POST', '/lp-compose/claim', { runner_run_id: run.slice(0, 80), max_images: MAX_IMAGES });
+  // shoot_spec: true = 撮影判定の仕様書 (新商品初動判定) をファイルに落とせる (PR-C2)。言わない古い phlp には、
+  // サーバは仕様書つきの依頼を掴ませない (仕様書を読めないまま「仕様書で判定した」形を出させない)
+  const r = await api('POST', '/lp-compose/claim', { runner_run_id: run.slice(0, 80), max_images: MAX_IMAGES, shoot_spec: true });
   if (r.status !== 200) { out(r.json); return fail(1); }
   const job = r.json.job;
   if (!job) {
-    out({ job: null, exhausted: r.json.exhausted || false, too_many_images: r.json.too_many_images || 0, note: r.json.error || '仕事はありません' });
+    out({ job: null, exhausted: r.json.exhausted || false, too_many_images: r.json.too_many_images || 0, needs_shoot_spec: r.json.needs_shoot_spec || 0, note: r.json.error || '仕事はありません' });
     return;
   }
   // lease と packet_hash は CLI が持つ。Claude には出さない
@@ -219,6 +223,10 @@ async function cmdClaim(opt) {
   });
   // 仕様書の全文はファイルに落とす (プロンプトに貼るのは Claude の仕事)
   fs.writeFileSync(path.resolve(process.cwd(), `spec-${job.job_id}.md`), job.spec.body, 'utf8');
+  // 撮影判定の仕様書「新商品初動判定」(PR-C2)。3 万字ほどあるので標準出力には出さずファイルに落とす (shoot_instruction が読めと言う)。
+  // 無い依頼 (取り込む前・古いサーバ) は null — shoot_instruction は PR-C の簡単な決まりのまま
+  const shootSpec = job.shoot_spec && typeof job.shoot_spec.body === 'string' ? job.shoot_spec : null;
+  if (shootSpec) fs.writeFileSync(path.resolve(process.cwd(), `shoot-spec-${job.job_id}.md`), shootSpec.body, 'utf8');
   out({
     job_id: job.job_id,
     draft_id: job.draft_id,
@@ -245,6 +253,8 @@ async function cmdClaim(opt) {
     // 撮影判定の指示 (画像制作の新フロー PR-C)。⑦を書き終えてから shoot-<ID>.json に JSON で書き、
     // lint と result に --shoot で渡す。🚨 ⑦の本文には足さない (上の instruction とは別の指示)
     shoot_instruction: job.packet.shoot_instruction || null,
+    // 撮影判定の仕様書「新商品初動判定」(PR-C2)。shoot_instruction に従ってこのファイルを最後まで読んで判定する
+    shoot_spec: shootSpec ? { id: shootSpec.id, title: shootSpec.title, file: `shoot-spec-${job.job_id}.md`, chars: shootSpec.body.length } : null,
     next: `./phlp images ${job.job_id}`,
   });
 }
@@ -516,7 +526,7 @@ function cmdReviewData(id) {
 function cmdClean(id) {
   const removed = [];
   const names = [
-    `spec-${id}.md`, `imgs-${id}.json`, `seen-${id}.md`,
+    `spec-${id}.md`, `shoot-spec-${id}.md`, `imgs-${id}.json`, `seen-${id}.md`,
     `out-${id}.md`, `lint-${id}.json`, `reason-${id}.txt`, `_lp_review_${id}.md`, `shoot-${id}.json`,
     ...Array.from({ length: MAX_IMAGES }, (_, i) => `img-${id}-${i + 1}.jpg`),
   ];

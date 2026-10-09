@@ -360,6 +360,78 @@ export function migrateAdKwCheckConstraints(db) {
   return { migrated: plan.map((p) => p[0]) };
 }
 
+// ─── LP 構成の仕様書の表 (段階1・2026-10-01)。初回作成と、kind の CHECK を広げる作り直し (migrateLpSpecsKindCheck) の両方で使う ───
+// kind: product_analysis = LP制作システム (構成を書く) / initial_judge = 新商品初動判定 (撮影判定・画像制作の新フロー PR-C2 2026-10-09)
+const LP_SPECS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind              TEXT NOT NULL CHECK (kind IN ('product_analysis', 'initial_judge')),
+      title             TEXT NOT NULL,
+      body              TEXT NOT NULL,          -- 全タブをテキスト化したもの
+      hash              TEXT NOT NULL,          -- body の sha256
+      sheet_titles_json TEXT NOT NULL DEFAULT '[]',
+      imported_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      imported_by       TEXT NOT NULL
+    );`;
+const LP_SPECS_COLS = 'id, kind, title, body, hash, sheet_titles_json, imported_at, imported_by';
+const LP_SPECS_INDEXES = [
+  'CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_specs_hash ON ph_lp_specs(kind, hash);',
+  'CREATE INDEX IF NOT EXISTS idx_ph_lp_specs_kind ON ph_lp_specs(kind, id DESC);',
+];
+const LP_SPECS_TRIGGERS = [
+  `CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_update BEFORE UPDATE ON ph_lp_specs
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (更新は新しい行として入れてください)'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_delete BEFORE DELETE ON ph_lp_specs
+      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (job が版を参照しています)'); END;`,
+];
+
+/**
+ * 仕様書の表 (ph_lp_specs) の kind の CHECK を、段階1 の ('product_analysis') から
+ * ('product_analysis', 'initial_judge') に広げる (画像制作の新フロー PR-C2・2026-10-09)。
+ * SQLite は CHECK を ALTER できないので、migrateAdKwCheckConstraints と同じ公式手順
+ * (新しい表を作る → 行をコピー → 旧表を DROP → 改名 → 索引とトリガーを作り直す) を 1 トランザクションで行う。
+ * 🚨 旧表を先に改名しない (ph_lp_compose_jobs.spec_id の FK の定義が追随して壊れる)。id は明示コピーで保つ
+ *    (job が spec_id で版を指している)。DROP は追記専用のトリガーを起こさない (暗黙の DELETE はトリガーを起こさない)。
+ *    行数・採番 (sqlite_sequence)・外部キーを確かめ、違えば例外で ROLLBACK。二度目以降は定義が新しいので何もしない (冪等)
+ * @returns {{migrated: boolean}}
+ */
+export function migrateLpSpecsKindCheck(db) {
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ph_lp_specs'").get()?.sql || '';
+  if (!/CHECK \(kind IN \('product_analysis'\)\)/.test(sql)) return { migrated: false };
+  const fkWas = db.pragma('foreign_keys', { simple: true });
+  db.pragma('foreign_keys = OFF');   // DROP/改名の間だけ。トランザクションの外でしか変えられない
+  const seqOf = () => db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'ph_lp_specs'").get()?.seq ?? null;
+  try {
+    db.transaction(() => {
+      const tmp = 'ph_lp_specs__new';
+      db.exec(`DROP TABLE IF EXISTS ${tmp}`);
+      db.exec(LP_SPECS_DDL(tmp));
+      const before = db.prepare('SELECT COUNT(*) AS n FROM ph_lp_specs').get().n;
+      const seqBefore = seqOf();
+      db.exec(`INSERT INTO ${tmp} (${LP_SPECS_COLS}) SELECT ${LP_SPECS_COLS} FROM ph_lp_specs`);
+      db.exec('DROP TABLE ph_lp_specs');
+      db.exec(`ALTER TABLE ${tmp} RENAME TO ph_lp_specs`);   // sqlite_sequence の name も追随する
+      for (const ix of LP_SPECS_INDEXES) db.exec(ix);
+      for (const tg of LP_SPECS_TRIGGERS) db.exec(tg);
+      const after = db.prepare('SELECT COUNT(*) AS n FROM ph_lp_specs').get().n;
+      if (before !== after) throw new Error(`ph_lp_specs の作り直しで行数が変わった (${before} → ${after})`);
+      // 採番の上限を保つ (id を再利用させない — 古い job の spec_id が別の版を指さないように)
+      const seqNow = seqOf();
+      const seqWant = Math.max(seqBefore ?? 0, seqNow ?? 0);
+      if (seqWant > 0) {
+        if (seqNow == null) db.prepare("INSERT INTO sqlite_sequence (name, seq) VALUES ('ph_lp_specs', ?)").run(seqWant);
+        else if (seqNow < seqWant) db.prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = 'ph_lp_specs'").run(seqWant);
+      }
+      const fkErrors = db.pragma('foreign_key_check');
+      if (fkErrors.length) throw new Error(`作り直し後に外部キーの不整合: ${JSON.stringify(fkErrors.slice(0, 3))}`);
+    })();
+  } finally {
+    db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
+  }
+  console.log('[product-hub] LP 構成の仕様書の表 (ph_lp_specs) の kind に initial_judge (新商品初動判定) を足した');
+  return { migrated: true };
+}
+
 // 「自社商品」の重要度は own_brand チェックと連動する (2026-08-24 中原さん要望)
 export const OWN_BRAND_IMAGE_PRIORITY = '自社商品（重要度：高）';
 // 画像制作の管理項目 (撮影・素材 / Canva / 依頼文 / 保留 / 定型文) は重要度に関係なく全商品で使える
@@ -1344,26 +1416,15 @@ export function initProductHubDB() {
     -- 仕様書のスナップショット。**追記専用** — 一度入れた行は書き換えない (Codex R3 #3)。
     -- job は「最新版」ではなく受付時の spec_id を持ち、claim で hash を照合する。
     -- こうしないと、依頼から claim までに仕様書が差し替わると packet_hash が同じまま中身が変わる。
-    CREATE TABLE IF NOT EXISTS ph_lp_specs (
-      id                INTEGER PRIMARY KEY AUTOINCREMENT,
-      kind              TEXT NOT NULL CHECK (kind IN ('product_analysis')),
-      title             TEXT NOT NULL,
-      body              TEXT NOT NULL,          -- 全タブをテキスト化したもの
-      hash              TEXT NOT NULL,          -- body の sha256
-      sheet_titles_json TEXT NOT NULL DEFAULT '[]',
-      imported_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      imported_by       TEXT NOT NULL
-    );
+    -- 定義は LP_SPECS_DDL (kind は product_analysis = LP制作システム / initial_judge = 新商品初動判定・PR-C2)。
+    -- CHECK を広げる作り直し (migrateLpSpecsKindCheck) と同じ定義を使う
+    ${LP_SPECS_DDL('ph_lp_specs')}
     -- 同じ中身を上げ直しても行が増えない (= 版が無駄に進まない)
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_lp_specs_hash ON ph_lp_specs(kind, hash);
-    CREATE INDEX IF NOT EXISTS idx_ph_lp_specs_kind ON ph_lp_specs(kind, id DESC);
+    ${LP_SPECS_INDEXES.join(' ')}
     -- 「追記専用」を宣言でなく DB で担保する (Codex R4 #4)。
     -- 宣言だけだと通常の UPDATE で中身を差し替えられ、spec_hash の照合が通ったまま
     -- AI への実効入力が変わる = job の再現性が失われる。
-    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_update BEFORE UPDATE ON ph_lp_specs
-      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (更新は新しい行として入れてください)'); END;
-    CREATE TRIGGER IF NOT EXISTS trg_ph_lp_specs_no_delete BEFORE DELETE ON ph_lp_specs
-      BEGIN SELECT RAISE(ABORT, 'ph_lp_specs は追記専用です (job が版を参照しています)'); END;
+    ${LP_SPECS_TRIGGERS.join(' ')}
 
     -- 🚨 draft_id に FK / ON DELETE CASCADE を張らない (Codex R3 #5)。
     --    段階1 は測定が目的なので、draft を普通に消しただけで実験記録が消えては困る。
@@ -2203,6 +2264,13 @@ export function initProductHubDB() {
     migrateAdKwCheckConstraints(db);
   } catch (e) {
     console.error('[product-hub] SP広告KW の表の作り直しに失敗 (旧い定義のまま動く。競合 ASIN の追加と「完全一致＋フレーズ一致」の採用は失敗する):', e.message);
+  }
+  // LP 構成の仕様書の表に 新商品初動判定 (initial_judge) を足す (画像制作の新フロー PR-C2)。既に新しい定義なら何もしない。
+  // 🚨 失敗しても起動は止めない。旧い定義のままだと 新商品初動判定 の取り込みだけが CHECK で失敗する (撮影判定は PR-C の決まりのまま動く)
+  try {
+    migrateLpSpecsKindCheck(db);
+  } catch (e) {
+    console.error('[product-hub] LP 構成の仕様書の表の作り直しに失敗 (旧い定義のまま動く。新商品初動判定の取り込みは失敗する):', e.message);
   }
 
   // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
