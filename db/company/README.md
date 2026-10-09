@@ -2377,3 +2377,23 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 🆕 (#1667 Codex R1 Low) 直さない境: miniPC の Amazon SKU の写し `m_sku_components.ne_code` = **norm の内部の鍵** (miniPC の `raw_ne_products.商品コード` = NE の取得の小文字と結ぶ・SQLite の CHECK も小文字だけ・NE のコードとして外へ出さない) → 小文字のまま (`lib/amazon-map-write.mjs`・`lib/amazon-map-migrate.mjs`)。契約の試験 = [U1] の ⑦
 - アプリ: `validateNewSkuCode` (lib/master-write.mjs)・`NEW_CODE_RE` (lib/master-reg-csv.mjs)・新商品の画面 (me-new.js・new.ejs)・product-hub のカードの取り込み (`cdb-card-intake.js` = 原文で作り・小文字で探す)・つかいかた。契約の試験 = `scripts/test-master-reg-csv.mjs` の [U1] (登録 → カード → CSV → NE の取得 (0041) → 3 者一致 → ロジザード用 CSV・入荷予定)
 - 当て方 (🚨 まだ流さない): どちらが先でも壊れない (コードが先 = 大文字は DB が `code_shape` で断る = 画面は 409 で何も書かない / migration が先 = 画面・API が先に断る) → `migrate.mjs --dry-run` (0064 だけが出る) → 中原さんの OK → 本適用 → Render のデプロイ。ロールの script は流し直さなくてよい
+### NE 登録の CSV の版 (ne-reg-single-v2 / ne-reg-variation-v1)・3 者一致・一度でも配った商品の代表 (0065・2026-10-08。AI_reference CompanyDB構想/20 v7 §⑤・§⑩ の PR-2。🚨 番号は 0064 (PR-1) の後)
+
+- **JAN を NE に送らない** (中原さん 10/8 夜「NE には JAN をほとんど入れていない。むしろ商品名に JAN を入れている」): 単品の CSV の `jan_code` は常に `empty` (Company DB の JAN は残す)。`ops.ne_reg_canonical` と `lib/master-reg-csv.mjs` の `regMaterialOf` が同じ決まり (JAN の数・チェック数字でも止めない)。
+  = 0063 の `ops.ne_reg_auto_block` の `jan_not_compared` に当たらない = JAN のある単品も翌朝の照合で自動で NE 確認済みになる。🚨 **今の単品の登録にも効く** (NE に JAN が入らなくなる)
+- **形の版** (`ops.ne_reg_schema_rule` = 1 か所・lib の `REG_SCHEMA_RULES` と同じ・試験で照らす): `ne-reg-single-v1` = 引退 (作らない = `schema_not_buildable`。前に配ったファイルの確かめ・申告・使わないは今までどおり) /
+  `ne-reg-single-v2` = 単品 (JAN = empty・試し用の門なし) / `ne-reg-variation-v1` = まとまり (JAN = empty・代表商品コード = まとまりのコード・門なし・**まだ作らない** = PR-5 で開く) / `ne-reg-set-v1` = セット (今までどおり 5 行の門あり)。
+  `ops.ne_reg_exports.schema_version` の CHECK に variation。single-v1 の実機の確かめ (ok) は v2 に引き継がない (converter_version が違う)。
+  門の無い版は最初から 1,000 行まで (中原さん「ためしは要らない」)。最初の品目が翌朝 3 者一致になったら、照合の確かめが `ops.ne_csv_verified` に ok を 1 行だけ残す (verified_by = ne_compare・記録だけ = 門にしない)
+- **3 者一致** (`ops.record_ne_registration_check` を 0063 から置き換え): verified = NE の観測が期待値と全部の列で合う (`ops.ne_reg_compare`) かつ 今の Company DB の値が期待値と合う (`ops.ne_reg_cdb_compare` = 単品の代表 (親)・まとまりの PR で効く)。
+  NE は合うが Company DB が違う = partial + 答えの `cdb_drift` → 照合の朝の要約に ⚠️「NE は配った値と合うが Company DB の代表 (親) が違う」(起きないはずの事故)
+  鍵 (#1664 Codex R1 High) = マスタの書き込み (共有・最初) → 確かめ → SKU → 親子 (共有) → CSV。夜間ロード (書き込み 排他 → 親子 排他) が代表を書いている途中なら commit を待ち、その後の値で比べる (古い値で verified にしない)。保存の代表の変更 (書き込み 共有 → SKU → 親子 排他 → CSV) と同じ向き = 逆順のデッドロックなし (本物の PG の鍵の順の試験 [18]・[22])。夜間ロードは 02:00 JST・6〜10 秒、毎朝の照合は daily-sync 07:00〜 = 普段は重ならない。手で流したロードと重なったときだけ照合が数秒待つ (書く接続の statement_timeout 60 秒を超えたらその朝の確かめは失敗 = 何も書かない・翌朝に確かめ直す)
+- **配る** (`ops.ne_reg_issue` を 0058 から置き換え・#1664 Codex R1 Medium): 初めて配る (built → issued) のは作れる版 (buildable) のファイルだけ = 0065 の前に作って配っていない v1 は 409 `schema_not_buildable` (使わないにして v2 で作り直す)。配った v1 の再ダウンロード・申告・照合・使わないは今までどおり
+- **一度でも配った商品の代表 (親) は変えない**: `ops.sku_ever_issued` (その SKU を含むファイルに `issued_at` がある = 追記だけの証跡・品目が後で superseded / failed でも残る) と `core.guard_parent_after_issue`
+  (core.products の BEFORE UPDATE OF parent_product_id・どのロールでも・`products.parent` の DB の active が company のときだけ = load の間は夜間ロードが NE の代表を写す道を止めない)。
+  画面 = 保存の 6d で 409 `parent_frozen`・商品の画面の代表の欄は 🔒 (`lib/master-write.mjs` の `parentFrozenExports`)
+- **一部だけ NE に入ったとき** (関数は 0063 のまま): 申告なしの issued の品目は NE に無くても failed にしない = **「N件失敗」のときは元のファイルの sha256 で partial を申告する (必須)** → 申告の後の完全な取得で 入った = verified / 入らなかった = failed (not_in_ne) → failed の商品だけで新しいファイル。
+  申告しないと待ちのまま (生きている品目 = 作り直せない)。つかいかた (manual.ejs)・NE 登録の CSV の画面・照合の朝の ℹ️ に書いた。試験 = `test-master-reg-csv.mjs` の [V3]
+- 当て方 (🚨 まだ流さない): **0064 (PR-1) の後**・`migrate.mjs --dry-run` (0065 だけが出る) → 中原さんの OK (JAN を NE に送らなくなることも) → 本適用 → 同じ日に Render を出す。
+  migration と Render の間は単品の NE 登録の CSV を作れない (古いコード = v1 = `schema_not_buildable` / 新しいコードと古い DB = 見出しの版が違う = 400)。データは何も変わらない (作る・配るの前に止まる)。
+  ロールの script は流し直さなくてよい (新しい部品はだれにも渡さない = migration が public から外す・照合の確かめの grant は migration が流し直す)

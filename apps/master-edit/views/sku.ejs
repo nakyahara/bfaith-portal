@@ -26,6 +26,7 @@
   const lockWhy = (f) => {
     if (L[f]) {
       const ids = L[f].exports.map((x) => '#' + x).join('・');
+      if (L[f].why === 'frozen') return '<span class="lockwhy">NE 登録の CSV (ファイル ' + h(ids) + ') を一度配ったので、代表は変えません</span>';
       return L[f].why === 'reg'
         ? '<span class="lockwhy">NE に送った値 (ファイル ' + h(ids) + ')</span>'
         : '<span class="lockwhy">NE に取り込む CSV (ファイル ' + h(ids) + ') が出ているので直せません · <a href="/apps/master-decisions/csv">マスタの判断 ↗</a></span>';
