@@ -108,6 +108,9 @@ const IMG = (root, cur, no, ver = 1, extra = {}) => ({ root_id: root, current_id
   const noHead = vals.filter((_, i) => i !== 2);
   back = ds.readBackNotes(noHead);
   ok(!back.ok && /見出しの行が見つかりません/.test(back.error), '🚨 見出しの行が無い (どこが修正指示か分からない) シートは読めない = 上書きしない');
+  const above = [vals[0], vals[1], vals[3], vals[2], vals[4], vals[5]];
+  back = ds.readBackNotes(above);
+  ok(back.ok && back.byKey.get(10)?.note === 'TOP の文字を大きく', '🚨 画像の行を見出しより上へ動かしても、修正指示を読み落とさない (Codex 名指し5 高)', JSON.stringify([...back.byKey]));
   const fakeHead = vals.map((r) => r.slice());
   fakeHead[2][2] = 'コメント';           // 見出しの「修正指示」を書き換えた
   fakeHead[4][2] = '修正指示';           // 本文にちょうど「修正指示」と書いた
@@ -377,6 +380,7 @@ const fakeSheets = { spreadsheets: {
     if (!tabs.length) throw gErr(400, 'You can\'t remove all the sheets in a document.');
     f.tabs = tabs;
     g.batches += 1;
+    if (g.failAfterBatch) { g.failAfterBatch = false; throw gErr(undefined, 'socket hang up (書けた後)'); }
     // 書けた直後 (記録する前) に、ほかの人の操作を割り込ませる口
     if (g.onBatch) { const fn = g.onBatch; g.onBatch = null; fn(p); }
     return { data: { replies: [] } };
@@ -555,6 +559,17 @@ const A = makeComposed({ code: 'maitakep50' });
     humanWrites(F.id, `img-${cards2[0].root_id}`, 'TOP の文字を大きく');
     humanWrites(F.id, `img-${cards2[1].root_id}`, 'ロゴを右上に\n背景をもう少し明るく');
     humanWrites(F.id, `img-${cards2[2].root_id}`, '');
+  }
+  // 送った後に返事が来なかった (Google 側では書けている) → 今回載せた画像の公開は外さない・作り直しが要る、を出す
+  {
+    const rjB = regen(A, cardsOf(A)[2].head_id); finishJob(rjB);
+    const newFile = cardsOf(A)[2].current.drive_file_id;
+    g.failAfterBatch = true;
+    const rB = await press(A);
+    ok(rB.status === 502 && publicFiles().includes(newFile) && tabOf(F.id).formulas[5][1].includes(newFile) && rowOf(A).writing_at != null && stateNow(A).stale === true,
+      '🚨 送った後の失敗は「書けていない」と決めつけない — シートが出している新しい画像の公開は外さない (Codex 名指し5 中)', JSON.stringify(rB.json));
+    const rB2 = await press(A);
+    ok(rB2.status === 200 && rowOf(A).writing_at == null && stateNow(A).stale === false, '押し直せば記録できる');
   }
   // 読み戻した後 (書く直前の読み直しの前) に、人が行を入れ替えた・列を足した → 書かない (修正指示を消さない・付け違えない)
   {
@@ -785,6 +800,17 @@ console.log('③ 共有ドライブの設定でリンク共有ができない');
       '🚨 削除が 404 でも公開が残っているなら閉じない (404 はファイルが見えないときにも返る — Codex 名指し4 中)', JSON.stringify(rowH));
     r = await press(B);
     ok(r.status === 200 && !publicFiles().includes(fh) && stateNow(B).unrevoked === 0, '押せば外し直す');
+    // ファイルごと見えない (削除も一覧も 404) → 公開が残っているかもしれないので閉じない
+    const rjV = regen(B, cardsOf(B)[1].head_id); finishJob(rjV);
+    const fv = sharesOf(B).filter((x) => !x.revoked_at).map((x) => x.drive_file_id).find((id) => !cardsOf(B).some((c) => c.current.drive_file_id === id));
+    g.fail.pdelete = { err: gErr(404, 'File not found'), when: (q) => q.fileId === fv, once: true };
+    g.fail.plist = { err: gErr(404, 'File not found'), when: (q) => q.fileId === fv, once: true };
+    r = await press(B);
+    const rowV = sharesOf(B).filter((x) => x.drive_file_id === fv).at(-1);
+    ok(r.status === 200 && fv && rowV.revoked_at == null && /見えない/.test(rowV.revoke_error || '') && stateNow(B).unrevoked === 1,
+      '🚨 ファイルごと見えない 404 では記録を閉じない (外せていないまま。削除も止まり、片付けが外し直す — Codex base R5 P1)', JSON.stringify(rowV));
+    const swV = await svc.sweepDesignerShares({ db });
+    ok(swV.revoked >= 1 && !publicFiles().includes(fv) && stateNow(B).unrevoked === 0, '見えるようになれば片付けが外す');
   }
   // 1 枚ごとに印の期限を延ばす = 公開の途中で印を取られたら止める
   const rj6 = regen(B, cardsOf(B)[0].head_id); finishJob(rj6);
@@ -828,7 +854,13 @@ console.log('③ 共有ドライブの設定でリンク共有ができない');
     // 書いている途中で止まった (writing_at) 商品も触らない (シートが新しい画像を出しているかもしれない)
     db.prepare("UPDATE ph_designer_sheets SET writing_at = '2026-10-09T00:00:00Z' WHERE draft_id = ?").run(E2.id);
     sw = await svc.sweepDesignerShares({ db });
-    ok(publicFiles().includes(f2), '書いている途中で止まった商品の公開は片付けない (作り直しが要る、を画面に出す)');
+    ok(publicFiles().includes(f2), '書いている途中で止まった商品でも、今の画像の公開は片付けない (シートが出しているかもしれない)');
+    // 同じ商品の古い版 (記録の依頼書にも今の画像にも無い) の公開は外す
+    const oldV = 'DRVOLDVER0001';
+    g.files.set(oldV, { id: oldV, name: 'old.png', mimeType: 'image/png', parents: ['AIFOLDER'], perms: [{ id: 'anyoneWithLink', type: 'anyone', role: 'reader' }] });
+    db.prepare('INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, ?, NULL, ?)').run(E2.id, oldV, 'anyoneWithLink', 't');
+    sw = await svc.sweepDesignerShares({ db });
+    ok(!publicFiles().includes(oldV) && publicFiles().includes(f2), '🚨 書いている途中で止まった商品も、どちらの版のシートにも載っていない古い版の公開は外す (Codex 名指し5 高)');
     db.prepare('UPDATE ph_designer_sheets SET writing_at = NULL WHERE draft_id = ?').run(E2.id);
     sw = await svc.sweepDesignerShares({ db });
     ok(!publicFiles().includes(f2) && sw.revoked >= 1 && stateNow(E2).unrevoked === 0 && rowOf(E2).lease_token == null,

@@ -300,19 +300,13 @@ async function revokeShares(db, drive, shares, { adopt = new Set() } = {}) {
     } catch (e) {
       if (statusOf(e) === 404) {
         // 404 は「その権限が無い」のほかに「ファイルが見えない」でも返る (Codex PR-F 名指し4 中)。一覧を読めて、その権限が無いと分かったときだけ閉じる。
-        // ファイルごと見えない (消された・サービスアカウントが入れない) ときは、確かめようがないので閉じて履歴に残す (画面と削除が止まり続けないように)
-        let why = 'file_not_visible';
-        try { if (!(await listAllPermissions(drive, s.drive_file_id)).some((p) => p && (p.id === s.permission_id || p.type === 'anyone'))) why = 'not_found'; else why = null; }
-        catch (_) { why = 'file_not_visible'; }
-        if (why) {
-          closeShare(db, s.id, why);
-          if (why === 'file_not_visible') {
-            try { logEvent(db, s.draft_id, 'designer_sheet_share_unverified', `画像 ${s.drive_file_id} が Drive で見えないので、公開を外せたか確かめられません (記録は閉じました)`, null); } catch (_) { /* 止めない */ }
-          }
-          revoked += 1;
-          continue;
-        }
-        db.prepare('UPDATE ph_designer_sheet_shares SET revoke_error = ? WHERE id = ?').run('権限の削除が 404 なのに、公開が残っています', s.id);
+        // ファイルごと見えない (サービスアカウントが入れなくなった) ときは、公開が残っているかもしれないので閉じない
+        // (外せていないまま = 画面に出し、商品の削除も止め、片付けが外し直す — Codex PR-F base R5 P1)
+        let gone = false;
+        try { gone = !(await listAllPermissions(drive, s.drive_file_id)).some((p) => p && (p.id === s.permission_id || p.type === 'anyone')); }
+        catch (_) { gone = false; }
+        if (gone) { closeShare(db, s.id, 'not_found'); revoked += 1; continue; }
+        db.prepare('UPDATE ph_designer_sheet_shares SET revoke_error = ? WHERE id = ?').run('権限の削除が 404 (画像ファイルが見えない・公開が残っている)。Drive で画像の共有を確かめてください', s.id);
       } else {
         // 外せなければ記録に残す (公開のまま)。次に作ったときに外し直す
         db.prepare('UPDATE ph_designer_sheet_shares SET revoke_error = ? WHERE id = ?').run(explainGoogleError(e).slice(0, 300), s.id);
@@ -346,7 +340,7 @@ export async function revokeAllDesignerShares(draftId, { db = getDB() } = {}) {
 
 /**
  * 依頼書に載っていないのに公開したままの画像を片付ける (Codex PR-F 名指し3 高: プロセスが止まると catch が動かず、
- * 押されるまで公開が残る)。サーバーの起動のあと (router.js) に 1 回呼ぶ。
+ * 押されるまで公開が残る)。サーバーの起動のあと (router.js) と、その後 30 分おきに呼ぶ (外すのに一度失敗した公開も、押されなくても外れる)。
  * 作っている最中 (印が期限内) の商品と、書いている途中で止まった (writing_at が立ったまま = シートが新しい画像を
  * 出しているかもしれない) 商品は触らない (後者は画面に「作り直しが要る」が出て、作り直すと片付く)
  * @returns {Promise<{drafts: number, revoked: number}>}
@@ -360,15 +354,22 @@ export async function sweepDesignerShares({ db = getDB(), now = Date.now() } = {
   let revoked = 0;
   for (const id of ids) {
     const row = rowOf(db, id);
-    if (row && row.writing_at) continue;
-    const left = sharesOutside(db, id, recordedFiles(db, id));
+    const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(id);
+    // 残す公開 = 記録の依頼書の画像。書いている途中で止まった (writing_at) 商品は、シートが今の画像を出しているかもしれないので
+    // 今の画像 (作り直すと載せるもの) も残す — 両方のほかは、どちらの版のシートにも載っていない (Codex PR-F 名指し5 高)
+    const keepOf = () => {
+      const keep = recordedFiles(db, id);
+      if (row && row.writing_at && draft) { try { for (const im of materialOf(db, draft).images) keep.add(String(im.drive_file_id)); } catch (_) { /* 読めなければ記録の画像だけ */ } }
+      return keep;
+    };
+    const left = sharesOutside(db, id, keepOf());
     if (!left.length) continue;
     // 商品が消えている (記録だけ残った) ときは印の行が作れない (外部キー) ので、印なしで外す
-    const exists = !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(id);
+    const exists = !!draft;
     const token = exists ? acquireLease(db, id, { now }) : 'none';
     if (!token) continue;
     try {
-      revoked += await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)));
+      revoked += await revokeShares(db, clients.drive, sharesOutside(db, id, keepOf()));
       drafts += 1;
     } catch (e) {
       console.error('[product-hub] デザイナー修正依頼書の公開の片付け:', id, e?.message || e);
@@ -461,6 +462,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
   let fileId = null;
   let created = false;
   let wrote = false;
+  let sending = false;
   let built = null;
   try {
     const prevFileId = row.file_id || null;
@@ -508,13 +510,19 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
       spreadsheetId: fileId, title: built.title, tabs: built.tabs, fresh: created,
       beforeWrite: () => {
         stillSame();
+        sending = true;
         db.prepare(`UPDATE ph_designer_sheets SET writing_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE draft_id = ?`).run(id);
       },
       onWritten: () => { wrote = true; },
     });
   } catch (e) {
-    // 書く前に止まったら、記録してある依頼書に載っていない公開は外す (書いた後なら、シートが新しい画像を出しているので外さない)
-    if (!wrote) await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)), { adopt });
+    // 書く前に止まったら、記録してある依頼書に載っていない公開は外す (書いた後なら、シートが新しい画像を出しているので外さない)。
+    // 送った後の失敗 (返事が来なかった) は、Google 側で書けているかもしれないので、今回載せた画像の公開は残す (Codex PR-F 名指し5 中)
+    if (!wrote) {
+      const keep = recordedFiles(db, id);
+      if (sending) for (const f of keepFiles) keep.add(f);
+      await revokeShares(db, clients.drive, sharesOutside(db, id, keep), { adopt });
+    }
     if (e?.code === 'designer_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     if (e?.code === 'unreadable') return { ok: false, status: 409, code: 'unreadable', error: e.message };
     if (e?.code === 'sheet_changed') return { ok: false, status: 409, code: 'sheet_changed', error: e.message };

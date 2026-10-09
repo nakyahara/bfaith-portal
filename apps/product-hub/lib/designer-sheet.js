@@ -171,8 +171,9 @@ export function readBackNotes(values, { rootOfFile = null } = {}) {
   // 管理番号が確かめられた行 (元の行の ID → 何行目か。最初の 1 行だけ)
   const rowOfKey = new Map();
   let inOrphans = false;
+  // 見出しの行のほかは全部の行を見る (画像の行を見出しより上へ動かしても、修正指示を読み落として消さない — Codex PR-F 名指し5 高)
   rows.forEach((r, idx) => {
-    if (idx <= headerIdx) return;
+    if (idx === headerIdx) return;
     const label = str(r[labelCol]);
     if (label.startsWith(ORPHAN_HEADING_HEAD)) { inOrphans = true; return; }
     const note = str(r[noteCol]);
