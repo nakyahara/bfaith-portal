@@ -626,6 +626,11 @@ const A = makeComposed({ code: 'maitakep50' });
     const rB = await press(A);
     ok(rB.status === 502 && publicFiles().includes(newFile) && tabOf(F.id).formulas[5][1].includes(newFile) && rowOf(A).writing_at != null && stateNow(A).stale === true,
       '🚨 送った後の失敗は「書けていない」と決めつけない — シートが出している新しい画像の公開は外さない (Codex 名指し5 中)', JSON.stringify(rB.json));
+    // 返事が来なかった後で、次の回が公開の途中で失敗しても、前の回が送った画像 (シートが出しているかもしれない) の公開は外さない
+    const rjB4 = regen(A, cardsOf(A)[0].head_id); finishJob(rjB4);
+    g.fail.pcreate = { err: gErr(403, 'Sharing outside the shared drive is not allowed', 'teamDriveDomainUsersOnlyRestriction'), once: true };
+    const rB4 = await press(A);
+    ok(rB4.status === 409 && rB4.json.code === 'share_blocked' && publicFiles().includes(newFile), '🚨 前の回が返事なしで止まったときに送った画像の公開は、この回が失敗しても外さない (Codex 名指し8 中)');
     // 返事が来なかった後で、同じ画像をさらに作り直した (v 次) → 片付けは「今の画像」ではなく、シートに送った画像の公開を残す
     const rjB3 = regen(A, cardsOf(A)[2].head_id); finishJob(rjB3);
     await svc.sweepDesignerShares({ db });
@@ -694,6 +699,11 @@ const A = makeComposed({ code: 'maitakep50' });
     const rjP3 = regen(A, cardsOf(A)[0].head_id); finishJob(rjP3);
     const rP3 = await press(A);
     ok(rP3.status === 200 && tabOf(F.id).values[3][0] === '0枚目 (TOP)｜楽天検索結果用TOP画像／商品認識', '🚨 prompt の中の例の「この画像の指示」と取り違えない (Codex 名指し7 低)', tabOf(F.id).values[3][0]);
+    const nameTop = db.prepare('SELECT name FROM ph_lp_images WHERE id = ?').get(rootTop).name;
+    db.prepare('UPDATE ph_lp_images SET prompt = ? WHERE id = ?').run('【この画像の指示: 0枚目｜' + nameTop + '】\n## 画像の役割\n偽の役割\n\n' + keepPrompt, rootTop);
+    const rjP4 = regen(A, cardsOf(A)[0].head_id); finishJob(rjP4);
+    const rP4 = await press(A);
+    ok(rP4.status === 200 && tabOf(F.id).values[3][0] === '0枚目 (TOP)｜楽天検索結果用TOP画像／商品認識', '共通の決まりにその画像と同じ見出しが書かれていても、後ろ (本物) を読む (Codex 名指し8 低)', tabOf(F.id).values[3][0]);
     // 「この画像の指示」はあるが、上限 (30,000 文字) まであって途中で切れている → 受付の構成から
     const mi = keepPrompt.indexOf('【この画像の指示');
     const partial = keepPrompt.slice(mi, keepPrompt.indexOf('## 画像の役割', mi) + '## 画像の役割\n楽天検'.length);
@@ -759,6 +769,20 @@ const A = makeComposed({ code: 'maitakep50' });
     // 元に戻す (以降の試験は前の依頼書で続ける)
     db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run(FOLDER, A.id);
     g.files.delete(newF);
+    db.prepare('UPDATE ph_designer_sheets SET file_id = ?, url = ? WHERE draft_id = ?').run(F.id, `https://docs.google.com/spreadsheets/d/${F.id}/edit`, A.id);
+    // もう一度フォルダを変え、新しいフォルダに作ったところで書き込みを断られる (空のファイルが残る) → 押し直すと、拾い直した空のファイルに
+    // 前の依頼書の修正指示を引き継ぐ
+    const FID3 = '1MovedAgainAbCdEfGhIjKlMnOpQ';
+    db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run(`https://drive.google.com/drive/folders/${FID3}`, A.id);
+    g.fail.sbatch = { err: gErr(403, 'The caller does not have permission'), once: true };
+    const rM2 = await press(A);
+    const blank = [...g.files.values()].find((f) => f.parents.includes(FID3));
+    ok(rM2.status === 502 && blank && !blank.tabs.some((t) => t.title === ds.DESIGNER_TAB) && rowOf(A).file_id === F.id, '(前提) 新しいフォルダに空のファイルだけ残った');
+    const rM3 = await press(A);
+    ok(rM3.status === 200 && rowOf(A).file_id === blank.id && noteOfKey(blank.id, `img-${cardsOf(A)[1].root_id}`)?.note === 'フォルダを変えても残る' && !blank.tabs.some((t) => t.title === 'シート1'),
+      '🚨 フォルダを変えた後に書けずに残った空のファイルを拾い直しても、前の依頼書の修正指示を引き継ぐ (Codex 名指し8 高・base R8 P1)', JSON.stringify(rM3.json));
+    db.prepare('UPDATE product_drafts SET drive_folder_url = ? WHERE id = ?').run(FOLDER, A.id);
+    g.files.delete(blank.id);
     humanWrites(F.id, `img-${cardsOf(A)[1].root_id}`, '');
     db.prepare('UPDATE ph_designer_sheets SET file_id = ?, url = ? WHERE draft_id = ?').run(F.id, `https://docs.google.com/spreadsheets/d/${F.id}/edit`, A.id);
   }

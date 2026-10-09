@@ -87,7 +87,8 @@ function rolesFromPrompts(db, rootIds) {
     // lp-image の buildImagePlan が付けた見出しと同じ形 (番号｜名前 60 文字) を探す。共通の決まりの中に例として
     // 「【この画像の指示: …】」が書かれていても取り違えない (Codex PR-F 名指し7 低)
     const head = `${marker}${im.no === 0 ? '0枚目' : (im.no != null ? im.no + '枚目' : im.seq + '番目')}｜${String(im.name || '').trim().slice(0, 60)}】\n`;
-    const hi = prompt.indexOf(head);
+    // 本物は共通の決まりの後ろに付く → 最後のものを使う (共通の決まりに同じ見出しが書かれていても取り違えない — Codex PR-F 名指し8 低)
+    const hi = prompt.lastIndexOf(head);
     const i = hi >= 0 ? hi : -1;
     const nl = i >= 0 ? prompt.indexOf('\n', i) : -1;
     // 上限 (lp-image の PROMPT_MAX = 30,000 文字) まであるなら途中で切れているかもしれない (役割の途中・見出しの前で切れる) → 下の代わりの引き方
@@ -442,6 +443,10 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
   const roles = rolesFromPrompts(db, m.images.map((im) => im.root_id));
   const images = m.images.map((im) => ({ ...im, role: roles.get(im.root_id)?.role || im.name || '', title: roles.get(im.root_id)?.title || '' }));
   const keepFiles = new Set(images.map((im) => String(im.drive_file_id)));
+  // 前の回が送った後に返事が来ずに止まった (writing_at) ときの、送った画像。シートが出しているかもしれないので、
+  // この回が失敗しても公開を外さない (Codex PR-F 名指し8 中)
+  const interruptedFiles = row.writing_at ? (safeJson(row.writing_images_json) || []).map(String) : [];
+  const protectedNow = () => { const k = recordedFiles(db, id); for (const f of interruptedFiles) k.add(f); return k; };
 
   // 1. 画像を公開する (依頼書を作る前。断られたら依頼書を作らない = 中途半端なシートを残さない)
   try {
@@ -453,7 +458,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
   } catch (e) {
     // 記録してある依頼書に載っていない公開は全部外す (作らなかった依頼書のために公開したままにしない)。
     // この回のものに限らない — 前の回が公開した直後に止まった分も、ここで片付く (Codex PR-F 名指し2 高)
-    await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)));
+    await revokeShares(db, clients.drive, sharesOutside(db, id, protectedNow()));
     if (e?.code === 'designer_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     const reason = explainShareError(e);
     try { logEvent(db, id, 'designer_sheet_failed', reason.slice(0, 500), actor); } catch (_) { /* 記録の失敗で結果を変えない */ }
@@ -490,7 +495,14 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
     let previous = null;
     // 範囲はタブ全体 (A1:Z2000 のように区切ると、その外へ動かした修正指示を「無い」と見て消す — Codex PR-F 名指し2 高)
     // 修正指示を読むファイル = 書くファイル (作ったばかりなら、フォルダを変える前の依頼書。無ければ読まない)
-    const src = created ? notesFrom : fileId;
+    let src = created ? notesFrom : fileId;
+    let fresh = created;
+    // 画像フォルダを変えた後、前の回が新しいフォルダに作ったまま書けずに止まったファイルを拾い直した (まだ依頼のタブが無い) →
+    // 前のフォルダの依頼書から修正指示を読み、拾い直したファイルは作ったばかりと同じに扱う (Codex PR-F 名指し8 高・base R8 P1)
+    if (!created && notesFrom && fileId !== notesFrom) {
+      const probe = await readOwnedTabValues(clients, { spreadsheetId: fileId, name: DESIGNER_TAB, render: 'FORMULA', range: null });
+      if (!probe.exists) { src = notesFrom; fresh = true; }
+    }
     const readNow = () => readOwnedTabValues(clients, { spreadsheetId: src, name: DESIGNER_TAB, render: 'FORMULA', range: null });
     let firstRead = null;
     if (src) {
@@ -526,7 +538,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
     }
     stillSame();
     await writeSpreadsheet(clients, {
-      spreadsheetId: fileId, title: built.title, tabs: built.tabs, fresh: created,
+      spreadsheetId: fileId, title: built.title, tabs: built.tabs, fresh,
       beforeWrite: () => {
         stillSame();
         sending = true;
@@ -547,7 +559,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
       if (!row.writing_at) db.prepare('UPDATE ph_designer_sheets SET writing_at = NULL, writing_images_json = NULL WHERE draft_id = ?').run(id);
     }
     if (!wrote) {
-      const keep = recordedFiles(db, id);
+      const keep = protectedNow();
       if (sending) for (const f of keepFiles) keep.add(f);
       await revokeShares(db, clients.drive, sharesOutside(db, id, keep));
     }
