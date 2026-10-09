@@ -23,7 +23,8 @@ description: product-hub の「構成をAIに作らせる」の実行役 — cla
 
 ```
 ./phlp queue                                  仕事があるか
-./phlp claim   --run RUN_ID                   1 件 claim (材料 + 仕様書を spec-ID.md に落とす)
+./phlp claim   --run RUN_ID                   1 件 claim (材料 + 仕様書を spec-ID.md に落とす。
+                                              撮影判定の仕様書「新商品初動判定」があれば shoot-spec-ID.md にも落とす)
 ./phlp images  ID                             画像 (商品 + 素材) を img-ID-1.jpg … に落とす
                                               (枚数は claim の packet で決まる。落とせない枚があれば失敗する)
 ./phlp reserve ID                             🚨 **構成を書き始める前に必ず**
@@ -73,8 +74,11 @@ RUN_ID="lp-$RANDOM$RANDOM"
 - 🚨 **`packet.image_guide`** … **添付画像の説明** (何枚目が何の画像か・画像の使い方)。
   **スタッフの ChatGPT 版にも同じ文が貼られる** (くらべっこを公平にするため)。画像の扱いはこれに従う。
   ここに書いていない画像の扱い方を自分で足さない
-- **`shoot_instruction`** … **撮影判定**の指示 (画像制作の新フロー・2026-10-09)。⑦ を書き終えてから使う (手順 4b)。
+- **`shoot_instruction`** … **撮影判定**の指示 (画像制作の新フロー・2026-10-09)。⑦ を書き終えてから使う (手順 6b)。
   `null` (サーバが古い) なら撮影判定は書かない (`shoot-<ID>.json` も作らず、`--shoot` も付けない)
+- **`shoot_spec`** … **撮影判定の仕様書「新商品初動判定」** (`shoot_spec.file` = `shoot-spec-<ID>.md`・2026-10-09 PR-C2)。
+  スタッフが撮影判定に使っている仕様書そのもの。あれば `shoot_instruction` はこれで判定せよと言う (手順 6b)。
+  `null` (まだ取り込まれていない) なら `shoot_instruction` は簡単な決まりの形 (下の v1) を言う
 
 `job: null` なら仕事なし。終了する。
 
@@ -176,7 +180,7 @@ img-12-7.jpg (素材1・使用イメージ/玄関.jpg): 玄関の床に向けて
 
 lint を通したら、その JSON を `lint-<ID>.json` に保存しておく (`result` に渡す)。
 
-`--shoot` を付けると応答に `shoot: {ok, errors}` も出る (構成の `lint` とは別)。`shoot.ok` が false なら
+`--shoot` を付けると応答に `shoot: {ok, errors, warnings}` も出る (構成の `lint` とは別)。`shoot.ok` が false なら
 `errors` を読んで `shoot-<ID>.json` を直す (コマンドも exit 1 になる)。構成の lint の結果はそれで変わらない。
 
 ### 6. Codex で検品 → 反映 (最大 2 巡)
@@ -216,10 +220,46 @@ critical / high の指摘があれば `out-<ID>.md` を直して、`_lp_review_<
 
 claim で来た **`shoot_instruction`** に従って、その構成の画像を作るのに撮影が要るかを判定し、
 **JSON だけ**を `shoot-<ID>.json` に書く。スタッフはこれを「AIのおすすめ」と理由として画面で見て、撮影判定を自分で決める
-(画面は自動では書き換えない)。画像ごとの撮影指示 (cut 以下) は撮影指示書の材料になる。
+(画面は自動では書き換えない)。撮影カット (または画像ごとの撮影指示) は撮影指示書の材料になる。
 
 🚨 **⑦ の本文 (`out-<ID>.md`) に撮影判定を書かない。** 本文に足すと lint と lp-tool のパーサーが落ちる。
 🚨 **撮影判定のために構成を変えない。** 構成は `instruction` (スタッフと同じ指示文) だけで決める。
+
+形は claim の **`shoot_spec` があるかで 2 つ**。どちらの形かは `shoot_instruction` に書いてある (サーバは依頼と違う形を受けない)。
+
+#### `shoot_spec` がある (仕様書「新商品初動判定」で判定する・v2)
+
+🚨 **`shoot-spec-<ID>.md` を最後まで読む。** 3 万字ほどあり Read 1 回では入りきらないので、`offset` を進めて分けて読む
+(途中で止めて判定しない)。判定のやり方 (判定順序・撮影区分・開封判定・使用イメージ・バリエーション・撮影担当・
+カット数の数え方・撮影用送付対象・LP に無いが必要な実写 など) は**仕様書の「システム本文」が正本**。
+`shoot_instruction` は材料の対応と JSON の形だけを言う。仕様書の 1〜9 の分析文と【撮影依頼書連携データ_START】のブロックは出さない
+(同じ中身を JSON の項目に入れる)。
+
+```json
+{"recommended":"inhouse","conclusion":"2枚目の使用シーンの実写がありません。消耗品なので社内の簡易物撮りで足ります。",
+ "open_required":"不要","send_targets":"ハッカ油スプレー 100ml (1本)","purpose":"使用シーンの実写を揃える",
+ "finish":"玄関で使っている手元が分かる明るい写真","usage":"楽天 LP 2枚目",
+ "cuts":[
+  {"no":1,"priority":"必須","expression_type":"使用イメージ","variation":"代表1色","target":"ハッカ油スプレー 100ml (1本)",
+   "content":"玄関でスプレーする手元","purpose":"使う場面を伝える","finish":"斜め上から手元と商品。商品ラベルが読めること",
+   "usage":"楽天 LP 2枚目","open_required":"不要","reference_theme":"玄関で使う手元","lp_image_nos":[2],"notice":"","required_notice":""}],
+ "images":[{"no":0,"needs_shoot":false},{"no":1,"needs_shoot":false},{"no":2,"needs_shoot":true}]}
+```
+
+サーバが見ること (`./phlp lint --shoot` で同じ検査を先に受けられる):
+- キーはこの形のものだけで、**どの項目も省略しない** (無い値は `""`、`lp_image_nos` だけは配列で LP に無いカットなら `[]`)。`conclusion` 以外は 1 行 (改行・タブを入れない)
+- `recommended` は `none` / `inhouse` / `photographer`。`open_required` は `不要` / `必要` / `一部必要`。カットの `priority`・`expression_type`・
+  `variation`・`open_required` は `shoot_instruction` に書いてある値のどれか。カットの `no` は 1 からの連番
+- `none` なら `cuts` は `[]`・`send_targets`・`purpose`・`finish`・`usage` は `""`・`needs_shoot` はすべて false。
+  `inhouse`・`photographer` なら `cuts` を 1 つ以上・その 4 項目は空にしない
+- 全体の `open_required` はカットの開封要否のまとめ (全部 `不要` → `不要` / 全部 `必要` → `必要` / 混ざる → `一部必要`)。`none` なら `不要`
+- `images` は **⑦ の画像見出しの N と 1 対 1** で `{no, needs_shoot}` だけ。**画像とカットは両向きで合わせる**:
+  `lp_image_nos` に入れた画像は `needs_shoot: true`、`needs_shoot: true` の画像はどれかのカットの `lp_image_nos` に入れる
+- 項目名は撮影指示書 (スプレッドシート) の項目と同じ。カットと概要はそのまま撮影指示書に載る
+- 応答の `shoot.warnings` は仕様書の運用ルールの知らせ (例: カメラマン撮影は 5 カット単位)。**通らないわけではない**が、
+  仕様書を読み直して直すべきなら直す
+
+#### `shoot_spec` が `null` (まだ取り込まれていない・v1)
 
 ```json
 {"recommended":"inhouse","reason":"2枚目 の写真 (使用シーン) がありません。卓上の簡単なカットなので社内撮影で足ります。",
@@ -236,7 +276,7 @@ claim で来た **`shoot_instruction`** に従って、その構成の画像を�
 - `needs_shoot: true` の画像は `cut` と `composition` が要る
 - `recommended` が `none` なのに撮影が要る画像がある / `inhouse`・`photographer` なのに 1 枚も無い は通らない
 
-判定の材料は**見た画像と ⑦ の「使用素材」だけ**。素材画像に無い写真を「ある」ことにしない。
+判定の材料は**見た画像・商品情報・⑦ だけ**。素材画像に無い写真を「ある」ことにしない。
 ```bash
 ./phlp lint <ID> --file out-<ID>.md --shoot shoot-<ID>.json
 ```

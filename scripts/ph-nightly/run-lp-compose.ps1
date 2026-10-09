@@ -34,7 +34,8 @@ $PingPs1   = Join-Path $PSScriptRoot 'ping.ps1'
 $Phlp      = Join-Path $Root 'bin\phlp.mjs'
 if (-not $TokenFile) { $TokenFile = Join-Path $env:USERPROFILE '.claude\secrets\ph-service-token.txt' }
 $PingId      = 'ph-lp-compose'
-$TimeoutMin  = 20     # one request: up to 16 images + write + lint + Codex review (<= 2 rounds). 2026-10-04: two runs took 13.5 min
+$TimeoutMin  = 25     # one request: up to 16 images + write + lint + Codex review (<= 2 rounds) + shoot judgement. 2026-10-04: two runs took 13.5 min.
+                      # 2026-10-09 (image-flow PR-C2): +5 min for reading the shoot spec (about 30k chars) and judging by it. The lease is 40 min.
 $LockWaitSec = 5      # SHORT: at 1 run/min we must not pile up behind the nightly jobs
 $Stamp     = Get-Date -Format 'yyyyMMdd-HHmmss'
 $LogDir    = Join-Path $Root 'logs'
@@ -202,7 +203,9 @@ try {
   # seen file, and the server lint is what decides whether an accepted result is taken.
   # It names shoot-<ID>.json (the shoot judgement, image-flow PR-C) so the session does not put the
   # judgement inside the section 7 output: that would break the lint and the lp-tool parser.
-  $prompt = 'Process ONE LP compose request. Follow the ph-lp-compose skill in this workspace exactly: claim one request with ./phlp, download all images (product and material) and LOOK AT every one, write what you saw into seen-<ID>.md, follow the image_guide that came with the claim, read the spec file, reserve BEFORE writing, write the section 7 output following the instruction that came with the claim, check it with ./phlp lint until it passes, review with ./phlpreview, then, only if the claim came with a shoot_instruction, write the shoot judgement it asks for about the FINAL reviewed output into shoot-<ID>.json (JSON only, never inside the section 7 output) and check it with ./phlp lint --shoot, then send the result with ./phlp result (adding --shoot shoot-<ID>.json when you wrote it) and clean up. After reserve, a failure must be reported as result --rejected, never as fail. Never read the service token and never touch files outside this workspace. Finish with one line: job=N status=done or rejected or failed'
+  # It names the shoot spec file (image-flow PR-C2): the judgement must follow that spec, and the file is long,
+  # so the session has to read it in parts instead of judging from the first page.
+  $prompt = 'Process ONE LP compose request. Follow the ph-lp-compose skill in this workspace exactly: claim one request with ./phlp, download all images (product and material) and LOOK AT every one, write what you saw into seen-<ID>.md, follow the image_guide that came with the claim, read the spec file, reserve BEFORE writing, write the section 7 output following the instruction that came with the claim, check it with ./phlp lint until it passes, review with ./phlpreview, then, only if the claim came with a shoot_instruction, read the whole shoot spec file when the claim came with one (shoot-spec-<ID>.md, it is long so read it in parts), write the shoot judgement it asks for about the FINAL reviewed output into shoot-<ID>.json (JSON only, never inside the section 7 output) and check it with ./phlp lint --shoot, then send the result with ./phlp result (adding --shoot shoot-<ID>.json when you wrote it) and clean up. After reserve, a failure must be reported as result --rejected, never as fail. Never read the service token and never touch files outside this workspace. Finish with one line: job=N status=done or rejected or failed'
   $timedOut = $false
   $claudeExit = -1
   # This run's id. ./phlp claim puts it on the job (whatever --run Claude writes), reserve copies it to the

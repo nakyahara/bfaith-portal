@@ -160,7 +160,8 @@ console.log('② packet に撮影判定の指示 (別の欄)・構成の指示�
 {
   const d = mkDraft();
   const r = reserveFor(d);
-  eq(r.packet.packet_version, 5, 'packet の版は 5');
+  eq(r.packet.packet_version, 6, 'packet の版は 6 (PR-C2 で撮影判定の仕様書 shoot_spec を足した)');
+  eq(r.packet.shoot_spec, null, '仕様書「新商品初動判定」を取り込む前は shoot_spec: null (PR-C の決まりのまま)');
   eq(r.packet.shoot_instruction, shootLib.SHOOT_JUDGE_INSTRUCTION, '🚨 claim で撮影判定の指示が届く (受付時に固定)');
   eq(r.packet.instruction, pt.PRODUCT_ANALYSIS_INSTRUCTION, '🚨 構成の指示文は正本のまま (くらべっこの前提を崩さない)');
   lp.submitResult(db, r.gid, { packetHash: r.packetHash, verdict: 'rejected', reason: '片付け' });
@@ -184,8 +185,9 @@ let dOk, rOk;
   eq(j.images.map((x) => [x.no, x.needs_shoot]), [[0, false], [1, false], [2, true]], '画像ごとの要否 (撮影指示書 PR-D の材料) も読める');
   eq(j.images[2].cut, '玄関でスプレーする手元', 'カット名も読める');
   const st = lp.jobStateFor(db, dOk.id);
-  eq(st.shoot, { job_id: rOk.jobId, available: true, recommended: 'inhouse', reason: goodShoot().reason, missing: null },
-    '画面の状態 (ポーリングの応答) には おすすめと理由だけ (画像ごとの要否は出さない)');
+  eq(st.shoot, { job_id: rOk.jobId, available: true, format: 1, recommended: 'inhouse', reason: goodShoot().reason,
+    open_required: '', cut_count: 1, send_targets: '', warnings: [], missing: null },
+    '画面の状態 (ポーリングの応答) には おすすめと理由と短い概要だけ (画像ごとの要否は出さない・PR-C の形は開封・送付が空)');
   ok(st.job.output_text === OUT, '構成の本文も今どおり出る');
 
   // 同じ結果の再送 = 保存済みを返す / 撮影判定だけ違う再送 = 別の結果なので断る
@@ -210,8 +212,10 @@ console.log('④ 壊れた撮影判定 → 構成は受け付け、撮影判定�
   eq(row.output_text, OUT, '構成の本文は保存される');
   ok(JSON.parse(row.lint_json).ok === true && JSON.parse(row.lint_json).source === 'server', '🚨 lint の扱いは今どおり (サーバの結果)');
   matchModel(r.run);
-  eq(lp.latestShootJudgement(db, d.id), { job_id: r.jobId, available: false, recommended: null, reason: null, images: [], missing: 'invalid' },
-    '読み口は「AI の判定なし (形が違った)」');
+  eq(lp.latestShootJudgement(db, d.id), { job_id: r.jobId, available: false, format: null, recommended: null, reason: null,
+    summary: { judgement: '', shooter: '', open_required: '', send_targets: '', purpose: '', finish: '', usage: '', conclusion: '' },
+    cuts: [], cut_count: 0, images: [], warnings: [], missing: 'invalid' },
+    '読み口は「AI の判定なし (形が違った)」(項目はそろえて中身は空)');
 
   {
     // 🚨 大きすぎる判定どうしでも、中身が違えば別の結果 (「使えない」1 つに畳まない・Codex PR-C 名指し1 M)
@@ -324,7 +328,7 @@ console.log('⑦ 出す前の検査 (lintForJob) — 撮影判定も同じ検査
   const plain = lp.lintForJob(db, r.jobId, { leaseToken: r.leaseToken, output: OUT });
   ok(plain.ok && plain.lint.ok && !('shoot' in plain), '撮影判定を渡さなければ今どおり (shoot は返さない)');
   const good = lp.lintForJob(db, r.jobId, { leaseToken: r.leaseToken, output: OUT, shoot: goodShoot() });
-  eq(good.shoot, { ok: true, errors: [] }, '正しい撮影判定は ok');
+  eq(good.shoot, { ok: true, errors: [], warnings: [] }, '正しい撮影判定は ok');
   const badL = lp.lintForJob(db, r.jobId, { leaseToken: r.leaseToken, output: OUT, shoot: { ...goodShoot(), images: [] } });
   ok(badL.shoot.ok === false && badL.shoot.errors.length > 0, '壊れた撮影判定は何が悪いかを返す');
   eq(badL.lint, plain.lint, '🚨 撮影判定が通らなくても、構成の lint の結果は変わらない');

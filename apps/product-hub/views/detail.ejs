@@ -6194,8 +6194,23 @@ th.attr-unknown { color: #dc2626; }
         : NL + '(まだ判定していません。おすすめでよければ「おすすめにする」か上のボタンを押してください)');
     return {
       show: true, recommended: j.recommended, adopt: !same, none: false,
-      text: 'AIのおすすめ: ' + LABEL[j.recommended] + ' — ' + String(j.reason || '') + tail,
+      text: 'AIのおすすめ: ' + LABEL[j.recommended] + ' — ' + String(j.reason || '') + shootRecDetail(j) + tail,
     };
+  }
+  /**
+   * 仕様書「新商品初動判定」で判定したもの (format 2・PR-C2) だけ、開封要否・カット数・撮影用送付対象を 1 行で添える。
+   * カットの中身は撮影指示書 (PR-D) の役目なのでここには出さない。warnings = 仕様書の運用ルールの知らせ (強制はしない)。
+   * PR-C の形 (format 1) には無い項目なので何も足さない
+   */
+  function shootRecDetail(j) {
+    if (!j || j.format !== 2) return '';
+    const NL = String.fromCharCode(10);
+    const parts = [];
+    if (j.open_required) parts.push('開封: ' + j.open_required);
+    if (j.recommended !== 'none') parts.push('撮影カット: ' + (Number(j.cut_count) || 0) + ' カット');
+    if (j.recommended !== 'none' && j.send_targets) parts.push('撮影用送付対象: ' + j.send_targets);
+    const warns = Array.isArray(j.warnings) ? j.warnings.filter(function (w) { return typeof w === 'string' && w; }) : [];
+    return (parts.length ? NL + parts.join(' ／ ') : '') + warns.map(function (w) { return NL + '⚠ ' + w; }).join('');
   }
   /**
    * 撮影判定の箱に描く。札 (AIのおすすめ) はおすすめのボタンにだけ出す。理由は textContent で入れる (AI の文なので HTML にしない)

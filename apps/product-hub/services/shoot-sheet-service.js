@@ -24,7 +24,7 @@ import { effectiveCompose } from '../lib/lp-edit.js';
 import { latestShootJudgement } from '../lib/lp-compose.js';
 import {
   buildShootSheet, cutsFromComposeText, cutsFromSlots, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
-  spreadsheetUrl, MANAGED_SHEETS, SHOOT_SHEET_MODES, SHOOT_JUDGEMENT_LABELS,
+  spreadsheetUrl, MANAGED_SHEETS, SHOOT_SHEET_MODES, SHOOT_JUDGEMENT_LABELS, aiSummaryStillValid, SUMMARY_NEEDS_REVIEW, SUMMARY_MODE_CHANGED,
 } from '../lib/shoot-sheet.js';
 import {
   getSheetsWriteClients, explainGoogleError, findSpreadsheetByAppProperty, spreadsheetUsable,
@@ -58,11 +58,11 @@ export function shootSheetConfigured() {
  *   (組み立ては lib/shoot-sheet.js の cutsFromSlots。純粋関数で試している)
  * 構成がパーサで読めない (画面で直せない) ときは、本文から推定する最小版 (cutsFromComposeText) で組む
  *
- * 形 = 新商品初動判定 仕様書 Ver1.3.11 の撮影依頼書 (概要 + 1 カット 1 ブロック)。PR-C の shoot_json は仕様書の全項目を
- * 持たないので、今は cut → 撮影内容 / composition 等 → 完成イメージ / ng → 注意 に対応づけ、ほかは空欄。概要 (summary) も
- * 撮影判定・撮影担当 (撮影判定の箱の値) のほかは空欄。
- * 🔁 C2 (AI の shoot_json を仕様書の全項目 = 概要の 8 項目 + 撮影カットの全項目に広げる PR) がマージされたら、
- *    ここで AI のカット・概要をそのまま使うように差し替える (lib/shoot-sheet.js の CUT_FIELDS / SUMMARY_FIELDS の形で返す)
+ * 形 = 新商品初動判定 仕様書 Ver1.3.11 の撮影依頼書 (概要 + 1 カット 1 ブロック)。
+ *   - AI の撮影判定が仕様書の形 (v2・PR-C2): AI のカット (LP に無いカットも) と概要 (開封要否・撮影用送付対象・撮影目的・
+ *     完成イメージ・使用用途・判定の結論) をそのまま使う (項目名は CUT_FIELDS / SUMMARY_FIELDS と同じ)
+ *   - PR-C の形 (v1): cut → 撮影内容 / composition 等 → 完成イメージ / ng → 注意 に対応づけ、ほかは空欄。概要も空欄
+ *   概要の撮影判定・撮影担当は、どちらでも撮影判定の箱の値 (人が決めた正本・materialOf が上書きする)
  * @returns {{cuts: Array, summary: object, source: 'lp'|'none', composeJobId: number|null, editId: number|null}}
  */
 export function shootSheetCutsFor(db, draft) {
@@ -76,8 +76,27 @@ export function shootSheetCutsFor(db, draft) {
   const hasEditShoot = !!eff.edit && eff.slots.every((sl) => !/^e\d+x\d+$/.test(String(sl.uid)));
   // AI の撮影判定は、効いている構成と同じ構成 (job) のものだけ使う (新しい構成を AI が作り直している途中なら使わない)
   const judge = latestShootJudgement(db, draft.id);
-  const aiImages = judge && judge.available && judge.job_id === eff.job.id ? judge.images : null;
-  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages }), summary: {}, source: 'lp', composeJobId: eff.job.id, editId };
+  const sameJob = !!(judge && judge.available && judge.job_id === eff.job.id);
+  const aiImages = sameJob ? judge.images : null;
+  // 仕様書の形 (v2・PR-C2) なら AI のカットと概要をそのまま使う。PR-C の形 (v1) は images からの対応づけ (cutsFromSlots の中)
+  const v2 = sameJob && judge.format === 2;
+  // AI のカット・概要をそのまま使えないとき (Codex PR-C2 名指し4・6 M):
+  //   - 人が撮影判定を AI のおすすめと違う区分にした (社内撮影 ↔ カメラマン撮影 など。カット数・送付対象は区分ごとに決まる)
+  //     → 概要は要確認・カットは構成の本文から拾う (使用素材の「撮影」・AI の判定が無いときと同じ)
+  //   - 編集版はあるが要撮影 (slots_json) が読めない (元の画像の uid で AI のカットを引けない) → 同上
+  //   - 人が編集版で要撮影を変えた (概要は AI が要撮影とした画像のためのもの) → 概要だけ要確認 (カットは画像ごとに引けるので AI のまま)
+  const shootMode = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.shoot_mode ?? null;
+  const modeChanged = v2 && shootMode !== judge.recommended;
+  const editBroken = !!eff.edit && !hasEditShoot;
+  const aiCuts = v2 && !modeChanged && !editBroken ? judge.cuts : null;
+  // 🚨 使わないときは AI の要撮影 (images) も使わない — 構成の本文 (使用素材の「撮影」) から拾い直す (Codex PR-C2 base 8 P1:
+  //    AI が「撮影不要」とした後に人が社内撮影にすると、AI の needs_shoot が全部 false のままでカットが 0 になった)
+  const aiImagesForCuts = v2 && (modeChanged || editBroken) ? null : aiImages;
+  const summary = !v2 ? {}
+    : modeChanged ? { ...SUMMARY_MODE_CHANGED }
+      : (editBroken || !aiSummaryStillValid({ slots: eff.slots, hasEditShoot, aiImages })) ? { ...SUMMARY_NEEDS_REVIEW }
+        : { ...judge.summary };
+  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages: aiImagesForCuts, aiCuts }), summary, source: 'lp', composeJobId: eff.job.id, editId };
 }
 
 const folderIdOf = (draft) => {

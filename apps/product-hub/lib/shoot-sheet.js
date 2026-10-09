@@ -25,7 +25,8 @@ export const MANAGED_SHEETS = [SHEET_MAIN, SHEET_REQUEST];
 
 /**
  * カット 1 つの欄 = 仕様書の「撮影依頼書連携データ」の撮影カット (No 以外) + こちらで足した欄。
- * 表示しない欄 (内部連携) も持つ — 材料の hash に入り、C2 (AI の撮影判定を仕様書の全項目に広げる PR) が埋める
+ * 表示しない欄 (内部連携) も持つ — 材料の hash に入る。AI の撮影判定が仕様書の形 (v2・PR-C2) なら、AI のカットがそのまま埋める
+ * (lib/lp-shoot.js の SHOOT_V2_CUT_FIELDS は同じ名前。違うのは使う LP 画像だけ: AI は番号の配列 lp_image_nos、ここは表示の lp_image)
  *   priority 優先度 (必須／推奨) / expression_type 撮影表現タイプ / variation 撮影対象バリエーション /
  *   target 撮影対象 (色・種類名＋点数) / content 撮影内容 / purpose 撮影目的 / finish 構図・完成イメージ /
  *   usage 使用用途 / open_required 開封要否 / reference_theme 参考イメージ (AI 参考画像用の短いテーマ名・表示しない)
@@ -308,37 +309,104 @@ export function aiNoOfUid(uid) {
   return m ? Number(m[1]) : null;
 }
 
+/** AI の撮影判定 (v2) のカット 1 つ → 撮影指示書のカット。項目名は同じなので写すだけ。lp_image (表示) は呼び手が今の並びから作る */
+function cutFromAi(c, lpImage) {
+  const o = {};
+  for (const f of CUT_FIELDS) o[f] = f === 'lp_image' ? lpImage : str(c && c[f]);
+  return o;
+}
+
 /**
- * 撮影指示書のカットを、いまの LP構成の並び (PR-B) と AI の撮影判定 (PR-C) から組む (純粋関数)。
+ * 撮影指示書のカットを、いまの LP構成の並び (PR-B) と AI の撮影判定 (PR-C / PR-C2) から組む (純粋関数)。
  *   - 要撮影か: 編集版の「要撮影」(人が直した値) が正本 (hasEditShoot)。編集版が無ければ AI の needs_shoot、
  *     AI の判定も無ければ使用素材に「撮影」が出てくるかで推定
- *   - カットの中身: AI の判定のその画像 (needs_shoot で中身があるもの)。PR-C の shoot_json は仕様書の全項目を持たないので
- *       cut → 撮影内容 / composition・props・background・tone → 完成イメージ (joinFinish) / ng → 注意 に対応づけ、
- *       ほか (撮影対象・優先度・表現タイプ・バリエーション・目的・用途・開封・参考テーマ) は空欄 (優先度だけ「必須」)。
- *     AI の判定が無い画像 (人が要撮影にした・追加した画像) はブロックの見出しから拾う
- *   🔁 C2 (AI の shoot_json を仕様書 Ver1.3.11 の撮影カットの全項目に広げる PR) がマージされたら、ここの対応づけを差し替える
- *      (AI のカットは LP 画像と 1 対 1 とは限らない = LP に無い実写素材のカットも来る。lp_image は任意の欄)
+ *   - カットの中身:
+ *     - AI の判定が仕様書の形 (v2・aiCuts あり・PR-C2): AI のカットをそのまま使う (項目名は CUT_FIELDS と同じ)。
+ *       要撮影の画像ごとに、その画像を使う AI のカット (lp_image_nos に元の番号があるもの) を AI の順で並べ、
+ *       最後に LP に無いカット (lp_image_nos が []) を足す。1 つのカットを複数の画像で使うときは最初の画像のところに 1 回だけ。
+ *       要撮影でなくなった画像 (人が「撮影不要」にした・消した) だけを使うカットは載せない
+ *     - AI の判定が PR-C の形 (v1): その画像の cut → 撮影内容 / composition・props・background・tone → 完成イメージ (joinFinish) /
+ *       ng → 注意 に対応づけ、ほか (撮影対象・優先度・表現タイプ・バリエーション・目的・用途・開封・参考テーマ) は空欄 (優先度だけ「必須」)
+ *     AI のカットが無い要撮影の画像 (人が要撮影にした・追加した画像) はブロックの見出しから拾う
  *   🚨 AI の判定は「AI の構成での番号」で付いている。編集版で並べ替え・追加した画像は番号がずれるので、
  *      **今の番号ではなく元の画像 (uid の a<元の番号>) で引く**。追加した画像 (n…) には AI の判定は無い
  * @param {{slots: Array<{uid, no, name, lines: string[], shoot?: boolean}>, hasEditShoot: boolean,
- *          aiImages: Array<{no, needs_shoot, cut, composition, props, background, tone, ng}>|null}} o
+ *          aiImages: Array<{no, needs_shoot, cut, composition, props, background, tone, ng}>|null,
+ *          aiCuts?: Array<{lp_image_nos: number[]} & Record<string, string>>|null}} o
  */
-export function cutsFromSlots({ slots, hasEditShoot, aiImages }) {
+export function cutsFromSlots({ slots, hasEditShoot, aiImages, aiCuts = null }) {
   const aiByNo = new Map((Array.isArray(aiImages) ? aiImages : []).map((x) => [x.no, x]));
+  const list = Array.isArray(slots) ? slots : [];
+  const v2 = Array.isArray(aiCuts) ? aiCuts.filter((c) => c && Array.isArray(c.lp_image_nos)) : null;
+  // 元の番号 → いまの表示 (N枚目｜名前)。AI のカットの lp_image に使う (並べ替えても元の画像で引く)
+  const labelOfOrig = new Map();
+  list.forEach((sl, i) => {
+    const origNo = aiNoOfUid(sl.uid);
+    if (origNo != null) labelOfOrig.set(origNo, imgLabel(Number.isInteger(sl.no) ? sl.no : i, sl.name));
+  });
+  const needsOf = (sl) => {
+    const origNo = aiNoOfUid(sl.uid);
+    const ai = origNo != null ? aiByNo.get(origNo) || null : null;
+    return hasEditShoot ? sl.shoot === true : (aiImages ? !!(ai && ai.needs_shoot) : blockMentionsShoot((Array.isArray(sl.lines) ? sl.lines : []).join('\n')));
+  };
+  // 🚨 表示に出すのは「いま要撮影」の画像だけ (人が片方だけ「撮影不要」にした共有カットに、撮影不要の画像を出さない。
+  //    出すと材料の hash も変わらず「LP構成が変わりました」も出ない — Codex PR-C2 名指し2 M)
+  const labelOfNeeded = new Map([...labelOfOrig].filter(([n]) => list.some((sl) => aiNoOfUid(sl.uid) === n && needsOf(sl))));
+  const lpImageOf = (c) => c.lp_image_nos.map((n) => labelOfNeeded.get(n)).filter(Boolean).join('・');
+  const used = new Set();
   const cuts = [];
-  for (const [i, sl] of (Array.isArray(slots) ? slots : []).entries()) {
+  for (const [i, sl] of list.entries()) {
     const block = (Array.isArray(sl.lines) ? sl.lines : []).join('\n');
     const origNo = aiNoOfUid(sl.uid);
     const ai = origNo != null ? aiByNo.get(origNo) || null : null;
-    const needs = hasEditShoot ? sl.shoot === true : (aiImages ? !!(ai && ai.needs_shoot) : blockMentionsShoot(block));
-    if (!needs) continue;
+    if (!needsOf(sl)) continue;
     const no = Number.isInteger(sl.no) ? sl.no : i;
     const fromBlock = cutFromBlock(block, { label: imgLabel(no, sl.name), name: sl.name });
+    if (v2) {
+      const mine = origNo != null ? v2.filter((c) => c.lp_image_nos.includes(origNo)) : [];
+      if (!mine.length) { cuts.push(fromBlock); continue; }
+      for (const c of mine) {
+        if (used.has(c)) continue;
+        used.add(c);
+        cuts.push(cutFromAi(c, lpImageOf(c)));
+      }
+      continue;
+    }
     const useAi = ai && ai.needs_shoot && str(ai.cut).trim();
     cuts.push(useAi ? { ...fromBlock, content: ai.cut, finish: joinFinish(ai), notice: ai.ng } : fromBlock);
   }
+  // LP に無いが必要な実写 (仕様書: LP構成を正として追認せず、抜けている実写素材を撮影候補にする)
+  if (v2) for (const c of v2) if (c.lp_image_nos.length === 0 && !used.has(c)) cuts.push(cutFromAi(c, ''));
   return normalizeCuts(cuts);
 }
+
+/**
+ * AI の概要 (撮影用送付対象・開封要否・撮影目的・完成イメージ・使用用途・判定の結論) を撮影指示書にそのまま使ってよいか (PR-C2)。
+ * 概要は AI が「自分が要撮影とした画像」のために決めたもの。人が編集版で要撮影を変えた (AI と違う画像を要撮影にした・
+ * 要撮影を外した・足した画像を要撮影にした) なら、送付対象などが今のカットと合わない — 違う商品を撮影先へ送りかねない
+ * (Codex PR-C2 名指し4 M)。編集版が無い (= 要撮影は AI の値) なら使ってよい
+ * @param {{slots: Array<{uid, shoot?: boolean}>, hasEditShoot: boolean, aiImages: Array<{no, needs_shoot}>|null}} o
+ */
+export function aiSummaryStillValid({ slots, hasEditShoot, aiImages }) {
+  if (!hasEditShoot) return true;
+  const aiNeeded = new Set((Array.isArray(aiImages) ? aiImages : []).filter((x) => x && x.needs_shoot).map((x) => x.no));
+  const nowNeeded = new Set();
+  for (const sl of Array.isArray(slots) ? slots : []) {
+    if (sl.shoot !== true) continue;
+    const n = aiNoOfUid(sl.uid);
+    if (n == null) return false;   // 人が足した画像を要撮影にした (AI の概要はこの画像を知らない)
+    nowNeeded.add(n);
+  }
+  return nowNeeded.size === aiNeeded.size && [...nowNeeded].every((n) => aiNeeded.has(n));
+}
+/** AI の概要を使えないときの撮影指示書の概要 (送付対象は人が決める) */
+export const SUMMARY_NEEDS_REVIEW = Object.freeze({
+  send_targets: '要確認（LP構成の要撮影を人が直したので、AI が決めた撮影用送付対象は使っていません）',
+});
+/** 撮影判定を AI のおすすめと違う区分にしたときの概要 (カット数・送付対象は区分ごとに決まるので AI の値を使わない・Codex PR-C2 名指し6 M) */
+export const SUMMARY_MODE_CHANGED = Object.freeze({
+  send_targets: '要確認（撮影判定を AI のおすすめと違う区分にしたので、AI が決めた撮影用送付対象・カットは使っていません）',
+});
 
 /**
  * 撮影指示書を作れない理由 (画面のボタンと API で同じ判定)。null なら作れる
