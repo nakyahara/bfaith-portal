@@ -10,6 +10,8 @@
  *   3 1 つの取引で全部か何も無いか (本物のログイン): 子の 1 つが断られた・閉じないで commit = 札・予約・子・知らせ・done が残らない
  *   4 子の数の上限の時間: 2 軸・20 子・子ごとに JAN のまとめての登録を本物の PG で測る = 1 つの文が画面のロールの statement_timeout (20 秒) より十分短く・
  *     取引全体も短い (測った値を出す = 上限を上げるときの材料)
+ *   4b 測るだけ: 40 色 × 3 サイズ = 120 子 (上限は 20 のまま・この試験の DB だけ一時的に 120)
+ *   6 NE のコードの鍵 (#1677 Codex R1 High): 照合の ops.record_ne_codes と まとめての登録・子の廃止・代表の採用・CSV を作る取引を並べる = 待って順に・後の方は新しい NE のコードを見る・40P01 なし
  *   5 本物のログイン: 画面のロールはまとまりの表を直接書けない・部品を実行できない・関数は実行できる
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-variation-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール master_* をクラスタに作る)。localhost 以外の URL は拒む。TEST_PG_URL が無ければ飛ばす
@@ -113,7 +115,9 @@ try {
       const r = (await timed(c, 'select ops.register_new_sku($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r', [ch.request_id, actor, null, OWN, 'e'.repeat(64), JSON.stringify(entry(ch.code, `子 ${ch.code}`))], stat)).r;
       if (jans[ch.code]) await timed(c, 'select ops.edit_sku_jan($1::uuid, $2, $3, $4::jsonb, $5::bigint, $6::jsonb, $7::jsonb)', [uuid(), actor, null, OWN, r.sku_id, '[]', JSON.stringify([jans[ch.code]])], stat);
     }
+    const tc = performance.now();
     const cl = close ? (await timed(c, 'select ops.variation_batch_close($1::uuid, $2, $3::jsonb, $4::jsonb) as r', [rid, actor, OWN, null], stat)).r : null;
+    if (stat) stat.lastClose = performance.now() - tc;
     return { open: o, close: cl, rid };
   }
   const batchTx = async (c, spec, o = {}) => { try { const r = await openBatch(c, spec, o); await c.query('commit'); return r; } catch (e) { try { await c.query('rollback'); } catch { /* */ } throw e; } };
@@ -243,6 +247,125 @@ try {
     const e = await batchTx(A, { group: { code: 'PgBig2', name: 'x' }, axes: [{ axis: 1, name: '色' }], options: Array.from({ length: 21 }, (_, i) => ({ axis: 1, code: `-D${i}`, name: `d${i}` })),
       children: Array.from({ length: 21 }, (_, i) => ({ code: `PgBig2-D${i}`, choices: { 1: `-D${i}` } })) }).catch((x) => x);
     assert.match(String(e?.message), /^too_many/);
+  });
+
+  await ta('[4b] 測るだけ (上限は 20 のまま): 40 色 × 3 サイズ = 120 子・子ごとに JAN のまとめての登録の時間 (この試験の DB だけ上限を 120 にして測り、戻す)', async () => {
+    const MAXFN = `create or replace function ops.variation_max_children() returns integer language sql immutable set search_path = pg_catalog, pg_temp as $$ select %s $$`;
+    await M.query(MAXFN.replace('%s', '120'));
+    try {
+      const colors = Array.from({ length: 40 }, (_, i) => ({ axis: 1, code: `-C${i}`, name: `色 ${i}` }));
+      const sizes = [{ axis: 2, code: '-S', name: 'S' }, { axis: 2, code: '-M', name: 'M' }, { axis: 2, code: '-L', name: 'L' }];
+      const children = colors.flatMap((c) => sizes.map((s) => ({ code: `PgHuge${c.code}${s.code}`, choices: { 1: c.code, 2: s.code } })));
+      assert.equal(children.length, 120);
+      const jans = Object.fromEntries(children.map((c, i) => [c.code, jan13(`49000007${String(i).padStart(4, '0')}`)]));
+      const stat = { n: 0, max: 0, sum: 0 };
+      const t0 = performance.now();
+      const r = await batchTx(A, { group: { code: 'PgHuge', name: '120 のまとまり' }, axes: [{ axis: 1, name: '色' }, { axis: 2, name: 'サイズ' }], options: [...colors, ...sizes], children }, { jans, stat });
+      const total = performance.now() - t0;
+      const closeMs = stat.lastClose ?? null;
+      console.log(`      測った値: 120 子 (40 色 × 3 サイズ・JAN つき) = 文 ${stat.n} 個・1 文の最大 ${stat.max.toFixed(0)} ms・合計 ${total.toFixed(0)} ms${closeMs ? `・閉じる ${closeMs.toFixed(0)} ms` : ''}`);
+      assert.equal(r.close.revision, 1);
+      assert.equal((await q(`select jsonb_array_length(payload -> 'children') as n from ops.product_hub_outbox where group_product_id = $1`, [r.close.group_product_id]))[0].n, 120);
+      assert.ok(stat.max < 20000, `1 文 ${stat.max} ms (statement_timeout 20 秒)`);
+    } finally {
+      await M.query(MAXFN.replace('%s', '20'));
+    }
+    assert.equal((await q('select ops.variation_max_children() as n'))[0].n, 20);
+  });
+
+  await ta('[6] NE のコードの鍵 (#1677 Codex R1 High): 照合の ops.record_ne_codes (排他) と まとめての登録・子の廃止・代表の採用が並ぶ = 先の方の commit を待ち、後の方は新しい NE のコードを見る・デッドロックしない (JAN = CSV の鍵を持ったまま NE のコードを待つ CSV を作る取引とも)', async () => {
+    const Wn = await openPgClient((() => { const x = new URL(u.toString()); x.username = 'watch_writer'; x.password = 'b'; return x.toString(); })());
+    clients.push(Wn);
+    let seq = 1;
+    const newRun = async () => { seq++; const id = `mc_20300110T0${seq}0000000Z_e0000${seq}`; await M.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, $2, 0)`, [id, `2030-01-10T0${seq}:00:00Z`]); return id; };
+    const codesOf = (run, extra = [], reps = [{ code_norm: 'grp1', ne_code: 'grp1' }]) => JSON.stringify({ compare_run_id: run, entries: [
+      ...['p001', 'p002', 'p003', ...extra].map((c) => ({ code_norm: c.toLowerCase(), kind: 'product', state: 'ok', ne_code: c, spellings: [c] })),
+      ...reps.map((r) => ({ code_norm: r.code_norm, kind: 'rep', state: 'ok', ne_code: r.ne_code, spellings: [r.ne_code] }))] });
+    const lease = async (run) => (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(dbM, { runId: run, withSet: true });
+
+    // (a) まとめての登録が先 (NE のコードの共有の鍵を持つ) → 照合の書き手は待つ → commit の後に入れ替える
+    const ra = await newRun();
+    const a = await openBatch(A, { group: { code: 'PgNeA', name: 'a' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-1', name: '1' }], children: [{ code: 'PgNeA-1', choices: { 1: '-1' } }] });
+    const wa = launch(Wn.query('select ops.record_ne_codes($1::jsonb) as r', [codesOf(ra)]));
+    await sleep(400);
+    assert.equal(wa.done, false, '照合の書き手は登録の commit を待つ');
+    await A.query('commit');
+    const rwa = await wa.promise;
+    assert.ok(rwa.ok, rwa.err?.message);
+    assert.ok(a.close.revision >= 1);
+    await lease(ra);
+
+    // (b) 照合の書き手が先 (排他を持ったまま) → まとめての登録は待つ → 入れ替わった後の NE のコード (子のコードが NE に現れた) を見て code_in_ne
+    const rb = await newRun();
+    await Wn.query('begin');
+    await Wn.query('select ops.record_ne_codes($1::jsonb)', [codesOf(rb, ['PgNeB-1'])]);
+    const bb = launch(batchTx(B, { group: { code: 'PgNeB', name: 'b' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-1', name: '1' }], children: [{ code: 'PgNeB-1', choices: { 1: '-1' } }] }));
+    await sleep(400);
+    assert.equal(bb.done, false, 'まとめての登録は照合の書き手の commit を待つ');
+    await Wn.query('commit');
+    const rbb = await bb.promise;
+    assert.match(String(rbb.err?.message), /^code_in_ne/, rbb.err?.message ?? JSON.stringify(rbb.ok));
+    await lease(rb);
+
+    // (c) 子の廃止: 照合の書き手が先 (子のコードが NE に初めて現れた) → 廃止は待つ → seen_in_ne (NE にある子を cancelled にしない)
+    const kid = await batchTx(A, { group: { product_id: GRP1 }, options: [{ axis: 1, code: '-Q1', name: 'Q1' }], children: [{ code: 'grp1-Q1', choices: { 1: '-Q1' } }] });
+    const kidSku = (await q(`select sku_id::text as id from core.skus where code = 'grp1-Q1'`))[0].id;
+    const rc = await newRun();
+    await Wn.query('begin');
+    await Wn.query('select ops.record_ne_codes($1::jsonb)', [codesOf(rc, ['grp1-Q1'])]);
+    const cc = launch(B.query('select ops.cancel_variation_child($1::uuid, $2, $3, $4::jsonb, $5::bigint) as r', [uuid(), 'naka@test', 'やめる', OWN, kidSku]));
+    await sleep(400);
+    assert.equal(cc.done, false, '子の廃止は照合の書き手の commit を待つ');
+    await Wn.query('commit');
+    const rcc = await cc.promise;
+    assert.match(String(rcc.err?.message), /^seen_in_ne/, rcc.err?.message);
+    assert.equal((await q('select state from ops.master_registrations where sku_id = $1', [kidSku]))[0].state, 'draft');
+    assert.ok(kid.close.revision >= 1);
+    await lease(rc);
+
+    // (d) 代表の採用: 封のある回 = NE のコードの回 で採用できる状態 → 照合の書き手が新しい回を入れている途中 → 採用は待つ → 新しい印の回 (封なし) を見て ne_not_fresh
+    const extra = [{ code: 'pq001', name: 'NE で作った【赤】', kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 3, cost: null, representativeCode: 'grp1', representativeState: 'value' }];
+    const lr = await runInitialLoad(dbM, { ...plan, skus: [...plan.skus, ...extra] }, { log: () => {}, runId: 'load_vg5_pq', now: new Date(Date.now() - 5 * 86400e3) });
+    assert.equal(lr.ok, true, lr.error);
+    const qSku = (await q(`select s.sku_id::text as id, r.state from core.skus s join ops.master_registrations r on r.sku_id = s.sku_id where s.code = 'pq001'`))[0];
+    assert.equal(qSku.state, 'quarantined');
+    const rd = await newRun();
+    await Wn.query('select ops.record_ne_codes($1::jsonb)', [codesOf(rd, ['pq001'])]);
+    const snap = (await Wn.query('select ops.snapshot_ne_reg_targets($1) as r', [rd])).rows[0].r;
+    const ok = (v) => ({ st: 'ok', v });
+    const at = new Date(Date.now() + 60000).toISOString();
+    const w = (await Wn.query('select ops.record_ne_registration_observations($1::jsonb) as r', [JSON.stringify({ compare_run_id: rd, fetch: { generation_id: 'gen_pq', products_rev: '1', sets_rev: '1', raw_hash: 'f'.repeat(64) },
+      products_at: at, sets_at: at, absence_trusted: true, observations: snap.targets.map((t) => (t.code_norm === 'pq001'
+        ? { code_norm: 'pq001', present: true, trusted: true, kind: 'single', cols: { parent: ok('grp1') } } : { code_norm: t.code_norm, present: false, trusted: true, kind: null })) })])).rows[0].r;
+    await Wn.query('select ops.seal_ne_registration_run($1, $2, $3)', [rd, w.observation_hash, 'e'.repeat(64)]);
+    const re = await newRun();
+    await Wn.query('begin');
+    await Wn.query('select ops.record_ne_codes($1::jsonb)', [codesOf(re, ['pq001'])]);
+    const ad = launch(B.query('select ops.adopt_ne_parent_for_quarantined($1::uuid, $2, $3, $4::jsonb, $5::bigint) as r', [uuid(), 'naka@test', 'NE から', OWN, qSku.id]));
+    await sleep(400);
+    assert.equal(ad.done, false, '代表の採用は照合の書き手の commit を待つ');
+    await Wn.query('commit');
+    const rad = await ad.promise;
+    assert.match(String(rad.err?.message), /^ne_not_fresh/, rad.err?.message ?? JSON.stringify(rad.ok?.rows));
+    assert.equal((await q(`select parent_product_id from core.products p join core.skus s on s.product_id = p.product_id where s.code = 'pq001'`))[0].parent_product_id, null);
+    await lease(re);
+
+    // (e) デッドロックしない: JAN つきのまとめての登録 (CSV の鍵 → NE のコードの共有) を持ったまま、照合の書き手 (NE のコード 排他) が待ち、
+    //     CSV を作る取引 (CSV → NE のコード 共有) も待つ → 登録の commit の後、全部 40P01 にならずに終わる
+    const rf = await newRun();
+    const a2 = await openBatch(A, { group: { code: 'PgNeE', name: 'e' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-1', name: '1' }], children: [{ code: 'PgNeE-1', choices: { 1: '-1' } }] },
+      { jans: { 'PgNeE-1': jan13('490000000601') } });
+    const wf = launch(Wn.query('select ops.record_ne_codes($1::jsonb) as r', [codesOf(rf)]));
+    await sleep(200);
+    const bf = launch(G.buildRegExport(pgAdapter(B), { actor: 'boss@test', kind: 'products', codes: ['PgNeA-1'], requestId: uuid(), variation: true },
+      { ownership: ALL_COMPANY, open: true, nowMs: new Date('2030-01-10T03:00:00Z').getTime() }));
+    await sleep(400);
+    assert.equal(wf.done, false); assert.equal(bf.done, false);
+    await A.query('commit');
+    const [rwf, rbf] = [await wf.promise, await bf.promise];
+    for (const r of [rwf, rbf]) assert.notEqual(r.err?.code, '40P01', r.err?.message);
+    assert.ok(rwf.ok, rwf.err?.message);
+    assert.ok(a2.close.revision >= 1);
   });
 
   await ta('[5] 本物のログイン: 画面のロールはまとまりの表を直接書けない・部品を実行できない・関数は実行できる (ロールの script を流した後)', async () => {

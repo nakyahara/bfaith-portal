@@ -656,20 +656,27 @@ begin
 end $$;
 revoke all on function ops._open_variation_write(text, uuid, text, text, jsonb, bigint, bigint[], text, jsonb) from public;
 
-/** 同じ request_id の前の答え (まとまりの関数・操作と人が同じ done = 結果に replayed・違えば request_id_reused)。無ければ null */
-create function ops._variation_replay(p_request_id uuid, p_operation text, p_actor_id text) returns jsonb
+/**
+ * 同じ request_id の前の答え (無ければ null)。操作・人・done・要求のハッシュ (保存の記録の payload_hash = 呼び手の要求から DB が作った値)・相手 (SKU / まとまり) が
+ * 全部同じとき = 前の結果に replayed。どれか違う = request_id_reused (同じ番号で違う相手・中身を黙って前の答えにしない・#1677 Codex R1 Medium 2)
+ */
+create function ops._variation_replay(p_request_id uuid, p_operation text, p_actor_id text, p_payload_hash text, p_sku_id bigint, p_group_product_id bigint) returns jsonb
   language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
 declare
   r record;
 begin
-  select m.operation, m.actor_id, m.status, m.result into r from ops.master_edit_requests m where m.request_id = p_request_id;
+  select m.operation, m.actor_id, m.status, m.result, m.payload_hash, m.sku_id into r from ops.master_edit_requests m where m.request_id = p_request_id;
   if not found then return null; end if;
   if r.operation is distinct from p_operation or r.actor_id is distinct from p_actor_id or r.status is distinct from 'done' then
     raise exception 'request_id_reused: request_id % はほかの操作・人で使われている', p_request_id using errcode = '23505';
   end if;
+  if r.payload_hash is distinct from p_payload_hash or r.sku_id is distinct from p_sku_id
+     or (p_group_product_id is not null and (r.result ->> 'group_product_id') is distinct from p_group_product_id::text) then
+    raise exception 'request_id_reused: request_id % は違う相手・中身で使われている (同じ操作の押し直しは同じ相手・同じ中身だけ)', p_request_id using errcode = '23505';
+  end if;
   return r.result || '{"replayed": true}'::jsonb;
 end $$;
-revoke all on function ops._variation_replay(uuid, text, text) from public;
+revoke all on function ops._variation_replay(uuid, text, text, text, bigint, bigint) from public;
 
 -- ═══════════ 7. まとめての登録 (開く → 子ごとに ops.register_new_sku・JAN は ops.edit_sku_jan → 閉じる。1 つの取引) ═══════════
 /**
@@ -737,6 +744,10 @@ begin
   end if;
   perform ops._require_new_entry_lease('single');   -- 子は新しい単品 = 単品の開放の許可 (ops.register_new_sku も子ごとに見る)
   perform pg_catalog.pg_advisory_xact_lock(core.parent_lock_key());
+  -- 🆕 #1677 Codex R1 High: CSV の鍵 (JAN の ops.edit_sku_jan も同じ取引で取る = 先に) → NE のコードの共有の鍵 (照合の ops.record_ne_codes の排他と並ぶ)。
+  --   鍵の順 = 0065 の共通の順 (親子 → CSV → NE のコード) の後に まとまりのコード → まとまり。コードの確かめ (まとまり・子 = NE の今と前に見たコード) はこの鍵の後で読む・commit まで持つ
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_csv'));
+  perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.ne_codes'));
 
   -- まとまり (コードの鍵 → まとまりの鍵)
   if pg_catalog.jsonb_typeof(v_g) is distinct from 'object' then raise exception 'invalid_input: group が要る' using errcode = '22023'; end if;
@@ -1010,6 +1021,7 @@ create function ops.cancel_variation_child(p_request_id uuid, p_actor_id text, p
 declare
   v_s      record;
   v_prev   jsonb;
+  v_hash   text;
   v_bump   jsonb;
   v_result jsonb;
 begin
@@ -1018,9 +1030,12 @@ begin
     raise exception 'invalid_input: 廃止は人が理由 (200 字まで) を書いてだけ' using errcode = '22023';
   end if;
   perform ops._variation_gate(p_ownership, array['products.parent']);
-  v_prev := ops._variation_replay(p_request_id, 'variation_child_cancel', p_actor_id);
+  v_hash := ops.reg_hash(pg_catalog.jsonb_build_object('op', 'variation_child_cancel', 'sku_id', p_sku_id, 'reason', p_reason));
+  v_prev := ops._variation_replay(p_request_id, 'variation_child_cancel', p_actor_id, v_hash, p_sku_id, null);
   if v_prev is not null then return v_prev; end if;
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || p_sku_id::text, 0));
+  -- 🆕 #1677 Codex R1 High: NE のコードの共有の鍵 (SKU の後・まとまりのコード / まとまりの前) = 「NE に一度も現れていない」を鍵の後に読み、commit まで照合に入れ替えさせない
+  perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.ne_codes'));
   select s.sku_id, s.code, s.code_norm, s.sku_kind, s.product_id, p.parent_product_id, r.state as reg into v_s
     from core.skus s left join core.products p on p.product_id = s.product_id left join ops.master_registrations r on r.sku_id = s.sku_id
    where s.sku_id = p_sku_id and s.company_id = 1;
@@ -1036,8 +1051,7 @@ begin
   if ops.ne_code_seen(v_s.code_norm) then
     raise exception 'seen_in_ne: % は NE に一度でも現れた = 廃止しない (NE にある商品を隠さない)', v_s.code using errcode = 'P0001';
   end if;
-  perform ops._open_variation_write('variation_child_cancel', p_request_id, p_actor_id, p_reason, p_ownership, p_sku_id, '{}'::bigint[],
-    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'variation_child_cancel', 'sku_id', p_sku_id, 'reason', p_reason)),
+  perform ops._open_variation_write('variation_child_cancel', p_request_id, p_actor_id, p_reason, p_ownership, p_sku_id, '{}'::bigint[], v_hash,
     pg_catalog.jsonb_build_object('group_product_id', v_s.parent_product_id::text));
   perform ops._variation_group_resolve(v_s.parent_product_id, p_actor_id, 'load', false);
   perform ops.transition_sku_registration(p_sku_id, 'cancelled', 'human', p_actor_id, p_reason, '{}'::jsonb, p_request_id::text);
@@ -1068,6 +1082,7 @@ declare
   v_opts    jsonb := '[]'::jsonb;   -- 変わる選択肢 [{ option_id, name }]
   e         jsonb;
   v_cur     record;
+  v_hash    text;
   v_bump    jsonb;
   v_result  jsonb;
 begin
@@ -1079,7 +1094,9 @@ begin
     raise exception 'invalid_input: 直す中身は { name, axes: [{ axis, name }], options: [{ axis, code, name }] }' using errcode = '22023';
   end if;
   perform ops._variation_gate(p_ownership, array['products.parent', 'products.name']);
-  v_prev := ops._variation_replay(p_request_id, 'variation_label_edit', p_actor_id);
+  -- 要求のハッシュ = 呼び手の要求そのもの (まとまり・見た revision・直す中身・理由) = 押し直しは同じ値 (#1677 Codex R1 Medium 2)
+  v_hash := ops.reg_hash(pg_catalog.jsonb_build_object('op', 'variation_label_edit', 'group_product_id', p_group_product_id, 'seen_revision', p_seen_revision, 'changes', p_changes, 'reason', p_reason));
+  v_prev := ops._variation_replay(p_request_id, 'variation_label_edit', p_actor_id, v_hash, null, p_group_product_id);
   if v_prev is not null then return v_prev; end if;
   perform ops._variation_lock_existing_group(p_group_product_id);   -- まとまりのコード → まとまり
   select coalesce((select k.code from core.skus k where k.product_id = p.product_id and k.sku_kind = 'single' order by k.sku_id limit 1), p.display_code),
@@ -1135,7 +1152,7 @@ begin
   end if;
   perform ops._open_variation_write('variation_label_edit', p_request_id, p_actor_id, p_reason, p_ownership, null,
     case when v_name is not null then array[p_group_product_id] else '{}'::bigint[] end,
-    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'variation_label_edit', 'group_product_id', p_group_product_id, 'name', v_name, 'axes', v_axes, 'options', v_opts)),
+    v_hash,
     pg_catalog.jsonb_build_object('group_product_id', p_group_product_id::text));
   perform ops._variation_group_resolve(p_group_product_id, p_actor_id, 'load', false);
   perform pg_catalog.set_config('ops.variation_protocol', '1', true);
@@ -1177,15 +1194,20 @@ declare
   v_created  boolean := false;
   v_n        integer;
   v_gname    text;
+  v_hash     text;
   v_bump     jsonb;
   v_result   jsonb;
 begin
   if p_request_id is null or p_sku_id is null then raise exception 'invalid_input: request_id と SKU が要る' using errcode = '22023'; end if;
   if ops.reg_actor_problem(p_actor_id, p_reason) is not null then raise exception 'invalid_input: 人・理由の形が違う' using errcode = '22023'; end if;
   perform ops._variation_gate(p_ownership, array['products.parent', 'products.name']);
-  v_prev := ops._variation_replay(p_request_id, 'parent_adopt_ne', p_actor_id);
+  v_hash := ops.reg_hash(pg_catalog.jsonb_build_object('op', 'parent_adopt_ne', 'sku_id', p_sku_id, 'reason', p_reason));
+  v_prev := ops._variation_replay(p_request_id, 'parent_adopt_ne', p_actor_id, v_hash, p_sku_id, null);
   if v_prev is not null then return v_prev; end if;
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || p_sku_id::text, 0));
+  -- 🆕 #1677 Codex R1 High: SKU → 親子 (排他) → NE のコード (共有) の後に、最新の封のある回・NE の元のコードの印・観測・元の書き方を読む (照合が入れ替える途中の世代を混ぜない・commit まで持つ)
+  perform pg_catalog.pg_advisory_xact_lock(core.parent_lock_key());
+  perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.ne_codes'));
   select s.sku_id, s.code, s.code_norm, s.sku_kind, s.name, s.product_id, p.parent_product_id, r.state as reg into v_s
     from core.skus s left join core.products p on p.product_id = s.product_id left join ops.master_registrations r on r.sku_id = s.sku_id
    where s.sku_id = p_sku_id and s.company_id = 1;
@@ -1218,7 +1240,6 @@ begin
   select c.ne_code into v_rcode from ops.master_ne_codes c where c.code_norm = v_rnorm and c.kind in ('rep', 'product') and c.state = 'ok'
    order by (c.kind = 'rep') desc limit 1;
   if v_rcode is null then raise exception 'ne_parent_spelling: NE の代表 % の元の書き方が確かめられない (0041)', v_rnorm using errcode = 'P0001'; end if;
-  perform pg_catalog.pg_advisory_xact_lock(core.parent_lock_key());
   perform ops.variation_lock_code(v_rnorm);
   -- まとまり: 予約 → 今ある札・単品 → 無ければ作る
   select r.group_product_id into v_gid from ops.variation_group_codes r where r.company_id = 1 and r.code_norm = v_rnorm;
@@ -1239,7 +1260,7 @@ begin
   perform ops.variation_lock_group(v_gid);
   perform ops._open_variation_write('parent_adopt_ne', p_request_id, p_actor_id, p_reason, p_ownership, p_sku_id,
     case when v_created then array[v_s.product_id, v_gid] else array[v_s.product_id] end,
-    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'parent_adopt_ne', 'sku_id', p_sku_id, 'run', v_run, 'rep', v_rcode)),
+    v_hash,
     pg_catalog.jsonb_build_object('group_product_id', v_gid::text));
   perform pg_catalog.set_config('ops.variation_protocol', '1', true);
   if v_created then
@@ -1519,10 +1540,11 @@ begin
   perform ops._new_entry_lease_shared_locks();
   perform ops.reg_write_gate(p -> 'ownership');   -- 段階の共有の鍵 → マスタの書き込みの共有の鍵 → 段階・持ち主表
   -- 同じ request_id = 同じファイル (種類・商品・作る人が違えば拒む)
-  select e.export_id, e.kind, e.created_by, e.state, e.sha256, e.trial into v_prev from ops.ne_reg_exports e where e.request_id = v_rid;
+  select e.export_id, e.kind, e.schema_version, e.header, e.created_by, e.state, e.sha256, e.trial into v_prev from ops.ne_reg_exports e where e.request_id = v_rid;
   if found then
     select pg_catalog.array_agg(distinct (i ->> 'sku_id')::bigint order by (i ->> 'sku_id')::bigint) into v_want from pg_catalog.jsonb_array_elements(p -> 'items') i;
-    if v_prev.kind is distinct from v_kind or v_prev.created_by is distinct from v_actor
+    -- 🆕 0067 (#1677 Codex R1 Medium 1): 形の版と見出しも同じときだけ前のファイル (single-v2 と variation-v1 はどちらも products)
+    if v_prev.kind is distinct from v_kind or v_prev.schema_version is distinct from v_schema or v_prev.header is distinct from v_header or v_prev.created_by is distinct from v_actor
        or v_want is distinct from (select pg_catalog.array_agg(x.sku_id order by x.sku_id) from ops.ne_reg_export_items x where x.export_id = v_prev.export_id) then
       raise exception 'request_id_reused: 同じ番号 (request_id) で違う中身' using errcode = '23505';
     end if;

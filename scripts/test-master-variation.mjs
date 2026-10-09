@@ -516,9 +516,17 @@ await ta('[R1] まとまりの名前 (札)・軸の名前・選択肢名を直�
   assert.equal(noop.no_change, true);
   assert.deepEqual(await counts(), before);
   await failsWith(editorCall('select ops.edit_variation_labels($1::uuid, $2, $3, $4::jsonb, $5::bigint, $6, $7::jsonb) as r', [uuid(), 'naka@test', null, OWN, HAKAMA, rev - 1, '{"name":"新しい袴"}']), /^version_conflict/);
-  const r = await editorCall('select ops.edit_variation_labels($1::uuid, $2, $3, $4::jsonb, $5::bigint, $6, $7::jsonb) as r', [uuid(), 'naka@test', '名前を直す', OWN, HAKAMA, rev,
-    JSON.stringify({ name: '新しい袴', axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-WH', name: 'ホワイト' }] })]);
+  const ridL = uuid();
+  const chL = JSON.stringify({ name: '新しい袴', axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-WH', name: 'ホワイト' }] });
+  const labelSql = 'select ops.edit_variation_labels($1::uuid, $2, $3, $4::jsonb, $5::bigint, $6, $7::jsonb) as r';
+  const r = await editorCall(labelSql, [ridL, 'naka@test', '名前を直す', OWN, HAKAMA, rev, chL]);
   assert.equal(r.revision, rev + 1);
+  // 🆕 #1677 Codex R1 Medium 2: 同じ request_id = 同じ相手・同じ中身だけ前の答え。違う中身・違うまとまり = request_id_reused
+  const again = await editorCall(labelSql, [ridL, 'naka@test', '名前を直す', OWN, HAKAMA, rev, chL]);
+  assert.deepEqual([again.replayed, again.revision], [true, rev + 1]);
+  await failsWith(editorCall(labelSql, [ridL, 'naka@test', '名前を直す', OWN, HAKAMA, rev, JSON.stringify({ name: '別の名前' })]), /^request_id_reused/);
+  await failsWith(editorCall(labelSql, [ridL, 'naka@test', '名前を直す', OWN, GRP1, await revOf(GRP1), chL]), /^request_id_reused/);
+  assert.equal(await revOf(HAKAMA), rev + 1);
   const p = (await outboxOf(HAKAMA)).pop().payload;
   assert.equal(p.revision, rev + 1);
   assert.equal(p.group.name, '新しい袴'); assert.equal(p.group.code, 'Hakama');
@@ -575,7 +583,7 @@ await ta('[P1] products.parent が company = 親を持つ商品は子を持て�
 console.log('\nNE 登録の CSV (まとまりの版 ne-reg-variation-v1)');
 
 const opts = (o = {}) => ({ ownership: ALL_COMPANY, open: true, nowMs: NOW_MS, ...o });
-const build = (codes, o = {}) => asEditor(() => G.buildRegExport(db, { actor: 'boss@test', kind: 'products', codes, requestId: uuid(), variation: o.variation }, opts()));
+const build = (codes, o = {}) => asEditor(() => G.buildRegExport(db, { actor: 'boss@test', kind: 'products', codes, requestId: o.requestId ?? uuid(), variation: o.variation }, opts()));
 await ta('[N1] ポータルで作った札の子 = NE に無いまとまりでも代表商品コード = 予約のコード (打ったとおり)・lib の regMaterialOf = DB の ops.ne_reg_canonical・JAN = empty', async () => {
   const id = await skuIdOf('Hakama-WH-90');
   const canon = (await one('select ops.ne_reg_canonical($1, $2::date) as c', [id, '2030-01-10'])).c;
@@ -619,8 +627,22 @@ await ta('[N2] まとまりで 1 ファイル: 全部の子 = 作れる (版 var
   // 今ある札 (NE にある grp1) の子も variation-v1 で作れる (NE の書き方)・単品の版でも作れる (ポータルの札でない)
   const g = (await q(`select s.code from core.skus s join core.products p on p.product_id = s.product_id join ops.master_registrations r on r.sku_id = s.sku_id
      where p.parent_product_id = $1 and r.state = 'draft' order by s.code`, [GRP1])).map((r) => r.code);
-  const fg = await build(g, { variation: true });
+  const ridF = uuid();
+  const fg = await build(g, { variation: true, requestId: ridF });
   assert.deepEqual((await q('select cells from ops.ne_reg_export_rows where export_id = $1 order by row_no', [fg.export.export_id])).map((r) => r.cells[7]), g.map(() => 'grp1'));
+  // 🆕 #1677 Codex R1 Medium 1: 同じ request_id で違う版 (single-v2) = 前のファイルを返さない (lib も DB も request_id_reused)・同じ版 = 前のファイル
+  assert.equal((await build(g, { variation: true, requestId: ridF })).replayed, true);
+  const eV = await errOf(build(g, { requestId: ridF }));
+  assert.equal(eV?.reason, 'request_id_reused', eV?.message);
+  const mats = [];
+  for (const c of g) mats.push((await one('select ops.ne_reg_canonical($1, $2::date) as c', [await skuIdOf(c), '2030-01-10'])).c);
+  const mark = (await one('select compare_run_id from ops.master_ne_code_mark')).compare_run_id;
+  const rowsV = mats.map((m) => m.cells[0]);
+  const payloadV = JSON.stringify({ request_id: ridF, actor: 'boss@test', ownership: ALL_COMPANY, kind: 'products', schema_version: 'ne-reg-single-v2', header: G.REG_SCHEMAS.products.header.join(','),
+    ne_codes_run: mark, cost_day: '2030-01-10', items: g.map((c, i) => ({ sku_id: null, expected: mats[i].expected, rows: [rowsV[i]] })) });
+  const ids = []; for (const c of g) ids.push(await skuIdOf(c));
+  const payloadV2 = JSON.parse(payloadV); payloadV2.items.forEach((it, i) => { it.sku_id = ids[i]; });
+  await failsWith(asEditor(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [JSON.stringify(payloadV2), G.buildRegCsv(G.REG_SCHEMAS.products, rowsV).bytes])), /^request_id_reused/);
   await asEditor(() => G.supersedeRegExport(db, { actor: 'boss@test', exportId: fg.export.export_id, reason: '試験', correction: 'NE には取り込んでいない', confirm: true }, opts()));
   // lib の形の版の決まり = DB (variation-v1 は作れる版)
   assert.deepEqual((await one(`select ops.ne_reg_schema_rule('ne-reg-variation-v1') as r`)).r, { kind: 'products', sku_kind: 'single', header: G.REG_VARIATION_SCHEMA.header.join(','),
@@ -632,8 +654,15 @@ console.log('\n子の廃止');
 await ta('[C1] 子の廃止: 下書きの子 → cancelled・revision + 1・スナップショットの廃止した子に移る・コードは使い回さない・まとまりやほかの子は変えない', async () => {
   const rev = await revOf(HAKAMA);
   const sid = await skuIdOf('Hakama-WH-95');
-  const r = await editorCall('select ops.cancel_variation_child($1::uuid, $2, $3, $4::jsonb, $5::bigint) as r', [uuid(), 'naka@test', 'NE が受けなかった', OWN, sid]);
+  const ridC = uuid();
+  const cancelSql = 'select ops.cancel_variation_child($1::uuid, $2, $3, $4::jsonb, $5::bigint) as r';
+  const r = await editorCall(cancelSql, [ridC, 'naka@test', 'NE が受けなかった', OWN, sid]);
   assert.deepEqual([r.state, r.revision], ['cancelled', rev + 1]);
+  // 🆕 #1677 Codex R1 Medium 2: 同じ request_id = 同じ子・同じ理由だけ前の答え。違う子・違う理由 = request_id_reused
+  assert.deepEqual((await editorCall(cancelSql, [ridC, 'naka@test', 'NE が受けなかった', OWN, sid])).replayed, true);
+  await failsWith(editorCall(cancelSql, [ridC, 'naka@test', 'NE が受けなかった', OWN, await skuIdOf('Hakama-BK-90')]), /^request_id_reused/);
+  await failsWith(editorCall(cancelSql, [ridC, 'naka@test', '違う理由', OWN, sid]), /^request_id_reused/);
+  assert.equal((await one('select state from ops.master_registrations where sku_id = $1', [await skuIdOf('Hakama-BK-90')])).state, 'draft');
   assert.equal((await one('select state from ops.master_registrations where sku_id = $1', [sid])).state, 'cancelled');
   const p = (await outboxOf(HAKAMA)).pop().payload;
   assert.equal(O.groupSnapshotShapeProblem(p), null);
@@ -721,10 +750,14 @@ await ta('[A1] NE で直接作られた商品 (quarantined・親なし) が照�
   const w = (await asRole('watch_writer', () => pg.query('select ops.record_ne_registration_observations($1::jsonb) as r', [JSON.stringify({ compare_run_id: RUN2,
     fetch: { generation_id: 'gen_q', products_rev: '1', sets_rev: '1', raw_hash: 'c'.repeat(64) }, products_at: new Date().toISOString(), sets_at: new Date().toISOString(), absence_trusted: true, observations })]))).rows[0].r;
   await asRole('watch_writer', () => pg.query('select ops.seal_ne_registration_run($1, $2, $3)', [RUN2, w.observation_hash, 'e'.repeat(64)]));
-  const adopt = (code) => skuIdOf(code).then((id) => editorCall('select ops.adopt_ne_parent_for_quarantined($1::uuid, $2, $3, $4::jsonb, $5::bigint) as r', [uuid(), 'naka@test', 'NE から', OWN, id]));
+  const adopt = (code, rid = uuid()) => skuIdOf(code).then((id) => editorCall('select ops.adopt_ne_parent_for_quarantined($1::uuid, $2, $3, $4::jsonb, $5::bigint) as r', [rid, 'naka@test', 'NE から', OWN, id]));
   // 今ある札 (grp1)
   const revG = await revOf(GRP1);
-  const a1 = await adopt('q001');
+  const ridA = uuid();
+  const a1 = await adopt('q001', ridA);
+  // 🆕 #1677 Codex R1 Medium 2: 同じ request_id で同じ SKU = 前の答え・違う SKU = request_id_reused (q002 は採用されない)
+  assert.equal((await adopt('q001', ridA)).replayed, true);
+  await failsWith(adopt('q002', ridA), /^request_id_reused/);
   assert.deepEqual([a1.group_product_id, a1.group_created, a1.revision, a1.compare_run_id], [GRP1, false, revG + 1, RUN2]);
   const p1 = (await outboxOf(GRP1)).pop().payload;
   assert.ok(p1.children.some((c) => c.code === 'q001' && JSON.stringify(c.choices) === '{}'));
@@ -826,8 +859,13 @@ await ta('[S2] 本文の差: 0067 が置き換えた関数は前の最後の版�
         "where g.company_id = 1 and g.code_norm = v_par and g.group_product_id = s.parent_product_id and g.source = 'portal';",
         "if coalesce(v_par, '') <> '' and v_pr.state is null and v_portal is not null then v_parc := v_portal;",
         "elsif coalesce(v_par, '') = '' or v_pr.state is distinct from 'ok' then v_blk := v_blk || '代表 (親) の NE の書き方が確かめられない'::text;"] },
-    'ops.ne_reg_build': { base: '0065_ne_reg_csv_versions.sql', removed: [],
+    'ops.ne_reg_build': { base: '0065_ne_reg_csv_versions.sql',
+      removed: ['select e.export_id, e.kind, e.created_by, e.state, e.sha256, e.trial into v_prev from ops.ne_reg_exports e where e.request_id = v_rid;',
+        'if v_prev.kind is distinct from v_kind or v_prev.created_by is distinct from v_actor'],
       added: ['v_vpar     bigint;   -- 🆕 0067: 品目の親', 'v_group    bigint;   -- 🆕 0067: まとまりの版のまとまり', 'v_left     text;     -- 🆕 0067: まとまりの NE 登録待ちの子でファイルに入っていないもの',
+        'select e.export_id, e.kind, e.schema_version, e.header, e.created_by, e.state, e.sha256, e.trial into v_prev from ops.ne_reg_exports e where e.request_id = v_rid;',
+        '-- 🆕 0067 (#1677 Codex R1 Medium 1): 形の版と見出しも同じときだけ前のファイル (single-v2 と variation-v1 はどちらも products)',
+        'if v_prev.kind is distinct from v_kind or v_prev.schema_version is distinct from v_schema or v_prev.header is distinct from v_header or v_prev.created_by is distinct from v_actor',
         '-- 🆕 0067: 代表の列の版の決まり (まとまりの版 = 全部が同じまとまりの子 / 単品の版 = ポータルで作ったまとまりの子は入れない)',
         'select pp.parent_product_id into v_vpar from core.products pp where pp.product_id = v_sku.product_id;',
         "if (v_rule ->> 'parent') = 'group' then",

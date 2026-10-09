@@ -2415,7 +2415,9 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   - `ops.cancel_variation_child` (下書き / NE 登録待ち・生きているファイルなし・NE に一度も現れていない子だけ)・`ops.edit_variation_labels` (札の名前・軸の名前・選択肢名・見た revision)・
     `ops.adopt_ne_parent_for_quarantined` (最新の封のある照合の回 = NE の元のコードの印の回の観測から・1 回だけ)
   - 確かめ: `ops.variation_group_code_problem(code)`・`ops.variation_parent_company()`・`ops.variation_max_children()` (= 20)
-  - 鍵の順 = request → 許可 (共有) → 段階 → マスタの書き込み → (SKU) → 親子 (排他) → まとまりのコード → まとまり → 子のコード (norm の順)。本物の PG で、同時に同じまとまりに足す・名前を直す・子の廃止・CSV を作る・照合の確かめ・夜間ロードの排他と並べて試験 (`scripts/test-master-variation-pg.mjs`)
+  - 鍵の順 = request → 許可 (共有) → 段階 → マスタの書き込み → (SKU) → 親子 (排他) → (まとめての登録だけ CSV (排他) = JAN の ops.edit_sku_jan より先) → **NE のコード (共有)** → まとまりのコード → まとまり → 子のコード (norm の順)。
+    NE のコードの共有の鍵 (#1677 Codex R1 High) = まとめての登録・子の廃止・代表の採用は、コードの確かめ (NE の今と前に見たコード)・印の回・封・観測・元の書き方を鍵の後に読み、commit まで照合の `ops.record_ne_codes` (排他) に入れ替えさせない。
+    同じ request_id の押し直し = 同じ操作・人・要求のハッシュ・相手 (SKU / まとまり) のときだけ前の答え (違えば `request_id_reused`)。NE 登録の CSV の押し直しも形の版と見出しまで同じときだけ (single-v2 と variation-v1 を取り違えない)。本物の PG で、同時に同じまとまりに足す・名前を直す・子の廃止・CSV を作る・照合の確かめ・夜間ロードの排他と並べて試験 (`scripts/test-master-variation-pg.mjs`)
 - **NE 登録の CSV** (`ne-reg-variation-v1` を作れる版に): `ops.ne_reg_canonical` (0065 から代表の列だけ: NE に無い = ポータルで作った札 (予約 portal) なら予約のコード)・
   `ops.ne_reg_build` (0065 から: まとまりの版 = 全部同じまとまりの子・NE 登録待ちの子を全部 (`variation_incomplete`)・単品の版にポータルの札の子は入れない (`variation_file_required`))。lib は `buildRegExport({ variation: true })`・`regMaterialOf` の `portalGroup`
 - **照合 ② の確かめ待ち** (`ops.v_ne_reg_targets`): company のとき、親の無い quarantined の単品 (まだ採用していない) を足す = 翌朝の照合が NE の観測を残す = 代表の採用の根拠 (miniPC のコードは変えない)

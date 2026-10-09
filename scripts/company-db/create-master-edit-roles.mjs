@@ -175,7 +175,7 @@ export const VARIATION_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.variation_labe
   'ops.guard_variation_write()', 'ops.check_variation_batch_closed()', 'core.check_parent_one_level()', 'ops.variation_existing_groups()', 'ops.variation_reservation_check()',
   'ops.reserve_existing_variation_groups(text)', 'ops._variation_group_resolve(bigint, text, text, boolean)', 'ops._variation_lock_existing_group(bigint)',
   'ops.variation_group_snapshot(bigint, integer, text)', 'ops._variation_bump(bigint, uuid, text)',
-  'ops._open_variation_write(text, uuid, text, text, jsonb, bigint, bigint[], text, jsonb)', 'ops._variation_replay(uuid, text, text)']);
+  'ops._open_variation_write(text, uuid, text, text, jsonb, bigint, bigint[], text, jsonb)', 'ops._variation_replay(uuid, text, text, text, bigint, bigint)']);
 /** 🆕 0067: 画面のロールが読むまとまりの表 (書き込みは関数だけ)。無い DB では付けない */
 export const VARIATION_SELECT = Object.freeze(['ops.variation_group_codes', 'core.variation_axes', 'core.variation_options', 'core.sku_variation_choices',
   'ops.variation_group_revisions', 'ops.variation_batches', 'ops.variation_parent_adoptions']);
