@@ -31,7 +31,7 @@ import { OWNED_COLUMNS } from '../config/master-ownership.mjs';
 import { forceNewOpen, seedParentGate, hex, ZERO_GATE } from './fixtures/master-widen.mjs';
 import { seedActiveEpoch } from './fixtures/master-epoch.mjs';
 import { nModelOf, resolutionsFor, decisionPrint, PARENT_SEMANTIC_SUFFIX } from '../apps/company-db/master-compare/compare-ne.mjs';
-import { parentObservations, recordParentGate, parentTrouble, parentNote, readParentCounts, PARENT_COUNT_KEYS } from '../apps/company-db/master-compare/parent-gate.mjs';
+import { parentObservations, recordParentGate, parentTrouble, parentNote, readParentCounts, repSpellingsOf, PARENT_COUNT_KEYS } from '../apps/company-db/master-compare/parent-gate.mjs';
 import { summaryLine, runCompare } from '../apps/company-db/master-compare/run.mjs';
 import { driftList, formatDriftList, parseArgs } from '../apps/company-db/master-compare/drift-list.mjs';
 import { jstDateStr } from '../lib/jst-date.js';
@@ -89,7 +89,7 @@ async function setupDb(codes) {
   return { pg, db, q, one, tx, pidOf, tag, setParent, setReg, mkItem, step, itemPath };
 }
 const errOf = async (p) => { try { await p; } catch (e) { return e; } return null; };
-const obsOf = (rows, { untrusted = [], complete = true } = {}) => ({ format: 'parent-obs-v1', complete, untrusted, rows });
+const obsOf = (rows, { untrusted = [], complete = true, repSpellings = { state: 'ok' } } = {}) => ({ format: 'parent-obs-v1', complete, untrusted, rep_spellings: repSpellings, rows });
 const S = (code, rep = null, raw = rep) => [code, 'single', 'ok', rep, rep == null ? null : raw];
 const SET = (code) => [code, 'set', null, null, null];
 const gate = async (E, obs, detail = true) => (await E.one('select ops.parent_raw_gate(1, $1::jsonb, $2) as r', [JSON.stringify(obs), detail])).r;
@@ -318,7 +318,7 @@ await ta('[P7] JS: 観測 (nModelOf → parentObservations)・選べる解決・
     sets: [{ parent: 's01', name: 's', child: 'a01', price_src: '1', qty_src: '1' }] };
   const { m, collided } = nModelOf(ne);
   const obs = parentObservations(m, { untrusted: [...collided], complete: true });
-  assert.deepEqual(obs, { format: 'parent-obs-v1', complete: true, untrusted: ['x1'], rep_collided: [], rows: [
+  assert.deepEqual(obs, { format: 'parent-obs-v1', complete: true, untrusted: ['x1'], rep_collided: [], rep_spellings: { state: 'unavailable', reason: 'not_read' }, rows: [
     ['a01', 'single', 'ok', 'grpa', 'GrpA'], ['a02', 'single', 'ok', null, null], ['a03', 'single', 'ok', null, null], ['a04', 'single', 'unknown', null, null],
     ['a05', 'single', 'ok', 'grpa', 'grpa'], ['s01', 'set', null, null, null], ['x1', 'single', 'ok', null, null]] });
   // 長すぎるコード・代表 = 送らない / 比べられない
@@ -412,7 +412,7 @@ await ta('[P9] drift-list (読むだけ): 照合と同じ読み方の NE で 6 �
     ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
   const prod = (code, rep) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1', rep, rep_src: JSON.stringify(rep ?? '') });
   const ne = { hasSrc: true, meta: { ne_api_products_complete_at: '2030-01-01 00:00:00', ne_api_setproducts_complete_at: '2030-01-01 00:00:00', ...integ },
-    products: [prod('m01', 'grpA'), prod('m02', 'grpA'), prod('m03', null), prod('d10', 'grpB')], sets: [] };
+    products: [prod('m01', 'grpA'), prod('m02', 'grpA'), prod('m03', null), prod('d10', 'grpB')], sets: [], spellings: { ok: true, rows: [] } };
   const n0 = (await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n;
   const r = await driftList({ ne, db: E.db });
   const cls = Object.fromEntries(r.items.map((x) => [x.code, `${x.class}${x.reason ? `:${x.reason}` : ''}`]));
@@ -489,7 +489,7 @@ await ta('[P11] (#1676 Codex R1 High) 本番の保存の形 = 代表は小文字
   const stored = (code, original) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1',
     rep: original == null ? '' : String(original).toLowerCase(), rep_src: JSON.stringify(original ?? '') });
   const neOf = (products, spellings) => ({ hasSrc: true, meta: { ne_api_products_complete_at: '2030-01-01 00:00:00', ne_api_setproducts_complete_at: '2030-01-01 00:00:00', ...integ },
-    products, sets: [], ...(spellings ? { spellings } : {}) });
+    products, sets: [], spellings: spellings || { ok: true, rows: [] } });
   // m01・m02 は社内の親 grpA (一致の形)。NE の代表の元の書き方が grpA と GRPA = 衝突 = 曖昧 (どちらの名札か決められない)
   const r = await driftList({ ne: neOf([stored('m01', 'grpA'), stored('m02', 'GRPA')]), db: E.db });
   const cls = Object.fromEntries(r.items.map((x) => [x.code, `${x.class}:${x.reason}`]));
@@ -527,6 +527,64 @@ await ta('[P12] (#1676 Codex R1 Medium) 持ち主が company で記録も重い�
   assert.equal(parentNote({ parent_gate: b }), null, '持ち主が分からない朝に「持ち主は夜間ロード」と言わない');
   // 書く接続が無く読み直しもできない朝も同じ (持ち主が分からない = ⚠️)
   assert.match(parentTrouble({ parent_gate: { state: 'not_configured' } }), /持ち主が分からない/);
+});
+
+await ta('[P13] (#1676 Codex R2 High) 書き方の台帳 (raw_ne_code_spellings) を読めない回 = 代表の数えを記録しない (SQL も断る)・drift-list も止まる / 商品コードが空で落ちた行にだけ別の書き方がある形: 台帳を読めた回 = 曖昧・読めない回 = 0 件の記録を作らない = 門は閉じたまま / 照合そのものは止めない (load = ℹ️・company = ⚠️)', async () => {
+  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dropped_no_code: 1 }),
+    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
+  const stored = (code, original) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1',
+    rep: String(original).toLowerCase(), rep_src: JSON.stringify(original) });
+  // 保存した行は m01 → grpA と m02 → grpA だけ。商品コードが空で落ちた行の代表 GRPA は書き方の台帳 (代表の名前空間) にだけある
+  const neOf = (spellings) => ({ hasSrc: true, meta: { ne_api_products_complete_at: '2030-01-01 00:00:00', ne_api_setproducts_complete_at: '2030-01-01 00:00:00', ...integ },
+    products: [stored('m01', 'grpA'), stored('m02', 'grpA')], sets: [], spellings });
+  const collected = { ok: true, rows: [{ kind: 'rep', code_norm: 'grpa', spellings: JSON.stringify(['GRPA', 'grpA']) }] };
+  const ok = await driftList({ ne: neOf(collected), db: E.db });
+  assert.equal(Object.fromEntries(ok.items.map((x) => [x.code, x.reason])).m01, 'ne_rep_spellings', '台帳を読めた回 = 曖昧');
+  for (const sp of [{ ok: false, reason: 'not_collected' }, { ok: false, reason: 'rows_mismatch' }, { ok: false, reason: 'unknown_version' }, undefined]) {
+    await assert.rejects(driftList({ ne: neOf(sp), db: E.db }), /NE のコードの元の書き方 \(代表\) を読めない/, JSON.stringify(sp));
+  }
+  // 照合 ② の観測 (compare-ne と同じ部品): 台帳を読めない = 信頼の状態 unavailable + 理由
+  const { m } = nModelOf(neOf(undefined));
+  const bad = parentObservations(m, { repSpellings: repSpellingsOf({ ok: false, reason: 'not_collected' }) });
+  assert.deepEqual([bad.rep_spellings, bad.rep_collided], [{ state: 'unavailable', reason: 'not_collected' }, []]);
+  const good = parentObservations(m, { repSpellings: repSpellingsOf({ ok: true, entries: [{ kind: 'rep', state: 'collided', code_norm: 'grpa' }, { kind: 'product', state: 'collided', code_norm: 'm09' }] }) });
+  assert.deepEqual([good.rep_spellings, good.rep_collided], [{ state: 'ok' }, ['grpa']]);
+  // SQL: 生の数えは台帳の状態を持つ観測だけ受ける・記録は「読めた」回だけ (読めない回は 0 件の記録を作らない)
+  await assert.rejects(gate(E, { ...NE1, rep_spellings: undefined }), /invalid_input: rep_spellings/);
+  await assert.rejects(gate(E, { ...NE1, rep_spellings: { state: 'maybe' } }), /invalid_input: rep_spellings/);
+  const n0 = (await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n;
+  await assert.rejects(E.q('select ops.record_parent_gate($1, $2::jsonb, $3, $4, $5::jsonb)', [runId(), JSON.stringify(FETCH()), 'mat_x', hex('d'), JSON.stringify(bad)]),
+    /spellings_unavailable: NE のコードの元の書き方 \(代表\) を読めない回 \(not_collected\)/);
+  // 照合の部品 (recordParentGate) は記録を呼ばない = 状態 no_spellings・読むだけの数え (持ち主) は出す
+  const r = await recordParentGate(async () => E.db, { compareRunId: runId(), parentObs: { obs: bad, fetch: FETCH(), material_generation_id: 'mat_x' }, evidenceSha256: hex('e'), readDb: E.db });
+  assert.deepEqual([r.state, r.reason, r.owner], ['no_spellings', 'not_collected', 'load']);
+  assert.equal((await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n, n0, '記録は作らない');
+  // 朝の要約: load = 照合は止めない・ℹ️ (CSV は閉じない) / company = ⚠️ 閉じたまま
+  assert.match(parentNote({ parent_gate: r }), /^ℹ️ 代表 \(親\) の数えを記録できない \(NE のコードの元の書き方 \(代表\) を読めない: not_collected・持ち主は夜間ロード = CSV は閉じない\)$/);
+  assert.match(parentTrouble({ parent_gate: { ...r, owner: 'company' } }), /代表 \(親\) の数えを記録できない \(NE のコードの元の書き方 \(代表\) を読めない: not_collected\).* → 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+  // 照合の実行口: 台帳を読めない回も照合は最後まで走る (証跡・全件 JSON・要約)・記録は作らない
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vg6-pgate-sp-'));
+  try {
+    const neStub = () => ({ result: { format: 'mc-ne-v1', verdict: 'pass', counts: { items: 0, held: 0 } }, pendingEntries: null, decisionsDone: [], baselineWrites: [], neCodes: null, regObs: null,
+      parentObs: { obs: bad, fetch: FETCH(), material_generation_id: 'mat_x' } });
+    const x = await runCompare({ db: E.db, writerDb: E.db, dataDir: tmp, asOf: jstDateStr(new Date()), compare: async () => ({ verdict: 'pass', counts: { compared: {} }, load: { ingest_run_id: 'L1' } }),
+      neCompare: neStub, oldCompare: null, write: () => true });
+    assert.equal(x.evidence.state, 'complete');
+    assert.equal(x.result.ne.parent_gate.state, 'no_spellings');
+    assert.match(x.line, /^⚠️ 代表 \(親\) が NE とずれた単品 .* \/ ✅ マスタ照合 ①.* \/ ℹ️ 代表 \(親\) の数えを記録できない \(NE のコードの元の書き方 \(代表\) を読めない: not_collected/);
+    assert.equal((await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n, n0);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  // company の DB: 台帳を読めない朝 = 一番新しい記録が作られない = 今の許可の回と違う = 新しい CSV は閉じたまま
+  const G = await setupDb(['k01', 'k02']);
+  await G.setReg('k02', 'draft');
+  await seedActiveEpoch(G.db, COMPANY);
+  const run = runId();
+  await G.q('select ops.close_new_entry_for_compare($1)', [run]);
+  await G.q('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', [run, nowRfc(), JSON.stringify(ZERO_GATE)]);
+  const gr = await recordParentGate(async () => G.db, { compareRunId: run, parentObs: { obs: { ...bad, rows: [S('k01'), S('k02')] }, fetch: FETCH(), material_generation_id: 'mat_x' }, evidenceSha256: hex('e'), readDb: G.db });
+  assert.deepEqual([gr.state, gr.owner, gr.gate.open], ['no_spellings', 'company', false]);
+  assert.match((await errOf(G.mkItem('k02')))?.message ?? '', /parent_gate_closed: .*no_parent_gate_result/);
+  await G.pg.close();
 });
 
 await E.pg.close();

@@ -94,7 +94,7 @@ export async function seedParentGate(db, { runId, obs = null, materialGeneration
     const rows = (await db.query(`select k.code_norm, k.sku_kind, nullif(core.norm_code(pp.display_code), '') as rep, pp.display_code as raw
         from core.skus k left join core.products p on p.product_id = k.product_id left join core.products pp on pp.product_id = p.parent_product_id
        where k.company_id = 1 and k.sku_kind in ('single', 'set') order by k.code_norm`)).rows;
-    return { format: 'parent-obs-v1', complete: true, untrusted: [],
+    return { format: 'parent-obs-v1', complete: true, untrusted: [], rep_spellings: { state: 'ok' },
       rows: rows.map((r) => (r.sku_kind === 'set' ? [r.code_norm, 'set', null, null, null] : [r.code_norm, 'single', 'ok', r.rep ?? null, r.rep ? r.raw : null])) };
   };
   const when = at || new Date(Date.now() - 1000).toISOString();

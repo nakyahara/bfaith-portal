@@ -18,7 +18,7 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { readNeSide, nModelOf, neIntegrity, resolveNeCodes } from './compare-ne.mjs';
-import { parentObservations, readParentCounts, repCollisionsOf, PARENT_COUNT_KEYS, PARENT_COUNT_JA } from './parent-gate.mjs';
+import { parentObservations, readParentCounts, repSpellingsOf, PARENT_COUNT_KEYS, PARENT_COUNT_JA } from './parent-gate.mjs';
 
 /**
  * 一覧を作る (読むだけ)。ne = readNeSide の結果・db = watcher の接続 ({ query })。
@@ -35,7 +35,10 @@ export async function driftList({ ne, db }) {
     throw new Error('Company DB に ops.parent_raw_gate が無い (0068 の前)');
   }
   const { m: nm, collided } = nModelOf(ne);
-  const obs = parentObservations(nm, { untrusted: [...collided, ...integ.intBlocked.keys()], complete: !integ.absenceUntrusted, repCollided: repCollisionsOf(resolveNeCodes(ne.spellings)) });
+  // 🆕 #1676 Codex R2 High: 代表の名前空間の書き方の台帳を読めない = 数えない (空 = 「衝突なし」と読まない)
+  const sp = repSpellingsOf(resolveNeCodes(ne.spellings));
+  if (sp.state !== 'ok') throw new Error(`NE のコードの元の書き方 (代表) を読めない (${sp.reason}) = 数えない (書き方の衝突を見落とす。NE の取得の後に集め終えた印を確かめる)`);
+  const obs = parentObservations(nm, { untrusted: [...collided, ...integ.intBlocked.keys()], complete: !integ.absenceUntrusted, repSpellings: sp });
   const r = await readParentCounts(db, obs, { detail: true });
   return { ne_fetch: { products_complete_at: M.ne_api_products_complete_at, setproducts_complete_at: M.ne_api_setproducts_complete_at,
     rows_dropped: integ.absenceUntrusted }, ...r };

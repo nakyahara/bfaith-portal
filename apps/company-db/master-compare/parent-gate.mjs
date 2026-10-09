@@ -32,9 +32,11 @@ export function fetchTimeRfc3339(t) {
  *   untrusted = 正規化の衝突・取込の整合で保持した商品 (DB は「比べられない」に数える)・complete = 行が落ちていない取得
  *   rep_collided = 🆕 #1676 Codex R1 High: NE のコードの元の書き方 (raw_ne_code_spellings の代表の名前空間) で書き方が 2 つ以上の代表 (DB は「曖昧」に数える)。
  *     代表の原文 (rows の 5 つめ) は compare-ne の repRawOf = 代表商品コード_src から戻した元の書き方 (保存の値は小文字)
+ *   rep_spellings = 🆕 #1676 Codex R2 High: その台帳を読めたか ({ state: 'ok' } / { state: 'unavailable', reason })。読めない回の rep_collided の空は「衝突なし」ではない
+ *     = 照合は記録しない (DB の ops.record_parent_gate も断る)・drift-list は止まる。渡されない = 読めない (not_read) に倒す
  *   🚨 長すぎるコード (200 字超) は送らない (= DB では「取得に無い」= 比べられない)・長すぎる代表は unknown (比べられない)
  */
-export function parentObservations(nm, { untrusted = [], complete = false, repCollided = [] } = {}) {
+export function parentObservations(nm, { untrusted = [], complete = false, repSpellings = { state: 'unavailable', reason: 'not_read', collided: [] } } = {}) {
   const rows = [];
   for (const [norm, n] of [...nm].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
     if (!norm || norm.length > MAX_CODE) continue;
@@ -46,13 +48,19 @@ export function parentObservations(nm, { untrusted = [], complete = false, repCo
     rows.push([norm, 'single', ok ? 'ok' : 'unknown', rep, raw]);
   }
   const u = [...new Set([...untrusted].filter((x) => typeof x === 'string' && x && x.length <= MAX_CODE))].sort();
-  const rc = [...new Set([...repCollided].filter((x) => typeof x === 'string' && x && x.length <= MAX_CODE))].sort();
-  return { format: PARENT_OBS_FORMAT, complete: !!complete, untrusted: u, rep_collided: rc, rows };
+  const okSp = !!repSpellings && repSpellings.state === 'ok';
+  const rc = okSp ? [...new Set([...(repSpellings.collided || [])].filter((x) => typeof x === 'string' && x && x.length <= MAX_CODE))].sort() : [];
+  const sp = okSp ? { state: 'ok' } : { state: 'unavailable', reason: String((repSpellings && repSpellings.reason) || 'not_read').slice(0, 100) };
+  return { format: PARENT_OBS_FORMAT, complete: !!complete, untrusted: u, rep_collided: rc, rep_spellings: sp, rows };
 }
 
-/** compare-ne の resolveNeCodes の答え → 代表の名前空間で書き方が 2 つ以上の norm (読めない回 = 空 = rows の原文だけで見る) */
-export function repCollisionsOf(neCodes) {
-  return neCodes && neCodes.ok ? neCodes.entries.filter((e) => e.kind === 'rep' && e.state === 'collided').map((e) => e.code_norm) : [];
+/**
+ * compare-ne の resolveNeCodes の答え → 代表の名前空間の書き方の台帳の状態 (#1676 Codex R2 High)。
+ *   読めた = { state: 'ok', collided: [書き方が 2 つ以上の代表の norm] } / 読めない (未収集・行の数が違う・知らない版 ほか) = { state: 'unavailable', reason }
+ */
+export function repSpellingsOf(neCodes) {
+  if (!neCodes || !neCodes.ok) return { state: 'unavailable', reason: (neCodes && neCodes.reason) || 'not_read', collided: [] };
+  return { state: 'ok', collided: neCodes.entries.filter((e) => e.kind === 'rep' && e.state === 'collided').map((e) => e.code_norm) };
 }
 
 const msg = (e) => String((e && e.message) || e).replace(/\s+/g, ' ').slice(0, 200);
@@ -85,6 +93,9 @@ const ownerOf = (g) => (g && typeof g.enforced === 'boolean' ? (g.enforced ? 'co
  */
 export async function recordParentGate(getWriter, { compareRunId, parentObs, evidenceSha256, readDb = null }) {
   if (!parentObs || !parentObs.obs) return { state: 'no_obs' };
+  // 🆕 #1676 Codex R2 High: 書き方の台帳を読めない回 = 記録しない (0 件の記録で門・widen を開けない = 一番新しい記録は前の回のまま = company なら閉じたまま)。照合そのものは止めない
+  const sp = parentObs.obs.rep_spellings;
+  const spOk = !!sp && sp.state === 'ok';
   const withCounts = async (out) => {
     if (!readDb || out.state === 'not_applied') return out;
     // 門の状態 (持ち主) を先に別に読む = 重い数えの読み直しが落ちても「持ち主は夜間ロード」と取り違えない (#1676 Codex R1 Medium)
@@ -95,6 +106,10 @@ export async function recordParentGate(getWriter, { compareRunId, parentObs, evi
   const f = parentObs.fetch || {};
   if (!parentObs.material_generation_id || !f.generation_id || !f.raw_hash || !f.products_complete_at || !f.setproducts_complete_at) {
     return withCounts({ state: 'no_fetch' });
+  }
+  if (!spOk) {
+    if (readDb) { try { if (!(await readDb.query(FN_RECORD)).rows[0].ok) return { state: 'not_applied' }; } catch { /* 有無が分からない = 記録しないことは同じ */ } }
+    return withCounts({ state: 'no_spellings', reason: (sp && sp.reason) || 'not_read' });
   }
   if (!getWriter) {
     if (!readDb) return { state: 'not_configured' };
@@ -120,7 +135,8 @@ const codesOf = (samples) => {
   for (const k of PARENT_COUNT_KEYS) for (const c of (samples && Array.isArray(samples[k]) ? samples[k] : [])) all.push(c);
   return all.length ? `: ${all.slice(0, 5).join(', ')}${all.length > 5 ? ' ほか' : ''}` : '';
 };
-const STATE_JA = { not_configured: '書く接続が無い (COMPANY_DB_WATCH_WRITER_URL)', failed: '書けない', no_fetch: '取得の世代・時刻・材料の世代が無い' };
+const STATE_JA = { not_configured: '書く接続が無い (COMPANY_DB_WATCH_WRITER_URL)', failed: '書けない', no_fetch: '取得の世代・時刻・材料の世代が無い',
+  no_spellings: 'NE のコードの元の書き方 (代表) を読めない' };
 
 /**
  * 代表の持ち主が company (DB の active) = 門が閉じる側 (記録 / 読み直しの答えの owner・門の状態)。
@@ -134,7 +150,7 @@ export function parentEnforced(ne) {
 }
 const ownerKnown = (p) => p.owner === 'load' || p.owner === 'company' || (!!p.gate && typeof p.gate.enforced === 'boolean');
 const CLOSED_JA = '新しい NE 登録の CSV (作る・配る) は閉じた (夜間ロードは済んだ・配ったファイルの申告・照合・取り込めなかった商品だけの作り直し・廃止はできる)';
-const recordWhy = (p) => `${STATE_JA[p.state] || p.state}${p.error ? `: ${String(p.error).slice(0, 80)}` : ''}`;
+const recordWhy = (p) => `${STATE_JA[p.state] || p.state}${p.error ? `: ${String(p.error).slice(0, 80)}` : p.reason ? `: ${String(p.reason).slice(0, 80)}` : ''}`;
 
 /**
  * 朝の要約に ⚠️ で出す代表 (親) の知らせ (問題なし = null。run.mjs の summaryLine が先頭が ⚠️ になるように置く)。

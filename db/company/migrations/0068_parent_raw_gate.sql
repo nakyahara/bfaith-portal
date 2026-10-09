@@ -64,6 +64,8 @@ revoke all on function ops.parent_structure_counts(integer) from public;
  * p_ne = 照合 ② が NE の完全な取得から作った観測 (apps/company-db/master-compare/parent-gate.mjs の parentObservations):
  *   { format: 'parent-obs-v1', complete: boolean (行が落ちていない取得), untrusted: [code_norm] (正規化の衝突・取込の整合で保持した商品),
  *     rep_collided (任意): [代表の norm] (NE のコードの元の書き方 = raw_ne_code_spellings の代表の名前空間で書き方が 2 つ以上 = 曖昧。#1676 Codex R1 High),
+ *     rep_spellings: { state: 'ok' } / { state: 'unavailable', reason } (その台帳を読めたか。読めない回の rep_collided の空は「衝突なし」ではない =
+ *       ops.record_parent_gate は記録しない (spellings_unavailable)。#1676 Codex R2 High),
  *     rows: [[code_norm, kind ('single' | 'set'), rep_state ('ok' | 'unknown'), rep_norm (親なし = null), rep_raw (代表の元の書き方 = 代表商品コード_src から)]] (セットは後ろの 3 つが null) }
  * 数える対象 (判定表・上の行から): 単品 (sku_kind = single) だけ (セット・例外は外す = excluded)。
  *   品目の最新が partial = 数える / 登録 cancelled = 外す / quarantined = 数える /
@@ -109,6 +111,10 @@ begin
   end if;
   if exists (select 1 from pg_catalog.jsonb_array_elements(p_ne -> 'untrusted') u where pg_catalog.jsonb_typeof(u) <> 'string' or pg_catalog.length(u #>> '{}') not between 1 and 200) then
     raise exception 'invalid_input: untrusted は code_norm の文字の配列' using errcode = '22023';
+  end if;
+  if pg_catalog.jsonb_typeof(p_ne -> 'rep_spellings') is distinct from 'object' or coalesce(p_ne #>> '{rep_spellings,state}', '') not in ('ok', 'unavailable')
+     or ((p_ne #>> '{rep_spellings,state}') = 'unavailable' and coalesce(pg_catalog.length(p_ne #>> '{rep_spellings,reason}'), 0) not between 1 and 100) then
+    raise exception 'invalid_input: rep_spellings は { state: ok } か { state: unavailable, reason } (NE のコードの元の書き方 (代表) の台帳を読めたか)' using errcode = '22023';
   end if;
   if p_ne ? 'rep_collided' and (pg_catalog.jsonb_typeof(p_ne -> 'rep_collided') is distinct from 'array'
      or exists (select 1 from pg_catalog.jsonb_array_elements(p_ne -> 'rep_collided') u where pg_catalog.jsonb_typeof(u) <> 'string' or pg_catalog.length(u #>> '{}') not between 1 and 200)) then
@@ -293,7 +299,11 @@ begin
   if exists (select 1 from ops.master_parent_gate_results r where r.compare_run_id = p_compare_run_id) then
     raise exception 'run_reused: 照合の回 % の代表の数えはもう残した', p_compare_run_id using errcode = 'P0001';
   end if;
-  v := ops.parent_raw_gate(1, p_ne, false);
+  v := ops.parent_raw_gate(1, p_ne, false);   -- 観測の形はここで確かめる (rep_spellings を含む)
+  -- 🆕 #1676 Codex R2 High: 書き方の台帳 (代表) を読めない回は記録しない = 0 件の記録で門・widen を開けない (一番新しい記録は前の回のまま)
+  if (p_ne #>> '{rep_spellings,state}') is distinct from 'ok' then
+    raise exception 'spellings_unavailable: NE のコードの元の書き方 (代表) を読めない回 (%) の代表の数えは残さない (書き方の衝突を見落とす)', p_ne #>> '{rep_spellings,reason}' using errcode = 'P0001';
+  end if;
   v_owner := case when ops.parent_gate_enforced() then 'company' else 'load' end;
   perform pg_catalog.set_config('ops.parent_gate_protocol', '1', true);
   insert into ops.master_parent_gate_results (company_id, compare_run_id, ne_generation_id, ne_raw_hash, products_complete_at, setproducts_complete_at, material_generation_id,

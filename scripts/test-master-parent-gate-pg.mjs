@@ -122,7 +122,7 @@ const putRecord = async (c, over) => {
 const mirrorObs = async (E) => {
   const rows = await E.q(`select k.code_norm, nullif(core.norm_code(pp.display_code), '') as rep, pp.display_code as raw from core.skus k
     left join core.products p on p.product_id = k.product_id left join core.products pp on pp.product_id = p.parent_product_id where k.sku_kind = 'single' order by 1`);
-  return { format: 'parent-obs-v1', complete: true, untrusted: [], rows: rows.map((r) => [r.code_norm, 'single', 'ok', r.rep ?? null, r.rep ? r.raw : null]) };
+  return { format: 'parent-obs-v1', complete: true, untrusted: [], rep_spellings: { state: 'ok' }, rows: rows.map((r) => [r.code_norm, 'single', 'ok', r.rep ?? null, r.rep ? r.raw : null]) };
 };
 
 try {
@@ -161,6 +161,16 @@ try {
     assert.ok(has(r, /parent_gate: 照合の NE の取得 .* が手の入口の停止 .* の前/), JSON.stringify(r.problems));
     assert.deepEqual(r.counts.parent_structure, { two_level: 0, loop: 0 });
     assert.ok(!has(r, /amazon_map|decisions|shape/), `ほかのキーの検査で止まらない: ${JSON.stringify(r.problems)}`);
+  });
+
+  await ta('[W1b] (#1676 Codex R2 High) prepared のロードの後の照合で書き方の台帳を読めない = 代表の数えの記録を作らない (watch_writer でも SQL が断る) = widen は止まったまま', async () => {
+    const f = { generation_id: 'ne_w1b', raw_hash: hex('1'), products_complete_at: new Date().toISOString(), setproducts_complete_at: new Date().toISOString() };
+    const obs = { ...(await mirrorObs(E)), rep_spellings: { state: 'unavailable', reason: 'not_collected' } };
+    const e = await errOf(E.WW, 'select ops.record_parent_gate($1, $2::jsonb, $3, $4, $5::jsonb)', [runId(), JSON.stringify(f), GEN, hex('2'), JSON.stringify(obs)]);
+    assert.match(e?.message ?? '', /spellings_unavailable/);
+    const r = await check(E, AT.id);
+    assert.equal(r.ok, false);
+    assert.ok(has(r, /parent_gate: 代表の数えの記録 .* が prepared のロード .* の前/), JSON.stringify(r.problems));
   });
 
   await ta('[W2] widen の判定: 6 つの数え・prepared のロードの前・材料の世代・停止の前の取得・構造 = 断る (読むだけと apply が同じ) / 揃えば widen が通る', async () => {

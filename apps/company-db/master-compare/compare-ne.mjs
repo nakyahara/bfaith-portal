@@ -21,7 +21,7 @@ import { readEvidence } from '../push/evidence.mjs';
 import { planFromSnapshot, subjectKey, sameValue } from './compare-load.mjs';
 import { evaluateBaseline } from './baseline.mjs';
 import { readNeFetchCounts } from '../../warehouse/ne-fetch-counts.js';
-import { parentObservations, repCollisionsOf, fetchTimeRfc3339 } from './parent-gate.mjs';
+import { parentObservations, repSpellingsOf, fetchTimeRfc3339 } from './parent-gate.mjs';
 
 export const NE_FORMAT = 'mc-ne-v1';
 /** NE の取扱区分で知っている語 (2026-09-26 の実データ。これ以外は invalid = 照合しない。今のロードの mapHandling は知らない語も discontinued にする) */
@@ -1246,11 +1246,13 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   }) : null;
   out.registrations = regObs ? { targets: regTargets.length, observations: regObs.observations.length, present: regObs.observations.filter((o) => o.present).length } : { state: 'not_applied' };
   // 🆕 0068 (設計 20 v7 §②・§⑥ PR-6): 代表 (親) の生の数えの元 = 同じ完全な取得の観測 (JSON には入れない。run.mjs が封の後に ops.record_parent_gate で DB に数えさせる)
-  //   代表の名前空間の元の書き方 (raw_ne_code_spellings・商品コードが空で落とした行の代表も) が 2 つ以上 = 衝突 (#1676 Codex R1 High)
-  const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], complete: !absenceUntrusted, repCollided: repCollisionsOf(neCodes) }),
+  //   代表の名前空間の元の書き方 (raw_ne_code_spellings・商品コードが空で落とした行の代表も) が 2 つ以上 = 衝突 (#1676 Codex R1 High)。
+  //   台帳を読めない回は「読めない」と理由を持たせる = run.mjs は記録しない (#1676 Codex R2 High)
+  const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], complete: !absenceUntrusted, repSpellings: repSpellingsOf(neCodes) }),
     fetch: { ...neFetchIdentity(marks, ne), products_complete_at: fetchTimeRfc3339(marks.products.at), setproducts_complete_at: fetchTimeRfc3339(marks.sets.at) },
     material_generation_id: out.generation ? out.generation.generation_id : null };
-  out.parent_obs = { rows: parentObs.obs.rows.length, untrusted: parentObs.obs.untrusted.length, rep_collided: parentObs.obs.rep_collided.length, complete: parentObs.obs.complete };
+  out.parent_obs = { rows: parentObs.obs.rows.length, untrusted: parentObs.obs.untrusted.length, rep_collided: parentObs.obs.rep_collided.length, rep_spellings: parentObs.obs.rep_spellings,
+    complete: parentObs.obs.complete };
   return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes, regObs, parentObs };
 }
 
