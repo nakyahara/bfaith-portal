@@ -300,6 +300,7 @@ const fakeSheets = { spreadsheets: {
   values: {
     get: async (p) => {
       await hit('vget', p);
+      if (g.onVgetNth && --g.onVgetNth.n === 0) { const fn = g.onVgetNth.fn; g.onVgetNth = null; fn(p); }
       const f = fileOrThrow(p.spreadsheetId);
       const title = /^'(.+?)'(?:!|$)/.exec(p.range)?.[1];
       g.lastRange = p.range;
@@ -520,10 +521,10 @@ const A = makeComposed({ code: 'maitakep50' });
   // 読み戻した後・送る前に人が修正指示を書いた → 同じ行の画像は KEEP なので消えない
   {
     const rjK = regen(A, cards2[2].head_id); finishJob(rjK);
-    g.onSgetNth = { n: 2, fn: () => humanWrites(F.id, `img-${cards2[2].root_id}`, '作り直しの最中に書いた') };
+    g.onSgetNth = { n: 3, fn: () => humanWrites(F.id, `img-${cards2[2].root_id}`, '作り直しの最中に書いた') };
     const rK = await press(A);
     ok(rK.status === 200 && rK.json.kept === 3 && noteOfKey(F.id, `img-${cards2[2].root_id}`).note === '作り直しの最中に書いた' && noteOfKey(F.id, `img-${cards2[0].root_id}`).note === 'TOP の文字を大きく',
-      '🚨 読み戻した後・Google に送る前に人が書いた修正指示も消えない (同じ行の画像は修正指示のセルを書かない — Codex 名指し1 高)', JSON.stringify(rK.json));
+      '🚨 書く直前に読み直した後・Google に送る前に人が書いた修正指示も消えない (同じ行の画像は修正指示のセルを書かない — Codex 名指し1 高)', JSON.stringify(rK.json));
     ok(noteOfKey(F.id, `img-${cards2[2].root_id}`).ver === 'v' + cardsOf(A)[2].current.version && cardsOf(A)[2].current.version === 3 && tabOf(F.id).formulas[5][1].includes(cardsOf(A)[2].current.drive_file_id), 'KEEP でも画像・版は最新に書き直す');
     // 管理番号のセルだけ入れ替えた → 別の画像に付けない
     const t0 = tabOf(F.id); const kc = 5;
@@ -539,6 +540,35 @@ const A = makeComposed({ code: 'maitakep50' });
     humanWrites(F.id, `img-${cards2[0].root_id}`, 'TOP の文字を大きく');
     humanWrites(F.id, `img-${cards2[1].root_id}`, 'ロゴを右上に\n背景をもう少し明るく');
     humanWrites(F.id, `img-${cards2[2].root_id}`, '');
+  }
+  // 読み戻した後 (書く直前の読み直しの前) に、人が行を入れ替えた・列を足した → 書かない (修正指示を消さない・付け違えない)
+  {
+    const rjX = regen(A, cards2[1].head_id); finishJob(rjX);
+    const tX = tabOf(F.id);
+    const before = JSON.stringify(tX.values);
+    const bX = g.batches;
+    g.onVgetNth = { n: 2, fn: () => { [tX.values[3], tX.values[4]] = [tX.values[4], tX.values[3]]; [tX.formulas[3], tX.formulas[4]] = [tX.formulas[4], tX.formulas[3]]; } };
+    const rX = await press(A);
+    ok(rX.status === 409 && rX.json.code === 'sheet_changed' && g.batches === bX && /書いた内容は消していません/.test(rX.json.error),
+      '🚨 読み戻した後に行を入れ替えられたら書かない (KEEP の座標がずれて修正指示が別の画像に付くのを防ぐ — Codex 名指し3 高)', JSON.stringify(rX.json));
+    g.onVgetNth = { n: 2, fn: () => { tX.values = tX.values.map((r) => ['', ...r]); tX.formulas = tX.formulas.map((r) => [null, ...r]); } };
+    const rX2 = await press(A);
+    ok(rX2.status === 409 && rX2.json.code === 'sheet_changed' && g.batches === bX, '🚨 読み戻した後に列を足されても書かない');
+    tX.values = tX.values.map((r) => r.slice(1)); tX.formulas = tX.formulas.map((r) => r.slice(1));
+    [tX.values[3], tX.values[4]] = [tX.values[4], tX.values[3]]; [tX.formulas[3], tX.formulas[4]] = [tX.formulas[4], tX.formulas[3]];
+    ok(JSON.stringify(tX.values) === before, '(片付け) 元に戻した');
+    const rX3 = await press(A);
+    ok(rX3.status === 200 && noteOfKey(F.id, `img-${cards2[1].root_id}`).note === 'ロゴを右上に\n背景をもう少し明るく', 'シートを触り終えてから押せば作り直せる (修正指示は残る)');
+  }
+  // 人が「デザイナー修正依頼」のタブの名前を変えた → 名前を変えたタブ (印で分かる) から修正指示を読み、新しいタブに書く
+  {
+    const tR = tabOf(F.id);
+    tR.title = '旧 依頼 (田中)';
+    const rjR = regen(A, cards2[0].head_id); finishJob(rjR);
+    const rR = await press(A);
+    ok(rR.status === 200 && rR.json.carried === 2 && rR.json.kept === 0 && noteOfKey(F.id, `img-${cards2[0].root_id}`)?.note === 'TOP の文字を大きく'
+      && F.tabs.some((x) => x.title === '旧 依頼 (田中)'), '🚨 タブの名前を変えられても、修正指示は新しい「デザイナー修正依頼」のタブに引き継ぐ (名前を変えたタブは残す — Codex 名指し3 中)', JSON.stringify(rR.json));
+    F.tabs = F.tabs.filter((x) => x.title !== '旧 依頼 (田中)');
   }
   // 人が左に 26 列を足して、全部が AA 列より右へ動いた → タブ全体を読むので、修正指示は残る (A1:Z2000 で読むと空に見えて消していた)
   {
@@ -714,6 +744,28 @@ console.log('③ 共有ドライブの設定でリンク共有ができない');
   let rE = await press(E);
   ok(rE.status === 409 && rE.json.code === 'share_blocked' && !fe.some((f) => publicFiles().includes(f)) && stateNow(E).unrevoked === 0,
     '🚨 作れなかったときは、記録の依頼書に載っていない公開を全部外す (前の回が残した分も)', JSON.stringify(publicFiles().filter((f) => fe.includes(f))));
+  // 前の回が公開した直後にプロセスごと止まり、だれも押さない → 起動のあとの片付けで外す
+  {
+    const E2 = makeComposed();
+    finishJob(fullJob(E2));
+    const f2 = cardsOf(E2)[0].current.drive_file_id;
+    g.files.get(f2).perms.push({ id: 'anyoneWithLink', type: 'anyone', role: 'reader' });
+    db.prepare('INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, ?, NULL, ?)').run(E2.id, f2, 'anyoneWithLink', 't');
+    // 作っている最中 (印が期限内) の商品は触らない
+    db.prepare("INSERT OR IGNORE INTO ph_designer_sheets (draft_id) VALUES (?)").run(E2.id);
+    db.prepare("UPDATE ph_designer_sheets SET lease_token = 'busy', lease_until = '2999-01-01T00:00:00Z' WHERE draft_id = ?").run(E2.id);
+    let sw = await svc.sweepDesignerShares({ db });
+    ok(publicFiles().includes(f2), '作っている最中の商品の公開は片付けない');
+    db.prepare('UPDATE ph_designer_sheets SET lease_token = NULL, lease_until = NULL WHERE draft_id = ?').run(E2.id);
+    // 書いている途中で止まった (writing_at) 商品も触らない (シートが新しい画像を出しているかもしれない)
+    db.prepare("UPDATE ph_designer_sheets SET writing_at = '2026-10-09T00:00:00Z' WHERE draft_id = ?").run(E2.id);
+    sw = await svc.sweepDesignerShares({ db });
+    ok(publicFiles().includes(f2), '書いている途中で止まった商品の公開は片付けない (作り直しが要る、を画面に出す)');
+    db.prepare('UPDATE ph_designer_sheets SET writing_at = NULL WHERE draft_id = ?').run(E2.id);
+    sw = await svc.sweepDesignerShares({ db });
+    ok(!publicFiles().includes(f2) && sw.revoked >= 1 && stateNow(E2).unrevoked === 0 && rowOf(E2).lease_token == null,
+      '🚨 起動のあとの片付けで、依頼書に載っていない公開を外す (だれも押さなくても — Codex 名指し3 高)', JSON.stringify(sw));
+  }
   // 商品を消す: 公開を外してから消す。外せなければ消さない
   rE = await press(E);
   ok(rE.status === 200 && fe.every((f) => publicFiles().includes(f)), '(前提) 依頼書ができて 3 枚公開');
@@ -757,7 +809,7 @@ console.log('④ 二重押し・2 人同時・待っている間の変化');
   // シートを読んだ後・送る直前 (書き込み係がタブを読んだ回) にほかの人が作り直した → 送らない
   const rjA = regen(C, cardsOf(C)[0].head_id); finishJob(rjA);
   const hB = rowOf(C).images_hash; const bB = g.batches;
-  g.onSgetNth = { n: 2, fn: () => { const r = regen(C, cardsOf(C)[1].head_id); finishJob(r); } };
+  g.onSgetNth = { n: 3, fn: () => { const r = regen(C, cardsOf(C)[1].head_id); finishJob(r); } };
   const rB = await press(C);
   ok(rB.status === 409 && rB.json.code === 'conflict' && g.batches === bB && rowOf(C).images_hash === hB && rowOf(C).writing_at == null,
     '🚨 送る直前 (書き込み係がタブを読んだ後) に画像が変わっても送らない', JSON.stringify([rB.json, g.onSgetNth]));

@@ -295,7 +295,8 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
  * 書き込み係が作ったタブ (印つき) の今の値を読む (PR-F: 作り直す前に、人が書いた修正指示を読み戻す)。
  * 値は画面に見えている文字 (FORMATTED_VALUE・式のセルは式の結果 = =IMAGE は空)。render: 'FORMULA' なら式のセルは式そのもの。
  * @returns {Promise<{exists: false}|{exists: true, owned: boolean, values: string[][]|null}>}
- *   owned=false (人が作った同じ名前のタブ) は読まない (書くときに writeSpreadsheet が TabConflictError で止める)
+ *   owned=false (人が作った同じ名前のタブ) は読まない (書くときに writeSpreadsheet が TabConflictError で止める)。
+ *   renamedFrom = その名前のタブが無く、印の名前が同じ自分のタブ (人が名前を変えた) から読んだときの、いまの名前
  */
 export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, range = 'A1:Z2000', render = 'FORMATTED_VALUE' }) {
   const opt = { timeout: GOOGLE_TIMEOUT_MS };
@@ -303,15 +304,24 @@ export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, rang
     spreadsheetId,
     fields: 'sheets(properties(sheetId,title),developerMetadata(metadataKey,metadataValue))',
   }, opt);
-  const tab = (got?.data?.sheets || []).find((s) => s?.properties?.title === name);
-  if (!tab) return { exists: false };
+  const all = got?.data?.sheets || [];
+  let tab = all.find((s) => s?.properties?.title === name);
+  let renamedFrom = null;
+  if (!tab) {
+    // 人がタブの名前を変えた: 印 (作ったときの名前) が同じ自分のタブが 1 枚だけなら、そこから読む (Codex PR-F 名指し3 中)。
+    // 書くのは元の名前の新しいタブ (名前を変えたタブはそのまま残す)
+    const mine = all.filter((s) => (s.developerMetadata || []).some((m) => m && m.metadataKey === OWNED_TAB_KEY && m.metadataValue === name));
+    if (mine.length !== 1) return { exists: false };
+    tab = mine[0];
+    renamedFrom = tab.properties.title;
+  }
   const owned = (tab.developerMetadata || []).some((m) => m && m.metadataKey === OWNED_TAB_KEY);
   if (!owned) return { exists: true, owned: false, values: null };
   // タブ名は自分で決めた名前 (引用符を含まない) なので、そのまま範囲に入れる
-  const tabRef = `'${String(name).replace(/'/g, "''")}'`;
+  const tabRef = `'${String(renamedFrom || name).replace(/'/g, "''")}'`;
   const r = await sheets.spreadsheets.values.get({
     // range: null = タブ全体 (使っている範囲を全部返す)
     spreadsheetId, range: range ? `${tabRef}!${range}` : tabRef, valueRenderOption: render === 'FORMULA' ? 'FORMULA' : 'FORMATTED_VALUE', majorDimension: 'ROWS',
   }, opt);
-  return { exists: true, owned: true, values: Array.isArray(r?.data?.values) ? r.data.values : [] };
+  return { exists: true, owned: true, renamedFrom, values: Array.isArray(r?.data?.values) ? r.data.values : [] };
 }

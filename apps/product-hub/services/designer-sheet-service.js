@@ -302,6 +302,41 @@ export async function revokeAllDesignerShares(draftId, { db = getDB() } = {}) {
   return remaining ? { ok: false, remaining, error: `デザイナー修正依頼書のために公開した画像 ${remaining} 枚の公開を外せませんでした (少し待ってからもう一度押してください)` } : { ok: true, remaining: 0 };
 }
 
+/**
+ * 依頼書に載っていないのに公開したままの画像を片付ける (Codex PR-F 名指し3 高: プロセスが止まると catch が動かず、
+ * 押されるまで公開が残る)。サーバーの起動のあと (router.js) に 1 回呼ぶ。
+ * 作っている最中 (印が期限内) の商品と、書いている途中で止まった (writing_at が立ったまま = シートが新しい画像を
+ * 出しているかもしれない) 商品は触らない (後者は画面に「作り直しが要る」が出て、作り直すと片付く)
+ * @returns {Promise<{drafts: number, revoked: number}>}
+ */
+export async function sweepDesignerShares({ db = getDB(), now = Date.now() } = {}) {
+  let clients = null;
+  try { clients = makeClients(); } catch (_) { clients = null; }
+  if (!clients) return { drafts: 0, revoked: 0 };
+  const ids = db.prepare(`SELECT DISTINCT draft_id FROM ph_designer_sheet_shares WHERE revoked_at IS NULL`).all().map((r) => r.draft_id);
+  let drafts = 0;
+  let revoked = 0;
+  for (const id of ids) {
+    const row = rowOf(db, id);
+    if (row && row.writing_at) continue;
+    const left = sharesOutside(db, id, recordedFiles(db, id));
+    if (!left.length) continue;
+    // 商品が消えている (記録だけ残った) ときは印の行が作れない (外部キー) ので、印なしで外す
+    const exists = !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(id);
+    const token = exists ? acquireLease(db, id, { now }) : 'none';
+    if (!token) continue;
+    try {
+      revoked += await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)));
+      drafts += 1;
+    } catch (e) {
+      console.error('[product-hub] デザイナー修正依頼書の公開の片付け:', id, e?.message || e);
+    } finally {
+      if (exists) { try { releaseLease(db, id, token); } catch (_) { /* 期限が来れば取り直せる */ } }
+    }
+  }
+  return { drafts, revoked };
+}
+
 // ─── 作る / 作り直す ─────────
 
 /**
@@ -395,17 +430,30 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
     }
     // 3. 人が書いた修正指示を読み戻す (作ったばかりなら無い)。読めない形 (見出しを消した) なら上書きしない
     let previous = null;
+    // 範囲はタブ全体 (A1:Z2000 のように区切ると、その外へ動かした修正指示を「無い」と見て消す — Codex PR-F 名指し2 高)
+    const readNow = () => readOwnedTabValues(clients, { spreadsheetId: fileId, name: DESIGNER_TAB, render: 'FORMULA', range: null });
+    let firstRead = null;
     if (!created) {
-      // 範囲はタブ全体 (A1:Z2000 のように区切ると、その外へ動かした修正指示を「無い」と見て消す — Codex PR-F 名指し2 高)
-      const cur = await readOwnedTabValues(clients, { spreadsheetId: fileId, name: DESIGNER_TAB, render: 'FORMULA', range: null });
+      const cur = await readNow();
       if (cur.exists && cur.owned) {
         const files = rootOfFileMap(db, id);
         const back = readBackNotes(cur.values, { rootOfFile: (fid) => files.get(String(fid)) ?? null });
         if (!back.ok) throw Object.assign(new Error(back.error), { code: 'unreadable' });
-        previous = back;
+        // 名前を変えられた自分のタブから読んだ: 書くのは新しい「デザイナー修正依頼」のタブなので、セルに触らずに残す (KEEP) は使えない
+        previous = cur.renamedFrom ? { ...back, layout: null } : back;
+        firstRead = JSON.stringify([cur.renamedFrom || null, cur.values]);
       }
     }
     built = buildDesignerSheet({ productCode: draft.ne_code, productName: draft.name, images, previous });
+    // 🚨 書く直前にもう一度読み、読み戻した後にシートが書き換えられていたら (修正指示を書いた・行を並べ替えた・列を足した) 書かない
+    //    (Codex PR-F 名指し3 高: 読み戻した座標のまま KEEP したり書き直したりすると、修正指示が消える・別の画像に付く)。
+    //    ここから送るまで (Google の 2 往復) の間の編集は、同じ行のままの修正指示なら KEEP で残る (見送りの残り)
+    if (firstRead) {
+      const again = await readNow();
+      if (JSON.stringify([again.renamedFrom || null, again.values]) !== firstRead) {
+        throw Object.assign(new Error('作り直している間に、デザイナー修正依頼書が書き換えられました (修正指示を書いた・行や列を動かした)。書いた内容は消していません。シートを触り終えてから、もう一度押してください'), { code: 'sheet_changed' });
+      }
+    }
     stillSame();
     await writeSpreadsheet(clients, {
       spreadsheetId: fileId, title: built.title, tabs: built.tabs, fresh: created,
@@ -420,6 +468,7 @@ async function run(db, id, { actor, seenFileId, seenImagesHash, token }) {
     if (!wrote) await revokeShares(db, clients.drive, sharesOutside(db, id, recordedFiles(db, id)));
     if (e?.code === 'designer_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     if (e?.code === 'unreadable') return { ok: false, status: 409, code: 'unreadable', error: e.message };
+    if (e?.code === 'sheet_changed') return { ok: false, status: 409, code: 'sheet_changed', error: e.message };
     const reason = explainGoogleError(e);
     try { logEvent(db, id, 'designer_sheet_failed', reason.slice(0, 500), actor); } catch (_) { /* 記録の失敗で結果を変えない */ }
     if (e?.code === 'tab_conflict') return { ok: false, status: 409, code: 'tab_conflict', error: reason };

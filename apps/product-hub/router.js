@@ -86,7 +86,16 @@ import { Readable } from 'node:stream';
 import { editStateFor as lpEditStateFor, saveEdit as saveLpEdit, effectiveComposeText as lpEffectiveComposeText } from './lib/lp-edit.js';
 import { imageLimitForPriority as lpImageLimitForPriority } from './lib/lp-image.js';
 // デザイナー修正依頼書 (スプレッドシート) の自動作成 (画像制作の新フロー PR-F・2026-10-09)
-import { createOrUpdateDesignerSheet, designerSheetStateFor, revokeAllDesignerShares, DESIGNER_SHEET_FORBIDDEN } from './services/designer-sheet-service.js';
+import { createOrUpdateDesignerSheet, designerSheetStateFor, revokeAllDesignerShares, sweepDesignerShares, DESIGNER_SHEET_FORBIDDEN } from './services/designer-sheet-service.js';
+// デザイナー修正依頼書のために公開したまま、依頼書に載っていない画像を、起動の 1 分あとに片付ける
+// (作っている途中でプロセスが止まると後片付けが動かない — Codex PR-F 名指し3 高)。鍵が無い (試験・未設定) なら何もしない
+if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+  const t = setTimeout(() => {
+    sweepDesignerShares().then((r) => { if (r.revoked) console.log(`[product-hub] デザイナー修正依頼書: 公開したままの画像 ${r.revoked} 枚を片付けました`); })
+      .catch((e) => console.error('[product-hub] デザイナー修正依頼書の公開の片付け:', e?.message || e));
+  }, 60_000);
+  if (t.unref) t.unref();
+}
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
