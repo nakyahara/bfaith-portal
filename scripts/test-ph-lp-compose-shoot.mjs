@@ -186,7 +186,7 @@ let dOk, rOk;
   eq(j.images[2].cut, '玄関でスプレーする手元', 'カット名も読める');
   const st = lp.jobStateFor(db, dOk.id);
   eq(st.shoot, { job_id: rOk.jobId, available: true, format: 1, recommended: 'inhouse', reason: goodShoot().reason,
-    unbox: '', cut_count: 1, send_targets: '', warnings: [], missing: null },
+    open_required: '', cut_count: 1, send_targets: '', warnings: [], missing: null },
     '画面の状態 (ポーリングの応答) には おすすめと理由と短い概要だけ (画像ごとの要否は出さない・PR-C の形は開封・送付が空)');
   ok(st.job.output_text === OUT, '構成の本文も今どおり出る');
 
@@ -212,8 +212,9 @@ console.log('④ 壊れた撮影判定 → 構成は受け付け、撮影判定�
   eq(row.output_text, OUT, '構成の本文は保存される');
   ok(JSON.parse(row.lint_json).ok === true && JSON.parse(row.lint_json).source === 'server', '🚨 lint の扱いは今どおり (サーバの結果)');
   matchModel(r.run);
-  eq(lp.latestShootJudgement(db, d.id), { job_id: r.jobId, available: false, format: null, recommended: null, shooter: null, unbox: '',
-    send_targets: '', purpose: '', finish: '', usage: '', reason: null, cuts: [], cut_count: 0, images: [], warnings: [], missing: 'invalid' },
+  eq(lp.latestShootJudgement(db, d.id), { job_id: r.jobId, available: false, format: null, recommended: null, reason: null,
+    summary: { judgement: '', shooter: '', open_required: '', send_targets: '', purpose: '', finish: '', usage: '', conclusion: '' },
+    cuts: [], cut_count: 0, images: [], warnings: [], missing: 'invalid' },
     '読み口は「AI の判定なし (形が違った)」(項目はそろえて中身は空)');
 
   {

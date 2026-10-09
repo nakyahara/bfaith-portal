@@ -236,23 +236,25 @@ claim で来た **`shoot_instruction`** に従って、その構成の画像を�
 (同じ中身を JSON の項目に入れる)。
 
 ```json
-{"recommended":"inhouse","reason":"2枚目の使用シーンの実写がありません。消耗品なので社内の簡易物撮りで足ります。",
- "unbox":"不要","send_targets":"ハッカ油スプレー 100ml (1本)","purpose":"使用シーンの実写を揃える",
+{"recommended":"inhouse","conclusion":"2枚目の使用シーンの実写がありません。消耗品なので社内の簡易物撮りで足ります。",
+ "open_required":"不要","send_targets":"ハッカ油スプレー 100ml (1本)","purpose":"使用シーンの実写を揃える",
  "finish":"玄関で使っている手元が分かる明るい写真","usage":"楽天 LP 2枚目",
  "cuts":[
-  {"no":1,"priority":"必須","expression":"使用イメージ","variation":"代表1色","target":"ハッカ油スプレー 100ml (1本)",
-   "cut":"玄関でスプレーする手元","purpose":"使う場面を伝える","composition":"斜め上から手元と商品。商品ラベルが読めること",
-   "usage":"楽天 LP 2枚目","unbox":"不要","reference":"玄関で使う手元","lp_image_no":2}],
+  {"no":1,"priority":"必須","expression_type":"使用イメージ","variation":"代表1色","target":"ハッカ油スプレー 100ml (1本)",
+   "content":"玄関でスプレーする手元","purpose":"使う場面を伝える","finish":"斜め上から手元と商品。商品ラベルが読めること",
+   "usage":"楽天 LP 2枚目","open_required":"不要","reference_theme":"玄関で使う手元","lp_image_nos":[2],"notice":"","required_notice":""}],
  "images":[{"no":0,"needs_shoot":false},{"no":1,"needs_shoot":false},{"no":2,"needs_shoot":true}]}
 ```
 
 サーバが見ること (`./phlp lint --shoot` で同じ検査を先に受けられる):
-- キーはこの形のものだけで、**どの項目も省略しない** (無い値は `""`、`lp_image_no` だけは LP に無いカットなら `null`)
-- `recommended` は `none` / `inhouse` / `photographer`。`unbox` は `不要` / `必要` / `一部必要`。カットの `priority`・`expression`・
-  `variation`・`unbox` は `shoot_instruction` に書いてある値のどれか。カットの `no` は 1 からの連番
+- キーはこの形のものだけで、**どの項目も省略しない** (無い値は `""`、`lp_image_nos` だけは配列で LP に無いカットなら `[]`)
+- `recommended` は `none` / `inhouse` / `photographer`。`open_required` は `不要` / `必要` / `一部必要`。カットの `priority`・`expression_type`・
+  `variation`・`open_required` は `shoot_instruction` に書いてある値のどれか。カットの `no` は 1 からの連番
 - `none` なら `cuts` は `[]`・`send_targets`・`purpose`・`finish`・`usage` は `""`・`needs_shoot` はすべて false。
   `inhouse`・`photographer` なら `cuts` を 1 つ以上・その 4 項目は空にしない
-- `images` は **⑦ の画像見出しの N と 1 対 1** で `{no, needs_shoot}` だけ。`lp_image_no` を書いたカットの画像は `needs_shoot: true`
+- `images` は **⑦ の画像見出しの N と 1 対 1** で `{no, needs_shoot}` だけ。**画像とカットは両向きで合わせる**:
+  `lp_image_nos` に入れた画像は `needs_shoot: true`、`needs_shoot: true` の画像はどれかのカットの `lp_image_nos` に入れる
+- 項目名は撮影指示書 (スプレッドシート) の項目と同じ。カットと概要はそのまま撮影指示書に載る
 - 応答の `shoot.warnings` は仕様書の運用ルールの知らせ (例: カメラマン撮影は 5 カット単位)。**通らないわけではない**が、
   仕様書を読み直して直すべきなら直す
 

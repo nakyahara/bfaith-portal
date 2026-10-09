@@ -54,6 +54,11 @@ import {
 //    (画像制作の新フロー PR-C2・2026-10-09)。あれば shoot_instruction は SHOOT_SPEC_INSTRUCTION (形 v2)、
 //    無ければ今までどおり SHOOT_JUDGE_INSTRUCTION (形 v1)。構成の指示文 (instruction) は変えていない
 export const PACKET_VERSION = 6;
+/**
+ * claim で受ける packet の版。5 (PR-C) は 6 から shoot_spec を除いただけ (= 仕様書を取り込む前の 6 と同じ材料) なので受ける
+ * (デプロイの時点で待っている PR-C の依頼を、押し直しにしない・Codex PR-C2 名指し1 M)。4 以下は今どおり packet_outdated
+ */
+export const ACCEPTED_PACKET_VERSIONS = [5, PACKET_VERSION];
 export const PROMPT_VERSION = 'lp-compose-v1';
 export const LEASE_MIN = 40;
 /** 測定の合格ライン (設計 §7.2)。受付時に created_at + これで deadline を固定する */
@@ -694,7 +699,7 @@ export function claimJob(db, { runnerRunId, maxImages, shootSpec = false, now = 
       //    版が上がる = 渡す材料の形が変わった。v1 には instruction が入っていないので、
       //    そのまま渡すと**スタッフと違う指示文で作ったものが測定に混ざる** (設計 §5 / §7.1)。
       //    自動で作り直さない — 人がもう一度ボタンを押す (渡した材料を勝手に差し替えない)。
-      if (job.packet_version !== PACKET_VERSION) {
+      if (!ACCEPTED_PACKET_VERSIONS.includes(job.packet_version)) {
         db.prepare(`UPDATE ph_lp_compose_jobs
           SET status = 'failed', error_code = 'packet_outdated', error = ?,
               updated_at = ?, completed_at = COALESCE(completed_at, ?)
@@ -1339,8 +1344,8 @@ function closeUncheckedModels(db, now) {
 /** AI の判定が無いときの読み口の形 (項目はそろえて、中身は空) */
 function emptyShootJudgement(jobId, missing) {
   return {
-    job_id: jobId, available: false, format: null, recommended: null, shooter: null, unbox: '',
-    send_targets: '', purpose: '', finish: '', usage: '', reason: null,
+    job_id: jobId, available: false, format: null, recommended: null, reason: null,
+    summary: { judgement: '', shooter: '', open_required: '', send_targets: '', purpose: '', finish: '', usage: '', conclusion: '' },
     cuts: [], cut_count: 0, images: [], warnings: [], missing,
   };
 }
@@ -1354,28 +1359,29 @@ function emptyShootJudgement(jobId, missing) {
  *
  * 形は仕様書「新商品初動判定」の撮影依頼書連携データに合わせた v2 (PR-C2・lib/lp-shoot.js の shootReadModel)。
  * PR-C の形 (v1) で保存済みの行も v2 の形に寄せて返す (v1 に無い項目は "")。
- * @returns {null|{job_id:number, available:boolean, format:1|2|null, recommended:string|null, shooter:string|null,
- *   unbox:string, send_targets:string, purpose:string, finish:string, usage:string, reason:string|null,
- *   cuts:Array<{no, priority, expression, variation, target, cut, purpose, composition, usage, unbox, reference, lp_image_no}>, cut_count:number,
+ * @returns {null|{job_id:number, available:boolean, format:1|2|null, recommended:string|null, reason:string|null,
+ *   summary:{judgement, shooter, open_required, send_targets, purpose, finish, usage, conclusion},
+ *   cuts:Array<{no, priority, expression_type, variation, target, content, purpose, finish, usage, open_required, reference_theme, lp_image_nos, notice, required_notice}>, cut_count:number,
  *   images:Array<{no:number, needs_shoot:boolean, cut:string, composition:string, props:string, background:string, tone:string, ng:string}>,
  *   warnings:string[], missing:null|'not_sent'|'invalid'}}
  *   null = 使える構成がまだ無い。available=false = 構成はあるが AI の判定が無い
  *   (missing: not_sent = 撮影判定を出さない古い実行役で作った / invalid = 形が違ったので使わなかった)
- *   images は撮影指示書 (PR-D の cutsFromSlots) が読む PR-C の形のまま (cut・composition は v2 ではその画像に使うカットから)
+ *   summary・cuts の項目名は撮影指示書 (PR-D・lib/shoot-sheet.js) の SUMMARY_FIELDS・CUT_FIELDS と同じ (撮影指示書がそのまま使う)。
+ *   images は PR-C の形のまま (v1 の判定から撮影指示書を作るときの材料。v2 では cut・composition にその画像を使うカットから入れる)
  */
 export function latestShootJudgement(db, draftId) {
   const id = posInt(draftId);
   if (!id) return null;
-  const job = db.prepare(`SELECT j.id, j.status, j.output_text, j.shoot_json, j.shoot_error, g.model_check
+  const job = db.prepare(`SELECT j.id, j.status, j.output_text, j.shoot_json, j.shoot_error, j.packet_json, g.model_check
     FROM ph_lp_compose_jobs j LEFT JOIN ph_lp_compose_generations g ON g.job_id = j.id
     WHERE j.draft_id = ? ORDER BY j.id DESC LIMIT 1`).get(id);
   if (!job || job.status !== 'done' || job.model_check !== 'match' || !trim(job.output_text)) return null;
   let value = null;
   if (job.shoot_json) {
     // 保存した形をもう一度通す (DB を直接触られて壊れたものを、人が決める材料として出さない)。
-    // 形は保存された中身で見分ける ('auto')。保存のときに依頼の形と照らし済み
+    // 形は依頼 (packet) が求める形で見る (保存のときと同じ。DB を直接触って別の形に替えたものを出さない)
     try {
-      const again = validateShootForComposition(JSON.parse(job.shoot_json), job.output_text, { format: 'auto' });
+      const again = validateShootForComposition(JSON.parse(job.shoot_json), job.output_text, { format: packetShootFormat(job) });
       value = again.ok ? again.value : null;
     } catch { value = null; }
   }
@@ -1393,7 +1399,7 @@ export function shootSummaryFor(db, draftId) {
   if (!j) return null;
   return {
     job_id: j.job_id, available: j.available, format: j.format, recommended: j.recommended, reason: j.reason,
-    unbox: j.unbox, cut_count: j.cut_count, send_targets: j.send_targets, warnings: j.warnings, missing: j.missing,
+    open_required: j.summary.open_required, cut_count: j.cut_count, send_targets: j.summary.send_targets, warnings: j.warnings, missing: j.missing,
   };
 }
 

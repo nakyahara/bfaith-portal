@@ -58,11 +58,11 @@ export function shootSheetConfigured() {
  *   (組み立ては lib/shoot-sheet.js の cutsFromSlots。純粋関数で試している)
  * 構成がパーサで読めない (画面で直せない) ときは、本文から推定する最小版 (cutsFromComposeText) で組む
  *
- * 形 = 新商品初動判定 仕様書 Ver1.3.11 の撮影依頼書 (概要 + 1 カット 1 ブロック)。PR-C の shoot_json は仕様書の全項目を
- * 持たないので、今は cut → 撮影内容 / composition 等 → 完成イメージ / ng → 注意 に対応づけ、ほかは空欄。概要 (summary) も
- * 撮影判定・撮影担当 (撮影判定の箱の値) のほかは空欄。
- * 🔁 C2 (AI の shoot_json を仕様書の全項目 = 概要の 8 項目 + 撮影カットの全項目に広げる PR) がマージされたら、
- *    ここで AI のカット・概要をそのまま使うように差し替える (lib/shoot-sheet.js の CUT_FIELDS / SUMMARY_FIELDS の形で返す)
+ * 形 = 新商品初動判定 仕様書 Ver1.3.11 の撮影依頼書 (概要 + 1 カット 1 ブロック)。
+ *   - AI の撮影判定が仕様書の形 (v2・PR-C2): AI のカット (LP に無いカットも) と概要 (開封要否・撮影用送付対象・撮影目的・
+ *     完成イメージ・使用用途・判定の結論) をそのまま使う (項目名は CUT_FIELDS / SUMMARY_FIELDS と同じ)
+ *   - PR-C の形 (v1): cut → 撮影内容 / composition 等 → 完成イメージ / ng → 注意 に対応づけ、ほかは空欄。概要も空欄
+ *   概要の撮影判定・撮影担当は、どちらでも撮影判定の箱の値 (人が決めた正本・materialOf が上書きする)
  * @returns {{cuts: Array, summary: object, source: 'lp'|'none', composeJobId: number|null, editId: number|null}}
  */
 export function shootSheetCutsFor(db, draft) {
@@ -76,8 +76,13 @@ export function shootSheetCutsFor(db, draft) {
   const hasEditShoot = !!eff.edit && eff.slots.every((sl) => !/^e\d+x\d+$/.test(String(sl.uid)));
   // AI の撮影判定は、効いている構成と同じ構成 (job) のものだけ使う (新しい構成を AI が作り直している途中なら使わない)
   const judge = latestShootJudgement(db, draft.id);
-  const aiImages = judge && judge.available && judge.job_id === eff.job.id ? judge.images : null;
-  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages }), summary: {}, source: 'lp', composeJobId: eff.job.id, editId };
+  const sameJob = !!(judge && judge.available && judge.job_id === eff.job.id);
+  const aiImages = sameJob ? judge.images : null;
+  // 仕様書の形 (v2・PR-C2) なら AI のカットと概要をそのまま使う。PR-C の形 (v1) は images からの対応づけ (cutsFromSlots の中)
+  const v2 = sameJob && judge.format === 2;
+  const aiCuts = v2 ? judge.cuts : null;
+  const summary = v2 ? { ...judge.summary } : {};
+  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages, aiCuts }), summary, source: 'lp', composeJobId: eff.job.id, editId };
 }
 
 const folderIdOf = (draft) => {

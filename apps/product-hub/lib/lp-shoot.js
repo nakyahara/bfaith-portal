@@ -192,7 +192,7 @@ export function validateShootJudgement(raw, { imageNos = null } = {}) {
  * 構成を読めなければ「照らせない」として受けない。
  *
  * format = どの形で受けるか (PR-C2)。1 = PR-C の簡単な決まりの形 / 2 = 仕様書「新商品初動判定」の形 /
- * 'auto' = 送られた形で見分ける (保存済みの行を読み直すとき)。
+ * 'auto' = 送られた形で見分ける。
  * 依頼ごとの形は packet で決まる (shootFormatOfPacket)。🚨 依頼と違う形は受けない —
  * 仕様書を渡した依頼に簡単な決まりの判定が返ってきたら、仕様書で判定したものではない
  */
@@ -201,7 +201,7 @@ export function validateShootForComposition(raw, outputText, { format = 'auto' }
   if (!nos) return { ok: false, errors: ['構成の画像見出しを読めないので、撮影判定を照らせません'] };
   const got = shootFormatOfRaw(raw);
   if (format === 1 && got === 2) return { ok: false, errors: ['この依頼の撮影判定は {recommended, reason, images} の形です (cuts などは付けない)'] };
-  if (format === 2 && got !== 2) return { ok: false, errors: ['この依頼の撮影判定は仕様書「新商品初動判定」の形です (cuts・unbox・send_targets などが要ります。shoot_instruction を読み直してください)'] };
+  if (format === 2 && got !== 2) return { ok: false, errors: ['この依頼の撮影判定は仕様書「新商品初動判定」の形です (cuts・open_required・send_targets などが要ります。shoot_instruction を読み直してください)'] };
   return got === 2 ? validateShootJudgementV2(raw, { imageNos: nos }) : validateShootJudgement(raw, { imageNos: nos });
 }
 
@@ -213,53 +213,60 @@ export function validateShootForComposition(raw, outputText, { format = 'auto' }
 // ここで見るのは**形**だけ: キー・型・列挙値・撮影判定とカットの食い違い・構成の画像と 1 対 1。
 // 仕様書の運用ルール (カメラマンは 5 カット単位 など) は強制せず、警告 (shootWarnings) として出すだけ。
 //
-// 🚨 項目名は撮影指示書 (PR-D・lib/shoot-sheet.js) の入力とそろえる: カット名 = cut / 構図 = composition。
-//    ほかの項目は仕様書の「撮影依頼書連携データ」の固定項目に 1 対 1 で名前を付けた (この 1 か所が定義)
+// 🚨 項目名は撮影指示書 (PR-D・lib/shoot-sheet.js) の CUT_FIELDS / SUMMARY_FIELDS とそろえる
+//    (撮影指示書がカット・概要をそのまま受け取れるように)。違うのは 2 つだけ:
+//    - 撮影判定は recommended (none|inhouse|photographer・PR-C から)。撮影指示書の judgement (「② 社内撮影」) と撮影担当 shooter は
+//      ここから決まるので AI には書かせない (仕様書: 撮影担当は商品単位で 1 つに統一)
+//    - 使う LP 画像は番号の配列 lp_image_nos (AI は ⑦ の番号で書く)。撮影指示書の lp_image (「2枚目｜…」の表示) は
+//      いまの構成の並びから撮影指示書の側で作る (人が並べ替えても元の画像で引ける)
 
 /** 撮影判定 → 撮影担当 (仕様書: 撮影担当は商品単位で 1 つに統一 = 撮影判定から決まる。AI には書かせない) */
 export const SHOOTER_LABELS = { none: 'なし', inhouse: '社内撮影', photographer: 'カメラマン撮影' };
+/** 撮影判定 → 仕様書の表記 (撮影指示書の SHOOT_JUDGEMENT_LABELS と同じ。① は撮影指示書を作らないので向こうには無い) */
+export const SHOOT_JUDGEMENT_TEXT = { none: '① 追加撮影不要', inhouse: '② 社内撮影', photographer: '③ カメラマン撮影' };
 /** 開封要否 (商品全体) */
-export const SHOOT_UNBOX_VALUES = ['不要', '必要', '一部必要'];
+export const SHOOT_OPEN_VALUES = ['不要', '必要', '一部必要'];
 /** 開封要否 (カットごと。仕様書「各撮影カットにも『開封要否：不要／必要』」) */
-export const SHOOT_CUT_UNBOX_VALUES = ['不要', '必要'];
+export const SHOOT_CUT_OPEN_VALUES = ['不要', '必要'];
 export const SHOOT_PRIORITY_VALUES = ['必須', '推奨'];
 /** 撮影表現タイプ */
 export const SHOOT_EXPRESSION_VALUES = ['物撮り', '使用イメージ', '物撮り＋使用イメージ'];
 /** 撮影対象バリエーション */
 export const SHOOT_VARIATION_VALUES = ['代表1色', '指定複数色', '全色個別', '全色同時'];
 /**
- * 概要の文字項目 (キー → 仕様書の項目名)。撮影判定 (recommended)・判定の結論 (reason)・開封要否 (unbox) は別に見る。
+ * 概要の文字項目 (キー → 仕様書の項目名)。撮影判定 (recommended)・開封要否 (open_required)・判定の結論 (conclusion) は別に見る。
  * 撮影なし (none) のときは "" (仕様書: ①は連携データを出さない)、撮影ありのときは空にしない
  */
 export const SHOOT_V2_SUMMARY_FIELDS = [
   ['send_targets', '撮影用送付対象'], ['purpose', '撮影目的'], ['finish', '完成イメージ'], ['usage', '使用用途'],
 ];
 /** 撮影判定 (v2) の上のキー。この順で保存する */
-export const SHOOT_V2_KEYS = ['recommended', 'reason', 'unbox', ...SHOOT_V2_SUMMARY_FIELDS.map(([k]) => k), 'cuts', 'images'];
+export const SHOOT_V2_KEYS = ['recommended', 'conclusion', 'open_required', ...SHOOT_V2_SUMMARY_FIELDS.map(([k]) => k), 'cuts', 'images'];
 /**
  * カット 1 つ (仕様書の【撮影カット_START】〜【撮影カット_END】の 1 ブロック) の項目。キー → 仕様書の項目名。
- * この順で保存する (仕様書の並びと同じ。最後の lp_image_no は商品ハブで足した「使う LP 画像の番号」)
+ * この順で保存する (仕様書の並び + 商品ハブで足した lp_image_nos・notice・required_notice。名前は撮影指示書の CUT_FIELDS と同じ)
  */
 export const SHOOT_V2_CUT_FIELDS = [
-  ['no', 'No'], ['priority', '優先度'], ['expression', '撮影表現タイプ'], ['variation', '撮影対象バリエーション'],
-  ['target', '撮影対象'], ['cut', '撮影内容'], ['purpose', '撮影目的'], ['composition', '構図・完成イメージ'],
-  ['usage', '使用用途'], ['unbox', '開封要否'], ['reference', '参考イメージ'], ['lp_image_no', '使う LP 画像の番号'],
+  ['no', 'No'], ['priority', '優先度'], ['expression_type', '撮影表現タイプ'], ['variation', '撮影対象バリエーション'],
+  ['target', '撮影対象'], ['content', '撮影内容'], ['purpose', '撮影目的'], ['finish', '構図・完成イメージ'],
+  ['usage', '使用用途'], ['open_required', '開封要否'], ['reference_theme', '参考イメージ'],
+  ['lp_image_nos', '使う LP 画像の番号'], ['notice', '注意'], ['required_notice', '必ず出す表示'],
 ];
 const V2_CUT_ENUMS = {
-  priority: SHOOT_PRIORITY_VALUES, expression: SHOOT_EXPRESSION_VALUES, variation: SHOOT_VARIATION_VALUES, unbox: SHOOT_CUT_UNBOX_VALUES,
+  priority: SHOOT_PRIORITY_VALUES, expression_type: SHOOT_EXPRESSION_VALUES, variation: SHOOT_VARIATION_VALUES, open_required: SHOOT_CUT_OPEN_VALUES,
 };
-/** 空にしてよいカットの文字項目 (参考画像が無ければ空欄でよい = 仕様書「参考イメージ記載ルール」) */
-const V2_CUT_OPTIONAL = new Set(['reference']);
+/** 空にしてよいカットの文字項目 (参考画像が無ければ空欄でよい = 仕様書「参考イメージ記載ルール」/ 注意・必ず出す表示は無ければ空) */
+const V2_CUT_OPTIONAL = new Set(['reference_theme', 'notice', 'required_notice']);
 /** v2 の判定の結論は「なぜこの担当・撮影内容なのか」まで書くので v1 より長く取る */
-export const SHOOT_V2_REASON_MAX = 600;
+export const SHOOT_V2_CONCLUSION_MAX = 600;
 /** カットの上限。撮影指示書 (PR-D) の MAX_CUTS と同じ (全色個別を実カット数に展開しても収まる) */
 export const SHOOT_V2_MAX_CUTS = 40;
-/** v2 の JSON の上限 (文字)。40 カット × 12 項目でも、ふつうの長さなら収まる */
+/** v2 の JSON の上限 (文字)。40 カット × 14 項目でも、ふつうの長さなら収まる */
 export const SHOOT_V2_RAW_MAX = 60_000;
 
-/** 送られてきた撮影判定がどちらの形か。cuts か unbox を持っていれば 2 (仕様書の形)。それ以外は 1 */
+/** 送られてきた撮影判定がどちらの形か。cuts か open_required を持っていれば 2 (仕様書の形)。それ以外は 1 */
 export function shootFormatOfRaw(raw) {
-  return isPlainObject(raw) && ('cuts' in raw || 'unbox' in raw) ? 2 : 1;
+  return isPlainObject(raw) && ('cuts' in raw || 'open_required' in raw) ? 2 : 1;
 }
 /** 依頼 (packet) が求める形。仕様書「新商品初動判定」を固めた依頼は 2、それ以外 (取り込む前・PR-C の依頼) は 1 */
 export function shootFormatOfPacket(packet) {
@@ -279,7 +286,7 @@ function textProblem(v, { max, required, at }) {
 /**
  * 仕様書「新商品初動判定」で判定した撮影判定 (v2) を検査して、保存する形にする。
  * v1 (validateShootJudgement) と同じく**厳しく**見る (欠け・余計・食い違いはどれも「判定なし」。直して受けない)
- * @param {{imageNos?: number[]|null}} opts imageNos = 構成の画像番号。渡せば images が「全部の画像に 1 つずつ」かと lp_image_no を照らす
+ * @param {{imageNos?: number[]|null}} opts imageNos = 構成の画像番号。渡せば images が「全部の画像に 1 つずつ」かを照らす
  * @returns {{ok:true, value:object}|{ok:false, errors:string[]}}
  */
 export function validateShootJudgementV2(raw, { imageNos = null } = {}) {
@@ -296,9 +303,9 @@ export function validateShootJudgementV2(raw, { imageNos = null } = {}) {
   const rec = raw.recommended;
   if (typeof rec !== 'string' || !SHOOT_RECOMMENDATIONS.includes(rec)) err(`recommended は ${SHOOT_RECOMMENDATIONS.join(' / ')} のどれかです`);
   const shooting = rec === 'inhouse' || rec === 'photographer';
-  const p = textProblem(raw.reason, { max: SHOOT_V2_REASON_MAX, required: true, at: 'reason (判定の結論)' });
+  const p = textProblem(raw.conclusion, { max: SHOOT_V2_CONCLUSION_MAX, required: true, at: 'conclusion (判定の結論)' });
   if (p) err(p);
-  if (typeof raw.unbox !== 'string' || !SHOOT_UNBOX_VALUES.includes(raw.unbox)) err(`unbox (開封要否) は ${SHOOT_UNBOX_VALUES.join(' / ')} のどれかです`);
+  if (typeof raw.open_required !== 'string' || !SHOOT_OPEN_VALUES.includes(raw.open_required)) err(`open_required (開封要否) は ${SHOOT_OPEN_VALUES.join(' / ')} のどれかです`);
   for (const [k, label] of SHOOT_V2_SUMMARY_FIELDS) {
     const q = textProblem(raw[k], { max: SHOOT_FIELD_MAX, required: false, at: `${k} (${label})` });
     if (q) { err(q); continue; }
@@ -311,10 +318,10 @@ export function validateShootJudgementV2(raw, { imageNos = null } = {}) {
   if (!Array.isArray(raw.cuts)) err('cuts は配列です');
   else if (raw.cuts.length > SHOOT_V2_MAX_CUTS) err(`cuts は ${SHOOT_V2_MAX_CUTS} 個までです (${raw.cuts.length} 個)`);
   else {
+    const keys = SHOOT_V2_CUT_FIELDS.map(([k]) => k);
     raw.cuts.forEach((c, i) => {
       const at = `cuts[${i}]`;
       if (!isPlainObject(c)) { err(`${at} はオブジェクトです`); return; }
-      const keys = SHOOT_V2_CUT_FIELDS.map(([k]) => k);
       for (const k of Object.keys(c)) if (!keys.includes(k)) err(`${at} に知らないキーがあります: ${k.slice(0, 40)}`);
       // 番号は 1 からの連番 (カット 1 つ = 別画像として撮る 1 枚。仕様書のカット数の数え方は AI が仕様書に従う)
       if (c.no !== i + 1) err(`${at}.no は ${i + 1} です (1 からの連番)`);
@@ -322,12 +329,13 @@ export function validateShootJudgementV2(raw, { imageNos = null } = {}) {
       for (const [k, label] of SHOOT_V2_CUT_FIELDS) {
         if (k === 'no') continue;
         const v = c[k];
-        // 🚨 欠けを "" / null で補わない (v1 と同じ。送られた値と保存する値を同じにする)
-        if (!(k in c)) { err(`${at}.${k} (${label}) がありません (無い値は ""${k === 'lp_image_no' ? '・LP に無いカットは null' : ''})`); continue; }
-        if (k === 'lp_image_no') {
-          if (v === null) { row[k] = null; continue; }
-          if (!Number.isInteger(v) || v < 0 || v > 99) { err(`${at}.lp_image_no (${label}) は ⑦ の画像の番号 (整数) か null です`); continue; }
-          row[k] = v;
+        // 🚨 欠けを "" / [] で補わない (v1 と同じ。送られた値と保存する値を同じにする)
+        if (!(k in c)) { err(`${at}.${k} (${label}) がありません (無い値は ${k === 'lp_image_nos' ? '[]・LP に無いカットは []' : '""'})`); continue; }
+        if (k === 'lp_image_nos') {
+          const okArr = Array.isArray(v) && v.length <= LINT_MAX_IMAGES && v.every((n) => Number.isInteger(n) && n >= 0 && n <= 99)
+            && new Set(v).size === v.length;
+          if (!okArr) { err(`${at}.lp_image_nos (${label}) は ⑦ の画像の番号 (整数・重複なし) の配列です (LP に無いカットは [])`); continue; }
+          row[k] = v.slice();
           continue;
         }
         if (V2_CUT_ENUMS[k]) {
@@ -365,12 +373,18 @@ export function validateShootJudgementV2(raw, { imageNos = null } = {}) {
     if (shooting && cuts.length === 0) err(`recommended が ${rec} なのに、撮影カットがありません`);
     const shoots = images.filter((x) => x.needs_shoot).length;
     if (rec === 'none' && shoots > 0) err(`recommended が none (追加撮影不要) なのに、撮影が要る画像が ${shoots} 枚あります`);
-    // カットを使う画像は「撮影が要る」(撮影が要らない画像に撮影カットを当てると、どちらを信じるか決められない)
+    // 画像とカットは両向きで合わせる (Codex PR-C2 名指し1 M):
+    //   カットを使う画像は「撮影が要る」/ 撮影が要る画像には、それを使うカットが 1 つ以上ある
+    //   (片方だけだと、撮影指示書にカットが載らない要撮影の画像や、要らない画像のためのカットができる)
     for (const c of cuts) {
-      if (c.lp_image_no === null) continue;
-      const im = images.find((x) => x.no === c.lp_image_no);
-      if (!im) err(`カット ${c.no} の lp_image_no = ${c.lp_image_no} は images にありません`);
-      else if (!im.needs_shoot) err(`カット ${c.no} は ${c.lp_image_no}枚目 に使うのに、${c.lp_image_no}枚目 の needs_shoot が false です`);
+      for (const n of c.lp_image_nos) {
+        const im = images.find((x) => x.no === n);
+        if (!im) err(`カット ${c.no} の lp_image_nos の ${n} は images にありません`);
+        else if (!im.needs_shoot) err(`カット ${c.no} は ${n}枚目 に使うのに、${n}枚目 の needs_shoot が false です`);
+      }
+    }
+    for (const im of images) {
+      if (im.needs_shoot && !cuts.some((c) => c.lp_image_nos.includes(im.no))) err(`${im.no}枚目 は needs_shoot が true なのに、${im.no}枚目 に使うカットがありません (lp_image_nos に ${im.no} を入れる)`);
     }
   }
   if (errors.length === 0 && imageNos) {
@@ -395,6 +409,7 @@ export function validateShootJudgementV2(raw, { imageNos = null } = {}) {
  * 仕様書の運用ルールのうち、**強制はせず知らせるだけ**のもの (画面と `./phlp lint --shoot` に出す)。
  * 🚨 ここに決まりを増やさない — 仕様書が変わるたびにコードを直すことになる。判定は AI が仕様書に従ってする。
  * いまは「カメラマン撮影は 5 カット単位」(仕様書の最終チェック・担当者向け手順 5) だけ。v1 (PR-C の形) には出さない
+ * (撮影指示書のシートにも同じ知らせが出る = lib/shoot-sheet.js の cutCountWarning)
  */
 export function shootWarnings(value) {
   const out = [];
@@ -407,16 +422,18 @@ export function shootWarnings(value) {
 }
 
 const blankV1Cut = () => ({ cut: '', composition: '', props: '', background: '', tone: '', ng: '' });
+const blankV2Cut = () => Object.fromEntries(SHOOT_V2_CUT_FIELDS.map(([k]) => [k, k === 'lp_image_nos' ? [] : '']));
 
 /**
  * 検査を通った撮影判定 (v1 / v2 どちらでも) を、読み口 (latestShootJudgement) の形にそろえる。
- *   - 概要: format (1|2)・recommended・shooter (撮影担当)・unbox・send_targets・purpose・finish・usage・reason
- *   - cuts: 仕様書のカット (SHOOT_V2_CUT_FIELDS の 12 項目)。cut_count = その数
- *   - images: 画像ごと {no, needs_shoot, cut, composition, props, background, tone, ng}
- *     🚨 PR-C の形 (撮影指示書 PR-D の cutsFromSlots が読む) のまま返す。v2 では cut・composition に
- *        その画像に使うカット (lp_image_no) の 撮影内容・構図・完成イメージ を入れ、ほかは ""
+ *   - format (1|2)・recommended・reason (判定の結論 = 画面が出す文)
+ *   - summary: 撮影指示書の SUMMARY_FIELDS の形 {judgement, shooter, open_required, send_targets, purpose, finish, usage, conclusion}
+ *   - cuts: 撮影指示書の CUT_FIELDS の形 (+ no・lp_image_nos)。cut_count = その数
+ *   - images: 画像ごと {no, needs_shoot, cut, composition, props, background, tone, ng} (PR-C の形のまま。v1 の撮影指示書の材料)。
+ *     v2 では cut・composition に、その画像を使う最初のカットの 撮影内容・構図・完成イメージ を入れ、ほかは ""
  *   - warnings: shootWarnings
- * v1 (PR-C の形で保存済みの行) は v2 の形に寄せる: 撮影が要る画像を 1 カットずつにし、v1 に無い項目は ""
+ * v1 (PR-C の形で保存済みの行) は v2 の形に寄せる: 撮影が要る画像を 1 カットずつ (撮影内容 = cut・完成イメージ = composition・
+ * 注意 = ng) にし、v1 に無い項目は ""
  */
 export function shootReadModel(value) {
   if (!value) return null;
@@ -424,26 +441,29 @@ export function shootReadModel(value) {
   let cuts;
   let images;
   if (v2) {
-    cuts = value.cuts.map((c) => ({ ...c }));
+    cuts = value.cuts.map((c) => ({ ...c, lp_image_nos: c.lp_image_nos.slice() }));
     images = value.images.map((im) => {
-      const c = im.needs_shoot ? cuts.find((x) => x.lp_image_no === im.no) : null;
-      return { no: im.no, needs_shoot: im.needs_shoot, ...blankV1Cut(), ...(c ? { cut: c.cut, composition: c.composition } : {}) };
+      const c = im.needs_shoot ? cuts.find((x) => x.lp_image_nos.includes(im.no)) : null;
+      return { no: im.no, needs_shoot: im.needs_shoot, ...blankV1Cut(), ...(c ? { cut: c.content, composition: c.finish } : {}) };
     });
   } else {
     images = value.images.map((im) => ({ ...im }));
-    cuts = images.filter((im) => im.needs_shoot).map((im, i) => {
-      const c = {};
-      for (const [k] of SHOOT_V2_CUT_FIELDS) c[k] = '';
-      return { ...c, no: i + 1, cut: im.cut, composition: im.composition, lp_image_no: im.no };
-    });
+    cuts = images.filter((im) => im.needs_shoot).map((im, i) => ({
+      ...blankV2Cut(), no: i + 1, content: im.cut, finish: im.composition, notice: im.ng, lp_image_nos: [im.no],
+    }));
   }
+  const summary = {
+    judgement: SHOOT_JUDGEMENT_TEXT[value.recommended] || '',
+    shooter: SHOOTER_LABELS[value.recommended] || '',
+    open_required: v2 ? value.open_required : '',
+    ...Object.fromEntries(SHOOT_V2_SUMMARY_FIELDS.map(([k]) => [k, v2 ? value[k] : ''])),
+    conclusion: v2 ? value.conclusion : value.reason,
+  };
   const model = {
     format: v2 ? 2 : 1,
     recommended: value.recommended,
-    shooter: SHOOTER_LABELS[value.recommended] || '',
-    unbox: v2 ? value.unbox : '',
-    ...Object.fromEntries(SHOOT_V2_SUMMARY_FIELDS.map(([k]) => [k, v2 ? value[k] : ''])),
-    reason: value.reason,
+    reason: summary.conclusion,
+    summary,
     cuts,
     cut_count: cuts.length,
     images,
@@ -457,6 +477,7 @@ export function shootReadModel(value) {
  * 🚨 判定の決まりはここに書かない (仕様書が正本)。ここに書くのは「どの材料を使うか」と「JSON の形」だけ。
  *    仕様書は claim で shoot-spec-<ID>.md に落ちる (phlp)
  */
+const quoted = (xs) => xs.map((x) => `"${x}"`).join(' / ');
 export const SHOOT_SPEC_INSTRUCTION = [
   '【撮影判定】(LP構成とは別に出してください・仕様書「新商品初動判定」で判定します)',
   '⑦の構成を書き終えて検品と直しが終わったら、仕様書「新商品初動判定」の判定ロジックに従って、この商品の撮影判定と撮影依頼書連携データを決め、JSON で出してください。',
@@ -474,28 +495,30 @@ export const SHOOT_SPEC_INSTRUCTION = [
   '',
   'JSON の項目 (仕様書の「撮影依頼書連携データ」との対応。この形以外のキーを足さない・どの項目も省略しない):',
   '- recommended: 撮影判定。"none" = ①追加撮影不要 / "inhouse" = ②社内撮影 / "photographer" = ③カメラマン撮影 (撮影担当はここから決まるので書かない)',
-  `- reason: 判定の結論 (なぜこの担当・撮影内容なのか。人が読んで撮影判定を決める。${SHOOT_V2_REASON_MAX} 字まで)`,
-  `- unbox: 開封要否 (${SHOOT_UNBOX_VALUES.map((x) => `"${x}"`).join(' / ')})`,
+  `- conclusion: 判定の結論 (なぜこの担当・撮影内容なのか。人が読んで撮影判定を決める。${SHOOT_V2_CONCLUSION_MAX} 字まで)`,
+  `- open_required: 開封要否 (${quoted(SHOOT_OPEN_VALUES)})`,
   '- send_targets: 撮影用送付対象 / purpose: 撮影目的 / finish: 完成イメージ / usage: 使用用途',
   '- cuts: 撮影カット一覧。1 カット = 1 つ (【撮影カット_START】〜【撮影カット_END】の 1 ブロックに当たる):',
-  `  - no: 1 からの連番 / priority: 優先度 (${SHOOT_PRIORITY_VALUES.map((x) => `"${x}"`).join(' / ')}) / expression: 撮影表現タイプ (${SHOOT_EXPRESSION_VALUES.map((x) => `"${x}"`).join(' / ')})`,
-  `  - variation: 撮影対象バリエーション (${SHOOT_VARIATION_VALUES.map((x) => `"${x}"`).join(' / ')})`,
-  '  - target: 撮影対象 / cut: 撮影内容 (短い見出し) / purpose: 撮影目的 / composition: 構図・完成イメージ / usage: 使用用途',
-  `  - unbox: 開封要否 (${SHOOT_CUT_UNBOX_VALUES.map((x) => `"${x}"`).join(' / ')}) / reference: 参考イメージ (AI 参考画像を作るための短いテーマ名。無ければ "")`,
-  '  - lp_image_no: このカットを使う ⑦ の画像の番号 (# N枚目 の N)。LP に無いが必要なカットは null',
+  `  - no: 1 からの連番 / priority: 優先度 (${quoted(SHOOT_PRIORITY_VALUES)}) / expression_type: 撮影表現タイプ (${quoted(SHOOT_EXPRESSION_VALUES)})`,
+  `  - variation: 撮影対象バリエーション (${quoted(SHOOT_VARIATION_VALUES)})`,
+  '  - target: 撮影対象 / content: 撮影内容 (短い見出し) / purpose: 撮影目的 / finish: 構図・完成イメージ / usage: 使用用途',
+  `  - open_required: 開封要否 (${quoted(SHOOT_CUT_OPEN_VALUES)}) / reference_theme: 参考イメージ (AI 参考画像を作るための短いテーマ名。無ければ "")`,
+  '  - lp_image_nos: このカットの写真を使う ⑦ の画像の番号 (# N枚目 の N) の配列。LP に無いが必要なカットは []',
+  '  - notice: 撮影者への注意 (無ければ "") / required_notice: 撮影依頼書に必ず出す表示 (仕様書が必ず書けという表示。無ければ "")',
   '- images: ⑦の画像見出し (# N枚目｜…) の N ごとに 1 つずつ、全部の画像について {"no": N, "needs_shoot": true か false}',
   '  (needs_shoot = その画像を作るのに追加撮影の写真が要るか)',
   '',
   'サーバが形を検査します (./phlp lint --shoot で先に確かめられます):',
   '- recommended が "none" なら cuts は [] で、send_targets・purpose・finish・usage は ""、needs_shoot はすべて false',
   '- "inhouse" か "photographer" なら cuts を 1 つ以上書き、send_targets・purpose・finish・usage は空にしない',
-  '- lp_image_no を書いたカットの画像は needs_shoot を true にする',
-  `- 文字は ${SHOOT_FIELD_MAX} 字まで (reason は ${SHOOT_V2_REASON_MAX} 字まで)。文字の前後に空白や改行を入れない。無い値は "" (lp_image_no だけは null)`,
+  '- 画像とカットは両向きで合わせる: lp_image_nos に入れた画像は needs_shoot を true にし、needs_shoot が true の画像はどれかのカットの lp_image_nos に入れる',
+  `- 文字は ${SHOOT_FIELD_MAX} 字まで (conclusion は ${SHOOT_V2_CONCLUSION_MAX} 字まで)。文字の前後に空白や改行を入れない。無い値は "" (lp_image_nos だけは [])`,
   '- 材料に無い素材を「ある」ことにしない。色名・種類名が分からなければ「要確認」と書く',
   '- lint の warnings は仕様書の運用ルールの知らせです (通らないわけではありません)。仕様書を読み直して、直すべきなら直してください',
   '',
   '形:',
-  '{"recommended":"inhouse","reason":"…","unbox":"不要","send_targets":"…","purpose":"…","finish":"…","usage":"…",'
-    + '"cuts":[{"no":1,"priority":"必須","expression":"物撮り","variation":"代表1色","target":"…","cut":"…","purpose":"…","composition":"…","usage":"…","unbox":"不要","reference":"…","lp_image_no":2}],'
+  '{"recommended":"inhouse","conclusion":"…","open_required":"不要","send_targets":"…","purpose":"…","finish":"…","usage":"…",'
+    + '"cuts":[{"no":1,"priority":"必須","expression_type":"物撮り","variation":"代表1色","target":"…","content":"…","purpose":"…","finish":"…","usage":"…",'
+    + '"open_required":"不要","reference_theme":"…","lp_image_nos":[2],"notice":"","required_notice":""}],'
     + '"images":[{"no":0,"needs_shoot":false}, …]}',
 ].join('\n');

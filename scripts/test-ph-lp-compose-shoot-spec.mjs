@@ -15,6 +15,8 @@ const tmp = await temporaryTestDataDir(import.meta.url, 'test-lp-compose-shoot-s
  *   ⑤ 古い実行役 (仕様書を落とせない phlp) には仕様書つきの依頼を掴ませない
  *   ⑥ 表の CHECK を広げる作り直しで、行・id・採番・追記専用のトリガー・一意索引を失わない
  *   ⑦ 画面: 撮影判定の箱に 開封要否・カット数・撮影用送付対象 を短く出す / 一覧の取り込みカードで種類を選べる
+ *   ⑧ 撮影指示書 (PR-D): 項目名は CUT_FIELDS / SUMMARY_FIELDS と同じ。v2 なら AI のカット (LP に無いカットも) と概要をそのまま渡す。
+ *      要撮影の正本 (編集版の shoot → AI の needs_shoot) と、元の画像を uid の a<番号> で引く作法は D のまま
  */
 process.env.PH_SERVICE_TOKEN = 'test-token-lp-shoot-spec';
 process.env.PH_LP_COMPOSE_ENABLED = '1';
@@ -104,6 +106,7 @@ const db = dbmod.initProductHubDB();
 
 const lp = await import('../apps/product-hub/lib/lp-compose.js');
 const sh = await import('../apps/product-hub/lib/lp-shoot.js');
+const sheet = await import('../apps/product-hub/lib/shoot-sheet.js');
 const pt = await import('../apps/product-hub/lib/prompt-templates.js');
 const wf = await import('../apps/product-hub/lib/workflow.js');
 const express = (await import('express')).default;
@@ -111,22 +114,22 @@ const { default: router, serviceApiRouter } = await import('../apps/product-hub/
 
 const NAME = 'ハッカ油スプレー 100ml';
 const OUT = compositionFor(NAME);   // 0枚目・1枚目・2枚目
-/** 仕様書の形 (v2) の正しい撮影判定 (社内撮影・2枚目に使う 1 カット + LP に無い 1 カット) */
+/** 仕様書の形 (v2) の正しい撮影判定 (社内撮影・2枚目に使う 1 カット + LP に無い 1 カット)。項目名は撮影指示書 (PR-D) の CUT_FIELDS と同じ */
 const cutOf = (no, patch = {}) => ({
-  no, priority: '必須', expression: '使用イメージ', variation: '代表1色', target: 'ハッカ油スプレー 100ml (1本)',
-  cut: '玄関でスプレーする手元', purpose: '使う場面を伝える', composition: '斜め上から手元と商品。ラベルが読めること',
-  usage: '楽天 LP 2枚目', unbox: '不要', reference: '玄関で使う手元', lp_image_no: 2, ...patch,
+  no, priority: '必須', expression_type: '使用イメージ', variation: '代表1色', target: 'ハッカ油スプレー 100ml (1本)',
+  content: '玄関でスプレーする手元', purpose: '使う場面を伝える', finish: '斜め上から手元と商品。ラベルが読めること',
+  usage: '楽天 LP 2枚目', open_required: '不要', reference_theme: '玄関で使う手元', lp_image_nos: [2], notice: '顔を写さない', required_notice: '', ...patch,
 });
 const goodV2 = () => ({
   recommended: 'inhouse',
-  reason: '2枚目の使用シーンの実写がありません。消耗品なので社内の簡易物撮りで足ります。',
-  unbox: '不要', send_targets: 'ハッカ油スプレー 100ml (1本)', purpose: '使用シーンの実写を揃える',
+  conclusion: '2枚目の使用シーンの実写がありません。消耗品なので社内の簡易物撮りで足ります。',
+  open_required: '不要', send_targets: 'ハッカ油スプレー 100ml (1本)', purpose: '使用シーンの実写を揃える',
   finish: '玄関で使っている手元が分かる明るい写真', usage: '楽天 LP・サムネイル',
-  cuts: [cutOf(1), cutOf(2, { priority: '推奨', expression: '物撮り', cut: 'ボトルを手に持ったサイズ感', reference: '', lp_image_no: null })],
+  cuts: [cutOf(1), cutOf(2, { priority: '推奨', expression_type: '物撮り', content: 'ボトルを手に持ったサイズ感', reference_theme: '', notice: '', lp_image_nos: [] })],
   images: [{ no: 0, needs_shoot: false }, { no: 1, needs_shoot: false }, { no: 2, needs_shoot: true }],
 });
 const noneV2 = () => ({
-  recommended: 'none', reason: '既存素材と図解で足ります。', unbox: '不要',
+  recommended: 'none', conclusion: '既存素材と図解で足ります。', open_required: '不要',
   send_targets: '', purpose: '', finish: '', usage: '', cuts: [],
   images: [0, 1, 2].map((no) => ({ no, needs_shoot: false })),
 });
@@ -144,13 +147,15 @@ console.log('③ 形 v2 の検査 (lib/lp-shoot.js・純粋関数)');
   const v = sh.validateShootJudgementV2(goodV2(), { imageNos: [0, 1, 2] });
   ok(v.ok, `正しい形 (社内撮影・LP に無いカットつき) は通る ${v.ok ? '' : v.errors.join(' / ')}`);
   eq(Object.keys(v.value), sh.SHOOT_V2_KEYS, '上のキーはこの順で保存する');
-  eq(Object.keys(v.value.cuts[0]), sh.SHOOT_V2_CUT_FIELDS.map(([k]) => k), 'カットの項目は仕様書の並び (No〜参考イメージ + 使う LP 画像の番号)');
-  eq(v.value.cuts[1].lp_image_no, null, 'LP に無いカットは lp_image_no: null のまま');
-  eq(v.value.cuts[1].reference, '', '参考イメージは空でよい (仕様書: 参考画像が無ければ空欄)');
+  eq(Object.keys(v.value.cuts[0]), sh.SHOOT_V2_CUT_FIELDS.map(([k]) => k), 'カットの項目は仕様書の並び (No〜参考イメージ + 使う LP 画像・注意・必ず出す表示)');
+  eq(v.value.cuts[1].lp_image_nos, [], 'LP に無いカットは lp_image_nos: [] のまま');
+  eq(v.value.cuts[1].reference_theme, '', '参考イメージは空でよい (仕様書: 参考画像が無ければ空欄)');
   ok(sh.validateShootJudgementV2(noneV2(), { imageNos: [0, 1, 2] }).ok, '追加撮影不要 (カットなし・概要は "") は通る');
-  const photo = { ...goodV2(), recommended: 'photographer', cuts: [1, 2, 3, 4, 5].map((n) => cutOf(n, { lp_image_no: n === 1 ? 2 : null })) };
+  const shared = { ...goodV2(), images: [{ no: 0, needs_shoot: false }, { no: 1, needs_shoot: true }, { no: 2, needs_shoot: true }], cuts: [cutOf(1, { lp_image_nos: [1, 2] })] };
+  ok(sh.validateShootJudgementV2(shared, { imageNos: [0, 1, 2] }).ok, '1 つのカットを 2 枚の LP 画像で使える (lp_image_nos が配列)');
+  const photo = { ...goodV2(), recommended: 'photographer', cuts: [1, 2, 3, 4, 5].map((n) => cutOf(n, { lp_image_nos: n === 1 ? [2] : [] })) };
   ok(sh.validateShootJudgementV2(photo, { imageNos: [0, 1, 2] }).ok, 'カメラマン撮影 5 カットは通る');
-  const photo7 = { ...photo, cuts: [1, 2, 3, 4, 5, 6, 7].map((n) => cutOf(n, { lp_image_no: null })) };
+  const photo7 = { ...photo, cuts: [1, 2, 3, 4, 5, 6, 7].map((n) => cutOf(n, { lp_image_nos: n === 1 ? [2] : [] })) };
   ok(sh.validateShootJudgementV2(photo7, { imageNos: [0, 1, 2] }).ok, '🚨 カメラマン撮影 7 カットも通る (5 カット単位は仕様書の運用ルール = 強制しない)');
   eq(sh.shootWarnings(sh.validateShootJudgementV2(photo7, { imageNos: [0, 1, 2] }).value), ['カメラマン撮影は 5 カット単位です (仕様書「新商品初動判定」) が、7 カットです'], '代わりに警告を出す');
   eq(sh.shootWarnings(sh.validateShootJudgementV2(photo, { imageNos: [0, 1, 2] }).value), [], '5 カットなら警告なし');
@@ -165,43 +170,48 @@ console.log('③ 形 v2 の検査 (lib/lp-shoot.js・純粋関数)');
   const withoutCut = (k) => { const g = goodV2(); delete g.cuts[0][k]; return g; };
   bad(null, 'null');
   bad({ ...goodV2(), shooter: '社内撮影' }, '知らないキー (撮影担当は撮影判定から決まるので受けない)');
-  for (const k of ['unbox', 'send_targets', 'purpose', 'finish', 'usage', 'cuts', 'images', 'reason']) bad(without(k), `${k} が無い (欠けを補わない)`);
+  bad({ ...goodV2(), reason: '理由' }, '知らないキー (v2 の判定の結論は conclusion)');
+  for (const k of ['open_required', 'send_targets', 'purpose', 'finish', 'usage', 'cuts', 'images', 'conclusion']) bad(without(k), `${k} が無い (欠けを補わない)`);
   bad({ ...goodV2(), recommended: '社内撮影' }, '撮影判定が日本語 (none / inhouse / photographer だけ)');
-  bad({ ...goodV2(), unbox: 'いいえ' }, '開封要否が列挙値でない');
-  bad({ ...goodV2(), unbox: '不要 ' }, '開封要否の後ろに空白');
-  bad({ ...goodV2(), reason: '' }, '判定の結論が空');
-  bad({ ...goodV2(), reason: 'あ'.repeat(sh.SHOOT_V2_REASON_MAX + 1) }, '判定の結論が長すぎる');
+  bad({ ...goodV2(), open_required: 'いいえ' }, '開封要否が列挙値でない');
+  bad({ ...goodV2(), open_required: '不要 ' }, '開封要否の後ろに空白');
+  bad({ ...goodV2(), conclusion: '' }, '判定の結論が空');
+  bad({ ...goodV2(), conclusion: 'あ'.repeat(sh.SHOOT_V2_CONCLUSION_MAX + 1) }, '判定の結論が長すぎる');
   bad({ ...goodV2(), send_targets: '' }, '🚨 撮影するのに撮影用送付対象が空');
   bad({ ...goodV2(), purpose: ' 目的' }, '撮影目的の前に空白 (trim して受けない)');
   bad({ ...goodV2(), finish: 'a' + String.fromCharCode(1) }, '完成イメージに制御文字');
   bad({ ...noneV2(), send_targets: 'ブラック (1本)' }, '🚨 追加撮影不要なのに撮影用送付対象がある (食い違い)');
-  bad({ ...noneV2(), cuts: [cutOf(1, { lp_image_no: null })] }, '🚨 追加撮影不要なのに撮影カットがある (食い違い)');
+  bad({ ...noneV2(), cuts: [cutOf(1, { lp_image_nos: [] })] }, '🚨 追加撮影不要なのに撮影カットがある (食い違い)');
   bad({ ...noneV2(), images: [{ no: 0, needs_shoot: false }, { no: 1, needs_shoot: false }, { no: 2, needs_shoot: true }] }, '🚨 追加撮影不要なのに撮影が要る画像がある');
   bad({ ...goodV2(), cuts: [] }, '🚨 社内撮影なのに撮影カットが無い');
   bad({ ...goodV2(), cuts: {} }, 'cuts が配列でない');
-  bad({ ...goodV2(), cuts: Array.from({ length: sh.SHOOT_V2_MAX_CUTS + 1 }, (_, i) => cutOf(i + 1, { lp_image_no: null })) }, 'カットが多すぎる');
+  bad({ ...goodV2(), cuts: Array.from({ length: sh.SHOOT_V2_MAX_CUTS + 1 }, (_, i) => cutOf(i + 1, { lp_image_nos: i === 0 ? [2] : [] })) }, 'カットが多すぎる');
   bad(withCut({ no: 2 }), 'カットの番号が 1 からの連番でない');
   bad(withCut({ no: '1' }), 'カットの番号が文字列');
-  for (const k of ['priority', 'expression', 'variation', 'target', 'cut', 'purpose', 'composition', 'usage', 'unbox', 'reference', 'lp_image_no']) bad(withoutCut(k), `カットの ${k} が無い`);
+  for (const [k] of sh.SHOOT_V2_CUT_FIELDS.slice(1)) bad(withoutCut(k), `カットの ${k} が無い`);
   {
-    const r = sh.validateShootJudgementV2(withoutCut('lp_image_no'), { imageNos: [0, 1, 2] });
-    ok(!r.ok && r.errors.some((e) => /lp_image_no .*がありません.*null/.test(e)), `🚨 欠けは「無い」と言う (null で補わない・LP に無いカットは null と書くよう返す) (${r.errors?.[0]})`);
+    const r = sh.validateShootJudgementV2(withoutCut('lp_image_nos'), { imageNos: [0, 1, 2] });
+    ok(!r.ok && r.errors.some((e) => /lp_image_nos .*がありません/.test(e)), `🚨 欠けは「無い」と言う ([] で補わない) (${r.errors?.[0]})`);
   }
   bad(withCut({ priority: '任意' }), '優先度が列挙値でない');
-  bad(withCut({ expression: '物撮り+使用イメージ' }), '撮影表現タイプが仕様書の表記と違う (半角 +)');
+  bad(withCut({ expression_type: '物撮り+使用イメージ' }), '撮影表現タイプが仕様書の表記と違う (半角 +)');
   bad(withCut({ variation: '全色' }), '撮影対象バリエーションが列挙値でない');
-  bad(withCut({ unbox: '一部必要' }), '🚨 カットの開封要否は 不要 / 必要 だけ (一部必要 は商品全体の値)');
+  bad(withCut({ open_required: '一部必要' }), '🚨 カットの開封要否は 不要 / 必要 だけ (一部必要 は商品全体の値)');
   bad(withCut({ target: '' }), '撮影対象が空');
-  bad(withCut({ cut: '' }), '撮影内容が空');
-  bad(withCut({ composition: 'x'.repeat(sh.SHOOT_FIELD_MAX + 1) }), '構図・完成イメージが長すぎる');
+  bad(withCut({ content: '' }), '撮影内容が空');
+  bad(withCut({ finish: 'x'.repeat(sh.SHOOT_FIELD_MAX + 1) }), '構図・完成イメージが長すぎる');
+  bad(withCut({ required_notice: 3 }), '必ず出す表示が文字列でない');
   bad(withCut({ extra: 'x' }), 'カットに知らないキー');
-  bad(withCut({ lp_image_no: '2' }), 'lp_image_no が文字列');
-  bad(withCut({ lp_image_no: 1 }), '🚨 カットを使う画像 (1枚目) が needs_shoot: false (食い違い)');
-  bad(withCut({ lp_image_no: 7 }), 'カットを使う画像が images に無い');
+  bad(withCut({ lp_image_nos: 2 }), 'lp_image_nos が配列でない');
+  bad(withCut({ lp_image_nos: ['2'] }), 'lp_image_nos に文字列');
+  bad(withCut({ lp_image_nos: [2, 2] }), 'lp_image_nos に重複');
+  bad(withCut({ lp_image_nos: [2, 1] }), '🚨 カットを使う画像 (1枚目) が needs_shoot: false (食い違い)');
+  bad(withCut({ lp_image_nos: [2, 7] }), 'カットを使う画像が images に無い');
+  bad(withCut({ lp_image_nos: [] }), '🚨 needs_shoot: true の 2枚目 を使うカットが無い (撮影指示書から抜ける・Codex PR-C2 名指し1)');
   bad({ ...goodV2(), images: goodV2().images.slice(0, 2).concat([{ no: 2, needs_shoot: true, cut: 'x' }]) }, '🚨 images に撮影の中身を書いた (v2 は cuts に書く)');
   bad({ ...goodV2(), images: goodV2().images.slice(1) }, '🚨 構成の画像が足りない (0枚目 の判定が無い)');
   bad({ ...goodV2(), images: [...goodV2().images, { no: 5, needs_shoot: false }] }, '🚨 構成に無い画像の判定がある');
-  bad({ ...goodV2(), reason: 'x'.repeat(sh.SHOOT_V2_RAW_MAX) }, '大きすぎる');
+  bad({ ...goodV2(), conclusion: 'x'.repeat(sh.SHOOT_V2_RAW_MAX) }, '大きすぎる');
   const circ = goodV2(); circ.self = circ;
   let threw = false;
   try { bad(circ, '循環参照'); } catch { threw = true; }
@@ -213,7 +223,7 @@ console.log('③ 形 v2 の検査 (lib/lp-shoot.js・純粋関数)');
   const asV2 = sh.validateShootForComposition(goodV2(), OUT, { format: 1 });
   ok(!asV2.ok, '🚨 仕様書を渡していない依頼に v2 の形が来たら受けない');
   ok(sh.validateShootForComposition(goodV2(), OUT, { format: 2 }).ok && sh.validateShootForComposition(goodV1(), OUT, { format: 1 }).ok, 'それぞれ合う形なら通る');
-  ok(sh.validateShootForComposition(goodV2(), OUT).ok && sh.validateShootForComposition(goodV1(), OUT).ok, "'auto' (保存済みを読み直すとき) はどちらも見分けて通す");
+  ok(sh.validateShootForComposition(goodV2(), OUT).ok && sh.validateShootForComposition(goodV1(), OUT).ok, "'auto' はどちらも見分けて通す");
   eq(sh.shootFormatOfPacket({ shoot_spec: { id: 1 } }), 2, 'packet に shoot_spec があれば 2');
   eq(sh.shootFormatOfPacket({ shoot_spec: null }), 1, '無ければ 1');
 
@@ -221,31 +231,39 @@ console.log('③ 形 v2 の検査 (lib/lp-shoot.js・純粋関数)');
   const ins = sh.SHOOT_SPEC_INSTRUCTION;
   const allKeys = [...sh.SHOOT_V2_KEYS, ...sh.SHOOT_V2_CUT_FIELDS.map(([k]) => k), 'needs_shoot'];
   ok(allKeys.every((k) => ins.includes(k)), '指示文は検査するキーを全部書いている');
-  const allValues = [...sh.SHOOT_UNBOX_VALUES, ...sh.SHOOT_PRIORITY_VALUES, ...sh.SHOOT_EXPRESSION_VALUES, ...sh.SHOOT_VARIATION_VALUES, ...sh.SHOOT_RECOMMENDATIONS];
+  const allValues = [...sh.SHOOT_OPEN_VALUES, ...sh.SHOOT_PRIORITY_VALUES, ...sh.SHOOT_EXPRESSION_VALUES, ...sh.SHOOT_VARIATION_VALUES, ...sh.SHOOT_RECOMMENDATIONS];
   ok(allValues.every((x) => ins.includes(`"${x}"`)), '指示文は列挙値を全部書いている');
   ok(ins.includes('shoot-spec-<ID>.md') && ins.includes('仕様書が正本') && ins.includes('offset'), '指示文: 仕様書のファイルを最後まで読む・仕様書が正本');
   ok(!/5 ?カット|最低5|革製品|消耗品/.test(ins), '🚨 指示文に仕様書の判定の決まり (5 カット・革製品・消耗品 …) を書き写していない');
   ok(ins.includes('⑦の本文には何も足さない'), '🚨 指示文が「⑦の本文に足さない」と言っている');
   ok(!pt.PRODUCT_ANALYSIS_INSTRUCTION.includes('新商品初動判定'), '🚨 構成の指示文 (スタッフと共有の正本) は変わらない');
+  // 🚨 項目名は撮影指示書 (PR-D) の CUT_FIELDS / SUMMARY_FIELDS と同じ (違うのは lp_image_nos ↔ lp_image だけ)
+  const v2CutKeys = sh.SHOOT_V2_CUT_FIELDS.map(([k]) => k).filter((k) => k !== 'no');
+  eq(v2CutKeys.filter((k) => !sheet.CUT_FIELDS.includes(k)), ['lp_image_nos'], 'カットの項目は撮影指示書の CUT_FIELDS にある (lp_image_nos だけは番号の配列)');
+  eq(sheet.CUT_FIELDS.filter((k) => !v2CutKeys.includes(k)), ['lp_image'], '撮影指示書の CUT_FIELDS は AI が全部埋める (lp_image は表示なので撮影指示書が作る)');
+  const v2SumKeys = ['open_required', ...sh.SHOOT_V2_SUMMARY_FIELDS.map(([k]) => k), 'conclusion'];
+  eq(sheet.SUMMARY_FIELDS.filter((k) => !v2SumKeys.includes(k)), ['judgement', 'shooter'], '概要は撮影判定・撮影担当 (撮影判定の箱の値) のほかを AI が埋める');
 }
 
-console.log('④ 読み口の形 (shootReadModel) — v1 を v2 に寄せる / PR-D が読む images の形は保つ');
+console.log('④ 読み口の形 (shootReadModel) — v1 を v2 に寄せる / 撮影指示書の形の summary・cuts');
 {
   const m1 = sh.shootReadModel(sh.validateShootJudgement(goodV1(), { imageNos: [0, 1, 2] }).value);
-  eq([m1.format, m1.recommended, m1.shooter, m1.unbox, m1.send_targets, m1.cut_count], [1, 'inhouse', '社内撮影', '', '', 1], 'v1: 概要の v2 の項目は空・撮影担当は撮影判定から');
-  eq(m1.cuts[0], { no: 1, priority: '', expression: '', variation: '', target: '', cut: '玄関の手元', purpose: '', composition: '斜め上から', usage: '', unbox: '', reference: '', lp_image_no: 2 },
-    'v1: 撮影が要る画像を 1 カットずつにする (撮影内容 = cut・構図 = composition・使う画像 = no)');
+  eq([m1.format, m1.recommended, m1.reason, m1.cut_count], [1, 'inhouse', '2枚目 の写真がありません。', 1], 'v1: 撮影判定と理由');
+  eq(m1.summary, { judgement: '② 社内撮影', shooter: '社内撮影', open_required: '', send_targets: '', purpose: '', finish: '', usage: '', conclusion: '2枚目 の写真がありません。' },
+    'v1: 概要 (撮影指示書の SUMMARY_FIELDS の形)。v1 に無い項目は空・撮影担当は撮影判定から');
+  eq(m1.cuts[0], { no: 1, priority: '', expression_type: '', variation: '', target: '', content: '玄関の手元', purpose: '', finish: '斜め上から', usage: '', open_required: '', reference_theme: '', lp_image_nos: [2], notice: '顔を写さない', required_notice: '' },
+    'v1: 撮影が要る画像を 1 カットずつにする (撮影内容 = cut・完成イメージ = composition・注意 = ng)');
   eq(m1.images[2], goodV1().images[2], '🚨 v1: images は保存したまま (props・background・tone・ng も残す)');
   eq(m1.warnings, [], 'v1 には警告を出さない');
   const m2 = sh.shootReadModel(sh.validateShootJudgementV2(goodV2(), { imageNos: [0, 1, 2] }).value);
-  eq([m2.format, m2.shooter, m2.unbox, m2.send_targets, m2.cut_count], [2, '社内撮影', '不要', 'ハッカ油スプレー 100ml (1本)', 2], 'v2: 概要');
-  eq(m2.images.map((im) => Object.keys(im)), [0, 1, 2].map(() => ['no', 'needs_shoot', 'cut', 'composition', 'props', 'background', 'tone', 'ng']),
-    '🚨 v2 でも images は PR-C の 8 項目の形 (撮影指示書 PR-D の cutsFromSlots がそのまま読める)');
-  eq([m2.images[2].cut, m2.images[2].composition, m2.images[2].props], ['玄関でスプレーする手元', '斜め上から手元と商品。ラベルが読めること', ''],
-    'v2: その画像に使うカット (lp_image_no) の 撮影内容・構図を images に入れる');
-  eq([m2.images[0].cut, m2.images[1].composition], ['', ''], '撮影が要らない画像は空');
+  eq([m2.format, m2.reason, m2.cut_count], [2, goodV2().conclusion, 2], 'v2: 理由 = 判定の結論');
+  eq(m2.summary, { judgement: '② 社内撮影', shooter: '社内撮影', open_required: '不要', send_targets: 'ハッカ油スプレー 100ml (1本)', purpose: '使用シーンの実写を揃える',
+    finish: '玄関で使っている手元が分かる明るい写真', usage: '楽天 LP・サムネイル', conclusion: goodV2().conclusion }, 'v2: 概要');
+  eq(m2.cuts, goodV2().cuts, 'v2: カットは送られたまま');
+  eq(m2.images.map((im) => Object.keys(im)), [0, 1, 2].map(() => ['no', 'needs_shoot', 'cut', 'composition', 'props', 'background', 'tone', 'ng']), 'v2 でも images は PR-C の 8 項目の形');
+  eq([m2.images[2].cut, m2.images[2].composition, m2.images[0].cut], ['玄関でスプレーする手元', '斜め上から手元と商品。ラベルが読めること', ''], 'v2: images にはその画像を使うカットの 撮影内容・完成イメージ');
   const mNone = sh.shootReadModel(sh.validateShootJudgementV2(noneV2(), { imageNos: [0, 1, 2] }).value);
-  eq([mNone.shooter, mNone.cut_count, mNone.cuts], ['なし', 0, []], '追加撮影不要: 撮影担当「なし」・カット 0');
+  eq([mNone.summary.judgement, mNone.summary.shooter, mNone.cut_count], ['① 追加撮影不要', 'なし', 0], '追加撮影不要: 撮影担当「なし」・カット 0');
 }
 
 // ── 依頼を進める道具 ──
@@ -290,7 +308,7 @@ let dV1, rV1;
   ok(res.ok && res.status === 'done' && res.shoot.status === 'saved', '古い実行役 (仕様書を知らない) でも v1 の判定を今どおり保存');
   matchModel(rV1.run);
   const j = lp.latestShootJudgement(db, dV1.id);
-  ok(j.available && j.format === 1 && j.cut_count === 1 && j.cuts[0].lp_image_no === 2 && j.images[2].ng === '顔を写さない', 'v1 で保存した行も読み口は v2 の形に寄せる (images は元のまま)');
+  ok(j.available && j.format === 1 && j.cut_count === 1 && j.cuts[0].lp_image_nos[0] === 2 && j.images[2].ng === '顔を写さない', 'v1 で保存した行も読み口は v2 の形に寄せる (images は元のまま)');
 }
 
 console.log('① 仕様書「新商品初動判定」を取り込む (追記専用・種類ごとの最新版)');
@@ -367,11 +385,11 @@ console.log('③ 結果: 仕様書の形 (v2) で保存 → 読み口・画面�
   eq(jobRow(rV2.jobId).output_text, OUT, '🚨 ⑦の本文は送られたまま');
   matchModel(rV2.run);
   const j = lp.latestShootJudgement(db, dV2.id);
-  ok(j.available && j.format === 2 && j.recommended === 'inhouse' && j.shooter === '社内撮影' && j.unbox === '不要' && j.cut_count === 2, '読み口は v2 の概要');
-  eq(j.cuts.map((c) => [c.no, c.priority, c.lp_image_no]), [[1, '必須', 2], [2, '推奨', null]], 'カット (PR-D の撮影指示書の材料)');
+  ok(j.available && j.format === 2 && j.recommended === 'inhouse' && j.summary.shooter === '社内撮影' && j.summary.open_required === '不要' && j.cut_count === 2, '読み口は v2 の概要');
+  eq(j.cuts.map((c) => [c.no, c.priority, c.lp_image_nos]), [[1, '必須', [2]], [2, '推奨', []]], 'カット (撮影指示書の材料)');
   eq(j.images[2].cut, '玄関でスプレーする手元', 'images (PR-D の cutsFromSlots が読む形) にも 2枚目のカット');
   const st = lp.jobStateFor(db, dV2.id);
-  eq(st.shoot, { job_id: rV2.jobId, available: true, format: 2, recommended: 'inhouse', reason: goodV2().reason, unbox: '不要', cut_count: 2, send_targets: 'ハッカ油スプレー 100ml (1本)', warnings: [], missing: null },
+  eq(st.shoot, { job_id: rV2.jobId, available: true, format: 2, recommended: 'inhouse', reason: goodV2().conclusion, open_required: '不要', cut_count: 2, send_targets: 'ハッカ油スプレー 100ml (1本)', warnings: [], missing: null },
     '画面の状態には 開封要否・カット数・撮影用送付対象 を足す (カットの中身は出さない)');
 }
 
@@ -397,13 +415,109 @@ let dPhoto;
 {
   dPhoto = mkDraft();
   const r = reserveFor(dPhoto);
-  const photo7 = { ...goodV2(), recommended: 'photographer', send_targets: 'キャメル／ブラック／レッド（3色・各1本）', cuts: [1, 2, 3, 4, 5, 6, 7].map((n) => cutOf(n, { lp_image_no: n === 1 ? 2 : null })) };
+  const photo7 = { ...goodV2(), recommended: 'photographer', send_targets: 'キャメル／ブラック／レッド（3色・各1本）', cuts: [1, 2, 3, 4, 5, 6, 7].map((n) => cutOf(n, { lp_image_nos: n === 1 ? [2] : [] })) };
   const ln = lp.lintForJob(db, r.jobId, { leaseToken: r.leaseToken, output: OUT, shoot: photo7 });
   ok(ln.shoot.ok === true && ln.shoot.warnings.length === 1 && /5 カット単位/.test(ln.shoot.warnings[0]), `lint は通り、警告を返す (${ln.shoot.warnings})`);
   ok(accept(r, { shoot: photo7 }).shoot.status === 'saved', '保存する (仕様書の運用ルールはサーバで強制しない)');
   matchModel(r.run);
   const st = lp.jobStateFor(db, dPhoto.id).shoot;
   ok(st.recommended === 'photographer' && st.cut_count === 7 && st.warnings.length === 1, '画面の状態に警告が乗る');
+  // 🚨 読み口も依頼の形で見る: 仕様書の依頼の行を DB で v1 の形に替えても出さない
+  const saved = jobRow(r.jobId).shoot_json;
+  db.prepare('UPDATE ph_lp_compose_jobs SET shoot_json = ? WHERE id = ?').run(JSON.stringify(goodV1()), r.jobId);
+  eq(lp.latestShootJudgement(db, dPhoto.id).missing, 'invalid', '🚨 仕様書の依頼に v1 の形が保存されていたら「判定なし」(読むときも依頼の形で見る)');
+  db.prepare('UPDATE ph_lp_compose_jobs SET shoot_json = ? WHERE id = ?').run(saved, r.jobId);
+}
+
+console.log('⑧ 撮影指示書 (PR-D) — 仕様書の形 (v2) なら AI のカットと概要をそのまま渡す');
+{
+  // 純粋関数 (lib/shoot-sheet.js の cutsFromSlots)。D の試験と同じ作りの並び
+  const blk = (mat) => ['## 画像の役割', '特長', '## 商品配置', 'ブロックの構図', '## 使用素材', mat, '## NG事項', 'ブロックのNG'].join('\n').split('\n');
+  const slots = [
+    { uid: 'a0', no: 0, name: 'サムネイル', lines: blk('提供された実物商品画像') },
+    { uid: 'a1', no: 1, name: 'FV', lines: blk('提供された実物商品画像') },
+    { uid: 'a2', no: 2, name: '成分', lines: blk('撮影: 手元') },
+  ];
+  const v = sh.validateShootJudgementV2({
+    ...goodV2(),
+    images: [{ no: 0, needs_shoot: false }, { no: 1, needs_shoot: true }, { no: 2, needs_shoot: true }],
+    cuts: [
+      cutOf(1, { content: 'LPに無い 手持ちサイズ', lp_image_nos: [] }),
+      cutOf(2, { content: '2枚目の手元', lp_image_nos: [2] }),
+      cutOf(3, { content: 'FVと2枚目で使う集合', lp_image_nos: [1, 2], required_notice: '実物への貼付不可' }),
+    ],
+  }, { imageNos: [0, 1, 2] });
+  ok(v.ok, `前提: v2 の判定 ${v.ok ? '' : v.errors[0]}`);
+  const J = sh.shootReadModel(v.value);
+  const c = sheet.cutsFromSlots({ slots, hasEditShoot: false, aiImages: J.images, aiCuts: J.cuts });
+  eq(c.map((x) => [x.content, x.lp_image]), [['FVと2枚目で使う集合', '1枚目｜FV・2枚目｜成分'], ['2枚目の手元', '2枚目｜成分'], ['LPに無い 手持ちサイズ', '']],
+    '🚨 画像の並びで AI のカットを並べ、複数の画像で使うカットは 1 回だけ・LP に無いカットは最後に (落とさない)');
+  const full = c[0];
+  ok(full.priority === '必須' && full.expression_type === '使用イメージ' && full.variation === '代表1色' && full.target === 'ハッカ油スプレー 100ml (1本)'
+    && full.purpose === '使う場面を伝える' && full.usage === '楽天 LP 2枚目' && full.open_required === '不要' && full.reference_theme === '玄関で使う手元' && full.notice === '顔を写さない',
+  `仕様書の項目 (優先度・表現タイプ・バリエーション・撮影対象・目的・用途・開封・参考テーマ・注意) をそのまま渡す (${JSON.stringify(full).slice(0, 160)})`);
+  ok(full.finish.includes('実物への貼付不可'), '必ず出す表示は撮影指示書の決まりどおり完成イメージに足される (D の normalizeCuts)');
+  // 編集版: 並べ替え (a2 を 1枚目へ)・人が FV (a1) を「撮影不要」に・足した画像 (nNew) を要撮影に
+  const edited = [
+    { ...slots[0], shoot: false }, { ...slots[2], no: 1, shoot: true }, { ...slots[1], no: 2, shoot: false },
+    { uid: 'nNew', no: 3, name: '使い方', lines: blk('提供された実物商品画像'), shoot: true },
+  ];
+  const ce = sheet.cutsFromSlots({ slots: edited, hasEditShoot: true, aiImages: J.images, aiCuts: J.cuts });
+  eq(ce.map((x) => [x.content, x.lp_image]), [['2枚目の手元', '1枚目｜成分'], ['FVと2枚目で使う集合', '2枚目｜FV・1枚目｜成分'], ['使い方', '3枚目｜使い方'], ['LPに無い 手持ちサイズ', '']],
+    '🚨 要撮影は人の値 (編集版) が正本・元の画像 (uid a<番号>) で AI のカットを引く・足した画像はブロックから・表示は今の番号');
+  const ceOff = sheet.cutsFromSlots({ slots: edited.map((x) => ({ ...x, shoot: x.uid === 'nNew' })), hasEditShoot: true, aiImages: J.images, aiCuts: J.cuts });
+  eq(ceOff.map((x) => x.content), ['使い方', 'LPに無い 手持ちサイズ'], '人が「撮影不要」にした画像だけで使うカットは載せない (LP に無いカットは残す)');
+  // v1 の判定なら今までどおり (D の対応づけ)
+  const J1 = sh.shootReadModel(sh.validateShootJudgement(goodV1(), { imageNos: [0, 1, 2] }).value);
+  const c1 = sheet.cutsFromSlots({ slots, hasEditShoot: false, aiImages: J1.images, aiCuts: null });
+  ok(c1.length === 1 && c1[0].content === '玄関の手元' && c1[0].finish.startsWith('斜め上から') && c1[0].target === '', 'v1 の判定は今までどおり images から (撮影対象などは空欄)');
+
+  // 本番の経路: shootSheetCutsFor (service) が v2 の判定から カット + 概要 を返す
+  const svcMod = await import('../apps/product-hub/services/shoot-sheet-service.js');
+  const m = svcMod.shootSheetCutsFor(db, dV2);
+  eq(m.cuts.map((x) => [x.content, x.lp_image ? x.lp_image.split('｜')[0] : '']), [['玄関でスプレーする手元', '2枚目'], ['ボトルを手に持ったサイズ感', '']],
+    '🚨 shootSheetCutsFor: AI のカット (LP に無いカットも) を撮影指示書の材料にする');
+  eq(m.summary, lp.latestShootJudgement(db, dV2.id).summary, 'shootSheetCutsFor: 概要も AI の判定 (撮影指示書の SUMMARY_FIELDS の形)');
+  const built = sheet.buildShootSheet({ productCode: 'X1', productName: NAME, shootMode: 'inhouse', summary: { ...m.summary, shooter: '社内撮影' }, cuts: m.cuts });
+  const flat = built.sheets[0].rows.map((r) => r.join('｜'));
+  ok(flat.includes('撮影用送付対象｜ハッカ油スプレー 100ml (1本)') && flat.includes('撮影対象｜ハッカ油スプレー 100ml (1本)') && flat.includes('カット2（推奨）'),
+    `シートに 撮影用送付対象・撮影対象・社内撮影の推奨 が出る (${flat.slice(0, 12).join(' / ')})`);
+  const mV1 = svcMod.shootSheetCutsFor(db, dV1);
+  eq(mV1.summary, {}, 'v1 の判定の商品は概要を渡さない (今までどおり)');
+}
+
+console.log('② PR-C の版 (5) の依頼は claim でそのまま受ける (デプロイで待っている依頼を押し直しにしない)');
+{
+  const d = mkDraft();
+  const req = request(d, 'ss-key-v5');
+  const p = JSON.parse(req.job.packet_json);
+  delete p.shoot_spec; p.packet_version = 5; p.shoot_instruction = sh.SHOOT_JUDGE_INSTRUCTION;
+  db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 5 WHERE id = ?').run(JSON.stringify(p), lp.sha256(lp.canonicalJson(p)), req.job.id);
+  const old = lp.claimJob(db, { runnerRunId: 'run-v5-old', maxImages: 16 });
+  eq(old.job?.job_id, req.job.id, '🚨 版 5 の依頼は古い phlp でも掴める (仕様書が無い = PR-C と同じ)');
+  ok(old.job.shoot_spec === null && old.job.packet.shoot_instruction === sh.SHOOT_JUDGE_INSTRUCTION, '撮影判定は PR-C の決まり (v1)');
+  const fileId = fileOf(d);
+  lp.recordImageServed(db, req.job.id, { leaseToken: old.job.lease_token, fileId, sha256: 'a'.repeat(64), bytes: 10 });
+  const rv = lp.reserveGeneration(db, req.job.id, { leaseToken: old.job.lease_token, model: lp.DEFAULT_MODEL, promptVersion: lp.PROMPT_VERSION });
+  const res = lp.submitResult(db, rv.generation_id, { packetHash: old.job.packet_hash, verdict: 'accepted', output: OUT, lint: { ok: true }, reviewRounds: 1, shoot: goodV1() });
+  ok(res.ok && res.status === 'done' && res.shoot.status === 'saved', '版 5 の依頼の v1 の撮影判定を保存');
+  const d4 = mkDraft();
+  const r4 = request(d4, 'ss-key-v4');
+  const p4 = JSON.parse(r4.job.packet_json);
+  delete p4.shoot_spec; delete p4.shoot_instruction; p4.packet_version = 4;
+  db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 4 WHERE id = ?').run(JSON.stringify(p4), lp.sha256(lp.canonicalJson(p4)), r4.job.id);
+  const c4 = lp.claimJob(db, { runnerRunId: 'run-v4', maxImages: 16, shootSpec: true });
+  ok(c4.job === null && jobRow(r4.job.id).error_code === 'packet_outdated', '版 4 以下は今どおり packet_outdated');
+}
+
+console.log('⑤ miniPC の設定 — Claude は仕様書のファイルを書き換えられない');
+{
+  const HERE = path.dirname(fileURLToPath(import.meta.url));
+  const settings = JSON.parse(fs.readFileSync(path.join(HERE, 'ph-nightly', 'settings.json'), 'utf8'));
+  const deny = settings.permissions.deny;
+  ok(['Write', 'Edit'].every((t) => deny.includes(`${t}(//C:/tools/ph-nightly/work/shoot-spec-*.md)`) && deny.includes(`${t}(//C:/tools/ph-nightly/work/spec-*.md)`)),
+    '🚨 spec-*.md・shoot-spec-*.md は Write / Edit を deny (サーバは形しか見ないので、決まりを書き換えて判定させない)');
+  ok(settings.permissions.allow.includes('Read'), '読むのは今どおりできる');
 }
 
 // ── HTTP: 本物の router と service-api ──
@@ -480,7 +594,7 @@ console.log('⑦ 詳細画面 — 撮影判定の箱に v2 の概要を埋める
   const html = await (await fetch(`${base}/detail/${dV2.id}`)).text();
   const m = html.match(/<script type="application\/json" id="shoot-rec-json">([\s\S]*?)<\/script>/);
   const emb = m ? JSON.parse(m[1]) : null;
-  ok(emb && emb.format === 2 && emb.unbox === '不要' && emb.cut_count === 2 && emb.send_targets === 'ハッカ油スプレー 100ml (1本)', '埋め込みに 開封要否・カット数・撮影用送付対象');
+  ok(emb && emb.format === 2 && emb.open_required === '不要' && emb.cut_count === 2 && emb.send_targets === 'ハッカ油スプレー 100ml (1本)', '埋め込みに 開封要否・カット数・撮影用送付対象');
   ok(emb && !('cuts' in emb) && !('images' in emb), 'カットの中身・画像ごとの要否は埋めない (撮影指示書 PR-D・構成の一覧 PR-B の役目)');
 }
 
@@ -493,11 +607,11 @@ console.log('⑦ 画面の JS (@shoot-rec) — 偽の document で v2 の概要�
     + '\nreturn { initImageFlow, initShootRec, shootRecView };')();
   const J2 = lp.jobStateFor(db, dV2.id).shoot;
   const v = F.shootRecView(J2, null);
-  ok(v.text.startsWith('AIのおすすめ: 社内撮影 — ' + goodV2().reason + '\n開封: 不要 ／ 撮影カット: 2 カット ／ 撮影用送付対象: ハッカ油スプレー 100ml (1本)'),
+  ok(v.text.startsWith('AIのおすすめ: 社内撮影 — ' + goodV2().conclusion + '\n開封: 不要 ／ 撮影カット: 2 カット ／ 撮影用送付対象: ハッカ油スプレー 100ml (1本)'),
     `v2: 理由の次の行に 開封・カット数・送付対象 (${JSON.stringify(v.text)})`);
   const vP = F.shootRecView(lp.jobStateFor(db, dPhoto.id).shoot, 'photographer');
   ok(vP.text.includes('\n⚠ カメラマン撮影は 5 カット単位です') && !vP.adopt, '警告は ⚠ の行で出す');
-  const vNone = F.shootRecView({ job_id: 9, available: true, format: 2, recommended: 'none', reason: '足ります。', unbox: '不要', cut_count: 0, send_targets: '', warnings: [], missing: null }, null);
+  const vNone = F.shootRecView({ job_id: 9, available: true, format: 2, recommended: 'none', reason: '足ります。', open_required: '不要', cut_count: 0, send_targets: '', warnings: [], missing: null }, null);
   ok(vNone.text.includes('\n開封: 不要') && !vNone.text.includes('撮影カット'), '追加撮影不要ならカット数・送付対象は出さない');
   const J1 = lp.jobStateFor(db, dV1.id).shoot;
   const v1 = F.shootRecView(J1, null);
@@ -596,7 +710,7 @@ console.log('⑤ 実行役 (phlp) の通し — 仕様書のファイル・v2 �
   ok(lBad.code === 1 && lBad.json.shoot.ok === false, '🚨 v1 の形は lint --shoot で exit 1 (仕様書の形で書き直す)');
   // 整形した大きめの v2 (40 カット) も CLI の上限で止まらない
   const long = 'あ'.repeat(280);
-  const big = { ...goodV2(), recommended: 'photographer', cuts: Array.from({ length: 40 }, (_, i) => cutOf(i + 1, { lp_image_no: i === 0 ? 2 : null, cut: long, composition: long, purpose: long })) };
+  const big = { ...goodV2(), recommended: 'photographer', cuts: Array.from({ length: 40 }, (_, i) => cutOf(i + 1, { lp_image_nos: i === 0 ? [2] : [], content: long, finish: long, purpose: long })) };
   fs.writeFileSync(path.join(work, `shoot-${id}.json`), JSON.stringify(big, null, 2), 'utf8');
   const bigBytes = fs.statSync(path.join(work, `shoot-${id}.json`)).size;
   ok(bigBytes > 100_000 && JSON.stringify(big).length < sh.SHOOT_V2_RAW_MAX, `前提: 整形すると 10 万バイトを超えるが、サーバの上限 (文字) には収まる判定 (${bigBytes} バイト)`);

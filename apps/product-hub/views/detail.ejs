@@ -6206,7 +6206,7 @@ th.attr-unknown { color: #dc2626; }
     if (!j || j.format !== 2) return '';
     const NL = String.fromCharCode(10);
     const parts = [];
-    if (j.unbox) parts.push('開封: ' + j.unbox);
+    if (j.open_required) parts.push('開封: ' + j.open_required);
     if (j.recommended !== 'none') parts.push('撮影カット: ' + (Number(j.cut_count) || 0) + ' カット');
     if (j.recommended !== 'none' && j.send_targets) parts.push('撮影用送付対象: ' + j.send_targets);
     const warns = Array.isArray(j.warnings) ? j.warnings.filter(function (w) { return typeof w === 'string' && w; }) : [];
