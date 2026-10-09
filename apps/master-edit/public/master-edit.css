@@ -926,3 +926,11 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
   #list-page .panel { backdrop-filter: none; }   /* blur があると下から出す板 (fixed) が板の中に閉じこめられる */
   .colpanel { position: fixed; top: auto; bottom: 0; left: 0; right: 0; width: 100%; max-width: none; border-radius: 18px 18px 0 0; max-height: 80vh; z-index: 120; }
 }
+/* 発注の設定 (views/_order.ejs・発注アプリに保存) */
+.po-sub { border: 1px solid rgba(58, 231, 255, 0.4); border-radius: 12px; padding: 12px 14px; background: rgba(58, 231, 255, 0.04); box-shadow: 0 0 0 4px rgba(58, 231, 255, 0.05); }
+.po-sub .ttl { font-weight: 600; font-size: 14px; margin-bottom: 6px; display: flex; gap: 8px; align-items: center; }
+.po-sub .f { grid-template-columns: 100px minmax(0, 1fr); padding: 6px 0; }
+.po-foot { display: flex; gap: 12px; align-items: center; justify-content: flex-end; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--line-soft); }
+.po-foot .hint { margin-right: auto; max-width: 460px; }
+#sec-order.po-dirty { border-color: rgba(255, 200, 87, 0.55); }
+#sec-order .ctl.col > .seg { align-self: flex-start; }

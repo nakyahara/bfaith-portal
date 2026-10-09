@@ -1,0 +1,108 @@
+<%
+  // 発注の設定 (発注アプリに保存・10/9 中原さん)。新商品の登録 (mode = new: 下書きの保存と一緒に送る) と商品の画面 (mode = sku: 別の「発注の設定を保存」) の 1 つの部品。
+  // 代表 (色違い) の画面 (Company DB構想 20 §⑩) にも同じ include で差し込める (渡すもの = os・mode・dis・stepNo・base・code)。動き = public/me-order.js
+  //   os = apps/master-edit/order-settings.mjs orderScreen の答え { canSee, canWrite, why, data, supplier }
+  const hh = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const d = os && os.data && os.data.ok ? os.data : null;
+  const cur = (d && d.row) || {};
+  const ro = !os || !os.canWrite || (mode === 'new' && !!dis);
+  const D = ro ? ' disabled' : '';
+  // 新商品の登録では、下書きの保存の「未保存」に数える (data-dirty-field)。商品の画面では Company DB の保存と混ぜない (me-order.js が自分で数える)
+  const track = (name, label) => (mode === 'new' ? ' data-dirty-field="po_' + name + '"' : ' data-po-dirty="' + name + '"') + ' data-label="' + hh(label) + '"';
+  const normSup = (v) => { const t = String(v ?? '').trim(); return /^\d+$/.test(t) ? String(parseInt(t, 10)) : t; };
+  const sup = normSup(os && os.supplier);
+  const condMode = cur.condition_id ? 'pick' : 'none';
+  const matMode = cur.material_group_id ? 'pick' : 'none';
+  const segPo = (id, value, opts, label) => '<div class="seg" role="group" id="' + id + '" aria-label="' + hh(label) + '" data-value="' + value + '"' + track(id, label) + '>'
+    + opts.map(([v, t]) => '<button type="button" data-v="' + v + '" aria-pressed="' + (value === v ? 'true' : 'false') + '"' + (value === v ? ' class="on"' : '') + D + '>' + hh(t) + '</button>').join('') + '</div>';
+  const num = (v) => (v == null ? '' : String(v));
+  const condLabel = (c) => c.id + ' — ' + (c.name || '') + (c.supplier ? ' (仕入先 ' + c.supplier + ')' : '');
+  const pageData = d ? {
+    mode, base, code: code || null, canWrite: !ro, supplier: sup || null,
+    seen: d.row ? d.row.updated_at : null,
+    conditions: d.conditions.map((c) => ({ id: c.id, supplier: c.supplier })),
+    lotSource: d.lotSource, neLot: d.neLot,
+  } : null;
+%>
+<section class="panel" id="sec-order" aria-labelledby="h-order" data-po-mode="<%= mode %>">
+  <div class="panel-h">
+    <% if (mode === 'new') { %><span class="stepno" data-step="sec-order" aria-hidden="true"><%= stepNo %></span><% } else { %><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-cart"/></svg></span><% } %>
+    <h2 id="h-order">発注の設定</h2><span class="sub">発注アプリに保存されます<%= mode === 'sku' ? ' (右の「保存する」とは別)' : ' (あとでも可)' %></span>
+    <span class="right"><a class="hint" href="/apps/purchase-orders/admin?grp=attrs" target="_blank" rel="noopener">発注アプリで見る <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a></span>
+  </div>
+  <% if (!os || !os.canSee) { %>
+    <div class="callout info" id="po-why"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= os ? os.why : '発注アプリの設定を読めません' %>。発注アプリの権限がある人が入れます。</div></div>
+  <% } else if (!d) { %>
+    <div class="callout err" id="po-why"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><%= os.why || '発注アプリの設定を読めません' %>。少し待ってから画面を開き直してください<%= mode === 'new' ? ' (空のまま下書きにして、あとで商品の画面で入れることもできます)' : '' %>。</div></div>
+  <% } else { %>
+    <% if (d.lotSource !== 'app') { %>
+    <div class="callout info" id="po-lot-ne"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">いまの発注のすすめる数は NE のロット<%= d.neLot ? ' (' + d.neLot + ' 個)' : '' %>を使っています。NE のロットを発注アプリに写した後は、ここの発注ロットを使います。</div></div>
+    <% } else if (d.neLot && cur.order_lot != null && Number(cur.order_lot) !== Number(d.neLot)) { %>
+    <div class="callout warn" id="po-lot-diff"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">NE のロット (<%= d.neLot %> 個) と違います。発注のすすめる数はここの値 (<%= cur.order_lot %> 個) を使います。NE だけで直したロットなら、ここも直してください。</div></div>
+    <% } %>
+    <% if (ro && os.why) { %><div class="callout info" id="po-why"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow">見るだけです: <%= os.why %></div></div><% } %>
+
+    <div class="f" data-row="order_settings.order_lot"><label class="lab" for="po-order_lot">発注ロット</label>
+      <div class="ctl"><input class="in w-s" id="po-order_lot" inputmode="numeric" autocomplete="off" placeholder="—" value="<%= num(cur.order_lot) %>"<%- track('order_lot', '発注ロット') %><%= D %>><span class="unit">個ずつ</span>
+        <span class="hint">発注のすすめる数をこの数の倍数にそろえます · 空 = すすめる数が出ません<%= d.neLot ? ' · NE のロット ' + d.neLot + ' 個' : '' %></span></div></div>
+
+    <div class="f" data-row="order_settings.condition_id" style="align-items:start"><div class="lab" style="padding-top:8px">発注条件グループ</div>
+      <div class="ctl col" style="gap:8px">
+        <%- segPo('po-cond-mode', condMode, [['none', 'なし'], ['pick', '今あるグループ'], ['new', '新しく作る']], '発注条件グループ') %>
+        <div id="po-cond-pick"<%= condMode === 'pick' ? '' : ' hidden' %>>
+          <select class="in w-l" id="po-condition_id" aria-label="発注条件グループを選ぶ"<%- track('condition_id', '発注条件グループ') %><%= D %>>
+            <option value="">(選ぶ)</option>
+            <% for (const c of d.conditions) { const mine = !!sup && c.supplier === sup; const sel = c.id === cur.condition_id; if (!mine && !sel && mode === 'sku') continue; %><option value="<%= c.id %>" data-sup="<%= c.supplier %>"<%= sel ? ' selected' : '' %>><%= condLabel(c) %><%= !mine && sel ? ' · 代表の仕入先ではない' : '' %></option><% } %>
+          </select>
+          <div class="hint" id="po-cond-hint">代表の仕入先<%= sup ? ' (' + sup + ')' : '' %> のグループだけ選べます (最低金額・最低数量など)</div>
+        </div>
+        <div class="po-sub" id="po-cond-new"<%= condMode === 'new' ? '' : ' hidden' %>>
+          <div class="ttl"><svg class="ic" style="color:var(--accent)" aria-hidden="true"><use href="#i-plus"/></svg>新しい発注条件グループ (代表の仕入先<span id="po-cond-new-sup"><%= sup ? ' ' + sup : '' %></span> に作ります)</div>
+          <div class="f" data-row="order_settings.new_condition.display_name"><label class="lab" for="po-nc-name">名前</label><div class="ctl"><input class="in w-m" id="po-nc-name" maxlength="100" autocomplete="off" placeholder="例: ○○商事 3 万円以上"<%- track('nc_name', '新しい発注条件グループの名前') %><%= D %>></div></div>
+          <div class="f" data-row="order_settings.new_condition.condition_id"><label class="lab" for="po-nc-id">ID</label><div class="ctl"><input class="in w-m mono" id="po-nc-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="例: maruma-30000"<%- track('nc_id', '新しい発注条件グループの ID') %><%= D %>><span class="hint">発注アプリでの呼び名 · あとで変えられません</span></div></div>
+          <div class="f" data-row="order_settings.new_condition.condition_type"><label class="lab" for="po-nc-type">決まり</label><div class="ctl"><select class="in w-m" id="po-nc-type"<%- track('nc_type', '新しい発注条件の決まり') %><%= D %>>
+            <option value="">(選ぶ)</option>
+            <% for (const t of d.types) { %><option value="<%= t.type %>|<%= t.unit %>"><%= t.label %></option><% } %>
+          </select></div></div>
+          <div class="f" data-row="order_settings.new_condition.condition_value"><label class="lab" for="po-nc-value">値</label><div class="ctl"><input class="in w-s" id="po-nc-value" inputmode="decimal" autocomplete="off" placeholder="0"<%- track('nc_value', '新しい発注条件の値') %><%= D %>><span class="unit" id="po-nc-unit"></span></div></div>
+        </div>
+      </div></div>
+
+    <div class="f" data-row="order_settings.material_group_id" style="align-items:start"><div class="lab" style="padding-top:8px">原料グループ</div>
+      <div class="ctl col" style="gap:8px">
+        <%- segPo('po-mat-mode', matMode, [['none', 'なし'], ['pick', '今あるグループ'], ['new', '新しく作る']], '原料グループ') %>
+        <div id="po-mat-pick"<%= matMode === 'pick' ? '' : ' hidden' %>>
+          <select class="in w-l" id="po-material_group_id" aria-label="原料グループを選ぶ"<%- track('material_group_id', '原料グループ') %><%= D %>>
+            <option value="">(選ぶ)</option>
+            <% for (const m of d.materials) { %><option value="<%= m.id %>"<%= m.id === cur.material_group_id ? ' selected' : '' %>><%= m.id %> — <%= m.name %><%= m.min != null ? ' (最低 ' + m.min + (m.unit || '') + ')' : '' %></option><% } %>
+          </select>
+          <div class="hint">自社で作る商品の原料 (同じ原料を使う商品をまとめて最低発注量を見る)</div>
+        </div>
+        <div class="po-sub" id="po-mat-new"<%= matMode === 'new' ? '' : ' hidden' %>>
+          <div class="ttl"><svg class="ic" style="color:var(--accent)" aria-hidden="true"><use href="#i-plus"/></svg>新しい原料グループ</div>
+          <div class="f" data-row="order_settings.new_material.name"><label class="lab" for="po-nm-name">名前</label><div class="ctl"><input class="in w-m" id="po-nm-name" maxlength="100" autocomplete="off" placeholder="例: 木工用オレンジオイル"<%- track('nm_name', '新しい原料グループの名前') %><%= D %>></div></div>
+          <div class="f" data-row="order_settings.new_material.group_id"><label class="lab" for="po-nm-id">ID</label><div class="ctl"><input class="in w-m mono" id="po-nm-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="例: orange-oil"<%- track('nm_id', '新しい原料グループの ID') %><%= D %>><span class="hint">あとで変えられません</span></div></div>
+          <div class="f" data-row="order_settings.new_material.min_order_qty"><label class="lab" for="po-nm-min">最低発注量</label><div class="ctl"><input class="in w-s" id="po-nm-min" inputmode="decimal" autocomplete="off" placeholder="空 = なし"<%- track('nm_min', '最低発注量') %><%= D %>>
+            <input class="in" style="width:70px" id="po-nm-unit" maxlength="20" autocomplete="off" placeholder="単位" aria-label="最低発注量の単位"<%- track('nm_unit', '最低発注量の単位') %><%= D %>></div></div>
+        </div>
+      </div></div>
+
+    <details class="more"<%= cur.case_lot != null || cur.case_group || cur.capacity_per_unit != null ? ' open' : '' %>>
+      <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>ケース・容量 (使う商品だけ)</summary>
+      <div class="body">
+        <div class="f" data-row="order_settings.case_lot"><label class="lab" for="po-case_lot">ケースロット</label><div class="ctl"><input class="in w-s" id="po-case_lot" inputmode="numeric" autocomplete="off" placeholder="—" value="<%= num(cur.case_lot) %>"<%- track('case_lot', 'ケースロット') %><%= D %>><span class="unit">個 / ケース</span><span class="hint">ケース単位で発注する仕入先だけ</span></div></div>
+        <div class="f" data-row="order_settings.case_group"><label class="lab" for="po-case_group">ケースグループ</label><div class="ctl"><input class="in w-m" id="po-case_group" maxlength="100" autocomplete="off" placeholder="—" value="<%= cur.case_group || '' %>"<%- track('case_group', 'ケースグループ') %><%= D %>><span class="hint">同じケースに混ぜて入れられる商品に同じ名前</span></div></div>
+        <div class="f" data-row="order_settings.capacity_per_unit"><label class="lab" for="po-capacity_per_unit">容量 / 個</label><div class="ctl"><input class="in w-s" id="po-capacity_per_unit" inputmode="decimal" autocomplete="off" placeholder="—" value="<%= num(cur.capacity_per_unit) %>"<%- track('capacity_per_unit', '容量/個') %><%= D %>><span class="hint">原料グループの最低発注量を見るとき (例: 100ml の商品 = 100)</span></div></div>
+      </div>
+    </details>
+
+    <% if (mode === 'sku' && !ro) { %>
+    <div class="po-foot">
+      <span class="hint">発注アプリに保存されます (Company DB の「保存する」とは別) · ほかの人が先に直していたら保存せずに知らせます</span>
+      <span class="msgline" id="po-msg" role="status" aria-live="polite"></span>
+      <button class="btn pri" type="button" id="po-save" disabled>発注の設定を保存</button>
+    </div>
+    <% } %>
+    <script type="application/json" id="me-order"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
+  <% } %>
+</section>

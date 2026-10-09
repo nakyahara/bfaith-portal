@@ -128,7 +128,35 @@ app.use('/apps/product-management-list', pmlListRouter);
 const server = app.listen(0);
 const base = `http://127.0.0.1:${server.address().port}/apps/purchase-orders`;
 const siteBase = `http://127.0.0.1:${server.address().port}`;
-const j = async (p, opt) => {
+// 発注の設定 (order-settings.js) の書き込みは「開いたときの印 (seen)」が要る (無い = 428)。この試験は画面と同じく、送る直前に今の印を付ける
+// (印が違えば 409 / 無ければ 428 の確かめそのもの = scripts/test-po-order-settings.mjs)
+function withSeen(p, opt) {
+  const m = /^\/api\/masters\/(attrs|conditions|materials)(?:\/([^?]+))?$/.exec(p);
+  const isBind = p === '/api/attrs/bind';
+  if (!m && !isBind) return { p, opt };
+  const method = String((opt && opt.method) || 'GET').toUpperCase();
+  const dbx = getDB();
+  const rowOf = (kind, id) => kind === 'attrs' ? dbx.prepare('SELECT * FROM po_product_attrs WHERE product_key=?').get(String(id || '').trim().toLowerCase())
+    : kind === 'conditions' ? dbx.prepare('SELECT * FROM po_order_conditions WHERE condition_id=?').get(id)
+    : dbx.prepare('SELECT * FROM po_material_groups WHERE group_id=?').get(id);
+  if (method === 'DELETE' && m && m[2]) {
+    const cur = rowOf(m[1], decodeURIComponent(m[2]));
+    return { p: p + '?seen=' + encodeURIComponent(cur ? cur.updated_at : ''), opt };
+  }
+  if (method !== 'POST' || !opt || typeof opt.body !== 'string') return { p, opt };
+  const body = JSON.parse(opt.body);
+  if (Object.prototype.hasOwnProperty.call(body, 'seen')) return { p, opt };
+  if (isBind) {
+    const cur = rowOf('attrs', body.product_code);
+    body.seen = { fields: Object.fromEntries(['condition_id', 'material_group_id'].filter((k) => k in body).map((k) => [k, cur ? cur[k] : null])) };
+  } else if (!m[2]) {
+    const cur = rowOf(m[1], m[1] === 'attrs' ? body.product_code : m[1] === 'conditions' ? body.condition_id : body.group_id);
+    body.seen = { updated_at: cur ? cur.updated_at : null };
+  }
+  return { p, opt: { ...opt, body: JSON.stringify(body) } };
+}
+const j = async (p0, opt0) => {
+  const { p, opt } = withSeen(p0, opt0);
   const r = await fetch(base + p, opt);
   return { status: r.status, body: await r.json().catch(() => null) };
 };

@@ -1437,7 +1437,10 @@ app.set('view engine', 'ejs');
 app.use((req, res, next) => {
   const s = req.headers['x-test-session'];
   req.session = s === 'editor' ? { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: ['master-edit', 'product-hub'] }
-    : s === 'viewer' ? { authenticated: true, email: 'viewer@test', role: 'user', allowedApps: ['master-edit', 'product-hub'] } : null;
+    : s === 'viewer' ? { authenticated: true, email: 'viewer@test', role: 'user', allowedApps: ['master-edit', 'product-hub'] }
+    // 発注の設定 (10/9): 発注アプリの利用権もある 名簿の人 / 名簿でない人
+    : s === 'po-editor' ? { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: ['master-edit', 'product-hub', 'purchase-orders'] }
+    : s === 'po-viewer' ? { authenticated: true, email: 'viewer@test', role: 'user', allowedApps: ['master-edit', 'product-hub', 'purchase-orders'] } : null;
   next();
 });
 app.use('/apps/master-edit', MR.default);
@@ -1676,6 +1679,187 @@ await ta('[H6] 商品の画面 (2026-10-08 中原さん): 下書きならロジ�
   page = await call('GET', '/apps/master-edit/sku/s001');
   const ng = await call('POST', '/apps/master-edit/api/sku/s001', { body: { request_id: uuid(), seen: { token: tok(page.text) }, values: { expiry_managed: '1' } } });
   assert.deepEqual([ng.status, ng.j.reason], [409, 'logizard_locked']);
+});
+
+// ── 発注の設定 (10/9 中原さん・master-edit の新商品の登録・商品の画面 → 発注アプリの po_*。apps/master-edit/order-settings.mjs → apps/purchase-orders/order-settings.js) ──
+console.log('\n発注の設定 (マスタの入力 → 発注アプリ)');
+// 発注アプリの SQLite = この試験の一時の DATA_DIR の warehouse-mirror.db (本番の DB に触らない)
+{ const WM = await import('../apps/warehouse-mirror/db.js'); try { WM.getMirrorDB(); } catch { WM.initMirrorDB(); } }   // product-hub が開いた同じ DB (開き直すと product-hub の握りが閉じる)
+const POD = await import('../apps/purchase-orders/db.js');
+const POS = await import('../apps/purchase-orders/order-settings.js');
+const podb = POD.getDB();
+{
+  const t0 = new Date().toISOString();
+  const insCond = podb.prepare('INSERT INTO po_order_conditions (condition_id, supplier_code, display_name, condition_type, condition_value, unit, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)');
+  insCond.run('amc-30000', '1', 'AMC 3 万円以上', '金額', 30000, '円', t0, t0);
+  insCond.run('other-sup', '3', 'ほかの仕入先の条件', '金額', 10000, '円', t0, t0);
+  podb.prepare('INSERT INTO po_material_groups (group_id, name, min_order_qty, unit, created_at, updated_at) VALUES (?,?,?,?,?,?)').run('oil', 'オイル', 1000, 'ml', t0, t0);
+}
+const attrsOf = (code) => podb.prepare('SELECT * FROM po_product_attrs WHERE product_key = ?').get(String(code).toLowerCase()) || null;
+const poAudit = (resource) => podb.prepare('SELECT actor, action, detail_json, request_id FROM po_audit_log WHERE resource = ? ORDER BY id').all(resource).map((r) => ({ ...r, detail: JSON.parse(r.detail_json) }));
+const poCounts = () => ({ attrs: podb.prepare('SELECT COUNT(*) AS n FROM po_product_attrs').get().n, conds: podb.prepare('SELECT COUNT(*) AS n FROM po_order_conditions').get().n,
+  mats: podb.prepare('SELECT COUNT(*) AS n FROM po_material_groups').get().n, audit: podb.prepare('SELECT COUNT(*) AS n FROM po_audit_log').get().n });
+const orderBody = (code, order, over = {}) => ({ request_id: uuid(), kind: 'single', code, card: { create: false },
+  values: { name: '発注の設定つきの単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', sales_class: '3', expiry_managed: '0', reorder_months: '1' },
+  ...(order === undefined ? {} : { order_settings: order }), ...over });
+const meOrderData = (html) => JSON.parse((/<script type="application\/json" id="me-order">([\s\S]*?)<\/script>/.exec(html) || [])[1] || 'null');
+
+await ta('[PO1] 新商品の画面: 発注の設定の欄 (発注ロット・発注条件グループ = 選ぶ / 新しく作る・原料グループ・ケース・容量)・発注アプリの権限が無い人には出さない・セットには無い', async () => {
+  let r = await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' });
+  assert.equal(r.status, 200, r.text.slice(0, 300));
+  const sc = await checkScripts(r.text, 0);
+  const orderJs = sc.find((x) => x.includes('me-order.js — 「発注の設定」の欄の動き')) || '';
+  assert.ok(orderJs, 'me-order.js を読んでいない');
+  assert.ok(orderJs.includes("'/order-settings'") && orderJs.includes('ME.orderSettings = { collect: collect }'));
+  const newJs = sc.find((x) => x.includes('me-new.js — 新商品の登録の画面')) || '';
+  assert.match(newJs, /out\.order_settings = po/, 'me-new.js が発注の設定を送らない');
+  assert.ok(sc.indexOf(orderJs) > sc.indexOf(newJs), 'me-order.js は me-new.js の後');
+  for (const w of ['id="sec-order"', '発注の設定', '発注アプリに保存されます', 'id="po-order_lot"', 'id="po-cond-mode"', 'id="po-mat-mode"', 'id="po-nc-type"', 'id="po-nm-id"', 'id="po-case_lot"', 'id="po-capacity_per_unit"', 'data-sec="sec-order"']) {
+    assert.ok(r.text.includes(w), `新商品の画面に ${w} が無い`);
+  }
+  assert.match(r.text, /<option value="amc-30000" data-sup="1">amc-30000 — AMC 3 万円以上 \(仕入先 1\)<\/option>/);
+  assert.match(r.text, /<option value="other-sup" data-sup="3">/, '新商品はその場で代表の仕入先で絞る (画面の JS)');
+  assert.match(r.text, /<option value="ロット倍率以上\|倍">発注ロットの n 倍以上<\/option>/);
+  assert.match(r.text, /data-dirty-field="po_order_lot"/, '新商品の画面では下書きの保存の未保存に数える');
+  assert.ok(!r.text.includes('id="po-save"'), '新商品の画面に別の保存のボタンは無い (下書きの保存と一緒)');
+  assert.match(r.text, /NE のロット(を使っています|を発注アプリに写した後)/);   // 写す前 (order_lot_source = ne)
+  const data = meOrderData(r.text);
+  assert.deepEqual([data.mode, data.canWrite, data.code, data.seen], ['new', true, null, null]);
+  // 発注アプリの権限が無い (名簿の人でも) = 値を出さない・JS も読まない
+  r = await call('GET', '/apps/master-edit/new?kind=single');
+  assert.match(r.text, /id="sec-order"/); assert.match(r.text, /発注アプリの権限がないので/);
+  assert.ok(!r.text.includes('id="po-order_lot"') && !r.text.includes('me-order.js'), '権限の無い人に発注アプリの値を出した');
+  // セット = 欄が無い (発注アプリはセットを扱わない)
+  r = await call('GET', '/apps/master-edit/new?kind=set', { session: 'po-editor' });
+  assert.ok(!r.text.includes('id="sec-order"') && !r.text.includes('me-order.js'));
+  // つかいかた (同じ PR で)
+  const m = await call('GET', '/apps/master-edit/manual');
+  for (const w of ['<h2 id="order">発注の設定 (発注アプリに保存)</h2>', '発注の設定を保存', 'NE 登録待ち', '名簿の人で、発注アプリの権限もある人', '発注の設定だけ保存できませんでした', 'すすめる数が出ません']) {
+    assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
+  }
+});
+
+await ta('[PO2] 登録: ① Company DB → ② 発注アプリ (発注ロット・選んだ発注条件・新しい原料グループ)・記録 (だれ・どの画面・前と後・request_id)・同じ request_id のやり直しも ② は同じ', async () => {
+  const body = orderBody('po-web-1', { order_lot: '１２', condition_id: 'amc-30000', new_material: { group_id: 'honey', name: 'はちみつ', min_order_qty: '20', unit: 'kg' }, case_lot: '', case_group: '', capacity_per_unit: '300' });
+  const r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.ok, r.j.state, r.j.order_settings], [true, 'draft', { ok: true, changed: true, created: { condition: false, material: true } }]);
+  assert.ok(await skuId('po-web-1'));
+  const a = attrsOf('po-web-1');
+  assert.deepEqual([a.product_code, a.order_lot, a.condition_id, a.material_group_id, a.capacity_per_unit, a.case_lot, a.created_via], ['po-web-1', 12, 'amc-30000', 'honey', 300, null, 'master-edit:new']);
+  assert.deepEqual(podb.prepare("SELECT name, min_order_qty, unit FROM po_material_groups WHERE group_id = 'honey'").get(), { name: 'はちみつ', min_order_qty: 20, unit: 'kg' });
+  const au = poAudit('attrs:po-web-1');
+  assert.equal(au.length, 1);
+  assert.deepEqual([au[0].actor, au[0].action, au[0].request_id, au[0].detail.via, au[0].detail.before, au[0].detail.after.order_lot], ['naka@test', 'po_attrs_write', body.request_id, 'master-edit:new', null, 12]);
+  assert.equal(poAudit('material:honey')[0].detail.via, 'master-edit:new');
+  // 同じ request_id をもう一度 (通信が切れて押し直し) = ① は前の結果・② も通る (同じ値 = 書かない・記録も増えない)
+  const again = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+  assert.equal(again.status, 200, again.text);
+  assert.deepEqual([again.j.replayed, again.j.order_settings.ok, again.j.order_settings.changed], [true, true, false]);
+  assert.equal(poAudit('attrs:po-web-1').length, 1);
+  // 新しい発注条件グループ = 代表の仕入先 (0001 → 発注アプリの 1) に作る・すぐ選んだことになる
+  const nb = orderBody('po-web-2', { order_lot: '6', new_condition: { condition_id: 'amc-case', display_name: 'AMC ケース 2 以上', condition_type: '数量', unit: 'ケース', condition_value: '2' } });
+  const r2 = await call('POST', '/apps/master-edit/api/new', { body: nb, session: 'po-editor' });
+  assert.equal(r2.status, 200, r2.text);
+  assert.deepEqual(podb.prepare("SELECT supplier_code, display_name, condition_type, condition_value, unit FROM po_order_conditions WHERE condition_id = 'amc-case'").get(),
+    { supplier_code: '1', display_name: 'AMC ケース 2 以上', condition_type: '数量', condition_value: 2, unit: 'ケース' });
+  assert.deepEqual([attrsOf('po-web-2').condition_id, attrsOf('po-web-2').order_lot], ['amc-case', 6]);
+  // 何も入れていない (全部空・なし) = 発注アプリに何も書かない (発注アプリの権限が無い人も登録できる)
+  const c0 = poCounts();
+  const r3 = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-3', { order_lot: '', condition_id: '', material_group_id: '' }) });
+  assert.equal(r3.status, 200, r3.text);
+  assert.equal(r3.j.order_settings, undefined);
+  assert.deepEqual(poCounts(), c0);
+});
+
+await ta('[PO3] 登録の前の確かめ (① の前): ほかの仕入先の発注条件・中身の違う同じ ID・0 のロット・発注アプリの権限が無い・セット = 断る (Company DB にも発注アプリにも何も書かない)', async () => {
+  const c0 = poCounts();
+  const cases = [
+    [orderBody('po-ng-1', { condition_id: 'other-sup' }), 'po-editor', 400, 'invalid_input', 'order_settings.condition_id', /代表の仕入先 \(1\) のグループではありません/],
+    [orderBody('po-ng-2', { new_condition: { condition_id: 'amc-30000', display_name: '別の中身', condition_type: '金額', unit: '円', condition_value: '1' } }), 'po-editor', 409, 'group_id_taken', 'order_settings.new_condition.condition_id', /もうあります/],
+    [orderBody('po-ng-3', { order_lot: '0' }), 'po-editor', 400, 'invalid_input', 'order_settings.order_lot', /発注ロットは 1 以上/],
+    [orderBody('po-ng-4', { condition_id: 'no-such' }), 'po-editor', 400, 'invalid_input', 'order_settings.condition_id', /未登録/],
+    [orderBody('po-ng-5', { order_lot: '3' }), 'editor', 403, 'no_po_access', 'order_settings', /発注アプリの権限がない/],
+    [orderBody('po-ng-6', { order_lot: '3' }), 'po-viewer', 403, 'not_editor', undefined, /名簿/],
+    [orderBody('po-ng-7', { order_lot: '3', bogus: 1 }), 'po-editor', 400, 'invalid_input', 'order_settings', /項目ではありません/],
+  ];
+  for (const [body, session, status, reason, field, re] of cases) {
+    const r = await call('POST', '/apps/master-edit/api/new', { body, session });
+    assert.equal(r.status, status, `${body.code}: ${r.text}`);
+    assert.equal(r.j.reason, reason, body.code);
+    if (field !== undefined) assert.equal(r.j.field, field, body.code);
+    assert.match(r.j.error, re, body.code);
+    assert.equal(await skuId(body.code), undefined, `${body.code} が Company DB に入った`);
+  }
+  const set = await call('POST', '/apps/master-edit/api/new', { session: 'po-editor', body: { request_id: uuid(), kind: 'set', code: 'po-ng-set', values: { name: 'x', standard_price: '1', reorder_months: '1', components: [{ code: 's001', qty: 1 }] }, card: { create: false }, order_settings: { order_lot: '2' } } });
+  assert.deepEqual([set.status, set.j.reason], [400, 'order_settings_set']);
+  assert.equal(await skuId('po-ng-set'), undefined);
+  assert.deepEqual(poCounts(), c0, '断った登録で発注アプリに何か書いた');
+});
+
+await ta('[PO4] ① 成功 ② 失敗: 登録は成功のまま・応答 order_settings.ok = false (画面は「商品の画面で入れてください」)・同じ request_id のやり直しで ② が入る', async () => {
+  MR.__setOrderWriter(() => { throw new Error('SQLite に書けない'); });
+  const body = orderBody('po-web-4', { order_lot: '24', condition_id: 'amc-30000' });
+  let r;
+  try {
+    r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+  } finally { MR.__setOrderWriter(null); }
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.ok, r.j.state, r.j.order_settings.ok, r.j.order_settings.error], [true, 'draft', false, '発注アプリに書けませんでした']);
+  assert.ok(await skuId('po-web-4'), '② の失敗で登録が消えた');
+  assert.equal(attrsOf('po-web-4'), null);
+  const newJs = (await checkScripts((await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' })).text)).find((x) => x.includes('me-new.js')) || '';
+  assert.match(newJs, /発注の設定だけ保存できませんでした/);
+  const again = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+  assert.deepEqual([again.status, again.j.replayed, again.j.order_settings.ok, again.j.order_settings.changed], [200, true, true, true]);
+  assert.deepEqual([attrsOf('po-web-4').order_lot, attrsOf('po-web-4').condition_id], [24, 'amc-30000']);
+});
+
+await ta('[PO5] 商品の画面: 発注の設定の欄 (今の値・別の保存のボタン)・保存 = 開いたときの印 (違う = 409・発注アプリのマスタ管理が先に直しても)・名簿 かつ 発注アプリの権限・単品だけ', async () => {
+  let page = await call('GET', '/apps/master-edit/sku/po-web-1', { session: 'po-editor' });
+  assert.equal(page.status, 200);
+  const sc = await checkScripts(page.text, 0);
+  const skuJs = sc.findIndex((x) => x.includes('me-sku.js')); const orderJs = sc.findIndex((x) => x.includes('me-order.js — '));
+  assert.ok(skuJs >= 0 && orderJs > skuJs, 'me-order.js は me-sku.js の後 (MasterEdit.dirty を包む)');
+  assert.match(page.text, /id="po-order_lot" [^>]*value="12"/); assert.match(page.text, /id="po-save" disabled>発注の設定を保存</);
+  assert.match(page.text, /<option value="amc-30000" data-sup="1" selected>/);
+  assert.ok(!page.text.includes('value="other-sup"'), '商品の画面はほかの仕入先のグループを出さない');
+  assert.ok(!/data-dirty-field="po_/.test(page.text), '商品の画面で Company DB の保存の未保存に混ぜた');
+  const data = meOrderData(page.text);
+  assert.deepEqual([data.mode, data.code, data.supplier, data.seen], ['sku', 'po-web-1', '1', attrsOf('po-web-1').updated_at]);
+  const url = '/apps/master-edit/api/sku/po-web-1/order-settings';
+  const vals = (over = {}) => ({ order_lot: '12', condition_id: 'amc-30000', material_group_id: 'honey', capacity_per_unit: '300', case_group: '', case_lot: '', ...over });
+  // だれが書けるか: 名簿の人 かつ 発注アプリの権限
+  assert.deepEqual([(await call('POST', url, { session: 'editor', body: { seen: { updated_at: data.seen }, values: vals() } })).j.reason], ['no_po_access']);
+  assert.deepEqual([(await call('POST', url, { session: 'po-viewer', body: { seen: { updated_at: data.seen }, values: vals() } })).status], [403]);
+  assert.equal((await call('POST', url, { session: 'po-editor', origin: false, body: { seen: { updated_at: data.seen }, values: vals() } })).j.error, 'origin_mismatch');
+  // 印が無い = 428 / 違う = 409 (何も書かない)
+  assert.deepEqual([(await call('POST', url, { session: 'po-editor', body: { values: vals({ order_lot: '48' }) } })).status], [428]);
+  const before = attrsOf('po-web-1');
+  const stale = await call('POST', url, { session: 'po-editor', body: { seen: { updated_at: '2020-01-01T00:00:00.000Z' }, values: vals({ order_lot: '48' }) } });
+  assert.deepEqual([stale.status, stale.j.reason, stale.j.current.order_lot], [409, 'stale', 12]);
+  assert.deepEqual(attrsOf('po-web-1'), before);
+  // 正しい印 = 保存 (記録の via = master-edit:sku)
+  const ok = await call('POST', url, { session: 'po-editor', body: { request_id: uuid(), seen: { updated_at: data.seen }, values: vals({ order_lot: '48' }) } });
+  assert.equal(ok.status, 200, ok.text);
+  assert.deepEqual([ok.j.changed, ok.j.row.order_lot, attrsOf('po-web-1').order_lot], [true, 48, 48]);
+  assert.equal(poAudit('attrs:po-web-1').at(-1).detail.via, 'master-edit:sku');
+  assert.deepEqual(poAudit('attrs:po-web-1').at(-1).detail.before.order_lot, 12);
+  // 入口が 2 つ: 商品の画面を開いた後に発注アプリのマスタ管理 (同じ部品・via po-admin) が先に直した = 商品の画面の保存は 409 (上書きしない)
+  const seen2 = ok.j.row.updated_at;
+  POS.writeOrderSettings({ code: 'po-web-1', patch: { case_lot: 24 }, seen: { updated_at: seen2 }, actor: 'other@test', via: 'po-admin' });
+  const lost = await call('POST', url, { session: 'po-editor', body: { seen: { updated_at: seen2 }, values: vals({ order_lot: '60' }) } });
+  assert.deepEqual([lost.status, lost.j.reason], [409, 'stale']);
+  assert.deepEqual([attrsOf('po-web-1').order_lot, attrsOf('po-web-1').case_lot], [48, 24], 'マスタ管理の値を消した');
+  // ほかの仕入先の発注条件グループ = 400 / セット = 400 / 無い商品 = 404
+  const other = await call('POST', url, { session: 'po-editor', body: { seen: { updated_at: attrsOf('po-web-1').updated_at }, values: vals({ condition_id: 'other-sup' }) } });
+  assert.deepEqual([other.status, other.j.field], [400, 'order_settings.condition_id']);
+  assert.equal((await call('POST', '/apps/master-edit/api/sku/new-set-1/order-settings', { session: 'po-editor', body: { seen: { updated_at: null }, values: vals() } })).j.reason, 'order_settings_set');
+  assert.equal((await call('POST', '/apps/master-edit/api/sku/no-such-sku/order-settings', { session: 'po-editor', body: { seen: { updated_at: null }, values: vals() } })).status, 404);
+  // 画面: セットの商品の画面に欄は無い・権限の無い人には値を出さない
+  assert.ok(!(await call('GET', '/apps/master-edit/sku/new-set-1', { session: 'po-editor' })).text.includes('id="sec-order"'));
+  page = await call('GET', '/apps/master-edit/sku/po-web-1');
+  assert.match(page.text, /発注アプリの権限がないので/); assert.ok(!page.text.includes('id="po-order_lot"'));
 });
 
 console.log('\nproduct-hub (新規作成の入口・ボード)');

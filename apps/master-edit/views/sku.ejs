@@ -244,10 +244,13 @@
         </section>
 
         <section class="panel" aria-labelledby="h-sup">
-          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-building"/></svg></span><h2 id="h-sup">仕入先</h2><span class="right"><a href="/apps/purchase-orders" class="hint">先方品番・入数・ロットは 発注アプリ <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a></span></div>
+          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-building"/></svg></span><h2 id="h-sup">仕入先</h2><span class="right"><a href="/apps/purchase-orders" class="hint">先方品番は 発注アプリ <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a></span></div>
           <%- row('primary_supplier', '代表の仕入先', '<select class="in w-m" id="f-primary_supplier" ' + meta('primary_supplier') + '>' + (!c.primary_supplier ? '<option value="" selected>(なし)</option>' : '') + page.activeSuppliers.map((s) => '<option value="' + h(s.code) + '"' + (s.code === c.primary_supplier ? ' selected' : '') + '>' + h(s.code) + ' · ' + h(s.name) + '</option>').join('') + (c.primary_supplier && !page.activeSuppliers.some((s) => s.code === c.primary_supplier) ? '<option value="' + h(c.primary_supplier) + '" selected>' + h(c.primary_supplier) + ' (取引停止)</option>' : '') + '</select>', c.primary_supplier ? c.primary_supplier + ' · ' + supName(c.primary_supplier) : 'なし', { forId: 'f-primary_supplier', hint: '選べるのは取引中で、NE への登録の申告が済んだ仕入先だけです' }) %>
           <div class="f"><div class="lab">この商品の仕入先</div><div class="ctl"><% if (!page.suppliers.length) { %><span class="muted">まだありません</span><% } %><% for (const s of page.suppliers) { %><span class="linkchip"><span class="mono"><%= s.code %></span> <%= s.name %><span class="n2"><%= s.vendor_code ? ' 先方品番 ' + s.vendor_code : '' %><%= s.is_primary ? ' · ★代表' : '' %></span></span><% } %></div></div>
         </section>
+
+        <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。Company DB の「保存する」とは別のボタン (部品 = _order.ejs・public/me-order.js) %>
+        <% if (orderSettings) { %><%- include('_order', { os: orderSettings, mode: 'sku', dis: '', stepNo: null, base, code: c.code }) %><% } %>
 
         <section class="panel" id="p-basic" aria-labelledby="h-basic">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-tag"/></svg></span><h2 id="h-basic">基本</h2><span class="sub">代表 (名前と取扱は上の見出しのところで直します)</span></div>
@@ -540,6 +543,8 @@
   </div>
   <%- include('_footer') %>
   <% if (page) { %><script src="<%= base %>/public/me-sku.js?v=<%= assetV %>" defer></script><% } %>
+  <%# me-order.js は me-sku.js の後 (MasterEdit.dirty に発注の設定の未保存を足す) %>
+  <% if (page && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
   <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
 </body>

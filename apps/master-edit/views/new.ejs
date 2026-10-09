@@ -22,7 +22,7 @@
   // 区切り (上の飛び先の帯と同じ順)。番号は種類で変わる
   const secs = isSet
     ? [['sec-code', 'コードと名前'], ['sec-comp', '構成'], ['sec-money', 'お金'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']]
-    : [['sec-code', 'コードと名前'], ['sec-money', 'お金'], ['sec-tax', '税・分類・仕入先'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']];
+    : [['sec-code', 'コードと名前'], ['sec-money', 'お金'], ['sec-tax', '税・分類・仕入先'], ['sec-order', '発注'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']];
   const no = (id) => secs.findIndex((x) => x[0] === id) + 1;
   // 画面の JS に渡す値 (JSON = EJS の出力を JS の値の位置に直に置かない)
   const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs } : null;
@@ -121,8 +121,10 @@
             <div class="ctl"><select class="in w-m" id="f-primary_supplier" data-field="primary_supplier" data-dirty-field="primary_supplier" data-label="代表の仕入先"<%= dis %>>
               <option value="">(選ぶ)</option>
               <% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"><%= s.code %> <%= s.name %></option><% } %>
-            </select><span class="hint">NE で必須の項目です</span><a class="hint" href="/apps/purchase-orders" target="_blank" rel="noopener">先方品番・入数・ロットは 発注アプリ ↗</a></div></div>
+            </select><span class="hint">NE で必須の項目です · 発注条件グループはこの仕入先のものから選びます (下の「発注の設定」)</span><a class="hint" href="/apps/purchase-orders" target="_blank" rel="noopener">先方品番は 発注アプリ ↗</a></div></div>
         </section>
+        <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。下書きの保存と一緒に送る = Company DB の登録が通った後に発注アプリへ (部品 = _order.ejs・public/me-order.js) %>
+        <%- include('_order', { os: orderSettings, mode: 'new', dis, stepNo: no('sec-order'), base, code: null }) %>
         <% } %>
 
         <section class="panel" id="sec-ship" aria-labelledby="h-ship">
@@ -229,5 +231,6 @@
   </div>
   <%- include('_footer') %>
   <% if (page) { %><script src="<%= base %>/public/me-new.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && !isSet && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

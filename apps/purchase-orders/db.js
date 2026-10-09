@@ -77,6 +77,11 @@ export function initPurchaseOrders() {
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
   )`);
+  // 発注ロット (10/9 中原さん): 発注のすすめる数をこの数の倍数にそろえる数。前は NE の goods_lot (商品管理リストの「発注ロット単位」)。
+  // NE の値を一度だけ写したら (scripts/copy-ne-order-lot.mjs → po_settings.order_lot_source = 'app') logic.js はこの列だけを見る。
+  // created_via = 行を作った画面 (order-settings.js VIA)。マスタの入力で作った商品が商品管理リストにまだ無い = 「NE 登録待ち」と見せる
+  addCol(db, 'po_product_attrs', 'order_lot', 'REAL CHECK(order_lot IS NULL OR order_lot > 0)');
+  addCol(db, 'po_product_attrs', 'created_via', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_attrs_cond ON po_product_attrs(condition_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_attrs_mat ON po_product_attrs(material_group_id)');
 
