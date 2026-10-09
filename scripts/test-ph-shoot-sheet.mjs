@@ -225,6 +225,10 @@ function fakeSheets(initialTabs, { failBatch = false } = {}) {
   const g6 = fakeSheets([{ title: '撮影指示', owned: true }]);
   await throwsAsync('送る直前の確認 (beforeWrite) が断れば throw', () => writeSpreadsheet(g6, { spreadsheetId: 'S1', tabs: inh.sheets, beforeWrite: () => { throw new Error('変わった'); } }), '変わった');
   ok(g6.calls.some((c) => c[0] === 'get') && !g6.calls.some((c) => c[0] === 'batchUpdate'), '🚨 送る直前の確認はタブを読んだ後に呼び、断ったら batchUpdate を送らない');
+  const g7 = fakeSheets([{ title: '撮影指示', owned: true }, { title: '人のメモ' }]);
+  let seen = null;
+  await writeSpreadsheet(g7, { spreadsheetId: 'S1', tabs: inh.sheets, beforeWrite: (ctx) => { seen = ctx; } });
+  ok(JSON.stringify(seen && seen.existing.map((t) => [t.title, t.owned])) === '[["撮影指示",true],["人のメモ",false]]', '送る直前の確認には、今あるタブと印の有無を渡す (拾い直したファイルに指示書があるかを呼び手が見る)', JSON.stringify(seen));
   const g4 = fakeSheets([{ title: '撮影指示', owned: true }], { failBatch: true });
   await throwsAsync('batchUpdate が失敗したら throw (呼び手が URL を書かない)', () => writeSpreadsheet(g4, { spreadsheetId: 'S1', title: 'x', tabs: inh.sheets }), 'Backend');
   ok(!g4.calls.some((c) => c[0] === 'driveUpdate'), '失敗したら名前も付け直さない');

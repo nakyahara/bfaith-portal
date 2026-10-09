@@ -26,7 +26,6 @@ import {
 // 撮影指示書 (スプレッドシート) の自動作成と、撮影依頼文のいつもの宛先 (2026-10-09 画像制作の新フロー PR-D)
 import { getShootMention, setShootMention, normalizeShootMention } from './db.js';
 import { createOrUpdateShootSheet, shootSheetStateFor } from './services/shoot-sheet-service.js';
-import { validateCutsInput } from './lib/shoot-sheet.js';
 // 夜間自動化 (2026-08-28): 人の確認待ち + 文字数ガード
 import {
   validateAiOutputLength, GENERATION_BLOCK_CODES, GENERATION_BLOCK_REASON_MAX,
@@ -1461,15 +1460,20 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (urlVal && !isHttpUrl(urlVal)) {
     return res.status(400).json({ ok: false, error: '撮影指示URLの形式が不正です (http/https)' });
   }
-  // 画面が見ていた指示書の URL (camera_instruction_url_expected) と今の値が違えば 409。別のタブで撮影指示書を
-  // 自動で作った (PR-D) 後に、古い画面の値で戻さない (Codex PR-D 名指し2 M)。省略可 (古い画面)
-  if (urlVal !== undefined && Object.prototype.hasOwnProperty.call(b, 'camera_instruction_url_expected')) {
-    if (typeof b.camera_instruction_url_expected !== 'string') {
+  // 指示書の URL を変える保存は、画面が見ていた値 (camera_instruction_url_expected) が要る。今の値と違えば 409。
+  // 別のタブで撮影指示書を自動で作った (PR-D) 後に、古い画面の値で戻さない (Codex PR-D 名指し2/3 M)。
+  // 値が変わらない保存 (今と同じ URL を送ってきた) は添えなくても通す
+  if (urlVal !== undefined) {
+    const nowUrl = String(db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.camera_instruction_url || '').trim();
+    const hasExp = Object.prototype.hasOwnProperty.call(b, 'camera_instruction_url_expected');
+    if (hasExp && typeof b.camera_instruction_url_expected !== 'string') {
       return res.status(400).json({ ok: false, error: 'camera_instruction_url_expected は文字で指定してください' });
     }
-    const nowUrl = String(db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.camera_instruction_url || '').trim();
-    if (nowUrl !== b.camera_instruction_url_expected.trim()) {
-      return res.status(409).json({ ok: false, error: 'ほかの人 (または別の画面) が撮影指示書の URL を変えています (撮影指示書を作った など)。画面を読み直してから保存してください' });
+    if (String(urlVal || '').trim() !== nowUrl) {
+      if (!hasExp) return res.status(409).json({ ok: false, error: '画面が古いので撮影指示書の URL を保存できません。画面を読み直してから保存してください' });
+      if (nowUrl !== b.camera_instruction_url_expected.trim()) {
+        return res.status(409).json({ ok: false, error: 'ほかの人 (または別の画面) が撮影指示書の URL を変えています (撮影指示書を作った など)。画面を読み直してから保存してください' });
+      }
     }
   }
   const canvaVal = b.canva_url !== undefined ? cleanText(b.canva_url, 1000) : undefined;
@@ -1656,9 +1660,10 @@ router.post('/api/drafts/:id/shoot-mode', (req, res) => {
 // 撮影指示書 (スプレッドシート) を作る / 上書きする (2026-10-09 画像制作の新フロー PR-D・設計 §3.4)。
 // 撮影判定が 社内撮影 / カメラマン撮影 で、画像フォルダがあるときだけ。無ければ作り、あれば同じファイルを上書き (URL は変えない)。
 // できたときだけ URL を撮影指示書の欄 (camera_instruction_url) に入れる = ボードの「撮影指示書 済」がそのまま動く。
-// body: { cuts?: [...] (渡せばそれで作る。無ければ LP構成から拾う),
-//         mention?: '宛先' (画面のその回だけの宛先。依頼文のタブに入れる。省略ならいつもの宛先),
-//         replace_manual_url?: 'URL' (手で貼った URL を置き換えてよいと確かめたときの、その URL。今の URL と同じときだけ置き換える) }
+// 材料 (カット) はサーバが LP構成から組む (shootSheetCutsFor)。呼び手からは受けない (cuts を送ると 400)。
+// body: { mention?: '宛先' (画面のその回だけの宛先。依頼文のタブに入れる。省略ならいつもの宛先),
+//         replace_manual_url?: 'URL' (手で貼った URL を置き換えてよいと確かめたときの、その URL。今の URL と同じときだけ置き換える),
+//         overwrite_file_id?: 'ID' (前に作りかけた撮影指示書を上書きしてよいと確かめたときの、そのファイルの ID) }
 router.post('/api/drafts/:id/shoot-sheet', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
@@ -1666,11 +1671,9 @@ router.post('/api/drafts/:id/shoot-sheet', async (req, res) => {
     return res.status(403).json({ ok: false, error: '撮影指示書を作れるのは 画像登録者・画像作成承認者 の担当者か管理者だけです' });
   }
   const b = req.body || {};
-  let cuts = null;
-  if (b.cuts !== undefined && b.cuts !== null) {
-    const v = validateCutsInput(b.cuts);
-    if (v.error) return res.status(400).json({ ok: false, error: v.error });
-    cuts = v.cuts;
+  // 正本の LP構成と違う中身を書かせない (古い画面・直接の呼び出し — Codex PR-D 名指し3 M)
+  if (b.cuts !== undefined) {
+    return res.status(400).json({ ok: false, error: '撮影指示書の中身 (cuts) は送れません。LP構成から作ります (LP構成を直してから押してください)' });
   }
   // 宛先はいつもの宛先と同じ検査 (1 行・60 文字まで)。null / 省略はいつもの宛先
   let mention = null;
@@ -1682,10 +1685,17 @@ router.post('/api/drafts/:id/shoot-sheet', async (req, res) => {
   if (b.replace_manual_url !== undefined && b.replace_manual_url !== null && (typeof b.replace_manual_url !== 'string' || b.replace_manual_url.length > 1000)) {
     return res.status(400).json({ ok: false, error: 'replace_manual_url は置き換える URL (文字) で指定してください' });
   }
+  if (b.overwrite_file_id !== undefined && b.overwrite_file_id !== null && (typeof b.overwrite_file_id !== 'string' || !/^[A-Za-z0-9_-]{5,200}$/.test(b.overwrite_file_id))) {
+    return res.status(400).json({ ok: false, error: 'overwrite_file_id はファイルの ID で指定してください' });
+  }
   const r = await createOrUpdateShootSheet(draft.id, {
-    cuts, mention, actor: actorOf(req), replaceManualUrl: typeof b.replace_manual_url === 'string' ? b.replace_manual_url.trim() : null,
+    mention, actor: actorOf(req), replaceManualUrl: typeof b.replace_manual_url === 'string' ? b.replace_manual_url.trim() : null,
+    overwriteFileId: typeof b.overwrite_file_id === 'string' ? b.overwrite_file_id : null,
   });
-  if (!r.ok) return res.status(r.status || 500).json({ ok: false, code: r.code, error: r.error, ...(r.manual_url ? { manual_url: r.manual_url } : {}) });
+  if (!r.ok) {
+    return res.status(r.status || 500).json({ ok: false, code: r.code, error: r.error,
+      ...(r.manual_url ? { manual_url: r.manual_url } : {}), ...(r.file_id ? { file_id: r.file_id } : {}) });
+  }
   res.json(r);
 });
 

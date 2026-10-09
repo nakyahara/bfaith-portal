@@ -150,7 +150,7 @@ const rowData = (row) => ({ values: row.map((c) => ({ userEnteredValue: { string
  * @param {Array<{name: string, rows: string[][], format?: object}>} o.tabs  書くタブ (この順に並べる)
  * @param {string[]} [o.removeTabs]  あれば消すタブ名 (自分が作るタブのうち、今回は要らないもの)
  * @param {boolean} [o.fresh]  この呼び出しで作ったばかりのファイル (最初からある空の「シート1」を消す)
- * @param {Function} [o.beforeWrite]  batchUpdate を送る直前に呼ぶ確認 (throw すれば送らない)。
+ * @param {Function} [o.beforeWrite]  batchUpdate を送る直前に呼ぶ確認 ({ existing: [{sheetId, title, owned}] } を渡す。throw すれば送らない)。
  *   呼び手が「待っている間に材料・持ち主が変わっていないか」を見る口 (Codex PR-D 名指し2 High)
  */
 export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title, tabs, removeTabs = [], fresh = false, beforeWrite = null }) {
@@ -232,7 +232,7 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
     const initialTab = fresh && !p.owned && Number(p.sheetId) === 0 && DEFAULT_TAB_RE.test(String(p.title || ''));
     if (initialTab || (p.owned && removeTabs.includes(p.title))) requests.push({ deleteSheet: { sheetId: p.sheetId } });
   }
-  if (beforeWrite) beforeWrite();
+  if (beforeWrite) beforeWrite({ existing: existing.map((p) => ({ sheetId: p.sheetId, title: p.title, owned: p.owned })) });
   await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } }, opt);
 
   // 4. ファイル名 (違うときだけ)。中身とは別の呼び出しだが、失敗しても中身は新しい版のまま (名前だけ古い)

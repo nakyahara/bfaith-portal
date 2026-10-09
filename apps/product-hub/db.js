@@ -2067,7 +2067,7 @@ export function initProductHubDB() {
     //   lease_token / lease_until … 作っている最中の印 (同じ商品を 2 本同時に作らない。プロセスをまたいでも効く)
     //   file_id … 作ったファイル (更新はこのファイルを上書き = URL は変わらない)
     //   hash    … 作ったときの材料の hash (今の材料と違えば「LP構成が変わりました → 更新」を出す)
-    //   source  … 材料の出どころ ('auto' = LP構成から拾った / 'request' = API で渡されたカット)。'request' は今の材料と比べない
+    //   source  … 材料の出どころ ('auto' = LP構成から組んだ。今はこれだけ。ほかの出どころを足すときに見分ける)
     //   URL は camera_instruction_url に入れる (ボードの「撮影指示書 済」がそのまま動く)。
     //   画像タブの「画像制作情報を保存」では書かない (recordShootSheet だけが書く)
     ['shoot_sheet_file_id', 'ALTER TABLE draft_image_production ADD COLUMN shoot_sheet_file_id TEXT'],

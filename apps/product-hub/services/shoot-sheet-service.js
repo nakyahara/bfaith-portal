@@ -109,13 +109,16 @@ export function shootSheetStateFor(db, draft, ip) {
 /**
  * 撮影指示書を作る (無ければ) / 上書きする (あれば)。reject しない (結果は outcome で返す)
  * @param {object} o
- * @param {Array} [o.cuts]  API で渡されたカット (検査済み)。無ければ shootSheetCutsFor
+ * 材料は必ず shootSheetCutsFor (サーバが LP構成から組む)。呼び手からカットは受けない
+ *   (古い画面・直接の呼び出しで、正本の LP構成と違う中身を書かせない — Codex PR-D 名指し3 M)
  * @param {string|null} [o.mention]  その回だけの宛先 (検査済み)。null / 省略ならいつもの宛先
  * @param {string|null} [o.replaceManualUrl]  手で貼った URL を置き換えてよい、と画面で確かめたときの「その URL」。
  *   今の URL と同じときだけ置き換える (確かめた後に別の URL に貼り替えられていたら、もう一度聞く — Codex PR-D 名指し M)
+ * @param {string|null} [o.overwriteFileId]  DB に記録する前に止まった撮影指示書 (拾い直したファイル) を上書きしてよい、と
+ *   画面で確かめたときの、そのファイルの ID
  * @returns {Promise<{ok: true, url, created: boolean, cuts: number, source}|{ok: false, status: number, code: string, error: string, manual_url?: string}>}
  */
-export async function createOrUpdateShootSheet(draftId, { cuts: givenCuts = null, mention = null, actor = null, replaceManualUrl = null, db = getDB() } = {}) {
+export async function createOrUpdateShootSheet(draftId, { mention = null, actor = null, replaceManualUrl = null, overwriteFileId = null, db = getDB() } = {}) {
   const id = Number(draftId);
   // 作っている最中の印 (DB)。同じ商品の 2 本目は 409 (二重押し・2 人同時・プロセスをまたいでも)
   let token = null;
@@ -125,7 +128,7 @@ export async function createOrUpdateShootSheet(draftId, { cuts: givenCuts = null
   }
   if (!token) return { ok: false, status: 409, code: 'busy', error: 'いまこの商品の撮影指示書を作っています。終わるまで待ってください' };
   try {
-    return await run(db, id, { givenCuts, mention, actor, replaceManualUrl, token });
+    return await run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, token });
   } catch (e) {
     // ここに来るのは DB の失敗など想定外のもの。Google の失敗は run の中で理由にしている
     console.error('[product-hub] 撮影指示書:', e);
@@ -145,7 +148,7 @@ function autoMaterialHashNow(db, id) {
   return shootSheetMaterialHash(materialOf(d, ip.shoot_mode ?? null, shootSheetCutsFor(db, d).cuts));
 }
 
-async function run(db, id, { givenCuts, mention, actor, replaceManualUrl, token }) {
+async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, token }) {
   const draft = db.prepare('SELECT id, ne_code, name, drive_folder_url FROM product_drafts WHERE id = ?').get(id);
   if (!draft) return { ok: false, status: 404, code: 'not_found', error: '商品が見つかりません' };
   const ip = db.prepare('SELECT shoot_mode, camera_instruction_url, shoot_sheet_file_id FROM draft_image_production WHERE draft_id = ?').get(id) || {};
@@ -169,16 +172,14 @@ async function run(db, id, { givenCuts, mention, actor, replaceManualUrl, token 
       error: `撮影指示書の URL に、手で貼ったもの (${prevUrl.slice(0, 120)}) が入っています。自動で作る撮影指示書に置き換えますか？ (手で貼ったスプレッドシートは消しません。URL の欄だけ差し替えます)` };
   }
 
-  const material = givenCuts
-    ? { cuts: givenCuts, source: 'request' }
-    : (() => { const m = shootSheetCutsFor(db, draft); return { cuts: m.cuts, source: 'auto' }; })();
+  const material = { cuts: shootSheetCutsFor(db, draft).cuts, source: 'auto' };
   const mat = materialOf(draft, shootMode, material.cuts);
   const hash = shootSheetMaterialHash(mat);
   const mentionUsed = typeof mention === 'string' ? mention : getShootMention(db).value;
   // 書く直前と記録するときの確認: 版・材料 (LP構成から拾うとき)・印がまだ自分のものか
   const stillSame = () => {
     assertShootSheetRevision(db, id, revision);
-    if (material.source === 'auto' && autoMaterialHashNow(db, id) !== hash) {
+    if (autoMaterialHashNow(db, id) !== hash) {
       throw Object.assign(new Error('作っている間に LP構成 (AI の撮影判定・直した構成) が変わりました。画面を読み直して、もう一度押してください (指示書の URL は変えていません)'), { code: 'shoot_sheet_conflict' });
     }
     assertShootSheetLease(db, id, token);
@@ -186,13 +187,14 @@ async function run(db, id, { givenCuts, mention, actor, replaceManualUrl, token 
 
   let fileId = null;
   let created = false;
+  let recovered = false;
   try {
     // 1. 前に作ったファイルが使えればそれ (消された・ごみ箱・別フォルダに移ったなら作り直す)
     if (prevFileId && (await spreadsheetUsable(clients, { fileId: prevFileId, folderId })).usable) fileId = prevFileId;
     // 2. DB に書く前に止まったファイルを拾い直す (既にあるファイル = 人が足したタブがありうるので fresh にしない)
     if (!fileId) {
       const found = await findSpreadsheetByAppProperty(clients, { folderId, key: APP_PROP_KEY, value: String(id) });
-      if (found) fileId = found.id;
+      if (found) { fileId = found.id; recovered = true; }
     }
     // 3. 無ければ作る (作る前にも版を見る = 待っている間に変わっていれば作らない)
     if (!fileId) {
@@ -206,12 +208,22 @@ async function run(db, id, { givenCuts, mention, actor, replaceManualUrl, token 
     // 書く直前 (タブの様子を読んだ後・送る直前) にもう一度見る (Google を待っている間に変わった材料で、既にある指示書を上書きしない)
     stillSame();
     await writeSpreadsheet(clients, {
-      spreadsheetId: fileId, title: built.title, tabs: built.sheets, fresh: created, beforeWrite: stillSame,
+      spreadsheetId: fileId, title: built.title, tabs: built.sheets, fresh: created,
+      beforeWrite: ({ existing }) => {
+        // 拾い直したファイル (DB に記録する前に止まったもの) に、もう指示書のタブ (印つき) があれば、人が直しているかもしれない。
+        // 画面は「作成」と出しているので上書きの確認が出ていない → 確かめてから送り直してもらう (Codex PR-D 名指し3 M)
+        if (recovered && overwriteFileId !== fileId && existing.some((t) => t.owned)) {
+          throw Object.assign(new Error(`画像フォルダに、前に作りかけた撮影指示書があります (${spreadsheetUrl(fileId)})。今の LP構成で上書きしますか？ (スプレッドシートで直した内容は消えます)`),
+            { code: 'recovered_file', fileId });
+        }
+        stillSame();
+      },
       // 自分が作るタブのうち今回は要らないもの (カメラマン撮影 → 社内撮影 にしたときの「依頼文」)。印のあるタブだけ消える
       removeTabs: MANAGED_SHEETS.filter((n) => !built.sheets.some((t) => t.name === n)),
     });
   } catch (e) {
     if (e?.code === 'shoot_sheet_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
+    if (e?.code === 'recovered_file') return { ok: false, status: 409, code: 'recovered_file', file_id: e.fileId, error: e.message };
     const reason = explainGoogleError(e);
     try { logEvent(db, id, 'shoot_sheet_failed', reason.slice(0, 500), actor); } catch (_) { /* 記録の失敗で結果を変えない */ }
     if (e?.code === 'tab_conflict') return { ok: false, status: 409, code: 'tab_conflict', error: reason };
