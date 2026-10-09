@@ -266,3 +266,26 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
     }
   }
 }
+
+/**
+ * 書き込み係が作ったタブ (印つき) の今の値を読む (PR-F: 作り直す前に、人が書いた修正指示を読み戻す)。
+ * 値は画面に見えている文字 (FORMATTED_VALUE)。式のセルは式の結果 (=IMAGE は空) になる。
+ * @returns {Promise<{exists: false}|{exists: true, owned: boolean, values: string[][]|null}>}
+ *   owned=false (人が作った同じ名前のタブ) は読まない (書くときに writeSpreadsheet が TabConflictError で止める)
+ */
+export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, range = 'A1:Z2000' }) {
+  const opt = { timeout: GOOGLE_TIMEOUT_MS };
+  const got = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets(properties(sheetId,title),developerMetadata(metadataKey,metadataValue))',
+  }, opt);
+  const tab = (got?.data?.sheets || []).find((s) => s?.properties?.title === name);
+  if (!tab) return { exists: false };
+  const owned = (tab.developerMetadata || []).some((m) => m && m.metadataKey === OWNED_TAB_KEY);
+  if (!owned) return { exists: true, owned: false, values: null };
+  // タブ名は自分で決めた名前 (引用符を含まない) なので、そのまま範囲に入れる
+  const r = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `'${String(name).replace(/'/g, "''")}'!${range}`, valueRenderOption: 'FORMATTED_VALUE', majorDimension: 'ROWS',
+  }, opt);
+  return { exists: true, owned: true, values: Array.isArray(r?.data?.values) ? r.data.values : [] };
+}

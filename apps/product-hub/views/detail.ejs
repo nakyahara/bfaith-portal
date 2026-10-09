@@ -1827,6 +1827,26 @@ th.attr-unknown { color: #dc2626; }
             <div id="lpi-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px; margin-top:8px;"></div>
             <p class="muted" style="font-size:11px; margin:6px 0 0;">画像は画像フォルダの「AI初稿」に保存します (楽天・Amazon の商品画像には入れません)。再生成した画像は v2, v3… の新しいファイルになり、前の版も残ります。</p>
           </div>
+          <%# デザイナー修正依頼書 (2026-10-09 PR-F・スタッフ要望 ⑥)。生成した全画像を TOP から順に貼ったスプレッドシートを商品の画像フォルダに作る。
+              中身は画面の JS (initDesignerSheet・@designer-sheet) が lpi-json の designer_sheet から入れる (画像のポーリングでも入れ直す) %>
+          <div id="dsheet" class="field" hidden style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;"
+               data-draft-id="<%= draft.id %>">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <div style="flex:1; min-width:220px;">
+                <b id="dsheet-title">デザイナー修正依頼書</b>
+                <div class="muted" id="dsheet-meta" style="font-size:11px;"></div>
+              </div>
+              <button type="button" class="btn btn-primary btn-sm" id="dsheet-create">デザイナー修正依頼書を作成</button>
+              <a id="dsheet-open" class="btn btn-sm" href="#" target="_blank" rel="noopener" hidden>開く ↗</a>
+            </div>
+            <div id="dsheet-stale" hidden style="margin-top:6px; padding:4px 8px; border-radius:6px; background:#fef3c7; border:1px solid #f59e0b; font-size:12px;">
+              <%# hidden で消すので、この div 自身に display を書かない (書くと hidden が効かない) %>
+              <span id="dsheet-stale-text"></span>
+              <button type="button" class="btn btn-sm" id="dsheet-update" style="margin-left:6px;">最新の画像で作り直す</button>
+            </div>
+            <div class="muted" id="dsheet-msg" style="font-size:12px; margin-top:4px; white-space:pre-wrap;"></div>
+            <p class="muted" style="font-size:11px; margin:4px 0 0;">修正指示はスプレッドシートの「修正指示」の列に書きます。作り直しても、書いた修正指示は同じ画像の行に残ります。画像を表示するため、載せる画像 (各画像の最新の版) だけを「リンクを知っている人は閲覧可」にします。</p>
+          </div>
           <script type="application/json" id="lpi-json"><%- JSON.stringify(lpImage).replace(/</g, '\\u003c') %></script>
           <% } %>
           <% if (!(typeof lpImage !== 'undefined' && lpImage && lpImage.enabled)) { %>
@@ -6570,6 +6590,8 @@ th.attr-unknown { color: #dc2626; }
       staleEl.hidden = !v.stale;
       gridEl.textContent = '';
       for (const c of s.cards || []) gridEl.appendChild(card(c));
+      // 取り直した状態を画像の箱の外 (デザイナー修正依頼書・PR-F) にも渡す
+      if (deps.onState) deps.onState(s);
       if (v.running) schedule(); else stop();
     }
     function stop() { if (timer) { deps.clearTimer(timer); timer = null; } }
@@ -6646,7 +6668,121 @@ th.attr-unknown { color: #dc2626; }
     return { render, poll, state: () => state };
   }
   /* @lp-image-ui:end */
-  initLpImages(document, {
+  // デザイナー修正依頼書 (2026-10-09 画像制作の新フロー PR-F)。生成した全画像を貼ったスプレッドシートを作る / 最新の画像で作り直す
+  /* @designer-sheet:start — test-ph-designer-sheet.mjs がこの間を切り出して、偽の document で動かして試す (EJS の値はここに書かない) */
+  const DSHEET_FORBIDDEN = 'デザイナー修正依頼書を作れるのは 画像登録者・画像作成承認者 の担当者か管理者だけです';
+  /** 見え方 (画面に依らない)。st = サーバの designer_sheet・busy = 送っている途中 */
+  function dsheetView(st, busy) {
+    if (!st) return { hidden: true };
+    const exists = !!st.exists;
+    const total = Number(st.total) || 0;
+    const reason = !st.can_edit ? DSHEET_FORBIDDEN : (st.blocked || '');
+    const when = String(st.at || '').slice(0, 16).replace('T', ' ');
+    return {
+      hidden: false,
+      title: exists ? st.title : 'デザイナー修正依頼書',
+      meta: exists
+        ? when + ' 作成' + (st.by ? ' (' + st.by + ')' : '') + ' ・ ' + (Number(st.count) || 0) + '枚 ・ 保存先: 商品の画像フォルダ'
+        : '生成した全' + (total ? total + '枚' : '画像') + 'を TOP から順に貼ったスプレッドシートを作り、商品の画像フォルダに保存します。修正指示はスプレッドシートに書いてください',
+      showCreate: !exists,
+      createLabel: busy ? '作成中…' : 'デザイナー修正依頼書を作成',
+      // 全部の画像ができてから (押せない理由はサーバが決める = API と同じ判定)
+      createDisabled: !st.can_edit || !!st.blocked || !!busy,
+      createTitle: reason,
+      openUrl: exists && st.url ? st.url : '',
+      showStale: exists && !!st.stale,
+      staleText: st.interrupted ? '前回の作り直しが最後まで記録できませんでした。' : '作成後に作り直した画像があります。',
+      updateLabel: busy ? '作り直しています…' : '最新の画像で作り直す',
+      updateDisabled: !st.can_edit || !!st.blocked || !!busy,
+      updateTitle: reason || '最新の画像でシートを書き直します (書いた修正指示は同じ画像の行に残ります)',
+      // 押せない理由は、押すボタンがあるときだけ出す (作成済みで最新なら何も出さない)
+      reason: (!exists || st.stale) ? reason : '',
+    };
+  }
+  /**
+   * 画面のつなぎ込み。deps = { fetchJson(url, {method, body}) → Promise<{status, json}> } (試験は偽物を渡す)。
+   * 状態は lpi-json の designer_sheet。画像のポーリング (initLpImages の onState) からも update で入れ直す
+   */
+  function initDesignerSheet(doc, deps) {
+    const root = doc.getElementById('dsheet');
+    const holder = doc.getElementById('lpi-json');
+    if (!root || !holder) return null;
+    let st = null;
+    try { st = JSON.parse(holder.textContent).designer_sheet || null; } catch (e) { return null; }
+    const $ = (id) => doc.getElementById(id);
+    const api = '/apps/product-hub/api/drafts/' + root.dataset.draftId;
+    let busy = false;
+    let msg = '';
+    function render() {
+      const v = dsheetView(st, busy);
+      root.hidden = !!v.hidden;
+      if (v.hidden) return;
+      $('dsheet-title').textContent = v.title;
+      $('dsheet-meta').textContent = v.meta;
+      const create = $('dsheet-create');
+      create.hidden = !v.showCreate;
+      create.textContent = v.createLabel;
+      create.disabled = v.createDisabled;
+      create.title = v.createTitle;
+      const open = $('dsheet-open');
+      open.hidden = !v.openUrl;
+      open.href = v.openUrl || '#';
+      $('dsheet-stale').hidden = !v.showStale;
+      $('dsheet-stale-text').textContent = v.staleText;
+      const upd = $('dsheet-update');
+      upd.textContent = v.updateLabel;
+      upd.disabled = v.updateDisabled;
+      upd.title = v.updateTitle;
+      $('dsheet-msg').textContent = [msg, v.reason].filter(Boolean).join('\n');
+    }
+    async function send() {
+      // 二重押しで 2 回送らない (サーバも同じ商品は 1 本ずつ)
+      if (busy || !st) return;
+      const wasExisting = !!st.exists;
+      busy = true;
+      msg = wasExisting ? '作り直しています… (10〜30 秒かかります)' : '作成しています… (10〜30 秒かかります)';
+      render();
+      let r = null;
+      // 画面が見ていた依頼書と画像の並びを添える (別のタブ・ほかの人が先に作った / 画像を作り直した後の古い画面ならサーバが止める)
+      try { r = await deps.fetchJson(api + '/designer-sheet', { method: 'POST', body: { seen_file_id: st.file_id || '', seen_images_hash: st.images_hash || '' } }); }
+      catch (e) { r = null; }
+      busy = false;
+      const j = r && r.json;
+      if (j && j.designer_sheet) st = j.designer_sheet;
+      if (j && j.ok) {
+        msg = (j.created ? 'デザイナー修正依頼書を作りました' : 'デザイナー修正依頼書を最新の画像で作り直しました')
+          + (j.carried ? ' (書いてあった修正指示 ' + j.carried + ' 件は同じ画像の行に残しました)' : '')
+          + (j.orphaned ? ' — 行き先の無い修正指示 ' + j.orphaned + ' 件はシートの下に残しました' : '');
+      } else if (!r) {
+        msg = '通信できませんでした。もう一度押してください (二重には作りません)';
+      } else {
+        msg = '作れませんでした: ' + ((j && j.error) || '');
+      }
+      render();
+      if (r && r.status === 409 && deps.refresh) deps.refresh();
+    }
+    // 押せない状態 (理由あり・送っている途中) のボタンは送らない
+    $('dsheet-create').addEventListener('click', function () { if (!$('dsheet-create').disabled) return send(); });
+    $('dsheet-update').addEventListener('click', function () { if (!$('dsheet-update').disabled) return send(); });
+    render();
+    return {
+      // 画像のポーリングの応答で入れ直す。送っている途中は待つ (送った結果で描き直す)。undefined (古い応答) は何もしない
+      update: function (next) { if (next === undefined || busy) return; st = next; render(); },
+      state: function () { return st; },
+      isBusy: function () { return busy; },
+    };
+  }
+  /* @designer-sheet:end */
+  const designerSheet = initDesignerSheet(document, {
+    fetchJson: async (url, opt) => {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(opt.body) });
+      return { status: res.status, json: await res.json().catch(() => null) };
+    },
+    // 断られた (古い画面・画像が変わった) ときは画像の箱も取り直す (見ていない画像で作らせない)
+    refresh: () => { if (lpiCtl) lpiCtl.poll(); },
+  });
+  const lpiCtl = initLpImages(document, {
+    onState: (s) => { if (designerSheet && s) designerSheet.update(s.designer_sheet); },
     fetchJson: async (url, opt) => {
       const res = await fetch(url, opt && opt.method === 'POST'
         ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(opt.body) }

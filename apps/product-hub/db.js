@@ -1613,6 +1613,43 @@ export function initProductHubDB() {
       BEGIN SELECT RAISE(ABORT, 'ph_lp_compose_edits は追記専用です'); END;
   `);
 
+  // デザイナー修正依頼書 (画像制作の新フロー PR-F・2026-10-09。services/designer-sheet-service.js)。
+  //   ph_designer_sheets       … 商品ごとに 1 行。作ったスプレッドシート (file_id / url)・作ったときの画像の並びの hash・
+  //                              作っている最中の印 (lease。同じ商品を 2 本同時に作らない・プロセスをまたいでも効く)・
+  //                              writing_at (Google に送る直前に立て、記録できたら下ろす。立ったままなら「作り直しが要る」)
+  //   ph_designer_sheet_shares … 依頼書に載せるために画像ファイルに付けた「リンクを知っている人は閲覧可」の権限 (後で外せるように)。
+  //                              ポータルが付けたものだけ記録する (前から付いていた共有は外さない)
+  // 撮影指示書 (PR-D) の列 (draft_image_production.shoot_sheet_*) とは混ぜない (別の書類)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_designer_sheets (
+      draft_id      INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
+      file_id       TEXT,
+      url           TEXT,
+      images_hash   TEXT,                -- 作ったときの画像の並び (lib/designer-sheet.js の designerImagesHash)
+      images_json   TEXT,                -- 作ったときに載せた画像 [{root_id, current_id, drive_file_id, version}] (公開を残すファイルの正本)
+      image_count   INTEGER,
+      created_at    TEXT,
+      created_by    TEXT,
+      updated_at    TEXT,
+      updated_by    TEXT,
+      writing_at    TEXT,
+      lease_token   TEXT,
+      lease_until   TEXT
+    );
+    CREATE TABLE IF NOT EXISTS ph_designer_sheet_shares (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id       INTEGER NOT NULL,     -- 商品を消しても記録は残す (Drive の共有は残るので、外すときの手がかり)
+      drive_file_id  TEXT NOT NULL,
+      permission_id  TEXT NOT NULL,
+      image_id       INTEGER,              -- ph_lp_images.id (載せた版の行)
+      shared_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      shared_by      TEXT,
+      revoked_at     TEXT,                 -- 外した (依頼書から外れた古い版)。NULL = まだ公開中
+      revoke_error   TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_designer_sheet_shares_draft ON ph_designer_sheet_shares(draft_id, revoked_at);
+  `);
+
   // LP 構成: 実行役へ配った画像の記録 (PR1-b で追加。PR1-a でデプロイ済みの DB にも入れる)
   const lpJobCols = new Set(db.prepare('PRAGMA table_info(ph_lp_compose_jobs)').all().map((c) => c.name));
   if (lpJobCols.size > 0 && !lpJobCols.has('images_served_json')) {
