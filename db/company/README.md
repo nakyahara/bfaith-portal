@@ -2397,3 +2397,42 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): **0064 (PR-1) の後**・`migrate.mjs --dry-run` (0065 だけが出る) → 中原さんの OK (JAN を NE に送らなくなることも) → 本適用 → 同じ日に Render を出す。
   migration と Render の間は単品の NE 登録の CSV を作れない (古いコード = v1 = `schema_not_buildable` / 新しいコードと古い DB = 見出しの版が違う = 400)。データは何も変わらない (作る・配るの前に止まる)。
   ロールの script は流し直さなくてよい (新しい部品はだれにも渡さない = migration が public から外す・照合の確かめの grant は migration が流し直す)
+
+### 色違い・サイズ違いのまとまり (group product) の DB (0067・2026-10-09。AI_reference CompanyDB構想/20 v7 §③・§⑤・§⑩ の PR-5。🚨 番号は 0066 (PR-3) の後・PR-6 (0068) の前)
+
+- **今は何も変わらない**: まとまりの関数は全部 `products.parent` の DB の active が company のときだけ動く (今は load = `parent_not_company` で断る)。親なしのふつうの登録・夜間ロード・照合は今までどおり。
+  入口の門 = `ops._variation_gate` (段階・持ち主表 → active の products.parent → 書く列のキー)。開くのは PR-8 の後の widen (DB の active を読む = 配り直しは要らない)
+- **表**: 予約 `ops.variation_group_codes` (会社 + norm で一意・source = portal / load / ne_adopt・追記だけ)・軸 `core.variation_axes` (1 = 横・2 = 縦)・選択肢 `core.variation_options`
+  (番号 `^-[A-Za-z0-9]{1,10}$` は軸ごとに小文字で一意・名前は軸ごとに NFKC + 前後の空白を除いた形で一意)・子の選択肢 `core.sku_variation_choices` ((まとまり, 横, 縦) で一意)・
+  revision `ops.variation_group_revisions` (まとまりごと・変わる取引でちょうど 1 = 2 回目は `revision_twice`・共通の欄 common)・まとめての登録 `ops.variation_batches` (開いて閉じないと commit できない)・
+  quarantined の採用 `ops.variation_parent_adoptions` (1 SKU に 1 回・由来)。書くのはまとまりの関数だけ (`ops.variation_protocol` の印・`ops.guard_variation_write`・持ち主の手の DML も断る)。変更の記録 = 0026 の trigger
+  (`events.master_change_events` の種類の CHECK に variation_axis / variation_option / sku_variation_choice を **NOT VALID** で足した = 後の手順は 0053 と同じ `alter table events.master_change_events validate constraint master_change_events_entity_type_check;`)
+- **親か子のどちらか一方** (`core.check_parent_one_level`・遅らせた constraint trigger・どのロールでも): company のときだけ見る (load の間の夜間ロードは止めない)
+- **関数** (security definer・search_path = pg_catalog, pg_temp・画面のロール master_edit に実行だけ):
+  - `ops.variation_batch_open(request_id, actor, reason, ownership, spec)` → 子ごとに `ops.register_new_sku` (子の request_id = `ops.variation_sub_request_id(request_id, 'child:' || norm)` = sha256 の先頭 32 字 = janRequestId と同じ作り方・カードの知らせは書かない)・JAN は `ops.edit_sku_jan` →
+    `ops.variation_batch_close(request_id, actor, ownership, common)` を **1 つの取引** で。spec = { group: { code, name } | { product_id }, axes, options (足すものだけ), children: [{ code, choices }] (1〜20) }。
+    子のコード = まとまりのコード + 横 + 縦 (打ったとおり)・`ops.new_sku_code_problem`・(横, 縦) の一意・選択肢の一意を DB が確かめる。閉じる = 親 (manual)・軸・選択肢・子の選択肢・revision + 1・`group_snapshot` (ph-group-v1) の知らせ
+  - `ops.cancel_variation_child` (下書き / NE 登録待ち・生きているファイルなし・NE に一度も現れていない子だけ)・`ops.edit_variation_labels` (札の名前・軸の名前・選択肢名・見た revision)・
+    `ops.adopt_ne_parent_for_quarantined` (最新の封のある照合の回 = NE の元のコードの印の回の観測から・1 回だけ)
+  - 確かめ: `ops.variation_group_code_problem(code)`・`ops.variation_parent_company()`・`ops.variation_max_children()` (= 20)
+  - 鍵の順 = request → 許可 (共有) → 段階 → マスタの書き込み → (SKU) → 親子 (排他) → まとまりのコード → まとまり → 子のコード (norm の順)。本物の PG で、同時に同じまとまりに足す・名前を直す・子の廃止・CSV を作る・照合の確かめ・夜間ロードの排他と並べて試験 (`scripts/test-master-variation-pg.mjs`)
+- **NE 登録の CSV** (`ne-reg-variation-v1` を作れる版に): `ops.ne_reg_canonical` (0065 から代表の列だけ: NE に無い = ポータルで作った札 (予約 portal) なら予約のコード)・
+  `ops.ne_reg_build` (0065 から: まとまりの版 = 全部同じまとまりの子・NE 登録待ちの子を全部 (`variation_incomplete`)・単品の版にポータルの札の子は入れない (`variation_file_required`))。lib は `buildRegExport({ variation: true })`・`regMaterialOf` の `portalGroup`
+- **照合 ② の確かめ待ち** (`ops.v_ne_reg_targets`): company のとき、親の無い quarantined の単品 (まだ採用していない) を足す = 翌朝の照合が NE の観測を残す = 代表の採用の根拠 (miniPC のコードは変えない)
+- **予約の事前検査** (0067 は、今ある札 (SKU の無い商品) と単品の代表 (子を持つ単品) を予約に入れる。同じ norm のまとまりが 2 つ以上・札のコードがほかの SKU のコード = 1 つでもあれば migration ごと止まる = 何も変えない)。
+  流す前に watcher で数える (読むだけ・`dup` と `tag_is_sku` が 0 でなければ、どれを直すか中原さんと決めてから):
+  ```sql
+  with g as (
+    select p.product_id as gid, core.norm_code(p.display_code) as norm, 'tag' as kind from core.products p
+     where p.company_id = 1 and coalesce(btrim(p.display_code), '') <> '' and not exists (select 1 from core.skus k where k.product_id = p.product_id)
+    union all
+    select p.product_id, k.code_norm, 'single' from core.products p join core.skus k on k.product_id = p.product_id and k.sku_kind = 'single'
+     where p.company_id = 1 and exists (select 1 from core.products c where c.parent_product_id = p.product_id))
+  select (select count(*) from g)::int as candidates,
+         (select count(*) from (select norm from g group by norm having count(*) > 1) d)::int as dup,
+         (select count(*) from g join core.skus k on k.company_id = 1 and k.code_norm = g.norm and k.product_id is distinct from g.gid where g.kind = 'tag')::int as tag_is_sku;
+  ```
+  流した後 (持ち主): `select ops.variation_reservation_check();` (同じ数 + reserved)。夜間ロードがその後に作った札は、まとまりの関数が最初に触るときに予約する (load)。
+  widen の前に `select ops.reserve_existing_variation_groups('<人>');` (DB の持ち主だけ・何回でも同じ) を流し直せる
+- 当て方 (🚨 まだ流さない): 0066 の後・上の事前検査の数 → `migrate.mjs --dry-run` (0067 だけが出る) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs`・
+  master_edit に 9 つの関数とまとまりの表の読み取り。流さなくても今の動きは変わらない) → `select ops.variation_reservation_check();` と予約の数を見る。Render と migration の順はどちらでもよい (lib の `regMaterialOf` は予約の表が無ければ読まない・まとまりの関数は company の後でないと動かない)

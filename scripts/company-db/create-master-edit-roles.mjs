@@ -41,6 +41,10 @@
  *   広げる道の DB の持ち主の関数 (prepare / widen / cancel / 停止 / 保守の印 / private の _ の関数) はだれにも渡さない
  * 🆕 0066 (Company DB構想 20 の PR-3・知らせの名前空間): master_edit に名前空間つきで借りる関数 (ops.claim_outbox_events) の実行を足す。
  *   まとまりの知らせを書く部品 (ops.enqueue_group_snapshot)・形 / 値の確かめ・insert の trigger はだれにも渡さない
+ * 🆕 0067 (Company DB構想 20 の PR-5・まとまりの DB): master_edit にまとまりの 5 つの関数 (まとめての登録を開く / 閉じる・子の廃止・名前を直す・
+ *   quarantined の代表の採用) と確かめの 4 つ (新しいまとまりのコードの決まり・products.parent が company か・子の request_id・子の数の上限) の実行と、
+ *   まとまりの表 (予約・軸・選択肢・子の選択肢・revision・まとめての登録・採用の記録) の読み取りを足す (表が無い DB = 0067 の前は付けない = 流し直すと付く)。
+ *   🚨 渡さない: まとまりの表の書き込み (関数だけ)・関数の中の部品 (鍵・スナップショット・revision・約束・予約の事前検査と入れる関数 = DB の持ち主だけ)
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
  *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
@@ -161,6 +165,20 @@ export const OUTBOX_NS_EDIT_FUNCTIONS = Object.freeze(['ops.claim_outbox_events(
 /** 🆕 0066: だれにも渡さない (まとまりの知らせを書く部品 = PR-5 のまとまりの関数の中だけ・形 / 値の確かめ・insert の trigger) */
 export const OUTBOX_NS_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.enqueue_group_snapshot(bigint, integer, jsonb, uuid, text)', 'ops.group_snapshot_shape_problem(jsonb)',
   'ops.group_snapshot_problem(smallint, bigint, integer, jsonb)', 'ops.guard_product_hub_outbox_group()']);
+/** 🆕 0067 (Company DB構想 20 の PR-5・まとまり): 画面のロールが実行する (どれも products.parent の DB の active が company のときだけ書く = 今は断る)。無い DB (0067 の前) では付けない */
+export const VARIATION_EDIT_FUNCTIONS = Object.freeze(['ops.variation_batch_open(uuid, text, text, jsonb, jsonb)', 'ops.variation_batch_close(uuid, text, jsonb, jsonb)',
+  'ops.cancel_variation_child(uuid, text, text, jsonb, bigint)', 'ops.edit_variation_labels(uuid, text, text, jsonb, bigint, integer, jsonb)',
+  'ops.adopt_ne_parent_for_quarantined(uuid, text, text, jsonb, bigint)', 'ops.variation_group_code_problem(text)', 'ops.variation_parent_company()',
+  'ops.variation_sub_request_id(uuid, text)', 'ops.variation_max_children()']);
+/** 🆕 0067: だれにも渡さない (関数の中の部品・守りの trigger・予約の事前検査と入れる関数 = DB の持ち主だけ) */
+export const VARIATION_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.variation_label_problem(text, integer)', 'ops.variation_lock_group(bigint)', 'ops.variation_lock_code(text)',
+  'ops.guard_variation_write()', 'ops.check_variation_batch_closed()', 'core.check_parent_one_level()', 'ops.variation_existing_groups()', 'ops.variation_reservation_check()',
+  'ops.reserve_existing_variation_groups(text)', 'ops._variation_group_resolve(bigint, text, text, boolean)', 'ops._variation_lock_existing_group(bigint)',
+  'ops.variation_group_snapshot(bigint, integer, text)', 'ops._variation_bump(bigint, uuid, text)',
+  'ops._open_variation_write(text, uuid, text, text, jsonb, bigint, bigint[], text, jsonb)', 'ops._variation_replay(uuid, text, text)']);
+/** 🆕 0067: 画面のロールが読むまとまりの表 (書き込みは関数だけ)。無い DB では付けない */
+export const VARIATION_SELECT = Object.freeze(['ops.variation_group_codes', 'core.variation_axes', 'core.variation_options', 'core.sku_variation_choices',
+  'ops.variation_group_revisions', 'ops.variation_batches', 'ops.variation_parent_adoptions']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -233,6 +251,12 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0066 (知らせの名前空間): 関数がある DB だけ。前に付けた実行権を外してから付け直す
   for (const f of [...OUTBOX_NS_EDIT_FUNCTIONS, ...OUTBOX_NS_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of OUTBOX_NS_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0067 (まとまり): 関数・表がある DB だけ。前に付けた権限を外してから付け直す
+  for (const f of [...VARIATION_EDIT_FUNCTIONS, ...VARIATION_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of VARIATION_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  for (const t of VARIATION_SELECT) {
+    s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
+  }
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、

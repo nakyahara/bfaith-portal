@@ -992,7 +992,8 @@ await ta('[G-0064] 大文字のコード (0064): ops.new_sku_code_problem・ops.
   ]) {
     // 元にする版 = 0058 (0058 の後に作り直したのは 0064 だけ)。例外は名指しの 1 つだけ: ops.ne_reg_build の 0065 (#1664) = 0064 の版から写す = その中身は
     //   test-master-reg-csv.mjs の [V2] が 0064 との差で確かめる。ops.new_sku_code_problem は例外なし (後の作り直しは全部拒む)
-    const allowLater = head === 'create or replace function ops.ne_reg_build(' ? ['0065_ne_reg_csv_versions.sql'] : [];
+    //   🆕 0067 (PR-5) も名指しで ops.ne_reg_build を 0065 の版から写す = その中身は scripts/test-master-variation.mjs の [S2] が 0065 との差で確かめる
+    const allowLater = head === 'create or replace function ops.ne_reg_build(' ? ['0065_ne_reg_csv_versions.sql', '0067_variation_groups.sql'] : [];
     for (const file of files.filter((x) => x.slice(0, 4) > '0058' && x.slice(0, 4) !== '0064' && !allowLater.includes(x))) {
       assert.ok(!re.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も ${head} を作り直している = 0064 の元にする定義を見直す`);
     }

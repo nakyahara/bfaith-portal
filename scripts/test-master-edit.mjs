@@ -502,12 +502,12 @@ await ta('[3] 単品: 名前・取扱・売価・税率・分類・送料・月�
   const id = uuid();
   const r = await save('s003', {
     name: '単品 3 改', handling: 'active', standard_price: '1,280', tax_rate: '8', sales_class: '2', shipping_code: 'S01', reorder_months: '1.5',
-    primary_supplier: '2', parent_code: 's001',
+    primary_supplier: '2', parent_code: 's002',   // 🆕 0067: 親か子のどちらか一方 = 親は子を持たない単品 (s001 は grp1 の子 = 親にすると 2 段 = DB が断る)
   }, { requestId: id, reason: '棚卸で見直し' });
   assert.deepEqual(r.changed.map((c) => c.field).sort(), ['name', 'parent_code', 'primary_supplier', 'reorder_months', 'sales_class', 'shipping_code', 'standard_price', 'tax_rate'].sort());
   assert.deepEqual(await skuRow('s003'), {
     name: '単品 3 改', tax_rate: 0.08, tax_class: 'REDUCED_8', handling: 'active', price: 1280, shipping_code: 'S01', shipping_method: 'ゆうパケット', ship: 210, months: 1.5,
-    override: null, handling_own: null, pname: '単品 3 改', sales_class: 2, status: 'active', parent: 's001', parent_set_by: 'manual',
+    override: null, handling_own: null, pname: '単品 3 改', sales_class: 2, status: 'active', parent: 's002', parent_set_by: 'manual',
   });
   assert.deepEqual(await primaryOf('s003'), ['0002']);
   assert.equal((await reqRow(id)).status, 'done');
@@ -535,7 +535,7 @@ await ta('[4] 保存した値は夜間ロード (持ち主 company) を 2 回流
   await load(MASTER_OWNERSHIP);
   assert.equal((await skuRow('s003')).name, '単品 3');
   assert.equal((await skuRow('s003')).tax_rate, 0.1);
-  assert.equal((await skuRow('s003')).parent, 's001');   // 人が決めた親 (manual) は load でも触らない (0036)
+  assert.equal((await skuRow('s003')).parent, 's002');   // 人が決めた親 (manual) は load でも触らない (0036)
   await save('s003', { name: '単品 3 改', tax_rate: '8' });   // 以降の試験の前提
 });
 
