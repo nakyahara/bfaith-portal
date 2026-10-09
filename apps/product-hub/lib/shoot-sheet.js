@@ -1,34 +1,74 @@
 /**
  * 撮影指示書 (スプレッドシート) の中身を組む純粋関数 (画像制作の新フロー PR-D・2026-10-09)。
  * 設計 = 共有ドライブ システム設計/商品ハブ_画像制作の新フロー_設計_20261008.md §3.4
+ * 形 = スタッフが使っている「新商品初動判定」仕様書 (Ver1.3.11・2026-10-08) の撮影依頼書
+ *   (「撮影依頼書スプレッドシート表示ルール」「撮影依頼書表示簡略化」「撮影依頼書連携データ」)。
+ *   **仕様書はよく変わるので、表示の並びは SHEET_LAYOUT の 1 か所にまとめてある。** 変わったらそこを直す
  *
- * ここは Google にも DB にも触らない。入力 (商品・撮影の種類・カット) → 出力 (ファイル名とシートごとの行) だけ。
+ * ここは Google にも DB にも触らない。入力 (商品・撮影の種類・概要・カット) → 出力 (ファイル名とシートごとの行) だけ。
  * 書き込みは services/sheets-writer.js、DB と材料集め (shootSheetCutsFor) は services/shoot-sheet-service.js。
  *
- * 🚨 材料は AI の出力 (LP構成) と人の入力。スプレッドシートの数式として解釈されないよう、
- *    書き込みは必ず valueInputOption=RAW (sheets-writer が固定している)。RAW なら `=IMPORTXML(...)` も文字のまま入る。
- *    先頭に `'` を付ける方式は採らない — RAW では `'` がそのまま見えてしまい、
- *    LP構成によく出る「- 箇条書き」の行がすべて `'- …` になる
+ * 🚨 材料は AI の出力 (LP構成・撮影判定) と人の入力。セルは文字 (stringValue) で書く = 数式として評価させない
+ *    (sheets-writer が固定している)。先頭に `'` を付ける方式は採らない (`'` がそのまま見えてしまう)
  */
 import { createHash } from 'node:crypto';
 
 import { parseConstructionDoc } from './lp-parser.js';
 
 export const SHOOT_SHEET_MODES = { inhouse: '社内撮影', photographer: 'カメラマン撮影' };
+/** 仕様書の撮影判定の表記 (②・③) */
+export const SHOOT_JUDGEMENT_LABELS = { inhouse: '② 社内撮影', photographer: '③ カメラマン撮影' };
 /** 1 タブ目 / 2 タブ目の名前。更新のときはこの名前のタブだけを書き換える (人が足したタブには触らない) */
-export const SHEET_MAIN = '撮影指示';
+export const SHEET_MAIN = '撮影依頼書';
 export const SHEET_REQUEST = '依頼文';
 export const MANAGED_SHEETS = [SHEET_MAIN, SHEET_REQUEST];
-/** カット一覧の見出し (設計 §3.4 の列) */
-export const CUT_COLUMNS = ['カット番号', '使う画像', 'カット名', '構図', '小物', '背景', 'トーン', 'NG'];
-/** カット 1 つの欄 (API で受ける形。文字列だけ) */
-export const CUT_FIELDS = ['label', 'cut', 'composition', 'props', 'background', 'tone', 'ng', 'role', 'title'];
+
+/**
+ * カット 1 つの欄 = 仕様書の「撮影依頼書連携データ」の撮影カット (No 以外) + こちらで足した欄。
+ * 表示しない欄 (内部連携) も持つ — 材料の hash に入り、C2 (AI の撮影判定を仕様書の全項目に広げる PR) が埋める
+ *   priority 優先度 (必須／推奨) / expression_type 撮影表現タイプ / variation 撮影対象バリエーション /
+ *   target 撮影対象 (色・種類名＋点数) / content 撮影内容 / purpose 撮影目的 / finish 構図・完成イメージ /
+ *   usage 使用用途 / open_required 開封要否 / reference_theme 参考イメージ (AI 参考画像用の短いテーマ名・表示しない)
+ *   lp_image 使う LP 画像 (任意。LP に無い実写素材のカットもある) / notice 注意 / required_notice 必ず出す表示 (「実物への貼付不可」など)
+ */
+export const CUT_FIELDS = ['priority', 'expression_type', 'variation', 'target', 'content', 'purpose', 'finish', 'usage',
+  'open_required', 'reference_theme', 'lp_image', 'notice', 'required_notice'];
+/** 概要の欄 = 仕様書の撮影依頼書連携データの上部 (撮影判定／撮影担当／開封要否／撮影用送付対象／撮影目的／完成イメージ／使用用途／判定の結論) */
+export const SUMMARY_FIELDS = ['judgement', 'shooter', 'open_required', 'send_targets', 'purpose', 'finish', 'usage', 'conclusion'];
 export const MAX_CUTS = 40;
 export const CUT_FIELD_MAX = 2000;
 /** Sheets の 1 セルの上限は 50,000 文字。依頼文などもこれより短く切る */
 const CELL_MAX = 5000;
-/** 見出しの行数 (タイトル・商品名・商品コード・撮影の種類・画像フォルダ・空行)。この次の行がカット一覧の見出し */
-const HEADER_ROWS = 6;
+
+/**
+ * ⭐ 人向け撮影依頼書の表示の定義 (ここ 1 か所)。仕様書 Ver1.3.11 の「撮影依頼書スプレッドシート表示ルール」:
+ *   上部は「商品コード／商品名／撮影担当／撮影用送付対象／撮影カット数」の概要だけ。
+ *   各カットは「カットNo.／撮影内容／撮影対象／完成イメージ／参考イメージ画像」だけ。
+ *   撮影表現タイプ・撮影対象バリエーション・撮影目的・使用用途・開封要否 (内部連携) はシートに出さない。
+ *   参考イメージ欄は画像だけ (説明文・テーマ名は出さない。参考画像がまだ無いので空欄)。
+ *   社内撮影は「必須／推奨」を出す (撮る／撮らないを社内で決める)。カメラマン撮影は出さない (全カット必須で確定)。
+ *   「注意」は AI の撮影判定の NG (PR-C) を出すため、値があるときだけの行 (仕様書には無い。要らなければ消す)
+ */
+export const SHEET_LAYOUT = {
+  spec: '新商品初動判定 Ver1.3.11 (2026-10-08)',
+  title: '撮影依頼書',
+  summary: [
+    { label: '商品コード', value: (x) => x.productCode },
+    { label: '商品名', value: (x) => x.productName },
+    { label: '撮影担当', value: (x) => x.summary.shooter || SHOOT_SHEET_MODES[x.shootMode] },
+    { label: '撮影用送付対象', value: (x) => x.summary.send_targets },
+    { label: '撮影カット数', value: (x) => `${x.cuts.length}カット` },
+  ],
+  cutHeading: (c, x) => (x.shootMode === 'inhouse' && c.priority ? `カット${c.no}（${c.priority}）` : `カット${c.no}`),
+  cut: [
+    { label: '撮影内容', value: (c) => c.content },
+    { label: '撮影対象', value: (c) => c.target },
+    { label: '完成イメージ', value: (c) => c.finish },
+    { label: '参考イメージ', value: () => '' },
+    { label: '注意', value: (c) => c.notice, onlyIfValue: true },
+  ],
+  columnWidths: [140, 640],
+};
 
 const str = (v) => (v == null ? '' : String(v));
 /** セルに入れる文字: 制御文字 (改行・タブ以外) を落とし、長さを切る */
@@ -46,70 +86,74 @@ export function shootSheetTitle(productCode, shootMode) {
   return `撮影指示書_${code || '(商品コードなし)'}（${SHOOT_SHEET_MODES[shootMode] || '撮影'}）`;
 }
 
-/** カット 1 つを決まった形にそろえる (欠けた欄は空文字・長さを切る)。no は 1 からの連番を振り直す */
+/**
+ * カットを決まった形にそろえる (欠けた欄は空文字・長さを切る)。no は 1 からの連番を振り直す。
+ * 必ず出す表示 (required_notice・例「実物への貼付不可」) が撮影内容にも完成イメージにも無ければ、完成イメージの後ろに足す
+ * (仕様書「補修シート類・撮影依頼書表示ルール」: カメラマン向け表示では撮影内容か完成イメージのどちらかに必ず含める)
+ */
 export function normalizeCuts(cuts) {
   return (Array.isArray(cuts) ? cuts : []).slice(0, MAX_CUTS).map((c, i) => {
     const o = { no: i + 1 };
     for (const f of CUT_FIELDS) o[f] = cellText(c && c[f], CUT_FIELD_MAX);
+    if (o.required_notice && !o.content.includes(o.required_notice) && !o.finish.includes(o.required_notice)) {
+      o.finish = o.finish ? `${o.finish}（${o.required_notice}）` : o.required_notice;
+    }
     return o;
   });
 }
 
+/** 概要をそろえる (欠けた欄は空文字) */
+export function normalizeSummary(summary) {
+  const o = {};
+  for (const f of SUMMARY_FIELDS) o[f] = cellText(summary && summary[f], CUT_FIELD_MAX);
+  return o;
+}
+
 /**
- * API で受けたカット (画面・B/C から渡す口) を検査する。形が違えば error を返す (黙って空にしない)
- * @returns {{cuts: Array|null, error: string|null}}
+ * カット数の確認 (シートの概要の下に出す)。仕様書: カット数は別画像として納品される実カット数。
+ * ③カメラマン撮影は最低 5 カット・5 カット単位 (5・10・15)。足りないときにカットを作るのは AI 側なので、ここは知らせるだけ
  */
-export function validateCutsInput(v) {
-  if (!Array.isArray(v)) return { cuts: null, error: 'cuts は配列で指定してください' };
-  if (v.length > MAX_CUTS) return { cuts: null, error: `カットは ${MAX_CUTS} 個までです` };
-  for (const [i, c] of v.entries()) {
-    if (!c || typeof c !== 'object' || Array.isArray(c)) return { cuts: null, error: `cuts[${i}] の形が不正です` };
-    for (const f of CUT_FIELDS) {
-      if (c[f] != null && typeof c[f] !== 'string') return { cuts: null, error: `cuts[${i}].${f} は文字列で指定してください` };
-      if (typeof c[f] === 'string' && c[f].length > CUT_FIELD_MAX) return { cuts: null, error: `cuts[${i}].${f} が長すぎます (${CUT_FIELD_MAX} 文字まで)` };
-    }
-  }
-  return { cuts: normalizeCuts(v), error: null };
+export function cutCountWarning(shootMode, n) {
+  if (!n) return '撮るカットがまだありません。LP構成 (要撮影の画像) を確かめるか、このシートに書き足してください';
+  if (shootMode === 'photographer' && n < 5) return `カメラマン撮影は最低 5 カットです (いま ${n} カット)。カットを足してから依頼してください`;
+  if (shootMode === 'photographer' && n % 5 !== 0) return `カメラマン撮影は 5 カット単位 (5・10・15) です (いま ${n} カット)。足すか減らすかを決めてから依頼してください`;
+  return null;
 }
 
 /**
  * 撮影指示書の中身。
- * @param {{productCode, productName, shootMode: 'inhouse'|'photographer', folderUrl, cuts, requestText}} input
+ * @param {{productCode, productName, shootMode: 'inhouse'|'photographer', folderUrl, summary, cuts, requestText}} input
  * @returns {{title: string, sheets: Array<{name, rows: string[][], format}>}}
- *   rows は文字列だけの 2 次元配列 (RAW で書く)。format は sheets-writer の書式指定
+ *   rows は文字列だけの 2 次元配列 (stringValue で書く)。format は sheets-writer の書式指定
  */
 export function buildShootSheet(input) {
   const mode = input && input.shootMode;
   if (!SHOOT_SHEET_MODES[mode]) throw new Error('撮影の種類は 社内撮影 / カメラマン撮影 のどちらかです');
-  const cuts = normalizeCuts(input.cuts);
-  const main = [
-    ['撮影指示書'],
-    ['商品名', cellText(input.productName)],
-    ['商品コード', cellText(input.productCode)],
-    ['撮影の種類', SHOOT_SHEET_MODES[mode]],
-    ['画像フォルダ', cellText(input.folderUrl)],
-    [],
-    CUT_COLUMNS.slice(),
-  ];
-  if (cuts.length) {
-    for (const c of cuts) {
-      main.push([String(c.no), c.label, c.cut, c.composition, c.props, c.background, c.tone, c.ng]);
+  const L = SHEET_LAYOUT;
+  const x = {
+    productCode: cellText(input.productCode), productName: cellText(input.productName), shootMode: mode,
+    summary: normalizeSummary(input.summary), cuts: normalizeCuts(input.cuts),
+  };
+  const rows = [[L.title]];
+  const bold = [0];
+  const shaded = [];
+  for (const it of L.summary) rows.push([it.label, cellText(it.value(x))]);
+  const warn = cutCountWarning(mode, x.cuts.length);
+  if (warn) { bold.push(rows.length); rows.push(['確認', warn]); }
+  for (const c of x.cuts) {
+    rows.push([]);
+    bold.push(rows.length); shaded.push(rows.length);
+    rows.push([L.cutHeading(c, x)]);
+    for (const it of L.cut) {
+      const v = cellText(it.value(c, x));
+      if (it.onlyIfValue && !v) continue;
+      rows.push([it.label, v]);
     }
-  } else {
-    // 要撮影の画像を LP構成から見つけられなかった。表は残して、人が書き足せるようにする
-    main.push(['', '', '(LP構成から撮影が要る画像を見つけられませんでした。撮るカットをここに書き足してください)']);
   }
   const sheets = [{
     name: SHEET_MAIN,
-    rows: main,
-    format: {
-      boldRows: [0, HEADER_ROWS],
-      shadedRows: [HEADER_ROWS],
-      frozenRows: HEADER_ROWS + 1,
-      // A カット番号 / B 使う画像 / C カット名 / D 構図 / E 小物 / F 背景 / G トーン / H NG
-      columnWidths: [90, 160, 160, 320, 200, 220, 200, 240],
-      wrap: true,
-    },
+    rows,
+    format: { boldRows: bold, shadedRows: shaded, frozenRows: 0, columnWidths: L.columnWidths, wrap: true },
   }];
   if (mode === 'photographer') {
     const lines = cellText(input.requestText, 20000).split('\n').map((l) => [cellText(l)]);
@@ -127,12 +171,12 @@ function canonical(v) {
 
 /**
  * 「作ったときの材料」の hash。今の材料と比べて違えば「LP構成が変わりました → 撮影指示書を更新」を出す。
- * 宛先 (依頼文の 1 行目) は入れない — 宛先を変えただけで全商品が「更新が要る」にならないように
+ * 表示しない欄 (内部連携) も入れる。宛先 (依頼文の 1 行目) は入れない — 宛先を変えただけで全商品が「更新が要る」にならないように
  */
-export function shootSheetMaterialHash({ productCode, productName, shootMode, folderUrl, cuts }) {
+export function shootSheetMaterialHash({ productCode, productName, shootMode, folderUrl, summary, cuts }) {
   const body = canonical({
-    v: 1, productCode: cellText(productCode), productName: cellText(productName), shootMode: str(shootMode),
-    folderUrl: cellText(folderUrl), cuts: normalizeCuts(cuts),
+    v: 2, productCode: cellText(productCode), productName: cellText(productName), shootMode: str(shootMode),
+    folderUrl: cellText(folderUrl), summary: normalizeSummary(summary), cuts: normalizeCuts(cuts),
   });
   return createHash('sha256').update(body, 'utf8').digest('hex');
 }
@@ -185,12 +229,13 @@ export function cutNameFrom(materialText) {
   return m ? m[1].trim() : null;
 }
 
-// 欄ごとの見出し (先に書いたものを優先)。B・C の形 (構図・小物・トーン) と ⑦ の固定見出しのどちらでも拾う
+// 欄ごとの見出し (先に書いたものを優先)。⑦ の固定見出しと、構図・小物・トーンの見出しのどちらでも拾う。
+// 完成イメージは仕様書で「1 文程度」なので、長い 詳細レイアウト・使用カラー (HEX の並び) は拾わない
 const FIELD_HEADINGS = {
-  composition: [/^構図/, /^商品配置$/, /^(詳細レイアウト|レイアウト)$/],
+  composition: [/^構図/, /^商品配置$/],
   props: [/^小物/, /^装飾[・･]演出$/],
   background: [/^背景/],
-  tone: [/トーン/, /^使用カラー$/],
+  tone: [/トーン/],
   ng: [/^NG/],
 };
 const firstSection = (block, res) => {
@@ -207,24 +252,32 @@ export function blockMentionsShoot(blockText) {
 }
 
 /**
+ * 構図・小物・背景・トーンを「完成イメージ」1 欄に寄せる (仕様書の人向け表示は完成イメージだけ)。
+ * C2 (AI が仕様書の「構図・完成イメージ」を直接出す) までのつなぎ
+ */
+export function joinFinish({ composition, props, background, tone } = {}) {
+  return [cellText(composition), props ? `小物：${cellText(props)}` : '', background ? `背景：${cellText(background)}` : '',
+    tone ? `トーン：${cellText(tone)}` : ''].filter(Boolean).join('／');
+}
+
+/**
  * 画像ブロック (⑦ の `# N枚目｜名前` の下) から、撮影指示書の 1 カットぶんを見出しで拾う。
  * AI の撮影判定 (PR-C) が無い画像を埋める最小版
  * @param {string} blockText  ブロックの中身 (見出しの行は含めなくてよい)
- * @param {{label: string, name?: string}} o  label = 使う画像 (N枚目｜名前)
+ * @param {{label: string, name?: string}} o  label = 使う LP 画像 (N枚目｜名前)
  */
 export function cutFromBlock(blockText, { label, name = '' }) {
   const block = str(blockText);
   const material = sectionText(block, /^使用素材$/);
   return {
-    label,
-    cut: cutNameFrom(material) || cellText(name, 100) || label,
-    composition: firstSection(block, FIELD_HEADINGS.composition),
-    props: firstSection(block, FIELD_HEADINGS.props),
-    background: firstSection(block, FIELD_HEADINGS.background),
-    tone: firstSection(block, FIELD_HEADINGS.tone),
-    ng: firstSection(block, FIELD_HEADINGS.ng),
-    role: sectionText(block, /^画像の役割$/),
-    title: sectionText(block, /^メイン見出し$/),
+    priority: '必須',
+    lp_image: label,
+    content: cutNameFrom(material) || cellText(name, 100) || label,
+    finish: joinFinish({
+      composition: firstSection(block, FIELD_HEADINGS.composition), props: firstSection(block, FIELD_HEADINGS.props),
+      background: firstSection(block, FIELD_HEADINGS.background), tone: firstSection(block, FIELD_HEADINGS.tone),
+    }),
+    notice: firstSection(block, FIELD_HEADINGS.ng),
   };
 }
 
@@ -235,7 +288,7 @@ const imgLabel = (no, name) => {
 
 /**
  * ⑦形式の LP構成から、`## 使用素材` に「撮影」が出てくる画像を要撮影のカットとして拾う (編集版も AI の判定も無いときの推定)。
- * 構成が読めなければ空配列 (指示書は空の表で作れる)
+ * 構成が読めなければ空配列 (指示書は空で作れる)
  */
 export function cutsFromComposeText(outputText) {
   let doc;
@@ -259,11 +312,15 @@ export function aiNoOfUid(uid) {
  * 撮影指示書のカットを、いまの LP構成の並び (PR-B) と AI の撮影判定 (PR-C) から組む (純粋関数)。
  *   - 要撮影か: 編集版の「要撮影」(人が直した値) が正本 (hasEditShoot)。編集版が無ければ AI の needs_shoot、
  *     AI の判定も無ければ使用素材に「撮影」が出てくるかで推定
- *   - カットの中身 (カット名・構図・小物・背景・トーン・NG): AI の判定のその画像 (needs_shoot で中身があるもの)。
- *     無い画像 (人が要撮影にした・追加した画像) はブロックの見出しから拾う
+ *   - カットの中身: AI の判定のその画像 (needs_shoot で中身があるもの)。PR-C の shoot_json は仕様書の全項目を持たないので
+ *       cut → 撮影内容 / composition・props・background・tone → 完成イメージ (joinFinish) / ng → 注意 に対応づけ、
+ *       ほか (撮影対象・優先度・表現タイプ・バリエーション・目的・用途・開封・参考テーマ) は空欄 (優先度だけ「必須」)。
+ *     AI の判定が無い画像 (人が要撮影にした・追加した画像) はブロックの見出しから拾う
+ *   🔁 C2 (AI の shoot_json を仕様書 Ver1.3.11 の撮影カットの全項目に広げる PR) がマージされたら、ここの対応づけを差し替える
+ *      (AI のカットは LP 画像と 1 対 1 とは限らない = LP に無い実写素材のカットも来る。lp_image は任意の欄)
  *   🚨 AI の判定は「AI の構成での番号」で付いている。編集版で並べ替え・追加した画像は番号がずれるので、
  *      **今の番号ではなく元の画像 (uid の a<元の番号>) で引く**。追加した画像 (n…) には AI の判定は無い
- * @param {{slots: Array<{uid, no, name, role, title, lines: string[], shoot?: boolean}>, hasEditShoot: boolean,
+ * @param {{slots: Array<{uid, no, name, lines: string[], shoot?: boolean}>, hasEditShoot: boolean,
  *          aiImages: Array<{no, needs_shoot, cut, composition, props, background, tone, ng}>|null}} o
  */
 export function cutsFromSlots({ slots, hasEditShoot, aiImages }) {
@@ -278,12 +335,7 @@ export function cutsFromSlots({ slots, hasEditShoot, aiImages }) {
     const no = Number.isInteger(sl.no) ? sl.no : i;
     const fromBlock = cutFromBlock(block, { label: imgLabel(no, sl.name), name: sl.name });
     const useAi = ai && ai.needs_shoot && str(ai.cut).trim();
-    cuts.push({
-      ...fromBlock,
-      ...(useAi ? { cut: ai.cut, composition: ai.composition, props: ai.props, background: ai.background, tone: ai.tone, ng: ai.ng } : {}),
-      role: str(sl.role) || fromBlock.role,
-      title: str(sl.title) || fromBlock.title,
-    });
+    cuts.push(useAi ? { ...fromBlock, content: ai.cut, finish: joinFinish(ai), notice: ai.ng } : fromBlock);
   }
   return normalizeCuts(cuts);
 }

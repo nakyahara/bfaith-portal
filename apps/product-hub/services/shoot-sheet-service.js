@@ -24,11 +24,11 @@ import { effectiveCompose } from '../lib/lp-edit.js';
 import { latestShootJudgement } from '../lib/lp-compose.js';
 import {
   buildShootSheet, cutsFromComposeText, cutsFromSlots, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
-  spreadsheetUrl, MANAGED_SHEETS, SHOOT_SHEET_MODES,
+  spreadsheetUrl, MANAGED_SHEETS, SHOOT_SHEET_MODES, SHOOT_JUDGEMENT_LABELS,
 } from '../lib/shoot-sheet.js';
 import {
   getSheetsWriteClients, explainGoogleError, findSpreadsheetByAppProperty, spreadsheetUsable,
-  createSpreadsheetInFolder, writeSpreadsheet, isUntouchedNewSpreadsheet,
+  createSpreadsheetInFolder, writeSpreadsheet,
 } from './sheets-writer.js';
 
 const APP_PROP_KEY = 'phShootSheetDraft';
@@ -57,30 +57,38 @@ export function shootSheetConfigured() {
  *   - カットの中身 = AI の撮影判定 (元の画像の番号で引く = 並べ替え・追加してもずれない)。無い画像はブロックの見出しから拾う
  *   (組み立ては lib/shoot-sheet.js の cutsFromSlots。純粋関数で試している)
  * 構成がパーサで読めない (画面で直せない) ときは、本文から推定する最小版 (cutsFromComposeText) で組む
- * @returns {{cuts: Array, source: 'lp'|'none', composeJobId: number|null, editId: number|null}}
+ *
+ * 形 = 新商品初動判定 仕様書 Ver1.3.11 の撮影依頼書 (概要 + 1 カット 1 ブロック)。PR-C の shoot_json は仕様書の全項目を
+ * 持たないので、今は cut → 撮影内容 / composition 等 → 完成イメージ / ng → 注意 に対応づけ、ほかは空欄。概要 (summary) も
+ * 撮影判定・撮影担当 (撮影判定の箱の値) のほかは空欄。
+ * 🔁 C2 (AI の shoot_json を仕様書の全項目 = 概要の 8 項目 + 撮影カットの全項目に広げる PR) がマージされたら、
+ *    ここで AI のカット・概要をそのまま使うように差し替える (lib/shoot-sheet.js の CUT_FIELDS / SUMMARY_FIELDS の形で返す)
+ * @returns {{cuts: Array, summary: object, source: 'lp'|'none', composeJobId: number|null, editId: number|null}}
  */
 export function shootSheetCutsFor(db, draft) {
   const eff = effectiveCompose(db, draft?.id);
-  if (!eff) return { cuts: [], source: 'none', composeJobId: null, editId: null };
+  if (!eff) return { cuts: [], summary: {}, source: 'none', composeJobId: null, editId: null };
   const editId = eff.edit ? eff.edit.id : null;
   if (eff.error || !Array.isArray(eff.slots)) {
-    return { cuts: cutsFromComposeText(eff.text), source: 'lp', composeJobId: eff.job.id, editId };
+    return { cuts: cutsFromComposeText(eff.text), summary: {}, source: 'lp', composeJobId: eff.job.id, editId };
   }
   // 編集版の要撮影が読めたか (slots_json が壊れていると、lp-edit は e<編集版>x<番号> の uid を振って shoot=false にする)
   const hasEditShoot = !!eff.edit && eff.slots.every((sl) => !/^e\d+x\d+$/.test(String(sl.uid)));
   // AI の撮影判定は、効いている構成と同じ構成 (job) のものだけ使う (新しい構成を AI が作り直している途中なら使わない)
   const judge = latestShootJudgement(db, draft.id);
   const aiImages = judge && judge.available && judge.job_id === eff.job.id ? judge.images : null;
-  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages }), source: 'lp', composeJobId: eff.job.id, editId };
+  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages }), summary: {}, source: 'lp', composeJobId: eff.job.id, editId };
 }
 
 const folderIdOf = (draft) => {
   const p = parseDriveLink(draft?.drive_folder_url);
   return p && p.type === 'folder' ? p.id : null;
 };
-const materialOf = (draft, shootMode, cuts) => ({
+// 概要の撮影判定・撮影担当は撮影判定の箱の値 (人が決めた正本)。ほかの概要は材料 (shootSheetCutsFor) から
+const materialOf = (draft, shootMode, cuts, summary = {}) => ({
   productCode: draft?.ne_code || '', productName: draft?.name || '', shootMode,
   folderUrl: String(draft?.drive_folder_url || '').trim(), cuts,
+  summary: { ...summary, judgement: SHOOT_JUDGEMENT_LABELS[shootMode] || '', shooter: SHOOT_SHEET_MODES[shootMode] || '' },
 });
 
 /**
@@ -94,16 +102,17 @@ export function shootSheetStateFor(db, draft, ip) {
   const ours = !!fileId && url === spreadsheetUrl(fileId);
   const blocked = shootSheetBlockReason({ shootMode, folderId: folderIdOf(draft), configured: shootSheetConfigured() });
   let cuts = [];
+  let summary = {};
   let source = 'none';
-  try { ({ cuts, source } = shootSheetCutsFor(db, draft)); } catch (e) { console.error('[product-hub] 撮影指示書の材料:', e?.message || e); }
+  try { ({ cuts, summary, source } = shootSheetCutsFor(db, draft)); } catch (e) { console.error('[product-hub] 撮影指示書の材料:', e?.message || e); }
   // 材料が変わったか: LP構成から作ったものだけ比べる (API で渡されたカットで作ったものは比べようがない)
   // 書いた後に記録できなかった (writing_at が立ったまま) ときも出す — 中身と記録の hash が食い違っているかもしれない
   const stale = ours && !!SHOOT_SHEET_MODES[shootMode]
-    && (!!ip?.shoot_sheet_writing_at || (ip?.shoot_sheet_source === 'auto' && ip?.shoot_sheet_hash !== shootSheetMaterialHash(materialOf(draft, shootMode, cuts))));
+    && (!!ip?.shoot_sheet_writing_at || (ip?.shoot_sheet_source === 'auto' && ip?.shoot_sheet_hash !== shootSheetMaterialHash(materialOf(draft, shootMode, cuts, summary))));
   return {
     ours, url: ours ? url : null, fileId: ours ? fileId : null, manualUrl: !ours && url ? url : null,
     at: ours ? ip?.shoot_sheet_at || null : null, by: ours ? ip?.shoot_sheet_by || null : null,
-    stale, blocked, cutsCount: cuts.length, cutLabels: cuts.map((c) => `${c.label} ${c.cut}`.trim()), source,
+    stale, blocked, cutsCount: cuts.length, cutLabels: cuts.map((c) => `${c.lp_image ? c.lp_image + ' ' : ''}${c.content}`.trim()), source,
   };
 }
 
@@ -147,7 +156,8 @@ export async function createOrUpdateShootSheet(draftId, { mention = null, actor 
 function autoMaterialHashNow(db, id) {
   const d = db.prepare('SELECT id, ne_code, name, drive_folder_url FROM product_drafts WHERE id = ?').get(id);
   const ip = db.prepare('SELECT shoot_mode FROM draft_image_production WHERE draft_id = ?').get(id) || {};
-  return shootSheetMaterialHash(materialOf(d, ip.shoot_mode ?? null, shootSheetCutsFor(db, d).cuts));
+  const m = shootSheetCutsFor(db, d);
+  return shootSheetMaterialHash(materialOf(d, ip.shoot_mode ?? null, m.cuts, m.summary));
 }
 
 async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, seenUrl, token }) {
@@ -178,8 +188,9 @@ async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, 
       error: `撮影指示書の URL に、手で貼ったもの (${prevUrl.slice(0, 120)}) が入っています。自動で作る撮影指示書に置き換えますか？ (手で貼ったスプレッドシートは消しません。URL の欄だけ差し替えます)` };
   }
 
-  const material = { cuts: shootSheetCutsFor(db, draft).cuts, source: 'auto' };
-  const mat = materialOf(draft, shootMode, material.cuts);
+  const got = shootSheetCutsFor(db, draft);
+  const material = { cuts: got.cuts, source: 'auto' };
+  const mat = materialOf(draft, shootMode, material.cuts, got.summary);
   const hash = shootSheetMaterialHash(mat);
   const mentionUsed = typeof mention === 'string' ? mention : getShootMention(db).value;
   // 書く直前と記録するときの確認: 版・材料 (LP構成から拾うとき)・印がまだ自分のものか
@@ -194,7 +205,6 @@ async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, 
   let fileId = null;
   let created = false;
   let recovered = false;
-  let written = false;
   try {
     // 1. 前に作ったファイルが使えればそれ (消された・ごみ箱・別フォルダに移ったなら作り直す)
     //    指示書の URL が手で貼り替えられている (ours でない) ときは、前に作ったファイルは画面に出ていない =
@@ -232,16 +242,11 @@ async function run(db, id, { mention, actor, replaceManualUrl, overwriteFileId, 
       },
       // 自分が作るタブのうち今回は要らないもの (カメラマン撮影 → 社内撮影 にしたときの「依頼文」)。印のあるタブだけ消える
       removeTabs: MANAGED_SHEETS.filter((n) => !built.sheets.some((t) => t.name === n)),
-      onWritten: () => { written = true; },
     });
   } catch (e) {
-    // この呼び出しで作っただけで中身を書けなかったファイル (送る前に止めた) はごみ箱へ。残すと、画像フォルダを変えた後などに
-    // 次の押下で 2 つ目ができる (Codex PR-D 名指し5 M)。片付けに失敗しても結果は変えない (同じフォルダなら印で拾い直せる)
-    // 片付ける前に読み直して、最初の空の「シート1」だけのとき (誰も触っていない) に限る。読み直せなければ片付けない
-    // (読んだ後に人が足したタブ・応答が失われただけで書けていた中身を、ごみ箱に入れない — Codex PR-D 名指し6 M)
-    if (created && !written && await isUntouchedNewSpreadsheet(clients, fileId)) {
-      try { await clients.drive.files.update({ fileId, requestBody: { trashed: true }, supportsAllDrives: true }, { timeout: 20_000 }); } catch (_) { /* 拾い直せる */ }
-    }
+    // この呼び出しで作っただけで書けなかったファイルは**消さない** (ごみ箱に入れない)。同じ画像フォルダなら次の押下で印
+    // (appProperties) から拾い直す。人が触ったかを確実には見分けられないので、自動では片付けない (Codex PR-D 名指し8 M)。
+    // 作っている間に画像フォルダを変えた場合だけ、前のフォルダに空のファイルが残る (PR の「見送り」)
     if (e?.code === 'shoot_sheet_conflict') return { ok: false, status: 409, code: 'conflict', error: e.message };
     if (e?.code === 'recovered_file') return { ok: false, status: 409, code: 'recovered_file', file_id: e.fileId, error: e.message };
     const reason = explainGoogleError(e);

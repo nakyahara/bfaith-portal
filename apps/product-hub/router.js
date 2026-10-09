@@ -1462,20 +1462,20 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   }
   // 指示書の URL を変える保存は、画面が見ていた値 (camera_instruction_url_expected) が要る。今の値と違えば 409。
   // 別のタブで撮影指示書を自動で作った (PR-D) 後に、古い画面の値で戻さない (Codex PR-D 名指し2/3 M)。
-  // 値が変わらない保存 (今と同じ URL を送ってきた) は添えなくても通す
-  if (urlVal !== undefined) {
-    const nowUrl = String(db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.camera_instruction_url || '').trim();
-    const hasExp = Object.prototype.hasOwnProperty.call(b, 'camera_instruction_url_expected');
-    if (hasExp && typeof b.camera_instruction_url_expected !== 'string') {
-      return res.status(400).json({ ok: false, error: 'camera_instruction_url_expected は文字で指定してください' });
-    }
-    if (String(urlVal || '').trim() !== nowUrl) {
-      if (!hasExp) return res.status(409).json({ ok: false, error: '画面が古いので撮影指示書の URL を保存できません。画面を読み直してから保存してください' });
-      if (nowUrl !== b.camera_instruction_url_expected.trim()) {
-        return res.status(409).json({ ok: false, error: 'ほかの人 (または別の画面) が撮影指示書の URL を変えています (撮影指示書を作った など)。画面を読み直してから保存してください' });
-      }
-    }
+  // 値が変わらない保存 (今と同じ URL を送ってきた) は添えなくても通す。比べるのは保存と同じトランザクションの中 (名指し8 M)
+  const hasCamExp = Object.prototype.hasOwnProperty.call(b, 'camera_instruction_url_expected');
+  if (urlVal !== undefined && hasCamExp && typeof b.camera_instruction_url_expected !== 'string') {
+    return res.status(400).json({ ok: false, error: 'camera_instruction_url_expected は文字で指定してください' });
   }
+  const cameraUrlConflict = () => {
+    if (urlVal === undefined) return null;
+    const nowUrl = String(db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(draft.id)?.camera_instruction_url || '').trim();
+    if (String(urlVal || '').trim() === nowUrl) return null;
+    if (!hasCamExp) return '画面が古いので撮影指示書の URL を保存できません。画面を読み直してから保存してください';
+    if (nowUrl !== b.camera_instruction_url_expected.trim()) return 'ほかの人 (または別の画面) が撮影指示書の URL を変えています (撮影指示書を作った など)。画面を読み直してから保存してください';
+    return null;
+  };
+  { const msg = cameraUrlConflict(); if (msg) return res.status(409).json({ ok: false, error: msg }); }
   const canvaVal = b.canva_url !== undefined ? cleanText(b.canva_url, 1000) : undefined;
   if (canvaVal && !isHttpUrl(canvaVal)) {
     return res.status(400).json({ ok: false, error: 'CanvaリンクのURL形式が不正です (http/https)' });
@@ -1553,6 +1553,8 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   // 保存・台帳同期・イベントを 1 トランザクションに (途中終了で product-hub だけ更新される状態を作らない — Codex PR1 R1 H1)
   try {
   db.transaction(() => {
+  // 先に見た後で変わっていないか (別のプロセスが撮影指示書を記録した直後など)。変わっていれば保存しない
+  { const msg = cameraUrlConflict(); if (msg) throw Object.assign(new Error(msg), { code: 'camera_url_conflict' }); }
   upsertImageProduction(db, draft.id, {
     status: clean(b.status, 100),
     importance_tier: clean(b.importance_tier, 100),
@@ -1584,6 +1586,7 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   logEvent(db, draft.id, 'image_production_updated', changedLabels.length ? `${changedLabels.join('・')}を更新` : null, actorOf(req));
   })();
   } catch (e) {
+    if (e?.code === 'camera_url_conflict') return res.status(409).json({ ok: false, error: e.message });
     console.error('[product-hub] image-production save failed (rolled back):', e);
     return res.status(500).json({ ok: false, error: '保存できませんでした (商品リンク台帳への同期で失敗。Render ログを確認してください)' });
   }

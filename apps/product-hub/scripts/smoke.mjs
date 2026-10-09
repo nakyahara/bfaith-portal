@@ -6670,6 +6670,9 @@ let wfSetParentId = null;
         update: async (p) => { await hit('update'); const uf = g.files.get(p.fileId); if ('name' in p.requestBody) uf.name = p.requestBody.name; if ('trashed' in p.requestBody) uf.trashed = p.requestBody.trashed; return { data: {} }; },
       } };
       const tabOf = (f, title) => f.tabs.find((t) => t.title === title);
+      // 撮影依頼書のタブ (仕様書 Ver1.3.11 の「概要 + 1 カット 1 ブロック」)。label の行の値 (同じ label の n 番目)
+      const MAIN = '撮影依頼書';
+      const valOf = (tab, label, nth = 0) => ((tab?.values || []).filter((row) => row[0] === label)[nth] || [])[1];
       // Sheets の偽物: batchUpdate は 1 回の要求を全部適用するか、どれかが不正なら何も適用しない (本物と同じ)。
       // 値は updateCells のセル (userEnteredValue の種類を記録する = stringValue 以外で書いていないかを見る)
       const fakeSheets = { spreadsheets: {
@@ -6800,10 +6803,11 @@ let wfSetParentId = null;
         && /^[0-9a-f]{64}$/.test(ipS().shoot_sheet_hash || '') && ipS().shoot_sheet_source === 'auto' && ipS().shoot_sheet_by === 'sheet-img@b-faith.biz', JSON.stringify(ipS()));
       check('撮影指示書: ファイル名は 撮影指示書_<商品コード>（社内撮影）・印 (appProperties) 付き・リンク共有は付けない',
         f1.name === '撮影指示書_DRV-SHEET（社内撮影）' && f1.appProperties.phShootSheetDraft === String(idS) && f1.perms == null, JSON.stringify(f1));
-      const main1 = tabOf(f1, '撮影指示');
-      check('撮影指示書: 1 タブ目「撮影指示」に見出しとカット (LP構成の 1枚目の使用シーン) が入る・最初の「シート1」は消える・社内撮影に依頼文のタブは無い',
-        !!main1 && f1.tabs.length === 1 && main1.values[1][1] === 'ハッカ油スプレー 100ml' && main1.values[3][1] === '社内撮影' && main1.values[4][1] === FOLDER
-        && main1.values[7][0] === '1' && main1.values[7][1] === '1枚目｜FV' && main1.values[7][2] === '使用シーン' && main1.values.length === 8 && main1.frozen === 7,
+      const main1 = tabOf(f1, MAIN);
+      check('撮影指示書: 1 タブ目「撮影依頼書」に概要とカットのブロック (LP構成の 1枚目の使用シーン) が入る・最初の「シート1」は消える・社内撮影に依頼文のタブは無い',
+        !!main1 && f1.tabs.length === 1 && main1.values[0][0] === '撮影依頼書' && valOf(main1, '商品名') === 'ハッカ油スプレー 100ml' && valOf(main1, '商品コード') === 'DRV-SHEET'
+        && valOf(main1, '撮影担当') === '社内撮影' && valOf(main1, '撮影カット数') === '1カット' && main1.values.some((row) => row[0] === 'カット1（必須）')
+        && valOf(main1, '撮影内容') === '使用シーン' && valOf(main1, '参考イメージ') === '' && main1.frozen === 0,
         JSON.stringify(f1.tabs));
       check('🚨 撮影指示書: 値は文字 (stringValue) だけで書く (数式・数値として評価させない)', g.cellKinds.size === 1 && g.cellKinds.has('stringValue'), JSON.stringify([...g.cellKinds]));
       check('撮影指示書: 自分で足したタブには印 (developer metadata) を付ける', (main1?.meta || []).some((m) => m.key === 'phOwnedTab'), JSON.stringify(main1?.meta));
@@ -6853,8 +6857,8 @@ let wfSetParentId = null;
       r = await sheetCall();
       pg = await pageOf();
       check('撮影指示書: 更新すると今の LP構成のカット (2 点) が入り、「更新が要る」は消える (URL はそのまま)',
-        r.status === 200 && tabOf(g.files.get(f1.id), '撮影指示').values.length === 9 && tabOf(g.files.get(f1.id), '撮影指示').values[8][2] === '成分アップ'
-        && !pg.includes('id="shoot-sheet-stale"') && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(tabOf(g.files.get(f1.id), '撮影指示').values.slice(6)));
+        r.status === 200 && valOf(tabOf(g.files.get(f1.id), MAIN), '撮影カット数') === '2カット' && valOf(tabOf(g.files.get(f1.id), MAIN), '撮影内容', 1) === '成分アップ'
+        && !pg.includes('id="shoot-sheet-stale"') && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(tabOf(g.files.get(f1.id), MAIN).values));
       // 動いている途中 (queued) の job は材料にしない (できた構成だけ)
       addJob(idS, 'queued', null);
       pg = await pageOf();
@@ -6887,15 +6891,16 @@ let wfSetParentId = null;
       check('撮影指示書: (前提) 数式のような材料の LP構成を作れた', evilText.includes('撮影: =1+1') && evilText.includes('\n@SUM(A1)'));
       addJob(idS, 'done', evilText);
       r = await sheetCall();
-      const evRow = tabOf(f1b, '撮影指示').values[7];
+      const evTab = tabOf(f1b, MAIN);
       check('🚨 撮影指示書: = + @ で始まる材料も文字のまま (stringValue) — 数式にしない',
-        r.status === 200 && evRow[2] === '=1+1' && evRow[4] === '+1' && evRow[7] === '@SUM(A1)' && g.cellKinds.size === 1 && g.cellKinds.has('stringValue'), JSON.stringify(evRow));
+        r.status === 200 && valOf(evTab, '撮影内容') === '=1+1' && valOf(evTab, '注意') === '@SUM(A1)' && /小物：\+1/.test(valOf(evTab, '完成イメージ') || '')
+        && g.cellKinds.size === 1 && g.cellKinds.has('stringValue'), JSON.stringify(evTab?.values));
       addJob(idS, 'done', lpText);
       r = await sheetCall();
       const badCuts = [];
       for (const body of [{ cuts: [] }, { cuts: [{ cut: '古いタブのカット' }] }, { replace_manual_url: 5 }, { mention: '@a\n@b' }, { mention: 'x'.repeat(61) }, { overwrite_file_id: "x' or" }]) badCuts.push((await sheetCall(body)).status);
       check('🚨 撮影指示書: 中身 (cuts) は送れない (正本の LP構成と違う中身を書かせない・名指し3 M)・replace_manual_url / overwrite_file_id の形が違う・宛先が 2 行/61 文字以上なら 400',
-        r.status === 200 && badCuts.every((s) => s === 400) && !tabOf(f1b, '撮影指示').values.flat().includes('古いタブのカット'), JSON.stringify(badCuts));
+        r.status === 200 && badCuts.every((s) => s === 400) && !tabOf(f1b, MAIN).values.flat().includes('古いタブのカット'), JSON.stringify(badCuts));
 
       // 手で貼った URL: 黙って差し替えない (409 → 確かめた URL を添えて送り直す)
       const MANUAL = 'https://docs.google.com/spreadsheets/d/manual-by-hand/edit';
@@ -6931,34 +6936,32 @@ let wfSetParentId = null;
       check('🚨 撮影指示書: Google が権限で断ったら 502 + 直し方 (コンテンツ管理者)・URL もファイル ID も書かない・履歴に失敗',
         r.status === 502 && /コンテンツ管理者/.test(r.json?.error || '') && ipF().camera_instruction_url == null && ipF().shoot_sheet_file_id == null
         && db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'shoot_sheet_failed'`).get(idF).c === 1, JSON.stringify([r, ipF()]));
-      // 作った後の書き込み (batchUpdate) で失敗 → URL は書かない。作っただけのファイルはごみ箱へ (中身は書けていない)
+      // 作った後の書き込み (batchUpdate) で失敗 → URL は書かない。作ったファイルは消さずに残し、次に押すと印で拾い直す
       const before = filesIn().length;
       g.fail.sbatch = { once: true, err: gErr(500, 'Backend Error') };
       r = await sheetFor(idF, {});
-      check('🚨 撮影指示書: ファイルを作った後の書き込みで失敗しても URL は書かない (中途半端に記録しない)・作っただけのファイルは片付ける',
-        r.status === 502 && ipF().camera_instruction_url == null && filesIn().length === before, JSON.stringify([r, ipF()]));
-      // 作ってすぐプロセスが止まった (DB にも記録が無い・中身はまだ「シート1」だけ) ファイルを、次に押すと印で拾い直す
-      const orphan = { id: 'SSORPHAN1', name: '撮影指示書_DRV-SHEET-F（カメラマン撮影）', mimeType: 'application/vnd.google-apps.spreadsheet', parents: [FID],
-        appProperties: { phShootSheetDraft: String(idF) }, tabs: [{ sheetId: 0, title: 'シート1', values: [] }, { sheetId: 55, title: '人のメモ2', values: [['途中で足したメモ']] }] };
-      g.files.set(orphan.id, orphan);
+      check('🚨 撮影指示書: ファイルを作った後の書き込みで失敗しても URL は書かない (中途半端に記録しない)・作ったファイルは消さない (自動でごみ箱に入れない・名指し8 M)',
+        r.status === 502 && ipF().camera_instruction_url == null && filesIn().length === before + 1, JSON.stringify([r, ipF()]));
+      const orphan = filesIn().find((f) => f.appProperties.phShootSheetDraft === String(idF));
+      orphan.tabs.push({ sheetId: 55, title: '人のメモ2', values: [['途中で足したメモ']] });
       r = await sheetFor(idF, {});
       check('🚨 撮影指示書: 拾い直したファイル (前に作ったもの) の、人が足したタブは消さない (作ったばかりではないので)',
         r.status === 200 && JSON.stringify(tabOf(orphan, '人のメモ2')?.values) === '[["途中で足したメモ"]]', JSON.stringify([r, orphan.tabs.map((t) => t.title)]));
       check('🚨 撮影指示書: 次に押すと、前に作ったファイルを印 (appProperties) で拾い直す (2 つ作らない・指示書のタブがまだ無いので確かめずに書く)',
         r.status === 200 && filesIn().length === before + 1 && ipF().shoot_sheet_file_id === orphan.id && ipF().camera_instruction_url === r.json?.url && tabOf(orphan, '依頼文'),
         JSON.stringify([r, filesIn().length]));
-      // 🚨 作っただけで中身を書く前に止めた (送る直前に商品名が変わった) ファイルはごみ箱へ (残すと次に 2 つ目ができる — 名指し5 M)
+      // 作っただけで書く前に止めた (送る直前に商品名が変わった) ファイルも消さない。次に押すと拾い直して 1 つのまま
       {
         const idT = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET-T', '片付け用', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
         await call('POST', `/api/drafts/${idT}/shoot-mode`, { mode: 'inhouse' });
         g.onSget = () => db.prepare('UPDATE product_drafts SET name = ? WHERE id = ?').run('片付け用 改', idT);
         r = await sheetFor(idT);
-        const made = [...g.files.values()].filter((f) => f.appProperties.phShootSheetDraft === String(idT));
-        check('🚨 撮影指示書: 作っただけで書く前に止めたファイルはごみ箱に入れる (409・URL は書かない)',
-          r.status === 409 && made.length === 1 && made[0].trashed === true
-          && db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(idT)?.camera_instruction_url == null, JSON.stringify([r, made.map((f) => f.trashed)]));
+        const made = () => [...g.files.values()].filter((f) => f.appProperties.phShootSheetDraft === String(idT));
+        check('撮影指示書: 作っただけで書く前に止めたら 409・URL は書かない・ファイルはごみ箱に入れない',
+          r.status === 409 && made().length === 1 && !made()[0].trashed
+          && db.prepare('SELECT camera_instruction_url FROM draft_image_production WHERE draft_id = ?').get(idT)?.camera_instruction_url == null, JSON.stringify([r, made().map((f) => f.trashed)]));
         r = await sheetFor(idT);
-        check('撮影指示書: 押し直せば新しく 1 つ作る (ごみ箱のものは拾わない)', r.status === 200 && [...g.files.values()].filter((f) => f.appProperties.phShootSheetDraft === String(idT) && !f.trashed).length === 1);
+        check('撮影指示書: 押し直せば残ったファイルを拾い直して書く (2 つ作らない)', r.status === 200 && made().length === 1 && made()[0].id === r.json?.url.split('/d/')[1].split('/')[0]);
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idT);
       }
 
@@ -6972,13 +6975,13 @@ let wfSetParentId = null;
         r = await sheetFor(idR, {});
         const orphanR = filesIn().find((f) => f.appProperties.phShootSheetDraft === String(idR));
         check('撮影指示書: (前提) 書いた後に記録で止まった (409・URL なし・ファイルは書けている)',
-          r.status === 409 && ipR().camera_instruction_url == null && !!orphanR && !!tabOf(orphanR, '撮影指示'), JSON.stringify(r));
-        tabOf(orphanR, '撮影指示').values[7] = ['1', '人が直した行'];
+          r.status === 409 && ipR().camera_instruction_url == null && !!orphanR && !!tabOf(orphanR, MAIN), JSON.stringify(r));
+        tabOf(orphanR, MAIN).values.push(['人が直した行', 'x']);
         const bR = g.batches;
         r = await sheetFor(idR, {});
         check('🚨 撮影指示書: 拾い直したファイルに指示書のタブがあれば、上書きせずに 409 (recovered_file) で確かめる',
           r.status === 409 && r.json?.code === 'recovered_file' && r.json?.file_id === orphanR.id && g.batches === bR
-          && tabOf(orphanR, '撮影指示').values[7][1] === '人が直した行' && ipR().camera_instruction_url == null, JSON.stringify(r));
+          && tabOf(orphanR, MAIN).values.some((row) => row[0] === '人が直した行') && ipR().camera_instruction_url == null, JSON.stringify(r));
         r = await sheetFor(idR, { overwrite_file_id: 'SS999999' });
         check('撮影指示書: 確かめたファイルと違う ID なら、もう一度 409', r.status === 409 && r.json?.code === 'recovered_file');
         r = await sheetFor(idR, { overwrite_file_id: orphanR.id });
@@ -6990,18 +6993,18 @@ let wfSetParentId = null;
       // 🚨 作ったばかりのファイルに、人が「撮影指示」という同じ名前のタブをすぐ作った: 上書きしない (名指し4 M)
       {
         g.files.get(ipF().shoot_sheet_file_id).trashed = true;
-        g.onSgetBefore = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 7, title: '撮影指示', values: [['人がすぐ書いた']] });
+        g.onSgetBefore = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 7, title: MAIN, values: [['人がすぐ書いた']] });
         r = await sheetFor(idF, {});
         const fx = filesIn().filter((f) => f.appProperties.phShootSheetDraft === String(idF)).at(-1);
         check('🚨 撮影指示書: 作ったばかりでも、人がすぐ作った同じ名前のタブ (印なし) は上書きせず 409・ファイルも片付けない',
-          r.status === 409 && r.json?.code === 'tab_conflict' && JSON.stringify(tabOf(fx, '撮影指示')?.values) === '[["人がすぐ書いた"]]', JSON.stringify(r));
+          r.status === 409 && r.json?.code === 'tab_conflict' && JSON.stringify(tabOf(fx, MAIN)?.values) === '[["人がすぐ書いた"]]', JSON.stringify(r));
         fx.trashed = true;
         // 読んだ後・送る前に人が同じ名前のタブを作った: Google が batchUpdate を断る (400) → 片付ける前に読み直して、人のタブがあるので残す
-        g.onSget = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 8, title: '撮影指示', values: [['読んだ後に書いた']] });
+        g.onSget = (p) => g.files.get(p.spreadsheetId).tabs.push({ sheetId: 8, title: MAIN, values: [['読んだ後に書いた']] });
         r = await sheetFor(idF, {});
         const fy = [...g.files.values()].filter((f) => f.appProperties.phShootSheetDraft === String(idF)).at(-1);
         check('🚨 撮影指示書: 読んだ後に人がタブを作って書き込みが断られても、読み直して人のタブがあればファイルをごみ箱に入れない (名指し6 M)',
-          r.status === 502 && fy !== fx && !fy.trashed && JSON.stringify(tabOf(fy, '撮影指示')?.values) === '[["読んだ後に書いた"]]', JSON.stringify([r, fy?.trashed]));
+          r.status === 502 && fy !== fx && !fy.trashed && JSON.stringify(tabOf(fy, MAIN)?.values) === '[["読んだ後に書いた"]]', JSON.stringify([r, fy?.trashed]));
         fy.trashed = true;
       }
 
@@ -7038,11 +7041,11 @@ let wfSetParentId = null;
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idF);
 
       // 🚨 更新の途中で Google が失敗しても、済の指示書を空にしない (batchUpdate 1 回 = 全部か何もしないか — Codex PR-D 名指し High)
-      const before1 = JSON.stringify(tabOf(g.files.get(f1.id), '撮影指示').values);
+      const before1 = JSON.stringify(tabOf(g.files.get(f1.id), MAIN).values);
       g.fail.sbatch = { once: true, err: gErr(500, 'Backend Error') };
       r = await sheetCall();
       check('🚨 撮影指示書: 更新の書き込みで失敗しても、前の版の中身はそのまま (空にしない)・URL もそのまま',
-        r.status === 502 && JSON.stringify(tabOf(g.files.get(f1.id), '撮影指示').values) === before1 && before1.length > 50 && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(r));
+        r.status === 502 && JSON.stringify(tabOf(g.files.get(f1.id), MAIN).values) === before1 && before1.length > 50 && ipS().camera_instruction_url === URL_OF(f1.id), JSON.stringify(r));
       // 🚨 待っている間に撮影判定 (撮影が要る同士) が変わった: 古い材料で上書きしない (Codex PR-D 名指し High)
       await call('POST', `/api/drafts/${idS}/shoot-mode`, { mode: 'photographer' });
       await sheetCall();
@@ -7085,8 +7088,8 @@ let wfSetParentId = null;
         check('🚨 撮影指示書: 待っている間に新しい構成の実モデル確認が一致になったら (材料が変わる) 送らない (Codex PR-D 名指し2 M)',
           r.status === 409 && g.batches === b0, JSON.stringify(r));
         r = await sheetCall();
-        check('撮影指示書: 押し直せば新しい構成の材料で書く', r.status === 200 && tabOf(g.files.get(f1.id), '撮影指示').values.some((row) => row[2] === '瓶のアップ'),
-          JSON.stringify(tabOf(g.files.get(f1.id), '撮影指示').values.slice(7)));
+        check('撮影指示書: 押し直せば新しい構成の材料で書く', r.status === 200 && tabOf(g.files.get(f1.id), MAIN).values.some((row) => row[0] === '撮影内容' && row[1] === '瓶のアップ'),
+          JSON.stringify(tabOf(g.files.get(f1.id), MAIN).values));
       }
       // 🚨 古いタブの「画像制作情報を保存」: 開いたときの指示書の URL を添えて、今と違えば 409 (作った URL を空で消さない)
       r = await call('POST', `/api/drafts/${idS}/image-production`, { camera_instruction_url: '', camera_instruction_url_expected: '', status: '古いタブ' });
@@ -7153,8 +7156,8 @@ let wfSetParentId = null;
         const cutsB = () => ssv.shootSheetCutsFor(db, { id: idB });
         let cb = cutsB();
         check('撮影指示書の材料: AI の撮影判定があれば、要撮影は AI の needs_shoot (使用素材からの推定より優先)・中身も AI の判定',
-          cb.cuts.length === 1 && cb.cuts[0].label.startsWith('2枚目') && cb.cuts[0].cut === 'AIのカット' && cb.cuts[0].composition === 'AIの構図'
-          && cb.cuts[0].props === 'AIの小物' && cb.cuts[0].ng === 'AIのNG', JSON.stringify(cb));
+          cb.cuts.length === 1 && cb.cuts[0].lp_image.startsWith('2枚目') && cb.cuts[0].content === 'AIのカット'
+          && cb.cuts[0].finish === 'AIの構図／小物：AIの小物／背景：AIの背景／トーン：AIのトーン' && cb.cuts[0].notice === 'AIのNG', JSON.stringify(cb));
         // 人が直した構成 (B): 画像を 1 枚足して 2枚目に入れ、AI の 2枚目を 3枚目に。要撮影は足した画像と元の 2枚目
         const st = lpEditMod.editStateFor(db, { id: idB }, { canEdit: true });
         check('撮影指示書の材料: (前提) B の構成の一覧が読める', st.available === true && st.slots.length === 3, JSON.stringify(st).slice(0, 300));
@@ -7167,9 +7170,9 @@ let wfSetParentId = null;
         check('🚨 撮影指示書の材料: 編集版があれば、要撮影は人が直した値 (slots_json の shoot) が正本',
           cb.cuts.length === 2 && cb.editId === saved.edit_id, JSON.stringify(cb));
         check('🚨 撮影指示書の材料: 並べ替えた画像には、元の画像 (uid) で AI の判定を引く (今の番号 3枚目 でも AI の 2枚目の中身)',
-          cb.cuts[1]?.label.startsWith('3枚目') && cb.cuts[1]?.cut === 'AIのカット' && cb.cuts[1]?.composition === 'AIの構図', JSON.stringify(cb.cuts[1]));
+          cb.cuts[1]?.lp_image.startsWith('3枚目') && cb.cuts[1]?.content === 'AIのカット' && cb.cuts[1]?.finish.startsWith('AIの構図'), JSON.stringify(cb.cuts[1]));
         check('🚨 撮影指示書の材料: 足した画像 (AI の判定が無い) はブロックから拾い、AI の別の画像の中身を付けない',
-          cb.cuts[0]?.label.startsWith('2枚目') && cb.cuts[0]?.cut !== 'AIのカット' && cb.cuts[0]?.composition !== 'AIの構図' && cb.cuts[0]?.title === '手元の使い方', JSON.stringify(cb.cuts[0]));
+          cb.cuts[0]?.lp_image.startsWith('2枚目') && cb.cuts[0]?.content !== 'AIのカット' && !String(cb.cuts[0]?.finish).includes('AIの構図'), JSON.stringify(cb.cuts[0]));
         // 人が「要撮影」を外したら指示書から抜ける (AI が要ると言っていても)
         const st2 = lpEditMod.editStateFor(db, { id: idB }, { canEdit: true });
         const saved2 = lpEditMod.saveEdit(db, { draft: { id: idB }, baseJobId: jobB, baseEditId: saved.edit_id, actor: 'smoke',
@@ -7187,7 +7190,7 @@ let wfSetParentId = null;
         addJob(idB, 'queued', null);
         cb = cutsB();
         check('撮影指示書の材料: AI が作り直している途中なら AI の判定の中身は使わない (編集版の要撮影は効く・中身はブロックから)',
-          cb.cuts.length === 1 && cb.cuts[0].label.startsWith('3枚目') && cb.cuts[0].cut !== 'AIのカット' && cb.cuts[0].composition !== 'AIの構図', JSON.stringify(cb));
+          cb.cuts.length === 1 && cb.cuts[0].lp_image.startsWith('3枚目') && cb.cuts[0].content !== 'AIのカット' && !String(cb.cuts[0].finish).includes('AIの構図'), JSON.stringify(cb));
         db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ? AND status = 'queued'`).run(idB);
         // 編集版は追記専用 (消せない) なので、この商品は残す (ほかの試験は商品コードで引かない)
       }

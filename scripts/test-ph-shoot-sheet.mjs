@@ -10,11 +10,11 @@ import { fileURLToPath } from 'node:url';
 
 import {
   buildShootSheet, shootSheetTitle, cutsFromComposeText, mentionsShoot, cutNameFrom, sectionText,
-  validateCutsInput, normalizeCuts, cutsFromSlots, aiNoOfUid, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
-  spreadsheetUrl, CUT_COLUMNS, MAX_CUTS,
+  normalizeCuts, cutsFromSlots, aiNoOfUid, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
+  spreadsheetUrl, cutCountWarning, joinFinish, SHEET_LAYOUT, CUT_FIELDS, SUMMARY_FIELDS,
 } from '../apps/product-hub/lib/shoot-sheet.js';
 import {
-  writeSpreadsheet, formulaCell, isUntouchedNewSpreadsheet, findSpreadsheetByAppProperty, spreadsheetUsable, createSpreadsheetInFolder,
+  writeSpreadsheet, formulaCell, findSpreadsheetByAppProperty, spreadsheetUsable, createSpreadsheetInFolder,
   explainGoogleError, getSheetsWriteClients,
 } from '../apps/product-hub/services/sheets-writer.js';
 
@@ -27,62 +27,85 @@ const throwsAsync = async (l, fn, want) => {
 };
 
 const FOLDER = 'https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz012345';
-const CUT = { label: '2枚目｜使い方', cut: '使用シーン', composition: '手元を左 2/3', props: '木の匙', background: '木目の天板', tone: '湯気・温かい', ng: 'ネイルなし', role: '使い方', title: '混ぜる・振る' };
+// 仕様書 (新商品初動判定 Ver1.3.11) の撮影カットの全項目
+const CUT = {
+  priority: '推奨', expression_type: '使用イメージ', variation: '代表1色', target: 'キャメル（1色・1本）', content: '使用シーン',
+  purpose: '使い方を伝える', finish: '手元で使っている状態', usage: 'LP', open_required: '必要', reference_theme: '手元で使う様子',
+  lp_image: '2枚目｜使い方', notice: 'ネイルなし',
+};
+const SUMMARY = { send_targets: 'キャメル（1色・1本）', purpose: '全体の目的', finish: '全体の完成像', usage: 'LP', conclusion: '結論', open_required: '一部必要' };
 
 console.log('① ファイル名');
 ok(shootSheetTitle('maitakep50', 'inhouse') === '撮影指示書_maitakep50（社内撮影）', '社内撮影');
 ok(shootSheetTitle('maitakep50', 'photographer') === '撮影指示書_maitakep50（カメラマン撮影）', 'カメラマン撮影');
 ok(shootSheetTitle('a/b:c\n', 'inhouse') === '撮影指示書_a／b_c（社内撮影）', '商品コードの / : 改行を寄せる', shootSheetTitle('a/b:c\n', 'inhouse'));
 
-console.log('② 中身 (社内撮影)');
-const inh = buildShootSheet({ productCode: 'maitakep50', productName: 'マイタケ粉末 50g', shootMode: 'inhouse', folderUrl: FOLDER, cuts: [CUT], requestText: '依頼文' });
-ok(inh.title === '撮影指示書_maitakep50（社内撮影）' && inh.sheets.length === 1 && inh.sheets[0].name === '撮影指示', '社内撮影は 1 タブ「撮影指示」だけ (依頼文のタブは無い)');
+console.log('② 中身 (社内撮影) — 仕様書 Ver1.3.11 の「概要 + 1 カット 1 ブロック」');
+const inh = buildShootSheet({ productCode: 'maitakep50', productName: 'マイタケ粉末 50g', shootMode: 'inhouse', folderUrl: FOLDER, summary: SUMMARY, cuts: [CUT], requestText: '依頼文' });
+ok(inh.title === '撮影指示書_maitakep50（社内撮影）' && inh.sheets.length === 1 && inh.sheets[0].name === '撮影依頼書', '社内撮影は 1 タブ「撮影依頼書」だけ (依頼文のタブは無い)');
 ok(JSON.stringify(inh.sheets[0].rows) === JSON.stringify([
-  ['撮影指示書'], ['商品名', 'マイタケ粉末 50g'], ['商品コード', 'maitakep50'], ['撮影の種類', '社内撮影'], ['画像フォルダ', FOLDER], [],
-  CUT_COLUMNS, ['1', '2枚目｜使い方', '使用シーン', '手元を左 2/3', '木の匙', '木目の天板', '湯気・温かい', 'ネイルなし'],
-]), '見出し (商品名・撮影の種類・画像フォルダ) + カット一覧 (カット番号・使う画像・カット名・構図・小物・背景・トーン・NG)', JSON.stringify(inh.sheets[0].rows));
-ok(CUT_COLUMNS.join() === 'カット番号,使う画像,カット名,構図,小物,背景,トーン,NG', '列は設計 §3.4 の順');
+  ['撮影依頼書'], ['商品コード', 'maitakep50'], ['商品名', 'マイタケ粉末 50g'], ['撮影担当', '社内撮影'], ['撮影用送付対象', 'キャメル（1色・1本）'], ['撮影カット数', '1カット'],
+  [], ['カット1（推奨）'], ['撮影内容', '使用シーン'], ['撮影対象', 'キャメル（1色・1本）'], ['完成イメージ', '手元で使っている状態'], ['参考イメージ', ''], ['注意', 'ネイルなし'],
+]), '概要 (商品コード／商品名／撮影担当／撮影用送付対象／撮影カット数) + カットのブロック (撮影内容／撮影対象／完成イメージ／参考イメージ)。社内撮影は必須／推奨を出す',
+JSON.stringify(inh.sheets[0].rows));
+const flatInh = inh.sheets[0].rows.flat().join('|');
+ok(!['使用イメージ', '代表1色', '使い方を伝える', '手元で使う様子', '全体の目的', '結論', '2枚目｜使い方'].some((w) => flatInh.includes(w)),
+  '🚨 内部連携の項目 (表現タイプ・バリエーション・目的・用途・開封・参考イメージのテーマ名・判定の結論) はシートに出さない', flatInh);
 const f0 = inh.sheets[0].format;
-ok(f0.boldRows.includes(0) && f0.boldRows.includes(6) && f0.frozenRows === 7 && f0.columnWidths.length === 8 && f0.wrap === true,
-  '書式: タイトルと表の見出しが太字・見出しまで固定・8 列の幅・折り返し', JSON.stringify(f0));
-ok(inh.sheets[0].rows.flat().every((c) => typeof c === 'string'), 'セルは全部文字列 (RAW で書く)');
+ok(f0.boldRows.includes(0) && f0.boldRows.includes(7) && f0.shadedRows.includes(7) && f0.columnWidths.length === 2 && f0.wrap === true,
+  '書式: タイトルとカットの見出しが太字・カットの見出しに網かけ・2 列の幅・折り返し', JSON.stringify(f0));
+ok(inh.sheets[0].rows.flat().every((c) => typeof c === 'string'), 'セルは全部文字列 (stringValue で書く)');
+ok(CUT_FIELDS.length === 13 && SUMMARY_FIELDS.join() === 'judgement,shooter,open_required,send_targets,purpose,finish,usage,conclusion', '入力は仕様書の撮影依頼書連携データの全項目を受ける形');
+ok(SHEET_LAYOUT.summary.map((x) => x.label).join() === '商品コード,商品名,撮影担当,撮影用送付対象,撮影カット数'
+  && SHEET_LAYOUT.cut.filter((x) => !x.onlyIfValue).map((x) => x.label).join() === '撮影内容,撮影対象,完成イメージ,参考イメージ', '表示の並びは SHEET_LAYOUT 1 か所 (仕様書の表示ルールの順)');
+const noNotice = buildShootSheet({ productCode: 'x', productName: 'y', shootMode: 'inhouse', cuts: [{ ...CUT, notice: '' }] });
+ok(!noNotice.sheets[0].rows.some((r) => r[0] === '注意'), '注意は値があるときだけ出す');
 const empty = buildShootSheet({ productCode: 'x', productName: 'y', shootMode: 'inhouse', folderUrl: FOLDER, cuts: [] });
-ok(empty.sheets[0].rows.length === 8 && /書き足してください/.test(empty.sheets[0].rows[7][2]), '要撮影のカットが無ければ、表は残して「書き足してください」の行');
+ok(empty.sheets[0].rows.some((r) => r[0] === '確認' && /書き足して/.test(r[1])) && empty.sheets[0].rows.some((r) => r[0] === '撮影カット数' && r[1] === '0カット'), '撮るカットが無ければ「確認」で書き足すよう出す');
 let threw = false;
 try { buildShootSheet({ productCode: 'x', shootMode: 'none', cuts: [] }); } catch { threw = true; }
 ok(threw, '撮影不要・未判定では組まない (throw)');
+// 補修材の「実物への貼付不可」(仕様書: 撮影内容か完成イメージのどちらかに必ず含める)
+const patch = normalizeCuts([{ content: '補修シートの内容物', finish: '補修対象の横に非接着で配置', required_notice: '実物への貼付不可' },
+  { content: '補修シート（実物への貼付不可）', finish: '横に置く', required_notice: '実物への貼付不可' }, { content: 'x', required_notice: '実物への貼付不可' }]);
+ok(patch[0].finish === '補修対象の横に非接着で配置（実物への貼付不可）' && patch[1].finish === '横に置く' && patch[2].finish === '実物への貼付不可',
+  '必ず出す表示 (実物への貼付不可) は、撮影内容にも完成イメージにも無ければ完成イメージに足す', JSON.stringify(patch));
 
 console.log('③ 中身 (カメラマン撮影)');
 const req = shootRequestBody({ mention: '@つくば', productName: 'マイタケ粉末 50g', sheetUrl: spreadsheetUrl('SHEET1'), folderUrl: FOLDER });
-const ph = buildShootSheet({ productCode: 'maitakep50', productName: 'マイタケ粉末 50g', shootMode: 'photographer', folderUrl: FOLDER, cuts: [CUT], requestText: req });
+const ph = buildShootSheet({ productCode: 'maitakep50', productName: 'マイタケ粉末 50g', shootMode: 'photographer', folderUrl: FOLDER, summary: SUMMARY, cuts: [CUT], requestText: req });
 ok(ph.sheets.length === 2 && ph.sheets[1].name === '依頼文', 'カメラマン撮影は 2 タブ目「依頼文」');
+ok(ph.sheets[0].rows.some((r) => r[0] === 'カット1') && !ph.sheets[0].rows.some((r) => /推奨|必須/.test(r[0] || '')), 'カメラマン撮影は必須／推奨を出さない (全カット必須で確定)');
+ok(ph.sheets[0].rows.some((r) => r[0] === '撮影担当' && r[1] === 'カメラマン撮影'), '撮影担当 (概要に無ければ撮影判定から)');
 ok(ph.sheets[1].rows.map((r) => r[0]).join('\n') === req, '依頼文のタブは 1 行 1 セルで依頼文そのまま', JSON.stringify(ph.sheets[1].rows));
 ok(req.split('\n')[0] === '@つくば' && req.includes('https://docs.google.com/spreadsheets/d/SHEET1/edit') && req.includes(FOLDER), '依頼文に宛先・指示書の URL・画像フォルダ');
 ok(!shootRequestBody({ mention: '  ', productName: 'x', sheetUrl: 'u', folderUrl: 'f' }).startsWith('\n')
   && shootRequestBody({ mention: '', productName: 'x', sheetUrl: 'u', folderUrl: 'f' }).startsWith('お世話になっています。'), '宛先が空なら宛先の行を入れない');
+ok(/最低 5 カット/.test(ph.sheets[0].rows.find((r) => r[0] === '確認')?.[1] || ''), 'カメラマン撮影で 5 カット未満なら「確認」に出す');
+ok(cutCountWarning('photographer', 5) === null && cutCountWarning('photographer', 10) === null && /5 カット単位/.test(cutCountWarning('photographer', 6) || '')
+  && cutCountWarning('inhouse', 2) === null, 'カメラマン撮影は 5 カット単位 (社内撮影は数を問わない)');
 
 console.log('④ 数式として評価させない材料');
-const evil = { ...CUT, cut: '=IMPORTXML("https://evil.example/","//a")', props: '+1+1', ng: '-NG を書く', background: '@SUM(A1)' };
+const evil = { ...CUT, content: '=IMPORTXML("https://evil.example/","//a")', target: '+1+1', notice: '-NG を書く', finish: '@SUM(A1)' };
 const ev = buildShootSheet({ productCode: '=cmd', productName: '=HYPERLINK("x","y")', shootMode: 'inhouse', folderUrl: FOLDER, cuts: [evil] });
-const evRow = ev.sheets[0].rows[7];
-ok(evRow[2] === evil.cut && evRow[4] === '+1+1' && evRow[7] === '-NG を書く' && evRow[5] === '@SUM(A1)' && ev.sheets[0].rows[1][1] === '=HYPERLINK("x","y")',
-  '値は書き換えない (先頭に \' も付けない) — 守りは RAW で書くこと (下の書き込み係の試験で見る)', JSON.stringify(evRow));
+const evv = (label) => ev.sheets[0].rows.find((r) => r[0] === label)?.[1];
+ok(evv('撮影内容') === evil.content && evv('撮影対象') === '+1+1' && evv('注意') === '-NG を書く' && evv('完成イメージ') === '@SUM(A1)' && evv('商品名') === '=HYPERLINK("x","y")',
+  '値は書き換えない (先頭に \' も付けない) — 守りは stringValue で書くこと (下の書き込み係の試験で見る)', JSON.stringify(ev.sheets[0].rows));
 
-console.log('⑤ カットの入力の検査');
-ok(validateCutsInput('x').error && validateCutsInput({}).error, '配列でなければエラー');
-ok(/40/.test(validateCutsInput(Array.from({ length: MAX_CUTS + 1 }, () => ({}))).error || ''), `${MAX_CUTS} 個より多ければエラー`);
-ok(/文字列/.test(validateCutsInput([{ cut: 1 }]).error || '') && /形が不正/.test(validateCutsInput([null]).error || '') && /形が不正/.test(validateCutsInput([['a']]).error || ''), '欄が文字列でない・カットが object でなければエラー');
-ok(/長すぎ/.test(validateCutsInput([{ ng: 'x'.repeat(2001) }]).error || ''), '長すぎる欄はエラー (黙って切らない)');
-const v = validateCutsInput([{ cut: ' 粉末アップ ', extra: 'x' }, CUT]);
-ok(!v.error && v.cuts.length === 2 && v.cuts[0].no === 1 && v.cuts[1].no === 2 && v.cuts[0].cut === '粉末アップ' && v.cuts[0].label === '' && !('extra' in v.cuts[0]),
-  '通ったカットは番号を振り直し・欠けた欄は空・知らない欄は落とす', JSON.stringify(v));
+console.log('⑤ カットをそろえる');
+const v = normalizeCuts([{ content: ' 粉末アップ ', extra: 'x' }, CUT]);
+ok(v.length === 2 && v[0].no === 1 && v[1].no === 2 && v[0].content === '粉末アップ' && v[0].target === '' && !('extra' in v[0]),
+  '番号を振り直し・欠けた欄は空・知らない欄は落とす', JSON.stringify(v));
+ok(normalizeCuts(Array.from({ length: 50 }, () => ({ content: 'x' }))).length === 40, '40 カットまで');
 
 console.log('⑥ 材料の hash (「LP構成が変わりました」)');
-const base = { productCode: 'c', productName: 'n', shootMode: 'inhouse', folderUrl: FOLDER, cuts: [CUT] };
+const base = { productCode: 'c', productName: 'n', shootMode: 'inhouse', folderUrl: FOLDER, summary: SUMMARY, cuts: [CUT] };
 const h0 = shootSheetMaterialHash(base);
 ok(h0 === shootSheetMaterialHash({ ...base, cuts: [{ ...CUT }] }) && /^[0-9a-f]{64}$/.test(h0), '同じ材料なら同じ hash');
 ok(h0 === shootSheetMaterialHash({ ...base, cuts: [Object.fromEntries(Object.entries(CUT).reverse())] }), '欄の順が違っても同じ hash');
-ok(h0 !== shootSheetMaterialHash({ ...base, cuts: [{ ...CUT, composition: '真上から' }] }), 'カットの中身が変われば違う hash');
+ok(h0 !== shootSheetMaterialHash({ ...base, cuts: [{ ...CUT, finish: '真上から' }] }) && h0 !== shootSheetMaterialHash({ ...base, cuts: [{ ...CUT, reference_theme: '別のテーマ' }] }),
+  'カットの中身が変われば違う hash (表示しない内部連携の項目も)');
+ok(h0 !== shootSheetMaterialHash({ ...base, summary: { ...SUMMARY, send_targets: '3色' } }), '概要が変われば違う hash');
 ok(h0 !== shootSheetMaterialHash({ ...base, shootMode: 'photographer' }) && h0 !== shootSheetMaterialHash({ ...base, productName: 'n2' })
   && h0 !== shootSheetMaterialHash({ ...base, folderUrl: FOLDER + 'x' }) && h0 !== shootSheetMaterialHash({ ...base, cuts: [] }),
   '撮影の種類・商品名・画像フォルダ・カットの数が変わっても違う hash');
@@ -96,18 +119,19 @@ ok(withShoot !== fixture, '(前提) 1枚目の使用素材を書き換えられ�
 const cuts = cutsFromComposeText(withShoot);
 ok(cuts.length === 1, '使用素材に「撮影」が出てくる画像だけ要撮影', JSON.stringify(cuts));
 const c1 = cuts[0] || {};
-ok(c1.no === 1 && c1.label === '1枚目｜FV' && c1.cut === '使用シーン', 'カット番号・使う画像 (N枚目｜画像名)・カット名 (「撮影:」の後ろ)', JSON.stringify(c1));
-ok(c1.composition.startsWith('提供された実物商品画像を中央やや右') && c1.props === '最小限。' && c1.background.startsWith('明るい背景')
-  && c1.tone.startsWith('#FAF9F6') && c1.ng.startsWith('商品形状・ラベル') && c1.title === '夏のベタつく空気に、ひと吹き。' && c1.role === 'FV／商品理解',
-  '構図=商品配置 / 小物=装飾・演出 / 背景=背景・シーン / トーン=使用カラー / NG=NG事項 / 見出し / 役割 を拾う', JSON.stringify(c1));
+ok(c1.no === 1 && c1.lp_image === '1枚目｜FV' && c1.content === '使用シーン' && c1.priority === '必須', 'カット番号・使う LP 画像 (N枚目｜画像名)・撮影内容 (「撮影:」の後ろ)・優先度は必須', JSON.stringify(c1));
+ok(c1.finish.startsWith('提供された実物商品画像を中央やや右') && c1.finish.includes('小物：最小限。') && c1.finish.includes('背景：明るい背景')
+  && !c1.finish.includes('#FAF9F6') && c1.notice.startsWith('商品形状・ラベル') && c1.target === '',
+  '完成イメージ = 商品配置 + 小物 (装飾・演出) + 背景 (長い使用カラーは入れない)・注意 = NG事項・撮影対象は空欄', JSON.stringify(c1));
 // 撮影不要・撮影済み は要らない側
 const notNeeded = fixture.replace(/(# 1枚目｜FV[\s\S]*?## 使用素材\n)提供された実物商品画像/, '$1撮影不要 (撮影済みの写真を使う)');
 ok(cutsFromComposeText(notNeeded).length === 0, '「撮影不要」「撮影済み」だけなら要撮影にしない');
-// B・C の形の見出し (## 構図 / ## 小物 / ## トーン) があればそちらを優先
+// 構図・小物・トーンの見出しがあればそれを使う
 const bcBlock = '# 0枚目｜サムネイル\n## 使用素材\n撮影（粉末アップ）\n## 構図\n真上から\n## 小物\n豆皿\n## 背景・シーン\n白\n## トーン\n柔らかい影\n## NG\n黄色く見せない\n### 補足\n小見出しは中身に含む\n## 商品配置\n中央';
 const bc = cutsFromComposeText(bcBlock)[0] || {};
-ok(bc.cut === '粉末アップ' && bc.composition === '真上から' && bc.props === '豆皿' && bc.tone === '柔らかい影' && bc.ng.startsWith('黄色く見せない') && bc.ng.includes('小見出しは中身に含む'),
-  '「## 構図」「## 小物」「## トーン」の見出しがあればそれを使う (### 以下は中身)', JSON.stringify(bc));
+ok(bc.content === '粉末アップ' && bc.finish === '真上から／小物：豆皿／背景：白／トーン：柔らかい影' && bc.notice.startsWith('黄色く見せない') && bc.notice.includes('小見出しは中身に含む'),
+  '「## 構図」「## 小物」「## トーン」の見出しがあればそれを使い、完成イメージに寄せる (### 以下は中身)', JSON.stringify(bc));
+ok(joinFinish({ composition: '真上', tone: '明るく' }) === '真上／トーン：明るく' && joinFinish({}) === '', '完成イメージに寄せる (空の欄は飛ばす)');
 ok(cutsFromComposeText('').length === 0 && cutsFromComposeText(null).length === 0 && cutsFromComposeText('ただの文章 撮影').length === 0, '構成が無い・読めなければ 0 カット');
 ok(mentionsShoot('撮影: x') && !mentionsShoot('撮影不要') && !mentionsShoot('撮影済み') && mentionsShoot('撮影済み・追加で撮影'), '撮影の語の見方');
 ok(cutNameFrom('撮影: 使用シーン・素材2') === '使用シーン' && cutNameFrom('撮影（粉末アップ）') === '粉末アップ' && cutNameFrom('撮影：料理') === '料理', 'カット名を取れる (区切りの前まで)');
@@ -123,30 +147,30 @@ console.log('⑦-2 B の並び (編集版の要撮影) と C の判定 (AI の�
     { no: 2, needs_shoot: true, cut: 'AIカット2', composition: 'AI構図2', props: 'AI小物2', background: 'AI背景2', tone: 'AIトーン2', ng: 'AI NG2' },
   ];
   const slotsAi = [
-    { uid: 'a0', no: 0, name: 'サムネイル', role: 'TOP', title: '', lines: blk('提供された実物商品画像') },
-    { uid: 'a1', no: 1, name: 'FV', role: 'FV', title: 'FVの見出し', lines: blk('撮影: 手元') },
-    { uid: 'a2', no: 2, name: '成分', role: '特長', title: '成分の見出し', lines: blk('提供された実物商品画像') },
+    { uid: 'a0', no: 0, name: 'サムネイル', lines: blk('提供された実物商品画像') },
+    { uid: 'a1', no: 1, name: 'FV', lines: blk('撮影: 手元') },
+    { uid: 'a2', no: 2, name: '成分', lines: blk('提供された実物商品画像') },
   ];
   ok(aiNoOfUid('a2') === 2 && aiNoOfUid('nAbc') === null && aiNoOfUid('e3x1') === null && aiNoOfUid('a') === null, 'uid から AI の構成での番号 (a<番号> だけ)');
   const c0 = cutsFromSlots({ slots: slotsAi, hasEditShoot: false, aiImages: null });
-  ok(c0.length === 1 && c0[0].label === '1枚目｜FV' && c0[0].cut === '手元' && c0[0].composition === 'ブロックの構図' && c0[0].title === 'FVの見出し',
+  ok(c0.length === 1 && c0[0].lp_image === '1枚目｜FV' && c0[0].content === '手元' && c0[0].finish === 'ブロックの構図' && c0[0].notice === 'ブロックのNG',
     '編集版も AI の判定も無い: 使用素材の「撮影」で推定し、中身はブロックから', JSON.stringify(c0));
-  const c1 = cutsFromSlots({ slots: slotsAi, hasEditShoot: false, aiImages: ai });
-  ok(c1.length === 1 && c1[0].label === '2枚目｜成分' && c1[0].cut === 'AIカット2' && c1[0].composition === 'AI構図2' && c1[0].props === 'AI小物2'
-    && c1[0].background === 'AI背景2' && c1[0].tone === 'AIトーン2' && c1[0].ng === 'AI NG2' && c1[0].role === '特長' && c1[0].title === '成分の見出し',
-  'AI の判定があれば要撮影は needs_shoot (使用素材の推定より優先)・中身 6 項目は AI・役割と見出しは構成', JSON.stringify(c1));
+  const c1b = cutsFromSlots({ slots: slotsAi, hasEditShoot: false, aiImages: ai });
+  ok(c1b.length === 1 && c1b[0].lp_image === '2枚目｜成分' && c1b[0].content === 'AIカット2' && c1b[0].finish === 'AI構図2／小物：AI小物2／背景：AI背景2／トーン：AIトーン2'
+    && c1b[0].notice === 'AI NG2' && c1b[0].target === '' && c1b[0].priority === '必須',
+  'AI の判定 (PR-C) があれば要撮影は needs_shoot・cut → 撮影内容 / 構図・小物・背景・トーン → 完成イメージ / NG → 注意・ほかは空欄', JSON.stringify(c1b));
   // 編集版: 足した画像 (nNew) を 2枚目に入れて、AI の 2枚目 (a2) を 3枚目に。要撮影は人の値
   const slotsEdit = [
     { ...slotsAi[0], shoot: false }, { ...slotsAi[1], shoot: false },
-    { uid: 'nNew', no: 2, name: '使い方', role: '使い方', title: '足した見出し', lines: blk('提供された実物商品画像'), shoot: true },
+    { uid: 'nNew', no: 2, name: '使い方', lines: blk('提供された実物商品画像'), shoot: true },
     { ...slotsAi[2], no: 3, shoot: true },
   ];
   const c2 = cutsFromSlots({ slots: slotsEdit, hasEditShoot: true, aiImages: ai });
-  ok(c2.length === 2 && c2[0].label === '2枚目｜使い方' && c2[0].cut === '使い方' && c2[0].composition === 'ブロックの構図' && c2[0].title === '足した見出し',
+  ok(c2.length === 2 && c2[0].lp_image === '2枚目｜使い方' && c2[0].content === '使い方' && c2[0].finish === 'ブロックの構図',
     '🚨 足した画像 (AI の判定なし) はブロックから拾う — 今の番号 2 で AI の 2枚目の中身を付けない', JSON.stringify(c2[0]));
-  ok(c2[1].label === '3枚目｜成分' && c2[1].cut === 'AIカット2' && c2[1].no === 2, '🚨 並べ替えた画像は元の画像 (uid a2) で AI の判定を引く (今の番号 3)', JSON.stringify(c2[1]));
+  ok(c2[1].lp_image === '3枚目｜成分' && c2[1].content === 'AIカット2' && c2[1].no === 2, '🚨 並べ替えた画像は元の画像 (uid a2) で AI の判定を引く (今の番号 3)', JSON.stringify(c2[1]));
   const c3 = cutsFromSlots({ slots: slotsEdit.map((x) => ({ ...x, shoot: x.uid === 'a1' })), hasEditShoot: true, aiImages: ai });
-  ok(c3.length === 1 && c3[0].label === '1枚目｜FV' && c3[0].cut === '手元', '人が要撮影にした画像 (AI は不要と判定) はブロックから拾う・AI が要るとした画像も人が外せば出ない', JSON.stringify(c3));
+  ok(c3.length === 1 && c3[0].lp_image === '1枚目｜FV' && c3[0].content === '手元', '人が要撮影にした画像 (AI は不要と判定) はブロックから拾う・AI が要るとした画像も人が外せば出ない', JSON.stringify(c3));
 }
 
 console.log('⑧ 作れない理由');
@@ -185,8 +209,8 @@ function fakeSheets(initialTabs, { failBatch = false } = {}) {
   ok(g.calls.filter((c) => c[0] === 'batchUpdate').length === 1 && !g.calls.some((c) => c[0] === 'batchClear' || c[0] === 'valuesBatchUpdate'),
     '🚨 タブの足し引き・値の消去と書き込み・書式は batchUpdate 1 回 (途中で失敗して空の指示書を残さない)', JSON.stringify(g.calls.map((c) => c[0])));
   const adds = rq.filter((r) => r.addSheet).map((r) => r.addSheet.properties);
-  ok(adds.map((p) => p.title).join() === '撮影指示,依頼文' && adds.every((p) => Number.isInteger(p.sheetId) && p.sheetId > 0) && new Set(adds.map((p) => p.sheetId)).size === 2,
-    '作ったばかり: 「撮影指示」「依頼文」を足す (sheetId をこちらで決めて、同じ要求の中で書く)', JSON.stringify(adds));
+  ok(adds.map((p) => p.title).join() === '撮影依頼書,依頼文' && adds.every((p) => Number.isInteger(p.sheetId) && p.sheetId > 0) && new Set(adds.map((p) => p.sheetId)).size === 2,
+    '作ったばかり: 「撮影依頼書」「依頼文」を足す (sheetId をこちらで決めて、同じ要求の中で書く)', JSON.stringify(adds));
   ok(rq.filter((r) => r.createDeveloperMetadata).map((r) => r.createDeveloperMetadata.developerMetadata).every((m) => m.metadataKey === 'phOwnedTab' && adds.some((p) => p.sheetId === m.location.sheetId))
     && rq.filter((r) => r.createDeveloperMetadata).length === 2, '足したタブに印 (developer metadata) を付ける');
   ok(rq.some((r) => r.deleteSheet && r.deleteSheet.sheetId === 0) && rq.findIndex((r) => r.deleteSheet) > rq.findIndex((r) => r.addSheet) && rq.findIndex((r) => r.deleteSheet) === rq.length - 1,
@@ -199,38 +223,38 @@ function fakeSheets(initialTabs, { failBatch = false } = {}) {
     'タブごとに A1 から全行を書く');
   const clearIdx = rq.findIndex((r) => r.updateCells && r.updateCells.range && r.updateCells.range.sheetId === mainId && /userEnteredValue/.test(r.updateCells.fields));
   ok(clearIdx >= 0 && clearIdx < rq.indexOf(writes[0]), '書く前にタブの中身を消す (前の版の行が残らない)');
-  ok(rq.some((r) => r.updateSheetProperties && r.updateSheetProperties.properties.sheetId === mainId && r.updateSheetProperties.properties.gridProperties.frozenRowCount === 7), '書式: 撮影指示のタブは 7 行目まで固定');
+  ok(rq.some((r) => r.updateSheetProperties && r.updateSheetProperties.properties.sheetId === mainId && r.updateSheetProperties.properties.gridProperties.frozenRowCount === 0), '書式: 固定する行は無し (並べ順も指定)');
   ok(rq.some((r) => r.repeatCell && r.repeatCell.range.sheetId === mainId && r.repeatCell.range.startRowIndex === 6 && r.repeatCell.cell.userEnteredFormat.textFormat?.bold === true), '書式: 表の見出し行を太字');
-  ok(rq.filter((r) => r.updateDimensionProperties && r.updateDimensionProperties.range.sheetId === mainId).length === 8, '書式: 8 列の幅');
+  ok(rq.filter((r) => r.updateDimensionProperties && r.updateDimensionProperties.range.sheetId === mainId).length === 2, '書式: 2 列 (項目・内容) の幅');
   ok(g.nameOf() === ph.title, 'ファイル名が違えば付け直す');
 }
 {
-  const g = fakeSheets([{ title: '撮影指示', owned: true }, { title: '依頼文', owned: true }, { title: '人のメモ' }]);
+  const g = fakeSheets([{ title: '撮影依頼書', owned: true }, { title: '依頼文', owned: true }, { title: '人のメモ' }]);
   await writeSpreadsheet(g, { spreadsheetId: 'S1', title: inh.title, tabs: inh.sheets, removeTabs: ['依頼文'] });
   const rq = g.reqs();
   ok(rq.filter((r) => r.deleteSheet).map((r) => r.deleteSheet.sheetId).join() === '1', '更新: 要らなくなった自分のタブ (印のある依頼文) だけ消し、人が足したタブは残す');
   ok(!rq.some((r) => r.addSheet), '更新: あるタブは足さない');
   ok(rq.filter((r) => r.updateCells).every((r) => (r.updateCells.range || r.updateCells.start).sheetId === 0), '更新: 書くのは自分のタブだけ (人のメモには触らない)');
-  ok(rq.some((r) => r.appendDimension && r.appendDimension.dimension === 'ROWS') && rq.some((r) => r.appendDimension && r.appendDimension.dimension === 'COLUMNS'),
+  ok(rq.some((r) => r.appendDimension && r.appendDimension.dimension === 'ROWS' && r.appendDimension.length === inh.sheets[0].rows.length - 5),
     '行・列が足りなければ広げる (人が行を消していても書ける)');
-  const g2 = fakeSheets([{ title: '撮影指示', owned: true }, { title: '依頼文' }]);
+  const g2 = fakeSheets([{ title: '撮影依頼書', owned: true }, { title: '依頼文' }]);
   await writeSpreadsheet(g2, { spreadsheetId: 'S1', title: inh.title, tabs: inh.sheets, removeTabs: ['依頼文'] });
   ok(!g2.reqs().some((r) => r.deleteSheet), '🚨 同じ名前でも印の無いタブ (人が作った「依頼文」) は消さない');
-  const g3 = fakeSheets([{ title: '撮影指示' }]);
+  const g3 = fakeSheets([{ title: '撮影依頼書' }]);
   await throwsAsync('🚨 書くタブと同じ名前の、人が作ったタブ (印なし) があれば止める (上書きしない)', () => writeSpreadsheet(g3, { spreadsheetId: 'S1', tabs: inh.sheets }), '人が作った');
   ok(!g3.calls.some((c) => c[0] === 'batchUpdate'), '止めたときは何も送らない');
-  const g8 = fakeSheets([{ title: 'シート1' }, { title: '撮影指示' }]);
+  const g8 = fakeSheets([{ title: 'シート1' }, { title: '撮影依頼書' }]);
   await throwsAsync('🚨 作ったばかりのファイルでも、人が作った同じ名前のタブ (印なし) があれば止める', () => writeSpreadsheet(g8, { spreadsheetId: 'S1', tabs: inh.sheets, fresh: true }), '人が作った');
   const g5 = fakeSheets([{ title: 'シート1' }, { title: '人のメモ' }]);
   await writeSpreadsheet(g5, { spreadsheetId: 'S1', tabs: inh.sheets, fresh: true });
   ok(g5.reqs().filter((r) => r.deleteSheet).map((r) => r.deleteSheet.sheetId).join() === '0', '作ったばかりでも消すのは最初の「シート1」(sheetId 0) だけ (人がすぐ足したタブは残す)');
-  const g6 = fakeSheets([{ title: '撮影指示', owned: true }]);
+  const g6 = fakeSheets([{ title: '撮影依頼書', owned: true }]);
   await throwsAsync('送る直前の確認 (beforeWrite) が断れば throw', () => writeSpreadsheet(g6, { spreadsheetId: 'S1', tabs: inh.sheets, beforeWrite: () => { throw new Error('変わった'); } }), '変わった');
   ok(g6.calls.some((c) => c[0] === 'get') && !g6.calls.some((c) => c[0] === 'batchUpdate'), '🚨 送る直前の確認はタブを読んだ後に呼び、断ったら batchUpdate を送らない');
-  const g7 = fakeSheets([{ title: '撮影指示', owned: true }, { title: '人のメモ' }]);
+  const g7 = fakeSheets([{ title: '撮影依頼書', owned: true }, { title: '人のメモ' }]);
   let seen = null;
   await writeSpreadsheet(g7, { spreadsheetId: 'S1', tabs: inh.sheets, beforeWrite: (ctx) => { seen = ctx; } });
-  ok(JSON.stringify(seen && seen.existing.map((t) => [t.title, t.owned])) === '[["撮影指示",true],["人のメモ",false]]', '送る直前の確認には、今あるタブと印の有無を渡す (拾い直したファイルに指示書があるかを呼び手が見る)', JSON.stringify(seen));
+  ok(JSON.stringify(seen && seen.existing.map((t) => [t.title, t.owned])) === '[["撮影依頼書",true],["人のメモ",false]]', '送る直前の確認には、今あるタブと印の有無を渡す (拾い直したファイルに指示書があるかを呼び手が見る)', JSON.stringify(seen));
   // PR-F (デザイナー修正依頼書) 向け: 呼び手が組んだ式だけ式のセル・行の高さ
   const g9 = fakeSheets([{ title: 'シート1' }]);
   await writeSpreadsheet(g9, { spreadsheetId: 'S1', fresh: true, tabs: [{ name: '修正依頼', rows: [['画像', '修正指示'], [formulaCell('=IMAGE("https://drive.google.com/thumbnail?id=abc")'), '=人の入力']], format: { rowHeights: [{ start: 1, end: 2, px: 200 }] } }] });
@@ -240,7 +264,7 @@ function fakeSheets(initialTabs, { failBatch = false } = {}) {
   ok(g9.reqs().some((r) => r.updateDimensionProperties && r.updateDimensionProperties.range.dimension === 'ROWS' && r.updateDimensionProperties.range.startIndex === 1 && r.updateDimensionProperties.properties.pixelSize === 200), '行の高さを指定できる');
   let threwF = false; try { formulaCell('IMAGE(x)'); } catch { threwF = true; }
   ok(threwF, '式は = で始まるものだけ');
-  const g4 = fakeSheets([{ title: '撮影指示', owned: true }], { failBatch: true });
+  const g4 = fakeSheets([{ title: '撮影依頼書', owned: true }], { failBatch: true });
   await throwsAsync('batchUpdate が失敗したら throw (呼び手が URL を書かない)', () => writeSpreadsheet(g4, { spreadsheetId: 'S1', title: 'x', tabs: inh.sheets }), 'Backend');
   ok(!g4.calls.some((c) => c[0] === 'driveUpdate'), '失敗したら名前も付け直さない');
 }
@@ -270,20 +294,6 @@ function fakeSheets(initialTabs, { failBatch = false } = {}) {
   ok((await spreadsheetUsable({ drive }, { fileId: 'MOVED0', folderId: 'FOLDER1' })).reason === 'moved', '別のフォルダに移ったファイルは使えない (今の画像フォルダに作る)');
   ok((await spreadsheetUsable({ drive }, { fileId: 'GOOD00', folderId: 'FOLDER1' })).usable === true, '同じフォルダのファイルは使う');
   await throwsAsync('404 以外の失敗 (権限・障害) は作り直さずに失敗にする', () => spreadsheetUsable({ drive }, { fileId: 'BOOM00', folderId: 'FOLDER1' }), 'Backend');
-}
-
-{
-  const sheetsOf = (list, { fail = false } = {}) => ({ spreadsheets: { get: async (p) => {
-    if (fail) throw new Error('timeout');
-    if (!p.includeGridData) throw new Error('値まで読んでいない');
-    return { data: { sheets: list } };
-  } } });
-  const blank = { properties: { sheetId: 0, title: 'シート1' }, data: [{ rowData: [] }] };
-  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([blank]) }, 'S') === true, '片付けてよい = 最初の空の「シート1」1 枚だけ');
-  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([blank, { properties: { sheetId: 5, title: '人のメモ' } }]) }, 'S') === false, '人のタブがあれば片付けない');
-  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([{ ...blank, data: [{ rowData: [{ values: [{ userEnteredValue: { stringValue: 'x' } }] }] }] }]) }, 'S') === false, '「シート1」に何か書いてあれば片付けない');
-  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([{ ...blank, developerMetadata: [{ metadataKey: 'phOwnedTab' }] }]) }, 'S') === false, '印があれば (書けていた) 片付けない');
-  ok(await isUntouchedNewSpreadsheet({ sheets: sheetsOf([], { fail: true }) }, 'S') === false, '読み直せなければ片付けない');
 }
 
 console.log('⑩ 失敗の理由 (画面に出す文)');
