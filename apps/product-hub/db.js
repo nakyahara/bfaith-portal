@@ -1640,7 +1640,7 @@ export function initProductHubDB() {
       id             INTEGER PRIMARY KEY AUTOINCREMENT,
       draft_id       INTEGER NOT NULL,     -- 商品を消しても記録は残す (Drive の共有は残るので、外すときの手がかり)
       drive_file_id  TEXT NOT NULL,
-      permission_id  TEXT NOT NULL,
+      permission_id  TEXT,                 -- NULL = 付けようとしている (付ける前に記録する。付けた直後に止まってもポータルのものと分かる)
       image_id       INTEGER,              -- ph_lp_images.id (載せた版の行)
       shared_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       shared_by      TEXT,

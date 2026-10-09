@@ -110,6 +110,37 @@ const IMG = (root, cur, no, ver = 1, extra = {}) => ({ root_id: root, current_id
   ok(!back.ok && /見出しの行が見つかりません/.test(back.error), '🚨 見出しの行が無い (どこが修正指示か分からない) シートは読めない = 上書きしない');
   ok(ds.readBackNotes([]).ok && ds.readBackNotes(null).ok && ds.readBackNotes([['', '']]).ok, '空のタブ・タブなしは読める (戻すものなし)');
 
+  // 管理番号と画像の照らし合わせ (読み戻しは FORMULA = 画像の列は式そのもの)
+  {
+    const fv = vals.map((r, i) => (i >= 3 ? [r[0], t.rows[i][1].__formula, r[2], r[3], r[4], r[5]] : r.slice()));
+    const files = new Map([['DRVFILE000010', 10], ['DRVFILE000011', 11], ['DRVFILE000012', 12]]);
+    const rof = (fid) => files.get(fid) ?? null;
+    let bk = ds.readBackNotes(fv, { rootOfFile: rof });
+    ok(bk.byKey.get(10)?.note === 'TOP の文字を大きく' && bk.byKey.get(12)?.note.startsWith('背景を白に') && bk.layout.rowOfKey.get(11) === 4 && bk.layout.headerIdx === 2 && bk.layout.noteCol === 2,
+      '照らし合わせ: 管理番号とその行の画像が合えば同じ画像として読む・行の場所も覚える');
+    const swapped = fv.map((r) => r.slice());
+    [swapped[3][5], swapped[5][5]] = [swapped[5][5], swapped[3][5]];
+    bk = ds.readBackNotes(swapped, { rootOfFile: rof });
+    ok(bk.byKey.size === 0 && bk.orphans.map((o) => o.note).sort().join('|') === ['TOP の文字を大きく', '背景を白に\n影を薄く'].sort().join('|'),
+      '🚨 管理番号のセルだけを入れ替えた (別の有効な番号) → 別の画像の行に付けず「行き先なし」に残す (Codex 名指し1 高)', JSON.stringify([...bk.byKey]));
+    const moved2 = [fv[0], fv[1], fv[2], fv[5], fv[4], fv[3]];
+    bk = ds.readBackNotes(moved2, { rootOfFile: rof });
+    ok(bk.byKey.get(10)?.note === 'TOP の文字を大きく' && bk.byKey.get(10)?.row === 5 && bk.byKey.get(12)?.row === 3, '行ごと並べ替えた (管理番号と画像が一緒に動いた) ときは同じ画像として読む');
+    const noImg = fv.map((r) => r.slice()); noImg[3][1] = '';
+    bk = ds.readBackNotes(noImg, { rootOfFile: rof });
+    ok(!bk.byKey.has(10) && bk.orphans.some((o) => o.note === 'TOP の文字を大きく'), '画像のセルを消された行は照らせないので「行き先なし」');
+    // KEEP: 同じ行・同じ列なら修正指示のセルを書かない (読み戻した後に書いた分を消さない)
+    bk = ds.readBackNotes(fv, { rootOfFile: rof });
+    const kb = ds.buildDesignerSheet({ productCode: 'C', productName: 'n', previous: bk, images: [IMG(10, 10, 0), IMG(11, 21, 1, 2), IMG(12, 12, 2)] });
+    const kr = kb.tabs[0].rows;
+    ok(kb.kept === 3 && [3, 4, 5].every((i) => kr[i][2] && kr[i][2].__keep === true) && kb.tabs[0].clearRows === fv.length && kb.tabs[0].clearCols === 6 && kr[4][3] === 'v2',
+      '🚨 前のシートと同じ行・同じ列の画像は、修正指示のセルを書かない (KEEP = いまシートにある値のまま。1 枚作り直しのよくある場合)', JSON.stringify(kr.slice(3).map((r) => r[2])));
+    const kb2 = ds.buildDesignerSheet({ productCode: 'C', productName: 'n', previous: bk, images: [IMG(11, 21, 1, 2), IMG(10, 10, 0), IMG(12, 12, 2)] });
+    ok(kb2.kept === 1 && kb2.tabs[0].rows[3][2] === '' && kb2.tabs[0].rows[4][2] === 'TOP の文字を大きく' && kb2.tabs[0].rows[5][2].__keep === true, '並びが変わった行は読み戻した値で書く (同じ行のままの画像だけ KEEP)');
+    const shifted = fv.map((r, i) => (i < 2 ? r : [r[0], r[1], i === 2 ? '担当' : '', ...r.slice(2)]));
+    const kb3 = ds.buildDesignerSheet({ productCode: 'C', productName: 'n', previous: ds.readBackNotes(shifted, { rootOfFile: rof }), images: [IMG(10, 10, 0)] });
+    ok(kb3.kept === 0 && kb3.tabs[0].rows[3][2] === 'TOP の文字を大きく' && kb3.tabs[0].clearRows === undefined, '人が列を足した (修正指示の列が動いた) ときは KEEP にしない (読み戻した値で書き直す)');
+  }
   // 作り直す: 画像 11 を作り直した (v2)・画像 12 は無くなった・画像 13 が増えた・並びが変わった
   back = ds.readBackNotes(vals.map((r, i) => (i === 4 ? [r[0], r[1], 'FV のロゴを右に', r[3], r[4], r[5]] : r)));
   const b2 = ds.buildDesignerSheet({ productCode: 'CODE1', productName: '商品', previous: back,
@@ -226,7 +257,7 @@ const fakeDrive = {
     update: async (p) => { await hit('update', p); const f = fileOrThrow(p.fileId); if ('name' in p.requestBody) f.name = p.requestBody.name; return { data: {} }; },
   },
   permissions: {
-    list: async (p) => { await hit('plist', p); const f = fileOrThrow(p.fileId); return { data: { permissions: f.perms.map((x) => ({ id: x.id, type: x.type, role: x.role })) } }; },
+    list: async (p) => { await hit('plist', p); if (g.onPlist) { const fn = g.onPlist; g.onPlist = null; fn(p); } const f = fileOrThrow(p.fileId); return { data: { permissions: f.perms.map((x) => ({ id: x.id, type: x.type, role: x.role })) } }; },
     create: async (p) => {
       await hit('pcreate', p);
       const f = fileOrThrow(p.fileId);
@@ -234,6 +265,7 @@ const fakeDrive = {
       const rb = p.requestBody;
       const id = rb.type === 'anyone' ? 'anyoneWithLink' : 'perm' + (++g.permSeq);
       f.perms.push({ id, type: rb.type, role: rb.role, discover: rb.allowFileDiscovery });
+      if (g.failAfterCreate) { g.failAfterCreate = false; throw gErr(undefined, 'socket hang up'); }
       return { data: { id } };
     },
     delete: async (p) => {
@@ -270,7 +302,9 @@ const fakeSheets = { spreadsheets: {
       const t = f.tabs.find((x) => x.title === title);
       if (!t) throw gErr(400, 'Unable to parse range: ' + p.range);
       // 本物と同じく、後ろの空のセル・空の行は返さない
-      const rows = t.values.map((r) => { const a = r.slice(); while (a.length && a[a.length - 1] === '') a.pop(); return a; });
+      // FORMULA なら式のセルは式そのもの (本物と同じ)
+      const asFormula = p.valueRenderOption === 'FORMULA';
+      const rows = t.values.map((r, ri) => { const a = r.map((v, ci) => (asFormula && t.formulas[ri]?.[ci] != null ? t.formulas[ri][ci] : v)); while (a.length && a[a.length - 1] === '') a.pop(); return a; });
       while (rows.length && rows[rows.length - 1].length === 0) rows.pop();
       return { data: { values: rows } };
     },
@@ -293,8 +327,16 @@ const fakeSheets = { spreadsheets: {
         if (u.range) { const t = find(u.range.sheetId); if (/userEnteredValue/.test(u.fields)) { t.values = []; t.formulas = []; } }
         else {
           const t = find(u.start.sheetId);
-          t.values = u.rows.map((row) => (row.values || []).map(shownOf));
-          t.formulas = u.rows.map((row) => (row.values || []).map((c) => c?.userEnteredValue?.formulaValue ?? null));
+          // start の位置から書く (送らなかったセル = KEEP はいまの値のまま)
+          u.rows.forEach((row, dr) => (row.values || []).forEach((c, dc) => {
+            const ri = u.start.rowIndex + dr; const ci = u.start.columnIndex + dc;
+            while (t.values.length <= ri) t.values.push([]);
+            while (t.formulas.length <= ri) t.formulas.push([]);
+            while (t.values[ri].length < ci) t.values[ri].push('');
+            t.values[ri][ci] = shownOf(c);
+            t.formulas[ri][ci] = c?.userEnteredValue?.formulaValue ?? null;
+          }));
+          g.cellWrites = (g.cellWrites || 0) + 1;
         }
       } else if (r.updateSheetProperties || r.repeatCell || r.updateDimensionProperties || r.appendDimension) {
         find((r.updateSheetProperties?.properties || r.repeatCell?.range || r.updateDimensionProperties?.range || r.appendDimension).sheetId);
@@ -467,6 +509,29 @@ const A = makeComposed({ code: 'maitakep50' });
   st = await stateOf(A);
   ok(st.stale === false && evOf(A, 'designer_sheet_updated').length === 1, '作り直した後は最新・履歴');
 
+  // 読み戻した後・送る前に人が修正指示を書いた → 同じ行の画像は KEEP なので消えない
+  {
+    const rjK = regen(A, cards2[2].head_id); finishJob(rjK);
+    g.onSgetNth = { n: 2, fn: () => humanWrites(F.id, `img-${cards2[2].root_id}`, '作り直しの最中に書いた') };
+    const rK = await press(A);
+    ok(rK.status === 200 && rK.json.kept === 3 && noteOfKey(F.id, `img-${cards2[2].root_id}`).note === '作り直しの最中に書いた' && noteOfKey(F.id, `img-${cards2[0].root_id}`).note === 'TOP の文字を大きく',
+      '🚨 読み戻した後・Google に送る前に人が書いた修正指示も消えない (同じ行の画像は修正指示のセルを書かない — Codex 名指し1 高)', JSON.stringify(rK.json));
+    ok(noteOfKey(F.id, `img-${cards2[2].root_id}`).ver === 'v' + cardsOf(A)[2].current.version && cardsOf(A)[2].current.version === 3 && tabOf(F.id).formulas[5][1].includes(cardsOf(A)[2].current.drive_file_id), 'KEEP でも画像・版は最新に書き直す');
+    // 管理番号のセルだけ入れ替えた → 別の画像に付けない
+    const t0 = tabOf(F.id); const kc = 5;
+    [t0.values[3][kc], t0.values[4][kc]] = [t0.values[4][kc], t0.values[3][kc]];
+    const rjS = regen(A, cardsOf(A)[2].head_id); finishJob(rjS);
+    const rS = await press(A);
+    const tS = tabOf(F.id);
+    const ohS = tS.values.findIndex((x) => String(x[0]).startsWith('前の依頼書の修正指示'));
+    ok(rS.status === 200 && tS.values[3][2] === '' && tS.values[4][2] === '' && ohS > 0 && tS.values.slice(ohS + 1).map((x) => x[2]).sort().join('|') === ['TOP の文字を大きく', 'ロゴを右上に\n背景をもう少し明るく'].sort().join('|'),
+      '🚨 (本番の経路) 管理番号のセルを入れ替えられたら、その修正指示は別の画像の行に付けず下に残す', JSON.stringify(tS.values.map((x) => x[2])));
+    // 片付け: 下に残った修正指示を空にし、元の 2 件を書き直して次の試験へ
+    for (const row of tS.values.slice(ohS + 1)) row[2] = '';
+    humanWrites(F.id, `img-${cards2[0].root_id}`, 'TOP の文字を大きく');
+    humanWrites(F.id, `img-${cards2[1].root_id}`, 'ロゴを右上に\n背景をもう少し明るく');
+    humanWrites(F.id, `img-${cards2[2].root_id}`, '');
+  }
   // 全部作り直す (別の画像になる) → 修正指示は下に残す
   const j2 = fullJob(A);
   st = stateNow(A);
@@ -563,9 +628,36 @@ console.log('③ 共有ドライブの設定でリンク共有ができない');
   r = await press(B);
   const s0 = sharesOf(B).find((s) => s.drive_file_id === cur0);
   ok(r.status === 200 && r.json.revoked === 0 && s0.revoked_at == null && /失敗/.test(s0.revoke_error || ''), '外せなかった公開は記録に理由を残す (依頼書はできている)');
-  const rj3 = regen(B, cardsOf(B)[1].head_id); finishJob(rj3);
+  let stB = stateNow(B);
+  ok(stB.stale === true && stB.unrevoked === 1 && stB.blocked === null, '🚨 外せなかった公開があれば、画像が同じでも「作り直す」を出す (次の作り直しが来なくても気づける — Codex 名指し1 高)');
   r = await press(B);
-  ok(r.status === 200 && sharesOf(B).find((s) => s.drive_file_id === cur0).revoked_at != null && !publicFiles().includes(cur0), '次に作ったときに外し直す');
+  stB = stateNow(B);
+  ok(r.status === 200 && sharesOf(B).find((s) => s.drive_file_id === cur0).revoked_at != null && !publicFiles().includes(cur0) && stB.stale === false && stB.unrevoked === 0, '押せば外し直す (画像を作り直さなくても)');
+  // 公開は付いたのに返事が来なかった (付けた直後に止まった) → この回で付けようとした公開は外す
+  const rj4 = regen(B, cardsOf(B)[2].head_id); finishJob(rj4);
+  const f4 = cardsOf(B)[2].current.drive_file_id;
+  g.failAfterCreate = true;
+  r = await press(B);
+  ok(r.status === 502 && !publicFiles().includes(f4) && sharesOf(B).filter((x) => x.drive_file_id === f4).every((x) => x.revoked_at),
+    '🚨 公開が付いたのに返事が来なかった → 付ける前に記録していたので、外して閉じる (記録の無い公開を残さない — Codex 名指し1 高)', JSON.stringify([r, sharesOf(B).filter((x) => x.drive_file_id === f4)]));
+  // 前の回が付けた直後にプロセスごと止まった (付けようとしていた行のまま・公開は付いている) → ポータルのものとして引き取り、後で外せる
+  g.files.get(f4).perms.push({ id: 'anyoneWithLink', type: 'anyone', role: 'reader' });
+  db.prepare('INSERT INTO ph_designer_sheet_shares (draft_id, drive_file_id, permission_id, image_id, shared_by) VALUES (?, ?, NULL, NULL, ?)').run(B.id, f4, 't');
+  r = await press(B);
+  ok(r.status === 200 && sharesOf(B).some((x) => x.drive_file_id === f4 && x.permission_id === 'anyoneWithLink' && !x.revoked_at), '付けようとしていた行のまま止まった公開は、ポータルのものとして ID を埋める');
+  const rj5 = regen(B, cardsOf(B)[2].head_id); finishJob(rj5);
+  r = await press(B);
+  ok(r.status === 200 && !publicFiles().includes(f4), 'それも依頼書から外れたら外す');
+  // 1 枚ごとに印の期限を延ばす = 公開の途中で印を取られたら止める
+  const rj6 = regen(B, cardsOf(B)[0].head_id); finishJob(rj6);
+  const f6 = cardsOf(B)[0].current.drive_file_id;
+  g.onPlist = () => { db.prepare("UPDATE ph_designer_sheets SET lease_token = 'other', lease_until = '2999-01-01T00:00:00Z' WHERE draft_id = ?").run(B.id); };
+  const bP = g.batches;
+  const nPC = g.log.filter((x) => x === 'plist').length;
+  r = await press(B);
+  const pcDuring = g.log.filter((x) => x === 'plist').length - nPC;
+  db.prepare('UPDATE ph_designer_sheets SET lease_token = NULL, lease_until = NULL WHERE draft_id = ?').run(B.id);
+  ok(r.status === 409 && /時間がかかりすぎた/.test(r.json.error) && g.batches === bP && !publicFiles().includes(f6) && pcDuring === 1, '🚨 公開の途中で印を別の処理に取られたら、残りの画像は公開せずに止める (1 枚ごとに印を確かめる・付けた公開は外す・書かない)', JSON.stringify(r.json));
 }
 
 console.log('④ 二重押し・2 人同時・待っている間の変化');
@@ -651,7 +743,9 @@ console.log('⑥ 画面の JS (印の間を切り出して偽の document で動
   v = ui.dsheetView(stBase, true);
   ok(v.createDisabled && v.createLabel === '作成中…', '送っている途中は押せない');
   v = ui.dsheetView({ ...stBase, exists: true, url: 'https://docs.google.com/spreadsheets/d/S/edit', at: '2026-10-09T01:02:03Z', by: 'a@x', count: 3 }, false);
-  ok(!v.showCreate && v.openUrl.endsWith('/edit') && !v.showStale && v.meta.startsWith('2026-10-09 01:02 作成 (a@x) ・ 3枚') && v.title === 'デザイナー修正依頼書_X' && v.reason === '', '作成済み・最新: 「開く ↗」だけ');
+  ok(!v.showCreate && v.openUrl.endsWith('/edit') && v.showStale && !v.staleWarn && v.updateLabel === '作り直す' && v.meta.startsWith('2026-10-09 01:02 作成 (a@x) ・ 3枚') && v.title === 'デザイナー修正依頼書_X' && v.reason === '', '作成済み・最新: 「開く ↗」と、目立たない「作り直す」(Drive で消した・移したときに直せる)');
+  v = ui.dsheetView({ ...stBase, exists: true, url: 'u', stale: true, unrevoked: 2 }, false);
+  ok(v.staleWarn && v.staleText.includes('2 枚の公開') && v.updateLabel === '最新の画像で作り直す', '依頼書から外れた画像の公開を外せていなければ出す');
   v = ui.dsheetView({ ...stBase, exists: true, url: 'u', stale: true }, false);
   ok(v.showStale && !v.updateDisabled && v.staleText === '作成後に作り直した画像があります。' && v.updateLabel === '最新の画像で作り直す', '作成後に作り直した画像があれば「最新の画像で作り直す」');
   v = ui.dsheetView({ ...stBase, exists: true, url: 'u', stale: true, blocked: '作り直している画像があります。…' }, false);
@@ -707,16 +801,17 @@ console.log('⑥ 画面の JS (印の間を切り出して偽の document で動
     '🚨 二重押しでも送るのは 1 回・画面が見ていた依頼書 (無し) と画像の並びを添える', JSON.stringify(posts));
   const fileD = rowOf(D).file_id;
   ok(fileD && els['dsheet-create'].hidden && !els['dsheet-open'].hidden && els['dsheet-open'].href === `https://docs.google.com/spreadsheets/d/${fileD}/edit`
-    && els['dsheet-title'].textContent === `デザイナー修正依頼書_${D.ne_code}` && els['dsheet-msg'].textContent.startsWith('デザイナー修正依頼書を作りました') && els['dsheet-stale'].hidden,
+    && els['dsheet-title'].textContent === `デザイナー修正依頼書_${D.ne_code}` && els['dsheet-msg'].textContent.startsWith('デザイナー修正依頼書を作りました') && els['dsheet-stale'].dataset.warn === '0'
+    && !els['dsheet-stale'].hidden && els['dsheet-update'].textContent === '作り直す' && els['dsheet-stale-text'].textContent.includes('Drive で消した・移した'),
     '作れたら「開く ↗」とファイル名・作成日時を出す (読み直さずに)');
   // 1 枚作り直す → ポーリングで「最新の画像で作り直す」
   humanWrites(fileD, `img-${cardsOf(D)[0].root_id}`, 'もっと明るく');
   const rj = regen(D, cardsOf(D)[0].head_id); finishJob(rj);
   await lpiCtl.poll();
-  ok(!els['dsheet-stale'].hidden && els['dsheet-stale-text'].textContent === '作成後に作り直した画像があります。' && !els['dsheet-update'].disabled, '🚨 作成後に作り直した画像があれば「最新の画像で作り直す」を出す (ポーリングで)');
+  ok(els['dsheet-stale'].dataset.warn === '1' && els['dsheet-update'].textContent === '最新の画像で作り直す' && els['dsheet-stale-text'].textContent === '作成後に作り直した画像があります。' && !els['dsheet-update'].disabled, '🚨 作成後に作り直した画像があれば「最新の画像で作り直す」を出す (ポーリングで)');
   await els['dsheet-update'].click();
   const last = sent.filter((x) => x[1]).at(-1);
-  ok(last[1].seen_file_id === fileD && els['dsheet-stale'].hidden && /最新の画像で作り直しました \(書いてあった修正指示 1 件は同じ画像の行に残しました\)/.test(els['dsheet-msg'].textContent),
+  ok(last[1].seen_file_id === fileD && els['dsheet-stale'].dataset.warn === '0' && /最新の画像で作り直しました \(書いてあった修正指示 1 件は同じ画像の行に残しました\)/.test(els['dsheet-msg'].textContent),
     '作り直す: 見ていた依頼書を添え、残した修正指示の数を出す', els['dsheet-msg'].textContent);
   ok(noteOfKey(fileD, `img-${cardsOf(D)[0].root_id}`).note === 'もっと明るく', '(本番の経路) 修正指示は残っている');
   // 古い画面: 別のタブで作り直された後に押す → 409 の理由・画像の箱を取り直す

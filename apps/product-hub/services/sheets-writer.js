@@ -143,6 +143,12 @@ const cellData = (c) => (c && typeof c === 'object' && typeof c.__formula === 's
   ? { userEnteredValue: { formulaValue: c.__formula } }
   : { userEnteredValue: { stringValue: c == null ? '' : String(c) } });
 const rowData = (row) => ({ values: row.map(cellData) });
+/**
+ * 書かないセル (PR-F のデザイナー修正依頼書: 人が書いている修正指示のセル)。行にこれがあるタブは、
+ * タブ全体を消してから書く代わりに、KEEP 以外のセルだけを (前の広さ clearRows × clearCols まで) 書き直す = KEEP のセルはいまの値のまま
+ */
+export const KEEP_CELL = Object.freeze({ __keep: true });
+const isKeep = (c) => !!c && typeof c === 'object' && c.__keep === true;
 
 /**
  * スプレッドシートの中身を差し替える。
@@ -208,8 +214,26 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
     const sheetId = ids.get(t.name);
     const f = t.format || {};
     const width = Math.max(1, ...t.rows.map((r) => r.length));
-    requests.push({ updateCells: { range: { sheetId }, fields: 'userEnteredValue,userEnteredFormat' } });
-    requests.push({ updateCells: { start: { sheetId, rowIndex: 0, columnIndex: 0 }, rows: t.rows.map(rowData), fields: 'userEnteredValue' } });
+    if (!t.rows.some((r) => r.some(isKeep))) {
+      requests.push({ updateCells: { range: { sheetId }, fields: 'userEnteredValue,userEnteredFormat' } });
+      requests.push({ updateCells: { start: { sheetId, rowIndex: 0, columnIndex: 0 }, rows: t.rows.map(rowData), fields: 'userEnteredValue' } });
+    } else {
+      // KEEP のあるタブ: 書式だけまっさらにし、値は KEEP 以外のセルを行ごとのひと続きで書く (空のセルは '' = 消す)。
+      // 前の版の広さ (clearRows × clearCols) まで書くので、前の行・列は残らない (KEEP のセルだけが残る)
+      requests.push({ updateCells: { range: { sheetId }, fields: 'userEnteredFormat' } });
+      const h = Math.max(t.rows.length, Number(t.clearRows) || 0);
+      const w = Math.max(width, Number(t.clearCols) || 0);
+      for (let r = 0; r < h; r++) {
+        const row = t.rows[r] || [];
+        let seg = null;
+        for (let c = 0; c <= w; c++) {
+          const cell = c < w ? row[c] : KEEP_CELL;
+          if (!isKeep(cell)) { (seg = seg || { c, cells: [] }).cells.push(cellData(cell)); continue; }
+          if (seg) requests.push({ updateCells: { start: { sheetId, rowIndex: r, columnIndex: seg.c }, rows: [{ values: seg.cells }], fields: 'userEnteredValue' } });
+          seg = null;
+        }
+      }
+    }
     requests.push({ updateSheetProperties: { properties: { sheetId, index, gridProperties: { frozenRowCount: Number(f.frozenRows) || 0 } }, fields: 'index,gridProperties.frozenRowCount' } });
     requests.push({ repeatCell: {
       range: { sheetId },
@@ -269,11 +293,11 @@ export async function writeSpreadsheet({ sheets, drive }, { spreadsheetId, title
 
 /**
  * 書き込み係が作ったタブ (印つき) の今の値を読む (PR-F: 作り直す前に、人が書いた修正指示を読み戻す)。
- * 値は画面に見えている文字 (FORMATTED_VALUE)。式のセルは式の結果 (=IMAGE は空) になる。
+ * 値は画面に見えている文字 (FORMATTED_VALUE・式のセルは式の結果 = =IMAGE は空)。render: 'FORMULA' なら式のセルは式そのもの。
  * @returns {Promise<{exists: false}|{exists: true, owned: boolean, values: string[][]|null}>}
  *   owned=false (人が作った同じ名前のタブ) は読まない (書くときに writeSpreadsheet が TabConflictError で止める)
  */
-export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, range = 'A1:Z2000' }) {
+export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, range = 'A1:Z2000', render = 'FORMATTED_VALUE' }) {
   const opt = { timeout: GOOGLE_TIMEOUT_MS };
   const got = await sheets.spreadsheets.get({
     spreadsheetId,
@@ -285,7 +309,7 @@ export async function readOwnedTabValues({ sheets }, { spreadsheetId, name, rang
   if (!owned) return { exists: true, owned: false, values: null };
   // タブ名は自分で決めた名前 (引用符を含まない) なので、そのまま範囲に入れる
   const r = await sheets.spreadsheets.values.get({
-    spreadsheetId, range: `'${String(name).replace(/'/g, "''")}'!${range}`, valueRenderOption: 'FORMATTED_VALUE', majorDimension: 'ROWS',
+    spreadsheetId, range: `'${String(name).replace(/'/g, "''")}'!${range}`, valueRenderOption: render === 'FORMULA' ? 'FORMULA' : 'FORMATTED_VALUE', majorDimension: 'ROWS',
   }, opt);
   return { exists: true, owned: true, values: Array.isArray(r?.data?.values) ? r.data.values : [] };
 }

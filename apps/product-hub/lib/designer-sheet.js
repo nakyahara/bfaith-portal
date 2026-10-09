@@ -24,6 +24,7 @@ export const DESIGNER_TAB = 'デザイナー修正依頼';
 /** 列 (左から)。読み戻しは見出しの文字で列を探す (人が列を足しても読める) */
 export const HEADERS = ['画像番号・役割', 'AI生成画像', '修正指示', '版', '画像を開く', '管理番号 (消さないでください)'];
 const H_LABEL = HEADERS[0];
+const H_IMAGE = HEADERS[1];
 const H_NOTE = HEADERS[2];
 const H_VERSION = HEADERS[3];
 const H_KEY_PREFIX = '管理番号';
@@ -38,6 +39,10 @@ const CELL_MAX = 5000;
 // Drive のファイル ID (式に埋めるので形を検査する。lp-image の DRIVE_ID_RE と同じ)
 const DRIVE_ID_RE = /^[-\w]{10,200}$/;
 const KEY_RE = /^img-([1-9]\d{0,15})$/;
+// 画像の列の式から、出している画像ファイルの ID を読む (imageFormulaUrl の形)
+const IMAGE_FILE_RE = /lh3\.googleusercontent\.com\/d\/([-\w]{10,200})/;
+/** 書かないセル (services/sheets-writer.js の KEEP_CELL と同じ形)。人がいま書いている修正指示に触らない */
+const KEEP = { __keep: true };
 /** 人の書いた修正指示は切らない (Sheets の 1 セルの上限 50,000 文字まで) */
 const NOTE_MAX = 50_000;
 /** 式のセル (services/sheets-writer.js の formulaCell と同じ形。lib は googleapis を読み込まないので形だけ合わせる) */
@@ -123,15 +128,23 @@ export function designerSheetBlockReason({ configured, folderId, job, cards }) {
 /**
  * 今のシート (タブの値) から、人が書いた修正指示を読み戻す。
  * 列は見出しの文字で探す (人が列を足しても・並べ替えても読める)。
- * @param {string[][]|null} values  タブの値 (FORMATTED_VALUE)。null = タブが無い (作ったばかり・人がタブを消した)
- * @returns {{ok: true, byKey: Map<number, {note, version, label}>, orphans: Array<{label, note, version}>}|{ok: false, error: string}}
- *   byKey = 管理番号のある画像の行 (元の行の ID → 修正指示)。orphans = 行き先の無いもの (前の「前の依頼書の修正指示」の行も含む)。
- *   修正指示が空の行は読まない
+ * 値は FORMULA で読む (画像の列の =IMAGE("…/d/<ファイル ID>") を読んで、その行に出ている画像を知るため)。
+ *
+ * 🚨 管理番号のセルだけを信じない (Codex PR-F 名指し1 高): 管理番号は人が書き換えられるので、
+ *    その行の =IMAGE が出している画像ファイルが、管理番号の画像 (の版のどれか) のものかを rootOfFile で照らす。
+ *    合わなければ (管理番号を入れ替えた・別の番号を書いた・画像のセルを消した) その行の修正指示は「行き先なし」に残す
+ *    (別の画像の行に付けない)。行ごと並べ替えた (管理番号と画像が一緒に動いた) ときは合うので、同じ画像の行に戻る
+ * @param {string[][]|null} values  タブの値 (FORMULA)。null = タブが無い (作ったばかり・人がタブを消した)
+ * @param {{rootOfFile?: (fileId: string) => number|null}} [opts]  画像ファイル → 元の行の ID (この商品の画像だけ)。無ければ照らさない
+ * @returns {{ok: true, byKey: Map<number, {note, version, label, row}>, orphans: Array<{label, note, version}>, layout: object|null}|{ok: false, error: string}}
+ *   byKey = 管理番号の画像の行 (元の行の ID → 修正指示・何行目か)。orphans = 行き先の無いもの (前の「前の依頼書の修正指示」の行も含む)。
+ *   修正指示が空の行は byKey / orphans に入れない (layout.rowOfKey には入れる = その行の場所は分かる)。
+ *   layout = 見出しの行・列の位置と、管理番号が確かめられた行 (作り直しで修正指示のセルに触らずに済むかを決める)
  */
-export function readBackNotes(values) {
+export function readBackNotes(values, { rootOfFile = null } = {}) {
   const byKey = new Map();
   const orphans = [];
-  if (values == null) return { ok: true, byKey, orphans };
+  if (values == null) return { ok: true, byKey, orphans, layout: null };
   const rows = Array.isArray(values) ? values.map((r) => (Array.isArray(r) ? r.map(str) : [])) : [];
   const headerIdx = rows.findIndex((r) => r.some((c) => c.trim() === H_NOTE));
   if (headerIdx < 0) {
@@ -139,7 +152,7 @@ export function readBackNotes(values) {
     if (rows.some((r) => r.some((c) => c.trim()))) {
       return { ok: false, error: `デザイナー修正依頼書の「${H_NOTE}」の見出しの行が見つかりません (見出しを消した・書き換えた)。書いた内容を消さないため、作り直していません。見出しの行を元に戻すか、要らなければタブ「${DESIGNER_TAB}」の名前を変えてから押してください` };
     }
-    return { ok: true, byKey, orphans };
+    return { ok: true, byKey, orphans, layout: null };
   }
   const head = rows[headerIdx];
   const col = (pred, fallback) => { const i = head.findIndex((c) => pred(c.trim())); return i >= 0 ? i : fallback; };
@@ -147,20 +160,30 @@ export function readBackNotes(values) {
   const keyCol = col((c) => c.startsWith(H_KEY_PREFIX), -1);
   const verCol = col((c) => c === H_VERSION, -1);
   const labelCol = col((c) => c === H_LABEL, 0);
+  const imageCol = col((c) => c === H_IMAGE, -1);
+  // 管理番号が確かめられた行 (元の行の ID → 何行目か。最初の 1 行だけ)
+  const rowOfKey = new Map();
   let inOrphans = false;
-  for (const r of rows.slice(headerIdx + 1)) {
+  rows.forEach((r, idx) => {
+    if (idx <= headerIdx) return;
     const label = str(r[labelCol]);
-    if (label.startsWith(ORPHAN_HEADING_HEAD)) { inOrphans = true; continue; }
+    if (label.startsWith(ORPHAN_HEADING_HEAD)) { inOrphans = true; return; }
     const note = str(r[noteCol]);
-    if (!note.trim()) continue;
     const version = verCol >= 0 ? str(r[verCol]) : '';
     const m = !inOrphans && keyCol >= 0 ? KEY_RE.exec(str(r[keyCol]).trim()) : null;
-    const id = m ? Number(m[1]) : null;
+    let id = m ? Number(m[1]) : null;
+    if (id && rootOfFile) {
+      const fm = imageCol >= 0 ? IMAGE_FILE_RE.exec(str(r[imageCol])) : null;
+      if (!fm || rootOfFile(fm[1]) !== id) id = null;
+    }
     // 同じ管理番号が 2 行 (人が行をコピーした) → 2 つ目からは行き先なしに残す (片方を黙って捨てない)
-    if (id && !byKey.has(id)) byKey.set(id, { note, version, label });
+    const first = id && !rowOfKey.has(id);
+    if (first) rowOfKey.set(id, idx);
+    if (!note.trim()) return;
+    if (first) byKey.set(id, { note, version, label, row: idx });
     else orphans.push({ label, note, version });
-  }
-  return { ok: true, byKey, orphans };
+  });
+  return { ok: true, byKey, orphans, layout: { headerIdx, noteCol, rowOfKey, rowCount: rows.length, colCount: Math.max(0, ...rows.map((r) => r.length)) } };
 }
 
 const verNo = (s) => { const m = /^v(\d+)/.exec(str(s).trim()); return m ? Number(m[1]) : null; };
@@ -188,12 +211,23 @@ export function versionCell(version, prev) {
  * @param {string} o.productCode
  * @param {string} o.productName
  * @param {Array<{root_id, current_id, no, seq, role, title, version, drive_file_id}>} o.images  TOP から順 (作った順)
- * @param {{byKey: Map, orphans: Array}|null} [o.previous]  readBackNotes の結果 (作り直すとき)
- * @returns {{title: string, tabs: Array<{name, rows, format}>, carried: number, orphaned: number}}
- *   carried = 同じ画像の行に戻した修正指示の数 / orphaned = 「前の依頼書の修正指示」に残した数
+ * @param {{byKey: Map, orphans: Array, layout: object|null}|null} [o.previous]  readBackNotes の結果 (作り直すとき)
+ * @returns {{title: string, tabs: Array<{name, rows, format, clearRows?, clearCols?}>, carried: number, orphaned: number, kept: number}}
+ *   carried = 同じ画像の行に戻した修正指示の数 / orphaned = 「前の依頼書の修正指示」に残した数 /
+ *   kept = 修正指示のセルに触らずに残した行の数 (下)
+ *
+ * 🚨 読み戻してから Google に送るまでの間 (数秒) に人が書いた修正指示を消さない (Codex PR-F 名指し1 高):
+ *    前のシートで、その画像が**同じ行**・修正指示が**同じ列**にある (見出しの位置も同じ) なら、その修正指示のセルは書かない
+ *    (KEEP = 送らない = いまシートにある値のまま)。1 枚だけ作り直した、のようなよくある作り直しはこれで、書いている途中の
+ *    修正指示も残る。画像が増えた・減った・並びが変わった・全部作り直したときは行が動くので、読み戻した値で書き直す
+ *    (そのときだけ、読み戻した後の数秒に書いた分は残らない — 画面で「作り直しの間はシートを書かないでください」と出す)
  */
 export function buildDesignerSheet({ productCode, productName, images, previous = null }) {
   const byKey = previous?.byKey instanceof Map ? previous.byKey : new Map();
+  const layout = previous?.layout || null;
+  // 前のシートと見出しの行・修正指示の列が同じ (人が列や見出しを動かしていない) ときだけ、セルに触らずに残せる
+  const sameFrame = !!layout && layout.headerIdx === TOP_ROWS && layout.noteCol === HEADERS.indexOf(H_NOTE);
+  let kept = 0;
   const used = new Set();
   const rows = [
     [cellText(`デザイナー修正依頼書　${str(productCode)}　${str(productName)}`)],
@@ -205,13 +239,16 @@ export function buildDesignerSheet({ productCode, productName, images, previous 
     const id = Number(im.root_id);
     const prev = byKey.get(id) || null;
     if (prev) { used.add(id); carried += 1; }
+    // この画像が前のシートでも同じ行にある → 修正指示のセルは書かない (いま人が書いている値のまま)
+    const keep = sameFrame && layout.rowOfKey.get(id) === rows.length;
+    if (keep) kept += 1;
     const role = cellText(im.role, 200);
     const title = cellText(im.title, 300);
     rows.push([
       cellText(`${imageLabel(im)}${role ? '｜' + role : ''}${title ? '\n' + title : ''}`),
       // 式は自分で組んだ URL だけ (ID は imageFormulaUrl / driveViewUrl が形を検査する)
       formula(`=IMAGE("${imageFormulaUrl(im.drive_file_id)}")`),
-      prev ? cellText(prev.note, NOTE_MAX) : '',
+      keep ? KEEP : (prev ? cellText(prev.note, NOTE_MAX) : ''),
       versionCell(im.version, prev),
       formula(`=HYPERLINK("${driveViewUrl(im.drive_file_id)}", "画像を開く")`),
       imageKey(id),
@@ -239,8 +276,10 @@ export function buildDesignerSheet({ productCode, productName, images, previous 
   };
   return {
     title: designerSheetTitle(productCode),
-    tabs: [{ name: DESIGNER_TAB, rows, format }],
+    // KEEP のあるときは、前のシートの広さまで (KEEP 以外を) 消してから書く (前の版の行が残らない)
+    tabs: [{ name: DESIGNER_TAB, rows, format, ...(kept ? { clearRows: layout.rowCount, clearCols: layout.colCount } : {}) }],
     carried,
     orphaned: orphans.length,
+    kept,
   };
 }
