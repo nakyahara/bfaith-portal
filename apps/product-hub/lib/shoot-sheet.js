@@ -344,15 +344,22 @@ export function cutsFromSlots({ slots, hasEditShoot, aiImages, aiCuts = null }) 
     const origNo = aiNoOfUid(sl.uid);
     if (origNo != null) labelOfOrig.set(origNo, imgLabel(Number.isInteger(sl.no) ? sl.no : i, sl.name));
   });
-  const lpImageOf = (c) => c.lp_image_nos.map((n) => labelOfOrig.get(n)).filter(Boolean).join('・');
+  const needsOf = (sl) => {
+    const origNo = aiNoOfUid(sl.uid);
+    const ai = origNo != null ? aiByNo.get(origNo) || null : null;
+    return hasEditShoot ? sl.shoot === true : (aiImages ? !!(ai && ai.needs_shoot) : blockMentionsShoot((Array.isArray(sl.lines) ? sl.lines : []).join('\n')));
+  };
+  // 🚨 表示に出すのは「いま要撮影」の画像だけ (人が片方だけ「撮影不要」にした共有カットに、撮影不要の画像を出さない。
+  //    出すと材料の hash も変わらず「LP構成が変わりました」も出ない — Codex PR-C2 名指し2 M)
+  const labelOfNeeded = new Map([...labelOfOrig].filter(([n]) => list.some((sl) => aiNoOfUid(sl.uid) === n && needsOf(sl))));
+  const lpImageOf = (c) => c.lp_image_nos.map((n) => labelOfNeeded.get(n)).filter(Boolean).join('・');
   const used = new Set();
   const cuts = [];
   for (const [i, sl] of list.entries()) {
     const block = (Array.isArray(sl.lines) ? sl.lines : []).join('\n');
     const origNo = aiNoOfUid(sl.uid);
     const ai = origNo != null ? aiByNo.get(origNo) || null : null;
-    const needs = hasEditShoot ? sl.shoot === true : (aiImages ? !!(ai && ai.needs_shoot) : blockMentionsShoot(block));
-    if (!needs) continue;
+    if (!needsOf(sl)) continue;
     const no = Number.isInteger(sl.no) ? sl.no : i;
     const fromBlock = cutFromBlock(block, { label: imgLabel(no, sl.name), name: sl.name });
     if (v2) {

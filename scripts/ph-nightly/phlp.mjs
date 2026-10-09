@@ -169,7 +169,8 @@ function loadLease(id) {
 // ── コマンド ────────────────────────────────────────────────
 
 async function cmdQueue() {
-  const r = await api('GET', '/lp-compose/queue');
+  // shoot_spec=1: 撮影判定の仕様書を受け取れると言う (サーバは仕様書つきの依頼も claimable に数える・PR-C2)。古いサーバは無視する
+  const r = await api('GET', '/lp-compose/queue?shoot_spec=1');
   out(r.json);
   if (r.status !== 200) fail(1);
 }

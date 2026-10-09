@@ -463,8 +463,12 @@ console.log('⑧ 撮影指示書 (PR-D) — 仕様書の形 (v2) なら AI の�
     { uid: 'nNew', no: 3, name: '使い方', lines: blk('提供された実物商品画像'), shoot: true },
   ];
   const ce = sheet.cutsFromSlots({ slots: edited, hasEditShoot: true, aiImages: J.images, aiCuts: J.cuts });
-  eq(ce.map((x) => [x.content, x.lp_image]), [['2枚目の手元', '1枚目｜成分'], ['FVと2枚目で使う集合', '2枚目｜FV・1枚目｜成分'], ['使い方', '3枚目｜使い方'], ['LPに無い 手持ちサイズ', '']],
-    '🚨 要撮影は人の値 (編集版) が正本・元の画像 (uid a<番号>) で AI のカットを引く・足した画像はブロックから・表示は今の番号');
+  eq(ce.map((x) => [x.content, x.lp_image]), [['2枚目の手元', '1枚目｜成分'], ['FVと2枚目で使う集合', '1枚目｜成分'], ['使い方', '3枚目｜使い方'], ['LPに無い 手持ちサイズ', '']],
+    '🚨 要撮影は人の値 (編集版) が正本・元の画像 (uid a<番号>) で AI のカットを引く・足した画像はブロックから・表示は今の番号 (撮影不要にした FV は出さない)');
+  const bothOn = sheet.cutsFromSlots({ slots: edited.map((x) => (x.uid === 'a1' ? { ...x, shoot: true } : x)), hasEditShoot: true, aiImages: J.images, aiCuts: J.cuts });
+  ok(bothOn.some((x) => x.lp_image === '2枚目｜FV・1枚目｜成分'), '共有カットの両方の画像が要撮影なら両方を出す');
+  const hashOf = (cs) => sheet.shootSheetMaterialHash({ productCode: 'X', productName: 'Y', shootMode: 'inhouse', folderUrl: '', summary: {}, cuts: cs });
+  ok(hashOf(bothOn) !== hashOf(ce), '🚨 共有カットの片方の画像だけ撮影不要にしても材料の hash が変わる (「LP構成が変わりました」が出る・Codex PR-C2 名指し2 M)');
   const ceOff = sheet.cutsFromSlots({ slots: edited.map((x) => ({ ...x, shoot: x.uid === 'nNew' })), hasEditShoot: true, aiImages: J.images, aiCuts: J.cuts });
   eq(ceOff.map((x) => x.content), ['使い方', 'LPに無い 手持ちサイズ'], '人が「撮影不要」にした画像だけで使うカットは載せない (LP に無いカットは残す)');
   // v1 の判定なら今までどおり (D の対応づけ)
@@ -508,6 +512,17 @@ console.log('② PR-C の版 (5) の依頼は claim でそのまま受ける (�
   db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ?, packet_version = 4 WHERE id = ?').run(JSON.stringify(p4), lp.sha256(lp.canonicalJson(p4)), r4.job.id);
   const c4 = lp.claimJob(db, { runnerRunId: 'run-v4', maxImages: 16, shootSpec: true });
   ok(c4.job === null && jobRow(r4.job.id).error_code === 'packet_outdated', '版 4 以下は今どおり packet_outdated');
+}
+
+console.log('⑤ queue — 古い phlp には、掴めない仕様書つきの依頼を数えない (毎分 Claude を空で起動しない)');
+{
+  const d = mkDraft();
+  const req = request(d, 'ss-key-queue');
+  const qOld = lp.queueSummary(db);
+  const qNew = lp.queueSummary(db, Date.now(), { shootSpec: true });
+  ok(qOld.claimable === 0 && qOld.waiting_runner_update === 1, `🚨 古い phlp の問い合わせ: claimable 0・waiting_runner_update 1 (${JSON.stringify([qOld.claimable, qOld.waiting_runner_update])})`);
+  ok(qNew.claimable === 1 && qNew.waiting_runner_update === 0, '新しい phlp (shoot_spec=1) には数える');
+  cancel(req.job.id);
 }
 
 console.log('⑤ miniPC の設定 — Claude は仕様書のファイルを書き換えられない');
@@ -693,6 +708,10 @@ console.log('⑤ 実行役 (phlp) の通し — 仕様書のファイル・v2 �
   const d = mkDraft();
   const req = request(d, 'ss-key-phlp');
   const id = String(req.job.id);
+  const q = await phlp({}, 'queue');
+  ok(q.code === 0 && q.json.queue.claimable === 1 && q.json.queue.waiting_runner_update === 0, '🚨 新しい phlp の queue は仕様書つきの依頼も数える (shoot_spec=1 と言う)');
+  const qOld = await call('GET', '/service-api/lp-compose/queue', undefined, { Authorization: 'Bearer test-token-lp-shoot-spec' });
+  ok(qOld.json.queue.claimable === 0 && qOld.json.queue.waiting_runner_update === 1, '言わない (古い phlp の) 問い合わせには数えない');
   const cl = await phlp({ PH_LP_RUN_ID: 'lpr-20261009-ss-phlp' }, 'claim', '--run', 'x');
   eq(cl.json?.job_id, req.job.id, '新しい phlp は仕様書つきの依頼を掴む (shoot_spec: true と言う)');
   const specFile = path.join(work, `shoot-spec-${id}.md`);

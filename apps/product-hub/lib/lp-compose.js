@@ -606,15 +606,23 @@ export function recoverExpired(db, now = Date.now()) {
 }
 
 /** キューの要約 (実行役の「仕事なし」判定・監視用) */
-export function queueSummary(db, now = Date.now()) {
+/**
+ * @param {{shootSpec?: boolean}} opts shootSpec = 問い合わせた実行役が撮影判定の仕様書 (新商品初動判定) を受け取れるか (PR-C2)。
+ *   受け取れない (古い phlp) なら、仕様書つきの依頼は claimable に数えない — claim で掴ませないので、数えるとランナーが
+ *   毎分 Claude を空で起動してしまう (Codex PR-C2 名指し2 M)。数えなかった分は waiting_runner_update に出す
+ */
+export function queueSummary(db, now = Date.now(), { shootSpec = false } = {}) {
   return db.transaction(() => {
     recoverExpired(db, now);
     const c = (sql, ...a) => db.prepare(sql).get(...a).n;
+    const withSpec = c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued' AND json_extract(packet_json, '$.shoot_spec') IS NOT NULL`);
+    const queued = c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued'`);
     return {
       enabled: lpComposeEnabled(),
       // ランナーはこれを claude --model に渡す (claude を起動する前に知る必要がある)
       model: lpComposeModel(),
-      claimable: c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'queued'`),
+      claimable: shootSpec === true ? queued : queued - withSpec,
+      waiting_runner_update: shootSpec === true ? 0 : withSpec,
       running: c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'running'`),
       needs_review: c(`SELECT COUNT(*) AS n FROM ph_lp_compose_jobs WHERE status = 'needs_review'`),
       reserved_today: c('SELECT COUNT(*) AS n FROM ph_lp_compose_generations WHERE reserved_day = ?', jstDay(now)),

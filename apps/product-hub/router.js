@@ -4451,7 +4451,8 @@ const rawField = (v, maxLen) => (typeof v === 'string' && v.length <= maxLen ? v
 const lpIdParam = (v) => (typeof v === 'string' && /^[1-9]\d*$/.test(v) ? Number(v) : 0);
 
 serviceApiRouter.get('/lp-compose/queue', (req, res) => {
-  res.json({ ok: true, queue: lpComposeQueueSummary(getDB()) });
+  // shoot_spec=1 = 撮影判定の仕様書を受け取れる実行役 (新しい phlp)。言わない古い phlp には、掴めない仕様書つきの依頼を数えない (PR-C2)
+  res.json({ ok: true, queue: lpComposeQueueSummary(getDB(), Date.now(), { shootSpec: req.query?.shoot_spec === '1' }) });
 });
 
 serviceApiRouter.post('/lp-compose/claim', (req, res) => {
