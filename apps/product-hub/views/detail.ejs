@@ -1781,12 +1781,26 @@ th.attr-unknown { color: #dc2626; }
           <% if (typeof lpImage !== 'undefined' && lpImage && lpImage.enabled) { %>
           <div id="lpi" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0;"
                data-draft-id="<%= draft.id %>">
+            <%# 作れる条件 (PR-E): 仮LP構成と撮影判定 / (撮影が要るなら) 素材が揃った。中身は画面の JS が lpi-json から入れる %>
+            <ul id="lpi-checks" style="list-style:none; padding:0; margin:0 0 6px; font-size:12px;"></ul>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
               <button type="button" class="btn" id="lpi-btn">🖼 画像を作る</button>
-              <span class="muted" id="lpi-status" style="font-size:12px;"></span>
+              <span class="muted" id="lpi-meta" style="font-size:11px;"></span>
             </div>
-            <div class="muted" id="lpi-meta" style="font-size:11px; margin-top:4px;"></div>
+            <div class="muted" id="lpi-status" style="font-size:12px; margin-top:4px;"></div>
+            <div id="lpi-head" hidden>
+              <div style="display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; margin-top:10px; font-size:12px;">
+                <b>生成した画像</b>
+                <span id="lpi-count"></span>
+                <span class="muted" id="lpi-checked"></span>
+                <a id="lpi-folder" href="#" target="_blank" rel="noopener" hidden>Drive で開く (AI初稿) ↗</a>
+              </div>
+            </div>
+            <div id="lpi-stale" hidden style="margin-top:6px; padding:4px 8px; border-radius:6px; background:#fef3c7; font-size:12px;">
+              画像を作ったあとで LP構成が変わりました。もう一度全部作ると反映されます (1 枚の再生成は前の指示のままです)
+            </div>
             <div id="lpi-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px; margin-top:8px;"></div>
+            <p class="muted" style="font-size:11px; margin:6px 0 0;">画像は画像フォルダの「AI初稿」に保存します (楽天・Amazon の商品画像には入れません)。再生成した画像は v2, v3… の新しいファイルになり、前の版も残ります。</p>
           </div>
           <script type="application/json" id="lpi-json"><%- JSON.stringify(lpImage).replace(/</g, '\\u003c') %></script>
           <% } %>
@@ -6258,130 +6272,282 @@ th.attr-unknown { color: #dc2626; }
     });
   })();
   // 🖼 画像を作る (段階2・2026-10-04)。押す → サーバの作る係が 1 枚ずつ作って Drive の「AI初稿」へ。
-  // 画面は作っている間 5 秒おきに状況を見て、できた画像からサムネイルを並べる
-  (function initLpImages() {
-    const root = document.getElementById('lpi');
-    const holder = document.getElementById('lpi-json');
-    if (!root || !holder) return;
+  // 画面は作っている間 5 秒おきに状況を見て、できた画像からカードを並べる。
+  // 画像制作の新フロー PR-E (2026-10-09): 作れる条件のチェックリスト・1 枚ずつ「確認」「再生成」・確認済み N/M
+  /* @lp-image-ui:start — test-ph-lp-image.mjs がこの間を切り出して、偽の document で動かして試す (EJS の値はここに書かない) */
+  const LPI_STATUS_TEXT = { queued: '待ち', running: '作っています…', done: 'できました', failed: '作れませんでした', skipped: '作っていません' };
+  const LPI_FORBIDDEN = '画像の生成・作り直し・確認は 画像登録者・画像作成承認者 の担当者か管理者だけです';
+  const lpiYen = (n) => Math.round(Number(n) || 0).toLocaleString() + ' 円';
+  const lpiLabel = (c) => (c.no === 0 ? '0枚目 (TOP)' : c.no != null ? c.no + '枚目' : c.seq + '番目');
+  /** 何かを作っている途中か (全部作る依頼 / 1 枚の作り直し)。途中なら 5 秒おきに見に行く */
+  function lpiRunning(s) {
+    const job = s && s.job;
+    return (!!job && (job.status === 'queued' || job.status === 'running')) || !!(s && s.regen_running)
+      || ((s && s.cards) || []).some((c) => c.pending);
+  }
+  /**
+   * 1 枚のカードの見え方 (画面に依らない)。busy = その 1 枚の依頼を送っている途中
+   */
+  function lpiCardView(c, s, busy) {
+    const canEdit = !!(s && s.can_edit);
+    const cur = c.current;
+    const remaking = c.pending && c.head_version > 1;
+    let checkTitle = '';
+    if (!canEdit) checkTitle = LPI_FORBIDDEN;
+    else if (c.pending) checkTitle = 'できてから確認できます';
+    else if (!cur) checkTitle = 'まだできていない画像は確認できません';
+    else if (c.checked) checkTitle = '確認済み: ' + (cur.checked_by || '') + ' ' + String(cur.checked_at || '').slice(0, 16).replace('T', ' ') + ' (押すと外します)';
+    else checkTitle = 'この画像を確認したら押します';
+    return {
+      rootId: c.root_id,
+      label: lpiLabel(c),
+      role: c.name || '',
+      versionText: cur && cur.version > 1 ? 'v' + cur.version : '',
+      imgSrc: cur && !c.pending ? '/apps/product-hub/api/thumb/' + encodeURIComponent(cur.drive_file_id) + '?w=320' : '',
+      openUrl: cur ? 'https://drive.google.com/file/d/' + encodeURIComponent(cur.drive_file_id) + '/view' : '',
+      placeholder: c.pending ? (remaking ? '作り直しています…' : (LPI_STATUS_TEXT[c.head_status] || c.head_status))
+        : (cur ? '' : (LPI_STATUS_TEXT[c.head_status] || c.head_status)),
+      // 新しい版が作れなかった (前の版はそのまま出す) / 1 枚もできなかった
+      error: !c.pending && c.head_error ? (cur ? '作り直せませんでした: ' : '') + c.head_error : '',
+      checked: !!c.checked,
+      checkLabel: c.checked ? '✓ 確認済み' : '確認',
+      checkDisabled: !canEdit || !cur || c.pending || !!busy,
+      checkTitle,
+      regenLabel: remaking ? '作成中…' : '再生成 (約 ' + lpiYen(c.regen_est_jpy) + ')',
+      regenDisabled: !canEdit || c.pending || !!c.regen_blocked || !!busy,
+      regenTitle: !canEdit ? LPI_FORBIDDEN : (c.regen_blocked || 'この 1 枚だけ作り直す (受付のときの指示と参考画像で。前の版は Drive に残ります・取り置き 約 ' + lpiYen(c.regen_est_jpy) + ')'),
+    };
+  }
+  /** カード以外の見え方 (ボタンの文字・押せない理由・チェックリスト・確認済み N/M) */
+  function lpiView(s, posting) {
+    const job = s.job;
+    const running = lpiRunning(s);
+    const cards = s.cards || [];
+    const checks = (s.checklist || []).map((x) => ({ ok: !!x.ok, text: x.text }));
+    const allOk = checks.every((x) => x.ok);
+    // 押したときに取り置く額 (安全側の見込み・保証ではない)。実際はふつうもっと安い
+    const est = Number(s.planned_reserve_jpy) || 0;
+    const fullRunning = !!job && (job.status === 'queued' || job.status === 'running');
+    // 出来ぐあいはカードの最新の版で見る (失敗した 1 枚を作り直せたら「できました」)。費用は作り直しの分も足す
+    const flow = s.flow_status || (job && job.status);
+    const cost = s.flow_cost_jpy != null ? Number(s.flow_cost_jpy) : (job ? Number(job.cost_jpy) || 0 : 0);
+    const mainLabel = fullRunning ? '🖼 画像を作っています…'
+      : (job ? '🖼 もう一度画像を作る (全部' + (est ? '・' + s.planned_count + ' 枚・取り置き 約 ' + lpiYen(est) : '') + ')'
+        : '🖼 画像を作る' + (est ? ' (' + s.planned_count + ' 枚・取り置き 約 ' + lpiYen(est) + ')' : ''));
+    let statusText;
+    if (!s.can_edit) statusText = LPI_FORBIDDEN;
+    else if (s.blocked && !running) statusText = (allOk ? '' : '上のチェックがそろうと押せます。') + s.blocked;
+    else if (!job) statusText = '押すと、できた構成から画像を作って画像フォルダの「AI初稿」に保存します (1 枚 1 分くらい)';
+    else {
+      const total = (job.images || []).length;
+      const done = (job.images || []).filter((im) => im.status === 'done').length;
+      statusText = fullRunning ? '画像を作っています… (' + done + ' / ' + total + ' 枚)'
+        : running ? '1 枚作り直しています…'
+        : flow === 'done' ? '画像を押すと Drive で開きます。気になる 1 枚は「再生成」で作り直せます'
+        : flow === 'partial' ? '一部だけできました' + (job.error ? ' — ' + job.error : '') + '。できなかった 1 枚は「再生成」で作れます'
+        : '作れませんでした' + (job.error ? ': ' + job.error : '');
+    }
+    const withImage = cards.filter((c) => c.current).length;
+    return {
+      running,
+      checks,
+      mainLabel,
+      mainDisabled: !s.can_edit || !!s.blocked || fullRunning || running || !!posting,
+      statusText,
+      metaText: (s.model ? s.model + ' / 品質 ' + s.quality + '・' : '') + '今月 ' + lpiYen(s.used_jpy) + ' / 上限 ' + lpiYen(s.budget_jpy)
+        + (job && cost ? '・この画像で ' + lpiYen(cost) : ''),
+      showHead: !!job && cards.length > 0,
+      countText: 'できました (' + withImage + ' / ' + cards.length + ' 枚)',
+      checkedText: '確認済み ' + (Number(s.checked_count) || 0) + ' / ' + (Number(s.checkable_count) || 0),
+      folderUrl: job && job.ai_folder_id ? 'https://drive.google.com/drive/folders/' + encodeURIComponent(job.ai_folder_id) : '',
+      stale: !!s.compose_changed,
+    };
+  }
+  /**
+   * 画面を動かす。deps = { fetchJson(url, {method, body}) → Promise<{status, json}>, confirm, setTimer, clearTimer, newKey, isHidden }
+   * (試験は偽物を渡す。本番は下の呼び出しが fetch / window.confirm / setTimeout を渡す)
+   */
+  function initLpImages(doc, deps) {
+    const root = doc.getElementById('lpi');
+    const holder = doc.getElementById('lpi-json');
+    if (!root || !holder) return null;
     let state = null;
-    try { state = JSON.parse(holder.textContent); } catch (e) { return; }
-    const draftId = root.dataset.draftId;
-    const btn = document.getElementById('lpi-btn');
-    const statusEl = document.getElementById('lpi-status');
-    const metaEl = document.getElementById('lpi-meta');
-    const gridEl = document.getElementById('lpi-grid');
-    const RUNNING = ['queued', 'running'];
-    const STATUS_TEXT = { queued: '待ち', running: '作っています…', done: 'できました', failed: '作れませんでした', skipped: '作っていません' };
+    try { state = JSON.parse(holder.textContent); } catch (e) { return null; }
+    const api = '/apps/product-hub/api/drafts/' + root.dataset.draftId + '/lp-images';
+    const $ = (id) => doc.getElementById(id);
+    const btn = $('lpi-btn');
+    const statusEl = $('lpi-status');
+    const metaEl = $('lpi-meta');
+    const gridEl = $('lpi-grid');
+    const checksEl = $('lpi-checks');
+    const headEl = $('lpi-head');
+    const staleEl = $('lpi-stale');
     let timer = null;
     let posting = false;
     let idemKey = null;
-    const newKey = () => (window.crypto?.randomUUID ? window.crypto.randomUUID()
-      : 'lpi-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
-    const yen = (n) => Math.round(Number(n) || 0).toLocaleString() + ' 円';
+    const regenKeys = {};        // 1 枚ごとの作り直しのキー (届いたか分からないときは同じキーで送り直す = 二重にならない)
+    const busy = {};             // 送っている途中の 1 枚 (root_id)
+    let cardMsg = {};            // 1 枚ごとの断られた理由 (root_id → 文)
+    let mainMsg = '';            // 「全部作る」が断られた理由。最新を取り直して描き直しても消さない (次に押すまで出す)
 
-    function tile(im) {
-      const box = document.createElement('div');
-      box.style.cssText = 'border:1px solid #e2e8f0; border-radius:8px; padding:4px; background:#fff; font-size:11px;';
-      const title = document.createElement('div');
-      title.style.cssText = 'font-weight:600; margin-bottom:2px;';
-      title.textContent = (im.no != null ? im.no + '枚目' : im.seq + '番目') + (im.name ? '｜' + im.name : '');
-      box.appendChild(title);
-      if (im.status === 'done' && im.drive_file_id) {
-        const a = document.createElement('a');
-        a.href = 'https://drive.google.com/file/d/' + encodeURIComponent(im.drive_file_id) + '/view';
-        a.target = '_blank'; a.rel = 'noopener';
-        const img = document.createElement('img');
-        img.src = '/apps/product-hub/api/thumb/' + encodeURIComponent(im.drive_file_id) + '?w=320';
-        img.alt = title.textContent; img.loading = 'lazy';
-        img.style.cssText = 'width:100%; aspect-ratio:1/1; object-fit:contain; background:#f8fafc; border-radius:6px;';
+    function el(tag, css, text) {
+      const e = doc.createElement(tag);
+      if (css) e.style.cssText = css;
+      if (text != null) e.textContent = text;
+      return e;
+    }
+    function card(c) {
+      const v = lpiCardView(c, state, busy[c.root_id]);
+      const box = el('div', 'border:1px solid ' + (v.checked ? '#86efac' : '#e2e8f0') + '; border-radius:8px; padding:4px; background:#fff; font-size:11px;');
+      box.dataset.rootId = String(c.root_id);
+      if (v.imgSrc) {
+        const a = el('a');
+        a.href = v.openUrl; a.target = '_blank'; a.rel = 'noopener'; a.title = 'Drive で開く';
+        const img = el('img', 'width:100%; aspect-ratio:1/1; object-fit:contain; background:#f8fafc; border-radius:6px;');
+        img.src = v.imgSrc; img.alt = v.label + ' ' + v.role; img.loading = 'lazy';
         a.appendChild(img);
         box.appendChild(a);
       } else {
-        const ph = document.createElement('div');
-        ph.style.cssText = 'width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; background:#f8fafc; border-radius:6px; color:#64748b; text-align:center; padding:4px;';
-        ph.textContent = STATUS_TEXT[im.status] || im.status;
-        box.appendChild(ph);
+        box.appendChild(el('div', 'width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; background:#f8fafc; border-radius:6px; color:#64748b; text-align:center; padding:4px;', v.placeholder));
       }
-      if (im.error) {
-        const er = document.createElement('div');
-        er.style.cssText = 'color:#b45309; margin-top:2px; white-space:pre-wrap;';
-        er.textContent = im.error;
-        box.appendChild(er);
+      const meta = el('div', 'display:flex; gap:4px; align-items:baseline; margin-top:3px; flex-wrap:wrap;');
+      meta.appendChild(el('b', '', v.label));
+      meta.appendChild(el('span', 'color:#475569;', v.role));
+      if (v.versionText) meta.appendChild(el('span', 'color:#94a3b8;', v.versionText));
+      box.appendChild(meta);
+      if (v.openUrl) {
+        const open = el('a', 'font-size:11px;', 'Drive で開く ↗');
+        open.href = v.openUrl; open.target = '_blank'; open.rel = 'noopener';
+        box.appendChild(open);
       }
+      const act = el('div', 'display:flex; gap:4px; margin-top:3px; flex-wrap:wrap;');
+      const cb = el('button', '', v.checkLabel);
+      cb.type = 'button'; cb.className = 'btn btn-sm'; cb.disabled = v.checkDisabled; cb.title = v.checkTitle;
+      cb.dataset.lpiAct = 'check';
+      cb.addEventListener('click', () => toggleCheck(c));
+      const rb = el('button', '', v.regenLabel);
+      rb.type = 'button'; rb.className = 'btn btn-sm'; rb.disabled = v.regenDisabled; rb.title = v.regenTitle;
+      rb.dataset.lpiAct = 'regen';
+      rb.addEventListener('click', () => regen(c));
+      act.appendChild(cb); act.appendChild(rb);
+      box.appendChild(act);
+      if (v.error) box.appendChild(el('div', 'color:#b45309; margin-top:2px; white-space:pre-wrap;', v.error));
+      if (cardMsg[c.root_id]) box.appendChild(el('div', 'color:#b91c1c; margin-top:2px; white-space:pre-wrap;', cardMsg[c.root_id]));
       return box;
     }
 
     function render(s) {
       state = s;
-      const job = s.job;
-      const running = !!job && RUNNING.includes(job.status);
-      // 押したときに取り置く額 (安全側の見込み・保証ではない)。実際はふつうもっと安い
-      const est = Number(s.planned_reserve_jpy) || 0;
-      btn.disabled = !!s.blocked || running || posting;
-      btn.textContent = running ? '🖼 画像を作っています…' : (job ? '🖼 もう一度画像を作る' : '🖼 画像を作る') + (est ? ' (' + s.planned_count + ' 枚・取り置き 約 ' + yen(est) + ')' : '');
-      metaEl.textContent = (s.model ? s.model + ' / 品質 ' + s.quality + '・' : '')
-        + '今月 ' + yen(s.used_jpy) + ' / 上限 ' + yen(s.budget_jpy)
-        + (job && job.cost_jpy ? '・この画像で ' + yen(job.cost_jpy) : '');
-      if (s.blocked && !running) statusEl.textContent = s.blocked;
-      else if (!job) statusEl.textContent = '押すと、できた構成から画像を作って画像フォルダの「AI初稿」に保存します (1 枚 1 分くらい)';
-      else {
-        const done = (job.images || []).filter((im) => im.status === 'done').length;
-        const total = (job.images || []).length;
-        statusEl.textContent = running ? '画像を作っています… (' + done + ' / ' + total + ' 枚)'
-          : job.status === 'done' ? 'できました (' + done + ' / ' + total + ' 枚)。画像を押すと Drive で開きます'
-          : job.status === 'partial' ? '一部だけできました (' + done + ' / ' + total + ' 枚)' + (job.error ? ' — ' + job.error : '')
-          : '作れませんでした' + (job.error ? ': ' + job.error : '');
+      const v = lpiView(s, posting);
+      checksEl.textContent = '';
+      for (const x of v.checks) {
+        const li = el('li', 'color:' + (x.ok ? '#166534' : '#64748b') + ';', (x.ok ? '✓ ' : '・ ') + x.text);
+        li.dataset.ok = x.ok ? '1' : '0';
+        checksEl.appendChild(li);
       }
+      btn.disabled = v.mainDisabled;
+      btn.textContent = v.mainLabel;
+      metaEl.textContent = v.metaText;
+      statusEl.textContent = mainMsg ? mainMsg + ' — ' + v.statusText : v.statusText;
+      headEl.hidden = !v.showHead;
+      $('lpi-count').textContent = v.countText;
+      $('lpi-checked').textContent = v.checkedText;
+      const folder = $('lpi-folder');
+      folder.hidden = !v.folderUrl;
+      folder.href = v.folderUrl || '#';
+      staleEl.hidden = !v.stale;
       gridEl.textContent = '';
-      for (const im of (job && job.images) || []) gridEl.appendChild(tile(im));
-      if (running) schedule(); else stop();
+      for (const c of s.cards || []) gridEl.appendChild(card(c));
+      if (v.running) schedule(); else stop();
     }
-    function stop() { if (timer) { clearTimeout(timer); timer = null; } }
-    function schedule() { stop(); timer = setTimeout(poll, 5000); }
+    function stop() { if (timer) { deps.clearTimer(timer); timer = null; } }
+    function schedule() { stop(); timer = deps.setTimer(poll, 5000); }
     async function poll() {
       stop();
-      if (document.hidden) { schedule(); return; }
+      if (deps.isHidden && deps.isHidden()) { schedule(); return; }
       try {
-        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', { headers: { Accept: 'application/json' } });
-        const json = await res.json();
-        if (json && json.ok) { render(json); return; }
+        const r = await deps.fetchJson(api);
+        if (r.json && r.json.ok) { render(r.json); return; }
       } catch (e) { /* 一時的な通信断。次の回で拾う */ }
       schedule();
+    }
+    /** 1 枚の依頼を送る (作り直し・確認)。断られたらそのカードに理由を出し、最新の状況を取り直す */
+    async function sendCard(c, url, body, onFail) {
+      busy[c.root_id] = true;
+      delete cardMsg[c.root_id];
+      render(state);
+      let r = null;
+      try { r = await deps.fetchJson(url, { method: 'POST', body }); }
+      catch (e) { r = null; }
+      delete busy[c.root_id];
+      if (r && r.json && r.json.ok) { render(r.json); return true; }
+      cardMsg[c.root_id] = r ? ((r.json && r.json.error) || '送れませんでした') : '届いたか分かりません。もう一度押してください (二重にはなりません)';
+      if (onFail) onFail(r);
+      render(state);
+      // ほかの人・別のタブが先に変えた / 作っている途中なら、最新の状況を取り直して出す
+      if (r && r.status === 409) await poll();   // 待ってから返す (押した後の画面が決まってから次の操作)
+      return false;
+    }
+    function regen(c) {
+      if (busy[c.root_id]) return;
+      if (!regenKeys[c.head_id]) regenKeys[c.head_id] = deps.newKey();
+      return sendCard(c, api + '/' + c.head_id + '/regenerate', { idempotency_key: regenKeys[c.head_id] }, (r) => {
+        // 断られた (4xx) ならキーを捨てる。届いたか分からない (通信断・5xx) ならキーを残して同じキーで送り直す
+        if (r && r.status >= 400 && r.status < 500) delete regenKeys[c.head_id];
+      });
+    }
+    function toggleCheck(c) {
+      if (busy[c.root_id] || !c.current) return;
+      return sendCard(c, api + '/' + c.current.id + '/check', { checked: !c.checked });
     }
     btn.addEventListener('click', async () => {
       if (posting) return;
       const est = Number(state.planned_reserve_jpy) || 0;
-      // 作り直しはお金がかかるので確かめる
-      if (state.job && !window.confirm('もう一度作ります。月の枠から約 ' + yen(est) + ' を取り置きます (見込み・実際はふつうもっと少ない。前の画像は Drive に残ります)。作りますか？')) return;
+      // 全部の作り直しはお金がかかるので確かめる
+      if (state.job && !deps.confirm('もう一度全部作ります。月の枠から約 ' + lpiYen(est) + ' を取り置きます (見込み・実際はふつうもっと少ない。前の画像は Drive に残りますが、「確認済み」は新しい画像で付け直しです)。作りますか？')) return;
       posting = true;
+      mainMsg = '';
       btn.disabled = true;
       statusEl.textContent = '依頼しています…';
-      if (!idemKey) idemKey = newKey();
-      try {
-        const res = await fetch('/apps/product-hub/api/drafts/' + draftId + '/lp-images', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          // 画面が見ている LP構成の版を添える (違えばサーバが断る・PR-B)
-          body: JSON.stringify({ idempotency_key: idemKey, compose_version: state.compose_version }),
-        });
-        const json = await res.json().catch(() => null);
-        posting = false;
-        if (json && json.ok) { idemKey = null; render(json); return; }
-        statusEl.textContent = (json && json.error) || '依頼できませんでした';
-        if (res.status === 409 || res.status === 400) idemKey = null;
-        btn.disabled = !!state.blocked;
-        // 別のタブで作っている最中などは、最新の状況を取り直して出す (#1612 R1 Low)
-        if (res.status === 409) poll();
-      } catch (e) {
-        posting = false;
+      if (!idemKey) idemKey = deps.newKey();
+      let r = null;
+      // 画面が見ていた「全部作る」の依頼 (PR-E) と LP構成の版 (PR-B) も送る (ほかの人・別のタブが先に変えていたら 409 で止まる)
+      try { r = await deps.fetchJson(api, { method: 'POST', body: { idempotency_key: idemKey, expected_job_id: state.latest_job_id != null ? state.latest_job_id : null, compose_version: state.compose_version } }); }
+      catch (e) { r = null; }
+      posting = false;
+      if (r && r.json && r.json.ok) { idemKey = null; render(r.json); return; }
+      if (!r) {
         btn.disabled = false;
         statusEl.textContent = '依頼できたか分かりません。もう一度押してください (二重にはなりません)';
+        return;
       }
+      mainMsg = (r.json && r.json.error) || '依頼できませんでした';
+      statusEl.textContent = mainMsg;
+      if (r.status >= 400 && r.status < 500) idemKey = null;
+      btn.disabled = lpiView(state, false).mainDisabled;
+      // 別のタブで作っている最中などは、最新の状況を取り直して出す (#1612 R1 Low)
+      if (r.status === 409) await poll();
     });
     // LP構成を直して保存したら、作る枚数・取り置き・押せるかを取り直す (PR-B・Codex PR-B 名指し M)
-    document.addEventListener('ph:lp-edit-saved', () => { if (!posting) poll(); });
+    if (doc.addEventListener) doc.addEventListener('ph:lp-edit-saved', () => { if (!posting) poll(); });
     render(state);
-  })();
+    return { render, poll, state: () => state };
+  }
+  /* @lp-image-ui:end */
+  initLpImages(document, {
+    fetchJson: async (url, opt) => {
+      const res = await fetch(url, opt && opt.method === 'POST'
+        ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(opt.body) }
+        : { headers: { Accept: 'application/json' } });
+      return { status: res.status, json: await res.json().catch(() => null) };
+    },
+    confirm: (m) => window.confirm(m),
+    setTimer: (fn, ms) => setTimeout(fn, ms),
+    clearTimer: (t) => clearTimeout(t),
+    newKey: () => (window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID()
+      : 'lpi-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10)),
+    isHidden: () => document.hidden,
+  });
   // 🤖 構成をAIに作らせる (段階1・PR1-d)。
   // 画面がするのは「押す」「状況を見る」「出す」だけ。判定も lint もサーバー側。
   // 書き戻した構成は**ここに出るだけ**で、lp-tool へは人がコピーして貼る。
