@@ -1490,8 +1490,28 @@ await ta('[33] ポータルで登録した新商品 (0052): 下書き・NE登録
   // 区分違いがある朝 (登録の不一致なし) も 0063 の知らせを消さない (#1659 Codex R1 Medium)
   const { neSummary: neSum } = await import('../apps/company-db/master-compare/run.mjs');
   const syn = { verdict: 'breach', counts: { items: 1 }, sku_kind_raw_mismatch: { alert: true, count: 1, codes: ['k001'] },
-    registrations: { written: { not_imported: [{ code: 'n901' }], not_imported_days: 3, needs_declaration: [{ code: 'j001', reason: 'jan_not_compared' }] } } };
+    registrations: { written: { not_imported: [{ code: 'n901' }], not_imported_days: 3, needs_declaration: [{ code: 'j001', reason: 'jan_not_compared' }],
+      case_mismatch: [{ code: 'Up-ABC-1', reason: 'case_mismatch', ne_spellings: ['up-abc-1'] }, { code: 'Up-X-2', reason: 'spelling_not_recorded', ne_spellings: null }] } } };
   const sl = neSum(syn);
+  // 🆕 0064 (#1667 Codex R1 High): NE のコードの書き方が配ったコード (原文) と違う / 確かめられない = 確かめない = 区分違いと並べて先頭の ⚠️ に
+  assert.match(sl, /^⚠️ ②: 区分が NE と違う SKU 1 件 \(NE の画面で直す: k001\) \/ NE のコードの書き方 \(大文字・小文字\) が配ったコードと違う・確かめられない = 確かめない 2 件 \(Up-ABC-1 NE の書き方が違う NE は up-abc-1・Up-X-2 書き方を確かめられない\)/);
+  // 🆕 (#1667 Codex R2 Medium) 書き方の問題だけ・ほかは正常 (① 差 0・② 差 0・区分も登録も正常) の朝 = 最後の要約が ⚠️ で始まる = daily-sync の isWarnSummary が警告にする (✅ で全部 OK に数えない)
+  {
+    const RUN = await import('../apps/company-db/master-compare/run.mjs');
+    const { isWarnSummary } = await import('../apps/warehouse/amazon-fees-outcome.js');
+    for (const reason of ['case_mismatch', 'case_collided', 'spelling_not_recorded']) {
+      const ne1 = { verdict: 'pass', counts: { items: 0, held: 0 }, registrations: { written: { counts: { waiting: 1 }, case_mismatch: [{ code: 'Up-ONLY-1', reason, ne_spellings: reason === 'spelling_not_recorded' ? null : ['up-only-1'] }] } } };
+      assert.equal(RUN.spellingTrouble({ ...ne1, registrations: { written: { case_mismatch: [] } } }), null);
+      assert.match(RUN.neSummary(ne1), /^⚠️ ②: NE のコードの書き方 \(大文字・小文字\) が配ったコードと違う・確かめられない = 確かめない 1 件 \(Up-ONLY-1 /, reason);
+      const line = RUN.summaryLine({ verdict: 'pass', counts: { compared: { value: 3 } }, load: { ingest_run_id: 'ld_1' }, ne: ne1 });
+      assert.match(line, /^⚠️ ②: NE のコードの書き方/, `${reason}: ${line}`);
+      assert.ok(/ \/ ✅ マスタ照合 ①: ロード ld_1 の差 0/.test(line), line);
+      assert.equal(isWarnSummary(line), true, `${reason}: daily-sync が警告にしない: ${line}`);
+      // 同じ朝で書き方の問題が無い = ✅ のまま (警告にしない)
+      const okLine = RUN.summaryLine({ verdict: 'pass', counts: { compared: { value: 3 } }, load: { ingest_run_id: 'ld_1' }, ne: { ...ne1, registrations: { written: { counts: { verified: 1 }, case_mismatch: [] } } } });
+      assert.match(okLine, /^✅ マスタ照合 ①/); assert.equal(isWarnSummary(okLine), false);
+    }
+  }
   assert.match(sl, /^⚠️ ②: 区分が NE と違う SKU 1 件/);
   assert.match(sl, /ℹ️ 配ってから 3 日たっても NE に無い \(取り込まれていないらしい\) 1 件 \(n901\)/);
   assert.match(sl, /ℹ️ NE にあるが自動では確かめない \(取り込んだと申告すると確かめる\) 1 件 \(j001 JAN\)/);
