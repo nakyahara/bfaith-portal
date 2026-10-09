@@ -34,6 +34,8 @@ import { buildPcDescriptionHtml } from '../lib/product-info-auto.js';
 // URL の検証は miniPC 側と同じものを使う (別に書くと判定がズレる)
 import { parseRakutenItemUrl } from '../../../lib/rakuten-item-page.js';
 import { resolveListingTax } from './listing-tax.mjs';
+// 🆕 まとまりのカードの出品の共通の門 (Company DB構想 20 v7 §⑤・PR-4): NE の写し待ち・2 軸のまとまりは楽天に書かない
+import { cdbGroupListingBlock } from './cdb-group-gate.js';
 // 配送方法の「値の意味」の正本 (定数と変換はこの1ファイルだけが決める)。
 // db.js のマイグレーションからも使うため、循環参照を避けて lib/ に置いてある
 import {
@@ -783,6 +785,9 @@ export async function syncSkuImagesToRms(draftId, { actor = null } = {}) {
   const db = getDB();
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { ok: false, error: 'draft_not_found' };
+  // 🆕 PR-4: 今ある楽天のページの SKU に書く = まとまりの出品の門 (NE の写し待ち・2 軸は書かない)
+  const groupBlock = cdbGroupListingBlock(db, draftId, { op: 'sku_images' });
+  if (groupBlock) return { ok: false, error: groupBlock.message, blocked: groupBlock.code };
   // 上書きされた画像を楽天へ紐づけないよう、ここでも Drive の最新状態を反映してから引く
   await refreshDriveModifiedTimes(draftId);
   const rows = db.prepare(`SELECT * FROM draft_sku_images WHERE draft_id = ? AND cabinet_location IS NOT NULL ORDER BY sku_code`).all(draftId);
@@ -1441,6 +1446,9 @@ export function buildItemPayload(db, draftId, { tax = null } = {}) {
   const trailingBanners = trailingBannerLocations(effectiveShip.group);
 
   const reasons = [];
+  // 🆕 PR-4: まとまりのカード = NE の写し待ち・2 軸のまとまりは出さない (サーバー側の共通の門。プレビュー・登録・ボードからの出品が全部ここを通る)
+  const groupBlock = cdbGroupListingBlock(db, draftId, { op: 'payload' });
+  if (groupBlock) reasons.push(groupBlock.message);
   // 既存の楽天ページに追加する商品 (2026-09-25)。ページはもうあるので出品しない —
   // 色追加のカードは商品コードが新しい色の SKU なので、出すと**別の新しいページができてしまう**。
   // 代表商品コードのカードは miniPC が 409 で断るが、理由の分かる形で先に止める
@@ -1919,6 +1927,9 @@ export function extractRmsErrors(data) {
  */
 export async function registerItem(draftId, { actor = null } = {}) {
   const db = getDB();
+  // 🆕 PR-4: まとまりの出品の門を、外への呼び出し (辞書・Drive) の前に (payload の門と同じ答え)
+  const groupBlock = cdbGroupListingBlock(db, draftId, { op: 'register' });
+  if (groupBlock) return { ok: false, reasons: [groupBlock.message], blocked: groupBlock.code };
   // 登録直前に辞書の鮮度を回復する (24h キャッシュ内なら通信なし)。
   // 失敗しても登録は止めない — 辞書が無ければ検証スキップで RMS が最終検証する
   const rkRow = db.prepare('SELECT genre_id FROM draft_rakuten WHERE draft_id = ?').get(draftId);
@@ -2126,6 +2137,11 @@ export async function setItemVisibility(draftId, { hide, actor = null } = {}) {
   const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId);
   if (!rk?.registered_at) {
     return { ok: false, error: 'このアプリから楽天に登録した商品だけ公開切替できます (先に「楽天に登録」)' };
+  }
+  // 🆕 PR-4: 公開に切り替える = 出品と同じ門 (非公開にするのは止めない)
+  if (hide !== true) {
+    const groupBlock = cdbGroupListingBlock(db, draftId, { op: 'publish' });
+    if (groupBlock) return { ok: false, error: groupBlock.message, blocked: groupBlock.code };
   }
   const mn = String(draft.ne_code).trim().toLowerCase();
   const r = await callWarehouse(

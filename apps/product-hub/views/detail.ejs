@@ -1038,6 +1038,51 @@ th.attr-unknown { color: #dc2626; }
     </div>
 
     <div style="display:grid; gap:16px; align-content:start;"><!-- 右カラム: バリエーション+参考URL -->
+    <% if (locals.cdbGroup) { const cg = locals.cdbGroup; %>
+    <!-- 🆕 まとまり (色違い・サイズ違い) のカード (Company DB構想 20 v7 §⑤・PR-4)。NE に入る前は Company DB の子の一覧が暫定の正本。
+         NE の写し待ち・2 軸のまとまりは楽天への出品を止めている (サーバー側の門 = 画面の表示だけではない) -->
+    <div class="card" id="cdb-group-card" style="border-color:#ddd6fe; background:#faf8ff;" data-state="<%= cg.state %>">
+      <h2>🧩 Company DB のまとまり <span class="muted" style="font-weight:400">(<%= cg.code %>・revision <%= cg.revision %>)</span></h2>
+      <div style="font-size:13px; margin-bottom:8px;">
+        <strong id="cdb-group-state"><%= cg.label %></strong>
+        <% if (cg.state === 'ne_waiting') { %>
+          <div class="muted">NE に子が入って、NE の写しの子の集まりと代表がこの一覧 (有効な子) とちょうど同じになると、ふつうのカードと同じに出品できます。それまでは下の一覧が暫定の正本です。</div>
+          <% if (!cg.sync.readable) { %><div class="muted">NE の写し (mirror) が読めません。</div><% } %>
+          <% if (cg.sync.missing.length) { %><div>NE にまだ無い子: <%= cg.sync.missing.join('・') %></div><% } %>
+          <% if (cg.sync.repDiffers.length) { %><div>NE の代表が違う子: <%= cg.sync.repDiffers.map((x) => `${x.code} (NE の代表 ${x.rep || '空'})`).join('・') %></div><% } %>
+          <% if (cg.sync.extra.length) { %><div>NE にだけある子: <%= cg.sync.extra.join('・') %></div><% } %>
+          <% if (cg.sync.dup.length) { %><div>NE に同じコードが 2 行以上: <%= cg.sync.dup.join('・') %></div><% } %>
+        <% } else if (cg.state === 'two_axes') { %>
+          <div class="muted">横 × 縦の 2 軸のまとまりは、product-hub が 2 軸を楽天に出せるようになるまで出品を止めています (子・軸・選択肢は保存しています)。</div>
+        <% } %>
+      </div>
+      <% if (cg.attention) { %>
+        <div id="cdb-group-attention" style="font-size:13px; border:1px solid #fdba74; background:#fff7ed; border-radius:8px; padding:8px 10px; margin-bottom:8px;">
+          ⚠ 要確認: <span id="cdb-group-attention-text"><%= cg.attention %></span>
+          <div class="muted">社内の値が変わっても、モールの出品は自動で変えていません。楽天のページを確かめてから押してください。</div>
+          <button type="button" class="btn" id="cdb-group-ack-btn" data-expected="<%= cg.attention %>">確かめた</button>
+        </div>
+      <% } %>
+      <% if (cg.axes.length) { %>
+        <div style="font-size:13px; margin-bottom:6px;">軸: <%= cg.axes.map((a) => `${a.axis === 1 ? '横' : '縦'} = ${a.name}`).join(' / ') %></div>
+      <% } %>
+      <table class="cdb-group-children" style="width:100%; font-size:12px; border-collapse:collapse;">
+        <thead><tr><th style="text-align:left">子のコード</th><th style="text-align:left">名前</th><th style="text-align:right">売価</th><% if (cg.axes.length) { %><th style="text-align:left">選択肢</th><% } %><th style="text-align:left">JAN</th></tr></thead>
+        <tbody>
+          <% const optName = (axis, code) => (cg.options.find((o) => o.axis === axis && o.code === code) || {}).name || code; %>
+          <% for (const k of cg.children) { %>
+            <tr data-code="<%= k.code %>"><td><code><%= k.code %></code></td><td><%= k.name %></td><td style="text-align:right"><%= k.price == null ? '—' : Number(k.price).toLocaleString('ja-JP') %></td>
+              <% if (cg.axes.length) { %><td><%= [k.choice1 ? optName(1, k.choice1) : null, k.choice2 ? optName(2, k.choice2) : null].filter(Boolean).join(' / ') || '—' %></td><% } %>
+              <td><%= k.jans.join(', ') || '—' %></td></tr>
+          <% } %>
+          <% if (cg.children.length === 0) { %><tr><td colspan="5" class="muted">有効な子はありません</td></tr><% } %>
+        </tbody>
+      </table>
+      <% if (cg.inactiveChildren.length) { %>
+        <div class="muted" style="font-size:12px; margin-top:6px;">無効にした子 (出品・NE との比べには使いません): <%= cg.inactiveChildren.map((k) => `${k.code} (${k.inactive_reason === 'cancelled' ? '廃止' : 'まとまりから外れた'})`).join('・') %></div>
+      <% } %>
+    </div>
+    <% } %>
     <!-- バリエーション (NE の代表商品コードで判定。NE が正・DBには焼かない) -->
     <div class="card" style="border-color:#bae6fd; background:#f8fdff;">
       <h2>🗄️ NE商品マスタから自動取得 <span class="muted" style="font-weight:400">(バリエーション判定)</span></h2>
@@ -3747,6 +3792,23 @@ th.attr-unknown { color: #dc2626; }
     });
   }
 
+
+  // 🆕 まとまりのカードの「要確認」を確かめて消す (PR-4)。画面が見ていた文を送る (その間に新しい知らせが来ていれば 409 = 開き直す)
+  const cdbGroupAckBtn = document.getElementById('cdb-group-ack-btn');
+  if (cdbGroupAckBtn) {
+    cdbGroupAckBtn.addEventListener('click', async () => {
+      cdbGroupAckBtn.disabled = true;
+      let json;
+      try {
+        json = await post(BASE + '/cdb-group/ack', { expected: cdbGroupAckBtn.dataset.expected });
+      } catch (e) {
+        json = { ok: false, error: '通信エラーで消せたか分かりません。画面を読み直して確かめてください' };
+      }
+      if (!json.ok) { cdbGroupAckBtn.disabled = false; alert(json.error || '消せませんでした'); return; }
+      const box = document.getElementById('cdb-group-attention');
+      if (box) box.remove();
+    });
+  }
 
   // 楽天ページ (既存ページに追加 / 新規ページ / 自動判定): 選択で即保存 (2026-09-25)。
   // 保存中は触らせない (続けて変えると応答の順序で表示と DB が食い違う)。失敗したら保存済みの値に戻す

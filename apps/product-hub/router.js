@@ -74,6 +74,9 @@ import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 // Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
 import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
+// 🆕 まとまり (色違い・サイズ違い) のカード (Company DB構想 20 v7 §⑤・PR-4): 取り込み・「要確認」・状態 (NE の写し待ち / 2 軸 = 出品の門)
+import { applyCdbGroupEvent, ackCdbGroupAttention } from './services/cdb-group-intake.js';
+import { cdbGroupCardView, cdbGroupBoardTags } from './services/cdb-group-gate.js';
 import { sweepCardOutbox, newEntryGate } from '../../lib/product-hub-outbox.mjs';
 import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders, getDriveWriteClient, ensureImageFolder } from './services/drive-image-folder.js';
 import {
@@ -494,6 +497,8 @@ router.get('/detail/:id', (req, res) => {
     blockLabels: GENERATION_BLOCK_CODES,
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
+    // 🆕 まとまりのカード (PR-4): NE に入る前は Company DB の子の一覧が暫定の正本・出品の門の状態・要確認
+    cdbGroup: cdbGroupCardView(db, draft.id),
     // 既存の楽天ページへの追加か (2026-09-25)。基本情報の選択欄 + ボードの札と同じ判定
     existingPage: existingPageOfDraft(db, draft.id),
     existingPageChoices: EXISTING_PAGE_CHOICES,
@@ -3206,7 +3211,7 @@ async function sweepCdbCards() {
   let timer;
   try {
     await Promise.race([
-      sweepCardOutbox((ev) => applyCdbCardEvent(ev)),
+      sweepCardOutbox((ev) => applyCdbCardEvent(ev), { applyGroup: (ev) => applyCdbGroupEvent(ev) }),
       new Promise((resolve) => { timer = setTimeout(resolve, CARD_SWEEP_WAIT_MS); }),
     ]);
   } catch (e) {
@@ -3289,6 +3294,8 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
     isAdmin: req.session?.role === 'admin',
     // Company DB の新商品の登録で、発送方法 (送料コード) に楽天の配送方法の対応が無かったカード (2026-10-01)
     cdbShippingCheck: cdbShippingCheckIds(db),
+    // 🆕 まとまりのカード (PR-4): NE の写し待ち / 2 軸 = 出品を止めている・要確認 の札
+    cdbGroupTags: cdbGroupBoardTags(db),
   });
 });
 
@@ -3514,6 +3521,18 @@ router.post('/api/drafts/:id/existing-page', (req, res) => {
     logEvent(db, draft.id, 'updated', `既存ページ: ${label(cur?.existing_page)} → ${label(value)}`, actorOf(req));
   })();
   res.json({ ok: true, ...existingPageOfDraft(db, draft.id) });
+});
+
+// 🆕 まとまりのカードの「要確認」を確かめて消す (Company DB構想 20 v7 §④・PR-4)。
+// 社内の名前・選択肢名・子が変わった / 今あるカードに結んだ = モールの出品は自動で変えていない。人が楽天のページを見て確かめたら押す。
+// expected = 画面が見ていた文 (その間に新しい知らせが来ていれば消さない)
+router.post('/api/drafts/:id/cdb-group/ack', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const expected = req.body?.expected == null ? null : String(req.body.expected);
+  const r = ackCdbGroupAttention(draft.id, { actor: actorOf(req), expected });
+  if (!r.ok) return res.status(r.changed ? 409 : 400).json(r);
+  res.json(r);
 });
 
 // 自社商品チェックの即保存 (2026-08-24)。基本情報の汎用APIとは分ける:
