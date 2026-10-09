@@ -956,13 +956,22 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   assert.equal(await dirty(p), 0, '保存の理由は数えない');
   await p.click('#checklist button:has-text("税率")');
   assert.equal(await p.evaluate(() => !!document.activeElement.closest('#f-tax_rate')), true, '① の税率を押すと税率の欄へ: ' + await p.evaluate(() => document.activeElement.outerHTML.slice(0, 120)));
-  // コードをその場で確かめる (もうある・大文字 = 使えない)
+  // コードをその場で確かめる (もうある・🆕 0064: 大文字も使える = 重なりは大文字小文字を問わず・使えない文字はその場で)
   await p.fill('#code', 's001');
   await p.waitForSelector('#code-msg.err');
   assert.match(await p.textContent('#code-msg'), /もう Company DB にあります/);
-  await p.fill('#code', 'UI-NEW');
+  await p.fill('#code', 'S001');
   await p.waitForSelector('#code-msg.err');
-  assert.match(await p.textContent('#code-msg'), /大文字は使えません/);
+  assert.match(await p.textContent('#code-msg'), /商品コード S001 はもう Company DB にあります/);
+  await p.fill('#code', 'UI-NEW');
+  await p.waitForSelector('#code-msg.ok');
+  assert.match(await p.textContent('#code-msg'), /使えます/);
+  await p.fill('#code', 'ui.new');
+  await p.waitForSelector('#code-msg.err');
+  assert.match(await p.textContent('#code-msg'), /使える文字は英字 \(大文字・小文字\)/);
+  await p.fill('#code', 'SET-ui');
+  await p.waitForSelector('#code-msg.err');
+  assert.match(await p.textContent('#code-msg'), /set- で始まるコードは使えません/);
   await p.fill('#code', 'ui-new-1');
   await p.waitForSelector('#code-msg.ok');
   await p.fill('#f-name', 'UI 新商品 1');

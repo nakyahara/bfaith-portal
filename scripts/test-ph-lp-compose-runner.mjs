@@ -80,6 +80,17 @@ const phlpWith = (extraEnv, ...args) => new Promise((resolve) => {
 const phlp = (...args) => phlpWith({}, ...args);
 
 const exists = (n) => fs.existsSync(path.join(work, n));
+
+/** 構成の fixture (0〜2枚目) に合う撮影判定 (画像制作の新フロー PR-C) */
+const SHOOT_OK = {
+  recommended: 'inhouse',
+  reason: '2枚目 の写真 (使用シーン) がありません。卓上の簡単なカットなので社内撮影で足ります。',
+  images: [
+    { no: 0, needs_shoot: false, cut: '', composition: '', props: '', background: '', tone: '', ng: '' },
+    { no: 1, needs_shoot: false, cut: '', composition: '', props: '', background: '', tone: '', ng: '' },
+    { no: 2, needs_shoot: true, cut: '玄関でスプレーする手元', composition: '斜め上から', props: '玄関マット', background: '白い床', tone: '自然光', ng: '顔を写さない' },
+  ],
+};
 const inState = (n) => fs.existsSync(path.join(state, n));
 
 // ── 材料 ──
@@ -129,6 +140,9 @@ ok(cl.json.packet.product_info.includes('ハッカ油'), '商品情報が来る'
 //    届かないと、実行役はスキルの言い回しを読むことになり、測定が「同じ入力の比較」にならない
 ok(cl.json.instruction && cl.json.instruction.includes('⑦ AI画像生成プロンプトのみを出力'),
   '🚨 claim にスタッフと同じ指示文が付いてくる');
+// 撮影判定の指示 (画像制作の新フロー PR-C) は別の欄で届く。構成の指示文には混ざらない
+ok(typeof cl.json.shoot_instruction === 'string' && cl.json.shoot_instruction.includes('needs_shoot')
+  && !cl.json.instruction.includes('needs_shoot'), '🚨 claim に撮影判定の指示が別の欄 (shoot_instruction) で付いてくる');
 
 console.log('③ images — Drive が無い環境では取れないことが分かる');
 const im = await phlp('images', jid);
@@ -195,6 +209,25 @@ console.log('⑤b lint — サーバが正本。出す前に自分で直せる (
   ok(bad.out.indexOf('lease_token') === -1, '🚨 lint の出力にも lease を混ぜない');
   eq((await phlp('lint', jid, '--file', `out-${other}.md`)).code, 2, '🚨 他の依頼の本文は lint しない');
   fs.writeFileSync(path.join(work, `out-${jid}.md`), compositionFor('ハッカ油スプレー 100ml'), 'utf8');
+
+  // 撮影判定 (PR-C): --shoot で結果と同じ検査を先に受けられる (AI 枠を使わない)
+  fs.writeFileSync(path.join(work, `shoot-${jid}.json`), JSON.stringify(SHOOT_OK, null, 2), 'utf8');
+  const ls = await phlp('lint', jid, '--file', `out-${jid}.md`, '--shoot', `shoot-${jid}.json`);
+  ok(ls.code === 0 && ls.json.lint.ok === true && ls.json.shoot?.ok === true, `撮影判定つきの lint が通る (${JSON.stringify(ls.json?.shoot)})`);
+  fs.writeFileSync(path.join(work, `shoot-${jid}.json`), JSON.stringify({ ...SHOOT_OK, recommended: 'none' }), 'utf8');
+  const lsBad = await phlp('lint', jid, '--file', `out-${jid}.md`, '--shoot', `shoot-${jid}.json`);
+  ok(lsBad.code === 1 && lsBad.json.lint.ok === true && lsBad.json.shoot.ok === false && lsBad.json.shoot.errors.length > 0,
+    '🚨 撮影判定の形が違えば exit 1 で何が悪いかを返す (構成の lint は通ったまま)');
+  fs.writeFileSync(path.join(work, `shoot-${jid}.json`), '{"recommended": "inhouse", 壊れた', 'utf8');
+  const lsBroken = await phlp('lint', jid, '--file', `out-${jid}.md`, '--shoot', `shoot-${jid}.json`);
+  ok(lsBroken.code === 2 && /JSON ではありません/.test(lsBroken.err), 'JSON として読めない撮影判定は送らずに止める');
+  fs.writeFileSync(path.join(work, `shoot-${other}.json`), JSON.stringify(SHOOT_OK), 'utf8');
+  eq((await phlp('lint', jid, '--file', `out-${jid}.md`, '--shoot', `shoot-${other}.json`)).code, 2, '🚨 他の依頼の撮影判定は読まない');
+  eq((await phlp('lint', jid, '--file', `out-${jid}.md`, '--shoot', `../shoot-${jid}.json`)).code, 2, '🚨 パス付きの撮影判定は読まない');
+  // 🚨 深く入れ子にした JSON は送る前に止める (送るときの JSON.stringify が溢れて result が届かないのを防ぐ・Codex PR-C 名指し3 High)
+  fs.writeFileSync(path.join(work, `shoot-${jid}.json`), '{"recommended":"inhouse","extra":' + '{"a":'.repeat(5000) + '1' + '}'.repeat(5000) + '}', 'utf8');
+  const lsDeep = await phlp('lint', jid, '--file', `out-${jid}.md`, '--shoot', `shoot-${jid}.json`);
+  ok(lsDeep.code === 2 && /入れ子が深すぎます/.test(lsDeep.err), '🚨 入れ子が深すぎる撮影判定は送らずに止める (--shoot を外せば構成は出せる)');
 }
 
 console.log('⑥ result — lint と証跡はサーバが見る');
@@ -216,9 +249,21 @@ eq((await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint',
 // サーバが実際に配ったときだけ通る
 const leaseTok = db.prepare('SELECT lease_token FROM ph_lp_compose_jobs WHERE id = ?').get(req.job.id).lease_token;
 lp.recordImageServed(db, req.job.id, { leaseToken: leaseTok, fileId: 'FILEIDTOP001', sha256: 'b'.repeat(64), bytes: 4321 });
-const good = await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint', `lint-${jid}.json`, '--rounds', '1');
+// 撮影判定のファイルが JSON として壊れていれば、結果ごと送らない (出す前なら直せる)
+fs.writeFileSync(path.join(work, `shoot-${jid}.json`), '{壊れた', 'utf8');
+const brokenShoot = await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint', `lint-${jid}.json`, '--rounds', '1', '--shoot', `shoot-${jid}.json`);
+ok(brokenShoot.code === 2 && db.prepare('SELECT status FROM ph_lp_compose_jobs WHERE id = ?').get(req.job.id).status === 'running',
+  '🚨 JSON として読めない撮影判定なら送らずに止める (依頼は running のまま・直して出し直せる)');
+fs.writeFileSync(path.join(work, `shoot-${jid}.json`), JSON.stringify(SHOOT_OK), 'utf8');
+const good = await phlp('result', jid, '--accepted', '--file', `out-${jid}.md`, '--lint', `lint-${jid}.json`, '--rounds', '1', '--shoot', `shoot-${jid}.json`);
 eq(good.code, 0, 'サーバが配っていれば通る');
 eq(good.json.status, 'done', 'done になる');
+eq(good.json.shoot, { status: 'saved' }, '撮影判定 (shoot-ID.json) も送って保存された');
+{
+  const row = db.prepare('SELECT output_text, shoot_json FROM ph_lp_compose_jobs WHERE id = ?').get(req.job.id);
+  ok(JSON.parse(row.shoot_json).recommended === 'inhouse' && !row.output_text.includes('needs_shoot'),
+    '🚨 撮影判定は別の列。⑦の本文には入らない');
+}
 eq(good.json.receipt.images[0].sha256, 'b'.repeat(64), '🚨 証跡はサーバの記録 (実行役が書いた値ではない)');
 
 console.log('⑥b reviewdata — 検品に渡すデータを CLI が組み立てる (codex exec review P1)');
@@ -237,7 +282,7 @@ console.log('⑦ clean — 一時ファイルを全部消す (rm は使えない
 fs.writeFileSync(path.join(work, `_lp_review_${jid}.md`), 'レビュー用', 'utf8');
 const cleaned = await phlp('clean', jid);
 eq(cleaned.code, 0, 'clean が通る');
-for (const n of [`spec-${jid}.md`, `out-${jid}.md`, `imgs-${jid}.json`, `seen-${jid}.md`, `lint-${jid}.json`, `_lp_review_${jid}.md`]) {
+for (const n of [`spec-${jid}.md`, `out-${jid}.md`, `imgs-${jid}.json`, `seen-${jid}.md`, `lint-${jid}.json`, `_lp_review_${jid}.md`, `shoot-${jid}.json`]) {
   ok(!exists(n), `${n} が消えた`);
 }
 ok(!inState(`lease-${jid}.json`), 'state/ の lease も消える');
@@ -329,9 +374,68 @@ console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検�
   fs.writeFileSync(path.join(work, `reason-${rj}.txt`), '2 巡目に high が残った', 'utf8');
   const resRj = await phlp('result', rj, '--rejected', '--reason-file', `reason-${rj}.txt`, '--file', `out-${rj}.md`, '--rounds', '2');
   ok(resRj.code === 0 && resRj.json.status === 'failed', 'rejected で返せる');
+  eq(resRj.json.shoot, { status: 'not_sent' }, '--shoot を付けなければ撮影判定は送らない (今どおり)');
   eq(db.prepare('SELECT output_text FROM ph_lp_compose_jobs WHERE id = ?').get(rRj.job.id).output_text, '# LP制作システム\n(下書き)',
     '🚨 --file で送った下書きがサーバに残る (画面で人が判断する)');
   await phlp('clean', rj);
+}
+
+console.log('⑪ 撮影判定 (PR-C) — あり / なし / 形が違う のどれでも構成は今どおり受け取られる');
+{
+  /** 新しい依頼を掴んで予約し、画像を配った記録を入れる (Drive が無いので記録を直接入れる) */
+  const prep = async (ne, fileId) => {
+    const d = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES (?, 'ハッカ油スプレー 100ml', 'test')`).run(ne).lastInsertRowid);
+    const r = lp.requestJob(db, {
+      draft: db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(d), spec, productInfo: '天然ハッカ油。', colorVariations: '',
+      images: [{ file_id: fileId }], idempotencyKey: 'runner-shoot-' + ne, actor: 'nakahara@x',
+    });
+    const id = String(r.job.id);
+    const c = await phlpWith({ PH_LP_RUN_ID: 'lpr-20261009-shoot-' + ne }, 'claim', '--run', 'x');
+    if (c.json?.job_id !== r.job.id) throw new Error('claim が別の依頼を掴んだ: ' + c.out);
+    const rv = await phlpWith({ PH_LP_MODEL: lp.DEFAULT_MODEL }, 'reserve', id);
+    if (rv.code !== 0) throw new Error('reserve: ' + rv.out + rv.err);
+    lp.recordImageServed(db, r.job.id, { leaseToken: db.prepare('SELECT lease_token FROM ph_lp_compose_jobs WHERE id = ?').get(r.job.id).lease_token, fileId, sha256: 'd'.repeat(64), bytes: 10 });
+    fs.writeFileSync(path.join(work, `out-${id}.md`), compositionFor('ハッカ油スプレー 100ml'), 'utf8');
+    fs.writeFileSync(path.join(work, `lint-${id}.json`), JSON.stringify({ ok: true }), 'utf8');
+    return { id, jobId: r.job.id };
+  };
+  const row = (jobId) => db.prepare('SELECT status, output_text, shoot_json, shoot_error FROM ph_lp_compose_jobs WHERE id = ?').get(jobId);
+
+  // 撮影判定の指示を返さないサーバ (Render のデプロイ前に miniPC を新しくした場合) を、packet から指示を抜いて模す。
+  // claim は shoot_instruction: null を出す → スキルは撮影判定を書かない (--shoot も付けない)
+  {
+    const dOld = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('LP-SH-OLDSRV', 'ハッカ油スプレー 100ml', 'test')`).run().lastInsertRowid);
+    const rOld = lp.requestJob(db, {
+      draft: db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(dOld), spec, productInfo: '天然ハッカ油。', colorVariations: '',
+      images: [{ file_id: 'FILEIDSHOLD1' }], idempotencyKey: 'runner-shoot-oldsrv', actor: 'nakahara@x',
+    });
+    const p = JSON.parse(rOld.job.packet_json);
+    delete p.shoot_instruction;
+    db.prepare('UPDATE ph_lp_compose_jobs SET packet_json = ?, packet_hash = ? WHERE id = ?').run(JSON.stringify(p), lp.sha256(lp.canonicalJson(p)), rOld.job.id);
+    const cOld = await phlpWith({ PH_LP_RUN_ID: 'lpr-20261009-shoot-oldsrv' }, 'claim', '--run', 'x');
+    ok(cOld.json?.job_id === rOld.job.id && cOld.json.shoot_instruction === null && typeof cOld.json.instruction === 'string',
+      '撮影判定の指示が無いサーバでも claim でき、shoot_instruction は null (撮影判定を書かない合図)');
+    await phlp('release', String(rOld.job.id), '--reason', '試験の片付け');
+    await phlp('clean', String(rOld.job.id));
+    db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE id = ?`).run(rOld.job.id);
+  }
+
+  const a = await prep('LP-SH-BAD', 'FILEIDSHBAD1');
+  fs.writeFileSync(path.join(work, `shoot-${a.id}.json`), JSON.stringify({ ...SHOOT_OK, images: SHOOT_OK.images.slice(1) }), 'utf8');
+  const ra = await phlp('result', a.id, '--accepted', '--file', `out-${a.id}.md`, '--lint', `lint-${a.id}.json`, '--rounds', '1', '--shoot', `shoot-${a.id}.json`);
+  ok(ra.code === 0 && ra.json.status === 'done', '🚨 形の違う撮影判定 (画像が足りない) でも構成は done');
+  ok(ra.json.shoot?.status === 'invalid' && /撮影判定がありません/.test(ra.json.shoot.error || ''), `撮影判定だけ使わず、理由を返す (${ra.json.shoot?.error})`);
+  ok(row(a.jobId).shoot_json === null && !!row(a.jobId).shoot_error && row(a.jobId).output_text.includes('# 0枚目'), '構成は保存・撮影判定は理由だけ');
+  await phlp('clean', a.id);
+
+  const b = await prep('LP-SH-NONE', 'FILEIDSHNON1');
+  // 前に作った shoot-ID.json が残っていても、--shoot を付けなければ読まない (勝手に送らない)
+  fs.writeFileSync(path.join(work, `shoot-${b.id}.json`), JSON.stringify(SHOOT_OK), 'utf8');
+  const rb = await phlp('result', b.id, '--accepted', '--file', `out-${b.id}.md`, '--lint', `lint-${b.id}.json`, '--rounds', '1');
+  ok(rb.code === 0 && rb.json.status === 'done' && rb.json.shoot?.status === 'not_sent', '撮影判定なし (--shoot を付けない) でも今どおり done');
+  ok(row(b.jobId).shoot_json === null && row(b.jobId).shoot_error === null, '撮影判定の列は空のまま (= 送られていない)');
+  const cleaned2 = await phlp('clean', b.id);
+  ok(cleaned2.json.removed.includes(`shoot-${b.id}.json`), 'clean が撮影判定のファイルも消す');
 }
 
 server.close();

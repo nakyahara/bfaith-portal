@@ -58,14 +58,14 @@
   }
 
   /* ---------- ① ② ③ ---------- */
-  var CODE_RE = /^[a-z0-9_-]{1,30}$/;
+  // 🆕 2026-10-08 夜 (Company DB構想 20 §③・0064): 大文字も使える。サーバーの validateNewSkuCode と同じ決まり (重なりはサーバーが小文字にそろえて確かめる)
+  var CODE_RE = /^[A-Za-z0-9_-]{1,30}$/;
   var codeState = { code: null, ok: null, message: '' };   // サーバーの確かめ (打った文字ごと)
   function codeShape(s) {
     if (!s) return '商品コードを入れてください';
     if (s !== s.trim()) return '前後に空白があります';
-    if (/[A-Z]/.test(s)) return '大文字は使えません (新しいコードは小文字だけ)';
-    if (!CODE_RE.test(s)) return '使える文字は小文字の英字・数字・- と _ だけ (30 字まで)';
-    if (/^set-/.test(s)) return 'set- で始まるコードは使えません';
+    if (!CODE_RE.test(s)) return '使える文字は英字 (大文字・小文字)・数字・- と _ だけ (30 字まで)';
+    if (/^set-/i.test(s)) return 'set- で始まるコードは使えません';
     return '';
   }
   function segVal(id) { var s = document.getElementById(id); return s ? s.getAttribute('data-value') || '' : ''; }
@@ -520,7 +520,7 @@
           msg('登録しました (下書き)。' + code + ' の画面を開いています…', 'ok');
           var warns = (x.j.warnings || []).slice();
           if (x.j.card && x.j.card.status !== 'done') warns.push('product-hub の出品カード: ' + (x.j.card_label || x.j.card.status) + ' (商品の画面の「カードをもう一度作る」か、product-hub のボードを開くと作り直します)');
-          try { sessionStorage.setItem(NOTE_KEY, JSON.stringify({ code: String(code).toLowerCase(), at: Date.now(), j: { replayed: !!x.j.replayed, changed: [], derived: [], ne_steps: x.j.ne_steps || [], warnings: warns } })); } catch (e) { /* 置けない = 知らせを出さないだけ */ }
+          try { sessionStorage.setItem(NOTE_KEY, JSON.stringify({ code: String(code), at: Date.now(), j: { replayed: !!x.j.replayed, changed: [], derived: [], ne_steps: x.j.ne_steps || [], warnings: warns } })); } catch (e) { /* 置けない = 知らせを出さないだけ */ }
           var url = BASE + '/sku/' + encodeURIComponent(code);
           if (ME.replacePage) ME.replacePage(url); else location.replace(url);
           return;

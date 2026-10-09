@@ -74,21 +74,22 @@ export const MAX_IMAGES = 10;
  *    検査 4〜7 を通ってしまった。仕様書は `# N枚目｜役割名` と階層ごと決めている
  *    (lp-tool の取込互換のため)。
  */
-const IMAGE_HEADING_RE = /^#(?!#)\s*([0-9０-９]+)\s*枚目\s*[｜|]\s*(.+?)\s*$/;
+export const IMAGE_HEADING_RE = /^#(?!#)\s*([0-9０-９]+)\s*枚目\s*[｜|]\s*(.+?)\s*$/;
 /** `# 共通…` のブロック見出し (H1 ちょうど) */
-const BLOCK_HEADING_RE = /^#(?!#)\s*(.+?)\s*$/;
+export const BLOCK_HEADING_RE = /^#(?!#)\s*(.+?)\s*$/;
 /**
  * 画像ブロックの中の `## 見出し` (H2 ちょうど)。
  * 🚨 `###` を拾わない — 「詳細レイアウト」の中には
  *    `### キャンバス構成` のような小見出しが入る (仕様書のテンプレートそのもの)。
  *    `^##` だけだと `### X` を「## 見出し `# X`」として数えてしまい、検査 7 が誤って落ちる
  */
-const SUB_HEADING_RE = /^##(?!#)\s*(.+?)\s*$/;
+export const SUB_HEADING_RE = /^##(?!#)\s*(.+?)\s*$/;
+// ↑ 見出しの決まり (IMAGE / BLOCK / SUB) と sameHeading は lib/lp-edit.js (構成の確認・修正) もブロックの切り出しに使う (export)
 
 const toHalfWidth = (s) => String(s).replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
 const normalize = (s) => String(s == null ? '' : s).replace(/\r\n?/g, '\n');
 /** 「・」と半角中黒の差で落とさない (パーサーも両方許している) */
-const sameHeading = (a, b) => String(a).replace(/[･・]/g, '・').trim() === String(b).replace(/[･・]/g, '・').trim();
+export const sameHeading = (a, b) => String(a).replace(/[･・]/g, '・').trim() === String(b).replace(/[･・]/g, '・').trim();
 
 /**
  * 構成の全文を検査する。

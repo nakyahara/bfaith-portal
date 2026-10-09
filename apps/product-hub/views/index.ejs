@@ -78,6 +78,8 @@
         商品ハブの「🤖 構成をAIに作らせる」が読む仕様書です。Google スプレッドシートの
         <strong>「LP制作システム」を .xlsx でダウンロードして、そのまま上げてください</strong>
         (全タブがテキストになって AI に渡ります)。
+        撮影判定 (撮影不要 / 社内撮影 / カメラマン撮影 と撮影カット) は<strong>「新商品初動判定」</strong>で決めます。
+        種類で「新商品初動判定」を選んで同じように上げてください (上げるまでは簡単な決まりで判定します)。
         <br>
         🚨 <strong>差し替えると、以降に作る全商品の生成内容が変わります。</strong>
         中身が前と同じなら版は増えません。受付済みの依頼は<strong>受付時の版</strong>を使い続けます。
@@ -92,8 +94,25 @@
         <% } else { %>
           いまの版: <strong style="color:#b45309">まだありません</strong> — 上げるまでボタンは押せません
         <% } %>
+        <br>
+        <%# 撮影判定の仕様書 (画像制作の新フロー PR-C2・2026-10-09) %>
+        <span id="lpspec-shoot-now">
+        <% if (lpSpec.shootSpec) { %>
+          新商品初動判定 (撮影判定): <strong>#<%= lpSpec.shootSpec.id %></strong> <%= lpSpec.shootSpec.title %>
+          ／ <%= String(lpSpec.shootSpec.imported_at).slice(0, 16).replace('T', ' ') %> <%= lpSpec.shootSpec.imported_by %>
+          ／ <%= lpSpec.shootSpec.chars.toLocaleString() %> 文字
+          ／ タブ: <%= lpSpec.shootSpec.sheet_titles.join('・') %>
+          ／ hash <code><%= lpSpec.shootSpec.hash_short %></code>
+        <% } else { %>
+          新商品初動判定 (撮影判定): <strong style="color:#b45309">まだありません</strong> — 上げるまでは AI の撮影判定は簡単な決まりで出ます
+        <% } %>
+        </span>
       </div>
       <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <select id="lpspec-kind" style="width:auto;" aria-label="仕様書の種類">
+          <option value="product_analysis" selected>LP制作システム (構成)</option>
+          <option value="initial_judge">新商品初動判定 (撮影判定)</option>
+        </select>
         <input type="file" id="lpspec-file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="width:auto;">
         <button class="btn btn-primary btn-sm" id="lpspec-upload-btn">取り込む</button>
         <span class="muted" id="lpspec-result" style="font-size:12px;"></span>
@@ -299,36 +318,53 @@
   // ─── NE取込の手動実行 (admin。cron を待たずシード/取込を回す) ───
   // LP構成の仕様書の取り込み (段階1・admin だけ)。
   // 🚨 これは **AI への指示そのもの**。差し替える = 以降の全商品の生成内容が変わるので確認を挟む。
-  const lpspecBtn = document.getElementById('lpspec-upload-btn');
-  if (lpspecBtn) {
-    lpspecBtn.addEventListener('click', async () => {
-      const out = document.getElementById('lpspec-result');
-      const fileEl = document.getElementById('lpspec-file');
+  /* @lpspec-upload:start — 仕様書の取り込み (段階1・種類を選べるようにしたのは画像制作の新フロー PR-C2)。
+     試験 (scripts/test-ph-lp-compose-shoot-spec.mjs) がこの間を切り出して、偽の document で動かす (EJS の値はここに書かない) */
+  /** 選んだ種類 → 送る kind と確認に出す名前。知らない値は LP制作システム (今までの既定) */
+  function lpSpecKindOf(value) {
+    return value === 'initial_judge'
+      ? { kind: 'initial_judge', label: '撮影判定の仕様書「新商品初動判定」' }
+      : { kind: 'product_analysis', label: 'LP構成の仕様書「LP制作システム」' };
+  }
+  function initLpSpecUpload(doc, env) {
+    const btn = doc.getElementById('lpspec-upload-btn');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      const out = doc.getElementById('lpspec-result');
+      const fileEl = doc.getElementById('lpspec-file');
+      const kindEl = doc.getElementById('lpspec-kind');
       const f = fileEl.files && fileEl.files[0];
       if (!f) { out.textContent = '.xlsx を選んでください'; return; }
       if (!/\.xlsx$/i.test(f.name)) { out.textContent = '.xlsx だけです (.xls や .csv は読めません)'; return; }
-      if (!confirm('「' + f.name + '」を LP構成の仕様書として取り込みます。\n\n🚨 以降に作る全商品の AI 生成の内容が変わります。\n(受付済みの依頼は受付時の版を使い続けます)\n\nよろしいですか?')) return;
-      lpspecBtn.disabled = true;
+      // 🚨 種類を取り違えると AI が別の仕様書で書く。確認に種類の名前を出す
+      const k = lpSpecKindOf(kindEl ? kindEl.value : '');
+      if (!env.confirm('「' + f.name + '」を ' + k.label + ' として取り込みます。\n\n🚨 以降に作る全商品の AI 生成の内容が変わります。\n(受付済みの依頼は受付時の版を使い続けます)\n\nよろしいですか?')) return;
+      btn.disabled = true;
       out.textContent = '取り込み中…';
       try {
         const buf = await f.arrayBuffer();
-        const q = new URLSearchParams({ kind: 'product_analysis', title: f.name.replace(/\.xlsx$/i, '') });
-        const res = await fetch('/apps/product-hub/api/lp-specs?' + q.toString(), {
+        const q = new URLSearchParams({ kind: k.kind, title: f.name.replace(/\.xlsx$/i, '') });
+        const res = await env.fetch('/apps/product-hub/api/lp-specs?' + q.toString(), {
           method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: buf,
         });
         const j = await res.json();
-        if (!j.ok) { out.textContent = ''; alert(j.error || '取り込めませんでした'); return; }
+        if (!j.ok) { out.textContent = ''; env.alert(j.error || '取り込めませんでした'); return; }
         out.textContent = j.created
-          ? '✅ 取り込みました (版 #' + j.spec.id + '・' + j.spec.chars.toLocaleString() + ' 文字・タブ ' + j.spec.sheet_titles.length + ')'
+          ? '✅ ' + k.label + ' を取り込みました (版 #' + j.spec.id + '・' + j.spec.chars.toLocaleString() + ' 文字・タブ ' + j.spec.sheet_titles.length + ')'
           : 'ℹ️ 中身が前と同じだったので、版は増えていません (いまの版 #' + j.spec.id + ')';
-        setTimeout(() => location.reload(), 2500);
+        env.reloadSoon();
       } catch (e) {
         out.textContent = '通信エラー: ' + e.message;
       } finally {
-        lpspecBtn.disabled = false;
+        btn.disabled = false;
       }
     });
   }
+  /* @lpspec-upload:end */
+  initLpSpecUpload(document, {
+    fetch: (u, o) => fetch(u, o), confirm: (m) => confirm(m), alert: (m) => alert(m),
+    reloadSoon: () => setTimeout(() => location.reload(), 2500),
+  });
 
   const intakeBtn = document.getElementById('intake-run-btn');
   if (intakeBtn) {
