@@ -657,6 +657,22 @@ node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain --a
 - `scripts/test-master-decisions-ui.mjs` [16] (直す値)
 - `scripts/test-master-baseline.mjs` [15] (0037)
 
+### 代表 (親) の生の数えと門 (0068。AI_reference CompanyDB構想/20 v7 §②・§⑥・§⑩ PR-6)
+
+代表 (`products.parent`) の持ち主を Company DB に広げる前に、今の代表のずれを数えて直して 0 にしてから広げる (中原さんの決定 10/8 夜・差を残したまま広げる承認はやめた)。広げた後は、毎朝の数えが 0 でなければ新しい NE 登録の CSV を閉じる。
+
+- **6 つの数え** (`ops.parent_raw_gate`・単品だけ・1 つの単品は 1 つだけ・上から): `parent_loop` (親を辿ると循環) / `parent_two_level` (親も親を持つ・自分も子を持つ) / `parent_incomparable` (NE の代表が分からない: 取得に無い・取込で保持・NE ではセット・元の値が不明) / `parent_ambiguous` (NE の代表が社内の 2 つ以上の商品に当たる・NE の代表の書き方が 2 つ以上 = 元の書き方は `代表商品コード_src` から戻す (保存の値は小文字)・NE のコードの元の書き方 (raw_ne_code_spellings) の代表の名前空間の衝突も) / `parent_missing` (NE に代表があるのに社内に親が無い) / `parent_mismatch` (NE の代表 ≠ 社内の親の display_code の norm)
+- **数える対象 = 判定表** (登録の状態 × その SKU の最新の品目の状態): 品目が partial = 数える / cancelled = 外す / quarantined = 数える / draft・ne_pending は 品目なし・built・superseded = 外す (draft)・issued・import_declared = 外す (登録の確かめ = 3 者一致で見る)・failed = 外す (復旧中)・verified = 数える / それ以外 (ne_confirmed・available・backfill・状態の行なし) = 数える。セット・例外 = 外す。外した数は証跡 (excluded) に
+- **承認で減らない**: 数えは判断の台帳を読まない。判断の画面の「差を残す」は代表 (`col = parent`) の候補には出さない・前からの候補でも DB が断る (`parent_no_accept`・trigger)。代表の候補の承認の指紋は意味の版を変えた (`+parent_raw@1` = 前の承認は新しい候補に効かない = もう一度判断する)
+- **照合 ② が毎朝残す** (`ops.record_parent_gate`・watch_writer): ② が最後まで走った回だけ・結果の JSON を書いた後 (sha256 = 封)・新商品のゲートの記録の後。NE の観測 (完全な取得の単品の代表) を渡し、**DB が自分で数える** (呼び手の数は受けない)。取得は今日 (JST) だけ・同じ回は 1 回。表 `ops.master_parent_gate_results` は追記だけ。**確かめられない回は記録しない = 許可の一覧** (`parentObsTrust`・#1676 Codex R4: 取得の件数 (単品・セットとも ok・同じ取得・落とした行 0・重なり 0)・取込の整合 (行の落ち・C1 のセットの行の欠けが無い)・区分のゲートの integrity_untrusted = 0・代表の台帳が ok の全部が**明示的に ok** のときだけ。知らない印は一覧に足すまで閉じる。SQL も trust の鍵の集合と全部 ok を確かめて `ne_untrusted` で断る。② が観測を作る前に blocked / error の朝も持ち主を読んで知らせる (company = ⚠️・load = ℹ️・0068 の前だけ黙る)): NE のコードの元の書き方 (raw_ne_code_spellings) の代表の台帳を読めない回 (未収集・行の数が違う・知らない版 ほか)・**代表に 1 件でも invalid (壊れた記録・全角・正規化の不一致) がある回**・**NE の取得で行が落ちた回 (C1 の形のセットの行の欠け `c1_set_rows_dropped`・コードの無い行など `ne_rows_dropped`。SQL は `ne_rows_dropped` で断る)** (観測の `rep_spellings` = unavailable + 理由・SQL も `spellings_unavailable` で断る = 0 件の記録で門・widen を開けない = company なら閉じたまま。照合そのものは止めない = load は ℹ️・company は ⚠️)。drift-list も止まる
+- **門** (`ops.parent_gate_state()`・品目の表の trigger `trg_ne_reg_items_parent_gate`): **products.parent の持ち主 (DB の active) が company のときだけ** 新しい一般の CSV を作る (品目の insert)・配る (built → issued) を閉じる。閉じる = 一番新しい記録が無い・その回が今の新商品の許可の回 (一番新しいゲートの結果) と違う・今日でない・6 つのどれかが 0 でない。
+  **通す** = 配ったファイルの再取得・申告・照合・使わない・failed (品目の insert / built → issued 以外は見ない)・**作り直し** (その SKU の前の品目 (superseded を除く) が failed = 取り込めなかった商品だけ)・夜間ロード (止めない)
+  - 🚨 **持ち主が load の間 (今) は閉じない** = 数えて朝の要約に出すだけ (今の単品の登録を止めない・設計 v7 §⑩「門は company の後」)
+- **朝の要約**: ずれ (6 つのどれか > 0) = どの持ち主でも要約の先頭が ⚠️ (load = 「知らせだけ」・company = 「新しい NE 登録の CSV は閉じた」)。load の朝で、もう ⚠️ で始まる朝は後ろに足す。記録できない = company なら ⚠️ (閉じたまま)・load なら ℹ️。持ち主は重い数えと別に門の状態 (`ops.parent_gate_state`) で読み直す。持ち主も分からない朝 = company と同じ ⚠️ (「持ち主は夜間ロード」と言わない)。ロードの完了 (①)・照合の失敗 (②) とは別の知らせ
+- **一覧** (読むだけ・watcher): `node apps/company-db/master-compare/drift-list.mjs [--class parent_mismatch] [--limit 200] [--json]` (env COMPANY_DB_WATCH_URL・DATA_DIR)。1 件ずつ「NE と社内のどちらが正しいか」を決めて直す (NE を正 = 持ち主 load の間に夜間ロードが直す / 社内を正 = NE の画面で人が直す・翌朝の照合で確かめる)
+- **widen の判定** (`ops._widen_judge`・products.parent を足す試みだけ): 一番新しい記録の 6 つ = 0・prepared のロードの commit の後の記録・照合が読んだ材料の世代 = prepared のロードの材料の世代・NE の取得の完了が手の入口 (ne:item-screen) の停止の後・全部の商品の 2 段 / 循環 = 0 (`ops.parent_structure_counts`・その場で数える)。広げてよいキー = listing_components.amazon・products.parent・skus.sku_kind
+- 試験 = `node scripts/test-master-parent-gate.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-parent-gate-pg.mjs` (ロール・widen・本物の trigger)
+
 ### NE に取り込む CSV (0040。10 §6.1.1「③b NE に取り込む CSV の契約 v3」)
 
 判断の画面で **NE を直す** (fix_ne) と承認した差を、NE の一括登録 (商品管理の一括登録) で取り込む CSV にする。画面 = `/apps/master-decisions/csv` (Render だけ・操作は名簿の人だけ)。
@@ -2438,3 +2454,9 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   widen の前に `select ops.reserve_existing_variation_groups('<人>');` (DB の持ち主だけ・何回でも同じ) を流し直せる
 - 当て方 (🚨 まだ流さない): 0066 の後・上の事前検査の数 → `migrate.mjs --dry-run` (0067 だけが出る) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs`・
   master_edit に 9 つの関数とまとまりの表の読み取り。流さなくても今の動きは変わらない) → `select ops.variation_reservation_check();` と予約の数を見る。Render と migration の順はどちらでもよい (lib の `regMaterialOf` は予約の表が無ければ読まない・まとまりの関数は company の後でないと動かない)
+
+### まとめての登録の要求のハッシュ (0069・2026-10-10。AI_reference CompanyDB構想/20 v7 §⑩ の PR-7・#1679 Codex R1 Medium 1。🚨 0067 は本番に適用済み = 本文は変えない)
+- **なぜ**: 0067 の `ops.variation_batches.spec_hash` は まとまり・軸・選択肢・子のコードと選択肢 だけ。画面は子の名前・売価・原価・JAN・出品カードの欄・理由も送る = 同じ request_id でそれらだけを変えた押し直しに前の答えが返っていた。
+- **表** `ops.variation_batch_requests` (request_id = まとめての登録・人・要求の全部のハッシュ (lib/master-variation.mjs の `variationPayloadHashOf`)・追記だけ)。**関数** `ops.variation_batch_record_request(request_id, actor, hash)` = この取引で開いた (閉じる前の) まとめての登録・開いた人だけ・1 回だけ書く (security definer・画面のロールに実行だけ・表は読むだけ)。
+- **lib の押し直し**: request の鍵の直後に、保存の記録 done があれば この表のハッシュと照らす = 同じ = 残した答えをすぐ返す (門・許可・持ち主・仕入先・product-hub の下書きは見ない) / 違う = 409 `request_id_reused`。0069 が無い DB の新しい要求 = 503 `db_not_ready`。
+- 当て方 (🚨 まだ流さない): 0068 の後・`migrate.mjs --dry-run` (0069 だけが出る) → 中原さんの OK → 本適用 → ロールの script (`create-master-edit-roles.mjs`) を流し直す。今は何も変わらない (まとめての登録は products.parent が company のときだけ = 今は 0067 の関数が断る)。

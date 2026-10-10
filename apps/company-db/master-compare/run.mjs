@@ -30,6 +30,8 @@ import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteF
 import { readDecisionLedger, writeDecisions, writeNeCodes, connectDecisionWriter, snapshotRegTargets, writeRegistrationObservations, sealRegistrationRun, runRegistrationCheck } from './decisions.mjs';
 import { readBaseline, writeBaseline, holdAllDirections } from './baseline.mjs';
 import { compareOldTables, oldTablesSummary, oldTablesBad, OLD_FORMAT } from './compare-old-tables.mjs';
+import { recordParentGate, parentGateUnrecorded, parentTrouble, parentNote, parentEnforced, fetchTimeRfc3339 } from './parent-gate.mjs';
+export { fetchTimeRfc3339 };   // 🆕 0068: parent-gate.mjs に移した (compare-ne からも使う = 読み込みの輪を作らない)
 
 export const EVIDENCE_NAME = 'master-compare';
 export const RESULT_DIR = 'cdb-master-compare';
@@ -72,11 +74,19 @@ export function summaryLine(r) {
   // 新商品の入口のゲートの記録 (ops.record_new_entry_gate) を書けなかった・入口を閉じられなかった朝は一言 (照合そのものは失敗にしない)
   const notes = [];
   if (gr && gr.state !== 'ok' && gr.state !== 'skipped_not_closed') notes.push(`ℹ️ 新商品のゲートの記録: ${GATE_RECORD_TEXT[gr.state] || gr.state}${gr.error ? ` (${gr.error.slice(0, 80)})` : ''}`);
+  // 🆕 0068: 代表 (親) の数えを記録できなかった朝 (持ち主が load の間 = 門は閉じない = 一言だけ。company の朝は下の ⚠️)
+  const pn = parentNote(r.ne);
+  if (pn) notes.push(pn);
   const base = notes.length ? `${base0} / ${notes.join(' / ')}` : base0;
   const old = oldTablesSummary(r.old_tables);
   const line = !old ? base : oldTablesBad(r.old_tables) ? `${old} / ${base}` : `${base} / ${old}`;
+  // 🆕 0068 (設計 20 v7 §⑥ PR-6): 代表 (親) のずれ (どの持ち主でも)・数えを記録できない (持ち主が company) = 要約の先頭が必ず ⚠️ になるように出す
+  //   (① のロードの完了・② の照合の失敗とは別の知らせ = 新しい NE 登録の CSV を閉じたか)。✅ / ℹ️ で始めると daily-sync の isWarnSummary が全部 OK に数える (#1667 R2 の教訓)。
+  //   持ち主が company (CSV を閉じた) = 一番先頭 / load (知らせだけ) = もう ⚠️ で始まる朝は後ろに足す (先に出た重い知らせを押し下げない)・✅ / ℹ️ で始まる朝は先頭
+  const pt = parentTrouble(r.ne);
+  const line2 = !pt ? line : parentEnforced(r.ne) || !line.startsWith('⚠️') ? `⚠️ ${pt} / ${line}` : `${line} / ⚠️ ${pt}`;
   // 入口を閉じられなかった (0058 があるのに・有無が確かめられない) = 前日の許可が残りうる = 重大 = 要約の先頭に ⚠️ (照合そのものの結果は変えない。#1641 Codex R3 High)
-  return gateCloseTrouble(gc) ? `⚠️ 新商品の入口を閉じられない (前日の許可が残りうる): ${gateCloseTrouble(gc)} / ${line}` : line;
+  return gateCloseTrouble(gc) ? `⚠️ 新商品の入口を閉じられない (前日の許可が残りうる): ${gateCloseTrouble(gc)} / ${line2}` : line2;
 }
 /** 入口を閉じられなかった (成功でも「0058 が無いと確かめた」でもない) 理由。問題なし = null */
 export function gateCloseTrouble(gc) {
@@ -108,10 +118,6 @@ export async function closeNewEntryForCompare(getWriter, { compareRunId, readDb 
     const r = (await w.query('select ops.close_new_entry_for_compare($1) as r', [compareRunId])).rows[0]?.r ?? null;
     return { state: 'ok', result: r };
   } catch (e) { return { state: 'failed', stage: 'close', error: String(e && e.message).slice(0, 200) }; }
-}
-/** 取得の件数の記録の完了の時刻 (sync_meta = UTC の 'YYYY-MM-DD HH:MM:SS') → RFC 3339 ('…Z')。読めない = null */
-export function fetchTimeRfc3339(t) {
-  return typeof t === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(t) ? `${t.replace(' ', 'T')}Z` : null;
 }
 /**
  * 照合 ② の最後 (結果と証跡を書いた後) に、新商品の入口のゲートの記録を 1 回書く (計画 newentry_min_plan.md §3-1)。
@@ -315,7 +321,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     if (neCompare) gateClose = await closeNewEntryForCompare(writerDb || connectWriter ? writer : null, { compareRunId, readDb: db });
     // ② の台帳は排他を取ってから読む (取れなければ台帳を使う判定は blocked = pending_locked。C2 v6-3)
     const release = neCompare ? (() => { try { return acquireLock(pendingDir(dataDir, RESULT_DIR)); } catch { return null; } })() : null;
-    let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [], neCodes = null, regObs = null, regRead = null;
+    let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [], neCodes = null, regObs = null, regRead = null, parentObs = null;
     // 新商品の NE 登録の CSV の確かめ待ち (0053) = 回の始まりに DB が回へ写す (読み取りの取引の前・#1571 Codex R2 Medium 1)。写せない = 送らない (② は続ける)
     if (neCompare) regRead = await snapshotRegTargets(writerDb || connectWriter ? writer : null, { compareRunId });
     try {
@@ -340,6 +346,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
               regTargets: regRead.state === 'ok' ? regRead.targets : null, registrations });
             result.ne = r2.result; pendingEntries = r2.pendingEntries; decisionsDone = r2.decisionsDone || []; baselineWrites = r2.baselineWrites || []; neCodes = r2.neCodes || null;
             regObs = r2.regObs || null;
+            parentObs = r2.parentObs || null;   // 🆕 0068: 代表 (親) の生の数えの元 (JSON には入れない)
             if (pendingEntries) result.ne.pending_entries = pendingEntries;   // 台帳の保存に失敗した回の復旧の元 (restore-pending.mjs)
           } catch (e) {
             result.ne = { format: NE_FORMAT, verdict: 'error', error: String(e && e.message).slice(0, 300) };   // ① は残す
@@ -490,6 +497,14 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       result.ne.gate_record = { state: 'skipped_not_closed' };   // 閉じていない回の結果を許可の材料にしない (#1641 Codex R3 High)
     } else if (result.ne && result.ne.verdict !== 'error' && result.ne.verdict !== 'blocked') {
       result.ne.gate_record = await recordNewEntryGate(writerDb || connectWriter ? writer : null, { compareRunId, ne: result.ne });
+    }
+    // 🆕 0068 (設計 20 v7 §②・§⑥ PR-6): 代表 (親) の生の数え = 封をした回 (結果の JSON の sha256) だけ・② が最後まで走った回だけ。DB が自分で数えて 1 行残す
+    //   (持ち主が company なら 0 でない朝・記録できない朝は新しい NE 登録の CSV が閉じる)。照合そのものは失敗にしない (要約の先頭に ⚠️)
+    if (result.ne && result.ne.verdict !== 'error' && result.ne.verdict !== 'blocked' && parentObs) {
+      result.ne.parent_gate = await recordParentGate(writerDb || connectWriter ? writer : null, { compareRunId, parentObs, evidenceSha256: j.sha256, readDb: db });
+    } else if (result.ne) {
+      // 🆕 #1676 Codex R4 Medium: ② が代表の観測を作る前に止まった (blocked / error) = 記録しない。持ち主を読んで知らせる (company = ⚠️ 閉じた / load = ℹ️ / 0068 の前 = 黙る)
+      result.ne.parent_gate = await parentGateUnrecorded(db, result.ne.verdict === 'error' ? 'ne_error' : result.ne.verdict === 'blocked' ? `ne_blocked:${result.ne.blocked_reason ?? ''}` : 'no_obs');
     }
     } finally { await closeWriter(); }
     pruneResults(dataDir, { now });

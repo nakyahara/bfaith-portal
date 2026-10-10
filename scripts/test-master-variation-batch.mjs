@@ -182,6 +182,52 @@ await ta('[R1] 同じ request_id = 前の答え (replayed・何も足さない)�
   assert.deepEqual(await counts(), before);
 });
 
+await ta('[R2] 0069 (#1679 Codex R1 Medium 1): 同じ request_id で名前・売価・原価・JAN・カードの欄・理由だけを変えた押し直し = 409 request_id_reused (前の答えにしない・何も書かない)・要求の全部のハッシュを同じ取引で残す', async () => {
+  const rid = uuid();
+  const input = { ...hakamaInput('Rp2'), requestId: rid, reason: '最初の理由' };
+  await reg(input);
+  const rec = await one('select request_hash, actor_id from ops.variation_batch_requests where request_id = $1', [rid]);
+  assert.deepEqual(rec, { request_hash: V.variationPayloadHashOf(V.parseVariationRequest({ actor: 'naka@test', ...input })), actor_id: 'naka@test' });
+  const before = await counts();
+  const kid0 = input.children[0];
+  const variants = [
+    ['名前', { children: [{ ...kid0, name: `${kid0.name} 改` }, ...input.children.slice(1)] }],
+    ['売価', { children: [{ ...kid0, price: '19800' }, ...input.children.slice(1)] }],
+    ['原価', { children: [{ ...kid0, cost: '777' }, ...input.children.slice(1)] }],
+    ['JAN', { children: [{ ...kid0, jan: jan13('458012399990') }, ...input.children.slice(1)] }],
+    ['カード', { card: { official_url: 'https://example.com/other' } }],
+    ['理由', { reason: '違う理由' }],
+    ['共通の売価', { values: { ...VALUES, standard_price: '9999' } }],
+  ];
+  for (const [what, patch] of variants) {
+    const e = await rejects(reg({ ...input, ...patch }), 409, 'request_id_reused');
+    assert.match(e.message, /違う中身/, what);
+  }
+  assert.deepEqual(await counts(), before);
+  // 同じ中身 = 前の答え
+  const again = await reg(input);
+  assert.equal(again.replayed, true);
+  // 記録の関数: この取引で開いたまとめての登録が無い = no_open_batch (画面のロールが直接呼んでも書けない)
+  const e2 = await errOf(asEditor(() => pg.query('select ops.variation_batch_record_request($1::uuid, $2, $3)', [rid, 'naka@test', 'a'.repeat(64)])));
+  assert.match(String(e2?.message), /^no_open_batch/);
+  const e3 = await errOf(asEditor(() => pg.query(`insert into ops.variation_batch_requests (request_id, actor_id, request_hash) values ($1, 'x', $2)`, [uuid(), 'a'.repeat(64)])));
+  assert.ok(e3, '画面のロールは表に直接書けない');
+});
+
+await ta('[R3] 0069: 成功した後の同じ要求の押し直しは、門・product-hub の下書き・仕入先を見ずに残した答え (自分の保存で作られたカード・閉じた門でも失敗しない)', async () => {
+  const rid = uuid();
+  const input = { ...hakamaInput('Rp3'), requestId: rid };
+  const a = await reg(input, { phDraftExists: async () => null });
+  // 自分の保存で product-hub にカードができた (同じ管理番号) = 新しい要求なら止まるが、押し直しは前の答え
+  const b = await reg(input, { phDraftExists: async (n) => (n === 'rp3' ? 99 : null) });
+  assert.deepEqual([b.replayed, b.group_product_id, b.children.length], [true, a.group_product_id, 15]);
+  await rejects(reg({ ...input, requestId: uuid(), group: { mode: 'new', code: 'Rp3x', name: 'x' }, children: hakamaInput('Rp3x').children }, { phDraftExists: async () => 99 }), 409, 'ph_draft_exists');
+  // 門が閉じた後 (MASTER_EDIT_OPEN なし・products.parent が load)
+  assert.equal((await reg(input, { open: false })).replayed, true);
+  await T.W2.setActiveOwnershipInDb(pg, { ...T.ALL_COMPANY, 'products.parent': 'load' });
+  try { assert.equal((await reg(input)).replayed, true); } finally { await T.W2.setActiveOwnershipInDb(pg, T.ALL_COMPANY); }
+});
+
 await ta('[F1] 1 つでも断られたら全部巻き戻す: 子のコードがもうある (code_taken・どの子か)・同じ request_id の押し直し = 同じ誤り (replayed)・JAN がほかの商品 (jan_taken)・まとまりのコードがある (group_exists)', async () => {
   // 先に単品 Zt-WH-90 を登録しておく (同じコードの子を作れない)
   await asEditor(() => pg.query('select ops.register_new_sku($1::uuid, $2, $3, $4::jsonb, $5, $6::jsonb) as r', [uuid(), 'naka@test', null, T.OWN, 'e'.repeat(64), JSON.stringify({

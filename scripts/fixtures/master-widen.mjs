@@ -66,6 +66,8 @@ export async function seedNewEntryLease(db, { actor = 'test', runId = null, kind
   await db.query('select ops.close_new_entry_for_compare($1)', [run]);   // 本番と同じ: 照合 ② の始めに閉じる → 結果 → grant (今回の回)
   await db.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', [run, at, JSON.stringify(kindGate)]);
   const lease = (await one(db, "select ops.grant_new_entry_lease('single', $1) as r", [run])).r;
+  // 🆕 0068: 同じ照合の回の代表 (親) の数え (NE = Company DB の観測 = 0) も残す (products.parent が company の DB で新しい NE 登録の CSV の門が開く)
+  await seedParentGate(db, { runId: run });
   // withSet = セットの CSV の 0053 の道を試験するためだけに、同じ結果の行のセットの許可を直接置く (本番には出す道が無い = grant は single だけ・#1644 Codex R1 Medium 2)
   if (withSet) {
     await db.query('begin');
@@ -78,6 +80,28 @@ export async function seedNewEntryLease(db, { actor = 'test', runId = null, kind
     } catch (e) { await db.query('rollback'); throw e; }
   }
   return lease;
+}
+
+/**
+ * 🆕 0068: 照合 ② の代表 (親) の数えの記録を 1 行置く (本物の関数 ops.record_parent_gate)。0068 の前の DB = 何もしない (null)。同じ回がもうある = 何もしない (null)。
+ *   obs = NE の観測 (無ければ「NE = 今の Company DB」= 単品の代表を Company DB の親から作る = 数え 0)。戻り値 = 関数の答え
+ *   本番 = 照合 ② (run.mjs) が NE の完全な取得から作った観測を、封をした回 (結果の JSON の sha256) で残す
+ */
+export async function seedParentGate(db, { runId, obs = null, materialGenerationId = 'mat_fixture', at = null } = {}) {
+  if ((await one(db, `select to_regprocedure('ops.record_parent_gate(text, jsonb, text, text, jsonb)') is not null as ok`)).ok !== true) return null;
+  if ((await one(db, 'select exists (select 1 from ops.master_parent_gate_results where compare_run_id = $1) as e', [runId])).e) return null;
+  const mirror = async () => {
+    const rows = (await db.query(`select k.code_norm, k.sku_kind, nullif(core.norm_code(pp.display_code), '') as rep, pp.display_code as raw
+        from core.skus k left join core.products p on p.product_id = k.product_id left join core.products pp on pp.product_id = p.parent_product_id
+       where k.company_id = 1 and k.sku_kind in ('single', 'set') order by k.code_norm`)).rows;
+    return { format: 'parent-obs-v1', complete: true, untrusted: [], rep_spellings: { state: 'ok' },
+      trust: { fetch_counts: 'ok', integrity: 'ok', kind_gate_integrity: 'ok', rep_spellings: 'ok' },   // 🆕 #1676 Codex R4: 照合の許可の一覧 (全部 ok)
+      rows: rows.map((r) => (r.sku_kind === 'set' ? [r.code_norm, 'set', null, null, null] : [r.code_norm, 'single', 'ok', r.rep ?? null, r.rep ? r.raw : null])) };
+  };
+  const when = at || new Date(Date.now() - 1000).toISOString();
+  const fetch = { generation_id: `ne_fixture_${crypto.randomBytes(3).toString('hex')}`, raw_hash: hex('c'), products_complete_at: when, setproducts_complete_at: when };
+  return (await one(db, 'select ops.record_parent_gate($1, $2::jsonb, $3, $4, $5::jsonb) as r',
+    [runId, JSON.stringify(fetch), materialGenerationId, hex('d'), JSON.stringify(obs || await mirror())])).r;
 }
 
 export const hex = (c) => c.repeat(64);

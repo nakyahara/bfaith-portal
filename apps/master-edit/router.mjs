@@ -601,13 +601,32 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
+/**
+ * 読むだけのまとまりの API (探す・1 つを読む・確かめる) も、画面と同じ持ち主の門で閉じる (#1679 Codex R1 Low)。
+ * DB の active を読めない = 503 owner_unreadable / このコードが扱えない持ち主がある・products.parent が company でない = 409 parent_not_company。通る = true
+ */
+async function variationReadGate(db, res) {
+  const owner = await screenOwner(db);
+  if (!owner || !owner.readable) {
+    res.status(503).json({ ok: false, error: '列ごとの持ち主 (Company DB の切替の記録) を読めないので、色違い・サイズ違いのまとまりは出せません。少し待ってからもう一度', reason: 'owner_unreadable' });
+    return false;
+  }
+  if (!variationOn(owner)) {
+    res.status(409).json({ ok: false, error: owner.code_behind.length ? `このサーバーのプログラムが古いので、色違い・サイズ違いのまとまりは出せません (Company DB の持ち主 ${owner.code_behind.join('・')} を扱えない)`
+      : '色違い・サイズ違いのまとまりは、まだ使えません (代表の正本を Company DB に切り替える前)', reason: 'parent_not_company' });
+    return false;
+  }
+  return true;
+}
 router.get('/api/variation/groups', (req, res) => withPgApi(res, async (db) => {
+  if (!(await variationReadGate(db, res))) return;
   const q = String(req.query.q ?? '');
   if (q.length > 60) return res.status(400).json({ ok: false, error: '長すぎます (60 字まで)' });
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, items: await searchVariationGroups(db, q) });
 }));
 router.get('/api/variation/groups/:id', (req, res) => withPgApi(res, async (db) => {
+  if (!(await variationReadGate(db, res))) return;
   const g = await readVariationGroup(db, String(req.params.id || ''), { now: new Date(clock()) });
   if (!g) return res.status(404).json({ ok: false, error: 'このまとまりは見つからないか、まとまりではありません (新しいまとまりは「新しいまとまりを作る」で)', reason: 'not_a_group' });
   res.set('Cache-Control', 'no-store');
@@ -619,6 +638,7 @@ router.post('/api/variation/check', (req, res) => {
     return res.status(413).json({ ok: false, error: `確かめるのは ${VARIATION_MAX_CHILDREN * 3} 件までです` });
   }
   return withPgApi(res, async (db) => {
+    if (!(await variationReadGate(db, res))) return;
     res.set('Cache-Control', 'no-store');
     res.json({ ok: true, ...(await checkVariationCodes(db, b, { phDraftExists: phDraftLookup })) });
   });

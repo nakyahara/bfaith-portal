@@ -92,6 +92,8 @@ export async function setupVariationDb({ quiet = () => {}, extraSkus = [] } = {}
   await (await import('./master-widen.mjs')).seedNewEntryLease(db, { runId: RUN1, withSet: true });
   await applyMigrations(db, { log: quiet });
   await createMasterEditRoles(pg, {});
+  // 🆕 0068: 照合 ② の代表 (親) の数えの記録 (products.parent が company の DB で新しい NE 登録の CSV の門が開く = 今日の回で数え 0)
+  await (await import('./master-widen.mjs')).seedParentGate(db, { runId: RUN1 });
   const SUP1 = (await one(`select supplier_id::text as id from core.suppliers where code = '0001'`)).id;
   // JAN を持つ単品 (s003) = ほかの商品の JAN の重なりの試験
   const OWN = JSON.stringify(ALL_COMPANY);
