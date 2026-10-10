@@ -62,16 +62,8 @@ export async function setupVariationDb({ quiet = () => {}, extraSkus = [] } = {}
     await pg.query(`set session authorization master_gate_${host}`);
     try { return await fn(); } finally { await pg.query(`set session authorization ${sessionUser}`); await pg.query('set role deploy'); }
   }
-  const skus = [...BASE_SKUS, ...extraSkus];
-  const plan = {
-    skus,
-    variationGroups: [{ code: 'ws100', name: 'ウールストール', childCodes: ['ws100-BR', 'ws100-NV', 'ws100-GY'], status: 'active' },
-      { code: 'towel-gift', name: '今治タオル ギフト', childCodes: ['towel-gift-2p', 'towel-gift-3p'], status: 'active' }],
-    setComponents: [], listings: [], observations: [], physicals: [], compliance: [], workers: [],
-    suppliers: [{ code: '0001', name: 'AMC' }, { code: '0034', name: '三河テキスタイル' }],
-    supplierSkus: skus.map((s) => ({ supplierCode: s.code === 'ws100-GY' ? '0034' : '0001', skuCode: s.code })),
-    primarySuppliers: skus.map((s) => ({ skuCode: s.code, supplierCode: s.code === 'ws100-GY' ? '0034' : '0001' })), reorder: { available: true, runId: 'pml_vg7' },
-  };
+  const plan = basePlan(extraSkus);
+  const skus = plan.skus;
   const lr = await runInitialLoad(db, plan, { log: quiet, runId: 'load_vg7', ownership: MASTER_OWNERSHIP, now: new Date(Date.now() - 5 * 86400e3) });
   if (!lr.ok) throw new Error(`夜間ロードの失敗: ${lr.error}`);
   async function toPhase(to) {
@@ -107,6 +99,21 @@ export async function setupVariationDb({ quiet = () => {}, extraSkus = [] } = {}
   const OWN = JSON.stringify(ALL_COMPANY);
   return { pg, db, q, one, asRole, asEditor: (fn) => asRole('master_edit', fn), ALL_COMPANY, OWN, SUP1, sessionUser, MASTER_OWNERSHIP, W2 };
 }
+
+/** 夜間ロードの材料 (今の NE の形)。extraSkus = 足す商品 (切替の後に流すと NE で直接作られた商品 = quarantined) */
+export function basePlan(extraSkus = [], extraGroups = []) {
+  const skus = [...BASE_SKUS, ...extraSkus];
+  return {
+    skus,
+    variationGroups: [{ code: 'ws100', name: 'ウールストール', childCodes: ['ws100-BR', 'ws100-NV', 'ws100-GY'], status: 'active' },
+      { code: 'towel-gift', name: '今治タオル ギフト', childCodes: ['towel-gift-2p', 'towel-gift-3p'], status: 'active' }, ...extraGroups],
+    setComponents: [], listings: [], observations: [], physicals: [], compliance: [], workers: [],
+    suppliers: [{ code: '0001', name: 'AMC' }, { code: '0034', name: '三河テキスタイル' }],
+    supplierSkus: skus.map((s) => ({ supplierCode: s.code === 'ws100-GY' ? '0034' : '0001', skuCode: s.code })),
+    primarySuppliers: skus.map((s) => ({ skuCode: s.code, supplierCode: s.code === 'ws100-GY' ? '0034' : '0001' })), reorder: { available: true, runId: 'pml_vg7' },
+  };
+}
+export const skuOf = sku;
 
 /** JAN 13 けた (チェック数字つき) */
 export const jan13 = (b) => { const d = b.split('').map(Number).reverse(); const s = d.reduce((a, x, i) => a + x * (i % 2 === 0 ? 3 : 1), 0); return b + ((10 - (s % 10)) % 10); };

@@ -26,6 +26,9 @@
  *   POST /api/variation/check          打った値を DB で確かめる { group_code?, codes: [子のコード], jans: [JAN] } (読むだけ)
  *   POST /api/new/variation            まとめての登録 { request_id, group, axes?, options, children, values, card?, order_settings?, reason? } (1 つの取引で全部か何も無いか)。
  *                                      発注の設定は登録の後に子ごとに発注アプリへ (子の request_id ごと・失敗しても登録は成功のまま)
+ *   POST /api/variation/groups/:id/labels  まとまりの名前・軸の名前・選択肢名を直す { request_id, seen_revision, changes: { name?, axes?, options? }, reason? } (社内だけ・NE に送らない)
+ *   POST /api/sku/:code/variation-cancel   まとまりの子の廃止 { request_id, reason } (下書き / NE 登録待ち・生きているファイルなし・NE に一度も現れていない子だけ)
+ *   POST /api/sku/:code/adopt-parent       NE で直接作られた商品 (quarantined) の代表を NE から 1 回だけ採用 { request_id, reason? }
  *   GET  /api/code-check?code= 新しい商品コードを確かめる (形 + Company DB・NE・使ったことがあるか)
  *   POST /api/new            新商品の登録 { request_id, kind, code, reason?, values: {...}, card: {...} } (lib/master-register.mjs)。
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
@@ -66,7 +69,8 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
-import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS } from '../../lib/master-variation.mjs';
+import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS,
+  editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
@@ -709,6 +713,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null, extras,
     // 発注の設定 (発注アプリ・単品だけ)。発注条件グループは代表の仕入先のものだけ選べる
     orderSettings: page && page.cur.sku_kind === 'single' ? orderScreen(req, editorGate(req), page.cur.code, { supplier: page.cur.primary_supplier || null }) : null,
+    // 🆕 PR-7b: まとまりの名前を直す・子の廃止・quarantined の代表の採用のボタン (products.parent が company のときだけ。決めるのは DB)
+    variationOn: variationOn(owner),
   });
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -778,6 +784,23 @@ router.post('/api/new', (req, res) => {
     res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null, ...(orderInput ? { order_settings: orderResult } : {}) });
   }, 'write');
 });
+
+// ─── 🆕 PR-7b: まとまりの名前を直す・子の廃止・quarantined の代表の採用 (名簿の人・保存を開く門 + products.parent が company・DB の関数が決まりを全部見る) ───
+function variationWrite(req, res, fn) {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const actor = String(req.session.email).trim().toLowerCase();
+  return withPgApi(res, async (db) => res.json({ ok: true, ...(await fn(db, actor, req.body || {})) }), 'write');
+}
+router.post('/api/variation/groups/:id/labels', (req, res) => variationWrite(req, res, (db, actor, b) => editVariationLabels(db, {
+  actor, requestId: b.request_id, reason: b.reason ?? null, groupProductId: req.params.id, seenRevision: b.seen_revision, changes: b.changes,
+}, { open: isOpen() })));
+router.post('/api/sku/:code/variation-cancel', (req, res) => variationWrite(req, res, (db, actor, b) => cancelVariationChild(db, {
+  actor, requestId: b.request_id, reason: b.reason ?? null, code: req.params.code,
+}, { open: isOpen() })));
+router.post('/api/sku/:code/adopt-parent', (req, res) => variationWrite(req, res, (db, actor, b) => adoptNeParent(db, {
+  actor, requestId: b.request_id, reason: b.reason ?? null, code: req.params.code,
+}, { open: isOpen() })));
 
 /**
  * 商品の画面の「発注の設定を保存」(発注アプリに書く。Company DB の保存とは別)。
