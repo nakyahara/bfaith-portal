@@ -377,19 +377,36 @@ try {
     try {
       await applyMigrations(pgAdapter(S), { log: () => {} });
       await applyMigrations(pgAdapter(D), { log: () => {} });
+      const insExport = async (bytes, sha) => Number((await S.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, state, void_at, void_reason)
+        values ('products', 'name', 'syohin_name', $4, 'utf8', true, 1, $1, $2, $3, 'test', 'void', now(), 'by_user') returning export_id`, [sha, bytes, csvRun, csv.CONVERTER_VERSION])).rows[0].export_id);
+      // (a) CSV ではない byte 列 (0x00・0xff・CRLF・バックスラッシュ・途中で切れた UTF-8) = 復元の byte の往復だけを確かめる
       const odd = Buffer.from([0x00, 0xff, 0x0d, 0x0a, 0x5c, 0x78, 0x41, 0xe3, 0x81]);
       const h = crypto.createHash('sha256').update(odd).digest('hex');
-      await S.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, state, void_at, void_reason)
-        values ('products', 'name', 'syohin_name', 'ne-csv-v1', 'utf8', true, 1, $1, $2, $3, 'test', 'void', now(), 'by_user')`, [h, odd, csvRun]);
+      const oddId = await insExport(odd, h);
+      // (b) 本物の形の CSV (今の buildCsv で作った CRLF の行・バックスラッシュ・引用符・カンマ・日本語) と、その行 = 復元の後に exportFile が配る
+      const spec = csv.specOf('products', 'name');
+      const realRows = [{ ne_code: 'Bk40A', cell: 'C:\\テスト\\x41 "引用",カンマ ¥100' }];
+      const real = csv.buildCsv(spec, realRows);
+      const realId = await insExport(real.bytes, real.sha256);
+      await S.query(`insert into ops.ne_csv_export_rows (export_id, source, code_norm, col, ne_code, target, cell, cdb_version, evidence, reserved, released_at, release_reason)
+        values ($1, 'to_ne', 'bk40a', 'name', $2, $3::jsonb, $4, 1, '{}'::jsonb, false, now(), 'void')`, [realId, realRows[0].ne_code, JSON.stringify(realRows[0].cell), realRows[0].cell]);
       const lines = [];
       await dumpCompanyDb(pgAdapter(S), (l) => lines.push(l), { log: () => {} });
       await restoreCompanyDb(pgAdapter(D), lines.join(String.fromCharCode(10)), { log: () => {} });
-      const got = (await D.query('select file_bytes, sha256, state from ops.ne_csv_exports')).rows;
-      assert.equal(got.length, 1);
+      const got = (await D.query('select export_id, file_bytes, sha256, state from ops.ne_csv_exports order by export_id')).rows;
+      assert.deepEqual(got.map((r) => Number(r.export_id)), [oddId, realId]);
       assert.ok(Buffer.from(got[0].file_bytes).equals(odd), Buffer.from(got[0].file_bytes).toString('hex'));
       assert.deepEqual([got[0].sha256, got[0].state], [h, 'void']);
-      const f = await csv.exportFile(pgAdapter(D), 1);
-      assert.ok(f.bytes.equals(odd));
+      assert.ok(Buffer.from(got[1].file_bytes).equals(real.bytes), Buffer.from(got[1].file_bytes).toString('hex'));
+      assert.deepEqual([got[1].sha256, got[1].state], [real.sha256, 'void']);
+      // (a) は #1629 (dc7cc836) から exportFile が「今の buildCsv で行から作り直した byte 列と同じか」を確かめ直す = CSV ではないので配らない。
+      //     sha256 の食い違いで throw しない = 復元した byte 列が記録の sha256 と同じ
+      const fOdd = await csv.exportFile(pgAdapter(D), oddId);
+      assert.deepEqual([fOdd.state, fOdd.reason, fOdd.bytes], ['unsafe', 'bytes_differ', null]);
+      // (b) は復元した行から作り直しても同じ byte 列 = そのまま配る
+      const f = await csv.exportFile(pgAdapter(D), realId);
+      assert.equal(f.state, 'void', JSON.stringify({ state: f.state, reason: f.reason }));
+      assert.ok(f.bytes.equals(real.bytes), f.bytes.toString('hex'));
     } finally {
       for (const c of [S, D]) { try { await c.end(); } catch { /* */ } }
       for (const n of names) { try { await admin.query(`drop database ${n}`); } catch (e) { console.error(`DB を消せない: ${e.message}`); } }
