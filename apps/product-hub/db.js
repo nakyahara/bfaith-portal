@@ -1866,6 +1866,77 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_ph_cdb_card_events_draft ON ph_cdb_card_events(draft_id);
   `);
+  // 🆕 まとまり (色違い・サイズ違い) のカード (2026-10-09・Company DB構想 20 v7 §⑤ / §⑩ の PR-4)。
+  // Company DB の知らせ (ops.product_hub_outbox の entity_kind = variation_group・kind = group_snapshot・ph-group-v1) から
+  // まとまりで 1 枚のカードを作る (services/cdb-group-intake.js)。
+  //   cdb_group_product_id = Company DB のまとまりの商品の番号 (札か単品の代表)。cdb_sku_id とは別の列 = 使い回さない (設計 R2 High 4)
+  //   cdb_group_revision   = 取り込んだスナップショットの revision。今より大きい知らせだけが全部を置き換える (小さい / 同じは何もしない)
+  // 子・軸・選択肢はスナップショットで全部置き換える表。廃止した子・消えた選択肢は消さずに無効の印 (active = 0)。
+  // NE に入る前は、この子の一覧が暫定の正本 (画面に出す)・出品は止める (services/cdb-group-gate.js = サーバー側の共通の門)
+  if (!draftCols.has('cdb_group_product_id')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN cdb_group_product_id INTEGER');
+  }
+  if (!draftCols.has('cdb_group_revision')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN cdb_group_revision INTEGER');
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_product_drafts_cdb_group ON product_drafts(cdb_group_product_id) WHERE cdb_group_product_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS ph_cdb_groups (
+      draft_id       INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
+      group_code     TEXT NOT NULL,
+      group_name     TEXT NOT NULL,
+      group_kind     TEXT NOT NULL CHECK (group_kind IN ('tag', 'single')),
+      rep_sku_id     INTEGER,
+      common_json    TEXT NOT NULL,
+      event_id       TEXT NOT NULL,
+      attention      TEXT,
+      attention_at   TEXT,
+      updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE TABLE IF NOT EXISTS ph_cdb_group_axes (
+      draft_id INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      axis     INTEGER NOT NULL CHECK (axis IN (1, 2)),
+      name     TEXT NOT NULL,
+      PRIMARY KEY (draft_id, axis)
+    );
+    CREATE TABLE IF NOT EXISTS ph_cdb_group_options (
+      draft_id INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      axis     INTEGER NOT NULL CHECK (axis IN (1, 2)),
+      code     TEXT NOT NULL,
+      code_key TEXT NOT NULL,
+      name     TEXT NOT NULL,
+      sort     INTEGER NOT NULL DEFAULT 0,
+      active   INTEGER NOT NULL CHECK (active IN (0, 1)),
+      PRIMARY KEY (draft_id, axis, code_key)
+    );
+    CREATE TABLE IF NOT EXISTS ph_cdb_group_children (
+      draft_id        INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      cdb_sku_id      INTEGER NOT NULL,
+      code            TEXT NOT NULL,
+      code_key        TEXT NOT NULL,
+      name            TEXT,
+      price           INTEGER,
+      choice1         TEXT,
+      choice2         TEXT,
+      jans_json       TEXT NOT NULL DEFAULT '[]',
+      sort            INTEGER NOT NULL DEFAULT 0,
+      active          INTEGER NOT NULL CHECK (active IN (0, 1)),
+      inactive_reason TEXT CHECK (inactive_reason IS NULL OR inactive_reason IN ('cancelled', 'removed')),
+      PRIMARY KEY (draft_id, cdb_sku_id),
+      UNIQUE (draft_id, code_key)
+    );
+    CREATE TABLE IF NOT EXISTS ph_cdb_group_events (
+      event_id             TEXT PRIMARY KEY,
+      cdb_group_product_id INTEGER NOT NULL,
+      revision             INTEGER NOT NULL,
+      group_code           TEXT NOT NULL,
+      outcome              TEXT NOT NULL CHECK (outcome IN ('created', 'replaced', 'linked', 'stale', 'conflict')),
+      draft_id             INTEGER,
+      conflict_draft_id    INTEGER,
+      applied_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_cdb_group_events_group ON ph_cdb_group_events(cdb_group_product_id, revision);
+  `);
   // ページ表記の自動保存 (#691): ページロードごとのトークン + 単調増加 seq。
   // 自動保存とpagehideビーコンの到着順が逆転しても「古いリクエストが新しい保存を
   // 上書きしない」ためのリビジョン (同一トークン内でのみ seq を比較する)

@@ -50,6 +50,9 @@
   /* 🆕 入荷のときに撮ったパッケージ裏面の写真がある (2026-09-18) */
   .kb-tag.backlabel { background: #fff7ed; color: #9a3412; border-color: #fed7aa; font-weight: 600; }
   .kb-tag.existing-page { background: #ecfeff; color: #0e7490; border-color: #a5f3fc; font-weight: 700; }
+  .kb-tag.cdb-group { background: #f5f3ff; color: #5b21b6; border-color: #ddd6fe; font-weight: 700; }
+  .kb-tag.cdb-group-ne_waiting, .kb-tag.cdb-group-two_axes, .kb-tag.cdb-group-no_children { background: #fefce8; color: #854d0e; border-color: #fde68a; }
+  .kb-tag.cdb-group-attention { background: #fff7ed; color: #9a3412; border-color: #fdba74; font-weight: 700; }
   .kb-tag.info-missing { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
   .kb-hold { font-size: 11px; font-weight: 600; color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 4px; padding: 1px 6px; margin: 2px 0; display: inline-block; }
   .kb-hold.kb-aiblock { color: #991b1b; background: #fee2e2; border-color: #ef4444; }
@@ -616,6 +619,15 @@
                   推し量らずに空のまま置いている = 人が選ぶ。楽天の配送方法を保存すると札は消える %>
               <% if (locals.cdbShippingCheck && locals.cdbShippingCheck.has(c.id)) { %>
                 <div class="kb-tags"><span class="kb-tag ship-check" title="新商品の登録の発送方法 (送料コード) に楽天の配送方法の対応がありません。詳細画面で配送方法を選んでください">⚠ 発送方法 要確認</span></div>
+              <% } %>
+              <%# 🆕 まとまり (色違い・サイズ違い) のカード (Company DB構想 20 v7 §⑤・PR-4)。NE の写し待ち・2 軸 = 楽天への出品を止めている (サーバー側の門)。
+                  要確認 = 社内の名前・選択肢名・子が変わった / 今あるカードに結んだ (モールの出品は自動で変えていない) %>
+              <% const cg = locals.cdbGroupTags && locals.cdbGroupTags.get(c.id); %>
+              <% if (cg) { %>
+                <div class="kb-tags">
+                  <span class="kb-tag cdb-group cdb-group-<%= cg.state %>" title="Company DB のまとまり (子 <%= cg.children %> 件<%= cg.axes ? `・軸 ${cg.axes}` : '' %>): <%= cg.label %>"><%= cg.state === 'ready' ? '🧩' : '⏸' %> <%= cg.state === 'two_axes' ? '2 軸: 出品停止' : cg.state === 'ne_waiting' ? 'NE の写し待ち' : cg.state === 'no_children' ? '有効な子なし' : 'まとまり' %></span>
+                  <% if (cg.attention) { %><span class="kb-tag cdb-group-attention" title="<%= cg.attention %>">⚠ まとまり 要確認</span><% } %>
+                </div>
               <% } %>
               <% if (c.existingPage) { %>
                 <div class="kb-tags"><span class="kb-tag existing-page" title="<%= c.addedToNeCode ? `出品済みのページ「${c.addedToNeCode}」に NE で色 (SKU) が足されたので出したカードです` : (c.existingPageAuto ? 'NE の同じグループに前からある商品があるので自動で付けました。違うときは商品詳細の基本情報で直せます' : '商品詳細で「既存ページに追加」に設定されています') %>">📄 既存ページ<%= c.addedToNeCode ? `: ${c.addedToNeCode} に色追加` : (c.existingPageAuto ? '' : ' (手動)') %></span></div>
