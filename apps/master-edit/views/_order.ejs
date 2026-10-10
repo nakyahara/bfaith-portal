@@ -27,7 +27,7 @@
 <section class="panel" id="sec-order" aria-labelledby="h-order" data-po-mode="<%= mode %>">
   <div class="panel-h">
     <% if (mode === 'new') { %><span class="stepno" data-step="sec-order" aria-hidden="true"><%= stepNo %></span><% } else { %><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-cart"/></svg></span><% } %>
-    <h2 id="h-order">発注の設定</h2><span class="sub">発注アプリに保存されます<%= mode === 'sku' ? ' (右の「保存する」とは別)' : ' (あとでも可)' %></span>
+    <h2 id="h-order">発注の設定</h2><span class="sub">発注アプリに保存されます<%= mode === 'sku' ? ' (右の「保存する」とは別)' : ' (あとでも可)' %><%= typeof subExtra === 'undefined' ? '' : subExtra %></span>
     <span class="right"><a class="hint" href="/apps/purchase-orders/admin?grp=attrs" target="_blank" rel="noopener">発注アプリで見る <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a></span>
   </div>
   <% if (!os || !os.canSee) { %>

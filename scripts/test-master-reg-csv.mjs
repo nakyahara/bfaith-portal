@@ -1352,7 +1352,7 @@ await ta('[V3] 一部だけ NE に入ったとき (設計 v7 §⑤ R3 High 1): �
   await supersede(f4.export.export_id);
 });
 
-await ta('[V4] 3 者一致 (設計 v7 §⑤ R1 High 3): verified = 期待値 = NE の観測 = 今の Company DB の代表 (親)。NE は合うが Company DB が違う = partial + cdb_drift (知らせる)・一度でも配った商品の代表は変えない (画面 409 parent_frozen・🔒・DB は持ち主が company のとき)・配っていない下書きは変えられる', async () => {
+await ta('[V4] 3 者一致 (設計 v7 §⑤ R1 High 3): verified = 期待値 = NE の観測 = 今の Company DB の代表 (親)。NE は合うが Company DB が違う = partial + cdb_drift (知らせる)・一度でも配った商品の代表は変えない (DB は持ち主が company のとき・🆕 PR-7: 画面の保存には代表の欄が無い = 400 parent_not_editable)・配っていない下書きは変えられる', async () => {
   const parentAsOwner = async (code, parentCode) => {
     await pg.query('begin');
     try {
@@ -1366,18 +1366,20 @@ await ta('[V4] 3 者一致 (設計 v7 §⑤ R1 High 3): verified = 期待値 = N
     await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, 'products.parent': 'load' });
     try { return await fn(); } finally { await W2.setActiveOwnershipInDb(pg, ALL_COMPANY); }
   };
-  const lockOf = async (code) => (await as(E, 'master_edit', () => readSkuPage(db, code, { now: NOW, ownership: ALL_COMPANY, open: true }))).locks.fields.parent_code ?? null;
+  // 🆕 PR-7: 商品の画面の欄に代表 (親) は無い (🔒 も出さない = 見るだけ)
+  const fieldsOf = async (code) => (await as(E, 'master_edit', () => readSkuPage(db, code, { now: NOW, ownership: ALL_COMPANY, open: true })));
   const parentOf = async (code) => (await one('select pp.display_code as p from core.skus k join core.products p on p.product_id = k.product_id left join core.products pp on pp.product_id = p.parent_product_id where k.code = $1', [code])).p;
   // 下書き (まだ一度も配っていない) = 代表を付けられる
   await reg('single', 'tw-a', single({ name: '3 者 A' }));
-  await save('tw-a', { parent_code: 'grp1' });
+  await rejectsWith(save('tw-a', { parent_code: 'grp1' }), 400, 'parent_not_editable');
+  await parentAsOwner('tw-a', 'grp1');   // 下書きの親 (まとめての登録・quarantined の採用の代わりに持ち主のロールで)
   assert.equal(await parentOf('tw-a'), 'grp1');
-  assert.equal(await lockOf('tw-a'), null);
+  const pg0 = await fieldsOf('tw-a');
+  assert.ok(!Object.hasOwn(pg0.fields, 'parent_code') && !Object.hasOwn(pg0.locks.fields, 'parent_code'));
   const f = await build('products', ['tw-a']);
   const row = (await one('select cells from ops.ne_reg_export_rows where export_id = $1', [f.export.export_id])).cells;
   assert.deepEqual([row[7], row[8]], ['GRP1', 'empty'], '代表 = NE の元の書き方・JAN = empty');
   await issue(f.export.export_id);
-  assert.equal((await lockOf('tw-a')).why, 'reg', '配っている間 = NE に送った値');
   assert.equal((await one('select ops.sku_ever_issued($1) as x', [await skuId('tw-a')])).x, true);
   // 起きないはずの事故 (持ち主 load の間に夜間ロード・持ち主のロールが親を変えた): NE は期待値と合うが Company DB が違う = partial (確認済みにしない)・cdb_drift で知らせる
   await withParentLoad(() => parentAsOwner('tw-a', null));
@@ -1399,11 +1401,8 @@ await ta('[V4] 3 者一致 (設計 v7 §⑤ R1 High 3): verified = 期待値 = N
   assert.deepEqual([(await itemsOf(f.export.export_id))[0].state, await regOf('tw-a')], ['verified', 'ne_confirmed']);
   // NE と期待値が違う (Company DB は合う) = 今までどおり partial (cdb_drift には出さない)
   // 確かめた後も、一度配った商品の代表は変えない: 画面の保存 = 409 parent_frozen (何も書かない)・画面は 🔒 frozen・DB も断る
-  const e = await rejectsWith(save('tw-a', { parent_code: '' }), 409, 'parent_frozen');
-  assert.deepEqual(e.extra.exports, [String(f.export.export_id)]);
-  await rejectsWith(save('tw-a', { parent_code: 's001' }), 409, 'parent_frozen');
+  await rejectsWith(save('tw-a', { parent_code: '' }), 400, 'parent_not_editable');
   assert.equal(await parentOf('tw-a'), 'grp1');
-  assert.deepEqual(await lockOf('tw-a'), { why: 'frozen', exports: [String(f.export.export_id)] });
   await pgErr(parentAsOwner('tw-a', null), /parent_frozen/);
   // 持ち主が load の間は夜間ロードの道を止めない (NE の代表を写す)。取引ごと巻き戻す
   await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, 'products.parent': 'load' });
@@ -1416,20 +1415,19 @@ await ta('[V4] 3 者一致 (設計 v7 §⑤ R1 High 3): verified = 期待値 = N
   assert.equal(await parentOf('tw-a'), 'grp1');
   // 作っただけ (配っていない) で使わないにしたファイル = 一度も配っていない = 代表を変えられる
   await reg('single', 'tw-b', single({ name: '3 者 B' }));
-  await save('tw-b', { parent_code: 'grp1' });
+  await parentAsOwner('tw-b', 'grp1');
   const fb = await build('products', ['tw-b']);
   await supersede(fb.export.export_id);
   assert.equal((await one('select ops.sku_ever_issued($1) as x', [await skuId('tw-b')])).x, false);
-  await save('tw-b', { parent_code: '' });
+  await parentAsOwner('tw-b', null);
   assert.equal(await parentOf('tw-b'), null);
-  assert.equal(await lockOf('tw-b'), null);
   // 配った後に使わないにしたファイル = 一度配った (証跡は消えない) = 変えない
-  await save('tw-b', { parent_code: 'grp1' });
+  await parentAsOwner('tw-b', 'grp1');
   const fb2 = await build('products', ['tw-b']);
   await issue(fb2.export.export_id);
   await supersede(fb2.export.export_id);
   assert.deepEqual((await itemsOf(fb2.export.export_id)).map((i) => i.state), ['superseded']);
-  await rejectsWith(save('tw-b', { parent_code: '' }), 409, 'parent_frozen');
+  await pgErr(parentAsOwner('tw-b', null), /parent_frozen/);
   assert.equal(await parentOf('tw-b'), 'grp1');
 });
 

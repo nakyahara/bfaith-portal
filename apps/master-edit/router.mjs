@@ -18,7 +18,14 @@
  *   GET  /sku/:code/history  変更の記録
  *   GET  /api/lookup?code=   構成品の引き当て
  *   POST /api/sku/:code      保存 { request_id, reason?, seen: { token (編集の印), event_id? }, values: {...} }
- *   GET  /new?kind=single|set 新商品の登録 (画面 D・⑤-2a)
+ *   GET  /new?kind=single|set|variation 新商品の登録 (画面 D・⑤-2a)。variation = 色違い・サイズ違いのまとまり (CompanyDB構想/20 §④・PR-7)。
+ *        「まとまり」の札と画面は、DB の active の products.parent が company のときだけ出す (今は load = 出さない = 「切替の前」の帯)
+ *   ── 色違い・サイズ違いのまとまり (PR-7・lib/master-variation.mjs。保存を開く門は新商品の登録と同じ + products.parent が company) ──
+ *   GET  /api/variation/groups?q=      今あるまとまりを探す (コード・名前・子の商品コード)
+ *   GET  /api/variation/groups/:id     まとまりを 1 つ (軸・選択肢・今ある子と子の値 = 共通の欄に写す)
+ *   POST /api/variation/check          打った値を DB で確かめる { group_code?, codes: [子のコード], jans: [JAN] } (読むだけ)
+ *   POST /api/new/variation            まとめての登録 { request_id, group, axes?, options, children, values, card?, order_settings?, reason? } (1 つの取引で全部か何も無いか)。
+ *                                      発注の設定は登録の後に子ごとに発注アプリへ (子の request_id ごと・失敗しても登録は成功のまま)
  *   GET  /api/code-check?code= 新しい商品コードを確かめる (形 + Company DB・NE・使ったことがあるか)
  *   POST /api/new            新商品の登録 { request_id, kind, code, reason?, values: {...}, card: {...} } (lib/master-register.mjs)。
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
@@ -59,7 +66,8 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
-import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
+import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS } from '../../lib/master-variation.mjs';
+import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
 import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
@@ -202,9 +210,30 @@ async function applyCard(ev) {
   const m = await import('../product-hub/services/cdb-card-intake.js');
   return m.applyCdbCardEvent(ev);
 }
+/** まとまりのカードの取り込み (SQLite・#1675 の cdb-group-intake.js)。試験は差し替える */
+let groupCardApplier = null;
+export function __setGroupCardApplier(fn) { groupCardApplier = fn || null; }
+async function applyGroupCard(ev) {
+  if (groupCardApplier) return groupCardApplier(ev);
+  const m = await import('../product-hub/services/cdb-group-intake.js');
+  return m.applyCdbGroupEvent(ev);
+}
+/** まとまりの知らせを 1 つ取り込む (まとめての登録の直後)。誤りは投げない (取れなければ product-hub の sweep が続きをする) */
+async function tryGroupCard(db, eventId) {
+  try {
+    const r = await runGroupOutbox(db, applyGroupCard, { eventId, limit: 1 });
+    return r[0] || null;
+  } catch (e) {
+    console.error(`[master-edit] まとまりのカードの取り込みの失敗: ${e && e.message}`);
+    return { status: 'pending', error: String(e && e.message || e) };
+  }
+}
 /** 発注の設定の書き込み (新商品の登録の ② = Company DB の登録の後)。本番 = 発注アプリの部品 (request_id で 1 回だけ)。試験は差し替える (② だけ失敗する) */
 let orderWriter = writeRegistrationOrderSettings;
 export function __setOrderWriter(fn) { orderWriter = fn || writeRegistrationOrderSettings; }
+/** product-hub の下書きカードに同じ管理番号があるか (まとまりのコード = 楽天の商品管理番号・Render の SQLite)。試験は差し替える */
+let phDraftLookup = defaultPhDraftExists;
+export function __setPhDraftLookup(fn) { phDraftLookup = fn || defaultPhDraftExists; }
 /** 衝突を解く (既存のカードに結ぶ)。本番 = cdb-card-intake.js の linkCdbCardToExisting。試験は差し替える */
 let cardLinker = null;
 export function __setCardLinker(fn) { cardLinker = fn || null; }
@@ -514,15 +543,19 @@ router.post('/api/view-prefs', async (req, res) => {
 });
 router.get('/manual', (req, res) => res.render(view('manual.ejs'), { ...pageLocals(req), ui2: true, nav: 'manual', MAX_COMPONENTS }));
 
+/** 「色違い・サイズ違いのまとまり」の札を出すか (見せ方だけ) = DB の active を読めて、このコードが扱えて、products.parent が company。登録は lib が取引の中で読み直す */
+const variationOn = (owner) => !!owner && owner.readable && !owner.code_behind.length && owner.map['products.parent'] === 'company';
 // 新商品の登録 (画面 D)。つながらないときも画面は出す (帯・保存のボタンは出さない)
 router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
-  const kind = Object.prototype.hasOwnProperty.call(KINDS_NEW, String(req.query.kind || '')) ? String(req.query.kind) : 'single';
+  const want = String(req.query.kind || '');
   const page = db ? await readNewPage(db) : null;
   if (page) page.phase = { ...page.phase, owner: await screenOwner(db) };
   const shipping = await shippingRatesProvider();
   const locals = pageLocals(req, page ? page.phase : null);
   const owner = page ? page.phase.owner : null;
   const own = owner ? owner.map : {};
+  if (want === 'variation') return renderVariationNew(req, res, { db, dbError, page, shipping, locals, owner, own });
+  const kind = Object.prototype.hasOwnProperty.call(KINDS_NEW, want) ? want : 'single';
   // 新規開始の門 (2 層目・広げる道 PR-2): DB の開放の許可 (lease)・非常の止め。見せ方だけ (登録は lib が取引の中で読み直す)
   const lease = await readScreenNewEntry(db, kind);
   res.render(view('new.ejs'), {
@@ -539,8 +572,118 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     yahooDeliveries: Object.values(SHIPPING_METHOD_GROUPS), setPlanChoices: SET_PLAN_CHOICES, setDecisionReasons: SET_DECISION_REASONS,
     // 発注の設定 (発注アプリ・単品だけ。発注アプリはセットを扱わない)
     orderSettings: kind === 'single' ? orderScreen(req, editorGate(req), null) : null,
+    variationOn: variationOn(owner),
   });
 }));
+/**
+ * 新商品の登録の「色違い・サイズ違いのまとまり」(PR-7・見本 v2 = 中原さんと Codex の UI レビューで決めた形)。
+ * products.parent が company でない = まとまりの欄は出さない (「切替の前」の帯と種類の札だけ)。開いている = 単品の登録と同じ門 + 代表の持ち主
+ */
+async function renderVariationNew(req, res, { db, dbError, page, shipping, locals, owner, own }) {
+  const gated = !variationOn(owner);
+  const lease = await readScreenNewEntry(db, 'single');
+  const entryWhy = locals.closedWhy
+    || (VARIATION_KEYS.some((k) => own[k] !== 'company') ? '色違い・サイズ違いで書く項目の持ち主がまだ NE・/register' : '')
+    || (!lease.open ? lease.why : '')
+    || (!(page && page.backfillDone) ? '切替の手順の「既存の商品の登録の状態 (backfill)」がまだ' : '');
+  res.render(view('new-variation.ejs'), {
+    ...locals, nav: 'new', dbError, page, fmt, gated,
+    entryClosed: gated || !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || VARIATION_KEYS.some((k) => own[k] !== 'company') || !lease.open
+      || !writeConfigured() || !(page && page.backfillDone),
+    entryWhy,
+    maxKids: VARIATION_MAX_CHILDREN,
+    shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
+    orderSettings: orderScreen(req, editorGate(req), null),
+  });
+}
+// ─── 色違い・サイズ違いのまとまり (PR-7) ───
+/**
+ * 読むだけのまとまりの API (探す・1 つを読む・確かめる) も、画面と同じ持ち主の門で閉じる (#1679 Codex R1 Low)。
+ * DB の active を読めない = 503 owner_unreadable / このコードが扱えない持ち主がある・products.parent が company でない = 409 parent_not_company。通る = true
+ */
+async function variationReadGate(db, res) {
+  const owner = await screenOwner(db);
+  if (!owner || !owner.readable) {
+    res.status(503).json({ ok: false, error: '列ごとの持ち主 (Company DB の切替の記録) を読めないので、色違い・サイズ違いのまとまりは出せません。少し待ってからもう一度', reason: 'owner_unreadable' });
+    return false;
+  }
+  if (!variationOn(owner)) {
+    res.status(409).json({ ok: false, error: owner.code_behind.length ? `このサーバーのプログラムが古いので、色違い・サイズ違いのまとまりは出せません (Company DB の持ち主 ${owner.code_behind.join('・')} を扱えない)`
+      : '色違い・サイズ違いのまとまりは、まだ使えません (代表の正本を Company DB に切り替える前)', reason: 'parent_not_company' });
+    return false;
+  }
+  return true;
+}
+router.get('/api/variation/groups', (req, res) => withPgApi(res, async (db) => {
+  if (!(await variationReadGate(db, res))) return;
+  const q = String(req.query.q ?? '');
+  if (q.length > 60) return res.status(400).json({ ok: false, error: '長すぎます (60 字まで)' });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, items: await searchVariationGroups(db, q) });
+}));
+router.get('/api/variation/groups/:id', (req, res) => withPgApi(res, async (db) => {
+  if (!(await variationReadGate(db, res))) return;
+  const g = await readVariationGroup(db, String(req.params.id || ''), { now: new Date(clock()) });
+  if (!g) return res.status(404).json({ ok: false, error: 'このまとまりは見つからないか、まとまりではありません (新しいまとまりは「新しいまとまりを作る」で)', reason: 'not_a_group' });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, group: g });
+}));
+router.post('/api/variation/check', (req, res) => {
+  const b = req.body || {};
+  if ((Array.isArray(b.codes) && b.codes.length > VARIATION_MAX_CHILDREN * 3) || (Array.isArray(b.jans) && b.jans.length > VARIATION_MAX_CHILDREN * 3)) {
+    return res.status(413).json({ ok: false, error: `確かめるのは ${VARIATION_MAX_CHILDREN * 3} 件までです` });
+  }
+  return withPgApi(res, async (db) => {
+    if (!(await variationReadGate(db, res))) return;
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, ...(await checkVariationCodes(db, b, { phDraftExists: phDraftLookup })) });
+  });
+});
+router.post('/api/new/variation', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  const rid = String(b.request_id ?? '').trim().toLowerCase();
+  const kids = Array.isArray(b.children) ? b.children : [];
+  // 発注の設定 (発注アプリ): 単品の登録と同じ = ① の前に全部確かめる (1 つ目の子のコードで dry-run・同じ値を全部の子に)。誤り = 何も書かない
+  let order = null;
+  let orderInput = null;
+  try { order = orderInputOf(b.order_settings); } catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
+  if (order) {
+    const og = orderWriteGate(req, gate);
+    if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason, field: 'order_settings' });
+    orderInput = { ...order, supplierCode: b.values && b.values.primary_supplier != null ? b.values.primary_supplier : null, actor: String(req.session.email).trim().toLowerCase() };
+    const first = kids[0] && typeof kids[0].code === 'string' ? kids[0].code : null;
+    if (first && /^[0-9a-f-]{36}$/.test(rid)) {
+      try { if (!registrationOrderDone(subRequestId(rid, `order:${normSku(first)}`))) writeOrderSettings({ ...orderInput, code: first, via: 'master-edit:new', seen: 'validate-only' }, { dryRun: true }); }
+      catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
+    }
+  }
+  return withPgApi(res, async (db) => {
+    const r = await registerVariationBatch(db, {
+      actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: b.reason ?? null,
+      group: b.group, axes: b.axes ?? null, options: b.options, children: b.children, values: b.values, card: b.card,
+    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup });
+    // ② 発注アプリに子ごとに書く (① が通った後だけ・子の request_id ごとに 1 回 = 押し直しでも同じ)。失敗しても登録は成功のまま
+    let orderResult = null;
+    if (orderInput) {
+      const failed = [];
+      let ok = 0;
+      for (const k of r.children || []) {
+        try { orderWriter({ ...orderInput, code: k.code, requestId: subRequestId(r.request_id || rid, `order:${normSku(k.code)}`) }); ok++; }
+        catch (e) { console.error(`[master-edit] 発注の設定だけ保存できなかった (${k.code}): ${e && e.message}`); failed.push({ code: k.code, error: e instanceof OrderSettingsError ? e.message : '発注アプリに書けませんでした' }); }
+      }
+      orderResult = { ok: failed.length === 0, written: ok, failed };
+    }
+    // まとまりのカード (product-hub・まとまりで 1 枚) を保存の後で 1 回だけ試す (同じ取引ではない = 失敗しても登録はできている・続きは product-hub の sweep)
+    let card = null;
+    if (r.event_id && !r.replayed) {
+      const t = await tryGroupCard(db, r.event_id);
+      if (t) card = { status: t.status, label: CARD_STATUS_LABELS[t.status] || t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null };
+    }
+    res.json({ ...r, card, ...(orderInput ? { order_settings: orderResult } : {}) });
+  }, 'write');
+});
 
 router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const now = new Date(clock());
@@ -785,7 +928,7 @@ function regWrite(req, res, fn) {
   const opts = { open: isOpen(), nowMs: clock() };   // 持ち主表は lib が取引の中で DB の active を読む (広げる道 PR-2)
   return withPgApi(res, async (db) => res.json({ ok: true, ...(await fn(db, actor, req.body || {}, opts)) }), 'write');
 }
-router.post('/api/reg-csv/exports', (req, res) => regWrite(req, res, (db, actor, b, o) => buildRegExport(db, { actor, kind: b.kind, codes: b.codes, requestId: b.request_id }, o)));
+router.post('/api/reg-csv/exports', (req, res) => regWrite(req, res, (db, actor, b, o) => buildRegExport(db, { actor, kind: b.kind, codes: b.codes, requestId: b.request_id, variation: b.variation === true }, o)));
 router.post('/api/reg-csv/exports/:id/issue', (req, res) => regWrite(req, res, (db, actor, b, o) => issueRegExport(db, { actor, exportId: req.params.id, requestId: b.request_id }, o)));
 router.post('/api/reg-csv/exports/:id/declare', (req, res) => regWrite(req, res, (db, actor, b, o) => declareRegExport(db, {
   actor, exportId: req.params.id, sha256: b.sha256, result: b.result, neMessage: b.ne_message ?? null, importedAt: b.imported_at ?? null, note: b.note ?? null, requestId: b.request_id,

@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+  <link rel="stylesheet" href="<%= base %>/public/me-variation.css?v=<%= assetV %>">
+</head>
+<body>
+<%
+  // 新商品の登録 → 「色違い・サイズ違いのまとまり」(CompanyDB構想/20 v7 §④・§⑩ の PR-7)。
+  // 見た目と動きの正本 = 見本 v2 (色違いの登録_見本_20261009.html・中原さんと Codex の UI レビューで決めた形)。上から 1 → 7 の順・右に「すすみぐあい」・最後に確かめの窓。
+  // 保存 = POST /api/new/variation (lib/master-variation.mjs = 1 つの取引で全部か何も無いか)。画面の動き = public/me-variation.js
+  // 🚨 まとまりの欄は DB の active の products.parent が company のときだけ (gated = 「まだ選べません」の帯と種類の札だけ = 見本の「切替の前」)
+  const canSave = !!page && canEdit && !dbError && !entryClosed;
+  const dis = canSave ? '' : ' disabled';
+  const showForm = !!page && !gated;
+  const pageData = showForm ? {
+    base, canSave, maxKids,
+    suppliers: page.activeSuppliers.map((s) => [s.code, s.name]),
+    shipping: shippingRates ? shippingRates.map((r) => [r.code, r.method || '', r.cost]) : null,
+  } : null;
+%>
+  <%- include('_header', { hasSave: canSave }) %>
+  <div class="page" id="new-page">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">新商品の登録</span></nav>
+    <div class="ph">
+      <div>
+        <h1>新商品の登録</h1>
+        <div class="lead">上から 1 → 7 の順に入れると、色違い・サイズ違いの<span class="word">子 <small>(実際に売る商品)</small></span>をまとめて下書きにできます。NE への登録は、そのあと「NE 登録の CSV」で行います。</div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/manual#variation"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
+    </div>
+
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
+    <% if (page && gated) { %><div class="callout lock" id="gate-note"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">「色違い・サイズ違いのまとまり」は、まだ選べません</div><div class="hint">まとまりの正本を自社 DB に切り替えた後に出ます。それまでは単品・セットだけ (今と同じ) です。</div></div></div><% } %>
+    <% if (showForm && entryClosed) { %><div class="callout warn" id="closed-note"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">切替前です (<%= entryWhy || ('段階: ' + phaseText) %>)</div><div class="hint">この画面は見るだけです (保存を押しても「切替前」で断られ、何も変わりません)。</div></div></div><% } %>
+    <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+    <% if (showForm && !shippingRates) { %><div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">送料の表が読めないので、発送方法を選べません</div><div class="hint">発送方法は空のまま下書きにして、あとで商品の画面で入れられます。</div></div></div><% } %>
+
+    <% if (page && gated) { %>
+    <div class="kindcards" role="group" aria-label="種類">
+      <a class="kindcard" href="?kind=single"><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-tag"/></svg></span><span><span class="kt">単品</span><br><span class="ks">1 つの商品 (仕入れたもの・作ったもの)</span></span><span class="radio" aria-hidden="true"></span></a>
+      <a class="kindcard" href="?kind=set"><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-box"/></svg></span><span><span class="kt">セット</span><br><span class="ks">単品を組み合わせる (ギフト・まとめ買い)</span></span><span class="radio" aria-hidden="true"></span></a>
+    </div>
+    <% } %>
+
+    <% if (showForm) { %>
+    <form class="edit" id="f" novalidate autocomplete="off" data-can-save="<%= canSave ? '1' : '0' %>">
+      <div>
+        <nav class="jump" id="jump" aria-label="区切りへ飛ぶ">
+          <a href="#sec-kind" data-step="1"><span class="n">1</span> 種類</a>
+          <a href="#sec-group" data-step="2"><span class="n">2</span> まとまり</a>
+          <a href="#sec-axes" data-step="3"><span class="n">3</span> 軸</a>
+          <a href="#sec-opts" data-step="4"><span class="n">4</span> 選択肢</a>
+          <a href="#sec-common" data-step="5"><span class="n">5</span> 共通の欄</a>
+          <a href="#sec-kids" data-step="6"><span class="n">6</span> 子の一覧</a>
+          <a href="#sec-save" data-step="7"><span class="n">7</span> 確かめて保存</a>
+        </nav>
+        <nav class="jumpm" id="jumpm" aria-label="手順">
+          <button type="button" class="btn sm" data-stepnav="-1"><svg class="ic s" aria-hidden="true"><use href="#i-chevl"/></svg>前へ</button>
+          <span class="now" id="jumpm-now">1/7 種類</span>
+          <button type="button" class="btn sm" data-stepnav="1">次へ<svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg></button>
+        </nav>
+
+        <!-- 1 種類 -->
+        <section class="panel" id="sec-kind" aria-labelledby="h-kind">
+          <div class="panel-h"><span class="stepno" data-step="1" aria-hidden="true">1</span><h2 id="h-kind">種類</h2><span class="sub">何を登録しますか</span></div>
+          <div class="kindcards three" role="group" aria-label="種類">
+            <a class="kindcard" href="?kind=single" data-kind="single"><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-tag"/></svg></span><span><span class="kt">ひとつだけの商品</span><br><span class="ks">色やサイズの違いがない (今の「単品」)</span></span><span class="radio" aria-hidden="true"></span></a>
+            <a class="kindcard on" href="?kind=variation" data-kind="variation" aria-current="page"><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-layers"/></svg></span><span><span class="kt">色違い・サイズ違いのまとまり<span class="newtag">NEW</span></span><br><span class="ks">楽天の 1 ページに色・サイズが並ぶ商品</span></span><span class="radio" aria-hidden="true"></span></a>
+            <a class="kindcard" href="?kind=set" data-kind="set"><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-box"/></svg></span><span><span class="kt">セット</span><br><span class="ks">単品を組み合わせる (ギフト・まとめ買い)</span></span><span class="radio" aria-hidden="true"></span></a>
+          </div>
+        </section>
+
+        <!-- 2 まとまり -->
+        <section class="panel" id="sec-group" aria-labelledby="h-group">
+          <div class="panel-h"><span class="stepno" data-step="2" aria-hidden="true">2</span><h2 id="h-group">まとまり</h2><span class="sub">楽天の 1 つのページ = 1 つのまとまり</span></div>
+          <div class="modecards" role="radiogroup" aria-label="まとまりを新しく作るか、今あるものに足すか">
+            <button type="button" class="kindcard on" data-mode="new" role="radio" aria-checked="true"<%= dis %>><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-plus"/></svg></span><span><span class="kt">新しいまとまりを作る</span><br><span class="ks">新しい楽天のページを作るとき</span></span><span class="radio" aria-hidden="true"></span></button>
+            <button type="button" class="kindcard" data-mode="add" role="radio" aria-checked="false"<%= dis %>><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-search"/></svg></span><span><span class="kt">今あるまとまりに足す</span><br><span class="ks">今ある楽天のページに色・サイズを足すとき</span></span><span class="radio" aria-hidden="true"></span></button>
+          </div>
+          <div id="grp-new">
+            <div class="f"><label class="lab" for="g-code">まとまりのコード<span class="req">必須</span></label>
+              <div class="ctl"><input class="in w-m mono" id="g-code" maxlength="30" spellcheck="false" placeholder="例: hakama"<%= dis %>>
+                <span class="fmsg" id="g-code-msg" role="status" aria-live="polite"></span>
+                <span class="hint" style="flex-basis:100%">楽天の<b>商品管理番号</b>と同じものを打ちます · 英字 (大文字も)・数字・- _ だけ · 打ったとおりの書き方で NE に · <b style="color:var(--warn)">保存の後は変えられません</b></span></div></div>
+            <div class="f"><label class="lab" for="g-name">商品名<span class="req">必須</span></label>
+              <div class="ctl"><input class="in w-l" id="g-name" maxlength="255" placeholder="例: 子ども袴 2点セット"<%= dis %>>
+                <span class="hint" style="flex-basis:100%">まとまりの名前にもなります (1 つの欄) · 子の名前は ここ +【カラー】【サイズ】【JAN】で自動で作ります · 例: <b id="g-name-ex" style="color:var(--text)">—</b></span>
+                <span class="hint" style="flex-basis:100%">ある子だけ名前を変えるときは、6 の一覧の「変える」で</span></div></div>
+          </div>
+          <div id="grp-add" hidden>
+            <div id="g-searchbox">
+              <div class="bigsearch"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg><input id="g-q" maxlength="60" placeholder="まとまりのコードか名前で探す (例: blanket・ストール)" aria-label="まとまりを探す"<%= dis %>></div>
+              <div class="gres" id="g-results"></div>
+            </div>
+            <div id="g-picked"></div>
+          </div>
+        </section>
+
+        <!-- 3 軸 -->
+        <section class="panel" id="sec-axes" aria-labelledby="h-axes">
+          <div class="panel-h"><span class="stepno" data-step="3" aria-hidden="true">3</span><h2 id="h-axes">軸 <small style="font-weight:400;font-size:14px;color:#b4c3df">(色やサイズの分け方)</small></h2><span class="sub">横 = 色など · 縦 = サイズなど</span></div>
+          <div id="axes-box"></div>
+          <div class="anat" id="anat" aria-live="polite"></div>
+        </section>
+
+        <!-- 4 選択肢 -->
+        <section class="panel" id="sec-opts" aria-labelledby="h-opts">
+          <div class="panel-h"><span class="stepno" data-step="4" aria-hidden="true">4</span><h2 id="h-opts">選択肢</h2><span class="sub">1 行に 1 つ「名前 / コードにつける文字」· まとめて貼れます</span></div>
+          <div class="empty" id="opt-wait" hidden>先に 2 でまとまりを選んでください</div>
+          <div id="opt-eq"></div>
+          <div id="old-box"></div>
+          <div class="optgrid" id="opt-grid">
+            <div class="optcard h" id="optc-0">
+              <div class="oh"><span class="t" id="opt-t-0">横軸の選択肢</span><span class="b mute right" id="opt-n-0">0 つ</span></div>
+              <div class="example" id="opt-ex-0">例: ブラウン / <code>-BR</code></div>
+              <label class="lab3" for="opt-0" id="opt-l-0">1 行に 1 つ: 名前 / コードにつける文字</label>
+              <textarea class="in" id="opt-0" spellcheck="false"<%= dis %>></textarea>
+              <div id="opt-p-0"></div>
+            </div>
+            <div class="optcard v" id="optc-1">
+              <div class="oh"><span class="t" id="opt-t-1">縦軸の選択肢</span><span class="b mute right" id="opt-n-1">0 つ</span></div>
+              <div class="example" id="opt-ex-1">例: 90cm / <code>-90</code></div>
+              <label class="lab3" for="opt-1" id="opt-l-1">1 行に 1 つ: 名前 / コードにつける文字</label>
+              <textarea class="in" id="opt-1" spellcheck="false"<%= dis %>></textarea>
+              <div id="opt-p-1"></div>
+            </div>
+          </div>
+          <div id="next-box"></div>
+          <div class="hint" style="margin-top:10px">区切りは「/」かタブ (Excel から 2 列のまま貼れます) · コードにつける文字は「-」から入れて英字・数字 (10 字まで) · 大文字も使えます · 保存の後は変えられません (名前はあとで直せます)</div>
+        </section>
+
+        <!-- 5 共通の欄 -->
+        <section class="panel" id="sec-common" aria-labelledby="h-common">
+          <div class="panel-h"><span class="stepno" data-step="5" aria-hidden="true">5</span><h2 id="h-common">共通の欄</h2><span class="sub">1 回入れると、全部の子に入ります</span></div>
+          <div id="c-copied"></div>
+          <div class="subh"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>お金</div>
+          <div class="f"><label class="lab" for="c-price">売価<span class="req">必須</span></label>
+            <div class="ctl"><span class="yen"><input class="in w-s" id="c-price" inputmode="numeric" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">標準売価 · 税込 · ある子だけ変えるときは 6 の一覧で</span><div id="cf-price" style="flex-basis:100%"></div></div></div>
+          <div class="f"><label class="lab" for="c-cost">原価<span class="opt">あとでも可</span></label>
+            <div class="ctl"><span class="yen"><input class="in w-s" id="c-cost" inputmode="numeric" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">今日から · ある子だけ変えるときは 6 の一覧で</span><div id="cf-cost" style="flex-basis:100%"></div></div></div>
+          <div class="subh"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>税・分類・仕入先</div>
+          <div class="f"><div class="lab" id="lab-c-tax">税率<span class="req">必須</span></div>
+            <div class="ctl"><div class="seg" role="group" id="c-tax" aria-labelledby="lab-c-tax" data-field="tax" data-value=""><button type="button" data-v="0.08" aria-pressed="false"<%= dis %>>8% <small>軽減 · 食品</small></button><button type="button" data-v="0.1" aria-pressed="false"<%= dis %>>10% <small>標準</small></button></div><div id="cf-tax" style="flex-basis:100%"></div></div></div>
+          <div class="f"><div class="lab" id="lab-c-sales">売上分類<span class="req">必須</span></div>
+            <div class="ctl"><div class="seg" role="group" id="c-sales" aria-labelledby="lab-c-sales" data-field="sales" data-value=""><button type="button" data-v="1" aria-pressed="false"<%= dis %>>1 自社</button><button type="button" data-v="2" aria-pressed="false"<%= dis %>>2 取引先限定</button><button type="button" data-v="3" aria-pressed="false"<%= dis %>>3 仕入</button><button type="button" data-v="4" aria-pressed="false"<%= dis %>>4 輸出</button></div><div id="cf-sales" style="flex-basis:100%"></div></div></div>
+          <div class="f"><label class="lab" for="f-primary_supplier">代表の仕入先<span class="req">必須</span></label>
+            <div class="ctl"><select class="in w-m" id="f-primary_supplier"<%= dis %>><option value="">(選ぶ)</option><% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"><%= s.code %> <%= s.name %></option><% } %></select><span class="hint">NE で必須の項目です · 発注条件グループはこの仕入先のものから選びます</span><div id="cf-supplier" style="flex-basis:100%"></div></div></div>
+          <div class="subh"><svg class="ic" aria-hidden="true"><use href="#i-truck"/></svg>発送・ロジザード</div>
+          <div class="f"><label class="lab" for="c-ship">発送方法<span class="opt">あとでも可</span></label>
+            <div class="ctl"><select class="in w-m" id="c-ship"<%= dis %><%= shippingRates ? '' : ' disabled' %>><option value="">(あとで)</option><% for (const r of (shippingRates || [])) { %><option value="<%= r.code %>"><%= r.code %> <%= r.method || '' %> / <%= fmt.yen(r.cost) %> 円</option><% } %></select><span class="hint">届いてサイズを見てから決めるときは空のまま</span><div id="cf-ship" style="flex-basis:100%"></div></div></div>
+          <div class="f"><label class="lab" for="c-months">推奨保有月数<span class="req">必須</span></label>
+            <div class="ctl"><span class="stepper"><button type="button" data-step="-1" aria-label="1 か月へらす"<%= dis %>>−</button><input id="c-months" inputmode="decimal" placeholder="—"<%= dis %>><button type="button" data-step="1" aria-label="1 か月ふやす"<%= dis %>>＋</button></span><span class="unit">か月</span><span class="hint">0〜60 · 持たない商品は 0</span><div id="cf-months" style="flex-basis:100%"></div></div></div>
+          <div class="f"><div class="lab" id="lab-c-expiry">ロジザードの有効期限の管理<span class="req">必須</span></div>
+            <div class="ctl"><div class="seg" role="group" id="c-expiry" aria-labelledby="lab-c-expiry" data-field="expiry" data-value=""><button type="button" data-v="0" aria-pressed="false"<%= dis %>>なし</button><button type="button" data-v="1" aria-pressed="false"<%= dis %>>あり</button></div><span class="hint">賞味期限・使用期限のある商品は あり</span><div id="cf-expiry" style="flex-basis:100%"></div></div></div>
+          <div class="f"><div class="lab" id="lab-c-inbound">ロジザードの入荷日の管理</div>
+            <div class="ctl"><div class="seg" role="group" id="c-inbound" aria-labelledby="lab-c-inbound" data-field="inbound" data-value="0"><button type="button" data-v="0" aria-pressed="true" class="on"<%= dis %>>なし</button><button type="button" data-v="1" aria-pressed="false"<%= dis %>>あり</button></div><span class="hint">最初の値だけ · あとはロジザードが正</span><div id="cf-inbound" style="flex-basis:100%"></div></div></div>
+        </section>
+
+        <%# 5 のつづき: 発注の設定 (今の単品の画面と同じ部品 = _order.ejs・public/me-order.js)。全部の子に同じ値 (登録の後に子ごとに発注アプリへ) %>
+        <%- include('_order', { os: orderSettings, mode: 'new', dis, stepNo: '5', base, code: null, subExtra: ' · 全部の子に同じ値' }) %>
+
+        <!-- 5 のつづき: 出品カード -->
+        <section class="panel" id="sec-card" aria-labelledby="h-card">
+          <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-layers"/></svg></span><h2 id="h-card">出品カード (product-hub)</h2><span class="sub">5 のつづき · まとまりで 1 枚</span></div>
+          <div id="card-note"></div>
+          <div id="card-fields">
+            <div class="f"><label class="lab" for="official-url">公式ページ URL</label><div class="ctl"><input class="in w-l" id="official-url" placeholder="https://"<%= dis %>></div></div>
+            <div class="f"><label class="lab" for="amazon-url">Amazon URL</label><div class="ctl"><input class="in w-l" id="amazon-url" placeholder="https://www.amazon.co.jp/dp/…"<%= dis %>></div></div>
+          </div>
+        </section>
+
+        <!-- 6 子の一覧 -->
+        <section class="panel" id="sec-kids" aria-labelledby="h-kids">
+          <div class="panel-h"><span class="stepno" data-step="6" aria-hidden="true">6</span><h2 id="h-kids">子の一覧</h2><span class="sub">子 = 実際に売る商品 · 作る組み合わせはマス目で選ぶ · 子ごとに変えられるのは 名前・売価・原価・JAN だけ</span></div>
+          <div id="kids-box"></div>
+        </section>
+
+        <!-- 7 確かめて保存 -->
+        <section class="panel hud" id="sec-save" aria-labelledby="h-save7">
+          <div class="panel-h"><span class="stepno" data-step="7" aria-hidden="true">7</span><h2 id="h-save7">確かめて下書きに保存</h2><span class="sub">打つたびに確かめています · 保存のときにサーバーも同じ決まりで確かめます</span></div>
+          <div id="checks" aria-live="polite"></div>
+          <div class="savefoot">
+            <span class="hint">全部の子が 1 回でまとめて下書きになります。1 つでもだめなら何もできません (半分だけできることはありません)。</span>
+            <button class="btn pri lg" type="button" id="save2" disabled>コードを確定して下書き保存</button>
+          </div>
+          <div id="result" aria-live="polite"></div>
+        </section>
+      </div>
+
+      <aside class="side" aria-label="すすみぐあい">
+        <section class="panel savebox hud" id="savebox" aria-labelledby="h-save" tabindex="-1">
+          <div class="mobilebar"><span class="grow"><b class="mb-n" id="mb-n">—</b></span><button class="btn soft sm" type="button" id="savebox-toggle" aria-expanded="false" aria-controls="savebox">すすみぐあい</button></div>
+          <h2 class="sr" id="h-save">すすみぐあいと下書きの保存</h2>
+          <div class="remain" id="remain" aria-live="polite">—</div>
+          <div class="hint aux" style="margin-bottom:4px">押すとその場所へ飛びます</div>
+          <ul class="checklist" id="hud-steps"></ul>
+          <div class="meter" id="hud-meter" style="margin:0 0 14px 10px"></div>
+          <% if (canSave) { %>
+          <label class="lab2" for="reason">理由 (なくてもよい)</label>
+          <input class="in" id="reason" maxlength="200" autocomplete="off" placeholder="例: 10 月の新商品">
+          <% } %>
+          <button class="btn pri lg block" id="save" disabled type="button" aria-keyshortcuts="Control+S">コードを確定して下書き保存</button>
+          <div class="below"><span>保存すると、子が全部「下書き」になります</span></div>
+        </section>
+        <section class="panel" aria-labelledby="h-after">
+          <div class="panel-h" style="margin-bottom:8px"><h2 id="h-after">登録のあと</h2></div>
+          <ol class="after-steps">
+            <li class="first">下書き (この画面) — 子を全部 1 回で</li>
+            <li>NE 登録の CSV — 回ごとに 1 ファイル (<span id="after-n">子 0 行</span>) · <a href="<%= base %>/reg-csv">NE 登録の CSV</a></li>
+            <li>NE の画面で取り込む → 申告 (一部だけ入ったら「一部」と申告)</li>
+            <li>翌朝の確かめ (NE と同じか・子ごと)</li>
+            <li>登録済み = 業務で使える</li>
+          </ol>
+        </section>
+      </aside>
+    </form>
+    <script type="application/json" id="me-variation"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
+    <% } %>
+  </div>
+
+  <%- include('_footer') %>
+  <div class="modal-bg" id="confirm-bg" role="dialog" aria-modal="true" aria-labelledby="confirm-h">
+    <div class="modal conf">
+      <h2 id="confirm-h"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>これで下書きにします</h2>
+      <div id="confirm-fixed"></div>
+      <table class="sumtbl" id="confirm-body"></table>
+      <div class="mbtns"><button class="btn" type="button" id="confirm-no">戻って直す</button><button class="btn pri" type="button" id="confirm-yes" disabled>コードを確定して下書き保存</button></div>
+    </div>
+  </div>
+  <% if (showForm) { %><script src="<%= base %>/public/me-variation.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (showForm && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
+</body>
+</html>
