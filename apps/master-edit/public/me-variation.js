@@ -304,7 +304,8 @@
     if (pk) {
       $('#g-results').innerHTML = '';
       $('#g-picked').innerHTML = '<div class="picked"><div class="ph2"><span class="pc">' + esc(pk.code) + '</span><span class="pn">' + esc(pk.name) + '</span>' + srcBadge(pk)
-        + '<span class="acts"><button type="button" class="btn sm" data-act="repick"' + (canSave ? '' : ' disabled') + '>' + icon('undo', 's') + 'えらび直す</button></span></div>'
+        + '<span class="acts">' + (ME.vops ? '<button type="button" class="btn sm" data-act="rename"' + (canSave ? '' : ' disabled') + '>' + icon('edit', 's') + '名前を直す</button>' : '')
+        + '<button type="button" class="btn sm" data-act="repick"' + (canSave ? '' : ' disabled') + '>' + icon('undo', 's') + 'えらび直す</button></span></div>'
         + '<div class="hint" style="margin-top:6px">まとまりのコードと今ある子は変わりません。新しい子の名前は「' + esc(pk.name) + '【…】」で作ります。今ある子 ' + pk.kids.length + ' 件:</div>'
         + '<div class="kidchips">' + pk.kids.map(function (c) { return '<span class="compchip"><span class="mono">' + esc(c) + '</span></span>'; }).join('') + '</div></div>';
       return;
@@ -805,6 +806,20 @@
       .catch(function () { if (my !== pickSeq) return; S.pk = null; S.results = { error: 'つながりません。少し待ってから', items: [] }; full(); });
   }
 
+  /** 名前を直した後: 選んだまとまりだけを読み直す (入れた選択肢・共通の欄・子の変更はそのまま。新しい子の自動の名前は新しいまとまりの名前から) */
+  function refreshGroup(id) {
+    fetch(BASE + '/api/variation/groups/' + encodeURIComponent(id), { headers: { Accept: 'application/json' } })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
+      .then(function (x) {
+        if (!x.r.ok || !x.j.ok || !S.pk || S.pk.id !== String(id)) return;
+        var pk = groupView(x.j.group);
+        S.pk = pk;
+        if (pk.axes) S.axisName = pk.axes.map(function (a) { return a.name; }).concat(['']).slice(0, 2);
+        renderGroup(); renderAxes(); update();
+      })
+      .catch(function () { /* 読めない = 前の表示のまま (保存の時に DB が見る) */ });
+  }
+
   // ---------- 動き ----------
   function toast(t) { if (ME.toast) ME.toast(t); }
   function go(sel) {
@@ -927,6 +942,7 @@
     if (d.mode) { if (S.mode !== d.mode) { var keep = { gcode: S.gcode, gname: S.gname }; S = fresh(); S.mode = d.mode; if (d.mode === 'new') Object.assign(S, keep); else searchGroups(); full(); } return; }
     if (d.pick) return pickGroup(d.pick);
     if (d.gotopick) { S.mode = 'add'; return pickGroup(d.gotopick); }
+    if (d.act === 'rename') { if (S.pk && ME.vops) { var gid0 = S.pk.id; ME.vops.openLabels(gid0, { onDone: function () { refreshGroup(gid0); } }); } return; }
     if (d.act === 'repick') { S = fresh(); S.mode = 'add'; full(); searchGroups(); setTimeout(function () { $('#g-q').focus(); }, 0); return; }
     if (d.act === 'split') return doSplit();
     if (d.act === 'unsplit') return unSplit();

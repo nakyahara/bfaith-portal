@@ -255,7 +255,15 @@
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-layers"/></svg></span><h2 id="h-basic">色違い・サイズ違い</h2><span class="sub">どのまとまりに入るか (名前と取扱は上の見出しのところで直します)</span></div>
           <%# 🆕 PR-7 (CompanyDB構想/20 §④): 代表 (親) は新商品の登録の時に 1 回だけ決める = この画面では直さない (読むだけ) %>
           <div class="f" data-row="parent_code"><div class="lab" id="lab-parent_code">まとまり (代表)</div><div class="ctl"><span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><% if (c.parent_code) { %><span class="mono"><%= c.parent_code %></span> <%= c.parent_name || '' %><% } else { %>なし (ひとつだけの商品)<% } %></span></span>
-            <span class="hint"><%= c.parent_code ? (c.parent_set_by === 'manual' ? 'ポータルで決めた · ' : c.parent_set_by === 'load' ? 'NE から · ' : '') : '' %>代表は新商品の登録の時に 1 回だけ決めます (この画面では変えません) · 色・サイズを足すときは「新商品の登録」の「色違い・サイズ違いのまとまり」→「今あるまとまりに足す」</span></div></div>
+            <span class="hint"><%= c.parent_code ? (c.parent_set_by === 'manual' ? 'ポータルで決めた · ' : c.parent_set_by === 'load' ? 'NE から · ' : '') : '' %>代表は新商品の登録の時に 1 回だけ決めます (この画面では変えません) · 色・サイズを足すときは「新商品の登録」の「色違い・サイズ違いのまとまり」→「今あるまとまりに足す」</span>
+            <%# 🆕 PR-7b: まとまりの名前を直す・子の廃止・quarantined の代表の採用 (products.parent が company のときだけ・決まりは Company DB が全部見る) %>
+            <% if (locals.variationOn && canEdit && !closed) { const vreg = c.registration ? c.registration.state : null; %>
+              <span class="vops-acts" style="display:flex;gap:8px;flex-wrap:wrap;flex-basis:100%">
+              <% if (c.parent_product_id) { %><button type="button" class="btn sm" data-vops="labels" data-gid="<%= c.parent_product_id %>"><svg class="ic s" aria-hidden="true"><use href="#i-edit"/></svg>まとまりの名前を直す</button>
+                <% if (vreg === 'draft' || vreg === 'ne_pending') { %><button type="button" class="btn sm danger" data-vops="cancel" data-code="<%= c.code %>">このまとまりから外す (廃止)</button><% } %>
+              <% } else if (vreg === 'quarantined') { %><button type="button" class="btn sm pri" data-vops="adopt" data-code="<%= c.code %>">NE の代表を採用する</button><span class="hint">NE で直接作られた商品 (要確認) = 最新の照合で NE に見えた代表を 1 回だけ入れます</span><% } %>
+              </span>
+            <% } %></div></div>
         </section>
       <% } else { %>
         <% if (c.component_request) { const rq = c.component_request; const curMap = new Map(c.components.map((x) => [x.code, x.qty])); const reqMap = new Map(rq.rows.map((x) => [x.code, x.qty]));
@@ -543,6 +551,8 @@
   <% } %>
   </div>
   <%- include('_footer') %>
+  <%# 🆕 PR-7b: まとまりの操作の窓 (名前を直す・子の廃止・代表の採用) %>
+  <% if (page && locals.variationOn && canEdit && !closed) { %><%- include('_vops') %><script src="<%= base %>/public/me-vops.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-sku.js?v=<%= assetV %>" defer></script><% } %>
   <%# me-order.js は me-sku.js の後 (MasterEdit.dirty に発注の設定の未保存を足す) %>
   <% if (page && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>

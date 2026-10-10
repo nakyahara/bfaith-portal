@@ -394,6 +394,62 @@ await ta('[+] 商品の画面の代表 (親) = 見るだけ (保存の欄が無�
   await p.waitForURL(/kind=variation/);
 });
 
+console.log('\nまとまりの操作 (PR-7b)');
+await ta('[⑨] 名前を直す (今あるまとまりを選んだとき): 窓 = まとまりの名前・軸の名前・選択肢名 (コードにつける文字は 🔒)・変えた所だけ送る・入れた選択肢はそのまま・新しい子の名前は新しいまとまりの名前から', async (p) => {
+  await p.goto(B + '/new?kind=variation');
+  await pickGroup(p, 'blanket', 'blanket-fl');
+  await fill(p, '#opt-0', 'ホワイト / -WH');
+  await p.click('#g-picked [data-act="rename"]');
+  await p.waitForSelector('#vl-bg.on #vl-name');
+  assert.equal(await p.isDisabled('#vl-yes'), true, '変えるまで押せない');
+  assert.match(await p.innerText('#vl-body'), /-BR[\s\S]*-BE[\s\S]*-GY/);
+  await p.fill('#vl-name', 'フランネル ブランケット 冬');
+  await p.fill('#vl-body .vl-opt[data-code="-BR"]', 'チョコ');
+  await p.click('#vl-yes');
+  await p.waitForFunction(() => !document.querySelector('#vl-bg').classList.contains('on'));
+  await p.waitForFunction(() => /フランネル ブランケット 冬/.test(document.querySelector('#g-picked').innerText));
+  assert.equal(await p.inputValue('#opt-0'), 'ホワイト / -WH', '入れた選択肢はそのまま');
+  await settle(p);
+  assert.match(await p.textContent('#kids-box .krow .nm'), /^フランネル ブランケット 冬【ホワイト】/);
+  assert.match(await p.innerText('#opt-p-0'), /チョコ/);
+  const g = await V.readVariationGroup(db, BL.group_product_id);
+  assert.deepEqual([g.name, g.options.find((o) => o.code === '-BR').name], ['フランネル ブランケット 冬', 'チョコ']);
+  assert.equal((await one(`select name from core.skus where code = 'blanket-fl-BR'`)).name, 'フランネル ブランケット【ブラウン】', '子の商品名は自動では変えない');
+});
+
+await ta('[⑩] 商品の画面: まとまりの子 = 「まとまりの名前を直す」「このまとまりから外す (廃止)」(理由が要る・通ったら読み直す) / NE で直接作られた商品 = 「NE の代表を採用する」(照合がまだ = 断りの文) / products.parent が load = 出さない', async (p) => {
+  await p.goto(B + '/sku/hakama-kids-WH-100');
+  assert.equal(await p.locator('[data-vops="labels"]').count(), 1);
+  await p.click('[data-vops="cancel"]');
+  await p.waitForSelector('#vc-bg.on');
+  assert.equal(await p.isDisabled('#vc-yes'), true, '理由を入れるまで押せない');
+  await p.fill('#vc-reason', 'この色は作らない');
+  await p.click('#vc-yes');
+  await p.waitForFunction(() => !document.querySelector('#vc-bg').classList.contains('on'));
+  await p.waitForLoadState('load');
+  await p.waitForFunction(() => /やめた|登録をやめた/.test(document.body.innerText));
+  assert.equal((await one(`select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code = 'hakama-kids-WH-100'`)).state, 'cancelled');
+  // NE で直接作られた商品 (quarantined) = 採用のボタン。照合の観測がまだ = 断りの文 (何もしない)
+  const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
+  const { basePlan, skuOf } = await import('./fixtures/master-variation-db.mjs');
+  const lr = await runInitialLoad(db, basePlan([skuOf('q-ui-RD', 'ウールストール【レッド】', { representativeCode: 'ws100', representativeState: 'value' })]), { log: () => {}, runId: 'load_vg7b_ui', now: new Date(Date.now() - 4 * 86400e3) });
+  assert.equal(lr.ok, true, lr.error);
+  await p.goto(B + '/sku/q-ui-RD');
+  assert.equal(await p.locator('[data-vops="cancel"]').count(), 0);
+  await p.click('[data-vops="adopt"]');
+  await p.waitForSelector('#vc-bg.on');
+  assert.equal(await p.isDisabled('#vc-yes'), false, '採用の理由はなくてもよい');
+  await p.click('#vc-yes');
+  await p.waitForFunction(() => /照合|NE の/.test(document.querySelector('#vc-msg').textContent));
+  assert.ok(await p.isVisible('#vc-bg.on'), '断られたら窓は閉じない');
+  await p.keyboard.press('Escape');
+  await T.W2.setActiveOwnershipInDb(pg, { ...T.ALL_COMPANY, 'products.parent': 'load' });
+  try {
+    await p.goto(B + '/sku/hakama-kids-WH-110');
+    assert.equal(await p.locator('[data-vops]').count(), 0);
+  } finally { await T.W2.setActiveOwnershipInDb(pg, T.ALL_COMPANY); }
+});
+
 console.log('\nスマホの幅');
 for (const w of [390, 360]) {
   await ta(`[📱${w}] はみ出さない・押す所は 44px 以上・種類は縦・手順の帯「n/7」(前へ / 次へ)・キーボードの間は下の帯を小さく・30 件をこえたら「パソコンがおすすめ」`, async (p) => {
