@@ -49,10 +49,13 @@
         <nav class="jump" id="jump" aria-label="区切りへ飛ぶ">
           <% for (const [id, t] of secs) { %><a href="#<%= id %>" data-sec="<%= id %>"><span class="n"><%= no(id) %></span> <%= t %></a><% } %>
         </nav>
-        <div class="kindcards" role="group" aria-label="種類">
-          <a class="kindcard<%= isSet ? '' : ' on' %>" href="?kind=single"<%- isSet ? '' : ' aria-current="page"' %>><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-tag"/></svg></span><span><span class="kt">単品</span><br><span class="ks">1 つの商品 (仕入れたもの・作ったもの)</span></span><span class="radio" aria-hidden="true"></span></a>
+        <%# 種類は 3 枚 (PR-7・見本 v2): ひとつだけ / 色違い・サイズ違いのまとまり / セット。まとまりの札は products.parent が company のときだけ (今は 2 枚 + 「まだ選べません」の帯) %>
+        <div class="kindcards<%= variationOn ? ' three' : '' %>" role="group" aria-label="種類">
+          <a class="kindcard<%= isSet ? '' : ' on' %>" href="?kind=single"<%- isSet ? '' : ' aria-current="page"' %>><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-tag"/></svg></span><span><span class="kt"><%= variationOn ? 'ひとつだけの商品' : '単品' %></span><br><span class="ks"><%= variationOn ? '色やサイズの違いがない (今の「単品」)' : '1 つの商品 (仕入れたもの・作ったもの)' %></span></span><span class="radio" aria-hidden="true"></span></a>
+          <% if (variationOn) { %><a class="kindcard" href="?kind=variation" data-kind="variation"><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-layers"/></svg></span><span><span class="kt">色違い・サイズ違いのまとまり<span class="newtag">NEW</span></span><br><span class="ks">楽天の 1 ページに色・サイズが並ぶ商品</span></span><span class="radio" aria-hidden="true"></span></a><% } %>
           <a class="kindcard<%= isSet ? ' on' : '' %>" href="?kind=set"<%- isSet ? ' aria-current="page"' : '' %>><span class="kico"><svg class="ic l" aria-hidden="true"><use href="#i-box"/></svg></span><span><span class="kt">セット</span><br><span class="ks">単品を組み合わせる (ギフト・まとめ買い)</span></span><span class="radio" aria-hidden="true"></span></a>
         </div>
+        <% if (!variationOn) { %><div class="callout lock vgate" id="gate-note"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">「色違い・サイズ違いのまとまり」は、まだ選べません</div><div class="hint">まとまりの正本を自社 DB に切り替えた後に出ます。それまでは単品・セットだけ (今と同じ) です。</div></div></div><% } %>
 
         <section class="panel" id="sec-code" aria-labelledby="h-code">
           <div class="panel-h"><span class="stepno" data-step="sec-code" aria-hidden="true"><%= no('sec-code') %></span><h2 id="h-code">コードと名前</h2></div>

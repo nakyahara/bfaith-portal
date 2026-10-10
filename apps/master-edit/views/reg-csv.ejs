@@ -19,11 +19,14 @@
     const shortSha = (s) => (s ? String(s).slice(0, 8) + '…' + String(s).slice(-6) : '');
     let pipe = null;
     if (S && S.applied) {
-      const buildable = S.candidates.filter((c) => !c.blockers.length).length;
+      // 🆕 PR-7: まとまりの子は回ごとに 1 ファイル (作れる回の子の数も数える)
+      const vRounds = (S.variation || []).flatMap((g) => g.rounds.map((r) => ({ ...r, multi: g.pending_rounds > 1 })));
+      const buildable = S.candidates.filter((c) => !c.blockers.length).length + vRounds.filter((r) => r.buildable && !r.multi).reduce((a, r) => a + r.codes.length, 0);
+      const vPending = vRounds.reduce((a, r) => a + r.pending, 0);
       const by = (st) => S.exports.filter((e) => e.state === st);
       const verifiedItems = S.exports.reduce((a, e) => a + e.items.filter((i) => i.state === 'verified').length, 0);
       pipe = [
-        { n: '① 作る', t: 'CSV にする', c: buildable, u: '件 作れる', s: `下書き・NE 登録待ち ${S.candidates.length} 件のうち`, hot: buildable > 0 },
+        { n: '① 作る', t: 'CSV にする', c: buildable, u: '件 作れる', s: `下書き・NE 登録待ち ${S.candidates.length + vPending} 件のうち`, hot: buildable > 0 },
         { n: '② 配る', t: 'ダウンロード', c: by('built').length, u: '件', s: '作って まだ配っていない', hot: by('built').length > 0 },
         { n: '③ NE で取り込む', t: 'NE の画面で', c: by('issued').length, u: '件 待ち', s: by('issued').length ? 'ファイル ' + by('issued').map((e) => '#' + e.export_id).join('・') + ' · 取り込めば翌朝自動で確かめる' : '配ったファイルを NE で取り込む (申告はしなくてよい)', hot: by('issued').length > 0, ne: true },
         { n: '④ 申告', t: '「N件失敗」なら必ず', c: by('declared').length, u: '件', s: '全部成功なら要らない (翌朝の照合で確かめる)', hot: false },
@@ -107,6 +110,34 @@
       <div class="msgline" id="build-msg" role="status" aria-live="polite"></div>
       <% } %>
     </section>
+
+    <% if (S.variation && S.variation.length) { %>
+    <%# 🆕 PR-7: 色違い・サイズ違いのまとまり = 回 (まとめての登録 1 回) ごとに 1 ファイル (ne-reg-variation-v1・代表商品コード = まとまりのコード・JAN は empty) %>
+    <section class="panel" id="vcands" aria-labelledby="h-vcands">
+      <div class="panel-h"><span class="hico" aria-hidden="true">①</span><h2 id="h-vcands">色違い・サイズ違いのまとまり</h2><span class="sub">回 (まとめての登録 1 回) ごとに 1 ファイル · 代表商品コードの列 = まとまりのコード · JAN は送りません</span></div>
+      <% for (const g of S.variation) { %>
+      <article class="filecard vgroup" data-gid="<%= g.group_product_id %>" aria-labelledby="vg-<%= g.group_product_id %>">
+        <div class="fh"><span class="ttl" id="vg-<%= g.group_product_id %>"><span class="mono"><%= g.group_code %></span> <%= g.group_name || '' %></span><span class="b info">まとまり · <%= g.rounds.length %> 回</span></div>
+        <% if (g.pending_rounds > 1) { const all = g.rounds.flatMap((r) => r.codes); const allOk = g.rounds.every((r) => !r.pending || r.buildable); %>
+        <div class="callout warn" style="margin:8px 0"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= g.rounds.filter((r) => r.pending).map((r) => r.no ? '回 ' + r.no : '回の分からない子').join('・') %> がどちらもまだファイルになっていません</div>
+          <div class="hint">今の決まり (Company DB) では、まとまりの NE 登録待ちの子は全部 1 つのファイルに入れます = この 2 つは回ごとには分けられません。次からは、1 回目を保存したら先にその回のファイルを作ってから「残りを足す」と、回ごとに 1 ファイルになります。</div>
+          <div style="margin-top:8px"><button class="btn pri" type="button" data-act="build-variation" data-codes="<%= JSON.stringify(all) %>"<%= canAct && allOk ? '' : ' disabled' %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>まとめて 1 ファイル (<%= all.length %> 件) を作る</button></div></div></div>
+        <% } %>
+        <% for (const r of g.rounds) { %>
+        <div class="vround" style="border-top:1px dashed var(--line-soft);padding:10px 0">
+          <div style="display:flex;gap:8px 14px;align-items:center;flex-wrap:wrap"><b><%= r.no ? '回 ' + r.no : '回の分からない子' %></b><span class="hint"><%= r.created_at ? when(r.created_at) + ' に登録' : '' %> · 子 <%= r.kids.length %> 件<%= r.pending !== r.kids.length ? ' (ファイルあり ' + (r.kids.length - r.pending) + ' 件)' : '' %></span>
+            <% if (r.pending) { %><button class="btn <%= g.pending_rounds > 1 ? 'soft' : 'pri' %> sm" type="button" data-act="build-variation" data-codes="<%= JSON.stringify(r.codes) %>"<%= canAct && r.buildable && g.pending_rounds === 1 ? '' : ' disabled' %>><svg class="ic s" aria-hidden="true"><use href="#i-file"/></svg>この回の <%= r.codes.length %> 件の CSV を作る</button><% } %></div>
+          <div class="kidchips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+          <% for (const k of r.kids) { %><a class="compchip" href="<%= base %>/sku/<%= encodeURIComponent(k.code) %>" title="<%= k.blockers.join(' / ') %>"><span class="mono"><%= k.code %></span><% if (k.live) { %> <span class="b mute">#<%= k.live.export_id %></span><% } else if (k.blockers.length) { %> <span class="b err">止まる</span><% } %></a><% } %>
+          </div>
+          <% for (const k of r.kids.filter((x) => !x.live && x.blockers.length)) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= k.code %>: <%= k.blockers.join(' / ') %></span></div><% } %>
+        </div>
+        <% } %>
+        <div class="msgline" data-msg role="status" aria-live="polite"></div>
+      </article>
+      <% } %>
+    </section>
+    <% } %>
 
     <section class="panel" aria-labelledby="h-files">
       <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-files">ファイル</h2><span class="sub">ファイルごとに「次にやること」を 1 つだけ大きく出します</span></div>

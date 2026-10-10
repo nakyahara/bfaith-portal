@@ -35,12 +35,15 @@ export const MASTER_OWNER_PROTOCOL = 2;
  *   skus.sku_kind = #1641 (夜間ロードの守り・正規化・写しの 9 升・照合 ② の区分の分類とゲートの数)。configured (config/master-ownership.mjs) も 'company' (10/7)・active も 10/7 の widen で company
  *   listing_components.amazon = ⑦-1 (表・保存・画面・夜間ロードの守り・移行) + ⑦-2 PR-A (古い表 m_sku_master・m_sku_components への写し =
  *     apps/company-db/publish/amazon-map.mjs・④a は写さない列として通す)。configured も 'company' (10/8・PR-C。active に入るのは widen の後)・DB の広げる許可は PR-B (0059)
- * 🚨 load のままのキー (products.parent・sku_components・suppliers.* の 3 つ) は、それぞれ扱いの PR で足す
+ *   products.parent = AI_reference CompanyDB構想/20 v7 §⑩ の PR-7 (まとまりの登録の画面・まとめての登録の lib・saveSku から代表の欄を外した・夜間ロードは company なら名札を作らず親を変えない = engine.mjs)。
+ *     configured (config/master-ownership.mjs) は load のまま (PR-8)・DB の active に入るのは widen の後
+ * 🚨 load のままのキー (sku_components・suppliers.* の 3 つ) は、それぞれ扱いの PR で足す
  */
 export const COMPANY_CAPABLE = Object.freeze([
   'external_ids.jan',
   'listing_components.amazon',
   'products.name',
+  'products.parent',
   'products.sales_class',
   'products.status',
   'sku_costs',

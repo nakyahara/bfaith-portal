@@ -159,6 +159,16 @@
         if (!r.ok) { say(bm, errText(r.j, r.status), false); buildIds[kind] = uuid(); b.disabled = false; return; }
         finish('ファイル #' + (r.j.export && r.j.export.export_id || '') + ' を作りました (' + codes.length + ' 件)。次は「配る (ダウンロード)」');
       });
+    } else if (act === 'build-variation') {
+      // 🆕 PR-7: まとまりの回ごとに 1 ファイル (ne-reg-variation-v1)。ボタンごとに作る番号 1 つ (押し直しても 2 つ作らない)
+      var vcodes = []; try { vcodes = JSON.parse(b.getAttribute('data-codes') || '[]'); } catch (e) { vcodes = []; }
+      var vmsg = $('[data-msg]', b.closest('.vgroup')) || $('#build-msg');
+      if (!b.getAttribute('data-rid')) b.setAttribute('data-rid', uuid());
+      say(vmsg, 'CSV を作っています…', true);
+      p = post('/api/reg-csv/exports', { kind: 'products', variation: true, codes: vcodes, request_id: b.getAttribute('data-rid') }).then(function (r) {
+        if (!r.ok) { say(vmsg, errText(r.j, r.status), false); b.setAttribute('data-rid', uuid()); b.disabled = false; return; }
+        finish('ファイル #' + (r.j.export && r.j.export.export_id || '') + ' を作りました (まとまり・' + vcodes.length + ' 件)。次は「配る (ダウンロード)」');
+      });
     } else if (act === 'issue') {
       say(cardMsg, '配っています…', true);
       p = post('/api/reg-csv/exports/' + id + '/issue', {}).then(function (r) {

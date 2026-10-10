@@ -14,7 +14,7 @@ import { salesOfCodes } from './sales-qty.mjs';
 import { checkDeadline, ListTimeoutError } from './deadline.mjs';
 import { normProductCode } from '../purchase-orders/db.js';
 import { TOKEN_RE } from './search-token.mjs';
-import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES, logizardLockOf, parentFrozenExports } from '../../lib/master-write.mjs';
+import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES, logizardLockOf } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
@@ -568,8 +568,8 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = null
  *   reg = 新商品の NE 登録の CSV を配った後 (issued / import_declared / partial) = REG_CSV_FIELDS の欄 (409 reg_csv_issued)。
  *         単品の税率はそれを含むセット (今の構成 + 開いている構成の依頼) の CSV にも入る = そのセットの CSV も見る
  *   csv = 既にある商品の NE に取り込む CSV (0040) が出ている列 (409 csv_issued・issuedCsv と同じ条件)
- *   frozen = 🆕 0065: NE 登録の CSV を一度でも配った商品の代表 (親) (409 parent_frozen・parentFrozenExports と同じ条件)
- * 戻り値 = { fields: { 欄: { why: 'reg' | 'csv' | 'frozen', exports: [番号] } }, regExports: [番号], taxParentCodes: [コード] }
+ *   (🆕 PR-7: 代表 (親) は保存の欄から外した = この画面では直さない・🔒 も出さない。代表は「色違い・サイズ違い」の欄に読むだけで出す)
+ * 戻り値 = { fields: { 欄: { why: 'reg' | 'csv', exports: [番号] } }, regExports: [番号], taxParentCodes: [コード] }
  */
 async function readFieldLocks(db, cur) {
   const fields = {};
@@ -597,11 +597,6 @@ async function readFieldLocks(db, cur) {
         for (const p of parents) if (!taxParentCodes.includes(p.code)) taxParentCodes.push(p.code);
       }
     }
-  }
-  // 🆕 0065: NE 登録の CSV を一度でも配った商品の代表 (親) は変えない (保存は 409 parent_frozen・DB も断る) = 🔒 frozen (配っている間の reg が先)
-  if (kind === 'single' && !fields.parent_code) {
-    const frozen = await parentFrozenExports(db, cur);
-    if (frozen.length) put('parent_code', 'frozen', frozen);
   }
   const colToField = new Map(Object.entries(defs).filter(([, d]) => d.csvCol).map(([f, d]) => [d.csvCol, f]));
   if (colToField.size) {
