@@ -38,8 +38,11 @@ export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory 
   try {
     // 案件の現状も同じ snapshot で読む (書くのは閉じた後)。0023 が未適用なら案件なしとして評価だけ (書く段で止まる)
     const migrated = (await db.query(`select to_regclass('ops.watch_issues') is not null as ok`)).rows[0].ok;
-    const openIssues = !migrated ? [] : (await db.query(`select watch_issue_id, check_id, scope_key, subject_type, subject_key, severity, first_seen_at::text as first_seen_at, last_seen_at::text as last_seen_at, days_seen, transitions
-        from ops.watch_issues where company_id = $1::smallint and state = 'open'`, [config.COMPANY_ID])).rows;
+    // last_check_version = 案件の最後の結果の項目の版 (規則を変えた後の最初の回に、前の版で開いた案件を「回復」と数えないため。09 §11.2・Codex #1678 R1)
+    const openIssues = !migrated ? [] : (await db.query(`select i.watch_issue_id, i.check_id, i.scope_key, i.subject_type, i.subject_key, i.severity, i.first_seen_at::text as first_seen_at, i.last_seen_at::text as last_seen_at, i.days_seen, i.transitions,
+          r.check_version as last_check_version
+        from ops.watch_issues i left join ops.watch_results r on r.watch_result_id = i.last_result_id
+        where i.company_id = $1::smallint and i.state = 'open'`, [config.COMPANY_ID])).rows;
     const generation = await generationOf(db, config, asOf, { evidence, dataDir });   // snapshot の中の世代。閉じた後に読み直して比べる (09 §2.1)
     for (const check of config.CHECKS) {
       const keys = planned.filter((k) => k.checkId === check.id);
@@ -84,14 +87,14 @@ export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory 
 }
 
 /**
- * 案件の遷移を決める (書かない)。戻り値 = { inserts: [...], updates: [...], notes: { new, continued, recovered, outOfWindow, held } }
+ * 案件の遷移を決める (書かない)。戻り値 = { inserts: [...], updates: [...], notes: { new, continued, recovered, outOfWindow, ruleChanged, held } }
  */
 export function reconcileIssues({ config, results, openIssues, asOf, now, holdRecoveries = false }) {
   const nowIso = now.toISOString();
   const open = new Map(openIssues.map((i) => [`${i.check_id}|${i.scope_key}|${i.subject_type}|${i.subject_key}`, i]));
   const touched = new Set();
   const inserts = [], updates = [];
-  const notes = { new: [], continued: [], recovered: [], outOfWindow: [], held: [] };
+  const notes = { new: [], continued: [], recovered: [], outOfWindow: [], ruleChanged: [], held: [] };
   const checkOf = (id) => config.CHECKS.find((c) => c.id === id);
   for (const r of results) {
     const check = checkOf(r.checkId) || {};
@@ -137,6 +140,15 @@ export function reconcileIssues({ config, results, openIssues, asOf, now, holdRe
         const outOfWindow = !!scopeOut || (check.issuePerItem && i.subject_type === 'day' && (r.periodFrom == null || i.subject_key < r.periodFrom));
         // 評価の範囲より未来側の案件 (過去の日を評価しているとき) は触らない = 判定保留 (Codex R1 #5)
         if (check.issuePerItem && r.periodTo && i.subject_type === 'day' && i.subject_key > r.periodTo) { notes.held.push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, reason: 'beyond_period' }); continue; }
+        // 規則の変更 (項目の版が上がった) の後の最初の評価で消えた案件 = 回復ではない (09 §11.2「閾値の変更による消失を回復として通知しない」・Codex #1678 R1)。
+        //   状態は既存の out_of_window (DB の CHECK に新しい値を足さない)・summary に理由・通知は「規則の変更で閉じた」(回復の数に入れない)。
+        //   版の分からない案件 (last_result_id が無い) は今まで通り。明示の回復 (r.explicitRecovery = 評価が回復を確かめた。W13:ne) も今まで通り回復
+        const ruleChanged = !outOfWindow && !r.explicitRecovery && i.last_check_version != null && r.checkVersion != null && i.last_check_version !== r.checkVersion;
+        if (ruleChanged) {
+          updates.push({ id: i.watch_issue_id, set: { state: 'out_of_window', transitions: i.transitions + 1, summary: `${i.check_id} ${i.scope_key}${i.subject_key ? ` ${i.subject_key}` : ''}: 規則の変更で閉じた (${i.last_check_version} → ${r.checkVersion}。回復ではない)` }, resultRef: r });
+          notes.ruleChanged.push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, transitions: i.transitions + 1, reason: `rule_changed:${i.last_check_version}->${r.checkVersion}` });
+          continue;
+        }
         const set = outOfWindow ? { state: 'out_of_window', transitions: i.transitions + 1 } : { state: 'recovered', recovered_at: nowIso, transitions: i.transitions + 1 };
         if (scopeOut) set.summary = `${i.check_id} ${i.scope_key} ${i.subject_key}: 監視対象外 (${scopeOut})`;
         updates.push({ id: i.watch_issue_id, set, resultRef: r });
@@ -189,7 +201,7 @@ export function summarize({ asOf, planned, results, notes, deadlineHit, separate
   // 別に数える評価キー (config.SUMMARY_SEPARATE。例 W13:ne = 切替までの NE との差 = 数百件の info)。「新・継続」の件数と明細からは外して、1 つの数にまとめる
   const isSep = (x) => separate.some((s) => s.checkId === x.checkId && s.scopeKey === x.scopeKey);
   const mainNew = notes.new.filter((x) => !isSep(x)), mainCont = notes.continued.filter((x) => !isSep(x));
-  const counts = { planned: planned.length, completed: results.length, pass: n('pass'), breach: n('breach'), blocked: n('blocked'), execution_error: n('execution_error'), new: mainNew.length, continued: mainCont.length, recovered: notes.recovered.length, out_of_window: notes.outOfWindow.length, held: notes.held.length };
+  const counts = { planned: planned.length, completed: results.length, pass: n('pass'), breach: n('breach'), blocked: n('blocked'), execution_error: n('execution_error'), new: mainNew.length, continued: mainCont.length, recovered: notes.recovered.length, out_of_window: notes.outOfWindow.length, rule_changed: (notes.ruleChanged || []).length, held: notes.held.length };
   const icon = counts.execution_error > 0 || counts.completed < counts.planned || deadlineHit ? '❌' : counts.breach > 0 || counts.blocked > 0 ? '⚠️' : '✅';
   const parts = [`異常 ${counts.breach} (新 ${counts.new} / 継続 ${counts.continued})`, `判定保留 ${counts.blocked}`, `回復 ${counts.recovered}`, `評価 ${counts.completed}/${counts.planned}`];
   for (const s of separate) {
@@ -200,6 +212,7 @@ export function summarize({ asOf, planned, results, notes, deadlineHit, separate
   }
   if (counts.execution_error) parts.push(`評価できず ${counts.execution_error}`);
   if (counts.out_of_window) parts.push(`監視期間外 ${counts.out_of_window}`);
+  if (counts.rule_changed) parts.push(`規則の変更で閉じた ${counts.rule_changed} (回復ではない)`);
   const details = [];
   for (const x of mainNew.slice(0, 3)) details.push(`${x.summary} (新)`);
   for (const x of mainCont.slice(0, 2)) details.push(`${x.summary} (継続 ${x.days} 日)`);

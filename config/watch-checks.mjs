@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v17';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す) / v14 (9/27): W14 (広告費の取込の完了と検算。Company DB構想 11 の ③) / v15 (9/28): Yahoo の売上日次を公開 (salesDaily: false を外す = W9 に Yahoo・W8 は売上も・W6 の公開の確認にも入る) / v16 (10/1): W13 に評価キー old (②b 古い表。④a) / v17 (10/6): W15 (migrate の lock が朝に残っていない。設計 13 §3.10 の 45 分の見張りの保険・PR #1638)
+export const CHECKS_VERSION = 'v18';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す) / v14 (9/27): W14 (広告費の取込の完了と検算。Company DB構想 11 の ③) / v15 (9/28): Yahoo の売上日次を公開 (salesDaily: false を外す = W9 に Yahoo・W8 は売上も・W6 の公開の確認にも入る) / v16 (10/1): W13 に評価キー old (②b 古い表。④a) / v17 (10/6): W15 (migrate の lock が朝に残っていない。設計 13 §3.10 の 45 分の見張りの保険・PR #1638) / v18 (10/10): 10/7 の見直し (本番の記録 9/23〜10/7) = W11 の支払い待ち 7 → 10 日・A' の上限 楽天 48 → 66 / W12 の容量 10 → 13 GB / W6・W8 の info を 11/4 の朝まで延長 / W11・W12 の項目の版 v1 → v2 (前の版で開いた案件が規則の変更で消えても回復と数えない。09 §11.2・Codex #1678 R1)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -70,7 +70,7 @@ export const W5_ESCALATE_DAYS = 3;
 /** W6: 売れ筋 SKU の欠品 = 直近この日数に売れた SKU (取消を引いて 1 個以上) で 倉庫 + FBA JP の在庫が 0。案件は SKU ごと (新 = 発生・回復 = 解消・継続 = 翌日も 0) */
 export const W6_SALES_DAYS = 28;
 export const W6_SCOPE = { scope: 'jp', sources: ['logizard', 'fba_jp'] };   // 在庫の合算に使う source (v_sku_stock の warehouse_qty + fba_jp_available)
-export const W6_INFO_UNTIL = '2026-10-06';   // 最初の 2 週間は info (件数の目安を見てから warn に。09 §4)
+export const W6_INFO_UNTIL = '2026-11-04';   // この日の朝 (asOf) から warn。最初の 2 週間 (〜10/5) は info → 10/7 の見直しで延長 (10/1〜10/7 は小さいモールの push 無しで W9:* に止まり 7 日 blocked・在庫 0 の 81 件のうち 35 件は記録以来一度も在庫なし)。決まりを直す PR (「28 日の間に在庫があったのに今 0」・小さいモールで止まらない) の後で warn に上げる (09 §4)
 export const W6_MAX_UNEXPANDED_SHARE = 0.1;   // SKU に展開できない販売 (listing にも当たらない・構成が無い) が正味数量のこれを超えたら「販売履歴が不完全」= blocked (それ以下は観測に残して評価は続ける)
 
 /**
@@ -92,7 +92,7 @@ export const W8_MIN_RATE_DELTA = 0.05;          // 取消率・金額不明率�
 export const W8_SMALL_MALL_ORDERS_PER_DAY = 30;
 export const W8_SMALL_MAX_CANCEL_RATE = 0.3;    // 小規模モール: 取消率の上限
 export const W8_SMALL_MAX_UNKNOWN_RATE = 0.5;   // 小規模モール: 金額不明率の上限
-export const W8_INFO_UNTIL = '2026-10-07';
+export const W8_INFO_UNTIL = '2026-11-04';   // この日の朝 (asOf) から warn。10/7 の見直しで延長 (9/23〜10/7 の異常 10 回のうちデータの欠けは 1 回 (9/25 amazon = #1449)・8 回はセールの上振れ)。上振れを異常にしない PR の後で warn に上げる (09 §4)
 
 /**
  * W10: 回復していない取込の異常 (ops.ingest_runs)。「悪い run」= failed / partial / W10_STUCK_MINUTES を超えて running のまま。
@@ -147,7 +147,7 @@ export const W10_ACCEPTED_RUNS = [];
  *   P = Amazon の支払い待ち (9/25 追加): モールで Pending かつ結び付いた有効な伝票が全部 NE で「受注メール取込済」(まだ起票していない) のまま = 入金待ちの保留 (中原さん確認)。
  *       B の条件を満たしても注文日から W11_P_MAX_DAYS 日未満は異常にしない (observed.payment_pending_orders に残す)。W11_P_MAX_DAYS 日目から B に出す。NE で起票済みなのに出荷していない注文は今まで通り B
  *       🚨 NE の 1 (受注メール取込済) は入金待ち専用ではない = 入金済みなのに NE の起票が止まった注文も同じ形になる (Codex #1454 R1) → 待つのは短く:
- *          Amazon のコンビニ・ATM 払いの期限 (注文から 6 日) を過ぎても保留なら異常 = 7 日 (中原さん 9/25)
+ *          Amazon のコンビニ・ATM 払いの期限 (注文から 6 日) を過ぎても保留なら異常 = 7 日 (中原さん 9/25) → 10 日 (10/7 の見直し。Amazon が支払い待ちを取り消すのは 7〜10 日目)
  *       🚨 Amazon の注文レポートでは「入金待ち」と「入金済み・出荷待ち」が同じ Pending = モールの状態だけでは見分けられない → NE の伝票の状態で見分ける
  *   🚨 楽天・au PAY はモールの状態を注文日から 7 日しか読み直さない・Qoo10 は取消が API に出ない = B / B2 は Amazon と LINE ギフトだけ (ほかのモールは既存の未発送アラート)
  */
@@ -155,7 +155,7 @@ export const W11_LAG_DAYS = 5;
 export const W11_WINDOW_DAYS = 30;
 export const W11_B2_GRACE_DAYS = 2;
 export const W11_B_MAX_DAYS = 14;   // 内容が変わり続けても、注文日からこの日数で B に出す (安全網)
-export const W11_P_MAX_DAYS = 7;    // 支払い待ち (P) を異常にしないのは注文日からこの日数の前日まで (この日数の日から B)。Amazon のコンビニ・ATM 払いの期限 6 日 + 1
+export const W11_P_MAX_DAYS = 10;   // 支払い待ち (P) を異常にしないのは注文日からこの日数の前日まで (この日数の日から B)。当初 7 (Amazon のコンビニ・ATM 払いの期限 6 日 + 1) → 10/7 の見直しで 10 (9/23〜10/7 の amazon の B は 13 日中 12 日異常・8 件のうち 5 件は支払い待ちを Amazon が 7〜10 日目にキャンセルしたもの。中原さん 10/10)
 export const W11_UNSHIPPED_MALLS = [
   { mall: 'amazon', notShipped: ['new', 'confirmed', 'ready', 'on_hold'], b2: true,    // 状態は最終更新日 (last_updated_date) で読み直す = 新しい
     paymentPending: { statusSource: 'Pending' } },   // P = 支払い待ち (上の注釈)。NE の伝票が全部 new (受注メール取込済) かは W11_ROWS の n_active_new で見る
@@ -165,9 +165,10 @@ export const W11_UNSHIPPED_MALLS = [
  * A' (キャンセルの伝票だけ) の上限 = 評価の窓 (注文日 30 日前〜5 日前 = 両端を含めて 26 日) の件数。暫定値。
  * 算出 = 9/23 本番の集計 (w11-survey.mjs の既定 = 90 日前〜5 日前 = 86 日: 楽天 79・Qoo10 44・au PAY 6・Amazon 2・LINE ギフト 0) × 26 / 86 × 2 を切り上げ、最低 3 (小さいモールの 1〜2 件で騒がない)
  *   = 楽天 48 (47.8)・Qoo10 27 (26.6)・au PAY 4 (3.6)・Amazon 3 (1.2)・LINE ギフト 3 (0)。見直すときは w11-survey.mjs --days 30 で評価と同じ窓を数える
+ * 10/7 の見直し (本番の記録 9/23〜10/7): 楽天 35 → 44 と上がり上限 48 にすれすれ (10/5 の大きなイベントの注文が 10/10〜11/4 に数える範囲に入る) → 楽天 66 (観測の最大 44 × 1.5)。Qoo10 は最大 6・ほかは変えない
  * pass は「同梱だと確かめた」ではない (件数がふだんの範囲というだけ)
  */
-export const W11_CANCELLED_ONLY_MAX = { rakuten: 48, qoo10: 27, aupay: 4, amazon: 3, linegift: 3, yahoo: 20 };   // yahoo = 2026-09-26 の本番 (直近 30 日 10 件・90 日 18 件) の約 2 倍
+export const W11_CANCELLED_ONLY_MAX = { rakuten: 66, qoo10: 27, aupay: 4, amazon: 3, linegift: 3, yahoo: 20 };   // yahoo = 2026-09-26 の本番 (直近 30 日 10 件・90 日 18 件) の約 2 倍
 export const W11_INFO_UNTIL = '2026-10-07';
 
 /**
@@ -205,7 +206,7 @@ export const W4_INFO_UNTIL = '2026-11-02';   // 判定を始めて (10/19 ごろ
  *   容量 W12_DISK_BYTES まで W12_MIN_REMAINING_DAYS 日を切る、または今の大きさが W12_WARN_BYTES を超えたら異常。日ごとの増え分が W12_MIN_DELTAS 個に満たなければ blocked
  *   🚨 pg_database_size はストレージ全体 (WAL など) ではない = Render の容量の監視の代わりではない (Codex D2)
  */
-export const W12_DISK_BYTES = 10 * 1024 ** 3;    // 06: Basic-1GB + ストレージ 10GB (プランを変えたらここも)
+export const W12_DISK_BYTES = 13 * 1024 ** 3;    // Render のストレージ 15 GB (9/29 に確認) − WAL の分 2 GB (max_wal_size 1,920 MB。pg_database_size に WAL は入らない) = 13 GB。当初 10 GB (06: Basic-1GB + ストレージ 10GB)。プランを変えたらここも。9/30〜10/4 の「あと 81〜85 日」(10/7 は 173 日) は、この 10 GB の誤りと、記録が数日分しか無い時期に一度きりの取込 (9/30 +500 MB) が重なったため (中央値は一度の急増では動かない = W12_HISTORY_DAYS 14 はそのまま。Codex #1678 R1)
 export const W12_WARN_BYTES = 7 * 1024 ** 3;     // D-34: 7 GB で通知
 export const W12_MIN_REMAINING_DAYS = 90;
 export const W12_HISTORY_DAYS = 14;
@@ -242,6 +243,8 @@ export const ITEMS_MAX_BYTES = 64 * 1024;
  * 項目。順番 = 評価の順 (depends は前に評価されている前提)。
  * depends = 'W1' は同じ scope の W1 が pass であること / 'W1:*' は W1 の全部の scope が pass であること (1 つでも違えば blocked)
  * issuePerItem = 案件を明細 (日付・SKU など) ごとに持つか (false = scope 全体で 1 つ)
+ * version = 項目の規則の版。🚨 閾値・判定の決まりを変えたら上げる = 前の版の結果で開いた案件は、今回 pass でも「回復」と数えず「規則の変更で閉じた」にする
+ *   (engine の reconcileIssues。案件の最後の結果 (last_result_id) の check_version と比べる。09 §11.2「閾値の変更による消失を回復として通知しない」・Codex #1678 R1)
  */
 export const CHECKS = [
   { id: 'W1', version: 'v1', title: '在庫の取込の完了', severity: 'error', depends: [], issuePerItem: false,
@@ -264,21 +267,21 @@ export const CHECKS = [
     runbook: 'README「在庫を毎時写す」の「SKU が分からない商品コード」= core.skus に無い NE 商品コード → 商品マスタ (product-hub) に登録するか、ロジザード側の商品ID を直す' },
   { id: 'W6', version: 'v2', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', 'W9:*'], issuePerItem: true,   // W9:* = 公開済みの行があっても作り直しの失敗・watermark の遅れがあれば止まる (Codex #1406 R2)。
     // 各モールの W7 は W9 (前提 = 同じモールの W7) を通して見る = 売上日次を公開しないモール (Yahoo) の W7 では止まらない (2026-09-26。以前は 'W7:*' も前提にしていた)
-    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットの出品は listing_components・NE のセット商品の SKU は sku_components で構成 SKU に展開 = セット自体は判定しない) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。窓の中に「注文があるのに未公開の日」や開いた session があれば blocked (未公開の売上を「売れていない」と読まない)。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} までは info`,
+    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットの出品は listing_components・NE のセット商品の SKU は sku_components で構成 SKU に展開 = セット自体は判定しない) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。窓の中に「注文があるのに未公開の日」や開いた session があれば blocked (未公開の売上を「売れていない」と読まない)。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} の前日の朝までは info・この日の朝から warn`,
     runbook: '発注 (仕入先発注補助) か FBA 補充。廃番 (handling = discontinued) は対象外' },
   { id: 'W8', version: 'v2', title: '注文の日次の異常', severity: 'warn', depends: ['W7', 'W9'], issuePerItem: false,
-    what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満・昨日が祝日は blocked (祝日は標本からも外す)。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} までは info`,
+    what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満・昨日が祝日は blocked (祝日は標本からも外す)。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} の前日の朝までは info・この日の朝から warn`,
     runbook: 'モールの管理画面で昨日の注文を確かめる (件数が少ない = 取込の抜けか本当に少ない / 取消率が高い = モール側の障害・在庫切れ / 金額不明 = 取込の項目の抜け)。README「注文を毎日送る」' },
   { id: 'W10', version: 'v1', title: '回復していない取込の異常', severity: 'error', depends: [], issuePerItem: false,
     what: `${W10_SINCE} 以降の ops.ingest_runs で failed / partial / ${W10_STUCK_MINUTES} 分を超えて running のまま、かつ回復していないもの (注文・出荷 = 失敗した行が 1 行ずつ正規の差分送信の世代で当たった。止まった run は自動では回復にしない / ロジザード = 同じか新しい世代の success / 在庫の日次 = その日が今 complete か例外つき。W1 / W2 の窓の中は W1 / W2)。今朝の push の run は W7 が判定したときだけ W7 に任せる。案件は取込の種類ごと。${W10_INFO_UNTIL} までは info`,
     runbook: 'README「AI が見張る」の W10。明細の run の failed_ranges / ops.ingest_chunks の result.failed を見て、直したら次の push が取り直す (直せないと決めたら W10_ACCEPTED_RUNS に理由と責任を書く)' },
-  { id: 'W11', version: 'v1', title: '注文と出荷の未リンク・発送遅れ', severity: 'warn', depends: ['W7'], issuePerItem: false,
+  { id: 'W11', version: 'v2', title: '注文と出荷の未リンク・発送遅れ', severity: 'warn', depends: ['W7'], issuePerItem: false,   // v2 (10/10 #1678): 支払い待ち 7 → 10 日・A' の上限 楽天 48 → 66 (版が変われば、前の版で開いた案件が消えても回復と数えない = engine の規則の変更)
     what: `自社発送の注文 (注文日 ${W11_WINDOW_DAYS} 日前〜${W11_LAG_DAYS} 日前) で、A = モールでは出荷済みなのに NE の伝票が結び付いていない (1 件でも異常) / A' = 結び付いた伝票がキャンセルだけ (多くは同梱。件数が上限を超えたら異常) / B = Amazon 自社発送・LINE ギフトでモールでも NE でも未発送のまま、内容が ${W11_LAG_DAYS} 日変わっていないか注文から ${W11_B_MAX_DAYS} 日 (要確認。Amazon で Pending かつ NE で受注メール取込済のまま = 支払い待ちは注文から ${W11_P_MAX_DAYS} 日未満は数えない) / B2 = NE で出荷して ${W11_B2_GRACE_DAYS} 日たつのに Amazon が未発送のまま。今朝の出荷の push が確かめられない・結び直しが途中なら blocked。${W11_INFO_UNTIL} までは info`,
     runbook: 'A = NE で注文番号を検索 (伝票が無い = NE に取り込まれていない・別の番号で起票) / B = セラーセントラル・LINE ギフトの管理画面で発送状況を確かめる / B2 = モールへの出荷通知 (送り状番号のアップロード) を確かめる。README「AI が見張る」の W11' },
   { id: 'W4', version: 'v1', title: '在庫の純減の異常', severity: 'warn', depends: ['W3'], issuePerItem: false,
     what: `昨日のロジザードの在庫の差 (SKU の和) の 減った数・差し引き を、同じ曜日の過去 ${W4_BASELINE_WEEKS} 週 (差を作った日・祝日を除く) の中央値 ± ${W4_MAD_K}×MAD かつ ${W4_MIN_ABS_QTY} 個以上の差で判定 (減った数は多すぎ・少なすぎ、差し引きは大きく減ったときだけ)。理由 (出荷・入荷・棚卸し・FBA 納品) は分からない。有効標本 ${W4_MIN_SAMPLES} 未満・昨日が祝日は blocked。${W4_INFO_UNTIL} までは info`,
     runbook: 'ロジザードの在庫の推移と、昨日の出荷 (NE)・入荷・棚卸し・FBA 納品を突き合わせる。README「在庫を毎時写す」「AI が見張る」の W4' },
-  { id: 'W12', version: 'v1', title: 'DB の容量', severity: 'warn', depends: [], issuePerItem: false,
+  { id: 'W12', version: 'v2', title: 'DB の容量', severity: 'warn', depends: [], issuePerItem: false,   // v2 (10/10 #1678): 容量 10 → 13 GB (同上)
     what: `今の DB の大きさ (pg_database_size) と、直近 ${W12_HISTORY_DAYS} 日の日ごとの増え分の中央値から、容量 (${Math.round(W12_DISK_BYTES / 1024 ** 3)} GB) まで ${W12_MIN_REMAINING_DAYS} 日を切る・${Math.round(W12_WARN_BYTES / 1024 ** 3)} GB を超えたら異常。Render の容量の監視の代わりではない。${W12_INFO_UNTIL} までは info`,
     runbook: 'Render のダッシュボードで Postgres のディスクを確かめ、大きい表 (pg_total_relation_size) と整理 (raw の 30 日・日次の整理) を見る。足りなければプラン / ディスクを上げる (中原さん判断)' },
   { id: 'W13', version: 'v3', title: 'マスタの照合 (ロードの検証・NE との照合・古い表)', severity: 'info', depends: [], issuePerItem: true,
