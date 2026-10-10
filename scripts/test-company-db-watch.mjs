@@ -177,9 +177,15 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W9:*'], true]);   // W6 の W7 は W9 を通して見る (2026-09-26)
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v17');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v18');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
+});
+await t('10/7 の見直し (v18・本番の記録 9/23〜10/7): W11 の支払い待ち 10 日・A\' の上限 楽天 66 / W12 の容量 13 GB (15 GB − WAL 2 GB)・増え方を見る日数 28 (7 GB はそのまま) / W6・W8 は 11/4 の朝から warn (その前の日までは info)', () => {
+  assert.deepEqual([REAL_CONFIG.W11_P_MAX_DAYS, REAL_CONFIG.W11_CANCELLED_ONLY_MAX.rakuten, REAL_CONFIG.W12_DISK_BYTES, REAL_CONFIG.W12_HISTORY_DAYS, REAL_CONFIG.W12_WARN_BYTES], [10, 66, 13 * 1024 ** 3, 28, 7 * 1024 ** 3]);
+  assert.deepEqual([REAL_CONFIG.W6_INFO_UNTIL, REAL_CONFIG.W8_INFO_UNTIL], ['2026-11-04', '2026-11-04']);
+  // 重さの決め方は asOf < *_INFO_UNTIL ? info : 定義の重さ (checks.mjs) = 11/3 の朝まで info・11/4 の朝から warn
+  assert.deepEqual([['2026-11-03', '2026-11-04'].map((d) => (d < REAL_CONFIG.W6_INFO_UNTIL ? 'info' : REAL_CONFIG.checkById('W6').severity)), ['2026-11-03', '2026-11-04'].map((d) => (d < REAL_CONFIG.W8_INFO_UNTIL ? 'info' : REAL_CONFIG.checkById('W8').severity))], [['info', 'warn'], ['info', 'warn']]);
 });
 await t('partial の例外は期限つき (until を過ぎたら効かない)', () => {
   const s = CONFIG.STOCK_SCOPES.find((x) => x.source === 'fba_us');
@@ -969,7 +975,7 @@ await t("🚨 W11 A' (Codex #1419 R1 High): 結び付いた伝票がキャンセ
   for (const n of [1, 2, 3]) { const id = await o11('rakuten', 'main', `w11-c${n}`, D(-10), 'delivered', '1'); await slip11(`w11-c${n}`, '1', { orderId: id, cancelled: true }); }
   let r = await run({ dryRun: true });
   let x = w11(r, 'rakuten/main');
-  assert.deepEqual([x.verdict, x.observed.a_cancelled_only, x.observed.a, x.items.length, /キャンセルだけ 3 \(上限 48 以内/.test(x.reason)], ['pass', 3, 0, 3, true]);
+  assert.deepEqual([x.verdict, x.observed.a_cancelled_only, x.observed.a, x.items.length, /キャンセルだけ 3 \(上限 66 以内/.test(x.reason)], ['pass', 3, 0, 3, true]);
   r = await run({ dryRun: true, config: { ...CONFIG, W11_CANCELLED_ONLY_MAX: { ...CONFIG.W11_CANCELLED_ONLY_MAX, rakuten: 2 } } });
   x = w11(r, 'rakuten/main');
   assert.deepEqual([x.verdict, /結び付いた伝票がキャンセルだけ 3 \(上限 2 = 同梱の目安を超えた/.test(x.reason)], ['breach', true]);
@@ -1008,12 +1014,13 @@ await t('🚨 W11 B / B2: Amazon 自社発送・LINE ギフトで、モールで
   assert.equal(verdictOf(r, 'W11', 'amazon/jp'), 'pass');
   await clean11();
 });
-await t('🚨 W11 P (9/25・中原さん確認): Amazon で Pending かつ有効な伝票が全部 NE で受注メール取込済 (new) のまま = 支払い待ちの保留 → 注文から 7 日未満は異常にしない (observed に残す)。7 日目から B (NE の受注メール取込済は起票が止まった注文も同じ形 = Codex #1454 R1) / NE で起票済み (confirmed) なのに未出荷・伝票なし・状態の原文が Pending でない は今まで通り B', async () => {
-  const p1 = await o11('amazon', 'jp', 'w11-p1', D(-6), 'new', '4', { src: 'Pending' });     // 支払い待ち (NE = 受注メール取込済)・注文から 6 日
+await t('🚨 W11 P (9/25・中原さん確認): Amazon で Pending かつ有効な伝票が全部 NE で受注メール取込済 (new) のまま = 支払い待ちの保留 → 注文から 10 日未満は異常にしない (observed に残す)。10 日目から B (9/25 は 7 日 → 10/7 の見直しで 10 日) (NE の受注メール取込済は起票が止まった注文も同じ形 = Codex #1454 R1) / NE で起票済み (confirmed) なのに未出荷・伝票なし・状態の原文が Pending でない は今まで通り B', async () => {
+  assert.equal(CONFIG.W11_P_MAX_DAYS, 10);   // 10/7 の見直しで 7 → 10 (下の境目の日付はこの値に合わせてある)
+  const p1 = await o11('amazon', 'jp', 'w11-p1', D(-9), 'new', '4', { src: 'Pending' });     // 支払い待ち (NE = 受注メール取込済)・注文から 9 日
   await slip11('w11-p1', '4', { orderId: p1, status: 'new' });
   const p2 = await o11('amazon', 'jp', 'w11-p2', D(-7), 'new', '4', { src: 'Pending' });     // NE で起票済みなのに未出荷 = B (250-5900546-7297417 の形)
   await slip11('w11-p2', '4', { orderId: p2 });
-  const p3 = await o11('amazon', 'jp', 'w11-p3', D(-7), 'new', '4', { src: 'Pending' });     // 注文から 7 日たっても支払い待ち = B (境目)
+  const p3 = await o11('amazon', 'jp', 'w11-p3', D(-10), 'new', '4', { src: 'Pending' });    // 注文から 10 日たっても支払い待ち = B (境目)
   await slip11('w11-p3', '4', { orderId: p3, status: 'new' });
   await o11('amazon', 'jp', 'w11-p4', D(-7), 'new', '4', { src: 'Pending' });                // 伝票なし = B (NE に取り込まれていない)
   const p5 = await o11('amazon', 'jp', 'w11-p5', D(-7), 'new', '4', { src: 'Unshipped' });   // 原文が Pending でない = B
@@ -1029,15 +1036,15 @@ await t('🚨 W11 P (9/25・中原さん確認): Amazon で Pending かつ有効
   await slip11('w11-p8', '4', { orderId: p8, cancelled: true });
   const p9 = await o11('amazon', 'jp', 'w11-p9', D(-6), 'new', '4', { src: 'Pending' });     // NE で出荷済み (2 日前) = B2 (支払い待ちにしない)
   await slip11('w11-p9', '4', { orderId: p9, shipDate: D(-2), status: 'new' });
-  const p10 = await o11('amazon', 'jp', 'w11-p10', D(-7), 'new', '4', { src: 'Pending', su: D(-1) });   // 注文から 7 日・内容が昨日変わった = それでも B (Codex #1454 R2)
+  const p10 = await o11('amazon', 'jp', 'w11-p10', D(-10), 'new', '4', { src: 'Pending', su: D(-1) });  // 注文から 10 日・内容が昨日変わった = それでも B (Codex #1454 R2)
   await slip11('w11-p10', '4', { orderId: p10, status: 'new' });
-  const p11 = await o11('amazon', 'jp', 'w11-p11', D(-6), 'new', '4', { src: 'Pending', su: D(-1) });   // 注文から 6 日・内容が昨日変わった = まだ数えない (P でも B でもない)
+  const p11 = await o11('amazon', 'jp', 'w11-p11', D(-9), 'new', '4', { src: 'Pending', su: D(-1) });   // 注文から 9 日・内容が昨日変わった = まだ数えない (P でも B でもない)
   await slip11('w11-p11', '4', { orderId: p11, status: 'new' });
   let r = await run({ dryRun: true });
   const x = w11(r, 'amazon/jp');
   assert.deepEqual([x.verdict, kinds(r, 'amazon/jp'), x.observed.payment_pending, x.observed.payment_pending_orders.map((o) => o.mall_order_no).sort()],
     ['breach', ['w11-p2:B_unshipped', 'w11-p3:B_unshipped', 'w11-p4:B_unshipped', 'w11-p5:B_unshipped', 'w11-p6:B_unshipped', 'w11-p8:B_unshipped', 'w11-p9:B2_mall_not_notified', 'w11-p10:B_unshipped'].sort(), 2, ['w11-p1', 'w11-p7']]);
-  assert.match(x.reason, /支払い待ち \(モールで Pending・NE で受注メール取込済のまま\) 2 \(注文から 7 日未満は数えない/);
+  assert.match(x.reason, /支払い待ち \(モールで Pending・NE で受注メール取込済のまま\) 2 \(注文から 10 日未満は数えない/);
   // 支払い待ちだけなら pass (理由に件数を残す)
   await pg.query(`delete from core.shipments where ne_order_no in ('w11-p2', 'w11-p3', 'w11-p5', 'w11-p6', 'w11-p8', 'w11-p9', 'w11-p10', 'w11-p11')`); await pg.query(`delete from core.orders where mall_order_no in ('w11-p2', 'w11-p3', 'w11-p4', 'w11-p5', 'w11-p6', 'w11-p8', 'w11-p9', 'w11-p10', 'w11-p11')`);
   r = await run({ dryRun: true });
@@ -1487,7 +1494,7 @@ const adEv = (x = {}) => ({ name: 'ad-spend-amazon', kind: 'ad_spend', mall: 'am
   yesterday: { date: D(-1), local: true, generation: 5000, fetchedAt: '2026-09-22T22:10:00Z', onRender: true }, campaign_check: [{ date: D(-2), generation: 5000, report_id: 'R5000', sku_cents: 90000, campaign_cents: 90000 }, { date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 100000, campaign_cents: 100300 }], ...x });
 const w14 = async (evx, opts = {}) => (await evalW14({ db, config: opts.config || A, asOf: opts.asOf || ASOF, evidence: evx === null ? {} : { 'ad-spend-amazon': evx }, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC }, W14C))[0];
 await t('W14: 本物の設定に評価キー amazon/jp (v14・前提なし・最初の 2 週間は info)。そろった朝は pass (差 3 円 < 許容 10 円・出品の分からない費用 1%)', async () => {
-  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v17', ['amazon/jp'], [], 'warn']);
+  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v18', ['amazon/jp'], [], 'warn']);
   await adDay(D(-1));
   const r = await w14(adEv());
   assert.deepEqual([r.verdict, r.severity, r.observed.unresolved_share, r.observed.render.generation, r.observed.campaign_check], ['pass', 'info', 0.01, 5000, ['09-21:900/900', '09-22:1000/1003']], JSON.stringify(r));
@@ -1557,7 +1564,7 @@ console.log('W15 migrate の lock が朝に残っていない (設計 13 §3.10 
 const W15C = REAL_CONFIG.checkById('W15');
 const w15 = async (cfg = REAL_CONFIG) => evalW15({ db, config: cfg, asOf: ASOF }, W15C);
 await t('W15: 本物の設定に評価キー db/company (v17・前提なし・warn・案件は 1 つ)・lock が無ければ pass / 既存の試験の設定 (W15_SCOPES = []) は評価キーを作らない', async () => {
-  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W15').map((k) => k.scopeKey), W15C.depends, W15C.severity, W15C.issuePerItem], ['v17', ['db/company'], [], 'warn', false]);
+  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W15').map((k) => k.scopeKey), W15C.depends, W15C.severity, W15C.issuePerItem], ['v18',['db/company'], [], 'warn', false]);
   assert.equal(plannedKeys(CONFIG).filter((k) => k.checkId === 'W15').length, 0);
   assert.equal(REAL_CONFIG.CHECKS.at(-1).id, 'W15');
   const [r] = await w15();
