@@ -14,6 +14,8 @@
  * 差を残す承認 (accept_difference) では減らない (承認の台帳を読まない・DB の承認の trigger も代表には断る)
  */
 
+import { checkNeFetchCounts, NE_FETCH_KINDS } from '../../warehouse/ne-fetch-counts.js';
+
 export const PARENT_OBS_FORMAT = 'parent-obs-v1';
 /** 6 つの数え (DB の ops.parent_raw_gate の counts の鍵と同じ) */
 export const PARENT_COUNT_KEYS = Object.freeze(['parent_mismatch', 'parent_incomparable', 'parent_ambiguous', 'parent_missing', 'parent_two_level', 'parent_loop']);
@@ -50,8 +52,8 @@ export function parentObservations(nm, { untrusted = [], trust = null, repSpelli
     rows.push([norm, 'single', ok ? 'ok' : 'unknown', rep, raw]);
   }
   const u = [...new Set([...untrusted].filter((x) => typeof x === 'string' && x && x.length <= MAX_CODE))].sort();
-  const okSp = !!repSpellings && repSpellings.state === 'ok';
-  const rc = okSp ? [...new Set([...(repSpellings.collided || [])].filter((x) => typeof x === 'string' && x && x.length <= MAX_CODE))].sort() : [];
+  const okSp = repSpellingsOk(repSpellings);   // 🆕 #1676 Codex R5: 形が完全に正しい ok だけ (許可の一覧と同じ確かめ)
+  const rc = okSp ? [...new Set(repSpellings.collided.filter((x) => x.length <= MAX_CODE))].sort() : [];
   const sp = okSp ? { state: 'ok' } : { state: 'unavailable', reason: String((repSpellings && repSpellings.reason) || 'not_read').slice(0, 100) };
   // 🆕 #1676 Codex R4: 信用 = 許可の一覧の全部が明示的に ok のときだけ complete (渡さない = 確かめていない = 閉じる)
   const tr = trust && typeof trust === 'object' && trust.checks ? trust : parentObsTrust({ rep_spellings: repSpellings });
@@ -69,38 +71,56 @@ export function parentObservations(nm, { untrusted = [], trust = null, repSpelli
  *     kind_gate    = 照合 ② の区分のゲートの数 (integrity_untrusted = 0 = 新商品の許可と同じ厳しさ)
  *     rep_spellings = NE のコードの元の書き方 (代表) の台帳 (repSpellingsOf の答え) が ok
  * 戻り値 { complete, checks: { fetch_counts, integrity, kind_gate_integrity, rep_spellings, (知らない印) }, reasons: [ok でない確かめの理由] }
+ * 🆕 #1676 Codex R5 High: 4 つの信号それぞれ、**形が完全に正しいときだけ** ok (型・範囲・形の不正 = どれも ok にしない):
+ *   fetch_counts = 2 つの種類の記録が取得の契約の確かめ (checkNeFetchCounts = 書く時と読む時と同じ部品) に通る・版は 64 桁の 16 進で 3 つとも同じ
+ *   integrity    = neIntegrity の答えの形 (intBlocked = Map・c2Form = 真偽・2 つの落ちの印が false そのもの。数え・配列の中身は neIntegrity が厳しく確かめる)
+ *   kind_gate    = 0 そのもの (負でない safe integer の 0。文字の '0'・小数・負・無い = ok にしない)
+ *   rep_spellings = repSpellingsOk (state 'ok' + collided が文字の配列)
  */
 export const PARENT_TRUST_INPUTS = Object.freeze(['fetch_counts', 'integrity', 'kind_gate', 'rep_spellings']);
 export const PARENT_TRUST_KEYS = Object.freeze(['fetch_counts', 'integrity', 'kind_gate_integrity', 'rep_spellings']);
-const isCount = (v) => Number.isInteger(v) && v >= 0;
+const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+const FP_RE = /^[0-9a-f]{64}$/;
+const why = (v, d = 'invalid') => (typeof v === 'string' && v ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : d);
+/** 代表の名前空間の書き方の台帳の答え (repSpellingsOf) が「読めた」の形そのものか: state 'ok'・collided = 空でない文字の配列 */
+export function repSpellingsOk(sp) {
+  return isObj(sp) && sp.state === 'ok' && Array.isArray(sp.collided) && sp.collided.every((x) => typeof x === 'string' && x.length > 0);
+}
 const TRUST_CHECKS = Object.freeze({
   fetch_counts: (s) => {
     const fc = s.fetch_counts;
-    if (!fc || typeof fc !== 'object') return 'fetch_counts_unreadable';
-    if (fc.fetch_fingerprint_mismatch) return 'fetch_counts_fingerprint_mismatch';
-    for (const kind of ['products', 'setproducts']) {
+    if (!isObj(fc)) return 'fetch_counts_unreadable';
+    if (fc.fetch_fingerprint_mismatch !== undefined) return 'fetch_counts_fingerprint_mismatch';
+    for (const kind of NE_FETCH_KINDS) {
       const r = fc[kind];
-      if (!r || r.ok !== true) return `fetch_counts_unavailable:${kind}:${(r && r.reason) || 'unreadable'}`;
-      const c = r.counts || {};
-      if (![c.dropped_no_code, c.dropped_missing_fields, c.write_attempts, c.stored_rows].every(isCount)) return `fetch_counts_invalid:${kind}`;
+      if (!isObj(r) || r.ok !== true) return `fetch_counts_unavailable:${kind}:${isObj(r) ? why(r.reason, 'unreadable') : 'unreadable'}`;
+      // 取得の記録の契約 (版・種類・時刻・件数が負でない safe integer・式・ページ) を読む時と同じ部品でもう一度 (渡された ok を信じない)
+      if (!isObj(r.counts) || checkNeFetchCounts(kind, r.counts).length) return `fetch_counts_invalid:${kind}`;
+      const c = r.counts;
       if (c.dropped_no_code + c.dropped_missing_fields !== 0) return `fetch_rows_dropped:${kind}`;
       if (c.write_attempts !== c.stored_rows) return `fetch_rows_overwritten:${kind}`;
     }
     if (fc.ok !== true) return 'fetch_counts_unavailable';
-    if (!fc.fetch_fingerprint || fc.products.counts.fetch_fingerprint !== fc.fetch_fingerprint || fc.setproducts.counts.fetch_fingerprint !== fc.fetch_fingerprint) {
+    if (typeof fc.fetch_fingerprint !== 'string' || !FP_RE.test(fc.fetch_fingerprint)
+      || fc.products.counts.fetch_fingerprint !== fc.fetch_fingerprint || fc.setproducts.counts.fetch_fingerprint !== fc.fetch_fingerprint) {
       return 'fetch_counts_fingerprint_mismatch';
     }
     return 'ok';
   },
   integrity: (s) => {
     const i = s.integrity;
-    if (!i || typeof i !== 'object') return 'integrity_unreadable';
+    if (!isObj(i) || !(i.intBlocked instanceof Map) || typeof i.c2Form !== 'boolean') return 'integrity_unreadable';
     if (i.componentsUntrusted !== false) return 'c1_set_rows_dropped';
     if (i.absenceUntrusted !== false) return 'ne_rows_dropped';
     return 'ok';
   },
-  kind_gate_integrity: (s) => (s.kind_gate && s.kind_gate.integrity_untrusted === 0 ? 'ok' : `kind_gate_integrity_untrusted:${s.kind_gate ? s.kind_gate.integrity_untrusted : 'none'}`),
-  rep_spellings: (s) => (s.rep_spellings && s.rep_spellings.state === 'ok' ? 'ok' : `rep_spellings_unavailable:${(s.rep_spellings && s.rep_spellings.reason) || 'none'}`),
+  kind_gate_integrity: (s) => {
+    const k = s.kind_gate;
+    if (!isObj(k)) return 'kind_gate_integrity_untrusted:none';
+    const v = k.integrity_untrusted;
+    return Number.isSafeInteger(v) && v === 0 ? 'ok' : `kind_gate_integrity_untrusted:${typeof v === 'number' && Number.isFinite(v) ? v : 'invalid'}`;
+  },
+  rep_spellings: (s) => (repSpellingsOk(s.rep_spellings) ? 'ok' : `rep_spellings_unavailable:${!isObj(s.rep_spellings) ? 'none' : s.rep_spellings.state === 'ok' ? 'invalid_shape' : why(s.rep_spellings.reason, 'none')}`),
 });
 export function parentObsTrust(signals = {}) {
   const checks = {};
@@ -127,9 +147,19 @@ export function trustProblems(obs) {
  *   読めた = { state: 'ok', collided: [書き方が 2 つ以上の代表の norm] } / 読めない (未収集・行の数が違う・知らない版 ほか) = { state: 'unavailable', reason }
  *   🆕 #1676 Codex R3 High 1: 代表が 1 件でも invalid (壊れた記録・全角・正規化の不一致 = 書き方を確かめられない) = 台帳全体を unavailable (理由 invalid_rep_spellings:件数)
  *     = その回は記録しない (保守的。次の正常な回で開く)
+ *   🆕 #1676 Codex R5 High 2: 壊れた行 (resolveNeCodes の damaged = 空・正規化できない code_norm・配列でない / 空の配列 / 文字でない / code_norm と合わない書き方・知らない種類) が
+ *     1 行でもある = 台帳全体を unavailable (理由 damaged_spellings:件数。商品の側の行でも = 台帳そのものが壊れている)。
+ *     damaged を持たない答え・entries の形が違う答え = resolveNeCodes の答えではない = unavailable (明示的に ok のときだけ)
  */
+const ENTRY_KINDS = new Set(['product', 'rep']);
+const ENTRY_STATES = new Set(['ok', 'collided', 'invalid']);
 export function repSpellingsOf(neCodes) {
-  if (!neCodes || !neCodes.ok) return { state: 'unavailable', reason: (neCodes && neCodes.reason) || 'not_read', collided: [] };
+  if (!neCodes || neCodes.ok !== true) return { state: 'unavailable', reason: why(neCodes && neCodes.reason, 'not_read'), collided: [] };
+  if (!Number.isSafeInteger(neCodes.damaged) || neCodes.damaged < 0) return { state: 'unavailable', reason: 'damaged_unknown', collided: [] };
+  if (neCodes.damaged > 0) return { state: 'unavailable', reason: `damaged_spellings:${neCodes.damaged}`, collided: [] };
+  if (!Array.isArray(neCodes.entries) || !neCodes.entries.every((e) => isObj(e) && ENTRY_KINDS.has(e.kind) && ENTRY_STATES.has(e.state) && typeof e.code_norm === 'string' && e.code_norm.length > 0)) {
+    return { state: 'unavailable', reason: 'entries_invalid', collided: [] };
+  }
   const invalid = neCodes.entries.filter((e) => e.kind === 'rep' && e.state === 'invalid').length;
   if (invalid > 0) return { state: 'unavailable', reason: `invalid_rep_spellings:${invalid}`, collided: [] };
   return { state: 'ok', collided: neCodes.entries.filter((e) => e.kind === 'rep' && e.state === 'collided').map((e) => e.code_norm) };

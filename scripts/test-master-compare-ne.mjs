@@ -756,7 +756,7 @@ await ta('[24] 直す承認の完了は信頼できる観測だけで: 値が無
   let dn = await doneIds();
   assert.ok(!dn.has(eNo) && !dn.has(eUnk) && !dn.has(eComp), JSON.stringify(r.decisions_done));
   //   C2 の形で親の行が落ちた回 (dropped_missing_parent・構成そのものは信頼できる) も「子が無い」とは言えない (Codex #1475 R2)
-  r = await runNe(noB, { intS: { dropped_missing_parent: 1 } });
+  r = await runNe(noB, { intS: { dropped_missing_key: 1, dropped_missing_parent: 1 } });   // 取込の形 (親の落ち ≦ 行の落ち。#1676 Codex R5)
   assert.deepEqual([r.prerequisites.integrity.form, r.prerequisites.integrity.components_untrusted, r.prerequisites.integrity.absence_untrusted], ['c2', false, true]);
   assert.ok(!(await doneIds()).has(eComp), JSON.stringify(r.decisions_done));
   r = await runNe(noB);
@@ -866,7 +866,7 @@ await ta('[25] 最後に一致した値 (D2): D2 の意味の一致を書く (�
   assert.deepEqual(x.result.ne.baseline.diffs.filter((z) => z.code_norm === 'd004').map((z) => [z.col, z.direction, z.held]), [['exists', 'held', 'ne_dropped_rows']]);
   assert.ok(!x.result.ne.baseline.diffs.some((z) => z.code_norm === 'a001'), '商品の表の行だけが落ちた回に単品を保留した');   // 種類の判断には効かない
   // セットの表の行が落ちた回 (C2 の形) = 単品に見える SKU は本当はセットかもしれない = 種類と値の列を書かない (有無は書く)
-  { const m = setNe(NE, d, { intS: { dropped_missing_parent: 1 } }); sendToRender(toMaterial(NE), d, setBuild(d, m, []));
+  { const m = setNe(NE, d, { intS: { dropped_missing_key: 1, dropped_missing_parent: 1 } }); sendToRender(toMaterial(NE), d, setBuild(d, m, []));
     await db.query(`update core.skus set name = '新A' where code = 'a001'`);
     x = await compare(d, { neCompare });
     await db.query(`update core.skus set name = $1 where code = 'a001'`, [nameA]); }

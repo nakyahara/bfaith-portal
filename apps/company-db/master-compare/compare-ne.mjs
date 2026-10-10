@@ -351,8 +351,10 @@ export const NE_SPELLING_VERSION = 'sp1';
 /**
  * 取得の世代の書き方を読む (readNeSide の読み取りの取引の中)。商品の世代から single・rep、セットの世代から set・child・set_rep。
  * 両方の側に、その世代の「集め終えた印」(知っている版) があるときだけ ok (片方でも無い = 元の書き方は公開しない。Codex ③b-1b-R1 H1)
+ * 🆕 #1676 Codex R5 High 2: 印の件数は**側ごとに**合わせる (単品の側の欠けをセットの側の余分で相殺させない)。印の件数が 0 以上の整数でない = 読めない
+ *   (db = better-sqlite3 の接続。試験のために export)
  */
-function readSpellings(db, pAt, sAt) {
+export function readSpellings(db, pAt, sAt) {
   const tbl = (t) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(t);
   if (!tbl('raw_ne_code_spellings') || !tbl('ne_code_spelling_marks')) return { ok: false, reason: 'no_table' };
   if (!pAt || !sAt) return { ok: false, reason: 'no_complete_mark' };
@@ -361,28 +363,45 @@ function readSpellings(db, pAt, sAt) {
   if (!mp || !ms) return { ok: false, reason: 'not_collected' };
   if (mp.version !== NE_SPELLING_VERSION || ms.version !== NE_SPELLING_VERSION) return { ok: false, reason: 'unknown_version' };
   const rows = (at, kinds) => db.prepare(`SELECT kind, code_norm, spellings FROM raw_ne_code_spellings WHERE synced_at = ? AND kind IN (${kinds.map(() => '?').join(', ')})`).all(at, ...kinds);
-  const all = [...rows(pAt, ['single', 'rep']), ...rows(sAt, ['set', 'child', 'set_rep'])];
-  if (all.length !== Number(mp.rows) + Number(ms.rows)) return { ok: false, reason: 'rows_mismatch' };   // 印の件数と合わない = 消えた・足りない
-  return { ok: true, rows: all };
+  const markRows = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : typeof v === 'string' && /^\d{1,15}$/.test(v) ? Number(v) : null);
+  const rp = rows(pAt, ['single', 'rep']), rs = rows(sAt, ['set', 'child', 'set_rep']);
+  for (const [side, list, mk] of [['products', rp, mp], ['sets', rs, ms]]) {
+    const n = markRows(mk.rows);
+    if (n == null) return { ok: false, reason: `mark_rows_invalid:${side}` };
+    if (list.length !== n) return { ok: false, reason: `rows_mismatch:${side}` };   // 印の件数と合わない = 消えた・足りない (側ごと)
+  }
+  return { ok: true, rows: [...rp, ...rs] };
 }
 const NE_CODE_RE = /^[A-Za-z0-9_-]{1,30}$/;
 /**
  * 元の書き方を決める (③b-1b 契約 v3)。商品のコード (single・set・child) と代表の名札 (rep・set_rep) は別の名前空間。
  * norm (照合の正規化) ごとに書き方の集合を合わせ、1 つ = ok (その書き方) / 2 つ以上 = collided / 使えない文字・小文字が norm と合わない = invalid。
  * 衝突・使えないものも省かずに返す (今回の回に「分からない」と記録する)
- * @returns {{ ok: boolean, reason?: string, entries?: Array<{ code_norm, kind: 'product'|'rep', state: 'ok'|'collided'|'invalid', ne_code: string|null, spellings: string[] }> }}
+ * 🆕 #1676 Codex R5 High 2: 壊れた行を黙って捨てない・文字に直さない。damaged = 壊れた行の数 (damaged_reasons = 理由 → 件数):
+ *   unknown_kind (知らない種類) / bad_code_norm (文字でない・空・正規化すると空) /
+ *   bad_spellings (文字でない・JSON でない・配列でない・空の配列・文字でない / 空の書き方・書き方の小文字が code_norm と合わない = 取込が書く形でない)。
+ *   壊れた書き方の norm は今までどおり invalid (③b-1b の記録は「分からない」)。代表の台帳 (parent-gate の repSpellingsOf) は damaged が 1 でも全体を unavailable
+ * @returns {{ ok: boolean, reason?: string, damaged?: number, damaged_reasons?: Record<string, number>,
+ *   entries?: Array<{ code_norm, kind: 'product'|'rep', state: 'ok'|'collided'|'invalid', ne_code: string|null, spellings: string[] }> }}
  */
+const SPELLING_NS = Object.freeze({ single: 'product', set: 'product', child: 'product', rep: 'rep', set_rep: 'rep' });
 export function resolveNeCodes(sp) {
-  if (!sp || !sp.ok) return { ok: false, reason: sp ? sp.reason : 'not_read' };
+  if (!sp || sp.ok !== true) return { ok: false, reason: sp ? sp.reason : 'not_read' };
+  if (!Array.isArray(sp.rows)) return { ok: false, reason: 'rows_unreadable' };
   const acc = { product: new Map(), rep: new Map() };
+  const damagedReasons = {};
+  const hurt = (why) => { damagedReasons[why] = (damagedReasons[why] || 0) + 1; };
   for (const r of sp.rows) {
-    const ns = r.kind === 'rep' || r.kind === 'set_rep' ? 'rep' : 'product';
-    const norm = normSku(r.code_norm);
-    if (!norm) continue;
-    let list; try { list = JSON.parse(r.spellings); } catch { list = null; }
+    const ns = r && typeof r.kind === 'string' && Object.hasOwn(SPELLING_NS, r.kind) ? SPELLING_NS[r.kind] : null;
+    if (!ns) { hurt('unknown_kind'); continue; }
+    const norm = typeof r.code_norm === 'string' ? normSku(r.code_norm) : '';
+    if (!norm) { hurt('bad_code_norm'); continue; }
+    let list; try { list = typeof r.spellings === 'string' ? JSON.parse(r.spellings) : null; } catch { list = null; }
     if (!acc[ns].has(norm)) acc[ns].set(norm, new Set());
-    if (!Array.isArray(list) || !list.length) { acc[ns].get(norm).add('\u0000broken'); continue; }   // 壊れた記録 = 使わない
-    for (const s of list) acc[ns].get(norm).add(String(s));
+    if (!Array.isArray(list) || !list.length || !list.every((s) => typeof s === 'string' && s.length > 0 && s.toLowerCase() === r.code_norm)) {
+      hurt('bad_spellings'); acc[ns].get(norm).add('\u0000broken'); continue;   // 壊れた記録 = 使わない
+    }
+    for (const s of list) acc[ns].get(norm).add(s);
   }
   const entries = [];
   for (const kind of ['product', 'rep']) {
@@ -394,7 +413,8 @@ export function resolveNeCodes(sp) {
       entries.push({ code_norm: norm, kind, state, ne_code, spellings });
     }
   }
-  return { ok: true, entries };
+  const damaged = Object.values(damagedReasons).reduce((a, n) => a + n, 0);
+  return { ok: true, entries, damaged, ...(damaged ? { damaged_reasons: damagedReasons } : {}) };
 }
 
 /**
@@ -425,24 +445,46 @@ export function neIntegrityRows(ne, intBlocked) {
   const fetchState = { ok: !!fc.ok, fetch_fingerprint: fc.fetch_fingerprint ?? null, ...(fc.error ? { error: fc.error } : {}), ...(fc.fetch_fingerprint_mismatch ? { fetch_fingerprint_mismatch: true } : {}) };
   for (const kind of ['products', 'setproducts']) {
     const r = fc[kind];
-    if (r && r.ok) {
-      const c = r.counts;
+    // 🆕 #1676 Codex R5: 件数は負でない safe integer・重なりは負でない (形が違う = 読めない種類と同じ 1。負の数で他の行を相殺させない)
+    const c = r && r.ok === true ? r.counts : null;
+    const shapeOk = isPlainObj(c) && [c.dropped_no_code, c.dropped_missing_fields, c.write_attempts, c.stored_rows].every(isCnt) && c.write_attempts >= c.stored_rows;
+    if (shapeOk) {
       const dropped = c.dropped_no_code + c.dropped_missing_fields, dup = c.write_attempts - c.stored_rows;
       fetchUntrusted += dropped + dup;
       fetchState[kind] = { ok: true, dropped_no_code: c.dropped_no_code, dropped_missing_fields: c.dropped_missing_fields, overwritten: dup, complete_at: c.complete_at };
-    } else { fetchUntrusted += 1; fetchState[kind] = { ok: false, reason: r ? r.reason : (fc.error ? 'error' : 'unreadable') }; }
+    } else if (r && r.ok === true) { fetchUntrusted += 1; fetchState[kind] = { ok: false, reason: 'invalid_counts' }; }
+    else { fetchUntrusted += 1; fetchState[kind] = { ok: false, reason: r ? r.reason : (fc.error ? 'error' : 'unreadable') }; }
   }
-  if (!fc.ok && fc.fetch_fingerprint_mismatch && fetchUntrusted === 0) fetchUntrusted = 1;   // 2 つの取得の版が違う = 信用しない
+  if (fc.ok !== true && fetchUntrusted === 0) fetchUntrusted = 1;   // 2 つの取得の版が違う・ok の印が無い = 信用しない (🆕 R5: 版の違い以外の ok でない も)
   integrityRows += fetchUntrusted;
   return { badRowNorms, integrityRows, fetchState };
 }
 
+/**
+ * 🆕 #1676 Codex R5 High 1: 形が完全に正しいときだけ読む (それ以外 = null = 照合 ② は blocked no_integrity・drift-list は止まる・代表の数えは記録しない):
+ *   件数 (dropped_no_code・dropped_missing_key・dropped_missing_parent) = 負でない safe integer (負・小数・文字・無い = null)
+ *   配列 (dup_codes・parent_conflicts・missing_child_parents) = 正規化して空でないコードの文字だけ / pair_dups = { parent, child } がどちらもそのコード
+ *   C1 / C2 の形: dropped_missing_parent と missing_child_parents は両方ある (C2) か両方無い (C1) か。片方だけ = null。
+ *     C2 = 親の落ち ≦ 行の落ち・子の欠けの行 (dropped_missing_key − dropped_missing_parent) があるとき、そのときだけ missing_child_parents が空でない
+ *     (子の欠けの行があるのに親が分からない = 構成の行の欠けを特定できない = 取込が書く形でない)
+ */
+const isCnt = (v) => Number.isSafeInteger(v) && v >= 0;
+const isPlainObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+const isNeCodeText = (v) => typeof v === 'string' && !!normSku(v);
+const codeList = (a) => Array.isArray(a) && a.every(isNeCodeText);
 export function neIntegrity(M) {
   let ip, is;
-  try { ip = JSON.parse(M.ne_api_products_integrity); is = JSON.parse(M.ne_api_setproducts_integrity); } catch { return null; }
-  const okInt = ip && Array.isArray(ip.dup_codes) && Number.isFinite(ip.dropped_no_code) && is && Array.isArray(is.parent_conflicts) && Array.isArray(is.pair_dups) && Number.isFinite(is.dropped_missing_key);
-  if (!okInt) return null;
-  const c2Form = Number.isFinite(is.dropped_missing_parent) && Array.isArray(is.missing_child_parents);
+  try { ip = JSON.parse((M || {}).ne_api_products_integrity); is = JSON.parse((M || {}).ne_api_setproducts_integrity); } catch { return null; }
+  if (!isPlainObj(ip) || !codeList(ip.dup_codes) || !isCnt(ip.dropped_no_code)) return null;
+  if (!isPlainObj(is) || !codeList(is.parent_conflicts) || !isCnt(is.dropped_missing_key)) return null;
+  if (!Array.isArray(is.pair_dups) || !is.pair_dups.every((d) => isPlainObj(d) && isNeCodeText(d.parent) && isNeCodeText(d.child))) return null;
+  const hasParent = is.dropped_missing_parent !== undefined, hasChildParents = is.missing_child_parents !== undefined;
+  if (hasParent !== hasChildParents) return null;
+  const c2Form = hasParent;
+  if (c2Form) {
+    if (!isCnt(is.dropped_missing_parent) || !codeList(is.missing_child_parents) || is.dropped_missing_parent > is.dropped_missing_key) return null;
+    if ((is.dropped_missing_key - is.dropped_missing_parent > 0) !== (is.missing_child_parents.length > 0)) return null;
+  }
   const intBlocked = new Map();   // norm → 理由
   for (const c of ip.dup_codes) intBlocked.set(normSku(c), 'dup_code');
   for (const c of is.parent_conflicts) intBlocked.set(normSku(c), 'parent_conflict');
@@ -1248,7 +1290,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   }
   // NE のコードの元の書き方 (③b-1b): 同じ読み取りで決めたもの。JSON には件数だけ (書くのは run.mjs が判断の台帳の後に)
   const neCodes = resolveNeCodes(ne.spellings);
-  out.ne_codes = neCodes.ok ? { state: 'resolved', counts: Object.fromEntries(['ok', 'collided', 'invalid'].map((s) => [s, neCodes.entries.filter((e) => e.state === s).length])) }
+  out.ne_codes = neCodes.ok ? { state: 'resolved', counts: Object.fromEntries(['ok', 'collided', 'invalid'].map((s) => [s, neCodes.entries.filter((e) => e.state === s).length])),
+    ...(neCodes.damaged ? { damaged: neCodes.damaged, damaged_reasons: neCodes.damaged_reasons } : {}) }
     : { state: 'unavailable', reason: neCodes.reason };
   // 新商品の NE 登録の CSV (0053・契約 v3 H5): 同じ完全な取得の中の、確かめ待ちの商品の NE の値 (書くのは run.mjs が判断の台帳の後に)
   const regObs = Array.isArray(regTargets) ? registrationObservations(nm, regTargets, {
