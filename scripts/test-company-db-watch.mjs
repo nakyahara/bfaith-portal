@@ -181,11 +181,12 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
-await t('10/7 の見直し (v18・本番の記録 9/23〜10/7): W11 の支払い待ち 10 日・A\' の上限 楽天 66 / W12 の容量 13 GB (15 GB − WAL 2 GB)・増え方を見る日数 28 (7 GB はそのまま) / W6・W8 は 11/4 の朝から warn (その前の日までは info)', () => {
-  assert.deepEqual([REAL_CONFIG.W11_P_MAX_DAYS, REAL_CONFIG.W11_CANCELLED_ONLY_MAX.rakuten, REAL_CONFIG.W12_DISK_BYTES, REAL_CONFIG.W12_HISTORY_DAYS, REAL_CONFIG.W12_WARN_BYTES], [10, 66, 13 * 1024 ** 3, 28, 7 * 1024 ** 3]);
+await t('10/7 の見直し (v18・本番の記録 9/23〜10/7): W11 の支払い待ち 10 日・A\' の上限 楽天 66 / W12 の容量 13 GB (15 GB − WAL 2 GB)・増え方を見る日数 14 と 7 GB はそのまま (Codex #1678 R1) / W6・W8 は 11/4 の朝から warn (その前の日までは info)', () => {
+  assert.deepEqual([REAL_CONFIG.W11_P_MAX_DAYS, REAL_CONFIG.W11_CANCELLED_ONLY_MAX.rakuten, REAL_CONFIG.W12_DISK_BYTES, REAL_CONFIG.W12_HISTORY_DAYS, REAL_CONFIG.W12_WARN_BYTES], [10, 66, 13 * 1024 ** 3, 14, 7 * 1024 ** 3]);
   assert.deepEqual([REAL_CONFIG.W6_INFO_UNTIL, REAL_CONFIG.W8_INFO_UNTIL], ['2026-11-04', '2026-11-04']);
   // 重さの決め方は asOf < *_INFO_UNTIL ? info : 定義の重さ (checks.mjs) = 11/3 の朝まで info・11/4 の朝から warn
   assert.deepEqual([['2026-11-03', '2026-11-04'].map((d) => (d < REAL_CONFIG.W6_INFO_UNTIL ? 'info' : REAL_CONFIG.checkById('W6').severity)), ['2026-11-03', '2026-11-04'].map((d) => (d < REAL_CONFIG.W8_INFO_UNTIL ? 'info' : REAL_CONFIG.checkById('W8').severity))], [['info', 'warn'], ['info', 'warn']]);
+  for (const id of ['W6', 'W8']) assert.match(REAL_CONFIG.checkById(id).what, /2026-11-04 の前日の朝までは info・この日の朝から warn/, `${id} の説明文の境目 (Codex #1678 R1 Low)`);
 });
 await t('partial の例外は期限つき (until を過ぎたら効かない)', () => {
   const s = CONFIG.STOCK_SCOPES.find((x) => x.source === 'fba_us');
@@ -1182,6 +1183,49 @@ await t('🚨 W4 / W12 の世代の指紋: 評価の後に昨日の差のイベ�
   r = await run({ dryRun: true });
   assert.equal(r.attempts, 1);   // 何も変わらなければ 1 回 (今の大きさが指紋に入っていない)
   await w4Replace(D(-1), Array.from({ length: 10 }, () => -300));
+});
+await t('🚨 規則の変更 (項目の版が上がった・Codex #1678 R1・09 §11.2): 前の版 (v1) の結果で開いた W12 の案件が、新しい版 (v2) の最初の回に pass で消えても「回復」と数えない (out_of_window・規則の変更で閉じた・回復 0)。新しい版どうしの次の回は通常どおり回復', async () => {
+  assert.deepEqual([REAL_CONFIG.checkById('W11').version, REAL_CONFIG.checkById('W12').version], ['v2', 'v2']);
+  const w12c = CONFIG.checkById('W12');
+  const only = (ver, extra = {}) => ({ ...CONFIG, CHECKS: [{ ...w12c, version: ver }], ...extra });   // W12 だけ評価する (ほかの項目の案件に触らない)
+  const issue = () => one(`select i.watch_issue_id, i.state, i.transitions, i.recovered_at is not null as rec, i.summary, r.check_version from ops.watch_issues i left join ops.watch_results r on r.watch_result_id = i.last_result_id where i.check_id = 'W12' order by i.watch_issue_id desc limit 1`);
+  await pg.query(`delete from ops.watch_issues where check_id = 'W12'`);
+  // v1 (前の規則) で breach → 案件が開く (最後の結果の版 = v1)
+  let r = await run({ config: only('v1', { W12_WARN_BYTES: 1048576 }) });
+  assert.deepEqual([w12(r).verdict, r.counts.new], ['breach', 1]);
+  let i = await issue();
+  assert.deepEqual([i.state, i.check_version], ['open', 'v1']);
+  // v2 (新しい規則) の最初の回で pass → 回復ではなく「規則の変更で閉じた」
+  r = await run({ config: only('v2'), now: new Date('2026-09-23T01:00:00Z') });
+  assert.deepEqual([w12(r).verdict, r.counts.recovered, r.counts.rule_changed, r.counts.out_of_window, r.notes.ruleChanged[0].reason], ['pass', 0, 1, 0, 'rule_changed:v1->v2']);
+  assert.match(r.lastLine, /回復 0 .*規則の変更で閉じた 1 \(回復ではない\)/);
+  i = await issue();
+  assert.deepEqual([i.state, i.transitions, i.rec, /規則の変更で閉じた \(v1 → v2。回復ではない\)/.test(i.summary)], ['out_of_window', 2, false, true]);
+  // v2 どうし: breach で開いて pass で消えた = 通常の回復
+  r = await run({ config: only('v2', { W12_WARN_BYTES: 1048576 }), now: new Date('2026-09-23T02:00:00Z') });
+  assert.deepEqual([w12(r).verdict, r.counts.new], ['breach', 1]);
+  r = await run({ config: only('v2'), now: new Date('2026-09-23T03:00:00Z') });
+  assert.deepEqual([r.counts.recovered, r.counts.rule_changed], [1, 0]);
+  assert.doesNotMatch(r.lastLine, /規則の変更/);
+  i = await issue();
+  assert.deepEqual([i.state, i.rec, i.check_version], ['recovered', true, 'v2']);
+  // v1 で開いて、v2 の最初の回も breach (継続) → 最後の結果が v2 になる = その後の pass は通常の回復
+  await run({ config: only('v1', { W12_WARN_BYTES: 1048576 }), now: new Date('2026-09-23T04:00:00Z') });
+  await run({ config: only('v2', { W12_WARN_BYTES: 1048576 }), now: new Date('2026-09-23T05:00:00Z') });
+  assert.equal((await issue()).check_version, 'v2');
+  r = await run({ config: only('v2'), now: new Date('2026-09-23T06:00:00Z') });
+  assert.deepEqual([r.counts.recovered, r.counts.rule_changed], [1, 0]);
+  await pg.query(`delete from ops.watch_issues where check_id = 'W12'`);
+  // 判定の部品: 版の分からない案件 (last_result_id が無い = 手で入れた・古い行) は今まで通り回復 / blocked なら触らない / 版の違う案件が breach なら継続
+  const open = (v) => [{ watch_issue_id: 7, check_id: 'W11', scope_key: 'amazon/jp', subject_type: 'scope', subject_key: '', severity: 'warn', first_seen_at: '2026-09-20T00:00:00Z', last_seen_at: '2026-09-22T00:00:00Z', days_seen: 3, transitions: 1, last_check_version: v }];
+  const res = (verdict) => [{ checkId: 'W11', checkVersion: 'v2', scopeKey: 'amazon/jp', verdict, severity: 'warn', items: [], reason: 'x' }];
+  const rcs = ['v1', null, 'v2'].map((v) => reconcileIssues({ config: CONFIG, results: res('pass'), openIssues: open(v), asOf: ASOF, now: NOW }));
+  assert.deepEqual(rcs.map((rc) => [rc.updates[0].set.state, rc.notes.recovered.length, rc.notes.ruleChanged.length]), [['out_of_window', 0, 1], ['recovered', 1, 0], ['recovered', 1, 0]]);
+  // 明示の回復 (評価が回復を確かめた = W13:ne の recoverable) は版が違っても回復
+  const ex = reconcileIssues({ config: CONFIG, results: [{ ...res('pass')[0], explicitRecovery: true, recoverable: [''] }], openIssues: open('v1'), asOf: ASOF, now: NOW });
+  assert.deepEqual([ex.updates[0].set.state, ex.notes.recovered.length, ex.notes.ruleChanged.length], ['recovered', 1, 0]);
+  assert.deepEqual([reconcileIssues({ config: CONFIG, results: res('blocked'), openIssues: open('v1'), asOf: ASOF, now: NOW }).updates.length,
+    reconcileIssues({ config: CONFIG, results: res('breach'), openIssues: open('v1'), asOf: ASOF, now: NOW }).notes.continued.length], [0, 1]);
 });
 
 console.log('実行器の守り');
