@@ -256,7 +256,11 @@ const lineDiff = (a, b) => {
 await ta('[B1] 0052 の後に claim_card_events / guard_product_hub_outbox / guard_product_hub_outbox_session を置き換えた migration は 0066 だけ (= 0052 が最新の版)', async () => {
   for (const name of ['ops.claim_card_events', 'ops.guard_product_hub_outbox', 'ops.guard_product_hub_outbox_session', 'ops.finish_card_event']) {
     const hits = migFiles.filter((f) => new RegExp(`create (or replace )?function ${name.replace('.', '\\.')}\\(`).test(migText(f)));
-    assert.deepEqual(hits, name === 'ops.finish_card_event' ? ['0052_master_registrations.sql'] : ['0052_master_registrations.sql', '0066_product_hub_outbox_namespace.sql'], name);
+    // 🆕 0067 (PR-5) が guard_product_hub_outbox_session を 0066 の版から置き換えた (まとまりの約束で開く) = その中身は scripts/test-master-variation.mjs の [S2] が 0066 との差で確かめる
+    const want = name === 'ops.finish_card_event' ? ['0052_master_registrations.sql']
+      : name === 'ops.guard_product_hub_outbox_session' ? ['0052_master_registrations.sql', '0066_product_hub_outbox_namespace.sql', '0067_variation_groups.sql']
+        : ['0052_master_registrations.sql', '0066_product_hub_outbox_namespace.sql'];
+    assert.deepEqual(hits, want, name);
   }
 });
 await ta('[B2] claim_card_events = 0052 の本文に「and o.entity_kind = \'sku\'」の 1 行を足しただけ・DB の本文も 0066 のもの', async () => {

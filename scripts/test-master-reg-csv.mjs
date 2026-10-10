@@ -918,7 +918,7 @@ await ta('[C14] 権限の境界: 画面のロールは表を直接書けない�
   assert.deepEqual([jg.c, jg.d, jg.pub], ['search_path=pg_catalog, pg_temp', true, false]);
 });
 
-await ta('[C15] 作る関数の門 (lib を通さずに呼んでも): 0065 = 単品 (v2) は試し用の門なし (6 行も作れる)・引退した v1 / まだ開かない variation-v1 は作らない (schema_not_buildable)・切替の前 (new_open でない) は作る / 配る / 申告 / 使わないを拒む', async () => {
+await ta('[C15] 作る関数の門 (lib を通さずに呼んでも): 0065 = 単品 (v2) は試し用の門なし (6 行も作れる)・引退した v1 は作らない (schema_not_buildable)・🆕 0067 の variation-v1 = まとまりの子でない品目は作らない (not_ready)・切替の前 (new_open でない) は作る / 配る / 申告 / 使わないを拒む', async () => {
   // 単品 6 つを 1 つのファイルに (0065: 単品の形 v2 は「ためしは要らない」= 5 行の門なし)
   const codes = ['new-t1', 'new-t2', 'new-t3', 'new-t4', 'new-t5', 'new-t6'];
   for (const c of codes) await reg('single', c, single({ name: `T ${c}` }));
@@ -931,10 +931,10 @@ await ta('[C15] 作る関数の門 (lib を通さずに呼んでも): 0065 = 単
     header: G.REG_SCHEMAS.products.header.join(','), ne_codes_run: mark, cost_day: TODAY,
     items: mats.map((m, i) => ({ sku_id: m.cur.sku_id, expected: m.expected, rows: [rows[i]] })) });
   const bytes6 = G.buildRegCsv(G.REG_SCHEMAS.products, rows).bytes;
-  for (const s of ['ne-reg-single-v1', 'ne-reg-variation-v1']) {
-    const e = await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [payloadOf(s), bytes6])), /schema_not_buildable/);
-    assert.match(e.message, s === 'ne-reg-single-v1' ? /引退/ : /PR-5/);
-  }
+  const e1 = await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [payloadOf('ne-reg-single-v1'), bytes6])), /schema_not_buildable/);
+  assert.match(e1.message, /引退/);
+  // 🆕 0067 (PR-5): まとまりの版は作れる版 = まとまりの子でない品目は断る (まとまりの試験は scripts/test-master-variation.mjs の [N1]〜[N3])
+  await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [payloadOf('ne-reg-variation-v1'), bytes6])), /^not_ready: new-t1 はまとまりの子でない/);
   await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [payloadOf('ne-reg-single-v9'), bytes6])), /種類・形の版・見出しが合わない/);
   const b6 = (await inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [payloadOf('ne-reg-single-v2'), bytes6]))).rows[0].r;
   assert.deepEqual([b6.state, b6.trial, b6.rows], ['built', false, 6], '単品 (v2) は 6 行も作れる (試し用でない)');
@@ -1159,7 +1159,7 @@ function lineDiff(a, b) {
 const F0065 = MIG_FILES.find((x) => x.startsWith('0065_'));
 const { readSkuPage } = await import('../apps/master-edit/read.mjs');
 
-await ta('[V1] 0065 形の版の決まり: lib の REG_SCHEMA_RULES = DB の ops.ne_reg_schema_rule (全部の版・知らない版 = null)・単品 = ne-reg-single-v2・まとまり = ne-reg-variation-v1 (JAN = empty・代表 = まとまりのコード・まだ作らない)・表の CHECK・最初の確かめの記録だけ', async () => {
+await ta('[V1] 0065 形の版の決まり: lib の REG_SCHEMA_RULES = DB の ops.ne_reg_schema_rule (全部の版・知らない版 = null)・単品 = ne-reg-single-v2・まとまり = ne-reg-variation-v1 (JAN = empty・代表 = まとまりのコード・🆕 0067 から作れる版)・表の CHECK・最初の確かめの記録だけ', async () => {
   const dbKeys = [...(await one(`select pg_get_functiondef('ops.ne_reg_schema_rule(text)'::regprocedure) as d`)).d.matchAll(/when '([a-z0-9-]+)' then/g)].map((x) => x[1]).sort();
   assert.deepEqual(dbKeys, Object.keys(G.REG_SCHEMA_RULES).sort(), 'DB と lib の版の一覧が同じ');
   for (const [schema, r] of Object.entries(G.REG_SCHEMA_RULES)) {
@@ -1170,7 +1170,7 @@ await ta('[V1] 0065 形の版の決まり: lib の REG_SCHEMA_RULES = DB の ops
   assert.deepEqual([G.REG_SCHEMAS.products.schema, G.REG_SCHEMAS.products.trialGate, G.REG_SCHEMAS.sets.schema, G.REG_SCHEMAS.sets.trialGate], ['ne-reg-single-v2', false, 'ne-reg-set-v1', true]);
   const v = G.REG_VARIATION_SCHEMA;
   assert.deepEqual([v.kind, v.skuKind, v.schema, v.header.join(','), v.trialGate], ['products', 'single', 'ne-reg-variation-v1', G.REG_SCHEMAS.products.header.join(','), false]);
-  assert.deepEqual(['buildable', 'jan', 'parent'].map((k) => G.REG_SCHEMA_RULES['ne-reg-variation-v1'][k]), [false, 'empty', 'group'], 'まとまりの版 = JAN は empty・代表商品コード = まとまりのコード・PR-5 まで作らない');
+  assert.deepEqual(['buildable', 'jan', 'parent'].map((k) => G.REG_SCHEMA_RULES['ne-reg-variation-v1'][k]), [true, 'empty', 'group'], 'まとまりの版 = JAN は empty・代表商品コード = まとまりのコード・🆕 0067 (PR-5) から作れる');
   assert.deepEqual(['ne-reg-single-v1', 'ne-reg-single-v2'].map((s) => [G.REG_SCHEMA_RULES[s].buildable, G.REG_SCHEMA_RULES[s].jan, G.REG_SCHEMA_RULES[s].trialGate]), [[false, 'value', true], [true, 'empty', false]]);
   // 表の CHECK: まとまりの版の名前は入る・知らない形は入らない (持ち主のロールで・取引は巻き戻す)
   const ins = (schema) => pg.query(`insert into ops.ne_reg_exports (kind, schema_version, header, encoding, trial, item_count, row_count, aggregate_token, payload_hash, sha256, file_bytes, request_id, ne_codes_run, cost_day, created_by)
@@ -1277,7 +1277,9 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
     assert.equal(prev, want.base, `${name} の元にした版 (0065 より前の最後の定義) が変わった = 0065 の関数を、新しい版から写し直す`);
     const d = lineDiff(fnDefIn(prev, name).split('\n'), fnDefIn(F0065, name).split('\n'));
     assert.deepEqual(d, { removed: want.removed, added: want.added }, `${name}: ${prev} との差`);
-    for (const later of MIG_FILES.filter((x) => x > F0065)) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0065 の試験の元を見直す`);
+    // 例外は名指しの 0067 (PR-5 = まとまりの版): ops.ne_reg_canonical / ops.ne_reg_build を 0065 の版から写す = その中身は scripts/test-master-variation.mjs の [S2] が 0065 との差で確かめる
+    const allowLater = ['ops.ne_reg_canonical', 'ops.ne_reg_build'].includes(name) ? ['0067_variation_groups.sql'] : [];
+    for (const later of MIG_FILES.filter((x) => x > F0065 && !allowLater.includes(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0065 の試験の元を見直す`);
   }
   // 権限: create or replace = 前の権限のまま (作る = 画面のロール・確かめ = watch_writer)・新しい部品はだれにも渡さない
   const priv = async (sig) => one(`select has_function_privilege('public', $1::regprocedure, 'execute') as pub, has_function_privilege('master_edit', $1::regprocedure, 'execute') as me,
