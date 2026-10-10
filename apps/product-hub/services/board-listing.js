@@ -25,6 +25,7 @@ import { getDB, logEvent } from '../db.js';
 import { transferImagesToCabinet, registerItem, rakutenItemPageUrl } from './rakuten-listing.js';
 import { markRakutenListed, mallStatusOf } from '../lib/mall-status.js';
 import { setStepState } from '../lib/workflow-progress.js';
+import { cdbGroupListingBlock } from './cdb-group-gate.js';
 
 /** 楽天への登録を実行中の draft_id → 開始時刻 (プロセス内。Render は 1 プロセスなのでこれで足りる) */
 const inFlight = new Map();
@@ -120,6 +121,10 @@ function setAttempt(db, draftId, { outcome, error = null, start = false, keepErr
  */
 export function assertRakutenListable(db, draft, { forceUnknown = false } = {}) {
   const id = Number(draft.id);
+  // 🆕 PR-4 (Company DB構想 20 v7 §⑤): まとまりのカードの出品の共通の門 = NE の写し待ち・2 軸のまとまりは出さない。
+  //   確認済みの再実行 (forceUnknown) でも通さない (registerItem・buildItemPayload も同じ門)
+  const groupBlock = cdbGroupListingBlock(db, id, { op: 'assert' });
+  if (groupBlock) throw httpError(400, groupBlock.message);
   const rk = db.prepare('SELECT registered_at, listing_outcome FROM draft_rakuten WHERE draft_id = ?').get(id);
   if (rk?.registered_at) {
     throw httpError(400, 'この商品は楽天に登録済みです (公開/非公開の切り替えは詳細画面から)');

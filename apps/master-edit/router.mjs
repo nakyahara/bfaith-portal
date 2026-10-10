@@ -71,7 +71,7 @@ import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } f
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
-import { runCardOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
+import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
 import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
@@ -213,6 +213,24 @@ async function applyCard(ev) {
   if (cardApplier) return cardApplier(ev);
   const m = await import('../product-hub/services/cdb-card-intake.js');
   return m.applyCdbCardEvent(ev);
+}
+/** まとまりのカードの取り込み (SQLite・#1675 の cdb-group-intake.js)。試験は差し替える */
+let groupCardApplier = null;
+export function __setGroupCardApplier(fn) { groupCardApplier = fn || null; }
+async function applyGroupCard(ev) {
+  if (groupCardApplier) return groupCardApplier(ev);
+  const m = await import('../product-hub/services/cdb-group-intake.js');
+  return m.applyCdbGroupEvent(ev);
+}
+/** まとまりの知らせを 1 つ取り込む (まとめての登録の直後)。誤りは投げない (取れなければ product-hub の sweep が続きをする) */
+async function tryGroupCard(db, eventId) {
+  try {
+    const r = await runGroupOutbox(db, applyGroupCard, { eventId, limit: 1 });
+    return r[0] || null;
+  } catch (e) {
+    console.error(`[master-edit] まとまりのカードの取り込みの失敗: ${e && e.message}`);
+    return { status: 'pending', error: String(e && e.message || e) };
+  }
 }
 /** 発注の設定の書き込み (新商品の登録の ② = Company DB の登録の後)。本番 = 発注アプリの部品 (request_id で 1 回だけ)。試験は差し替える (② だけ失敗する) */
 let orderWriter = writeRegistrationOrderSettings;
@@ -641,7 +659,13 @@ router.post('/api/new/variation', (req, res) => {
       }
       orderResult = { ok: failed.length === 0, written: ok, failed };
     }
-    res.json({ ...r, ...(orderInput ? { order_settings: orderResult } : {}) });
+    // まとまりのカード (product-hub・まとまりで 1 枚) を保存の後で 1 回だけ試す (同じ取引ではない = 失敗しても登録はできている・続きは product-hub の sweep)
+    let card = null;
+    if (r.event_id && !r.replayed) {
+      const t = await tryGroupCard(db, r.event_id);
+      if (t) card = { status: t.status, label: CARD_STATUS_LABELS[t.status] || t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null };
+    }
+    res.json({ ...r, card, ...(orderInput ? { order_settings: orderResult } : {}) });
   }, 'write');
 });
 

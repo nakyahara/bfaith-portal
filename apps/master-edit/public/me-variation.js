@@ -1059,7 +1059,7 @@
           $('#result').innerHTML = '<div class="result ok"><div class="rt">' + icon('check', 's') + ' ' + kids.length + ' 件を下書きにしました' + (x.j.replayed ? ' (前の同じ保存の結果)' : '') + '</div><ul>'
             + '<li>まとまり ' + esc(x.j.group_code) + (x.j.group_created ? ' を作りました' : ' に足しました (今ある ' + (m.pk ? m.pk.kids.length : 0) + ' 件は変更なし)') + ' (軸・選択肢も一緒に記録)</li>'
             + '<li>次は「NE 登録の CSV」で、この回の ' + kids.length + ' 件を 1 ファイルにして NE に取り込みます' + (S.nextOpts.length ? ' (回ごとに 1 ファイル = 残りを足す前に、この回のファイルを作っておくと分けられます)' : '') + '</li>'
-            + '<li>出品カードはまとまりで 1 枚 (NE の写し待ち)</li>'
+            + '<li>出品カードはまとまりで 1 枚 (NE の写し待ち)' + (x.j.card ? ' · ' + esc(x.j.card.label) + (x.j.card.status === 'done' ? '' : ' (product-hub のボードを開くと続きを作ります)') : '') + '</li>'
             + (po ? (po.ok ? '<li>発注の設定を ' + po.written + ' 件に入れました</li>' : '<li style="color:var(--warn)">発注の設定だけ ' + po.failed.length + ' 件入れられませんでした (' + esc(po.failed.slice(0, 3).map(function (f) { return f.code; }).join('・')) + ')。商品の画面の「発注の設定」で入れてください</li>') : '')
             + '</ul><div class="kidchips" style="margin:6px 0 10px">' + kids.slice(0, 12).map(function (k) { return '<a class="compchip" href="' + BASE + '/sku/' + encodeURIComponent(k.code) + '"><span class="mono">' + esc(k.code) + '</span></a>'; }).join('') + (kids.length > 12 ? '<span class="hint">… ほか ' + (kids.length - 12) + ' 件</span>' : '') + '</div>'
             + (S.nextOpts.length ? '<button type="button" class="btn pri" data-act="next">' + icon('plus', 's') + '残りの ' + S.nextOpts.length + ' ' + u + 'を足す (このまとまりに続けて)</button> ' : '')

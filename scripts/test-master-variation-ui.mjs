@@ -197,6 +197,8 @@ await ta('[①] 新しいまとまり (色 4 × サイズ 4): コードのでき
   await shot(p, '3-kids', '#sec-kids');
   const r = await saveViaConfirm(p);
   assert.match(r, /15 件を下書きにしました/);
+  assert.match(r, /出品カードはまとまりで 1 枚 \(NE の写し待ち\) · カード作成済み/, 'まとまりのカード (#1675) を保存の後に 1 回試す: ' + r);
+  assert.equal((await one("select status from ops.product_hub_outbox where group_product_id = (select group_product_id from ops.variation_group_codes where code_norm = 'hakama')")).status, 'done');
   assert.equal((await kidsOf('hakama')).length, 15);
   const nv = await one(`select name from core.skus where code = 'hakama-NV-110'`);
   assert.equal(nv.name, '子ども袴 2点セット【ネイビー】【110cm】限定柄');
