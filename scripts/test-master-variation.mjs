@@ -7,7 +7,7 @@
  *   M 予約: 0067 が今ある札・単品の代表を予約 (load) に入れる・重なりがあれば migration を止める (何も入れない)・事前検査の読むだけの SQL (README / PR 本文と同じ文) が同じ数
  *   G 持ち主の門: products.parent の DB の active が load = まとまりの関数は全部 parent_not_company (何も書かない)・ふつうの単品の登録は今までどおり
  *   B まとめての登録 (1 取引): 札・予約 (portal)・軸・選択肢・子の選択肢・親 (manual)・revision 1・スナップショット (ph-group-v1 = lib の形の決まりと DB の値に合う)・約束と done・
- *     同じ request_id = 前の答え・コードの決まり (まとまり・選択肢番号・子 = まとまり + 選択肢・一意・(横, 縦) の一意・20 件まで)・閉じないと commit できない・
+ *     同じ request_id = 前の答え・コードの決まり (まとまり・選択肢番号・子 = まとまり + 選択肢・一意・(横, 縦) の一意・120 件まで (121 = too_many))・閉じないと commit できない・
  *     閉じる時の子の確かめ (この取引で登録した下書き・子の request_id・カードなし)・一部が断られたら全部巻き戻す・今あるまとまり (札・単品の代表) に足す・
  *     同じまとまりを 1 つの取引で 2 回変える = revision_twice
  *   R 名前を直す: まとまり (札だけ)・軸・選択肢名・見た revision・一意・変わらない = 何も書かない・巻き戻した取引は revision を上げない
@@ -376,7 +376,8 @@ await ta('[B3] 断る (どれも全部巻き戻す = 札・予約・子・知ら
   await failsWith(batch(spec2({ group: { code: 'ChUnk', name: 'x' }, children: [{ code: 'ChUnk-wh-90', choices: { 1: '-wh', 2: '-90' } }] })), /^choice_unknown/);
   await failsWith(batch(spec2({ group: { code: 'ChOne', name: 'x' }, children: [{ code: 'ChOne-WH', choices: { 1: '-WH' } }] })), /^invalid_input/);
   await failsWith(batch(spec2({ group: { code: 'ChDup', name: 'x' }, children: [{ code: 'ChDup-WH-90', choices: { 1: '-WH', 2: '-90' } }, { code: 'ChDup-WH-90', choices: { 1: '-WH', 2: '-90' } }] })), /^child_dup/);
-  const many = Array.from({ length: 21 }, (_, i) => ({ axis: 1, code: `-C${i}`, name: `色 ${i}` }));
+  assert.equal((await one('select ops.variation_max_children() as n')).n, 120);   // 中原さんの決定 10/10
+  const many = Array.from({ length: 121 }, (_, i) => ({ axis: 1, code: `-C${i}`, name: `色 ${i}` }));
   await failsWith(batch(spec2({ group: { code: 'Many', name: 'x' }, options: [...many, { axis: 2, code: '-90', name: '90' }], children: many.map((o) => ({ code: `Many${o.code}-90`, choices: { 1: o.code, 2: '-90' } })) })), /^too_many/);
   await failsWith(batch(spec2({ group: { code: 'L'.repeat(20), name: 'x' }, options: [{ axis: 1, code: '-ABCDEFGHIJ', name: 'x' }, { axis: 2, code: '-90', name: '90' }],
     children: [{ code: `${'L'.repeat(20)}-ABCDEFGHIJ-90`, choices: { 1: '-ABCDEFGHIJ', 2: '-90' } }] })), /^code_shape/);

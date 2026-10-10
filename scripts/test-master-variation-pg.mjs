@@ -8,9 +8,9 @@
  *   2 鍵の順 (デッドロックしない): まとめての登録 (JAN つき = CSV の鍵まで持つ) と、同じまとまりの名前を直す・子の廃止・NE 登録の CSV を作る・翌朝の照合の確かめ ([2b])・
  *     夜間ロード (マスタの書き込みの排他) が同時に走っても 40P01 にならない (待って順に終わる)
  *   3 1 つの取引で全部か何も無いか (本物のログイン): 子の 1 つが断られた・閉じないで commit = 札・予約・子・知らせ・done が残らない
- *   4 子の数の上限の時間: 2 軸・20 子・子ごとに JAN のまとめての登録を本物の PG で測る = 1 つの文が画面のロールの statement_timeout (20 秒) より十分短く・
- *     取引全体も短い (測った値を出す = 上限を上げるときの材料)
- *   4b 測るだけ: 40 色 × 3 サイズ = 120 子 (上限は 20 のまま・この試験の DB だけ一時的に 120)
+ *   4 子の数の時間: 2 軸・20 子・子ごとに JAN のまとめての登録を本物の PG で測る = 1 つの文が画面のロールの statement_timeout (20 秒) より十分短く・
+ *     取引全体も短い (測った値を出す)・121 子は断る (上限 120 = 中原さんの決定 10/10)
+ *   4b 上限ちょうど: 40 色 × 3 サイズ = 120 子 (上限 120 のまま通る・時間を測る)
  *   6 NE のコードの鍵 (#1677 Codex R1 High): 照合の ops.record_ne_codes と まとめての登録・子の廃止・代表の採用・CSV を作る取引を並べる = 待って順に・後の方は新しい NE のコードを見る・40P01 なし
  *   5 本物のログイン: 画面のロールはまとまりの表を直接書けない・部品を実行できない・関数は実行できる
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-variation-pg.mjs
@@ -228,7 +228,7 @@ try {
     assert.deepEqual(await counts(), before);
   });
 
-  await ta('[4] 子の数の上限の時間: 2 軸・20 子・子ごとに JAN = 1 つの文は statement_timeout (20 秒) より十分短い・取引全体も測る (上限を上げる材料)', async () => {
+  await ta('[4] 子の数の時間: 2 軸・20 子・子ごとに JAN = 1 つの文は statement_timeout (20 秒) より十分短い・取引全体も測る・121 子は断る (上限 120)', async () => {
     const colors = Array.from({ length: 10 }, (_, i) => ({ axis: 1, code: `-C${i}`, name: `色 ${i}` }));
     const sizes = [{ axis: 2, code: '-S', name: 'S' }, { axis: 2, code: '-M', name: 'M' }];
     const children = colors.flatMap((c) => sizes.map((s) => ({ code: `PgBig${c.code}${s.code}`, choices: { 1: c.code, 2: s.code } })));
@@ -243,16 +243,15 @@ try {
     assert.equal((await q('select jsonb_array_length(payload -> \'children\') as n from ops.product_hub_outbox where group_product_id = $1', [r.close.group_product_id]))[0].n, 20);
     assert.ok(stat.max < 5000, `1 文 ${stat.max} ms (statement_timeout 20 秒の 1/4 より短い)`);
     assert.ok(total < 30000, `取引全体 ${total} ms`);
-    // 21 子 = 断る
-    const e = await batchTx(A, { group: { code: 'PgBig2', name: 'x' }, axes: [{ axis: 1, name: '色' }], options: Array.from({ length: 21 }, (_, i) => ({ axis: 1, code: `-D${i}`, name: `d${i}` })),
-      children: Array.from({ length: 21 }, (_, i) => ({ code: `PgBig2-D${i}`, choices: { 1: `-D${i}` } })) }).catch((x) => x);
+    // 121 子 = 断る (上限 120 = 中原さんの決定 10/10)
+    const e = await batchTx(A, { group: { code: 'PgBig2', name: 'x' }, axes: [{ axis: 1, name: '色' }], options: Array.from({ length: 121 }, (_, i) => ({ axis: 1, code: `-D${i}`, name: `d${i}` })),
+      children: Array.from({ length: 121 }, (_, i) => ({ code: `PgBig2-D${i}`, choices: { 1: `-D${i}` } })) }).catch((x) => x);
     assert.match(String(e?.message), /^too_many/);
   });
 
-  await ta('[4b] 測るだけ (上限は 20 のまま): 40 色 × 3 サイズ = 120 子・子ごとに JAN のまとめての登録の時間 (この試験の DB だけ上限を 120 にして測り、戻す)', async () => {
-    const MAXFN = `create or replace function ops.variation_max_children() returns integer language sql immutable set search_path = pg_catalog, pg_temp as $$ select %s $$`;
-    await M.query(MAXFN.replace('%s', '120'));
-    try {
+  await ta('[4b] 上限ちょうど (120 = 中原さんの決定 10/10): 40 色 × 3 サイズ = 120 子・子ごとに JAN のまとめての登録が上限のまま通る・時間を測る', async () => {
+    assert.equal((await q('select ops.variation_max_children() as n'))[0].n, 120);
+    {
       const colors = Array.from({ length: 40 }, (_, i) => ({ axis: 1, code: `-C${i}`, name: `色 ${i}` }));
       const sizes = [{ axis: 2, code: '-S', name: 'S' }, { axis: 2, code: '-M', name: 'M' }, { axis: 2, code: '-L', name: 'L' }];
       const children = colors.flatMap((c) => sizes.map((s) => ({ code: `PgHuge${c.code}${s.code}`, choices: { 1: c.code, 2: s.code } })));
@@ -267,10 +266,7 @@ try {
       assert.equal(r.close.revision, 1);
       assert.equal((await q(`select jsonb_array_length(payload -> 'children') as n from ops.product_hub_outbox where group_product_id = $1`, [r.close.group_product_id]))[0].n, 120);
       assert.ok(stat.max < 20000, `1 文 ${stat.max} ms (statement_timeout 20 秒)`);
-    } finally {
-      await M.query(MAXFN.replace('%s', '20'));
     }
-    assert.equal((await q('select ops.variation_max_children() as n'))[0].n, 20);
   });
 
   await ta('[6] NE のコードの鍵 (#1677 Codex R1 High): 照合の ops.record_ne_codes (排他) と まとめての登録・子の廃止・代表の採用が並ぶ = 先の方の commit を待ち、後の方は新しい NE のコードを見る・デッドロックしない (JAN = CSV の鍵を持ったまま NE のコードを待つ CSV を作る取引とも)', async () => {
@@ -374,7 +370,7 @@ try {
     assert.equal(await codeOf(A, `update ops.variation_group_revisions set revision = 99`), '42501');
     assert.equal(await codeOf(A, `select ops._variation_bump($1, gen_random_uuid(), 'x')`, [GRP1]), '42501');
     assert.equal(await codeOf(A, `select ops.reserve_existing_variation_groups('x')`), '42501');
-    assert.equal((await A.query(`select ops.variation_group_code_problem('NewOne') as p, ops.variation_parent_company() as c, ops.variation_max_children() as m`)).rows[0].m, 20);
+    assert.equal((await A.query(`select ops.variation_group_code_problem('NewOne') as p, ops.variation_parent_company() as c, ops.variation_max_children() as m`)).rows[0].m, 120);
     assert.ok((await A.query('select count(*)::int as n from ops.variation_group_codes')).rows[0].n >= 1);
   });
 } finally {

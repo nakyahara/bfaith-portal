@@ -102,8 +102,9 @@ create function ops.variation_parent_company() returns boolean language sql stab
 $$;
 revoke all on function ops.variation_parent_company() from public;
 
--- 1 回のまとめての登録の子の数の上限 (設計 v7 §④・R2 Medium 7: 本物の PG で時間の上限つきで測るまで小さく = 20)
-create function ops.variation_max_children() returns integer language sql immutable set search_path = pg_catalog, pg_temp as $$ select 20 $$;
+-- 1 回のまとめての登録の子の数の上限 = 120 (中原さんの決定 10/10・40 色 × 3 サイズ)。設計 v7 §④・R2 Medium 7 = 本物の PG で測った:
+--   120 子・子ごとに JAN = 文 242 個・1 文の最大 約 530 ms (閉じる)・取引全体 約 2.1 秒 (画面のロールの statement_timeout 20 秒・lock_timeout 10 秒より十分短い = scripts/test-master-variation-pg.mjs の [4b])
+create function ops.variation_max_children() returns integer language sql immutable set search_path = pg_catalog, pg_temp as $$ select 120 $$;
 revoke all on function ops.variation_max_children() from public;
 
 -- まとめての request_id から子・閉じるの request_id を決める (lib/master-write.mjs の janRequestId と同じ作り方: sha256(request_id || ':' || 印) の 16 進の先頭 32 字を uuid の形に)。
@@ -684,7 +685,7 @@ revoke all on function ops._variation_replay(uuid, text, text, text, bigint, big
  *   group: { code, name } (新しいまとまり = 札を作る・コード = 楽天の商品管理番号を人が打つ) | { product_id } (今あるまとまり = 札か単品の代表),
  *   axes: [{ axis: 1, name }, { axis: 2, name }] (新しいまとまり・軸の無い今あるまとまりは要る (1〜2 つ)。軸のある今あるまとまりは無しか今と同じ = 軸の数・名前は変えない),
  *   options: [{ axis, code: '-WH', name }] (足す選択肢だけ・並びはこの順),
- *   children: [{ code: 'hakama-WH-90', choices: { '1': '-WH', '2': '-90' } }] (1〜20・コード = まとまりのコード + 横 + 縦 (打ったとおり)) }
+ *   children: [{ code: 'hakama-WH-90', choices: { '1': '-WH', '2': '-90' } }] (1〜120・コード = まとまりのコード + 横 + 縦 (打ったとおり)) }
  * 鍵: request → 許可 (共有) → 段階 → マスタの書き込み → 親子 (排他) → まとまりのコード → まとまり → 子のコード (norm の順)。
  * 確かめ: products.parent の active が company・新しいまとまりのコードの決まり・選択肢番号の形と軸ごとの一意 (今の選択肢とも)・選択肢名の一意・
  *   子のコード = まとまり + 選択肢・子のコードの一意 (この登録の中・今の Company DB・NE・消したコード = ops.new_sku_code_problem)・(横, 縦) の一意 (今の子とも)。

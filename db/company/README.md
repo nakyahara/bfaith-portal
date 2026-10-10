@@ -2410,11 +2410,11 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **親か子のどちらか一方** (`core.check_parent_one_level`・遅らせた constraint trigger・どのロールでも): company のときだけ見る (load の間の夜間ロードは止めない)
 - **関数** (security definer・search_path = pg_catalog, pg_temp・画面のロール master_edit に実行だけ):
   - `ops.variation_batch_open(request_id, actor, reason, ownership, spec)` → 子ごとに `ops.register_new_sku` (子の request_id = `ops.variation_sub_request_id(request_id, 'child:' || norm)` = sha256 の先頭 32 字 = janRequestId と同じ作り方・カードの知らせは書かない)・JAN は `ops.edit_sku_jan` →
-    `ops.variation_batch_close(request_id, actor, ownership, common)` を **1 つの取引** で。spec = { group: { code, name } | { product_id }, axes, options (足すものだけ), children: [{ code, choices }] (1〜20) }。
+    `ops.variation_batch_close(request_id, actor, ownership, common)` を **1 つの取引** で。spec = { group: { code, name } | { product_id }, axes, options (足すものだけ), children: [{ code, choices }] (1〜120 = 中原さんの決定 10/10) }。
     子のコード = まとまりのコード + 横 + 縦 (打ったとおり)・`ops.new_sku_code_problem`・(横, 縦) の一意・選択肢の一意を DB が確かめる。閉じる = 親 (manual)・軸・選択肢・子の選択肢・revision + 1・`group_snapshot` (ph-group-v1) の知らせ
   - `ops.cancel_variation_child` (下書き / NE 登録待ち・生きているファイルなし・NE に一度も現れていない子だけ)・`ops.edit_variation_labels` (札の名前・軸の名前・選択肢名・見た revision)・
     `ops.adopt_ne_parent_for_quarantined` (最新の封のある照合の回 = NE の元のコードの印の回の観測から・1 回だけ)
-  - 確かめ: `ops.variation_group_code_problem(code)`・`ops.variation_parent_company()`・`ops.variation_max_children()` (= 20)
+  - 確かめ: `ops.variation_group_code_problem(code)`・`ops.variation_parent_company()`・`ops.variation_max_children()` (= 120・本物の PG で 120 子 + JAN = 約 2.1 秒)
   - 鍵の順 = request → 許可 (共有) → 段階 → マスタの書き込み → (SKU) → 親子 (排他) → (まとめての登録だけ CSV (排他) = JAN の ops.edit_sku_jan より先) → **NE のコード (共有)** → まとまりのコード → まとまり → 子のコード (norm の順)。
     NE のコードの共有の鍵 (#1677 Codex R1 High) = まとめての登録・子の廃止・代表の採用は、コードの確かめ (NE の今と前に見たコード)・印の回・封・観測・元の書き方を鍵の後に読み、commit まで照合の `ops.record_ne_codes` (排他) に入れ替えさせない。
     同じ request_id の押し直し = 同じ操作・人・要求のハッシュ・相手 (SKU / まとまり) のときだけ前の答え (違えば `request_id_reused`)。NE 登録の CSV の押し直しも形の版と見出しまで同じときだけ (single-v2 と variation-v1 を取り違えない)。本物の PG で、同時に同じまとまりに足す・名前を直す・子の廃止・CSV を作る・照合の確かめ・夜間ロードの排他と並べて試験 (`scripts/test-master-variation-pg.mjs`)
