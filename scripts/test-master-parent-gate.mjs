@@ -17,7 +17,7 @@
  *   [P8] 照合の実行口 (runCompare) が封の後に記録する・recordParentGate の状態 (ok / not_applied / not_configured / failed / no_fetch)
  *   [P9] drift-list (読むだけ): 6 つの数えと一覧・引数・数えられないときは止まる
  *   [P10] 関数の作り直しは 0059 の版との差が決めた所だけ (ops._widen_judge・ops.master_widen_allowed_keys)・後の migration が作り直していない
- *   [P11]〜[P17] Codex の巡の直し (#1676 R1〜R5)。[P17] = 4 つの信号は形が完全に正しいときだけ ok (取込の整合・書き方の台帳・取得の件数・区分のゲート)
+ *   [P11]〜[P18] Codex の巡の直し (#1676 R1〜R6)。[P17] = 4 つの信号は形が完全に正しいときだけ ok (取込の整合・書き方の台帳・取得の件数・区分のゲート)・[P18] = 取込の整合の件数と配列
  * 使い方: node scripts/test-master-parent-gate.mjs   (widen の判定の全部の道・ロールは scripts/test-master-parent-gate-pg.mjs)
  */
 import assert from 'node:assert/strict';
@@ -104,9 +104,14 @@ const fcCounts = (n, { kind = 'products', dnc = 0, dmf = 0, dup = 0, fp = FP1 } 
     page_limit: 1000, pages: 1, page_rows: [fetched], last_page_rows: fetched };
 };
 const FC_OK = Object.freeze({ ok: true, fetch_fingerprint: FP1, products: { ok: true, counts: fcCounts(2) }, setproducts: { ok: true, counts: fcCounts(0, { kind: 'setproducts' }) } });
-/** 取込の整合 (neIntegrity の答え = 本物の部品で作る)。C2 の形・落ちなし */
-const INT_META = (p = {}, s = {}) => ({ ne_api_products_integrity: JSON.stringify({ dup_codes: [], dropped_no_code: 0, ...p }),
-  ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [], ...s }) });
+/**
+ * 取込の整合 (neIntegrity の答え = 本物の部品で作る)。C2 の形・落ちなし。
+ * 🆕 #1676 Codex R6: 件数 (dup_code_count・parent_conflict_count・pair_dup_count) は取込 (ne-api.js) と同じ = 配列の数 (明示した件数はそのまま = 合わない形の試験)
+ */
+const withCount = (o, arr, cnt) => (Object.hasOwn(o, cnt) || !Array.isArray(o[arr]) ? o : { ...o, [cnt]: o[arr].length });
+const INT_META = (p = {}, s = {}) => ({ ne_api_products_integrity: JSON.stringify(withCount({ dropped_no_code: 0, dup_codes: [], ...p }, 'dup_codes', 'dup_code_count')),
+  ne_api_setproducts_integrity: JSON.stringify(withCount(withCount({ dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [], parent_conflicts: [], pair_dups: [], ...s },
+    'parent_conflicts', 'parent_conflict_count'), 'pair_dups', 'pair_dup_count')) });
 const INTEG_OK = neIntegrity(INT_META());
 /** 照合の許可の一覧の入力が全部 ok (台帳だけ差し替え) */
 const sigOk = (sp) => ({ fetch_counts: FC_OK, integrity: INTEG_OK, kind_gate: { integrity_untrusted: 0 }, rep_spellings: sp });
@@ -431,8 +436,8 @@ await ta('[P8] 照合の実行口: 封 (結果の JSON の sha256) の後に DB 
 });
 
 await ta('[P9] drift-list (読むだけ): 照合と同じ読み方の NE で 6 つの数えと一覧・引数・数えられないときは止まる', async () => {
-  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dropped_no_code: 0 }),
-    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
+  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dup_code_count: 0, dropped_no_code: 0 }),
+    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], parent_conflict_count: 0, pair_dups: [], pair_dup_count: 0, dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
   const prod = (code, rep) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1', rep, rep_src: JSON.stringify(rep ?? '') });
   const ne = { hasSrc: true, meta: { ne_api_products_complete_at: '2030-01-01 00:00:00', ne_api_setproducts_complete_at: '2030-01-01 00:00:00', ...integ },
     products: [prod('m01', 'grpA'), prod('m02', 'grpA'), prod('m03', null), prod('M03', null), prod('d10', 'grpB')], sets: [], spellings: { ok: true, rows: [] }, fetchCounts: FC_OK };
@@ -444,7 +449,7 @@ await ta('[P9] drift-list (読むだけ): 照合と同じ読み方の NE で 6 �
   assert.equal(cls.m02, undefined, 'm02 は NE grpA = 社内 grpA = 一致 (この取得では)');
   assert.equal(cls.m03, 'parent_incomparable:ne_untrusted', '正規化の衝突 = 比べられない');
   // 取込の整合で保持した商品がある取得 = 区分のゲートの integrity_untrusted > 0 = 数えない (新商品の許可と同じ厳しさ・#1676 Codex R4)
-  await assert.rejects(driftList({ ne: { ...ne, meta: { ...ne.meta, ne_api_products_integrity: JSON.stringify({ dup_codes: ['m01'], dropped_no_code: 0 }) } }, db: E.db }), /kind_gate_integrity_untrusted:1/);
+  await assert.rejects(driftList({ ne: { ...ne, meta: { ...ne.meta, ne_api_products_integrity: JSON.stringify({ dup_codes: ['m01'], dup_code_count: 1, dropped_no_code: 0 }) } }, db: E.db }), /kind_gate_integrity_untrusted:1/);
   assert.equal(cls.m05, 'parent_incomparable:not_in_ne');
   assert.equal(r.counted, 20); assert.equal((await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n, n0, '何も書かない');
   const lines = formatDriftList(r, { cls: 'parent_incomparable', limit: 2 });
@@ -508,8 +513,8 @@ await ta('[P10] 関数の作り直し: 0059 の版との差は決めた所だけ
 });
 
 await ta('[P11] (#1676 Codex R1 High) 本番の保存の形 = 代表は小文字 (代表商品コード)・元の書き方は 代表商品コード_src (JSON): GRPA と grpA は書き方の衝突 = parent_ambiguous / NE のコードの元の書き方 (raw_ne_code_spellings の代表の名前空間) の衝突も同じ', async () => {
-  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dropped_no_code: 0 }),
-    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
+  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dup_code_count: 0, dropped_no_code: 0 }),
+    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], parent_conflict_count: 0, pair_dups: [], pair_dup_count: 0, dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
   // 本番の ne-api.js の保存 = 代表商品コード は toLowerCase・代表商品コード_src = JSON.stringify(元の値)
   const stored = (code, original) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1',
     rep: original == null ? '' : String(original).toLowerCase(), rep_src: JSON.stringify(original ?? '') });
@@ -555,8 +560,8 @@ await ta('[P12] (#1676 Codex R1 Medium) 持ち主が company で記録も重い�
 });
 
 await ta('[P13] (#1676 Codex R2 High) 書き方の台帳 (raw_ne_code_spellings) を読めない回 = 代表の数えを記録しない (SQL も断る)・drift-list も止まる / 商品コードが空で落ちた行にだけ別の書き方がある形: 台帳を読めた回 = 曖昧・読めない回 = 0 件の記録を作らない = 門は閉じたまま / 照合そのものは止めない (load = ℹ️・company = ⚠️)', async () => {
-  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dropped_no_code: 0 }),
-    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
+  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dup_code_count: 0, dropped_no_code: 0 }),
+    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], parent_conflict_count: 0, pair_dups: [], pair_dup_count: 0, dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
   const stored = (code, original) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1',
     rep: String(original).toLowerCase(), rep_src: JSON.stringify(original) });
   // 保存した行は m01 → grpA と m02 → grpA だけ。商品コードが空で落ちた行の代表 GRPA は書き方の台帳 (代表の名前空間) にだけある
@@ -632,8 +637,8 @@ await ta('[P14] (#1676 Codex R3 High 1・2) 確かめられない回 = 代表の
   assert.equal(repSpellingsOf(resolveNeCodes({ ok: true, rows: [ok1('grpa', ['grpA']), { kind: 'single', code_norm: 'ｘ１', spellings: JSON.stringify(['Ｘ１']) }] })).state, 'ok');
   assert.equal(repSpellingsOf(resolveNeCodes({ ok: true, rows: [ok1('grpa', ['grpA']), { kind: 'single', code_norm: 'x1', spellings: '[broken' }] })).reason, 'damaged_spellings:1');
   const integ = (p, s) => ({ ne_api_products_integrity: JSON.stringify(p), ne_api_setproducts_integrity: JSON.stringify(s) });
-  const C2OK = integ({ dup_codes: [], dropped_no_code: 0 }, { parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] });
-  const C1DROP = integ({ dup_codes: [], dropped_no_code: 0 }, { parent_conflicts: [], pair_dups: [], dropped_missing_key: 2 });   // C1 の形 (missing_child_parents が無い) のセットの行の欠け
+  const C2OK = integ({ dup_codes: [], dup_code_count: 0, dropped_no_code: 0 }, { parent_conflicts: [], parent_conflict_count: 0, pair_dups: [], pair_dup_count: 0, dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] });
+  const C1DROP = integ({ dup_codes: [], dup_code_count: 0, dropped_no_code: 0 }, { parent_conflicts: [], parent_conflict_count: 0, pair_dups: [], pair_dup_count: 0, dropped_missing_key: 2 });   // C1 の形 (missing_child_parents が無い) のセットの行の欠け
   const stored = (code, original) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1',
     rep: String(original).toLowerCase(), rep_src: JSON.stringify(original) });
   const neOf = (meta, spellings) => ({ hasSrc: true, meta: { ne_api_products_complete_at: '2030-01-01 00:00:00', ne_api_setproducts_complete_at: '2030-01-01 00:00:00', ...meta },
@@ -641,7 +646,7 @@ await ta('[P14] (#1676 Codex R3 High 1・2) 確かめられない回 = 代表の
   // drift-list: どちらも数えない (止まる)
   for (const [label, sp] of Object.entries(forms)) await assert.rejects(driftList({ ne: neOf(C2OK, sp), db: E.db }), new RegExp(`NE のコードの元の書き方 \\(代表\\) を読めない \\(${formWhy[label]}\\)`), label);
   await assert.rejects(driftList({ ne: neOf(C1DROP, { ok: true, rows: [] }), db: E.db }), /NE の取得を確かめられない \(c1_set_rows_dropped\) = 数えない/);
-  await assert.rejects(driftList({ ne: neOf(integ({ dup_codes: [], dropped_no_code: 1 }, { parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }), { ok: true, rows: [] }), db: E.db }),
+  await assert.rejects(driftList({ ne: neOf(integ({ dup_codes: [], dup_code_count: 0, dropped_no_code: 1 }, { parent_conflicts: [], parent_conflict_count: 0, pair_dups: [], pair_dup_count: 0, dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }), { ok: true, rows: [] }), db: E.db }),
     /NE の取得を確かめられない \(ne_rows_dropped\) = 数えない/);
   // 照合の部品: 観測の形 (compare-ne と同じ組み立て)
   const { m } = nModelOf(neOf(C2OK, undefined));
@@ -752,8 +757,8 @@ await ta('[P15] (#1676 Codex R4 High) 親の観測の信用 = 許可の一覧 (p
   assert.equal((await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n, n0);
   // drift-list も同じ一覧で止まる (取得の件数を読めない回)
   const stored = (code, original) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1', rep: String(original).toLowerCase(), rep_src: JSON.stringify(original) });
-  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dropped_no_code: 0 }),
-    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
+  const integ = { ne_api_products_integrity: JSON.stringify({ dup_codes: [], dup_code_count: 0, dropped_no_code: 0 }),
+    ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], parent_conflict_count: 0, pair_dups: [], pair_dup_count: 0, dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) };
   const neOf = (fetchCounts) => ({ hasSrc: true, meta: { ne_api_products_complete_at: '2030-01-01 00:00:00', ne_api_setproducts_complete_at: '2030-01-01 00:00:00', ...integ },
     products: [stored('m01', 'grpA')], sets: [], spellings: { ok: true, rows: [] }, fetchCounts });
   for (const c of cases.slice(0, 4)) await assert.rejects(driftList({ ne: neOf(c[1].fetch_counts), db: E.db }), new RegExp('NE の取得を確かめられない \\(' + c[2]), c[0]);
@@ -991,6 +996,53 @@ await ta('[P17] (#1676 Codex R5 High 1・2) 4 つの信号は形が完全に正�
   assert.deepEqual([good.state, good.gate.open], ['ok', true]);
   const it = await company.mkItem('r02'); await company.step(it, 'issued');
   await company.pg.close();
+});
+
+await ta('[P18] (#1676 Codex R6 Medium) 取込の整合の件数と配列を照らす: dup_code_count / parent_conflict_count / pair_dup_count が配列の数と違う・負・無い・配列が (正規化の後に) 重なる・同じ親 × 子が 2 つ = neIntegrity が null → 記録 0 行・drift-list は止まる / 取込が書く形 (件数 = 配列の一意の数・同じ親に子の違う重なりが 2 つ) は今までどおり読める (正常な取得で毎朝閉じない)', async () => {
+  const okSp = { state: 'ok', collided: [] };
+  const stored = (code, original) => ({ code, name: code, supplier: '0001', handling: '取扱中', cost_src: '100', price_src: '200', tax_src: '0.1', rep: String(original).toLowerCase(), rep_src: JSON.stringify(original) });
+  const neOf = (meta) => ({ hasSrc: true, meta: { ne_api_products_complete_at: '2030-01-01 00:00:00', ne_api_setproducts_complete_at: '2030-01-01 00:00:00', ...meta },
+    products: [stored('m01', 'grpA'), stored('m02', 'grpA')], sets: [], spellings: { ok: true, rows: [] }, fetchCounts: FC_OK });
+  const { m } = nModelOf(neOf(INT_META()));
+  const n0 = (await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n;
+  const rec = (obs) => E.q('select ops.record_parent_gate($1, $2::jsonb, $3, $4, $5::jsonb)', [runId(), JSON.stringify(FETCH()), 'mat_x', hex('d'), JSON.stringify(obs)]);
+  // 取込 (ne-api.js) が書く形: 件数 = 配列の数・配列は Map / Set のキー = 重ならない・同じ親に子の違う重なり (pair_dups) は 2 つあってよい
+  const real = INT_META({ dup_codes: ['x01', 'x02'], dup_code_count: 2 },
+    { parent_conflicts: ['s01'], parent_conflict_count: 1, pair_dups: [{ parent: 's02', child: 'x01', qtys: ['"1"', '"2"'] }, { parent: 's02', child: 'x02', qtys: ['"1"', '"1"'] }], pair_dup_count: 2 });
+  const ri = neIntegrity(real);
+  assert.ok(ri, '取込の形は読める');
+  assert.deepEqual([...ri.intBlocked].sort(), [['s01', 'parent_conflict'], ['s02', 'pair_dup'], ['x01', 'dup_code'], ['x02', 'dup_code']]);
+  assert.equal(parentObsTrust({ ...sigOk(okSp), integrity: ri }).complete, true, '落ちの無い取込の形 = 信用の一覧は ok (毎朝閉じない)');
+  const bad = [
+    ['Codex の例: parent_conflict_count 1・parent_conflicts 空', INT_META({}, { parent_conflict_count: 1, parent_conflicts: [] })],
+    ['dup_code_count 0・dup_codes 1 つ', INT_META({ dup_codes: ['x01'], dup_code_count: 0 })],
+    ['dup_code_count 2・dup_codes 1 つ', INT_META({ dup_codes: ['x01'], dup_code_count: 2 })],
+    ['pair_dup_count 0・pair_dups 1 つ', INT_META({}, { pair_dups: [{ parent: 's01', child: 'x01' }], pair_dup_count: 0 })],
+    ['dup_code_count 負', INT_META({ dup_codes: [], dup_code_count: -1 })],
+    ['parent_conflict_count 文字', INT_META({}, { parent_conflicts: ['s01'], parent_conflict_count: '1' })],
+    ['pair_dup_count 小数', INT_META({}, { pair_dups: [{ parent: 's01', child: 'x01' }], pair_dup_count: 1.0000001 })],
+    ['dup_code_count 無い', { ...INT_META(), ne_api_products_integrity: JSON.stringify({ dup_codes: [], dropped_no_code: 0 }) }],
+    ['parent_conflict_count 無い', { ...INT_META(), ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], pair_dups: [], pair_dup_count: 0, dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) }],
+    ['pair_dup_count 無い', { ...INT_META(), ne_api_setproducts_integrity: JSON.stringify({ parent_conflicts: [], parent_conflict_count: 0, pair_dups: [], dropped_missing_key: 0, dropped_missing_parent: 0, missing_child_parents: [] }) }],
+    ['dup_codes の重なり (同じ)', INT_META({ dup_codes: ['x01', 'x01'] })],
+    ['dup_codes の重なり (正規化の後)', INT_META({ dup_codes: ['x01', 'Ｘ０１'] })],
+    ['parent_conflicts の重なり', INT_META({}, { parent_conflicts: ['s01', 'S01'] })],
+    ['missing_child_parents の重なり', INT_META({}, { dropped_missing_key: 2, dropped_missing_parent: 0, missing_child_parents: ['s01', ' s01'] })],
+    ['pair_dups の同じ親 × 子', INT_META({}, { pair_dups: [{ parent: 's01', child: 'x01' }, { parent: 'S01', child: 'X01' }] })],
+  ];
+  for (const [label, meta] of bad) {
+    assert.equal(neIntegrity(meta), null, label);
+    const t = parentObsTrust({ ...sigOk(okSp), integrity: neIntegrity(meta) });
+    assert.deepEqual([t.complete, t.reasons], [false, ['integrity_unreadable']], label);
+    const obs = parentObservations(m, { trust: t, repSpellings: okSp });
+    await assert.rejects(rec(obs), /ne_untrusted: .*integrity_unreadable/, label);
+    const r = await recordParentGate(async () => E.db, { compareRunId: runId(), parentObs: { obs, fetch: FETCH(), material_generation_id: 'mat_x' }, evidenceSha256: hex('e'), readDb: E.db });
+    assert.deepEqual([r.state, r.owner], ['ne_untrusted', 'load'], label);
+    assert.match(parentNote({ parent_gate: r }), /^ℹ️ 代表 \(親\) の数えを記録できない \(NE の取得を確かめられない/, label);
+    await assert.rejects(driftList({ ne: neOf(meta), db: E.db }), /取込の整合 \(ne_api_\*_integrity\) を読めない = 数えない/, label);
+  }
+  assert.equal((await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n, n0, 'どの形も 0 件の記録を作らない');
+  assert.ok((await driftList({ ne: neOf(INT_META()), db: E.db })).counted > 0, '正しい形 = 数える');
 });
 
 await E.pg.close();

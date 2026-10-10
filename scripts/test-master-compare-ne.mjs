@@ -42,7 +42,7 @@ const { buildPlanFromRender } = await import('../apps/company-db/load/sources.mj
 const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
 const { buildMaterialGeneration, saveMaterialSnapshot, materialDigest, projectMaterialRows, MATERIAL_COLUMNS } = await import('../apps/warehouse/material-lineage.js');
 const { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } = await import('../apps/warehouse-mirror/material-tables.js');
-const { numState, textState, comparability, KNOWN_DIFF, ABSENT, compareNe, nameIsCode, readRegistrations } = await import('../apps/company-db/master-compare/compare-ne.mjs');
+const { numState, textState, comparability, KNOWN_DIFF, ABSENT, compareNe, nameIsCode, readRegistrations, neIntegrity } = await import('../apps/company-db/master-compare/compare-ne.mjs');
 const { writeDecisions } = await import('../apps/company-db/master-compare/decisions.mjs');
 const { runCompare, RESULT_DIR } = await import('../apps/company-db/master-compare/run.mjs');
 const { pendingDir } = await import('../apps/company-db/master-compare/pending.mjs');
@@ -1874,6 +1874,45 @@ await ta('[39] 照合 ② の始め (何かを読む前) に新商品の入口�
     for (const [sig, name] of hidden) await db.exec(`alter function ${sig.replace(name, `${name}__0058_hidden`)} rename to ${name}`);
   }
   for (const [sig] of REAL) assert.equal((await db.query('select to_regprocedure($1) is not null as ok', [sig])).rows[0].ok, true, `${sig} を戻した`);
+});
+
+await ta('[40] (#1676 Codex R6) 本物の取込 (fetchProducts / fetchSetProducts) が書く取込の整合 = 件数は配列の一意の数・同じ親に子の違う重なり 2 つ・名前の食い違い・同じコードが 2 度 → neIntegrity は読める (正常な取得で照合 ② を毎朝止めない・落ちが無ければ信用も ok)', async () => {
+  fs.writeFileSync(path.join(tmp, 'ne-tokens.json'), JSON.stringify({ access_token: 'a', refresh_token: 'r' }));
+  const api = { goods: [], setgoods: [] };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (!u.startsWith('https://api.next-engine.org')) return realFetch(url, opts);
+    const q = new URLSearchParams(opts.body); const offset = Number(q.get('offset')), limit = Number(q.get('limit'));
+    const rows = (u.endsWith('/api_v1_master_goods/search') ? api.goods : api.setgoods).slice(offset, offset + limit);
+    return { ok: true, status: 200, json: async () => ({ result: 'success', data: rows }) };
+  };
+  try {
+    const { fetchProducts, fetchSetProducts } = await quietly(() => import('../apps/warehouse/ne-api.js'));
+    const NE = baseNe();
+    const goodsOf = (r) => ({ goods_id: r.code, goods_name: r.name, goods_supplier_id: r.supplier, goods_cost_price: JSON.parse(r.cost_src), goods_selling_price: JSON.parse(r.price_src),
+      goods_merchandise_name: r.handling, goods_representation_id: '', goods_tax_rate: JSON.parse(r.tax_src) });
+    const setOf = (r) => ({ set_goods_id: r.parent, set_goods_name: r.name, set_goods_selling_price: JSON.parse(r.price_src), set_goods_detail_goods_id: r.child, set_goods_detail_quantity: JSON.parse(r.qty_src) });
+    const p = (code) => goodsOf(NE.products.find((r) => r.code === code));
+    api.goods = [...NE.products.map(goodsOf), { ...p('c003'), goods_id: 'C003' }, { ...p('a001'), goods_id: 'A001' }, p('a001')];   // 同じコードが 2 度 (c003)・3 度 (a001)
+    const s1 = NE.sets.filter((r) => r.parent === 's001').map(setOf), s2 = NE.sets.filter((r) => r.parent === 's002').map(setOf);
+    api.setgoods = [...NE.sets.map(setOf),
+      { ...s1[0], set_goods_detail_quantity: '3' }, { ...s1[1] },              // s001 の 2 つの親 × 子がどちらも 2 度 (同じ親に子の違う重なり 2 つ)
+      { ...s2[0], set_goods_name: '名前違い' }];                                 // s002 の名前の食い違い + 同じ親 × 子の重なり
+    await quietly(() => fetchProducts()); await quietly(() => fetchSetProducts());
+    const m = (k) => wh().prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value;
+    const ip = JSON.parse(m('ne_api_products_integrity')), is = JSON.parse(m('ne_api_setproducts_integrity'));
+    // 取込の書き方 = 件数は配列の数 (Map / Set のキー = 重ならない)
+    assert.deepEqual([ip.dup_code_count, [...ip.dup_codes].sort()], [2, ['a001', 'c003']]);
+    assert.deepEqual([is.parent_conflict_count, is.parent_conflicts, is.pair_dup_count, is.pair_dups.map((d) => `${d.parent}/${d.child}`).sort()],
+      [1, ['s002'], 3, ['s001/a001', 's001/b002', 's002/a001']]);
+    const integ = neIntegrity({ ne_api_products_integrity: m('ne_api_products_integrity'), ne_api_setproducts_integrity: m('ne_api_setproducts_integrity') });
+    assert.ok(integ, '本物の取込の形は読める (照合 ② は blocked にならない)');
+    assert.deepEqual([integ.c2Form, integ.absenceUntrusted, integ.componentsUntrusted], [true, false, false]);
+    assert.deepEqual([...integ.intBlocked].sort(), [['a001', 'dup_code'], ['c003', 'dup_code'], ['s001', 'pair_dup'], ['s002', 'pair_dup']]);
+    const { parentObsTrust } = await import('../apps/company-db/master-compare/parent-gate.mjs');
+    assert.equal(parentObsTrust({ integrity: integ }).checks.integrity, 'ok', '落ちの無い本物の取込 = 取込の整合の信号は ok');
+  } finally { globalThis.fetch = realFetch; }
 });
 
 await pg.close();

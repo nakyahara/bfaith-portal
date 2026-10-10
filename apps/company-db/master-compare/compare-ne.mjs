@@ -467,22 +467,31 @@ export function neIntegrityRows(ne, intBlocked) {
  *   C1 / C2 の形: dropped_missing_parent と missing_child_parents は両方ある (C2) か両方無い (C1) か。片方だけ = null。
  *     C2 = 親の落ち ≦ 行の落ち・子の欠けの行 (dropped_missing_key − dropped_missing_parent) があるとき、そのときだけ missing_child_parents が空でない
  *     (子の欠けの行があるのに親が分からない = 構成の行の欠けを特定できない = 取込が書く形でない)
+ * 🆕 #1676 Codex R6 Medium: 件数と配列を照らす (取込 ne-api.js の書き方 = 件数 = 配列の長さ・配列は Map / Set のキー = 重ならない):
+ *   dup_code_count = dup_codes の数・parent_conflict_count = parent_conflicts の数・pair_dup_count = pair_dups の数 (どれも負でない safe integer・無い = null)。
+ *   配列は正規化 (normSku) の後も重ならない (dup_codes・parent_conflicts・missing_child_parents)・pair_dups は同じ親 × 子 (正規化の後) が 2 つ無い。
+ *   合わない・重なる = null (例: parent_conflict_count 1 なのに parent_conflicts が空 = どの親を保持するか分からない)
  */
 const isCnt = (v) => Number.isSafeInteger(v) && v >= 0;
 const isPlainObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 const isNeCodeText = (v) => typeof v === 'string' && !!normSku(v);
 const codeList = (a) => Array.isArray(a) && a.every(isNeCodeText);
+/** 件数 = 配列の数・正規化の後も重ならない (codeList を通った配列) */
+const countedUnique = (count, a, key = normSku) => isCnt(count) && count === a.length && new Set(a.map(key)).size === a.length;
+const pairKey = (d) => `${normSku(d.parent)}\u0000${normSku(d.child)}`;
 export function neIntegrity(M) {
   let ip, is;
   try { ip = JSON.parse((M || {}).ne_api_products_integrity); is = JSON.parse((M || {}).ne_api_setproducts_integrity); } catch { return null; }
   if (!isPlainObj(ip) || !codeList(ip.dup_codes) || !isCnt(ip.dropped_no_code)) return null;
   if (!isPlainObj(is) || !codeList(is.parent_conflicts) || !isCnt(is.dropped_missing_key)) return null;
   if (!Array.isArray(is.pair_dups) || !is.pair_dups.every((d) => isPlainObj(d) && isNeCodeText(d.parent) && isNeCodeText(d.child))) return null;
+  if (!countedUnique(ip.dup_code_count, ip.dup_codes) || !countedUnique(is.parent_conflict_count, is.parent_conflicts) || !countedUnique(is.pair_dup_count, is.pair_dups, pairKey)) return null;
   const hasParent = is.dropped_missing_parent !== undefined, hasChildParents = is.missing_child_parents !== undefined;
   if (hasParent !== hasChildParents) return null;
   const c2Form = hasParent;
   if (c2Form) {
     if (!isCnt(is.dropped_missing_parent) || !codeList(is.missing_child_parents) || is.dropped_missing_parent > is.dropped_missing_key) return null;
+    if (new Set(is.missing_child_parents.map(normSku)).size !== is.missing_child_parents.length) return null;   // 重なり = 取込が書く形でない (Set のキー)
     if ((is.dropped_missing_key - is.dropped_missing_parent > 0) !== (is.missing_child_parents.length > 0)) return null;
   }
   const intBlocked = new Map();   // norm → 理由
