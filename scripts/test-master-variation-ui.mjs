@@ -162,6 +162,13 @@ async function pickGroup(p, q0, code) {
   await p.waitForSelector('#g-picked .picked');
 }
 
+/** 読むだけのまとまりの API 3 つの [状態, reason] (探す・1 つを読む・確かめる) */
+const readApis = (p) => p.evaluate(async ([base, gid]) => {
+  const one = async (r) => { const j = await r.json().catch(() => ({})); return [r.status, j.reason ?? null]; };
+  return [await one(await fetch(base + '/api/variation/groups?q=b')), await one(await fetch(base + '/api/variation/groups/' + gid)),
+    await one(await fetch(base + '/api/variation/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ group_code: 'x', codes: [], jans: [] }) }))];
+}, [B, BL.group_product_id]);
+
 console.log('見本の 8 つの場面 (1440 幅)');
 await ta('[①] 新しいまとまり (色 4 × サイズ 4): コードのでき方・エンジ × 90 を作らない (マス目)・JAN で名前が変わる・この商品だけの売価・手で直した名前・JAN をまとめて貼る・作らないを見る・確かめの窓 → 15 件が下書き', async (p) => {
   await p.goto(B + '/new?kind=variation');
@@ -380,7 +387,16 @@ await ta('[⑧] 空から: あと N つ・7 の確かめは「まだ入れてい
     // API も断る (DB が持ち主を見る)
     const r = await p.evaluate(async (base) => (await fetch(base + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), group: { mode: 'new', code: 'gx', name: 'x' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-A', name: 'A' }], children: [{ code: 'gx-A', choices: { 1: '-A' }, name: 'x' }], values: { standard_price: '1', tax_rate: '0.1', sales_class: '1', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0' } }) })).json(), B);
     assert.equal(r.reason, 'parent_not_company');
+    // 🆕 #1679 Codex R1 Low: 読むだけのまとまりの API (探す・1 つを読む・確かめる) も同じ持ち主の門で閉じる
+    assert.deepEqual(await readApis(p), [[409, 'parent_not_company'], [409, 'parent_not_company'], [409, 'parent_not_company']]);
   } finally { await T.W2.setActiveOwnershipInDb(pg, T.ALL_COMPANY); }
+  assert.deepEqual((await readApis(p)).map((x) => x[0]), [200, 200, 200]);
+  // 持ち主を読めない (関数の実行権が無い) = 503 / このコードが扱えない持ち主 (code_behind) = 409
+  await T.W2.revokeActiveMap(pg);
+  try { assert.deepEqual(await readApis(p), [[503, 'owner_unreadable'], [503, 'owner_unreadable'], [503, 'owner_unreadable']]); } finally { await T.W2.grantActiveMap(pg); }
+  OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.filter((k) => k !== 'products.parent'));
+  try { assert.deepEqual(await readApis(p), [[409, 'parent_not_company'], [409, 'parent_not_company'], [409, 'parent_not_company']]); }
+  finally { OG.__setCapableForTest((await import('../config/master-ownership.mjs')).OWNED_COLUMNS); }
 });
 
 await ta('[+] 商品の画面の代表 (親) = 見るだけ (保存の欄が無い・登録の時に 1 回だけと案内)・API で parent_code を送ると 400', async (p) => {
