@@ -229,7 +229,7 @@ try {
   let AT;   // 本番の試み
 
   await ta('[M0] 移行の apply: new_open で試みが無い = 断る (AMAZON_MAP_MIGRATE_PHASE・CLI も --attempt なしは断る)・広げてよいキーは 2 つ・ほかのキーは断る', async () => {
-    assert.deepEqual((await A.q('select ops.master_widen_allowed_keys() as k'))[0].k, [KEY_A, KEY_K]);
+    assert.deepEqual((await A.q('select ops.master_widen_allowed_keys() as k'))[0].k, [KEY_A, 'products.parent', KEY_K]);   // 🆕 0068: 代表 (親) も広げてよい (判定は 0068 の試験)
     await assert.rejects(migrate(A, legacyA), phaseErr(/--attempt/));                          // 試みを指さない
     const c0 = cliApply(A, legacyA);                                                             // CLI も (new_open は --attempt が必須 = 断る・何も書かない)
     assert.equal(c0.code, 1, c0.out); assert.match(c0.out, /--attempt/);

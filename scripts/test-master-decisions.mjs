@@ -224,9 +224,9 @@ await ta('[9] 権限: 呼び手 (watch_writer) の一時の型 (domain) の CHEC
     assert.equal((await p3.query(`select value from ops.master_ne_baseline where code_norm = 'x1' and col = 'name'`)).rows[0].value, 'X');
     assert.deepEqual((await p3.query(`select ne_code from ops.master_ne_codes`)).rows, [{ ne_code: 'X1' }]);
     const rows = (await p3.query(`select p.proname, p.proconfig from pg_proc p where p.prosecdef and has_function_privilege('watch_writer', p.oid, 'execute')`)).rows;
-    assert.deepEqual(rows.map((r) => r.proname).sort(), ['close_new_entry_for_compare', 'record_decision_candidates', 'record_decision_done', 'record_ne_baseline', 'record_ne_codes', 'record_ne_registration_check', 'record_ne_registration_observations', 'record_new_entry_gate', 'seal_ne_registration_run', 'snapshot_ne_reg_targets']);   // 0058: 照合 ② の始めに閉じる・新商品のゲートの結果 (広げる道 PR-1)
+    assert.deepEqual(rows.map((r) => r.proname).sort(), ['close_new_entry_for_compare', 'record_decision_candidates', 'record_decision_done', 'record_ne_baseline', 'record_ne_codes', 'record_ne_registration_check', 'record_ne_registration_observations', 'record_new_entry_gate', 'record_parent_gate', 'seal_ne_registration_run', 'snapshot_ne_reg_targets']);   // 🆕 0068: 照合 ② の代表 (親) の数えの記録 / 0058: 照合 ② の始めに閉じる・新商品のゲートの結果 (広げる道 PR-1)
     // 0053 (⑤-2b) の確かめの関数は ops も外す (名前は全部 schema つき = ⑤-2a の約束)。ほかは 0034〜0041 の決まり (最後に pg_temp)
-    const want = Object.fromEntries(['close_new_entry_for_compare', 'record_new_entry_gate', 'record_ne_registration_check', 'record_ne_registration_observations', 'seal_ne_registration_run', 'snapshot_ne_reg_targets'].map((n) => [n, ['search_path=pg_catalog, pg_temp']]));
+    const want = Object.fromEntries(['close_new_entry_for_compare', 'record_new_entry_gate', 'record_parent_gate', 'record_ne_registration_check', 'record_ne_registration_observations', 'seal_ne_registration_run', 'snapshot_ne_reg_targets'].map((n) => [n, ['search_path=pg_catalog, pg_temp']]));
     for (const r of rows) assert.deepEqual(r.proconfig, want[r.proname] ?? ['search_path=pg_catalog, ops, pg_temp'], `${r.proname} の search_path が決まりと違う (先頭に別の schema を足しても見つける)`);
   } finally { await p3.close(); }
 });
