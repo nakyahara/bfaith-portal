@@ -53,8 +53,10 @@ await ta('[2] 本番の active (10/5 の 13 キー・10/7 の 14 キー) は全�
   assert.deepEqual(configuredBeyondCapable(), []);
   assert.equal(validateConfiguredCapable(), MASTER_OWNERSHIP);
   for (const k of companyOwned(MASTER_OWNERSHIP)) assert.ok(COMPANY_CAPABLE.includes(k), `configured が company なのに capable でない: ${k}`);
-  // 予定が能力を追い越す = 落とす (products.parent はまだ扱う PR が無い)
-  throwsCode(() => validateConfiguredCapable({ ...MASTER_OWNERSHIP, 'products.parent': 'company' }), /products\.parent/);
+  // 予定が能力を追い越す = 落とす (sku_components はまだ扱う PR が無い)。products.parent は CompanyDB構想/20 の PR-7 から扱える (configured は PR-8 まで load)
+  throwsCode(() => validateConfiguredCapable({ ...MASTER_OWNERSHIP, sku_components: 'company' }), /sku_components/);
+  assert.equal(MASTER_OWNERSHIP['products.parent'], 'load');
+  assert.deepEqual(configuredBeyondCapable({ ...MASTER_OWNERSHIP, 'products.parent': 'company' }), []);
   // skus.sku_kind は #1641 で扱える = 予定に入れても能力の中。10/7 から configured も 'company' (広げる道の手順の 1)・10/7 13:48 の widen で active も company
   assert.equal(MASTER_OWNERSHIP['skus.sku_kind'], 'company');
   assert.deepEqual(configuredBeyondCapable({ ...MASTER_OWNERSHIP, 'skus.sku_kind': 'company' }), []);
@@ -108,11 +110,32 @@ await ta('[2c] ⑦-2 PR-A: listing_components.amazon を capable に足す = 写
   assert.deepEqual(configuredBeyondCapable({ ...MASTER_OWNERSHIP, 'listing_components.amazon': 'company' }), []);
 });
 
+await ta('[2d] CompanyDB構想/20 PR-7: products.parent を capable に足す = まとまりの登録の画面・saveSku から代表の欄を外す と同じ PR。configured は load のまま (PR-8)・今の本番の動きは変わらない・products.parent を company にした持ち主表でも ④a の写しは止まらない (写さない列)', async () => {
+  const MP = await import('../warehouse/master-publish.js');
+  assert.ok(COMPANY_CAPABLE.includes('products.parent'));
+  assert.equal(MASTER_OWNERSHIP['products.parent'], 'load');
+  const active = { ...ALL_LOAD, ...Object.fromEntries(PROD_ACTIVE_COMPANY_20261007.map((k) => [k, 'company'])) };
+  assert.equal(active['products.parent'], 'load');
+  assert.deepEqual(codeBehindKeys(active), []);
+  assert.deepEqual(MP.checkPublishOwnership(active), []);
+  const widened = { ...active, 'products.parent': 'company' };
+  assert.deepEqual(codeBehindKeys(widened), []);
+  assert.deepEqual(MP.checkPublishOwnership(widened), []);
+  assert.ok(Object.hasOwn(MP.NO_OLD_TABLE_COPY, 'products.parent'));
+  assert.match(MP.NO_OLD_TABLE_COPY['products.parent'], /照合 ②/);
+  assert.deepEqual(MP.publishCols(widened), MP.publishCols(active));
+  // 新商品の画面の保存 (saveSku) の欄に代表は無い (代表は登録の時に 1 回だけ・まとまりの関数だけ)
+  const W = await import('../../lib/master-write.mjs');
+  assert.ok(!Object.hasOwn(W.SINGLE_FIELDS, 'parent_code'));
+  assert.ok(!Object.values(W.SINGLE_FIELDS).some((d) => d.keys.includes('products.parent')));
+});
+
 await ta('[3] code_behind: capable の外の company のキー (知らないキーも)・load は見ない', async () => {
   assert.deepEqual(codeBehindKeys(ALL_LOAD), []);
-  assert.deepEqual(codeBehindKeys({ ...ALL_LOAD, 'products.parent': 'company', 'skus.name': 'company' }), ['products.parent']);
+  assert.deepEqual(codeBehindKeys({ ...ALL_LOAD, sku_components: 'company', 'skus.name': 'company' }), ['sku_components']);
+  assert.deepEqual(codeBehindKeys({ ...ALL_LOAD, 'products.parent': 'company', 'skus.name': 'company' }), []);   // PR-7 から扱える
   assert.deepEqual(codeBehindKeys({ ...ALL_LOAD, 'future.key': 'company', 'other.future': 'load' }), ['future.key']);
-  assert.deepEqual(codeBehindKeys({ 'products.parent': 'company' }, [...COMPANY_CAPABLE, 'products.parent'].sort()), []);
+  assert.deepEqual(codeBehindKeys({ 'products.parent': 'company' }, COMPANY_CAPABLE.filter((k) => k !== 'products.parent')), ['products.parent']);   // PR-7 の前の能力 = code_behind
   assert.deepEqual(codeBehindKeys({ 'skus.sku_kind': 'company' }), []);   // #1641 から扱える
   assert.deepEqual(codeBehindKeys(null), []);
 });
@@ -120,7 +143,7 @@ await ta('[3] code_behind: capable の外の company のキー (知らないキ�
 await ta('[4] 能力のハッシュ: 順によらない・一覧が変わると変わる・指紋', async () => {
   assert.match(capableHash(), /^[0-9a-f]{64}$/);
   assert.equal(capableHash([...COMPANY_CAPABLE].reverse()), capableHash());
-  assert.notEqual(capableHash([...COMPANY_CAPABLE, 'products.parent']), capableHash());
+  assert.notEqual(capableHash([...COMPANY_CAPABLE, 'sku_components']), capableHash());
   const fp = capabilityFingerprint();
   assert.deepEqual(fp, { protocol: MASTER_OWNER_PROTOCOL, capable_hash: capableHash(), capable: [...COMPANY_CAPABLE] });
 });

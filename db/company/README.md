@@ -2454,3 +2454,9 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   widen の前に `select ops.reserve_existing_variation_groups('<人>');` (DB の持ち主だけ・何回でも同じ) を流し直せる
 - 当て方 (🚨 まだ流さない): 0066 の後・上の事前検査の数 → `migrate.mjs --dry-run` (0067 だけが出る) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs`・
   master_edit に 9 つの関数とまとまりの表の読み取り。流さなくても今の動きは変わらない) → `select ops.variation_reservation_check();` と予約の数を見る。Render と migration の順はどちらでもよい (lib の `regMaterialOf` は予約の表が無ければ読まない・まとまりの関数は company の後でないと動かない)
+
+### まとめての登録の要求のハッシュ (0069・2026-10-10。AI_reference CompanyDB構想/20 v7 §⑩ の PR-7・#1679 Codex R1 Medium 1。🚨 0067 は本番に適用済み = 本文は変えない)
+- **なぜ**: 0067 の `ops.variation_batches.spec_hash` は まとまり・軸・選択肢・子のコードと選択肢 だけ。画面は子の名前・売価・原価・JAN・出品カードの欄・理由も送る = 同じ request_id でそれらだけを変えた押し直しに前の答えが返っていた。
+- **表** `ops.variation_batch_requests` (request_id = まとめての登録・人・要求の全部のハッシュ (lib/master-variation.mjs の `variationPayloadHashOf`)・追記だけ)。**関数** `ops.variation_batch_record_request(request_id, actor, hash)` = この取引で開いた (閉じる前の) まとめての登録・開いた人だけ・1 回だけ書く (security definer・画面のロールに実行だけ・表は読むだけ)。
+- **lib の押し直し**: request の鍵の直後に、保存の記録 done があれば この表のハッシュと照らす = 同じ = 残した答えをすぐ返す (門・許可・持ち主・仕入先・product-hub の下書きは見ない) / 違う = 409 `request_id_reused`。0069 が無い DB の新しい要求 = 503 `db_not_ready`。
+- 当て方 (🚨 まだ流さない): 0068 の後・`migrate.mjs --dry-run` (0069 だけが出る) → 中原さんの OK → 本適用 → ロールの script (`create-master-edit-roles.mjs`) を流し直す。今は何も変わらない (まとめての登録は products.parent が company のときだけ = 今は 0067 の関数が断る)。
