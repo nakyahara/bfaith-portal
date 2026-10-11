@@ -468,7 +468,7 @@ export const JOBS_REGISTRY = [
       + '「Amazon Ads (SKU)」の直後に「Company DB 広告費 (Amazon)」(fact_ad_spend の Amazon SP を Render Postgres の core.ad_spend_daily へ。apps/company-db/push/ad-spend.mjs --mall amazon --days 35。'
       + 'Company DB構想 11 の ② / 0035。取込の取得の記録 (ads_fetch_days) がある日だけ・Render に日ごとの世代と指紋を聞いて違う日だけ・1 日 = 1 要求 = 1 取引・古い世代は受け口が拒む・送った後に出品の結び直し。'
       + '取込が失敗した朝は見送って retry に載せ、取込の再試行が成功した回に送る (UPSTREAM_OF)。止まると mart.v_ad_spend_daily が古びる。手で流す・初回 = README「広告費の日次」。新しい定期実行は無い)。'
-      + '全部の push の後・見張りの前に「マスタ照合」(apps/company-db/master-compare/run.mjs --daily。①ロードの検証 + ②NE との照合 (C2・反映待ちの台帳 = DATA_DIR/cdb-master-compare/pending/)。設計 = AI_reference CompanyDB構想/10 §6.1.1 B・C2。'
+      + '全部の push の後・「Render同期」の直後 (2026-10-11 から。DBバックアップ = daily-sync の一番最後の段を待たない)・見張りの前に「マスタ照合」(apps/company-db/master-compare/run.mjs --daily。①ロードの検証 + ②NE との照合 (C2・反映待ちの台帳 = DATA_DIR/cdb-master-compare/pending/)。設計 = AI_reference CompanyDB構想/10 §6.1.1 B・C2。'
       + '②b = 持ち主が C で NE に欄が無い列 (税区分・売上分類・送料・推奨保有月数) の Company DB ↔ 古い表 (m_products・product_shipping・m_reorder_setting)。反映待ちの台帳 = DATA_DIR/cdb-master-compare/old-tables/pending/・'
       + '世代にあった値が無い / 翌朝の作り直しでも違う = ⚠️ (要約の先頭)。今は持ち主が全部 load = 比べない (④a・Codex #1564 R1 H3)。'
       + '最新の夜間ロード (Render・02:00) が実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直し、Company DB (watcher で読むだけ) と比べる = ロードの検証。'
