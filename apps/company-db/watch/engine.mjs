@@ -219,6 +219,9 @@ export function summarize({ asOf, planned, results, notes, deadlineHit, separate
   if (counts.execution_error) parts.push(`評価できず ${counts.execution_error}`);
   if (counts.out_of_window) parts.push(`監視期間外 ${counts.out_of_window}`);
   if (counts.rule_changed) parts.push(`規則の変更で閉じた ${counts.rule_changed} (回復ではない)`);
+  // 案件を回復にも継続にもせずに残した数 (前提が blocked・世代が変わり続けた・評価が保留と名指しした = W6 の除いたモールでだけ売れていたかもしれない など)。
+  //   blocked の件数 (判定保留) だけでは、pass の評価の中で保留された案件が見えない (Codex #1687 R2 Medium 1)
+  if (counts.held) parts.push(`回復保留 ${counts.held}`);
   const details = [];
   for (const x of mainNew.slice(0, 3)) details.push(`${x.summary} (新)`);
   for (const x of mainCont.slice(0, 2)) details.push(`${x.summary} (継続 ${x.days} 日)`);

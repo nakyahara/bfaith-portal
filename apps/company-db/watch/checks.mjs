@@ -414,8 +414,12 @@ export async function evalW6(ctx, check) {
       if (Number(x.stock) !== 0) continue;   // 在庫が入った = 回復 (engine)
       if (x.handling === 'discontinued') r.outOfScope[x.sku_id] = 'discontinued';
       else if (!x.sold_now) {
-        // 除いたモールがある朝は「窓から外れた」と決めない (除いたモールでだけ売れていたのかもしれない) = 判定保留
-        if (excluded.size) r.held[x.sku_id] = `mall_excluded:${[...excluded.keys()].join(',')}`;
+        // 除いたモールがある朝は「窓から外れた」と決めない (除いたモールでだけ売れていたのかもしれない) = 判定保留。
+        //   保留するのは今の版・版の分からない案件だけ。前の版の案件は保留にせず engine の「規則の変更で閉じた」へ流す
+        //   (保留が先に効くと、除いたモールの不調が続く間は前の版の案件が無期限に残る。Codex #1687 R2 Medium 1)
+        const iss = mineIssues.find((i) => i.subject_key === x.sku_id);
+        const priorVersion = !!(iss && iss.last_check_version != null && iss.last_check_version !== check.version);
+        if (excluded.size) { if (!priorVersion) r.held[x.sku_id] = `mall_excluded:${[...excluded.keys()].join(',')}`; }
         else r.outOfScope[x.sku_id] = 'no_sales_in_window';
       }
       // 残り = 売れていて在庫 0 なのに明細に無い = 窓の中に在庫の記録が無い・前の版で開いた案件だけ (今の版の案件は上の keepOpen で明細に残る)。
