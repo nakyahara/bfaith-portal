@@ -406,21 +406,29 @@ export async function evalW8(ctx, check) {
     const so = st('orders'), ss = st('sales'), sc = st('cancel_rate'), su = st('unknown_rate');
     const small = so.med < config.W8_SMALL_MALL_ORDERS_PER_DAY;
     r.observed.stats = { small, sales_published: !noSales, orders: { median: so.med, mad: so.mad }, sales: noSales ? null : { median: ss.med, mad: ss.mad }, cancel_rate: { median: r4(sc.med), mad: r4(sc.mad) }, unknown_rate: noSales ? null : { median: r4(su.med), mad: r4(su.mad) } };
-    const bad = [];
+    const bad = [], upward = [];
     if (y.orders === 0 && so.med > 0) bad.push(`昨日の注文 0 件 (平常の中央値 ${so.med})`);
     if (!small) {
       const dOrders = y.orders - so.med, dSales = y.sales - ss.med;
-      if (y.orders > 0 && Math.abs(dOrders) > config.W8_MAD_K * so.mad && Math.abs(dOrders) >= config.W8_MIN_ABS_ORDERS) bad.push(`件数 ${y.orders} (平常 ${so.med} ± ${r4(config.W8_MAD_K * so.mad)})`);
-      if (!noSales && Math.abs(dSales) > config.W8_MAD_K * ss.mad && Math.abs(dSales) >= config.W8_MIN_ABS_SALES_JPY) bad.push(`売上 ${y.sales.toLocaleString()} 円 (平常 ${ss.med.toLocaleString()} ± ${Math.round(config.W8_MAD_K * ss.mad).toLocaleString()})`);
+      // 件数・売上は下に外れたときだけ異常 (項目の版 v3・10/7 の見直し = 9/23〜10/7 の異常 10 回のうち 8 回はセールなどの本当の上振れ・データの欠けは 1 回)。
+      //   上に外れた日は pass のまま observed.upward に「上振れ」として残す (通知はしない)。0 件・取消率・金額不明率は今まで通り
+      const outOrders = Math.abs(dOrders) > config.W8_MAD_K * so.mad && Math.abs(dOrders) >= config.W8_MIN_ABS_ORDERS;
+      const outSales = !noSales && Math.abs(dSales) > config.W8_MAD_K * ss.mad && Math.abs(dSales) >= config.W8_MIN_ABS_SALES_JPY;
+      if (outOrders && dOrders < 0 && y.orders > 0) bad.push(`件数 ${y.orders} (平常 ${so.med} ± ${r4(config.W8_MAD_K * so.mad)})`);
+      else if (outOrders && dOrders > 0) upward.push(`件数 ${y.orders} (平常 ${so.med} ± ${r4(config.W8_MAD_K * so.mad)})`);
+      if (outSales && dSales < 0) bad.push(`売上 ${y.sales.toLocaleString()} 円 (平常 ${ss.med.toLocaleString()} ± ${Math.round(config.W8_MAD_K * ss.mad).toLocaleString()})`);
+      else if (outSales && dSales > 0) upward.push(`売上 ${y.sales.toLocaleString()} 円 (平常 ${ss.med.toLocaleString()} ± ${Math.round(config.W8_MAD_K * ss.mad).toLocaleString()})`);
       if (y.cancel_rate > sc.med + Math.max(config.W8_MAD_K * sc.mad, config.W8_MIN_RATE_DELTA)) bad.push(`取消率 ${r4(y.cancel_rate * 100)}% (平常 ${r4(sc.med * 100)}%)`);
       if (!noSales && y.unknown_rate > su.med + Math.max(config.W8_MAD_K * su.mad, config.W8_MIN_RATE_DELTA)) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (平常 ${r4(su.med * 100)}%)`);
     } else {
       if (y.cancel_rate > config.W8_SMALL_MAX_CANCEL_RATE) bad.push(`取消率 ${r4(y.cancel_rate * 100)}% (上限 ${config.W8_SMALL_MAX_CANCEL_RATE * 100}%)`);
       if (!noSales && y.unknown_rate > config.W8_SMALL_MAX_UNKNOWN_RATE) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (上限 ${config.W8_SMALL_MAX_UNKNOWN_RATE * 100}%)`);
     }
+    r.observed.upward = upward;
     r.verdict = bad.length ? 'breach' : 'pass';
     if (bad.length) r.reason = `${day}: ${bad.join(' / ')}${small ? ' (小規模 = 統計の判定なし)' : ''}`;
     else if (small) r.reason = `小規模モール (平常 ${so.med} 件/日) = 統計の判定なし`;
+    if (upward.length) r.reason = `${r.reason ? `${r.reason} / ` : `${day}: `}上振れ (異常にしない): ${upward.join(' / ')}`;
     if (noSales) r.reason = `${r.reason ? `${r.reason} / ` : ''}売上日次を公開していない = 件数と取消率だけ`;
     out.push(r);
   }

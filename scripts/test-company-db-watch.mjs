@@ -177,7 +177,7 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W9:*'], true]);   // W6 の W7 は W9 を通して見る (2026-09-26)
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v18');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v19');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
@@ -687,6 +687,76 @@ await t('🚨 W8 の祝日・年末年始: 昨日が祝日なら判定しない 
   assert.equal(verdictOf(r, 'W8', 'rakuten/main'), 'pass');
   r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS_UNTIL: D(-2) } });
   assert.deepEqual([verdictOf(r, 'W8', 'rakuten/main'), /祝日の一覧 .* までしか無い/.test(resultOf(r, 'W8', 'rakuten/main').reason)], ['blocked', true]);
+});
+
+await t('🚨 W8 は下に外れたときだけ異常 (項目の版 v3・10/7 の見直し = 9/23〜10/7 の異常 10 回のうち 8 回がセールなどの上振れ): 件数・売上の上振れは pass (observed.upward と理由に「上振れ」) / 下振れは breach / 境の値 (差 20 件・5 万円) / 上振れでも 取消率・金額不明率・0 件 は今まで通り異常 / 小規模モールは上振れも見ない', async () => {
+  const w8 = (r, m) => resultOf(r, 'W8', m);
+  const idxOf = "substring(mall_order_no from '[0-9]+$')::int";
+  const setSales = (jpy) => pg.query(`update mart.sales_daily set items_amount_jpy = $2, sales_jpy = $2, customer_paid_jpy = $2 where mall = 'aupay' and date_jst = $1::date`, [D(-1), jpy]);
+  const keepTo = (n) => pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > $2`, [D(-1), n]);
+  // 平常 (aupay = 中央値 40 件・MAD 1 / 40 万円・MAD 1 万円): 上振れなし
+  assert.equal(CONFIG.checkById('W8').version, 'v3');
+  let r = await run({ dryRun: true }); let w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward, w.reason, w.observed.stats.orders.median, w.observed.stats.orders.mad, w.observed.stats.sales.median, w.observed.stats.sales.mad], ['pass', [], null, 40, 1, 400000, 10000]);
+  // 件数の上振れ: 59 件 (差 19 < 20) = 上振れにも数えない / 60 件 (差 20) = 前の版なら breach → 今は pass・上振れとして残す
+  await ordersBulk('aupay', 'main', D(-1), 19, 0, 41);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.yesterday.orders, w.observed.upward, w.reason], ['pass', 59, [], null]);
+  await ordersBulk('aupay', 'main', D(-1), 1, 0, 60);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.severity, w.observed.yesterday.orders, w.observed.upward, w.reason], ['pass', 'info', 60, ['件数 60 (平常 40 ± 3)'], `${D(-1)}: 上振れ (異常にしない): 件数 60 (平常 40 ± 3)`]);
+  // 売上も上振れ (200 万円 = 平常の 5 倍): pass のまま 2 つとも残す。warn の時期 (11/4 から) でも pass
+  await setSales(2000000);
+  r = await run({ dryRun: true, config: { ...CONFIG, W8_INFO_UNTIL: '2026-09-01' } }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.severity, w.observed.upward], ['pass', 'warn', ['件数 60 (平常 40 ± 3)', '売上 2,000,000 円 (平常 400,000 ± 30,000)']]);
+  // 上振れでも取消率が高ければ異常 (理由の先頭は取消率・上振れは後ろに添える)
+  await pg.query(`update core.orders set is_cancelled = true, status = 'cancelled' where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} <= 30`, [D(-1)]);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.reason.startsWith(`${D(-1)}: 取消率 50% (平常 5%) / 上振れ (異常にしない): 件数 60`), w.observed.upward.length], ['breach', true, 2]);
+  await pg.query(`update core.orders set is_cancelled = false, status = 'new' where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 2`, [D(-1)]);
+  // 上振れでも金額不明の明細の割合が高ければ異常 (30/40 = 75%)
+  await pg.query(`update mart.sales_daily set lines_amount_unknown = 30 where mall = 'aupay' and date_jst = $1::date`, [D(-1)]);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /^\S+: 金額不明の明細 75% \(平常 10%\) \/ 上振れ \(異常にしない\)/.test(w.reason)], ['breach', true]);
+  await pg.query(`update mart.sales_daily set lines_amount_unknown = 4 where mall = 'aupay' and date_jst = $1::date`, [D(-1)]);
+  // 件数の下振れの境: 21 件 (差 19) = pass / 20 件 (差 20) = breach (売上は平常に戻す)
+  await setSales(400000);
+  await keepTo(21);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.yesterday.orders, w.observed.upward], ['pass', 21, []]);
+  await keepTo(20);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /件数 20 \(平常 40 ± 3\)/.test(w.reason), /上振れ/.test(w.reason)], ['breach', true, false]);
+  // 件数は下・売上は上 (20 件で 100 万円) = 件数で breach・売上の上振れは添えるだけ
+  await setSales(1000000);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /^\S+: 件数 20 \(平常 40 ± 3\) \/ 上振れ \(異常にしない\): 売上 1,000,000 円/.test(w.reason), /: 売上 1,000,000 円 \(平常 400,000 ± 30,000\)$/.test(w.reason)], ['breach', true, true]);
+  // 0 件は今まで通り異常
+  await keepTo(0);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /注文 0 件 \(平常の中央値 40\)/.test(w.reason)], ['breach', true]);
+  await ordersBulk('aupay', 'main', D(-1), 40, 2);
+  // 売上の下振れの境 (件数は平常の 40 件): 350,001 円 (差 49,999) = pass / 350,000 円 (差 50,000) = breach / 上の境 450,000 円 (差 50,000) = pass・上振れ
+  await setSales(350001);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', []]);
+  await setSales(350000);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /売上 350,000 円 \(平常 400,000 ± 30,000\)/.test(w.reason)], ['breach', true]);
+  await setSales(449999);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', []]);
+  await setSales(450000);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', ['売上 450,000 円 (平常 400,000 ± 30,000)']]);
+  await setSales(400000);
+  // 小規模モール (qoo10 = 10 件/日): 50 件に増えても統計の判定は無い = 上振れにも数えない
+  await ordersBulk('qoo10', 'main', D(-1), 40, 0, 11);
+  r = await run({ dryRun: true }); w = w8(r, 'qoo10/main');
+  assert.deepEqual([w.verdict, w.observed.yesterday.orders, w.observed.upward, /小規模/.test(w.reason)], ['pass', 50, [], true]);
+  await pg.query(`delete from core.orders where mall = 'qoo10' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 10`, [D(-1)]);
+  r = await run({ dryRun: true });
+  assert.deepEqual(CONFIG.ORDER_MALLS.map((m) => [verdictOf(r, 'W8', `${m.mall}/${m.scope}`), resultOf(r, 'W8', `${m.mall}/${m.scope}`).observed.upward]), CONFIG.ORDER_MALLS.map(() => ['pass', []]));
 });
 
 console.log('W7 / W9: 証跡と Render の run');
@@ -1227,6 +1297,43 @@ await t('🚨 規則の変更 (項目の版が上がった・Codex #1678 R1・09
   assert.deepEqual([reconcileIssues({ config: CONFIG, results: res('blocked'), openIssues: open('v1'), asOf: ASOF, now: NOW }).updates.length,
     reconcileIssues({ config: CONFIG, results: res('breach'), openIssues: open('v1'), asOf: ASOF, now: NOW }).notes.continued.length], [0, 1]);
 });
+await t('🚨 W8 の版を v2 → v3 に上げた (下に外れたときだけ異常): 前の版 (v2) で開いていた W8 の案件が、v3 の最初の朝に上振れの pass で消えても「回復」ではなく「規則の変更で閉じた」。v3 どうしの下振れ → 平常は通常の回復', async () => {
+  assert.deepEqual([REAL_CONFIG.checkById('W8').version, REAL_CONFIG.W8_INFO_UNTIL], ['v3', '2026-11-04']);
+  const w8c = CONFIG.checkById('W8');
+  const only = (ver) => ({ ...CONFIG, CHECKS: [CONFIG.checkById('W7'), CONFIG.checkById('W9'), { ...w8c, version: ver }] });   // W8 と前提だけ評価する (ほかの項目の案件に触らない)
+  const w8 = (r) => resultOf(r, 'W8', 'aupay/main');
+  const issue = () => one(`select i.watch_issue_id, i.state, i.transitions, i.recovered_at is not null as rec, i.summary, r.check_version from ops.watch_issues i left join ops.watch_results r on r.watch_result_id = i.last_result_id where i.check_id = 'W8' and i.scope_key = 'aupay/main' order by i.watch_issue_id desc limit 1`);
+  const idxOf = "substring(mall_order_no from '[0-9]+$')::int";
+  await pg.query(`delete from ops.watch_issues where check_id = 'W8'`);
+  let r = await run({ dryRun: true, config: only('v3') });
+  assert.deepEqual(CONFIG.ORDER_MALLS.map((m) => verdictOf(r, 'W8', `${m.mall}/${m.scope}`)), ['pass', 'pass', 'pass', 'pass', 'pass']);
+  // 前の版 (v2) の結果で案件が開く (本番の 10/1 の amazon の上振れのような案件の代わり。前の版の判定は残っていないので、v2 の印をつけた下振れで開く)
+  await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 15`, [D(-1)]);
+  r = await run({ config: only('v2'), now: new Date('2026-09-23T07:00:00Z') });
+  assert.deepEqual([w8(r).verdict, w8(r).checkVersion, r.counts.new], ['breach', 'v2', 1]);
+  let i = await issue();
+  assert.deepEqual([i.state, i.check_version], ['open', 'v2']);
+  // v3 の最初の朝: 昨日は上振れ (60 件) = pass → 回復ではなく「規則の変更で閉じた」
+  await ordersBulk('aupay', 'main', D(-1), 45, 0, 16);
+  r = await run({ config: only('v3'), now: new Date('2026-09-23T08:00:00Z') });
+  assert.deepEqual([w8(r).verdict, w8(r).observed.upward, r.counts.recovered, r.counts.rule_changed, r.notes.ruleChanged[0].reason], ['pass', ['件数 60 (平常 40 ± 3)'], 0, 1, 'rule_changed:v2->v3']);
+  assert.match(r.lastLine, /回復 0 .*規則の変更で閉じた 1 \(回復ではない\)/);
+  i = await issue();
+  assert.deepEqual([i.state, i.transitions, i.rec, /W8 aupay\/main: 規則の変更で閉じた \(v2 → v3。回復ではない\)/.test(i.summary)], ['out_of_window', 2, false, true]);
+  // v3 どうし: 下振れで開いて上振れの日に消えた = 通常の回復 (上振れは異常ではない = 少なすぎが直った)
+  await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 15`, [D(-1)]);
+  r = await run({ config: only('v3'), now: new Date('2026-09-23T09:00:00Z') });
+  assert.deepEqual([w8(r).verdict, r.counts.new], ['breach', 1]);
+  await ordersBulk('aupay', 'main', D(-1), 45, 0, 16);
+  r = await run({ config: only('v3'), now: new Date('2026-09-23T10:00:00Z') });
+  assert.deepEqual([w8(r).verdict, r.counts.recovered, r.counts.rule_changed], ['pass', 1, 0]);
+  i = await issue();
+  assert.deepEqual([i.state, i.rec, i.check_version], ['recovered', true, 'v3']);
+  await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 40`, [D(-1)]);
+  await pg.query(`delete from ops.watch_issues where check_id = 'W8'`);
+  r = await run({ dryRun: true, config: only('v3') });
+  assert.deepEqual([w8(r).verdict, w8(r).observed.upward], ['pass', []]);
+});
 
 console.log('実行器の守り');
 await t('🚨 評価の 1 つが例外 → その項目の評価キーだけ execution_error・ほかは続く・最後の行は ❌ で exit 1。予定した評価キーが 1 つでも欠ければ ❌', async () => {
@@ -1538,7 +1645,7 @@ const adEv = (x = {}) => ({ name: 'ad-spend-amazon', kind: 'ad_spend', mall: 'am
   yesterday: { date: D(-1), local: true, generation: 5000, fetchedAt: '2026-09-22T22:10:00Z', onRender: true }, campaign_check: [{ date: D(-2), generation: 5000, report_id: 'R5000', sku_cents: 90000, campaign_cents: 90000 }, { date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 100000, campaign_cents: 100300 }], ...x });
 const w14 = async (evx, opts = {}) => (await evalW14({ db, config: opts.config || A, asOf: opts.asOf || ASOF, evidence: evx === null ? {} : { 'ad-spend-amazon': evx }, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC }, W14C))[0];
 await t('W14: 本物の設定に評価キー amazon/jp (v14・前提なし・最初の 2 週間は info)。そろった朝は pass (差 3 円 < 許容 10 円・出品の分からない費用 1%)', async () => {
-  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v18', ['amazon/jp'], [], 'warn']);
+  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v19', ['amazon/jp'], [], 'warn']);
   await adDay(D(-1));
   const r = await w14(adEv());
   assert.deepEqual([r.verdict, r.severity, r.observed.unresolved_share, r.observed.render.generation, r.observed.campaign_check], ['pass', 'info', 0.01, 5000, ['09-21:900/900', '09-22:1000/1003']], JSON.stringify(r));
@@ -1608,7 +1715,7 @@ console.log('W15 migrate の lock が朝に残っていない (設計 13 §3.10 
 const W15C = REAL_CONFIG.checkById('W15');
 const w15 = async (cfg = REAL_CONFIG) => evalW15({ db, config: cfg, asOf: ASOF }, W15C);
 await t('W15: 本物の設定に評価キー db/company (v17・前提なし・warn・案件は 1 つ)・lock が無ければ pass / 既存の試験の設定 (W15_SCOPES = []) は評価キーを作らない', async () => {
-  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W15').map((k) => k.scopeKey), W15C.depends, W15C.severity, W15C.issuePerItem], ['v18',['db/company'], [], 'warn', false]);
+  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W15').map((k) => k.scopeKey), W15C.depends, W15C.severity, W15C.issuePerItem], ['v19',['db/company'], [], 'warn', false]);
   assert.equal(plannedKeys(CONFIG).filter((k) => k.checkId === 'W15').length, 0);
   assert.equal(REAL_CONFIG.CHECKS.at(-1).id, 'W15');
   const [r] = await w15();
