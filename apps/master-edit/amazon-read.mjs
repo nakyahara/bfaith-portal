@@ -9,8 +9,10 @@
 import { normSku } from '../../lib/sku-norm.js';
 import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
 import { COMPANY_ID, jstDate, MasterWriteError } from '../../lib/master-write.mjs';
-import { readAmazonMap, sellerSkuIn, MAP_STATES, AMAZON_JP_SHOP_CODE } from '../../lib/amazon-map-write.mjs';
+import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage, MAP_STATES, AMAZON_JP_SHOP_CODE, AMAZON_SKU_MAX_LEN } from '../../lib/amazon-map-write.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
+
+export { AMAZON_SKU_MAX_LEN };
 
 export const AMAZON_LIST_LIMIT = 100;
 export const UNMAPPED_DAYS = 7;
@@ -116,10 +118,10 @@ export async function amazonUnmapped(db, { now = new Date(), channel = 'FBA', ch
 
 // ─── 新しい seller SKU の対応を自分で作る入口 (10/11 中原さん「売れてから作るしかない」→ まだ売れていない SKU も先に作れる) ───
 
-/** Amazon の seller SKU の長さの上限 (Seller Central の決まり。ここは「気をつけること」に出すだけ・止めない) */
-export const AMAZON_SKU_MAX_LEN = 40;
 /** 「もしかして」に出す数 */
 export const SIMILAR_LIMIT = 5;
+/** 「もしかして」で 1 回に比べる出品の上限 (#1685 Codex R1 Low: 直に連打できる API・JS の比べには statement_timeout が効かない)。超えたら incomplete */
+export const SIMILAR_SCAN_MAX = 2000;
 const SKELETON_RE = /[-_./\s]/g;
 const DIGIT_RE = /[0-9]/;
 
@@ -164,27 +166,41 @@ export function similarKind(a, b) {
   return d <= max ? { kind: 'typo', distance: d } : null;
 }
 
-/** 気をつけること (止めない): Amazon の 40 文字・全角や日本語・途中の空白。sku = sellerSkuIn の後の形 */
+/**
+ * 気をつけること (止めない): 半角の英数字・記号でない字 (日本語など) が残っている。sku = sellerSkuIn の後の形。
+ * 40 文字・途中の空白・全角の英数字 / Unicode のダッシュは、まだ出品の無い SKU では止める (lib の newSellerSkuProblems・#1685 Codex R1 High)
+ */
 export function sellerSkuWarnings(sku) {
-  const w = [];
-  const len = [...sku].length;
-  if (len > AMAZON_SKU_MAX_LEN) w.push(`Amazon の seller SKU は ${AMAZON_SKU_MAX_LEN} 文字までです (いま ${len} 文字)。Seller Central の SKU と同じか確かめてください`);
-  if (/[^\x20-\x7e]/.test(sku)) w.push('全角の文字か日本語が入っています。Seller Central の SKU と同じ書き方か確かめてください (全角の英数字・記号は半角と同じ SKU と見ます)');
-  if (/\s/.test(sku)) w.push('途中に空白があります。空白を除いた形が同じ SKU は同じものと見ます');
-  return w;
+  return /[^\x20-\x7e]/.test(sku) ? ['半角の英数字・記号でない字 (日本語など) が入っています。Seller Central の SKU と同じ書き方か確かめてください'] : [];
 }
 const lowerSkuOr = (code) => { try { return sellerSkuIn(String(code ?? '')); } catch { return String(code ?? '').trim().toLowerCase(); } };
 
-/** 似た seller SKU (Company DB の Amazon (日本) の出品 = 対応の有効・墓標と、対応の無い出品)。近い順に SIMILAR_LIMIT 件 + 全部の数 */
+/**
+ * 似た seller SKU (Company DB の Amazon (日本) の出品 = 対応の有効・墓標と、対応の無い出品)。近い順に SIMILAR_LIMIT 件 + 全部の数 + incomplete。
+ *   候補 = ① 記号 (- _ . /) を除くと同じ (長さの差によらない・#1685 Codex R1 Medium) + ② 長さ ±2 (1〜2 文字の違い)。
+ *   ② は長さの近い順に SIMILAR_SCAN_MAX 件まで (超えた = incomplete: 全部とは比べていない・#1685 Codex R1 Low)
+ */
 export async function similarAmazonSkus(db, sellerSku) {
   const norm = (await db.query('select core.norm_code($1) as n', [sellerSku])).rows[0].n || '';
-  if (!norm) return { rows: [], total: 0 };
-  const cands = (await db.query(`select l.listing_id::text as listing_id, l.listing_norm from core.listings l
-     where l.company_id = $1 and l.mall = 'amazon' and l.shop_code = $2 and length(l.listing_norm) between $3 and $4 and l.listing_norm <> $5`,
-  [COMPANY_ID, AMAZON_JP_SHOP_CODE, Math.max(1, norm.length - 2), norm.length + 2, norm])).rows;
+  if (!norm) return { rows: [], total: 0, incomplete: false };
+  const skel = norm.replace(SKELETON_RE, '');
+  const bySkel = skel ? (await db.query(`select l.listing_id::text as listing_id, l.listing_norm from core.listings l
+     where l.company_id = $1 and l.mall = 'amazon' and l.shop_code = $2 and regexp_replace(l.listing_norm, '[-_./[:space:]]', '', 'g') = $3 and l.listing_norm <> $4
+     order by l.listing_norm limit 50`, [COMPANY_ID, AMAZON_JP_SHOP_CODE, skel, norm])).rows : [];
+  const band = (await db.query(`select l.listing_id::text as listing_id, l.listing_norm from core.listings l
+     where l.company_id = $1 and l.mall = 'amazon' and l.shop_code = $2 and length(l.listing_norm) between $3 and $4 and l.listing_norm <> $5
+     order by abs(length(l.listing_norm) - $6), l.listing_norm limit $7`,
+  [COMPANY_ID, AMAZON_JP_SHOP_CODE, Math.max(1, norm.length - 2), norm.length + 2, norm, norm.length, SIMILAR_SCAN_MAX + 1])).rows;
+  const incomplete = band.length > SIMILAR_SCAN_MAX;
+  const seen = new Set();
   const hits = [];
-  for (const c of cands) { const s = similarKind(norm, c.listing_norm); if (s) hits.push({ listing_id: c.listing_id, norm: c.listing_norm, ...s }); }
-  if (!hits.length) return { rows: [], total: 0 };
+  for (const c of [...bySkel, ...band.slice(0, SIMILAR_SCAN_MAX)]) {
+    if (seen.has(c.listing_id)) continue;
+    seen.add(c.listing_id);
+    const s = similarKind(norm, c.listing_norm);
+    if (s) hits.push({ listing_id: c.listing_id, norm: c.listing_norm, ...s });
+  }
+  if (!hits.length) return { rows: [], total: 0, incomplete };
   const ids = hits.map((h) => h.listing_id);
   const info = new Map((await db.query(`select l.listing_id::text as listing_id, l.listing_code, l.title, m.seller_sku, m.name, m.state, ci.asin
       from core.listings l left join core.amazon_sku_maps m on m.listing_id = l.listing_id left join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id
@@ -195,7 +211,7 @@ export async function similarAmazonSkus(db, sellerSku) {
     return { seller_sku: r.seller_sku || lowerSkuOr(r.listing_code), name: r.name || r.title || null, state: r.state || null, asin: r.asin || null, kind: h.kind, distance: h.distance };
   }).sort((x, y) => (x.kind === y.kind ? 0 : x.kind === 'symbols' ? -1 : 1) || x.distance - y.distance
     || (RANK[x.state] ?? 2) - (RANK[y.state] ?? 2) || (x.seller_sku < y.seller_sku ? -1 : x.seller_sku > y.seller_sku ? 1 : 0));
-  return { rows: rows.slice(0, SIMILAR_LIMIT), total: rows.length };
+  return { rows: rows.slice(0, SIMILAR_LIMIT), total: rows.length, incomplete };
 }
 
 /**
@@ -203,11 +219,13 @@ export async function similarAmazonSkus(db, sellerSku) {
  *   1. 形 = 保存と同じ sellerSkuIn (前後の空白を除いて小文字・写しの受け手の決まり)。合わない = { ok: false, reason: 'shape', message }
  *   2. もうある: Company DB に対応 (有効・墓標) がある (正規化して同じ = 同じ SKU) = exists.kind 'map' → next 'exists' (そのページへ案内・作らない)
  *      対応は無いが出品 (夜間の取り込みの写し) がある = exists.kind 'listing' → next 'create' (出品のコードの画面で作る)
- *   3. 打ち間違いの守り (止めない): 似た seller SKU (similar)・気をつけること (warnings) があれば next 'confirm' (見てから「このまま作る」)、無ければ 'create'
+ *   3. 出品も対応も無い = 先に作る SKU: 正規化しても同じ形・40 文字まで・途中の空白なし でなければ止める (= 保存の lib と同じ newSellerSkuProblems・#1685 Codex R1 High)
+ *      → { ok: false, reason: 'not_canonical', message, problems, canonical (半角にそろえた形・作れる形のときだけ) }
+ *   4. 打ち間違いの守り (止めない): 似た seller SKU (similar)・気をつけること (warnings) があれば next 'confirm' (見てから「このまま作る」)、無ければ 'create'
  *   open = 作る / 開く画面の seller SKU
  */
 export async function checkNewAmazonSku(db, raw) {
-  const base = { ok: false, sku: null, open: null, exists: null, similar: [], similar_total: 0, warnings: [], next: null };
+  const base = { ok: false, sku: null, open: null, exists: null, similar: [], similar_total: 0, similar_incomplete: false, warnings: [], problems: [], canonical: null, next: null };
   let sku;
   try { sku = sellerSkuIn(typeof raw === 'string' ? raw : ''); } catch (e) {
     if (e instanceof MasterWriteError) return { ...base, reason: 'shape', message: e.message };
@@ -224,8 +242,15 @@ export async function checkNewAmazonSku(db, raw) {
     return { ...base, ok: true, reason: null, message: null, sku, open, next: 'create',
       exists: { kind: 'listing', seller_sku: open, name: cur.listing.title ?? null, state: null, same: open === sku, asin: cur.listing.asin ?? null } };
   }
+  const norm = (await db.query('select core.norm_code($1) as n', [sku])).rows[0].n || '';
+  const problems = newSellerSkuProblems(sku, norm);
+  if (problems.length) {
+    let canonical = null;
+    try { const c = sellerSkuIn(norm); if (!newSellerSkuProblems(c, c).length) canonical = c; } catch { /* 半角にしても使えない形 */ }
+    return { ...base, sku, reason: 'not_canonical', message: newSkuRefusedMessage(sku, problems), problems, canonical };
+  }
   const sim = await similarAmazonSkus(db, sku);
   const warnings = sellerSkuWarnings(sku);
-  return { ...base, ok: true, reason: null, message: null, sku, open: sku, similar: sim.rows, similar_total: sim.total, warnings,
+  return { ...base, ok: true, reason: null, message: null, sku, open: sku, similar: sim.rows, similar_total: sim.total, similar_incomplete: sim.incomplete, warnings,
     next: sim.rows.length || warnings.length ? 'confirm' : 'create' };
 }

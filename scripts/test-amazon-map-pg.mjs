@@ -278,7 +278,7 @@ try {
     assert.equal(await code(CLI.assertShadowTarget({ targetUrl: other.toString(), productionUrl: prod })), 'ok');
     assert.match(await code(CLI.assertShadowTarget({ targetUrl: other.toString(), productionUrl: undefined })), /^AMAZON_MAP_MIGRATE_ARGS/);
   });
-  await ta('[10] まだ売れていない・出品も無い seller SKU (10/11 の自分で作る入口): 画面のロールのログインで作れる (出品・対応・構成)・2 人が同時に作る = 後の人は出品ごとの鍵で待ち、409 (出品は 1 つ)・全角で打った同じ SKU も 409', async () => {
+  await ta('[10] まだ売れていない・出品も無い seller SKU (10/11 の自分で作る入口): 画面のロールのログインで作れる (出品・対応・構成)・2 人が同時に作る = 後の人は出品ごとの鍵で待ち、409 (出品は 1 つ)・全角で打った同じ SKU はすぐ 400 (先に作る形の決まり)', async () => {
     const lidsOf = async (code) => (await q("select listing_id::text as id from core.listings where mall = 'amazon' and listing_norm = core.norm_code($1)", [code])).map((r) => r.id);
     assert.deepEqual(await lidsOf('pm_new_10'), [], '始めは出品も無い');
     const v = await versionsOf('pm_new_10');
@@ -291,18 +291,21 @@ try {
     const c = launch(save(pgAdapter(EC), 'ｐｍ＿ｎｅｗ＿１０', '全角で打った人', [{ code: 'p002', qty: 1 }], { versions: v }));
     await sleep(700);
     assert.equal(b.done, false, '後の人は出品ごとの鍵で待っている (出品がまだ無くても)');
-    assert.equal(c.done, false, '全角で打った同じ SKU も同じ鍵で待っている');
+    assert.equal(c.done, true, '全角で打った同じ SKU = 出品がまだ無い先行の登録の形の決まりで、鍵を待たずにすぐ断る (#1685 Codex R1 High)');
     g.open();
     const ra = await a.promise; const rb = await b.promise; const rc = await c.promise;
     assert.ok(ra.ok, ra.err?.message);
     assert.deepEqual([ra.ok.created, ra.ok.listing_created, ra.ok.seller_sku], [true, true, 'pm_new_10']);
     assert.deepEqual([rb.err?.status, rb.err?.reason], [409, 'version_conflict'], rb.err?.message || 'ok になった');
-    assert.equal(rc.err?.status, 409, rc.err?.message || 'ok になった');
-    assert.ok(['version_conflict', 'norm_collision'].includes(rc.err?.reason), rc.err?.reason);
+    assert.deepEqual([rc.err?.status, rc.err?.reason], [400, 'invalid_input'], rc.err?.message || 'ok になった');
     assert.equal((await lidsOf('pm_new_10')).length, 1, '出品は 1 つ');
     assert.deepEqual(await comps('pm_new_10'), ['p001x2@0']);
     const row = (await q("select l.catalog_item_id, l.created_by_type, m.name, m.origin from core.listings l join core.amazon_sku_maps m on m.listing_id = l.listing_id where m.seller_sku = 'pm_new_10'"))[0];
     assert.deepEqual(row, { catalog_item_id: null, created_by_type: 'human', name: '先に作る人', origin: 'portal' });
+    // 全角で先に作る = 画面のロールのログインでも lib が断る (#1685 Codex R1 High)・何も作らない
+    const ef = await save(dbA, 'ｐｍ＿ｆｗ＿１０', '全角で先に', [{ code: 'p001', qty: 1 }], { versions: { listing: null, map: null } }).then(() => null, (x) => x);
+    assert.deepEqual([ef?.status, ef?.reason], [400, 'invalid_input'], ef?.message || 'ok になった');
+    assert.deepEqual(await lidsOf('pm_fw_10'), []);
     assert.deepEqual(K.validateSkuMap(await A.readCompanyAmazonMapCanon(dbO)), []);
   });} finally {
   for (const c of clients.reverse()) { try { await c.end(); } catch { /* */ } }

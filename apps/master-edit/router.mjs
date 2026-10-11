@@ -81,8 +81,8 @@ import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody } from './ord
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
-import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
-import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN } from './amazon-read.mjs';
+import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, newSellerSkuCheckInDb, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
+import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX } from './amazon-read.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
@@ -748,7 +748,7 @@ router.get('/amazon/new', (req, res) => withPgPage(req, res, async (db, dbError)
   }
   const phase = await readPhaseView(db);
   const shapeError = tooLong ? TOO_LONG : check && !check.ok ? check.message : '';
-  res.status(shapeError ? 400 : 200).render(view('amazon-new.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, raw: raw.slice(0, AMAZON_CHECK_RAW_MAX), asked, check, shapeError, MAP_STATES, AMAZON_SKU_MAX_LEN });
+  res.status(shapeError ? 400 : 200).render(view('amazon-new.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, raw: raw.slice(0, AMAZON_CHECK_RAW_MAX), asked, check, shapeError, MAP_STATES, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX });
 }));
 router.get('/api/amazon/check', (req, res) => {
   const raw = typeof req.query.sku === 'string' ? req.query.sku : '';
@@ -768,7 +768,9 @@ router.get('/amazon/sku', (req, res) => withPgPage(req, res, async (db, dbError)
   const channels = db ? await amazonChannelsProvider() : null;
   const page = db ? await readAmazonPage(db, sku, { channels }) : null;
   if (page) page.phase = { ...page.phase, owner: await screenOwner(db) };
-  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY });
+  // 出品も対応も無い seller SKU = 先に作る形の決まり (#1685 Codex R1 High)。合わなければ画面で先に知らせて保存のボタンを出さない (保存の lib も断る)
+  const newSkuProblems = page && !page.cur.listing ? (await newSellerSkuCheckInDb(db, sku)).problems : [];
+  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY });
 }));
 router.post('/api/amazon/save', (req, res) => {
   const gate = editorGate(req);

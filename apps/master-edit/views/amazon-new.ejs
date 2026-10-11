@@ -30,7 +30,7 @@
     <%- include('_amazon-create', { createValue: raw }) %>
 
     <% if (shapeError) { %>
-    <div class="callout err" role="alert" id="new-result"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= shapeError %></div><div class="hint">直してから、もう一度「作り始める」を押してください。何も作っていません。</div></div></div>
+    <div class="callout err" role="alert" id="new-result"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= shapeError %></div><div class="hint">直してから、もう一度「作り始める」を押してください。何も作っていません。</div><% if (check && check.canonical) { %><div class="exists-row" style="margin-top:10px"><a class="btn soft" id="use-canonical" href="<%= base %>/amazon/new?sku=<%= encodeURIComponent(check.canonical) %>">半角にそろえた <span class="mono"><%= check.canonical %></span> で確かめる</a></div><% } %></div></div>
     <% } else if (check && !check.ok) { %>
     <div class="callout warn" id="new-result"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><%= check.message %></div></div>
     <% } else if (c && c.next === 'exists') { const ex = c.exists; const [tone, label] = stateBadge(ex.state); %>
@@ -64,6 +64,7 @@
         <% } %>
       </ul>
       <% } %>
+      <% if (c.similar_incomplete) { %><div class="hint">出品が多いので、長さの近い <%= SIMILAR_SCAN_MAX.toLocaleString('ja-JP') %> 件だけと比べました (記号だけ違うものは全部と比べています)。</div><% } %>
       <% if (c.warnings.length) { %>
       <ul class="warnlist"><% for (const w of c.warnings) { %><li><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><span><%= w %></span></li><% } %></ul>
       <% } %>

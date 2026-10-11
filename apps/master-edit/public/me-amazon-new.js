@@ -33,6 +33,8 @@
     var h = '';
     if (!j || j.ok !== true) {
       h = line('err', esc((j && (j.message || j.error)) || '確かめられません'));
+      // 全角・ダッシュなどで先に作れない = 半角にそろえた形で確かめ直すボタン (#1685 Codex R1 High)
+      if (j && j.canonical) h += '<div class="exists-row"><button type="button" class="btn soft sm" id="use-canonical" data-sku="' + esc(j.canonical) + '">半角にそろえた <span class="mono">' + esc(j.canonical) + '</span> で確かめる</button></div>';
       setGo(null);
     } else if (j.next === 'exists') {
       var ex = j.exists;
@@ -55,6 +57,7 @@
         });
         h += '</ul><div class="hint">打ち間違いでなければ、そのまま「作り始める」</div>';
       }
+      if (j.similar_incomplete) h += '<div class="hint">出品が多いので、「もしかして」は長さの近い出品の一部だけと比べました (記号だけ違うものは全部と比べています)</div>';
       if (j.warnings && j.warnings.length) {
         h += '<ul class="warnlist">' + j.warnings.map(function (w) { return '<li><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><span>' + esc(w) + '</span></li>'; }).join('') + '</ul>';
       }
@@ -78,6 +81,11 @@
       })
       .catch(function () { if (my === seq) { out.innerHTML = line('warn', '確かめられません (通信)。「作り始める」を押すと、もう一度確かめます'); setGo(null); } });
   }
+  out.addEventListener('click', function (e) {
+    var b = e.target.closest && e.target.closest('#use-canonical');
+    if (!b) return;
+    input.value = b.getAttribute('data-sku'); input.focus(); clearTimeout(timer); checkedEl.value = ''; check();
+  });
   input.addEventListener('input', function () { clearTimeout(timer); shown = null; checkedEl.value = ''; timer = setTimeout(check, 400); });
   form.addEventListener('submit', function (e) {
     var raw = input.value;

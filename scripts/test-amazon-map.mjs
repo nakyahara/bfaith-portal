@@ -1053,6 +1053,7 @@ await ta('[12] 未登録 (M11): 直近 7 日の Amazon の注文で構成が無�
 
 console.log('\n自分で作る入口 (10/11: まだ売れていない seller SKU の対応を先に作る)');
 const RD = await import('../apps/master-edit/amazon-read.mjs');
+const newCheckAsEdit = (sku) => asRole(E, 'master_edit', () => A.newSellerSkuCheckInDb(db, sku));
 const asEditRole = (fn) => asRole(E, 'master_edit', fn);
 
 await ta('[13] 似ているか (打ち間違いの守り・止めない): 記号だけ違う・1〜2 文字違い (入れ替え・抜け)・連番の数字だけの違いは出さない・短い SKU は 1 文字だけ / 気をつけること (40 文字・全角・途中の空白)', async () => {
@@ -1070,12 +1071,16 @@ await ta('[13] 似ているか (打ち間違いの守り・止めない): 記号
   assert.equal(RD.similarKind('pr_abc001', 'pr_abc001'), null, '同じ = 似ているではない (もうある)');
   assert.deepEqual(RD.similarKind('a001', 'a01'), { kind: 'typo', distance: 1 });
   assert.equal(RD.similarKind('abcd', 'abxy'), null, '5 文字以下は 1 文字違いだけ');
+  assert.deepEqual(RD.similarKind('prabc001', 'p-r-a-b-c-001'), { kind: 'symbols', distance: 5 }, '記号が 3 個以上違っても記号だけの違い');
   assert.deepEqual(RD.sellerSkuWarnings('pr_abc001'), []);
-  assert.match(RD.sellerSkuWarnings('a'.repeat(41)).join(' '), /40 文字までです \(いま 41 文字\)/);
-  assert.deepEqual(RD.sellerSkuWarnings('a'.repeat(40)), [], '40 文字ちょうどは言わない');
-  assert.match(RD.sellerSkuWarnings('ｐｒ＿ａ001').join(' '), /全角の文字か日本語/);
-  assert.match(RD.sellerSkuWarnings('はちみつ').join(' '), /全角の文字か日本語/);
-  assert.match(RD.sellerSkuWarnings('pr abc').join(' '), /途中に空白/);
+  assert.match(RD.sellerSkuWarnings('はちみつ').join(' '), /日本語など/);
+  // 先に作るときの決まり (#1685 Codex R1 High・lib の newSellerSkuProblems = 確かめと保存で同じ)
+  assert.deepEqual(A.newSellerSkuProblems('pr_abc001', 'pr_abc001'), []);
+  assert.deepEqual(A.newSellerSkuProblems('a'.repeat(40), 'a'.repeat(40)), [], '40 文字ちょうどは作れる');
+  assert.match(A.newSellerSkuProblems('a'.repeat(41), 'a'.repeat(41)).join(' '), /40 文字までです \(いま 41 文字\)/);
+  assert.match(A.newSellerSkuProblems('ｐｒ＿ａ001', 'pr_a001').join(' '), /全角の英数字・記号か、Unicode のダッシュ[\s\S]*半角にそろえると pr_a001/);
+  assert.match(A.newSellerSkuProblems('pr abc', 'prabc').join(' '), /途中に空白/);
+  assert.deepEqual(A.newSellerSkuProblems('はちみつ', 'はちみつ'), [], '日本語は止めない (正規化しても同じ)');
 });
 
 await ta('[13] 確かめ (画面のロール・読むだけ): 形の誤り・もうある (有効 / 墓標 / 正規化で同じ)・出品だけある・似た SKU (近い順)・新しく作れる。何も書かない', async () => {
@@ -1107,8 +1112,33 @@ await ta('[13] 確かめ (画面のロール・読むだけ): 形の誤り・も
   assert.deepEqual([c.next, c.similar], ['create', []]);
   c = await asEditRole(() => RD.checkNewAmazonSku(db, ' Brand_New_01 '));
   assert.deepEqual({ ok: c.ok, next: c.next, sku: c.sku, open: c.open, exists: c.exists, similar: c.similar, warnings: c.warnings }, { ok: true, next: 'create', sku: 'brand_new_01', open: 'brand_new_01', exists: null, similar: [], warnings: [] });
-  c = await asEditRole(() => RD.checkNewAmazonSku(db, 'ブランド_01'));
-  assert.equal(c.next, 'confirm'); assert.match(c.warnings.join(' '), /全角の文字か日本語/);
+  c = await asEditRole(() => RD.checkNewAmazonSku(db, 'ブランド_01'));   // 日本語は正規化しても同じ = 止めない (気をつけること)
+  assert.equal(c.next, 'confirm'); assert.match(c.warnings.join(' '), /日本語など/);
+  // #1685 Codex R1 High: 出品の無い SKU を全角・Unicode のダッシュ・途中の空白・41 文字で先に作る = 止める (半角にそろえた形を案内)
+  c = await asEditRole(() => RD.checkNewAmazonSku(db, 'ｂｒａｎｄ＿ｎｅｗ'));
+  assert.deepEqual([c.ok, c.reason, c.canonical, c.next], [false, 'not_canonical', 'brand_new', null]);
+  assert.match(c.message, /この形では先に作れません: 全角の英数字・記号か、Unicode のダッシュが入っています \(半角にそろえると brand_new\)/);
+  c = await asEditRole(() => RD.checkNewAmazonSku(db, `pr${String.fromCharCode(0x2212)}zz9`));
+  assert.deepEqual([c.ok, c.reason, c.canonical], [false, 'not_canonical', 'pr-zz9']);
+  c = await asEditRole(() => RD.checkNewAmazonSku(db, 'pr zz 9'));
+  assert.deepEqual([c.ok, c.canonical], [false, 'przz9']); assert.match(c.message, /途中に空白があります/);
+  c = await asEditRole(() => RD.checkNewAmazonSku(db, 'z'.repeat(41)));
+  assert.deepEqual([c.ok, c.canonical], [false, null]); assert.match(c.message, /40 文字までです \(いま 41 文字\)/);
+  c = await asEditRole(() => RD.checkNewAmazonSku(db, 'z'.repeat(40)));
+  assert.equal(c.ok, true, '40 文字ちょうどは作れる');
+  // #1685 Codex R1 Medium: 記号だけ違う候補は長さの差 (3 文字以上) によらず出す
+  c = await asEditRole(() => RD.checkNewAmazonSku(db, 'n-e-w-s-k-u-1'));
+  assert.deepEqual(c.similar.map((s) => [s.seller_sku, s.kind]), [['new_sku1', 'symbols']]);
+  // #1685 Codex R1 Low: 長さの近い出品が上限より多い = 上限までと比べて incomplete (記号だけ違うものは別に全部)
+  await pg.query('begin');
+  try {
+    await pg.query(`insert into core.listings (company_id, mall, shop_code, listing_code, status) select 1, 'amazon', $1, 'zq_bulk_' || lpad(g::text, 5, '0'), 'active' from generate_series(1, $2::int) g`, [AMZ, RD.SIMILAR_SCAN_MAX + 1]);
+    c = await asEditRole(() => RD.checkNewAmazonSku(db, 'zq_bulk_000011'));
+    assert.equal(c.similar_incomplete, true);
+    assert.ok(c.similar.some((s) => s.seller_sku === 'zq_bulk_00001'), JSON.stringify(c.similar));
+    c = await asEditRole(() => RD.checkNewAmazonSku(db, 'z-q-b-u-l-k-0-0-0-0-1'));
+    assert.ok(c.similar.some((s) => s.seller_sku === 'zq_bulk_00001' && s.kind === 'symbols'), '記号だけ違うものは上限によらず');
+  } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
   const after = await q('select (select count(*)::int from core.listings) as l, (select count(*)::int from core.amazon_sku_maps) as m, (select count(*)::int from ops.master_edit_requests) as r');
   assert.deepEqual(after, before, '確かめは何も書かない');
 });
@@ -1167,6 +1197,27 @@ await ta('[13] 画面: 一覧の上の「新しい seller SKU の対応を作る
   assert.deepEqual([r.status, r.j.ok, r.j.reason], [200, false, 'shape']);
   r = await call('GET', '/api/amazon/check');
   assert.deepEqual([r.j.ok, r.j.message], [false, 'seller SKU を入れてください']);
+  // #1685 Codex R1 High: 出品の無い SKU を全角などで先に作る = 確かめ・入口・作る画面・保存 (画面を飛ばした API) のどれでも断る
+  const FW = 'ｂｒａｎｄ＿ｎｅｗ';
+  r = await call('GET', '/api/amazon/check?sku=' + encodeURIComponent(FW));
+  assert.deepEqual([r.status, r.j.ok, r.j.reason, r.j.canonical], [200, false, 'not_canonical', 'brand_new']);
+  r = await call('GET', '/amazon/new?sku=' + encodeURIComponent(FW));
+  assert.equal(r.status, 400); assert.ok(r.text.includes('この形では先に作れません') && r.text.includes('id="use-canonical" href="/apps/master-edit/amazon/new?sku=brand_new"'));
+  r = await call('GET', '/amazon/new?sku=' + encodeURIComponent(FW) + '&checked=' + encodeURIComponent(FW));
+  assert.equal(r.status, 400, 'checked でも通さない');
+  r = await call('GET', '/amazon/sku?sku=' + encodeURIComponent(FW));
+  assert.equal(r.status, 200); assert.ok(r.text.includes('id="new-sku-refused"') && !r.text.includes('id="save"'), '作る画面は先に知らせて保存のボタンを出さない');
+  r = await call('GET', '/amazon/sku?sku=brand_new_99');
+  assert.ok(!r.text.includes('id="new-sku-refused"') && r.text.includes('id="save"'), '半角なら作れる');
+  for (const bad of [FW, 'brand new 2', `brand${String.fromCharCode(0x2010)}new3`, 'b'.repeat(41)]) {
+    const sk = bad.trim().toLowerCase();
+    const rr = await call('POST', '/api/amazon/save', { body: { request_id: uuid(), seller_sku: bad, name: '先に作る', components: [{ code: 'a002', qty: 1 }], seen: { versions: { listing: null, map: null } } } });
+    assert.deepEqual([rr.status, rr.j.reason, rr.j.field], [400, 'invalid_input', 'seller_sku'], `${bad}: ${rr.text}`);
+    assert.match(rr.j.error, /この形では先に作れません/);
+    assert.equal(await lidOf(sk), null, `${bad}: 出品を作っていない`);
+  }
+  // 出品がもうある SKU (夜間の取り込みの表記) は今までどおり: 対応は出品の無い SKU の決まりで止めない
+  assert.deepEqual((await newCheckAsEdit('a006')).problems, []);
 });
 
 await ta('[13] まだ売れていない・出品も無い seller SKU を作る画面から保存できる: 出品 (ASIN なし)・対応・構成 (manual) を作る → 最初の注文から結びつく・未登録に出ない → 後で Amazon に出品 = 夜間の取り込みが ASIN だけ付ける (構成・名前は変えない)', async () => {
@@ -1200,7 +1251,8 @@ await ta('[13] まだ売れていない・出品も無い seller SKU を作る�
   assert.ok(r.text.includes('sku?sku=brand_new_01') && r.text.includes('ブランド新 3 個組'));
   // 後で Amazon に出品 → 夜間の取り込み (SKU マスタの写しに違う構成・Amazon のタイトル・ASIN) = ASIN だけ付ける。構成・対応の名前は人が作ったまま
   const plan = makePlan();
-  plan.listings.push({ mall: 'amazon', shopCode: AMZ, marketplaceId: 'A1VC38T7YXB528', listingCode: 'brand_new_01', title: 'Amazon のタイトル', status: 'active',
+  const AMAZON_RAW = 'BRAND_NEW_01';   // Amazon の本物の seller SKU (取り込みの表記 = 大文字)
+  plan.listings.push({ mall: 'amazon', shopCode: AMZ, marketplaceId: 'A1VC38T7YXB528', listingCode: AMAZON_RAW, title: 'Amazon のタイトル', status: 'active',
     components: [{ code: 'a001', qty: 1, sortOrder: 0, resolution: 'imported', evidence: { source: 'm_sku_master' } }], asinCandidates: [{ asin: 'B0NEW00001', source: 'listing_report' }], fnskuCandidates: [], evidenceSource: 'mirror_sku_master' });
   await load(db, ALL_COMPANY, plan, 'load_brand_new');
   const after = await A.readAmazonMap(db, 'brand_new_01');
@@ -1210,6 +1262,14 @@ await ta('[13] まだ売れていない・出品も無い seller SKU を作る�
   const canon = await A.readCompanyAmazonMapCanon(db, { sellerSkus: ['brand_new_01'] });
   assert.deepEqual([canon.master.map((m) => [m.seller_sku, m.name]), canon.components.map((x) => [x.ne_code, x.quantity])], [[['brand_new_01', 'ブランド新 3 個組']], [['a002', 3]]]);
   assert.deepEqual(K.validateSkuMap(canon), []);
+  // 売上の集計 (rebuild-f-sales.js = LOWER(seller_sku) と写しの seller_sku の toLowerCase) と FBA 補充 (sheetless-mode.js の normSkuKey) の引き方で、本物の SKU が先に作った対応に当たる
+  const { normSkuKey } = await import('../apps/fba-replenishment/sheetless-mode.js');
+  const key = canon.master[0].seller_sku;
+  assert.equal(AMAZON_RAW.toLowerCase(), key.toLowerCase(), '売上の集計の引き方');
+  assert.equal(normSkuKey(AMAZON_RAW), normSkuKey(key), 'FBA 補充の引き方');
+  assert.equal((await q('select listing_code from core.listings where listing_id = $1', [lid]))[0].listing_code, 'brand_new_01', '出品のコードは先に作った表記のまま (= 半角だから合う)');
+  // 全角で先に作ろうとした = 断られる (上の試験) ので、Amazon の本物の出品が来てもずれた表記の対応は残らない
+  assert.deepEqual(await q("select seller_sku from core.amazon_sku_maps where seller_sku <> core.norm_code(seller_sku)"), [], '正規化と違う表記の対応が無い');
 });
 
 server.close();

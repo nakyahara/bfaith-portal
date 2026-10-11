@@ -1953,6 +1953,13 @@ await ta('[55] 新しい seller SKU を自分で作る (10/11): 一覧の上の�
   await p.fill('#new-sku', 'a'.repeat(256));
   await waitOut(/255 文字を超える/);
   assert.equal(await p.locator('#new-sku-out .fmsg.err').count(), 1);
+  // 出品の無い SKU を全角で先に作る = その場で止める・半角にそろえた形で確かめ直すボタン (#1685 Codex R1 High)
+  await p.fill('#new-sku', 'ｐｒ－ｋ００１ｚ');
+  await waitOut(/この形では先に作れません/);
+  assert.equal(await p.locator('#new-sku-out .fmsg.err').count(), 1);
+  await p.click('#use-canonical');
+  assert.equal(await p.inputValue('#new-sku'), 'pr-k001z');
+  await waitOut(/もしかして/);
   // 空の Enter は送らない
   await p.fill('#new-sku', '');
   await p.press('#new-sku', 'Enter');
