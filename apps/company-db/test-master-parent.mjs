@@ -9,7 +9,9 @@
  *   4 外せる材料 (matched・完了した取得・意味の版 src1) でなければ外さない (material_untrusted)
  *   5 一度に外しすぎの守り (max(20, 2%) を超えたら 1 件も外さない)
  *   6 外す辺を明示の null 辺として循環を検算する (同時に外すと循環しない / manual で旧い辺が残ると循環になる)
- *   7 持ち主 company = 名札も親子も触らない / 0036 の前の DB = 今までどおり (付けるだけ・記録なし)
+ *   7 持ち主 company = 名札も親子も触らない / 0036 の前の DB = 今までどおり (付けるだけ・記録なし) /
+ *     configured (config/master-ownership.mjs) の products.parent = company を配っても (CompanyDB構想/20 PR-8)、ロードは DB の active (本番 10/9 の 15 キー・代表は load) に従う =
+ *     NE の代表で名札と親を作る・widen の後 (active = configured) は触らない。照合 ① の代表の記録の形もロードが記録した持ち主で合う ([8b])
  *   8 送る形の代表の状態 (readMasterMaterial) と、材料の意味の版 (representativeStateOf・受け手の validMaterialSemantics)
  * 使い方: node apps/company-db/test-master-parent.mjs
  */
@@ -21,7 +23,9 @@ import { runInitialLoad, UNLINK_GUARD_MIN, unlinkGuardLimit } from './load/engin
 import { summaryLine } from './master-compare/run.mjs';
 import { validTimestampText } from './master-compare/compare-load.mjs';
 import { representativeStateOf } from './load/sources.mjs';
-import { OWNED_COLUMNS as OWNED_COLUMNS_FOR_BASE } from '../../config/master-ownership.mjs';
+import { OWNED_COLUMNS as OWNED_COLUMNS_FOR_BASE, MASTER_OWNERSHIP as CONFIGURED, companyOwned } from '../../config/master-ownership.mjs';
+import { parentDecisionsProblem } from './master-compare/compare-load.mjs';
+import { seedActiveEpoch } from '../../scripts/fixtures/master-epoch.mjs';
 // 試験の基準 = 切替前の持ち主表 (全部 load)。⑤-3b の PR から config/master-ownership.mjs (configured) は 10/5 の 13 キーが company = 基準にしない
 const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries(OWNED_COLUMNS_FOR_BASE.map((k) => [k, 'load'])));
 import { readMasterMaterial, MATERIAL_REP_SEMANTICS } from '../warehouse/master-material.js';
@@ -253,6 +257,50 @@ await ta('[8] 持ち主 company = 名札を作らず親子を触らない (記�
     assert.equal((await q("select count(*)::int as n from core.products where display_code = 'h'"))[0].n, 0);
     assert.deepEqual(await decisionsOf(q, 'load_o2'), { owned: false });
     assert.equal(r.summary.variation_groups.expected, 0); assert.equal(r.summary.variation_parents.expected, 0);
+  } finally { await pg.close(); }
+});
+
+await ta('[8b] configured の代表 = company を配っても (PR-8)、ロードは DB の active (10/9 の 15 キー・代表 load) に従う = NE の代表で名札と親を作る / widen の後 (active = configured) は名札も親子も触らない', async () => {
+  // 🚨 変わる configured から作らない (#1652 Codex R1 Low): 10/9 15:35 の Amazon の widen の後の本番の active = 15 キー (履歴の固定値・ハッシュ 53a62b53…)
+  const KEYS_20261009 = ['external_ids.jan', 'listing_components.amazon', 'products.name', 'products.sales_class', 'products.status', 'sku_costs', 'skus.handling', 'skus.name',
+    'skus.reorder_months', 'skus.shipping', 'skus.sku_kind', 'skus.standard_price', 'skus.tax_class', 'skus.tax_rate', 'supplier_skus.is_primary'];
+  const ACTIVE_20261009 = Object.freeze({ ...MASTER_OWNERSHIP, ...Object.fromEntries(KEYS_20261009.map((k) => [k, 'company'])) });
+  assert.equal(ACTIVE_20261009['products.parent'], 'load');
+  assert.equal(CONFIGURED['products.parent'], 'company');   // configured (10/11〜・PR-8)
+  // prepare --widen の足すキー (configured の company − 本番の active) = products.parent だけ (0068 の広げてよいキーの中)・active の company を load に戻すキーは無い
+  assert.deepEqual(companyOwned(CONFIGURED).filter((k) => ACTIVE_20261009[k] !== 'company'), ['products.parent']);
+  assert.deepEqual(companyOwned(ACTIVE_20261009).filter((k) => CONFIGURED[k] !== 'company'), []);
+  const { pg, db, q } = await freshDb();
+  try {
+    await load(db, planOf([['k1', 'g', 'value'], ['k2', null, 'empty']], [['g', ['k1']]]), 'load_c0');
+    assert.equal(await seedActiveEpoch(db, ACTIVE_20261009), true);
+    const recorded = async (runId) => (await q("select ownership from ops.load_materials where ingest_run_id = $1 and entity = 'products'", [runId]))[0]?.ownership ?? null;
+    // (1) 配ってから widen まで: 持ち主を渡さない (= 本番の夜間ロードと同じく epoch を読む) = NE の代表に合わせる (付け替え・新しい名札)
+    const r = await load(db, planOf([['k1', 'h', 'value'], ['k2', 'h', 'value']], [['h', ['k1', 'k2']]]), 'load_c1');
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.ownership_epoch.epoch, 'active');
+    assert.ok(!r.company_owned.includes('products.parent'), JSON.stringify(r.company_owned));
+    assert.deepEqual([await stateOf(q, 'k1'), await stateOf(q, 'k2')], [['h', 'load'], ['h', 'load']]);
+    assert.equal((await q("select count(*)::int as n from core.products where display_code = 'h'"))[0].n, 1);
+    const own1 = await recorded('load_c1');
+    assert.equal(own1['products.parent'], 'load');   // 照合 ①・②・写しが使うロードの記録の持ち主 = active (configured ではない)
+    const V1 = await decisionsOf(q, 'load_c1');
+    assert.equal(V1.owned, true);
+    assert.equal(parentDecisionsProblem(V1, { ownership: own1, material: { status: 'matched', source_complete_at: V1.trusted.source_complete_at } }), null);
+    // (2) widen の後 (active = configured): NE の代表が変わっても名札を作らず、親を付けない・変えない・外さない。記録は owned: false
+    assert.equal(await seedActiveEpoch(db, CONFIGURED), true);
+    const r2 = await load(db, planOf([['k1', 'z', 'value'], ['k2', null, 'empty'], ['k3', 'z', 'value']], [['z', ['k1', 'k3']]]), 'load_c2');
+    assert.equal(r2.ok, true, r2.error);
+    assert.equal(r2.ownership_epoch.epoch, 'active');
+    assert.ok(r2.company_owned.includes('products.parent'));
+    assert.deepEqual([await stateOf(q, 'k1'), await stateOf(q, 'k2'), await stateOf(q, 'k3')], [['h', 'load'], ['h', 'load'], [null, null]]);
+    assert.equal((await q("select count(*)::int as n from core.products where display_code = 'z'"))[0].n, 0);
+    const own2 = await recorded('load_c2');
+    assert.equal(own2['products.parent'], 'company');
+    const V2 = await decisionsOf(q, 'load_c2');
+    assert.deepEqual(V2, { owned: false });
+    assert.equal(parentDecisionsProblem(V2, { ownership: own2, material: { status: 'matched', source_complete_at: null } }), null);
+    assert.equal(parentDecisionsProblem(V2, { ownership: own1, material: { status: 'matched', source_complete_at: null } }), 'variation_parents_owner');   // 持ち主の取り違えは形の誤り
   } finally { await pg.close(); }
 });
 
