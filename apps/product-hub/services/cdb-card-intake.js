@@ -299,6 +299,43 @@ export function linkCdbCardToExisting(event, { draftId, actor = ACTOR, db = getD
 }
 
 /**
+ * 🆕 0071: Company DB で新商品の下書きを消した (登録をやめた = cancelled) SKU のカードを「除外」(excluded) にする (SQLite の 1 つの取引)。
+ * Postgres の取引 (ops.cancel_sku_draft) の commit の後に、マスタの入力の画面 (apps/master-edit/router.mjs) が呼ぶ = 失敗しても消したのは成功のまま。
+ *   相手 = この SKU に結んだカード (cdb_sku_id) だけ。同じ商品コードでも結んでいないカードは触らない (same_code に番号を返すだけ = 人が決める)。
+ *   除外 = product-hub の画面の「除外」と同じ書き方 (状態を CAS で替え・AI の借りを外し・status_changed を記録)。消さない (いつでも「再開」で戻せる)。
+ *   🚨 出品済み (listed / expanded) のカードは除外にしない (モールに出した商品を黙って隠さない = 記録だけ残して kept_listed)。もう除外 = already
+ * 戻り値 { cards: [{ draft_id, before, outcome: excluded | already | kept_listed | raced }], same_code: [draft_id] }
+ */
+export function excludeCdbCardsForCancelledSku({ skuId, code = null, actor = ACTOR, reason = null } = {}, { db = getDB() } = {}) {
+  const sid = Number(skuId);
+  if (!/^[1-9][0-9]{0,15}$/.test(String(skuId ?? '')) || !Number.isSafeInteger(sid)) throw fail(`SKU の番号が不正: ${skuId}`);
+  const codeKey = code == null ? null : String(code).trim().toLowerCase();
+  const why = `Company DB の新商品の下書き ${code ?? `SKU ${sid}`} を消した (登録をやめた)${reason ? `: ${String(reason).slice(0, 200)}` : ''}`;
+  return db.transaction(() => {
+    const out = [];
+    for (const d of db.prepare('SELECT id, status FROM product_drafts WHERE cdb_sku_id = ? ORDER BY id').all(sid)) {
+      if (d.status === 'excluded') { out.push({ draft_id: d.id, before: d.status, outcome: 'already' }); continue; }
+      if (d.status === 'listed' || d.status === 'expanded') {
+        logEvent(db, d.id, 'cdb_sku_cancelled', `${why} · 出品済みのカードなので除外にしていません (人が確かめる)`, actor);
+        out.push({ draft_id: d.id, before: d.status, outcome: 'kept_listed' });
+        continue;
+      }
+      const info = db.prepare(`
+        UPDATE product_drafts
+        SET status = 'excluded', generation_claim_run_id = NULL, generation_claim_until = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND status = ?
+      `).run(d.id, d.status);
+      if (info.changes !== 1) { out.push({ draft_id: d.id, before: d.status, outcome: 'raced' }); continue; }
+      logEvent(db, d.id, 'status_changed', `${d.status} -> excluded (${why})`, actor);
+      out.push({ draft_id: d.id, before: d.status, outcome: 'excluded' });
+    }
+    const same = codeKey ? db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? AND (cdb_sku_id IS NULL OR cdb_sku_id <> ?) ORDER BY id').all(codeKey, sid).map((r) => r.id) : [];
+    return { cards: out, same_code: same };
+  })();
+}
+
+/**
  * ボードのカードに「発送方法 要確認」を出す draft の id (取り込みで対応が無かった・まだ楽天の配送方法が空のもの)。
  * 表が無い (初期化の前) = 空
  */

@@ -29,6 +29,8 @@
  *   POST /api/variation/groups/:id/labels  まとまりの名前・軸の名前・選択肢名を直す { request_id, seen_revision, changes: { name?, axes?, options? }, reason? } (社内だけ・NE に送らない)
  *   POST /api/sku/:code/variation-cancel   まとまりの子の廃止 { request_id, reason } (下書き / NE 登録待ち・生きているファイルなし・NE に一度も現れていない子だけ)
  *   POST /api/sku/:code/adopt-parent       NE で直接作られた商品 (quarantined) の代表を NE から 1 回だけ採用 { request_id, reason? }
+ *   POST /api/sku/:code/draft-cancel       🆕 0071: 新商品の下書き (NE に一度も配っていない) を消す = 登録をやめた { request_id, reason, confirm: true } (名簿 MASTER_EDITORS の人・
+ *                                          lib/master-draft-cancel.mjs)。Postgres の後に product-hub のカード (SQLite) を「除外」(失敗しても消したのは成功のまま)
  *   GET  /api/code-check?code= 新しい商品コードを確かめる (形 + Company DB・NE・使ったことがあるか)
  *   POST /api/new            新商品の登録 { request_id, kind, code, reason?, values: {...}, card: {...} } (lib/master-register.mjs)。
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
@@ -71,6 +73,7 @@ import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } f
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
+import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
@@ -245,6 +248,14 @@ async function linkCard(ev, opts) {
   if (cardLinker) return cardLinker(ev, opts);
   const m = await import('../product-hub/services/cdb-card-intake.js');
   return m.linkCdbCardToExisting(ev, opts);
+}
+/** 🆕 0071: 下書きを消した SKU の product-hub のカードを「除外」(SQLite)。本番 = cdb-card-intake.js の excludeCdbCardsForCancelledSku。試験は差し替える */
+let cardExcluder = null;
+export function __setCardExcluder(fn) { cardExcluder = fn || null; }
+async function excludeCards(input) {
+  if (cardExcluder) return cardExcluder(input);
+  const m = await import('../product-hub/services/cdb-card-intake.js');
+  return m.excludeCdbCardsForCancelledSku(input);
 }
 /** 知らせを 1 つ取り込む (保存の直後・「もう一度」)。誤りは投げない (画面に「カード作成待ち」を出す) */
 async function tryCard(db, { eventId = null, skuId = null, manual = false }) {
@@ -715,6 +726,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     orderSettings: page && page.cur.sku_kind === 'single' ? orderScreen(req, editorGate(req), page.cur.code, { supplier: page.cur.primary_supplier || null }) : null,
     // 🆕 PR-7b: まとまりの名前を直す・子の廃止・quarantined の代表の採用のボタン (products.parent が company のときだけ。決めるのは DB)
     variationOn: variationOn(owner),
+    // 🆕 0071: 下書きだけ「この下書きを消す」の確かめを読む (DB の ops.sku_draft_cancel_check・読めない = 出さない)。押せるのは名簿 MASTER_EDITORS の人
+    deldraft: page && page.cur.registration && page.cur.registration.state === 'draft' ? draftCancelView(await readDraftCancelCheck(db, page.cur.sku_id)) : null,
   });
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -801,6 +814,30 @@ router.post('/api/sku/:code/variation-cancel', (req, res) => variationWrite(req,
 router.post('/api/sku/:code/adopt-parent', (req, res) => variationWrite(req, res, (db, actor, b) => adoptNeParent(db, {
   actor, requestId: b.request_id, reason: b.reason ?? null, code: req.params.code,
 }, { open: isOpen() })));
+
+/**
+ * 🆕 0071: 新商品の下書き (NE に一度も配っていない) を消す = 登録をやめた { request_id, reason, confirm: true }。名簿 MASTER_EDITORS の人 (下書きを作れる人と同じ =
+ *   NE・ロジザード・モールにはまだ何も無い = 作るのと同じ重さ)・この画面だけのロールで・MASTER_EDIT_OPEN の後だけ。
+ *   条件 (下書き・一度も配っていない・NE に現れていない・どこにも使われていない) と片付け (作っただけの CSV・構成の依頼・JAN・まだのカードの知らせ) は DB の関数が鍵の後に (lib/master-draft-cancel.mjs)。
+ *   commit の後に product-hub のカード (SQLite) を「除外」(出品済みは除外しない)。こちらの失敗は product_hub.error に返すだけ (消したのは成功のまま)
+ */
+router.post('/api/sku/:code/draft-cancel', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  const actor = String(req.session.email).trim().toLowerCase();
+  return withPgApi(res, async (db) => {
+    const r = await cancelSkuDraft(db, { actor, code: req.params.code, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen(), requireConfirm: true });
+    let productHub;
+    try {
+      productHub = await excludeCards({ skuId: r.sku_id, code: r.code, actor, reason: String(b.reason ?? '').trim() });
+    } catch (e) {
+      console.error(`[master-edit] 下書きを消した後の product-hub のカードの除外の失敗 (${r.code}): ${e && e.message}`);
+      productHub = { error: `product-hub のカードを除外にできませんでした (${String((e && e.message) || e).slice(0, 200)})。product-hub で「除外」にしてください` };
+    }
+    res.json({ ...r, product_hub: productHub });
+  }, 'write');
+});
 
 /**
  * 商品の画面の「発注の設定を保存」(発注アプリに書く。Company DB の保存とは別)。

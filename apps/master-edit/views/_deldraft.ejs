@@ -1,0 +1,46 @@
+<%#
+  🆕 0071: 新商品の下書きを消す (登録をやめた)。lib/master-draft-cancel.mjs の draftCancelView = deldraft { show, canGo, variation, will, why }。
+  押せる = DB の確かめが ok・名簿 MASTER_EDITORS の人・保存を開いている。動き = public/me-draft-cancel.js (確かめの窓 → POST /api/sku/:code/draft-cancel → 読み直し)
+  置き場所 = 商品の画面の上の「下書きです」の帯のすぐ下 (下書きのときだけ出る = 下書きの間に気づく所)
+%>
+<% const D = typeof deldraft !== 'undefined' && deldraft && deldraft.show ? deldraft : null; const delCan = !!D && D.canGo && canEdit && !dbError && !closed; %>
+<% if (D) { %>
+<div class="deldraft<%= delCan ? ' can' : '' %>" id="deldraft" data-base="<%= base %>" data-code="<%= c.code %>">
+  <svg class="ic" aria-hidden="true"><use href="#i-x"/></svg>
+  <div class="grow">
+    <% if (delCan) { %>
+      <div class="t">入れ間違い・発売中止なら、この下書きを消せます</div>
+      <div class="hint">NE・ロジザード・モールにはまだ何もありません。消すと「やめた」になり、一覧に出なくなります (記録は残ります)。値を直すだけなら、消さずにこの画面で直してください。</div>
+    <% } else if (D.variation) { %>
+      <div class="t">この下書きは色違い・サイズ違いのまとまりの子です</div>
+      <div class="hint">消すときは、上の「基本」の「このまとまりから外す (廃止)」を使います (まとまりのカードも一緒に直ります)。</div>
+    <% } else if (D.canGo && !canEdit) { %>
+      <div class="t">この下書きは消せる状態です</div>
+      <div class="hint">消せるのは、マスタの入力の名簿 (MASTER_EDITORS) の人だけです。</div>
+    <% } else if (D.canGo) { %>
+      <div class="t">この下書きは消せる状態です</div>
+      <div class="hint">いまは保存できません (<%= dbError ? 'Company DB につながらない' : closedWhy %>)。</div>
+    <% } else { %>
+      <div class="t">この下書きは、いまは消せません</div>
+      <ul class="deldraft-why" id="deldraft-why"><% for (const w of D.why) { %><li data-reason="<%= w.reason %>"><b><%= w.word %></b>: <%= w.text %></li><% } %></ul>
+    <% } %>
+  </div>
+  <% if (delCan) { %><button class="btn sm danger ghosty" type="button" id="deldraft-open" aria-haspopup="dialog" aria-controls="deldraft-bg">この下書きを消す</button><% } %>
+</div>
+<% if (delCan) { %>
+<div class="modal-bg" id="deldraft-bg">
+  <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="deldraft-t" aria-describedby="deldraft-d">
+    <h2 id="deldraft-t"><svg class="ic l" aria-hidden="true"><use href="#i-warn"/></svg><span class="mono"><%= c.code %></span> の下書きを消します</h2>
+    <div class="hint" id="deldraft-d" style="color:var(--text2)">登録の状態が「やめた」になり、一覧に出なくなります。<b>元には戻せません。このコードはもう使えません</b> (登録し直すときは別のコードで)。NE・ロジザード・モールには何もしません。</div>
+    <% if (D.will.length) { %>
+    <div class="lab2" style="margin-top:12px">一緒に片付けるもの</div>
+    <ul id="deldraft-will"><% for (const w of D.will) { %><li><%= w %></li><% } %></ul>
+    <% } %>
+    <label class="lab2" for="deldraft-reason" style="display:block;margin-top:8px">理由<span class="req">必須</span></label>
+    <input class="in" id="deldraft-reason" maxlength="200" autocomplete="off" placeholder="例: コードを打ち間違えた (正しくは xxx) / 発売が中止になった" style="width:100%">
+    <div class="msgline" id="deldraft-msg" role="status" aria-live="polite"></div>
+    <div class="mbtns"><button class="btn ghost" type="button" id="deldraft-no">消さない</button><button class="btn danger" type="button" id="deldraft-yes" disabled>消す</button></div>
+  </div>
+</div>
+<% } %>
+<% } %>

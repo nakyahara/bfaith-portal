@@ -268,6 +268,10 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     if (!hasReg) where.push(f.reg === 'none' ? 'true' : 'false');
     else if (f.reg === 'none') where.push('not exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id)');
     else { params.push(f.reg); where.push(`exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id and mr.state = $${params.length})`); }
+  } else if (hasReg && !f.codes) {
+    // 🆕 0071 (下書きを消す): 登録をやめた商品 (cancelled = 消した下書き・まとまりから外した子・NE から消えた) は、ふだんの一覧に出さない。
+    //   「登録 = やめた」で絞ったとき (一覧の札「やめた商品」)・商品コードでぴったり探したときは出す (戻り値の cancelledHidden = 隠したか)
+    where.push(`not exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id and mr.state = 'cancelled')`);
   }
   const hasOutbox = await regclass(db, 'ops.product_hub_outbox');
   if (f.card) {
@@ -463,7 +467,8 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   for (const r of pageRows) r.flags = [...(diffSet.has(r.code_norm) ? ['NEとの差'] : []), ...(csvSet.has(r.code_norm) ? ['CSV待ち'] : []), ...(reqSet.has(r.sku_id) ? ['構成の依頼'] : []),
     ...(cardOf.has(r.sku_id) ? [CARD_FLAG[cardOf.get(r.sku_id)]] : [])];
   tick();
-  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut, registeredOnAvailable: hasRegOn };
+  return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut, registeredOnAvailable: hasRegOn,
+    cancelledHidden: hasReg && !f.reg && !f.codes };
 }
 
 /**
@@ -483,7 +488,7 @@ export async function listCounts(db, { now = new Date() } = {}) {
   if (run) params.push(run.compare_run_id);
   const r = (await db.query(`with c as (
         ${costTodaySql(2)})
-      ${hasReg ? ", rd as (select distinct sku_id from ops.master_registrations where state = 'draft')" : ''}
+      ${hasReg ? ", rd as (select distinct sku_id from ops.master_registrations where state = 'draft'), rx as (select distinct sku_id from ops.master_registrations where state = 'cancelled')" : ''}
       ${hasOutbox ? ", ow as (select distinct sku_id from ops.product_hub_outbox where status in ('pending', 'failed')), oc as (select distinct sku_id from ops.product_hub_outbox where status = 'conflict')" : ''}
       ${run ? ', dc as (select distinct code_norm from ops.master_decision_candidates where last_seen_run = $3)' : ''}
       select count(*)::int as n_all,
@@ -496,13 +501,14 @@ export async function listCounts(db, { now = new Date() } = {}) {
         ${hasReg ? 'count(rd.sku_id)::int' : 'null::int'} as reg_draft,
         ${hasOutbox ? 'count(ow.sku_id)::int' : 'null::int'} as card_waiting,
         ${hasOutbox ? 'count(oc.sku_id)::int' : 'null::int'} as card_conflict,
-        ${run ? 'count(dc.code_norm)::int' : 'null::int'} as diff
+        ${run ? 'count(dc.code_norm)::int' : 'null::int'} as diff,
+        ${hasReg ? `(select count(*)::int from core.skus k join rx on rx.sku_id = k.sku_id where k.company_id = $1)` : 'null::int'} as n_cancelled
       from core.skus s
       left join c on c.sku_id = s.sku_id
-      ${hasReg ? 'left join rd on rd.sku_id = s.sku_id' : ''}
+      ${hasReg ? 'left join rd on rd.sku_id = s.sku_id left join rx on rx.sku_id = s.sku_id' : ''}
       ${hasOutbox ? 'left join ow on ow.sku_id = s.sku_id left join oc on oc.sku_id = s.sku_id' : ''}
       ${run ? 'left join dc on dc.code_norm = s.code_norm' : ''}
-     where s.company_id = $1`, params)).rows[0];
+     where s.company_id = $1${hasReg ? ' and rx.sku_id is null' : ''}`, params)).rows[0];   // 🆕 0071: 札の数もふだんの一覧と同じ (やめた商品は数えない・n_cancelled に別に)
   return r;
 }
 

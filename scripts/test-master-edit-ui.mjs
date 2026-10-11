@@ -614,7 +614,9 @@ await ta('[19] 詳細検索の項目 (10/5): JAN (複数)・仕入先 (0001 と 
   assert.deepEqual(await q({ parents: 'K001' }), ['k001', 'k002'], '代表 k001 = 子 k002 と代表そのもの');
   assert.deepEqual(await q({ name: 'ﾊﾁﾐﾂ' }), ['k001', 'k002', 'k003']);
   assert.deepEqual(await q({ cost_min: '305', cost_max: '310' }), ['k002']);
-  assert.deepEqual(await q({ price_min: '1,200' }), ['ui-card-1'], '売価の範囲 (カンマ付きでも)');
+  // 🆕 0071: 登録をやめた商品 (ui-card-1 = [13] でやめた) はふだんの一覧に出さない・「やめた」で絞ると出る
+  assert.deepEqual(await q({ price_min: '1,200' }), [], '売価の範囲 (カンマ付きでも)・やめた商品はふだん出さない');
+  assert.deepEqual(await q({ price_min: '1,200', reg: 'cancelled' }), ['ui-card-1'], '売価の範囲 (カンマ付きでも)・「やめた」で絞ると出る');
   assert.deepEqual(await q({ name: 'はちみつ', tax: '8' }), ['k001', 'k002', 'k003']);
   assert.deepEqual(await q({ name: 'はちみつ', tax: '10' }), []);
   assert.deepEqual(await q({ name: 'はちみつ', sales: '1' }), ['k001', 'k002', 'k003']);

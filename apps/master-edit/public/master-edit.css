@@ -945,3 +945,15 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 .modal.vops .opttbl .in { width: 100%; }
 .modal.vops .f { grid-template-columns: 140px minmax(0, 1fr); }
 @media (max-width: 760px) { .modal.vops .f { grid-template-columns: minmax(0, 1fr); } .modal.vops .btn, .modal.vops .in { min-height: 44px; } }
+
+/* 🆕 0071: 新商品の下書きを消す (商品の画面の「下書きです」の帯の下・_deldraft.ejs)。ふだんは控えめ (細い線) = 押す前に「下書き」と「消す」の関係が分かる場所に置く */
+.deldraft { display: flex; gap: 12px; align-items: flex-start; margin: -6px 0 16px; padding: 10px 14px; border-radius: 12px; border: 1px dashed rgba(255, 112, 133, 0.28); background: rgba(255, 112, 133, 0.03); }
+.deldraft > .ic { color: var(--err); flex: none; margin-top: 2px; opacity: 0.8; }
+.deldraft .t { font-size: 14px; color: var(--text); }
+.deldraft .hint { margin-top: 2px; }
+.deldraft-why { margin: 6px 0 0 18px; font-size: 13.5px; color: var(--text2); }
+.deldraft .btn.ghosty { flex: none; align-self: center; }
+.deldraft.can:hover { border-color: rgba(255, 112, 133, 0.5); }
+#deldraft-bg .lab2 { font-size: 13px; color: var(--muted); }
+#deldraft-bg .msgline { margin-top: 8px; }
+@media (max-width: 760px) { .deldraft { flex-wrap: wrap; } .deldraft .btn.ghosty { width: 100%; min-height: 44px; } #deldraft-bg .btn, #deldraft-bg .in { min-height: 44px; } }
