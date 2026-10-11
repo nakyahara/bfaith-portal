@@ -327,6 +327,27 @@ await ta('[C4] 一覧 (CLI の dry-run): null = 候補 (available で数えた�
   assert.match(e?.message ?? '', /invalid_input/);
 });
 
+await ta('[C5] #1683 Codex R3 High: 削除済みの出品に残る構成も断る (どの出品か理由に出す・動かす関数も断る) / 構成を外した後は通る (取引の中で巻き戻す)', async () => {
+  await pg.query('begin');
+  try {
+    const lid = (await pg.query(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'rakuten', '', 'r-del-g10', 'deleted') returning listing_id`)).rows[0].listing_id;
+    await pg.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type) values (1, $1, $2, 1, 0, 'manual', 'human')`, [lid, await sid('g10')]);
+    const c = await check('g10');
+    assert.deepEqual(reasons(c), ['listing_component_deleted']);
+    assert.match(c.problems[0].text, /削除済みの出品 rakuten:r-del-g10 の構成に入っている/);
+    await pg.query('savepoint s');
+    const e = await errOf(async () => pg.query('select ops.cancel_sku_gone_from_ne($1::uuid, $2, $3, $4::bigint)', [crypto.randomUUID(), 'naka@test', 'NE で消えた', await sid('g10')]));
+    assert.match(e?.message ?? '', /not_gone_from_ne: g10 .*削除済みの出品 rakuten:r-del-g10/);
+    await pg.query('rollback to savepoint s');
+    assert.equal(G.GONE_REASON_WORDS.listing_component_deleted, '削除済みの出品の構成に入っている');
+    await pg.query('delete from core.listing_components where listing_id = $1', [lid]);   // 構成を外す
+    assert.equal((await check('g10')).ok, true);
+    const r = (await pg.query('select ops.cancel_sku_gone_from_ne($1::uuid, $2, $3, $4::bigint) as r', [crypto.randomUUID(), 'naka@test', 'NE で消えた', await sid('g10')])).rows[0].r;
+    assert.equal(r.state, 'cancelled');
+  } finally { await pg.query('rollback'); }
+  assert.equal(await regOf('g10'), 'available');
+});
+
 // ═══════════ [T] transition を直に ═══════════
 console.log('[T] ops.transition_sku_registration を直に');
 await ta('[T1] available → cancelled は約束なしでは断る (持ち主・master_ops)・呼び手の根拠は受けない・ほかの行き先は今までどおり断る', async () => {

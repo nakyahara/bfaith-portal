@@ -22,7 +22,7 @@
 --        登録の状態 available・単品 (セット・例外は外す)・数えた一番新しい完全な取得の完了が ops.ne_gone_fresh_hours() 時間の中・その取得にも無い・
 --        続けて無い日数 >= ops.ne_gone_required_runs() (= 3 日)・今の NE のコードの台帳 (0041) にも無い・生きた NE 登録の CSV の品目 (built / issued /
 --        import_declared / partial) が無い・ほかのセットの構成品 (core.sku_components) でない・開いている構成の依頼に入っていない・
---        販路の構成 (core.listing_components・削除した出品を除く = Amazon の対応ほか) に使われていない・その商品がほかの商品の親 (代表) でない
+--        販路の構成 (core.listing_components・🆕 #1683 R3: 削除済みの出品も = Amazon の対応ほか) に使われていない・その商品がほかの商品の親 (代表) でない
 --      ops.sku_gone_from_ne_list(コード | null) = CLI の dry-run 用 (null = 候補 = available で、一番新しい完全な取得に無い SKU)
 --   3. 登録の状態の行き先に available → cancelled を 1 つ足す (ops.registration_transition_allowed = 0052 の版から写して 1 行足しただけ)。
 --      ops.transition_sku_registration (0063 の版から写して足しただけ): available → cancelled は「NE から消えた」の約束の中だけ
@@ -224,7 +224,7 @@ revoke all on function ops.record_parent_gate(text, jsonb, text, text, jsonb) fr
  *   absent_since: { result_id, compare_run_id, products_complete_at, day } (続けて無いの最初の取得),
  *   evidence (ok のときだけ = 登録の状態の記録の根拠) }
  * reason: no_sku / not_company / not_available / not_single / no_trusted_fetch / fetch_old / in_ne_latest / absent_short / in_ne_codes /
- *         live_file / set_component / component_request / listing_component / parent_of_others
+ *         live_file / set_component / component_request / listing_component / listing_component_deleted (#1683 R3) / parent_of_others
  */
 create function ops.sku_gone_from_ne_check(p_sku_id bigint) returns jsonb
   language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
@@ -309,6 +309,15 @@ begin
            where lc.sku_id = s.sku_id and l.status <> 'deleted' order by 1 limit 6) x;
   if v_txt is not null then
     v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'listing_component', 'text', pg_catalog.format('販路の出品の構成に使われている (%s)', v_txt)));
+  end if;
+  -- 🆕 #1683 Codex R3 High: 削除済み (status = deleted) の出品に残る構成も断る = 後で出品が戻る (夜間ロードが active に戻す) と、やめた商品が使われてしまう。
+  --   どの出品か分かるように出す (先に構成を外す = Amazon の対応の墓標・モールの対応を直す)
+  select pg_catalog.string_agg(x.w, '・' order by x.w) into v_txt
+    from (select l.mall || ':' || l.listing_code as w from core.listing_components lc join core.listings l on l.listing_id = lc.listing_id
+           where lc.sku_id = s.sku_id and l.status = 'deleted' order by 1 limit 6) x;
+  if v_txt is not null then
+    v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'listing_component_deleted',
+      'text', pg_catalog.format('削除済みの出品 %s の構成に入っている (出品が戻るとやめた商品が使われる = 先にその出品の構成から外す)', v_txt)));
   end if;
   if s.product_id is not null and exists (select 1 from core.products c where c.parent_product_id = s.product_id and c.product_id <> s.product_id) then
     v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'parent_of_others', 'text', 'この商品がほかの商品の代表 (親) になっている'));

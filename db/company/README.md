@@ -683,7 +683,7 @@ available から先に進む道が無かった (0052 の行き先の決まり) �
   **数えるのは JST の取得の日** (1 日に何回取得しても 1 日 = 「3 回」= 3 日)。ある取得で消える。記録しなかった回 (確かめられない取得) は数えない・途切れさせない。
   0041 の `ops.master_ne_codes` は最新の 1 回の入れ替え (回ごとの記録が無い・取得の信用を見ない) = 証拠にせず、**今そこにあれば断る**ための守りだけ。0058 の `master_ne_code_history` は「一度でも見た」= 使えない
 - **確かめ** `ops.sku_gone_from_ne_check(sku_id)` (読むだけ・watcher / master_edit / master_ops): 登録の状態 available・単品・数えた一番新しい取得の**取得の完了の時刻** (単品とセットの古い方) が 36 時間 (`ops.ne_gone_fresh_hours()`) の中・その取得にも無い・続けて 3 日 (`ops.ne_gone_required_runs()`) 以上・今の NE のコードの台帳に無い・
-  生きた NE 登録の CSV の品目 (built / issued / import_declared / partial) が無い・ほかのセットの構成品 (`core.sku_components`) でない・開いている構成の依頼に無い・販路の出品の構成 (`core.listing_components`・削除した出品を除く) に無い・ほかの商品の親でない。
+  生きた NE 登録の CSV の品目 (built / issued / import_declared / partial) が無い・ほかのセットの構成品 (`core.sku_components`) でない・開いている構成の依頼に無い・販路の出品の構成 (`core.listing_components`・🆕 #1683 Codex R3 High: **削除済みの出品の構成も** = 出品が戻るとやめた商品が使われる・理由 `listing_component_deleted` にどの出品かを出す) に無い・ほかの商品の親でない。
   `ops.sku_gone_from_ne_list(codes | null)` = CLI の dry-run (null = 候補)
 - **動かす** `ops.cancel_sku_gone_from_ne(request_id, 人, 理由, sku_id)` (security definer・master_edit = 画面 / master_ops = CLI): 鍵 (新商品の許可の共有 → 段階 → マスタの書き込みの共有 → SKU → NE のコードの共有 → **登録の状態の行 (排他)** → SKU の行) → 段階 new_open・持ち主表 = DB の active → 確かめ →
   約束 (0051 の表・操作 `sku_gone_cancel`) → 登録の状態 → 保存の記録 done。押し直し = 前の答え。`ops.transition_sku_registration` (0063 の版から写して足しただけ) は available → cancelled を**この約束の中だけ**・確かめが ok のときだけ通し、根拠を DB が作る (master_ops が直に呼んでも断る = `gone_session_required`)
