@@ -66,7 +66,7 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
-import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS } from '../../lib/master-variation.mjs';
+import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows } from '../../lib/master-variation.mjs';
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
@@ -911,7 +911,7 @@ router.post('/api/amazon/delete', (req, res) => {
 
 // ─── NE 登録の CSV (⑤-2b) ───
 router.get('/reg-csv', (req, res) => withPgPage(req, res, async (db, dbError) => {
-  const summary = db ? await regSummary(db, { nowMs: clock() }) : null;
+  const summary = db ? await regSummary(db, { nowMs: clock(), maxRows: variationMaxFileRows() }) : null;
   const phase = await readPhaseView(db);
   const gate = approverGate(req);
   res.render(view('reg-csv.ejs'), {
@@ -919,7 +919,7 @@ router.get('/reg-csv', (req, res) => withPgPage(req, res, async (db, dbError) =>
     REG_STATES, ITEM_STATES: REG_ITEM_STATES, RESULTS: REG_RESULTS, EXPORT_STATES: REG_EXPORT_STATES, CLOSE_REASONS: REG_CLOSE_REASONS, CHECK_OUTCOMES: REG_CHECK_OUTCOMES, AUTO_BLOCKS: REG_AUTO_BLOCKS,
   });
 }));
-router.get('/api/reg-csv/summary', (req, res) => withPgApi(res, async (db) => res.json({ ok: true, ...(await regSummary(db, { nowMs: clock() })) })));
+router.get('/api/reg-csv/summary', (req, res) => withPgApi(res, async (db) => res.json({ ok: true, ...(await regSummary(db, { nowMs: clock(), maxRows: variationMaxFileRows() })) })));
 /** NE 登録の CSV の書き込み = 名簿 (MASTER_DECISION_APPROVERS) の人だけ・この画面だけのロールで */
 function regWrite(req, res, fn) {
   const gate = approverGate(req);
