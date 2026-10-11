@@ -7,7 +7,7 @@
  *   ③ 前回作らなかった組み合わせ (最初は「作らない」・押したら作る)
  *   ④ NE で作ったまとまりに足す (前からある子の文字 = コードの末尾から仮に・色の名前は空 = 人が打つ)
  *   ⑤ 40 色 × 3 サイズ = 120 (上限ちょうど・保存できる)
- *   ⑥ 上限を超える (45 色) = 保存を止め、色そのものを分ける → 保存 → 「残りを足す」→ 同じまとまりに続けて保存 / NE 登録の CSV は回ごと
+ *   ⑥ 上限を超える (45 色) = 保存を止め、色そのものを分ける → 保存 → 「残りを足す」→ 同じまとまりに続けて保存 / NE 登録の CSV = 1 回目の CSV を先に作ってから残りを足す・未処理の回が重なると 1 つのファイル
  *   ⑦ 誤り (「-」の付け忘れ = 誤り + 「- を付ける」・重なり・JAN の形とほかの商品の JAN・まとまりのコードがもうある = 「このまとまりに足す」)
  *   ⑧ 空から / 切替の前 (products.parent が load = まとまりの札と欄が出ない・単品とセットは今までどおり)
  *   + スマホの幅 (390・360): 横にはみ出さない・押す所は 44px 以上・種類は縦・手順の帯「4/7 選択肢」・キーボードの間は下の帯を小さく・30 件をこえたら「パソコンがおすすめ」
@@ -204,6 +204,7 @@ await ta('[①] 新しいまとまり (色 4 × サイズ 4): コードのでき
   await shot(p, '3-kids', '#sec-kids');
   const r = await saveViaConfirm(p);
   assert.match(r, /15 件を下書きにしました/);
+  assert.match(r, /この回の 15 件を 1 つのファイルにして NE に取り込みます \(決まり = 1 回目の CSV を先に作ってから残りを足す。未処理の回が重なると 1 つのファイルにまとまる\)/, '残りが無くても決まりの言葉を出す');
   assert.match(r, /出品カードはまとまりで 1 枚 \(NE の写し待ち\) · カード作成済み/, 'まとまりのカード (#1675) を保存の後に 1 回試す: ' + r);
   assert.equal((await one("select status from ops.product_hub_outbox where group_product_id = (select group_product_id from ops.variation_group_codes where code_norm = 'hakama')")).status, 'done');
   assert.equal((await kidsOf('hakama')).length, 15);
@@ -297,7 +298,7 @@ await ta('[⑤] 40 色 × 3 サイズ = 120 (上限ちょうど): 「40 × 3 = 1
   assert.equal((await kidsOf('roomwear')).length, 120);
 });
 
-await ta('[⑥] 上限を超える (45 色 × 3 = 135): 保存を止める・色そのものを分ける (40 色 = 120 件 + 残り 5 色)・保存 → 「残りの 5 色を足す」→ 同じまとまりに 15 件 / NE 登録の CSV の画面 = 回ごと', async (p) => {
+await ta('[⑥] 上限を超える (45 色 × 3 = 135): 保存を止める・色そのものを分ける (40 色 = 120 件 + 残り 5 色)・保存 → 「残りの 5 色を足す」→ 同じまとまりに 15 件 (まだ CSV にしていない 120 件と 1 つのファイル) / NE 登録の CSV の画面 = 未処理の 2 回が 1 つのファイルにまとまる', async (p) => {
   await p.goto(B + '/new?kind=variation');
   await newGroup(p, { code: 'roomwear2', name: 'ルームウェア 2', h: 'カラー', v: 'サイズ', hl: colorLines(45), vl: 'S / -S\nM / -M\nL / -L' });
   await fillCommon(p, { price: '2980', cost: '1200', sales: '3', sup: '0034', months: '2', ship: 'A1' });
@@ -322,6 +323,9 @@ await ta('[⑥] 上限を超える (45 色 × 3 = 135): 保存を止める・色
   assert.match(await p.innerText('#opt-eq .vpend'), /まだ NE 登録の CSV にしていない子が 120 件あります = 今回の分と 1 つのファイルにまとまります/);
   const r2 = await saveViaConfirm(p);
   assert.match(r2, /15 件を下書きにしました/);
+  // 保存の後の案内 = まだ CSV にしていない 120 件と今回の 15 件を合わせて 1 つのファイル (#1679 Codex R3 Low)
+  assert.match(r2, /まだ CSV にしていない 120 件と今回の 15 件を合わせて 1 つのファイル \(135 行\) にして NE に取り込みます \(決まり = 1 回目の CSV を先に作ってから残りを足す。未処理の回が重なると 1 つのファイルにまとまる\)/);
+  assert.doesNotMatch(r2, /この回の 15 件/);
   assert.equal((await kidsOf('roomwear2')).length, 135);
   // NE 登録の CSV の画面: まとまり → 回 1 (120)・回 2 (15)
   await p.goto(B + '/reg-csv');
