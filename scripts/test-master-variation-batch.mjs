@@ -12,7 +12,7 @@
  *     NE で作ったまとまり (最初の 1 回 = 前からある子の選択肢も記録・子は増えない)・単品が代表のまとまり
  *   S 探す・読む・確かめる: コード・名前・子の商品コードで探す・まとまりでない単品は出さない・今ある子の値・確かめの答え (重なり・product-hub の下書き・JAN)
  *   E 商品の画面の保存 (saveSku) に代表の欄は無い = parent_code は 400 parent_not_editable
- *   C NE 登録の CSV: まとまりの子は回ごとに並ぶ・回ごとに 1 ファイル (代表商品コード = まとまりのコード・JAN = empty)・2 つの回がどちらもまだ = 回ごとには作れない (まとめて 1 ファイル)
+ *   C NE 登録の CSV: まとまりの子は回ごとに並ぶ・1 回目の CSV を先に作ってから残りを足す・未処理の回が重なると 1 つのファイル (代表商品コード = まとまりのコード・JAN = empty)・1 つのファイルの上限を超える登録は断る
  * 使い方: node scripts/test-master-variation-batch.mjs
  */
 import assert from 'node:assert/strict';
@@ -360,12 +360,13 @@ await ta('[E1] 商品の画面の保存 (saveSku) に代表の欄は無い: pare
 });
 
 console.log('\nNE 登録の CSV');
-await ta('[C1] まとまりの子は回ごとに並ぶ (ふつうの候補には出さない)・回ごとに 1 ファイル (ne-reg-variation-v1・代表商品コード = まとまりのコード・JAN = empty)・止まる子が居る回は作れない', async () => {
+await ta('[C1] まとまりの子は回ごとに並ぶ (ふつうの候補には出さない)・1 回目の CSV を先に作れば回ごとのファイル・未処理の回が重なると 1 つのファイル (ne-reg-variation-v1・代表商品コード = まとまりのコード・JAN = empty)・止まる子が居る回は作れない', async () => {
   const s0 = await asEditor(() => G.regSummary(db, { nowMs: NOW_MS }));
   assert.ok(!s0.candidates.some((c) => /^hakama-/.test(c.code)), 'まとまりの子はふつうの候補に出さない');
   const hk = s0.variation.find((g) => g.group_code === 'hakama');
   assert.deepEqual(hk.rounds.map((r) => [r.no, r.kids.length, r.pending]), [[1, 15, 15], [2, 5, 5]]);
   assert.equal(hk.pending_rounds, 2);
+  assert.deepEqual([hk.pending_total, hk.too_many, s0.max_rows], [20, false, G.REG_MAX_ROWS]);
   // 2 つの回がどちらもまだ = 回ごとには作れない (DB の決まり = まとまりの NE 登録待ちの子は全部 1 つのファイル)
   const e = await errOf(asEditor(() => G.buildRegExport(db, { actor: 'naka@test', kind: 'products', variation: true, codes: hk.rounds[0].codes, requestId: uuid() }, { open: true, nowMs: NOW_MS })));
   assert.match(String(e && e.message), /variation_incomplete|まとまりで 1 ファイル/);
@@ -376,7 +377,7 @@ await ta('[C1] まとまりの子は回ごとに並ぶ (ふつうの候補には
   const rows = await q('select r.cells from ops.ne_reg_export_rows r where r.export_id = $1 order by r.row_no', [b.export.export_id]);
   assert.equal(rows.length, 20);
   assert.ok(rows.every((x) => x.cells[7] === 'hakama' && x.cells[8] === 'empty'), JSON.stringify(rows[0]));
-  // 回ごとに 1 ファイル: 新しいまとまり (1 回目を保存 → 1 回目のファイル → 2 回目を保存 → 2 回目のファイル)
+  // 1 回目の CSV を先に作ってから残りを足す: 新しいまとまり (1 回目を保存 → 1 回目のファイル → 2 回目を保存 → 2 回目のファイル)
   const one1 = { group: { mode: 'new', code: 'roomwear', name: 'ルームウェア' }, axes: [{ axis: 1, name: 'カラー' }], options: [{ axis: 1, code: '-WH', name: 'ホワイト' }],
     children: [{ code: 'roomwear-WH', choices: { 1: '-WH' }, name: 'ルームウェア【ホワイト】' }], values: VALUES };
   const r1 = await reg(one1);
@@ -405,6 +406,40 @@ await ta('[C1] まとまりの子は回ごとに並ぶ (ふつうの候補には
   const nc = s4.variation.find((g) => g.group_code === 'nocost');
   assert.equal(nc.rounds[0].buildable, false);
   assert.deepEqual(nc.rounds[0].kids.map((k) => [k.code, k.blockers.some((b) => /原価が無い/.test(b))]), [['nocost-A', false], ['nocost-B', true]]);
+});
+
+await ta('[C2] 未処理の子 (CSV にしていない) + 今回 が 1 つのファイルの上限を超える登録は断る (何も保存しない)・先に CSV を作れば足せる・NE 登録の CSV の画面の数 (too_many)', async () => {
+  V.__setMaxFileRowsForTest(3);
+  try {
+    assert.equal(V.variationMaxFileRows(), 3);
+    const opt = (c) => ({ axis: 1, code: `-${c}`, name: `色${c}` });
+    const kid = (c) => ({ code: `cap-${c}`, choices: { 1: `-${c}` }, name: `上限【色${c}】` });
+    const r1 = await reg({ group: { mode: 'new', code: 'cap', name: '上限' }, axes: [{ axis: 1, name: 'カラー' }], options: ['A', 'B'].map(opt), children: ['A', 'B'].map(kid), values: VALUES });
+    const gid = r1.group_product_id;
+    const g1 = await V.readVariationGroup(db, gid);
+    assert.deepEqual([g1.pending_unfiled, g1.max_file_rows], [2, 3]);
+    // 2 件まだ + 2 件 = 4 > 3 = 断る (何も保存しない・どれだけ待っているかを返す)
+    const before = await counts();
+    const e = await rejects(reg({ group: { mode: 'add', product_id: gid }, options: ['C', 'D'].map(opt), children: ['C', 'D'].map(kid), values: VALUES }), 409, 'variation_pending_too_many');
+    assert.deepEqual([e.extra.field, e.extra.pending], ['children', 2]);
+    assert.match(e.message, /先に「NE 登録の CSV」で今ある分のファイルを作ってから/);
+    assert.deepEqual(await counts(), before);
+    // ちょうど上限 (2 + 1 = 3) は通る
+    await reg({ group: { mode: 'add', product_id: gid }, options: [opt('C')], children: [kid('C')], values: VALUES });
+    // NE 登録の CSV の画面の数: 3 件まだ = 上限ちょうど = 作れる / 上限が 2 なら too_many
+    const sOk = await asEditor(() => G.regSummary(db, { nowMs: NOW_MS, maxRows: 3 }));
+    const cOk = sOk.variation.find((g) => g.group_code === 'cap');
+    assert.deepEqual([cOk.pending_total, cOk.too_many, cOk.pending_rounds, sOk.max_rows], [3, false, 2, 3]);
+    const sNg = await asEditor(() => G.regSummary(db, { nowMs: NOW_MS, maxRows: 2 }));
+    assert.deepEqual([sNg.variation.find((g) => g.group_code === 'cap').too_many, sNg.max_rows], [true, 2]);
+    // 先に今ある分の CSV を作る → 未処理 0 → もう一度足せる
+    await asEditor(() => G.buildRegExport(db, { actor: 'naka@test', kind: 'products', variation: true, codes: cOk.rounds.flatMap((r) => r.codes), requestId: uuid() }, { open: true, nowMs: NOW_MS }));
+    assert.equal((await V.readVariationGroup(db, gid)).pending_unfiled, 0);
+    const r4 = await reg({ group: { mode: 'add', product_id: gid }, options: ['D', 'E'].map(opt), children: ['D', 'E'].map(kid), values: VALUES });
+    assert.equal(r4.ok, true);
+    assert.equal((await V.readVariationGroup(db, gid)).pending_unfiled, 2);
+  } finally { V.__setMaxFileRowsForTest(null); }
+  assert.equal(V.variationMaxFileRows(), G.REG_MAX_ROWS);
 });
 
 console.log(`\n${passed} ok`);

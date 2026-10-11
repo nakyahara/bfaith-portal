@@ -87,6 +87,7 @@ await ta('[L2] 断る: 見た revision が古い (409 version_conflict)・選択
 
 console.log('\n子の廃止');
 await ta('[C1] 下書きの子を廃止 = cancelled・revision + 1・知らせの廃止した子・押し直し = 前の答え / 理由が要る (400)・まとまりの子でない (409)', async () => {
+  const pend0 = (await V.readVariationGroup(db, GID)).pending_unfiled;
   const rev = await revOf(GID);
   const er = await rejects(op(V.cancelVariationChild, { code: 'blanket-fl-BE-S', reason: '' }), 400, 'invalid_input');
   assert.equal(er.extra.field, 'reason', '画面の理由の欄へ (DB に送る前に断る)');
@@ -104,6 +105,9 @@ await ta('[C1] 下書きの子を廃止 = cancelled・revision + 1・知らせ�
   // 今の画面: 廃止した組み合わせは「今ある」(作り直さない = コードは使い回さない)
   const g = await V.readVariationGroup(db, GID);
   assert.ok(g.children.some((k) => k.code === 'blanket-fl-BE-S' && k.cancelled));
+  // 廃止 = まだ CSV にしていない子が減る (NE 登録の CSV の 1 ファイルの上限を超えたときの手順 ① = #1679 Codex R2 Medium 2)
+  assert.ok(pend0 >= 1);
+  assert.equal(g.pending_unfiled, pend0 - 1);
 });
 
 await ta('[C2] 生きている NE 登録の CSV がある子 = 409 live_file / NE に一度でも現れた子 = 409 seen_in_ne (どちらも何もしない)', async () => {

@@ -117,6 +117,7 @@
     var combos = new Set();
     g.children.forEach(function (k) { if (k.choices) combos.add(norm(k.choices['1']) + '|' + norm(k.choices['2'] || '')); });
     return { id: g.product_id, code: g.code, name: g.name, kind: g.kind, source: g.source, revision: g.revision, axes: axes,
+      pendingUnfiled: Number(g.pending_unfiled) || 0, maxFileRows: Number(g.max_file_rows) || 1000,
       kids: active.map(function (k) { return k.code; }), kidRows: active, allCodes: new Set(g.children.map(function (k) { return norm(k.code); })), combos: combos,
       cancelled: g.children.filter(function (k) { return k.cancelled; }).map(function (k) { return k.code; }) };
   }
@@ -269,6 +270,10 @@
     var live = kids.filter(function (k) { return k.inc; });
     var n = live.length;
     if (kids.length && !n) Pi(6, 'miss', '作る子 (1 つ以上)', '#sec-kids');
+    // まだ NE 登録の CSV にしていない子 + 今回 が 1 つのファイルの上限を超える = 先に今ある分の CSV を作ってもらう (サーバーも断る)
+    if (pk && n && pk.pendingUnfiled + n > pk.maxFileRows) {
+      Pi(6, 'count', 'このまとまりには、まだ NE 登録の CSV にしていない子が ' + pk.pendingUnfiled + ' 件あります。今回の ' + n + ' 件と合わせると ' + (pk.pendingUnfiled + n) + ' 件で、1 つのファイル (' + pk.maxFileRows.toLocaleString('ja-JP') + ' 行まで) にできません → 先に「NE 登録の CSV」で今ある分のファイルを作ってから足す', '#sec-kids');
+    }
     // 上限をこえたら: 外すのではなく、横の選択肢そのものを分ける案を出す
     var plan = null;
     if (n > MAX_KIDS) {
@@ -385,7 +390,8 @@
       } else {
         var prevN = m.kids.filter(function (k) { return k.prev; }).length;
         eq = '<div class="eqbar' + (over ? ' over' : '') + '"><span>新しい組み合わせ <b>' + (m.kids.length - prevN) + '</b></span>' + (prevN ? '<span class="x">+</span><span>前回は作らなかった <b>' + prevN + '</b></span>' : '')
-          + '<span class="x">→</span><span>作る <b class="tot">' + m.n + '</b> 商品</span><span class="hint">· 今ある ' + m.pk.kids.length + ' 件は変えません</span></div>';
+          + '<span class="x">→</span><span>作る <b class="tot">' + m.n + '</b> 商品</span><span class="hint">· 今ある ' + m.pk.kids.length + ' 件は変えません</span>'
+          + (m.pk.pendingUnfiled ? '<span class="hint vpend" style="flex-basis:100%">' + icon('info', 's') + ' まだ NE 登録の CSV にしていない子が ' + m.pk.pendingUnfiled + ' 件あります = 今回の分と 1 つのファイルにまとまります (先に CSV を作れば分けられます)</span>' : '') + '</div>';
       }
     }
     $('#opt-eq').innerHTML = eq;
@@ -1058,7 +1064,7 @@
           var po = x.j.order_settings;
           $('#result').innerHTML = '<div class="result ok"><div class="rt">' + icon('check', 's') + ' ' + kids.length + ' 件を下書きにしました' + (x.j.replayed ? ' (前の同じ保存の結果)' : '') + '</div><ul>'
             + '<li>まとまり ' + esc(x.j.group_code) + (x.j.group_created ? ' を作りました' : ' に足しました (今ある ' + (m.pk ? m.pk.kids.length : 0) + ' 件は変更なし)') + ' (軸・選択肢も一緒に記録)</li>'
-            + '<li>次は「NE 登録の CSV」で、この回の ' + kids.length + ' 件を 1 ファイルにして NE に取り込みます' + (S.nextOpts.length ? ' (回ごとに 1 ファイル = 残りを足す前に、この回のファイルを作っておくと分けられます)' : '') + '</li>'
+            + '<li>次は「NE 登録の CSV」で、この回の ' + kids.length + ' 件を 1 ファイルにして NE に取り込みます' + (S.nextOpts.length ? ' (1 回目の CSV を先に作ってから残りを足してください。未処理の回が重なると 1 つのファイルにまとまります)' : '') + '</li>'
             + '<li>出品カードはまとまりで 1 枚 (NE の写し待ち)' + (x.j.card ? ' · ' + esc(x.j.card.label) + (x.j.card.status === 'done' ? '' : ' (product-hub のボードを開くと続きを作ります)') : '') + '</li>'
             + (po ? (po.ok ? '<li>発注の設定を ' + po.written + ' 件に入れました</li>' : '<li style="color:var(--warn)">発注の設定だけ ' + po.failed.length + ' 件入れられませんでした (' + esc(po.failed.slice(0, 3).map(function (f) { return f.code; }).join('・')) + ')。商品の画面の「発注の設定」で入れてください</li>') : '')
             + '</ul><div class="kidchips" style="margin:6px 0 10px">' + kids.slice(0, 12).map(function (k) { return '<a class="compchip" href="' + BASE + '/sku/' + encodeURIComponent(k.code) + '"><span class="mono">' + esc(k.code) + '</span></a>'; }).join('') + (kids.length > 12 ? '<span class="hint">… ほか ' + (kids.length - 12) + ' 件</span>' : '') + '</div>'
