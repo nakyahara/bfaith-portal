@@ -10,7 +10,7 @@
   <div class="grow">
     <% if (delCan) { %>
       <div class="t">入れ間違い・発売中止なら、この下書きを消せます</div>
-      <div class="hint">NE・ロジザード・モールにはまだ何もありません。消すと「やめた」になり、一覧に出なくなります (記録は残ります)。値を直すだけなら、消さずにこの画面で直してください。</div>
+      <div class="hint">NE にはまだ配っていません (ロジザードの商品マスタへ出す CSV も NE にある商品だけ = この下書きは出していません)。消すと「やめた」になり、一覧に出なくなります (記録は残ります)。値を直すだけなら、消さずにこの画面で直してください。</div>
     <% } else if (D.variation) { %>
       <div class="t">この下書きは色違い・サイズ違いのまとまりの子です</div>
       <div class="hint">消すときは、上の「基本」の「このまとまりから外す (廃止)」を使います (まとまりのカードも一緒に直ります)。</div>
@@ -32,6 +32,7 @@
   <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="deldraft-t" aria-describedby="deldraft-d">
     <h2 id="deldraft-t"><svg class="ic l" aria-hidden="true"><use href="#i-warn"/></svg><span class="mono"><%= c.code %></span> の下書きを消します</h2>
     <div class="hint" id="deldraft-d" style="color:var(--text2)">登録の状態が「やめた」になり、一覧に出なくなります。<b>元には戻せません。このコードはもう使えません</b> (登録し直すときは別のコードで)。NE・ロジザード・モールには何もしません。</div>
+    <div class="hint" style="margin-top:6px">消した後に product-hub に出品カードが出てきたら (ちょうど作っていたときだけ)、product-hub でそのカードを「除外」にしてください。</div>
     <% if (D.will.length) { %>
     <div class="lab2" style="margin-top:12px">一緒に片付けるもの</div>
     <ul id="deldraft-will"><% for (const w of D.will) { %><li><%= w %></li><% } %></ul>

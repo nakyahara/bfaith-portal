@@ -4,7 +4,7 @@
  * Company DB = PGlite (scripts/fixtures/master-variation-db.mjs = 切替の後・持ち主は全部 company・今日の照合の回・新規開始の許可・代表の数えの記録)。
  * 書き込みは画面のロール master_edit (本物の関数の権限)。product-hub = 一時の DATA_DIR の SQLite (本物の取り込み・本物の除外)。
  * 固定する契約:
- *   [M] migration の写し: ops.master_write_allowed (0067)・core.guard_master_edit_jan (0053) は前の最新の版から写して「🆕 0071」の行だけ足した
+ *   [M] migration の写し: ops.master_write_allowed (0067)・core.guard_master_edit_jan (0053)・ops.transition_sku_registration (0070 = #1683) は前の最新の版から写して「🆕 0071」の行だけ足した
  *       (印の行を外すと前の版と 1 字も違わない)・約束の操作の CHECK = 前の最新の CHECK の全部 (+ 0070 の sku_gone_cancel) + sku_draft_cancel・
  *       security definer の関数は search_path = pg_catalog, pg_temp・public の実行権なし・一時の表を使わない
  *   [C] 確かめ (ops.sku_draft_cancel_check): 消せる下書き = ok と片付けの見込み / 理由の 1 つ 1 つ (下書きでない・一度配った・NE に現れた・まとまりの子・ほかの商品の親・
@@ -13,12 +13,13 @@
  *       理由 / 確かめの窓が要る (400)・MASTER_EDIT_OPEN なし = before_cutover・無いコード = 404・もう一度 = not_cancellable・消したコードはもう使えない (code_taken)
  *   [K] 片付け: 作っただけの NE 登録の CSV を使わない (ほかの商品は作り直せる)・セットの下書きの構成の依頼を取り下げ (構成品の下書きが消せるようになる)・
  *       JAN を外す (同じ JAN で登録し直せる・変更の記録)・まだのカードの知らせ = 済み「作らない」(もう借りられない・見張りの数に入らない)・
- *       取り込んだカード = 知らせはそのまま → product-hub のカードを除外 (出品済み = そのまま・同じコードの結んでいないカード = 触らない)
+ *       取り込んだカード = DB は止めない・product-hub の除外していないカード (結んだ・同じコード・出品済みも) を数える = 画面は押せない (Codex #1688 R1 High 2・3)
+ *   [T] (Codex #1688 R1 High 1) 運用のロールが transition_sku_registration を直に呼んで下書きをやめる = 断る / 持ち主は通る / 子の廃止は通る
  *   [R] ロール: master_edit = 消す・確かめの実行だけ (登録の状態・知らせの表は直接書けない)・watcher = 確かめだけ・master_ops は消す関数を持たない・
  *       画面のロールが関数を直に呼んでも DB が同じに確かめる・JAN の守り (0053) は今までどおり (約束なしの JAN の書き込みは断る)
- *   [L] 一覧: やめた商品はふだんの一覧・札の数に出さない・「やめた」で絞る / 商品コードでぴったり探すと出る
+ *   [L] 一覧: やめた商品はふだんの一覧・札の数に出さない・「やめた」で絞る / 商品コードでぴったり探す (詳細検索・上の絞る欄) と出る
  *   [S] 画面 (本物の router): 消せる下書き = 「この下書きを消す」と窓・片付けるもの / まとまりの子 = 子の廃止へ案内 / 業務で使える商品 = 何も出さない /
- *       名簿の人だけ (403)・確かめの窓の印・通ったら product-hub のカードも除外・消した後の画面 = やめた・カードは作らない
+ *       名簿の人だけ (403)・確かめの窓の印・除外していないカード = 409 card_exists・除外すれば通る・カードを読めない = 503・消した後の画面 = やめた・カードは作らない
  *   [U] 画面の JS (Playwright・Chromium): 押す → 窓 → 理由で押せる → 消す → 読み直し = やめた / 携帯の幅で横にはみ出さない (MASTER_EDIT_UI_SKIP=1 で飛ばす)
  * 使い方: node scripts/test-master-draft-cancel.mjs
  */
@@ -93,7 +94,7 @@ const checkOps = (text, tbl) => {
 };
 
 console.log('[M] migration の写し');
-for (const [name, expectFrom] of [['ops.master_write_allowed', '0067'], ['core.guard_master_edit_jan', '0053']]) {
+for (const [name, expectFrom] of [['ops.master_write_allowed', '0067'], ['core.guard_master_edit_jan', '0053'], ['ops.transition_sku_registration', '0070']]) {
   await ta(`[M1] ${name} = ${expectFrom} の版 (前の最新) から写して 🆕 0071 の行だけ足した`, async () => {
     const src = lastDefBefore(name);
     assert.ok(src && src.startsWith(expectFrom), `前の最新の版が ${src} (期待 ${expectFrom})`);
@@ -152,7 +153,7 @@ const PHDB = await import('../apps/product-hub/db.js');
 const PH = await import('../apps/product-hub/services/cdb-card-intake.js');
 const phdb = PHDB.getDB();
 
-for (const c of ['d-ok', 'd-busy', 'd-k1', 'd-k2', 'd-k3', 'd-k4', 'd-k5', 'd-k6', 'd-comp', 'd-list', 'd-listdel', 'd-par', 'd-kid', 'd-iss', 'd-seen', 'd-l1', 'd-s1', 'd-s2', 'd-u1', 'd-u2']) await draft(c);
+for (const c of ['d-ok', 'd-busy', 'd-k1', 'd-k2', 'd-k3', 'd-k4', 'd-k5', 'd-k6', 'd-comp', 'd-list', 'd-listdel', 'd-par', 'd-kid', 'd-iss', 'd-seen', 'd-l1', 'd-s1', 'd-s2', 'd-u1', 'd-u2', 'd-t1']) await draft(c);
 await draft('d-nocard', { card: { create: false } });
 
 console.log('\n[C] 確かめ');
@@ -338,38 +339,34 @@ await ta('[K4] まだ取り込んでいないカードの知らせ = 済み「�
   assert.equal((await one(`select count(*)::int as n from ops.product_hub_outbox o join ops.master_registrations r on r.sku_id = o.sku_id where o.status <> 'done' and r.state = 'cancelled'`)).n, 0);
   assert.ok(sum >= 0);
 });
-await ta('[K5] 取り込んだカード = 知らせはそのまま (作った番号を返す) → product-hub のカードを除外・もう一度 = already・出品済み = そのまま・同じコードの結んでいないカード = 触らない', async () => {
+await ta('[K5] 取り込んだカード (知らせ done) = DB は止めない (SQLite は見えない)・product-hub の除外していないカード (結んだ・同じコードの結んでいない・出品済みも) を数える = 画面は押せない・除外すれば押せる', async () => {
   // 本物の取り込み (SQLite) で d-k5 のカードを作る
   const k5 = await sid('d-k5');
   const res = await asEditor(() => O.runCardOutbox(db, (ev) => PH.applyCdbCardEvent(ev, { db: phdb }), { skuId: k5, limit: 1 }));
   assert.equal(res[0].status, 'done', JSON.stringify(res[0]));
   const draftId = res[0].result.draft_id;
   const c = await check('d-k5');
-  assert.deepEqual([c.cleanup.card.status, c.cleanup.card.outcome, c.cleanup.card.draft_id], ['done', 'created', draftId]);
-  assert.ok(D.draftCancelView(c).will.some((w) => w.includes(`#${draftId}`) && /除外/.test(w)));
-  const r = await cancel('d-k5', '発売中止');
-  const o = await outboxOf('d-k5');
-  assert.deepEqual([o.status, o.result.outcome, o.result.draft_id], ['done', 'created', draftId], '済んだ知らせは変えない');
-  assert.equal(r.cleanup.card.draft_id, draftId);
-  // 同じコードの結んでいないカード (古いやり方で作ったカード = 別の行)。本番の SQLite は前からの重なりで正規化のコードの一意が無いことがある (db.js) = 試験の DB でも外して置く
-  phdb.exec('DROP INDEX IF EXISTS idx_product_drafts_ne_norm');
-  const other = Number(phdb.prepare("INSERT INTO product_drafts (ne_code, name) VALUES ('d-k5x', '古いカード')").run().lastInsertRowid);
-  const x = PH.excludeCdbCardsForCancelledSku({ skuId: r.sku_id, code: 'd-k5', actor: 'naka@test', reason: '発売中止' }, { db: phdb });
-  assert.deepEqual(x.cards.map((k) => [k.draft_id, k.outcome]), [[draftId, 'excluded']]);
-  assert.equal(phdb.prepare('SELECT status FROM product_drafts WHERE id = ?').get(draftId).status, 'excluded');
-  assert.match(phdb.prepare("SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'status_changed' ORDER BY id DESC").get(draftId).detail, /-> excluded \(Company DB の新商品の下書き d-k5 を消した/);
-  const y = PH.excludeCdbCardsForCancelledSku({ skuId: r.sku_id, code: 'd-k5' }, { db: phdb });
-  assert.deepEqual(y.cards.map((k) => k.outcome), ['already']);
-  // 出品済みのカード = 除外にしない (記録だけ)
+  assert.deepEqual([c.ok, c.cleanup.card.status, c.cleanup.card.outcome, c.cleanup.card.draft_id], [true, 'done', 'created', draftId]);
+  const live = () => PH.liveCdbCardsForSku({ skuId: k5, code: 'd-k5' }, { db: phdb });
+  assert.deepEqual(live().map((x) => [x.draft_id, x.linked]), [[draftId, true]]);
+  const v = D.draftCancelView(c, { cards: live() });
+  assert.deepEqual([v.show, v.canGo, v.why.map((w) => w.reason)], [true, false, ['card_exists']]);
+  assert.match(v.why[0].text, new RegExp(`#${draftId}.*除外`));
+  // 出品済み (listed) でも数える (除外していない)
   phdb.prepare("UPDATE product_drafts SET status = 'listed' WHERE id = ?").run(draftId);
-  const z = PH.excludeCdbCardsForCancelledSku({ skuId: r.sku_id, code: 'd-k5' }, { db: phdb });
-  assert.deepEqual([z.cards.map((k) => k.outcome), phdb.prepare('SELECT status FROM product_drafts WHERE id = ?').get(draftId).status], [['kept_listed'], 'listed']);
-  // 違うコードのカード = 知らせない / 同じコード (大文字・前後の空白だけ違う) の結んでいないカード = 番号を知らせるだけ
-  assert.deepEqual(PH.excludeCdbCardsForCancelledSku({ skuId: r.sku_id, code: 'd-k5' }, { db: phdb }).same_code, []);
-  phdb.prepare('UPDATE product_drafts SET ne_code = ? WHERE id = ?').run(' D-K5 ', other);
-  assert.deepEqual(PH.excludeCdbCardsForCancelledSku({ skuId: r.sku_id, code: 'd-k5' }, { db: phdb }).same_code, [other]);
-  assert.equal(phdb.prepare('SELECT status FROM product_drafts WHERE id = ?').get(other).status, 'draft', '結んでいないカードは触らない');
+  assert.deepEqual(live().map((x) => x.status), ['listed']);
+  // 除外した = 数えない = 押せる
+  phdb.prepare("UPDATE product_drafts SET status = 'excluded' WHERE id = ?").run(draftId);
+  assert.deepEqual(live(), []);
+  assert.equal(D.draftCancelView(c, { cards: live() }).canGo, true);
+  // 同じコード (大文字・前後の空白だけ違う) の結んでいないカード (古いやり方で作ったカード) も数える。本番の SQLite は前からの重なりで正規化のコードの一意が無いことがある = 試験の DB でも外して置く
+  phdb.exec('DROP INDEX IF EXISTS idx_product_drafts_ne_norm');
+  const other = Number(phdb.prepare("INSERT INTO product_drafts (ne_code, name) VALUES (' D-K5 ', '古いカード')").run().lastInsertRowid);
+  assert.deepEqual(live().map((x) => [x.draft_id, x.linked]), [[other, false]]);
   phdb.prepare("UPDATE product_drafts SET status = 'excluded' WHERE id = ?").run(other);
+  // 読めない = 押せない
+  assert.deepEqual(D.draftCancelView(c, { error: 'SQLite が読めない' }).why.map((w) => w.reason), ['card_unreadable']);
+  assert.throws(() => PH.liveCdbCardsForSku({ skuId: 'x' }, { db: phdb }), /SKU の番号が不正/);
 });
 
 console.log('\n[R] ロール');
@@ -408,6 +405,26 @@ await ta('[R3] JAN の守り (0053) は今までどおり: 約束なしの画面
   assert.equal((await one(`select count(*)::int as n from core.external_ids e join core.skus k on k.product_id = e.entity_id where k.code = 'd-k6' and e.system = 'jan' and e.valid_to is null`)).n, 0);
 });
 
+await ta('[T1] (Codex #1688 R1 High 1) 運用のロール (master_ops) が ops.transition_sku_registration を直に呼んで下書きをやめる = 42501 draft_cancel_session_required / 表の持ち主は通る / 子の廃止 (約束 variation_child_cancel) は通る', async () => {
+  const k6 = await sid('d-k6');
+  const e = await errOf(asRole('master_ops', () => pg.query("select ops.transition_sku_registration($1, 'cancelled', 'human', 'ops@test', '運用でやめる')", [k6])));
+  assert.equal(e?.code, '42501', e?.message);
+  assert.match(String(e.message), /^draft_cancel_session_required/);
+  assert.equal(await regOf('d-k6'), 'draft');
+  // 画面のロールは実行権が無い (42501)
+  assert.equal((await errOf(asEditor(() => pg.query("select ops.transition_sku_registration($1, 'cancelled', 'human', 'x', '理由')", [k6]))))?.code, '42501');
+  // 表の持ち主 (migration・手の復旧) は約束を求めない
+  await pg.query("select ops.transition_sku_registration($1, 'cancelled', 'human', 'owner@test', '持ち主の手')", [await sid('d-t1')]);
+  assert.equal(await regOf('d-t1'), 'cancelled');
+  // 子の廃止 (0067) は今までどおり
+  await asEditor(() => V.registerVariationBatch(db, { actor: 'naka@test', requestId: uuid(), group: { mode: 'new', code: 'dd-grp2', name: '子の廃止の試験' }, axes: [{ axis: 1, name: 'カラー' }],
+    options: [{ axis: 1, code: '-BL', name: 'ブルー' }], children: [{ code: 'dd-grp2-BL', choices: { 1: '-BL' }, name: '子の廃止の試験【ブルー】' }],
+    values: { standard_price: '1980', cost: { jpy: '500' }, tax_rate: '0.1', sales_class: '3', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0', inbound_date_managed: '0', shipping_code: 'S01' } },
+  { open: true, shippingRates: RATES }));
+  const r = await asEditor(() => V.cancelVariationChild(db, { actor: 'naka@test', requestId: uuid(), code: 'dd-grp2-BL', reason: '作らない' }, { open: true }));
+  assert.equal(r.state, 'cancelled');
+});
+
 console.log('\n[L] 一覧');
 await ta('[L1] やめた商品はふだんの一覧・札の数に出さない・「やめた」で絞る / 商品コードでぴったり探すと出る', async () => {
   const codesOf = (r) => r.rows.map((x) => x.code);
@@ -419,6 +436,10 @@ await ta('[L1] やめた商品はふだんの一覧・札の数に出さない�
   assert.deepEqual(codesOf(exact).sort(), ['d-l1', 'd-ok']);
   assert.deepEqual(exact.notFound, []);
   assert.deepEqual([all.cancelledHidden, can.cancelledHidden, exact.cancelledHidden], [true, false, false]);
+  // 🆕 Codex #1688 R1 Medium: 上の絞る欄にコードをぴったり (大文字・全角でも) = やめた商品も出す / 一部だけ = 出さない
+  assert.deepEqual(codesOf(await listSkus(db, { q: 'D-OK' }, { now: new Date(NOW_MS) })), ['d-ok', 'd-ok2'], 'd-ok (やめた・ぴったり) と d-ok2 (下書き・一部)');
+  assert.deepEqual(codesOf(await listSkus(db, { q: 'ｄ－ｏｋ' }, { now: new Date(NOW_MS) })), ['d-ok', 'd-ok2']);
+  assert.ok(!codesOf(await listSkus(db, { q: 'd-o' }, { now: new Date(NOW_MS) })).includes('d-ok'));
   const c = await listCounts(db, { now: new Date(NOW_MS) });
   const n = (await one(`select count(*)::int as n from core.skus k join ops.master_registrations r on r.sku_id = k.sku_id where r.state = 'cancelled'`)).n;
   const total = (await one('select count(*)::int as n from core.skus where company_id = 1')).n;
@@ -438,7 +459,8 @@ RT.__setPgClientFactory(async (url) => {
   return { query: (t, p) => pg.query(t, p), end: async () => { await pg.query('set role deploy'); release(); }, on: () => {} };
 });
 RT.__setShippingRatesProvider(async () => RATES);
-RT.__setCardExcluder((input) => PH.excludeCdbCardsForCancelledSku(input, { db: phdb }));
+const liveReader = (input) => PH.liveCdbCardsForSku(input, { db: phdb });
+RT.__setLiveCardsReader(liveReader);
 let who = 'naka@test';
 const app = express();
 app.set('view engine', 'ejs');
@@ -471,7 +493,7 @@ await ta('[S1] 消せる下書き = 「この下書きを消す」と確かめ�
   assert.match(u.html, /いまは消せません[\s\S]*出品の構成に使われている/);
   assert.doesNotMatch(u.html, /me-draft-cancel\.js/);
 });
-await ta('[S2] 名簿の人だけ (403)・確かめの窓の印なし (400)・通ったら product-hub のカードも除外・消した後の画面 = やめた・カードは作らない', async () => {
+await ta('[S2] 名簿の人だけ (403)・確かめの窓の印なし (400)・product-hub に除外していないカード = 409 card_exists (画面も押せない)・除外すれば通る・知らせだけ = 通って「作らない」・カードを読めない = 503', async () => {
   who = 'other@test';
   try {
     const p0 = await page('d-s1');
@@ -479,26 +501,44 @@ await ta('[S2] 名簿の人だけ (403)・確かめの窓の印なし (400)・�
     assert.equal((await post('d-s1', { request_id: uuid(), reason: '理由', confirm: true })).status, 403);
   } finally { who = 'naka@test'; }
   assert.equal((await post('d-s1', { request_id: uuid(), reason: '理由' })).status, 400);
-  // カードを取り込んでから消す
+  // カードを取り込む → 画面は押せない・消すは 409 card_exists (何もしない)
   const s1 = await sid('d-s1');
   const res = await asEditor(() => O.runCardOutbox(db, (ev) => PH.applyCdbCardEvent(ev, { db: phdb }), { skuId: s1, limit: 1 }));
   const draftId = res[0].result.draft_id;
+  const p1 = await page('d-s1');
+  assert.doesNotMatch(p1.html, /id="deldraft-open"/);
+  assert.match(p1.html, new RegExp(`product-hub にカードがある[\\s\\S]*#${draftId}`));
+  const r0 = await post('d-s1', { request_id: uuid(), reason: '入れ間違い', confirm: true });
+  assert.deepEqual([r0.status, r0.j.reason, r0.j.cards.map((c) => c.draft_id)], [409, 'card_exists', [draftId]]);
+  assert.match(r0.j.error, /先に product-hub でカードを確かめて「除外」にしてから/);
+  assert.equal(await regOf('d-s1'), 'draft');
+  // 人が product-hub で除外した → 通る (知らせは done のまま)
+  phdb.prepare("UPDATE product_drafts SET status = 'excluded' WHERE id = ?").run(draftId);
+  assert.match((await page('d-s1')).html, /id="deldraft-open"/);
   const r = await post('d-s1', { request_id: uuid(), reason: '入れ間違い', confirm: true });
   assert.equal(r.status, 200, JSON.stringify(r.j));
-  assert.deepEqual([r.j.ok, r.j.state, r.j.product_hub.cards.map((c) => [c.draft_id, c.outcome])], [true, 'cancelled', [[draftId, 'excluded']]]);
+  assert.deepEqual([r.j.ok, r.j.state, r.j.product_hub], [true, 'cancelled', undefined]);
+  const o1 = await outboxOf('d-s1');
+  assert.deepEqual([o1.status, o1.result.outcome], ['done', 'created']);
   const after = await page('d-s1');
   assert.match(after.html, /id="cancelled-band"/);
   assert.doesNotMatch(after.html, /id="deldraft"/);
+  // まだカードになっていない知らせだけ = 通って、知らせは「作らない」で済み
   const q2 = await post('d-s2', { request_id: uuid(), reason: '発売中止', confirm: true });
-  assert.equal(q2.status, 200);
+  assert.equal(q2.status, 200, JSON.stringify(q2.j));
+  const o2 = await outboxOf('d-s2');
+  assert.deepEqual([o2.status, o2.result.outcome], ['done', 'cancelled']);
   assert.match((await page('d-s2')).html, /id="card-cancelled"/);
-  // product-hub の除外が失敗しても消したのは成功のまま (応答に知らせる)
-  RT.__setCardExcluder(() => { throw new Error('SQLite が読めない'); });
+  // product-hub のカードを読めない = 503 (消さない)・画面も押せない
+  RT.__setLiveCardsReader(() => { throw new Error('SQLite が読めない'); });
   try {
     const q3 = await post('d-u2', { request_id: uuid(), reason: '理由', confirm: true });
-    assert.deepEqual([q3.status, q3.j.ok, /除外にできませんでした/.test(q3.j.product_hub.error)], [200, true, true]);
-    assert.equal(await regOf('d-u2'), 'cancelled');
-  } finally { RT.__setCardExcluder((input) => PH.excludeCdbCardsForCancelledSku(input, { db: phdb })); }
+    assert.deepEqual([q3.status, q3.j.reason], [503, 'card_unreadable']);
+    assert.equal(await regOf('d-u2'), 'draft');
+    const pu = await page('d-u2');
+    assert.doesNotMatch(pu.html, /id="deldraft-open"/);
+    assert.match(pu.html, /product-hub のカードを読めない/);
+  } finally { RT.__setLiveCardsReader(liveReader); }
   // 断られた = 409 と文
   const n = await post('d-list', { request_id: uuid(), reason: '理由', confirm: true });
   assert.deepEqual([n.status, n.j.reason], [409, 'not_cancellable']);
@@ -511,6 +551,8 @@ await ta('[S3] 一覧 = やめた商品を出さない・札「やめた商品�
   assert.match(html, /やめた商品/);
   const r2 = await fetch(`${B}/?reg=cancelled`);
   assert.match(await r2.text(), /sku\/d-s1/);
+  const r3 = await fetch(`${B}/?q=D-S1`);
+  assert.match(await r3.text(), /sku\/d-s1/, '上の絞る欄にコードをぴったり = 出す');
 });
 
 // ═══════════ [U] 画面の JS (Playwright) ═══════════

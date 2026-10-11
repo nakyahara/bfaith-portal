@@ -271,7 +271,10 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   } else if (hasReg && !f.codes) {
     // 🆕 0071 (下書きを消す): 登録をやめた商品 (cancelled = 消した下書き・まとまりから外した子・NE から消えた) は、ふだんの一覧に出さない。
     //   「登録 = やめた」で絞ったとき (一覧の札「やめた商品」)・商品コードでぴったり探したときは出す (戻り値の cancelledHidden = 隠したか)
-    where.push(`not exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id and mr.state = 'cancelled')`);
+    //   🆕 Codex #1688 R1 Medium: 上の絞る欄 (q) にコードをぴったり打ったとき (code_norm が同じ) も、その商品は出す
+    let exact = '';
+    if (f.q) { params.push(normSku(f.q)); exact = `s.code_norm = $${params.length} or `; }
+    where.push(`(${exact}not exists (select 1 from ops.master_registrations mr where mr.sku_id = s.sku_id and mr.state = 'cancelled'))`);
   }
   const hasOutbox = await regclass(db, 'ops.product_hub_outbox');
   if (f.card) {

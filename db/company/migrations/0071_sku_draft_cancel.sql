@@ -3,7 +3,9 @@
 --    0070 (#1683・available → cancelled「NE から消えた」) の後の番号。0070 の関数・trigger は使わない・置き換えない (0070 が無い DB でも動く)。
 --    約束の操作の CHECK だけは 0070 の版 (0067 の全部 + sku_gone_cancel) に sku_draft_cancel を足した (0070 が無い DB でも CHECK が広いだけ)
 --
--- なぜ: 新商品の登録の画面で作った下書き (入れ間違い・発売中止) を消す道が無い。下書きは NE・ロジザード・モールにまだ何も無い = 消しても外には何も起きない。
+-- なぜ: 新商品の登録の画面で作った下書き (入れ間違い・発売中止) を消す道が無い。NE 登録の CSV を一度も配っていない下書きは NE に無い。
+--   ロジザードの商品マスタへ出す CSV は NE の取得の商品だけを回す (apps/master-decisions/lz-cdb.mjs の classifyForLz・scripts/company-db/lz-daily.mjs) = NE に配る前の下書きは出さない
+--   (手でロジザードに登録する道は人の決まり)。product-hub の出品カードは画面が先に読んで、除外していないカードがあれば消さない (Postgres の外)
 -- 「消す」の決め方 = 行を物理的に消さない。登録の状態を cancelled (やめた) にして、画面の一覧から隠す:
 --   ・登録の状態の行・履歴 (ops.master_registration_events)・保存の記録・約束・変更の記録 (events.master_change_events)・カードの知らせ・NE 登録の CSV の品目は
 --     どれも「消さない」の守り (DELETE の trigger・追記だけ・外部キー) がある = SKU の行を消すにはこの守りを全部外すことになる (監査が消える)
@@ -24,8 +26,9 @@
 --        b. セットの下書き自身の開いている構成の依頼 = 取り下げ (cancelled / withdrawn)。残すと夜間の昇格・0070 の「構成の依頼に入っている」に当たる
 --        c. 商品の有効な JAN = 外す (valid_to = 今)。残すと、正しいコードで登録し直すときに同じ JAN が jan_taken で断られる (その商品の SKU がこの下書きだけのとき)
 --        d. product-hub のカードの知らせ (まだ取り込んでいない = pending / failed / conflict) = 済み (done) にして結果に「作らない (下書きを消した)」= もうカードを作らない。
---           もう取り込んだ (done) = 知らせはそのまま (カードは画面の lib が SQLite で「除外」にする = Postgres と SQLite は 1 つの取引にできない)
---        e. 登録の状態 draft → cancelled (0052 の行き先の地図に前からある・ops.transition_sku_registration の今の版をそのまま呼ぶ = 人の理由・根拠は DB が作った片付けの中身)
+--           もう取り込んだ (done) = 知らせはそのまま。カード (Render の SQLite) は画面が Postgres の取引の前に読み、除外していないカードが 1 枚でもあれば消さない
+--           (409 card_exists = 人が先に product-hub で除外する・Codex #1688 R1 High 2・3。Postgres と SQLite は 1 つの取引にできない)
+--        e. 登録の状態 draft → cancelled (0052 の行き先の地図に前からある・ops.transition_sku_registration (下の 5. = この約束の中だけ通す) = 人の理由・根拠は DB が作った片付けの中身)
 --        f. 保存の記録 done (0053 の ops.close_reg_write)
 --      残す (消さない) 物: SKU・商品の行・原価・仕入先 (記録として。読み手は登録の状態で使わないと分かる)・発注の設定 (Render の SQLite = 発注アプリは NE にある商品だけを計算する)
 --      鍵: 段階 (共有) → マスタの書き込み (共有) → SKU → CSV → NE のコード (共有) → 登録の状態の行 (排他 = 0070 の参照の守りの共有と並ぶ) → SKU・商品の行 → カードの知らせの行
@@ -33,6 +36,9 @@
 --        NE 登録の CSV の 2 つの表の UPDATE (作っただけのファイルを使わないにする = 0053 の守りがそれ以外を断る)・構成の依頼の UPDATE (取り下げ)・
 --        JAN の UPDATE (外す)・SKU と商品の UPDATE (JAN を外したときの version の付け替え = 0053 の core.bump_jan_owner_version)
 --   4. core.guard_master_edit_jan (0053 の版から写して 🆕 0071 の行だけ足した): 画面のロールの JAN の書き込みに、約束 sku_draft_cancel の「外す」(UPDATE) だけを足す
+--   5. ops.transition_sku_registration (0070 (#1683) の版から写して 🆕 0071 の行だけ足した・Codex #1688 R1 High 1): 下書き・NE 登録待ち → やめた は、
+--      約束 sku_draft_cancel (この関数)・variation_child_cancel (0067 の子の廃止) の中だけ (同じ SKU・人・request_id)。運用のロール (master_ops) が直に呼んでも断る
+--      (表の持ち主のロールとそのメンバーは求めない)
 -- 🚨 この migration は商品・登録の状態の値を何も変えない (関数と守りを足すだけ)
 -- 🚨 security definer の関数 = 一時の表を使わない・search_path = pg_catalog, pg_temp (名前は全部 schema つき)・public の実行権を外す。
 --    ロール (scripts/company-db/create-master-edit-roles.mjs) の流し直しで master_edit に 1. と 2. の実行を足す (流さなくても今の動きは変わらない)
@@ -359,6 +365,130 @@ begin
   return v_result;
 end $$;
 revoke all on function ops.cancel_sku_draft(uuid, text, text, bigint) from public;
+
+-- ═══════════ 5. 登録の状態を 1 つ進める (0070 (#1683) の版から写して 🆕 0071 の行だけ足した・Codex #1688 R1 High 1) ═══════════
+-- 下書き・NE 登録待ち → やめた は、下書きを消す・子の廃止の約束の中だけ (運用のロール master_ops が直に呼んで条件と片付けを迂回しない)。
+--   要確認 (quarantined) → やめた は今までどおり (人の理由)・業務で使える → やめた は 0070 の決まりのまま
+create or replace function ops.transition_sku_registration(p_sku_id bigint, p_to text, p_actor_type text, p_actor_id text,
+                                                           p_reason text default null, p_evidence jsonb default '{}'::jsonb, p_request_id text default null) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  r        ops.master_registrations%rowtype;
+  v_ev     jsonb := coalesce(p_evidence, '{}'::jsonb);
+  v_rec    record;
+  v_event  bigint;
+  v_sess   ops.master_write_sessions;   -- 🆕 0070
+  v_chk    jsonb;                       -- 🆕 0070
+  v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;   -- 🆕 0071
+begin
+  if p_actor_type is null or p_actor_type not in ('human', 'system') then raise exception 'invalid_input: actor_type は human か system' using errcode = '22023'; end if;
+  if p_actor_id is null or pg_catalog.length(p_actor_id) = 0 then raise exception 'invalid_input: 誰が (actor_id) が要る' using errcode = '22023'; end if;
+  if pg_catalog.jsonb_typeof(v_ev) <> 'object' then raise exception 'invalid_input: 根拠 (evidence) は object' using errcode = '22023'; end if;
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || p_sku_id::text, 0));
+  select * into r from ops.master_registrations x where x.sku_id = p_sku_id for update;
+  if not found then raise exception 'no_registration: SKU % に状態の行が無い (使えない商品)', p_sku_id using errcode = 'P0001'; end if;
+  if not ops.registration_transition_allowed(r.state, p_to) then
+    raise exception 'one_way: 状態は % から % に進めない', r.state, p_to using errcode = 'P0001';
+  end if;
+  if p_to in ('distributable', 'available') then
+    raise exception 'not_ready: % への根拠 (%) の表がまだ無い = 進めない (④ で作る)', p_to, case p_to when 'distributable' then '配る世代' else '場所ごとの受け取り' end
+      using errcode = 'P0001';
+  end if;
+  if p_to in ('ne_pending', 'ne_confirmed') then
+    -- NE で見つけた商品 (要確認) を NE 確認済みにする根拠 (照合の結果の表) はまだ無い = 開いていない (呼び手の根拠の有無より先に)
+    if p_to = 'ne_confirmed' and r.state = 'quarantined' then
+      raise exception 'not_ready: NE で見つけた商品を NE 確認済みにする根拠 (照合の結果の表) はまだ無い' using errcode = 'P0001';
+    end if;
+    if v_ev <> '{}'::jsonb then
+      raise exception 'caller_evidence: % の根拠は関数が記録 (新規登録の CSV・照合の確かめ) から読む。呼び手の根拠は受けない', p_to using errcode = '22023';
+    end if;
+    if p_to = 'ne_pending' and p_actor_type = 'human' then
+      select i.item_id, i.export_id, a.attempt_id, a.sha256, a.result, a.declared_by, a.declared_at into v_rec
+        from ops.ne_reg_export_items i
+        join ops.ne_reg_exports e on e.export_id = i.export_id
+        join ops.ne_reg_attempts a on a.attempt_id = i.attempt_id and a.export_id = i.export_id
+       where i.sku_id = p_sku_id and i.state in ('import_declared', 'partial') and e.state = 'declared' and a.sha256 = e.sha256 and a.result in ('ok', 'partial')   -- 🆕 0063: 申告を結んだ partial も
+       order by i.item_id desc limit 1
+       for share of i, e;
+      if not found then
+        raise exception 'no_evidence: SKU % に、取り込んだと申告した新規登録の CSV の品目が無い', p_sku_id using errcode = '22023';
+      end if;
+      v_ev := pg_catalog.jsonb_build_object('export_id', v_rec.export_id, 'item_id', v_rec.item_id, 'attempt_id', v_rec.attempt_id, 'sha256', v_rec.sha256,
+                                            'result', v_rec.result, 'declared_by', v_rec.declared_by, 'declared_at', v_rec.declared_at);
+    elsif p_to = 'ne_pending' then
+      -- 🆕 0063: 申告をしなかった品目を、配った後の NE の完全な取得で照合が確かめた (system・ne_compare だけ)
+      if p_actor_id <> 'ne_compare' then raise exception 'no_evidence: 申告なしの NE 登録待ちは翌朝の照合 (ne_compare) の確かめで' using errcode = '22023'; end if;
+      select c.check_id, c.compare_run_id, c.item_id, i.export_id, c.fetched_at, e.issued_at into v_rec
+        from ops.ne_reg_checks c
+        join ops.ne_reg_export_items i on i.item_id = c.item_id and i.sku_id = c.sku_id
+        join ops.ne_reg_exports e on e.export_id = i.export_id
+       where c.sku_id = p_sku_id and c.outcome = 'verified' and i.state = 'verified' and i.verified_run = c.compare_run_id and i.attempt_id is null
+         and e.issued_at is not null and c.fetched_at > e.issued_at
+         and ops.ne_reg_auto_block(i.item_id) = ''   -- 自動で確かめてよい品目だけ (単品・JAN を送っていない・配った時の許可の印がある)
+         and exists (select 1 from ops.master_compare_runs m where m.compare_run_id = c.compare_run_id)
+       order by c.check_id desc limit 1
+       for share of i;
+      if not found then
+        raise exception 'no_evidence: SKU % に、配った後の NE の完全な取得で全部の列が合った確かめ (verified・申告なし) が無い', p_sku_id using errcode = '22023';
+      end if;
+      v_ev := pg_catalog.jsonb_build_object('compare_run_id', v_rec.compare_run_id, 'check_id', v_rec.check_id, 'item_id', v_rec.item_id, 'export_id', v_rec.export_id,
+                                            'fetched_at', v_rec.fetched_at, 'issued_at', v_rec.issued_at, 'matched', true, 'declared', false);
+    else
+      if p_actor_type <> 'system' then raise exception 'no_evidence: NE 確認済みは翌朝の照合 (system) で' using errcode = '22023'; end if;
+      select c.check_id, c.compare_run_id, c.item_id, i.export_id, c.fetched_at into v_rec
+        from ops.ne_reg_checks c
+        join ops.ne_reg_export_items i on i.item_id = c.item_id and i.sku_id = c.sku_id
+       where c.sku_id = p_sku_id and c.outcome = 'verified' and i.state = 'verified' and i.verified_run = c.compare_run_id
+         and exists (select 1 from ops.master_compare_runs m where m.compare_run_id = c.compare_run_id)
+       order by c.check_id desc limit 1
+       for share of i;
+      if not found then
+        raise exception 'no_evidence: SKU % に、NE の完全な取得で全部の列が合った確かめ (verified) が無い', p_sku_id using errcode = '22023';
+      end if;
+      v_ev := pg_catalog.jsonb_build_object('compare_run_id', v_rec.compare_run_id, 'check_id', v_rec.check_id, 'item_id', v_rec.item_id, 'export_id', v_rec.export_id,
+                                            'fetched_at', v_rec.fetched_at, 'matched', true);
+    end if;
+  else
+    -- cancelled = 人が理由を書いてだけ
+    if p_actor_type <> 'human' or coalesce(pg_catalog.length(pg_catalog.btrim(p_reason)), 0) = 0 then raise exception 'no_evidence: やめるのは人が理由を書いてだけ' using errcode = '22023'; end if;
+    -- 🆕 0070 ここから: 業務で使える (available) → やめた = 「NE から消えた」の約束の中だけ・DB の確かめが ok・根拠は DB が作る
+    if r.state = 'available' then
+      v_sess := ops.current_master_write_session();
+      if v_sess.session_id is null or v_sess.operation is distinct from 'sku_gone_cancel' or v_sess.sku_id is distinct from p_sku_id
+         or v_sess.actor_id is distinct from p_actor_id or v_sess.request_id::text is distinct from p_request_id then
+        raise exception 'gone_session_required: 業務で使える商品をやめるのは「NE から消えた」の操作 (ops.cancel_sku_gone_from_ne) の中だけ' using errcode = '42501';
+      end if;
+      if v_ev <> '{}'::jsonb then
+        raise exception 'caller_evidence: NE から消えた根拠は DB が完全な NE の取得の記録から作る。呼び手の根拠は受けない' using errcode = '22023';
+      end if;
+      v_chk := ops.sku_gone_from_ne_check(p_sku_id);
+      if (v_chk ->> 'ok') is distinct from 'true' then
+        raise exception 'not_gone_from_ne: %', (select pg_catalog.string_agg(x ->> 'text', ' / ') from pg_catalog.jsonb_array_elements(v_chk -> 'problems') x) using errcode = 'P0001';
+      end if;
+      v_ev := v_chk -> 'evidence';
+    end if;
+    -- 🆕 0070 ここまで
+    -- 🆕 0071 ここから: 下書き・NE 登録待ち → やめた = 下書きを消す (ops.cancel_sku_draft・約束 sku_draft_cancel)・まとまりの子の廃止 (ops.cancel_variation_child・約束 variation_child_cancel)
+    --   の中だけ (同じ SKU・人・request_id)。運用のロール (master_ops) が直に呼んでも断る = 消せる条件 (一度配った・NE に現れた・使われている) と片付けを迂回しない。
+    --   表の持ち主のロール (とそのメンバー = migration・手の復旧) は約束を求めない (表を直接書けるロール = 守りの境界はログインのロール)
+    if r.state in ('draft', 'ne_pending')
+       and not pg_catalog.pg_has_role(v_db_user, (select c.relowner from pg_catalog.pg_class c where c.oid = 'ops.master_registrations'::pg_catalog.regclass), 'MEMBER') then
+      v_sess := ops.current_master_write_session();
+      if v_sess.session_id is null or v_sess.operation not in ('sku_draft_cancel', 'variation_child_cancel') or v_sess.sku_id is distinct from p_sku_id
+         or v_sess.actor_id is distinct from p_actor_id or v_sess.request_id::text is distinct from p_request_id then
+        raise exception 'draft_cancel_session_required: 下書き・NE 登録待ちをやめるのは「下書きを消す」(ops.cancel_sku_draft)・「子の廃止」(ops.cancel_variation_child) の中だけ' using errcode = '42501';
+      end if;
+    end if;
+    -- 🆕 0071 ここまで
+  end if;
+  perform pg_catalog.set_config('ops.registration_protocol', '1', true);
+  update ops.master_registrations set state = p_to, state_changed_at = pg_catalog.now(), state_changed_by = p_actor_id where sku_id = p_sku_id;
+  perform pg_catalog.set_config('ops.registration_protocol', '', true);
+  insert into ops.master_registration_events (company_id, sku_id, from_state, to_state, actor_type, actor_id, reason, evidence, request_id)
+    values (r.company_id, p_sku_id, r.state, p_to, p_actor_type, p_actor_id, p_reason, v_ev, p_request_id) returning event_id into v_event;
+  return pg_catalog.jsonb_build_object('sku_id', p_sku_id, 'from', r.state, 'to', p_to, 'event_id', v_event);
+end $$;
+revoke all on function ops.transition_sku_registration(bigint, text, text, text, text, jsonb, text) from public;
 
 -- ─── 権限 (0070 と同じ形)。master_edit には scripts/company-db/create-master-edit-roles.mjs の流し直しで付ける (表は読ませない・関数の実行だけ) ───
 --   watcher = 確かめ (読むだけ) の実行

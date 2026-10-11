@@ -3,7 +3,7 @@
  *
  * 固定する契約:
  *   [R]  本物のログイン: master_edit (画面の lib) = 消せる・保存の記録の db_user = master_edit / 登録の状態・知らせ・JAN の表を直接書けない (42501) /
- *        master_ops・watcher は消す関数を実行できない (watcher は確かめだけ)
+ *        master_ops・watcher は消す関数を実行できない (watcher は確かめだけ)・master_ops が transition_sku_registration を直に呼んで下書きをやめる = 42501 (Codex #1688 R1 High 1)
  *   [1]  NE 登録の CSV を配る取引と競る: (a) 配るが先 (commit 前) = 消すは SKU の鍵で待ち、配るの commit の後に「一度配った」で断る /
  *        (b) 消すが先 = 配るは SKU の鍵で待ち、消すの commit の後にファイルはもう閉じている (使わない) = 消した商品を NE に配らない
  *   [2]  下書きを構成品にするセットの登録と競る: (a) 消すが先 = セットの登録は待って「使えない商品」で断る / (b) セットの登録が先 = 消すは待って「構成の依頼に入っている」で断る
@@ -130,6 +130,11 @@ try {
     for (const c of [P, WA]) assert.equal((await errOf(c.query('select ops.cancel_sku_draft($1::uuid, $2, $3, $4::bigint)', [uuid(), 'x@test', '理由', id])))?.code, '42501');
     assert.equal((await WA.query('select ops.sku_draft_cancel_check($1::bigint) as r', [id])).rows[0].r.ok, true);
     assert.equal((await errOf(P.query('select ops.sku_draft_cancel_check($1::bigint)', [id])))?.code, '42501');
+    // 🆕 Codex #1688 R1 High 1: master_ops (本物のログイン) が ops.transition_sku_registration を直に呼んで下書きをやめる = 42501 (消せる条件と片付けを迂回しない)
+    const e = await errOf(P.query(`select ops.transition_sku_registration($1, 'cancelled', 'human', 'ops@test', '運用でやめる')`, [id]));
+    assert.equal(e?.code, '42501', e?.message);
+    assert.match(String(e.message), /^draft_cancel_session_required/);
+    assert.equal(await regOf('q-5'), 'draft');
   });
 
   await ta('[1a] 配るが先 (commit 前) = 消すは SKU の鍵で待ち、配るの commit の後に「一度配った」で断る', async () => {
