@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v18';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す) / v14 (9/27): W14 (広告費の取込の完了と検算。Company DB構想 11 の ③) / v15 (9/28): Yahoo の売上日次を公開 (salesDaily: false を外す = W9 に Yahoo・W8 は売上も・W6 の公開の確認にも入る) / v16 (10/1): W13 に評価キー old (②b 古い表。④a) / v17 (10/6): W15 (migrate の lock が朝に残っていない。設計 13 §3.10 の 45 分の見張りの保険・PR #1638) / v18 (10/10): 10/7 の見直し (本番の記録 9/23〜10/7) = W11 の支払い待ち 7 → 10 日・A' の上限 楽天 48 → 66 / W12 の容量 10 → 13 GB / W6・W8 の info を 11/4 の朝まで延長 / W11・W12 の項目の版 v1 → v2 (前の版で開いた案件が規則の変更で消えても回復と数えない。09 §11.2・Codex #1678 R1)
+export const CHECKS_VERSION = 'v19';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す) / v14 (9/27): W14 (広告費の取込の完了と検算。Company DB構想 11 の ③) / v15 (9/28): Yahoo の売上日次を公開 (salesDaily: false を外す = W9 に Yahoo・W8 は売上も・W6 の公開の確認にも入る) / v16 (10/1): W13 に評価キー old (②b 古い表。④a) / v17 (10/6): W15 (migrate の lock が朝に残っていない。設計 13 §3.10 の 45 分の見張りの保険・PR #1638) / v18 (10/10): 10/7 の見直し (本番の記録 9/23〜10/7) = W11 の支払い待ち 7 → 10 日・A' の上限 楽天 48 → 66 / W12 の容量 10 → 13 GB / W6・W8 の info を 11/4 の朝まで延長 / W11・W12 の項目の版 v1 → v2 (前の版で開いた案件が規則の変更で消えても回復と数えない。09 §11.2・Codex #1678 R1) / v19 (10/11): W6 の決まりを直す (10/7 の見直し) = 直近 28 日に倉庫か FBA JP に在庫の記録がある SKU だけを見る (直送・取り寄せを数えない)・前提の売上日次は楽天と Amazon だけ必須 (ほかのモールは今朝そろっていなければ、そのモールの売上を除いて判定)・depends に 'W9:<scope>' の書き方・W6 の項目の版 v2 → v3
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -72,6 +72,18 @@ export const W6_SALES_DAYS = 28;
 export const W6_SCOPE = { scope: 'jp', sources: ['logizard', 'fba_jp'] };   // 在庫の合算に使う source (v_sku_stock の warehouse_qty + fba_jp_available)
 export const W6_INFO_UNTIL = '2026-11-04';   // この日の朝 (asOf) から warn。最初の 2 週間 (〜10/5) は info → 10/7 の見直しで延長 (10/1〜10/7 は小さいモールの push 無しで W9:* に止まり 7 日 blocked・在庫 0 の 81 件のうち 35 件は記録以来一度も在庫なし)。決まりを直す PR (「28 日の間に在庫があったのに今 0」・小さいモールで止まらない) の後で warn に上げる (09 §4)
 export const W6_MAX_UNEXPANDED_SHARE = 0.1;   // SKU に展開できない販売 (listing にも当たらない・構成が無い) が正味数量のこれを超えたら「販売履歴が不完全」= blocked (それ以下は観測に残して評価は続ける)
+/**
+ * W6 の前提にする売上日次 (10/7 の見直し・10/11)。ここにあるモール (scope) は今朝の W9 が pass でなければ W6 ごと blocked (今まで通り = CHECKS の W6 の depends に 'W9:<scope>' で入る)。
+ *   ほかの売上日次を公開するモール (Yahoo・au PAY・LINE ギフト・Qoo10) は、今朝の W9 が pass でない・窓の 28 日の中に「注文があるのに未公開の日」か開いた session がある なら
+ *   **そのモールの売上を除いて判定する** (observed.excluded_sales と理由に「今朝の分が無いので除いた」)。除いた朝は「在庫 0 のまま売上が窓から消えた」案件を閉じずに保留にする
+ *   (除いたモールでだけ売れていたのかもしれない = 監視対象外と決めない)
+ *   根拠 = 売上の割合 (本番 10/11 に読むだけで集計・直近 28 日 9/13〜10/10 の v_sales_daily): 売上 (円) = Amazon 72.6%・楽天 18.6% (合わせて 91.2%) / Yahoo 6.5%・LINE ギフト 1.1%・au PAY 0.9%・Qoo10 0.3%。
+ *   正味の数量でも Amazon 77.0%・楽天 15.7% (合わせて 92.7%)。除くモールは 1 つでも 7% 未満 = 売れ筋の欠品の見落としは小さい (除いた朝は理由に出る)。モールの割合が変わったら見直す
+ *   10/1〜10/7 は au PAY・LINE ギフト (token 切れ)・Yahoo の今朝の push が無いだけで W9:* の前提に止まり 7 日 blocked だった
+ */
+export const W6_REQUIRED_SALES = ['rakuten/main', 'amazon/jp'];
+/** W6 が見るのは、直近 W6_SALES_DAYS 日 (販売の窓と同じ) に倉庫 (logizard の qty > 0) か FBA JP (fba_available > 0) に一度でも在庫の記録がある SKU だけ。一度も無い SKU (直送・取り寄せ・在庫を持たないセット) は監視対象外 (この理由) */
+export const W6_NO_STOCK_REASON = 'no_stock_in_window: 直近 28 日に在庫の記録が無い (直送・取り寄せの見込み)';
 
 /**
  * W8: 注文の日次の異常 (モール × 昨日)。平常 = 同じ曜日の過去 W8_BASELINE_WEEKS 週のうち「取込の完了が確かめられた日」だけ (ORDER_MALLS の注釈。行が無い = 0 件も、確かめられた日なら正当なゼロ)。
@@ -241,7 +253,8 @@ export const ITEMS_MAX_BYTES = 64 * 1024;
 
 /**
  * 項目。順番 = 評価の順 (depends は前に評価されている前提)。
- * depends = 'W1' は同じ scope の W1 が pass であること / 'W1:*' は W1 の全部の scope が pass であること (1 つでも違えば blocked)
+ * depends = 'W1' は同じ scope の W1 が pass であること / 'W1:*' は W1 の全部の scope が pass であること (1 つでも違えば blocked) /
+ *   'W9:rakuten/main' は W9 のその scope が pass であること (評価されていなければ blocked。予定の評価キーに無い scope を書けば plannedKeys が止める。10/11 W6)
  * issuePerItem = 案件を明細 (日付・SKU など) ごとに持つか (false = scope 全体で 1 つ)
  * version = 項目の規則の版。🚨 閾値・判定の決まりを変えたら上げる = 前の版の結果で開いた案件は、今回 pass でも「回復」と数えず「規則の変更で閉じた」にする
  *   (engine の reconcileIssues。案件の最後の結果 (last_result_id) の check_version と比べる。09 §11.2「閾値の変更による消失を回復として通知しない」・Codex #1678 R1)
@@ -265,9 +278,10 @@ export const CHECKS = [
   { id: 'W5', version: 'v1', title: '解決できない在庫の差', severity: 'info', depends: ['W3'], issuePerItem: false,
     what: `昨日の stock_diff_days の unresolved_changed (SKU が分からず差をイベントにできなかった商品コード) が ${W5_MAX_UNRESOLVED} 件以下 かつ 数量の割合 (日次の元から計算) が ${W5_MAX_UNRESOLVED_SHARE * 100}% 以下。done の日で ${W5_ESCALATE_DAYS} 日続けば warn`,
     runbook: 'README「在庫を毎時写す」の「SKU が分からない商品コード」= core.skus に無い NE 商品コード → 商品マスタ (product-hub) に登録するか、ロジザード側の商品ID を直す' },
-  { id: 'W6', version: 'v2', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', 'W9:*'], issuePerItem: true,   // W9:* = 公開済みの行があっても作り直しの失敗・watermark の遅れがあれば止まる (Codex #1406 R2)。
-    // 各モールの W7 は W9 (前提 = 同じモールの W7) を通して見る = 売上日次を公開しないモール (Yahoo) の W7 では止まらない (2026-09-26。以前は 'W7:*' も前提にしていた)
-    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットの出品は listing_components・NE のセット商品の SKU は sku_components で構成 SKU に展開 = セット自体は判定しない) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。窓の中に「注文があるのに未公開の日」や開いた session があれば blocked (未公開の売上を「売れていない」と読まない)。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} の前日の朝までは info・この日の朝から warn`,
+  { id: 'W6', version: 'v3', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', ...W6_REQUIRED_SALES.map((s) => `W9:${s}`)], issuePerItem: true,   // W9 = 公開済みの行があっても作り直しの失敗・watermark の遅れがあれば止まる (Codex #1406 R2)。
+    // 各モールの W7 は W9 (前提 = 同じモールの W7) を通して見る (2026-09-26。以前は 'W7:*' も前提にしていた)。
+    // v3 (10/11): 前提は W6_REQUIRED_SALES (楽天・Amazon) の W9 だけ (以前は 'W9:*' = 小さいモールの push が無いだけで止まった)・ほかのモールは評価の中で「今朝そろっていなければ除く」/ 直近 28 日に在庫の記録がある SKU だけを見る
+    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットの出品は listing_components・NE のセット商品の SKU は sku_components で構成 SKU に展開 = セット自体は判定しない) のうち、同じ ${W6_SALES_DAYS} 日に倉庫 (logizard) か FBA JP に一度でも在庫の記録がある SKU で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0 (一度も無い SKU = 直送・取り寄せの見込みは数えない)。前提の売上日次は ${W6_REQUIRED_SALES.join('・')} だけ必須 (窓の中に「注文があるのに未公開の日」や開いた session があれば blocked = 未公開の売上を「売れていない」と読まない)。ほかのモールは今朝の W9 が pass でない・窓の中に未公開の日がある なら、そのモールの売上を除いて判定し、理由と観測に残す。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた・窓の中に在庫の記録が無い = 在庫は 0 のまま)。${W6_INFO_UNTIL} の前日の朝までは info・この日の朝から warn`,
     runbook: '発注 (仕入先発注補助) か FBA 補充。廃番 (handling = discontinued) は対象外' },
   { id: 'W8', version: 'v2', title: '注文の日次の異常', severity: 'warn', depends: ['W7', 'W9'], issuePerItem: false,
     what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満・昨日が祝日は blocked (祝日は標本からも外す)。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} の前日の朝までは info・この日の朝から warn`,

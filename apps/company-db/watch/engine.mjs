@@ -55,7 +55,9 @@ export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory 
       let rs;
       // 🚨 1 つの評価の SQL が失敗しても取引ごと壊さない (Postgres は例外の後、rollback するまで何も受け付けない) → 評価ごとに savepoint
       await db.exec('savepoint chk');
-      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound, openIssues, dataDir }, check); await db.exec('release savepoint chk'); }
+      // priorResult = 先に評価した項目の結果 (前提で blocked にした後の値)。W6 が前提にしないモールの W9 を見て「今朝そろっていなければ、そのモールを除く」に使う (10/11)
+      const priorResult = (id, scopeKey) => byKey.get(`${id}:${scopeKey}`) || null;
+      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound, openIssues, dataDir, priorResult }, check); await db.exec('release savepoint chk'); }
       catch (e) {
         try { await db.exec('rollback to savepoint chk'); } catch { /* */ }
         log(`${check.id}: 評価に失敗: ${String(e && e.message).slice(0, 200)}`);
@@ -68,11 +70,15 @@ export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory 
         r.durationMs = r.durationMs ?? Math.round(dur / Math.max(rs.length, 1));
         // 前提 (depends) が pass でなければ blocked = 上流の障害を 1 件にまとめる
         for (const dep of check.depends || []) {
-          // 'W1' = 同じ scope の W1 / 'W1:*' = W1 の全部の scope (1 つでも pass でなければ blocked。前提の項目が 1 つも評価されていなければそれも blocked)
-          const all = dep.endsWith(':*'), depId = all ? dep.slice(0, -2) : dep;
-          const ds = all ? [...byKey.values()].filter((x) => x.checkId === depId) : [byKey.get(`${dep}:${r.scopeKey}`)].filter(Boolean);
-          const d = all && !ds.length ? { verdict: 'blocked', reason: '前提の項目が評価されていない', scopeKey: '*' } : ds.find((x) => x.verdict !== 'pass');
-          if (d) { r.verdict = 'blocked'; r.reason = `前提 ${depId} (${all ? d.scopeKey : r.scopeKey}) が ${d.verdict}${d.reason ? `: ${d.reason}` : ''}`; r.blockedBy = `${depId}:${all ? d.scopeKey : r.scopeKey}`; break; }
+          // 'W1' = 同じ scope の W1 / 'W1:*' = W1 の全部の scope (1 つでも pass でなければ blocked。前提の項目が 1 つも評価されていなければそれも blocked) /
+          // 'W9:rakuten/main' = W9 のその scope (評価されていなければ blocked。10/11 W6 = 前提にするモールを選ぶ)
+          const cut = dep.indexOf(':'), depId = cut < 0 ? dep : dep.slice(0, cut), depScope = cut < 0 ? null : dep.slice(cut + 1);
+          const all = depScope === '*', named = depScope != null && !all;
+          const ds = all ? [...byKey.values()].filter((x) => x.checkId === depId) : [byKey.get(`${depId}:${named ? depScope : r.scopeKey}`)].filter(Boolean);
+          const d = all && !ds.length ? { verdict: 'blocked', reason: '前提の項目が評価されていない', scopeKey: '*' }
+            : named && !ds.length ? { verdict: 'blocked', reason: '前提の項目が評価されていない', scopeKey: depScope } : ds.find((x) => x.verdict !== 'pass');
+          const at = all || named ? d && d.scopeKey : r.scopeKey;
+          if (d) { r.verdict = 'blocked'; r.reason = `前提 ${depId} (${at}) が ${d.verdict}${d.reason ? `: ${d.reason}` : ''}`; r.blockedBy = `${depId}:${at}`; break; }
         }
         byKey.set(`${r.checkId}:${r.scopeKey}`, r);
         results.push(r);
