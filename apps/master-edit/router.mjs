@@ -24,6 +24,7 @@
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
  *   POST /api/sku/:code/card-retry  カードの取り込みをもう一度 (名簿の人・衝突 / 失敗の知らせも試す)
  *   POST /api/sku/:code/card-link   衝突を解く = 既存のカード (同じ商品コード) をこの商品に結ぶ (名簿の人。PR #1566 R1 M6)
+ *   POST /api/sku/:code/gone        🆕 0070: 業務で使える商品を「NE から消えた」でやめる { request_id, reason, confirm: true } (MASTER_DECISION_APPROVERS の人・lib/master-gone.mjs)
  *   ── 発注の設定 (10/9・発注アプリの po_* に書く・apps/master-edit/order-settings.mjs → apps/purchase-orders/order-settings.js の 1 つの部品) ──
  *   POST /api/new の order_settings = { order_lot?, condition_id?, material_group_id?, capacity_per_unit?, case_group?, case_lot?, new_condition?, new_material? } (単品だけ):
  *        ① の前に形・グループ・代表の仕入先を確かめる (誤り = 400 / 409・何も書かない) → ① Company DB の登録 → 通ったら ② 発注アプリに書く。
@@ -87,6 +88,7 @@ import {
   regSummary, buildRegExport, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
   REG_ITEM_STATES, REG_RESULTS,
 } from '../../lib/master-reg-csv.mjs';
+import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -561,7 +563,11 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     // 売れた数 (7 日・30 日) = 商品管理リストの公開の回 (発注アプリと同じ数)・FBA / FBA 以外・モール別 (速報)
     sales: await readSalesSku(await readSalesRun({ now: clock() }), page.cur.code),
   } : null;
+  // 🆕 0070: 業務で使える単品だけ「NE から消えた (やめる)」の確かめを読む (DB の ops.sku_gone_from_ne_check・読めない = 出さない)。押せるのは名簿 MASTER_DECISION_APPROVERS の人
+  const goneChk = page && page.cur.sku_kind === 'single' && page.cur.registration && page.cur.registration.state === 'available' ? await readGoneCheck(db, page.cur.sku_id) : null;
+  const gone = goneChk ? { ...goneView(goneChk), canApprove: approverGate(req).ok } : null;
   res.render(view('sku.ejs'), {
+    gone,
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null, extras,
     // 発注の設定 (発注アプリ・単品だけ)。発注条件グループは代表の仕入先のものだけ選べる
@@ -844,6 +850,22 @@ router.post('/api/bulk/apply', (req, res) => {
   return withPgApi(res, async (db) => {
     res.json(await bulkApplyChunk(db, { ...b, actor: String(req.session.email).trim().toLowerCase() },
       { open: isOpen(), now: clockOverridden ? new Date(clock()) : undefined }));
+  }, 'write');
+});
+
+/**
+ * 🆕 0070: 業務で使える商品を「NE から消えた」でやめる { request_id, reason, confirm: true }。名簿 MASTER_DECISION_APPROVERS の人だけ (NE 登録の CSV・マスタの判断と同じ =
+ *   商品を業務で使えなくする判断。MASTER_EDITORS より狭い名簿)・この画面だけのロールで・MASTER_EDIT_OPEN の後だけ。
+ *   条件 (完全な NE の取得に続けて 3 回無い・使われていない ほか) は DB の関数が鍵の後に確かめる (lib/master-gone.mjs)
+ */
+router.post('/api/sku/:code/gone', (req, res) => {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    const r = await cancelSkuGoneFromNe(db, { actor: String(req.session.email).trim().toLowerCase(), code: req.params.code, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true },
+      { open: isOpen(), requireConfirm: true });
+    res.json(r);
   }, 'write');
 });
 
