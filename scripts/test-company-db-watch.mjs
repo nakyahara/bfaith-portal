@@ -526,7 +526,7 @@ await t('🚨 W6 の NE のセット商品 (9/24 本番: セット 618 件が「
   await pg.query(`delete from mart.sales_daily where run_id = $1`, [runId2]);
   await pg.query(`delete from core.listing_components where listing_id = $1`, [l20]); await pg.query(`delete from core.listings where listing_id = $1`, [l20]);
 });
-await t('🚨 W6 v3 (10/11・10/7 の見直し = 10/1〜10/7 は小さいモールの push が無いだけで 7 日 blocked・在庫 0 の 81 件のうち 35 件は記録以来一度も在庫なし): 窓の 28 日に倉庫か FBA JP に在庫の記録が一度も無い SKU は数えない (直送・取り寄せ) / 窓の中に在庫があって今 0 は breach / 前提にするモール (Amazon) が今朝そろわなければ blocked / ほかのモール (LINE ギフト・au PAY・Qoo10) は今朝そろっていなければ、そのモールの売上を除いて判定し理由と観測に残す (除いた朝は売上の消えた案件を保留) / 版の変更 (v2 → v3) で消えた案件は「規則の変更で閉じた」・今の版 (v3) で開いた案件は在庫の記録が窓から外れても継続 (Codex #1687 R1) / 除いたモールでだけ売れていた案件は今の版なら保留・前の版なら「規則の変更で閉じた」・モールが戻って売上が無ければ監視対象外 (R2) / 1 行に「回復保留 N」/ 窓の中に在庫の記録が 1 つも無ければ blocked / 前提の scope の書き誤りは定義の誤り', async () => {
+await t('🚨 W6 v3 (10/11・10/7 の見直し = 10/1〜10/7 は小さいモールの push が無いだけで 7 日 blocked・在庫 0 の 81 件のうち 35 件は記録以来一度も在庫なし): 窓の 28 日に倉庫か FBA JP に在庫の記録が一度も無い SKU は数えない (直送・取り寄せ) / 窓の中に在庫があって今 0 は breach / 前提にするモール (Amazon) が今朝そろわなければ blocked / ほかのモール (LINE ギフト・au PAY・Qoo10) は今朝そろっていなければ、そのモールの売上を除いて判定し理由と観測に残す (除いた朝は売上の消えた案件を保留) / 版の変更 (v2 → v3) で消えた案件は「規則の変更で閉じた」・今の版 (v3) で開いた案件は在庫の記録が窓から外れても継続 (Codex #1687 R1) / 除いたモールでだけ売れていた案件は今の版なら保留・前の版なら「規則の変更で閉じた」・モールが戻って売上が無ければ監視対象外 (R2) / 1 行に「欠品の売上除外で保留 N」(W6 のモール除外の保留だけ・W13:ne の保持などは数えない = R3)/ 窓の中に在庫の記録が 1 つも無ければ blocked / 前提の scope の書き誤りは定義の誤り', async () => {
   assert.deepEqual([REAL_CONFIG.checkById('W6').version, REAL_CONFIG.W6_REQUIRED_SALES, REAL_CONFIG.checkById('W6').depends, REAL_CONFIG.W6_INFO_UNTIL], ['v3', ['rakuten/main', 'amazon/jp'], ['W1:*', 'W9:rakuten/main', 'W9:amazon/jp'], '2026-11-04']);
   assert.ok(plannedKeys(REAL_CONFIG).length > 0);   // 本物の設定で前提の scope が全部ある
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: CONFIG.CHECKS.map((c) => (c.id === 'W6' ? { ...c, depends: ['W1:*', 'W9:amazon/main'] } : c)) }), /W6 の前提 W9:amazon\/main の評価キーが無い/);
@@ -606,8 +606,8 @@ await t('🚨 W6 v3 (10/11・10/7 の見直し = 10/1〜10/7 は小さいモー�
   const noAmazon = goodEvidence(); delete noAmazon['orders-amazon'];
   r = await run({ dryRun: true, evidence: noAmazon }); w = resultOf(r, 'W6', 'all/jp');
   assert.deepEqual([verdictOf(r, 'W9', 'amazon/jp'), w.verdict, w.blockedBy], ['blocked', 'blocked', 'W9:amazon/jp']);
-  // blocked の間は案件に触らない (判定保留) = 開いている EEE-5 の案件も 1 行の「回復保留」に数える (Codex #1687 R2 = blocked の項目の案件も含む)
-  assert.deepEqual([r.notes.held.filter((h) => h.checkId === 'W6').map((h) => h.subjectKey), /\/ 回復保留 1( — |$)/.test(r.lastLine)], [[String(skuE)], true]);
+  // blocked の間は案件に触らない (判定保留)。開いている EEE-5 の案件は notes.held に入るが、1 行の「欠品の売上除外で保留」には数えない (モールを除いた保留だけ。Codex #1687 R3)
+  assert.deepEqual([r.notes.held.filter((h) => h.checkId === 'W6').map((h) => h.subjectKey), r.counts.held_w6_mall_excluded, /欠品の売上除外で保留|回復保留/.test(r.lastLine)], [[String(skuE)], 0, false]);
   // 🚨 LINE ギフトの今朝の push の証跡が無い (10/1〜10/6 の token 切れと同じ) → 止まらず LINE ギフトの売上を除いて判定 (EEE-5 = 7 → 3 個)・理由と観測に残す
   const noLine = goodEvidence(); delete noLine['orders-linegift'];
   r = await run({ dryRun: true, evidence: noLine }); w = resultOf(r, 'W6', 'all/jp');
@@ -629,17 +629,26 @@ await t('🚨 W6 v3 (10/11・10/7 の見直し = 10/1〜10/7 は小さいモー�
   r = await run({ dryRun: true, config: noWindow }); w = resultOf(r, 'W6', 'all/jp');
   assert.deepEqual([w.verdict, /在庫の記録が 1 つも無い/.test(w.reason), w.observed.stock_windows], ['blocked', true, []]);
   // 🚨 Codex #1687 R2 Medium 1: 版の変更 × モールを除いた朝 × 除いたモールでだけ売れていた SKU。
-  //   前の版 (v2) の DDD-4 の案件 (au PAY でだけ売れた・在庫の記録なし) は保留にせず「規則の変更で閉じた」/ 今の版 (v3) の EEE-5 の案件は保留のまま (open)・1 行に「回復保留 1」
+  //   前の版 (v2) の DDD-4 の案件 (au PAY でだけ売れた・在庫の記録なし) は保留にせず「規則の変更で閉じた」/ 今の版 (v3) の EEE-5 の案件は保留のまま (open)・1 行に「欠品の売上除外で保留 1」
   await pg.query(`insert into ops.watch_issues (company_id, check_id, scope_key, subject_type, subject_key, state, severity, first_seen_at, last_seen_at, first_result_id, last_result_id, summary) values (1, 'W6', 'all/jp', 'sku', $1, 'open', 'info', now(), now(), $2, $2, 'W6 all/jp DDD-4 (v2 の朝・2 回目)')`, [String(skuD), v2rid]);
   r = await run({ evidence: noLineAupay, now: new Date('2026-09-23T04:00:00Z') });
   assert.deepEqual([r.counts.rule_changed, r.notes.ruleChanged.map((x) => [x.subjectKey, x.reason]), r.notes.held.filter((h) => h.checkId === 'W6').map((h) => h.subjectKey), r.counts.held, (await issueOf(skuD)).state, (await issueOf(skuE)).state],
     [1, [[String(skuD), 'rule_changed:v2->v3']], [String(skuE)], 1, 'out_of_window', 'open']);
-  assert.match(r.lastLine, /\/ 規則の変更で閉じた 1 \(回復ではない\) \/ 回復保留 1( — |$)/);
-  // モールが戻った朝に EEE-5 の売上が無い (窓から消えた・在庫は 0 のまま) → 監視対象外 (no_sales_in_window) で閉じる (保留のまま残らない)。回復保留は出ない
+  assert.deepEqual([r.counts.held_w6_mall_excluded, /\/ 規則の変更で閉じた 1 \(回復ではない\) \/ 欠品の売上除外で保留 1( — |$)/.test(r.lastLine)], [1, true], r.lastLine);
+  // モールが戻った朝に EEE-5 の売上が無い (窓から消えた・在庫は 0 のまま) → 監視対象外 (no_sales_in_window) で閉じる (保留のまま残らない)。1 行の保留も出ない
   await pg.query(`delete from mart.sales_daily where sku_id = $1`, [skuE]);
   r = await run({ now: new Date('2026-09-23T05:00:00Z') });
   assert.deepEqual([r.counts.held, r.counts.recovered, r.notes.outOfWindow.filter((x) => x.checkId === 'W6').map((x) => [x.subjectKey, x.reason]), (await issueOf(skuE)).state], [0, 0, [[String(skuE), 'no_sales_in_window']], 'out_of_window']);
-  assert.doesNotMatch(r.lastLine, /回復保留/);
+  assert.doesNotMatch(r.lastLine, /欠品の売上除外で保留|回復保留/);
+  // 🚨 Codex #1687 R3: 1 行に出すのは W6 のモール除外の保留だけ。W13:ne の保持 (本番 885 件)・blocked の項目の案件・W2 の世代の保留は数えない (counts.held = 全体は保存用に残す)
+  const { summarize } = await import('../apps/company-db/watch/engine.mjs');
+  const heldOf = (checkId, reason, i) => ({ issueId: i, checkId, scopeKey: checkId === 'W13' ? 'ne' : 'all/jp', subjectKey: String(i), reason });
+  const notes0 = { new: [], continued: [], recovered: [], outOfWindow: [], ruleChanged: [] };
+  const ne885 = Array.from({ length: 885 }, (_, i) => heldOf('W13', i % 2 ? 'not_confirmed' : 'held_reason', i));
+  let sm = summarize({ asOf: ASOF, planned: [], results: [], notes: { ...notes0, held: [...ne885, heldOf('W6', 'mall_excluded:linegift/main', 9001), heldOf('W6', undefined, 9002), heldOf('W2', 'unstable', 9003)] }, deadlineHit: false });
+  assert.deepEqual([sm.counts.held, sm.counts.held_w6_mall_excluded, /\/ 欠品の売上除外で保留 1$/.test(sm.lastLine), /88\d|回復保留/.test(sm.lastLine)], [888, 1, true, false], sm.lastLine);
+  sm = summarize({ asOf: ASOF, planned: [], results: [], notes: { ...notes0, held: [...ne885, heldOf('W2', 'unstable', 9003)] }, deadlineHit: false });   // W6 のモール除外が無い朝 = 何も出ない
+  assert.deepEqual([sm.counts.held, sm.counts.held_w6_mall_excluded, /欠品の売上除外で保留|回復保留|88\d/.test(sm.lastLine)], [886, 0, false], sm.lastLine);
   // 片づけ (売上・公開・案件・在庫の記録 = 最初の W6 の試験の 2 日前の分も)
   for (const rid of [ra, rl]) { await pg.query(`delete from mart.sales_daily where run_id = $1`, [rid]); await pg.query(`delete from mart.sales_daily_published where run_id = $1`, [rid]); await pg.query(`delete from mart.sales_daily_runs where run_id = $1`, [rid]); }
   await pg.query(`delete from ops.watch_issues where check_id = 'W6'`);
@@ -1427,11 +1436,11 @@ await t('🚨 Codex R2 #2: 世代が変わり続けた回は回復も保留 (bre
   await capture(D(-2), 'ne', 'main', 'complete');   // D(-2) は直った
   r = await run({ hooks: { afterSnapshot: async () => { await bump(); } } });
   assert.deepEqual([r.unstable, verdictOf(r, 'W2', 'ne/main'), r.counts.recovered, r.counts.continued, r.notes.held.filter((h) => h.reason === 'unstable').length, /回復は保留/.test(r.lastLine)], [true, 'breach', 0, 1, 1, true]);
-  assert.match(r.lastLine, /\/ 回復保留 1( — |$)/);   // 1 行の「回復保留 N」(Codex #1687 R2) は W2 の世代の保留 (holdRecoveries) も数える = 回復を保留した案件が 1 行で見える
+  assert.doesNotMatch(r.lastLine, /欠品の売上除外で保留|回復保留/);   // W2 の世代の保留 (holdRecoveries) は 1 行の「欠品の売上除外で保留」に数えない (W6 のモール除外だけ。Codex #1687 R3)
   assert.equal((await one(`select state from ops.watch_issues where check_id = 'W2' and scope_key = 'ne/main' and subject_key = $1`, [D(-2)])).state, 'open');
   r = await run();
   assert.deepEqual([r.unstable, r.counts.recovered, r.counts.continued], [false, 1, 1]);
-  assert.doesNotMatch(r.lastLine, /回復保留/);
+  assert.doesNotMatch(r.lastLine, /欠品の売上除外で保留|回復保留/);
   await capture(D(-3), 'ne', 'main', 'complete');
   r = await run();
   assert.deepEqual([r.counts.recovered, (await one(`select count(*)::int as n from ops.watch_issues where state = 'open'`)).n], [1, 0]);
