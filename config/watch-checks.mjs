@@ -82,8 +82,13 @@ export const W6_MAX_UNEXPANDED_SHARE = 0.1;   // SKU に展開できない販売
  *   10/1〜10/7 は au PAY・LINE ギフト (token 切れ)・Yahoo の今朝の push が無いだけで W9:* の前提に止まり 7 日 blocked だった
  */
 export const W6_REQUIRED_SALES = ['rakuten/main', 'amazon/jp'];
-/** W6 が見るのは、直近 W6_SALES_DAYS 日 (販売の窓と同じ) に倉庫 (logizard の qty > 0) か FBA JP (fba_available > 0) に一度でも在庫の記録がある SKU だけ。一度も無い SKU (直送・取り寄せ・在庫を持たないセット) は監視対象外 (この理由) */
-export const W6_NO_STOCK_REASON = 'no_stock_in_window: 直近 28 日に在庫の記録が無い (直送・取り寄せの見込み)';
+/**
+ * W6 が見るのは、直近 W6_SALES_DAYS 日 (販売の窓と同じ asOf−28 〜 asOf−1) に倉庫 (logizard の qty > 0) か FBA JP (fba_available > 0) に一度でも在庫の記録がある SKU と、
+ *   今の版で開いている案件の SKU (最後の在庫の記録が窓から外れても、売上が窓から消える・廃番・在庫が入る まで継続 = 長期の欠品を閉じない。Codex #1687 R1 Medium 1)。
+ *   一度も無い SKU (直送・取り寄せ・在庫を持たないセット の見込み) は数えず、観測 no_stock_in_window_items に全件 (SKU・コード・28 日の数量。この件数まで) を残す。
+ *   🚨 既知の限界 (Codex #1687 R1 Medium 2・中原さんの判断待ち): 登録直後から在庫 0 の新商品・監視の開始前から欠品の商品も「一度も無い」に入る
+ */
+export const W6_NO_STOCK_OBSERVED_MAX = 1000;
 
 /**
  * W8: 注文の日次の異常 (モール × 昨日)。平常 = 同じ曜日の過去 W8_BASELINE_WEEKS 週のうち「取込の完了が確かめられた日」だけ (ORDER_MALLS の注釈。行が無い = 0 件も、確かめられた日なら正当なゼロ)。
@@ -281,7 +286,7 @@ export const CHECKS = [
   { id: 'W6', version: 'v3', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', ...W6_REQUIRED_SALES.map((s) => `W9:${s}`)], issuePerItem: true,   // W9 = 公開済みの行があっても作り直しの失敗・watermark の遅れがあれば止まる (Codex #1406 R2)。
     // 各モールの W7 は W9 (前提 = 同じモールの W7) を通して見る (2026-09-26。以前は 'W7:*' も前提にしていた)。
     // v3 (10/11): 前提は W6_REQUIRED_SALES (楽天・Amazon) の W9 だけ (以前は 'W9:*' = 小さいモールの push が無いだけで止まった)・ほかのモールは評価の中で「今朝そろっていなければ除く」/ 直近 28 日に在庫の記録がある SKU だけを見る
-    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットの出品は listing_components・NE のセット商品の SKU は sku_components で構成 SKU に展開 = セット自体は判定しない) のうち、同じ ${W6_SALES_DAYS} 日に倉庫 (logizard) か FBA JP に一度でも在庫の記録がある SKU で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0 (一度も無い SKU = 直送・取り寄せの見込みは数えない)。前提の売上日次は ${W6_REQUIRED_SALES.join('・')} だけ必須 (窓の中に「注文があるのに未公開の日」や開いた session があれば blocked = 未公開の売上を「売れていない」と読まない)。ほかのモールは今朝の W9 が pass でない・窓の中に未公開の日がある なら、そのモールの売上を除いて判定し、理由と観測に残す。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた・窓の中に在庫の記録が無い = 在庫は 0 のまま)。${W6_INFO_UNTIL} の前日の朝までは info・この日の朝から warn`,
+    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットの出品は listing_components・NE のセット商品の SKU は sku_components で構成 SKU に展開 = セット自体は判定しない) のうち、同じ ${W6_SALES_DAYS} 日に倉庫 (logizard) か FBA JP に一度でも在庫の記録がある SKU で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0 (一度も無い SKU = 直送・取り寄せの見込みは数えない)。前提の売上日次は ${W6_REQUIRED_SALES.join('・')} だけ必須 (窓の中に「注文があるのに未公開の日」や開いた session があれば blocked = 未公開の売上を「売れていない」と読まない)。ほかのモールは今朝の W9 が pass でない・窓の中に未公開の日がある なら、そのモールの売上を除いて判定し、理由と観測に残す。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0。開いた後に最後の在庫の記録が窓から外れても続ける) / 回復 (在庫が入った) / 監視対象外 (廃番・売上が窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} の前日の朝までは info・この日の朝から warn`,
     runbook: '発注 (仕入先発注補助) か FBA 補充。廃番 (handling = discontinued) は対象外' },
   { id: 'W8', version: 'v2', title: '注文の日次の異常', severity: 'warn', depends: ['W7', 'W9'], issuePerItem: false,
     what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満・昨日が祝日は blocked (祝日は標本からも外す)。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} の前日の朝までは info・この日の朝から warn`,

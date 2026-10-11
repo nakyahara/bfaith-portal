@@ -391,7 +391,7 @@ await t('🚨 W6: 直近 28 日に売れた SKU で 倉庫 + FBA JP が 0 → SK
   let w = resultOf(r, 'W6', 'all/jp');
   assert.deepEqual([w.verdict, w.severity, w.observed.skus, w.observed.sold_skus, w.periodFrom, w.periodTo, w.observed.unpublished_days], ['pass', 'info', 3, 0, D(-28), D(-1), 0]);
   // 3 つの SKU は 2 日前に倉庫に在庫があった (今は 0) = W6 の対象 (v3 = 窓の中に在庫の記録がある SKU だけを見る)。後の W6 の試験でも使う (最後の W6 の試験で片づける)
-  assert.deepEqual(w.observed.stock_windows, [`logizard/main ${D(-4)}..${D(-1)}`, `fba_jp/jp ${D(-1)}..${D(0)}`]);   // 窓の頭は監視の開始日 (since: logizard 9/19・fba_jp 9/22) で切れる
+  assert.deepEqual(w.observed.stock_windows, [`logizard/main ${D(-4)}..${D(-1)}`, `fba_jp/jp ${D(-1)}..${D(-1)}`]);   // 窓の頭は監視の開始日 (since: logizard 9/19・fba_jp 9/22) で切れる・終わりは販売と同じ昨日 (FBA JP も)
   await dailyRows(D(-2), 'logizard', 'main', [['AAA-1', skuA, 4], ['bbb-2', skuB, 4], ['CCC-3', await skuOf('CCC-3'), 4]]);
   const runId = await published('aupay', 'main', D(-3));
   await salesRow(runId, 'aupay', 'main', D(-3), skuA, 5, 0);
@@ -542,6 +542,28 @@ await t('🚨 W6 v3 (10/11・10/7 の見直し = 10/1〜10/7 は小さいモー�
   let r = await run({ dryRun: true }); let w = resultOf(r, 'W6', 'all/jp');
   assert.deepEqual([w.verdict, w.items.map((i) => `${i.payload.code}:${i.payload.units}`), w.observed.no_stock_in_window, w.observed.no_stock_in_window_units, w.observed.no_stock_in_window_top, w.observed.sold_skus, w.observed.sold_stocked_skus, w.sampleSize, w.observed.excluded_sales, w.reason],
     ['breach', ['EEE-5:7'], 1, 7, ['DDD-4 (7)'], 2, 1, 1, [], '売れ筋 1 SKU (窓の中に在庫の記録がある) のうち在庫 0 が 1 (EEE-5 (7))。在庫の記録が無い 1 は数えない']);
+  // 数えない SKU は全件を観測に残す (SKU・コード・28 日の数量。Codex #1687 R1 Medium 2 = 後で判断する材料)。上限を超えた分は件数だけ
+  assert.deepEqual([w.observed.no_stock_in_window_items, w.observed.no_stock_in_window_omitted, REAL_CONFIG.W6_NO_STOCK_OBSERVED_MAX], [[{ sku_id: String(skuD), code: 'DDD-4', units: 7 }], 0, 1000]);
+  r = await run({ dryRun: true, config: { ...CONFIG, W6_NO_STOCK_OBSERVED_MAX: 0 } }); w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([w.observed.no_stock_in_window, w.observed.no_stock_in_window_items, w.observed.no_stock_in_window_omitted], [1, [], 1]);
+  // 🚨 窓の境 (Codex #1687 R1 Low 1): 在庫の記録を読む窓は販売と同じ 28 日 = asOf−28 〜 asOf−1 (FBA JP も今日を含めない)。since を外すと D(-28) は入り D(-29) は入らない
+  const wide = { ...CONFIG, STOCK_SCOPES: CONFIG.STOCK_SCOPES.map((s) => (CONFIG.W6_SCOPE.sources.includes(s.source) ? { ...s, since: '2026-01-01' } : s)) };
+  await ensureCapture(D(-28));
+  await dailyRows(D(-29), 'logizard', 'main', [['DDD-4', skuD, 5]]);
+  r = await run({ dryRun: true, config: wide }); w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([w.observed.stock_windows, w.items.map((i) => i.payload.code)], [[`logizard/main ${D(-28)}..${D(-1)}`, `fba_jp/jp ${D(-28)}..${D(-1)}`], ['EEE-5']]);
+  await delDaily([D(-29)], 'logizard');
+  await dailyRows(D(-28), 'logizard', 'main', [['DDD-4', skuD, 5]]);
+  r = await run({ dryRun: true, config: wide });
+  assert.deepEqual(resultOf(r, 'W6', 'all/jp').items.map((i) => i.payload.code), ['DDD-4', 'EEE-5']);
+  await delDaily([D(-28)], 'logizard');
+  // 🚨 世代の指紋 (Codex #1687 R1 Low 2): snapshot の後に窓の中の在庫の履歴を足す・消す (W5 の日次・取得記録の指紋の外の日 = D(-9)) → 在庫の記録がある SKU の集まりが変わる = 再評価 (attempts 2)
+  r = await run({ dryRun: true, config: wide });
+  assert.equal(r.attempts, 1);
+  r = await run({ dryRun: true, config: wide, hooks: { afterSnapshot: async (n) => { if (n === 1) await dailyRows(D(-9), 'logizard', 'main', [['DDD-4', skuD, 1]]); } } });
+  assert.deepEqual([r.attempts, resultOf(r, 'W6', 'all/jp').items.map((i) => i.payload.code)], [2, ['DDD-4', 'EEE-5']]);
+  r = await run({ dryRun: true, config: wide, hooks: { afterSnapshot: async (n) => { if (n === 1) await delDaily([D(-9)], 'logizard'); } } });
+  assert.deepEqual([r.attempts, resultOf(r, 'W6', 'all/jp').items.map((i) => i.payload.code)], [2, ['EEE-5']]);
   // FBA JP の在庫の記録 (fba_available > 0) でも対象になる = DDD-4 が今日の FBA に 0・昨日に 1 → 対象 (今 0 = breach)。qty だけあって available が 0 は在庫と数えない
   await dailyRows(D(-1), 'fba_jp', 'jp', [['DDD-4', skuD, 3, { fba_available: 0 }]]);
   r = await run({ dryRun: true });
@@ -560,13 +582,26 @@ await t('🚨 W6 v3 (10/11・10/7 の見直し = 10/1〜10/7 は小さいモー�
   assert.deepEqual([r.counts.rule_changed, r.counts.recovered, r.counts.out_of_window, r.counts.continued, r.notes.ruleChanged.map((x) => [x.subjectKey, x.reason])], [1, 0, 0, 1, [[String(skuD), 'rule_changed:v2->v3']]]);
   let iss = await issueOf(skuD);
   assert.deepEqual([iss.state, iss.rec, /規則の変更で閉じた \(v2 → v3。回復ではない\)/.test(iss.summary)], ['out_of_window', false, true]);
-  // 同じ版 (v3) で開いていた案件が「在庫の記録が無い」で消えた → 監視対象外 (理由つき・回復ではない)
+  // 🚨 Codex #1687 R1 Medium 1: 今の版 (v3) で開いた本物の欠品 (EEE-5 = 在庫あり → 0) は、最後の在庫の記録が窓から外れても閉じない = 継続 (28 日入荷しない長期の欠品を見落とさない)。
+  //   窓から外れるのを since を後ろにずらして作る (D(-3) の記録が窓の外 = 29 日目と同じ形)
+  const outWin = { ...CONFIG, STOCK_SCOPES: CONFIG.STOCK_SCOPES.map((s) => (s.source === 'logizard' ? { ...s, since: D(-2) } : s)) };
+  r = await run({ config: outWin, now: new Date('2026-09-23T02:00:00Z') }); w = resultOf(r, 'W6', 'all/jp');
+  const e5 = w.items.find((i) => i.payload.code === 'EEE-5');
+  assert.deepEqual([w.verdict, !!e5, e5 && e5.payload.stocked_in_window, w.observed.kept_open_without_stock_record, r.counts.continued, r.counts.recovered, r.counts.out_of_window, r.counts.rule_changed, (await issueOf(skuE)).state, /うち在庫の記録が窓から外れた継続 1/.test(w.reason)],
+    ['breach', true, false, 1, 1, 0, 0, 0, 'open', true]);
+  // 在庫が入れば回復
+  await dailyRows(D(-1), 'logizard', 'main', [['EEE-5', skuE, 5]]);
+  r = await run({ config: outWin, now: new Date('2026-09-23T02:10:00Z') });
+  assert.deepEqual([r.counts.recovered, r.notes.recovered.map((x) => x.subjectKey), (await issueOf(skuE)).state], [1, [String(skuE)], 'recovered']);
+  await delDaily([D(-1)], 'logizard');
+  r = await run({ now: new Date('2026-09-23T02:20:00Z') });   // 在庫 0 に戻る (窓の中に D(-3) の記録) = 新しい案件 (後の試験で使う)
+  assert.deepEqual([r.counts.new, (await issueOf(skuE)).state], [1, 'open']);
+  // 今の版で開いている案件は、窓の中に在庫の記録が一度も無い SKU でも「監視対象外」で閉じない (no_stock_in_window で閉じるのは前の版の案件 = 規則の変更 だけ)
   const v3rid = (await one(`select watch_result_id from ops.watch_results where watch_run_id = $1 and check_id = 'W6'`, [r.runId])).watch_result_id;
   await pg.query(`insert into ops.watch_issues (company_id, check_id, scope_key, subject_type, subject_key, state, severity, first_seen_at, last_seen_at, first_result_id, last_result_id, summary) values (1, 'W6', 'all/jp', 'sku', $1, 'open', 'info', now(), now(), $2, $2, 'W6 all/jp DDD-4 (v3 の朝)')`, [String(skuD), v3rid]);
-  r = await run({ now: new Date('2026-09-23T02:00:00Z') });
-  assert.deepEqual([r.counts.rule_changed, r.counts.recovered, r.counts.out_of_window, r.notes.outOfWindow.map((x) => [x.subjectKey, x.reason])], [0, 0, 1, [[String(skuD), REAL_CONFIG.W6_NO_STOCK_REASON]]]);
-  iss = await issueOf(skuD);
-  assert.deepEqual([iss.state, iss.summary], ['out_of_window', `W6 all/jp ${skuD}: 監視対象外 (no_stock_in_window: 直近 28 日に在庫の記録が無い (直送・取り寄せの見込み))`]);
+  r = await run({ now: new Date('2026-09-23T02:30:00Z') });
+  assert.deepEqual([r.counts.rule_changed, r.counts.recovered, r.counts.out_of_window, r.counts.continued, (await issueOf(skuD)).state], [0, 0, 0, 2, 'open']);
+  await pg.query(`delete from ops.watch_issues where check_id = 'W6' and subject_key = $1`, [String(skuD)]);
   // 🚨 前提にするモール (Amazon) の今朝の push の証跡が無い → W7 → W9 → W6 は blocked (今まで通り)
   const noAmazon = goodEvidence(); delete noAmazon['orders-amazon'];
   r = await run({ dryRun: true, evidence: noAmazon }); w = resultOf(r, 'W6', 'all/jp');
