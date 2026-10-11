@@ -1033,6 +1033,14 @@
     var body = collect(m);
     var yes = $('#confirm-yes'); yes.textContent = '保存しています…'; yes.classList.add('busy'); yes.disabled = true;
     busy = true; renderHud(m);
+    /** 保存の後の NE 登録の CSV の案内 (まだ CSV にしていない子があれば、今回の分と 1 つのファイルにまとまる)・決まりの言葉はいつも出す */
+    function afterCsvText(pend, n, hasNext) {
+      return '次は「NE 登録の CSV」で、' + (pend > 0
+        ? 'まだ CSV にしていない ' + pend + ' 件と今回の ' + n + ' 件を合わせて 1 つのファイル (' + (pend + n) + ' 行) にして'
+        : 'この回の ' + n + ' 件を 1 つのファイルにして') + ' NE に取り込みます'
+        + (hasNext ? ' (1 回目の CSV を先に作ってから残りを足してください。未処理の回が重なると 1 つのファイルにまとまります)'
+          : ' (決まり = 1 回目の CSV を先に作ってから残りを足す。未処理の回が重なると 1 つのファイルにまとまる)');
+    }
     fetch(BASE + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
@@ -1048,7 +1056,7 @@
           var po = x.j.order_settings;
           $('#result').innerHTML = '<div class="result ok"><div class="rt">' + icon('check', 's') + ' ' + kids.length + ' 件を下書きにしました' + (x.j.replayed ? ' (前の同じ保存の結果)' : '') + '</div><ul>'
             + '<li>まとまり ' + esc(x.j.group_code) + (x.j.group_created ? ' を作りました' : ' に足しました (今ある ' + (m.pk ? m.pk.kids.length : 0) + ' 件は変更なし)') + ' (軸・選択肢も一緒に記録)</li>'
-            + '<li>次は「NE 登録の CSV」で、この回の ' + kids.length + ' 件を 1 ファイルにして NE に取り込みます' + (S.nextOpts.length ? ' (1 回目の CSV を先に作ってから残りを足してください。未処理の回が重なると 1 つのファイルにまとまります)' : '') + '</li>'
+            + '<li>' + afterCsvText(m.pk ? m.pk.pendingUnfiled : 0, kids.length, S.nextOpts.length > 0) + '</li>'
             + '<li>出品カードはまとまりで 1 枚 (NE の写し待ち)' + (x.j.card ? ' · ' + esc(x.j.card.label) + (x.j.card.status === 'done' ? '' : ' (product-hub のボードを開くと続きを作ります)') : '') + '</li>'
             + (po ? (po.ok ? '<li>発注の設定を ' + po.written + ' 件に入れました</li>' : '<li style="color:var(--warn)">発注の設定だけ ' + po.failed.length + ' 件入れられませんでした (' + esc(po.failed.slice(0, 3).map(function (f) { return f.code; }).join('・')) + ')。商品の画面の「発注の設定」で入れてください</li>') : '')
             + '</ul><div class="kidchips" style="margin:6px 0 10px">' + kids.slice(0, 12).map(function (k) { return '<a class="compchip" href="' + BASE + '/sku/' + encodeURIComponent(k.code) + '"><span class="mono">' + esc(k.code) + '</span></a>'; }).join('') + (kids.length > 12 ? '<span class="hint">… ほか ' + (kids.length - 12) + ' 件</span>' : '') + '</div>'
