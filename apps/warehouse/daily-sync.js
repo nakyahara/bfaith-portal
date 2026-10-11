@@ -1495,6 +1495,26 @@ async function main() {
   }
   results.push({ name: 'Render同期', ...syncResult });
 
+  // ─── マスタ照合 ①ロードの検証 + ②NE との照合 (Company DB構想 10 §6.1.1 B・C2。見張りの前 = 見張りの W13 がこの証跡を読む) ───
+  // 置き場所 = Render同期 の直後 (2026-10-11 中原さん Q1 = a)。照合が使うのは Render同期 までの結果 (夜間ロードの材料の控え・warehouse.db の NE の取得) だけで、
+  // DBバックアップ・未発送アラートなどとはつながっていない = バックアップ (約 93 分) を待たずに照合 ② と新商品の許可を出す。見張り (W13 がこの証跡を読む) はこの後
+  // 最新の夜間ロードが実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直して Company DB と比べる (読むだけ)。
+  // 差がある・判定できない は ⚠️ (exit 0)。照合そのものの失敗だけ ❌ (retry。Render同期 が retry で直ったら照合 → 見張りも走らせ直す = RERUN_AFTER)
+  const masterCompareResult = runScript('apps/company-db/master-compare/run.mjs --daily', 'マスタ照合', 300000);
+  results.push({ name: 'マスタ照合', ...masterCompareResult, warn: masterCompareResult.success && isWarnSummary(masterCompareResult.summary) });
+
+  // ─── 新商品の許可 (照合 ② の次の 1 段・計画 newentry_min_plan.md §3 の 2・PR-7。新しい定期実行ではない) ───
+  // その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ = 単品の新商品をポータルで開ける (〜翌日 07:00)。
+  // 照合が失敗・見送り = 流さない (入口は照合の始めで閉じたまま。retry で照合が直ったら RERUN_AFTER でこの段も流す)。照合 ② が判定できない回はこの段が grant を呼ばない。
+  // 接続 COMPANY_DB_NEW_ENTRY_GATE_URL が無い・関数が無い (0058 の前) = 飛ばして要約に一言 (exit 0)。拒まれた = 新しい接続で revoke → 閉じたのを確かめて理由つきで閉・❌
+  // (確かめられない = ⚠️ 状態不明)。失敗した朝の retry は「マスタ照合」からやり直す (下の gateRetryJobs)
+  const newEntryGateSkip = skipAfterCompare(masterCompareResult);
+  if (newEntryGateSkip) results.push(newEntryGateSkip);
+  else {
+    const newEntryGateResult = runScript('apps/company-db/master-compare/new-entry-gate.mjs --daily', NEW_ENTRY_GATE_STEP, 120000);
+    results.push({ name: NEW_ENTRY_GATE_STEP, ...newEntryGateResult, warn: newEntryGateResult.success && isWarnSummary(newEntryGateResult.summary) });
+  }
+
   // Amazon手数料カバー率の監視 (SLO 監視、Codex+Claude 議論結果 2026-05-15)
   // 売上加重カバー率 (件数じゃなく金額) を主指標、warn 30日<98%、critical <95% or 売上TOP20未カバー
   // critical で exit 1 → daily-sync 赤、warn/ok は exit 0 (cron 緑)
@@ -1663,7 +1683,22 @@ async function main() {
   const yahooInquiryResult = runScript('apps/yahoo-inquiry-alert/notify-job.js --once', 'Yahoo問い合わせ対応漏れ', 300000);
   results.push({ name: 'Yahoo問い合わせ対応漏れ', ...yahooInquiryResult });
 
+  // ─── ロジザードの毎日の商品マスタ (影。マスタ正本切替 ③c-1a。設計 = AI_reference CompanyDB構想/10 §6.3「③c 契約 v1〜v3」) ───
+  // Company DB の値で作り、NE の取得の値から作ったもの (GAS と同じ変換と確かめ済み) と突き合わせる。**まだロジザードに取り込まない**。
+  // マスタ照合の後 (その朝の照合の全件 JSON と元のコードの印を使う)。作れた = ✅ / ⚠️ (exit 0)。材料が欠ける = ⏭️ (exit 3 = 失敗として retry に載る)。
+  // 作ること自体の失敗 = ❌ (exit 1・retry)。作れた回だけ lz-daily.mjs が自分で ok の ping (台帳 lz-daily-build)
+  const lzDailyResult = runScript('scripts/company-db/lz-daily.mjs --daily', 'ロジザード毎日の商品マスタ(影)', 300000);
+  results.push({ name: 'ロジザード毎日の商品マスタ(影)', ...lzDailyResult, warn: lzDailyResult.success && isWarnSummary(lzDailyResult.summary) });
+
+  // ─── Company DB の見張り (設計 = AI_reference CompanyDB構想/09。全部の push の後・要約の前) ───
+  // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
+  // 判定 4 値 (pass / breach / blocked / execution_error) で「そろっているか → おかしくないか」を出す。🚨 「行がある = そろっている」と読まない。
+  // 業務の異常を見つけたら exit 0 (⚠️ = warn) = 異常のたびに再実行させない。見張り自身の失敗 (評価できない・DB に届かない) だけ ❌ (retry の対象)。env が無ければ ⏭️ (Dark Launch)
+  const watchResult = runScript('apps/company-db/watch/run.mjs', 'Company DB 見張り', 300000);
+  results.push({ name: 'CompanyDB見張り', ...watchResult, warn: watchResult.success && isWarnSummary(watchResult.summary) });
+
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
+  // 一番最後の段 (2026-10-11 中原さん Q1 = a。前は見張り・照合の前 = 照合 ② と新商品の許可がバックアップ (約 93 分) を待っていた)。中身は変えない。
   // 全 build/sync の後に実行 (WarehouseServer の並行書き込み分は前後しうる = 厳密断面ではない)。
   // 冪等 (当日分完成済み+元DB変化なしなら再利用して offsite 以降だけやり直す) なので retry 対象。
   // timeout 6h: 月初最悪ケース = rclone 内訳上限合計 約4h (upload90+manifest5+prune10+monthly copy30
@@ -1757,38 +1792,6 @@ async function main() {
   }
 
   // ─── retry-state 書き込み (リトライ対象の失敗があれば) ───
-
-  // ─── Company DB の見張り (設計 = AI_reference CompanyDB構想/09。全部の push の後・要約の前) ───
-  // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
-  // 判定 4 値 (pass / breach / blocked / execution_error) で「そろっているか → おかしくないか」を出す。🚨 「行がある = そろっている」と読まない。
-  // 業務の異常を見つけたら exit 0 (⚠️ = warn) = 異常のたびに再実行させない。見張り自身の失敗 (評価できない・DB に届かない) だけ ❌ (retry の対象)。env が無ければ ⏭️ (Dark Launch)
-  // ─── マスタ照合 ①ロードの検証 + ②NE との照合 (Company DB構想 10 §6.1.1 B・C2。見張りの前 = 見張りの W13 がこの証跡を読む) ───
-  // 最新の夜間ロードが実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直して Company DB と比べる (読むだけ)。
-  // 差がある・判定できない は ⚠️ (exit 0)。照合そのものの失敗だけ ❌ (retry。Render同期 が retry で直ったら照合 → 見張りも走らせ直す = RERUN_AFTER)
-  const masterCompareResult = runScript('apps/company-db/master-compare/run.mjs --daily', 'マスタ照合', 300000);
-  results.push({ name: 'マスタ照合', ...masterCompareResult, warn: masterCompareResult.success && isWarnSummary(masterCompareResult.summary) });
-
-  // ─── 新商品の許可 (照合 ② の次の 1 段・計画 newentry_min_plan.md §3 の 2・PR-7。新しい定期実行ではない) ───
-  // その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ = 単品の新商品をポータルで開ける (〜翌日 07:00)。
-  // 照合が失敗・見送り = 流さない (入口は照合の始めで閉じたまま。retry で照合が直ったら RERUN_AFTER でこの段も流す)。照合 ② が判定できない回はこの段が grant を呼ばない。
-  // 接続 COMPANY_DB_NEW_ENTRY_GATE_URL が無い・関数が無い (0058 の前) = 飛ばして要約に一言 (exit 0)。拒まれた = 新しい接続で revoke → 閉じたのを確かめて理由つきで閉・❌
-  // (確かめられない = ⚠️ 状態不明)。失敗した朝の retry は「マスタ照合」からやり直す (下の gateRetryJobs)
-  const newEntryGateSkip = skipAfterCompare(masterCompareResult);
-  if (newEntryGateSkip) results.push(newEntryGateSkip);
-  else {
-    const newEntryGateResult = runScript('apps/company-db/master-compare/new-entry-gate.mjs --daily', NEW_ENTRY_GATE_STEP, 120000);
-    results.push({ name: NEW_ENTRY_GATE_STEP, ...newEntryGateResult, warn: newEntryGateResult.success && isWarnSummary(newEntryGateResult.summary) });
-  }
-
-  // ─── ロジザードの毎日の商品マスタ (影。マスタ正本切替 ③c-1a。設計 = AI_reference CompanyDB構想/10 §6.3「③c 契約 v1〜v3」) ───
-  // Company DB の値で作り、NE の取得の値から作ったもの (GAS と同じ変換と確かめ済み) と突き合わせる。**まだロジザードに取り込まない**。
-  // マスタ照合の後 (その朝の照合の全件 JSON と元のコードの印を使う)。作れた = ✅ / ⚠️ (exit 0)。材料が欠ける = ⏭️ (exit 3 = 失敗として retry に載る)。
-  // 作ること自体の失敗 = ❌ (exit 1・retry)。作れた回だけ lz-daily.mjs が自分で ok の ping (台帳 lz-daily-build)
-  const lzDailyResult = runScript('scripts/company-db/lz-daily.mjs --daily', 'ロジザード毎日の商品マスタ(影)', 300000);
-  results.push({ name: 'ロジザード毎日の商品マスタ(影)', ...lzDailyResult, warn: lzDailyResult.success && isWarnSummary(lzDailyResult.summary) });
-
-  const watchResult = runScript('apps/company-db/watch/run.mjs', 'Company DB 見張り', 300000);
-  results.push({ name: 'CompanyDB見張り', ...watchResult, warn: watchResult.success && isWarnSummary(watchResult.summary) });
 
   // 「新商品の許可」が失敗した朝は「マスタ照合」も載せる (拒まれた後の revoke で停止の床が進む = 同じ照合の回では開かない。
   //   retry は新しい照合の回で close → record → grant の順。#1645 Codex R1 Medium・gateRetryJobs)

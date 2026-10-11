@@ -64,6 +64,9 @@ export const NO_OLD_TABLE_COPY = Object.freeze({
   'external_ids.jan': '古い表に JAN の置き場所が無い (正 = Company DB の external_ids・⑤-2b の JAN の記録と NE 登録の CSV)',
   // ⑦-2 PR-A: Amazon SKU の対応は m_products でなく m_sku_master・m_sku_components に写す = ④a の世代には入れない (別の工程が写す)
   'listing_components.amazon': '⑦-2 が写す (apps/company-db/publish/amazon-map.mjs = daily-sync の「CompanyDB写し(Amazon SKU)」が m_sku_master・m_sku_components へ。④a の m_products には置き場所が無い)',
+  // CompanyDB構想/20 v7 §⑤ (PR-7): 代表 (親) は写さない。古い表の読み手 (mirror_products / raw_ne_products の代表商品コード) は NE の値を読む = 代表は登録の後に変わらない・
+  //   NE 登録の CSV で NE に入る・翌朝の照合 ② の 3 者一致と親の門で NE = 社内を確かめる (差は CSV を取り込むまでの間だけ・その間の商品はまだ NE に無い)
+  'products.parent': '写さない (古い表の代表は NE の値 = NE 登録の CSV で入り、照合 ② の 3 者一致で Company DB と同じと確かめる・CompanyDB構想/20 §⑤)',
 });
 /** 一緒に切り替える組 (持ち主が違うと、同じものの 2 つの値の片方だけが C になる) */
 export const CO_SWITCH_GROUPS = Object.freeze([['products.name', 'skus.name'], ['products.status', 'skus.handling'], ['skus.tax_rate', 'skus.tax_class']]);

@@ -498,20 +498,23 @@ await ta('[2] 一部だけ company で切り替えた DB: 名前 (company) + 税
 
 console.log('\n単品の保存');
 
-await ta('[3] 単品: 名前・取扱・売価・税率・分類・送料・月数・代表の仕入先・代表 (親) を 1 回で。変わった列だけ・商品の行もそろう (画面のロールで)', async () => {
+await ta('[3] 単品: 名前・取扱・売価・税率・分類・送料・月数・代表の仕入先を 1 回で。変わった列だけ・商品の行もそろう (画面のロールで)・代表 (親) はこの保存では変えない (PR-7)', async () => {
   const id = uuid();
+  // 🆕 PR-7 (CompanyDB構想/20 §⑤): 代表 (親) は登録の時に 1 回だけ (まとめての登録) = 商品の画面の保存に代表の欄は無い = 400 parent_not_editable (何も書かない・記録もしない)
+  const ep = await rejectsWith(save('s003', { name: '単品 3 改', parent_code: 's002' }), 400, 'parent_not_editable');
+  assert.equal(ep.extra.field, 'parent_code');
   const r = await save('s003', {
     name: '単品 3 改', handling: 'active', standard_price: '1,280', tax_rate: '8', sales_class: '2', shipping_code: 'S01', reorder_months: '1.5',
-    primary_supplier: '2', parent_code: 's002',   // 🆕 0067: 親か子のどちらか一方 = 親は子を持たない単品 (s001 は grp1 の子 = 親にすると 2 段 = DB が断る)
+    primary_supplier: '2',
   }, { requestId: id, reason: '棚卸で見直し' });
-  assert.deepEqual(r.changed.map((c) => c.field).sort(), ['name', 'parent_code', 'primary_supplier', 'reorder_months', 'sales_class', 'shipping_code', 'standard_price', 'tax_rate'].sort());
+  assert.deepEqual(r.changed.map((c) => c.field).sort(), ['name', 'primary_supplier', 'reorder_months', 'sales_class', 'shipping_code', 'standard_price', 'tax_rate'].sort());
   assert.deepEqual(await skuRow('s003'), {
     name: '単品 3 改', tax_rate: 0.08, tax_class: 'REDUCED_8', handling: 'active', price: 1280, shipping_code: 'S01', shipping_method: 'ゆうパケット', ship: 210, months: 1.5,
-    override: null, handling_own: null, pname: '単品 3 改', sales_class: 2, status: 'active', parent: 's002', parent_set_by: 'manual',
+    override: null, handling_own: null, pname: '単品 3 改', sales_class: 2, status: 'active', parent: 'grp1', parent_set_by: 'load',
   });
   assert.deepEqual(await primaryOf('s003'), ['0002']);
   assert.equal((await reqRow(id)).status, 'done');
-  assert.deepEqual((await reqRow(id)).result.changed.length, 8);
+  assert.deepEqual((await reqRow(id)).result.changed.length, 7);
   assert.ok(r.ne_steps.some((s) => /翌朝の照合/.test(s)));
 });
 
@@ -535,7 +538,7 @@ await ta('[4] 保存した値は夜間ロード (持ち主 company) を 2 回流
   await load(MASTER_OWNERSHIP);
   assert.equal((await skuRow('s003')).name, '単品 3');
   assert.equal((await skuRow('s003')).tax_rate, 0.1);
-  assert.equal((await skuRow('s003')).parent, 's002');   // 人が決めた親 (manual) は load でも触らない (0036)
+  assert.equal((await skuRow('s003')).parent, 'grp1');   // 代表 (親) は NE から (この画面では変えない・PR-7)
   await save('s003', { name: '単品 3 改', tax_rate: '8' });   // 以降の試験の前提
 });
 
@@ -642,9 +645,9 @@ await ta('[7] 形の誤り (400): 名前・売価・税率・分類・月数・�
   await b('s001', { handling: 'paused' }, /取扱/);
   await b('s001', { primary_supplier: '0003' }, /取引停止/);
   await b('s001', { primary_supplier: '0099' }, /ありません/);
-  await b('s001', { parent_code: 's001' }, /自分自身/);
-  await b('s001', { parent_code: 'set001' }, /単品か代表の名札/);
-  await b('s001', { parent_code: 'nope' }, /見つかりません/);
+  // 🆕 PR-7: 代表 (親) はこの画面では変えない (登録の時に 1 回だけ)
+  await b('s001', { parent_code: 's002' }, /この画面では変えられません/);
+  await b('s001', { parent_code: '' }, /この画面では変えられません/);
   await b('s001', { shipping_code: 'S99' }, /送料の表にありません/);
   await b('s001', { components: [{ code: 's002', qty: 1 }] }, /単品では直せません/);
   await b('set001', { tax_rate: '10' }, /セットでは直せません/);
@@ -1604,7 +1607,9 @@ await ta('[15] 単品・セットの画面: 描画・画面の JS・編集の印
   assert.match(r.text, /data-can-save="1"/);
   assert.match(r.text, /id="lab-jan">JAN</); assert.match(r.text, /ロジザードが正/);
   // 未保存に数えるのは保存する欄だけ (data-dirty-field)。保存の理由・全体から探す・一覧の絞る欄には付けない
-  for (const f of ['name', 'handling', 'parent_code', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan']) assert.match(r.text, new RegExp(`data-dirty-field="${f}"`), f);
+  for (const f of ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan']) assert.match(r.text, new RegExp(`data-dirty-field="${f}"`), f);
+  // 🆕 PR-7: 代表 (親) は見るだけ (保存の欄が無い)
+  assert.ok(!/data-dirty-field="parent_code"/.test(r.text) && /data-row="parent_code"/.test(r.text) && /登録の時に 1 回だけ/.test(r.text), '代表は見るだけ');
   assert.ok(!/id="reason"[^>]*data-dirty-field|data-dirty-field[^>]*id="reason"/.test(r.text), '保存の理由を数えない');
   // s001 を使うセット set005 は、前の試験 ([9] 日の境目) で原価が 2030-01-11 (画面の今日の翌日) から始まる = s001 の原価はここでは閉じる (サーバーも set_cost_future)
   assert.ok(r.text.includes('id="cost-future"') && r.text.includes('set005') && !r.text.includes('data-dirty-field="cost"'), '先の日付の原価のあるセットを使う単品の原価は閉じる');

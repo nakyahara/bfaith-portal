@@ -672,6 +672,14 @@ node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain --a
 - **一覧** (読むだけ・watcher): `node apps/company-db/master-compare/drift-list.mjs [--class parent_mismatch] [--limit 200] [--json]` (env COMPANY_DB_WATCH_URL・DATA_DIR)。1 件ずつ「NE と社内のどちらが正しいか」を決めて直す (NE を正 = 持ち主 load の間に夜間ロードが直す / 社内を正 = NE の画面で人が直す・翌朝の照合で確かめる)
 - **widen の判定** (`ops._widen_judge`・products.parent を足す試みだけ): 一番新しい記録の 6 つ = 0・prepared のロードの commit の後の記録・照合が読んだ材料の世代 = prepared のロードの材料の世代・NE の取得の完了が手の入口 (ne:item-screen) の停止の後・全部の商品の 2 段 / 循環 = 0 (`ops.parent_structure_counts`・その場で数える)。広げてよいキー = listing_components.amazon・products.parent・skus.sku_kind
 - 試験 = `node scripts/test-master-parent-gate.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-parent-gate-pg.mjs` (ロール・widen・本物の trigger)
+- **configured** (PR-8・2026-10-11): `config/master-ownership.mjs` の `'products.parent'` = `'company'` (configured の持ち主表のハッシュ = `e1b9c686b7280b1640840849948022fc27f918196026b586913d9d524841ae37`・16 キー。前 = `53a62b53…` = 10/9 の Amazon の widen の後の本番の active)。
+  **配っただけでは何も変わらない** (夜間ロード・写し・画面・門・まとまりの関数は DB の active を読む = products.parent は load のまま。configured を読むのは `prepare` / `prepare --widen` と証跡のハッシュだけ)。
+  🚨 ただし `config/master-ownership.mjs` は夜間ロードの規則の指紋 (`LOAD_RULE_FILES`) に入る = **朝の照合の後〜次の夜間ロード (02:00) の前に Render と miniPC の両方へ配り** (同じ日のうちに)、build と `configured_hash` を両方で確かめる (違う build だとその朝の照合 ① が `rule_mismatch`。revert も同じ)。
+  その後の当日の段 = 上の数え (drift-list) が 0 → `master-ownership-epoch.mjs prepare --widen --company 1` (足すキー = products.parent だけ) → `stop-manual --entry ne:item-screen` → 門の記録 (2 版) が prepared を見て書きかけ 0 →
+  **同じ材料で 2 回のロード** (🚨 0068 の判定は prepare の後 (`base_commit_seq` より後) の commit が**ちょうど 2 つ・1 つ目 = epoch active (持ち主 = 今の active)・2 つ目 = epoch prepared** を求める。`--use-prepared` だけを先に流す・後から active を流す = check / widen が断る = 試みを cancel して作り直す):
+  NE の取得 → 写し (`publish/fetch.mjs`) → 作り直し → `--verify-apply` → Render の同期 → **回収のロード `remote-load.mjs load --apply --wait` (`--use-prepared` なし)** → **prepared のロード `remote-load.mjs load --apply --wait --use-prepared`** → 写し → 作り直し → `--verify-apply`
+  (10/9 の Amazon の widen の `amz-widen-steps.ps1` と同じ順。間に夜間ロード (02:00) を挟まない) → 照合 ② (封をした回・6 つ = 0) → `check --attempt` → `widen --attempt` (中原さんの OK)。
+  試験 = `apps/company-db/test-master-parent.mjs` [8b] (configured = company を配っても、DB の active が load なら夜間ロードは NE の代表で名札と親を作る / widen の後は触らない)
 
 ### NE に取り込む CSV (0040。10 §6.1.1「③b NE に取り込む CSV の契約 v3」)
 
@@ -2454,3 +2462,9 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   widen の前に `select ops.reserve_existing_variation_groups('<人>');` (DB の持ち主だけ・何回でも同じ) を流し直せる
 - 当て方 (🚨 まだ流さない): 0066 の後・上の事前検査の数 → `migrate.mjs --dry-run` (0067 だけが出る) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs`・
   master_edit に 9 つの関数とまとまりの表の読み取り。流さなくても今の動きは変わらない) → `select ops.variation_reservation_check();` と予約の数を見る。Render と migration の順はどちらでもよい (lib の `regMaterialOf` は予約の表が無ければ読まない・まとまりの関数は company の後でないと動かない)
+
+### まとめての登録の要求のハッシュ (0069・2026-10-10。AI_reference CompanyDB構想/20 v7 §⑩ の PR-7・#1679 Codex R1 Medium 1。🚨 0067 は本番に適用済み = 本文は変えない)
+- **なぜ**: 0067 の `ops.variation_batches.spec_hash` は まとまり・軸・選択肢・子のコードと選択肢 だけ。画面は子の名前・売価・原価・JAN・出品カードの欄・理由も送る = 同じ request_id でそれらだけを変えた押し直しに前の答えが返っていた。
+- **表** `ops.variation_batch_requests` (request_id = まとめての登録・人・要求の全部のハッシュ (lib/master-variation.mjs の `variationPayloadHashOf`)・追記だけ)。**関数** `ops.variation_batch_record_request(request_id, actor, hash)` = この取引で開いた (閉じる前の) まとめての登録・開いた人だけ・1 回だけ書く (security definer・画面のロールに実行だけ・表は読むだけ)。
+- **lib の押し直し**: request の鍵の直後に、保存の記録 done があれば この表のハッシュと照らす = 同じ = 残した答えをすぐ返す (門・許可・持ち主・仕入先・product-hub の下書きは見ない) / 違う = 409 `request_id_reused`。0069 が無い DB の新しい要求 = 503 `db_not_ready`。
+- 当て方 (🚨 まだ流さない): 0068 の後・`migrate.mjs --dry-run` (0069 だけが出る) → 中原さんの OK → 本適用 → ロールの script (`create-master-edit-roles.mjs`) を流し直す。今は何も変わらない (まとめての登録は products.parent が company のときだけ = 今は 0067 の関数が断る)。

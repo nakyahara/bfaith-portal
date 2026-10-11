@@ -169,7 +169,9 @@ export const OUTBOX_NS_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.enqueue_group_
 export const VARIATION_EDIT_FUNCTIONS = Object.freeze(['ops.variation_batch_open(uuid, text, text, jsonb, jsonb)', 'ops.variation_batch_close(uuid, text, jsonb, jsonb)',
   'ops.cancel_variation_child(uuid, text, text, jsonb, bigint)', 'ops.edit_variation_labels(uuid, text, text, jsonb, bigint, integer, jsonb)',
   'ops.adopt_ne_parent_for_quarantined(uuid, text, text, jsonb, bigint)', 'ops.variation_group_code_problem(text)', 'ops.variation_parent_company()',
-  'ops.variation_sub_request_id(uuid, text)', 'ops.variation_max_children()']);
+  'ops.variation_sub_request_id(uuid, text)', 'ops.variation_max_children()',
+  // 🆕 0069 (#1679 Codex R1 Medium 1): まとめての登録の要求の全部のハッシュを残す
+  'ops.variation_batch_record_request(uuid, text, text)']);
 /** 🆕 0067: だれにも渡さない (関数の中の部品・守りの trigger・予約の事前検査と入れる関数 = DB の持ち主だけ) */
 export const VARIATION_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.variation_label_problem(text, integer)', 'ops.variation_lock_group(bigint)', 'ops.variation_lock_code(text)',
   'ops.guard_variation_write()', 'ops.check_variation_batch_closed()', 'core.check_parent_one_level()', 'ops.variation_existing_groups()', 'ops.variation_reservation_check()',
@@ -178,7 +180,7 @@ export const VARIATION_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.variation_labe
   'ops._open_variation_write(text, uuid, text, text, jsonb, bigint, bigint[], text, jsonb)', 'ops._variation_replay(uuid, text, text, text, bigint, bigint)']);
 /** 🆕 0067: 画面のロールが読むまとまりの表 (書き込みは関数だけ)。無い DB では付けない */
 export const VARIATION_SELECT = Object.freeze(['ops.variation_group_codes', 'core.variation_axes', 'core.variation_options', 'core.sku_variation_choices',
-  'ops.variation_group_revisions', 'ops.variation_batches', 'ops.variation_parent_adoptions']);
+  'ops.variation_group_revisions', 'ops.variation_batches', 'ops.variation_parent_adoptions', 'ops.variation_batch_requests']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
