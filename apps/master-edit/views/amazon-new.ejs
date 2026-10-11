@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // 新しい seller SKU の対応を作る入口 (10/11)。GET /amazon/new?sku= の答え: 形の誤り・もうある (そのページへ案内)・似た SKU / 気をつけること (見てから作る)。
+    // 作ってよいときは router が /amazon/sku?sku= へ 303 で送る = この画面には出ない
+    const c = check && check.ok ? check : null;
+    const skuHref = (s) => base + '/amazon/sku?sku=' + encodeURIComponent(s);
+    const stateBadge = (st) => (st === 'active' ? ['ok', MAP_STATES.active] : st === 'deleted' ? ['mute', MAP_STATES.deleted] : ['warn', '出品だけ (対応なし)']);
+    const kindText = (s) => (s.kind === 'symbols' ? '記号だけ違う' : `${s.distance} 文字違い`);
+  %>
+  <div class="page" id="amazon-new-page">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/amazon/">Amazon SKU</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">新しい seller SKU</span></nav>
+    <div class="ph">
+      <div>
+        <h1>新しい seller SKU の対応を作る</h1>
+        <div class="lead">売れる前に作っておけば、最初の注文から商品に結びつき、売上の日次で商品に分けられます。古い表 (miniPC の SKU マスタ・Render) と FBA 補充に届くのは、毎朝 07:00 の写しの後です。</div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/manual#amazon-new"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
+    </div>
+
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
+    <% if (amazonClosed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= amazonClosedWhy %>)</div><div class="hint">確かめることはできますが、作る画面は見るだけになります。切替日までは Amazon SKU の対応の正は miniPC の SKU マスタ (/apps/warehouse の「SKUマスタ」) です。</div></div></div><% } %>
+    <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+
+    <%- include('_amazon-create', { createValue: raw }) %>
+
+    <% if (shapeError) { %>
+    <div class="callout err" role="alert" id="new-result"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= shapeError %></div><div class="hint">直してから、もう一度「作り始める」を押してください。何も作っていません。</div><% if (check && check.canonical) { %><div class="exists-row" style="margin-top:10px"><a class="btn soft" id="use-canonical" href="<%= base %>/amazon/new?sku=<%= encodeURIComponent(check.canonical) %>">半角にそろえた <span class="mono"><%= check.canonical %></span> で確かめる</a></div><% } %></div></div>
+    <% } else if (check && !check.ok) { %>
+    <div class="callout warn" id="new-result"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><%= check.message %></div></div>
+    <% } else if (c && c.next === 'exists') { const ex = c.exists; const [tone, label] = stateBadge(ex.state); %>
+    <section class="panel todo-card warnc" id="new-result" aria-labelledby="h-exists">
+      <div class="panel-h">
+        <span class="hico" aria-hidden="true" style="color:var(--warn);border-color:rgba(255,200,87,.45);background:var(--warn-bg)"><svg class="ic"><use href="#i-info"/></svg></span>
+        <h2 id="h-exists">もうあります</h2>
+        <span class="sub">新しくは作りません · その画面で直せます</span>
+      </div>
+      <div class="exists-row">
+        <span class="code-pill"><%= ex.seller_sku %></span>
+        <span class="b <%= tone %>"><% if (ex.state === 'active') { %><span class="dot" aria-hidden="true"></span><% } %><%= label %></span>
+        <span class="nm"><%= ex.name || '' %></span>
+        <a class="btn pri" href="<%= skuHref(ex.seller_sku) %>"><%= ex.state === 'deleted' ? '開く (もう一度登録できます)' : '開く' %><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg></a>
+      </div>
+      <% if (!ex.same) { %><div class="hint" style="margin-top:8px">打った <span class="mono"><%= c.sku %></span> は、全角・ダッシュ・空白のちがいを除くと <span class="mono"><%= ex.seller_sku %></span> と同じ SKU と見ます。</div><% } %>
+      <% if (ex.state === 'deleted') { %><div class="hint" style="margin-top:8px">削除済み (墓標) です。開いて保存すると、同じ seller SKU をもう一度登録します (登録日は新しくなります)。</div><% } %>
+    </section>
+    <% } else if (c && c.next === 'confirm') { %>
+    <section class="panel todo-card warnc" id="new-result" aria-labelledby="h-confirm" data-raw="<%= raw %>" data-sku="<%= c.sku %>">
+      <div class="panel-h">
+        <span class="hico" aria-hidden="true" style="color:var(--warn);border-color:rgba(255,200,87,.45);background:var(--warn-bg)"><svg class="ic"><use href="#i-warn"/></svg></span>
+        <h2 id="h-confirm">作る前に、打ち間違いがないか見てください</h2>
+        <span class="sub"><span class="mono"><%= c.sku %></span> はまだありません</span>
+      </div>
+      <% if (c.similar.length) { %>
+      <div class="lab2">もしかして (似た seller SKU<%= c.similar_total > c.similar.length ? ` ${c.similar_total} 件のうち近い ${c.similar.length} 件` : ` ${c.similar.length} 件` %>)</div>
+      <ul class="simlist">
+        <% for (const s of c.similar) { const [tone, label] = stateBadge(s.state); %>
+        <li><a class="linkchip" href="<%= skuHref(s.seller_sku) %>"><span class="mono"><%= s.seller_sku %></span></a><span class="b <%= tone %>"><%= label %></span><span class="b mute"><%= kindText(s) %></span><span class="nm"><%= s.name || '' %></span></li>
+        <% } %>
+      </ul>
+      <% } %>
+      <% if (c.similar_incomplete) { %><div class="hint" id="sim-incomplete">出品が多いので、長さの近い <%= SIMILAR_SCAN_MAX.toLocaleString('ja-JP') %> 件だけと比べました (もっとあります)。</div><% } %>
+      <% if (c.similar_symbols_incomplete) { %><div class="hint" id="sim-symbols-incomplete">記号だけ違う出品は最大 <%= SIMILAR_SYMBOLS_MAX %> 件と比べました (もっとあります)。</div><% } %>
+      <% if (c.warnings.length) { %>
+      <ul class="warnlist"><% for (const w of c.warnings) { %><li><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><span><%= w %></span></li><% } %></ul>
+      <% } %>
+      <div class="exists-row" style="margin-top:12px">
+        <a class="btn pri" href="<%= skuHref(c.sku) %>" id="create-anyway"><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>打ち間違いではない: <span class="mono"><%= c.sku %></span> を新しく作る</a>
+        <span class="hint">直すときは上の欄で打ち直して「作り始める」</span>
+      </div>
+    </section>
+    <% } %>
+  </div>
+  <%- include('_footer') %>
+  <script src="<%= base %>/public/me-amazon-new.js?v=<%= assetV %>" defer></script>
+</body>
+</html>

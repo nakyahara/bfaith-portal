@@ -10,7 +10,8 @@
   const cur = page ? page.cur : null;
   const map = cur ? cur.map : null;
   const deleted = !!map && map.state === 'deleted';
-  const canSave = !!page && canEdit && !dbError && !amazonClosed;
+  const refusedNew = locals.newSkuProblems || [];
+  const canSave = !!page && canEdit && !dbError && !amazonClosed && !refusedNew.length;
   const dis = canSave ? '' : ' disabled';
   const RES = { manual: '人', imported: 'SKU マスタから', exact: 'FBM の完全一致', normalized: 'FBM の完全一致 (正規化)', map: '対応表' };
   const REG = { draft: '下書き', ne_pending: 'NE登録待ち', ne_confirmed: 'NE確認済み', distributable: '配る対象', available: '登録済み', quarantined: '要確認', cancelled: 'やめた' };
@@ -46,6 +47,7 @@
 
     <% if (amazonClosed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= amazonClosedWhy %>)</div><div class="hint">見るだけです。切替日までは、この SKU の対応の正は miniPC の SKU マスタ (/apps/warehouse の「SKUマスタ」) です。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+    <% if (refusedNew.length) { %><div class="callout err" role="alert" id="new-sku-refused"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">まだ出品の無い seller SKU は、この形では先に作れません</div><ul class="warnlist" style="color:inherit"><% for (const w of refusedNew) { %><li><%= w %></li><% } %></ul><div class="hint">後で Amazon の本物の SKU と結びつかないまま残るためです。Seller Central と同じ半角の SKU で作るか、Amazon に出品して夜間の取り込みが出品を入れた後に作ってください。</div></div></div><% } %>
     <% if (!map) { %>
       <div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">この seller SKU の対応は Company DB にまだありません</div><div class="hint"><% if (cur.components.length) { %>下の構成は夜間の取り込みが作った今の構成 (miniPC の SKU マスタ・FBM の完全一致から) です。<% } %>保存すると、この seller SKU の対応を新しく作ります。</div></div></div>
     <% } else if (deleted) { %>
@@ -67,7 +69,7 @@
             <% if (page.related.length) { %><div style="grid-column:1 / -1"><div class="k">同じ NE の商品を使う seller SKU</div><div class="v"><% for (const r of page.related) { %><a class="linkchip" href="?sku=<%= encodeURIComponent(r.seller_sku) %>" title="<%= r.name %>"><span class="mono"><%= r.seller_sku %></span></a><% } %></div></div><% } %>
           </div>
           <% } else { %>
-          <div class="hint">Company DB にこの seller SKU の出品はまだありません。保存すると出品も作ります (ASIN・FNSKU は夜間の取り込みが付けます)。</div>
+          <div class="hint">Company DB にこの seller SKU の出品はまだありません (まだ売れていない・Amazon の出品の写しにも無い)。保存すると出品も作ります。ASIN・FNSKU は、Amazon に出品した後に夜間の取り込みが付けます。FBA / FBM はここでは選びません (Amazon の出品の手数料の写しから付きます)。</div>
           <% } %>
         </section>
 
