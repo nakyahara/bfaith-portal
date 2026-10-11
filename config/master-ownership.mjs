@@ -32,7 +32,10 @@
  * 🆕 2026-10-11 products.parent = 'company' (代表の正本 = AI_reference CompanyDB構想/20 v7 §⑩ の PR-8 = configured)。扱いのコードは PR-7 (#1679・capable・
  *    まとまりの登録の画面・saveSku から代表の欄を外した)・DB は PR-5 (0067 = まとまりの関数は DB の active が company のときだけ動く)・PR-6 (0068 = 広げる許可・親の生の数え)。
  *    これを Render と miniPC の両方に配ってから `master-ownership-epoch.mjs prepare --widen --company 1`
- *    (足すキー = configured の company − active = products.parent だけ) → stop-manual --entry ne:item-screen → … → --use-prepared のロード → 照合 ② (親の生の数え = 0) → widen で
+ *    (足すキー = configured の company − active = products.parent だけ) → stop-manual --entry ne:item-screen → 門の記録 (2 版) が prepared を見て書きかけ 0 →
+ *    同じ材料で 2 回のロード = **回収のロード (remote-load.mjs load --apply --wait・--use-prepared なし・epoch active)** → **prepared のロード (同じ + --use-prepared)**
+ *    (0068 の判定は prepare の後の commit がちょうど 2 つ・1 つ目 active・2 つ目 prepared を求める = 逆の順・間に 02:00 の夜間ロード = 断る = 試みを作り直す。
+ *    10/9 の Amazon の amz-widen-steps.ps1 と同じ順・db/company/README.md の 0068 の節) → 写し → 作り直し → verify-apply → 照合 ② (親の生の数え = 0) → check → widen で
  *    DB の active に入った時に初めて切り替わる。配ってから widen までの間は DB の active (products.parent = load) のまま = 夜間ロード (NE の代表で名札と親を作る)・
  *    写し・画面 (まとまりの欄は出ない・まとまりの関数は DB が断る)・門は今までの動き。
  *    戻し方: prepare --widen の前 = この行を 'load' に戻して配る (DB は何も変わっていない。配る時刻の条件は上と同じ) /
