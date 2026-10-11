@@ -46,9 +46,15 @@ const ROLES = ['master_edit', 'master_gate_render', 'master_gate_minipc', 'maste
 const PW = Object.fromEntries(ROLES.map((r) => [r, `t_${crypto.randomBytes(12).toString('hex')}`]));
 const WPW = { watcher: `w_${crypto.randomBytes(12).toString('hex')}`, watch_writer: `ww_${crypto.randomBytes(12).toString('hex')}` };
 const single = (code) => ({ code, name: code, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 3, cost: { jpy: 100, source: 'ne', status: 'COMPLETE' } });
-const GONE = ['p01', 'p02', 'p03', 'p04', 'p05', 'p06', 'p07', 'p08', 'p09', 'p10', 'p11', 'p12'];
-const PLAN = { skus: [...[...GONE, 'keep', 'k2', 'k3'].map(single), { ...single('pset'), kind: 'set', cost: { jpy: 100, source: 'set_calc', status: 'COMPLETE' } }],
-  variationGroups: [], setComponents: [{ parentCode: 'pset', childCode: 'keep', qty: 1, source: 'ne' }], listings: [], observations: [], physicals: [], compliance: [], workers: [],
+// zgone (先に作る = sku_id が小さい) と agone (後 = 大きい) = コードの順と sku_id の順が逆 ([D] の鍵の順の試験)
+const GONE = ['zgone', 'p01', 'p02', 'p03', 'p04', 'p05', 'p06', 'p07', 'p08', 'p09', 'p10', 'p11', 'p12', 'agone'];
+const setSku = (code) => ({ ...single(code), kind: 'set', cost: { jpy: 100, source: 'set_calc', status: 'COMPLETE' } });
+const rakuten = (code, comps) => ({ mall: 'rakuten', shopCode: 'main', listingCode: code, status: 'active', components: comps.map((c) => ({ code: c, qty: 1, resolution: 'exact', evidence: { source: 'rakuten_sku_map' } })) });
+const PLAN = { skus: [...[...GONE, 'keep', 'k2', 'k3', 'k4', 'k5', 'k6'].map(single), setSku('pset'), setSku('pset2'), setSku('pset3')],
+  variationGroups: [],
+  setComponents: [{ parentCode: 'pset', childCode: 'keep', qty: 1, source: 'ne' }, { parentCode: 'pset2', childCode: 'k4', qty: 1, source: 'ne' }, { parentCode: 'pset2', childCode: 'k5', qty: 1, source: 'ne' },
+    { parentCode: 'pset3', childCode: 'k6', qty: 1, source: 'ne' }],
+  listings: [rakuten('r-l1', ['k4', 'k5']), rakuten('r-l2', ['k6'])], observations: [], physicals: [], compliance: [], workers: [],
   suppliers: [{ code: '0001', name: 'AMC' }], supplierSkus: [] };
 let runN = 0;
 const runId = () => `mc_20301011T${String(++runN).padStart(9, '0')}Z_${crypto.randomBytes(3).toString('hex')}`;
@@ -257,6 +263,47 @@ try {
       (select count(*)::int from core.products p where p.parent_product_id = (select product_id from core.skus where code = 'p02')) as par`);
     assert.deepEqual(refs[0], { comp: 0, lc: 0, par: 0 });
     for (const c of ['p01', 'p02', 'p05']) assert.equal(await regOf(c), 'cancelled');
+  });
+  await ta('[E2] #1683 Codex R2 Medium 1: やめた子・商品は「わざと除く」= 親 / 出品のほかの古い自動の構成は消える (DB が A + C・材料が A + やめた X → C が消え X は入らない / 全部やめた = 古い構成が全部消える)', async () => {
+    const before = await q(`select (select string_agg(k.code, ',' order by k.code) from core.sku_components c join core.skus p on p.sku_id = c.parent_sku_id join core.skus k on k.sku_id = c.child_sku_id where p.code = 'pset2') as s2,
+      (select string_agg(k.code, ',' order by k.code) from core.listing_components lc join core.listings l on l.listing_id = lc.listing_id join core.skus k on k.sku_id = lc.sku_id where l.listing_code = 'r-l1') as l1`);
+    assert.deepEqual(before[0], { s2: 'k4,k5', l1: 'k4,k5' });
+    const PLAN3 = { ...PLAN,
+      setComponents: [{ parentCode: 'pset', childCode: 'keep', qty: 1, source: 'ne' }, { parentCode: 'pset2', childCode: 'k4', qty: 1, source: 'ne' }, { parentCode: 'pset2', childCode: 'p01', qty: 1, source: 'ne' },
+        { parentCode: 'pset3', childCode: 'p02', qty: 1, source: 'ne' }],
+      listings: [rakuten('r-l1', ['k4', 'p05']), rakuten('r-l2', ['p05'])] };
+    const r = await runInitialLoad(dbO, PLAN3, { log: () => {}, runId: `gone_load3_${name}`, host: 'test' });
+    assert.equal(r.ok, true, r.error);
+    const comps = async (parent) => (await q('select k.code from core.sku_components c join core.skus p on p.sku_id = c.parent_sku_id join core.skus k on k.sku_id = c.child_sku_id where p.code = $1 order by 1', [parent])).map((x) => x.code);
+    const lcs = async (lc) => (await q('select k.code from core.listing_components c join core.listings l on l.listing_id = c.listing_id join core.skus k on k.sku_id = c.sku_id where l.listing_code = $1 order by 1', [lc])).map((x) => x.code);
+    assert.deepEqual(await comps('pset2'), ['k4'], 'pset2 = A だけ (C = k5 が消える・X = p01 は入らない)');
+    assert.deepEqual(await comps('pset3'), [], 'pset3 = 子が全部やめた = 古い自動の構成 (k6) が消える');
+    assert.deepEqual(await lcs('r-l1'), ['k4'], 'r-l1 = A だけ');
+    assert.deepEqual(await lcs('r-l2'), [], 'r-l2 = 全部やめた = 古い自動の構成が消える');
+  });
+
+  await ta('[D] #1683 Codex R2 Medium 2: CLI の複数件の取消は sku_id の昇順で鍵を取る = ほかの処理 (Amazon の保存・構成の昇格 = sku_id の昇順の鍵) と並んでもデッドロックしない', async () => {
+    const [zid, aid] = [await sid('zgone'), await sid('agone')];
+    assert.ok(BigInt(zid) < BigInt(aid), 'zgone の sku_id が agone より小さい (コードの順と逆) 前提');
+    const { runGone } = await import('./company-db/master-gone-from-ne.mjs');
+    const dry = await runGone(pgAdapter(MO), { apply: false, codes: ['agone', 'zgone'] }, { log: () => {} });
+    assert.equal(dry.checks.filter((c) => c.ok).length, 2, JSON.stringify(dry.checks.map((c) => c.problems)));
+    const X = await open(null); const M = await open('master_ops');
+    try {
+      await X.query('begin');
+      await X.query(`set local lock_timeout = '5s'`);
+      const lockSql = "select pg_advisory_xact_lock(hashtextextended('core.sku:' || $1::text, 0))";   // 0054 の Amazon の保存・構成の昇格と同じ鍵 (sku_id の昇順)
+      await X.query(lockSql, [zid]);
+      const p = runGone(pgAdapter(M), { apply: true, codes: ['agone', 'zgone'], expectHash: dry.planHash, actor: 'naka@test', reason: 'NE で消えた' }, { log: () => {} });
+      p.catch(() => {});
+      assert.equal(await stillWaiting(p, 800), true, 'CLI がほかの処理の鍵を待たずに進んだ');
+      await X.query(lockSql, [aid]);   // 逆順だと CLI が aid を持って zid を待つ = ここでデッドロック
+      await X.query('commit');
+      const r = await p;
+      assert.equal(r.exitCode, 0, JSON.stringify(r.error));
+      assert.deepEqual(r.applied.map((a) => a.code), ['zgone', 'agone']);
+      assert.equal(await regOf('zgone'), 'cancelled'); assert.equal(await regOf('agone'), 'cancelled');
+    } finally { try { await X.query('rollback'); } catch { /* */ } await done(X, M); }
   });
 } finally {
   for (const c of clients.slice(1)) { try { await c.end(); } catch { /* */ } }

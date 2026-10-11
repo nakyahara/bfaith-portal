@@ -92,7 +92,8 @@ export async function runGone(db, opts, { log = console.log } = {}) {
   try {
     const checks = await listGoneChecks(db, codes);
     const planHash = gonePlanHash(checks);
-    const okRows = checks.filter((r) => r.ok);
+    // 🆕 #1683 Codex R2 Medium 2: 1 つの取引で SKU の鍵を commit まで持つ = ほかの処理 (Amazon の保存・構成の昇格・セットの登録) と同じ数値の sku_id の昇順で取る (逆順のデッドロックを作らない)
+    const okRows = checks.filter((r) => r.ok).sort((a, b) => (BigInt(a.sku_id) < BigInt(b.sku_id) ? -1 : BigInt(a.sku_id) > BigInt(b.sku_id) ? 1 : 0));
     log(`確かめ直し: やめてよい ${okRows.length} 件・計画のハッシュ ${planHash}`);
     if (planHash !== opts.expectHash) {
       throw Object.assign(new Error(`計画のハッシュが dry-run と違う (今 ${planHash}・渡された ${opts.expectHash}) = 対象か証拠が変わった。dry-run をもう一度見てから`), { reason: 'plan_mismatch' });

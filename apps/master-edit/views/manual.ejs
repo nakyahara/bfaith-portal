@@ -190,8 +190,9 @@
       <li>やり方: NE の商品の画面でそのコードを検索して<b>出てこないのを確かめる</b> → <b>理由</b> (例: 「NE で消えた (別のコード xxx で作り直した)」) を書く → 「NE で消えたのを確かめた」に印 → 「やめた にする」→ 確かめの窓で、もう一度「やめた にする」。
         通ると画面を読み直し、登録の状態が「やめた」になります。理由・押した人・Company DB が確かめた取得の回は、登録の状態の記録に残ります。</li>
       <li>通信が切れたときは、もう一度押してください (同じ操作は 2 回入りません)。</li>
-      <li>たくさんあるとき (中原さんが miniPC で): <code>node -r dotenv/config scripts/company-db/master-gone-from-ne.mjs --codes-file gone.txt</code> で <b>確かめだけ</b> (何も変えない) → 答えを見て OK なら
-        <code>--apply --expect &lt;やめてよいの数&gt; --actor &lt;メール&gt; --reason "&lt;理由&gt;" --yes</code> を足して流します (1 件ずつ・断られた件は理由が出て、残りは続けます)。</li>
+      <li>たくさんあるとき (中原さんが miniPC で): <code>node -r dotenv/config scripts/company-db/master-gone-from-ne.mjs --codes-file gone.txt</code> で <b>確かめだけ</b> (何も変えない)。最後に <b>計画のハッシュ</b> (64 桁) が出ます → 答えを見て OK なら
+        <code>--apply --expect-hash &lt;計画のハッシュ&gt; --actor &lt;メール&gt; --reason "&lt;理由&gt;" --yes</code> を足して流します。
+        <b>全部うまくいったときだけ</b>まとめて「やめた」になります (確かめた時から対象や根拠が 1 つでも変わった・1 件でも断られた = 1 件も変えません。そのときは確かめからやり直します)。</li>
       <li>やめた商品は、代表 (親) のずれの数え (drift-list) にも数えません。夜間の取り込みが「業務で使える」に戻すこともありません。</li>
     </ul>
 

@@ -725,7 +725,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
         report.conflicts.push({ kind: 'components_on_non_set_removed', count: bad.length, sha256: ev.sha256 });
       } else if (bad.length) report.conflicts.push({ kind: 'components_on_non_set_kept', count: bad.length, sha256: normEvidence(bad).sha256, rows: bad });
     }
-    const compCand = []; const compKeys = new Set(); const parentsWithSkip = new Set();
+    const compCand = []; const compKeys = new Set(); const parentsWithSkip = new Set(); const compCancelledParents = new Map();   // 🆕 0070: やめた子だけを除いた親 → 親のコード
     for (const c of planSetComponents) {
       const p = skuIdOf(c.parentCode); const ch = skuIdOf(c.childCode);
       if (!p) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '親 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_parent' }); continue; }
@@ -734,13 +734,14 @@ export async function runInitialLoad(db, plan, opts = {}) {
       if (heldKind && heldKind.cdb_kind !== 'set') { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `親の区分が NE (${heldKind.ne_kind}) と社内 (${heldKind.cdb_kind}) で違う = 構成は触らない`, reason_code: 'kind_held', _p: p, ...(ch ? { _ch: ch } : {}) }); parentsWithSkip.add(p); continue; }
       if (acceptedKind.get(normSku(c.parentCode)) !== 'set') { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `親の区分がセットでない (${acceptedKind.get(normSku(c.parentCode))}) = 構成を入れない`, reason_code: 'parent_not_set', _p: p, ...(ch ? { _ch: ch } : {}) }); parentsWithSkip.add(p); continue; }
       if (!ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_child', _p: p }); parentsWithSkip.add(p); continue; }
-      if (cancelledSkus.has(ch)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子の商品はやめた (cancelled) = 構成に入れない', reason_code: 'child_cancelled', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }   // 🆕 0070
+      // 🆕 0070 (#1683 Codex R2 Medium 1): やめた子 = 「材料が分からない」ではなく「わざと除く」= 親は prune してよい (parentsWithSkip に入れない)・子が全部やめた親も prune の候補に入れる
+      if (cancelledSkus.has(ch)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子の商品はやめた (cancelled) = 構成に入れない', reason_code: 'child_cancelled', _p: p, _ch: ch }); compCancelledParents.set(p, c.parentCode); continue; }
       if (p === ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '自分自身', reason_code: 'self', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
       const k = `${p}|${ch}`; if (compKeys.has(k)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '重複', reason_code: 'duplicate', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; } compKeys.add(k);
       if (!(c.qty > 0)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `数量が不正 (${c.qty})`, reason_code: 'invalid_qty', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
       compCand.push({ company_id: COMPANY_ID, parent_sku_id: p, child_sku_id: ch, qty: c.qty, source: c.source || 'imported', created_by_type: 'system', created_by_id: runId, _parent: c.parentCode, _child: c.childCode });
     }
-    const compParents = [...new Set(compCand.map((r) => r.parent_sku_id))];
+    const compParents = [...new Set([...compCand.map((r) => r.parent_sku_id), ...compCancelledParents.keys()])];
     const compManual = new Map();
     if (compParents.length) for (const r of (await db.query("select parent_sku_id, child_sku_id, qty from core.sku_components where source = 'manual' and parent_sku_id = any($1::bigint[])", [compParents])).rows) compManual.set(`${r.parent_sku_id}|${r.child_sku_id}`, Number(r.qty));
     const compRows = []; const compManualSame = [];
@@ -778,7 +779,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
           [heldKeyed.map((x) => x._p), heldKeyed.map((x) => x._ch)])).rows) heldRows.set(`${r.parent_sku_id}|${r.child_sku_id}`, { qty: Number(r.qty), source: r.source });
       }
       const heldOf = (x) => (x._p && x._ch ? heldRows.get(`${x._p}|${x._ch}`) ?? null : 'unknown');
-      const parentCode = new Map(compCand.map((r) => [r.parent_sku_id, r._parent]));
+      const parentCode = new Map([...compCancelledParents, ...compCand.map((r) => [r.parent_sku_id, r._parent])]);
       decisions.set_components = {
         owned: loadOwns('sku_components'),
         prune_parents: pruneParents.map((p) => [parentCode.get(p) ?? null, Number(p)]),
@@ -1009,14 +1010,15 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const lcSec = section(report, 'listing_components', acceptedListings.reduce((n, l) => n + compsOf(l).length, 0));
     if (!amazonCompsOwned) lcSec.notes.push(`Company DB が正: Amazon の構成 ${amzOwnedSkip} 行は見送り (SKU マスタ・Sheet の構成。FBM の完全一致 ${amzFbmKept} 行は対応の無い出品にだけ続ける)`);
     if (amzMapped) lcSec.notes.push(`Amazon SKU の対応 (Company DB) がある出品の構成 ${amzMapped} 行は見送り (対応が正)`);
-    const lcCand = []; const lcKeys = new Set(); const listingsWithSkip = new Set();
+    const lcCand = []; const lcKeys = new Set(); const listingsWithSkip = new Set(); const lcCancelledListings = new Set();   // 🆕 0070: やめた商品だけを除いた出品
     const asinCands = new Map(); const extRows = []; const fnskuClearLids = [];
     for (const l of acceptedListings) {
       const lid = listingIdOf(l); if (!lid) continue;
       for (const c of compsOf(l)) {
         const sid = skuIdOf(c.code);
         if (!sid) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'NE コードが無い (または正規化衝突で落とした)' }); listingsWithSkip.add(lid); continue; }
-        if (cancelledSkus.has(sid)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'その商品はやめた (cancelled) = 出品の構成に入れない' }); listingsWithSkip.add(lid); continue; }   // 🆕 0070
+        // 🆕 0070 (#1683 Codex R2 Medium 1): やめた商品 = わざと除く = 出品は prune してよい (listingsWithSkip に入れない)・全部やめた出品も prune の候補に入れる
+        if (cancelledSkus.has(sid)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'その商品はやめた (cancelled) = 出品の構成に入れない' }); lcCancelledListings.add(lid); continue; }
         const k = `${lid}|${sid}`; if (lcKeys.has(k)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: '重複' }); listingsWithSkip.add(lid); continue; } lcKeys.add(k);
         if (!(c.qty > 0)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: `数量が不正 (${c.qty})` }); listingsWithSkip.add(lid); continue; }
         lcCand.push({ company_id: COMPANY_ID, listing_id: lid, sku_id: sid, qty: c.qty, sort_order: Number.isInteger(c.sortOrder) ? c.sortOrder : 0, resolution: c.resolution || 'imported', resolved_by_type: 'system', resolved_by_id: runId, evidence: c.evidence ? JSON.stringify(c.evidence) : null, _mall: l.mall, _listing: l.listingCode, _code: c.code });
@@ -1038,7 +1040,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       } else if (l.fnskuCleared) fnskuClearLids.push(lid);   // 出どころが明示的に FNSKU を外した → 既存の自動付与を閉じる
       for (const x of (l.externalIds || [])) if (x.value) extRows.push({ company_id: COMPANY_ID, entity_type: 'listing', entity_id: lid, system: x.system, id_kind: x.kind, external_value: x.value, resolution: 'imported', resolved_by_type: 'system', resolved_by_id: runId });
     }
-    const lcListings = [...new Set(lcCand.map((r) => r.listing_id))];
+    const lcListings = [...new Set([...lcCand.map((r) => r.listing_id), ...lcCancelledListings])];
     const lcManual = new Map();
     if (lcListings.length) for (const r of (await db.query("select listing_id, sku_id, qty from core.listing_components where resolution = 'manual' and listing_id = any($1::bigint[])", [lcListings])).rows) lcManual.set(`${r.listing_id}|${r.sku_id}`, Number(r.qty));
     const lcRows = [];
