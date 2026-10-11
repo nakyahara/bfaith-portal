@@ -220,6 +220,7 @@
   </div>
 
   <%- include('_footer') %>
+  <% if (showForm) { %><%- include('_vops') %><% } %>
   <div class="modal-bg" id="confirm-bg" role="dialog" aria-modal="true" aria-labelledby="confirm-h">
     <div class="modal conf">
       <h2 id="confirm-h"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>これで下書きにします</h2>
@@ -228,7 +229,7 @@
       <div class="mbtns"><button class="btn" type="button" id="confirm-no">戻って直す</button><button class="btn pri" type="button" id="confirm-yes" disabled>コードを確定して下書き保存</button></div>
     </div>
   </div>
-  <% if (showForm) { %><script src="<%= base %>/public/me-variation.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (showForm) { %><script src="<%= base %>/public/me-vops.js?v=<%= assetV %>" defer></script><script src="<%= base %>/public/me-variation.js?v=<%= assetV %>" defer></script><% } %>
   <% if (showForm && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>
