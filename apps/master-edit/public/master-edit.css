@@ -667,6 +667,9 @@ details.adv[open] > summary { border-color: var(--line-strong); color: #fff; }
 .kindcard.on { border-color: rgba(58, 231, 255, 0.65); background: linear-gradient(135deg, rgba(58, 231, 255, 0.13), rgba(16, 25, 44, 0.75)); box-shadow: 0 0 0 1px rgba(58, 231, 255, 0.2) inset, 0 12px 30px rgba(58, 231, 255, 0.08); }
 .kindcard.on .kico { color: var(--accent); border-color: rgba(58, 231, 255, 0.5); background: rgba(58, 231, 255, 0.12); }
 .kindcard.on .radio { border-color: var(--accent); background: radial-gradient(circle, var(--accent) 0 5px, transparent 6px); box-shadow: 0 0 10px rgba(58, 231, 255, 0.5); }
+/* 種類は 3 枚 (PR-7・見本 v2: ひとつだけ / 色違い・サイズ違いのまとまり / セット。狭い幅では縦に 1 列 = 下の 960px の決まり) */
+.kindcards.three { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) minmax(0, 1fr); }
+.kindcard .kt .newtag { margin-left: 6px; vertical-align: 2px; }
 /* 下書き保存まで あと N つ */
 .remain { font-size: 15px; font-weight: 600; margin-bottom: 2px; }
 .remain b { color: var(--warn); font-size: 22px; margin: 0 3px; }
@@ -823,7 +826,7 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
   .pipe:nth-child(3) { margin-right: 0; }
   .pipe:nth-child(3)::after { display: none; }
   .choices { grid-template-columns: 1fr; }
-  .kindcards { grid-template-columns: 1fr; }
+  .kindcards, .kindcards.three { grid-template-columns: 1fr; }
   .hchanges li { grid-template-columns: 1fr; gap: 2px; }
 }
 /* 新商品の登録: 飛び先で移ったとき・欄へ移ったとき、上の帯と飛び先の帯の下に出す */

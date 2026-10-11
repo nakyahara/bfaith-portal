@@ -317,14 +317,15 @@ await ta('[1] 持ち主が全部 load = PR の前と同じ (業務の表 7 つ�
   const mut2 = await quietly(() => FX.noopProbe(db, async () => { const r = await rebuildMProducts(); db.prepare("UPDATE m_reorder_setting SET synced_at = 'y' WHERE sku = 's-ne'").run(); return r; }));
   assert.notEqual(mut2.tables.all, GOLDEN.second.tables_all);
   db.prepare("UPDATE m_reorder_setting SET synced_at = 'x' WHERE sku = 's-ne'").run();
-  // (c) ④a で写さない列 (products.parent) を company にした・一緒に切り替える組の片方だけ = 扱えない = 作り直しを止める (何も書かない)
-  assert.deepEqual(MP.checkPublishOwnership(OWN('products.parent')), ['not_copied:products.parent']);
+  // (c) ④a で写さない列 (sku_components・🆕 PR-7 から products.parent は「写さない列」= NO_OLD_TABLE_COPY) を company にした・一緒に切り替える組の片方だけ = 扱えない = 作り直しを止める (何も書かない)
+  assert.deepEqual(MP.checkPublishOwnership(OWN('sku_components')), ['not_copied:sku_components']);
+  assert.deepEqual(MP.checkPublishOwnership(OWN('products.parent')), []);   // 🆕 PR-7: 代表は写さない列 (理由 = NO_OLD_TABLE_COPY)
   assert.deepEqual(MP.checkPublishOwnership(OWN('skus.name')), ['co_switch:products.name+skus.name']);
   assert.deepEqual(MP.checkPublishOwnership(OWN('skus.tax_rate', 'products.status')), ['co_switch:products.status+skus.handling', 'co_switch:skus.tax_rate+skus.tax_class']);
   assert.deepEqual(MP.checkPublishOwnership(OWN('skus.name', 'products.name', 'skus.tax_rate', 'skus.tax_class')), []);
-  assert.throws(() => MP.assertPublishOwnership(OWN('products.parent')), /④a で扱えない/);
+  assert.throws(() => MP.assertPublishOwnership(OWN('sku_components')), /④a で扱えない/);
   const t0 = FX.tablesDigest(db).all, nBuilds = count('m_products_builds');
-  for (const bad of [OWN('products.parent'), OWN('skus.name')]) {
+  for (const bad of [OWN('sku_components'), OWN('skus.name')]) {
     const r = await rebuild(bad);
     assert.deepEqual([r.ok, r.error, r.problem], [false, 'CDB_PUBLISH_UNAVAILABLE', 'ownership_not_supported']);
   }

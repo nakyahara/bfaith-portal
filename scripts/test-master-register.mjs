@@ -2019,7 +2019,7 @@ const { MASTER_OWNERSHIP: CONFIGURED } = await import('../config/master-ownershi
  *  configured = WIDENED + listing_components.amazon (10/8・⑦-2 PR-C。Amazon の widen の後の持ち主表) */
 const PROD13 = Object.freeze({ ...CONFIGURED, 'skus.sku_kind': 'load', 'listing_components.amazon': 'load' });   // 🚨 COMPANY_CAPABLE から作らない (#1641 で skus.sku_kind・⑦-2 PR-A で Amazon が入った = 15 キー・Codex #1640 R6 Medium)
 /** 旧 build (widen の前の能力 = 13 キー) = 今の COMPANY_CAPABLE から skus.sku_kind と listing_components.amazon (⑦-2 PR-A で入った) を明示して外す */
-const OLD_CAPABLE = Object.freeze(COMPANY_CAPABLE.filter((k) => k !== 'skus.sku_kind' && k !== 'listing_components.amazon'));
+const OLD_CAPABLE = Object.freeze(COMPANY_CAPABLE.filter((k) => k !== 'skus.sku_kind' && k !== 'listing_components.amazon' && k !== 'products.parent'));   // 🆕 PR-7 で products.parent も (configured は load = 本番の active にも無い)
 const WIDENED = Object.freeze({ ...PROD13, 'skus.sku_kind': 'company' });
 const snap = async () => one(`select (select count(*) from core.skus)::int as s, (select count(*) from ops.master_registrations)::int as r, (select count(*) from events.master_change_events)::int as e,
   (select count(*) from ops.product_hub_outbox)::int as o`);
