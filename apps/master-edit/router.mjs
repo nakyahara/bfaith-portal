@@ -32,6 +32,9 @@
  *   書ける人 = 名簿 (MASTER_EDITORS) かつ 発注アプリの利用権。Company DB の切替の門は見ない (発注アプリのマスタ管理と同じく、いつでも)
  *   ── Amazon SKU の対応 (⑦-1・0054・Company DB構想 16。保存を開く門は上と同じ + 持ち主 listing_components.amazon が 'company') ──
  *   GET  /amazon/            一覧 (Company DB の対応・墓標も)。?q=&state=&offset=
+ *   GET  /amazon/new?sku=    新しい seller SKU の対応を自分で作る入口 (まだ売れていない SKU も)。形 → もうある (対応・墓標) = その画面へ案内 →
+ *                            似た SKU・気をつけること (打ち間違いの守り) があれば見せて「このまま作る」/ 無ければ /amazon/sku?sku= へ (checked = 画面でもう見た)
+ *   GET  /api/amazon/check?sku=  同じ確かめ (読むだけ・打つとその場で)
  *   GET  /amazon/sku?sku=    1 つの seller SKU (見る・直す・墓標にする・墓標から戻す)。対応が無ければ「新しい対応」(今の構成は夜間ロードの写しとして見せる)
  *   GET  /amazon/sku/history?sku=  変更の記録 (対応・構成・出品)
  *   GET  /amazon/unmapped    未登録 = 直近 7 日に売れたのに構成が無い seller SKU (FBA / FBM で分ける・売上の公開が欠けた日は「未判定」)
@@ -79,7 +82,7 @@ import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
-import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, CHANNELS, UNMAPPED_DAYS } from './amazon-read.mjs';
+import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN } from './amazon-read.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
@@ -728,6 +731,30 @@ router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbE
   const phase = await readPhaseView(db);
   res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, channel, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
 }));
+/**
+ * 新しい seller SKU の対応を作る入口 (読むだけ・保存は今までどおり /amazon/sku の画面から POST /api/amazon/save)。
+ * 作ってよい (形が合う・対応が無い・似た SKU も気をつけることも無い、または checked = 画面でもう見た) = /amazon/sku?sku= へ 303
+ */
+const AMAZON_CHECK_RAW_MAX = 300;
+const TOO_LONG = `seller SKU が長すぎます (${AMAZON_CHECK_RAW_MAX} 文字まで)`;
+router.get('/amazon/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const raw = typeof req.query.sku === 'string' ? req.query.sku : '';
+  const asked = typeof req.query.sku === 'string';
+  const tooLong = raw.length > AMAZON_CHECK_RAW_MAX;
+  const check = db && asked && !tooLong ? await checkNewAmazonSku(db, raw) : null;
+  const checked = typeof req.query.checked === 'string' ? req.query.checked : '';
+  if (check && check.ok && (check.next === 'create' || (check.next === 'confirm' && checked === check.sku))) {
+    return res.redirect(303, `${req.baseUrl}/amazon/sku?sku=${encodeURIComponent(check.open)}`);
+  }
+  const phase = await readPhaseView(db);
+  const shapeError = tooLong ? TOO_LONG : check && !check.ok ? check.message : '';
+  res.status(shapeError ? 400 : 200).render(view('amazon-new.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, raw: raw.slice(0, AMAZON_CHECK_RAW_MAX), asked, check, shapeError, MAP_STATES, AMAZON_SKU_MAX_LEN });
+}));
+router.get('/api/amazon/check', (req, res) => {
+  const raw = typeof req.query.sku === 'string' ? req.query.sku : '';
+  if (raw.length > AMAZON_CHECK_RAW_MAX) return res.json({ ok: false, reason: 'shape', message: TOO_LONG });
+  return withPgApi(res, async (db) => res.json(await checkNewAmazonSku(db, raw)));
+});
 router.get('/amazon/sku/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
   let sku;
   try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).render(view('error.ejs'), { ...pageLocals(req), nav: 'amazon', message: e.message }); }

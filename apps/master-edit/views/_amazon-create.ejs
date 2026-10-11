@@ -1,0 +1,21 @@
+<%
+  // 新しい seller SKU の対応を「自分で作る」入口 (10/11・一覧の上と /amazon/new)。まだ売れていない・これから出品する SKU も先に作れる。
+  // 打つとその場で確かめる = public/me-amazon-new.js (GET /api/amazon/check・読むだけ)。JS が無くても「作り始める」で /amazon/new が同じ確かめをする
+  // 保存は今までどおり /amazon/sku の画面 (POST /api/amazon/save・名簿の人だけ・門は同じ)
+  const cv = typeof createValue === 'string' ? createValue : '';
+%>
+<section class="panel hud create-sku" id="create-sku" aria-labelledby="h-create">
+  <div class="panel-h">
+    <span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-plus"/></svg></span>
+    <h2 id="h-create">新しい seller SKU の対応を作る</h2>
+    <span class="sub">まだ売れていない・これから Amazon に出す SKU も、先に作っておけます</span>
+  </div>
+  <form method="get" action="<%= base %>/amazon/new" class="bigsearch create" id="create-form" data-base="<%= base %>">
+    <svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>
+    <input id="new-sku" name="sku" value="<%= cv %>" required maxlength="300" autocomplete="off" spellcheck="false" autocapitalize="off" aria-label="新しく作る seller SKU" aria-describedby="new-sku-hint" placeholder="Seller Central に出す seller SKU　例: pr_abc001">
+    <input type="hidden" name="checked" id="new-sku-checked" value="">
+    <button class="btn pri go" type="submit" id="new-sku-go"><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>作り始める</button>
+  </form>
+  <div class="create-out" id="new-sku-out" role="status" aria-live="polite"></div>
+  <div class="hint" id="new-sku-hint" style="margin-top:8px">Seller Central の SKU と同じ書き方で · 大文字は小文字に、前後の空白は除いてそろえます · もうある SKU はその画面へ案内します</div>
+</section>

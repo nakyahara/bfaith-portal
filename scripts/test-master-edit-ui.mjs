@@ -33,6 +33,7 @@
  *        削除は 1 回だけ確かめる・申告はファイルを落として sha256 を照合・1440 / 1280 / 1024 / 150% で横にはみ出さない
  *        (41〜46 = 構成品の照合・カードを作らないときの欄・確かめ直しの上限・Yahoo! の残値と誤りの欄・Amazon の変わらない保存)
  *  49〜50 利益 (1 個あたり・10/6): 単品 / セットの欄を変えると保存の前にその場で計算し直す (保存すると ○ → ○)・数でない・マイナスは赤・元に戻す・一覧の列と利益の少ない順
+ *  55 新しい seller SKU を自分で作る (10/11): 一覧の上の欄 = 打つとその場で確かめる・もしかしてを見た後は作る画面へ直行・まだ売れていない SKU を作って保存・もうある = 開く
  *  51 円の欄 (標準売価・原価・例外原価) の読みはサーバーと同じ (カンマ・全角の数字・空白): 保存すると変わること・前との差・保存するとこうなる・利益
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
@@ -1546,7 +1547,7 @@ const fillSet = async (p) => {
 const SCREENS2 = [
   ['新商品_単品', '/new?kind=single', fillNew], ['新商品_セット', '/new?kind=set', fillSet],
   ['Amazon_一覧', '/amazon/', null], ['Amazon_未登録', '/amazon/unmapped?channel=all', null], ['Amazon_1つのSKU', '/amazon/sku?sku=pr-k001', null],
-  ['Amazon_変更の記録', '/amazon/sku/history?sku=pr-k001-b', null], ['NE登録のCSV', '/reg-csv', null], ['変更の記録', '/sku/s003/history', null],
+  ['Amazon_変更の記録', '/amazon/sku/history?sku=pr-k001-b', null], ['Amazon_新しいSKU', '/amazon/new?sku=pr-k001-bx', null], ['NE登録のCSV', '/reg-csv', null], ['変更の記録', '/sku/s003/history', null],
 ];
 for (const [label, vp, scale] of [['1440', { width: 1440, height: 900 }, 1], ['1280', { width: 1280, height: 720 }, 1], ['1024', { width: 1024, height: 768 }, 1], ['1280×720 150%', { width: 853, height: 480 }, 1.5]]) {
   await ta(`[39] ${label}: 第 2 段の画面 (新商品・Amazon・NE 登録の CSV・変更の記録) が横にはみ出さない`, async (p) => {
@@ -1905,6 +1906,66 @@ for (const [label, vp, scale] of [['1280×720 100%', { width: 1280, height: 720 
     }
   }, vp, scale);
 }
+
+// MASTER_EDIT_UI_AMAZON_NEW_SHOTS=フォルダ を付けると、入口の写し (もしかして・もうある) を残す (目で見る用)
+const AMZ_NEW_SHOTS = process.env.MASTER_EDIT_UI_AMAZON_NEW_SHOTS || '';
+await ta('[55] 新しい seller SKU を自分で作る (10/11): 一覧の上の欄に打つ = その場で確かめる (出品だけある・もしかして・もうある・形の誤り)・もしかしてを見た後の Enter は作る画面へ直行・まだ売れていない SKU を作って保存・もうある SKU は「開く」', async (p) => {
+  const out = () => p.evaluate(() => document.getElementById('new-sku-out').textContent.replace(/\s+/g, ' ').trim());
+  const waitOut = (re) => p.waitForFunction((s) => new RegExp(s).test(document.getElementById('new-sku-out').textContent), re.source);
+  await p.goto(B + '/amazon/');
+  assert.match(await p.textContent('#h-create'), /新しい seller SKU の対応を作る/);
+  // 夜間の取り込みの出品 (対応なし) = 作れる
+  await p.fill('#new-sku', 'PR-K001');
+  await waitOut(/Amazon の出品はあります/);
+  // 打ち間違い = もしかして (1 文字違いの出品)・止めない
+  await p.fill('#new-sku', 'pr-k001x');
+  await waitOut(/もしかして/);
+  assert.match(await out(), /pr-k001x は、まだありません[\s\S]*もしかして[\s\S]*pr-k001[\s\S]*1 文字違い/);
+  assert.equal(await p.locator('#new-sku-out a.linkchip[href$="/amazon/sku?sku=pr-k001"]').count(), 1, 'もしかしての SKU を開ける');
+  if (AMZ_NEW_SHOTS) await p.screenshot({ path: AMZ_NEW_SHOTS + '/入口_もしかして.png' });
+  await Promise.all([p.waitForNavigation(), p.press('#new-sku', 'Enter')]);
+  assert.match(p.url(), /\/amazon\/sku\?sku=pr-k001x$/, '見た後は /amazon/new で止めずに作る画面へ');
+  // 作る画面 (出品も無い) で名前と構成を入れて保存
+  assert.match(await p.textContent('.idrow'), /対応なし/);
+  assert.match(await p.textContent('#h-listing ~ .hint, .panel.soft .hint'), /まだ売れていない/);
+  await p.fill('#name', '自分で作った 2 個組');
+  await p.click('#comp-add');
+  const row = p.locator('#comp-rows tr.comp-row').last();
+  await row.locator('.c-code').fill('k001'); await row.locator('.c-code').press('Tab');
+  await row.locator('.c-qty').fill('2'); await row.locator('.c-qty').press('Tab');
+  await p.waitForFunction(() => !document.getElementById('save').disabled);
+  await p.keyboard.press('Control+s');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /新しい対応を作りました/);
+  assert.deepEqual(await mapOf('pr-k001x'), { name: '自分で作った 2 個組', state: 'active' });
+  assert.equal((await pg.query("select catalog_item_id from core.listings where listing_code = 'pr-k001x'")).rows[0].catalog_item_id, null, 'ASIN の無い出品を作った');
+  // もうある = 「開く」に変わる・Enter でその画面へ
+  await p.goto(B + '/amazon/');
+  await p.fill('#new-sku', ' PR-K001X ');
+  await waitOut(/もうあります/);
+  assert.match(await out(), /もうあります[\s\S]*pr-k001x[\s\S]*有効/);
+  assert.match(await p.textContent('#new-sku-go'), /開く/);
+  if (AMZ_NEW_SHOTS) await p.screenshot({ path: AMZ_NEW_SHOTS + '/入口_もうある.png' });
+  await Promise.all([p.waitForNavigation(), p.press('#new-sku', 'Enter')]);
+  assert.match(p.url(), /\/amazon\/sku\?sku=pr-k001x$/);
+  // 形の誤り = その場で赤・押すと /amazon/new が 400 で同じ理由
+  await p.goto(B + '/amazon/');
+  await p.fill('#new-sku', 'a'.repeat(256));
+  await waitOut(/255 文字を超える/);
+  assert.equal(await p.locator('#new-sku-out .fmsg.err').count(), 1);
+  // 空の Enter は送らない
+  await p.fill('#new-sku', '');
+  await p.press('#new-sku', 'Enter');
+  await p.waitForTimeout(150);
+  assert.match(p.url(), /\/amazon\/$/);
+  // JS より先に送った (または直接開いた) = /amazon/new が「もしかして」を出す → 同じ値のまま「作り始める」= 作る画面へ
+  await p.goto(B + '/amazon/new?sku=pr-k001y');
+  assert.match(await p.textContent('#h-confirm'), /打ち間違いがないか/);
+  assert.match(await p.textContent('#new-result'), /もしかして[\s\S]*pr-k001x/);
+  await Promise.all([p.waitForNavigation(), p.click('#new-sku-go')]);
+  assert.match(p.url(), /\/amazon\/sku\?sku=pr-k001y$/);
+  assert.equal(await mapOf('pr-k001y'), undefined, '開いただけ = 作っていない');
+});
 
 await browser.close();
 server.close();

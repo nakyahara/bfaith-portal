@@ -8,8 +8,8 @@
  */
 import { normSku } from '../../lib/sku-norm.js';
 import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
-import { COMPANY_ID, jstDate } from '../../lib/master-write.mjs';
-import { readAmazonMap, MAP_STATES, AMAZON_JP_SHOP_CODE } from '../../lib/amazon-map-write.mjs';
+import { COMPANY_ID, jstDate, MasterWriteError } from '../../lib/master-write.mjs';
+import { readAmazonMap, sellerSkuIn, MAP_STATES, AMAZON_JP_SHOP_CODE } from '../../lib/amazon-map-write.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
 
 export const AMAZON_LIST_LIMIT = 100;
@@ -112,4 +112,120 @@ export async function amazonUnmapped(db, { now = new Date(), channel = 'FBA', ch
   for (const r of all) r.channel = channels ? (channels.get(normSku(r.code)) ?? null) : null;
   const rows = channel && channels ? all.filter((r) => r.channel === channel) : all;
   return { rows, total_all: all.length, today, undecided: missing.map(dateOnly), tableMissing: false, channel, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID };
+}
+
+// ─── 新しい seller SKU の対応を自分で作る入口 (10/11 中原さん「売れてから作るしかない」→ まだ売れていない SKU も先に作れる) ───
+
+/** Amazon の seller SKU の長さの上限 (Seller Central の決まり。ここは「気をつけること」に出すだけ・止めない) */
+export const AMAZON_SKU_MAX_LEN = 40;
+/** 「もしかして」に出す数 */
+export const SIMILAR_LIMIT = 5;
+const SKELETON_RE = /[-_./\s]/g;
+const DIGIT_RE = /[0-9]/;
+
+/** 2 つの文字の差 (足す・抜く・別の字・隣どうしの入れ替え = OSA)。max を超えたら max + 1 (途中で打ち切る) */
+export function editDistance(a, b, max = 2) {
+  const n = a.length; const m = b.length;
+  if (Math.abs(n - m) > max) return max + 1;
+  let prev2 = null;
+  let prev = Array.from({ length: m + 1 }, (_, j) => j);
+  for (let i = 1; i <= n; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= m; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) v = Math.min(v, prev2[j - 2] + 1);
+      cur.push(v);
+      if (v < rowMin) rowMin = v;
+    }
+    if (rowMin > max) return max + 1;
+    prev2 = prev; prev = cur;
+  }
+  return Math.min(prev[m], max + 1);
+}
+
+/**
+ * 似ているか (どちらも正規化した形 = core.norm_code で渡す)。null = 似ていない /
+ *   { kind: 'symbols' } = 記号 (- _ . / 空白) だけ違う / { kind: 'typo', distance } = 1〜2 文字の違い (5 文字以下の短い SKU は 1 文字だけ)。
+ *   同じ長さで、違う所が全部「数字 ↔ 数字」= 連番 (pr_a001 と pr_a002) は似ているとしない (新しい連番を作るたびに出ると、読まれなくなる)
+ */
+export function similarKind(a, b) {
+  if (!a || !b || a === b) return null;
+  const sa = a.replace(SKELETON_RE, ''); const sb = b.replace(SKELETON_RE, '');
+  if (sa && sa === sb) return { kind: 'symbols', distance: editDistance(a, b, 9) };
+  if (a.length === b.length) {
+    let onlyDigits = true;
+    for (let i = 0; i < a.length && onlyDigits; i++) if (a[i] !== b[i] && !(DIGIT_RE.test(a[i]) && DIGIT_RE.test(b[i]))) onlyDigits = false;
+    if (onlyDigits) return null;
+  }
+  const max = Math.min(a.length, b.length) <= 5 ? 1 : 2;
+  const d = editDistance(a, b, max);
+  return d <= max ? { kind: 'typo', distance: d } : null;
+}
+
+/** 気をつけること (止めない): Amazon の 40 文字・全角や日本語・途中の空白。sku = sellerSkuIn の後の形 */
+export function sellerSkuWarnings(sku) {
+  const w = [];
+  const len = [...sku].length;
+  if (len > AMAZON_SKU_MAX_LEN) w.push(`Amazon の seller SKU は ${AMAZON_SKU_MAX_LEN} 文字までです (いま ${len} 文字)。Seller Central の SKU と同じか確かめてください`);
+  if (/[^\x20-\x7e]/.test(sku)) w.push('全角の文字か日本語が入っています。Seller Central の SKU と同じ書き方か確かめてください (全角の英数字・記号は半角と同じ SKU と見ます)');
+  if (/\s/.test(sku)) w.push('途中に空白があります。空白を除いた形が同じ SKU は同じものと見ます');
+  return w;
+}
+const lowerSkuOr = (code) => { try { return sellerSkuIn(String(code ?? '')); } catch { return String(code ?? '').trim().toLowerCase(); } };
+
+/** 似た seller SKU (Company DB の Amazon (日本) の出品 = 対応の有効・墓標と、対応の無い出品)。近い順に SIMILAR_LIMIT 件 + 全部の数 */
+export async function similarAmazonSkus(db, sellerSku) {
+  const norm = (await db.query('select core.norm_code($1) as n', [sellerSku])).rows[0].n || '';
+  if (!norm) return { rows: [], total: 0 };
+  const cands = (await db.query(`select l.listing_id::text as listing_id, l.listing_norm from core.listings l
+     where l.company_id = $1 and l.mall = 'amazon' and l.shop_code = $2 and length(l.listing_norm) between $3 and $4 and l.listing_norm <> $5`,
+  [COMPANY_ID, AMAZON_JP_SHOP_CODE, Math.max(1, norm.length - 2), norm.length + 2, norm])).rows;
+  const hits = [];
+  for (const c of cands) { const s = similarKind(norm, c.listing_norm); if (s) hits.push({ listing_id: c.listing_id, norm: c.listing_norm, ...s }); }
+  if (!hits.length) return { rows: [], total: 0 };
+  const ids = hits.map((h) => h.listing_id);
+  const info = new Map((await db.query(`select l.listing_id::text as listing_id, l.listing_code, l.title, m.seller_sku, m.name, m.state, ci.asin
+      from core.listings l left join core.amazon_sku_maps m on m.listing_id = l.listing_id left join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id
+     where l.listing_id = any($1::bigint[])`, [ids])).rows.map((r) => [r.listing_id, r]));
+  const RANK = { active: 0, deleted: 1 };
+  const rows = hits.map((h) => {
+    const r = info.get(h.listing_id) || {};
+    return { seller_sku: r.seller_sku || lowerSkuOr(r.listing_code), name: r.name || r.title || null, state: r.state || null, asin: r.asin || null, kind: h.kind, distance: h.distance };
+  }).sort((x, y) => (x.kind === y.kind ? 0 : x.kind === 'symbols' ? -1 : 1) || x.distance - y.distance
+    || (RANK[x.state] ?? 2) - (RANK[y.state] ?? 2) || (x.seller_sku < y.seller_sku ? -1 : x.seller_sku > y.seller_sku ? 1 : 0));
+  return { rows: rows.slice(0, SIMILAR_LIMIT), total: rows.length };
+}
+
+/**
+ * 新しく作る seller SKU を確かめる (読むだけ・何も書かない)。
+ *   1. 形 = 保存と同じ sellerSkuIn (前後の空白を除いて小文字・写しの受け手の決まり)。合わない = { ok: false, reason: 'shape', message }
+ *   2. もうある: Company DB に対応 (有効・墓標) がある (正規化して同じ = 同じ SKU) = exists.kind 'map' → next 'exists' (そのページへ案内・作らない)
+ *      対応は無いが出品 (夜間の取り込みの写し) がある = exists.kind 'listing' → next 'create' (出品のコードの画面で作る)
+ *   3. 打ち間違いの守り (止めない): 似た seller SKU (similar)・気をつけること (warnings) があれば next 'confirm' (見てから「このまま作る」)、無ければ 'create'
+ *   open = 作る / 開く画面の seller SKU
+ */
+export async function checkNewAmazonSku(db, raw) {
+  const base = { ok: false, sku: null, open: null, exists: null, similar: [], similar_total: 0, warnings: [], next: null };
+  let sku;
+  try { sku = sellerSkuIn(typeof raw === 'string' ? raw : ''); } catch (e) {
+    if (e instanceof MasterWriteError) return { ...base, reason: 'shape', message: e.message };
+    throw e;
+  }
+  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { ...base, sku, reason: 'table_missing', message: 'Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)' };
+  const cur = await readAmazonMap(db, sku);
+  if (cur.map) {
+    return { ...base, ok: true, reason: null, message: null, sku, open: cur.map.seller_sku, next: 'exists',
+      exists: { kind: 'map', seller_sku: cur.map.seller_sku, name: cur.map.name, state: cur.map.state, same: cur.map.seller_sku === sku, asin: cur.listing.asin ?? null } };
+  }
+  if (cur.listing) {
+    const open = lowerSkuOr(cur.listing.listing_code);
+    return { ...base, ok: true, reason: null, message: null, sku, open, next: 'create',
+      exists: { kind: 'listing', seller_sku: open, name: cur.listing.title ?? null, state: null, same: open === sku, asin: cur.listing.asin ?? null } };
+  }
+  const sim = await similarAmazonSkus(db, sku);
+  const warnings = sellerSkuWarnings(sku);
+  return { ...base, ok: true, reason: null, message: null, sku, open: sku, similar: sim.rows, similar_total: sim.total, warnings,
+    next: sim.rows.length || warnings.length ? 'confirm' : 'create' };
 }

@@ -67,7 +67,7 @@
             <% if (page.related.length) { %><div style="grid-column:1 / -1"><div class="k">同じ NE の商品を使う seller SKU</div><div class="v"><% for (const r of page.related) { %><a class="linkchip" href="?sku=<%= encodeURIComponent(r.seller_sku) %>" title="<%= r.name %>"><span class="mono"><%= r.seller_sku %></span></a><% } %></div></div><% } %>
           </div>
           <% } else { %>
-          <div class="hint">Company DB にこの seller SKU の出品はまだありません。保存すると出品も作ります (ASIN・FNSKU は夜間の取り込みが付けます)。</div>
+          <div class="hint">Company DB にこの seller SKU の出品はまだありません (まだ売れていない・Amazon の出品の写しにも無い)。保存すると出品も作ります。ASIN・FNSKU は、Amazon に出品した後に夜間の取り込みが付けます。FBA / FBM はここでは選びません (Amazon の出品の手数料の写しから付きます)。</div>
           <% } %>
         </section>
 

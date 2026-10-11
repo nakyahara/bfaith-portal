@@ -22,6 +22,8 @@
     const umTone = !um ? '' : um.rows.length ? 'err' : um.undecided.length ? 'warn' : 'ok';
     const TONE = { err: ['', 'i-warn', 'color:var(--err);border-color:rgba(255,112,133,.45);background:var(--err-bg)'], warn: [' warnc', 'i-info', 'color:var(--warn);border-color:rgba(255,200,87,.45);background:var(--warn-bg)'], ok: [' calm', 'i-check', 'color:var(--ok);border-color:rgba(46,230,168,.45);background:var(--ok-bg)'] };
     const chLabel = (ch) => (ch ? (CHANNELS[ch] || ch) : '—');
+    // 新しい seller SKU の対応を自分で作る入口 (10/11) = 保存できる人・保存を開いているときだけ (保存の門と同じ。保存は作る画面の POST /api/amazon/save が確かめ直す)
+    const showCreate = canEdit && !amazonClosed && !dbError && !data.tableMissing;
   %>
   <div class="page" id="amazon-page">
     <div class="ph">
@@ -39,6 +41,8 @@
     <% if (amazonClosed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= amazonClosedWhy %>)</div><div class="hint">この画面は見るだけです。切替日までは Amazon SKU の対応の正は miniPC の SKU マスタ (/apps/warehouse の「SKUマスタ」) です。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
     <% if (data.tableMissing) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)。</div></div><% } %>
+
+    <% if (showCreate) { %><%- include('_amazon-create', { createValue: '' }) %><% } %>
 
     <% if (um) { %>
     <section class="panel todo-card<%= TONE[umTone][0] %>" aria-labelledby="h-um">
@@ -77,7 +81,7 @@
         <% for (const [k, v] of Object.entries(MAP_STATES)) { %><a class="chip<%= filters.state === k ? ' on' : '' %>" href="<%= hrefWith({ state: filters.state === k ? '' : k }) %>"<%- filters.state === k ? ' aria-current="true"' : '' %>><%= v %></a><% } %>
       </div>
       <form method="get" action="sku" class="opensku">
-        <label for="open-sku">seller SKU を開く (無ければ新しい対応)</label>
+        <label for="open-sku">seller SKU を開く</label>
         <input class="in mono" id="open-sku" name="sku" required autocomplete="off" spellcheck="false" placeholder="例: pr_abc001">
         <button class="btn sm" type="submit">開く</button>
       </form>
@@ -112,5 +116,6 @@
     </section>
   </div>
   <%- include('_footer') %>
+  <% if (showCreate) { %><script src="<%= base %>/public/me-amazon-new.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>
