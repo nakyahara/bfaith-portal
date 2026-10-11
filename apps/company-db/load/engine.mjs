@@ -436,6 +436,10 @@ export async function runInitialLoad(db, plan, opts = {}) {
       const nq = Number((await db.query('select ops.quarantine_unregistered_skus($1) as n', [runId])).rows[0].n);
       if (nq) skuSec.notes.push(`登録の状態: NE で見つけた知らない商品 ${nq} 件を要確認 (quarantined) にした`);
     } else report.notes = [...(report.notes || []), '0052 が未適用: 登録の状態 (要確認) は見送り'];
+    // 🆕 0070 (#1683 Codex R1 High 2): やめた (cancelled) SKU への参照 (構成の子・出品の構成・代表) は DB の trigger が断る = ロードは先に飛ばす
+    //   (skip の理由 sku_cancelled に残す・ロードは止めない)。マスタの書き込みの鍵 (排他) の中で読む = やめる関数 (共有) と並ぶ = 読んだ後に増えない
+    const cancelledSkus = new Set();
+    if (has0052) for (const r of (await db.query("select r.sku_id from ops.master_registrations r join core.skus k on k.sku_id = r.sku_id where k.company_id = $1 and r.state = 'cancelled'", [COMPANY_ID])).rows) cancelledSkus.add(Number(r.sku_id));
 
     // ── 3.5 バリエーションのまとまり (D-24 = A)。NE の代表商品コードは実在しない「名札」なので、それ用の product を作って色違い・サイズ違いを束ねる ──
     //   代表コードが単品 SKU として実在する → その product を親に (新しく作らない)
@@ -487,6 +491,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
           if (kindOf(own) !== 'single') { skipGroup(gi, g.code, `代表コードが ${kindOf(own)} の SKU (名札にしない)`, 'rep_not_single'); report.conflicts.push({ kind: 'variation_parent_not_single', representative: g.code, sku_kind: kindOf(own), children: kids.length }); continue; }
           const pid = productIdOf(own.code);
           if (!pid) { skipGroup(gi, g.code, '代表コードの product が無い', 'rep_no_product'); continue; }
+          if (cancelledSkus.has(skuIdOf(own.code))) { skipGroup(gi, g.code, '代表コードの商品はやめた (cancelled) = 代表にしない', 'rep_cancelled'); continue; }   // 🆕 0070
           parentPidOfGroup.set(gi, pid); vgSec.same++; continue;
         }
         const rows = byDisplay.get(k) || [];
@@ -729,6 +734,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       if (heldKind && heldKind.cdb_kind !== 'set') { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `親の区分が NE (${heldKind.ne_kind}) と社内 (${heldKind.cdb_kind}) で違う = 構成は触らない`, reason_code: 'kind_held', _p: p, ...(ch ? { _ch: ch } : {}) }); parentsWithSkip.add(p); continue; }
       if (acceptedKind.get(normSku(c.parentCode)) !== 'set') { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `親の区分がセットでない (${acceptedKind.get(normSku(c.parentCode))}) = 構成を入れない`, reason_code: 'parent_not_set', _p: p, ...(ch ? { _ch: ch } : {}) }); parentsWithSkip.add(p); continue; }
       if (!ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_child', _p: p }); parentsWithSkip.add(p); continue; }
+      if (cancelledSkus.has(ch)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子の商品はやめた (cancelled) = 構成に入れない', reason_code: 'child_cancelled', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }   // 🆕 0070
       if (p === ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '自分自身', reason_code: 'self', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
       const k = `${p}|${ch}`; if (compKeys.has(k)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '重複', reason_code: 'duplicate', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; } compKeys.add(k);
       if (!(c.qty > 0)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `数量が不正 (${c.qty})`, reason_code: 'invalid_qty', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
@@ -1010,6 +1016,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       for (const c of compsOf(l)) {
         const sid = skuIdOf(c.code);
         if (!sid) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'NE コードが無い (または正規化衝突で落とした)' }); listingsWithSkip.add(lid); continue; }
+        if (cancelledSkus.has(sid)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'その商品はやめた (cancelled) = 出品の構成に入れない' }); listingsWithSkip.add(lid); continue; }   // 🆕 0070
         const k = `${lid}|${sid}`; if (lcKeys.has(k)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: '重複' }); listingsWithSkip.add(lid); continue; } lcKeys.add(k);
         if (!(c.qty > 0)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: `数量が不正 (${c.qty})` }); listingsWithSkip.add(lid); continue; }
         lcCand.push({ company_id: COMPANY_ID, listing_id: lid, sku_id: sid, qty: c.qty, sort_order: Number.isInteger(c.sortOrder) ? c.sortOrder : 0, resolution: c.resolution || 'imported', resolved_by_type: 'system', resolved_by_id: runId, evidence: c.evidence ? JSON.stringify(c.evidence) : null, _mall: l.mall, _listing: l.listingCode, _code: c.code });

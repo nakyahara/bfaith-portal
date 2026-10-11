@@ -532,8 +532,8 @@
         <% const G = typeof gone !== 'undefined' && gone && gone.show ? gone : null; const goneCan = !!G && G.canGo && G.canApprove && !dbError && !closed; %>
         <% if (G) { %>
         <section class="panel" aria-labelledby="h-gone" id="gone-box" data-base="<%= base %>" data-code="<%= c.code %>">
-          <div class="panel-h" style="margin-bottom:10px"><h2 id="h-gone">NE から消えた (やめる)</h2><span class="right"><span class="b <%= G.canGo ? 'warn' : 'mute' %>" id="gone-streak">NE に無い <%= G.streak %> / <%= G.required %> 回</span></span></div>
-          <div class="hint" id="gone-lead">この商品は、毎朝の照合の「完全な NE の取得」に <b><%= G.streak %> 回続けて</b>ありません<%= G.since ? ' (' + ui.fmtJst(G.since.products_complete_at, { nowMs }) + ' の取得から)' : '' %>。<%= G.required %> 回続けて無く、どこにも使われていなければ、理由を書いて「やめた」にできます (業務で使わない商品になります・NE には何もしません)。</div>
+          <div class="panel-h" style="margin-bottom:10px"><h2 id="h-gone">NE から消えた (やめる)</h2><span class="right"><span class="b <%= G.canGo ? 'warn' : 'mute' %>" id="gone-streak">NE に無い <%= G.streak %> / <%= G.required %> 日</span></span></div>
+          <div class="hint" id="gone-lead">この商品は、毎朝の照合の「完全な NE の取得」に <b><%= G.streak %> 日続けて</b>ありません (1 日に何回取得しても 1 日と数えます)<%= G.since ? ' (' + ui.fmtJst(G.since.products_complete_at, { nowMs }) + ' の取得から)' : '' %>。<%= G.required %> 日続けて無く、どこにも使われていなければ、理由を書いて「やめた」にできます (業務で使わない商品になります・NE には何もしません)。</div>
           <% if (G.why.length) { %>
           <ul class="gone-why" id="gone-why-list" style="margin:8px 0 0 18px">
             <% for (const w of G.why) { %><li data-reason="<%= w.reason %>"><b><%= w.word %></b>: <%= w.text %></li><% } %>
@@ -568,7 +568,7 @@
       <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="gone-t" aria-describedby="gone-d">
         <h2 id="gone-t"><svg class="ic l" aria-hidden="true"><use href="#i-warn"/></svg><span class="mono"><%= c.code %></span> を「やめた」にします</h2>
         <div class="hint" id="gone-d" style="color:var(--text2)">業務で使える商品から外れます (登録の状態 = やめた)。元には戻せません。NE・ロジザード・モールには何もしません。</div>
-        <ul><li>理由: <span id="gone-why"></span></li><li>完全な NE の取得に <%= gone.streak %> 回続けて無い (Company DB が確かめた)</li></ul>
+        <ul><li>理由: <span id="gone-why"></span></li><li>完全な NE の取得に <%= gone.streak %> 日続けて無い (Company DB が確かめた)</li></ul>
         <div class="mbtns"><button class="btn ghost" type="button" id="gone-stay">やめない</button><button class="btn danger" type="button" id="gone-ok">やめた にする</button></div>
       </div>
     </div>

@@ -6,7 +6,7 @@
 --   available のまま (parent_incomparable・not_in_ne)。登録の状態は available から先に進めない (0052 の行き先の決まり・cancelled に行けるのは
 --   draft / ne_pending / quarantined だけ) = 0068 の判定表で数えない側 (cancelled) にできない = 代表の数えが 0 にならない。
 -- なにを (中原さんの決定 = DB が自分で「完全な NE の取得に N 回続けて無い」を確かめてから、人が理由を付けて動かす):
---   1. ops.master_ne_absence = 完全で信用できる NE の取得 (照合 ② の ops.record_parent_gate が記録した回) に「無い」Company DB の SKU のコードと、続けて無い回数。
+--   1. ops.master_ne_absence = 完全で信用できる NE の取得 (照合 ② の ops.record_parent_gate が記録した回) に「無い」Company DB の SKU のコードと、続けて無い日数 (JST の取得の日ごとに最大 1)。
 --      ops.record_parent_gate (0068 の版から写して、記録の後に 1 行足しただけ) が同じ取引で書く (ops._record_ne_absence)。
 --      🚨 証拠に 0068 の記録の回を使う理由: その回は「完全な取得」(complete = true・許可の一覧 trust の 4 つが全部 ok = 取得の件数・行の落ちなし・
 --         区分のゲート・代表の台帳) と DB が確かめた回だけ・取得の完了は記録と同じ JST の日だけ・同じ回は 1 回 = 「無い」と言ってよい回。
@@ -14,11 +14,13 @@
 --         0041 の ops.master_ne_codes は毎回入れ替える最新の 1 回分だけ (回ごとの記録が無い)・record_ne_codes は取得の信用を見ない
 --         = 「続けて N 回」の証拠にはしない。今そこにあれば断る (下の 2. の in_ne_codes) = 安全側の守りだけに使う。
 --         0058 の ops.master_ne_code_history は「一度でも見た」= 消えた商品も載っている = 使えない
---      続けて = 記録の回 (result_id) の続き。記録しなかった回 (確かめられない取得) は「無い」の証拠にも「ある」の証拠にもしない (数えない・途切れさせない)。
---      同じ NE の取得 (ne_generation_id) を照合し直した回は数を増やさない (= 数えるのは別々の完全な取得)
+--      🆕 #1683 Codex R1 High 1: 続けて = 取得の時刻の順 (記録の順ではない)。数えを進めるのは、取得の完了の時刻 (単品・セットとも) が数えた一番新しい取得
+--      (ops.master_ne_absence_mark) より後で、その取得の世代 (ne_generation_id) をほかの記録の回で見ていないときだけ (古い取得を後から記録した・同じ取得を
+--      照合し直した = 何も変えない)。数えるのは JST の取得の日 = 1 日に何回取得しても 1 日は 1 (「3 回」= 3 日)。新しさも実際の取得の完了の時刻で見る。
+--      記録しなかった回 (確かめられない取得) は「無い」の証拠にも「ある」の証拠にもしない (数えない・途切れさせない)
 --   2. ops.sku_gone_from_ne_check(SKU) = やめてよいかを DB が自分の今の値で確かめる (読むだけ)。全部を満たすときだけ ok:
---        登録の状態 available・単品 (セット・例外は外す)・一番新しい完全な取得の記録が ops.ne_gone_fresh_hours() 時間の中・その回にも無い・
---        続けて無い回数 >= ops.ne_gone_required_runs() (= 3)・今の NE のコードの台帳 (0041) にも無い・生きた NE 登録の CSV の品目 (built / issued /
+--        登録の状態 available・単品 (セット・例外は外す)・数えた一番新しい完全な取得の完了が ops.ne_gone_fresh_hours() 時間の中・その取得にも無い・
+--        続けて無い日数 >= ops.ne_gone_required_runs() (= 3 日)・今の NE のコードの台帳 (0041) にも無い・生きた NE 登録の CSV の品目 (built / issued /
 --        import_declared / partial) が無い・ほかのセットの構成品 (core.sku_components) でない・開いている構成の依頼に入っていない・
 --        販路の構成 (core.listing_components・削除した出品を除く = Amazon の対応ほか) に使われていない・その商品がほかの商品の親 (代表) でない
 --      ops.sku_gone_from_ne_list(コード | null) = CLI の dry-run 用 (null = 候補 = available で、一番新しい完全な取得に無い SKU)
@@ -31,36 +33,52 @@
 --      段階 new_open・持ち主表 (DB の active) が段階の記録と同じ (0053 の ops.reg_write_gate) → 2. の確かめ → 約束 (0051 の表・操作 sku_gone_cancel) →
 --      登録の状態 (3.) → 保存の記録 done (0053 の ops.close_reg_write)
 --   5. 約束の操作 (ops.master_write_sessions・ops.master_edit_requests の CHECK) に sku_gone_cancel (0067 の版から写して 1 つ足しただけ)
+--   6. 🆕 #1683 Codex R1 High 2: やめた (cancelled) SKU への参照 (構成・出品の構成・構成の依頼・代表) を新しく作らない trigger (登録の状態の行を共有で取ってから断る)
 -- 🚨 0068 の数え方 (判定表) は変えない = cancelled は今までどおり数えない側
--- 🚨 この migration は商品・登録の状態の値を何も変えない (1. の表は次の照合 ② の記録から貯まる = 当てた後の 3 回の照合までは、どの SKU もやめられない)
+-- 🚨 この migration は商品・登録の状態の値を何も変えない (1. の表は次の照合 ② の記録から貯まる = 当てた後の 3 日の照合までは、どの SKU もやめられない)
 -- 🚨 security definer の関数 = 一時の表を使わない・search_path = pg_catalog, pg_temp (名前は全部 schema つき)・public の実行権を外す。
 --    ロール (scripts/company-db/create-master-edit-roles.mjs) の流し直しで master_edit (画面) と master_ops (CLI) に 4. と 2. の実行を足す
 -- 🚨 夜間ロード (apps/company-db/load/engine.mjs) は登録の状態を「行の無い SKU を quarantined にする」(ops.quarantine_unregistered_skus) だけ = cancelled を available に戻さない
 
--- ═══════════ 1. 完全な取得に無いコードと続けて無い回数 ═══════════
-/** 続けて何回の完全な取得に無ければやめてよいか (中原さんの案 = 3 回) */
+-- ═══════════ 1. 完全な取得に無いコードと続けて無い日数 ═══════════
+/** 続けて何日 (JST の取得の日) の完全な取得に無ければやめてよいか (中原さんの案 = 3 回 = 3 日。1 日に何回取得しても 1 日は 1 回) */
 create function ops.ne_gone_required_runs() returns integer language sql immutable set search_path = pg_catalog, pg_temp as $$ select 3 $$;
 revoke all on function ops.ne_gone_required_runs() from public;
-/** 一番新しい完全な取得の記録の古さの上限 (時間)。毎朝の照合 ② が 1 回止まった日の夕方まで = それより古ければ「今も無い」と言わない */
+/** 一番新しく数えた取得の古さの上限 (時間・取得の完了の時刻 (単品とセットの古い方) から)。毎朝の照合 ② が 1 回止まった日の夕方まで = それより古ければ「今も無い」と言わない */
 create function ops.ne_gone_fresh_hours() returns integer language sql immutable set search_path = pg_catalog, pg_temp as $$ select 36 $$;
 revoke all on function ops.ne_gone_fresh_hours() from public;
+
+-- 数えた一番新しい取得 (1 行)。🆕 #1683 Codex R1 High 1: 数えを進めるのは、取得の完了の時刻 (単品・セットとも) がこれより後の取得だけ
+--   (記録の順 (result_id) ではなく取得の時刻の順 = 古い取得を後から記録しても数えは変わらない)
+create table ops.master_ne_absence_mark (
+  id                      smallint primary key default 1 check (id = 1),
+  result_id               bigint not null references ops.master_parent_gate_results (result_id),
+  ne_generation_id        text not null,
+  products_complete_at    timestamptz not null,
+  setproducts_complete_at timestamptz not null,
+  fetch_day               date not null,   -- JST の取得の日 (単品とセットの完了の古い方の日)
+  updated_at              timestamptz not null default pg_catalog.clock_timestamp()
+);
+comment on table ops.master_ne_absence_mark is '続けて無い日数を数えた一番新しい完全な NE の取得 (0070)。書くのは ops.record_parent_gate (の中の ops._record_ne_absence) だけ';
 
 create table ops.master_ne_absence (
   company_id             smallint not null default 1 references core.companies,
   code_norm              text not null check (pg_catalog.length(code_norm) between 1 and 200),
-  first_absent_result_id bigint not null references ops.master_parent_gate_results (result_id),   -- 続けて無いの最初の回
-  last_absent_result_id  bigint not null references ops.master_parent_gate_results (result_id),   -- 続けて無いの最後の回 (= 一番新しい記録の回のときだけ「今も無い」)
-  streak                 integer not null check (streak >= 1),                                     -- 続けて無い回数 (記録の回の続き)
+  first_absent_result_id bigint not null references ops.master_parent_gate_results (result_id),   -- 続けて無いの最初の取得の記録の回
+  last_absent_result_id  bigint not null references ops.master_parent_gate_results (result_id),   -- 続けて無いの最後の取得の記録の回 (= 数えた一番新しい取得のときだけ「今も無い」)
+  first_absent_day       date not null,   -- JST の取得の日
+  last_absent_day        date not null,
+  streak                 integer not null check (streak >= 1),   -- 続けて無い日数 (JST の取得の日ごとに最大 1)
   updated_at             timestamptz not null default pg_catalog.clock_timestamp(),
   primary key (company_id, code_norm),
-  constraint ck_mna_order check (last_absent_result_id >= first_absent_result_id)
+  constraint ck_mna_days check (last_absent_day >= first_absent_day and streak <= last_absent_day - first_absent_day + 1)
 );
-comment on table ops.master_ne_absence is '完全で信用できる NE の取得 (照合 ② の ops.record_parent_gate の記録の回) に無い Company DB の SKU のコードと続けて無い回数 (0070)。書くのは ops.record_parent_gate (の中の ops._record_ne_absence) だけ';
+comment on table ops.master_ne_absence is '完全で信用できる NE の取得 (照合 ② の ops.record_parent_gate の記録の回) に無い Company DB の SKU のコードと続けて無い日数 (0070)。書くのは ops.record_parent_gate (の中の ops._record_ne_absence) だけ';
 
 create function ops.guard_master_ne_absence() returns trigger language plpgsql set search_path = pg_catalog, pg_temp as $$
 begin
   if coalesce(pg_catalog.current_setting('ops.ne_absence_protocol', true), '') is distinct from '1' then
-    raise exception 'master_ne_absence は ops.record_parent_gate (照合 ② の記録) の中でだけ書く' using errcode = '42501';
+    raise exception '% は ops.record_parent_gate (照合 ② の記録) の中でだけ書く', tg_table_name using errcode = '42501';
   end if;
   return case when tg_op = 'DELETE' then old else new end;
 end $$;
@@ -69,25 +87,34 @@ create trigger trg_master_ne_absence_guard before insert or update or delete on 
   for each row execute function ops.guard_master_ne_absence();
 create trigger trg_master_ne_absence_no_truncate before truncate on ops.master_ne_absence
   for each statement execute function core.reject_mutation();
+create trigger trg_master_ne_absence_mark_guard before insert or update or delete on ops.master_ne_absence_mark
+  for each row execute function ops.guard_master_ne_absence();
+create trigger trg_master_ne_absence_mark_no_truncate before truncate on ops.master_ne_absence_mark
+  for each statement execute function core.reject_mutation();
 
 /**
  * 記録した回 (p_result_id・完全で信用できる取得) の観測 p_ne から、無いコードを数える (ops.record_parent_gate の中だけ・記録の行の後・同じ取引)。
- *   無い = Company DB の SKU (会社 1) のコードで、観測の rows (単品・セット) にも untrusted (無いと言えない) にも無い
- *   前の記録の回 (result_id の 1 つ前) にも無かった = 続けて (+1。前の回と同じ NE の取得 (ne_generation_id) の照合し直し = +0)・そうでなければ 1 から。
- *   この回にある (か SKU が無くなった) コードの行は消す (途切れた)
- * 戻り値 = この回に無いコードの数
+ *   🆕 #1683 Codex R1 High 1: 数えを進めるのは「取得の完了の時刻が、単品・セットとも、数えた一番新しい取得 (ops.master_ne_absence_mark) より後」かつ
+ *   「その取得の世代 (ne_generation_id) をほかの記録の回で見ていない」ときだけ。それ以外 (古い取得を後から記録した・同じ取得を照合し直した) は何も変えない (-1 を返す)
+ *   無い = Company DB の SKU (会社 1) のコードで、観測の rows (単品・セット) にも untrusted (無いと言えない) にも無い。
+ *   続けて = 前に数えた取得にも無かった (行がある = 前の取得の後に消していない) → 取得の日 (JST) が前の日より後なら +1・同じ日なら +0 (1 日は 1 回)。
+ *   この取得にある (か SKU が無くなった) コードの行は消す (途切れた)
+ * 戻り値 = この取得に無いコードの数 (数えなかった = -1)
  */
 create function ops._record_ne_absence(p_result_id bigint, p_ne jsonb) returns integer
   language plpgsql set search_path = pg_catalog, pg_temp as $$
 declare
-  v_prev     bigint;
-  v_step     integer;
-  v_n        integer;
+  r      ops.master_parent_gate_results;
+  m      ops.master_ne_absence_mark;
+  v_day  date;
+  v_n    integer;
 begin
-  select pg_catalog.max(r.result_id) into v_prev from ops.master_parent_gate_results r where r.result_id < p_result_id;
-  -- 同じ NE の取得 (世代 = ne_generation_id) を照合し直した回は「続けて」を増やさない (数えるのは別々の完全な取得の回数・続きは途切れさせない)
-  select case when exists (select 1 from ops.master_parent_gate_results a join ops.master_parent_gate_results b on b.ne_generation_id = a.ne_generation_id
-                            where a.result_id = p_result_id and b.result_id = v_prev) then 0 else 1 end into v_step;
+  select * into r from ops.master_parent_gate_results x where x.result_id = p_result_id;
+  if r.result_id is null then raise exception 'invalid_input: 記録の回 % が無い', p_result_id using errcode = '22023'; end if;
+  select * into m from ops.master_ne_absence_mark x where x.id = 1 for update;
+  if m.id is not null and (r.products_complete_at <= m.products_complete_at or r.setproducts_complete_at <= m.setproducts_complete_at) then return -1; end if;
+  if exists (select 1 from ops.master_parent_gate_results x where x.ne_generation_id = r.ne_generation_id and x.result_id <> r.result_id) then return -1; end if;
+  v_day := (least(r.products_complete_at, r.setproducts_complete_at) at time zone 'Asia/Tokyo')::date;
   perform pg_catalog.set_config('ops.ne_absence_protocol', '1', true);
   with obs as materialized (
     select (x ->> 0) as code_norm from pg_catalog.jsonb_array_elements(p_ne -> 'rows') x
@@ -96,15 +123,21 @@ begin
   gone as (
     select distinct k.code_norm from core.skus k
      where k.company_id = 1 and not exists (select 1 from obs o where o.code_norm = k.code_norm))
-  insert into ops.master_ne_absence as t (company_id, code_norm, first_absent_result_id, last_absent_result_id, streak)
-    select 1, g.code_norm, p_result_id, p_result_id, 1 from gone g
+  insert into ops.master_ne_absence as t (company_id, code_norm, first_absent_result_id, last_absent_result_id, first_absent_day, last_absent_day, streak)
+    select 1, g.code_norm, p_result_id, p_result_id, v_day, v_day, 1 from gone g
   on conflict (company_id, code_norm) do update set
-    streak = case when t.last_absent_result_id = v_prev then t.streak + v_step else 1 end,
-    first_absent_result_id = case when t.last_absent_result_id = v_prev then t.first_absent_result_id else excluded.first_absent_result_id end,
+    streak = case when t.last_absent_result_id = m.result_id then t.streak + (case when v_day > t.last_absent_day then 1 else 0 end) else 1 end,
+    first_absent_result_id = case when t.last_absent_result_id = m.result_id then t.first_absent_result_id else excluded.first_absent_result_id end,
+    first_absent_day = case when t.last_absent_result_id = m.result_id then t.first_absent_day else excluded.first_absent_day end,
     last_absent_result_id = excluded.last_absent_result_id,
+    last_absent_day = excluded.last_absent_day,
     updated_at = pg_catalog.clock_timestamp();
   get diagnostics v_n = row_count;
   delete from ops.master_ne_absence a where a.company_id = 1 and a.last_absent_result_id <> p_result_id;
+  insert into ops.master_ne_absence_mark (id, result_id, ne_generation_id, products_complete_at, setproducts_complete_at, fetch_day)
+    values (1, p_result_id, r.ne_generation_id, r.products_complete_at, r.setproducts_complete_at, v_day)
+    on conflict (id) do update set result_id = excluded.result_id, ne_generation_id = excluded.ne_generation_id, products_complete_at = excluded.products_complete_at,
+      setproducts_complete_at = excluded.setproducts_complete_at, fetch_day = excluded.fetch_day, updated_at = pg_catalog.clock_timestamp();
   perform pg_catalog.set_config('ops.ne_absence_protocol', '', true);
   return v_n;
 end $$;
@@ -118,7 +151,7 @@ revoke all on function ops._record_ne_absence(bigint, jsonb) from public;
  *   p_material_generation_id = 照合が読んだ材料の世代 (widen の判定がロードの材料の世代と照らす)・p_evidence_sha256 = 照合の結果の JSON の sha256
  *   鍵 = 新商品の許可の排他の鍵 (種類の順) = CSV を作る / 配る取引 (共有) の完了を待ってから書く (書いた瞬間から門はこの行を読む)
  *   同じ照合の回の 2 回目は拒む (run_reused)。戻り値 = { result_id (文字), counts, counted, excluded, samples, owner, gate: ops.parent_gate_state() }
- *   🆕 0070: 記録した回の観測から、完全な取得に無いコードと続けて無い回数 (ops.master_ne_absence) を同じ取引で書く (ops._record_ne_absence)
+ *   🆕 0070: 記録した回の観測から、完全な取得に無いコードと続けて無い日数 (ops.master_ne_absence) を同じ取引で書く (ops._record_ne_absence)
  */
 create or replace function ops.record_parent_gate(p_compare_run_id text, p_fetch jsonb, p_material_generation_id text, p_evidence_sha256 text, p_ne jsonb) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
@@ -176,7 +209,7 @@ begin
             pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p_ne::text, 'UTF8')), 'hex'), v -> 'counts', (v ->> 'counted')::bigint, v -> 'excluded', v -> 'samples',
             v_owner, session_user::text, v_now)
     returning result_id into v_id;
-  perform ops._record_ne_absence(v_id, p_ne);   -- 🆕 0070: 完全な取得に無いコードと続けて無い回数 (同じ取引・この回の観測)
+  perform ops._record_ne_absence(v_id, p_ne);   -- 🆕 0070: 完全な取得に無いコードと続けて無い日数 (同じ取引・この回の観測)
   perform pg_catalog.set_config('ops.parent_gate_protocol', '', true);
   return pg_catalog.jsonb_build_object('result_id', v_id::text, 'compare_run_id', p_compare_run_id, 'counts', v -> 'counts', 'counted', v -> 'counted', 'excluded', v -> 'excluded',
     'samples', v -> 'samples', 'obs', v -> 'obs', 'owner', v_owner, 'gate', ops.parent_gate_state());
@@ -186,8 +219,9 @@ revoke all on function ops.record_parent_gate(text, jsonb, text, text, jsonb) fr
 -- ═══════════ 2. やめてよいかの確かめ (読むだけ) ═══════════
 /**
  * SKU を「NE から消えた」でやめてよいか。何も書かない。戻り値 = {
- *   sku_id (文字), code, ok, problems: [{ reason, text }] (空 = ok), reg_state, required_runs, streak (続けて無い回数・無い = 0), fresh_hours,
- *   latest: { result_id, compare_run_id, created_at } (一番新しい完全な取得の記録), absent_since: { result_id, compare_run_id, products_complete_at } (続けて無いの最初の回),
+ *   sku_id (文字), code, ok, problems: [{ reason, text }] (空 = ok), reg_state, required_runs, streak (続けて無い日数・無い = 0), fresh_hours,
+ *   latest: { result_id, compare_run_id, products_complete_at, setproducts_complete_at, fetch_day } (数えた一番新しい完全な取得 = ops.master_ne_absence_mark),
+ *   absent_since: { result_id, compare_run_id, products_complete_at, day } (続けて無いの最初の取得),
  *   evidence (ok のときだけ = 登録の状態の記録の根拠) }
  * reason: no_sku / not_company / not_available / not_single / no_trusted_fetch / fetch_old / in_ne_latest / absent_short / in_ne_codes /
  *         live_file / set_component / component_request / listing_component / parent_of_others
@@ -200,6 +234,7 @@ declare
   g        ops.master_parent_gate_results;
   f        ops.master_parent_gate_results;
   m        ops.master_ne_code_mark;
+  am       ops.master_ne_absence_mark;
   v_req    integer := ops.ne_gone_required_runs();
   v_hours  integer := ops.ne_gone_fresh_hours();
   v_p      jsonb := '[]'::jsonb;
@@ -221,14 +256,17 @@ begin
   if s.sku_kind is distinct from 'single' then
     v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'not_single', 'text', pg_catalog.format('%s はこの操作でやめない (単品だけ)', case s.sku_kind when 'set' then 'セット' else '例外の SKU' end)));
   end if;
-  -- NE の完全な取得 (照合 ② の記録の回) に続けて無いか
-  select * into g from ops.master_parent_gate_results x order by x.result_id desc limit 1;
+  -- NE の完全な取得 (照合 ② の記録の回) に続けて無いか。🆕 #1683 Codex R1 High 1: 「一番新しい」= 数えた一番新しい取得 (取得の時刻の順・ops.master_ne_absence_mark)・
+  --   新しさ = 実際の取得の完了の時刻 (単品とセットの古い方)。記録の時刻 (created_at)・記録の順 (result_id) では決めない
+  select * into am from ops.master_ne_absence_mark x where x.id = 1;
+  select * into g from ops.master_parent_gate_results x where x.result_id = am.result_id;
   if g.result_id is null then
     v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'no_trusted_fetch', 'text', '完全で信用できる NE の取得の記録 (照合 ② の代表の数え) がまだ無い'));
   else
-    if g.created_at < pg_catalog.clock_timestamp() - pg_catalog.make_interval(hours => v_hours) then
+    if least(g.products_complete_at, g.setproducts_complete_at) < pg_catalog.clock_timestamp() - pg_catalog.make_interval(hours => v_hours) then
       v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'fetch_old',
-        'text', pg_catalog.format('一番新しい完全な NE の取得の記録 (照合の回 %s) が %s 時間より古い (今朝の照合 ② を待つ)', g.compare_run_id, v_hours)));
+        'text', pg_catalog.format('一番新しい完全な NE の取得 (照合の回 %s・取得の完了 %s) が %s 時間より古い (今朝の照合 ② を待つ)', g.compare_run_id,
+          pg_catalog.to_char(least(g.products_complete_at, g.setproducts_complete_at) at time zone 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI'), v_hours)));
     end if;
     select * into a from ops.master_ne_absence x where x.company_id = 1 and x.code_norm = s.code_norm;
     if a.code_norm is null or a.last_absent_result_id <> g.result_id then
@@ -239,7 +277,7 @@ begin
       select * into f from ops.master_parent_gate_results x where x.result_id = a.first_absent_result_id;
       if a.streak < v_req then
         v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'absent_short',
-          'text', pg_catalog.format('完全な NE の取得に続けて無いのが %s 回 (%s 回で、やめられる)', a.streak, v_req)));
+          'text', pg_catalog.format('完全な NE の取得に続けて無いのが %s 日 (%s 日で、やめられる・1 日に何回取得しても 1 日)', a.streak, v_req)));
       end if;
     end if;
   end if;
@@ -278,19 +316,21 @@ begin
   v_ok := pg_catalog.jsonb_array_length(v_p) = 0;
   return pg_catalog.jsonb_build_object('sku_id', s.sku_id::text, 'code', s.code, 'ok', v_ok, 'problems', v_p, 'reg_state', s.reg, 'sku_kind', s.sku_kind,
     'required_runs', v_req, 'fresh_hours', v_hours, 'streak', v_streak,
-    'latest', case when g.result_id is null then null else pg_catalog.jsonb_build_object('result_id', g.result_id::text, 'compare_run_id', g.compare_run_id, 'created_at', g.created_at) end,
-    'absent_since', case when f.result_id is null then null else pg_catalog.jsonb_build_object('result_id', f.result_id::text, 'compare_run_id', f.compare_run_id, 'products_complete_at', f.products_complete_at) end,
-    'evidence', case when v_ok then pg_catalog.jsonb_build_object('rule', 'gone_from_ne_v1', 'required_runs', v_req, 'streak', v_streak,
-        'first_absent', pg_catalog.jsonb_build_object('result_id', f.result_id::text, 'compare_run_id', f.compare_run_id, 'products_complete_at', f.products_complete_at),
+    'latest', case when g.result_id is null then null else pg_catalog.jsonb_build_object('result_id', g.result_id::text, 'compare_run_id', g.compare_run_id,
+        'products_complete_at', g.products_complete_at, 'setproducts_complete_at', g.setproducts_complete_at, 'fetch_day', am.fetch_day) end,
+    'absent_since', case when f.result_id is null then null else pg_catalog.jsonb_build_object('result_id', f.result_id::text, 'compare_run_id', f.compare_run_id,
+        'products_complete_at', f.products_complete_at, 'day', a.first_absent_day) end,
+    'evidence', case when v_ok then pg_catalog.jsonb_build_object('rule', 'gone_from_ne_v2', 'required_days', v_req, 'streak_days', v_streak,
+        'first_absent', pg_catalog.jsonb_build_object('result_id', f.result_id::text, 'compare_run_id', f.compare_run_id, 'products_complete_at', f.products_complete_at, 'day', a.first_absent_day),
         'last_absent', pg_catalog.jsonb_build_object('result_id', g.result_id::text, 'compare_run_id', g.compare_run_id, 'products_complete_at', g.products_complete_at,
-          'ne_generation_id', g.ne_generation_id),
+          'setproducts_complete_at', g.setproducts_complete_at, 'day', a.last_absent_day, 'ne_generation_id', g.ne_generation_id),
         'ne_codes_run', m.compare_run_id) end);
 end $$;
 revoke all on function ops.sku_gone_from_ne_check(bigint) from public;
 
 /**
  * CLI の dry-run 用 (読むだけ)。p_codes = 確かめるコード (500 件まで・code_norm で探す) / null = 候補 (登録の状態 available で、
- * 一番新しい完全な取得の記録の回に無い SKU)。戻り値 = [ops.sku_gone_from_ne_check の答え (無いコード = { code, ok: false, problems: [no_sku] })] (コードの順)
+ * 数えた一番新しい完全な取得 (ops.master_ne_absence_mark) に無い SKU)。戻り値 = [ops.sku_gone_from_ne_check の答え (無いコード = { code, ok: false, problems: [no_sku] })] (コードの順)
  */
 create function ops.sku_gone_from_ne_list(p_codes text[]) returns jsonb
   language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
@@ -305,7 +345,7 @@ begin
       from core.skus k join ops.master_registrations r on r.sku_id = k.sku_id
       join ops.master_ne_absence a on a.company_id = 1 and a.code_norm = k.code_norm
      where k.company_id = 1 and r.state = 'available'
-       and a.last_absent_result_id = (select pg_catalog.max(x.result_id) from ops.master_parent_gate_results x);
+       and a.last_absent_result_id = (select am.result_id from ops.master_ne_absence_mark am where am.id = 1);
   else
     select coalesce(pg_catalog.jsonb_agg(case when k.sku_id is null
              then pg_catalog.jsonb_build_object('sku_id', null, 'code', c.code, 'ok', false,
@@ -468,7 +508,8 @@ alter table ops.master_edit_requests add constraint ck_mer_operation check (oper
 /**
  * 業務で使える商品 (available) を「NE から消えた」でやめる (cancelled)。人が理由 (200 字まで・改行なし) を書いてだけ・1 件ずつ・1 つの取引。
  *   同じ request_id の押し直し = 前の答え (replayed)。違う操作・人・SKU・理由で同じ request_id = request_id_reused
- *   鍵: 新商品の許可 (共有・種類の順) → 段階 (共有) → マスタの書き込み (共有) → SKU → NE のコード (共有) → SKU の行 (for update = 構成・出品の構成の外部キーの insert と並ぶ)
+ *   鍵: 新商品の許可 (共有・種類の順) → 段階 (共有) → マスタの書き込み (共有) → SKU → NE のコード (共有) → 登録の状態の行 (for update = 6. の参照を作る trigger と並ぶ) →
+ *       SKU の行 (for update = 構成・出品の構成の外部キーの insert と並ぶ)
  *   段階 new_open・持ち主表 (DB の active) が段階の記録と同じ (ops.reg_write_gate)。確かめ (ops.sku_gone_from_ne_check) が ok でなければ not_gone_from_ne (理由を全部)
  *   約束 (0051 の ops.master_write_sessions・操作 sku_gone_cancel・この関数だけが書く) → 登録の状態 (ops.transition_sku_registration が約束と確かめをもう一度見る) →
  *   保存の記録 done (ops.close_reg_write)。戻り値 = { ok, request_id, code, sku_id, from, state, event_id, evidence }
@@ -509,6 +550,9 @@ begin
   end if;
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || p_sku_id::text, 0));
   perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('ops.ne_codes'));
+  -- 🆕 #1683 Codex R1 High 2: 登録の状態の行を先に (SKU の行より前に) 排他で取る = 参照を作る道 (下の 6. の trigger) はこの行を共有で取ってから cancelled を断る
+  --   = 確かめの後に構成・依頼・出品の構成・代表が増えない (先に参照を作った取引が commit するまで、ここで待つ → 確かめが見る)
+  perform 1 from ops.master_registrations x where x.sku_id = p_sku_id for update;
   select x.code into v_code from core.skus x where x.sku_id = p_sku_id and x.company_id = 1 for update;
   if not found then raise exception 'not_found: SKU % が無い', p_sku_id using errcode = 'P0002'; end if;
   v_chk := ops.sku_gone_from_ne_check(p_sku_id);
@@ -532,6 +576,67 @@ begin
   return v_result;
 end $$;
 revoke all on function ops.cancel_sku_gone_from_ne(uuid, text, text, bigint) from public;
+
+-- ═══════════ 6. やめた (cancelled) SKU への参照を新しく作らない (🆕 #1683 Codex R1 High 2・DB の不変の決まり) ═══════════
+/**
+ * 参照を作る全部の道 (構成 core.sku_components の子・販路の出品の構成 core.listing_components・構成の依頼 ops.sku_component_requests の rows・
+ * 代表 core.products.parent_product_id) が、参照する SKU の登録の状態の行を共有で取ってから、cancelled なら断る (どの書き手も = 夜間ロード・画面・関数・持ち主の手)。
+ *   ops.cancel_sku_gone_from_ne は同じ行を排他で取ってから確かめる = どちらが先でも「確かめた後に参照が増える」「参照を作った後に取り消す」が起きない。
+ *   前からある行の数量だけの変更 (参照する SKU を変えない UPDATE) は見ない。登録の状態の行が無い SKU (切替の前) は見ない
+ *   夜間ロード (engine.mjs) は cancelled の SKU への構成・出品の構成・代表を先に飛ばす (skip の理由に残す) = この守りでロードを止めない
+ */
+create function ops.sku_ref_cancelled(p_sku_ids bigint[]) returns text
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_bad text;
+begin
+  if p_sku_ids is null or pg_catalog.cardinality(p_sku_ids) = 0 then return null; end if;
+  perform 1 from ops.master_registrations r where r.sku_id = any(p_sku_ids) order by r.sku_id for share;
+  select pg_catalog.string_agg(k.code, '・' order by k.code) into v_bad
+    from ops.master_registrations r join core.skus k on k.sku_id = r.sku_id where r.sku_id = any(p_sku_ids) and r.state = 'cancelled';
+  return v_bad;
+end $$;
+revoke all on function ops.sku_ref_cancelled(bigint[]) from public;
+
+create function ops.guard_sku_ref_not_cancelled() returns trigger
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_ids bigint[];
+  v_bad text;
+begin
+  if tg_table_name = 'sku_components' then
+    if tg_op = 'UPDATE' and new.child_sku_id is not distinct from old.child_sku_id then return new; end if;
+    v_ids := array[new.child_sku_id];
+  elsif tg_table_name = 'listing_components' then
+    if tg_op = 'UPDATE' and new.sku_id is not distinct from old.sku_id then return new; end if;
+    v_ids := array[new.sku_id];
+  elsif tg_table_name = 'sku_component_requests' then
+    select pg_catalog.array_agg(distinct (e ->> 'sku_id')::bigint) into v_ids
+      from pg_catalog.jsonb_array_elements(case when pg_catalog.jsonb_typeof(new.rows) = 'array' then new.rows else '[]'::jsonb end) e
+     where (e ->> 'sku_id') ~ '^[0-9]{1,18}$';
+  elsif tg_table_name = 'products' then
+    if new.parent_product_id is null or new.parent_product_id = new.product_id
+       or (tg_op = 'UPDATE' and new.parent_product_id is not distinct from old.parent_product_id) then return new; end if;
+    select pg_catalog.array_agg(k.sku_id) into v_ids from core.skus k where k.product_id = new.parent_product_id;
+  else
+    raise exception 'guard_sku_ref_not_cancelled: 知らない表 %', tg_table_name;
+  end if;
+  v_bad := ops.sku_ref_cancelled(v_ids);
+  if v_bad is not null then
+    raise exception 'sku_cancelled: やめた (cancelled) 商品 % は、構成・出品の構成・構成の依頼・代表 (親) に使えない (%)', v_bad, tg_table_schema || '.' || tg_table_name
+      using errcode = '23514';
+  end if;
+  return new;
+end $$;
+revoke all on function ops.guard_sku_ref_not_cancelled() from public;
+create trigger trg_sku_components_not_cancelled before insert or update of child_sku_id on core.sku_components
+  for each row execute function ops.guard_sku_ref_not_cancelled();
+create trigger trg_listing_components_not_cancelled before insert or update of sku_id on core.listing_components
+  for each row execute function ops.guard_sku_ref_not_cancelled();
+create trigger trg_sku_component_requests_not_cancelled before insert on ops.sku_component_requests
+  for each row execute function ops.guard_sku_ref_not_cancelled();
+create trigger trg_products_parent_not_cancelled before insert or update of parent_product_id on core.products
+  for each row execute function ops.guard_sku_ref_not_cancelled();
 
 -- ─── 権限 (0068 と同じ形)。master_edit・master_ops には scripts/company-db/create-master-edit-roles.mjs の流し直しで付ける (表は読ませない・関数の実行だけ) ───
 --   watcher = 表 ops.master_ne_absence を読むだけ (ops の全部の表の select = create-watch-roles.mjs の既定の権限で付く)・確かめ (読むだけ) の実行
