@@ -369,7 +369,8 @@ try {
 
   await ta('[13] 0040 バックアップ → 復元 (本物の Postgres): CSV の byte 列 (0x00・0xff・CRLF・バックスラッシュ) がそのまま戻る', async () => {
     const { dumpCompanyDb, restoreCompanyDb } = await import('../apps/company-db/backup/dump.mjs');
-    // 判断の台帳に完了の行がある DB は今の復元が戻せない (master の穴・別の PR) = 完了の行の無い別の DB で確かめる
+    // 判断の台帳に完了 (action_done) の行がある DB も戻せる (#1494 で解消済み・dump.mjs の自己参照の復元・test-company-db-backup.mjs で確かめている)。
+    //   ここは CSV の byte 列だけを見たいので、ほかの試験の行の無い別の DB で確かめる
     const names = [`cdb_bk_${crypto.randomBytes(4).toString('hex')}`, `cdb_rs_${crypto.randomBytes(4).toString('hex')}`];
     for (const n of names) await admin.query(`create database ${n}`);
     const conn = async (n) => { const x = new URL(url); x.pathname = `/${n}`; return openPgClient(x.toString()); };
