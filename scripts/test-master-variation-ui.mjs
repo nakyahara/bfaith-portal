@@ -311,13 +311,15 @@ await ta('[⑥] 上限を超える (45 色 × 3 = 135): 保存を止める・色
   assert.match(await p.innerText('#next-box'), /次に足す色 \(5\)/);
   assert.match(await p.innerText('#hud-meter'), /作る 120 \/ 120/);
   const r = await saveViaConfirm(p);
-  assert.match(r, /120 件を下書きにしました[\s\S]*回ごとに 1 ファイル/);
+  assert.match(r, /120 件を下書きにしました[\s\S]*1 回目の CSV を先に作ってから残りを足してください。未処理の回が重なると 1 つのファイルにまとまります/);
   assert.equal(await p.locator('#result [data-act="next"]').count(), 1);
   await p.click('#result [data-act="next"]');
   await p.waitForSelector('#g-picked .picked .pc:text-is("roomwear2")');
   await settle(p);
   assert.equal((await p.inputValue('#opt-0')).split('\n').length, 5);
   assert.match(await p.innerText('#opt-eq'), /作る 15 商品/);
+  // まだ CSV にしていない 120 件と 1 つのファイルにまとまる、と前もって言う (#1679 Codex R2 Medium 2)
+  assert.match(await p.innerText('#opt-eq .vpend'), /まだ NE 登録の CSV にしていない子が 120 件あります = 今回の分と 1 つのファイルにまとまります/);
   const r2 = await saveViaConfirm(p);
   assert.match(r2, /15 件を下書きにしました/);
   assert.equal((await kidsOf('roomwear2')).length, 135);
@@ -325,7 +327,41 @@ await ta('[⑥] 上限を超える (45 色 × 3 = 135): 保存を止める・色
   await p.goto(B + '/reg-csv');
   const card = p.locator('#vcands .vgroup:has(.mono:text-is("roomwear2"))');
   assert.match(await card.innerText(), /回 1[\s\S]*子 120 件[\s\S]*回 2[\s\S]*子 15 件/);
-  assert.match(await card.innerText(), /どちらもまだファイルになっていません/);
+  assert.match(await card.innerText(), /回 1・回 2 は、どれもまだ CSV にしていない = 1 つのファイルにまとまります \(135 行\)/);
+  assert.equal(await card.locator('.vtoo').count(), 0);
+  assert.equal(await card.locator('button[data-act="build-variation"]:not([disabled])').count(), 1, '押せるのは「まとめて 1 ファイル」だけ');
+  assert.match(await card.locator('button[data-act="build-variation"]:not([disabled])').innerText(), /まとめて 1 ファイル \(135 件\) を作る/);
+});
+
+await ta('[⑥b] 1 つのファイルの上限 (試験は 136 行) を超える: 足す画面 = 「先に今ある分の CSV を作ってから」で保存を止める・API も 409 / NE 登録の CSV の画面 = 作れない理由と手順 (ボタンは押せない)', async (p) => {
+  V.__setMaxFileRowsForTest(136);
+  try {
+    await p.goto(B + '/new?kind=variation');
+    await pickGroup(p, 'roomwear2', 'roomwear2');
+    await fill(p, '#opt-0', 'テスト色 / -ZZ');
+    await settle(p);
+    const i0 = await info(p);
+    assert.equal(i0.save, 'disabled');
+    assert.ok(i0.issues.some((x) => /まだ NE 登録の CSV にしていない子が 135 件あります。今回の 3 件と合わせると 138 件で、1 つのファイル \(136 行まで\) にできません → 先に「NE 登録の CSV」で今ある分のファイルを作ってから足す/.test(x)), JSON.stringify(i0.issues));
+    // API も断る (画面を通らない送り方でも・何も保存しない)
+    const before = (await kidsOf('roomwear2')).length;
+    const gid = (await one("select group_product_id::text as id from ops.variation_group_codes where code_norm = 'roomwear2'")).id;
+    const r = await p.evaluate(async ([base, gid]) => { const x = await fetch(base + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), group: { mode: 'add', product_id: gid }, options: [{ axis: 1, code: '-ZZ', name: 'テスト色' }], children: ['-S', '-M', '-L'].map((v) => ({ code: 'roomwear2-ZZ' + v, choices: { 1: '-ZZ', 2: v }, name: 'x' + v })), values: { standard_price: '2980', cost: { jpy: '1200' }, tax_rate: '0.1', sales_class: '3', primary_supplier: '0034', reorder_months: '2', expiry_managed: '0', inbound_date_managed: '0' } }) }); return [x.status, (await x.json()).reason]; }, [B, gid]);
+    assert.deepEqual(r, [409, 'variation_pending_too_many']);
+    assert.equal((await kidsOf('roomwear2')).length, before);
+    // NE 登録の CSV の画面: 上限 14 行 = roomwear2 (2 回・135 行) も hakama (1 回・15 行) も作れない → 理由と手順・ボタンは押せない
+    V.__setMaxFileRowsForTest(14);
+    await p.goto(B + '/reg-csv');
+    const card = p.locator('#vcands .vgroup:has(.mono:text-is("roomwear2"))');
+    assert.match(await card.locator('.vtoo').innerText(), /まだ CSV にしていない子が 135 件 = 1 つのファイル \(14 行まで\) にできないので、このまとまりの CSV は作れません[\s\S]*「このまとまりから外す \(廃止\)」で減らす[\s\S]*管理者へ/);
+    assert.equal(await card.locator('button[data-act="build-variation"]:not([disabled])').count(), 0, '作れないまとまりのボタンは押せない');
+    assert.doesNotMatch(await card.innerText(), /まとめて 1 ファイル/);
+    const hk = p.locator('#vcands .vgroup:has(.mono:text-is("hakama"))');
+    assert.match(await hk.locator('.vtoo').innerText(), /まだ CSV にしていない子が 15 件 = 1 つのファイル \(14 行まで\)/);
+    assert.equal(await hk.locator('button[data-act="build-variation"]').count(), 1, '1 回だけのまとまり = 回のボタンはある');
+    assert.equal(await hk.locator('button[data-act="build-variation"]:not([disabled])').count(), 0, '回のボタンも押せない');
+    await shot(p, '6b-too-many', '#vcands');
+  } finally { V.__setMaxFileRowsForTest(null); }
 });
 
 await ta('[⑦] 誤り: 「-」の付け忘れ = 誤り + 「- を付ける」(押した行が光る・黙っては直さない)・文字の重なり (大文字小文字)・名前の重なり・JAN の形とほかの商品の JAN・まとまりのコードがもうある (このまとまりに足す)・product-hub の下書き', async (p) => {

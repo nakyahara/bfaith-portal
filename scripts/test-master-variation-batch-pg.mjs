@@ -181,7 +181,7 @@ try {
     assert.equal((await q('select status from ops.master_edit_requests where request_id = $1', [rid]))[0].status, 'failed');
   });
 
-  await ta('[5] NE 登録の CSV: 回ごとに並ぶ → 1 回目のファイル (120 子 + 足した 9 子は 1 回目と別の回) …まとまりの全部の NE 登録待ちを 1 ファイル / 新しいまとまりは回ごとに 1 ファイル (代表 = まとまりのコード・JAN = empty)', async () => {
+  await ta('[5] NE 登録の CSV: 回ごとに並ぶ → 1 回目のファイル (120 子 + 足した 9 子は 1 回目と別の回) …まとまりの全部の NE 登録待ちを 1 ファイル / 新しいまとまりは 1 回目の CSV を先に作ってから残りを足す = 回ごとのファイル (代表 = まとまりのコード・JAN = empty)', async () => {
     const o = { open: true, nowMs: NOW_MS };
     const s = await G.regSummary(pgAdapter(A), { nowMs: NOW_MS });
     const g = s.variation.find((x) => x.group_code === 'rw120');

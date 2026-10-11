@@ -160,7 +160,7 @@
         finish('ファイル #' + (r.j.export && r.j.export.export_id || '') + ' を作りました (' + codes.length + ' 件)。次は「配る (ダウンロード)」');
       });
     } else if (act === 'build-variation') {
-      // 🆕 PR-7: まとまりの回ごとに 1 ファイル (ne-reg-variation-v1)。ボタンごとに作る番号 1 つ (押し直しても 2 つ作らない)
+      // 🆕 PR-7: まとまりの NE 登録待ちの子で 1 ファイル (ne-reg-variation-v1・未処理の回が重なると 1 つにまとまる)。ボタンごとに作る番号 1 つ (押し直しても 2 つ作らない)
       var vcodes = []; try { vcodes = JSON.parse(b.getAttribute('data-codes') || '[]'); } catch (e) { vcodes = []; }
       var vmsg = $('[data-msg]', b.closest('.vgroup')) || $('#build-msg');
       if (!b.getAttribute('data-rid')) b.setAttribute('data-rid', uuid());
