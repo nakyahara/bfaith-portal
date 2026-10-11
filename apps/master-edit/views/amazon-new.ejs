@@ -64,7 +64,8 @@
         <% } %>
       </ul>
       <% } %>
-      <% if (c.similar_incomplete) { %><div class="hint">出品が多いので、長さの近い <%= SIMILAR_SCAN_MAX.toLocaleString('ja-JP') %> 件だけと比べました (記号だけ違うものは全部と比べています)。</div><% } %>
+      <% if (c.similar_incomplete) { %><div class="hint" id="sim-incomplete">出品が多いので、長さの近い <%= SIMILAR_SCAN_MAX.toLocaleString('ja-JP') %> 件だけと比べました (もっとあります)。</div><% } %>
+      <% if (c.similar_symbols_incomplete) { %><div class="hint" id="sim-symbols-incomplete">記号だけ違う出品は最大 <%= SIMILAR_SYMBOLS_MAX %> 件と比べました (もっとあります)。</div><% } %>
       <% if (c.warnings.length) { %>
       <ul class="warnlist"><% for (const w of c.warnings) { %><li><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><span><%= w %></span></li><% } %></ul>
       <% } %>

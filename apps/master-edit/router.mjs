@@ -82,7 +82,7 @@ import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, newSellerSkuCheckInDb, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
-import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX } from './amazon-read.mjs';
+import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
@@ -748,7 +748,7 @@ router.get('/amazon/new', (req, res) => withPgPage(req, res, async (db, dbError)
   }
   const phase = await readPhaseView(db);
   const shapeError = tooLong ? TOO_LONG : check && !check.ok ? check.message : '';
-  res.status(shapeError ? 400 : 200).render(view('amazon-new.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, raw: raw.slice(0, AMAZON_CHECK_RAW_MAX), asked, check, shapeError, MAP_STATES, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX });
+  res.status(shapeError ? 400 : 200).render(view('amazon-new.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, raw: raw.slice(0, AMAZON_CHECK_RAW_MAX), asked, check, shapeError, MAP_STATES, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX });
 }));
 router.get('/api/amazon/check', (req, res) => {
   const raw = typeof req.query.sku === 'string' ? req.query.sku : '';

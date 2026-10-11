@@ -1137,7 +1137,23 @@ await ta('[13] 確かめ (画面のロール・読むだけ): 形の誤り・も
     assert.equal(c.similar_incomplete, true);
     assert.ok(c.similar.some((s) => s.seller_sku === 'zq_bulk_00001'), JSON.stringify(c.similar));
     c = await asEditRole(() => RD.checkNewAmazonSku(db, 'z-q-b-u-l-k-0-0-0-0-1'));
-    assert.ok(c.similar.some((s) => s.seller_sku === 'zq_bulk_00001' && s.kind === 'symbols'), '記号だけ違うものは上限によらず');
+    assert.ok(c.similar.some((s) => s.seller_sku === 'zq_bulk_00001' && s.kind === 'symbols'), '記号だけ違うものは長さの上限によらず');
+    assert.equal(c.similar_symbols_incomplete, false);
+    // #1685 Codex R2 Low: 記号だけ違う出品が上限 (50) より多い = symbols_incomplete・画面は「最大 50 件と比べました (もっとあります)」(「全部と比べた」と言わない)
+    const SEPS = ['-', '_', '.', '/'];
+    const variants = [];
+    for (let i = 1; variants.length < RD.SIMILAR_SYMBOLS_MAX + 1; i++) {
+      // 'zsym001' の 6 つの隙間に、i を 5 進で読んだ記号を入れる (0 = 何も入れない)。記号が 1 つ以上ある形だけ
+      let x = i; let v = 'z';
+      for (const ch of 'sym001') { const d = x % 5; x = Math.floor(x / 5); v += (d ? SEPS[d - 1] : '') + ch; }
+      if (v !== 'zsym001') variants.push(v);
+    }
+    await pg.query(`insert into core.listings (company_id, mall, shop_code, listing_code, status) select 1, 'amazon', $1, v, 'active' from unnest($2::text[]) as t(v)`, [AMZ, variants]);
+    c = await asEditRole(() => RD.checkNewAmazonSku(db, 'zsym001'));
+    assert.deepEqual([c.similar_symbols_incomplete, c.similar_incomplete, c.similar.length, c.similar.every((s) => s.kind === 'symbols')], [true, false, RD.SIMILAR_LIMIT, true]);
+    const pageR = await call('GET', '/amazon/new?sku=zsym001');
+    assert.ok(pageR.text.includes('id="sim-symbols-incomplete"') && pageR.text.includes('記号だけ違う出品は最大 50 件と比べました (もっとあります)'), '比べた範囲を正しく言う');
+    assert.ok(!pageR.text.includes('全部と比べています'));
   } finally { await pg.query('rollback'); await pg.query('set role deploy'); }
   const after = await q('select (select count(*)::int from core.listings) as l, (select count(*)::int from core.amazon_sku_maps) as m, (select count(*)::int from ops.master_edit_requests) as r');
   assert.deepEqual(after, before, '確かめは何も書かない');

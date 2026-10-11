@@ -122,6 +122,8 @@ export async function amazonUnmapped(db, { now = new Date(), channel = 'FBA', ch
 export const SIMILAR_LIMIT = 5;
 /** 「もしかして」で 1 回に比べる出品の上限 (#1685 Codex R1 Low: 直に連打できる API・JS の比べには statement_timeout が効かない)。超えたら incomplete */
 export const SIMILAR_SCAN_MAX = 2000;
+/** 「もしかして」で記号 (- _ . /) を除くと同じ出品を比べる上限 (#1685 Codex R2 Low)。超えたら symbols_incomplete */
+export const SIMILAR_SYMBOLS_MAX = 50;
 const SKELETON_RE = /[-_./\s]/g;
 const DIGIT_RE = /[0-9]/;
 
@@ -178,15 +180,16 @@ const lowerSkuOr = (code) => { try { return sellerSkuIn(String(code ?? '')); } c
 /**
  * 似た seller SKU (Company DB の Amazon (日本) の出品 = 対応の有効・墓標と、対応の無い出品)。近い順に SIMILAR_LIMIT 件 + 全部の数 + incomplete。
  *   候補 = ① 記号 (- _ . /) を除くと同じ (長さの差によらない・#1685 Codex R1 Medium) + ② 長さ ±2 (1〜2 文字の違い)。
- *   ② は長さの近い順に SIMILAR_SCAN_MAX 件まで (超えた = incomplete: 全部とは比べていない・#1685 Codex R1 Low)
+ *   ① は SIMILAR_SYMBOLS_MAX 件まで (超えた = symbols_incomplete・#1685 Codex R2 Low)。② は長さの近い順に SIMILAR_SCAN_MAX 件まで (超えた = incomplete: 全部とは比べていない・#1685 Codex R1 Low)
  */
 export async function similarAmazonSkus(db, sellerSku) {
   const norm = (await db.query('select core.norm_code($1) as n', [sellerSku])).rows[0].n || '';
-  if (!norm) return { rows: [], total: 0, incomplete: false };
+  if (!norm) return { rows: [], total: 0, incomplete: false, symbols_incomplete: false };
   const skel = norm.replace(SKELETON_RE, '');
   const bySkel = skel ? (await db.query(`select l.listing_id::text as listing_id, l.listing_norm from core.listings l
      where l.company_id = $1 and l.mall = 'amazon' and l.shop_code = $2 and regexp_replace(l.listing_norm, '[-_./[:space:]]', '', 'g') = $3 and l.listing_norm <> $4
-     order by l.listing_norm limit 50`, [COMPANY_ID, AMAZON_JP_SHOP_CODE, skel, norm])).rows : [];
+     order by l.listing_norm limit $5`, [COMPANY_ID, AMAZON_JP_SHOP_CODE, skel, norm, SIMILAR_SYMBOLS_MAX + 1])).rows : [];
+  const symbolsIncomplete = bySkel.length > SIMILAR_SYMBOLS_MAX;
   const band = (await db.query(`select l.listing_id::text as listing_id, l.listing_norm from core.listings l
      where l.company_id = $1 and l.mall = 'amazon' and l.shop_code = $2 and length(l.listing_norm) between $3 and $4 and l.listing_norm <> $5
      order by abs(length(l.listing_norm) - $6), l.listing_norm limit $7`,
@@ -194,13 +197,13 @@ export async function similarAmazonSkus(db, sellerSku) {
   const incomplete = band.length > SIMILAR_SCAN_MAX;
   const seen = new Set();
   const hits = [];
-  for (const c of [...bySkel, ...band.slice(0, SIMILAR_SCAN_MAX)]) {
+  for (const c of [...bySkel.slice(0, SIMILAR_SYMBOLS_MAX), ...band.slice(0, SIMILAR_SCAN_MAX)]) {
     if (seen.has(c.listing_id)) continue;
     seen.add(c.listing_id);
     const s = similarKind(norm, c.listing_norm);
     if (s) hits.push({ listing_id: c.listing_id, norm: c.listing_norm, ...s });
   }
-  if (!hits.length) return { rows: [], total: 0, incomplete };
+  if (!hits.length) return { rows: [], total: 0, incomplete, symbols_incomplete: symbolsIncomplete };
   const ids = hits.map((h) => h.listing_id);
   const info = new Map((await db.query(`select l.listing_id::text as listing_id, l.listing_code, l.title, m.seller_sku, m.name, m.state, ci.asin
       from core.listings l left join core.amazon_sku_maps m on m.listing_id = l.listing_id left join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id
@@ -211,7 +214,7 @@ export async function similarAmazonSkus(db, sellerSku) {
     return { seller_sku: r.seller_sku || lowerSkuOr(r.listing_code), name: r.name || r.title || null, state: r.state || null, asin: r.asin || null, kind: h.kind, distance: h.distance };
   }).sort((x, y) => (x.kind === y.kind ? 0 : x.kind === 'symbols' ? -1 : 1) || x.distance - y.distance
     || (RANK[x.state] ?? 2) - (RANK[y.state] ?? 2) || (x.seller_sku < y.seller_sku ? -1 : x.seller_sku > y.seller_sku ? 1 : 0));
-  return { rows: rows.slice(0, SIMILAR_LIMIT), total: rows.length, incomplete };
+  return { rows: rows.slice(0, SIMILAR_LIMIT), total: rows.length, incomplete, symbols_incomplete: symbolsIncomplete };
 }
 
 /**
@@ -225,7 +228,7 @@ export async function similarAmazonSkus(db, sellerSku) {
  *   open = 作る / 開く画面の seller SKU
  */
 export async function checkNewAmazonSku(db, raw) {
-  const base = { ok: false, sku: null, open: null, exists: null, similar: [], similar_total: 0, similar_incomplete: false, warnings: [], problems: [], canonical: null, next: null };
+  const base = { ok: false, sku: null, open: null, exists: null, similar: [], similar_total: 0, similar_incomplete: false, similar_symbols_incomplete: false, warnings: [], problems: [], canonical: null, next: null };
   let sku;
   try { sku = sellerSkuIn(typeof raw === 'string' ? raw : ''); } catch (e) {
     if (e instanceof MasterWriteError) return { ...base, reason: 'shape', message: e.message };
@@ -251,6 +254,6 @@ export async function checkNewAmazonSku(db, raw) {
   }
   const sim = await similarAmazonSkus(db, sku);
   const warnings = sellerSkuWarnings(sku);
-  return { ...base, ok: true, reason: null, message: null, sku, open: sku, similar: sim.rows, similar_total: sim.total, similar_incomplete: sim.incomplete, warnings,
+  return { ...base, ok: true, reason: null, message: null, sku, open: sku, similar: sim.rows, similar_total: sim.total, similar_incomplete: sim.incomplete, similar_symbols_incomplete: sim.symbols_incomplete, warnings,
     next: sim.rows.length || warnings.length ? 'confirm' : 'create' };
 }

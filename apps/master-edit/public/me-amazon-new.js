@@ -57,7 +57,9 @@
         });
         h += '</ul><div class="hint">打ち間違いでなければ、そのまま「作り始める」</div>';
       }
-      if (j.similar_incomplete) h += '<div class="hint">出品が多いので、「もしかして」は長さの近い出品の一部だけと比べました (記号だけ違うものは全部と比べています)</div>';
+      // 比べた範囲を正しく言う (#1685 Codex R2 Low): 長さの近い出品・記号だけ違う出品の、どちらが上限で打ち切りか
+      if (j.similar_incomplete) h += '<div class="hint">出品が多いので、「もしかして」は長さの近い出品の一部 (2,000 件まで) だけと比べました (もっとあります)</div>';
+      if (j.similar_symbols_incomplete) h += '<div class="hint">記号だけ違う出品は最大 50 件と比べました (もっとあります)</div>';
       if (j.warnings && j.warnings.length) {
         h += '<ul class="warnlist">' + j.warnings.map(function (w) { return '<li><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><span>' + esc(w) + '</span></li>'; }).join('') + '</ul>';
       }
