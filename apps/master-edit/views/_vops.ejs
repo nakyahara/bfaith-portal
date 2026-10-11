@@ -1,0 +1,26 @@
+<%#
+  まとまりの操作の窓 (PR-7b・CompanyDB構想/20 §④ §⑤): まとまりの名前・軸の名前・選択肢名を直す / 子の廃止 / NE で直接作られた商品 (quarantined) の代表の採用。
+  新商品の登録 (色違い・サイズ違い) と商品の画面で同じ部品。動き = public/me-vops.js (MasterEdit.vops.openLabels / openCancel / openAdopt)
+%>
+<div class="modal-bg" id="vl-bg" role="dialog" aria-modal="true" aria-labelledby="vl-h" data-base="<%= base %>">
+  <div class="modal conf vops">
+    <h2 id="vl-h"><svg class="ic" aria-hidden="true"><use href="#i-edit"/></svg>まとまりの名前を直す</h2>
+    <div class="callout info" style="margin-bottom:12px"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="hint" style="color:var(--text)">社内だけの名前です (<b>NE には送りません</b>)。まとまりのコードと「コードにつける文字」は直せません。
+      子の商品名は自動では変えません (変えるときは商品の画面で)。モールの出品も自動では変えません (product-hub のカードに「要確認」が出ます)。</div></div></div>
+    <div id="vl-body" aria-live="polite"><div class="empty">読んでいます…</div></div>
+    <label class="lab2" for="vl-reason" style="margin-top:10px;display:block">理由 (なくてもよい)</label>
+    <input class="in" id="vl-reason" maxlength="200" autocomplete="off" placeholder="例: 色の呼び方をそろえる" style="width:100%">
+    <div class="msgline" id="vl-msg" role="status" aria-live="polite"></div>
+    <div class="mbtns"><button class="btn" type="button" id="vl-no">やめる</button><button class="btn pri" type="button" id="vl-yes" disabled>名前を直す</button></div>
+  </div>
+</div>
+<div class="modal-bg" id="vc-bg" role="alertdialog" aria-modal="true" aria-labelledby="vc-h" aria-describedby="vc-d" data-base="<%= base %>">
+  <div class="modal conf vops">
+    <h2 id="vc-h"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span id="vc-t">—</span></h2>
+    <div id="vc-d" class="hint" style="color:var(--text);margin-bottom:10px"></div>
+    <label class="lab2" for="vc-reason" style="display:block">理由<span id="vc-req" class="req">必須</span></label>
+    <input class="in" id="vc-reason" maxlength="200" autocomplete="off" style="width:100%">
+    <div class="msgline" id="vc-msg" role="status" aria-live="polite"></div>
+    <div class="mbtns"><button class="btn" type="button" id="vc-no">やめる</button><button class="btn danger" type="button" id="vc-yes">—</button></div>
+  </div>
+</div>
