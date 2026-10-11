@@ -675,7 +675,10 @@ node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain --a
 - **configured** (PR-8・2026-10-11): `config/master-ownership.mjs` の `'products.parent'` = `'company'` (configured の持ち主表のハッシュ = `e1b9c686b7280b1640840849948022fc27f918196026b586913d9d524841ae37`・16 キー。前 = `53a62b53…` = 10/9 の Amazon の widen の後の本番の active)。
   **配っただけでは何も変わらない** (夜間ロード・写し・画面・門・まとまりの関数は DB の active を読む = products.parent は load のまま。configured を読むのは `prepare` / `prepare --widen` と証跡のハッシュだけ)。
   🚨 ただし `config/master-ownership.mjs` は夜間ロードの規則の指紋 (`LOAD_RULE_FILES`) に入る = **朝の照合の後〜次の夜間ロード (02:00) の前に Render と miniPC の両方へ配り** (同じ日のうちに)、build と `configured_hash` を両方で確かめる (違う build だとその朝の照合 ① が `rule_mismatch`。revert も同じ)。
-  その後の当日の段 = 上の数え (drift-list) が 0 → `master-ownership-epoch.mjs prepare --widen --company 1` (足すキー = products.parent だけ) → `stop-manual --entry ne:item-screen` → 門の記録 (2 版) が prepared を見て書きかけ 0 → `remote-load.mjs load --apply --wait --use-prepared` → 照合 ② (封をした回・6 つ = 0) → `check --attempt` → `widen --attempt` (中原さんの OK)。
+  その後の当日の段 = 上の数え (drift-list) が 0 → `master-ownership-epoch.mjs prepare --widen --company 1` (足すキー = products.parent だけ) → `stop-manual --entry ne:item-screen` → 門の記録 (2 版) が prepared を見て書きかけ 0 →
+  **同じ材料で 2 回のロード** (🚨 0068 の判定は prepare の後 (`base_commit_seq` より後) の commit が**ちょうど 2 つ・1 つ目 = epoch active (持ち主 = 今の active)・2 つ目 = epoch prepared** を求める。`--use-prepared` だけを先に流す・後から active を流す = check / widen が断る = 試みを cancel して作り直す):
+  NE の取得 → 写し (`publish/fetch.mjs`) → 作り直し → `--verify-apply` → Render の同期 → **回収のロード `remote-load.mjs load --apply --wait` (`--use-prepared` なし)** → **prepared のロード `remote-load.mjs load --apply --wait --use-prepared`** → 写し → 作り直し → `--verify-apply`
+  (10/9 の Amazon の widen の `amz-widen-steps.ps1` と同じ順。間に夜間ロード (02:00) を挟まない) → 照合 ② (封をした回・6 つ = 0) → `check --attempt` → `widen --attempt` (中原さんの OK)。
   試験 = `apps/company-db/test-master-parent.mjs` [8b] (configured = company を配っても、DB の active が load なら夜間ロードは NE の代表で名札と親を作る / widen の後は触らない)
 
 ### NE に取り込む CSV (0040。10 §6.1.1「③b NE に取り込む CSV の契約 v3」)
