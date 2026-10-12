@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * test-amazon-unlinked-pg.mjs — Amazon の出品一覧 (0076 (仮の番号)) と「まだつないでいない SKU」の**同時実行**・**ロールの権限**・**本物の件数の所要時間**を、
+ * test-amazon-unlinked-pg.mjs — Amazon の出品一覧 (0074) と「まだつないでいない SKU」の**同時実行**・**ロールの権限**・**本物の件数の所要時間**を、
  *   実 PostgreSQL の独立した接続で確かめる (PGlite は 1 接続 = test-amazon-unlinked.mjs では書けない分)
  *
  * 接続は本番と同じロールでログインする (create-master-edit-roles.mjs で作る・パスワードは試験の回ごと): 画面 = master_edit / 受け口・夜間ロード = 持ち主
  * 固定する契約:
- *   1 今のデータのある DB (0076 の前 + 夜間ロード) に 0076 を流しても失敗しない・何も変えない (表は空)
+ *   1 今のデータのある DB (0074 の前 + 夜間ロード) に 0074 を流しても失敗しない・何も変えない (表は空)
  *   2 画面のロールのログイン: 3 つの表を読める・最後に売れた日と隠すの関数を呼べる / 表に直に書けない・記録の表は読めない (42501)
  *   3 受け口が同じ店に 2 つ並んで来る: 後の方は advisory lock が取れず LOCKED (待たない = 送り手が次の朝にやり直す)・先の方は最後まで (行は 1 回分だけ)
  *   4 同じ SKU を 2 人が同時に隠す: 関数の中の鍵で並び、片方は hidden・もう片方は same (印は 1 行・記録は 1 行)
@@ -17,8 +17,7 @@
  */
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import { openPgClient, pgAdapter, applyMigrations, DEFAULT_DIR } from './company-db/migrate.mjs';
+import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.mjs';
 import { createMasterEditRoles } from './company-db/create-master-edit-roles.mjs';
 import { runInitialLoad } from '../apps/company-db/load/engine.mjs';
 import { OWNED_COLUMNS } from '../config/master-ownership.mjs';
@@ -42,8 +41,7 @@ const A = await import('../lib/amazon-map-write.mjs');
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
 const quiet = () => {};
-const MIG = F.migrationsDir();
-const BEFORE = F.versionBefore0076(MIG);
+const BEFORE = F.VERSION_BEFORE_0074;
 const NOW = Date.now();
 const TODAY = F.jstToday(NOW);
 const PW = Object.fromEntries(['master_edit', 'master_gate_render', 'master_gate_minipc', 'master_ops', 'master_observer'].map((r) => [r, `t_${crypto.randomBytes(12).toString('hex')}`]));
@@ -74,14 +72,14 @@ function bigRows(n = 8000) {
 }
 try {
   const db = pgAdapter(O);
-  await applyMigrations(db, { log: quiet, dir: MIG, to: BEFORE });
+  await applyMigrations(db, { log: quiet, to: BEFORE });
   await createMasterEditRoles(O, { pw: PW });
   assert.equal((await runInitialLoad(db, F.makePlan(), { log: quiet, runId: 'load_pg', ownership: MASTER_OWNERSHIP, now: new Date(NOW - 3600e3), host: 'test' })).ok, true);
 
-  await ta('[1] 今のデータのある DB (0076 の前 + 夜間ロード) に 0076 を流しても失敗しない・新しい表は空・出品と構成は変わらない', async () => {
+  await ta('[1] 今のデータのある DB (0074 の前 + 夜間ロード) に 0074 を流しても失敗しない・新しい表は空・出品と構成は変わらない', async () => {
     const snap = async () => (await O.query(`select l.listing_code, count(c.*)::int as comps from core.listings l left join core.listing_components c on c.listing_id = l.listing_id group by 1 order by 1`)).rows;
     const before = await snap();
-    await applyMigrations(db, { log: quiet, dir: MIG });
+    await applyMigrations(db, { log: quiet });
     await createMasterEditRoles(O, { pw: PW });   // 表ができた後に流し直す = 権限が付く
     assert.deepEqual(await snap(), before);
     for (const t of ['ops.amazon_listing_report', 'ops.amazon_listing_report_loads', 'ops.amazon_sku_hidden', 'ops.amazon_sku_hidden_events']) {
@@ -216,6 +214,5 @@ try {
   for (const c of clients.reverse()) { try { await c.end(); } catch { /* */ } }
   try { await admin.query(`drop database if exists ${dbName} with (force)`); } catch (e) { console.error(`DB を消せない: ${e.message}`); }
   await admin.end();
-  if (MIG !== DEFAULT_DIR) fs.rmSync(MIG, { recursive: true, force: true });
 }
 console.log(`\n${passed} ok`);

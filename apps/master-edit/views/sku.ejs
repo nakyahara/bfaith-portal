@@ -543,8 +543,9 @@
         <% const G = typeof gone !== 'undefined' && gone && gone.show ? gone : null; const goneCan = !!G && G.canGo && G.canApprove && !dbError && !closed; %>
         <% if (G) { %>
         <section class="panel" aria-labelledby="h-gone" id="gone-box" data-base="<%= base %>" data-code="<%= c.code %>">
+          <% if (G.fromRequest && G.canGo) { %><div class="callout ok" style="margin:0 0 10px"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg><div class="grow"><div class="t">NE から消えました。Company DB でも「やめた」にしてください</div><div class="hint">「NE から消す」の依頼で消した商品です (毎朝の照合が NE に <%= G.required %> 日続けて無いのを確かめました)。</div></div></div><% } %>
           <div class="panel-h" style="margin-bottom:10px"><h2 id="h-gone">NE から消えた (やめる)</h2><span class="right"><span class="b <%= G.canGo ? 'warn' : 'mute' %>" id="gone-streak">NE に無い <%= G.streak %> / <%= G.required %> 日</span></span></div>
-          <div class="hint" id="gone-lead">この商品は、毎朝の照合の「完全な NE の取得」に <b><%= G.streak %> 日続けて</b>ありません (1 日に何回取得しても 1 日と数えます)<%= G.since ? ' (' + ui.fmtJst(G.since.products_complete_at, { nowMs }) + ' の取得から)' : '' %>。<%= G.required %> 日続けて無く、どこにも使われていなければ、理由を書いて「やめた」にできます (業務で使わない商品になります・NE には何もしません)。</div>
+          <div class="hint" id="gone-lead">この商品は、毎朝の照合の「完全な NE の取得」に <b><%= G.streak %> 日続けて</b>ありません (1 日に何回取得しても 1 日と数えます)<%= G.since ? ' (' + ui.fmtJst(G.since.products_complete_at, { nowMs }) + ' の取得から)' : '' %>。<%= G.required %> 日続けて無く、どこにも使われていなければ、理由を書いて「やめた」にできます (業務で使わない商品になります・NE には何もしません)。<% if (G.kind === 'set') { %><b>セットは、やめると構成 (中身の商品との結び付き) も外します</b> (中身の単品を消せるようになります)。<% } %></div>
           <% if (G.why.length) { %>
           <ul class="gone-why" id="gone-why-list" style="margin:8px 0 0 18px">
             <% for (const w of G.why) { %><li data-reason="<%= w.reason %>"><b><%= w.word %></b>: <%= w.text %></li><% } %>
@@ -564,6 +565,22 @@
         </section>
         <% } %>
 
+        <%# 🆕 0072: NE から消す (業務で使える単品・セット)。依頼の途中ならその様子・無ければ「NE から消す」の画面へ (確かめと CSV はその画面で) %>
+        <% const ND = typeof nedel !== 'undefined' && nedel ? nedel : null; %>
+        <% if (ND && (ND.live.length || (ND.canApprove && !(G && G.show)))) { %>
+        <section class="panel" aria-labelledby="h-nedel" id="nedel-box">
+          <div class="panel-h" style="margin-bottom:10px"><h2 id="h-nedel">NE から消す</h2><% if (ND.live.length) { %><span class="right"><span class="b warn">依頼の途中</span></span><% } %></div>
+          <% if (ND.live.length) { for (const i of ND.live) { const st = i.status || {}; %>
+          <div class="hint">ファイル #<%= i.export_id %> で NE から消す依頼の途中です: <b style="color:var(--text)"><%= st.word || ND.STATUS_WORDS[st.status] || st.status %></b><% if (st.status === 'gone_counting' || st.status === 'gone_ready') { %> (NE に無い <%= st.streak %> / <%= st.required %> 日)<% } %>。依頼の間は、新しいセットの構成・出品・Amazon の対応に入れられません。</div>
+          <% } %>
+          <div style="margin-top:8px"><a class="btn soft sm" href="<%= base %>/ne-delete"><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg>「NE から消す」の画面で見る</a></div>
+          <% } else { %>
+          <div class="hint">NE でもう使わない商品を、NE の「マスタ削除」で消す CSV を作れます (在庫 0・どこにも使われていない商品だけ)。NE から消えたのを確かめてから、ここで「やめた」にします。</div>
+          <div style="margin-top:8px"><a class="btn ghost sm" href="<%= base %>/ne-delete?codes=<%= encodeURIComponent(c.code) %>"><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg>NE から消せるか確かめる</a></div>
+          <% } %>
+        </section>
+        <% } %>
+
         <section class="panel" aria-labelledby="h-recent">
           <div class="panel-h" style="margin-bottom:10px"><h2 id="h-recent">最近の変更</h2><span class="right"><a href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>/history" class="hint">ぜんぶ見る →</a></span></div>
           <% if (!recent.length) { %><div class="hint">まだありません</div><% } else { %>
@@ -579,7 +596,7 @@
       <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="gone-t" aria-describedby="gone-d">
         <h2 id="gone-t"><svg class="ic l" aria-hidden="true"><use href="#i-warn"/></svg><span class="mono"><%= c.code %></span> を「やめた」にします</h2>
         <div class="hint" id="gone-d" style="color:var(--text2)">業務で使える商品から外れます (登録の状態 = やめた)。元には戻せません。NE・ロジザード・モールには何もしません。</div>
-        <ul><li>理由: <span id="gone-why"></span></li><li>完全な NE の取得に <%= gone.streak %> 日続けて無い (Company DB が確かめた)</li></ul>
+        <ul><li>理由: <span id="gone-why"></span></li><li>完全な NE の取得に <%= gone.streak %> 日続けて無い (Company DB が確かめた)</li><% if (gone.kind === 'set') { %><li>セットの構成 (中身の商品との結び付き) も外します</li><% } %></ul>
         <div class="mbtns"><button class="btn ghost" type="button" id="gone-stay">やめない</button><button class="btn danger" type="button" id="gone-ok">やめた にする</button></div>
       </div>
     </div>

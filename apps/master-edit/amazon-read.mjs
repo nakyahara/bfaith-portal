@@ -7,9 +7,10 @@
  *   売上の日次の公開がそろっていない日があれば「未判定」(0 件と言わない = M11)
  */
 import { normSku } from '../../lib/sku-norm.js';
-import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
+import { foldSearch, foldSql, likeOf, HIRA_CHARS, KATA_CHARS } from './search-fold.mjs';
 import { COMPANY_ID, jstDate, MasterWriteError } from '../../lib/master-write.mjs';
-import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage, MAP_STATES, AMAZON_JP_SHOP_CODE, AMAZON_SKU_MAX_LEN } from '../../lib/amazon-map-write.mjs';
+import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage, componentUnusable, USABLE_REG_STATES, NOT_IN_NE_REG_STATES, USABLE_SKU_KINDS, MAP_STATES, AMAZON_JP_SHOP_CODE, AMAZON_SKU_MAX_LEN } from '../../lib/amazon-map-write.mjs';
+import { stockOf } from './extras.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
 import { readReportLoad } from './amazon-unlinked.mjs';
 
@@ -139,7 +140,7 @@ export function channelsFromFeeRows(rows) {
  * 未登録 (M11): 直近 UNMAPPED_DAYS 日の Amazon の注文で、出品が無い・出品に構成が無い **FBA の** seller SKU。
  * 🚨 自社発送 (FBM) は出さない・数えない (中原さん 10/12「自社発送は 商品コード = Amazon SKU なので対応が要らない」)。区分の切り替えも無い。
  * 区分の決め方 = 鮮度で決める (#1691 Codex R4 M1):
- *   ① Company DB の Amazon の出品一覧 (0076・毎日全件の今の姿) が古くなければ (36 時間以内) それを先に
+ *   ① Company DB の Amazon の出品一覧 (0074・毎日全件の今の姿) が古くなければ (36 時間以内) それを先に
  *   ② 出品一覧に無い・古い・読めない = 手数料の写し (channels = Render の mirror_amazon_sku_fees) が新しければ (FEES_FRESH_MS 以内) それ
  *   ③ どちらも古い・無い = 区分が分からない
  *   同じ正規化の鍵で区分が食い違う行 (出品一覧・fees とも) = 区分が分からない (後勝ちにしない・R4 M2)
@@ -327,4 +328,94 @@ export async function checkNewAmazonSku(db, raw) {
   const warnings = sellerSkuWarnings(sku);
   return { ...base, ok: true, reason: null, message: null, sku, open: sku, similar: sim.rows, similar_total: sim.total, similar_incomplete: sim.incomplete, similar_symbols_incomplete: sim.symbols_incomplete, warnings,
     next: sim.rows.length || warnings.length ? 'confirm' : 'create' };
+}
+
+// ─── 構成の行の「NE の商品」の欄の候補 (10/12 中原さん「既存の商品コードを検索して選んで登録できるように」) ───
+
+/** 何文字から探すか・何件まで返すか・欄の長さ (コードの欄と同じ 60 = 言葉は多くても 30 個 = 全部の言葉を見る。#1689 Codex R1 Low: 黙って捨てない) */
+export const COMPONENT_SEARCH_MIN = 2;
+export const COMPONENT_SEARCH_LIMIT = 20;
+export const COMPONENT_SEARCH_Q_MAX = 60;
+const KIND_WORDS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
+const REG_WHY = Object.freeze({
+  cancelled: '登録をやめた商品',
+});
+/**
+ * 構成品に使えない理由 (画面に出す文)。使える = null。決まりは保存の確かめと同じ関数 (lib/amazon-map-write.mjs の componentUnusable)
+ * = 画面で選べる候補は保存で断られない
+ */
+export function componentUnusableWhy(skuKind, regState) {
+  const w = componentUnusable(skuKind, regState);
+  if (!w) return null;
+  if (w === 'kind') return '例外の SKU (NE に無い商品) = 構成品にできません';
+  return REG_WHY[regState] || (regState ? `登録の状態が「${regState}」` : '登録の状態が無い (切替の前の商品)');
+}
+const escLike = (s) => String(s).replace(/[\\%_]/g, (c) => `\\${c}`);
+/** ひらがな (search-fold.mjs の HIRA_CHARS と同じ字: ぁ〜ゖ・ゝゞ) を 1 字でも含むか (PostgreSQL の正規表現) */
+const HIRA_CLASS = `[${HIRA_CHARS}]`;
+
+/**
+ * 構成の行に入れる NE の商品を探す (読むだけ)。q = 打った文字 (COMPONENT_SEARCH_MIN 文字から)。
+ *   当てる: ① 商品コード (前方一致を上に・部分一致も。全角英数・大文字・ハイフンの違いは同じ = normSku / core.norm_code だけ。
+ *              🚨 コードには NFKC を掛けない (#1689 Codex R1 M2): core.norm_code はわざと NFKC を使わない (0001) = ﾊﾁ-01 と ハチ-01 は別の商品。保存の重なりの確かめとも同じ)
+ *           ② 商品名の言葉 (空白で区切った言葉が全部入っている・全部の言葉を見る。言葉ごとにコードに入っていてもよい。かなの同一視 (NFKC を含む) = search-fold.mjs = 一覧と同じ = 名前だけ)
+ *           ③ JAN (ぴったり・一覧の検索と同じ core.external_ids)
+ *   並び: コードがぴったり → コードの前方一致 → JAN → コードの部分一致 → 名前。同じ段の中は使える商品が上・コード順。上限 limit 件 (more = もっとある)
+ *   使えない商品 (例外の SKU・状態が無い) も出す = usable false と理由 (画面は灰色で押せない)。まだ NE に無い 下書き・NE 登録待ちは使える (not_in_ne = 画面の印)・
+ *   要確認 (NE で直接作った商品) も使える (ne_direct = 画面の印・中原さん 10/12)。
+ *   登録をやめた商品 (cancelled) は、一覧と同じく、コードをぴったり打ったときだけ出す (#1688 の一覧の決まり)。
+ *   重さ: core.skus (会社の SKU は 7,400 ほど) を 1 回走査する 1 本の SQL。コードの前方一致の索引は無い (unique (company_id, code_norm) は照合順が "C" でない) が、
+ *     一覧の検索 (read.mjs listSkus の q) と同じく索引なしで足りる (search-fold.mjs)。JAN は ux_external_ids_active のぴったり。
+ *     名前のかなの同一視は search-fold.mjs の foldSql と同じ答え (NFKC・小文字・ひらがな → カタカナ) を、1 行に 1 回だけ作る (言葉が増えても作り直さない)。
+ *     translate (ひらがな → カタカナ) は重い (本物の PG・8,000 件で 1 回 70ms ほど) = ひらがなを含む名前だけにかける (含まなければ translate しても同じ = 答えは変わらない)
+ * stock = readWarehouseStock() の結果 (読めない = null)。単品・例外だけ在庫 (ロジザード) を付ける (セットは null)
+ * 戻り値 { items: [{ code, name, kind, kind_label, reg_state, handling, usable, why, stock }], more, short }
+ */
+export async function searchMapComponents(db, q, { limit = COMPONENT_SEARCH_LIMIT, stock = null } = {}) {
+  const text = String(q ?? '').trim();
+  if ([...text].length < COMPONENT_SEARCH_MIN) return { items: [], more: false, short: true };
+  if (text.length > COMPONENT_SEARCH_Q_MAX) return { items: [], more: false, short: false, too_long: true };   // 入口 (router) でも 400。黙って切らない
+  const words = text.split(/\s+/).filter(Boolean);
+  const params = [COMPANY_ID];
+  params.push(HIRA_CHARS); const hira = params.length;
+  params.push(KATA_CHARS); const kata = params.length;
+  params.push(HIRA_CLASS); const hasHira = params.length;
+  const conds = words.map((w) => {
+    params.push(likeOf(normSku(w))); const c = params.length;
+    params.push(likeOf(foldSearch(w))); const n = params.length;
+    return `(b.code_norm like $${c} or b.fname like $${n})`;
+  });
+  const whole = normSku(text);
+  params.push(whole); const exact = params.length;
+  params.push(`${escLike(whole)}%`); const pre = params.length;
+  params.push(likeOf(whole)); const any = params.length;
+  params.push(text); const raw = params.length;
+  params.push([...USABLE_SKU_KINDS]); const kinds = params.length;
+  params.push([...USABLE_REG_STATES]); const states = params.length;
+  const max = Math.max(1, Math.min(Number(limit) || COMPONENT_SEARCH_LIMIT, COMPONENT_SEARCH_LIMIT));
+  params.push(max + 1); const lim = params.length;
+  const rows = (await db.query(`with jan as (
+      select e.entity_id from core.external_ids e
+       where e.system = 'jan' and e.id_kind = 'jan' and e.valid_to is null and e.entity_type = 'product' and e.external_norm = core.norm_code($${raw})),
+    low as materialized (
+      select s.sku_id, s.code, s.code_norm, s.name, s.sku_kind, s.handling, s.product_id, lower(normalize(s.name, NFKC)) as lname from core.skus s where s.company_id = $1),
+    b as materialized (
+      select l.*, case when l.lname ~ $${hasHira} then translate(l.lname, $${hira}, $${kata}) else l.lname end as fname from low l),
+    hit as (
+      select b.code, b.code_norm, b.name, b.sku_kind, b.handling, r.state as reg_state, coalesce(b.product_id in (select entity_id from jan), false) as jan_hit
+        from b left join ops.master_registrations r on r.sku_id = b.sku_id
+       where ((${conds.join(' and ')}) or b.product_id in (select entity_id from jan))
+         and (r.state is distinct from 'cancelled' or b.code_norm = $${exact}))
+    select code, code_norm, name, sku_kind, handling, reg_state from hit
+     order by case when code_norm = $${exact} then 0 when code_norm like $${pre} then 1 when jan_hit then 2 when code_norm like $${any} then 3 else 4 end,
+              case when sku_kind = any($${kinds}::text[]) and reg_state = any($${states}::text[]) then 0 else 1 end,
+              code_norm
+     limit $${lim}`, params)).rows;
+  const more = rows.length > max;
+  const items = rows.slice(0, max).map((r) => {
+    const why = componentUnusableWhy(r.sku_kind, r.reg_state);
+    return { code: r.code, name: r.name, kind: r.sku_kind, kind_label: KIND_WORDS[r.sku_kind] || r.sku_kind, reg_state: r.reg_state ?? null, handling: r.handling,
+      usable: !why, why, not_in_ne: NOT_IN_NE_REG_STATES.includes(r.reg_state), ne_direct: r.reg_state === 'quarantined', stock: r.sku_kind === 'set' ? null : stockOf(stock, r.code_norm) };
+  });
+  return { items, more, short: false };
 }

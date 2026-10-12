@@ -367,7 +367,7 @@ app.use((req, res, next) => {
     if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/ad-spend')) return next();
     // /apps/company-db/sync/sku-cost-observed (観測の原価。D7b-2。router 側の 12MB・圧縮なしの parser) も同じ
     if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/sku-cost-observed')) return next();
-    // /apps/company-db/sync/amazon-listings (Amazon の出品一覧の 1 回分・0076。router 側の 12MB・圧縮なしの parser) も同じ
+    // /apps/company-db/sync/amazon-listings (Amazon の出品一覧の 1 回分・0074。router 側の 12MB・圧縮なしの parser) も同じ
     if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/amazon-listings')) return next();
     // /apps/stock-bot は Chat Bearer 検証 (stockBotAuth) 後に専用 parser (256kb) が走る。
     // 認証前に body を読まない (未認可 DoS 面を閉じる)

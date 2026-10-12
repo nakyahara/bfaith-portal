@@ -3,7 +3,7 @@
  * push/amazon-listings.mjs — 前の夜に想定利益の夜間 (miniPC 23:30・apps/expected-profit/fetch-listings.js) が取って残した Amazon の出品レポート
  *   (GET_MERCHANT_LISTINGS_ALL_DATA の TSV 原文 = DATA_DIR/mall-items-history/amazon/YYYY/MM/items_amazon_*.tsv.gz・manifest.jsonl) を読み、
  *   Company DB (Render Postgres) の ops.amazon_listing_report へ 1 要求で送る (2026-10-12 中原さん「Amazon の登録の商品名・まだつないでいない SKU」。
- *   受け口 = POST /apps/company-db/sync/amazon-listings・受け皿 = migration 0076 (仮の番号))。
+ *   受け口 = POST /apps/company-db/sync/amazon-listings・受け皿 = migration 0074)。
  *
  *   node apps/company-db/push/amazon-listings.mjs --send        ← daily-sync (毎朝 07:00 の 1 工程)。Render と同じ取得なら送らない
  *   node apps/company-db/push/amazon-listings.mjs --dry-run     ← 読んで数えるだけ (Render は GET で読むだけ = POST しない)
@@ -24,7 +24,7 @@
  *   - 🛑 安全弁: Render に前の回があり、行が前の 80% 未満 = 送らない (❌・既存の行を消さない)。初回 (Render に前の回が無い) = 想定利益の夜間の判定 (enum_status) が ok でない回・
  *     manifest の同じ店の 1 つ前の回より 20% 以上少ない回は送らない (#1691 Codex R1 M2)。受け口も同じ取引の中で今の行と比べ直す (SHRINK = 409)。
  *     わざと減ったときだけ --force (手で流す・body の force: true で受け口の安全弁も越える)
- *   - Render に 0076 がまだ無い (status が 409 not_migrated) = ⚠️ で exit 0 (マージから migrate (中原さんの指示の後) までの朝を ❌ にしない)
+ *   - Render に 0074 がまだ無い (status が 409 not_migrated) = ⚠️ で exit 0 (マージから migrate (中原さんの指示の後) までの朝を ❌ にしない)
  *   - 取得が古い (36 時間より前 = 想定利益の夜間が止まっている疑い) = 送るが ⚠️ (想定利益の台帳 expected-profit-nightly の見張りとは別に、朝の通知でも分かる)
  * 最後の 1 行が daily-sync の朝の通知に載る。❌ = exit 1 (retry に載る)・⚠️ / ✅ = exit 0
  * env: DATA_DIR / RENDER_MIRROR_URL (RENDER_PORTAL_URL) / MIRROR_SYNC_KEY
@@ -294,7 +294,7 @@ export async function pushAmazonListings({ historyDir, shopId, fetchImpl = fetch
     const warn = out.warn.length ? ` ⚠️ ${out.warn.join(' / ')}` : '';
     const mark = out.warn.length ? '⚠️' : '✅';
     out.lastLine = err ? `❌ Company DB 出品一覧 (Amazon): ${String(err.message).replace(/\s+/g, ' ').slice(0, 300)}`
-      : out.status === 'not_migrated' ? '⚠️ Company DB 出品一覧 (Amazon): Render に migration 0076 がまだ無い = 送らない (中原さんの指示で migrate した後に送る)'
+      : out.status === 'not_migrated' ? '⚠️ Company DB 出品一覧 (Amazon): Render に migration 0074 がまだ無い = 送らない (中原さんの指示で migrate した後に送る)'
       : out.status === 'dry-run' ? `dry-run: 送る予定 ${tail} / Render の今の回 ${out.remote ? fmtJst(out.remote.generation) : 'なし'}${warn} [dry-run = 送っていない]`
       : out.status === 'unchanged' ? `${mark} Company DB 出品一覧 (Amazon): 変わりなし (Render と同じ取得) ${tail}${warn}`
       : out.status === 'remote_newer' ? `⚠️ Company DB 出品一覧 (Amazon): Render の方が新しい取得 (${out.remote ? fmtJst(out.remote.generation) : '?'}) = 送らない ${tail}`

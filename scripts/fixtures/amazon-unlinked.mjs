@@ -1,41 +1,12 @@
 /**
- * fixtures/amazon-unlinked.mjs — 「Amazon の出品一覧・まだつないでいない SKU」(0076) の試験の部品 (test-amazon-unlinked.mjs と test-amazon-unlinked-pg.mjs が使う)
+ * fixtures/amazon-unlinked.mjs — 「Amazon の出品一覧・まだつないでいない SKU」(0074) の試験の部品 (test-amazon-unlinked.mjs と test-amazon-unlinked-pg.mjs が使う)
  *
- *   - migrationsDir(): 0076 は仮の番号 (0072〜 は別の PR・マージのときに付け替える)。番号に欠番があれば、一時のフォルダに写して詰めた番号で流す
- *     (付け替えた後 = 欠番が無い = 元のフォルダをそのまま返す)
  *   - レポートの見出し: 英語 = SP-API の説明の GET_MERCHANT_LISTINGS_ALL_DATA の 1 行目 (All Listings Report の列の並び)。
  *     日本語 = 日本のマーケットプレイスの今のレポートの列 (expected-profit/fetch-listings.js が読む 出品者SKU・商品ID・価格・フルフィルメント・チャンネル・ステータス・ポイント・
  *     merchant-shipping-group と、AI_reference『商品別想定利益_要件定義』§15-4 の列の一覧 (数量・在庫数・出品日)・profit-calculator の 商品名 から並べた)
  */
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { DEFAULT_DIR } from '../company-db/migrate.mjs';
-
-const FILE_RE = /^(\d{4})_([A-Za-z0-9_-]+)\.sql$/;
-
-/** 欠番があれば詰めた番号の一時のフォルダ (expect.json も一緒に写す)。無ければ元のフォルダ */
-export function migrationsDir() {
-  const files = fs.readdirSync(DEFAULT_DIR).filter((f) => FILE_RE.test(f)).sort();
-  const contiguous = files.every((f, i) => Number(FILE_RE.exec(f)[1]) === i + 1);
-  if (contiguous) return DEFAULT_DIR;
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amzunlinked-mig-'));
-  files.forEach((f, i) => {
-    const [, ver, name] = FILE_RE.exec(f);
-    const nv = String(i + 1).padStart(4, '0');
-    fs.copyFileSync(path.join(DEFAULT_DIR, f), path.join(dir, `${nv}_${name}.sql`));
-    const exp = path.join(DEFAULT_DIR, `${ver}_${name}.expect.json`);
-    if (fs.existsSync(exp)) fs.copyFileSync(exp, path.join(dir, `${nv}_${name}.expect.json`));
-  });
-  return dir;
-}
-/** 0076 の前まで (= 出品一覧の表の無い DB) の番号 */
-export function versionBefore0076(dir) {
-  const files = fs.readdirSync(dir).filter((f) => FILE_RE.test(f)).sort();
-  const i = files.findIndex((f) => FILE_RE.exec(f)[2] === 'amazon_listing_report');
-  if (i < 1) throw new Error('amazon_listing_report の migration が無い');
-  return FILE_RE.exec(files[i - 1])[1];
-}
+/** 0074 の前 (= 出品一覧の表の無い DB) の番号 */
+export const VERSION_BEFORE_0074 = '0073';
 
 /** SP-API の説明の GET_MERCHANT_LISTINGS_ALL_DATA の見出し (英語) */
 export const HEADER_EN = ['item-name', 'item-description', 'listing-id', 'seller-sku', 'price', 'quantity', 'open-date', 'image-url', 'item-is-marketplace', 'product-id-type',

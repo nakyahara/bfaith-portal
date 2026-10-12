@@ -102,7 +102,7 @@ export const JOB_DEFINITIONS = {
   'Amazon Ads (SKU)':      { script: 'apps/warehouse/fetch-amazon-ads.js',          args: [], timeoutMs: 1800000 },
   // Company DB へ Amazon SP の広告費の日次を送る (Company DB構想 11 の ②)。Render と同じ日は送らない・古い世代は受け口が拒む = 再実行安全。上流 = Amazon Ads (SKU) (UPSTREAM_OF)
   'CompanyDB広告費(Amazon)': { script: 'apps/company-db/push/ad-spend.mjs',     args: ['--mall', 'amazon', '--days', '35'], timeoutMs: 600000 },
-  // Company DB へ Amazon の出品一覧を送る (0076)。前の夜の出品レポートの TSV を読むだけ (SP-API は呼ばない)・Render と同じ取得なら送らない・古い世代は受け口が拒む = 再実行安全
+  // Company DB へ Amazon の出品一覧を送る (0074)。前の夜の出品レポートの TSV を読むだけ (SP-API は呼ばない)・Render と同じ取得なら送らない・古い世代は受け口が拒む = 再実行安全
   'CompanyDB出品一覧(Amazon)': { script: 'apps/company-db/push/amazon-listings.mjs', args: ['--send'], timeoutMs: 300000 },
   // スイッチが無いとき (今までどおり・master と同じ): Company DB へ Amazon の財務を送る (F2b-3)。台帳の指紋 + 読み直す鍵 + Render の世代で冪等。retry は曜日に依らず --full。
   //   スイッチがあるとき = 'Amazon決済と財務' (coordinator) にまとめる。突き合わせ (CompanyDB財務突合(Amazon)) はどちらでも retry に載せない (差の続いた回数を数えている)

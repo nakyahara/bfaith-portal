@@ -1,6 +1,6 @@
 /**
  * ingest/amazon-listings.mjs — miniPC から届いた「Amazon の出品一覧」(出品レポート GET_MERCHANT_LISTINGS_ALL_DATA の 1 回分) を
- *   ops.amazon_listing_report に入れる受け口の本体 (2026-10-12 中原さん「Amazon の登録の商品名・まだつないでいない SKU」。受け皿 = migration 0076 (仮の番号)。
+ *   ops.amazon_listing_report に入れる受け口の本体 (2026-10-12 中原さん「Amazon の登録の商品名・まだつないでいない SKU」。受け皿 = migration 0074。
  *   送り手 = apps/company-db/push/amazon-listings.mjs = 毎朝の daily-sync の 1 工程。材料 = 想定利益の夜間 (miniPC 23:30) が残した TSV = SP-API は 2 回取らない)。
  *
  * 1 要求 = 1 回分の全部 = 1 取引: 店の行を丸ごと消して入れ直し、見出し (ops.amazon_listing_report_loads) を 1 行足す。
@@ -137,7 +137,7 @@ const loadOut = (x) => (x ? {
   row_count: Number(x.row_count), skipped_count: Number(x.skipped_count), ingest_run_id: x.ingest_run_id, received_at: iso(x.received_at), refreshed_at: iso(x.refreshed_at),
 } : null);
 
-/** 表があるか (0076 の前の DB = 送り手に not_migrated を返す) */
+/** 表があるか (0074 の前の DB = 送り手に not_migrated を返す) */
 export async function listingTablesReady(db) {
   return (await db.query(`select to_regclass('ops.amazon_listing_report') is not null and to_regclass('ops.amazon_listing_report_loads') is not null as ok`)).rows[0].ok === true;
 }
@@ -149,7 +149,7 @@ export async function listingTablesReady(db) {
  */
 export async function ingestAmazonListings(db, body, { host = 'render', companyId = COMPANY_ID, nowMs, afterWrite = null, log = () => {} } = {}) {
   const v = validateListingBody(body, nowMs != null ? { nowMs } : {});
-  if (!(await listingTablesReady(db))) throw err('NOT_MIGRATED', 'Company DB に Amazon の出品一覧の表がまだ無い (migration 0076 の前)');
+  if (!(await listingTablesReady(db))) throw err('NOT_MIGRATED', 'Company DB に Amazon の出品一覧の表がまだ無い (migration 0074 の前)');
   const one = async (sql, p) => (await db.query(sql, p)).rows[0];
   const base = { shop_code: v.shopCode, generation: v.generation, checksum: v.checksum };
   await db.exec('begin');
@@ -215,10 +215,10 @@ export async function ingestAmazonListings(db, body, { host = 'render', companyI
   }
 }
 
-/** 今の見出しと行の数 (送り手が回の始めに読む)。戻り値 = { shop_code, load: {...} | null, rows }。0076 の前 = NOT_MIGRATED */
+/** 今の見出しと行の数 (送り手が回の始めに読む)。戻り値 = { shop_code, load: {...} | null, rows }。0074 の前 = NOT_MIGRATED */
 export async function amazonListingsStatus(db, { companyId = COMPANY_ID, shopCode = SHOP_CODE } = {}) {
   if (!SHOP_CODES.includes(shopCode)) throw bad('shop_code が不正');
-  if (!(await listingTablesReady(db))) throw err('NOT_MIGRATED', 'Company DB に Amazon の出品一覧の表がまだ無い (migration 0076 の前)');
+  if (!(await listingTablesReady(db))) throw err('NOT_MIGRATED', 'Company DB に Amazon の出品一覧の表がまだ無い (migration 0074 の前)');
   const cur = (await db.query(`select ${LOAD_COLS} from ops.amazon_listing_report_loads where company_id = $1::smallint and shop_code = $2 order by generation desc limit 1`, [companyId, shopCode])).rows[0];
   const n = (await db.query(`select count(*)::int as n from ops.amazon_listing_report where company_id = $1::smallint and shop_code = $2 and load_id = $3::bigint`, [companyId, shopCode, cur ? cur.load_id : null])).rows[0].n;
   return { shop_code: shopCode, load: loadOut(cur), rows: Number(n) };

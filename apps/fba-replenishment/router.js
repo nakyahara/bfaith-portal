@@ -49,6 +49,7 @@ import { isRender } from '../../lib/is-render.js';
 import { runDecisionAttemptSafe, shouldCatchUpAtStartup, DECISION_JOB_ID } from './decision-job.js';
 import { readMirrorWarehouse } from './mirror-warehouse.js';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { readNeProductCodes, missingNeCodes, componentCodesOf, notInNeWarning, historyNotes, warningsHeader } from './ne-registered.js';
 import { judgeInboundFetch } from './inbound-state.js';
 import archiver from 'archiver';
 import fs from 'node:fs';
@@ -1483,6 +1484,22 @@ router.get('/api/us-slips-status', (req, res) => {
   }
 });
 
+/**
+ * 手で足す画面の確かめ (#1694): その SKU の構成品に NE に未登録の商品コードがあるか (読むだけ)。
+ * { ok: true, missing: [コード], mapped } / 写しを読めない = 503 { ok: false, error } (画面は足すのを止める = CSV でも断るので)
+ */
+router.get('/api/ne-unregistered', (req, res) => {
+  const sku = String(req.query.sku ?? '').trim();
+  if (!sku || sku.length > 200) return res.status(400).json({ ok: false, error: 'SKU を入れてください' });
+  let ne;
+  try { ne = readNeProductCodes(getMirrorDB()); } catch (e) { ne = { ok: false, error: `NE の商品の写しを開けません: ${String(e && e.message || e).slice(0, 120)}` }; }
+  if (!ne.ok) return res.status(503).json({ ok: false, error: ne.error });
+  const key = sku.toLowerCase();
+  const mapping = getSkuMappings().find((m) => String(m.amazon_sku ?? '').trim().toLowerCase() === key);
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, mapped: !!mapping, missing: mapping ? missingNeCodes(ne, componentCodesOf(mapping)) : [], note: ne.note || null, as_of: ne.asOf || null });
+});
+
 router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   const { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
@@ -1494,6 +1511,14 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   for (const m of mappings) mappingMap[normSku(m.amazon_sku)] = m;
   // 恒久除外SKUはサーバ側でも納品させない (stale画面/直接API 経由の漏れ防止)。norm で case 差も拾う
   const excludedSet = new Set(getReplenishmentExcluded().map(r => normSku(r.amazon_sku)));
+  // NE の商品の写し (mirror_products)。まだ NE に無い商品コード (Company DB の下書き・NE 登録待ち = Amazon の構成に使える・#1694) を CSV に入れない。
+  // 読めない・空 = 何も出さない (fail-closed: NE に無いコードを混ぜた受注 CSV を作らない)
+  let ne;
+  try { ne = readNeProductCodes(getMirrorDB()); } catch (e) { ne = { ok: false, error: `NE の商品の写しを開けません: ${String(e && e.message || e).slice(0, 120)}` }; }
+  if (!ne.ok) return res.status(503).json({ error: `${ne.error}。NE に商品があるかを確かめられないので、CSV を出しません`, reason: 'ne_products_unreadable' });
+  // 写しが古い・いつの物か分からない = 止めずに知らせる (#1694 Codex R2 M1・FBA 補充の現場を止めない)。
+  // 知らせ (notes) とスキップ (warnings) は別に返す = X-NE-Notes / X-NE-Warnings (+ X-NE-Skipped-Count はスキップの数だけ・#1694 Codex R3 Low)
+  const notes = ne.note ? [ne.note] : [];
 
   // SKU → NE商品コードに展開し、同一NE商品コードは合算
   const neAggregated = {};
@@ -1542,6 +1567,13 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
     if (validComponents.length < components.length) {
       warnings.push(`${item.amazon_sku} (${mapping.product_name || ''}): 一部構成のNE商品コードが空（その分のみ除外）`);
     }
+    // NE に未登録の商品コードがある SKU = その SKU だけ出さない (ほかの SKU は出す = 1 つのために全部を捨てない・ほかのスキップと同じ形)。
+    // 構成の一部だけを出すと、セットの数が合わない伝票になる = SKU ごと外す
+    const notInNe = missingNeCodes(ne, validComponents.map(c => c.ne_code));
+    if (notInNe.length) {
+      warnings.push(notInNeWarning(item.amazon_sku, mapping.product_name || '', notInNe));
+      continue;
+    }
 
     const shipQty = parseInt(item.ship_qty) || 0;
     if (shipQty <= 0) {
@@ -1573,7 +1605,7 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   const neItems = Object.values(neAggregated).sort((a, b) => a.ne_code.localeCompare(b.ne_code));
 
   if (neItems.length === 0) {
-    return res.status(400).json({ error: 'NE商品コードに変換できる商品がありません', warnings });
+    return res.status(400).json({ error: 'NE商品コードに変換できる商品がありません', warnings, notes });
   }
 
   // CSV生成（SHIFT-JIS、61列のインボイス形式）
@@ -1652,6 +1684,8 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
     // スキップされたSKUを成功時(200+CSV)でもクライアントに伝える (従来は失敗時しか warnings を返さず無音欠落だった)。
     // 件数は常に返す。詳細はヘッダー過大で CSV ダウンロード自体が失敗しないよう byte 上限(約6KB)で詰める。
     res.setHeader('X-NE-Skipped-Count', String(warnings.length));
+    // 写しの鮮度の知らせ = X-NE-Notes だけ (X-NE-Warnings = スキップだけ = 画面の「ほか N 件」がスキップの数と合う)
+    if (notes.length) res.setHeader('X-NE-Notes', warningsHeader(notes));
     if (warnings.length > 0) {
       const picked = [];
       let bytes = 2; // "[]" 分
@@ -1701,6 +1735,14 @@ router.get('/api/export-history/:id/download', (req, res) => {
           }
         }
       } catch (e) { /* sku_list 壊れていてもDL自体は通す */ }
+    }
+    // NE 受注 CSV の再ダウンロード = 今の NE の商品の写しで構成のコードを確かめ、無い・確かめられない・写しが古いを知らせる (#1694 Codex R2 M2)。
+    // 🚨 止めない (前からある道)。読めない・古い形の履歴も警告だけ
+    if (record.type === 'ne_csv') {
+      let ne;
+      try { ne = readNeProductCodes(getMirrorDB()); } catch (e) { ne = { ok: false, error: `NE の商品の写しを開けません: ${String(e && e.message || e).slice(0, 120)}` }; }
+      const notes = historyNotes(record, ne);
+      if (notes.length) res.setHeader('X-NE-Notes', warningsHeader(notes));   // 知らせだけ (スキップは無い = X-NE-Warnings は出さない)
     }
     const contentType = record.type === 'manifest_excel'
       ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'

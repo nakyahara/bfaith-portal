@@ -440,6 +440,10 @@ export async function runInitialLoad(db, plan, opts = {}) {
     //   (skip の理由 sku_cancelled に残す・ロードは止めない)。マスタの書き込みの鍵 (排他) の中で読む = やめる関数 (共有) と並ぶ = 読んだ後に増えない
     const cancelledSkus = new Set();
     if (has0052) for (const r of (await db.query("select r.sku_id from ops.master_registrations r join core.skus k on k.sku_id = r.sku_id where k.company_id = $1 and r.state = 'cancelled'", [COMPANY_ID])).rows) cancelledSkus.add(Number(r.sku_id));
+    // 🆕 0072: NE から消す依頼の途中 (ops.ne_del_items が live) の SKU への新しい参照 (構成の子・出品の構成・代表) も DB の trigger が断る = ロードは先に飛ばす。
+    //   やめた とは違い「わざと除く」ではない (NE ではまだある・依頼を取り下げると戻る) = 親 / 出品は prune しない (今ある行はそのまま)。同じ鍵の中で読む
+    const deletingSkus = new Set();
+    if ((await db.query("select to_regclass('ops.ne_del_items') is not null as ok")).rows[0].ok) for (const r of (await db.query("select i.sku_id from ops.ne_del_items i where i.company_id = $1 and i.state = 'live'", [COMPANY_ID])).rows) deletingSkus.add(Number(r.sku_id));
 
     // ── 3.5 バリエーションのまとまり (D-24 = A)。NE の代表商品コードは実在しない「名札」なので、それ用の product を作って色違い・サイズ違いを束ねる ──
     //   代表コードが単品 SKU として実在する → その product を親に (新しく作らない)
@@ -492,6 +496,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
           const pid = productIdOf(own.code);
           if (!pid) { skipGroup(gi, g.code, '代表コードの product が無い', 'rep_no_product'); continue; }
           if (cancelledSkus.has(skuIdOf(own.code))) { skipGroup(gi, g.code, '代表コードの商品はやめた (cancelled) = 代表にしない', 'rep_cancelled'); continue; }   // 🆕 0070
+          if (deletingSkus.has(skuIdOf(own.code))) { skipGroup(gi, g.code, '代表コードの商品は NE から消す依頼の途中 = 代表にしない', 'rep_ne_deleting'); continue; }   // 🆕 0072
           parentPidOfGroup.set(gi, pid); vgSec.same++; continue;
         }
         const rows = byDisplay.get(k) || [];
@@ -729,6 +734,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
     for (const c of planSetComponents) {
       const p = skuIdOf(c.parentCode); const ch = skuIdOf(c.childCode);
       if (!p) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '親 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_parent' }); continue; }
+      // 🆕 0072: 親のセットはやめた (cancelled・NE から消えた) = 構成を入れない (miniPC の取得に消えたセットの古い行が残っても戻さない)・わざと除く = prune の候補
+      if (cancelledSkus.has(p)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '親のセットはやめた (cancelled) = 構成を入れない', reason_code: 'parent_cancelled', _p: p, ...(ch ? { _ch: ch } : {}) }); compCancelledParents.set(p, c.parentCode); continue; }
       // 構成は最終の区分がセットの親だけ (正規化)。区分が違う親 (kindHeld) で社内がセットでない = NE のセットの構成を社内の単品・例外に入れない
       const heldKind = kindHeld.get(normSku(c.parentCode));
       if (heldKind && heldKind.cdb_kind !== 'set') { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `親の区分が NE (${heldKind.ne_kind}) と社内 (${heldKind.cdb_kind}) で違う = 構成は触らない`, reason_code: 'kind_held', _p: p, ...(ch ? { _ch: ch } : {}) }); parentsWithSkip.add(p); continue; }
@@ -736,6 +743,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
       if (!ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_child', _p: p }); parentsWithSkip.add(p); continue; }
       // 🆕 0070 (#1683 Codex R2 Medium 1): やめた子 = 「材料が分からない」ではなく「わざと除く」= 親は prune してよい (parentsWithSkip に入れない)・子が全部やめた親も prune の候補に入れる
       if (cancelledSkus.has(ch)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子の商品はやめた (cancelled) = 構成に入れない', reason_code: 'child_cancelled', _p: p, _ch: ch }); compCancelledParents.set(p, c.parentCode); continue; }
+      // 🆕 0072: NE から消す依頼の途中の子 = 新しく入れない (DB の trigger が断る)・今ある行はそのまま (親を prune しない)
+      if (deletingSkus.has(ch)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子の商品は NE から消す依頼の途中 = 構成に入れない (今の行はそのまま)', reason_code: 'child_ne_deleting', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
       if (p === ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '自分自身', reason_code: 'self', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
       const k = `${p}|${ch}`; if (compKeys.has(k)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '重複', reason_code: 'duplicate', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; } compKeys.add(k);
       if (!(c.qty > 0)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `数量が不正 (${c.qty})`, reason_code: 'invalid_qty', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
@@ -1019,6 +1028,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
         if (!sid) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'NE コードが無い (または正規化衝突で落とした)' }); listingsWithSkip.add(lid); continue; }
         // 🆕 0070 (#1683 Codex R2 Medium 1): やめた商品 = わざと除く = 出品は prune してよい (listingsWithSkip に入れない)・全部やめた出品も prune の候補に入れる
         if (cancelledSkus.has(sid)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'その商品はやめた (cancelled) = 出品の構成に入れない' }); lcCancelledListings.add(lid); continue; }
+        // 🆕 0072: NE から消す依頼の途中の商品 = 新しく入れない (DB の trigger が断る)・今ある行はそのまま (出品を prune しない)
+        if (deletingSkus.has(sid)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'その商品は NE から消す依頼の途中 = 出品の構成に入れない (今の行はそのまま)' }); listingsWithSkip.add(lid); continue; }
         const k = `${lid}|${sid}`; if (lcKeys.has(k)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: '重複' }); listingsWithSkip.add(lid); continue; } lcKeys.add(k);
         if (!(c.qty > 0)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: `数量が不正 (${c.qty})` }); listingsWithSkip.add(lid); continue; }
         lcCand.push({ company_id: COMPANY_ID, listing_id: lid, sku_id: sid, qty: c.qty, sort_order: Number.isInteger(c.sortOrder) ? c.sortOrder : 0, resolution: c.resolution || 'imported', resolved_by_type: 'system', resolved_by_id: runId, evidence: c.evidence ? JSON.stringify(c.evidence) : null, _mall: l.mall, _listing: l.listingCode, _code: c.code });

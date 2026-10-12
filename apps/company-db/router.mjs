@@ -620,11 +620,11 @@ router.get('/sku-cost-observed/sku-codes', requireSyncKey, async (req, res) => {
 });
 
 /**
- * Amazon の出品一覧 (出品レポートの 1 回分・0076。本体 = ingest/amazon-listings.mjs、送り手 = apps/company-db/push/amazon-listings.mjs = daily-sync の 1 工程)。
+ * Amazon の出品一覧 (出品レポートの 1 回分・0074。本体 = ingest/amazon-listings.mjs、送り手 = apps/company-db/push/amazon-listings.mjs = daily-sync の 1 工程)。
  *   POST /apps/company-db/sync/amazon-listings          { shop_code, generation, snapshot_at, report_run_id, checksum, row_count, skipped_count, rows: [...] }
  *     → { status: 'applied' | 'same' | 'refreshed' | 'stale', rows, load_id, run_id, checksum, generation }。全部 = 1 要求 = 1 取引で入れ替える。
- *       同じ世代で違う内容 = 409 CONFLICT / 行が今の 80% 未満 (force なし) = 409 SHRINK / 0076 の前 = 409 not_migrated / 別の取込が走っている = 503 LOCKED
- *   GET  /apps/company-db/sync/amazon-listings/status   → { shop_code, load: { generation, checksum, row_count, snapshot_at, … } | null, rows }。0076 の前は 409 { error: 'not_migrated' }
+ *       同じ世代で違う内容 = 409 CONFLICT / 行が今の 80% 未満 (force なし) = 409 SHRINK / 0074 の前 = 409 not_migrated / 別の取込が走っている = 503 LOCKED
+ *   GET  /apps/company-db/sync/amazon-listings/status   → { shop_code, load: { generation, checksum, row_count, snapshot_at, … } | null, rows }。0074 の前は 409 { error: 'not_migrated' }
  * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる)。1 回で 7,600 行 ≒ 4MB = 伝票と同じ 12MB・圧縮なしの parser
  */
 router.post('/amazon-listings', requireSyncKey, shipmentsJson, shipmentsParserError, async (req, res) => {
@@ -638,7 +638,7 @@ router.post('/amazon-listings', requireSyncKey, shipmentsJson, shipmentsParserEr
     const r = await ingestAmazonListings(pgAdapter(client), req.body, { host: 'render', log: (m) => console.log(`[company-db amazon-listings] ${m}`) });
     res.json({ ...r, ms: Date.now() - t0 });
   } catch (e) {
-    if (e.code === 'NOT_MIGRATED') return res.status(409).json({ error: 'not_migrated', detail: 'migration 0076 (ops.amazon_listing_report) is not applied' });
+    if (e.code === 'NOT_MIGRATED') return res.status(409).json({ error: 'not_migrated', detail: 'migration 0074 (ops.amazon_listing_report) is not applied' });
     const status = e.code === 'BAD_REQUEST' ? 400 : (e.code === 'CONFLICT' || e.code === 'SHRINK') ? 409 : e.code === 'LOCKED' ? 503 : 500;
     if (status >= 500) console.error(`[company-db amazon-listings] FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
     res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null });
@@ -647,7 +647,7 @@ router.post('/amazon-listings', requireSyncKey, shipmentsJson, shipmentsParserEr
 router.get('/amazon-listings/status', requireSyncKey, async (req, res) => {
   await withPg(res, async (client) => {
     try { res.json(await amazonListingsStatus(pgAdapter(client))); } catch (e) {
-      if (e.code === 'NOT_MIGRATED') return res.status(409).json({ error: 'not_migrated', detail: 'migration 0076 (ops.amazon_listing_report) is not applied' });
+      if (e.code === 'NOT_MIGRATED') return res.status(409).json({ error: 'not_migrated', detail: 'migration 0074 (ops.amazon_listing_report) is not applied' });
       throw e;
     }
   });

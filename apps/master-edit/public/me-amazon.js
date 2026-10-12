@@ -5,6 +5,8 @@
  *   - 右の「保存すると変わること」= 前 → 後 と、保存するとこうなる (代表・翌朝 7:00 の写し)
  *   - 保存・削除の送り方は前と同じ (POST /api/amazon/save { request_id, seller_sku, name, components, reason, seen: { versions } } / /api/amazon/delete)
  *   - 保存・削除が通ったら画面を読み直す (保存した後の値・新しい版で続けて直せる)。上に結果を 1 回だけ出す
+ *   - 構成の行の「NE の商品」の欄 = 打つと候補 (GET /api/amazon/components?q=・10/12)。使えない商品は灰色で選べない (下の「欄で探す」)
+ *   - 構成の行で使える NE の商品が決まったとき、名前 (社内) が空ならその商品名を入れる (10/12・下の fillNameFrom。書いてあれば触らない)
  */
 (function () {
   'use strict';
@@ -86,6 +88,7 @@
       if (i === 0 && !b) { b = document.createElement('span'); b.className = 'repbadge'; b.textContent = '代表'; $('.c-name', tr).insertAdjacentElement('afterend', b); }
       if (i > 0 && b) b.remove();
     });
+    if (nameNote && $('#name') && $('#name').value !== nameNote.value) clearNameNote();
     ME.setUnsaved(items.length);
     lastState = { n: items.length, items: items.map(function (it) { return it.label + ': ' + it.from + ' → ' + it.to; }), impacts: imp.map(function (x) { return x[1]; }) };
   }
@@ -103,6 +106,39 @@
     $$('button[data-act]', tr).forEach(function (b) { b.setAttribute('aria-label', who + ' ' + acts[b.getAttribute('data-act')]); });
   }
   function renumber() { $$('tr.comp-row', rowsEl).forEach(relabel); update(); }
+  /* ---------- 名前 (社内) が空なら NE の商品名を入れる (10/12 中原さん「商品コードを探したときに 名前 (社内) が空欄なら商品名を入れてほしい」) ----------
+   *   入れる時 = 構成の行で使える商品が決まった時 (候補から選んだ・コードを打って引き当てた)。使えない商品 (例外・NE で確かめる前・やめた) では入れない。
+   *   名前の欄が空 (空白だけも空) のときだけ = 人が書いた名前は消さない・入れた後に人が直したらそのまま (空でないので二度と入れない)。
+   *   入れたら input を起こす = 今までの「変更」の印・右の「保存すると変わること」に出る。欄の横に一言 (人が名前を直すと消える) */
+  var nameNote = null;   // { el, value } = 一言と、入れた値
+  function clearNameNote() { if (nameNote) { nameNote.el.remove(); nameNote = null; } }
+  function fillNameFrom(code, name) {
+    var nm = $('#name');
+    if (!canSave || saved || !nm || nm.disabled || nm.value.trim() !== '' || !name) return false;
+    nm.value = String(name).slice(0, Number(nm.getAttribute('maxlength')) || 255);
+    clearNameNote();
+    var el = document.createElement('span');
+    el.className = 'fmsg ok'; el.id = 'name-filled'; el.setAttribute('role', 'status');
+    el.innerHTML = '<svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>';
+    el.appendChild(document.createTextNode('NE の商品名 (' + code + ') を入れました。直してもかまいません'));
+    nm.insertAdjacentElement('afterend', el);
+    nameNote = { el: el, value: nm.value };
+    nm.dispatchEvent(new Event('input', { bubbles: true }));   // 未保存・保存すると変わること
+    return true;
+  }
+  /** コードを打って引き当てた行: 構成品に使えるかを候補の API (保存と同じ決まり) で確かめてから名前を入れる (ぴったりの行だけ) */
+  function fillNameIfUsable(tr, code) {
+    var nm = $('#name');
+    if (!canSave || !nm || nm.disabled || nm.value.trim() !== '' || Array.from(code).length < (P.searchMin || 2)) return;
+    fetch(BASE + '/api/amazon/components?q=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || !j.ok || !tr.isConnected || $('.c-code', tr).value.trim() !== code) return;
+        var hit = (j.items || []).filter(function (it) { return normCode(it.code) === normCode(code); })[0];
+        if (hit && hit.usable) fillNameFrom(hit.code, hit.name);
+      })
+      .catch(function () { /* 確かめられない = 入れないだけ */ });
+  }
   function lookup(tr) {
     var code = $('.c-code', tr).value.trim();
     var cell = $('.c-name', tr), reg = $('.c-reg', tr);
@@ -115,10 +151,217 @@
         if (!x.r.ok || !x.j.ok) { cell.textContent = x.j.error || '見つかりません'; cell.classList.add('bad'); reg.textContent = ''; return; }
         cell.classList.toggle('bad', x.j.item.kind === 'exception');
         cell.textContent = x.j.item.name + (x.j.item.kind === 'exception' ? ' (例外の SKU = 構成品にできません)' : '');
-        reg.innerHTML = '<span class="muted">保存のときに確かめます</span>';
+        // 候補から選んだ行 = 候補の登録の状態を見せる (確かめは保存のときにもう一度)
+        var known = tr.__picked && tr.__picked.code === code ? tr.__picked.reg : null;
+        reg.innerHTML = known ? '<span class="b ' + (REG_CLS[known] || 'mute') + '">' + esc(REG_LABEL[known] || known) + '</span>' : '<span class="muted">保存のときに確かめます</span>';
+        if (!known && x.j.item.kind !== 'exception') fillNameIfUsable(tr, code);   // 候補から選んだ行は chooseSug で入れた
       })
       .catch(function () { cell.textContent = '引き当てできません (通信)'; cell.classList.add('bad'); });
   }
+  /* ---------- 構成の行の「NE の商品」の欄で探す (10/12 中原さん「既存の商品コードを検索して選んで登録できるように」) ----------
+   *   打つと (P.searchMin 文字から・250ms 待って) GET /api/amazon/components?q= → 欄の下に候補 (コード・名前・単品 / セット / 例外・登録の状態・在庫)。
+   *   ↑↓ と Enter・マウス・タッチで選ぶ → その行の欄にコードが入り、今までの引き当て (名前が出る) が走る (change と同じ)。
+   *   使えない商品 (サーバーが理由を付けた物・この構成のほかの行にもうある物) は灰色で選べない = 画面で選べる物は保存で断られない。
+   *   ぴったりのコードが一番上で使えるときだけ、はじめから選んだ状態 (Enter で入る)。ほかは ↓ で選ぶまで Enter は今までどおり (数の欄へ)。
+   *   候補の箱は表の囲い (.scrollx = 横に送る) の外に 1 つだけ置き、打っている欄の下に出す (囲いで切れない・スマホの幅でもはみ出さない) */
+  var sug = $('#comp-suggest'), sugSay = $('#comp-suggest-status');
+  var MIN = P.searchMin || 2;
+  var REG_LABEL = { draft: '下書き', ne_pending: 'NE登録待ち', ne_confirmed: 'NE確認済み', distributable: '配る対象', available: '登録済み', quarantined: '要確認', cancelled: 'やめた' };
+  var REG_CLS = { draft: 'warn', ne_pending: 'warn', ne_confirmed: 'ok', distributable: 'ok', available: 'ok', quarantined: 'err', cancelled: 'mute' };
+  // forQ = 今の候補を作った検索語 (欄の値が変わったら候補は古い = 選ばない・#1689 Codex R1 M1)
+  var S = { input: null, items: [], sel: -1, seq: 0, timer: 0, ctl: null, q: '', forQ: null };
+  // コードの同じ = lib/sku-norm.js normSku と同じ決まり (全角英数記号 → 半角・全角の空白 → 空白・ダッシュ → -・空白を除く・小文字)。
+  // 🚨 NFKC は掛けない (core.norm_code と同じ = ﾊﾁ-01 と ハチ-01 は別の商品。#1689 Codex R1 M2)。保存の「2 回あります」の確かめと同じ
+  function normCode(v) {
+    if (v == null) return '';
+    return String(v).replace(/[！-～]/g, function (ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); }).replace(/　/g, ' ')
+      .replace(/[−‐-―﹘﹣－]/g, '-').trim().replace(/\s+/g, '').toLowerCase();
+  }
+  // かなの同一視 (search-fold.mjs と同じ: NFKC・小文字・ひらがな → カタカナ)
+  function fold(s) { return String(s == null ? '' : s).normalize('NFKC').toLowerCase().replace(/[ぁ-ゖゝゞ]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) + 0x60); }); }
+  function mark(text, ranges) {
+    if (!ranges.length) return esc(text);
+    ranges.sort(function (a, b) { return a[0] - b[0]; });
+    var out = '', at = 0;
+    ranges.forEach(function (r) { if (r[0] < at) return; out += esc(text.slice(at, r[0])) + '<mark>' + esc(text.slice(r[0], r[1])) + '</mark>'; at = r[1]; });
+    return out + esc(text.slice(at));
+  }
+  // 当たった所に印 (字の数が変わる文字 (半角カナの濁点など) があるときは印を付けない = ずれた所に付けない)
+  function hits(text, words, f) {
+    var t = f(text); if (t.length !== text.length) return [];
+    var rs = [];
+    words.forEach(function (w) { var k = f(w); if (!k) return; var i = t.indexOf(k); if (i >= 0) rs.push([i, i + k.length]); });
+    return rs;
+  }
+  function rowOf(inp) { return inp.closest('tr'); }
+  function usedAt(code, tr) {
+    var n = normCode(code), at = 0;
+    $$('tr.comp-row', rowsEl).some(function (x, i) { if (x !== tr && normCode($('.c-code', x).value) === n) { at = i + 1; return true; } return false; });
+    return at;
+  }
+  function placeSug() {
+    if (!sug || sug.hidden || !S.input) return;
+    var host = sug.parentNode, hr = host.getBoundingClientRect(), ir = S.input.getBoundingClientRect();
+    var w = Math.min(560, hr.width);
+    sug.style.width = w + 'px';
+    sug.style.left = Math.max(0, Math.min(ir.left - hr.left, hr.width - w)) + 'px';
+    // 上の帯 (.hdr) と、狭い画面で下に固定する保存の帯 (#savebox) に隠れない向きと高さ。下に足りなければ欄の上に出す
+    var hdr = $('.hdr'), top0 = hdr ? hdr.getBoundingClientRect().bottom : 0;
+    var box = $('#savebox'), bottom0 = window.innerHeight;
+    if (box && window.getComputedStyle(box).position === 'fixed') bottom0 = Math.min(bottom0, box.getBoundingClientRect().top);
+    var below = bottom0 - ir.bottom - 12, above = ir.top - top0 - 12;
+    var up = below < 220 && above > below;
+    sug.style.maxHeight = Math.max(120, Math.min(420, up ? above : below)) + 'px';
+    sug.classList.toggle('up', up);
+    sug.style.top = (up ? ir.top - hr.top - 4 - sug.offsetHeight : ir.bottom - hr.top + 4) + 'px';
+  }
+  function setSel(i) {
+    S.sel = i;
+    $$('.co', sug).forEach(function (o, k) { o.classList.toggle('sel', k === i); o.setAttribute('aria-selected', k === i ? 'true' : 'false'); });
+    if (S.input) { if (i >= 0) S.input.setAttribute('aria-activedescendant', 'cs-opt-' + i); else S.input.removeAttribute('aria-activedescendant'); }
+    var o = $('#cs-opt-' + i); if (o && o.scrollIntoView) o.scrollIntoView({ block: 'nearest' });
+  }
+  function closeSug() {
+    clearTimeout(S.timer); S.seq++;
+    if (S.ctl) { try { S.ctl.abort(); } catch (e) { /* 止められない = 返事を捨てるだけ (seq) */ } S.ctl = null; }
+    if (S.input) { S.input.setAttribute('aria-expanded', 'false'); S.input.removeAttribute('aria-activedescendant'); }
+    if (sug) { sug.hidden = true; sug.innerHTML = ''; var pnl = sug.closest('.panel'); if (pnl) pnl.classList.remove('sug-on'); }
+    S.items = []; S.sel = -1; S.input = null; S.forQ = null;
+    if (sug) sug.classList.remove('stale');
+  }
+  function showSug(html) {
+    sug.innerHTML = html; sug.hidden = false;
+    var pnl = sug.closest('.panel'); if (pnl) pnl.classList.add('sug-on');   // 後ろの板 (削除の箱など) より上に出す
+    if (S.input) S.input.setAttribute('aria-expanded', 'true');
+    placeSug();
+  }
+  function renderSug(j) {
+    var tr = rowOf(S.input), words = S.q.split(/\s+/).filter(Boolean);
+    S.forQ = S.q;
+    sug.classList.remove('stale');
+    S.items = (j.items || []).map(function (it) {
+      var at = it.usable ? usedAt(it.code, tr) : 0;
+      return { it: it, off: !it.usable || at > 0, why: !it.usable ? it.why : at ? 'この構成の ' + at + ' 行目にもうあります (同じ品は 1 行にして数で)' : '' };
+    });
+    if (!S.items.length) {
+      showSug('<div class="cs-empty">「' + esc(S.q) + '」に当たる NE の商品はありません。コードの一部・名前の言葉 (空白で区切ると全部を含む)・JAN で探せます</div>');
+      if (sugSay) sugSay.textContent = '候補はありません';
+      S.sel = -1; return;
+    }
+    var stockNote = j.stock ? (j.stock.stale ? '<span class="warn">在庫 = ロジザードの写し (古い)</span>' : '<span>在庫 = ロジザードの写し</span>') : '';
+    var h = '<div class="cs-h"><span>候補 ' + S.items.length + ' 件' + (j.more ? ' (上から ' + S.items.length + ' 件。もっと打つと絞れます)' : '') + '</span>' + stockNote + '</div>';
+    S.items.forEach(function (x, i) {
+      var it = x.it;
+      h += '<div class="co' + (x.off ? ' off' : '') + '" role="option" id="cs-opt-' + i + '" data-i="' + i + '" aria-selected="false"' + (x.off ? ' aria-disabled="true"' : '') + '>'
+        + '<div class="l1"><span class="cc">' + mark(it.code, hits(it.code, [S.q.replace(/\s+/g, '')], normCode)) + '</span>'
+        + '<span class="b ' + (it.kind === 'exception' ? 'err' : 'mute') + '">' + esc(it.kind_label || it.kind) + '</span>'
+        + (it.reg_state ? '<span class="b ' + (REG_CLS[it.reg_state] || 'mute') + '">' + esc(REG_LABEL[it.reg_state] || it.reg_state) + '</span>' : '<span class="b mute">状態なし</span>')
+        + (it.not_in_ne && !x.off ? '<span class="b warn" title="NE 登録の CSV で NE に入るまで、FBA 補充はこの SKU を保留にします">NE 未登録 (登録待ち)</span>' : '')
+        + (it.ne_direct && !x.off ? '<span class="b info" title="夜間の取り込みが NE で見つけた、ポータルで作っていない商品 (NE にある)。代表の採用の画面で確かめられます">要確認 (NE で直接作った商品)</span>' : '')
+        + (it.handling === 'discontinued' ? '<span class="b warn">中止</span>' : '')
+        + (it.stock != null ? '<span class="st">在庫 ' + Number(it.stock).toLocaleString('ja-JP') + '</span>' : '') + '</div>'
+        + '<div class="cn">' + mark(it.name || '', hits(it.name || '', words, fold)) + '</div>'
+        + (x.off ? '<div class="why"><svg class="ic s" aria-hidden="true"><use href="#i-lock"/></svg>使えません: ' + esc(x.why) + '</div>' : '')
+        + '</div>';
+    });
+    showSug(h);
+    var first = S.items[0];
+    setSel(first && !first.off && normCode(first.it.code) === normCode(S.q) ? 0 : -1);
+    var n = S.items.filter(function (x) { return !x.off; }).length;
+    if (sugSay) sugSay.textContent = '候補 ' + S.items.length + ' 件 (選べる ' + n + ' 件)。↓ で選んで Enter';
+  }
+  function searchNow(inp, q, my) {
+    var ctl = window.AbortController ? new AbortController() : null;
+    if (S.ctl) { try { S.ctl.abort(); } catch (e) { /* 前の問い合わせ */ } }
+    S.ctl = ctl;
+    fetch(BASE + '/api/amazon/components?q=' + encodeURIComponent(q), { headers: { Accept: 'application/json' }, signal: ctl ? ctl.signal : undefined })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
+      .then(function (x) {
+        if (my !== S.seq || S.input !== inp || inp.value.trim() !== q || document.activeElement !== inp) return;
+        if (!x.r.ok || !x.j.ok) { S.items = []; S.sel = -1; showSug('<div class="cs-empty bad">' + esc(x.j.error || '探せませんでした (HTTP ' + x.r.status + ')') + '</div>'); return; }
+        renderSug(x.j);
+      })
+      .catch(function (err) {
+        if (err && err.name === 'AbortError') return;
+        if (my !== S.seq || S.input !== inp) return;
+        S.items = []; S.sel = -1; showSug('<div class="cs-empty bad">つながりません。コードをそのまま打っても名前は出ます</div>');
+      });
+  }
+  /** 欄の値が変わった = 今の候補は古い (選べない・選んだ印も消す)。新しい候補が来るまで (250ms + 問い合わせ) 古い候補を Enter・押す・タップで入れない (#1689 Codex R1 M1) */
+  function staleSug(inp) {
+    if (!sug || S.input !== inp || inp.value.trim() === S.forQ) return;
+    S.forQ = null;
+    if (S.sel >= 0) setSel(-1);
+    sug.classList.add('stale');
+  }
+  function queueSug(inp) {
+    if (!sug) return;
+    staleSug(inp);
+    var q = inp.value.trim();
+    if (S.input && S.input !== inp) closeSug();
+    if (Array.from(q).length < MIN) { closeSug(); return; }
+    S.input = inp; S.q = q;
+    clearTimeout(S.timer);
+    var my = ++S.seq;
+    if (sug.hidden) { S.items = []; S.sel = -1; showSug('<div class="cs-empty">探しています…</div>'); }
+    S.timer = setTimeout(function () { if (my === S.seq) searchNow(inp, q, my); }, 250);
+  }
+  function chooseSug(i) {
+    var x = S.items[i], inp = S.input;
+    if (!x || !inp) return;
+    if (S.forQ == null || inp.value.trim() !== S.forQ) return;   // 古い候補 (打ち足した後・新しい候補がまだ来ていない) は入れない
+    if (x.off) { ME.toast('使えません: ' + x.why); return; }
+    var tr = rowOf(inp);
+    closeSug();
+    inp.value = x.it.code;
+    tr.__picked = { code: x.it.code, reg: x.it.reg_state };
+    inp.dispatchEvent(new Event('change', { bubbles: true }));   // 今までの引き当て (名前が出る)・行の読み上げの名前・未保存
+    fillNameFrom(x.it.code, x.it.name);   // 名前 (社内) が空なら、選んだ商品の名前 (使える商品だけがここに来る)
+    var qty = $('.c-qty', tr); if (qty) { qty.focus(); qty.select(); }
+    if (sugSay) sugSay.textContent = x.it.code + ' を入れました';
+  }
+  function moveSel(d) {
+    if (!S.items.length) return;
+    var i = S.sel;
+    for (var k = 0; k < S.items.length; k++) {
+      i += d;
+      if (i < 0) { setSel(-1); return; }
+      if (i >= S.items.length) return;
+      if (!S.items[i].off) { setSel(i); return; }
+    }
+  }
+  /** 欄のキー。候補の箱が使ったら true (今までの Enter = 数の欄へ は動かさない) */
+  function sugKey(e) {
+    if (!sug || e.isComposing || e.keyCode === 229) return false;
+    var open = !sug.hidden && S.input === e.target;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!open) { queueSug(e.target); return true; }
+      moveSel(1); return true;
+    }
+    if (e.key === 'ArrowUp' && open) { e.preventDefault(); moveSel(-1); return true; }
+    if (e.key === 'Enter' && open && S.sel >= 0 && S.forQ != null && e.target.value.trim() === S.forQ) { e.preventDefault(); chooseSug(S.sel); return true; }
+    if (e.key === 'Escape' && open) { e.preventDefault(); e.stopPropagation(); closeSug(); return true; }
+    if (e.key === 'Enter' || e.key === 'Tab') closeSug();
+    return false;
+  }
+  if (sug && rowsEl && canSave) {
+    rowsEl.addEventListener('input', function (e) {
+      if (!e.target.classList.contains('c-code')) return;
+      // 手でコードを変えた = 候補から選んだ印は捨てる (同じコードを打ち直しても、使えるかを確かめて名前を入れる・#1692 Codex R1 Medium)
+      var row = e.target.closest('tr'); if (row) row.__picked = null;
+      staleSug(e.target);   // 変換中も、値が変わった時点で古い候補は選べなくする
+      if (!e.isComposing) queueSug(e.target);
+    });
+    rowsEl.addEventListener('compositionend', function (e) { if (e.target.classList.contains('c-code')) queueSug(e.target); });
+    rowsEl.addEventListener('focusout', function (e) { if (e.target === S.input) closeSug(); });
+    // 押した所へフォーカスを移さない (欄から出ない = 閉じない)。タッチも同じ (mousedown が後から来る)
+    sug.addEventListener('mousedown', function (e) { e.preventDefault(); });
+    sug.addEventListener('click', function (e) { var o = e.target.closest('.co'); if (o) chooseSug(Number(o.getAttribute('data-i'))); });
+    window.addEventListener('resize', placeSug);
+    window.addEventListener('scroll', placeSug, true);
+  }
+
   if (rowsEl && canSave) {
     rowsEl.addEventListener('click', function (e) {
       var b = e.target.closest('button[data-act]'); if (!b || b.disabled) return;
@@ -130,6 +373,7 @@
     });
     rowsEl.addEventListener('change', function (e) { if (e.target.classList.contains('c-code')) { var tr = e.target.closest('tr'); relabel(tr, $$('tr.comp-row', rowsEl).indexOf(tr)); lookup(tr); } });
     rowsEl.addEventListener('keydown', function (e) {
+      if (e.target.classList.contains('c-code') && sugKey(e)) return;
       if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
       if (e.target.classList.contains('c-code')) { e.preventDefault(); var q = $('.c-qty', e.target.closest('tr')); if (q) { q.focus(); q.select(); } }
     });
@@ -142,6 +386,7 @@
   }
   if (revertBtn) revertBtn.addEventListener('click', function () {
     tracked().forEach(function (el) { if (initial.has(el) && el.id !== 'comp') el.value = initial.get(el); });
+    if (sug) closeSug();
     if (rowsEl) rowsEl.innerHTML = initialRows;
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });
     update(); ME.toast('変更を元に戻しました');

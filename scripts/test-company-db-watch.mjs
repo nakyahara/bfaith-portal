@@ -19,7 +19,7 @@ import * as REAL_CONFIG from '../config/watch-checks.mjs';
 import { plannedKeys, addDays, partialAllowed, evalW6, evalW8, evalW14, evalW15, w8Days } from '../apps/company-db/watch/checks.mjs';
 import { runWatch, reconcileIssues, pickItems, MAX_GENERATION_RETRIES } from '../apps/company-db/watch/engine.mjs';
 import { writeEvidence, readEvidence, purgeOldEvidence, EVIDENCE_KEEP_DAYS } from '../apps/company-db/push/evidence.mjs';
-import { roleStatements, createRoles, urlFor, verifyRole, WATCH_TABLES } from './company-db/create-watch-roles.mjs';
+import { roleStatements, createRoles, urlFor, verifyRole, WATCH_TABLES, targetOf } from './company-db/create-watch-roles.mjs';
 import { parseArgs } from '../apps/company-db/watch/run.mjs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -174,10 +174,10 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   assert.deepEqual(CONFIG.CHECKS.map((c) => c.id), ['W1', 'W2', 'W3', 'W7', 'W9', 'W5', 'W6', 'W8', 'W10', 'W11', 'W4', 'W12', 'W13', 'W14', 'W15']);
   assert.deepEqual([CONFIG.checkById('W13').depends, CONFIG.checkById('W13').issuePerItem, CONFIG.checkById('W13').severity, keys.filter((k) => k.checkId === 'W13').map((k) => k.scopeKey)], [[], true, 'info', ['load', 'ne', 'old']]);
   assert.deepEqual([CONFIG.checkById('W8').depends, keys.filter((k) => k.checkId === 'W8').length], [['W7', 'W9'], 5]);
-  assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W9:*'], true]);   // W6 の W7 は W9 を通して見る (2026-09-26)
+  assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W9:rakuten/main', 'W9:amazon/jp'], true]);   // W6 の W7 は W9 を通して見る (2026-09-26)。前提の W9 は楽天・Amazon だけ (10/11 W6 v3)
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v18');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v20');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
@@ -386,10 +386,13 @@ await t('W5: 昨日の差の unresolved_changed (件数) と数量の割合 (日
   r = await run({ dryRun: true });
   assert.equal(verdictOf(r, 'W5', 'logizard/main'), 'pass');
 });
-await t('🚨 W6: 直近 28 日に売れた SKU で 倉庫 + FBA JP が 0 → SKU ごとの案件 (新 = 発生) / 全部取消なら売れ筋ではない / セットは構成 SKU × 数量に展開 / 展開できない販売が多ければ blocked / 注文があるのに未公開の日・開いた session があれば blocked / 在庫が入れば回復 / 廃番・窓から外れた SKU は「監視対象外」(回復ではない) / FBA だけにあっても在庫あり / 2 週間後は warn / W1 のどれかが pass でなければ blocked / 在庫が不明なら blocked / 廃番にした変化は世代で捕まえる', async () => {
+await t('🚨 W6: 直近 28 日に売れた SKU で 倉庫 + FBA JP が 0 → SKU ごとの案件 (新 = 発生) / 全部取消なら売れ筋ではない / セットは構成 SKU × 数量に展開 / 展開できない販売が多ければ blocked / 前提にするモール (楽天) で注文があるのに未公開の日・開いた session があれば blocked / ほかのモール (au PAY) の作り直しの失敗は、そのモールを除いて判定 / 在庫が入れば回復 / 廃番・窓から外れた SKU は「監視対象外」(回復ではない) / FBA だけにあっても在庫あり / 2 週間後は warn / W1 のどれかが pass でなければ blocked / 在庫が不明なら blocked / 廃番にした変化は世代で捕まえる', async () => {
   let r = await run({ dryRun: true });
   let w = resultOf(r, 'W6', 'all/jp');
   assert.deepEqual([w.verdict, w.severity, w.observed.skus, w.observed.sold_skus, w.periodFrom, w.periodTo, w.observed.unpublished_days], ['pass', 'info', 3, 0, D(-28), D(-1), 0]);
+  // 3 つの SKU は 2 日前に倉庫に在庫があった (今は 0) = W6 の対象 (v3 = 窓の中に在庫の記録がある SKU だけを見る)。後の W6 の試験でも使う (最後の W6 の試験で片づける)
+  assert.deepEqual(w.observed.stock_windows, [`logizard/main ${D(-4)}..${D(-1)}`, `fba_jp/jp ${D(-1)}..${D(-1)}`]);   // 窓の頭は監視の開始日 (since: logizard 9/19・fba_jp 9/22) で切れる・終わりは販売と同じ昨日 (FBA JP も)
+  await dailyRows(D(-2), 'logizard', 'main', [['AAA-1', skuA, 4], ['bbb-2', skuB, 4], ['CCC-3', await skuOf('CCC-3'), 4]]);
   const runId = await published('aupay', 'main', D(-3));
   await salesRow(runId, 'aupay', 'main', D(-3), skuA, 5, 0);
   await salesRow(runId, 'aupay', 'main', D(-3), skuB, 2, 2);   // 全部取消 = 売れていない
@@ -412,21 +415,26 @@ await t('🚨 W6: 直近 28 日に売れた SKU で 倉庫 + FBA JP が 0 → SK
   r = await run({ dryRun: true }); w = resultOf(r, 'W6', 'all/jp');
   assert.deepEqual([w.verdict, /展開できない/.test(w.reason), w.observed.unexpanded_share], ['blocked', true, 0.9524]);
   await pg.query(`delete from mart.sales_daily where run_id = $1 and sku_id is null`, [runId]);
-  // 🚨 注文があるのに未公開の日が窓の中にある → blocked (未公開の売上を「売れていない」と読まない)
-  await order('aupay', 'main', D(-5), 'w6-gap');
+  // 🚨 前提にするモール (楽天) で注文があるのに未公開の日が窓の中にある → blocked (未公開の売上を「売れていない」と読まない)。W9 の窓 (3 日) の外の日 = 評価の中で確かめる
+  await order('rakuten', 'main', D(-5), 'w6-gap');
   r = await run({ dryRun: true }); w = resultOf(r, 'W6', 'all/jp');
-  assert.deepEqual([w.verdict, /未公開の日 1/.test(w.reason), w.observed.unpublished_days], ['blocked', true, 1]);
-  const run5 = await published('aupay', 'main', D(-5));
+  assert.deepEqual([verdictOf(r, 'W9', 'rakuten/main'), w.verdict, /未公開の日 1: rakuten\/main/.test(w.reason), w.observed.unpublished_days], ['pass', 'blocked', true, 1]);
+  const run5 = await published('rakuten', 'main', D(-5));
   r = await run({ dryRun: true });
   assert.equal(verdictOf(r, 'W6', 'all/jp'), 'breach');
-  // 開いた session = W9 (前提 W9:*) で止まる。公開行があっても作り直しが失敗した朝 (証跡 sales.ok=false) も W9 → W6 は blocked (公開済みの古い売上で pass にしない。Codex R2)
+  // 開いた session = W9 (前提 W9:rakuten/main) で止まる。公開行があっても作り直しが失敗した朝 (証跡 sales.ok=false) も W9 → W6 は blocked (公開済みの古い売上で pass にしない。Codex R2)
   await salesState('rakuten', 'main', { sessionId: 'w6-open' });
   r = await run({ dryRun: true }); w = resultOf(r, 'W6', 'all/jp');
   assert.deepEqual([w.verdict, w.blockedBy, /開いたまま/.test(w.reason)], ['blocked', 'W9:rakuten/main', true]);
   await salesState('rakuten', 'main');
-  r = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-aupay': ev('aupay', 'main', { sales: { ok: false, error: 'timeout' } }) } });   // 変更ゼロ (W7 pass) だが作り直しが失敗
+  r = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-amazon': ev('amazon', 'jp', { sales: { ok: false, error: 'timeout' } }) } });   // 変更ゼロ (W7 pass) だが作り直しが失敗 (前提にするモール)
   w = resultOf(r, 'W6', 'all/jp');
-  assert.deepEqual([verdictOf(r, 'W7', 'aupay/main'), verdictOf(r, 'W9', 'aupay/main'), w.verdict, w.blockedBy], ['pass', 'breach', 'blocked', 'W9:aupay/main']);
+  assert.deepEqual([verdictOf(r, 'W7', 'amazon/jp'), verdictOf(r, 'W9', 'amazon/jp'), w.verdict, w.blockedBy], ['pass', 'breach', 'blocked', 'W9:amazon/jp']);
+  // 🚨 前提にしないモール (au PAY) の作り直しが失敗 → W6 は止まらず、au PAY の売上を除いて判定する (AAA-1 は au PAY でだけ売れた = 今朝は数えない)。開いていた AAA-1 の案件は「窓から外れた」と決めずに保留 (10/11)
+  r = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-aupay': ev('aupay', 'main', { sales: { ok: false, error: 'timeout' } }) } });
+  w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([verdictOf(r, 'W9', 'aupay/main'), w.verdict, w.blockedBy, w.items.length, w.observed.excluded_sales.map((x) => x.scope), /^今朝の分が無いので除いた: aupay\/main \(W9 が breach: 作り直しに失敗/.test(w.reason), r.counts.recovered, r.counts.out_of_window, r.notes.held.filter((h) => h.checkId === 'W6').map((h) => [h.subjectKey, h.reason])],
+    ['breach', 'pass', undefined, 0, ['aupay/main'], true, 0, 0, [[String(skuA), 'mall_excluded:aupay/main']]]);
   // 評価そのものにも守りがある (前提を外して直接呼んでも開いた session で止まる)
   await salesState('rakuten', 'main', { sessionId: 'w6-open' });
   const w6direct = (await evalW6({ db, config: CONFIG, asOf: ASOF, now: NOW }, CONFIG.checkById('W6')))[0];
@@ -476,7 +484,7 @@ await t('🚨 W6: 直近 28 日に売れた SKU で 倉庫 + FBA JP が 0 → SK
   await pg4.close();
   // 片づけ (売上の行・公開・注文・案件)
   for (const rid of [runId, runId4, run5]) { await pg.query(`delete from mart.sales_daily where run_id = $1`, [rid]); await pg.query(`delete from mart.sales_daily_published where run_id = $1`, [rid]); await pg.query(`delete from mart.sales_daily_runs where run_id = $1`, [rid]); }
-  await pg.query(`delete from core.orders where mall = 'aupay' and mall_order_no = 'w6-gap'`);
+  await pg.query(`delete from core.orders where mall = 'rakuten' and mall_order_no = 'w6-gap'`);
   await pg.query(`delete from core.listing_components where listing_id = $1`, [listingId]); await pg.query(`delete from core.listings where listing_id = $1`, [listingId]);
   await pg.query(`delete from ops.watch_issues where check_id = 'W6'`);
 });
@@ -518,8 +526,136 @@ await t('🚨 W6 の NE のセット商品 (9/24 本番: セット 618 件が「
   await pg.query(`delete from mart.sales_daily where run_id = $1`, [runId2]);
   await pg.query(`delete from core.listing_components where listing_id = $1`, [l20]); await pg.query(`delete from core.listings where listing_id = $1`, [l20]);
 });
+await t('🚨 W6 v3 (10/11・10/7 の見直し = 10/1〜10/7 は小さいモールの push が無いだけで 7 日 blocked・在庫 0 の 81 件のうち 35 件は記録以来一度も在庫なし): 窓の 28 日に倉庫か FBA JP に在庫の記録が一度も無い SKU は数えない (直送・取り寄せ) / 窓の中に在庫があって今 0 は breach / 前提にするモール (Amazon) が今朝そろわなければ blocked / ほかのモール (LINE ギフト・au PAY・Qoo10) は今朝そろっていなければ、そのモールの売上を除いて判定し理由と観測に残す (除いた朝は売上の消えた案件を保留) / 版の変更 (v2 → v3) で消えた案件は「規則の変更で閉じた」・今の版 (v3) で開いた案件は在庫の記録が窓から外れても継続 (Codex #1687 R1) / 除いたモールでだけ売れていた案件は今の版なら保留・前の版なら「規則の変更で閉じた」・モールが戻って売上が無ければ監視対象外 (R2) / 1 行に「欠品の売上除外で保留 N」(W6 のモール除外の保留だけ・W13:ne の保持などは数えない = R3)/ 窓の中に在庫の記録が 1 つも無ければ blocked / 前提の scope の書き誤りは定義の誤り', async () => {
+  assert.deepEqual([REAL_CONFIG.checkById('W6').version, REAL_CONFIG.W6_REQUIRED_SALES, REAL_CONFIG.checkById('W6').depends, REAL_CONFIG.W6_INFO_UNTIL], ['v3', ['rakuten/main', 'amazon/jp'], ['W1:*', 'W9:rakuten/main', 'W9:amazon/jp'], '2026-11-04']);
+  assert.ok(plannedKeys(REAL_CONFIG).length > 0);   // 本物の設定で前提の scope が全部ある
+  assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: CONFIG.CHECKS.map((c) => (c.id === 'W6' ? { ...c, depends: ['W1:*', 'W9:amazon/main'] } : c)) }), /W6 の前提 W9:amazon\/main の評価キーが無い/);
+  // 見本: DDD-4 (直送 = 在庫の記録が一度も無い) と EEE-5 (3 日前にだけ倉庫に 2 個 → 今 0)。どちらも 6 日前に au PAY で売れた
+  await pg.query(`insert into core.products (company_id, name) values (1, '見本D'), (1, '見本E')`);
+  await pg.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) select company_id, product_id, 'single', case name when '見本D' then 'DDD-4' else 'EEE-5' end, name from core.products where name in ('見本D', '見本E')`);
+  const skuD = await skuOf('DDD-4'), skuE = await skuOf('EEE-5');
+  await dailyRows(D(-3), 'logizard', 'main', [['EEE-5', skuE, 2]]);
+  const ra = await published('aupay', 'main', D(-6)), rl = await published('linegift', 'main', D(-6));
+  await salesRow(ra, 'aupay', 'main', D(-6), skuD, 7, 0);
+  await salesRow(ra, 'aupay', 'main', D(-6), skuE, 3, 0);
+  await salesRow(rl, 'linegift', 'main', D(-6), skuE, 4, 0);
+  let r = await run({ dryRun: true }); let w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([w.verdict, w.items.map((i) => `${i.payload.code}:${i.payload.units}`), w.observed.no_stock_in_window, w.observed.no_stock_in_window_units, w.observed.no_stock_in_window_top, w.observed.sold_skus, w.observed.sold_stocked_skus, w.sampleSize, w.observed.excluded_sales, w.reason],
+    ['breach', ['EEE-5:7'], 1, 7, ['DDD-4 (7)'], 2, 1, 1, [], '売れ筋 1 SKU (窓の中に在庫の記録がある) のうち在庫 0 が 1 (EEE-5 (7))。在庫の記録が無い 1 は数えない']);
+  // 数えない SKU は全件を観測に残す (SKU・コード・28 日の数量。Codex #1687 R1 Medium 2 = 後で判断する材料)。上限を超えた分は件数だけ
+  assert.deepEqual([w.observed.no_stock_in_window_items, w.observed.no_stock_in_window_omitted, REAL_CONFIG.W6_NO_STOCK_OBSERVED_MAX], [[{ sku_id: String(skuD), code: 'DDD-4', units: 7 }], 0, 1000]);
+  r = await run({ dryRun: true, config: { ...CONFIG, W6_NO_STOCK_OBSERVED_MAX: 0 } }); w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([w.observed.no_stock_in_window, w.observed.no_stock_in_window_items, w.observed.no_stock_in_window_omitted], [1, [], 1]);
+  // 🚨 窓の境 (Codex #1687 R1 Low 1): 在庫の記録を読む窓は販売と同じ 28 日 = asOf−28 〜 asOf−1 (FBA JP も今日を含めない)。since を外すと D(-28) は入り D(-29) は入らない
+  const wide = { ...CONFIG, STOCK_SCOPES: CONFIG.STOCK_SCOPES.map((s) => (CONFIG.W6_SCOPE.sources.includes(s.source) ? { ...s, since: '2026-01-01' } : s)) };
+  await ensureCapture(D(-28));
+  await dailyRows(D(-29), 'logizard', 'main', [['DDD-4', skuD, 5]]);
+  r = await run({ dryRun: true, config: wide }); w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([w.observed.stock_windows, w.items.map((i) => i.payload.code)], [[`logizard/main ${D(-28)}..${D(-1)}`, `fba_jp/jp ${D(-28)}..${D(-1)}`], ['EEE-5']]);
+  await delDaily([D(-29)], 'logizard');
+  await dailyRows(D(-28), 'logizard', 'main', [['DDD-4', skuD, 5]]);
+  r = await run({ dryRun: true, config: wide });
+  assert.deepEqual(resultOf(r, 'W6', 'all/jp').items.map((i) => i.payload.code), ['DDD-4', 'EEE-5']);
+  await delDaily([D(-28)], 'logizard');
+  // 🚨 世代の指紋 (Codex #1687 R1 Low 2): snapshot の後に窓の中の在庫の履歴を足す・消す (W5 の日次・取得記録の指紋の外の日 = D(-9)) → 在庫の記録がある SKU の集まりが変わる = 再評価 (attempts 2)
+  r = await run({ dryRun: true, config: wide });
+  assert.equal(r.attempts, 1);
+  r = await run({ dryRun: true, config: wide, hooks: { afterSnapshot: async (n) => { if (n === 1) await dailyRows(D(-9), 'logizard', 'main', [['DDD-4', skuD, 1]]); } } });
+  assert.deepEqual([r.attempts, resultOf(r, 'W6', 'all/jp').items.map((i) => i.payload.code)], [2, ['DDD-4', 'EEE-5']]);
+  r = await run({ dryRun: true, config: wide, hooks: { afterSnapshot: async (n) => { if (n === 1) await delDaily([D(-9)], 'logizard'); } } });
+  assert.deepEqual([r.attempts, resultOf(r, 'W6', 'all/jp').items.map((i) => i.payload.code)], [2, ['EEE-5']]);
+  // FBA JP の在庫の記録 (fba_available > 0) でも対象になる = DDD-4 が今日の FBA に 0・昨日に 1 → 対象 (今 0 = breach)。qty だけあって available が 0 は在庫と数えない
+  await dailyRows(D(-1), 'fba_jp', 'jp', [['DDD-4', skuD, 3, { fba_available: 0 }]]);
+  r = await run({ dryRun: true });
+  assert.deepEqual(resultOf(r, 'W6', 'all/jp').items.map((i) => i.payload.code), ['EEE-5']);
+  await dailyRows(D(-1), 'fba_jp', 'jp', [['DDD-4', skuD, 1, { fba_available: 1 }]]);
+  r = await run({ dryRun: true });
+  assert.deepEqual([resultOf(r, 'W6', 'all/jp').items.map((i) => i.payload.code), resultOf(r, 'W6', 'all/jp').observed.no_stock_in_window], [['DDD-4', 'EEE-5'], 0]);
+  await delDaily([D(-1)], 'fba_jp');
+  // 🚨 版の変更: 前の版 (v2 = 在庫の記録を見ない) の朝に DDD-4 と EEE-5 の案件が開いた → v3 の最初の朝: DDD-4 は「規則の変更で閉じた」(回復ではない)・EEE-5 は継続
+  const v2 = { ...CONFIG, CHECKS: CONFIG.CHECKS.map((c) => (c.id === 'W6' ? { ...c, version: 'v2' } : c)) };
+  r = await run({ config: v2 });   // EEE-5 の案件が開く (版 v2)
+  const v2rid = (await one(`select watch_result_id from ops.watch_results where watch_run_id = $1 and check_id = 'W6'`, [r.runId])).watch_result_id;
+  await pg.query(`insert into ops.watch_issues (company_id, check_id, scope_key, subject_type, subject_key, state, severity, first_seen_at, last_seen_at, first_result_id, last_result_id, summary) values (1, 'W6', 'all/jp', 'sku', $1, 'open', 'info', now(), now(), $2, $2, 'W6 all/jp DDD-4 (v2 の朝)')`, [String(skuD), v2rid]);
+  const issueOf = (sku) => one(`select state, summary, recovered_at is not null as rec from ops.watch_issues where check_id = 'W6' and subject_key = $1 order by watch_issue_id desc limit 1`, [String(sku)]);
+  r = await run({ now: new Date('2026-09-23T01:00:00Z') });
+  assert.deepEqual([r.counts.rule_changed, r.counts.recovered, r.counts.out_of_window, r.counts.continued, r.notes.ruleChanged.map((x) => [x.subjectKey, x.reason])], [1, 0, 0, 1, [[String(skuD), 'rule_changed:v2->v3']]]);
+  let iss = await issueOf(skuD);
+  assert.deepEqual([iss.state, iss.rec, /規則の変更で閉じた \(v2 → v3。回復ではない\)/.test(iss.summary)], ['out_of_window', false, true]);
+  // 🚨 Codex #1687 R1 Medium 1: 今の版 (v3) で開いた本物の欠品 (EEE-5 = 在庫あり → 0) は、最後の在庫の記録が窓から外れても閉じない = 継続 (28 日入荷しない長期の欠品を見落とさない)。
+  //   窓から外れるのを since を後ろにずらして作る (D(-3) の記録が窓の外 = 29 日目と同じ形)
+  const outWin = { ...CONFIG, STOCK_SCOPES: CONFIG.STOCK_SCOPES.map((s) => (s.source === 'logizard' ? { ...s, since: D(-2) } : s)) };
+  r = await run({ config: outWin, now: new Date('2026-09-23T02:00:00Z') }); w = resultOf(r, 'W6', 'all/jp');
+  const e5 = w.items.find((i) => i.payload.code === 'EEE-5');
+  assert.deepEqual([w.verdict, !!e5, e5 && e5.payload.stocked_in_window, w.observed.kept_open_without_stock_record, r.counts.continued, r.counts.recovered, r.counts.out_of_window, r.counts.rule_changed, (await issueOf(skuE)).state, /うち在庫の記録が窓から外れた継続 1/.test(w.reason)],
+    ['breach', true, false, 1, 1, 0, 0, 0, 'open', true]);
+  // 在庫が入れば回復
+  await dailyRows(D(-1), 'logizard', 'main', [['EEE-5', skuE, 5]]);
+  r = await run({ config: outWin, now: new Date('2026-09-23T02:10:00Z') });
+  assert.deepEqual([r.counts.recovered, r.notes.recovered.map((x) => x.subjectKey), (await issueOf(skuE)).state], [1, [String(skuE)], 'recovered']);
+  await delDaily([D(-1)], 'logizard');
+  r = await run({ now: new Date('2026-09-23T02:20:00Z') });   // 在庫 0 に戻る (窓の中に D(-3) の記録) = 新しい案件 (後の試験で使う)
+  assert.deepEqual([r.counts.new, (await issueOf(skuE)).state], [1, 'open']);
+  // 今の版で開いている案件は、窓の中に在庫の記録が一度も無い SKU でも「監視対象外」で閉じない (no_stock_in_window で閉じるのは前の版の案件 = 規則の変更 だけ)
+  const v3rid = (await one(`select watch_result_id from ops.watch_results where watch_run_id = $1 and check_id = 'W6'`, [r.runId])).watch_result_id;
+  await pg.query(`insert into ops.watch_issues (company_id, check_id, scope_key, subject_type, subject_key, state, severity, first_seen_at, last_seen_at, first_result_id, last_result_id, summary) values (1, 'W6', 'all/jp', 'sku', $1, 'open', 'info', now(), now(), $2, $2, 'W6 all/jp DDD-4 (v3 の朝)')`, [String(skuD), v3rid]);
+  r = await run({ now: new Date('2026-09-23T02:30:00Z') });
+  assert.deepEqual([r.counts.rule_changed, r.counts.recovered, r.counts.out_of_window, r.counts.continued, (await issueOf(skuD)).state], [0, 0, 0, 2, 'open']);
+  await pg.query(`delete from ops.watch_issues where check_id = 'W6' and subject_key = $1`, [String(skuD)]);
+  // 🚨 前提にするモール (Amazon) の今朝の push の証跡が無い → W7 → W9 → W6 は blocked (今まで通り)
+  const noAmazon = goodEvidence(); delete noAmazon['orders-amazon'];
+  r = await run({ dryRun: true, evidence: noAmazon }); w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([verdictOf(r, 'W9', 'amazon/jp'), w.verdict, w.blockedBy], ['blocked', 'blocked', 'W9:amazon/jp']);
+  // blocked の間は案件に触らない (判定保留)。開いている EEE-5 の案件は notes.held に入るが、1 行の「欠品の売上除外で保留」には数えない (モールを除いた保留だけ。Codex #1687 R3)
+  assert.deepEqual([r.notes.held.filter((h) => h.checkId === 'W6').map((h) => h.subjectKey), r.counts.held_w6_mall_excluded, /欠品の売上除外で保留|回復保留/.test(r.lastLine)], [[String(skuE)], 0, false]);
+  // 🚨 LINE ギフトの今朝の push の証跡が無い (10/1〜10/6 の token 切れと同じ) → 止まらず LINE ギフトの売上を除いて判定 (EEE-5 = 7 → 3 個)・理由と観測に残す
+  const noLine = goodEvidence(); delete noLine['orders-linegift'];
+  r = await run({ dryRun: true, evidence: noLine }); w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([verdictOf(r, 'W9', 'linegift/main'), w.verdict, w.blockedBy, w.items.map((i) => `${i.payload.code}:${i.payload.units}`), w.observed.excluded_sales.map((x) => x.scope), /^W9 が blocked: 前提 W7/.test(w.observed.excluded_sales[0].why)],
+    ['blocked', 'breach', undefined, ['EEE-5:3'], ['linegift/main'], true]);
+  assert.match(w.reason, /^売れ筋 1 SKU .* \/ 今朝の分が無いので除いた: linegift\/main \(W9 が blocked: /);
+  // au PAY も無い → EEE-5 の売上が窓から消える (在庫 0 のまま) → 案件は閉じずに保留 (除いたモールでだけ売れていたのかもしれない)。記録する回でも open のまま
+  const noLineAupay = { ...noLine }; delete noLineAupay['orders-aupay'];
+  r = await run({ evidence: noLineAupay, now: new Date('2026-09-23T03:00:00Z') }); w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([w.verdict, w.observed.excluded_sales.map((x) => x.scope), r.counts.recovered, r.counts.out_of_window, r.notes.held.filter((h) => h.checkId === 'W6').map((h) => [h.subjectKey, h.reason]), (await issueOf(skuE)).state],
+    ['pass', ['aupay/main', 'linegift/main'], 0, 0, [[String(skuE), 'mall_excluded:aupay/main,linegift/main']], 'open']);
+  // Qoo10 に窓の中の未公開の日 (W9 の 3 日より前) → Qoo10 を除く (blocked にしない)
+  await order('qoo10', 'main', D(-10), 'w6-gap-q');
+  r = await run({ dryRun: true }); w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([verdictOf(r, 'W9', 'qoo10/main'), w.verdict, w.observed.excluded_sales, w.observed.unpublished_days], ['pass', 'breach', [{ scope: 'qoo10/main', why: `窓の中に注文があるのに未公開の日 1 (${D(-10)})` }], 1]);
+  await pg.query(`delete from core.orders where mall = 'qoo10' and mall_order_no = 'w6-gap-q'`);
+  // 🚨 窓の中に在庫の記録が 1 つも無い (在庫の日次が読めていない) → 全部を対象外にして pass にしない = blocked
+  const noWindow = { ...CONFIG, STOCK_SCOPES: CONFIG.STOCK_SCOPES.map((s) => (CONFIG.W6_SCOPE.sources.includes(s.source) ? { ...s, since: D(5) } : s)) };
+  r = await run({ dryRun: true, config: noWindow }); w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([w.verdict, /在庫の記録が 1 つも無い/.test(w.reason), w.observed.stock_windows], ['blocked', true, []]);
+  // 🚨 Codex #1687 R2 Medium 1: 版の変更 × モールを除いた朝 × 除いたモールでだけ売れていた SKU。
+  //   前の版 (v2) の DDD-4 の案件 (au PAY でだけ売れた・在庫の記録なし) は保留にせず「規則の変更で閉じた」/ 今の版 (v3) の EEE-5 の案件は保留のまま (open)・1 行に「欠品の売上除外で保留 1」
+  await pg.query(`insert into ops.watch_issues (company_id, check_id, scope_key, subject_type, subject_key, state, severity, first_seen_at, last_seen_at, first_result_id, last_result_id, summary) values (1, 'W6', 'all/jp', 'sku', $1, 'open', 'info', now(), now(), $2, $2, 'W6 all/jp DDD-4 (v2 の朝・2 回目)')`, [String(skuD), v2rid]);
+  r = await run({ evidence: noLineAupay, now: new Date('2026-09-23T04:00:00Z') });
+  assert.deepEqual([r.counts.rule_changed, r.notes.ruleChanged.map((x) => [x.subjectKey, x.reason]), r.notes.held.filter((h) => h.checkId === 'W6').map((h) => h.subjectKey), r.counts.held, (await issueOf(skuD)).state, (await issueOf(skuE)).state],
+    [1, [[String(skuD), 'rule_changed:v2->v3']], [String(skuE)], 1, 'out_of_window', 'open']);
+  assert.deepEqual([r.counts.held_w6_mall_excluded, /\/ 規則の変更で閉じた 1 \(回復ではない\) \/ 欠品の売上除外で保留 1( — |$)/.test(r.lastLine)], [1, true], r.lastLine);
+  // モールが戻った朝に EEE-5 の売上が無い (窓から消えた・在庫は 0 のまま) → 監視対象外 (no_sales_in_window) で閉じる (保留のまま残らない)。1 行の保留も出ない
+  await pg.query(`delete from mart.sales_daily where sku_id = $1`, [skuE]);
+  r = await run({ now: new Date('2026-09-23T05:00:00Z') });
+  assert.deepEqual([r.counts.held, r.counts.recovered, r.notes.outOfWindow.filter((x) => x.checkId === 'W6').map((x) => [x.subjectKey, x.reason]), (await issueOf(skuE)).state], [0, 0, [[String(skuE), 'no_sales_in_window']], 'out_of_window']);
+  assert.doesNotMatch(r.lastLine, /欠品の売上除外で保留|回復保留/);
+  // 🚨 Codex #1687 R3: 1 行に出すのは W6 のモール除外の保留だけ。W13:ne の保持 (本番 885 件)・blocked の項目の案件・W2 の世代の保留は数えない (counts.held = 全体は保存用に残す)
+  const { summarize } = await import('../apps/company-db/watch/engine.mjs');
+  const heldOf = (checkId, reason, i) => ({ issueId: i, checkId, scopeKey: checkId === 'W13' ? 'ne' : 'all/jp', subjectKey: String(i), reason });
+  const notes0 = { new: [], continued: [], recovered: [], outOfWindow: [], ruleChanged: [] };
+  const ne885 = Array.from({ length: 885 }, (_, i) => heldOf('W13', i % 2 ? 'not_confirmed' : 'held_reason', i));
+  let sm = summarize({ asOf: ASOF, planned: [], results: [], notes: { ...notes0, held: [...ne885, heldOf('W6', 'mall_excluded:linegift/main', 9001), heldOf('W6', undefined, 9002), heldOf('W2', 'unstable', 9003)] }, deadlineHit: false });
+  assert.deepEqual([sm.counts.held, sm.counts.held_w6_mall_excluded, /\/ 欠品の売上除外で保留 1$/.test(sm.lastLine), /88\d|回復保留/.test(sm.lastLine)], [888, 1, true, false], sm.lastLine);
+  sm = summarize({ asOf: ASOF, planned: [], results: [], notes: { ...notes0, held: [...ne885, heldOf('W2', 'unstable', 9003)] }, deadlineHit: false });   // W6 のモール除外が無い朝 = 何も出ない
+  assert.deepEqual([sm.counts.held, sm.counts.held_w6_mall_excluded, /欠品の売上除外で保留|回復保留|88\d/.test(sm.lastLine)], [886, 0, false], sm.lastLine);
+  // 片づけ (売上・公開・案件・在庫の記録 = 最初の W6 の試験の 2 日前の分も)
+  for (const rid of [ra, rl]) { await pg.query(`delete from mart.sales_daily where run_id = $1`, [rid]); await pg.query(`delete from mart.sales_daily_published where run_id = $1`, [rid]); await pg.query(`delete from mart.sales_daily_runs where run_id = $1`, [rid]); }
+  await pg.query(`delete from ops.watch_issues where check_id = 'W6'`);
+  await delDaily([D(-3), D(-2)], 'logizard');
+});
 
-await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同じ曜日の過去 8 週の中央値 ± 3×MAD (+ 絶対差) で判定 / 0 件は必ず異常 / 小規模モールは統計なし・取消率と金額不明率の上限だけ / 標本は取込の完了が確かめられた日だけ (突合済みの範囲・翌朝の W7 pass。取込 run・翌々朝の pass は証跡ではない) / 有効標本 4 未満は blocked / 未公開は W9 経由で blocked / 2 週間後は warn / 平常の日が変われば世代で再評価', async () => {
+await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同じ曜日の過去 8 週の中央値で判定 (件数・売上は 中央値 − 3×MAD かつ 絶対差 を下回ったとき・取消率・金額不明率は上に外れたとき) / 0 件は必ず異常 / 小規模モールは統計なし・取消率と金額不明率の上限だけ / 標本は取込の完了が確かめられた日だけ (突合済みの範囲・翌朝の W7 pass。取込 run・翌々朝の pass は証跡ではない) / 有効標本 4 未満は blocked / 未公開は W9 経由で blocked / 2 週間後は warn / 平常の日が変われば世代で再評価', async () => {
   const w8 = (r, m) => resultOf(r, 'W8', m);
   let r = await run({ dryRun: true });
   let w = w8(r, 'aupay/main');
@@ -687,6 +823,104 @@ await t('🚨 W8 の祝日・年末年始: 昨日が祝日なら判定しない 
   assert.equal(verdictOf(r, 'W8', 'rakuten/main'), 'pass');
   r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS_UNTIL: D(-2) } });
   assert.deepEqual([verdictOf(r, 'W8', 'rakuten/main'), /祝日の一覧 .* までしか無い/.test(resultOf(r, 'W8', 'rakuten/main').reason)], ['blocked', true]);
+});
+
+await t('🚨 W8 は下に外れたときだけ異常 (項目の版 v3・10/7 の見直し = 9/23〜10/7 の異常 10 回のうち 8 回がセールなどの上振れ): 件数・売上の上振れは pass (observed.upward と理由に「上振れ」) / 下振れは breach / 境の値 (差 20 件・5 万円・3×MAD ちょうど) / 上振れでも 取消率・金額不明率・0 件 は今まで通り異常 / 小規模モールは上振れも見ない', async () => {
+  const w8 = (r, m) => resultOf(r, 'W8', m);
+  const idxOf = "substring(mall_order_no from '[0-9]+$')::int";
+  const setSales = (jpy) => pg.query(`update mart.sales_daily set items_amount_jpy = $2, sales_jpy = $2, customer_paid_jpy = $2 where mall = 'aupay' and date_jst = $1::date`, [D(-1), jpy]);
+  const keepTo = (n) => pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > $2`, [D(-1), n]);
+  // 平常 (aupay = 中央値 40 件・MAD 1 / 40 万円・MAD 1 万円): 上振れなし
+  assert.equal(CONFIG.checkById('W8').version, 'v3');
+  let r = await run({ dryRun: true }); let w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward, w.reason, w.observed.stats.orders.median, w.observed.stats.orders.mad, w.observed.stats.sales.median, w.observed.stats.sales.mad], ['pass', [], null, 40, 1, 400000, 10000]);
+  // 件数の上振れ: 59 件 (差 19 < 20) = 上振れにも数えない / 60 件 (差 20) = 前の版なら breach → 今は pass・上振れとして残す
+  await ordersBulk('aupay', 'main', D(-1), 19, 0, 41);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.yesterday.orders, w.observed.upward, w.reason], ['pass', 59, [], null]);
+  await ordersBulk('aupay', 'main', D(-1), 1, 0, 60);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.severity, w.observed.yesterday.orders, w.observed.upward, w.reason], ['pass', 'info', 60, ['件数 60 (平常 40 ± 3)'], `${D(-1)}: 上振れ (異常にしない): 件数 60 (平常 40 ± 3)`]);
+  // 売上も上振れ (200 万円 = 平常の 5 倍): pass のまま 2 つとも残す。warn の時期 (11/4 から) でも pass
+  await setSales(2000000);
+  r = await run({ dryRun: true, config: { ...CONFIG, W8_INFO_UNTIL: '2026-09-01' } }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.severity, w.observed.upward], ['pass', 'warn', ['件数 60 (平常 40 ± 3)', '売上 2,000,000 円 (平常 400,000 ± 30,000)']]);
+  // 上振れでも取消率が高ければ異常 (理由の先頭は取消率・上振れは後ろに添える)
+  await pg.query(`update core.orders set is_cancelled = true, status = 'cancelled' where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} <= 30`, [D(-1)]);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.reason.startsWith(`${D(-1)}: 取消率 50% (平常 5%) / 上振れ (異常にしない): 件数 60`), w.observed.upward.length], ['breach', true, 2]);
+  await pg.query(`update core.orders set is_cancelled = false, status = 'new' where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 2`, [D(-1)]);
+  // 上振れでも金額不明の明細の割合が高ければ異常 (30/40 = 75%)
+  await pg.query(`update mart.sales_daily set lines_amount_unknown = 30 where mall = 'aupay' and date_jst = $1::date`, [D(-1)]);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /^\S+: 金額不明の明細 75% \(平常 10%\) \/ 上振れ \(異常にしない\)/.test(w.reason)], ['breach', true]);
+  await pg.query(`update mart.sales_daily set lines_amount_unknown = 4 where mall = 'aupay' and date_jst = $1::date`, [D(-1)]);
+  // 件数の下振れの境: 21 件 (差 19) = pass / 20 件 (差 20) = breach (売上は平常に戻す)
+  await setSales(400000);
+  await keepTo(21);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.yesterday.orders, w.observed.upward], ['pass', 21, []]);
+  await keepTo(20);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /件数 20 \(平常 40 ± 3\)/.test(w.reason), /上振れ/.test(w.reason)], ['breach', true, false]);
+  // 件数は下・売上は上 (20 件で 100 万円) = 件数で breach・売上の上振れは添えるだけ
+  await setSales(1000000);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /^\S+: 件数 20 \(平常 40 ± 3\) \/ 上振れ \(異常にしない\): 売上 1,000,000 円/.test(w.reason), /: 売上 1,000,000 円 \(平常 400,000 ± 30,000\)$/.test(w.reason)], ['breach', true, true]);
+  // 0 件は今まで通り異常
+  await keepTo(0);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /注文 0 件 \(平常の中央値 40\)/.test(w.reason)], ['breach', true]);
+  await ordersBulk('aupay', 'main', D(-1), 40, 2);
+  // 売上の下振れの境 (件数は平常の 40 件): 350,001 円 (差 49,999) = pass / 350,000 円 (差 50,000) = breach / 上の境 450,000 円 (差 50,000) = pass・上振れ
+  await setSales(350001);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', []]);
+  await setSales(350000);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /売上 350,000 円 \(平常 400,000 ± 30,000\)/.test(w.reason)], ['breach', true]);
+  await setSales(449999);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', []]);
+  await setSales(450000);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', ['売上 450,000 円 (平常 400,000 ± 30,000)']]);
+  await setSales(400000);
+  // 3×MAD ちょうどの境 (Codex #1686 R1 Low 1): 絶対差の下限を 0 にした設定で、差がちょうど 3×MAD は pass・超えたら 下 = breach / 上 = 上振れ
+  const noAbs = { ...CONFIG, W8_MIN_ABS_ORDERS: 0, W8_MIN_ABS_SALES_JPY: 0 };
+  await keepTo(37);   // 件数 37 = 差 −3 = ちょうど 3×MAD (MAD 1)
+  r = await run({ dryRun: true, config: noAbs }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.yesterday.orders, w.observed.upward], ['pass', 37, []]);
+  await keepTo(36);   // 差 −4 > 3
+  r = await run({ dryRun: true, config: noAbs }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /件数 36 \(平常 40 ± 3\)/.test(w.reason)], ['breach', true]);
+  await ordersBulk('aupay', 'main', D(-1), 7, 0, 37);   // 件数 43 = 差 +3 = ちょうど 3×MAD
+  r = await run({ dryRun: true, config: noAbs }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.yesterday.orders, w.observed.upward], ['pass', 43, []]);
+  await ordersBulk('aupay', 'main', D(-1), 1, 0, 44);   // 差 +4 > 3
+  r = await run({ dryRun: true, config: noAbs }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', ['件数 44 (平常 40 ± 3)']]);
+  await keepTo(40);
+  await setSales(370000);   // 売上の差 −30,000 = ちょうど 3×MAD (MAD 1 万円)
+  r = await run({ dryRun: true, config: noAbs }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', []]);
+  await setSales(369999);
+  r = await run({ dryRun: true, config: noAbs }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, /売上 369,999 円 \(平常 400,000 ± 30,000\)/.test(w.reason)], ['breach', true]);
+  await setSales(430000);
+  r = await run({ dryRun: true, config: noAbs }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', []]);
+  await setSales(430001);
+  r = await run({ dryRun: true, config: noAbs }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.upward], ['pass', ['売上 430,001 円 (平常 400,000 ± 30,000)']]);
+  await setSales(400000);
+  // 小規模モール (qoo10 = 10 件/日): 50 件に増えても統計の判定は無い = 上振れにも数えない
+  await ordersBulk('qoo10', 'main', D(-1), 40, 0, 11);
+  r = await run({ dryRun: true }); w = w8(r, 'qoo10/main');
+  assert.deepEqual([w.verdict, w.observed.yesterday.orders, w.observed.upward, /小規模/.test(w.reason)], ['pass', 50, [], true]);
+  await pg.query(`delete from core.orders where mall = 'qoo10' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 10`, [D(-1)]);
+  r = await run({ dryRun: true });
+  assert.deepEqual(CONFIG.ORDER_MALLS.map((m) => [verdictOf(r, 'W8', `${m.mall}/${m.scope}`), resultOf(r, 'W8', `${m.mall}/${m.scope}`).observed.upward]), CONFIG.ORDER_MALLS.map(() => ['pass', []]));
 });
 
 console.log('W7 / W9: 証跡と Render の run');
@@ -1227,6 +1461,43 @@ await t('🚨 規則の変更 (項目の版が上がった・Codex #1678 R1・09
   assert.deepEqual([reconcileIssues({ config: CONFIG, results: res('blocked'), openIssues: open('v1'), asOf: ASOF, now: NOW }).updates.length,
     reconcileIssues({ config: CONFIG, results: res('breach'), openIssues: open('v1'), asOf: ASOF, now: NOW }).notes.continued.length], [0, 1]);
 });
+await t('🚨 W8 の版を v2 → v3 に上げた (下に外れたときだけ異常): 前の版 (v2) で開いていた W8 の案件が、v3 の最初の朝に上振れの pass で消えても「回復」ではなく「規則の変更で閉じた」。v3 どうしの下振れ → 平常は通常の回復', async () => {
+  assert.deepEqual([REAL_CONFIG.checkById('W8').version, REAL_CONFIG.W8_INFO_UNTIL], ['v3', '2026-11-04']);
+  const w8c = CONFIG.checkById('W8');
+  const only = (ver) => ({ ...CONFIG, CHECKS: [CONFIG.checkById('W7'), CONFIG.checkById('W9'), { ...w8c, version: ver }] });   // W8 と前提だけ評価する (ほかの項目の案件に触らない)
+  const w8 = (r) => resultOf(r, 'W8', 'aupay/main');
+  const issue = () => one(`select i.watch_issue_id, i.state, i.transitions, i.recovered_at is not null as rec, i.summary, r.check_version from ops.watch_issues i left join ops.watch_results r on r.watch_result_id = i.last_result_id where i.check_id = 'W8' and i.scope_key = 'aupay/main' order by i.watch_issue_id desc limit 1`);
+  const idxOf = "substring(mall_order_no from '[0-9]+$')::int";
+  await pg.query(`delete from ops.watch_issues where check_id = 'W8'`);
+  let r = await run({ dryRun: true, config: only('v3') });
+  assert.deepEqual(CONFIG.ORDER_MALLS.map((m) => verdictOf(r, 'W8', `${m.mall}/${m.scope}`)), ['pass', 'pass', 'pass', 'pass', 'pass']);
+  // 前の版 (v2) の結果で案件が開く (本番の 10/1 の amazon の上振れのような案件の代わり。前の版の判定は残っていないので、v2 の印をつけた下振れで開く)
+  await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 15`, [D(-1)]);
+  r = await run({ config: only('v2'), now: new Date('2026-09-23T07:00:00Z') });
+  assert.deepEqual([w8(r).verdict, w8(r).checkVersion, r.counts.new], ['breach', 'v2', 1]);
+  let i = await issue();
+  assert.deepEqual([i.state, i.check_version], ['open', 'v2']);
+  // v3 の最初の朝: 昨日は上振れ (60 件) = pass → 回復ではなく「規則の変更で閉じた」
+  await ordersBulk('aupay', 'main', D(-1), 45, 0, 16);
+  r = await run({ config: only('v3'), now: new Date('2026-09-23T08:00:00Z') });
+  assert.deepEqual([w8(r).verdict, w8(r).observed.upward, r.counts.recovered, r.counts.rule_changed, r.notes.ruleChanged[0].reason], ['pass', ['件数 60 (平常 40 ± 3)'], 0, 1, 'rule_changed:v2->v3']);
+  assert.match(r.lastLine, /回復 0 .*規則の変更で閉じた 1 \(回復ではない\)/);
+  i = await issue();
+  assert.deepEqual([i.state, i.transitions, i.rec, /W8 aupay\/main: 規則の変更で閉じた \(v2 → v3。回復ではない\)/.test(i.summary)], ['out_of_window', 2, false, true]);
+  // v3 どうし: 下振れで開いて上振れの日に消えた = 通常の回復 (上振れは異常ではない = 少なすぎが直った)
+  await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 15`, [D(-1)]);
+  r = await run({ config: only('v3'), now: new Date('2026-09-23T09:00:00Z') });
+  assert.deepEqual([w8(r).verdict, r.counts.new], ['breach', 1]);
+  await ordersBulk('aupay', 'main', D(-1), 45, 0, 16);
+  r = await run({ config: only('v3'), now: new Date('2026-09-23T10:00:00Z') });
+  assert.deepEqual([w8(r).verdict, r.counts.recovered, r.counts.rule_changed], ['pass', 1, 0]);
+  i = await issue();
+  assert.deepEqual([i.state, i.rec, i.check_version], ['recovered', true, 'v3']);
+  await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 40`, [D(-1)]);
+  await pg.query(`delete from ops.watch_issues where check_id = 'W8'`);
+  r = await run({ dryRun: true, config: only('v3') });
+  assert.deepEqual([w8(r).verdict, w8(r).observed.upward], ['pass', []]);
+});
 
 console.log('実行器の守り');
 await t('🚨 評価の 1 つが例外 → その項目の評価キーだけ execution_error・ほかは続く・最後の行は ❌ で exit 1。予定した評価キーが 1 つでも欠ければ ❌', async () => {
@@ -1300,9 +1571,11 @@ await t('🚨 Codex R2 #2: 世代が変わり続けた回は回復も保留 (bre
   await capture(D(-2), 'ne', 'main', 'complete');   // D(-2) は直った
   r = await run({ hooks: { afterSnapshot: async () => { await bump(); } } });
   assert.deepEqual([r.unstable, verdictOf(r, 'W2', 'ne/main'), r.counts.recovered, r.counts.continued, r.notes.held.filter((h) => h.reason === 'unstable').length, /回復は保留/.test(r.lastLine)], [true, 'breach', 0, 1, 1, true]);
+  assert.doesNotMatch(r.lastLine, /欠品の売上除外で保留|回復保留/);   // W2 の世代の保留 (holdRecoveries) は 1 行の「欠品の売上除外で保留」に数えない (W6 のモール除外だけ。Codex #1687 R3)
   assert.equal((await one(`select state from ops.watch_issues where check_id = 'W2' and scope_key = 'ne/main' and subject_key = $1`, [D(-2)])).state, 'open');
   r = await run();
   assert.deepEqual([r.unstable, r.counts.recovered, r.counts.continued], [false, 1, 1]);
+  assert.doesNotMatch(r.lastLine, /欠品の売上除外で保留|回復保留/);
   await capture(D(-3), 'ne', 'main', 'complete');
   r = await run();
   assert.deepEqual([r.counts.recovered, (await one(`select count(*)::int as n from ops.watch_issues where state = 'open'`)).n], [1, 0]);
@@ -1444,6 +1717,111 @@ await t('🚨 Render と同じ条件 (superuser でない・CREATEROLE だけ・
     assert.ok(d.stmts.length > 20 && d.roles.length === 0 && d.info.owner === 'deploy');
   } finally { await pg3.close(); }
 });
+await t('🚨 10/12 の事故: 既定 (パスワードを渡さない) = 無いロールだけ新しいパスワードで作る・もうあるロールのパスワードは変えない (alter role に password も login も書かない)。rotate = 両方作り直す。nologin / パスワードが無いロールは黙って直さず止める', async () => {
+  // roleStatements: パスワードを渡さない = そのロールの alter に password も login も無い (権限・設定の文は同じ)
+  const keep = roleStatements({ dbName: 'cdb', owner: 'u', watcherPw: null, writerPw: undefined });
+  const withPw = roleStatements({ dbName: 'cdb', owner: 'u', watcherPw: 'a', writerPw: 'b' });
+  assert.ok(!keep.some((x) => /password|\blogin\b/.test(x)), keep.filter((x) => /password|login/.test(x)).join(' | '));
+  assert.ok(keep.includes('alter role watcher with nocreaterole noinherit connection limit 3') && keep.includes('alter role watch_writer with nocreaterole noinherit connection limit 2'));
+  assert.equal(keep.length, withPw.length, '権限・設定の文の数は同じ');
+  assert.deepEqual(keep.filter((x) => !/^alter role \w+ with /.test(x)), withPw.filter((x) => !/^alter role \w+ with /.test(x)), 'alter role … with の 2 文のほかは同じ');
+  // mustCreate (#1696 Codex R1 L1) = 「無いと確かめた」ロールは素の create role (別の実行が先に作っていたら 42710 で取り消す)。ほかは「無ければ作る」のまま
+  const mc = roleStatements({ dbName: 'cdb', owner: 'u', watcherPw: 'a', writerPw: null, mustCreate: ['watcher'] });
+  assert.ok(mc.includes('create role watcher') && !mc.some((x) => /if not exists .*'watcher'/.test(x)) && mc.some((x) => /if not exists .*'watch_writer'.* create role watch_writer;/.test(x)), mc.slice(0, 3).join(' | '));
+  assert.ok(withPw.some((x) => /if not exists .*'watcher'/.test(x)) && !withPw.includes('create role watcher'), '既定 (mustCreate なし) は今までどおり「無ければ作る」');
+  // targetOf (#1696 Codex R1 M2) = host:port/database だけ (ユーザー・パスワードは入れない)
+  assert.equal(targetOf('postgres://watcher:s3cret@Host.Example:5433/cdb?sslmode=require'), 'host.example:5433/cdb');
+  assert.equal(targetOf('postgres://u:p@h/cdb'), 'h:5432/cdb');
+  assert.notEqual(targetOf('postgres://u:p@h/cdb_old'), targetOf('postgres://u:p@h/cdb'));
+  assert.ok(!targetOf('postgres://watcher:s3cret@h/cdb').includes('s3cret'));
+  assert.equal(targetOf('not a url'), null);
+  const pg4 = new PGlite();
+  try {
+    await pg4.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
+    await pg4.query(`alter database ${(await pg4.query('select current_database() as d')).rows[0].d} owner to deploy`);
+    await pg4.query('set role deploy');
+    await applyMigrations(pgliteAdapter(pg4), { log: quiet });
+    const logged = (c) => ({ log: [], query(sql, p) { this.log.push(sql); return c.query(sql, p); } });
+    // dry-run (ロールが無い) = 両方新しく作る予定・パスワードは入れ物 (本物を作らない)・何も流さない
+    const d0 = await createRoles(pg4, { dryRun: true });
+    assert.deepEqual([Object.keys(d0.pw).sort(), d0.created.sort(), d0.roles.length], [['watch_writer', 'watcher'], ['watch_writer', 'watcher'], 0]);
+    assert.ok(Object.values(d0.pw).every((x) => /^<.+ の新しいパスワード>$/.test(x)), JSON.stringify(d0.pw));
+    assert.equal((await pg4.query(`select count(*)::int as n from pg_roles where rolname in ('watcher', 'watch_writer')`)).rows[0].n, 0);
+    // 1 回目 (無い) = 両方作って新しいパスワードを返す
+    const L1 = logged(pg4);
+    const r1 = await createRoles(L1, {});
+    // 確かめ (pg_roles を読む) は begin + advisory lock の後 = 同時の実行と取り違えない (#1696 Codex R1 L1)。作るのは素の create role
+    const iBegin = L1.log.indexOf('begin'), iLock = L1.log.findIndex((x) => /pg_advisory_xact_lock/.test(x)), iCheck = L1.log.findIndex((x) => /from pg_roles where rolname = any/.test(x) && /rolcanlogin/.test(x));
+    assert.ok(iBegin >= 0 && iBegin < iLock && iLock < iCheck, `${iBegin} ${iLock} ${iCheck}`);
+    assert.ok(L1.log.includes('create role watcher') && L1.log.includes('create role watch_writer'));
+    assert.deepEqual([Object.keys(r1.pw).sort(), r1.created.sort()], [['watch_writer', 'watcher'], ['watch_writer', 'watcher']]);
+    assert.ok(r1.pw.watcher.length >= 30 && r1.pw.watch_writer.length >= 30 && r1.pw.watcher !== r1.pw.watch_writer);
+    assert.ok(r1.roles.every((x) => x.rolcanlogin), '作ったロールは login できる');
+    // 2 回目 (ある) = パスワードを付けない・作らない。流した文に password も login も無い。権限は同じにそろう
+    const L2 = logged(pg4);
+    const r2 = await createRoles(L2, {});
+    assert.deepEqual([r2.pw, r2.created, r2.roles.length], [{}, [], 2]);
+    assert.ok(!L2.log.some((x) => /password|alter role \w+ with login/.test(x)), L2.log.filter((x) => /password|login/.test(x)).join(' | '));
+    assert.ok(L2.log.some((x) => /grant select on all tables in schema core to watcher/.test(x)), '権限はそろえ直す');
+    // 片方だけ無い = 無い方だけ作る (ある方は変えない)
+    await pg4.query('reset role'); await pg4.query('drop owned by watch_writer'); await pg4.query('drop role watch_writer'); await pg4.query('set role deploy');
+    const L3 = logged(pg4);
+    const r3 = await createRoles(L3, {});
+    assert.deepEqual([Object.keys(r3.pw), r3.created], [['watch_writer'], ['watch_writer']]);
+    assert.ok(!L3.log.some((x) => /alter role watcher with .*password/.test(x)) && L3.log.some((x) => /alter role watch_writer with login password/.test(x)));
+    assert.ok(L3.log.includes('create role watch_writer') && !L3.log.includes('create role watcher'), '無かった方だけ素の create role');
+    // rotate = 両方作り直す (作らない)
+    const r4 = await createRoles(pg4, { rotate: true });
+    assert.deepEqual([Object.keys(r4.pw).sort(), r4.created], [['watch_writer', 'watcher'], []]);
+    assert.ok(r4.pw.watcher !== r1.pw.watcher);
+    // dry-run (ある) = パスワードを付けるロールなし
+    const d1 = await createRoles(pg4, { dryRun: true });
+    assert.deepEqual([d1.pw, d1.created], [{}, []]);
+    assert.ok(!d1.stmts.some((x) => /password/.test(x)));
+    // nologin のロール = 既定では黙って直さず止める (login を付けない・取り消す) / rotate なら直る
+    await pg4.query('reset role'); await pg4.query('alter role watcher with nologin'); await pg4.query('set role deploy');
+    await assert.rejects(createRoles(pg4, {}), /watcher が login できない.*--rotate-passwords が要る/);
+    await assert.rejects(createRoles(pg4, { dryRun: true }), /--rotate-passwords が要る/);
+    assert.equal((await pg4.query(`select rolcanlogin from pg_roles where rolname = 'watcher'`)).rows[0].rolcanlogin, false, '止めた = login は付いていない');
+    assert.ok((await createRoles(pg4, { rotate: true })).roles.every((x) => x.rolcanlogin));
+    // パスワードが無いロール (pg_authid を読める実行者 = superuser のときだけ分かる) = 止める
+    await pg4.query('reset role'); await pg4.query('alter role watch_writer password null');
+    await assert.rejects(createRoles(pg4, {}), /watch_writer にパスワードが無い.*--rotate-passwords/);
+    // deploy (pg_authid を読めない) には分からない = 止めない (CLI の最後の .env の確かめで見つける)
+    await pg4.query('set role deploy');
+    assert.equal((await createRoles(pg4, {})).roles.length, 2);
+    await pg4.query('reset role');
+    assert.equal((await pg4.query(`select rolpassword is null as n from pg_authid where rolname = 'watch_writer'`)).rows[0].n, true, '既定の実行はパスワードを付けていない');
+  } finally { await pg4.close(); }
+});
+await t('🚨 #1696 Codex R2: begin の後の鍵の取得・ロールの確かめで失敗しても rollback する (呼び手の接続に失敗中の取引を残さない = 次の文が 25P02 にならない)', async () => {
+  // 鍵の取得 (pg_advisory_xact_lock) / ロールの確かめ (pg_roles) を、本当に失敗する文 (0 で割る = 22012) に差し替える = PGlite の取引は本当に失敗中になる
+  for (const [label, re] of [['鍵の取得', /pg_advisory_xact_lock/], ['ロールの確かめ', /rolcanlogin/]]) {
+    const log = [];
+    const c = { query: (sql, p) => { log.push(sql); if (re.test(sql)) return pg.query('select 1/0'); return pg.query(sql, p); } };
+    await assert.rejects(createRoles(c, {}), (e) => /division by zero/.test(e.message), label);
+    const iBegin = log.indexOf('begin'), iFail = log.findIndex((x) => re.test(x));
+    assert.ok(iBegin >= 0 && iFail > iBegin && log.slice(iFail + 1).includes('rollback'), `${label}: ${log.slice(-3).join(' | ')}`);
+    assert.deepEqual((await pg.query('select 1 as n')).rows, [{ n: 1 }], `${label}: 接続が使える (失敗中の取引が残っていない)`);
+  }
+  // begin そのものが失敗しても rollback を試す (取引の外なら警告だけ)
+  const log2 = [];
+  const c2 = { query: (sql, p) => { log2.push(sql); if (sql === 'begin') { const e = new Error('begin failed'); e.code = '08006'; throw e; } return pg.query(sql, p); } };
+  await assert.rejects(createRoles(c2, {}), /begin failed/);
+  assert.equal(log2[log2.length - 1], 'rollback');
+  // dry-run は取引を始めない = rollback も送らない
+  const log3 = [];
+  const c3 = { query: (sql, p) => { log3.push(sql); if (/rolcanlogin/.test(sql)) return pg.query('select 1/0'); return pg.query(sql, p); } };
+  await assert.rejects(createRoles(c3, { dryRun: true }), /division by zero/);
+  assert.ok(!log3.includes('begin') && !log3.includes('rollback'), log3.join(' | '));
+});
+await t('CLI の引数: 知らない引数 (--rotate-password の打ち間違いなど) は流さずに止める・--verify は単独', () => {
+  const run = (...a) => spawnSync(process.execPath, [path.join(root, 'scripts', 'company-db', 'create-watch-roles.mjs'), ...a], { encoding: 'utf8', timeout: 30000, env: { ...process.env, COMPANY_DB_URL: 'postgres://nobody:x@127.0.0.1:1/none' } });
+  const a = run('--rotate-password');
+  assert.equal(a.status, 1); assert.ok(/知らない引数: --rotate-password/.test(a.stderr), a.stderr);
+  const b = run('--verify', '--rotate-passwords');
+  assert.equal(b.status, 1); assert.ok(/--verify は単独/.test(b.stderr), b.stderr);
+});
 await t('🚨 --verify は権限そのものを見る: watcher は read write の取引で書いて拒まれる (42501) / writer は記録の経路が通り・禁止の列・core の select・delete は拒まれる。期待と違えば findings に残る (exit 1 の材料)', async () => {
   // 疑似の接続: 文ごとに ok か 42501 を返す。savepoint / begin / rollback は通す
   const fake = (user, rule) => ({ log: [], query(sql, params) { this.log.push(sql); if (/^select current_user/.test(sql)) return { rows: [{ u: user, st: '10s' }] }; if (/^(begin|savepoint|release|rollback)/.test(sql)) return { rows: [] }; if (/select watch_result_id from ops.watch_results/.test(sql)) return { rows: [{ watch_result_id: 1 }] }; const code = rule(sql, params); if (code === 'ok') return { rows: [] }; const e = new Error('permission denied'); e.code = code; throw e; } });
@@ -1538,7 +1916,7 @@ const adEv = (x = {}) => ({ name: 'ad-spend-amazon', kind: 'ad_spend', mall: 'am
   yesterday: { date: D(-1), local: true, generation: 5000, fetchedAt: '2026-09-22T22:10:00Z', onRender: true }, campaign_check: [{ date: D(-2), generation: 5000, report_id: 'R5000', sku_cents: 90000, campaign_cents: 90000 }, { date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 100000, campaign_cents: 100300 }], ...x });
 const w14 = async (evx, opts = {}) => (await evalW14({ db, config: opts.config || A, asOf: opts.asOf || ASOF, evidence: evx === null ? {} : { 'ad-spend-amazon': evx }, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC }, W14C))[0];
 await t('W14: 本物の設定に評価キー amazon/jp (v14・前提なし・最初の 2 週間は info)。そろった朝は pass (差 3 円 < 許容 10 円・出品の分からない費用 1%)', async () => {
-  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v18', ['amazon/jp'], [], 'warn']);
+  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v20', ['amazon/jp'], [], 'warn']);
   await adDay(D(-1));
   const r = await w14(adEv());
   assert.deepEqual([r.verdict, r.severity, r.observed.unresolved_share, r.observed.render.generation, r.observed.campaign_check], ['pass', 'info', 0.01, 5000, ['09-21:900/900', '09-22:1000/1003']], JSON.stringify(r));
@@ -1608,7 +1986,7 @@ console.log('W15 migrate の lock が朝に残っていない (設計 13 §3.10 
 const W15C = REAL_CONFIG.checkById('W15');
 const w15 = async (cfg = REAL_CONFIG) => evalW15({ db, config: cfg, asOf: ASOF }, W15C);
 await t('W15: 本物の設定に評価キー db/company (v17・前提なし・warn・案件は 1 つ)・lock が無ければ pass / 既存の試験の設定 (W15_SCOPES = []) は評価キーを作らない', async () => {
-  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W15').map((k) => k.scopeKey), W15C.depends, W15C.severity, W15C.issuePerItem], ['v18',['db/company'], [], 'warn', false]);
+  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W15').map((k) => k.scopeKey), W15C.depends, W15C.severity, W15C.issuePerItem], ['v20',['db/company'], [], 'warn', false]);
   assert.equal(plannedKeys(CONFIG).filter((k) => k.checkId === 'W15').length, 0);
   assert.equal(REAL_CONFIG.CHECKS.at(-1).id, 'W15');
   const [r] = await w15();

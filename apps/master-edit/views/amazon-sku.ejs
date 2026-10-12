@@ -22,7 +22,10 @@
   // 属性に入れる値は必ずエスケープする (コードに引用符があっても属性が増えない = #1628 Codex R1 M4)
   const h = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const iconBtns = (i, code) => { const who = h(i + ' 行目' + (code ? ' (' + code + ')' : '')); return '<button type="button" class="iconbtn" data-act="up" aria-label="' + who + ' を上へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg></button><button type="button" class="iconbtn" data-act="down" aria-label="' + who + ' を下へ"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-down"/></svg></button><button type="button" class="iconbtn del" data-act="del" aria-label="' + who + ' を外す"' + dis + '><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg></button>'; };
-  const pageData = page ? { base, sku, canSave, maxComponents: MAX_MAP_COMPONENTS, maxQty: MAX_MAP_QTY, isNew: !map, deleted } : null;
+  // 構成の行の「NE の商品」の欄 = 打つと候補 (10/12・public/me-amazon.js)。保存できる画面だけ (候補の箱 #comp-suggest も保存できるときだけ置く)
+  const searchMin = locals.COMPONENT_SEARCH_MIN || 2;
+  const cbx = canSave ? ' role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="comp-suggest"' : '';
+  const pageData = page ? { base, sku, canSave, maxComponents: MAX_MAP_COMPONENTS, maxQty: MAX_MAP_QTY, isNew: !map, deleted, searchMin } : null;
 %>
   <%- include('_header', { hasSave: canSave }) %>
   <div class="page" id="amazon-sku-page">
@@ -78,13 +81,13 @@
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-box"/></svg></span><h2 id="h-comp"><%= !map ? '新しい対応' : deleted ? 'もう一度登録する' : '対応を直す' %></h2><span class="sub">この SKU 1 個 = 下の NE の商品 × 数</span></div>
           <div class="f" data-row="name"><label class="lab" for="name">名前 (社内)</label><div class="ctl"><input class="in w-l" id="name" value="<%= startName %>" maxlength="255" autocomplete="off" data-dirty-field="name" data-label="名前 (社内)"<%= dis %>></div></div>
           <div class="f wide" data-row="components">
-            <div class="scrollx"><table class="comp" id="comp" data-dirty-field="components" data-label="構成"><caption class="sr">構成 (コードを打つと名前が出ます・1 行目が代表)</caption>
-              <thead><tr><th scope="col">#</th><th scope="col">NE の商品 (コードを打つと名前が出ます)</th><th scope="col">数</th><th scope="col">登録の状態</th><th scope="col">どこから</th><th scope="col"><span class="sr">並べ替え・外す</span></th></tr></thead>
+            <div class="scrollx"><table class="comp" id="comp" data-dirty-field="components" data-label="構成"><caption class="sr">構成 (コード・名前・JAN を打つと候補が出ます・選ぶと名前が出ます・1 行目が代表)</caption>
+              <thead><tr><th scope="col">#</th><th scope="col">NE の商品 (コード・名前・JAN で探せます)</th><th scope="col">数</th><th scope="col">登録の状態</th><th scope="col">どこから</th><th scope="col"><span class="sr">並べ替え・外す</span></th></tr></thead>
               <tbody id="comp-rows">
                 <% startRows.forEach((c, i) => { %>
                 <tr class="comp-row">
                   <td class="no"><%= i + 1 %></td>
-                  <td><input class="in mono c-code" style="width:150px" value="<%= c.code %>" autocomplete="off" spellcheck="false" aria-label="<%= i + 1 %> 行目の NE コード"<%= dis %>> <span class="c-name"><%= c.name %><%= c.sku_kind === 'exception' ? ' (例外の SKU)' : '' %></span><% if (i === 0) { %><span class="repbadge">代表</span><% } %></td>
+                  <td><input class="in mono c-code" style="width:150px" value="<%= c.code %>" autocomplete="off" spellcheck="false" placeholder="コード・名前・JAN" aria-label="<%= i + 1 %> 行目の NE コード"<%- cbx %><%= dis %>> <span class="c-name"><%= c.name %><%= c.sku_kind === 'exception' ? ' (例外の SKU)' : '' %></span><% if (i === 0) { %><span class="repbadge">代表</span><% } %></td>
                   <td><input class="in c-qty" style="width:70px;text-align:right" inputmode="numeric" autocomplete="off" value="<%= c.qty %>" aria-label="<%= i + 1 %> 行目 (<%= c.code %>) の数"<%= dis %>></td>
                   <td class="c-reg"><% if (c.reg_state) { %><span class="b <%= REG_BADGE[c.reg_state] || 'mute' %>"><%= REG[c.reg_state] || c.reg_state %></span><% } else { %><span class="muted">—</span><% } %></td>
                   <td class="hint"><%= RES[c.resolution] || c.resolution %></td>
@@ -93,9 +96,10 @@
                 <% }) %>
               </tbody>
             </table></div>
-            <template id="comp-tpl"><tr class="comp-row"><td class="no"></td><td><input class="in mono c-code" style="width:150px" autocomplete="off" spellcheck="false" placeholder="NE コード" aria-label="NE コード"> <span class="c-name"></span></td><td><input class="in c-qty" style="width:70px;text-align:right" inputmode="numeric" autocomplete="off" value="1" aria-label="数"></td><td class="c-reg"></td><td class="hint">人</td><td class="acts"><%- iconBtns('', '') %></td></tr></template>
+            <% if (canSave) { %><div class="csug" id="comp-suggest" role="listbox" aria-label="NE の商品の候補" hidden></div><div class="sr" id="comp-suggest-status" role="status" aria-live="polite"></div><% } %>
+            <template id="comp-tpl"><tr class="comp-row"><td class="no"></td><td><input class="in mono c-code" style="width:150px" autocomplete="off" spellcheck="false" placeholder="コード・名前・JAN" aria-label="NE コード"<%- cbx %>> <span class="c-name"></span></td><td><input class="in c-qty" style="width:70px;text-align:right" inputmode="numeric" autocomplete="off" value="1" aria-label="数"></td><td class="c-reg"></td><td class="hint">人</td><td class="acts"><%- iconBtns('', '') %></td></tr></template>
             <div style="display:flex;gap:12px;align-items:center;margin-top:6px;flex-wrap:wrap"><button class="btn sm" type="button" id="comp-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>NE の商品を足す</button>
-              <span class="hint">1 行目が代表 (↑↓ で並べ替え) · 1〜<%= MAX_MAP_COMPONENTS %> 行 · 数は 1〜<%= MAX_MAP_QTY %> · NE で確かめた商品 (NE確認済み・登録済み) だけ使えます</span></div>
+              <span class="hint">コード・名前・JAN を <%= searchMin %> 文字から打つと候補が出ます (↑↓ と Enter で選ぶ) · 1 行目が代表 (並べ替えは右の ↑↓) · 1〜<%= MAX_MAP_COMPONENTS %> 行 · 数は 1〜<%= MAX_MAP_QTY %> · まだ NE に無い新商品 (下書き・NE 登録待ち)・NE で直接作った商品 (要確認) も使えます (やめた商品・例外の SKU は使えません)</span></div>
           </div>
         </section>
 

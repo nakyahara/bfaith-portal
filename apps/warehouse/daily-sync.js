@@ -691,9 +691,9 @@ async function main() {
       results.push({ name, ...r, warn: r.success && isWarnSummary(r.summary) });
     }
   }
-  // Company DB (Render Postgres) へ Amazon の出品一覧を送る (2026-10-12・受け皿 0076 (仮の番号)・画面 = マスタの入力の「まだつないでいない Amazon の SKU」と seller SKU の画面の商品名)。
+  // Company DB (Render Postgres) へ Amazon の出品一覧を送る (2026-10-12・受け皿 0074・画面 = マスタの入力の「まだつないでいない Amazon の SKU」と seller SKU の画面の商品名)。
   // 材料 = 前の夜に想定利益の夜間 (ExpectedProfitNightly 23:30) が取って残した出品レポートの TSV (DATA_DIR/mall-items-history/amazon/)。SP-API は呼ばない (2 回取らない)。
-  // Render と同じ取得なら送らない・古い世代は受け口が拒む = 再実行安全。0076 がまだ Render に無い朝は ⚠️ (exit 0)
+  // Render と同じ取得なら送らない・古い世代は受け口が拒む = 再実行安全。0074 がまだ Render に無い朝は ⚠️ (exit 0)
   const cdbListingsResult = runScript('apps/company-db/push/amazon-listings.mjs --send', 'Company DB 出品一覧 (Amazon)', 300000);
   results.push({ name: 'CompanyDB出品一覧(Amazon)', ...cdbListingsResult, warn: cdbListingsResult.success && isWarnSummary(cdbListingsResult.summary) });
 

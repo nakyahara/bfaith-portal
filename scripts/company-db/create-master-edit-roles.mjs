@@ -42,11 +42,13 @@
  * 🆕 0066 (Company DB構想 20 の PR-3・知らせの名前空間): master_edit に名前空間つきで借りる関数 (ops.claim_outbox_events) の実行を足す。
  *   まとまりの知らせを書く部品 (ops.enqueue_group_snapshot)・形 / 値の確かめ・insert の trigger はだれにも渡さない
  * 🆕 0071 (新商品の下書きを消す): master_edit に ops.cancel_sku_draft と確かめ ops.sku_draft_cancel_check の実行 (DRAFT_CANCEL_FUNCTIONS)。表の権限は足さない (関数の中だけで書く)
- * 🆕 0076 (Amazon の出品一覧・まだつないでいない SKU): master_edit に 3 つの表の select (AMAZON_LISTING_SELECT) と、隠す・最後に売れた日の関数の実行 (AMAZON_LISTING_EDIT_FUNCTIONS)
+ * 🆕 0074 (Amazon の出品一覧・まだつないでいない SKU): master_edit に 3 つの表の select (AMAZON_LISTING_SELECT) と、隠す・最後に売れた日の関数の実行 (AMAZON_LISTING_EDIT_FUNCTIONS)
  * 🆕 0067 (Company DB構想 20 の PR-5・まとまりの DB): master_edit にまとまりの 5 つの関数 (まとめての登録を開く / 閉じる・子の廃止・名前を直す・
  *   quarantined の代表の採用) と確かめの 4 つ (新しいまとまりのコードの決まり・products.parent が company か・子の request_id・子の数の上限) の実行と、
  *   まとまりの表 (予約・軸・選択肢・子の選択肢・revision・まとめての登録・採用の記録) の読み取りを足す (表が無い DB = 0067 の前は付けない = 流し直すと付く)。
  *   🚨 渡さない: まとまりの表の書き込み (関数だけ)・関数の中の部品 (鍵・スナップショット・revision・約束・予約の事前検査と入れる関数 = DB の持ち主だけ)
+ * 🆕 0072 (NE から消す CSV): master_edit に確かめ・作る・受け取る・取り下げ・取扱中止・一覧の 8 つの実行 (NE_DEL_FUNCTIONS)。表の権限は足さない (関数の中だけで書く・
+ *   ファイルのバイト列は ops.ne_del_download だけ)。🚨 渡さない: 表の守り・行き先・CSV のバイト列を作る部品・参照の守りの部品 (NE_DEL_OWNER_ONLY_FUNCTIONS)
  * 🆕 0070 (NE から消えた商品をやめる): master_edit と master_ops に ops.cancel_sku_gone_from_ne と確かめの 2 つ (ops.sku_gone_from_ne_check / _list) の実行
  *   (GONE_FUNCTIONS)。🚨 渡さない: ops.master_ne_absence の表・照合 ② の記録の中の部品 (ops._record_ne_absence ほか = GONE_OWNER_ONLY_FUNCTIONS)
  *
@@ -199,10 +201,20 @@ export const GONE_FUNCTIONS = Object.freeze(['ops.cancel_sku_gone_from_ne(uuid, 
 /** 🆕 0070: だれにも渡さない (照合 ② の記録の中の部品・表の守り・定数) */
 export const GONE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops._record_ne_absence(bigint, jsonb)', 'ops.guard_master_ne_absence()', 'ops.ne_gone_required_runs()', 'ops.ne_gone_fresh_hours()',
   'ops.sku_ref_cancelled(bigint[])', 'ops.guard_sku_ref_not_cancelled()']);   // #1683 R1 High 2: やめた SKU への参照を断る trigger とその部品
+/**
+ * 🆕 0072 (NE から消す CSV・中原さんの決定 10/12): 画面 (master_edit・名簿 MASTER_DECISION_APPROVERS の人) に実行だけ。無い DB (0072 の前) では付けない (流し直すと付く)。
+ *   master_ops (CLI) には渡さない (NE から消す CSV は画面だけ・「やめる」は 0070 の GONE_FUNCTIONS のまま)
+ */
+export const NE_DEL_FUNCTIONS = Object.freeze(['ops.ne_del_check(bigint, bigint[], jsonb)', 'ops.ne_del_check_many(bigint[], jsonb)', 'ops.ne_del_build(uuid, text, text, bigint[], jsonb)',
+  'ops.ne_del_download(text, bigint)', 'ops.ne_del_withdraw(uuid, text, text, bigint)', 'ops.ne_del_refused_check(bigint)', 'ops.ne_handling_build(uuid, text, text, bigint[])',
+  'ops.ne_del_item_status(bigint)', 'ops.ne_del_overview(bigint)']);
+/** 🆕 0072: だれにも渡さない (表の守り・行き先・理由の部品・在庫の鍵・CSV のバイト列・参照の守りの部品) */
+export const NE_DEL_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_ne_del_write()', 'ops.ne_del_item_transition_allowed(text, text)', 'ops._ne_del_problem(text, text)',
+  'ops.ne_del_app_stock_keys()', 'ops.ne_del_csv_bytes(text[])', 'ops.ne_handling_csv_bytes(text[])', 'ops.sku_ref_ne_deleting(bigint[])', 'ops.restrict_ne_del_file_bytes()']);
 
 /**
- * 🆕 0076 (仮の番号・Amazon の出品一覧と「まだつないでいない SKU」・中原さんの頼み 10/12): 画面のロール master_edit が読む表 (出品一覧の今の姿・見出し・隠す印) と、
- *   実行する関数 (隠す / 元に戻す = security definer・最後に売れた日 = 注文の表は読ませない)。表・関数が無い DB (0076 の前) では付けない (流し直すと付く)。
+ * 🆕 0074 (Amazon の出品一覧と「まだつないでいない SKU」・中原さんの頼み 10/12): 画面のロール master_edit が読む表 (出品一覧の今の姿・見出し・隠す印) と、
+ *   実行する関数 (隠す / 元に戻す = security definer・最後に売れた日 = 注文の表は読ませない)。表・関数が無い DB (0074 の前) では付けない (流し直すと付く)。
  *   🚨 渡さない: 出品一覧の表の書き込み (受け口 = 持ち主のロールだけ)・隠す印の表の書き込みと記録の表 (関数だけが書く)
  */
 export const AMAZON_LISTING_SELECT = Object.freeze(['ops.amazon_listing_report', 'ops.amazon_listing_report_loads', 'ops.amazon_sku_hidden']);
@@ -291,7 +303,10 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0070 (NE から消えた商品をやめる): 関数がある DB だけ。前に付けた実行権を外してから、画面 (master_edit) と CLI (master_ops) に付け直す
   for (const f of [...GONE_FUNCTIONS, ...GONE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of GONE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit, master_ops';`));
-  // 🆕 0076 (Amazon の出品一覧): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (記録の表 ops.amazon_sku_hidden_events は読ませない)
+  // 🆕 0072 (NE から消す CSV): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (watcher の確かめ・一覧は migration が付ける = ここでは外さない)
+  for (const f of [...NE_DEL_FUNCTIONS, ...NE_DEL_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of NE_DEL_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0074 (Amazon の出品一覧): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (記録の表 ops.amazon_sku_hidden_events は読ませない)
   for (const t of [...AMAZON_LISTING_SELECT, 'ops.amazon_sku_hidden_events']) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; end if; end $$`);
   for (const t of AMAZON_LISTING_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of AMAZON_LISTING_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
@@ -305,6 +320,8 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   s.push(ifFn(LEASE_VALID_FUNCTION, `execute 'grant execute on function ${LEASE_VALID_FUNCTION} to new_entry_gate';`));
   // 0058: 上の「画面が読む表」の GRANT (ops.ne_reg_exports の表の SELECT) の後に、file_bytes を外して列ごとに付け直す (byte 列は ops.ne_reg_file だけ)
   s.push(RESTRICT_FILE_BYTES_SQL);
+  // 🆕 0072 (#1690 Codex R1 Medium 1): NE から消す CSV の byte 列も同じ (byte 列は ops.ne_del_download だけ)
+  s.push("do $$ begin if to_regprocedure('ops.restrict_ne_del_file_bytes()') is not null then perform ops.restrict_ne_del_file_bytes(); end if; end $$");
   return s;
 }
 

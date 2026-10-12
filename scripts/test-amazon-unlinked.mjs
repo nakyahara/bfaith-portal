@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /**
- * test-amazon-unlinked.mjs — Amazon の出品一覧 (0076 (仮の番号)) と「まだつないでいない Amazon の SKU」(10/12 中原さん) の試験。
+ * test-amazon-unlinked.mjs — Amazon の出品一覧 (0074) と「まだつないでいない Amazon の SKU」(10/12 中原さん) の試験。
  *   PGlite (持ち主のロール deploy で migration・画面のロール master_edit で読む / 隠す) + 本物の router (Company DB の受け口・マスタの入力) を HTTP で +
  *   送り手 (push/amazon-listings.mjs) を本物の履歴の保存 (scripts/mall-items/archive-items.mjs の archiveItems) で作った gz と manifest で回す。
  * 固定する契約:
  *   1 TSV の読み方: 日本語の見出し (日本のマーケットプレイスの今の形)・英語の見出し (SP-API の説明の 1 行目) のどちらでも同じ行になる。出品日 (- と / の表記)・FBA / 自社 (知らない値は null)・
  *     状態・価格 (, を外す)・ASIN (商品ID は ASIN の形のときだけ)。SKU が空・同じ SKU の 2 行目・列の数が違う行は外して数える。seller SKU の列が無い = 例外
  *   2 受け口: 世代 = 取得の時刻。applied → same (同じ世代・中身) / 同じ世代で違う中身 = 409 / 古い世代 = stale / 中身が同じ新しい世代 = refreshed (行は触らない) /
- *     0 行・指紋の食い違い・重複は 400 / 途中で落ちたら全部巻き戻る / 鍵が無ければ 401 / 0076 の前は 409 not_migrated
+ *     0 行・指紋の食い違い・重複は 400 / 途中で落ちたら全部巻き戻る / 鍵が無ければ 401 / 0074 の前は 409 not_migrated
  *   3 送り手: manifest の最後の complete の TSV の回だけ・sha256 が違えば ❌・Render と同じなら送らない・🛑 行が前の 80% 未満は ❌ (--force で越える)・
- *     外した行が多すぎる = ❌・商品名の列が無い = ⚠️ (送る)・取得が古い = ⚠️・0076 の前 = ⚠️ exit 0
- *   4 画面の読み: 「つないでいる」= 出品に構成がある (切替の前の SKU マスタの構成も)。無い・読めない (0076 の前・権限なし・まだ届いていない) を混ぜない。
+ *     外した行が多すぎる = ❌・商品名の列が無い = ⚠️ (送る)・取得が古い = ⚠️・0074 の前 = ⚠️ exit 0
+ *   4 画面の読み: 「つないでいる」= 出品に構成がある (切替の前の SKU マスタの構成も)。無い・読めない (0074 の前・権限なし・まだ届いていない) を混ぜない。
  *     絞り込み (区分・状態・出品日・言葉 = かなの同一視・ASIN)・並び (出品日・最後に売れた日・値の無い行は後ろ)・最後に売れた日 (取り消しを除く)・FBA の在庫 (出品 SKU で結ぶ)
  *   5 隠す: 画面のロールは関数だけ (表に直に書けない)・同じ操作 = same・出品一覧に無い = 404・「その他」は文が要る・記録は追記だけ・元に戻す
  *   6 画面: 一覧 (隠すのボタンは名簿の人だけ・Origin が要る)・seller SKU の画面の「Amazon の出品一覧では」(無い = 何も出さない・読めない = 読めない)・つかいかた・一覧からの入口
@@ -54,9 +54,7 @@ let passed = 0, failed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { failed++; console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
 const quiet = () => {};
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'amzunlinked-test-'));
-const MIG = F.migrationsDir();
 const cleanups = [() => fs.rmSync(TMP, { recursive: true, force: true })];
-if (MIG !== (await import('./company-db/migrate.mjs')).DEFAULT_DIR) cleanups.push(() => fs.rmSync(MIG, { recursive: true, force: true }));
 const NOW = Date.now();
 const TODAY = F.jstToday(NOW);
 const ROWS = F.reportRows(TODAY);
@@ -68,7 +66,7 @@ async function setupDb({ to = null, load = true } = {}) {
   await pg.query(`alter database ${(await pg.query('select current_database() as d')).rows[0].d} owner to deploy`);
   await pg.query('set role deploy');
   const db = pgliteAdapter(pg);
-  await applyMigrations(db, { log: quiet, dir: MIG, ...(to ? { to } : {}) });
+  await applyMigrations(db, { log: quiet, ...(to ? { to } : {}) });
   await createRoles(pg, { watcherPw: 'a', writerPw: 'b' });
   await createMasterEditRoles(pg, {});
   if (load) {
@@ -186,8 +184,8 @@ await ta('新しい世代で中身が違う = 入れ替え (消えた行は消�
   // 戻す (このあとの試験は 6 行で)
   assert.equal((await I.ingestAmazonListings(db, body(parsed.rows, { generation: G2 + 2, report_run_id: 'r_test_5' }), { nowMs: NOW })).status, 'applied');
 });
-await ta('0076 の前の DB = NOT_MIGRATED (受け口・状態・画面の読み = 読めない)', async () => {
-  const E0 = await setupDb({ to: F.versionBefore0076(MIG), load: false });
+await ta('0074 の前の DB = NOT_MIGRATED (受け口・状態・画面の読み = 読めない)', async () => {
+  const E0 = await setupDb({ to: F.VERSION_BEFORE_0074, load: false });
   await assert.rejects(I.ingestAmazonListings(E0.db, body(parsed.rows), { nowMs: NOW }), (e) => e.code === 'NOT_MIGRATED');
   await assert.rejects(I.amazonListingsStatus(E0.db), (e) => e.code === 'NOT_MIGRATED');
   const r = await asRole(E0.pg, 'master_edit', () => U.readAmazonReportFor(E0.db, 'pr_a001'));
@@ -203,7 +201,7 @@ process.env.MIRROR_SYNC_KEY = 'k-test';
 process.env.COMPANY_DB_URL = 'postgres://owner@localhost:5432/test';
 process.env.COMPANY_DB_MASTER_EDIT_URL = 'postgres://master_edit@localhost:5432/test';
 process.env.MASTER_EDITORS = 'Naka@Test';
-let cdbTarget = E;   // 受け口がつなぐ DB (0076 の前の試験で差し替える)
+let cdbTarget = E;   // 受け口がつなぐ DB (0074 の前の試験で差し替える)
 setCdbFactory(async () => ({
   query: async (t, p) => {
     if (p && p.length) return cdbTarget.pg.query(t, p);
@@ -293,19 +291,19 @@ await ta('🛑 送り手: 行が前の 80% 未満は送らない (❌・既存�
   r = await push();
   assert.equal(r.status, 'applied', r.lastLine); assert.equal((await I.amazonListingsStatus(db)).rows, 6);
 });
-await ta('送り手: 商品名の列が無い = 送るが ⚠️ / 取得が古い (36 時間より前) = ⚠️ / 0076 の前の Render = ⚠️ (exit 0 の扱い) / Render の方が新しい = ⚠️ 送らない', async () => {
+await ta('送り手: 商品名の列が無い = 送るが ⚠️ / 取得が古い (36 時間より前) = ⚠️ / 0074 の前の Render = ⚠️ (exit 0 の扱い) / Render の方が新しい = ⚠️ 送らない', async () => {
   const H2 = path.join(TMP, 'hist2');
   const arch2 = (text, at) => archiveItems({ mall: 'amazon', shopId: SHOP_ID, source: 'merchant_listings_all_data', runId: `h2_${crypto.randomBytes(3).toString('hex')}`, fetchedAt: at.toISOString(), format: 'tsv', payload: text, items: 6, dest: H2, noOffsite: true, log: quiet, meta: { enum_status: 'ok' } });
   await arch2(F.buildTsv(ROWS, F.HEADER_JP.filter((h) => h !== '商品名')), new Date(NOW - 40 * 3600e3));
   // Render の方が新しい
   let r = await push({ historyDir: H2 });
   assert.equal(r.ok, true, r.lastLine); assert.equal(r.status, 'remote_newer'); assert.match(r.lastLine, /^⚠️ .*Render の方が新しい/);
-  // 0076 の前の Render
-  const E0 = await setupDb({ to: F.versionBefore0076(MIG), load: false });
+  // 0074 の前の Render
+  const E0 = await setupDb({ to: F.VERSION_BEFORE_0074, load: false });
   cdbTarget = E0;
   try {
     r = await push({ historyDir: H2 });
-    assert.equal(r.ok, true, r.lastLine); assert.equal(r.status, 'not_migrated'); assert.match(r.lastLine, /^⚠️ .*migration 0076 がまだ無い/);
+    assert.equal(r.ok, true, r.lastLine); assert.equal(r.status, 'not_migrated'); assert.match(r.lastLine, /^⚠️ .*migration 0074 がまだ無い/);
   } finally { cdbTarget = E; await E0.pg.close(); }
   // 空の Render へ (別の DB): 商品名の列が無い・古い = ⚠️ で送る
   const E3 = await setupDb({ load: false });

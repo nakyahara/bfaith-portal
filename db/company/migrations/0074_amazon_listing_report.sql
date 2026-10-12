@@ -1,4 +1,4 @@
--- 0076 (仮の番号・マージのときに付け替える): Amazon の出品一覧の今の姿 (出品レポート GET_MERCHANT_LISTINGS_ALL_DATA) と、「まだつないでいない Amazon の SKU」の隠す印 (2026-10-12 中原さん)
+-- 0074: Amazon の出品一覧の今の姿 (出品レポート GET_MERCHANT_LISTINGS_ALL_DATA) と、「まだつないでいない Amazon の SKU」の隠す印 (2026-10-12 中原さん)
 -- 🚨 前提 = 0054 (core.amazon_jp_shop_code・core.amazon_sku_maps)・0013 (core.orders / order_lines)・0004 (ops.ingest_runs)・0001 (core.norm_code・core.make_append_only)
 --
 -- なぜ: Amazon の SKU の対応を作る画面で「Amazon の登録の商品名」を見たい。FBA に登録したのに社内の商品コードとつないでいない SKU を一覧で拾いたい
@@ -35,7 +35,7 @@ create table ops.amazon_listing_report_loads (
   unique (company_id, shop_code, generation)
 );
 create index ix_amazon_listing_report_loads_cur on ops.amazon_listing_report_loads (company_id, shop_code, generation desc);
-comment on table ops.amazon_listing_report_loads is 'Amazon の出品レポート (GET_MERCHANT_LISTINGS_ALL_DATA) の受け取りの見出し (0076)。今の姿 = 店ごとに generation が最大の行。書くのは受け口 apps/company-db/ingest/amazon-listings.mjs だけ';
+comment on table ops.amazon_listing_report_loads is 'Amazon の出品レポート (GET_MERCHANT_LISTINGS_ALL_DATA) の受け取りの見出し (0074)。今の姿 = 店ごとに generation が最大の行。書くのは受け口 apps/company-db/ingest/amazon-listings.mjs だけ';
 
 -- 2. 今の姿の行
 create table ops.amazon_listing_report (
@@ -58,7 +58,7 @@ create table ops.amazon_listing_report (
 );
 create index ix_amazon_listing_report_norm on ops.amazon_listing_report (company_id, shop_code, sku_norm);
 create index ix_amazon_listing_report_load on ops.amazon_listing_report (load_id);
-comment on table ops.amazon_listing_report is 'Amazon の出品レポートの今の姿 (0076)。1 行 = 1 つの seller SKU (原文)。新しい中身が来たら店ごとに丸ごと入れ替える。書くのは受け口だけ';
+comment on table ops.amazon_listing_report is 'Amazon の出品レポートの今の姿 (0074)。1 行 = 1 つの seller SKU (原文)。新しい中身が来たら店ごとに丸ごと入れ替える。書くのは受け口だけ';
 
 -- 3. 隠す印 (「まだつないでいない Amazon の SKU」の一覧の表示だけ)
 create table ops.amazon_sku_hidden (
@@ -73,7 +73,7 @@ create table ops.amazon_sku_hidden (
   primary key (company_id, shop_code, sku_norm),
   constraint ck_amazon_sku_hidden_other_note check (reason <> 'other' or note is not null)
 );
-comment on table ops.amazon_sku_hidden is '「まだつないでいない Amazon の SKU」の一覧で隠す SKU (0076)。表示だけ = Amazon・対応・出品には触らない。書くのは ops.set_amazon_sku_hidden だけ (戻す = 行を消す・記録は ops.amazon_sku_hidden_events)';
+comment on table ops.amazon_sku_hidden is '「まだつないでいない Amazon の SKU」の一覧で隠す SKU (0074)。表示だけ = Amazon・対応・出品には触らない。書くのは ops.set_amazon_sku_hidden だけ (戻す = 行を消す・記録は ops.amazon_sku_hidden_events)';
 create table ops.amazon_sku_hidden_events (
   event_id       bigint generated always as identity primary key,
   company_id     smallint not null,
@@ -88,7 +88,7 @@ create table ops.amazon_sku_hidden_events (
 );
 create index ix_amazon_sku_hidden_events_key on ops.amazon_sku_hidden_events (company_id, shop_code, sku_norm, event_id desc);
 select core.make_append_only('ops', 'amazon_sku_hidden_events');
-comment on table ops.amazon_sku_hidden_events is '隠す・戻す の記録 (0076・追記だけ)。誰が・いつ・なぜ';
+comment on table ops.amazon_sku_hidden_events is '隠す・戻す の記録 (0074・追記だけ)。誰が・いつ・なぜ';
 
 -- 隠す / 戻す (1 件ずつ)。戻り値 = { status: 'hidden' | 'shown' | 'same', seller_sku, sku_norm, reason, note, by, at }
 --   形が外れる = 22023 (画面は 400)・隠す SKU が今の出品一覧に無い = P0002 (画面は 404)・もうつないでいる (構成がある) = P0001 linked (画面は 409)。同じ状態への操作 = same (何も書かない)

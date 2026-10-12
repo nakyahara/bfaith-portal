@@ -6,10 +6,10 @@
  *      区分が分からない行 (列が無い・知らない値) も FBA と言い切れないので出さない。① の seller SKU の画面は自社発送も出す
  *   ③ いらない SKU (バリエーションの親・使っていない古い SKU) を一覧から「隠す」/ 元に戻す (setHidden = ops.set_amazon_sku_hidden。表示だけ・Amazon にも対応にも触らない)
  *
- * 読み元 = Company DB の ops.amazon_listing_report (migration 0076 (仮の番号))。毎朝の daily-sync の「Company DB 出品一覧 (Amazon)」が、
+ * 読み元 = Company DB の ops.amazon_listing_report (migration 0074)。毎朝の daily-sync の「Company DB 出品一覧 (Amazon)」が、
  *   前の夜に想定利益の夜間 (miniPC 23:30) が取った出品レポート (GET_MERCHANT_LISTINGS_ALL_DATA) を送る = 画面の値は「前の夜 23:30 ごろの Amazon」。取得の時刻を必ず出す。
  * 「無い」と「読めない」を混ぜない:
- *   - 読めない (表が無い = 0076 の前・画面のロールに権限が無い・まだ 1 回も届いていない・DB の誤り) = state 'unreadable' + 理由 (画面は「読めない」と出す)
+ *   - 読めない (表が無い = 0074 の前・画面のロールに権限が無い・まだ 1 回も届いていない・DB の誤り) = state 'unreadable' + 理由 (画面は「読めない」と出す)
  *   - 届いた出品一覧にその SKU が無い = state 'absent' (seller SKU の画面は何も出さない)
  *   - 取得が古い (36 時間より前) = stale (値は出すが「古い」の札)
  * 「つないでいる」= Company DB の Amazon (日本) の出品 (core.listings・正規化した seller SKU) に構成 (core.listing_components) が 1 行以上ある。
@@ -49,7 +49,7 @@ export async function readReportLoad(db, { nowMs = Date.now() } = {}) {
   if (!db) return { state: 'unreadable', reason: 'error', message: 'Company DB につながらない' };
   try {
     const t = (await db.query(`select to_regclass('ops.amazon_listing_report') is not null and to_regclass('ops.amazon_listing_report_loads') is not null as ok`)).rows[0];
-    if (!t || !t.ok) return { state: 'unreadable', reason: 'not_migrated', message: 'Company DB に Amazon の出品一覧の表がまだありません (migration 0076 の前)' };
+    if (!t || !t.ok) return { state: 'unreadable', reason: 'not_migrated', message: 'Company DB に Amazon の出品一覧の表がまだありません (migration 0074 の前)' };
     const p = (await db.query(`select has_table_privilege('ops.amazon_listing_report', 'select') and has_table_privilege('ops.amazon_listing_report_loads', 'select') as ok`)).rows[0];
     if (!p || !p.ok) return { state: 'unreadable', reason: 'no_privilege', message: '画面のロールに Amazon の出品一覧を読む権限がまだありません (create-master-edit-roles.mjs の流し直しが要る)' };
     const x = (await db.query(`select load_id::text as load_id, ${TS('snapshot_at')} as snapshot_at, row_count, skipped_count, ${TS('received_at')} as received_at, ${TS('coalesce(refreshed_at, received_at)')} as arrived_at
@@ -216,7 +216,7 @@ export async function setHidden(db, { actor, ...input }) {
     if (code === '22023') throw new MasterWriteError(400, 'invalid_value', msg);
     if (code === 'P0002') throw new MasterWriteError(404, 'not_in_report', `${msg} (毎朝の取り込みの後に、もう一度開いてください)`);
     if (code === '42501') throw new MasterWriteError(503, 'no_privilege', '画面のロールに「隠す」の権限がまだありません (create-master-edit-roles.mjs の流し直しが要る)。何もしていません');
-    if (code === '42883' || code === '42P01') throw new MasterWriteError(503, 'not_migrated', 'Company DB に「隠す」の仕組みがまだありません (migration 0076 の前)。何もしていません');
+    if (code === '42883' || code === '42P01') throw new MasterWriteError(503, 'not_migrated', 'Company DB に「隠す」の仕組みがまだありません (migration 0074 の前)。何もしていません');
     throw e;
   }
 }
