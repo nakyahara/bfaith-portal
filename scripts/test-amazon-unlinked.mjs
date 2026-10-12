@@ -229,7 +229,7 @@ async function archive(text, { at = new Date(NOW - 8 * 3600e3), complete = true,
   assert.ok(['archived', 'exists_same'].includes(r.code), JSON.stringify(r));
   return r;
 }
-const push = (x = {}) => P.pushAmazonListings({ historyDir: HIST, base: CBASE, syncKey: 'k-test', log: quiet, sleep: async () => {}, ...x }).catch((e) => e.result || { ok: false, lastLine: e.message });
+const push = (x = {}) => P.pushAmazonListings({ historyDir: HIST, shopId: SHOP_ID, base: CBASE, syncKey: 'k-test', log: quiet, sleep: async () => {}, ...x }).catch((e) => e.result || { ok: false, lastLine: e.message });
 await ta('受け口 (HTTP): 鍵が無ければ 401 / 検証に通らなければ 400 / 状態 / server.js は鍵の検査と共通 parser の素通りに amazon-listings を入れている', async () => {
   let r = await fetch(`${CBASE}/amazon-listings/status`);
   assert.equal(r.status, 401);
@@ -353,11 +353,44 @@ await ta('送り手の回の選び方 (#1691 Codex R1 M3): 日本の店・取得
     { ...base, run_id: 'outside', file: '../x.tsv.gz', snapshot_at: at(1) },
     { ...base, run_id: 'bad_time', snapshot_at: 'きのう' },
   ];
-  fs.writeFileSync(path.join(H3, 'amazon', 'manifest.jsonl'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n{壊れた行\n');
-  const got = P.latestReportRecord(H3);
-  assert.deepEqual([got.rec.run_id, got.prev.run_id], ['newest', 'older']);
+  // 🚨 同じ日本の marketplace の別のセラーの回 (形は使える回) が主店の回より新しく・後に書かれていても選ばない (#1691 Codex R2 M1)
+  const other = [{ ...base, run_id: 'other_seller_new', shop_id: 'B0THERSELLER1@A1VC38T7YXB528', snapshot_at: at(0.5), items: 999 },
+    { ...base, run_id: 'other_seller_mid', shop_id: 'B0THERSELLER1@A1VC38T7YXB528', snapshot_at: at(3) }];
+  for (const l of other) assert.equal(P.usableRecord(l), true, '形は使える回');
+  fs.writeFileSync(path.join(H3, 'amazon', 'manifest.jsonl'), [...lines, ...other].map((l) => JSON.stringify(l)).join('\n') + '\n{壊れた行\n');
+  const got = P.latestReportRecord(H3, SHOP_ID);
+  assert.deepEqual([got.rec.run_id, got.prev.run_id], ['newest', 'older'], '主店の回だけ・1 つ前の回も主店から');
+  const got2 = P.latestReportRecord(H3, 'B0THERSELLER1@A1VC38T7YXB528');
+  assert.deepEqual([got2.rec.run_id, got2.prev.run_id], ['other_seller_new', 'other_seller_mid']);
+  assert.equal(P.latestReportRecord(H3, 'ZZZZZZZZZZ@A1VC38T7YXB528'), null, '主店の回が無い = null (ほかの店の回を使わない)');
+  for (const bad of [undefined, '', 'unknown@A1VC38T7YXB528', 'A6HMLHKUUJC27@A1F83G8C2ARO7P']) assert.throws(() => P.latestReportRecord(H3, bad), /主店の shop_id/);
   for (const l of lines.slice(2)) assert.equal(P.usableRecord(l), false, l.run_id);
   assert.throws(() => P.readReportText(H3, { ...base, sha256: undefined }), /sha256 が無い/);
+  // 送り手: 主店が決まらない = ❌ (推測で選ばない)・ほかの店の回しか無い = ❌
+  let r = await push({ historyDir: H3, shopId: undefined });
+  assert.equal(r.ok, false); assert.match(r.lastLine, /^❌ .*主店の shop_id が決まらない/);
+  r = await push({ historyDir: H3, shopId: 'ZZZZZZZZZZ@A1VC38T7YXB528' });
+  assert.equal(r.ok, false); assert.match(r.lastLine, /^❌ .*主店 ZZZZZZZZZZ@A1VC38T7YXB528・merchant_listings_all_data・complete・TSV・sha256 つきの回が無い/);
+});
+await ta('主店の shop_id (#1691 Codex R2 M1): 想定利益の夜間と同じ出どころ = expected-profit.db の覚え書き → env SP_API_SELLER_ID・marketplace は env (日本だけ)。無い・形が違う・読めない・日本でない = 送らない', async () => {
+  const D = path.join(TMP, 'epdb'); fs.mkdirSync(D, { recursive: true });
+  const { default: Database } = await import('better-sqlite3');
+  // DB が無い = env
+  assert.deepEqual(P.mainShopId({ dataDir: D, env: { SP_API_SELLER_ID: 'A6HMLHKUUJC27' } }), { shopId: 'A6HMLHKUUJC27@A1VC38T7YXB528', from: 'env' });
+  assert.match(P.mainShopId({ dataDir: D, env: {} }).error, /セラーID が無い/);
+  // 覚え書きの表が無い DB = env (fetch-listings.js の getSetting と同じ)
+  const file = path.join(D, 'expected-profit.db');
+  let x = new Database(file); x.exec('create table other (a)'); x.close();
+  assert.deepEqual(P.mainShopId({ dataDir: D, env: { SP_API_SELLER_ID: 'A6HMLHKUUJC27' } }).from, 'env');
+  assert.match(P.mainShopId({ dataDir: D, env: {} }).error, /セラーID が無い/);
+  // 覚え書きがある = 覚え書きが勝つ (env と違っても)
+  x = new Database(file); x.exec(`create table expected_profit_setting (key text primary key, value text, updated_at text); insert into expected_profit_setting values ('amazon_seller_id', 'A6HMLHKUUJC27', 'x')`); x.close();
+  assert.deepEqual(P.mainShopId({ dataDir: D, env: { SP_API_SELLER_ID: 'B0THERSELLER1' } }), { shopId: 'A6HMLHKUUJC27@A1VC38T7YXB528', from: 'setting' });
+  assert.deepEqual(P.mainShopId({ dataDir: D, env: {} }).shopId, 'A6HMLHKUUJC27@A1VC38T7YXB528');
+  // marketplace が日本でない・セラーID の形が違う・DB が読めない = 送らない
+  assert.match(P.mainShopId({ dataDir: D, env: { SP_API_MARKETPLACE_ID: 'A1F83G8C2ARO7P' } }).error, /日本 .* でない/);
+  assert.match(P.mainShopId({ dataDir: path.join(TMP, 'nope'), env: { SP_API_SELLER_ID: 'unknown' } }).error, /形が違う/);
+  assert.match(P.mainShopId({ dataDir: D, env: {}, openDb: () => { throw new Error('file is not a database'); } }).error, /読めない/);
 });
 await ta('🛑 送り手の初回 (Render に前の回が無い) の安全弁 (#1691 Codex R1 M2): 想定利益の夜間の判定が ok でない回・1 つ前の回の 80% 未満の回は送らない / --force で送る', async () => {
   const E6 = await setupDb({ load: false });

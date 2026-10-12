@@ -11,7 +11,9 @@
  *
  * 決め:
  *   - 🚨 **SP-API は呼ばない** (createReport は 1 分に 1 回の制限・同じレポートを 2 回取らない)。材料は想定利益の夜間が残した原文だけ = 新しい定期実行も無い
- *   - 送るのは manifest の中で「Amazon・日本の店 (<セラーID>@A1VC38T7YXB528)・取得元 merchant_listings_all_data・complete=true・TSV・64 桁の sha256」の回のうち、
+ *   - 🚨 主店 = 想定利益の夜間 (fetch-listings.js の amazonShopId) と同じ出どころ = expected-profit.db の覚え書きのセラーID → env SP_API_SELLER_ID・marketplace は env SP_API_MARKETPLACE_ID (日本だけ)。
+ *     決まらない (無い・読めない・日本でない) = 推測で選ばず ❌ (#1691 Codex R2 M1 = 同じ日本の marketplace の別のセラーの回で主店を置き換えない)
+ *   - 送るのは manifest の中で「Amazon・主店と完全に同じ shop_id・取得元 merchant_listings_all_data・complete=true・TSV・64 桁の sha256」の回のうち、
  *     取得の時刻 (snapshot_at) がいちばん新しい回 (manifest の並びに頼らない・#1691 Codex R1 M3)。部分取得・0 件は archive-items.mjs が complete=false / 保存しない。
  *     gz を開いて sha256 が manifest と合わなければ送らない (❌ = 壊れた・書きかけの履歴を Company DB に入れない)
  *   - 世代 = その回の snapshot_at (レポートを取り終えた時刻 ms)。Render の世代と同じ・中身も同じ = 送らない (✅ 変わりなし)。Render の方が新しい = 送らない (⚠️)
@@ -35,7 +37,9 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { postJson, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { syncBase } from './ne-shipments.mjs';
+import Database from 'better-sqlite3';
 import { listingRowOf, listingChecksum, bySku, canonPrice, SHOP_CODE, MAX_ROWS } from '../ingest/amazon-listings.mjs';
+import { SETTING_AMAZON_SELLER_ID } from '../../expected-profit/db.js';
 
 export const MAX_BODY_BYTES = 11 * 1024 * 1024;   // 受け口の parser は 12MB
 export const GUARD_MIN_ROW_RATIO = 0.8;           // 🛑 行が前の回のこの割合を下回ったら送らない
@@ -136,8 +140,39 @@ export function parseListingReportTsv(text) {
 
 /** 送る回の取得元 = 想定利益の夜間の出品レポート (fetch-listings.js の archiveListings の source) */
 export const REPORT_SOURCE = 'merchant_listings_all_data';
+/** 受け口の店 (SHOP_CODE = main@A1VC38T7YXB528) の marketplace = 日本 */
+export const JP_MARKETPLACE = 'A1VC38T7YXB528';
 /** 店 = 日本のマーケットプレイスの <セラーID>@A1VC38T7YXB528 (fetch-listings.js の amazonShopId。セラーID が分からなかった夜の unknown@… は使わない) */
 export const SHOP_ID_RE = /^[A-Z0-9]{5,20}@A1VC38T7YXB528$/;
+const SELLER_ID_RE = /^[A-Z0-9]{5,20}$/;
+
+/**
+ * 主店の shop_id (#1691 Codex R2 M1 = 同じ日本の marketplace の別のセラーの回で主店を置き換えさせない)。
+ *   想定利益の夜間 (fetch-listings.js の amazonShopId) と同じ出どころ・同じ順:
+ *   セラーID = expected-profit.db の覚え書き (expected_profit_setting の amazon_seller_id・refresh-fees.js の storedSellerId) → 無ければ env SP_API_SELLER_ID /
+ *   marketplace = env SP_API_MARKETPLACE_ID → 無ければ日本。🚨 値をハードコードしない・推測しない
+ * 戻り値 = { shopId, from: 'setting' | 'env' } / { error } (セラーID が無い・形が違う・DB が読めない・marketplace が日本でない = 送らない)
+ */
+export function mainShopId({ dataDir, env = process.env, openDb = (file) => new Database(file, { readonly: true, fileMustExist: true }) } = {}) {
+  let setting = null;
+  const file = dataDir ? path.join(dataDir, 'expected-profit.db') : null;
+  if (file && fs.existsSync(file)) {
+    let db = null;
+    try {
+      db = openDb(file);
+      const has = db.prepare(`select 1 as x from sqlite_master where type = 'table' and name = 'expected_profit_setting'`).get();
+      if (has) setting = db.prepare('select value from expected_profit_setting where key = ?').get(SETTING_AMAZON_SELLER_ID)?.value ?? null;
+    } catch (e) {
+      return { error: `想定利益の DB (expected-profit.db) のセラーID の覚え書きを読めない = 主店が決まらないので送らない: ${String(e.message).slice(0, 120)}` };
+    } finally { try { if (db) db.close(); } catch { /* */ } }
+  }
+  const seller = setting || (env.SP_API_SELLER_ID ? String(env.SP_API_SELLER_ID).trim() : '') || null;
+  if (!seller) return { error: '主店のセラーID が無い (expected-profit.db の覚え書き amazon_seller_id も env SP_API_SELLER_ID も無い) = 推測で選ばないので送らない' };
+  if (!SELLER_ID_RE.test(seller)) return { error: `主店のセラーID の形が違う (${String(seller).slice(0, 30)}) = 送らない` };
+  const market = String(env.SP_API_MARKETPLACE_ID || JP_MARKETPLACE).trim();
+  if (market !== JP_MARKETPLACE) return { error: `env SP_API_MARKETPLACE_ID が日本 (${JP_MARKETPLACE}) でない (${market.slice(0, 30)}) = 受け口の店 (${SHOP_CODE}) と合わないので送らない` };
+  return { shopId: `${seller}@${market}`, from: setting ? 'setting' : 'env' };
+}
 /** manifest の 1 行が送ってよい回か (店・取得元・形式・完走・64 桁の sha256・読める時刻・履歴のフォルダの中のファイル) */
 export function usableRecord(r) {
   return !!r && typeof r === 'object' && r.mall === 'amazon' && r.source === REPORT_SOURCE && typeof r.shop_id === 'string' && SHOP_ID_RE.test(r.shop_id)
@@ -145,22 +180,24 @@ export function usableRecord(r) {
     && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256) && typeof r.snapshot_at === 'string' && Number.isSafeInteger(Date.parse(r.snapshot_at)) && Date.parse(r.snapshot_at) > 0;
 }
 /**
- * manifest.jsonl (archive-items.mjs) から送る回を選ぶ (#1691 Codex R1 M3): usableRecord の中で取得の時刻 (snapshot_at) がいちばん新しい回 (manifest の並びに頼らない)。
- * 戻り値 = { rec, prev } (prev = 同じ店・同じ取得元の 1 つ前の回 = 初回の安全弁の比べる相手) / 無ければ null。壊れた行は飛ばす
+ * manifest.jsonl (archive-items.mjs) から送る回を選ぶ: usableRecord で、店が主店 (shopId) と完全に同じ回 (#1691 Codex R2 M1) の中で、
+ *   取得の時刻 (snapshot_at) がいちばん新しい回 (manifest の並びに頼らない・Codex R1 M3)。
+ * 戻り値 = { rec, prev } (prev = 同じ主店・同じ取得元の 1 つ前の回 = 初回の安全弁の比べる相手) / 無ければ null。壊れた行は飛ばす
  */
-export function latestReportRecord(historyDir) {
+export function latestReportRecord(historyDir, shopId) {
+  if (typeof shopId !== 'string' || !SHOP_ID_RE.test(shopId)) throw new Error(`主店の shop_id が無い・形が違う: ${String(shopId).slice(0, 40)}`);
   const mf = path.join(historyDir, 'amazon', 'manifest.jsonl');
   if (!fs.existsSync(mf)) return null;
   const recs = [];
   for (const line of fs.readFileSync(mf, 'utf8').split(/\r?\n/)) {
     if (!line.trim()) continue;
     let r; try { r = JSON.parse(line); } catch { continue; }
-    if (usableRecord(r)) recs.push(r);
+    if (usableRecord(r) && r.shop_id === shopId) recs.push(r);
   }
   if (!recs.length) return null;
   const at = (r) => Date.parse(r.snapshot_at);
   const rec = recs.reduce((a, b) => (at(b) >= at(a) ? b : a));
-  const older = recs.filter((r) => r.shop_id === rec.shop_id && at(r) < at(rec));
+  const older = recs.filter((r) => at(r) < at(rec));
   const prev = older.length ? older.reduce((a, b) => (at(b) >= at(a) ? b : a)) : null;
   return { rec, prev };
 }
@@ -186,14 +223,16 @@ const fmtJst = (ms) => { const d = new Date(ms + 9 * 3600e3); return `${d.getUTC
  *   status = 'applied' | 'same' | 'refreshed' | 'unchanged' | 'remote_newer' | 'not_migrated' | 'dry-run' | null。送信の失敗は例外 (CLI が ❌)
  * 差し替え (試験): fetchImpl / sleep / now
  */
-export async function pushAmazonListings({ historyDir, fetchImpl = fetch, base, syncKey, dryRun = false, force = false, log = console.log, sleep, now = () => Date.now() } = {}) {
+export async function pushAmazonListings({ historyDir, shopId, fetchImpl = fetch, base, syncKey, dryRun = false, force = false, log = console.log, sleep, now = () => Date.now() } = {}) {
   if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
   if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
   const out = { ok: false, status: null, rows: 0, skipped: 0, missing: [], generation: null, remote: null, record: null, lastLine: '', warn: [] };
   let err = null;
   try {
-    const picked = latestReportRecord(historyDir);
-    if (!picked) throw new Error(`Amazon の出品レポートの履歴が無い (${path.join(historyDir, 'amazon', 'manifest.jsonl')} に 日本の店・${REPORT_SOURCE}・complete・TSV・sha256 つきの回が無い = 想定利益の夜間がまだ一度も保存していない)`);
+    if (typeof shopId !== 'string' || !SHOP_ID_RE.test(shopId)) throw new Error(`主店の shop_id が決まらない (${String(shopId ?? 'なし').slice(0, 60)}) = 推測で選ばないので送らない`);
+    out.shopId = shopId;
+    const picked = latestReportRecord(historyDir, shopId);
+    if (!picked) throw new Error(`Amazon の出品レポートの履歴が無い (${path.join(historyDir, 'amazon', 'manifest.jsonl')} に 主店 ${shopId}・${REPORT_SOURCE}・complete・TSV・sha256 つきの回が無い = 想定利益の夜間がまだ一度も保存していない)`);
     const { rec, prev } = picked;
     out.record = { file: rec.file, snapshot_at: rec.snapshot_at, run_id: rec.run_id };
     const generation = Date.parse(rec.snapshot_at);
@@ -288,7 +327,10 @@ if (isMain) {
     const dataDir = process.env.DATA_DIR || path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'data');
     const historyDir = a.historyDir || path.join(dataDir, 'mall-items-history');
     let r;
-    try { r = await pushAmazonListings({ historyDir, base: syncBase(), syncKey: process.env.MIRROR_SYNC_KEY || '', dryRun: a.dryRun, force: a.force }); }
+    // 主店 = 想定利益の夜間と同じ出どころ (expected-profit.db の覚え書き → env)。決まらない = shopId に理由を入れて ❌ (pushAmazonListings が断る)
+    const shop = mainShopId({ dataDir });
+    if (shop.error) throw new Error(shop.error);
+    try { r = await pushAmazonListings({ historyDir, shopId: shop.shopId, base: syncBase(), syncKey: process.env.MIRROR_SYNC_KEY || '', dryRun: a.dryRun, force: a.force }); }
     catch (e) { r = e.result || { ok: false, lastLine: `❌ Company DB 出品一覧 (Amazon): ${String(e.message).replace(/\s+/g, ' ').slice(0, 300)}` }; }
     console.log(String(r.lastLine).replace(/\s+/g, ' '));   // 最後の 1 行を複数行にしない (daily-sync が朝の通知に載せる)
     code = r.ok ? 0 : 1;
