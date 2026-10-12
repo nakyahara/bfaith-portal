@@ -25,15 +25,27 @@ import { parentObservations, parentObsTrust, readParentCounts, repSpellingsOf, P
  * @returns {Promise<{ ne_fetch: object, counts, counted, excluded, obs, items, gate }>}
  */
 export async function driftList({ ne, db }) {
+  const { obs, meta: M, integ } = neParentObservations(ne);
+  if ((await db.query("select to_regprocedure('ops.parent_raw_gate(integer, jsonb, boolean)') is not null as ok")).rows[0].ok !== true) {
+    throw new Error('Company DB に ops.parent_raw_gate が無い (0068 の前)');
+  }
+  const r = await readParentCounts(db, obs, { detail: true });
+  return { ne_fetch: { products_complete_at: M.ne_api_products_complete_at, setproducts_complete_at: M.ne_api_setproducts_complete_at,
+    rows_dropped: integ.absenceUntrusted }, ...r };
+}
+
+/**
+ * 🆕 NE の完全な取得 (readNeSide の答え) → 代表の観測 (parent-obs-v1・照合 ② と同じ読み方と許可の一覧)。読むだけ・DB に触らない。
+ *   確かめられない (取得が無い・完了の印が無い・整合が読めない・台帳が読めない・許可の一覧が ok でない) = throw。戻り値 { obs, meta (sync_meta), integ }。
+ *   drift-list と一回きりの scripts/company-db/once-variation-group-from-ne.mjs が同じものを使う
+ */
+export function neParentObservations(ne) {
   if (!ne || ne.error) throw new Error(`NE の取得を読めない (${ne ? ne.error : 'なし'})`);
   if (!ne.hasSrc) throw new Error('warehouse.db が古い (元の値 *_src の列が無い)');
   const M = ne.meta || {};
   if (!M.ne_api_products_complete_at || !M.ne_api_setproducts_complete_at) throw new Error('NE の取得の完了の印が無い (取得の途中・失敗) = 数えない');
   const integ = neIntegrity(M);
   if (!integ) throw new Error('取込の整合 (ne_api_*_integrity) を読めない = 数えない');
-  if ((await db.query("select to_regprocedure('ops.parent_raw_gate(integer, jsonb, boolean)') is not null as ok")).rows[0].ok !== true) {
-    throw new Error('Company DB に ops.parent_raw_gate が無い (0068 の前)');
-  }
   const { m: nm, collided } = nModelOf(ne);
   // 🆕 #1676 Codex R2 High: 代表の名前空間の書き方の台帳を読めない = 数えない (空 = 「衝突なし」と読まない)
   const sp = repSpellingsOf(resolveNeCodes(ne.spellings));
@@ -42,9 +54,7 @@ export async function driftList({ ne, db }) {
   const trust = parentObsTrust({ fetch_counts: ne.fetchCounts, integrity: integ, kind_gate: { integrity_untrusted: neIntegrityRows(ne, integ.intBlocked).integrityRows }, rep_spellings: sp });
   if (!trust.complete) throw new Error(`NE の取得を確かめられない (${trust.reasons.join(', ')}) = 数えない (どのコードか特定できない。取得の件数・取込の整合を確かめて取り直す)`);
   const obs = parentObservations(nm, { untrusted: [...collided, ...integ.intBlocked.keys()], trust, repSpellings: sp });
-  const r = await readParentCounts(db, obs, { detail: true });
-  return { ne_fetch: { products_complete_at: M.ne_api_products_complete_at, setproducts_complete_at: M.ne_api_setproducts_complete_at,
-    rows_dropped: integ.absenceUntrusted }, ...r };
+  return { obs, meta: M, integ };
 }
 
 const CLASS_RE = new RegExp(`^(${PARENT_COUNT_KEYS.join('|')})$`);

@@ -1513,9 +1513,14 @@ export const JOBS_REGISTRY = [
     where: 'bfaith-portal リポジトリ (miniPC で手で dry-run → 中原さんの OK → --apply --expect-hash を 1 回)',
     remove_by: '2026-11-30',
     lifecycle: 'temporary',
-    runbook: 'dry-run (watcher) の表を中原さんが見る (選択肢名 = 商品名の最後の【】・軸の名前 = カラー) → OK なら --apply --expect-hash <dry-run のハッシュ> --actor <メール> --yes (COMPANY_DB_URL) → '
-      + 'product-hub のボードを開くとまとまりで 1 枚のカード。済んだら 2 ファイルを消す PR を出し、このエントリも消す。'
-      + '同じ形のまとまり (例 sanrio3soupk・smhc) を直すかは中原さんが決める (直すなら --group を変えて同じ手順)',
+    runbook: '🚨 代表 (products.parent) の切替 (widen) の後だけ書ける (前は「切替の後に流す」で止まる)。'
+      + '① 照合 ② (daily-sync のマスタ照合) が今日の NE の取得で済んだ後に dry-run (watcher・--group fuwear --actor <メール>) → 表を中原さんが見る (選択肢名 = 商品名の最後の【】・軸の名前 = カラー) → '
+      + '② OK なら同じ --actor で --apply --expect-hash <dry-run のハッシュ> --yes (COMPANY_DB_URL)。commit の答えが分からないと出たら、出た「書けた / 書けていない / 分からない」に従う '
+      + '(分からない = select status from ops.master_edit_requests where request_id = <出た request_id> で確かめる) → '
+      + '③ product-hub のボードを開く → select status, result ->> \'outcome\', error from ops.product_hub_outbox where group_product_id = <まとまり> で done (created / linked) を確かめる。'
+      + 'conflict = 同じコードのカードがほかの商品・まとまりに結ばれている / 2 枚ある: 自動で直さない。product-hub で古いカードを確かめて片付け (除外・コードを外す) てから、'
+      + 'Render で runGroupOutbox (lib/product-hub-outbox.mjs) を manual で 1 回流す (Claude に頼む)。'
+      + '済んだら 2 ファイルを消す PR を出し、このエントリも消す。許可の一覧 = fuwear・sanrio3soupk・smhc (直すかは中原さんが決める)',
   },
   {
     id: 'lz-gas-rollback',
