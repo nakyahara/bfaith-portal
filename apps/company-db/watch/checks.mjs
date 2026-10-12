@@ -27,7 +27,7 @@ export function plannedKeys(config) {
   // 定義の順番の約束: depends の相手は先に評価される (後ろにあると「未評価」で blocked のまま = 定義の誤り)
   const seen = new Set();
   for (const c of config.CHECKS) {
-    for (const dep of c.depends || []) { const id = dep.endsWith(':*') ? dep.slice(0, -2) : dep; if (!seen.has(id)) throw new Error(`定義の順番が違う: ${c.id} の前提 ${id} が先に無い (config/watch-checks.mjs の CHECKS)`); }
+    for (const dep of c.depends || []) { const id = dep.split(':')[0]; if (!seen.has(id)) throw new Error(`定義の順番が違う: ${c.id} の前提 ${id} が先に無い (config/watch-checks.mjs の CHECKS)`); }
     seen.add(c.id);
   }
   for (const c of config.CHECKS) {
@@ -45,6 +45,11 @@ export function plannedKeys(config) {
     else if (c.id === 'W10') { for (const k of config.W10_KINDS) keys.push({ checkId: c.id, scopeKey: w10KindKey(k) }); keys.push({ checkId: c.id, scopeKey: W10_OTHER }); }
     else if (c.id === 'W14') for (const s of config.AD_SPEND_SCOPES || []) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(s.mall, s.scope) });
     else if (c.id === 'W15') for (const s of config.W15_SCOPES || []) keys.push({ checkId: c.id, scopeKey: s });
+  }
+  // scope を名指しした前提 ('W9:rakuten/main') は予定の評価キーにあること (書き誤り = 毎朝「評価されていない」で blocked を続けない。定義の誤りとして止める)
+  for (const c of config.CHECKS) for (const dep of c.depends || []) {
+    const cut = dep.indexOf(':'), scope = cut < 0 ? null : dep.slice(cut + 1);
+    if (scope && scope !== '*' && !keys.some((k) => k.checkId === dep.slice(0, cut) && k.scopeKey === scope)) throw new Error(`定義の誤り: ${c.id} の前提 ${dep} の評価キーが無い (config/watch-checks.mjs の CHECKS・W6_REQUIRED_SALES)`);
   }
   return keys;
 }
@@ -268,7 +273,8 @@ export async function evalW5(ctx, check) {
 export const W6_MAX_SET_DEPTH = 5;
 const W6_SOLD = `
   with recursive s as (select row_number() over (order by date_jst, listing_id, sku_id) as sid, listing_id, sku_id, (units_ordered - units_cancelled)::bigint as units, date_jst from mart.v_sales_daily
-              where company_id = $1::smallint and date_jst between $2::date and $3::date and units_ordered - units_cancelled > 0),
+              where company_id = $1::smallint and date_jst between $2::date and $3::date and units_ordered - units_cancelled > 0
+                and not ((mall || '/' || scope_key) = any($4::text[]))),   -- $4 = 今朝そろっていないので除いたモール (前提にしないモールだけ。10/11)
        u0 as (select sid, sku_id, units, date_jst from s where sku_id is not null
              union all select s.sid, c.sku_id, s.units * c.qty, s.date_jst from s join core.listing_components c on c.company_id = $1::smallint and c.listing_id = s.listing_id where s.sku_id is null),
        -- 🚨 NE のセット商品の SKU (sku_kind = 'set') は在庫を持たない (在庫は構成品側) → core.sku_components で末端 (単品) まで構成品 × 数量に展開する (入れ子のセットも。循環は path で止める。Codex #1433 R1)
@@ -285,6 +291,29 @@ const W6_SOLD = `
        bad as (select sid from s where sku_id is null and (listing_id is null or not exists (select 1 from core.listing_components c where c.company_id = $1::smallint and c.listing_id = s.listing_id))
                union select sid from node where sku_kind = 'set' and (not has_comp or has_cycle or depth >= ${W6_MAX_SET_DEPTH})),
        sold as (select sku_id, sum(units)::bigint as units, count(distinct date_jst)::int as days, max(date_jst)::text as last_day from u group by sku_id)`;   // 日付を持ったまま合算 = 販売日数は直接 + セットの和集合
+/**
+ * W6 の対象 (10/11): 窓の中に倉庫 (logizard の qty > 0) か FBA JP (fba_available > 0) に一度でも在庫の記録がある SKU (stocked)。
+ *   source ごとの窓 = w6StockWindows (販売の窓と同じ 28 日 = asOf−28 〜 asOf−1。頭は監視の開始日 since で切る)。記録のある日 (complete・partial) の行だけ読む (building・missing の日は読まない)
+ *   n = 窓の配列の最初の引数の番号 ($n source / $n+1 scope / $n+2 from / $n+3 to。$1 = company)。WITH の中の 1 つの CTE として置く
+ */
+const w6StockedCte = (n) => `stocked as (select distinct d.sku_id from snapshots.sku_stock_daily d
+         join unnest($${n}::text[], $${n + 1}::text[], $${n + 2}::date[], $${n + 3}::date[]) as w(source, scope, d_from, d_to) on d.source = w.source and d.scope_key = w.scope and d.snapshot_date between w.d_from and w.d_to
+         join snapshots.stock_capture_days c on c.company_id = d.company_id and c.snapshot_date = d.snapshot_date and c.source = d.source and c.scope_key = d.scope_key and c.status in ('complete', 'partial')
+        where d.company_id = $1::smallint and d.sku_id is not null and (case when d.source like 'fba%' then coalesce(d.fba_available, 0) else d.qty end) > 0)`;
+/** W6 の在庫の記録を読む窓 (source ごと)。since (STOCK_SCOPES) より前の日は読まない (在庫日次を作る前・fba.db の事故の跡) */
+export function w6StockWindows(config, asOf) {
+  const salesFrom = addDays(asOf, -config.W6_SALES_DAYS), salesTo = addDays(asOf, -1);   // 販売の窓 (evalW6 の from / to と同じ)
+  // 終わりは source の対象日と販売の窓の終わり (昨日) の早い方 = FBA JP (対象日 = 今日) も 28 日 (Codex #1687 R1 Low 1)
+  return config.STOCK_SCOPES.filter((s) => config.W6_SCOPE.sources.includes(s.source))
+    .map((s) => { const own = addDays(asOf, s.dayOffset); return { source: s.source, scope: s.scope, from: [salesFrom, s.since || ''].reduce((a, b) => (a > b ? a : b)), to: own < salesTo ? own : salesTo }; })
+    .filter((w) => w.from <= w.to);
+}
+const w6WindowParams = (ws) => [ws.map((w) => w.source), ws.map((w) => w.scope), ws.map((w) => w.from), ws.map((w) => w.to)];
+/** W6 の前提にするモール (check.depends の 'W9:<scope>'。'W9:*' なら全部) */
+export function w6RequiredSales(check) {
+  const deps = check.depends || [];
+  return { all: deps.includes('W9:*'), scopes: deps.filter((d) => d.startsWith('W9:') && d !== 'W9:*').map((d) => d.slice(3)) };
+}
 export async function evalW6(ctx, check) {
   const { db, config, asOf, openIssues = [] } = ctx;
   const scopeKey = scopeKeyOf('all', config.W6_SCOPE.scope), to = addDays(asOf, -1), from = addDays(to, -(config.W6_SALES_DAYS - 1));
@@ -295,56 +324,116 @@ export async function evalW6(ctx, check) {
   r.observed = { sales_from: from, sales_to: to, warehouse_as_of: st.w_as_of, fba_jp_as_of: st.f_as_of, skus: st.skus };
   if (!st.skus) { r.verdict = 'blocked'; r.reason = 'SKU が 1 つも無い (core.skus)'; return [r]; }
   if (st.w_null || st.f_null) { r.verdict = 'blocked'; r.reason = `在庫が不明 (complete な日が無い: ${st.w_null ? '倉庫 ' : ''}${st.f_null ? 'FBA JP' : ''})`; return [r]; }
-  // 🚨 販売履歴の完全性: 窓の中に「注文があるのに未公開の日」や開いた session があれば、未公開の売上を「売れていない」と読まない = blocked
-  //   売上日次を公開しないモール (Yahoo = salesDaily: false) は確かめない = その販売はまだ数えていない (observed.sales_not_published に残す)
+  // 🚨 販売履歴の完全性: 窓の中に「注文があるのに未公開の日」や開いた session があれば、未公開の売上を「売れていない」と読まない
+  //   前提にするモール (W6_REQUIRED_SALES = depends の 'W9:<scope>') = blocked / ほかのモール = 今朝の W9 が pass でない・窓の中に未公開の日・開いた session があれば、
+  //   そのモールの売上を除いて判定する (observed.excluded_sales と理由に残す。10/11 = 小さいモールの push が無いだけで止まらない)
+  //   売上日次を公開しないモール (salesDaily: false) は確かめない = その販売はまだ数えていない (observed.sales_not_published に残す)
   const pubMalls = config.ORDER_MALLS.filter((m) => m.salesDaily !== false);
-  const malls = pubMalls.map((m) => m.mall), scopes = pubMalls.map((m) => m.scope);
+  const req = w6RequiredSales(check);
+  const isRequired = (k) => req.all || req.scopes.includes(k);
+  const excluded = new Map();   // 除いたモール (mall/scope) → 理由
+  if (ctx.priorResult) {   // engine から呼ばれたとき (先に評価した W9 の結果がある)。評価を直接呼ぶ試験では下の未公開の日・session だけを見る
+    for (const m of pubMalls) {
+      const k = scopeKeyOf(m.mall, m.scope);
+      if (isRequired(k)) continue;
+      const w9 = ctx.priorResult('W9', k);
+      if (!w9 || w9.verdict !== 'pass') excluded.set(k, w9 ? `W9 が ${w9.verdict}${w9.reason ? `: ${String(w9.reason).slice(0, 80)}` : ''}` : 'W9 が評価されていない');
+    }
+  }
+  const checked = pubMalls.filter((m) => !excluded.has(scopeKeyOf(m.mall, m.scope)));
+  const malls = checked.map((m) => m.mall), scopes = checked.map((m) => m.scope);
   const gaps = await rowsOf(db, `with d as (select generate_series($2::date, $3::date, interval '1 day')::date as day), m as (select unnest($4::text[]) as mall, unnest($5::text[]) as scope)
-    select m.mall || '/' || m.scope || ' ' || d.day::text as k from m, d
+    select m.mall || '/' || m.scope as sk, d.day::text as day from m, d
      where exists (select 1 from core.orders o where o.company_id = $1::smallint and o.mall = m.mall and o.scope_key = m.scope and o.order_date_jst = d.day)
        and not exists (select 1 from mart.sales_daily_published p where p.company_id = $1::smallint and p.mall = m.mall and p.scope_key = m.scope and p.date_jst = d.day)
-     order by 1`, [config.COMPANY_ID, from, to, malls, scopes]);
+     order by 1, 2`, [config.COMPANY_ID, from, to, malls, scopes]);
   const openSessions = await rowsOf(db, `select mall || '/' || scope_key as k from mart.sales_daily_state where company_id = $1::smallint and session_id is not null and mall = any($2::text[]) order by 1`, [config.COMPANY_ID, malls]);
+  for (const g of gaps) if (!isRequired(g.sk) && !excluded.has(g.sk)) { const n = gaps.filter((x) => x.sk === g.sk).length; excluded.set(g.sk, `窓の中に注文があるのに未公開の日 ${n} (${g.day}${n > 1 ? ' ほか' : ''})`); }
+  for (const x of openSessions) if (!isRequired(x.k) && !excluded.has(x.k)) excluded.set(x.k, '開いた session');
+  const blockGaps = gaps.filter((g) => isRequired(g.sk)), blockSessions = openSessions.filter((x) => isRequired(x.k));
   r.observed.unpublished_days = gaps.length; r.observed.open_sessions = openSessions.map((x) => x.k);
+  r.observed.required_sales = req.all ? ['*'] : req.scopes;
+  r.observed.excluded_sales = [...excluded].map(([scope, why]) => ({ scope, why }));
   r.observed.sales_not_published = config.ORDER_MALLS.filter((m) => m.salesDaily === false).map((m) => scopeKeyOf(m.mall, m.scope));
-  if (gaps.length || openSessions.length) {
+  const exNote = excluded.size ? `今朝の分が無いので除いた: ${[...excluded].map(([k, why]) => `${k} (${why})`).join(' / ')}` : null;
+  if (blockGaps.length || blockSessions.length) {
     r.verdict = 'blocked';
-    r.reason = `売上日次が窓の全部で公開されていない (${gaps.length ? `注文があるのに未公開の日 ${gaps.length}: ${gaps.slice(0, 3).map((x) => x.k).join(', ')}${gaps.length > 3 ? ' ほか' : ''}` : ''}${gaps.length && openSessions.length ? ' / ' : ''}${openSessions.length ? `開いた session: ${openSessions.map((x) => x.k).join(', ')}` : ''}) = 未公開の売上を「売れていない」と読まない`;
+    r.reason = `売上日次が窓の全部で公開されていない (${blockGaps.length ? `注文があるのに未公開の日 ${blockGaps.length}: ${blockGaps.slice(0, 3).map((x) => `${x.sk} ${x.day}`).join(', ')}${blockGaps.length > 3 ? ' ほか' : ''}` : ''}${blockGaps.length && blockSessions.length ? ' / ' : ''}${blockSessions.length ? `開いた session: ${blockSessions.map((x) => x.k).join(', ')}` : ''}) = 未公開の売上を「売れていない」と読まない${exNote ? ` / ${exNote}` : ''}`;
     return [r];
   }
+  // 引数 = $1 会社 / $2〜$3 販売の窓 / $4 除いたモール / $5〜$8 在庫の記録を読む窓 (w6StockedCte)
+  const ws = w6StockWindows(config, asOf);
+  const P = [config.COMPANY_ID, from, to, [...excluded.keys()], ...w6WindowParams(ws)];
+  const SOLD = `${W6_SOLD},
+       ${w6StockedCte(5)}`;
+  r.observed.stock_windows = ws.map((w) => `${w.source}/${w.scope} ${w.from}..${w.to}`);
   // SKU に展開できない正味の販売 (listing にも当たらない・構成が無い) の割合。多ければ「販売履歴が不完全」= blocked。少なければ観測に残す
-  const un = await oneOf(db, `${W6_SOLD} select (select coalesce(sum(units), 0) from s) as total_units, (select count(*) from sold) as sold_skus,
+  const un = await oneOf(db, `${SOLD} select (select coalesce(sum(units), 0) from s) as total_units, (select count(*) from sold) as sold_skus,
+      (select count(*) from sold where sku_id in (select sku_id from stocked)) as sold_stocked_skus, (select count(*) from stocked) as stocked_skus,
       (select coalesce(sum(s.units), 0) from s where s.sid in (select sid from bad)) as unexpanded_units, (select count(*) from (select distinct sid from bad) z) as unexpanded_rows,
-      (select count(distinct sku_id) from node where sku_kind = 'set' and not has_comp) as sets_without_components`, [config.COMPANY_ID, from, to]);
+      (select count(distinct sku_id) from node where sku_kind = 'set' and not has_comp) as sets_without_components`, P);
   const unexpandedShare = Number(un.total_units) > 0 ? Number(un.unexpanded_units) / Number(un.total_units) : 0;
-  r.observed.sold_skus = Number(un.sold_skus); r.observed.total_units = Number(un.total_units); r.observed.unexpanded_units = Number(un.unexpanded_units); r.observed.unexpanded_rows = Number(un.unexpanded_rows); r.observed.sets_without_components = Number(un.sets_without_components); r.observed.unexpanded_share = Math.round(unexpandedShare * 10000) / 10000;
-  r.sampleSize = Number(un.sold_skus);
-  if (unexpandedShare > config.W6_MAX_UNEXPANDED_SHARE) { r.verdict = 'blocked'; r.reason = `SKU に展開できない販売が正味数量の ${(unexpandedShare * 100).toFixed(1)}% (上限 ${config.W6_MAX_UNEXPANDED_SHARE * 100}%) = 販売履歴が不完全 (出品と SKU の紐付け = product-hub)`; return [r]; }
-  const rows = await rowsOf(db, `${W6_SOLD}
-    select s.sku_id, k.code, k.name, k.handling, s.units, s.days, s.last_day, v.warehouse_qty, v.warehouse_allocated_qty, v.fba_jp_available, v.fba_jp_inbound
+  r.observed.sold_skus = Number(un.sold_skus); r.observed.sold_stocked_skus = Number(un.sold_stocked_skus); r.observed.stocked_skus = Number(un.stocked_skus);
+  r.observed.total_units = Number(un.total_units); r.observed.unexpanded_units = Number(un.unexpanded_units); r.observed.unexpanded_rows = Number(un.unexpanded_rows); r.observed.sets_without_components = Number(un.sets_without_components); r.observed.unexpanded_share = Math.round(unexpandedShare * 10000) / 10000;
+  r.sampleSize = Number(un.sold_stocked_skus);   // 判定の対象 = 売れた SKU のうち窓の中に在庫の記録があるもの
+  if (unexpandedShare > config.W6_MAX_UNEXPANDED_SHARE) { r.verdict = 'blocked'; r.reason = `SKU に展開できない販売が正味数量の ${(unexpandedShare * 100).toFixed(1)}% (上限 ${config.W6_MAX_UNEXPANDED_SHARE * 100}%) = 販売履歴が不完全 (出品と SKU の紐付け = product-hub)${exNote ? ` / ${exNote}` : ''}`; return [r]; }
+  // 🚨 窓の中に在庫の記録が 1 つも無い = 在庫の日次が読めていない (在庫を持たない商品と見分けられない) → 全部を「対象外」にして pass にしない
+  if (Number(un.sold_skus) > 0 && Number(un.stocked_skus) === 0) { r.verdict = 'blocked'; r.reason = `窓の中 (${r.observed.stock_windows.join(' / ') || '窓なし'}) に倉庫・FBA JP の在庫の記録が 1 つも無い = 在庫を持たない商品と見分けられない`; return [r]; }
+  const rows = await rowsOf(db, `${SOLD}
+    select s.sku_id, k.code, k.name, k.handling, s.units, s.days, s.last_day, v.warehouse_qty, v.warehouse_allocated_qty, v.fba_jp_available, v.fba_jp_inbound,
+           exists (select 1 from stocked t where t.sku_id = s.sku_id) as stocked
       from sold s join mart.v_sku_stock v on v.company_id = $1::smallint and v.sku_id = s.sku_id join core.skus k on k.company_id = $1::smallint and k.sku_id = s.sku_id
      where coalesce(v.warehouse_qty, 0) + coalesce(v.fba_jp_available, 0) = 0 and k.handling <> 'discontinued' and k.sku_kind <> 'set'   -- セットの中のセット (構成品がセット) も在庫を持たない = 判定しない
-     order by s.units desc, s.sku_id`, [config.COMPANY_ID, from, to]);
-  r.items = rows.map((x) => ({ subjectType: 'sku', subjectKey: String(x.sku_id), payload: { code: x.code, name: String(x.name || '').slice(0, 60), units: Number(x.units), days_sold: x.days, last_sold: x.last_day, warehouse_qty: x.warehouse_qty, warehouse_allocated_qty: x.warehouse_allocated_qty, fba_jp_available: x.fba_jp_available, fba_jp_inbound: x.fba_jp_inbound, weight: Number(x.units) } }));
-  r.itemTotal = rows.length;
-  r.observed.out_of_stock = rows.length; r.observed.top = rows.slice(0, 3).map((x) => `${x.code} (${x.units})`);
+     order by s.units desc, s.sku_id`, P);
+  // 在庫 0 のうち、窓の中に在庫の記録が一度も無い SKU (直送・取り寄せ・在庫を持たない選べるセット) は数えない = 観測にだけ残す (9/24 の定義・10/7 の見直し: 81 件のうち 35 件)
+  // 🚨 ただし今の版 (v3) で開いている案件 (在庫あり → 0 で開いた本物の欠品) は、最後の在庫の記録が窓から外れても数え続ける = 売上が窓から消える・廃番・在庫が入る まで継続
+  //    (28 日入荷しない長期の欠品を「在庫を持たない商品」と取り違えて閉じない。Codex #1687 R1 Medium 1)。前の版で開いた案件は engine の「規則の変更で閉じた」に任せる
+  const keepOpen = new Set(openIssues.filter((i) => i.check_id === check.id && i.scope_key === scopeKey && i.subject_type === 'sku' && (i.last_check_version == null || i.last_check_version === check.version)).map((i) => i.subject_key));
+  const hit = rows.filter((x) => x.stocked || keepOpen.has(String(x.sku_id))), noStock = rows.filter((x) => !x.stocked && !keepOpen.has(String(x.sku_id)));
+  const kept = hit.filter((x) => !x.stocked);
+  r.items = hit.map((x) => ({ subjectType: 'sku', subjectKey: String(x.sku_id), payload: { code: x.code, name: String(x.name || '').slice(0, 60), units: Number(x.units), days_sold: x.days, last_sold: x.last_day, warehouse_qty: x.warehouse_qty, warehouse_allocated_qty: x.warehouse_allocated_qty, fba_jp_available: x.fba_jp_available, fba_jp_inbound: x.fba_jp_inbound, stocked_in_window: !!x.stocked, weight: Number(x.units) } }));
+  r.itemTotal = hit.length;
+  r.observed.out_of_stock = hit.length; r.observed.top = hit.slice(0, 3).map((x) => `${x.code} (${x.units})`);
+  r.observed.kept_open_without_stock_record = kept.length;
+  // 数えない SKU は全件を観測に残す (SKU・コード・28 日の数量。新商品・監視の開始前からの欠品が混ざっていないかを後で判断する材料 = Codex #1687 R1 Medium 2。多すぎれば上限で切って残りの件数を残す)
+  const noStockMax = config.W6_NO_STOCK_OBSERVED_MAX ?? 1000;
+  r.observed.no_stock_in_window = noStock.length; r.observed.no_stock_in_window_units = noStock.reduce((a, x) => a + Number(x.units), 0); r.observed.no_stock_in_window_top = noStock.slice(0, 5).map((x) => `${x.code} (${x.units})`);
+  r.observed.no_stock_in_window_items = noStock.slice(0, noStockMax).map((x) => ({ sku_id: String(x.sku_id), code: x.code, units: Number(x.units) }));
+  r.observed.no_stock_in_window_omitted = Math.max(noStock.length - noStockMax, 0);
   r.inputGeneration = { warehouse_as_of: st.w_as_of, fba_jp_as_of: st.f_as_of };
   // 🚨 open の案件 (SKU) が今回の明細に無いとき、「在庫が入った (回復)」と「監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)」を分ける (engine は outOfScope を回復にしない)
   const inItems = new Set(r.items.map((i) => i.subjectKey));
-  const mine = openIssues.filter((i) => i.check_id === check.id && i.scope_key === scopeKey && i.subject_type === 'sku' && !inItems.has(i.subject_key)).map((i) => i.subject_key);
+  const mineIssues = openIssues.filter((i) => i.check_id === check.id && i.scope_key === scopeKey && i.subject_type === 'sku' && !inItems.has(i.subject_key));
+  const mine = mineIssues.map((i) => i.subject_key);
   if (mine.length) {
-    const ex = await rowsOf(db, `${W6_SOLD} select k.sku_id::text as sku_id, k.handling, k.sku_kind, coalesce(v.warehouse_qty, 0) + coalesce(v.fba_jp_available, 0) as stock, exists (select 1 from sold where sold.sku_id = k.sku_id) as sold_now
-        from core.skus k join mart.v_sku_stock v on v.company_id = k.company_id and v.sku_id = k.sku_id where k.company_id = $1::smallint and k.sku_id = any($4::bigint[])`, [config.COMPANY_ID, from, to, mine]);
-    r.outOfScope = {};
+    const ex = await rowsOf(db, `${SOLD} select k.sku_id::text as sku_id, k.handling, k.sku_kind, coalesce(v.warehouse_qty, 0) + coalesce(v.fba_jp_available, 0) as stock, exists (select 1 from sold where sold.sku_id = k.sku_id) as sold_now
+        from core.skus k join mart.v_sku_stock v on v.company_id = k.company_id and v.sku_id = k.sku_id where k.company_id = $1::smallint and k.sku_id = any($9::bigint[])`, [...P, mine]);
+    r.outOfScope = {}; r.held = {};
     for (const x of ex) {
-      if (x.sku_kind === 'set') r.outOfScope[x.sku_id] = 'set_sku';   // セットは在庫を持たない = 判定の対象ではない (回復ではない)
-      else if (Number(x.stock) === 0) r.outOfScope[x.sku_id] = x.handling === 'discontinued' ? 'discontinued' : 'no_sales_in_window';
+      if (x.sku_kind === 'set') { r.outOfScope[x.sku_id] = 'set_sku'; continue; }   // セットは在庫を持たない = 判定の対象ではない (回復ではない)
+      if (Number(x.stock) !== 0) continue;   // 在庫が入った = 回復 (engine)
+      if (x.handling === 'discontinued') r.outOfScope[x.sku_id] = 'discontinued';
+      else if (!x.sold_now) {
+        // 除いたモールがある朝は「窓から外れた」と決めない (除いたモールでだけ売れていたのかもしれない) = 判定保留。
+        //   保留するのは今の版・版の分からない案件だけ。前の版の案件は保留にせず engine の「規則の変更で閉じた」へ流す
+        //   (保留が先に効くと、除いたモールの不調が続く間は前の版の案件が無期限に残る。Codex #1687 R2 Medium 1)
+        const iss = mineIssues.find((i) => i.subject_key === x.sku_id);
+        const priorVersion = !!(iss && iss.last_check_version != null && iss.last_check_version !== check.version);
+        if (excluded.size) { if (!priorVersion) r.held[x.sku_id] = `mall_excluded:${[...excluded.keys()].join(',')}`; }
+        else r.outOfScope[x.sku_id] = 'no_sales_in_window';
+      }
+      // 残り = 売れていて在庫 0 なのに明細に無い = 窓の中に在庫の記録が無い・前の版で開いた案件だけ (今の版の案件は上の keepOpen で明細に残る)。
+      //   outOfScope にしない = engine の「規則の変更で閉じた」(回復でも単なる対象外でもない。この決まりは v3 で足した)
     }
     for (const id of mine) if (!ex.some((x) => x.sku_id === id)) r.outOfScope[id] = 'sku_missing';
     r.observed.out_of_scope = r.outOfScope;
+    if (Object.keys(r.held).length) r.observed.held = r.held;
   }
-  r.verdict = rows.length ? 'breach' : 'pass';
-  if (rows.length) r.reason = `売れ筋 ${un.sold_skus} SKU のうち在庫 0 が ${rows.length} (${r.observed.top.join(', ')}${rows.length > 3 ? ' ほか' : ''})`;
+  r.verdict = hit.length ? 'breach' : 'pass';
+  const reasons = [];
+  if (hit.length) reasons.push(`売れ筋 ${un.sold_stocked_skus} SKU (窓の中に在庫の記録がある) のうち在庫 0 が ${hit.length}${kept.length ? ` (うち在庫の記録が窓から外れた継続 ${kept.length})` : ''} (${r.observed.top.join(', ')}${hit.length > 3 ? ' ほか' : ''})${noStock.length ? `。在庫の記録が無い ${noStock.length} は数えない` : ''}`);
+  if (exNote) reasons.push(exNote);
+  r.reason = reasons.length ? reasons.join(' / ') : null;
   return [r];
 }
 
@@ -1123,6 +1212,9 @@ export async function generationOf(db, config, asOf, { evidence = {}, dataDir = 
   const skus = await part(`select count(*)::int as n, coalesce(sum(hashtext(sku_id::text || ':' || handling || ':' || sku_kind)), 0)::bigint as h from core.skus where company_id = $1::smallint`, [config.COMPANY_ID]);
   const setComps = await part(`select count(*)::int as n, coalesce(sum(hashtext(parent_sku_id::text || ':' || child_sku_id::text || ':' || qty)), 0)::bigint as h from core.sku_components where company_id = $1::smallint`, [config.COMPANY_ID]);
   const comps = await part(`select count(*)::int as n, coalesce(sum(hashtext(listing_id::text || ':' || sku_id::text || ':' || qty)), 0)::bigint as h from core.listing_components where company_id = $1::smallint`, [config.COMPANY_ID]);
+  // W6: 窓の中に在庫の記録がある SKU の集まり (evalW6 と同じ問い合わせ。窓の中の日の行が作り直されれば変わる。10/11)。
+  //   順に並べた SKU の一覧の md5 (件数 + hash の和だと、同じ数の入れ替わりで和がぶつかれば見逃す。Codex #1687 R1 Low 2)
+  const w6Stocked = config.W6_SCOPE ? await part(`with ${w6StockedCte(2)} select count(*)::int as n, md5(coalesce(string_agg(sku_id::text, ',' order by sku_id), '')) as d from stocked`, [config.COMPANY_ID, ...w6WindowParams(w6StockWindows(config, asOf))]) : null;
   // W8: 昨日 + 同じ曜日の過去 N 週の 注文の件数・取消 (core.orders) と 売上日次の合計 (v_sales_daily)・昨日の公開・モールの最初の注文日
   const w8 = w8Days(config, asOf); const w8All = [w8.day, ...w8.baseline];
   const w8Orders = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || order_date_jst || '=' || n || ':' || c, ',' order by mall, scope_key, order_date_jst), '') as s
@@ -1180,5 +1272,5 @@ export async function generationOf(db, config, asOf, { evidence = {}, dataDir = 
   for (const s of config.AD_SPEND_SCOPES || []) w14.push(await part(`select coalesce((select x.generation || ':' || x.report_id || ':' || x.checksum || ':' || x.row_count || ':' || x.cost_total || ':' || x.unresolved_cost from (${W14_DAY_SQL}) x), '-') as s`,
     [config.COMPANY_ID, s.mall, s.scope, s.adType, addDays(asOf, -1)]));
   if (config.W12_HISTORY_DAYS) w12 = await part(`select coalesce(string_agg(x.d || '=' || x.bytes, ',' order by x.d), '') as s from (${W12_ROWS}) x`, [config.W12_JOB_ID, addDays(asOf, -config.W12_HISTORY_DAYS)]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, setComps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12, w13, w14]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, setComps, w6Stocked, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12, w13, w14]);
 }
