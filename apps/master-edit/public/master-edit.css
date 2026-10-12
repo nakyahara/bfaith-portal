@@ -945,3 +945,66 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 .modal.vops .opttbl .in { width: 100%; }
 .modal.vops .f { grid-template-columns: 140px minmax(0, 1fr); }
 @media (max-width: 760px) { .modal.vops .f { grid-template-columns: minmax(0, 1fr); } .modal.vops .btn, .modal.vops .in { min-height: 44px; } }
+
+/* 🆕 0071: 新商品の下書きを消す (商品の画面の「下書きです」の帯の下・_deldraft.ejs)。ふだんは控えめ (細い線) = 押す前に「下書き」と「消す」の関係が分かる場所に置く */
+.deldraft { display: flex; gap: 12px; align-items: flex-start; margin: -6px 0 16px; padding: 10px 14px; border-radius: 12px; border: 1px dashed rgba(255, 112, 133, 0.28); background: rgba(255, 112, 133, 0.03); }
+.deldraft > .ic { color: var(--err); flex: none; margin-top: 2px; opacity: 0.8; }
+.deldraft .t { font-size: 14px; color: var(--text); }
+.deldraft .hint { margin-top: 2px; }
+.deldraft-why { margin: 6px 0 0 18px; font-size: 13.5px; color: var(--text2); }
+.deldraft .btn.ghosty { flex: none; align-self: center; }
+.deldraft.can:hover { border-color: rgba(255, 112, 133, 0.5); }
+#deldraft-bg .lab2 { font-size: 13px; color: var(--muted); }
+#deldraft-bg .msgline { margin-top: 8px; }
+@media (max-width: 760px) { .deldraft { flex-wrap: wrap; } .deldraft .btn.ghosty { width: 100%; min-height: 44px; } #deldraft-bg .btn, #deldraft-bg .in { min-height: 44px; } }
+/* 新しい seller SKU の対応を自分で作る入口 (10/11・views/_amazon-create.ejs・amazon-new.ejs・public/me-amazon-new.js) */
+.create-sku .bigsearch.create { border-color: rgba(58, 231, 255, 0.55); background: rgba(58, 231, 255, 0.07); }
+.create-sku .bigsearch.create input { font-family: var(--mono); min-width: 0; }
+.create-out { margin-top: 10px; display: grid; gap: 8px; }
+.create-out:empty { display: none; }
+.create-out > .fmsg { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 14px; }
+.create-out .linkchip, .simlist .linkchip { margin: 0; }
+.simlist { list-style: none; display: grid; gap: 6px; margin: 4px 0 6px; padding: 0; }
+.simlist li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 10px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--line-soft); font-size: 13.5px; min-width: 0; }
+.simlist .nm, .exists-row .nm { color: var(--text2); overflow-wrap: anywhere; min-width: 0; }
+.simlist .mono, .exists-row .code-pill { overflow-wrap: anywhere; }
+.warnlist { list-style: none; display: grid; gap: 4px; margin: 6px 0; padding: 0; font-size: 13.5px; color: var(--warn); }
+.warnlist li { display: flex; gap: 6px; align-items: flex-start; }
+.warnlist .ic { flex: none; margin-top: 2px; }
+.exists-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; min-width: 0; }
+.exists-row .btn { max-width: 100%; white-space: normal; height: auto; min-height: 38px; padding: 6px 15px; text-align: left; }
+.exists-row .btn .mono { overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .create-sku .bigsearch.create { height: auto; flex-wrap: wrap; padding: 8px 12px; }
+  .create-sku .bigsearch.create input { flex-basis: 60%; height: 40px; }
+}
+/* 構成の行の「NE の商品」の欄の候補 (10/12・views/amazon-sku.ejs の #comp-suggest・public/me-amazon.js)。表の囲い (.scrollx) の外に 1 つだけ置き、打っている欄の下に出す (囲いで切れない) */
+.csug { position: absolute; z-index: 60; left: 0; top: 0; width: min(560px, 100%); max-height: min(420px, 60vh); overflow: auto; overscroll-behavior: contain; padding: 6px; border-radius: 14px; border: 1px solid rgba(58, 231, 255, 0.45); background: rgba(10, 17, 31, 0.97); box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(58, 231, 255, 0.1), 0 0 30px rgba(58, 231, 255, 0.1); animation: rise 0.12s ease-out; }
+.csug[hidden] { display: none; }
+/* 打ち足した直後 = 前の候補は古い (選べない・新しい候補を待つ間だけ薄く) */
+.csug.stale .co { opacity: 0.55; cursor: progress; }
+/* 候補を出している間は、その板を後ろの板より上に (上の帯・狭い画面の保存の帯 = z-index 40 より下) */
+.panel.sug-on { z-index: 30; }
+.csug .cs-h { display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; padding: 4px 8px 6px; font-size: 12.5px; color: var(--muted); }
+.csug .cs-h .warn { color: var(--warn); }
+.csug .cs-empty { padding: 10px; font-size: 13.5px; color: var(--muted); }
+.csug .cs-empty.bad { color: var(--err); }
+.csug .co { display: grid; gap: 3px; min-height: 44px; padding: 7px 10px; border-radius: 10px; cursor: pointer; align-content: center; min-width: 0; }
+.csug .co:hover { background: rgba(255, 255, 255, 0.04); }
+.csug .co.sel { background: rgba(58, 231, 255, 0.12); box-shadow: inset 3px 0 0 var(--accent); }
+.csug .co .l1 { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+.csug .co .cc { font-family: var(--mono); font-size: 13.5px; color: var(--accent); overflow-wrap: anywhere; min-width: 0; }
+.csug .co .st { font-size: 12.5px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.csug .co .cn { font-size: 13.5px; color: var(--text2); overflow-wrap: anywhere; min-width: 0; }
+.csug .co mark { background: rgba(58, 231, 255, 0.25); color: #fff; border-radius: 3px; padding: 0 1px; }
+.csug .co.off { cursor: not-allowed; }
+.csug .co.off .l1, .csug .co.off .cn { opacity: 0.5; }
+.csug .co.off .cc { color: var(--muted); }
+.csug .co.off:hover { background: transparent; }
+.csug .co .why { display: flex; gap: 6px; align-items: center; font-size: 12.5px; color: var(--warn); }
+.csug .co .why .ic { flex: none; }
+@media (max-width: 760px) {
+  #comp .c-code, #comp .c-qty, #comp-add { min-height: 44px; }
+  .csug { max-height: min(360px, 55vh); }
+}
+@media (prefers-reduced-motion: reduce) { .csug { animation: none; } }

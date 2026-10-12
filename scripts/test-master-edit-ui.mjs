@@ -33,6 +33,7 @@
  *        削除は 1 回だけ確かめる・申告はファイルを落として sha256 を照合・1440 / 1280 / 1024 / 150% で横にはみ出さない
  *        (41〜46 = 構成品の照合・カードを作らないときの欄・確かめ直しの上限・Yahoo! の残値と誤りの欄・Amazon の変わらない保存)
  *  49〜50 利益 (1 個あたり・10/6): 単品 / セットの欄を変えると保存の前にその場で計算し直す (保存すると ○ → ○)・数でない・マイナスは赤・元に戻す・一覧の列と利益の少ない順
+ *  55 新しい seller SKU を自分で作る (10/11): 一覧の上の欄 = 打つとその場で確かめる・もしかしてを見た後は作る画面へ直行・まだ売れていない SKU を作って保存・もうある = 開く
  *  51 円の欄 (標準売価・原価・例外原価) の読みはサーバーと同じ (カンマ・全角の数字・空白): 保存すると変わること・前との差・保存するとこうなる・利益
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
@@ -614,7 +615,9 @@ await ta('[19] 詳細検索の項目 (10/5): JAN (複数)・仕入先 (0001 と 
   assert.deepEqual(await q({ parents: 'K001' }), ['k001', 'k002'], '代表 k001 = 子 k002 と代表そのもの');
   assert.deepEqual(await q({ name: 'ﾊﾁﾐﾂ' }), ['k001', 'k002', 'k003']);
   assert.deepEqual(await q({ cost_min: '305', cost_max: '310' }), ['k002']);
-  assert.deepEqual(await q({ price_min: '1,200' }), ['ui-card-1'], '売価の範囲 (カンマ付きでも)');
+  // 🆕 0071: 登録をやめた商品 (ui-card-1 = [13] でやめた) はふだんの一覧に出さない・「やめた」で絞ると出る
+  assert.deepEqual(await q({ price_min: '1,200' }), [], '売価の範囲 (カンマ付きでも)・やめた商品はふだん出さない');
+  assert.deepEqual(await q({ price_min: '1,200', reg: 'cancelled' }), ['ui-card-1'], '売価の範囲 (カンマ付きでも)・「やめた」で絞ると出る');
   assert.deepEqual(await q({ name: 'はちみつ', tax: '8' }), ['k001', 'k002', 'k003']);
   assert.deepEqual(await q({ name: 'はちみつ', tax: '10' }), []);
   assert.deepEqual(await q({ name: 'はちみつ', sales: '1' }), ['k001', 'k002', 'k003']);
@@ -1546,7 +1549,7 @@ const fillSet = async (p) => {
 const SCREENS2 = [
   ['新商品_単品', '/new?kind=single', fillNew], ['新商品_セット', '/new?kind=set', fillSet],
   ['Amazon_一覧', '/amazon/', null], ['Amazon_未登録', '/amazon/unmapped?channel=all', null], ['Amazon_1つのSKU', '/amazon/sku?sku=pr-k001', null],
-  ['Amazon_変更の記録', '/amazon/sku/history?sku=pr-k001-b', null], ['NE登録のCSV', '/reg-csv', null], ['変更の記録', '/sku/s003/history', null],
+  ['Amazon_変更の記録', '/amazon/sku/history?sku=pr-k001-b', null], ['Amazon_新しいSKU', '/amazon/new?sku=pr-k001-bx', null], ['NE登録のCSV', '/reg-csv', null], ['変更の記録', '/sku/s003/history', null],
 ];
 for (const [label, vp, scale] of [['1440', { width: 1440, height: 900 }, 1], ['1280', { width: 1280, height: 720 }, 1], ['1024', { width: 1024, height: 768 }, 1], ['1280×720 150%', { width: 853, height: 480 }, 1.5]]) {
   await ta(`[39] ${label}: 第 2 段の画面 (新商品・Amazon・NE 登録の CSV・変更の記録) が横にはみ出さない`, async (p) => {
@@ -1905,6 +1908,237 @@ for (const [label, vp, scale] of [['1280×720 100%', { width: 1280, height: 720 
     }
   }, vp, scale);
 }
+
+// MASTER_EDIT_UI_AMAZON_NEW_SHOTS=フォルダ を付けると、入口の写し (もしかして・もうある) を残す (目で見る用)
+const AMZ_NEW_SHOTS = process.env.MASTER_EDIT_UI_AMAZON_NEW_SHOTS || '';
+await ta('[55] 新しい seller SKU を自分で作る (10/11): 一覧の上の欄に打つ = その場で確かめる (出品だけある・もしかして・もうある・形の誤り)・もしかしてを見た後の Enter は作る画面へ直行・まだ売れていない SKU を作って保存・もうある SKU は「開く」', async (p) => {
+  const out = () => p.evaluate(() => document.getElementById('new-sku-out').textContent.replace(/\s+/g, ' ').trim());
+  const waitOut = (re) => p.waitForFunction((s) => new RegExp(s).test(document.getElementById('new-sku-out').textContent), re.source);
+  await p.goto(B + '/amazon/');
+  assert.match(await p.textContent('#h-create'), /新しい seller SKU の対応を作る/);
+  // 夜間の取り込みの出品 (対応なし) = 作れる
+  await p.fill('#new-sku', 'PR-K001');
+  await waitOut(/Amazon の出品はあります/);
+  // 打ち間違い = もしかして (1 文字違いの出品)・止めない
+  await p.fill('#new-sku', 'pr-k001x');
+  await waitOut(/もしかして/);
+  assert.match(await out(), /pr-k001x は、まだありません[\s\S]*もしかして[\s\S]*pr-k001[\s\S]*1 文字違い/);
+  assert.equal(await p.locator('#new-sku-out a.linkchip[href$="/amazon/sku?sku=pr-k001"]').count(), 1, 'もしかしての SKU を開ける');
+  if (AMZ_NEW_SHOTS) await p.screenshot({ path: AMZ_NEW_SHOTS + '/入口_もしかして.png' });
+  await Promise.all([p.waitForNavigation(), p.press('#new-sku', 'Enter')]);
+  assert.match(p.url(), /\/amazon\/sku\?sku=pr-k001x$/, '見た後は /amazon/new で止めずに作る画面へ');
+  // 作る画面 (出品も無い) で名前と構成を入れて保存
+  assert.match(await p.textContent('.idrow'), /対応なし/);
+  assert.match(await p.textContent('#h-listing ~ .hint, .panel.soft .hint'), /まだ売れていない/);
+  await p.fill('#name', '自分で作った 2 個組');
+  await p.click('#comp-add');
+  const row = p.locator('#comp-rows tr.comp-row').last();
+  await row.locator('.c-code').fill('k001'); await row.locator('.c-code').press('Tab');
+  await row.locator('.c-qty').fill('2'); await row.locator('.c-qty').press('Tab');
+  await p.waitForFunction(() => !document.getElementById('save').disabled);
+  await p.keyboard.press('Control+s');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /新しい対応を作りました/);
+  assert.deepEqual(await mapOf('pr-k001x'), { name: '自分で作った 2 個組', state: 'active' });
+  assert.equal((await pg.query("select catalog_item_id from core.listings where listing_code = 'pr-k001x'")).rows[0].catalog_item_id, null, 'ASIN の無い出品を作った');
+  // もうある = 「開く」に変わる・Enter でその画面へ
+  await p.goto(B + '/amazon/');
+  await p.fill('#new-sku', ' PR-K001X ');
+  await waitOut(/もうあります/);
+  assert.match(await out(), /もうあります[\s\S]*pr-k001x[\s\S]*有効/);
+  assert.match(await p.textContent('#new-sku-go'), /開く/);
+  if (AMZ_NEW_SHOTS) await p.screenshot({ path: AMZ_NEW_SHOTS + '/入口_もうある.png' });
+  await Promise.all([p.waitForNavigation(), p.press('#new-sku', 'Enter')]);
+  assert.match(p.url(), /\/amazon\/sku\?sku=pr-k001x$/);
+  // 形の誤り = その場で赤・押すと /amazon/new が 400 で同じ理由
+  await p.goto(B + '/amazon/');
+  await p.fill('#new-sku', 'a'.repeat(256));
+  await waitOut(/255 文字を超える/);
+  assert.equal(await p.locator('#new-sku-out .fmsg.err').count(), 1);
+  // 出品の無い SKU を全角で先に作る = その場で止める・半角にそろえた形で確かめ直すボタン (#1685 Codex R1 High)
+  await p.fill('#new-sku', 'ｐｒ－ｋ００１ｚ');
+  await waitOut(/この形では先に作れません/);
+  assert.equal(await p.locator('#new-sku-out .fmsg.err').count(), 1);
+  await p.click('#use-canonical');
+  assert.equal(await p.inputValue('#new-sku'), 'pr-k001z');
+  await waitOut(/もしかして/);
+  // 空の Enter は送らない
+  await p.fill('#new-sku', '');
+  await p.press('#new-sku', 'Enter');
+  await p.waitForTimeout(150);
+  assert.match(p.url(), /\/amazon\/$/);
+  // JS より先に送った (または直接開いた) = /amazon/new が「もしかして」を出す → 同じ値のまま「作り始める」= 作る画面へ
+  await p.goto(B + '/amazon/new?sku=pr-k001y');
+  assert.match(await p.textContent('#h-confirm'), /打ち間違いがないか/);
+  assert.match(await p.textContent('#new-result'), /もしかして[\s\S]*pr-k001x/);
+  await Promise.all([p.waitForNavigation(), p.click('#new-sku-go')]);
+  assert.match(p.url(), /\/amazon\/sku\?sku=pr-k001y$/);
+  assert.equal(await mapOf('pr-k001y'), undefined, '開いただけ = 作っていない');
+});
+
+// ── 構成の行の「NE の商品」の欄で探す (10/12 中原さん「既存の商品コードを検索して選んで登録できるように」) ──
+const setRegUi = async (code, state) => {
+  await pg.query(`select set_config('ops.registration_protocol', '1', false)`);
+  try { await pg.query('update ops.master_registrations set state = $2 where sku_id = (select sku_id from core.skus where code = $1)', [code, state]); }
+  finally { await pg.query(`select set_config('ops.registration_protocol', '', false)`); }
+};
+const regUi = async (code) => (await pg.query('select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code = $1', [code])).rows[0].state;
+const compsUi = async (sku) => (await pg.query(`select k.code, c.qty from core.listing_components c join core.skus k on k.sku_id = c.sku_id
+  where c.listing_id = (select listing_id from core.listings where mall = 'amazon' and listing_norm = core.norm_code($1)) order by c.sort_order`, [sku])).rows.map((r) => [r.code, r.qty]);
+const sugOpen = (p) => p.waitForFunction(() => { const s = document.getElementById('comp-suggest'); return s && !s.hidden && !s.classList.contains('stale') && s.querySelector('.co, .cs-empty:not(:first-child), .cs-h'); });
+/** 候補の問い合わせを遅らせる (打ち足した直後 = 新しい候補がまだ来ない間を確実に作る) */
+const slowSearch = (p) => p.route('**/api/amazon/components**', async (r) => { await new Promise((res) => setTimeout(res, 1500)); await r.continue().catch(() => {}); });
+const fastSearch = (p) => p.unroute('**/api/amazon/components**');
+const sugCodes = (p) => p.evaluate(() => [...document.querySelectorAll('#comp-suggest .co')].map((o) => (o.classList.contains('off') ? '×' : '') + o.querySelector('.cc').textContent));
+const selCode = (p) => p.evaluate(() => { const o = document.querySelector('#comp-suggest .co.sel'); return o ? o.querySelector('.cc').textContent : null; });
+
+await ta('[56] Amazon SKU の構成で探す (10/12): 名前の言葉 (かな・半角カナも) で候補・使えない商品は灰色で理由 (選べない・↓ で飛ばす)・↑↓ と Enter で選ぶ → コードが入って名前と登録の状態・ほかの行にある商品は選べない・マウスで選ぶ・Esc で閉じる・保存', async (p) => {
+  const keep = await regUi('k003');
+  await setRegUi('k003', 'ne_pending');
+  try {
+    await p.goto(B + '/amazon/sku?sku=pr-k006');
+    assert.equal(await p.inputValue('#comp-rows tr.comp-row .c-code'), 'k006');
+    await p.click('#comp-add');
+    const row2 = p.locator('#comp-rows tr.comp-row').nth(1);
+    const in2 = row2.locator('.c-code');
+    assert.equal(await active(p), '2 行目の NE コード', '足した行の欄へ');
+    assert.equal(await in2.getAttribute('role'), 'combobox', '足した行の欄も探せる');
+    // 1 文字では探さない
+    await in2.fill('は');
+    await p.waitForTimeout(400);
+    assert.equal(await p.isHidden('#comp-suggest'), true, '1 文字では出さない');
+    await in2.fill('はちみつ');
+    await sugOpen(p);
+    assert.equal(await in2.getAttribute('aria-expanded'), 'true');
+    assert.deepEqual(await sugCodes(p), ['k001', 'k002', '×k003'], 'はちみつ = ハチミツ = ﾊﾁﾐﾂ (かなの同一視)・使えない k003 は灰色で最後');
+    const off = p.locator('#comp-suggest .co.off');
+    assert.equal(await off.getAttribute('aria-disabled'), 'true');
+    assert.match(await off.textContent(), /使えません: NE 登録待ち/);
+    assert.match(await p.locator('#comp-suggest .co').first().textContent(), /単品[\s\S]*登録済み[\s\S]*在庫 15[\s\S]*国産 はちみつ 500g/, '単品・登録の状態・在庫 (ロジザード)・名前');
+    assert.equal(await p.locator('#comp-suggest .co').first().locator('mark').count(), 1, '当たった言葉に印');
+    if (process.env.MASTER_EDIT_UI_SEARCH_SHOTS) { await in2.press('ArrowDown'); await p.screenshot({ path: `${process.env.MASTER_EDIT_UI_SEARCH_SHOTS}/1440_候補.png` }); await in2.press('ArrowUp'); }
+    assert.equal(await selCode(p), null, 'ぴったりでなければ、はじめは選んでいない (Enter は今までどおり)');
+    await in2.press('ArrowDown'); assert.equal(await selCode(p), 'k001');
+    await in2.press('ArrowDown'); assert.equal(await selCode(p), 'k002');
+    await in2.press('ArrowDown'); assert.equal(await selCode(p), 'k002', '使えない k003 には止まらない');
+    assert.equal(await in2.getAttribute('aria-activedescendant'), 'cs-opt-1');
+    await in2.press('ArrowUp'); assert.equal(await selCode(p), 'k001');
+    await in2.press('Enter');
+    assert.equal(await p.isHidden('#comp-suggest'), true, '選ぶと閉じる');
+    assert.equal(await in2.inputValue(), 'k001');
+    assert.equal(await active(p), '2 行目 (k001) の数', '数の欄へ');
+    await p.waitForFunction(() => /国産 はちみつ/.test(document.querySelectorAll('#comp-rows .c-name')[1].textContent));
+    await p.waitForFunction(() => /登録済み/.test(document.querySelectorAll('#comp-rows .c-reg')[1].textContent));
+    assert.equal(await dirty(p), 1);
+    assert.match(await p.textContent('#save-diff'), /k006×1, k001×1/);
+    // 3 行目: コードの一部。上の行にある商品は選べない (同じ品は 1 行に)・使えない商品を押しても入らない・マウスで選ぶ
+    await p.click('#comp-add');
+    const in3 = p.locator('#comp-rows tr.comp-row').nth(2).locator('.c-code');
+    await in3.fill('k00');
+    await sugOpen(p);
+    assert.deepEqual(await sugCodes(p), ['×k001', 'k002', 'k004', 'k005', '×k006', '×k003'], '前方一致・使えない物は同じ段の最後 (k003)・ほかの行にある k001 と k006 も灰色');
+    assert.match(await p.locator('#comp-suggest .co.off').first().textContent(), /この構成の 2 行目にもうあります/);
+    await p.locator('#comp-suggest .co.off').last().click({ force: true });   // aria-disabled = Playwright は押せない物と見る。人は押せる (押しても入らないことを確かめる)
+    assert.equal(await in3.inputValue(), 'k00', '使えない商品は入らない');
+    assert.match(await p.textContent('#toast-t'), /使えません: NE 登録待ち/);
+    assert.equal(await p.isVisible('#comp-suggest'), true, '押しても閉じない (欄から出ない)');
+    await p.locator('#comp-suggest .co:not(.off)').filter({ hasText: 'k005' }).click();
+    assert.equal(await in3.inputValue(), 'k005');
+    await p.waitForFunction(() => /abc 小袋/.test(document.querySelectorAll('#comp-rows .c-name')[2].textContent));
+    // Esc で閉じる (欄の値は変えない・画面の Esc の動きにしない)・欄から出ると閉じる
+    await in3.fill('k0');
+    await sugOpen(p);
+    await in3.press('Escape');
+    assert.equal(await p.isHidden('#comp-suggest'), true);
+    assert.equal(await in3.inputValue(), 'k0');
+    await in3.fill('k005');
+    await sugOpen(p);
+    assert.equal(await selCode(p), 'k005', 'ぴったりで使える = はじめから選んでいる');
+    await in3.press('Tab');
+    assert.equal(await p.isHidden('#comp-suggest'), true, '欄から出ると閉じる');
+    // 打ち足して すぐ Enter / すぐ押す = 前の候補 (古い) は入らない (#1689 Codex R1 M1)
+    await in3.fill('k005');
+    await sugOpen(p);
+    assert.equal(await selCode(p), 'k005');
+    await slowSearch(p);
+    try {
+      await in3.press('x');
+      assert.equal(await selCode(p), null, '打ち足したら選んだ印が消える');
+      assert.equal(await p.evaluate(() => document.getElementById('comp-suggest').classList.contains('stale')), true, '古い候補 = 薄く');
+      await in3.press('Enter');
+      assert.equal(await in3.inputValue(), 'k005x', 'Enter で古い k005 が入らない');
+      await in3.fill('k00');
+      await fastSearch(p);
+      await sugOpen(p);
+      await slowSearch(p);
+      await in3.press('2');
+      await p.locator('#comp-suggest .co:not(.off)').filter({ hasText: 'k004' }).click();
+      assert.equal(await in3.inputValue(), 'k002', '押しても古い候補 (k004) は入らない');
+    } finally { await fastSearch(p); }
+    await in3.fill('k005');
+    await sugOpen(p);
+    await in3.press('Tab');
+    // 当たらない
+    await in2.fill('zzzz-none');
+    await p.waitForSelector('#comp-suggest .cs-empty:has-text("当たる NE の商品はありません")');
+    await in2.fill('k001');
+    await in2.press('Tab');
+    assert.equal(await p.isHidden('#comp-suggest'), true);
+    await p.fill('#name', '探して選んだ構成');
+    await p.keyboard.press('Control+s');
+    await p.waitForSelector('#saved-note');
+    assert.match(await p.textContent('#saved-note'), /保存しました/);
+    assert.deepEqual(await compsUi('pr-k006'), [['k006', 1], ['k001', 1], ['k005', 1]]);
+  } finally { await setRegUi('k003', keep); }
+});
+
+await ta('[57] Amazon SKU の構成で探す (スマホ 390・タッチ): 候補の箱は画面の中・横にはみ出さない・候補と欄は 44px 以上・タッチで選ぶ / JAN で探す', async (p, ctx) => {
+  await ctx.close().catch(() => {});
+  const c2 = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, locale: 'ja-JP' });
+  const m = await c2.newPage();
+  const errs = []; m.on('pageerror', (e) => errs.push(e.message));
+  try {
+    await pg.query(`insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type)
+      values (1, 'product', (select product_id from core.skus where code = 'k004'), 'jan', 'jan', '4900000000017', 'manual', 'human')`);
+    await m.goto(B + '/amazon/sku?sku=pr-k1k2');
+    const spill = () => m.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+    const [sw0, cw0] = await spill();
+    if (process.env.MASTER_EDIT_UI_SEARCH_SHOTS) console.log(`      (390 幅: 開く前の横幅 ${sw0} / ${cw0})`);
+    await m.tap('#comp-add');
+    const inp = m.locator('#comp-rows tr.comp-row').nth(2).locator('.c-code');
+    const ib = await inp.boundingBox();
+    assert.ok(ib.height >= 43.5, '欄の高さ ' + ib.height);
+    assert.ok((await m.locator('#comp-add').boundingBox()).height >= 43.5, '「NE の商品を足す」の高さ');
+    await inp.fill('ABC');
+    await sugOpen(m);
+    assert.deepEqual(await sugCodes(m), ['k004', 'k005'], 'ＡＢＣ (全角) と abc に当たる');
+    if (process.env.MASTER_EDIT_UI_SEARCH_SHOTS) await m.screenshot({ path: `${process.env.MASTER_EDIT_UI_SEARCH_SHOTS}/390_候補.png` });
+    const box = await m.evaluate(() => { const b = document.getElementById('comp-suggest').getBoundingClientRect(); return { l: b.left, r: b.right, vw: innerWidth }; });
+    assert.ok(box.l >= 0 && box.r <= box.vw + 0.5, '候補の箱は画面の中: ' + JSON.stringify(box));
+    const [sw, cw] = await spill();
+    assert.ok(sw <= Math.max(cw, sw0) + 1, `開いても横にはみ出さない ${sw} > ${cw} (前 ${sw0}/${cw0})`);
+    for (const h of await m.locator('#comp-suggest .co').evaluateAll((xs) => xs.map((x) => x.getBoundingClientRect().height))) assert.ok(h >= 44, '候補の高さ ' + h);
+    // 打ち足して すぐタップ = 古い候補は入らない (#1689 Codex R1 M1)
+    await slowSearch(m);
+    try {
+      await inp.press('D');
+      await m.locator('#comp-suggest .co').filter({ hasText: 'k005' }).tap();
+      assert.equal(await inp.inputValue(), 'ABCD', 'タップでも古い候補は入らない');
+    } finally { await fastSearch(m); }
+    await inp.fill('ABC');
+    await sugOpen(m);
+    await m.locator('#comp-suggest .co').filter({ hasText: 'k005' }).tap();
+    assert.equal(await inp.inputValue(), 'k005', 'タッチで選べる');
+    await m.waitForFunction(() => /abc 小袋/.test(document.querySelectorAll('#comp-rows .c-name')[2].textContent));
+    // JAN
+    await inp.fill('4900000000017');
+    await sugOpen(m);
+    assert.deepEqual(await sugCodes(m), ['k004'], 'JAN で探せる');
+    await m.locator('#comp-suggest .co').first().tap();
+    assert.equal(await inp.inputValue(), 'k004');
+    assert.deepEqual(errs, [], '画面の JS の例外');
+  } finally { await c2.close(); }
+});
 
 await browser.close();
 server.close();

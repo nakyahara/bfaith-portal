@@ -72,6 +72,8 @@
           <% if (nOf(c.n_exception) || filters.kind === 'exception') { %><%- chip('例外', 'kind', 'exception', nOf(c.n_exception)) %><% } %>
           <span class="vsep" aria-hidden="true"></span>
           <%- chip('取扱を中止した商品', 'state', 'discontinued', nOf(c.discontinued)) %>
+          <%# 🆕 0071: 登録をやめた商品 (消した下書きなど) はふだんの一覧に出さない = この札で見る %>
+          <% if (nOf(c.n_cancelled) || filters.reg === 'cancelled') { %><%- chip('やめた商品', 'reg', 'cancelled', nOf(c.n_cancelled)) %><% } %>
         </div>
         <div class="chips" role="group" aria-label="やること">
           <span class="chip-lab" aria-hidden="true">やること</span>

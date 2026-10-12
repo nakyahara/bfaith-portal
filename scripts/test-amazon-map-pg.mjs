@@ -13,6 +13,7 @@
  *   6 墓標 × 夜間ロードの自動の候補 (FBM の完全一致): どちらが先でも、墓標の出品に構成を作り直さない
  *   7 画面のロールのログイン: 対応・構成・出品を直接書けない・消せない・部品の関数を呼べない (42501)
  *   8 不変条件は commit のときに効く (実 PostgreSQL の deferred の constraint trigger)・UTC / 東京の session で写しのハッシュが同じ
+ *  10 まだ売れていない・出品も無い seller SKU (10/11 の自分で作る入口) を画面のロールのログインで作れる・同時に作る = 後の人は鍵で待って 409 (出品は 1 つ)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-amazon-map-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む (本番を渡さない)
@@ -277,7 +278,36 @@ try {
     assert.equal(await code(CLI.assertShadowTarget({ targetUrl: other.toString(), productionUrl: prod })), 'ok');
     assert.match(await code(CLI.assertShadowTarget({ targetUrl: other.toString(), productionUrl: undefined })), /^AMAZON_MAP_MIGRATE_ARGS/);
   });
-} finally {
+  await ta('[10] まだ売れていない・出品も無い seller SKU (10/11 の自分で作る入口): 画面のロールのログインで作れる (出品・対応・構成)・2 人が同時に作る = 後の人は出品ごとの鍵で待ち、409 (出品は 1 つ)・全角で打った同じ SKU はすぐ 400 (先に作る形の決まり)', async () => {
+    const lidsOf = async (code) => (await q("select listing_id::text as id from core.listings where mall = 'amazon' and listing_norm = core.norm_code($1)", [code])).map((r) => r.id);
+    assert.deepEqual(await lidsOf('pm_new_10'), [], '始めは出品も無い');
+    const v = await versionsOf('pm_new_10');
+    assert.deepEqual(v, { listing: null, map: null });
+    const g = gate();
+    const a = launch(save(dbA, ' PM_NEW_10 ', '先に作る人', [{ code: 'p001', qty: 2 }], { versions: v, beforeCommit: g.wait }));
+    await sleep(300);
+    const b = launch(save(dbB, 'pm_new_10', '後の人', [{ code: 'p002', qty: 1 }], { versions: v }));
+    const EC = await open('master_edit'); clients.push(EC);
+    const c = launch(save(pgAdapter(EC), 'ｐｍ＿ｎｅｗ＿１０', '全角で打った人', [{ code: 'p002', qty: 1 }], { versions: v }));
+    await sleep(700);
+    assert.equal(b.done, false, '後の人は出品ごとの鍵で待っている (出品がまだ無くても)');
+    assert.equal(c.done, true, '全角で打った同じ SKU = 出品がまだ無い先行の登録の形の決まりで、鍵を待たずにすぐ断る (#1685 Codex R1 High)');
+    g.open();
+    const ra = await a.promise; const rb = await b.promise; const rc = await c.promise;
+    assert.ok(ra.ok, ra.err?.message);
+    assert.deepEqual([ra.ok.created, ra.ok.listing_created, ra.ok.seller_sku], [true, true, 'pm_new_10']);
+    assert.deepEqual([rb.err?.status, rb.err?.reason], [409, 'version_conflict'], rb.err?.message || 'ok になった');
+    assert.deepEqual([rc.err?.status, rc.err?.reason], [400, 'invalid_input'], rc.err?.message || 'ok になった');
+    assert.equal((await lidsOf('pm_new_10')).length, 1, '出品は 1 つ');
+    assert.deepEqual(await comps('pm_new_10'), ['p001x2@0']);
+    const row = (await q("select l.catalog_item_id, l.created_by_type, m.name, m.origin from core.listings l join core.amazon_sku_maps m on m.listing_id = l.listing_id where m.seller_sku = 'pm_new_10'"))[0];
+    assert.deepEqual(row, { catalog_item_id: null, created_by_type: 'human', name: '先に作る人', origin: 'portal' });
+    // 全角で先に作る = 画面のロールのログインでも lib が断る (#1685 Codex R1 High)・何も作らない
+    const ef = await save(dbA, 'ｐｍ＿ｆｗ＿１０', '全角で先に', [{ code: 'p001', qty: 1 }], { versions: { listing: null, map: null } }).then(() => null, (x) => x);
+    assert.deepEqual([ef?.status, ef?.reason], [400, 'invalid_input'], ef?.message || 'ok になった');
+    assert.deepEqual(await lidsOf('pm_fw_10'), []);
+    assert.deepEqual(K.validateSkuMap(await A.readCompanyAmazonMapCanon(dbO)), []);
+  });} finally {
   for (const c of clients.reverse()) { try { await c.end(); } catch { /* */ } }
   try { await admin.query(`drop database ${dbName} with (force)`); } catch (e) { console.error(`DB を消せなかった: ${e.message}`); }
   await admin.end();

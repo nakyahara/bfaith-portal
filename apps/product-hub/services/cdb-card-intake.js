@@ -299,6 +299,23 @@ export function linkCdbCardToExisting(event, { draftId, actor = ACTOR, db = getD
 }
 
 /**
+ * 🆕 0071: Company DB の新商品の下書きを消す前の確かめ (読むだけ)。この SKU の出品カードで、まだ除外 (excluded) になっていないもの。
+ *   相手 = この SKU に結んだカード (cdb_sku_id) と、同じ商品コード (LOWER(TRIM(ne_code))・結んでいない = 古いやり方で作ったカード・衝突の相手) の両方。
+ *   1 枚でもあれば、マスタの入力の画面は消さない (409 card_exists = 「先に product-hub でカードを除外してから」・Codex #1688 R1 High 2・3)。
+ *   カードは人が先に除外する (出品済み・出品中・RMS の実行中かを人が確かめる = 自動で除外にしない)
+ * 戻り値 [{ draft_id, status, ne_code, linked }] (番号の順)。読めない = throw (呼び手は消さない = fail-closed)
+ */
+export function liveCdbCardsForSku({ skuId, code = null } = {}, { db = getDB() } = {}) {
+  const sid = Number(skuId);
+  if (!/^[1-9][0-9]{0,15}$/.test(String(skuId ?? '')) || !Number.isSafeInteger(sid)) throw fail(`SKU の番号が不正: ${skuId}`);
+  const codeKey = code == null ? null : String(code).trim().toLowerCase();
+  return db.prepare(`SELECT id, status, ne_code, cdb_sku_id FROM product_drafts
+      WHERE status <> 'excluded' AND (cdb_sku_id = ? OR (? IS NOT NULL AND LOWER(TRIM(ne_code)) = ?)) ORDER BY id`)
+    .all(sid, codeKey, codeKey)
+    .map((d) => ({ draft_id: d.id, status: d.status, ne_code: d.ne_code, linked: d.cdb_sku_id != null && Number(d.cdb_sku_id) === sid }));
+}
+
+/**
  * ボードのカードに「発送方法 要確認」を出す draft の id (取り込みで対応が無かった・まだ楽天の配送方法が空のもの)。
  * 表が無い (初期化の前) = 空
  */

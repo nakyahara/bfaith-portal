@@ -41,10 +41,13 @@
  *   広げる道の DB の持ち主の関数 (prepare / widen / cancel / 停止 / 保守の印 / private の _ の関数) はだれにも渡さない
  * 🆕 0066 (Company DB構想 20 の PR-3・知らせの名前空間): master_edit に名前空間つきで借りる関数 (ops.claim_outbox_events) の実行を足す。
  *   まとまりの知らせを書く部品 (ops.enqueue_group_snapshot)・形 / 値の確かめ・insert の trigger はだれにも渡さない
+ * 🆕 0071 (新商品の下書きを消す): master_edit に ops.cancel_sku_draft と確かめ ops.sku_draft_cancel_check の実行 (DRAFT_CANCEL_FUNCTIONS)。表の権限は足さない (関数の中だけで書く)
  * 🆕 0067 (Company DB構想 20 の PR-5・まとまりの DB): master_edit にまとまりの 5 つの関数 (まとめての登録を開く / 閉じる・子の廃止・名前を直す・
  *   quarantined の代表の採用) と確かめの 4 つ (新しいまとまりのコードの決まり・products.parent が company か・子の request_id・子の数の上限) の実行と、
  *   まとまりの表 (予約・軸・選択肢・子の選択肢・revision・まとめての登録・採用の記録) の読み取りを足す (表が無い DB = 0067 の前は付けない = 流し直すと付く)。
  *   🚨 渡さない: まとまりの表の書き込み (関数だけ)・関数の中の部品 (鍵・スナップショット・revision・約束・予約の事前検査と入れる関数 = DB の持ち主だけ)
+ * 🆕 0070 (NE から消えた商品をやめる): master_edit と master_ops に ops.cancel_sku_gone_from_ne と確かめの 2 つ (ops.sku_gone_from_ne_check / _list) の実行
+ *   (GONE_FUNCTIONS)。🚨 渡さない: ops.master_ne_absence の表・照合 ② の記録の中の部品 (ops._record_ne_absence ほか = GONE_OWNER_ONLY_FUNCTIONS)
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
  *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
@@ -165,6 +168,11 @@ export const OUTBOX_NS_EDIT_FUNCTIONS = Object.freeze(['ops.claim_outbox_events(
 /** 🆕 0066: だれにも渡さない (まとまりの知らせを書く部品 = PR-5 のまとまりの関数の中だけ・形 / 値の確かめ・insert の trigger) */
 export const OUTBOX_NS_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.enqueue_group_snapshot(bigint, integer, jsonb, uuid, text)', 'ops.group_snapshot_shape_problem(jsonb)',
   'ops.group_snapshot_problem(smallint, bigint, integer, jsonb)', 'ops.guard_product_hub_outbox_group()']);
+/**
+ * 🆕 0071 (新商品の下書きを消す・中原さんの頼み 10/11): 消す関数 (ops.cancel_sku_draft) と確かめ (読むだけ) を master_edit (画面・名簿 MASTER_EDITORS の人) に実行だけ。
+ *   無い DB (0071 の前) では付けない (流し直すと付く)
+ */
+export const DRAFT_CANCEL_FUNCTIONS = Object.freeze(['ops.cancel_sku_draft(uuid, text, text, bigint)', 'ops.sku_draft_cancel_check(bigint)']);
 /** 🆕 0067 (Company DB構想 20 の PR-5・まとまり): 画面のロールが実行する (どれも products.parent の DB の active が company のときだけ書く = 今は断る)。無い DB (0067 の前) では付けない */
 export const VARIATION_EDIT_FUNCTIONS = Object.freeze(['ops.variation_batch_open(uuid, text, text, jsonb, jsonb)', 'ops.variation_batch_close(uuid, text, jsonb, jsonb)',
   'ops.cancel_variation_child(uuid, text, text, jsonb, bigint)', 'ops.edit_variation_labels(uuid, text, text, jsonb, bigint, integer, jsonb)',
@@ -181,6 +189,15 @@ export const VARIATION_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.variation_labe
 /** 🆕 0067: 画面のロールが読むまとまりの表 (書き込みは関数だけ)。無い DB では付けない */
 export const VARIATION_SELECT = Object.freeze(['ops.variation_group_codes', 'core.variation_axes', 'core.variation_options', 'core.sku_variation_choices',
   'ops.variation_group_revisions', 'ops.variation_batches', 'ops.variation_parent_adoptions', 'ops.variation_batch_requests']);
+/**
+ * 🆕 0070 (NE から消えた商品をやめる・中原さんの決定 10/11): 動かす関数 (ops.cancel_sku_gone_from_ne) と確かめ (読むだけ) を、
+ *   master_edit (画面・名簿 MASTER_DECISION_APPROVERS の人) と master_ops (CLI scripts/company-db/master-gone-from-ne.mjs) に実行だけ。表は読ませない。
+ *   無い DB (0070 の前) では付けない (流し直すと付く)
+ */
+export const GONE_FUNCTIONS = Object.freeze(['ops.cancel_sku_gone_from_ne(uuid, text, text, bigint)', 'ops.sku_gone_from_ne_check(bigint)', 'ops.sku_gone_from_ne_list(text[])']);
+/** 🆕 0070: だれにも渡さない (照合 ② の記録の中の部品・表の守り・定数) */
+export const GONE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops._record_ne_absence(bigint, jsonb)', 'ops.guard_master_ne_absence()', 'ops.ne_gone_required_runs()', 'ops.ne_gone_fresh_hours()',
+  'ops.sku_ref_cancelled(bigint[])', 'ops.guard_sku_ref_not_cancelled()']);   // #1683 R1 High 2: やめた SKU への参照を断る trigger とその部品
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -253,12 +270,18 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0066 (知らせの名前空間): 関数がある DB だけ。前に付けた実行権を外してから付け直す
   for (const f of [...OUTBOX_NS_EDIT_FUNCTIONS, ...OUTBOX_NS_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of OUTBOX_NS_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0071 (下書きを消す): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す
+  for (const f of DRAFT_CANCEL_FUNCTIONS) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of DRAFT_CANCEL_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   // 🆕 0067 (まとまり): 関数・表がある DB だけ。前に付けた権限を外してから付け直す
   for (const f of [...VARIATION_EDIT_FUNCTIONS, ...VARIATION_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of VARIATION_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   for (const t of VARIATION_SELECT) {
     s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   }
+  // 🆕 0070 (NE から消えた商品をやめる): 関数がある DB だけ。前に付けた実行権を外してから、画面 (master_edit) と CLI (master_ops) に付け直す
+  for (const f of [...GONE_FUNCTIONS, ...GONE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of GONE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit, master_ops';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、

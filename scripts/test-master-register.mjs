@@ -320,9 +320,10 @@ await ta('[S3] NE 登録待ち・NE 確認済みの根拠は 0053 (⑤-2b) の�
   await assert.rejects(() => transition(d2, 'draft'), /one_way/);
   const ev = await q('select from_state, to_state, actor_type, reason from ops.master_registration_events where sku_id = $1 order by event_id', [d2]);
   assert.deepEqual(ev.map((e) => [e.from_state, e.to_state, e.reason]), [[null, 'draft', null], ['draft', 'cancelled', '作るのをやめた']]);
+  // 🆕 0071 (Codex #1688 R1 High 1): 運用のロール (master_ops) は下書きを直にやめられない (下書きを消す・子の廃止の約束の中だけ = 条件と片付けを迂回しない)
   const d3 = await makeDraftSku('tx-3');
-  await asRole('master_ops', () => transition(d3, 'cancelled', { reason: '運用でやめた' }));
-  assert.equal((await regOf('tx-3')).state, 'cancelled');
+  await assert.rejects(() => asRole('master_ops', () => transition(d3, 'cancelled', { reason: '運用でやめた' })), /draft_cancel_session_required/);
+  assert.equal((await regOf('tx-3')).state, 'draft');
 });
 
 await ta('[S4] 消した SKU のコード (使い回さない試験の材料) と、切替の前の登録は 409 切替前・何も書かない・失敗の記録は残る', async () => {
