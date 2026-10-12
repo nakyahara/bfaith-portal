@@ -175,14 +175,14 @@ await t('[5] 時刻の読み方・古さの文 / 世代の received_at が先・
   assert.deepEqual([ne.ok, ne.asOf], [true, null]);
   assert.match(ne.note, /いつの物か分かりません/, '分からない = 知らせ (止めない)');
 });
-await t('[5] 古い写し = CSV は出る (200・スキップ 0)・X-NE-Notes と X-NE-Warnings に知らせ / 確かめの API にも note / 新しい写し = 知らせなし', async () => {
+await t('[5] 古い写し = CSV は出る (200・スキップ 0)・知らせは X-NE-Notes だけ (X-NE-Warnings = スキップだけ) / 確かめの API にも note / 新しい写し = 知らせなし', async () => {
   putProducts(['ne001', 'ne002'], { hoursAgo: 48 });
   let r = await exportCsv([{ amazon_sku: 'pr_ok', ship_qty: 1 }]);
   assert.equal(r.status, 200, '古い写しでも止めない');
   assert.match(await csvText(r), /,ne001,0,1,/);
   assert.equal(r.headers.get('X-NE-Skipped-Count'), '0', '知らせはスキップの数に入れない');
   assert.match(notesOf(r)[0], /48 時間前/);
-  assert.match(warningsOf(r)[0], /48 時間前/, 'X-NE-Warnings の先頭にも');
+  assert.deepEqual(warningsOf(r), [], 'X-NE-Warnings = スキップだけ (知らせは X-NE-Notes = 別に数える・#1694 Codex R3 Low)');
   let j = await (await fetch(B + '/api/ne-unregistered?sku=pr_ok')).json();
   assert.deepEqual([j.ok, j.missing], [true, []]); assert.match(j.note, /48 時間前/);
   // 全部外れた (400) ときも知らせを付ける
@@ -190,6 +190,7 @@ await t('[5] 古い写し = CSV は出る (200・スキップ 0)・X-NE-Notes �
   assert.equal(r.status, 400);
   j = await r.json();
   assert.match(j.notes[0], /48 時間前/);
+  assert.ok(j.warnings.length === 1 && !j.warnings.some((x) => /時間前/.test(x)), 'warnings = スキップだけ');
   putProducts(['ne001', 'ne002'], { hoursAgo: 1 });
   r = await exportCsv([{ amazon_sku: 'pr_ok', ship_qty: 1 }]);
   assert.equal(r.status, 200);
@@ -217,7 +218,7 @@ await t('[6] 今の写しに無いコード = 知らせ・ファイルは同じ 
   assert.equal(r.status, 200, '止めない');
   assert.ok(Buffer.from(await r.arrayBuffer()).equals(original), 'ファイルは保存したまま');
   assert.match(notesOf(r)[0], /今の NE の商品の写しに無い商品コード new-draft/);
-  assert.match(warningsOf(r)[0], /new-draft/);
+  assert.equal(r.headers.get('X-NE-Warnings'), null, '再ダウンロードの知らせは X-NE-Notes だけ');
   // 写しが古い = 鮮度の知らせも
   putProducts(['ne001', 'ne002', 'new-draft'], { hoursAgo: 72 });
   r = await fetch(B + `/api/export-history/${id}/download`);
@@ -251,6 +252,37 @@ await t('[6] 画面: 再ダウンロードは取ってきてから保存し X-NE
   const add = v.slice(v.indexOf('async function addManualItem()'), v.indexOf('async function addManualItem()') + 7000);
   assert.match(add, /neNote = nj\.note \|\| null;/);
   assert.match(add, /if \(neNote\) \{ msgEl\.textContent \+=/);
+});
+
+console.log('知らせとスキップを別に数える・画面から落とさない (#1694 Codex R3)');
+await t('[7] スキップの警告が 6KB で切れても、X-NE-Warnings はスキップだけ = 画面の「ほか N 件」(Skipped-Count − 出た数) が正しい / 知らせは X-NE-Notes に全部', async () => {
+  const many = Array.from({ length: 80 }, (_, i) => ({ amazon_sku: `pr_many_${String(i).padStart(2, '0')}`, product_name: '長い名前の新商品 '.repeat(4) + i, ne_code: `new-many-${i}` }));
+  DB.upsertSkuMappings(many);
+  putProducts(['ne001', 'ne002'], { hoursAgo: 50 });
+  const r = await exportCsv([{ amazon_sku: 'pr_ok', ship_qty: 1 }, ...many.map((m) => ({ amazon_sku: m.amazon_sku, ship_qty: 1 }))]);
+  assert.equal(r.status, 200);
+  const skipped = Number(r.headers.get('X-NE-Skipped-Count'));
+  const w = warningsOf(r);
+  assert.equal(skipped, 80, 'スキップの数 = 外した SKU の数 (知らせは入れない)');
+  assert.ok(w.length > 0 && w.length < skipped, `6KB で切れている (${w.length} / ${skipped})`);
+  assert.ok(w.every((x) => /^pr_many_\d+ .*NE に未登録/.test(x)), '切れた一覧もスキップだけ (知らせが 1 枠を取らない)');
+  // 画面の「ほか N 件」= skippedCount − 出た数 = 本当に出ていないスキップの数
+  assert.equal(skipped - w.length, 80 - w.length);
+  assert.deepEqual(notesOf(r).map((x) => /50 時間前/.test(x)), [true]);
+});
+await t('[7] 画面: 手で足す「NE に未登録」の文に鮮度の知らせ (note) も入れる・全部外れた 400 の alert に notes も入れる・スキップの alert にも知らせ', async () => {
+  const v = fs.readFileSync(path.join(root, 'views', 'fba-replenishment.ejs'), 'utf8');
+  const add = v.slice(v.indexOf('async function addManualItem()'), v.indexOf('async function addManualItem()') + 7000);
+  const missing = add.slice(add.indexOf('if (nj.missing && nj.missing.length) {'), add.indexOf('neNote = nj.note || null;'));
+  assert.ok(missing.length > 50, '未登録の道が見つからない');
+  assert.match(missing, /msgEl\.textContent = [^;]*NE に未登録[^;]*nj\.note \? `[^`]*\$\{nj\.note\}/, '未登録の文に note');
+  assert.ok(missing.indexOf('nj.note') < missing.indexOf('return;'), 'return の前に note を入れる');
+  const ex = v.slice(v.indexOf("fetch(`${BASE}/api/export-ne-csv`"), v.indexOf("fetch(`${BASE}/api/export-ne-csv`") + 4000);
+  const notOk = ex.slice(ex.indexOf('if (!res.ok) {'), ex.indexOf('const skippedCount'));
+  assert.match(notOk, /const errNotes = Array\.isArray\(err\.notes\)/);
+  assert.match(notOk, /alert\('エラー: ' \+ \(err\.error \|\| 'CSV出力に失敗'\) \+ \(errNotes\.length \?/, '400 の alert に notes');
+  const okSkip = ex.slice(ex.indexOf('if (skippedCount > 0) {'), ex.indexOf('} else if (neNotes.length) {'));
+  assert.match(okSkip, /alert\(`NE受注CSVを出力しましたが[\s\S]*neNotes\.length \?/, 'スキップの alert にも知らせ');
 });
 
 server.close();

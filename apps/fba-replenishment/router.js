@@ -1516,7 +1516,8 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   let ne;
   try { ne = readNeProductCodes(getMirrorDB()); } catch (e) { ne = { ok: false, error: `NE の商品の写しを開けません: ${String(e && e.message || e).slice(0, 120)}` }; }
   if (!ne.ok) return res.status(503).json({ error: `${ne.error}。NE に商品があるかを確かめられないので、CSV を出しません`, reason: 'ne_products_unreadable' });
-  // 写しが古い・いつの物か分からない = 止めずに知らせる (#1694 Codex R2 M1・FBA 補充の現場を止めない)。X-NE-Notes と X-NE-Warnings の先頭に出す
+  // 写しが古い・いつの物か分からない = 止めずに知らせる (#1694 Codex R2 M1・FBA 補充の現場を止めない)。
+  // 知らせ (notes) とスキップ (warnings) は別に返す = X-NE-Notes / X-NE-Warnings (+ X-NE-Skipped-Count はスキップの数だけ・#1694 Codex R3 Low)
   const notes = ne.note ? [ne.note] : [];
 
   // SKU → NE商品コードに展開し、同一NE商品コードは合算
@@ -1604,7 +1605,7 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   const neItems = Object.values(neAggregated).sort((a, b) => a.ne_code.localeCompare(b.ne_code));
 
   if (neItems.length === 0) {
-    return res.status(400).json({ error: 'NE商品コードに変換できる商品がありません', warnings: [...notes, ...warnings], notes });
+    return res.status(400).json({ error: 'NE商品コードに変換できる商品がありません', warnings, notes });
   }
 
   // CSV生成（SHIFT-JIS、61列のインボイス形式）
@@ -1683,12 +1684,12 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
     // スキップされたSKUを成功時(200+CSV)でもクライアントに伝える (従来は失敗時しか warnings を返さず無音欠落だった)。
     // 件数は常に返す。詳細はヘッダー過大で CSV ダウンロード自体が失敗しないよう byte 上限(約6KB)で詰める。
     res.setHeader('X-NE-Skipped-Count', String(warnings.length));
-    // 写しの鮮度の知らせ (スキップの数には入れない)。X-NE-Warnings にも先頭に入れる = スキップがあるときの画面の一覧にも出る
+    // 写しの鮮度の知らせ = X-NE-Notes だけ (X-NE-Warnings = スキップだけ = 画面の「ほか N 件」がスキップの数と合う)
     if (notes.length) res.setHeader('X-NE-Notes', warningsHeader(notes));
-    if (warnings.length > 0 || notes.length > 0) {
+    if (warnings.length > 0) {
       const picked = [];
       let bytes = 2; // "[]" 分
-      for (const w of [...notes, ...warnings]) {
+      for (const w of warnings) {
         const enc = encodeURIComponent(JSON.stringify(w));
         if (bytes + enc.length + 1 > 6000) break; // +1 はカンマ区切り相当
         picked.push(w);
@@ -1741,10 +1742,7 @@ router.get('/api/export-history/:id/download', (req, res) => {
       let ne;
       try { ne = readNeProductCodes(getMirrorDB()); } catch (e) { ne = { ok: false, error: `NE の商品の写しを開けません: ${String(e && e.message || e).slice(0, 120)}` }; }
       const notes = historyNotes(record, ne);
-      if (notes.length) {
-        res.setHeader('X-NE-Notes', warningsHeader(notes));
-        res.setHeader('X-NE-Warnings', warningsHeader(notes));
-      }
+      if (notes.length) res.setHeader('X-NE-Notes', warningsHeader(notes));   // 知らせだけ (スキップは無い = X-NE-Warnings は出さない)
     }
     const contentType = record.type === 'manifest_excel'
       ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
