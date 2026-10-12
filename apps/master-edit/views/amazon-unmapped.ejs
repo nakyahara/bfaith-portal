@@ -26,7 +26,7 @@
       <% if (!data.tableMissing && !data.decidable) { %><div class="callout warn" id="unmapped-undecidable"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">FBA か自社発送かを読めないので、一覧を出せません</div><div class="hint">手数料の写し (fees) も Amazon の出品一覧も読めません。「0 件」ではありません。</div></div></div><% } %>
       <section class="panel">
         <div class="chips" style="margin-bottom:14px">
-          <span class="hint"><b style="color:var(--text)"><%= data.rows.length %></b> 件 (FBA) · 今日 (東京) <%= ui.fmtDay(data.today) %></span>
+          <span class="hint" id="unmapped-count"><% if (data.decidable) { %><b style="color:var(--text)"><%= data.rows.length %></b> 件 (FBA)<% } else { %><b style="color:var(--warn)">件数は読めない</b> (FBA か自社発送かを読めない)<% } %> · 今日 (東京) <%= ui.fmtDay(data.today) %></span>
         </div>
         <% if (!data.rows.length) { %>
           <div class="empty"><%= !data.decidable ? 'FBA か自社発送かを読めないので出せません (上の帯)' : data.undecided.length ? '未判定の日があります (上の帯)。分かっている日の分では、当てはまる SKU はありません。' : '当てはまる SKU はありません' %></div>
@@ -40,8 +40,8 @@
           <% } %>
         </ul>
         <% } %>
-        <% if (data.decidable && data.unknown.length) { %><div class="hint" id="unmapped-unknown" style="margin-top:10px">FBA か自社発送かが分からない SKU (手数料の写しにも Amazon の出品一覧にも無い) が <b style="color:var(--text)"><%= data.unknown.length %></b> 件あります (一覧と件数には入れていません): <% for (const r of data.unknown.slice(0, 10)) { %><a class="mono" href="sku?sku=<%= encodeURIComponent(String(r.code).trim().toLowerCase()) %>"><%= r.code %></a> <% } %><%= data.unknown.length > 10 ? 'ほか' : '' %></div><% } %>
-        <div class="hint" style="margin-top:10px">seller SKU の「対応を作る」で構成を入れられます (保存を開いた後)。FBA / 自社発送は Amazon の手数料の取得 (fees) の区分 (無ければ Amazon の出品一覧の区分) です。自社発送は 商品コード = Amazon SKU なので出しません。</div>
+        <% if (data.decidable && data.unknown.length) { %><div class="hint" id="unmapped-unknown" style="margin-top:10px">FBA か自社発送かが分からない SKU (Amazon の出品一覧にも手数料の写しにも新しい区分が無い・食い違う) が <b style="color:var(--text)"><%= data.unknown.length %></b> 件あります (一覧と件数には入れていません): <% for (const r of data.unknown.slice(0, 10)) { %><a class="mono" href="sku?sku=<%= encodeURIComponent(String(r.code).trim().toLowerCase()) %>"><%= r.code %></a> <% } %><%= data.unknown.length > 10 ? 'ほか' : '' %></div><% } %>
+        <div class="hint" style="margin-top:10px">seller SKU の「対応を作る」で構成を入れられます (保存を開いた後)。FBA / 自社発送は Amazon の出品一覧 (毎日の今の姿・36 時間以内) の区分、無ければ・古ければ Amazon の手数料の取得 (fees・7 日以内) の区分です。どちらも古い・無い・大文字小文字だけ違う SKU で食い違う = 分からない。自社発送は 商品コード = Amazon SKU なので出しません。</div>
       </section>
     <% } %>
   </div>
