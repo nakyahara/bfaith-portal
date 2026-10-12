@@ -1502,6 +1502,22 @@ export const JOBS_REGISTRY = [
 
   // ─────────────── temporary_asset (期限つきの一時物) ───────────────
   {
+    id: 'once-variation-group-from-ne',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん + Claude',
+    purpose: '一回きり: NE で直接作った色違いのまとまり (fuwear = fuwear-bk / -nd / -wh・10/8 = 自社 DB の色違いの登録がまだ使えなかった日) を、'
+      + 'Company DB のまとまりの記録 (予約・軸・選択肢・子の選択肢・revision・product-hub のカードの知らせ) にするスクリプト '
+      + 'scripts/company-db/once-variation-group-from-ne.mjs + 試験 scripts/test-once-variation-group.mjs (中原さん 10/12)。'
+      + '代表 (親) は変えない (夜間ロードが NE の代表から付けた親のまま)。定期実行はしない',
+    where: 'bfaith-portal リポジトリ (miniPC で手で dry-run → 中原さんの OK → --apply --expect-hash を 1 回)',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: 'dry-run (watcher) の表を中原さんが見る (選択肢名 = 商品名の最後の【】・軸の名前 = カラー) → OK なら --apply --expect-hash <dry-run のハッシュ> --actor <メール> --yes (COMPANY_DB_URL) → '
+      + 'product-hub のボードを開くとまとまりで 1 枚のカード。済んだら 2 ファイルを消す PR を出し、このエントリも消す。'
+      + '同じ形のまとまり (例 sanrio3soupk・smhc) を直すかは中原さんが決める (直すなら --group を変えて同じ手順)',
+  },
+  {
     id: 'lz-gas-rollback',
     type: 'temporary_asset',
     importance: 'TMP',
