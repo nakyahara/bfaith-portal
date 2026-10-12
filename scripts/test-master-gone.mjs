@@ -273,7 +273,7 @@ await ta('[C2] 理由: 日数が足りない (g08 = 2・g09 = 1) / NE にある 
   assert.deepEqual(reasons(await check('g09')), ['absent_short']);
   assert.deepEqual(reasons(await check('g03')), ['in_ne_latest']);
   assert.deepEqual(reasons(await check('keep01')), ['in_ne_latest', 'set_component']);
-  assert.deepEqual(reasons(await check('set001')), ['not_single']);
+  assert.deepEqual(reasons(await check('set001')), ['own_component_request']);   // 🆕 0072: セットもやめられる (決定 10/12 Q4 b)・set001 には開いている構成の依頼 (g07) がある
   assert.deepEqual(reasons(await check('g04')), ['set_component']);
   assert.match((await check('g04')).problems[0].text, /set001/);
   assert.deepEqual(reasons(await check('g05')), ['listing_component']);

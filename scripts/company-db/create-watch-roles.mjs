@@ -73,6 +73,8 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   for (const f of secdefFunctions) if (/^ops\.(widen_check_readonly|new_entry_lease_valid)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
   //   🆕 0071 (新商品の下書きを消す): 消してよいかの確かめ (読むだけ) = watcher も読める (消す関数は渡さない = create-master-edit-roles.mjs の master_edit だけ)
   for (const f of secdefFunctions) if (/^ops\.sku_draft_cancel_check\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
+  //   🆕 0072 (NE から消す CSV): 確かめ・断られたかの確かめ・品目の様子・一覧 (読むだけ・バイト列なし) = watcher も読める (作る・受け取る・取り下げは渡さない = master_edit だけ)
+  for (const f of secdefFunctions) if (/^ops\.(ne_del_check|ne_del_check_many|ne_del_refused_check|ne_del_item_status|ne_del_overview)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
   //   🆕 0068 (代表の数えと門 PR-6): 照合 ② の代表 (親) の生の数えの記録 (ops.record_parent_gate) = watch_writer が関数だけで書く /
   //   生の数え (ops.parent_raw_gate = drift-list・要約の読み直し)・門の状態 (ops.parent_gate_state) = watcher が読むだけ
   for (const f of secdefFunctions) if (/^ops\.record_parent_gate\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);

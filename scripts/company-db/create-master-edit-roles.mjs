@@ -46,6 +46,8 @@
  *   quarantined の代表の採用) と確かめの 4 つ (新しいまとまりのコードの決まり・products.parent が company か・子の request_id・子の数の上限) の実行と、
  *   まとまりの表 (予約・軸・選択肢・子の選択肢・revision・まとめての登録・採用の記録) の読み取りを足す (表が無い DB = 0067 の前は付けない = 流し直すと付く)。
  *   🚨 渡さない: まとまりの表の書き込み (関数だけ)・関数の中の部品 (鍵・スナップショット・revision・約束・予約の事前検査と入れる関数 = DB の持ち主だけ)
+ * 🆕 0072 (NE から消す CSV): master_edit に確かめ・作る・受け取る・取り下げ・取扱中止・一覧の 8 つの実行 (NE_DEL_FUNCTIONS)。表の権限は足さない (関数の中だけで書く・
+ *   ファイルのバイト列は ops.ne_del_download だけ)。🚨 渡さない: 表の守り・行き先・CSV のバイト列を作る部品・参照の守りの部品 (NE_DEL_OWNER_ONLY_FUNCTIONS)
  * 🆕 0070 (NE から消えた商品をやめる): master_edit と master_ops に ops.cancel_sku_gone_from_ne と確かめの 2 つ (ops.sku_gone_from_ne_check / _list) の実行
  *   (GONE_FUNCTIONS)。🚨 渡さない: ops.master_ne_absence の表・照合 ② の記録の中の部品 (ops._record_ne_absence ほか = GONE_OWNER_ONLY_FUNCTIONS)
  *
@@ -198,6 +200,16 @@ export const GONE_FUNCTIONS = Object.freeze(['ops.cancel_sku_gone_from_ne(uuid, 
 /** 🆕 0070: だれにも渡さない (照合 ② の記録の中の部品・表の守り・定数) */
 export const GONE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops._record_ne_absence(bigint, jsonb)', 'ops.guard_master_ne_absence()', 'ops.ne_gone_required_runs()', 'ops.ne_gone_fresh_hours()',
   'ops.sku_ref_cancelled(bigint[])', 'ops.guard_sku_ref_not_cancelled()']);   // #1683 R1 High 2: やめた SKU への参照を断る trigger とその部品
+/**
+ * 🆕 0072 (NE から消す CSV・中原さんの決定 10/12): 画面 (master_edit・名簿 MASTER_DECISION_APPROVERS の人) に実行だけ。無い DB (0072 の前) では付けない (流し直すと付く)。
+ *   master_ops (CLI) には渡さない (NE から消す CSV は画面だけ・「やめる」は 0070 の GONE_FUNCTIONS のまま)
+ */
+export const NE_DEL_FUNCTIONS = Object.freeze(['ops.ne_del_check(bigint, bigint[], jsonb)', 'ops.ne_del_check_many(bigint[], jsonb)', 'ops.ne_del_build(uuid, text, text, bigint[], jsonb)',
+  'ops.ne_del_download(text, bigint)', 'ops.ne_del_withdraw(uuid, text, text, bigint)', 'ops.ne_del_refused_check(bigint)', 'ops.ne_handling_build(uuid, text, text, bigint[])',
+  'ops.ne_del_item_status(bigint)', 'ops.ne_del_overview(bigint)']);
+/** 🆕 0072: だれにも渡さない (表の守り・行き先・理由の部品・在庫の鍵・CSV のバイト列・参照の守りの部品) */
+export const NE_DEL_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_ne_del_write()', 'ops.ne_del_item_transition_allowed(text, text)', 'ops._ne_del_problem(text, text)',
+  'ops.ne_del_app_stock_keys()', 'ops.ne_del_csv_bytes(text[])', 'ops.ne_handling_csv_bytes(text[])', 'ops.sku_ref_ne_deleting(bigint[])']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -282,6 +294,9 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0070 (NE から消えた商品をやめる): 関数がある DB だけ。前に付けた実行権を外してから、画面 (master_edit) と CLI (master_ops) に付け直す
   for (const f of [...GONE_FUNCTIONS, ...GONE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of GONE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit, master_ops';`));
+  // 🆕 0072 (NE から消す CSV): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (watcher の確かめ・一覧は migration が付ける = ここでは外さない)
+  for (const f of [...NE_DEL_FUNCTIONS, ...NE_DEL_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of NE_DEL_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、

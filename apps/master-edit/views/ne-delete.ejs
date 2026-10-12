@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // NE から消す (🆕 0072・lib/master-ne-delete.mjs)。上に 5 つの流れと件数 (今やること = 光る)・下に「消す商品を入れる」→ 確かめ → CSV を作る・依頼の途中・ファイル・終わった依頼。
+    // 画面の動き = public/me-nedel.js (確かめ・作る・受け取り・取り下げ・取扱中止)。押せるのは名簿 MASTER_DECISION_APPROVERS の人だけ
+    const O = overview || { items: [], exports: [], today: null };
+    const canAct = canApprove && !dbError && !closed && available;
+    const dis = canAct ? '' : ' disabled';
+    const kindLabel = { single: '単品', set: 'セット' };
+    const live = O.items.filter((i) => i.action === 'delete' && i.state === 'live');
+    const done = O.items.filter((i) => !(i.action === 'delete' && i.state === 'live'));
+    const by = (st) => live.filter((i) => i.status && i.status.status === st);
+    const refused = by('refused');
+    const expById = new Map(O.exports.map((e) => [e.export_id, e]));
+    const today = O.today;
+    const canDl = (e) => !!e && String(e.built_day) === String(today);
+    const when = (v) => (v ? ui.fmtJst(v, { nowMs }) : '');
+    const shortSha = (s) => (s ? String(s).slice(0, 8) + '…' + String(s).slice(-6) : '');
+    const ST_BADGE = { not_downloaded: 'warn', waiting: 'info', gone_counting: 'info', gone_ready: 'ok', refused: 'err', withdrawn: 'mute', handled: 'vio', gone: 'mute', recorded: 'vio' };
+    const pipe = [
+      { n: '① 確かめて作る', t: '消す CSV を作る', c: null, u: '', s: '下の欄にコードを入れて「確かめる」', hot: !live.length },
+      { n: '② ダウンロード', t: '作った日のうちに', c: by('not_downloaded').length, u: '件', s: 'セットのファイル → 単品のファイル', hot: by('not_downloaded').length > 0 },
+      { n: '③ NE で取り込む', t: '[設定] → [マスタ削除]', c: by('waiting').length, u: '件 待ち', s: 'セット商品マスタ を先に → 商品マスタ', hot: by('waiting').length > 0, ne: true },
+      { n: '④ 毎朝の確かめ', t: 'NE に 3 日続けて無い', c: by('gone_counting').length, u: '件 数えている', s: '照合が自動で数えます (1 日 1 回)', hot: false },
+      { n: '⑤ やめる', t: 'Company DB でも', c: by('gone_ready').length, u: '件 やめられる', s: '商品の画面の「NE から消えた (やめる)」', hot: by('gone_ready').length > 0 },
+    ];
+  %>
+  <div class="page" id="nd" data-base="<%= base %>" data-can="<%= canAct ? '1' : '' %>">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">NE から消す</span></nav>
+    <div class="ph">
+      <div>
+        <h1>NE から消す</h1>
+        <div class="lead">NE にもう登録した商品を、NE の「マスタ削除」で消す CSV を作ります。<b style="color:var(--text)">確かめて作る → ダウンロード → NE で取り込む (セットを先に) → 毎朝の照合が 3 日続けて NE に無いのを確かめる → Company DB でも「やめた」にする</b>。在庫が残っている商品は入れません (在庫 0 になるまで待つ)。</div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/manual#ne-delete"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
+    </div>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは CSV を作れません (<%= closedWhy %>)</div><div class="hint">見るだけです。</div></div></div><% } %>
+    <% if (!canApprove) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= approveMessage || 'NE から消すのは、マスタの判断の名簿 (MASTER_DECISION_APPROVERS) の人だけです' %> (見るだけです)</div></div><% } %>
+    <% if (!dbError && !available) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">Company DB に「NE から消す」の表 (migration 0072) がまだ入っていない、または画面のロールにまだ権限がありません。</div></div><% } %>
+
+    <section class="panel hud" aria-label="流れ">
+      <ol class="pipeline">
+        <% for (const p of pipe) { %><li class="pipe<%= p.hot ? ' hot' : '' %><%= p.c === 0 ? ' zero' : '' %><%= p.ne ? ' ne' : '' %>"><div class="pn"><%= p.n %></div><div class="pt"><%= p.t %></div><div class="pc"><%= p.c == null ? '—' : p.c %><small><%= p.u %></small></div><div class="ps"><%= p.s %></div></li><% } %>
+      </ol>
+      <% if (refused.length) { %>
+      <div class="callout err" style="margin-top:12px"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">NE が消すのを断ったかもしれない商品が <%= refused.length %> 件あります (ダウンロードから 3 日たっても NE にある)</div>
+        <div class="hint">NE は、受注・発注・セットに使っている商品を消しません。下の「依頼の途中」で選んで <b>代わりに「取扱中止」の CSV</b> を作るか、残すなら「取り下げ」てください。</div></div></div>
+      <% } %>
+    </section>
+
+    <section class="panel" aria-labelledby="h-in" id="nd-in">
+      <div class="panel-h"><span class="hico" aria-hidden="true">①</span><h2 id="h-in">消す商品を入れる</h2><span class="sub">商品コードを 1 行に 1 つ (空白・カンマで区切っても可) · 1 回に <%= MAX %> 件まで · セットと中身の単品は一緒に入れられます</span></div>
+      <div class="f wide"><label class="lab" for="nd-codes">商品コード</label>
+        <div class="ctl col"><textarea class="in mono" id="nd-codes" rows="4" spellcheck="false" autocomplete="off" placeholder="例: abc-001&#10;abc-set01"<%= dis %>><%= codes.join('\n') %></textarea>
+          <div class="buildbar" style="margin-top:8px"><button class="btn pri" type="button" id="nd-check"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>NE から消せるか確かめる</button>
+            <span class="hint">確かめるだけです (何も変えません)。Company DB が、使われていないか・在庫が 0 か (NE・ロジザード・FBA・発注アプリの注文残) を見ます。</span></div></div></div>
+      <div id="nd-results" hidden>
+        <div class="tblwrap">
+          <table class="tbl" id="nd-table">
+            <caption class="sr">確かめた結果</caption>
+            <thead><tr><th scope="col">コード</th><th scope="col">種類</th><th scope="col">消せるか</th><th scope="col">在庫 (Company DB / 今)</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="f wide" style="margin-top:12px" id="nd-go-box" hidden><label class="lab" for="nd-reason">理由<span class="req">必須</span></label>
+          <div class="ctl col"><input class="in" id="nd-reason" maxlength="200" autocomplete="off" placeholder="例: 販売をやめた (在庫を売り切った)">
+            <div class="buildbar"><button class="btn danger" type="button" id="nd-build" disabled><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>消す CSV を作る (<span id="nd-n">0</span> 件)</button>
+              <span class="hint">全部が「消せる」のときだけ作れます (1 件でも止まっていれば、その商品を外して確かめ直してください)。</span></div></div></div>
+      </div>
+      <div class="msgline" id="nd-msg" role="status" aria-live="polite"></div>
+      <div id="nd-built" hidden></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-live" id="nd-live">
+      <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-live">依頼の途中</h2><span class="sub">この商品はまだ Company DB では「業務で使える」です · 依頼の間は、新しいセットの構成・出品・Amazon の対応に入れられません</span></div>
+      <% if (!live.length) { %><div class="empty">いま NE から消す依頼の途中の商品はありません。</div><% } else { %>
+      <div class="tblwrap">
+        <table class="tbl">
+          <caption class="sr">依頼の途中の商品</caption>
+          <thead><tr><th scope="col" style="width:44px"><span class="sr">取扱中止にする</span></th><th scope="col">コード</th><th scope="col">種類</th><th scope="col">ファイル</th><th scope="col">いまの様子</th><th scope="col">やること</th></tr></thead>
+          <tbody>
+          <% for (const i of live) { const st = i.status || {}; const e = expById.get(i.export_id); const canHandle = st.status === 'refused' && i.sku_kind === 'single'; %>
+            <tr data-item="<%= i.item_id %>" data-code="<%= i.code %>">
+              <td><% if (canHandle) { %><input type="checkbox" class="pick nd-pick" value="<%= i.item_id %>" aria-label="<%= i.code %> を取扱中止の CSV に入れる"<%= dis %>><% } %></td>
+              <td class="code"><a href="<%= base %>/sku/<%= encodeURIComponent(i.code) %>"><%= i.code %></a><% if (i.ne_code !== i.code) { %><span class="sub">NE: <span class="mono"><%= i.ne_code %></span></span><% } %></td>
+              <td><span class="b <%= i.sku_kind === 'set' ? 'vio' : 'mute' %>"><%= kindLabel[i.sku_kind] %></span></td>
+              <td>#<%= i.export_id %><span class="sub"><%= e ? (e.first_downloaded_at ? when(e.first_downloaded_at) + ' にダウンロード' : 'まだダウンロードしていない') : '' %></span></td>
+              <td><span class="b <%= ST_BADGE[st.status] || 'mute' %>"><span class="dot" aria-hidden="true"></span><%= st.word || STATUS_WORDS[st.status] || st.status %></span>
+                <% if (st.status === 'gone_counting' || st.status === 'gone_ready') { %><span class="sub">NE に無い <%= st.streak %> / <%= st.required %> 日</span><% } %>
+                <% if (st.status === 'gone_counting') { for (const p of (st.gone_problems || []).filter((x) => x.reason !== 'absent_short')) { %><div class="why-wrn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span><b><%= p.word %></b>: <%= p.text %></span></div><% } } %>
+              </td>
+              <td>
+                <% if (st.status === 'gone_ready') { %><a class="btn pri sm" href="<%= base %>/sku/<%= encodeURIComponent(i.code) %>#gone-box"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>商品の画面でやめる</a><% } %>
+                <% if (st.status === 'not_downloaded' && canDl(e)) { %><button class="btn soft sm" type="button" data-dl="<%= i.export_id %>"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>ダウンロード</button><% } %>
+                <button class="btn ghost sm" type="button" data-withdraw="<%= i.item_id %>" data-code="<%= i.code %>"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-undo"/></svg>取り下げ</button>
+              </td>
+            </tr>
+          <% } %>
+          </tbody>
+        </table>
+      </div>
+      <% if (refused.some((i) => i.sku_kind === 'single')) { %>
+      <div class="f wide" style="margin-top:12px"><label class="lab" for="nh-reason">取扱中止の理由</label>
+        <div class="ctl col"><input class="in" id="nh-reason" maxlength="200" autocomplete="off" placeholder="例: NE が消すのを断った (受注が残っている) = 取扱中止にする"<%= dis %>>
+          <div class="buildbar"><button class="btn soft" type="button" id="nh-build" disabled><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>選んだ <span id="nh-n">0</span> 件の代わりに「取扱中止」の CSV を作る</button>
+            <span class="hint">NE の「商品一括登録」で取り込む CSV (見出し syohin_code,toriatukai_kbn・値 1 = 取扱中止) です。作ると「消す依頼」は終わります (商品は NE に残り、取扱中止になります)。</span></div></div></div>
+      <% } %>
+      <% } %>
+      <div class="msgline" id="nl-msg" role="status" aria-live="polite"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-files">
+      <div class="panel-h"><span class="hico" aria-hidden="true">③</span><h2 id="h-files">ファイル</h2><span class="sub">ダウンロードできるのは作った日のうちだけ (日をまたいだら、取り下げて作り直す)</span></div>
+      <% if (!O.exports.length) { %><div class="empty">まだありません。</div><% } %>
+      <% for (const e of O.exports) { %>
+      <article class="filecard<%= canDl(e) ? '' : ' closed' %>" aria-labelledby="nf-<%= e.export_id %>">
+        <div class="fh"><span class="ttl" id="nf-<%= e.export_id %>">ファイル #<%= e.export_id %></span><span class="b <%= e.kind === 'sets' ? 'vio' : e.kind === 'handling' ? 'warn' : 'mute' %>"><%= KIND_WORDS[e.kind] || e.kind %></span>
+          <% if (canDl(e)) { %><button class="btn soft sm" type="button" data-dl="<%= e.export_id %>"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>ダウンロード</button><% } %></div>
+        <div class="fmeta">
+          <span><%= e.row_count %> 行</span><span class="dotsep" aria-hidden="true"></span>
+          <span><%= e.built_by %> · <%= when(e.built_at) %> に作った</span>
+          <% if (e.first_downloaded_at) { %><span class="dotsep" aria-hidden="true"></span><span><%= e.first_downloaded_by %> · <%= when(e.first_downloaded_at) %> に初めてダウンロード (<%= e.download_count %> 回)</span><% } %>
+          <span class="dotsep" aria-hidden="true"></span><span class="shabox" title="sha256 <%= e.sha256 %>">sha256 <%= shortSha(e.sha256) %></span>
+          <span class="muted">理由: <%= e.reason %></span>
+        </div>
+      </article>
+      <% } %>
+    </section>
+
+    <% if (done.length) { %>
+    <section class="panel" aria-labelledby="h-done">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-history"/></svg></span><h2 id="h-done">終わった依頼</h2><span class="sub">30 日の中</span></div>
+      <div class="tblwrap">
+        <table class="tbl">
+          <thead><tr><th scope="col">コード</th><th scope="col">種類</th><th scope="col">ファイル</th><th scope="col">どうなった</th><th scope="col">だれが・いつ</th></tr></thead>
+          <tbody>
+          <% for (const i of done) { const st = i.action === 'handling' ? 'recorded' : i.state; %>
+            <tr><td class="code"><a href="<%= base %>/sku/<%= encodeURIComponent(i.code) %>"><%= i.code %></a></td><td><span class="b <%= i.sku_kind === 'set' ? 'vio' : 'mute' %>"><%= kindLabel[i.sku_kind] %></span></td>
+              <td>#<%= i.export_id %></td><td><span class="b <%= ST_BADGE[st] || 'mute' %>"><%= STATUS_WORDS[st] || st %></span><% if (i.state_reason) { %><span class="sub"><%= i.state_reason %></span><% } %></td>
+              <td><%= i.state_changed_by %> · <%= when(i.state_changed_at) %></td></tr>
+          <% } %>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <% } %>
+  </div>
+
+  <div class="modal-bg" id="nd-bg">
+    <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="nd-bg-t" aria-describedby="nd-bg-d">
+      <h2 id="nd-bg-t"><svg class="ic l" aria-hidden="true"><use href="#i-warn"/></svg><span id="nd-bg-n">0</span> 件を NE から消す CSV を作ります</h2>
+      <div class="hint" id="nd-bg-d" style="color:var(--text2)">NE に取り込むと、その商品は NE から消えます (元に戻せません)。一緒に <b>単品のページ情報・商品コード紐付</b> も消えます。同じ代表の子を全部消すと、代表のページ情報も消えます (NE は警告を出しません)。</div>
+      <ul><li>理由: <span id="nd-bg-why"></span></li><li>ファイル: セットがあれば「セット商品マスタ」用と「商品マスタ」用の 2 つ。<b>セットのファイルを先に</b> NE に取り込みます</li><li>ダウンロードは今日のうちだけ</li></ul>
+      <div class="mbtns"><button class="btn ghost" type="button" id="nd-bg-stay">作らない</button><button class="btn danger" type="button" id="nd-bg-ok">CSV を作る</button></div>
+    </div>
+  </div>
+  <div class="modal-bg" id="nw-bg">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="nw-bg-t">
+      <h2 id="nw-bg-t"><span class="mono" id="nw-bg-code"></span> の依頼を取り下げます</h2>
+      <div class="hint" style="color:var(--text2)">Company DB の「NE から消す依頼」だけを終わりにします。<b>ダウンロードした CSV を NE に取り込めば、NE からは消えます</b> (そのときは毎朝の照合が見つけ、商品の画面に「NE から消えた (やめる)」が出ます)。</div>
+      <div class="f wide" style="margin-top:10px"><label class="lab" for="nw-reason">理由<span class="req">必須</span></label><div class="ctl col"><input class="in" id="nw-reason" maxlength="200" autocomplete="off" placeholder="例: NE で消すのをやめた (まだ使う)"></div></div>
+      <div class="mbtns"><button class="btn ghost" type="button" id="nw-bg-stay">やめる</button><button class="btn pri" type="button" id="nw-bg-ok" disabled>取り下げる</button></div>
+    </div>
+  </div>
+  <div class="modal-bg" id="nh-bg">
+    <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="nh-bg-t">
+      <h2 id="nh-bg-t"><span id="nh-bg-n">0</span> 件の「取扱中止」の CSV を作ります</h2>
+      <div class="hint" style="color:var(--text2)">NE の [商品] → [商品一括登録] で取り込みます (消す CSV とは別の画面)。商品は NE に残り、取扱区分が「取扱中止」になります。作ると「消す依頼」は終わります。</div>
+      <ul><li>理由: <span id="nh-bg-why"></span></li></ul>
+      <div class="mbtns"><button class="btn ghost" type="button" id="nh-bg-stay">作らない</button><button class="btn pri" type="button" id="nh-bg-ok">取扱中止の CSV を作る</button></div>
+    </div>
+  </div>
+  <%- include('_footer') %>
+  <script src="<%= base %>/public/me-nedel.js?v=<%= assetV %>" defer></script>
+</body>
+</html>
