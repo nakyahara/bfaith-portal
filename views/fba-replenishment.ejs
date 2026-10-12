@@ -1295,6 +1295,25 @@
         msgEl.style.color = '#dc2626';
         return;
       }
+      // まだ NE に無い商品コード (新商品の下書き・NE 登録待ち) を構成に持つ SKU は足さない = NE 受注 CSV でも出さない (#1694)
+      try {
+        const nr = await fetch(`${BASE}/api/ne-unregistered?sku=${encodeURIComponent(sku)}`, { headers: { Accept: 'application/json' } });
+        const nj = await nr.json().catch(() => ({}));
+        if (!nr.ok || !nj.ok) {
+          msgEl.textContent = `${sku}: NE に商品があるかを確かめられないので追加しません (${nj.error || 'HTTP ' + nr.status})`;
+          msgEl.style.color = '#dc2626';
+          return;
+        }
+        if (nj.missing && nj.missing.length) {
+          msgEl.textContent = `${sku} は NE に未登録の商品コード (${nj.missing.join('・')}) を含むため追加できません（NE 登録の CSV で NE に入れて、次の朝の同期の後に）`;
+          msgEl.style.color = '#dc2626';
+          return;
+        }
+      } catch (e) {
+        msgEl.textContent = `${sku}: NE に商品があるかを確かめられないので追加しません (通信)`;
+        msgEl.style.color = '#dc2626';
+        return;
+      }
       if (existing) {
         existing.recommended_qty = qty;
         existing.adjusted_qty = qty;

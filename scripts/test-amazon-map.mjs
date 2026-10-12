@@ -1497,8 +1497,14 @@ await ta('[15] 下書き・NE 登録待ちの商品で対応を作れる (代表
   assert.notEqual(strip(now2), now2);
   assert.equal(strip(now2), fnText(rd('0067_variation_groups.sql'), 'ops.cancel_variation_child'), 'cancel_variation_child = 0067 の版 + 🆕 0074 の行だけ');
   for (const [name, after] of [['ops.amazon_map_components', '0055'], ['ops.cancel_variation_child', '0068']]) {
-    for (const f of fs.readdirSync(MIG).filter((x) => /^d{4}_.+.sql$/.test(x) && x >= after && x !== mine)) assert.equal(fnText(rd(f), name), null, `${f} にも ${name} がある (前の最新の版が変わった = 写し直す)`);
+    const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.+\.sql$/.test(x) && x >= after && x !== mine);
+    // 検査が空回りしない (#1694 Codex R1 Low): 0055〜 / 0068〜 の migration を本当に見ている (今の master で 0055〜0071 = 17 個・0068〜0071 = 4 個。増えるのはよい)
+    assert.ok(later.length >= (after === '0055' ? 17 : 4), `${name}: 見た migration が少ない (${later.length} 個)`);
+    assert.ok(later.every((f) => /^\d{4}_/.test(f) && f >= after) && later.includes('0071_sku_draft_cancel.sql'), later.join(','));
+    for (const f of later) assert.equal(fnText(rd(f), name), null, `${f} にも ${name} がある (前の最新の版が変わった = 写し直す)`);
   }
+  // fnText が本当に関数を見つけること (見つからない = いつも null = 空回り)
+  assert.ok(fnText(rd('0054_amazon_sku_maps.sql'), 'ops.amazon_map_components') && fnText(rd('0067_variation_groups.sql'), 'ops.cancel_variation_child'));
   // JS の決まり = DB の決まり
   assert.deepEqual([...A.USABLE_REG_STATES], ['draft', 'ne_pending', 'ne_confirmed', 'distributable', 'available']);
   assert.deepEqual([...A.NOT_IN_NE_REG_STATES], ['draft', 'ne_pending']);
