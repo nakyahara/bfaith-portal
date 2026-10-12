@@ -25,7 +25,7 @@ import {
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
   getPickingStats, getTodayProgress, getMissStats, statsRange, loadStatsLines, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
-import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking, returnCandidates, listRepickFirstLines, listLaterRequests, cancelLaterRequest } from './service.js';
+import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking, returnCandidates, listRepickFirstLines, listLaterRequests, cancelLaterRequest, pickingStockDraws } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
@@ -487,6 +487,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         shortageQty: line.shortage_qty ?? line.qty,
         altFree: req.body.alt_free == null ? null : Number(req.body.alt_free),
         allocations: listShortageAllocations(batchId, Number(req.body.line_seq)),
+        stockDrawsFor: (snapshotAt) => stockDrawsSafe(line.sku, snapshotAt),
       }).catch((e) => console.warn(`[picking-notify] 欠品通知失敗 (${line.sku}): ${e.message}`));
     }
     // 「後で取りに行く」を梱包タスクへ展開 (梱包が取込済みなら即・未取込なら reconcile が追いつく)
@@ -591,10 +592,19 @@ router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
   res.json({ ok: true, images: bySeq });
 }));
 
+/** 写しの後にピッキングで取る数 (失敗しても候補は出す = 引かない従来の表示に戻るだけ) */
+function stockDrawsSafe(sku, snapshotAt) {
+  try { return pickingStockDraws(sku, snapshotAt); } catch (e) {
+    console.warn(`[picking-stock] ピッキング分の差し引き失敗 (引かずに出す): ${e.message}`);
+    return null;
+  }
+}
+
 /** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
 /**
  * 欠品フローv2: 表示中明細の同一SKUの他ロケ在庫 (ロジザード毎時スナップショット) を画面に出す。
  * 取得失敗 (fetched=false) と候補ゼロ (rows=[]) は区別して返す — 失敗時に「どこにもない」を既定にしない
+ * 写しの後にピッキングで取る/取った数は引く (同じピッキングで後で取る棚を候補に出さない — 2026-10-12 現場の要望)
  */
 router.get('/api/batches/:id(\\d+)/stock-locations', api(async (req, res) => {
   const batchId = Number(req.params.id);
@@ -603,7 +613,10 @@ router.get('/api/batches/:id(\\d+)/stock-locations', api(async (req, res) => {
   if (!line) throw new PkError(404, 'line_not_found', '明細がありません');
   if (!stockLookupConfigured()) return res.json({ ok: true, configured: false, fetched: false, rows: [] });
   const data = await fetchStockLocations(line.sku);
-  const out = listStockCandidates(data, { excludeBlock: line.block, excludeLocation: line.location, groupByLocation: true, maxRows: 40 });
+  const out = listStockCandidates(data, {
+    excludeBlock: line.block, excludeLocation: line.location, groupByLocation: true, maxRows: 40,
+    draws: data ? stockDrawsSafe(line.sku, data.importedAt) : null,
+  });
   res.json({ ok: true, configured: true, sku: line.sku, ...out });
 }));
 

@@ -138,6 +138,36 @@ export async function fetchStockBlock(blockCode, fetchFn = fetch) {
   }
 }
 
+/** ピッキングで取る数 (draws) のキー。ロケ表記の違い (00200305 / 002-003-05) を数字に揃える */
+export function stockDrawKey(block, location) {
+  return `${String(block || '')}\u001f${normalizeLocationDigits(location)}`;
+}
+
+/**
+ * 在庫の写し (毎時) の後にピッキングで取る/取った数を、ロケのフリー在庫から引く (2026-10-12 現場の要望)。
+ * 写しの後に取り込んだピッキングの引当はロジザードの写しにまだ入っていないので、
+ * そのままだと「同じピッキングで後で取る棚」が他ロケ候補に出て、行ってみると数が足りない。
+ * 同じロケの期限違いロットは期限の近い順に引く。depleted (写しの後に欠品と報告された棚) は 0 にする。
+ */
+function applyStockDraws(rows, draws) {
+  if (!draws || draws.size === 0) return rows;
+  const left = new Map();
+  const after = new Map();
+  const byExpiry = [...rows].sort((a, b) => String(a.expiry || '9999').localeCompare(String(b.expiry || '9999')));
+  for (const r of byExpiry) {
+    const k = stockDrawKey(r.block, r.location);
+    const d = draws.get(k);
+    if (!d) continue;
+    const free = Number(r.free);
+    if (d.depleted) { after.set(r, 0); continue; }
+    const rest = left.has(k) ? left.get(k) : (Number(d.qty) || 0);
+    const take = Math.max(0, Math.min(rest, free));
+    left.set(k, rest - take);
+    after.set(r, free - take);
+  }
+  return rows.map((r) => (after.has(r) ? { ...r, free: after.get(r) } : r));
+}
+
 /**
  * 通知メッセージ用の他ロケ在庫セクションを組み立てる。
  * - 良品のみ・フリー在庫 (在庫数-引当数) が正のロケのみ・欠品報告のあったロケは除外
@@ -154,14 +184,16 @@ export function listStockCandidates(data, {
   // 画面用: 同一ロケのロット/期限違いを1行にまとめ (free合計・期限は最も近いもの)、件数上限をかける。
   // 通知本文 (LINE/GChat) は従来どおり期限ロットごとの行
   groupByLocation = false, maxRows = null,
+  // 写しの後にピッキングで取る/取った数 (service.pickingStockDraws)。Map: stockDrawKey → { qty, depleted }
+  draws = null,
 } = {}) {
   if (!data) return { fetched: false, stamp: null, stale: true, rows: [] };
   const excludeDigits = normalizeLocationDigits(excludeLocation);
-  const candidates = (data.locations || [])
+  const candidates = applyStockDraws((data.locations || [])
     .filter((r) => String(r.quality || '') === '良品')
     .filter((r) => !(excludeDigits
       && String(r.block || '') === String(excludeBlock || '')
-      && normalizeLocationDigits(r.location) === excludeDigits))
+      && normalizeLocationDigits(r.location) === excludeDigits)), draws)
     .filter((r) => Number(r.free) > 0);
   // 棚ロケ (8桁数字に正規化できるもの) を先に、それ以外 (ロジザード上の特殊ロケ。
   // 実データに ZZZ-ZZZ-ZZ が存在) を後ろに並べる。特殊ロケも実在のロケコードなので、
@@ -212,10 +244,10 @@ export function listStockCandidates(data, {
 export function buildStockLocationsText(data, {
   excludeBlock, excludeLocation, now = new Date(),
   // stock-bot (GChat在庫検索) からの流用用: 見出しと表示行数を差し替えられる
-  title = '他ロケ在庫', maxLines = MAX_LINES,
+  title = '他ロケ在庫', maxLines = MAX_LINES, draws = null,
 } = {}) {
   if (!data) return `📍 ${title}: 取得できず`;
-  const { stamp, stale, rows } = listStockCandidates(data, { excludeBlock, excludeLocation, now });
+  const { stamp, stale, rows } = listStockCandidates(data, { excludeBlock, excludeLocation, now, draws });
   const header = `📍 ${title} (${stamp || `在庫日${data.stockDate || '不明'}`}時点${stale ? ' ⚠古い可能性' : ''})`;
   if (rows.length === 0) return `${header}: なし`;
   const lines = rows.slice(0, maxLines).map((r) => {

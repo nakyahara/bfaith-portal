@@ -13,6 +13,7 @@ import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
 import { getDB, getBatch, getBatchByTbNo, listLines, utcNow, jstToday } from './db.js';
 import { suggestPatterns } from './patterns.js';
 import { getImageMap, queueEnsureImages } from './images.js';
+import { stockDrawKey } from './stock-locations.js';
 
 /** 業務エラー。router が status + message に変換する。 */
 export class PkError extends Error {
@@ -1535,6 +1536,44 @@ export async function returnCandidates(task, { fetchFn = fetch, now = new Date()
     && sl.normalizeLocationDigits(r.location) === sl.normalizeLocationDigits(picked.location);
   return { ...base, rows: c.rows.filter((r) => !same(r)), fetched: c.fetched, stale: c.stale, stamp: c.stamp, truncated: c.truncated || 0 };
 }
+/**
+ * 他ロケ候補から引く「ロジザード在庫の写し (毎時) の後にピッキングで取る/取った数」(2026-10-12 現場の要望)。
+ *   現場の声: 同じピッキングで引き当たっている棚が「他の棚から取る」の候補に出て、行ったら取れなかった。
+ *   - 写しの後に取り込んだピッキング (origin=import) の明細 = ロジザードの引当が写しにまだ入っていない
+ *     → 未ピック・ピック済みとも明細の数を引く (写しより前の取込は写しの引当数に入っているので引かない)
+ *   - 写しの後に欠品と報告された棚 → depleted (行っても無い)
+ *   - 写しの後に他ロケで確保した数 → そのロケから引く (ロジザードの減算は事務の手作業で、写しに入っていない)
+ * 取込の少し前にロジザードで引き当てて、その間に写しが取られると二重に引く (棚が少なく見える)。
+ * そのときも「後で取りに行く」で逃げられるので、空の棚に歩かせない方を選ぶ。
+ * @returns {Map<string, {qty:number, depleted:boolean}>} キー = stockDrawKey(block, location)
+ */
+export function pickingStockDraws(sku, snapshotAt, db = getDB()) {
+  const draws = new Map();
+  const t = Date.parse(snapshotAt || '');
+  const code = String(sku || '').trim().toLowerCase();
+  if (!Number.isFinite(t) || !code) return draws;
+  const since = new Date(t).toISOString().slice(0, 19) + 'Z';   // utcNow() と同じ形 (文字列で比較する)
+  const at = (block, location) => {
+    const k = stockDrawKey(block, location);
+    if (!draws.has(k)) draws.set(k, { qty: 0, depleted: false });
+    return draws.get(k);
+  };
+  const lines = db.prepare(`
+    SELECT l.block, l.location, l.qty FROM pk_lines l JOIN pk_batches b ON b.id = l.batch_id
+    WHERE b.created_at >= ? AND b.origin = 'import' AND b.validity = 'valid' AND b.status != 'cancelled'
+      AND l.status IN ('pending', 'done') AND lower(trim(l.sku)) = ?`).all(since, code);
+  for (const l of lines) at(l.block, l.location).qty += Number(l.qty) || 0;
+  const shorts = db.prepare(`
+    SELECT l.block, l.location, l.alt_block, l.alt_location, l.alt_qty FROM pk_lines l JOIN pk_batches b ON b.id = l.batch_id
+    WHERE l.status = 'shortage' AND l.done_at >= ? AND b.validity = 'valid' AND b.status != 'cancelled'
+      AND lower(trim(l.sku)) = ?`).all(since, code);
+  for (const s of shorts) {
+    at(s.block, s.location).depleted = true;
+    if (Number(s.alt_qty) > 0 && s.alt_location) at(s.alt_block, s.alt_location).qty += Number(s.alt_qty);
+  }
+  return draws;
+}
+
 async function fetchStockLocationsSafe(sl, sku, fetchFn) {
   try { return await sl.fetchStockLocations(sku, fetchFn); } catch { return null; }
 }
