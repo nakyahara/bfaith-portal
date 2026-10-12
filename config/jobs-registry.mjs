@@ -1506,21 +1506,31 @@ export const JOBS_REGISTRY = [
     type: 'temporary_asset',
     importance: 'TMP',
     owner: '中原さん + Claude',
-    purpose: '一回きり: NE で直接作った色違いのまとまり (fuwear = fuwear-bk / -nd / -wh・10/8 = 自社 DB の色違いの登録がまだ使えなかった日) を、'
+    purpose: '一回きり: NE で直接作った色違いのまとまり 3 つ (fuwear = 10/8・sanrio3soupk = 10/8・smhc = 10/5 = 自社 DB の色違いの登録がまだ使えなかった日) を、'
       + 'Company DB のまとまりの記録 (予約・軸・選択肢・子の選択肢・revision・product-hub のカードの知らせ) にするスクリプト '
-      + 'scripts/company-db/once-variation-group-from-ne.mjs + 試験 scripts/test-once-variation-group.mjs (中原さん 10/12)。'
-      + '代表 (親) は変えない (夜間ロードが NE の代表から付けた親のまま)。定期実行はしない',
-    where: 'bfaith-portal リポジトリ (miniPC で手で dry-run → 中原さんの OK → --apply --expect-hash を 1 回)',
+      + 'scripts/company-db/once-variation-group-from-ne.mjs + 試験 scripts/test-once-variation-group.mjs (中原さん 10/12 = 3 つとも直す)。'
+      + '代表 (親) は変えない (夜間ロードが NE の代表から付けた親のまま)。代表 (products.parent) の切替 (widen) の後だけ書ける。定期実行はしない',
+    where: 'bfaith-portal リポジトリ (miniPC で手で、まとまりごとに dry-run → --apply --expect-hash を 1 回ずつ)',
     remove_by: '2026-11-30',
     lifecycle: 'temporary',
-    runbook: '🚨 代表 (products.parent) の切替 (widen) の後だけ書ける (前は「切替の後に流す」で止まる)。'
-      + '① 照合 ② (daily-sync のマスタ照合) が今日の NE の取得で済んだ後に dry-run (watcher・--group fuwear --actor <メール>) → 表を中原さんが見る (選択肢名 = 商品名の最後の【】・軸の名前 = カラー) → '
-      + '② OK なら同じ --actor で --apply --expect-hash <dry-run のハッシュ> --yes (COMPANY_DB_URL)。commit の答えが分からないと出たら、出た「書けた / 書けていない / 分からない」に従う '
-      + '(分からない = select status from ops.master_edit_requests where request_id = <出た request_id> で確かめる) → '
-      + '③ product-hub のボードを開く → select status, result ->> \'outcome\', error from ops.product_hub_outbox where group_product_id = <まとまり> で done (created / linked) を確かめる。'
-      + 'conflict = 同じコードのカードがほかの商品・まとまりに結ばれている / 2 枚ある: 自動で直さない。product-hub で古いカードを確かめて片付け (除外・コードを外す) てから、'
+    runbook: '🚨 代表 (products.parent) の切替 (widen) の後だけ書ける (前は「切替の後に流す」で止まる)。順番 = widen → その日の照合 ② (daily-sync のマスタ照合) が終わる → '
+      + 'まとまりごとに dry-run → 同じ --actor・--axis-name・--names・--reason で --apply --expect-hash <その dry-run のハッシュ> --yes → product-hub の outbox が done か確かめる。'
+      + '🚨 --actor・--axis-name・--names・--reason は計画のハッシュに入る = apply は dry-run と同じ指定 (省くとハッシュが違って止まる)。照合の封は 36 時間で古くなる・widen の前のハッシュは使えない。'
+      + 'miniPC の PowerShell (リポジトリ直下・値は一重引用符):'
+      + ' 準備 = $env:DOTENV_CONFIG_PATH = \'C:\\Users\\bfaith\\bfaith-portal\\.env\'; $A = \'<人のメール>\'。'
+      + ' (1) fuwear: node -r dotenv/config scripts/company-db/once-variation-group-from-ne.mjs --group \'fuwear\' --actor $A --axis-name \'カラー\''
+      + ' → node -r dotenv/config scripts/company-db/once-variation-group-from-ne.mjs --group \'fuwear\' --actor $A --axis-name \'カラー\' --apply --expect-hash \'<(1) のハッシュ>\' --yes。'
+      + ' (2) sanrio3soupk: node -r dotenv/config scripts/company-db/once-variation-group-from-ne.mjs --group \'sanrio3soupk\' --actor $A --axis-name \'サイズ\''
+      + ' → node -r dotenv/config scripts/company-db/once-variation-group-from-ne.mjs --group \'sanrio3soupk\' --actor $A --axis-name \'サイズ\' --apply --expect-hash \'<(2) のハッシュ>\' --yes。'
+      + ' (3) smhc: node -r dotenv/config scripts/company-db/once-variation-group-from-ne.mjs --group \'smhc\' --actor $A --axis-name \'カラー\' --names \'<案 a か b>\''
+      + ' → node -r dotenv/config scripts/company-db/once-variation-group-from-ne.mjs --group \'smhc\' --actor $A --axis-name \'カラー\' --names \'<案 a か b>\' --apply --expect-hash \'<(3) のハッシュ>\' --yes。'
+      + ' smhc の --names (中原さんの答え待ち): 案 a = \'-bkg=ブラック アンティークゴールドボタン,-bks=ブラック シルバーボタン\' / 案 b = \'-bkg=ブラック ゴールドボタン,-bks=ブラック シルバーボタン\'。'
+      + ' --reason を変えるなら dry-run と apply の両方に同じ \'<理由>\' を足す。'
+      + ' commit の答えが分からないと出たら、出た「書けた / 書けていない / 分からない」に従う (分からない = select status from ops.master_edit_requests where request_id = \'<出た request_id>\' で確かめる)。'
+      + ' 確かめ = product-hub のボードを開く → select status, result ->> \'outcome\' as outcome, error from ops.product_hub_outbox where group_product_id = <まとまりの商品の番号 (fuwear 10762・sanrio3soupk 10763・smhc 10748)> で done (created / linked)。'
+      + ' conflict = 同じコードのカードがほかの商品・まとまりに結ばれている / 2 枚ある: 自動で直さない。product-hub で古いカードを確かめて片付け (除外・コードを外す) てから、'
       + 'Render で runGroupOutbox (lib/product-hub-outbox.mjs) を manual で 1 回流す (Claude に頼む)。'
-      + '済んだら 2 ファイルを消す PR を出し、このエントリも消す。許可の一覧 = fuwear・sanrio3soupk・smhc (直すかは中原さんが決める)',
+      + '3 つ済んだら 2 ファイルを消す PR を出し、このエントリも消す',
   },
   {
     id: 'lz-gas-rollback',
