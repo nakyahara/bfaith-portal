@@ -60,6 +60,7 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   { sig: 'core.apply_shipment_batch(smallint, text, bigint, jsonb, jsonb)', cls: 'guard_later', public: true, reason: '出荷の 1 伝票の入れ替え (0013)。POST /shipments の chunk が呼ぶ' },
   { sig: 'ops.amazon_map_sales_coverage(date, integer)', cls: 'guard_later', public: false, reason: 'Amazon SKU の対応の売上のそろい (日数の範囲・SECURITY DEFINER・PUBLIC なし)。マスタの入力の画面 (master_edit) が使う' },
   { sig: 'ops.amazon_map_unmapped_recent(date, integer)', cls: 'guard_later', public: false, reason: 'Amazon SKU の対応の無い最近の売上 (日数の範囲・SECURITY DEFINER・PUBLIC なし)。マスタの入力の画面 (master_edit) が使う' },
+  { sig: 'ops.amazon_sku_last_sold(text[], date)', cls: 'guard_later', public: false, since: '0074', reason: 'seller SKU (正規化) ごとの最後に売れた日 (0074・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。マスタの入力の「まだつないでいない Amazon の SKU」(apps/master-edit/amazon-unlinked.mjs の listUnlinked) が画面を開くたびに 1 回呼ぶ = 正当な呼び手がいる (閉じない)。' + 'p_since = JST の今日 - 364 日 (SOLD_LOOKBACK_DAYS 365 の固定・画面から変えられない)・p_norms = 絞り込んだ FBA の未接続の SKU (関数が 20,000 個を超えると 22023 で断る・本番は約 4,000)。Amazon 日本の 1 年の注文を ix_orders_mall_date (company_id, mall, scope_key, order_date_jst) で読み、明細は order_id・出品は主キーで引く = 1 年分を集計するので軽くはない (amazon_map_unmapped_recent の 7〜60 日より長い)。画面のロールの statement_timeout 20 秒が上限' },
   // ─── light (規則にかかるが重くない) ───
   { sig: 'mart.amazon_profit_composition_audit_since()', cls: 'light', public: true, reason: '定数 (0049 の適用の時刻)' },
   { sig: 'mart.amazon_account_fee_tax_rate(text)', cls: 'light', public: true, reason: '定数 (月の手数料の税の表)' },

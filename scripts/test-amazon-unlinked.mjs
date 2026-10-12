@@ -508,6 +508,21 @@ await ta('読めない: 画面のロールに表の権限が無い = no_privileg
   await E4.pg.close();
 });
 
+await ta('重い入口の棚卸し (heavy-entry-manifest.mjs・0074 の ops.amazon_sku_last_sold = guard_later) : 全部の migration の DB で「分けていない関数」が無い / 呼び手の上限 = since は今日 - 364 日・norms は 20,000 個まで (超えたら関数が断る)', async () => {
+  const { heavyEntryFindings, HEAVY_ENTRY_MANIFEST } = await import('./company-db/heavy-entry-manifest.mjs');
+  const e = HEAVY_ENTRY_MANIFEST.find((x) => x.sig === 'ops.amazon_sku_last_sold(text[], date)');
+  assert.deepEqual([e.cls, e.public, e.since], ['guard_later', false, '0074']);
+  assert.deepEqual(await heavyEntryFindings(db), [], '本番の --verify と同じ確かめ');
+  // 呼び手 (listUnlinked) の範囲: since = JST の今日 - 364 日 (画面から変えられない)
+  const l = await list({ q: 'fba_new1' });
+  assert.equal(l.sold.since, F.addDays(TODAY, -(U.SOLD_LOOKBACK_DAYS - 1)));
+  assert.equal(U.SOLD_LOOKBACK_DAYS, 365);
+  // 件数の上限 = 関数が 20,000 個を超える norms を断る (22023)・20,000 個ちょうどは通る
+  const many = (n) => Array.from({ length: n }, (_, i) => `n${i}`);
+  await assert.rejects(asEdit(() => pg.query('select * from ops.amazon_sku_last_sold($1::text[], $2::date)', [many(20001), F.addDays(TODAY, -364)])), (x) => x.code === '22023');
+  assert.equal((await asEdit(() => pg.query('select * from ops.amazon_sku_last_sold($1::text[], $2::date)', [many(20000), F.addDays(TODAY, -364)]))).rows.length, 0);
+});
+
 // ─────────────────────────────────────────────────────────
 console.log('\n5 隠す (ops.set_amazon_sku_hidden)');
 await ta('画面のロールは関数だけ: 隠す印・記録・出品一覧の表に直に書けない / 部品でない 2 つの関数を実行できる / ロールの一覧の定数', async () => {
