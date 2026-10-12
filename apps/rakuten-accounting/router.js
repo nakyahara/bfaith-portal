@@ -348,11 +348,19 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       return res.status(400).json({ error: 'CSVからデータを読み取れませんでした' });
     }
 
-    // 対象年月を推定（注文確定日時から）
-    const firstDate = allRows[0]?.注文確定日時 || '';
-    // 月をゼロ埋め (例 2026/3 → 2026-03)
-    const _rm = String(firstDate).match(/(\d{4})\D+(\d{1,2})/);
-    const yearMonth = _rm ? `${_rm[1]}-${String(parseInt(_rm[2], 10)).padStart(2, '0')}` : '';
+    // 対象年月を推定（注文確定日時の月ごとの行数を数え、いちばん多い月）
+    // 決済確定日でダウンロードするため前月に注文された行が混ざる → 1行目の月だと集計月がずれる。
+    // 推定は初期値で、画面の「集計月」欄で変えられる
+    const monthCounts = {};
+    for (const r of allRows) {
+      // 月をゼロ埋め (例 2026/3 → 2026-03)
+      const m = String(r.注文確定日時 || '').match(/(\d{4})\D+(\d{1,2})/);
+      if (!m) continue;
+      const ym = `${m[1]}-${String(parseInt(m[2], 10)).padStart(2, '0')}`;
+      monthCounts[ym] = (monthCounts[ym] || 0) + 1;
+    }
+    const yearMonth = Object.keys(monthCounts)
+      .sort((a, b) => monthCounts[b] - monthCounts[a] || b.localeCompare(a))[0] || '';
 
     // 商品番号解決
     const { resolved, unresolved, unresolvedTax, unresolvedSegment, zeroGenka } = resolveProducts(allRows, db);
@@ -381,6 +389,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
 
     res.json({
       yearMonth,
+      monthCounts,
       totalRows: allRows.length,
       fileCount: req.files.length,
       fileNames,
@@ -537,6 +546,10 @@ router.post('/confirm', (req, res) => {
     byTax, bySegment, excluded, mfRow, adCost, billing, pfFee } = req.body;
 
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
+  // 集計月は画面で選び直せるため形式を確かめる（YYYY-MM 以外で保存すると管理会計の月と結びつかない）
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(yearMonth))) {
+    return res.status(400).json({ error: '集計月は YYYY-MM 形式で指定してください: ' + yearMonth });
+  }
 
   try {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -675,6 +688,12 @@ function renderPage() {
       <!-- 集計概要 -->
       <div class="card">
         <h2>集計概要</h2>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
+          <label for="targetMonth"><b>集計月</b></label>
+          <input type="month" id="targetMonth" onchange="onTargetMonthChange()" style="padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:14px">
+          <span class="meta" style="margin-top:0">CSVの注文確定日時から推定しています。ずれていたらここで変えてください（確定・CSVのファイル名に使います）</span>
+        </div>
+        <div id="monthNote" class="meta"></div>
         <div id="summary"></div>
       </div>
 
@@ -776,6 +795,7 @@ function renderPage() {
   <script>
     let lastData = null;
     let billingData = null;
+    let historyMonths = []; // 確定済みの集計月（上書きの警告用）
     const fmt = n => {
       if (n === 0) return '0';
       const s = Math.round(n).toLocaleString();
@@ -839,8 +859,41 @@ function renderPage() {
       btn.textContent = 'アップロード＆集計';
     }
 
+    // ─── 集計月 ───
+    const isYearMonth = v => /^[0-9]{4}-(0[1-9]|1[0-2])$/.test(v || '');
+
+    function renderMonthNote() {
+      if (!lastData) return;
+      const counts = lastData.monthCounts || {};
+      const parts = Object.keys(counts).sort().reverse().map(ym => ym + ': ' + counts[ym].toLocaleString() + '行');
+      let html = '注文確定日時の月ごとの行数 — ' + (parts.length ? parts.join(' / ') : '読み取れませんでした');
+      const ym = lastData.yearMonth;
+      if (!isYearMonth(ym)) {
+        html += '<br><span class="negative">集計月を選んでください</span>';
+      } else {
+        if (ym !== lastData.inferredYearMonth) {
+          html += '<br><span style="color:#e67e22;font-weight:bold">推定（' + (lastData.inferredYearMonth || 'なし') + '）から ' + ym + ' に変更しています</span>';
+        }
+        if (historyMonths.includes(ym)) {
+          html += '<br><span class="negative">' + ym + ' はすでに確定済みです。確定すると上書きされます</span>';
+        }
+      }
+      document.getElementById('monthNote').innerHTML = html;
+    }
+
+    function onTargetMonthChange() {
+      if (!lastData) return;
+      const v = document.getElementById('targetMonth').value;
+      lastData.yearMonth = isYearMonth(v) ? v : '';
+      renderMonthNote();
+      updateConfirmState();
+    }
+
     function showResult(data) {
       lastData = data;
+      lastData.inferredYearMonth = data.yearMonth;
+      document.getElementById('targetMonth').value = data.yearMonth || '';
+      renderMonthNote();
       document.getElementById('result').style.display = 'block';
       document.getElementById('uploadStatus').textContent = '';
       document.getElementById('csvDownloadArea').style.display = data.detailRows ? 'block' : 'none';
@@ -852,7 +905,7 @@ function renderPage() {
       const canConfirm = !hasUnresolved;
 
       let summaryHtml = '<div class="' + (canConfirm ? 'ok' : 'warn') + '">';
-      summaryHtml += '<b>対象年月: ' + data.yearMonth + '</b> （' + data.fileCount + 'ファイル）<br>';
+      summaryHtml += '<b>' + data.fileCount + 'ファイル</b><br>';
       summaryHtml += '総行数: ' + data.totalRows + ' / 解決済: ' + data.resolvedCount + ' / 未登録商品: ' + data.unresolvedProducts.length + '件';
       if (hasUnresTax) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTax.length + '件（10%仮扱い）</span>';
       if (hasUnresSeg) summaryHtml += ' / <span class="negative">セグメント未登録: ' + data.unresolvedSegment.length + '件</span>';
@@ -1100,14 +1153,17 @@ function renderPage() {
     }
 
     function updateConfirmState() {
-      const ready = lastData && billingData;
+      const ready = lastData && billingData && isYearMonth(lastData.yearMonth);
       document.getElementById('confirmBtn').disabled = !ready;
       const pre = document.getElementById('confirmPreCheck');
       if (ready) {
         const ad = getAdCostFromBilling();
         pre.className = 'ok';
-        pre.innerHTML = '注文データ: <b>' + lastData.yearMonth + '</b>（' + lastData.totalRows + '行） / 仕訳書: <b>' + billingData.totalRows + '行</b>' + (ad ? ' / 広告費（税込）: <b>\\u00a5' + Math.round(ad).toLocaleString() + '</b>' : '');
+        pre.innerHTML = '集計月: <b>' + lastData.yearMonth + '</b>（変えるときは「集計概要」の集計月欄） / 注文データ: <b>' + lastData.totalRows + '行</b> / 仕訳書: <b>' + billingData.totalRows + '行</b>' + (ad ? ' / 広告費（税込）: <b>\\u00a5' + Math.round(ad).toLocaleString() + '</b>' : '');
         document.getElementById('adCostDisplay').textContent = '';
+      } else if (lastData && billingData) {
+        pre.className = 'warn';
+        pre.innerHTML = '「集計概要」の集計月欄で集計月を選んでから確定してください';
       } else {
         pre.className = 'warn';
         let missing = [];
@@ -1287,7 +1343,15 @@ function renderPage() {
     async function doConfirm() {
       if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
       if (!billingData) { alert('先に店舗別仕訳書CSVをアップロードしてください'); return; }
-      if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
+      if (!isYearMonth(lastData.yearMonth)) { alert('「集計概要」の集計月欄で集計月を選んでください'); return; }
+      let msg = lastData.yearMonth + ' の集計として確定しますか？';
+      if (lastData.yearMonth !== lastData.inferredYearMonth) {
+        msg += '\\n\\n※CSVから推定した月（' + (lastData.inferredYearMonth || 'なし') + '）とは別の月です。';
+      }
+      if (historyMonths.includes(lastData.yearMonth)) {
+        msg += '\\n\\n⚠️ ' + lastData.yearMonth + ' はすでに確定済みです。前の確定データは上書きされます。';
+      }
+      if (!confirm(msg)) return;
       const btn = document.getElementById('confirmBtn');
       btn.disabled = true;
       btn.textContent = '保存中...';
@@ -1329,6 +1393,8 @@ function renderPage() {
       try {
         const r = await fetchWithRetry(location.pathname + '/history', {});
         const rows = await r.json();
+        historyMonths = rows.map(row => row.year_month);
+        renderMonthNote();
         if (!rows.length) {
           document.getElementById('historyList').innerHTML = '<span class="meta">確定データはまだありません</span>';
           return;
