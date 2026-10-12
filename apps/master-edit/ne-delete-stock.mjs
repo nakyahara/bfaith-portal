@@ -6,13 +6,14 @@
  *   logizard / logizard_allocated = ロジザードの今の在庫と引当を別々に (毎時の写し mirror_logizard_stock を、この削除のためだけに読む = readLogizardForDelete)
  *     🆕 #1690 Codex R1 High 1: 一覧・商品の画面の在庫 (extras.mjs の readWarehouseStock / stockOf = 在庫数だけ・読めない値は 0) は変えない。
  *     ここは 商品ID ごとに 在庫数 と 引当数 を足し、1 行でも 0 以上の整数でない値があればその商品は「読めない」(0 にしない)・写しが古い = 全部「読めない」
- *   po_backorder = 発注アプリの注文残 (extras.mjs の readBackorders = 発注アプリと同じ数)
+ *   po_backorder = 発注アプリの注文残 (extras.mjs の readBackorders = 発注アプリと同じ数)。🆕 #1690 Codex R2 Medium 2: 値は backorderOf (読めない値を 0 にする・画面の表示用) を使わず
+ *     backorderForDelete で厳密に読む = 台帳に鍵が無い = 0 / 鍵があって 0 以上の整数 (数か数字だけの文字) でない (null・NaN・空・小数・負) = 読めない
  * どれかを読めない (写しが無い・古い・商品管理リストにその商品が無い・値が整数でない) = その商品は { unreadable: 理由 } (= DB が断る)。
  * 🚨 Company DB の在庫の日次 (NE・ロジザード) は DB の関数 (ops.ne_del_check) が自分で読む = ここでは読まない
  */
 import path from 'node:path';
 import { readPmlStock } from './sales-qty.mjs';
-import { readBackorders, backorderOf, stockStale } from './extras.mjs';
+import { readBackorders, stockStale } from './extras.mjs';
 import { readMirrorLogizardStock } from '../company-db/inventory/logizard.mjs';
 import { normProductCode } from '../purchase-orders/db.js';
 import { normSku } from '../../lib/sku-norm.js';
@@ -23,6 +24,14 @@ function countOf(v) {
   if (typeof v === 'number') return isCount(v) ? v : null;
   if (typeof v === 'string' && /^\d{1,10}$/.test(v.trim())) { const n = Number(v.trim()); return isCount(n) ? n : null; }
   return null;
+}
+
+/** 発注アプリの注文残 (削除の確かめだけ)。台帳に鍵が無い = 0 / 鍵がある = 0 以上の整数でなければ null (= 読めない)。画面の表示用の backorderOf は変えない */
+export function backorderForDelete(bo, code) {
+  if (!bo || !bo.ok || !(bo.map instanceof Map)) return null;
+  const k = normProductCode(code);
+  if (!bo.map.has(k)) return 0;
+  return countOf(bo.map.get(k));
 }
 
 /**
@@ -67,7 +76,7 @@ export async function readNeDeleteStock(skus, { now = Date.now(), readers = {} }
     const lzRow = lz && lz.ok ? (lz.map.get(s.code_norm) || { qty: 0, allocated: 0 }) : null;
     if (lzRow && lzRow.bad) why.push(lzRow.bad);
     else if (lzRow && !(isCount(lzRow.qty) && isCount(lzRow.allocated))) why.push('ロジザードの在庫の値が読めない');
-    const po = bo && bo.ok ? backorderOf(bo, s.code) : null;
+    const po = bo && bo.ok ? backorderForDelete(bo, s.code) : null;
     if (bo && bo.ok && !isCount(po)) why.push('発注アプリの注文残の値が読めない');
     if (why.length) { out.set(s.code_norm, { unreadable: why.join(' / ').slice(0, 200) }); continue; }
     const neOwn = row.total - row.fba;

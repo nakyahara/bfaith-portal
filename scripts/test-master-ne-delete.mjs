@@ -355,6 +355,10 @@ await ta('[B1] 画面のロールで作る: セット → 単品の 2 つのフ�
   // 押し直し = 前の答え・同じ番号で違う理由 = request_id_reused
   const again = await asEditTx((d) => ND.buildNeDelete(d, { actor: 'naka@test', codes: ['n01', 'set01', 'c01', 'c02', 'NdUp'], reason: '販売をやめた', requestId: rid, confirm: true }, { open: true, stockReader: zeroReader }));
   assert.equal(again.replayed, true); assert.deepEqual(again.exports, B1.exports);
+  // 🆕 #1690 Codex R2 Medium 1: 応答が失われて押し直す = 在庫を読み直す (読んだ時刻・値の証跡が変わる) = それでも前の答え (request_id_reused にしない)
+  const movingReader = async (skus) => new Map(skus.map((s) => [s.code_norm, { ...zero(), sources: { read_at: new Date().toISOString(), nonce: crypto.randomUUID() } }]));
+  const again2 = await asEditTx((d) => ND.buildNeDelete(d, { actor: 'naka@test', codes: ['n01', 'set01', 'c01', 'c02', 'NdUp'], reason: '販売をやめた', requestId: rid, confirm: true }, { open: true, stockReader: movingReader }));
+  assert.equal(again2.replayed, true); assert.deepEqual(again2.exports, B1.exports);
   const e2 = await errOf(async () => asEditTx((d) => ND.buildNeDelete(d, { actor: 'naka@test', codes: ['n01', 'set01', 'c01', 'c02', 'NdUp'], reason: '別の理由', requestId: rid, confirm: true }, { open: true, stockReader: zeroReader })));
   assert.equal(e2?.reason, 'request_id_reused');
 });
@@ -660,6 +664,11 @@ await ta('[K2] 読めない = unreadable (0 にしない): 商品管理リスト
   assert.match((await run({ logizard: async () => ({ ok: false, error: 'ロジザード無し' }) })).unreadable, /ロジザード無し/);
   assert.match((await run({ logizard: async () => lzOk({ b2: { bad: 'ロジザードの在庫数・引当数が読めない行' } }) })).unreadable, /読めない行/);
   assert.match((await run({ backorders: () => boOk({ b2: 1.5 }) })).unreadable, /注文残の値が読めない/);
+  // 🆕 #1690 Codex R2 Medium 2: 鍵があって読めない値 (null・NaN・空・負) = 読めない (0 にしない)・鍵が無い = 0
+  for (const v of [null, NaN, '', -1, 'x', undefined]) assert.match((await run({ backorders: () => boOk({ b2: v }) })).unreadable ?? '', /注文残の値が読めない/, String(v));
+  assert.equal((await run({ backorders: () => boOk({ b2: '0' }) })).po_backorder, 0);
+  assert.equal((await run({ backorders: () => boOk({ b2: 4 }) })).po_backorder, 4);
+  assert.equal((await run({ backorders: () => boOk({ other: 4 }) })).po_backorder, 0);
   assert.match((await run({ backorders: () => ({ ok: false, error: '台帳無し' }) })).unreadable, /台帳無し/);
   assert.equal((await run({})).unreadable, undefined);
 });

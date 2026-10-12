@@ -408,7 +408,7 @@ revoke all on function ops.ne_handling_csv_bytes(text[]) from public;
 
 /**
  * NE から消す CSV を作る (1 つの取引・人が理由 (200 字まで・改行なし) を書いてだけ・1〜500 件)。同じ request_id の押し直し = 前の答え (replayed)。
- *   違う人・中身 (SKU・理由・在庫の値) で同じ request_id = request_id_reused
+ *   違う人・中身 (SKU・理由) で同じ request_id = request_id_reused (アプリの在庫の値・読んだ時刻は判定に入れない = 読み直した押し直しも前の答え)
  *   鍵: 段階 (共有) → マスタの書き込み (共有・夜間ロードと並ぶ) → SKU (sku_id の順) → CSV (ops.ne_reg_lock_skus = NE 登録の CSV と並ぶ) → NE のコード (共有) →
  *       登録の状態の行 (排他・sku_id の順 = 参照を作る trigger の共有と並ぶ) → SKU の行 (排他)
  *   段階 new_open・持ち主表 = 段階の記録 (ops.reg_write_gate)。確かめ (ops.ne_del_check・同じ依頼 = 全部の SKU) が 1 件でも ok でなければ not_deletable (理由を全部)
@@ -452,7 +452,8 @@ begin
   if pg_catalog.cardinality(v_ids) <> pg_catalog.cardinality(p_sku_ids) then raise exception 'invalid_input: 同じ SKU が 2 回ある' using errcode = '22023'; end if;
   v_own := ops.master_ownership_active_map();
   perform ops.reg_write_gate(v_own);
-  v_hash := ops.reg_hash(pg_catalog.jsonb_build_object('op', 'ne_del_build', 'sku_ids', pg_catalog.to_jsonb(v_ids::text[]), 'reason', v_reason, 'app_stock', v_stock));
+  -- 押し直しの判定 = 依頼の中身 (SKU・理由) だけ。アプリの在庫 (読んだ時刻を含む) は根拠に残すだけ = 応答が失われて同じ request_id で押し直すと、在庫を読み直していても前の答え (#1690 Codex R2 Medium 1)
+  v_hash := ops.reg_hash(pg_catalog.jsonb_build_object('op', 'ne_del_build', 'sku_ids', pg_catalog.to_jsonb(v_ids::text[]), 'reason', v_reason));
   perform ops.ne_reg_lock_skus(v_ids);   -- SKU (sku_id の順) → CSV (同じ request_id の 2 つ目の押し直しはここで前の取引の commit を待つ = 下で前の答えを見る)
   select r.operation, r.actor_id, r.status, r.result, r.payload_hash into v_prev from ops.master_edit_requests r where r.request_id = p_request_id;
   if found then
