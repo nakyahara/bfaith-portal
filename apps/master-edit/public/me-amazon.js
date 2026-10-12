@@ -220,6 +220,7 @@
         + '<div class="l1"><span class="cc">' + mark(it.code, hits(it.code, [S.q.replace(/\s+/g, '')], normCode)) + '</span>'
         + '<span class="b ' + (it.kind === 'exception' ? 'err' : 'mute') + '">' + esc(it.kind_label || it.kind) + '</span>'
         + (it.reg_state ? '<span class="b ' + (REG_CLS[it.reg_state] || 'mute') + '">' + esc(REG_LABEL[it.reg_state] || it.reg_state) + '</span>' : '<span class="b mute">状態なし</span>')
+        + (it.not_in_ne && !x.off ? '<span class="b warn" title="NE 登録の CSV で NE に入るまで、FBA 補充はこの SKU を保留にします">NE 未登録 (登録待ち)</span>' : '')
         + (it.handling === 'discontinued' ? '<span class="b warn">中止</span>' : '')
         + (it.stock != null ? '<span class="st">在庫 ' + Number(it.stock).toLocaleString('ja-JP') + '</span>' : '') + '</div>'
         + '<div class="cn">' + mark(it.name || '', hits(it.name || '', words, fold)) + '</div>'

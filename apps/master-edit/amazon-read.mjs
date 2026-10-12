@@ -9,7 +9,7 @@
 import { normSku } from '../../lib/sku-norm.js';
 import { foldSearch, foldSql, likeOf, HIRA_CHARS, KATA_CHARS } from './search-fold.mjs';
 import { COMPANY_ID, jstDate, MasterWriteError } from '../../lib/master-write.mjs';
-import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage, componentUnusable, USABLE_REG_STATES, USABLE_SKU_KINDS, MAP_STATES, AMAZON_JP_SHOP_CODE, AMAZON_SKU_MAX_LEN } from '../../lib/amazon-map-write.mjs';
+import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage, componentUnusable, USABLE_REG_STATES, NOT_IN_NE_REG_STATES, USABLE_SKU_KINDS, MAP_STATES, AMAZON_JP_SHOP_CODE, AMAZON_SKU_MAX_LEN } from '../../lib/amazon-map-write.mjs';
 import { stockOf } from './extras.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
 
@@ -267,8 +267,6 @@ export const COMPONENT_SEARCH_LIMIT = 20;
 export const COMPONENT_SEARCH_Q_MAX = 60;
 const KIND_WORDS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
 const REG_WHY = Object.freeze({
-  draft: '下書き (まだ NE に登録していない)',
-  ne_pending: 'NE 登録待ち (NE で確かめた後に使えます)',
   quarantined: '要確認 (NE で見つけた商品・確かめた後に使えます)',
   cancelled: '登録をやめた商品',
 });
@@ -293,7 +291,7 @@ const HIRA_CLASS = `[${HIRA_CHARS}]`;
  *           ② 商品名の言葉 (空白で区切った言葉が全部入っている・全部の言葉を見る。言葉ごとにコードに入っていてもよい。かなの同一視 (NFKC を含む) = search-fold.mjs = 一覧と同じ = 名前だけ)
  *           ③ JAN (ぴったり・一覧の検索と同じ core.external_ids)
  *   並び: コードがぴったり → コードの前方一致 → JAN → コードの部分一致 → 名前。同じ段の中は使える商品が上・コード順。上限 limit 件 (more = もっとある)
- *   使えない商品 (例外の SKU・登録の状態が NE 確認済みより前・状態が無い) も出す = usable false と理由 (画面は灰色で押せない)。
+ *   使えない商品 (例外の SKU・要確認・状態が無い) も出す = usable false と理由 (画面は灰色で押せない)。まだ NE に無い 下書き・NE 登録待ちは使える (not_in_ne = 画面の印)。
  *   登録をやめた商品 (cancelled) は、一覧と同じく、コードをぴったり打ったときだけ出す (#1688 の一覧の決まり)。
  *   重さ: core.skus (会社の SKU は 7,400 ほど) を 1 回走査する 1 本の SQL。コードの前方一致の索引は無い (unique (company_id, code_norm) は照合順が "C" でない) が、
  *     一覧の検索 (read.mjs listSkus の q) と同じく索引なしで足りる (search-fold.mjs)。JAN は ux_external_ids_active のぴったり。
@@ -346,7 +344,7 @@ export async function searchMapComponents(db, q, { limit = COMPONENT_SEARCH_LIMI
   const items = rows.slice(0, max).map((r) => {
     const why = componentUnusableWhy(r.sku_kind, r.reg_state);
     return { code: r.code, name: r.name, kind: r.sku_kind, kind_label: KIND_WORDS[r.sku_kind] || r.sku_kind, reg_state: r.reg_state ?? null, handling: r.handling,
-      usable: !why, why, stock: r.sku_kind === 'set' ? null : stockOf(stock, r.code_norm) };
+      usable: !why, why, not_in_ne: NOT_IN_NE_REG_STATES.includes(r.reg_state), stock: r.sku_kind === 'set' ? null : stockOf(stock, r.code_norm) };
   });
   return { items, more, short: false };
 }

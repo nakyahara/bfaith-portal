@@ -392,14 +392,14 @@ await ta('[4] 版: 画面が読んだ後に構成・対応・出品が変わっ�
   assert.equal(Number((await q('select count(*)::int as n from ops.master_edit_requests where request_id = $1', [rid]))[0].n), 1);
 });
 
-await ta('[5] 構成品と形: 無い・例外の SKU・NE 確認前 (下書き) = 400 / seller SKU (大文字だけの違いは小文字に・全角の空白・制御文字・長すぎ)・名前 (空白だけ) / DB でも同じ決まり', async () => {
+await ta('[5] 構成品と形: 無い・例外の SKU・要確認 (quarantined) = 400 / seller SKU (大文字だけの違いは小文字に・全角の空白・制御文字・長すぎ)・名前 (空白だけ) / DB でも同じ決まり', async () => {
   await rejectsWith(save('new_sku2', 'x', [{ code: 'nosuch', qty: 1 }]), 400, 'invalid_input');
   await rejectsWith(save('new_sku2', 'x', [{ code: 'aexc', qty: 1 }]), 400, 'invalid_input');
   await pg.query(`select set_config('ops.registration_protocol', '1', false)`);
-  await pg.query("update ops.master_registrations set state = 'draft' where sku_id = (select sku_id from core.skus where code = 'a007')");
+  await pg.query("update ops.master_registrations set state = 'quarantined' where sku_id = (select sku_id from core.skus where code = 'a007')");
   await pg.query(`select set_config('ops.registration_protocol', '', false)`);
   const e1 = await rejectsWith(save('new_sku2', 'x', [{ code: 'a007', qty: 1 }]), 400, 'invalid_input');
-  assert.match(e1.message, /NE で確かめた商品ではありません/);
+  assert.match(e1.message, /構成品に使えない登録の状態です \(要確認/);
   await rejectsWith(save('new_sku2', 'x', [{ code: 'a001', qty: 1 }, { code: 'A001', qty: 1 }]), 400, 'invalid_input');   // 正規化で同じ
   await rejectsWith(save('new_sku2', 'x', [{ code: 'a001', qty: 1000 }]), 400, 'invalid_input');
   await rejectsWith(save('new_sku2', 'x', []), 400, 'invalid_input');
@@ -412,7 +412,7 @@ await ta('[5] 構成品と形: 無い・例外の SKU・NE 確認前 (下書き)
   const entry = (o) => JSON.stringify({ seller_sku: 'new_sku2', name: 'x', components: [{ sku_id: 0, code: 'a001', qty: 1 }], versions: { listing: null, map: null }, ...o });
   const a001 = await skuIdOf('a001'); const a007 = await skuIdOf('a007'); const aexc = await skuIdOf('aexc');
   const cases = [
-    [{ components: [{ sku_id: a007, code: 'a007', qty: 1 }] }, /component_unusable.*状態 draft/],
+    [{ components: [{ sku_id: a007, code: 'a007', qty: 1 }] }, /component_unusable.*状態 quarantined/],
     [{ components: [{ sku_id: aexc, code: 'aexc', qty: 1 }] }, /component_unusable.*例外の SKU/],
     [{ components: [{ sku_id: a001, code: 'a002', qty: 1 }] }, /component_unusable.*コードが違う/],
     [{ components: [{ sku_id: a001, code: 'a001', qty: 1.5 }] }, /invalid_value/],
@@ -1373,10 +1373,10 @@ await ta('[14] 使えない商品 = 候補に出すが usable false と理由・
     let r = await call('GET', '/api/amazon/components?q=aexc');
     assert.deepEqual([r.j.items[0].code, r.j.items[0].usable], ['aexc', false]);
     assert.match(r.j.items[0].why, /例外の SKU/);
-    await setReg('a002', 'draft');
+    await setReg('a002', 'quarantined');
     r = await call('GET', '/api/amazon/components?q=a00');
     assert.deepEqual(codesOf(r.j), ['a001', 'a003', 'a004', 'a005', 'a006', 'a007', 'a002'], '使えない a002 は同じ段 (前方一致) の最後');
-    assert.match(r.j.items.at(-1).why, /下書き/);
+    assert.match(r.j.items.at(-1).why, /要確認/);
     r = await call('GET', '/api/amazon/components?q=a002');
     assert.deepEqual([codesOf(r.j)[0], r.j.items[0].usable], ['a002', false], 'ぴったりは使えなくても一番上 (理由が分かる)');
     await setReg('a002', 'available');
@@ -1392,6 +1392,9 @@ await ta('[14] 使えない商品 = 候補に出すが usable false と理由・
       assert.equal(it.usable, !e, `${s}: 画面 ${it.usable} / DB ${e ? e.message : '通る'}`);
       assert.equal(it.usable, A.componentUnusable('single', s) === null, `${s}: lib と同じ`);
       if (!it.usable) assert.ok(it.why && it.why.length > 2, `${s}: 理由がある`);
+      // 🆕 0072 (仮): 使える = 下書き・NE 登録待ち・NE 確認済み以降 / まだ NE に無い 2 つには「NE 未登録」の印
+      assert.equal(it.usable, ['draft', 'ne_pending', 'ne_confirmed', 'distributable', 'available'].includes(s), `${s}: 使えるか`);
+      assert.equal(it.not_in_ne, ['draft', 'ne_pending'].includes(s), `${s}: NE 未登録の印`);
     }
     // やめた商品 = 前方一致・名前では出さない (一覧と同じ)・ぴったりなら理由つき
     r = await call('GET', '/api/amazon/components?q=a00');
@@ -1454,6 +1457,51 @@ await ta('[14] 画面: 欄は候補つき (combobox・候補の箱・API を呼�
   } finally { process.env.MASTER_EDIT_OPEN = '1'; }
   const m = await call('GET', '/manual');
   assert.ok(m.text.includes('NE の商品を探して選ぶ') && m.text.includes('灰色'), 'つかいかたに一言');
+});
+
+console.log('\nまだ NE に無い新商品も構成に (10/12・0072 (仮))');
+await ta('[15] 下書き・NE 登録待ちの商品で対応を作れる (代表 = 1 行目でも)・写しの決まった形に入る (形の確かめも通る)・使っている下書きは「下書きを消す」が断る / 0072 (仮) の関数 = 前の版の写し + 🆕 0074 の所だけ', async () => {
+  const keep = await regOf('a007');
+  try {
+    await setReg('a007', 'draft');
+    const c = (await call('GET', '/api/amazon/components?q=a007')).j.items[0];
+    assert.deepEqual([c.code, c.usable, c.not_in_ne, c.why], ['a007', true, true, null], '候補 = 使える・NE 未登録の印');
+    let res = await save('notne_draft', 'まだ NE に無い 2 個組', [{ code: 'a007', qty: 2 }, { code: 'a001', qty: 1 }]);
+    assert.equal(res.state, 'active');
+    assert.deepEqual(await compsOfListing('notne_draft'), [['a007', 2, 0, 'manual'], ['a001', 1, 1, 'manual']], '代表 (1 行目) が NE 未登録でも作れる');
+    await setReg('a007', 'ne_pending');
+    res = await save('notne_pending', 'NE 登録待ち', [{ code: 'a007', qty: 1 }]);
+    assert.equal(res.state, 'active');
+    // 古い表への写し (⑦-2) の決まった形 = NE にあるかは見ない・形の確かめ (validateSkuMap) も通る
+    const canon = await A.readCompanyAmazonMapCanon(db, { sellerSkus: ['notne_draft', 'notne_pending'] });
+    assert.deepEqual(canon.components.map((x) => [x.seller_sku, x.ne_code, x.quantity]).sort(), [['notne_draft', 'a001', 1], ['notne_draft', 'a007', 2], ['notne_pending', 'a007', 1]]);
+    assert.deepEqual(K.validateSkuMap(canon), []);
+    // 使っている下書きは「下書きを消す」が断る (0071・出品の構成)
+    await setReg('a007', 'draft');
+    const chk = (await q('select ops.sku_draft_cancel_check($1) as r', [await skuIdOf('a007')]))[0].r;
+    assert.ok(chk.problems.some((p) => p.reason === 'listing_component'), JSON.stringify(chk.problems));
+    // 要確認・やめた・状態なし は今までどおり断る ([5] [14])
+    await setReg('a007', 'quarantined');
+    await rejectsWith(save('notne_q', 'x', [{ code: 'a007', qty: 1 }]), 400, 'invalid_input');
+  } finally { await setReg('a007', keep); }
+  // migration の写し: 前の版 (0054 / 0067) から写して 🆕 0074 の所だけ変えた (番号を付け替えても名前で探す)
+  const MIG = path.join(path.dirname(fileURLToPath(import.meta.url)), '../db/company/migrations');
+  const rd = (f) => fs.readFileSync(path.join(MIG, f), 'utf8').replace(/\r\n/g, '\n');
+  const mine = fs.readdirSync(MIG).find((f) => /^\d{4}_amazon_map_not_in_ne\.sql$/.test(f));
+  const fnText = (t, name) => { const i = t.search(new RegExp(`create (?:or replace )?function ${name.replace(/\./g, '\\.')}\\(`)); if (i < 0) return null; const k = t.indexOf(' as $$', i); return t.slice(i, t.indexOf('$$;', k + 6) + 3).replace(/^create or replace function/, 'create function'); };
+  const strip = (t) => { const out = []; let skip = false; for (const l of t.split('\n')) { if (/🆕 0074 ここから/.test(l)) { skip = true; continue; } if (/🆕 0074 ここまで/.test(l)) { skip = false; continue; } if (skip || /🆕 0074/.test(l)) continue; out.push(l); } return out.join('\n'); };
+  const now1 = fnText(rd(mine), 'ops.amazon_map_components');
+  assert.equal(strip(now1).replace("f.state not in ('draft', 'ne_pending', 'ne_confirmed', 'distributable', 'available')", "f.state not in ('ne_confirmed', 'distributable', 'available')"),
+    fnText(rd('0054_amazon_sku_maps.sql'), 'ops.amazon_map_components'), 'amazon_map_components = 0054 の版 + 状態の 2 つだけ');
+  const now2 = fnText(rd(mine), 'ops.cancel_variation_child');
+  assert.notEqual(strip(now2), now2);
+  assert.equal(strip(now2), fnText(rd('0067_variation_groups.sql'), 'ops.cancel_variation_child'), 'cancel_variation_child = 0067 の版 + 🆕 0074 の行だけ');
+  for (const [name, after] of [['ops.amazon_map_components', '0055'], ['ops.cancel_variation_child', '0068']]) {
+    for (const f of fs.readdirSync(MIG).filter((x) => /^d{4}_.+.sql$/.test(x) && x >= after && x !== mine)) assert.equal(fnText(rd(f), name), null, `${f} にも ${name} がある (前の最新の版が変わった = 写し直す)`);
+  }
+  // JS の決まり = DB の決まり
+  assert.deepEqual([...A.USABLE_REG_STATES], ['draft', 'ne_pending', 'ne_confirmed', 'distributable', 'available']);
+  assert.deepEqual([...A.NOT_IN_NE_REG_STATES], ['draft', 'ne_pending']);
 });
 
 server.close();
