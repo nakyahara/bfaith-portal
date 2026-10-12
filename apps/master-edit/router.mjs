@@ -99,6 +99,7 @@ import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/mast
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, newSellerSkuCheckInDb, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
 import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
+import { registerAmazonUnlinkedRoutes, readAmazonReportFor } from './amazon-unlinked.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
@@ -949,6 +950,8 @@ router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbE
   const phase = await readPhaseView(db);
   res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, channel, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
 }));
+// まだつないでいない Amazon の SKU (Amazon の出品一覧にあって構成が無い・隠す / 元に戻す。10/12・amazon-unlinked.mjs)
+registerAmazonUnlinkedRoutes(router, { withPgPage, withPgApi, pageLocals, editorGate, view, readPhaseView, clock: () => clock() });
 /**
  * 新しい seller SKU の対応を作る入口 (読むだけ・保存は今までどおり /amazon/sku の画面から POST /api/amazon/save)。
  * 作ってよい (形が合う・対応が無い・似た SKU も気をつけることも無い、または checked = 画面でもう見た) = /amazon/sku?sku= へ 303
@@ -988,7 +991,9 @@ router.get('/amazon/sku', (req, res) => withPgPage(req, res, async (db, dbError)
   if (page) page.phase = { ...page.phase, owner: await screenOwner(db) };
   // 出品も対応も無い seller SKU = 先に作る形の決まり (#1685 Codex R1 High)。合わなければ画面で先に知らせて保存のボタンを出さない (保存の lib も断る)
   const newSkuProblems = page && !page.cur.listing ? (await newSellerSkuCheckInDb(db, sku)).problems : [];
-  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY });
+  // Amazon の出品一覧 (前の夜のレポート) にこの seller SKU があれば、Amazon の商品名・ASIN・出品日・FBA / 自社・状態を見せる (無い = 何も出さない・読めない = 読めないと出す)
+  const amazonReport = db ? await readAmazonReportFor(db, sku, { nowMs: clock() }) : null;
+  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY, amazonReport });
 }));
 router.post('/api/amazon/save', (req, res) => {
   const gate = editorGate(req);

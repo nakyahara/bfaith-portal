@@ -1,0 +1,273 @@
+#!/usr/bin/env node
+/**
+ * push/amazon-listings.mjs — 前の夜に想定利益の夜間 (miniPC 23:30・apps/expected-profit/fetch-listings.js) が取って残した Amazon の出品レポート
+ *   (GET_MERCHANT_LISTINGS_ALL_DATA の TSV 原文 = DATA_DIR/mall-items-history/amazon/YYYY/MM/items_amazon_*.tsv.gz・manifest.jsonl) を読み、
+ *   Company DB (Render Postgres) の ops.amazon_listing_report へ 1 要求で送る (2026-10-12 中原さん「Amazon の登録の商品名・まだつないでいない SKU」。
+ *   受け口 = POST /apps/company-db/sync/amazon-listings・受け皿 = migration 0076 (仮の番号))。
+ *
+ *   node apps/company-db/push/amazon-listings.mjs --send        ← daily-sync (毎朝 07:00 の 1 工程)。Render と同じ取得なら送らない
+ *   node apps/company-db/push/amazon-listings.mjs --dry-run     ← 読んで数えるだけ (Render は GET で読むだけ = POST しない)
+ *   [--history-dir <dir>] (既定 = env DATA_DIR → リポジトリの data/ の mall-items-history) / [--force] (安全弁を越える = 手で流すときだけ)
+ *
+ * 決め:
+ *   - 🚨 **SP-API は呼ばない** (createReport は 1 分に 1 回の制限・同じレポートを 2 回取らない)。材料は想定利益の夜間が残した原文だけ = 新しい定期実行も無い
+ *   - 送るのは manifest の最後の「Amazon・complete=true・TSV」の回 (部分取得・0 件は archive-items.mjs が complete=false / 保存しない)。
+ *     gz を開いて sha256 が manifest と合わなければ送らない (❌ = 壊れた・書きかけの履歴を Company DB に入れない)
+ *   - 世代 = その回の snapshot_at (レポートを取り終えた時刻 ms)。Render の世代と同じ・中身も同じ = 送らない (✅ 変わりなし)。Render の方が新しい = 送らない (⚠️)
+ *   - 列は日本語の見出し (日本のマーケットプレイスの今の形) と英語の見出し (SP-API の説明の形) のどちらでも読む (HEADER_ALIASES)。
+ *     seller SKU の列が無い = ❌ (別の形のレポート)。ほかの列が無い = その値を null で送り ⚠️ (例: 商品名の列が無い → 画面に商品名が出ない理由が朝の通知で分かる)
+ *   - 🚨 1 行の違反で全部を捨てない: SKU が空・同じ SKU が 2 行目以降・形が読めない (列の数が見出しと違う = 説明の中の改行など) 行は外して数える (skipped_count)。
+ *     ただし外した行が多い (max(20, 2%)) = レポートの形が変わった疑い = 送らない (❌)
+ *   - 🛑 安全弁: Render に前の回があり、行が前の 80% 未満 = 送らない (❌・既存の行を消さない)。わざと減ったときだけ --force (手で流す)
+ *   - Render に 0076 がまだ無い (status が 409 not_migrated) = ⚠️ で exit 0 (マージから migrate (中原さんの指示の後) までの朝を ❌ にしない)
+ *   - 取得が古い (36 時間より前 = 想定利益の夜間が止まっている疑い) = 送るが ⚠️ (想定利益の台帳 expected-profit-nightly の見張りとは別に、朝の通知でも分かる)
+ * 最後の 1 行が daily-sync の朝の通知に載る。❌ = exit 1 (retry に載る)・⚠️ / ✅ = exit 0
+ * env: DATA_DIR / RENDER_MIRROR_URL (RENDER_PORTAL_URL) / MIRROR_SYNC_KEY
+ */
+import 'dotenv/config';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { fileURLToPath } from 'node:url';
+import { postJson, HTTP_TIMEOUT_MS } from './pipeline.mjs';
+import { syncBase } from './ne-shipments.mjs';
+import { listingRowOf, listingChecksum, bySku, canonPrice, SHOP_CODE, MAX_ROWS } from '../ingest/amazon-listings.mjs';
+
+export const MAX_BODY_BYTES = 11 * 1024 * 1024;   // 受け口の parser は 12MB
+export const GUARD_MIN_ROW_RATIO = 0.8;           // 🛑 行が前の回のこの割合を下回ったら送らない
+export const SKIP_LIMIT_MIN = 20;                 // 外した行がこれと 2% の大きい方を超えたら送らない
+export const SKIP_LIMIT_RATIO = 0.02;
+export const STALE_HOURS = 36;                    // 取得がこれより古い = ⚠️
+/**
+ * 列の見出し → 送る値。日本のマーケットプレイスの今のレポートは日本語の見出し (expected-profit/fetch-listings.js の amazonRowToSnapshot・
+ *   AI_reference『商品別想定利益_要件定義』§15-4 の列)・SP-API の説明は英語の見出し (profit-calculator の在庫一覧の取込と同じ候補)。先に見つかった方を使う
+ */
+export const HEADER_ALIASES = Object.freeze({
+  seller_sku: ['出品者SKU', 'seller-sku', 'Seller SKU', 'seller_sku'],
+  item_name: ['商品名', 'item-name', 'Item Name', 'item_name'],
+  asin: ['asin1', 'ASIN1', 'ASIN 1'],
+  product_id: ['商品ID', 'product-id'],         // ASIN の形のときだけ ASIN に使う (JAN・ISBN の行がある)
+  open_date: ['出品日', 'open-date', 'Open Date'],
+  fulfillment: ['フルフィルメント・チャンネル', 'フルフィルメントチャネル', 'fulfillment-channel', 'Fulfillment Channel'],
+  status: ['ステータス', 'status', 'Status'],
+  quantity: ['数量', 'quantity', 'Quantity'],
+  price: ['価格', 'price', 'Price'],
+});
+/** 朝の通知で「無い」と知らせる列 (asin は product_id のどちらかがあればよい) */
+const WANTED = ['item_name', 'open_date', 'fulfillment', 'status'];
+const LABEL = { item_name: '商品名', open_date: '出品日', fulfillment: 'フルフィルメント・チャンネル', status: 'ステータス', asin: 'ASIN' };
+const ASIN_RE = /^[A-Z0-9]{10}$/;
+
+/** フルフィルメント・チャンネル → FBA / FBM (expected-profit/fetch-listings.js の amazonFulfillment と同じ。欠損・知らない値を FBM に倒さない) */
+export function fulfillmentOf(raw) {
+  const s = String(raw ?? '').trim().toUpperCase();
+  if (!s) return null;
+  if (s.includes('AMAZON') || s.startsWith('AFN')) return 'FBA';
+  if (s === 'DEFAULT' || s.startsWith('MFN') || s.includes('MERCHANT')) return 'FBM';
+  return null;
+}
+/** ステータス → active / inactive / incomplete / unknown (fetch-listings.js の amazonListingStatus と同じ) */
+export function statusOf(raw) {
+  const s = String(raw ?? '').trim().toLowerCase();
+  return s === 'active' || s === 'inactive' || s === 'incomplete' ? s : 'unknown';
+}
+/** 出品日の表記 ('2023-05-12 10:22:33 JST'・'2023/05/12 10:22:33 JST'・'2019-05-14 03:34:53 PDT') → 表記の日付の部分 'YYYY-MM-DD'。読めなければ null (原文は別に送る) */
+export function openDateOf(raw) {
+  const m = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T]|$)/.exec(String(raw ?? '').trim());
+  if (!m) return null;
+  const d = `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  const t = Date.parse(`${d}T00:00:00Z`);
+  return Number.isNaN(t) || new Date(t).toISOString().slice(0, 10) !== d ? null : d;
+}
+const cut = (v, max) => { const s = String(v ?? '').trim(); return s === '' ? null : s.length > max ? s.slice(0, max) : s; };
+
+/**
+ * TSV の原文 → 送る行。戻り値 = { rows (seller SKU の順), skipped: [{ line, reason }], cols: { 値 → 見出し }, missing: [値], header }
+ *   見出しに seller SKU の列が無い = 例外 (別の形のレポート)
+ */
+export function parseListingReportTsv(text) {
+  const lines = String(text ?? '').replace(/^\uFEFF/, '').split(/\r?\n/);
+  while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+  if (!lines.length) throw new Error('レポートが空 (見出しも無い)');
+  const header = lines[0].split('\t').map((h) => h.trim());
+  const cols = {};
+  for (const [k, names] of Object.entries(HEADER_ALIASES)) {
+    const i = names.map((n) => header.indexOf(n)).find((x) => x >= 0);
+    if (i !== undefined) cols[k] = i;
+  }
+  if (cols.seller_sku === undefined) throw new Error(`見出しに seller SKU の列 (${HEADER_ALIASES.seller_sku.join(' / ')}) が無い = 別の形のレポート: ${header.slice(0, 8).join(' | ').slice(0, 160)}`);
+  const missing = WANTED.filter((k) => cols[k] === undefined);
+  if (cols.asin === undefined && cols.product_id === undefined) missing.push('asin');
+  const rows = [], skipped = [], seen = new Set();
+  for (let li = 1; li < lines.length; li++) {
+    const line = lines[li];
+    if (line.trim() === '') continue;
+    const cells = line.split('\t');
+    if (cells.length !== header.length) { skipped.push({ line: li + 1, reason: `列の数が ${cells.length} (見出しは ${header.length})` }); continue; }
+    const cell = (k) => (cols[k] === undefined ? null : cells[cols[k]]);
+    const sku = String(cell('seller_sku') ?? '').trim();
+    if (!sku) { skipped.push({ line: li + 1, reason: 'seller SKU が空' }); continue; }
+    if (seen.has(sku)) { skipped.push({ line: li + 1, reason: `同じ seller SKU が 2 行目以降: ${sku.slice(0, 60)}` }); continue; }
+    const asin1 = cut(cell('asin'), 20);
+    const pid = cut(cell('product_id'), 20);
+    const asin = asin1 && ASIN_RE.test(asin1.toUpperCase()) ? asin1.toUpperCase() : pid && ASIN_RE.test(pid.toUpperCase()) && /[A-Z]/i.test(pid) ? pid.toUpperCase() : null;
+    const qtyRaw = String(cell('quantity') ?? '').trim();
+    const priceRaw = String(cell('price') ?? '').trim().replace(/,/g, '');
+    const openRaw = cut(cell('open_date'), 60);
+    const chRaw = cut(cell('fulfillment'), 60);
+    const stRaw = cut(cell('status'), 60);
+    const candidate = {
+      seller_sku: sku, item_name: cut(cell('item_name'), 2000), asin, open_date: openDateOf(openRaw), open_date_raw: openRaw,
+      fulfillment: fulfillmentOf(chRaw), channel_raw: chRaw, status: statusOf(stRaw), status_raw: stRaw,
+      quantity: /^\d{1,9}$/.test(qtyRaw) ? Number(qtyRaw) : null, price: canonPrice(priceRaw) === null ? null : priceRaw,
+    };
+    let row;
+    try { row = listingRowOf(candidate); } catch (e) { skipped.push({ line: li + 1, reason: `${sku.slice(0, 40)}: ${e.message}` }); continue; }
+    seen.add(sku);
+    rows.push(row);
+  }
+  rows.sort(bySku);
+  return { rows, skipped, cols, missing, header };
+}
+
+/** manifest.jsonl (archive-items.mjs) の最後の「Amazon・complete・TSV」の回。無ければ null。壊れた行は飛ばす */
+export function latestReportRecord(historyDir) {
+  const mf = path.join(historyDir, 'amazon', 'manifest.jsonl');
+  if (!fs.existsSync(mf)) return null;
+  const lines = fs.readFileSync(mf, 'utf8').split(/\r?\n/).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let r; try { r = JSON.parse(lines[i]); } catch { continue; }
+    if (r && r.mall === 'amazon' && r.complete === true && r.format === 'tsv' && typeof r.file === 'string' && typeof r.snapshot_at === 'string') return r;
+  }
+  return null;
+}
+
+/** 回の gz を開いて原文と sha256 (manifest の sha256 = 原文の sha256) */
+export function readReportText(historyDir, rec) {
+  const rel = String(rec.file);
+  if (rel.includes('..') || path.isAbsolute(rel)) throw new Error(`manifest の file が履歴のフォルダの外を指す: ${rel.slice(0, 80)}`);
+  const file = path.join(historyDir, rel);
+  if (!fs.existsSync(file)) throw new Error(`manifest にある履歴のファイルが無い: ${rel}`);
+  const buf = zlib.gunzipSync(fs.readFileSync(file));
+  const sha = crypto.createHash('sha256').update(buf).digest('hex');
+  if (rec.sha256 && sha !== rec.sha256) throw new Error(`履歴のファイルの sha256 が manifest と違う (壊れた・書き換わった): ${rel}`);
+  return buf.toString('utf8');
+}
+
+const isHex64 = (v) => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v);
+const fmtJst = (ms) => { const d = new Date(ms + 9 * 3600e3); return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`; };
+
+/**
+ * 送る (本体)。戻り値 = { ok, status, lastLine, rows, skipped, missing, generation, remote, record }
+ *   status = 'applied' | 'same' | 'refreshed' | 'unchanged' | 'remote_newer' | 'not_migrated' | 'dry-run' | null。送信の失敗は例外 (CLI が ❌)
+ * 差し替え (試験): fetchImpl / sleep / now
+ */
+export async function pushAmazonListings({ historyDir, fetchImpl = fetch, base, syncKey, dryRun = false, force = false, log = console.log, sleep, now = () => Date.now() } = {}) {
+  if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
+  if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
+  const out = { ok: false, status: null, rows: 0, skipped: 0, missing: [], generation: null, remote: null, record: null, lastLine: '', warn: [] };
+  let err = null;
+  try {
+    const rec = latestReportRecord(historyDir);
+    if (!rec) throw new Error(`Amazon の出品レポートの履歴が無い (${path.join(historyDir, 'amazon', 'manifest.jsonl')} に complete の TSV の回が無い = 想定利益の夜間がまだ一度も保存していない)`);
+    out.record = { file: rec.file, snapshot_at: rec.snapshot_at, run_id: rec.run_id };
+    const generation = Date.parse(rec.snapshot_at);
+    if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error(`manifest の snapshot_at が日時として読めない: ${String(rec.snapshot_at).slice(0, 40)}`);
+    if (typeof rec.run_id !== 'string' || !/^[A-Za-z0-9_.:-]{1,100}$/.test(rec.run_id)) throw new Error(`manifest の run_id が読めない: ${String(rec.run_id).slice(0, 40)}`);
+    out.generation = generation;
+    if (now() - generation > STALE_HOURS * 3600e3) out.warn.push(`取得が古い (${fmtJst(generation)}・${STALE_HOURS} 時間より前 = 想定利益の夜間が止まっている?)`);
+    const parsed = parseListingReportTsv(readReportText(historyDir, rec));
+    out.rows = parsed.rows.length; out.skipped = parsed.skipped.length; out.missing = parsed.missing;
+    if (parsed.missing.length) out.warn.push(`見出しに無い列: ${parsed.missing.map((k) => LABEL[k] || k).join('・')} (その値は空で送る)`);
+    if (parsed.skipped.length) log(`[company-db amazon-listings] 外した行 ${parsed.skipped.length}: ${parsed.skipped.slice(0, 5).map((s) => `${s.line} 行目 ${s.reason}`).join(' / ')}`);
+    const skipLimit = Math.max(SKIP_LIMIT_MIN, Math.floor((parsed.rows.length + parsed.skipped.length) * SKIP_LIMIT_RATIO));
+    if (parsed.skipped.length > skipLimit) throw new Error(`外した行が多すぎる (${parsed.skipped.length} > ${skipLimit} = レポートの形が変わった疑い・例 ${parsed.skipped.slice(0, 3).map((s) => `${s.line} 行目 ${s.reason}`).join(' / ').slice(0, 160)})`);
+    if (!parsed.rows.length) throw new Error('送る行が 0 (取れなかったを「全部の出品が消えた」と読まない)');
+    if (parsed.rows.length > MAX_ROWS) throw new Error(`行が多すぎる (${parsed.rows.length} > 受け口の上限 ${MAX_ROWS})`);
+    const checksum = listingChecksum(parsed.rows);
+    // ① Render の今の回
+    const sres = await fetchImpl(`${base}/amazon-listings/status`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+    if (sres.status === 409) {
+      const j = await sres.json().catch(() => null);
+      if (j && j.error === 'not_migrated') { out.status = 'not_migrated'; out.ok = true; return out; }
+      throw new Error(`Render の出品一覧の状態が取れない: HTTP 409 ${JSON.stringify(j).slice(0, 160)}`);
+    }
+    if (!sres.ok) throw new Error(`Render の出品一覧の状態が取れない: HTTP ${sres.status}${sres.status === 404 ? ' (Render がまだ新しい版になっていない?)' : ''} ${(await sres.text()).replace(/\s+/g, ' ').slice(0, 200)}`);
+    const sj = await sres.json();
+    if (!sj || typeof sj !== 'object' || !Object.hasOwn(sj, 'load')) throw new Error('Render の出品一覧の状態の応答に load が無い');
+    const remote = sj.load;
+    if (remote !== null && (!remote || !Number.isSafeInteger(remote.generation) || !isHex64(remote.checksum) || !Number.isInteger(remote.row_count))) throw new Error(`Render の出品一覧の状態の形が分からない: ${JSON.stringify(remote).slice(0, 160)}`);
+    out.remote = remote;
+    if (remote && remote.generation > generation) { out.status = 'remote_newer'; out.ok = true; return out; }
+    if (remote && remote.generation === generation && remote.checksum === checksum && remote.row_count === parsed.rows.length && sj.rows === remote.row_count) { out.status = 'unchanged'; out.ok = true; return out; }
+    // 🛑 安全弁 (dry-run でも止めて理由を出す)
+    const guard = remote && parsed.rows.length < remote.row_count * GUARD_MIN_ROW_RATIO ? `行が前の回 ${remote.row_count} の ${GUARD_MIN_ROW_RATIO * 100}% 未満 (${parsed.rows.length})` : null;
+    if (guard && (!force || dryRun)) throw new Error(`🛑 安全弁: ${guard} = 送らない (既存の行を消さない)。レポートを確かめ、わざとなら手で --force`);
+    if (guard) out.warn.push(`--force で安全弁を越えた: ${guard}`);
+    const body = { shop_code: SHOP_CODE, generation, snapshot_at: new Date(generation).toISOString(), report_run_id: rec.run_id, checksum, row_count: parsed.rows.length, skipped_count: parsed.skipped.length, rows: parsed.rows };
+    const bytes = Buffer.byteLength(JSON.stringify(body));
+    if (bytes > MAX_BODY_BYTES) throw new Error(`送る中身が大きすぎる (${bytes} バイト > ${MAX_BODY_BYTES})`);
+    if (dryRun) { out.status = 'dry-run'; out.ok = true; return out; }
+    // ② 送る (5xx・通信の失敗は同じ body で再送 = same になる。4xx は例外)
+    const res = await postJson(fetchImpl, { base, syncKey, path: '/amazon-listings', log, ...(sleep ? { sleep } : {}), body });
+    if (!res || !['applied', 'same', 'refreshed', 'stale'].includes(res.status)) throw new Error(`受け口の応答が分からない: ${JSON.stringify(res).slice(0, 160)}`);
+    if (res.checksum !== checksum || res.generation !== generation) throw new Error(`受け口の応答 (世代 ${res.generation} / 指紋 ${String(res.checksum).slice(0, 16)}…) が送った内容と違う`);
+    out.status = res.status;
+    if (res.status === 'stale') { out.status = 'remote_newer'; out.ok = true; return out; }
+    if (res.status === 'applied' && res.rows !== parsed.rows.length) throw new Error(`受け口が入れた行数 ${res.rows} が、送った行数 ${parsed.rows.length} と違う`);
+    out.ok = true;
+    return out;
+  } catch (e) {
+    err = e; out.ok = false; out.error = e.message;
+    throw e;
+  } finally {
+    const when = out.generation ? `取得 ${fmtJst(out.generation)}` : '';
+    const tail = `${when} / 行 ${out.rows}${out.skipped ? ` (外した行 ${out.skipped})` : ''}`;
+    const warn = out.warn.length ? ` ⚠️ ${out.warn.join(' / ')}` : '';
+    const mark = out.warn.length ? '⚠️' : '✅';
+    out.lastLine = err ? `❌ Company DB 出品一覧 (Amazon): ${String(err.message).replace(/\s+/g, ' ').slice(0, 300)}`
+      : out.status === 'not_migrated' ? '⚠️ Company DB 出品一覧 (Amazon): Render に migration 0076 がまだ無い = 送らない (中原さんの指示で migrate した後に送る)'
+      : out.status === 'dry-run' ? `dry-run: 送る予定 ${tail} / Render の今の回 ${out.remote ? fmtJst(out.remote.generation) : 'なし'}${warn} [dry-run = 送っていない]`
+      : out.status === 'unchanged' ? `${mark} Company DB 出品一覧 (Amazon): 変わりなし (Render と同じ取得) ${tail}${warn}`
+      : out.status === 'remote_newer' ? `⚠️ Company DB 出品一覧 (Amazon): Render の方が新しい取得 (${out.remote ? fmtJst(out.remote.generation) : '?'}) = 送らない ${tail}`
+      : `${mark} Company DB 出品一覧 (Amazon): ${out.status === 'applied' ? '入れ替えた' : out.status === 'refreshed' ? '中身は同じ (取得の時刻だけ進めた)' : '送り直し (same)'} ${tail}${warn}`;
+    if (err) err.result = out;   // CLI が要約の 1 行を出せるように
+  }
+}
+
+export function parseArgs(argv) {
+  const out = { send: false, dryRun: false, force: false, historyDir: null };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--send') out.send = true;
+    else if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--force') out.force = true;
+    else if (a === '--history-dir') { const v = argv[++i]; if (v === undefined || v.startsWith('--')) throw new Error('--history-dir に値が無い'); out.historyDir = v; }
+    else throw new Error(`知らない引数: ${a}`);
+  }
+  if (out.send === out.dryRun) throw new Error('--send か --dry-run のどちらか 1 つを付ける');
+  if (out.force && out.dryRun) throw new Error('--force は --send と一緒にだけ使う (dry-run は安全弁で止まって理由を出す)');
+  return out;
+}
+
+const fold = (x) => (process.platform === 'win32' ? x.toLowerCase() : x);
+const isMain = (() => { try { return !!process.argv[1] && fold(fs.realpathSync.native(process.argv[1])) === fold(fs.realpathSync.native(fileURLToPath(import.meta.url))); } catch { return false; } })();
+if (isMain) {
+  let code = 1;
+  try {
+    const a = parseArgs(process.argv.slice(2));
+    const dataDir = process.env.DATA_DIR || path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'data');
+    const historyDir = a.historyDir || path.join(dataDir, 'mall-items-history');
+    let r;
+    try { r = await pushAmazonListings({ historyDir, base: syncBase(), syncKey: process.env.MIRROR_SYNC_KEY || '', dryRun: a.dryRun, force: a.force }); }
+    catch (e) { r = e.result || { ok: false, lastLine: `❌ Company DB 出品一覧 (Amazon): ${String(e.message).replace(/\s+/g, ' ').slice(0, 300)}` }; }
+    console.log(String(r.lastLine).replace(/\s+/g, ' '));   // 最後の 1 行を複数行にしない (daily-sync が朝の通知に載せる)
+    code = r.ok ? 0 : 1;
+  } catch (e) {
+    console.log(`❌ Company DB 出品一覧 (Amazon): ${String(e.message).replace(/\s+/g, ' ').slice(0, 400)}`);
+  }
+  // 🚨 fetch の直後に process.exit() しない (Windows の Node で終了コード 127。stock-daily.mjs と同じ)
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 10000).unref();
+}

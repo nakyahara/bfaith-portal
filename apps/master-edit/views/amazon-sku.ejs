@@ -58,6 +58,7 @@
       <div>
         <section class="panel soft" aria-labelledby="h-listing">
           <div class="panel-h"><span class="hico" aria-hidden="true" style="color:var(--text2);background:rgba(255,255,255,.05)"><svg class="ic"><use href="#i-lock"/></svg></span><h2 id="h-listing">出品 (Amazon の情報)</h2><span class="sub">見るだけ · 夜間の取り込みが入れます</span></div>
+          <%- include('_amazon-report') %>
           <% if (cur.listing) { %>
           <div class="listing">
             <div><div class="k">タイトル</div><div class="v"><%= cur.listing.title || '—' %></div></div>

@@ -1,0 +1,29 @@
+<%
+  // seller SKU の画面の「Amazon の出品一覧では」(10/12・amazon-unlinked.mjs の readAmazonReportFor)。前の夜の出品レポートにこの SKU があれば、Amazon の商品名・ASIN・出品日・FBA / 自社・状態。
+  // 無い (absent) = 何も出さない / 読めない (unreadable) = 「読めない」と一言 (無いと混ぜない)
+  const rep = locals.amazonReport || null;
+  const SW = { active: ['ok', '出品中'], inactive: ['mute', '停止中'], incomplete: ['warn', '情報が足りない'], unknown: ['mute', '分からない'] };
+  const CW = { FBA: 'FBA', FBM: '自社発送' };
+  const yen = (v) => (v == null || v === '' ? '' : Number(v).toLocaleString('ja-JP') + ' 円');
+%>
+<% if (rep && rep.state === 'ok') { const r0 = rep.rows[0]; const sw = SW[r0.status] || SW.unknown; %>
+<div class="amzrep" id="amazon-report" role="group" aria-labelledby="amzrep-h">
+  <div class="amzrep-h">
+    <span class="lbl" id="amzrep-h">Amazon の出品一覧では</span>
+    <span class="amzrep-when"><%= ui.fmtJst(rep.load.snapshot_at, { nowMs }) %> 時点 (前の夜の出品レポート)</span>
+    <% if (rep.stale) { %><span class="b warn" title="取得が 36 時間より前 = 朝の取り込みか想定利益の夜間が止まっている">古い</span><% } %>
+  </div>
+  <div class="amzrep-name"><%= r0.item_name || '(Amazon の商品名が空)' %></div>
+  <div class="amzrep-grid">
+    <div><div class="k">ASIN</div><div class="v mono"><%= r0.asin || '—' %></div></div>
+    <div><div class="k">出品日</div><div class="v"><%= r0.open_date ? ui.fmtDay(r0.open_date) : (r0.open_date_raw || '—') %></div></div>
+    <div><div class="k">FBA / 自社</div><div class="v"><% if (r0.fulfillment) { %><span class="b <%= r0.fulfillment === 'FBM' ? 'vio' : 'mute' %>"><%= CW[r0.fulfillment] %></span><% } else { %><span class="muted"><%= r0.channel_raw || '分からない' %></span><% } %></div></div>
+    <div><div class="k">状態</div><div class="v"><span class="b <%= sw[0] %>"><% if (r0.status === 'active') { %><span class="dot" aria-hidden="true"></span><% } %><%= sw[1] %></span></div></div>
+    <div><div class="k">価格</div><div class="v"><%= r0.price != null ? yen(r0.price) : '—' %><% if (r0.fulfillment === 'FBM' && r0.quantity != null) { %> <span class="muted">· 数量 <%= r0.quantity %></span><% } %></div></div>
+    <div><div class="k">Amazon の seller SKU</div><div class="v mono"><%= r0.seller_sku %></div></div>
+  </div>
+  <% if (rep.rows.length > 1) { %><div class="amzrep-when" style="margin-top:6px">Amazon の出品一覧に、同じ SKU と見なす (大文字・全角・空白だけ違う) seller SKU がほかにもあります: <% for (const r of rep.rows.slice(1)) { %><span class="mono"><%= r.seller_sku %></span> <% } %></div><% } %>
+</div>
+<% } else if (rep && rep.state === 'unreadable') { %>
+<div class="amzrep-off" id="amazon-report-off">Amazon の出品一覧 (商品名・出品日): 読めません — <%= rep.message %></div>
+<% } %>

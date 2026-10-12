@@ -978,3 +978,51 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
   .create-sku .bigsearch.create { height: auto; flex-wrap: wrap; padding: 8px 12px; }
   .create-sku .bigsearch.create input { flex-basis: 60%; height: 40px; }
 }
+/* まだつないでいない Amazon の SKU (10/12・views/amazon-unlinked.ejs・public/me-amazon-unlinked.js) と seller SKU の画面の「Amazon の出品一覧では」(views/_amazon-report.ejs) */
+.amzrep { margin: 0 0 14px; padding: 12px 14px; border-radius: 12px; border: 1px solid rgba(58, 231, 255, 0.32); background: rgba(58, 231, 255, 0.05); }
+.amzrep-h { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-bottom: 4px; }
+.amzrep-h .lbl { font-size: 12.5px; color: var(--accent); letter-spacing: 0.06em; font-weight: 600; }
+.amzrep-name { font-size: 16px; font-weight: 600; color: #fff; line-height: 1.5; margin-bottom: 10px; overflow-wrap: anywhere; }
+.amzrep-when, .amzrep-off { font-size: 13px; color: var(--muted); line-height: 1.55; }
+.amzrep-off { margin: 0 0 12px; }
+.amzrep-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 18px; font-size: 14px; }
+.amzrep-grid .k { font-size: 12.5px; color: var(--muted); }
+.amzrep-grid .v { color: var(--text); overflow-wrap: anywhere; }
+.ul-sum { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-bottom: 12px; font-size: 14px; color: var(--text2); }
+.ul-sum b { font-size: 18px; color: #fff; font-variant-numeric: tabular-nums; }
+.ul-chips { margin-top: 12px; }
+#unlinked-search input { min-width: 0; }
+.ul-chips .chip[aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; }
+.ul-range { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ul-range .in { height: 32px; width: 150px; }
+.ul-list { list-style: none; display: grid; gap: 8px; margin: 0; padding: 0; }
+.ul-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 14px; align-items: center; padding: 10px 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--line-soft); min-width: 0; transition: opacity 0.2s, border-color 0.12s; }
+.ul-row:hover, .ul-row:focus-within { border-color: rgba(58, 231, 255, 0.45); background: rgba(58, 231, 255, 0.05); }
+.ul-row.hid { border-style: dashed; }
+.ul-row.gone { opacity: 0.35; pointer-events: none; }
+.ul-main { display: grid; gap: 3px; min-width: 0; color: var(--text); text-decoration: none; }
+a.ul-main:hover { text-decoration: none; }
+a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 8px; }
+.ul-sku { color: var(--accent); font-size: 14px; overflow-wrap: anywhere; }
+.ul-name { font-size: 14.5px; color: #fff; line-height: 1.5; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ul-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 13px; color: var(--text2); }
+.ul-meta .ul-kv { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ul-meta .ul-kv .k { color: var(--muted); font-size: 12px; }
+.ul-hid { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.ul-acts { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.hide-why { border: 0; margin: 12px 0 6px; padding: 0; display: grid; gap: 6px; }
+#hide-bg .in { width: 100%; }
+#hide-bg .msgline { margin-top: 8px; }
+@media (max-width: 1100px) { .amzrep-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) {
+  .ul-row { grid-template-columns: minmax(0, 1fr); }
+  .ul-acts { justify-content: stretch; }
+  .ul-acts .btn { flex: 1 1 auto; min-height: 44px; justify-content: center; }
+  .ul-meta .ul-kv { white-space: normal; }
+  .ul-range { width: 100%; }
+  .ul-range .in { flex: 1 1 120px; width: auto; min-width: 0; height: 40px; }
+  #hide-bg .btn, #hide-bg .in { min-height: 44px; }
+  #unlinked-search { padding: 0 8px 0 12px; gap: 8px; }
+  #unlinked-search .kbd { display: none; }
+  #unlinked-search input { font-size: 15px; }
+}

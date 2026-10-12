@@ -88,7 +88,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価', 'CompanyDB出品一覧(Amazon)'];
 // 🚨 Amazon の決済と財務は env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator「Amazon決済と財務」の 1 工程・無ければ今までの 2 工程「Amazon Settlement」→「CompanyDB財務(Amazon)」
 //   (finance-coordinator-switch.js・#1567。走るのはどちらか片方 = retry の対象には両方の名前を載せる)
 
@@ -691,6 +691,11 @@ async function main() {
       results.push({ name, ...r, warn: r.success && isWarnSummary(r.summary) });
     }
   }
+  // Company DB (Render Postgres) へ Amazon の出品一覧を送る (2026-10-12・受け皿 0076 (仮の番号)・画面 = マスタの入力の「まだつないでいない Amazon の SKU」と seller SKU の画面の商品名)。
+  // 材料 = 前の夜に想定利益の夜間 (ExpectedProfitNightly 23:30) が取って残した出品レポートの TSV (DATA_DIR/mall-items-history/amazon/)。SP-API は呼ばない (2 回取らない)。
+  // Render と同じ取得なら送らない・古い世代は受け口が拒む = 再実行安全。0076 がまだ Render に無い朝は ⚠️ (exit 0)
+  const cdbListingsResult = runScript('apps/company-db/push/amazon-listings.mjs --send', 'Company DB 出品一覧 (Amazon)', 300000);
+  results.push({ name: 'CompanyDB出品一覧(Amazon)', ...cdbListingsResult, warn: cdbListingsResult.success && isWarnSummary(cdbListingsResult.summary) });
 
   // 在庫スナップショット集計 (FBA + 自社倉庫の金額算出 → inv_daily_summary)
   // 上の NE/FBA スナップショットの後に必ず走る (失敗時も結果は no_source で記録)

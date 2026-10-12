@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // まだつないでいない Amazon の SKU (10/12・amazon-unlinked.mjs の listUnlinked)。Amazon の出品一覧 (前の夜の出品レポート) にあって、社内の商品 (NE の商品 × 数) とつないでいない seller SKU。
+    // 上 = 絞り込み (言葉・FBA / 自社・状態・出品日・並び・隠した SKU) / 下 = 1 行 = 1 SKU のカード (押すと対応を作る画面・右に「隠す」)。画面の動き = public/me-amazon-unlinked.js
+    const ok = data && data.state === 'ok' ? data : null;
+    const f = filters;
+    const DEF = { ch: 'FBA', st: 'all', sort: 'open_desc' };
+    const keep = Object.fromEntries(Object.entries(f).filter(([k, v]) => v && k !== 'offset' && DEF[k] !== v));
+    const hrefWith = (over) => {
+      const p = { ...keep };
+      for (const [k, v] of Object.entries(over)) { if (v && DEF[k] !== v) p[k] = v; else delete p[k]; }
+      const s = new URLSearchParams(p).toString();
+      return s ? '?' + s : '?';
+    };
+    const pageHref = (offset) => { const s = new URLSearchParams({ ...keep, ...(offset ? { offset: String(offset) } : {}) }).toString(); return s ? '?' + s : '?'; };
+    const today = ok ? ok.today : null;
+    const addDays = (d, n) => new Date(Date.parse(d + 'T00:00:00Z') + n * 864e5).toISOString().slice(0, 10);
+    const dayChips = today ? [[30, '直近 30 日'], [90, '直近 90 日'], [365, '直近 1 年']].map(([n, t]) => [addDays(today, -(n - 1)), t]) : [];
+    const SW = { active: ['ok', LISTING_STATUS_WORDS.active], inactive: ['mute', LISTING_STATUS_WORDS.inactive], incomplete: ['warn', LISTING_STATUS_WORDS.incomplete], unknown: ['mute', LISTING_STATUS_WORDS.unknown] };
+    const yen = (v) => Number(v).toLocaleString('ja-JP') + ' 円';
+    const ago = (d) => { if (!d || !today) return ''; const n = ui.dayDiff(today, d); return n == null ? '' : n <= 0 ? '今日' : n + ' 日前'; };
+    const mapWords = (r) => (r.map_state === 'deleted' ? ['mute', '対応を削除済み (墓標)'] : r.listing_id ? ['warn', '出品はある (構成なし)'] : ['warn', '対応なし']);
+  %>
+  <div class="page" id="unlinked-page">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/amazon/" data-list-back>Amazon SKU</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">まだつないでいない SKU</span></nav>
+    <div class="ph">
+      <div>
+        <h1>まだつないでいない Amazon の SKU</h1>
+        <div class="lead">Amazon に出品している (前の夜の出品一覧にある) のに、社内の商品 (NE の商品 × 数) とつないでいない seller SKU です。行を押すと、その SKU の対応を作る画面が開きます。いらない SKU (バリエーションの親・使っていない古い SKU) は「隠す」で一覧から外せます (Amazon にも対応にも触りません・元に戻せます)。</div>
+      </div>
+      <div class="ph-actions">
+        <a class="btn" href="unmapped"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg>売れたのに対応が無い SKU</a>
+        <a class="btn" href="<%= base %>/manual#amazon-unlinked"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a>
+      </div>
+    </div>
+
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
+    <% if (data && data.state === 'unreadable') { %><div class="callout warn" id="unlinked-unreadable"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">Amazon の出品一覧を読めません</div><div class="hint"><%= data.message %>。「つないでいない SKU は 0 件」ではありません。</div></div></div><% } %>
+    <% if (ok && ok.stale) { %><div class="callout warn" id="unlinked-stale"><svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg><div class="grow"><div class="t">出品一覧が古いままです (<%= ui.fmtJst(ok.load.snapshot_at, { nowMs }) %> の取得)</div><div class="hint">朝の取り込み (daily-sync の「Company DB 出品一覧 (Amazon)」) か、想定利益の夜間 (出品レポートの取得) が止まっているかもしれません。その後に出品した SKU はまだ出ません。</div></div></div><% } %>
+    <% if (amazonClosed) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">対応の保存はまだ開いていません (<%= amazonClosedWhy %>)</div><div class="hint">一覧を見る・「隠す」はできます。行を押して開く画面は、切替の日までは見るだけです (今の正は miniPC の SKU マスタ)。</div></div></div><% } %>
+    <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %> (「隠す」も名簿の人だけ)</div></div><% } %>
+
+    <% if (ok) { %>
+    <section class="panel hud" aria-label="絞り込み">
+      <div class="ul-sum" id="unlinked-sum">
+        <span><b><%= ok.counts.unlinked.toLocaleString('ja-JP') %></b> 件がまだつないでいない</span>
+        <span class="dotsep" aria-hidden="true"></span><span class="muted">出品一覧 <%= ok.counts.report.toLocaleString('ja-JP') %> 件 (つないでいる <%= ok.counts.linked.toLocaleString('ja-JP') %>)</span>
+        <span class="dotsep" aria-hidden="true"></span><span class="muted">取得 <%= ui.fmtJst(ok.load.snapshot_at, { nowMs }) %></span>
+      </div>
+      <form method="get" action="" role="search" class="bigsearch" id="unlinked-search">
+        <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="q" name="q" value="<%= f.q %>" autocomplete="off" aria-keyshortcuts="/" aria-label="seller SKU・Amazon の商品名・ASIN で絞る" placeholder="seller SKU・Amazon の商品名・ASIN で絞る　例: pr_ / はちみつ">
+        <% for (const k of ['ch', 'st', 'sort', 'from', 'to', 'hidden']) { if (f[k] && DEF[k] !== f[k]) { %><input type="hidden" name="<%= k %>" value="<%= f[k] %>"><% } } %>
+        <span class="kbd" aria-hidden="true">/</span>
+        <button class="btn pri go" type="submit">絞る</button>
+      </form>
+      <div class="chips ul-chips">
+        <span class="chip-lab">区分</span>
+        <% for (const [k, t] of [['FBA', `FBA (${ok.counts.fba})`], ['FBM', `自社発送 (${ok.counts.fbm})`], ['all', '全部']]) { %><a class="chip<%= f.ch === k ? ' on' : '' %>" href="<%= hrefWith({ ch: k }) %>"<%- f.ch === k ? ' aria-current="true"' : '' %>><%= t %></a><% } %>
+        <span class="vsep" aria-hidden="true"></span>
+        <span class="chip-lab">状態</span>
+        <% for (const [k, t] of [['all', '全部'], ['active', '出品中だけ'], ['inactive', '停止中・その他']]) { %><a class="chip<%= f.st === k ? ' on' : '' %>" href="<%= hrefWith({ st: k }) %>"<%- f.st === k ? ' aria-current="true"' : '' %>><%= t %></a><% } %>
+      </div>
+      <div class="chips ul-chips">
+        <span class="chip-lab">出品日</span>
+        <a class="chip<%= !f.from && !f.to ? ' on' : '' %>" href="<%= hrefWith({ from: '', to: '' }) %>"<%- !f.from && !f.to ? ' aria-current="true"' : '' %>>全部</a>
+        <% for (const [from, t] of dayChips) { const on = f.from === from && !f.to; %><a class="chip<%= on ? ' on' : '' %>" href="<%= hrefWith({ from, to: '' }) %>"<%- on ? ' aria-current="true"' : '' %>><%= t %></a><% } %>
+        <form method="get" action="" class="ul-range" aria-label="出品日の範囲">
+          <% for (const k of ['q', 'ch', 'st', 'sort', 'hidden']) { if (f[k] && DEF[k] !== f[k]) { %><input type="hidden" name="<%= k %>" value="<%= f[k] %>"><% } } %>
+          <label class="sr" for="ul-from">出品日 から</label><input class="in" type="date" id="ul-from" name="from" value="<%= f.from %>">
+          <span class="muted" aria-hidden="true">〜</span>
+          <label class="sr" for="ul-to">出品日 まで</label><input class="in" type="date" id="ul-to" name="to" value="<%= f.to %>">
+          <button class="btn sm" type="submit">この範囲</button>
+        </form>
+      </div>
+      <div class="chips ul-chips">
+        <span class="chip-lab">並び</span>
+        <% for (const [k, t] of Object.entries(SORTS)) { const dis = k === 'sold_desc' && !ok.sold.ok; %><% if (dis) { %><span class="chip" aria-disabled="true" title="最後に売れた日を読めない"><%= t %></span><% } else { %><a class="chip<%= f.sort === k ? ' on' : '' %>" href="<%= hrefWith({ sort: k }) %>"<%- f.sort === k ? ' aria-current="true"' : '' %>><%= t %></a><% } %><% } %>
+        <span class="vsep" aria-hidden="true"></span>
+        <a class="chip<%= f.hidden ? ' on' : '' %>" href="<%= hrefWith({ hidden: f.hidden ? '' : '1' }) %>"<%- f.hidden ? ' aria-current="true"' : '' %>>隠した SKU (<span id="hidden-count"><%= ok.counts.hidden %></span>)</a>
+      </div>
+    </section>
+
+    <% if (ok.sold.error) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= ok.sold.error %>。「最後に売れた日」の列は「読めない」と出します (売れていないとは言いません)。</div></div><% } %>
+    <% if (!ok.fba.ok) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">FBA の在庫: <%= ok.fba.error || '読めません' %></div></div><% } %>
+
+    <section class="panel" aria-label="<%= f.hidden ? '隠した SKU' : 'まだつないでいない SKU' %>">
+      <div class="tbl-top"><span><b id="ul-total"><%= ok.total.toLocaleString('ja-JP') %></b> 件<% if (ok.total) { %> <span class="muted">(<%= ok.offset + 1 %>〜<%= ok.offset + ok.rows.length %> 件目 · <%= SORTS[f.sort] %>)</span><% } %></span>
+        <% if (ok.fba.ok) { %><span class="dotsep" aria-hidden="true"></span><span class="muted">FBA の在庫 = <%= ui.fmtJst(ok.fba.asOf, { nowMs }) %> 時点の販売可能<%= ok.fba.stale ? ' (古い)' : '' %></span><% } %>
+      </div>
+      <% if (!ok.rows.length) { %>
+        <div class="empty"><%= f.hidden ? '隠した SKU はありません' : (f.q || f.from || f.to || f.st !== 'all' || f.ch !== 'all' ? '当てはまる SKU はありません (絞り込みを変えてみてください)' : 'Amazon の出品一覧の SKU は、全部 社内の商品とつないでいます') %></div>
+      <% } else { %>
+      <ul class="ul-list" id="unlinked-list" aria-label="seller SKU の一覧 (押すと対応を作る画面が開きます)">
+        <% for (const r of ok.rows) { const sw = SW[r.status] || SW.unknown; const mw = mapWords(r); const href = r.open_sku ? base + '/amazon/sku?sku=' + encodeURIComponent(r.open_sku) : null; %>
+        <li class="ul-row<%= r.hidden_reason ? ' hid' : '' %>" data-sku="<%= r.seller_sku %>">
+          <% if (href) { %><a class="ul-main" href="<%= href %>" aria-label="<%= r.seller_sku %> の対応を<%= r.map_state === 'deleted' ? 'もう一度登録する' : '作る' %>"><% } else { %><div class="ul-main"><% } %>
+            <span class="ul-sku mono"><%= r.seller_sku %></span>
+            <span class="ul-name"><%= r.item_name || '(Amazon の商品名が空)' %></span>
+            <span class="ul-meta">
+              <% if (r.fulfillment) { %><span class="b <%= r.fulfillment === 'FBM' ? 'vio' : 'mute' %>"><%= CHANNEL_WORDS[r.fulfillment] %></span><% } else { %><span class="b mute" title="<%= r.channel_raw || '' %>">区分が分からない</span><% } %>
+              <span class="b <%= sw[0] %>"><% if (r.status === 'active') { %><span class="dot" aria-hidden="true"></span><% } %><%= sw[1] %></span>
+              <span class="b <%= mw[0] %>"><%= mw[1] %></span>
+              <span class="ul-kv"><span class="k">出品日</span> <%= r.open_date ? ui.fmtDay(r.open_date, today) : (r.open_date_raw || '—') %></span>
+              <span class="ul-kv"><span class="k">ASIN</span> <span class="mono"><%= r.asin || '—' %></span></span>
+              <% if (r.fulfillment === 'FBA') { %><span class="ul-kv"><span class="k">FBA 在庫</span> <%= !ok.fba.ok ? '読めない' : r.fba_row ? (r.fba_available == null ? '不明' : r.fba_available + ' 個') : 'レポートに無い' %></span><% } %>
+              <span class="ul-kv"><span class="k">最後に売れた日</span> <%= !ok.sold.ok ? '読めない' : r.last_sold ? `${ui.fmtDay(r.last_sold, today)} (${ago(r.last_sold)})` : `直近 ${SOLD_LOOKBACK_DAYS === 365 ? '1 年' : SOLD_LOOKBACK_DAYS + ' 日'} に無し` %></span>
+              <span class="ul-kv"><span class="k">価格</span> <%= r.price != null ? yen(r.price) : 'なし' %></span>
+            </span>
+            <% if (r.hidden_reason) { %><span class="ul-hid">隠した理由: <b><%= HIDE_REASONS[r.hidden_reason] || r.hidden_reason %></b><%= r.hidden_note ? ` 「${r.hidden_note}」` : '' %> · <%= r.hidden_by %> · <%= ui.fmtJst(r.hidden_at, { nowMs }) %></span><% } %>
+          <% if (href) { %></a><% } else { %><span class="ul-hid">この seller SKU は画面から開けない形です (制御文字など)</span></div><% } %>
+          <span class="ul-acts">
+            <% if (href) { %><a class="btn soft sm" href="<%= href %>" tabindex="-1" aria-hidden="true"><%= r.map_state === 'deleted' ? '開く' : '対応を作る' %></a><% } %>
+            <% if (canHide) { %><% if (r.hidden_reason) { %><button class="btn sm" type="button" data-act="show" data-sku="<%= r.seller_sku %>" aria-label="<%= r.seller_sku %> を一覧に戻す"><svg class="ic s" aria-hidden="true"><use href="#i-undo"/></svg>元に戻す</button><% } else { %><button class="btn ghost sm" type="button" data-act="hide" data-sku="<%= r.seller_sku %>" data-name="<%= r.item_name || '' %>" aria-label="<%= r.seller_sku %> を一覧から隠す"><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg>隠す</button><% } %><% } %>
+          </span>
+        </li>
+        <% } %>
+      </ul>
+      <% } %>
+      <div class="pager">
+        <% if (ok.offset > 0) { %><a class="btn sm" href="<%= pageHref(Math.max(0, ok.offset - ok.limit)) %>">← 前の <%= ok.limit %> 件</a><% } %>
+        <% if (ok.total > ok.offset + ok.rows.length) { %><a class="btn sm" href="<%= pageHref(ok.offset + ok.limit) %>">次の <%= ok.limit %> 件 →</a><% } %>
+      </div>
+      <div class="msgline" id="ul-msg" role="status" aria-live="polite"></div>
+      <div class="hint" style="margin-top:10px">「つないでいる」= Company DB の出品に構成 (NE の商品 × 数) が 1 行以上ある SKU。出品一覧 = 想定利益の夜間 (23:30) が取った Amazon の出品レポートを、毎朝の取り込みが Company DB に入れたものです。FBA 在庫 = 朝の FBA の在庫の日次の販売可能 (その SKU の行が無い = 「レポートに無い」)。</div>
+    </section>
+    <% } %>
+  </div>
+
+  <% if (ok && canHide) { %>
+  <div class="modal-bg" id="hide-bg">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="hide-t" aria-describedby="hide-d">
+      <h2 id="hide-t"><svg class="ic l" aria-hidden="true"><use href="#i-x"/></svg><span class="mono" id="hide-sku"></span> を一覧から隠す</h2>
+      <div class="hint" id="hide-d" style="color:var(--text2)"><span id="hide-name"></span><br>この一覧に出さなくなるだけです。Amazon の出品・対応・出品の写しには何もしません。「隠した SKU」からいつでも元に戻せます。</div>
+      <fieldset class="hide-why">
+        <legend class="lab2">理由</legend>
+        <% for (const [k, t] of Object.entries(HIDE_REASONS)) { %><label class="check-row"><input type="radio" name="hide-reason" value="<%= k %>"><span><%= t %></span></label><% } %>
+      </fieldset>
+      <label class="lab2" for="hide-note">ひとこと (「その他」は必須・<%= NOTE_MAX %> 文字まで)</label>
+      <input class="in" id="hide-note" maxlength="<%= NOTE_MAX %>" autocomplete="off" placeholder="例: 親の SKU (子は別にある)">
+      <div class="msgline" id="hide-msg" role="status" aria-live="polite"></div>
+      <div class="mbtns"><button class="btn ghost" type="button" id="hide-stay">やめる</button><button class="btn pri" type="button" id="hide-go" disabled>隠す</button></div>
+    </div>
+  </div>
+  <script type="application/json" id="me-unlinked"><%- JSON.stringify({ base }).replace(/</g, '\\u003c') %></script>
+  <% } %>
+  <%- include('_footer') %>
+  <% if (ok && canHide) { %><script src="<%= base %>/public/me-amazon-unlinked.js?v=<%= assetV %>" defer></script><% } %>
+</body>
+</html>
