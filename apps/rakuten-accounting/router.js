@@ -1370,25 +1370,25 @@ function renderPage() {
       btn.textContent = '保存中...';
       try {
         const ym = lastData.yearMonth;
-        const adCost = getAdCostFromBilling();
+        // 送る中身は最初に固定する（409 の確認中に CSV を入れ直しても、再送で別の集計が混ざらない）
+        const payload = {
+          yearMonth: ym,
+          totalRows: lastData.totalRows,
+          resolvedCount: lastData.resolvedCount,
+          unresolvedCount: lastData.unresolvedProducts?.length || 0,
+          byTax: lastData.byTax,
+          bySegment: lastData.bySegment,
+          excluded: lastData.excluded,
+          mfRow: lastData.mfRow,
+          adCost: getAdCostFromBilling(),
+          billing: billingData ? billingData.byCategory : null,
+          pfFee: getBillingTotals() ? getBillingTotals().pfFee : 0,
+        };
         // 確定済みの月はサーバが 409 で止める → 上書きしてよいか聞いてから overwrite: true で送り直す
         const send = overwrite => fetchWithRetry(location.pathname + '/confirm', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            yearMonth: ym,
-            overwrite,
-            totalRows: lastData.totalRows,
-            resolvedCount: lastData.resolvedCount,
-            unresolvedCount: lastData.unresolvedProducts?.length || 0,
-            byTax: lastData.byTax,
-            bySegment: lastData.bySegment,
-            excluded: lastData.excluded,
-            mfRow: lastData.mfRow,
-            adCost,
-            billing: billingData ? billingData.byCategory : null,
-            pfFee: getBillingTotals() ? getBillingTotals().pfFee : 0,
-          }),
+          body: JSON.stringify({ ...payload, overwrite }),
         });
         let r = await send(historyMonths.includes(ym));
         let result = await r.json();
