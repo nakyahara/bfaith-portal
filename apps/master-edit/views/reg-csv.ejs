@@ -224,12 +224,15 @@
           <div class="f wide"><label class="check-row"><input type="checkbox" name="confirm" data-dirty-field="supersede" data-label="NE の状態を確かめた"><span>NE の状態を確かめた (取り込んでいない・取り込んだものは直した / 消した)</span></label></div>
           <div class="drawer-foot"><div class="msgline" data-msg role="status" aria-live="polite"></div><button class="btn ghost" type="button" data-act="close-drawer">やめる</button><button class="btn danger" type="button" data-act="supersede"<%= dis %>>使わないにする</button></div>
         </div>
-        <% } else if (e.trial && e.items.length && e.items.every((i) => i.state === 'verified')) { %>
+        <% } else if (e.trial && e.items.length && e.items.every((i) => i.state === 'verified') && e.verify && e.verify.can) { %>
         <div class="callout info" style="margin:12px 0 0"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">試し用の商品が全部 NE で確かめ済みです</div><div class="hint">実機で NE の画面も見て問題なければ、この形を「実機で確かめた」にします (本番の行数で作れるようになります)。</div></div></div>
         <div class="acts">
           <button class="btn pri" type="button" data-act="verified" data-kind="<%= e.kind %>" data-result="ok"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>この形を「実機で確かめた」にする</button>
           <button class="btn danger sm" type="button" data-act="verified" data-kind="<%= e.kind %>" data-result="ng"<%= dis %>>問題があった (ng)</button>
         </div>
+        <% } else if (e.trial && e.items.length && e.items.every((i) => i.state === 'verified')) { %>
+        <%# 🆕 10/12 (中原さん): 引退した版 (v1 など)・試し用の門の無い版の試し用のファイル = 実機の確かめのボタンは出さない (API は export_mismatch で断る)。決まり = lib の regVerifyTargetOf %>
+        <div class="callout info" style="margin:12px 0 0" data-verify-none="<%= e.verify ? e.verify.why : 'mismatch' %>"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">試し用の商品は全部 NE で確かめ済みです</div><div class="hint"><%= (e.verify && e.verify.message) || 'このファイルの形は今の形と違うので、このファイルでは実機の確かめを記録できません' %></div><% if (e.verify && e.verify.why === 'retired' && e.verify.rule_why) { %><div class="hint">引退の理由: <%= e.verify.rule_why %></div><% } %></div></div>
         <% } %>
         <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
       </article>
