@@ -2515,3 +2515,33 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 画面 = 商品の画面の「この下書きを消す」(名簿 MASTER_EDITORS の人 = 下書きを作れる人と同じ・MASTER_EDIT_OPEN の後)。一覧はやめた商品をふだん出さない (札「やめた商品」・商品コードでぴったり探すと出る)
 - 当て方 (🚨 まだ流さない): 0070 の後 → `migrate.mjs --dry-run` (0071 だけ) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs` = master_edit に 2 つの関数の実行・`create-watch-roles.mjs` = watcher に確かめ。どちらも引数なし = パスワードは変えない)。流さなくても今の動きは変わらない (画面は確かめを読めない = 何も出さない)
 - 試験 = `node scripts/test-master-draft-cancel.mjs` (PGlite・画面・product-hub の SQLite・Playwright) / `TEST_PG_URL=… node scripts/test-master-draft-cancel-pg.mjs` (本物のログイン・CSV を配る / セットの登録 / カードの取り込み / 押し直し / 夜間ロード / 0070 の参照の守りとの競り合い)
+
+### NE から消す CSV (0072・2026-10-12 中原さんの頼み「自社商品 DB で商品を削除できるようにしたい」の場面 c・決定 Q1 a / Q2 a / Q3 a / Q4 b)
+- **なぜ**: NE にもう登録した商品をポータルで「消す」と決めても、NE の商品のマスタの削除は CSV だけ (公開のマニュアル ID:8641「商品管理データの削除 (マスタ削除)」・API の口は無い)。NE のマスタへの書き込みは全部「CSV を作る → 人が NE に取り込む → 翌朝の照合で確かめる」(0040・0053 と同じ)
+- **CSV の形** (マニュアルのひな形 syohindel.csv = バイト列 `83 52 81 5B 83 68 0D 0A`): 見出し「コード」の 1 列・Shift_JIS・CRLF・最後の行も CRLF。単品 = [設定]→[マスタ削除]→「商品マスタ」/ セット = 「セット商品マスタ」(別のファイル・**セットを先に**)。削除のフラグの列は無い = 書いたコードが全部消える。
+  コードは NE の元の書き方 (0041 の `ops.master_ne_codes`・大文字も・英数字と _- だけ = Shift_JIS でも ASCII と同じ)。バイト列は DB が作る (`ops.ne_del_csv_bytes`)・sha256 は表の CHECK でも照らす
+- **表** `ops.ne_del_exports` (ファイル: 種類 products / sets / handling・見出し・バイト列・sha256・作った人・時刻・JST の日・理由・初めてのダウンロードの人と時刻・回数) /
+  `ops.ne_del_items` (品目: SKU・NE の元のコード・単品 / セット・消す (delete) / 取扱中止 (handling)・状態・根拠 = 確かめの答え (在庫の値を含む))。
+  品目の状態 = `live` (依頼の途中) → `withdrawn` (取り下げ) / `handled` (代わりに取扱中止の CSV) / `gone` (NE から消えた = Company DB でやめた)。SKU ごとに live は 1 つ。
+  書くのは 0072 の関数と `ops.cancel_sku_gone_from_ne` だけ (取引の中の印 `ops.ne_del_protocol`・持ち主の手も止める)・消さない・ファイルの中身は変えない・状態は一方向
+- **確かめ** `ops.ne_del_check(sku_id, 同じ依頼の SKU, アプリの在庫)` / `ops.ne_del_check_many` (読むだけ・master_edit / watcher): 会社 1・available・単品かセット・依頼の途中でない・NE のコードの台帳に書き方が 1 つ (印が 36 時間の中)・
+  一番新しい完全な NE の取得 (0070) にまだある・生きた NE 登録の CSV が無い・(単品) それを中身に持つ生きたセットが無い (同じ依頼か依頼の途中のセットは除く = 警告「セットのファイルを先に」)・
+  ほかのセットの開いている構成の依頼に無い・(セット) 自身の開いている構成の依頼が無い・出品の構成 (削除済みの出品も) に無い・ほかの商品の親でない・
+  **(単品) 在庫 0** (決定 Q3 a): DB が自分で読む = 在庫の日次 (`snapshots.sku_stock_daily`) の NE (今日か前日の complete の日に行があって 0)・ロジザード (2 日の中の complete の日に在庫 0・引当 0) /
+  アプリが Postgres の前に読む (DB は確かめられない = 根拠に残す) = NE の在庫・引当・発注残 (商品管理リストの公開の回・NE の取得が 36 時間の中)・FBA の在庫・ロジザードの今の在庫と引当 (毎時の写しを削除のためだけに読む = `readLogizardForDelete`・在庫と引当を別々に・整数でない行 / 古い = 読めない・#1690 Codex R1 High 1)・発注アプリの注文残。**どれかを読めない・鍵が欠ける = 断る**。
+  警告 (止めない): 同じ代表の子を全部消す = NE の代表のページ情報も消える
+- **作る** `ops.ne_del_build(request_id, 人, 理由, SKU の配列, アプリの在庫)`: 鍵 (段階 → マスタの書き込み (共有) → SKU (sku_id の順) → CSV → NE のコード (共有) → **登録の状態の行 (排他)** → SKU の行) → 全部の確かめ (1 件でも断られる = 何も書かない) →
+  約束 `ne_del_build` → ファイル (セット → 単品) と品目 live → 保存の記録 done。押し直し = 前の答え
+- **受け取る** `ops.ne_del_download(人, ファイル)`: 消すファイルは作った JST の日だけ (取扱中止のファイルは後の日も同じバイト列 = 作った時に元の品目を handled にしたので・#1690 Codex R1 Medium 3)・消すファイルは中の品目が全部まだ live のときだけ (取り下げた商品を NE で消さない)・初めてのダウンロードと回数を残す。画面は POST (GET にしない)
+- **取り下げ** `ops.ne_del_withdraw` (live → withdrawn・理由)。**断られたとき** (決定 Q2 a): `ops.ne_del_refused_check` = 単品・ファイルを初めてダウンロードした日から 3 日以上・その後の一番新しい完全な NE の取得が **3 日の待機の期限 (ダウンロードした日 + 3 日の JST 0 時) 以後** で (#1690 Codex R1 Medium 2)、まだある →
+  `ops.ne_handling_build` = 代わりに取扱中止の CSV (`apps/master-decisions/ne-csv.mjs` の products:handling と同じバイト = 見出し syohin_code,toriatukai_kbn・値 1・UTF-8・CRLF・9/27 実機で確かめ済みの形)・消す品目は handled
+- **NE から消えた → やめる** (0070 の道): 毎朝の照合が「完全な NE の取得に 3 日続けて無い」を数える → 商品の画面の「NE から消えた (やめる)」。🆕 **セットも** (決定 Q4 b): `ops.sku_gone_from_ne_check` / `ops.cancel_sku_gone_from_ne` (0070 の版から写して 🆕 0072 の行だけ) =
+  セットを ok にできる (自身の開いている構成の依頼は断る)・やめるときに**構成 (core.sku_components の親がこのセット) を同じ取引で外す** (0026 の変更の記録に残る・中身の単品が「構成品」でなくなる)・依頼の品目は gone。`ops.master_write_allowed` (0071 の版 + `sku_gone_cancel` の core.skus UPDATE = 構成を外したときの version)
+- **参照の守り**: `ops.guard_sku_ref_not_cancelled` (0070 の版から写して 🆕 0072 の行だけ) = 依頼の途中の SKU は新しい構成の子・構成の依頼 (依頼のセット自身も)・出品の構成 (Amazon の対応も)・代表に入れない (`sku_ne_deleting`)・
+  やめたセット (親) に構成を作らない (`sku_cancelled`・trigger の列に parent_sku_id を足して作り直した)。夜間ロード (engine.mjs) は先に飛ばす: 依頼の途中の子・出品・代表 = 今の行はそのまま (prune しない) /
+  やめたセットの構成 = `parent_cancelled` (miniPC の raw_ne_set_products は消えたセットの行を消さない = 古い行から戻さない)
+- バイト列を直接読めるロールを無くす: `ops.restrict_ne_del_file_bytes()` (0058 の `restrict_ne_reg_file_bytes` と同じ考え・migration の最後と 2 つのロールの script が毎回呼ぶ = watcher は file_bytes を SELECT できない・#1690 Codex R1 Medium 1)
+- 画面 = 左の「NE から消す」(`/ne-delete`・確かめる → 作る → ダウンロード・依頼の途中の様子・取り下げ・取扱中止)・商品の画面の右の「NE から消す」の箱。全部 名簿 MASTER_DECISION_APPROVERS の人だけ (見るのはだれでも)・MASTER_EDIT_OPEN の後
+- 当て方 (🚨 まだ流さない): 0071 の後 → `migrate.mjs --dry-run` (0072 だけ) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs` = master_edit に 9 つの関数の実行・`create-watch-roles.mjs` = watcher に確かめと一覧)。流さなくても今の動きは変わらない (画面は「まだ使えない」)。
+  最初の 1 件は中原さんが在庫 0・受注なし・出品なしの商品で試す
+- 試験 = `node scripts/test-master-ne-delete.mjs` (PGlite・バイト列・確かめ・作る・受け取る・取り下げ・セットのやめる・取扱中止・夜間ロード・画面・Playwright) / `TEST_PG_URL=… node scripts/test-master-ne-delete-pg.mjs` (本物のログイン・参照 / 作る / 受け取り / 取り下げ / 夜間ロードとの競り合い)
