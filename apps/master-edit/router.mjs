@@ -48,6 +48,7 @@
  *   GET  /amazon/new?sku=    新しい seller SKU の対応を自分で作る入口 (まだ売れていない SKU も)。形 → もうある (対応・墓標) = その画面へ案内 →
  *                            似た SKU・気をつけること (打ち間違いの守り) があれば見せて「このまま作る」/ 無ければ /amazon/sku?sku= へ (checked = 画面でもう見た)
  *   GET  /api/amazon/check?sku=  同じ確かめ (読むだけ・打つとその場で)
+ *   GET  /api/amazon/components?q=  構成の行の「NE の商品」の欄の候補 (読むだけ・コード / 名前の言葉 / JAN・20 件まで・使えない商品は理由つき)
  *   GET  /amazon/sku?sku=    1 つの seller SKU (見る・直す・墓標にする・墓標から戻す)。対応が無ければ「新しい対応」(今の構成は夜間ロードの写しとして見せる)
  *   GET  /amazon/sku/history?sku=  変更の記録 (対応・構成・出品)
  *   GET  /amazon/unmapped    未登録 = 直近 7 日に売れたのに構成が無い seller SKU (FBA / FBM で分ける・売上の公開が欠けた日は「未判定」)
@@ -98,7 +99,7 @@ import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, newSellerSkuCheckInDb, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
-import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
+import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, searchMapComponents, COMPONENT_SEARCH_Q_MAX, COMPONENT_SEARCH_MIN, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
@@ -973,6 +974,21 @@ router.get('/api/amazon/check', (req, res) => {
   if (raw.length > AMAZON_CHECK_RAW_MAX) return res.json({ ok: false, reason: 'shape', message: TOO_LONG });
   return withPgApi(res, async (db) => res.json(await checkNewAmazonSku(db, raw)));
 });
+/**
+ * 構成の行の「NE の商品」の欄の候補 (10/12・読むだけ)。?q= (2 文字から・60 文字まで) → { ok, items, more, short, stock: { as_of, stale } | null }。
+ * 見られる人 = この画面と同じ (アプリの利用権)。探し方・使えない商品の扱いは amazon-read.mjs の searchMapComponents
+ */
+router.get('/api/amazon/components', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q : '';
+  if (q.length > COMPONENT_SEARCH_Q_MAX) return res.status(400).json({ ok: false, error: `長すぎます (${COMPONENT_SEARCH_Q_MAX} 文字まで)` });
+  if (/[\x00-\x1f\x7f]/.test(q)) return res.status(400).json({ ok: false, error: '使えない文字があります' });
+  return withPgApi(res, async (db) => {
+    const st = await readWarehouseStock({ now: clock() });
+    const out = await searchMapComponents(db, q, { stock: st && st.ok ? st : null });
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, ...out, stock: st && st.ok ? { as_of: st.asOf, stale: !!st.stale } : null });
+  });
+});
 router.get('/amazon/sku/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
   let sku;
   try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).render(view('error.ejs'), { ...pageLocals(req), nav: 'amazon', message: e.message }); }
@@ -988,7 +1004,7 @@ router.get('/amazon/sku', (req, res) => withPgPage(req, res, async (db, dbError)
   if (page) page.phase = { ...page.phase, owner: await screenOwner(db) };
   // 出品も対応も無い seller SKU = 先に作る形の決まり (#1685 Codex R1 High)。合わなければ画面で先に知らせて保存のボタンを出さない (保存の lib も断る)
   const newSkuProblems = page && !page.cur.listing ? (await newSellerSkuCheckInDb(db, sku)).problems : [];
-  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY });
+  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY, COMPONENT_SEARCH_MIN });
 }));
 router.post('/api/amazon/save', (req, res) => {
   const gate = editorGate(req);
