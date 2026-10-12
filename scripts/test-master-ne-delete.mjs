@@ -19,7 +19,7 @@
  *   [L]  夜間ロード: 依頼の途中の子・出品の構成は飛ばして止まらない (今の行は残す)
  *   [O]  表の守り (関数の外の書き込み・消す・戻す) と権限 (master_edit = 関数だけ・watcher = 確かめと一覧だけ)
  *   [K]  アプリの在庫 (ne-delete-stock.mjs): 値の出どころ (NE = 総在庫数 − FBA ほか・ロジザードの今の在庫と引当を別々に)・読めない = unreadable (0 にしない) / [G4] CLI でセットをやめたときの変更の記録
- *   [S]  画面 (本物の router): 「NE から消す」の画面・確かめる・作る・受け取る (POST・sha256・Shift_JIS)・名簿の人だけ・商品の画面の箱 / [U] 画面の JS (Playwright)
+ *   [S]  画面 (本物の router): 注文残の数は発注アプリの権限がある人だけ (S4)・ 「NE から消す」の画面・確かめる・作る・受け取る (POST・sha256・Shift_JIS)・名簿の人だけ・商品の画面の箱 / [U] 画面の JS (Playwright)
  * 使い方: node scripts/test-master-ne-delete.mjs (MASTER_EDIT_UI_SKIP=1 で画面の JS を飛ばす)
  */
 import assert from 'node:assert/strict';
@@ -713,9 +713,10 @@ __setPgClientFactory(async (url) => {
 __setShippingRatesProvider(async () => new Map([['S02', { method: '宅急便', cost: 520 }]]));
 __setNeDelStockReader(zeroReader);
 let EMAIL = 'naka@test';
+let APPS = ['master-edit'];   // 発注アプリの権限 (purchase-orders) が無い = 注文残の数を見せない
 const app = express();
 app.set('view engine', 'ejs');
-app.use((req, res, next) => { req.session = { authenticated: true, email: EMAIL, displayName: '中原', role: 'user', allowedApps: ['master-edit'] }; next(); });
+app.use((req, res, next) => { req.session = { authenticated: true, email: EMAIL, displayName: '中原', role: 'user', allowedApps: APPS }; next(); });
 app.use('/apps/master-edit', router);
 const server = http.createServer(app);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -772,6 +773,33 @@ await ta('[S3] 商品の画面: 依頼の途中 = 「NE から消す」の箱 (�
   EMAIL = 'naka@test';
   const hs = await (await fetch(`${B}/sku/set03`)).text();
   assert.match(hs, /id="gone-box"/); assert.match(hs, /セットは、やめると構成/); assert.match(hs, /NE から消えました。Company DB でも/);
+});
+
+await ta('[S4] 注文残の数は発注アプリの権限がある人だけ: 確かめの答え (在庫・理由)・作るの断りの理由に数が出る / 権限が無い = 数を外して「注文残あり」(確かめ自体は同じく断る)', async () => {
+  const poReader = async (skus) => new Map(skus.map((s) => [s.code_norm, { ...zero(), po_backorder: s.code_norm === 'n09' ? 7 : 0 }]));
+  __setNeDelStockReader(poReader);
+  try {
+    EMAIL = 'naka@test';
+    APPS = ['master-edit'];
+    const c = await apiJ('/api/ne-delete/check', { codes: ['n09'] });
+    assert.equal(c.status, 200); assert.equal(c.j.all_ok, false);
+    const row = c.j.rows[0];
+    assert.deepEqual(row.problems.map((p) => p.reason), ['stock_app']);
+    assert.match(row.problems[0].text, /発注アプリの注文残あり/);
+    assert.equal(row.stock.app.po_backorder, null); assert.equal(row.stock.app.po_backorder_hidden, true);
+    assert.equal(c.j.app_stock[row.sku_id].po_backorder, null);
+    assert.doesNotMatch(JSON.stringify(c.j), /注文残 7|"po_backorder":7/);
+    const b = await apiJ('/api/ne-delete/build', { codes: ['n09'], reason: '販売をやめた', confirm: true, request_id: crypto.randomUUID() });
+    assert.equal(b.status, 409); assert.equal(b.j.reason, 'not_deletable');
+    assert.match(b.j.error, /発注アプリの注文残あり/); assert.doesNotMatch(b.j.error, /注文残 7/);
+    APPS = ['master-edit', 'purchase-orders'];
+    const c2 = await apiJ('/api/ne-delete/check', { codes: ['n09'] });
+    assert.match(c2.j.rows[0].problems[0].text, /発注アプリの注文残 7/);
+    assert.equal(c2.j.rows[0].stock.app.po_backorder, 7);
+    const b2 = await apiJ('/api/ne-delete/build', { codes: ['n09'], reason: '販売をやめた', confirm: true, request_id: crypto.randomUUID() });
+    assert.equal(b2.status, 409); assert.match(b2.j.error, /発注アプリの注文残 7/);
+  } finally { __setNeDelStockReader(zeroReader); APPS = ['master-edit']; }
+  assert.equal((await one("select count(*)::int as n from ops.ne_del_items i join core.skus k on k.sku_id = i.sku_id where k.code = 'n09'")).n, 0);
 });
 
 // ═══════════ [U] 画面の JS ═══════════

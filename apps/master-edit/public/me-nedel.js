@@ -73,7 +73,7 @@
     var parts = [];
     parts.push('日次: NE ' + (d.ne_qty == null ? '?' : d.ne_qty) + (d.ne_day ? ' (' + d.ne_day + ')' : '') + ' · ロジザード ' + (d.logizard_qty == null ? '?' : d.logizard_qty));
     if (a.unreadable) parts.push('今: 読めない');
-    else parts.push('今: NE ' + a.ne_own + ' · 引当 ' + a.ne_allocated + ' · NE 発注残 ' + a.ne_on_order + ' · FBA ' + a.fba + ' · ロジザード ' + a.logizard + ' (引当 ' + a.logizard_allocated + ') · 注文残 ' + a.po_backorder);
+    else parts.push('今: NE ' + a.ne_own + ' · 引当 ' + a.ne_allocated + ' · NE 発注残 ' + a.ne_on_order + ' · FBA ' + a.fba + ' · ロジザード ' + a.logizard + ' (引当 ' + a.logizard_allocated + ') · 注文残 ' + (a.po_backorder_hidden ? '— (発注アプリの権限が要る)' : a.po_backorder));
     return parts.join(' / ');
   }
   function render(data) {

@@ -114,7 +114,7 @@ import {
   REG_ITEM_STATES, REG_RESULTS,
 } from '../../lib/master-reg-csv.mjs';
 import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
-import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, buildHandling, readNeDelOverview, neDelAvailable, NE_DEL_STATUS_WORDS, NE_DEL_KIND_WORDS, NE_DEL_MAX } from '../../lib/master-ne-delete.mjs';
+import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, buildHandling, readNeDelOverview, neDelAvailable, hideBackorder, hideBackorderText, NE_DEL_STATUS_WORDS, NE_DEL_KIND_WORDS, NE_DEL_MAX } from '../../lib/master-ne-delete.mjs';
 import { readNeDeleteStock } from './ne-delete-stock.mjs';
 
 /**
@@ -1145,9 +1145,20 @@ function neDelApi(req, res, fn, kind = 'write') {
   const gate = approverGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
   const actor = String(req.session.email).trim().toLowerCase();
-  return withPgApi(res, async (db) => { res.set('Cache-Control', 'no-store'); return fn(db, actor, req.body || {}); }, kind);
+  // 🆕 #1690 Codex R3 Medium: 注文残の数は発注アプリの権限がある人だけ (canSeeBackorders・今までの画面と同じ)。確かめは DB が全部の値でする = 見せる答えから数だけを外す
+  const poOk = canSeeBackorders(req);
+  return withPgApi(res, async (db) => {
+    res.set('Cache-Control', 'no-store');
+    try { return await fn(db, actor, req.body || {}, poOk); } catch (e) {
+      if (!poOk && e instanceof MasterWriteError) throw new MasterWriteError(e.status, e.reason, hideBackorderText(e.message), e.extra);
+      throw e;
+    }
+  }, kind);
 }
-router.post('/api/ne-delete/check', (req, res) => neDelApi(req, res, async (db, actor, b) => res.json({ ok: true, ...(await checkNeDelete(db, { codes: b.codes }, { stockReader: neDelStockReader })) }), 'read'));
+router.post('/api/ne-delete/check', (req, res) => neDelApi(req, res, async (db, actor, b, poOk) => {
+  const r = await checkNeDelete(db, { codes: b.codes }, { stockReader: neDelStockReader });
+  res.json({ ok: true, ...(poOk ? r : hideBackorder(r)) });
+}, 'read'));
 router.post('/api/ne-delete/build', (req, res) => neDelApi(req, res, async (db, actor, b) => res.json(await buildNeDelete(db,
   { actor, codes: b.codes, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen(), stockReader: neDelStockReader }))));
 router.post('/api/ne-delete/exports/:id/download', (req, res) => neDelApi(req, res, async (db, actor) => {
