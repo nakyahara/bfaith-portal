@@ -23,7 +23,7 @@
 --        (= もう消えた商品は「NE から消えた (やめる)」へ)・生きた NE 登録の CSV の品目が無い・(単品) それを中身に持つ生きたセットが無い (同じ依頼か依頼の途中のセットは除く =
 --        セットのファイルを先に取り込む)・ほかのセットの開いている構成の依頼に無い・(セット) 自身の開いている構成の依頼が無い・出品の構成に無い (削除済みの出品も)・ほかの商品の親でない・
 --        (単品) 在庫 0 (決定 Q3 a): Company DB の在庫の日次 (NE = 前日か今日の complete の日に行があって 0・ロジザード = 2 日の中の complete の日に在庫 0・引当 0) と
---        アプリが読んだ値 (NE の在庫・引当・発注残 = 商品管理リストの公開の回 / FBA の在庫 / ロジザードの今の在庫 (毎時の写し) / 発注アプリの注文残) が全部 0。
+--        アプリが読んだ値 (NE の在庫・引当・発注残 = 商品管理リストの公開の回 / FBA の在庫 / ロジザードの今の在庫と引当 (毎時の写し・別々に) / 発注アプリの注文残) が全部 0。
 --        どれかを読めない = 断る (DB はアプリの値を確かめられない = 記録に残す)
 --   3. ops.ne_del_build(request_id, 人, 理由, SKU の配列, アプリが読んだ在庫) = 確かめ直して (鍵の後) ファイルを作る (セット → 単品の 2 つまで)・記録・約束 ne_del_build・保存の記録
 --   4. ops.ne_del_download(人, ファイル) = バイト列を渡す (作った JST の日だけ・中の消す品目が全部まだ依頼の途中のときだけ)・初めてのダウンロードを残す
@@ -216,7 +216,7 @@ $$;
 revoke all on function ops._ne_del_problem(text, text) from public;
 /** アプリが読む在庫の値の鍵 (lib/master-ne-delete.mjs の APP_STOCK_KEYS と同じ・試験で照らす) と言葉 */
 create function ops.ne_del_app_stock_keys() returns jsonb language sql immutable set search_path = pg_catalog, pg_temp as $$
-  select '{"ne_own": "NE の在庫", "ne_allocated": "NE の引当", "ne_on_order": "NE の発注残", "fba": "FBA の在庫", "logizard": "ロジザードの在庫 (今)", "po_backorder": "発注アプリの注文残"}'::jsonb
+  select '{"ne_own": "NE の在庫", "ne_allocated": "NE の引当", "ne_on_order": "NE の発注残", "fba": "FBA の在庫", "logizard": "ロジザードの在庫 (今)", "logizard_allocated": "ロジザードの引当 (今)", "po_backorder": "発注アプリの注文残"}'::jsonb
 $$;
 revoke all on function ops.ne_del_app_stock_keys() from public;
 
@@ -224,7 +224,7 @@ revoke all on function ops.ne_del_app_stock_keys() from public;
  * NE から消す CSV に入れてよいか。何も書かない。p_batch = 同じ依頼の SKU (セットと中身の単品を一緒に消す) / p_app_stock = アプリが読んだ在庫の値 (単品だけ見る・下の形)。戻り値 = {
  *   sku_id (文字), code, ne_code (NE の元の書き方 | null), sku_kind, reg_state, ok, problems: [{ reason, text }] (空 = ok), warnings: [{ reason, text }],
  *   stock: { db: { ne_day, ne_rows, ne_qty, logizard_day, logizard_qty, logizard_allocated }, app: p_app_stock } (単品だけ), ne_codes_run }
- * p_app_stock = { ne_own, ne_allocated, ne_on_order, fba, logizard, po_backorder (0 以上の整数), sources: {...} } か { unreadable: '読めない理由' } (null = 読めない)
+ * p_app_stock = { ne_own, ne_allocated, ne_on_order, fba, logizard, logizard_allocated, po_backorder (どれも 0 以上の整数・1 つでも欠ける / 整数でない = 読めない), sources: {...} } か { unreadable: '読めない理由' } (null = 読めない)
  * reason: no_sku / not_company / not_available / kind_exception / live_request / ne_codes_old / not_in_ne / gone_from_ne / ne_code_bad / live_file / set_component /
  *         component_request / own_component_request / listing_component / listing_component_deleted / parent_of_others /
  *         stock_ne_unknown / stock_ne / stock_logizard_unknown / stock_logizard / stock_app_unknown / stock_app
@@ -508,7 +508,8 @@ revoke all on function ops.ne_del_build(uuid, text, text, bigint[], jsonb) from 
 
 -- ═══════════ 4. ダウンロード ═══════════
 /**
- * ファイルのバイト列を渡す (画面のダウンロード)。作った JST の日だけ (古いファイル = 在庫・依頼が変わったかもしれない = 作り直す)・
+ * ファイルのバイト列を渡す (画面のダウンロード)。消すファイル (products / sets) は作った JST の日だけ (古いファイル = 在庫・依頼が変わったかもしれない = 作り直す)。
+ *   取扱中止のファイル (handling) は後の日も同じバイト列 (sha256) のまま渡す (作った時に元の品目を handled にした = 当日に受け取れなくても戻らない・#1690 Codex R1 Medium 3)・
  * 消すファイルは中の品目が全部まだ依頼の途中 (live) のときだけ (取り下げた・やめた商品を NE で消さない)。初めてのダウンロード (人・時刻) と回数を残す。
  * 戻り値 = { export_id, kind, file_name, sha256, bytes_b64, row_count, first_downloaded_at }
  */
@@ -522,7 +523,7 @@ begin
   if ops.reg_actor_problem(p_actor_id, null) is not null then raise exception 'invalid_input: 人 (ログインのメール) が要る' using errcode = '22023'; end if;
   select * into e from ops.ne_del_exports x where x.export_id = p_export_id for update;
   if e.export_id is null then raise exception 'not_found: ファイル % が無い', p_export_id using errcode = 'P0002'; end if;
-  if e.built_day <> v_today then
+  if e.kind in ('products', 'sets') and e.built_day <> v_today then
     raise exception 'file_old: ファイル #% は % に作った = 作った日だけダウンロードできる (在庫・依頼が変わったかもしれない。消す商品は「取り下げ」てから作り直す)', e.export_id, e.built_day using errcode = 'P0001';
   end if;
   if e.kind in ('products', 'sets') then
@@ -607,7 +608,7 @@ revoke all on function ops.ne_del_withdraw(uuid, text, text, bigint) from public
  * 品目が「NE が消すのを断った (かもしれない)」か (読むだけ)。全部を満たすときだけ ok:
  *   消す品目で依頼の途中 (live)・単品 (取扱区分の CSV の列の表は単品だけ = セットは NE の画面で)・登録の状態 available・
  *   ファイルを初めてダウンロードした JST の日から ops.ne_gone_required_runs() (= 3) 日以上たった・数えた一番新しい完全な NE の取得 (0070) が
- *   ダウンロードより後で 36 時間の中・その取得にまだある・NE のコードの台帳 (0041) に書き方が 1 つ (印が 36 時間の中)
+ *   ダウンロードより後で、**3 日の待機の期限 (ダウンロードした日 + 3 日の JST 0 時) 以後の取得**で (#1690 Codex R1 Medium 2)・36 時間の中・その取得にまだある・NE のコードの台帳 (0041) に書き方が 1 つ (印が 36 時間の中)
  * 戻り値 = { item_id, code, ne_code, ok, problems: [{ reason, text }], downloaded_day, latest_fetch }
  */
 create function ops.ne_del_refused_check(p_item_id bigint) returns jsonb
@@ -651,6 +652,11 @@ begin
     end if;
     if e.first_downloaded_at is not null and least(g.products_complete_at, g.setproducts_complete_at) <= e.first_downloaded_at then
       v_p := v_p || ops._ne_del_problem('fetch_before_download', 'ダウンロードの後の完全な NE の取得がまだ無い');
+    end if;
+    -- 3 日の待機の期限 (ダウンロードした日 + 3 日の JST 0 時) より前の取得で「3 日たっても NE にある」と言わない (日をまたいだだけで、期限の後の取得がまだ = 待つ)
+    if e.first_downloaded_at is not null and (least(g.products_complete_at, g.setproducts_complete_at) at time zone 'Asia/Tokyo')::date < v_dday + v_days then
+      v_p := v_p || ops._ne_del_problem('fetch_too_soon', pg_catalog.format('3 日の待機の後 (%s 以後) の完全な NE の取得がまだ (一番新しい取得 %s)', v_dday + v_days,
+        pg_catalog.to_char(least(g.products_complete_at, g.setproducts_complete_at) at time zone 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI')));
     end if;
     if exists (select 1 from ops.master_ne_absence a where a.company_id = 1 and a.code_norm = i.code_norm and a.last_absent_result_id = g.result_id) then
       v_p := v_p || ops._ne_del_problem('gone_from_ne', '一番新しい完全な NE の取得に無い = NE から消えた (「NE から消えた (やめる)」へ)');
@@ -1110,8 +1116,41 @@ drop trigger trg_sku_components_not_cancelled on core.sku_components;
 create trigger trg_sku_components_not_cancelled before insert or update of child_sku_id, parent_sku_id on core.sku_components
   for each row execute function ops.guard_sku_ref_not_cancelled();
 
+-- ─── バイト列を直接読めるロールを無くす (#1690 Codex R1 Medium 1・0058 の ops.restrict_ne_reg_file_bytes と同じ考え) ───
+-- 表の SELECT を持つ owner でない全部のロール (と PUBLIC) から表の SELECT を外し、file_bytes 以外の列だけを列ごとに渡す。列ごとの file_bytes の SELECT も外す。
+--   DB の持ち主だけが呼ぶ (この migration の最後と、2 つのロールの script が「全部の表に GRANT」の後に毎回呼ぶ = 流し直しても戻らない)。バイト列は ops.ne_del_download だけ
+create function ops.restrict_ne_del_file_bytes() returns jsonb
+  language plpgsql set search_path = pg_catalog, pg_temp as $$
+declare
+  v_cols text;
+  r      record;
+  v_done text[] := '{}';
+begin
+  select pg_catalog.string_agg(pg_catalog.quote_ident(a.attname), ', ' order by a.attnum) into v_cols
+    from pg_catalog.pg_attribute a where a.attrelid = 'ops.ne_del_exports'::regclass and a.attnum > 0 and not a.attisdropped and a.attname <> 'file_bytes';
+  for r in select distinct x.grantee from pg_catalog.pg_class c cross join lateral pg_catalog.aclexplode(c.relacl) x
+            where c.oid = 'ops.ne_del_exports'::regclass and x.privilege_type = 'SELECT' and x.grantee <> c.relowner loop
+    if r.grantee = 0 then
+      execute 'revoke select on ops.ne_del_exports from public';
+      v_done := v_done || 'PUBLIC'::text;
+    else
+      execute pg_catalog.format('revoke select on ops.ne_del_exports from %I', r.grantee::regrole::text);
+      execute pg_catalog.format('grant select (%s) on ops.ne_del_exports to %I', v_cols, r.grantee::regrole::text);
+      v_done := v_done || r.grantee::regrole::text;
+    end if;
+  end loop;
+  for r in select distinct x.grantee from pg_catalog.pg_attribute a cross join lateral pg_catalog.aclexplode(a.attacl) x
+            where a.attrelid = 'ops.ne_del_exports'::regclass and a.attname = 'file_bytes' and x.privilege_type = 'SELECT'
+              and x.grantee <> (select c.relowner from pg_catalog.pg_class c where c.oid = 'ops.ne_del_exports'::regclass) loop
+    if r.grantee = 0 then execute 'revoke select (file_bytes) on ops.ne_del_exports from public';
+    else execute pg_catalog.format('revoke select (file_bytes) on ops.ne_del_exports from %I', r.grantee::regrole::text); end if;
+  end loop;
+  return pg_catalog.jsonb_build_object('restricted', pg_catalog.to_jsonb(v_done));
+end $$;
+revoke all on function ops.restrict_ne_del_file_bytes() from public;
+
 -- ─── 権限 (0070 / 0071 と同じ形)。master_edit には scripts/company-db/create-master-edit-roles.mjs の流し直しで付ける (表は読ませない・関数の実行だけ) ───
---   watcher = 表を読むだけ (ops の全部の表の select = create-watch-roles.mjs の既定の権限)・確かめと一覧 (読むだけ) の実行。ファイルのバイト列は ops.ne_del_download だけ (master_edit)
+--   watcher = 表を読むだけ (ops の全部の表の select = create-watch-roles.mjs の既定の権限・ops.ne_del_exports の file_bytes は除く)・確かめと一覧 (読むだけ) の実行。ファイルのバイト列は ops.ne_del_download だけ (master_edit)
 do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then
     execute 'grant execute on function ops.ne_del_check(bigint, bigint[], jsonb) to watcher';
@@ -1121,3 +1160,5 @@ do $$ begin
     execute 'grant execute on function ops.ne_del_overview(bigint) to watcher';
   end if;
 end $$;
+-- 既定の権限 (ops の新しい表の select = watcher) で付いたバイト列の SELECT を外す
+select ops.restrict_ne_del_file_bytes();

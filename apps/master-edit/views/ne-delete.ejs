@@ -18,7 +18,8 @@
     const refused = by('refused');
     const expById = new Map(O.exports.map((e) => [e.export_id, e]));
     const today = O.today;
-    const canDl = (e) => !!e && String(e.built_day) === String(today);
+    // 消すファイルは作った日だけ・取扱中止のファイルは後の日も (同じバイト列・#1690 Codex R1 Medium 3)
+    const canDl = (e) => !!e && (e.kind === 'handling' || String(e.built_day) === String(today));
     const when = (v) => (v ? ui.fmtJst(v, { nowMs }) : '');
     const shortSha = (s) => (s ? String(s).slice(0, 8) + '…' + String(s).slice(-6) : '');
     const ST_BADGE = { not_downloaded: 'warn', waiting: 'info', gone_counting: 'info', gone_ready: 'ok', refused: 'err', withdrawn: 'mute', handled: 'vio', gone: 'mute', recorded: 'vio' };
@@ -116,7 +117,7 @@
     </section>
 
     <section class="panel" aria-labelledby="h-files">
-      <div class="panel-h"><span class="hico" aria-hidden="true">③</span><h2 id="h-files">ファイル</h2><span class="sub">ダウンロードできるのは作った日のうちだけ (日をまたいだら、取り下げて作り直す)</span></div>
+      <div class="panel-h"><span class="hico" aria-hidden="true">③</span><h2 id="h-files">ファイル</h2><span class="sub">消す CSV をダウンロードできるのは作った日のうちだけ (日をまたいだら、取り下げて作り直す)。取扱中止の CSV は後の日もダウンロードできます</span></div>
       <% if (!O.exports.length) { %><div class="empty">まだありません。</div><% } %>
       <% for (const e of O.exports) { %>
       <article class="filecard<%= canDl(e) ? '' : ' closed' %>" aria-labelledby="nf-<%= e.export_id %>">

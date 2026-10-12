@@ -2,8 +2,9 @@
  * test-master-ne-delete-pg.mjs — 0072 (NE から消す CSV) を実 PostgreSQL の独立した接続と本物のログインのロールで確かめる
  *
  * 固定する契約:
- *   [R]  本物のログイン: master_edit (画面の lib) = 確かめる・作る・受け取る・取り下げる / master_ops = 作れない (42501) / watcher = 確かめ・一覧だけ /
+ *   [R]  本物のログイン: master_edit (画面の lib) = 確かめる・作る・受け取る・取り下げる / master_ops = 作れない (42501) / watcher = 確かめ・一覧だけ・file_bytes は SELECT できない (ロールの script を流し直しても) /
  *        どのアプリのロールも表を直に読めない (バイト列は ops.ne_del_download だけ)
+ *   [R2] 本番の順 (ロールがある DB に 0072 を当て、ロールの script はまだ流さない) でも watcher は file_bytes を SELECT できない
  *   [C1] 参照が先 (出品の構成の insert・未 commit): 作るは登録の状態の行で待つ → 参照の commit の後に「出品の構成」で断る (何も書かない)
  *   [C2] 作るが先 (未 commit): 参照 (出品の構成・構成の子・構成の依頼) は待つ → 作るの commit の後に sku_ne_deleting で断る (デッドロックしない)
  *   [C3] 同じ SKU を 2 人が同時に作る: 2 つ目は待つ → 1 つ目の commit の後に「依頼の途中」で断る (live は 1 つ)
@@ -60,7 +61,7 @@ let runN = 0;
 const runId = () => `mc_20301012T${String(++runN).padStart(9, '0')}Z_${crypto.randomBytes(3).toString('hex')}`;
 let tick = 0;
 const fetchAt = (day) => { tick++; return day === 0 ? new Date(Math.max(Date.now() - 20 * 60e3, Date.parse(`${jstToday()}T00:01:00+09:00`)) + tick * 1000) : new Date(Date.parse(`${jstToday()}T12:00:00+09:00`) + day * 86400e3 + tick * 1000); };
-const zero = () => ({ ne_own: 0, ne_allocated: 0, ne_on_order: 0, fba: 0, logizard: 0, po_backorder: 0 });
+const zero = () => ({ ne_own: 0, ne_allocated: 0, ne_on_order: 0, fba: 0, logizard: 0, logizard_allocated: 0, po_backorder: 0 });
 const zeroReader = async (skus) => new Map(skus.map((s) => [s.code_norm, zero()]));
 
 const dbNames = [];
@@ -153,6 +154,14 @@ try {
     assert.equal((await WA.query('select ops.ne_del_check($1::bigint, null, $2::jsonb) as r', [await sid('d02'), JSON.stringify(zero())])).rows[0].r.ok, true);
     assert.ok((await WA.query('select ops.ne_del_overview(null) as r')).rows[0].r.items.length >= 1);
     assert.equal((await errOf(WA.query('select ops.ne_del_download($1, $2::bigint)', ['w@test', b.exports[0].export_id])))?.code, '42501');
+    // 🆕 #1690 Codex R1 Medium 1: watcher (本物のログイン) は file_bytes を直に SELECT できない (ほかの列は読める)
+    assert.equal((await errOf(WA.query('select file_bytes from ops.ne_del_exports')))?.code, '42501');
+    assert.equal((await errOf(WA.query('select * from ops.ne_del_exports')))?.code, '42501');
+    assert.ok((await WA.query('select export_id, sha256, built_by from ops.ne_del_exports')).rows.length >= 1);
+    // ロールの script を流し直しても戻らない
+    await createWatchRoles(O, { watcherPw: WPW.watcher, writerPw: WPW.watch_writer });
+    await createMasterEditRoles(O, { pw: PW });
+    assert.equal((await errOf(WA.query('select file_bytes from ops.ne_del_exports')))?.code, '42501');
     for (const [c2, label] of [[ME, 'master_edit'], [MO, 'master_ops']]) {
       for (const t of ['ops.ne_del_exports', 'ops.ne_del_items']) assert.equal((await errOf(c2.query(`select count(*) from ${t}`)))?.code, '42501', `${label} ${t}`);
       assert.equal((await errOf(c2.query("select ops.ne_del_csv_bytes('{a}'::text[])")))?.code, '42501', label);
@@ -263,6 +272,23 @@ try {
     assert.ok(reasons.includes('parent_cancelled') && reasons.includes('child_ne_deleting'), JSON.stringify(reasons));
     assert.equal(Number((await q("select count(*)::int as n from core.listing_components lc join core.listings l on l.listing_id = lc.listing_id where l.listing_code = 'r-d10'"))[0].n), 0);
     assert.equal(await regOf('dset'), 'cancelled');
+  });
+  await ta('[R2] 本番の順 (ロールがある DB に 0072 を当てて、ロールの script はまだ流さない): watcher は ops.ne_del_exports の file_bytes を SELECT できない (migration の最後で外す)', async () => {
+    const name2 = `cdb_nedel2_${crypto.randomBytes(4).toString('hex')}`;
+    await admin.query(`create database ${name2}`);
+    dbNames.push(name2);
+    const u2 = new URL(url); u2.pathname = `/${name2}`;
+    const O2 = await openPgClient(u2.toString()); clients.push(O2);
+    await applyMigrations(pgAdapter(O2), { log: () => {}, to: '0071' });
+    await createWatchRoles(O2, { watcherPw: WPW.watcher, writerPw: WPW.watch_writer });
+    await applyMigrations(pgAdapter(O2), { log: () => {} });
+    const x = new URL(u2.toString()); x.username = 'watcher'; x.password = WPW.watcher;
+    const W2 = await openPgClient(x.toString()); clients.push(W2);
+    try {
+      assert.equal((await errOf(W2.query('select file_bytes from ops.ne_del_exports')))?.code, '42501');
+      await W2.query('select export_id, sha256 from ops.ne_del_exports');
+      assert.equal((await errOf(W2.query('select file_bytes from ops.ne_reg_exports')))?.code, '42501');   // 0058 の守りもそのまま
+    } finally { await done(W2, O2); }
   });
 } finally {
   for (const c of clients.slice(1)) { try { await c.end(); } catch { /* */ } }

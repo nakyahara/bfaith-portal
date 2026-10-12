@@ -18,7 +18,7 @@
  *   [R]  断られたとき (決定 Q2 a): ダウンロードから 3 日たっても NE にある単品 = 取扱中止の CSV (ne-csv.mjs と同じバイト)・消す品目は handled / 3 日たっていない = 断る
  *   [L]  夜間ロード: 依頼の途中の子・出品の構成は飛ばして止まらない (今の行は残す)
  *   [O]  表の守り (関数の外の書き込み・消す・戻す) と権限 (master_edit = 関数だけ・watcher = 確かめと一覧だけ)
- *   [K]  アプリの在庫 (ne-delete-stock.mjs): 値の出どころ (NE = 総在庫数 − FBA ほか)・読めない = unreadable (0 にしない) / [G4] CLI でセットをやめたときの変更の記録
+ *   [K]  アプリの在庫 (ne-delete-stock.mjs): 値の出どころ (NE = 総在庫数 − FBA ほか・ロジザードの今の在庫と引当を別々に)・読めない = unreadable (0 にしない) / [G4] CLI でセットをやめたときの変更の記録
  *   [S]  画面 (本物の router): 「NE から消す」の画面・確かめる・作る・受け取る (POST・sha256・Shift_JIS)・名簿の人だけ・商品の画面の箱 / [U] 画面の JS (Playwright)
  * 使い方: node scripts/test-master-ne-delete.mjs (MASTER_EDIT_UI_SKIP=1 で画面の JS を飛ばす)
  */
@@ -216,7 +216,7 @@ await stockDay('ne', jstToday(), neRows);
 await stockDay('logizard', jstDay(-1), { n07: 1, n01: 0 });
 
 /** アプリの在庫 (全部 0) */
-const zero = () => ({ ne_own: 0, ne_allocated: 0, ne_on_order: 0, fba: 0, logizard: 0, po_backorder: 0, sources: { test: true } });
+const zero = () => ({ ne_own: 0, ne_allocated: 0, ne_on_order: 0, fba: 0, logizard: 0, logizard_allocated: 0, po_backorder: 0, sources: { test: true } });
 const zeroReader = async (skus) => new Map(skus.map((s) => [s.code_norm, zero()]));
 const check = async (code, { batch = null, app = undefined } = {}) => {
   const id = await sid(code);
@@ -283,6 +283,12 @@ await ta('[C2] 理由: NE に無い・書き方が決まらない・出品の構
 await ta('[C3] アプリの在庫: 1 つでも 0 でない = stock_app (どれか言う)・鍵が無い / 形が違う / 読めない / 無い = stock_app_unknown', async () => {
   const nz = await check('n09', { app: { ...zero(), fba: 3, po_backorder: 1 } });
   assert.deepEqual(reasons(nz), ['stock_app']); assert.match(nz.problems[0].text, /FBA の在庫 3/); assert.match(nz.problems[0].text, /発注アプリの注文残 1/);
+  // 🆕 #1690 Codex R1 High 1: ロジザードの今の引当 (在庫 0・引当 5) = 断る / 引当の鍵が無い = 読めない
+  const al = await check('n09', { app: { ...zero(), logizard_allocated: 5 } });
+  assert.deepEqual(reasons(al), ['stock_app']); assert.match(al.problems[0].text, /ロジザードの引当 \(今\) 5/);
+  const noAl = { ...zero() }; delete noAl.logizard_allocated;
+  assert.deepEqual(reasons(await check('n09', { app: noAl })), ['stock_app_unknown']);
+  assert.deepEqual(reasons(await check('n09', { app: { ...zero(), logizard_allocated: null } })), ['stock_app_unknown']);
   const miss = { ...zero() }; delete miss.ne_allocated;
   assert.deepEqual(reasons(await check('n09', { app: miss })), ['stock_app_unknown']);
   assert.deepEqual(reasons(await check('n09', { app: { ...zero(), ne_own: -1 } })), ['stock_app_unknown']);
@@ -406,15 +412,23 @@ await ta('[D1] 受け取る: バイト列 = 記録・初めてのダウンロー
   const r2 = await one('select first_downloaded_by, download_count, first_downloaded_at from ops.ne_del_exports where export_id = $1', [sets.export_id]);
   assert.deepEqual([r2.first_downloaded_by, r2.download_count, String(r2.first_downloaded_at)], ['naka@test', 2, String(r1.first_downloaded_at)]);
 });
-await ta('[D2] 作った日でない = file_old (渡さない)', async () => {
+await ta('[D2] 作った日でない: 消す CSV = file_old (渡さない) / 取扱中止の CSV = 後の日も同じバイト列 (sha256) で渡す', async () => {
   await pg.query('begin');
   try {
     await pg.query("select set_config('ops.ne_del_protocol', '1', true)");
     const b = ND.delCsvBytes(['n13']);
     const id = (await one(`insert into ops.ne_del_exports (kind, schema_version, encoding, header, file_bytes, sha256, row_count, request_id, reason, built_by, built_day, db_user)
       values ('products', 'ne-del-products-v1', 'sjis', 'コード', $1, $2, 1, gen_random_uuid(), '古い', 't', $3, 't') returning export_id`, [b, ND.sha256Hex(b), jstDay(-1)])).export_id;
+    await pg.query('savepoint d2');
     const e = await errOf(async () => one('select ops.ne_del_download($1, $2::bigint) as r', ['naka@test', id]));
     assert.match(e?.message ?? '', /^file_old:/);
+    await pg.query('rollback to savepoint d2');
+    // 🆕 #1690 Codex R1 Medium 3: 取扱中止の CSV は作った時に元の品目を handled にする = 後の日も受け取れる
+    const hb = ND.handlingCsvBytes(['n13']);
+    const hid = (await one(`insert into ops.ne_del_exports (kind, schema_version, encoding, header, file_bytes, sha256, row_count, request_id, reason, built_by, built_day, db_user)
+      values ('handling', 'ne-handling-v1', 'utf8', 'syohin_code,toriatukai_kbn', $1, $2, 1, gen_random_uuid(), '前の日', 't', $3, 't') returning export_id`, [hb, ND.sha256Hex(hb), jstDay(-5)])).export_id;
+    const r = (await one('select ops.ne_del_download($1, $2::bigint) as r', ['naka@test', hid])).r;
+    assert.equal(r.sha256, ND.sha256Hex(hb)); assert.equal(Buffer.from(r.bytes_b64, 'base64').toString('hex'), hb.toString('hex'));
   } finally { await pg.query('rollback'); }
 });
 await ta('[W1] 取り下げ: live → withdrawn (理由・押し直し = 前の答え)・同じ品目をもう一度 = not_live・中の品目が変わったファイル = file_changed・取り下げた SKU は参照に使える', async () => {
@@ -555,6 +569,34 @@ await ta('[R2] 3 日たっていない = too_soon・ダウンロードの後の�
   assert.deepEqual(await counts(), before);
 });
 
+await ta('[R3] 日をまたいで 3 日たっても、一番新しい完全な取得が 3 日の待機の期限 (ダウンロードした日 + 3 日の 0 時) より前 = fetch_too_soon (断られたかもと言わない)', async () => {
+  await asEditTx((d) => ND.buildNeDelete(d, { actor: 'naka@test', codes: ['k01'], reason: '試験', confirm: true }, { open: true, stockReader: zeroReader }));
+  const k01 = await itemOf('k01');
+  // 3 日前の夜 (JST 23:00) にダウンロード = 期限は今日の 0 時
+  await pg.query('begin');
+  try {
+    await pg.query("select set_config('ops.ne_del_protocol', '1', true)");
+    await q(`update ops.ne_del_exports set first_downloaded_at = ($2::date + time '23:00') at time zone 'Asia/Tokyo', first_downloaded_by = 'naka@test', download_count = 1 where export_id = $1`, [k01.e, jstDay(-3)]);
+    await pg.query('commit');
+  } catch (e) { await pg.query('rollback'); throw e; }
+  // 一番新しい取得を、ダウンロードの後・期限の前 (昨日の取得) に置き換える (取引の中だけ)
+  await pg.query('begin');
+  try {
+    const y = await one(`select result_id, ne_generation_id, products_complete_at, setproducts_complete_at from ops.master_parent_gate_results
+       where (least(products_complete_at, setproducts_complete_at) at time zone 'Asia/Tokyo')::date = $1::date order by result_id desc limit 1`, [jstDay(-1)]);
+    assert.ok(y, '昨日の取得が無い');
+    await pg.query("select set_config('ops.ne_absence_protocol', '1', true)");
+    await q('update ops.master_ne_absence_mark set result_id = $1, ne_generation_id = $2, products_complete_at = $3, setproducts_complete_at = $4, fetch_day = $5::date where id = 1',
+      [y.result_id, y.ne_generation_id, y.products_complete_at, y.setproducts_complete_at, jstDay(-1)]);
+    const p = (await one('select ops.ne_del_refused_check($1::bigint) as r', [k01.id])).r.problems.map((x) => x.reason);
+    assert.deepEqual(p, ['fetch_too_soon']);
+    assert.equal((await one('select ops.ne_del_item_status($1::bigint) as r', [k01.id])).r.status, 'waiting');
+  } finally { await pg.query('rollback'); }
+  // 期限の後 (今日) の取得 = 断られたかも
+  const ok = (await one('select ops.ne_del_refused_check($1::bigint) as r', [k01.id])).r;
+  assert.equal(ok.ok, true, JSON.stringify(ok.problems));
+});
+
 // ═══════════ [O] 表の守りと権限 ═══════════
 console.log('[O] 表の守りと権限');
 await ta('[O1] 表は関数の外で書けない (持ち主の手も)・消せない・品目の状態は戻せない・ファイルの中身は変えられない', async () => {
@@ -585,11 +627,14 @@ await ta('[O2] 権限: master_edit = 9 つの関数だけ (表は読めない・
   await as('watcher', async () => (await pg.query('select ops.ne_del_check($1::bigint, null, null) as r', [await sid('n13')])).rows[0].r);
   const e = await errOf(async () => as('watcher', () => pg.query('select ops.ne_del_download($1, 1)', ['w@test'])));
   assert.equal(e?.code, '42501');
+  // 🆕 #1690 Codex R1 Medium 1: watcher は file_bytes を直に読めない (ほかの列は読める)
+  assert.equal((await errOf(async () => as('watcher', () => pg.query('select file_bytes from ops.ne_del_exports limit 1'))))?.code, '42501');
+  assert.ok((await as('watcher', () => pg.query('select export_id, sha256 from ops.ne_del_exports'))).rows.length > 0);
 });
 
 // ═══════════ [K] アプリの在庫 (apps/master-edit/ne-delete-stock.mjs) ═══════════
 console.log('[K] アプリの在庫');
-const { readNeDeleteStock } = await import('../apps/master-edit/ne-delete-stock.mjs');
+const { readNeDeleteStock, readLogizardForDelete } = await import('../apps/master-edit/ne-delete-stock.mjs');
 const pmlOk = (rows) => ({ ok: true, runId: 'run1', neSyncedAt: '2030-01-01T00:00:00Z', map: new Map(Object.entries(rows)) });
 const lzOk = (rows, stale = false) => ({ ok: true, asOf: '2030-01-01T00:00:00Z', stale, map: new Map(Object.entries(rows)) });
 const boOk = (rows) => ({ ok: true, map: new Map(Object.entries(rows)) });
@@ -597,24 +642,47 @@ const SK = [{ code: 'Ab-1', code_norm: 'ab-1' }, { code: 'b2', code_norm: 'b2' }
 await ta('[K1] 値: NE の在庫 = 総在庫数 − FBA・引当・NE の発注残・FBA・ロジザード (code_norm)・注文残 (発注アプリの鍵) / 出どころを残す', async () => {
   const m = await readNeDeleteStock(SK, { readers: {
     pml: async () => pmlOk({ 'ab-1': { total: 5, fba: 2, allocated: 1, onOrder: 4 }, b2: { total: 0, fba: 0, allocated: 0, onOrder: 0 } }),
-    warehouse: async () => lzOk({ 'ab-1': 7 }), backorders: () => boOk({ 'ab-1': 3 }) } });
+    logizard: async () => lzOk({ 'ab-1': { qty: 7, allocated: 2 } }), backorders: () => boOk({ 'ab-1': 3 }) } });
   const a = m.get('ab-1');
-  assert.deepEqual([a.ne_own, a.ne_allocated, a.ne_on_order, a.fba, a.logizard, a.po_backorder], [3, 1, 4, 2, 7, 3]);
+  assert.deepEqual([a.ne_own, a.ne_allocated, a.ne_on_order, a.fba, a.logizard, a.logizard_allocated, a.po_backorder], [3, 1, 4, 2, 7, 2, 3]);
   assert.equal(a.sources.pml_run, 'run1');
   const b = m.get('b2');
-  assert.deepEqual([b.ne_own, b.ne_allocated, b.ne_on_order, b.fba, b.logizard, b.po_backorder], [0, 0, 0, 0, 0, 0]);
+  assert.deepEqual([b.ne_own, b.ne_allocated, b.ne_on_order, b.fba, b.logizard, b.logizard_allocated, b.po_backorder], [0, 0, 0, 0, 0, 0, 0]);
 });
 await ta('[K2] 読めない = unreadable (0 にしない): 商品管理リストが読めない / 商品が無い / 値が整数でない / ロジザードの写しが古い・読めない / 注文残が読めない', async () => {
   const zeroRow = { total: 0, fba: 0, allocated: 0, onOrder: 0 };
-  const run = async (r) => (await readNeDeleteStock([SK[1]], { readers: { pml: async () => pmlOk({ b2: zeroRow }), warehouse: async () => lzOk({}), backorders: () => boOk({}), ...r } })).get('b2');
+  const run = async (r) => (await readNeDeleteStock([SK[1]], { readers: { pml: async () => pmlOk({ b2: zeroRow }), logizard: async () => lzOk({}), backorders: () => boOk({}), ...r } })).get('b2');
   assert.match((await run({ pml: async () => ({ ok: false, error: '古い' }) })).unreadable, /古い/);
   assert.match((await run({ pml: async () => pmlOk({}) })).unreadable, /商品管理リストにこの商品が無い/);
   assert.match((await run({ pml: async () => pmlOk({ b2: { ...zeroRow, allocated: null } }) })).unreadable, /読めない/);
   assert.match((await run({ pml: async () => pmlOk({ b2: { ...zeroRow, fba: 3 } }) })).unreadable, /総在庫数 − FBA在庫数/);
-  assert.match((await run({ warehouse: async () => lzOk({}, true) })).unreadable, /古い/);
-  assert.match((await run({ warehouse: async () => ({ ok: false, error: 'ロジザード無し' }) })).unreadable, /ロジザード無し/);
+  assert.match((await run({ logizard: async () => lzOk({}, true) })).unreadable, /古い/);
+  assert.match((await run({ logizard: async () => ({ ok: false, error: 'ロジザード無し' }) })).unreadable, /ロジザード無し/);
+  assert.match((await run({ logizard: async () => lzOk({ b2: { bad: 'ロジザードの在庫数・引当数が読めない行' } }) })).unreadable, /読めない行/);
+  assert.match((await run({ backorders: () => boOk({ b2: 1.5 }) })).unreadable, /注文残の値が読めない/);
   assert.match((await run({ backorders: () => ({ ok: false, error: '台帳無し' }) })).unreadable, /台帳無し/);
   assert.equal((await run({})).unreadable, undefined);
+});
+
+await ta('[K3] ロジザードの今の在庫と引当 (削除だけの読み方): 商品ID ごとに在庫数と引当数を足す・1 行でも整数でない (空・小数・負・文字・NaN) = その商品は読めない (0 にしない)・写しが無い / 古い', async () => {
+  const at = new Date(Date.now() - 10 * 60e3).toISOString();
+  const rows = [{ 商品ID: 'AB-1', 在庫数: 0, 引当数: 5 }, { 商品ID: 'ab-1', 在庫数: '2', 引当数: 0 }, { 商品ID: 'c3', 在庫数: 0, 引当数: 0 },
+    { 商品ID: 'bad1', 在庫数: NaN, 引当数: 0 }, { 商品ID: 'bad2', 在庫数: 1.5, 引当数: 0 }, { 商品ID: 'bad3', 在庫数: '', 引当数: 0 }, { 商品ID: 'bad4', 在庫数: 0, 引当数: null },
+    { 商品ID: 'bad5', 在庫数: -1, 引当数: 0 }, { 商品ID: 'bad6', 在庫数: 'x', 引当数: 0 }, { 商品ID: 'bad6', 在庫数: 3, 引当数: 0 }];
+  const r = await readLogizardForDelete({ reader: async () => ({ capturedAt: at, rows }) });
+  assert.equal(r.ok, true); assert.equal(r.stale, false);
+  assert.deepEqual(r.map.get('ab-1'), { qty: 2, allocated: 5 });
+  assert.deepEqual(r.map.get('c3'), { qty: 0, allocated: 0 });
+  for (const k of ['bad1', 'bad2', 'bad3', 'bad4', 'bad5', 'bad6']) assert.ok(r.map.get(k)?.bad, k);
+  const s = await readNeDeleteStock([{ code: 'AB-1', code_norm: 'ab-1' }, { code: 'bad1', code_norm: 'bad1' }, { code: 'none', code_norm: 'none' }],
+    { readers: { pml: async () => pmlOk({ 'ab-1': { total: 0, fba: 0, allocated: 0, onOrder: 0 }, bad1: { total: 0, fba: 0, allocated: 0, onOrder: 0 }, none: { total: 0, fba: 0, allocated: 0, onOrder: 0 } }),
+      logizard: async () => r, backorders: () => boOk({}) } });
+  assert.deepEqual([s.get('ab-1').logizard, s.get('ab-1').logizard_allocated], [2, 5]);   // 在庫 2・引当 5 = DB が断る
+  assert.ok(s.get('bad1').unreadable);
+  assert.deepEqual([s.get('none').logizard, s.get('none').logizard_allocated], [0, 0]);   // 写しに行が無い = 0
+  assert.equal((await readLogizardForDelete({ reader: async () => null })).ok, false);
+  assert.equal((await readLogizardForDelete({ reader: async () => { throw new Error('壊れた'); } })).ok, false);
+  assert.equal((await readLogizardForDelete({ reader: async () => ({ capturedAt: '2020-01-01T00:00:00Z', rows }) })).stale, true);
 });
 
 // ═══════════ [S] 画面 (本物の router) ═══════════

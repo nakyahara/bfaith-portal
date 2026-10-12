@@ -209,7 +209,7 @@ export const NE_DEL_FUNCTIONS = Object.freeze(['ops.ne_del_check(bigint, bigint[
   'ops.ne_del_item_status(bigint)', 'ops.ne_del_overview(bigint)']);
 /** 🆕 0072: だれにも渡さない (表の守り・行き先・理由の部品・在庫の鍵・CSV のバイト列・参照の守りの部品) */
 export const NE_DEL_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_ne_del_write()', 'ops.ne_del_item_transition_allowed(text, text)', 'ops._ne_del_problem(text, text)',
-  'ops.ne_del_app_stock_keys()', 'ops.ne_del_csv_bytes(text[])', 'ops.ne_handling_csv_bytes(text[])', 'ops.sku_ref_ne_deleting(bigint[])']);
+  'ops.ne_del_app_stock_keys()', 'ops.ne_del_csv_bytes(text[])', 'ops.ne_handling_csv_bytes(text[])', 'ops.sku_ref_ne_deleting(bigint[])', 'ops.restrict_ne_del_file_bytes()']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -306,6 +306,8 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   s.push(ifFn(LEASE_VALID_FUNCTION, `execute 'grant execute on function ${LEASE_VALID_FUNCTION} to new_entry_gate';`));
   // 0058: 上の「画面が読む表」の GRANT (ops.ne_reg_exports の表の SELECT) の後に、file_bytes を外して列ごとに付け直す (byte 列は ops.ne_reg_file だけ)
   s.push(RESTRICT_FILE_BYTES_SQL);
+  // 🆕 0072 (#1690 Codex R1 Medium 1): NE から消す CSV の byte 列も同じ (byte 列は ops.ne_del_download だけ)
+  s.push("do $$ begin if to_regprocedure('ops.restrict_ne_del_file_bytes()') is not null then perform ops.restrict_ne_del_file_bytes(); end if; end $$");
   return s;
 }
 

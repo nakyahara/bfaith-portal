@@ -85,6 +85,8 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   s.push(`do $$ begin if to_regclass('ops.master_maintenance_marks') is not null then execute 'revoke all on ops.master_maintenance_marks from watcher, watch_writer'; end if; end $$`);
   //   0058 (§3.9 の 3・R16 H1): 「全部の表に GRANT」の後に、配った CSV の byte 列 (ops.ne_reg_exports.file_bytes) を外して列ごとに付け直す (流し直しても戻らない)
   s.push(`do $$ begin if to_regprocedure('ops.restrict_ne_reg_file_bytes()') is not null then perform ops.restrict_ne_reg_file_bytes(); end if; end $$`);
+  //   🆕 0072 (#1690 Codex R1 Medium 1): NE から消す CSV の byte 列 (ops.ne_del_exports.file_bytes) も同じく外す (byte 列は ops.ne_del_download だけ)
+  s.push(`do $$ begin if to_regprocedure('ops.restrict_ne_del_file_bytes()') is not null then perform ops.restrict_ne_del_file_bytes(); end if; end $$`);
   return s;
 }
 
