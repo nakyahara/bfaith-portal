@@ -8,6 +8,8 @@
  *     セットの構成の一部だけが無い = その SKU ごと外す (一部だけ出すと数の合わない伝票になる)・全部が無い = 400 (CSV なし)・写しが読めない = 503 (CSV なし)
  *   3 /api/ne-unregistered?sku= (手で足す画面の確かめ): 無いコード・対応なし・写しが読めない = 503
  *   4 画面 (views/fba-replenishment.ejs の addManualItem) が確かめの API を呼び、無いコード・確かめられないときは足さない
+ *   5 写しの鮮度 (#1694 Codex R2 M1): 世代の received_at → 無ければ行の updated_at。36 時間より古い・分からない = 止めずに知らせる (X-NE-Notes・X-NE-Warnings・確かめの API の note)
+ *   6 過去の NE 受注 CSV の再ダウンロード (#1694 Codex R2 M2): 止めない。今の写しに無いコード・古い形の履歴・写しが読めない = 知らせ (X-NE-Notes) だけ・ファイルは同じ
  * 使い方: node scripts/test-fba-ne-unregistered.mjs
  */
 import assert from 'node:assert/strict';
@@ -32,10 +34,16 @@ const NR = await imp('apps/fba-replenishment/ne-registered.js');
 const { initMirrorDB, getMirrorDB } = await imp('apps/warehouse-mirror/db.js');
 initMirrorDB();
 const mdb = getMirrorDB();
-const putProducts = (codes) => {
+/** /api/sync と同じ形の時刻 ('YYYY-MM-DD HH:MM:SS'・UTC)。h = 何時間前 */
+const syncTime = (h = 0) => new Date(Date.now() - h * 3600e3).toISOString().replace('T', ' ').slice(0, 19);
+/** 写しを入れ替える (行の updated_at = 入れ替えた時刻・世代の記録 = 同じ時刻。gen = false で世代の記録なし = 古い送り手) */
+const putProducts = (codes, { hoursAgo = 1, gen = true, rowsAt } = {}) => {
   mdb.exec('DELETE FROM mirror_products');
-  const st = mdb.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 原価状態, updated_at) VALUES (?, ?, '単品', 'COMPLETE', '2030-01-01')`);
-  for (const c of codes) st.run(c, `商品 ${c}`);
+  const at = syncTime(hoursAgo);
+  const st = mdb.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 原価状態, updated_at) VALUES (?, ?, '単品', 'COMPLETE', ?)`);
+  for (const c of codes) st.run(c, `商品 ${c}`, rowsAt ?? at);
+  mdb.exec("DELETE FROM mirror_material_generations WHERE entity = 'products'");
+  if (gen) mdb.prepare(`INSERT INTO mirror_material_generations (entity, generation_id, content_hash, row_count, received_at) VALUES ('products', 'g1', ?, ?, ?)`).run('a'.repeat(64), codes.length, at);
 };
 
 console.log('写しを読む');
@@ -138,6 +146,111 @@ await t('[4] 画面の addManualItem = 確かめの API を呼び、無いコー
   assert.match(block.slice(iUnread, iMissing), /return;/, '確かめられない = 足さない');
   assert.match(block.slice(iMissing, iCatch), /NE に未登録[\s\S]*return;/, '無いコード = 足さない');
   assert.match(block.slice(iCatch), /return;/, '通信の失敗 = 足さない');
+});
+
+const notesOf = (r) => JSON.parse(decodeURIComponent(r.headers.get('X-NE-Notes') || '%5B%5D'));
+
+console.log('写しの鮮度 (止めない)');
+await t('[5] 時刻の読み方・古さの文 / 世代の received_at が先・無ければ行の updated_at / 新しい = 知らせなし・36 時間より古い・分からない = 知らせ', async () => {
+  assert.equal(NR.parseMirrorTime('2026-10-12 01:02:03'), Date.UTC(2026, 9, 12, 1, 2, 3), '時差なし = UTC (/api/sync の now)');
+  assert.equal(NR.parseMirrorTime('2026-10-12T01:02:03.000Z'), Date.UTC(2026, 9, 12, 1, 2, 3));
+  assert.equal(NR.parseMirrorTime(''), null); assert.equal(NR.parseMirrorTime('こわれた'), null);
+  const now = Date.UTC(2026, 9, 12, 12);
+  assert.equal(NR.freshnessNote(now - 35 * 3600e3, now), null);
+  assert.match(NR.freshnessNote(now - 40 * 3600e3, now), /40 時間前のものです \(同期が止まっているかも\)/);
+  assert.match(NR.freshnessNote(null, now), /いつの物か分かりません/);
+  putProducts(['ne001'], { hoursAgo: 2 });
+  let ne = NR.readNeProductCodes(mdb);
+  assert.deepEqual([ne.ok, ne.asOfSource, ne.note], [true, 'generation', null]);
+  putProducts(['ne001'], { hoursAgo: 50 });
+  ne = NR.readNeProductCodes(mdb);
+  assert.match(ne.note, /^NE の商品の写しが 50 時間前のものです/);
+  putProducts(['ne001'], { hoursAgo: 2, rowsAt: syncTime(100) });
+  assert.equal(NR.readNeProductCodes(mdb).note, null, '世代の記録 (入れ替えた時刻) が先');
+  putProducts(['ne001'], { hoursAgo: 60, gen: false });
+  ne = NR.readNeProductCodes(mdb);
+  assert.deepEqual([ne.asOfSource, /60 時間前/.test(ne.note)], ['rows', true], '世代が無い = 行の updated_at');
+  putProducts(['ne001'], { gen: false, rowsAt: '' });
+  ne = NR.readNeProductCodes(mdb);
+  assert.deepEqual([ne.ok, ne.asOf], [true, null]);
+  assert.match(ne.note, /いつの物か分かりません/, '分からない = 知らせ (止めない)');
+});
+await t('[5] 古い写し = CSV は出る (200・スキップ 0)・X-NE-Notes と X-NE-Warnings に知らせ / 確かめの API にも note / 新しい写し = 知らせなし', async () => {
+  putProducts(['ne001', 'ne002'], { hoursAgo: 48 });
+  let r = await exportCsv([{ amazon_sku: 'pr_ok', ship_qty: 1 }]);
+  assert.equal(r.status, 200, '古い写しでも止めない');
+  assert.match(await csvText(r), /,ne001,0,1,/);
+  assert.equal(r.headers.get('X-NE-Skipped-Count'), '0', '知らせはスキップの数に入れない');
+  assert.match(notesOf(r)[0], /48 時間前/);
+  assert.match(warningsOf(r)[0], /48 時間前/, 'X-NE-Warnings の先頭にも');
+  let j = await (await fetch(B + '/api/ne-unregistered?sku=pr_ok')).json();
+  assert.deepEqual([j.ok, j.missing], [true, []]); assert.match(j.note, /48 時間前/);
+  // 全部外れた (400) ときも知らせを付ける
+  r = await exportCsv([{ amazon_sku: 'pr_draft', ship_qty: 1 }]);
+  assert.equal(r.status, 400);
+  j = await r.json();
+  assert.match(j.notes[0], /48 時間前/);
+  putProducts(['ne001', 'ne002'], { hoursAgo: 1 });
+  r = await exportCsv([{ amazon_sku: 'pr_ok', ship_qty: 1 }]);
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('X-NE-Notes'), null);
+  assert.equal(r.headers.get('X-NE-Warnings'), null);
+  j = await (await fetch(B + '/api/ne-unregistered?sku=pr_ok')).json();
+  assert.equal(j.note, null);
+});
+
+console.log('過去の NE 受注 CSV の再ダウンロード (止めない)');
+await t('[6] 今の写しに無いコード = 知らせ・ファイルは同じ / 古い形の履歴 = 確かめられない知らせ / 写しが読めない = 知らせだけ (200) / 新しい写しにある = 知らせなし', async () => {
+  putProducts(['ne001', 'ne002', 'new-draft'], { hoursAgo: 1 });
+  let r = await exportCsv([{ amazon_sku: 'pr_ok', ship_qty: 1 }, { amazon_sku: 'pr_draft', ship_qty: 2 }]);
+  assert.equal(r.status, 200);
+  const original = Buffer.from(await r.arrayBuffer());
+  const hist = await (await fetch(B + '/api/export-history')).json();
+  const id = Math.max(...hist.filter((h) => h.type === 'ne_csv').map((h) => h.id));   // 同じ秒に作った履歴があっても今出した物 (番号が一番大きい)
+  r = await fetch(B + `/api/export-history/${id}/download`);
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('X-NE-Notes'), null, '今の写しに全部ある = 知らせなし');
+  assert.ok(Buffer.from(await r.arrayBuffer()).equals(original));
+  // 出した後に NE から消えた (写しに無い)
+  putProducts(['ne001', 'ne002'], { hoursAgo: 1 });
+  r = await fetch(B + `/api/export-history/${id}/download`);
+  assert.equal(r.status, 200, '止めない');
+  assert.ok(Buffer.from(await r.arrayBuffer()).equals(original), 'ファイルは保存したまま');
+  assert.match(notesOf(r)[0], /今の NE の商品の写しに無い商品コード new-draft/);
+  assert.match(warningsOf(r)[0], /new-draft/);
+  // 写しが古い = 鮮度の知らせも
+  putProducts(['ne001', 'ne002', 'new-draft'], { hoursAgo: 72 });
+  r = await fetch(B + `/api/export-history/${id}/download`);
+  assert.deepEqual(notesOf(r).map((x) => /72 時間前/.test(x)), [true]);
+  // 古い形の履歴 (構成の記録なし)
+  DB.saveExportHistory('ne_csv', 'old-form.csv', 1, 1, Buffer.from('x'), ['pr_ok'], null);
+  const oldId = (await (await fetch(B + '/api/export-history')).json()).find((h) => h.filename === 'old-form.csv').id;
+  putProducts(['ne001'], { hoursAgo: 1 });
+  r = await fetch(B + `/api/export-history/${oldId}/download`);
+  assert.equal(r.status, 200);
+  assert.match(notesOf(r)[0], /古い形 .*確かめられません/);
+  // 写しが読めない = 知らせだけ (再ダウンロードは止めない)
+  putProducts([]);
+  r = await fetch(B + `/api/export-history/${id}/download`);
+  assert.equal(r.status, 200);
+  assert.match(notesOf(r)[0], /確かめられません/);
+  // 納品 Excel の履歴は確かめない
+  DB.saveExportHistory('manifest_excel', 'm.xlsx', 1, 1, Buffer.from('y'), ['pr_ok'], null);
+  const mId = (await (await fetch(B + '/api/export-history')).json()).find((h) => h.filename === 'm.xlsx').id;
+  r = await fetch(B + `/api/export-history/${mId}/download`);
+  assert.deepEqual([r.status, r.headers.get('X-NE-Notes')], [200, null]);
+});
+await t('[6] 画面: 再ダウンロードは取ってきてから保存し X-NE-Notes を出す・CSV 出力も知らせ (X-NE-Notes) を出す・手で足す画面は note を出して足す', async () => {
+  const v = fs.readFileSync(path.join(root, 'views', 'fba-replenishment.ejs'), 'utf8');
+  const dl = v.slice(v.indexOf('async function downloadHistory('), v.indexOf('async function downloadHistory(') + 1500);
+  assert.ok(dl.length > 100, 'downloadHistory が fetch の形でない');
+  assert.match(dl, /await fetch\(`\$\{BASE\}\/api\/export-history\/\$\{id\}\/download`\)/);
+  assert.match(dl, /X-NE-Notes[\s\S]*alert\(/);
+  const ex = v.slice(v.indexOf("fetch(`${BASE}/api/export-ne-csv`"), v.indexOf("fetch(`${BASE}/api/export-ne-csv`") + 3500);
+  assert.match(ex, /X-NE-Notes[\s\S]*else if \(neNotes\.length\)/);
+  const add = v.slice(v.indexOf('async function addManualItem()'), v.indexOf('async function addManualItem()') + 7000);
+  assert.match(add, /neNote = nj\.note \|\| null;/);
+  assert.match(add, /if \(neNote\) \{ msgEl\.textContent \+=/);
 });
 
 server.close();

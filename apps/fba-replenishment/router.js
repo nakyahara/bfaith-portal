@@ -49,7 +49,7 @@ import { isRender } from '../../lib/is-render.js';
 import { runDecisionAttemptSafe, shouldCatchUpAtStartup, DECISION_JOB_ID } from './decision-job.js';
 import { readMirrorWarehouse } from './mirror-warehouse.js';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
-import { readNeProductCodes, missingNeCodes, componentCodesOf, notInNeWarning } from './ne-registered.js';
+import { readNeProductCodes, missingNeCodes, componentCodesOf, notInNeWarning, historyNotes, warningsHeader } from './ne-registered.js';
 import { judgeInboundFetch } from './inbound-state.js';
 import archiver from 'archiver';
 import fs from 'node:fs';
@@ -1497,7 +1497,7 @@ router.get('/api/ne-unregistered', (req, res) => {
   const key = sku.toLowerCase();
   const mapping = getSkuMappings().find((m) => String(m.amazon_sku ?? '').trim().toLowerCase() === key);
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, mapped: !!mapping, missing: mapping ? missingNeCodes(ne, componentCodesOf(mapping)) : [] });
+  res.json({ ok: true, mapped: !!mapping, missing: mapping ? missingNeCodes(ne, componentCodesOf(mapping)) : [], note: ne.note || null, as_of: ne.asOf || null });
 });
 
 router.post('/api/export-ne-csv', express.json(), async (req, res) => {
@@ -1516,6 +1516,8 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   let ne;
   try { ne = readNeProductCodes(getMirrorDB()); } catch (e) { ne = { ok: false, error: `NE の商品の写しを開けません: ${String(e && e.message || e).slice(0, 120)}` }; }
   if (!ne.ok) return res.status(503).json({ error: `${ne.error}。NE に商品があるかを確かめられないので、CSV を出しません`, reason: 'ne_products_unreadable' });
+  // 写しが古い・いつの物か分からない = 止めずに知らせる (#1694 Codex R2 M1・FBA 補充の現場を止めない)。X-NE-Notes と X-NE-Warnings の先頭に出す
+  const notes = ne.note ? [ne.note] : [];
 
   // SKU → NE商品コードに展開し、同一NE商品コードは合算
   const neAggregated = {};
@@ -1602,7 +1604,7 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   const neItems = Object.values(neAggregated).sort((a, b) => a.ne_code.localeCompare(b.ne_code));
 
   if (neItems.length === 0) {
-    return res.status(400).json({ error: 'NE商品コードに変換できる商品がありません', warnings });
+    return res.status(400).json({ error: 'NE商品コードに変換できる商品がありません', warnings: [...notes, ...warnings], notes });
   }
 
   // CSV生成（SHIFT-JIS、61列のインボイス形式）
@@ -1681,10 +1683,12 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
     // スキップされたSKUを成功時(200+CSV)でもクライアントに伝える (従来は失敗時しか warnings を返さず無音欠落だった)。
     // 件数は常に返す。詳細はヘッダー過大で CSV ダウンロード自体が失敗しないよう byte 上限(約6KB)で詰める。
     res.setHeader('X-NE-Skipped-Count', String(warnings.length));
-    if (warnings.length > 0) {
+    // 写しの鮮度の知らせ (スキップの数には入れない)。X-NE-Warnings にも先頭に入れる = スキップがあるときの画面の一覧にも出る
+    if (notes.length) res.setHeader('X-NE-Notes', warningsHeader(notes));
+    if (warnings.length > 0 || notes.length > 0) {
       const picked = [];
       let bytes = 2; // "[]" 分
-      for (const w of warnings) {
+      for (const w of [...notes, ...warnings]) {
         const enc = encodeURIComponent(JSON.stringify(w));
         if (bytes + enc.length + 1 > 6000) break; // +1 はカンマ区切り相当
         picked.push(w);
@@ -1730,6 +1734,17 @@ router.get('/api/export-history/:id/download', (req, res) => {
           }
         }
       } catch (e) { /* sku_list 壊れていてもDL自体は通す */ }
+    }
+    // NE 受注 CSV の再ダウンロード = 今の NE の商品の写しで構成のコードを確かめ、無い・確かめられない・写しが古いを知らせる (#1694 Codex R2 M2)。
+    // 🚨 止めない (前からある道)。読めない・古い形の履歴も警告だけ
+    if (record.type === 'ne_csv') {
+      let ne;
+      try { ne = readNeProductCodes(getMirrorDB()); } catch (e) { ne = { ok: false, error: `NE の商品の写しを開けません: ${String(e && e.message || e).slice(0, 120)}` }; }
+      const notes = historyNotes(record, ne);
+      if (notes.length) {
+        res.setHeader('X-NE-Notes', warningsHeader(notes));
+        res.setHeader('X-NE-Warnings', warningsHeader(notes));
+      }
     }
     const contentType = record.type === 'manifest_excel'
       ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'

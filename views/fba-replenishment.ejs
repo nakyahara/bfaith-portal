@@ -1296,6 +1296,7 @@
         return;
       }
       // まだ NE に無い商品コード (新商品の下書き・NE 登録待ち) を構成に持つ SKU は足さない = NE 受注 CSV でも出さない (#1694)
+      let neNote = null;   // 写しが古い・いつの物か分からない = 足すのは止めずに知らせる (#1694 Codex R2)
       try {
         const nr = await fetch(`${BASE}/api/ne-unregistered?sku=${encodeURIComponent(sku)}`, { headers: { Accept: 'application/json' } });
         const nj = await nr.json().catch(() => ({}));
@@ -1309,6 +1310,7 @@
           msgEl.style.color = '#dc2626';
           return;
         }
+        neNote = nj.note || null;
       } catch (e) {
         msgEl.textContent = `${sku}: NE に商品があるかを確かめられないので追加しません (通信)`;
         msgEl.style.color = '#dc2626';
@@ -1372,6 +1374,8 @@
           ? `${sku}（${mapping.product_name}）を ${qty} 個で追加しました`
           : `${sku} を ${qty} 個で追加しました（商品情報なし）`;
       }
+      msgEl.style.color = '';
+      if (neNote) { msgEl.textContent += ` ⚠️ ${neNote}`; msgEl.style.color = '#b45309'; }
       skuInput.value = '';
       qtyInput.value = '';
       document.getElementById('recSection').style.display = '';
@@ -3815,11 +3819,30 @@ Step11: 倉庫在庫の配分 (NE 商品コード = 構成品ごと。2026-09-24
       } catch(e) { console.error('履歴読み込みエラー:', e); }
     }
 
-    function downloadHistory(id, filename) {
-      const a = document.createElement('a');
-      a.href = `${BASE}/api/export-history/${id}/download`;
-      a.download = filename;
-      a.click();
+    // 再ダウンロード = 取ってきてから保存する (NE 受注 CSV は今の NE の写しで確かめた知らせ X-NE-Notes を出す・#1694 Codex R2 M2。止めない)
+    async function downloadHistory(id, filename) {
+      try {
+        const res = await fetch(`${BASE}/api/export-history/${id}/download`);
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          alert('エラー: ' + (err.error || ('HTTP ' + res.status)));
+          return;
+        }
+        let neNotes = [];
+        const notesHeader = res.headers.get('X-NE-Notes');
+        if (notesHeader) { try { neNotes = JSON.parse(decodeURIComponent(notesHeader)); } catch(e) { neNotes = []; } }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+        if (neNotes.length) {
+          neNotes.forEach(w => log(`⚠️ 履歴の再DL: ${w}`));
+          alert(`${filename} をダウンロードしました。気をつけること:\n\n${neNotes.join('\n')}`);
+        }
+      } catch (e) { alert('エラー: ' + e.message); }
     }
 
     // ===== 仮確定タブ =====
@@ -4169,6 +4192,10 @@ Step11: 倉庫在庫の配分 (NE 商品コード = 構成品ごと。2026-09-24
         let skippedWarns = [];
         const warnHeader = res.headers.get('X-NE-Warnings');
         if (warnHeader) { try { skippedWarns = JSON.parse(decodeURIComponent(warnHeader)); } catch(e) { skippedWarns = []; } }
+        // 写しの鮮度の知らせ (スキップではない・止めない)。X-NE-Warnings にも先頭に入っている
+        let neNotes = [];
+        const notesHeader = res.headers.get('X-NE-Notes');
+        if (notesHeader) { try { neNotes = JSON.parse(decodeURIComponent(notesHeader)); } catch(e) { neNotes = []; } }
 
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
@@ -4183,6 +4210,9 @@ Step11: 倉庫在庫の配分 (NE 商品コード = 構成品ごと。2026-09-24
           const shown = skippedWarns.join('\n');
           const more = skippedCount > skippedWarns.length ? `\n…ほか ${skippedCount - skippedWarns.length} 件` : '';
           alert(`NE受注CSVを出力しましたが、${skippedCount} 件のSKUがCSVに含まれませんでした:\n\n${shown}${more}`);
+        } else if (neNotes.length) {
+          neNotes.forEach(w => log(`⚠️ NE CSV: ${w}`));
+          alert(`NE受注CSVを出力しました。気をつけること:\n\n${neNotes.join('\n')}`);
         }
       } catch(e) { alert('エラー: ' + e.message); }
     }
