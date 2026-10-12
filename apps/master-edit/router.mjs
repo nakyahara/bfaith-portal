@@ -58,7 +58,7 @@
  *   GET  /api/amazon/components?q=  構成の行の「NE の商品」の欄の候補 (読むだけ・コード / 名前の言葉 / JAN・20 件まで・使えない商品は理由つき)
  *   GET  /amazon/sku?sku=    1 つの seller SKU (見る・直す・墓標にする・墓標から戻す)。対応が無ければ「新しい対応」(今の構成は夜間ロードの写しとして見せる)
  *   GET  /amazon/sku/history?sku=  変更の記録 (対応・構成・出品)
- *   GET  /amazon/unmapped    未登録 = 直近 7 日に売れたのに構成が無い seller SKU (FBA / FBM で分ける・売上の公開が欠けた日は「未判定」)
+ *   GET  /amazon/unmapped    未登録 = 直近 7 日に売れたのに構成が無い FBA の seller SKU (自社発送は出さない・区分が分からない SKU は別の一言・売上の公開が欠けた日は「未判定」)
  *   POST /api/amazon/save    保存 { request_id, seller_sku, name, components: [{ code, qty }], reason?, seen: { versions } } (lib/amazon-map-write.mjs)
  *   POST /api/amazon/delete  墓標にする { request_id, seller_sku, reason, seen: { versions } }
  *   NE 登録の CSV (⑤-2b・0053・lib/master-reg-csv.mjs。作る・配る・申告・使わない・実機の確かめは MASTER_DECISION_APPROVERS の名簿の人だけ = マスタの判断の CSV と同じ):
@@ -106,7 +106,8 @@ import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, newSellerSkuCheckInDb, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
-import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, searchMapComponents, COMPONENT_SEARCH_Q_MAX, COMPONENT_SEARCH_MIN, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
+import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, channelsFromFeeRows, normalizeAmazonFilters, checkNewAmazonSku, searchMapComponents, COMPONENT_SEARCH_Q_MAX, COMPONENT_SEARCH_MIN, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
+import { registerAmazonUnlinkedRoutes, readAmazonReportFor } from './amazon-unlinked.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
@@ -202,18 +203,13 @@ export function __setShippingRatesProvider(fn) { shippingRatesProvider = fn || d
 
 /**
  * FBA / FBM (seller SKU の正規化 → 'FBA' / 'FBM')。Render の warehouse-mirror.db の mirror_amazon_sku_fees.fulfillment_channel (読むだけ・16 §3 #9 = Company DB に列を作らない)。
- * 読めない = null (画面は「分からない」と出す・「未登録」は全部を出す)
+ * 読めない = null (画面は「分からない」と出す)。大文字小文字だけ違う SKU の区分が食い違う = 入れない (分からない)。map.at = 取得の時刻 (未登録は古い区分を使わない)
  */
 async function defaultAmazonChannels() {
   try {
     const { getMirrorDB } = await import('../warehouse-mirror/db.js');
-    const rows = getMirrorDB().prepare('select seller_sku, fulfillment_channel from mirror_amazon_sku_fees').all();
-    const out = new Map();
-    for (const r of rows) {
-      const ch = String(r.fulfillment_channel || '').trim().toUpperCase();
-      if (ch === 'FBA' || ch === 'FBM') out.set(normSku(r.seller_sku), ch);
-    }
-    return out;
+    // 区分が食い違う正規化の鍵は入れない・取得の時刻 (map.at) も持つ (未登録は鮮度で区分を決める・#1691 Codex R4 M1 / M2)
+    return channelsFromFeeRows(getMirrorDB().prepare('select seller_sku, fulfillment_channel, fetched_at from mirror_amazon_sku_fees').all());
   } catch {
     return null;
   }
@@ -953,18 +949,19 @@ router.get('/amazon', (req, res) => {
     // 「売れたのに対応が無い SKU」(未登録の画面と同じ読み方・読むだけ)。絞り込みの無い最初の画面だけ (検索・ページ送りのたびには読まない)
     const landing = !filters.q && !filters.state && !filters.offset;
     // 読めない = 札を出さないだけ (一覧は出す)
-    const unmapped = db && landing && !data.tableMissing ? await amazonUnmapped(db, { now: new Date(clock()), channel: '', channels }).catch((e) => { console.error(`[master-edit] 未登録の要約を読めない: ${e && e.message}`); return null; }) : null;
+    const unmapped = db && landing && !data.tableMissing ? await amazonUnmapped(db, { now: new Date(clock()), channels }).catch((e) => { console.error(`[master-edit] 未登録の要約を読めない: ${e && e.message}`); return null; }) : null;
     res.render(view('amazon-index.ejs'), { ...pageLocals(req, phase), nav: 'amazon', listPage: true, dbError, data, filters, MAP_STATES, CHANNELS, unmapped, UNMAPPED_DAYS });
   });
 });
+// FBA だけ (自社発送は 商品コード = Amazon SKU = 対応が要らない・10/12)。区分の引数 (?channel=) は捨てる
 router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbError) => {
-  const want = String(req.query.channel ?? 'FBA');
-  const channel = ['FBA', 'FBM'].includes(want) ? want : '';
   const channels = db ? await amazonChannelsProvider() : null;
-  const data = db ? await amazonUnmapped(db, { now: new Date(clock()), channel, channels }) : null;
+  const data = db ? await amazonUnmapped(db, { now: new Date(clock()), channels }) : null;
   const phase = await readPhaseView(db);
-  res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, channel, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
+  res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
 }));
+// まだつないでいない Amazon の SKU (Amazon の出品一覧にあって構成が無い・隠す / 元に戻す。10/12・amazon-unlinked.mjs)
+registerAmazonUnlinkedRoutes(router, { withPgPage, withPgApi, pageLocals, editorGate, view, readPhaseView, clock: () => clock() });
 /**
  * 新しい seller SKU の対応を作る入口 (読むだけ・保存は今までどおり /amazon/sku の画面から POST /api/amazon/save)。
  * 作ってよい (形が合う・対応が無い・似た SKU も気をつけることも無い、または checked = 画面でもう見た) = /amazon/sku?sku= へ 303
@@ -1019,7 +1016,9 @@ router.get('/amazon/sku', (req, res) => withPgPage(req, res, async (db, dbError)
   if (page) page.phase = { ...page.phase, owner: await screenOwner(db) };
   // 出品も対応も無い seller SKU = 先に作る形の決まり (#1685 Codex R1 High)。合わなければ画面で先に知らせて保存のボタンを出さない (保存の lib も断る)
   const newSkuProblems = page && !page.cur.listing ? (await newSellerSkuCheckInDb(db, sku)).problems : [];
-  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY, COMPONENT_SEARCH_MIN });
+  // Amazon の出品一覧 (前の夜のレポート) にこの seller SKU があれば、Amazon の商品名・ASIN・出品日・FBA / 自社・状態を見せる (無い = 何も出さない・読めない = 読めないと出す)
+  const amazonReport = db ? await readAmazonReportFor(db, sku, { nowMs: clock() }) : null;
+  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY, COMPONENT_SEARCH_MIN, amazonReport });
 }));
 router.post('/api/amazon/save', (req, res) => {
   const gate = editorGate(req);

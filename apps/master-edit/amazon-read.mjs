@@ -3,7 +3,7 @@
  * (Company DB構想 16 §2「画面」・§3 #9・§7 v2 M11 / L12。PR ⑦-1)
  *
  * FBA / FBM は Company DB に列を作らない (16 §3 #9) = 画面が Render の mirror_amazon_sku_fees (SQLite) の fulfillment_channel を読む (router の channelProvider)
- * 「未登録」= 直近 7 日の Amazon の注文で、出品が無い・出品に構成が無い seller SKU (ops.amazon_map_unmapped_recent)。
+ * 「未登録」= 直近 7 日の Amazon の注文で、出品が無い・出品に構成が無い FBA の seller SKU (ops.amazon_map_unmapped_recent。自社発送は出さない・10/12)。
  *   売上の日次の公開がそろっていない日があれば「未判定」(0 件と言わない = M11)
  */
 import { normSku } from '../../lib/sku-norm.js';
@@ -12,6 +12,7 @@ import { COMPANY_ID, jstDate, MasterWriteError } from '../../lib/master-write.mj
 import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage, componentUnusable, USABLE_REG_STATES, NOT_IN_NE_REG_STATES, USABLE_SKU_KINDS, MAP_STATES, AMAZON_JP_SHOP_CODE, AMAZON_SKU_MAX_LEN } from '../../lib/amazon-map-write.mjs';
 import { stockOf } from './extras.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
+import { readReportLoad } from './amazon-unlinked.mjs';
 
 export { AMAZON_SKU_MAX_LEN };
 
@@ -102,19 +103,89 @@ export async function amazonHistory(db, sellerSku) {
   return { cur, events };
 }
 
+/** 手数料の写し (fees) の区分が「新しい」とみなす長さ = 取り直しの硬い期限 132 時間 (fetch-amazon-fees.js の REFRESH_HARD_HOURS) + 1.5 日のゆとり */
+export const FEES_FRESH_MS = 168 * 3600e3;
+/** fees の fetched_at ('YYYY-MM-DD HH:MM:SS' = UTC・fetch-amazon-fees.js の now()) → ms。読めない = null */
+export function feesFetchedMs(v) {
+  const s = String(v ?? '').trim();
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z)?$/.exec(s);
+  if (!m) return null;
+  const t = Date.parse(`${m[1]}T${m[2]}Z`);
+  return Number.isNaN(t) ? null : t;
+}
 /**
- * 未登録 (M11): 直近 UNMAPPED_DAYS 日の Amazon の注文で、出品が無い・出品に構成が無い seller SKU。channel = 'FBA' / 'FBM' / '' (全部)。
+ * 手数料の写しの行 [{ seller_sku, fulfillment_channel, fetched_at }] → Map(正規化した seller SKU → 'FBA' | 'FBM')。
+ *   🚨 大文字小文字・全角だけ違う SKU が同じ正規化の鍵になって区分が違う = どちらとも言えない = 入れない (後勝ちにしない・#1691 Codex R4 M2)。
+ *   map.at = Map(鍵 → fetched_at の ms (同じ鍵のいちばん新しい) | null)・map.conflicts = 区分が食い違った鍵
+ */
+export function channelsFromFeeRows(rows) {
+  const out = new Map(); const at = new Map(); const conflicts = new Set();
+  for (const r of rows || []) {
+    const ch = String(r.fulfillment_channel || '').trim().toUpperCase();
+    if (ch !== 'FBA' && ch !== 'FBM') continue;
+    const k = normSku(r.seller_sku);
+    if (!k) continue;
+    if (conflicts.has(k)) continue;
+    if (out.has(k) && out.get(k) !== ch) { out.delete(k); at.delete(k); conflicts.add(k); continue; }
+    out.set(k, ch);
+    const t = feesFetchedMs(r.fetched_at);
+    const prev = at.get(k);
+    at.set(k, prev == null ? t : t == null ? prev : Math.max(prev, t));
+  }
+  out.at = at; out.conflicts = conflicts;
+  return out;
+}
+
+/**
+ * 未登録 (M11): 直近 UNMAPPED_DAYS 日の Amazon の注文で、出品が無い・出品に構成が無い **FBA の** seller SKU。
+ * 🚨 自社発送 (FBM) は出さない・数えない (中原さん 10/12「自社発送は 商品コード = Amazon SKU なので対応が要らない」)。区分の切り替えも無い。
+ * 区分の決め方 = 鮮度で決める (#1691 Codex R4 M1):
+ *   ① Company DB の Amazon の出品一覧 (0074・毎日全件の今の姿) が古くなければ (36 時間以内) それを先に
+ *   ② 出品一覧に無い・古い・読めない = 手数料の写し (channels = Render の mirror_amazon_sku_fees) が新しければ (FEES_FRESH_MS 以内) それ
+ *   ③ どちらも古い・無い = 区分が分からない
+ *   同じ正規化の鍵で区分が食い違う行 (出品一覧・fees とも) = 区分が分からない (後勝ちにしない・R4 M2)
+ *   区分が分からない SKU = 一覧と件数に入れず unknown に分けて返す (画面は別の一言 = 黙って隠さない)。
+ *   区分の出どころが両方とも古い・読めない = decidable: false (画面は件数も「読めない」・0 件と言わない・R4 M3)。候補が 0 件なら読めなくても 0 件と確定 (R4 L1)
  * 売上の日次の公開がそろっていない日があれば undecided = その日の一覧 (画面は「未判定」)
  */
-export async function amazonUnmapped(db, { now = new Date(), channel = 'FBA', channels = null } = {}) {
+export async function amazonUnmapped(db, { now = new Date(), channels = null } = {}) {
   const today = jstDate(now);
-  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], today, undecided: [], tableMissing: true, channel, channelsAvailable: !!channels };
+  const nowMs = now.getTime();
+  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], unknown: [], today, undecided: [], tableMissing: true, channelsAvailable: !!channels, decidable: false };
   const missing = (await db.query('select ops.amazon_map_sales_coverage($1::date, $2) as d', [today, UNMAPPED_DAYS])).rows[0].d || [];
   const all = (await db.query('select code, listing_id::text as listing_id, map_state, units::int as units, orders::int as orders, last_date::text as last_date from ops.amazon_map_unmapped_recent($1::date, $2) order by units desc, code',
     [today, UNMAPPED_DAYS])).rows;
-  for (const r of all) r.channel = channels ? (channels.get(normSku(r.code)) ?? null) : null;
-  const rows = channel && channels ? all.filter((r) => r.channel === channel) : all;
-  return { rows, total_all: all.length, today, undecided: missing.map(dateOnly), tableMissing: false, channel, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID };
+  const base = { today, undecided: missing.map(dateOnly), tableMissing: false, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID };
+  if (!all.length) return { ...base, rows: [], unknown: [], decidable: true, source: null };   // 候補が無い = 区分によらず 0 件 (R4 L1)
+  // ① 出品一覧 (古くないときだけ)。鍵ごとに区分が 1 つのときだけ採る (食い違い = 'conflict')
+  let report = null;
+  const head = await readReportLoad(db, { nowMs });
+  const reportFresh = head.state === 'ok' && !head.stale;
+  if (reportFresh) {
+    try {
+      report = new Map((await db.query(`select sku_norm, count(distinct coalesce(fulfillment, '?'))::int as n, min(fulfillment) as f from ops.amazon_listing_report
+          where company_id = $1 and shop_code = $2 and load_id = $3::bigint and sku_norm = any(select core.norm_code(x) from unnest($4::text[]) as t(x)) group by sku_norm`,
+      [COMPANY_ID, AMAZON_JP_SHOP_CODE, head.load.load_id, all.map((r) => r.code)])).rows.map((x) => [x.sku_norm, x.n > 1 ? 'conflict' : x.f || null]));
+    } catch (e) { console.error(`[master-edit] 未登録の区分 (出品一覧) を読めない: ${e && e.message}`); report = null; }
+  }
+  // ② fees (新しいときだけ)
+  const feesAt = (k) => (channels && channels.at instanceof Map ? channels.at.get(k) : null);
+  const feesFresh = (k) => { const t = feesAt(k); return t != null && nowMs - t <= FEES_FRESH_MS; };
+  const anyFeesFresh = !!channels && channels.at instanceof Map && [...channels.at.values()].some((t) => t != null && nowMs - t <= FEES_FRESH_MS);
+  for (const r of all) {
+    const k = normSku(r.code);
+    const rep = report ? report.get(k) : undefined;
+    if (rep === 'conflict') { r.channel = null; r.channel_from = 'conflict'; continue; }
+    if (rep) { r.channel = rep; r.channel_from = 'report'; continue; }
+    if (channels && channels.conflicts instanceof Set && channels.conflicts.has(k)) { r.channel = null; r.channel_from = 'conflict'; continue; }
+    const ch = channels ? channels.get(k) : null;
+    if (ch && feesFresh(k)) { r.channel = ch; r.channel_from = 'fees'; continue; }
+    r.channel = null; r.channel_from = ch ? 'stale' : 'none';
+  }
+  const decidable = (reportFresh && !!report) || anyFeesFresh;
+  const rows = decidable ? all.filter((r) => r.channel === 'FBA') : [];
+  const unknown = all.filter((r) => !r.channel);
+  return { ...base, rows, unknown, decidable, reportFresh: reportFresh && !!report, feesFresh: anyFeesFresh };
 }
 
 // ─── 新しい seller SKU の対応を自分で作る入口 (10/11 中原さん「売れてから作るしかない」→ まだ売れていない SKU も先に作れる) ───

@@ -887,7 +887,9 @@ __setPgClientFactory(async (url) => {
 });
 __setClock(() => new Date('2030-01-10T03:00:00Z').getTime());
 // 持ち主表 = DB の active (広げる道 PR-2)
-__setAmazonChannelsProvider(async () => new Map([['pr_a001', 'FBA'], ['a003', 'FBM'], ['zz_sold', 'FBA'], ['zz_fbm', 'FBM']]));
+// 手数料の写し (fees) の区分 = 本物と同じ形 (取得の時刻つき・#1691 Codex R4: 未登録は 7 日より古い区分を使わない)。時計 (2030-01-10) の前の日に取った
+const FEES_NOW = (await import('../apps/master-edit/amazon-read.mjs')).channelsFromFeeRows([['pr_a001', 'FBA'], ['a003', 'FBM'], ['zz_sold', 'FBA'], ['zz_fbm', 'FBM']].map(([s, c]) => ({ seller_sku: s, fulfillment_channel: c, fetched_at: '2030-01-09 12:00:00' })));
+__setAmazonChannelsProvider(async () => FEES_NOW);
 const app = express();
 app.set('view engine', 'ejs');
 app.use((req, res, next) => {
@@ -1038,10 +1040,70 @@ await ta('[12] 未登録 (M11): 直近 7 日の Amazon の注文で構成が無�
   assert.equal(r.status, 200); await checkScripts(r.text, 0);
   assert.ok(r.text.includes('未判定'));   // 売上の日次が公開されていない
   assert.ok(r.text.includes('zz_sold') && !r.text.includes('zz_fbm') && !r.text.includes('zz_old'));
-  r = await call('GET', '/amazon/unmapped?channel=FBM');
-  assert.ok(r.text.includes('zz_fbm') && !r.text.includes('zz_sold'));
-  r = await call('GET', '/amazon/unmapped?channel=all');
-  assert.ok(r.text.includes('zz_sold') && r.text.includes('zz_fbm') && r.text.includes('削除済み (墓標)'));
+  // 🚨 10/12 中原さん: 自社発送 (FBM) は出さない (商品コード = Amazon SKU = 対応が要らない)。区分の引数 (?channel=) は捨てる = どの引数でも FBA だけ
+  for (const ch of ['FBM', 'all', 'fbm']) {
+    r = await call('GET', '/amazon/unmapped?channel=' + ch);
+    assert.ok(r.text.includes('zz_sold') && !r.text.includes('zz_fbm'), ch);
+  }
+  assert.ok(!/\?channel=/.test(r.text) && !r.text.includes('chip-lab">区分'), '区分の切り替えが無い');
+  // 区分が分からない SKU (墓標の pr_pack2 = 手数料の写しにも出品一覧にも無い) は一覧と件数に入れず、下の一言で出す (黙って隠さない)
+  assert.ok(r.text.includes('id="unmapped-unknown"') && r.text.includes('sku?sku=pr_pack2'));
+  assert.ok(r.text.includes('<b style="color:var(--text)">1</b> 件 (FBA)'), '件数も FBA だけ');
+  {
+    const page = await call('GET', '/amazon/');
+    assert.ok(page.text.includes('売れたのに対応が無い SKU (FBA) — 1 件') && page.text.includes('href="unmapped">全部見る') && !page.text.includes('zz_fbm'));
+  }
+  // 区分の出どころ (#1691 Codex R4): 出品一覧 (0074・36 時間以内) が先・無い / 古い = fees (7 日以内)・どちらも古い・無い = 分からない・食い違い = 分からない
+  const RU = await import('../apps/master-edit/amazon-read.mjs');
+  const I = await import('../apps/company-db/ingest/amazon-listings.mjs');
+  const NOW_MS = Date.parse('2030-01-10T03:00:00Z');
+  const um = (channels, now = new Date(NOW_MS)) => asRole(E, 'master_edit', () => RU.amazonUnmapped(db, { now, channels }));
+  const feeMap = (list, at) => RU.channelsFromFeeRows(list.map(([s, c]) => ({ seller_sku: s, fulfillment_channel: c, fetched_at: at })));
+  const report = async (list, genIso, run) => {
+    const rowsR = list.map(([s, f]) => I.listingRowOf({ seller_sku: s, item_name: s, asin: null, open_date: null, open_date_raw: null, fulfillment: f, channel_raw: f === 'FBM' ? 'DEFAULT' : 'AMAZON_JP', status: 'active', status_raw: 'Active', quantity: null, price: null }));
+    const gen = Date.parse(genIso);
+    const r0 = await I.ingestAmazonListings(db, { shop_code: I.SHOP_CODE, generation: gen, snapshot_at: new Date(gen).toISOString(), report_run_id: run, checksum: I.listingChecksum(rowsR), row_count: rowsR.length, skipped_count: 0, rows: rowsR, force: true }, { nowMs: NOW_MS });
+    assert.ok(['applied', 'refreshed'].includes(r0.status), JSON.stringify(r0));
+  };
+  // fees の時刻の読み方・正規化の衝突 (大文字小文字だけ違う SKU の区分が違う = 入れない・後勝ちにしない)
+  assert.equal(RU.feesFetchedMs('2030-01-09 12:00:00'), Date.parse('2030-01-09T12:00:00Z'));
+  assert.equal(RU.feesFetchedMs('きのう'), null);
+  const fc = RU.channelsFromFeeRows([{ seller_sku: 'zz_sold', fulfillment_channel: 'FBA', fetched_at: '2030-01-09 00:00:00' }, { seller_sku: 'ZZ_SOLD', fulfillment_channel: 'FBM', fetched_at: '2030-01-09 01:00:00' },
+    { seller_sku: 'zz_fbm', fulfillment_channel: 'FBM', fetched_at: '2030-01-08 00:00:00' }, { seller_sku: 'ZZ_FBM', fulfillment_channel: 'FBM', fetched_at: '2030-01-09 00:00:00' }]);
+  assert.deepEqual([fc.get('zz_sold'), fc.conflicts.has('zz_sold'), fc.get('zz_fbm'), fc.at.get('zz_fbm')], [undefined, true, 'FBM', Date.parse('2030-01-09T00:00:00Z')]);
+  let d = await um(fc);
+  assert.deepEqual([d.decidable, d.rows.map((x) => x.code), d.unknown.map((x) => x.code).sort()], [true, [], ['pr_pack2', 'zz_sold']], 'fees の正規化の衝突 = 分からない (FBA とも FBM とも言わない)');
+  // 両方が古い・無い = 区分を読めない (件数も「読めない」・0 件と言わない)
+  __setAmazonChannelsProvider(async () => feeMap([['zz_sold', 'FBA'], ['zz_fbm', 'FBM']], '2029-12-01 00:00:00'));
+  try {
+    d = await um(feeMap([['zz_sold', 'FBA'], ['zz_fbm', 'FBM']], '2029-12-01 00:00:00'));
+    assert.deepEqual([d.decidable, d.rows.length, d.unknown.length], [false, 0, 3], '古い fees は使わない');
+    r = await call('GET', '/amazon/unmapped');
+    assert.ok(r.text.includes('id="unmapped-undecidable"') && !r.text.includes('zz_sold'));
+    assert.ok(r.text.includes('件数は読めない') && !/>0<\/b> 件 \(FBA\)/.test(r.text), '件数欄も「読めない」(0 件と言わない)');
+    const page = await call('GET', '/amazon/');
+    assert.ok(page.text.includes('売れたのに対応が無い SKU (FBA) — 区分を読めない') && !page.text.includes('(FBA) — 0 件'));
+    __setAmazonChannelsProvider(async () => null);
+    r = await call('GET', '/amazon/unmapped');
+    assert.ok(r.text.includes('件数は読めない') && r.text.includes('読めないので出せません'), 'fees が読めない・出品一覧も無い');
+    // 候補が 0 件 = 区分を読めなくても 0 件と確定 (R4 L1)
+    d = await um(null, new Date('2031-06-01T03:00:00Z'));
+    assert.deepEqual([d.decidable, d.rows.length, d.unknown.length], [true, 0, 0]);
+    // 古い fees (zz_sold = FBM のまま) + 新しい出品一覧 (zz_sold = FBA) = 出品一覧が勝つ
+    await report([['zz_sold', 'FBA'], ['zz_fbm', 'FBM']], '2030-01-10T00:00:00Z', 'r_um1');
+    d = await um(feeMap([['zz_sold', 'FBM'], ['zz_fbm', 'FBA']], '2029-12-01 00:00:00'));
+    assert.deepEqual([d.decidable, d.rows.map((x) => [x.code, x.channel_from]), d.unknown.map((x) => x.code)], [true, [['zz_sold', 'report']], ['pr_pack2']], '新しい出品一覧が古い fees に勝つ');
+    // 新しい fees と新しい出品一覧が違う = 出品一覧が先 (毎日全件の今の姿)
+    d = await um(feeMap([['zz_sold', 'FBM']], '2030-01-09 12:00:00'));
+    assert.deepEqual(d.rows.map((x) => x.code), ['zz_sold']);
+    // 出品一覧が古い (36 時間より前) = 新しい fees で決める・fees も無い SKU = 分からない
+    d = await um(feeMap([['zz_sold', 'FBM'], ['zz_fbm', 'FBA']], '2030-01-09 12:00:00'), new Date(NOW_MS + 40 * 3600e3));
+    assert.deepEqual([d.decidable, d.rows.map((x) => [x.code, x.channel_from])], [true, [['zz_fbm', 'fees']]], '古い出品一覧は使わない');
+    // 出品一覧の中で大文字小文字だけ違う SKU の区分が違う = 分からない (fees にも回さない)
+    await report([['zz_sold', 'FBA'], ['ZZ_SOLD', 'FBM'], ['zz_fbm', 'FBM']], '2030-01-10T01:00:00Z', 'r_um2');
+    d = await um(feeMap([['zz_sold', 'FBA']], '2030-01-09 12:00:00'));
+    assert.deepEqual([d.rows.map((x) => x.code), d.unknown.map((x) => [x.code, x.channel_from]).sort()], [[], [['pr_pack2', 'none'], ['zz_sold', 'conflict']]]);
+  } finally { __setAmazonChannelsProvider(async () => FEES_NOW); }
   const rows = (await q(`select code, units::int as units, orders::int as orders, map_state from ops.amazon_map_unmapped_recent('2030-01-10', 7) order by code`));
   assert.deepEqual(rows.map((x) => [x.code, x.units, x.orders, x.map_state]), [['pr_pack2', 1, 1, 'deleted'], ['zz_fbm', 4, 1, null], ['zz_sold', 5, 3, null]]);
   assert.ok(!r.text.includes('zz_cancel') && !r.text.includes('zz_hdr'));

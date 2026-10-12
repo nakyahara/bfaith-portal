@@ -2545,3 +2545,22 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): 0071 の後 → `migrate.mjs --dry-run` (0072 だけ) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs` = master_edit に 9 つの関数の実行・`create-watch-roles.mjs` = watcher に確かめと一覧)。流さなくても今の動きは変わらない (画面は「まだ使えない」)。
   最初の 1 件は中原さんが在庫 0・受注なし・出品なしの商品で試す
 - 試験 = `node scripts/test-master-ne-delete.mjs` (PGlite・バイト列・確かめ・作る・受け取る・取り下げ・セットのやめる・取扱中止・夜間ロード・画面・Playwright) / `TEST_PG_URL=… node scripts/test-master-ne-delete-pg.mjs` (本物のログイン・参照 / 作る / 受け取り / 取り下げ / 夜間ロードとの競り合い)
+
+### Amazon の出品一覧・まだつないでいない Amazon の SKU (0074・2026-10-12 中原さんの頼み「Amazon の SKU の登録で Amazon の商品名も見たい・FBA に登録して社内の商品コードとつないでいない SKU の入口がほしい」・決定 Q5 A / Q6 A / Q7 A)
+- **なぜ**: Company DB の Amazon の出品 (夜間ロード) は SKU マスタ・fba.db・手数料の写しから作る = 商品名・出品日・停止中の SKU が無い。今の「未登録」は直近 7 日に売れた SKU だけ = 売れていない FBA の SKU が出ない
+- **材料**: 想定利益の夜間 (miniPC 23:30・`apps/expected-profit/fetch-listings.js`) が毎晩全件取って残している出品レポート GET_MERCHANT_LISTINGS_ALL_DATA の TSV 原文 (`DATA_DIR/mall-items-history/amazon/`・manifest.jsonl)。
+  **SP-API は呼ばない** (同じレポートを 2 回取らない)・**新しい定期実行は無い** = 毎朝の daily-sync の 1 工程「Company DB 出品一覧 (Amazon)」(`apps/company-db/push/amazon-listings.mjs --send`・台帳 warehouse-daily-sync)
+- **送り手**: manifest の中で 主店 (想定利益の夜間と同じ出どころ = expected-profit.db の覚え書きのセラーID → env SP_API_SELLER_ID・marketplace は日本だけ) と完全に同じ shop_id・取得元 merchant_listings_all_data・complete・TSV・64 桁の sha256 の回のうち、
+  取得の時刻がいちばん新しい回を送る (主店が決まらない = ❌・推測しない)。gz の sha256 が manifest と違う = ❌。日本語の見出し・英語の見出しのどちらでも読む (seller SKU の列が無い = ❌・ほかの列が無い = ⚠️)。
+  外す行 (SKU が空・同じ SKU の 2 行目・列の数が違う) は数える・多すぎる (max(20, 2%)) = ❌。🛑 行が前の回の 80% 未満 = 送らない (初回は manifest の 1 つ前の回・想定利益の判定 enum_status で守る)・わざとなら手で `--force`
+- **受け口** `POST /apps/company-db/sync/amazon-listings` (`apps/company-db/ingest/amazon-listings.mjs`・x-sync-key・12MB の parser): 世代 = 取得の時刻。同じ = same・中身が同じ新しい取得 = refreshed (見出しだけ)・古い = stale・同じ世代で違う = 409・
+  🛑 同じ取引の中で今の行と比べて 80% 未満 = 409 SHRINK (body の force: true だけ通す)・0 行は 400・店ごとに丸ごと入れ替え (1 取引・advisory lock)
+- **表** `ops.amazon_listing_report_loads` (見出し・今の姿 = 世代が最大の行) / `ops.amazon_listing_report` (今の姿の行・sku_norm = core.norm_code の生成列) /
+  `ops.amazon_sku_hidden` (「まだつないでいない SKU」の一覧で隠す印・表示だけ = Amazon・対応・出品には触らない) / `ops.amazon_sku_hidden_events` (隠す・戻すの記録・追記だけ)
+- **関数** (security definer・public なし): `ops.set_amazon_sku_hidden` (対応の保存と同じ SKU の鍵 `core.amazon_map:<norm>` → 出品に構成があれば断る `linked`・出品一覧に無い SKU は断る・同じ状態 = same) /
+  `ops.amazon_sku_last_sold(norms, since)` (Amazon 日本の注文・取り消しを除く・画面のロールに注文の表は読ませない)。0073 (`ops.amazon_map_*`) の関数は使わない・変えない
+- **画面** (マスタの入力): seller SKU の画面の「Amazon の出品一覧では」(商品名・ASIN・出品日・FBA / 自社・状態・価格・自社発送も出す) / 新しい入口 `/amazon/unlinked`「まだつないでいない Amazon の SKU (FBA)」(FBA だけ・
+  出品日・状態・言葉で絞る・FBA の在庫・最後に売れた日・隠す / 元に戻す = 名簿 MASTER_EDITORS の人) / 「売れたのに対応が無い SKU」も FBA だけ (区分 = 出品一覧 (36 時間以内) → 新しい手数料の写し (7 日以内)・分からない SKU は別の一言)
+- 当て方 (🚨 まだ流さない): 0073 の後 → `migrate.mjs --dry-run` (0074 だけ・今のデータは何も変えない = 新しい表は空・関数だけ) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs` = master_edit に 3 つの表の select と 2 つの関数の実行・引数なし = パスワードは変えない)。
+  migrate の前の朝は daily-sync の 1 行が「⚠️ Render に migration 0074 がまだ無い」(exit 0)。手で先に送る = miniPC で `node -r dotenv/config apps/company-db/push/amazon-listings.mjs --dry-run` → `--send`
+- 試験 = `node scripts/test-amazon-unlinked.mjs` (PGlite・本物の router・本物の履歴の保存) / `TEST_PG_URL=… node scripts/test-amazon-unlinked-pg.mjs` (本物の PostgreSQL・ロールの権限・受け口の並行・保存と隠すの競り合い・8,000 行) / `node scripts/test-amazon-map.mjs` の [12] (未登録 = FBA だけ・区分の鮮度)

@@ -229,7 +229,8 @@ export const JOBS_REGISTRY = [
       + '書込先は専用DB expected-profit.db (warehouse.db は 11GB で product-idea-scout が常駐しているため読み取りのみ)。'
       + '【2026-09-09 追加・Company DB構想 06 Step 0】出品列挙で取った応答 (Amazon 出品レポートの TSV 原文 / 楽天 items/search の商品 JSON) を'
       + '毎晩そのまま data/mall-items-history/<mall>/YYYY/MM/items_*.gz + manifest.jsonl に残す (商品の「昨日」= 履歴。'
-      + 'Company DB raw 層への backfill 材料)。0 件は保存しない・部分取得は complete=false・保存失敗はジョブ結果を変えず note に写す',
+      + 'Company DB raw 層への backfill 材料)。0 件は保存しない・部分取得は complete=false・保存失敗はジョブ結果を変えず note に写す。'
+      + '【2026-10-12】Amazon の TSV は翌朝の warehouse-daily-sync の「Company DB 出品一覧 (Amazon)」(apps/company-db/push/amazon-listings.mjs) が読んで Company DB へ送る = TSV の保存の形 (manifest の項目・列) を変えるときはそちらも',
     where: 'miniPC TaskScheduler [ExpectedProfitNightly] → scripts/expected-profit/run-expected-profit-nightly.ps1'
       + ' → node apps/expected-profit/nightly.js',
     schedule: '毎日 23:30 (全体終了期限 06:00。超えたら中断して翌日に持ち越す)',
@@ -450,6 +451,11 @@ export const JOBS_REGISTRY = [
       + '同じ「FBA在庫スナップショット」の中で、米国の RESTOCK / PLANNING を取れたままの行で DATA_DIR/fba-us-reports/ にも残す (apps/warehouse/fba-us-reports-store.js。YYYY-MM-DD.json = その日の行・400 日で消す / last-attempt.json = 最後の取得の成否と保存の失敗。fba.db の外)。'
       + '米国FBA在庫補充 (/apps/fba-replenishment-us) が miniPC の GET /service-api/fba/us/reports/latest で読む。保存に失敗しても朝のスナップショットは失敗にしない (最後の行の末尾に「取れたままのレポートを残せなかった」)。'
       + '止まると米国の画面に「RESTOCK が古い」「最新の取得で失敗」の赤帯。見る所 = そのフォルダの last-attempt.json と logs/daily-sync-*.log の [fba-stock-snapshot:us]。新しい定期実行は無い。'
+      + '🆕 2026-10-12: 「Company DB 在庫日次 (fba_jp / fba_us)」の後に「Company DB 出品一覧 (Amazon)」(apps/company-db/push/amazon-listings.mjs --send。受け皿 = ops.amazon_listing_report (migration 0074)。'
+      + '材料 = 前の夜に「expected-profit-nightly」(23:30) が取って残した出品レポート GET_MERCHANT_LISTINGS_ALL_DATA の TSV (DATA_DIR/mall-items-history/amazon/ の manifest の最後の complete の回)。'
+      + 'SP-API は呼ばない (同じレポートを 2 回取らない)・新しい定期実行は無い (この台帳の ping に乗る)。Render と同じ取得なら送らない・世代 = 取得の時刻で古い送信は受け口が拒む・行が前の 80% 未満は送らない (🛑 --force は手で)。'
+      + '使い手 = マスタの入力の「まだつないでいない Amazon の SKU」(/apps/master-edit/amazon/unlinked) と seller SKU の画面の「Amazon の出品一覧では」(商品名・出品日・FBA / 自社・状態)。'
+      + '止まると商品名・出品日が古びる (画面に取得の時刻が出る)。⚠️「取得が古い」= 想定利益の夜間が止まっている (expected-profit-nightly の runbook)。⚠️「0074 がまだ無い」= migrate の前 (正常)) が走る。'
       + '同じ「FBA在庫スナップショット」の中で、JP のレポートを頼む直前 (S0) と保存した直後 (S1) に、納品プラン・出荷便の状態を ID ごとに記録してレポートと照合する (FBA 補充 B1。apps/warehouse/inbound-baseline.js → DATA_DIR/fba-inbound-state.db。'
       + '表 = inbound_snapshots (30 日で消す) / inbound_baselines (その日の基準 = レポート作成中に動いたプラン・準備中と輸送中の不一致・一部出荷・結べない v0 便・Render が使う世代) / inbound_state_kv (追跡中のプラン・空プランの記録)。'
       + 'B1 は記録だけで誰も使わない。失敗しても朝のスナップショットは失敗にしない (最後の行の末尾に「準備中の基準: S0 … → S1 …」)。空の古い ACTIVE プラン (約 460 件) は 1 回 150 秒までしか確かめないので、最初の数日は S0/S1 が「不完全」になる (正常)。新しい定期実行は無い。'
