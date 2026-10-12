@@ -1985,7 +1985,10 @@ const setRegUi = async (code, state) => {
 const regUi = async (code) => (await pg.query('select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code = $1', [code])).rows[0].state;
 const compsUi = async (sku) => (await pg.query(`select k.code, c.qty from core.listing_components c join core.skus k on k.sku_id = c.sku_id
   where c.listing_id = (select listing_id from core.listings where mall = 'amazon' and listing_norm = core.norm_code($1)) order by c.sort_order`, [sku])).rows.map((r) => [r.code, r.qty]);
-const sugOpen = (p) => p.waitForFunction(() => { const s = document.getElementById('comp-suggest'); return s && !s.hidden && s.querySelector('.co, .cs-empty:not(:first-child), .cs-h'); });
+const sugOpen = (p) => p.waitForFunction(() => { const s = document.getElementById('comp-suggest'); return s && !s.hidden && !s.classList.contains('stale') && s.querySelector('.co, .cs-empty:not(:first-child), .cs-h'); });
+/** 候補の問い合わせを遅らせる (打ち足した直後 = 新しい候補がまだ来ない間を確実に作る) */
+const slowSearch = (p) => p.route('**/api/amazon/components**', async (r) => { await new Promise((res) => setTimeout(res, 1500)); await r.continue().catch(() => {}); });
+const fastSearch = (p) => p.unroute('**/api/amazon/components**');
 const sugCodes = (p) => p.evaluate(() => [...document.querySelectorAll('#comp-suggest .co')].map((o) => (o.classList.contains('off') ? '×' : '') + o.querySelector('.cc').textContent));
 const selCode = (p) => p.evaluate(() => { const o = document.querySelector('#comp-suggest .co.sel'); return o ? o.querySelector('.cc').textContent : null; });
 
@@ -2053,6 +2056,28 @@ await ta('[56] Amazon SKU の構成で探す (10/12): 名前の言葉 (かな・
     assert.equal(await selCode(p), 'k005', 'ぴったりで使える = はじめから選んでいる');
     await in3.press('Tab');
     assert.equal(await p.isHidden('#comp-suggest'), true, '欄から出ると閉じる');
+    // 打ち足して すぐ Enter / すぐ押す = 前の候補 (古い) は入らない (#1689 Codex R1 M1)
+    await in3.fill('k005');
+    await sugOpen(p);
+    assert.equal(await selCode(p), 'k005');
+    await slowSearch(p);
+    try {
+      await in3.press('x');
+      assert.equal(await selCode(p), null, '打ち足したら選んだ印が消える');
+      assert.equal(await p.evaluate(() => document.getElementById('comp-suggest').classList.contains('stale')), true, '古い候補 = 薄く');
+      await in3.press('Enter');
+      assert.equal(await in3.inputValue(), 'k005x', 'Enter で古い k005 が入らない');
+      await in3.fill('k00');
+      await fastSearch(p);
+      await sugOpen(p);
+      await slowSearch(p);
+      await in3.press('2');
+      await p.locator('#comp-suggest .co:not(.off)').filter({ hasText: 'k004' }).click();
+      assert.equal(await in3.inputValue(), 'k002', '押しても古い候補 (k004) は入らない');
+    } finally { await fastSearch(p); }
+    await in3.fill('k005');
+    await sugOpen(p);
+    await in3.press('Tab');
     // 当たらない
     await in2.fill('zzzz-none');
     await p.waitForSelector('#comp-suggest .cs-empty:has-text("当たる NE の商品はありません")');
@@ -2093,6 +2118,15 @@ await ta('[57] Amazon SKU の構成で探す (スマホ 390・タッチ): 候補
     const [sw, cw] = await spill();
     assert.ok(sw <= Math.max(cw, sw0) + 1, `開いても横にはみ出さない ${sw} > ${cw} (前 ${sw0}/${cw0})`);
     for (const h of await m.locator('#comp-suggest .co').evaluateAll((xs) => xs.map((x) => x.getBoundingClientRect().height))) assert.ok(h >= 44, '候補の高さ ' + h);
+    // 打ち足して すぐタップ = 古い候補は入らない (#1689 Codex R1 M1)
+    await slowSearch(m);
+    try {
+      await inp.press('D');
+      await m.locator('#comp-suggest .co').filter({ hasText: 'k005' }).tap();
+      assert.equal(await inp.inputValue(), 'ABCD', 'タップでも古い候補は入らない');
+    } finally { await fastSearch(m); }
+    await inp.fill('ABC');
+    await sugOpen(m);
     await m.locator('#comp-suggest .co').filter({ hasText: 'k005' }).tap();
     assert.equal(await inp.inputValue(), 'k005', 'タッチで選べる');
     await m.waitForFunction(() => /abc 小袋/.test(document.querySelectorAll('#comp-rows .c-name')[2].textContent));

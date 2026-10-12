@@ -132,9 +132,15 @@
   var MIN = P.searchMin || 2;
   var REG_LABEL = { draft: '下書き', ne_pending: 'NE登録待ち', ne_confirmed: 'NE確認済み', distributable: '配る対象', available: '登録済み', quarantined: '要確認', cancelled: 'やめた' };
   var REG_CLS = { draft: 'warn', ne_pending: 'warn', ne_confirmed: 'ok', distributable: 'ok', available: 'ok', quarantined: 'err', cancelled: 'mute' };
-  var S = { input: null, items: [], sel: -1, seq: 0, timer: 0, ctl: null, q: '' };
-  // コードの同じ (サーバーの normSku と同じ決まり: 全角 → 半角・ダッシュ → -・空白を除く・小文字)
-  function normCode(s) { return String(s == null ? '' : s).normalize('NFKC').replace(/[‐-―−﹘﹣－]/g, '-').replace(/\s+/g, '').toLowerCase(); }
+  // forQ = 今の候補を作った検索語 (欄の値が変わったら候補は古い = 選ばない・#1689 Codex R1 M1)
+  var S = { input: null, items: [], sel: -1, seq: 0, timer: 0, ctl: null, q: '', forQ: null };
+  // コードの同じ = lib/sku-norm.js normSku と同じ決まり (全角英数記号 → 半角・全角の空白 → 空白・ダッシュ → -・空白を除く・小文字)。
+  // 🚨 NFKC は掛けない (core.norm_code と同じ = ﾊﾁ-01 と ハチ-01 は別の商品。#1689 Codex R1 M2)。保存の「2 回あります」の確かめと同じ
+  function normCode(v) {
+    if (v == null) return '';
+    return String(v).replace(/[！-～]/g, function (ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); }).replace(/　/g, ' ')
+      .replace(/[−‐-―﹘﹣－]/g, '-').trim().replace(/\s+/g, '').toLowerCase();
+  }
   // かなの同一視 (search-fold.mjs と同じ: NFKC・小文字・ひらがな → カタカナ)
   function fold(s) { return String(s == null ? '' : s).normalize('NFKC').toLowerCase().replace(/[ぁ-ゖゝゞ]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) + 0x60); }); }
   function mark(text, ranges) {
@@ -184,7 +190,8 @@
     if (S.ctl) { try { S.ctl.abort(); } catch (e) { /* 止められない = 返事を捨てるだけ (seq) */ } S.ctl = null; }
     if (S.input) { S.input.setAttribute('aria-expanded', 'false'); S.input.removeAttribute('aria-activedescendant'); }
     if (sug) { sug.hidden = true; sug.innerHTML = ''; var pnl = sug.closest('.panel'); if (pnl) pnl.classList.remove('sug-on'); }
-    S.items = []; S.sel = -1; S.input = null;
+    S.items = []; S.sel = -1; S.input = null; S.forQ = null;
+    if (sug) sug.classList.remove('stale');
   }
   function showSug(html) {
     sug.innerHTML = html; sug.hidden = false;
@@ -193,7 +200,9 @@
     placeSug();
   }
   function renderSug(j) {
-    var tr = rowOf(S.input), words = S.q.normalize('NFKC').split(/\s+/).filter(Boolean);
+    var tr = rowOf(S.input), words = S.q.split(/\s+/).filter(Boolean);
+    S.forQ = S.q;
+    sug.classList.remove('stale');
     S.items = (j.items || []).map(function (it) {
       var at = it.usable ? usedAt(it.code, tr) : 0;
       return { it: it, off: !it.usable || at > 0, why: !it.usable ? it.why : at ? 'この構成の ' + at + ' 行目にもうあります (同じ品は 1 行にして数で)' : '' };
@@ -240,8 +249,16 @@
         S.items = []; S.sel = -1; showSug('<div class="cs-empty bad">つながりません。コードをそのまま打っても名前は出ます</div>');
       });
   }
+  /** 欄の値が変わった = 今の候補は古い (選べない・選んだ印も消す)。新しい候補が来るまで (250ms + 問い合わせ) 古い候補を Enter・押す・タップで入れない (#1689 Codex R1 M1) */
+  function staleSug(inp) {
+    if (!sug || S.input !== inp || inp.value.trim() === S.forQ) return;
+    S.forQ = null;
+    if (S.sel >= 0) setSel(-1);
+    sug.classList.add('stale');
+  }
   function queueSug(inp) {
     if (!sug) return;
+    staleSug(inp);
     var q = inp.value.trim();
     if (S.input && S.input !== inp) closeSug();
     if (Array.from(q).length < MIN) { closeSug(); return; }
@@ -254,6 +271,7 @@
   function chooseSug(i) {
     var x = S.items[i], inp = S.input;
     if (!x || !inp) return;
+    if (S.forQ == null || inp.value.trim() !== S.forQ) return;   // 古い候補 (打ち足した後・新しい候補がまだ来ていない) は入れない
     if (x.off) { ME.toast('使えません: ' + x.why); return; }
     var tr = rowOf(inp);
     closeSug();
@@ -283,13 +301,17 @@
       moveSel(1); return true;
     }
     if (e.key === 'ArrowUp' && open) { e.preventDefault(); moveSel(-1); return true; }
-    if (e.key === 'Enter' && open && S.sel >= 0) { e.preventDefault(); chooseSug(S.sel); return true; }
+    if (e.key === 'Enter' && open && S.sel >= 0 && S.forQ != null && e.target.value.trim() === S.forQ) { e.preventDefault(); chooseSug(S.sel); return true; }
     if (e.key === 'Escape' && open) { e.preventDefault(); e.stopPropagation(); closeSug(); return true; }
     if (e.key === 'Enter' || e.key === 'Tab') closeSug();
     return false;
   }
   if (sug && rowsEl && canSave) {
-    rowsEl.addEventListener('input', function (e) { if (e.target.classList.contains('c-code') && !e.isComposing) queueSug(e.target); });
+    rowsEl.addEventListener('input', function (e) {
+      if (!e.target.classList.contains('c-code')) return;
+      staleSug(e.target);   // 変換中も、値が変わった時点で古い候補は選べなくする
+      if (!e.isComposing) queueSug(e.target);
+    });
     rowsEl.addEventListener('compositionend', function (e) { if (e.target.classList.contains('c-code')) queueSug(e.target); });
     rowsEl.addEventListener('focusout', function (e) { if (e.target === S.input) closeSug(); });
     // 押した所へフォーカスを移さない (欄から出ない = 閉じない)。タッチも同じ (mousedown が後から来る)

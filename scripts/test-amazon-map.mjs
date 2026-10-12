@@ -86,6 +86,8 @@ function makePlan() {
   return {
     skus: [single('a001', '単品 1'), single('a002', '単品 2'), single('a003', '単品 3 (FBM)'), single('a004', '単品 4 (FBM・墓標にする)'), single('a005', '単品 5 (Sheet)'),
       single('a006', '単品 6'), single('a007', '単品 7'),
+      // 半角カナと全角カナだけが違うコード = core.norm_code (NFKC を使わない) では別の商品 (#1689 Codex R1 M2 の試験)
+      single('ﾊﾁ-01', 'はちみつ 半角のコード'), single('ハチ-01', 'はちみつ 全角のコード'),
       { code: 'aset1', name: 'セット 1', kind: 'set', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: null, cost: { jpy: 300, source: 'set_calc', status: 'COMPLETE' } },
       { code: 'aexc', name: '例外の SKU', kind: 'exception', taxRate: null, taxClass: null, handling: 'active', salesClass: null, cost: null }],
     variationGroups: [],
@@ -1355,6 +1357,13 @@ await ta('[14] 探す API (画面のロール・読むだけ): コードの前�
   const ws = await asRole(E, 'master_edit', () => R.searchMapComponents(db, 'a00', { stock: st }));
   assert.deepEqual(ws.items.slice(0, 2).map((x) => [x.code, x.stock]), [['a001', 12], ['a002', 0]]);
   assert.equal((await asRole(E, 'master_edit', () => R.searchMapComponents(db, 'aset', { stock: st }))).items[0].stock, null);
+  // 言葉は全部見る (#1689 Codex R1 Low: 6 つ目より後を黙って捨てない)
+  r = await call('GET', '/api/amazon/components?q=' + encodeURIComponent('a0 a0 a0 a0 a0 6'));
+  assert.deepEqual(codesOf(r.j), ['a006'], '6 つ目の言葉も効く');
+  r = await call('GET', '/api/amazon/components?q=' + encodeURIComponent('a0 a0 a0 a0 a0 a0 a0 zz'));
+  assert.deepEqual(codesOf(r.j), [], '8 つ目の言葉で当たらなければ 0 件');
+  const longQ = await asRole(E, 'master_edit', () => R.searchMapComponents(db, 'a'.repeat(R.COMPONENT_SEARCH_Q_MAX + 1)));
+  assert.deepEqual([longQ.items, longQ.too_long], [[], true], '長すぎる語は切らずに探さない');
   assert.deepEqual(await snapshot(db), before, '何も書かない');
 });
 
@@ -1401,6 +1410,30 @@ await ta('[14] 使えない商品 = 候補に出すが usable false と理由・
   const res = await save('pick_from_search', '探して選んだ', pick);
   assert.equal(res.state, 'active');
   assert.deepEqual(await compsOfListing('pick_from_search'), [['a003', 1, 0, 'manual'], ['a004', 1, 1, 'manual']]);
+});
+
+await ta('[14] コードは保存と同じ正規化だけ (#1689 Codex R1 M2): ﾊﾁ-01 と ハチ-01 は別の商品 = 探すとそれぞれ自分だけ・名前は NFKC (かな) で両方・2 つとも構成に入れて保存できる / 画面の JS のコードの比べ方 = normSku と同じ', async () => {
+  const n = (await q("select core.norm_code('ﾊﾁ-01') as h, core.norm_code('ハチ-01') as z"))[0];
+  assert.notEqual(n.h, n.z, '前提: DB は半角カナと全角カナを別にする');
+  let r = await call('GET', '/api/amazon/components?q=' + encodeURIComponent('ﾊﾁ-01'));
+  assert.deepEqual(codesOf(r.j), ['ﾊﾁ-01'], '半角カナのコード = 自分だけ (全角カナのコードを当てない)');
+  r = await call('GET', '/api/amazon/components?q=' + encodeURIComponent('ハチ-01'));
+  assert.deepEqual(codesOf(r.j), ['ハチ-01'], '全角カナのコード = 自分だけ');
+  r = await call('GET', '/api/amazon/components?q=' + encodeURIComponent('ﾊﾁﾐﾂ'));
+  assert.deepEqual(codesOf(r.j).slice().sort(), ['ﾊﾁ-01', 'ハチ-01'].sort(), '名前は NFKC (半角カナの言葉でひらがなの名前に当たる) = 両方');
+  const res = await save('kana_both', '半角と全角', [{ code: 'ﾊﾁ-01', qty: 1 }, { code: 'ハチ-01', qty: 2 }]);
+  assert.equal(res.state, 'active');
+  assert.deepEqual(await compsOfListing('kana_both'), [['ﾊﾁ-01', 1, 0, 'manual'], ['ハチ-01', 2, 1, 'manual']], '保存でも別の商品 (2 回ありますにならない)');
+  // 画面の JS のコードの比べ方 (重なりの確かめ「N 行目にもうあります」・ぴったりの自動の選択) = lib/sku-norm.js normSku と同じ答え
+  const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '../apps/master-edit/public/me-amazon.js'), 'utf8');
+  const m = /function normCode\(v\) \{[\s\S]*?\n  \}/.exec(src);
+  assert.ok(m, '画面の JS に normCode がある');
+  const normCode = vm.runInNewContext(`(${m[0]})`);
+  const { normSku } = await import('../lib/sku-norm.js');
+  for (const s of ['ﾊﾁ-01', 'ハチ-01', 'Ａ００１', 'a\u2010001', 'a\u2212001', 'a\uFF0D001', ' k 0\u300001 ', 'ｶﾞ1', 'ガ1', 'ABC-1', '\uFF41\uFF42']) {
+    assert.equal(normCode(s), normSku(s), `画面と normSku が違う: ${JSON.stringify(s)}`);
+  }
+  assert.notEqual(normCode('ﾊﾁ-01'), normCode('ハチ-01'), '画面でも別の商品');
 });
 
 await ta('[14] 画面: 欄は候補つき (combobox・候補の箱・API を呼ぶ・何文字から)・保存できないときは出さない・つかいかたに一言', async () => {

@@ -261,11 +261,10 @@ export async function checkNewAmazonSku(db, raw) {
 
 // ─── 構成の行の「NE の商品」の欄の候補 (10/12 中原さん「既存の商品コードを検索して選んで登録できるように」) ───
 
-/** 何文字から探すか・何件まで返すか・欄の長さ (コードの欄と同じ 60)・言葉の数 (空白で区切った言葉を何個まで見るか) */
+/** 何文字から探すか・何件まで返すか・欄の長さ (コードの欄と同じ 60 = 言葉は多くても 30 個 = 全部の言葉を見る。#1689 Codex R1 Low: 黙って捨てない) */
 export const COMPONENT_SEARCH_MIN = 2;
 export const COMPONENT_SEARCH_LIMIT = 20;
 export const COMPONENT_SEARCH_Q_MAX = 60;
-export const COMPONENT_SEARCH_WORDS = 5;
 const KIND_WORDS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
 const REG_WHY = Object.freeze({
   draft: '下書き (まだ NE に登録していない)',
@@ -289,8 +288,9 @@ const HIRA_CLASS = `[${HIRA_CHARS}]`;
 
 /**
  * 構成の行に入れる NE の商品を探す (読むだけ)。q = 打った文字 (COMPONENT_SEARCH_MIN 文字から)。
- *   当てる: ① 商品コード (前方一致を上に・部分一致も。全角・大文字・ハイフンの違いは同じ = normSku / core.norm_code)
- *           ② 商品名の言葉 (空白で区切った言葉が全部入っている。言葉ごとにコードに入っていてもよい。かなの同一視 = search-fold.mjs = 一覧と同じ)
+ *   当てる: ① 商品コード (前方一致を上に・部分一致も。全角英数・大文字・ハイフンの違いは同じ = normSku / core.norm_code だけ。
+ *              🚨 コードには NFKC を掛けない (#1689 Codex R1 M2): core.norm_code はわざと NFKC を使わない (0001) = ﾊﾁ-01 と ハチ-01 は別の商品。保存の重なりの確かめとも同じ)
+ *           ② 商品名の言葉 (空白で区切った言葉が全部入っている・全部の言葉を見る。言葉ごとにコードに入っていてもよい。かなの同一視 (NFKC を含む) = search-fold.mjs = 一覧と同じ = 名前だけ)
  *           ③ JAN (ぴったり・一覧の検索と同じ core.external_ids)
  *   並び: コードがぴったり → コードの前方一致 → JAN → コードの部分一致 → 名前。同じ段の中は使える商品が上・コード順。上限 limit 件 (more = もっとある)
  *   使えない商品 (例外の SKU・登録の状態が NE 確認済みより前・状態が無い) も出す = usable false と理由 (画面は灰色で押せない)。
@@ -303,9 +303,10 @@ const HIRA_CLASS = `[${HIRA_CHARS}]`;
  * 戻り値 { items: [{ code, name, kind, kind_label, reg_state, handling, usable, why, stock }], more, short }
  */
 export async function searchMapComponents(db, q, { limit = COMPONENT_SEARCH_LIMIT, stock = null } = {}) {
-  const text = String(q ?? '').normalize('NFKC').trim();
+  const text = String(q ?? '').trim();
   if ([...text].length < COMPONENT_SEARCH_MIN) return { items: [], more: false, short: true };
-  const words = text.split(/\s+/).filter(Boolean).slice(0, COMPONENT_SEARCH_WORDS);
+  if (text.length > COMPONENT_SEARCH_Q_MAX) return { items: [], more: false, short: false, too_long: true };   // 入口 (router) でも 400。黙って切らない
+  const words = text.split(/\s+/).filter(Boolean);
   const params = [COMPANY_ID];
   params.push(HIRA_CHARS); const hira = params.length;
   params.push(KATA_CHARS); const kata = params.length;
