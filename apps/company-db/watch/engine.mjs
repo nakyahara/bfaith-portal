@@ -55,7 +55,9 @@ export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory 
       let rs;
       // 🚨 1 つの評価の SQL が失敗しても取引ごと壊さない (Postgres は例外の後、rollback するまで何も受け付けない) → 評価ごとに savepoint
       await db.exec('savepoint chk');
-      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound, openIssues, dataDir }, check); await db.exec('release savepoint chk'); }
+      // priorResult = 先に評価した項目の結果 (前提で blocked にした後の値)。W6 が前提にしないモールの W9 を見て「今朝そろっていなければ、そのモールを除く」に使う (10/11)
+      const priorResult = (id, scopeKey) => byKey.get(`${id}:${scopeKey}`) || null;
+      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound, openIssues, dataDir, priorResult }, check); await db.exec('release savepoint chk'); }
       catch (e) {
         try { await db.exec('rollback to savepoint chk'); } catch { /* */ }
         log(`${check.id}: 評価に失敗: ${String(e && e.message).slice(0, 200)}`);
@@ -68,11 +70,15 @@ export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory 
         r.durationMs = r.durationMs ?? Math.round(dur / Math.max(rs.length, 1));
         // 前提 (depends) が pass でなければ blocked = 上流の障害を 1 件にまとめる
         for (const dep of check.depends || []) {
-          // 'W1' = 同じ scope の W1 / 'W1:*' = W1 の全部の scope (1 つでも pass でなければ blocked。前提の項目が 1 つも評価されていなければそれも blocked)
-          const all = dep.endsWith(':*'), depId = all ? dep.slice(0, -2) : dep;
-          const ds = all ? [...byKey.values()].filter((x) => x.checkId === depId) : [byKey.get(`${dep}:${r.scopeKey}`)].filter(Boolean);
-          const d = all && !ds.length ? { verdict: 'blocked', reason: '前提の項目が評価されていない', scopeKey: '*' } : ds.find((x) => x.verdict !== 'pass');
-          if (d) { r.verdict = 'blocked'; r.reason = `前提 ${depId} (${all ? d.scopeKey : r.scopeKey}) が ${d.verdict}${d.reason ? `: ${d.reason}` : ''}`; r.blockedBy = `${depId}:${all ? d.scopeKey : r.scopeKey}`; break; }
+          // 'W1' = 同じ scope の W1 / 'W1:*' = W1 の全部の scope (1 つでも pass でなければ blocked。前提の項目が 1 つも評価されていなければそれも blocked) /
+          // 'W9:rakuten/main' = W9 のその scope (評価されていなければ blocked。10/11 W6 = 前提にするモールを選ぶ)
+          const cut = dep.indexOf(':'), depId = cut < 0 ? dep : dep.slice(0, cut), depScope = cut < 0 ? null : dep.slice(cut + 1);
+          const all = depScope === '*', named = depScope != null && !all;
+          const ds = all ? [...byKey.values()].filter((x) => x.checkId === depId) : [byKey.get(`${depId}:${named ? depScope : r.scopeKey}`)].filter(Boolean);
+          const d = all && !ds.length ? { verdict: 'blocked', reason: '前提の項目が評価されていない', scopeKey: '*' }
+            : named && !ds.length ? { verdict: 'blocked', reason: '前提の項目が評価されていない', scopeKey: depScope } : ds.find((x) => x.verdict !== 'pass');
+          const at = all || named ? d && d.scopeKey : r.scopeKey;
+          if (d) { r.verdict = 'blocked'; r.reason = `前提 ${depId} (${at}) が ${d.verdict}${d.reason ? `: ${d.reason}` : ''}`; r.blockedBy = `${depId}:${at}`; break; }
         }
         byKey.set(`${r.checkId}:${r.scopeKey}`, r);
         results.push(r);
@@ -213,6 +219,10 @@ export function summarize({ asOf, planned, results, notes, deadlineHit, separate
   if (counts.execution_error) parts.push(`評価できず ${counts.execution_error}`);
   if (counts.out_of_window) parts.push(`監視期間外 ${counts.out_of_window}`);
   if (counts.rule_changed) parts.push(`規則の変更で閉じた ${counts.rule_changed} (回復ではない)`);
+  // W6 で売上を除いたモールでだけ売れていたかもしれない = 閉じずに保留した在庫切れの案件の数 (pass の評価の中の保留 = blocked の件数には出ない。Codex #1687 R2 Medium 1)。
+  //   🚨 counts.held (全体) は blocked の項目の案件・世代の保留・W13:ne の保持 (本番で 800 件台) も数える = 1 行に出すとこの数が埋もれる → W6 のモール除外の分だけを別の名前で出す (R3)
+  counts.held_w6_mall_excluded = notes.held.filter((x) => x.checkId === 'W6' && String(x.reason || '').startsWith('mall_excluded:')).length;
+  if (counts.held_w6_mall_excluded) parts.push(`欠品の売上除外で保留 ${counts.held_w6_mall_excluded}`);
   const details = [];
   for (const x of mainNew.slice(0, 3)) details.push(`${x.summary} (新)`);
   for (const x of mainCont.slice(0, 2)) details.push(`${x.summary} (継続 ${x.days} 日)`);

@@ -86,7 +86,7 @@ await ta('[L2] 断る: 見た revision が古い (409 version_conflict)・選択
 });
 
 console.log('\n子の廃止');
-await ta('[C0] 🆕 0072 (仮): 販路の出品の構成 (Amazon の対応など・削除済みの出品も) に使われている子は廃止しない = 409 listing_component (何もしない)', async () => {
+await ta('[C0] 🆕 0073: 販路の出品の構成 (Amazon の対応など・削除済みの出品も) に使われている子は廃止しない = 409 listing_component (何もしない)', async () => {
   const sid = (await one("select sku_id from core.skus where code = 'blanket-fl-BE-S'")).sku_id;
   const rev = await revOf(GID);
   const lid = (await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'amazon', 'main@A1VC38T7YXB528', 'pr-blanket-be', 'active') returning listing_id`)).listing_id;

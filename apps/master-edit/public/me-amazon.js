@@ -6,6 +6,7 @@
  *   - 保存・削除の送り方は前と同じ (POST /api/amazon/save { request_id, seller_sku, name, components, reason, seen: { versions } } / /api/amazon/delete)
  *   - 保存・削除が通ったら画面を読み直す (保存した後の値・新しい版で続けて直せる)。上に結果を 1 回だけ出す
  *   - 構成の行の「NE の商品」の欄 = 打つと候補 (GET /api/amazon/components?q=・10/12)。使えない商品は灰色で選べない (下の「欄で探す」)
+ *   - 構成の行で使える NE の商品が決まったとき、名前 (社内) が空ならその商品名を入れる (10/12・下の fillNameFrom。書いてあれば触らない)
  */
 (function () {
   'use strict';
@@ -87,6 +88,7 @@
       if (i === 0 && !b) { b = document.createElement('span'); b.className = 'repbadge'; b.textContent = '代表'; $('.c-name', tr).insertAdjacentElement('afterend', b); }
       if (i > 0 && b) b.remove();
     });
+    if (nameNote && $('#name') && $('#name').value !== nameNote.value) clearNameNote();
     ME.setUnsaved(items.length);
     lastState = { n: items.length, items: items.map(function (it) { return it.label + ': ' + it.from + ' → ' + it.to; }), impacts: imp.map(function (x) { return x[1]; }) };
   }
@@ -104,6 +106,39 @@
     $$('button[data-act]', tr).forEach(function (b) { b.setAttribute('aria-label', who + ' ' + acts[b.getAttribute('data-act')]); });
   }
   function renumber() { $$('tr.comp-row', rowsEl).forEach(relabel); update(); }
+  /* ---------- 名前 (社内) が空なら NE の商品名を入れる (10/12 中原さん「商品コードを探したときに 名前 (社内) が空欄なら商品名を入れてほしい」) ----------
+   *   入れる時 = 構成の行で使える商品が決まった時 (候補から選んだ・コードを打って引き当てた)。使えない商品 (例外・NE で確かめる前・やめた) では入れない。
+   *   名前の欄が空 (空白だけも空) のときだけ = 人が書いた名前は消さない・入れた後に人が直したらそのまま (空でないので二度と入れない)。
+   *   入れたら input を起こす = 今までの「変更」の印・右の「保存すると変わること」に出る。欄の横に一言 (人が名前を直すと消える) */
+  var nameNote = null;   // { el, value } = 一言と、入れた値
+  function clearNameNote() { if (nameNote) { nameNote.el.remove(); nameNote = null; } }
+  function fillNameFrom(code, name) {
+    var nm = $('#name');
+    if (!canSave || saved || !nm || nm.disabled || nm.value.trim() !== '' || !name) return false;
+    nm.value = String(name).slice(0, Number(nm.getAttribute('maxlength')) || 255);
+    clearNameNote();
+    var el = document.createElement('span');
+    el.className = 'fmsg ok'; el.id = 'name-filled'; el.setAttribute('role', 'status');
+    el.innerHTML = '<svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>';
+    el.appendChild(document.createTextNode('NE の商品名 (' + code + ') を入れました。直してもかまいません'));
+    nm.insertAdjacentElement('afterend', el);
+    nameNote = { el: el, value: nm.value };
+    nm.dispatchEvent(new Event('input', { bubbles: true }));   // 未保存・保存すると変わること
+    return true;
+  }
+  /** コードを打って引き当てた行: 構成品に使えるかを候補の API (保存と同じ決まり) で確かめてから名前を入れる (ぴったりの行だけ) */
+  function fillNameIfUsable(tr, code) {
+    var nm = $('#name');
+    if (!canSave || !nm || nm.disabled || nm.value.trim() !== '' || Array.from(code).length < (P.searchMin || 2)) return;
+    fetch(BASE + '/api/amazon/components?q=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || !j.ok || !tr.isConnected || $('.c-code', tr).value.trim() !== code) return;
+        var hit = (j.items || []).filter(function (it) { return normCode(it.code) === normCode(code); })[0];
+        if (hit && hit.usable) fillNameFrom(hit.code, hit.name);
+      })
+      .catch(function () { /* 確かめられない = 入れないだけ */ });
+  }
   function lookup(tr) {
     var code = $('.c-code', tr).value.trim();
     var cell = $('.c-name', tr), reg = $('.c-reg', tr);
@@ -119,6 +154,7 @@
         // 候補から選んだ行 = 候補の登録の状態を見せる (確かめは保存のときにもう一度)
         var known = tr.__picked && tr.__picked.code === code ? tr.__picked.reg : null;
         reg.innerHTML = known ? '<span class="b ' + (REG_CLS[known] || 'mute') + '">' + esc(REG_LABEL[known] || known) + '</span>' : '<span class="muted">保存のときに確かめます</span>';
+        if (!known && x.j.item.kind !== 'exception') fillNameIfUsable(tr, code);   // 候補から選んだ行は chooseSug で入れた
       })
       .catch(function () { cell.textContent = '引き当てできません (通信)'; cell.classList.add('bad'); });
   }
@@ -221,6 +257,7 @@
         + '<span class="b ' + (it.kind === 'exception' ? 'err' : 'mute') + '">' + esc(it.kind_label || it.kind) + '</span>'
         + (it.reg_state ? '<span class="b ' + (REG_CLS[it.reg_state] || 'mute') + '">' + esc(REG_LABEL[it.reg_state] || it.reg_state) + '</span>' : '<span class="b mute">状態なし</span>')
         + (it.not_in_ne && !x.off ? '<span class="b warn" title="NE 登録の CSV で NE に入るまで、FBA 補充はこの SKU を保留にします">NE 未登録 (登録待ち)</span>' : '')
+        + (it.ne_direct && !x.off ? '<span class="b info" title="夜間の取り込みが NE で見つけた、ポータルで作っていない商品 (NE にある)。代表の採用の画面で確かめられます">要確認 (NE で直接作った商品)</span>' : '')
         + (it.handling === 'discontinued' ? '<span class="b warn">中止</span>' : '')
         + (it.stock != null ? '<span class="st">在庫 ' + Number(it.stock).toLocaleString('ja-JP') + '</span>' : '') + '</div>'
         + '<div class="cn">' + mark(it.name || '', hits(it.name || '', words, fold)) + '</div>'
@@ -279,6 +316,7 @@
     inp.value = x.it.code;
     tr.__picked = { code: x.it.code, reg: x.it.reg_state };
     inp.dispatchEvent(new Event('change', { bubbles: true }));   // 今までの引き当て (名前が出る)・行の読み上げの名前・未保存
+    fillNameFrom(x.it.code, x.it.name);   // 名前 (社内) が空なら、選んだ商品の名前 (使える商品だけがここに来る)
     var qty = $('.c-qty', tr); if (qty) { qty.focus(); qty.select(); }
     if (sugSay) sugSay.textContent = x.it.code + ' を入れました';
   }
@@ -310,6 +348,8 @@
   if (sug && rowsEl && canSave) {
     rowsEl.addEventListener('input', function (e) {
       if (!e.target.classList.contains('c-code')) return;
+      // 手でコードを変えた = 候補から選んだ印は捨てる (同じコードを打ち直しても、使えるかを確かめて名前を入れる・#1692 Codex R1 Medium)
+      var row = e.target.closest('tr'); if (row) row.__picked = null;
       staleSug(e.target);   // 変換中も、値が変わった時点で古い候補は選べなくする
       if (!e.isComposing) queueSug(e.target);
     });

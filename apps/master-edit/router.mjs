@@ -36,7 +36,14 @@
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
  *   POST /api/sku/:code/card-retry  カードの取り込みをもう一度 (名簿の人・衝突 / 失敗の知らせも試す)
  *   POST /api/sku/:code/card-link   衝突を解く = 既存のカード (同じ商品コード) をこの商品に結ぶ (名簿の人。PR #1566 R1 M6)
- *   POST /api/sku/:code/gone        🆕 0070: 業務で使える商品を「NE から消えた」でやめる { request_id, reason, confirm: true } (MASTER_DECISION_APPROVERS の人・lib/master-gone.mjs)
+ *   POST /api/sku/:code/gone        🆕 0070: 業務で使える商品を「NE から消えた」でやめる { request_id, reason, confirm: true } (MASTER_DECISION_APPROVERS の人・lib/master-gone.mjs)。🆕 0072: セットも
+ *   ── NE から消す (🆕 0072・lib/master-ne-delete.mjs・apps/master-edit/ne-delete-stock.mjs。書く・確かめる・受け取るは MASTER_DECISION_APPROVERS の人だけ = 業務で使う商品をやめる判断) ──
+ *   GET  /ne-delete?codes=          画面 (確かめる・CSV を作る・依頼の途中・断られたとき・終わった依頼)
+ *   POST /api/ne-delete/check       確かめる (読むだけ) { codes }。アプリの在庫 (商品管理リスト・ロジザードの写し・発注アプリ) を Postgres の前に読んで DB に渡す
+ *   POST /api/ne-delete/build       消す CSV を作る { codes, reason, request_id, confirm: true } (セット → 単品の 2 つまで)
+ *   POST /api/ne-delete/exports/:id/download  ファイルを受け取る (作った JST の日だけ・中の品目が全部まだ依頼の途中のときだけ・初めてのダウンロードを残す = GET にしない)
+ *   POST /api/ne-delete/items/:id/withdraw    依頼を取り下げる { reason, request_id }
+ *   POST /api/ne-delete/handling    断られた単品の代わりに取扱中止の CSV を作る { item_ids, reason, request_id, confirm: true }
  *   ── 発注の設定 (10/9・発注アプリの po_* に書く・apps/master-edit/order-settings.mjs → apps/purchase-orders/order-settings.js の 1 つの部品) ──
  *   POST /api/new の order_settings = { order_lot?, condition_id?, material_group_id?, capacity_per_unit?, case_group?, case_lot?, new_condition?, new_material? } (単品だけ):
  *        ① の前に形・グループ・代表の仕入先を確かめる (誤り = 400 / 409・何も書かない) → ① Company DB の登録 → 通ったら ② 発注アプリに書く。
@@ -108,6 +115,8 @@ import {
   REG_ITEM_STATES, REG_RESULTS,
 } from '../../lib/master-reg-csv.mjs';
 import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
+import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, buildHandling, readNeDelOverview, neDelAvailable, hideBackorder, hideBackorderText, NE_DEL_STATUS_WORDS, NE_DEL_KIND_WORDS, NE_DEL_MAX } from '../../lib/master-ne-delete.mjs';
+import { readNeDeleteStock } from './ne-delete-stock.mjs';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -734,10 +743,16 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     sales: await readSalesSku(await readSalesRun({ now: clock() }), page.cur.code),
   } : null;
   // 🆕 0070: 業務で使える単品だけ「NE から消えた (やめる)」の確かめを読む (DB の ops.sku_gone_from_ne_check・読めない = 出さない)。押せるのは名簿 MASTER_DECISION_APPROVERS の人
-  const goneChk = page && page.cur.sku_kind === 'single' && page.cur.registration && page.cur.registration.state === 'available' ? await readGoneCheck(db, page.cur.sku_id) : null;
-  const gone = goneChk ? { ...goneView(goneChk), canApprove: approverGate(req).ok } : null;
+  //   🆕 0072: セットも (やめると構成を外す)・NE から消す依頼 (ops.ne_del_overview) の途中なら「NE から消えました・やめる」を目立たせる
+  const usable = page && ['single', 'set'].includes(page.cur.sku_kind) && page.cur.registration && page.cur.registration.state === 'available';
+  const goneChk = usable ? await readGoneCheck(db, page.cur.sku_id) : null;
+  const nedel = usable ? await readNeDelOverview(db, page.cur.sku_id) : null;
+  const nedelLive = nedel ? nedel.items.filter((i) => i.action === 'delete' && i.state === 'live') : [];
+  const gone = goneChk ? { ...goneView(goneChk), canApprove: approverGate(req).ok, fromRequest: nedelLive.length > 0, kind: page.cur.sku_kind } : null;
   res.render(view('sku.ejs'), {
     gone,
+    // 🆕 0072: NE から消す (箱 = 依頼の途中の様子・「NE から消す」の画面へ)。0072 の前・読めない = null (出さない)
+    nedel: nedel ? { live: nedelLive, canApprove: approverGate(req).ok, STATUS_WORDS: NE_DEL_STATUS_WORDS } : null,
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null, extras,
     // 発注の設定 (発注アプリ・単品だけ)。発注条件グループは代表の仕入先のものだけ選べる
@@ -1125,6 +1140,55 @@ router.post('/api/sku/:code/gone', (req, res) => {
     res.json(r);
   }, 'write');
 });
+
+// ─── NE から消す (🆕 0072・lib/master-ne-delete.mjs) ───
+/** アプリの在庫 (商品管理リスト・ロジザードの写し・発注アプリ) = Postgres の取引の前に読む。試験は差し替える */
+let neDelStockReader = (skus) => readNeDeleteStock(skus, { now: clock() });
+export function __setNeDelStockReader(fn) { neDelStockReader = fn || ((skus) => readNeDeleteStock(skus, { now: clock() })); }
+router.get('/ne-delete', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const phase = await readPhaseView(db);
+  const available = db ? await neDelAvailable(db).catch(() => false) : false;
+  const overview = available ? await readNeDelOverview(db, null) : null;
+  const gate = approverGate(req);
+  const codes = String(req.query.codes || '').split(/[\s,、]+/).map((s) => s.trim()).filter((s) => s && s.length <= 60).slice(0, NE_DEL_MAX);
+  res.render(view('ne-delete.ejs'), {
+    ...pageLocals(req, phase), nav: 'nedel', dbError, available, overview, canApprove: gate.ok, approveMessage: gate.message || '', codes,
+    STATUS_WORDS: NE_DEL_STATUS_WORDS, KIND_WORDS: NE_DEL_KIND_WORDS, MAX: NE_DEL_MAX,
+  });
+}));
+/** NE から消す の書き込み・確かめ・受け取り = 名簿 (MASTER_DECISION_APPROVERS) の人だけ・この画面だけのロールで (確かめは読むだけの接続でよい) */
+function neDelApi(req, res, fn, kind = 'write') {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  const actor = String(req.session.email).trim().toLowerCase();
+  // 🆕 #1690 Codex R3 Medium: 注文残の数は発注アプリの権限がある人だけ (canSeeBackorders・今までの画面と同じ)。確かめは DB が全部の値でする = 見せる答えから数だけを外す
+  const poOk = canSeeBackorders(req);
+  return withPgApi(res, async (db) => {
+    res.set('Cache-Control', 'no-store');
+    try { return await fn(db, actor, req.body || {}, poOk); } catch (e) {
+      if (!poOk && e instanceof MasterWriteError) throw new MasterWriteError(e.status, e.reason, hideBackorderText(e.message), e.extra);
+      throw e;
+    }
+  }, kind);
+}
+router.post('/api/ne-delete/check', (req, res) => neDelApi(req, res, async (db, actor, b, poOk) => {
+  const r = await checkNeDelete(db, { codes: b.codes }, { stockReader: neDelStockReader });
+  res.json({ ok: true, ...(poOk ? r : hideBackorder(r)) });
+}, 'read'));
+router.post('/api/ne-delete/build', (req, res) => neDelApi(req, res, async (db, actor, b) => res.json(await buildNeDelete(db,
+  { actor, codes: b.codes, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen(), stockReader: neDelStockReader }))));
+router.post('/api/ne-delete/exports/:id/download', (req, res) => neDelApi(req, res, async (db, actor) => {
+  const f = await downloadNeDelete(db, { actor, exportId: req.params.id });
+  // 消す CSV = Shift_JIS (NE のひな形と同じ) / 取扱中止 = UTF-8 (ne-csv.mjs と同じ)
+  res.set('Content-Type', f.kind === 'handling' ? 'text/csv; charset=utf-8' : 'text/csv; charset=Shift_JIS');
+  res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
+  res.set('X-Content-SHA256', f.sha256);
+  res.send(f.bytes);
+}));
+router.post('/api/ne-delete/items/:id/withdraw', (req, res) => neDelApi(req, res, async (db, actor, b) => res.json(await withdrawNeDelete(db,
+  { actor, itemId: req.params.id, reason: b.reason, requestId: b.request_id }, { open: isOpen() }))));
+router.post('/api/ne-delete/handling', (req, res) => neDelApi(req, res, async (db, actor, b) => res.json(await buildHandling(db,
+  { actor, itemIds: b.item_ids, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen() }))));
 
 router.post('/api/sku/:code', (req, res) => {
   const gate = editorGate(req);
