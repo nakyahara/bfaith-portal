@@ -1994,7 +1994,7 @@ const selCode = (p) => p.evaluate(() => { const o = document.querySelector('#com
 
 await ta('[56] Amazon SKU の構成で探す (10/12): 名前の言葉 (かな・半角カナも) で候補・使えない商品は灰色で理由 (選べない・↓ で飛ばす)・↑↓ と Enter で選ぶ → コードが入って名前と登録の状態・ほかの行にある商品は選べない・マウスで選ぶ・Esc で閉じる・保存', async (p) => {
   const keep = await regUi('k003');
-  await setRegUi('k003', 'ne_pending');
+  await setRegUi('k003', 'cancelled');   // 使えない見本 = やめた (0073 から 下書き・NE 登録待ち・要確認は使える。やめた商品はコードをぴったり打ったときだけ出る)
   try {
     await p.goto(B + '/amazon/sku?sku=pr-k006');
     assert.equal(await p.inputValue('#comp-rows tr.comp-row .c-code'), 'k006');
@@ -2010,17 +2010,14 @@ await ta('[56] Amazon SKU の構成で探す (10/12): 名前の言葉 (かな・
     await in2.fill('はちみつ');
     await sugOpen(p);
     assert.equal(await in2.getAttribute('aria-expanded'), 'true');
-    assert.deepEqual(await sugCodes(p), ['k001', 'k002', '×k003'], 'はちみつ = ハチミツ = ﾊﾁﾐﾂ (かなの同一視)・使えない k003 は灰色で最後');
-    const off = p.locator('#comp-suggest .co.off');
-    assert.equal(await off.getAttribute('aria-disabled'), 'true');
-    assert.match(await off.textContent(), /使えません: NE 登録待ち/);
+    assert.deepEqual(await sugCodes(p), ['k001', 'k002'], 'はちみつ = ハチミツ (かなの同一視)・やめた k003 (ﾊﾁﾐﾂ) は名前では出さない');
     assert.match(await p.locator('#comp-suggest .co').first().textContent(), /単品[\s\S]*登録済み[\s\S]*在庫 15[\s\S]*国産 はちみつ 500g/, '単品・登録の状態・在庫 (ロジザード)・名前');
     assert.equal(await p.locator('#comp-suggest .co').first().locator('mark').count(), 1, '当たった言葉に印');
     if (process.env.MASTER_EDIT_UI_SEARCH_SHOTS) { await in2.press('ArrowDown'); await p.screenshot({ path: `${process.env.MASTER_EDIT_UI_SEARCH_SHOTS}/1440_候補.png` }); await in2.press('ArrowUp'); }
     assert.equal(await selCode(p), null, 'ぴったりでなければ、はじめは選んでいない (Enter は今までどおり)');
     await in2.press('ArrowDown'); assert.equal(await selCode(p), 'k001');
     await in2.press('ArrowDown'); assert.equal(await selCode(p), 'k002');
-    await in2.press('ArrowDown'); assert.equal(await selCode(p), 'k002', '使えない k003 には止まらない');
+    await in2.press('ArrowDown'); assert.equal(await selCode(p), 'k002', '最後で止まる');
     assert.equal(await in2.getAttribute('aria-activedescendant'), 'cs-opt-1');
     await in2.press('ArrowUp'); assert.equal(await selCode(p), 'k001');
     await in2.press('Enter');
@@ -2037,15 +2034,24 @@ await ta('[56] Amazon SKU の構成で探す (10/12): 名前の言葉 (かな・
     const in3 = p.locator('#comp-rows tr.comp-row').nth(2).locator('.c-code');
     await in3.fill('k00');
     await sugOpen(p);
-    assert.deepEqual(await sugCodes(p), ['×k001', 'k002', 'k004', 'k005', '×k006', '×k003'], '前方一致・使えない物は同じ段の最後 (k003)・ほかの行にある k001 と k006 も灰色');
+    assert.deepEqual(await sugCodes(p), ['×k001', 'k002', 'k004', 'k005', '×k006'], '前方一致・ほかの行にある k001 と k006 は灰色・やめた k003 は前方一致では出さない');
+    const off = p.locator('#comp-suggest .co.off').first();
+    assert.equal(await off.getAttribute('aria-disabled'), 'true');
     assert.match(await p.locator('#comp-suggest .co.off').first().textContent(), /この構成の 2 行目にもうあります/);
     await p.locator('#comp-suggest .co.off').last().click({ force: true });   // aria-disabled = Playwright は押せない物と見る。人は押せる (押しても入らないことを確かめる)
     assert.equal(await in3.inputValue(), 'k00', '使えない商品は入らない');
-    assert.match(await p.textContent('#toast-t'), /使えません: NE 登録待ち/);
+    assert.match(await p.textContent('#toast-t'), /使えません: この構成の 1 行目にもうあります/);
     assert.equal(await p.isVisible('#comp-suggest'), true, '押しても閉じない (欄から出ない)');
     await p.locator('#comp-suggest .co:not(.off)').filter({ hasText: 'k005' }).click();
     assert.equal(await in3.inputValue(), 'k005');
     await p.waitForFunction(() => /abc 小袋/.test(document.querySelectorAll('#comp-rows .c-name')[2].textContent));
+    // やめた商品 = コードをぴったり打ったときだけ灰色で出る (理由つき・選べない)
+    await in3.fill('k003');
+    await sugOpen(p);
+    assert.deepEqual(await sugCodes(p), ['×k003']);
+    assert.match(await p.locator('#comp-suggest .co.off').textContent(), /使えません: 登録をやめた商品/);
+    await in3.press('ArrowDown');
+    assert.equal(await selCode(p), null, '↓ でも灰色には止まらない');
     // Esc で閉じる (欄の値は変えない・画面の Esc の動きにしない)・欄から出ると閉じる
     await in3.fill('k0');
     await sugOpen(p);
@@ -2141,9 +2147,38 @@ await ta('[57] Amazon SKU の構成で探す (スマホ 390・タッチ): 候補
   } finally { await c2.close(); }
 });
 
+await ta('[59] Amazon SKU の構成に まだ NE に無い新商品・要確認 (0073・10/12): NE 登録待ち・要確認の商品は候補で選べる・「NE 未登録 (登録待ち)」「要確認 (NE で直接作った商品)」の印・下の説明の文', async (p) => {
+  const keep = await regUi('k004');
+  await setRegUi('k004', 'ne_pending');
+  try {
+    await p.goto(B + '/amazon/sku?sku=pr-k006');
+    assert.match(await p.textContent('.f[data-row="components"]'), /まだ NE に無い新商品 \(下書き・NE 登録待ち\)・NE で直接作った商品 \(要確認\) も使えます/);
+    await p.click('#comp-add');
+    const inp = p.locator('#comp-rows tr.comp-row').last().locator('.c-code');
+    await inp.fill('k004');
+    await sugOpen(p);
+    const o = p.locator('#comp-suggest .co').first();
+    assert.equal(await o.getAttribute('aria-disabled'), null, '灰色でない');
+    assert.match(await o.textContent(), /NE登録待ち[\s\S]*NE 未登録 \(登録待ち\)/);
+    await inp.press('Enter');
+    assert.equal(await inp.inputValue(), 'k004', '選べる');
+    // 要確認 (NE で直接作った商品) も選べる・印
+    await setRegUi('k002', 'quarantined');
+    await p.click('#comp-add');
+    const inp2 = p.locator('#comp-rows tr.comp-row').last().locator('.c-code');
+    await inp2.fill('k002');
+    await sugOpen(p);
+    const o2 = p.locator('#comp-suggest .co').first();
+    assert.equal(await o2.getAttribute('aria-disabled'), null, '要確認は灰色でない');
+    assert.match(await o2.textContent(), /要確認[\s\S]*要確認 \(NE で直接作った商品\)/);
+    await inp2.press('Enter');
+    assert.equal(await inp2.inputValue(), 'k002', '要確認も選べる');
+  } finally { await setRegUi('k004', keep); await setRegUi('k002', 'available'); }
+});
+
 await ta('[58] Amazon SKU の名前 (社内) が空なら NE の商品名を入れる (10/12): 候補から選ぶ = 入る (変更の印・保存すると変わること・一言)・次の行では上書きしない・人が直すと一言が消える・元に戻す / 空白だけも空 / コードをぴったり打つ = 入る / 使えない商品 (灰色・打っても) = 入らない / 名前のある対応 = 入らない', async (p) => {
   const keep = await regUi('k003');
-  await setRegUi('k003', 'ne_pending');
+  await setRegUi('k003', 'cancelled');   // 使えない見本 = やめた (0073 から NE 登録待ち・要確認は使える)
   try {
     await p.goto(B + '/amazon/sku?sku=pr-k1k2');
     assert.equal(await p.inputValue('#name'), '', '前提: 名前が空の新しい対応');
@@ -2205,7 +2240,7 @@ await ta('[58] Amazon SKU の名前 (社内) が空なら NE の商品名を入�
     await inp.press('Tab');
     await p.waitForFunction(() => /ﾊﾁﾐﾂ/.test([...document.querySelectorAll('#comp-rows .c-name')].pop().textContent));
     await p.waitForTimeout(600);   // 名前を入れる確かめ (候補の API) が終わるのを待つ
-    assert.equal(await p.inputValue('#name'), '', '使えない商品 (NE 登録待ち) では入れない');
+    assert.equal(await p.inputValue('#name'), '', '使えない商品 (やめた) では入れない');
     assert.equal(await p.locator('#name-filled').count(), 0);
     // コードをぴったり打つ (候補を選ばない) = 使える商品なら入る
     await inp.fill('K004');

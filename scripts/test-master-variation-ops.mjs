@@ -86,6 +86,24 @@ await ta('[L2] 断る: 見た revision が古い (409 version_conflict)・選択
 });
 
 console.log('\n子の廃止');
+await ta('[C0] 🆕 0073: 販路の出品の構成 (Amazon の対応など・削除済みの出品も) に使われている子は廃止しない = 409 listing_component (何もしない)', async () => {
+  const sid = (await one("select sku_id from core.skus where code = 'blanket-fl-BE-S'")).sku_id;
+  const rev = await revOf(GID);
+  const lid = (await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'amazon', 'main@A1VC38T7YXB528', 'pr-blanket-be', 'active') returning listing_id`)).listing_id;
+  await pg.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type) values (1, $1, $2, 1, 0, 'manual', 'human')`, [lid, sid]);
+  try {
+    const e = await rejects(op(V.cancelVariationChild, { code: 'blanket-fl-BE-S', reason: 'x' }), 409, 'listing_component');
+    assert.match(e.message, /amazon:pr-blanket-be/);
+    await pg.query("update core.listings set status = 'deleted' where listing_id = $1", [lid]);
+    const e2 = await rejects(op(V.cancelVariationChild, { code: 'blanket-fl-BE-S', reason: 'x' }), 409, 'listing_component');
+    assert.match(e2.message, /削除済みの出品/);
+    assert.equal((await one('select r.state from ops.master_registrations r where r.sku_id = $1', [sid])).state, 'draft', '何もしない');
+    assert.equal(await revOf(GID), rev);
+  } finally {
+    await pg.query('delete from core.listing_components where listing_id = $1', [lid]);
+    await pg.query('delete from core.listings where listing_id = $1', [lid]);
+  }
+});
 await ta('[C1] 下書きの子を廃止 = cancelled・revision + 1・知らせの廃止した子・押し直し = 前の答え / 理由が要る (400)・まとまりの子でない (409)', async () => {
   const pend0 = (await V.readVariationGroup(db, GID)).pending_unfiled;
   const rev = await revOf(GID);
