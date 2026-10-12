@@ -220,11 +220,12 @@ cleanups.push(() => cserver.close());
 const CBASE = `http://127.0.0.1:${cserver.address().port}/apps/company-db/sync`;
 const HIST = path.join(TMP, 'mall-items-history');
 let runN = 0;
+const SHOP_ID = 'A6HMLHKUUJC27@A1VC38T7YXB528';   // fetch-listings.js の amazonShopId の形 (<セラーID>@<日本のマーケットプレイス>)
 /** 想定利益の夜間と同じ道で履歴を残す (archiveItems・offsite なし)。戻り値 = manifest の行 */
-async function archive(text, { at = new Date(NOW - 8 * 3600e3), complete = true } = {}) {
+async function archive(text, { at = new Date(NOW - 8 * 3600e3), complete = true, enumStatus = 'ok' } = {}) {
   runN++;
-  const r = await archiveItems({ mall: 'amazon', shopId: 'S@A1VC38T7YXB528', source: 'merchant_listings_all_data', runId: `r_${runN}_${crypto.randomBytes(2).toString('hex')}`, fetchedAt: at.toISOString(),
-    format: 'tsv', payload: text, items: text.split('\r\n').length - 2, dest: HIST, noOffsite: true, log: quiet, meta: { complete } });
+  const r = await archiveItems({ mall: 'amazon', shopId: SHOP_ID, source: 'merchant_listings_all_data', runId: `r_${runN}_${crypto.randomBytes(2).toString('hex')}`, fetchedAt: at.toISOString(),
+    format: 'tsv', payload: text, items: text.split('\r\n').length - 2, dest: HIST, noOffsite: true, log: quiet, meta: { complete, enum_status: enumStatus } });
   assert.ok(['archived', 'exists_same'].includes(r.code), JSON.stringify(r));
   return r;
 }
@@ -294,7 +295,7 @@ await ta('🛑 送り手: 行が前の 80% 未満は送らない (❌・既存�
 });
 await ta('送り手: 商品名の列が無い = 送るが ⚠️ / 取得が古い (36 時間より前) = ⚠️ / 0076 の前の Render = ⚠️ (exit 0 の扱い) / Render の方が新しい = ⚠️ 送らない', async () => {
   const H2 = path.join(TMP, 'hist2');
-  const arch2 = (text, at) => archiveItems({ mall: 'amazon', shopId: 'S', source: 'merchant_listings_all_data', runId: `h2_${crypto.randomBytes(3).toString('hex')}`, fetchedAt: at.toISOString(), format: 'tsv', payload: text, items: 6, dest: H2, noOffsite: true, log: quiet });
+  const arch2 = (text, at) => archiveItems({ mall: 'amazon', shopId: SHOP_ID, source: 'merchant_listings_all_data', runId: `h2_${crypto.randomBytes(3).toString('hex')}`, fetchedAt: at.toISOString(), format: 'tsv', payload: text, items: 6, dest: H2, noOffsite: true, log: quiet, meta: { enum_status: 'ok' } });
   await arch2(F.buildTsv(ROWS, F.HEADER_JP.filter((h) => h !== '商品名')), new Date(NOW - 40 * 3600e3));
   // Render の方が新しい
   let r = await push({ historyDir: H2 });
@@ -315,6 +316,68 @@ await ta('送り手: 商品名の列が無い = 送るが ⚠️ / 取得が古�
     assert.match(r.lastLine, /^⚠️ .*入れ替えた.*⚠️ 取得が古い .*見出しに無い列: 商品名/);
     assert.equal((await E3.pg.query('select count(*)::int as n from ops.amazon_listing_report where item_name is null')).rows[0].n, 6);
   } finally { cdbTarget = E; await E3.pg.close(); }
+});
+await ta('🛑 受け口の安全弁 (#1691 Codex R1 M2): 同じ取引の中で今の行と比べ 80% 未満は SHRINK (409・何も変わらない) / force: true だけ通す / 今の行が 0 = 比べない / force は boolean だけ', async () => {
+  const E5 = await setupDb({ load: false });
+  try {
+    const G = NOW - 5 * 3600e3;
+    assert.equal((await I.ingestAmazonListings(E5.db, body(parsed.rows, { generation: G, report_run_id: 's1' }), { nowMs: NOW })).status, 'applied', '今の行が 0 = 比べない');
+    await assert.rejects(I.ingestAmazonListings(E5.db, body(parsed.rows.slice(0, 4), { generation: G + 1, report_run_id: 's2' }), { nowMs: NOW }), (e) => e.code === 'SHRINK' && /今の 6 の 80% 未満 \(4\)/.test(e.message));
+    assert.equal((await E5.pg.query('select count(*)::int as n from ops.amazon_listing_report')).rows[0].n, 6, 'SHRINK は何も変えない');
+    assert.equal((await E5.pg.query(`select count(*)::int as n from ops.ingest_runs where entity = 'listing_report'`)).rows[0].n, 1, 'SHRINK は取込の記録も残さない (巻き戻す)');
+    assert.equal((await I.ingestAmazonListings(E5.db, body(parsed.rows.slice(0, 5), { generation: G + 2, report_run_id: 's3' }), { nowMs: NOW })).status, 'applied', '5 / 6 = 83% は通る');
+    const r = await I.ingestAmazonListings(E5.db, body(parsed.rows.slice(0, 2), { generation: G + 3, report_run_id: 's4', force: true }), { nowMs: NOW });
+    assert.deepEqual([r.status, r.rows, r.forced], ['applied', 2, true]);
+    assert.throws(() => I.validateListingBody(body(parsed.rows, { force: 'yes' }), { nowMs: NOW }), (e) => e.code === 'BAD_REQUEST' && /force/.test(e.message));
+    // HTTP = 409 code SHRINK
+    cdbTarget = E5;
+    const h = await fetch(`${CBASE}/amazon-listings`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-key': 'k-test' }, body: JSON.stringify(body(parsed.rows.slice(0, 1), { generation: G + 4, report_run_id: 's5' })) });
+    assert.equal(h.status, 409); assert.equal((await h.json()).code, 'SHRINK');
+  } finally { cdbTarget = E; await E5.pg.close(); }
+});
+await ta('送り手の回の選び方 (#1691 Codex R1 M3): 日本の店・取得元 merchant_listings_all_data・complete・TSV・64 桁の sha256 の回だけ・取得の時刻がいちばん新しい回 (manifest の並びによらない)・sha256 が無い回は読まない', async () => {
+  const H3 = path.join(TMP, 'hist3');
+  fs.mkdirSync(path.join(H3, 'amazon'), { recursive: true });
+  const base = { mall: 'amazon', source: 'merchant_listings_all_data', shop_id: SHOP_ID, complete: true, format: 'tsv', file: 'amazon/2026/10/x.tsv.gz', sha256: 'a'.repeat(64), items: 6, run_id: 'r' };
+  const at = (h) => new Date(NOW - h * 3600e3).toISOString();
+  const lines = [
+    { ...base, run_id: 'newest', snapshot_at: at(2) },                                    // 新しい回が先に書かれている
+    { ...base, run_id: 'older', snapshot_at: at(26) },
+    { ...base, run_id: 'other_source', source: 'rms_items_search', snapshot_at: at(1) },
+    { ...base, run_id: 'other_market', shop_id: 'A6HMLHKUUJC27@A1F83G8C2ARO7P', snapshot_at: at(1) },
+    { ...base, run_id: 'unknown_seller', shop_id: 'unknown@A1VC38T7YXB528', snapshot_at: at(1) },
+    { ...base, run_id: 'no_sha', sha256: undefined, snapshot_at: at(1) },
+    { ...base, run_id: 'short_sha', sha256: 'abc', snapshot_at: at(1) },
+    { ...base, run_id: 'partial', complete: false, snapshot_at: at(1) },
+    { ...base, run_id: 'ndjson', format: 'ndjson', snapshot_at: at(1) },
+    { ...base, run_id: 'outside', file: '../x.tsv.gz', snapshot_at: at(1) },
+    { ...base, run_id: 'bad_time', snapshot_at: 'きのう' },
+  ];
+  fs.writeFileSync(path.join(H3, 'amazon', 'manifest.jsonl'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n{壊れた行\n');
+  const got = P.latestReportRecord(H3);
+  assert.deepEqual([got.rec.run_id, got.prev.run_id], ['newest', 'older']);
+  for (const l of lines.slice(2)) assert.equal(P.usableRecord(l), false, l.run_id);
+  assert.throws(() => P.readReportText(H3, { ...base, sha256: undefined }), /sha256 が無い/);
+});
+await ta('🛑 送り手の初回 (Render に前の回が無い) の安全弁 (#1691 Codex R1 M2): 想定利益の夜間の判定が ok でない回・1 つ前の回の 80% 未満の回は送らない / --force で送る', async () => {
+  const E6 = await setupDb({ load: false });
+  cdbTarget = E6;
+  try {
+    const H4 = path.join(TMP, 'hist4');
+    const arch4 = (text, at, enumStatus = 'ok') => archiveItems({ mall: 'amazon', shopId: SHOP_ID, source: 'merchant_listings_all_data', runId: `h4_${crypto.randomBytes(3).toString('hex')}`, fetchedAt: at.toISOString(),
+      format: 'tsv', payload: text, items: text.split('\r\n').length - 2, dest: H4, noOffsite: true, log: quiet, meta: { enum_status: enumStatus } });
+    await arch4(F.buildTsv(ROWS), new Date(NOW - 30 * 3600e3));
+    await arch4(F.buildTsv(ROWS.slice(0, 2)), new Date(NOW - 6 * 3600e3));
+    let r = await push({ historyDir: H4 });
+    assert.equal(r.ok, false); assert.match(r.lastLine, /^❌ .*🛑 安全弁: 初回なのに、1 つ前の取得 6 行の 80% 未満 \(2\)/);
+    assert.equal((await E6.pg.query('select count(*)::int as n from ops.amazon_listing_report')).rows[0].n, 0);
+    await arch4(F.buildTsv(ROWS), new Date(NOW - 5 * 3600e3), 'partial');
+    r = await push({ historyDir: H4 });
+    assert.equal(r.ok, false); assert.match(r.lastLine, /初回なのに、想定利益の夜間の判定 \(enum_status\) が ok でない \(partial/);
+    r = await push({ historyDir: H4, force: true });
+    assert.equal(r.ok, true, r.lastLine); assert.equal(r.status, 'applied'); assert.match(r.lastLine, /^⚠️ .*--force で安全弁を越えた/);
+    assert.equal((await E6.pg.query('select count(*)::int as n from ops.amazon_listing_report')).rows[0].n, 6);
+  } finally { cdbTarget = E; await E6.pg.close(); }
 });
 await ta('送り手の引数: --send か --dry-run のどちらか 1 つ・--force は --send と一緒だけ・知らない引数は例外', async () => {
   assert.deepEqual(P.parseArgs(['--send']), { send: true, dryRun: false, force: false, historyDir: null });
@@ -434,6 +497,10 @@ await ta('隠す → same → 一覧から外れて「隠した SKU」に出る 
   l = await list({ hidden: '1' });
   assert.deepEqual(l.rows.map((x) => [x.seller_sku, x.hidden_reason, x.hidden_by]), [['parent_1', 'variation_parent', 'naka@test']]);
   await assert.rejects(hide({ seller_sku: 'no_such', hide: true, reason: 'unused' }), (e) => e instanceof MasterWriteError && e.status === 404);
+  // つないでいる SKU (出品に構成がある pr_a001) には付けない (#1691 Codex R1 M4 = 古い画面・API の直呼び)。DB の関数が確かめ直す
+  await assert.rejects(hide({ seller_sku: 'PR_A001', hide: true, reason: 'unused' }), (e) => e instanceof MasterWriteError && e.status === 409 && e.reason === 'linked');
+  await assert.rejects(asEdit(() => pg.query("select ops.set_amazon_sku_hidden('n@t', 'pr_a001', true, 'unused', null)")), (e) => e.code === 'P0001' && /^linked: /.test(e.message));
+  assert.equal((await pg.query("select count(*)::int as n from ops.amazon_sku_hidden where sku_norm = 'pr_a001'")).rows[0].n, 0);
   await assert.rejects(hide({ seller_sku: 'fba_old', hide: true, reason: 'other' }), (e) => e instanceof MasterWriteError && e.status === 400 && /その他/.test(e.message));
   await assert.rejects(hide({ seller_sku: 'fba_old', hide: true }), (e) => e instanceof MasterWriteError && e.status === 400);
   // DB の関数も同じことを確かめる (画面の検査を通らない呼び方)

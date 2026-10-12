@@ -212,7 +212,8 @@ export async function setHidden(db, { actor, ...input }) {
     return { ok: true, ...out };
   } catch (e) {
     const code = errCodeOf(e);
-    const msg = String((e && e.message) || '').replace(/^(invalid_value|not_found): /, '');
+    const msg = String((e && e.message) || '').replace(/^(invalid_value|not_found|linked): /, '');
+    if (code === 'P0001' && /^linked: /.test(String(e.message))) throw new MasterWriteError(409, 'linked', `${msg}。何もしていません (一覧を開き直してください)`);
     if (code === '22023') throw new MasterWriteError(400, 'invalid_value', msg);
     if (code === 'P0002') throw new MasterWriteError(404, 'not_in_report', `${msg} (毎朝の取り込みの後に、もう一度開いてください)`);
     if (code === '42501') throw new MasterWriteError(503, 'no_privilege', '画面のロールに「隠す」の権限がまだありません (create-master-edit-roles.mjs の流し直しが要る)。何もしていません');

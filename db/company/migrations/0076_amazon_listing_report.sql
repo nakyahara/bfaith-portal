@@ -91,7 +91,7 @@ select core.make_append_only('ops', 'amazon_sku_hidden_events');
 comment on table ops.amazon_sku_hidden_events is '隠す・戻す の記録 (0076・追記だけ)。誰が・いつ・なぜ';
 
 -- 隠す / 戻す (1 件ずつ)。戻り値 = { status: 'hidden' | 'shown' | 'same', seller_sku, sku_norm, reason, note, by, at }
---   形が外れる = 22023 (画面は 400)・隠す SKU が今の出品一覧に無い = P0002 (画面は 404)。同じ状態への操作 = same (何も書かない)
+--   形が外れる = 22023 (画面は 400)・隠す SKU が今の出品一覧に無い = P0002 (画面は 404)・もうつないでいる (構成がある) = P0001 linked (画面は 409)。同じ状態への操作 = same (何も書かない)
 create function ops.set_amazon_sku_hidden(p_actor text, p_seller_sku text, p_hide boolean, p_reason text default null, p_note text default null)
   returns jsonb language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
@@ -100,6 +100,7 @@ declare
   v_note text := nullif(pg_catalog.btrim(coalesce(p_note, '')), '');
   v_norm text;
   v_cur record;
+  v_lid bigint;
   v_now timestamptz := pg_catalog.now();
 begin
   if v_actor = '' or pg_catalog.length(v_actor) > 200 then raise exception 'invalid_value: 操作した人が無い' using errcode = '22023'; end if;
@@ -109,7 +110,8 @@ begin
   if p_hide is null then raise exception 'invalid_value: 隠すか戻すかが無い' using errcode = '22023'; end if;
   v_norm := core.norm_code(p_seller_sku);
   if v_norm is null or v_norm = '' then raise exception 'invalid_value: seller SKU が空' using errcode = '22023'; end if;
-  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('company-db:amazon-sku-hidden:' || v_shop || ':' || v_norm));
+  -- 鍵 = 対応の保存 (0054 の ops.amazon_map_begin) と同じ SKU の鍵 (#1691 Codex R1 M4)。保存と隠すが同じ SKU で並ぶ (同じ SKU の 2 つの隠すも並ぶ)
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.amazon_map:' || v_norm, 0));
   select h.seller_sku, h.reason, h.note, h.hidden_by, h.hidden_at into v_cur from ops.amazon_sku_hidden h
    where h.company_id = 1 and h.shop_code = v_shop and h.sku_norm = v_norm for update;
   if p_hide then
@@ -123,6 +125,13 @@ begin
     select r.seller_sku into v_cur from ops.amazon_listing_report r
      where r.company_id = 1 and r.shop_code = v_shop and r.sku_norm = v_norm order by r.seller_sku limit 1;
     if v_cur.seller_sku is null then raise exception 'not_found: Amazon の出品一覧 (今の姿) に無い seller SKU' using errcode = 'P0002'; end if;
+    -- つないでいる SKU には付けない (#1691 Codex R1 M4 = 古い画面・API の直呼び): 上の鍵の中で出品の行を共有の鍵で読み、構成が無いことを確かめ直す
+    --   (保存は同じ鍵 → 出品の行を for update = 保存の commit の後に読む)。削除済み (墓標) の対応 = 構成 0 行 = 隠せる
+    select l.listing_id into v_lid from core.listings l
+     where l.company_id = 1 and l.mall = 'amazon' and l.shop_code = v_shop and l.listing_norm = v_norm for share;
+    if v_lid is not null and exists (select 1 from core.listing_components c where c.listing_id = v_lid) then
+      raise exception 'linked: この seller SKU はもう社内の商品とつないでいる (出品に構成がある) = 隠す印は付けない' using errcode = 'P0001';
+    end if;
     insert into ops.amazon_sku_hidden (company_id, shop_code, sku_norm, seller_sku, reason, note, hidden_by, hidden_at)
       values (1, v_shop, v_norm, v_cur.seller_sku, p_reason, v_note, v_actor, v_now);
     insert into ops.amazon_sku_hidden_events (company_id, shop_code, sku_norm, seller_sku, action, reason, note, actor, at)

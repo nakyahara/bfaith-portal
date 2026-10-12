@@ -29,6 +29,8 @@ export const MAX_ROWS = 50000;   // 2026-09 の実測 = 7,594 行
 export const STATUSES = Object.freeze(['active', 'inactive', 'incomplete', 'unknown']);
 export const FULFILLMENTS = Object.freeze(['FBA', 'FBM']);
 export const GENERATION_FUTURE_MS = 10 * 60 * 1000;   // 取得の時刻が「いま」より先でも、時計のずれとして許す幅
+/** 🛑 受け口の安全弁: 新しい行が今の行 (同じ取引の中で数える) のこの割合を下回ったら入れ替えない (送り手の安全弁と同じ値。#1691 Codex R1 M2) */
+export const MIN_ROW_RATIO = 0.8;
 const bad = (m) => err('BAD_REQUEST', m);
 // 🚨 制御文字はソースにエスケープで書かず、文字コードから作る (stock-daily.mjs と同じ理由)
 const CONTROL = new RegExp(`[${String.fromCharCode(0)}-${String.fromCharCode(31)}${String.fromCharCode(127)}]`);
@@ -101,6 +103,7 @@ export function validateListingBody(body, { nowMs = Date.now() } = {}) {
   if (typeof body.report_run_id !== 'string' || !RUN_ID_RE.test(body.report_run_id)) throw bad('report_run_id が無い・不正 (英数字と _ . : - の 100 文字まで)');
   if (typeof body.checksum !== 'string' || !HEX64.test(body.checksum)) throw bad('checksum は 64 桁の 16 進');
   if (!isCount(body.row_count) || !isCount(body.skipped_count)) throw bad('row_count・skipped_count は 0 以上の整数');
+  if (body.force !== undefined && typeof body.force !== 'boolean') throw bad('force は boolean (わざと減らすときだけ true)');
   if (!Array.isArray(body.rows)) throw bad('rows は配列');
   if (body.rows.length === 0) throw bad('rows が 0 行 = 受けない (取れなかったを「全部の出品が消えた」と読まない)');
   if (body.rows.length > MAX_ROWS) throw bad(`rows が多すぎる (${body.rows.length} > ${MAX_ROWS})`);
@@ -116,7 +119,7 @@ export function validateListingBody(body, { nowMs = Date.now() } = {}) {
   rows.sort(bySku);
   const checksum = listingChecksum(rows);
   if (body.checksum !== checksum) throw bad(`checksum が届いた行から計算した値と合わない (送り手 ${body.checksum.slice(0, 16)}… / 受け口 ${checksum.slice(0, 16)}…)`);
-  return { shopCode: body.shop_code, generation, runId: body.report_run_id, snapshotAt: new Date(generation).toISOString(), checksum, skipped: body.skipped_count, rows };
+  return { shopCode: body.shop_code, generation, runId: body.report_run_id, snapshotAt: new Date(generation).toISOString(), checksum, skipped: body.skipped_count, rows, force: body.force === true };
 }
 
 export function newListingRunId() {
@@ -142,7 +145,7 @@ export async function listingTablesReady(db) {
 /**
  * 1 回分を入れる。db = { query, exec } (router の pgAdapter / 試験の PGlite)。
  * @returns {{ status: 'applied'|'same'|'refreshed'|'stale', shop_code, generation, checksum, rows, load_id, run_id, replaced?, remote_generation? }}
- *   例外: BAD_REQUEST (400) / NOT_MIGRATED (409) / CONFLICT (409 = 同じ世代で違う内容) / LOCKED (503)
+ *   例外: BAD_REQUEST (400) / NOT_MIGRATED (409) / CONFLICT (409 = 同じ世代で違う内容) / SHRINK (409 = 行が今の 80% 未満・force なし) / LOCKED (503)
  */
 export async function ingestAmazonListings(db, body, { host = 'render', companyId = COMPANY_ID, nowMs, afterWrite = null, log = () => {} } = {}) {
   const v = validateListingBody(body, nowMs != null ? { nowMs } : {});
@@ -178,6 +181,12 @@ export async function ingestAmazonListings(db, body, { host = 'render', companyI
         return { status: 'refreshed', ...base, rows: Number(cur.row_count), load_id: Number(cur.load_id), run_id: cur.ingest_run_id };
       }
     }
+    // 🛑 安全弁 (#1691 Codex R1 M2): 送り手の安全弁は Render の前の回があるときだけ = 受け口でも同じ取引の中で今の行を数えて比べる (advisory lock の中 = 並ぶ取込は無い)。
+    //   80% 未満 = 入れ替えない (SHRINK = 409)。わざと減らすときだけ送り手の --force (body.force = true)
+    const nowRows = Number((await one(`select count(*)::int as n from ops.amazon_listing_report where company_id = $1::smallint and shop_code = $2`, [companyId, v.shopCode])).n);
+    if (nowRows > 0 && v.rows.length < nowRows * MIN_ROW_RATIO && !v.force) {
+      throw err('SHRINK', `行が今の ${nowRows} の ${MIN_ROW_RATIO * 100}% 未満 (${v.rows.length}) = 入れ替えない (既存の行を消さない)。わざとなら送り手の --force`);
+    }
     const runId = newListingRunId();
     await db.query(
       `insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, status, complete, rows_seen, source_tz, checksum, format_version)
@@ -198,8 +207,8 @@ export async function ingestAmazonListings(db, body, { host = 'render', companyI
     await db.query(`update ops.ingest_runs set status = 'success', complete = true, finished_at = now(), rows_inserted = $2, rows_skipped = $3, updated_at = now() where ingest_run_id = $1`, [runId, inserted, v.skipped]);
     if (afterWrite) await afterWrite();   // 試験用: 全部書いた後・commit の前
     await db.exec('commit');
-    log(`applied (世代 ${cur ? cur.generation : '-'} → ${v.generation} / 行 ${inserted} / 消した前の行 ${replaced} / 送り手が外した行 ${v.skipped})`);
-    return { status: 'applied', ...base, rows: inserted, replaced, load_id: loadId, run_id: runId };
+    log(`applied (世代 ${cur ? cur.generation : '-'} → ${v.generation} / 行 ${inserted} / 消した前の行 ${replaced} / 送り手が外した行 ${v.skipped}${v.force ? ' / force' : ''})`);
+    return { status: 'applied', ...base, rows: inserted, replaced, load_id: loadId, run_id: runId, forced: v.force && nowRows > 0 && v.rows.length < nowRows * MIN_ROW_RATIO };
   } catch (e) {
     try { await db.exec('rollback'); } catch { /* 取引が既に無い */ }
     throw e;

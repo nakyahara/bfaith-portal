@@ -11,14 +11,17 @@
  *
  * 決め:
  *   - 🚨 **SP-API は呼ばない** (createReport は 1 分に 1 回の制限・同じレポートを 2 回取らない)。材料は想定利益の夜間が残した原文だけ = 新しい定期実行も無い
- *   - 送るのは manifest の最後の「Amazon・complete=true・TSV」の回 (部分取得・0 件は archive-items.mjs が complete=false / 保存しない)。
+ *   - 送るのは manifest の中で「Amazon・日本の店 (<セラーID>@A1VC38T7YXB528)・取得元 merchant_listings_all_data・complete=true・TSV・64 桁の sha256」の回のうち、
+ *     取得の時刻 (snapshot_at) がいちばん新しい回 (manifest の並びに頼らない・#1691 Codex R1 M3)。部分取得・0 件は archive-items.mjs が complete=false / 保存しない。
  *     gz を開いて sha256 が manifest と合わなければ送らない (❌ = 壊れた・書きかけの履歴を Company DB に入れない)
  *   - 世代 = その回の snapshot_at (レポートを取り終えた時刻 ms)。Render の世代と同じ・中身も同じ = 送らない (✅ 変わりなし)。Render の方が新しい = 送らない (⚠️)
  *   - 列は日本語の見出し (日本のマーケットプレイスの今の形) と英語の見出し (SP-API の説明の形) のどちらでも読む (HEADER_ALIASES)。
  *     seller SKU の列が無い = ❌ (別の形のレポート)。ほかの列が無い = その値を null で送り ⚠️ (例: 商品名の列が無い → 画面に商品名が出ない理由が朝の通知で分かる)
  *   - 🚨 1 行の違反で全部を捨てない: SKU が空・同じ SKU が 2 行目以降・形が読めない (列の数が見出しと違う = 説明の中の改行など) 行は外して数える (skipped_count)。
  *     ただし外した行が多い (max(20, 2%)) = レポートの形が変わった疑い = 送らない (❌)
- *   - 🛑 安全弁: Render に前の回があり、行が前の 80% 未満 = 送らない (❌・既存の行を消さない)。わざと減ったときだけ --force (手で流す)
+ *   - 🛑 安全弁: Render に前の回があり、行が前の 80% 未満 = 送らない (❌・既存の行を消さない)。初回 (Render に前の回が無い) = 想定利益の夜間の判定 (enum_status) が ok でない回・
+ *     manifest の同じ店の 1 つ前の回より 20% 以上少ない回は送らない (#1691 Codex R1 M2)。受け口も同じ取引の中で今の行と比べ直す (SHRINK = 409)。
+ *     わざと減ったときだけ --force (手で流す・body の force: true で受け口の安全弁も越える)
  *   - Render に 0076 がまだ無い (status が 409 not_migrated) = ⚠️ で exit 0 (マージから migrate (中原さんの指示の後) までの朝を ❌ にしない)
  *   - 取得が古い (36 時間より前 = 想定利益の夜間が止まっている疑い) = 送るが ⚠️ (想定利益の台帳 expected-profit-nightly の見張りとは別に、朝の通知でも分かる)
  * 最後の 1 行が daily-sync の朝の通知に載る。❌ = exit 1 (retry に載る)・⚠️ / ✅ = exit 0
@@ -131,27 +134,47 @@ export function parseListingReportTsv(text) {
   return { rows, skipped, cols, missing, header };
 }
 
-/** manifest.jsonl (archive-items.mjs) の最後の「Amazon・complete・TSV」の回。無ければ null。壊れた行は飛ばす */
+/** 送る回の取得元 = 想定利益の夜間の出品レポート (fetch-listings.js の archiveListings の source) */
+export const REPORT_SOURCE = 'merchant_listings_all_data';
+/** 店 = 日本のマーケットプレイスの <セラーID>@A1VC38T7YXB528 (fetch-listings.js の amazonShopId。セラーID が分からなかった夜の unknown@… は使わない) */
+export const SHOP_ID_RE = /^[A-Z0-9]{5,20}@A1VC38T7YXB528$/;
+/** manifest の 1 行が送ってよい回か (店・取得元・形式・完走・64 桁の sha256・読める時刻・履歴のフォルダの中のファイル) */
+export function usableRecord(r) {
+  return !!r && typeof r === 'object' && r.mall === 'amazon' && r.source === REPORT_SOURCE && typeof r.shop_id === 'string' && SHOP_ID_RE.test(r.shop_id)
+    && r.complete === true && r.format === 'tsv' && typeof r.file === 'string' && r.file !== '' && !r.file.includes('..') && !path.isAbsolute(r.file)
+    && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256) && typeof r.snapshot_at === 'string' && Number.isSafeInteger(Date.parse(r.snapshot_at)) && Date.parse(r.snapshot_at) > 0;
+}
+/**
+ * manifest.jsonl (archive-items.mjs) から送る回を選ぶ (#1691 Codex R1 M3): usableRecord の中で取得の時刻 (snapshot_at) がいちばん新しい回 (manifest の並びに頼らない)。
+ * 戻り値 = { rec, prev } (prev = 同じ店・同じ取得元の 1 つ前の回 = 初回の安全弁の比べる相手) / 無ければ null。壊れた行は飛ばす
+ */
 export function latestReportRecord(historyDir) {
   const mf = path.join(historyDir, 'amazon', 'manifest.jsonl');
   if (!fs.existsSync(mf)) return null;
-  const lines = fs.readFileSync(mf, 'utf8').split(/\r?\n/).filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    let r; try { r = JSON.parse(lines[i]); } catch { continue; }
-    if (r && r.mall === 'amazon' && r.complete === true && r.format === 'tsv' && typeof r.file === 'string' && typeof r.snapshot_at === 'string') return r;
+  const recs = [];
+  for (const line of fs.readFileSync(mf, 'utf8').split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let r; try { r = JSON.parse(line); } catch { continue; }
+    if (usableRecord(r)) recs.push(r);
   }
-  return null;
+  if (!recs.length) return null;
+  const at = (r) => Date.parse(r.snapshot_at);
+  const rec = recs.reduce((a, b) => (at(b) >= at(a) ? b : a));
+  const older = recs.filter((r) => r.shop_id === rec.shop_id && at(r) < at(rec));
+  const prev = older.length ? older.reduce((a, b) => (at(b) >= at(a) ? b : a)) : null;
+  return { rec, prev };
 }
 
 /** 回の gz を開いて原文と sha256 (manifest の sha256 = 原文の sha256) */
 export function readReportText(historyDir, rec) {
   const rel = String(rec.file);
+  if (typeof rec.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(rec.sha256)) throw new Error(`manifest の sha256 が無い・形が違う = 中身を確かめられないので送らない: ${rel}`);
   if (rel.includes('..') || path.isAbsolute(rel)) throw new Error(`manifest の file が履歴のフォルダの外を指す: ${rel.slice(0, 80)}`);
   const file = path.join(historyDir, rel);
   if (!fs.existsSync(file)) throw new Error(`manifest にある履歴のファイルが無い: ${rel}`);
   const buf = zlib.gunzipSync(fs.readFileSync(file));
   const sha = crypto.createHash('sha256').update(buf).digest('hex');
-  if (rec.sha256 && sha !== rec.sha256) throw new Error(`履歴のファイルの sha256 が manifest と違う (壊れた・書き換わった): ${rel}`);
+  if (sha !== rec.sha256) throw new Error(`履歴のファイルの sha256 が manifest と違う (壊れた・書き換わった): ${rel}`);
   return buf.toString('utf8');
 }
 
@@ -169,8 +192,9 @@ export async function pushAmazonListings({ historyDir, fetchImpl = fetch, base, 
   const out = { ok: false, status: null, rows: 0, skipped: 0, missing: [], generation: null, remote: null, record: null, lastLine: '', warn: [] };
   let err = null;
   try {
-    const rec = latestReportRecord(historyDir);
-    if (!rec) throw new Error(`Amazon の出品レポートの履歴が無い (${path.join(historyDir, 'amazon', 'manifest.jsonl')} に complete の TSV の回が無い = 想定利益の夜間がまだ一度も保存していない)`);
+    const picked = latestReportRecord(historyDir);
+    if (!picked) throw new Error(`Amazon の出品レポートの履歴が無い (${path.join(historyDir, 'amazon', 'manifest.jsonl')} に 日本の店・${REPORT_SOURCE}・complete・TSV・sha256 つきの回が無い = 想定利益の夜間がまだ一度も保存していない)`);
+    const { rec, prev } = picked;
     out.record = { file: rec.file, snapshot_at: rec.snapshot_at, run_id: rec.run_id };
     const generation = Date.parse(rec.snapshot_at);
     if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error(`manifest の snapshot_at が日時として読めない: ${String(rec.snapshot_at).slice(0, 40)}`);
@@ -202,10 +226,14 @@ export async function pushAmazonListings({ historyDir, fetchImpl = fetch, base, 
     if (remote && remote.generation > generation) { out.status = 'remote_newer'; out.ok = true; return out; }
     if (remote && remote.generation === generation && remote.checksum === checksum && remote.row_count === parsed.rows.length && sj.rows === remote.row_count) { out.status = 'unchanged'; out.ok = true; return out; }
     // 🛑 安全弁 (dry-run でも止めて理由を出す)
-    const guard = remote && parsed.rows.length < remote.row_count * GUARD_MIN_ROW_RATIO ? `行が前の回 ${remote.row_count} の ${GUARD_MIN_ROW_RATIO * 100}% 未満 (${parsed.rows.length})` : null;
+    // Render に前の回がある = その行の数と比べる (受け口も同じ取引の中で今の行と比べ直す = SHRINK)。
+    // 🆕 初回 (Render に前の回が無い) = manifest で守る (#1691 Codex R1 M2): 想定利益の夜間の判定 (enum_status) が ok でない回・同じ店の 1 つ前の回より 20% 以上少ない回は送らない
+    const guard = remote ? (parsed.rows.length < remote.row_count * GUARD_MIN_ROW_RATIO ? `行が前の回 ${remote.row_count} の ${GUARD_MIN_ROW_RATIO * 100}% 未満 (${parsed.rows.length})` : null)
+      : rec.enum_status !== 'ok' ? `初回なのに、想定利益の夜間の判定 (enum_status) が ok でない (${String(rec.enum_status ?? 'なし').slice(0, 20)} = 前の夜より出品が大きく減った・読めない行が多い)`
+      : prev && Number.isInteger(prev.items) && Number.isInteger(rec.items) && rec.items < prev.items * GUARD_MIN_ROW_RATIO ? `初回なのに、1 つ前の取得 ${prev.items} 行の ${GUARD_MIN_ROW_RATIO * 100}% 未満 (${rec.items})` : null;
     if (guard && (!force || dryRun)) throw new Error(`🛑 安全弁: ${guard} = 送らない (既存の行を消さない)。レポートを確かめ、わざとなら手で --force`);
     if (guard) out.warn.push(`--force で安全弁を越えた: ${guard}`);
-    const body = { shop_code: SHOP_CODE, generation, snapshot_at: new Date(generation).toISOString(), report_run_id: rec.run_id, checksum, row_count: parsed.rows.length, skipped_count: parsed.skipped.length, rows: parsed.rows };
+    const body = { shop_code: SHOP_CODE, generation, snapshot_at: new Date(generation).toISOString(), report_run_id: rec.run_id, checksum, row_count: parsed.rows.length, skipped_count: parsed.skipped.length, rows: parsed.rows, ...(force ? { force: true } : {}) };
     const bytes = Buffer.byteLength(JSON.stringify(body));
     if (bytes > MAX_BODY_BYTES) throw new Error(`送る中身が大きすぎる (${bytes} バイト > ${MAX_BODY_BYTES})`);
     if (dryRun) { out.status = 'dry-run'; out.ok = true; return out; }
