@@ -31,7 +31,11 @@ router.get('/locations', (req, res) => {
     const name = db.prepare('SELECT MIN(商品名) AS n FROM raw_lz_inventory WHERE 商品ID = ?').get(code)?.n || null;
     const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
     const stockDate = db.prepare('SELECT 在庫日 AS d FROM raw_lz_inventory LIMIT 1').get()?.d || null;
-    res.json({ ok: true, importedAt, stockDate, name, count: locations.length, locations });
+    // 在庫を取った時刻 (ロジザードへ取りに行く直前)。importedAt は「取り込み完了」で数分遅い。
+    // ピッキング側が「写しの後の引当」を引く境目に使う (PR #1697 Codex R1 High)。今の取り込みの値のときだけ返す
+    const meta = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value || null;
+    const sourceAt = importedAt && meta('logizard_source_for') === importedAt ? meta('logizard_source_at') : null;
+    res.json({ ok: true, importedAt, sourceAt, stockDate, name, count: locations.length, locations });
   } catch (e) {
     console.error('[logizard-stock-service] locations error', e);
     // 上流のエラー文をそのまま返さない (呼び出し側は固定の形だけを期待する)

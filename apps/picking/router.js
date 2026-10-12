@@ -28,7 +28,7 @@ import {
 import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking, returnCandidates, listRepickFirstLines, listLaterRequests, cancelLaterRequest, pickingStockDraws } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
-import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
+import { fetchStockLocations, listStockCandidates, stockLookupConfigured, stockSnapshotAt } from './stock-locations.js';
 import { enqueueBatchSync, fetchNotionWorkerNames, STATUS_PICKING, STATUS_PICKED } from './notion.js';
 import { getFloorData } from './floor.js';
 import { syncStaff, isStaffSyncConfigured, getStaffSyncState } from './staff-sync.js';
@@ -615,7 +615,7 @@ router.get('/api/batches/:id(\\d+)/stock-locations', api(async (req, res) => {
   const data = await fetchStockLocations(line.sku);
   const out = listStockCandidates(data, {
     excludeBlock: line.block, excludeLocation: line.location, groupByLocation: true, maxRows: 40,
-    draws: data ? stockDrawsSafe(line.sku, data.importedAt) : null,
+    draws: data ? stockDrawsSafe(line.sku, stockSnapshotAt(data)) : null,
   });
   res.json({ ok: true, configured: true, sku: line.sku, ...out });
 }));

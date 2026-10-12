@@ -138,9 +138,20 @@ export async function fetchStockBlock(blockCode, fetchFn = fetch) {
   }
 }
 
-/** ピッキングで取る数 (draws) のキー。ロケ表記の違い (00200305 / 002-003-05) を数字に揃える */
+/**
+ * ピッキングで取る数 (draws) のキー。棚ロケは表記の違い (00200305 / 002-003-05) を数字に揃える。
+ * 特殊ロケ (ZZZ-ZZZ-ZZ 等) は数字だけにすると別のロケと重なるので、そのままの名前で持つ (PR #1697 Codex R1 Low)
+ */
 export function stockDrawKey(block, location) {
-  return `${String(block || '')}\u001f${normalizeLocationDigits(location)}`;
+  const loc = String(location || '').trim();
+  const digits = normalizeLocationDigits(loc);
+  const key = /^[\d-]+$/.test(loc) && digits.length === 8 ? digits : `=${loc.toUpperCase()}`;
+  return `${String(block || '').trim()}\u001f${key}`;
+}
+
+/** 写しの「在庫を取った時刻」。無ければ取り込み完了の時刻 (古い warehouse・素性が別の回のとき) */
+export function stockSnapshotAt(data) {
+  return (data && (data.sourceAt || data.importedAt)) || null;
 }
 
 /**
