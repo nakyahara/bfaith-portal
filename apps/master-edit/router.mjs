@@ -36,6 +36,7 @@
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
  *   POST /api/sku/:code/card-retry  カードの取り込みをもう一度 (名簿の人・衝突 / 失敗の知らせも試す)
  *   POST /api/sku/:code/card-link   衝突を解く = 既存のカード (同じ商品コード) をこの商品に結ぶ (名簿の人。PR #1566 R1 M6)
+ *   POST /api/sku/:code/gone        🆕 0070: 業務で使える商品を「NE から消えた」でやめる { request_id, reason, confirm: true } (MASTER_DECISION_APPROVERS の人・lib/master-gone.mjs)
  *   ── 発注の設定 (10/9・発注アプリの po_* に書く・apps/master-edit/order-settings.mjs → apps/purchase-orders/order-settings.js の 1 つの部品) ──
  *   POST /api/new の order_settings = { order_lot?, condition_id?, material_group_id?, capacity_per_unit?, case_group?, case_lot?, new_condition?, new_material? } (単品だけ):
  *        ① の前に形・グループ・代表の仕入先を確かめる (誤り = 400 / 409・何も書かない) → ① Company DB の登録 → 通ったら ② 発注アプリに書く。
@@ -44,6 +45,9 @@
  *   書ける人 = 名簿 (MASTER_EDITORS) かつ 発注アプリの利用権。Company DB の切替の門は見ない (発注アプリのマスタ管理と同じく、いつでも)
  *   ── Amazon SKU の対応 (⑦-1・0054・Company DB構想 16。保存を開く門は上と同じ + 持ち主 listing_components.amazon が 'company') ──
  *   GET  /amazon/            一覧 (Company DB の対応・墓標も)。?q=&state=&offset=
+ *   GET  /amazon/new?sku=    新しい seller SKU の対応を自分で作る入口 (まだ売れていない SKU も)。形 → もうある (対応・墓標) = その画面へ案内 →
+ *                            似た SKU・気をつけること (打ち間違いの守り) があれば見せて「このまま作る」/ 無ければ /amazon/sku?sku= へ (checked = 画面でもう見た)
+ *   GET  /api/amazon/check?sku=  同じ確かめ (読むだけ・打つとその場で)
  *   GET  /amazon/sku?sku=    1 つの seller SKU (見る・直す・墓標にする・墓標から戻す)。対応が無ければ「新しい対応」(今の構成は夜間ロードの写しとして見せる)
  *   GET  /amazon/sku/history?sku=  変更の記録 (対応・構成・出品)
  *   GET  /amazon/unmapped    未登録 = 直近 7 日に売れたのに構成が無い seller SKU (FBA / FBM で分ける・売上の公開が欠けた日は「未判定」)
@@ -93,8 +97,8 @@ import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody } from './ord
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
-import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
-import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, CHANNELS, UNMAPPED_DAYS } from './amazon-read.mjs';
+import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, newSellerSkuCheckInDb, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
+import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, normalizeAmazonFilters, checkNewAmazonSku, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
@@ -102,6 +106,7 @@ import {
   regSummary, buildRegExport, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
   REG_ITEM_STATES, REG_RESULTS,
 } from '../../lib/master-reg-csv.mjs';
+import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -727,7 +732,11 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     // 売れた数 (7 日・30 日) = 商品管理リストの公開の回 (発注アプリと同じ数)・FBA / FBA 以外・モール別 (速報)
     sales: await readSalesSku(await readSalesRun({ now: clock() }), page.cur.code),
   } : null;
+  // 🆕 0070: 業務で使える単品だけ「NE から消えた (やめる)」の確かめを読む (DB の ops.sku_gone_from_ne_check・読めない = 出さない)。押せるのは名簿 MASTER_DECISION_APPROVERS の人
+  const goneChk = page && page.cur.sku_kind === 'single' && page.cur.registration && page.cur.registration.state === 'available' ? await readGoneCheck(db, page.cur.sku_id) : null;
+  const gone = goneChk ? { ...goneView(goneChk), canApprove: approverGate(req).ok } : null;
   res.render(view('sku.ejs'), {
+    gone,
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null, extras,
     // 発注の設定 (発注アプリ・単品だけ)。発注条件グループは代表の仕入先のものだけ選べる
@@ -940,6 +949,30 @@ router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbE
   const phase = await readPhaseView(db);
   res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, channel, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
 }));
+/**
+ * 新しい seller SKU の対応を作る入口 (読むだけ・保存は今までどおり /amazon/sku の画面から POST /api/amazon/save)。
+ * 作ってよい (形が合う・対応が無い・似た SKU も気をつけることも無い、または checked = 画面でもう見た) = /amazon/sku?sku= へ 303
+ */
+const AMAZON_CHECK_RAW_MAX = 300;
+const TOO_LONG = `seller SKU が長すぎます (${AMAZON_CHECK_RAW_MAX} 文字まで)`;
+router.get('/amazon/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const raw = typeof req.query.sku === 'string' ? req.query.sku : '';
+  const asked = typeof req.query.sku === 'string';
+  const tooLong = raw.length > AMAZON_CHECK_RAW_MAX;
+  const check = db && asked && !tooLong ? await checkNewAmazonSku(db, raw) : null;
+  const checked = typeof req.query.checked === 'string' ? req.query.checked : '';
+  if (check && check.ok && (check.next === 'create' || (check.next === 'confirm' && checked === check.sku))) {
+    return res.redirect(303, `${req.baseUrl}/amazon/sku?sku=${encodeURIComponent(check.open)}`);
+  }
+  const phase = await readPhaseView(db);
+  const shapeError = tooLong ? TOO_LONG : check && !check.ok ? check.message : '';
+  res.status(shapeError ? 400 : 200).render(view('amazon-new.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, raw: raw.slice(0, AMAZON_CHECK_RAW_MAX), asked, check, shapeError, MAP_STATES, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX });
+}));
+router.get('/api/amazon/check', (req, res) => {
+  const raw = typeof req.query.sku === 'string' ? req.query.sku : '';
+  if (raw.length > AMAZON_CHECK_RAW_MAX) return res.json({ ok: false, reason: 'shape', message: TOO_LONG });
+  return withPgApi(res, async (db) => res.json(await checkNewAmazonSku(db, raw)));
+});
 router.get('/amazon/sku/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
   let sku;
   try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).render(view('error.ejs'), { ...pageLocals(req), nav: 'amazon', message: e.message }); }
@@ -953,7 +986,9 @@ router.get('/amazon/sku', (req, res) => withPgPage(req, res, async (db, dbError)
   const channels = db ? await amazonChannelsProvider() : null;
   const page = db ? await readAmazonPage(db, sku, { channels }) : null;
   if (page) page.phase = { ...page.phase, owner: await screenOwner(db) };
-  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY });
+  // 出品も対応も無い seller SKU = 先に作る形の決まり (#1685 Codex R1 High)。合わなければ画面で先に知らせて保存のボタンを出さない (保存の lib も断る)
+  const newSkuProblems = page && !page.cur.listing ? (await newSellerSkuCheckInDb(db, sku)).problems : [];
+  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY });
 }));
 router.post('/api/amazon/save', (req, res) => {
   const gate = editorGate(req);
@@ -1056,6 +1091,22 @@ router.post('/api/bulk/apply', (req, res) => {
   return withPgApi(res, async (db) => {
     res.json(await bulkApplyChunk(db, { ...b, actor: String(req.session.email).trim().toLowerCase() },
       { open: isOpen(), now: clockOverridden ? new Date(clock()) : undefined }));
+  }, 'write');
+});
+
+/**
+ * 🆕 0070: 業務で使える商品を「NE から消えた」でやめる { request_id, reason, confirm: true }。名簿 MASTER_DECISION_APPROVERS の人だけ (NE 登録の CSV・マスタの判断と同じ =
+ *   商品を業務で使えなくする判断。MASTER_EDITORS より狭い名簿)・この画面だけのロールで・MASTER_EDIT_OPEN の後だけ。
+ *   条件 (完全な NE の取得に続けて 3 回無い・使われていない ほか) は DB の関数が鍵の後に確かめる (lib/master-gone.mjs)
+ */
+router.post('/api/sku/:code/gone', (req, res) => {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    const r = await cancelSkuGoneFromNe(db, { actor: String(req.session.email).trim().toLowerCase(), code: req.params.code, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true },
+      { open: isOpen(), requireConfirm: true });
+    res.json(r);
   }, 'write');
 });
 

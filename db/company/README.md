@@ -681,6 +681,31 @@ node -r dotenv/config apps/warehouse/retry-failed-jobs.js --amazon-map-chain --a
   (10/9 の Amazon の widen の `amz-widen-steps.ps1` と同じ順。間に夜間ロード (02:00) を挟まない) → 照合 ② (封をした回・6 つ = 0) → `check --attempt` → `widen --attempt` (中原さんの OK)。
   試験 = `apps/company-db/test-master-parent.mjs` [8b] (configured = company を配っても、DB の active が load なら夜間ロードは NE の代表で名札と親を作る / widen の後は触らない)
 
+### NE から消えた商品をやめる (0070・2026-10-11 中原さんの決定 Q1 = a。番号 = 0069 (#1679) の後・マージの順で振り直す)
+
+drift-list の代表のずれ 23 件のうち 18 件は「NE ではもう消えた (別のコードで作り直した) のに、Company DB では登録の状態が available のまま」(parent_incomparable・not_in_ne)。
+available から先に進む道が無かった (0052 の行き先の決まり) ので、**available → cancelled を 1 つ足し、DB が自分で「完全な NE の取得に 3 日続けて無い」を確かめてから、人が理由を付けて動かす**。0068 の判定表は変えない (cancelled は前から数えない側)。
+
+- **証拠 = 照合 ② の代表の数えの記録の回** (`ops.record_parent_gate` が記録した回 = complete・許可の一覧の 4 つが全部 ok・取得は今日・同じ回は 1 回)。同じ関数が同じ取引で、その回の観測の rows (NE の取得の全部の単品・セットのコード) と untrusted (保持 = 無いと言えない) に無い Company DB の SKU のコードを `ops.master_ne_absence` に数える。
+  🆕 #1683 Codex R1 High 1: **取得の時刻の順** (記録の順ではない) = 数えを進めるのは、取得の完了の時刻 (単品・セットとも) が数えた一番新しい取得 (`ops.master_ne_absence_mark`) より後で、その取得の世代 (`ne_generation_id`) をほかの記録の回で見ていないときだけ (古い取得を後から記録した・同じ取得の照合し直し = 何も変えない)。
+  **数えるのは JST の取得の日** (1 日に何回取得しても 1 日 = 「3 回」= 3 日)。ある取得で消える。記録しなかった回 (確かめられない取得) は数えない・途切れさせない。
+  0041 の `ops.master_ne_codes` は最新の 1 回の入れ替え (回ごとの記録が無い・取得の信用を見ない) = 証拠にせず、**今そこにあれば断る**ための守りだけ。0058 の `master_ne_code_history` は「一度でも見た」= 使えない
+- **確かめ** `ops.sku_gone_from_ne_check(sku_id)` (読むだけ・watcher / master_edit / master_ops): 登録の状態 available・単品・数えた一番新しい取得の**取得の完了の時刻** (単品とセットの古い方) が 36 時間 (`ops.ne_gone_fresh_hours()`) の中・その取得にも無い・続けて 3 日 (`ops.ne_gone_required_runs()`) 以上・今の NE のコードの台帳に無い・
+  生きた NE 登録の CSV の品目 (built / issued / import_declared / partial) が無い・ほかのセットの構成品 (`core.sku_components`) でない・開いている構成の依頼に無い・販路の出品の構成 (`core.listing_components`・🆕 #1683 Codex R3 High: **削除済みの出品の構成も** = 出品が戻るとやめた商品が使われる・理由 `listing_component_deleted` にどの出品かを出す) に無い・ほかの商品の親でない。
+  `ops.sku_gone_from_ne_list(codes | null)` = CLI の dry-run (null = 候補)
+- **動かす** `ops.cancel_sku_gone_from_ne(request_id, 人, 理由, sku_id)` (security definer・master_edit = 画面 / master_ops = CLI): 鍵 (新商品の許可の共有 → 段階 → マスタの書き込みの共有 → SKU → NE のコードの共有 → **登録の状態の行 (排他)** → SKU の行) → 段階 new_open・持ち主表 = DB の active → 確かめ →
+  約束 (0051 の表・操作 `sku_gone_cancel`) → 登録の状態 → 保存の記録 done。押し直し = 前の答え。`ops.transition_sku_registration` (0063 の版から写して足しただけ) は available → cancelled を**この約束の中だけ**・確かめが ok のときだけ通し、根拠を DB が作る (master_ops が直に呼んでも断る = `gone_session_required`)
+- 🆕 #1683 Codex R1 High 2: **やめた SKU への参照を新しく作らない (DB の不変の決まり)** = trigger (`ops.guard_sku_ref_not_cancelled`) が 構成の子 (`core.sku_components`)・出品の構成 (`core.listing_components`)・構成の依頼 (`ops.sku_component_requests` の rows)・代表 (`core.products.parent_product_id`) の insert / 参照を変える update で、参照する SKU の登録の状態の行を**共有**で取ってから cancelled を断る (`sku_cancelled`・23514・どの書き手も)。
+  やめる関数は同じ行を排他で取ってから確かめる = どちらが先でも「確かめの後に参照が増える」「参照を作った後に取り消す」は起きない (実 PG の試験 [H1〜H4])。数量だけの更新は見ない。
+  夜間ロード (engine.mjs) は、やめた SKU への構成の子・出品の構成・代表を先に飛ばす (skip の理由 `child_cancelled`・`rep_cancelled`・出品の構成) = この守りでロードを止めない
+- 夜間ロードは登録の状態を「行の無い SKU を quarantined」にしかしない = cancelled を戻さない (同じ材料でもう一度流しても = 試験 [L1])
+- 🚨 **当てた後の 3 日 (3 回の毎朝の照合 ②) までは、どの SKU もやめられない** (数えは 0070 の後の記録から貯まる)
+- 画面 = 商品の画面の「NE から消えた (やめる)」(名簿 MASTER_DECISION_APPROVERS の人・MASTER_EDIT_OPEN の後)。CLI = `node -r dotenv/config scripts/company-db/master-gone-from-ne.mjs [--codes a,b | --codes-file f] [--json out]` (確かめだけ・**計画のハッシュ**を出す) →
+  `--apply --expect-hash <計画のハッシュ> --actor <メール> --reason "<理由>" --yes` (🆕 #1683 Codex R1 Medium: 1 つの取引で確かめ直したハッシュと、1 件ずつ DB の関数が返した証拠が計画と全部同じときだけ commit・1 つでも違う / 断られた = 1 件も変えない)
+- 🚨 別の問題 (直していない): `apps/warehouse/rebuild-m-products.js` は raw_ne_products の消えた行も読み続ける (ne-api.js が消えた行を消さない) = 夜間ロードの材料に消えた商品が残る。やめた後も Company DB の SKU の行 (名前・原価など) は夜間ロードが書き続ける (登録の状態は変わらない・構成・出品の構成・代表は上の守りで飛ばす)
+- 当て方 (🚨 まだ流さない): 0069 の後 → `migrate.mjs --dry-run` (0070 だけ) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs` = master_edit・master_ops に実行) → 3 日の照合 ② の後に CLI の dry-run → 中原さんの OK → `--apply --expect-hash`
+- 試験 = `node scripts/test-master-gone.mjs` (PGlite・画面・CLI・Playwright) / `TEST_PG_URL=… node scripts/test-master-gone-pg.mjs` (本物のログイン・照合 ② の記録との競り合い・夜間ロードの鍵・参照を作る道との競り合い・夜間ロードの skip)
+
 ### NE に取り込む CSV (0040。10 §6.1.1「③b NE に取り込む CSV の契約 v3」)
 
 判断の画面で **NE を直す** (fix_ne) と承認した差を、NE の一括登録 (商品管理の一括登録) で取り込む CSV にする。画面 = `/apps/master-decisions/csv` (Render だけ・操作は名簿の人だけ)。

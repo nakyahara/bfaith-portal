@@ -77,6 +77,8 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   //   生の数え (ops.parent_raw_gate = drift-list・要約の読み直し)・門の状態 (ops.parent_gate_state) = watcher が読むだけ
   for (const f of secdefFunctions) if (/^ops\.record_parent_gate\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
   for (const f of secdefFunctions) if (/^ops\.(parent_raw_gate|parent_gate_state)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
+  //   🆕 0070 (NE から消えた商品をやめる): やめてよいかの確かめ (読むだけ) = watcher も読める (動かす関数は渡さない = create-master-edit-roles.mjs の master_edit / master_ops だけ)
+  for (const f of secdefFunctions) if (/^ops\.sku_gone_from_ne_(check|list)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
   //   0058: 保守の印の表は「ops の全部の表」の select から外す (印の UUID を読ませない・G24)
   s.push(`do $$ begin if to_regclass('ops.master_maintenance_marks') is not null then execute 'revoke all on ops.master_maintenance_marks from watcher, watch_writer'; end if; end $$`);
   //   0058 (§3.9 の 3・R16 H1): 「全部の表に GRANT」の後に、配った CSV の byte 列 (ops.ne_reg_exports.file_bytes) を外して列ごとに付け直す (流し直しても戻らない)

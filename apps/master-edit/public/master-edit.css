@@ -957,3 +957,24 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 #deldraft-bg .lab2 { font-size: 13px; color: var(--muted); }
 #deldraft-bg .msgline { margin-top: 8px; }
 @media (max-width: 760px) { .deldraft { flex-wrap: wrap; } .deldraft .btn.ghosty { width: 100%; min-height: 44px; } #deldraft-bg .btn, #deldraft-bg .in { min-height: 44px; } }
+/* 新しい seller SKU の対応を自分で作る入口 (10/11・views/_amazon-create.ejs・amazon-new.ejs・public/me-amazon-new.js) */
+.create-sku .bigsearch.create { border-color: rgba(58, 231, 255, 0.55); background: rgba(58, 231, 255, 0.07); }
+.create-sku .bigsearch.create input { font-family: var(--mono); min-width: 0; }
+.create-out { margin-top: 10px; display: grid; gap: 8px; }
+.create-out:empty { display: none; }
+.create-out > .fmsg { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 14px; }
+.create-out .linkchip, .simlist .linkchip { margin: 0; }
+.simlist { list-style: none; display: grid; gap: 6px; margin: 4px 0 6px; padding: 0; }
+.simlist li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 10px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--line-soft); font-size: 13.5px; min-width: 0; }
+.simlist .nm, .exists-row .nm { color: var(--text2); overflow-wrap: anywhere; min-width: 0; }
+.simlist .mono, .exists-row .code-pill { overflow-wrap: anywhere; }
+.warnlist { list-style: none; display: grid; gap: 4px; margin: 6px 0; padding: 0; font-size: 13.5px; color: var(--warn); }
+.warnlist li { display: flex; gap: 6px; align-items: flex-start; }
+.warnlist .ic { flex: none; margin-top: 2px; }
+.exists-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; min-width: 0; }
+.exists-row .btn { max-width: 100%; white-space: normal; height: auto; min-height: 38px; padding: 6px 15px; text-align: left; }
+.exists-row .btn .mono { overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .create-sku .bigsearch.create { height: auto; flex-wrap: wrap; padding: 8px 12px; }
+  .create-sku .bigsearch.create input { flex-basis: 60%; height: 40px; }
+}
