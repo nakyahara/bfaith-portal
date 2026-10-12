@@ -146,6 +146,8 @@
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
     <% if (c.sku_kind === 'exception') { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">例外の SKU (NE に無い商品) はこの画面では直せません。</div></div><% } %>
     <% if (reg === 'draft' && !page.locks.regExports.length) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">下書きです (新商品の登録)</div><div class="hint">NE・ロジザードへの登録はまだです。値はこの画面で直せます (ロジザードの有効期限・入荷日の管理も、NE 登録の CSV を配るまでは直せます)。NE への登録は「NE 登録の CSV」で行います。</div></div><a class="btn sm" href="<%= base %>/reg-csv">NE 登録の CSV を開く</a></div><% } %>
+    <%# 🆕 0071: 新商品の下書きを消す (下書きのときだけ・DB の確かめの答え = deldraft) %>
+    <%- include('_deldraft', { c }) %>
     <% if (cancelled) { %><div class="callout warn" id="cancelled-band"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">この商品は登録をやめました (やめた)</div><div class="hint">登録をやめた商品は直せません (見るだけです)。使うときは、新しい商品として登録し直してください。</div></div></div><% } %>
     <% if (reg === 'quarantined') { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">要確認</div><div class="hint">切替の後に夜間の処理が NE で見つけた、登録の記録の無い商品です。業務ではまだ使えません。</div></div></div><% } %>
     <% if (page.locks.regExports.length) { %>
@@ -519,7 +521,7 @@
             <% if (page.regItems.length) { %><div class="row"><span class="k">NE 登録の CSV</span><span class="v"><% for (const i of page.regItems) { %><span class="b <%= ['verified'].includes(i.state) ? 'ok' : ['failed', 'superseded'].includes(i.state) ? 'mute' : 'info' %>" style="margin:0 4px 4px 0">ファイル #<%= i.export_id %><%= i.trial ? ' · 試し用' : '' %></span><span class="hint" style="display:block"><%= REG_ITEM_STATES[i.state] || i.state %></span><% } %><a class="hint" href="<%= base %>/reg-csv">NE 登録の CSV を開く →</a></span></div><% } %>
             <% if (page.card) { const cr = page.card.result || {}; %>
             <div class="row"><span class="k">出品カード</span><span class="v">
-              <span class="b <%= page.card.status === 'done' ? 'ok' : page.card.status === 'conflict' || page.card.status === 'failed' ? 'err' : 'warn' %>"><% if (page.card.status === 'done') { %><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg><% } %><%= CARD_STATUS_LABELS[page.card.status] || page.card.status %></span>
+              <% if (page.card.status === 'done' && cr.outcome === 'cancelled') { %><span class="b mute" id="card-cancelled">カードは作らない (下書きを消した)</span><% } else { %><span class="b <%= page.card.status === 'done' ? 'ok' : page.card.status === 'conflict' || page.card.status === 'failed' ? 'err' : 'warn' %>"><% if (page.card.status === 'done') { %><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg><% } %><%= CARD_STATUS_LABELS[page.card.status] || page.card.status %></span><% } %>
               <% if (page.card.status === 'done' && cr.draft_id) { %> <a class="hint" href="/apps/product-hub/detail/<%= cr.draft_id %>">product-hub で開く ↗</a><% } %>
               <% if (page.card.status === 'conflict' && cr.conflict_draft_id) { %> <a class="hint" href="/apps/product-hub/detail/<%= cr.conflict_draft_id %>">同じコードのカード ↗</a><% } %>
               <% if (page.card.status === 'conflict' && cr.ambiguous && Array.isArray(cr.conflict_draft_ids)) { %><% cr.conflict_draft_ids.forEach((d) => { %> <a class="hint" href="/apps/product-hub/detail/<%= d %>">#<%= d %> ↗</a><% }) %><% } %>
@@ -589,6 +591,8 @@
   <%# 🆕 PR-7b: まとまりの操作の窓 (名前を直す・子の廃止・代表の採用) %>
   <% if (page && locals.variationOn && canEdit && !closed) { %><%- include('_vops') %><script src="<%= base %>/public/me-vops.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-sku.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0071: 下書きを消す = 押せる人・押せるときだけ (me-sku.js の後 = 未保存の数を読む) %>
+  <% if (page && typeof deldraft !== 'undefined' && deldraft && deldraft.show && deldraft.canGo && canEdit && !dbError && !closed) { %><script src="<%= base %>/public/me-draft-cancel.js?v=<%= assetV %>" defer></script><% } %>
   <%# me-order.js は me-sku.js の後 (MasterEdit.dirty に発注の設定の未保存を足す) %>
   <% if (page && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
   <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>

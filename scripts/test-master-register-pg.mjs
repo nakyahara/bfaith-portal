@@ -285,8 +285,10 @@ try {
     assert.equal(await codeOf(A, `select ops.transition_sku_registration($1, 'cancelled', 'human', 'x', '理由')`, [d]), '42501');   // 画面は状態を進めない
     assert.equal(await codeOf(P, `select ops.create_sku_registration($1, 'x')`, [d]), '42501');                                    // 運用は下書きを作らない
     assert.equal(await stateOf('race-1'), 'draft');
-    // 運用のロールはやめる (cancelled) だけ
-    await P.query(`select ops.transition_sku_registration($1, 'cancelled', 'human', 'ops@test', '試験でやめる')`, [d]);
+    // 🆕 0071 (Codex #1688 R1 High 1): 運用のロールも下書きを直にはやめられない (下書きを消す・子の廃止の約束の中だけ)。持ち主のロールは通る
+    assert.equal(await codeOf(P, `select ops.transition_sku_registration($1, 'cancelled', 'human', 'ops@test', '試験でやめる')`, [d]), '42501');
+    assert.equal(await stateOf('race-1'), 'draft');
+    await M.query(`select ops.transition_sku_registration($1, 'cancelled', 'human', 'owner@test', '試験でやめる')`, [d]);
     assert.equal(await stateOf('race-1'), 'cancelled');
   });
 

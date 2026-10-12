@@ -2493,3 +2493,22 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **表** `ops.variation_batch_requests` (request_id = まとめての登録・人・要求の全部のハッシュ (lib/master-variation.mjs の `variationPayloadHashOf`)・追記だけ)。**関数** `ops.variation_batch_record_request(request_id, actor, hash)` = この取引で開いた (閉じる前の) まとめての登録・開いた人だけ・1 回だけ書く (security definer・画面のロールに実行だけ・表は読むだけ)。
 - **lib の押し直し**: request の鍵の直後に、保存の記録 done があれば この表のハッシュと照らす = 同じ = 残した答えをすぐ返す (門・許可・持ち主・仕入先・product-hub の下書きは見ない) / 違う = 409 `request_id_reused`。0069 が無い DB の新しい要求 = 503 `db_not_ready`。
 - 当て方 (🚨 まだ流さない): 0068 の後・`migrate.mjs --dry-run` (0069 だけが出る) → 中原さんの OK → 本適用 → ロールの script (`create-master-edit-roles.mjs`) を流し直す。今は何も変わらない (まとめての登録は products.parent が company のときだけ = 今は 0067 の関数が断る)。
+
+### 新商品の下書きを消す (0071・2026-10-11 中原さんの頼み「自社商品 DB で商品を削除できるようにしたい」の場面 a。🚨 番号 = 0070 (#1683) の後。#1683 より先にマージするなら 0070 に振り直す)
+- **なぜ**: 新商品の登録で作った下書き (入れ間違い・発売中止) を消す道が無かった。下書きで NE 登録の CSV を一度も配っていない商品は、NE・ロジザード・モールにまだ何も無い = 消しても外に何も起きない
+- **「消す」= 物理の削除はしない。登録の状態を cancelled (やめた) にして画面の一覧から隠す**。理由: 登録の状態の行・履歴・保存の記録・約束・変更の記録・カードの知らせ・NE 登録の CSV の品目は どれも「消さない」の守り (DELETE の trigger・追記だけ・外部キー) がある = SKU の行を消すには守りを外して監査を消すことになる。
+  cancelled は 0067 の子の廃止・0070 の NE から消えた と同じ = 読み手 (新しいセットの構成品・NE 登録の CSV・まとまりのスナップショット・0070 の参照の守り・画面の保存) は前から「使わない」と扱う。
+  🚨 **消したコードはもう使えない** (SKU の行が残る = `ops.new_sku_code_problem` の code_taken・0067 / 0070 と同じ「やめたコードは使い回さない」)。値の入れ間違いは消さずに直す
+- **確かめ** `ops.sku_draft_cancel_check(sku_id)` (読むだけ・master_edit / watcher): 会社 1・登録の状態が draft・**NE 登録の CSV を一度も配っていない** (`ops.sku_ever_issued`)・NE に一度も現れていない (`ops.ne_code_seen`)・まとまりの子でない (= 子の廃止 `ops.cancel_variation_child` の道)・ほかの商品の親でない・ほかのセットの構成品 / 開いている構成の依頼 / 販路の出品の構成 (削除済みの出品も) に無い・カードの知らせを取り込み中でない。
+  ne_pending は CSV を配って申告した後にしか来ない (0063) = いつも「一度配った」= 消さない。片付けの見込み (cleanup) も返す
+- **消す** `ops.cancel_sku_draft(request_id, 人, 理由, sku_id)` (security definer・master_edit = 画面の lib `lib/master-draft-cancel.mjs`): 鍵 (段階 → マスタの書き込み (共有) → SKU → CSV → NE のコード (共有) → **登録の状態の行 (排他)** → SKU・商品の行 → カードの知らせの行) → 段階 new_open・持ち主表 = DB の active → 確かめ → 約束 (操作 `sku_draft_cancel`) →
+  ① 作っただけ (built) の NE 登録の CSV を使わない (ファイル closed・同じファイルのほかの商品は作り直し) ② セットの下書き自身の構成の依頼を取り下げ ③ 商品の有効な JAN を外す (正しいコードで登録し直すときの jan_taken を避ける) ④ まだ取り込んでいないカードの知らせ = done・結果 `outcome: cancelled` (もう借りない・見張りの数に入らない) ⑤ 登録の状態 draft → cancelled (0052 の地図に前からある・`ops.transition_sku_registration` = 下の High 1 の守りがこの約束の中だけ通す) ⑥ 保存の記録 done。押し直し = 前の答え。
+  残す物: SKU・商品・原価・仕入先 (記録)・発注の設定 (Render の SQLite = 発注アプリは NE にある商品だけを計算)。
+  product-hub のカード (SQLite) は画面が Postgres の取引の前に読む (`liveCdbCardsForSku`): この SKU に結んだ / 同じコードのカードで除外していないものが 1 枚でもある = 409 `card_exists` (人が先に product-hub で除外する = 出品済み・出品中・RMS の実行中を人が確かめる)・読めない = 503 (消さない)。自動の除外はしない (Codex #1688 R1 High 2・3)。
+  🚨 受け入れ: カードの取り込みの借り (120 秒) が切れた後もまだ SQLite に書いている、のまれな競りだけは閉じない = 消した後にカードが出たら product-hub で除外 (人の手順)
+- 🆕 Codex #1688 R1 High 1: `ops.transition_sku_registration` (0070 の版から写して 🆕 0071 の行だけ足した) = 下書き・NE 登録待ち → cancelled は 約束 `sku_draft_cancel` / `variation_child_cancel` の中だけ (同じ SKU・人・request_id)。master_ops が直に呼ぶと `draft_cancel_session_required` (42501)。表の持ち主のロールとそのメンバーは求めない
+- ロジザード: ロジザードの商品マスタへ出す CSV (`scripts/company-db/lz-daily.mjs`) は NE の取得の商品だけを回す (`apps/master-decisions/lz-cdb.mjs` の `classifyForLz`) = NE に配る前の下書きは出さない。手でロジザードに登録する道は人の決まり
+- 守りの写し: `ops.master_write_allowed` (0067 の版 + 6 行 = CSV の 2 表・構成の依頼・JAN・JAN を外したときの SKU / 商品の version)・`core.guard_master_edit_jan` (0053 の版 + 約束 `sku_draft_cancel` の UPDATE だけ)・約束の操作の CHECK (0070 の版 + `sku_draft_cancel`)
+- 画面 = 商品の画面の「この下書きを消す」(名簿 MASTER_EDITORS の人 = 下書きを作れる人と同じ・MASTER_EDIT_OPEN の後)。一覧はやめた商品をふだん出さない (札「やめた商品」・商品コードでぴったり探すと出る)
+- 当て方 (🚨 まだ流さない): 0070 の後 → `migrate.mjs --dry-run` (0071 だけ) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs` = master_edit に 2 つの関数の実行・`create-watch-roles.mjs` = watcher に確かめ)。流さなくても今の動きは変わらない (画面は確かめを読めない = 何も出さない)
+- 試験 = `node scripts/test-master-draft-cancel.mjs` (PGlite・画面・product-hub の SQLite・Playwright) / `TEST_PG_URL=… node scripts/test-master-draft-cancel-pg.mjs` (本物のログイン・CSV を配る / セットの登録 / カードの取り込み / 押し直し / 夜間ロード / 0070 の参照の守りとの競り合い)

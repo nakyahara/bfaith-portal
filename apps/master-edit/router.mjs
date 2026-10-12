@@ -29,6 +29,8 @@
  *   POST /api/variation/groups/:id/labels  まとまりの名前・軸の名前・選択肢名を直す { request_id, seen_revision, changes: { name?, axes?, options? }, reason? } (社内だけ・NE に送らない)
  *   POST /api/sku/:code/variation-cancel   まとまりの子の廃止 { request_id, reason } (下書き / NE 登録待ち・生きているファイルなし・NE に一度も現れていない子だけ)
  *   POST /api/sku/:code/adopt-parent       NE で直接作られた商品 (quarantined) の代表を NE から 1 回だけ採用 { request_id, reason? }
+ *   POST /api/sku/:code/draft-cancel       🆕 0071: 新商品の下書き (NE に一度も配っていない) を消す = 登録をやめた { request_id, reason, confirm: true } (名簿 MASTER_EDITORS の人・
+ *                                          lib/master-draft-cancel.mjs)。Postgres の前に product-hub のカード (SQLite) を読み、除外していないカードがあれば 409 card_exists
  *   GET  /api/code-check?code= 新しい商品コードを確かめる (形 + Company DB・NE・使ったことがあるか)
  *   POST /api/new            新商品の登録 { request_id, kind, code, reason?, values: {...}, card: {...} } (lib/master-register.mjs)。
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
@@ -75,6 +77,7 @@ import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } f
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
+import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
@@ -251,6 +254,22 @@ async function linkCard(ev, opts) {
   const m = await import('../product-hub/services/cdb-card-intake.js');
   return m.linkCdbCardToExisting(ev, opts);
 }
+/**
+ * 🆕 0071 (Codex #1688 R1 High 2・3): 下書きを消す前に product-hub のカード (Render の SQLite・同じプロセス) を読む = 除外していないカード [{ draft_id, status, ne_code, linked }]。
+ *   本番 = cdb-card-intake.js の liveCdbCardsForSku。読めない = throw (消さない)。試験は差し替える
+ */
+let liveCardsReader = null;
+export function __setLiveCardsReader(fn) { liveCardsReader = fn || null; }
+async function liveCards(input) {
+  if (liveCardsReader) return liveCardsReader(input);
+  const m = await import('../product-hub/services/cdb-card-intake.js');
+  return m.liveCdbCardsForSku(input);
+}
+/** カードの見せ方 (画面・断るときの文)。読めない = { error } */
+async function liveCardsSafe(input) {
+  try { return { cards: await liveCards(input) }; } catch (e) { return { error: String((e && e.message) || e).slice(0, 200) }; }
+}
+const cardExistsWords = (cards) => `product-hub に除外していない出品カード (${cards.map((c) => '#' + c.draft_id).join('・')}) があります。先に product-hub でカードを確かめて「除外」にしてから消してください (出品済み・出品中ならこの下書きは消さない)。何もしていません`;
 /** 知らせを 1 つ取り込む (保存の直後・「もう一度」)。誤りは投げない (画面に「カード作成待ち」を出す) */
 async function tryCard(db, { eventId = null, skuId = null, manual = false }) {
   try {
@@ -724,6 +743,9 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     orderSettings: page && page.cur.sku_kind === 'single' ? orderScreen(req, editorGate(req), page.cur.code, { supplier: page.cur.primary_supplier || null }) : null,
     // 🆕 PR-7b: まとまりの名前を直す・子の廃止・quarantined の代表の採用のボタン (products.parent が company のときだけ。決めるのは DB)
     variationOn: variationOn(owner),
+    // 🆕 0071: 下書きだけ「この下書きを消す」の確かめを読む (DB の ops.sku_draft_cancel_check・読めない = 出さない)。押せるのは名簿 MASTER_EDITORS の人
+    deldraft: page && page.cur.registration && page.cur.registration.state === 'draft'
+      ? draftCancelView(await readDraftCancelCheck(db, page.cur.sku_id), await liveCardsSafe({ skuId: page.cur.sku_id, code: page.cur.code })) : null,
   });
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -810,6 +832,30 @@ router.post('/api/sku/:code/variation-cancel', (req, res) => variationWrite(req,
 router.post('/api/sku/:code/adopt-parent', (req, res) => variationWrite(req, res, (db, actor, b) => adoptNeParent(db, {
   actor, requestId: b.request_id, reason: b.reason ?? null, code: req.params.code,
 }, { open: isOpen() })));
+
+/**
+ * 🆕 0071: 新商品の下書き (NE に一度も配っていない) を消す = 登録をやめた { request_id, reason, confirm: true }。名簿 MASTER_EDITORS の人 (下書きを作れる人と同じ =
+ *   NE にまだ配っていない = 作るのと同じ重さ)・この画面だけのロールで・MASTER_EDIT_OPEN の後だけ。
+ *   ① product-hub のカード (SQLite) を先に読む: 除外していないカードが 1 枚でもある = 409 card_exists (人が先に除外する)・読めない = 503 (消さない)
+ *   ② 条件 (下書き・一度も配っていない・NE に現れていない・どこにも使われていない・カードの取り込み中でない) と片付け
+ *      (作っただけの CSV・構成の依頼・JAN・まだカードになっていない知らせ) は DB の関数が鍵の後に (lib/master-draft-cancel.mjs)。
+ *   🚨 取り込みの借り (120 秒) が切れた後もまだ SQLite に書いている、のまれな競りだけは閉じない (受け入れ = 消した後にカードが出たら product-hub で除外)
+ */
+router.post('/api/sku/:code/draft-cancel', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  const actor = String(req.session.email).trim().toLowerCase();
+  return withPgApi(res, async (db) => {
+    const sku = (await db.query('select sku_id::text as id, code from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(req.params.code || '')])).rows[0];
+    if (sku) {
+      const lc = await liveCardsSafe({ skuId: sku.id, code: sku.code });
+      if (lc.error) return res.status(503).json({ ok: false, reason: 'card_unreadable', error: `product-hub のカードを読めないので、消していません (${lc.error})。少し待ってからもう一度` });
+      if (lc.cards.length) return res.status(409).json({ ok: false, reason: 'card_exists', error: cardExistsWords(lc.cards), cards: lc.cards });
+    }
+    res.json(await cancelSkuDraft(db, { actor, code: req.params.code, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen(), requireConfirm: true }));
+  }, 'write');
+});
 
 /**
  * 商品の画面の「発注の設定を保存」(発注アプリに書く。Company DB の保存とは別)。
