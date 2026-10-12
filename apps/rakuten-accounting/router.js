@@ -355,7 +355,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
     for (const r of allRows) {
       // 月をゼロ埋め (例 2026/3 → 2026-03)
       const m = String(r.注文確定日時 || '').match(/(\d{4})\D+(\d{1,2})/);
-      if (!m) continue;
+      if (!m || +m[2] < 1 || +m[2] > 12) continue;
       const ym = `${m[1]}-${String(parseInt(m[2], 10)).padStart(2, '0')}`;
       monthCounts[ym] = (monthCounts[ym] || 0) + 1;
     }
@@ -543,7 +543,7 @@ router.post('/upload-billing', upload.single('file'), (req, res) => {
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
   const { yearMonth, totalRows, resolvedCount, unresolvedCount,
-    byTax, bySegment, excluded, mfRow, adCost, billing, pfFee } = req.body;
+    byTax, bySegment, excluded, mfRow, adCost, billing, pfFee, overwrite } = req.body;
 
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
   // 集計月は画面で選び直せるため形式を確かめる（YYYY-MM 以外で保存すると管理会計の月と結びつかない）
@@ -553,21 +553,34 @@ router.post('/confirm', (req, res) => {
 
   try {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-    // pf_fee = 請求合計(税込) − 広告費 − クーポン値引（mgmt-accounting の PF手数料として直結）
-    db.prepare(`INSERT OR REPLACE INTO mart_rakuten_monthly_summary
-      (year_month, total_rows, resolved_count, unresolved_count,
-       by_tax, by_segment, excluded, mf_row, ad_cost, billing, pf_fee, confirmed_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    `).run(
-      yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0,
-      JSON.stringify(byTax), JSON.stringify(bySegment), JSON.stringify(excluded),
-      JSON.stringify(mfRow), adCost || 0, JSON.stringify(billing || {}), Math.max(0, Math.round(pfFee || 0)), now
-    );
+    // 確定済みの月は overwrite: true のときだけ上書きする（月の選び間違い・別タブでの確定を黙って消さない）。
+    // 有無の確認と保存は同じトランザクションで行う
+    const existing = db.transaction(() => {
+      const row = db.prepare('SELECT confirmed_at FROM mart_rakuten_monthly_summary WHERE year_month = ?').get(yearMonth);
+      if (row && overwrite !== true) return row;
+      // pf_fee = 請求合計(税込) − 広告費 − クーポン値引（mgmt-accounting の PF手数料として直結）
+      db.prepare(`INSERT OR REPLACE INTO mart_rakuten_monthly_summary
+        (year_month, total_rows, resolved_count, unresolved_count,
+         by_tax, by_segment, excluded, mf_row, ad_cost, billing, pf_fee, confirmed_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(
+        yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0,
+        JSON.stringify(byTax), JSON.stringify(bySegment), JSON.stringify(excluded),
+        JSON.stringify(mfRow), adCost || 0, JSON.stringify(billing || {}), Math.max(0, Math.round(pfFee || 0)), now
+      );
 
-    db.prepare(`INSERT INTO mart_rakuten_upload_log
-      (year_month, total_rows, resolved_count, unresolved_count, uploaded_at)
-      VALUES (?,?,?,?,?)
-    `).run(yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0, now);
+      db.prepare(`INSERT INTO mart_rakuten_upload_log
+        (year_month, total_rows, resolved_count, unresolved_count, uploaded_at)
+        VALUES (?,?,?,?,?)
+      `).run(yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0, now);
+      return null;
+    }).immediate();
+    if (existing) {
+      return res.status(409).json({
+        error: yearMonth + ' はすでに確定済みです（' + (existing.confirmed_at || '') + '）',
+        conflict: true, yearMonth, confirmed_at: existing.confirmed_at || null,
+      });
+    }
 
     res.json({ ok: true, yearMonth, confirmed_at: now });
   } catch (e) {
@@ -1356,12 +1369,15 @@ function renderPage() {
       btn.disabled = true;
       btn.textContent = '保存中...';
       try {
+        const ym = lastData.yearMonth;
         const adCost = getAdCostFromBilling();
-        const r = await fetchWithRetry(location.pathname + '/confirm', {
+        // 確定済みの月はサーバが 409 で止める → 上書きしてよいか聞いてから overwrite: true で送り直す
+        const send = overwrite => fetchWithRetry(location.pathname + '/confirm', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            yearMonth: lastData.yearMonth,
+            yearMonth: ym,
+            overwrite,
             totalRows: lastData.totalRows,
             resolvedCount: lastData.resolvedCount,
             unresolvedCount: lastData.unresolvedProducts?.length || 0,
@@ -1374,9 +1390,18 @@ function renderPage() {
             pfFee: getBillingTotals() ? getBillingTotals().pfFee : 0,
           }),
         });
-        const result = await r.json();
+        let r = await send(historyMonths.includes(ym));
+        let result = await r.json();
+        if (r.status === 409 && result.conflict) {
+          if (confirm('⚠️ ' + ym + ' はすでに確定済みです（' + (result.confirmed_at || '') + '）。\\n前の確定データを上書きしますか？')) {
+            r = await send(true);
+            result = await r.json();
+          } else {
+            result = { error: ym + ' は確定済みのため保存しませんでした' };
+          }
+        }
         if (result.ok) {
-          document.getElementById('confirmStatus').innerHTML = '<span style="color:#27ae60">OK ' + lastData.yearMonth + ' 確定済（' + result.confirmed_at + '）</span>';
+          document.getElementById('confirmStatus').innerHTML = '<span style="color:#27ae60">OK ' + ym + ' 確定済（' + result.confirmed_at + '）</span>';
           loadHistory();
         } else {
           document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + (result.error || '') + '</span>';
@@ -1539,6 +1564,7 @@ function renderPage() {
     // ─── 明細データCSVダウンロード ───
     function downloadDetailCsv() {
       if (!lastData || !lastData.detailRows) { alert('先に注文データCSVをアップロードしてください'); return; }
+      if (!isYearMonth(lastData.yearMonth)) { alert('「集計概要」の集計月欄で集計月を選んでください'); return; }
       const rows = lastData.detailRows;
       let csv = '\\uFEFF';
       csv += '注文番号,注文確定日時,商品コード,商品名,単価,個数,売上合計,按分クーポン,クーポン値引後売上,原価,原価合計,税率,セグメント\\n';
@@ -1556,6 +1582,7 @@ function renderPage() {
     // ─── 集計サマリーCSVダウンロード ───
     function downloadSummaryCsv() {
       if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
+      if (!isYearMonth(lastData.yearMonth)) { alert('「集計概要」の集計月欄で集計月を選んでください'); return; }
       const data = lastData;
       let csv = '\\uFEFF';
 
