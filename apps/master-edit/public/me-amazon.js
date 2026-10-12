@@ -346,6 +346,8 @@
   if (sug && rowsEl && canSave) {
     rowsEl.addEventListener('input', function (e) {
       if (!e.target.classList.contains('c-code')) return;
+      // 手でコードを変えた = 候補から選んだ印は捨てる (同じコードを打ち直しても、使えるかを確かめて名前を入れる・#1692 Codex R1 Medium)
+      var row = e.target.closest('tr'); if (row) row.__picked = null;
       staleSug(e.target);   // 変換中も、値が変わった時点で古い候補は選べなくする
       if (!e.isComposing) queueSug(e.target);
     });

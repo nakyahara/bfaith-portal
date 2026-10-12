@@ -2183,6 +2183,17 @@ await ta('[58] Amazon SKU の名前 (社内) が空なら NE の商品名を入�
     await p.fill('#name', '  \u3000 ');
     await pickRow('k005', 'k005');
     assert.equal(await p.inputValue('#name'), (await row('k005')).name, '空白だけは空と同じ');
+    // 候補から選んだ後に、名前を空にしてコードを手で変え、同じコードをぴったり打ち直す = 入る (選んだ印は手で変えたら捨てる・#1692 Codex R1 Medium)
+    const again = rows.last().locator('.c-code');
+    await p.fill('#name', '');
+    await again.fill('zzzz-none');
+    await again.press('Tab');
+    await p.waitForFunction(() => /見つかりません|ありません/.test([...document.querySelectorAll('#comp-rows .c-name')].pop().textContent));
+    assert.equal(await p.inputValue('#name'), '', '無いコードでは入らない');
+    await again.fill('k005');
+    await again.press('Tab');
+    await p.waitForFunction(() => document.getElementById('name').value !== '', null, { timeout: 5000 });
+    assert.equal(await p.inputValue('#name'), (await row('k005')).name, '同じコードを打ち直しても入る');
     await p.click('#revert');
     // 使えない商品 = 灰色を押しても・コードをぴったり打っても入らない
     await p.click('#comp-add');
