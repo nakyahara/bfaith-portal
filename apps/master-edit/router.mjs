@@ -50,7 +50,7 @@
  *   GET  /api/amazon/check?sku=  同じ確かめ (読むだけ・打つとその場で)
  *   GET  /amazon/sku?sku=    1 つの seller SKU (見る・直す・墓標にする・墓標から戻す)。対応が無ければ「新しい対応」(今の構成は夜間ロードの写しとして見せる)
  *   GET  /amazon/sku/history?sku=  変更の記録 (対応・構成・出品)
- *   GET  /amazon/unmapped    未登録 = 直近 7 日に売れたのに構成が無い seller SKU (FBA / FBM で分ける・売上の公開が欠けた日は「未判定」)
+ *   GET  /amazon/unmapped    未登録 = 直近 7 日に売れたのに構成が無い FBA の seller SKU (自社発送は出さない・区分が分からない SKU は別の一言・売上の公開が欠けた日は「未判定」)
  *   POST /api/amazon/save    保存 { request_id, seller_sku, name, components: [{ code, qty }], reason?, seen: { versions } } (lib/amazon-map-write.mjs)
  *   POST /api/amazon/delete  墓標にする { request_id, seller_sku, reason, seen: { versions } }
  *   NE 登録の CSV (⑤-2b・0053・lib/master-reg-csv.mjs。作る・配る・申告・使わない・実機の確かめは MASTER_DECISION_APPROVERS の名簿の人だけ = マスタの判断の CSV と同じ):
@@ -938,17 +938,16 @@ router.get('/amazon', (req, res) => {
     // 「売れたのに対応が無い SKU」(未登録の画面と同じ読み方・読むだけ)。絞り込みの無い最初の画面だけ (検索・ページ送りのたびには読まない)
     const landing = !filters.q && !filters.state && !filters.offset;
     // 読めない = 札を出さないだけ (一覧は出す)
-    const unmapped = db && landing && !data.tableMissing ? await amazonUnmapped(db, { now: new Date(clock()), channel: '', channels }).catch((e) => { console.error(`[master-edit] 未登録の要約を読めない: ${e && e.message}`); return null; }) : null;
+    const unmapped = db && landing && !data.tableMissing ? await amazonUnmapped(db, { now: new Date(clock()), channels }).catch((e) => { console.error(`[master-edit] 未登録の要約を読めない: ${e && e.message}`); return null; }) : null;
     res.render(view('amazon-index.ejs'), { ...pageLocals(req, phase), nav: 'amazon', listPage: true, dbError, data, filters, MAP_STATES, CHANNELS, unmapped, UNMAPPED_DAYS });
   });
 });
+// FBA だけ (自社発送は 商品コード = Amazon SKU = 対応が要らない・10/12)。区分の引数 (?channel=) は捨てる
 router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbError) => {
-  const want = String(req.query.channel ?? 'FBA');
-  const channel = ['FBA', 'FBM'].includes(want) ? want : '';
   const channels = db ? await amazonChannelsProvider() : null;
-  const data = db ? await amazonUnmapped(db, { now: new Date(clock()), channel, channels }) : null;
+  const data = db ? await amazonUnmapped(db, { now: new Date(clock()), channels }) : null;
   const phase = await readPhaseView(db);
-  res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, channel, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
+  res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
 }));
 // まだつないでいない Amazon の SKU (Amazon の出品一覧にあって構成が無い・隠す / 元に戻す。10/12・amazon-unlinked.mjs)
 registerAmazonUnlinkedRoutes(router, { withPgPage, withPgApi, pageLocals, editorGate, view, readPhaseView, clock: () => clock() });

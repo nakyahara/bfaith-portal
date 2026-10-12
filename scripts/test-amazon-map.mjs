@@ -1034,10 +1034,34 @@ await ta('[12] 未登録 (M11): 直近 7 日の Amazon の注文で構成が無�
   assert.equal(r.status, 200); await checkScripts(r.text, 0);
   assert.ok(r.text.includes('未判定'));   // 売上の日次が公開されていない
   assert.ok(r.text.includes('zz_sold') && !r.text.includes('zz_fbm') && !r.text.includes('zz_old'));
-  r = await call('GET', '/amazon/unmapped?channel=FBM');
-  assert.ok(r.text.includes('zz_fbm') && !r.text.includes('zz_sold'));
-  r = await call('GET', '/amazon/unmapped?channel=all');
-  assert.ok(r.text.includes('zz_sold') && r.text.includes('zz_fbm') && r.text.includes('削除済み (墓標)'));
+  // 🚨 10/12 中原さん: 自社発送 (FBM) は出さない (商品コード = Amazon SKU = 対応が要らない)。区分の引数 (?channel=) は捨てる = どの引数でも FBA だけ
+  for (const ch of ['FBM', 'all', 'fbm']) {
+    r = await call('GET', '/amazon/unmapped?channel=' + ch);
+    assert.ok(r.text.includes('zz_sold') && !r.text.includes('zz_fbm'), ch);
+  }
+  assert.ok(!/\?channel=/.test(r.text) && !r.text.includes('chip-lab">区分'), '区分の切り替えが無い');
+  // 区分が分からない SKU (墓標の pr_pack2 = 手数料の写しにも出品一覧にも無い) は一覧と件数に入れず、下の一言で出す (黙って隠さない)
+  assert.ok(r.text.includes('id="unmapped-unknown"') && r.text.includes('sku?sku=pr_pack2'));
+  assert.ok(r.text.includes('<b style="color:var(--text)">1</b> 件 (FBA)'), '件数も FBA だけ');
+  {
+    const page = await call('GET', '/amazon/');
+    assert.ok(page.text.includes('売れたのに対応が無い SKU (FBA) — 1 件') && page.text.includes('href="unmapped">全部見る') && !page.text.includes('zz_fbm'));
+  }
+  // 手数料の写しが読めない = Amazon の出品一覧 (0076) の区分で補う / どちらも読めない = 出せない (0 件と言わない)
+  const RU = await import('../apps/master-edit/amazon-read.mjs');
+  __setAmazonChannelsProvider(async () => null);
+  try {
+    r = await call('GET', '/amazon/unmapped');
+    assert.ok(r.text.includes('id="unmapped-undecidable"') && !r.text.includes('zz_sold') && r.text.includes('読めないので出せません'));
+    const page = await call('GET', '/amazon/');
+    assert.ok(page.text.includes('売れたのに対応が無い SKU (FBA) — 区分を読めない'));
+    const I = await import('../apps/company-db/ingest/amazon-listings.mjs');
+    const rowsR = ['zz_sold', 'zz_fbm'].map((s, i) => I.listingRowOf({ seller_sku: s, item_name: s, asin: null, open_date: null, open_date_raw: null, fulfillment: i ? 'FBM' : 'FBA', channel_raw: i ? 'DEFAULT' : 'AMAZON_JP', status: 'active', status_raw: 'Active', quantity: null, price: null }));
+    const gen = Date.now() - 3600e3;
+    assert.equal((await I.ingestAmazonListings(db, { shop_code: I.SHOP_CODE, generation: gen, snapshot_at: new Date(gen).toISOString(), report_run_id: 'r_um', checksum: I.listingChecksum(rowsR), row_count: 2, skipped_count: 0, rows: rowsR })).status, 'applied');
+    const d = await asRole(E, 'master_edit', () => RU.amazonUnmapped(db, { now: new Date('2030-01-10T03:00:00Z'), channels: null }));
+    assert.deepEqual([d.decidable, d.rows.map((x) => x.code), d.unknown.map((x) => x.code)], [true, ['zz_sold'], ['pr_pack2']], '出品一覧の区分で補う (自社発送は出さない)');
+  } finally { __setAmazonChannelsProvider(async () => new Map([['pr_a001', 'FBA'], ['a003', 'FBM'], ['zz_sold', 'FBA'], ['zz_fbm', 'FBM']])); }
   const rows = (await q(`select code, units::int as units, orders::int as orders, map_state from ops.amazon_map_unmapped_recent('2030-01-10', 7) order by code`));
   assert.deepEqual(rows.map((x) => [x.code, x.units, x.orders, x.map_state]), [['pr_pack2', 1, 1, 'deleted'], ['zz_fbm', 4, 1, null], ['zz_sold', 5, 3, null]]);
   assert.ok(!r.text.includes('zz_cancel') && !r.text.includes('zz_hdr'));

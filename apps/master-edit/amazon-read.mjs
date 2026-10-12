@@ -3,7 +3,7 @@
  * (Company DB構想 16 §2「画面」・§3 #9・§7 v2 M11 / L12。PR ⑦-1)
  *
  * FBA / FBM は Company DB に列を作らない (16 §3 #9) = 画面が Render の mirror_amazon_sku_fees (SQLite) の fulfillment_channel を読む (router の channelProvider)
- * 「未登録」= 直近 7 日の Amazon の注文で、出品が無い・出品に構成が無い seller SKU (ops.amazon_map_unmapped_recent)。
+ * 「未登録」= 直近 7 日の Amazon の注文で、出品が無い・出品に構成が無い FBA の seller SKU (ops.amazon_map_unmapped_recent。自社発送は出さない・10/12)。
  *   売上の日次の公開がそろっていない日があれば「未判定」(0 件と言わない = M11)
  */
 import { normSku } from '../../lib/sku-norm.js';
@@ -11,6 +11,7 @@ import { foldSearch, foldSql, likeOf } from './search-fold.mjs';
 import { COMPANY_ID, jstDate, MasterWriteError } from '../../lib/master-write.mjs';
 import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage, MAP_STATES, AMAZON_JP_SHOP_CODE, AMAZON_SKU_MAX_LEN } from '../../lib/amazon-map-write.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
+import { readReportLoad } from './amazon-unlinked.mjs';
 
 export { AMAZON_SKU_MAX_LEN };
 
@@ -102,18 +103,36 @@ export async function amazonHistory(db, sellerSku) {
 }
 
 /**
- * 未登録 (M11): 直近 UNMAPPED_DAYS 日の Amazon の注文で、出品が無い・出品に構成が無い seller SKU。channel = 'FBA' / 'FBM' / '' (全部)。
+ * 未登録 (M11): 直近 UNMAPPED_DAYS 日の Amazon の注文で、出品が無い・出品に構成が無い **FBA の** seller SKU。
+ * 🚨 自社発送 (FBM) は出さない・数えない (中原さん 10/12「自社発送は 商品コード = Amazon SKU なので対応が要らない」)。区分の切り替えも無い。
+ *   区分 = Render の手数料の写し (mirror_amazon_sku_fees・channels) → 無ければ Company DB の Amazon の出品一覧 (0076 の ops.amazon_listing_report の今の姿)。
+ *   どちらにも無い SKU = 区分が分からない = 一覧と件数には入れず unknown に分けて返す (画面は別の一言で出す = 黙って隠さない)。
+ *   区分の出どころが両方とも読めない = decidable: false (画面は「区分を読めないので出せない (0 件ではない)」)
  * 売上の日次の公開がそろっていない日があれば undecided = その日の一覧 (画面は「未判定」)
  */
-export async function amazonUnmapped(db, { now = new Date(), channel = 'FBA', channels = null } = {}) {
+export async function amazonUnmapped(db, { now = new Date(), channels = null } = {}) {
   const today = jstDate(now);
-  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], today, undecided: [], tableMissing: true, channel, channelsAvailable: !!channels };
+  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], unknown: [], today, undecided: [], tableMissing: true, channelsAvailable: !!channels, decidable: !!channels };
   const missing = (await db.query('select ops.amazon_map_sales_coverage($1::date, $2) as d', [today, UNMAPPED_DAYS])).rows[0].d || [];
   const all = (await db.query('select code, listing_id::text as listing_id, map_state, units::int as units, orders::int as orders, last_date::text as last_date from ops.amazon_map_unmapped_recent($1::date, $2) order by units desc, code',
     [today, UNMAPPED_DAYS])).rows;
-  for (const r of all) r.channel = channels ? (channels.get(normSku(r.code)) ?? null) : null;
-  const rows = channel && channels ? all.filter((r) => r.channel === channel) : all;
-  return { rows, total_all: all.length, today, undecided: missing.map(dateOnly), tableMissing: false, channel, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID };
+  // 手数料の写しに無い SKU は、Amazon の出品一覧の区分で補う (読めない = 補わない)
+  let report = null;
+  const need = all.filter((r) => !(channels && channels.get(normSku(r.code)))).map((r) => r.code);
+  if (need.length) {
+    const head = await readReportLoad(db, { nowMs: now.getTime() });
+    if (head.state === 'ok') {
+      try {
+        report = new Map((await db.query(`select sku_norm, fulfillment from ops.amazon_listing_report where company_id = $1 and shop_code = $2 and load_id = $3::bigint
+            and sku_norm = any(select core.norm_code(x) from unnest($4::text[]) as t(x)) and fulfillment is not null`, [COMPANY_ID, AMAZON_JP_SHOP_CODE, head.load.load_id, need])).rows.map((x) => [x.sku_norm, x.fulfillment]));
+      } catch (e) { console.error(`[master-edit] 未登録の区分 (出品一覧) を読めない: ${e && e.message}`); report = null; }
+    }
+  }
+  for (const r of all) r.channel = (channels && channels.get(normSku(r.code))) || (report && report.get(normSku(r.code))) || null;
+  const decidable = !!channels || !!report;
+  const rows = decidable ? all.filter((r) => r.channel === 'FBA') : [];
+  const unknown = all.filter((r) => !r.channel);
+  return { rows, unknown, today, undecided: missing.map(dateOnly), tableMissing: false, channelsAvailable: !!channels, decidable, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID };
 }
 
 // ─── 新しい seller SKU の対応を自分で作る入口 (10/11 中原さん「売れてから作るしかない」→ まだ売れていない SKU も先に作れる) ───

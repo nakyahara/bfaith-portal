@@ -1,7 +1,9 @@
 /**
  * amazon-unlinked.mjs — マスタ入力画面の「Amazon の出品一覧」を読むもの (2026-10-12 中原さん):
  *   ① seller SKU の画面に「Amazon の出品一覧では」(Amazon の商品名・ASIN・出品日・FBA / 自社・状態) を出す (readAmazonReportFor)
- *   ② 新しい入口「まだつないでいない Amazon の SKU」= Amazon の出品一覧にあるのに、Company DB の出品に構成 (NE の商品 × 数) が無い seller SKU (listUnlinked)
+ *   ② 新しい入口「まだつないでいない Amazon の SKU」= Amazon の出品一覧にあるのに、Company DB の出品に構成 (NE の商品 × 数) が無い **FBA の** seller SKU (listUnlinked)。
+ *      🚨 自社発送 (FBM) は出さない・数えない (中原さん 10/12「自社発送はそもそも 商品コード = Amazon SKU だから不要」)。区分の切り替えも無い (URL の ch は捨てる)。
+ *      区分が分からない行 (列が無い・知らない値) も FBA と言い切れないので出さない。① の seller SKU の画面は自社発送も出す
  *   ③ いらない SKU (バリエーションの親・使っていない古い SKU) を一覧から「隠す」/ 元に戻す (setHidden = ops.set_amazon_sku_hidden。表示だけ・Amazon にも対応にも触らない)
  *
  * 読み元 = Company DB の ops.amazon_listing_report (migration 0076 (仮の番号))。毎朝の daily-sync の「Company DB 出品一覧 (Amazon)」が、
@@ -26,7 +28,6 @@ export const SOLD_LOOKBACK_DAYS = 365;
 export const REPORT_STALE_MS = 36 * 3600e3;
 export const HIDE_REASONS = Object.freeze({ variation_parent: 'バリエーションの親', unused: '使っていない・古い SKU', other: 'その他' });
 export const LISTING_STATUS_WORDS = Object.freeze({ active: '出品中', inactive: '停止中', incomplete: '情報が足りない', unknown: '分からない' });
-export const CHANNEL_WORDS = Object.freeze({ FBA: 'FBA', FBM: '自社発送' });
 export const SORTS = Object.freeze({ open_desc: '出品日の新しい順', open_asc: '出品日の古い順', sold_desc: '最後に売れた日の新しい順', sku: 'seller SKU の順' });
 export const NOTE_MAX = 200;
 const TS = (col) => `to_char((${col}) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
@@ -83,10 +84,9 @@ export async function readAmazonReportFor(db, sellerSku, { nowMs = Date.now() } 
 }
 const rowOut = (r) => ({ ...r, quantity: r.quantity == null ? null : Number(r.quantity) });
 
-/** 一覧の絞り込み (知らない値は捨てる・既定 = FBA・状態は全部・出品日の新しい順) */
+/** 一覧の絞り込み (知らない値は捨てる・状態は全部・出品日の新しい順が既定)。区分 (ch) は無い = いつも FBA だけ */
 export function normalizeUnlinkedFilters(q = {}, { today = null } = {}) {
   const str = (v) => (typeof v === 'string' ? v : '');
-  const ch = ['FBA', 'FBM', 'all'].includes(str(q.ch)) ? str(q.ch) : 'FBA';
   const st = ['all', 'active', 'inactive'].includes(str(q.st)) ? str(q.st) : 'all';
   const sort = Object.hasOwn(SORTS, str(q.sort)) ? str(q.sort) : 'open_desc';
   let from = realDate(str(q.from)) ? str(q.from) : '';
@@ -96,7 +96,7 @@ export function normalizeUnlinkedFilters(q = {}, { today = null } = {}) {
   if (!from && !to && today && [30, 90, 365].includes(days)) from = addDays(today, -(days - 1));
   if (from && to && from > to) [from, to] = [to, from];
   const offset = Math.max(0, Math.min(1e6, Number.parseInt(str(q.offset), 10) || 0));
-  return { q: str(q.q).trim().slice(0, 100), ch, st, sort, from, to, hidden: str(q.hidden) === '1' ? '1' : '', offset };
+  return { q: str(q.q).trim().slice(0, 100), st, sort, from, to, hidden: str(q.hidden) === '1' ? '1' : '', offset };
 }
 
 const cmpStr = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -117,7 +117,7 @@ export function sortUnlinked(rows, sort) {
 
 /**
  * 「まだつないでいない Amazon の SKU」。filters = normalizeUnlinkedFilters の形。
- * 戻り値 = { state: 'ok', load, stale, rows (このページ), total (絞り込みの後), offset, limit, filters, counts: { report, linked, unlinked, hidden, fba, fbm }, sold: { ok, since }, fba: readFbaDay の答え }
+ * 戻り値 = { state: 'ok', load, stale, rows (このページ), total (絞り込みの後), offset, limit, filters, counts: { report (FBA の行), linked, unlinked, hidden }, sold: { ok, since }, fba: readFbaDay の答え }
  *   / { state: 'unreadable', reason, message, filters }
  */
 export async function listUnlinked(db, filters, { nowMs = Date.now() } = {}) {
@@ -130,19 +130,18 @@ export async function listUnlinked(db, filters, { nowMs = Date.now() } = {}) {
       left join core.listings l on l.company_id = r.company_id and l.mall = 'amazon' and l.shop_code = r.shop_code and l.listing_norm = r.sku_norm
       left join core.amazon_sku_maps m on m.listing_id = l.listing_id
       left join ops.amazon_sku_hidden h on h.company_id = r.company_id and h.shop_code = r.shop_code and h.sku_norm = r.sku_norm
-     where r.company_id = $1 and r.shop_code = $2 and r.load_id = $3::bigint
+     where r.company_id = $1 and r.shop_code = $2 and r.load_id = $3::bigint and r.fulfillment = 'FBA'
        and not exists (select 1 from core.listing_components c where c.listing_id = l.listing_id)`,
   [COMPANY_ID, AMAZON_JP_SHOP_CODE, head.load.load_id])).rows.map(rowOut);
   const hiddenCount = all.filter((r) => r.hidden_reason).length;
-  const counts = { report: head.load.row_count, unlinked: all.length - hiddenCount, hidden: hiddenCount, linked: Math.max(0, head.load.row_count - all.length) };
+  // 数も FBA だけ (自社発送は出品一覧の件数にも入れない)
+  const fbaRows = Number((await db.query(`select count(*)::int as n from ops.amazon_listing_report where company_id = $1 and shop_code = $2 and load_id = $3::bigint and fulfillment = 'FBA'`, [COMPANY_ID, AMAZON_JP_SHOP_CODE, head.load.load_id])).rows[0].n);
+  const counts = { report: fbaRows, unlinked: all.length - hiddenCount, hidden: hiddenCount, linked: Math.max(0, fbaRows - all.length) };
   const base = all.filter((r) => (filters.hidden ? !!r.hidden_reason : !r.hidden_reason));
-  counts.fba = base.filter((r) => r.fulfillment === 'FBA').length;
-  counts.fbm = base.filter((r) => r.fulfillment === 'FBM').length;
   const skuQ = filters.q ? normSku(filters.q) : '';
   const nameQ = filters.q ? foldSearch(filters.q) : '';
   const asinQ = filters.q ? filters.q.toUpperCase() : '';
   let rows = base.filter((r) => {
-    if (filters.ch !== 'all' && r.fulfillment !== filters.ch) return false;
     if (filters.st === 'active' && r.status !== 'active') return false;
     if (filters.st === 'inactive' && r.status === 'active') return false;
     if ((filters.from || filters.to) && !r.open_date) return false;
@@ -237,7 +236,7 @@ export function registerAmazonUnlinkedRoutes(router, h) {
     const locals = h.pageLocals(req, phase);
     res.render(h.view('amazon-unlinked.ejs'), {
       ...locals, nav: 'amazon', dbError, data, filters: data && data.filters ? data.filters : filters,
-      canHide: locals.canEdit && !dbError, HIDE_REASONS, LISTING_STATUS_WORDS, CHANNEL_WORDS, SORTS, SOLD_LOOKBACK_DAYS, NOTE_MAX,
+      canHide: locals.canEdit && !dbError, HIDE_REASONS, LISTING_STATUS_WORDS, SORTS, SOLD_LOOKBACK_DAYS, NOTE_MAX,
     });
   }));
   router.post('/api/amazon/unlinked/hide', (req, res) => {

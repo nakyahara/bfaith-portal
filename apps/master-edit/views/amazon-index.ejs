@@ -19,7 +19,8 @@
     const um = unmapped && !unmapped.tableMissing ? unmapped : null;
     const umRows = um ? um.rows.slice(0, 5) : [];
     // 札の色: 対応の無い SKU がある = 赤 / 未判定の日がある = 黄 (0 件と言い切れない) / どちらも無い = 緑
-    const umTone = !um ? '' : um.rows.length ? 'err' : um.undecided.length ? 'warn' : 'ok';
+    // FBA だけ (自社発送は 商品コード = Amazon SKU = 対応が要らない・10/12)。区分を読めない = 黄 (0 件と言い切れない)
+    const umTone = !um ? '' : um.rows.length ? 'err' : (um.undecided.length || !um.decidable) ? 'warn' : 'ok';
     const TONE = { err: ['', 'i-warn', 'color:var(--err);border-color:rgba(255,112,133,.45);background:var(--err-bg)'], warn: [' warnc', 'i-info', 'color:var(--warn);border-color:rgba(255,200,87,.45);background:var(--warn-bg)'], ok: [' calm', 'i-check', 'color:var(--ok);border-color:rgba(46,230,168,.45);background:var(--ok-bg)'] };
     const chLabel = (ch) => (ch ? (CHANNELS[ch] || ch) : '—');
     // 新しい seller SKU の対応を自分で作る入口 (10/11) = 保存できる人・保存を開いているときだけ (保存の門と同じ。保存は作る画面の POST /api/amazon/save が確かめ直す)
@@ -49,9 +50,9 @@
     <section class="panel todo-card<%= TONE[umTone][0] %>" aria-labelledby="h-um">
       <div class="panel-h">
         <span class="hico" aria-hidden="true" style="<%= TONE[umTone][2] %>"><svg class="ic"><use href="#<%= TONE[umTone][1] %>"/></svg></span>
-        <h2 id="h-um">売れたのに対応が無い SKU — <%= um.rows.length %> 件</h2>
+        <h2 id="h-um">売れたのに対応が無い SKU (FBA) — <%= um.decidable ? um.rows.length + ' 件' : '区分を読めない' %></h2>
         <span class="sub">直近 <%= UNMAPPED_DAYS %> 日 · このままだと売上の日次で商品に分けられません</span>
-        <span class="right"><a class="btn sm" href="unmapped?channel=all">全部見る<svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg></a></span>
+        <span class="right"><a class="btn sm" href="unmapped">全部見る<svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg></a></span>
       </div>
       <% if (um.undecided.length) { %><div class="callout warn" style="margin-bottom:12px"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">売上の日次がまだ公開されていない日があります (<%= um.undecided.map((d) => ui.fmtDay(d, um.today)).join('・') %>)。その日の注文が入っていない = 「0 件」とは言い切れません (未判定)。</div></div><% } %>
       <% if (umRows.length) { %>
@@ -64,7 +65,8 @@
       <% } %>
       </ul>
       <% if (um.rows.length > umRows.length) { %><div class="hint" style="margin-top:4px">ほか <%= um.rows.length - umRows.length %> 件は「全部見る」で。</div><% } %>
-      <% } else { %><div class="hint"><%= um.undecided.length ? '分かっている日の分では、対応の無い SKU はありません。' : '直近に売れた seller SKU は、全部 対応があります。' %></div><% } %>
+      <% } else { %><div class="hint"><%= !um.decidable ? 'FBA か自社発送かを読めないので出せません (0 件ではありません)。' : um.undecided.length ? '分かっている日の分では、対応の無い FBA の SKU はありません。' : '直近に売れた FBA の seller SKU は、全部 対応があります。' %></div><% } %>
+      <% if (um.decidable && um.unknown.length) { %><div class="hint" style="margin-top:4px">FBA か自社発送かが分からない SKU が <%= um.unknown.length %> 件あります (「全部見る」の下に出ます)。</div><% } %>
     </section>
     <% } %>
 

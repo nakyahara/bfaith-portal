@@ -448,7 +448,7 @@ const list = (q = {}) => asEdit(() => U.listUnlinked(db, U.normalizeUnlinkedFilt
 await ta('「つないでいる」= 出品に構成がある (切替の前の SKU マスタの構成も) = 出さない / 既定 = FBA・出品日の新しい順 (出品日の無い行は後ろ)・数・最後に売れた日・FBA の在庫', async () => {
   const r = await list();
   assert.equal(r.state, 'ok'); assert.equal(r.stale, false);
-  assert.deepEqual(r.counts, { report: 6, unlinked: 5, hidden: 0, linked: 1, fba: 4, fbm: 1 });
+  assert.deepEqual(r.counts, { report: 5, unlinked: 4, hidden: 0, linked: 1 }, '数も FBA だけ (自社発送 fbm_1 は数えない)');
   assert.deepEqual(r.rows.map((x) => x.seller_sku), ['fba_new1', 'PR_NOCOMP', 'parent_1', 'fba_old']);
   const by = Object.fromEntries(r.rows.map((x) => [x.seller_sku, x]));
   assert.equal(by.PR_NOCOMP.listing_id !== null, true, '出品はある (構成なし)');
@@ -463,13 +463,18 @@ await ta('「つないでいる」= 出品に構成がある (切替の前の SK
 });
 await ta('絞り込み: 区分 (自社発送・全部)・状態 (出品中だけ・停止中)・出品日 (直近 30 日・範囲)・言葉 (SKU・商品名のかな・ASIN) / 並び (古い順・最後に売れた日・SKU)', async () => {
   const skus = async (q) => (await list(q)).rows.map((x) => x.seller_sku);
-  assert.deepEqual(await skus({ ch: 'FBM' }), ['fbm_1']);
-  assert.deepEqual(await skus({ ch: 'all' }), ['fba_new1', 'PR_NOCOMP', 'parent_1', 'fbm_1', 'fba_old']);
+  // 🚨 一覧は FBA だけ (中原さん 10/12: 自社発送は 商品コード = Amazon SKU)。区分の引数 (ch) は捨てる = 自社発送は どの引数でも出ない・言葉でも出ない
+  for (const ch of ['FBM', 'fbm', 'all', 'x']) assert.deepEqual(await skus({ ch }), ['fba_new1', 'PR_NOCOMP', 'parent_1', 'fba_old'], ch);
+  assert.deepEqual(await skus({ q: '自社' }), []);
+  assert.deepEqual(await skus({ q: 'fbm_1', sort: 'sku' }), []);
+  // 区分が分からない行 (列が無い・知らない値) も FBA と言い切れないので出さない
+  await pg.query("update ops.amazon_listing_report set fulfillment = null where seller_sku = 'fba_old'");
+  try { assert.deepEqual(await skus({}), ['fba_new1', 'PR_NOCOMP', 'parent_1']); } finally { await pg.query("update ops.amazon_listing_report set fulfillment = 'FBA' where seller_sku = 'fba_old'"); }
   assert.deepEqual(await skus({ st: 'active' }), ['PR_NOCOMP']);
   assert.deepEqual(await skus({ st: 'inactive' }), ['fba_new1', 'parent_1', 'fba_old']);
   assert.deepEqual(await skus({ days: '30' }), ['fba_new1', 'PR_NOCOMP']);
-  assert.deepEqual(await skus({ ch: 'all', from: F.addDays(TODAY, -61), to: F.addDays(TODAY, -21) }), ['parent_1', 'fbm_1']);
-  assert.deepEqual(await skus({ ch: 'all', from: F.addDays(TODAY, -21), to: F.addDays(TODAY, -61) }), ['parent_1', 'fbm_1'], 'from と to が逆でも');
+  assert.deepEqual(await skus({ from: F.addDays(TODAY, -61), to: F.addDays(TODAY, -21) }), ['parent_1'], '自社発送 (60 日前) は範囲の中でも出ない');
+  assert.deepEqual(await skus({ from: F.addDays(TODAY, -21), to: F.addDays(TODAY, -61) }), ['parent_1'], 'from と to が逆でも');
   assert.deepEqual(await skus({ q: 'はちみつ' }), ['PR_NOCOMP'], 'ひらがなで カタカナ の商品名');
   assert.deepEqual(await skus({ q: 'ＦＢＡ＿ＯＬＤ' }), ['fba_old'], '全角の SKU');
   assert.deepEqual(await skus({ q: 'b00000a003' }), ['fba_new1'], 'ASIN');
@@ -477,7 +482,7 @@ await ta('絞り込み: 区分 (自社発送・全部)・状態 (出品中だけ
   assert.deepEqual(await skus({ sort: 'sold_desc' }), ['PR_NOCOMP', 'fba_new1', 'fba_old', 'parent_1'], '売れていない行は後ろ (SKU の順)');
   assert.deepEqual(await skus({ sort: 'sku' }), ['PR_NOCOMP', 'fba_new1', 'fba_old', 'parent_1']);
   // 知らない値は捨てる
-  assert.deepEqual(U.normalizeUnlinkedFilters({ ch: 'x', st: 'y', sort: 'z', from: '2026-02-30', offset: '-5', hidden: 'yes' }), { q: '', ch: 'FBA', st: 'all', sort: 'open_desc', from: '', to: '', hidden: '', offset: 0 });
+  assert.deepEqual(U.normalizeUnlinkedFilters({ ch: 'x', st: 'y', sort: 'z', from: '2026-02-30', offset: '-5', hidden: 'yes' }), { q: '', st: 'all', sort: 'open_desc', from: '', to: '', hidden: '', offset: 0 });
 });
 await ta('seller SKU の画面: ある = 行 (正規化で同じ SKU)・無い = absent・古い (36 時間より前) = stale', async () => {
   let r = await asEdit(() => U.readAmazonReportFor(db, 'pr_nocomp', { nowMs: NOW }));
@@ -526,7 +531,7 @@ await ta('隠す → same → 一覧から外れて「隠した SKU」に出る 
   assert.equal(r.status, 'same', '正規化で同じ SKU'); assert.equal(r.reason, 'variation_parent');
   let l = await list();
   assert.deepEqual(l.rows.map((x) => x.seller_sku), ['fba_new1', 'PR_NOCOMP', 'fba_old']);
-  assert.equal(l.counts.hidden, 1); assert.equal(l.counts.unlinked, 4);
+  assert.equal(l.counts.hidden, 1); assert.equal(l.counts.unlinked, 3);
   l = await list({ hidden: '1' });
   assert.deepEqual(l.rows.map((x) => [x.seller_sku, x.hidden_reason, x.hidden_by]), [['parent_1', 'variation_parent', 'naka@test']]);
   await assert.rejects(hide({ seller_sku: 'no_such', hide: true, reason: 'unused' }), (e) => e instanceof MasterWriteError && e.status === 404);
@@ -609,9 +614,13 @@ await ta('一覧の画面: 行・商品名・入口のリンク・隠すのボ�
   assert.ok(r.text.includes('data-act="hide"') && r.text.includes('id="hide-bg"'));
   assert.ok(r.text.indexOf('data-sku="fba_new1"') < r.text.indexOf('data-sku="PR_NOCOMP"'), '出品日の新しい順');
   assert.ok(r.text.includes('7 個'), 'FBA の在庫');
-  r = await call('GET', '/amazon/unlinked?ch=FBM');
-  assert.ok(r.text.includes('data-sku="fbm_1"') && !r.text.includes('data-sku="fba_new1"'));
-  assert.ok(r.text.includes('1,280 円'));
+  // 区分の切り替えは無い・URL で ch=FBM / fbm / all が来ても FBA だけ (自社発送 fbm_1 = 1,280 円 は出ない)
+  assert.ok(!r.text.includes('>区分<') && !/[?&;]ch=/.test(r.text), '区分の札・引数が無い');
+  for (const ch of ['FBM', 'fbm', 'all']) {
+    r = await call('GET', '/amazon/unlinked?ch=' + ch);
+    assert.ok(!r.text.includes('data-sku="fbm_1"') && r.text.includes('data-sku="fba_new1"') && !r.text.includes('1,280 円'), ch);
+  }
+  assert.ok(r.text.includes('FBA の出品一覧 5 件'), '件数も FBA だけ');
   r = await call('GET', '/amazon/unlinked?q=%3Cscript%3E');
   assert.ok(!r.text.includes('<script>alert') && r.text.includes('value="&lt;script&gt;"'), '言葉はエスケープ');
   r = await call('GET', '/amazon/unlinked', { session: 'viewer' });

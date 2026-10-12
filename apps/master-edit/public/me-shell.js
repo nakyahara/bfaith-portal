@@ -167,7 +167,7 @@
     { ico: 'i-box', t: '新しいセットを登録する', go: BASE + '/new?kind=set' },
     { ico: 'i-send', t: 'NE 登録の CSV を開く', go: BASE + '/reg-csv' },
     { ico: 'i-cart', t: 'Amazon SKU の対応の一覧', go: BASE + '/amazon/' },
-    { ico: 'i-cart', t: '売れたのに対応が無い Amazon SKU', go: BASE + '/amazon/unmapped' },
+    { ico: 'i-cart', t: '売れたのに対応が無い Amazon SKU (FBA)', go: BASE + '/amazon/unmapped' },
     { ico: 'i-scale', t: 'マスタの判断 (NE との差)', go: '/apps/master-decisions/' },
     { ico: 'i-book', t: 'つかいかた', go: BASE + '/manual' }
   ];

@@ -95,7 +95,7 @@ try {
     const M = await open('master_edit'); clients.push(M);
     const mdb = pgAdapter(M);
     const l = await U.listUnlinked(mdb, U.normalizeUnlinkedFilters({ ch: 'all' }, { today: TODAY }), { nowMs: NOW });
-    assert.equal(l.state, 'ok'); assert.deepEqual(l.rows.map((r) => r.seller_sku).sort(), ['PR_NOCOMP', 'fba_new1', 'fba_old', 'fbm_1', 'parent_1']);
+    assert.equal(l.state, 'ok'); assert.deepEqual(l.rows.map((r) => r.seller_sku).sort(), ['PR_NOCOMP', 'fba_new1', 'fba_old', 'parent_1'], 'FBA だけ (自社発送 fbm_1 は出ない)');
     assert.equal(l.sold.ok, true);
     const r = await U.setHidden(mdb, { actor: 'naka@test', seller_sku: 'fba_old', hide: true, reason: 'unused', note: null });
     assert.equal(r.status, 'hidden');
@@ -176,15 +176,15 @@ try {
     assert.equal(await hidden('fba_new1'), 0);
     // ② 隠すが先 (取引を開けたまま) → 保存は鍵で待つ → 隠すの commit の後に最後まで。つないだ SKU は一覧から消える (隠す印が残っても表示だけ)
     await M3.query('begin');
-    assert.equal((await M3.query(`select ops.set_amazon_sku_hidden('c@test', 'fbm_1', true, 'unused', null) as r`)).rows[0].r.status, 'hidden');
-    const s2 = launch(save(pgAdapter(EA), 'fbm_1'));
+    assert.equal((await M3.query(`select ops.set_amazon_sku_hidden('c@test', 'fba_old', true, 'unused', null) as r`)).rows[0].r.status, 'hidden');
+    const s2 = launch(save(pgAdapter(EA), 'fba_old'));
     await sleep(700);
     assert.equal(s2.done, false, '保存は隠すと同じ SKU の鍵で待つ');
     await M3.query('commit');
     const r2 = await s2.promise;
     assert.ok(r2.ok, r2.err?.message);
-    const l = await U.listUnlinked(pgAdapter(M2), U.normalizeUnlinkedFilters({ ch: 'all', hidden: '1' }, { today: TODAY }), { nowMs: NOW });
-    assert.ok(!l.rows.some((r) => r.seller_sku === 'fbm_1'), 'つないだ SKU は「隠した SKU」にも出ない');
+    const l = await U.listUnlinked(pgAdapter(M2), U.normalizeUnlinkedFilters({ hidden: '1' }, { today: TODAY }), { nowMs: NOW });
+    assert.ok(!l.rows.some((r) => r.seller_sku === 'fba_old'), 'つないだ SKU は「隠した SKU」にも出ない');
     // ③ もうつないでいる SKU を直に隠そうとしても断る
     await assert.rejects(M2.query(`select ops.set_amazon_sku_hidden('d@test', 'fba_new1', true, 'unused', null)`), (e) => e.code === 'P0001' && /^linked: /.test(e.message));
   });
@@ -206,9 +206,9 @@ try {
     const msR = Date.now() - t;
     const M = await open('master_edit'); clients.push(M);
     t = Date.now();
-    const l = await U.listUnlinked(pgAdapter(M), U.normalizeUnlinkedFilters({ ch: 'all', sort: 'sold_desc' }, { today: TODAY }), { nowMs: NOW });
+    const l = await U.listUnlinked(pgAdapter(M), U.normalizeUnlinkedFilters({ sort: 'sold_desc' }, { today: TODAY }), { nowMs: NOW });
     const msL = Date.now() - t;
-    assert.equal(l.state, 'ok'); assert.equal(l.total, 8000); assert.equal(l.rows.length, U.UNLINKED_PAGE);
+    assert.equal(l.state, 'ok'); assert.equal(l.total, 4000, '自社発送 (半分) は出さない'); assert.equal(l.rows.length, U.UNLINKED_PAGE);
     assert.ok(msL < 5000, `一覧 ${msL} ms`);
     console.log(`      (入れ替え ${ms} ms・refreshed ${msR} ms・一覧の読み ${msL} ms・送る中身 ${(bytes / 1048576).toFixed(2)} MB)`);
   });
