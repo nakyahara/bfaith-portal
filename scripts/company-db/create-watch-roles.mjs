@@ -287,8 +287,11 @@ export async function createRoles(client, { watcherPw, writerPw, rotate = false,
   // 🚨 #1696 Codex R1 L1: 「あるか」の確かめから作る / そろえるまでを 1 つの取引にし、advisory lock で同時の実行を 1 本ずつにする
   //    (確かめと作るの間に別の実行がロールを作ると、無いと思って ALTER ROLE … PASSWORD を流し、もうあるロールのパスワードを変えてしまう)。
   //    鍵の外で作られた場合 (人の手など) も、作るロールは素の create role = 42710 で取り消す (roleStatements の mustCreate)
-  if (!dryRun) { await client.query('begin'); await client.query('select pg_advisory_xact_lock(hashtext($1))', [ROLES_LOCK_NAME]); }
+  //    🚨 #1696 Codex R2 Medium: begin と鍵の取得も try の中 (鍵の待ちの取り消し・statement_timeout (57014)・権限のエラーでも rollback する =
+  //    export の createRoles() の呼び手に失敗中の取引を残さない)。began は begin を送る前に立てる (begin 自体の失敗でも rollback を試す = 取引の外なら警告だけ)
+  let began = false;
   try {
+    if (!dryRun) { began = true; await client.query('begin'); await client.query('select pg_advisory_xact_lock(hashtext($1))', [ROLES_LOCK_NAME]); }
     const existing = await existingWatchRoles(client);
     const given = { watcher: watcherPw, watch_writer: writerPw };
     const pw = {};
@@ -324,7 +327,7 @@ export async function createRoles(client, { watcherPw, writerPw, rotate = false,
     if (bad.length) throw new Error(`ロールの属性が期待と違う (取り消した): ${bad.join(' ; ')}`);
     await client.query('commit');
     return { info, secdef, stmts, roles, pw, created };
-  } catch (e) { if (!dryRun) { try { await client.query('rollback'); } catch { /* */ } } throw e; }
+  } catch (e) { if (began) { try { await client.query('rollback'); } catch { /* */ } } throw e; }
 }
 
 const isMain = process.argv[1] && /create-watch-roles\.mjs$/i.test(process.argv[1]);

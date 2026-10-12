@@ -1659,6 +1659,27 @@ await t('🚨 10/12 の事故: 既定 (パスワードを渡さない) = 無い�
     assert.equal((await pg4.query(`select rolpassword is null as n from pg_authid where rolname = 'watch_writer'`)).rows[0].n, true, '既定の実行はパスワードを付けていない');
   } finally { await pg4.close(); }
 });
+await t('🚨 #1696 Codex R2: begin の後の鍵の取得・ロールの確かめで失敗しても rollback する (呼び手の接続に失敗中の取引を残さない = 次の文が 25P02 にならない)', async () => {
+  // 鍵の取得 (pg_advisory_xact_lock) / ロールの確かめ (pg_roles) を、本当に失敗する文 (0 で割る = 22012) に差し替える = PGlite の取引は本当に失敗中になる
+  for (const [label, re] of [['鍵の取得', /pg_advisory_xact_lock/], ['ロールの確かめ', /rolcanlogin/]]) {
+    const log = [];
+    const c = { query: (sql, p) => { log.push(sql); if (re.test(sql)) return pg.query('select 1/0'); return pg.query(sql, p); } };
+    await assert.rejects(createRoles(c, {}), (e) => /division by zero/.test(e.message), label);
+    const iBegin = log.indexOf('begin'), iFail = log.findIndex((x) => re.test(x));
+    assert.ok(iBegin >= 0 && iFail > iBegin && log.slice(iFail + 1).includes('rollback'), `${label}: ${log.slice(-3).join(' | ')}`);
+    assert.deepEqual((await pg.query('select 1 as n')).rows, [{ n: 1 }], `${label}: 接続が使える (失敗中の取引が残っていない)`);
+  }
+  // begin そのものが失敗しても rollback を試す (取引の外なら警告だけ)
+  const log2 = [];
+  const c2 = { query: (sql, p) => { log2.push(sql); if (sql === 'begin') { const e = new Error('begin failed'); e.code = '08006'; throw e; } return pg.query(sql, p); } };
+  await assert.rejects(createRoles(c2, {}), /begin failed/);
+  assert.equal(log2[log2.length - 1], 'rollback');
+  // dry-run は取引を始めない = rollback も送らない
+  const log3 = [];
+  const c3 = { query: (sql, p) => { log3.push(sql); if (/rolcanlogin/.test(sql)) return pg.query('select 1/0'); return pg.query(sql, p); } };
+  await assert.rejects(createRoles(c3, { dryRun: true }), /division by zero/);
+  assert.ok(!log3.includes('begin') && !log3.includes('rollback'), log3.join(' | '));
+});
 await t('CLI の引数: 知らない引数 (--rotate-password の打ち間違いなど) は流さずに止める・--verify は単独', () => {
   const run = (...a) => spawnSync(process.execPath, [path.join(root, 'scripts', 'company-db', 'create-watch-roles.mjs'), ...a], { encoding: 'utf8', timeout: 30000, env: { ...process.env, COMPANY_DB_URL: 'postgres://nobody:x@127.0.0.1:1/none' } });
   const a = run('--rotate-password');

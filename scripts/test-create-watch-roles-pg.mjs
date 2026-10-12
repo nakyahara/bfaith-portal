@@ -15,6 +15,7 @@
  *   9 (#1696 Codex R1 M2) .env の URL が別の DB (同じ作りの古い DB) を指している = 入れても exit 1 (既定・--verify とも)。パスワードは出さない
  *  10 (#1696 Codex R1 L1) 同時に 2 本: 後の方は advisory lock で待ち「もうある」と見てパスワードを変えない /
  *     確かめの後に鍵の外で作られた = 素の create role が 42710 で取り消す (そのロールのパスワードは変えない)
+ *  11 (#1696 Codex R2) 鍵の待ちが statement_timeout (57014) で打ち切られた = rollback して、呼び手の接続は取引の外・次の文が通る
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-create-watch-roles-pg.mjs
  *   (cd C:/tmp/pg-embed && node run-watchroles.mjs scripts/test-create-watch-roles-pg.mjs C:/tmp/watchroles-work)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール watcher / watch_writer / 実行者も作って消す)。localhost 以外の URL は拒む。package.json の test:company-db には入れない
@@ -258,6 +259,23 @@ try {
       assert.equal(await login(urlFor(dbUrl, 'watcher', `by-hand-${tag}`)), 'ok', '人が付けたパスワードのまま');
       assert.equal(Number((await admin.query(`select count(*)::int as n from pg_roles where rolname = 'watch_writer'`)).rows[0].n), 0, '取り消した = watch_writer も作っていない');
     } finally { await C0.end(); }
+  });
+  await ta('[11] 🚨 鍵の待ちが statement_timeout (57014) で打ち切られた = createRoles は rollback する (呼び手の接続は取引の外・次の文が通る)・鍵を放せば同じ接続で流せる', async () => {
+    await dropWatchRoles(['watcher', 'watch_writer']);   // [10] で superuser が作った watcher は deploy には alter できない (PG16+) = 消してから
+    const H = await openPgClient(deployUrl), D = await openPgClient(deployUrl);
+    try {
+      await H.query('begin');
+      await H.query('select pg_advisory_xact_lock(hashtext($1))', [ROLES_LOCK_NAME]);   // ほかの実行が鍵を持っている
+      await D.query(`set statement_timeout = '500ms'`);
+      await assert.rejects(createRoles(D, {}), (e) => e.code === '57014');
+      assert.deepEqual((await D.query('select 1 as n')).rows, [{ n: 1 }], '失敗中の取引 (25P02) が残っていない');
+      const st = (await admin.query(`select state from pg_stat_activity where pid = $1`, [D.processID])).rows[0];
+      assert.equal(st && st.state, 'idle', `取引の外 (${st && st.state})`);
+      await H.query('rollback');
+      await D.query('reset statement_timeout');
+      const r = await createRoles(D, {});
+      assert.equal(r.roles.length, 2);
+    } finally { try { await H.query('rollback'); } catch { /* */ } await H.end(); await D.end(); }
   });
 } finally {
   try {
