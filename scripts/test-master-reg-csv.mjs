@@ -777,7 +777,13 @@ await ta('[C11] 実機の確かめの門: 試し用は 5 行まで・ok は試�
   const notDone = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'products' and close_reason = 'superseded' order by export_id desc limit 1")).id;
   await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok' }, opts())), 400);
   await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: notDone }, opts())), 409, 'export_mismatch');
-  await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'products', result: 'ok', exportId: notDone }, opts())), 409, 'not_verified');
+  // 🆕 #1699 Codex R1 Medium: 単品 (v2) のファイル = 門の無い版 = 今の版・今の見出しでも断る (画面にボタンが無いのと同じ)。商品が全部確かめ済みか (not_verified) は門のある版 (セット) で
+  assert.equal((await expOf(notDone)).schema_version, 'ne-reg-single-v2');
+  const eNg = await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'products', result: 'ok', exportId: notDone }, opts())), 409, 'export_mismatch');
+  assert.equal(eNg.extra.why, 'no_gate');
+  const setNotDone = (await one("select e.export_id::text as id from ops.ne_reg_exports e where e.kind = 'sets' and exists (select 1 from ops.ne_reg_export_items i where i.export_id = e.export_id and i.state <> 'verified') order by e.export_id desc limit 1"))?.id;
+  assert.ok(setNotDone, '商品がまだ全部は確かめ済みでないセットのファイル');
+  await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: setNotDone }, opts())), 409, 'not_verified');
   await as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: setExp, note: '中原さんと実機で' }, opts()));
   assert.equal(await G.regFormatVerified(db, G.REG_SCHEMAS.sets), true);
   assert.equal(await G.regFormatVerified(db, G.REG_SCHEMAS.products), true, '単品 (v2) = [C7] の翌朝の確かめが記録だけ残した (種類ごと)');
@@ -2394,6 +2400,21 @@ try {
     // API (画面のボタンと同じ道) = 引退した版は今までどおり 409 export_mismatch・文は画面と同じ
     const a = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'products', result: 'ok', export_id: v1.export_id, request_id: uuid() } });
     assert.deepEqual([a.status, a.j.reason, a.j.why, a.j.error], [409, 'export_mismatch', 'retired', v1.verify.message]);
+    // 🆕 #1699 Codex R1 Medium: 門の無い版 (single-v2・variation-v1) の試し用のファイルも、API に直に ok / ng を送ると 409 export_mismatch (画面と同じ理由)・何も記録しない
+    const nRec = (await q('select 1 from ops.ne_csv_verified')).length;
+    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1']) {
+      const want = done.find((e) => e.export_id === ids[k]).verify.message;
+      for (const result of ['ok', 'ng']) {
+        const x = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'products', result, export_id: ids[k], request_id: uuid() } });
+        assert.deepEqual([x.status, x.j.reason, x.j.why, x.j.error], [409, 'export_mismatch', 'no_gate', want], `${k} ${result}`);
+      }
+    }
+    assert.equal((await q('select 1 from ops.ne_csv_verified')).length, nRec, '何も記録しない');
+    // 門のある版 (セット) = 今までどおり通る (ok = 記録が 1 行)
+    const xs = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'sets', result: 'ok', export_id: set.export_id, request_id: uuid() } });
+    assert.equal(xs.status, 200, xs.text);
+    const rs = await one("select converter_version, result, reg_export_id::text as x from ops.ne_csv_verified order by verified_id desc limit 1");
+    assert.deepEqual([rs.converter_version, rs.result, rs.x], ['ne-reg-set-v1', 'ok', set.export_id]);
     const a2 = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'products', result: 'ng', export_id: String(V1_ISSUED.export_id), request_id: uuid() } });
     assert.deepEqual([a2.status, a2.j.reason, a2.j.why], [409, 'export_mismatch', 'retired'], '本物の v1 のファイル ([V5]) も');
   });
