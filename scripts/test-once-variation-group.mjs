@@ -45,10 +45,15 @@ const { pg, db, q, one, asRole } = T;
 await T.W2.setActiveOwnershipInDb(pg, { ...T.ALL_COMPANY, 'products.parent': 'load' });
 const KIDS = [['fuwear-bk', 'ブラック'], ['fuwear-nd', 'ヌード'], ['fuwear-wh', 'ホワイト']];
 const SMHC = [['smhc-bkg', 'ブラックG'], ['smhc-bks', 'ブラックS']];
+// サンリオのトレパン: NE の代表の書き方 = sanrio3souPK (大文字混じり)・夜間ロードの札 = sanrio3soupk (本番と同じ)。sku_id の順 = 100 → 90 → 95
+const SAN = [['sanrio3soupk-100', '100サイズ'], ['sanrio3soupk-90', '90サイズ'], ['sanrio3soupk-95', '95サイズ']];
+const SAN_REP_NE = 'sanrio3souPK';
 const extra = [...KIDS.map(([c, n]) => skuOf(c, `機能性肌着の補修シート 薄地【${n}】`, { representativeCode: 'fuwear', representativeState: 'value', standardPriceJpy: 598 })),
-  ...SMHC.map(([c, n]) => skuOf(c, `ショルダー【${n}】`, { representativeCode: 'smhc', representativeState: 'value' }))];
+  ...SMHC.map(([c, n]) => skuOf(c, `ショルダー【${n}】`, { representativeCode: 'smhc', representativeState: 'value' })),
+  ...SAN.map(([c, n]) => skuOf(c, `トレパン 3層【マイメロ・キティ】【${n}】`, { representativeCode: 'sanrio3soupk', representativeState: 'value' }))];
 const GROUPS = [{ code: 'fuwear', name: '機能性肌着の補修シート 薄地', childCodes: KIDS.map(([c]) => c), status: 'active' },
-  { code: 'smhc', name: 'ショルダー', childCodes: SMHC.map(([c]) => c), status: 'active' }];
+  { code: 'smhc', name: 'ショルダー', childCodes: SMHC.map(([c]) => c), status: 'active' },
+  { code: 'sanrio3soupk', name: 'トレパン 3層', childCodes: SAN.map(([c]) => c), status: 'active' }];
 const lr = await runInitialLoad(db, basePlan(extra, GROUPS), { log: quiet, runId: 'load_once_vg', now: new Date(Date.now() - 2 * 86400e3) });
 assert.equal(lr.ok, true, lr.error);
 // 照合 ② の NE のコードの台帳 (0041): 子は NE の書き方 fuwear-BK・代表 fuwear / smhc
@@ -58,8 +63,10 @@ const prev = await q('select code_norm, kind, state, ne_code from ops.master_ne_
 const neSpell = (c) => (c.startsWith('fuwear-') ? `fuwear-${c.slice(7).toUpperCase()}` : c);
 await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: RUN2, entries: [
   ...prev.map((x) => ({ code_norm: x.code_norm, kind: x.kind, state: x.state, ne_code: x.ne_code, spellings: [x.ne_code] })),
-  ...[...KIDS, ...SMHC].map(([c]) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: neSpell(c), spellings: [neSpell(c)] })),
-  { code_norm: 'fuwear', kind: 'rep', state: 'ok', ne_code: 'fuwear', spellings: ['fuwear'] }, { code_norm: 'smhc', kind: 'rep', state: 'ok', ne_code: 'smhc', spellings: ['smhc'] }] })]);
+  ...[...KIDS, ...SMHC, ...SAN].map(([c]) => ({ code_norm: c, kind: 'product', state: 'ok', ne_code: neSpell(c), spellings: [neSpell(c)] })),
+  { code_norm: 'fuwear', kind: 'rep', state: 'ok', ne_code: 'fuwear', spellings: ['fuwear'] }, { code_norm: 'smhc', kind: 'rep', state: 'ok', ne_code: 'smhc', spellings: ['smhc'] },
+  { code_norm: 'sanrio3soupk', kind: 'rep', state: 'ok', ne_code: SAN_REP_NE, spellings: [SAN_REP_NE] }] })]);
+const SAN_TAG = (await one(`select product_id::text as id from core.products where display_code = 'sanrio3soupk'`)).id;
 const TAG = (await one(`select product_id::text as id from core.products where display_code = 'fuwear'`)).id;
 const SMHC_TAG = (await one(`select product_id::text as id from core.products where display_code = 'smhc'`)).id;
 
@@ -67,7 +74,8 @@ const SMHC_TAG = (await one(`select product_id::text as id from core.products wh
 function neObs(over = {}, { complete = true } = {}) {
   const plan = basePlan(extra, GROUPS);
   const rows = plan.skus.map((s) => {
-    const rep = Object.hasOwn(over, s.code) ? over[s.code] : (s.representativeCode ?? null);
+    const rep0 = Object.hasOwn(over, s.code) ? over[s.code] : (s.representativeCode ?? null);
+    const rep = rep0 === 'sanrio3soupk' ? SAN_REP_NE : rep0;   // NE の元の書き方
     return [s.code.toLowerCase(), 'single', 'ok', rep ? rep.toLowerCase() : null, rep];
   }).sort((a, b) => (a[0] < b[0] ? -1 : 1));
   return { format: 'parent-obs-v1', complete, ...(complete ? {} : { incomplete_reason: 'fetch_rows_dropped:products' }), untrusted: [], rep_collided: [], rep_spellings: { state: 'ok' },
@@ -193,9 +201,9 @@ await ta('[D3] 引数: 許可の一覧 (fuwear・sanrio3soupk・smhc) だけ・-
   const r = await dry({ ...OPTS, group: 'ws100' });
   assert.ok(r.problems.some((p) => /は許可の一覧 (.*) に無い/.test(p)));
 });
-await ta('[R1] 直さない: 許可の一覧の札が無い (sanrio3soupk)・子が quarantined でない', async () => {
-  const r = await dry({ ...OPTS, group: 'sanrio3soupk' });
-  assert.equal(r.exitCode, 1);
+await ta('[R1] 直さない: 札が無い・子が quarantined でない', async () => {
+  const noTag = { query: (sql, params) => (/from core\.products p where p\.company_id = 1 and core\.norm_code\(p\.display_code\) = \$1/.test(sql) ? Promise.resolve({ rows: [] }) : db.query(sql, params)) };
+  const r = await X.readOncePlan(noTag, { ...OPTS, group: 'sanrio3soupk' }, { ne: NE });
   assert.ok(r.problems.some((p) => /札\) が 0 件/.test(p)));
   // 子の 1 つが quarantined でない (登録の状態だけ試験で変える = 取引の中で巻き戻す)
   await pg.query('begin');
@@ -267,6 +275,28 @@ await ta('[A4] 夜間ロードをもう一度流しても、親・予約・軸�
   const r = await runInitialLoad(db, basePlan(extra, GROUPS), { log: quiet, runId: 'load_once_vg2', now: new Date(Date.now() - 86400e3) });
   assert.equal(r.ok, true, r.error);
   assert.deepEqual(await state(), before);
+});
+
+await ta('[S1] NE の代表の書き方 sanrio3souPK と札 sanrio3soupk = 大文字小文字をそろえて同じ = 通す・軸 サイズ・選択肢は -90 / -95 / -100 の順 (名前は最後の【】)・書ける', async () => {
+  const o = { ...OPTS, group: 'sanrio3soupk', axisName: 'サイズ' };
+  const d = await dry(o);
+  assert.equal(d.exitCode, 0, JSON.stringify(d.problems));
+  assert.deepEqual(d.plan.options, [{ code: '-90', name: '90サイズ', sort: 0 }, { code: '-95', name: '95サイズ', sort: 1 }, { code: '-100', name: '100サイズ', sort: 2 }]);
+  assert.equal(d.plan.group.code, 'sanrio3soupk');
+  const r = await apply(d.hash, o);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.error));
+  const s = await state(SAN_TAG, 'sanrio3soupk%');
+  assert.deepEqual(s.parents.map((x) => [x.parent, x.by]), SAN.map(() => ['sanrio3soupk', 'load']));
+  assert.deepEqual([s.axes, s.options.map((x) => x.code), s.choices, s.rev, s.events], [[{ axis: 1, name: 'サイズ' }], ['-90', '-95', '-100'], 3, 1, 1]);
+  assert.equal(X.stable((await one('select payload from ops.product_hub_outbox where group_product_id = $1', [SAN_TAG])).payload), X.stable(d.expected));
+});
+await ta('[S2] 大文字小文字をそろえても違う NE の代表 (sanrio3soupx) = 止まる', async () => {
+  const bad = neObs(Object.fromEntries(SAN.map(([c]) => [c, 'sanrio3soupX'])));
+  await seal(bad);
+  try {
+    const r = await dry({ ...OPTS, group: 'sanrio3soupk', axisName: 'サイズ' }, { obs: bad });
+    assert.ok(r.problems.some((p) => /子 sanrio3soupk-90 の NE の代表が sanrio3soupX/.test(p)), JSON.stringify(r.problems));
+  } finally { await seal(NE.obs); }
 });
 
 console.log('commit の答えが分からない');

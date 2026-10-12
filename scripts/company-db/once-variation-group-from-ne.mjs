@@ -137,7 +137,9 @@ export async function readOncePlan(db, opts, { ne, now = new Date() } = {}) {
   // NE の元のコード (0041 = 最新の照合の回)。まとまり = rep・子 = product
   const neRep = (await db.query(`select ne_code, state from ops.master_ne_codes where code_norm = $1 and kind = 'rep'`, [norm])).rows[0] || null;
   if (!neRep || neRep.state !== 'ok') problems.push(`NE の代表商品コード ${group} が NE のコードの台帳 (0041) に無い / ok でない (${neRep ? neRep.state : 'なし'})`);
-  else if (neRep.ne_code !== P.display_code) problems.push(`NE の代表の書き方 ${neRep.ne_code} と札の表示のコード ${P.display_code} が違う`);
+  // NE の代表の書き方 (例 sanrio3souPK) と札の表示のコード (sanrio3soupk) は大文字小文字 (norm) で同じなら同じまとまり
+  //   (NE の代表は登録の後に変えられない = NE の書き方は直せない・札の表示のコードも今のまま。中原さん 10/12)
+  else if (neRep.ne_code.toLowerCase() !== norm) problems.push(`NE の代表 ${neRep.ne_code} と札の表示のコード ${P.display_code} が大文字小文字をそろえても違う`);
   // 子 = 親がこの札の商品 (全部・sku_id の順 = スナップショットと同じ順)
   const kids = (await db.query(`select c.product_id::text as product_id, c.parent_set_by, s.sku_id::text as sku_id, s.code, s.code_norm, s.sku_kind, s.name,
        pg_catalog.to_jsonb(s.standard_price_jpy) as price, r.state as reg, (select count(*)::int from core.skus k2 where k2.product_id = c.product_id) as n_sku,
@@ -202,7 +204,7 @@ export async function readOncePlan(db, opts, { ne, now = new Date() } = {}) {
       neInfo.children.push(r ? [...r] : [c.code_norm, null]);
       if (!r) problems.push(`子 ${c.code} が NE の取得に無い`);
       else if (r[1] !== 'single' || r[2] !== 'ok') problems.push(`子 ${c.code} の NE の代表が読めない (${r[1]}・${r[2]})`);
-      else if (r[3] !== norm || r[4] !== P.display_code) problems.push(`子 ${c.code} の NE の代表が ${r[4] ?? '(なし)'} (--group ${group} と違う)`);
+      else if (r[3] !== norm || typeof r[4] !== 'string' || r[4].toLowerCase() !== norm) problems.push(`子 ${c.code} の NE の代表が ${r[4] ?? '(なし)'} (--group ${group} と違う)`);
     }
     if ((obs.untrusted || []).some((u) => children.some((c) => c.code_norm === u))) problems.push('子が NE の取得で保持 (正規化の衝突・取込の整合) されている');
     // 照合 ② と同じ親の数え (ops.parent_raw_gate) で、子にずれ (6 つの数えのどれか) が無い
@@ -227,7 +229,8 @@ export async function readOncePlan(db, opts, { ne, now = new Date() } = {}) {
   const plan = {
     group: { product_id: P.id, code: P.display_code, name: P.name, reserved: res.length ? res[0].source : null },
     axis: { axis: 1, name: axisName },
-    options: children.map((c, i) => ({ code: c.option, name: c.option_name, sort: i })),
+    // 並び = 選択肢番号の数字の順 (-90 / -95 / -100・-BK / -ND / -WH)
+    options: [...children].sort((a, b) => a.option.localeCompare(b.option, 'en', { numeric: true })).map((c, i) => ({ code: c.option, name: c.option_name, sort: i })),
     children: children.map((c) => ({ sku_id: c.sku_id, code: c.code, ne_code: c.ne_code, product_id: c.product_id, option: c.option, reg: c.reg, parent_set_by: c.parent_set_by })),
   };
   // 知らせ (ph-group-v1) の中身の全部 = ops.variation_group_snapshot(まとまり, 1, 人) と同じ形 (書いた後に DB の知らせと照らす)
