@@ -19,7 +19,7 @@ import * as REAL_CONFIG from '../config/watch-checks.mjs';
 import { plannedKeys, addDays, partialAllowed, evalW6, evalW8, evalW14, evalW15, w8Days } from '../apps/company-db/watch/checks.mjs';
 import { runWatch, reconcileIssues, pickItems, MAX_GENERATION_RETRIES } from '../apps/company-db/watch/engine.mjs';
 import { writeEvidence, readEvidence, purgeOldEvidence, EVIDENCE_KEEP_DAYS } from '../apps/company-db/push/evidence.mjs';
-import { roleStatements, createRoles, urlFor, verifyRole, WATCH_TABLES } from './company-db/create-watch-roles.mjs';
+import { roleStatements, createRoles, urlFor, verifyRole, WATCH_TABLES, targetOf } from './company-db/create-watch-roles.mjs';
 import { parseArgs } from '../apps/company-db/watch/run.mjs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -1716,6 +1716,111 @@ await t('🚨 Render と同じ条件 (superuser でない・CREATEROLE だけ・
     const d = await createRoles(pg3, { watcherPw: 'x', writerPw: 'y', dryRun: true });
     assert.ok(d.stmts.length > 20 && d.roles.length === 0 && d.info.owner === 'deploy');
   } finally { await pg3.close(); }
+});
+await t('🚨 10/12 の事故: 既定 (パスワードを渡さない) = 無いロールだけ新しいパスワードで作る・もうあるロールのパスワードは変えない (alter role に password も login も書かない)。rotate = 両方作り直す。nologin / パスワードが無いロールは黙って直さず止める', async () => {
+  // roleStatements: パスワードを渡さない = そのロールの alter に password も login も無い (権限・設定の文は同じ)
+  const keep = roleStatements({ dbName: 'cdb', owner: 'u', watcherPw: null, writerPw: undefined });
+  const withPw = roleStatements({ dbName: 'cdb', owner: 'u', watcherPw: 'a', writerPw: 'b' });
+  assert.ok(!keep.some((x) => /password|\blogin\b/.test(x)), keep.filter((x) => /password|login/.test(x)).join(' | '));
+  assert.ok(keep.includes('alter role watcher with nocreaterole noinherit connection limit 3') && keep.includes('alter role watch_writer with nocreaterole noinherit connection limit 2'));
+  assert.equal(keep.length, withPw.length, '権限・設定の文の数は同じ');
+  assert.deepEqual(keep.filter((x) => !/^alter role \w+ with /.test(x)), withPw.filter((x) => !/^alter role \w+ with /.test(x)), 'alter role … with の 2 文のほかは同じ');
+  // mustCreate (#1696 Codex R1 L1) = 「無いと確かめた」ロールは素の create role (別の実行が先に作っていたら 42710 で取り消す)。ほかは「無ければ作る」のまま
+  const mc = roleStatements({ dbName: 'cdb', owner: 'u', watcherPw: 'a', writerPw: null, mustCreate: ['watcher'] });
+  assert.ok(mc.includes('create role watcher') && !mc.some((x) => /if not exists .*'watcher'/.test(x)) && mc.some((x) => /if not exists .*'watch_writer'.* create role watch_writer;/.test(x)), mc.slice(0, 3).join(' | '));
+  assert.ok(withPw.some((x) => /if not exists .*'watcher'/.test(x)) && !withPw.includes('create role watcher'), '既定 (mustCreate なし) は今までどおり「無ければ作る」');
+  // targetOf (#1696 Codex R1 M2) = host:port/database だけ (ユーザー・パスワードは入れない)
+  assert.equal(targetOf('postgres://watcher:s3cret@Host.Example:5433/cdb?sslmode=require'), 'host.example:5433/cdb');
+  assert.equal(targetOf('postgres://u:p@h/cdb'), 'h:5432/cdb');
+  assert.notEqual(targetOf('postgres://u:p@h/cdb_old'), targetOf('postgres://u:p@h/cdb'));
+  assert.ok(!targetOf('postgres://watcher:s3cret@h/cdb').includes('s3cret'));
+  assert.equal(targetOf('not a url'), null);
+  const pg4 = new PGlite();
+  try {
+    await pg4.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
+    await pg4.query(`alter database ${(await pg4.query('select current_database() as d')).rows[0].d} owner to deploy`);
+    await pg4.query('set role deploy');
+    await applyMigrations(pgliteAdapter(pg4), { log: quiet });
+    const logged = (c) => ({ log: [], query(sql, p) { this.log.push(sql); return c.query(sql, p); } });
+    // dry-run (ロールが無い) = 両方新しく作る予定・パスワードは入れ物 (本物を作らない)・何も流さない
+    const d0 = await createRoles(pg4, { dryRun: true });
+    assert.deepEqual([Object.keys(d0.pw).sort(), d0.created.sort(), d0.roles.length], [['watch_writer', 'watcher'], ['watch_writer', 'watcher'], 0]);
+    assert.ok(Object.values(d0.pw).every((x) => /^<.+ の新しいパスワード>$/.test(x)), JSON.stringify(d0.pw));
+    assert.equal((await pg4.query(`select count(*)::int as n from pg_roles where rolname in ('watcher', 'watch_writer')`)).rows[0].n, 0);
+    // 1 回目 (無い) = 両方作って新しいパスワードを返す
+    const L1 = logged(pg4);
+    const r1 = await createRoles(L1, {});
+    // 確かめ (pg_roles を読む) は begin + advisory lock の後 = 同時の実行と取り違えない (#1696 Codex R1 L1)。作るのは素の create role
+    const iBegin = L1.log.indexOf('begin'), iLock = L1.log.findIndex((x) => /pg_advisory_xact_lock/.test(x)), iCheck = L1.log.findIndex((x) => /from pg_roles where rolname = any/.test(x) && /rolcanlogin/.test(x));
+    assert.ok(iBegin >= 0 && iBegin < iLock && iLock < iCheck, `${iBegin} ${iLock} ${iCheck}`);
+    assert.ok(L1.log.includes('create role watcher') && L1.log.includes('create role watch_writer'));
+    assert.deepEqual([Object.keys(r1.pw).sort(), r1.created.sort()], [['watch_writer', 'watcher'], ['watch_writer', 'watcher']]);
+    assert.ok(r1.pw.watcher.length >= 30 && r1.pw.watch_writer.length >= 30 && r1.pw.watcher !== r1.pw.watch_writer);
+    assert.ok(r1.roles.every((x) => x.rolcanlogin), '作ったロールは login できる');
+    // 2 回目 (ある) = パスワードを付けない・作らない。流した文に password も login も無い。権限は同じにそろう
+    const L2 = logged(pg4);
+    const r2 = await createRoles(L2, {});
+    assert.deepEqual([r2.pw, r2.created, r2.roles.length], [{}, [], 2]);
+    assert.ok(!L2.log.some((x) => /password|alter role \w+ with login/.test(x)), L2.log.filter((x) => /password|login/.test(x)).join(' | '));
+    assert.ok(L2.log.some((x) => /grant select on all tables in schema core to watcher/.test(x)), '権限はそろえ直す');
+    // 片方だけ無い = 無い方だけ作る (ある方は変えない)
+    await pg4.query('reset role'); await pg4.query('drop owned by watch_writer'); await pg4.query('drop role watch_writer'); await pg4.query('set role deploy');
+    const L3 = logged(pg4);
+    const r3 = await createRoles(L3, {});
+    assert.deepEqual([Object.keys(r3.pw), r3.created], [['watch_writer'], ['watch_writer']]);
+    assert.ok(!L3.log.some((x) => /alter role watcher with .*password/.test(x)) && L3.log.some((x) => /alter role watch_writer with login password/.test(x)));
+    assert.ok(L3.log.includes('create role watch_writer') && !L3.log.includes('create role watcher'), '無かった方だけ素の create role');
+    // rotate = 両方作り直す (作らない)
+    const r4 = await createRoles(pg4, { rotate: true });
+    assert.deepEqual([Object.keys(r4.pw).sort(), r4.created], [['watch_writer', 'watcher'], []]);
+    assert.ok(r4.pw.watcher !== r1.pw.watcher);
+    // dry-run (ある) = パスワードを付けるロールなし
+    const d1 = await createRoles(pg4, { dryRun: true });
+    assert.deepEqual([d1.pw, d1.created], [{}, []]);
+    assert.ok(!d1.stmts.some((x) => /password/.test(x)));
+    // nologin のロール = 既定では黙って直さず止める (login を付けない・取り消す) / rotate なら直る
+    await pg4.query('reset role'); await pg4.query('alter role watcher with nologin'); await pg4.query('set role deploy');
+    await assert.rejects(createRoles(pg4, {}), /watcher が login できない.*--rotate-passwords が要る/);
+    await assert.rejects(createRoles(pg4, { dryRun: true }), /--rotate-passwords が要る/);
+    assert.equal((await pg4.query(`select rolcanlogin from pg_roles where rolname = 'watcher'`)).rows[0].rolcanlogin, false, '止めた = login は付いていない');
+    assert.ok((await createRoles(pg4, { rotate: true })).roles.every((x) => x.rolcanlogin));
+    // パスワードが無いロール (pg_authid を読める実行者 = superuser のときだけ分かる) = 止める
+    await pg4.query('reset role'); await pg4.query('alter role watch_writer password null');
+    await assert.rejects(createRoles(pg4, {}), /watch_writer にパスワードが無い.*--rotate-passwords/);
+    // deploy (pg_authid を読めない) には分からない = 止めない (CLI の最後の .env の確かめで見つける)
+    await pg4.query('set role deploy');
+    assert.equal((await createRoles(pg4, {})).roles.length, 2);
+    await pg4.query('reset role');
+    assert.equal((await pg4.query(`select rolpassword is null as n from pg_authid where rolname = 'watch_writer'`)).rows[0].n, true, '既定の実行はパスワードを付けていない');
+  } finally { await pg4.close(); }
+});
+await t('🚨 #1696 Codex R2: begin の後の鍵の取得・ロールの確かめで失敗しても rollback する (呼び手の接続に失敗中の取引を残さない = 次の文が 25P02 にならない)', async () => {
+  // 鍵の取得 (pg_advisory_xact_lock) / ロールの確かめ (pg_roles) を、本当に失敗する文 (0 で割る = 22012) に差し替える = PGlite の取引は本当に失敗中になる
+  for (const [label, re] of [['鍵の取得', /pg_advisory_xact_lock/], ['ロールの確かめ', /rolcanlogin/]]) {
+    const log = [];
+    const c = { query: (sql, p) => { log.push(sql); if (re.test(sql)) return pg.query('select 1/0'); return pg.query(sql, p); } };
+    await assert.rejects(createRoles(c, {}), (e) => /division by zero/.test(e.message), label);
+    const iBegin = log.indexOf('begin'), iFail = log.findIndex((x) => re.test(x));
+    assert.ok(iBegin >= 0 && iFail > iBegin && log.slice(iFail + 1).includes('rollback'), `${label}: ${log.slice(-3).join(' | ')}`);
+    assert.deepEqual((await pg.query('select 1 as n')).rows, [{ n: 1 }], `${label}: 接続が使える (失敗中の取引が残っていない)`);
+  }
+  // begin そのものが失敗しても rollback を試す (取引の外なら警告だけ)
+  const log2 = [];
+  const c2 = { query: (sql, p) => { log2.push(sql); if (sql === 'begin') { const e = new Error('begin failed'); e.code = '08006'; throw e; } return pg.query(sql, p); } };
+  await assert.rejects(createRoles(c2, {}), /begin failed/);
+  assert.equal(log2[log2.length - 1], 'rollback');
+  // dry-run は取引を始めない = rollback も送らない
+  const log3 = [];
+  const c3 = { query: (sql, p) => { log3.push(sql); if (/rolcanlogin/.test(sql)) return pg.query('select 1/0'); return pg.query(sql, p); } };
+  await assert.rejects(createRoles(c3, { dryRun: true }), /division by zero/);
+  assert.ok(!log3.includes('begin') && !log3.includes('rollback'), log3.join(' | '));
+});
+await t('CLI の引数: 知らない引数 (--rotate-password の打ち間違いなど) は流さずに止める・--verify は単独', () => {
+  const run = (...a) => spawnSync(process.execPath, [path.join(root, 'scripts', 'company-db', 'create-watch-roles.mjs'), ...a], { encoding: 'utf8', timeout: 30000, env: { ...process.env, COMPANY_DB_URL: 'postgres://nobody:x@127.0.0.1:1/none' } });
+  const a = run('--rotate-password');
+  assert.equal(a.status, 1); assert.ok(/知らない引数: --rotate-password/.test(a.stderr), a.stderr);
+  const b = run('--verify', '--rotate-passwords');
+  assert.equal(b.status, 1); assert.ok(/--verify は単独/.test(b.stderr), b.stderr);
 });
 await t('🚨 --verify は権限そのものを見る: watcher は read write の取引で書いて拒まれる (42501) / writer は記録の経路が通り・禁止の列・core の select・delete は拒まれる。期待と違えば findings に残る (exit 1 の材料)', async () => {
   // 疑似の接続: 文ごとに ok か 42501 を返す。savepoint / begin / rollback は通す
