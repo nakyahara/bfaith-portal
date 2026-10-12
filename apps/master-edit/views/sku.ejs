@@ -537,6 +537,31 @@
         </section>
         <% } %>
 
+        <%# 🆕 0070: 業務で使える単品で、完全な NE の取得に無いときだけ「NE から消えた (やめる)」(lib/master-gone.mjs の goneView・押せるのは条件を DB が満たすと言ったとき・名簿 MASTER_DECISION_APPROVERS の人) %>
+        <% const G = typeof gone !== 'undefined' && gone && gone.show ? gone : null; const goneCan = !!G && G.canGo && G.canApprove && !dbError && !closed; %>
+        <% if (G) { %>
+        <section class="panel" aria-labelledby="h-gone" id="gone-box" data-base="<%= base %>" data-code="<%= c.code %>">
+          <div class="panel-h" style="margin-bottom:10px"><h2 id="h-gone">NE から消えた (やめる)</h2><span class="right"><span class="b <%= G.canGo ? 'warn' : 'mute' %>" id="gone-streak">NE に無い <%= G.streak %> / <%= G.required %> 日</span></span></div>
+          <div class="hint" id="gone-lead">この商品は、毎朝の照合の「完全な NE の取得」に <b><%= G.streak %> 日続けて</b>ありません (1 日に何回取得しても 1 日と数えます)<%= G.since ? ' (' + ui.fmtJst(G.since.products_complete_at, { nowMs }) + ' の取得から)' : '' %>。<%= G.required %> 日続けて無く、どこにも使われていなければ、理由を書いて「やめた」にできます (業務で使わない商品になります・NE には何もしません)。</div>
+          <% if (G.why.length) { %>
+          <ul class="gone-why" id="gone-why-list" style="margin:8px 0 0 18px">
+            <% for (const w of G.why) { %><li data-reason="<%= w.reason %>"><b><%= w.word %></b>: <%= w.text %></li><% } %>
+          </ul>
+          <% } %>
+          <% if (goneCan) { %>
+          <div class="f wide" style="margin-top:10px"><label class="lab" for="gone-reason">理由<span class="req">必須</span></label>
+            <div class="ctl col"><input class="in" id="gone-reason" maxlength="200" autocomplete="off" placeholder="例: NE で消えた (別のコード xxx で作り直した)">
+              <label class="hint" style="display:flex;gap:6px;align-items:center;margin-top:6px"><input type="checkbox" id="gone-seen"> NE で消えたのを確かめた (NE の商品の画面で検索して出てこない)</label>
+              <button class="btn danger" type="button" id="gone-go" disabled style="margin-top:8px">やめた にする</button></div></div>
+          <% } else if (G.canGo && !G.canApprove) { %>
+          <div class="hint" id="gone-who" style="margin-top:8px">やめた にできるのは、マスタの判断の名簿 (MASTER_DECISION_APPROVERS) の人だけです。</div>
+          <% } else if (G.canGo) { %>
+          <div class="hint" id="gone-closed" style="margin-top:8px">いまは保存できません (<%= dbError ? 'Company DB につながらない' : closedWhy %>)。</div>
+          <% } %>
+          <div class="msgline" id="gone-msg" role="status" aria-live="polite"></div>
+        </section>
+        <% } %>
+
         <section class="panel" aria-labelledby="h-recent">
           <div class="panel-h" style="margin-bottom:10px"><h2 id="h-recent">最近の変更</h2><span class="right"><a href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>/history" class="hint">ぜんぶ見る →</a></span></div>
           <% if (!recent.length) { %><div class="hint">まだありません</div><% } else { %>
@@ -547,6 +572,16 @@
         </section>
       </aside>
     </form>
+    <% if (typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %>
+    <div class="modal-bg" id="gone-bg">
+      <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="gone-t" aria-describedby="gone-d">
+        <h2 id="gone-t"><svg class="ic l" aria-hidden="true"><use href="#i-warn"/></svg><span class="mono"><%= c.code %></span> を「やめた」にします</h2>
+        <div class="hint" id="gone-d" style="color:var(--text2)">業務で使える商品から外れます (登録の状態 = やめた)。元には戻せません。NE・ロジザード・モールには何もしません。</div>
+        <ul><li>理由: <span id="gone-why"></span></li><li>完全な NE の取得に <%= gone.streak %> 日続けて無い (Company DB が確かめた)</li></ul>
+        <div class="mbtns"><button class="btn ghost" type="button" id="gone-stay">やめない</button><button class="btn danger" type="button" id="gone-ok">やめた にする</button></div>
+      </div>
+    </div>
+    <% } %>
     <script type="application/json" id="me-page"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
   <% } %>
   </div>
@@ -558,5 +593,7 @@
   <% if (page && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
   <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0070: NE から消えた (やめる) = 押せる人・押せるときだけ %>
+  <% if (page && typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %><script src="<%= base %>/public/me-gone.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>
