@@ -5,15 +5,22 @@
  *   watch_writer  記録用: ops.watch_* の insert + 限定 update (watch_runs の終了情報・watch_issues の管理列) + sequence の usage
  *
  * 🚨 Render の「新しい credential」は使わない (default user を差し替える)。ここで SQL で作るロールは Render の管理外
- *    = 資格情報の更新・DB の復元 / 移設のときは、もう一度これを流して .env を更新する (README「AI が見張る」)。
+ *    = DB の復元 / 移設でロールが無くなったら、もう一度これを流して (無いロールだけ新しいパスワードで作る) 出た行を .env に入れる。
+ *      パスワードを変えたい (漏れた・定期の入れ替え) ときだけ --rotate-passwords (README「AI が見張る」)。
  * 🚨 security definer の関数は public の execute を外す (view から呼べるため)。必要なアプリのロール = migration を流す default user (= このスクリプトを流す current_user) には残る。
+ * 🚨 パスワード (2026-10-12 の事故): 既定 (引数なし) では、もうあるロールのパスワードは変えない = migration の後の「ロールを流し直す」は権限をそろえるだけ。
+ *    前は流すたびにパスワードを作り直して画面に出すだけだった → 10/12 に migration 0070 の後に素で流し、miniPC の .env が古いまま
+ *    11:30 から照合・見張りが password authentication failed で止まった。パスワードを付けるのは「ロールが無くて新しく作るとき」と --rotate-passwords のときだけ。
+ *    もうあるロールが login できない (nologin)・パスワードが無い (pg_authid を読める実行者のときだけ分かる) なら、黙って直さず exit 1 (--rotate-passwords が要る)。
+ *    既定の実行の最後に、.env の COMPANY_DB_WATCH_URL / _WRITER_URL があればそれで入れるかを確かめる (--verify と同じ。入れなければ exit 1)。
  *
  * 使い方:
- *   node -r dotenv/config scripts/company-db/create-watch-roles.mjs            # 作る (無ければ作り・あれば権限だけそろえる。パスワードは新しく発行して表示)
- *   node -r dotenv/config scripts/company-db/create-watch-roles.mjs --dry-run  # 流す SQL を表示するだけ (パスワードは出さない)
- *   node -r dotenv/config scripts/company-db/create-watch-roles.mjs --verify   # .env の COMPANY_DB_WATCH_URL / _WRITER_URL で接続し、読める・書けない を確かめる
+ *   node -r dotenv/config scripts/company-db/create-watch-roles.mjs                     # 権限だけそろえる (無いロールだけ作って新しいパスワードを表示。あるロールのパスワードは変えない = .env はそのまま)
+ *   node -r dotenv/config scripts/company-db/create-watch-roles.mjs --dry-run           # 流す SQL を表示するだけ (パスワードは出さない)
+ *   node -r dotenv/config scripts/company-db/create-watch-roles.mjs --verify            # .env の COMPANY_DB_WATCH_URL / _WRITER_URL で接続し、読める・書けない を確かめる
+ *   node -r dotenv/config scripts/company-db/create-watch-roles.mjs --rotate-passwords  # 🚨 2 つのパスワードを作り直す = .env を直すまで照合・見張りが止まる (表示された 2 行ですぐ .env を書き換える)
  *
- * 表示された 2 行 (COMPANY_DB_WATCH_URL= / COMPANY_DB_WATCH_WRITER_URL=) を miniPC の .env に足す。パスワードはこの画面にしか出ない。
+ * 表示された行 (COMPANY_DB_WATCH_URL= / COMPANY_DB_WATCH_WRITER_URL=) を miniPC の .env に入れる。パスワードはこの画面にしか出ない。
  */
 import crypto from 'node:crypto';
 import { openPgClient } from './migrate.mjs';
@@ -29,16 +36,21 @@ const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識�
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const newPassword = () => crypto.randomBytes(24).toString('base64url');
 
-/** 流す SQL の一覧 (パスワードは引数)。dbName / owner = 実際の DB 名・migration を流すユーザー (= current_user) */
+/**
+ * 流す SQL の一覧。dbName / owner = 実際の DB 名・migration を流すユーザー (= current_user)。
+ * watcherPw / writerPw = 付けるパスワード。null / undefined = そのロールのパスワードは変えない (login も書かない = もうあるロールの今の状態のまま。
+ * 作った直後のロールに付けなければ login できないまま = createRoles の確かめで止まる)
+ */
 export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunctions = [] }) {
   const db = ident(dbName), o = ident(owner);
+  const loginPw = (pw) => (pw != null ? ` login password ${lit(pw)}` : '');
   const s = [];
   // watcher
   s.push(`do $$ begin if not exists (select 1 from pg_roles where rolname = 'watcher') then create role watcher; end if; end $$`);
   // 🚨 nosuperuser / nocreatedb / nobypassrls / noreplication は書かない: PostgreSQL 16 以降は、その属性を「書くだけ」で実行者に同じ属性が無いと拒まれる
   //    (Render の default user は CREATEROLE だけ → "permission denied to alter role"。9/22 に本番で踏んだ。PGlite 18 でも同じ)。
   //    create role の既定がどれも off なので書く必要は無い。代わりに作った後 (commit の前) に pg_roles で確かめ、違えば rollback する (createRoles)
-  s.push(`alter role watcher with login password ${lit(watcherPw)} nocreaterole noinherit connection limit ${WATCHER_CONN_LIMIT}`);
+  s.push(`alter role watcher with${loginPw(watcherPw)} nocreaterole noinherit connection limit ${WATCHER_CONN_LIMIT}`);
   s.push(`alter role watcher set statement_timeout = '10s'`);
   s.push(`alter role watcher set default_transaction_read_only = on`);
   s.push(`grant connect on database ${db} to watcher`);
@@ -53,7 +65,7 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   }
   // watch_writer
   s.push(`do $$ begin if not exists (select 1 from pg_roles where rolname = 'watch_writer') then create role watch_writer; end if; end $$`);
-  s.push(`alter role watch_writer with login password ${lit(writerPw)} nocreaterole noinherit connection limit ${WRITER_CONN_LIMIT}`);
+  s.push(`alter role watch_writer with${loginPw(writerPw)} nocreaterole noinherit connection limit ${WRITER_CONN_LIMIT}`);
   s.push(`alter role watch_writer set statement_timeout = '30s'`);
   s.push(`grant connect on database ${db} to watch_writer`);
   s.push(`grant usage on schema ops to watch_writer`);
@@ -146,51 +158,123 @@ export async function verifyRole(client, kind) {
   return { user: who.u, statementTimeout: who.st, findings };
 }
 
+const ENV_OF = { watcher: 'COMPANY_DB_WATCH_URL', watch_writer: 'COMPANY_DB_WATCH_WRITER_URL' };
+export const KNOWN_ARGS = ['--dry-run', '--verify', '--rotate-passwords'];
+const ROTATE_WARNING = [
+  '🚨🚨🚨 --rotate-passwords: watcher / watch_writer のパスワードを作り直す 🚨🚨🚨',
+  '🚨 この後 miniPC の .env の COMPANY_DB_WATCH_URL / COMPANY_DB_WATCH_WRITER_URL を下の 2 行に書き換えるまで、',
+  '🚨 照合・見張り (daily-sync の CompanyDB見張り・照合 ②) は password authentication failed で止まる。',
+  '🚨 書き換えたら: node -r dotenv/config scripts/company-db/create-watch-roles.mjs --verify',
+].join('\n');
+
+/** .env の 2 本 (COMPANY_DB_WATCH_URL / _WRITER_URL) で入って権限を確かめる。戻り値 = { bad, authFailed }。onlySet = 未設定の env は数えない (既定の実行の最後の確かめ) */
+async function verifyEnvUrls(env, { onlySet = false } = {}) {
+  let bad = 0, authFailed = 0;
+  for (const [name, url, kind] of [['COMPANY_DB_WATCH_URL', env.COMPANY_DB_WATCH_URL, 'watcher'], ['COMPANY_DB_WATCH_WRITER_URL', env.COMPANY_DB_WATCH_WRITER_URL, 'writer']]) {
+    if (!url) { if (!onlySet) { console.log(`❌ ${name}: 未設定`); bad++; } else console.log(`⏭️ ${name}: 未設定 (確かめない)`); continue; }
+    let c;
+    try { c = await openPgClient(url); }
+    catch (e) {
+      bad++;
+      // 28P01 = password authentication failed (パスワードが違う・ロールにパスワードが無い) / 28000 = login できない・ロールが無い
+      if (e && (e.code === '28P01' || e.code === '28000')) authFailed++;
+      console.log(`❌ ${name}: 接続できない (${e && e.code ? `${e.code} ` : ''}${e && e.message})`);
+      continue;
+    }
+    try {
+      const v = await verifyRole(c, kind);
+      if (v.findings.length) { bad++; console.log(`❌ ${name} (role=${v.user} statement_timeout=${v.statementTimeout}):`); for (const f of v.findings) console.log(`   - ${f}`); }
+      else console.log(`✅ ${name}: role=${v.user} statement_timeout=${v.statementTimeout} 期待どおり (${kind === 'watcher' ? '読める・書けない' : '記録の経路は通る・それ以外は拒まれる'})`);
+    } finally { await c.end(); }
+  }
+  return { bad, authFailed };
+}
+
 async function main() {
   const args = process.argv.slice(2);
-  const dryRun = args.includes('--dry-run'), verify = args.includes('--verify');
+  const unknown = args.filter((a) => !KNOWN_ARGS.includes(a));
+  if (unknown.length) throw new Error(`知らない引数: ${unknown.join(' ')} (使えるのは ${KNOWN_ARGS.join(' / ')})`);
+  const dryRun = args.includes('--dry-run'), verify = args.includes('--verify'), rotate = args.includes('--rotate-passwords');
+  if (verify && (dryRun || rotate)) throw new Error('--verify は単独で流す (--dry-run / --rotate-passwords と一緒にしない)');
   const base = process.env.COMPANY_DB_URL;
   if (!base) throw new Error('COMPANY_DB_URL が要る (node -r dotenv/config …)');
   if (verify) {
-    let bad = 0;
-    for (const [name, url, kind] of [['COMPANY_DB_WATCH_URL', process.env.COMPANY_DB_WATCH_URL, 'watcher'], ['COMPANY_DB_WATCH_WRITER_URL', process.env.COMPANY_DB_WATCH_WRITER_URL, 'writer']]) {
-      if (!url) { console.log(`❌ ${name}: 未設定`); bad++; continue; }
-      const c = await openPgClient(url);
-      try {
-        const v = await verifyRole(c, kind);
-        if (v.findings.length) { bad++; console.log(`❌ ${name} (role=${v.user} statement_timeout=${v.statementTimeout}):`); for (const f of v.findings) console.log(`   - ${f}`); }
-        else console.log(`✅ ${name}: role=${v.user} statement_timeout=${v.statementTimeout} 期待どおり (${kind === 'watcher' ? '読める・書けない' : '記録の経路は通る・それ以外は拒まれる'})`);
-      } finally { await c.end(); }
-    }
-    if (bad) throw new Error(`${bad} 本の接続が期待と違う (create-watch-roles.mjs を流し直す・.env を確かめる)`);
+    const { bad, authFailed } = await verifyEnvUrls(process.env);
+    if (bad) throw new Error(`${bad} 本の接続が期待と違う (${authFailed ? 'パスワードで入れない = .env が古いか、ロールのパスワードが無い。.env の値を確かめ、分からなければ --rotate-passwords で作り直して .env を書き換える' : 'create-watch-roles.mjs を流し直す・.env を確かめる'})`);
     return;
   }
+  if (rotate && !dryRun) console.log(ROTATE_WARNING);
   const client = await openPgClient(base);
+  let r;
   try {
-    const watcherPw = dryRun ? '<watcher の新しいパスワード>' : newPassword(), writerPw = dryRun ? '<watch_writer の新しいパスワード>' : newPassword();
-    const r = await createRoles(client, { watcherPw, writerPw, dryRun });
-    if (dryRun) { console.log(`-- dry-run: owner=${r.info.owner} db=${r.info.db} security definer 関数 ${r.secdef.length} 件`); for (const s of r.stmts) console.log(s.replace(/password '[^']*'/, "password '***'") + ';'); return; }
-    console.log(`✅ ロールを作った / 権限をそろえた (owner=${r.info.owner} db=${r.info.db} security definer 関数 ${r.secdef.length} 件の public execute を外した。${r.roles.map((x) => `${x.rolname}: superuser=${x.rolsuper} createrole=${x.rolcreaterole} createdb=${x.rolcreatedb} bypassrls=${x.rolbypassrls} login=${x.rolcanlogin} connlimit=${x.rolconnlimit} memberships=${x.memberships}`).join(' / ')})`);
-    console.log('miniPC の .env に足す 2 行 (パスワードはこの画面にしか出ない。Render の画面では管理されない):');
-    console.log(`COMPANY_DB_WATCH_URL=${urlFor(base, 'watcher', watcherPw)}`);
-    console.log(`COMPANY_DB_WATCH_WRITER_URL=${urlFor(base, 'watch_writer', writerPw)}`);
-    console.log('足したら: node -r dotenv/config scripts/company-db/create-watch-roles.mjs --verify');
+    r = await createRoles(client, { rotate, dryRun });
   } finally { await client.end(); }
+  const set = Object.keys(r.pw);
+  if (dryRun) {
+    console.log(`-- dry-run: owner=${r.info.owner} db=${r.info.db} security definer 関数 ${r.secdef.length} 件`);
+    for (const s of r.stmts) console.log(s.replace(/password '[^']*'/, "password '***'") + ';');
+    console.log(`-- パスワードを付けるロール: ${set.length ? set.map((x) => `${x}${r.created.includes(x) ? ' (新しく作る)' : ' (作り直す)'}`).join(' / ') : 'なし (もうあるロールのパスワードは変えない = .env はそのまま)'}`);
+    return;
+  }
+  console.log(`✅ ${r.created.length ? `ロールを作った (${r.created.join(' / ')}) / ` : ''}権限をそろえた (owner=${r.info.owner} db=${r.info.db} security definer 関数 ${r.secdef.length} 件の public execute を外した。${r.roles.map((x) => `${x.rolname}: superuser=${x.rolsuper} createrole=${x.rolcreaterole} createdb=${x.rolcreatedb} bypassrls=${x.rolbypassrls} login=${x.rolcanlogin} connlimit=${x.rolconnlimit} memberships=${x.memberships}`).join(' / ')})`);
+  if (set.length) {
+    console.log(`miniPC の .env に${rotate ? '書き換える' : '足す'}行 (パスワードはこの画面にしか出ない。Render の画面では管理されない。ここに出ないロールは今の .env のまま):`);
+    for (const role of set) console.log(`${ENV_OF[role]}=${urlFor(base, role, r.pw[role])}      # ${role}${r.created.includes(role) ? ' (新しく作った)' : ' (パスワードを作り直した)'}`);
+  }
+  if (rotate) { console.log(ROTATE_WARNING); return; }
+  if (!set.length) console.log('パスワードは変えていない (もうあるロールは今の .env のまま)。変えるときだけ --rotate-passwords');
+  if (set.length) { console.log('足したら: node -r dotenv/config scripts/company-db/create-watch-roles.mjs --verify'); return; }
+  // 既定の実行の最後: 今の .env の 2 本で入れるか・権限が期待どおりかを確かめる (未設定なら飛ばす)。入れなければ exit 1 (推測でパスワードを変えない)
+  const { bad, authFailed } = await verifyEnvUrls(process.env, { onlySet: true });
+  if (bad) throw new Error(`.env の ${bad} 本が期待と違う (権限はそろえた・パスワードは変えていない)。${authFailed ? 'パスワードで入れない = .env が古いか、ロールのパスワードが無い → --rotate-passwords が要る (作り直して .env を書き換える)' : '--verify の結果を見る'}`);
 }
 
 /**
- * ロールを作る / 権限をそろえる (1 取引)。戻り値 = { info, secdef, stmts, roles }。dryRun なら文を作るだけで流さない。
+ * もうあるロールの login・パスワードの様子。戻り値 = Map(ロール → { login, noPassword })。
+ * noPassword = pg_authid を読める実行者 (superuser) のときだけ分かる (Render の default user は読めない = null = 分からない。そのときは既定の実行の最後の .env の確かめで見つける)
+ */
+export async function existingWatchRoles(client) {
+  const rows = (await client.query(`select rolname, rolcanlogin from pg_roles where rolname = any($1::text[])`, [WATCH_ROLES])).rows;
+  const canReadAuthid = (await client.query(`select has_table_privilege('pg_catalog.pg_authid', 'select') as ok`)).rows[0].ok;
+  const noPw = canReadAuthid ? new Set((await client.query(`select rolname from pg_authid where rolname = any($1::text[]) and rolpassword is null`, [WATCH_ROLES])).rows.map((r) => r.rolname)) : null;
+  return new Map(rows.map((r) => [r.rolname, { login: r.rolcanlogin, noPassword: noPw ? noPw.has(r.rolname) : null }]));
+}
+
+/**
+ * ロールを作る / 権限をそろえる (1 取引)。戻り値 = { info, secdef, stmts, roles, pw, created }。dryRun なら文を作るだけで流さない。
+ * 🚨 パスワード (2026-10-12 の事故): 付けるのは
+ *    - watcherPw / writerPw で渡したロール (その値・試験用。今までの呼び方 = 渡せば毎回付ける)
+ *    - まだ無いロール (新しいパスワードを発行)
+ *    - rotate = true のとき (両方とも新しいパスワードを発行 = CLI の --rotate-passwords)
+ *    それ以外のもうあるロールのパスワードは変えない。そのロールが login できない・パスワードが無い (分かるとき) なら黙って直さず止める (--rotate-passwords が要る)。
+ *    戻り値の pw = 付けたロールのパスワードだけ ({ watcher?, watch_writer? })・created = 新しく作ったロール
  * 🚨 commit の前に pg_roles で確かめる: superuser / createrole / createdb / bypassrls / replication が無い・login できる・noinherit・connection limit が期待どおり・
  *    ほかのロールのメンバーになっていない (pg_auth_members)。違えば rollback して止める = 「書いて直す」のではなく「検査して止める」
  *    (nosuperuser などを alter に書くと CREATEROLE だけの実行者は拒まれる。既存のロールに危険な属性や membership が付いていたら人が見る)
  */
-export async function createRoles(client, { watcherPw, writerPw, dryRun = false }) {
+export async function createRoles(client, { watcherPw, writerPw, rotate = false, dryRun = false } = {}) {
   const info = (await client.query(`select current_user as owner, current_database() as db, r.rolcreaterole, r.rolsuper from pg_roles r where r.rolname = current_user`)).rows[0];
   if (!info.rolcreaterole && !info.rolsuper) throw new Error(`${info.owner} に CREATEROLE が無い = ロールを作れない (Render の default user なら普通はある。別のユーザーで接続していないか .env の COMPANY_DB_URL を確かめる)`);
   const secdef = (await client.query(`select n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as sig
     from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prosecdef and n.nspname = any($1::text[]) order by 1`, [WATCH_SCHEMAS])).rows.map((r) => r.sig);
-  const stmts = roleStatements({ dbName: info.db, owner: info.owner, watcherPw, writerPw, secdefFunctions: secdef });
-  if (dryRun) return { info, secdef, stmts, roles: [] };
+  const existing = await existingWatchRoles(client);
+  const given = { watcher: watcherPw, watch_writer: writerPw };
+  const pw = {};
+  const needRotate = [];
+  for (const role of WATCH_ROLES) {
+    if (given[role] != null) pw[role] = given[role];
+    else if (!existing.has(role) || rotate) pw[role] = dryRun ? `<${role} の新しいパスワード>` : newPassword();
+    else {
+      const e = existing.get(role);
+      if (!e.login) needRotate.push(`${role} が login できない (nologin)`);
+      if (e.noPassword) needRotate.push(`${role} にパスワードが無い`);
+    }
+  }
+  // 推測で直さない: login を付ける / パスワードを付けるのは --rotate-passwords で人が決める (付ければ .env を書き換える日になる)
+  if (needRotate.length) throw new Error(`もうあるロールが入れない状態 (${needRotate.join(' / ')})。既定の実行ではパスワードも login も変えない = --rotate-passwords が要る (作り直して表示された行で .env を書き換える)`);
+  const created = WATCH_ROLES.filter((r) => !existing.has(r));
+  const stmts = roleStatements({ dbName: info.db, owner: info.owner, watcherPw: pw.watcher, writerPw: pw.watch_writer, secdefFunctions: secdef });
+  if (dryRun) return { info, secdef, stmts, roles: [], pw, created };
   await client.query('begin');
   try {
     for (const s of stmts) await client.query(s);
@@ -209,7 +293,7 @@ export async function createRoles(client, { watcherPw, writerPw, dryRun = false 
     if (roles.length !== WATCH_ROLES.length) bad.push(`ロールが ${roles.length} 件しか無い (期待 ${WATCH_ROLES.length})`);
     if (bad.length) throw new Error(`ロールの属性が期待と違う (取り消した): ${bad.join(' ; ')}`);
     await client.query('commit');
-    return { info, secdef, stmts, roles };
+    return { info, secdef, stmts, roles, pw, created };
   } catch (e) { try { await client.query('rollback'); } catch { /* */ } throw e; }
 }
 
