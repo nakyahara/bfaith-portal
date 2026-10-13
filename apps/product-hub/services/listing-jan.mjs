@@ -17,7 +17,7 @@
  *   まとまり = 子の SKU ごと ↔ draft_sku_jans (なしの理由 = draft_sku_catalog_exemptions → 無ければページ共通の理由)
  */
 import crypto from 'node:crypto';
-import { janUnitsForDraft, readCdbJans, janPairKey, JAN_READ_DEADLINE_MS } from './cdb-jan-compare.mjs';
+import { janUnitsForDraft, janUnitsForDrafts, readCdbJans, janPairKey, JAN_READ_DEADLINE_MS } from './cdb-jan-compare.mjs';
 import { JAN_LINK_REASONS, JAN_LINK_FIX } from './jan-link.mjs';
 
 /** 止める設定の名前 (環境変数)。'1' のときだけ止める。ほかの値・無し = 止めない (今までどおり) */
@@ -58,6 +58,11 @@ export const JAN_GATE_PROBLEMS = Object.freeze({
     text: '大文字小文字だけ違う同じ SKU の JAN の行が 2 つある (どちらを送るか決まらない)',
     fix: 'カテゴリ・属性タブの「カタログID」で、商品マスタの JAN を選び直す (行が 1 つになる)',
   },
+  no_code: {
+    label: '出品の商品コードが無い',
+    text: '出品の商品コードが無いので JAN を確かめられない',
+    fix: '基本情報タブで商品コードを入れる',
+  },
   unreadable: {
     label: '確かめられない',
     text: '商品マスタ (Company DB) を読めないので、結んだ JAN を確かめられない',
@@ -96,22 +101,29 @@ export const masterEditSkuUrl = (code) => `/apps/master-edit/sku/${encodeURIComp
 export function listingJanUnits(db, draftId) {
   const d = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!d) return null;
-  const { mode, units } = janUnitsForDraft(db, d);
+  const { mode, units } = janUnitsForDraft(db, d);   // buildItemPayload と同じ決め方 (resolveVariationGroup)
   const rk = db.prepare('SELECT catalog_id_exemption_reason FROM draft_rakuten WHERE draft_id = ?').get(d.id) || {};
-  const pageReason = validReason(rk.catalog_id_exemption_reason);
+  return assembleUnits(d, { mode, units }, {
+    pageReason: validReason(rk.catalog_id_exemption_reason),
+    skuRows: mode === 'variation' ? db.prepare('SELECT * FROM draft_sku_jans WHERE draft_id = ? ORDER BY sku_code').all(d.id) : [],
+    exRows: mode === 'variation' ? db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(d.id) : [],
+  });
+}
+
+/** 単位と SQLite の行から、出品の単位の形を組む (1 件ずつ = listingJanUnits と、一括 = listingJanUnitsBulk の両方がこれを通る) */
+function assembleUnits(d, { mode, units }, { pageReason, skuRows, exRows }) {
   const base = { draftId: d.id, neCode: str(d.ne_code) };
   if (mode !== 'variation') {
     return { ...base, mode: 'single', units: units.map((u) => ({ code: u.code, phJan: u.phJan, link: linkOf(d), dup: false, ownReason: pageReason, fallbackReason: null })) };
   }
   const byNorm = new Map();
-  for (const r of db.prepare('SELECT * FROM draft_sku_jans WHERE draft_id = ? ORDER BY sku_code').all(d.id)) {
+  for (const r of [...skuRows].sort((a, b) => String(a.sku_code).localeCompare(String(b.sku_code)))) {
     const k = normSku(r.sku_code);
     if (!byNorm.has(k)) byNorm.set(k, []);
     byNorm.get(k).push(r);
   }
   // buildItemPayload と同じ引き方 (SKU コードを小文字にした鍵でそのまま引く)
-  const exOf = new Map(db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(d.id)
-    .map((r) => [String(r.sku_code), validReason(r.reason)]));
+  const exOf = new Map(exRows.map((r) => [String(r.sku_code), validReason(r.reason)]));
   return {
     ...base,
     mode: 'variation',
@@ -122,6 +134,34 @@ export function listingJanUnits(db, draftId) {
       return { code: u.code, phJan: u.phJan, link: own ? linkOf(own) : EMPTY_LINK, dup: same.length > 1, ownReason: exOf.get(key) ?? null, fallbackReason: pageReason };
     }),
   };
+}
+
+/**
+ * 一括版 (管理画面の「今止めたら止まる」の数): ドラフトの数によらず SQLite を数回だけ読む (Codex #1713 R1 L1)。
+ * 単位の決め方は B1 の一括の関数 janUnitsForDrafts (= 1 件ずつの janUnitsForDraft と同じ答え・試験で突き合わせる)。戻り値 Map(draftId → 単位の形)
+ */
+export function listingJanUnitsBulk(db, drafts) {
+  const out = new Map();
+  if (!drafts.length) return out;
+  const unitsOf = janUnitsForDrafts(db, drafts);
+  const reasonOf = new Map(db.prepare('SELECT draft_id, catalog_id_exemption_reason AS r FROM draft_rakuten').all().map((x) => [x.draft_id, validReason(x.r)]));
+  const group = (rows) => { const m = new Map(); for (const r of rows) { if (!m.has(r.draft_id)) m.set(r.draft_id, []); m.get(r.draft_id).push(r); } return m; };
+  const skuOf = group(db.prepare('SELECT * FROM draft_sku_jans').all());
+  const exOf = group(db.prepare('SELECT draft_id, sku_code, reason FROM draft_sku_catalog_exemptions').all());
+  for (const d of drafts) {
+    out.set(d.id, assembleUnits(d, unitsOf.get(d.id), { pageReason: reasonOf.get(d.id) ?? null, skuRows: skuOf.get(d.id) || [], exRows: exOf.get(d.id) || [] }));
+  }
+  return out;
+}
+
+/**
+ * 段 4 の判定の本体 (止める単位の一覧)。門 (janListingBlock) と数え (enforceForecast) は必ずこれを通す = 同じ答え (Codex #1713 R1 M1)。
+ * 戻り値 [{ u (単位・商品コードが無いときは null), d (stop) }] (空 = 止めない)
+ */
+export function gateProblemsOf(lj) {
+  if (!lj) return [];
+  if (!lj.units.length) return [{ u: null, d: stop('no_code') }];
+  return lj.units.map((u) => ({ u, d: decideLocal(u) })).filter((x) => !x.d.ok);
 }
 
 const stop = (problem, detail = '') => ({ ok: false, problem, detail: detail || '' });
@@ -163,6 +203,7 @@ export function verifyLinked(u, read) {
 /** 単位の判定を人の言葉に (止める理由・プレビューの注意) */
 export function problemText(u, d, { mode = 'single' } = {}) {
   const p = JAN_GATE_PROBLEMS[d.problem] || { label: d.problem, text: d.problem, fix: '' };
+  if (!u) return `カタログID (JAN) ${p.label}: ${p.text}。直し方: ${p.fix}`;
   const who = mode === 'variation' ? `SKU「${u.code}」` : `商品コード ${u.code}`;
   const fix = d.problem === 'needs_review' && u.link.reason && JAN_LINK_FIX[u.link.reason] ? `${p.fix} (${JAN_LINK_FIX[u.link.reason]})` : p.fix;
   return `カタログID (JAN) ${p.label}: ${who} — ${p.text}${d.detail ? ` (${d.detail})` : ''}。直し方: ${fix}`;
@@ -186,9 +227,7 @@ export function janGateFresh(db, draftId, gate) {
 export function janListingBlock(db, draftId, { env = process.env } = {}) {
   if (!janEnforceOn(env)) return null;
   const lj = listingJanUnits(db, draftId);
-  if (!lj) return null;
-  if (!lj.units.length) return 'カタログID (JAN): 出品の商品コードが無いので JAN を確かめられません';
-  const bad = lj.units.map((u) => ({ u, d: decideLocal(u) })).filter((x) => !x.d.ok);
+  const bad = gateProblemsOf(lj);
   if (!bad.length) return null;
   return bad.map(({ u, d }) => problemText(u, d, { mode: lj.mode })).join(' / ');
 }
@@ -196,8 +235,7 @@ export function janListingBlock(db, draftId, { env = process.env } = {}) {
 /** 止める設定の前に出す知らせ (プレビュー): 「設定を入れたら止まる」単位 (SQLite だけで決まる物) */
 export function janLinkNotices(db, draftId) {
   const lj = listingJanUnits(db, draftId);
-  if (!lj) return [];
-  return lj.units.map((u) => ({ u, d: decideLocal(u) })).filter((x) => !x.d.ok)
+  return gateProblemsOf(lj)
     .map(({ u, d }) => `${problemText(u, d, { mode: lj.mode })} (今は止めません。止める設定 ${JAN_ENFORCE_ENV}=1 を入れると出品が止まります)`);
 }
 
@@ -208,8 +246,9 @@ export function janLinkNotices(db, draftId) {
  *   decision = { ok: true, send: { value } | { reason } } / { ok: false, problem, detail }
  *   snapshot = 確かめたときの SQLite の状態の印 (送る直前に janGateFresh で照らす)
  */
-export async function resolveListingJans(db, draftId, { env = process.env, enforce = janEnforceOn(env), deadlineMs = JAN_READ_DEADLINE_MS, deadlineAt = null, read: given = null } = {}) {
-  const lj = listingJanUnits(db, draftId);
+export async function resolveListingJans(db, draftId, { env = process.env, enforce = janEnforceOn(env), deadlineMs = JAN_READ_DEADLINE_MS, deadlineAt = null, read: given = null, lj: givenLj = null } = {}) {
+  // lj / read = 呼ぶ側がもう組んだ単位と、その単位の全部の組で読んだ答え (プレビュー = 1 回の読みで payload と B1 の印の両方・Codex #1713 R1 M2)
+  const lj = givenLj || listingJanUnits(db, draftId);
   if (!lj) return { enforce, ok: false, mode: null, units: [], reasons: ['ドラフトが見つかりません'], snapshot: null };
   const snapshot = snapshotOf(lj);   // 🚨 読む (await) より前の状態の印
   const units = lj.units.map((u) => ({ ...u, local: decideLocal(u) }));
@@ -221,7 +260,7 @@ export async function resolveListingJans(db, draftId, { env = process.env, enfor
   }
   for (const u of units) u.decision = u.local.verdict === 'verify' ? verifyLinked(u, read) : u.local;
   const reasons = units.filter((u) => !u.decision.ok).map((u) => problemText(u, u.decision, { mode: lj.mode }));
-  if (!units.length) reasons.push('カタログID (JAN): 出品の商品コードが無いので JAN を確かめられません');
+  if (!units.length) reasons.push(problemText(null, stop('no_code')));
   return { enforce: true, ok: reasons.length === 0, mode: lj.mode, units, reasons, snapshot };
 }
 
@@ -337,27 +376,28 @@ export function verifySelection({ code, row, value }, read) {
 }
 
 /**
- * 止める設定を入れたら、今いくつ止まるか (jan-link の管理画面に出す・SQLite だけ・楽天に登録済みの商品は数えない)
- * 戻り値 { drafts, units, stopDrafts, byProblem: { problem: 単位の数 } }
+ * 止める設定を入れたら、今いくつ止まるか (jan-link の管理画面に出す・SQLite だけ)。
+ * 🚨 中原さんの答え 5a: この数が 0 (か止まってよい物だけ) になってから設定を入れる = 少なく出てはいけない (Codex #1713 R1 M1):
+ *   - 判定は門と同じ関数 (gateProblemsOf)。商品コードが無い (単位が無い) ドラフトも止まる商品として数える
+ *   - 1 件でも読めない・組めない = 投げる (黙って外さない)。呼ぶ側は「数えきれていない (この数は信用しない)」と出す
+ *   - 数えるのは楽天に未登録で、色追加のカード (既存ページに足す = 出品しない) でない物。保留・除外も数える (詳細画面からは出せるので)
+ * 戻り値 { drafts, units, stopDrafts, heldStopDrafts, byProblem: { problem: 単位の数 } }
  */
 export function enforceForecast(db) {
-  const ids = db.prepare(`SELECT d.id FROM product_drafts d LEFT JOIN draft_rakuten r ON r.draft_id = d.id
-    WHERE r.registered_at IS NULL AND COALESCE(d.status, '') NOT IN ('excluded') AND d.added_to_draft_id IS NULL ORDER BY d.id`).all().map((r) => r.id);
-  const out = { drafts: 0, units: 0, stopDrafts: 0, byProblem: {} };
-  for (const id of ids) {
-    let lj;
-    try { lj = listingJanUnits(db, id); } catch { continue; }
-    if (!lj || !lj.units.length) continue;
+  const drafts = db.prepare(`SELECT d.* FROM product_drafts d LEFT JOIN draft_rakuten r ON r.draft_id = d.id
+    WHERE r.registered_at IS NULL AND d.added_to_draft_id IS NULL ORDER BY d.id`).all();
+  const all = listingJanUnitsBulk(db, drafts);
+  const out = { drafts: 0, units: 0, stopDrafts: 0, heldStopDrafts: 0, byProblem: {} };
+  for (const d of drafts) {
+    const lj = all.get(d.id);
+    if (!lj) throw new Error(`ドラフト ${d.id} の単位を組めない`);
     out.drafts++;
-    let stopped = false;
-    for (const u of lj.units) {
-      out.units++;
-      const d = decideLocal(u);
-      if (d.ok) continue;
-      stopped = true;
-      out.byProblem[d.problem] = (out.byProblem[d.problem] || 0) + 1;
-    }
-    if (stopped) out.stopDrafts++;
+    out.units += lj.units.length;
+    const bad = gateProblemsOf(lj);
+    if (!bad.length) continue;
+    out.stopDrafts++;
+    if (['on_hold', 'excluded'].includes(String(d.status || ''))) out.heldStopDrafts++;
+    for (const { d: x } of bad) out.byProblem[x.problem] = (out.byProblem[x.problem] || 0) + 1;
   }
   return out;
 }

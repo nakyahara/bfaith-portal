@@ -384,6 +384,57 @@ try {
     for (const m of [...r.text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)]) { if (/application\/json/.test(m[1])) JSON.parse(m[2]); else if (!/\bsrc=/.test(m[1])) new vm.Script(m[2]); }
   });
 
+  await ta('[G4] 🚨 「今止めたら止まる」の数 = 門 (janListingBlock) と同じ答え: 商品コードが無い商品も数える・一括の単位は 1 件ずつと同じ・保留 / 除外も数える (Codex #1713 R1 M1)', async () => {
+    const dEmpty = draft('', null);   // 商品コードが無い = 門は「出品の商品コードが無い」で止める
+    const dHeld = draft('held01', null);
+    ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(dHeld.id);
+    try {
+      const drafts = ph.prepare(`SELECT d.* FROM product_drafts d LEFT JOIN draft_rakuten r ON r.draft_id = d.id WHERE r.registered_at IS NULL AND d.added_to_draft_id IS NULL ORDER BY d.id`).all();
+      const bulk = LJ.listingJanUnitsBulk(ph, drafts);
+      for (const d of drafts) assert.deepEqual(bulk.get(d.id), LJ.listingJanUnits(ph, d.id), `一括と 1 件ずつが違う: ${d.id} ${d.ne_code}`);
+      enforce(true);
+      let blocked;
+      try { blocked = drafts.filter((d) => LJ.janListingBlock(ph, d.id) != null); } finally { enforce(false); }
+      const f = LJ.enforceForecast(ph);
+      assert.equal(f.stopDrafts, blocked.length, `数 ${f.stopDrafts} / 門で止まる ${blocked.length}`);
+      assert.ok(blocked.some((d) => d.id === dEmpty.id) && f.byProblem.no_code === 1, JSON.stringify(f));
+      assert.ok(blocked.some((d) => d.id === dHeld.id) && f.heldStopDrafts >= 1, JSON.stringify(f));
+      enforce(true);
+      try { assert.match(LJ.janListingBlock(ph, dEmpty.id), /出品の商品コードが無い: 出品の商品コードが無いので JAN を確かめられない/); } finally { enforce(false); }
+    } finally {
+      ph.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(dEmpty.id, dHeld.id);
+    }
+  });
+
+  await ta('[G5] 🚨 数えきれない (読めない表がある) = 黙って外さず「数えきれていない・信用しない」と出す (数のタイルは出さない)', async () => {
+    ph.exec('ALTER TABLE draft_sku_catalog_exemptions RENAME TO draft_sku_catalog_exemptions_x');
+    try {
+      assert.throws(() => LJ.enforceForecast(ph), /no such table/);
+      const r = await call('GET', '/apps/product-hub/jan-link', { session: 'admin' });
+      assert.equal(r.status, 200);
+      assert.ok(r.text.includes('id="jl-forecast-error"') && r.text.includes('数えきれていません') && r.text.includes('この画面の数は信用しないでください'), '数えきれていないと出ない');
+      assert.ok(!r.text.includes('id="jl-forecast-stop"'), '数えきれていないのに数を出した');
+    } finally { ph.exec('ALTER TABLE draft_sku_catalog_exemptions_x RENAME TO draft_sku_catalog_exemptions'); }
+  });
+
+  await ta('[G6] 数えるのに SQLite を読む回数はドラフトの数によらない (一括・Codex #1713 R1 L1)', () => {
+    const countPrepares = () => {
+      const orig = ph.prepare;
+      let n = 0;
+      ph.prepare = function (...a) { n++; return orig.apply(this, a); };
+      try { LJ.enforceForecast(ph); } finally { ph.prepare = orig; }
+      return n;
+    };
+    const before = countPrepares();
+    const ids = [];
+    ph.transaction(() => { for (let i = 0; i < 40; i++) ids.push(Number(ph.prepare('INSERT INTO product_drafts (ne_code, name, jan_code) VALUES (?, ?, ?)').run(`many-${i}`, 'x', JAN.z1).lastInsertRowid)); })();
+    try {
+      const after = countPrepares();
+      assert.equal(after, before, `ドラフトを 40 足したら読む回数が ${before} → ${after}`);
+      assert.ok(before <= 12, `読む回数 ${before}`);
+    } finally { ph.prepare(`DELETE FROM product_drafts WHERE id IN (${ids.join(',')})`).run(); }
+  });
+
   // ═══ P 段 5: 送る直前の 1 か所 ═══
   console.log('P 送る直前の 1 か所 (段 5)');
   await ta('[P1] 既定 = Company DB を読まずに今までどおり jan_code を送る (手で打った値もそのまま)', async () => {
@@ -504,6 +555,32 @@ try {
       assert.equal(r.j.ok, false);
       assert.ok(r.j.reasons.some((x) => /商品マスタに結ばれていない: 商品コード s002/.test(x)), JSON.stringify(r.j.reasons));
     } finally { enforce(false); }
+  });
+
+  await ta('[P7b] 🚨 設定ありのプレビューは Company DB を 1 回だけ読み、payload の確かめと B1 の印の両方に使う (Codex #1713 R1 M2)', async () => {
+    enforce(true);
+    ph.prepare('UPDATE product_drafts SET jan_code = ? WHERE id = ?').run(JAN.x1, dS3.id);   // 商品マスタに無い JAN を手で打った
+    setReason(dS3.id, null);
+    try {
+      reads = 0;
+      let r = await call('GET', `/apps/product-hub/api/drafts/${dS3.id}/rakuten/preview`);
+      assert.equal(reads, 1, `読んだ回数 ${reads}`);
+      assert.equal(r.j.ok, false);
+      assert.ok(r.j.reasons.some((x) => /商品マスタに結ばれていない: 商品コード s003/.test(x)), JSON.stringify(r.j.reasons));
+      assert.ok(r.j.warnings.some((w) => /^JAN Company DB に無い: s003/.test(w)), JSON.stringify(r.j.warnings));
+      assert.ok(!r.j.warnings.some((w) => /比べられませんでした/.test(w)), '2 回目の読みが期限切れ / 読めない');
+      reads = 0;
+      r = await call('GET', `/apps/product-hub/api/drafts/${dS1.id}/rakuten/preview`);
+      assert.equal(reads, 1, `読んだ回数 ${reads}`);
+      assert.equal(r.j.ok, true, JSON.stringify(r.j.reasons));
+      assert.ok(!(r.j.warnings || []).some((w) => /^JAN /.test(w)), JSON.stringify(r.j.warnings));
+      // 読めない = 1 回だけ試して、payload は止まり、印は「比べられませんでした」
+      readable = false; reads = 0;
+      r = await call('GET', `/apps/product-hub/api/drafts/${dS1.id}/rakuten/preview`);
+      assert.equal(reads, 1);
+      assert.equal(r.j.ok, false);
+      assert.ok(r.j.warnings.some((w) => /比べられませんでした \(テストで読めない\)/.test(w)));
+    } finally { enforce(false); readable = true; ph.prepare('UPDATE product_drafts SET jan_code = NULL WHERE id = ?').run(dS3.id); }
   });
 
   await ta('[P8] ソース: 登録は「確かめる → payload → 送る直前の決まり → PUT」の順・決まりと PUT の間に await を挟まない・送る道は registerItem だけ', () => {

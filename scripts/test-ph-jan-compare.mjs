@@ -600,7 +600,9 @@ try {
     const route = "router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {";
     const at = src.indexOf(route);
     assert.match(src.slice(at + route.length, at + route.length + 200), /^\s*const janDeadlineAt = Date\.now\(\) \+ JAN_READ_DEADLINE_MS;/);
-    assert.match(src, /compareJanUnits\(janUnits, \{ deadlineAt: janDeadlineAt \}\)/);
+    // (B2: 止める設定のときは同じ 1 回の読みの答え janRead を渡す・設定が無ければ janRead は null = ここで期限つきで読む)
+    assert.match(src, /compareJanUnits\(janCmpUnits, \{ deadlineAt: janDeadlineAt, read: janRead \}\)/);
+    assert.match(src, /const janCmpUnits = janLj \? \{ mode: janLj\.mode, units: janLj\.units\.map\(\(u\) => \(\{ code: u\.code, phJan: u\.phJan \}\)\) \} : janUnits;/);
   });
   await ta('[R4c] 🚨 プレビューの途中 (ジャンルの辞書を待つ間) に JAN が保存されても、payload と同じ今の値で比べる (Codex #1700 R1 M4)', async () => {
     const saved = { WAREHOUSE_URL: process.env.WAREHOUSE_URL, CF_ACCESS_CLIENT_ID: process.env.CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET: process.env.CF_ACCESS_CLIENT_SECRET, WAREHOUSE_SERVICE_TOKEN: process.env.WAREHOUSE_SERVICE_TOKEN };

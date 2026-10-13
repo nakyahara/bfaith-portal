@@ -66,14 +66,15 @@
     <% if (janForecast && !janForecast.error) { %>
       <div class="jl-tiles">
         <div class="jl-tile"><div class="n"><%= janForecast.drafts %></div><div class="l">楽天に未登録の商品</div></div>
-        <div class="jl-tile <%= janForecast.stopDrafts ? 'review' : 'link' %>"><div class="n"><%= janForecast.stopDrafts %></div><div class="l">今止めたら止まる商品</div></div>
+        <div class="jl-tile <%= janForecast.stopDrafts ? 'review' : 'link' %>" id="jl-forecast-stop"><div class="n"><%= janForecast.stopDrafts %></div><div class="l">今止めたら止まる商品</div></div>
+        <% if (janForecast.heldStopDrafts) { %><div class="jl-tile"><div class="n"><%= janForecast.heldStopDrafts %></div><div class="l">うち 保留・除外の商品</div></div><% } %>
         <% for (const [k, n] of Object.entries(janForecast.byProblem || {})) { %>
           <div class="jl-tile review"><div class="n"><%= n %></div><div class="l"><%= (janProblems[k] && janProblems[k].label) || k %> (SKU)</div></div>
         <% } %>
       </div>
-      <p class="muted" style="margin:0 0 8px; font-size:12px;">数は product-hub だけで数えた物です (商品マスタで JAN が外れた物は、出品のときに確かめて止まります)。</p>
+      <p class="muted" style="margin:0 0 8px; font-size:12px;">数は product-hub だけで、出品の門と同じ決まりで数えた物です (楽天に未登録の商品・保留や除外も含む。商品マスタで JAN が外れた物は、出品のときに確かめて止まります)。</p>
     <% } else if (janForecast && janForecast.error) { %>
-      <p class="muted" style="font-size:12px;">止まる数を数えられませんでした (<%= janForecast.error %>)</p>
+      <div class="banner-warn" id="jl-forecast-error">⚠️ 止まる数を<strong>数えきれていません</strong> (<%= janForecast.error %>)。この画面の数は信用しないでください。直るまで止める設定は入れないでください。</div>
     <% } %>
     <ul class="muted" style="margin:0; padding-left:18px; font-size:12px;">
       <li>入れ方: Render の環境変数に <code><%= janEnforceEnv %>=1</code> を入れて再起動します。戻すときは消して (か <code>0</code> にして) 再起動します。</li>

@@ -2427,14 +2427,20 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   // 🆕 カタログID (JAN) を止める設定 (Company DB構想 21 B2 の段 4・5) のときは、登録と同じく結んだ JAN を Company DB で確かめ直して payload を組む (止まる理由も同じ)。
   //    設定が無ければ Company DB を読まずに今までどおり (下で「設定を入れたら止まる」単位を知らせるだけ)
   const janEnforce = janEnforceOn();
-  const janGate = janEnforce ? await resolveListingJans(db, draft.id, { enforce: true, deadlineAt: janDeadlineAt }) : null;
+  //    設定のときは、単位を組み (読む前の SQLite の値)、全部の単位の組で Company DB を **1 回だけ** 読んで、その答えを payload の確かめと B1 の印の両方に使う
+  //    (2 回読むと 2 回目が共通の期限で切れる・読み枠を余計に使う・間に変わると payload と印が食い違う・Codex #1713 R1 M2)
+  const janLj = janEnforce ? listingJanUnits(db, draft.id) : null;
+  const janRead = janLj ? await readCdbJans(janLj.units.map((u) => ({ code: u.code, jan: u.phJan })), { deadlineAt: janDeadlineAt }) : null;
+  const janGate = janEnforce ? await resolveListingJans(db, draft.id, { enforce: true, lj: janLj, read: janRead }) : null;
   const built = buildItemPayload(db, draft.id, { tax, jan: janGate });
   // 🆕 JAN を Company DB と比べた印 (Company DB構想 21 §5 B1)。知らせだけ = payload も送る値も変えない・出品も止めない。
   //    🚨 比べる値は payload を作った直後に await を挟まずに読み直す (= payload と同じ値。上の await の間に JAN が保存されてもずれない・Codex #1700 R1 M4)
   const janUnits = janUnitsForDraftId(db, draft.id);
+  //    設定のときの payload の JAN は確かめた単位 (janLj) の値 = 印もその単位と同じ読みの答えで比べる
+  const janCmpUnits = janLj ? { mode: janLj.mode, units: janLj.units.map((u) => ({ code: u.code, phJan: u.phJan })) } : janUnits;
   const janNotices = janEnforce ? [] : janLinkNotices(db, draft.id);
   // (プレビューの JAN の読みは入口から 4.5 秒まで。辞書・税率で使い切っていれば読みに行かず「読めない」の一言)
-  const warnings = [...(tax.warning ? [tax.warning] : []), ...janNotices, ...janWarningsOf(await compareJanUnits(janUnits, { deadlineAt: janDeadlineAt }), { enforce: janEnforce })];
+  const warnings = [...(tax.warning ? [tax.warning] : []), ...janNotices, ...janWarningsOf(await compareJanUnits(janCmpUnits, { deadlineAt: janDeadlineAt, read: janRead }), { enforce: janEnforce })];
   if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(warnings.length ? { warnings } : {}) });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
