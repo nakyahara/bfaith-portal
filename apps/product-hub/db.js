@@ -1937,6 +1937,42 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_ph_cdb_group_events_group ON ph_cdb_group_events(cdb_group_product_id, revision);
   `);
+  // 🆕 JAN を商品マスタ (Company DB) の JAN に結ぶ (2026-10-13・Company DB構想 21 §5 B2 の段 1)。
+  //   楽天に出す JAN は「Company DB の有効な JAN から選んだ物」にする (中原さんの決定 3 = a)。選んだ物は値だけでなく
+  //   Company DB の外部 ID の行番号 (core.external_ids.external_id_row) と、選んだときの値で持つ (Codex R2 Medium 2 / R3 High 2)。
+  //   列は全部 空でよい (今ある行は空のまま = 何も変わらない)。今ある値を移すのは管理者のボタン (services/jan-link.mjs・段 2)。
+  //   移す間も楽天の出品は今の列 (jan_code) を読む (段 3 で切り替える)。
+  //     jan_cdb_row    = 結んだ Company DB の JAN の行番号 (外部 ID)
+  //     jan_cdb_value  = 結んだときの Company DB の JAN の値 (行が外されたか・値が変わったかを後で確かめる印)
+  //     jan_link_state = linked (結んだ) / needs_review (要確認 = 1 つに決まらない) / NULL (まだ)
+  //     jan_link_reason = 要確認の理由 (services/jan-link.mjs の JAN_LINK_REASONS)
+  //     jan_linked_at / jan_linked_by = だれがいつ (ボタンを押した人)
+  for (const table of ['product_drafts', 'draft_sku_jans']) {
+    const cols = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+    for (const [col, ddl] of [
+      ['jan_cdb_row', 'INTEGER'],
+      ['jan_cdb_value', 'TEXT'],
+      ['jan_link_state', "TEXT CHECK (jan_link_state IN ('linked', 'needs_review'))"],
+      ['jan_link_reason', 'TEXT'],
+      ['jan_linked_at', 'TEXT'],
+      ['jan_linked_by', 'TEXT'],
+    ]) {
+      if (!cols.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
+    }
+  }
+  // 移すボタンの記録 (だれがいつ・数えた / 移した・結果)。消さない
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_jan_link_runs (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind        TEXT NOT NULL CHECK (kind IN ('preview', 'apply')),
+      outcome     TEXT NOT NULL CHECK (outcome IN ('ok', 'refused', 'failed')),
+      actor       TEXT NOT NULL,
+      plan_hash   TEXT,
+      counts_json TEXT,
+      error       TEXT,
+      created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+  `);
   // ページ表記の自動保存 (#691): ページロードごとのトークン + 単調増加 seq。
   // 自動保存とpagehideビーコンの到着順が逆転しても「古いリクエストが新しい保存を
   // 上書きしない」ためのリビジョン (同一トークン内でのみ seq を比較する)

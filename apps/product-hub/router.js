@@ -179,6 +179,9 @@ import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLega
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
 import { compareDraftJans, compareJanUnits, janUnitsForDraftId, boardJanMarks, parseBoardDraftIds, janWarningsOf, JAN_READ_DEADLINE_MS } from './services/cdb-jan-compare.mjs';
+import {
+  buildJanLinkPlan, applyJanLinkPlan, planView, recordJanLinkRun, recentJanLinkRuns, tryLockJanLink, unlockJanLink, JanLinkConflict, JAN_LINK_REASONS,
+} from './services/jan-link.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -3330,6 +3333,81 @@ router.get('/api/board/jan-check', async (req, res) => {
     console.error('[product-hub] board jan-check:', e);
     res.json({ ok: true, readable: false, reason: '比べる途中で失敗した', checked: 0, byDraft: {} });
   }
+});
+
+// 🆕 JAN を商品マスタ (Company DB) の JAN に結ぶ (Company DB構想 21 §5 B2 の段 2・中原さんの答え 10/13 = a: 管理画面のボタン)。
+//    管理者だけ。「数える」(書かない) → 見た計画の印 (hash) を付けて「移す」= 数え直して同じときだけ product-hub の SQLite に 1 つの取引で書く。
+//    だれがいつ押したかは ph_jan_link_runs と、商品ごとの draft_events (jan_linked)。Company DB は読むだけ
+const isPhAdmin = (req) => req.session?.role === 'admin';
+// CSRF の守り (Codex #1707 R1 M6・master-edit と同じ二段): 書く口 (数える = 記録を書く・移す) は Origin 必須で Host と一致・本文は JSON。
+//   product-hub のほかの口には今は付けていない = この 2 本だけ (product-hub 全体に広げるのは別の話)
+function janLinkCsrfGuard(req, res, next) {
+  const origin = req.headers.origin;
+  let host = null;
+  try { host = origin ? new URL(origin).host : null; } catch { /* 壊れた Origin は不一致 */ }
+  if (!host || host !== req.headers.host) return res.status(403).json({ ok: false, error: 'ブラウザの画面から押してください (Origin が違う / 無い)' });
+  if (!/^application\/json\b/i.test(String(req.headers['content-type'] || ''))) return res.status(415).json({ ok: false, error: 'Content-Type は application/json にしてください' });
+  next();
+}
+/** 失敗・断りの記録 (記録そのものが失敗しても答えは変えない = 何も書いていないことは同じ) */
+function recordJanLinkRunSafe(db, run) {
+  try { recordJanLinkRun(db, run); } catch (e) { console.error('[product-hub] jan-link の記録に失敗:', e && e.message); }
+}
+router.get('/jan-link', (req, res) => {
+  const admin = isPhAdmin(req);
+  res.status(admin ? 200 : 403).render(view('jan-link.ejs'), {
+    title: 'JAN を商品マスタに結ぶ',
+    displayName: req.session?.displayName || req.session?.email || '',
+    isAdmin: admin,
+    runs: admin ? recentJanLinkRuns(getDB()) : [],
+    reasons: JAN_LINK_REASONS,
+  });
+});
+router.post('/api/jan-link/preview', janLinkCsrfGuard, async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // Company DB を読む期限は要求の入口から (B1 と同じ)
+  if (!isPhAdmin(req)) return res.status(403).json({ ok: false, error: '管理者だけが使えます' });
+  const db = getDB();
+  const actor = actorOf(req);
+  let plan;
+  try { plan = await buildJanLinkPlan(db, { deadlineAt }); } catch (e) { plan = { ok: false, reason: String((e && e.message) || e).slice(0, 160) }; }
+  if (!plan.ok) {
+    recordJanLinkRunSafe(db, { kind: 'preview', outcome: 'failed', actor, error: plan.reason });
+    return res.status(503).json({ ok: false, error: `商品マスタ (Company DB) を読めないので数えられません (${plan.reason})。何も書いていません` });
+  }
+  recordJanLinkRun(db, { kind: 'preview', outcome: 'ok', actor, hash: plan.hash, counts: plan.counts });
+  res.json({ ok: true, ...planView(plan) });
+});
+router.post('/api/jan-link/apply', janLinkCsrfGuard, async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // Company DB を読む期限は要求の入口から (B1 と同じ)
+  if (!isPhAdmin(req)) return res.status(403).json({ ok: false, error: '管理者だけが使えます' });
+  if (req.body?.confirm !== true) return res.status(400).json({ ok: false, error: 'confirm が必要です' });
+  const seen = typeof req.body?.hash === 'string' ? req.body.hash : '';
+  if (!/^[0-9a-f]{64}$/.test(seen)) return res.status(400).json({ ok: false, error: '先に「数える」を押してください (hash が無い)' });
+  const db = getDB();
+  const actor = actorOf(req);
+  if (!tryLockJanLink()) {
+    recordJanLinkRunSafe(db, { kind: 'apply', outcome: 'refused', actor, hash: seen, error: 'ほかの人が移している途中' });
+    return res.status(409).json({ ok: false, error: 'ほかの人が移している途中です。終わってから「数える」からやり直してください' });
+  }
+  try {
+    const plan = await buildJanLinkPlan(db, { deadlineAt });
+    if (!plan.ok) {
+      recordJanLinkRunSafe(db, { kind: 'apply', outcome: 'failed', actor, hash: seen, error: plan.reason });
+      return res.status(503).json({ ok: false, error: `商品マスタ (Company DB) を読めないので移せません (${plan.reason})。何も書いていません` });
+    }
+    if (plan.hash !== seen) {
+      recordJanLinkRunSafe(db, { kind: 'apply', outcome: 'refused', actor, hash: seen, counts: plan.counts, error: `数えた後に内容が変わった (今 ${plan.hash.slice(0, 12)})` });
+      return res.status(409).json({ ok: false, error: '数えた後に内容が変わりました (もう移した・JAN が直された・商品マスタが変わった など)。何も書いていません。もう一度「数える」を押してください', ...planView(plan) });
+    }
+    // 成功の記録は JAN の更新と同じ SQLite の取引の中 (記録に失敗 = 更新も戻る = 「全部 元に戻しました」が本当になる・Codex #1707 R1 H2)
+    const r = applyJanLinkPlan(db, plan, { actor, record: ({ written }) => recordJanLinkRun(db, { kind: 'apply', outcome: 'ok', actor, hash: plan.hash, counts: { ...plan.counts, written } }) });
+    res.json({ ok: true, written: r.written, drafts: r.drafts });
+  } catch (e) {
+    const conflict = e instanceof JanLinkConflict;
+    if (!conflict) console.error('[product-hub] jan-link apply:', e);
+    recordJanLinkRunSafe(db, { kind: 'apply', outcome: conflict ? 'refused' : 'failed', actor, hash: seen, error: String((e && e.message) || e) });
+    res.status(conflict ? 409 : 500).json({ ok: false, error: conflict ? `${e.message} (何も書いていません)` : '途中で失敗したので全部 元に戻しました (何も書いていません)' });
+  } finally { unlockJanLink(); }
 });
 
 router.get('/staff', (req, res) => {

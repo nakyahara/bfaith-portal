@@ -408,6 +408,19 @@
       <% if (!isAdmin) { %> ・ 変えられるのは管理者だけです<% } %>
     </div>
   </div>
+
+  <!-- ═══ 🆕 JAN を商品マスタの JAN に結ぶ (2026-10-13・Company DB構想 21 B2) ═══ -->
+  <div class="card" id="jan-link-card">
+    <h2>🔗 JAN を商品マスタの JAN に結ぶ</h2>
+    <p class="muted" style="margin:0 0 8px;">
+      product-hub に今ある JAN を、商品マスタ (Company DB) の JAN と照らして結びます。先に「何件結べるか・何件が要確認か」を数えてから移します。
+    </p>
+    <% if (isAdmin) { %>
+      <a class="btn btn-sm" href="/apps/product-hub/jan-link">JAN を結ぶ画面を開く</a>
+    <% } else { %>
+      <div class="mini">使えるのは管理者だけです</div>
+    <% } %>
+  </div>
 </div>
 
 <script>
