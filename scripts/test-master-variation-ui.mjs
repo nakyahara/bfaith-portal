@@ -550,8 +550,8 @@ await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発
   // 子ごとの記録 (#1706 Codex R1 M1): 原価・JAN は その子に無いときだけ (WH = 子だけの原価 700・JAN あり / BK = どちらも無い)
   const reasons = Object.fromEntries((await q(`select s.code, e.reason from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK')`)).map((r) => [r.code, r.reason]));
   assert.deepEqual(reasons, {
-    'nonegrp-BK': '新商品の登録 (色違い・サイズ違い) · 入力なし: 原価・発送方法・入荷日の管理・発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量・公式ページURL・Amazon・JAN',
-    'nonegrp-WH': '新商品の登録 (色違い・サイズ違い) · 入力なし: 発送方法・入荷日の管理・発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量・公式ページURL・Amazon',
+    'nonegrp-BK': '新商品の登録 (色違い・サイズ違い) · 入力なし: 原価・発送方法・入荷日の管理・公式ページURL・Amazon・JAN · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量',
+    'nonegrp-WH': '新商品の登録 (色違い・サイズ違い) · 入力なし: 発送方法・入荷日の管理・公式ページURL・Amazon · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量',
   });
   assert.deepEqual((await q(`select s.code, c.cost_jpy::int as c from core.sku_costs c join core.skus s on s.sku_id = c.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK') order by s.code`)).map((r) => [r.code, r.c]), [['nonegrp-WH', 700]]);
   assert.equal((await one("select inbound_date_managed from core.products where display_code = 'nonegrp-WH'")).inbound_date_managed, null, '入荷日の管理を入力なし = 不明のまま');

@@ -2400,7 +2400,8 @@ await ta('[61] 入力なし (単品・1440): 必須がそろっても押せな�
   // 送る印 = サーバーと同じ並び (lib/master-register-blanks.mjs の BLANK_KEYS)
   assert.deepEqual(bodies[0].blanks, ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit',
     'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.reference_urls', 'card.set_decision', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
-  assert.equal(await regReason('ui-none-1'), '新商品の登録 · 入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量・発送方法・入荷日の管理・公式ページURL・参考URL・セット商品・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path');
+  // 発注の設定の入力なしは理由の後ろの一言 (要求のハッシュに入らない・#1706 Codex R2 M)
+  assert.equal(await regReason('ui-none-1'), '新商品の登録 · 入力なし: 発送方法・入荷日の管理・公式ページURL・参考URL・セット商品・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量');
   assert.deepEqual(await skuRow('ui-none-1'), { name: '入力なしの試験 ui-none-1', price: 1200, tax: 0.1, shipping_code: null });
 });
 

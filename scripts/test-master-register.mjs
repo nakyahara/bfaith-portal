@@ -2507,7 +2507,7 @@ await ta('[BL3] 登録の API (セット・発注の設定): セットは例外�
   const blanks = ['cost', 'shipping_code', 'inbound_date_managed', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit'];
   r = await call('POST', '/apps/master-edit/api/new', { body: { ...po, order_settings: { order_lot: '12', condition_id: '', material_group_id: '' }, blanks }, session: 'po-editor', blanks: 'raw' });
   assert.equal(r.status, 200, r.text);
-  assert.equal((await regEvents('bl-po-1'))[0].reason, '新商品の登録 · 入力なし: 原価・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量・発送方法・入荷日の管理');
+  assert.equal((await regEvents('bl-po-1'))[0].reason, '新商品の登録 · 入力なし: 原価・発送方法・入荷日の管理 · 発注の設定の入力なし: 発注条件グループ・原料グループ・ケースロット・ケースグループ・容量');
   assert.equal(attrsOf('bl-po-1').order_lot, 12);
   // 発注ロットに値と入力なしの両方 = 断る
   r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl-po-2', { card: { create: false } }), order_settings: { order_lot: '3' }, blanks: [...blanks, 'order_settings.order_lot'] }, session: 'po-editor', blanks: 'raw' });
@@ -2602,6 +2602,47 @@ await ta('[BL5] #1706 Codex R1: まとまりの原価は子ごとの実際の原
   assert.ok(page2.text.includes('data-none="order_settings.order_lot"'));
   r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl-po-read', { card: { create: false } }), blanks: ['cost', 'shipping_code', 'inbound_date_managed'] }, session: 'po-editor', blanks: 'raw' });
   assert.deepEqual([r.status, r.j.field], [400, 'order_settings.order_lot'], r.text);
+});
+
+await ta('[BL6] #1706 Codex R2 M: 発注の設定の「入力なし」は要求のハッシュ (理由) に入れない (記録 = 理由の後ろの一言)・押し直しは初回の記録で決める = 発注アプリが 読めた → 読めない / 読めない → 読めた の押し直しも 200 replayed・発注ロットを足した押し直し = 登録は replayed・発注の設定は mismatch', async () => {
+  // 理由 (ハッシュに入る) は発注の設定の入力なしで変わらない
+  const one0 = blankBody('bl6-x', { card: { create: false } });
+  const main = ['cost', 'shipping_code', 'inbound_date_managed'];
+  const ord = ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit'];
+  assert.equal(BLK.prepareRegisterBody('single', { ...one0, blanks: [...main, ...ord] }).body.reason, BLK.prepareRegisterBody('single', { ...one0, blanks: main }).body.reason);
+  assert.equal(BLK.blankReasonOf('single', null, [...main, ...ord]), '新商品の登録 · 入力なし: 原価・発送方法・入荷日の管理');
+  const ob = BLK.prepareOrderBlanks('single', { ...one0, blanks: [...main, ...ord] }, { orderApplicable: true, reason: '新商品の登録 · 入力なし: 原価' });
+  assert.deepEqual([ob.ok, ob.note], [true, ' · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量']);
+  assert.equal(BLK.prepareOrderBlanks('single', { ...one0, blanks: main }, { orderApplicable: false }).note, null, '発注の欄が出ない = 聞かない');
+  const nb = BLK.prepareOrderBlanks('single', { ...one0, blanks: main }, { orderApplicable: true });
+  assert.deepEqual([nb.ok, nb.status, nb.json.reason, nb.json.field], [false, 400, 'blank_unmarked', 'order_settings.order_lot']);
+  const unread = async (fn) => { podb.exec('ALTER TABLE po_material_groups RENAME TO po_material_groups_regall'); try { return await fn(); } finally { podb.exec('ALTER TABLE po_material_groups_regall RENAME TO po_material_groups'); } };
+  // ① 読めた (6 つも入力なし) → 読めない の押し直し = 200 replayed (前は理由が変わって 409)
+  const b1 = { ...blankBody('bl6-a', { card: { create: false } }), blanks: [...main, ...ord] };
+  let r = await call('POST', '/apps/master-edit/api/new', { body: b1, session: 'po-editor', blanks: 'raw' });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await regEvents('bl6-a'))[0].reason, '新商品の登録 · 入力なし: 原価・発送方法・入荷日の管理 · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量');
+  r = await unread(() => call('POST', '/apps/master-edit/api/new', { body: b1, session: 'po-editor', blanks: 'raw' }));
+  assert.deepEqual([r.status, r.j.replayed], [200, true], r.text);
+  // ② 読めない (画面に発注の欄が無い = 印も無い) → 読めた の押し直し = 200 replayed (前は 400 blank_unmarked)
+  const b2 = { ...blankBody('bl6-b', { card: { create: false } }), blanks: main };
+  r = await unread(() => call('POST', '/apps/master-edit/api/new', { body: b2, session: 'po-editor', blanks: 'raw' }));
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await regEvents('bl6-b'))[0].reason, '新商品の登録 · 入力なし: 原価・発送方法・入荷日の管理', '読めなかった = 発注の設定の一言は無い');
+  r = await call('POST', '/apps/master-edit/api/new', { body: b2, session: 'po-editor', blanks: 'raw' });
+  assert.deepEqual([r.status, r.j.replayed], [200, true], r.text);
+  // ③ 発注ロットを足した押し直し (印から発注ロットを外す) = 登録は前の答え (replayed)・発注の設定は照らし合わせ (mismatch・#1703 の決まり)
+  r = await call('POST', '/apps/master-edit/api/new', { body: { ...b1, order_settings: { order_lot: '30' }, blanks: [...main, ...ord.filter((k) => k !== 'order_settings.order_lot')] }, session: 'po-editor', blanks: 'raw' });
+  assert.deepEqual([r.status, r.j.replayed, r.j.order_settings && r.j.order_settings.status, attrsOf('bl6-a')], [200, true, 'mismatch', null], r.text);
+  // ④ 初回 (記録が無い) は今までどおり 6 つも聞く
+  r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl6-c', { card: { create: false } }), blanks: main }, session: 'po-editor', blanks: 'raw' });
+  assert.deepEqual([r.status, r.j.reason, r.j.field], [400, 'blank_unmarked', 'order_settings.order_lot'], r.text);
+  // ⑤ 失敗の記録がある request_id の押し直し = 前と同じ誤り (発注アプリの状態で変わらない)
+  const b5 = { ...blankBody('s001', { card: { create: false } }), blanks: [...main, ...ord] };
+  const f1 = await call('POST', '/apps/master-edit/api/new', { body: b5, session: 'po-editor', blanks: 'raw' });
+  assert.equal(f1.status, 409, f1.text);
+  const f2 = await unread(() => call('POST', '/apps/master-edit/api/new', { body: b5, session: 'po-editor', blanks: 'raw' }));
+  assert.deepEqual([f2.status, f2.j.reason], [f1.status, f1.j.reason], f2.text);
 });
 
 server.close();
