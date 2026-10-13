@@ -2356,6 +2356,56 @@ await ta('[61] Amazon SKU の新しい対応 (10/13): 開くと構成の 1 行�
   assert.equal(await p.evaluate(() => !!(document.getElementById('comp').compareDocumentPosition(document.getElementById('name')) & Node.DOCUMENT_POSITION_FOLLOWING)), true);
 });
 
+await ta('[63] Amazon SKU (#1704 Codex R1): 既にある行のコードを消して保存 = 保存しない・理由 (構成から外れない) / 外すなら消える / 数だけ変えた新しい行は空の行でない (未保存に数える・「足す」は足す・保存は止める)', async (p) => {
+  const rows = p.locator('#comp-rows tr.comp-row');
+  const saveAndWait = async () => { await p.keyboard.press('Control+s'); await p.waitForSelector('#saved-note'); };
+  // A×1・B×1 の対応を作る
+  await p.goto(B + '/amazon/sku?sku=pr-row1-c');
+  await rows.first().locator('.c-code').fill('k004');
+  await rows.first().locator('.c-code').press('Tab');
+  await p.waitForFunction(() => document.getElementById('name').value !== '');
+  await p.click('#comp-add');
+  await rows.nth(1).locator('.c-code').fill('k005');
+  await rows.nth(1).locator('.c-code').press('Tab');
+  await saveAndWait();
+  assert.deepEqual(await compsUi('pr-row1-c'), [['k004', 1], ['k005', 1]]);
+  assert.equal(await rows.count(), 2);
+  // 既にある行 (読み込んだ k004) のコードを消して Ctrl+S = 保存しない・理由・その欄へ
+  await rows.first().locator('.c-code').fill('');
+  assert.equal(await dirty(p), 1, 'コードを消した = 変更 (構成から外れたことにはしない)');
+  assert.match(await p.textContent('#save-diff'), /k004×1, k005×1[\s\S]*→[\s\S]*×1, k005×1/);
+  await p.keyboard.press('Control+s');
+  await p.waitForFunction(() => /コード\) が空です/.test(document.getElementById('msg').textContent));
+  assert.match(await p.textContent('#msg'), /^1 行目の NE の商品 \(コード\) が空です。何も保存していません。.*「外す」/);
+  assert.equal(await active(p), '1 行目の NE コード');
+  assert.deepEqual(await compsUi('pr-row1-c'), [['k004', 1], ['k005', 1]], '何も保存していない (k004 は外れていない)');
+  // 「外す」(ゴミ箱) なら構成から外れる
+  await rows.first().locator('button[data-act="del"]').click();
+  assert.equal(await rows.count(), 1);
+  await saveAndWait();
+  assert.deepEqual(await compsUi('pr-row1-c'), [['k005', 1]]);
+  // 数だけ 2 にした新しい行 = 空の行ではない (未保存に数える・「足す」は新しい行を足す・保存は止める)
+  await p.click('#comp-add');
+  assert.equal(await rows.count(), 2);
+  assert.equal(await dirty(p), 0, '足しただけの行は数えない');
+  await rows.nth(1).locator('.c-qty').fill('2');
+  assert.equal(await dirty(p), 1, '数を変えた新しい行は数える');
+  await p.click('#comp-add');
+  assert.equal(await rows.count(), 3, '数を変えた行は空の行でない = 「足す」は新しい行を足す (判定は 1 つ)');
+  await p.keyboard.press('Control+s');
+  await p.waitForFunction(() => /2 行目の NE の商品 \(コード\) が空です/.test(document.getElementById('msg').textContent));
+  assert.deepEqual(await compsUi('pr-row1-c'), [['k005', 1]], '何も保存していない');
+  // 一度コードを入れた新しい行 = 既にある行と同じ (消しても数える)
+  await rows.nth(2).locator('.c-code').fill('k002');
+  await rows.nth(2).locator('.c-code').fill('');
+  await p.click('#comp-add');
+  assert.equal(await rows.count(), 4, '一度コードが入った行は空の行でない');
+  await p.click('#revert');
+  assert.equal(await rows.count(), 1);
+  assert.equal(await dirty(p), 0);
+  assert.equal(await p.textContent('#msg'), '', '元に戻すと理由も消える');
+});
+
 await ta('[62] Amazon SKU の新しい対応 (390・タッチ): 1 行目がある・勝手にキーボードを出さない (フォーカスしない)・「足す」は 44px・未保存 0', async (p, ctx) => {
   await ctx.close().catch(() => {});
   const c2 = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, locale: 'ja-JP' });

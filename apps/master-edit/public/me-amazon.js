@@ -26,18 +26,31 @@
 
   /* ---------- 欄の値・未保存 ---------- */
   var rowsEl = $('#comp-rows');
-  // 空の行 (コードが空で数がはじめの 1) は数えない = 開いたときの 1 行目・足しただけの行で「未保存」にしない・保存に送らない (新商品のセットの画面 me-new.js と同じ)
-  function components() {
-    return $$('tr.comp-row', rowsEl).map(function (tr) { return { code: $('.c-code', tr).value.trim(), qty: $('.c-qty', tr).value.trim() }; })
-      .filter(function (r) { return r.code || (r.qty && r.qty !== '1'); });
+  /*
+   * 数えない行 = 「まだ何も入れていない新しい行」だけ (#1704 Codex R1 High): 開いたときに出した 1 行目・「足す」で足した行 (data-fresh) で、コードが空・数がはじめの 1 (か空)。
+   *   一度でもコードが入った行は印を外す (= 既にある行と同じ)。読み込んだ行 (既にある構成) はコードを消しても数える = 保存で止めて理由を出す (doSave)。
+   *   構成から外すのは「外す」(ゴミ箱) の操作だけ (コードを消しただけで構成の削除にしない)
+   * 空の行の判定はこの 1 つ (未保存・保存すると変わること・保存・「足す」が全部これを使う・#1704 Codex R1 Low)
+   */
+  function ignorableRow(tr) {
+    if (tr.getAttribute('data-fresh') === '1' && $('.c-code', tr).value.trim()) tr.removeAttribute('data-fresh');
+    if (tr.getAttribute('data-fresh') !== '1') return false;
+    var q = $('.c-qty', tr).value.trim();
+    return !$('.c-code', tr).value.trim() && (!q || q === '1');
   }
+  function componentRows() { return $$('tr.comp-row', rowsEl).filter(function (tr) { return !ignorableRow(tr); }); }
+  function components() {
+    return componentRows().map(function (tr) { return { code: $('.c-code', tr).value.trim(), qty: $('.c-qty', tr).value.trim() }; });
+  }
+  /** 新しい行 (テンプレートから・まだ何も入れていない印つき) */
+  function freshRow() { var tr = $('#comp-tpl').content.firstElementChild.cloneNode(true); tr.setAttribute('data-fresh', '1'); return tr; }
   /*
    * 構成が 0 行 (新しい対応・墓標から戻す) = 開いたときに 1 行目 (空のコード・数 1・代表) を出しておく (中原さん 10/13「NE の商品を足すボタンがいらない。
    * 最初からボタン押した後をデフォルト表示してほしい」)。比べる基準 (initial)・元に戻す の先もこの 1 行の形 = 開いただけで未保存にならない
    */
   var firstRowAdded = false;
   if (rowsEl && D.canSave === '1' && !$('tr.comp-row', rowsEl)) {
-    rowsEl.appendChild($('#comp-tpl').content.firstElementChild.cloneNode(true));
+    rowsEl.appendChild(freshRow());
     relabel(rowsEl.firstElementChild, 0);   // 番号・読み上げの名前 (元に戻す の先の形にも入る)
     firstRowAdded = true;
   }
@@ -389,11 +402,11 @@
       if (e.target.classList.contains('c-code')) { e.preventDefault(); var q = $('.c-qty', e.target.closest('tr')); if (q) { q.focus(); q.select(); } }
     });
     $('#comp-add').addEventListener('click', function () {
-      // 最後の行がまだ空 (コードなし) = 新しい行を足さずにその欄へ (空の行を重ねない)
+      // 最後の行が「まだ何も入れていない新しい行」= 新しい行を足さずにその欄へ (空の行を重ねない・判定は ignorableRow の 1 つ)
       var last = rowsEl.lastElementChild;
-      if (last && !$('.c-code', last).value.trim()) { $('.c-code', last).focus(); return; }
+      if (last && ignorableRow(last)) { $('.c-code', last).focus(); return; }
       if ($$('tr.comp-row', rowsEl).length >= (P.maxComponents || 20)) { ME.toast('構成は ' + (P.maxComponents || 20) + ' 行までです'); return; }
-      rowsEl.appendChild($('#comp-tpl').content.firstElementChild.cloneNode(true));
+      rowsEl.appendChild(freshRow());
       renumber();
       $('.c-code', rowsEl.lastElementChild).focus();
     });
@@ -402,6 +415,7 @@
     tracked().forEach(function (el) { if (initial.has(el) && el.id !== 'comp') el.value = initial.get(el); });
     if (sug) closeSug();
     if (rowsEl) rowsEl.innerHTML = initialRows;
+    msg('msg', '');
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });
     update(); ME.toast('変更を元に戻しました');
   });
@@ -481,6 +495,15 @@
   }
   function doSave() {
     if (!saveBtn || saveBtn.disabled || busy) return;
+    // 数える行でコードが空 = 保存しない (コードを消しただけで構成から外れない = 外すのは「外す」の操作だけ・#1704 Codex R1 High)
+    var blank = componentRows().filter(function (tr) { return !$('.c-code', tr).value.trim(); });
+    if (blank.length) {
+      var at = $$('tr.comp-row', rowsEl).indexOf(blank[0]) + 1;
+      msg('msg', at + ' 行目の NE の商品 (コード) が空です。何も保存していません。この行を構成から外すときは、行の右の「外す」(ゴミ箱) を押してください', 'err');
+      var row = $('[data-row="components"]', scope); if (row) row.classList.add('err');
+      $('.c-code', blank[0]).focus();
+      return;
+    }
     post('/api/amazon/save', { request_id: requestId, seller_sku: P.sku, name: $('#name').value, components: components(), reason: $('#reason').value, seen: { versions: versions } }, saveBtn, 'msg');
   }
   if (saveBtn && canSave) saveBtn.addEventListener('click', doSave);
