@@ -2695,7 +2695,7 @@ const lzMirror = ({ keys = [], bc = [], at = LZ_NOW, ok = true, state = 'checked
   const bcAt = state === 'stale' ? new Date(Date.now() - 40 * 3600e3).toISOString() : rows.length ? at : null;
   return { ok, reason: ok ? null : '写しがありません', keys: new Set(keys.map((k) => k.toLowerCase())),
     ids: rows.reduce((m, [id]) => { const l = id.toLowerCase(); if (!m.has(l)) m.set(l, new Set()); m.get(l).add(id); return m; }, new Map()),
-    barcodes: new Map(rows.map(([id, v]) => [v, id])), list_as_of: at, bc_as_of: bcAt, rows: Math.max(1, keys.length),
+    barcodes: rows.reduce((m, [id, v]) => m.set(v, new Set([...(m.get(v) || []), id])), new Map()), list_as_of: at, bc_as_of: bcAt, rows: Math.max(1, keys.length),
     bc: { ok: state === 'checked' ? rows.length > 0 : state === 'stale', reason: state === 'unavailable' ? '写しがありません' : null, rows: rows.length, empty: state === 'empty' } };
 };
 let LZM = lzMirror({ bc: [['zz-any', 'X00ZZZZANY']] });
@@ -2750,6 +2750,22 @@ await ta('[LZ-H2] 単品の登録 × ロジザードの写し (#1719 R1 High 2):
     LZM = lzMirror({ state: 'unavailable' });
     const r2 = await regApi('lzh-u6', { kind: 'lz_assign' });
     assert.deepEqual([r2.status, r2.j.lz_unchecked], [200, undefined], '空欄に照らせていない印');
+    // 🆕 #1719 R3 High: 応答が失われた後の再送 (同じ request_id) = 印は DB に残した結果から (今の写しで作らない)
+    LZM = lzMirror({ state: 'stale', bc: [['zz-old', 'X00LZHWARE']] });
+    const rid = uuid();
+    const f1 = await regApi('lzh-u7', { kind: 'value', value: 'X00LZU0007' }, { body: { request_id: rid } });   // この応答は届かなかったことにする
+    assert.equal(f1.status, 200, f1.text);
+    LZM = lzMirror({ bc: [['zz-old', 'X00LZHWARE']] });
+    const f2 = await regApi('lzh-u7', { kind: 'value', value: 'X00LZU0007' }, { body: { request_id: rid } });
+    assert.deepEqual([f2.status, f2.j.replayed, f2.j.lz_unchecked && f2.j.lz_unchecked.state, f2.j.lz_unchecked && f2.j.lz_unchecked.codes], [200, true, 'stale', ['lzh-u7']], f2.text);
+    assert.equal(f2.j.lz_unchecked.as_of, f1.j.lz_unchecked.as_of, '残した写しの時刻');
+    assert.ok(f2.j.lz_unchecked.note.includes('GAS の H 列に入れる前に'), f2.j.lz_unchecked.note);
+    // 逆: 照らせた登録を写しが読めなくなってから再送 = 印なし
+    const rid2 = uuid();
+    assert.equal((await regApi('lzh-u8', { kind: 'value', value: 'X00LZU0008' }, { body: { request_id: rid2 } })).j.lz_unchecked, undefined);
+    LZM = lzMirror({ state: 'unavailable' });
+    const f3 = await regApi('lzh-u8', { kind: 'value', value: 'X00LZU0008' }, { body: { request_id: rid2 } });
+    assert.deepEqual([f3.status, f3.j.replayed, f3.j.lz_unchecked], [200, true, undefined], f3.text);
   } finally { LZM = lzMirror({ bc: [['zz-any', 'X00ZZZZANY']] }); }
 });
 

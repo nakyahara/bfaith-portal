@@ -1185,7 +1185,7 @@
             + '<li>まとまり ' + esc(x.j.group_code) + (x.j.group_created ? ' を作りました' : ' に足しました (今ある ' + (m.pk ? m.pk.kids.length : 0) + ' 件は変更なし)') + ' (軸・選択肢も一緒に記録)</li>'
             + '<li>' + afterCsvText(m.pk ? m.pk.pendingUnfiled : 0, kids.length, S.nextOpts.length > 0) + '</li>'
             // 🆕 #1719 R1 High 2: ロジザードの写しが読めない・空・古い = 保存はした・照らせていない印。R2 High: 手順の一文 (GAS の H 列の前にロジザードで確かめる) はサーバーの note
-            + (x.j.lz_unchecked ? '<li style="color:var(--warn)" data-lz-unchecked="' + esc(x.j.lz_unchecked.state) + '">ロジザードのバーコード: ' + esc(x.j.lz_unchecked.note || ('ロジザードの写しと照らせていません (' + x.j.lz_unchecked.words + ')')) + '</li>' : '')
+            + (x.j.lz_unchecked ? '<li style="color:var(--warn)" data-lz-unchecked="' + esc(x.j.lz_unchecked.state) + '">ロジザードのバーコード' + (x.j.lz_unchecked.codes && x.j.lz_unchecked.codes.length ? ' (' + esc(x.j.lz_unchecked.codes.join('・')) + ')' : '') + ': ' + esc(x.j.lz_unchecked.note || ('ロジザードの写しと照らせていません (' + x.j.lz_unchecked.words + ')')) + '</li>' : '')
             + '<li>出品カードはまとまりで 1 枚 (NE の写し待ち)' + (x.j.card ? ' · ' + esc(x.j.card.label) + (x.j.card.status === 'done' ? '' : ' (product-hub のボードを開くと続きを作ります)') : '') + '</li>'
             + (po ? (po.ok ? '<li>発注の設定を ' + po.written + ' 件に入れました</li>'
               // 🆕 0075: 届いていない子 = 知らせは Company DB に残る (自動でもう一度届ける)・要確認の子 = 商品の画面で確かめる

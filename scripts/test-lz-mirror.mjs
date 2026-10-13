@@ -23,7 +23,7 @@ initMirrorDB();
 const { createTables } = await import('../apps/inbound-check/db.js');
 const { importBarcodeMaster } = await import('../apps/inbound-check/barcode-master.js');
 const { importProductMaster } = await import('../apps/inbound-check/product-master.js');
-const { readLzMirror, lzCopyCheck, LZ_COPY_FRESH_HOURS } = await import('../lib/lz-mirror.mjs');
+const { readLzMirror, lzCopyCheck, lzMirrorOwners, LZ_COPY_FRESH_HOURS } = await import('../lib/lz-mirror.mjs');
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -68,8 +68,8 @@ t('[M3] 本物の取込の後 = checked (時刻 = 取込の時刻・ISO の文�
   importedAt = raw;
   const m = readLzMirror(() => getMirrorDB());
   assert.deepEqual([m.ok, m.bc.ok, m.bc.rows, m.rows, m.bc_as_of], [true, true, 3, 2, raw]);
-  assert.equal(m.barcodes.get('X002ABCD1F'), 'pashima-single-KI');
-  assert.equal(m.barcodes.get('4936695001014'), 'Awa-Shio-250');
+  assert.deepEqual([...m.barcodes.get('X002ABCD1F')], ['pashima-single-KI']);
+  assert.deepEqual([...m.barcodes.get('4936695001014')], ['Awa-Shio-250']);
   assert.ok(m.keys.has('awa-shio-250') && m.keys.has('only-in-list') && m.keys.has('pashima-single-ki'));
   assert.deepEqual([...m.ids.get('awa-shio-250')], ['Awa-Shio-250']);
   const c = lzCopyCheck(m, Date.now());
@@ -117,9 +117,33 @@ t('[M6] 商品の一覧の表だけ無い = 一覧は ok でない・バーコ�
   const now = new Date().toISOString();
   sq.prepare("INSERT INTO f_inbound_check_barcode_master (barcode, code_key, product_id, barcode_type, rank, updated_at) VALUES ('X00LZM6001', 'm6', 'M6', 'fnsku', 0, ?)").run(now);
   const m = readLzMirror(() => sq);
-  assert.deepEqual([m.ok, m.bc.ok, m.barcodes.get('X00LZM6001'), m.bc_as_of], [false, true, 'M6', now]);
+  assert.deepEqual([m.ok, m.bc.ok, [...m.barcodes.get('X00LZM6001')], m.bc_as_of], [false, true, ['M6'], now]);
   assert.match(m.reason, /商品の一覧の写しがありません/);
   assert.equal(lzCopyCheck(m, Date.now()).state, 'checked');
+  sq.close();
+});
+t('[M8] 同じ値 (形をそろえると同じ) を持つ商品が複数 (#1719 R3 Medium) = 全部持つ・この商品以外が 1 つでもあれば持ち主・行の順を入れ替えても同じ', () => {
+  for (const [lower, upper] of [['A8', 'B8'], ['B8', 'A8']]) {
+    const sq = new Database(':memory:');
+    createTables(sq);
+    const now = new Date().toISOString();
+    const ins = sq.prepare("INSERT INTO f_inbound_check_barcode_master (barcode, code_key, product_id, barcode_type, rank, updated_at) VALUES (?, ?, ?, 'fnsku', 0, ?)");
+    ins.run('x00lzm8001', lower.toLowerCase(), lower, now);   // 小文字で入った行 (barcode の主キーは別 = 写しには 2 行ある)
+    ins.run('X00LZM8001', upper.toLowerCase(), upper, now);
+    const m = readLzMirror(() => sq);
+    assert.deepEqual([...m.barcodes.get('X00LZM8001')].sort(), ['A8', 'B8'], `${lower}/${upper}`);
+    assert.equal(lzMirrorOwners(m, 'A8', 'X00LZM8001'), 'B8', `${lower}/${upper}`);
+    assert.equal(lzMirrorOwners(m, 'b8', 'X00LZM8001'), 'A8', `${lower}/${upper} (大文字小文字は区別しない)`);
+    assert.equal(lzMirrorOwners(m, null, 'X00LZM8001'), 'A8・B8');
+    assert.equal(lzMirrorOwners(m, 'C8', 'X00LZM8001'), 'A8・B8');
+    assert.equal(lzMirrorOwners(m, 'A8', 'X00LZM8999'), null);
+    sq.close();
+  }
+  // この商品だけ = 持ち主なし
+  const sq = new Database(':memory:');
+  createTables(sq);
+  sq.prepare("INSERT INTO f_inbound_check_barcode_master (barcode, code_key, product_id, barcode_type, rank, updated_at) VALUES ('X00LZM8002', 'a8', 'A8', 'fnsku', 0, ?)").run(new Date().toISOString());
+  assert.equal(lzMirrorOwners(readLzMirror(() => sq), 'a8', 'X00LZM8002'), null);
   sq.close();
 });
 t('[M7] 開けない = unavailable', () => {

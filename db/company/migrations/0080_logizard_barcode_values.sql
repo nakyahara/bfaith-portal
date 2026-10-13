@@ -154,7 +154,8 @@ begin
   end if;
   -- 今の一番新しい行と同じ (種類・値・写しと照らした結果) = 書かない (照らせなかった値を照らせた = 書く)
   if v_cur.rule_row is not null and v_cur.rule = p_kind and v_cur.value is not distinct from p_value and v_cur.lz_copy_state is not distinct from p_lz_state then
-    return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', p_lz_state, 'lz_copy_as_of', p_lz_as_of,
+    -- 書かない = 残っている行の時刻 (#1719 R3 Low: 今回渡された時刻を返すと、画面と DB の時刻が食い違う)
+    return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', v_cur.lz_copy_state, 'lz_copy_as_of', v_cur.lz_copy_as_of,
       'changed', false, 'rule_row', v_cur.rule_row::text);
   end if;
   perform pg_catalog.set_config('ops.logizard_barcode_protocol', '1', true);

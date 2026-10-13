@@ -132,7 +132,7 @@ import { readNeDeleteStock } from './ne-delete-stock.mjs';
 // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
-import { readLzMirror, lzCopyCheck } from '../../lib/lz-mirror.mjs';
+import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -232,8 +232,7 @@ let lzMirrorProvider = defaultLzMirror;
 export function __setLzMirrorProvider(fn) { lzMirrorProvider = fn || defaultLzMirror; }
 /** ロジザードのバーコードマスタの写しで、その値を持っているほかの商品の商品ID (無い = null) */
 function lzMirrorOwner(mirror, code, value) {
-  const owner = mirror && mirror.barcodes ? mirror.barcodes.get(value) : null;
-  return owner && owner.toLowerCase() !== String(code || '').toLowerCase() ? owner : null;
+  return lzMirrorOwners(mirror, code, value);   // #1719 R3 Medium: 同じ値の商品が複数 = この商品以外が 1 つでもあれば断る
 }
 /**
  * 🆕 0080: 新商品の登録の入口で、送ってきたロジザードのバーコードの値を確かめる = ロジザードのバーコードマスタの写しでほかの商品の値 = 409 (DB には写しが無い = ここで)。
@@ -272,6 +271,21 @@ const lzUncheckedOf = (copy) => {
   return { lz_unchecked: { state: copy.state, as_of: Number.isNaN(ms) ? null : new Date(ms).toISOString(), words: LZ_COPY_STATE_WORDS[copy.state] || copy.state,
     as_of_jst: jst, note: lzCopyNote(copy.state, jst) } };
 };
+/**
+ * 🆕 #1719 Codex R3 High: 登録の答えの「照らせていない」印 = この登録 (request_id) が DB に残した子 / 単品の lz_copy_state・lz_copy_as_of から作る。
+ *   押し直し (応答が失われた後の再送) でも同じ印が出る (今の写しでは作らない・印を落とさない)。codes = 照らせていない値の商品コード
+ */
+async function lzSavedUncheckedOf(db, requestId) {
+  const rid = String(requestId ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid) || !(await lzBarcodeReady(db))) return {};
+  const rows = (await db.query(`select s.code, r.lz_copy_state as state, to_char(r.lz_copy_as_of at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as as_of
+    from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id
+    where r.request_id = $1::uuid and r.via = 'register' and r.value is not null and r.lz_copy_state <> 'checked' order by s.code`, [rid])).rows;
+  if (!rows.length) return {};
+  const u = lzUncheckedOf({ state: rows[0].state, as_of: rows[0].as_of });
+  u.lz_unchecked.codes = rows.map((x) => x.code);
+  return u;
+}
 
 /**
  * FBA / FBM (seller SKU の正規化 → 'FBA' / 'FBM')。Render の warehouse-mirror.db の mirror_amazon_sku_fees.fulfillment_channel (読むだけ・16 §3 #9 = Company DB に列を作らない)。
@@ -826,7 +840,7 @@ router.post('/api/variation/check', (req, res) => {
       for (const raw of new Set(b.lz_values)) {
         const sh = lzValueShape(raw);
         if (sh.problem) continue;
-        const owner = mirror.barcodes.get(sh.value) || (await lzHolderInDb(db, null, sh.value));
+        const owner = lzMirrorOwners(mirror, null, sh.value) || (await lzHolderInDb(db, null, sh.value));
         if (owner) lz[sh.value] = owner;
       }
     }
@@ -907,7 +921,7 @@ router.post('/api/new/variation', (req, res) => {
       const t = await tryGroupCard(db, r.event_id);
       if (t) card = { status: t.status, label: CARD_STATUS_LABELS[t.status] || t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null };
     }
-    res.json({ ...r, card, ...(orderInput ? { order_settings: orderResult } : {}), ...(r.replayed ? {} : lzUncheckedOf(lg.copy)) });
+    res.json({ ...r, card, ...(orderInput ? { order_settings: orderResult } : {}), ...(await lzSavedUncheckedOf(db, regId)) });
   }, 'write');
 });
 
@@ -1047,7 +1061,7 @@ router.post('/api/new', (req, res) => {
       if (t) card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null };
     }
     res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null, ...(orderInput ? { order_settings: orderResult } : {}),
-      ...(r.replayed ? {} : lzUncheckedOf(lzCopy && b.logizard_barcode && b.logizard_barcode.kind === 'value' ? lzCopy : null)) });
+      ...(await lzSavedUncheckedOf(db, b.request_id)) });   // #1719 R3 High: 押し直しでも DB に残した結果から
   }, 'write');
 });
 

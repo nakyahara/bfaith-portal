@@ -2679,6 +2679,7 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   ロジザードのバーコードマスタの写し (Render の SQLite) でほかの商品の値 = router が 409。ロジザードの新商品の CSV は今までどおり GAS (H 列に打った値を入れる)・ポータルから出すのは次の PR
 - **写しと照らせたか** (#1719 Codex R1 High 2 / R2): 写しが読めない・空・古い (36 時間) = 保存は通す・値の行に `lz_copy_state` (checked / unavailable / empty / stale) と `lz_copy_as_of` を残す。
   組み合わせは表の CHECK (`ck_slbr_copy_as_of` = checked / stale は時刻あり・ほかは時刻なし) と書く関数 (DB の時計で checked = 36 時間より新しい・stale = 36 時間より前・境目の前後 5 分はどちらでも) で守る。
+  登録の答えの印は、その登録 (request_id) が残した行の結果と時刻から作る (応答が失われた後の再送でも同じ印・#1719 R3)。写しで同じ値を持つ商品が複数 = この商品以外が 1 つでもあれば断る。
   照らせていない値 = 画面に「ロジザードの写しと照らせていません。GAS の H 列に入れる前に、ロジザードの商品マスタで同じバーコードが無いか確かめてください」(人の手順)・商品の一覧の「未入力 → ロジザードの確かめ待ち」で出せる
 - 当て方 (🚨 まだ流さない): `migrate.mjs --dry-run` (0080 だけ・列を足すだけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す (引数なし) → アプリ (**0080 を先に** = 前にアプリが出ても欄を出さないだけ)
 - 試験 = `node scripts/test-lz-barcode.mjs` / `test-lz-mirror.mjs` (写しを読む部品を本物の SQLite と本番の取込で) / `test-master-register.mjs` [R-LZ]・[LZ-H*] / `test-master-variation-batch.mjs` [R-LZ] / 画面 (`test-master-edit-ui.mjs`・`test-master-variation-ui.mjs`)

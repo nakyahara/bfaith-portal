@@ -82,7 +82,8 @@ await ta('[U2] 入れ方: { kind: value, value } / { kind: lz_assign } だけ・
 const item = (code, x = {}) => ({ code_norm: code.toLowerCase(), ne_code: code, name: `商品 ${code}`, cost_src: '100.00', supplier: '1', ...x });
 await ta('[C1] 新商品の CSV のバーコードの列: X00 + 7 字の FNSKU・JAN (チェック数字)・空欄 = 書ける / X0 + 8 字・チェック数字の合わない JAN = 例外', async () => {
   const r = LZ.buildLzCsv([item('a1', { barcode: F1 }), item('a2', { barcode: J1 }), item('a3', { barcode: '' })], 'new');
-  assert.deepEqual(iconv.decode(r.bytes, 'cp932').split('\r\n').slice(1).map((l) => l.split(',')[7]), [F1, J1, '']);
+  // 末尾の改行 (CRLF で終わる CSV) は空の行として数えない (#1719 R3 Low 2)
+  assert.deepEqual(iconv.decode(r.bytes, 'cp932').replace(/\r\n$/, '').split('\r\n').slice(1).map((l) => l.split(',')[7]), [F1, J1, '']);
   for (const v of ['X0LZB00001', JBAD]) assert.throws(() => LZ.buildLzCsv([item('b1', { barcode: v })], 'new'), /バーコードの形/, v);
 });
 
@@ -262,6 +263,15 @@ await ta('[F6] 結果と時刻の組み合わせ (#1719 R2 Medium 1): 直に関�
     }
   } finally { await pg.query('set role deploy'); }
 });
+await ta('[F7] 書かなかった答え (changed: false) = 残っている行の時刻 (#1719 R3 Low 1): 同じ値・同じ stale で写しの時刻だけ違う = 書かない・答えは前の時刻', async () => {
+  const setC = (copy) => asEditor(async () => { await pg.query('begin'); try { const r = await LB.setLzBarcodeInTx(db, { requestId: uuid(), actor: 'naka@test', skuId: ids.lz4, kind: 'fnsku', value: 'X00LZF7001', via: 'sku_page', seenRow: await latestRow('lz4'), copy }); await pg.query('commit'); return r; } catch (e) { await pg.query('rollback'); throw e; } });
+  const t1 = '2025-02-01T00:00:00.000Z', t2 = '2025-03-01T00:00:00.000Z';
+  const r1 = await setC({ state: 'stale', as_of: t1 });
+  assert.equal(r1.changed, true);
+  const r2 = await setC({ state: 'stale', as_of: t2 });
+  assert.deepEqual([r2.changed, r2.lz_copy_state, Date.parse(r2.lz_copy_as_of)], [false, 'stale', Date.parse(t1)], JSON.stringify(r2));
+  assert.equal((await q('select lz_copy_as_of from ops.sku_logizard_barcode_rules where sku_id = $1 order by rule_row desc limit 1', [ids.lz4]))[0].lz_copy_as_of.getTime(), Date.parse(t1));
+});
 await ta('[R1] 参考: Amazon の FNSKU・この商品の JAN と違う = 参考の一言だけ (保存はできる)・同じ / Amazon のデータが無い = 一言なし', async () => {
   // lz1 = JAN J1・Amazon の FNSKU X00LZ10001。違う FNSKU を打つ = 通る + 参考
   const F3 = 'X00LZB0003';
@@ -317,7 +327,7 @@ MR.__setShippingRatesProvider(async () => new Map([['S02', { method: '宅急便'
 const mirrorOf = ({ state = 'checked', bc = [['zz-old', 'X00LZWAREH']] } = {}) => {
   const fresh = new Date().toISOString(), old = new Date(Date.now() - 40 * 3600e3).toISOString();
   const rows = state === 'empty' || state === 'unavailable' ? [] : bc;
-  return { ok: true, reason: null, keys: new Set(rows.map(([id]) => id.toLowerCase())), ids: new Map(rows.map(([id]) => [id.toLowerCase(), new Set([id])])), barcodes: new Map(rows.map(([id, v]) => [v, id])),
+  return { ok: true, reason: null, keys: new Set(rows.map(([id]) => id.toLowerCase())), ids: new Map(rows.map(([id]) => [id.toLowerCase(), new Set([id])])), barcodes: rows.reduce((m, [id, v]) => m.set(v, new Set([...(m.get(v) || []), id])), new Map()),
     list_as_of: fresh, bc_as_of: state === 'stale' ? old : rows.length ? fresh : null, rows: 1,
     bc: { ok: state === 'checked' || state === 'stale', reason: state === 'unavailable' ? '写しがありません' : state === 'empty' ? '写しが空です' : null, rows: rows.length, empty: state === 'empty' } };
 };
@@ -474,6 +484,20 @@ await ta('[H3c] 押し直しの答えの印 = DB に残した結果と時刻 (#1
     const list = await call('GET', '/apps/master-edit/?missing=lzbc');
     assert.equal(list.status, 200);
     assert.ok(list.text.includes('<option value="lzbc" selected>ロジザードの確かめ待ち</option>'), '一覧に選択肢が無い');
+  } finally { LZ_MIRROR = mirrorOf(); }
+});
+await ta('[H3d] 写しで同じ値を持つ商品が複数 (#1719 R3 Medium): この商品と ほかの商品の両方 = 断る (並びの順に左右されない)・この商品だけ = 通る', async () => {
+  try {
+    for (const bc of [[['lz4', 'X00LZDUP01'], ['zz-other', 'X00LZDUP01']], [['zz-other', 'X00LZDUP01'], ['lz4', 'X00LZDUP01']]]) {
+      LZ_MIRROR = mirrorOf({ bc });
+      const seen = lzData((await call('GET', '/apps/master-edit/sku/lz4')).text).seenRow;
+      const r = await call('POST', api('lz4'), { body: { request_id: uuid(), barcode: { kind: 'value', value: 'X00LZDUP01' }, seen_row: seen } });
+      assert.deepEqual([r.status, r.j.reason, /zz-other/.test(r.j.error)], [409, 'lzbc_taken', true], `${JSON.stringify(bc)}: ${r.text}`);
+    }
+    LZ_MIRROR = mirrorOf({ bc: [['LZ4', 'X00LZDUP02']] });
+    const seen = lzData((await call('GET', '/apps/master-edit/sku/lz4')).text).seenRow;
+    const r = await call('POST', api('lz4'), { body: { request_id: uuid(), barcode: { kind: 'value', value: 'X00LZDUP02' }, seen_row: seen } });
+    assert.equal(r.status, 200, r.text);
   } finally { LZ_MIRROR = mirrorOf(); }
 });
 await ta('[H4] 画面の動き (Chromium): 値を打つと空欄の印が外れる・空欄に印で値が消える・形の一言・通信が切れた保存は同じ request_id で送り直す (2 回書かない)', async () => {

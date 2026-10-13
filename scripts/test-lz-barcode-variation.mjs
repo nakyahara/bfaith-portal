@@ -56,7 +56,7 @@ MR.__setPhDraftLookup(async () => null);
 const mirrorOf = (state = 'checked') => {
   const rows = state === 'unavailable' || state === 'empty' ? [] : [['zz-old', 'X00LZVWARE']];
   const at = state === 'stale' ? new Date(Date.now() - 40 * 3600e3).toISOString() : new Date().toISOString();
-  return { ok: true, reason: null, keys: new Set(rows.map(([id]) => id)), ids: new Map(rows.map(([id]) => [id, new Set([id])])), barcodes: new Map(rows.map(([id, v]) => [v, id])),
+  return { ok: true, reason: null, keys: new Set(rows.map(([id]) => id)), ids: new Map(rows.map(([id]) => [id, new Set([id])])), barcodes: rows.reduce((m, [id, v]) => m.set(v, new Set([...(m.get(v) || []), id])), new Map()),
     list_as_of: at, bc_as_of: rows.length ? at : null, rows: 1, bc: { ok: rows.length > 0, reason: state === 'unavailable' ? '写しがありません' : state === 'empty' ? '写しが空です' : null, rows: rows.length, empty: state === 'empty' } };
 };
 let MIRROR = mirrorOf();
@@ -137,10 +137,32 @@ await ta('[C1] ロジザードの写しが読めない / 空 / 古い = 登録�
       assert.equal(r.j.lz_unchecked && r.j.lz_unchecked.state, st);
       if (st === 'stale') assert.match(r.j.lz_unchecked.as_of_jst, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
       assert.deepEqual(await lzRows(g), [[`${g}-A`, 'fnsku', `X00LZC${i}001`, st], [`${g}-B`, 'lz_assign', null, null]]);
+      assert.deepEqual(r.j.lz_unchecked.codes, [`${g}-A`], '照らせていない子のコード');
     }
     MIRROR = mirrorOf('checked');
     const r = await post('/api/new/variation', body('lzc9', [['-A', '', { kind: 'value', value: 'X00LZC9001' }]]));
     assert.deepEqual([r.status, r.j.lz_unchecked], [200, undefined], r.text);
+  } finally { MIRROR = mirrorOf(); }
+});
+await ta('[C2] 応答が失われた後の再送 (同じ request_id) = 印は DB に残した子の結果から (#1719 R3 High): 古い写しで登録 → 写しが新しくなってから再送 = 印が残る / 照らせた登録 → 写しが読めなくなってから再送 = 印なし', async () => {
+  try {
+    MIRROR = mirrorOf('stale');
+    const b1 = body('lzr1', [['-A', '', { kind: 'value', value: 'X00LZR1001' }], ['-B', '', { kind: 'value', value: 'X00LZR1002' }], ['-C', '', { kind: 'lz_assign' }]]);
+    const first = await post('/api/new/variation', b1);   // この応答は届かなかったことにする (画面は同じ request_id で送り直す)
+    assert.equal(first.status, 200, first.text);
+    MIRROR = mirrorOf('checked');
+    const again = await post('/api/new/variation', b1);
+    assert.equal(again.status, 200, again.text);
+    assert.equal(again.j.replayed, true, again.text);
+    assert.deepEqual([again.j.lz_unchecked && again.j.lz_unchecked.state, again.j.lz_unchecked && again.j.lz_unchecked.codes], ['stale', ['lzr1-A', 'lzr1-B']], again.text);
+    assert.equal(again.j.lz_unchecked.as_of, first.j.lz_unchecked.as_of, '残した写しの時刻');
+    assert.ok(again.j.lz_unchecked.note.includes('GAS の H 列に入れる前に'), again.j.lz_unchecked.note);
+    // 逆: 照らせた登録を、写しが読めなくなってから再送 = 印なし (今の写しで印を付けない)
+    const b2 = body('lzr2', [['-A', '', { kind: 'value', value: 'X00LZR2001' }]]);
+    assert.deepEqual([(await post('/api/new/variation', b2)).j.lz_unchecked], [undefined]);
+    MIRROR = mirrorOf('unavailable');
+    const again2 = await post('/api/new/variation', b2);
+    assert.deepEqual([again2.status, again2.j.replayed, again2.j.lz_unchecked], [200, true, undefined], again2.text);
   } finally { MIRROR = mirrorOf(); }
 });
 
