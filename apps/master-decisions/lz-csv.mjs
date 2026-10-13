@@ -15,7 +15,7 @@
  */
 import { createRequire } from 'node:module';
 import iconv from 'iconv-lite';
-import { lzBarcodeValueOk } from '../../lib/logizard-barcode.mjs';
+import { lzBarcodeValueOk, LZ_BARCODE_HOLDS } from '../../lib/logizard-barcode.mjs';
 
 export const LZ_CONVERTER_VERSION = 'lz-v1';
 /** CP932 の表は iconv-lite の版で決まる。版が変わったら表の実測をやり直す (契約 v2 M6) */
@@ -176,7 +176,7 @@ function newBarcodeProblem(it) {
   const hasHold = it.barcode_hold != null, hasCode = it.barcode != null;
   if (hasHold && hasCode) throw new Error(`新商品 ${it.ne_code}: barcode と barcode_hold の両方がある`);
   if (hasHold) {
-    if (typeof it.barcode_hold !== 'string' || !/^lz_barcode_[a-z_]+$/.test(it.barcode_hold)) throw new Error(`新商品 ${it.ne_code}: 知らない barcode_hold ${String(it.barcode_hold).slice(0, 40)}`);
+    if (!LZ_BARCODE_HOLDS.includes(it.barcode_hold)) throw new Error(`新商品 ${it.ne_code}: 知らない barcode_hold ${String(it.barcode_hold).slice(0, 40)}`);
     return it.barcode_hold;
   }
   if (hasCode && (typeof it.barcode !== 'string' || !lzBarcodeValueOk(it.barcode))) throw new Error(`新商品 ${it.ne_code}: バーコードの形が違う (${String(it.barcode).slice(0, 40)})`);

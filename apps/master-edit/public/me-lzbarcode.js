@@ -18,12 +18,16 @@
   var saveBtn = $('#lzbc-save');
   var busy = false;
   var initial = null;
-  var pinned = P.pinned || null;
+  // 決め方ごとの「選んだ 1 本」(Codex PR R1 M1: ほかの決め方へ持ち越さない)。初めの値は今の決め方のときだけ。'' = 「選ばない」を押した
+  var pinBy = {};
+  if (P.rule && P.pinned) pinBy[P.rule] = P.pinned;
+  // 押し直しの番号 (Codex PR R1 M4): 通信が分からないまま終わった保存は、同じ中身なら同じ request_id で送り直す (2 回書かない・stale にしない)
+  var pending = null;
   var BADGE = { fnsku: 'info', jan: 'vio', blank: 'mute', ambiguous: 'warn', waiting: 'warn' };
 
   function ruleNow() { var s = $('#lzbc-rule'); return s ? s.getAttribute('data-value') || '' : ''; }
   function pinList(rule) { return rule === 'fnsku' ? P.cands.fnsku : rule === 'jan' ? P.cands.jan : []; }
-  function pinNow() { var r = $('input[name="lzbc-pin"]:checked', box); return r ? r.value : null; }
+  function pinNow() { var p = pinBy[ruleNow()]; return p ? p : null; }
   function collect() { var rule = ruleNow(); return { rule: rule, pinned: (rule === 'fnsku' || rule === 'jan') ? pinNow() : null }; }
   function isDirty() { return JSON.stringify(collect()) !== initial; }
   /** 今の選びの答え (サーバーの答え + 選んだ 1 本) */
@@ -40,7 +44,7 @@
   function drawPins() {
     var rule = ruleNow(), list = pinList(rule), row = $('#lzbc-pin-row'), host = $('#lzbc-pins');
     if (!row || !host) return;
-    var cur = pinNow() || pinned;
+    var cur = pinNow();
     row.hidden = !(list.length > 1 || (cur && (rule === 'fnsku' || rule === 'jan')));
     host.textContent = '';
     if (row.hidden) return;
@@ -96,7 +100,7 @@
       changed();
     });
   }
-  box.addEventListener('change', function (e) { if (e.target && e.target.name === 'lzbc-pin') changed(); });
+  box.addEventListener('change', function (e) { if (e.target && e.target.name === 'lzbc-pin') { pinBy[ruleNow()] = e.target.value; changed(); } });
 
   function msg(t, cls) { var m = $('#lzbc-msg'); if (m) { m.className = 'msgline ' + (cls || ''); m.textContent = t || ''; } }
   function uuid() {
@@ -108,14 +112,18 @@
   function save() {
     if (!saveBtn || busy || !P.canWrite) return;
     var c = collect();
-    var body = { request_id: uuid(), rule: c.rule, pinned: c.pinned, seen_row: P.seenRow };
+    var key = JSON.stringify([c.rule, c.pinned, P.seenRow]);
+    if (!pending || pending.key !== key) pending = { key: key, rid: uuid() };
+    var body = { request_id: pending.rid, rule: c.rule, pinned: c.pinned, seen_row: P.seenRow };
     busy = true; changed(); msg('保存しています…');
     fetch(P.base + '/api/sku/' + encodeURIComponent(P.code) + '/logizard-barcode', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
         busy = false;
+        pending = null;   // 返事が来た = 次は新しい番号
         if (x.r.ok && x.j.ok) {
           P.seenRow = x.j.rule_row || P.seenRow;
+          P.rule = x.j.rule; P.pinned = x.j.pinned || null;
           initial = JSON.stringify(collect());
           msg(x.j.changed ? '保存しました' : '今の決め方と同じです (書いていません)', 'ok');
           if (ME.toast && x.j.changed) ME.toast('ロジザードに送るバーコードの決め方を保存しました');
@@ -127,7 +135,7 @@
         msg(t, 'err');
         changed();
       })
-      .catch(function () { busy = false; changed(); msg('通信できませんでした。保存されたか分からないので、画面を開き直して確かめてください', 'err'); });
+      .catch(function () { busy = false; changed(); msg('通信できませんでした。保存されたか分からないので、もう一度「決め方を保存」を押してください (同じ保存として送り直します)', 'err'); });
   }
   if (saveBtn) saveBtn.addEventListener('click', save);
 

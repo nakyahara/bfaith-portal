@@ -66,6 +66,8 @@ declare
   v_prev    ops.sku_logizard_barcode_rules;
   v_cur     ops.sku_logizard_barcode_rules;
   v_row     bigint;
+  v_sum     integer := 0;
+  v_i       integer;
 begin
   if p_request_id is null or p_sku_id is null then raise exception 'invalid_input: request_id と SKU が要る' using errcode = '22023'; end if;
   if ops.reg_actor_problem(p_actor_id, null) is not null or p_actor_id !~ '^[^[:space:]@]+@[^[:space:]@]+$' then
@@ -96,7 +98,16 @@ begin
   if v_cur.rule_row is distinct from p_seen_row then
     raise exception 'stale: 画面を開いた後にほかの人が決め方を直した (今の行 %・開いたときの行 %)', coalesce(v_cur.rule_row::text, 'なし'), coalesce(p_seen_row::text, 'なし') using errcode = '40001';
   end if;
-  -- 選んだ 1 本は今の候補にあるときだけ (lib/logizard-barcode.mjs の候補と同じ読み方)
+  -- 選んだ 1 本は今の候補にあるときだけ (lib/logizard-barcode.mjs の候補と同じ読み方)。
+  -- JAN はチェック数字まで (lzJanOk と同じ・Codex PR R1 M2 = 形の合わない JAN が external_ids にあっても選ばせない)
+  if p_pinned is not null and p_rule = 'jan' then
+    for v_i in 1 .. pg_catalog.length(p_pinned) - 1 loop
+      v_sum := v_sum + pg_catalog.substr(p_pinned, pg_catalog.length(p_pinned) - v_i, 1)::integer * (case when v_i % 2 = 1 then 3 else 1 end);
+    end loop;
+    if (10 - v_sum % 10) % 10 <> pg_catalog.right(p_pinned, 1)::integer then
+      raise exception 'pinned_not_candidate: JAN % はチェック数字が合わない', p_pinned using errcode = '22023';
+    end if;
+  end if;
   if p_pinned is not null and p_rule = 'jan' and not exists (
        select 1 from core.external_ids e where e.company_id = 1 and e.entity_type = 'product' and e.entity_id = s.product_id
           and e.system = 'jan' and e.id_kind = 'jan' and e.valid_to is null and e.external_norm = core.norm_code(p_pinned)) then

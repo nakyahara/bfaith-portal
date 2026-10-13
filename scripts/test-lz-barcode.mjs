@@ -126,6 +126,7 @@ await ta('[C2] 渡し方の誤り = 例外 (両方・形の違う値・知らな
   assert.throws(() => LZ.buildLzCsv([item('b2', { barcode: JBAD })], 'new'), /バーコードの形が違う/);
   assert.throws(() => LZ.buildLzCsv([item('b3', { barcode: 4901234567894 })], 'new'), /バーコードの形が違う/);
   assert.throws(() => LZ.buildLzCsv([item('b4', { barcode_hold: 'later' })], 'new'), /知らない barcode_hold/);
+  assert.throws(() => LZ.buildLzCsv([item('b5', { barcode_hold: 'lz_barcode_typo' })], 'new'), /知らない barcode_hold/, '決まった 3 つ以外の理由を受けた');
   const d = LZ.buildLzCsv([item('d1', { barcode: F1 })], 'daily');
   assert.deepEqual(cells(d)[0], ['d1', '商品 d1', '商品 d1', '100', '0001']);
   const plain = LZ.buildLzCsv([item('e1')], 'new');
@@ -252,6 +253,9 @@ await ta('[F2] 選んだ 1 本: JS が出した候補は全部 DB でも選べ�
   for (const j of m.get(ids.lz3).candidates.jans) assert.equal((await setRule('lz3', 'jan', { pinned: j.value, seenRow: await latestRow('lz3') })).pinned, j.value);
   let e = await pgErr(setRule('lz3', 'jan', { pinned: J1, seenRow: await latestRow('lz3') }));   // lz1 の JAN
   assert.equal(e && e.reason, 'pinned_not_candidate');
+  // チェック数字の合わない JAN は external_ids にあっても DB が断る (Codex PR R1 M2 = JS の候補と同じ)
+  e = await pgErr(setRule('lz4', 'jan', { pinned: JBAD, seenRow: await latestRow('lz4') }));
+  assert.equal(e && e.reason, 'pinned_not_candidate', 'チェック数字の合わない JAN を DB が受けた');
   e = await pgErr(setRule('lz2', 'auto', { pinned: 'X00LZ20001', seenRow: await latestRow('lz2') }));
   assert.equal(e && e.reason, 'invalid_input', '自動に選んだ 1 本を DB が受けた');
   // lz2 = FNSKU 2 つ → 選んだ 1 本で答えが決まる
@@ -390,6 +394,45 @@ await ta('[H3] 保存の API: 名簿・Origin・形 (決め方・選んだ 1 本
 await ta('[H4] つかいかた: ロジザードに送るバーコードの節 (決め方・要確認・待つ・今は GAS の H 列 = 参考)', async () => {
   const r = await call('GET', '/apps/master-edit/manual');
   for (const w of ['id="lz-barcode"', 'JAN とロジザードに送るバーコードは別です', 'FNSKU があれば FNSKU・無ければ JAN・JAN も無ければ空欄', '要確認', '待つ', 'H 列 (バーコード) を入れています', '参考']) assert.ok(r.text.includes(w), `つかいかたに「${w}」が無い`);
+});
+
+await ta('[H5] 画面の動き (Chromium): 選んだ 1 本はほかの決め方へ持ち越さない・「選ばない」= 要確認・通信が切れた保存は同じ request_id で送り直す (2 回書かない)', async () => {
+  let chromium;
+  try { ({ chromium } = await import('playwright')); } catch (e) { throw new Error(`Playwright が無い: ${e.message}`); }
+  const browser = await chromium.launch();
+  try {
+    const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'ja-JP', extraHTTPHeaders: { 'x-test-session': 'editor' } });
+    const p = await ctx.newPage();
+    const errors = []; p.on('pageerror', (x) => errors.push(x.message));
+    await p.goto(`${ORIGIN}/apps/master-edit/sku/lz2`);
+    const d = lzData(await p.content());
+    assert.equal(d.rule, 'fnsku'); assert.ok(d.pinned);
+    assert.equal(await p.isVisible('#lzbc-pin-row'), true);
+    assert.equal(await p.isChecked(`input[name="lzbc-pin"][value="${d.pinned}"]`), true);
+    await p.click('#lzbc-rule button[data-v="jan"]');
+    assert.equal(await p.isVisible('#lzbc-pin-row'), false, 'JAN に切り替えたのに FNSKU の 1 本が残った');
+    assert.match(await p.innerText('#lzbc-st'), /待つ/);
+    await p.click('#lzbc-rule button[data-v="fnsku"]');
+    await p.check('input[name="lzbc-pin"][value=""]');
+    assert.match(await p.innerText('#lzbc-st'), /要確認/);
+    // 1 回目の保存は通信が切れる (サーバーには届かない) → 2 回目は同じ request_id
+    const sent = [];
+    let first = true;
+    await p.route('**/logizard-barcode', async (route) => {
+      sent.push(JSON.parse(route.request().postData()));
+      if (first) { first = false; await route.abort(); } else await route.continue();
+    });
+    await p.click('#lzbc-save');
+    await p.waitForFunction(() => /通信できませんでした/.test(document.querySelector('#lzbc-msg').textContent));
+    const [resp] = await Promise.all([p.waitForResponse((r) => /logizard-barcode$/.test(r.url())), p.click('#lzbc-save')]);
+    assert.equal(resp.status(), 200);   // 中身は下の DB で確かめる (保存の後に画面を読み直すので応答の本文は読めない)
+    assert.equal(sent.length, 2);
+    assert.equal(sent[0].request_id, sent[1].request_id, '送り直しで request_id が変わった');
+    assert.deepEqual([sent[1].rule, sent[1].pinned], ['fnsku', null]);
+    const last = (await rowsOf('lz2')).slice(-1)[0];
+    assert.deepEqual([last.rule, last.pinned], ['fnsku', null]);
+    assert.deepEqual(errors, [], '画面の JS の例外');
+  } finally { await browser.close(); }
 });
 
 server.close();
