@@ -10,6 +10,7 @@
  *   [P]  CLI (master-gone-from-ne.mjs) の計画のハッシュに許可の事実が入る = dry-run の後に許可が変わると --apply は 1 件も変えない / 同じなら通る
  *   [W]  許可を書けるのは master_ops の関数だけ (master_edit・watcher = 42501・表に直接 = 42501・持ち主の手も印が無ければ断る・変える / 消す = 断る)・
  *        1 つでも足せないコード = 何も書かない・同じ request_id = 前の答え・違う中身 = request_id_reused
+ *   [H]  重い入口の棚卸し (heavy-entry-manifest.mjs): 全部の migration の DB で「分けていない関数」が無い・呼び手の上限 (コード 1〜100 件ほか)
  *   [K]  許可を足す CLI (master-gone-day-override.mjs): 引数・確かめ (読むだけ・許可を足したらやめてよいか)・足す (だれ・理由・日数・期限・DB のロールが残る)
  * 使い方: node scripts/test-master-gone-day.mjs
  */
@@ -389,6 +390,29 @@ await ta('[K2] 確かめ (既定) = 何も書かない・許可を足したら�
   assert.equal((await one('select count(*)::int as n from ops.sku_gone_from_ne_day_overrides where request_id = $1', [rid2])).n, 1);
   // 分け方: SQLSTATE がある = はっきり断った / コードなし・ECONNRESET・08xxx・57P01 = 分からない
   assert.deepEqual(['P0001', '22023', '42501', '23505', '57014', undefined, 'ECONNRESET', '08006', '57P01'].map((code) => definiteDbError({ code })), [true, true, true, true, true, false, false, false, false]);
+});
+
+// ═══════════ [H] 重い入口の棚卸し (heavy-entry-manifest.mjs) ═══════════
+console.log('[H] 重い入口の棚卸し');
+await ta('[H1] 重い入口の棚卸し (0076 の ops.add_sku_gone_day_overrides = light・本番の heavy-entry-manifest --verify の ❌): 全部の migration の DB で「分けていない関数」が無い / 呼び手の上限 = コード 1〜100 件・日数 1〜3・有効な日数 1〜14・master_ops だけ', async () => {
+  const { heavyEntryFindings, HEAVY_ENTRY_MANIFEST } = await import('./company-db/heavy-entry-manifest.mjs');
+  const sig = 'ops.add_sku_gone_day_overrides(uuid, text, text, text[], integer, integer)';
+  const e = HEAVY_ENTRY_MANIFEST.find((x) => x.sig === sig);
+  assert.deepEqual([e.cls, e.public, e.since], ['light', false, '0076']);
+  assert.equal(sig, GONE_DAY_OVERRIDE_FUNCTIONS[0], 'roles の一覧と同じ署名');
+  assert.deepEqual(await heavyEntryFindings(db), [], '本番の --verify と同じ確かめ');
+  // 件数の上限: 101 件 = 22023 (何も書かない)・100 件ちょうどは件数では断らない (無いコードで断る = 件数の確かめを通った)
+  const many = (n) => Array.from({ length: n }, (_, i) => `h${i}`);
+  const n0 = (await one('select count(*)::int as n from ops.sku_gone_from_ne_day_overrides')).n;
+  const e101 = await errOf(() => addOv(many(101), 1));
+  assert.equal(e101?.code, '22023'); assert.match(e101.message, /1〜100 件/);
+  const e100 = await errOf(() => addOv(many(100), 1));
+  assert.equal(e100?.code, '22023'); assert.match(e100.message, /許可を足せないコード/);
+  for (const [days, valid] of [[0, 7], [4, 7], [1, 0], [1, 15]]) assert.equal((await errOf(() => addOv(['d07'], days, { valid })))?.code, '22023', `${days}/${valid}`);
+  assert.equal((await one('select count(*)::int as n from ops.sku_gone_from_ne_day_overrides')).n, n0);
+  // 実行できるのは master_ops だけ (PUBLIC なし)
+  assert.equal((await one(`select has_function_privilege('public', $1::regprocedure, 'execute') as x`, [sig])).x, false);
+  assert.equal((await one(`select has_function_privilege('master_ops', $1::regprocedure, 'execute') as x`, [sig])).x, true);
 });
 
 await pg.close();
