@@ -199,6 +199,13 @@ export const VARIATION_SELECT = Object.freeze(['ops.variation_group_codes', 'cor
  *   無い DB (0070 の前) では付けない (流し直すと付く)
  */
 export const GONE_FUNCTIONS = Object.freeze(['ops.cancel_sku_gone_from_ne(uuid, text, text, bigint)', 'ops.sku_gone_from_ne_check(bigint)', 'ops.sku_gone_from_ne_list(text[])']);
+/**
+ * 🆕 0076 (「NE から消えた」の日数の許可・中原さんの決定 10/13 夜 B): 許可を足す関数は運用のロール master_ops (CLI scripts/company-db/master-gone-day-override.mjs) だけに実行。
+ *   画面のロール (master_edit) には渡さない。表は読ませない。無い DB (0076 の前) では付けない (流し直すと付く)
+ */
+export const GONE_DAY_OVERRIDE_FUNCTIONS = Object.freeze(['ops.add_sku_gone_day_overrides(uuid, text, text, text[], integer, integer)']);
+/** 🆕 0076: だれにも渡さない (表の守り・効いている許可を読む部品 = 確かめの中から持ち主の権限で呼ぶ) */
+export const GONE_DAY_OVERRIDE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_gone_day_overrides()', 'ops.sku_gone_day_override_active(bigint)']);
 /** 🆕 0070: だれにも渡さない (照合 ② の記録の中の部品・表の守り・定数) */
 export const GONE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops._record_ne_absence(bigint, jsonb)', 'ops.guard_master_ne_absence()', 'ops.ne_gone_required_runs()', 'ops.ne_gone_fresh_hours()',
   'ops.sku_ref_cancelled(bigint[])', 'ops.guard_sku_ref_not_cancelled()']);   // #1683 R1 High 2: やめた SKU への参照を断る trigger とその部品
@@ -314,6 +321,9 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0070 (NE から消えた商品をやめる): 関数がある DB だけ。前に付けた実行権を外してから、画面 (master_edit) と CLI (master_ops) に付け直す
   for (const f of [...GONE_FUNCTIONS, ...GONE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of GONE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit, master_ops';`));
+  // 🆕 0076 (日数の許可): 関数がある DB だけ。前に付けた実行権を外してから、運用のロール (master_ops) だけに付け直す
+  for (const f of [...GONE_DAY_OVERRIDE_FUNCTIONS, ...GONE_DAY_OVERRIDE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of GONE_DAY_OVERRIDE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_ops';`));
   // 🆕 0072 (NE から消す CSV): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (watcher の確かめ・一覧は migration が付ける = ここでは外さない)
   for (const f of [...NE_DEL_FUNCTIONS, ...NE_DEL_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of NE_DEL_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));

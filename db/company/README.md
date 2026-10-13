@@ -2626,3 +2626,13 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): 0073 の後 → `migrate.mjs --dry-run` (0074 だけ・今のデータは何も変えない = 新しい表は空・関数だけ) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs` = master_edit に 3 つの表の select と 2 つの関数の実行・引数なし = パスワードは変えない)。
   migrate の前の朝は daily-sync の 1 行が「⚠️ Render に migration 0074 がまだ無い」(exit 0)。手で先に送る = miniPC で `node -r dotenv/config apps/company-db/push/amazon-listings.mjs --dry-run` → `--send`
 - 試験 = `node scripts/test-amazon-unlinked.mjs` (PGlite・本物の router・本物の履歴の保存) / `TEST_PG_URL=… node scripts/test-amazon-unlinked-pg.mjs` (本物の PostgreSQL・ロールの権限・受け口の並行・保存と隠すの競り合い・8,000 行) / `node scripts/test-amazon-map.mjs` の [12] (未登録 = FBA だけ・区分の鮮度)
+
+### 「NE から消えた」の日数の許可 (0076・2026-10-13 夜 中原さんの決定 B = 色違いの登録 (widen) を 10/15 から 10/14 に 1 日前倒し)
+- **なぜ**: widen には代表のずれ 0 件が要る。今のずれ 18 件は 0070 の「NE から消えた」(完全な NE の取得に 3 日続けて無い) でやめる予定だが、今は全部 1 / 3 日 (ほかの止まる理由は無い)
+- **表** `ops.sku_gone_from_ne_day_overrides` (SKU・必要な日数 1〜3・だれ・理由・request_id・DB のロール・作った時刻・期限 = 作った時刻 + 1〜14 日)。追記だけ (変えない・消さない)・書くのは `ops.add_sku_gone_day_overrides` だけ (取引の中の印)。
+  効くのは期限の中の一番新しい 1 つ (`ops.sku_gone_day_override_active`)・期限切れ = 3 日に戻る
+- **足す** `ops.add_sku_gone_day_overrides(request_id, 人, 理由, コード, 日数, 有効な日数)` = 運用のロール **master_ops だけ**に実行 (画面のロールには渡さない)。1〜100 件・全部か何も無いか (無い・available でない・例外のコードが 1 つでもある = 何も書かない)・押し直し = 前の答え
+- **確かめ** `ops.sku_gone_from_ne_check` (0072 の版から写して 🆕 0076 の行だけ) = 許可のある SKU は「3 日」の代わりに許可の日数。**ほかの決まりは全部そのまま**。答えと根拠 (evidence) に `day_override` (許可の番号・日数・ふだんの日数・だれ・理由・期限) = CLI の計画のハッシュ・登録の状態の履歴に許可の事実が入る
+- CLI = `scripts/company-db/master-gone-day-override.mjs` (確かめが既定 = 今の答えと「許可を足したらやめてよいか」/ `--apply --days 1 --valid-days 7 --actor --reason --yes`)。やめるのは今まで通り `master-gone-from-ne.mjs` (dry-run → `--apply --expect-hash`)
+- 当て方 (🚨 まだ流さない): `migrate.mjs --dry-run` (0076 だけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す (master_ops に足す関数の実行) → 許可 (確かめ → 中原さんの OK → `--apply`) → やめる (dry-run → 中原さんの OK → `--apply --expect-hash`) → drift-list で 0
+- 試験 = `node scripts/test-master-gone-day.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-gone-day-pg.mjs` (本物のログイン)
