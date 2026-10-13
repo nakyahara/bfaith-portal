@@ -28,6 +28,8 @@ import crypto from 'node:crypto';
 import { openPgClient } from './migrate.mjs';
 
 export const WATCH_SCHEMAS = ['core', 'snapshots', 'events', 'ops', 'mart'];
+/** 🆕 0077: あれば読ませる schema (purchasing = 発注の設定の読むだけの写し・CompanyDB構想 21 C2)。無い DB (0077 の前) では何もしない (流し直すと付く) */
+export const WATCH_OPTIONAL_SCHEMAS = ['purchasing'];
 export const WATCH_TABLES = ['watch_runs', 'watch_results', 'watch_issues', 'watch_result_items'];
 export const RUNS_UPDATE_COLS = ['finished_at', 'completed_keys', 'summary', 'last_line'];
 export const ISSUES_UPDATE_COLS = ['state', 'severity', 'last_seen_at', 'days_seen', 'recovered_at', 'transitions', 'last_result_id', 'summary', 'updated_at'];
@@ -65,6 +67,10 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
     s.push(`grant usage on schema ${sc} to watcher`);
     s.push(`grant select on all tables in schema ${sc} to watcher`);
     s.push(`alter default privileges for role ${o} in schema ${sc} grant select on tables to watcher`);   // 将来の表にも (schema を限定)
+  }
+  for (const sc of WATCH_OPTIONAL_SCHEMAS) {
+    s.push(`do $$ begin if exists (select 1 from pg_namespace where nspname = '${ident(sc)}') then execute 'grant usage on schema ${ident(sc)} to watcher'; `
+      + `execute 'grant select on all tables in schema ${ident(sc)} to watcher'; execute 'alter default privileges for role ${o} in schema ${ident(sc)} grant select on tables to watcher'; end if; end $$`);
   }
   // security definer の関数: public の execute を外す (owner には残る)。将来の関数は作るときに個別に
   for (const f of secdefFunctions) {

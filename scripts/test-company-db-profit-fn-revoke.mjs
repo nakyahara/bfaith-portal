@@ -19,7 +19,7 @@ import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import express from 'express';
 import { applyMigrations, pgliteAdapter, DEFAULT_DIR } from './company-db/migrate.mjs';
-import { HEAVY_ENTRY_MANIFEST, HEAVY_VIEWS, APP_HEAVY_ENTRIES, revokeSigs, heavyEntryFindings, heavyCandidates, tempPrivilegeAudit } from './company-db/heavy-entry-manifest.mjs';
+import { HEAVY_ENTRY_MANIFEST, HEAVY_VIEWS, VIEW_SCHEMAS, APP_HEAVY_ENTRIES, revokeSigs, heavyEntryFindings, heavyCandidates, tempPrivilegeAudit } from './company-db/heavy-entry-manifest.mjs';
 import companyDbRouter, { __setPgClientFactory } from '../apps/company-db/router.mjs';
 
 let ok = 0, ng = 0;
@@ -132,8 +132,10 @@ await t('規則にかかる関数は全部 manifest にあり、manifest の関�
   for (const n of ['core.apply_order_finance_batch', 'core.apply_order_batch', 'core.apply_shipment_batch']) assert.equal(cls[n], 'guard_later', n);
 });
 await t('view の一覧 = mart / ops の全部の view (重い / 軽いと理由)・権限は 0056 で変えない / アプリの側の重い処理の一覧のファイルがある', async () => {
-  const views = (await q(`select n.nspname || '.' || c.relname as v from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('v', 'm') and n.nspname in ('mart', 'ops') order by 1`)).map((r) => r.v);
-  assert.deepEqual([...HEAVY_VIEWS.map((v) => v.view)].sort(), views);
+  // 見る schema = 一覧の VIEW_SCHEMAS (🆕 0077 で purchasing も)。この DB は 0056 まで = 後の migration で足した view (since > 0056) は一覧から除いて比べる
+  //   (#1703 の 0075 の view が since つきで足されて、ここが落ちていた = C2 の PR で直す)
+  const views = (await q(`select n.nspname || '.' || c.relname as v from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('v', 'm') and n.nspname = any($1::text[]) order by 1`, [VIEW_SCHEMAS])).map((r) => r.v);
+  assert.deepEqual(HEAVY_VIEWS.filter((v) => !v.since || v.since <= '0056').map((v) => v.view).sort(), views);
   for (const v of ['mart.v_finance_daily', 'mart.v_order_finance_summary', 'mart.v_sales_daily']) assert.equal(HEAVY_VIEWS.find((x) => x.view === v).cls, 'heavy', v);
   assert.equal((await q(`select has_table_privilege('watcher', 'mart.v_finance_daily', 'select') as x`))[0].x, true);   // view の権限は変えていない (0043 の GRANT のまま)
   for (const a of APP_HEAVY_ENTRIES) assert.ok(fs.existsSync(new URL(`../${a.file}`, import.meta.url)), a.file);
