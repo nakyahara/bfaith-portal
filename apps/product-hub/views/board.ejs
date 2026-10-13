@@ -54,6 +54,10 @@
   .kb-tag.cdb-group-ne_waiting, .kb-tag.cdb-group-two_axes, .kb-tag.cdb-group-no_children { background: #fefce8; color: #854d0e; border-color: #fde68a; }
   .kb-tag.cdb-group-attention { background: #fff7ed; color: #9a3412; border-color: #fdba74; font-weight: 700; }
   .kb-tag.info-missing { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
+  /* 🆕 JAN を Company DB と比べた印 (Company DB構想 21 B1・知らせだけ)。画面を開いた後に読んで足す */
+  .kb-tag.jan-check { background: #fff7ed; color: #9a3412; border-color: #fdba74; font-weight: 700; }
+  .kb-jan-status { font-size: 11px; }
+  .kb-jan-status.warn { color: #9a3412; font-weight: 700; }
   .kb-hold { font-size: 11px; font-weight: 600; color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 4px; padding: 1px 6px; margin: 2px 0; display: inline-block; }
   .kb-hold.kb-aiblock { color: #991b1b; background: #fee2e2; border-color: #ef4444; }
   /* 確認中 (2026-08-31): 情報待ちのカード。列の先頭に並ぶ + 左の太いラインで一目で分かるようにする */
@@ -285,6 +289,8 @@
     <input type="search" id="kb-search" placeholder="🔍 商品名・商品コード"
            style="width:190px; font-size:12px; padding:5px 9px; border:1px solid #cbd5e1; border-radius:8px;">
     <span style="flex:1"></span>
+    <%# 🆕 JAN を Company DB と比べた結果の一言 (Company DB構想 21 B1)。ボードを開いた後に画面が読む %>
+    <span id="kb-jan-status" class="kb-jan-status muted" hidden></span>
     <span class="muted"><%= board.total %> 件<%= board.truncated ? ' (上限まで表示)' : '' %></span>
     <a class="btn btn-sm" href="/apps/product-hub/list">一覧で見る</a>
   </div>
@@ -991,8 +997,51 @@
     const el = document.getElementById('kb-busy');
     if (el) el.style.display = 'none';
   }
-  function confirmListing(name) {
+  // 🆕 JAN を Company DB と比べた印 (Company DB構想 21 B1・読むだけ・知らせだけ)。
+  //    ボードの表示を待たせないよう、開いた後に読んでカードに札を足す。出品は止めない (確認の文に一言足すだけ)
+  const janMarks = {};
+  (function initJanMarks() {
+    const status = document.getElementById('kb-jan-status');
+    if (!document.querySelector('.kb-card[data-draft]')) return;
+    fetch('/apps/product-hub/api/board/jan-check', { headers: { Accept: 'application/json' } })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j || j.ok !== true) return;
+        if (j.readable === false) {
+          if (status) { status.hidden = false; status.textContent = 'JAN の比べ: 読めない'; status.title = 'JAN を Company DB と比べられませんでした (' + (j.reason || '') + ')。出品は止めません'; }
+          return;
+        }
+        const ids = Object.keys(j.byDraft || {});
+        ids.forEach(function (id) {
+          const m = j.byDraft[id];
+          janMarks[id] = m;
+          document.querySelectorAll('.kb-card[data-draft="' + String(id).replace(/[^0-9]/g, '') + '"] .kb-card-link').forEach(function (link) {
+            const wrap = document.createElement('div');
+            wrap.className = 'kb-tags';
+            const tag = document.createElement('span');
+            tag.className = 'kb-tag jan-check';
+            tag.textContent = '⚠ JAN ' + m.label;
+            tag.title = (m.units || []).map(function (u) { return u.code + (u.phJan ? ' の JAN ' + u.phJan : '') + ': ' + u.label + (u.detail ? ' — ' + u.detail : ''); }).join('\n')
+              + '\n\nJAN の正本は商品マスタ (Company DB)。直すのは商品マスタの画面です (この札は知らせだけ・出品は止めません)';
+            wrap.appendChild(tag);
+            link.insertBefore(wrap, link.firstChild);
+          });
+        });
+        if (status && ids.length) { status.hidden = false; status.classList.add('warn'); status.classList.remove('muted'); status.textContent = '⚠ JAN 要確認 ' + ids.length + ' 件'; status.title = 'product-hub の JAN が商品マスタ (Company DB) と違う / Company DB に無いカード'; }
+      })
+      .catch(function () {
+        if (status) { status.hidden = false; status.textContent = 'JAN の比べ: 読めない'; status.title = '通信できませんでした。出品は止めません'; }
+      });
+  })();
+  function janNoteOf(draftId) {
+    const m = janMarks[String(draftId)];
+    if (!m) return '';
+    return '⚠ JAN ' + m.label + ' (' + (m.units || []).map(function (u) { return u.code; }).join('・') + ')\n'
+      + '   JAN の正本は商品マスタ (Company DB) です。出品は止めませんが、確かめてから出してください。\n\n';
+  }
+  function confirmListing(name, draftId) {
     return confirm('「' + name + '」を楽天に出品しますか?\n\n'
+      + janNoteOf(draftId)
       + '・画像を Drive → R-Cabinet へ転送します (転送済みの分は飛ばします)\n'
       + '・公開状態で登録します (在庫0なので売れません。在庫はNE連携が入れます)\n\n'
       + '※ 楽天への登録は取り消せません。\n'
@@ -1003,7 +1052,7 @@
   async function listToRakuten(draftId, name, force) {
     if (force && !confirm('RMS で商品管理番号を検索して「登録されていない」ことを確認しましたか?\n\n'
       + '登録されているのに再実行すると二重登録になります。\n[OK] = 確認した   [キャンセル] = やめる')) return false;
-    if (!confirmListing(name)) return false;
+    if (!confirmListing(name, draftId)) return false;
     showBusy('楽天に出品しています…', '① 画像を R-Cabinet へ転送 → ② 公開で登録 (30秒〜1分ほど)');
     let j = null;
     let unreadable = null;   // 応答が読めなかった (切断・プロキシの HTML 等)。結果不明として扱う

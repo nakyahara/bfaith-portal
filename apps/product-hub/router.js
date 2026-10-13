@@ -178,6 +178,7 @@ import {
 import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLegacyNewKind, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
+import { compareDraftJansWithin, boardJanMarks, janWarningsOf } from './services/cdb-jan-compare.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -2402,10 +2403,12 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   // プレビューは送らないので、段階を読めないときは今の税率で見せて注意を添える (登録は止まる。中間レビュー 2 回目 Low)
   const tax = await resolveListingTax(db, draft, { preview: true });
   const built = buildItemPayload(db, draft.id, { tax });
-  if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(tax.warning ? { warnings: [tax.warning] } : {}) });
+  // 🆕 JAN を Company DB と比べた印 (Company DB構想 21 §5 B1)。知らせだけ = payload も送る値も変えない・出品も止めない
+  const warnings = [...(tax.warning ? [tax.warning] : []), ...janWarningsOf(await compareDraftJansWithin(db, draft))];
+  if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(warnings.length ? { warnings } : {}) });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
-    ...(tax.warning ? { warnings: [tax.warning] } : {}),
+    ...(warnings.length ? { warnings } : {}),
     // 店舗内カテゴリは RMS payload に含まれない (item-mappings API で登録成功後に自動反映)。
     // プレビューには参考情報として添える
     shopCategories: selectedShopCategoryPaths(db, draft.id),
@@ -2814,6 +2817,16 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
   })();
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
   res.json({ ok: true });
+});
+
+// 🆕 JAN を Company DB と比べる印 (Company DB構想 21 §5 B1・読むだけ)。詳細画面が開いた後に読む (画面の表示を Company DB で待たせない)。
+//    単品 = 出品の商品コード ↔ product_drafts.jan_code / まとまり = 子の SKU ごと ↔ draft_sku_jans (楽天に送る値と同じ決め方)。
+//    Company DB も product-hub の SQLite も書かない。読めないときも 200 で「読めない」の印を返す
+router.get('/api/drafts/:id/jan-check', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const r = await compareDraftJansWithin(getDB(), draft);
+  res.json(r.ok ? r : { ok: true, readable: false, reason: r.reason, mode: null, units: [], summary: { state: 'unreadable', severity: 'muted', label: '読めない', counts: {} } });
 });
 
 // SKU別 JANコード (2026-08-28 中原さん要望: バリエーションありのとき、ページ代表の JAN 1つだけでは
@@ -3297,6 +3310,23 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
     // 🆕 まとまりのカード (PR-4): NE の写し待ち / 2 軸 = 出品を止めている・要確認 の札
     cdbGroupTags: cdbGroupBoardTags(db),
   });
+});
+
+// 🆕 ボードの JAN の印 (Company DB構想 21 §5 B1・読むだけ)。ボードを開いた後に画面が読む (ボードの表示を Company DB で待たせない)。
+//    product-hub に JAN があるカードだけを 1 回で比べ、「違う / Company DB に無い」のカードだけ返す
+export const BOARD_JAN_WAIT_MS = 8000;
+router.get('/api/board/jan-check', async (req, res) => {
+  let timer;
+  try {
+    const r = await Promise.race([
+      boardJanMarks(getDB()),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: true, readable: false, reason: `${BOARD_JAN_WAIT_MS / 1000} 秒で読めなかった`, checked: 0, byDraft: {} }), BOARD_JAN_WAIT_MS); }),
+    ]);
+    res.json(r);
+  } catch (e) {
+    console.error('[product-hub] board jan-check:', e);
+    res.json({ ok: true, readable: false, reason: '比べる途中で失敗した', checked: 0, byDraft: {} });
+  } finally { clearTimeout(timer); }
 });
 
 router.get('/staff', (req, res) => {
