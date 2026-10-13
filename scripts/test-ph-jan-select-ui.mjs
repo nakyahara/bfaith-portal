@@ -7,6 +7,7 @@
  *   2 まとまり: SKU ごとに選ぶ・SKU のなしの理由が外れる・手の道 (/sku-jans) で送り直さない
  *   3 商品マスタに JAN が無い = 選ぶ欄は使えず「足す」の案内 (master-edit の商品の画面へのリンク)・読めない = 「読めない」だけ
  *   4 止める設定 (PH_JAN_ENFORCE=1) = 「手で打つ」が無い・印は「出品は止まります」・説明も「今は入っています」/ 既定 = 「手で打つ」で今までどおり打てる
+ *   6 商品コードが無い = 「読めない」でなく「出品の商品コードが無い」(設定の後は「出品は止まります」)
  *   5 390 幅: はみ出さない・画面のエラーなし (画像を scratchpad に残す: PHJAN3_SHOT_DIR)
  * 使い方: node scripts/test-ph-jan-select-ui.mjs   (Playwright / Chromium が無い = 失敗。飛ばすのは PH_UI_SKIP=1)
  */
@@ -71,6 +72,7 @@ const draft = (code, jan) => {
 const dB1 = draft('b001', '4900000001013');   // 手で打った (商品マスタと同じ値でも結ばれていない)
 const dB2 = draft('b002', null);              // 商品マスタに JAN が無い
 const dK = draft('grpk', null);
+const dE = draft('', null);   // 商品コードが無い (Codex #1713 R2 L2)
 ph.prepare(`INSERT INTO draft_rakuten (draft_id, catalog_id_exemption_reason) VALUES (?, 5)`).run(dB1.id);   // 両方 (JAN + 理由)
 ph.prepare('INSERT INTO draft_sku_catalog_exemptions (draft_id, sku_code, reason) VALUES (?, ?, 3)').run(dK.id, 'k-red');
 
@@ -215,6 +217,23 @@ try {
     } finally { delete process.env.PH_JAN_ENFORCE; }
   });
 
+  await ta('[6] 商品コードが無い = 「商品マスタを読めない」でなく「出品の商品コードが無い」・既定は「今は止めません」・設定の後は「出品は止まります」', async () => {
+    for (const on of [false, true]) {
+      if (on) process.env.PH_JAN_ENFORCE = '1';
+      try {
+        const { page, errors } = await openDetail(dE.id);
+        const state = page.locator('.jan-pick-state').first();
+        await page.waitForFunction(() => /出品の商品コードが無い/.test(document.querySelector('.jan-pick-state .jan-cdb-pill')?.textContent || ''));
+        assert.equal(await state.locator('.jan-cdb-pill').textContent(), `楽天のカタログID: 出品の商品コードが無い — ${on ? '出品は止まります' : '今は止めません'}`);
+        assert.match(await state.textContent(), /直し方: 基本情報タブで商品コードを入れる/);
+        const opts = await page.locator('.jan-pick-select').first().locator('option').allTextContents();
+        assert.deepEqual(opts, ['出品の商品コードが無い (基本情報タブで入れる)']);
+        assert.ok(!(await page.locator('#rk-attrs').textContent()).includes('商品マスタを読めない'), '「読めない」と出した');
+        assert.deepEqual(errors, []);
+        await page.close();
+      } finally { delete process.env.PH_JAN_ENFORCE; }
+    }
+  });
   await ta('[5] 390 幅: 選ぶ欄と印がページを横にはみ出させない・画面のエラーなし', async () => {
     const { page, errors } = await openDetail(dK.id, { width: 390 });
     await page.waitForFunction(() => document.querySelectorAll('.jan-pick-select[data-code="k-wht"] option').length >= 2);

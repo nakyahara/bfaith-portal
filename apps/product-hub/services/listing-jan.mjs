@@ -144,10 +144,13 @@ export function listingJanUnitsBulk(db, drafts) {
   const out = new Map();
   if (!drafts.length) return out;
   const unitsOf = janUnitsForDrafts(db, drafts);
-  const reasonOf = new Map(db.prepare('SELECT draft_id, catalog_id_exemption_reason AS r FROM draft_rakuten').all().map((x) => [x.draft_id, validReason(x.r)]));
+  // 読むのは候補のドラフトの行だけ (登録済みの履歴が増えても読む行は増えない・ドラフトの数によらず 1 回ずつ・Codex #1713 R2 L1)
+  const ids = JSON.stringify(drafts.map((d) => d.id));
+  const inIds = 'draft_id IN (SELECT value FROM json_each(?))';
+  const reasonOf = new Map(db.prepare(`SELECT draft_id, catalog_id_exemption_reason AS r FROM draft_rakuten WHERE ${inIds}`).all(ids).map((x) => [x.draft_id, validReason(x.r)]));
   const group = (rows) => { const m = new Map(); for (const r of rows) { if (!m.has(r.draft_id)) m.set(r.draft_id, []); m.get(r.draft_id).push(r); } return m; };
-  const skuOf = group(db.prepare('SELECT * FROM draft_sku_jans').all());
-  const exOf = group(db.prepare('SELECT draft_id, sku_code, reason FROM draft_sku_catalog_exemptions').all());
+  const skuOf = group(db.prepare(`SELECT * FROM draft_sku_jans WHERE ${inIds}`).all(ids));
+  const exOf = group(db.prepare(`SELECT draft_id, sku_code, reason FROM draft_sku_catalog_exemptions WHERE ${inIds}`).all(ids));
   for (const d of drafts) {
     out.set(d.id, assembleUnits(d, unitsOf.get(d.id), { pageReason: reasonOf.get(d.id) ?? null, skuRows: skuOf.get(d.id) || [], exRows: exOf.get(d.id) || [] }));
   }
@@ -352,7 +355,9 @@ export function pickViewOf(lj, read, { env = process.env } = {}) {
       masterEditUrl: masterEditSkuUrl(u.code),
     };
   });
-  return { enforce, readable, reason: readable ? null : ((read && read.reason) || '読めない'), mode: lj.mode, units };
+  // 商品コードが無い (単位が 0) = 門は「出品の商品コードが無い」で止める (gateProblemsOf と同じ)。画面が「読めない」と取り違えないように理由を添える (Codex #1713 R2 L2)
+  const noCode = lj.units.length ? null : { state: 'no_code', label: JAN_GATE_PROBLEMS.no_code.label, text: JAN_GATE_PROBLEMS.no_code.text, fix: JAN_GATE_PROBLEMS.no_code.fix };
+  return { enforce, readable, reason: readable ? null : ((read && read.reason) || '読めない'), mode: lj.mode, units, noCode };
 }
 
 /**

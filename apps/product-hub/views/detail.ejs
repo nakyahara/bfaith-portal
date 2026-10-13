@@ -3724,7 +3724,8 @@ th.attr-unknown { color: #dc2626; }
   function janConfirmNote(j) {
     const enforced = !!JAN_PICK_CFG.enforce;
     // 🆕 B2: 楽天に出せない単位 (商品マスタに結ばれていない など) を先に (止める設定の前は「今は止めません」)
-    const pickBad = ((j && j.picks && j.picks.units) || []).filter((u) => janPickSeverity(u) === 'warn');
+    const pickBad = ((j && j.picks && j.picks.units) || []).filter((u) => janPickSeverity(u) === 'warn')
+      .concat(j && j.picks && j.picks.noCode ? [{ code: '(商品コード無し)', label: j.picks.noCode.label, fix: j.picks.noCode.fix }] : []);
     const pickNote = pickBad.length
       ? pickBad.map((u) => '⚠ カタログID ' + u.label + ': ' + u.code + (u.fix ? '\n   直し方: ' + u.fix : '')).join('\n')
         + (enforced ? '\n   この状態では楽天への登録は止まります。\n\n' : '\n   今は止めませんが、止める設定を入れると出せなくなります。\n\n')
@@ -3765,6 +3766,13 @@ th.attr-unknown { color: #dc2626; }
       if (!sel) return;
       sel.textContent = '';
       const u = byCode.get(janKey(box.dataset.code));
+      // 商品コードが無い = 選ぶ物が無い (「読めない」とは別・Codex #1713 R2 L2)
+      if (picks && picks.noCode) {
+        janPickOption(sel, '', '出品の商品コードが無い (基本情報タブで入れる)');
+        sel.disabled = true;
+        sel.title = '';
+        return;
+      }
       if (!picks || !picks.readable || !u) {
         janPickOption(sel, '', '商品マスタを読めない (少し待って開き直す)');
         sel.disabled = true;
@@ -3786,6 +3794,13 @@ th.attr-unknown { color: #dc2626; }
     });
     document.querySelectorAll('.jan-pick-state').forEach((el) => {
       el.textContent = '';
+      if (picks && picks.noCode) {
+        el.appendChild(janPill('楽天のカタログID: ' + picks.noCode.label + (picks.enforce ? ' — 出品は止まります' : ' — 今は止めません'), 'warn'));
+        el.appendChild(janDetail(picks.noCode.text));
+        el.appendChild(janDetail('直し方: ' + picks.noCode.fix));
+        if (!picks.enforce) el.appendChild(janDetail('止める設定 (' + (JAN_PICK_CFG.env || 'PH_JAN_ENFORCE') + ') を入れると、この状態では楽天に出せなくなります'));
+        return;
+      }
       const u = byCode.get(janKey(el.dataset.code));
       if (!picks || !u) return;
       const sev = janPickSeverity(u);
