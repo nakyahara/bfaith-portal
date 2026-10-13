@@ -277,6 +277,23 @@ export function revertLabelAudited({ productCode, version, before, actor, via, r
   }).immediate();
 }
 
+/**
+ * 戻す書き込みそのものが (版の違い以外で) 失敗したとき: 記録だけを別の取引で残す (Codex #1701 R2 High)。
+ * po_audit_log に barcode_label_revert_failed (理由・失敗のわけ・今の行)。返値 = { label (今の行・無ければ null) }
+ */
+export function recordRevertFailed({ productCode, actor, via, requestId = null, why, error, detail = null }) {
+  if (!Object.hasOwn(BARCODE_VIA, String(via || ''))) throw Object.assign(new Error(`書いた画面 (via) が分からない: ${via}`), { status: 400, reason: 'invalid_input' });
+  const db = getDB();
+  const key = normProductCode(productCode);
+  return db.transaction(() => {
+    const cur = db.prepare('SELECT * FROM po_barcode_labels WHERE product_key=?').get(key);
+    const label = cur ? rowToLabel(cur) : null;
+    audit(db, { actorType: 'user', actor: actor || null, action: 'barcode_label_revert_failed', resource: `barcode:${key}`, requestId,
+      detail: { via, code: productCode, why, error, recheck: detail, before: labelCols(label), after: labelCols(label) } });
+    return { label };
+  }).immediate();
+}
+
 /** 状態変更履歴 */
 export function listLabelEvents(productKey, limit = 50) {
   const db = getDB();

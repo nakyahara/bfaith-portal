@@ -20,7 +20,7 @@
 import { orderWriteGate } from './order-settings.mjs';
 import { COMPANY_ID } from '../../lib/master-write.mjs';
 import { getDB } from '../purchase-orders/db.js';
-import { barcodeTargetOf, writeLabelAudited, revertLabelAudited, detectBarcodeType, BARCODE_TARGET_REASONS } from '../purchase-orders/barcode-labels.js';
+import { barcodeTargetOf, writeLabelAudited, revertLabelAudited, recordRevertFailed, detectBarcodeType, BARCODE_TARGET_REASONS } from '../purchase-orders/barcode-labels.js';
 
 export const AMC_STATUSES = Object.freeze(['printed', 'requested', 'unset', 'not_needed']);
 /** 画面の言葉 (発注アプリの admin では printed = 「設定済み」と出る = 同じもの) */
@@ -318,13 +318,41 @@ export async function saveAmcLabel(db, { sku, input, actor }) {
     productCode: sku.code, status: input.status, barcodeValue: verified.value, note: input.note, version: input.version,
     actor, via: 'master-edit:sku', requestId: input.requestId, pick: verified.audit,
   });
-  const why = await recheckAmcPick(db, sku, input.pick, verified);
+  // ここから先は発注アプリに「書いた後」。どの失敗でも「何も保存していない」とは言わない (Codex #1701 R2 High):
+  //   読み直しが失敗 (切断・時間切れ・SQL の誤り) = 確かめられない = 食い違いと同じに戻す (要確認)
+  let why = null;
+  let unavailable = false;
+  try {
+    why = await recheckAmcPick(db, sku, input.pick, verified);
+  } catch (e) {
+    unavailable = true;
+    why = `書いた後に Company DB を読み直せませんでした (${String((e && (e.code || e.message)) || e).slice(0, 120)})`;
+    console.error(`[master-edit] AMC ラベル: 書いた後の読み直しに失敗 (${sku.code}): ${e && e.stack || e}`);
+  }
   if (!why) return { label: w.label, pick: verified.audit };
-  const rv = revertLabelAudited({ productCode: sku.code, version: w.label.version, before: w.before, actor, via: 'master-edit:sku', requestId: input.requestId, why, detail: verified.audit });
-  throw new AmcLabelError(409, 'recheck_failed', rv.reverted
-    ? `保存した直後に Company DB の値が変わっていたので、保存を戻しました (要確認): ${why}。画面を開き直して選び直してください`
-    : `保存した直後に Company DB の値が変わっていましたが、その間にほかの人が直したので戻せませんでした (要確認・発注アプリの値を確かめてください): ${why}`,
-  { field: 'value', reverted: rv.reverted, current: rv.label });
+  const rv = revertAfterWrite({ code: sku.code, written: w.label, before: w.before, actor, requestId: input.requestId, why, detail: verified.audit });
+  const head = unavailable ? '保存しましたが、書いた後に Company DB で確かめられませんでした' : '保存した直後に Company DB の値が変わっていました';
+  const tail = rv.reverted ? `ので、保存を戻しました (要確認): ${why}。画面を開き直して選び直してください`
+    : `。保存を戻せませんでした (${rv.error || 'その間にほかの人が直した'})。いま発注アプリにある値は確かめていない値かもしれません (要確認・発注アプリの値を確かめてください): ${why}`;
+  throw new AmcLabelError(409, unavailable ? 'recheck_unavailable' : 'recheck_failed', head + tail, { field: 'value', saved: true, reverted: rv.reverted, current: rv.label });
+}
+
+/**
+ * 書いた後に戻す (要確認)。戻す更新が版の違い以外で失敗しても投げない = 別の取引で barcode_label_revert_failed を記録して、今の行を返す。
+ * 戻り値 = { reverted, label (今の行・読めない = 書いた行), error (戻せなかったわけ) }
+ */
+function revertAfterWrite({ code, written, before, actor, requestId, why, detail }) {
+  try {
+    const rv = revertLabelAudited({ productCode: code, version: written.version, before, actor, via: 'master-edit:sku', requestId, why, detail });
+    return { ...rv, error: rv.reverted ? null : 'その間にほかの人が直した' };
+  } catch (e) {
+    const error = `戻す書き込みが失敗: ${String((e && e.message) || e).slice(0, 120)}`;
+    console.error(`[master-edit] AMC ラベル: 戻す書き込みに失敗 (${code}): ${e && e.stack || e}`);
+    let label = written;
+    try { label = recordRevertFailed({ productCode: code, actor, via: 'master-edit:sku', requestId, why, error, detail }).label || written; }
+    catch (e2) { console.error(`[master-edit] AMC ラベル: 戻せなかった記録も書けない (${code}): ${e2 && e2.message}`); }
+    return { reverted: false, label, error };
+  }
 }
 
 /** 誤り → 応答の本文 */

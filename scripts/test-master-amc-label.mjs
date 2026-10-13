@@ -400,7 +400,7 @@ await ta('[H2] 書いた後に Company DB を読み直す (Codex #1701 R1 H2): �
   const row = await extRow('X00AMC0003'); const lid = await listingId('pr_amc2');
   // ① 前の行がある (amc2) → 前の値に戻す
   const before = labelOf('amc2');
-  AMC.__setAmcBeforeWrite(async () => asOwner(() => pg.query('update core.external_ids set valid_to = now() where external_id_row = $1', [row]))); 
+  AMC.__setAmcBeforeWrite(async () => asOwner(() => pg.query('update core.external_ids set valid_to = now() where external_id_row = $1', [row])));
   let r;
   try { r = await call('POST', url('amc2'), { body: { request_id: uuid(), version: before.version, status: 'requested', note: '頼んだ', pick: { kind: 'fnsku', row, listing_id: lid, value: 'X00AMC0003' } } }); }
   finally { AMC.__setAmcBeforeWrite(null); await pg.query('update core.external_ids set valid_to = null where external_id_row = $1', [row]); }
@@ -437,6 +437,48 @@ await ta('[H2] 書いた後に Company DB を読み直す (Codex #1701 R1 H2): �
   const cur = labelOf('amc5');
   const rv = BL.revertLabelAudited({ productCode: 'amc5', version: cur.version - 1, before: null, actor: 't@test', via: 'master-edit:sku', why: '試験' });
   assert.deepEqual([rv.reverted, labelOf('amc5').barcode_value, auditOf('amc5').at(-1).action], [false, 'X00AMC0005', 'barcode_label_revert_failed']);
+});
+
+await ta('[H3] 書いた後の失敗の道 (Codex #1701 R2 High): 読み直しで例外 (権限・切断) = 確かめられない = 戻す (要確認・recheck_unavailable)・戻す書き込みで例外 = 記録 (revert_failed) と今の値を返す・どちらも「何も保存していない」500 にしない', async () => {
+  const AMC = await import('../apps/master-edit/amc-label.mjs');
+  const asOwner = async (fn) => { await pg.query('set role deploy'); try { return await fn(); } finally { await pg.query('set role master_edit'); } };
+  await pg.query('create role amc_noread nologin');   // core を読めない = 読み直しが SQL の誤り (42501) で失敗する
+  // ① 読み直しで例外 → 前の行 (amc5 = 印字済み X00AMC0005) に戻す
+  const b5 = labelOf('amc5'); const lid5 = await listingId('pr_amc5');
+  AMC.__setAmcBeforeWrite(async () => { await pg.query('set role amc_noread'); });
+  let r;
+  try { r = await call('POST', url('amc5'), { body: { request_id: uuid(), version: b5.version, status: 'requested', note: '頼む', pick: { kind: 'fnsku', row: await extRow('X00AMC0005'), listing_id: lid5, value: 'X00AMC0005' } } }); }
+  finally { AMC.__setAmcBeforeWrite(null); await pg.query('set role deploy'); }
+  assert.deepEqual([r.status, r.j.reason, r.j.saved, r.j.reverted], [409, 'recheck_unavailable', true, true], r.text);
+  assert.match(r.j.error, /保存しましたが、書いた後に Company DB で確かめられませんでした.*保存を戻しました \(要確認\)/);
+  assert.ok(!/何も保存していません/.test(r.j.error));
+  const a5 = labelOf('amc5');
+  assert.deepEqual([a5.status, a5.barcode_value, a5.note, a5.version], [b5.status, b5.barcode_value, b5.note, b5.version + 2]);
+  const au5 = auditOf('amc5').slice(-2);
+  assert.deepEqual(au5.map((x) => x.action), ['barcode_label_write', 'barcode_label_revert']);
+  assert.match(au5[1].detail.why, /読み直せませんでした \(42501\)/);
+  assert.deepEqual([r.j.current.status, r.j.current.version], [b5.status, b5.version + 2]);
+  // ② 食い違い → 戻す書き込みそのものが失敗 (SQLite の誤り) = 戻せない・revert_failed を別の取引で記録・今の (確かめていない) 値を返す
+  const b2 = labelOf('amc2'); const row2 = await extRow('X00AMC0003'); const lid2 = await listingId('pr_amc2');
+  AMC.__setAmcBeforeWrite(async () => {
+    podb.exec("CREATE TEMP TRIGGER amclabel_boom BEFORE UPDATE ON po_barcode_labels WHEN NEW.product_key = 'amc2' AND NEW.status <> 'requested' BEGIN SELECT RAISE(ABORT, 'disk I/O error (試験)'); END");
+    await asOwner(() => pg.query('update core.external_ids set valid_to = now() where external_id_row = $1', [row2]));
+  });
+  try { r = await call('POST', url('amc2'), { body: { request_id: uuid(), version: b2.version, status: 'requested', note: '', pick: { kind: 'fnsku', row: row2, listing_id: lid2, value: 'X00AMC0003' } } }); }
+  finally {
+    AMC.__setAmcBeforeWrite(null);
+    podb.exec('DROP TRIGGER IF EXISTS amclabel_boom');
+    await pg.query('update core.external_ids set valid_to = null where external_id_row = $1', [row2]);
+  }
+  assert.deepEqual([r.status, r.j.reason, r.j.saved, r.j.reverted], [409, 'recheck_failed', true, false], r.text);
+  assert.match(r.j.error, /保存を戻せませんでした \(戻す書き込みが失敗: disk I\/O error \(試験\)\)/);
+  assert.match(r.j.error, /確かめていない値かもしれません \(要確認/);
+  assert.deepEqual([r.j.current.status, r.j.current.version, labelOf('amc2').status, labelOf('amc2').version], ['requested', b2.version + 1, 'requested', b2.version + 1], '今の値を返していない');
+  const au2 = auditOf('amc2').slice(-2);
+  assert.deepEqual(au2.map((x) => x.action), ['barcode_label_write', 'barcode_label_revert_failed']);
+  assert.match(au2[1].detail.error, /disk I\/O error/);
+  assert.match(au2[1].detail.why, /もうこの商品の出品に付いていません/);
+  assert.equal(au2[1].detail.after.status, 'requested');
 });
 
 await ta('[G1] 門: 発注アプリの権限なし・名簿でない = 403・Origin・セット = 400・無い商品 = 404・対象外 = 409 not_target・本文の形 = 400 (どれも何も書かない)', async () => {
@@ -603,9 +645,9 @@ else {
       await o.p.check('input[name="amc-pick"][value="none"]');
       await o.p.check('input[name="amc-pick"][value="c0"]');
       assert.equal(await o.p.isDisabled('#amc-save'), true, '元に戻したのに未保存');
-      await o.p.click('#amc-status button[data-v="requested"]');
+      await o.p.click('#amc-status button[data-v="printed"]');
       await Promise.all([o.p.waitForEvent('load'), o.p.click('#amc-save')]);
-      assert.deepEqual([labelOf('amc2').status, labelOf('amc2').barcode_value, auditOf('amc2').at(-1).detail.pick.kind], ['requested', 'X00AMC0003', 'fnsku']);
+      assert.deepEqual([labelOf('amc2').status, labelOf('amc2').barcode_value, auditOf('amc2').at(-1).detail.pick.kind], ['printed', 'X00AMC0003', 'fnsku']);
       assert.deepEqual(o.errors, []);
     } finally { await o.ctx.close(); }
   });

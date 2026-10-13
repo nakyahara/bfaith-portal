@@ -138,7 +138,7 @@
           return;
         }
         var t = x.j.error || ('HTTP ' + x.r.status);
-        if (x.j.reason === 'stale' || x.j.reason === 'candidate_gone' || x.j.reason === 'candidate_changed' || x.j.reason === 'recheck_failed' || x.j.reason === 'value_of_other') t += ' (画面を開き直すと今の値が出ます)';
+        if (x.j.reason === 'stale' || x.j.reason === 'candidate_gone' || x.j.reason === 'candidate_changed' || x.j.reason === 'recheck_failed' || x.j.reason === 'recheck_unavailable' || x.j.reason === 'value_of_other') t += ' (画面を開き直すと今の値が出ます)';
         msg(t, 'err');
         markErr(x.j.field);
         changed();
