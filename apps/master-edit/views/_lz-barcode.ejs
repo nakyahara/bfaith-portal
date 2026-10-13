@@ -1,0 +1,78 @@
+<%
+  // ロジザードに送るバーコード (CompanyDB構想 23・0078)。商品の画面の単品だけ。動き = public/me-lzbarcode.js
+  //   lz = router の lzBarcode (lib/logizard-barcode.mjs lzBarcodeView の答え + RULES・HINTS・STATES・VIA)
+  //   🚨 バーコードは 4 つを混ぜない: ① JAN・FNSKU (Company DB の識別子) ② AMC ラベルの印字 ③ 入庫の BC シール ④ ここ = ロジザードに初めて載せるときの 1 本
+  //   今 (GAS の間) の正は GAS のシートの H 列 (人)。ここの「今の答え」は参考 (人が現物のバーコードと見比べる)
+  const hh = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const R = lz.RULES || {}, HN = lz.HINTS || {}, ST = lz.STATES || {}, VIA = lz.VIA || {};
+  const ok = !lz.error;
+  const rule0 = ok ? (lz.rule || 'auto') : 'auto';
+  const pick = ok ? lz.pick : null;
+  const cands = ok ? lz.candidates : { fnskus: [], jans: [], excluded: [] };
+  const ro = !ok || !lz.canWrite;
+  const D = ro ? ' disabled' : '';
+  const badge = { fnsku: 'info', jan: 'vio', blank: 'mute', ambiguous: 'warn', waiting: 'warn' };
+  const valueWord = (p) => (!p ? '—' : p.state === 'blank' ? '空欄' : p.value || '—');
+  const pageData = ok ? {
+    base, code, canWrite: !!lz.canWrite, rule: lz.rule || null, pinned: lz.pinned || null, seenRow: lz.rule_row || null,
+    answers: lz.answers, states: ST, hints: HN,
+    cands: { fnsku: cands.fnskus.map((c) => c.value), jan: cands.jans.map((c) => c.value) },
+  } : null;
+%>
+<section class="panel" id="sec-lzbc" aria-labelledby="h-lzbc">
+  <div class="panel-h">
+    <span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-box"/></svg></span>
+    <h2 id="h-lzbc">ロジザードに送るバーコード</h2><span class="sub">新商品をロジザードに初めて載せるときの 1 本 · 右の「保存する」とは別</span>
+  </div>
+  <p class="hint lzbc-lead">JAN の欄・AMC ラベルの印字とは別のものです。決め方 = FNSKU があれば FNSKU・無ければ JAN・JAN も無ければ空欄 (ロジザードが番号を付ける)。
+    <b>今はロジザードの新商品のシート (GAS) の H 列に人が入れます</b> = 下の「今の答え」は参考です。現物のバーコードと見比べてから入れてください。</p>
+  <% if (!ok) { %>
+    <div class="callout err" id="lzbc-why"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><%= lz.error %>。少し待ってから画面を開き直してください。</div></div>
+  <% } else { %>
+    <% if (!lz.rule) { %><div class="callout warn" id="lzbc-norule"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">決め方がまだありません</div><div class="hint">この機能の前に登録した商品・NE で直接作った商品です。下の答えは「自動」で計算した参考です。決め方を選んで保存すると、Company DB からロジザードの CSV を作るとき (これから) に使えます。</div></div></div><% } %>
+    <% if (ro && lz.why) { %><div class="callout info" id="lzbc-ro"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow">見るだけです: <%= lz.why %></div></div><% } %>
+
+    <div class="f lzbc-now"><div class="lab">今の答え</div>
+      <div class="ctl col" style="gap:4px">
+        <div class="lzbc-ans"><span class="v mono" id="lzbc-v"><%= valueWord(pick) %></span><span class="b <%= badge[pick.state] || 'mute' %>" id="lzbc-st"><%= ST[pick.state] || pick.state %></span></div>
+        <span class="hint" id="lzbc-reason"><%= pick.reason || (pick.state === 'blank' ? 'ロジザードが番号を付けます (入荷アプリの値札で刷って貼る)' : 'Company DB の今の値から決めました (CSV を作るときにもう一度決めます)') %></span>
+      </div></div>
+
+    <div class="f" data-row="lzbc.rule"><div class="lab" id="lab-lzbc-rule">決め方</div>
+      <div class="ctl col" style="gap:6px">
+        <div class="seg" role="group" id="lzbc-rule" aria-labelledby="lab-lzbc-rule" data-value="<%= rule0 %>">
+          <% for (const k of Object.keys(R)) { %><button type="button" data-v="<%= k %>" aria-pressed="<%= k === rule0 ? 'true' : 'false' %>"<%= k === rule0 ? ' class="on"' : '' %><%= D %>><%= k === 'auto' ? '自動' : k === 'lz_assign' ? '空欄' : R[k] %></button><% } %>
+        </div>
+        <span class="hint" id="lzbc-rule-hint"><%= HN[rule0] || '' %></span>
+        <% if (lz.rule_row) { %><span class="hint" id="lzbc-by">いまの決め方 = <%= R[lz.rule] || lz.rule %><%= lz.pinned ? ' (' + lz.pinned + ')' : '' %> · <%= VIA[lz.via] || lz.via %> · <%= lz.actor_id || '—' %> · <%= String(lz.created_at || '').slice(0, 16) %></span><% } %>
+      </div></div>
+
+    <div class="f" data-row="lzbc.pinned" id="lzbc-pin-row" style="align-items:start" hidden><div class="lab" id="lab-lzbc-pin" style="padding-top:8px">送る 1 本</div>
+      <div class="ctl col" style="gap:8px">
+        <div class="amc-cands" role="radiogroup" aria-labelledby="lab-lzbc-pin" id="lzbc-pins"></div>
+        <span class="hint">候補が 2 つ以上のときに選びます · 選んだ値が候補から消えたら「要確認」になります (黙ってほかの値にしません)</span>
+      </div></div>
+
+    <div class="f" style="align-items:start"><div class="lab" style="padding-top:2px">候補 (Company DB)</div>
+      <div class="ctl col" style="gap:6px" id="lzbc-cands">
+        <% if (!cands.fnskus.length && !cands.jans.length) { %><span class="muted">FNSKU も JAN もまだありません</span><% } %>
+        <% for (const c of cands.fnskus) { %><span class="linkchip"><span class="b info">FNSKU</span> <span class="mono"><%= c.value %></span><span class="n2"> Amazon 日本 · 出品 SKU <%= c.listing_code %></span></span><% } %>
+        <% for (const c of cands.jans) { %><span class="linkchip"><span class="b vio">JAN</span> <span class="mono"><%= c.value %></span><span class="n2"> この商品の JAN</span></span><% } %>
+        <% if (cands.excluded.length) { %>
+        <details class="more" id="lzbc-excluded"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>候補にしないもの (<%= cands.excluded.length %>)</summary>
+          <div class="body"><% for (const x of cands.excluded) { %><div class="amc-ex"><span class="mono"><%= x.value %></span> <span class="hint"><%= x.kind === 'jan' ? 'JAN' : 'FNSKU · 出品 SKU ' + x.listing_code %> · <%= x.why %></span></div><% } %></div>
+        </details>
+        <% } %>
+        <span class="hint">FNSKU = Amazon 日本の、この商品 1 個だけの出品 (まとめ売り・ほかの商品と組んだ出品・消えた出品・米国は数えない) · JAN = この画面の「JAN」(チェック数字が合うもの)</span>
+      </div></div>
+
+    <% if (!ro) { %>
+    <div class="po-foot">
+      <span class="hint">Company DB に保存されます (右の「保存する」とは別) · 使うのはロジザードに初めて載せるときだけ (載った後はロジザードの画面で直す) · ほかの人が先に直していたら保存せずに知らせます</span>
+      <span class="msgline" id="lzbc-msg" role="status" aria-live="polite"></span>
+      <button class="btn pri" type="button" id="lzbc-save" disabled>決め方を保存</button>
+    </div>
+    <% } %>
+    <script type="application/json" id="me-lzbc"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
+  <% } %>
+</section>

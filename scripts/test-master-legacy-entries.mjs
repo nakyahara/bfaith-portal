@@ -288,9 +288,9 @@ console.log('── 5. 門が実際に掛かっている ──');
   }
   // 楽天の出品の payload は、いつも税率の決め方 (切替前 = legacy / 閉じた後 = Company DB) を渡す (R1 H5)
   const calls = [];
-  for (const f of files) for (const m of text.get(f.rel).matchAll(/buildItemPayload\(([^)]*)\)/g)) if (!/^\s*db,\s*draftId,\s*\{\s*tax\s*=\s*null\s*\}\s*=\s*\{\}\s*$/.test(m[1])) calls.push(`${f.rel}: ${m[1]}`);
-  // { tax: … } か { tax } (直前に const tax = await resolveListingTax(…) がある) の形
-  const passesTax = (c) => /\{\s*tax:/.test(c) || (/\{\s*tax\s*\}/.test(c) && /const tax = await resolveListingTax\(/.test(text.get(c.split(':')[0])));
+  for (const f of files) for (const m of text.get(f.rel).matchAll(/buildItemPayload\(([^)]*)\)/g)) if (!/^\s*db,\s*draftId,\s*\{\s*tax\s*=\s*null\s*(,\s*jan:\s*janGate\s*=\s*null\s*)?\}\s*=\s*\{\}\s*$/.test(m[1])) calls.push(`${f.rel}: ${m[1]}`);
+  // { tax: … } か { tax } / { tax, jan: … } (直前に const tax = await resolveListingTax(…) がある) の形 (jan = Company DB構想 21 B2 の段 5 の JAN の決定)
+  const passesTax = (c) => /\{\s*tax:/.test(c) || (/\{\s*tax\s*[,}]/.test(c) && /const tax = (draftRow \? )?await resolveListingTax\(/.test(text.get(c.split(':')[0])));
   ok(calls.length >= 2 && calls.every(passesTax), `楽天の出品の payload を作る呼び出しは全部 { tax } を渡す (${calls.length} か所)`, calls.filter((c) => !passesTax(c)).join('\n      '));
 }
 

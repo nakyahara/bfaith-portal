@@ -37,6 +37,11 @@
  *  60 NE 登録の CSV の「この形を実機で確かめた」(10/12 中原さん): 引退した版 (ne-reg-single-v1) の試し用のファイル = ボタンも「本番の行数で作れるようになります」も出さず一言・
  *     門の無い版 (single-v2・variation-v1) も出さない・門のある版 (セット) は今までどおり出る (押すと記録)
  *  51 円の欄 (標準売価・原価・例外原価) の読みはサーバーと同じ (カンマ・全角の数字・空白): 保存すると変わること・前との差・保存するとこうなる・利益
+ *  67 スマホ 390 / 360 / 境目の 760 (10/13): 主な画面 22 (一覧・商品・新商品 3 種・Amazon SKU 7 つ・NE 登録の CSV・NE から消す・発注の設定の届け待ち・つかいかた・マスタの判断 3 つ) が
+ *     200 で開き・横にはみ出さない (表は表の箱の中で横に送る)・上の帯は 1 行 (未保存と発注の札が出ても)・押す所 (上の帯・左の列・「絞る」・本文のボタン / 切り替え / 札 / 欄・保存の箱) は
+ *     44px で真ん中を押すとその物に当たる・本文の最後が下の保存の箱に隠れない
+ *  68 スマホ 390: 開く物 (Amazon SKU の構成の候補・全体から探す・左の列の吹き出し・列の板・マスタの判断の引き出し・隠すの窓・離れるときの確認) が画面の中で切れていない・押せる
+ *  69 スマホ 390: 上の帯から行ける道 (ポータル・左の列・全体から探す)。隠すのはダッシュボードと「マスタの入力」の札だけ (ほかの .btn は隠さない)。写し = MASTER_EDIT_UI_SHOTS_390=フォルダ
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -203,6 +208,14 @@ app.set('view engine', 'ejs');
 let SESSION_APPS = ['master-edit', 'purchase-orders'];
 app.use((req, res, next) => { req.session = { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: SESSION_APPS }; next(); });
 app.use('/apps/master-edit', router);
+// マスタの判断 (左の列から行く・同じ master-edit.css を読む = [67] スマホ 390 の幅で開く)。同じ PGlite を順番に使う (master-edit と同じ鎖)
+const { default: decisionsRouter, __setPgClientFactory: __setDecisionsPgClientFactory } = await import('../apps/master-decisions/router.mjs');
+__setDecisionsPgClientFactory(async () => {
+  let release; const prev = chain; chain = new Promise((r) => { release = r; }); await prev;
+  await pg.query('set role deploy');
+  return { query: (t, p) => pg.query(t, p), end: async () => { release(); }, on: () => {} };
+});
+app.use('/apps/master-decisions', decisionsRouter);
 app.get('/', (req, res) => res.send('<p>portal</p>'));
 const server = http.createServer(app);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -1944,7 +1957,7 @@ await ta('[53] 一覧の見出しで並び替え (10/8 PR1): 押す = 全件で�
 await ta('[54] 一覧の列の板 (狭い画面 390): 下から出る・板ははみ出さない', async (p) => {
   await p.goto(B + '/?q=' + encodeURIComponent('単品'));
   const spill = () => p.evaluate(() => [...document.querySelectorAll('body *')].filter((e) => e.offsetParent !== null && e.getBoundingClientRect().right > innerWidth + 1 && !e.closest('.tblwrap')).map((e) => (e.id ? '#' + e.id : e.tagName.toLowerCase() + '.' + [...e.classList].join('.')) + ':' + Math.round(e.getBoundingClientRect().right)).slice(0, 12));
-  // 🚨 この画面は前から 390 幅では上の帯・詳細検索の欄がはみ出す (携帯向けに作っていない・この PR の外)。ここでは「列の板がはみ出しを増やさない」を見る
+  // この画面の 390 幅のはみ出し (上の帯・詳細検索の欄) は 10/13 に直した ([67] が見る)。ここでは「列の板がはみ出しを増やさない」を見る
   const before = await spill();
   await p.click('#colbtn');
   await p.waitForTimeout(300);
@@ -2394,9 +2407,18 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   await noneRest(p);
   assert.match(await p.textContent('#remain'), /下書きを保存できます/);
   assert.equal(await p.locator('#checklist li.todo').count(), 0);
+  // 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコード = 初めから「自動」が押された形 (入力なしは無い = 数えない)・押し替えると送る値が変わる
+  assert.equal(await p.getAttribute('#f-lzbc', 'data-value'), 'auto');
+  assert.equal(await p.locator('[data-row="logizard_barcode"] .nonechk').count(), 0, 'ロジザードのバーコードに入力なしがある');
+  await p.click('#f-lzbc button[data-v="fnsku"]');
+  assert.equal(await p.getAttribute('#f-lzbc', 'data-value'), 'fnsku');
   const bodies = [];
   p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url())) bodies.push(JSON.parse(rq.postData())); });
   await Promise.all([p.waitForURL(/\/sku\/ui-none-1$/), p.click('#save')]);
+  assert.equal(bodies[0].logizard_barcode, 'fnsku');
+  assert.deepEqual((await pg.query(`select r.rule, r.via from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = 'ui-none-1'`)).rows, [{ rule: 'fnsku', via: 'register' }]);
+  // 登録の後の商品の画面に「ロジザードに送るバーコード」(決め方 = FNSKU・FNSKU はまだ無い = 待つ)
+  assert.match(await p.innerText('#sec-lzbc'), /待つ/);
   // 送る印 = サーバーと同じ並び (lib/master-register-blanks.mjs の BLANK_KEYS)
   assert.deepEqual(bodies[0].blanks, ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit',
     'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.reference_urls', 'card.set_decision', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
@@ -2408,7 +2430,7 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
 await ta('[65] 入力なし (スマホ 390): 横にはみ出さない・押す所は 44px・押すと入力なし・下の帯から保存まで', async (p) => {
   await p.goto(B + '/new?kind=single');
   await fillSingleReq(p, 'ui-none-390');
-  // 🚨 単品の登録の画面は前から 390 幅では上の帯 (ログインの名前)・円の欄・参考 URL の行が少しはみ出す (携帯向けに作っていない・この PR の外)。
+  // 単品の登録の画面の 390 幅のはみ出し (上の帯・円の欄) は 10/13 に直した ([67] が全体を見る)。
   //    ここでは「入力なし」の札と参考 URL の下の行がはみ出さない・小さくないことを見る (まとまりの画面は [📱390] が全体を見る)
   const out0 = await p.evaluate(() => [...document.querySelectorAll('.refsfoot')].filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > document.documentElement.clientWidth + 1).length);
   assert.equal(out0, 0, '参考 URL の下の行がはみ出す');
@@ -2567,6 +2589,213 @@ await ta('[62] Amazon SKU の新しい対応 (390・タッチ): 1 行目があ�
     assert.deepEqual(errs, [], '画面の JS の例外');
   } finally { await c2.close(); }
 });
+
+// ── [67] スマホの幅 (390 / 360 / 境目の 760・10/13): 主な画面がどれも横にはみ出さない (表は表の箱の中で横に送る)・上の帯は 1 行・押す所は 44px で真ん中を押すとその物に当たる ──
+// [68] 390 で開く物 (候補の一覧・全体から探す・吹き出し・引き出し・窓・列の板) が画面の中で切れていない・押せる / [69] 390 の上の帯から行ける道 (ポータル・画面の切り替え・全体から探す)
+// MASTER_EDIT_UI_SHOTS_390=フォルダ を付けると 390 幅の写しを残す (目で見る用)
+const SHOTS390 = process.env.MASTER_EDIT_UI_SHOTS_390 || '';
+{
+  // Amazon の出品一覧 (0074) の見本 = 「まだつないでいない SKU」の行と seller SKU の画面の「Amazon の出品一覧では」を描く
+  const IL = await import('../apps/company-db/ingest/amazon-listings.mjs');
+  const today = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+  const lr = (sku, name, fba = true) => ({ seller_sku: sku, item_name: name, asin: 'B0000UI390', open_date: today, open_date_raw: `${today} 10:00:00 JST`, fulfillment: fba ? 'FBA' : 'FBM', channel_raw: fba ? 'AMAZON_NA' : 'DEFAULT', status: 'active', status_raw: 'Active', quantity: 3, price: '1280.00' });
+  const rows = [lr('pr-k001', '国産 はちみつ 500g'), lr('pr-ui390-unlinked-very-long-seller-sku-0001', '長い名前の試験: 国産 有機 シリコン 保存袋 Sサイズ 3枚入 まとめ買い 12 個セット 送料無料 ギフト ラッピング対応'), lr('pr-ui390-b', 'はちみつ レモン キャンディ')];
+  const gen = Date.now() - 3600e3;
+  const got = await IL.ingestAmazonListings(db, { shop_code: IL.SHOP_CODE, generation: gen, snapshot_at: new Date(gen).toISOString(), report_run_id: 'r_ui390', checksum: IL.listingChecksum(rows.map((r) => IL.listingRowOf(r))), row_count: rows.length, skipped_count: 0, rows }, { nowMs: Date.now() });
+  assert.equal(got.status, 'applied');
+  // マスタの判断の候補 1 件 (一覧の行と右から出る引き出しを描く)
+  const { writeDecisions } = await import('../apps/company-db/master-compare/decisions.mjs');
+  const fp = 'f'.repeat(64);
+  await writeDecisions(db, { compareRunId: 'mc_20300101T000000001Z_abcdef', observedAt: '2030-01-01T00:00:00Z', decisions: [{ fingerprint: fp, subject_key: 'value:s001', code_norm: 's001', col: 'tax_rate', child: null, cls: 'ne_no_value', reason_kind: 'tax_fallback',
+    semantic: 'tax_fallback@1', print: { code_norm: 's001', col: 'tax_rate', n: null, n_state: 'empty', c: 0.1, reason: { reason: 'tax_fallback' } }, resolutions: ['accept_difference', 'fix_ne'], proposal: { op: 'set_ne_value', value: 0.1 } }] });
+}
+// [名前, 道, その画面にあるはずの物 (見えている)]
+const MOBILE_SCREENS = [
+  ['一覧', '/', '#list-page #list-search'], ['一覧_絞り込み', '/?q=はちみつ', '#list-page #list-tbl'], ['単品', '/sku/s002', '#sku-page #f-reorder_months'], ['セット', '/sku/set001', '#sku-page #set-mode'], ['変更の記録', '/sku/s003/history', '#history-page'],
+  ['新商品_単品', '/new?kind=single', '#new-page #code'], ['新商品_セット', '/new?kind=set', '#new-page #comp'], ['新商品_まとまり', '/new?kind=variation', '#new-page .kindcards'],
+  ['Amazon_一覧', '/amazon/', '#amazon-page #list-search'], ['Amazon_1つのSKU', '/amazon/sku?sku=pr-k001', '#amazon-sku-page #comp'], ['Amazon_新しいSKU', '/amazon/sku?sku=pr-ui390-b', '#amazon-sku-page #comp-rows .c-code'],
+  ['Amazon_つないでいない', '/amazon/unlinked', '#unlinked-page .ul-row'], ['Amazon_対応が無い', '/amazon/unmapped?channel=all', '#unmapped-page'], ['Amazon_変更の記録', '/amazon/sku/history?sku=pr-k001-b', '#history-page'],
+  ['Amazon_作る', '/amazon/new?sku=pr-k001-bx', '#amazon-new-page'], ['NE登録のCSV', '/reg-csv', '#rc'], ['NEから消す', '/ne-delete', '#nd'], ['発注の設定の届け待ち', '/order-settings-outbox', '#poq-page'], ['つかいかた', '/manual', '.page.doc'],
+  ['マスタの判断', '/apps/master-decisions/', '#md-page #rows a.rowlink'], ['マスタの判断_CSV', '/apps/master-decisions/csv', '#csv-page'], ['マスタの判断_つかいかた', '/apps/master-decisions/manual', '.page.doc'],
+];
+const mobileUrl = (url) => (url.startsWith('/apps/') ? new URL(url, B).href : B + url);
+/** 開いて待つ: 200・上の帯・画面ごとの物があること (無ければ投げる)・動きが終わるまで */
+async function openMobile(p, name, url, sel) {
+  const res = await p.goto(mobileUrl(url));
+  assert.equal(res.status(), 200, `${name}: ${res.status()}`);
+  await p.waitForLoadState('networkidle');
+  await p.waitForSelector(sel, { state: 'visible', timeout: 5000 }).catch(() => { throw new Error(`${name}: 画面の物 ${sel} が見えない`); });
+  assert.equal(await p.locator('header.hdr').isVisible(), true, `${name}: 上の帯が無い`);
+  await p.evaluate(() => Promise.all(document.getAnimations().map((a) => a.finished.catch(() => {}))));
+}
+/**
+ * スマホの幅の測り: ページの横幅・はみ出している一番外の要素 (横に送る箱の中・fixed は除く)・上の帯の高さ・
+ * 押す所 (上の帯・左の列・「絞る」・本文のボタン / 切り替え / 札 / 欄・下の保存の箱) の大きさと、真ん中を押すとその物に当たるか (重なり・保存の箱の下に隠れない)
+ */
+const measureMobile = (p) => p.evaluate(() => {
+  const W = document.documentElement.clientWidth;
+  const tag = (el) => `${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}${typeof el.className === 'string' && el.className ? '.' + el.className.trim().split(/\s+/).join('.') : ''}`;
+  const inBox = (el) => { for (let a = el.parentElement; a && a !== document.body; a = a.parentElement) { const s = getComputedStyle(a); if (s.overflowX !== 'visible' || s.position === 'fixed') return true; } return false; };
+  const out = [...document.querySelectorAll('body *')].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > W + 1 && getComputedStyle(el).position !== 'fixed' && !inBox(el); });
+  const wide = out.filter((el) => !out.includes(el.parentElement)).slice(0, 6).map((el) => `${tag(el)} 右 ${Math.round(el.getBoundingClientRect().right)}`);
+  const seen = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility === 'visible' && !el.closest('[hidden], .sr') && el.checkVisibility({ contentVisibilityAuto: true, opacityProperty: true }) && !(el.closest('details:not([open])') && !el.closest('summary')); };   // 閉じた details の中 = 見えない (Chromium は大きさを持つ)
+  const square = [...document.querySelectorAll('.hdr a, .hdr button, .rail a.nav, .bigsearch .go')].filter(seen);
+  const tall = [...document.querySelectorAll('main .btn, main .seg button, main .chip, main input.in, main select.in, main textarea.in, .savebox .btn')].filter(seen).filter((el) => !square.includes(el));
+  const small = [...square.filter((el) => { const r = el.getBoundingClientRect(); return r.height < 43.5 || r.width < 43.5; }), ...tall.filter((el) => el.getBoundingClientRect().height < 43.5)]
+    .slice(0, 8).map((el) => `${tag(el)} ${Math.round(el.getBoundingClientRect().width)}×${Math.round(el.getBoundingClientRect().height)}`);
+  const blocked = [];
+  for (const el of [...square, ...tall]) {
+    if (getComputedStyle(el).position !== 'fixed' && !el.closest('.hdr, .rail, .savebox')) el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    const r = el.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    if (!hit || !(hit === el || el.contains(hit) || (hit.control && hit.control === el))) blocked.push(`${tag(el)} の上に ${hit ? tag(hit) : '何も無い'}`);
+    if (blocked.length >= 6) break;
+  }
+  // 下に固定の保存の箱: いちばん下まで送ったとき、本文の最後の物が箱の下に隠れない (箱の上で読める・押せる)
+  const sb = [...document.querySelectorAll('.savebox')].find((x) => seen(x) && getComputedStyle(x).position === 'fixed');
+  if (sb) {
+    window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' });
+    const bottom = Math.max(...[...document.querySelectorAll('main *')].filter((x) => seen(x) && !sb.contains(x) && getComputedStyle(x).position !== 'fixed' && !x.closest('.palette-bg, .modal-bg')).map((x) => x.getBoundingClientRect().bottom));
+    const top = sb.getBoundingClientRect().top;
+    if (bottom > top + 1) blocked.push(`本文の最後 (下端 ${Math.round(bottom)}) が保存の箱 (上端 ${Math.round(top)}) の下に隠れる`);
+  }
+  window.scrollTo(0, 0);
+  const hdr = document.querySelector('.hdr');
+  return { sw: document.documentElement.scrollWidth, W, wide, small, blocked, hdrH: hdr ? Math.round(hdr.getBoundingClientRect().height) : 0, n: square.length + tall.length };
+});
+for (const w of [390, 360, 760]) {
+  await ta(`[67] スマホ ${w}: 主な画面 22 (一覧・商品・新商品 3 種・Amazon SKU 7 つ・NE 登録の CSV・NE から消す・マスタの判断・つかいかた) が横にはみ出さない・上の帯は 1 行・押す所は 44px で押せる`, async (p) => {
+    process.env.MASTER_DECISION_APPROVERS = 'naka@test';   // NE 登録の CSV・NE から消す・マスタの判断を操作できる人の画面で (ボタンが一番多い)
+    const bad = [];
+    let targets = 0;
+    try {
+      for (const [name, url, sel] of MOBILE_SCREENS) {
+        await openMobile(p, name, url, sel);
+        const m = await measureMobile(p);
+        targets += m.n;
+        if (m.sw > m.W || m.wide.length || m.small.length || m.blocked.length) bad.push(`${name} (${url}): 横幅 ${m.sw} / ${m.W}・はみ出す ${JSON.stringify(m.wide)}・小さい ${JSON.stringify(m.small)}・押せない ${JSON.stringify(m.blocked)}`);
+        if (m.hdrH > 58) bad.push(`${name}: 上の帯が ${m.hdrH}px (1 行の 58px に収まらない)`);
+        if (SHOTS390 && w === 390) await p.screenshot({ path: `${SHOTS390}/${name}.png`, fullPage: true });
+      }
+      // 上の帯に「未保存」と「発注の設定が届いていない商品」の札が両方出たとき (一番混む形) も 1 行・はみ出さない・押せる
+      await openMobile(p, '札が全部', '/sku/s002', '#f-reorder_months');
+      await p.fill('#f-reorder_months', '5');
+      await p.evaluate(() => { document.getElementById('poq-pill').hidden = false; document.getElementById('poq-pill-t').textContent = '発注の設定が届いていない商品 12 件'; });
+      assert.equal(await p.isVisible('#unsaved'), true);
+      assert.equal(await p.isVisible('#poq-pill'), true);
+      const m = await measureMobile(p);
+      if (m.sw > m.W || m.wide.length || m.small.length || m.blocked.length || m.hdrH > 58) bad.push(`札が全部出た上の帯: 横幅 ${m.sw} / ${m.W}・高さ ${m.hdrH}・はみ出す ${JSON.stringify(m.wide)}・小さい ${JSON.stringify(m.small)}・押せない ${JSON.stringify(m.blocked)}`);
+      if (SHOTS390) await p.screenshot({ path: `${SHOTS390}/上の帯_札が全部_${w}.png` });
+    } finally { delete process.env.MASTER_DECISION_APPROVERS; }
+    assert.deepEqual(bad, [], `${w} 幅ではみ出す・押せない画面:\n${bad.join('\n')}`);
+    assert.ok(targets > 300, `押す所を見ている数 ${targets}`);
+  }, { width: w, height: 844 });
+}
+
+/** 開いた物が画面の中にあり、overflow の箱 (表の箱・板など) に切られていない・真ん中を押すとその物に当たる */
+const unclipped = (p, sel) => p.evaluate((sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return [`${sel} が無い`];
+  const r = el.getBoundingClientRect();
+  const bad = [];
+  if (!(r.width > 0 && r.height > 0)) return [`${sel} が見えない`];
+  if (r.left < -1 || r.right > document.documentElement.clientWidth + 1 || r.top < -1 || r.bottom > innerHeight + 1) bad.push(`${sel} が画面の外 ${JSON.stringify([r.left, r.top, r.right, r.bottom].map(Math.round))}`);
+  for (let a = el.parentElement; a && a !== document.documentElement; a = a.parentElement) {
+    const s = getComputedStyle(a);
+    if (s.overflowX === 'visible' && s.overflowY === 'visible') continue;
+    const b = a.getBoundingClientRect();
+    if (r.left < b.left - 1 || r.right > b.right + 1 || r.top < b.top - 1 || r.bottom > b.bottom + 1) bad.push(`${sel} が ${a.tagName.toLowerCase()}${a.id ? '#' + a.id : ''}.${a.className} に切られる`);
+  }
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + Math.min(r.height / 2, 20));
+  if (!hit || !(hit === el || el.contains(hit))) bad.push(`${sel} の上に ${hit ? hit.tagName + '.' + hit.className : '何も無い'}`);
+  return bad;
+}, sel);
+const settle = (p) => p.waitForTimeout(350);   // 出てくる動き (0.15〜0.22 秒) の後に測る
+await ta('[68] スマホ 390: 開く物 (Amazon SKU の構成の候補・全体から探す・左の列の吹き出し・列の板・マスタの判断の引き出し・隠すの窓・離れるときの確認) が画面の中で切れていない・押せる', async (p) => {
+  process.env.MASTER_DECISION_APPROVERS = 'naka@test';
+  const bad = [];
+  const shot = async (n) => { if (SHOTS390) await p.screenshot({ path: `${SHOTS390}/開く_${n}.png` }); };
+  try {
+    // Amazon SKU の構成の候補 (表の箱の中の欄の下に出る・箱の外に 1 つだけ置いてある)
+    await openMobile(p, 'Amazon_新しいSKU', '/amazon/sku?sku=pr-ui390-b', '#comp-rows .c-code');
+    const code = p.locator('#comp-rows tr.comp-row').first().locator('.c-code');
+    await code.evaluate((el) => window.scrollTo(0, el.getBoundingClientRect().top + window.scrollY - 120));
+    await code.fill('はち');
+    await p.waitForSelector('#comp-suggest:not([hidden]) [role="option"]');
+    await settle(p);
+    bad.push(...await unclipped(p, '#comp-suggest'), ...await unclipped(p, '#comp-suggest [role="option"]'));
+    await shot('構成の候補');
+    // 全体から探す (虫めがね → 窓 → 候補)
+    await openMobile(p, '一覧', '/', '#list-search');
+    await p.click('#open-palette');
+    await p.waitForSelector('#palette-bg.on #pal-in');
+    await p.fill('#pal-in', 'k001');
+    await p.waitForSelector('#pal-res [role="option"]');
+    await settle(p);
+    bad.push(...await unclipped(p, '#palette-bg .palette'), ...await unclipped(p, '#pal-res [role="option"]'));
+    await shot('全体から探す');
+    await p.keyboard.press('Escape');
+    // 左の列の吹き出し (アイコンの名前)
+    await p.hover('.rail a.nav[aria-label="Amazon SKU"]');
+    await settle(p);
+    bad.push(...await unclipped(p, '.rail a.nav[aria-label="Amazon SKU"] .lbl'));
+    await shot('左の列の吹き出し');
+    // 列の板 (下から出る)
+    await p.mouse.move(300, 600);
+    await p.click('#colbtn');
+    await settle(p);
+    bad.push(...await unclipped(p, '#colpanel'));
+    // マスタの判断の引き出し (右から出る)
+    await openMobile(p, 'マスタの判断', '/apps/master-decisions/', '#rows a.rowlink');
+    await p.click('#rows a.rowlink');
+    await p.waitForSelector('#dr-bg', { state: 'visible' });
+    await settle(p);
+    bad.push(...await unclipped(p, '#drawer'));
+    await shot('判断の引き出し');
+    // まだつないでいない SKU の「隠す」の窓
+    await openMobile(p, 'Amazon_つないでいない', '/amazon/unlinked', '.ul-row button[data-act="hide"]');
+    await p.click('.ul-row button[data-act="hide"]');
+    await p.waitForSelector('#hide-bg.on .modal');
+    await settle(p);
+    bad.push(...await unclipped(p, '#hide-bg .modal'));
+    await shot('隠すの窓');
+    // 離れるときの確認 (未保存のまま左の列を押す)
+    await openMobile(p, '単品', '/sku/s002', '#f-reorder_months');
+    await p.fill('#f-reorder_months', '6');
+    await p.click('.rail a.nav[aria-label="つかいかた"]');
+    await p.waitForSelector('#leave-bg.on .modal');
+    await settle(p);
+    bad.push(...await unclipped(p, '#leave-bg .modal'), ...await unclipped(p, '#leave-stay'));
+    await shot('離れるときの確認');
+  } finally { delete process.env.MASTER_DECISION_APPROVERS; }
+  assert.deepEqual(bad, [], `切れている・押せない:\n${bad.join('\n')}`);
+}, { width: 390, height: 844 });
+
+await ta('[69] スマホ 390: 上の帯から行ける道 = ポータル (B-Faith Portal)・画面の切り替え (左の列)・全体から探す が見えて押せる。隠すのは「ダッシュボード」(ポータルと同じ行き先) と「マスタの入力」の札だけ', async (p) => {
+  for (const [name, url, sel] of [MOBILE_SCREENS[0], MOBILE_SCREENS[19]]) {
+    await openMobile(p, name, url, sel);
+    // 上の帯の押す物で見えないのは決めた 2 つだけ (ほかの .btn = ログアウトなどを足しても隠れない)
+    await p.evaluate(() => { const a = document.createElement('a'); a.className = 'btn sm'; a.id = 'probe-logout'; a.href = '/logout'; a.textContent = 'ログアウト'; document.querySelector('.hdr .user').appendChild(a); });
+    const hiddenOnes = await p.evaluate(() => [...document.querySelectorAll('.hdr a, .hdr button')].filter((el) => !el.closest('[hidden]') && el.getBoundingClientRect().width === 0).map((el) => el.classList.contains('hdr-dash') ? 'ダッシュボード' : el.classList.contains('app-pill') ? '札' : el.id || el.className));
+    assert.deepEqual(hiddenOnes.sort(), ['ダッシュボード', '札'].sort(), `${name}: 上の帯で隠れている物`);
+    assert.equal(await p.isVisible('#probe-logout'), true, `${name}: 上の帯のほかのボタン (ログアウトなど) は隠さない`);
+    assert.equal(await p.getAttribute('.hdr .brand > a:first-child', 'href'), await p.getAttribute('.hdr .hdr-dash', 'href'), 'ポータルの名前とダッシュボードは同じ行き先');
+  }
+  // ポータルへ (名前を押す)
+  await openMobile(p, '一覧', '/', '#list-search');
+  await Promise.all([p.waitForURL((u) => new URL(u).pathname === '/'), p.click('.hdr .brand > a:first-child')]);
+  // 画面の切り替え (左の列)
+  await openMobile(p, '一覧', '/', '#list-search');
+  await Promise.all([p.waitForURL(/\/amazon\/$/), p.click('.rail a.nav[aria-label="Amazon SKU"]')]);
+  await Promise.all([p.waitForURL(/master-decisions\/$/), p.click('.rail a.nav[aria-label="マスタの判断 (NE との差)"]')]);
+  // 全体から探す → 操作で別の画面へ
+  await p.click('#open-palette');
+  await p.waitForSelector('#palette-bg.on #pal-in');
+  await p.fill('#pal-in', 'NE 登録');
+  const op = p.locator('#pal-res [role="option"]', { hasText: 'NE 登録の CSV を開く' });
+  await op.waitFor();
+  await Promise.all([p.waitForURL(/\/reg-csv$/), op.click()]);
+}, { width: 390, height: 844 });
 
 await browser.close();
 server.close();

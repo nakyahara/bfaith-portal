@@ -86,6 +86,8 @@ export const JAN_READ_SQL = `select x.ord::int as ord, k.sku_id::text as sku_id,
 
 const str = (v) => String(v ?? '').trim();
 const pairKey = (code, jan) => `${code.toLowerCase()}\u0000${jan}`;
+/** readCdbJans の答え (byPair) の鍵 (商品コード, JAN)。listing-jan.mjs も同じ鍵で引く */
+export const janPairKey = (code, jan) => pairKey(str(code), str(jan));
 
 /** 読む接続の URL を選ぶ。{ url, source } (url が無ければ null) */
 export function janReadUrlFrom(env = process.env) {
@@ -295,23 +297,25 @@ export function summarizeJanUnits(units) {
   return { state: worst.state, severity: worst.severity, label, counts };
 }
 
-/** 注意の文 (楽天のプレビュー・登録の確認に出す)。warn と muted の単位だけ */
-export function janWarningsOf(result) {
+/** 注意の文 (楽天のプレビュー・登録の確認に出す)。warn と muted の単位だけ。
+ *  enforce = JAN を止める設定 (listing-jan.mjs の PH_JAN_ENFORCE) が入っている = 「出品は止めません」と書かない (止めるかは出品の門が決める) */
+export function janWarningsOf(result, { enforce = false } = {}) {
   if (!result) return [];
-  if (!result.ok || result.readable === false) return [`JAN を Company DB と比べられませんでした (${result.reason})。出品は止めません`];
+  if (!result.ok || result.readable === false) return [`JAN を Company DB と比べられませんでした (${result.reason})。${enforce ? '商品マスタに結んだ JAN は、出品のときにもう一度確かめます' : '出品は止めません'}`];
   const out = [];
   for (const u of result.units) {
     if (u.severity !== 'warn' && u.severity !== 'muted') continue;
-    out.push(`JAN ${u.label}: ${u.code}${u.phJan ? ` の JAN ${u.phJan}` : ''}${u.detail ? ` — ${u.detail}` : ''}。${u.fix ? `直し方: ${u.fix}。` : ''}(この印は知らせだけ・出品は止めません)`);
+    out.push(`JAN ${u.label}: ${u.code}${u.phJan ? ` の JAN ${u.phJan}` : ''}${u.detail ? ` — ${u.detail}` : ''}。${u.fix ? `直し方: ${u.fix}。` : ''}${enforce ? '(この印は知らせ。出品を止めるかは、商品マスタに結んであるかで決まります)' : '(この印は知らせだけ・出品は止めません)'}`);
   }
   return out;
 }
 
 /** 比べる単位 (janUnitsForDraft の戻り値) を Company DB と比べる。読めないときも ok: true で各単位が unreadable (読めないのも印)。投げない */
-export async function compareJanUnits({ mode, units }, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS, deadlineAt = null } = {}) {
+/** read = 同じ組でもう読んだ答え (readCdbJans の戻り値) を渡すと読み直さない (詳細画面は 1 回の読みで比べる印と選ぶ物の両方を出す) */
+export async function compareJanUnits({ mode, units }, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS, deadlineAt = null, read: given = null } = {}) {
   try {
     if (!units.length) return { ok: true, mode, readable: true, reason: null, units: [], summary: summarizeJanUnits([]) };
-    const read = await readCdbJans(units.map((u) => ({ code: u.code, jan: u.phJan })), { env, deadlineMs, deadlineAt });
+    const read = given || await readCdbJans(units.map((u) => ({ code: u.code, jan: u.phJan })), { env, deadlineMs, deadlineAt });
     const judged = units.map((u) => judgeJanUnit(u, read));
     return { ok: true, mode, readable: read.ok, reason: read.ok ? null : read.reason, units: judged, summary: summarizeJanUnits(judged) };
   } catch (e) {

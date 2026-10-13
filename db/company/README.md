@@ -2658,6 +2658,18 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): `migrate.mjs --dry-run` (0076 だけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す (master_ops に足す関数の実行) → 許可 (確かめ → 中原さんの OK → `--apply`) → やめる (dry-run → 中原さんの OK → `--apply --expect-hash`) → drift-list で 0
 - 試験 = `node scripts/test-master-gone-day.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-gone-day-pg.mjs` (本物のログイン)
 
+### ロジザードに送るバーコードの決め方 (0078 仮番号・AI_reference CompanyDB構想/23・2026-10-13 夜 中原さんの決定)
+- **なぜ**: 「JAN コードとロジザードに送るバーコード情報は別。商品のバーコードには Amazon の FNSKU を記載している場合もある」。値の決め方 = **FNSKU があれば FNSKU・無ければ JAN・JAN も無ければ空欄** (空欄 = ロジザードが番号を付ける)
+- **表** `ops.sku_logizard_barcode_rules` (SKU・決め方 auto / fnsku / jan / lz_assign・候補が複数のときに選んだ 1 本 pinned・どこから register / sku_page・だれ・request_id・DB のロール・時刻)。
+  追記だけ (変えない・消さない・TRUNCATE しない)・書くのは `ops.set_sku_logizard_barcode_rule` だけ (取引の中の印)。SKU ごとに一番新しい行が今の決め方・**行が無い = 決め方なし** (この機能の前の商品)。
+  🚨 **送る値は持たない** (CSV を作るときに Company DB の今の FNSKU・JAN から決める = `lib/logizard-barcode.mjs`)。`core.external_ids` (識別子) には混ぜない
+- **書く** `ops.set_sku_logizard_barcode_rule(request_id, 人, sku_id, 決め方, 選んだ 1 本, どこから, 開いたときの行番号)` = 画面のロール **master_edit だけ**に実行。単品・やめていない商品ならいつでも。
+  SKU の鍵 → 押し直し (前の答え) → 開いたときの行番号 (違う = stale) → 選んだ 1 本は今の候補だけ (Amazon 日本・この SKU 1 個だけの出品の FNSKU / この商品の有効な JAN) → 今と同じ = 書かない
+- **入口**: 新商品の登録 (単品・まとまりの子ごと・同じ取引) / 商品の画面の「ロジザードに送るバーコード」(`POST /api/sku/:code/logizard-barcode`)。今 (GAS の間) は画面の答えは参考 = 人が GAS のシートの H 列に入れる
+- 当て方 (🚨 まだ流さない): `migrate.mjs --dry-run` (0078 だけ・今の行は何も変えない = 表は空・関数だけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す (master_edit に表の select と関数の実行・引数なし = パスワードは変えない) → アプリ。
+  **0078 を先に当てる** (前にアプリが出ると、新商品の登録は「自動」だけ受けて行を書かない = 決め方なしの新商品が増える・自動以外は 503 db_not_ready)
+- 試験 = `node scripts/test-lz-barcode.mjs` (PGlite・本物の router・決め方 / 候補 / CSV の部品 / DB の関数 / 守り / 画面) と `test-master-register.mjs` [R-LZ]・`test-master-variation-batch.mjs` [R-LZ]・画面の試験 (`test-master-edit-ui.mjs`・`test-master-variation-ui.mjs`)
+
 ### 要確認 (quarantined) の商品を確認済みにする (0078・仮の番号・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える
 - **照合 ② の確かめ待ち** (`ops.v_ne_reg_targets`): 要確認を全部 (単品もセットも・親のある子も・持ち主を問わず・コード 80 字まで) = 毎朝の照合 ② が要確認の NE の観測を残す (miniPC のコードは変えない・新しい定期実行なし)

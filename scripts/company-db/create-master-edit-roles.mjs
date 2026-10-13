@@ -249,6 +249,14 @@ export const ORDER_OUTBOX_EDIT_FUNCTIONS = Object.freeze(['ops.enqueue_order_set
   'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer, uuid[])', 'ops.finish_order_settings_event(uuid, text, text, jsonb, text)',
   'ops.dismiss_order_settings_event(uuid, text, text)']);
 export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()']);
+/**
+ * 🆕 0078 (ロジザードに送るバーコードの決め方・CompanyDB構想 23・中原さんの決定 10/13 夜): master_edit に決め方の表の select (商品の画面) と、
+ *   決め方を書く関数の実行 (新商品の登録の取引の中・商品の画面)。表・関数が無い DB (0078 の前) では付けない (流し直すと付く)。
+ *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・守りの trigger
+ */
+export const LZ_BARCODE_SELECT = Object.freeze(['ops.sku_logizard_barcode_rules']);
+export const LZ_BARCODE_EDIT_FUNCTIONS = Object.freeze(['ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)']);
+export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_logizard_barcode_rules()']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -351,6 +359,10 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const t of ORDER_OUTBOX_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...ORDER_OUTBOX_EDIT_FUNCTIONS, ...ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of ORDER_OUTBOX_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0078 (ロジザードのバーコードの決め方): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (表は読むだけ・書くのは関数だけ)
+  for (const t of LZ_BARCODE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
+  for (const f of [...LZ_BARCODE_EDIT_FUNCTIONS, ...LZ_BARCODE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of LZ_BARCODE_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、

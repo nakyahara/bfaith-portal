@@ -90,6 +90,13 @@ const ctx = await browser.newContext();
 ctx.setDefaultTimeout(15000);
 // 外のサイト (画像・フォントなど) には出ない
 await ctx.route(/^https?:\/\/(?!127\.0\.0\.1)/, (route) => route.abort());
+// B2 の段 3: 保存に使う JAN の入力は隠してある (商品マスタから選ぶ)。止める設定の前は「手で打つ」で出せる
+async function revealManual(page, code) {
+  const input = page.locator(`.sku-jan-input[data-code="${code}"]`);
+  if (await input.isVisible()) return;
+  await page.locator(`.sku-grid-catalog-cell[data-code="${code}"] .jan-manual-toggle`).click();
+  await input.waitFor({ state: 'visible' });
+}
 async function openPage(url, { width } = {}) {
   const page = await ctx.newPage();
   if (width) await page.setViewportSize({ width, height: 900 });
@@ -131,6 +138,7 @@ try {
     await page.locator('.jan-cdb-mark[data-code="g-red"] .jan-cdb-pill').waitFor({ state: 'attached' });
     await page.locator('.tab-btn[data-tab="tab-category"]').click();   // 表はカテゴリ・属性タブ
     const input = page.locator('.sku-jan-input[data-code="g-red"]');
+    await revealManual(page, 'g-red');   // B2 の段 3: JAN は商品マスタから選ぶ形 = 手で打つ欄は「手で打つ」で出す (止める設定の前だけ)
     await input.fill('4900000001075');
     await input.dispatchEvent('change');
     await page.waitForFunction(() => document.querySelector('.jan-cdb-mark[data-code="g-red"] .jan-cdb-pill')?.textContent === 'Company DB: 一致');
@@ -166,7 +174,8 @@ try {
       // 青 → 白 → 赤 の順に続けて直す (保存はすぐ・照らしは遅い)
       for (const [code, v] of [['g-blue', '4900000001099'], ['g-wht', '4900000001082'], ['g-red', '4900000001020']]) {
         const input = page.locator(`.sku-jan-input[data-code="${code}"]`);
-        if (!(await input.isVisible())) await page.locator(`.sku-catalog-cell[data-code="${code}"] .sku-catalog-mode[value="with"], .sku-grid-catalog-cell[data-code="${code}"] .sku-catalog-mode[value="with"]`).first().check();
+        if (!(await page.locator(`.sku-grid-catalog-cell[data-code="${code}"] .sku-catalog-with`).isVisible())) await page.locator(`.sku-catalog-cell[data-code="${code}"] .sku-catalog-mode[value="with"], .sku-grid-catalog-cell[data-code="${code}"] .sku-catalog-mode[value="with"]`).first().check();
+        await revealManual(page, code);
         await input.fill(v);
         await input.dispatchEvent('change');
         await page.waitForTimeout(60);

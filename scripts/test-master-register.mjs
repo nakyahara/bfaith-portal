@@ -604,6 +604,36 @@ await ta('[R5] 同じ request_id = 前の結果 (何も増えない) / 違う中
   await rejectsWith(reg('single', 'new-a1', single()), 409, 'code_taken');
 });
 
+await ta('[R-LZ] 🆕 0078 ロジザードに送るバーコードの決め方 (CompanyDB構想 23): 送った = 登録と同じ取引で 1 行 (auto も・via register)・送らない (古い画面) = 行なし・要求のハッシュ (送らない = 前と同じ)・違う決め方の押し直し = 409・知らない値 = 400・セット = 400・巻き戻る = 行も残らない', async () => {
+  const lzRows = (code) => q(`select r.rule, r.pinned, r.via, r.actor_id, r.db_user from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = $1 order by r.rule_row`, [code]);
+  const regLz = (code, lz, o = {}) => asEditor(() => R.registerNewSku(db, { actor: 'Naka@Test', requestId: o.requestId ?? uuid(), kind: 'single', code, values: withReq('single', single()), card: {}, logizardBarcode: lz },
+    { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES, beforeCommit: o.beforeCommit }));
+  const rid = uuid();
+  const r = await regLz('lz-r1', 'fnsku', { requestId: rid });
+  assert.equal(r.ok, true);
+  assert.deepEqual(await lzRows('lz-r1'), [{ rule: 'fnsku', pinned: null, via: 'register', actor_id: 'naka@test', db_user: 'master_edit' }]);
+  assert.equal((await regLz('lz-r1', 'fnsku', { requestId: rid })).replayed, true);
+  assert.equal((await lzRows('lz-r1')).length, 1, '押し直しで行が増えた');
+  await rejectsWith(regLz('lz-r1', 'jan', { requestId: rid }), 409, 'request_id_reused');
+  await rejectsWith(regLz('lz-r1', undefined, { requestId: rid }), 409, 'request_id_reused');
+  await regLz('lz-r2', 'auto');
+  assert.deepEqual((await lzRows('lz-r2')).map((x) => x.rule), ['auto'], '既定の自動も 1 行 (決め方なし と分ける)');
+  await regLz('lz-r3', undefined);
+  assert.deepEqual(await lzRows('lz-r3'), [], '送らない古い画面で行を書いた');
+  const base = R.parseRegisterRequest({ actor: 'a@b.c', requestId: uuid(), kind: 'single', code: 'x1', values: withReq('single', single()), card: {} });
+  assert.equal(base.lzBarcode, null);
+  assert.equal(R.registerPayloadHashOf(base), R.registerPayloadHashOf({ ...base, lzBarcode: undefined }), '送らない要求のハッシュが変わった');
+  assert.notEqual(R.registerPayloadHashOf(base), R.registerPayloadHashOf({ ...base, lzBarcode: 'auto' }));
+  await rejectsWith(regLz('lz-r4', 'none'), 400, 'invalid_input');
+  assert.equal((await one("select count(*)::int as n from core.skus where code = 'lz-r4'")).n, 0);
+  assert.throws(() => R.parseRegisterRequest({ actor: 'a@b.c', requestId: uuid(), kind: 'set', code: 'lz-set-x', logizardBarcode: 'auto',
+    values: withReq('set', { name: 'セット', standard_price: '1000', components: [{ code: 's002', qty: 1 }] }), card: {} }), (e) => e.status === 400 && e.extra.field === 'logizard_barcode');
+  // 巻き戻る (commit の直前に落ちる) = 決め方の行も残らない
+  await rejectsWith(regLz('lz-r5', 'lz_assign', { beforeCommit: async () => { throw new W.MasterWriteError(409, 'boom', 'わざと'); } }), 409, 'boom');
+  assert.equal((await one("select count(*)::int as n from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = 'lz-r5'")).n, 0);
+  assert.equal((await one("select count(*)::int as n from core.skus where code = 'lz-r5'")).n, 0);
+});
+
 await ta('[R6] セット: 構成は構成の依頼 (元の構成なし・core.sku_components は書かない)・税率 / 取扱 / 原価は構成品から・状態 draft・知らせ', async () => {
   const r = await reg('set', 'new-set-1', { name: '新しいセット', standard_price: '3,600', shipping_code: 'S02', components: [{ code: 's002', qty: 1 }, { code: 'S001', qty: 2 }] },
     { reference_urls: ['https://ref.example/set'] });
