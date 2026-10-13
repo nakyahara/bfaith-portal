@@ -40,7 +40,8 @@ import { computeShortageRisk, shortageSettings, validateShortageSetting, shortag
 import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 import { startFbaAutoRefresh, nextBusinessDay9Jst } from './scheduler.js';
 import { masterLegacyGate, legacyRecheck } from '../../lib/master-legacy-gate.mjs';
-import { orderOutboxStatus } from '../../lib/order-settings-outbox.mjs';
+import { orderOutboxStatus, readOrderSettingsPendingFor } from '../../lib/order-settings-outbox.mjs';
+import { withCompanyDb } from '../../lib/product-hub-outbox.mjs';
 import {
   writeOrderSettings, clearProductLinks, writeGroup, deleteGroup, OrderSettingsError, ATTR_FIELDS, hasLinkage, orderLotSource,
 } from './order-settings.js';
@@ -607,16 +608,22 @@ router.get('/api/overview', (req, res) => {
  * 🆕 0075 (AI_reference CompanyDB構想/21 C1・lib/order-settings-outbox.mjs): 新商品の登録で入れた発注の設定が、まだこのアプリに届いていない商品。
  *   Company DB の知らせ (ops.order_settings_outbox) を読む (読むついでに届け直す = 60 秒に 1 回まで・Render の中だけ)。3 秒で諦める (画面は止めない)。
  *   決定 2 = b (中原さん 10/13): すすめる発注数は止めない (今のこのアプリの設定で出す)。印 (「発注の設定がまだ届いていない」) を出すだけ
+ *   印は画面に出ている商品のコードで Company DB に照らす (届いていない知らせが何件あっても欠けない・Codex #1703 R1 L2)。
  *   戻り値 { ok, open, overdue, keys: Set<商品コードの照合キー> }。読めない = { ok: false, keys: 空 }
  */
-async function orderSettingsPending() {
+async function orderSettingsPending(codes = []) {
   const none = { ok: false, open: 0, overdue: 0, keys: new Set() };
+  const timeout = (ms) => new Promise((r) => setTimeout(() => r(null), ms).unref());
   try {
-    const st = await Promise.race([orderOutboxStatus({ limit: 500 }), new Promise((r) => setTimeout(() => r(null), 3000).unref())]);
+    const st = await Promise.race([orderOutboxStatus({ limit: 1 }), timeout(3000)]);
     if (!st || !st.ok || !st.ready) return none;
-    return { ok: true, open: st.open || 0, overdue: st.overdue || 0, keys: new Set((st.items || []).map((i) => normProductCode(i.code))) };
+    const k = await Promise.race([withCompanyDb((db) => readOrderSettingsPendingFor(db, codes), { applicationName: 'po-settings-marks', statementTimeout: '5s' }), timeout(3000)]);
+    if (!k || !k.ok || !k.value) return none;
+    return { ok: true, open: st.open || 0, overdue: st.overdue || 0, keys: new Set([...k.value].map((c) => normProductCode(c))) };
   } catch (e) { console.error(`[purchase-orders] 発注の設定の届け待ちを読めない: ${e && e.message}`); return none; }
 }
+/** 仕入先の画面に出る商品のコード (要発注・追加候補・掘り起こし・下書きのリスト外) */
+const workspaceCodes = (data) => (data ? [data.targets, data.candidates, data.horikoshi, data.draftExtras].flatMap((l) => (l || []).map((p) => p.code)) : []);
 /** 行に印を付ける (届いていない商品 = poPending) */
 function markOrderSettingsPending(data, pend) {
   if (!data) return data;
@@ -640,7 +647,7 @@ router.get('/api/supplier/:code', async (req, res) => {
     const code = normSupplierCode(req.params.code);
     const data = supplierWorkspaceData(code);
     if (!data) return res.status(404).json({ ok: false, error: '仕入先が見つかりません' });
-    res.json({ ok: true, ...markOrderSettingsPending(data, await orderSettingsPending()) });
+    res.json({ ok: true, ...markOrderSettingsPending(data, await orderSettingsPending(workspaceCodes(data))) });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -4182,7 +4189,7 @@ router.get('/supplier/:code', async (req, res) => {
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
   if (!data) return res.status(404).send('仕入先が見つかりません: ' + he(req.params.code));
   // 🆕 0075: 発注の設定がまだ届いていない新商品に印 (すすめる数は止めない = 決定 2 = b)
-  markOrderSettingsPending(data, await orderSettingsPending());
+  markOrderSettingsPending(data, await orderSettingsPending(workspaceCodes(data)));
 
   const body = `
     <div class="toolbar">

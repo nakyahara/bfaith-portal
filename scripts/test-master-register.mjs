@@ -1775,8 +1775,10 @@ await ta('[PO2] 登録: ① Company DB → ② 発注アプリ (発注ロット�
   const again2 = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
   assert.deepEqual([again2.status, again2.j.replayed, again2.j.order_settings.ok, again2.j.order_settings.replayed, attrsOf('po-web-1').order_lot], [200, true, true, true, 13]);
   // 🆕 0075: 同じ request_id で違う発注の設定 = 登録ごと 409 (要求のハッシュに発注の設定が入る)・何も変えない
+  // 🆕 0075 (Codex #1703 R1 M2): 同じ request_id で違う発注の設定 = 登録は前の答え・発注の設定は変えない (知らせの中身と照らす = mismatch)
   const diff = await call('POST', '/apps/master-edit/api/new', { body: { ...body, order_settings: { ...body.order_settings, order_lot: '48' } }, session: 'po-editor' });
-  assert.deepEqual([diff.status, diff.j.reason, attrsOf('po-web-1').order_lot], [409, 'request_id_reused', 13]);
+  assert.deepEqual([diff.status, diff.j.replayed, diff.j.order_settings.ok, diff.j.order_settings.reason, diff.j.order_settings.status, attrsOf('po-web-1').order_lot],
+    [200, true, false, 'request_id_reused', 'mismatch', 13], diff.text);
   POS.writeOrderSettings({ code: 'po-web-1', patch: { order_lot: 12 }, seen: { updated_at: attrsOf('po-web-1').updated_at }, actor: 'other@test', via: 'po-admin' });
   // 新しい発注条件グループ = 代表の仕入先 (0001 → 発注アプリの 1) に作る・すぐ選んだことになる
   const nb = orderBody('po-web-2', { order_lot: '6', new_condition: { condition_id: 'amc-case', display_name: 'AMC ケース 2 以上', condition_type: '数量', unit: 'ケース', condition_value: '2' } });
@@ -1955,17 +1957,31 @@ await ta('[PO6] 🆕 0075 届け待ち: 上の帯の件数 (発注アプリの�
   }
 });
 
+let lastPo7Rid = null; let po7b = null;
 await ta('[PO7] 🆕 0075 の前の DB (知らせの関数が無い) = 今までどおり ② をすぐ書く (知らせは積まない・要求のハッシュも前と同じ)', async () => {
   await pg.query('alter function ops.enqueue_order_settings(uuid, text, jsonb) rename to enqueue_order_settings_hidden');
   try {
     const body = orderBody('po-web-7', { order_lot: '9' });
+    lastPo7Rid = body.request_id;
     const r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
     assert.equal(r.status, 200, r.text);
     assert.deepEqual([r.j.order_settings.ok, r.j.order_settings.status, attrsOf('po-web-7').order_lot], [true, undefined, 9]);
     assert.equal(await poOutboxOf('po-web-7'), undefined, '0075 の前に知らせを積んだ');
+    // Codex #1703 R1 M2: 0075 の前に ② が失敗した登録 (旧の道)
+    MR.__setOrderWriter(() => { throw new Error('SQLite に書けない'); });
+    po7b = orderBody('po-web-7b', { order_lot: '11' });
+    try { assert.equal((await call('POST', '/apps/master-edit/api/new', { body: po7b, session: 'po-editor' })).j.order_settings.ok, false); }
+    finally { MR.__setOrderWriter(null); }
   } finally {
     await pg.query('alter function ops.enqueue_order_settings_hidden(uuid, text, jsonb) rename to enqueue_order_settings');
   }
+  // 0075 の後に同じ要求を押し直す = 同じハッシュ (409 にしない)・知らせの無い前の登録 = 今までの ② で書く
+  const again = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-7', { order_lot: '9' }, { request_id: lastPo7Rid }), session: 'po-editor' });
+  assert.deepEqual([again.status, again.j.replayed, again.j.order_settings.ok, attrsOf('po-web-7').order_lot], [200, true, true, 9], again.text);
+  assert.equal(attrsOf('po-web-7b'), null);
+  const again7b = await call('POST', '/apps/master-edit/api/new', { body: po7b, session: 'po-editor' });
+  assert.deepEqual([again7b.status, again7b.j.replayed, again7b.j.order_settings.ok, attrsOf('po-web-7b').order_lot], [200, true, true, 11], again7b.text);
+  assert.equal(await poOutboxOf('po-web-7b'), undefined);
 });
 
 await ta('[PO8] 🆕 0075 Render の外 (miniPC) = 登録の直後に届けない (知らせは pending で残る・Render が届ける)', async () => {

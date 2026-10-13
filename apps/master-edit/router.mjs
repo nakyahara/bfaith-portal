@@ -110,7 +110,7 @@ import { sessionHasApp } from '../../lib/app-access.js';
 import { writeOrderSettings, writeRegistrationOrderSettings, registrationOrderDone, OrderSettingsError } from '../purchase-orders/order-settings.js';
 import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf } from './order-settings.mjs';
 import { orderOutboxReady, runOrderSettingsOutbox, readOrderSettingsForRegistration, deliveryInputOf, orderDeliveryEnabled, orderOutboxStatus, readOrderSettingsOutbox,
-  dismissOrderSettingsEvent, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS } from '../../lib/order-settings-outbox.mjs';
+  dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS } from '../../lib/order-settings-outbox.mjs';
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
@@ -270,6 +270,23 @@ async function deliverRegistrationOrders(db, regId) {
   catch (e) { console.error(`[master-edit] 発注の設定の知らせを読めない (${regId}): ${e && e.message}`); return null; }
 }
 const ORDER_PENDING_WORDS = '発注の設定はまだ発注アプリに届いていません (知らせは Company DB に残っています)。自動でもう一度届けます (画面を開いたとき・毎晩)';
+const ORDER_MISMATCH_WORDS = '同じ登録の番号 (request_id) で、前と違う発注の設定が来ました。前の発注の設定のままです (変えていません)。商品の画面の「発注の設定」で確かめてください';
+/**
+ * 🆕 0075: 登録 (押し直しも) の後の発注の設定 (Codex #1703 R1 M2 = 発注の設定は登録の要求のハッシュの外 = 0075 の前後で同じ要求が冪等)。
+ *   押し直し (replayed): その登録の知らせがある = 中身の hash を今の発注の設定と照らす (違う = mismatch・何も変えない) → 同じなら届け直す /
+ *                        知らせが無い = 0075 の前 (か知らせを使えなかった時) の登録 = legacy (今までの ② をすぐ書く・部品が request_id で 1 回だけ)
+ *   新しい登録 = 届ける。戻り値 { mode: 'events', evs } | { mode: 'mismatch', codes } | { mode: 'legacy' }
+ */
+async function ordersAfterRegistration(db, regId, replayed, base) {
+  if (replayed) {
+    let cur = null;
+    try { cur = await readOrderSettingsForRegistration(db, regId); } catch (e) { console.error(`[master-edit] 発注の設定の知らせを読めない (${regId}): ${e && e.message}`); }
+    if (cur && cur.length === 0) return { mode: 'legacy' };
+    const bad = (cur || []).filter((e) => orderPayloadHash(orderPayloadOf(e.code, base)) !== e.payload_hash);
+    if (bad.length) return { mode: 'mismatch', codes: bad.map((e) => e.code) };
+  }
+  return { mode: 'events', evs: await deliverRegistrationOrders(db, regId) };
+}
 /** 🆕 0075: 知らせ 1 つ → 応答の order_settings (単品) */
 function orderEventView(ev, replayed) {
   if (!ev) return { ok: false, status: null, reason: 'no_event', pending: false, error: '発注の設定の知らせが見つかりません。商品の画面の「発注の設定」で確かめてください' };
@@ -750,10 +767,12 @@ router.post('/api/new/variation', (req, res) => {
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
-    const evs = orderInput && outbox ? await deliverRegistrationOrders(db, regId) : null;
-    if (evs && evs.length) orderResult = orderEventsView(evs, r.children);
-    else if (orderInput && outbox) orderResult = orderEventsView([], r.children);
-    // 0075 の前の DB (知らせが無い) = ② 発注アプリに子ごとに書く (① が通った後だけ・子の request_id ごとに 1 回 = 押し直しでも同じ)。失敗しても登録は成功のまま
+    const after = orderInput && outbox ? await ordersAfterRegistration(db, regId, !!r.replayed, orderBase) : { mode: 'legacy' };
+    if (after.mode === 'mismatch') orderResult = { ok: false, reason: 'request_id_reused', written: 0, pending: 0, failed: (r.children || []).map((k) => ({ code: k.code, status: 'mismatch', error: ORDER_MISMATCH_WORDS })) };
+    else if (after.mode === 'events' && after.evs && after.evs.length) orderResult = orderEventsView(after.evs, r.children);
+    else if (after.mode === 'events') orderResult = orderEventsView([], r.children);
+    // 0075 の前の DB・知らせを使えない (権限の流し直しの前)・知らせの無い前の登録の押し直し = ② 発注アプリに子ごとに書く
+    //   (① が通った後だけ・子の request_id ごとに 1 回 = 押し直しでも同じ)。失敗しても登録は成功のまま
     else if (orderInput) {
       const failed = [];
       let ok = 0;
@@ -863,11 +882,12 @@ router.post('/api/new', (req, res) => {
       order: outbox ? orderBase : null,
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox });
     let orderResult = null;
-    const evs = orderInput && outbox ? await deliverRegistrationOrders(db, String(b.request_id).trim().toLowerCase()) : null;
-    if (evs && evs.length) orderResult = orderEventView(evs[0], r.replayed);
-    else if (orderInput && outbox) orderResult = orderEventView({ status: 'pending', last_error: null }, false);
-    // 0075 の前の DB (知らせが無い) = ② 発注アプリに書く (① が通った後だけ = 登録の誤りはここに来ない)。同じ request_id のやり直し (replayed) でももう一度 (同じ値の上書き = 何度でも同じ)。
-    //   失敗しても登録は成功のまま。画面は「商品の画面で入れてください」
+    const after = orderInput && outbox ? await ordersAfterRegistration(db, String(b.request_id).trim().toLowerCase(), !!r.replayed, orderBase) : { mode: 'legacy' };
+    if (after.mode === 'mismatch') orderResult = { ok: false, status: 'mismatch', reason: 'request_id_reused', pending: false, error: ORDER_MISMATCH_WORDS };
+    else if (after.mode === 'events' && after.evs && after.evs.length) orderResult = orderEventView(after.evs[0], r.replayed);
+    else if (after.mode === 'events') orderResult = orderEventView({ status: 'pending', last_error: null }, false);
+    // 0075 の前の DB・知らせを使えない (権限の流し直しの前)・知らせの無い前の登録の押し直し = ② 発注アプリに書く (① が通った後だけ = 登録の誤りはここに来ない)。
+    //   同じ request_id のやり直し (replayed) でももう一度 (部品が request_id で 1 回だけ)。失敗しても登録は成功のまま。画面は「商品の画面で入れてください」
     else if (orderInput) {
       try {
         const w = orderWriter({ ...orderInput, code: r.code || b.code });

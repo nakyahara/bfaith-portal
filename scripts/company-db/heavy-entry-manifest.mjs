@@ -73,7 +73,7 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   { sig: 'ops.cutover_ts_between(text, timestamp with time zone, timestamp with time zone)', cls: 'light', public: true, reason: '文字の時刻の判定 (表を読まない)' },
   { sig: 'ops.claim_card_events(text, text, uuid, bigint, integer, integer, integer)', cls: 'light', public: false, reason: 'カードの出来事を件数の上限つきで借りる (SECURITY DEFINER・PUBLIC なし)' },
   { sig: 'ops.claim_outbox_events(text, text, text, uuid, bigint, integer, integer, integer)', cls: 'light', public: false, since: '0066', reason: '名前空間つきの知らせを件数の上限つきで借りる (0066・SECURITY DEFINER・PUBLIC なし)' },
-  { sig: 'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer)', cls: 'light', public: false, since: '0075', reason: '発注の設定の知らせを件数の上限 (200) つきで借りる (0075・SECURITY DEFINER・PUBLIC なし・master_edit と持ち主 = 夜間ロードの後ろの段)。知らせの表は新商品の数 (少数)・開いている知らせの部分 index' },
+  { sig: 'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer, uuid[])', cls: 'light', public: false, since: '0075', reason: '発注の設定の知らせを件数の上限 (200) つきで借りる (0075・SECURITY DEFINER・PUBLIC なし・master_edit と持ち主 = 夜間ロードの後ろの段)。知らせの表は新商品の数 (少数)・開いている知らせの部分 index' },
 ]);
 
 export const MANIFEST_CLASSES = Object.freeze(['revoke', 'guard_later', 'light']);

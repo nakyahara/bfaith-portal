@@ -227,7 +227,7 @@ export const AMAZON_LISTING_EDIT_FUNCTIONS = Object.freeze(['ops.set_amazon_sku_
  */
 export const ORDER_OUTBOX_SELECT = Object.freeze(['ops.order_settings_outbox', 'ops.v_order_settings_outbox_open']);
 export const ORDER_OUTBOX_EDIT_FUNCTIONS = Object.freeze(['ops.enqueue_order_settings(uuid, text, jsonb)',
-  'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer)', 'ops.finish_order_settings_event(uuid, text, text, jsonb, text)',
+  'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer, uuid[])', 'ops.finish_order_settings_event(uuid, text, text, jsonb, text)',
   'ops.dismiss_order_settings_event(uuid, text, text)']);
 export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()']);
 

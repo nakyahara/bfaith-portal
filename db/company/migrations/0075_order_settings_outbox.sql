@@ -187,9 +187,12 @@ end $$;
 revoke all on function ops.enqueue_order_settings(uuid, text, jsonb) from public;
 
 -- 3. 届ける知らせを借りる。p_mode = auto (まだ・失敗で回数の上限の前) / sweep (まだ・失敗 = 回数を問わない = 夜間ロードの後ろの段) / manual (人の「もう一度」= 衝突も)。
---    登録の ID・知らせの ID で絞れる。借りた行を返す (試した回数を 1 増やす)。登録の状態 (やめた = cancelled なら届け手が書かずに閉じる) も返す
+--    登録の ID・知らせの ID で絞れる。借りた行を返す (試した回数を 1 増やす)。登録の状態 (やめた = cancelled なら届け手が書かずに閉じる) も返す。
+--    p_exclude = この回にもう借りた知らせ (夜間の段が何周しても同じ失敗の行に塞がれない・Codex #1703 R1 M1)。
+--    順 = まだ (pending) が先 → 試した回数の少ない順 → 古い順 (いつも失敗する古い行が新しい知らせの前を塞がない)
 create function ops.claim_order_settings_events(p_owner text, p_mode text, p_registration_request_id uuid default null, p_event_id uuid default null,
-                                                p_limit integer default 20, p_lease_seconds integer default 120, p_max_auto integer default 5)
+                                                p_limit integer default 20, p_lease_seconds integer default 120, p_max_auto integer default 5,
+                                                p_exclude uuid[] default null)
   returns table (event_id uuid, sku_id bigint, code text, registration_kind text, registration_request_id uuid, delivery_request_id uuid, schema_version text,
                  payload jsonb, payload_hash text, created_by text, attempts integer, status text, reg_state text)
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
@@ -205,7 +208,8 @@ begin
        and (o.leased_until is null or o.leased_until < pg_catalog.now())
        and (p_registration_request_id is null or o.registration_request_id = p_registration_request_id)
        and (p_event_id is null or o.event_id = p_event_id)
-     order by o.created_at, o.event_id limit greatest(1, least(200, coalesce(p_limit, 20))) for update skip locked),
+       and (p_exclude is null or not (o.event_id = any (p_exclude)))
+     order by (o.status <> 'pending'), o.attempts, o.created_at, o.event_id limit greatest(1, least(200, coalesce(p_limit, 20))) for update skip locked),
   u as (
     update ops.order_settings_outbox o set lease_owner = p_owner,
            leased_until = pg_catalog.now() + pg_catalog.make_interval(secs => greatest(10, least(3600, coalesce(p_lease_seconds, 120)))),
@@ -218,7 +222,7 @@ begin
     from u left join ops.master_registrations r on r.sku_id = u.sku_id
    order by u.created_at, u.event_id;
 end $$;
-revoke all on function ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer) from public;
+revoke all on function ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer, uuid[]) from public;
 
 -- 4. 借りた知らせの結果を書く (借りた人だけ・閉じた知らせは変えない)。p_status = done / failed / conflict。書けたら true (借りが切れてほかが取った = false)
 create function ops.finish_order_settings_event(p_event_id uuid, p_owner text, p_status text, p_result jsonb, p_error text) returns boolean
