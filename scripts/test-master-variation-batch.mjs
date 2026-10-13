@@ -182,25 +182,35 @@ await ta('[R1] 同じ request_id = 前の答え (replayed・何も足さない)�
   assert.deepEqual(await counts(), before);
 });
 
-await ta('[R-LZ] 🆕 0078 ロジザードに送るバーコードの決め方: 全部の子に同じ決め方を 1 行ずつ (同じ取引・via register)・送らない = 行なし・違う決め方の押し直し = 409・答えは子ごと (子の JAN)', async () => {
-  const LB = await import('../lib/logizard-barcode.mjs');
+await ta('[R-LZ] 🆕 0080 子ごとのロジザードのバーコード: 値 (FNSKU / JAN) か空欄を子ごとに 1 行 (同じ取引・via register)・送らない子 = 行なし・違う値の押し直し = 409・同じ値の子 2 つ = 400・ほかの商品の値 = 409 で全部戻る', async () => {
   const rid = uuid();
-  const input = { ...hakamaInput('Lzb1'), requestId: rid, logizardBarcode: 'jan' };
+  const base = hakamaInput('Lzb1');
+  const kids = base.children.map((k, i) => ({ ...k, lz_barcode: i === 0 ? { kind: 'value', value: 'x00lzv0001' } : i === 1 ? { kind: 'value', value: jan13('458099900001') } : { kind: 'lz_assign' } }));
+  const input = { ...base, children: kids, requestId: rid };
   const a = await reg(input);
-  const rows = await q(`select s.code, r.rule, r.via from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id
+  const rows = await q(`select s.code, r.rule, r.value, r.via from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id
      join core.products p on p.product_id = s.product_id where p.parent_product_id = $1 order by s.code`, [a.group_product_id]);
   assert.equal(rows.length, a.children.length);
-  assert.ok(rows.every((x) => x.rule === 'jan' && x.via === 'register'), JSON.stringify(rows.slice(0, 2)));
+  const by = Object.fromEntries(rows.map((x) => [x.code, [x.rule, x.value, x.via]]));
+  assert.deepEqual(by[kids[0].code], ['fnsku', 'X00LZV0001', 'register']);
+  assert.deepEqual(by[kids[1].code], ['jan', jan13('458099900001'), 'register']);
+  assert.deepEqual(by[kids[2].code], ['lz_assign', null, 'register']);
   assert.equal((await reg(input)).replayed, true);
-  await rejects(reg({ ...input, logizardBarcode: 'auto' }), 409, 'request_id_reused');
-  await rejects(reg({ ...input, logizardBarcode: undefined }), 409, 'request_id_reused');
-  // 子の JAN が無い = 決め方 jan は「待つ」(子ごとに決まる)
-  const m = await asEditor(() => LB.readLogizardBarcodes(db, a.children.map((k) => k.sku_id)));
-  assert.ok([...m.values()].every((x) => x.rule === 'jan' && x.pick.state === 'waiting'));
+  await rejects(reg({ ...input, children: kids.map((k, i) => (i === 2 ? { ...k, lz_barcode: { kind: 'value', value: 'X00LZV0002' } } : k)) }), 409, 'request_id_reused');
+  await rejects(reg({ ...input, children: kids.map(({ lz_barcode, ...k }) => k) }), 409, 'request_id_reused');
+  // 送らない (lib) = 行なし
   const b = await reg({ ...hakamaInput('Lzb2') });
   assert.equal((await one(`select count(*)::int as n from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id
      join core.products p on p.product_id = s.product_id where p.parent_product_id = $1`, [b.group_product_id])).n, 0, '送らないまとまりに行を書いた');
-  await rejects(reg({ ...hakamaInput('Lzb3'), logizardBarcode: 'none' }), 400, 'invalid_input');
+  // 同じ値の子 2 つ = 400・形 = 400
+  const b3 = hakamaInput('Lzb3');
+  await rejects(reg({ ...b3, children: b3.children.map((k, i) => (i < 2 ? { ...k, lz_barcode: { kind: 'value', value: 'X00LZV0009' } } : k)) }), 400, 'lzbc_dup');
+  await rejects(reg({ ...b3, children: b3.children.map((k, i) => (i === 0 ? { ...k, lz_barcode: { kind: 'value', value: '4580123450010' } } : k)) }), 400, 'lzbc_shape');
+  // ほかの商品 (Lzb1 の子) と同じ値 = 409 lzbc_taken・まとまりも子も残らない
+  const before = await counts();
+  const e = await rejects(reg({ ...b3, children: b3.children.map((k, i) => (i === 3 ? { ...k, lz_barcode: { kind: 'value', value: 'X00LZV0001' } } : k)) }), 409, 'lzbc_taken');
+  assert.equal(e.extra.code, b3.children[3].code, '断った子のコード');
+  assert.deepEqual(await counts(), before);
 });
 
 await ta('[R2] 0069 (#1679 Codex R1 Medium 1): 同じ request_id で名前・売価・原価・JAN・カードの欄・理由だけを変えた押し直し = 409 request_id_reused (前の答えにしない・何も書かない)・要求の全部のハッシュを同じ取引で残す', async () => {

@@ -72,6 +72,33 @@
     if (/^set-/i.test(s)) return 'set- で始まるコードは使えません';
     return '';
   }
+  /**
+   * 🆕 0080: ロジザードのバーコードの欄 → 送る形 (body) か 形の一言 (problem)。サーバーの lib/logizard-barcode.mjs lzValueShape と同じ決まり
+   *   FNSKU = X00 + 英数字 7 字 (大文字にそろえる)・JAN = 8 / 13 けた + チェック数字・「空欄」の印 = { kind: 'lz_assign' }
+   */
+  function lzbc() {
+    var inEl = $('#f-lzbc-in'), bl = $('#f-lzbc-blank');
+    if (!inEl) return { body: null, problem: '' };
+    if (bl && bl.checked) return { body: { kind: 'lz_assign' }, problem: '' };
+    var v = String(inEl.value || '').normalize('NFKC').trim().toUpperCase();
+    if (!v) return { body: null, problem: '' };
+    if (/^X00[0-9A-Z]{7}$/.test(v)) return { body: { kind: 'value', value: v }, kind: 'fnsku' };
+    if (/^\d+$/.test(v)) {
+      if (v.length !== 8 && v.length !== 13) return { body: null, problem: 'JAN は 8 けたか 13 けた (いま ' + v.length + ' けた)' };
+      var d = v.split('').map(Number), ck = d.pop(), sum = 0;
+      for (var i = d.length - 1, w = 3; i >= 0; i--, w = w === 3 ? 1 : 3) sum += d[i] * w;
+      return (10 - (sum % 10)) % 10 === ck ? { body: { kind: 'value', value: v }, kind: 'jan' } : { body: null, problem: 'JAN の最後の数字 (チェック数字) が合いません' };
+    }
+    return { body: null, problem: /^X0/.test(v) ? 'FNSKU は X00 + 英数字 7 字の 10 文字' : 'FNSKU (X00…) か JAN (数字) を入れてください' };
+  }
+  /** 形の一言を出す。typed = 値を打った (「空欄」の印を外す = 両方は持たない) */
+  function lzbcShow(typed) {
+    var inEl = $('#f-lzbc-in'), bl = $('#f-lzbc-blank'), m = $('#f-lzbc-msg');
+    if (!inEl) return;
+    if (typed && bl && bl.checked && inEl.value.trim()) bl.checked = false;
+    var r = lzbc();
+    if (m) m.textContent = bl && bl.checked ? 'ロジザードが番号を付けます' : r.kind === 'fnsku' ? 'FNSKU の形' : r.kind === 'jan' ? 'JAN の形 (チェック数字 OK)' : r.problem || '';
+  }
   function segVal(id) { var s = document.getElementById(id); return s ? s.getAttribute('data-value') || '' : ''; }
   function cardOn() { return segVal('card-create') !== '0'; }
   function priceOk(id) { var v = half(val(id)).replace(/,/g, ''); return /^\d+$/.test(v) && Number(v) >= 1; }
@@ -99,6 +126,8 @@
     if (!isSet) list.push({ id: 'sales_class', sec: 'sec-tax', t: '売上分類', ok: !!segVal('f-sales_class'), focus: '#f-sales_class button', level: 1 });
     list.push({ id: 'reorder_months', sec: 'sec-ship', t: '推奨保有月数 (0〜60)', ok: monthsOk(), focus: '#f-reorder_months', level: 1 });
     if (!isSet) list.push({ id: 'expiry_managed', sec: 'sec-ship', t: 'ロジザードの有効期限の管理', ok: !!segVal('f-expiry'), focus: '#f-expiry button', level: 1 });
+    // 🆕 0080: ロジザードのバーコード = 値か「空欄」のどちらかが要る (欄がある = 0080 がある DB だけ)
+    if (!isSet && $('#f-lzbc-in')) list.push({ id: 'logizard_barcode', sec: 'sec-ship', t: 'ロジザードのバーコード (値か「空欄」)', ok: !!lzbc().body, focus: '#f-lzbc-in', level: 1 });
     // 🆕 2026-10-13: 必須でない項目 = 値か「入力なし」。ok = どちらか / none = 入力なし (印「なし」)。原価は 1 円以上の形も見る (0 = 値でない)
     var N = ME.none;
     var opt = function (key, sec, t, focus, level, okValue) {
@@ -194,7 +223,9 @@
   }
   ME.dirty = function () { return { n: lastState.n, items: lastState.items, impacts: lastState.impacts }; };
   ME.recount = function () { update(); };   // 発注の設定の部品 (後から読む) が読み終わったとき
-  scope.addEventListener('input', function (e) { if (e.target.id === 'code') codeLater(); update(); });
+  scope.addEventListener('input', function (e) { if (e.target.id === 'code') codeLater(); if (e.target.id === 'f-lzbc-in') lzbcShow(true); update(); });
+  var lzBlankEl = $('#f-lzbc-blank');
+  if (lzBlankEl) lzBlankEl.addEventListener('change', function () { if (lzBlankEl.checked) $('#f-lzbc-in').value = ''; lzbcShow(false); });
   scope.addEventListener('change', update);
 
   /* ---------- ① ② ③ を押すと その欄へ ---------- */
@@ -502,8 +533,8 @@
     // 発注の設定 (発注アプリ・単品だけ・public/me-order.js)。何も入れていない = 送らない (発注アプリに何も書かない)
     var po = !isSet && ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
-    // 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコードの決め方 (単品だけ・欄が無い = 0078 の前 = 自動)
-    if (!isSet) out.logizard_barcode = segVal('f-lzbc') || 'auto';
+    // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコード (単品だけ・欄が無い = 0080 の前 = 送らない)
+    if (!isSet && $('#f-lzbc-in')) out.logizard_barcode = lzbc().body;
     return out;
   }
 
@@ -513,7 +544,7 @@
    * サーバーの誤りの項目 → 直す欄 (1 つの行に欄が 2 つある Yahoo! など。#1628 Codex R5 L1)。
    * ここに無い項目は data-row の行の最初の欄
    */
-  var FIELD_INPUT = { 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path', reason: '#reason' };
+  var FIELD_INPUT = { logizard_barcode: '#f-lzbc-in', 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path', reason: '#reason' };
   function showError(j, status) {
     var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
     if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) h += '<ul>' + j.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>';
@@ -559,6 +590,8 @@
           saved = true; lockAfterSave(); update();
           msg('登録しました (下書き)。' + code + ' の画面を開いています…', 'ok');
           var warns = (x.j.warnings || []).slice();
+          // 🆕 #1719 R2 High: ロジザードの写しと照らせていない値 = 手順の一文 (GAS の H 列に入れる前にロジザードの商品マスタで確かめる)。商品の画面にも同じ印が出る
+          if (x.j.lz_unchecked) warns.push('ロジザードのバーコード: ' + (x.j.lz_unchecked.note || 'ロジザードの写しと照らせていません (' + x.j.lz_unchecked.words + ')'));
           if (x.j.card && x.j.card.status !== 'done') warns.push('product-hub の出品カード: ' + (x.j.card_label || x.j.card.status) + ' (商品の画面の「カードをもう一度作る」か、product-hub のボードを開くと作り直します)');
           // 登録は成功・発注アプリへの書き込み (②) だけまだ = 🆕 0075: 知らせは Company DB に残る (自動でもう一度届ける) / 要確認 = 商品の画面で確かめる。
           //   0075 の前の DB = 商品の画面の「発注の設定」で入れ直す (知らせが無い)

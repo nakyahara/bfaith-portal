@@ -133,6 +133,9 @@ async function fillCommon(p, { price = '12800', cost = '5200', tax = '0.1', sale
  */
 const noneRest = (p) => p.evaluate(() => {
   let n = 0;
+  // 🆕 0080: ロジザードのバーコードの無い子 = 「空欄で送る」(入力なしと同じ形の印)
+  const lz = document.getElementById('lz-blank-rest');
+  if (lz && !lz.checked && !lz.closest('[hidden]')) lz.click();
   for (const id of ['po-cond-mode', 'po-mat-mode']) {
     const sg = document.getElementById(id);
     if (sg && !sg.getAttribute('data-value')) { sg.querySelector('button[data-v="none"]').click(); n++; }
@@ -424,6 +427,46 @@ await ta('[⑦] 誤り: 「-」の付け忘れ = 誤り + 「- を付ける」(�
   await p.waitForSelector('#g-picked .picked .pc:text-is("blanket-fl")');
 });
 
+await ta('[⑦b] 子のロジザードの値 = ほかの子の JAN (#1719 Codex R6): 前の子の値 = 後の子の JAN / 後の子の値 = 前の子の JAN の両方の向きで打ったその場で印・確かめに子の値を送る (lz_children)・DB の確かめの lz_kid_clash も出す', async (p) => {
+  const sent = [];
+  p.on('request', (r) => { if (r.url().endsWith('/api/variation/check')) sent.push(JSON.parse(r.postData() || '{}')); });
+  await p.goto(B + '/new?kind=variation');
+  await newGroup(p, { code: 'lz-ord', name: '順番の試し', h: 'カラー', hl: 'ホワイト / -WH\nグレー / -GY\nネイビー / -NV' });
+  await fillCommon(p, { price: '2,980', sales: '3', sup: '0034', months: '2' });
+  const row = (k, f) => `#kids-box .krow[data-key="${k}|"] [data-k="${f}"]`;
+  const JX = jan13('458777700101'), JY = jan13('458777700102');
+  // ① 前の子 (WH) の値 = 後の子 (NV) の JAN
+  await fill(p, row('-nv', 'jan'), JX);
+  await fill(p, row('-wh', 'lzbc'), JX);
+  await settle(p);
+  let i = await info(p);
+  assert.ok(i.issues.some((x) => x === 'lz-ord-WH: ロジザードのバーコードが lz-ord-NV の JAN と同じ'), JSON.stringify(i.issues));
+  assert.equal(i.save, 'disabled');
+  const last = sent[sent.length - 1];
+  assert.deepEqual(last.lz_children.find((k) => k.code === 'lz-ord-WH'), { code: 'lz-ord-WH', jan: '', lz: JX }, JSON.stringify(last));
+  // ② 後の子 (NV) の値 = 前の子 (WH) の JAN (向きを逆に)
+  await fill(p, row('-nv', 'jan'), '');
+  await fill(p, row('-wh', 'lzbc'), '');
+  await fill(p, row('-wh', 'jan'), JY);
+  await fill(p, row('-nv', 'lzbc'), JY);
+  await settle(p);
+  i = await info(p);
+  assert.ok(i.issues.some((x) => x === 'lz-ord-NV: ロジザードのバーコードが lz-ord-WH の JAN と同じ'), JSON.stringify(i.issues));
+  assert.ok(!i.issues.some((x) => /^lz-ord-WH: ロジザードのバーコードが/.test(x)), JSON.stringify(i.issues));
+  // ③ DB の確かめが子の値の重なりを返した (lz_kid_clash) = 画面に出す
+  await fill(p, row('-nv', 'lzbc'), 'X00LZUI001');
+  await p.route('**/api/variation/check', async (route) => {
+    const res = await route.fetch();
+    const j = await res.json();
+    await route.fulfill({ response: res, json: { ...j, lz_kid_clash: { 'lz-ord-GY': 'zz-kid' } } });
+  });
+  await fill(p, row('-gy', 'lzbc'), 'X00LZUI002');
+  await settle(p);
+  i = await info(p);
+  assert.ok(i.issues.some((x) => x === 'lz-ord-GY: ロジザードのバーコードが zz-kid の JAN と同じ (DB の確かめ)'), JSON.stringify(i.issues));
+  assert.ok(!i.issues.some((x) => /^lz-ord-NV: ロジザードのバーコードが/.test(x)), JSON.stringify(i.issues));
+});
+
 await ta('[⑧] 空から: あと N つ・7 の確かめは「まだ入れていない」・保存は押せない / 切替の前 (products.parent が load) = まとまりの札と欄が出ない・単品とセットは今までどおり', async (p) => {
   await p.goto(B + '/new?kind=variation');
   const i0 = await info(p);
@@ -547,10 +590,12 @@ await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発
   await p.waitForSelector('#result .result', { timeout: 60000 });
   assert.match(await p.innerText('#result'), /2 件を下書きにしました/);
   assert.deepEqual(bodies[0].blanks, ['cost', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan']);
-  // 🆕 0078: ロジザードに送るバーコード = 初めから「自動」(入力なしの一覧に入らない)・全部の子に 1 行ずつ
-  assert.equal(bodies[0].logizard_barcode, 'auto');
+  // 🆕 0080: ロジザードのバーコード = 子ごと (JAN のある子 = 初めは JAN・無い子 = 「空欄で送る」の印で空欄)・全部の子に 1 行ずつ
+  const lzOf = Object.fromEntries(bodies[0].children.map((k) => [k.code, k.lz_barcode]));
+  assert.deepEqual(lzOf['nonegrp-BK'], { kind: 'lz_assign' });
+  assert.equal(lzOf['nonegrp-WH'].kind, 'value');
   assert.deepEqual((await q(`select s.code, r.rule from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK') order by s.code`)).map((r) => [r.code, r.rule]),
-    [['nonegrp-BK', 'auto'], ['nonegrp-WH', 'auto']]);
+    [['nonegrp-BK', 'lz_assign'], ['nonegrp-WH', 'jan']]);
   // 子ごとの記録 (#1706 Codex R1 M1): 原価・JAN は その子に無いときだけ (WH = 子だけの原価 700・JAN あり / BK = どちらも無い)
   const reasons = Object.fromEntries((await q(`select s.code, e.reason from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK')`)).map((r) => [r.code, r.reason]));
   assert.deepEqual(reasons, {
