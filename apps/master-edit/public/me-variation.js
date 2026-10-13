@@ -12,6 +12,9 @@
  *   - NE で作った古いまとまり = 最初の 1 回だけ、前からある子の「コードにつける文字」(コードの末尾から仮に入れる) と色の名前 (空 = 人が打つ) を確かめる
  *   - 今あるまとまりに足す = 今ある子の値を写す (どの子から・値が違う項目は人が選ぶ = 自動では選ばない)
  *   - スマホの幅: 手順の帯は「4/7 選択肢 ← 前へ / 次へ →」・キーボードの間は下の帯を小さく・子が 30 件をこえたら「パソコンがおすすめ」
+ *   🆕 2026-10-13 中原さん「全部そろわないと入力できない」: 必須でない項目 (原価・発送方法・入荷日の管理・発注の設定 6 つ・公式ページ URL・Amazon URL・
+ *     JAN の無い子) は「値」か「入力なし」(public/me-none.js)。どちらでもない = 「まだ入れていない」に数える (保存できない)。
+ *     送る本文の blanks = 入力なしにした項目 (サーバー = lib/master-register-blanks.mjs がもう一度確かめて、登録の理由に残す)
  */
 (function () {
   'use strict';
@@ -54,7 +57,13 @@
     if (f === 'months') return v + ' か月';
     return v === '1' ? 'あり' : 'なし';
   };
-  var COMMON0 = { price: '', cost: '', tax: '', sales: '', supplier: '', months: '', expiry: '', inbound: '0', ship: '' };
+  // 🆕 2026-10-13: 入荷日の管理も初めは選ばない形 (なし / あり / 入力なし のどれかを選ぶ)
+  var COMMON0 = { price: '', cost: '', tax: '', sales: '', supplier: '', months: '', expiry: '', inbound: '', ship: '' };
+  /** 「入力なし」にできる項目 (key → [画面の名前, 飛ぶ所, 共通の欄の名前 (今ある子の値が違うときは選ぶまで数えない)]) */
+  var NONE_ITEMS = [['cost', '原価', '#c-cost', 'cost'], ['shipping_code', '発送方法', '#c-ship', 'ship'], ['inbound_date_managed', 'ロジザードの入荷日の管理', '#c-inbound button', 'inbound']];
+  var NONE_CARD = [['card.official_url', '公式ページ URL', '#official-url'], ['card.amazon', 'Amazon URL', '#amazon-url']];
+  var janAll = false;   // 作る子が全部 JAN を持つ (= JAN の「入力なし」は要らない)
+  var costAll = false;  // 作る子が全部 実際の原価 (子だけの原価 か 共通の原価) を持つ
 
   // ---------- 画面の状態 ----------
   var fresh = function () {
@@ -269,6 +278,21 @@
     });
     var live = kids.filter(function (k) { return k.inc; });
     var n = live.length;
+    // 🆕 2026-10-13: 必須でない項目 = 値か「入力なし」。どちらでもない = まだ入れていない (保存できない)
+    janAll = n > 0 && live.every(function (k) { return !!k.jan; });
+    costAll = n > 0 ? live.every(function (k) { var c = k.cv !== null ? k.cv : cc; return c !== null && !Number.isNaN(c); }) : (cc !== null && !Number.isNaN(cc));
+    var noneKeys = [];
+    if (ME.none) {
+      ME.none.refresh();
+      var N = ME.none;
+      var need = function (key, t, go, step) { if (!N.present(key)) return; if (N.on(key) && !N.has(key)) { noneKeys.push(key); return; } if (!N.has(key)) Pi(step, 'miss', t + ' (値か「入力なし」)', go); };
+      NONE_ITEMS.forEach(function (x) { if (!S.conflicts[x[3]] || S.picks[x[3]]) need(x[0], x[1], x[2], 5); });
+      if (ME.orderSettings && ME.orderSettings.items) ME.orderSettings.items().forEach(function (x) { if (x.none) noneKeys.push(x.key); else if (!x.ok) Pi(5, 'miss', '発注の設定: ' + x.t + ' (値か「入力なし」)', x.focus); });
+      NONE_CARD.forEach(function (x) { need(x[0], x[1], x[2], 5); });
+      if (n && !janAll) need('children.jan', 'JAN の無い子 (' + live.filter(function (k) { return !k.jan; }).length + ' 件)', '#row-jan-none', 6);
+      var order = P.blankKeys || [];   // サーバーと同じ並び
+      noneKeys.sort(function (a, b) { return order.indexOf(a) - order.indexOf(b); });
+    }
     if (kids.length && !n) Pi(6, 'miss', '作る子 (1 つ以上)', '#sec-kids');
     // まだ NE 登録の CSV にしていない子 + 今回 が 1 つのファイルの上限を超える = 先に今ある分の CSV を作ってもらう (サーバーも断る)
     if (pk && n && pk.pendingUnfiled + n > pk.maxFileRows) {
@@ -284,7 +308,7 @@
       }
       Pi(6, 'count', '子が ' + n + ' 件。1 回に作れるのは ' + MAX_KIDS + ' 件まで' + (plan ? ' → 「この分け方にする」で ' + plan.cnt + ' 件と残り ' + plan.rest + ' ' + (axes[0].name === 'カラー' ? '色' : 'つ') + 'に分ける' : ''), '#sec-kids');
     }
-    return { add: add, pk: pk, gcode: gcode, baseName: baseName, recorded: recorded, firstTime: firstTime, ac: ac, axes: axes, oldRows: oldRows, kids: kids, live: live, n: n, issues: issues, cp: cp, cc: cc, plan: plan };
+    return { add: add, pk: pk, gcode: gcode, baseName: baseName, recorded: recorded, firstTime: firstTime, ac: ac, axes: axes, oldRows: oldRows, kids: kids, live: live, n: n, issues: issues, cp: cp, cc: cc, plan: plan, noneKeys: noneKeys };
   }
 
   // ---------- 描く ----------
@@ -621,6 +645,7 @@
       ['作らない商品', offs.length ? list(offs.map(function (k) { return '<span class="mono">' + esc(k.code) + '</span> ' + esc(k.h.name + (k.v ? ' × ' + k.v.name : '')) + (k.prev ? ' (前回も作らなかった)' : ''); }), 12) : 'なし'],
       ['共通の欄', '売価 ' + (m.cp ? yen(m.cp) + ' 円' : '—') + (m.cc != null && !Number.isNaN(m.cc) ? ' · 原価 ' + yen(m.cc) + ' 円' : ' · 原価はあとで') + ' · 税 ' + fv('tax', S.common.tax) + ' · 仕入先 ' + esc(fv('supplier', S.common.supplier))],
       ['発注の設定', po ? '発注アプリへ (全部の子に同じ値)' : 'なし (あとで商品の画面で)'],
+      ['入力なし', m.noneKeys.length ? esc(m.noneKeys.map(function (k) { return (P.blankLabels && P.blankLabels[k] ? P.blankLabels[k].label : k); }).join('・')) + ' <span class="hint aux">(わざと空けた = 登録の記録に残ります)</span>' : 'なし (全部の項目に値)'],
       ['出品カード', 'まとまりで 1 枚' + (m.ac === 2 ? ' (2 軸なので出品は止めたまま)' : '')],
     ].concat(S.nextOpts.length ? [['次に足す' + unitOf(m), S.nextOpts.length + ' ' + unitOf(m) + ' (今回は保存しない · 保存の後に続けて足す)']] : []);
   }
@@ -712,6 +737,13 @@
     var cn = '<div class="hint" style="margin-bottom:6px">作る ' + m.n + ' 件を 1 枚のカードにまとめます · NE に入る (翌朝の確かめ) までは出品を止めます (「NE の写し待ち」)' + (m.add && m.pk ? ' · 今あるカードがあれば、そのカードに足して「要確認」を付けます' : '') + '</div>';
     if (m.ac === 2) cn += '<div class="callout warn" style="margin-bottom:8px">' + icon('warn') + '<div class="grow"><div class="t">2 軸 (' + esc(m.axes.map(function (a) { return a.name || '?'; }).join(' × ')) + ') は、カードは作りますが出品は止めたままです</div><div class="hint">product-hub が 2 軸の出品に対応するまで (後の PR) の間だけです。</div></div></div>';
     $('#card-note').innerHTML = cn;
+    // JAN の無い子の「入力なし」(全部の子に JAN = 出さない)
+    var jr = $('#row-jan-none');
+    if (jr) {
+      var noJan = m.live.filter(function (k) { return !k.jan; }).length;
+      jr.hidden = !m.n || janAll;
+      $('#jan-none-n').textContent = noJan ? 'JAN の無い子が ' + noJan + ' 件あります' : '';
+    }
   }
 
   // ---------- DB の確かめ (打った値ごと・少し待ってからまとめて) ----------
@@ -752,6 +784,11 @@
 
   var M = null;
   var busy = false;
+  if (ME.none) ME.none.define('children.jan', { has: function () { return janAll; }, clear: false });
+  // 🆕 #1706 Codex R1 M1: 原価 = 子ごとの実際の原価 (子だけの原価 か 共通の原価)。全部の子にある = 値 (入力なしは外れる)・無い子がある = 入力なしが要る
+  //   (記録は原価の無い子だけ = サーバーが子ごとの理由を作る)。入力なしを押すと共通の原価だけ消す (子だけの原価は残す)
+  if (ME.none) ME.none.define('cost', { has: function () { return costAll; } });
+  ME.recount = function () { if (!S.done) light(); };   // 発注の設定の部品 (後から読む) が読み終わったとき
   function update() { M = model(); renderAnat(M); renderOpts(M); renderCommon(M); renderKids(M); renderChecks(M); renderHud(M); renderMisc(M); scheduleCheck(M); }
   function light() { M = model(); refreshKids(M); renderChecks(M); renderHud(M); renderMisc(M); scheduleCheck(M); }
   function lightOld() { M = model(); renderAnat(M); renderOpts(M); renderKids(M); renderChecks(M); renderHud(M); renderMisc(M); scheduleCheck(M); }
@@ -791,7 +828,6 @@
       if (mp.size === 1) S.common[f] = Array.from(mp.keys())[0];
       else S.conflicts[f] = Array.from(mp).map(function (x) { return { v: x[0], codes: x[1] }; });
     });
-    if (S.common.inbound === '' && !S.conflicts.inbound) S.common.inbound = '0';
     S.copied = rows.length ? { from: rows[0].code, n: rows.length, dropped: dropped } : null;
     if (!pk.axes) initOldKids(pk);
     full();
@@ -830,6 +866,7 @@
   function toast(t) { if (ME.toast) ME.toast(t); }
   function go(sel) {
     var el = $(sel); if (!el) return;
+    var det = el.closest('details'); if (det) det.open = true;
     var tgt = el.closest('.f') || el.closest('.krow') || el.closest('tr') || el.closest('.optcard') || el;
     tgt.scrollIntoView({ behavior: 'smooth', block: 'center' });
     tgt.classList.remove('flash'); void tgt.offsetWidth; tgt.classList.add('flash');
@@ -856,7 +893,7 @@
       var e = S.edits[key] || (S.edits[key] = {});
       if (k === 'name') { e.manual = true; e.name = t.value; } else e[k] = t.value;
       light(); return;
-    } else if (t.closest && t.closest('#sec-order, #sec-card')) { renderHud(M || model()); return; }
+    } else if (t.closest && t.closest('#sec-order, #sec-card')) { light(); return; }
     else return;
     update();
   }
@@ -866,6 +903,9 @@
   document.addEventListener('change', function (e) {
     var t = e.target;
     if (t.tagName === 'SELECT' && form.contains(t) && !t.closest('#sec-order')) onInput(t);
+    if (t.tagName === 'SELECT' && form.contains(t) && t.closest('#sec-order') && !S.done) light();
+    // 🆕 入力なしのチェック (me-none.js が先に値を空にする) = 数え直す
+    if (t.matches && t.matches('input[type="checkbox"][data-none]') && form.contains(t) && !S.done) { light(); return; }
     if (t.id === 'fix-ok') $('#confirm-yes').disabled = !t.checked || busy;
     // 切り替えボタン (me-shell.js が押された状態と data-value を付けて change を出す)
     if (t.classList && t.classList.contains('seg') && form.contains(t)) {
@@ -880,7 +920,7 @@
         if (S.vOn) setTimeout(function () { var a1 = $('#ax-1'); if (a1) a1.focus(); }, 0);
         return;
       }
-      if (t.closest('#sec-order')) renderHud(M || model());
+      if (t.closest('#sec-order')) light();
     }
   });
   // スマホでキーボードが出ている間は、下の固定の帯を小さく
@@ -1008,6 +1048,8 @@
       card: { official_url: val('official-url'), amazon_url: amz, asin: asin ? asin.toUpperCase() : '' },
     };
     if (!m.add || m.firstTime) out.axes = m.axes.map(function (ax) { return { axis: ax.i + 1, name: ax.name }; });
+    // 🆕 2026-10-13: 入力なしにした項目 (サーバーがもう一度確かめて、登録の理由に残す)
+    out.blanks = m.noneKeys.slice();
     var po = ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
     return out;
@@ -1037,6 +1079,9 @@
     if (f === 'children') return '#sec-kids';
     var MAP = { standard_price: '#c-price', cost: '#c-cost', tax_rate: '#c-tax', sales_class: '#c-sales', primary_supplier: '#f-primary_supplier', reorder_months: '#c-months', expiry_managed: '#c-expiry', inbound_date_managed: '#c-inbound', shipping_code: '#c-ship' };
     if (MAP[f]) return MAP[f];
+    if (f === 'card.amazon_url' || f === 'card.asin') return '#amazon-url';
+    if (f === 'children.jan') return '#row-jan-none';
+    if (f === 'reason') return '#reason';
     if (/^card/.test(f)) return '#official-url';
     if (/^order_settings/.test(f)) { var row = document.querySelector('[data-row="' + f.replace(/"/g, '') + '"]'); return row ? '[data-row="' + f.replace(/"/g, '') + '"]' : '#sec-order'; }
     return '#sec-save';

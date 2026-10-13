@@ -1,13 +1,17 @@
 /*
  * me-new.js — 新商品の登録の画面 (単品・セット) の動き (第 2 段 10/5)
  *   - 未保存の数 = data-dirty-field を付けた欄だけ (保存の理由・種類の札・全体から探す は数えない)。セットの構成は「構成の中身どうし」をくらべる
- *   - 右の「下書き保存まで あと N つ」= ① 下書きに要る (これがそろうまで保存のボタンは押せない) ② NE 登録の CSV までに要る ③ 出品カードに要る (② ③ は止めない)
- *   - 上の飛び先の帯 = 区切りごとに ① が足りていれば緑・足りなければ黄色
+ *   - 右の「下書き保存まで あと N つ」= ① 下書きに要る ② NE 登録の CSV までに要る ③ 出品カードに要る ④ そのほか (🆕 2026-10-13: ②〜④ も「値か入力なし」になるまで保存は押せない)
+ *   - 上の飛び先の帯 = 区切りごとに全部の項目がそろっていれば緑・足りなければ黄色
  *   - 保存の送り方は前と同じ (POST /api/new { request_id, kind, code, reason, values, card })。
  *     🆕 2026-10-08 中原さん: 単品の代表の仕入先は ① (必須)・発送方法は ③ (あとでも可・届いてサイズを見てから)。サーバー (lib/master-register.mjs) と DB (0060) も同じ決まり
  *     🆕 2026-10-08 中原さん「下書き保存時にわかる内容だから必須にする」: 単品の売上分類 (「あとで」は無い)・推奨保有月数・単品のロジザードの有効期限の管理 (初めは選んでいない) も ①。
  *     サーバー (lib/master-register.mjs) と DB (0061) も同じ決まり。セットの売上分類は構成品から (今までどおり)
  *   - 保存が通ったら、できた商品の画面へ移る (今の画面の履歴を置き換える = 戻る 1 回で前の画面)。商品の画面の上に結果を 1 回だけ出す
+ *   🆕 2026-10-13 中原さん「全部そろわないと入力できない」: 必須でない項目は どれも「値」か「入力なし」(public/me-none.js) のどちらか。
+ *     どちらでもない項目があるうちは保存を押せない (あと N つに数える)。並び = ① 必須 → ② NE 登録の CSV までに要る → ③ 出品カードに要る → ④ そのほか。
+ *     入力なしにした項目は「なし」の印。送る本文の blanks = 入力なしにした項目 (サーバー = lib/master-register-blanks.mjs が同じ決まりでもう一度確かめる)。
+ *     カードを作らない = カードの欄 (Yahoo! も) は数えない・送らない。発注の設定は欄が出る (書ける) ときだけ (public/me-order.js の items)
  */
 (function () {
   'use strict';
@@ -95,15 +99,39 @@
     if (!isSet) list.push({ id: 'sales_class', sec: 'sec-tax', t: '売上分類', ok: !!segVal('f-sales_class'), focus: '#f-sales_class button', level: 1 });
     list.push({ id: 'reorder_months', sec: 'sec-ship', t: '推奨保有月数 (0〜60)', ok: monthsOk(), focus: '#f-reorder_months', level: 1 });
     if (!isSet) list.push({ id: 'expiry_managed', sec: 'sec-ship', t: 'ロジザードの有効期限の管理', ok: !!segVal('f-expiry'), focus: '#f-expiry button', level: 1 });
-    if (!isSet) list.push({ id: 'cost', sec: 'sec-money', t: '原価 (1 円以上)', ok: priceOk('cost-jpy'), focus: '#cost-jpy', level: 2 });
-    if (cardOn()) {
-      list.push({ id: 'amazon', sec: 'sec-card', t: 'Amazon URL か ASIN', ok: !!(val('amazon-url') || val('asin')), focus: '#amazon-url', level: 3 });
-      list.push({ id: 'official', sec: 'sec-card', t: '公式ページ URL', ok: !!val('official-url'), focus: '#official-url', level: 3 });
-      // 発送方法 = 出品カードの楽天の配送方法に使う (届いてサイズを見てから商品の画面で入れてもよい)
-      list.push({ id: 'shipping_code', sec: 'sec-ship', t: '発送方法 (届いてからでも可)', ok: !!val('shipping'), focus: '#shipping', level: 3 });
-      if (!isSet) list.push({ id: 'set_plan', sec: 'sec-card', t: 'セット商品を作るか', ok: !!segVal('set-plan'), focus: '#set-plan button', level: 3 });
+    // 🆕 2026-10-13: 必須でない項目 = 値か「入力なし」。ok = どちらか / none = 入力なし (印「なし」)。原価は 1 円以上の形も見る (0 = 値でない)
+    var N = ME.none;
+    var opt = function (key, sec, t, focus, level, okValue) {
+      if (!N || !N.present(key)) return;
+      var none = N.on(key) && !N.has(key);
+      list.push({ id: key, sec: sec, t: t, ok: none || (okValue == null ? N.has(key) : okValue), none: none, focus: focus, level: level, opt: true });
+    };
+    var card = cardOn();
+    if (!isSet) opt('cost', 'sec-money', '原価 (1 円以上)', '#cost-jpy', 2, priceOk('cost-jpy'));
+    if (card) {
+      opt('card.amazon', 'sec-card', 'Amazon URL か ASIN', '#amazon-url', 3);
+      opt('card.official_url', 'sec-card', '公式ページ URL', '#official-url', 3);
+    }
+    // 発送方法 = 出品カードの楽天の配送方法にも使う (届いてサイズを見てから = 入力なし・商品の画面で入れる)。カードを作らないときは ④
+    opt('shipping_code', 'sec-ship', '発送方法 (届いてからでも可)', document.getElementById('shipping') ? '#shipping' : '[data-row="shipping_code"] .nonechk input', card ? 3 : 4);
+    if (!isSet && card) opt('card.set_decision', 'sec-card', 'セット商品を作るか', '#set-plan button', 3);
+    // ④ そのほか (画面の上からの順)
+    if (isSet) opt('exception_cost', 'sec-comp', '例外原価 (入力なし = 構成品の合計)', '#xcost-jpy', 4);
+    if (!isSet && ME.orderSettings && ME.orderSettings.items) {
+      ME.orderSettings.items().forEach(function (x) { list.push({ id: x.key, sec: 'sec-order', t: x.t, ok: x.ok, none: x.none, focus: x.focus, level: 4, opt: true }); });
+    }
+    if (!isSet) opt('inbound_date_managed', 'sec-ship', 'ロジザードの入荷日の管理', '#f-inbound button', 4);
+    if (card) {
+      opt('card.reference_urls', 'sec-card', '参考 URL', '#ref-rows .ref-url', 4);
+      [['card.yahoo.price', 'Yahoo!売価', '#y-price'], ['card.yahoo.price_sagawa', 'Yahoo!売価 (佐川)', '#y-price-sagawa'], ['card.yahoo.delivery_label', 'Yahoo!の配送方法', '#y-delivery'],
+        ['card.yahoo.category_id', 'Yahoo!カテゴリID', '#y-category'], ['card.yahoo.path', 'Yahoo!path', '#y-path']].forEach(function (y) { opt(y[0], 'sec-yahoo', y[1], y[2], 4); });
     }
     return list;
+  }
+  /** 送る「入力なし」の印 = 数えている項目のうち入力なしにしたもの (カードを作らない = カードの欄は送らない) */
+  function blanks() {
+    var order = P.blankKeys || [];   // サーバーと同じ並び (lib/master-register-blanks.mjs の BLANK_KEYS)
+    return items().filter(function (x) { return x.opt && x.none; }).map(function (x) { return x.id; }).sort(function (a, b) { return order.indexOf(a) - order.indexOf(b); });
   }
 
   /* ---------- 画面を描き直す ---------- */
@@ -112,20 +140,23 @@
   var drawn = {};
   /** 中身が同じなら描き直さない (押している最中のボタンを消すと押しても効かない = 欄を離れたときの change で描き直していた) */
   function paint(sel, html) { if (drawn[sel] === html) return; drawn[sel] = html; $(sel).innerHTML = html; }
-  var mark = function (ok) { return '<span class="mark" aria-hidden="true">' + (ok ? '<svg class="ic"><use href="#i-check"/></svg>' : '') + '</span>'; };
+  var mark = function (ok, none) { return '<span class="mark" aria-hidden="true">' + (none ? 'なし' : ok ? '<svg class="ic"><use href="#i-check"/></svg>' : '') + '</span>'; };
   function update() {
+    if (ME.none) ME.none.refresh();
     var it = items();
-    var need = it.filter(function (x) { return x.level === 1 && !x.ok; });
+    // 🆕 2026-10-13: 数えるのは全部の項目 (① = 値がない / ②〜④ = 値も入力なしもない)
+    var need = it.filter(function (x) { return !x.ok; });
     var h = '';
-    [[1, '① 下書きに要る', ''], [2, '② NE 登録の CSV までに要る', 'あとでも可'], [3, '③ 出品カードに要る', 'あとでも可']].forEach(function (g) {
+    [[1, '① 下書きに要る (必須)', ''], [2, '② NE 登録の CSV までに要る', '値か入力なし'], [3, '③ 出品カードに要る', '値か入力なし'], [4, '④ そのほかの項目', '値か入力なし']].forEach(function (g) {
       var xs = it.filter(function (x) { return x.level === g[0]; });
-      if (g[0] === 2 && isSet) { h += '<li class="grp2">' + g[1] + '<span>' + g[2] + '</span></li><li class="hint" style="padding:2px 10px 4px">構成品が全部 NE 確認済みなら作れます (NE 登録の CSV の画面で確かめます)</li>'; return; }
-      if (g[0] === 3 && !cardOn()) { h += '<li class="grp2">' + g[1] + '<span>カードを作らない</span></li>'; return; }
+      if (g[0] === 2 && isSet) { h += '<li class="grp2">' + g[1] + '<span>構成品から</span></li><li class="hint" style="padding:2px 10px 4px">構成品が全部 NE 確認済みなら作れます (NE 登録の CSV の画面で確かめます)</li>'; return; }
+      if (g[0] === 3 && !cardOn()) { h += '<li class="grp2">' + g[1] + '<span>カードを作らない</span></li>'; }
       if (!xs.length) return;
-      h += '<li class="grp2">' + g[1] + '<span>' + (g[2] || xs.filter(function (x) { return x.ok; }).length + ' / ' + xs.length) + '</span></li>';
+      if (!(g[0] === 3 && !cardOn())) h += '<li class="grp2">' + g[1] + '<span>' + xs.filter(function (x) { return x.ok; }).length + ' / ' + xs.length + '</span></li>';
       xs.forEach(function (x) {
-        h += '<li class="' + (x.ok ? 'done' : 'todo') + (x.level === 1 && !x.ok ? ' need' : '') + (x.level > 1 ? ' opt' : '') + '"><button type="button" data-focus="' + esc(x.focus) + '">'
-          + mark(x.ok) + '<span class="lbl">' + esc(x.t) + '</span>' + (x.ok ? '<span class="sr">入っています</span>' : '<span class="go">' + (x.level === 1 ? '入れる' : 'あとでも可') + ' →</span>') + '</button></li>';
+        h += '<li class="' + (x.none ? 'done none' : x.ok ? 'done' : 'todo need') + (x.opt ? ' opt' : '') + '"><button type="button" data-focus="' + esc(x.focus) + '">'
+          + mark(x.ok, x.none) + '<span class="lbl">' + esc(x.t) + '</span>'
+          + (x.none ? '<span class="nonetag">入力なし</span>' : x.ok ? '<span class="sr">入っています</span>' : '<span class="go">' + (x.opt ? '値か入力なし' : '入れる') + ' →</span>') + '</button></li>';
       });
     });
     paint('#checklist', h);
@@ -133,10 +164,10 @@
     rm.classList.toggle('ok', need.length === 0);
     var rh = need.length ? '下書き保存まで あと<b>' + need.length + '</b>つ' : '<b><svg class="ic" aria-hidden="true" style="width:20px;height:20px;vertical-align:-3px"><use href="#i-check"/></svg></b>下書きを保存できます';
     paint('#remain', rh);
-    // 飛び先の帯・区切りの番号: ① が足りない区切り = 黄色・足りている = 緑
+    // 飛び先の帯・区切りの番号: 足りない項目 (値も入力なしもない) がある区切り = 黄色・全部そろった = 緑
     $$('#jump a[data-sec]').forEach(function (a) {
       var sec = a.getAttribute('data-sec');
-      var mine = it.filter(function (x) { return x.sec === sec && x.level === 1; });
+      var mine = it.filter(function (x) { return x.sec === sec; });
       var todo = mine.some(function (x) { return !x.ok; });
       a.classList.toggle('todo', todo); a.classList.toggle('done', mine.length > 0 && !todo);
       var st = $('[data-step="' + sec + '"]'); if (st) st.classList.toggle('done', mine.length > 0 && !todo);
@@ -162,6 +193,7 @@
     yahooSummary();
   }
   ME.dirty = function () { return { n: lastState.n, items: lastState.items, impacts: lastState.impacts }; };
+  ME.recount = function () { update(); };   // 発注の設定の部品 (後から読む) が読み終わったとき
   scope.addEventListener('input', function (e) { if (e.target.id === 'code') codeLater(); update(); });
   scope.addEventListener('change', update);
 
@@ -427,7 +459,7 @@
     if (val('y-delivery')) parts.push('配送 ' + val('y-delivery'));
     if (val('y-category')) parts.push('カテゴリ ' + val('y-category'));
     if (val('y-path')) parts.push('path あり');
-    s.textContent = parts.length ? parts.join(' · ') + ' を入れてあります' : 'ふだんは空のまま';
+    s.textContent = parts.length ? parts.join(' · ') + ' を入れてあります' : 'ふだんは全部「入力なし」';
     s.className = 'b ' + (parts.length ? 'info' : 'mute');
   }
 
@@ -465,7 +497,8 @@
       var plan = segVal('set-plan');
       if (plan) card.set_decision = { decision: plan, reason_code: plan === 'none' ? val('set-reason') : '', reason_text: val('set-text') };
     }
-    var out = { request_id: requestId, kind: P.kind, code: $('#code').value, reason: val('reason'), values: values, card: card };
+    // 🆕 2026-10-13: 入力なしにした項目 (サーバーが「値か入力なし」をもう一度確かめる・登録の記録 (理由) に残す)
+    var out = { request_id: requestId, kind: P.kind, code: $('#code').value, reason: val('reason'), values: values, card: card, blanks: blanks() };
     // 発注の設定 (発注アプリ・単品だけ・public/me-order.js)。何も入れていない = 送らない (発注アプリに何も書かない)
     var po = !isSet && ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
@@ -478,7 +511,7 @@
    * サーバーの誤りの項目 → 直す欄 (1 つの行に欄が 2 つある Yahoo! など。#1628 Codex R5 L1)。
    * ここに無い項目は data-row の行の最初の欄
    */
-  var FIELD_INPUT = { 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path' };
+  var FIELD_INPUT = { 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path', reason: '#reason' };
   function showError(j, status) {
     var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
     if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) h += '<ul>' + j.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>';
@@ -487,10 +520,11 @@
       if (/^card\./.test(String(j.field))) { var cf = $('#card-fields'); if (cf) cf.hidden = false; }   // 隠れた欄の誤りでも直せるように開く
       var row = $('[data-row="' + String(j.field).replace(/"/g, '') + '"]', scope);
       var target = Object.prototype.hasOwnProperty.call(FIELD_INPUT, j.field) ? $(FIELD_INPUT[j.field]) : null;
-      if (target) row = target.closest('.f');
+      if (target) row = target.closest('.f') || row;
       // セット判断の誤りで「作らない / 保留」を選んでいる = 直すのは理由・メモの欄
       var plan0 = segVal('set-plan');
       if (j.field === 'card.set_decision' && (plan0 === 'none' || plan0 === 'hold') && $('#row-set-reason')) { row = $('#row-set-reason'); row.hidden = false; }
+      if (!row && target) { try { target.focus(); } catch (e) { /* */ } }
       if (row) {
         row.classList.add('err');
         var det = row.closest('details'); if (det) det.open = true;

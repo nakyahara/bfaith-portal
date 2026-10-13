@@ -35,6 +35,15 @@ export function orderScreen(req, editor, code = null, { supplier = null } = {}) 
 }
 
 /**
+ * 🆕 2026-10-13 (入力なし・#1706 Codex R1 M2): 新商品の登録で発注の設定の 6 つの項目を「値か入力なし」として数えるか。
+ *   画面 (views/_order.ejs の「入力なし」と public/me-order.js の items) と API (lib/master-register-blanks.mjs の orderApplicable) は
+ *   どちらもこの 1 つの答えを使う = 権限が無い・発注アプリの設定を読めない (画面に欄が出ない) ときは、API も聞かない
+ */
+export function orderNoneApplies(os) {
+  return !!os && os.canSee === true && os.canWrite === true && !!os.data && os.data.ok === true;
+}
+
+/**
  * 画面の本文 (order_settings / values) → 部品の入力 { patch, newCondition, newMaterial }。
  * 新商品の登録: 全部空 = null (発注アプリに何も書かない)。商品の画面 (allowEmpty) = 全部空でも送る (空にする)
  */

@@ -5,6 +5,8 @@
  *   - 新商品の登録 (mode = new): 下書きの保存と一緒に送る = MasterEdit.orderSettings.collect() を me-new.js が本文の order_settings に入れる
  *   - 商品の画面 (mode = sku): 自分の「発注の設定を保存」(POST /api/sku/:code/order-settings・開いたときの印 seen)。Company DB の保存とは別。
  *     未保存の数は MasterEdit.dirty() に足す (離れるときの確認に出る)
+ *   🆕 2026-10-13 (入力なし): 新商品の登録では、6 つの項目 (発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量) は
+ *     どれも「値」か「入力なし」(グループは「なし」= 入力なし)。MasterEdit.orderSettings.items() = 画面が数える項目 (書けないとき = 空)
  */
 (function () {
   'use strict';
@@ -76,7 +78,33 @@
     var empty = Object.keys(out).every(function (k) { return k === 'new_condition' || k === 'new_material' ? !out[k] : out[k] === ''; });
     return empty ? null : out;
   }
+  /**
+   * 新商品の登録の項目 [{ key, t, ok (値か入力なし), none (入力なし), focus }]。書けない (権限・読めない・見るだけ) = 空 (数えない・サーバーも数えない)。
+   *   グループ: なし = 入力なし / 今あるグループ = 選んだら値 / 新しく作る = 名前・ID・決まり (・値) を入れたら値 (中身はサーバーが確かめる)
+   */
+  function items() {
+    if (P.mode !== 'new' || !P.canWrite || !P.noneOn) return [];   // 数えるかはサーバーと同じ答え (noneOn)
+    var N = ME.none;
+    var chk = function (key, t, focus) {
+      var none = !!N && N.on(key) && !N.has(key);
+      return { key: key, t: t, ok: none || (!!N && N.has(key)), none: none, focus: focus };
+    };
+    var grp = function (key, segId, pickId, t, newOk, newFocus) {
+      var m = segVal(segId);
+      var ok = m === 'none' || (m === 'pick' && !!val(pickId)) || (m === 'new' && newOk());
+      return { key: key, t: t, ok: ok, none: m === 'none', focus: m === 'pick' ? '#' + pickId : m === 'new' ? newFocus : '#' + segId + ' button' };
+    };
+    return [
+      chk('order_settings.order_lot', '発注ロット', '#po-order_lot'),
+      grp('order_settings.condition', 'po-cond-mode', 'po-condition_id', '発注条件グループ', function () { return !!(val('po-nc-name') && val('po-nc-id') && val('po-nc-type') && val('po-nc-value')); }, '#po-nc-name'),
+      grp('order_settings.material', 'po-mat-mode', 'po-material_group_id', '原料グループ', function () { return !!(val('po-nm-name') && val('po-nm-id')); }, '#po-nm-name'),
+      chk('order_settings.case_lot', 'ケースロット', '#po-case_lot'),
+      chk('order_settings.case_group', 'ケースグループ', '#po-case_group'),
+      chk('order_settings.capacity_per_unit', '容量 / 個', '#po-capacity_per_unit'),
+    ];
+  }
   ME.orderSettings = { collect: collect };
+  ME.orderSettings.items = items;
 
   /* ---------- 商品の画面: 自分の保存 ---------- */
   var saveBtn = $('#po-save');
@@ -151,4 +179,6 @@
   filterConditions();
   initial = JSON.stringify(collect({ all: true }));
   changed();
+  // 新商品の登録: 画面の JS はこの部品より先に読む = 読み終わったので発注の設定の項目も数え直してもらう (入力なし)
+  if (P.mode === 'new' && typeof ME.recount === 'function') ME.recount();
 })();

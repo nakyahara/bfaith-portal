@@ -24,8 +24,13 @@
     ? [['sec-code', 'コードと名前'], ['sec-comp', '構成'], ['sec-money', 'お金'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']]
     : [['sec-code', 'コードと名前'], ['sec-money', 'お金'], ['sec-tax', '税・分類・仕入先'], ['sec-order', '発注'], ['sec-ship', '発送'], ['sec-card', '出品カード'], ['sec-yahoo', 'Yahoo!']];
   const no = (id) => secs.findIndex((x) => x[0] === id) + 1;
+  // 🆕 2026-10-13 中原さん「入力なし」: 必須でない項目は 値 か 入力なし のどちらか (サーバー = lib/master-register-blanks.mjs と同じ名前 = blankKeys)。
+  //   押す所は 44px (master-edit.css の .nonechk)。値の入れ物は data-none-part (値を入れるとチェックが外れる = public/me-none.js)
+  const none = (key) => '<label class="nonechk"><input type="checkbox" data-none="' + h(key) + '" aria-label="' + h((blankLabels[key] || {}).label || key) + 'を入力なしにする"' + dis + '><span>入力なし</span></label>';
+  const part = (key) => ' data-none-part="' + h(key) + '"';
+  const segPart = (key, html) => html.replace(/^<div class="seg"([^>]*)>/, (m0, attrs) => '<div class="seg"' + attrs + part(key) + '>');
   // 画面の JS に渡す値 (JSON = EJS の出力を JS の値の位置に直に置かない)
-  const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs } : null;
+  const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs, blankKeys, blankLabels } : null;
 %>
   <%- include('_header', { hasSave: canSave }) %>
   <div class="page" id="new-page">
@@ -96,7 +101,7 @@
                   <% for (const [k, v] of Object.entries(SALES)) { %><option value="<%= k %>"><%= v %></option><% } %>
                 </select><span class="hint" id="override-hint">構成品から導けないときだけ (未入力・輸出 4 と 1〜3 の混在)</span></div></div>
               <div class="f" data-row="exception_cost"><label class="lab" for="xcost-jpy">例外原価</label>
-                <div class="ctl"><span class="yen"><input class="in w-s" id="xcost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="exception_cost" data-label="例外原価" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">空なら構成品の原価の合計</span></div></div>
+                <div class="ctl"><span class="yen"><input class="in w-s" id="xcost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="exception_cost" data-label="例外原価" placeholder="0"<%- part('exception_cost') %><%= dis %>></span><span class="unit">円</span><%- none('exception_cost') %><span class="hint">入力なし = 構成品の原価の合計</span></div></div>
             </div>
           </details>
         </section>
@@ -108,7 +113,7 @@
             <div class="ctl"><span class="yen"><input class="in w-s" id="f-standard_price" inputmode="numeric" autocomplete="off" data-field="standard_price" data-dirty-field="standard_price" data-label="売価" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">標準売価 · 税込</span></div></div>
           <% if (!isSet) { %>
           <div class="f" data-row="cost"><label class="lab" for="cost-jpy">原価<span class="opt">あとでも可</span></label>
-            <div class="ctl"><span class="yen"><input class="in w-s" id="cost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="cost" data-label="原価" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">今日から</span></div></div>
+            <div class="ctl"><span class="yen"><input class="in w-s" id="cost-jpy" inputmode="numeric" autocomplete="off" data-dirty-field="cost" data-label="原価" placeholder="0"<%- part('cost') %><%= dis %>></span><span class="unit">円</span><%- none('cost') %><span class="hint">今日から · 入力なしにしても、NE 登録の CSV の前に要ります</span></div></div>
           <% } %>
         </section>
 
@@ -135,12 +140,13 @@
           <div class="f" data-row="shipping_code"><label class="lab" for="shipping">発送方法<span class="opt">あとでも可</span></label>
             <div class="ctl">
               <% if (shippingRates) { %>
-              <select class="in w-m" id="shipping" data-field="shipping_code" data-dirty-field="shipping_code" data-label="発送方法"<%= dis %>>
-                <option value="">(あとで)</option>
+              <select class="in w-m" id="shipping" data-field="shipping_code" data-dirty-field="shipping_code" data-label="発送方法"<%- part('shipping_code') %><%= dis %>>
+                <option value="">(選ぶ)</option>
                 <% for (const r of shippingRates) { %><option value="<%= r.code %>"><%= r.code %> <%= r.method || '' %> / <%= fmt.yen(r.cost) %> 円</option><% } %>
               </select>
-              <span class="hint">届いてサイズを見てから決めるときは空のまま (あとで商品の画面で入れる) · 送料コード → 方法と金額は送料の表から · product-hub の楽天の配送方法は対応表から (無ければカードに「要確認」)</span>
-              <% } else { %><span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg>送料の表が読めません</span><% } %>
+              <%- none('shipping_code') %>
+              <span class="hint">届いてサイズを見てから決めるときは「入力なし」(あとで商品の画面で入れる) · 送料コード → 方法と金額は送料の表から · product-hub の楽天の配送方法は対応表から (無ければカードに「要確認」)</span>
+              <% } else { %><span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg>送料の表が読めません</span><%- none('shipping_code') %><% } %>
             </div></div>
           <%# 推奨保有月数・ロジザードの有効期限の管理は下書きの保存で要る (2026-10-08 中原さん)。有効期限の管理は初めから選んだ形にしない (選ぶまで保存できない)。入荷日の管理は今までどおり %>
           <div class="f" data-row="reorder_months"><label class="lab" for="f-reorder_months">推奨保有月数<span class="req">必須</span></label>
@@ -150,8 +156,8 @@
             <div class="ctl"><%- seg('f-expiry', 'expiry_managed', '', [['0', 'なし'], ['1', 'あり']], '有効期限の管理') %><span class="misslabel" id="expiry-miss"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ選んでいません</span>
               <span class="hint">賞味期限・使用期限のある商品は あり · ロジザードの最初の値 (あとはロジザードが正)</span></div></div>
           <div class="f" data-row="inbound_date_managed"><div class="lab" id="lab-f-inbound">ロジザードの入荷日の管理</div>
-            <div class="ctl"><%- seg('f-inbound', 'inbound_date_managed', '0', [['0', 'なし'], ['1', 'あり']], '入荷日の管理') %>
-              <span class="hint">最初の値だけ · あとはロジザードが正</span></div></div>
+            <div class="ctl"><%- segPart('inbound_date_managed', seg('f-inbound', 'inbound_date_managed', '', [['0', 'なし'], ['1', 'あり']], '入荷日の管理')) %><%- none('inbound_date_managed') %>
+              <span class="hint">最初の値だけ · あとはロジザードが正 · 入力なし = 不明のまま</span></div></div>
           <% } %>
         </section>
 
@@ -160,17 +166,17 @@
             <span class="right"><span class="sr" id="lab-card-create">出品カードを作るか</span><%- seg('card-create', 'card_create', '1', [['1', 'カードを作る'], ['0', '作らない']], '出品カード') %></span></div>
           <div class="hint" id="card-off-note" hidden style="margin-bottom:6px">カードは作りません (保存しても product-hub のボードにカードはできません)。</div>
           <div id="card-fields">
-            <div class="f" data-row="card.official_url"><label class="lab" for="official-url">公式ページ URL</label><div class="ctl"><input class="in w-l" id="official-url" autocomplete="off" data-dirty-field="official_url" data-label="公式ページ URL" placeholder="https://"<%= dis %>></div></div>
-            <div class="f" data-row="card.amazon_url"><label class="lab" for="amazon-url">Amazon URL</label><div class="ctl"><input class="in w-l" id="amazon-url" autocomplete="off" data-dirty-field="amazon_url" data-label="Amazon URL" placeholder="https://www.amazon.co.jp/dp/…  (貼ると ASIN を読み取ります)"<%= dis %>></div></div>
-            <div class="f" data-row="card.asin"><label class="lab" for="asin">ASIN</label><div class="ctl"><input class="in w-s mono" id="asin" maxlength="10" autocomplete="off" spellcheck="false" data-dirty-field="asin" data-label="ASIN" placeholder="B0XXXXXXXX"<%= dis %>><span class="fmsg ok" id="asin-msg" role="status" hidden><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>Amazon URL から読み取りました</span></div></div>
+            <div class="f" data-row="card.official_url"><label class="lab" for="official-url">公式ページ URL</label><div class="ctl"><input class="in w-l" id="official-url" autocomplete="off" data-dirty-field="official_url" data-label="公式ページ URL" placeholder="https://"<%- part('card.official_url') %><%= dis %>><%- none('card.official_url') %></div></div>
+            <div class="f" data-row="card.amazon_url"><label class="lab" for="amazon-url">Amazon URL</label><div class="ctl"><input class="in w-l" id="amazon-url" autocomplete="off" data-dirty-field="amazon_url" data-label="Amazon URL" placeholder="https://www.amazon.co.jp/dp/…  (貼ると ASIN を読み取ります)"<%- part('card.amazon') %><%= dis %>><%- none('card.amazon') %><span class="hint" style="flex-basis:100%">Amazon URL か ASIN のどちらか · Amazon に無い商品は「入力なし」</span></div></div>
+            <div class="f" data-row="card.asin"><label class="lab" for="asin">ASIN</label><div class="ctl"><input class="in w-s mono" id="asin" maxlength="10" autocomplete="off" spellcheck="false" data-dirty-field="asin" data-label="ASIN" placeholder="B0XXXXXXXX"<%- part('card.amazon') %><%= dis %>><span class="fmsg ok" id="asin-msg" role="status" hidden><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>Amazon URL から読み取りました</span></div></div>
             <div class="f" data-row="card.reference_urls" style="align-items:start"><div class="lab" id="lab-refs" style="padding-top:8px">参考 URL</div>
-              <div class="ctl col" style="gap:0" id="refs" role="group" aria-labelledby="lab-refs" data-dirty-field="reference_urls" data-label="参考 URL">
+              <div class="ctl col" style="gap:0" id="refs" role="group" aria-labelledby="lab-refs" data-dirty-field="reference_urls" data-label="参考 URL"<%- part('card.reference_urls') %>>
                 <div id="ref-rows"><div class="urlrow"><span class="idx" aria-hidden="true">1</span><input class="in ref-url" autocomplete="off" aria-label="参考 URL 1" placeholder="https://"<%= dis %>><button class="iconbtn del" type="button" data-ref-del aria-label="参考 URL 1 を外す"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg></button></div></div>
-                <div><button class="btn sm" type="button" id="ref-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>URL を足す</button> <span class="hint"><%= MAX_REFERENCE_URLS %> 個まで</span></div>
+                <div class="refsfoot"><button class="btn sm" type="button" id="ref-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>URL を足す</button><%- none('card.reference_urls') %><span class="hint"><%= MAX_REFERENCE_URLS %> 個まで</span></div>
               </div></div>
             <% if (!isSet) { %>
             <div class="f" data-row="card.set_decision"><div class="lab" id="lab-set-plan">セット商品を作るか</div>
-              <div class="ctl"><%- seg('set-plan', 'set_plan', '', [...Object.entries(setPlanChoices), ['', 'まだ決めない']], 'セット商品を作るか') %></div></div>
+              <div class="ctl"><%- segPart('card.set_decision', seg('set-plan', 'set_plan', '', Object.entries(setPlanChoices), 'セット商品を作るか')) %><%- none('card.set_decision') %><span class="hint">まだ決めないときは「入力なし」</span></div></div>
             <div class="f" id="row-set-reason" hidden><label class="lab" for="set-reason">作らない理由・メモ</label>
               <div class="ctl"><select class="in w-m" id="set-reason" data-dirty-field="set_reason" data-label="作らない理由"<%= dis %>>
                 <option value="">(作らないときに選ぶ)</option>
@@ -181,20 +187,22 @@
         </section>
 
         <details class="panel soft" id="sec-yahoo">
-          <summary><span class="stepno" data-step="sec-yahoo" aria-hidden="true" style="width:26px;height:26px;font-size:13px"><%= no('sec-yahoo') %></span>Yahoo! を楽天と変えるときだけ <span class="b mute" id="yahoo-sum">ふだんは空のまま</span><svg class="ic s chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
+          <summary><span class="stepno" data-step="sec-yahoo" aria-hidden="true" style="width:26px;height:26px;font-size:13px"><%= no('sec-yahoo') %></span>Yahoo! を楽天と変えるときだけ <span class="b mute" id="yahoo-sum">ふだんは全部「入力なし」</span><svg class="ic s chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
           <div class="body">
+            <div class="hint" style="padding:4px 0 6px">楽天と同じにする欄は、欄ごとに「入力なし」を押します · 売価は 1 円以上 (0 は入れない)</div>
             <div class="f" data-row="card.yahoo.price"><label class="lab" for="y-price">Yahoo!売価</label>
-              <div class="ctl"><span class="yen"><input class="in w-s" id="y-price" inputmode="numeric" autocomplete="off" data-dirty-field="y_price" data-label="Yahoo!売価" placeholder="0"<%= dis %>></span><span class="unit">円</span>
-                <label class="hint" for="y-price-sagawa" style="color:var(--text2);margin-left:10px">Yahoo!売価 (佐川)</label><span class="yen"><input class="in w-s" id="y-price-sagawa" inputmode="numeric" autocomplete="off" data-dirty-field="y_price_sagawa" data-label="Yahoo!売価 (佐川)" placeholder="0"<%= dis %>></span><span class="unit">円</span>
-                <span class="hint">1 円以上 (決めていなければ空のまま・0 は入れない)</span></div></div>
+              <div class="ctl"><span class="yen"><input class="in w-s" id="y-price" inputmode="numeric" autocomplete="off" data-dirty-field="y_price" data-label="Yahoo!売価" placeholder="0"<%- part('card.yahoo.price') %><%= dis %>></span><span class="unit">円</span><%- none('card.yahoo.price') %></div></div>
+            <div class="f" data-row="card.yahoo.price_sagawa"><label class="lab" for="y-price-sagawa">Yahoo!売価 (佐川)</label>
+              <div class="ctl"><span class="yen"><input class="in w-s" id="y-price-sagawa" inputmode="numeric" autocomplete="off" data-dirty-field="y_price_sagawa" data-label="Yahoo!売価 (佐川)" placeholder="0"<%- part('card.yahoo.price_sagawa') %><%= dis %>></span><span class="unit">円</span><%- none('card.yahoo.price_sagawa') %></div></div>
             <div class="f" data-row="card.yahoo.delivery_label"><label class="lab" for="y-delivery">配送方法</label>
-              <div class="ctl"><select class="in w-m" id="y-delivery" data-dirty-field="y_delivery" data-label="Yahoo!の配送方法"<%= dis %>>
-                <option value="">(楽天と同じ)</option>
+              <div class="ctl"><select class="in w-m" id="y-delivery" data-dirty-field="y_delivery" data-label="Yahoo!の配送方法"<%- part('card.yahoo.delivery_label') %><%= dis %>>
+                <option value="">(選ぶ)</option>
                 <% for (const d of yahooDeliveries) { %><option value="<%= d %>"><%= d %></option><% } %>
-              </select><span class="hint">楽天と違う配送にするときだけ</span></div></div>
+              </select><%- none('card.yahoo.delivery_label') %><span class="hint">楽天と違う配送にするときだけ (同じなら入力なし)</span></div></div>
             <div class="f" data-row="card.yahoo.category_id"><label class="lab" for="y-category">Yahoo!カテゴリID</label>
-              <div class="ctl"><input class="in w-s mono" id="y-category" autocomplete="off" data-dirty-field="y_category" data-label="Yahoo!カテゴリID"<%= dis %>>
-                <label class="hint" for="y-path" style="color:var(--text2);margin-left:10px">Yahoo!path</label><input class="in w-m" id="y-path" maxlength="500" autocomplete="off" data-dirty-field="y_path" data-label="Yahoo!path"<%= dis %>></div></div>
+              <div class="ctl"><input class="in w-s mono" id="y-category" autocomplete="off" data-dirty-field="y_category" data-label="Yahoo!カテゴリID"<%- part('card.yahoo.category_id') %><%= dis %>><%- none('card.yahoo.category_id') %></div></div>
+            <div class="f" data-row="card.yahoo.path"><label class="lab" for="y-path">Yahoo!path</label>
+              <div class="ctl"><input class="in w-m" id="y-path" maxlength="500" autocomplete="off" data-dirty-field="y_path" data-label="Yahoo!path"<%- part('card.yahoo.path') %><%= dis %>><%- none('card.yahoo.path') %></div></div>
             <div class="hint">税率は Company DB の税率を使います (ここでは入れません)。</div>
           </div>
         </details>
@@ -205,7 +213,7 @@
           <div class="mobilebar"><span class="grow"><b class="mb-n">未保存の変更はありません</b></span><button class="btn soft sm" type="button" id="savebox-toggle" aria-expanded="false" aria-controls="savebox">確認して保存</button></div>
           <h2 class="sr" id="h-save">下書きの保存</h2>
           <div class="remain" id="remain" aria-live="polite">下書き保存まで あと<b>—</b>つ</div>
-          <div class="hint" style="margin-bottom:4px">① がそろえば下書きにできます。② ③ はあとでも入れられます (押すとその欄へ)</div>
+          <div class="hint" style="margin-bottom:4px">全部の項目を「値」か「入力なし」にすると下書きにできます (① は値だけ)。入力なしにしても ② は NE 登録の CSV の前・③ は出品カードで要ります (押すとその欄へ)</div>
           <ul class="checklist" id="checklist"></ul>
           <% if (canSave) { %>
           <label class="lab2" for="reason">理由 (なくてもよい)</label>
@@ -219,7 +227,7 @@
         <section class="panel" aria-labelledby="h-after">
           <div class="panel-h" style="margin-bottom:8px"><h2 id="h-after">登録のあと</h2></div>
           <ol class="after-steps">
-            <li class="first">下書き (この画面) — ① がそろったら</li>
+            <li class="first">下書き (この画面) — 全部の項目が「値」か「入力なし」になったら</li>
             <li>NE 登録の CSV を作って配る — ② がそろったら · <a href="<%= base %>/reg-csv">NE 登録の CSV</a></li>
             <li>NE の画面で取り込む → 申告</li>
             <li>翌朝の確かめ (NE と同じか)</li>
@@ -233,6 +241,8 @@
     <% } %>
   </div>
   <%- include('_footer') %>
+  <%# 並び: 入力なし (me-none) → 画面 → 発注の設定 (読み終わったら画面に数え直してもらう = MasterEdit.recount) %>
+  <% if (page) { %><script src="<%= base %>/public/me-none.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-new.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page && !isSet && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
 </body>

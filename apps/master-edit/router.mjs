@@ -90,6 +90,8 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
+// 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
+import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf } from '../../lib/master-register-blanks.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
@@ -108,7 +110,7 @@ import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
 import { writeOrderSettings, writeRegistrationOrderSettings, registrationOrderDone, OrderSettingsError } from '../purchase-orders/order-settings.js';
-import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf } from './order-settings.mjs';
+import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf, orderNoneApplies } from './order-settings.mjs';
 import { orderOutboxReady, runOrderSettingsOutbox, readOrderSettingsForRegistration, deliveryInputOf, orderDeliveryEnabled, orderOutboxStatus, readOrderSettingsOutbox,
   dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, readRegistrationOrderMark, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS } from '../../lib/order-settings-outbox.mjs';
 import { ui } from './ui-format.mjs';
@@ -677,7 +679,10 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     yahooDeliveries: Object.values(SHIPPING_METHOD_GROUPS), setPlanChoices: SET_PLAN_CHOICES, setDecisionReasons: SET_DECISION_REASONS,
     // 発注の設定 (発注アプリ・単品だけ。発注アプリはセットを扱わない)
     orderSettings: kind === 'single' ? orderScreen(req, editorGate(req), null) : null,
+    orderNoneApplies,   // 発注の設定の「入力なし」を出すか (API と同じ関数・views/_order.ejs)
     variationOn: variationOn(owner),
+    // 「入力なし」にできる項目 (lib/master-register-blanks.mjs = サーバーと同じ名前)
+    blankKeys: BLANK_KEYS[kind], blankLabels: blankLabelsOf(kind),
   });
 }));
 /**
@@ -699,6 +704,8 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     maxKids: VARIATION_MAX_CHILDREN,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     orderSettings: orderScreen(req, editorGate(req), null),
+    orderNoneApplies,
+    blankKeys: BLANK_KEYS.variation, blankLabels: blankLabelsOf('variation'),
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
@@ -744,10 +751,23 @@ router.post('/api/variation/check', (req, res) => {
     res.json({ ok: true, ...(await checkVariationCodes(db, b, { phDraftExists: phDraftLookup })) });
   });
 });
+/**
+ * 🆕 #1706 Codex R2 M: 発注の設定の 6 つの「入力なし」= その request_id の記録 (保存の記録 ops.master_edit_requests = 成功・失敗とも) がまだ無いとき (初回) だけ確かめる。
+ *   数えるかは画面と同じ答え (orderNoneApplies)。押し直し (記録がある) = 確かめない・一言も作らない (lib が前の答え・前の誤りを返す) =
+ *   その時の発注アプリの読める / 読めないで押し直しが変わらない。戻り値 = prepareOrderBlanks の答え ({ ok, note } / { ok: false, status, json })
+ */
+function orderBlanksFirstTime(db, req, gate, kind, b) {
+  // 断る前に request の鍵を取って記録を読み直す (同じ request_id が同時に来た = 前の答え・#1706 Codex R3 M) = lib/master-register-blanks.mjs
+  return orderBlanksForRequest(db, kind, b, { orderApplicable: () => orderNoneApplies(orderScreen(req, gate, null)) });
+}
 router.post('/api/new/variation', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
-  const b = req.body || {};
+  // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか。どちらでもない = 400 (何も書かない)・入力なしの一覧は理由に足す (lib/master-register-blanks.mjs)
+  //   発注の設定の 6 つは、ここでは数えない (下 = その request_id の記録がまだ無いときだけ・要求のハッシュに入らない = #1706 Codex R2 M)
+  const pre = prepareRegisterBody('variation', req.body || {});
+  if (!pre.ok) return res.status(pre.status).json(pre.json);
+  const b = pre.body;
   const rid = String(b.request_id ?? '').trim().toLowerCase();
   const kids = Array.isArray(b.children) ? b.children : [];
   // 発注の設定 (発注アプリ): 単品の登録と同じ = ① の前に全部確かめる (1 つ目の子のコードで dry-run・同じ値を全部の子に)。誤り = 何も書かない
@@ -770,9 +790,13 @@ router.post('/api/new/variation', (req, res) => {
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ (子ごと) → commit の後に届ける。入る前 = 今までどおり ② をすぐ書く。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
+    const po = await orderBlanksFirstTime(db, req, gate, 'variation', b);
+    if (!po.ok) return res.status(po.status).json(po.json);
     const r = await registerVariationBatch(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: b.reason ?? null,
       group: b.group, axes: b.axes ?? null, options: b.options, children: b.children, values: b.values, card: b.card, order: outbox ? orderBase : null,
+      childReasons: pre.childReasons,   // 🆕 子ごとの入力なしの理由 (原価・JAN はその子に無いときだけ・#1706 Codex R1 M1)
+      reasonNote: po.note,              // 🆕 発注の設定の入力なし (DB に書く理由にだけ・ハッシュに入らない・#1706 Codex R2 M)
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
@@ -867,7 +891,11 @@ router.get('/api/code-check', (req, res) => withPgApi(res, async (db) => {
 router.post('/api/new', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
-  const b = req.body || {};
+  // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか (発注の設定は欄が出る人だけ・カードを作らない = カードの欄は数えない)。入力なしの一覧は理由に足す
+  //   発注の設定の 6 つは、ここでは数えない (下 = その request_id の記録がまだ無いときだけ・要求のハッシュに入らない = #1706 Codex R2 M)
+  const pre = prepareRegisterBody(String((req.body || {}).kind ?? ''), req.body || {});
+  if (!pre.ok) return res.status(pre.status).json(pre.json);
+  const b = pre.body;
   // 発注の設定 (発注アプリ): ① Company DB の登録の前に全部確かめる (グループがあるか・代表の仕入先のグループか・新しいグループの ID など)。
   //   誤り = ここで断る (Company DB にも発注アプリにも何も書かない)。確かめは発注アプリの部品の dry-run = 書くときと同じ決まり
   let order = null;
@@ -889,9 +917,11 @@ router.post('/api/new', (req, res) => {
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ → commit の後に届ける (届かなくても知らせは残る = 届け直す)。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
+    const po = await orderBlanksFirstTime(db, req, gate, String(b.kind ?? ''), b);
+    if (!po.ok) return res.status(po.status).json(po.json);
     const r = await registerNewSku(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
-      order: outbox ? orderBase : null,
+      order: outbox ? orderBase : null, reasonNote: po.note,
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox });
     let orderResult = null;
     const after = orderInput && outbox ? await ordersAfterRegistration(db, String(b.request_id).trim().toLowerCase(), !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
