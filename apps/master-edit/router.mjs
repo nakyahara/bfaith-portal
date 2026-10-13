@@ -83,6 +83,8 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
+// 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
+import { prepareRegisterBody, BLANK_KEYS, blankLabelsOf } from '../../lib/master-register-blanks.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
@@ -607,6 +609,8 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     // 発注の設定 (発注アプリ・単品だけ。発注アプリはセットを扱わない)
     orderSettings: kind === 'single' ? orderScreen(req, editorGate(req), null) : null,
     variationOn: variationOn(owner),
+    // 「入力なし」にできる項目 (lib/master-register-blanks.mjs = サーバーと同じ名前)
+    blankKeys: BLANK_KEYS[kind], blankLabels: blankLabelsOf(kind),
   });
 }));
 /**
@@ -628,6 +632,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     maxKids: VARIATION_MAX_CHILDREN,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     orderSettings: orderScreen(req, editorGate(req), null),
+    blankKeys: BLANK_KEYS.variation, blankLabels: blankLabelsOf('variation'),
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
@@ -676,7 +681,10 @@ router.post('/api/variation/check', (req, res) => {
 router.post('/api/new/variation', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
-  const b = req.body || {};
+  // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか。どちらでもない = 400 (何も書かない)・入力なしの一覧は理由に足す (lib/master-register-blanks.mjs)
+  const pre = prepareRegisterBody('variation', req.body || {}, { orderApplicable: () => orderScreen(req, gate, null).canWrite });
+  if (!pre.ok) return res.status(pre.status).json(pre.json);
+  const b = pre.body;
   const rid = String(b.request_id ?? '').trim().toLowerCase();
   const kids = Array.isArray(b.children) ? b.children : [];
   // 発注の設定 (発注アプリ): 単品の登録と同じ = ① の前に全部確かめる (1 つ目の子のコードで dry-run・同じ値を全部の子に)。誤り = 何も書かない
@@ -783,7 +791,10 @@ router.get('/api/code-check', (req, res) => withPgApi(res, async (db) => {
 router.post('/api/new', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
-  const b = req.body || {};
+  // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか (発注の設定は欄が出る人だけ・カードを作らない = カードの欄は数えない)。入力なしの一覧は理由に足す
+  const pre = prepareRegisterBody(String((req.body || {}).kind ?? ''), req.body || {}, { orderApplicable: () => orderScreen(req, gate, null).canWrite });
+  if (!pre.ok) return res.status(pre.status).json(pre.json);
+  const b = pre.body;
   // 発注の設定 (発注アプリ): ① Company DB の登録の前に全部確かめる (グループがあるか・代表の仕入先のグループか・新しいグループの ID など)。
   //   誤り = ここで断る (Company DB にも発注アプリにも何も書かない)。確かめは発注アプリの部品の dry-run = 書くときと同じ決まり
   let order = null;

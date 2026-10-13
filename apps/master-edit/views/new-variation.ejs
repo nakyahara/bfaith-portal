@@ -13,8 +13,12 @@
   const canSave = !!page && canEdit && !dbError && !entryClosed;
   const dis = canSave ? '' : ' disabled';
   const showForm = !!page && !gated;
+  // 🆕 2026-10-13 中原さん「入力なし」: 必須でない項目は 値 か 入力なし (サーバー = lib/master-register-blanks.mjs の variation と同じ名前)。押す所 44px
+  const hx = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const none = (key) => '<label class="nonechk"><input type="checkbox" data-none="' + hx(key) + '" aria-label="' + hx((blankLabels[key] || {}).label || key) + 'を入力なしにする"' + dis + '><span>入力なし</span></label>';
+  const part = (key) => ' data-none-part="' + hx(key) + '"';
   const pageData = showForm ? {
-    base, canSave, maxKids,
+    base, canSave, maxKids, blankKeys, blankLabels,
     suppliers: page.activeSuppliers.map((s) => [s.code, s.name]),
     shipping: shippingRates ? shippingRates.map((r) => [r.code, r.method || '', r.cost]) : null,
   } : null;
@@ -138,7 +142,7 @@
           <div class="f"><label class="lab" for="c-price">売価<span class="req">必須</span></label>
             <div class="ctl"><span class="yen"><input class="in w-s" id="c-price" inputmode="numeric" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">標準売価 · 税込 · ある子だけ変えるときは 6 の一覧で</span><div id="cf-price" style="flex-basis:100%"></div></div></div>
           <div class="f"><label class="lab" for="c-cost">原価<span class="opt">あとでも可</span></label>
-            <div class="ctl"><span class="yen"><input class="in w-s" id="c-cost" inputmode="numeric" placeholder="0"<%= dis %>></span><span class="unit">円</span><span class="hint">今日から · ある子だけ変えるときは 6 の一覧で</span><div id="cf-cost" style="flex-basis:100%"></div></div></div>
+            <div class="ctl"><span class="yen"><input class="in w-s" id="c-cost" inputmode="numeric" placeholder="0"<%- part('cost') %><%= dis %>></span><span class="unit">円</span><%- none('cost') %><span class="hint">今日から · ある子だけ変えるときは 6 の一覧で · 入力なしにしても NE 登録の CSV の前に要ります</span><div id="cf-cost" style="flex-basis:100%"></div></div></div>
           <div class="subh"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>税・分類・仕入先</div>
           <div class="f"><div class="lab" id="lab-c-tax">税率<span class="req">必須</span></div>
             <div class="ctl"><div class="seg" role="group" id="c-tax" aria-labelledby="lab-c-tax" data-field="tax" data-value=""><button type="button" data-v="0.08" aria-pressed="false"<%= dis %>>8% <small>軽減 · 食品</small></button><button type="button" data-v="0.1" aria-pressed="false"<%= dis %>>10% <small>標準</small></button></div><div id="cf-tax" style="flex-basis:100%"></div></div></div>
@@ -148,13 +152,13 @@
             <div class="ctl"><select class="in w-m" id="f-primary_supplier"<%= dis %>><option value="">(選ぶ)</option><% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"><%= s.code %> <%= s.name %></option><% } %></select><span class="hint">NE で必須の項目です · 発注条件グループはこの仕入先のものから選びます</span><div id="cf-supplier" style="flex-basis:100%"></div></div></div>
           <div class="subh"><svg class="ic" aria-hidden="true"><use href="#i-truck"/></svg>発送・ロジザード</div>
           <div class="f"><label class="lab" for="c-ship">発送方法<span class="opt">あとでも可</span></label>
-            <div class="ctl"><select class="in w-m" id="c-ship"<%= dis %><%= shippingRates ? '' : ' disabled' %>><option value="">(あとで)</option><% for (const r of (shippingRates || [])) { %><option value="<%= r.code %>"><%= r.code %> <%= r.method || '' %> / <%= fmt.yen(r.cost) %> 円</option><% } %></select><span class="hint">届いてサイズを見てから決めるときは空のまま</span><div id="cf-ship" style="flex-basis:100%"></div></div></div>
+            <div class="ctl"><select class="in w-m" id="c-ship"<%- part('shipping_code') %><%= dis %><%= shippingRates ? '' : ' disabled' %>><option value="">(選ぶ)</option><% for (const r of (shippingRates || [])) { %><option value="<%= r.code %>"><%= r.code %> <%= r.method || '' %> / <%= fmt.yen(r.cost) %> 円</option><% } %></select><%- none('shipping_code') %><span class="hint">届いてサイズを見てから決めるときは「入力なし」</span><div id="cf-ship" style="flex-basis:100%"></div></div></div>
           <div class="f"><label class="lab" for="c-months">推奨保有月数<span class="req">必須</span></label>
             <div class="ctl"><span class="stepper"><button type="button" data-step="-1" aria-label="1 か月へらす"<%= dis %>>−</button><input id="c-months" inputmode="decimal" placeholder="—"<%= dis %>><button type="button" data-step="1" aria-label="1 か月ふやす"<%= dis %>>＋</button></span><span class="unit">か月</span><span class="hint">0〜60 · 持たない商品は 0</span><div id="cf-months" style="flex-basis:100%"></div></div></div>
           <div class="f"><div class="lab" id="lab-c-expiry">ロジザードの有効期限の管理<span class="req">必須</span></div>
             <div class="ctl"><div class="seg" role="group" id="c-expiry" aria-labelledby="lab-c-expiry" data-field="expiry" data-value=""><button type="button" data-v="0" aria-pressed="false"<%= dis %>>なし</button><button type="button" data-v="1" aria-pressed="false"<%= dis %>>あり</button></div><span class="hint">賞味期限・使用期限のある商品は あり</span><div id="cf-expiry" style="flex-basis:100%"></div></div></div>
           <div class="f"><div class="lab" id="lab-c-inbound">ロジザードの入荷日の管理</div>
-            <div class="ctl"><div class="seg" role="group" id="c-inbound" aria-labelledby="lab-c-inbound" data-field="inbound" data-value="0"><button type="button" data-v="0" aria-pressed="true" class="on"<%= dis %>>なし</button><button type="button" data-v="1" aria-pressed="false"<%= dis %>>あり</button></div><span class="hint">最初の値だけ · あとはロジザードが正</span><div id="cf-inbound" style="flex-basis:100%"></div></div></div>
+            <div class="ctl"><div class="seg" role="group" id="c-inbound" aria-labelledby="lab-c-inbound" data-field="inbound" data-value=""<%- part('inbound_date_managed') %>><button type="button" data-v="0" aria-pressed="false"<%= dis %>>なし</button><button type="button" data-v="1" aria-pressed="false"<%= dis %>>あり</button></div><%- none('inbound_date_managed') %><span class="hint">最初の値だけ · あとはロジザードが正 · 入力なし = 不明のまま</span><div id="cf-inbound" style="flex-basis:100%"></div></div></div>
         </section>
 
         <%# 5 のつづき: 発注の設定 (今の単品の画面と同じ部品 = _order.ejs・public/me-order.js)。全部の子に同じ値 (登録の後に子ごとに発注アプリへ) %>
@@ -165,8 +169,8 @@
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-layers"/></svg></span><h2 id="h-card">出品カード (product-hub)</h2><span class="sub">5 のつづき · まとまりで 1 枚</span></div>
           <div id="card-note"></div>
           <div id="card-fields">
-            <div class="f"><label class="lab" for="official-url">公式ページ URL</label><div class="ctl"><input class="in w-l" id="official-url" placeholder="https://"<%= dis %>></div></div>
-            <div class="f"><label class="lab" for="amazon-url">Amazon URL</label><div class="ctl"><input class="in w-l" id="amazon-url" placeholder="https://www.amazon.co.jp/dp/…"<%= dis %>></div></div>
+            <div class="f" data-row="card.official_url"><label class="lab" for="official-url">公式ページ URL</label><div class="ctl"><input class="in w-l" id="official-url" placeholder="https://"<%- part('card.official_url') %><%= dis %>><%- none('card.official_url') %></div></div>
+            <div class="f" data-row="card.amazon_url"><label class="lab" for="amazon-url">Amazon URL</label><div class="ctl"><input class="in w-l" id="amazon-url" placeholder="https://www.amazon.co.jp/dp/…"<%- part('card.amazon') %><%= dis %>><%- none('card.amazon') %><span class="hint" style="flex-basis:100%">Amazon に無い商品は「入力なし」</span></div></div>
           </div>
         </section>
 
@@ -174,6 +178,9 @@
         <section class="panel" id="sec-kids" aria-labelledby="h-kids">
           <div class="panel-h"><span class="stepno" data-step="6" aria-hidden="true">6</span><h2 id="h-kids">子の一覧</h2><span class="sub">子 = 実際に売る商品 · 作る組み合わせはマス目で選ぶ · 子ごとに変えられるのは 名前・売価・原価・JAN だけ</span></div>
           <div id="kids-box"></div>
+          <%# JAN の無い子 = まとめて 1 つの「入力なし」(全部の子に JAN があれば出さない・値を入れたら外れる = me-variation.js) %>
+          <div class="f nonebar" id="row-jan-none" data-row="children.jan" hidden><div class="lab">JAN の無い子</div>
+            <div class="ctl"><span class="hint" id="jan-none-n"></span><%- none('children.jan') %><span class="hint" style="flex-basis:100%">JAN が無い商品はこのまま。入れるときは上の一覧の JAN の欄か「JAN をまとめて貼る」で</span></div></div>
         </section>
 
         <!-- 7 確かめて保存 -->
@@ -229,6 +236,8 @@
       <div class="mbtns"><button class="btn" type="button" id="confirm-no">戻って直す</button><button class="btn pri" type="button" id="confirm-yes" disabled>コードを確定して下書き保存</button></div>
     </div>
   </div>
+  <%# 並び: 入力なし (me-none) → 画面 → 発注の設定 (読み終わったら画面に数え直してもらう = MasterEdit.recount) %>
+  <% if (showForm) { %><script src="<%= base %>/public/me-none.js?v=<%= assetV %>" defer></script><% } %>
   <% if (showForm) { %><script src="<%= base %>/public/me-vops.js?v=<%= assetV %>" defer></script><script src="<%= base %>/public/me-variation.js?v=<%= assetV %>" defer></script><% } %>
   <% if (showForm && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
 </body>

@@ -946,6 +946,22 @@ const fillReq = async (p, { set = false } = {}) => {
   if (!set) { await p.click('#f-sales_class button[data-v="3"]'); await p.click('#f-expiry button[data-v="0"]'); }
   await p.fill('#f-reorder_months', '1');
 };
+/**
+ * 🆕 2026-10-13 (入力なし): 値の無い必須でない項目を全部「入力なし」にする (画面でチェックを押すのと同じ・発注条件グループ / 原料グループは「なし」)。
+ *   ほかの決まりを確かめる試験で、保存の前に使う。押した数を返す
+ */
+const noneRest = (p) => p.evaluate(() => {
+  let n = 0;
+  for (const id of ['po-cond-mode', 'po-mat-mode']) {
+    const sg = document.getElementById(id);
+    if (sg && !sg.getAttribute('data-value')) { sg.querySelector('button[data-v="none"]').click(); n++; }
+  }
+  document.querySelectorAll('input[type="checkbox"][data-none]').forEach((c) => {
+    if (c.disabled || c.checked || window.MasterEdit.none.has(c.getAttribute('data-none'))) return;
+    c.click(); n++;
+  });
+  return n;
+});
 const skuRow = async (code) => (await pg.query('select s.name, s.standard_price_jpy::int as price, s.tax_rate::float8 as tax, s.shipping_code from core.skus s where s.code = $1', [code])).rows[0];
 const mapOf = async (sku) => (await pg.query('select m.name, m.state from core.amazon_sku_maps m where m.seller_sku = $1', [sku])).rows[0];
 
@@ -954,9 +970,10 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   await Promise.all([p.waitForNavigation(), p.click('.ph-actions a:has-text("新しい単品")')]);
   assert.match(p.url(), /new\?kind=single$/);
   assert.equal(await dirty(p), 0);
-  assert.match(await p.textContent('#remain'), /あと\s*8\s*つ/);
+  // 🆕 2026-10-13 (入力なし): 必須 8 + 必須でない 18 (原価・Amazon・公式ページ・発送方法・セット商品・発注の設定 6・入荷日の管理・参考 URL・Yahoo! 5) = 26
+  assert.match(await p.textContent('#remain'), /あと\s*26\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
-  assert.match(await p.textContent('#save'), /あと 8 つ: 商品コード/);
+  assert.match(await p.textContent('#save'), /あと 26 つ: 商品コード/);
   await p.fill('#reason', '理由だけ');
   assert.equal(await dirty(p), 0, '保存の理由は数えない');
   await p.click('#checklist button:has-text("税率")');
@@ -981,26 +998,31 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   await p.waitForSelector('#code-msg.ok');
   await p.fill('#f-name', 'UI 新商品 1');
   await p.fill('#f-standard_price', '1280');
-  assert.match(await p.textContent('#save'), /あと 5 つ: 税率/);
+  assert.match(await p.textContent('#save'), /あと 23 つ: 税率/);
   await p.click('#f-tax_rate button[data-v="0.08"]');
   // 2026-10-08 中原さん: 代表の仕入先は ① (必須)・発送方法は ③ (あとでも可) = 発送方法を選んでも保存できない
   await p.selectOption('#shipping', 'S02');
-  assert.match(await p.textContent('#save'), /あと 4 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 21 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true, '代表の仕入先が無い = 押せない');
   await p.selectOption('#f-primary_supplier', '0001');
   // 🆕 0061: 売上分類・推奨保有月数・ロジザードの有効期限の管理もそろうまで押せない
-  assert.match(await p.textContent('#save'), /あと 3 つ: 売上分類/);
+  assert.match(await p.textContent('#save'), /あと 20 つ: 売上分類/);
   assert.equal(await p.isDisabled('#save'), true);
   await fillReq(p);
-  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
-  assert.equal(await p.isDisabled('#save'), false);
-  assert.equal(await p.locator('#jump a.todo').count(), 0, '飛び先の帯に黄色が残らない');
-  // 出品カードを作らない = ③ を出さない (product-hub につながない)
+  // 🆕 2026-10-13: 必須がそろっても、必須でない項目が「値」も「入力なし」も無いうちは押せない
+  assert.match(await p.textContent('#save'), /あと 17 つ: 原価/);
+  assert.equal(await p.isDisabled('#save'), true);
+  // 出品カードを作らない = ③ と Yahoo! を数えない (product-hub につながない)
   await p.click('#card-create button[data-v="0"]');
   assert.equal(await p.isHidden('#card-fields'), true);
   assert.match(await p.textContent('#checklist'), /カードを作らない/);
-  // ② (NE 登録の CSV まで) も入れる
+  assert.match(await p.textContent('#save'), /あと 8 つ: 原価/, 'カードを作らない = 原価・発注の設定 6・入荷日の管理');
+  // ② (NE 登録の CSV まで) も入れる・残りは入力なし
   await p.fill('#cost-jpy', '500');
+  await noneRest(p);
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  assert.equal(await p.isDisabled('#save'), false);
+  assert.equal(await p.locator('#jump a.todo').count(), 0, '飛び先の帯に黄色が残らない');
   assert.ok(await dirty(p) >= 6, String(await dirty(p)));
   // 離れるときの確認 (左の列・種類の札)
   await p.click('.rail a[aria-label="つかいかた"]');
@@ -1029,10 +1051,11 @@ await ta('[35b] 新商品の登録 (2026-10-08 中原さん): 発送方法を選
   await p.fill('#f-name', '発送方法なしの単品');
   await p.fill('#f-standard_price', '990');
   await p.click('#f-tax_rate button[data-v="0.1"]');
-  assert.match(await p.textContent('#save'), /あと 4 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 22 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true);
   await p.selectOption('#f-primary_supplier', '0001');
   await fillReq(p);
+  await noneRest(p);   // 🆕 2026-10-13: 発送方法も「入力なし」(届いてから)
   assert.match(await p.textContent('#remain'), /下書きを保存できます/);
   assert.match(await p.textContent('#checklist'), /発送方法 \(届いてからでも可\)/);
   assert.equal(await p.locator('#checklist li.need').count(), 0, '発送方法は ① に無い');
@@ -1064,7 +1087,7 @@ await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない�
   await pg.query("update core.products set sales_class = null where display_code = 'ui-new-1'");
   await p.goto(B + '/new?kind=set');
   assert.equal(await dirty(p), 0, '空の 2 行は数えない');
-  assert.match(await p.textContent('#remain'), /あと\s*5\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*15\s*つ/, '必須 5 + 必須でない 10 (例外原価・発送方法・Amazon・公式・参考 URL・Yahoo! 5)');
   const rows = p.locator('#comp-rows tr.comp-row');
   await rows.nth(0).locator('.c-code').fill('s001');
   await rows.nth(0).locator('.c-code').press('Enter');
@@ -1078,7 +1101,7 @@ await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない�
   assert.equal(await dirty(p), 1, '構成は 1 件 (中身どうし)');
   await rows.nth(1).locator('button[data-act="up"]').click();
   assert.equal(await rows.nth(0).locator('.c-qty').getAttribute('aria-label'), '1 行目 (s003) の数');
-  assert.match(await p.textContent('#remain'), /あと\s*4\s*つ/);
+  assert.match(await p.textContent('#remain'), /あと\s*14\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
   // 売上分類の上書き (#1628 Codex R1 M2): 構成品から導ける (3 と 1 = 1) 間は押せない
   const ovr = p.locator('#f-set_sales_class_override');
@@ -1112,6 +1135,7 @@ await ta('[36] 新商品の登録 (セット・10/5): 空の行は数えない�
   await p.fill('#f-standard_price', '1500');
   await p.selectOption('#shipping', 'S02');
   await fillReq(p, { set: true });
+  await noneRest(p);
   await rows.nth(0).locator('.c-code').fill('ui-new-1');
   await rows.nth(0).locator('.c-code').press('Tab');
   await p.waitForFunction(() => /UI 新商品 1/.test(document.querySelectorAll('#comp-rows .c-name')[0].textContent));
@@ -1144,6 +1168,7 @@ await ta('[40] 新商品の登録 (#1628 Codex R2 M2): カードを作らない�
   await p.selectOption('#shipping', 'S01');
   await p.selectOption('#f-primary_supplier', '0001');
   await fillReq(p);
+  await noneRest(p);
   await p.click('#save');
   await p.waitForSelector('.result.err');
   assert.match(await p.textContent('.result.err'), /URL/);
@@ -1195,14 +1220,16 @@ await ta('[42] 新商品 (#1628 Codex R3 M2): 「作らない」の理由の欄�
   await p.selectOption('#shipping', 'S01');
   await p.selectOption('#f-primary_supplier', '0001');
   await fillReq(p);
+  await noneRest(p);
   await p.click('#save');
   await p.waitForSelector('.result.err');
   assert.match(await p.textContent('.result.err'), /作らない理由を選んでください/);
   assert.equal(await p.locator('#row-set-reason.err').count(), 1, '理由の欄に印');
   assert.equal(await active(p), 'set-reason', '理由の欄へ');
   assert.equal(await skuRow('ui-setplan-1'), undefined);
-  // 「まだ決めない」に戻して空にすれば畳む
-  await p.click('#set-plan button[data-v=""]');
+  // 「入力なし」(前の「まだ決めない」) にして空にすれば畳む
+  await p.click('[data-row="card.set_decision"] .nonechk');
+  assert.equal(await p.getAttribute('#set-plan', 'data-value'), '', '入力なし = 選んだ値を消す');
   await p.focus('#f-name');
   await p.waitForFunction(() => document.getElementById('card-fields').hidden === true);
 });
@@ -1264,6 +1291,7 @@ await ta('[44] 新商品 (#1628 Codex R4 M2): カードを作らない + Yahoo! 
   await p.selectOption('#shipping', 'S01');
   await p.selectOption('#f-primary_supplier', '0001');
   await fillReq(p);
+  await noneRest(p);
   await p.click('#save');
   assert.match(await p.textContent('#msg'), /Yahoo!売価は 1 円以上/);
   assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), true, 'Yahoo! の欄を開く');
@@ -1445,6 +1473,7 @@ await ta('[45] 新商品 (#1628 Codex R5 L1): Yahoo! の 1 行に 2 つある欄
   for (const [id, val, re] of [['y-price-sagawa', 'abc', /Yahoo!売価 \(佐川\)/], ['y-path', 'a\tb', /Yahoo!path/]]) {
     await p.evaluate(() => { document.getElementById('sec-yahoo').open = true; });
     await p.fill('#' + id, val);
+    await noneRest(p);   // 🆕 2026-10-13: ほかの項目は入力なし (値を入れた欄は入力なしにしない)
     await p.evaluate(() => { document.getElementById('sec-yahoo').open = false; });   // 畳む
     assert.equal(await p.evaluate(() => document.getElementById('sec-yahoo').open), false);
     await p.click('#save');
@@ -2297,6 +2326,120 @@ await ta('[58] Amazon SKU の名前 (社内) が空なら NE の商品名を入�
     assert.equal(await p.inputValue('#name'), abc, '名前のある対応は変えない');
     assert.equal(await p.locator('#name-filled').count(), 0);
   } finally { await setRegUi('k003', keep); }
+});
+
+// ─── 🆕 2026-10-13 中原さん「入力なし」: 必須でない項目は 値 か 入力なし。全部そろうまで下書きの保存は押せない ───
+const regReason = async (code) => ((await pg.query('select e.reason from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = $1 order by e.event_id limit 1', [code])).rows[0] || {}).reason;
+const fillSingleReq = async (p, code) => {
+  await p.fill('#code', code);
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', '入力なしの試験 ' + code);
+  await p.fill('#f-standard_price', '1200');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#f-primary_supplier', '0001');
+  await fillReq(p);
+};
+const liOf = (p, t) => p.locator('#checklist li', { hasText: t }).first();
+
+await ta('[61] 入力なし (単品・1440): 必須がそろっても押せない・入力なしを押すと値を消して「なし」の印・値を入れるとチェックが外れる・グループの「なし」= 入力なし・Yahoo! はまとめて・全部そろうと押せる → 登録の記録 (理由) に入力なしの一覧', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await fillSingleReq(p, 'ui-none-1');
+  assert.equal(await p.isDisabled('#save'), true, '必須だけでは押せない');
+  assert.match(await p.textContent('#save'), /あと 18 つ: 原価/);
+  assert.match(await p.textContent('#checklist'), /④ そのほかの項目/);
+  // 原価: 値を入れてから「入力なし」= 値を消す・印
+  await p.fill('#cost-jpy', '300');
+  assert.equal(await liOf(p, '原価').getAttribute('class'), 'done opt');
+  await p.click('[data-row="cost"] .nonechk');
+  assert.equal(await p.inputValue('#cost-jpy'), '', '入力なし = 値を消す');
+  assert.equal(await p.isChecked('[data-none="cost"]'), true);
+  assert.match(await p.getAttribute('[data-row="cost"]', 'class'), /isnone/);
+  assert.match(await p.getAttribute('[data-row="cost"] .nonechk', 'class'), /\bon\b/);
+  assert.match(await liOf(p, '原価').getAttribute('class'), /\bnone\b/);
+  assert.match(await liOf(p, '原価').textContent(), /なし[\s\S]*入力なし/);
+  // 値を入れると入力なしは自動で外れる (両方は持たない)
+  await p.fill('#cost-jpy', '250');
+  assert.equal(await p.isChecked('[data-none="cost"]'), false, '値を入れたらチェックが外れる');
+  assert.ok(!/isnone/.test(await p.getAttribute('[data-row="cost"]', 'class')));
+  await p.fill('#cost-jpy', '');
+  assert.match(await liOf(p, '原価').getAttribute('class'), /todo/, '値を消しただけ = まだ (入力なしにはならない)');
+  // ASIN / Amazon URL: どちらかに値 = 入力なしが外れる
+  await p.click('[data-row="card.amazon_url"] .nonechk');
+  assert.equal(await p.isChecked('[data-none="card.amazon"]'), true);
+  await p.fill('#asin', 'B0UINONE01');
+  assert.equal(await p.isChecked('[data-none="card.amazon"]'), false, 'ASIN を入れたら Amazon の入力なしが外れる');
+  // 切り替え (入荷日の管理): 入力なし → 「あり」を押すと外れる・入力なしを押すと選んだのを消す
+  await p.click('[data-row="inbound_date_managed"] .nonechk');
+  await p.click('#f-inbound button[data-v="1"]');
+  assert.equal(await p.isChecked('[data-none="inbound_date_managed"]'), false);
+  await p.click('[data-row="inbound_date_managed"] .nonechk');
+  assert.equal(await p.getAttribute('#f-inbound', 'data-value'), '');
+  // 発注条件グループ = 「なし」が入力なし (右の一覧も「なし」)
+  await p.click('#po-cond-mode button[data-v="none"]');
+  assert.match(await liOf(p, '発注条件グループ').getAttribute('class'), /\bnone\b/);
+  // Yahoo! は「空の欄を全部『入力なし』にする」で 5 つ (値のある欄はそのまま)
+  await p.click('#sec-yahoo > summary');
+  await p.fill('#y-price', '1500');
+  await p.click('#sec-yahoo [data-none-all]');
+  assert.deepEqual(await p.evaluate(() => ['card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'].map((k) => document.querySelector(`[data-none="${k}"]`).checked)), [false, true, true, true, true]);
+  assert.equal(await p.inputValue('#y-price'), '1500', '値のある欄は入力なしにしない');
+  // 押す所は 44px 以上
+  const small = await p.evaluate(() => [...document.querySelectorAll('.nonechk')].filter((x) => x.offsetParent !== null).map((x) => x.getBoundingClientRect()).filter((r) => r.height < 44 || r.width < 44).length);
+  assert.equal(small, 0, '入力なしの押す所が 44px より小さい');
+  // 残りを入力なしにする前は押せない → 全部そろうと押せる
+  assert.equal(await p.isDisabled('#save'), true);
+  await p.fill('#cost-jpy', '480');
+  await noneRest(p);
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  assert.equal(await p.locator('#checklist li.todo').count(), 0);
+  const bodies = [];
+  p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url())) bodies.push(JSON.parse(rq.postData())); });
+  await Promise.all([p.waitForURL(/\/sku\/ui-none-1$/), p.click('#save')]);
+  // 送る印 = サーバーと同じ並び (lib/master-register-blanks.mjs の BLANK_KEYS)
+  assert.deepEqual(bodies[0].blanks, ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit',
+    'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.reference_urls', 'card.set_decision', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
+  assert.equal(await regReason('ui-none-1'), '新商品の登録 · 入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量・発送方法・入荷日の管理・公式ページURL・参考URL・セット商品・Yahoo!売価(佐川)・Yahoo!配送方法・Yahoo!カテゴリID・Yahoo!path');
+  assert.deepEqual(await skuRow('ui-none-1'), { name: '入力なしの試験 ui-none-1', price: 1200, tax: 0.1, shipping_code: null });
+});
+
+await ta('[62] 入力なし (スマホ 390): 横にはみ出さない・押す所は 44px・押すと入力なし・下の帯から保存まで', async (p) => {
+  await p.goto(B + '/new?kind=single');
+  await fillSingleReq(p, 'ui-none-390');
+  // 🚨 単品の登録の画面は前から 390 幅では上の帯 (ログインの名前)・円の欄・参考 URL の行が少しはみ出す (携帯向けに作っていない・この PR の外)。
+  //    ここでは「入力なし」の札と「まとめて入力なし」がはみ出さない・小さくないことを見る (まとまりの画面は [📱390] が全体を見る)
+  const out0 = await p.evaluate(() => [...document.querySelectorAll('.nonebulk, .refsfoot')].filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > document.documentElement.clientWidth + 1).length);
+  assert.equal(out0, 0, '「まとめて入力なし」の行がはみ出す');
+  const small = await p.evaluate(() => [...document.querySelectorAll('.nonechk')].filter((x) => x.offsetParent !== null).map((x) => x.getBoundingClientRect()).filter((r) => r.height < 44 || r.width < 44).length);
+  assert.equal(small, 0, '入力なしの押す所が 44px より小さい');
+  const out = await p.evaluate(() => [...document.querySelectorAll('.nonechk')].filter((x) => x.offsetParent !== null).filter((x) => { const r = x.getBoundingClientRect(); return r.right > document.documentElement.clientWidth + 1; }).length);
+  assert.equal(out, 0, '入力なしが画面の外');
+  await p.click('[data-row="shipping_code"] .nonechk');
+  assert.equal(await p.isChecked('[data-none="shipping_code"]'), true);
+  await noneRest(p);
+  await p.click('#savebox-toggle');
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  await Promise.all([p.waitForURL(/\/sku\/ui-none-390$/), p.click('#save')]);
+  assert.match(await regReason('ui-none-390'), /入力なし: 原価・/);
+}, { width: 390, height: 844 });
+
+await ta('[63] 入力なし (セット): 例外原価 (例外のときの欄) も 値か入力なし・カードを作らない = カードの欄は数えない・記録に残る', async (p) => {
+  await p.goto(B + '/new?kind=set');
+  const rows = p.locator('#comp-rows tr.comp-row');
+  await rows.nth(0).locator('.c-code').fill('s001'); await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /単品 1/.test(document.querySelector('#comp-rows .c-name').textContent));
+  await p.fill('#code', 'ui-none-set');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', '入力なしのセット');
+  await p.fill('#f-standard_price', '2400');
+  await fillReq(p, { set: true });
+  await p.click('#card-create button[data-v="0"]');
+  assert.match(await p.textContent('#save'), /あと 2 つ: 発送方法|あと 2 つ: 例外原価/, 'カードを作らない = 例外原価・発送方法の 2 つ');
+  await p.click('#sec-comp details.more > summary');
+  await p.click('[data-row="exception_cost"] .nonechk');
+  await p.click('[data-row="shipping_code"] .nonechk');
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  await Promise.all([p.waitForURL(/\/sku\/ui-none-set$/), p.click('#save')]);
+  assert.equal(await regReason('ui-none-set'), '新商品の登録 · 入力なし: 例外原価・発送方法');
 });
 
 await browser.close();

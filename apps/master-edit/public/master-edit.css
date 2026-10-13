@@ -688,6 +688,23 @@ details.adv[open] > summary { border-color: var(--line-strong); color: #fff; }
 .checklist li.opt .mark { border-style: dashed; }
 .checklist .grp2 { font-size: 13px; color: var(--text2); font-weight: 600; padding: 10px 10px 2px; display: flex; justify-content: space-between; gap: 6px; }
 .checklist .grp2 span { color: var(--muted); font-weight: 400; font-size: 12px; }
+/* 🆕 2026-10-13「入力なし」(public/me-none.js): 必須でない項目 = 値か入力なし。押す所は 44px・押すと光る・行の欄は薄く・右の一覧は「なし」 */
+.nonechk { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; min-width: 44px; padding: 0 12px; border-radius: 11px; border: 1px dashed rgba(160, 190, 240, 0.32); background: rgba(255, 255, 255, 0.025); color: var(--text2); font-size: 13.5px; cursor: pointer; user-select: none; white-space: nowrap; transition: background .15s, border-color .15s, color .15s; }
+.nonechk:hover { border-color: rgba(139, 155, 255, 0.7); color: #fff; }
+.nonechk input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent2); cursor: pointer; flex: none; }
+.nonechk.on { border-style: solid; border-color: rgba(139, 155, 255, 0.75); background: rgba(139, 155, 255, 0.16); color: #fff; box-shadow: inset 0 0 14px rgba(139, 155, 255, 0.18), 0 0 12px rgba(139, 155, 255, 0.18); }
+.nonechk:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.nonechk:has(input:disabled) { opacity: 0.4; cursor: not-allowed; }
+.f.isnone .in, .f.isnone .seg, .f.isnone .stepper, .f.isnone .yen { opacity: 0.45; }
+.f.isnone .nonechk { opacity: 1; }
+.nonebulk { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 4px 0 8px; }
+.nonebulk .btn { min-height: 44px; }
+.refsfoot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.checklist li.none .mark { border-color: var(--accent2); background: rgba(139, 155, 255, 0.14); color: var(--accent2); font-size: 9.5px; font-weight: 700; letter-spacing: -0.02em; }
+.checklist li.none .lbl { color: var(--text2); }
+/* スマホの幅: 新商品の登録の欄は 見出しの下に欄 (横に並べると「入力なし」が画面の外に出る・まとまりの画面 = me-variation.css と同じ) */
+@media (max-width: 760px) { #new-page form.edit .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #new-page .urlrow { min-width: 0; } #new-page .urlrow .ref-url { min-width: 0; flex: 1; } }
+.checklist .nonetag { margin-left: auto; font-size: 11.5px; color: var(--accent2); border: 1px solid rgba(139, 155, 255, 0.45); border-radius: 6px; padding: 0 6px; line-height: 18px; white-space: nowrap; }
 .after-steps { list-style: none; display: grid; margin-top: 4px; font-size: 13px; color: var(--muted); }
 .after-steps li { position: relative; padding: 0 0 10px 22px; }
 .after-steps li::before { content: ""; position: absolute; left: 5px; top: 7px; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--faint); }

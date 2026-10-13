@@ -127,8 +127,26 @@ async function fillCommon(p, { price = '12800', cost = '5200', tax = '0.1', sale
   await p.selectOption('#f-primary_supplier', sup); await p.selectOption('#c-ship', ship);
   await fill(p, '#c-months', months); await p.click(`#c-expiry button[data-v="${expiry}"]`);
 }
-/** 保存 = 確かめの窓 (直せない 3 つにチェック) → 保存 → 結果 */
+/**
+ * 🆕 2026-10-13 (入力なし): 値の無い必須でない項目を全部「入力なし」にする (画面でチェックを押すのと同じ・発注条件グループ / 原料グループは「なし」)。
+ *   ほかの決まりを確かめる試験で、保存の前に使う
+ */
+const noneRest = (p) => p.evaluate(() => {
+  let n = 0;
+  for (const id of ['po-cond-mode', 'po-mat-mode']) {
+    const sg = document.getElementById(id);
+    if (sg && !sg.getAttribute('data-value')) { sg.querySelector('button[data-v="none"]').click(); n++; }
+  }
+  document.querySelectorAll('input[type="checkbox"][data-none]').forEach((c) => {
+    if (c.disabled || c.checked || window.MasterEdit.none.has(c.getAttribute('data-none'))) return;
+    c.click(); n++;
+  });
+  return n;
+});
+/** 保存 = 確かめの窓 (直せない 3 つにチェック) → 保存 → 結果。残りの必須でない項目は「入力なし」にしてから */
 async function saveViaConfirm(p) {
+  await settle(p);
+  await noneRest(p);
   await settle(p);
   assert.equal(await p.isDisabled('#save2'), false, JSON.stringify(await info(p)));
   await p.click('#save2');
@@ -228,6 +246,8 @@ await ta('[②] 今あるまとまりに新色 (売価が 2 種類): 探して�
   assert.ok(i0.issues.some((x) => /売価 \(今ある子で 2 種類・選ぶ\)/.test(x)), JSON.stringify(i0.issues));
   await shot(p, '7-add-conflict', '#sec-common');
   await p.click('[data-cf="price"][data-v="3980"]');
+  await settle(p);
+  await noneRest(p);   // 🆕 2026-10-13: 必須でない項目は「入力なし」
   await settle(p);
   assert.equal((await info(p)).save, 'enabled');
   assert.match(await p.innerText('#opt-eq'), /今ある 3 件は変えません/);
@@ -350,7 +370,8 @@ await ta('[⑥b] 1 つのファイルの上限 (試験は 136 行) を超える:
     // API も断る (画面を通らない送り方でも・何も保存しない)
     const before = (await kidsOf('roomwear2')).length;
     const gid = (await one("select group_product_id::text as id from ops.variation_group_codes where code_norm = 'roomwear2'")).id;
-    const r = await p.evaluate(async ([base, gid]) => { const x = await fetch(base + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), group: { mode: 'add', product_id: gid }, options: [{ axis: 1, code: '-ZZ', name: 'テスト色' }], children: ['-S', '-M', '-L'].map((v) => ({ code: 'roomwear2-ZZ' + v, choices: { 1: '-ZZ', 2: v }, name: 'x' + v })), values: { standard_price: '2980', cost: { jpy: '1200' }, tax_rate: '0.1', sales_class: '3', primary_supplier: '0034', reorder_months: '2', expiry_managed: '0', inbound_date_managed: '0' } }) }); return [x.status, (await x.json()).reason]; }, [B, gid]);
+    const r = await p.evaluate(async ([base, gid]) => { const x = await fetch(base + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), group: { mode: 'add', product_id: gid }, options: [{ axis: 1, code: '-ZZ', name: 'テスト色' }], children: ['-S', '-M', '-L'].map((v) => ({ code: 'roomwear2-ZZ' + v, choices: { 1: '-ZZ', 2: v }, name: 'x' + v })), values: { standard_price: '2980', cost: { jpy: '1200' }, tax_rate: '0.1', sales_class: '3', primary_supplier: '0034', reorder_months: '2', expiry_managed: '0', inbound_date_managed: '0' },
+      blanks: ['shipping_code', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan'] }) }); return [x.status, (await x.json()).reason]; }, [B, gid]);
     assert.deepEqual(r, [409, 'variation_pending_too_many']);
     assert.equal((await kidsOf('roomwear2')).length, before);
     // NE 登録の CSV の画面: 上限 14 行 = roomwear2 (2 回・135 行) も hakama (1 回・15 行) も作れない → 理由と手順・ボタンは押せない
@@ -425,7 +446,8 @@ await ta('[⑧] 空から: あと N つ・7 の確かめは「まだ入れてい
     assert.match(await p.innerText('#gate-note'), /まだ選べません/);
     assert.ok(await p.locator('#code').isVisible(), '単品の欄は今までどおり');
     // API も断る (DB が持ち主を見る)
-    const r = await p.evaluate(async (base) => (await fetch(base + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), group: { mode: 'new', code: 'gx', name: 'x' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-A', name: 'A' }], children: [{ code: 'gx-A', choices: { 1: '-A' }, name: 'x' }], values: { standard_price: '1', tax_rate: '0.1', sales_class: '1', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0' } }) })).json(), B);
+    const r = await p.evaluate(async (base) => (await fetch(base + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), group: { mode: 'new', code: 'gx', name: 'x' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-A', name: 'A' }], children: [{ code: 'gx-A', choices: { 1: '-A' }, name: 'x' }], values: { standard_price: '1', tax_rate: '0.1', sales_class: '1', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0' },
+      blanks: ['cost', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan'] }) })).json(), B);
     assert.equal(r.reason, 'parent_not_company');
     // 🆕 #1679 Codex R1 Low: 読むだけのまとまりの API (探す・1 つを読む・確かめる) も同じ持ち主の門で閉じる
     assert.deepEqual(await readApis(p), [[409, 'parent_not_company'], [409, 'parent_not_company'], [409, 'parent_not_company']]);
@@ -450,6 +472,69 @@ await ta('[+] 商品の画面の代表 (親) = 見るだけ (保存の欄が無�
   await p.goto(B + '/new?kind=set');
   await p.click('.kindcard[data-kind="variation"]');
   await p.waitForURL(/kind=variation/);
+});
+
+console.log('\n入力なし (2026-10-13)');
+await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発送方法・入荷日の管理・発注の設定・公式ページ URL・Amazon URL・JAN の無い子) は 値か入力なし・値を入れると外れる・JAN が全部そろうと JAN の行は消える・確かめの窓に一覧・記録 (理由) に残る・印の無い API は 400', async (p) => {
+  await p.goto(B + '/new?kind=variation');
+  assert.equal(await p.getAttribute('#c-inbound', 'data-value'), '', '入荷日の管理は初めは選ばない形');
+  await newGroup(p, { code: 'nonegrp', name: '入力なしの試験', h: 'カラー', hl: 'ホワイト / -WH\nブラック / -BK' });
+  await fillCommon(p, { cost: '', ship: '' });
+  await settle(p);
+  let i0 = await info(p);
+  assert.equal(i0.save, 'disabled');
+  for (const re of [/^原価 \(値か「入力なし」\)/, /^発送方法 \(値か「入力なし」\)/, /^ロジザードの入荷日の管理 \(値か「入力なし」\)/, /^発注の設定: 発注ロット \(値か「入力なし」\)/,
+    /^公式ページ URL \(値か「入力なし」\)/, /^Amazon URL \(値か「入力なし」\)/, /^JAN の無い子 \(2 件\) \(値か「入力なし」\)/]) assert.ok(i0.issues.some((x) => re.test(x)), re + ' ' + JSON.stringify(i0.issues));
+  // 原価: 入力なし → 値を入れると外れる
+  await p.click('#sec-common .f:has(#c-cost) .nonechk');
+  await settle(p);
+  assert.ok(!(await info(p)).issues.some((x) => /^原価/.test(x)), '入力なしにした原価は数えない');
+  await fill(p, '#c-cost', '900');
+  assert.equal(await p.isChecked('[data-none="cost"]'), false, '値を入れたらチェックが外れる');
+  await fill(p, '#c-cost', '');
+  await settle(p);
+  assert.ok((await info(p)).issues.some((x) => /^原価/.test(x)), '値を消しただけ = まだ');
+  // 入荷日の管理: 入力なし = 選んだのを消す
+  await p.click('#c-inbound button[data-v="1"]');
+  await p.click('#sec-common .f:has(#c-inbound) .nonechk');
+  assert.equal(await p.getAttribute('#c-inbound', 'data-value'), '');
+  // JAN: 1 件だけ入れても行は出たまま・全部の子に入れると行が消えてチェックも外れる
+  assert.equal(await p.isHidden('#row-jan-none'), false);
+  await p.click('#row-jan-none .nonechk');
+  await settle(p);
+  assert.ok(!(await info(p)).issues.some((x) => /^JAN の無い子/.test(x)));
+  await fill(p, '#kids-box .krow[data-key="-wh|"] [data-k="jan"]', jan13('458012349001'));
+  await fill(p, '#kids-box .krow[data-key="-bk|"] [data-k="jan"]', jan13('458012349002'));
+  await settle(p);
+  assert.equal(await p.isHidden('#row-jan-none'), true, '全部の子に JAN = 行を出さない');
+  assert.equal(await p.isChecked('[data-none="children.jan"]'), false, '全部の子に JAN = チェックを外す (両方は持たない)');
+  await fill(p, '#kids-box .krow[data-key="-bk|"] [data-k="jan"]', '');
+  await settle(p);
+  assert.ok((await info(p)).issues.some((x) => /^JAN の無い子 \(1 件\)/.test(x)), '1 件消すとまた聞く');
+  // 押す所は 44px
+  const small = await p.evaluate(() => [...document.querySelectorAll('.nonechk')].filter((x) => x.offsetParent !== null).map((x) => x.getBoundingClientRect()).filter((r) => r.height < 44 || r.width < 44).length);
+  assert.equal(small, 0);
+  // 印の無い API (古い画面) = 400 (どの項目か)・何も書かない
+  const raw = await p.evaluate(async (base) => { const r = await fetch(base + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), group: { mode: 'new', code: 'nonegrp', name: 'x' }, axes: [{ axis: 1, name: 'カラー' }], options: [{ axis: 1, code: '-WH', name: 'ホワイト' }], children: [{ code: 'nonegrp-WH', choices: { 1: '-WH' }, name: 'x' }], values: { standard_price: '1', tax_rate: '0.1', sales_class: '1', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0' } }) }); return [r.status, await r.json()]; }, B);
+  assert.deepEqual([raw[0], raw[1].reason, raw[1].field, raw[1].screen_outdated], [400, 'blank_unmarked', 'cost', true], JSON.stringify(raw));
+  assert.equal((await kidsOf('nonegrp')).length, 0);
+  // 残りを入力なし → 確かめの窓に「入力なし」の一覧 → 保存 → 子の登録の記録 (理由) に残る
+  await noneRest(p);
+  await settle(p);
+  assert.equal((await info(p)).save, 'enabled', JSON.stringify(await info(p)));
+  await p.click('#save2');
+  await p.waitForSelector('#confirm-bg.on');
+  assert.match(await p.innerText('#confirm-body'), /入力なし\s*原価・発送方法・ロジザードの入荷日の管理・発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量 \/ 個・公式ページ URL・Amazon URL か ASIN・JAN \(JAN の無い子\)/);
+  await p.check('#fix-ok');
+  const bodies = [];
+  p.on('request', (rq) => { if (/\/api\/new\/variation$/.test(rq.url())) bodies.push(JSON.parse(rq.postData())); });
+  await p.click('#confirm-yes');
+  await p.waitForSelector('#result .result', { timeout: 60000 });
+  assert.match(await p.innerText('#result'), /2 件を下書きにしました/);
+  assert.deepEqual(bodies[0].blanks, ['cost', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan']);
+  const reasons = await q(`select distinct e.reason from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK')`);
+  assert.deepEqual(reasons.map((r) => r.reason), ['新商品の登録 (色違い・サイズ違い) · 入力なし: 原価・発送方法・入荷日の管理・発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量・公式ページURL・Amazon・JAN']);
+  assert.equal((await one("select inbound_date_managed from core.products where display_code = 'nonegrp-WH'")).inbound_date_managed, null, '入荷日の管理を入力なし = 不明のまま');
 });
 
 console.log('\nまとまりの操作 (PR-7b)');
