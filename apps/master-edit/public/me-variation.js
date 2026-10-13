@@ -63,6 +63,7 @@
   var NONE_ITEMS = [['cost', '原価', '#c-cost', 'cost'], ['shipping_code', '発送方法', '#c-ship', 'ship'], ['inbound_date_managed', 'ロジザードの入荷日の管理', '#c-inbound button', 'inbound']];
   var NONE_CARD = [['card.official_url', '公式ページ URL', '#official-url'], ['card.amazon', 'Amazon URL', '#amazon-url']];
   var janAll = false;   // 作る子が全部 JAN を持つ (= JAN の「入力なし」は要らない)
+  var costAll = false;  // 作る子が全部 実際の原価 (子だけの原価 か 共通の原価) を持つ
 
   // ---------- 画面の状態 ----------
   var fresh = function () {
@@ -279,6 +280,7 @@
     var n = live.length;
     // 🆕 2026-10-13: 必須でない項目 = 値か「入力なし」。どちらでもない = まだ入れていない (保存できない)
     janAll = n > 0 && live.every(function (k) { return !!k.jan; });
+    costAll = n > 0 ? live.every(function (k) { var c = k.cv !== null ? k.cv : cc; return c !== null && !Number.isNaN(c); }) : (cc !== null && !Number.isNaN(cc));
     var noneKeys = [];
     if (ME.none) {
       ME.none.refresh();
@@ -783,6 +785,9 @@
   var M = null;
   var busy = false;
   if (ME.none) ME.none.define('children.jan', { has: function () { return janAll; }, clear: false });
+  // 🆕 #1706 Codex R1 M1: 原価 = 子ごとの実際の原価 (子だけの原価 か 共通の原価)。全部の子にある = 値 (入力なしは外れる)・無い子がある = 入力なしが要る
+  //   (記録は原価の無い子だけ = サーバーが子ごとの理由を作る)。入力なしを押すと共通の原価だけ消す (子だけの原価は残す)
+  if (ME.none) ME.none.define('cost', { has: function () { return costAll; } });
   ME.recount = function () { if (!S.done) light(); };   // 発注の設定の部品 (後から読む) が読み終わったとき
   function update() { M = model(); renderAnat(M); renderOpts(M); renderCommon(M); renderKids(M); renderChecks(M); renderHud(M); renderMisc(M); scheduleCheck(M); }
   function light() { M = model(); refreshKids(M); renderChecks(M); renderHud(M); renderMisc(M); scheduleCheck(M); }

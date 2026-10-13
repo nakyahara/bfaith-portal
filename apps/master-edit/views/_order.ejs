@@ -15,7 +15,8 @@
   const condMode = cur.condition_id ? 'pick' : (mode === 'new' ? '' : 'none');
   const matMode = cur.material_group_id ? 'pick' : (mode === 'new' ? '' : 'none');
   // 新商品の登録の「入力なし」(public/me-none.js・サーバー = lib/master-register-blanks.mjs と同じ名前)。商品の画面には出さない
-  const noneOn = mode === 'new' && !ro;
+  //   出すかどうかは API と同じ関数 (order-settings.mjs の orderNoneApplies = #1706 Codex R1 M2)。渡されていない画面 = 出さない
+  const noneOn = mode === 'new' && !ro && typeof orderNoneApplies === 'function' && orderNoneApplies(os);
   const none = (key, label) => (noneOn ? '<label class="nonechk"><input type="checkbox" data-none="order_settings.' + key + '" aria-label="' + hh(label) + 'を入力なしにする"><span>入力なし</span></label>' : '');
   const part = (key) => (noneOn ? ' data-none-part="order_settings.' + key + '"' : '');
   const segPo = (id, value, opts, label) => '<div class="seg" role="group" id="' + id + '" aria-label="' + hh(label) + '" data-value="' + value + '"' + track(id, label) + '>'
@@ -23,7 +24,7 @@
   const num = (v) => (v == null ? '' : String(v));
   const condLabel = (c) => c.id + ' — ' + (c.name || '') + (c.supplier ? ' (仕入先 ' + c.supplier + ')' : '');
   const pageData = d ? {
-    mode, base, code: code || null, canWrite: !ro, supplier: sup || null,
+    mode, base, code: code || null, canWrite: !ro, noneOn, supplier: sup || null,
     seen: d.row ? d.row.updated_at : null,
     conditions: d.conditions.map((c) => ({ id: c.id, supplier: c.supplier })),
     lotSource: d.lotSource, neLot: d.neLot,

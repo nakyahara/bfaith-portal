@@ -2542,6 +2542,68 @@ await ta('[BL4] 画面とつかいかた: 新商品の画面に「入力なし�
   assert.ok(!m.text.includes('空の欄を全部'), 'つかいかたに、外したまとめてのボタンが残っている');
 });
 
+await ta('[BL5] #1706 Codex R1: まとまりの原価は子ごとの実際の原価 (子に原価があれば入力なしと両立しない・記録は原価 / JAN の無い子だけ)・発注の設定は画面と API で同じ答え (読めない = 画面に欄が無い = API も聞かない)・blanks: null は断る', async () => {
+  const MV = await import('../lib/master-variation.mjs');
+  const { orderNoneApplies } = await import('../apps/master-edit/order-settings.mjs');
+  const vb = (kids, cost) => ({ values: { standard_price: '1', ...(cost == null ? {} : { cost: { jpy: cost } }) }, card: {}, children: kids });
+  // M1: 共通の原価なし + 子だけの原価が全部 = 値がある (入力なしは両立しない)・1 つでも無い子 = 入力なしが要る・共通の原価 = 全部の子にある
+  const two = (a, b) => [{ code: 'g-A', cost: a, jan: '' }, { code: 'g-B', cost: b, jan: '' }];
+  assert.ok(!BLK.missingBlankKeys('variation', vb(two('100', '200'))).includes('cost'), '全部の子に子だけの原価 = 値');
+  assert.ok(BLK.missingBlankKeys('variation', vb(two('100', ''))).includes('cost'), '原価の無い子がある = 入力なしが要る');
+  assert.ok(!BLK.missingBlankKeys('variation', vb(two('', ''), '300')).includes('cost'), '共通の原価 = 全部の子にある');
+  assert.ok(!BLK.missingBlankKeys('variation', vb([], '300')).includes('cost'), '子がまだ無い = 共通の原価で見る');
+  const err = (fn) => { try { fn(); } catch (e) { return e; } assert.fail('断らなかった'); };
+  const others = ['shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'children.jan'];
+  let e = err(() => BLK.checkRegisterBlanks('variation', { ...vb(two('100', '200')), blanks: ['cost', ...others] }));
+  assert.deepEqual([e.status, e.reason, e.extra.field], [400, 'blank_with_value', 'cost'], '子に全部原価があるのに「入力なし: 原価」= 断る');
+  assert.deepEqual(BLK.checkRegisterBlanks('variation', { ...vb(two('100', '')), blanks: ['cost', ...others] }), ['cost', ...others]);
+  // 子ごとの理由: 原価・JAN は その子に無いときだけ
+  const body = { ...vb([{ code: 'g-A', cost: '100', jan: '4901234567894' }, { code: 'g-B', cost: '', jan: '' }]), reason: '秋' };
+  const pre = BLK.prepareRegisterBody('variation', { ...body, blanks: ['cost', ...others] });
+  assert.equal(pre.ok, true, JSON.stringify(pre.json));
+  assert.equal(pre.body.reason, '秋 · 入力なし: 原価・発送方法・入荷日の管理・公式ページURL・Amazon・JAN');
+  assert.deepEqual(pre.childReasons, { 'g-A': '秋 · 入力なし: 発送方法・入荷日の管理・公式ページURL・Amazon', 'g-B': '秋 · 入力なし: 原価・発送方法・入荷日の管理・公式ページURL・Amazon・JAN' });
+  assert.equal(BLK.prepareRegisterBody('single', { ...blankBody('x'), blanks: BLK.missingBlankKeys('single', blankBody('x')) }).childReasons, null, '単品に子ごとの理由は無い');
+  // lib の子ごとの理由: 子ごとに使う・無い登録のハッシュは前と同じ・知らない子は断る
+  const vin = { actor: 'a@test', requestId: uuid(), group: { mode: 'new', code: 'g', name: 'G' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-A', name: 'A' }, { axis: 1, code: '-B', name: 'B' }],
+    children: [{ code: 'g-A', choices: { 1: '-A' }, name: 'a' }, { code: 'g-B', choices: { 1: '-B' }, name: 'b' }],
+    values: { standard_price: '1', tax_rate: '0.1', sales_class: '1', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0' } };
+  const r0 = MV.parseVariationRequest(vin);
+  const r1 = MV.parseVariationRequest({ ...vin, childReasons: { 'g-A': 'x · 入力なし: 原価', 'G-B': 'y' } });
+  assert.equal(r0.childReasons, null);
+  assert.deepEqual(r1.childReasons, { 'g-a': 'x · 入力なし: 原価', 'g-b': 'y' });
+  assert.notEqual(MV.variationPayloadHashOf(r1), MV.variationPayloadHashOf(r0), '子ごとの理由は要求のハッシュに入る');
+  assert.equal(MV.variationPayloadHashOf(MV.parseVariationRequest({ ...vin, childReasons: {} })), MV.variationPayloadHashOf(r0), '空 = 前と同じハッシュ');
+  assert.notEqual(MV.__forTest.childPayloadHash(r1, r1.children[0]), MV.__forTest.childPayloadHash(r0, r0.children[0]), '子の記録のハッシュも子ごとの理由で変わる');
+  e = err(() => MV.parseVariationRequest({ ...vin, childReasons: { 'g-Z': 'x' } }));
+  assert.deepEqual([e.status, e.extra.field], [400, 'reason']);
+  // L1: blanks: null・文字・オブジェクト = 断る (古い画面 = 送らない とは別)
+  for (const bad of [null, 'cost', { cost: true }, 1]) {
+    e = err(() => BLK.checkRegisterBlanks('single', { ...blankBody('x'), blanks: bad }));
+    assert.deepEqual([e.status, e.reason, e.extra.field], [400, 'blank_unknown', 'blanks'], JSON.stringify(bad));
+  }
+  let r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl-null-1'), blanks: null }, blanks: 'raw' });
+  assert.deepEqual([r.status, r.j.reason], [400, 'blank_unknown'], r.text);
+  // M2: 画面と API で同じ答え (orderNoneApplies)
+  assert.equal(orderNoneApplies({ canSee: true, canWrite: true, data: { ok: true } }), true);
+  for (const os of [null, { canSee: false, canWrite: false, data: null }, { canSee: true, canWrite: false, data: { ok: true } }, { canSee: true, canWrite: true, data: { ok: false } }]) assert.equal(orderNoneApplies(os), false, JSON.stringify(os));
+  // 発注アプリの権限はあるが設定を読めない = 画面に発注の設定の「入力なし」が無い → API も聞かない (前は必ず blank_unmarked)
+  podb.exec('ALTER TABLE po_material_groups RENAME TO po_material_groups_regall');
+  try {
+    const page = await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' });
+    assert.equal(page.status, 200);
+    assert.ok(!page.text.includes('data-none="order_settings.'), '読めない = 発注の設定の「入力なし」を出さない');
+    const nb = blankBody('bl-po-unread', { card: { create: false } });
+    r = await call('POST', '/apps/master-edit/api/new', { body: { ...nb, blanks: ['cost', 'shipping_code', 'inbound_date_managed'] }, session: 'po-editor', blanks: 'raw' });
+    assert.equal(r.status, 200, r.text);
+  } finally { podb.exec('ALTER TABLE po_material_groups_regall RENAME TO po_material_groups'); }
+  // 読める = 画面に出る = API も聞く
+  const page2 = await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' });
+  assert.ok(page2.text.includes('data-none="order_settings.order_lot"'));
+  r = await call('POST', '/apps/master-edit/api/new', { body: { ...blankBody('bl-po-read', { card: { create: false } }), blanks: ['cost', 'shipping_code', 'inbound_date_managed'] }, session: 'po-editor', blanks: 'raw' });
+  assert.deepEqual([r.status, r.j.field], [400, 'order_settings.order_lot'], r.text);
+});
+
 server.close();
 try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch { /* Windows で開いたままのことがある */ }
 console.log(`\n${passed} 件 ok`);

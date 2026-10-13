@@ -431,7 +431,15 @@ app.use('/apps/purchase-orders', express.json({ limit: '1mb' }), POR);
 const server = http.createServer(app);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const ORIGIN = `http://127.0.0.1:${server.address().port}`;
-const call = async (method, url, body) => {
+/**
+ * 🆕 #1706 (入力なし): 新商品の登録の API は、必須でない項目ごとに「値」か「入力なし」(blanks) が要る。
+ *   この試験の登録は、値の無い項目を全部「入力なし」にして送る (画面で全部「入力なし」を押したのと同じ)
+ */
+const RB = await import('../lib/master-register-blanks.mjs');
+const NEW_API_RE = /\/apps\/master-edit\/api\/new(\/variation)?$/;
+const call = async (method, url, body0) => {
+  const m = method === 'POST' && body0 && typeof body0 === 'object' && body0.blanks === undefined ? NEW_API_RE.exec(url) : null;
+  const body = m ? { ...body0, blanks: RB.missingBlankKeys(m[1] ? 'variation' : body0.kind, body0, { orderApplicable: true }) } : body0;
   const r = await fetch(ORIGIN + url, { method, headers: { Accept: 'application/json', Origin: ORIGIN, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await r.text(); let j = null; try { j = JSON.parse(text); } catch { /* HTML */ }
   return { status: r.status, text, j };
@@ -490,15 +498,19 @@ await ta('[R2] (Codex #1703 R1 L1) migration の後・ロールの流し直し�
 await ta('[R3] (Codex #1703 R2 M) 0075 の後に発注の設定なしで登録 → 同じ request_id に発注の設定を足して押し直す = 違う中身 (mismatch・黙って書かない)・単品もまとまりも', async () => {
   const sb = { request_id: uuid(), kind: 'single', code: 'posync-r3', card: { create: false }, values: { name: '設定なし', ...VALUES } };
   assert.equal((await call('POST', '/apps/master-edit/api/new', sb)).status, 200);
+  // 🆕 #1706 (入力なし): 発注ロットを足す = 「入力なし: 発注ロット」が消える = 登録の理由 (要求のハッシュ) も違う = 登録の段で 409 (何も書かない)。
+  //   値だけ変える押し直し (理由が同じ) は今までどおり発注の設定の照らし合わせ (mismatch) = R1 の r4
   const r = await call('POST', '/apps/master-edit/api/new', { ...sb, order_settings: { order_lot: '30' } });
-  assert.deepEqual([r.status, r.j.replayed, r.j.order_settings.ok, r.j.order_settings.status, r.j.order_settings.reason, attrsOf('posync-r3')], [200, true, false, 'mismatch', 'request_id_reused', null], r.text);
+  assert.deepEqual([r.status, r.j.reason, attrsOf('posync-r3')], [409, 'request_id_reused', null], r.text);
   assert.equal(await outboxOf('posync-r3'), undefined);
   const vb = { request_id: uuid(), group: { mode: 'new', code: 'posync-r3g', name: 'まとまり (設定なし)' }, axes: [{ axis: 1, name: 'カラー' }],
     options: [{ axis: 1, code: '-A', name: 'A' }], children: [{ code: 'posync-r3g-A', choices: { 1: '-A' }, name: 'まとまり【A】' }], values: { ...VALUES }, card: {} };
   assert.equal((await call('POST', '/apps/master-edit/api/new/variation', vb)).status, 200);
   const v = await call('POST', '/apps/master-edit/api/new/variation', { ...vb, order_settings: { order_lot: '30' } });
-  assert.deepEqual([v.status, v.j.replayed, v.j.order_settings.ok, v.j.order_settings.reason, v.j.order_settings.failed.map((f) => f.status), attrsOf('posync-r3g-A')],
-    [200, true, false, 'request_id_reused', ['mismatch'], null], v.text);
+  assert.deepEqual([v.status, v.j.reason, attrsOf('posync-r3g-A')], [409, 'request_id_reused', null], v.text);
+  // 入力なしの印を前と同じにしたまま発注の設定を足す = 値と入力なしの両方 = 400 (何も書かない)
+  const v2 = await call('POST', '/apps/master-edit/api/new/variation', { ...vb, order_settings: { order_lot: '30' }, blanks: RB.missingBlankKeys('variation', vb, { orderApplicable: true }) });
+  assert.deepEqual([v2.status, v2.j.reason, v2.j.field, attrsOf('posync-r3g-A')], [400, 'blank_with_value', 'order_settings.order_lot', null], v2.text);
 });
 
 await ta('[P1] 発注アプリ: 届いていない新商品に「発注の設定がまだ届いていない」の印 (すすめる数は今の設定で出す = 止めない)・全部の画面の上の帯・API の件数・Company DB が読めなくても画面は出る', async () => {

@@ -83,7 +83,7 @@
    *   グループ: なし = 入力なし / 今あるグループ = 選んだら値 / 新しく作る = 名前・ID・決まり (・値) を入れたら値 (中身はサーバーが確かめる)
    */
   function items() {
-    if (P.mode !== 'new' || !P.canWrite) return [];
+    if (P.mode !== 'new' || !P.canWrite || !P.noneOn) return [];   // 数えるかはサーバーと同じ答え (noneOn)
     var N = ME.none;
     var chk = function (key, t, focus) {
       var none = !!N && N.on(key) && !N.has(key);

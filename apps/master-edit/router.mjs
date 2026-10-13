@@ -110,7 +110,7 @@ import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
 import { writeOrderSettings, writeRegistrationOrderSettings, registrationOrderDone, OrderSettingsError } from '../purchase-orders/order-settings.js';
-import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf } from './order-settings.mjs';
+import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf, orderNoneApplies } from './order-settings.mjs';
 import { orderOutboxReady, runOrderSettingsOutbox, readOrderSettingsForRegistration, deliveryInputOf, orderDeliveryEnabled, orderOutboxStatus, readOrderSettingsOutbox,
   dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, readRegistrationOrderMark, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS } from '../../lib/order-settings-outbox.mjs';
 import { ui } from './ui-format.mjs';
@@ -679,6 +679,7 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     yahooDeliveries: Object.values(SHIPPING_METHOD_GROUPS), setPlanChoices: SET_PLAN_CHOICES, setDecisionReasons: SET_DECISION_REASONS,
     // 発注の設定 (発注アプリ・単品だけ。発注アプリはセットを扱わない)
     orderSettings: kind === 'single' ? orderScreen(req, editorGate(req), null) : null,
+    orderNoneApplies,   // 発注の設定の「入力なし」を出すか (API と同じ関数・views/_order.ejs)
     variationOn: variationOn(owner),
     // 「入力なし」にできる項目 (lib/master-register-blanks.mjs = サーバーと同じ名前)
     blankKeys: BLANK_KEYS[kind], blankLabels: blankLabelsOf(kind),
@@ -703,6 +704,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     maxKids: VARIATION_MAX_CHILDREN,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     orderSettings: orderScreen(req, editorGate(req), null),
+    orderNoneApplies,
     blankKeys: BLANK_KEYS.variation, blankLabels: blankLabelsOf('variation'),
   });
 }
@@ -753,7 +755,7 @@ router.post('/api/new/variation', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
   // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか。どちらでもない = 400 (何も書かない)・入力なしの一覧は理由に足す (lib/master-register-blanks.mjs)
-  const pre = prepareRegisterBody('variation', req.body || {}, { orderApplicable: () => orderScreen(req, gate, null).canWrite });
+  const pre = prepareRegisterBody('variation', req.body || {}, { orderApplicable: () => orderNoneApplies(orderScreen(req, gate, null)) });
   if (!pre.ok) return res.status(pre.status).json(pre.json);
   const b = pre.body;
   const rid = String(b.request_id ?? '').trim().toLowerCase();
@@ -781,6 +783,7 @@ router.post('/api/new/variation', (req, res) => {
     const r = await registerVariationBatch(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: b.reason ?? null,
       group: b.group, axes: b.axes ?? null, options: b.options, children: b.children, values: b.values, card: b.card, order: outbox ? orderBase : null,
+      childReasons: pre.childReasons,   // 🆕 子ごとの入力なしの理由 (原価・JAN はその子に無いときだけ・#1706 Codex R1 M1)
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
@@ -876,7 +879,7 @@ router.post('/api/new', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
   // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか (発注の設定は欄が出る人だけ・カードを作らない = カードの欄は数えない)。入力なしの一覧は理由に足す
-  const pre = prepareRegisterBody(String((req.body || {}).kind ?? ''), req.body || {}, { orderApplicable: () => orderScreen(req, gate, null).canWrite });
+  const pre = prepareRegisterBody(String((req.body || {}).kind ?? ''), req.body || {}, { orderApplicable: () => orderNoneApplies(orderScreen(req, gate, null)) });
   if (!pre.ok) return res.status(pre.status).json(pre.json);
   const b = pre.body;
   // 発注の設定 (発注アプリ): ① Company DB の登録の前に全部確かめる (グループがあるか・代表の仕入先のグループか・新しいグループの ID など)。

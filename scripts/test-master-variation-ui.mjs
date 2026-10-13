@@ -511,6 +511,21 @@ await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発
   await fill(p, '#kids-box .krow[data-key="-bk|"] [data-k="jan"]', '');
   await settle(p);
   assert.ok((await info(p)).issues.some((x) => /^JAN の無い子 \(1 件\)/.test(x)), '1 件消すとまた聞く');
+  // 🆕 #1706 Codex R1 M1: 原価 = 子ごとの実際の原価。共通を入力なし → 子だけの原価を 1 つ = まだ入力なしのまま (原価の無い子がある)・全部の子に入れる = 入力なしが外れる
+  await p.click('#sec-common .f:has(#c-cost) .nonechk');
+  await p.click('#kids-box .krow[data-key="-wh|"] [data-open]');
+  await fill(p, '#kids-box .krow[data-key="-wh|"] [data-k="cost"]', '700');
+  await settle(p);
+  assert.equal(await p.isChecked('[data-none="cost"]'), true, '原価の無い子がある = 入力なしのまま');
+  assert.ok(!(await info(p)).issues.some((x) => /^原価/.test(x)));
+  await p.click('#kids-box .krow[data-key="-bk|"] [data-open]');
+  await fill(p, '#kids-box .krow[data-key="-bk|"] [data-k="cost"]', '800');
+  await settle(p);
+  assert.equal(await p.isChecked('[data-none="cost"]'), false, '全部の子に原価 = 入力なしが外れる (両方は持たない)');
+  assert.ok(!(await info(p)).issues.some((x) => /^原価/.test(x)), '全部の子に原価 = 値がある');
+  await fill(p, '#kids-box .krow[data-key="-bk|"] [data-k="cost"]', '');
+  await settle(p);
+  assert.ok((await info(p)).issues.some((x) => /^原価 \(値か「入力なし」\)/.test(x)), '原価の無い子がまたできた = また聞く');
   // 押す所は 44px
   const small = await p.evaluate(() => [...document.querySelectorAll('.nonechk')].filter((x) => x.offsetParent !== null).map((x) => x.getBoundingClientRect()).filter((r) => r.height < 44 || r.width < 44).length);
   assert.equal(small, 0);
@@ -532,8 +547,13 @@ await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発
   await p.waitForSelector('#result .result', { timeout: 60000 });
   assert.match(await p.innerText('#result'), /2 件を下書きにしました/);
   assert.deepEqual(bodies[0].blanks, ['cost', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan']);
-  const reasons = await q(`select distinct e.reason from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK')`);
-  assert.deepEqual(reasons.map((r) => r.reason), ['新商品の登録 (色違い・サイズ違い) · 入力なし: 原価・発送方法・入荷日の管理・発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量・公式ページURL・Amazon・JAN']);
+  // 子ごとの記録 (#1706 Codex R1 M1): 原価・JAN は その子に無いときだけ (WH = 子だけの原価 700・JAN あり / BK = どちらも無い)
+  const reasons = Object.fromEntries((await q(`select s.code, e.reason from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK')`)).map((r) => [r.code, r.reason]));
+  assert.deepEqual(reasons, {
+    'nonegrp-BK': '新商品の登録 (色違い・サイズ違い) · 入力なし: 原価・発送方法・入荷日の管理・発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量・公式ページURL・Amazon・JAN',
+    'nonegrp-WH': '新商品の登録 (色違い・サイズ違い) · 入力なし: 発送方法・入荷日の管理・発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量・公式ページURL・Amazon',
+  });
+  assert.deepEqual((await q(`select s.code, c.cost_jpy::int as c from core.sku_costs c join core.skus s on s.sku_id = c.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK') order by s.code`)).map((r) => [r.code, r.c]), [['nonegrp-WH', 700]]);
   assert.equal((await one("select inbound_date_managed from core.products where display_code = 'nonegrp-WH'")).inbound_date_managed, null, '入荷日の管理を入力なし = 不明のまま');
 });
 
