@@ -63,16 +63,28 @@
   var NONE_ITEMS = [['cost', '原価', '#c-cost', 'cost'], ['shipping_code', '発送方法', '#c-ship', 'ship'], ['inbound_date_managed', 'ロジザードの入荷日の管理', '#c-inbound button', 'inbound']];
   var NONE_CARD = [['card.official_url', '公式ページ URL', '#official-url'], ['card.amazon', 'Amazon URL', '#amazon-url']];
   var janAll = false;   // 作る子が全部 JAN を持つ (= JAN の「入力なし」は要らない)
+  var lzAll = false;    // 🆕 0080: 作る子が全部ロジザードのバーコード (形の合う値) を持つ (= 「空欄で送る」は要らない)
+  var LZ_ON = !!P.lzReady;   // 🆕 0080: ロジザードのバーコードの欄を出すか (0080 がある DB だけ)
+  /** 🆕 0080: ロジザードのバーコードの形 (サーバーの lib/logizard-barcode.mjs lzValueShape と同じ)。'' = 値なし */
+  function lzShape(v) {
+    if (!v) return null;
+    if (/^X00[0-9A-Z]{7}$/.test(v)) return { kind: 'fnsku' };
+    if (/^\d+$/.test(v)) {
+      if (v.length !== 8 && v.length !== 13) return { c: 'shape', m: 'JAN は 8 けたか 13 けた (いま ' + v.length + ' けた)' };
+      return janCd(v.slice(0, -1)) === v.slice(-1) ? { kind: 'jan' } : { c: 'shape', m: 'JAN の最後の数字 (チェック数字) が合いません' };
+    }
+    return { c: 'shape', m: /^X0/.test(v) ? 'FNSKU は X00 + 英数字 7 字の 10 文字' : 'FNSKU (X00…) か JAN (数字) を入れます' };
+  }
   var costAll = false;  // 作る子が全部 実際の原価 (子だけの原価 か 共通の原価) を持つ
 
   // ---------- 画面の状態 ----------
   var fresh = function () {
     return { mode: 'new', gcode: '', gname: '', pk: null, q: '', results: null, axisName: ['', ''], vOn: false, optText: ['', ''], nextOpts: [],
       common: Object.assign({}, COMMON0), copied: null, conflicts: {}, picks: {}, oldKid: {},
-      excluded: new Set(), optIn: new Set(), edits: {}, filter: 'all', open: null, janPaste: false, janMsg: '', flash: null, done: null };
+      excluded: new Set(), optIn: new Set(), edits: {}, filter: 'all', open: null, janPaste: false, janMsg: '', lzPaste: false, lzMsg: '', flash: null, done: null };
   };
   var S = fresh();
-  var R = { key: '', busy: false, group: null, codes: {}, jans: {}, fresh: true, error: null };   // DB の確かめの答え (打った値ごと)
+  var R = { key: '', busy: false, group: null, codes: {}, jans: {}, lz: {}, fresh: true, error: null };   // DB の確かめの答え (打った値ごと)
 
   var money = function (s) { var t = String(s == null ? '' : s).normalize('NFKC').replace(/[,\s円¥]/g, ''); if (t === '') return null; return /^\d{1,9}$/.test(t) ? Number(t) : NaN; };
   function janProblem(j) {
@@ -248,11 +260,14 @@
     if (C.expiry === '' && !S.conflicts.expiry) Pi(5, 'miss', 'ロジザードの有効期限の管理', '#c-expiry');
 
     var kids = axes.length ? buildKids(axes, gcode, pk) : [];
-    var seenCode = new Map(), seenJan = new Map();
+    var seenCode = new Map(), seenJan = new Map(), seenLz = new Map();
     kids.forEach(function (k, i2) {
       k.idx = i2;
       var e = S.edits[k.key] || {};
       k.jan = String(e.jan == null ? '' : e.jan).normalize('NFKC').trim();
+      // 🆕 0080: ロジザードのバーコード = 打った値 (大文字にそろえる)。打っていない = 子の JAN (JAN を変えるとついてくる)
+      k.lzbc = String(e.lzbc == null ? k.jan : e.lzbc).normalize('NFKC').trim().toUpperCase();
+      k.lzOwn = e.lzbc != null;
       k.auto = baseName + '【' + k.h.name + '】' + (k.v ? '【' + k.v.name + '】' : '') + (k.jan ? '【' + k.jan + '】' : '');
       k.manual = !!e.manual; k.name = k.manual ? (e.name == null ? '' : e.name) : k.auto;
       k.price = e.price == null ? '' : e.price; k.cost = e.cost == null ? '' : e.cost;
@@ -274,12 +289,22 @@
       if (k.pv !== null && (Number.isNaN(k.pv) || k.pv < 1)) E('shape', '売価は 1 円以上の整数で');
       if (k.cv !== null && Number.isNaN(k.cv)) E('shape', '原価は整数で');
       if (k.jan) { var jp = janProblem(k.jan); if (jp) E(jp.c, 'JAN: ' + jp.m); else if (seenJan.has(k.jan)) E('dup', 'JAN が ' + seenJan.get(k.jan) + ' と同じ'); else seenJan.set(k.jan, k.code); }
+      if (LZ_ON && k.lzbc) {
+        var ls = lzShape(k.lzbc);
+        if (ls && ls.c) E(ls.c, 'ロジザードのバーコード: ' + ls.m);
+        else if (seenLz.has(k.lzbc)) E('dup', 'ロジザードのバーコードが ' + seenLz.get(k.lzbc) + ' と同じ');
+        else { seenLz.set(k.lzbc, k.code); if (R.lz[k.lzbc]) E('dup', 'ロジザードのバーコード: ほかの商品 (' + R.lz[k.lzbc] + ') が使っています'); }
+      }
       k.errs.forEach(function (x) { Pi(6, x.c, k.code + ': ' + x.m, '#kid-' + i2); });
     });
     var live = kids.filter(function (k) { return k.inc; });
     var n = live.length;
     // 🆕 2026-10-13: 必須でない項目 = 値か「入力なし」。どちらでもない = まだ入れていない (保存できない)
     janAll = n > 0 && live.every(function (k) { return !!k.jan; });
+    lzAll = n > 0 && live.every(function (k) { var ls = lzShape(k.lzbc); return !!(ls && ls.kind); });
+    // 🆕 0080: バーコードの無い子 = 「空欄で送る」の印が要る (値か空欄のどちらか・#1706 の入力なしと同じ形)
+    var lzRest = $('#lz-blank-rest');
+    if (LZ_ON && n && !lzAll && !(lzRest && lzRest.checked)) Pi(6, 'miss', 'ロジザードのバーコードの無い子 (' + live.filter(function (k) { var ls = lzShape(k.lzbc); return !(ls && ls.kind); }).length + ' 件・値か「空欄で送る」)', '#row-lz-none');
     costAll = n > 0 ? live.every(function (k) { var c = k.cv !== null ? k.cv : cc; return c !== null && !Number.isNaN(c); }) : (cc !== null && !Number.isNaN(cc));
     var noneKeys = [];
     if (ME.none) {
@@ -522,7 +547,8 @@
   var passF = function (k, f) { return f === 'all' ? true : f === 'err' ? k.errs.length > 0 : f === 'diff' ? (k.ownPrice || k.ownCost || k.manual) : f === 'nojan' ? (k.inc && !k.jan) : !k.inc; };
   function filterChips(m) {
     return '<span class="lbl0">絞る:</span>' + FILTERS.map(function (x) { var f = x[0]; var c = m.kids.filter(function (k) { return passF(k, f); }).length; return '<button type="button" class="chip' + (S.filter === f ? ' on' : '') + (f === 'err' && c ? ' t-err' : '') + '" data-filter="' + f + '" aria-pressed="' + (S.filter === f) + '">' + x[1] + ' <span class="n">' + c + '</span></button>'; }).join('')
-      + '<button type="button" class="btn sm" data-act="janpaste" aria-expanded="' + S.janPaste + '" style="margin-left:auto"' + (canSave ? '' : ' disabled') + '>' + icon('paste', 's') + 'JAN をまとめて貼る</button>';
+      + '<button type="button" class="btn sm" data-act="janpaste" aria-expanded="' + S.janPaste + '" style="margin-left:auto"' + (canSave ? '' : ' disabled') + '>' + icon('paste', 's') + 'JAN をまとめて貼る</button>'
+      + (LZ_ON ? '<button type="button" class="btn sm" data-act="lzpaste" aria-expanded="' + S.lzPaste + '"' + (canSave ? '' : ' disabled') + '>' + icon('paste', 's') + 'バーコードをまとめて貼る</button>' : '');
   }
 
   function renderKids(m) {
@@ -573,8 +599,12 @@
       + '<div class="example">例: <code>' + esc(first.code) + '</code><span class="hint aux">(タブ)</span><code>4580123450013</code></div>'
       + '<textarea class="in" id="jan-paste" spellcheck="false" placeholder="' + esc(first.code) + '\t4580123450013"></textarea>'
       + '<div class="savefoot"><button type="button" class="btn soft" data-act="janapply">' + icon('check', 's') + 'JAN を入れる</button><button type="button" class="btn ghost" data-act="janpaste">閉じる</button><span class="hint" id="jan-msg">' + esc(S.janMsg) + '</span></div></div>';
+    if (LZ_ON && S.lzPaste) h += '<div class="janpaste"><label class="lab3" for="lz-paste">Excel から「商品のコード / ロジザードのバーコード (FNSKU か JAN)」の 2 列を貼る (1 行に 1 つ)</label>'
+      + '<div class="example">例: <code>' + esc(first.code) + '</code><span class="hint aux">(タブ)</span><code>X001ABC234</code></div>'
+      + '<textarea class="in" id="lz-paste" spellcheck="false" placeholder="' + esc(first.code) + '\tX001ABC234"></textarea>'
+      + '<div class="savefoot"><button type="button" class="btn soft" data-act="lzapply">' + icon('check', 's') + 'バーコードを入れる</button><button type="button" class="btn ghost" data-act="lzpaste">閉じる</button><span class="hint" id="lz-msg">' + esc(S.lzMsg) + '</span></div></div>';
     var rows = m.kids.filter(function (k) { return passF(k, S.filter); });
-    h += '<div class="klist" id="klist"><div class="khead" aria-hidden="true"><span>商品のコード · ' + esc(m.axes.map(function (x) { return x.name || '?'; }).join(' · ')) + '</span><span>名前</span><span>売価 · 原価</span><span>JAN</span><span></span></div>';
+    h += '<div class="klist' + (LZ_ON ? ' lzon' : '') + '" id="klist"><div class="khead" aria-hidden="true"><span>商品のコード · ' + esc(m.axes.map(function (x) { return x.name || '?'; }).join(' · ')) + '</span><span>名前</span><span>売価 · 原価</span><span>JAN</span>' + (LZ_ON ? '<span>ロジザード</span>' : '') + '<span></span></div>';
     h += rows.length ? rows.map(function (k) {
       var cls = ['krow', k.inc ? '' : 'off', k.prev ? 'prev' : '', k.inc && k.errs.some(function (e) { return e.c !== 'miss'; }) ? 'row-err' : ''].filter(Boolean).join(' ');
       var d2 = k.inc && canSave ? '' : ' disabled';
@@ -584,6 +614,7 @@
         + '<div class="c-name"><div class="nm" title="' + esc(k.name) + '">' + esc(k.name) + '</div><div class="tags">' + kidTags(k) + '</div></div>'
         + '<div class="c-money">' + moneyChips(k, m) + '</div>'
         + '<div class="c-jan"><input class="in kin mono" data-k="jan" data-fid="jan:' + esc(k.key) + '" inputmode="numeric" maxlength="13" value="' + esc(k.jan) + '" placeholder="JAN なし"' + d2 + ' aria-label="' + esc(k.code) + ' の JAN"></div>'
+        + (LZ_ON ? '<div class="c-lz"><input class="in kin mono" data-k="lzbc" data-fid="lz:' + esc(k.key) + '" maxlength="20" autocomplete="off" spellcheck="false" value="' + esc(k.lzbc) + '" placeholder="空 = 下の「空欄」"' + d2 + ' aria-label="' + esc(k.code) + ' のロジザードのバーコード (FNSKU か JAN)"></div>' : '')
         + '<div class="c-btn"><button type="button" class="btn sm' + (open ? ' soft' : '') + '" data-open="' + esc(k.key) + '" data-fid="op:' + esc(k.key) + '" aria-expanded="' + open + '" title="この商品だけ変える (名前・売価・原価)"' + d2 + '>' + (open ? '閉じる' : '変える') + '</button></div>'
         + '<div class="k-err">' + kidErrs(k) + '</div>' + (open ? kedit(k, m) : '') + '</div>';
     }).join('') : '<div class="kempty">この絞り込みに当てはまる子はありません</div>';
@@ -602,6 +633,9 @@
       row.querySelector('.tags').innerHTML = kidTags(k);
       row.querySelector('.c-money').innerHTML = moneyChips(k, m);
       row.querySelector('.k-err').innerHTML = kidErrs(k);
+      // 🆕 0080: ロジザードのバーコードが子の JAN についていくとき (打っていない子) = 打っている欄でなければ書き直す
+      var lzi = row.querySelector('[data-k="lzbc"]');
+      if (lzi && document.activeElement !== lzi && !k.lzOwn && lzi.value !== k.lzbc) lzi.value = k.lzbc;
       row.classList.toggle('row-err', k.inc && k.errs.some(function (e) { return e.c !== 'miss'; }));
       var ke = row.querySelector('.kedit');
       if (ke) {
@@ -744,6 +778,13 @@
       jr.hidden = !m.n || janAll;
       $('#jan-none-n').textContent = noJan ? 'JAN の無い子が ' + noJan + ' 件あります' : '';
     }
+    // 🆕 0080: ロジザードのバーコードの無い子の「空欄で送る」(全部の子に値 = 出さない)
+    var lr = $('#row-lz-none');
+    if (lr) {
+      var noLz = m.live.filter(function (k) { var ls = lzShape(k.lzbc); return !(ls && ls.kind); }).length;
+      lr.hidden = !m.n || lzAll;
+      $('#lz-none-n').textContent = noLz ? 'ロジザードのバーコードの無い子が ' + noLz + ' 件あります' : '';
+    }
   }
 
   // ---------- DB の確かめ (打った値ごと・少し待ってからまとめて) ----------
@@ -751,8 +792,9 @@
   function remoteKeyOf(m) {
     var codes = m.live.map(function (k) { return k.code; }).filter(function (c) { return CODE_RE.test(c); });
     var jans = m.live.map(function (k) { return k.jan; }).filter(function (j) { return /^(\d{8}|\d{13})$/.test(j); });
+    var lzv = LZ_ON ? m.live.map(function (k) { return k.lzbc; }).filter(function (v) { var ls = lzShape(v); return !!(ls && ls.kind); }) : [];
     var gc = S.mode === 'new' && CODE_RE.test(S.gcode) && !/^set-/i.test(S.gcode) ? S.gcode : '';
-    return { key: JSON.stringify([gc, codes, jans]), gc: gc, codes: codes, jans: jans };
+    return { key: JSON.stringify([gc, codes, jans, lzv]), gc: gc, codes: codes, jans: jans, lzv: lzv };
   }
   /** 確かめが今の値に追いついたか (試験と画面の印 = フォームの data-check) */
   function markCheck() { form.setAttribute('data-check', ready() ? 'done' : 'busy'); }
@@ -763,16 +805,16 @@
     clearTimeout(checkTimer);
     var my = ++checkSeq;
     checkTimer = setTimeout(function () {
-      if (!q.gc && !q.codes.length && !q.jans.length) { R.group = null; R.codes = {}; R.jans = {}; R.fresh = true; R.busy = false; light(); return; }
+      if (!q.gc && !q.codes.length && !q.jans.length && !q.lzv.length) { R.group = null; R.codes = {}; R.jans = {}; R.lz = {}; R.fresh = true; R.busy = false; light(); return; }
       R.busy = true;
-      fetch(BASE + '/api/variation/check', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ group_code: q.gc || null, codes: q.codes, jans: q.jans }) })
+      fetch(BASE + '/api/variation/check', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ group_code: q.gc || null, codes: q.codes, jans: q.jans, lz_values: q.lzv }) })
         .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
         .then(function (x) {
           if (my !== checkSeq) return;
           R.busy = false;
           if (!x.r.ok || !x.j.ok) { R.error = 'DB で確かめられません (' + (x.j.error || 'HTTP ' + x.r.status) + ')。少し待つともう一度確かめます'; R.fresh = false; retryCheck(); light(); return; }
           R.group = x.j.group ? Object.assign({ code: q.gc }, x.j.group) : null;
-          R.codes = x.j.codes || {}; R.jans = x.j.jans || {}; R.fresh = true; R.error = null;
+          R.codes = x.j.codes || {}; R.jans = x.j.jans || {}; R.lz = x.j.lz || {}; R.fresh = true; R.error = null;
           if (M && M.issues.some(function (i) { return i.go === '#g-code'; }) !== !!(R.group && R.group.problem)) update(); else light();
         })
         .catch(function () { if (my !== checkSeq) return; R.busy = false; R.error = 'つながりません。少し待つともう一度確かめます'; retryCheck(); light(); });
@@ -882,7 +924,7 @@
     else if (id === 'g-q') { S.q = t.value; S.results = S.results || null; searchGroups(); return; }
     else if (id === 'ax-0' || id === 'ax-1') S.axisName[+id.slice(-1)] = t.value;
     else if (id === 'opt-0' || id === 'opt-1') S.optText[+id.slice(-1)] = t.value;
-    else if (id === 'jan-paste' || id === 'reason') return;
+    else if (id === 'jan-paste' || id === 'lz-paste' || id === 'reason') return;
     else if (Object.keys(INPUT_ID).some(function (f) { return INPUT_ID[f] === id; })) {
       var f = Object.keys(INPUT_ID).filter(function (x) { return INPUT_ID[x] === id; })[0];
       S.common[f] = t.value; if (S.conflicts[f]) S.picks[f] = true;
@@ -906,6 +948,7 @@
     if (t.tagName === 'SELECT' && form.contains(t) && t.closest('#sec-order') && !S.done) light();
     // 🆕 入力なしのチェック (me-none.js が先に値を空にする) = 数え直す
     if (t.matches && t.matches('input[type="checkbox"][data-none]') && form.contains(t) && !S.done) { light(); return; }
+    if (t.id === 'lz-blank-rest' && !S.done) { light(); return; }   // 🆕 0080: ロジザードのバーコードの無い子を「空欄で送る」
     if (t.id === 'fix-ok') $('#confirm-yes').disabled = !t.checked || busy;
     // 切り替えボタン (me-shell.js が押された状態と data-value を付けて change を出す)
     if (t.classList && t.classList.contains('seg') && form.contains(t)) {
@@ -954,6 +997,22 @@
     S.janMsg = ok + ' 件入れました' + (miss.length ? ' · 見つからないコード ' + miss.length + ' 件 (' + miss.slice(0, 3).join('・') + (miss.length > 3 ? ' …' : '') + ')' : '');
     update();
   }
+  /** 🆕 0080: ロジザードのバーコードをまとめて貼る (商品のコード / FNSKU か JAN の 2 列・JAN をまとめて貼る と同じ形) */
+  function lzApply() {
+    var m = model();
+    var byCode = new Map(m.kids.map(function (k) { return [norm(k.code), k]; }));
+    var ok = 0; var miss = [];
+    String($('#lz-paste').value || '').split(/\r?\n/).forEach(function (l) {
+      var t = l.trim(); if (!t) return;
+      var mm = t.match(/^(\S+)[\s,，\/]+(\S+)$/);
+      if (!mm) { miss.push(t); return; }
+      var k = byCode.get(norm(mm[1]));
+      if (!k) { miss.push(mm[1]); return; }
+      (S.edits[k.key] || (S.edits[k.key] = {})).lzbc = mm[2].normalize('NFKC').toUpperCase(); ok++;
+    });
+    S.lzMsg = ok + ' 件入れました' + (miss.length ? ' · 見つからないコード ' + miss.length + ' 件 (' + miss.slice(0, 3).join('・') + (miss.length > 3 ? ' …' : '') + ')' : '');
+    update();
+  }
   /** 保存の後: 保存したまとまりを「今ある」として読み直し、残りの色を入れる (残りを足す) */
   function continueNext() {
     var rest = S.nextOpts.slice();
@@ -994,6 +1053,8 @@
     if (d.act === 'unsplit') return unSplit();
     if (d.act === 'janpaste') { S.janPaste = !S.janPaste; S.janMsg = ''; update(); if (S.janPaste) setTimeout(function () { var jp = $('#jan-paste'); if (jp) jp.focus(); }, 0); return; }
     if (d.act === 'janapply') return janApply();
+    if (d.act === 'lzpaste') { S.lzPaste = !S.lzPaste; S.lzMsg = ''; update(); if (S.lzPaste) setTimeout(function () { var lp = $('#lz-paste'); if (lp) lp.focus(); }, 0); return; }
+    if (d.act === 'lzapply') return lzApply();
     if (d.axv) { S.axisName[+d.axv] = d.v; renderAxes(); update(); return; }
     if (d.fix != null) {
       var i = +d.fix; var changed = [];
@@ -1042,7 +1103,10 @@
       options: opts,
       children: m.live.map(function (k) {
         var ch = { 1: k.h.num }; if (k.v) ch[2] = k.v.num;
-        return { code: k.code, choices: ch, name: k.name, price: k.ownPrice ? k.price : '', cost: k.ownCost ? k.cost : '', jan: k.jan };
+        var kid = { code: k.code, choices: ch, name: k.name, price: k.ownPrice ? k.price : '', cost: k.ownCost ? k.cost : '', jan: k.jan };
+        // 🆕 0080: ロジザードのバーコード = 形の合う値 / 無い子は「空欄で送る」の印のとき空欄 (印が無い子は送らない = サーバーが断る)
+        if (LZ_ON) { var ls = lzShape(k.lzbc); if (ls && ls.kind) kid.lz_barcode = { kind: 'value', value: k.lzbc }; else if ($('#lz-blank-rest') && $('#lz-blank-rest').checked) kid.lz_barcode = { kind: 'lz_assign' }; }
+        return kid;
       }),
       values: values,
       card: { official_url: val('official-url'), amazon_url: amz, asin: asin ? asin.toUpperCase() : '' },
@@ -1052,9 +1116,6 @@
     out.blanks = m.noneKeys.slice();
     var po = ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
-    // 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコードの決め方 (全部の子に同じ・欄が無い = 0078 の前 = 自動)
-    var lz = document.getElementById('c-lzbc');
-    out.logizard_barcode = (lz && lz.getAttribute('data-value')) || 'auto';
     return out;
   }
   function openConfirm() {

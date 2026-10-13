@@ -604,32 +604,37 @@ await ta('[R5] 同じ request_id = 前の結果 (何も増えない) / 違う中
   await rejectsWith(reg('single', 'new-a1', single()), 409, 'code_taken');
 });
 
-await ta('[R-LZ] 🆕 0078 ロジザードに送るバーコードの決め方 (CompanyDB構想 23): 送った = 登録と同じ取引で 1 行 (auto も・via register)・送らない (古い画面) = 行なし・要求のハッシュ (送らない = 前と同じ)・違う決め方の押し直し = 409・知らない値 = 400・セット = 400・巻き戻る = 行も残らない', async () => {
-  const lzRows = (code) => q(`select r.rule, r.pinned, r.via, r.actor_id, r.db_user from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = $1 order by r.rule_row`, [code]);
+await ta('[R-LZ] 🆕 0080 ロジザードのバーコードの値 (CompanyDB構想 23 v4): 値 / 空欄 = 登録と同じ取引で 1 行 (via register)・送らない (古い画面・lib) = 行なし・要求のハッシュ (送らない = 前と同じ)・違う値の押し直し = 409・形 = 400・セット = 400・ほかの商品の値 = 409 で登録ごと戻る・巻き戻る = 行も残らない', async () => {
+  const lzRows = (code) => q(`select r.rule, r.value, r.via, r.actor_id, r.db_user from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = $1 order by r.rule_row`, [code]);
   const regLz = (code, lz, o = {}) => asEditor(() => R.registerNewSku(db, { actor: 'Naka@Test', requestId: o.requestId ?? uuid(), kind: 'single', code, values: withReq('single', single()), card: {}, logizardBarcode: lz },
     { ownership: ALL_COMPANY, open: true, now: NOW, shippingRates: RATES, beforeCommit: o.beforeCommit }));
   const rid = uuid();
-  const r = await regLz('lz-r1', 'fnsku', { requestId: rid });
+  const r = await regLz('lz-r1', { kind: 'value', value: 'x00lzr0001' }, { requestId: rid });
   assert.equal(r.ok, true);
-  assert.deepEqual(await lzRows('lz-r1'), [{ rule: 'fnsku', pinned: null, via: 'register', actor_id: 'naka@test', db_user: 'master_edit' }]);
-  assert.equal((await regLz('lz-r1', 'fnsku', { requestId: rid })).replayed, true);
+  assert.deepEqual(await lzRows('lz-r1'), [{ rule: 'fnsku', value: 'X00LZR0001', via: 'register', actor_id: 'naka@test', db_user: 'master_edit' }]);
+  assert.equal((await regLz('lz-r1', { kind: 'value', value: 'X00LZR0001' }, { requestId: rid })).replayed, true);
   assert.equal((await lzRows('lz-r1')).length, 1, '押し直しで行が増えた');
-  await rejectsWith(regLz('lz-r1', 'jan', { requestId: rid }), 409, 'request_id_reused');
+  await rejectsWith(regLz('lz-r1', { kind: 'lz_assign' }, { requestId: rid }), 409, 'request_id_reused');
   await rejectsWith(regLz('lz-r1', undefined, { requestId: rid }), 409, 'request_id_reused');
-  await regLz('lz-r2', 'auto');
-  assert.deepEqual((await lzRows('lz-r2')).map((x) => x.rule), ['auto'], '既定の自動も 1 行 (決め方なし と分ける)');
+  await regLz('lz-r2', { kind: 'lz_assign' });
+  assert.deepEqual((await lzRows('lz-r2')).map((x) => [x.rule, x.value]), [['lz_assign', null]]);
   await regLz('lz-r3', undefined);
-  assert.deepEqual(await lzRows('lz-r3'), [], '送らない古い画面で行を書いた');
+  assert.deepEqual(await lzRows('lz-r3'), [], '送らない (lib) で行を書いた');
   const base = R.parseRegisterRequest({ actor: 'a@b.c', requestId: uuid(), kind: 'single', code: 'x1', values: withReq('single', single()), card: {} });
   assert.equal(base.lzBarcode, null);
   assert.equal(R.registerPayloadHashOf(base), R.registerPayloadHashOf({ ...base, lzBarcode: undefined }), '送らない要求のハッシュが変わった');
-  assert.notEqual(R.registerPayloadHashOf(base), R.registerPayloadHashOf({ ...base, lzBarcode: 'auto' }));
-  await rejectsWith(regLz('lz-r4', 'none'), 400, 'invalid_input');
+  assert.notEqual(R.registerPayloadHashOf(base), R.registerPayloadHashOf({ ...base, lzBarcode: { kind: 'lz_assign', value: null } }));
+  for (const bad of ['auto', { kind: 'value', value: '4901234567890' }, { kind: 'value', value: 'X0LZR00001' }]) {
+    await rejectsWith(regLz('lz-r4', bad), 400, 'invalid_input');
+  }
   assert.equal((await one("select count(*)::int as n from core.skus where code = 'lz-r4'")).n, 0);
-  assert.throws(() => R.parseRegisterRequest({ actor: 'a@b.c', requestId: uuid(), kind: 'set', code: 'lz-set-x', logizardBarcode: 'auto',
+  assert.throws(() => R.parseRegisterRequest({ actor: 'a@b.c', requestId: uuid(), kind: 'set', code: 'lz-set-x', logizardBarcode: { kind: 'lz_assign' },
     values: withReq('set', { name: 'セット', standard_price: '1000', components: [{ code: 's002', qty: 1 }] }), card: {} }), (e) => e.status === 400 && e.extra.field === 'logizard_barcode');
-  // 巻き戻る (commit の直前に落ちる) = 決め方の行も残らない
-  await rejectsWith(regLz('lz-r5', 'lz_assign', { beforeCommit: async () => { throw new W.MasterWriteError(409, 'boom', 'わざと'); } }), 409, 'boom');
+  // ほかの商品 (lz-r1) と同じ値 = 409 lzbc_taken・登録ごと戻る (SKU も残らない)
+  await rejectsWith(regLz('lz-r6', { kind: 'value', value: 'X00LZR0001' }), 409, 'lzbc_taken');
+  assert.equal((await one("select count(*)::int as n from core.skus where code = 'lz-r6'")).n, 0);
+  // 巻き戻る (commit の直前に落ちる) = 値の行も残らない
+  await rejectsWith(regLz('lz-r5', { kind: 'lz_assign' }, { beforeCommit: async () => { throw new W.MasterWriteError(409, 'boom', 'わざと'); } }), 409, 'boom');
   assert.equal((await one("select count(*)::int as n from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = 'lz-r5'")).n, 0);
   assert.equal((await one("select count(*)::int as n from core.skus where code = 'lz-r5'")).n, 0);
 });
@@ -1488,9 +1493,13 @@ const ORIGIN = `http://127.0.0.1:${server.address().port}`;
  * ほかの決まりを確かめる試験は、値の無い項目を全部「入力なし」にして送る (画面で全部「入力なし」を押したのと同じ)。印そのものの試験は blanks: 'raw' (送ったまま)
  */
 const NEW_API_RE = /\/apps\/master-edit\/api\/new(\/variation)?$/;
-async function call(method, url, { body, session = 'editor', origin = true, blanks = 'auto' } = {}) {
+async function call(method, url, { body, session = 'editor', origin = true, blanks = 'auto', lz = 'auto' } = {}) {
   const m = method === 'POST' && blanks === 'auto' && body && typeof body === 'object' && body.blanks === undefined ? NEW_API_RE.exec(url) : null;
   if (m) body = { ...body, blanks: RB.missingBlankKeys(m[1] ? 'variation' : body.kind, body, { orderApplicable: true }) };
+  // 🆕 0080: 新商品の登録の API はロジザードのバーコード (値か空欄) が要る。ほかの決まりを確かめる試験は「空欄」を足して送る (lz: 'raw' = 送ったまま)
+  const ml = method === 'POST' && lz === 'auto' && body && typeof body === 'object' ? NEW_API_RE.exec(url) : null;
+  if (ml && ml[1] && Array.isArray(body.children)) body = { ...body, children: body.children.map((k) => (k && typeof k === 'object' && k.lz_barcode === undefined ? { ...k, lz_barcode: { kind: 'lz_assign' } } : k)) };
+  else if (ml && !ml[1] && body.kind === 'single' && body.logizard_barcode === undefined) body = { ...body, logizard_barcode: { kind: 'lz_assign' } };
   const headers = { Accept: 'application/json', 'x-test-session': session };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (origin) headers.Origin = ORIGIN;
@@ -2674,6 +2683,50 @@ await ta('[BL6] #1706 Codex R2 M: 発注の設定の「入力なし」は要求�
   assert.equal(f1.status, 409, f1.text);
   const f2 = await unread(() => call('POST', '/apps/master-edit/api/new', { body: b5, session: 'po-editor', blanks: 'raw' }));
   assert.deepEqual([f2.status, f2.j.reason], [f1.status, f1.j.reason], f2.text);
+});
+
+// ─── 🆕 0080 新商品の登録の API のロジザードのバーコード ───
+console.log('\nロジザードのバーコード (新商品の登録の API)');
+const LZ_NOW = new Date().toISOString();
+/** ロジザードの写し (試験) = 商品の一覧 (小文字の ID) とバーコードマスタ (書いたとおりの ID・値) */
+const lzMirror = ({ keys = [], bc = [], at = LZ_NOW, ok = true } = {}) => ({ ok, reason: ok ? null : '写しがありません', keys: new Set(keys.map((k) => k.toLowerCase())),
+  ids: bc.reduce((m, [id]) => { const l = id.toLowerCase(); if (!m.has(l)) m.set(l, new Set()); m.get(l).add(id); return m; }, new Map()),
+  barcodes: new Map(bc.map(([id, v]) => [v, id])), list_as_of: at, bc_as_of: at, rows: Math.max(1, keys.length) });
+let LZM = lzMirror();
+MR.__setLzMirrorProvider(async () => LZM);
+process.env.MASTER_DECISION_APPROVERS = 'naka@test';
+const regApi = async (code, lzb, extra = {}) => {
+  const r = await call('POST', '/apps/master-edit/api/new', { body: { request_id: uuid(), kind: 'single', code, values: withReq('single', single(extra.values || {})), card: { create: false }, logizard_barcode: lzb, ...(extra.body || {}) }, lz: 'raw' });
+  return r;
+};
+
+await ta('[LZ-H1] 新商品の登録の API: ロジザードのバーコードが無い = 400 lzbc_missing (前の画面)・形 = 400・ロジザードの写しでほかの商品の値 = 409・値 / 空欄で登録できる', async () => {
+  let r = await regApi('lzh-a', undefined);
+  assert.deepEqual([r.status, r.j.reason, r.j.field], [400, 'lzbc_missing', 'logizard_barcode'], r.text);
+  assert.match(r.j.error, /画面を開き直してください/);
+  r = await regApi('lzh-a', { kind: 'value', value: '4901234567890' });
+  assert.deepEqual([r.status, r.j.field], [400, 'logizard_barcode'], r.text);
+  LZM = lzMirror({ keys: ['zz-old'], bc: [['zz-old', 'X00LZHWARE']] });
+  r = await regApi('lzh-a', { kind: 'value', value: 'X00LZHWARE' });
+  assert.deepEqual([r.status, r.j.reason], [409, 'lzbc_taken'], r.text);
+  assert.equal((await one("select count(*)::int as n from core.skus where code = 'lzh-a'")).n, 0);
+  r = await regApi('lzh-a', { kind: 'value', value: 'x00lzh0001' }, { values: { expiry_managed: '1', inbound_date_managed: '1' } });
+  assert.equal(r.status, 200, r.text);
+  r = await regApi('lzh-b', { kind: 'lz_assign' });
+  assert.equal(r.status, 200, r.text);
+  r = await regApi('lzh-c', { kind: 'value', value: '4912345678904' }, { values: { cost: { jpy: '450' } } });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual((await q(`select s.code, r.rule, r.value from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code in ('lzh-a', 'lzh-b', 'lzh-c') order by s.code`)).map((x) => [x.code, x.rule, x.value]),
+    [['lzh-a', 'fnsku', 'X00LZH0001'], ['lzh-b', 'lz_assign', null], ['lzh-c', 'jan', '4912345678904']]);
+  // ほかの商品 (lzh-a) と同じ値 = 409 (Company DB の重なり)
+  r = await regApi('lzh-d', { kind: 'value', value: 'X00LZH0001' });
+  assert.deepEqual([r.status, r.j.reason], [409, 'lzbc_taken'], r.text);
+});
+await ta('[LZ-H3] まとまりの確かめ: 打ったロジザードのバーコードの持ち主 (Company DB のほかの商品・ロジザードの写し) を返す', async () => {
+  const r = await call('POST', '/apps/master-edit/api/variation/check', { body: { codes: [], jans: [], lz_values: ['x00lzh0001', 'X00LZHWARE', '4900000000023', 'bad'] } });
+  if (r.status === 409 && r.j && r.j.reason === 'parent_not_company') return;   // このファイルの DB は代表の持ち主が load = まとまりの API は閉じている (まとまりの試験で見る)
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual(r.j.lz, { X00LZH0001: 'lzh-a', X00LZHWARE: 'zz-old' });
 });
 
 server.close();

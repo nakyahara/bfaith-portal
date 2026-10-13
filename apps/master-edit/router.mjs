@@ -131,7 +131,8 @@ import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, build
 import { readNeDeleteStock } from './ne-delete-stock.mjs';
 // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
-import { lzBarcodeView, lzBarcodeRuleIn, lzBarcodePinnedIn, lzBarcodeReady, setLzBarcodeRuleInTx, LZ_BARCODE_RULES, LZ_BARCODE_RULE_HINTS, LZ_BARCODE_STATES, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
+import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
+import { readLzMirror } from '../../lib/lz-mirror.mjs';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -214,6 +215,50 @@ async function defaultShippingRates() {
 }
 let shippingRatesProvider = defaultShippingRates;
 export function __setShippingRatesProvider(fn) { shippingRatesProvider = fn || defaultShippingRates; }
+
+/**
+ * 🆕 0080: ロジザードの写し (Render の warehouse-mirror.db の商品の一覧 f_inbound_check_product_flags とバーコードマスタ f_inbound_check_barcode_master・読むだけ)。
+ *   読めない = ok: false (lib/lz-mirror.mjs readLzMirror)
+ */
+async function defaultLzMirror() {
+  try {
+    const { getMirrorDB } = await import('../warehouse-mirror/db.js');
+    return readLzMirror(getMirrorDB);
+  } catch (e) {
+    return readLzMirror(() => { throw e; });
+  }
+}
+let lzMirrorProvider = defaultLzMirror;
+export function __setLzMirrorProvider(fn) { lzMirrorProvider = fn || defaultLzMirror; }
+/** ロジザードのバーコードマスタの写しで、その値を持っているほかの商品の商品ID (無い = null) */
+function lzMirrorOwner(mirror, code, value) {
+  const owner = mirror && mirror.barcodes ? mirror.barcodes.get(value) : null;
+  return owner && owner.toLowerCase() !== String(code || '').toLowerCase() ? owner : null;
+}
+/**
+ * 🆕 0080: 新商品の登録の入口で、送ってきたロジザードのバーコードの値を確かめる = ロジザードのバーコードマスタの写しでほかの商品の値 = 409 (DB には写しが無い = ここで)。
+ *   値か「空欄」が要る (無い = 前の画面 = 400 lzbc_missing) のは lib が門の後に確かめる (opts.requireLz)・Company DB の重なりは DB の関数。
+ *   items = [{ code, raw, field }]。戻り値 null = 通る / { status, json }
+ */
+async function lzRegisterGate(db, items) {
+  if (!(await lzBarcodeReady(db))) return null;
+  let mirror = null;
+  for (const it of items) {
+    const at = it.code ? `${it.code}: ` : '';
+    if (it.raw === undefined || it.raw === null) continue;
+    let v;
+    try { v = lzBarcodeIn(it.raw, { field: it.field, label: it.field === 'children' ? it.code : '' }); } catch (e) {
+      if (e instanceof MasterWriteError) return { status: e.status, json: { ok: false, error: e.message, reason: e.reason, ...e.extra, ...(it.field === 'children' ? { code: it.code } : {}) } };
+      throw e;
+    }
+    if (v.value) {
+      mirror = mirror || (await lzMirrorProvider());
+      const owner = lzMirrorOwner(mirror, it.code, v.value);
+      if (owner) return { status: 409, json: { ok: false, reason: 'lzbc_taken', field: it.field, ...(it.field === 'children' ? { code: it.code } : {}), error: `${at}ロジザードのバーコード ${v.value} はロジザードでほかの商品 (${owner}) が使っています。何も保存していません` } };
+    }
+  }
+  return null;
+}
 
 /**
  * FBA / FBM (seller SKU の正規化 → 'FBA' / 'FBM')。Render の warehouse-mirror.db の mirror_amazon_sku_fees.fulfillment_channel (読むだけ・16 §3 #9 = Company DB に列を作らない)。
@@ -684,7 +729,7 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     variationOn: variationOn(owner),
     // 「入力なし」にできる項目 (lib/master-register-blanks.mjs = サーバーと同じ名前)
     blankKeys: BLANK_KEYS[kind], blankLabels: blankLabelsOf(kind),
-    // 🆕 0078: ロジザードに送るバーコードの決め方を選べるか (表と関数がある DB だけ・無い = 自動の固定表示)
+    // 🆕 0080: ロジザードに送るバーコードの欄を出すか (0080 がある DB だけ)
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,
   });
 }));
@@ -709,7 +754,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     orderSettings: orderScreen(req, editorGate(req), null),
     orderNoneApplies,
     blankKeys: BLANK_KEYS.variation, blankLabels: blankLabelsOf('variation'),
-    lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,   // 🆕 0078
+    lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,   // 🆕 0080 (子ごとのロジザードのバーコードの欄を出すか)
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
@@ -752,7 +797,18 @@ router.post('/api/variation/check', (req, res) => {
   return withPgApi(res, async (db) => {
     if (!(await variationReadGate(db, res))) return;
     res.set('Cache-Control', 'no-store');
-    res.json({ ok: true, ...(await checkVariationCodes(db, b, { phDraftExists: phDraftLookup })) });
+    // 🆕 0080: ロジザードのバーコードの重なり (Company DB = ほかの商品の値 / ロジザードのバーコードマスタの写し)。{ 値: 持っている商品 }
+    const lz = {};
+    if (Array.isArray(b.lz_values) && b.lz_values.length <= VARIATION_MAX_CHILDREN * 3 && (await lzBarcodeReady(db))) {
+      const mirror = await lzMirrorProvider();
+      for (const raw of new Set(b.lz_values)) {
+        const sh = lzValueShape(raw);
+        if (sh.problem) continue;
+        const owner = mirror.barcodes.get(sh.value) || (await lzHolderInDb(db, null, sh.value));
+        if (owner) lz[sh.value] = owner;
+      }
+    }
+    res.json({ ok: true, ...(await checkVariationCodes(db, b, { phDraftExists: phDraftLookup })), lz });
   });
 });
 /**
@@ -796,13 +852,15 @@ router.post('/api/new/variation', (req, res) => {
     const outbox = await orderOutboxReady(db);
     const po = await orderBlanksFirstTime(db, req, gate, 'variation', b);
     if (!po.ok) return res.status(po.status).json(po.json);
+    // 🆕 0080: 子ごとにロジザードのバーコード (値か空欄) が要る・ロジザードの写しでほかの商品の値 = 409 (何も書かない)
+    const lg = await lzRegisterGate(db, kids.map((k) => ({ code: k && typeof k.code === 'string' ? k.code : '', raw: k ? k.lz_barcode : undefined, field: 'children' })));
+    if (lg) return res.status(lg.status).json(lg.json);
     const r = await registerVariationBatch(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: b.reason ?? null,
       group: b.group, axes: b.axes ?? null, options: b.options, children: b.children, values: b.values, card: b.card, order: outbox ? orderBase : null,
       childReasons: pre.childReasons,   // 🆕 子ごとの入力なしの理由 (原価・JAN はその子に無いときだけ・#1706 Codex R1 M1)
       reasonNote: po.note,              // 🆕 発注の設定の入力なし (DB に書く理由にだけ・ハッシュに入らない・#1706 Codex R2 M)
-      logizardBarcode: b.logizard_barcode,   // 🆕 0078 (CompanyDB構想 23): 全部の子に同じ決め方 (子ごとに 1 行)
-    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox });
+    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox, requireLz: true });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
     const after = orderInput && outbox ? await ordersAfterRegistration(db, regId, !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
@@ -862,9 +920,9 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     nedel: nedel ? { live: nedelLive, canApprove: approverGate(req).ok, STATUS_WORDS: NE_DEL_STATUS_WORDS } : null,
     // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリに保存・単品で AMC × 自社商品だけ欄を出す)
     amcLabel: page ? { ...(await amcLabelScreen(req, editorGate(req), db, page.cur)), STATUSES: AMC_STATUSES, WORDS: AMC_STATUS_WORDS, HINTS: AMC_STATUS_HINTS } : null,
-    // 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコード (単品だけ・決め方 + 今の答え (参考)・候補)。直すのは POST /api/sku/:code/logizard-barcode
+    // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコード (単品だけ・値か空欄・CSV に出した後は見るだけ・Amazon との違いは参考)。直すのは POST /api/sku/:code/logizard-barcode
     lzBarcode: page && page.cur.sku_kind === 'single'
-      ? { ...(await lzBarcodeView(db, page.cur, { canEdit: editorGate(req).ok })), RULES: LZ_BARCODE_RULES, HINTS: LZ_BARCODE_RULE_HINTS, STATES: LZ_BARCODE_STATES, VIA: LZ_BARCODE_VIA } : null,
+      ? { ...(await lzBarcodeView(db, page.cur, { canEdit: editorGate(req).ok })), KINDS: LZ_KIND_WORDS, VIA: LZ_BARCODE_VIA } : null,
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null, extras,
     // 発注の設定 (発注アプリ・単品だけ)。発注条件グループは代表の仕入先のものだけ選べる
@@ -927,11 +985,16 @@ router.post('/api/new', (req, res) => {
     const outbox = await orderOutboxReady(db);
     const po = await orderBlanksFirstTime(db, req, gate, String(b.kind ?? ''), b);
     if (!po.ok) return res.status(po.status).json(po.json);
+    // 🆕 0080: 単品 = ロジザードのバーコード (値か空欄) が要る・ロジザードの写しでほかの商品の値 = 409 (何も書かない)
+    if (String(b.kind ?? '') === 'single') {
+      const lg = await lzRegisterGate(db, [{ code: String(b.code ?? ''), raw: b.logizard_barcode, field: 'logizard_barcode' }]);
+      if (lg) return res.status(lg.status).json(lg.json);
+    }
     const r = await registerNewSku(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
       order: outbox ? orderBase : null, reasonNote: po.note,
-      logizardBarcode: b.logizard_barcode,   // 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコードの決め方 (単品だけ・送らない = 決め方なし)
-    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox });
+      logizardBarcode: b.logizard_barcode,   // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコードの値か空欄 (単品だけ・要るかは上の lzRegisterGate)
+    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true });
     let orderResult = null;
     const after = orderInput && outbox ? await ordersAfterRegistration(db, String(b.request_id).trim().toLowerCase(), !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
     if (after.mode === 'mismatch') orderResult = { ok: false, status: 'mismatch', reason: 'request_id_reused', pending: false, error: ORDER_MISMATCH_WORDS };
@@ -1126,19 +1189,18 @@ router.post('/api/sku/:code/card-link', (req, res) => {
 });
 
 /**
- * 🆕 0078 (CompanyDB構想 23): 商品の画面の「ロジザードのバーコードの決め方を保存」。本文 = { request_id, rule, pinned?, seen_row (開いたときの一番新しい行番号・無かった = null) }
- *   書ける人 = マスタの入力の名簿 (editorGate)。書くのは DB の関数 1 回 (単品・やめていない・開いたときの行番号が今と同じ・選んだ 1 本は今の候補)。
- *   Company DB の「保存する」とは別のボタン。答え (値) は CSV を作るとき (今は GAS の H 列を人が埋めるとき) に決まる = ここでは決め方だけ
+ * 🆕 0080 (CompanyDB構想 23 v4): 商品の画面の「ロジザードのバーコードを保存」。本文 = { request_id, barcode: { kind: 'value', value } | { kind: 'lz_assign' }, seen_row }
+ *   書ける人 = マスタの入力の名簿 (editorGate)。DB の関数 1 回 (単品・やめていない・CSV に出していない・開いたときの行番号が今と同じ・ほかの商品の値でない)。
+ *   ロジザードのバーコードマスタの写しでほかの商品の値 = 409 (DB には写しが無い = ここで)。Company DB の「保存する」とは別のボタン
  */
 router.post('/api/sku/:code/logizard-barcode', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
   const b = req.body || {};
-  let rule, pinned, seen;
+  let bc, seen;
   try {
-    rule = lzBarcodeRuleIn(b.rule);
-    if (rule == null) throw new MasterWriteError(400, 'invalid_input', 'ロジザードのバーコードの決め方を選んでください', { field: 'logizard_barcode' });
-    pinned = lzBarcodePinnedIn(b.pinned, rule);
+    bc = lzBarcodeIn(b.barcode);
+    if (bc == null) throw new MasterWriteError(400, 'invalid_input', 'ロジザードのバーコードを入れるか「空欄 (ロジザードが番号を付ける)」を選んでください', { field: 'logizard_barcode' });
     seen = b.seen_row == null || b.seen_row === '' ? null : String(b.seen_row);
     if (seen != null && !/^[1-9]\d{0,17}$/.test(seen)) throw new MasterWriteError(400, 'invalid_input', '開いたときの行番号の形が違う。画面を開き直してください', { field: 'logizard_barcode' });
   } catch (e) {
@@ -1148,20 +1210,22 @@ router.post('/api/sku/:code/logizard-barcode', (req, res) => {
   const rid = String(b.request_id ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid)) return res.status(400).json({ ok: false, error: '保存の番号 (request_id) の形が違う。画面を開き直してください', reason: 'invalid_input' });
   return withPgApi(res, async (db) => {
-    const sku = (await db.query('select sku_id::text as id, sku_kind from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(req.params.code || '')])).rows[0];
+    const sku = (await db.query('select sku_id::text as id, code, sku_kind from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(req.params.code || '')])).rows[0];
     if (!sku) return res.status(404).json({ ok: false, error: `商品コード ${req.params.code} は Company DB にありません` });
-    if (sku.sku_kind !== 'single') return res.status(400).json({ ok: false, error: 'ロジザードのバーコードの決め方は単品だけです', reason: 'not_single' });
-    if (!(await lzBarcodeReady(db))) return res.status(503).json({ ok: false, error: 'Company DB に 0078 (ロジザードのバーコードの決め方) がまだ入っていません。何も保存していません', reason: 'db_not_ready' });
+    if (sku.sku_kind !== 'single') return res.status(400).json({ ok: false, error: 'ロジザードのバーコードは単品だけです', reason: 'not_single' });
+    if (!(await lzBarcodeReady(db))) return res.status(503).json({ ok: false, error: 'Company DB に 0080 (ロジザードのバーコードの値) がまだ入っていません。何も保存していません', reason: 'db_not_ready' });
+    const lzHit = bc.value ? lzMirrorOwner(await lzMirrorProvider(), sku.code, bc.value) : null;
+    if (lzHit) return res.status(409).json({ ok: false, reason: 'lzbc_taken', field: 'logizard_barcode', error: `ロジザードのバーコード ${bc.value} はロジザードでほかの商品 (${lzHit}) が使っています。何も保存していません` });
     await db.query('begin');
     let r;
     try {
-      r = await setLzBarcodeRuleInTx(db, { requestId: rid, actor: String(req.session.email).trim().toLowerCase(), skuId: sku.id, rule, pinned, via: 'sku_page', seenRow: seen });
+      r = await setLzBarcodeInTx(db, { requestId: rid, actor: String(req.session.email).trim().toLowerCase(), skuId: sku.id, kind: bc.kind, value: bc.value, via: 'sku_page', seenRow: seen });
       await db.query('commit');
     } catch (e) {
       try { await db.query('rollback'); } catch { /* 接続が切れていれば rollback も失敗する */ }
       throw e;
     }
-    res.json({ ok: true, rule: r.rule, pinned: r.pinned ?? null, changed: !!r.changed, rule_row: r.rule_row ?? null, replayed: !!r.replayed });
+    res.json({ ok: true, kind: r.kind, value: r.value ?? null, changed: !!r.changed, rule_row: r.rule_row ?? null, replayed: !!r.replayed });
   }, 'write');
 });
 

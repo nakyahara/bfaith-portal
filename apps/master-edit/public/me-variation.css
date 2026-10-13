@@ -152,6 +152,9 @@ button.kindcard { font: inherit; cursor: pointer; width: 100%; }
 .krow .c-name .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; align-items: center; }
 .krow .c-money { display: grid; gap: 3px; justify-items: start; }
 .krow .c-jan .in { width: 100%; height: 36px; font-size: 13.5px; padding: 0 8px; }
+/* 🆕 0080 ロジザードのバーコードの列 (0080 がある DB だけ = .lzon) */
+.klist.lzon .khead, .klist.lzon .krow { grid-template-columns: 176px minmax(0, 1fr) 146px 140px 140px 72px; }
+.krow .c-lz .in { width: 100%; height: 36px; font-size: 13.5px; padding: 0 8px; }
 .krow .c-btn .btn { width: 100%; padding: 0 6px; }
 .krow .k-err { grid-column: 1 / -1; margin-top: 4px; }
 .krow .k-err:empty { display: none; }
@@ -235,6 +238,7 @@ button.kindcard { font: inherit; cursor: pointer; width: 100%; }
 }
 @media (max-width: 1240px) {
   .khead, .krow { grid-template-columns: 160px minmax(0, 1fr) 140px 132px 72px; }
+  .klist.lzon .khead, .klist.lzon .krow { grid-template-columns: 150px minmax(0, 1fr) 132px 124px 124px 72px; }
 }
 /* スマホの幅 (横にはみ出さない・押す所は 44px 以上) */
 @media (max-width: 760px) {
@@ -266,7 +270,8 @@ button.kindcard { font: inherit; cursor: pointer; width: 100%; }
   .checklist li > button, .chkgrp li button { min-height: 44px; }
   .matrix button.cell { height: 44px; }
   .khead { display: none; }
-  .krow { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "c b" "n n" "m m" "j j" "e e" "k k"; row-gap: 6px; }
+  .krow, .klist.lzon .krow { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "c b" "n n" "m m" "j j" "l l" "e e" "k k"; row-gap: 6px; }
+  .krow .c-lz { grid-area: l; } .krow .c-lz .in { height: 44px; }
   .krow .c-code { grid-area: c; } .krow .c-btn { grid-area: b; } .krow .c-name { grid-area: n; } .krow .c-money { grid-area: m; display: flex; flex-wrap: wrap; gap: 6px; }
   .krow .c-jan { grid-area: j; } .krow .k-err { grid-area: e; } .krow .kedit { grid-area: k; grid-template-columns: minmax(0, 1fr); }
   .krow .c-jan .in { height: 44px; }

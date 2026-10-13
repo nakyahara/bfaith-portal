@@ -133,6 +133,9 @@ async function fillCommon(p, { price = '12800', cost = '5200', tax = '0.1', sale
  */
 const noneRest = (p) => p.evaluate(() => {
   let n = 0;
+  // 🆕 0080: ロジザードのバーコードの無い子 = 「空欄で送る」(入力なしと同じ形の印)
+  const lz = document.getElementById('lz-blank-rest');
+  if (lz && !lz.checked && !lz.closest('[hidden]')) lz.click();
   for (const id of ['po-cond-mode', 'po-mat-mode']) {
     const sg = document.getElementById(id);
     if (sg && !sg.getAttribute('data-value')) { sg.querySelector('button[data-v="none"]').click(); n++; }
@@ -547,10 +550,12 @@ await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発
   await p.waitForSelector('#result .result', { timeout: 60000 });
   assert.match(await p.innerText('#result'), /2 件を下書きにしました/);
   assert.deepEqual(bodies[0].blanks, ['cost', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan']);
-  // 🆕 0078: ロジザードに送るバーコード = 初めから「自動」(入力なしの一覧に入らない)・全部の子に 1 行ずつ
-  assert.equal(bodies[0].logizard_barcode, 'auto');
+  // 🆕 0080: ロジザードのバーコード = 子ごと (JAN のある子 = 初めは JAN・無い子 = 「空欄で送る」の印で空欄)・全部の子に 1 行ずつ
+  const lzOf = Object.fromEntries(bodies[0].children.map((k) => [k.code, k.lz_barcode]));
+  assert.deepEqual(lzOf['nonegrp-BK'], { kind: 'lz_assign' });
+  assert.equal(lzOf['nonegrp-WH'].kind, 'value');
   assert.deepEqual((await q(`select s.code, r.rule from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK') order by s.code`)).map((r) => [r.code, r.rule]),
-    [['nonegrp-BK', 'auto'], ['nonegrp-WH', 'auto']]);
+    [['nonegrp-BK', 'lz_assign'], ['nonegrp-WH', 'jan']]);
   // 子ごとの記録 (#1706 Codex R1 M1): 原価・JAN は その子に無いときだけ (WH = 子だけの原価 700・JAN あり / BK = どちらも無い)
   const reasons = Object.fromEntries((await q(`select s.code, e.reason from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK')`)).map((r) => [r.code, r.reason]));
   assert.deepEqual(reasons, {

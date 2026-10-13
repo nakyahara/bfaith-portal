@@ -958,6 +958,8 @@ await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP �
 const fillReq = async (p, { set = false } = {}) => {
   if (!set) { await p.click('#f-sales_class button[data-v="3"]'); await p.click('#f-expiry button[data-v="0"]'); }
   await p.fill('#f-reorder_months', '1');
+  // 🆕 0080: 単品のロジザードのバーコード (必須 = 値か「空欄」)。ほかの決まりの試験は「空欄」
+  if (!set && (await p.locator('#f-lzbc-blank').count())) await p.check('#f-lzbc-blank');
 };
 /**
  * 🆕 2026-10-13 (入力なし): 値の無い必須でない項目を全部「入力なし」にする (画面でチェックを押すのと同じ・発注条件グループ / 原料グループは「なし」)。
@@ -984,9 +986,10 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   assert.match(p.url(), /new\?kind=single$/);
   assert.equal(await dirty(p), 0);
   // 🆕 2026-10-13 (入力なし): 必須 8 + 必須でない 18 (原価・Amazon・公式ページ・発送方法・セット商品・発注の設定 6・入荷日の管理・参考 URL・Yahoo! 5) = 26
-  assert.match(await p.textContent('#remain'), /あと\s*26\s*つ/);
+  //   🆕 0080: + ロジザードのバーコード (必須 = 値か空欄) = 27
+  assert.match(await p.textContent('#remain'), /あと\s*27\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
-  assert.match(await p.textContent('#save'), /あと 26 つ: 商品コード/);
+  assert.match(await p.textContent('#save'), /あと 27 つ: 商品コード/);
   await p.fill('#reason', '理由だけ');
   assert.equal(await dirty(p), 0, '保存の理由は数えない');
   await p.click('#checklist button:has-text("税率")');
@@ -1011,15 +1014,15 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   await p.waitForSelector('#code-msg.ok');
   await p.fill('#f-name', 'UI 新商品 1');
   await p.fill('#f-standard_price', '1280');
-  assert.match(await p.textContent('#save'), /あと 23 つ: 税率/);
+  assert.match(await p.textContent('#save'), /あと 24 つ: 税率/);
   await p.click('#f-tax_rate button[data-v="0.08"]');
   // 2026-10-08 中原さん: 代表の仕入先は ① (必須)・発送方法は ③ (あとでも可) = 発送方法を選んでも保存できない
   await p.selectOption('#shipping', 'S02');
-  assert.match(await p.textContent('#save'), /あと 21 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 22 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true, '代表の仕入先が無い = 押せない');
   await p.selectOption('#f-primary_supplier', '0001');
   // 🆕 0061: 売上分類・推奨保有月数・ロジザードの有効期限の管理もそろうまで押せない
-  assert.match(await p.textContent('#save'), /あと 20 つ: 売上分類/);
+  assert.match(await p.textContent('#save'), /あと 21 つ: 売上分類/);
   assert.equal(await p.isDisabled('#save'), true);
   await fillReq(p);
   // 🆕 2026-10-13: 必須がそろっても、必須でない項目が「値」も「入力なし」も無いうちは押せない
@@ -1064,7 +1067,7 @@ await ta('[35b] 新商品の登録 (2026-10-08 中原さん): 発送方法を選
   await p.fill('#f-name', '発送方法なしの単品');
   await p.fill('#f-standard_price', '990');
   await p.click('#f-tax_rate button[data-v="0.1"]');
-  assert.match(await p.textContent('#save'), /あと 22 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 23 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true);
   await p.selectOption('#f-primary_supplier', '0001');
   await fillReq(p);
@@ -2407,18 +2410,25 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   await noneRest(p);
   assert.match(await p.textContent('#remain'), /下書きを保存できます/);
   assert.equal(await p.locator('#checklist li.todo').count(), 0);
-  // 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコード = 初めから「自動」が押された形 (入力なしは無い = 数えない)・押し替えると送る値が変わる
-  assert.equal(await p.getAttribute('#f-lzbc', 'data-value'), 'auto');
-  assert.equal(await p.locator('[data-row="logizard_barcode"] .nonechk').count(), 0, 'ロジザードのバーコードに入力なしがある');
-  await p.click('#f-lzbc button[data-v="fnsku"]');
-  assert.equal(await p.getAttribute('#f-lzbc', 'data-value'), 'fnsku');
+  // 🆕 0080 (CompanyDB構想 23 v4): ロジザードのバーコード = 必須 (値か「空欄」)。空欄の印を外す = 押せない・値を打つと空欄の印が外れる・形の一言
+  await p.uncheck('#f-lzbc-blank');
+  assert.equal(await p.isDisabled('#save'), true, 'ロジザードのバーコードが無いのに押せる');
+  assert.match(await p.textContent('#checklist'), /ロジザードのバーコード/);
+  await p.fill('#f-lzbc-in', '4901234567890');
+  assert.match(await p.textContent('#f-lzbc-msg'), /チェック数字/);
+  assert.equal(await p.isDisabled('#save'), true);
+  await p.check('#f-lzbc-blank');
+  assert.equal(await p.inputValue('#f-lzbc-in'), '', '空欄に印で値が残った');
+  await p.fill('#f-lzbc-in', 'x00uin0001');
+  assert.equal(await p.isChecked('#f-lzbc-blank'), false, '値を打ったのに空欄の印が残った');
+  assert.match(await p.textContent('#f-lzbc-msg'), /FNSKU の形/);
   const bodies = [];
   p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url())) bodies.push(JSON.parse(rq.postData())); });
   await Promise.all([p.waitForURL(/\/sku\/ui-none-1$/), p.click('#save')]);
-  assert.equal(bodies[0].logizard_barcode, 'fnsku');
-  assert.deepEqual((await pg.query(`select r.rule, r.via from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = 'ui-none-1'`)).rows, [{ rule: 'fnsku', via: 'register' }]);
-  // 登録の後の商品の画面に「ロジザードに送るバーコード」(決め方 = FNSKU・FNSKU はまだ無い = 待つ)
-  assert.match(await p.innerText('#sec-lzbc'), /待つ/);
+  assert.deepEqual(bodies[0].logizard_barcode, { kind: 'value', value: 'X00UIN0001' });
+  assert.deepEqual((await pg.query(`select r.rule, r.value, r.via from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = 'ui-none-1'`)).rows, [{ rule: 'fnsku', value: 'X00UIN0001', via: 'register' }]);
+  // 登録の後の商品の画面に「ロジザードのバーコード」(いま = 打った値)
+  assert.match(await p.innerText('#sec-lzbc'), /X00UIN0001/);
   // 送る印 = サーバーと同じ並び (lib/master-register-blanks.mjs の BLANK_KEYS)
   assert.deepEqual(bodies[0].blanks, ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit',
     'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.reference_urls', 'card.set_decision', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);

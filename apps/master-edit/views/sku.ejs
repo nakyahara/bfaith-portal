@@ -224,7 +224,7 @@
           <% } %>
           <%- row('reorder_months', '推奨保有月数', '<span class="stepper"><button type="button" data-step="-1" aria-label="1 か月へらす">−</button><input id="f-reorder_months" inputmode="decimal" autocomplete="off" ' + meta('reorder_months') + ' data-unit=" か月" value="' + h(c.reorder_months ?? '') + '" placeholder="—"><button type="button" data-step="1" aria-label="1 か月ふやす">＋</button></span><span class="unit">か月</span>', c.reorder_months == null ? '未入力' : c.reorder_months + ' か月', { forId: 'f-reorder_months', hint: '発注の目安に使います (0〜60・小数は 1 桁まで)' }) %>
           <% if (c.sku_kind === 'single') { %>
-            <%- row('jan', 'JAN', '<div class="ctl col" style="gap:6px;width:100%"><div class="tokens" id="jan-tokens" role="group" aria-labelledby="lab-jan">' + page.jan.map((j) => '<span class="tok" data-jan="' + h(j) + '"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>' + h(j) + '<button type="button" aria-label="JAN ' + h(j) + ' を外す">×</button></span>').join('') + '<input id="jan-in" inputmode="numeric" autocomplete="off" aria-label="JAN を足す (8 桁か 13 桁)" placeholder="JAN を足す (8 桁か 13 桁) → Enter"></div><input type="hidden" id="f-jan" ' + meta('jan') + ' value="' + h(page.jan.join(', ')) + '"><span class="fmsg" id="jan-msg" aria-live="polite"></span><span class="hint">桁とチェック数字をその場で確かめます · ほかの商品の JAN は入れられません · 5 つまで · product-hub (楽天の出品) で使います · ロジザードに送るバーコードは下の「ロジザードに送るバーコード」(FNSKU があれば FNSKU) · NE の JAN は NE の画面で</span></div>', page.jan.length ? page.jan.join('・') : 'なし', { mono: true }) %>
+            <%- row('jan', 'JAN', '<div class="ctl col" style="gap:6px;width:100%"><div class="tokens" id="jan-tokens" role="group" aria-labelledby="lab-jan">' + page.jan.map((j) => '<span class="tok" data-jan="' + h(j) + '"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>' + h(j) + '<button type="button" aria-label="JAN ' + h(j) + ' を外す">×</button></span>').join('') + '<input id="jan-in" inputmode="numeric" autocomplete="off" aria-label="JAN を足す (8 桁か 13 桁)" placeholder="JAN を足す (8 桁か 13 桁) → Enter"></div><input type="hidden" id="f-jan" ' + meta('jan') + ' value="' + h(page.jan.join(', ')) + '"><span class="fmsg" id="jan-msg" aria-live="polite"></span><span class="hint">桁とチェック数字をその場で確かめます · ほかの商品の JAN は入れられません · 5 つまで · product-hub (楽天の出品) で使います · ロジザードに送るバーコードは下の「ロジザードのバーコード」(FNSKU か JAN を打つ) · NE の JAN は NE の画面で</span></div>', page.jan.length ? page.jan.join('・') : 'なし', { mono: true }) %>
             <%# ロジザードの最初の値 (2026-10-08 中原さん「下書きの状態なら、ロジザードの期限管理の情報とかも編集できるように」): 下書き かつ NE 登録の CSV を配る前だけ直せる。
                 配った後・NE 登録待ちより先はロジザードが正 = 🔒 で理由を出す (保存も 409 logizard_locked・DB も 0062 で断る) %>
             <% const LG = page.locks.logizard; const flagText = (v) => (v == null ? '不明' : v ? 'あり' : 'なし');
@@ -254,7 +254,7 @@
         <% if (orderSettings) { %><%- include('_order', { os: orderSettings, mode: 'sku', dis: '', stepNo: null, base, code: c.code }) %><% } %>
         <%# AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリに保存・部品 = _amc-label.ejs・public/me-amclabel.js)。JAN・FNSKU・入庫の BC シールとは別 %>
         <% if (typeof amcLabel !== 'undefined' && amcLabel) { %><%- include('_amc-label', { al: amcLabel, base, code: c.code }) %><% } %>
-        <%# 🆕 0078 ロジザードに送るバーコード (CompanyDB構想 23・単品だけ・部品 = _lz-barcode.ejs・public/me-lzbarcode.js)。JAN の欄・AMC ラベルとは別 %>
+        <%# 🆕 0080 ロジザードのバーコード (CompanyDB構想 23 v4・単品だけ・値か空欄・部品 = _lz-barcode.ejs・public/me-lzbarcode.js)。JAN の欄・AMC ラベルとは別 %>
         <% if (typeof lzBarcode !== 'undefined' && lzBarcode && lzBarcode.show) { %><%- include('_lz-barcode', { lz: lzBarcode, base, code: c.code }) %><% } %>
 
         <section class="panel" id="p-basic" aria-labelledby="h-basic">
@@ -620,7 +620,7 @@
   <% if (page && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
   <%# me-amclabel.js も me-sku.js の後 (MasterEdit.dirty に AMC ラベルの未保存を足す) %>
   <% if (page && typeof amcLabel !== 'undefined' && amcLabel && amcLabel.target && amcLabel.canWrite) { %><script src="<%= base %>/public/me-amclabel.js?v=<%= assetV %>" defer></script><% } %>
-  <%# 🆕 0078: me-lzbarcode.js も me-sku.js の後 (MasterEdit.dirty にロジザードのバーコードの未保存を足す) %>
+  <%# 🆕 0080: me-lzbarcode.js も me-sku.js の後 (MasterEdit.dirty にロジザードのバーコードの未保存を足す) %>
   <% if (page && typeof lzBarcode !== 'undefined' && lzBarcode && lzBarcode.show && !lzBarcode.error && lzBarcode.canWrite) { %><script src="<%= base %>/public/me-lzbarcode.js?v=<%= assetV %>" defer></script><% } %>
   <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
