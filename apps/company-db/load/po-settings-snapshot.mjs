@@ -14,7 +14,8 @@
  *   5. 🆕 Codex #1708 R1 M1: **PG の鍵を取ってから SQLite を読む** (同時に 2 本 = 読みも順番 = 古い読みが新しい写しを上書きしない)。
  *      それでも同じ時刻 (ミリ秒) で中身の違う読み = あいまい = 断る (ambiguous_read)・前の世代より前の読み = 断る (older_read)
  *   6. 🆕 M2: 減りの受け入れ = env PO_SNAPSHOT_ACCEPT_SHRINK に「表:件数」(例 attrs:10) = **1 回だけ** (使った回を世代の override に残し、同じ値は 2 回目から効かない)
- *   7. 🆕 M3: 正規化した後の鍵の重なり (大文字小文字・前後の空白だけ違う商品) = 不完全とみなして断る (duplicate_key・黙って捨てない)
+ *   7. 🆕 M3: 正規化した後の鍵の重なり (大文字小文字・前後の空白だけ違う商品) = 不完全とみなして断る (duplicate_key・黙って捨てない)。
+ *      🆕 R2 M2: 別々の行が同じ SKU に結ばれる (全角の記号だけ違うコードなど) = duplicate_sku で断る
  * 手で 1 回だけ流す (復元の後など・本番ランナーは流さない) = Render の Shell で `node apps/company-db/load/po-settings-snapshot.mjs --apply` (README「バックアップと復元」)
  */
 import fs from 'node:fs';
@@ -131,6 +132,22 @@ export async function applyPoSettingsSnapshot(db, source, { host = null, shrinkO
     }
     // 正規化した後の鍵の重なり = 不完全 (黙って 1 行を捨てない・Codex #1708 R1 M3)
     for (const [k, keys] of Object.entries(duplicateKeys(snap.rows))) problems.push(`duplicate_key: ${TABLES[k].table} の鍵が正規化で重なる (${keys.slice(0, 5).join(', ')}${keys.length > 5 ? ` ほか ${keys.length - 5}` : ''})`);
+    // 結ぶ値 (写した時の Company DB の SKU と代表の仕入先)。別々の行が同じ SKU に結ばれる = どちらの設定か決められない = 断る (Codex #1708 R2 M2)
+    const codes = [...new Set(snap.rows.attrs.map((r) => String(r.product_code)))];
+    const link = new Map((await db.query(`select x.code, s.sku_id::text as sku_id,
+        (select sp.code from core.supplier_skus ss join core.suppliers sp on sp.supplier_id = ss.supplier_id where ss.sku_id = s.sku_id and ss.is_primary order by sp.code limit 1) as supplier
+       from unnest($1::text[]) as x(code) join core.skus s on s.company_id = 1 and s.code_norm = core.norm_code(x.code)`, [codes])).rows.map((r) => [r.code, r]));
+    {
+      const bySku = new Map();
+      for (const r of snap.rows.attrs) {
+        const l = link.get(String(r.product_code));
+        if (!l) continue;
+        if (!bySku.has(l.sku_id)) bySku.set(l.sku_id, new Set());
+        bySku.get(l.sku_id).add(String(r.product_key).trim().toLowerCase());
+      }
+      const dup = [...bySku.values()].filter((s) => s.size > 1).map((s) => [...s].sort().join(' / '));
+      if (dup.length) problems.push(`duplicate_sku: 発注アプリの別々の行が同じ SKU に結ばれる (${dup.slice(0, 3).join('・')}${dup.length > 3 ? ` ほか ${dup.length - 3}` : ''})`);
+    }
     let override = null;
     if (!problems.length && prev) {
       const shrinks = [];
@@ -144,7 +161,9 @@ export async function applyPoSettingsSnapshot(db, source, { host = null, shrinkO
         if (shrinkOverride) {
           const used = (await db.query(`select 1 from purchasing.snapshot_runs where override ->> 'token' = $1 limit 1`, [shrinkOverride.token])).rows.length > 0;
           if (used) why = ' (受け入れの env は使用済み = 2 回目は効かない)';
-          else if (!shrinks.every((x) => shrinkOverride.tables[x.table] === x.now)) why = ` (受け入れの env ${shrinkOverride.token} と表・件数が違う)`;
+          // 指定の表の集まり = 実際に減った表の集まり (減っていない表を足して使い回せない)・件数もちょうど
+          else if (Object.keys(shrinkOverride.tables).sort().join() !== shrinks.map((x) => x.table).sort().join()
+            || !shrinks.every((x) => shrinkOverride.tables[x.table] === x.now)) why = ` (受け入れの env ${shrinkOverride.token} と表・件数が違う)`;
         }
         if (why === null) override = { kind: 'accept_shrink', token: shrinkOverride.token, tables: shrinkOverride.tables, accepted: shrinks };
         else for (const x of shrinks) problems.push(`shrink: ${TABLES[x.table].table} が ${x.was} → ${x.now} 行 (前の世代の ${Math.round(SHRINK_RATIO * 100)}% 未満 = 途中の読み・移行の途中かもしれない)${why}`);
@@ -157,11 +176,6 @@ export async function applyPoSettingsSnapshot(db, source, { host = null, shrinkO
       await db.query('commit');
       return { ok: false, status: 'rejected', run_id: runId, counts: snap.counts, problems, snap };
     }
-    // 結ぶ値 (写した時の Company DB の SKU と代表の仕入先)
-    const codes = [...new Set(snap.rows.attrs.map((r) => String(r.product_code)))];
-    const link = new Map((await db.query(`select x.code, s.sku_id::text as sku_id,
-        (select sp.code from core.supplier_skus ss join core.suppliers sp on sp.supplier_id = ss.supplier_id where ss.sku_id = s.sku_id and ss.is_primary order by sp.code limit 1) as supplier
-       from unnest($1::text[]) as x(code) join core.skus s on s.company_id = 1 and s.code_norm = core.norm_code(x.code)`, [codes])).rows.map((r) => [r.code, r]));
     const ctx = { skuOf: (c) => (link.get(String(c)) ? link.get(String(c)).sku_id : null), supplierOf: (c) => (link.get(String(c)) ? link.get(String(c)).supplier : null) };
     const want = Object.fromEntries(Object.entries(SHAPES).map(([k, sh]) => [k, snap.rows[k].map((r) => sh.of(r, ctx))]));
     // 前と同じ (SQLite の hash が同じ・結んだ値も同じ) = unchanged
@@ -224,7 +238,9 @@ export function parseShrinkOverride(env = process.env) {
     if (!m || Object.hasOwn(tables, m[1])) return null;
     tables[m[1]] = Number(m[2]);
   }
-  return { token: raw, tables };
+  // token = 表の名前の順・数は正規化した形 (Codex #1708 R2 M1 = 書き方 (010・空白・並び) を変えて「1 回だけ」をすり抜けない)
+  const token = Object.keys(tables).sort().map((k) => `${k}:${tables[k]}`).join(',');
+  return { token, tables };
 }
 
 /**

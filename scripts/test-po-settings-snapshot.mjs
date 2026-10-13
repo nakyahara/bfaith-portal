@@ -161,11 +161,17 @@ await ta('[S3] 完全に読めない回は入れ替えない (前の世代のま
   // Codex #1708 R1 M2: 人が決めた時だけ減った表を受け入れる = env「表:件数」・1 回だけ・使った回を世代に残す
   assert.deepEqual(S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:10' }), { token: 'attrs:10', tables: { attrs: 10 } });
   assert.deepEqual(S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:10, materials:3' }).tables, { attrs: 10, materials: 3 });
+  // Codex #1708 R2 M1: token = 表の名前の順・数は正規化 (書き方を変えても同じ token)
+  for (const w of ['attrs:010', ' attrs : 10 ', 'attrs:0010']) assert.equal(S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: w }).token, 'attrs:10', w);
+  assert.equal(S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'materials:3,attrs:10' }).token, 'attrs:10,materials:3');
   for (const bad of ['', 'attrs', 'attrs:x', 'items:10', 'attrs:10,attrs:11', 'x'.repeat(201)]) assert.equal(S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: bad }), null, bad);
   const bfile = path.join(broken, 'warehouse-mirror.db');
   // 件数が違う env = 受け入れない
   let acc = await S.applyPoSettingsSnapshot(db, () => S.readPoSettingsSnapshot(bfile), { shrinkOverride: S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:11' }) });
   assert.deepEqual([acc.ok, acc.status], [false, 'rejected']); assert.match(acc.problems.join(), /件数が違う/);
+  // 減っていない表を足した env = 受け入れない (指定の表の集まり = 実際に減った表の集まり)
+  acc = await S.applyPoSettingsSnapshot(db, () => S.readPoSettingsSnapshot(bfile), { shrinkOverride: S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:10,materials:22' }) });
+  assert.deepEqual([acc.ok, acc.status], [false, 'rejected']); assert.match(acc.problems.join(), /表・件数が違う/);
   acc = await S.applyPoSettingsSnapshot(db, () => S.readPoSettingsSnapshot(bfile), { shrinkOverride: S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:10' }) });
   assert.deepEqual([acc.ok, acc.status, acc.changes.attrs.removed, acc.override.token], [true, 'applied', 21, 'attrs:10']);
   assert.deepEqual((await one(`select override from purchasing.snapshot_runs where run_id = $1`, [acc.run_id])).override,
@@ -177,9 +183,11 @@ await ta('[S3] 完全に読めない回は入れ替えない (前の世代のま
   r = await step();
   assert.deepEqual([r.ok, r.status], [true, 'unchanged']);
   assert.equal((await one('select rejected_since_at from purchasing.v_snapshot_status')).rejected_since_at, null);
-  // 同じ env の 2 回目 = 効かない (env を消し忘れても次の減りは守る)
-  acc = await S.applyPoSettingsSnapshot(db, () => S.readPoSettingsSnapshot(bfile), { shrinkOverride: S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:10' }) });
-  assert.deepEqual([acc.ok, acc.status], [false, 'rejected']); assert.match(acc.problems.join(), /使用済み/);
+  // 同じ env の 2 回目 = 効かない (env を消し忘れても次の減りは守る)・書き方を変えても同じ (attrs:010・空白)
+  for (const w of ['attrs:10', 'attrs:010', ' attrs : 10']) {
+    acc = await S.applyPoSettingsSnapshot(db, () => S.readPoSettingsSnapshot(bfile), { shrinkOverride: S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: w }) });
+    assert.deepEqual([acc.ok, acc.status], [false, 'rejected'], w); assert.match(acc.problems.join(), /使用済み/, w);
+  }
   // 段の道でも env を読む (1 回だけ = もう使った値)
   process.env.PO_SNAPSHOT_ACCEPT_SHRINK = 'attrs:10';
   try { r = await step({ dataDir: broken }); } finally { delete process.env.PO_SNAPSHOT_ACCEPT_SHRINK; }
@@ -195,6 +203,28 @@ await ta('[S10] (Codex #1708 R1 M3) 正規化した後に鍵が重なる (大文
     assert.equal(r.ok, false); assert.match(r.note, /duplicate_key: po_product_attrs の鍵が正規化で重なる \(snap-01\)/);
     assert.deepEqual(await rows(`select * from purchasing.sku_order_settings order by product_key`), before);
   } finally { podb.prepare(`DELETE FROM po_product_attrs WHERE product_key = 'SNAP-01'`).run(); }
+  assert.equal((await step()).ok, true);
+});
+
+await ta('[S12] (Codex #1708 R2 M2) 別々の行が同じ SKU に結ばれる (全角の記号だけ違う商品コード) = 入れ替えない (duplicate_sku)・商品 360 は重なった SKU の po_* を出さず印 (po_settings_ambiguous)', async () => {
+  const before = await rows(`select * from purchasing.sku_order_settings order by product_key`);
+  podb.prepare('INSERT INTO po_product_attrs (product_key, product_code, order_lot, created_at, updated_at) VALUES (?,?,?,?,?)').run('snap－07', 'snap－07', 70, T0, T0);
+  try {
+    const r = await step();
+    assert.equal(r.ok, false); assert.match(r.note, /duplicate_sku: 発注アプリの別々の行が同じ SKU に結ばれる \(snap-07 \/ snap－07\)/);
+    assert.deepEqual(await rows(`select * from purchasing.sku_order_settings order by product_key`), before);
+  } finally { podb.prepare(`DELETE FROM po_product_attrs WHERE product_key = 'snap－07'`).run(); }
+  // view の守り (持ち主が直接重ねた = 写しの段の外の道でも): 重なった SKU は po_* を出さず印・ほかの SKU はそのまま
+  const s07 = (await one(`select sku_id from core.skus where code = 'snap-07'`)).sku_id;
+  const run = (await one('select run_id from purchasing.v_snapshot_status')).run_id;
+  await pg.query(`insert into purchasing.sku_order_settings (product_key, product_code, sku_id, order_lot, run_id) values ('snap－07', 'snap－07', $1, 70, $2)`, [s07, run]);
+  try {
+    const v = await one(`select po_order_lot, po_settings_ambiguous from mart.v_product_360 where sku_code = 'snap-07'`);
+    assert.deepEqual([v.po_order_lot, v.po_settings_ambiguous], [null, true]);
+    const o = await one(`select po_order_lot, po_settings_ambiguous from mart.v_product_360 where sku_code = 'snap-08'`);
+    assert.deepEqual([Number(o.po_order_lot), o.po_settings_ambiguous], [8, false]);
+    assert.equal((await one('select count(*)::int as n from mart.v_product_360')).n, (await one('select count(*)::int as n from core.skus')).n);
+  } finally { await pg.query(`delete from purchasing.sku_order_settings where product_key = 'snap－07'`); }
   assert.equal((await step()).ok, true);
 });
 

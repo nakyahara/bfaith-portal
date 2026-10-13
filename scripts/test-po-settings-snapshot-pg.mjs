@@ -118,6 +118,8 @@ try {
     assert.ok(['42501', '25006'].includes(await codeOf(W, `delete from purchasing.material_groups`)));
     await W.query('rollback').catch(() => {});
     assert.equal(await codeOf(E, 'select 1 from purchasing.sku_order_settings limit 1'), '42501');
+    // Codex #1708 R2 L1: 商品 360 の po_* 経由でも読めない (mart の usage が無い)
+    assert.equal(await codeOf(E, 'select po_order_lot, po_settings_read_at from mart.v_product_360 limit 1'), '42501');
     assert.equal(await codeOf(E, `insert into purchasing.material_groups (group_id, name, run_id) values ('x', 'x', 'x')`), '42501');
   });
 } finally {

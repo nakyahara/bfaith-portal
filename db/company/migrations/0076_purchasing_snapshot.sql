@@ -15,6 +15,8 @@
 --   3. purchasing.v_snapshot_status = 今の写し (最後の applied / unchanged) の読んだ時刻・何時間前か・36 時間を超えたか・最後に断った回
 --   4. mart.v_product_360 の最後に列を足す (発注ロット・グループ・ケース・容量と、写しの読んだ時刻・何時間前か)。
 --      決定 5 = b (中原さん 10/13): 古い写し (36 時間超) も AI はそのまま使う = 行を外さない・時刻 (po_settings_read_at / po_settings_age_hours) を見せる
+--      po_settings_ambiguous = 同じ SKU に発注アプリの 2 行が結ばれている (po_* は出さない・ふだんは写しの段が duplicate_sku で断る)
+--   🚨 バックアップ (dump.mjs) は purchasing を取らない = 復元の直後に写しの段だけを手で 1 回流す (node apps/company-db/load/po-settings-snapshot.mjs --apply)
 -- 書く人: 夜間ロードの後ろの段 (apps/company-db/load/po-settings-snapshot.mjs・表の持ち主のロール = COMPANY_DB_URL) だけ。本体のロードとは別の取引。
 --   画面のロール・見張り・AI は読むだけ (書く権限は渡さない)。列の制限は要らない (秘密の値・ファイルのバイト列は無い)
 -- 🚨 この migration は今のデータを何も変えない (新しい表は空 = 最初の夜間の段で入る)。バックアップ (apps/company-db/backup/dump.mjs) は取らない = 写しは発注アプリから作り直せる
@@ -140,10 +142,13 @@ malls as (
   group by lc.sku_id
 ),
 po as (
-  -- 🆕 0076: 発注の設定の写し (発注アプリが正本・写した時刻つき)。SKU に 1 行だけ (全角など正規化で同じ SKU に当たる 2 行が来ても行を増やさない = 鍵の小さい方)
-  select distinct on (os.sku_id) os.sku_id, os.order_lot, os.condition_id, os.material_group_id, os.case_group, os.case_lot, os.capacity_per_unit
+  -- 🆕 0076: 発注の設定の写し (発注アプリが正本・写した時刻つき)。SKU に 1 行だけ。同じ SKU に 2 行 (全角の記号だけ違うコードなど) = どちらか決められない =
+  --   po_* は出さず po_settings_ambiguous = true (写しの段は duplicate_sku で断るので、ふだんは起きない・Codex #1708 R2 M2)
+  select os.sku_id, pg_catalog.count(*)::int as n, pg_catalog.min(os.order_lot) as order_lot, pg_catalog.min(os.condition_id) as condition_id,
+         pg_catalog.min(os.material_group_id) as material_group_id, pg_catalog.min(os.case_group) as case_group, pg_catalog.min(os.case_lot) as case_lot,
+         pg_catalog.min(os.capacity_per_unit) as capacity_per_unit
   from purchasing.sku_order_settings os where os.sku_id is not null
-  order by os.sku_id, os.product_key
+  group by os.sku_id
 )
 select
   s.sku_id, s.company_id, s.code as sku_code, s.code_norm, s.name as sku_name, s.sku_kind, s.handling, s.tax_rate, s.tax_class,
@@ -170,9 +175,11 @@ select
   ], null) as dq_flags,
   greatest(s.updated_at, p.updated_at) as updated_at,
   -- 🆕 0076: 発注の設定 (発注アプリの写し)。po_settings_read_at = いつの発注アプリの値か (写しが無い = null)。古くても外さない (決定 5 = b)
-  po.order_lot as po_order_lot, po.condition_id as po_condition_id, po.material_group_id as po_material_group_id,
-  po.case_group as po_case_group, po.case_lot as po_case_lot, po.capacity_per_unit as po_capacity_per_unit,
-  st.read_at as po_settings_read_at, st.age_hours as po_settings_age_hours
+  case when po.n = 1 then po.order_lot end as po_order_lot, case when po.n = 1 then po.condition_id end as po_condition_id,
+  case when po.n = 1 then po.material_group_id end as po_material_group_id, case when po.n = 1 then po.case_group end as po_case_group,
+  case when po.n = 1 then po.case_lot end as po_case_lot, case when po.n = 1 then po.capacity_per_unit end as po_capacity_per_unit,
+  st.read_at as po_settings_read_at, st.age_hours as po_settings_age_hours,
+  coalesce(po.n, 0) > 1 as po_settings_ambiguous
 from core.skus s
 left join core.products p on p.product_id = s.product_id
 left join ids ip on ip.entity_type = 'product' and ip.entity_id = p.product_id
