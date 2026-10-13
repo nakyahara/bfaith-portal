@@ -4,7 +4,7 @@
  * 9 つの道を交差させる (🆕 PR-2 #1640 が載った後: アプリの道は PR-2 の lib = 新規開始の鍵 lib/master-owner-gate.mjs の acquireNewEntryLocksInTx → 段階 → 土台の門 → 新規開始の門):
  *   A = 配る (アプリ lib/master-reg-csv.mjs の issueRegExport = 初めて配るだけ ops.acquire_new_entry_locks を段階の鍵より前に・画面のロール master_edit)
  *   B = 配る (DB の関数 ops.ne_reg_issue を master_edit で直接呼ぶ = アプリの鍵なし)
- *   C = 照合 ② の始めに閉じる (ops.close_new_entry_for_compare・watch_writer = 許可の排他)
+ *   C = 照合 ② の始め (ops.close_new_entry_for_compare・watch_writer。🆕 0082: 何もしない = 鍵を取らない・閉じない)
  *   D = 照合の確かめ (ops.record_ne_registration_check・watch_writer = 🆕 0065: マスタの書き込み (共有) → ne_reg_check → SKU → 親子 (共有) → CSV)
  *   F = CSV を作る (DB の関数 ops.ne_reg_build を master_edit で直接 = request → 許可 → 段階 → マスタの書き込み → SKU → CSV)
  *   G = CSV を作る (アプリ buildRegExport = request → 許可 → 段階 → マスタの書き込み → SKU → CSV → NE のコード → ops.ne_reg_build)
@@ -14,8 +14,8 @@
  * 段階ごとの barrier: 試験の接続が §3.10 の表の鍵 n を 1 つ排他で持ち、道を (順を変えて) 始める → 全部が「その鍵で待つ」か「終わる」まで待つ →
  *   待っている道ごとに pg_locks から {道・持っている鍵の番号・待っている鍵の番号} を記録し、「待っている鍵の番号 ≥ 持っている全部の鍵の番号」
  *   (= 小さい番号へ戻らない) を確かめる → 鍵を放す → deadlock (40P01) なしに終わる (閉じた後の配るは new_entry_closed)。
- * あわせて: ops.acquire_new_entry_locks の鍵とモード・ops.ne_reg_file も許可の共有の鍵を返すまで持つ (R19)・照合 ② の始めに閉じるのは配る取引を待つ・
- *   結果を書く前に落ちた再実行では開かない。
+ * あわせて: ops.acquire_new_entry_locks の鍵とモード・ops.ne_reg_file も許可の共有の鍵を返すまで持つ (R19)・🆕 0082: 照合 ② の始めは配る取引を待たず閉じない・
+ *   結果を書く前に落ちた再実行では新しい許可は出ない (前の許可のまま)。
  * 🆕 0065 (#1664 Codex R1 High) [22]: 夜間ロードが代表を書く直前で止まっている間、照合の確かめは待ち、ロードの後の Company DB の値で 3 者一致を比べる。
  * 使い方: TEST_PG_URL=postgres://… node scripts/test-master-widen-locks-pg.mjs (localhost だけ・使い捨ての DB を作って消す)
  */
@@ -326,6 +326,7 @@ try {
         assert.ok(closedOk(res.A), `${round} A: ${res.A.err && res.A.err.message}`);
         assert.ok(closedOk(res.B), `${round} B: ${res.B.err && res.B.err.message}`);
         assert.ok(!res.C.err, `${round} C: ${res.C.err && res.C.err.message}`);
+        assert.deepEqual([res.C.ok.revoked, res.C.ok.noop], [0, true], round);   // 🆕 0082: 何もしない
         assert.ok(!res.D.err, `${round} D: ${res.D.err && res.D.err.message}`);
         assert.ok(closedOk(res.G), `${round} G: ${res.G.err && res.G.err.message}`);
         assert.ok(closedOk(res.R), `${round} R: ${res.R.err && res.R.err.message}`);
@@ -341,7 +342,7 @@ try {
     }
     const waits = LOG.filter((x) => x.waiting != null);
     console.log(`  (barrier の記録 ${LOG.length} 件・例: ${JSON.stringify(waits.slice(0, 5))})`);
-    assert.ok(LOG.some((x) => x.path === 'C' && x.waiting === 2 && x.held.length === 0), '照合 ② の始めに閉じるのは許可の排他の鍵で待つ (何も持たずに)');
+    assert.ok(!LOG.some((x) => x.path === 'C' && x.waiting != null), '🆕 0082: 照合 ② の始め (close) は何も待たない = 鍵を取らない・閉じない');
     assert.ok(LOG.some((x) => x.path === 'A' && x.waiting === 7 && x.held.includes(2) && x.held.includes(5)), 'アプリの配るは許可・マスタの書き込みの鍵を持って SKU の鍵で待つ');
     assert.ok(LOG.some((x) => x.path === 'B' && x.waiting >= 4 && x.held.includes(2)), 'DB の関数を直接呼んでも許可の鍵を段階の鍵より先に取る');
     assert.ok(LOG.some((x) => x.path === 'F' && x.waiting === 4 && x.held.includes(1) && x.held.includes(2)), 'CSV を作る DB の関数は request → 許可の鍵を持って段階の鍵で待つ (R4)');
@@ -382,7 +383,7 @@ try {
     await reopen();
   });
 
-  await ta('[21] 照合 ② の始めに閉じる (許可の排他の鍵) は配る取引の完了を待つ・閉じた後の配る / 登録は閉じる (409)・結果を書く前に落ちた再実行では開かない', async () => {
+  await ta('[21] 🆕 0082: 照合 ② の始め (ops.close_new_entry_for_compare) は配る取引を待たない・何も閉じない = 照合の途中も配る / 登録 / 渡すが通る・結果を書く前に落ちた再実行では新しい許可は出ない (前の許可のまま)', async () => {
     n++;
     const y = `lk-i${n}`, y2 = `lk-j${n}`;
     await reg(y); await reg(y2);
@@ -391,19 +392,18 @@ try {
     await E1.query('begin');
     await E1.query('select ops.ne_reg_issue($1::uuid, $2, $3::jsonb, $4::bigint) as r', [crypto.randomUUID(), 'boss@test', OWN, e.export_id]);
     const cl = launch(pathC('close_21'));
-    await sleep(500);
-    assert.equal(cl.done, false, '閉じるのは配る取引を待つ');
+    await sleep(300);
+    assert.equal(cl.done, true, '照合 ② の始めは配る取引を待たない (鍵を取らない)');
+    const cr = await cl.promise; assert.ok(cr.ok, cr.err && cr.err.message); assert.deepEqual([cr.ok.revoked, cr.ok.noop], [0, true]);
     await E1.query('commit');
-    const cr = await cl.promise; assert.ok(cr.ok, cr.err && cr.err.message); assert.equal(cr.ok.revoked, 1);
     assert.equal((await one('select state from ops.ne_reg_exports where export_id = $1', [e.export_id])).state, 'issued');
-    await assert.rejects(G.issueRegExport(dbE1, { actor: 'boss@test', exportId: e2.export_id }, opts), (err) => err.status === 409 || /new_entry_closed|入口は閉じている/.test(err.message));
-    await assert.rejects(reg(`lk-k${n}`), (err) => err.status === 409 || /new_entry_closed|入口は閉じている/.test(err.message));
-    await assert.rejects(E2.query('select sha256 from ops.ne_reg_file($1::bigint)', [e.export_id]), /reg_file_expired: lease_invalid/);
-    // 結果を書く前に落ちた (close_21 の結果が無い) = 前の成功の回でも今回の回でも grant できない
-    const prev = (await one('select compare_run_id from ops.new_entry_gate_results order by result_id desc limit 1')).compare_run_id;
-    await assert.rejects(NG.query("select ops.grant_new_entry_lease('single', $1)", [prev]), /stop_floor/);
+    // 照合の途中も配る・登録・渡すが通る (閉じていない)
+    assert.equal((await G.issueRegExport(dbE1, { actor: 'boss@test', exportId: e2.export_id }, opts)).export.state, 'issued');
+    await reg(`lk-k${n}`);
+    assert.equal((await E2.query('select sha256 from ops.ne_reg_file($1::bigint)', [e.export_id])).rows[0].sha256, e.sha256);
+    // 結果を書く前に落ちた (close_21 の結果が無い) = 今回の回では grant できない・前の許可のまま
     await assert.rejects(NG.query("select ops.grant_new_entry_lease('single', 'close_21')"), /compare_run_mismatch/);
-    assert.equal((await one("select ops.new_entry_lease_valid('single') as v")).v, false);
+    assert.equal((await one("select ops.new_entry_lease_valid('single') as v")).v, true);
   });
 
   console.log(`\n${passed} 件 PASS`);

@@ -1330,9 +1330,19 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
     const d = lineDiff(fnDefIn(prev, name).split('\n'), fnDefIn(F0065, name).split('\n'));
     assert.deepEqual(d, { removed: want.removed, added: want.added }, `${name}: ${prev} との差`);
     // 例外は名指しの 0067 (PR-5 = まとまりの版): ops.ne_reg_canonical / ops.ne_reg_build を 0065 の版から写す = その中身は scripts/test-master-variation.mjs の [S2] が 0065 との差で確かめる
-    const allowLater = ['ops.ne_reg_canonical', 'ops.ne_reg_build'].includes(name) ? ['0067_variation_groups.sql'] : [];
+    //   🆕 0082 (新商品の許可の切れ目を 0 に): ops.ne_reg_issue を 0065 の版から写す = 差は下で確かめる
+    const allowLater = ['ops.ne_reg_canonical', 'ops.ne_reg_build'].includes(name) ? ['0067_variation_groups.sql'] : name === 'ops.ne_reg_issue' ? ['0082_new_entry_no_gap.sql'] : [];
     for (const later of MIG_FILES.filter((x) => x > F0065 && !allowLater.includes(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0065 の試験の元を見直す`);
   }
+  // 🆕 0082: ops.ne_reg_issue の 0065 との差 = NE のコードの回の確かめだけ (許可の回か、それより新しい照合の回の印も通す)
+  assert.deepEqual(lineDiff(fnDefIn(F0065, 'ops.ne_reg_issue').split('\n'), fnDefIn('0082_new_entry_no_gap.sql', 'ops.ne_reg_issue').split('\n')), {
+    removed: ['if v_mark is distinct from v_run then'],
+    added: [
+      '-- 🆕 0082: 許可の回より新しい照合の回 (ops.master_compare_runs の順) の印も通す = 照合の途中で印だけ先に進んだ朝 (次の許可の前) も配れる',
+      '--   (新しい回のコード + 消さない履歴 ops.master_ne_code_history = 許可の回より広く確かめる)。許可の回より古い印・回の記録が無い印は今までどおり ne_codes_stale',
+      'if v_mark is distinct from v_run and not exists (',
+      'select 1 from ops.master_compare_runs a, ops.master_compare_runs b',
+      'where a.compare_run_id = v_mark and b.compare_run_id = v_run and (a.observed_at, a.compare_run_id) > (b.observed_at, b.compare_run_id)) then'] }, '0082 の ops.ne_reg_issue と 0065 との差');
   // 権限: create or replace = 前の権限のまま (作る = 画面のロール・確かめ = watch_writer)・新しい部品はだれにも渡さない
   const priv = async (sig) => one(`select has_function_privilege('public', $1::regprocedure, 'execute') as pub, has_function_privilege('master_edit', $1::regprocedure, 'execute') as me,
       has_function_privilege('watch_writer', $1::regprocedure, 'execute') as ww, (select prosecdef from pg_proc where oid = $1::regprocedure) as d,
@@ -1484,10 +1494,16 @@ await ta('[W1] 0058 (広げる道 PR-1): 初回の配る (ne_reg_issue) の直�
   for (const c of ['new-x1', 'new-x2', 'new-x3', 'new-x4', 'new-x5', 'new-z1', 'new-z2', 'new-z3', 'new-z4']) await reg('single', c, single({ name: `広げる道 ${c}` }));
   // ① build の後に、今の NE のコード (master_ne_codes) にだけ現れた = 配らない
   const b1 = await build('products', ['new-x1']);
-  // ⓪ NE のコードの回が許可の回と違う (新しい照合が NE のコードを書いたが、その回の許可がまだ無い) = 配らない (R16 M5 ne_codes_stale)
+  // ⓪ 🆕 0082: NE のコードの回が許可の回より新しい (新しい照合が NE のコードを書いたが、その回の許可がまだ無い = 照合の途中) = 新しい回のコードで確かめて配る (切れ目を作らない)
+  //   = 許可の回のコードに無い new-x1 も、新しい回のコードにあれば配らない (新しい回 + 履歴 = 広く確かめる)
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T035000000Z_0a5800', '2030-01-10T03:50:00Z', 0)`);
-  await recordNeCodes(pg, 'mc_20300110T035000000Z_0a5800', ['new-dup'], { lease: false });
-  await pgErr(issue(b1.export.export_id), /NE のコードの回 \(mc_20300110T035000000Z_0a5800\) が許可を出した照合の回/);
+  await recordNeCodes(pg, 'mc_20300110T035000000Z_0a5800', ['new-dup', 'new-x1'], { lease: false });
+  await pgErr(issue(b1.export.export_id), /new-x1 は NE にもうある/);
+  assert.equal((await expOf(b1.export.export_id)).state, 'built');
+  // NE のコードの回が許可の回より古い (許可の回のコードを書けなかった) = 配らない (R16 M5 ne_codes_stale・今までどおり)
+  await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T035500000Z_0a58ff', '2030-01-10T03:55:00Z', 0)`);
+  await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(pgliteAdapter(pg), { runId: 'mc_20300110T035500000Z_0a58ff', withSet: true });
+  await pgErr(issue(b1.export.export_id), /NE のコードの回 \(mc_20300110T035000000Z_0a5800\) が許可を出した照合の回 \(mc_20300110T035500000Z_0a58ff\)/);
   assert.equal((await expOf(b1.export.export_id)).state, 'built');
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T040000000Z_0a5801', '2030-01-10T04:00:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T040000000Z_0a5801', ['new-dup', 'new-x1']);
@@ -1537,7 +1553,7 @@ await ta('[W1] 0058 (広げる道 PR-1): 初回の配る (ne_reg_issue) の直�
   assert.equal((await one("select ops.new_entry_lease_valid('single') as v")).v, true);
 });
 
-await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops.ne_reg_file だけ (配ってから 2 時間・配った時の許可が有効)・file_bytes の列はどのロールも読めない (ロールの script を流し直しても) / 新しい照合 ② の結果で前の許可は無効 / 区分のゲートの数が 0 でないと許可は出ない・停止の床', async () => {
+await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops.ne_reg_file だけ (配ってから 2 時間・配った時の許可が有効)・file_bytes の列はどのロールも読めない (ロールの script を流し直しても) / 🆕 0082: 問題のない新しい結果では前の許可は有効・次の許可で置き換わる / 区分のゲートの数が 0 でないと許可は出ない・停止の床', async () => {
   const shaOf = (b) => crypto.createHash('sha256').update(b).digest('hex');
   const isValid = async () => (await one("select ops.new_entry_lease_valid('single') as v")).v;
   const ROLES = ['master_edit', 'master_ops', 'master_observer', 'master_gate', 'master_gate_render', 'master_gate_minipc', 'new_entry_gate', 'watcher', 'watch_writer'];
@@ -1592,21 +1608,23 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   assert.equal(await isValid(), true);
   f = await as(E, 'master_edit', () => G.regExportFile(db, b2.export.export_id));
   assert.deepEqual([f.bytes, f.expired], [null, 'lease_invalid'], '新しい許可は配った時の許可でない');
-  // ⑤ 新しい照合 ② の結果が書かれた = 古い許可は無効 = 渡さない (許可の行 = 一番新しい結果の行のときだけ有効)
+  // ⑤ 🆕 0082: 照合 ② の始めに閉じない・問題のない新しい結果の行が書かれても次の許可までは前の許可が有効 (結果 → 次の段の grant の間も閉じない)・
+  //   次の許可が出たら前の許可は置き換わる (取り消しの印) = 前の許可で配ったファイルは渡さない
   const b3 = await build('products', ['new-y3']);
   await issue(b3.export.export_id);
   assert.ok((await as(E, 'master_edit', () => G.regExportFile(db, b3.export.export_id))).bytes);
-  // 閉じずに結果だけ = 拒む (#1644 Codex R1 High 1)・閉じてから結果 = 前の許可は無効
-  await pgErr(as(E, 'watch_writer', () => pg.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', ['mc_w2_new_result', new Date(Date.now() - 1000).toISOString(), JSON.stringify(ZERO_GATE)])), /not_closed/);
-  assert.equal(await isValid(), true, '拒んだ結果は何も変えない');
+  const lease3 = (await one("select max(lease_id)::text as l from ops.master_new_entry_leases where kind = 'single'")).l;
   await as(E, 'watch_writer', () => pg.query('select ops.close_new_entry_for_compare($1)', ['mc_w2_new_result']));
+  assert.equal(await isValid(), true, '照合 ② の始めに閉じない (close は何もしない)');
   await as(E, 'watch_writer', () => pg.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', ['mc_w2_new_result', new Date(Date.now() - 1000).toISOString(), JSON.stringify(ZERO_GATE)]));
-  assert.equal(await isValid(), false, '新しい結果の行 = 前の許可は無効');
-  f = await as(E, 'master_edit', () => G.regExportFile(db, b3.export.export_id));
-  assert.deepEqual([f.bytes, f.expired], [null, 'lease_invalid']);
+  assert.equal(await isValid(), true, '問題のない新しい結果の行 = 前の許可はそのまま');
+  assert.ok((await as(E, 'master_edit', () => G.regExportFile(db, b3.export.export_id))).bytes, '前の許可が一番新しく有効な間は渡す');
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T070000000Z_0a5804', '2030-01-10T07:00:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T070000000Z_0a5804', ['new-dup', 'new-x1']);
   assert.equal(await isValid(), true);
+  assert.match((await one('select revoke_reason from ops.master_new_entry_leases where lease_id = $1::bigint', [lease3])).revoke_reason, /^置き換え: 次の許可 \(lease \d+\) が出た$/);
+  f = await as(E, 'master_edit', () => G.regExportFile(db, b3.export.export_id));
+  assert.deepEqual([f.bytes, f.expired], [null, 'lease_invalid'], '次の許可 = 前の許可で配ったファイルは渡さない');
   // ⑥ 照合 ② の区分のゲートの数が 0 でない結果 = 許可は出ない (段は取り消して非 0)・前の許可も無効・停止の床の後は新しい結果まで閉じたまま
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T080000000Z_0a5805', '2030-01-10T08:00:00Z', 0)`);
   await pgErr(recordNeCodes(pg, 'mc_20300110T080000000Z_0a5805', ['new-dup', 'new-x1'], { kindGate: { ...ZERO_GATE, raw_mismatch: 2 } }), /lease_denied: kind_gate/);
@@ -1620,6 +1638,11 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T100000000Z_0a5807', '2030-01-10T10:00:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T100000000Z_0a5807', ['new-dup', 'new-x1'], { withSet: false });
   assert.equal(await isValid(), true);
+  //   🆕 0082: 許可は問題のない新しい結果の行では切れない = 前の回に試験だけで置いたセットの許可はまだ有効 → 外して本番と同じ形 (単品の許可だけ) にする
+  assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, true);
+  await pg.query('begin'); await pg.query("select set_config('ops.lease_protocol', '1', true)");
+  await pg.query("update ops.master_new_entry_leases set revoked_at = clock_timestamp(), revoke_reason = '試験: セットの許可を外す', revoked_by = 'test' where kind = 'set' and revoked_at is null");
+  await pg.query('commit');
   assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, false);
   await pg.query('begin');
   await pgErr(pg.query("select ops._require_new_entry_lease('set')"), /new_entry_closed: 新商品 \(set\)/);
@@ -1631,9 +1654,9 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [setPay, Buffer.from('x')])), /new_entry_closed: 新商品 \(set\)/);
   const setEx = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'sets' and state in ('issued', 'declared') order by export_id desc limit 1"))?.id;
   if (setEx) await pgErr(as(E, 'master_edit', () => pg.query('select * from ops.ne_reg_file($1::bigint)', [setEx])), /reg_file_expired/);
-  // ⑧ 期限 = 東京の翌日 07:00 (daily-sync の始まり・#1641 Codex R3): 06:59:59 は有効・07:00:00 は無効 (期限の式と、期限ちょうどで無効になる比べ方)
+  // ⑧ 🆕 0082: 期限 = 出したときから 72 時間 (予定の切れ目にしない = 確かめが 3 日流れないときの安全弁): 期限の 1 秒前は有効・期限ちょうど以降は無効 (期限の式と比べ方)
   const exp = (await one("select to_char(ops.new_entry_lease_expiry('2030-01-10T08:00:00+09:00') at time zone 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI:SS') as e")).e;
-  assert.equal(exp, '2030-01-11 07:00:00');
+  assert.equal(exp, '2030-01-13 08:00:00');
   const insLease = async (expiresIn) => { await pg.query('begin'); await pg.query("select set_config('ops.lease_protocol', '1', true)");
     await pg.query("insert into ops.master_new_entry_leases (kind, result_id, compare_run_id, granted_by, granted_at, expires_at) select 'single', r.result_id, r.compare_run_id, 'test', clock_timestamp() - interval '1 hour', clock_timestamp() + $1::interval from ops.new_entry_gate_results r order by r.result_id desc limit 1", [expiresIn]);
     await pg.query('commit'); };

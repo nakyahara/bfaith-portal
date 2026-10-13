@@ -92,7 +92,7 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   for (const f of secdefFunctions) if (/^ops\.(record_decision_(candidates|done)|record_ne_baseline|record_ne_codes|snapshot_ne_reg_targets|record_ne_registration_observations|seal_ne_registration_run|record_ne_registration_check)\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
   //   0058 (広げる道 PR-1・最小の計画 §3): 照合 ② の新商品のゲートの結果 (ops.record_new_entry_gate) も watch_writer が関数だけで書く。
   //   🚨 開放の許可 (grant / revoke) は渡さない = 専用のログイン new_entry_gate (create-master-edit-roles.mjs)。照合のコード 1 本で開放まで完結しない
-  //   照合 ② の始めに入口を閉じる (ops.close_new_entry_for_compare) も同じ
+  //   ops.close_new_entry_for_compare も同じ (🆕 0082 から何もしない = 照合 ② の始めに閉じない・0082 の前のアプリの互換で残す)
   for (const f of secdefFunctions) if (/^ops\.(record_new_entry_gate|close_new_entry_for_compare)\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
   //   0058: watcher は広げる道の読むだけの判定 (ops.widen_check_readonly)・許可の表示用 (ops.new_entry_lease_valid) を実行できる (判定の本体・apply・許可を出す関数は渡さない)
   for (const f of secdefFunctions) if (/^ops\.(widen_check_readonly|new_entry_lease_valid)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);

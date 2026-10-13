@@ -7,7 +7,7 @@
  *      知らない古い入口の一覧は拒む・開いている試みがあれば次の prepare は拒む
  *   10 同じ持ち主表で cancel → prepare = 別の試み・新しい base (前の試みのロードは数えない)・試みの表は関数でだけ書く
  *   15 照合 ② の新商品のゲートの結果 (5 つの数の形・取得の完了は今日・同じ回は 1 回だけ・最終形は DB が数える)・許可を出す条件 (今回の回・全部 0・widen の後)・
- *      照合 ② の始めに閉じる (停止の床)・取り消し・期限の式
+ *      照合 ② の始めに閉じない (0082: close は何もしない)・取り消し (停止の床)・期限の式 (0082: 出してから 72 時間)
  *   21 NE で一度でも見たコードの履歴 (seed・毎日の照合が足す・追記だけ)
  *   24 保守の印: 理由が空・GUC だけ・直接の INSERT は拒む / 本物の印は同じ取引だけ有効
  * 使い方: node scripts/test-master-widen.mjs   (実 PostgreSQL の同時実行・ロール・widen 本体・G18 / G19・復元は scripts/test-master-widen-pg.mjs)
@@ -137,46 +137,37 @@ await ta('[15] 照合 ② の新商品のゲートの結果: 5 つの数の形�
   await assert.rejects(rec('mc_gate_t', ZERO_GATE, '2030-01-01 00:00:00'), /RFC 3339/);                       // timezone なし
   await assert.rejects(rec('mc_gate_t', ZERO_GATE, at(60000)), /今より後/);
   await assert.rejects(rec('mc_gate_t', ZERO_GATE, at(-36 * 3600e3)), /stale_fetch/);                           // 古い取得の数は残さない
-  // #1644 Codex R1 High 1: 照合 ② の始めに同じ回が閉じていない = 拒む (close なし / 別の回 A の close の後の B / close の後に取り消し)
+  // 🆕 0082: 照合 ② の始めに閉じたことは求めない (close なしで書ける・close は何もしない = 停止の床を足さない・許可を取り消さない)
   const close = (run) => q('select ops.close_new_entry_for_compare($1) as r', [run]).then((x) => x[0].r);
-  await assert.rejects(rec('mc_gate_1'), /not_closed/);
-  await close('mc_gate_other');
-  await assert.rejects(rec('mc_gate_1'), /not_closed/);
-  await close('mc_gate_1');
-  await q("select ops.revoke_new_entry_lease('single', '試験: 閉じた後の取り消し')");
-  await assert.rejects(rec('mc_gate_1'), /not_closed/);
-  await close('mc_gate_1');
+  const floors0 = (await q('select count(*)::int as n from ops.master_new_entry_stop_floors'))[0].n;
+  assert.deepEqual(await close('mc_gate_other'), { revoked: 0, floor_result_id: null, compare_run_id: 'mc_gate_other', noop: true });
+  assert.equal((await q('select count(*)::int as n from ops.master_new_entry_stop_floors'))[0].n, floors0, 'close は床を足さない');
   const r1 = await rec('mc_gate_1', { ...ZERO_GATE, unknown_kind: '2' });
-  assert.equal((await q("select s.closed_by_compare_run_id as c from ops.new_entry_gate_results r join ops.master_new_entry_stop_floors s on s.floor_id = r.close_floor_id where r.compare_run_id = 'mc_gate_1'"))[0].c, 'mc_gate_1');
+  assert.equal((await q("select close_floor_id from ops.new_entry_gate_results where compare_run_id = 'mc_gate_1'"))[0].close_floor_id, null);
   assert.equal(typeof r1.result_id, 'string'); assert.deepEqual(r1.shape, { single_product_mismatch: 0, non_set_parent_components: 0 });
   assert.deepEqual(await q("select kind_gate, single_product_mismatch::int as a, non_set_parent_components::int as b from ops.new_entry_gate_results where compare_run_id = 'mc_gate_1'"),
     [{ kind_gate: { ...ZERO_GATE, unknown_kind: 2 }, a: 0, b: 0 }]);                                               // 数字の文字は数に直して残す
-  await assert.rejects(rec('mc_gate_1'), /not_closed|duplicate|unique|一意/i);                                    // 同じ回は 1 回だけ
+  await assert.rejects(rec('mc_gate_1'), /duplicate|unique|一意/i);                                                  // 同じ回は 1 回だけ
   await close('mc_gate_1'); await assert.rejects(rec('mc_gate_1'), /duplicate|unique|一意/i);
   assert.match(await codeOf("insert into ops.new_entry_gate_results (compare_run_id, products_complete_at, setproducts_complete_at, kind_gate, single_product_mismatch, non_set_parent_components, recorded_by) values ('x', now(), now(), '{}', 0, 0, 'x')"), /42501/);
   assert.match(await codeOf("update ops.new_entry_gate_results set kind_gate = '{}'"), /append-only/);
   // 許可: 5 つの数が 0 でない・区分の持ち主が company でない・widen の記録が無い = 出さない (理由を全部)
   await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_1')"), (e) => /lease_denied/.test(e.message) && /kind_gate: .*unknown_kind/.test(e.message) && /sku_kind_not_company/.test(e.message) && /not_widened/.test(e.message));
   await assert.rejects(q("select ops.grant_new_entry_lease('set', 'mc_gate_1')"), /invalid_input/);
-  await close('mc_gate_2'); await rec('mc_gate_2');
-  await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_2')"), (e) => !/kind_gate/.test(e.message) && !/compare_run_mismatch/.test(e.message) && /sku_kind_not_company/.test(e.message));   // 一番新しい行を見る
+  await rec('mc_gate_2');
+  await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_2')"), (e) => !/kind_gate/.test(e.message) && !/compare_run_mismatch/.test(e.message) && !/not_closed/.test(e.message) && /sku_kind_not_company/.test(e.message));   // 一番新しい行を見る
   await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_1')"), /compare_run_mismatch/);   // 今回の回が一番新しい行でない = 出さない (結果を書く前に落ちた再実行)
-  // 照合 ② の始めに閉じる (watch_writer): 許可が無くても停止の床を全部の種類に足す・どの回か残す → 前の行ではもう出せない
-  const cl = (await q("select ops.close_new_entry_for_compare('mc_gate_3') as r"))[0].r;
-  const maxId = (await q('select max(result_id)::text as m from ops.new_entry_gate_results'))[0].m;
-  assert.deepEqual([cl.revoked, cl.floor_result_id], [0, maxId]);
-  assert.deepEqual(await q("select kind, floor_result_id::text as f from ops.master_new_entry_stop_floors where closed_by_compare_run_id = 'mc_gate_3' order by kind"), [{ kind: 'set', f: maxId }, { kind: 'single', f: maxId }]);
-  await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_2')"), /stop_floor/);
   await assert.rejects(q("select ops.close_new_entry_for_compare('bad id!')"), /invalid_input/);
   assert.equal((await q("select ops.new_entry_lease_valid('single') as v"))[0].v, false);
-  // 取り消し = 許可が無くても停止の床 (一番新しい結果の行の番号) を足す
+  // 取り消し = 許可が無くても停止の床 (一番新しい結果の行の番号) を足す → 前の行ではもう出せない
   const rv = (await q("select ops.revoke_new_entry_lease('single', '試験') as r"))[0].r;
   assert.deepEqual([rv.revoked, rv.floor_result_id], [0, (await q('select max(result_id)::text as m from ops.new_entry_gate_results'))[0].m]);
+  await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_2')"), /stop_floor/);
   await assert.rejects(q("select ops.revoke_new_entry_lease('single', ' ')"), /理由/);
-  // 期限 = 東京の今日の翌日 07:00 (daily-sync の始まり・session の TimeZone に左右されない)
+  // 🆕 0082: 期限 = 出したときから 72 時間 (予定の切れ目にしない・session の TimeZone に左右されない)
   await db.query("set timezone = 'America/Los_Angeles'");
   const exp = async (t) => (await q("select to_char(ops.new_entry_lease_expiry($1::timestamptz) at time zone 'Asia/Tokyo', 'YYYY-MM-DD HH24:MI') as e", [t]))[0].e;
-  assert.equal(await exp('2030-01-10T23:59:00+09:00'), '2030-01-11 07:00'); assert.equal(await exp('2030-01-10T00:01:00+09:00'), '2030-01-11 07:00');
+  assert.equal(await exp('2030-01-10T23:59:00+09:00'), '2030-01-13 23:59'); assert.equal(await exp('2030-01-10T06:59:00+09:00'), '2030-01-13 06:59');
   await db.query('reset timezone');
   // アプリの鍵の入口: 知らない種類は拒む・今の許可が無い = false
   assert.equal((await q("select ops.acquire_new_entry_locks('single') as v"))[0].v, false);

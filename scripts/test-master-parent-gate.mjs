@@ -391,8 +391,8 @@ await ta('[P7] JS: 観測 (nModelOf → parentObservations)・選べる解決・
   assert.match(summaryLine(R({ state: 'not_configured', owner: 'company', counts: counts() })), /^⚠️ 代表 \(親\) の数えを記録できない \(書く接続が無い/);
   // 門の状態だけが company を知っている (読み直しの答え)
   assert.match(summaryLine(R({ state: 'failed', owner: undefined, gate: { enforced: true }, error: 'e', counts: null })), /^⚠️ 代表 \(親\) の数えを記録できない \(書けない: e\) → 新しい NE 登録の CSV/);
-  // 新商品の入口を閉じられない朝はそれが一番先頭 (今までどおり)
-  assert.match(summaryLine(R(driftC, { gate_close: { state: 'failed', error: 'x' } })), /^⚠️ 新商品の入口を閉じられない .* \/ ⚠️ 代表 \(親\) が NE とずれた/);
+  // 🆕 0082: 照合の始めに入口を閉じない = 古い印 (gate_close) が残っていても入口の ⚠️ は出さない・代表のずれが先頭
+  assert.match(summaryLine(R(driftC, { gate_close: { state: 'failed', error: 'x' } })), /^⚠️ 代表 \(親\) が NE とずれた/);
 });
 
 await ta('[P8] 照合の実行口: 封 (結果の JSON の sha256) の後に DB に数えさせて記録する・recordParentGate の状態 (ok / not_applied / not_configured / failed / no_fetch)', async () => {
