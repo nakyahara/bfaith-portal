@@ -20,18 +20,27 @@ router.get('/locations', (req, res) => {
   if (!code) return res.status(400).json({ ok: false, error: 'CODE_REQUIRED' });
   try {
     const db = getDB();
-    const locations = db.prepare(`
-      SELECT ブロック略称 AS block, ロケ AS location, 品質区分名 AS quality, 有効期限 AS expiry,
-             SUM(在庫数) AS qty, SUM(引当数) AS allocated,
-             SUM(在庫数 - 引当数) AS free
-      FROM raw_lz_inventory
-      WHERE 商品ID = ?
-      GROUP BY ブロック略称, ロケ, 品質区分名, 有効期限
-    `).all(code);
-    const name = db.prepare('SELECT MIN(商品名) AS n FROM raw_lz_inventory WHERE 商品ID = ?').get(code)?.n || null;
-    const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
-    const stockDate = db.prepare('SELECT 在庫日 AS d FROM raw_lz_inventory LIMIT 1').get()?.d || null;
-    res.json({ ok: true, importedAt, stockDate, name, count: locations.length, locations });
+    // 在庫と時刻は 1 つの読み取りトランザクションで読む (途中で毎時の取込が入って、古い在庫に新しい時刻を付けない —
+    // PR #1697 Codex R2 Low)
+    const out = db.transaction(() => {
+      const locations = db.prepare(`
+        SELECT ブロック略称 AS block, ロケ AS location, 品質区分名 AS quality, 有効期限 AS expiry,
+               SUM(在庫数) AS qty, SUM(引当数) AS allocated,
+               SUM(在庫数 - 引当数) AS free
+        FROM raw_lz_inventory
+        WHERE 商品ID = ?
+        GROUP BY ブロック略称, ロケ, 品質区分名, 有効期限
+      `).all(code);
+      const name = db.prepare('SELECT MIN(商品名) AS n FROM raw_lz_inventory WHERE 商品ID = ?').get(code)?.n || null;
+      const meta = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value || null;
+      const importedAt = meta('logizard_last_import');
+      const stockDate = db.prepare('SELECT 在庫日 AS d FROM raw_lz_inventory LIMIT 1').get()?.d || null;
+      // 在庫を取った時刻 (ロジザードへ取りに行く直前)。importedAt は「取り込み完了」で数分遅い。
+      // ピッキング側が「写しの後の引当」を引く境目に使う (PR #1697 Codex R1 High)。今の取り込みの値のときだけ返す
+      const sourceAt = importedAt && meta('logizard_source_for') === importedAt ? meta('logizard_source_at') : null;
+      return { ok: true, importedAt, sourceAt, stockDate, name, count: locations.length, locations };
+    })();
+    res.json(out);
   } catch (e) {
     console.error('[logizard-stock-service] locations error', e);
     // 上流のエラー文をそのまま返さない (呼び出し側は固定の形だけを期待する)
