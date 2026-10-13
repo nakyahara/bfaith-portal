@@ -85,7 +85,8 @@ try {
     await page.locator('#jl-preview').click();
     await page.locator('#jl-tiles:not([hidden])').waitFor();
     assert.deepEqual((await tileNums(page)).slice(0, 3), [1, 1, 0]);
-    assert.match(await page.locator('details.jl-list').first().textContent(), /違う JAN の商品[\s\S]*商品マスタにはこの商品の別の JAN がある/);
+    assert.match(await page.locator('details.jl-list').first().textContent(), /違う JAN の商品[\s\S]*商品マスタにはこの商品の別の JAN がある[\s\S]*product-hub の JAN を商品マスタの JAN と同じ値に直す/);
+    assert.deepEqual(await page.locator('details.jl-list').first().locator('th').allTextContents(), ['商品', '商品コード', 'product-hub の JAN', '理由', '直し方']);
     assert.equal(await page.locator('#jl-apply').isDisabled(), false);
     assert.equal(await page.locator('#jl-apply').textContent(), '③ 移す (2 件を書く)');
     assert.equal(stateOf('a001').jan_link_state, null, '数えただけで書いた');

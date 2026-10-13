@@ -3350,11 +3350,12 @@ router.get('/jan-link', (req, res) => {
   });
 });
 router.post('/api/jan-link/preview', async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // Company DB を読む期限は要求の入口から (B1 と同じ)
   if (!isPhAdmin(req)) return res.status(403).json({ ok: false, error: '管理者だけが使えます' });
   const db = getDB();
   const actor = actorOf(req);
   let plan;
-  try { plan = await buildJanLinkPlan(db); } catch (e) { plan = { ok: false, reason: String((e && e.message) || e).slice(0, 160) }; }
+  try { plan = await buildJanLinkPlan(db, { deadlineAt }); } catch (e) { plan = { ok: false, reason: String((e && e.message) || e).slice(0, 160) }; }
   if (!plan.ok) {
     recordJanLinkRun(db, { kind: 'preview', outcome: 'failed', actor, error: plan.reason });
     return res.status(503).json({ ok: false, error: `商品マスタ (Company DB) を読めないので数えられません (${plan.reason})。何も書いていません` });
@@ -3363,6 +3364,7 @@ router.post('/api/jan-link/preview', async (req, res) => {
   res.json({ ok: true, ...planView(plan) });
 });
 router.post('/api/jan-link/apply', async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // Company DB を読む期限は要求の入口から (B1 と同じ)
   if (!isPhAdmin(req)) return res.status(403).json({ ok: false, error: '管理者だけが使えます' });
   if (req.body?.confirm !== true) return res.status(400).json({ ok: false, error: 'confirm が必要です' });
   const seen = typeof req.body?.hash === 'string' ? req.body.hash : '';
@@ -3374,7 +3376,7 @@ router.post('/api/jan-link/apply', async (req, res) => {
     return res.status(409).json({ ok: false, error: 'ほかの人が移している途中です。終わってから「数える」からやり直してください' });
   }
   try {
-    const plan = await buildJanLinkPlan(db);
+    const plan = await buildJanLinkPlan(db, { deadlineAt });
     if (!plan.ok) {
       recordJanLinkRun(db, { kind: 'apply', outcome: 'failed', actor, hash: seen, error: plan.reason });
       return res.status(503).json({ ok: false, error: `商品マスタ (Company DB) を読めないので移せません (${plan.reason})。何も書いていません` });

@@ -45,7 +45,7 @@
       <li>楽天の出品は、この作業の後も<strong>今までどおり</strong>動きます (出品の前に止める・選ぶ画面は次の段で有効にします)。</li>
       <li><strong>要確認</strong> = 1 つに決まらない物 (商品マスタに JAN が無い・違う JAN がある・セット など)。消さずに印を付けるだけで、後で商品の画面で選びます。商品マスタの JAN を直すのは「マスタの入力」の商品の画面です。</li>
       <li>何回押しても同じ行を書き直しません (2 回目は「もう済んだ」と出ます)。だれがいつ押したかは下の記録と、商品ごとの履歴に残ります。</li>
-      <li>商品マスタに今つながらないときは何も書きません。少し待ってからやり直してください。</li>
+      <li>商品マスタに今つながらないとき・混んでいるとき (ほかの画面が商品マスタを読んでいる) は何も書きません。少し待ってからやり直してください。</li>
     </ul>
   </div>
 
@@ -116,7 +116,7 @@
       const wrap = el('div', 'jl-table-wrap');
       const tbl = el('table', 'list');
       const head = el('tr');
-      ['商品', '商品コード', 'product-hub の JAN', withReason ? '理由' : '商品マスタの JAN'].forEach((h) => head.appendChild(el('th', null, h)));
+      (withReason ? ['商品', '商品コード', 'product-hub の JAN', '理由', '直し方'] : ['商品', '商品コード', 'product-hub の JAN', '商品マスタの JAN']).forEach((h) => head.appendChild(el('th', null, h)));
       const thead = el('thead'); thead.appendChild(head); tbl.appendChild(thead);
       const tb = el('tbody');
       rows.forEach((r) => {
@@ -128,6 +128,7 @@
         tr.appendChild(el('td', null, r.code));
         tr.appendChild(el('td', null, r.phJan || '—'));
         tr.appendChild(withReason ? el('td', 'jl-reason', r.reasonText || r.reason || '') : el('td', null, r.cdbJan || ''));
+        if (withReason) tr.appendChild(el('td', 'muted', r.fixText || ''));
         tb.appendChild(tr);
       });
       tbl.appendChild(tb); wrap.appendChild(tbl); d.appendChild(wrap);

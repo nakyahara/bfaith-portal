@@ -9,13 +9,13 @@
  *   書くのは product-hub の SQLite の 1 つの取引だけ (途中で失敗 = 全部 戻る)。書く直前に、取引の中で今の値が数えたときと同じかを確かめる。
  *   同じ行を書き直さない (同じ = 何もしない) = 二度押しても 2 回目は「もう済んだ」(計画が変わる = 409)。同時に押す = プロセスの中の鍵で 1 つだけ。
  *   Company DB は読むだけ (cdb-jan-compare.mjs の読むだけの取引・期限つき)。読めない = 何も書かない。
- * 対象 (楽天に送る値と同じ決め方 = cdb-jan-compare.mjs の janUnitsForDraft):
+ * 対象 (楽天に送る値と同じ決め方 = cdb-jan-compare.mjs の janUnitsForDrafts = 1 件ずつの janUnitsForDraft と同じ答えを一括で):
  *   単品 = product_drafts.jan_code (その行の jan_* に書く) / まとまり = 子の SKU ごとの draft_sku_jans (その行の jan_* に書く)。
  *   まとまりの子で JAN の行が無い子・ページ代表の jan_code・まとまりに居ない子の行は対象外 (段 3 の画面で選ぶ)。
  *   JAN が空になった行に前の印が残っていれば消す (clear)。
  */
 import crypto from 'node:crypto';
-import { janUnitsForDraft, readCdbJans, JAN_READ_DEADLINE_MS } from './cdb-jan-compare.mjs';
+import { janUnitsForDrafts, readCdbJans, JAN_READ_DEADLINE_MS, JAN_FIX } from './cdb-jan-compare.mjs';
 import { logEvent } from '../db.js';
 
 /** 要確認の理由 (画面の言葉) */
@@ -25,6 +25,14 @@ export const JAN_LINK_REASONS = Object.freeze({
   cdb_set: 'セット・例外の商品 (商品マスタでは JAN を持たない)',
   cdb_no_sku: '商品マスタに商品コードが無い',
   cdb_multiple: '同じ JAN が商品マスタに 2 つ以上ある (1 つに決まらない)',
+});
+/** 要確認の理由ごとの直し方 (B1 の印の直し方 JAN_FIX と同じ言葉) */
+export const JAN_LINK_FIX = Object.freeze({
+  cdb_other_jan: JAN_FIX.differs,
+  cdb_no_jan: JAN_FIX.not_in_cdb,
+  cdb_set: JAN_FIX.not_in_cdb_set,
+  cdb_no_sku: JAN_FIX.sku_missing,
+  cdb_multiple: '商品マスタの JAN を確かめる (同じ JAN が 2 つ以上ある)',
 });
 export const JAN_LINK_ACTIONS = Object.freeze(['link', 'review', 'clear', 'same', 'empty']);
 
@@ -43,13 +51,14 @@ const curOf = (r) => ({
  */
 export function collectJanLinkUnits(db) {
   const drafts = db.prepare('SELECT * FROM product_drafts ORDER BY id').all();
-  const skuRow = db.prepare('SELECT * FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?');
+  const unitsOf = janUnitsForDrafts(db, drafts);   // まとまりの判定は一括 (ドラフトの数によらず SQL は数回)
+  const skuRows = new Map(db.prepare('SELECT * FROM draft_sku_jans').all().map((r) => [`${r.draft_id}\u0000${r.sku_code}`, r]));
   const out = [];
   for (const d of drafts) {
-    const { mode, units } = janUnitsForDraft(db, d);
+    const { mode, units } = unitsOf.get(d.id);
     if (mode === 'variation') {
       for (const u of units) {
-        const r = skuRow.get(d.id, u.code.toLowerCase());
+        const r = skuRows.get(`${d.id}\u0000${u.code.toLowerCase()}`);
         if (!r) continue;   // JAN の行が無い子 = 結ぶ物が無い (段 3 の画面で選ぶ)
         out.push({ draftId: d.id, draftName: d.name, neCode: d.ne_code, table: 'draft_sku_jans', skuKey: r.sku_code, code: u.code, phJan: str(r.jan_code), cur: curOf(r) });
       }
@@ -94,11 +103,11 @@ function sha(v) { return crypto.createHash('sha256').update(JSON.stringify(v)).d
  * 戻り値 { ok: true, hash, snapshot, counts, items: [...unit, target, action] } / { ok: false, reason } (Company DB を読めない = 計画なし)
  *   hash = 書く物 (link / review / clear) の印。0 件なら 'none'
  */
-export async function buildJanLinkPlan(db, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS } = {}) {
+export async function buildJanLinkPlan(db, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS, deadlineAt = null } = {}) {
   const units = collectJanLinkUnits(db);
   const snapshot = snapshotOf(units);
-  const read = await readCdbJans(units.filter((u) => u.phJan).map((u) => ({ code: u.code, jan: u.phJan })), { env, deadlineMs });
-  if (!read.ok) return { ok: false, reason: read.reason };
+  const read = await readCdbJans(units.filter((u) => u.phJan).map((u) => ({ code: u.code, jan: u.phJan })), { env, deadlineMs, deadlineAt });
+  if (!read.ok) return { ok: false, reason: read.reason, busy: !!read.busy };
   let items;
   try {
     items = units.map((u) => { const target = decideJanLink(u, read); return { ...u, target, action: actionOf(u, target) }; });
@@ -172,9 +181,9 @@ export function recentJanLinkRuns(db, limit = 20) {
 /** 画面に返す形 (一覧は上限つき) */
 export function planView(plan, { limit = 300 } = {}) {
   const pick = (a) => plan.items.filter((i) => i.action === a).slice(0, limit)
-    .map((i) => ({ draftId: i.draftId, draftName: i.draftName, neCode: i.neCode, code: i.code, phJan: i.phJan, reason: i.target.reason, reasonText: i.target.reason ? JAN_LINK_REASONS[i.target.reason] : null, cdbJan: i.target.value }));
+    .map((i) => ({ draftId: i.draftId, draftName: i.draftName, neCode: i.neCode, code: i.code, phJan: i.phJan, reason: i.target.reason, reasonText: i.target.reason ? JAN_LINK_REASONS[i.target.reason] : null, fixText: i.target.reason ? JAN_LINK_FIX[i.target.reason] || null : null, cdbJan: i.target.value }));
   const stillReview = plan.items.filter((i) => i.action === 'same' && i.target.state === 'needs_review').slice(0, limit)
-    .map((i) => ({ draftId: i.draftId, draftName: i.draftName, neCode: i.neCode, code: i.code, phJan: i.phJan, reason: i.target.reason, reasonText: JAN_LINK_REASONS[i.target.reason] || i.target.reason }));
+    .map((i) => ({ draftId: i.draftId, draftName: i.draftName, neCode: i.neCode, code: i.code, phJan: i.phJan, reason: i.target.reason, reasonText: JAN_LINK_REASONS[i.target.reason] || i.target.reason, fixText: JAN_LINK_FIX[i.target.reason] || null }));
   return { hash: plan.hash, counts: plan.counts, link: pick('link'), review: pick('review'), clear: pick('clear'), stillReview };
 }
 

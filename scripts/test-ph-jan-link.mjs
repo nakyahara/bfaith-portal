@@ -9,6 +9,8 @@
  *   A 「移す」: 数えたのと同じ数え方 (書いた数 = 数えた数)・外部 ID の行番号と値・だれがいつ・商品の履歴・
  *     二度押し = 409 (何も変えない)・同時に押す = 1 つだけ・途中で失敗 = 全部 戻る・数えた後に変わった = 409・
  *     Company DB を読めない = 何も書かない・JAN が空になった = 結びを外す・商品マスタで JAN が外れた = 要確認に変える
+ *     商品マスタを読むのが混んでいる (B1 の同時 2 本) = 何も書かない・期限は要求の入口から (B1 と同じ)
+ *   P3 対象を集めるのは B1 の一括の関数 (janUnitsForDrafts) = 1 件ずつと同じ単位 (大文字の子のコードも)・直し方は B1 の JAN_FIX と同じ言葉
  *   G 管理者だけ (画面・数える・移す)
  *   H 画面: 管理者の画面・担当者・工程の設定から入れる・画面の JS が読める
  *   B 楽天の出品は今の列 (jan_code) のまま = 移しても payload は同じ
@@ -151,6 +153,35 @@ await ta('[P1] 結べる / 要確認 (理由ごと) / 空 / まとまりは子�
   assert.deepEqual(plan.counts.reviewByReason, { cdb_other_jan: 2, cdb_no_jan: 1, cdb_set: 1, cdb_no_sku: 1 });
   assert.match(plan.hash, /^[0-9a-f]{64}$/);
 });
+await ta('[P3] 対象を集めるのは B1 の一括の関数 (janUnitsForDrafts) = 1 件ずつ (janUnitsForDraft) と同じ単位 (大文字の子のコードも)', () => {
+  // 写しの子のコードが大文字 (product-hub の SKU 別 JAN は小文字で持つ) のまとまりを一時に足す
+  mirror('U-RED', 'grpu'); const pidA = mirrorPid; mirror('U-BLU', 'grpu'); const pidB = mirrorPid;
+  const du = draft('grpu', null);
+  sj.run(du.id, 'u-red', JAN.r1);
+  try {
+    const got = L.collectJanLinkUnits(ph).filter((u) => u.draftId === du.id).map((u) => [u.skuKey, u.code, u.phJan]);
+    assert.deepEqual(got, [['u-red', 'U-RED', JAN.r1]], '大文字の子の JAN の行を見落とした');
+    checkAll();
+  } finally {
+    ph.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ?').run(du.id);
+    ph.prepare('DELETE FROM product_drafts WHERE id = ?').run(du.id);
+    for (const pid of [pidA, pidB]) ph.prepare('DELETE FROM mirror_products WHERE product_id = ?').run(pid);
+  }
+});
+function checkAll() {
+  const units = L.collectJanLinkUnits(ph);
+  const drafts = ph.prepare('SELECT * FROM product_drafts ORDER BY id').all();
+  const expect = [];
+  for (const d of drafts) {
+    const { mode, units: us } = J.janUnitsForDraft(ph, d);
+    if (mode === 'variation') {
+      for (const u of us) { const r = ph.prepare('SELECT * FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?').get(d.id, u.code.toLowerCase()); if (r) expect.push([d.id, r.sku_code, u.code, r.jan_code]); }
+    } else if (us.length) expect.push([d.id, null, us[0].code, String(d.jan_code ?? '').trim()]);
+  }
+  assert.deepEqual(units.map((u) => [u.draftId, u.skuKey, u.code, u.phJan]), expect);
+  const src = fs.readFileSync(new URL('../apps/product-hub/services/jan-link.mjs', import.meta.url), 'utf8');
+  assert.ok(/janUnitsForDrafts\(db, drafts\)/.test(src) && !/janUnitsForDraft\(db, d\)/.test(src), '1 件ずつ判定している');
+}
 await ta('[P2] 同じ中身なら同じ印 (hash)・数えるだけでは何も書かない', async () => {
   const before = fingerprint();
   const [a, b] = [await L.buildJanLinkPlan(ph), await L.buildJanLinkPlan(ph)];
@@ -213,7 +244,10 @@ try {
     assert.equal(r.status, 200);
     assert.deepEqual([r.j.counts.link, r.j.counts.review], [2, 5]);
     assert.equal(r.j.review.length, 5);
-    assert.ok(r.j.review.every((x) => x.reasonText));
+    assert.ok(r.j.review.every((x) => x.reasonText && x.fixText), '理由か直し方が無い');
+    // 直し方は B1 の印の直し方 (JAN_FIX) と同じ言葉
+    assert.equal(r.j.review.find((x) => x.reason === 'cdb_other_jan').fixText, J.JAN_FIX.differs);
+    assert.equal(r.j.review.find((x) => x.reason === 'cdb_set').fixText, J.JAN_FIX.not_in_cdb_set);
     firstHash = r.j.hash; firstCounts = r.j.counts;
     assert.deepEqual(fingerprint(), before);
     const last = runs().at(-1);
@@ -351,6 +385,43 @@ try {
       const again = await preview();
       assert.equal(again.j.hash, 'none', '書いた後に数え直しても書く物が残った');
     }
+  });
+
+  await ta('[A10] 商品マスタを読むのが混んでいる (B1 の同時 2 本の上限) = 数える・移す とも 503「混んでいる」・何も書かない', async () => {
+    const p = await preview();
+    const gates = [];
+    J.__setCdbJanReader(() => new Promise((resolve) => gates.push(() => resolve({ ok: true, rows: [] }))));
+    const hold = [J.readCdbJans([{ code: 'a001', jan: '1' }]), J.readCdbJans([{ code: 'a001', jan: '2' }])];
+    try {
+      await new Promise((r) => setTimeout(r, 10));
+      assert.equal(J.__janReadInFlight(), 2);
+      const before = fingerprint();
+      const a = await preview();
+      assert.deepEqual([a.status, /混んでいる/.test(a.j.error)], [503, true], JSON.stringify(a.j));
+      const b = await applyReq(p.j.hash);
+      assert.deepEqual([b.status, /混んでいる/.test(b.j.error)], [503, true], JSON.stringify(b.j));
+      assert.deepEqual(fingerprint(), before);
+    } finally {
+      gates.splice(0).forEach((g) => g());
+      await Promise.all(hold);
+      J.__setCdbJanReader(async (items) => {
+        if (slowMs) await new Promise((r) => setTimeout(r, slowMs));
+        if (!readable) return { ok: false, reason: 'テストで読めない' };
+        return { ok: true, rows: await J.queryCdbJans(pg, 1, items) };
+      });
+    }
+  });
+  await ta('[A11] 期限は要求の入口から (数える・移す とも入口で決めて計画まで渡す)', async () => {
+    const src = fs.readFileSync(new URL('../apps/product-hub/router.js', import.meta.url), 'utf8');
+    for (const route of ["router.post('/api/jan-link/preview', async (req, res) => {", "router.post('/api/jan-link/apply', async (req, res) => {"]) {
+      const at = src.indexOf(route);
+      assert.ok(at >= 0, route);
+      assert.match(src.slice(at + route.length, at + route.length + 200), /^\s*const deadlineAt = Date\.now\(\) \+ JAN_READ_DEADLINE_MS;/, `${route} の入口で期限を決めていない`);
+    }
+    assert.equal((src.match(/buildJanLinkPlan\(db, \{ deadlineAt \}\)/g) || []).length, 2, '計画に期限を渡していない');
+    // 期限が過ぎていれば読みに行かない = 計画なし (何も書かない)
+    const plan = await L.buildJanLinkPlan(ph, { deadlineAt: Date.now() - 1 });
+    assert.deepEqual([plan.ok, /期限/.test(plan.reason)], [false, true]);
   });
 
   console.log('H 画面');
