@@ -178,7 +178,10 @@ import {
 import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLegacyNewKind, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
-import { compareDraftJans, compareJanUnits, janUnitsForDraftId, boardJanMarks, parseBoardDraftIds, janWarningsOf, JAN_READ_DEADLINE_MS } from './services/cdb-jan-compare.mjs';
+import { compareJanUnits, janUnitsForDraftId, boardJanMarks, parseBoardDraftIds, janWarningsOf, readCdbJans, JAN_READ_DEADLINE_MS } from './services/cdb-jan-compare.mjs';
+import {
+  janEnforceOn, listingJanUnits, resolveListingJans, janLinkNotices, pickViewOf, verifySelection, enforceForecast, looseJan, JAN_ENFORCE_ENV, JAN_GATE_PROBLEMS,
+} from './services/listing-jan.mjs';
 import {
   buildJanLinkPlan, applyJanLinkPlan, planView, recordJanLinkRun, recentJanLinkRuns, tryLockJanLink, unlockJanLink, JanLinkConflict, JAN_LINK_REASONS,
 } from './services/jan-link.mjs';
@@ -517,6 +520,8 @@ router.get('/detail/:id', (req, res) => {
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
     neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans, skuSelectorValues,
+    // 🆕 カタログID (JAN) を止める設定 (Company DB構想 21 B2 の段 4・5)。入っていなければ「手で打つ」の道も残す (今までどおり)
+    janEnforce: janEnforceOn(), janEnforceEnv: JAN_ENFORCE_ENV,
     // 利益シミュレーションで配送方法を差し替えて試算するための材料 (2026-09-04)。
     // 楽天の配送方法グループとは粒度が違うので NE の配送方法で持つ (lib/variation.js 参照)
     neShippingOptions: profitShipChoices(listNeShippingOptions(db), neCost?.shippingMethod, neCost?.shippingCost),
@@ -697,6 +702,14 @@ router.post('/api/drafts/:id', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
+  // 🆕 JAN を止める設定 (Company DB構想 21 B2 の段 3・4) のときは、JAN を手で打って変える道を閉じる (商品マスタの JAN から選ぶ = /jan-select だけ)。
+  //    空にする (IDなし) と、今と同じ値は通す。設定が無ければ今までどおり (結んだ印は値が変わったら下で外す)
+  if (janEnforceOn() && req.body?.jan_code !== undefined) {
+    const next = cleanText(req.body.jan_code, 20);
+    if (next && looseJan(next) !== looseJan(draft.jan_code)) {
+      return res.status(400).json({ ok: false, error: 'JAN は商品マスタ (Company DB) の JAN から選んでください (カテゴリ・属性タブの「カタログID」)。商品マスタに無い JAN は、マスタの入力の商品の画面で足してから選びます' });
+    }
+  }
 
   const name = cleanText(req.body?.name, 300) || draft.name;
   const officialUrl = req.body?.official_url !== undefined ? cleanText(req.body.official_url, 1000) : draft.official_url;
@@ -725,7 +738,7 @@ router.post('/api/drafts/:id', async (req, res) => {
   // ON → 重要度を自社商品へ / OFF → 自社商品の重要度なら未設定へ (他の重要度はそのまま)。
   // 連動列はトランザクション内で読み直した最新行を基準にする (Codex R2: 並行更新後の no-op 化を防ぐ)
   const { ownBrandValue, imagePriorityValue, saved } = db.transaction(() => {
-    const cur = db.prepare('SELECT own_brand, image_priority FROM product_drafts WHERE id = ?').get(draft.id);
+    const cur = db.prepare('SELECT own_brand, image_priority, jan_code FROM product_drafts WHERE id = ?').get(draft.id);
     const ownBrand = req.body?.own_brand !== undefined ? (req.body.own_brand ? 1 : 0) : cur.own_brand;
     let imagePriority = cur.image_priority;
     if (ownBrand === 1) imagePriority = OWN_BRAND_IMAGE_PRIORITY;
@@ -756,6 +769,11 @@ router.post('/api/drafts/:id', async (req, res) => {
       imagePriority,
       draft.id,
     );
+    // 🆕 JAN を手で変えた = 商品マスタの JAN に結んだ印を外す (Company DB構想 21 B2。結んだ印は「その値を選んだ」の印なので、値が変われば無効)
+    if (looseJan(janValue) !== looseJan(cur.jan_code)) {
+      db.prepare(`UPDATE product_drafts SET jan_cdb_row = NULL, jan_cdb_value = NULL, jan_link_state = NULL, jan_link_reason = NULL,
+        jan_linked_at = NULL, jan_linked_by = NULL WHERE id = ?`).run(draft.id);
+    }
     if ((imagePriority || null) !== (cur.image_priority || null)) {
       logEvent(db, draft.id, 'image_priority_changed', `${cur.image_priority || '未設定'} -> ${imagePriority || '未設定'} (自社商品チェック連動)`, actorOf(req));
     }
@@ -2406,12 +2424,17 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   // 税率: 切替前は今までどおり / 閉じた後は Company DB (決められない = 止める)。PR #1565 R1 H5
   // プレビューは送らないので、段階を読めないときは今の税率で見せて注意を添える (登録は止まる。中間レビュー 2 回目 Low)
   const tax = await resolveListingTax(db, draft, { preview: true });
-  const built = buildItemPayload(db, draft.id, { tax });
+  // 🆕 カタログID (JAN) を止める設定 (Company DB構想 21 B2 の段 4・5) のときは、登録と同じく結んだ JAN を Company DB で確かめ直して payload を組む (止まる理由も同じ)。
+  //    設定が無ければ Company DB を読まずに今までどおり (下で「設定を入れたら止まる」単位を知らせるだけ)
+  const janEnforce = janEnforceOn();
+  const janGate = janEnforce ? await resolveListingJans(db, draft.id, { enforce: true, deadlineAt: janDeadlineAt }) : null;
+  const built = buildItemPayload(db, draft.id, { tax, jan: janGate });
   // 🆕 JAN を Company DB と比べた印 (Company DB構想 21 §5 B1)。知らせだけ = payload も送る値も変えない・出品も止めない。
   //    🚨 比べる値は payload を作った直後に await を挟まずに読み直す (= payload と同じ値。上の await の間に JAN が保存されてもずれない・Codex #1700 R1 M4)
   const janUnits = janUnitsForDraftId(db, draft.id);
+  const janNotices = janEnforce ? [] : janLinkNotices(db, draft.id);
   // (プレビューの JAN の読みは入口から 4.5 秒まで。辞書・税率で使い切っていれば読みに行かず「読めない」の一言)
-  const warnings = [...(tax.warning ? [tax.warning] : []), ...janWarningsOf(await compareJanUnits(janUnits, { deadlineAt: janDeadlineAt }))];
+  const warnings = [...(tax.warning ? [tax.warning] : []), ...janNotices, ...janWarningsOf(await compareJanUnits(janUnits, { deadlineAt: janDeadlineAt }), { enforce: janEnforce })];
   if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(warnings.length ? { warnings } : {}) });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
@@ -2829,12 +2852,76 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
 // 🆕 JAN を Company DB と比べる印 (Company DB構想 21 §5 B1・読むだけ)。詳細画面が開いた後に読む (画面の表示を Company DB で待たせない)。
 //    単品 = 出品の商品コード ↔ product_drafts.jan_code / まとまり = 子の SKU ごと ↔ draft_sku_jans (楽天に送る値と同じ決め方)。
 //    Company DB も product-hub の SQLite も書かない。読めないときも 200 で「読めない」の印を返す
+//    🆕 B2 の段 3: 同じ 1 回の読みで「選ぶ物」(picks = 単位ごとの今の状態と、Company DB のその商品の有効な JAN) も返す (読む数を増やさない)
 router.get('/api/drafts/:id/jan-check', async (req, res) => {
   const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // 期限は要求の入口から (Codex #1700 R2 M2)
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  const r = await compareDraftJans(getDB(), draft, { deadlineAt });
-  res.json(r.ok ? r : { ok: true, readable: false, reason: r.reason, mode: null, units: [], summary: { state: 'unreadable', severity: 'muted', label: '読めない', counts: {} } });
+  const db = getDB();
+  const unreadable = (reason) => ({ ok: true, readable: false, reason, mode: null, units: [], summary: { state: 'unreadable', severity: 'muted', label: '読めない', counts: {} }, enforce: janEnforceOn(), picks: null });
+  let lj;
+  try { lj = listingJanUnits(db, draft.id); } catch (e) { return res.json(unreadable(String((e && e.message) || e).slice(0, 160))); }
+  if (!lj) return res.json(unreadable('ドラフトが見つかりません'));
+  // 🚨 読む組は await の前の SQLite の値 (比べる印・選ぶ物の両方がこの値で決まる)
+  const units = lj.units.map((u) => ({ code: u.code, phJan: u.phJan }));
+  const read = await readCdbJans(units.map((u) => ({ code: u.code, jan: u.phJan })), { deadlineAt });
+  const r = await compareJanUnits({ mode: lj.mode, units }, { read });
+  if (!r.ok) return res.json(unreadable(r.reason));
+  res.json({ ...r, enforce: janEnforceOn(), picks: pickViewOf(lj, read) });
+});
+
+// 🆕 商品マスタ (Company DB) の JAN を選ぶ (Company DB構想 21 §5 B2 の段 3・中原さんの決定 3 = a: product-hub の JAN は Company DB の JAN から選ぶだけ)。
+//    body { code (出品の商品コード / まとまりの子の SKU), row (Company DB の外部 ID の行番号), value (その JAN) }。
+//    Company DB を読むだけの取引で「今も有効・この商品の JAN・値が同じ」を確かめてから、product-hub の SQLite に 1 つの取引で書く:
+//      JAN の値 (jan_code = Company DB の値) + 結んだ印 (行番号・値・linked・だれがいつ) + その単位の「カタログIDなしの理由」を外す (どちらか 1 つ)。
+//    書く前に、取引の中で単位がまだこのドラフトに居るかを確かめる (読む間に商品コード・まとまりが変わったら書かない = 409)
+router.post('/api/drafts/:id/jan-select', janLinkCsrfGuard, async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // 期限は要求の入口から (B1 と同じ)
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const code = cleanText(req.body?.code, 100);
+  const value = String(req.body?.value ?? '').trim();
+  const rowRaw = String(req.body?.row ?? '').trim();
+  if (!code || !value || !/^[0-9]{1,18}$/.test(rowRaw)) return res.status(400).json({ ok: false, error: 'code・row・value が必要です (画面から選んでください)' });
+  if (!isValidGtin(value)) return res.status(400).json({ ok: false, error: `商品マスタの JAN「${value}」の形式が楽天に送れない形です (8/12/13桁 + チェックデジット)。マスタの入力の商品の画面で確かめてください` });
+  const db = getDB();
+  const lj0 = listingJanUnits(db, draft.id);
+  const unitOf = (lj) => (lj ? lj.units.find((u) => u.code.toLowerCase() === code.toLowerCase()) : null);
+  const u0 = unitOf(lj0);
+  if (!u0) return res.status(409).json({ ok: false, error: `${code} はこの商品の出品の単位ではありません。画面を開き直してください` });
+  const read = await readCdbJans([{ code: u0.code, jan: value }], { deadlineAt });
+  const v = verifySelection({ code: u0.code, row: rowRaw, value }, read);
+  if (!v.ok) return res.status(v.status).json({ ok: false, error: v.error });
+  const actor = actorOf(req);
+  const r = db.transaction(() => {
+    const lj = listingJanUnits(db, draft.id);
+    const u = unitOf(lj);
+    if (!u || !lj || lj.mode !== lj0.mode || lj.neCode !== lj0.neCode) return { code: 409, error: '選んでいる間に商品コード・まとまりが変わりました。画面を開き直してください' };
+    const at = new Date().toISOString();
+    if (lj.mode === 'variation') {
+      const key = u.code.toLowerCase();
+      const dup = db.prepare('SELECT sku_code FROM draft_sku_jans WHERE draft_id = ? AND jan_code = ? AND LOWER(TRIM(sku_code)) != ?').get(draft.id, v.value, key);
+      if (dup) return { code: 409, error: `JAN ${v.value} はこのページの別の SKU (${dup.sku_code}) で使われています` };
+      // 大文字小文字だけ違う同じ SKU の行は 1 つにする (選んだ行だけを残す)
+      const dropped = db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND LOWER(TRIM(sku_code)) = ? AND sku_code != ?').run(draft.id, key, key).changes;
+      db.prepare(`INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code, jan_cdb_row, jan_cdb_value, jan_link_state, jan_link_reason, jan_linked_at, jan_linked_by)
+        VALUES (?, ?, ?, ?, ?, 'linked', NULL, ?, ?)
+        ON CONFLICT(draft_id, sku_code) DO UPDATE SET jan_code = excluded.jan_code, jan_cdb_row = excluded.jan_cdb_row, jan_cdb_value = excluded.jan_cdb_value,
+          jan_link_state = 'linked', jan_link_reason = NULL, jan_linked_at = excluded.jan_linked_at, jan_linked_by = excluded.jan_linked_by,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`).run(draft.id, key, v.value, v.row, v.value, at, actor);
+      const ex = db.prepare('DELETE FROM draft_sku_catalog_exemptions WHERE draft_id = ? AND sku_code = ?').run(draft.id, key).changes;
+      logEvent(db, draft.id, 'jan_selected', `${u.code} = ${v.value} (商品マスタの JAN を選んだ・行 ${v.row})${ex ? ' / カタログIDなしの理由を外した' : ''}${dropped ? ` / 重なっていた行 ${dropped} 件を 1 つに` : ''}`, actor);
+      return { code: 200, clearedReason: ex > 0 };
+    }
+    const info = db.prepare(`UPDATE product_drafts SET jan_code = ?, jan_cdb_row = ?, jan_cdb_value = ?, jan_link_state = 'linked', jan_link_reason = NULL,
+      jan_linked_at = ?, jan_linked_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND TRIM(COALESCE(ne_code, '')) = ?`).run(v.value, v.row, v.value, at, actor, draft.id, lj0.neCode);
+    if (info.changes !== 1) return { code: 409, error: '選んでいる間に商品コードが変わりました。画面を開き直してください' };
+    const ex = db.prepare('UPDATE draft_rakuten SET catalog_id_exemption_reason = NULL, updated_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE draft_id = ? AND catalog_id_exemption_reason IS NOT NULL').run(draft.id).changes;
+    logEvent(db, draft.id, 'jan_selected', `${u.code} = ${v.value} (商品マスタの JAN を選んだ・行 ${v.row})${ex ? ' / カタログIDなしの理由を外した' : ''}`, actor);
+    return { code: 200, clearedReason: ex > 0 };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true, code: u0.code, jan: v.value, row: v.row, clearedReason: r.clearedReason });
 });
 
 // SKU別 JANコード (2026-08-28 中原さん要望: バリエーションありのとき、ページ代表の JAN 1つだけでは
@@ -2853,6 +2940,12 @@ router.post('/api/drafts/:id/sku-jans', (req, res) => {
   const db = getDB();
   const r = db.transaction(() => {
     const key = code.trim().toLowerCase();
+    const prevJan = db.prepare('SELECT jan_code FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?').get(draft.id, key)?.jan_code ?? '';
+    // 🆕 JAN を止める設定 (Company DB構想 21 B2 の段 3・4) のときは、手で打って変える道を閉じる (商品マスタの JAN から選ぶ = /jan-select だけ)。
+    //    空にする (IDなし) と、今と同じ値は通す
+    if (jan !== '' && janEnforceOn() && looseJan(jan) !== looseJan(prevJan)) {
+      return { code: 400, error: 'JAN は商品マスタ (Company DB) の JAN から選んでください (カテゴリ・属性タブの表の「カタログID」)。商品マスタに無い JAN は、マスタの入力の商品の画面で足してから選びます' };
+    }
     if (jan === '') {
       // 解除はいつでも許可 (SKU を外した後でも残った行を消せるように — sku-prices と同じ方針)
       const info = db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?').run(draft.id, key);
@@ -2884,6 +2977,11 @@ router.post('/api/drafts/:id/sku-jans', (req, res) => {
         return { code: 409, error: `JAN ${jan} はこのページの別のSKUで既に使われています` };
       }
       throw e;
+    }
+    // 🆕 JAN を手で変えた = 商品マスタの JAN に結んだ印を外す (結んだ印は「その値を選んだ」の印・Company DB構想 21 B2)
+    if (looseJan(jan) !== looseJan(prevJan)) {
+      db.prepare(`UPDATE draft_sku_jans SET jan_cdb_row = NULL, jan_cdb_value = NULL, jan_link_state = NULL, jan_link_reason = NULL,
+        jan_linked_at = NULL, jan_linked_by = NULL WHERE draft_id = ? AND sku_code = ?`).run(draft.id, key);
     }
     logEvent(db, draft.id, 'sku_jan_saved', `${code} = ${jan}`, actorOf(req));
     return { code: 200 };
@@ -3361,6 +3459,10 @@ router.get('/jan-link', (req, res) => {
     isAdmin: admin,
     runs: admin ? recentJanLinkRuns(getDB()) : [],
     reasons: JAN_LINK_REASONS,
+    // 🆕 出品の前に止める設定 (段 4・5) の今と、入れたら今いくつ止まるか (楽天に未登録の商品・SQLite だけで数える)
+    janEnforce: janEnforceOn(), janEnforceEnv: JAN_ENFORCE_ENV,
+    janForecast: admin ? (() => { try { return enforceForecast(getDB()); } catch (e) { return { error: String((e && e.message) || e).slice(0, 160) }; } })() : null,
+    janProblems: JAN_GATE_PROBLEMS,
   });
 });
 router.post('/api/jan-link/preview', janLinkCsrfGuard, async (req, res) => {

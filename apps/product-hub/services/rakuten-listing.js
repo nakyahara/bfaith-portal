@@ -36,6 +36,7 @@ import { parseRakutenItemUrl } from '../../../lib/rakuten-item-page.js';
 import { resolveListingTax } from './listing-tax.mjs';
 // 🆕 まとまりのカードの出品の共通の門 (Company DB構想 20 v7 §⑤・PR-4): NE の写し待ち・2 軸のまとまりは楽天に書かない
 import { cdbGroupListingBlock } from './cdb-group-gate.js';
+import { janEnforceOn, resolveListingJans, gateDecisionFor, checkArticleNumbers } from './listing-jan.mjs';
 // 配送方法の「値の意味」の正本 (定数と変換はこの1ファイルだけが決める)。
 // db.js のマイグレーションからも使うため、循環参照を避けて lib/ に置いてある
 import {
@@ -1411,8 +1412,11 @@ export function skuAttributeGrid(db, draftId, rk, members) {
  * tax = listing-tax.mjs の resolveListingTax の結果 (PR #1565 R1 H5):
  *   { mode: 'legacy' } = 今までどおり draft_yahoo.tax_rate / { mode: 'cdb', percent } = Company DB の税率 / { mode: 'blocked', reason } = 出品を止める
  * 🚨 tax を渡さない呼び方は作らない (scripts/test-master-legacy-entries.mjs が呼び手を数える)。渡されなければ止める (fail-closed)
+ * jan = listing-jan.mjs の resolveListingJans の結果 (Company DB構想 21 §5 B2 の段 5)。
+ *   止める設定 (PH_JAN_ENFORCE=1) のときだけ使う: 送るカタログID は確かめた Company DB の JAN か「なしの理由」のどちらか 1 つ。
+ *   設定があるのに渡されない = 止める (fail-closed)。設定が無ければ今までどおり jan_code を送る
  */
-export function buildItemPayload(db, draftId, { tax = null } = {}) {
+export function buildItemPayload(db, draftId, { tax = null, jan: janGate = null } = {}) {
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { ok: false, reasons: ['ドラフトが見つかりません'] };
   const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId) || {};
@@ -1526,14 +1530,30 @@ export function buildItemPayload(db, draftId, { tax = null } = {}) {
   if (!isVariation && Array.isArray(attributes) && attributes.some((a) => a.name === 'カタログID')) {
     reasons.push('商品属性の行に「カタログID」があります — カタログID (JAN) はカテゴリ・属性タブの表の「カタログID」の行で入力すると自動で送ります。属性の行からは削除してください');
   }
-  const jan = isVariation ? '' : String(draft.jan_code || '').trim();
+  // 🆕 JAN を止める設定 (Company DB構想 21 §5 B2 の段 5)。設定があれば、送る値は確かめた Company DB の値 (下で SKU ごとに差し替える)
+  const janEnforced = janEnforceOn();
+  if (janEnforced && !(janGate && janGate.enforce)) {
+    reasons.push('カタログID (JAN) を商品マスタ (Company DB) で確かめていません (出品を止めました)');
+  } else if (janEnforced && !janGate.ok) {
+    reasons.push(...janGate.reasons);
+  }
+  // 止める設定のときの SKU ごとの決定 (確かめた JAN か なしの理由)。決まっていない SKU は空 (上の reasons で止まる)
+  const janByGate = (code) => {
+    if (!janEnforced) return null;
+    const d = gateDecisionFor(janGate, code);
+    return d && d.ok ? d.send : { value: null, reason: null };
+  };
+  const singleGate = isVariation ? null : janByGate(draft.ne_code);
+  const jan = isVariation ? '' : (singleGate ? String(singleGate.value || '') : String(draft.jan_code || '').trim());
   if (jan && !isValidGtin(jan)) {
     reasons.push(`JANコード「${jan}」の形式が不正です (8/12/13桁 + チェックデジット)`);
   }
   // カタログID (= API の articleNumber) が無いときの理由。JAN がある SKU には使わない。
   // 未設定は 5 (該当製品コードなし) = 2026-09-02 以前の固定値なので、既存ドラフトの送信内容は変わらない
+  // (止める設定のときは「未設定 = 5」にしない: 段 4 の判定で JAN も理由も無い単位は止めている)
   const rawReason = Number(rk.catalog_id_exemption_reason);
   const catalogExemptionReason = Number.isInteger(rawReason) && rawReason >= 1 && rawReason <= 6 ? rawReason : 5;
+  const singleReason = singleGate && singleGate.reason != null ? singleGate.reason : catalogExemptionReason;
 
   // ─── カラバリ (バリエーションページ) の材料 (2026-09-02) ───
   // 楽天の形: item.variantSelectors [{key, displayName, values:[{displayValue}]}]
@@ -1566,7 +1586,8 @@ export function buildItemPayload(db, draftId, { tax = null } = {}) {
       const skuCode = String(m.商品コード || '').trim();
       const key = skuCode.toLowerCase();
       const selectorValue = String(selRows.get(key) || '').trim();
-      const skuJan = String(janRows.get(key) || '').trim();
+      const skuGate = janByGate(skuCode);
+      const skuJan = skuGate ? String(skuGate.value || '') : String(janRows.get(key) || '').trim();
       const cell = grid.bySku.get(key) || new Map();
       if ((cell.get('カタログID') || []).length > 0) {
         reasons.push(`SKU「${skuCode}」の商品仕様に「カタログID」の行があります — カタログID (JAN) は表の「カタログID」の行で入力してください`);
@@ -1583,7 +1604,8 @@ export function buildItemPayload(db, draftId, { tax = null } = {}) {
       const skuModel = String(modelVals[0] || '').trim();
       const modelExplicit = (grid.explicit.get(key) || new Set()).has(MODEL_ATTR_NAME);
       const rawSkuReason = exemptionRows.get(key);
-      const skuReason = Number.isInteger(rawSkuReason) && rawSkuReason >= 1 && rawSkuReason <= 6 ? rawSkuReason : catalogExemptionReason;
+      const skuReason = skuGate && skuGate.reason != null ? skuGate.reason
+        : (Number.isInteger(rawSkuReason) && rawSkuReason >= 1 && rawSkuReason <= 6 ? rawSkuReason : catalogExemptionReason);
       if (!selectorValue) reasons.push(`SKU「${skuCode}」の選択肢 (${selectorName || 'バリエーション'}) が未入力です — 基本情報タブのSKU表で入れてください`);
       if (skuJan && !isValidGtin(skuJan)) {
         reasons.push(`SKU「${skuCode}」のJANコード「${skuJan}」の形式が不正です (8/12/13桁 + チェックデジット)`);
@@ -1620,7 +1642,7 @@ export function buildItemPayload(db, draftId, { tax = null } = {}) {
   // 単品の attrs/model は下で確定する (ページ共通の属性 + メーカー型番欄)
   const skuRows = isVariation && variantRows
     ? variantRows
-    : [{ skuCode: String(draft.ne_code).trim(), selectorValue: null, jan, price: draft.price, attrs: null, model: null, reason: catalogExemptionReason }];
+    : [{ skuCode: String(draft.ne_code).trim(), selectorValue: null, jan, price: draft.price, attrs: null, model: null, reason: singleReason }];
   // 1 (セット商品) は articleNumberForSet (構成品の JAN 一覧) が別に必須になる。まだ送れないので止める
   if (skuRows.some((s) => !s.jan && s.reason === 1)) {
     reasons.push('カタログIDなしの理由「1: セット商品」は未対応です (構成品のJAN一覧を送る仕組みがまだありません)。JANを入力するか別の理由を選んでください');
@@ -1853,7 +1875,7 @@ export function buildItemPayload(db, draftId, { tax = null } = {}) {
         //   4=項目選択肢別在庫商品 / 5=該当製品コードなし / 6=頒布会商品
         articleNumber: jan
           ? { value: jan }
-          : { exemptionReason: catalogExemptionReason },
+          : { exemptionReason: singleReason },
         ...(attrsForSku(skuRows[0]).length > 0 ? { attributes: attrsForSku(skuRows[0]) } : {}),
         ...(Object.keys(shipping).length > 0 ? { shipping } : {}),
         ...(deliveryDateId ? { normalDeliveryDateId: Number(deliveryDateId) } : {}),
@@ -1940,8 +1962,16 @@ export async function registerItem(draftId, { actor = null } = {}) {
   await refreshDriveModifiedTimes(draftId);
   // 税率: 切替前は今までどおり / 閉じた後は Company DB (決められない = 止める)。PR #1565 R1 H5
   const draftRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
-  const built = buildItemPayload(db, draftId, { tax: draftRow ? await resolveListingTax(db, draftRow) : null });
+  const tax = draftRow ? await resolveListingTax(db, draftRow) : null;
+  // 🆕 カタログID (JAN) を決める (Company DB構想 21 §5 B2 の段 5)。止める設定 (PH_JAN_ENFORCE=1) が無ければ Company DB を読まずに今までどおり。
+  //    設定があれば、結んだ JAN を Company DB で確かめ直す (読めない・変わった・結ばれていない = 止める)
+  const janGate = await resolveListingJans(db, draftId);
+  const built = buildItemPayload(db, draftId, { tax, jan: janGate });
   if (!built.ok) return { ok: false, reasons: built.reasons };
+  // 🚨 送る直前の 1 か所: articleNumber は「JAN 1 つ」か「なしの理由」のどちらか 1 つだけ・止める設定なら確かめた Company DB の値だけ
+  //    (確かめた後に SQLite の JAN が変わっていないかもここで同期で照らす。この後は PUT まで await を挟まない)
+  const articleProblems = checkArticleNumbers(built.payload, janGate, { db, draftId });
+  if (articleProblems.length) return { ok: false, reasons: articleProblems };
   const mn = String(built.draft.ne_code).trim().toLowerCase();
 
   // PUT の「結果不明」をそのまま失敗にすると、実は登録が通っていた場合に公開ページの孤児

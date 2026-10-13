@@ -549,7 +549,7 @@ try {
     assert.equal(bad.status, 200);
     assert.ok((bad.j.warnings || []).some((w) => /JAN Company DB と違う: a003/.test(w)), JSON.stringify(bad.j.warnings));
     const good = await call('GET', `/apps/product-hub/api/drafts/${dA1.id}/rakuten/preview`);
-    assert.ok(!(good.j.warnings || []).some((w) => /JAN/.test(w)), JSON.stringify(good.j.warnings));
+    assert.ok(!(good.j.warnings || []).some((w) => /^JAN /.test(w)), JSON.stringify(good.j.warnings));
     // 印を足しても止める理由 (reasons) は同じ = 印は知らせだけ
     J.__setCdbJanReader(async () => ({ ok: false, reason: 'テストで読めない' }));
     const off = await call('GET', `/apps/product-hub/api/drafts/${dA3.id}/rakuten/preview`);
@@ -559,7 +559,7 @@ try {
     assert.ok(off.j.warnings.some((w) => /JAN を Company DB と比べられませんでした \(テストで読めない\)/.test(w)));
     // 🚨 比べる値は payload を作った直後に await を挟まずに読み直す (Codex #1700 R1 M4)
     const src = fs.readFileSync(new URL('../apps/product-hub/router.js', import.meta.url), 'utf8');
-    const m = src.match(/const built = buildItemPayload\(db, draft\.id, \{ tax \}\);([\s\S]*?)const janUnits = janUnitsForDraftId\(db, draft\.id\);/);
+    const m = src.match(/const built = buildItemPayload\(db, draft\.id, \{ tax, jan: janGate \}\);([\s\S]*?)const janUnits = janUnitsForDraftId\(db, draft\.id\);/);
     assert.ok(m, 'プレビューが payload の直後に JAN の単位を読み直していない');
     assert.ok(!/\bawait\b/.test(m[1].replace(/\/\/[^\n]*/g, '')), 'payload と JAN の読み直しの間に await がある');
   });
@@ -569,7 +569,7 @@ try {
     try {
       assert.deepEqual(J.janUnitsForDraftId(ph, dA3.id).units, [{ code: 'a003', phJan: JAN.a3 }]);
       const r = await call('GET', `/apps/product-hub/api/drafts/${dA3.id}/rakuten/preview`);
-      assert.ok(!(r.j.warnings || []).some((w) => /JAN/.test(w)), JSON.stringify(r.j.warnings));
+      assert.ok(!(r.j.warnings || []).some((w) => /^JAN /.test(w)), JSON.stringify(r.j.warnings));
     } finally { ph.prepare('UPDATE product_drafts SET jan_code = ? WHERE id = ?').run(JAN.a9, dA3.id); }
     assert.deepEqual(J.janUnitsForDraftId(ph, 999999), { mode: null, units: [] });
   });
@@ -695,7 +695,8 @@ try {
       assert.ok(at >= 0, route);
       assert.match(r.slice(at + route.length, at + route.length + 200), /^\s*const deadlineAt = Date\.now\(\) \+ JAN_READ_DEADLINE_MS;/, `${route} の入口で期限を決めていない`);
     }
-    assert.match(r, /compareDraftJans\(getDB\(\), draft, \{ deadlineAt \}\)/, '詳細の入口の期限を渡していない');
+    // 詳細の入口は 1 回の読み (期限つき) で、比べる印と選ぶ物 (B2 の段 3) の両方を出す
+    assert.match(r, /const read = await readCdbJans\(units\.map\(\(u\) => \(\{ code: u\.code, jan: u\.phJan \}\)\), \{ deadlineAt \}\);\s*const r = await compareJanUnits\(\{ mode: lj\.mode, units \}, \{ read \}\);/, '詳細の入口の期限を渡していない / 2 回読んでいる');
     assert.match(r, /boardJanMarks\(getDB\(\), \{ ids, deadlineAt \}\)/, 'ボードの入口の期限を渡していない');
   });
   await ta('[R9] ボードに 1000 枚 (まとまり入り) = 一括で読んで速い (1 回の Company DB の読み)・期限が過ぎていれば読みに行かない', async () => {

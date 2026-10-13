@@ -26,6 +26,7 @@ import { transferImagesToCabinet, registerItem, rakutenItemPageUrl } from './rak
 import { markRakutenListed, mallStatusOf } from '../lib/mall-status.js';
 import { setStepState } from '../lib/workflow-progress.js';
 import { cdbGroupListingBlock } from './cdb-group-gate.js';
+import { janListingBlock } from './listing-jan.mjs';
 
 /** 楽天への登録を実行中の draft_id → 開始時刻 (プロセス内。Render は 1 プロセスなのでこれで足りる) */
 const inFlight = new Map();
@@ -139,6 +140,10 @@ export function assertRakutenListable(db, draft, { forceUnknown = false } = {}) 
     throw httpError(400, `${head}。RMS で商品管理番号「${String(draft.ne_code || '').toLowerCase()}」の有無を確認してください。`
       + '登録されていれば詳細画面の「モール別の展開状況」で楽天を完了に、無ければ管理者がボードの「確認済み → 再実行」で出し直せます');
   }
+  // 🆕 カタログID (JAN) の門 (Company DB構想 21 §5 B2 の段 4): 止める設定 (PH_JAN_ENFORCE=1) のときだけ。商品マスタに結ばれていない・要確認・
+  //    JAN と「なしの理由」の両方 / どちらも無い 単位があれば、画像の転送やロックの前に止める (SQLite だけ。Company DB の確かめ直しは送る直前 = registerItem)
+  const janBlock = janListingBlock(db, id);
+  if (janBlock) throw httpError(400, janBlock);
 }
 
 /**
