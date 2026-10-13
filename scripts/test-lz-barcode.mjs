@@ -85,6 +85,12 @@ await ta('[C1] 新商品の CSV のバーコードの列: X00 + 7 字の FNSKU�
   // 末尾の改行 (CRLF で終わる CSV) は空の行として数えない (#1719 R3 Low 2)
   assert.deepEqual(iconv.decode(r.bytes, 'cp932').replace(/\r\n$/, '').split('\r\n').slice(1).map((l) => l.split(',')[7]), [F1, J1, '']);
   for (const v of ['X0LZB00001', JBAD]) assert.throws(() => LZ.buildLzCsv([item('b1', { barcode: v })], 'new'), /バーコードの形/, v);
+  // 🆕 0081: E 列 (有効期限区分 01 / 02)・F 列 (入荷日管理フラグ 0 / 1) = 欄があれば書く・形が違う = 例外・欄が無い = 今と同じ空 (影運転)
+  const r2 = LZ.buildLzCsv([item('e1', { barcode: '', expiry_code: '02', inbound_code: '0' }), item('e2', { barcode: F1 })], 'new');
+  assert.deepEqual(iconv.decode(r2.bytes, 'cp932').replace(/\r\n$/, '').split('\r\n').slice(1).map((l) => l.split(',').slice(4, 6).join('|')), ['02|0', '|']);
+  for (const [k, v] of [['expiry_code', '03'], ['expiry_code', '2'], ['inbound_code', '2'], ['inbound_code', undefined]]) {
+    assert.throws(() => LZ.buildLzCsv([item('b2', { barcode: '', [k]: v })], 'new'), /有効期限区分の形|入荷日管理フラグの形/, `${k} ${v}`);
+  }
 });
 
 // ─── Company DB (PGlite・持ち主のロール deploy) ───
@@ -233,7 +239,7 @@ await ta('[F5] 写しと照らした結果 (#1719 R1 High 2): 値の行に残る
     const v = await read('lz4');
     assert.deepEqual([v.lz_copy_state, !!v.unchecked], [st, true], st);
     // #1719 R2 High: 人の手順の一文 (GAS の H 列に入れる前にロジザードの商品マスタで確かめる)
-    assert.ok(v.unchecked.startsWith('ロジザードの写しと照らせていません。GAS の H 列に入れる前に、ロジザードの商品マスタで同じバーコードが無いか確かめてください'), v.unchecked);
+    assert.ok(v.unchecked.startsWith('ロジザードの写しと照らせていません。ロジザード登録の CSV には、新しい写しで照らし直せるまで出しません'), v.unchecked);
     if (st === 'stale') assert.match(v.unchecked, /2025-01-04 21:00/, '写しの時刻 (日本時間)');
     else assert.match(v.unchecked, /写しの時刻 なし/);
   }
@@ -470,10 +476,10 @@ await ta('[H3c] 押し直しの答えの印 = DB に残した結果と時刻 (#1
     const r1 = await call('POST', api('lz4'), { body });
     assert.equal(r1.status, 200, r1.text);
     assert.equal(r1.j.lz_unchecked.state, 'stale');
-    assert.ok(r1.j.lz_unchecked.note.startsWith('ロジザードの写しと照らせていません。GAS の H 列に入れる前に、ロジザードの商品マスタで同じバーコードが無いか確かめてください'), r1.j.lz_unchecked.note);
+    assert.ok(r1.j.lz_unchecked.note.startsWith('ロジザードの写しと照らせていません。ロジザード登録の CSV には、新しい写しで照らし直せるまで出しません'), r1.j.lz_unchecked.note);
     assert.ok(r1.j.lz_unchecked.note.includes(r1.j.lz_unchecked.as_of_jst), '一文に写しの時刻が無い');
     const page = section((await call('GET', '/apps/master-edit/sku/lz4')).text);
-    assert.ok(page.includes('GAS の H 列に入れる前に、ロジザードの商品マスタで同じバーコードが無いか確かめてください'), '商品の画面に手順の一文が無い');
+    assert.ok(page.includes('H 列に入れる前にロジザードの商品マスタで同じバーコードが無いか確かめてください'), '商品の画面に手順の一文が無い');
     // 写しが新しくなってから押し直す = 前に残した stale のまま (今の写しの checked で印を消さない)
     LZ_MIRROR = mirrorOf();
     const r2 = await call('POST', api('lz4'), { body });
@@ -617,8 +623,8 @@ await ta('[H4] 画面の動き (Chromium): 値を打つと空欄の印が外れ�
 await ta('[H5] つかいかた: ロジザードのバーコードの節', async () => {
   const r = await call('GET', '/apps/master-edit/manual');
   for (const w of ['id="lz-barcode"', '新商品の登録で、ロジザードに送るバーコードを打ちます', 'Amazon の出品とは関係ありません', 'バーコードをまとめて貼る', 'ほかの商品と同じバーコードは保存できません',
-    'H 列 (バーコード) には、ここで打った値を入れてください',
-    'ロジザードの写しと照らせていません。GAS の H 列に入れる前に、ロジザードの商品マスタで同じバーコードが無いか確かめてください', 'ロジザードの確かめ待ち']) assert.ok(r.text.includes(w), `つかいかたに「${w}」が無い`);
+    'H 列 (バーコード) には商品の画面のバーコードを入れてください', 'ロジザード登録の CSV</a>」の画面で作ります',
+    'ロジザードの写しと照らせていません。ロジザード登録の CSV には、新しい写しで照らし直せるまで出しません', 'ロジザードの確かめ待ち']) assert.ok(r.text.includes(w), `つかいかたに「${w}」が無い`);
 });
 
 server.close();

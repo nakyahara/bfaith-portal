@@ -157,7 +157,7 @@ await ta('[C2] 応答が失われた後の再送 (同じ request_id) = 印は DB
     assert.equal(again.j.replayed, true, again.text);
     assert.deepEqual([again.j.lz_unchecked && again.j.lz_unchecked.state, again.j.lz_unchecked && again.j.lz_unchecked.codes], ['stale', ['lzr1-A', 'lzr1-B']], again.text);
     assert.equal(again.j.lz_unchecked.as_of, first.j.lz_unchecked.as_of, '残した写しの時刻');
-    assert.ok(again.j.lz_unchecked.note.includes('GAS の H 列に入れる前に'), again.j.lz_unchecked.note);
+    assert.ok(again.j.lz_unchecked.note.includes('ロジザード登録の CSV には、新しい写しで照らし直せるまで出しません'), again.j.lz_unchecked.note);
     // 逆: 照らせた登録を、写しが読めなくなってから再送 = 印なし (今の写しで印を付けない)
     const b2 = body('lzr2', [['-A', '', { kind: 'value', value: 'X00LZR2001' }]]);
     assert.deepEqual([(await post('/api/new/variation', b2)).j.lz_unchecked], [undefined]);

@@ -27,8 +27,9 @@ export const NEW = Object.freeze({
   file: 'logizard_bc_upload.csv',
   header: Object.freeze(['商品ID', '商品名', '検索名称', '仕入単価', '有効期限区分', '入荷日管理フラグ', '取引先コード', 'バーコード']),
   human: Object.freeze([4, 5, 7]),   // 人がシートに入れる 3 列 (有効期限区分・入荷日管理フラグ・バーコード) = 空で書き、突き合わせでは比べない (中原さん L-2)
-  // 🆕 2026-10-13 (CompanyDB構想 23): バーコード (7 列目) は、項目に barcode (lib/logizard-barcode.mjs の lzCsvBarcodeOf の答え) があれば書く。
-  //   今 (GAS の間) は GAS の H 列 (人) が正 = 影運転は barcode を渡さない = 今と同じ空・比べない (L-2 のまま)。③c-2 で Company DB から作るときに使う
+  // 🆕 CompanyDB構想 23 v4 (0081): 人が入れていた 3 列は、項目に欄があれば書く = ポータルのロジザード登録の CSV (lib/lz-new-export.mjs)。
+  //   有効期限区分 (4 列目) = expiry_code '01' / '02'・入荷日管理フラグ (5 列目) = inbound_code '0' / '1'・バーコード (7 列目) = barcode ('' = 空欄 = ロジザードが番号を付ける)。
+  //   影運転 (lz-shadow) は渡さない = 今と同じ空・比べない (L-2 のまま)
 });
 
 const hexCp = (cp) => `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
@@ -120,7 +121,8 @@ export function rowTexts(it, kind) {
   const cost = it.cost_text != null ? { text: String(it.cost_text), unverified: it.cost_unverified || null } : costText(it.cost_src), sup = supplierText(it.supplier);
   if (cost.unverified) flags.push({ col: 3, why: cost.unverified });
   if (sup.unverified) flags.push({ col: kind === 'daily' ? 4 : 6, why: sup.unverified });
-  const texts = kind === 'daily' ? [code, name, name, cost.text, sup.text] : [code, name, name, cost.text, '', '', sup.text, it.barcode == null ? '' : String(it.barcode)];
+  const opt = (k) => (Object.prototype.hasOwnProperty.call(it, k) && it[k] != null ? String(it[k]) : '');
+  const texts = kind === 'daily' ? [code, name, name, cost.text, sup.text] : [code, name, name, cost.text, opt('expiry_code'), opt('inbound_code'), sup.text, opt('barcode')];
   return { texts, flags };
 }
 
@@ -182,6 +184,9 @@ function newBarcodeProblem(it) {
     return it.barcode_hold;
   }
   if (hasCode && (typeof it.barcode !== 'string' || !lzBarcodeValueOk(it.barcode))) throw new Error(`新商品 ${it.ne_code}: バーコードの形が違う (${String(it.barcode).slice(0, 40)})`);
+  // 🆕 0081: 有効期限区分 '01' / '02'・入荷日管理フラグ '0' / '1' (欄があれば値まで確かめる・無い = 今と同じ空 = 影運転)
+  if (has('expiry_code') && !['01', '02'].includes(it.expiry_code)) throw new Error(`新商品 ${it.ne_code}: 有効期限区分の形が違う (${String(it.expiry_code).slice(0, 10)})`);
+  if (has('inbound_code') && !['0', '1'].includes(it.inbound_code)) throw new Error(`新商品 ${it.ne_code}: 入荷日管理フラグの形が違う (${String(it.inbound_code).slice(0, 10)})`);
   return null;
 }
 function joinCells(bufs) { const out = []; bufs.forEach((b, i) => { if (i) out.push(Buffer.from([0x2c])); out.push(b); }); return out; }

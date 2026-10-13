@@ -255,7 +255,8 @@ export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_setti
  *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・守りの trigger
  */
 // 🆕 0080 (#1719 Codex R5): 答えの控え (ops.sku_logizard_barcode_requests) も読むだけ = 商品の画面の再送を見分ける (書くのは関数だけ)
-export const LZ_BARCODE_SELECT = Object.freeze(['ops.sku_logizard_barcode_rules', 'ops.sku_logizard_barcode_requests']);
+// 🆕 0081: ロジザード登録の CSV の帳面 (ops.lz_new_exports / _items) も読むだけ (画面・ダウンロード・商品の画面の「CSV に出した」)
+export const LZ_BARCODE_SELECT = Object.freeze(['ops.sku_logizard_barcode_rules', 'ops.sku_logizard_barcode_requests', 'ops.lz_new_exports', 'ops.lz_new_export_items']);
 /**
  * 🆕 0080 (CompanyDB構想 23 v4・中原さん 10/13 夜「新商品登録の画面で入れてすぐにロジザードと NE に登録する」): 値を書く・
  *   値の持ち主 (画面のその場の確かめ・読むだけ) を master_edit に (ロジザード登録の CSV の関数は 2 本目)。0078 の「決め方だけ」の関数は画面から使わない = 持ち主だけ (下の OWNER_ONLY)。
@@ -263,9 +264,11 @@ export const LZ_BARCODE_SELECT = Object.freeze(['ops.sku_logizard_barcode_rules'
  */
 // 🆕 #1719 R8: ops.lzbc_value_clash = 今の値の重なり (商品の画面の印・読むだけ)
 export const LZ_BARCODE_EDIT_FUNCTIONS = Object.freeze(['ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint, text, timestamp with time zone)', 'ops.lzbc_value_holder(bigint, text)',
-  'ops.lzbc_value_clash(bigint, text)']);
+  'ops.lzbc_value_clash(bigint, text)',
+  // 🆕 0081: ロジザード登録の CSV を出す・取り消す (書くのは関数だけ)
+  'ops.lz_new_export_issue(uuid, text, jsonb, timestamp with time zone, timestamp with time zone)', 'ops.lz_new_export_void(text, bigint, text)']);
 export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_logizard_barcode_rules()', 'ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)',
-  'ops.lzbc_jan_ok(text)', 'ops.guard_sku_logizard_barcode_requests()']);
+  'ops.lzbc_jan_ok(text)', 'ops.guard_sku_logizard_barcode_requests()', 'ops.guard_lz_new_exports()']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;

@@ -133,6 +133,7 @@ import { readNeDeleteStock } from './ne-delete-stock.mjs';
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
 import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
+import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -1422,6 +1423,56 @@ router.post('/api/amazon/delete', (req, res) => {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, sellerSku: b.seller_sku, reason: b.reason ?? null, seen: b.seen,
     }, { open: isOpen() });
     res.json(r);
+  }, 'write');
+});
+
+// ─── 🆕 0081 ロジザード登録の CSV (logizard_bc_upload.csv・CompanyDB構想 23 v4 §5'・lib/lz-new-export.mjs) ───
+//   見る = この画面の利用権の人・作る / 取り消す / ファイル = 名簿 (MASTER_DECISION_APPROVERS) の人 (NE 登録の CSV と同じ)
+router.get('/lz-csv', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const mirror = await lzMirrorProvider();
+  const cands = db ? await lzNewCandidates(db, mirror, clock()) : null;
+  const exports = db ? await lzNewExports(db) : [];
+  const phase = await readPhaseView(db);
+  const gate = approverGate(req);
+  res.render(view('lz-csv.ejs'), {
+    ...pageLocals(req, phase), nav: 'lzcsv', ui2: true, dbError, cands, exports, canApprove: gate.ok, approveMessage: gate.message || '',
+    mirror: { ok: mirror.ok, reason: mirror.reason, list_as_of: mirror.list_as_of, bc_as_of: mirror.bc_as_of, rows: mirror.rows, stale: mirror.ok && lzListStale(mirror, clock()) },
+    HOLD_WORDS: LZ_HOLD_WORDS, KINDS: LZ_KIND_WORDS, FRESH_HOURS: LZ_LIST_FRESH_HOURS,
+  });
+}));
+router.post('/api/lz-csv/build', (req, res) => {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  const b = req.body || {};
+  const rid = String(b.request_id ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid)) return res.status(400).json({ ok: false, error: '作る番号 (request_id) の形が違う。画面を開き直してください', reason: 'invalid_input' });
+  return withPgApi(res, async (db) => {
+    const r = await issueLzNewExport(db, { requestId: rid, actor: String(req.session.email).trim().toLowerCase(), want: b.items, mirror: await lzMirrorProvider(), nowMs: clock() });
+    res.json({ ok: true, ...r });
+  }, 'write');
+});
+router.get('/lz-csv/:id/file', (req, res) => {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  return withPgApi(res, async (db) => {
+    const f = await lzNewExportFile(db, req.params.id);
+    if (!f) return res.status(404).json({ ok: false, error: 'ファイルがありません' });
+    if (f.state !== 'issued') return res.status(409).json({ ok: false, error: '取り消したファイルは出しません (作り直してください)', reason: 'voided' });
+    // Shift_JIS の byte 列のまま (express の send は文字の型に charset=utf-8 を足すことがある = node の setHeader と end で)
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
+    res.setHeader('Content-Disposition', `attachment; filename="${f.file_name}"`);
+    res.setHeader('X-Content-SHA256', f.file_sha256);
+    res.setHeader('Content-Length', String(f.file_bytes.length));
+    res.end(f.file_bytes);
+  }, 'write');
+});
+router.post('/api/lz-csv/:id/void', (req, res) => {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  return withPgApi(res, async (db) => {
+    const r = await voidLzNewExport(db, { actor: String(req.session.email).trim().toLowerCase(), exportId: req.params.id, reason: (req.body || {}).reason });
+    res.json({ ok: true, ...r });
   }, 'write');
 });
 
