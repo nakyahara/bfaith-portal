@@ -992,7 +992,10 @@ export const JOBS_REGISTRY = [
       + 'これが止まると Company DB は「その日の写し」のまま古びていき、mart の 360 度ビュー・欠落フラグ・'
       + 'モール間の値ズレが実態とずれる (見ている人は気づけない)。ロードは冪等なので、'
       + '毎晩流せば前日に SQLite で起きたことが翌朝には入っている。1 回 6〜10 秒。'
-      + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
+      + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)。'
+      + '🆕 後ろの段 (本体のロードの後・別の接続・別の取引 = 段が失敗しても本体は戻さない・段の失敗 = この ping が fail): '
+      + '① 発注の設定の知らせ (AI_reference CompanyDB構想/21 C1・migration 0075・lib/order-settings-outbox.mjs) = 新商品の登録で入れた発注の設定を発注アプリ (Render の SQLite の po_*) へ届け直す。'
+      + '24 時間を超えて届いていない知らせが 1 つでもあれば段の失敗 (新しい定期実行は作らず、この 1 本の後ろに載せた)',
     where: 'Render bfaith-portal 内 node-cron (apps/company-db/nightly.mjs startCompanyDbNightlyLoadCron。'
       + 'COMPANY_DB_LOAD_CRON_ENABLED=1 かつ RENDER=true のときだけ起動。miniPC も同じ server.js を動かすので、'
       + 'lib/is-render.js の isRender() で Render 以外を弾く。材料 (warehouse-mirror.db) の有無は別の検査 = 「Render なのに材料が無い」の検知)',
@@ -1015,7 +1018,11 @@ export const JOBS_REGISTRY = [
       + 'Render Logs は「company-db nightly」で検索。失敗したら report の conflicts (不一致) と unresolved (未解決) を見る。'
       + '途中で Render が再起動した回は /status の interrupted に出る (本適用が commit 済みかは ops.ingest_runs で分かる)。'
       + '正本 = AI_reference『システム設計/CompanyDB構想/07_初期ロード_名寄せレポート_20260910.md』、'
-      + '約束と手順 = db/company/README.md',
+      + '約束と手順 = db/company/README.md。'
+      + '🆕 note が「段の失敗: 発注の設定の知らせ: … (24時間超 N: コード)」= 新商品の発注の設定がまだ発注アプリに届いていない (本体のロードは成功 = note の「本体は成功 run=…」)。'
+      + 'マスタの入力 → 左の列「発注の設定の届け待ち」(/apps/master-edit/order-settings-outbox) を開く → 理由を見て「もう一度届ける」。'
+      + '「要確認」(発注アプリにほかの画面がもう設定を作っていた) は商品の画面の「発注の設定」で今の値を確かめてから「閉じる」(理由を書く)。'
+      + 'どうしても届かない = 商品の画面の「発注の設定」で入れてから「閉じる」',
   },
   {
     id: 'company-db-inventory-hourly',

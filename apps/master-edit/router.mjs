@@ -50,6 +50,13 @@
  *        ② だけ失敗 = 登録は成功のまま・応答の order_settings = { ok: false, error } (画面は「商品の画面で入れてください」)。同じ request_id のやり直しでも ② をもう一度 (同じ値の上書き)
  *   POST /api/sku/:code/order-settings  商品の画面の「発注の設定を保存」{ request_id, seen: { updated_at }, values: {...} } (Company DB の保存とは別・開いたときの印が違えば 409)
  *   書ける人 = 名簿 (MASTER_EDITORS) かつ 発注アプリの利用権。Company DB の切替の門は見ない (発注アプリのマスタ管理と同じく、いつでも)
+ *   🆕 0075 (CompanyDB構想 21 C1・lib/order-settings-outbox.mjs): 新商品の登録 (単品・まとまり) の発注の設定は ① と同じ Postgres の取引に「発注の設定の知らせ」を積み、
+ *        commit の後に発注アプリへ届ける (届かなくても知らせは残る = 画面を開いたとき・人の「もう一度」・夜間ロードの後ろの段で届け直す・24 時間で知らせる)。
+ *        応答の order_settings = { ok, status, pending?, error? }。0075 の前の DB = 今までどおり ② をすぐ書く (知らせは無い)
+ *   GET  /order-settings-outbox               発注の設定の届け待ちの画面 (発注アプリの権限がある人)
+ *   GET  /api/order-settings-outbox           画面の上の件数 (開いたときに届け直してから数える・60 秒に 1 回まで)
+ *   POST /api/order-settings-outbox/:id/retry   もう一度届ける (名簿 かつ 発注アプリの権限・要確認 (conflict) も試す)
+ *   POST /api/order-settings-outbox/:id/dismiss 閉じる { reason } (名簿 かつ 発注アプリの権限・失敗 / 要確認だけ・商品の画面で入れ直した後など)
  *   ── Amazon SKU の対応 (⑦-1・0054・Company DB構想 16。保存を開く門は上と同じ + 持ち主 listing_components.amazon が 'company') ──
  *   GET  /amazon/            一覧 (Company DB の対応・墓標も)。?q=&state=&offset=
  *   GET  /amazon/new?sku=    新しい seller SKU の対応を自分で作る入口 (まだ売れていない SKU も)。形 → もうある (対応・墓標) = その画面へ案内 →
@@ -101,7 +108,9 @@ import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
 import { writeOrderSettings, writeRegistrationOrderSettings, registrationOrderDone, OrderSettingsError } from '../purchase-orders/order-settings.js';
-import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody } from './order-settings.mjs';
+import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf } from './order-settings.mjs';
+import { orderOutboxReady, runOrderSettingsOutbox, readOrderSettingsForRegistration, deliveryInputOf, orderDeliveryEnabled, orderOutboxStatus, readOrderSettingsOutbox,
+  dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, readRegistrationOrderMark, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS } from '../../lib/order-settings-outbox.mjs';
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
@@ -251,6 +260,64 @@ async function tryGroupCard(db, eventId) {
 /** 発注の設定の書き込み (新商品の登録の ② = Company DB の登録の後)。本番 = 発注アプリの部品 (request_id で 1 回だけ)。試験は差し替える (② だけ失敗する) */
 let orderWriter = writeRegistrationOrderSettings;
 export function __setOrderWriter(fn) { orderWriter = fn || writeRegistrationOrderSettings; }
+/** 🆕 0075: 知らせを届ける = 発注アプリの部品 (orderWriter・届けの ID で 1 回だけ) */
+const applyOrder = (ev) => orderWriter(deliveryInputOf(ev));
+/** 🆕 0075: 登録の直後に、その登録の知らせを届ける (Render の中だけ・誤りは投げない) → 知らせの今の状態 (読めない = null) */
+async function deliverRegistrationOrders(db, regId) {
+  if (orderDeliveryEnabled()) {
+    try { await runOrderSettingsOutbox(db, { mode: 'auto', registrationRequestId: regId, limit: 120, apply: applyOrder }); }
+    catch (e) { console.error(`[master-edit] 発注の設定の知らせを届けられなかった (${regId}): ${e && e.message}`); }
+  }
+  try { return await readOrderSettingsForRegistration(db, regId); }
+  catch (e) { console.error(`[master-edit] 発注の設定の知らせを読めない (${regId}): ${e && e.message}`); return null; }
+}
+const ORDER_PENDING_WORDS = '発注の設定はまだ発注アプリに届いていません (知らせは Company DB に残っています)。自動でもう一度届けます (画面を開いたとき・毎晩)';
+const ORDER_MISMATCH_WORDS = '同じ登録の番号 (request_id) で、前と違う発注の設定が来ました。前の発注の設定のままです (変えていません)。商品の画面の「発注の設定」で確かめてください';
+/**
+ * 🆕 0075: 登録 (押し直しも) の後の発注の設定 (Codex #1703 R1 M2 = 発注の設定は登録の要求のハッシュの外 = 0075 の前後で同じ要求が冪等)。
+ *   押し直し (replayed): 「知らせの道で登録した」印 (ops.order_settings_registrations・Codex #1703 R2 M) で見分ける:
+ *     印が無い = 0075 の前 (かロールの流し直しの前) の登録 = legacy (今までの ② をすぐ書く・部品が request_id で 1 回だけ)
+ *     印がある = 知らせと照らす: 知らせ 0 件 (発注の設定なしで登録) なのに発注の設定が来た・中身の hash が違う = mismatch (何も変えない) / 同じ = 届け直す
+ *   新しい登録 = 届ける。戻り値 { mode: 'events', evs } | { mode: 'mismatch', codes } | { mode: 'legacy' }
+ */
+async function ordersAfterRegistration(db, regId, replayed, base) {
+  if (replayed) {
+    let mark; let cur;
+    try { mark = await readRegistrationOrderMark(db, regId); cur = await readOrderSettingsForRegistration(db, regId); } catch (e) {
+      // 読めない = どちらの道か決められない = 書かない (届け直しは画面を開いたとき・夜間)
+      console.error(`[master-edit] 発注の設定の知らせを読めない (${regId}): ${e && e.message}`);
+      return { mode: 'events', evs: null };
+    }
+    if (!mark) return { mode: 'legacy' };
+    if (cur.length === 0) return { mode: 'mismatch', codes: [] };
+    const bad = cur.filter((e) => orderPayloadHash(orderPayloadOf(e.code, base)) !== e.payload_hash);
+    if (bad.length) return { mode: 'mismatch', codes: bad.map((e) => e.code) };
+  }
+  return { mode: 'events', evs: await deliverRegistrationOrders(db, regId) };
+}
+/** 🆕 0075: 知らせ 1 つ → 応答の order_settings (単品) */
+function orderEventView(ev, replayed) {
+  if (!ev) return { ok: false, status: null, reason: 'no_event', pending: false, error: '発注の設定の知らせが見つかりません。商品の画面の「発注の設定」で確かめてください' };
+  const r = ev.result || {};
+  if (ev.status === 'done') return { ok: true, status: 'done', changed: !!r.changed, created: r.created || null, replayed: !!replayed || !!r.replayed };
+  if (ev.status === 'conflict' || ev.status === 'dismissed') {
+    return { ok: false, status: ev.status, reason: r.reason || ev.status, pending: false, error: ev.last_error || 'この商品の発注の設定は発注アプリにもう作られていました。上書きしていません。商品の画面で確かめてください' };
+  }
+  return { ok: false, status: ev.status, reason: 'pending', pending: true, error: ev.last_error ? `${ORDER_PENDING_WORDS} (理由: ${String(ev.last_error).slice(0, 200)})` : ORDER_PENDING_WORDS };
+}
+/** 🆕 0075: 知らせ (子ごと) → 応答の order_settings (まとまり)。failed = 届いていない子 (状態・理由つき) */
+function orderEventsView(evs, kids) {
+  const byCode = new Map((evs || []).map((e) => [normSku(e.code), e]));
+  let written = 0; let pending = 0;
+  const failed = [];
+  for (const k of kids || []) {
+    const e = byCode.get(normSku(k.code));
+    if (e && e.status === 'done') { written++; continue; }
+    if (!e || e.status === 'pending' || e.status === 'failed') pending++;
+    failed.push({ code: k.code, status: e ? e.status : null, error: e ? (e.last_error || ORDER_PENDING_WORDS) : '発注の設定の知らせが見つかりません' });
+  }
+  return { ok: failed.length === 0, written, pending, failed };
+}
 /** product-hub の下書きカードに同じ管理番号があるか (まとまりのコード = 楽天の商品管理番号・Render の SQLite)。試験は差し替える */
 let phDraftLookup = defaultPhDraftExists;
 export function __setPhDraftLookup(fn) { phDraftLookup = fn || defaultPhDraftExists; }
@@ -398,6 +465,8 @@ const pageLocals = (req, phase = null) => {
     amazonClosed: !!amazonWhy, amazonClosedWhy: amazonWhy,
     // 見せ方の道具・部品の版・左の列でいまどこか。画面はすべて新しいデザイン (ui2。第 2 段 10/5 で新商品・NE 登録の CSV・Amazon・変更の記録も)
     ui, assetV, ui2: true, nav: '', nowMs: clock(),
+    // 🆕 0075: 上の帯の「発注の設定が届いていない」と左の列の「発注の設定の届け待ち」= 発注アプリの権限がある人だけ (発注アプリの値)
+    poAccess: canSeeBackorders(req),
     PF,   // 利益 (1 個あたり・参考) の計算と見せ方 = lib/profit-estimate.js (一覧・1 つの商品の画面・つかいかた。画面の JS も同じファイル)
   };
 };
@@ -684,11 +753,13 @@ router.post('/api/new/variation', (req, res) => {
   // 発注の設定 (発注アプリ): 単品の登録と同じ = ① の前に全部確かめる (1 つ目の子のコードで dry-run・同じ値を全部の子に)。誤り = 何も書かない
   let order = null;
   let orderInput = null;
+  let orderBase = null;
   try { order = orderInputOf(b.order_settings); } catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
   if (order) {
     const og = orderWriteGate(req, gate);
     if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason, field: 'order_settings' });
     orderInput = { ...order, supplierCode: b.values && b.values.primary_supplier != null ? b.values.primary_supplier : null, actor: String(req.session.email).trim().toLowerCase() };
+    try { orderBase = orderBaseOf({ order, supplierCode: orderInput.supplierCode }); } catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
     const first = kids[0] && typeof kids[0].code === 'string' ? kids[0].code : null;
     if (first && /^[0-9a-f-]{36}$/.test(rid)) {
       try { if (!registrationOrderDone(subRequestId(rid, `order:${normSku(first)}`))) writeOrderSettings({ ...orderInput, code: first, via: 'master-edit:new', seen: 'validate-only' }, { dryRun: true }); }
@@ -696,20 +767,29 @@ router.post('/api/new/variation', (req, res) => {
     }
   }
   return withPgApi(res, async (db) => {
+    // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ (子ごと) → commit の後に届ける。入る前 = 今までどおり ② をすぐ書く。
+    //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
+    const outbox = await orderOutboxReady(db);
     const r = await registerVariationBatch(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: b.reason ?? null,
-      group: b.group, axes: b.axes ?? null, options: b.options, children: b.children, values: b.values, card: b.card,
-    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup });
-    // ② 発注アプリに子ごとに書く (① が通った後だけ・子の request_id ごとに 1 回 = 押し直しでも同じ)。失敗しても登録は成功のまま
+      group: b.group, axes: b.axes ?? null, options: b.options, children: b.children, values: b.values, card: b.card, order: outbox ? orderBase : null,
+    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox });
     let orderResult = null;
-    if (orderInput) {
+    const regId = String(r.request_id || rid).trim().toLowerCase();
+    const after = orderInput && outbox ? await ordersAfterRegistration(db, regId, !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
+    if (after.mode === 'mismatch') orderResult = { ok: false, reason: 'request_id_reused', written: 0, pending: 0, failed: (r.children || []).map((k) => ({ code: k.code, status: 'mismatch', error: ORDER_MISMATCH_WORDS })) };
+    else if (after.mode === 'events' && after.evs && after.evs.length) orderResult = orderEventsView(after.evs, r.children);
+    else if (after.mode === 'events') orderResult = orderEventsView([], r.children);
+    // 0075 の前の DB・知らせを使えない (権限の流し直しの前)・知らせの無い前の登録の押し直し = ② 発注アプリに子ごとに書く
+    //   (① が通った後だけ・子の request_id ごとに 1 回 = 押し直しでも同じ)。失敗しても登録は成功のまま
+    else if (orderInput) {
       const failed = [];
       let ok = 0;
       for (const k of r.children || []) {
         try { orderWriter({ ...orderInput, code: k.code, requestId: subRequestId(r.request_id || rid, `order:${normSku(k.code)}`) }); ok++; }
         catch (e) { console.error(`[master-edit] 発注の設定だけ保存できなかった (${k.code}): ${e && e.message}`); failed.push({ code: k.code, error: e instanceof OrderSettingsError ? e.message : '発注アプリに書けませんでした' }); }
       }
-      orderResult = { ok: failed.length === 0, written: ok, failed };
+      orderResult = { ok: failed.length === 0, written: ok, pending: 0, failed };
     }
     // まとまりのカード (product-hub・まとまりで 1 枚) を保存の後で 1 回だけ試す (同じ取引ではない = 失敗しても登録はできている・続きは product-hub の sweep)
     let card = null;
@@ -792,6 +872,7 @@ router.post('/api/new', (req, res) => {
   //   誤り = ここで断る (Company DB にも発注アプリにも何も書かない)。確かめは発注アプリの部品の dry-run = 書くときと同じ決まり
   let order = null;
   let orderInput = null;
+  let orderBase = null;
   try { order = orderInputOf(b.order_settings); } catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
   if (order) {
     if (b.kind !== 'single') return res.status(400).json({ ok: false, error: 'セットには発注の設定がありません (発注アプリはセットを扱わず、構成品で発注します)', reason: 'order_settings_set', field: 'order_settings' });
@@ -799,18 +880,27 @@ router.post('/api/new', (req, res) => {
     if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason, field: 'order_settings' });
     orderInput = { code: b.code, ...order, supplierCode: b.values && b.values.primary_supplier != null ? b.values.primary_supplier : null,
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id };
+    try { orderBase = orderBaseOf({ order, supplierCode: orderInput.supplierCode }); } catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
     // ② がもう済んだ request_id (やり直し) = 前の結果を返すだけなので確かめない。まだ = 形・グループ・仕入先を確かめる (印 = validate-only・書かない)
     try { if (!registrationOrderDone(b.request_id)) writeOrderSettings({ ...orderInput, via: 'master-edit:new', seen: 'validate-only' }, { dryRun: true }); }
     catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
   }
   return withPgApi(res, async (db) => {
+    // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ → commit の後に届ける (届かなくても知らせは残る = 届け直す)。
+    //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
+    const outbox = await orderOutboxReady(db);
     const r = await registerNewSku(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
-    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined });
-    // ② 発注アプリに書く (① が通った後だけ = 登録の誤りはここに来ない)。同じ request_id のやり直し (replayed) でももう一度 (同じ値の上書き = 何度でも同じ)。
-    //   失敗しても登録は成功のまま (outbox は使わない = 10/9 中原さん Q4 a)。画面は「商品の画面で入れてください」
+      order: outbox ? orderBase : null,
+    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox });
     let orderResult = null;
-    if (orderInput) {
+    const after = orderInput && outbox ? await ordersAfterRegistration(db, String(b.request_id).trim().toLowerCase(), !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
+    if (after.mode === 'mismatch') orderResult = { ok: false, status: 'mismatch', reason: 'request_id_reused', pending: false, error: ORDER_MISMATCH_WORDS };
+    else if (after.mode === 'events' && after.evs && after.evs.length) orderResult = orderEventView(after.evs[0], r.replayed);
+    else if (after.mode === 'events') orderResult = orderEventView({ status: 'pending', last_error: null }, false);
+    // 0075 の前の DB・知らせを使えない (権限の流し直しの前)・知らせの無い前の登録の押し直し = ② 発注アプリに書く (① が通った後だけ = 登録の誤りはここに来ない)。
+    //   同じ request_id のやり直し (replayed) でももう一度 (部品が request_id で 1 回だけ)。失敗しても登録は成功のまま。画面は「商品の画面で入れてください」
+    else if (orderInput) {
       try {
         const w = orderWriter({ ...orderInput, code: r.code || b.code });
         orderResult = { ok: true, changed: !!w.changed, created: w.created || null, replayed: !!w.replayed };
@@ -903,6 +993,61 @@ router.post('/api/sku/:code/order-settings', (req, res) => {
       throw e;
     }
   });
+});
+
+// ─── 🆕 0075: 発注の設定の届け待ち (CompanyDB構想 21 C1・lib/order-settings-outbox.mjs) ───
+/** 発注の設定の知らせを書く / 閉じる人 = 名簿 かつ 発注アプリの権限 (発注の設定を書ける人と同じ) */
+function orderOutboxGate(req, res) {
+  const og = orderWriteGate(req, editorGate(req));
+  if (!og.ok) { res.status(403).json({ ok: false, error: og.message, reason: og.reason }); return false; }
+  return true;
+}
+const UUID_RE_PARAM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+router.get('/api/order-settings-outbox', async (req, res) => {
+  if (!canSeeBackorders(req)) return res.status(403).json({ ok: false, reason: 'no_po_access', error: '発注アプリの権限がないので、発注の設定の届け待ちは出せません' });
+  const st = await orderOutboxStatus({ apply: applyOrder });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: st.ok, ready: !!st.ready, open: st.open || 0, overdue: st.overdue || 0, by_status: st.by_status || {}, error: st.ok ? undefined : 'Company DB を読めません',
+    items: (st.items || []).slice(0, 50).map((i) => ({ event_id: i.event_id, code: i.code, status: i.status, label: ORDER_STATUS_LABELS[i.status] || i.status, overdue: !!i.overdue, created_at: i.created_at })) });
+});
+router.get('/order-settings-outbox', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const poOk = canSeeBackorders(req);
+  let data = null; let readError = null;
+  if (db && poOk) {
+    try { data = await readOrderSettingsOutbox(db, { limit: 500, closedDays: 14 }); } catch (e) { readError = String((e && e.message) || e); }
+  }
+  res.render(view('order-outbox.ejs'), {
+    ...pageLocals(req), ui2: true, nav: 'poq', dbError, poOk, data, readError, fmt, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS,
+    canAct: orderWriteGate(req, editorGate(req)).ok, delivery: orderDeliveryEnabled(),
+  });
+}));
+router.post('/api/order-settings-outbox/:id/retry', (req, res) => {
+  if (!orderOutboxGate(req, res)) return;
+  const id = String(req.params.id || '').toLowerCase();
+  if (!UUID_RE_PARAM.test(id)) return res.status(400).json({ ok: false, error: '知らせの番号の形が違う' });
+  if (!orderDeliveryEnabled()) return res.status(409).json({ ok: false, reason: 'not_render', error: 'このサーバーは発注アプリ (Render) ではないので届けられません' });
+  return withPgApi(res, async (db) => {
+    const r = await runOrderSettingsOutbox(db, { mode: 'manual', eventId: id, limit: 1, apply: applyOrder });
+    if (!r.length) {
+      const cur = (await db.query('select status, leased_until > now() as leased from ops.order_settings_outbox where event_id = $1::uuid', [id])).rows[0];
+      if (!cur) return res.status(404).json({ ok: false, error: '知らせが見つかりません' });
+      return res.status(409).json({ ok: false, reason: cur.leased ? 'leased' : cur.status, error: cur.leased ? 'ちょうどほかの処理が届けています。少し待ってから画面を開き直してください' : `もう閉じています (${ORDER_STATUS_LABELS[cur.status] || cur.status})` });
+    }
+    const x = r[0];
+    res.json({ ok: x.status === 'done', status: x.status, label: ORDER_STATUS_LABELS[x.status] || x.status, error: x.error || null, result: x.result || null });
+  }, 'write');
+});
+router.post('/api/order-settings-outbox/:id/dismiss', (req, res) => {
+  if (!orderOutboxGate(req, res)) return;
+  const id = String(req.params.id || '').toLowerCase();
+  if (!UUID_RE_PARAM.test(id)) return res.status(400).json({ ok: false, error: '知らせの番号の形が違う' });
+  const reason = String((req.body && req.body.reason) ?? '').trim();
+  if (!reason || [...reason].length > 500 || /[\u0000-\u001f\u007f]/.test(reason)) return res.status(400).json({ ok: false, field: 'reason', error: '閉じる理由を 1〜500 字で入れてください (改行なし)' });
+  return withPgApi(res, async (db) => {
+    const ok = await dismissOrderSettingsEvent(db, { eventId: id, actor: String(req.session.email).trim().toLowerCase(), reason });
+    if (!ok) return res.status(409).json({ ok: false, reason: 'not_dismissable', error: '閉じられません (届け待ち・届けている最中・もう閉じた知らせは閉じない。届け待ちは「もう一度届ける」で)' });
+    res.json({ ok: true, status: 'dismissed' });
+  }, 'write');
 });
 
 router.post('/api/sku/:code/card-retry', (req, res) => {

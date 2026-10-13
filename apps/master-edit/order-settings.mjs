@@ -10,7 +10,7 @@
  * Company DB には書かない (この画面の Company DB の切替の門とは別。発注アプリのマスタ管理と同じく、いつでも書ける)。
  */
 import { sessionHasApp } from '../../lib/app-access.js';
-import { readOrderSettingsForScreen, ATTR_FIELDS, OrderSettingsError } from '../purchase-orders/order-settings.js';
+import { readOrderSettingsForScreen, ATTR_FIELDS, OrderSettingsError, parseAttrPatch, parseNewCondition, parseNewMaterial } from '../purchase-orders/order-settings.js';
 
 export const PO_APP_ID = 'purchase-orders';
 const BODY_KEYS = new Set([...ATTR_FIELDS, 'new_condition', 'new_material']);
@@ -57,4 +57,25 @@ export function orderInputOf(raw, { allowEmpty = false } = {}) {
 export function orderErrorBody(e) {
   const field = e.extra && e.extra.field ? `order_settings.${e.extra.field}` : 'order_settings';
   return { ok: false, error: `発注の設定: ${e.message}`, reason: e.reason, ...e.extra, field };
+}
+
+/**
+ * 🆕 0075 (CompanyDB構想 21 C1): 画面の発注の設定 (orderInputOf の答え { patch, newCondition, newMaterial }) と代表の仕入先 →
+ *   「発注の設定の知らせ」の中身の共通の部分 (コード以外・lib/order-settings-outbox.mjs の orderPayloadOf に渡す)。
+ *   形は発注アプリの部品の決まりで確かめ (誤り = OrderSettingsError)、数は文字にする (DB の hash の stable は整数しか扱わない・
+ *   届けるときに発注アプリの部品がもう一度数に直して確かめる)
+ */
+export function orderBaseOf({ order, supplierCode }) {
+  if (!order || typeof order !== 'object' || Array.isArray(order)) throw new OrderSettingsError(400, 'invalid_input', '発注の設定の入れ方が違う');
+  const str = (v) => (v == null ? null : String(v));
+  const patch = parseAttrPatch(order.patch ?? {});
+  const nc = parseNewCondition(order.newCondition ?? null);
+  const nm = parseNewMaterial(order.newMaterial ?? null);
+  return {
+    supplier_code: supplierCode == null || String(supplierCode).trim() === '' ? null : String(supplierCode),
+    patch: Object.fromEntries(Object.entries(patch).map(([k, v]) => [k, str(v)])),
+    new_condition: nc ? { condition_id: nc.condition_id, display_name: nc.display_name, condition_type: nc.condition_type, unit: nc.unit,
+      condition_value: str(nc.condition_value), maker_name: str(nc.maker_name) } : null,
+    new_material: nm ? { group_id: nm.group_id, name: nm.name, min_order_qty: str(nm.min_order_qty), unit: str(nm.unit) } : null,
+  };
 }
