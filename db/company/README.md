@@ -2663,7 +2663,7 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **照合 ② の確かめ待ち** (`ops.v_ne_reg_targets`): 要確認を全部 (単品もセットも・親のある子も・持ち主を問わず・コード 80 字まで) = 毎朝の照合 ② が要確認の NE の観測を残す (miniPC のコードは変えない・新しい定期実行なし)
 - **確かめ** `ops.quarantine_confirm_check(SKU)` (読むだけ・watcher も) = 表 `items: [{ key, ok, cdb, ne, text, fix }]`・`check_hash`・`evidence` (ok のときだけ)。
   ① 必須の欄 (新商品と同じ: 推奨保有月数 = Q2 a・単品の売上分類・代表の仕入先・今日の原価 / セット = 構成品が全部 NE 確認済み以降・税率・取扱・売上分類・原価 = 構成品から導いた値か例外原価)
-  ② NE と合っている (最新の封をした照合 ② の回 = NE のコードの回・36 時間・観測がある / 信用できる / 区分が同じ・欄ごと (構成は子ごと) に今の社内の値 = その回の観測 か、違うなら今の社内の値に結びついた承認済みの判断 (候補の print.c = 今の社内の値) = Q3 a。照合の後・承認の後に値を変えた = 明日の照合の後に)
+  ② NE と合っている (最新の封をした照合 ② の回 = NE のコードの回・36 時間・観測がある / 信用できる / 区分が同じ・欄ごと (構成は子ごと) に今の社内の値 = その回の観測 か、違うなら今の組に結びついた承認済みの判断 (候補の print.c ↔ print.n = 今日の社内の値 ↔ 今の観測の値) = Q3 a。照合の後・承認の後に社内か NE の値が変わった = 明日の照合の後に)
   ③ 代表 (親のある子 = まとまりの記録がある・NE に代表がある親なし = 先に代表の採用) ④ 生きている CSV・NE から消す依頼が無い・コードが 80 字まで (code_length)。fix = `one` / `ne_fill` / `decision` / `after_compare`
 - **一覧** `ops.quarantine_confirm_list(コード | null)` (null = 要確認の全部・500 件を超えたら too_many / コードは 500 件まで) = 一括の inspect と毎朝のまとめ (Q-3・Q-4) の材料
 - **確認** `ops.confirm_quarantined_sku(request_id, 人, 理由, 持ち主表, SKU, check_hash)` (master_edit = 名簿 MASTER_EDITORS の人 = Q1 a)。鍵の後に確かめ直す・画面の表と違う = `stale`・だめ = `not_confirmable`・

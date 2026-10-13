@@ -124,7 +124,7 @@ try {
   };
   const fp = (s) => crypto.createHash('sha256').update(s).digest('hex');
   const candOf = (code) => ({ fingerprint: fp(`${code}|cost`), subject_key: `cost:${code}`, code_norm: code, col: 'cost', child: null, cls: 'rule', reason_kind: 'company_owned', semantic: 'company_owned@1',
-    print: { code_norm: code, col: 'cost', c: 300 }, resolutions: ['accept_difference', 'fix_ne', 'fix_cdb'], proposal: { op: 'decide' } });
+    print: { code_norm: code, col: 'cost', c: 300, n: 280 }, resolutions: ['accept_difference', 'fix_ne', 'fix_cdb'], proposal: { op: 'decide' } });
   const candQ06 = candOf('q06');
   const candQ05 = candOf('q05');
   await sealRun({ decisions: [candQ06] });

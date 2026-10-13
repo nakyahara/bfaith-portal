@@ -204,9 +204,9 @@ async function obsLikeCdb(codeNorm) {
 }
 const fp = (s) => crypto.createHash('sha256').update(s).digest('hex');
 /** 判断の候補 (照合 ② が出す形) */
-const cand = (code, col, { child = null, c = null, cls = 'rule', reason = 'company_owned', resolutions = ['accept_difference', 'fix_ne', 'fix_cdb'], tag = '' } = {}) => ({
-  fingerprint: fp(`${code}|${col}|${child}|${tag}|${JSON.stringify(c)}`), subject_key: `${col === 'cost' ? 'cost' : 'value'}:${code}`, code_norm: code, col, child, cls, reason_kind: reason,
-  semantic: `${reason}@1`, print: { code_norm: code, col, child, c }, resolutions, proposal: { op: 'decide' } });
+const cand = (code, col, { child = null, c = null, n = null, cls = 'rule', reason = 'company_owned', resolutions = ['accept_difference', 'fix_ne', 'fix_cdb'], tag = '' } = {}) => ({
+  fingerprint: fp(`${code}|${col}|${child}|${tag}|${JSON.stringify(c)}|${JSON.stringify(n)}`), subject_key: `${col === 'cost' ? 'cost' : 'value'}:${code}`, code_norm: code, col, child, cls, reason_kind: reason,
+  semantic: `${reason}@1`, print: { code_norm: code, col, child, c, n }, resolutions, proposal: { op: 'decide' } });
 /**
  * 照合 ② の回を 1 つ置く。obs = { code_norm: 観測 | (今と同じ観測) => 観測 }・decisions = 候補・fetchAgoMs = 取得の古さ・neCodes = false なら NE のコードの印を進めない
  */
@@ -328,6 +328,7 @@ await ta('[C4] セットの欄: 構成品が要確認 (qs2) / 開いている構
     [() => setCost('qs1', 251, 'set_calc', 'COMPLETE'), ['cost']],
     [() => setCost('qs1', 999, 'manual', 'OVERRIDDEN'), []],
     [() => setCost('qs1', 0, 'manual', 'OVERRIDDEN'), ['cost']],   // #1715 Codex R1 M1: 例外原価 0 円は通さない (単品と同じ)
+    [() => setCost('qs1', 0, 'set_calc', 'COMPLETE'), ['cost']],   // #1715 Codex R2 M1: 構成品の合計 (set_calc) でも 0 円は通さない
     [() => setCost('qs1', 250, 'manual', 'COMPLETE'), ['cost']],
     [async () => q(`update core.sku_costs set cost_status = 'MISSING' where sku_id = $1 and valid_to is null`, [await sid('a02')]), ['cost']],
     [async () => q('delete from core.sku_components where parent_sku_id = $1', [await sid('qs1')]), ['components', 'cost', 'ne.children', 'sales_class', 'tax']],
@@ -380,9 +381,9 @@ await ta('[C5] 照合の回: NE の元のコードの回が先に進んだ (封�
     assert.match(itemOf(c, 'ne_observed').text, /観測が無い/);
   });
 });
-await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承認 (差を残す・NE を直す・社内を直す) = ok / 却下・取り消し = だめ / 直す承認の完了の後にまた出た = だめ / 写した (今の社内 = 観測) = ok / 列に当たらない候補 = ne.other / 照合の後・承認の後に値を変えた = だめ (#1715 R1 High)', async () => {
+await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承認 (差を残す・NE を直す・社内を直す) = ok / 却下・取り消し = だめ / 直す承認の完了の後にまた出た = だめ / 写した (今の社内 = 観測) = ok / 列に当たらない候補 = ne.other / 照合の後・承認の後に値を変えた = だめ (#1715 R1 High)・承認の後に NE の値だけ変わった (単品・構成の子)・今日の原価と将来の原価 = だめ (R2 High)', async () => {
   // q03: NE の原価 280・社内 300 = 照合 ② が原価の差を候補に (company_owned)
-  const cc = cand('q03', 'cost', { c: 300 });
+  const cc = cand('q03', 'cost', { c: 300, n: 280 });
   const neCost = (v) => (b) => ({ ...b, cols: { ...b.cols, cost: { st: 'ok', v } } });
   await rolledBack(async () => {
     await sealRun({ obs: { q03: neCost(280) }, decisions: [cc], at: new Date(Date.now() + 1000) });
@@ -406,6 +407,14 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
       assert.match(itemOf(c3, 'ne.cost').text, /承認の後に社内の値が変わった \(照合の時 300・今 290\)/);
       assert.equal(itemOf(c3, 'ne.cost').fix, 'after_compare');
       await pg.query('rollback to savepoint s3');
+      // #1715 Codex R2 High 1: 承認のまま、次の回で NE の値だけ 280 → 270 (同じ候補 = 同じ指紋が次の回にも見えた) = 承認は効かない
+      await pg.query('savepoint s4');
+      await sealRun({ obs: { q03: neCost(270) }, decisions: [cc], at: new Date(Date.now() + 1500) });
+      const c4 = await check('q03');
+      assert.deepEqual(bad(c4), ['ne.cost'], res);
+      assert.match(itemOf(c4, 'ne.cost').text, /承認の後に NE の値が変わった \(承認の時 280・今 270\)/);
+      assert.equal(itemOf(c4, 'ne.cost').fix, 'after_compare');
+      await pg.query('rollback to savepoint s4');
       if (res === 'fix_ne') {
         // 直す承認の完了 (action_done) の後にまた同じ差が出た = 再発 = だめ
         await q(`insert into ops.master_decision_events (fingerprint, kind, approved_event_id, actor_type, actor, observed) values ($1, 'action_done', $2, 'system', 'mc_x', '{}'::jsonb)`, [cc.fingerprint, ev]);
@@ -424,7 +433,7 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
     }
     // 解決が spec / fix_input は数えない
     await pg.query('savepoint s');
-    const cs = cand('q03', 'cost', { c: 300, tag: 'spec', resolutions: ['spec'] });
+    const cs = cand('q03', 'cost', { c: 300, n: 280, tag: 'spec', resolutions: ['spec'] });
     const lastRun = (await one('select compare_run_id from ops.ne_reg_compare_receipts order by sealed_at desc limit 1')).compare_run_id;
     await as('watch_writer', () => pg.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: lastRun, observed_at: new Date().toISOString(), decisions: [cs] })]));
     await approve(cs.fingerprint, 'spec');
@@ -441,7 +450,7 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
   });
   // 前の回の候補 (この回に見えていない) は数えない・列に当たらない候補 (exists など) = ne.other
   await rolledBack(async () => {
-    const old = cand('q03', 'cost', { c: 300, tag: 'old' });
+    const old = cand('q03', 'cost', { c: 300, n: 280, tag: 'old' });
     await sealRun({ obs: { q03: neCost(280) }, decisions: [old], at: new Date(Date.now() + 1000) });
     await approve(old.fingerprint, 'accept_difference');
     await sealRun({ obs: { q03: neCost(280) }, decisions: [cand('q03', 'exists', { c: true, cls: 'reg_stale', reason: 'reg_stale' })], at: new Date(Date.now() + 2000) });
@@ -453,7 +462,7 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
   // 構成 (components:子): NE の a02 は 2・社内は 1 = 子ごとに今の構成に結びついた承認が要る / 承認の後に社内を 3 にした = だめ
   await rolledBack(async () => {
     const neKids = (b) => ({ ...b, children: b.children.map((x) => (x.code_norm === 'a02' ? { ...x, v: 2 } : x)) });
-    const ck = cand('qs1', 'components', { child: 'a02', c: 1, reason: 'manual' });
+    const ck = cand('qs1', 'components', { child: 'a02', c: 1, n: 2, reason: 'manual' });
     await sealRun({ obs: { qs1: neKids }, decisions: [ck], at: new Date(Date.now() + 1000) });
     assert.deepEqual(bad(await check('qs1')), ['ne.children']);
     assert.equal(itemOf(await check('qs1'), 'ne.children').fix, 'decision');
@@ -463,12 +472,37 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
     const c = await check('qs1');
     assert.ok(bad(c).includes('ne.children'));
     assert.match(itemOf(c, 'ne.children').text, /承認の後に社内の値が変わった \(照合の時 1・今 3\)/);
+    // #1715 Codex R2 High 1: 承認のまま、次の回で NE の子の数量だけ 2 → 4 (同じ候補が次の回にも見えた) = 承認は効かない
+    await q('update core.sku_components set qty = 1 where parent_sku_id = $1 and child_sku_id = $2', [await sid('qs1'), await sid('a02')]);
+    assert.equal((await check('qs1')).ok, true);
+    await pg.query('savepoint r2');
+    await sealRun({ obs: { qs1: (b) => ({ ...b, children: b.children.map((x) => (x.code_norm === 'a02' ? { ...x, v: 4 } : x)) }) }, decisions: [ck], at: new Date(Date.now() + 2000) });
+    const c4 = await check('qs1');
+    assert.deepEqual(bad(c4), ['ne.children']);
+    assert.match(itemOf(c4, 'ne.children').text, /承認の後に NE の値が変わった \(承認の時 2・今 4\)/);
+    assert.equal(itemOf(c4, 'ne.children').fix, 'after_compare');
+    await pg.query('rollback to savepoint r2');
     // 照合の後に子を足した (候補が無い) = だめ
     await q('update core.sku_components set qty = 1 where parent_sku_id = $1 and child_sku_id = $2', [await sid('qs1'), await sid('a02')]);
     await q(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, sort_order, source) values (1, $1, $2, 1, 9, 'ne')`, [await sid('qs1'), await sid('a03')]);
     const c2 = await check('qs1');
     assert.ok(bad(c2).includes('ne.children'));
     assert.match(itemOf(c2, 'ne.children').text, /a03/);
+  });
+  // #1715 Codex R2 High 2: 今日の原価 500 (期限つき) と将来の原価 300 (期間の終わり無し) が並ぶ。照合 (print.c = 期間の終わりの無い行 300) の承認は今日の 500 に結びつかない
+  await rolledBack(async () => {
+    const id = await sid('q05');
+    await q('delete from core.sku_costs where sku_id = $1', [id]);
+    await q(`insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from, valid_to, reason, created_by_type, created_by_id)
+      values (1, $1, 500, 'manual', 'COMPLETE', $2::date, $2::date + 30, 't', 'human', 't'), (1, $1, 300, 'manual', 'COMPLETE', $2::date + 31, null, 't', 'human', 't')`, [id, TODAY]);
+    const cf = cand('q05', 'cost', { c: 300, n: 280 });
+    await sealRun({ obs: { q05: neCost(280) }, decisions: [cf], at: new Date(Date.now() + 1000) });
+    await approve(cf.fingerprint, 'accept_difference');
+    const c = await check('q05');
+    assert.deepEqual(bad(c), ['ne.cost'], JSON.stringify(c.items.filter((x) => !x.ok)));
+    assert.equal(itemOf(c, 'ne.cost').cdb, 500);
+    assert.match(itemOf(c, 'ne.cost').text, /承認の後に社内の値が変わった \(照合の時 300・今 500\)/);
+    assert.equal(itemOf(c, 'cost').ok, true);
   });
   // 照合の後に社内の値を NE と違う値に変えた (その回に候補が無い) = 判断なしでは通さない (#1715 Codex R1 High)
   for (const [mut, key] of [[() => setSku('q04', { name: '照合の後の名前' }), 'ne.name'], [() => setSku('q04', { standard_price_jpy: 1234 }), 'ne.price'],

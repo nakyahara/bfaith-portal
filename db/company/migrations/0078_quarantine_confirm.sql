@@ -18,8 +18,9 @@
 --           開いている構成の依頼が無い・税率と取扱と売上分類 = 構成品から導いた値 (売上分類は上書きでも)・推奨保有月数・今日の原価 (構成品の合計 set_calc か例外原価)
 --        ② NE と合っている: 最新の封をした照合 ② の回 = NE の元のコードの印の回・取得が ops.ne_gone_fresh_hours() 時間の中。その回の観測に、ある・信用できる・区分が同じ。
 --           欄ごと (名前・仕入先・原価・売価・税率・取扱・代表 / 名前・売価・構成の子ごと): 今の社内の値 = その回の観測 か、違うなら「今の社内の値」に結びついた
---           承認済みの判断 (その回に見えた候補で print.c = 今の社内の値・差を残す / NE を直す / 社内を直す・直す承認の完了の後にまた出た = 再発はだめ) があるときだけ (Q3 a)。
---           照合の後に値を変えた (候補が無い)・承認の後に第三の値に変えた = だめ (明日の照合の後に) (#1715 Codex R1 High)
+--           承認済みの判断 (その回に見えた候補で、承認した組 print.c ↔ print.n = 今の社内の値 ↔ 今の NE の値・差を残す / NE を直す / 社内を直す・
+--           直す承認の完了の後にまた出た = 再発はだめ) があるときだけ (Q3 a)。照合の後に値を変えた (候補が無い)・承認の後に社内か NE の値が変わった = だめ
+--           (明日の照合の後に) (#1715 Codex R1 High・R2 High 1 / 2)
 --        ③ 代表 (色違いのまとまり): 親のある単品 = まとまりの記録 (予約) がある。親の無い単品で NE に代表がある = 先に代表の採用
 --        ④ そのほか: 生きている NE 登録の CSV の品目・NE から消す依頼が無い
 --      人が見る欄 (名前と構成の数・売上分類) は画面の「見たら ✓」(DB は ✓ の有無で断らない)
@@ -113,6 +114,8 @@ declare
   v_cur    jsonb;                  -- 今の社内の値 (照合の読み方 = 候補の print.c と同じ形)
   v_kids   jsonb;                  -- 今の構成 (子の code_norm → 数量)
   v_tied   boolean;
+  v_ccur   jsonb;                  -- 候補の列の今の社内の値
+  v_ncur   jsonb;                  -- 候補の列の今の NE の値 (最新の封をした回の観測)
   v_diff   text[];
   v_used   jsonb := '[]'::jsonb;   -- 根拠: 使った判断・写した列
   v_cols   text[];
@@ -289,33 +292,37 @@ begin
       case when s.set_sales_class_override between 1 and 4 then '売上分類の上書きがある' when v_sales is not null then '売上分類を構成品から導ける'
            else '構成品から売上分類を導けない (上書きを入れる)' end, 'one');
     -- 今日の原価 = 構成品の合計 (set_calc / COMPLETE・円に丸めて同じ) か例外原価 (manual / OVERRIDDEN)
-    v_ok := (v_cost.cost_source = 'set_calc' and v_cost.cost_status = 'COMPLETE' and coalesce(v_all, false) and v_cost.cost_jpy = pg_catalog.round(pg_catalog.round(v_sum, 2), 0))
-            or (v_cost.cost_source = 'manual' and v_cost.cost_status = 'OVERRIDDEN' and v_cost.cost_jpy >= 1);   -- #1715 Codex R1 M1: 0 円は通さない (単品と同じ)
+    --   #1715 Codex R1 M1・R2 M1: どちらの分岐も 1 円以上 (0 円は通さない = 単品と同じ)
+    v_ok := v_cost.cost_jpy >= 1
+            and ((v_cost.cost_source = 'set_calc' and v_cost.cost_status = 'COMPLETE' and coalesce(v_all, false) and v_cost.cost_jpy = pg_catalog.round(pg_catalog.round(v_sum, 2), 0))
+                 or (v_cost.cost_source = 'manual' and v_cost.cost_status = 'OVERRIDDEN'));
     v_it := v_it || ops.quarantine_confirm_item('cost', v_ok,
       case when v_cost.sku_cost_id is null then null else pg_catalog.jsonb_build_object('cost_jpy', v_cost.cost_jpy, 'source', v_cost.cost_source, 'status', v_cost.cost_status) end,
       pg_catalog.jsonb_build_object('derived_cost_jpy', case when coalesce(v_all, false) then pg_catalog.round(pg_catalog.round(v_sum, 2), 0) end),
       case when v_ok then '今日の原価がある (構成品の合計か例外原価)'
            when v_cost.sku_cost_id is null then pg_catalog.format('今日 (%s) の原価が無い (構成品から計算・例外原価)', v_today)
            when not coalesce(v_all, false) then '構成品の原価がそろっていない (合計できない = 先に構成品の原価か、例外原価)'
-           when v_cost.cost_source = 'manual' and v_cost.cost_status = 'OVERRIDDEN' then '例外原価が 0 円 (1 円以上)'
+           when v_cost.cost_jpy < 1 then '今日の原価が 0 円 (1 円以上)'
            else '今日の原価が構成品の合計と違う (構成品から計算し直す・例外原価)' end, 'one');
   end if;
 
   -- ─── ② 欄ごと = 今の社内の値と封をした回の NE の観測が同じ / 違うなら「今の社内の値」に結びついた承認済みの判断 (Q3 a・#1715 Codex R1 High) ───
-  --   判断の候補は照合 ② がその回に見た差 (NE の値 = その回の観測・社内の値 = 候補の print.c)。承認が効くのは print.c = 今の社内の値 (照合の読み方と同じ形) のときだけ =
-  --   照合の後に社内の値を変えた (候補が無い)・承認の後に第三の値に変えた = 通さない (明日の照合の後に、新しい差をマスタの判断で)
+  --   判断の候補は照合 ② が見た差 (社内の値 = 候補の print.c・NE の値 = 候補の print.n)。承認が効くのは、承認した組 (print.c ↔ print.n) = 今の組
+  --   (今の社内の値 ↔ 最新の封をした回の観測の値・照合の読み方と同じ形) のときだけ (#1715 Codex R2 High 1) = 照合の後に社内の値を変えた (候補が無い)・
+  --   承認の後に社内を第三の値に変えた・NE の値が変わった (同じ候補が次の回にも見えていても) = 通さない (明日の照合の後に、新しい差をマスタの判断で)
   if v_obsok then
     -- 今の社内の値 (apps/company-db/master-compare/compare-load.mjs の読み方 = 候補の print.c と同じ形)
     v_cur := pg_catalog.jsonb_build_object('name', s.name, 'standard_price_jpy', s.standard_price_jpy, 'tax_rate', s.tax_rate, 'handling', s.handling, 'kind', s.sku_kind,
       'exists', true,
-      'cost', (select y.cost_jpy from core.sku_costs y where y.sku_id = p_sku_id and y.valid_to is null order by y.sku_cost_id desc limit 1),
+      'cost', v_cost.cost_jpy,   -- #1715 Codex R2 High 2: 今日の原価 (必須・期待値と同じ行)。照合の print.c (期間の終わりの無い行) と違う行なら承認は結びつかない (通さない側)
       'primary_supplier', coalesce((select pg_catalog.jsonb_agg(su.code_norm order by su.code_norm) from core.supplier_skus x join core.suppliers su on su.supplier_id = x.supplier_id
                                      where x.sku_id = p_sku_id and x.is_primary), '[]'::jsonb),
       'parent', (select core.norm_code(pp.display_code) from core.products pp where pp.product_id = s.parent_product_id));
     select pg_catalog.jsonb_object_agg(k2.code_norm, c2.qty) into v_kids from core.sku_components c2 join core.skus k2 on k2.sku_id = c2.child_sku_id where c2.parent_sku_id = p_sku_id;
     v_kids := coalesce(v_kids, '{}'::jsonb);
     for c in
-      select x.fingerprint, x.col, x.child, x.cls, x.reason_kind, x.print -> 'c' as pc, l.event_id, l.kind as dkind, l.resolution,
+      select x.fingerprint, x.col, x.child, x.cls, x.reason_kind, coalesce(x.print -> 'c', 'null'::jsonb) as pc, coalesce(x.print -> 'n', 'null'::jsonb) as pn,
+             l.event_id, l.kind as dkind, l.resolution,
              exists (select 1 from ops.master_decision_events d where d.kind = 'action_done' and d.approved_event_id = l.event_id) as done
         from ops.master_decision_candidates x
         left join lateral (select e1.event_id, e1.kind, e1.resolution from ops.master_decision_events e1
@@ -326,7 +333,22 @@ begin
     loop
       v_dcol := case c.col when 'name' then 'name' when 'primary_supplier' then 'supplier' when 'cost' then 'cost' when 'standard_price_jpy' then 'price'
                            when 'tax_rate' then 'tax_rate' when 'handling' then 'handling' when 'parent' then 'parent' when 'components' then 'children' else 'other' end;
-      v_tied := coalesce(c.pc = case when c.col = 'components' then coalesce(v_kids -> c.child, '"(無い)"'::jsonb) else v_cur -> c.col end, false);
+      v_ccur := case when c.col = 'components' then coalesce(v_kids -> c.child, '"(無い)"'::jsonb) else v_cur -> c.col end;
+      -- 今の NE の値 (最新の封をした回の観測を照合の print.n と同じ形に: 仕入先 = [値]・構成の子 = 数量か "(無い)"・値なし = null・読めない = 結びつけない)
+      v_ncur := case
+        when c.col = 'components' then (select case when z.ch is null then '"(無い)"'::jsonb when (z.ch ->> 'st') = 'ok' then z.ch -> 'v' end
+                                          from (select (select x2 from pg_catalog.jsonb_array_elements(coalesce(v_obs -> 'children', '[]'::jsonb)) x2 where x2 ->> 'code_norm' = c.child limit 1) as ch) z)
+        when c.col = 'kind' then v_obs -> 'kind'
+        when c.col = 'exists' then 'true'::jsonb
+        else (select case when (oc ->> 'st') = 'no_value' then 'null'::jsonb
+                          when (oc ->> 'st') <> 'ok' then null
+                          when c.col = 'primary_supplier' then case when oc -> 'v' = 'null'::jsonb then 'null'::jsonb else pg_catalog.jsonb_build_array(oc -> 'v') end
+                          when c.col = 'parent' and pg_catalog.jsonb_typeof(oc -> 'v') = 'string' and core.norm_code(oc ->> 'v') = s.code_norm then 'null'::jsonb
+                          when c.col = 'parent' and pg_catalog.jsonb_typeof(oc -> 'v') = 'string' then pg_catalog.to_jsonb(core.norm_code(oc ->> 'v'))
+                          else coalesce(oc -> 'v', 'null'::jsonb) end
+                from (select v_obs -> 'cols' -> (case c.col when 'standard_price_jpy' then 'price' when 'primary_supplier' then 'supplier' else c.col end) as oc) y)
+      end;
+      v_tied := coalesce(c.pc = v_ccur and c.pn = v_ncur, false);
       if c.dkind = 'approved' and c.resolution in ('accept_difference', 'fix_ne', 'fix_cdb') and not (c.resolution in ('fix_ne', 'fix_cdb') and c.done) and v_tied then
         -- 承認済みで、承認した差の社内の値 = 今の社内の値 (構成は子ごと)
         v_appr := v_appr || pg_catalog.jsonb_build_object(v_dcol || coalesce(':' || c.child, ''), pg_catalog.jsonb_build_object('fingerprint', c.fingerprint, 'col', c.col,
@@ -338,8 +360,8 @@ begin
                  when c.dkind <> 'approved' then '・最新の判断が ' || c.dkind
                  when c.resolution not in ('accept_difference', 'fix_ne', 'fix_cdb') then '・解決 ' || c.resolution || ' はこの確認では数えない'
                  when c.resolution in ('fix_ne', 'fix_cdb') and c.done then '・直す承認の完了の後にまた出た'
-                 else pg_catalog.format('・承認の後に社内の値が変わった (照合の時 %s・今 %s)', c.pc,
-                        case when c.col = 'components' then coalesce(v_kids -> c.child, '"(無い)"'::jsonb) else v_cur -> c.col end) end)));
+                 when c.pc is distinct from v_ccur then pg_catalog.format('・承認の後に社内の値が変わった (照合の時 %s・今 %s)', c.pc, coalesce(v_ccur::text, '読めない'))
+                 else pg_catalog.format('・承認の後に NE の値が変わった (承認の時 %s・今 %s)', c.pn, coalesce(v_ncur::text, '読めない')) end)));
       end if;
       v_cands := v_cands || pg_catalog.jsonb_build_object(v_dcol, true);
     end loop;
@@ -383,7 +405,7 @@ begin
              when k = 'children' then pg_catalog.format('構成が NE と違う子 (%s) に、今の構成でのマスタの判断が無い (照合の後に構成を変えた = 明日の照合の後に)', pg_catalog.array_to_string(v_diff, '・'))
              else pg_catalog.format('NE (照合の回 %s) と違う。照合の後に社内の値を変えた = 明日の照合の後にマスタの判断で', v_run) end,
         case when k not in ('children', 'other') and e = 'null'::jsonb and (o ->> 'st') = 'ok' then 'ne_fill'
-             when v_unres ? k and not exists (select 1 from pg_catalog.jsonb_array_elements_text(v_unres -> k) t where t like '%承認の後に社内の値が変わった%') then 'decision'
+             when v_unres ? k and not exists (select 1 from pg_catalog.jsonb_array_elements_text(v_unres -> k) t where t like '%承認の後に%の値が変わった%') then 'decision'
              else 'after_compare' end);
     end loop;
   end if;
