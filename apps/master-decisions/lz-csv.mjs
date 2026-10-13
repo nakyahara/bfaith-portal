@@ -137,11 +137,10 @@ export function buildLzCsv(items, kind) {
   const unmade = [];
   const made = [];
   for (const it of items) {
+    // 新商品のバーコードの渡し方は元のコードより先に確かめる (Codex PR R2 Low = 誤った渡し方は行を作らない項目でも止める)
+    const why = kind === 'new' ? newBarcodeProblem(it) : null;
     if (!it.ne_code) { unmade.push({ code_norm: it.code_norm, reason: it.code_reason || 'no_ne_code' }); continue; }
-    if (kind === 'new') {
-      const why = newBarcodeProblem(it);
-      if (why) { unmade.push({ code_norm: it.code_norm, reason: why }); continue; }
-    }
+    if (why) { unmade.push({ code_norm: it.code_norm, reason: why }); continue; }
     made.push(it);
   }
   made.sort((a, b) => (a.ne_code < b.ne_code ? -1 : a.ne_code > b.ne_code ? 1 : 0));
@@ -173,7 +172,9 @@ export function buildLzCsv(items, kind) {
  *   要確認・待つ・決め方なし = 行を作らない (理由 = barcode_hold)。両方・形の違う値 = 例外で止める (黙って空欄にしない = 空欄はロジザードが別の番号を付ける)
  */
 function newBarcodeProblem(it) {
-  const hasHold = it.barcode_hold != null, hasCode = it.barcode != null;
+  // 有る / 無いは「欄があるか」で見る (Codex PR R2 M1: { barcode: null } を「無い」= 空欄にしない)
+  const has = (k) => Object.prototype.hasOwnProperty.call(it, k) && it[k] !== undefined;
+  const hasHold = has('barcode_hold'), hasCode = has('barcode');
   if (hasHold && hasCode) throw new Error(`新商品 ${it.ne_code}: barcode と barcode_hold の両方がある`);
   if (hasHold) {
     if (!LZ_BARCODE_HOLDS.includes(it.barcode_hold)) throw new Error(`新商品 ${it.ne_code}: 知らない barcode_hold ${String(it.barcode_hold).slice(0, 40)}`);

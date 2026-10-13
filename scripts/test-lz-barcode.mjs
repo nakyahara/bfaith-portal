@@ -127,6 +127,9 @@ await ta('[C2] 渡し方の誤り = 例外 (両方・形の違う値・知らな
   assert.throws(() => LZ.buildLzCsv([item('b3', { barcode: 4901234567894 })], 'new'), /バーコードの形が違う/);
   assert.throws(() => LZ.buildLzCsv([item('b4', { barcode_hold: 'later' })], 'new'), /知らない barcode_hold/);
   assert.throws(() => LZ.buildLzCsv([item('b5', { barcode_hold: 'lz_barcode_typo' })], 'new'), /知らない barcode_hold/, '決まった 3 つ以外の理由を受けた');
+  assert.throws(() => LZ.buildLzCsv([item('b6', { barcode: null })], 'new'), /バーコードの形が違う/, '{ barcode: null } を空欄にした');
+  assert.throws(() => LZ.buildLzCsv([item('b7', { barcode: F1, barcode_hold: 'lz_barcode_waiting', ne_code: null })], 'new'), /両方がある/, '元のコードが無い項目の誤った渡し方を見逃した');
+  assert.deepEqual(LB.lzCsvBarcodeOf(LB.pickLogizardBarcode('fnsku', c())), { barcode_hold: 'lz_barcode_waiting' });
   const d = LZ.buildLzCsv([item('d1', { barcode: F1 })], 'daily');
   assert.deepEqual(cells(d)[0], ['d1', '商品 d1', '商品 d1', '100', '0001']);
   const plain = LZ.buildLzCsv([item('e1')], 'new');
@@ -431,6 +434,24 @@ await ta('[H5] 画面の動き (Chromium): 選んだ 1 本はほかの決め方�
     assert.deepEqual([sent[1].rule, sent[1].pinned], ['fnsku', null]);
     const last = (await rowsOf('lz2')).slice(-1)[0];
     assert.deepEqual([last.rule, last.pinned], ['fnsku', null]);
+    // サーバーは保存した (commit) のに返事だけ 502 = 次の押し直しも同じ request_id (前の答え = 2 行にしない・stale にしない)
+    await p.unroute('**/logizard-barcode');
+    await p.goto(`${ORIGIN}/apps/master-edit/sku/lz2`);
+    const n0 = (await rowsOf('lz2')).length;
+    const sent2 = [];
+    let lost = true;
+    await p.route('**/logizard-barcode', async (route) => {
+      sent2.push(JSON.parse(route.request().postData()));
+      if (lost) { lost = false; await route.fetch(); await route.fulfill({ status: 502, body: 'bad gateway' }); } else await route.continue();
+    });
+    await p.click('#lzbc-rule button[data-v="lz_assign"]');
+    await p.click('#lzbc-save');
+    await p.waitForFunction(() => /保存されたか分かりません/.test(document.querySelector('#lzbc-msg').textContent));
+    assert.equal((await rowsOf('lz2')).length, n0 + 1, '1 回目がサーバーに届いていない');
+    const [resp2] = await Promise.all([p.waitForResponse((r) => /logizard-barcode$/.test(r.url())), p.click('#lzbc-save')]);
+    assert.equal(resp2.status(), 200);
+    assert.equal(sent2.length, 2); assert.equal(sent2[0].request_id, sent2[1].request_id, '502 の後の押し直しで request_id が変わった');
+    assert.equal((await rowsOf('lz2')).length, n0 + 1, '押し直しで 2 行になった');
     assert.deepEqual(errors, [], '画面の JS の例外');
   } finally { await browser.close(); }
 });

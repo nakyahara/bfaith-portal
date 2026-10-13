@@ -117,10 +117,14 @@
     var body = { request_id: pending.rid, rule: c.rule, pinned: c.pinned, seen_row: P.seenRow };
     busy = true; changed(); msg('保存しています…');
     fetch(P.base + '/api/sku/' + encodeURIComponent(P.code) + '/logizard-barcode', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) })
-      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
+      .then(function (r) { return r.json().catch(function () { return null; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
         busy = false;
-        pending = null;   // 返事が来た = 次は新しい番号
+        // 番号を捨てるのは、ちゃんとした返事 (成功 か はっきりした 4xx) のときだけ (Codex PR R2 M2)。
+        //   5xx・本文の読めない返事 = 保存されたか分からない = 同じ番号のまま (もう一度押すと同じ保存として送り直す)
+        var sure = !!x.j && (x.r.ok ? x.j.ok === true : x.r.status >= 400 && x.r.status < 500);
+        if (!sure) { msg('保存されたか分かりません (HTTP ' + x.r.status + ')。もう一度「決め方を保存」を押してください (同じ保存として送り直します)', 'err'); changed(); return; }
+        pending = null;
         if (x.r.ok && x.j.ok) {
           P.seenRow = x.j.rule_row || P.seenRow;
           P.rule = x.j.rule; P.pinned = x.j.pinned || null;
