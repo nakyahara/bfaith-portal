@@ -20,7 +20,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import {
   businessKey, payloadOf, contentHashOf, captureLogizardInventory, closeStockDay, closeStockDays, maintainInventory,
-  readMirrorLogizardStock, nextDay, safeDate, SCOPE, RAW_SRC,
+  readMirrorLogizardStock, nextDay, safeDate, SCOPE, RAW_SRC, RETENTION_DAYS,
 } from '../apps/company-db/inventory/logizard.mjs';
 import { runInventoryHourly, summarize, startCompanyDbInventoryHourlyCron, JOB_ID } from '../apps/company-db/inventory-hourly.mjs';
 
@@ -205,18 +205,22 @@ await t('🚨 有効期限 2027/03/31 と 2027-3-1 は date になり、13 月�
 });
 
 console.log('整理と記録');
-await t('maintainInventory: 30 日より古い置き換え済みの観測が消え、ops.job_runs に DB の大きさが残る', async () => {
-  // 古い観測を作る: 60 日前の完走 run で AAA-1 が 99 → その後の世代で置き換わっている
-  await pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, started_at, finished_at, status, complete, checksum) values ('old-run', 'logizard', 'inventory', $1, now() - interval '60 days', now() - interval '60 days', 'success', true, '2026-07-13T00:00:00.000Z')`, [SCOPE]);
+await t('maintainInventory: 保持の日数より古い置き換え済みの観測が消え、ops.job_runs に DB の大きさが残る (既定の保持 = 30 日)', async () => {
+  assert.equal(RETENTION_DAYS, 30);
+  // 古い観測を作る: 7/13 の完走 run で AAA-1 が 99 → その後の世代 (9/10〜9/12 の固定の日付) で置き換わっている
+  // 🚨 上の世代は日付が固定 = now() 基準の 30 日で切ると、日がたつほど上の世代も「古い置き換え済み」に入って purged が増える (2026-10-11 ごろから 11 件になって NG)。
+  //    保持の境目を 8/15 (old-run と上の世代の間) に置く日数を渡し、消えるのは old-run の 1 件だけにする
+  const keepDays = Math.ceil((Date.now() - Date.parse('2026-08-15T00:00:00Z')) / 86400000);
+  await pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, started_at, finished_at, status, complete, checksum) values ('old-run', 'logizard', 'inventory', $1, '2026-07-13T00:00:00Z', '2026-07-13T00:00:00Z', 'success', true, '2026-07-13T00:00:00.000Z')`, [SCOPE]);
   await pg.query(`insert into raw.${RAW_SRC}_contents (content_hash, payload) values ('h-old', '{"商品ID":"AAA-1","在庫数":99}')`);
-  await pg.query(`insert into raw.${RAW_SRC}_observations (ingest_run_id, scope_key, business_key, content_hash, fetch_status, observed_at) values ('old-run', $1, 'AAA-1|P3FA|001-001-01|良品|-|2026/09/01', 'h-old', 'ok', now() - interval '60 days')`, [SCOPE]);
+  await pg.query(`insert into raw.${RAW_SRC}_observations (ingest_run_id, scope_key, business_key, content_hash, fetch_status, observed_at) values ('old-run', $1, 'AAA-1|P3FA|001-001-01|良品|-|2026/09/01', 'h-old', 'ok', '2026-07-13T00:00:00Z')`, [SCOPE]);
   const before = await num(`select count(*) as n from raw.${RAW_SRC}_observations`);
-  const m = await maintainInventory(db, { host: 'test', note: 'test' });
+  const m = await maintainInventory(db, { host: 'test', note: 'test', keepDays });
   assert.equal(m.purged, 1); assert.ok(m.dbBytes > 0);
   assert.equal(await num(`select count(*) as n from raw.${RAW_SRC}_observations`), before - 1);
   assert.equal(await num(`select count(*) as n from raw.${RAW_SRC}_contents where content_hash = 'h-old'`), 0);
   const jr = await one(`select job_id, status, summary from ops.job_runs order by job_run_id desc limit 1`);
-  assert.equal(jr.job_id, JOB_ID); assert.equal(jr.status, 'ok'); assert.match(jr.summary, /"purged_observations":1/); assert.match(jr.summary, /db_mb/);
+  assert.equal(jr.job_id, JOB_ID); assert.equal(jr.status, 'ok'); assert.match(jr.summary, /"purged_observations":1/); assert.match(jr.summary, new RegExp(`"keep_days":${keepDays}`)); assert.match(jr.summary, /db_mb/);
 });
 
 console.log('mirror の読み取り');
