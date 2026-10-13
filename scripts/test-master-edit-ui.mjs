@@ -37,6 +37,8 @@
  *  60 NE 登録の CSV の「この形を実機で確かめた」(10/12 中原さん): 引退した版 (ne-reg-single-v1) の試し用のファイル = ボタンも「本番の行数で作れるようになります」も出さず一言・
  *     門の無い版 (single-v2・variation-v1) も出さない・門のある版 (セット) は今までどおり出る (押すと記録)
  *  51 円の欄 (標準売価・原価・例外原価) の読みはサーバーと同じ (カンマ・全角の数字・空白): 保存すると変わること・前との差・保存するとこうなる・利益
+ *  67 スマホ 390 (10/13): 主な画面 22 (一覧・商品・新商品 3 種・Amazon SKU 7 つ・NE 登録の CSV・NE から消す・発注の設定の届け待ち・つかいかた・マスタの判断 3 つ) が横にはみ出さない
+ *     (表は表の箱の中で横に送る)・上の帯は 1 行 (未保存と発注の札が出ても)・上の帯 / 左の列 / 「絞る」は 44px。写し = MASTER_EDIT_UI_SHOTS_390=フォルダ
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -203,6 +205,14 @@ app.set('view engine', 'ejs');
 let SESSION_APPS = ['master-edit', 'purchase-orders'];
 app.use((req, res, next) => { req.session = { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: SESSION_APPS }; next(); });
 app.use('/apps/master-edit', router);
+// マスタの判断 (左の列から行く・同じ master-edit.css を読む = [67] スマホ 390 の幅で開く)。同じ PGlite を順番に使う (master-edit と同じ鎖)
+const { default: decisionsRouter, __setPgClientFactory: __setDecisionsPgClientFactory } = await import('../apps/master-decisions/router.mjs');
+__setDecisionsPgClientFactory(async () => {
+  let release; const prev = chain; chain = new Promise((r) => { release = r; }); await prev;
+  await pg.query('set role deploy');
+  return { query: (t, p) => pg.query(t, p), end: async () => { release(); }, on: () => {} };
+});
+app.use('/apps/master-decisions', decisionsRouter);
 app.get('/', (req, res) => res.send('<p>portal</p>'));
 const server = http.createServer(app);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -2567,6 +2577,63 @@ await ta('[62] Amazon SKU の新しい対応 (390・タッチ): 1 行目があ�
     assert.deepEqual(errs, [], '画面の JS の例外');
   } finally { await c2.close(); }
 });
+
+// ── [67] スマホ 390 の幅 (10/13): 主な画面がどれも横にはみ出さない (表は表の箱の中で横に送る)・上の帯の押す所は 44px ──
+// MASTER_EDIT_UI_SHOTS_390=フォルダ を付けると 390 幅の写しを残す (目で見る用)
+const SHOTS390 = process.env.MASTER_EDIT_UI_SHOTS_390 || '';
+{
+  // Amazon の出品一覧 (0074) の見本 = 「まだつないでいない SKU」の行と seller SKU の画面の「Amazon の出品一覧では」を 390 幅で描く
+  const IL = await import('../apps/company-db/ingest/amazon-listings.mjs');
+  const today = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+  const lr = (sku, name, fba = true) => ({ seller_sku: sku, item_name: name, asin: 'B0000UI390', open_date: today, open_date_raw: `${today} 10:00:00 JST`, fulfillment: fba ? 'FBA' : 'FBM', channel_raw: fba ? 'AMAZON_NA' : 'DEFAULT', status: 'active', status_raw: 'Active', quantity: 3, price: '1280.00' });
+  const rows = [lr('pr-k001', '国産 はちみつ 500g'), lr('pr-ui390-unlinked-very-long-seller-sku-0001', '長い名前の試験: 国産 有機 シリコン 保存袋 Sサイズ 3枚入 まとめ買い 12 個セット 送料無料 ギフト ラッピング対応'), lr('pr-ui390-b', 'はちみつ レモン キャンディ')];
+  const gen = Date.now() - 3600e3;
+  const got = await IL.ingestAmazonListings(db, { shop_code: IL.SHOP_CODE, generation: gen, snapshot_at: new Date(gen).toISOString(), report_run_id: 'r_ui390', checksum: IL.listingChecksum(rows.map((r) => IL.listingRowOf(r))), row_count: rows.length, skipped_count: 0, rows }, { nowMs: Date.now() });
+  assert.equal(got.status, 'applied');
+}
+const MOBILE_SCREENS = [
+  ['一覧', '/'], ['一覧_絞り込み', '/?q=はちみつ'], ['単品', '/sku/s002'], ['セット', '/sku/set001'], ['変更の記録', '/sku/s003/history'],
+  ['新商品_単品', '/new?kind=single'], ['新商品_セット', '/new?kind=set'], ['新商品_まとまり', '/new?kind=variation'],
+  ['Amazon_一覧', '/amazon/'], ['Amazon_1つのSKU', '/amazon/sku?sku=pr-k001'], ['Amazon_新しいSKU', '/amazon/sku?sku=pr-ui390-b'], ['Amazon_つないでいない', '/amazon/unlinked'],
+  ['Amazon_対応が無い', '/amazon/unmapped?channel=all'], ['Amazon_変更の記録', '/amazon/sku/history?sku=pr-k001-b'], ['Amazon_作る', '/amazon/new?sku=pr-k001-bx'],
+  ['NE登録のCSV', '/reg-csv'], ['NEから消す', '/ne-delete'], ['発注の設定の届け待ち', '/order-settings-outbox'], ['つかいかた', '/manual'],
+  ['マスタの判断', '/apps/master-decisions/'], ['マスタの判断_CSV', '/apps/master-decisions/csv'], ['マスタの判断_つかいかた', '/apps/master-decisions/manual'],
+];
+/** 390 幅の測り: ページの横幅・はみ出している一番外の要素 (横に送る箱の中・fixed は除く)・上の帯 / 左の列 / 「絞る」の押す所の大きさ */
+const measure390 = (p) => p.evaluate(() => {
+  const W = document.documentElement.clientWidth;
+  const inBox = (el) => { for (let a = el.parentElement; a && a !== document.body; a = a.parentElement) { const s = getComputedStyle(a); if (s.overflowX !== 'visible' || s.position === 'fixed') return true; } return false; };
+  const out = [...document.querySelectorAll('body *')].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.right > W + 1 && getComputedStyle(el).position !== 'fixed' && !inBox(el); });
+  const wide = out.filter((el) => !out.includes(el.parentElement)).slice(0, 6).map((el) => `${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}${typeof el.className === 'string' && el.className ? '.' + el.className.trim().split(/\s+/).join('.') : ''} 右 ${Math.round(el.getBoundingClientRect().right)}`);
+  const small = [...document.querySelectorAll('.hdr a, .hdr button, .rail a.nav, .bigsearch .go')].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (r.height < 43.5 || r.width < 43.5); }).map((el) => `${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}.${el.className} ${Math.round(el.getBoundingClientRect().width)}×${Math.round(el.getBoundingClientRect().height)}`);
+  const hdr = document.querySelector('.hdr');
+  return { sw: document.documentElement.scrollWidth, W, wide, small, hdrH: hdr ? Math.round(hdr.getBoundingClientRect().height) : 0 };
+});
+await ta('[67] スマホ 390: 主な画面 (一覧・商品・新商品 3 種・Amazon SKU 7 つ・NE 登録の CSV・NE から消す・マスタの判断・つかいかた) が横にはみ出さない・上の帯の押す所は 44px', async (p) => {
+  process.env.MASTER_DECISION_APPROVERS = 'naka@test';   // NE 登録の CSV・NE から消すを操作できる人の画面で (ボタンが一番多い)
+  const bad = [];
+  try {
+    for (const [name, url] of MOBILE_SCREENS) {
+      const res = await p.goto(url.startsWith('/apps/') ? new URL(url, B).href : B + url);
+      assert.ok(res.status() < 500, `${name}: ${res.status()}`);
+      await p.waitForLoadState('networkidle');
+      await p.evaluate(() => Promise.all(document.getAnimations().map((a) => a.finished.catch(() => {}))));
+      const m = await measure390(p);
+      if (m.sw > m.W || m.wide.length || m.small.length) bad.push(`${name} (${url}): 横幅 ${m.sw} / ${m.W}・はみ出す ${JSON.stringify(m.wide)}・小さい ${JSON.stringify(m.small)}`);
+      if (m.hdrH && m.hdrH > 58) bad.push(`${name}: 上の帯が ${m.hdrH}px (1 行の 58px に収まらない)`);
+      if (SHOTS390) await p.screenshot({ path: `${SHOTS390}/${name}.png`, fullPage: true });
+    }
+    // 上の帯に「未保存」と「発注の設定が届いていない商品」の札も出たとき (一番混む形) も 1 行・はみ出さない
+    await p.goto(B + '/sku/s002');
+    await p.fill('#f-reorder_months', '5');
+    await p.evaluate(() => { const q = document.getElementById('poq-pill'); q.hidden = false; document.getElementById('poq-pill-t').textContent = '発注の設定が届いていない商品 12 件'; });
+    assert.equal(await p.isVisible('#unsaved'), true);
+    const m = await measure390(p);
+    if (m.sw > m.W || m.wide.length || m.small.length || m.hdrH > 58) bad.push(`札が全部出た上の帯: 横幅 ${m.sw} / ${m.W}・高さ ${m.hdrH}・はみ出す ${JSON.stringify(m.wide)}・小さい ${JSON.stringify(m.small)}`);
+    if (SHOTS390) await p.screenshot({ path: `${SHOTS390}/上の帯_札が全部.png` });
+  } finally { delete process.env.MASTER_DECISION_APPROVERS; }
+  assert.deepEqual(bad, [], `390 幅ではみ出す画面:\n${bad.join('\n')}`);
+}, { width: 390, height: 844 });
 
 await browser.close();
 server.close();
