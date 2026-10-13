@@ -1605,7 +1605,8 @@ await ta('[15] 下書き・NE 登録待ちの商品で対応を作れる (代表
   const now3 = fnText(rd(mine), 'ops.transition_sku_registration');
   assert.ok(now3 && strip(now3) !== now3);
   assert.equal(strip(now3), fnText(rd('0071_sku_draft_cancel.sql'), 'ops.transition_sku_registration'), 'transition_sku_registration = 0071 の版 + 🆕 0073 の行だけ');
-  for (const f of fs.readdirSync(MIG).filter((x) => /^\d{4}_.+\.sql$/.test(x) && x >= '0072' && x !== mine)) assert.equal(fnText(rd(f), 'ops.transition_sku_registration'), null, `${f} にも transition_sku_registration がある`);
+  // 🆕 0078 (要確認を確認済みにする): 0073 の後の版は、その migration の試験が「0073 の版 + 🆕 の行だけ」を確かめる = ここは 0073 より前だけ見る
+  for (const f of fs.readdirSync(MIG).filter((x) => /^\d{4}_.+\.sql$/.test(x) && x >= '0072' && x < mine)) assert.equal(fnText(rd(f), 'ops.transition_sku_registration'), null, `${f} にも transition_sku_registration がある`);
   assert.deepEqual([...A.NOT_IN_NE_REG_STATES], ['draft', 'ne_pending']);
 });
 
