@@ -2205,14 +2205,14 @@ git worktree remove C:\tmp\d60-revoke
 - **いつ入るか**: 夜間ロード (`company-db-nightly-load`) の**後ろの段** (`apps/company-db/load/po-settings-snapshot.mjs`・新しい定期実行は作らない)。本体のロードとは**別の接続・別の取引** = 写しが失敗しても本体は戻らない (段の失敗 = ジョブの ping が fail)。先の段 (発注の設定の知らせ = 0075) が届けた後に読む
 - **読み方**: SQLite の **1 つの読む取引**で 3 つの表を読む (同じ時点の値)。表・要る列がある・読めた・件数・hash を世代 `purchasing.snapshot_runs` (追記だけ) に残す
 - **PG の鍵を取ってから SQLite を読む** (同時に 2 本 = 読みも順番)。同じ時刻 (ミリ秒) で中身の違う読み = `ambiguous_read`・前の世代より前の読み = `older_read` で断る
-- **完全に読めた回だけ入れ替える**: 表が無い・列が無い・読めない・正規化した後に鍵が重なる (`duplicate_key`)・別々の行が同じ SKU に結ばれる (`duplicate_sku`)・前の世代より半分未満に減った (前が 20 行以上の表)・今の写しより前の読み = `rejected` (行は前の世代のまま・段の失敗)。同じ値 = `unchanged` (行は触らない)。変わった = 足す / 直す / 消す (行の `run_id` = 最後に値を変えた世代)
+- **完全に読めた回だけ入れ替える**: 表が無い・列が無い・読めない・正規化した後に鍵が重なる (`duplicate_key`)・別々の行が同じ SKU に結ばれる (`duplicate_sku`)・列の値がおかしい (`invalid_value` = 数でない・0 以下のロット・負の数・空の鍵 / 名前)・前の世代より半分未満に減った (前が 20 行以上の表)・今の写しより前の読み = `rejected` (行は前の世代のまま・段の失敗)。同じ値 = `unchanged` (行は触らない)。変わった = 足す / 直す / 消す (行の `run_id` = 最後に値を変えた世代)
 - **減りの受け入れは 1 回だけ**: 本当に発注アプリで半分以上消した = Render の env `PO_SNAPSHOT_ACCEPT_SHRINK=attrs:<今の件数>` (表 = attrs / conditions / materials・カンマで複数) → 指定の表の集まり = 実際に減った表の集まり、かつ件数もちょうどのときだけ 1 回受け入れ、世代の `override` に残す。token は表の名前の順・数は正規化した形 (`attrs:010` も `attrs:10`) = 同じ値は書き方を変えても 2 回目から効かない (使った後は env を消す)
 - **写しの日付** = `read_at` (発注アプリの SQLite を読んだ時刻 = 「この時の発注アプリの値」)。`purchasing.v_snapshot_status` = 今の写しの `read_at`・`age_hours`・`stale` (36 時間超)・`rejected_since_at` (その後に完全に読めなかった回)
-- `mart.v_product_360` の最後の列 = `po_order_lot`・`po_condition_id`・`po_material_group_id`・`po_case_group`・`po_case_lot`・`po_capacity_per_unit`・`po_settings_read_at`・`po_settings_age_hours`。**決定 5 = b: 写しが古くても (36 時間超) AI はそのまま使ってよい = 行を外さない。答えには `po_settings_read_at` (いつの発注アプリの値か) を必ず添える**
+- `mart.v_product_360` の最後の列 = `po_order_lot`・`po_condition_id`・`po_material_group_id`・`po_case_group`・`po_case_lot`・`po_capacity_per_unit`・`po_settings_read_at`・`po_settings_age_hours`・`po_settings_ambiguous` (同じ SKU に発注アプリの 2 行 = po_* を出さない)。**決定 5 = b: 写しが古くても (36 時間超) AI はそのまま使ってよい = 行を外さない。答えには `po_settings_read_at` (いつの発注アプリの値か) を必ず添える**
 - `sku_id` / `primary_supplier_code` = 写した時に Company DB のコードで結んだ SKU と代表の仕入先 (発注アプリにしか無い商品 = `sku_id` null)。発注ロットは「弊社の在庫の個数の倍数」(`core.supplier_skus.order_multiple` = 先方の発注単位の倍数とは単位が違う = 混ぜない)
 - **権限**: 書けるのは表の持ち主のロール (夜間ロードの `COMPANY_DB_URL`) だけ。見張り (`watcher`) は読むだけ (`create-watch-roles.mjs` の `WATCH_OPTIONAL_SCHEMAS`)。画面のロール (`master_edit`) は読めない (要らない)。列の制限は要らない (秘密の値・ファイルのバイト列は無い)
 - **バックアップ**: 取らない (`apps/company-db/backup/dump.mjs` の `SCHEMAS` に入れない = 発注アプリから作り直せる)。**復元の直後に写しの段だけを手で 1 回流す** (`node apps/company-db/load/po-settings-snapshot.mjs --apply`・下の「バックアップと復元」の手順)
-- 試験 = `node scripts/test-po-settings-snapshot.mjs` (PGlite 9 件) / `node C:/tmp/pg-embed/run-posync.mjs scripts/test-po-settings-snapshot-pg.mjs <作業の木>` (本物の PG 3 件 = 同時に 2 本・入れる途中の読み・本物のログインの権限)
+- 試験 = `node scripts/test-po-settings-snapshot.mjs` (PGlite 13 件) / `node C:/tmp/pg-embed/run-posync.mjs scripts/test-po-settings-snapshot-pg.mjs <作業の木>` (本物の PG 3 件 = 同時に 2 本・入れる途中の読み・本物のログインの権限)
 
 ## AI が見張る (Company DB を毎朝読んで「おかしいところ」に気づく。09)
 

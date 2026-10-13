@@ -15,7 +15,8 @@
  *      それでも同じ時刻 (ミリ秒) で中身の違う読み = あいまい = 断る (ambiguous_read)・前の世代より前の読み = 断る (older_read)
  *   6. 🆕 M2: 減りの受け入れ = env PO_SNAPSHOT_ACCEPT_SHRINK に「表:件数」(例 attrs:10) = **1 回だけ** (使った回を世代の override に残し、同じ値は 2 回目から効かない)
  *   7. 🆕 M3: 正規化した後の鍵の重なり (大文字小文字・前後の空白だけ違う商品) = 不完全とみなして断る (duplicate_key・黙って捨てない)。
- *      🆕 R2 M2: 別々の行が同じ SKU に結ばれる (全角の記号だけ違うコードなど) = duplicate_sku で断る
+ *      🆕 R2 M2: 別々の行が同じ SKU に結ばれる (全角の記号だけ違うコードなど) = duplicate_sku で断る。
+ *      🆕 R3: 列ごとの値の決まり (壊れた数 'abc'・空の鍵 / 名前・0 以下のロット・負の金額) = invalid_value で断る (null に化けさせない)
  * 手で 1 回だけ流す (復元の後など・本番ランナーは流さない) = Render の Shell で `node apps/company-db/load/po-settings-snapshot.mjs --apply` (README「バックアップと復元」)
  */
 import fs from 'node:fs';
@@ -112,6 +113,38 @@ function duplicateKeys(rows) {
 const sameHashes = (a, b) => Object.keys(TABLES).every((k) => (a && a[k]) === (b && b[k]));
 
 /**
+ * 列ごとの値の決まり (Codex #1708 R3 = 壊れた数を null に化けさせて「完全な読み」として入れない)。
+ *   key / text = 空でない文字 (255 字まで)・pos = 空 (null / '') か 0 より大きい有限の数・nonneg = 空か 0 以上の有限の数・nonnegReq = 0 以上の有限の数 (必須)
+ *   決まりは写しの表の CHECK / not null と同じか、より厳しい (DB の制約で例外になる値も先に見つける)
+ */
+const COLUMN_RULES = Object.freeze({
+  attrs: { product_key: 'key', product_code: 'text', order_lot: 'pos', capacity_per_unit: 'pos', case_lot: 'pos' },
+  conditions: { condition_id: 'key', display_name: 'text', condition_type: 'text', condition_value: 'nonnegReq' },
+  materials: { group_id: 'key', name: 'text', min_order_qty: 'nonneg' },
+});
+const blankNum = (v) => v == null || (typeof v === 'string' && v.trim() === '');
+const finiteNum = (v) => (typeof v === 'number' || (typeof v === 'string' && /^\s*[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?\s*$/.test(v))) && Number.isFinite(Number(v));
+function badValue(rule, v) {
+  if (rule === 'key' || rule === 'text') return !(typeof v === 'string' || typeof v === 'number') || String(v).trim() === '' || String(v).length > 255;
+  if (rule === 'pos') return !blankNum(v) && !(finiteNum(v) && Number(v) > 0);
+  if (rule === 'nonneg') return !blankNum(v) && !(finiteNum(v) && Number(v) >= 0);
+  if (rule === 'nonnegReq') return !(finiteNum(v) && Number(v) >= 0);
+  return false;
+}
+/** おかしい値 = [「表 鍵.列 = 値」] (先頭の数件) */
+function invalidValues(rows) {
+  const out = [];
+  for (const [k, rules] of Object.entries(COLUMN_RULES)) {
+    for (const r of rows[k] || []) {
+      for (const [col, rule] of Object.entries(rules)) {
+        if (badValue(rule, r[col])) out.push(`${TABLES[k].table} ${String(r[TABLES[k].key] ?? '(空の鍵)').slice(0, 60)}.${col} = ${JSON.stringify(r[col] ?? null).slice(0, 40)}`);
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * 写しを入れる (1 つの Postgres の取引・表の持ち主のロール)。
  * source = 読む関数 (() => readPoSettingsSnapshot の答え) = **鍵を取ってから読む** (段の道) / 読んだ答え (試験・前に読んだ値を入れてみる)。
  * opts.shrinkOverride = parseShrinkOverride の答え (減りの受け入れ・1 回だけ)。
@@ -131,6 +164,9 @@ export async function applyPoSettingsSnapshot(db, source, { host = null, shrinkO
       problems.push(`ambiguous_read: 今の写しと同じ時刻 (${snap.readAt.toISOString()}) で中身が違う読み (どちらが新しいか決められない)`);
     }
     // 正規化した後の鍵の重なり = 不完全 (黙って 1 行を捨てない・Codex #1708 R1 M3)
+    // 列ごとの値の決まり (壊れた数・空の鍵 / 名前・範囲の外 = 不完全・どの鍵・どの列・Codex #1708 R3)
+    const bad = invalidValues(snap.rows);
+    if (bad.length) problems.push(`invalid_value: ${bad.slice(0, 5).join(' / ')}${bad.length > 5 ? ` ほか ${bad.length - 5}` : ''}`);
     for (const [k, keys] of Object.entries(duplicateKeys(snap.rows))) problems.push(`duplicate_key: ${TABLES[k].table} の鍵が正規化で重なる (${keys.slice(0, 5).join(', ')}${keys.length > 5 ? ` ほか ${keys.length - 5}` : ''})`);
     // 結ぶ値 (写した時の Company DB の SKU と代表の仕入先)。別々の行が同じ SKU に結ばれる = どちらの設定か決められない = 断る (Codex #1708 R2 M2)
     const codes = [...new Set(snap.rows.attrs.map((r) => String(r.product_code)))];

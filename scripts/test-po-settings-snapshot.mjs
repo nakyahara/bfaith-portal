@@ -10,6 +10,7 @@
  *   S5 入れる途中で落ちた = 全部巻き戻す (前の世代のまま・世代の行も残らない)
  *   S6 古い写し (36 時間超) = stale・それでも商品 360 は値を出す (決定 5 = b)・時刻が見える
  *   S9 遅れて来た古い読み = 入れ替えない
+ *   S13 列の値がおかしい (数の列に文字・0 以下・空の名前) = invalid_value で入れ替えない
  *   S10 正規化した後の鍵の重なり = 入れ替えない・S11 鍵を取ってから読む・同じ時刻で中身の違う読み = あいまい = 断る・減りの受け入れは 1 回だけ (S3)
  *   S7 権限: 書けるのは持ち主 (夜間ロード) だけ・見張りは読める・画面のロールは書けない・世代は追記だけ・重い入口の棚卸しに漏れが無い・夜間の段の順 (知らせ → 写し)
  * 使い方: node scripts/test-po-settings-snapshot.mjs
@@ -228,6 +229,37 @@ await ta('[S12] (Codex #1708 R2 M2) 別々の行が同じ SKU に結ばれる (�
   assert.equal((await step()).ok, true);
 });
 
+await ta('[S13] (Codex #1708 R3) 列の値がおかしい (数の列に文字・0 以下のロット・負の最低発注量・空の名前) = invalid_value で入れ替えない (null に化けさせない・どの鍵・どの列・世代に理由)', async () => {
+  const before = await rows(`select * from purchasing.sku_order_settings order by product_key`);
+  const beforeM = await rows(`select * from purchasing.material_groups order by group_id`);
+  const cases = [
+    [`UPDATE po_product_attrs SET order_lot = 'abc' WHERE product_key = 'snap-09'`, `UPDATE po_product_attrs SET order_lot = 9 WHERE product_key = 'snap-09'`, /po_product_attrs snap-09\.order_lot = "abc"/],
+    [`UPDATE po_product_attrs SET case_lot = 'x' WHERE product_key = 'snap-10'`, `UPDATE po_product_attrs SET case_lot = NULL WHERE product_key = 'snap-10'`, /snap-10\.case_lot = "x"/],
+    [`UPDATE po_product_attrs SET product_code = '  ' WHERE product_key = 'snap-11'`, `UPDATE po_product_attrs SET product_code = 'snap-11' WHERE product_key = 'snap-11'`, /snap-11\.product_code = "  "/],
+    [`UPDATE po_material_groups SET min_order_qty = 'zz' WHERE group_id = 'm-02'`, `UPDATE po_material_groups SET min_order_qty = 20 WHERE group_id = 'm-02'`, /po_material_groups m-02\.min_order_qty = "zz"/],
+    [`UPDATE po_material_groups SET name = '' WHERE group_id = 'm-03'`, `UPDATE po_material_groups SET name = '原料 3' WHERE group_id = 'm-03'`, /m-03\.name = ""/],
+    [`UPDATE po_order_conditions SET condition_value = 'n/a' WHERE condition_id = 'c-04'`, `UPDATE po_order_conditions SET condition_value = 4000.5 WHERE condition_id = 'c-04'`, /c-04\.condition_value = "n\/a"/],
+  ];
+  for (const [broke, fix, re] of cases) {
+    podb.exec(broke);
+    try {
+      const r = await step();
+      assert.equal(r.ok, false, broke); assert.match(r.note, /invalid_value: /, broke); assert.match(r.note, re, broke);
+      const last = await one(`select status, problems from purchasing.snapshot_runs order by finished_at desc limit 1`);
+      assert.equal(last.status, 'rejected'); assert.match(last.problems.join(), re);
+      assert.deepEqual(await rows(`select * from purchasing.sku_order_settings order by product_key`), before, `${broke} で写しを変えた`);
+      assert.deepEqual(await rows(`select * from purchasing.material_groups order by group_id`), beforeM);
+    } finally { podb.exec(fix); }
+  }
+  // 決まりの境 (JS の確かめ): 空 = null は許す・0 のロットは断る・小数の容量は許す
+  const ok = S.readPoSettingsSnapshot(FILE);
+  ok.rows.attrs[0] = { ...ok.rows.attrs[0], order_lot: 0 };
+  ok.readAt = new Date();
+  const z = await S.applyPoSettingsSnapshot(db, ok);
+  assert.equal(z.status, 'rejected'); assert.match(z.problems.join(), /order_lot = 0/);
+  assert.equal((await step()).ok, true);
+});
+
 await ta('[S11] (Codex #1708 R1 M1) 鍵を取ってから読む (段の道)・同じ時刻 (ミリ秒) で中身の違う読み = あいまい = 断る', async () => {
   // 読む関数は鍵の後に呼ばれる (取引の中・鍵を持っている)
   let lockedWhenRead = null;
@@ -268,8 +300,9 @@ await ta('[S5] 入れる途中で落ちた = 全部巻き戻す (前の世代の
   const nRuns = (await one('select count(*)::int as n from purchasing.snapshot_runs')).n;
   podb.prepare(`UPDATE po_order_conditions SET display_name = 'X', updated_at = ? WHERE condition_id = 'c-05'`).run('2026-10-03T00:00:00.000Z');
   const snap = S.readPoSettingsSnapshot(FILE);
-  snap.rows.materials[0] = { ...snap.rows.materials[0], name: null };   // name は not null = 入れる途中で落ちる
-  const e = await errOf(S.applyPoSettingsSnapshot(db, snap));
+  // 入れる途中 (発注条件グループの insert = c-05 を直した) で DB が落ちる (値の決まりは通る = 決まりで断るのではなく、本当に途中で落ちる)
+  const failing = { query: (t, p) => (/insert into purchasing\.order_condition_groups/.test(t) ? Promise.reject(new Error('入れる途中で落ちた')) : db.query(t, p)), exec: (t) => db.exec(t) };
+  const e = await errOf(S.applyPoSettingsSnapshot(failing, snap));
   assert.ok(e, '落ちなかった');
   assert.deepEqual(await rows(`select * from purchasing.order_condition_groups order by condition_id`), before);
   assert.equal((await one('select count(*)::int as n from purchasing.snapshot_runs')).n, nRuns);
