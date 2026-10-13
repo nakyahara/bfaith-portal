@@ -1716,6 +1716,11 @@ const orderBody = (code, order, over = {}) => ({ request_id: uuid(), kind: 'sing
   values: { name: '発注の設定つきの単品', standard_price: '1500', shipping_code: 'S01', tax_rate: '10', primary_supplier: '0001', sales_class: '3', expiry_managed: '0', reorder_months: '1' },
   ...(order === undefined ? {} : { order_settings: order }), ...over });
 const meOrderData = (html) => JSON.parse((/<script type="application\/json" id="me-order">([\s\S]*?)<\/script>/.exec(html) || [])[1] || 'null');
+// 🆕 0075 (CompanyDB構想 21 C1): 発注の設定は登録と同じ取引の知らせ (ops.order_settings_outbox) → commit の後に届ける。届けるのは Render の中だけ = 試験は届ける側にする
+const OSO = await import('../lib/order-settings-outbox.mjs');
+OSO.__setOrderDeliveryEnabledForTest(true);
+const poOutboxOf = async (code) => one(`select o.status, o.attempts, o.registration_kind, o.registration_request_id::text as reg, o.delivery_request_id::text as del, o.payload, o.last_error, o.result
+  from ops.order_settings_outbox o join core.skus s on s.sku_id = o.sku_id where s.code_norm = lower($1)`, [code]);
 
 await ta('[PO1] 新商品の画面: 発注の設定の欄 (発注ロット・発注条件グループ = 選ぶ / 新しく作る・原料グループ・ケース・容量)・発注アプリの権限が無い人には出さない・セットには無い', async () => {
   let r = await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' });
@@ -1756,8 +1761,14 @@ await ta('[PO2] 登録: ① Company DB → ② 発注アプリ (発注ロット�
   const body = orderBody('po-web-1', { order_lot: '１２', condition_id: 'amc-30000', new_material: { group_id: 'honey', name: 'はちみつ', min_order_qty: '20', unit: 'kg' }, case_lot: '', case_group: '', capacity_per_unit: '300' });
   const r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
   assert.equal(r.status, 200, r.text);
-  assert.deepEqual([r.j.ok, r.j.state, r.j.order_settings], [true, 'draft', { ok: true, changed: true, created: { condition: false, material: true }, replayed: false }]);
+  assert.deepEqual([r.j.ok, r.j.state, r.j.order_settings], [true, 'draft', { ok: true, status: 'done', changed: true, created: { condition: false, material: true }, replayed: false }]);
   assert.ok(await skuId('po-web-1'));
+  // 🆕 0075: 知らせ = 登録の ID が届けの ID (今までの ② の request_id と同じ)・中身は文字 (数も)・届いた
+  const ob = await poOutboxOf('po-web-1');
+  assert.deepEqual([ob.status, ob.attempts, ob.registration_kind, ob.reg, ob.del], ['done', 1, 'single', body.request_id, body.request_id]);
+  assert.deepEqual(ob.payload, { schema: 'po-settings-v1', code: 'po-web-1', supplier_code: '0001',
+    patch: { order_lot: '12', condition_id: 'amc-30000', capacity_per_unit: '300', case_lot: null, case_group: null },
+    new_condition: null, new_material: { group_id: 'honey', name: 'はちみつ', min_order_qty: '20', unit: 'kg' } });
   const a = attrsOf('po-web-1');
   assert.deepEqual([a.product_code, a.order_lot, a.condition_id, a.material_group_id, a.capacity_per_unit, a.case_lot, a.created_via], ['po-web-1', 12, 'amc-30000', 'honey', 300, null, 'master-edit:new']);
   assert.deepEqual(podb.prepare("SELECT name, min_order_qty, unit FROM po_material_groups WHERE group_id = 'honey'").get(), { name: 'はちみつ', min_order_qty: 20, unit: 'kg' });
@@ -1774,6 +1785,11 @@ await ta('[PO2] 登録: ① Company DB → ② 発注アプリ (発注ロット�
   POS.writeOrderSettings({ code: 'po-web-1', patch: { order_lot: 13 }, seen: { updated_at: attrsOf('po-web-1').updated_at }, actor: 'other@test', via: 'po-admin' });
   const again2 = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
   assert.deepEqual([again2.status, again2.j.replayed, again2.j.order_settings.ok, again2.j.order_settings.replayed, attrsOf('po-web-1').order_lot], [200, true, true, true, 13]);
+  // 🆕 0075: 同じ request_id で違う発注の設定 = 登録ごと 409 (要求のハッシュに発注の設定が入る)・何も変えない
+  // 🆕 0075 (Codex #1703 R1 M2): 同じ request_id で違う発注の設定 = 登録は前の答え・発注の設定は変えない (知らせの中身と照らす = mismatch)
+  const diff = await call('POST', '/apps/master-edit/api/new', { body: { ...body, order_settings: { ...body.order_settings, order_lot: '48' } }, session: 'po-editor' });
+  assert.deepEqual([diff.status, diff.j.replayed, diff.j.order_settings.ok, diff.j.order_settings.reason, diff.j.order_settings.status, attrsOf('po-web-1').order_lot],
+    [200, true, false, 'request_id_reused', 'mismatch', 13], diff.text);
   POS.writeOrderSettings({ code: 'po-web-1', patch: { order_lot: 12 }, seen: { updated_at: attrsOf('po-web-1').updated_at }, actor: 'other@test', via: 'po-admin' });
   // 新しい発注条件グループ = 代表の仕入先 (0001 → 発注アプリの 1) に作る・すぐ選んだことになる
   const nb = orderBody('po-web-2', { order_lot: '6', new_condition: { condition_id: 'amc-case', display_name: 'AMC ケース 2 以上', condition_type: '数量', unit: 'ケース', condition_value: '2' } });
@@ -1815,7 +1831,7 @@ await ta('[PO3] 登録の前の確かめ (① の前): ほかの仕入先の発�
   assert.deepEqual(poCounts(), c0, '断った登録で発注アプリに何か書いた');
 });
 
-await ta('[PO4] ① 成功 ② 失敗: 登録は成功のまま・応答 order_settings.ok = false (画面は「商品の画面で入れてください」)・同じ request_id のやり直しで ② が入る・やり直しの前にほかの画面が作っていたら上書きしない (R1 High 1)', async () => {
+await ta('[PO4] ① 成功 ② 失敗 (🆕 0075 = 知らせが残る): 登録は成功のまま・応答 order_settings = 届け待ち (pending)・知らせは failed で残る・同じ request_id の押し直しで届く・やり直しの前にほかの画面が作っていたら上書きしない = 要確認 (R1 High 1)', async () => {
   MR.__setOrderWriter(() => { throw new Error('SQLite に書けない'); });
   const body = orderBody('po-web-4', { order_lot: '24', condition_id: 'amc-30000' });
   let r;
@@ -1823,22 +1839,27 @@ await ta('[PO4] ① 成功 ② 失敗: 登録は成功のまま・応答 order_s
     r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
   } finally { MR.__setOrderWriter(null); }
   assert.equal(r.status, 200, r.text);
-  assert.deepEqual([r.j.ok, r.j.state, r.j.order_settings.ok, r.j.order_settings.error], [true, 'draft', false, '発注アプリに書けませんでした']);
+  assert.deepEqual([r.j.ok, r.j.state, r.j.order_settings.ok, r.j.order_settings.status, r.j.order_settings.pending], [true, 'draft', false, 'failed', true]);
+  assert.match(r.j.order_settings.error, /まだ発注アプリに届いていません[\s\S]*SQLite に書けない/);
   assert.ok(await skuId('po-web-4'), '② の失敗で登録が消えた');
   assert.equal(attrsOf('po-web-4'), null);
+  assert.deepEqual([(await poOutboxOf('po-web-4')).status, (await poOutboxOf('po-web-4')).attempts], ['failed', 1], '② の失敗で知らせが消えた');
   const newJs = (await checkScripts((await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' })).text)).find((x) => x.includes('me-new.js')) || '';
   assert.match(newJs, /発注の設定だけ保存できませんでした/);
+  assert.match(newJs, /発注の設定はまだ発注アプリに届いていません/);
   const again = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
-  assert.deepEqual([again.status, again.j.replayed, again.j.order_settings.ok, again.j.order_settings.changed], [200, true, true, true]);
+  assert.deepEqual([again.status, again.j.replayed, again.j.order_settings.ok, again.j.order_settings.changed], [200, true, true, true], again.text);
   assert.deepEqual([attrsOf('po-web-4').order_lot, attrsOf('po-web-4').condition_id], [24, 'amc-30000']);
-  // R1 High 1: ② が落ちた後、やり直しの前にほかの画面 (発注アプリのマスタ管理) が行を作った = やり直しは上書きしない (① 成功・② 失敗の知らせ)
+  assert.deepEqual([(await poOutboxOf('po-web-4')).status, (await poOutboxOf('po-web-4')).attempts], ['done', 2]);
+  // R1 High 1: ② が落ちた後、やり直しの前にほかの画面 (発注アプリのマスタ管理) が行を作った = やり直しは上書きしない (要確認 = 人が確かめて閉じる)
   MR.__setOrderWriter(() => { throw new Error('SQLite に書けない'); });
   const b5 = orderBody('po-web-5', { order_lot: '24' });
   try { assert.equal((await call('POST', '/apps/master-edit/api/new', { body: b5, session: 'po-editor' })).j.order_settings.ok, false); } finally { MR.__setOrderWriter(null); }
   POS.writeOrderSettings({ code: 'po-web-5', patch: { order_lot: 6 }, seen: { updated_at: null }, actor: 'other@test', via: 'po-admin' });
   const r5 = await call('POST', '/apps/master-edit/api/new', { body: b5, session: 'po-editor' });
-  assert.deepEqual([r5.status, r5.j.replayed, r5.j.order_settings.ok, r5.j.order_settings.reason, attrsOf('po-web-5').order_lot], [200, true, false, 'stale', 6], r5.text);
+  assert.deepEqual([r5.status, r5.j.replayed, r5.j.order_settings.ok, r5.j.order_settings.reason, r5.j.order_settings.status, attrsOf('po-web-5').order_lot], [200, true, false, 'stale', 'conflict', 6], r5.text);
   assert.match(r5.j.order_settings.error, /もう作られて/);
+  assert.equal((await poOutboxOf('po-web-5')).status, 'conflict');
 });
 
 await ta('[PO5] 商品の画面: 発注の設定の欄 (今の値・別の保存のボタン)・保存 = 開いたときの印 (違う = 409・発注アプリのマスタ管理が先に直しても)・名簿 かつ 発注アプリの権限・単品だけ', async () => {
@@ -1886,6 +1907,109 @@ await ta('[PO5] 商品の画面: 発注の設定の欄 (今の値・別の保存
   assert.ok(!(await call('GET', '/apps/master-edit/sku/new-set-1', { session: 'po-editor' })).text.includes('id="sec-order"'));
   page = await call('GET', '/apps/master-edit/sku/po-web-1');
   assert.match(page.text, /発注アプリの権限がないので/); assert.ok(!page.text.includes('id="po-order_lot"'));
+});
+
+await ta('[PO6] 🆕 0075 届け待ち: 上の帯の件数 (発注アプリの権限がある人だけ・画面を開くと届け直す)・届け待ちの画面・もう一度届ける・閉じる (理由・failed / conflict だけ)・つかいかた', async () => {
+  O.__setCompanyDbClientFactory(roleClient);
+  OSO.__resetOrderOutboxCacheForTest();
+  // 知らせを 2 つ残す: 失敗 (書けない) と、すでに要確認 (po-web-5)
+  MR.__setOrderWriter(() => { throw new Error('SQLite がいっぱい'); });
+  const b6 = orderBody('po-web-6', { order_lot: '10' });
+  try { assert.equal((await call('POST', '/apps/master-edit/api/new', { body: b6, session: 'po-editor' })).j.order_settings.status, 'failed'); } finally { MR.__setOrderWriter(null); }
+  // 権限: 発注アプリの権限が無い人 = 403・帯も左の列も出さない
+  assert.equal((await call('GET', '/apps/master-edit/api/order-settings-outbox', { session: 'editor' })).status, 403);
+  let page = await call('GET', '/apps/master-edit/', { session: 'editor' });
+  assert.ok(!page.text.includes('id="poq-pill"') && !page.text.includes('/order-settings-outbox"'), '権限の無い人に帯・左の列を出した');
+  page = await call('GET', '/apps/master-edit/', { session: 'po-editor' });
+  assert.match(page.text, /id="poq-pill" href="\/apps\/master-edit\/order-settings-outbox" data-src="\/apps\/master-edit\/api\/order-settings-outbox" hidden/);
+  assert.match(page.text, /<span class="lbl">発注の設定の届け待ち<\/span>/);
+  const shell = (await checkScripts(page.text)).find((x) => x.includes('me-shell.js')) || '';
+  assert.match(shell, /poqPill/);
+  // 件数 = 開くと先に届け直す (po-web-6 は今度は書ける = 届く)・要確認 (po-web-5) は自動では試さない
+  const st = await call('GET', '/apps/master-edit/api/order-settings-outbox', { session: 'po-editor' });
+  assert.equal(st.status, 200, st.text);
+  assert.deepEqual([st.j.ok, st.j.ready, st.j.open, st.j.by_status.conflict, st.j.items.map((i) => i.code)], [true, true, 1, 1, ['po-web-5']]);
+  assert.equal((await poOutboxOf('po-web-6')).status, 'done', '画面を開いたときに届け直していない');
+  assert.equal(attrsOf('po-web-6').order_lot, 10);
+  // 届け待ちの画面
+  page = await call('GET', '/apps/master-edit/order-settings-outbox', { session: 'po-editor' });
+  assert.equal(page.status, 200, page.text.slice(0, 300));
+  await checkScripts(page.text, 0);
+  assert.match(page.text, /<h1>発注の設定の届け待ち<\/h1>/);
+  assert.match(page.text, /id="poq-open-n">1 件/);
+  assert.match(page.text, /data-event="[0-9a-f-]{36}"[\s\S]{0,200}po-web-5[\s\S]{0,300}要確認 \(発注アプリにもう設定がある\)/);
+  assert.match(page.text, /data-act="retry"/); assert.match(page.text, /data-act="dismiss"/);
+  assert.match(page.text, /me-poq\.js/);
+  assert.match(page.text, /po-web-6[\s\S]{0,200}届いた/, '最近閉じた (14 日) に出ない');
+  // 発注アプリの権限が無い人 = 出さない
+  const np = await call('GET', '/apps/master-edit/order-settings-outbox', { session: 'editor' });
+  assert.match(np.text, /id="poq-no-access"/); assert.ok(!np.text.includes('po-web-5'));
+  // もう一度届ける (人 = 要確認も試す) = まだ発注アプリに行がある = 要確認のまま (上書きしない)
+  const ev5 = (await one(`select o.event_id::text as id from ops.order_settings_outbox o join core.skus s on s.sku_id = o.sku_id where s.code_norm = 'po-web-5'`)).id;
+  const rt = await call('POST', `/apps/master-edit/api/order-settings-outbox/${ev5}/retry`, { session: 'po-editor', body: {} });
+  assert.deepEqual([rt.status, rt.j.ok, rt.j.status, attrsOf('po-web-5').order_lot], [200, false, 'conflict', 6], rt.text);
+  // 閉じる: 名簿 かつ 発注アプリの権限・理由が要る・origin
+  assert.equal((await call('POST', `/apps/master-edit/api/order-settings-outbox/${ev5}/dismiss`, { session: 'editor', body: { reason: 'x' } })).j.reason, 'no_po_access');
+  assert.equal((await call('POST', `/apps/master-edit/api/order-settings-outbox/${ev5}/dismiss`, { session: 'po-viewer', body: { reason: 'x' } })).status, 403);
+  assert.equal((await call('POST', `/apps/master-edit/api/order-settings-outbox/${ev5}/dismiss`, { session: 'po-editor', body: { reason: '' } })).status, 400);
+  assert.equal((await call('POST', `/apps/master-edit/api/order-settings-outbox/${ev5}/dismiss`, { session: 'po-editor', origin: false, body: { reason: 'x' } })).j.error, 'origin_mismatch');
+  const ds = await call('POST', `/apps/master-edit/api/order-settings-outbox/${ev5}/dismiss`, { session: 'po-editor', body: { reason: '発注アプリの値 (6) が正しい' } });
+  assert.deepEqual([ds.status, ds.j.ok], [200, true], ds.text);
+  assert.deepEqual(await one(`select status, closed_by, close_reason from ops.order_settings_outbox where event_id = $1::uuid`, [ev5]), { status: 'dismissed', closed_by: 'naka@test', close_reason: '発注アプリの値 (6) が正しい' });
+  assert.equal((await call('POST', `/apps/master-edit/api/order-settings-outbox/${ev5}/dismiss`, { session: 'po-editor', body: { reason: 'もう一度' } })).status, 409, '閉じた知らせをもう一度閉じた');
+  assert.equal((await call('POST', `/apps/master-edit/api/order-settings-outbox/${ev5}/retry`, { session: 'po-editor', body: {} })).status, 409, '閉じた知らせを届けた');
+  OSO.__resetOrderOutboxCacheForTest();
+  assert.equal((await call('GET', '/apps/master-edit/api/order-settings-outbox', { session: 'po-editor' })).j.open, 0);
+  // 届け待ち (pending) は閉じない (= 届け直しに任せる)
+  // つかいかた (同じ PR で)
+  const m = await call('GET', '/apps/master-edit/manual');
+  for (const w of ['<h2 id="order-outbox">発注の設定の届け待ち', 'もう一度届ける', '要確認', '24 時間たっても届いていない', 'すすめる発注数は止めません', '毎晩 2 時']) {
+    assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
+  }
+});
+
+let lastPo7Rid = null; let po7b = null;
+await ta('[PO7] 🆕 0075 の前の DB (知らせの関数が無い) = 今までどおり ② をすぐ書く (知らせは積まない・要求のハッシュも前と同じ)', async () => {
+  await pg.query('alter function ops.enqueue_order_settings(uuid, text, jsonb) rename to enqueue_order_settings_hidden');
+  try {
+    const body = orderBody('po-web-7', { order_lot: '9' });
+    lastPo7Rid = body.request_id;
+    const r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual([r.j.order_settings.ok, r.j.order_settings.status, attrsOf('po-web-7').order_lot], [true, undefined, 9]);
+    assert.equal(await one('select 1 from ops.order_settings_registrations where registration_request_id = $1::uuid', [body.request_id]), undefined, '0075 の前の登録に印を積んだ');
+    assert.equal(await poOutboxOf('po-web-7'), undefined, '0075 の前に知らせを積んだ');
+    // Codex #1703 R1 M2: 0075 の前に ② が失敗した登録 (旧の道)
+    MR.__setOrderWriter(() => { throw new Error('SQLite に書けない'); });
+    po7b = orderBody('po-web-7b', { order_lot: '11' });
+    try { assert.equal((await call('POST', '/apps/master-edit/api/new', { body: po7b, session: 'po-editor' })).j.order_settings.ok, false); }
+    finally { MR.__setOrderWriter(null); }
+  } finally {
+    await pg.query('alter function ops.enqueue_order_settings_hidden(uuid, text, jsonb) rename to enqueue_order_settings');
+  }
+  // 0075 の後に同じ要求を押し直す = 同じハッシュ (409 にしない)・知らせの無い前の登録 = 今までの ② で書く
+  const again = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-7', { order_lot: '9' }, { request_id: lastPo7Rid }), session: 'po-editor' });
+  assert.deepEqual([again.status, again.j.replayed, again.j.order_settings.ok, attrsOf('po-web-7').order_lot], [200, true, true, 9], again.text);
+  assert.equal(attrsOf('po-web-7b'), null);
+  const again7b = await call('POST', '/apps/master-edit/api/new', { body: po7b, session: 'po-editor' });
+  assert.deepEqual([again7b.status, again7b.j.replayed, again7b.j.order_settings.ok, attrsOf('po-web-7b').order_lot], [200, true, true, 11], again7b.text);
+  assert.equal(await poOutboxOf('po-web-7b'), undefined);
+});
+
+await ta('[PO8] 🆕 0075 Render の外 (miniPC) = 登録の直後に届けない (知らせは pending で残る・Render が届ける)', async () => {
+  OSO.__setOrderDeliveryEnabledForTest(false);
+  try {
+    const body = orderBody('po-web-8', { order_lot: '4' });
+    const r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+    assert.deepEqual([r.status, r.j.order_settings.ok, r.j.order_settings.status, r.j.order_settings.pending], [200, false, 'pending', true], r.text);
+    assert.equal(attrsOf('po-web-8'), null, 'Render の外で発注アプリの SQLite に書いた');
+    assert.deepEqual([(await poOutboxOf('po-web-8')).status, (await poOutboxOf('po-web-8')).attempts], ['pending', 0]);
+    const ev = (await one(`select o.event_id::text as id from ops.order_settings_outbox o join core.skus s on s.sku_id = o.sku_id where s.code_norm = 'po-web-8'`)).id;
+    assert.equal((await call('POST', `/apps/master-edit/api/order-settings-outbox/${ev}/retry`, { session: 'po-editor', body: {} })).j.reason, 'not_render');
+  } finally { OSO.__setOrderDeliveryEnabledForTest(true); }
+  OSO.__resetOrderOutboxCacheForTest();
+  await call('GET', '/apps/master-edit/api/order-settings-outbox', { session: 'po-editor' });
+  assert.deepEqual([(await poOutboxOf('po-web-8')).status, attrsOf('po-web-8').order_lot], ['done', 4]);
 });
 
 console.log('\nproduct-hub (新規作成の入口・ボード)');

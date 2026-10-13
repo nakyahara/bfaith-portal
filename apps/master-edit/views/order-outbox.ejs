@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // 🆕 0075 (CompanyDB構想 21 C1): 新商品の登録で入れた発注の設定が、発注アプリにまだ届いていない知らせ (lib/order-settings-outbox.mjs)。
+    //   1 行 = 1 商品。届け待ち (自動でもう一度届ける)・要確認 (発注アプリにもう設定があった = 上書きしない) と、最近閉じた知らせ (14 日)
+    const tone = (s) => (s === 'done' ? 'ok' : s === 'conflict' ? 'err' : s === 'failed' ? 'warn' : s === 'dismissed' ? 'mute' : 'info');
+    const when = (t) => (t ? String(t).replace('T', ' ').slice(0, 16) : '—');
+  %>
+  <div class="page" id="poq-page" data-base="<%= base %>">
+    <div class="ph">
+      <div>
+        <h1>発注の設定の届け待ち</h1>
+        <div class="lead">新商品の登録で入れた発注の設定 (発注ロット・発注条件グループ・原料グループ・ケース・容量) は、登録と同じ時に Company DB に「知らせ」として残り、発注アプリへ届けます。ここは、まだ発注アプリに届いていない商品です。届くまで自動でもう一度届けます (画面を開いたとき・毎晩 2 時)。<%= ORDER_OVERDUE_HOURS %> 時間たっても届かないと、夜間の見張りが知らせます。</div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/manual#order-outbox"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
+    </div>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (!poOk) { %>
+      <div class="callout warn" id="poq-no-access"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">発注アプリの権限がないので、発注の設定の届け待ちは出せません</div></div></div>
+    <% } else if (readError) { %>
+      <div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t">知らせを読めません</div><div class="hint"><%= readError %></div></div></div>
+    <% } else if (data && !data.ready) { %>
+      <div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">Company DB に発注の設定の知らせの表がまだありません (migration 0075 の前)。今は登録のときに発注アプリへすぐ書いています。</div></div>
+    <% } else if (data) { %>
+      <% if (!delivery) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">このサーバーは発注アプリ (Render) ではないので、ここからは届けられません (見るだけ)。</div></div><% } %>
+      <section class="panel" aria-labelledby="poq-open-h">
+        <div class="panel-h"><h2 id="poq-open-h">まだ届いていない</h2>
+          <span class="b <%= data.open ? 'warn' : 'ok' %>" id="poq-open-n"><%= data.open %> 件</span>
+          <% if (data.overdue) { %><span class="b err" id="poq-overdue-n"><%= ORDER_OVERDUE_HOURS %> 時間超 <%= data.overdue %> 件</span><% } %>
+        </div>
+        <% if (!data.items.length) { %>
+          <div class="empty">届いていない発注の設定はありません</div>
+        <% } else { %>
+        <ul style="list-style:none" aria-label="まだ届いていない発注の設定">
+          <% for (const i of data.items) { %>
+          <li class="poq-row" data-event="<%= i.event_id %>">
+            <a class="code" href="<%= base %>/sku/<%= encodeURIComponent(i.code) %>"><%= i.code %></a>
+            <span><span class="b <%= tone(i.status) %>"><%= ORDER_STATUS_LABELS[i.status] || i.status %></span><% if (i.overdue) { %> <span class="b err"><%= ORDER_OVERDUE_HOURS %> 時間超</span><% } %></span>
+            <span class="muted">登録 <%= when(i.created_at) %> · <%= i.registration_kind === 'variation' ? 'まとまりの子' : '単品' %> · 試した <%= i.attempts %> 回</span>
+            <span class="poq-err"><%= i.last_error || '' %></span>
+            <span class="poq-act">
+              <% if (canAct && delivery) { %><button class="btn soft sm" type="button" data-act="retry"<%= i.leased ? ' disabled' : '' %>>もう一度届ける</button><% } %>
+              <% if (canAct && i.status !== 'pending') { %><button class="btn ghost sm" type="button" data-act="dismiss"<%= i.leased ? ' disabled' : '' %>>閉じる</button><% } %>
+            </span>
+          </li>
+          <% } %>
+        </ul>
+        <% } %>
+        <div class="hint" style="margin-top:10px">「要確認」= 届けようとしたら、発注アプリにほかの画面 (発注アプリのマスタ管理・商品の画面) がもうこの商品の発注の設定を作っていた (上書きしていません)。商品の画面の「発注の設定」で今の値を確かめてから「閉じる」(理由を書く)。<br>発注アプリのすすめる発注数は、届いていない間も今の発注アプリの設定で出ます (止めません)。発注アプリの画面には「発注の設定がまだ届いていない」の印が出ます。</div>
+        <p class="fmsg" id="poq-msg" role="status" aria-live="polite"></p>
+      </section>
+      <% if (data.closed && data.closed.length) { %>
+      <section class="panel soft" aria-labelledby="poq-closed-h">
+        <div class="panel-h"><h2 id="poq-closed-h">最近閉じた (14 日)</h2><span class="b mute"><%= data.closed.length %> 件</span></div>
+        <ul style="list-style:none" aria-label="最近閉じた知らせ">
+          <% for (const c of data.closed) { %>
+          <li class="poq-row closed"><a class="code" href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>"><%= c.code %></a>
+            <span><span class="b <%= tone(c.status) %>"><%= ORDER_STATUS_LABELS[c.status] || c.status %></span></span>
+            <span class="muted"><%= when(c.closed_at) %><%= c.closed_by ? ' · ' + c.closed_by : '' %></span>
+            <span class="poq-err"><%= c.close_reason || (c.result && c.result.outcome === 'skipped_cancelled' ? '登録をやめた下書き (届けない)' : '') %></span><span></span></li>
+          <% } %>
+        </ul>
+      </section>
+      <% } %>
+    <% } %>
+  </div>
+  <% if (poOk && data && data.ready && canAct) { %><script src="<%= base %>/public/me-poq.js?v=<%= assetV %>" defer></script><% } %>
+  <%- include('_footer') %>
+</body>
+</html>

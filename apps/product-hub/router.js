@@ -178,6 +178,7 @@ import {
 import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLegacyNewKind, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
+import { compareDraftJans, compareJanUnits, janUnitsForDraftId, boardJanMarks, parseBoardDraftIds, janWarningsOf, JAN_READ_DEADLINE_MS } from './services/cdb-jan-compare.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -2390,6 +2391,7 @@ router.get('/api/drafts/:id/rakuten/desc-preview', (req, res) => {
 });
 
 router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
+  const janDeadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // JAN の読みの期限も要求の入口から (辞書・税率を待った分も入る・Codex #1700 R3 M2)
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
@@ -2402,10 +2404,15 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   // プレビューは送らないので、段階を読めないときは今の税率で見せて注意を添える (登録は止まる。中間レビュー 2 回目 Low)
   const tax = await resolveListingTax(db, draft, { preview: true });
   const built = buildItemPayload(db, draft.id, { tax });
-  if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(tax.warning ? { warnings: [tax.warning] } : {}) });
+  // 🆕 JAN を Company DB と比べた印 (Company DB構想 21 §5 B1)。知らせだけ = payload も送る値も変えない・出品も止めない。
+  //    🚨 比べる値は payload を作った直後に await を挟まずに読み直す (= payload と同じ値。上の await の間に JAN が保存されてもずれない・Codex #1700 R1 M4)
+  const janUnits = janUnitsForDraftId(db, draft.id);
+  // (プレビューの JAN の読みは入口から 4.5 秒まで。辞書・税率で使い切っていれば読みに行かず「読めない」の一言)
+  const warnings = [...(tax.warning ? [tax.warning] : []), ...janWarningsOf(await compareJanUnits(janUnits, { deadlineAt: janDeadlineAt }))];
+  if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(warnings.length ? { warnings } : {}) });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
-    ...(tax.warning ? { warnings: [tax.warning] } : {}),
+    ...(warnings.length ? { warnings } : {}),
     // 店舗内カテゴリは RMS payload に含まれない (item-mappings API で登録成功後に自動反映)。
     // プレビューには参考情報として添える
     shopCategories: selectedShopCategoryPaths(db, draft.id),
@@ -2814,6 +2821,17 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
   })();
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
   res.json({ ok: true });
+});
+
+// 🆕 JAN を Company DB と比べる印 (Company DB構想 21 §5 B1・読むだけ)。詳細画面が開いた後に読む (画面の表示を Company DB で待たせない)。
+//    単品 = 出品の商品コード ↔ product_drafts.jan_code / まとまり = 子の SKU ごと ↔ draft_sku_jans (楽天に送る値と同じ決め方)。
+//    Company DB も product-hub の SQLite も書かない。読めないときも 200 で「読めない」の印を返す
+router.get('/api/drafts/:id/jan-check', async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // 期限は要求の入口から (Codex #1700 R2 M2)
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const r = await compareDraftJans(getDB(), draft, { deadlineAt });
+  res.json(r.ok ? r : { ok: true, readable: false, reason: r.reason, mode: null, units: [], summary: { state: 'unreadable', severity: 'muted', label: '読めない', counts: {} } });
 });
 
 // SKU別 JANコード (2026-08-28 中原さん要望: バリエーションありのとき、ページ代表の JAN 1つだけでは
@@ -3297,6 +3315,21 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
     // 🆕 まとまりのカード (PR-4): NE の写し待ち / 2 軸 = 出品を止めている・要確認 の札
     cdbGroupTags: cdbGroupBoardTags(db),
   });
+});
+
+// 🆕 ボードの JAN の印 (Company DB構想 21 §5 B1・読むだけ)。ボードを開いた後に画面が読む (ボードの表示を Company DB で待たせない)。
+//    ?ids= = 画面に出ているカードの draft ID (担当・確認中・ビュー・表示の上限で絞った後の物)。そのうち product-hub に JAN があるカードだけを 1 回で比べ、
+//    「違う / Company DB に無い」のカードだけ返す (件数も画面のカードだけ・Codex #1700 R1 M2)。時間は 4.5 秒まで (超えたら接続を閉じて「読めない」)
+router.get('/api/board/jan-check', async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // 期限は要求の入口から (ID の読み・まとまりの判定の時間も入れる・Codex #1700 R2 M2)
+  const ids = parseBoardDraftIds(req.query.ids);
+  if (ids === null) return res.status(400).json({ ok: false, error: 'ids はカンマで区切った数 (1000 個まで)' });
+  try {
+    res.json(await boardJanMarks(getDB(), { ids, deadlineAt }));
+  } catch (e) {
+    console.error('[product-hub] board jan-check:', e);
+    res.json({ ok: true, readable: false, reason: '比べる途中で失敗した', checked: 0, byDraft: {} });
+  }
 });
 
 router.get('/staff', (req, res) => {

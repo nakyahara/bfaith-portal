@@ -558,8 +558,14 @@
           msg('登録しました (下書き)。' + code + ' の画面を開いています…', 'ok');
           var warns = (x.j.warnings || []).slice();
           if (x.j.card && x.j.card.status !== 'done') warns.push('product-hub の出品カード: ' + (x.j.card_label || x.j.card.status) + ' (商品の画面の「カードをもう一度作る」か、product-hub のボードを開くと作り直します)');
-          // 登録は成功・発注アプリへの書き込み (②) だけ失敗 = 商品の画面の「発注の設定」で入れ直す
-          if (x.j.order_settings && !x.j.order_settings.ok) warns.push('発注の設定だけ保存できませんでした (' + (x.j.order_settings.error || '発注アプリに書けない') + ')。商品の画面の「発注の設定」で入れてください');
+          // 登録は成功・発注アプリへの書き込み (②) だけまだ = 🆕 0075: 知らせは Company DB に残る (自動でもう一度届ける) / 要確認 = 商品の画面で確かめる。
+          //   0075 の前の DB = 商品の画面の「発注の設定」で入れ直す (知らせが無い)
+          var po = x.j.order_settings;
+          if (po && !po.ok) {
+            if (po.pending) warns.push('発注の設定はまだ発注アプリに届いていません (登録と一緒に残してあるので、自動でもう一度届けます。急ぐときは「発注の設定の届け待ち」の画面で「もう一度届ける」)');
+            else if (po.status) warns.push('発注の設定は要確認です (' + (po.error || '発注アプリにもう設定がある') + ')。商品の画面の「発注の設定」で確かめて、「発注の設定の届け待ち」の画面で閉じてください');
+            else warns.push('発注の設定だけ保存できませんでした (' + (po.error || '発注アプリに書けない') + ')。商品の画面の「発注の設定」で入れてください');
+          }
           try { sessionStorage.setItem(NOTE_KEY, JSON.stringify({ code: String(code), at: Date.now(), j: { replayed: !!x.j.replayed, changed: [], derived: [], ne_steps: x.j.ne_steps || [], warnings: warns } })); } catch (e) { /* 置けない = 知らせを出さないだけ */ }
           var url = BASE + '/sku/' + encodeURIComponent(code);
           if (ME.replacePage) ME.replacePage(url); else location.replace(url);
