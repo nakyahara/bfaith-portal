@@ -530,9 +530,12 @@ await ta('[H3f] 書かなかった (changed: false) 応答が失われた後の�
     LZ_MIRROR = mirrorOf({ bc: [['zz-new', 'X00LZR5001']] });
     const s2 = await call('POST', api('lz4'), { body });
     assert.deepEqual([s2.status, s2.j.replayed, s2.j.changed, s2.j.rule_row], [200, true, false, w1.j.rule_row], s2.text);
-    // 違う中身で同じ request_id = 断る
+    // 違う中身で同じ request_id = 断る (#1719 R6 Low: 開いたときの行番号が違うのも)
     const s3 = await call('POST', api('lz4'), { body: { ...body, barcode: { kind: 'lz_assign' } } });
     assert.deepEqual([s3.status, s3.j.reason], [409, 'request_id_reused'], s3.text);
+    const s4 = await call('POST', api('lz4'), { body: { ...body, seen_row: String(Number(w1.j.rule_row) - 1) } });
+    assert.deepEqual([s4.status, s4.j.reason], [409, 'request_id_reused'], s4.text);
+    assert.equal((await q('select seen_row::text as s from ops.sku_logizard_barcode_requests where request_id = $1', [body.request_id]))[0].s, String(w1.j.rule_row));
     // 控えは画面のロールが書けない・持ち主も関数の外では書けない・変えられない
     const code = async (fn) => { const e = await pgErr(fn()); return e ? e.code : null; };
     assert.equal(await asEditor(() => code(() => pg.query(`insert into ops.sku_logizard_barcode_requests (request_id, sku_id, actor_id, rule, via, result) values ($1, $2, 'x@y', 'lz_assign', 'sku_page', '{}')`, [uuid(), ids.lz4]))), '42501');

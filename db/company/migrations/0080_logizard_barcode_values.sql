@@ -87,6 +87,7 @@ create table ops.sku_logizard_barcode_requests (
   rule       text        not null,
   value      text,
   via        text        not null,
+  seen_row   bigint,                 -- 画面を開いたときの行番号 (#1719 Codex R6 Low: 押し直しの比べに入れる = 違う行番号の同じ request_id は request_id_reused)
   result     jsonb       not null,
   created_at timestamptz not null default pg_catalog.now(),
   primary key (request_id, sku_id)
@@ -165,7 +166,8 @@ begin
   -- 押し直し (同じ request_id・同じ SKU) = 前の答え。🆕 #1719 R5: 答えの控え (書かなかった回も) を先に見る
   select * into v_req from ops.sku_logizard_barcode_requests x where x.request_id = p_request_id and x.sku_id = p_sku_id;
   if v_req.request_id is not null then
-    if v_req.actor_id is distinct from p_actor_id or v_req.rule is distinct from p_kind or v_req.value is distinct from p_value or v_req.via is distinct from p_via then
+    if v_req.actor_id is distinct from p_actor_id or v_req.rule is distinct from p_kind or v_req.value is distinct from p_value or v_req.via is distinct from p_via
+       or v_req.seen_row is distinct from p_seen_row then
       raise exception 'request_id_reused: request_id % はほかの人・中身で使われている', p_request_id using errcode = '23505';
     end if;
     return v_req.result || pg_catalog.jsonb_build_object('replayed', true);
@@ -204,7 +206,7 @@ begin
       'changed', true, 'rule_row', v_row::text);
   end if;
   perform pg_catalog.set_config('ops.logizard_barcode_protocol', '1', true);
-  insert into ops.sku_logizard_barcode_requests (request_id, sku_id, actor_id, rule, value, via, result) values (p_request_id, p_sku_id, p_actor_id, p_kind, p_value, p_via, v_res);
+  insert into ops.sku_logizard_barcode_requests (request_id, sku_id, actor_id, rule, value, via, seen_row, result) values (p_request_id, p_sku_id, p_actor_id, p_kind, p_value, p_via, p_seen_row, v_res);
   perform pg_catalog.set_config('ops.logizard_barcode_protocol', '', true);
   return v_res;
 end $$;

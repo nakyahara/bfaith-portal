@@ -84,7 +84,7 @@
       excluded: new Set(), optIn: new Set(), edits: {}, filter: 'all', open: null, janPaste: false, janMsg: '', lzPaste: false, lzMsg: '', flash: null, done: null };
   };
   var S = fresh();
-  var R = { key: '', busy: false, group: null, codes: {}, jans: {}, lz: {}, fresh: true, error: null };   // DB の確かめの答え (打った値ごと)
+  var R = { key: '', busy: false, group: null, codes: {}, jans: {}, lz: {}, lzKid: {}, fresh: true, error: null };   // DB の確かめの答え (打った値ごと)
 
   var money = function (s) { var t = String(s == null ? '' : s).normalize('NFKC').replace(/[,\s円¥]/g, ''); if (t === '') return null; return /^\d{1,9}$/.test(t) ? Number(t) : NaN; };
   function janProblem(j) {
@@ -291,14 +291,22 @@
       if (k.jan) { var jp = janProblem(k.jan); if (jp) E(jp.c, 'JAN: ' + jp.m); else if (seenJan.has(k.jan)) E('dup', 'JAN が ' + seenJan.get(k.jan) + ' と同じ'); else seenJan.set(k.jan, k.code); }
       if (LZ_ON && k.lzbc) {
         var ls = lzShape(k.lzbc);
-        var janOf = kids.filter(function (o) { return o !== k && o.inc && String((S.edits[o.key] || {}).jan == null ? '' : S.edits[o.key].jan).normalize('NFKC').trim() === k.lzbc; })[0];
         if (ls && ls.c) E(ls.c, 'ロジザードのバーコード: ' + ls.m);
-        else if (janOf) E('dup', 'ロジザードのバーコードが ' + janOf.code + ' の JAN と同じ');
         else if (seenLz.has(k.lzbc)) E('dup', 'ロジザードのバーコードが ' + seenLz.get(k.lzbc) + ' と同じ');
         else { seenLz.set(k.lzbc, k.code); if (R.lz[k.lzbc]) E('dup', 'ロジザードのバーコード: ほかの商品 (' + R.lz[k.lzbc] + ') が使っています'); }
       }
-      k.errs.forEach(function (x) { Pi(6, x.c, k.code + ': ' + x.m, '#kid-' + i2); });
     });
+    // 🆕 #1719 Codex R6: 子のロジザードの値 = ほかの子の JAN は、全部の子の作る / 作らない・JAN・値が決まった後に比べる (子の順番に左右されない)。
+    //   DB の確かめ (/api/variation/check の lz_kid_clash) が同じ値を見つけたときも出す (形の誤り・ほかの印がある子は重ねない)
+    if (LZ_ON) kids.forEach(function (k) {
+      if (!k.inc || !k.lzbc || k.errs.some(function (x) { return /^ロジザードのバーコード/.test(x.m); })) return;
+      var ls = lzShape(k.lzbc);
+      if (!ls || !ls.kind) return;
+      var janOf = kids.filter(function (o) { return o !== k && o.inc && o.jan && o.jan === k.lzbc; })[0];
+      if (janOf) k.errs.push({ c: 'dup', m: 'ロジザードのバーコードが ' + janOf.code + ' の JAN と同じ' });
+      else if (R.lzKid && R.lzKid[k.code]) k.errs.push({ c: 'dup', m: 'ロジザードのバーコードが ' + R.lzKid[k.code] + ' の JAN と同じ (DB の確かめ)' });
+    });
+    kids.forEach(function (k, i2) { (k.errs || []).forEach(function (x) { Pi(6, x.c, k.code + ': ' + x.m, '#kid-' + i2); }); });
     var live = kids.filter(function (k) { return k.inc; });
     var n = live.length;
     // 🆕 2026-10-13: 必須でない項目 = 値か「入力なし」。どちらでもない = まだ入れていない (保存できない)
@@ -795,8 +803,10 @@
     var codes = m.live.map(function (k) { return k.code; }).filter(function (c) { return CODE_RE.test(c); });
     var jans = m.live.map(function (k) { return k.jan; }).filter(function (j) { return /^(\d{8}|\d{13})$/.test(j); });
     var lzv = LZ_ON ? m.live.map(function (k) { return k.lzbc; }).filter(function (v) { var ls = lzShape(v); return !!(ls && ls.kind); }) : [];
+    // 🆕 #1719 Codex R6: 子ごとの JAN と値 (DB の確かめが「子の値 = ほかの子の JAN」を lz_kid_clash で返す)
+    var lzk = LZ_ON ? m.live.map(function (k) { return { code: k.code, jan: k.jan, lz: k.lzbc }; }) : [];
     var gc = S.mode === 'new' && CODE_RE.test(S.gcode) && !/^set-/i.test(S.gcode) ? S.gcode : '';
-    return { key: JSON.stringify([gc, codes, jans, lzv]), gc: gc, codes: codes, jans: jans, lzv: lzv };
+    return { key: JSON.stringify([gc, codes, jans, lzv, lzk]), gc: gc, codes: codes, jans: jans, lzv: lzv, lzk: lzk };
   }
   /** 確かめが今の値に追いついたか (試験と画面の印 = フォームの data-check) */
   function markCheck() { form.setAttribute('data-check', ready() ? 'done' : 'busy'); }
@@ -807,16 +817,16 @@
     clearTimeout(checkTimer);
     var my = ++checkSeq;
     checkTimer = setTimeout(function () {
-      if (!q.gc && !q.codes.length && !q.jans.length && !q.lzv.length) { R.group = null; R.codes = {}; R.jans = {}; R.lz = {}; R.fresh = true; R.busy = false; light(); return; }
+      if (!q.gc && !q.codes.length && !q.jans.length && !q.lzv.length) { R.group = null; R.codes = {}; R.jans = {}; R.lz = {}; R.lzKid = {}; R.fresh = true; R.busy = false; light(); return; }
       R.busy = true;
-      fetch(BASE + '/api/variation/check', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ group_code: q.gc || null, codes: q.codes, jans: q.jans, lz_values: q.lzv }) })
+      fetch(BASE + '/api/variation/check', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ group_code: q.gc || null, codes: q.codes, jans: q.jans, lz_values: q.lzv, lz_children: q.lzk }) })
         .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
         .then(function (x) {
           if (my !== checkSeq) return;
           R.busy = false;
           if (!x.r.ok || !x.j.ok) { R.error = 'DB で確かめられません (' + (x.j.error || 'HTTP ' + x.r.status) + ')。少し待つともう一度確かめます'; R.fresh = false; retryCheck(); light(); return; }
           R.group = x.j.group ? Object.assign({ code: q.gc }, x.j.group) : null;
-          R.codes = x.j.codes || {}; R.jans = x.j.jans || {}; R.lz = x.j.lz || {}; R.fresh = true; R.error = null;
+          R.codes = x.j.codes || {}; R.jans = x.j.jans || {}; R.lz = x.j.lz || {}; R.lzKid = x.j.lz_kid_clash || {}; R.fresh = true; R.error = null;
           if (M && M.issues.some(function (i) { return i.go === '#g-code'; }) !== !!(R.group && R.group.problem)) update(); else light();
         })
         .catch(function () { if (my !== checkSeq) return; R.busy = false; R.error = 'つながりません。少し待つともう一度確かめます'; retryCheck(); light(); });
