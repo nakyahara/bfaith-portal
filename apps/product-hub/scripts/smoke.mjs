@@ -13720,7 +13720,9 @@ for (const [name, file, data] of renders) {
     const mkEl = (extra = {}) => {
       const ls = {};
       return {
-        dataset: {}, style: {}, value: '', checked: false, disabled: false, textContent: '',
+        // style は CSS 変数 (--pri-bg / --pri-fg) を setProperty / removeProperty で書く (2026-10-13 黒テーマ)
+        dataset: {}, style: { setProperty(k, v) { this[k] = v; }, removeProperty(k) { delete this[k]; } },
+        value: '', checked: false, disabled: false, textContent: '',
         addEventListener(t, fn) { (ls[t] = ls[t] || []).push(fn); },
         fire(t) { return Promise.all((ls[t] || []).map((fn) => fn())); },
         ...extra,

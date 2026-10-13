@@ -2,58 +2,58 @@
 <style>
 /* いまのジャンルの属性辞書に無い属性 (#1165)。必須属性の薄い赤 (#fca5a5・インライン) とは
    別物なので、インラインスタイルを書き換えずクラスで重ねる */
-input.attr-unknown { border-color: #dc2626 !important; background: #fef2f2; }
-th.attr-unknown { color: #dc2626; }
+input.attr-unknown { border-color: var(--phd-bd-dc2626, #dc2626) !important; background: var(--phd-bg-fef2f2, #fef2f2); }
+th.attr-unknown { color: var(--phd-fg-dc2626, #dc2626); }
   /* 説明文3欄プレビュー: 送信HTMLの画像は width=100% (楽天ページでは正)。
      プレビュー枠で原寸表示すると巨大な帯になって読めないため、表示だけスマホ幅相当に
      縮小して中央寄せする (コピーされるHTMLはそのまま — 2026-08-05 中原さん指摘) */
   .desc3-render img { max-width: 420px !important; height: auto; display: block; margin: 0 auto; }
   /* タブ構成 (2026-07-29 中原さん要望: 項目をタブで整理し、必須未入力をバッジで見せる) */
-  .tabbar { position: sticky; top: 0; z-index: 40; background: #f5f6f8; display: flex; gap: 6px;
+  .tabbar { position: sticky; top: 0; z-index: 40; background: var(--phd-bg-f5f6f8, #f5f6f8); display: flex; gap: 6px;
             flex-wrap: wrap; align-items: center; padding: 10px 0; margin-bottom: 12px;
-            border-bottom: 2px solid #e2e8f0; }
-  .tab-btn { position: relative; border: 1px solid #cbd5e1; background: #fff; color: #475569;
+            border-bottom: 2px solid var(--phd-bd-e2e8f0, #e2e8f0); }
+  .tab-btn { position: relative; border: 1px solid var(--phd-bd-cbd5e1, #cbd5e1); background: var(--phd-bg-fff, #fff); color: var(--phd-fg-475569, #475569);
              border-radius: 999px; padding: 7px 16px; font-size: 13px; cursor: pointer; }
-  .tab-btn:hover { background: #f1f5f9; }
-  .tab-btn.active { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 600; }
+  .tab-btn:hover { background: var(--phd-bg-f1f5f9, #f1f5f9); }
+  .tab-btn.active { background: var(--phd-bg-2563eb, #2563eb); border-color: var(--phd-bd-2563eb, #2563eb); color: var(--phd-fg-fff, #fff); font-weight: 600; }
   .tab-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 18px;
-               height: 18px; border-radius: 999px; background: #dc2626; color: #fff; font-size: 11px;
+               height: 18px; border-radius: 999px; background: var(--phd-bg-dc2626, #dc2626); color: var(--phd-fg-fff, #fff); font-size: 11px;
                font-weight: 700; margin-left: 6px; padding: 0 5px; vertical-align: 1px; }
-  .tab-btn.active .tab-badge { background: #fff; color: #dc2626; }
+  .tab-btn.active .tab-badge { background: var(--phd-bg-fff, #fff); color: var(--phd-fg-dc2626, #dc2626); }
   /* カタログID・商品仕様の SKU 表 (2026-09-03): 列 = SKU、行 = 項目。項目列は横スクロールしても固定 */
-  .sku-grid th.sku-grid-head { position: sticky; left: 0; z-index: 1; background: #f8fafc; min-width: 190px;
+  .sku-grid th.sku-grid-head { position: sticky; left: 0; z-index: 1; background: var(--phd-bg-f8fafc, #f8fafc); min-width: 190px;
                                text-align: left; font-weight: 600; vertical-align: top; }
-  .sku-grid thead th { background: #f1f5f9; vertical-align: top; text-align: left; white-space: nowrap; }
+  .sku-grid thead th { background: var(--phd-bg-f1f5f9, #f1f5f9); vertical-align: top; text-align: left; white-space: nowrap; }
   .sku-grid td { vertical-align: top; min-width: 190px; }
   .sku-grid td input[type="text"], .sku-grid td select { width: 100%; box-sizing: border-box; }
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
   /* 工程パネル (誰のボールか)。.wf-dot は _header.ejs で共通定義 */
-  .mini-note { font-size: 11px; color: #94a3b8; }
+  .mini-note { font-size: 11px; color: var(--phd-fg-94a3b8, #94a3b8); }
   /* モール別の展開状況を折りたたみ見出しで一目にする点 */
   .mall-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px;
-              background: #e2e8f0; vertical-align: middle; }
-  .mall-dot.mall-done { background: #16a34a; }
-  .mall-dot.mall-doing { background: #f59e0b; }
-  .mall-dot.mall-skip { background: #cbd5e1; opacity: .5; }
+              background: var(--phd-bg-e2e8f0, #e2e8f0); vertical-align: middle; }
+  .mall-dot.mall-done { background: var(--phd-bg-16a34a, #16a34a); }
+  .mall-dot.mall-doing { background: var(--phd-bg-f59e0b, #f59e0b); }
+  .mall-dot.mall-skip { background: var(--phd-bg-cbd5e1, #cbd5e1); opacity: .5; }
   #wf-card select, #wf-card input { font-size: 12px; padding: 4px 7px; }
   /* 確認中 (2026-08-31 中原さん: 折りたたみでは気づけない)。商品名のすぐ下に 1 本の帯で置き、
      理由ボタンを 1 タップで押せるようにする。立っているときは青く塗って見落とせなくする */
   .chk-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
              margin-top: 8px; padding: 6px 10px; border-radius: 8px;
-             background: #f8fafc; border: 1px solid #e2e8f0; }
-  .chk-bar.chk-on { background: #eff6ff; border: 2px solid #3b82f6; }
-  .chk-lead { font-size: 13px; font-weight: 700; color: #334155; }
-  .chk-bar.chk-on .chk-lead { color: #1e40af; }
-  .chk-reason { font-size: 15px; color: #1e3a8a; }
-  .chk-days { font-size: 12px; font-weight: 700; color: #fff; background: #3b82f6;
+             background: var(--phd-bg-f8fafc, #f8fafc); border: 1px solid var(--phd-bd-e2e8f0, #e2e8f0); }
+  .chk-bar.chk-on { background: var(--phd-bg-eff6ff, #eff6ff); border: 2px solid var(--phd-bd-3b82f6, #3b82f6); }
+  .chk-lead { font-size: 13px; font-weight: 700; color: var(--phd-fg-334155, #334155); }
+  .chk-bar.chk-on .chk-lead { color: var(--phd-fg-1e40af, #1e40af); }
+  .chk-reason { font-size: 15px; color: var(--phd-fg-1e3a8a, #1e3a8a); }
+  .chk-days { font-size: 12px; font-weight: 700; color: var(--phd-fg-fff, #fff); background: var(--phd-bg-3b82f6, #3b82f6);
               border-radius: 999px; padding: 2px 10px; }
-  .chk-pick { font-size: 13px; padding: 7px 14px; border: 1px solid #93c5fd;
-              background: #fff; color: #1e40af; border-radius: 8px; cursor: pointer; }
-  .chk-pick:hover { background: #dbeafe; border-color: #3b82f6; }
-  .chk-clear { font-size: 13px; padding: 7px 16px; background: #16a34a; color: #fff;
-               border: 1px solid #16a34a; border-radius: 8px; cursor: pointer; font-weight: 600; }
-  .chk-clear:hover { background: #15803d; }
+  .chk-pick { font-size: 13px; padding: 7px 14px; border: 1px solid var(--phd-bd-93c5fd, #93c5fd);
+              background: var(--phd-bg-fff, #fff); color: var(--phd-fg-1e40af, #1e40af); border-radius: 8px; cursor: pointer; }
+  .chk-pick:hover { background: var(--phd-bg-dbeafe, #dbeafe); border-color: var(--phd-bd-3b82f6, #3b82f6); }
+  .chk-clear { font-size: 13px; padding: 7px 16px; background: var(--phd-bg-16a34a, #16a34a); color: var(--phd-fg-fff, #fff);
+               border: 1px solid var(--phd-bd-16a34a, #16a34a); border-radius: 8px; cursor: pointer; font-weight: 600; }
+  .chk-clear:hover { background: var(--phd-bg-15803d, #15803d); }
   .chk-note { width: 240px; font-size: 12px; }
   .chk-select { width: auto; font-size: 12px; }
   /* タブより上 (常時表示) のカードは詰める (2026-08-31 中原さん: 間延びして専有スペースが大きい)。
@@ -62,72 +62,73 @@ th.attr-unknown { color: #dc2626; }
   .card.hdr { padding: 9px 14px; margin-bottom: 8px; }
   .card.hdr h2 { font-size: 14px; margin: 0 0 6px; }
   /* 読まなくても操作できる説明は畳む (操作そのものは畳まない — 折りたたむと気づけないため) */
-  .hdr-help > summary { cursor: pointer; font-size: 12px; color: #64748b; list-style: none; }
+  .hdr-help > summary { cursor: pointer; font-size: 12px; color: var(--phd-fg-64748b, #64748b); list-style: none; }
   .hdr-help > summary::-webkit-details-marker { display: none; }
   .hdr-help > summary::before { content: 'ⓘ '; }
   .hdr-help[open] > summary::before { content: '▾ '; }   /* 開閉が見た目で分かるようにする */
-  .hdr-help > summary:hover { color: #1d4ed8; text-decoration: underline; }
-  .hdr-help p { margin: 6px 0 0; font-size: 12px; color: #64748b; }
+  .hdr-help > summary:hover { color: var(--phd-fg-1d4ed8, #1d4ed8); text-decoration: underline; }
+  .hdr-help p { margin: 6px 0 0; font-size: 12px; color: var(--phd-fg-64748b, #64748b); }
   /* 利益額・利益率 (2026-09-01 中原さん要望: 小さくて読み飛ばす)。売価を決めるときに
      一番見る数字なので、原価・内訳の文字とは別格の大きさで出す */
   .profit-figs { display: flex; gap: 20px; align-items: baseline; flex-wrap: wrap;
-                 margin-top: 6px; padding: 7px 12px; border: 1px solid #e2e8f0;
-                 border-radius: 8px; background: #f8fafc; }
-  .profit-figs.neg { background: #fef2f2; border-color: #fca5a5; }   /* 赤字は枠ごと赤 */
+                 margin-top: 6px; padding: 7px 12px; border: 1px solid var(--phd-bd-e2e8f0, #e2e8f0);
+                 border-radius: 8px; background: var(--phd-bg-f8fafc, #f8fafc); }
+  .profit-figs.neg { background: var(--phd-bg-fef2f2, #fef2f2); border-color: var(--phd-bd-fca5a5, #fca5a5); }   /* 赤字は枠ごと赤 */
   .profit-fig { display: flex; align-items: baseline; gap: 7px; }
-  .profit-fig .lbl { font-size: 11px; font-weight: 700; color: #64748b; }
-  .profit-fig .val { font-size: 24px; font-weight: 800; color: #0f172a; line-height: 1.15;
+  .profit-fig .lbl { font-size: 11px; font-weight: 700; color: var(--phd-fg-64748b, #64748b); }
+  .profit-fig .val { font-size: 24px; font-weight: 800; color: var(--phd-fg-0f172a, #0f172a); line-height: 1.15;
                      font-variant-numeric: tabular-nums; }
-  .profit-fig .val.neg { color: #dc2626; }
+  .profit-fig .val.neg { color: var(--phd-fg-dc2626, #dc2626); }
   /* SKU別売価の表の利益セル。色は class で切り替える (inline style を JS で消すと
      ここの指定ごと消えてしまうため) */
-  .sku-profit { font-size: 14px; font-weight: 700; color: #0f172a; white-space: nowrap; }
-  .sku-profit.neg { color: #dc2626; }
-  .sku-profit.none { font-size: 12px; font-weight: 400; color: #94a3b8; }
+  .sku-profit { font-size: 14px; font-weight: 700; color: var(--phd-fg-0f172a, #0f172a); white-space: nowrap; }
+  .sku-profit.neg { color: var(--phd-fg-dc2626, #dc2626); }
+  .sku-profit.none { font-size: 12px; font-weight: 400; color: var(--phd-fg-94a3b8, #94a3b8); }
   /* NE登録の進み (2026-09-04 §5.3)。工程とは別に「どこで止まっているか」を1行で見せる */
   .ne-stepper { display:flex; align-items:center; gap:4px; flex-wrap:wrap; font-size:11px; }
-  .ne-step { padding:2px 8px; border-radius:10px; border:1px solid #e2e8f0; background:#f8fafc; color:#64748b; }
-  .ne-step.on { background:#fef3c7; color:#92400e; border-color:#fcd34d; font-weight:700; }
-  .ne-step.on.ok { background:#dcfce7; color:#166534; border-color:#86efac; }
-  .ne-step.on.bad { background:#fee2e2; color:#991b1b; border-color:#fca5a5; }
-  .ne-arrow { color:#cbd5e1; }
+  .ne-step { padding:2px 8px; border-radius:10px; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); background:var(--phd-bg-f8fafc, #f8fafc); color:var(--phd-fg-64748b, #64748b); }
+  .ne-step.on { background:var(--phd-bg-fef3c7, #fef3c7); color:var(--phd-fg-92400e, #92400e); border-color:var(--phd-bd-fcd34d, #fcd34d); font-weight:700; }
+  .ne-step.on.ok { background:var(--phd-bg-dcfce7, #dcfce7); color:var(--phd-fg-166534, #166534); border-color:var(--phd-bd-86efac, #86efac); }
+  .ne-step.on.bad { background:var(--phd-bg-fee2e2, #fee2e2); color:var(--phd-fg-991b1b, #991b1b); border-color:var(--phd-bd-fca5a5, #fca5a5); }
+  .ne-arrow { color:var(--phd-fg-cbd5e1, #cbd5e1); }
   /* 未保存の印 (2026-09-21)。明示保存の欄は「ボタンを押すまで DB に行かない」ので、
      どこに未保存が残っているかをボタンとタブの両方で見えるようにする */
-  .unsaved-mark { display:none; margin-left:8px; font-size:12px; font-weight:700; color:#b45309; }
+  .unsaved-mark { display:none; margin-left:8px; font-size:12px; font-weight:700; color:var(--phd-fg-b45309, #b45309); }
   .unsaved-mark.on { display:inline; }
-  .tab-unsaved { display:none; margin-left:4px; color:#f59e0b; font-size:11px; }
+  .tab-unsaved { display:none; margin-left:4px; color:var(--phd-fg-f59e0b, #f59e0b); font-size:11px; }
   .tab-unsaved.on { display:inline; }
   .unsaved-banner { margin-top:10px; padding:8px 12px; border-radius:8px; font-size:12.5px;
-                    background:#fffbeb; border:1px solid #fcd34d; color:#92400e; }
+                    background:var(--phd-bg-fffbeb, #fffbeb); border:1px solid var(--phd-bd-fcd34d, #fcd34d); color:var(--phd-fg-92400e, #92400e); }
   /* 即保存の結果 (2026-09-21)。入力を確定した時点で保存されたことを、その欄のそばで知らせる */
-  .autosave-mark { margin-left: 8px; font-size: 11.5px; color: #16a34a; }
-  .autosave-mark.bad { color: #dc2626; font-weight: 600; }
+  .autosave-mark { margin-left: 8px; font-size: 11.5px; color: var(--phd-fg-16a34a, #16a34a); }
+  .autosave-mark.bad { color: var(--phd-fg-dc2626, #dc2626); font-weight: 600; }
   /* 🆕 JAN を Company DB と比べた印 (Company DB構想 21 B1・知らせだけ)。画面を開いた後に読んで出す */
   .jan-cdb-mark { margin-top:4px; font-size:11.5px; line-height:1.45; }
   .jan-cdb-mark:empty { display:none; }
-  .jan-cdb-pill { display:inline-block; border-radius:999px; padding:1px 8px; font-weight:700; border:1px solid #e2e8f0; background:#f8fafc; color:#475569; }
-  .jan-cdb-pill.warn { background:#fff7ed; color:#9a3412; border-color:#fdba74; }
-  .jan-cdb-pill.ok { background:#f0fdf4; color:#166534; border-color:#86efac; }
-  .jan-cdb-pill.info { background:#eff6ff; color:#1e40af; border-color:#bfdbfe; }
-  .jan-cdb-pill.muted { background:#f1f5f9; color:#64748b; border-color:#cbd5e1; }
-  .jan-cdb-detail { display:block; color:#64748b; margin-top:2px; }
+  .jan-cdb-pill { display:inline-block; border-radius:999px; padding:1px 8px; font-weight:700; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); background:var(--phd-bg-f8fafc, #f8fafc); color:var(--phd-fg-475569, #475569); }
+  .jan-cdb-pill.warn { background:var(--phd-bg-fff7ed, #fff7ed); color:var(--phd-fg-9a3412, #9a3412); border-color:var(--phd-bd-fdba74, #fdba74); }
+  .jan-cdb-pill.ok { background:var(--phd-bg-f0fdf4, #f0fdf4); color:var(--phd-fg-166534, #166534); border-color:var(--phd-bd-86efac, #86efac); }
+  .jan-cdb-pill.info { background:var(--phd-bg-eff6ff, #eff6ff); color:var(--phd-fg-1e40af, #1e40af); border-color:var(--phd-bd-bfdbfe, #bfdbfe); }
+  .jan-cdb-pill.muted { background:var(--phd-bg-f1f5f9, #f1f5f9); color:var(--phd-fg-64748b, #64748b); border-color:var(--phd-bd-cbd5e1, #cbd5e1); }
+  .jan-cdb-detail { display:block; color:var(--phd-fg-64748b, #64748b); margin-top:2px; }
   .jan-cdb-summary { margin-top:6px; font-size:12px; }
-  .jan-cdb-help { margin-top:6px; font-size:12px; color:#475569; }
-  .jan-cdb-help summary { cursor:pointer; color:#2563eb; }
+  .jan-cdb-help { margin-top:6px; font-size:12px; color:var(--phd-fg-475569, #475569); }
+  .jan-cdb-help summary { cursor:pointer; color:var(--phd-fg-2563eb, #2563eb); }
   .jan-cdb-help ul { margin:6px 0 0 18px; padding:0; }
   /* 🆕 商品マスタ (Company DB) の JAN から選ぶ (Company DB構想 21 B2 の段 3)。読んだ後に JS が選べる JAN を並べる */
   .jan-pick { display:flex; flex-direction:column; gap:4px; }
-  .jan-pick-select { max-width:260px; font-size:12.5px; padding:5px 8px; border-radius:8px; border:1px solid #cbd5e1; background:#fff; }
-  .jan-pick-select:focus-visible { outline:2px solid #2563eb; outline-offset:1px; }
-  .jan-pick-select:disabled { background:#f1f5f9; color:#64748b; }
+  .jan-pick-select { max-width:260px; font-size:12.5px; padding:5px 8px; border-radius:8px; border:1px solid var(--phd-bd-cbd5e1, #cbd5e1); background:var(--phd-bg-fff, #fff); }
+  .jan-pick-select:focus-visible { outline:2px solid var(--phd-bd-2563eb, #2563eb); outline-offset:1px; }
+  .jan-pick-select:disabled { background:var(--phd-bg-f1f5f9, #f1f5f9); color:var(--phd-fg-64748b, #64748b); }
   .jan-pick-links { font-size:11.5px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-  .jan-pick-links a { color:#2563eb; }
-  .jan-manual-toggle { border:0; background:none; padding:0; color:#64748b; font-size:11.5px; text-decoration:underline; cursor:pointer; }
+  .jan-pick-links a { color:var(--phd-fg-2563eb, #2563eb); }
+  .jan-manual-toggle { border:0; background:none; padding:0; color:var(--phd-fg-64748b, #64748b); font-size:11.5px; text-decoration:underline; cursor:pointer; }
   .jan-pick-state { margin-top:4px; font-size:11.5px; line-height:1.45; }
   .jan-pick-state:empty { display:none; }
   .jan-pick-saving { opacity:.6; }
   #f-jan[hidden], .sku-jan-input[hidden] { display:none; }
 </style>
+<%- include('_detail-theme') %>
 <div class="wrap wide">
 
   <div style="margin-bottom:8px; display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
@@ -165,7 +166,7 @@ th.attr-unknown { color: #dc2626; }
     <% } %>
     <%# AI が「人の確認待ち」にした商品 (2026-08-28 夜間自動化)。解除だけでは生成されない — 人が直してから解除する %>
     <% if (draft.generation_block_code) { %>
-      <div class="banner-warn" style="margin:12px 0 0; background:#fee2e2; border-color:#ef4444;">
+      <div class="banner-warn" style="margin:12px 0 0; background:var(--phd-bg-fee2e2, #fee2e2); border-color:var(--phd-bd-ef4444, #ef4444);">
         <div>
           <strong>⚠ AI が止めています: <%= blockLabels[draft.generation_block_code] || draft.generation_block_code %></strong>
           <div style="margin-top:4px; white-space:pre-wrap;"><%= draft.generation_block_reason %></div>
@@ -244,22 +245,22 @@ th.attr-unknown { color: #dc2626; }
     ).length;
   %>
   <!-- 楽天出品 (P3) -->
-  <div class="card hdr" style="border-color:#fecaca; background:#fffbfa;">
+  <div class="card hdr" style="border-color:var(--phd-bd-fecaca, #fecaca); background:var(--phd-bg-fffbfa, #fffbfa);">
     <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(公開で登録 — 在庫0なので売れません。在庫はNE連携)</span></h2>
     <div style="font-size:13px; margin-bottom:6px;">
       🖼 画像転送:
       <% if (images.length === 0) { %>
-        <span style="color:#b45309;">画像未登録 (画像タブでフォルダを取り込んでください)</span>
+        <span style="color:var(--phd-fg-b45309, #b45309);">画像未登録 (画像タブでフォルダを取り込んでください)</span>
       <% } else if (transferredImageCount >= images.length) { %>
-        <span style="color:#166534;">✅ <%= transferredImageCount %>/<%= images.length %> 枚 転送済み</span>
+        <span style="color:var(--phd-fg-166534, #166534);">✅ <%= transferredImageCount %>/<%= images.length %> 枚 転送済み</span>
       <% } else { %>
-        <span style="color:#b45309;">⚠️ 未転送 <%= images.length - transferredImageCount %> 枚 (<%= transferredImageCount %>/<%= images.length %> 済) — 画像タブの「画像をR-Cabinetへ転送」で送ってください</span>
+        <span style="color:var(--phd-fg-b45309, #b45309);">⚠️ 未転送 <%= images.length - transferredImageCount %> 枚 (<%= transferredImageCount %>/<%= images.length %> 済) — 画像タブの「画像をR-Cabinetへ転送」で送ってください</span>
       <% } %>
     </div>
     <% const selectedShopCats = shopCategories.filter((c) => c.selected)
          .sort((a, b) => (a.slot ?? 99) - (b.slot ?? 99) || a.id - b.id); // 枠順 (枠1=メイン) %>
     <% if (rakuten && rakuten.registered_at && rakuten.published_at) { %>
-      <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
+      <div style="background:var(--phd-bg-dcfce7, #dcfce7); border:1px solid var(--phd-bd-86efac, #86efac); border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
         🟢 <strong>楽天で公開中</strong>
         <a href="<%= rakutenItemUrl %>" target="_blank" rel="noopener" style="margin-left:8px; font-weight:600;">🔗 楽天の商品ページを開く ↗</a>
         <% if (rakutenRmsUrl) { %><a href="<%= rakutenRmsUrl %>" target="_blank" rel="noopener" style="margin-left:8px; font-weight:600;" title="RMS の商品編集画面を開きます">🛠 RMSで編集 ↗</a><% } %>
@@ -270,7 +271,7 @@ th.attr-unknown { color: #dc2626; }
         </div>
       </div>
     <% } else if (rakuten && rakuten.registered_at) { %>
-      <div style="background:#fefce8; border:1px solid #fde047; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
+      <div style="background:var(--phd-bg-fefce8, #fefce8); border:1px solid var(--phd-bd-fde047, #fde047); border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
         ✅ <strong>楽天に非公開 (倉庫指定) で登録済み</strong>
         <span class="muted">(<%= rakuten.registered_at.replace('T',' ').slice(0,16) %>)</span><br>
         公開前チェック:
@@ -281,18 +282,18 @@ th.attr-unknown { color: #dc2626; }
               店舗内カテゴリ: <strong><%= selectedShopCats.map((c) => c.path).join(' ／ ') %></strong>
               <%# 状態は「今の選択が反映済みか」で判定する (反映後に棚を変えたら stale) %>
               <% if (shopCatSyncState === 'synced') { %>
-                <span style="color:#166534;">✅ 反映済み (<%= rakuten.shop_categories_synced_at.replace('T',' ').slice(0,16) %>)</span>
+                <span style="color:var(--phd-fg-166534, #166534);">✅ 反映済み (<%= rakuten.shop_categories_synced_at.replace('T',' ').slice(0,16) %>)</span>
               <% } else if (shopCatSyncState === 'stale') { %>
-                <span style="color:#b45309;">⚠️ 反映後に棚を変えました (もう一度反映してください)</span>
+                <span style="color:var(--phd-fg-b45309, #b45309);">⚠️ 反映後に棚を変えました (もう一度反映してください)</span>
               <% } else if (shopCatSyncState === 'failed') { %>
-                <span style="color:#dc2626;">❌ 反映に失敗</span>
+                <span style="color:var(--phd-fg-dc2626, #dc2626);">❌ 反映に失敗</span>
               <% } else { %>
                 <span class="muted">⏳ 未反映</span>
               <% } %>
               <button class="btn btn-sm" id="rk-syncshopcat-btn" style="margin-left:6px;">棚を反映</button>
               <span class="muted" id="rk-syncshopcat-result" style="font-size:12px;"></span>
               <% if (rakuten.shop_categories_error && shopCatSyncState !== 'synced') { %>
-                <div class="muted" style="font-size:11px; color:#b91c1c; white-space:pre-wrap;"><%= rakuten.shop_categories_error %></div>
+                <div class="muted" style="font-size:11px; color:var(--phd-fg-b91c1c, #b91c1c); white-space:pre-wrap;"><%= rakuten.shop_categories_error %></div>
               <% } %>
             </li>
           <% } else { %>
@@ -326,22 +327,22 @@ th.attr-unknown { color: #dc2626; }
       <button class="btn btn-primary" id="rk-register-btn">公開で登録</button>
       <span class="muted" id="rk-result"></span>
     </div>
-    <pre id="rk-preview" style="display:none; margin-top:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; font-size:11px; max-height:340px; overflow:auto;"></pre>
+    <pre id="rk-preview" style="display:none; margin-top:10px; background:var(--phd-bg-f8fafc, #f8fafc); border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; padding:10px; font-size:11px; max-height:340px; overflow:auto;"></pre>
   </div>
 
   <!-- ═══ 工程 (いま誰のボールか) ═══ 2026-08-23 -->
-  <div class="card hdr" id="wf-card" style="border-color:#bfdbfe; background:#f8fbff;">
+  <div class="card hdr" id="wf-card" style="border-color:var(--phd-bd-bfdbfe, #bfdbfe); background:var(--phd-bg-f8fbff, #f8fbff);">
     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
       <span style="font-size:14px; font-weight:700;">🔁 工程</span>
       <% if (workflow.current) { %>
-        <span class="badge" style="background:#dbeafe; color:#1d4ed8;"><%= workflow.current.label %></span>
+        <span class="badge" style="background:var(--phd-bg-dbeafe, #dbeafe); color:var(--phd-fg-1d4ed8, #1d4ed8);"><%= workflow.current.label %></span>
         <span style="font-size:13px; display:inline-flex; align-items:center; gap:5px;">
           <% if (workflow.current.assignee_name) { %>
-            <span class="wf-dot" style="background:<%= workflow.current.assignee_color || '#94a3b8' %>"></span>
+            <span class="wf-dot" style="background:<%= workflow.current.assignee_color || 'var(--phd-bg-94a3b8, #94a3b8)' %>"></span>
             <%= workflow.current.assignee_name %>
             <% if (workflow.current.assignee_active !== 1) { %><span class="muted">(無効)</span><% } %>
           <% } else if (workflow.current.role_label) { %>
-            <span style="color:#b45309; font-weight:600;"><%= workflow.current.role_label %> — 未割り当て</span>
+            <span style="color:var(--phd-fg-b45309, #b45309); font-weight:600;"><%= workflow.current.role_label %> — 未割り当て</span>
           <% } else { %>
             <span class="muted">システム (夜間バッチ)</span>
           <% } %>
@@ -351,7 +352,7 @@ th.attr-unknown { color: #dc2626; }
       <% } %>
       <span class="muted"><%= workflow.doneCount %>/<%= workflow.totalCount %> 完了</span>
       <% if (workflow.stalledDays) { %>
-        <span class="badge" style="background:#fee2e2; color:#b91c1c;">⚠️ <%= workflow.stalledDays %>日 動いていません</span>
+        <span class="badge" style="background:var(--phd-bg-fee2e2, #fee2e2); color:var(--phd-fg-b91c1c, #b91c1c);">⚠️ <%= workflow.stalledDays %>日 動いていません</span>
       <% } %>
       <span style="flex:1"></span>
       <%# 画像の工程は商品詳細 (LP) の 1 本 (2026-08-31: TOP の 4 工程は廃止し、
@@ -362,14 +363,14 @@ th.attr-unknown { color: #dc2626; }
           <% if (t.excluded) { %>
             <span class="muted">対象外</span>
           <% } else if (t.done) { %>
-            <span style="color:#166534; font-weight:600;">完了</span>
+            <span style="color:var(--phd-fg-166534, #166534); font-weight:600;">完了</span>
           <% } else if (t.current) { %>
             <%= t.current.label %>
             <% if (t.current.assignee_name) { %>
-              <span class="wf-dot" style="background:<%= t.current.assignee_color || '#94a3b8' %>"></span><%= t.current.assignee_name %>
+              <span class="wf-dot" style="background:<%= t.current.assignee_color || 'var(--phd-bg-94a3b8, #94a3b8)' %>"></span><%= t.current.assignee_name %>
             <% } %>
             <% if (t.stalledDays) { %>
-              <span style="color:#b91c1c; font-weight:600;">／ <%= t.stalledDays %>日 滞留</span>
+              <span style="color:var(--phd-fg-b91c1c, #b91c1c); font-weight:600;">／ <%= t.stalledDays %>日 滞留</span>
             <% } %>
           <% } else { %>
             <span class="muted">—</span>
@@ -380,7 +381,7 @@ th.attr-unknown { color: #dc2626; }
     </div>
 
     <details style="margin-top:10px;">
-      <summary style="cursor:pointer; font-size:13px; color:#1d4ed8;">工程を進める / 担当者を変える</summary>
+      <summary style="cursor:pointer; font-size:13px; color:var(--phd-fg-1d4ed8, #1d4ed8);">工程を進める / 担当者を変える</summary>
       <table class="list" style="margin-top:8px;">
         <thead>
           <tr><th style="width:210px">工程</th><th style="width:110px">状態</th><th style="width:170px">担当者</th>
@@ -402,10 +403,10 @@ th.attr-unknown { color: #dc2626; }
             <%# data-prev-state = いまの状態。⑤で「完了」を選んだときに選択を戻すために使う (2026-09-04) %>
             <tr data-step="<%= s.step_code %>" data-version="<%= s.version == null ? '' : s.version %>"
                 data-prev-state="<%= s.state %>"
-                <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : (isDetailKind && workflow.detailExcluded ? 'style="opacity:.45"' : '') %>>
+                <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:var(--phd-bg-eff6ff, #eff6ff)"' : (isDetailKind && workflow.detailExcluded ? 'style="opacity:.45"' : '') %>>
               <td>
                 <% if (s.track === 'image') { %>
-                  <span class="badge" style="font-size:10px; padding:1px 6px; background:<%= isDetailKind ? '#ede9fe' : '#dbeafe' %>; color:<%= isDetailKind ? '#6d28d9' : '#1d4ed8' %>;">🖼 <%= isDetailKind ? '詳細' : 'TOP' %></span>
+                  <span class="badge" style="font-size:10px; padding:1px 6px; background:<%= isDetailKind ? 'var(--phd-bg-ede9fe, #ede9fe)' : 'var(--phd-bg-dbeafe, #dbeafe)' %>; color:<%= isDetailKind ? 'var(--phd-fg-6d28d9, #6d28d9)' : 'var(--phd-fg-1d4ed8, #1d4ed8)' %>;">🖼 <%= isDetailKind ? '詳細' : 'TOP' %></span>
                 <% } %>
                 <%= s.label %>
                 <% if (s.description) { %><br><span class="mini-note" title="<%= s.description %>"><%= s.description.length > 34 ? s.description.slice(0, 34) + '…' : s.description %></span><% } %>
@@ -447,7 +448,7 @@ th.attr-unknown { color: #dc2626; }
                   <% } %>
                 <% } else { %>
                   <span style="font-size:12px; display:inline-flex; align-items:center; gap:4px;">
-                    <span class="wf-dot" style="background:<%= s.assignee_color || '#94a3b8' %>"></span><%= s.assignee_name %>
+                    <span class="wf-dot" style="background:<%= s.assignee_color || 'var(--phd-bg-94a3b8, #94a3b8)' %>"></span><%= s.assignee_name %>
                   </span>
                 <% } %>
               </td>
@@ -468,7 +469,7 @@ th.attr-unknown { color: #dc2626; }
       %>
       <p style="margin:10px 0 0; font-size:12px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
         <% if (workflow.detailExcluded) { %>
-          <span style="color:#6d28d9;">🖼 この商品は<strong>詳細画像を作りません</strong> (TOP画像が登録されていれば出品ゲートが開きます)</span>
+          <span style="color:var(--phd-fg-6d28d9, #6d28d9);">🖼 この商品は<strong>詳細画像を作りません</strong> (TOP画像が登録されていれば出品ゲートが開きます)</span>
           <% if (canToggleDetailExcluded) { %>
             <button type="button" class="btn btn-sm" id="wf-detail-excluded" data-next="false">対象外を解除する</button>
           <% } %>
@@ -484,7 +485,7 @@ th.attr-unknown { color: #dc2626; }
 
     <!-- モール別の展開状況 (工程「出品・展開」の中身) -->
     <details style="margin-top:8px;" id="mall-details">
-      <summary style="cursor:pointer; font-size:13px; color:#1d4ed8;">
+      <summary style="cursor:pointer; font-size:13px; color:var(--phd-fg-1d4ed8, #1d4ed8);">
         モール別の展開状況
         <span class="muted" style="margin-left:6px;">
           <%= mallStatus.doneCount %>/<%= mallStatus.totalCount %> 掲載済<% if (mallStatus.skipCount) { %> ・対象外 <%= mallStatus.skipCount %><% } %>
@@ -531,7 +532,7 @@ th.attr-unknown { color: #dc2626; }
                   <% } else { %><span class="muted" style="font-size:12px;">未割り当て</span><% } %>
                 <% } else { %>
                   <span style="font-size:12px; display:inline-flex; align-items:center; gap:4px;">
-                    <span class="wf-dot" style="background:<%= m.assignee_color || '#94a3b8' %>"></span><%= m.assignee_name %>
+                    <span class="wf-dot" style="background:<%= m.assignee_color || 'var(--phd-bg-94a3b8, #94a3b8)' %>"></span><%= m.assignee_name %>
                   </span>
                 <% } %>
               </td>
@@ -557,7 +558,7 @@ th.attr-unknown { color: #dc2626; }
 
     <!-- セット商品 (工程「セット商品作成検討」の実務) -->
     <% if (setInfo) { %>
-      <div style="margin-top:10px; padding:10px 12px; background:#fff7ed; border:1px solid #fed7aa; border-radius:8px;">
+      <div style="margin-top:10px; padding:10px 12px; background:var(--phd-bg-fff7ed, #fff7ed); border:1px solid var(--phd-bd-fed7aa, #fed7aa); border-radius:8px;">
         <div style="font-size:13px;">
           🎁 これは
           <% if (setInfo.parent) { %>
@@ -582,7 +583,7 @@ th.attr-unknown { color: #dc2626; }
         <% } %>
         <%# 親が派生後に変わった (§4.5)。自動追随はしない — 見て判断してもらう %>
         <% if (setInfo.parentChanged) { %>
-          <div style="margin-top:8px; padding:6px 8px; background:#fff; border:1px solid #fbbf24; border-radius:6px; font-size:12px;">
+          <div style="margin-top:8px; padding:6px 8px; background:var(--phd-bg-fff, #fff); border:1px solid var(--phd-bd-fbbf24, #fbbf24); border-radius:6px; font-size:12px;">
             🔔 派生したあとに親商品が更新されています。
             <% if (setInfo.parent) { %>
               <a href="/apps/product-hub/detail/<%= setInfo.parent.id %>">親を見る</a>
@@ -607,7 +608,7 @@ th.attr-unknown { color: #dc2626; }
           <% } %>
         </div>
         <% if (setInfo.neState === 'needs_action' && setInfo.neError) { %>
-          <div style="margin-top:6px; font-size:12px; color:#991b1b;">⚠ <%= setInfo.neError %></div>
+          <div style="margin-top:6px; font-size:12px; color:var(--phd-fg-991b1b, #991b1b);">⚠ <%= setInfo.neError %></div>
         <% } %>
         <% if (setInfo.neRequestedAt) { %>
           <div class="muted" style="margin-top:4px; font-size:11px;">
@@ -618,7 +619,7 @@ th.attr-unknown { color: #dc2626; }
 
         <% if (setInfo.provisional) { %>
           <% const stillTemp = /^SET-/i.test(String(draft.ne_code || '')); %>
-          <div style="margin-top:8px; font-size:13px; color:#b45309;">
+          <div style="margin-top:8px; font-size:13px; color:var(--phd-fg-b45309, #b45309);">
             <% if (stillTemp) { %>
               ⚠️ 商品コードが仮のままです（<code><%= draft.ne_code %></code>）。<strong>このままでは楽天に出品できません。</strong>
               ネクストエンジンに登録した本コードへ差し替えてください。
@@ -660,10 +661,10 @@ th.attr-unknown { color: #dc2626; }
           : setDec === 'hold' ? { bg: '#fef3c7', fg: '#92400e' }
           : { bg: '#fee2e2', fg: '#b91c1c' };
       %>
-      <div style="margin-top:10px; padding:12px 14px; background:#fff; border:2px solid #cbd5e1; border-radius:10px;">
+      <div style="margin-top:10px; padding:12px 14px; background:var(--phd-bg-fff, #fff); border:2px solid var(--phd-bd-cbd5e1, #cbd5e1); border-radius:10px;">
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           <span style="font-size:14px; font-weight:700;">🎁 セット商品にする？</span>
-          <span class="badge" style="background:<%= setChip.bg %>; color:<%= setChip.fg %>;"><%= setDecisionText || 'まだ決めていません' %></span>
+          <span class="badge" style="background:var(--phd-bg-<%= setChip.bg.slice(1) %>, <%= setChip.bg %>); color:var(--phd-fg-<%= setChip.fg.slice(1) %>, <%= setChip.fg %>);"><%= setDecisionText || 'まだ決めていません' %></span>
           <% if (setDrafts.length) { %><span class="muted"><%= setDrafts.length %> 件作成済み</span><% } %>
         </div>
         <p class="muted" style="margin:6px 0 0; font-size:12px;">
@@ -686,7 +687,7 @@ th.attr-unknown { color: #dc2626; }
               「見直す」= 別の判断で上書き、「取り消す」= 判断そのものを白紙 (ひとつ前) に戻す %>
           <% if (setDec) { %>
             <button type="button" class="btn" id="set-decision-undo"
-                    style="font-size:13px; padding:10px 14px; color:#64748b;"
+                    style="font-size:13px; padding:10px 14px; color:var(--phd-fg-64748b, #64748b);"
                     <%= setStepEditable ? '' : 'disabled' %>>↩ この判断を取り消す</button>
           <% } %>
         </div>
@@ -702,7 +703,7 @@ th.attr-unknown { color: #dc2626; }
                 <tr>
                   <td><a href="/apps/product-hub/detail/<%= s.id %>"><%= s.name %></a></td>
                   <td style="width:180px;"><code style="font-size:11px;"><%= s.ne_code %></code>
-                    <% if (s.provisional_code === 1) { %><span style="color:#b45309; font-size:11px;">仮</span><% } %></td>
+                    <% if (s.provisional_code === 1) { %><span style="color:var(--phd-fg-b45309, #b45309); font-size:11px;">仮</span><% } %></td>
                   <td class="muted" style="width:200px; font-size:11px;"><%= s.members || '' %></td>
                   <td style="width:90px;"><span class="badge badge-<%= s.status %>"><%= statusLabels[s.status] || s.status %></span></td>
                 </tr>
@@ -712,7 +713,7 @@ th.attr-unknown { color: #dc2626; }
         <% } %>
         <%# 作成フォームは既定で畳んでおく (押してから中身を決める)。details の summary だと
             「作らない」ボタンと大きさが揃わないので、button + hidden の開閉にした %>
-        <div id="set-create-box" hidden style="margin-top:12px; padding-top:12px; border-top:1px dashed #cbd5e1;">
+        <div id="set-create-box" hidden style="margin-top:12px; padding-top:12px; border-top:1px dashed var(--phd-bd-cbd5e1, #cbd5e1);">
           <div style="font-size:13px; font-weight:600; margin-bottom:6px;">セットの中身を決める</div>
           <%# 構成は複数行で指定できる (§5.6)。既定は「この商品 × 2」= いちばん多い形。
               候補はこの商品と、バリエーションがあればその子SKU (混載セットの入口) %>
@@ -777,7 +778,7 @@ th.attr-unknown { color: #dc2626; }
       成分表示・原材料・内容量は実物を見ないと埋まらないので、ここに出して見ながら書けるようにする。
       現物が社内を通るのは入荷のときだけ = 撮り逃すと次の入荷まで取り返せない %>
   <% if (backLabelPhotos && backLabelPhotos.length) { %>
-    <div class="card" style="margin-bottom:16px; background:#fff7ed; border-color:#fed7aa;">
+    <div class="card" style="margin-bottom:16px; background:var(--phd-bg-fff7ed, #fff7ed); border-color:var(--phd-bd-fed7aa, #fed7aa);">
       <h2>📷 パッケージ裏面の写真 <span class="muted" style="font-weight:400; font-size:12px;">(入荷のときに撮ったもの・<%= backLabelPhotos.length %>枚)</span></h2>
       <p class="muted" style="margin:0 0 8px; font-size:12px;">
         成分表示・原材料・内容量など<b>実物を見ないと埋まらない項目</b>はここから読み取ってください。
@@ -789,7 +790,7 @@ th.attr-unknown { color: #dc2626; }
              title="<%= ph.product_id %> ・ <%= String(ph.created_at || '').slice(0, 16).replace('T', ' ') %>"
              style="display:block; width:132px;">
             <img src="/apps/product-hub/drafts/<%= draft.id %>/back-label/<%= ph.id %>" alt="パッケージ裏面" loading="lazy"
-                 style="width:132px; height:132px; object-fit:cover; border-radius:8px; border:1px solid #e2e8f0; background:#fff; display:block;">
+                 style="width:132px; height:132px; object-fit:cover; border-radius:8px; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); background:var(--phd-bg-fff, #fff); display:block;">
             <div class="muted" style="font-size:11px; margin-top:2px;">
               <%= ph.product_id %><% if (ph.status !== 'uploaded') { %> <span title="まだ Drive へ送っていません">⏳</span><% } %>
             </div>
@@ -823,7 +824,7 @@ th.attr-unknown { color: #dc2626; }
         <%# data-saved = 保存済みの値。簡易LPの定型文はこの値を入れる (選んでも読み直さないので画面で持つ — 2026-09-17)。
             保存中は data-saving=1、通信エラーで保存できたか分からないときは data-unknown=1 (定型文のコピーを止める) %>
         <select id="f-image-priority" data-saved="<%= draft.image_priority || '' %>"
-                style="width:auto; min-width:280px; border-radius:6px; <%= ipr ? `background:${ipr.bg}; color:${ipr.fg}; font-weight:600;` : '' %>">
+                style="width:auto; min-width:280px; border-radius:6px; <%= ipr ? `--pri-bg:${ipr.bg}; --pri-fg:${ipr.fg}; font-weight:600;` : '' %>">
           <option value="">未設定</option>
           <% for (const p of imagePriorities) { %>
             <option value="<%= p.value %>" <%= draft.image_priority === p.value ? 'selected' : '' %>><%= p.value %></option>
@@ -934,7 +935,7 @@ th.attr-unknown { color: #dc2626; }
       </div>
       <!-- 配送・納期。売価とセットで見たい (利益に効く) ため基本情報タブに配置 (2026-07-29 中原さん要望)。
            保存は下の「基本情報を保存」で出品情報 (/rakuten) にも書き込まれる -->
-      <div class="field" style="display:flex; gap:12px; flex-wrap:wrap; background:#f8fafc; border-radius:8px; padding:10px 12px;">
+      <div class="field" style="display:flex; gap:12px; flex-wrap:wrap; background:var(--phd-bg-f8fafc, #f8fafc); border-radius:8px; padding:10px 12px;">
         <div style="flex:1; min-width:160px;">
           <label>配送方法 <span class="muted">(楽天の配送方法グループ)</span><span class="ftag ftag-m">手入力</span></label>
           <select id="rk-shipping-group" style="width:100%;">
@@ -971,18 +972,18 @@ th.attr-unknown { color: #dc2626; }
                 違うものにするならここで選んでください。
               </div>
             <% } else if (setInfo) { %>
-              <div style="font-size:11px; margin-top:4px; color:#b45309;">
+              <div style="font-size:11px; margin-top:4px; color:var(--phd-fg-b45309, #b45309);">
                 配送方法が決まりません（このままでは出品できません）。NE に本コードが載るのを待つか、ここで選んでください。
               </div>
             <% } else if (neShipping.group) { %>
               <div style="font-size:11px; margin-top:4px;">
-                <span style="color:#b45309;">未選択です（このままでは出品できません）。</span>
+                <span style="color:var(--phd-fg-b45309, #b45309);">未選択です（このままでは出品できません）。</span>
                 NE は「<%= neCost?.shippingMethod %>」→
                 <button type="button" class="btn btn-sm" id="rk-ship-use-ne"
                         data-group="<%= neShipping.group %>">これにする</button>
               </div>
             <% } else { %>
-              <div style="font-size:11px; margin-top:4px; color:#b45309;">
+              <div style="font-size:11px; margin-top:4px; color:var(--phd-fg-b45309, #b45309);">
                 未選択です（このままでは出品できません）。NE にも配送方法が入っていないので、ここで選んでください。
               </div>
             <% } %>
@@ -990,7 +991,7 @@ th.attr-unknown { color: #dc2626; }
           <%# セットは配送方法をコピーしていない (§5.3)。個数で箱もサイズも変わるため。
               NE に本コードが載れば、単品と同じ「NEから自動選択」に乗る %>
           <% if (setInfo && !rakuten?.shipping_method_group && !neShipping.group) { %>
-            <div style="font-size:11px; color:#b45309;">
+            <div style="font-size:11px; color:var(--phd-fg-b45309, #b45309);">
               NE確定待ち — 親の配送方法は<%= setInfo.parent ? `「${setInfo.parent.name}」の` : '' %>ものですが、
               個数で箱もサイズも変わるためコピーしていません。ネクストエンジンに本コードが載ると自動で選ばれます
               （それまでは手で選んでも構いません）。
@@ -1006,7 +1007,7 @@ th.attr-unknown { color: #dc2626; }
                送料別は誤操作防止のためリンク→confirm 経由でのみ選べる (中原さん指示 2026-08-01) -->
           <% const postageIsOther = rakuten?.postage_included === 0; %>
           <div id="rk-postage-fixed" style="<%= postageIsOther ? 'display:none;' : '' %>">
-            <div style="padding:7px 10px; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; font-size:13px;">送料込み <span class="muted">(全商品共通)</span></div>
+            <div style="padding:7px 10px; background:var(--phd-bg-f0fdf4, #f0fdf4); border:1px solid var(--phd-bd-bbf7d0, #bbf7d0); border-radius:6px; font-size:13px;">送料込み <span class="muted">(全商品共通)</span></div>
             <a href="#" id="rk-postage-unlock" class="muted" style="font-size:11px;">送料別にする (特殊なケースのみ)</a>
           </div>
           <select id="rk-postage" style="width:100%; <%= postageIsOther ? '' : 'display:none;' %>">
@@ -1023,7 +1024,7 @@ th.attr-unknown { color: #dc2626; }
             const deliveryIsCustom = deliveryVal !== DELIVERY_DEFAULT_ID;
           %>
           <div id="rk-delivery-fixed" style="<%= deliveryIsCustom ? 'display:none;' : '' %>">
-            <div style="padding:7px 10px; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; font-size:13px;">12時までの注文で当日発送 <span class="muted">(ID: 4)</span></div>
+            <div style="padding:7px 10px; background:var(--phd-bg-f0fdf4, #f0fdf4); border:1px solid var(--phd-bd-bbf7d0, #bbf7d0); border-radius:6px; font-size:13px;">12時までの注文で当日発送 <span class="muted">(ID: 4)</span></div>
             <a href="#" id="rk-delivery-unlock" class="muted" style="font-size:11px;">別の納期IDにする (特殊なケースのみ)</a>
           </div>
           <input type="text" id="rk-delivery-date" inputmode="numeric" value="<%= deliveryVal %>"
@@ -1095,7 +1096,7 @@ th.attr-unknown { color: #dc2626; }
     <% if (locals.cdbGroup) { const cg = locals.cdbGroup; %>
     <!-- 🆕 まとまり (色違い・サイズ違い) のカード (Company DB構想 20 v7 §⑤・PR-4)。NE に入る前は Company DB の子の一覧が暫定の正本。
          NE の写し待ち・2 軸のまとまりは楽天への出品を止めている (サーバー側の門 = 画面の表示だけではない) -->
-    <div class="card" id="cdb-group-card" style="border-color:#ddd6fe; background:#faf8ff;" data-state="<%= cg.state %>">
+    <div class="card" id="cdb-group-card" style="border-color:var(--phd-bd-ddd6fe, #ddd6fe); background:var(--phd-bg-faf8ff, #faf8ff);" data-state="<%= cg.state %>">
       <h2>🧩 Company DB のまとまり <span class="muted" style="font-weight:400">(<%= cg.code %>・revision <%= cg.revision %>)</span></h2>
       <div style="font-size:13px; margin-bottom:8px;">
         <strong id="cdb-group-state"><%= cg.label %></strong>
@@ -1111,7 +1112,7 @@ th.attr-unknown { color: #dc2626; }
         <% } %>
       </div>
       <% if (cg.attention) { %>
-        <div id="cdb-group-attention" style="font-size:13px; border:1px solid #fdba74; background:#fff7ed; border-radius:8px; padding:8px 10px; margin-bottom:8px;">
+        <div id="cdb-group-attention" style="font-size:13px; border:1px solid var(--phd-bd-fdba74, #fdba74); background:var(--phd-bg-fff7ed, #fff7ed); border-radius:8px; padding:8px 10px; margin-bottom:8px;">
           ⚠ 要確認: <span id="cdb-group-attention-text"><%= cg.attention %></span>
           <div class="muted">社内の値が変わっても、モールの出品は自動で変えていません。楽天のページを確かめてから押してください。</div>
           <button type="button" class="btn" id="cdb-group-ack-btn" data-expected="<%= cg.attention %>">確かめた</button>
@@ -1138,7 +1139,7 @@ th.attr-unknown { color: #dc2626; }
     </div>
     <% } %>
     <!-- バリエーション (NE の代表商品コードで判定。NE が正・DBには焼かない) -->
-    <div class="card" style="border-color:#bae6fd; background:#f8fdff;">
+    <div class="card" style="border-color:var(--phd-bd-bae6fd, #bae6fd); background:var(--phd-bg-f8fdff, #f8fdff);">
       <h2>🗄️ NE商品マスタから自動取得 <span class="muted" style="font-weight:400">(バリエーション判定)</span></h2>
       <p class="muted" style="margin-top:-6px">
         入力不要です。ネクストエンジンの代表商品コードから自動で判定しています。
@@ -1200,7 +1201,7 @@ th.attr-unknown { color: #dc2626; }
                 <% const isSelf = String(m.商品コード || '').trim().toLowerCase() === String(draft.ne_code || '').trim().toLowerCase(); %>
                 <% const mKey = String(m.商品コード || '').trim().toLowerCase(); %>
                 <% const mCost = skuCostBy[mKey] || null; %>
-                <tr<%= isSelf ? ' style="background:#eff6ff"' : '' %>>
+                <tr<%= isSelf ? ' style="background:var(--phd-bg-eff6ff, #eff6ff)"' : '' %>>
                   <td><code style="font-size:12px"><%= m.商品コード %></code></td>
                   <td><%= m.商品名 || '' %></td>
                   <td class="muted"><%= m.取扱区分 || '' %></td>
@@ -1239,7 +1240,7 @@ th.attr-unknown { color: #dc2626; }
         </details>
         <% if (variation.excludedMembers.length > 0) { %>
           <details style="margin-top:10px;">
-            <summary style="cursor:pointer; font-size:13px; font-weight:600; color:#b45309;">
+            <summary style="cursor:pointer; font-size:13px; font-weight:600; color:var(--phd-fg-b45309, #b45309);">
               このページから外したSKU (<%= variation.excludedMembers.length %>件)
             </summary>
             <p class="muted" style="margin:8px 0 0;">
@@ -1256,7 +1257,7 @@ th.attr-unknown { color: #dc2626; }
                       <% if (m.ownDraftId) { %>
                         <a href="/apps/product-hub/detail/<%= m.ownDraftId %>">単独ページ #<%= m.ownDraftId %></a>
                       <% } else { %>
-                        <span style="color:#b45309" title="このSKUはどの楽天ページにも載りません">未割当</span>
+                        <span style="color:var(--phd-fg-b45309, #b45309)" title="このSKUはどの楽天ページにも載りません">未割当</span>
                       <% } %>
                     </td>
                     <td style="width:70px"><button class="btn btn-sm restore-sku-btn" data-code="<%= m.商品コード %>">戻す</button></td>
@@ -1362,7 +1363,7 @@ th.attr-unknown { color: #dc2626; }
       (2026-09-04 §4.7 中原さん: 「単品の詳細画像で何枚目を修正、みたいな形で指示を送れるように」)。
       全部「そのまま使う」なら制作は要らないので、画像の工程は自動で「対象外」になる %>
   <% if (setInfo && setImagePlans.length) { %>
-    <div class="card" style="margin-bottom:16px; background:#faf5ff; border-color:#ddd6fe;">
+    <div class="card" style="margin-bottom:16px; background:var(--phd-bg-faf5ff, #faf5ff); border-color:var(--phd-bd-ddd6fe, #ddd6fe);">
       <h2>🎁 親の画像をどう使うか<span class="muted" style="font-weight:400; font-size:12px;">（枠ごとに決める）</span></h2>
       <p class="muted" style="margin:0 0 8px; font-size:12px;">
         「そのまま使う」枠は親の画像がここにコピーされています。1つでも「直して使う／作り直す」にすると、
@@ -1379,7 +1380,7 @@ th.attr-unknown { color: #dc2626; }
                 <% if (pl.parent_drive_file_id) { %>
                   <a href="<%= fileViewUrl(pl.parent_drive_file_id) %>" target="_blank" rel="noopener">
                     <img src="<%= thumbnailUrl(pl.parent_drive_file_id, 160) %>" alt="<%= pl.label %>"
-                         style="width:56px; height:56px; object-fit:contain; background:#fff; border:1px solid #e2e8f0; border-radius:4px;">
+                         style="width:56px; height:56px; object-fit:contain; background:var(--phd-bg-fff, #fff); border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:4px;">
                   </a>
                 <% } else { %><span class="muted">—</span><% } %>
               </td>
@@ -1407,7 +1408,7 @@ th.attr-unknown { color: #dc2626; }
   <% } %>
   <%# 制作の依頼に載る指示 (§4.7)。依頼を受ける人がここだけ見れば何を作るか分かるようにする %>
   <% if (setInfo && setImageInstructions.length) { %>
-    <div class="card" style="margin-bottom:16px; background:#fffbeb; border-color:#fcd34d;">
+    <div class="card" style="margin-bottom:16px; background:var(--phd-bg-fffbeb, #fffbeb); border-color:var(--phd-bd-fcd34d, #fcd34d);">
       <h2>🎨 この画像を作ってください<span class="muted" style="font-weight:400; font-size:12px;">（制作の依頼に載る内容）</span></h2>
       <ul style="margin:0; padding-left:18px; font-size:13px;">
         <% for (const ins of setImageInstructions) { %>
@@ -1460,15 +1461,15 @@ th.attr-unknown { color: #dc2626; }
     <!-- スロットグリッド: 白抜き (00) + 楽天の登録口20個 (枠1 = _top) -->
     <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(104px, 1fr)); gap:10px;">
       <div style="text-align:center;">
-        <div style="font-size:11px; color:#64748b; margin-bottom:2px;">00 白抜き</div>
+        <div style="font-size:11px; color:var(--phd-fg-64748b, #64748b); margin-bottom:2px;">00 白抜き</div>
         <% if (rakuten?.white_bg_drive_file_id) { %>
           <a href="<%= fileViewUrl(rakuten.white_bg_drive_file_id) %>" target="_blank" rel="noopener">
             <img src="<%= thumbnailUrl(rakuten.white_bg_drive_file_id, 320, rakuten.white_bg_modified_time) %>" alt="" loading="lazy" referrerpolicy="no-referrer"
-                 style="width:100%; aspect-ratio:1; object-fit:cover; border-radius:8px; border:2px solid #c7d2fe; background:#f8fafc;">
+                 style="width:100%; aspect-ratio:1; object-fit:cover; border-radius:8px; border:2px solid var(--phd-bd-c7d2fe, #c7d2fe); background:var(--phd-bg-f8fafc, #f8fafc);">
           </a>
           <div style="font-size:11px;"><%= whiteBgTransferred ? '✅ 転送済み' : '⏳ 未転送' %></div>
         <% } else { %>
-          <div style="width:100%; aspect-ratio:1; border:2px dashed #cbd5e1; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:11px;">未設定</div>
+          <div style="width:100%; aspect-ratio:1; border:2px dashed var(--phd-bd-cbd5e1, #cbd5e1); border-radius:8px; display:flex; align-items:center; justify-content:center; color:var(--phd-fg-94a3b8, #94a3b8); font-size:11px;">未設定</div>
         <% } %>
         <%# 受信箱から選ぶ (2026-09-14 中原さん要望): 仕入先 (0001) からメールで届いた白抜き画像を
             1 枚選んで「商品コード_00」に登録し、商品の画像フォルダへ移動する (受信箱から消える)。
@@ -1487,19 +1488,19 @@ th.attr-unknown { color: #dc2626; }
         <div style="text-align:center;">
           <%# ファイル名は取り込み時に記録した source_label があるときだけ出す。
               旧データ (NULL) は枠との対応が新仕様と違うため断定しない (Codex medium) %>
-          <div style="font-size:11px; color:<%= over ? '#dc2626' : '#64748b' %>; margin-bottom:2px;"><%= i + 1 %><%= i === 0 ? ' TOP' : '' %>
+          <div style="font-size:11px; color:<%= over ? 'var(--phd-fg-dc2626, #dc2626)' : 'var(--phd-fg-64748b, #64748b)' %>; margin-bottom:2px;"><%= i + 1 %><%= i === 0 ? ' TOP' : '' %>
             <% if (img && img.source_label) { %><span class="muted">(<%= img.source_label %>)</span><% } %><%= over ? ' ⚠上限超え' : '' %></div>
           <% if (img) { %>
             <a href="<%= img.view_url %>" target="_blank" rel="noopener">
               <img src="<%= img.thumb %>" alt="" loading="lazy" referrerpolicy="no-referrer"
-                   style="width:100%; aspect-ratio:1; object-fit:cover; border-radius:8px; border:1px solid <%= over ? '#fca5a5' : '#e2e8f0' %>; background:#f8fafc;">
+                   style="width:100%; aspect-ratio:1; object-fit:cover; border-radius:8px; border:1px solid <%= over ? 'var(--phd-bd-fca5a5, #fca5a5)' : 'var(--phd-bd-e2e8f0, #e2e8f0)' %>; background:var(--phd-bg-f8fafc, #f8fafc);">
             </a>
             <div style="font-size:11px; display:flex; gap:4px; align-items:center; justify-content:center;">
               <span><%= transferredIds.has(img.drive_file_id) ? '✅' : '⏳' %></span>
               <button class="btn btn-sm btn-danger del-image-btn" data-id="<%= img.id %>">削除</button>
             </div>
           <% } else { %>
-            <div style="width:100%; aspect-ratio:1; border:2px dashed #e2e8f0; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-size:16px;">＋</div>
+            <div style="width:100%; aspect-ratio:1; border:2px dashed var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; display:flex; align-items:center; justify-content:center; color:var(--phd-fg-cbd5e1, #cbd5e1); font-size:16px;">＋</div>
           <% } %>
         </div>
       <% } %>
@@ -1509,16 +1510,16 @@ th.attr-unknown { color: #dc2626; }
     <style>
       .wb-modal { display:none; position:fixed; inset:0; background:rgba(15,23,42,.55); z-index:1000; align-items:center; justify-content:center; padding:16px; }
       .wb-modal.open { display:flex; }
-      .wb-modal-box { background:#fff; border-radius:12px; width:min(960px, 100%); max-height:90vh; display:flex; flex-direction:column; box-shadow:0 20px 60px rgba(0,0,0,.3); }
-      .wb-modal-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; padding:14px 16px 10px; border-bottom:1px solid #e2e8f0; }
+      .wb-modal-box { background:var(--phd-bg-fff, #fff); border-radius:12px; width:min(960px, 100%); max-height:90vh; display:flex; flex-direction:column; box-shadow:0 20px 60px rgba(0,0,0,.3); }
+      .wb-modal-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; padding:14px 16px 10px; border-bottom:1px solid var(--phd-bd-e2e8f0, #e2e8f0); }
       .wb-modal-body { padding:10px 16px 16px; overflow:auto; }
       .wb-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:10px; margin-top:8px; }
-      .wb-item { text-align:left; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:6px; cursor:pointer; font:inherit; color:inherit; }
-      .wb-item:hover { border-color:#2563eb; background:#eff6ff; }
+      .wb-item { text-align:left; background:var(--phd-bg-f8fafc, #f8fafc); border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; padding:6px; cursor:pointer; font:inherit; color:inherit; }
+      .wb-item:hover { border-color:var(--phd-bd-2563eb, #2563eb); background:var(--phd-bg-eff6ff, #eff6ff); }
       .wb-item:disabled { opacity:.5; cursor:wait; }
-      .wb-item img { width:100%; aspect-ratio:1; object-fit:contain; background:#fff; border-radius:6px; display:block; }
+      .wb-item img { width:100%; aspect-ratio:1; object-fit:contain; background:var(--phd-bg-fff, #fff); border-radius:6px; display:block; }
       .wb-item .wb-name { font-size:12px; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-      .wb-item .wb-reg { font-size:11px; color:#b45309; }
+      .wb-item .wb-reg { font-size:11px; color:var(--phd-fg-b45309, #b45309); }
     </style>
     <div class="wb-modal" id="wb-inbox-modal" role="dialog" aria-modal="true" aria-labelledby="wb-inbox-title">
       <div class="wb-modal-box">
@@ -1554,7 +1555,7 @@ th.attr-unknown { color: #dc2626; }
         <% for (const b of trailingBanners) { %>
           <div style="text-align:center; width:110px;">
             <img src="<%= b.url %>" alt="" loading="lazy" referrerpolicy="no-referrer"
-                 style="width:100%; aspect-ratio:1; object-fit:contain; border-radius:8px; border:1px solid #e2e8f0; background:#f8fafc;">
+                 style="width:100%; aspect-ratio:1; object-fit:contain; border-radius:8px; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); background:var(--phd-bg-f8fafc, #f8fafc);">
             <div class="muted" style="font-size:11px;"><%= b.label %></div>
           </div>
         <% } %>
@@ -1569,7 +1570,7 @@ th.attr-unknown { color: #dc2626; }
         保存された画像を取り込み → R-Cabinet転送 → 楽天ページの variants[sku].images へ PATCH %>
     <% if (variation.kind === 'variation' && variation.members.length > 0) { %>
       <% const skuImgBySku = new Map(skuImages.map((r) => [r.sku_code, r])); %>
-      <div class="field" style="margin-top:16px; border-top:1px dashed #e2e8f0; padding-top:12px;">
+      <div class="field" style="margin-top:16px; border-top:1px dashed var(--phd-bd-e2e8f0, #e2e8f0); padding-top:12px;">
         <label>SKU画像 <span class="muted">(SKU選択時に切り替わる画像。楽天ページ登録後に紐づけ)</span></label>
         <div class="muted" style="font-size:11px; margin-bottom:6px;">
           画像フォルダに <b>SKUコード名</b> (例: <code><%= String(variation.members[0]?.商品コード || 'sku-code').toLowerCase() %>.jpg</code>) で保存 →
@@ -1584,12 +1585,12 @@ th.attr-unknown { color: #dc2626; }
                 <td><code><%= sku %></code></td>
                 <td class="muted" style="max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= m.商品名 || '' %></td>
                 <td><% if (r) { %><img src="<%= thumbnailUrl(r.drive_file_id, 160, r.drive_modified_time) %>" alt="" loading="lazy"
-                       style="width:56px; height:56px; object-fit:contain; border:1px solid #e2e8f0; border-radius:6px; background:#fff;"><% } else { %><span class="muted">—</span><% } %></td>
+                       style="width:56px; height:56px; object-fit:contain; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:6px; background:var(--phd-bg-fff, #fff);"><% } else { %><span class="muted">—</span><% } %></td>
                 <td>
                   <% if (!r) { %><span class="muted">未取込 (フォルダに <%= sku %>.jpg 等を置いて「フォルダから自動セット」)</span>
-                  <% } else if (r.synced_at) { %><span style="color:#166534;">🔗 楽天へ反映済み (<%= r.synced_at.replace('T',' ').slice(0,16) %>)</span>
-                  <% } else if (r.cabinet_location) { %><span style="color:#166534;">✅ 転送済み</span> <span class="muted">(未紐づけ)</span>
-                  <% } else { %><span style="color:#b45309;">⏳ 未転送</span><% } %>
+                  <% } else if (r.synced_at) { %><span style="color:var(--phd-fg-166534, #166534);">🔗 楽天へ反映済み (<%= r.synced_at.replace('T',' ').slice(0,16) %>)</span>
+                  <% } else if (r.cabinet_location) { %><span style="color:var(--phd-fg-166534, #166534);">✅ 転送済み</span> <span class="muted">(未紐づけ)</span>
+                  <% } else { %><span style="color:var(--phd-fg-b45309, #b45309);">⏳ 未転送</span><% } %>
                 </td>
               </tr>
             <% } %>
@@ -1627,7 +1628,7 @@ th.attr-unknown { color: #dc2626; }
           簡易LPを作る) と広げてきた。サーバ (image-production / image-hold API) も重要度では弾かない %>
         <% const ip = imageProduction || {}; %>
         <%# 画像制作だけの保留 (2026-08-26 中原さん決定)。商品の本流は止めず、画像トラックと楽天出品ゲートだけ閉じる %>
-        <div class="field" style="padding:8px 10px; border-radius:8px; background:<%= ip.workflow_state === 'on_hold' ? '#fef3c7' : '#f8fafc' %>; border:1px solid <%= ip.workflow_state === 'on_hold' ? '#f59e0b' : '#e2e8f0' %>;">
+        <div class="field" style="padding:8px 10px; border-radius:8px; background:<%= ip.workflow_state === 'on_hold' ? 'var(--phd-bg-fef3c7, #fef3c7)' : 'var(--phd-bg-f8fafc, #f8fafc)' %>; border:1px solid <%= ip.workflow_state === 'on_hold' ? 'var(--phd-bd-f59e0b, #f59e0b)' : 'var(--phd-bd-e2e8f0, #e2e8f0)' %>;">
           <% if (ip.workflow_state === 'on_hold') { %>
             <strong>⏸ 画像制作は保留中</strong><% if (ip.hold_note) { %> <span class="muted">(<%= ip.hold_note %>)</span><% } %>
             <span class="muted"> — 商品の工程は進みますが、画像トラックと楽天出品は止まります</span>
@@ -1644,25 +1645,25 @@ th.attr-unknown { color: #dc2626; }
         <%# 撮影判定より前から指示書の URL が入っている商品もある。見えなくなると直せないので、そのときも出す %>
         <% const ipfShowShoot = ipfNeedsShoot || String(ip.camera_instruction_url || '').trim() !== ''; %>
         <style>
-          .ipf-step { margin-top:12px; padding-top:10px; border-top:1px solid #e2e8f0; }
+          .ipf-step { margin-top:12px; padding-top:10px; border-top:1px solid var(--phd-bd-e2e8f0, #e2e8f0); }
           .ipf-h { display:flex; align-items:center; gap:8px; font-size:15px; margin:0 0 8px; }
-          .ipf-no { display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:50%; background:#1e293b; color:#fff; font-size:12px; }
+          .ipf-no { display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:50%; background:var(--phd-bg-1e293b, #1e293b); color:var(--phd-fg-fff, #fff); font-size:12px; }
           .ipf-seg { display:flex; gap:6px; flex-wrap:wrap; }
-          .ipf-seg-btn { flex:1; min-width:120px; display:flex; flex-direction:column; align-items:flex-start; gap:2px; padding:8px 10px; border:1px solid #cbd5e1; border-radius:8px; background:#fff; cursor:pointer; text-align:left; }
-          .ipf-seg-btn.on { border-color:#2563eb; background:#eff6ff; box-shadow:0 0 0 1px #2563eb inset; }
+          .ipf-seg-btn { flex:1; min-width:120px; display:flex; flex-direction:column; align-items:flex-start; gap:2px; padding:8px 10px; border:1px solid var(--phd-bd-cbd5e1, #cbd5e1); border-radius:8px; background:var(--phd-bg-fff, #fff); cursor:pointer; text-align:left; }
+          .ipf-seg-btn.on { border-color:var(--phd-bd-2563eb, #2563eb); background:var(--phd-bg-eff6ff, #eff6ff); box-shadow:0 0 0 1px var(--phd-bd-2563eb, #2563eb) inset; }
           .ipf-seg-btn .muted { font-size:11px; }
           /* AI のおすすめの札 (PR-C)。hidden 属性を display で上書きしないよう [hidden] を明示する */
-          .ipf-rec { display:inline-block; margin-top:2px; font-size:10px; font-weight:700; color:#fff; background:#16a34a; border-radius:999px; padding:1px 7px; }
-          .ipf-rec-box { margin-top:6px; padding:6px 8px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0; font-size:12px; display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap; }
-          .ipf-rec-box.none { background:#f8fafc; border-color:#e2e8f0; color:#64748b; }
+          .ipf-rec { display:inline-block; margin-top:2px; font-size:10px; font-weight:700; color:var(--phd-fg-fff, #fff); background:var(--phd-bg-16a34a, #16a34a); border-radius:999px; padding:1px 7px; }
+          .ipf-rec-box { margin-top:6px; padding:6px 8px; border-radius:8px; background:var(--phd-bg-f0fdf4, #f0fdf4); border:1px solid var(--phd-bd-bbf7d0, #bbf7d0); font-size:12px; display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap; }
+          .ipf-rec-box.none { background:var(--phd-bg-f8fafc, #f8fafc); border-color:var(--phd-bd-e2e8f0, #e2e8f0); color:var(--phd-fg-64748b, #64748b); }
           .ipf-rec[hidden], .ipf-rec-box[hidden], .ipf-rec-box [hidden] { display:none; }
-          .ipf-more { margin:10px 0; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#f8fafc; }
-          .ipf-more > summary { cursor:pointer; color:#475569; font-size:13px; }
+          .ipf-more { margin:10px 0; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; padding:6px 10px; background:var(--phd-bg-f8fafc, #f8fafc); }
+          .ipf-more > summary { cursor:pointer; color:var(--phd-fg-475569, #475569); font-size:13px; }
         </style>
         <section class="ipf-step" id="ipf-step-info">
         <h3 class="ipf-h"><span class="ipf-no">1</span>商品情報</h3>
         <%# 画像工程 v2 (2026-08-26): 1.5 商品情報 (手入力) と ChatGPT 用の定型文ボタン %>
-        <div class="field" style="padding:8px 10px; border-radius:8px; background:#f0f9ff; border:1px solid #bae6fd;">
+        <div class="field" style="padding:8px 10px; border-radius:8px; background:var(--phd-bg-f0f9ff, #f0f9ff); border:1px solid var(--phd-bd-bae6fd, #bae6fd);">
           <label>商品情報 <span class="muted" style="font-weight:400">(商品説明タブの説明文から自動で入ります。直して保存するとそちらが優先。下の定型文の材料)</span></label>
           <%# 2026-09-13 スタッフ要望: 説明文とカラバリをコピペしていたので自動で出す (lib/product-info-auto.js)。
               手入力が保存されていればそれ、無ければ自動。data-auto=1 の間は触らずに保存しても手入力として
@@ -1680,7 +1681,7 @@ th.attr-unknown { color: #dc2626; }
             <% } %>
           </div>
           <label style="margin-top:10px;">カラバリ <span class="muted" style="font-weight:400">(基本情報タブの SKU から自動。定型文にも入ります)</span></label>
-          <pre id="ip-color-variations" style="margin:0; padding:6px 8px; background:#fff; border:1px solid #e2e8f0; border-radius:6px; font-size:12px; white-space:pre-wrap;"><%= colorVariationsText %></pre>
+          <pre id="ip-color-variations" style="margin:0; padding:6px 8px; background:var(--phd-bg-fff, #fff); border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:6px; font-size:12px; white-space:pre-wrap;"><%= colorVariationsText %></pre>
           <%# 裏面情報 (2026-09-10 スタッフ要望)。パッケージ裏面を撮って AI に文字起こしさせた文章の置き場。
               **任意** (裏面表記が要らない商品もある) なので工程の完了条件には入れない %>
           <label style="margin-top:10px;">裏面情報 <span class="muted" style="font-weight:400">(任意。パッケージ裏面をそのまま貼り付ける。下の定型文の材料)</span></label>
@@ -1690,7 +1691,7 @@ th.attr-unknown { color: #dc2626; }
               <% backLabelPhotos.forEach(function (ph) { %>
                 <a href="/apps/product-hub/drafts/<%= draft.id %>/back-label/<%= ph.id %>" target="_blank" rel="noopener" title="クリックで拡大">
                   <img src="/apps/product-hub/drafts/<%= draft.id %>/back-label/<%= ph.id %>" alt="パッケージ裏面" loading="lazy"
-                       style="width:72px; height:72px; object-fit:cover; border-radius:6px; border:1px solid #e2e8f0; background:#fff; display:block;">
+                       style="width:72px; height:72px; object-fit:cover; border-radius:6px; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); background:var(--phd-bg-fff, #fff); display:block;">
                 </a>
               <% }); %>
               <div style="flex:1; min-width:220px;">
@@ -1724,7 +1725,7 @@ th.attr-unknown { color: #dc2626; }
               押す = キューに積むだけ。書き戻した構成は**ここに出るだけ**で、
               人がコピーして lp-tool に貼るところまでは変わらない %>
           <% if (lpCompose.enabled) { %>
-          <div id="lpc" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;"
+          <div id="lpc" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:var(--phd-bg-f8fafc, #f8fafc); border:1px solid var(--phd-bd-e2e8f0, #e2e8f0);"
                data-draft-id="<%= draft.id %>" data-ne-code="<%= draft.ne_code || '' %>" data-name="<%= draft.name || '' %>">
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
               <%# モデル名をボタンに出す (2026-10-02 中原さん)。決める場所は Render の PH_LP_COMPOSE_MODEL だけ %>
@@ -1737,7 +1738,7 @@ th.attr-unknown { color: #dc2626; }
             <div class="muted" id="lpc-images" style="font-size:11px; margin-top:2px;"></div>
             <%# 添付画像の説明 = AI に渡したのと同じ文。くらべっこ (測定) を公平にするため、スタッフの ChatGPT 版にも貼る
                 (codex #1593 High・中原さん 2026-10-03「A」) %>
-            <div id="lpc-guide" hidden style="margin-top:6px; background:#fff; border:1px dashed #cbd5e1; border-radius:8px; padding:6px 8px;">
+            <div id="lpc-guide" hidden style="margin-top:6px; background:var(--phd-bg-fff, #fff); border:1px dashed var(--phd-bd-cbd5e1, #cbd5e1); border-radius:8px; padding:6px 8px;">
               <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                 <strong style="font-size:12px;">ChatGPT 版に貼る文 (添付画像の説明)</strong>
                 <button type="button" class="btn btn-sm" id="lpc-guide-copy">コピー</button>
@@ -1750,10 +1751,10 @@ th.attr-unknown { color: #dc2626; }
             </div>
             <%# 🚨 失敗したときの説明はここ。lint の中身 (lpc-lint) は「できた」ときの箱の中にあるので、
                 失敗したときは見えない (codex exec review P2) %>
-            <div id="lpc-fail" hidden class="muted" style="font-size:11px; margin-top:4px; color:#b45309;"></div>
+            <div id="lpc-fail" hidden class="muted" style="font-size:11px; margin-top:4px; color:var(--phd-fg-b45309, #b45309);"></div>
             <%# チェック (Codex 検品など) を通らなかった構成 (参考)。捨てずに出して、使えるかは人が決める
                 (2026-10-04 中原さん「A」: 段階1 は AI と人のくらべっこなので、落ちた構成も比べる材料) %>
-            <div id="lpc-draft" hidden style="margin-top:8px; background:#fffbeb; border:1px solid #fcd34d; border-radius:8px; padding:8px;">
+            <div id="lpc-draft" hidden style="margin-top:8px; background:var(--phd-bg-fffbeb, #fffbeb); border:1px solid var(--phd-bd-fcd34d, #fcd34d); border-radius:8px; padding:8px;">
               <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:4px;">
                 <strong style="font-size:13px;">⚠️ チェックを通らなかった構成 (参考)</strong>
                 <button type="button" class="btn btn-sm" id="lpc-draft-copy">コピー</button>
@@ -1762,13 +1763,13 @@ th.attr-unknown { color: #dc2626; }
               <div class="muted" style="font-size:11px; margin-bottom:4px;">
                 AI は最後まで書きましたが、チェック役に指摘が残りました。下の「指摘されたこと」を読んで、使えるかどうかを決めてください
               </div>
-              <div id="lpc-draft-reason" style="font-size:12px; white-space:pre-wrap; background:#fff; border:1px solid #fde68a; border-radius:6px; padding:6px; margin-bottom:6px;"></div>
+              <div id="lpc-draft-reason" style="font-size:12px; white-space:pre-wrap; background:var(--phd-bg-fff, #fff); border:1px solid var(--phd-bd-fde68a, #fde68a); border-radius:6px; padding:6px; margin-bottom:6px;"></div>
               <textarea id="lpc-draft-text" rows="12" readonly style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
             </div>
             <%# 測定台帳 (設計 §7.1b) に書き写す値。画面は作らない方針なので、
                 台帳に要る「機械が知っている事実」だけをここに並べる %>
             <div id="lpc-meas" hidden class="muted" style="font-size:11px; margin-top:4px; font-family:ui-monospace, monospace; word-break:break-all;"></div>
-            <div id="lpc-result" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
+            <div id="lpc-result" hidden style="margin-top:8px; background:var(--phd-bg-fff, #fff); border:1px solid var(--phd-bd-cbd5e1, #cbd5e1); border-radius:8px; padding:8px;">
               <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px;">
                 <strong style="font-size:13px;" id="lpc-result-title">AI が作った構成 (⑦ AI画像生成プロンプト)</strong>
                 <button type="button" class="btn btn-primary btn-sm" id="lpc-copy">コピー</button>
@@ -1779,7 +1780,7 @@ th.attr-unknown { color: #dc2626; }
               <%# 人が直した版 (下の「LP構成」で保存したもの)・作り直しの前の構成を出しているときの知らせ (PR-B)。
                   AI の初稿 (直す前) は消さずに残っているので、測定 (くらべっこ) 用にコピーできる。
                   🚨 hidden を付ける要素に display を直に書かない (書くと hidden が効かずに出っぱなしになる) %>
-              <div id="lpc-edited" hidden style="font-size:11px; margin-bottom:6px; color:#1d4ed8;">
+              <div id="lpc-edited" hidden style="font-size:11px; margin-bottom:6px; color:var(--phd-fg-1d4ed8, #1d4ed8);">
                 <span id="lpc-edited-note"></span>
                 <button type="button" class="btn btn-sm" id="lpc-copy-ai" hidden>AI の初稿をコピー (測定用)</button>
                 <span class="muted" id="lpc-copy-ai-result"></span>
@@ -1800,27 +1801,27 @@ th.attr-unknown { color: #dc2626; }
               構成がまだ無いときは隠しておき、AI の構成ができたら JS が読み込んで出す %>
           <% if (typeof lpEdit !== 'undefined' && lpEdit) { %>
           <style>
-            .lpe-head { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:12px; color:#475569; margin-bottom:6px; }
-            .lpe-slot { border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin:4px 0; }
-            .lpe-slot.fixed { background:#f8fafc; }
+            .lpe-head { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:12px; color:var(--phd-fg-475569, #475569); margin-bottom:6px; }
+            .lpe-slot { border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; background:var(--phd-bg-fff, #fff); margin:4px 0; }
+            .lpe-slot.fixed { background:var(--phd-bg-f8fafc, #f8fafc); }
             .lpe-slot > summary { display:flex; gap:8px; align-items:center; padding:6px 8px; cursor:pointer; list-style:none; }
             .lpe-slot > summary::-webkit-details-marker { display:none; }
-            .lpe-no { min-width:44px; font-weight:700; font-size:12px; color:#1e293b; }
-            .lpe-role { font-size:11px; color:#64748b; max-width:30%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+            .lpe-no { min-width:44px; font-weight:700; font-size:12px; color:var(--phd-fg-1e293b, #1e293b); }
+            .lpe-role { font-size:11px; color:var(--phd-fg-64748b, #64748b); max-width:30%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
             .lpe-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
-            .lpe-chip { border:1px solid #cbd5e1; border-radius:999px; padding:1px 8px; font-size:11px; background:#f1f5f9; cursor:pointer; white-space:nowrap; }
-            .lpe-chip.need { background:#fef3c7; border-color:#f59e0b; color:#92400e; }
+            .lpe-chip { border:1px solid var(--phd-bd-cbd5e1, #cbd5e1); border-radius:999px; padding:1px 8px; font-size:11px; background:var(--phd-bg-f1f5f9, #f1f5f9); cursor:pointer; white-space:nowrap; }
+            .lpe-chip.need { background:var(--phd-bg-fef3c7, #fef3c7); border-color:var(--phd-bd-f59e0b, #f59e0b); color:var(--phd-fg-92400e, #92400e); }
             .lpe-acts { display:flex; gap:2px; }
-            .lpe-ib { border:1px solid #cbd5e1; background:#fff; border-radius:6px; width:26px; height:24px; cursor:pointer; }
+            .lpe-ib { border:1px solid var(--phd-bd-cbd5e1, #cbd5e1); background:var(--phd-bg-fff, #fff); border-radius:6px; width:26px; height:24px; cursor:pointer; }
             .lpe-ib:disabled { opacity:.35; cursor:default; }
-            .lpe-fixed { font-size:11px; color:#64748b; white-space:nowrap; }
+            .lpe-fixed { font-size:11px; color:var(--phd-fg-64748b, #64748b); white-space:nowrap; }
             .lpe-body { padding:6px 10px 10px; display:grid; grid-template-columns:1fr; gap:4px; }
-            .lpe-body label { font-size:11px; color:#475569; margin:4px 0 0; }
+            .lpe-body label { font-size:11px; color:var(--phd-fg-475569, #475569); margin:4px 0 0; }
             .lpe-body textarea { width:100%; font-size:13px; }
-            .lpe-rule { font-size:11px; background:#f8fafc; border:1px dashed #cbd5e1; border-radius:6px; padding:4px 6px; }
-            .lpe-warn { color:#b45309; }
-            .lpe-stale, .lpe-undo { font-size:12px; background:#fffbeb; border:1px solid #fcd34d; border-radius:6px; padding:4px 8px; margin:6px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-            .lpe-dirty { color:#b45309; font-size:12px; }
+            .lpe-rule { font-size:11px; background:var(--phd-bg-f8fafc, #f8fafc); border:1px dashed var(--phd-bd-cbd5e1, #cbd5e1); border-radius:6px; padding:4px 6px; }
+            .lpe-warn { color:var(--phd-fg-b45309, #b45309); }
+            .lpe-stale, .lpe-undo { font-size:12px; background:var(--phd-bg-fffbeb, #fffbeb); border:1px solid var(--phd-bd-fcd34d, #fcd34d); border-radius:6px; padding:4px 8px; margin:6px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+            .lpe-dirty { color:var(--phd-fg-b45309, #b45309); font-size:12px; }
           </style>
           <div id="lpe" class="field" style="margin-top:8px;" data-url="/apps/product-hub/api/drafts/<%= draft.id %>/lp-edit" <%= lpEdit.available ? '' : 'hidden' %>></div>
           <%# `<` は潰す (役割・見出しは AI と人が書いたもの。`</script>` で画面が壊れないように) %>
@@ -1865,7 +1866,7 @@ th.attr-unknown { color: #dc2626; }
             <span class="muted" id="shoot-sheet-msg" style="font-size:12px;"><%= shootSheet.blocked || '' %></span>
           </div>
           <% if (shootSheet.ours && shootSheet.stale) { %>
-            <div id="shoot-sheet-stale" style="margin-top:4px; padding:4px 8px; border-radius:6px; background:#fef3c7; border:1px solid #f59e0b; font-size:12px;">LP構成 (または撮影判定・商品名・画像フォルダ) が変わりました。「撮影指示書を更新」で反映してください</div>
+            <div id="shoot-sheet-stale" style="margin-top:4px; padding:4px 8px; border-radius:6px; background:var(--phd-bg-fef3c7, #fef3c7); border:1px solid var(--phd-bd-f59e0b, #f59e0b); font-size:12px;">LP構成 (または撮影判定・商品名・画像フォルダ) が変わりました。「撮影指示書を更新」で反映してください</div>
           <% } %>
           <div class="muted" style="font-size:11px; margin-top:4px;">
             <% if (shootSheet.ours) { %>作成・更新: <%= String(shootSheet.at || '').slice(0, 16).replace('T', ' ') %> <%= shootSheet.by || '' %> ・<% } %>
@@ -1903,7 +1904,7 @@ th.attr-unknown { color: #dc2626; }
           <%# 🖼 画像を作る (段階2・2026-10-04 中原さん)。できた構成から gpt-image-2.5 で画像を作り、
               商品の画像フォルダの中の「AI初稿」に保存する。人が押したときだけ・月の上限つき %>
           <% if (typeof lpImage !== 'undefined' && lpImage && lpImage.enabled) { %>
-          <div id="lpi" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0;"
+          <div id="lpi" class="field" style="margin-top:8px; padding:8px 10px; border-radius:8px; background:var(--phd-bg-f0fdf4, #f0fdf4); border:1px solid var(--phd-bd-bbf7d0, #bbf7d0);"
                data-draft-id="<%= draft.id %>">
             <%# 作れる条件 (PR-E): 仮LP構成と撮影判定 / (撮影が要るなら) 素材が揃った。中身は画面の JS が lpi-json から入れる %>
             <ul id="lpi-checks" style="list-style:none; padding:0; margin:0 0 6px; font-size:12px;"></ul>
@@ -1920,7 +1921,7 @@ th.attr-unknown { color: #dc2626; }
                 <a id="lpi-folder" href="#" target="_blank" rel="noopener" hidden>Drive で開く (AI初稿) ↗</a>
               </div>
             </div>
-            <div id="lpi-stale" hidden style="margin-top:6px; padding:4px 8px; border-radius:6px; background:#fef3c7; font-size:12px;">
+            <div id="lpi-stale" hidden style="margin-top:6px; padding:4px 8px; border-radius:6px; background:var(--phd-bg-fef3c7, #fef3c7); font-size:12px;">
               画像を作ったあとで LP構成が変わりました。もう一度全部作ると反映されます (1 枚の再生成は前の指示のままです)
             </div>
             <div id="lpi-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px; margin-top:8px;"></div>
@@ -1928,7 +1929,7 @@ th.attr-unknown { color: #dc2626; }
           </div>
           <%# デザイナー修正依頼書 (2026-10-09 PR-F・スタッフ要望 ⑥)。生成した全画像を TOP から順に貼ったスプレッドシートを商品の画像フォルダに作る。
               中身は画面の JS (initDesignerSheet・@designer-sheet) が lpi-json の designer_sheet から入れる (画像のポーリングでも入れ直す) %>
-          <div id="dsheet" class="field" hidden style="margin-top:8px; padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;"
+          <div id="dsheet" class="field" hidden style="margin-top:8px; padding:8px 10px; border-radius:8px; background:var(--phd-bg-f8fafc, #f8fafc); border:1px solid var(--phd-bd-e2e8f0, #e2e8f0);"
                data-draft-id="<%= draft.id %>">
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
               <div style="flex:1; min-width:220px;">
@@ -1938,7 +1939,7 @@ th.attr-unknown { color: #dc2626; }
               <button type="button" class="btn btn-primary btn-sm" id="dsheet-create">デザイナー修正依頼書を作成</button>
               <a id="dsheet-open" class="btn btn-sm" href="#" target="_blank" rel="noopener" hidden>開く ↗</a>
             </div>
-            <div id="dsheet-stale" hidden style="margin-top:6px; padding:4px 8px; border-radius:6px; background:#fef3c7; border:1px solid #f59e0b; font-size:12px;">
+            <div id="dsheet-stale" hidden style="margin-top:6px; padding:4px 8px; border-radius:6px; background:var(--phd-bg-fef3c7, #fef3c7); border:1px solid var(--phd-bd-f59e0b, #f59e0b); font-size:12px;">
               <%# hidden で消すので、この div 自身に display を書かない (書くと hidden が効かない) %>
               <span id="dsheet-stale-text"></span>
               <button type="button" class="btn btn-sm" id="dsheet-update" style="margin-left:6px;">最新の画像で作り直す</button>
@@ -1988,7 +1989,7 @@ th.attr-unknown { color: #dc2626; }
             <button type="button" class="btn prompt-btn" data-kind="simpleLp" <%= promptTemplates.available ? '' : 'disabled' %>>🖼 簡易LPを準備</button>
             <span class="muted" style="font-size:12px;"><%= promptTemplates.available ? 'ChatGPT に貼る定型文を作ります (コピーして商品画像を添付。保存前の編集は反映されません)' : promptTemplates.reason %></span>
           </div>
-          <div id="prompt-modal" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
+          <div id="prompt-modal" hidden style="margin-top:8px; background:var(--phd-bg-fff, #fff); border:1px solid var(--phd-bd-cbd5e1, #cbd5e1); border-radius:8px; padding:8px;">
             <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
               <strong id="prompt-title"></strong>
               <button type="button" class="btn btn-primary" id="prompt-copy-btn">コピー</button>
@@ -2001,12 +2002,12 @@ th.attr-unknown { color: #dc2626; }
           </div>
         <script type="application/json" id="prompt-templates-json"><%- JSON.stringify(promptTemplates).replace(/</g, '\\u003c') %></script>
         <%# 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列「仮構成」とは別。ボードのカードに「構成：まだ／済」で出る %>
-        <div class="field" style="padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;">
+        <div class="field" style="padding:8px 10px; border-radius:8px; background:var(--phd-bg-f8fafc, #f8fafc); border:1px solid var(--phd-bd-e2e8f0, #e2e8f0);">
           <label style="display:inline; margin-right:8px;">構成</label>
           <% if (composeState.excluded) { %>
             <span class="muted">対象外 (詳細画像を作らない商品)</span>
           <% } else { %>
-            <% if (composeState.done) { %><strong style="color:#15803d;">済</strong><% } else { %><strong>まだ</strong><% } %>
+            <% if (composeState.done) { %><strong style="color:var(--phd-fg-15803d, #15803d);">済</strong><% } else { %><strong>まだ</strong><% } %>
             <span class="muted" style="font-size:12px;">
               <% if (composeState.marked) { %><%= String(ip.compose_updated_at || '').slice(0, 16).replace('T', ' ') %> <%= ip.compose_updated_by || '' %>
               <% } else if (composeState.implied) { %>(④AI制作が済んで ⑤デザイン修正 に移っているので 済 とみなしています)
@@ -2050,7 +2051,7 @@ th.attr-unknown { color: #dc2626; }
         <div class="field" style="display:flex; gap:12px;">
           <div style="flex:1">
             <label>撮影商品発送 <span class="muted" style="font-weight:400">(旧 Notion 項目。上の「撮影・素材ステータス」に置き換え)</span></label>
-            <input type="text" id="ip-shipping" value="<%= ip.shipping_status || '' %>" readonly style="background:#f1f5f9;">
+            <input type="text" id="ip-shipping" value="<%= ip.shipping_status || '' %>" readonly style="background:var(--phd-bg-f1f5f9, #f1f5f9);">
           </div>
           <div style="flex:1">
             <label>参考画像・レビュー収集</label>
@@ -2075,7 +2076,7 @@ th.attr-unknown { color: #dc2626; }
         <%# TOP画像の構成 (2026-09-13 スタッフ要望)。TOP作成から完了までを円滑にするため、詳細画像 (LP) と同じく
             TOP画像も田中さんが簡単な構成を作る。テキストの構成と参考・ラフの URL を並べて、すり合わせを見える形にし
             大輔さんに制作意図を伝える %>
-        <div class="field" style="padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;">
+        <div class="field" style="padding:8px 10px; border-radius:8px; background:var(--phd-bg-f8fafc, #f8fafc); border:1px solid var(--phd-bd-e2e8f0, #e2e8f0);">
           <label>TOP画像の構成 <span class="muted" style="font-weight:400">(簡単なもので OK。少量のテキスト)</span></label>
           <textarea id="ip-top-compose" rows="3" placeholder="例: 白背景に商品を大きく配置。左上に「内容量 50g」、下に使用シーンの小写真"><%= ip.top_compose_text || '' %></textarea>
           <label style="margin-top:8px;">参考・ラフの URL <span class="muted" style="font-weight:400">(田中さんのワークスペースか、商品の Drive に保存したもの)</span></label>
@@ -2122,7 +2123,7 @@ th.attr-unknown { color: #dc2626; }
   %>
 
   <!-- タイトル・キャッチコピー (店舗ルールの文字数制限つき) -->
-  <div class="card" style="border-color:#c7d2fe; background:#fbfbff;">
+  <div class="card" style="border-color:var(--phd-bd-c7d2fe, #c7d2fe); background:var(--phd-bg-fbfbff, #fbfbff);">
     <h2>✏️ タイトル・キャッチコピー</h2>
     <p class="muted" style="margin-top:-6px">
       AI が下書きを作り、人が仕上げます。文字数は店舗ルール — 超えると赤くなります。
@@ -2165,7 +2166,7 @@ th.attr-unknown { color: #dc2626; }
           </div>
           <div class="muted" style="font-size:11px;"><%= note %></div>
           <div id="desc3-render-<%= key %>" class="desc3-render"
-               style="border:1px solid #e2e8f0; border-radius:8px; padding:10px; margin-top:4px; max-height:<%= key === 'pc' ? 320 : 480 %>px; overflow:auto; background:#fff; font-size:13px;"></div>
+               style="border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; padding:10px; margin-top:4px; max-height:<%= key === 'pc' ? 320 : 480 %>px; overflow:auto; background:var(--phd-bg-fff, #fff); font-size:13px;"></div>
         </div>
       <% } %>
     </div>
@@ -2178,7 +2179,7 @@ th.attr-unknown { color: #dc2626; }
     </summary>
   <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start; margin-top:8px;">
     <!-- AI素材 -->
-    <div class="card" style="border-color:#c7d2fe; background:#fbfbff;">
+    <div class="card" style="border-color:var(--phd-bd-c7d2fe, #c7d2fe); background:var(--phd-bg-fbfbff, #fbfbff);">
       <h2>🤖 AIが書く素材</h2>
       <p class="muted" style="margin-top:-6px">手で埋めなくて構いません。工程「基本情報入力」を完了にすると AI が書きます。直すのは自由です。</p>
       <% for (const kind of ['desc_features', 'desc_spec', 'desc_notes']) { %>
@@ -2223,11 +2224,11 @@ th.attr-unknown { color: #dc2626; }
   <!-- ═══ タブ4: 商品情報 (商品ページ表記) ═══ -->
   <div class="tab-panel" id="tab-info">
   <!-- 商品ページ表記 (化粧品・食品) — 旧xlsmの移植 -->
-  <div class="card" style="border-color:#fde68a; background:#fffdf5;">
+  <div class="card" style="border-color:var(--phd-bd-fde68a, #fde68a); background:var(--phd-bg-fffdf5, #fffdf5);">
     <h2>📄 商品ページ表記 <span class="muted" style="font-weight:400">(化粧品・食品の必須記載。説明文の末尾に表として自動掲載)</span></h2>
     <p class="muted" style="margin-top:-6px; font-size:12px;">
       商品タイプを選ぶと、そのタイプで入力が要る項目だけが表示されます (値が入っている項目は常に表示)。
-      <span style="color:#dc2626">*必須</span> は楽天の必須記載事項です。
+      <span style="color:var(--phd-fg-dc2626, #dc2626)">*必須</span> は楽天の必須記載事項です。
     </p>
     <div class="grid-2">
       <div class="field">
@@ -2296,7 +2297,7 @@ th.attr-unknown { color: #dc2626; }
         <textarea id="pi-other-notes" rows="3" placeholder="例: 箱から出して配送します"><%= pageInfo?.other_notes || '' %></textarea>
       </div>
     </div>
-    <div id="pi-food-fields" class="grid-2" style="display:none; background:#fef9ec; border-radius:8px; padding:8px 12px; margin-bottom:8px;">
+    <div id="pi-food-fields" class="grid-2" style="display:none; background:var(--phd-bg-fef9ec, #fef9ec); border-radius:8px; padding:8px 12px; margin-bottom:8px;">
       <div class="field">
         <label id="pi-l-food-name">名称 (食品表示)<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-food-name" value="<%= pageInfo?.food_name || '' %>" placeholder="例: 有機亜麻仁シード">
@@ -2326,7 +2327,7 @@ th.attr-unknown { color: #dc2626; }
       <span class="muted" id="pi-result">入力は自動で保存されます (入力が止まって約1秒後)</span>
     </div>
     <div id="pi-warnings" style="margin-top:8px;"></div>
-    <div id="pi-preview" style="display:none; margin-top:10px; border:1px solid #e2e8f0; border-radius:8px; padding:10px; background:#fff; overflow:auto; max-height:400px;"></div>
+    <div id="pi-preview" style="display:none; margin-top:10px; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; padding:10px; background:var(--phd-bg-fff, #fff); overflow:auto; max-height:400px;"></div>
     <textarea id="pi-html-src" style="display:none;"><%= pageInfoHtml %></textarea>
     <script type="application/json" id="pi-cat-by-type"><%- JSON.stringify(categoryLabelsByType).replace(/</g, '\\u003c') %></script>
   </div>
@@ -2359,7 +2360,7 @@ th.attr-unknown { color: #dc2626; }
         <div id="rk-genre-suggest" style="font-size:12px; margin-top:4px;"></div>
         <div id="rk-genre-info" style="font-size:12px; margin-top:4px;">
           <% if (genreDict) { %>
-            <span style="color:#166534;">✅ <%= genreDict.genrePath || genreDict.genreName %></span>
+            <span style="color:var(--phd-fg-166534, #166534);">✅ <%= genreDict.genrePath || genreDict.genreName %></span>
             <span class="muted">(必須属性 <%= genreDict.attributes.filter((a) => a.mandatory).length %> 件 / 辞書取得済み)</span>
           <% } else { %>
             <span class="muted">辞書未取得 — 取得すると必須属性の行が自動で並び、登録前にチェックされます</span>
@@ -2430,7 +2431,7 @@ th.attr-unknown { color: #dc2626; }
       for (const n of gridData.names) if (!gridNames.includes(n)) gridNames.push(n);
       const skuKeyOf = (m) => String(m.商品コード || '').trim().toLowerCase();
     %>
-    <label>カタログID・商品仕様 <span class="muted">(RMSの「製品情報」と同じ表。列 = <%= isVariationPage ? 'SKU' : 'この商品' %>、行 = 項目。「ジャンル情報を取得」で必須の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式は「ジャンル情報を取得」を押すと楽天の選択肢から選べます。選択肢が出ない項目はRMSと同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
+    <label>カタログID・商品仕様 <span class="muted">(RMSの「製品情報」と同じ表。列 = <%= isVariationPage ? 'SKU' : 'この商品' %>、行 = 項目。「ジャンル情報を取得」で必須の行が自動で並びます。<span style="color:var(--phd-fg-dc2626, #dc2626)">*必須</span> / 選択式は「ジャンル情報を取得」を押すと楽天の選択肢から選べます。選択肢が出ない項目はRMSと同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
     <% if (isVariationPage) { %>
       <p class="muted" style="margin:0 0 6px; font-size:12px;">
         入力欄を離れると<strong>即保存</strong>。「一括入力」で全SKUに同じ値を入れられます。JANが無いSKUは「IDなし」を選んで理由を選択。
@@ -2444,7 +2445,7 @@ th.attr-unknown { color: #dc2626; }
           <div style="margin-top:6px;"><button type="button" class="btn btn-sm" id="rk-legacy-catalog-drop">旧データの「カタログID」属性を削除する</button></div>
         </div>
       <% } %>
-      <div style="overflow-x:auto; border:1px solid #e2e8f0; border-radius:8px; margin-bottom:8px; background:#fff;">
+      <div style="overflow-x:auto; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; margin-bottom:8px; background:var(--phd-bg-fff, #fff);">
         <table class="list sku-grid" id="rk-sku-grid" style="margin:0; width:max-content; min-width:100%;">
           <thead><tr>
             <th class="sku-grid-head">項目</th>
@@ -2456,7 +2457,7 @@ th.attr-unknown { color: #dc2626; }
           <tbody>
             <tr class="sku-grid-catalog">
               <th class="sku-grid-head">
-                <div>カタログID <span style="color:#dc2626">*必須</span></div>
+                <div>カタログID <span style="color:var(--phd-fg-dc2626, #dc2626)">*必須</span></div>
                 <div class="muted" style="font-size:11px; font-weight:400;">JAN は商品マスタから選ぶ。無ければ「IDなし」+ 理由</div>
               </th>
               <% for (const [mi, m] of variation.members.entries()) { const k = skuKeyOf(m); const jan = skuJans[k] || ''; const ex = gridExemptions[k] != null ? Number(gridExemptions[k]) : null; %>
@@ -2494,9 +2495,9 @@ th.attr-unknown { color: #dc2626; }
             <% for (const name of gridNames) { const da = dictOf(name); %>
               <tr class="sku-grid-attr" data-name="<%= name %>">
                 <th class="sku-grid-head">
-                  <div><%= name %> <% if (da && da.mandatory) { %><span style="color:#dc2626">*必須</span><% } %></div>
+                  <div><%= name %> <% if (da && da.mandatory) { %><span style="color:var(--phd-fg-dc2626, #dc2626)">*必須</span><% } %></div>
                   <% if (hintOf(da)) { %><div class="muted" style="font-size:11px; font-weight:400;"><%= hintOf(da) %></div><% } %>
-                  <% if (da && da.inputMethod === 'SELECTIVE') { %><div class="muted" style="font-size:11px; font-weight:400; color:#b45309;">⚠️ 楽天が用意した値と同じ表記で</div><% } %>
+                  <% if (da && da.inputMethod === 'SELECTIVE') { %><div class="muted" style="font-size:11px; font-weight:400; color:var(--phd-fg-b45309, #b45309);">⚠️ 楽天が用意した値と同じ表記で</div><% } %>
                   <div style="margin-top:4px; display:flex; gap:6px;">
                     <button type="button" class="btn btn-sm sku-grid-bulk" data-name="<%= name %>" style="font-size:11px; padding:2px 8px;">一括入力</button>
                     <button type="button" class="btn btn-sm sku-grid-del" data-name="<%= name %>" style="font-size:11px; padding:2px 8px;" title="この行を全SKUから外す">×</button>
@@ -2517,9 +2518,9 @@ th.attr-unknown { color: #dc2626; }
       <tbody>
         <%# カタログID — RMS と同じ ◉IDあり=JAN / ○IDなし=理由。JAN の実体は product_drafts.jan_code (#f-jan)、
             保存は saveJanIfChanged (プレビュー・登録・保存の前に必ず確定させる) %>
-        <tr style="background:#f8fafc;">
+        <tr style="background:var(--phd-bg-f8fafc, #f8fafc);">
           <td>
-            <div style="padding:4px 2px; font-weight:600;">カタログID <span style="color:#dc2626">*必須</span></div>
+            <div style="padding:4px 2px; font-weight:600;">カタログID <span style="color:var(--phd-fg-dc2626, #dc2626)">*必須</span></div>
             <div class="muted" style="font-size:11px;">JAN は商品マスタから選ぶ。無ければ「IDなし」+ 理由</div>
           </td>
           <td>
@@ -2561,7 +2562,7 @@ th.attr-unknown { color: #dc2626; }
             値の実体は draft_rakuten.article_number のまま (#1029 の「入口は1つ」を維持。
             送信時に属性「メーカー型番」へ自動で積まれる配線も不変)。
             旧データで属性側に残っている値は引き上げて表示し、食い違いはバナーで人に選ばせる %>
-        <tr style="background:#f8fafc;">
+        <tr style="background:var(--phd-bg-f8fafc, #f8fafc);">
           <td>
             <div style="padding:4px 2px; font-weight:600;"><%= modelAttrName %></div>
             <div class="muted" style="font-size:11px;"><%= modelDict && modelDict.mandatory ? '必須 / ' : '' %>固定の項目 — 空なら「型番なし」で送信</div>
@@ -2606,7 +2607,7 @@ th.attr-unknown { color: #dc2626; }
             </td>
             <td><input type="text" class="rk-attr-value" value="<%= (a.values && a.values[0]) || '' %>">
               <% if (da && da.inputMethod === 'SELECTIVE') { %>
-                <div class="muted rk-attr-selective" style="font-size:11px; color:#b45309;">
+                <div class="muted rk-attr-selective" style="font-size:11px; color:var(--phd-fg-b45309, #b45309);">
                   ⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)
                 </div>
               <% } %>
@@ -2642,8 +2643,8 @@ th.attr-unknown { color: #dc2626; }
         <%# ツリーは 5 枠の**上**に置き、既定で開いておく (2026-08-31 中原さん: 必須項目なので
             畳んでいると記載を見逃す)。開いた状態でも枠 1〜5 がすぐ下にあるので、
             選んだ結果がその場で見える %>
-        <details id="rk-cats-acc" open style="border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin-bottom:6px;">
-          <summary style="cursor:pointer; padding:7px 10px; font-size:13px; color:#475569;">🗂 カテゴリ選択 (ツリー)</summary>
+        <details id="rk-cats-acc" open style="border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; background:var(--phd-bg-fff, #fff); margin-bottom:6px;">
+          <summary style="cursor:pointer; padding:7px 10px; font-size:13px; color:var(--phd-fg-475569, #475569);">🗂 カテゴリ選択 (ツリー)</summary>
           <div style="padding:0 10px 8px;">
             <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin:6px 0;">
             <div id="rk-cats" style="max-height:280px; overflow:auto;"></div>
@@ -2669,7 +2670,7 @@ th.attr-unknown { color: #dc2626; }
        AI 提案・ABA・除外KW・商品ターゲットは後続 PR。Amazon (Ads API) には書き込まない。
        画面は adkw-json の状態から JS が描く (収集のたびに state を受け取って描き直す。ページは読み直さない) -->
   <div class="tab-panel" id="tab-adkw">
-    <div class="card" style="border-color:#fde68a; background:#fffdf5;">
+    <div class="card" style="border-color:var(--phd-bd-fde68a, #fde68a); background:var(--phd-bg-fffdf5, #fffdf5);">
       <h2>📣 SP広告 検索キーワード — サジェスト収集・採用支援</h2>
       <p class="muted" style="margin-top:-6px;">
         頭で考えた種キーワードを入れると、Amazon の検索ボックスに出るサジェスト (そのまま + あ〜わ) を会社の回線 (miniPC) から集めます。
@@ -2783,7 +2784,7 @@ th.attr-unknown { color: #dc2626; }
       root.textContent = '';
       const req = state.request;
       if (!state.configured) {
-        root.appendChild(el('div', { class: 'muted', style: 'padding:8px 10px; border:1px solid #fecaca; background:#fef2f2; border-radius:8px; margin-bottom:10px; color:#991b1b;',
+        root.appendChild(el('div', { class: 'muted', style: 'padding:8px 10px; border:1px solid var(--phd-bd-fecaca, #fecaca); background:var(--phd-bg-fef2f2, #fef2f2); border-radius:8px; margin-bottom:10px; color:var(--phd-fg-991b1b, #991b1b);',
           text: 'miniPC を呼ぶ設定 (WAREHOUSE_SERVICE_TOKEN) がこのサーバーに無いため、サジェストを集められません。既に集めた候補の採否とコピーはできます。' }));
       }
       // ── おまかせ (夜の自動・PR3c)。自社商品は毎晩 AI が種 KW → サジェスト・ABA → 最終案まで作る。人は朝に採否とコピーだけ
@@ -2936,7 +2937,7 @@ th.attr-unknown { color: #dc2626; }
                 + ' → 該当あり ' + au.found + ' / 該当なし ' + au.none + (au.not_covered ? ' / 判定できない ' + au.not_covered : '')
                 + '・出てきた商品 ' + au.asins_seen + ' → 採用 (自動) ' + au.added + ' 件');
         }
-        const box = el('div', { style: 'margin-top:14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' }, [
+        const box = el('div', { style: 'margin-top:14px; padding:10px 12px; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; background:var(--phd-bg-fff, #fff);' }, [
           el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:6px;' }, [
             el('strong', { style: 'font-size:13px;', text: '商品ターゲット (競合 ASIN) — ' + asins.length + ' / ' + state.limits.max_asins + ' 件' }),
             el('span', { class: 'muted', text: '「ABA から競合を自動で出す」= 採用した検索キーワードごとに、ABA (miniPC に取込済みの週) でクリック上位 3 に入った商品を集め、多く出た順に「採用 (自動)」で入れます。'
@@ -2970,7 +2971,7 @@ th.attr-unknown { color: #dc2626; }
         sel.appendChild(el('option', { value: v, text: t, selected: v === cur }));
       }
       const autoAdopted = d && d.decision === 'adopt' && d.actor === 'auto:aba';
-      const note = el('span', { class: 'muted', style: 'font-size:11px;' + (autoAdopted ? ' color:#b45309;' : ''),
+      const note = el('span', { class: 'muted', style: 'font-size:11px;' + (autoAdopted ? ' color:var(--phd-fg-b45309, #b45309);' : ''),
         text: inflight.has(a.id) ? '保存中…' : (autoAdopted ? '自動で採用・' + fmtTime(d.created_at) + ' (要らなければ却下)'
           : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '')) });
       if (inflight.has(a.id)) sel.disabled = true;
@@ -3077,7 +3078,7 @@ th.attr-unknown { color: #dc2626; }
     let aiKey = null;   // 冪等キー (通信断で押し直しても同じ依頼になる。受け付けたら捨てる)
     function aiSection() {
       const ai = state.ai;
-      const box = el('div', { id: 'adkw-ai', style: 'margin-top:12px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' });
+      const box = el('div', { id: 'adkw-ai', style: 'margin-top:12px; padding:10px 12px; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; background:var(--phd-bg-fff, #fff);' });
       const busy = inflight.has('ai-request');
       const btn = el('button', { type: 'button', class: 'btn btn-primary', id: 'adkw-ai-request', disabled: !ai.can_request || busy,
         text: busy ? '受け付けています…' : '🤖 AI に案を出してもらう (今夜)',
@@ -3100,7 +3101,7 @@ th.attr-unknown { color: #dc2626; }
         if (staleNow && j.status !== 'cancelled') bits.push('⚠ 旧材料に基づく (頼んだあとに商品情報か採否が変わった)');
         if (j.reviewed_by) bits.push('確認済み (' + j.reviewed_by + ')');
         if (j.mode === 'auto') bits.unshift('おまかせ');
-        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (j.needs_ack ? ' color:#b45309;' : '') }, [el('span', { text: bits.join('・') })]);
+        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (j.needs_ack ? ' color:var(--phd-fg-b45309, #b45309);' : '') }, [el('span', { text: bits.join('・') })]);
         if (j.needs_ack) line.appendChild(reviewButton(j));
         box.appendChild(line);
       }
@@ -3150,7 +3151,7 @@ th.attr-unknown { color: #dc2626; }
     let autoKey = null;   // やり直すの冪等キー (通信断で押し直しても同じ回になる)
     function autoSection() {
       const a = state.ai.auto;
-      const box = el('div', { id: 'adkw-auto', style: 'margin-bottom:12px; padding:10px 12px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff;' });
+      const box = el('div', { id: 'adkw-auto', style: 'margin-bottom:12px; padding:10px 12px; border:1px solid var(--phd-bd-bfdbfe, #bfdbfe); border-radius:8px; background:var(--phd-bg-eff6ff, #eff6ff);' });
       const j = a.job;
       const head = el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [el('strong', { style: 'font-size:13px;', text: '🌙 おまかせ (夜に AI が自動で)' })]);
       let msg;
@@ -3173,7 +3174,7 @@ th.attr-unknown { color: #dc2626; }
         if (j.error && j.status !== 'done') bits.push(j.error);
         if (j.reviewed_by) bits.push('確認済み (' + j.reviewed_by + ')');
         const needsAck = ['needs_review', 'failed', 'needs_input'].includes(j.status) && !j.reviewed_by;
-        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (needsAck ? ' color:#b45309;' : '') }, [el('span', { text: bits.join('・') })]);
+        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (needsAck ? ' color:var(--phd-fg-b45309, #b45309);' : '') }, [el('span', { text: bits.join('・') })]);
         if (needsAck) line.appendChild(reviewButton(j));
         box.appendChild(line);
       }
@@ -3324,7 +3325,7 @@ th.attr-unknown { color: #dc2626; }
       const saving = inflight.has(c.id);
       // おまかせが観測のある語を最初から採用した (auto:ai) = 要らなければ却下 (中原さん 2026-09-26)
       const aiAdopted = d && d.decision === 'adopt' && d.actor === 'auto:ai';
-      const note = el('span', { class: 'muted', style: 'font-size:11px;' + (aiAdopted ? ' color:#b45309;' : ''), text: saving ? '保存中…'
+      const note = el('span', { class: 'muted', style: 'font-size:11px;' + (aiAdopted ? ' color:var(--phd-fg-b45309, #b45309);' : ''), text: saving ? '保存中…'
         : aiAdopted ? 'AI が自動で採用・' + fmtTime(d.created_at) + ' (要らなければ却下)'
           : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '') });
       if (saving) { sel.disabled = true; kwInput.disabled = true; }   // GET で描き直されても保存中は触れない
@@ -3407,7 +3408,7 @@ th.attr-unknown { color: #dc2626; }
     }
 
     function exportSection() {
-      const box = el('div', { id: 'adkw-export', style: 'margin-top:14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' });
+      const box = el('div', { id: 'adkw-export', style: 'margin-top:14px; padding:10px 12px; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; background:var(--phd-bg-fff, #fff);' });
       box.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [
         el('strong', { style: 'font-size:13px;', text: '広告画面に貼る本文 (採用 ' + state.adopted_count + ' 語・商品ターゲット ' + (state.adopted_asin_count || 0) + ' 件)' }),
         el('button', { type: 'button', class: 'btn btn-sm btn-primary', text: '本文を固定する', onclick: () => makeExport(),
@@ -3417,7 +3418,7 @@ th.attr-unknown { color: #dc2626; }
       const latest = state.exports && state.exports[0];
       if (latest && latest.body) {
         if (latest.decision_version !== state.decision_version) {
-          box.appendChild(el('p', { class: 'muted', style: 'color:#b45309; margin:8px 0 0;', text: '⚠ 固定したあとに採否が変わっています。下の本文は古い採否のものです。「本文を固定する」を押し直してください' }));
+          box.appendChild(el('p', { class: 'muted', style: 'color:var(--phd-fg-b45309, #b45309); margin:8px 0 0;', text: '⚠ 固定したあとに採否が変わっています。下の本文は古い採否のものです。「本文を固定する」を押し直してください' }));
         }
         box.appendChild(el('p', { class: 'muted', style: 'margin:6px 0 0;', text: '履歴 #' + latest.id + '（' + fmtTime(latest.created_at) + (latest.created_by ? '・' + latest.created_by : '') + '）— マッチタイプごとに分けてあります。Amazon の広告画面の「キーワードを入力」に、同じマッチタイプを選んで貼ってください' }));
         for (const b of latest.body.blocks || []) {
@@ -3537,7 +3538,7 @@ th.attr-unknown { color: #dc2626; }
   <%# セット展開判断 (2026-09-04 要件定義 §5.4)。⑤は判断を記録してからでないと閉じられない。
       「新規作成」は上部の「セット商品を作る」が入口なので、ここでは選ばせない %>
   <div id="setdec-modal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:1000;">
-    <div style="background:#fff; max-width:560px; margin:8vh auto; border-radius:12px; padding:18px 20px; display:flex; flex-direction:column; gap:10px;">
+    <div style="background:var(--phd-bg-fff, #fff); max-width:560px; margin:8vh auto; border-radius:12px; padding:18px 20px; display:flex; flex-direction:column; gap:10px;">
       <div style="display:flex; align-items:center;">
         <h2 style="margin:0; font-size:16px;">セット展開判断</h2>
         <span style="flex:1"></span>
@@ -3547,7 +3548,7 @@ th.attr-unknown { color: #dc2626; }
         この商品をセットにするか決めます。<strong>作らない・保留も記録します</strong>
         (後から「まだ検討していない」のか「検討して作らないと決めた」のかが分かるように)。
       </p>
-      <label style="display:flex; gap:8px; align-items:flex-start; border:1px solid #e2e8f0; border-radius:6px; padding:8px 10px;">
+      <label style="display:flex; gap:8px; align-items:flex-start; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:6px; padding:8px 10px;">
         <input type="radio" name="setdec" value="none" checked>
         <span><strong>セットは作らない</strong><br><span class="muted" style="font-size:11.5px;">理由を選んでください</span></span>
       </label>
@@ -3560,7 +3561,7 @@ th.attr-unknown { color: #dc2626; }
         <input type="text" id="setdec-reason-text" maxlength="200" placeholder="「その他」を選んだときは一言" hidden>
       </div>
       <% if (setDrafts.length) { %>
-        <label style="display:flex; gap:8px; align-items:flex-start; border:1px solid #e2e8f0; border-radius:6px; padding:8px 10px;">
+        <label style="display:flex; gap:8px; align-items:flex-start; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:6px; padding:8px 10px;">
           <input type="radio" name="setdec" value="existing">
           <span><strong>既存のセットがある</strong><br><span class="muted" style="font-size:11.5px;">二重に作らないよう、そのセットに紐づけます</span></span>
         </label>
@@ -3572,7 +3573,7 @@ th.attr-unknown { color: #dc2626; }
           </select>
         </div>
       <% } %>
-      <label style="display:flex; gap:8px; align-items:flex-start; border:1px solid #e2e8f0; border-radius:6px; padding:8px 10px;">
+      <label style="display:flex; gap:8px; align-items:flex-start; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:6px; padding:8px 10px;">
         <input type="radio" name="setdec" value="hold">
         <span><strong>保留</strong><br><span class="muted" style="font-size:11.5px;">この工程は開いたままにして、何日待っているかを数え続けます</span></span>
       </label>
@@ -3593,16 +3594,16 @@ th.attr-unknown { color: #dc2626; }
   </div>
 
   <div id="genre-modal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:1000;">
-    <div style="background:#fff; max-width:640px; margin:6vh auto; border-radius:12px; padding:18px 20px; max-height:84vh; display:flex; flex-direction:column;">
+    <div style="background:var(--phd-bg-fff, #fff); max-width:640px; margin:6vh auto; border-radius:12px; padding:18px 20px; max-height:84vh; display:flex; flex-direction:column;">
       <div style="display:flex; align-items:center;">
         <h2 style="margin:0; font-size:16px;">ジャンルID選択</h2>
         <span style="flex:1"></span>
         <button type="button" class="btn btn-sm" id="genre-modal-close">✕</button>
       </div>
-      <div id="genre-tree" style="flex:1; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; margin:12px 0; padding:6px 4px; font-size:13px;">
+      <div id="genre-tree" style="flex:1; overflow:auto; border:1px solid var(--phd-bd-e2e8f0, #e2e8f0); border-radius:8px; margin:12px 0; padding:6px 4px; font-size:13px;">
         <p class="muted" style="margin:8px;">読み込み中…</p>
       </div>
-      <div style="background:#f8fafc; border-radius:8px; padding:8px 12px; font-size:12px;">
+      <div style="background:var(--phd-bg-f8fafc, #f8fafc); border-radius:8px; padding:8px 12px; font-size:12px;">
         選択ジャンルID: <code id="genre-modal-id">—</code><br>
         選択ジャンルパス: <span id="genre-modal-path" class="muted">—</span>
       </div>
@@ -4163,8 +4164,9 @@ th.attr-unknown { color: #dc2626; }
     // 画像制作カードは全商品に出る (2026-09-13〜) ので、重要度・自社商品を変えても読み直さない
     const applyPriorityColors = () => {
       const p = IMG_PRIORITIES.find((x) => x.value === imgPrioritySel.value);
-      imgPrioritySel.style.background = p ? p.bg : '';
-      imgPrioritySel.style.color = p ? p.fg : '';
+      // 色は CSS 変数で渡す (地と文字の塗り方は画面の明暗で _dark-theme / _detail-theme が決める)
+      if (p) { imgPrioritySel.style.setProperty('--pri-bg', p.bg); imgPrioritySel.style.setProperty('--pri-fg', p.fg); }
+      else { imgPrioritySel.style.removeProperty('--pri-bg'); imgPrioritySel.style.removeProperty('--pri-fg'); }
       imgPrioritySel.style.fontWeight = p ? '600' : '';
     };
     // 重要度と自社商品チェックはどちらも重要度 (image_priority) を書くので、どちらかの保存中は両方触らせない。
@@ -4342,7 +4344,7 @@ th.attr-unknown { color: #dc2626; }
     head.style.cssText = 'display:flex; align-items:center; gap:6px; cursor:pointer; padding:3px 6px; border-radius:6px;';
     const arrow = document.createElement('span');
     arrow.textContent = '>';
-    arrow.style.cssText = 'width:14px; color:#94a3b8; transition:transform .15s; display:inline-block;';
+    arrow.style.cssText = 'width:14px; color:var(--phd-fg-94a3b8, #94a3b8); transition:transform .15s; display:inline-block;';
     const label = document.createElement('span');
     label.textContent = child.name;
     head.appendChild(arrow); head.appendChild(label);
@@ -4357,7 +4359,7 @@ th.attr-unknown { color: #dc2626; }
         el.classList.remove('genre-row-active'); el.style.background = '';
       });
       head.classList.add('genre-row-active');
-      head.style.background = '#eff6ff';
+      head.style.background = 'var(--phd-bg-eff6ff, #eff6ff)';
       if (!loaded) {
         arrow.textContent = '…';
         try {
@@ -4465,7 +4467,7 @@ th.attr-unknown { color: #dc2626; }
         out.append(line);
         if (!json.usable) {
           const warn = document.createElement('div');
-          warn.style.color = '#b45309';
+          warn.style.color = 'var(--phd-fg-b45309, #b45309)';
           warn.textContent = '⚠ このジャンルは末端でないか、辞書を取得できませんでした。'
             + 'そのままでは登録に使えない可能性があります (「ツリーから選ぶ」で確認してください)';
           out.append(warn);
@@ -4582,18 +4584,18 @@ th.attr-unknown { color: #dc2626; }
         row.style.cssText = 'display:flex; align-items:center; gap:8px; font-size:13px;';
         const num = document.createElement('span');
         num.textContent = String(i + 1);
-        num.style.cssText = 'width:18px; text-align:right; color:#94a3b8; font-size:12px;';
+        num.style.cssText = 'width:18px; text-align:right; color:var(--phd-fg-94a3b8, #94a3b8); font-size:12px;';
         row.appendChild(num);
         const boxEl = document.createElement('div');
         if (id != null) {
-          boxEl.style.cssText = 'flex:1; padding:6px 10px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+          boxEl.style.cssText = 'flex:1; padding:6px 10px; border:1px solid var(--phd-bd-cbd5e1, #cbd5e1); border-radius:6px; background:var(--phd-bg-fff, #fff); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
           boxEl.textContent = byId.get(id)?.path || id;
           boxEl.title = (i === 0 ? '枠1 = メインページ設定\n' : '') + (byId.get(id)?.path || '');
           row.appendChild(boxEl);
           if (i === 0 && order.length > 1) {
             const mainTag = document.createElement('span');
             mainTag.textContent = 'メイン';
-            mainTag.style.cssText = 'font-size:10px; color:#1d4ed8; background:#dbeafe; border-radius:4px; padding:1px 5px; white-space:nowrap;';
+            mainTag.style.cssText = 'font-size:10px; color:var(--phd-fg-1d4ed8, #1d4ed8); background:var(--phd-bg-dbeafe, #dbeafe); border-radius:4px; padding:1px 5px; white-space:nowrap;';
             row.appendChild(mainTag);
           }
           const clear = document.createElement('button');
@@ -4603,7 +4605,7 @@ th.attr-unknown { color: #dc2626; }
           clear.addEventListener('click', () => setShopCatChecked(id, false));
           row.appendChild(clear);
         } else {
-          boxEl.style.cssText = 'flex:1; padding:6px 10px; border:1px dashed #e2e8f0; border-radius:6px; color:#cbd5e1;';
+          boxEl.style.cssText = 'flex:1; padding:6px 10px; border:1px dashed var(--phd-bd-e2e8f0, #e2e8f0); border-radius:6px; color:var(--phd-fg-cbd5e1, #cbd5e1);';
           boxEl.textContent = '(未設定)';
           row.appendChild(boxEl);
         }
@@ -4653,7 +4655,7 @@ th.attr-unknown { color: #dc2626; }
       const hasKids = node.children.size > 0;
       const arrow = document.createElement('span');
       arrow.textContent = hasKids ? '>' : '・';
-      arrow.style.cssText = 'width:14px; color:#94a3b8; cursor:' + (hasKids ? 'pointer' : 'default') + '; display:inline-block; transition:transform .15s;';
+      arrow.style.cssText = 'width:14px; color:var(--phd-fg-94a3b8, #94a3b8); cursor:' + (hasKids ? 'pointer' : 'default') + '; display:inline-block; transition:transform .15s;';
       head.appendChild(arrow);
       let box = null;
       const toggle = () => {
@@ -4770,7 +4772,7 @@ th.attr-unknown { color: #dc2626; }
           b.type = 'button';
           b.className = 'btn btn-sm';
           b.style.cssText = 'margin:2px 4px 2px 0; font-size:11px;'
-            + (cb && cb.checked ? ' background:#dcfce7; border-color:#86efac;' : '');
+            + (cb && cb.checked ? ' background:var(--phd-bg-dcfce7, #dcfce7); border-color:var(--phd-bd-86efac, #86efac);' : '');
           b.textContent = (cb && cb.checked ? '✓ ' : '') + c.path;
           b.addEventListener('click', async () => {
             if (!cb) return;
@@ -4852,7 +4854,7 @@ th.attr-unknown { color: #dc2626; }
     box.textContent = '';
     if (attrDict.length === 0 || stale.length === 0) return;
     const msg = document.createElement('div');
-    msg.style.cssText = 'font-size:12px; color:#b45309; border:1px solid #fcd34d; background:#fffbeb; border-radius:6px; padding:6px 8px;';
+    msg.style.cssText = 'font-size:12px; color:var(--phd-fg-b45309, #b45309); border:1px solid var(--phd-bd-fcd34d, #fcd34d); background:var(--phd-bg-fffbeb, #fffbeb); border-radius:6px; padding:6px 8px;';
     msg.textContent = '⚠ いまのジャンルに無い属性が ' + stale.length + ' 件あります: ' + stale.join(' / ')
       + '　このままだと出品時に止まります (登録エラー IE1002)。表の × で外してください';
     box.appendChild(msg);
@@ -4927,7 +4929,7 @@ th.attr-unknown { color: #dc2626; }
       if (text && !note) {
         note = document.createElement('div');
         note.className = 'muted rk-attr-selective';
-        note.style.cssText = 'font-size:11px; color:#b45309;';
+        note.style.cssText = 'font-size:11px; color:var(--phd-fg-b45309, #b45309);';
         el.parentNode.appendChild(note);
       }
       if (note) { note.textContent = text; note.style.display = text ? '' : 'none'; }
@@ -4970,7 +4972,7 @@ th.attr-unknown { color: #dc2626; }
       b.className = 'btn btn-sm';
       b.style.fontSize = '12px';
       b.style.padding = '3px 9px';
-      if (a.mandatory) { b.style.borderColor = '#fca5a5'; b.style.color = '#b91c1c'; b.style.fontWeight = '600'; }
+      if (a.mandatory) { b.style.borderColor = 'var(--phd-bd-fca5a5, #fca5a5)'; b.style.color = 'var(--phd-fg-b91c1c, #b91c1c)'; b.style.fontWeight = '600'; }
       b.textContent = (a.mandatory ? '*' : '') + a.name;
       b.title = [a.mandatory ? '必須' : '任意', a.inputMethod === 'SELECTIVE' ? '選択式' : null,
                  a.unit ? '単位:' + a.unit : null, a.maxLength ? '〜' + a.maxLength + '文字' : null]
@@ -5013,7 +5015,7 @@ th.attr-unknown { color: #dc2626; }
     tr.innerHTML = '<td><input type="text" class="rk-attr-name">'
       + (hint ? '<div class="muted" style="font-size:11px;"></div>' : '') + '</td>'
       + '<td><input type="text" class="rk-attr-value">'
-      + (selective ? '<div class="muted rk-attr-selective" style="font-size:11px; color:#b45309;"></div>' : '') + '</td>'
+      + (selective ? '<div class="muted rk-attr-selective" style="font-size:11px; color:var(--phd-fg-b45309, #b45309);"></div>' : '') + '</td>'
       + '<td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>';
     tr.querySelector('.rk-attr-name').value = name || '';
     tr.querySelector('.rk-attr-value').value = value || '';
@@ -5022,7 +5024,7 @@ th.attr-unknown { color: #dc2626; }
     if (selective) {
       tr.querySelector('.rk-attr-selective').textContent = SELECTIVE_NOTE;
     }
-    if (meta && meta.mandatory) tr.querySelector('.rk-attr-name').style.borderColor = '#fca5a5';
+    if (meta && meta.mandatory) tr.querySelector('.rk-attr-name').style.borderColor = 'var(--phd-bd-fca5a5, #fca5a5)';
     document.querySelector('#rk-attrs tbody').appendChild(tr);
     return tr;
   }
@@ -5061,7 +5063,7 @@ th.attr-unknown { color: #dc2626; }
       mandatoryAttrNames = mandatory.map((a) => a.name); // バッジの必須属性リストも更新
       info.innerHTML = '';
       const ok = document.createElement('span');
-      ok.style.color = '#166534';
+      ok.style.color = 'var(--phd-fg-166534, #166534)';
       ok.textContent = '✅ ' + (g.genrePath || g.genreName || genreId);
       const mut = document.createElement('span');
       mut.className = 'muted';
@@ -5662,7 +5664,7 @@ th.attr-unknown { color: #dc2626; }
       if (!json.ok) {
         // 自動保存の失敗は alert で作業を止めない (次の入力/手動保存で再試行される)
         if (opts.silent) {
-          result.style.color = '#dc2626';
+          result.style.color = 'var(--phd-fg-dc2626, #dc2626)';
           result.textContent = '自動保存に失敗しました — 「ページ表記を保存」で再試行してください';
           return null;
         }
@@ -6104,7 +6106,7 @@ th.attr-unknown { color: #dc2626; }
       const title = document.createElement('div');
       title.textContent = name + ' ';
       if (meta && meta.mandatory) {
-        const req = document.createElement('span'); req.style.color = '#dc2626'; req.textContent = '*必須'; title.appendChild(req);
+        const req = document.createElement('span'); req.style.color = 'var(--phd-fg-dc2626, #dc2626)'; req.textContent = '*必須'; title.appendChild(req);
       }
       th.appendChild(title);
       const hint = meta
@@ -6114,7 +6116,7 @@ th.attr-unknown { color: #dc2626; }
         : '';
       if (hint) { const h = document.createElement('div'); h.className = 'muted'; h.style.cssText = 'font-size:11px; font-weight:400;'; h.textContent = hint; th.appendChild(h); }
       if (meta && meta.inputMethod === 'SELECTIVE') {
-        const w = document.createElement('div'); w.className = 'muted'; w.style.cssText = 'font-size:11px; font-weight:400; color:#b45309;';
+        const w = document.createElement('div'); w.className = 'muted'; w.style.cssText = 'font-size:11px; font-weight:400; color:var(--phd-fg-b45309, #b45309);';
         w.textContent = '⚠️ 楽天が用意した値と同じ表記で'; th.appendChild(w);
       }
       const btns = document.createElement('div');
@@ -6742,7 +6744,7 @@ th.attr-unknown { color: #dc2626; }
     const setMsg = (text, warn) => {
       if (!msg) return;
       msg.textContent = text;
-      msg.style.color = warn ? '#b91c1c' : '';
+      msg.style.color = warn ? 'var(--phd-fg-b91c1c, #b91c1c)' : '';
       msg.style.fontWeight = warn ? '700' : '';
     };
     btn.addEventListener('click', async () => {
@@ -6916,22 +6918,22 @@ th.attr-unknown { color: #dc2626; }
     }
     function card(c) {
       const v = lpiCardView(c, state, busy[c.root_id]);
-      const box = el('div', 'border:1px solid ' + (v.checked ? '#86efac' : '#e2e8f0') + '; border-radius:8px; padding:4px; background:#fff; font-size:11px;');
+      const box = el('div', 'border:1px solid ' + (v.checked ? 'var(--phd-bd-86efac, #86efac)' : 'var(--phd-bd-e2e8f0, #e2e8f0)') + '; border-radius:8px; padding:4px; background:var(--phd-bg-fff, #fff); font-size:11px;');
       box.dataset.rootId = String(c.root_id);
       if (v.imgSrc) {
         const a = el('a');
         a.href = v.openUrl; a.target = '_blank'; a.rel = 'noopener'; a.title = 'Drive で開く';
-        const img = el('img', 'width:100%; aspect-ratio:1/1; object-fit:contain; background:#f8fafc; border-radius:6px;');
+        const img = el('img', 'width:100%; aspect-ratio:1/1; object-fit:contain; background:var(--phd-bg-f8fafc, #f8fafc); border-radius:6px;');
         img.src = v.imgSrc; img.alt = v.label + ' ' + v.role; img.loading = 'lazy';
         a.appendChild(img);
         box.appendChild(a);
       } else {
-        box.appendChild(el('div', 'width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; background:#f8fafc; border-radius:6px; color:#64748b; text-align:center; padding:4px;', v.placeholder));
+        box.appendChild(el('div', 'width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; background:var(--phd-bg-f8fafc, #f8fafc); border-radius:6px; color:var(--phd-fg-64748b, #64748b); text-align:center; padding:4px;', v.placeholder));
       }
       const meta = el('div', 'display:flex; gap:4px; align-items:baseline; margin-top:3px; flex-wrap:wrap;');
       meta.appendChild(el('b', '', v.label));
-      meta.appendChild(el('span', 'color:#475569;', v.role));
-      if (v.versionText) meta.appendChild(el('span', 'color:#94a3b8;', v.versionText));
+      meta.appendChild(el('span', 'color:var(--phd-fg-475569, #475569);', v.role));
+      if (v.versionText) meta.appendChild(el('span', 'color:var(--phd-fg-94a3b8, #94a3b8);', v.versionText));
       box.appendChild(meta);
       if (v.openUrl) {
         const open = el('a', 'font-size:11px;', 'Drive で開く ↗');
@@ -6949,8 +6951,8 @@ th.attr-unknown { color: #dc2626; }
       rb.addEventListener('click', () => regen(c));
       act.appendChild(cb); act.appendChild(rb);
       box.appendChild(act);
-      if (v.error) box.appendChild(el('div', 'color:#b45309; margin-top:2px; white-space:pre-wrap;', v.error));
-      if (cardMsg[c.root_id]) box.appendChild(el('div', 'color:#b91c1c; margin-top:2px; white-space:pre-wrap;', cardMsg[c.root_id]));
+      if (v.error) box.appendChild(el('div', 'color:var(--phd-fg-b45309, #b45309); margin-top:2px; white-space:pre-wrap;', v.error));
+      if (cardMsg[c.root_id]) box.appendChild(el('div', 'color:var(--phd-fg-b91c1c, #b91c1c); margin-top:2px; white-space:pre-wrap;', cardMsg[c.root_id]));
       return box;
     }
 
@@ -6959,7 +6961,7 @@ th.attr-unknown { color: #dc2626; }
       const v = lpiView(s, posting);
       checksEl.textContent = '';
       for (const x of v.checks) {
-        const li = el('li', 'color:' + (x.ok ? '#166534' : '#64748b') + ';', (x.ok ? '✓ ' : '・ ') + x.text);
+        const li = el('li', 'color:' + (x.ok ? 'var(--phd-fg-166534, #166534)' : 'var(--phd-fg-64748b, #64748b)') + ';', (x.ok ? '✓ ' : '・ ') + x.text);
         li.dataset.ok = x.ok ? '1' : '0';
         checksEl.appendChild(li);
       }
@@ -7122,8 +7124,8 @@ th.attr-unknown { color: #dc2626; }
       open.href = v.openUrl || '#';
       const staleBox = $('dsheet-stale');
       staleBox.hidden = !v.showStale;
-      staleBox.style.background = v.staleWarn ? '#fef3c7' : 'transparent';
-      staleBox.style.borderColor = v.staleWarn ? '#f59e0b' : '#e2e8f0';
+      staleBox.style.background = v.staleWarn ? 'var(--phd-bg-fef3c7, #fef3c7)' : 'transparent';
+      staleBox.style.borderColor = v.staleWarn ? 'var(--phd-bd-f59e0b, #f59e0b)' : 'var(--phd-bd-e2e8f0, #e2e8f0)';
       staleBox.dataset.warn = v.staleWarn ? '1' : '0';
       $('dsheet-stale-text').textContent = v.staleText;
       const upd = $('dsheet-update');
@@ -7974,7 +7976,7 @@ th.attr-unknown { color: #dc2626; }
       if (!url) return;                       // 空欄で離れただけ = 何もしない
       if (!/^https?:\/\//i.test(url)) {
         // 打ちかけで離れただけの可能性があるので、消さずに理由だけ出す
-        msg.style.color = '#dc2626';
+        msg.style.color = 'var(--phd-fg-dc2626, #dc2626)';
         msg.textContent = 'http:// または https:// で始まる URL を入力してください';
         return;
       }
@@ -7985,7 +7987,7 @@ th.attr-unknown { color: #dc2626; }
         // showAndReload は成功時に読み直す (一覧・タブのバッジ・AI参照元の判定まで揃える)
         showAndReload(await post(BASE + '/refs', { url }), '追加しました');
       } catch (e) {
-        msg.style.color = '#dc2626';
+        msg.style.color = 'var(--phd-fg-dc2626, #dc2626)';
         msg.textContent = '通信エラーで追加できませんでした — もう一度お試しください';
       } finally {
         // 例外時に busy を握ったままにしない (以後 Enter もボタンも無反応になる — Codex R1 低)
@@ -8018,7 +8020,7 @@ th.attr-unknown { color: #dc2626; }
           // 素材を直した直後の失敗で、旧内容を最新と誤認してコピーしてしまう)
           status.textContent = '⚠️ 組み立てに失敗しました'
             + (latest ? ' — 下の表示とコピーは前回の結果です' : '') + ': ' + (j.error || '');
-          status.style.color = '#dc2626';
+          status.style.color = 'var(--phd-fg-dc2626, #dc2626)';
           return;
         }
         status.style.color = '';
@@ -8028,7 +8030,7 @@ th.attr-unknown { color: #dc2626; }
           const html = j[key] || '';
           const lenEl = document.getElementById('desc3-len-' + key);
           lenEl.textContent = html.length + '字 / 上限' + j.limit + '字';
-          lenEl.style.color = html.length > j.limit ? '#dc2626' : '';
+          lenEl.style.color = html.length > j.limit ? 'var(--phd-fg-dc2626, #dc2626)' : '';
           const box = document.getElementById('desc3-render-' + key);
           if (!html) {
             box.innerHTML = '';
@@ -8041,14 +8043,14 @@ th.attr-unknown { color: #dc2626; }
         }
         if (j.imageCount > j.transferredCount) {
           document.getElementById('desc3-render-sales').insertAdjacentHTML('afterbegin',
-            '<div style="color:#b45309; font-size:12px;">⚠️ 未転送の画像が ' + (j.imageCount - j.transferredCount)
+            '<div style="color:var(--phd-fg-b45309, #b45309); font-size:12px;">⚠️ 未転送の画像が ' + (j.imageCount - j.transferredCount)
             + ' 枚あります (転送すると販売説明文に追加されます)</div>');
         }
         status.textContent = '';
       } catch (e) {
         const st = document.getElementById('desc3-status');
         st.textContent = '⚠️ 通信エラー' + (latest ? ' — 下の表示とコピーは前回の結果です' : '') + ': ' + e.message;
-        st.style.color = '#dc2626';
+        st.style.color = 'var(--phd-fg-dc2626, #dc2626)';
       } finally {
         btn.disabled = false;
       }
@@ -8077,7 +8079,7 @@ th.attr-unknown { color: #dc2626; }
       const url = urlEl.value.trim();
       const manualUrl = url !== '' && !isAutoUrl(url, asinEl.value.trim());
       asinEl.disabled = manualUrl;
-      asinEl.style.background = manualUrl ? '#f1f5f9' : '';
+      asinEl.style.background = manualUrl ? 'var(--phd-bg-f1f5f9, #f1f5f9)' : '';
       noteEl.hidden = !manualUrl;
     };
     asinEl.addEventListener('input', () => {
@@ -8205,7 +8207,7 @@ th.attr-unknown { color: #dc2626; }
         const readOnly = json.writable === false;
         status.textContent = items.length + ' 枚 (新しい順)' + (json.truncated ? ' — 多すぎるため一部だけ表示しています' : '')
           + (readOnly ? ' ｜ ⚠ この受信箱から画像を動かす権限がありません。画像フォルダがある商品では、いま選んでも移動できず登録もされません (Drive で受信箱フォルダのサービスアカウントを「コンテンツ管理者」にしてください)' : '');
-        status.style.color = readOnly ? '#b45309' : '';
+        status.style.color = readOnly ? 'var(--phd-fg-b45309, #b45309)' : '';
         render();
       } catch (e) {
         status.textContent = '⚠ 読み込みに失敗しました: ' + e.message;
@@ -8310,10 +8312,10 @@ th.attr-unknown { color: #dc2626; }
       const n = ta.value.length;
       if (lenEl) {
         lenEl.textContent = max ? (n + ' / ' + max + '文字') : (n + '文字');
-        lenEl.style.color = max && n > max ? '#dc2626' : '';
+        lenEl.style.color = max && n > max ? 'var(--phd-fg-dc2626, #dc2626)' : '';
         lenEl.style.fontWeight = max && n > max ? '700' : '';
       }
-      ta.style.borderColor = max && n > max ? '#dc2626' : '';
+      ta.style.borderColor = max && n > max ? 'var(--phd-bd-dc2626, #dc2626)' : '';
     };
     ta.addEventListener('input', update);
     update();
