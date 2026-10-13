@@ -197,6 +197,7 @@
     border: 1px solid #cbd5e1; border-radius: 6px; }
   .ad-stage-opts label { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
 </style>
+<%- include('_board-theme') %>
 
 <%
   // フィルタとタブの URL。切り替えても他の条件 (担当者・未割り当て・ビュー・種別) を失わない
@@ -245,7 +246,7 @@
 
 <div class="wrap wide">
   <div class="filters">
-    <span style="font-size:15px; font-weight:700;">🔁 工程ボード</span>
+    <span class="kb-board-title" style="font-size:15px; font-weight:700;">🔁 工程ボード</span>
     <span class="kb-tabs">
       <a class="kb-tab <%= boardView === 'main' ? 'on' : '' %>" href="<%= boardUrl({ view: 'main' }) %>">全体</a>
       <a class="kb-tab <%= boardView === 'single' ? 'on' : '' %>" href="<%= boardUrl({ view: 'single' }) %>">単品</a>
@@ -272,8 +273,7 @@
         絞り込み中に 0 と出ると確認中が無いように見えて、拾うための入口がそこで消える。
         画像ビューはカード = 商品×種別なので、この件数とカード枚数は一致しない (Codex R1) %>
     <a class="chip <%= checkingOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: 'checking' }) %>"
-       title="確認中の商品の件数 (いまの絞り込み・ビューに関わらない全体の数)"
-       style="<%= !checkingOnly && board.checkingTotal > 0 ? 'border-color:#3b82f6; color:#1e40af;' : '' %>">
+       title="確認中の商品の件数 (いまの絞り込み・ビューに関わらない全体の数)"<%- !checkingOnly && board.checkingTotal > 0 ? ' data-alert' : '' %>>
       🔍 確認中<%= board.checkingTotal > 0 ? ` ${board.checkingTotal}` : '' %>
     </a>
     <% if (byAssignee) { %>
@@ -287,7 +287,7 @@
     <% } %><%# /boardView !== 'ad' (広告タブは担当者・確認中で絞らない = 広告の作業は工程の担当と別) %>
     <%# 検索 (2026-08-25 中原さん要望): 商品名・商品コードでカードを即時絞り込み (入力のたび・リロード不要) %>
     <input type="search" id="kb-search" placeholder="🔍 商品名・商品コード"
-           style="width:190px; font-size:12px; padding:5px 9px; border:1px solid #cbd5e1; border-radius:8px;">
+           style="width:190px; font-size:12px; padding:5px 9px; border-width:1px; border-style:solid; border-radius:8px;">
     <span style="flex:1"></span>
     <%# 🆕 JAN を Company DB と比べた結果の一言 (Company DB構想 21 B1)。ボードを開いた後に画面が読む %>
     <span id="kb-jan-status" class="kb-jan-status muted" hidden></span>
@@ -427,7 +427,7 @@
       <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
         <button type="button" class="chip on ad-filter" data-stage="">すべて <%= adOps.rows.length %></button>
         <% if (adOps.counts.warn > 0) { %>
-          <button type="button" class="chip ad-filter" data-stage="warn" style="border-color:#fdba74; color:#b45309;">⚠ 記録と実績が違う <%= adOps.counts.warn %></button>
+          <button type="button" class="chip chip-warn ad-filter" data-stage="warn">⚠ 記録と実績が違う <%= adOps.counts.warn %></button>
         <% } %>
         <% for (const s of ['running', 'kw_ready', 'none', 'stopped']) { %>
           <button type="button" class="chip ad-filter" data-stage="<%= s %>"><%= adOpsDefs.stageJa[s] %> <%= adOps.counts[s] %></button>
@@ -800,7 +800,7 @@
                   同じ商品の TOP カードと詳細カードには同じものが出る (片方を変えると両方に効く) %>
               <% const pr = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
               <select class="kb-priority" data-draft="<%= c.id %>"
-                      style="<%= pr ? `background:${pr.bg}; color:${pr.fg}; border-color:${pr.fg}33; font-weight:600;` : '' %>">
+                      style="<%= pr ? `background:${pr.fg}40; color:${pr.bg}; border-color:${pr.bg}88; font-weight:600;` : '' %>">
                 <option value="">重要度: 未設定</option>
                 <% for (const p of imagePriorities) { %>
                   <option value="<%= p.value %>" <%= c.image_priority === p.value ? 'selected' : '' %>><%= p.value %></option>
@@ -815,7 +815,7 @@
 
     <!-- 終端列: 完了 (画像ビューでは「TOP済み・詳細も済みか対象外」の商品)。
          D&D で落とすと残りの工程をまとめて完了にする (本流は listing のモール決着チェックで止まる) -->
-    <div class="kb-col" style="background:#f0fdf4;" data-col="done">
+    <div class="kb-col kb-col-done" data-col="done">
       <div class="kb-col-head">
         <span class="kb-col-title">✅ 完了</span>
         <span class="kb-col-count"><%= board.doneTotal %></span>
@@ -874,7 +874,7 @@
           <% if (boardView === 'image') { %>
             <% const prd = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
             <select class="kb-priority" data-draft="<%= c.id %>"
-                    style="<%= prd ? `background:${prd.bg}; color:${prd.fg}; border-color:${prd.fg}33; font-weight:600;` : '' %>">
+                    style="<%= prd ? `background:${prd.fg}40; color:${prd.bg}; border-color:${prd.bg}88; font-weight:600;` : '' %>">
               <option value="">重要度: 未設定</option>
               <% for (const p of imagePriorities) { %>
                 <option value="<%= p.value %>" <%= c.image_priority === p.value ? 'selected' : '' %>><%= p.value %></option>
@@ -1570,10 +1570,10 @@
         const p = PR.find((x) => x.value === s.value);
         document.querySelectorAll('.kb-priority[data-draft="' + s.dataset.draft + '"]').forEach(function (o) {
           o.value = s.value;
-          o.style.background = p ? p.bg : '';
-          o.style.color = p ? p.fg : '';
+          o.style.background = p ? p.fg + '40' : '';
+          o.style.color = p ? p.bg : '';
           // 枠線も揃える (初期描画は border-color も重要度色。ここを抜くと枠だけ前の色が残る)
-          o.style.borderColor = p ? p.fg + '33' : '';
+          o.style.borderColor = p ? p.bg + '88' : '';
           o.style.fontWeight = p ? '600' : '';
         });
       } catch (err) {

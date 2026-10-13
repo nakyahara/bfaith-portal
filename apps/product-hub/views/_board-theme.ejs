@@ -1,0 +1,176 @@
+<%# 工程ボードの黒背景テーマ (2026-10-13 中原さん要望「黒背景で近未来的な UI に」)。
+    board.ejs の <style> と _header の共通スタイルより後に読み込み、後勝ちで色だけを上書きする。
+    レイアウト (幅・余白・並び) には触らない = 既存の挙動とテストに影響させない。
+    タグ類は「明るい地 + 濃い文字」を「色の薄い半透明の地 + 明るい文字 + 色の縁」に置き換え、
+    色の意味 (赤 = 要対応・緑 = 済・黄 = 保留 …) はそのまま残す %>
+<style>
+  :root {
+    --kb-bg: #05080f;
+    --kb-panel: rgba(13, 20, 36, .82);
+    --kb-panel-2: rgba(18, 28, 50, .9);
+    --kb-line: rgba(56, 189, 248, .16);
+    --kb-line-strong: rgba(56, 189, 248, .38);
+    --kb-text: #e2e8f0;
+    --kb-sub: #94a3b8;
+    --kb-dim: #64748b;
+    --kb-cyan: #22d3ee;
+    --kb-blue: #60a5fa;
+    --kb-violet: #a78bfa;
+    --kb-glow: 0 0 0 1px rgba(34, 211, 238, .35), 0 0 18px rgba(34, 211, 238, .18);
+  }
+  html { background: var(--kb-bg); color-scheme: dark; }
+  body {
+    color: var(--kb-text);
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(34, 211, 238, .10), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(139, 92, 246, .12), transparent 60%),
+      linear-gradient(rgba(56, 189, 248, .045) 1px, transparent 1px) 0 0 / 32px 32px,
+      linear-gradient(90deg, rgba(56, 189, 248, .045) 1px, transparent 1px) 0 0 / 32px 32px,
+      var(--kb-bg);
+    background-attachment: fixed;
+  }
+  ::selection { background: rgba(34, 211, 238, .35); }
+  * { scrollbar-color: rgba(56, 189, 248, .35) transparent; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: rgba(56, 189, 248, .3); border-radius: 999px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  /* ---- 共通部品 (_header の白基調を上書き) ---- */
+  .topbar { background: rgba(5, 8, 15, .85); border-bottom: 1px solid var(--kb-line-strong);
+            box-shadow: 0 1px 24px rgba(34, 211, 238, .12); backdrop-filter: blur(8px); }
+  .topbar .app-title { color: #fff; text-shadow: 0 0 10px rgba(34, 211, 238, .55); letter-spacing: .04em; }
+  .topbar a { color: var(--kb-sub); }
+  .topbar a:hover { color: var(--kb-cyan); }
+  .card { background: var(--kb-panel); border-color: var(--kb-line); color: var(--kb-text);
+          box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03); }
+  .btn { background: rgba(15, 23, 42, .7); border-color: var(--kb-line-strong); color: var(--kb-text); }
+  .btn:hover { background: rgba(34, 211, 238, .12); border-color: var(--kb-cyan); }
+  .btn-primary { background: linear-gradient(135deg, #0891b2, #2563eb); border-color: #22d3ee; color: #fff; }
+  .btn-primary:hover { background: linear-gradient(135deg, #06b6d4, #3b82f6); }
+  .btn-danger { color: #fca5a5; border-color: rgba(248, 113, 113, .5); }
+  .muted, .kb-set-note, .kb-empty, .mini, .kb-code { color: var(--kb-dim); }
+  label { color: var(--kb-sub); }
+  a { color: var(--kb-blue); }
+  input[type=text], input[type=number], input[type=url], input[type=search], textarea, select {
+    background: rgba(2, 6, 14, .8); color: var(--kb-text); border-color: var(--kb-line-strong); }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--kb-cyan); box-shadow: var(--kb-glow); }
+  input::placeholder, textarea::placeholder { color: var(--kb-dim); }
+  option { background: #0b1222; color: var(--kb-text); }
+  .banner-warn { background: rgba(250, 204, 21, .1); border-color: rgba(250, 204, 21, .45); color: #fde68a; }
+  table.list th { color: var(--kb-cyan); border-bottom-color: var(--kb-line-strong); letter-spacing: .03em; }
+  table.list td { border-bottom-color: rgba(56, 189, 248, .08); }
+  table.list tr:hover td { background: rgba(34, 211, 238, .05); }
+  .thumb, .kb-thumb { background: #0b1222; border-color: var(--kb-line); }
+
+  /* ---- 見出し・絞り込み・タブ ---- */
+  .kb-board-title { color: #fff; letter-spacing: .06em;
+                    text-shadow: 0 0 12px rgba(34, 211, 238, .6); }
+  .chip { background: rgba(15, 23, 42, .7); border-color: var(--kb-line-strong); color: var(--kb-sub); }
+  .chip:hover { color: var(--kb-text); border-color: var(--kb-cyan); }
+  .chip.on { background: rgba(34, 211, 238, .16); border-color: var(--kb-cyan); color: #a5f3fc; box-shadow: var(--kb-glow); }
+  .chip[data-alert] { border-color: #3b82f6; color: #93c5fd; }
+  .chip.chip-warn { border-color: rgba(251, 146, 60, .6); color: #fdba74; }
+  .kb-tabs { border-color: var(--kb-line-strong); background: rgba(2, 6, 14, .6); }
+  .kb-tab { background: transparent; color: var(--kb-sub); }
+  .kb-tab:hover { color: var(--kb-text); background: rgba(34, 211, 238, .06); }
+  .kb-tab.on { background: linear-gradient(180deg, rgba(34, 211, 238, .28), rgba(37, 99, 235, .22));
+               color: #fff; box-shadow: inset 0 -2px 0 var(--kb-cyan); text-shadow: 0 0 8px rgba(34, 211, 238, .7); }
+  .kb-tab-n { background: rgba(248, 113, 113, .25); color: #fecaca; }
+
+  /* ---- 列 ---- */
+  .kb-col { background: linear-gradient(180deg, rgba(15, 23, 42, .85), rgba(8, 13, 25, .85));
+            border: 1px solid var(--kb-line); box-shadow: inset 0 1px 0 rgba(34, 211, 238, .12); }
+  .kb-col.system { background: rgba(8, 13, 25, .6); border: 1px dashed rgba(148, 163, 184, .3); }
+  .kb-col.kb-col-done { background: linear-gradient(180deg, rgba(6, 46, 34, .7), rgba(4, 20, 16, .75));
+                        border-color: rgba(52, 211, 153, .3); }
+  .kb-col-head { border-bottom: 1px solid var(--kb-line); margin-bottom: 8px; }
+  .kb-col-title { color: #e0f2fe; letter-spacing: .03em; }
+  .kb-col-count { color: var(--kb-cyan); font-family: ui-monospace, Consolas, monospace; }
+  .kb-col-role { color: var(--kb-dim); }
+  .kb-col.drop-ok { outline-color: var(--kb-cyan); background: rgba(34, 211, 238, .1); box-shadow: var(--kb-glow); }
+
+  /* ---- カード ---- */
+  .kb-card { background: var(--kb-panel-2); border-color: rgba(148, 163, 184, .16); color: var(--kb-text);
+             transition: border-color .15s, box-shadow .15s, transform .15s; }
+  .kb-card:hover { border-color: rgba(34, 211, 238, .6); box-shadow: var(--kb-glow); transform: translateY(-1px); }
+  .kb-card.stalled { border-color: rgba(248, 113, 113, .6); background: rgba(69, 10, 10, .45); }
+  .kb-card.is-set { border-left-color: var(--kb-violet); }
+  .kb-card.checking { border-color: rgba(96, 165, 250, .5); border-left-color: #3b82f6; background: rgba(23, 37, 84, .55); }
+  .kb-card.picked { outline-color: var(--kb-cyan); background: rgba(8, 51, 68, .7); }
+  .kb-card.kind-top { border-left-color: #3b82f6; background: rgba(23, 37, 84, .5); }
+  .kb-card.kind-detail { border-left-color: #8b5cf6; background: rgba(46, 16, 101, .4); }
+  .kb-name { color: #f1f5f9; }
+  .kb-assignee { color: var(--kb-sub); }
+  .kb-unassigned { color: #fbbf24; }
+  .kb-stall, .kb-kstall, .ne-late, .ad-late { color: #f87171; }
+  .kb-setline, .kb-krow, .ad-sub, .kb-rk-note { color: var(--kb-sub); }
+  .kb-krow .kb-kname { color: #cbd5e1; }
+  .kb-progress { background: rgba(148, 163, 184, .15); }
+  .kb-progress > i { background: linear-gradient(90deg, #22d3ee, #818cf8); box-shadow: 0 0 8px rgba(34, 211, 238, .7); }
+  .mall-dot { background: rgba(148, 163, 184, .3); }
+  .mall-dot.mall-done { background: #34d399; box-shadow: 0 0 6px rgba(52, 211, 153, .8); }
+  .mall-dot.mall-doing { background: #fbbf24; box-shadow: 0 0 6px rgba(251, 191, 36, .8); }
+  .mall-dot.mall-skip { background: #475569; }
+  .kb-priority { background: rgba(2, 6, 14, .8); border-color: var(--kb-line); color: var(--kb-text); }
+  .kb-set { border-top-color: rgba(148, 163, 184, .2); }
+  @keyframes kb-just-moved { 0% { box-shadow: 0 0 0 4px rgba(34, 211, 238, .9); } 100% { box-shadow: 0 0 0 0 rgba(34, 211, 238, 0); } }
+
+  /* ---- タグ・札: 色の意味ごとに「半透明の地 + 明るい文字」へ ---- */
+  .kb-tag { background: rgba(148, 163, 184, .1); color: #cbd5e1; border-color: rgba(148, 163, 184, .25); }
+  .kb-tag.mat-none { color: var(--kb-dim); }
+  /* 緑 = 済・揃った */
+  .kb-tag.ne-confirmed, .kb-tag.mat-ready, .kb-tag.mat-not_required, .kb-tag.ad-running,
+  .kb-state.done, .kb-rk-done, .kb-set-chip.create, .kb-set-chip.existing {
+    background: rgba(16, 185, 129, .14); color: #6ee7b7; border-color: rgba(52, 211, 153, .45); }
+  /* 黄 = 待ち・保留 */
+  .kb-tag.ne-requested, .kb-tag.ne-processing, .kb-tag.mat-internal_prep, .kb-tag.ad-kw_ready,
+  .kb-tag.cdb-group-ne_waiting, .kb-tag.cdb-group-two_axes, .kb-tag.cdb-group-no_children,
+  .kb-set-chip.hold, .kb-hold, .kb-parent-changed {
+    background: rgba(245, 158, 11, .13); color: #fcd34d; border-color: rgba(251, 191, 36, .45); }
+  /* 赤 = 要対応 */
+  .kb-tag.ne-needs_action, .kb-tag.mat-not_shipped, .kb-hold.kb-aiblock, .kb-rk-fail, .kb-set-chip.none-yet {
+    background: rgba(239, 68, 68, .14); color: #fca5a5; border-color: rgba(248, 113, 113, .5); }
+  /* 橙 = 注意 */
+  .kb-tag.ship-check, .kb-tag.backlabel, .kb-tag.cdb-group-attention, .kb-tag.info-missing, .kb-tag.jan-check,
+  .kb-hold.kb-checking.long, .kb-state.todo {
+    background: rgba(249, 115, 22, .13); color: #fdba74; border-color: rgba(251, 146, 60, .45); }
+  /* 青 = 進行中・確認中 */
+  .kb-tag.mat-shooting, .kb-tag.mat-shipped, .kb-hold.kb-checking, .kb-rk-busy, .kb-kind.top, .kb-kindband.top {
+    background: rgba(59, 130, 246, .16); color: #93c5fd; border-color: rgba(96, 165, 250, .45); }
+  /* 紫 = セット・修正・詳細画像 */
+  .kb-tag.set, .kb-tag.setstep, .kb-tag.rev, .kb-tag.cdb-group, .kb-tag.decision, .kb-kind.detail, .kb-kindband.detail {
+    background: rgba(139, 92, 246, .16); color: #c4b5fd; border-color: rgba(167, 139, 250, .45); }
+  /* 水色 = Canva・既存ページ */
+  .kb-tag.canva, .kb-tag.existing-page {
+    background: rgba(34, 211, 238, .12); color: #67e8f9; border-color: rgba(34, 211, 238, .45); }
+  /* 灰 = 対象外・未着手 */
+  .kb-tag.ne-not_requested, .kb-tag.ad-none, .kb-tag.ad-stopped, .kb-state.off, .kb-rk-skip, .kb-set-chip.none {
+    background: rgba(148, 163, 184, .08); color: var(--kb-sub); border-color: rgba(148, 163, 184, .25); }
+  .kb-jan-status.warn, .kb-rk-warn, .ad-warnmsg { color: #fdba74; }
+  .ne-err { color: #fca5a5; }
+  .ne-table .prov, .kb-setline .prov { color: #fcd34d; }
+  .kb-rk-link { color: #67e8f9; }
+
+  /* ---- カードの中のボタン ---- */
+  .kb-rk-btn { background: rgba(239, 68, 68, .1); border-color: rgba(248, 113, 113, .6); color: #fca5a5; }
+  .kb-rk-btn:hover { background: rgba(239, 68, 68, .22); box-shadow: 0 0 12px rgba(239, 68, 68, .35); }
+  .kb-set-btn { background: rgba(15, 23, 42, .8); border-color: rgba(148, 163, 184, .35); color: #cbd5e1; }
+  .kb-set-btn:hover { background: rgba(34, 211, 238, .1); }
+  .kb-set-btn.make { border-color: var(--kb-cyan); color: #67e8f9; }
+  .kb-set-btn.undo { color: var(--kb-sub); }
+
+  /* ---- まとめて移動のバー・ダイアログ・出品中の表示 ---- */
+  .kb-pickbar { background: rgba(8, 51, 68, .92); border: 1px solid var(--kb-cyan); box-shadow: var(--kb-glow), 0 8px 24px rgba(0, 0, 0, .5); }
+  .kb-pickbar button { background: var(--kb-cyan); color: #04121a; font-weight: 700; }
+  .kb-busy, .kb-modal { background: rgba(0, 0, 0, .65); backdrop-filter: blur(3px); }
+  .kb-busy-box, .kb-modal-box { background: #0b1222; color: var(--kb-text); border: 1px solid var(--kb-line-strong);
+                                box-shadow: var(--kb-glow), 0 20px 50px rgba(0, 0, 0, .6); }
+  .kb-busy-box .step { color: var(--kb-sub); }
+  .kb-modal-box select, .kb-modal-box input[type="text"], .ad-modal-box textarea {
+    background: rgba(2, 6, 14, .8); color: var(--kb-text); border-color: var(--kb-line-strong); }
+
+  /* ---- 表のタブ (NE要対応・広告) ---- */
+  .ad-table tr.ad-warn > td { background: rgba(249, 115, 22, .08); }
+  .ad-live.on { background: #34d399; box-shadow: 0 0 6px rgba(52, 211, 153, .8); }
+  .ad-live.off { background: #475569; }
+</style>
