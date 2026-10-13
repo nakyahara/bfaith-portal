@@ -435,6 +435,57 @@ try {
     } finally { ph.prepare(`DELETE FROM product_drafts WHERE id IN (${ids.join(',')})`).run(); }
   });
 
+  await ta('[G6b] 数えで読む行は候補のドラフトの分だけ: 関係ない登録済みの商品 (楽天の行・SKU の JAN・なしの理由) を増やしても読む行の数が増えない (Codex #1713 R2 L1)', () => {
+    const countRows = () => {
+      const orig = ph.prepare;
+      let rows = 0;
+      ph.prepare = function (...a) {
+        const st = orig.apply(this, a);
+        const all = st.all.bind(st);
+        const get = st.get.bind(st);
+        st.all = (...x) => { const r = all(...x); rows += r.length; return r; };
+        st.get = (...x) => { const r = get(...x); if (r) rows += 1; return r; };
+        return st;
+      };
+      try { LJ.enforceForecast(ph); } finally { ph.prepare = orig; }
+      return rows;
+    };
+    const before = countRows();
+    const ids = [];
+    ph.transaction(() => {
+      for (let i = 0; i < 30; i++) {
+        const id = Number(ph.prepare('INSERT INTO product_drafts (ne_code, name) VALUES (?, ?)').run(`done-${i}`, 'x').lastInsertRowid);
+        ids.push(id);
+        ph.prepare(`INSERT INTO draft_rakuten (draft_id, catalog_id_exemption_reason, registered_at) VALUES (?, 5, '2026-10-01T00:00:00Z')`).run(id);
+        for (let k = 0; k < 3; k++) {
+          ph.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(id, `done-${i}-${k}`, `j-${i}-${k}`);
+          ph.prepare('INSERT INTO draft_sku_catalog_exemptions (draft_id, sku_code, reason) VALUES (?, ?, 3)').run(id, `done-${i}-${k}`);
+        }
+      }
+    })();
+    try {
+      const after = countRows();
+      assert.equal(after, before, `登録済みの商品を 30 足したら読む行が ${before} → ${after}`);
+    } finally {
+      const list = ids.join(',');
+      for (const t of ['draft_sku_catalog_exemptions', 'draft_sku_jans', 'draft_rakuten']) ph.prepare(`DELETE FROM ${t} WHERE draft_id IN (${list})`).run();
+      ph.prepare(`DELETE FROM product_drafts WHERE id IN (${list})`).run();
+    }
+  });
+
+  await ta('[G7] 商品コードが無い商品: 選ぶ画面の答えは「読めない」でなく「出品の商品コードが無い」(門と同じ理由・Codex #1713 R2 L2)', async () => {
+    const dEmpty = draft('', null);
+    try {
+      const r = await janCheck(dEmpty.id);
+      assert.equal(r.status, 200);
+      assert.equal(r.j.picks.readable, true);
+      assert.deepEqual(r.j.picks.units, []);
+      assert.deepEqual(r.j.picks.noCode, { state: 'no_code', label: '出品の商品コードが無い', text: LJ.JAN_GATE_PROBLEMS.no_code.text, fix: LJ.JAN_GATE_PROBLEMS.no_code.fix });
+      assert.deepEqual(LJ.gateProblemsOf(LJ.listingJanUnits(ph, dEmpty.id)).map((x) => x.d.problem), ['no_code'], '門と同じ理由');
+      assert.equal(pickOf((await janCheck(dS1.id)).j, 's001') && (await janCheck(dS1.id)).j.picks.noCode, null, '商品コードがある商品に noCode');
+    } finally { ph.prepare('DELETE FROM product_drafts WHERE id = ?').run(dEmpty.id); }
+  });
+
   // ═══ P 段 5: 送る直前の 1 か所 ═══
   console.log('P 送る直前の 1 か所 (段 5)');
   await ta('[P1] 既定 = Company DB を読まずに今までどおり jan_code を送る (手で打った値もそのまま)', async () => {
