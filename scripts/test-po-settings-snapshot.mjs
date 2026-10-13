@@ -1,5 +1,5 @@
 /**
- * test-po-settings-snapshot.mjs — 発注の設定の読むだけの写し (0076・apps/company-db/load/po-settings-snapshot.mjs・AI_reference CompanyDB構想/21 v4 の C2)
+ * test-po-settings-snapshot.mjs — 発注の設定の読むだけの写し (0077・apps/company-db/load/po-settings-snapshot.mjs・AI_reference CompanyDB構想/21 v4 の C2)
  *
  * Company DB = PGlite (全部の migration・夜間ロードで商品と代表の仕入先)。発注アプリ = 一時の DATA_DIR の warehouse-mirror.db (本番の DB に触らない)。
  * 固定する契約:
@@ -342,7 +342,7 @@ await ta('[S7] 権限: 書けるのは持ち主だけ (見張り・画面のロ�
     assert.ok((await one(`select po_order_lot from mart.v_product_360 where sku_code = 'snap-03'`)).po_order_lot);
   } finally { await pg.query('set role deploy'); }
   assert.match(String((await errOf(pg.query(`update purchasing.snapshot_runs set status = 'applied'`)))?.message), /append|reject|変え|mutation/i);
-  // 見張りのロールを流し直しても読める (0076 の後) / 0076 の前の DB でも流せる (purchasing が無い = 飛ばす)
+  // 見張りのロールを流し直しても読める (0077 の後) / 0077 の前の DB でも流せる (purchasing が無い = 飛ばす)
   const { roleStatements } = await import('./company-db/create-watch-roles.mjs');
   const st = roleStatements({ dbName: 'x', owner: 'deploy' }).filter((x) => x.includes('purchasing'));
   assert.equal(st.length, 1); assert.match(st[0], /if exists \(select 1 from pg_namespace where nspname = 'purchasing'\)/);
@@ -352,9 +352,9 @@ await ta('[S7] 権限: 書けるのは持ち主だけ (見張り・画面のロ�
   assert.deepEqual(N.DEFAULT_STEPS.map((s) => s.id), ['po-settings-outbox', 'po-settings-snapshot']);
 });
 
-await ta('[S8] 0076 の前の DB = 段は飛ばす (ok)・URL / DATA_DIR が無い = 段の失敗', async () => {
+await ta('[S8] 0077 の前の DB = 段は飛ばす (ok)・URL / DATA_DIR が無い = 段の失敗', async () => {
   const fake = async () => ({ query: async (t) => (/to_regclass\('purchasing\.snapshot_runs'\)/.test(t) ? { rows: [{ ok: false }] } : { rows: [] }), exec: async () => {} });
-  assert.deepEqual(await S.runPoSettingsSnapshotStep({ url: 'x', dataDir: DATA_DIR, connect: fake }), { ok: true, skipped: true, note: '0076 の前 (写しの表が無い)' });
+  assert.deepEqual(await S.runPoSettingsSnapshotStep({ url: 'x', dataDir: DATA_DIR, connect: fake }), { ok: true, skipped: true, note: '0077 の前 (写しの表が無い)' });
   assert.equal((await S.runPoSettingsSnapshotStep({ url: '', dataDir: DATA_DIR, connect: fake })).ok, false);
   assert.equal((await S.runPoSettingsSnapshotStep({ url: 'x', dataDir: '', connect: fake })).ok, false);
 });

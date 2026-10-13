@@ -999,7 +999,7 @@ export const JOBS_REGISTRY = [
       + '🆕 後ろの段 (本体のロードの後・別の接続・別の取引 = 段が失敗しても本体は戻さない・段の失敗 = この ping が fail): '
       + '① 発注の設定の知らせ (AI_reference CompanyDB構想/21 C1・migration 0075・lib/order-settings-outbox.mjs) = 新商品の登録で入れた発注の設定を発注アプリ (Render の SQLite の po_*) へ届け直す。'
       + '24 時間を超えて届いていない知らせが 1 つでもあれば段の失敗 (新しい定期実行は作らず、この 1 本の後ろに載せた)。'
-      + '② 発注の設定の写し (CompanyDB構想/21 C2・migration 0076・apps/company-db/load/po-settings-snapshot.mjs) = 発注アプリの発注の設定を Company DB の purchasing に読むだけの写しとして入れる。'
+      + '② 発注の設定の写し (CompanyDB構想/21 C2・migration 0077・apps/company-db/load/po-settings-snapshot.mjs) = 発注アプリの発注の設定を Company DB の purchasing に読むだけの写しとして入れる。'
       + '完全に読めた回だけ入れ替える (表が無い・列が無い・大きく減った・古い読み = 入れ替えず段の失敗)',
     where: 'Render bfaith-portal 内 node-cron (apps/company-db/nightly.mjs startCompanyDbNightlyLoadCron。'
       + 'COMPANY_DB_LOAD_CRON_ENABLED=1 かつ RENDER=true のときだけ起動。miniPC も同じ server.js を動かすので、'
@@ -1033,7 +1033,7 @@ export const JOBS_REGISTRY = [
       + '本当に消した = Render の env に PO_SNAPSHOT_ACCEPT_SHRINK=attrs:<今の件数> を入れる (1 回だけ効く・使った回は purchasing.snapshot_runs.override に残る・翌晩に入ったら env を消す)・'
       + 'invalid_value = 発注アプリの値が壊れている (数の列に文字・空の名前など。note の 表 鍵.列 を発注アプリのマスタ管理で直す)・'
       + 'duplicate_key / duplicate_sku = 発注アプリに大文字小文字・全角の記号だけ違う商品コードが 2 行 (発注アプリのマスタ管理で 1 つにする)・older_read / ambiguous_read = 同時に 2 本 (翌晩に直る)。'
-      + '復元の後 (purchasing はバックアップに入れていない = 空) = 0076 を確かめ、Render の Shell で node apps/company-db/load/po-settings-snapshot.mjs --apply (写しの段だけ・夜間ロードは流さない) → '
+      + '復元の後 (purchasing はバックアップに入れていない = 空) = 0077 を確かめ、Render の Shell で node apps/company-db/load/po-settings-snapshot.mjs --apply (写しの段だけ・夜間ロードは流さない) → '
       + 'purchasing.snapshot_runs の最新が applied・件数・purchasing.v_snapshot_status の read_at・watcher の select の権限を確かめる',
   },
   {

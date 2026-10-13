@@ -1,5 +1,5 @@
 /**
- * test-po-settings-snapshot-pg.mjs — 発注の設定の写し (0076・CompanyDB構想 21 C2) の**同時実行**と**ロールの権限**を実 PostgreSQL の独立した接続で確かめる
+ * test-po-settings-snapshot-pg.mjs — 発注の設定の写し (0077・CompanyDB構想 21 C2) の**同時実行**と**ロールの権限**を実 PostgreSQL の独立した接続で確かめる
  * 固定する契約:
  *   P1 同時に 2 本の写し = 順番 (鍵)・後の方は前の世代と比べる (同じ値 = unchanged・行は 1 回分)・遅れて来た古い読み = 入れ替えない
  *   P2 写しを入れている取引の途中 = 見張り (watcher の本物のログイン) は前の世代を読む (入れ替わるのは commit の時に一度に)

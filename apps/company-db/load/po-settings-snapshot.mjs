@@ -1,5 +1,5 @@
 /**
- * po-settings-snapshot.mjs — 発注の設定の読むだけの写し (発注アプリの SQLite → Company DB の purchasing・0076・AI_reference CompanyDB構想/21 v4 の C2)
+ * po-settings-snapshot.mjs — 発注の設定の読むだけの写し (発注アプリの SQLite → Company DB の purchasing・0077・AI_reference CompanyDB構想/21 v4 の C2)
  *
  * 正本は発注アプリ (Render の warehouse-mirror.db の po_*・D-44・中原さんの決定 1 = a)。Company DB は「前の夜の値」の写しを持つだけ (AI・照合が読む)。
  * いつ: 夜間ロード (apps/company-db/nightly.mjs = company-db-nightly-load) の後ろの段 (新しい定期実行は作らない)。本体のロードとは**別の接続・別の取引**
@@ -281,7 +281,7 @@ export function parseShrinkOverride(env = process.env) {
 
 /**
  * 夜間ロードの後ろの段。DATA_DIR の warehouse-mirror.db を読んで、持ち主のロールで入れる。
- * 戻り値 { ok, note, status? }。0076 の前 (purchasing の表が無い) = 飛ばす (ok)
+ * 戻り値 { ok, note, status? }。0077 の前 (purchasing の表が無い) = 飛ばす (ok)
  */
 export async function runPoSettingsSnapshotStep({ url, dataDir = process.env.DATA_DIR, connect = openPgClient, log = () => {}, host = 'render-nightly', read = readPoSettingsSnapshot } = {}) {
   if (!url) return { ok: false, note: 'COMPANY_DB_URL が無い' };
@@ -292,7 +292,7 @@ export async function runPoSettingsSnapshotStep({ url, dataDir = process.env.DAT
     if (client.on) client.on('error', (e) => log(`接続のエラー: ${e.message}`));
     const db = client.query && client.exec ? client : pgAdapter(client);
     await db.query(`set statement_timeout = '120s'`);
-    if (!(await db.query(`select to_regclass('purchasing.snapshot_runs') is not null as ok`)).rows[0].ok) return { ok: true, skipped: true, note: '0076 の前 (写しの表が無い)' };
+    if (!(await db.query(`select to_regclass('purchasing.snapshot_runs') is not null as ok`)).rows[0].ok) return { ok: true, skipped: true, note: '0077 の前 (写しの表が無い)' };
     // 鍵を取ってから読む (Codex #1708 R1 M1)
     const r = await applyPoSettingsSnapshot(db, () => read(path.join(dataDir, 'warehouse-mirror.db')), { host, shrinkOverride: parseShrinkOverride() });
     const snap = r.snap;

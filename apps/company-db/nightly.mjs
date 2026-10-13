@@ -24,7 +24,7 @@
  *     **別の接続・別の取引**で 1 つずつ流す。段が失敗しても本体のロード (もう commit 済み) は戻さない。段の失敗 = ジョブの ping は fail (理由を先頭に)。
  *     ・po-settings-outbox (C1・0075): 新商品の登録の発注の設定の知らせを発注アプリへ届け直す (lib/order-settings-outbox.mjs の runOrderSettingsNightlyStep)。
  *       24 時間を超えて届いていない知らせが 1 つでもあれば段の失敗 (= jobs-monitor が知らせる)。新しい定期実行は作らない (この 1 本の後ろの段)
- *     ・po-settings-snapshot (C2・0076): 発注アプリの発注の設定を Company DB の purchasing に読むだけの写しとして入れる (apps/company-db/load/po-settings-snapshot.mjs)。
+ *     ・po-settings-snapshot (C2・0077): 発注アプリの発注の設定を Company DB の purchasing に読むだけの写しとして入れる (apps/company-db/load/po-settings-snapshot.mjs)。
  *       知らせを届けた後に流す (届いた設定も写る)。完全に読めた回だけ入れ替える (不完全 = 前の世代のまま・段の失敗)
  *   - Dark Launch: env `COMPANY_DB_LOAD_CRON_ENABLED` が '1' / 'true' のときだけ起動する
  *   - 🚨 **待つのをやめる上限**はあるが、それでロード本体は止まらない (Postgres の 1 トランザクションを

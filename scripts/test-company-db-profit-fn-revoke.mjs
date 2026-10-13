@@ -132,7 +132,7 @@ await t('規則にかかる関数は全部 manifest にあり、manifest の関�
   for (const n of ['core.apply_order_finance_batch', 'core.apply_order_batch', 'core.apply_shipment_batch']) assert.equal(cls[n], 'guard_later', n);
 });
 await t('view の一覧 = mart / ops の全部の view (重い / 軽いと理由)・権限は 0056 で変えない / アプリの側の重い処理の一覧のファイルがある', async () => {
-  // 見る schema = 一覧の VIEW_SCHEMAS (🆕 0076 で purchasing も)。この DB は 0056 まで = 後の migration で足した view (since > 0056) は一覧から除いて比べる
+  // 見る schema = 一覧の VIEW_SCHEMAS (🆕 0077 で purchasing も)。この DB は 0056 まで = 後の migration で足した view (since > 0056) は一覧から除いて比べる
   //   (#1703 の 0075 の view が since つきで足されて、ここが落ちていた = C2 の PR で直す)
   const views = (await q(`select n.nspname || '.' || c.relname as v from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('v', 'm') and n.nspname = any($1::text[]) order by 1`, [VIEW_SCHEMAS])).map((r) => r.v);
   assert.deepEqual(HEAVY_VIEWS.filter((v) => !v.since || v.since <= '0056').map((v) => v.view).sort(), views);

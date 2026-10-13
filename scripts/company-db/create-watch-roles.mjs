@@ -28,7 +28,7 @@ import crypto from 'node:crypto';
 import { openPgClient } from './migrate.mjs';
 
 export const WATCH_SCHEMAS = ['core', 'snapshots', 'events', 'ops', 'mart'];
-/** 🆕 0076: あれば読ませる schema (purchasing = 発注の設定の読むだけの写し・CompanyDB構想 21 C2)。無い DB (0076 の前) では何もしない (流し直すと付く) */
+/** 🆕 0077: あれば読ませる schema (purchasing = 発注の設定の読むだけの写し・CompanyDB構想 21 C2)。無い DB (0077 の前) では何もしない (流し直すと付く) */
 export const WATCH_OPTIONAL_SCHEMAS = ['purchasing'];
 export const WATCH_TABLES = ['watch_runs', 'watch_results', 'watch_issues', 'watch_result_items'];
 export const RUNS_UPDATE_COLS = ['finished_at', 'completed_keys', 'summary', 'last_line'];

@@ -1,4 +1,4 @@
--- 0076: 発注の設定の読むだけの写し (schema purchasing) (2026-10-13。AI_reference CompanyDB構想/21 v4 の C2・中原さんの決定 1 = a / 5 = b)
+-- 0077: 発注の設定の読むだけの写し (schema purchasing) (2026-10-13。AI_reference CompanyDB構想/21 v4 の C2・中原さんの決定 1 = a / 5 = b)
 -- 🚨 前提 = 0001 (core.make_append_only)・0007 / 0009 (mart.v_product_360)・0075 (発注の設定の知らせ = 夜間の段の先の段)
 --
 -- なぜ: 発注の設定 (発注ロット・発注条件グループ・原料グループ・ケース・容量) の正本は発注アプリ (Render の SQLite の po_*・D-44・決定 1 = a)。
@@ -22,7 +22,7 @@
 -- 🚨 この migration は今のデータを何も変えない (新しい表は空 = 最初の夜間の段で入る)。バックアップ (apps/company-db/backup/dump.mjs) は取らない = 写しは発注アプリから作り直せる
 
 create schema purchasing;
-comment on schema purchasing is '発注アプリ (Render の SQLite の po_*) の発注の設定の読むだけの写し (0076・CompanyDB構想 21 C2)。正本は発注アプリ (D-44)。書くのは夜間ロードの後ろの段 (表の持ち主のロール) だけ';
+comment on schema purchasing is '発注アプリ (Render の SQLite の po_*) の発注の設定の読むだけの写し (0077・CompanyDB構想 21 C2)。正本は発注アプリ (D-44)。書くのは夜間ロードの後ろの段 (表の持ち主のロール) だけ';
 revoke all on schema purchasing from public;
 
 -- 1. 写しの世代
@@ -45,7 +45,7 @@ create table purchasing.snapshot_runs (
 );
 create index ix_snapshot_runs_read on purchasing.snapshot_runs (read_at desc) where status in ('applied', 'unchanged');
 select core.make_append_only('purchasing', 'snapshot_runs');
-comment on table purchasing.snapshot_runs is '発注の設定の写しの世代 (0076)。read_at = 発注アプリの SQLite を読んだ時刻。rejected = 完全に読めなかった (前の世代のまま)。追記だけ';
+comment on table purchasing.snapshot_runs is '発注の設定の写しの世代 (0077)。read_at = 発注アプリの SQLite を読んだ時刻。rejected = 完全に読めなかった (前の世代のまま)。追記だけ';
 
 -- 2. 写しの表
 create table purchasing.sku_order_settings (
@@ -65,7 +65,7 @@ create table purchasing.sku_order_settings (
   run_id                 text not null references purchasing.snapshot_runs
 );
 create index ix_sku_order_settings_sku on purchasing.sku_order_settings (sku_id);
-comment on table purchasing.sku_order_settings is '発注アプリ po_product_attrs の読むだけの写し (0076)。正本は発注アプリ。sku_id / primary_supplier_code = 写した時の Company DB の値。run_id = この行の値を最後に変えた世代';
+comment on table purchasing.sku_order_settings is '発注アプリ po_product_attrs の読むだけの写し (0077)。正本は発注アプリ。sku_id / primary_supplier_code = 写した時の Company DB の値。run_id = この行の値を最後に変えた世代';
 create table purchasing.order_condition_groups (
   condition_id           text primary key check (length(condition_id) between 1 and 255),
   supplier_code          text,
@@ -78,7 +78,7 @@ create table purchasing.order_condition_groups (
   source_updated_at      text,
   run_id                 text not null references purchasing.snapshot_runs
 );
-comment on table purchasing.order_condition_groups is '発注アプリ po_order_conditions (発注条件グループ) の読むだけの写し (0076)';
+comment on table purchasing.order_condition_groups is '発注アプリ po_order_conditions (発注条件グループ) の読むだけの写し (0077)';
 create table purchasing.material_groups (
   group_id               text primary key check (length(group_id) between 1 and 255),
   name                   text not null,
@@ -88,7 +88,7 @@ create table purchasing.material_groups (
   source_updated_at      text,
   run_id                 text not null references purchasing.snapshot_runs
 );
-comment on table purchasing.material_groups is '発注アプリ po_material_groups (原料グループ) の読むだけの写し (0076)';
+comment on table purchasing.material_groups is '発注アプリ po_material_groups (原料グループ) の読むだけの写し (0077)';
 
 -- 3. 今の写しの様子 (1 行・まだ 1 回も入っていない = 行なし)
 create view purchasing.v_snapshot_status as
@@ -100,7 +100,7 @@ create view purchasing.v_snapshot_status as
    where r.status in ('applied', 'unchanged')
    order by r.read_at desc, r.finished_at desc
    limit 1;
-comment on view purchasing.v_snapshot_status is '今の発注の設定の写し (0076)。read_at = いつの発注アプリの値か・age_hours・stale (36 時間超 = 決定 5 = b: 使ってよいが時刻を見せる)・rejected_since_at = その後に完全に読めなかった回';
+comment on view purchasing.v_snapshot_status is '今の発注の設定の写し (0077)。read_at = いつの発注アプリの値か・age_hours・stale (36 時間超 = 決定 5 = b: 使ってよいが時刻を見せる)・rejected_since_at = その後に完全に読めなかった回';
 
 -- 4. 商品 360 に発注の設定 (最後に列を足すだけ = 0009 の列はそのまま・同じ順)
 create or replace view mart.v_product_360 as
@@ -142,7 +142,7 @@ malls as (
   group by lc.sku_id
 ),
 po as (
-  -- 🆕 0076: 発注の設定の写し (発注アプリが正本・写した時刻つき)。SKU に 1 行だけ。同じ SKU に 2 行 (全角の記号だけ違うコードなど) = どちらか決められない =
+  -- 🆕 0077: 発注の設定の写し (発注アプリが正本・写した時刻つき)。SKU に 1 行だけ。同じ SKU に 2 行 (全角の記号だけ違うコードなど) = どちらか決められない =
   --   po_* は出さず po_settings_ambiguous = true (写しの段は duplicate_sku で断るので、ふだんは起きない・Codex #1708 R2 M2)
   select os.sku_id, pg_catalog.count(*)::int as n, pg_catalog.min(os.order_lot) as order_lot, pg_catalog.min(os.condition_id) as condition_id,
          pg_catalog.min(os.material_group_id) as material_group_id, pg_catalog.min(os.case_group) as case_group, pg_catalog.min(os.case_lot) as case_lot,
@@ -174,7 +174,7 @@ select
     case when s.handling = 'active' and coalesce(m.active_listing_count, 0) = 0 then 'no_active_listing' end
   ], null) as dq_flags,
   greatest(s.updated_at, p.updated_at) as updated_at,
-  -- 🆕 0076: 発注の設定 (発注アプリの写し)。po_settings_read_at = いつの発注アプリの値か (写しが無い = null)。古くても外さない (決定 5 = b)
+  -- 🆕 0077: 発注の設定 (発注アプリの写し)。po_settings_read_at = いつの発注アプリの値か (写しが無い = null)。古くても外さない (決定 5 = b)
   case when po.n = 1 then po.order_lot end as po_order_lot, case when po.n = 1 then po.condition_id end as po_condition_id,
   case when po.n = 1 then po.material_group_id end as po_material_group_id, case when po.n = 1 then po.case_group end as po_case_group,
   case when po.n = 1 then po.case_lot end as po_case_lot, case when po.n = 1 then po.capacity_per_unit end as po_capacity_per_unit,
