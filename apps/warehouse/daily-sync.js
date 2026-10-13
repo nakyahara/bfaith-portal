@@ -1532,7 +1532,10 @@ async function main() {
   // 最後の行 = 登録の状態の数・カード作成待ち・要確認 N 件 (確認済みにできる件数とコード・直す所の多い理由・一覧のはじめの 10 件)。1 件ずつの行はログだけ。
   // 要確認が 500 件を超える = 一覧は出さない (ops.quarantine_confirm_list の上限)。読めない・届かない = 止めずに ⚠️「読めない」(--daily = exit 0)。
   // RETRYABLE_JOBS に入れない (読むだけ・翌朝また読めば足りる)。⚠️「読めない」の朝だけ warn (要確認があるだけでは朝の見出しを ⚠️ にしない)
-  const registerSummaryResult = runScript('scripts/company-db/master-register-summary.mjs --daily', REGISTER_SUMMARY_STEP, 120000);
+  // 子の中の期限 (60 秒) でも終わらず親の 120 秒で殺された・子が落ちた = これも止めずに ⚠️ 読めない (❌ にしない。Codex #1717 R1 High)
+  const registerSummaryRaw = runScript('scripts/company-db/master-register-summary.mjs --daily', REGISTER_SUMMARY_STEP, 120000);
+  const registerSummaryResult = registerSummaryRaw.success || registerSummaryRaw.gated ? registerSummaryRaw
+    : { success: true, summary: `⚠️ 新商品と要確認のまとめ: 読めない (${String(registerSummaryRaw.summary || '').split('\n')[0].slice(0, 200)}) = 毎朝の通知は止めない・明日また読む` };
   results.push({ name: REGISTER_SUMMARY_STEP, ...registerSummaryResult, warn: registerSummaryResult.success && /読めない/.test(String(registerSummaryResult.summary || '')) });
 
   // Amazon手数料カバー率の監視 (SLO 監視、Codex+Claude 議論結果 2026-05-15)

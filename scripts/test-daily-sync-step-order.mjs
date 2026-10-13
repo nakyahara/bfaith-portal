@@ -121,7 +121,9 @@ await ta('[8] 新商品と要確認のまとめ (Company DB構想 22 の Q-4) = 
   assert.equal(count(SUMMARY), 1);
   const iSum = first(SUMMARY);
   assert.ok(first(GATE) < iSum && iSum < first(LZ) && iSum < first(WATCH), '置き場所が違う');
-  assert.match(body, /runScript\('scripts\/company-db\/master-register-summary\.mjs --daily', REGISTER_SUMMARY_STEP, 120000\)/);
+  assert.match(body, /const registerSummaryRaw = runScript\('scripts\/company-db\/master-register-summary\.mjs --daily', REGISTER_SUMMARY_STEP, 120000\)/);
+  // 親の 120 秒で殺された・子が落ちた = ⚠️ 読めない の成功に変える (❌ にしない。Codex #1717 R1 High)
+  assert.match(body, /const registerSummaryResult = registerSummaryRaw\.success \|\| registerSummaryRaw\.gated \? registerSummaryRaw\n\s+: \{ success: true, summary: `⚠️ 新商品と要確認のまとめ: 読めない \(/);
   assert.match(body, /results\.push\(\{ name: REGISTER_SUMMARY_STEP, \.\.\.registerSummaryResult, warn: registerSummaryResult\.success && \/読めない\/\.test\(/);
   assert.match(ds, /\nconst REGISTER_SUMMARY_STEP = '新商品と要確認のまとめ';\n/);
   assert.doesNotMatch(ds.slice(ds.indexOf('const RETRYABLE_JOBS = ['), ds.indexOf('];', ds.indexOf('const RETRYABLE_JOBS = ['))), /新商品と要確認のまとめ/);

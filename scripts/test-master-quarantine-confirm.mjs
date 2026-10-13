@@ -904,6 +904,9 @@ await ta('[Q4-1] まとめの最後の行 = 要確認 N 件・確認済みにで
   assert.match(r.line, new RegExp(`要確認 ${list.length} 件: 確認済みにできる ${ready.length} \\(${ready.slice(0, 10).join('・')}`));
   assert.match(r.line, new RegExp(`直す所あり ${notReady.length} \\(`));
   assert.match(r.line, /→ マスタの入力の商品の画面で確かめる・一覧: /);
+  // 一覧 = 確かめの表の順のまま はじめの 10 件 (確認済みにできるものを先に集めない。Codex #1717 R1 Medium)
+  const shownWant = list.slice(0, 10).map((x) => x.code).join('・');
+  assert.ok(r.line.endsWith(`一覧: ${shownWant}${list.length > 10 ? ` ほか ${list.length - 10} 件` : ''}`), r.line);
   assert.ok(r.line.includes(`新商品の登録: `) && r.line.includes(`要確認 ${list.length}`), r.line);
   assert.equal(r.details.length, list.length);
   for (const code of ready) assert.ok(r.details.includes(`  ✅ ${code}: 確認済みにできる`), code);
@@ -956,6 +959,18 @@ await ta('[Q4-3] 読めない・0079 の前・届かない: 要確認の部分�
   assert.match(before.line, /確かめの表は 0079 の前/);
   assert.deepEqual(SUM.failureLine(new Error('connect ECONNREFUSED'), { daily: true }), { line: '⚠️ 新商品と要確認のまとめ: 読めない (connect ECONNREFUSED) = 毎朝の通知は止めない・明日また読む', code: 0 });
   assert.equal(SUM.failureLine(new Error('x')).code, 1);
+  // コードは 1 行・40 文字まで (改行・制御文字・向きを変える文字でログの行や朝のまとめを壊さない。Codex #1717 R1 Medium)
+  assert.equal(SUM.safeCode('a\nb\r\u0000c\u202ed'), 'a b c d');
+  assert.equal(SUM.safeCode('x'.repeat(41)), 'x'.repeat(39) + '…');
+  assert.equal(SUM.safeCode('x'.repeat(40)), 'x'.repeat(40));
+  assert.equal(SUM.safeCode(null), '?');
+  const odd = await SUM.summarizeQuarantine({ query: async (sql) => (/to_regprocedure/.test(sql) ? { rows: [{ ok: true }] }
+    : { rows: [{ r: [{ code: 'z1', ok: false, items: [{ key: 'cost', ok: false }] }, { code: 'bad\n✅ fake: 確認済みにできる', ok: true, items: [] }, { code: 'y'.repeat(300), ok: true, items: [] }] }] }) }, 3);
+  assert.deepEqual(odd.details, ['  ・ z1: 原価', '  ✅ bad ✅ fake: 確認済みにできる: 確認済みにできる', `  ✅ ${'y'.repeat(39)}…: 確認済みにできる`]);
+  assert.ok(!odd.text.includes('\n') && odd.text.endsWith(`一覧: z1・bad ✅ fake: 確認済みにできる・${'y'.repeat(39)}…`), odd.text);
+  // 中の期限: 終わらない約束を打ち切る・終わる約束はそのまま
+  await assert.rejects(SUM.withDeadline(new Promise(() => {}), 50, 'まとめ'), /^Error: まとめが 0 秒で終わらない$/);
+  assert.equal(await SUM.withDeadline(Promise.resolve(7), 1000, 'x'), 7);
   // 本物の CLI (届かない DB)
   const { spawnSync } = await import('node:child_process');
   const run = (args) => spawnSync(process.execPath, [path.join(ROOT, 'scripts/company-db/master-register-summary.mjs'), ...args],
@@ -966,6 +981,26 @@ await ta('[Q4-3] 読めない・0079 の前・届かない: 要確認の部分�
   const nd = run([]);
   assert.equal(nd.status, 1);
   assert.match(nd.stdout.trim().split('\n').pop(), /^❌ 新商品の登録のまとめ: /);
+  // 本物の CLI (つながるが何も答えない DB) = --daily は中の期限で ⚠️ 読めない (exit 0)・親の 120 秒を待たずに終わる (Codex #1717 R1 High)
+  const net = await import('node:net');
+  const socks = [];
+  const srv = net.createServer((s) => { s.on('error', () => {}); socks.push(s); });   // 受けるだけ・何も返さない (子が切ったときの ECONNRESET は受け流す)
+  await new Promise((res) => srv.listen(0, '127.0.0.1', res));
+  try {
+    const { spawn } = await import('node:child_process');
+    const t0 = Date.now();
+    const h = await new Promise((res) => {
+      const c = spawn(process.execPath, [path.join(ROOT, 'scripts/company-db/master-register-summary.mjs'), '--daily'],
+        { env: { ...process.env, COMPANY_DB_WATCH_URL: `postgres://u:p@127.0.0.1:${srv.address().port}/none`, COMPANY_DB_URL: '', REGISTER_SUMMARY_DEADLINE_MS: '2000' } });
+      let out = '', err = '';
+      c.stdout.on('data', (b) => { out += b; }); c.stderr.on('data', (b) => { err += b; });
+      const kill = setTimeout(() => c.kill(), 30000);
+      c.on('close', (status) => { clearTimeout(kill); res({ status, out, err }); });
+    });
+    assert.equal(h.status, 0, h.err);
+    assert.match(h.out.trim().split('\n').pop(), /^⚠️ 新商品と要確認のまとめ: 読めない \(まとめが 2 秒で終わらない\) = 毎朝の通知は止めない/);
+    assert.ok(Date.now() - t0 < 15000, `${Date.now() - t0}ms`);
+  } finally { for (const s of socks) s.destroy(); srv.close(); }
 });
 
 console.log(`\n${passed} 件 ok${process.exitCode ? ' (NG あり)' : ''}`);
