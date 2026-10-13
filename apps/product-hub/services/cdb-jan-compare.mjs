@@ -18,7 +18,10 @@
  *   none        どちらにも無い (印は出さない)
  *   unreadable  Company DB を読めない (接続先が無い・時間切れ・失敗)
  *   どの印でも、product-hub の JAN がほかの商品の有効な JAN なら holder (その商品コード) を添える。
- * env: COMPANY_DB_URL (Render。無ければ COMPANY_DB_WATCH_URL) = cdb-tax-rate.mjs と同じ
+ * 接続 (janReadUrlFrom): COMPANY_DB_SCREEN_READ_URL (画面用の読むだけのロール・今は Render に無い = 足すならこの名前) → 無ければ COMPANY_DB_URL
+ *   (Render の画面が今使っている接続。読むだけの取引 + 取引の中の statement_timeout で読む)。
+ *   🚨 見張りの watcher (COMPANY_DB_WATCH_URL・接続 3 本まで) には落ちない (lib/master-legacy-gate.mjs の phaseUrlFrom と同じ決まり)
+ * 時間: どの道も JAN_READ_DEADLINE_MS (4.5 秒) まで。超えたら接続を閉じて (= 裏の SELECT も止まる)「読めない」
  */
 import { resolveVariationGroup } from '../lib/variation.js';
 
@@ -37,10 +40,14 @@ export const JAN_STATE_SEVERITY = Object.freeze({
   differs: 'warn', not_in_cdb: 'warn', sku_missing: 'warn', unreadable: 'muted', ph_empty: 'info', match: 'ok', none: 'none',
 });
 const SEVERITY_RANK = Object.freeze({ warn: 4, muted: 3, info: 2, ok: 1, none: 0 });
-/** 1 回に読む (商品コード, JAN) の組の上限 (ボードの全部のカードでも今は 100 組ほど) */
-export const JAN_READ_MAX_ITEMS = 5000;
-/** 画面の要求の中で待つ上限 (楽天のプレビュー・登録の確認)。超えたら「読めない」 */
-export const JAN_READ_WAIT_MS = 6000;
+/** 1 回の SELECT で読む (商品コード, JAN) の組の数 (超える分は同じ読むだけの取引の中で分けて読む) */
+export const JAN_READ_CHUNK = 1000;
+/** 1 回に読む組の上限 (安全弁。ボードの画面のカードは 800 枚まで = 普通は届かない) */
+export const JAN_READ_MAX_ITEMS = 20000;
+/** 読むのに使ってよい時間 (接続 + SELECT)。超えたら接続を閉じて「読めない」。画面の要求は 5 秒以内に返す */
+export const JAN_READ_DEADLINE_MS = 4500;
+/** 接続を待つ上限 (残りは SELECT に) */
+export const JAN_CONNECT_TIMEOUT_MS = 2500;
 
 /**
  * Company DB の有効な JAN を読む SQL。入れた (商品コード, product-hub の JAN) の組ごとに 1 行 (ord の順)。
@@ -55,8 +62,8 @@ export const JAN_READ_SQL = `select x.ord::int as ord, k.sku_id::text as sku_id,
     case when x.jan <> '' then core.norm_code(x.jan) end as jan_norm,
     (select coalesce((select s.code from core.skus s where s.company_id = e.company_id and s.product_id = e.entity_id order by s.code_norm limit 1), e.entity_type || ' ' || e.entity_id::text)
        from core.external_ids e
-      where x.jan <> '' and e.company_id = $1 and e.system = 'jan' and e.id_kind = 'jan' and e.valid_to is null and e.external_norm = core.norm_code(x.jan)
-        and not (e.entity_type = 'product' and e.entity_id is not distinct from k.product_id)
+      where x.jan <> '' and e.company_id = $1 and e.entity_type = 'product' and e.system = 'jan' and e.id_kind = 'jan' and e.valid_to is null and e.external_norm = core.norm_code(x.jan)
+        and e.entity_id is distinct from k.product_id
       order by e.external_id_row limit 1) as jan_holder
   from unnest($2::text[], $3::text[]) with ordinality as x(code, jan, ord)
   left join core.skus k on k.company_id = $1 and k.code_norm = core.norm_code(x.code)
@@ -65,28 +72,89 @@ export const JAN_READ_SQL = `select x.ord::int as ord, k.sku_id::text as sku_id,
 const str = (v) => String(v ?? '').trim();
 const pairKey = (code, jan) => `${code.toLowerCase()}\u0000${jan}`;
 
+/** 読む接続の URL を選ぶ。{ url, source } (url が無ければ null) */
+export function janReadUrlFrom(env = process.env) {
+  const ro = str(env.COMPANY_DB_SCREEN_READ_URL);
+  if (ro) return { url: ro, source: 'COMPANY_DB_SCREEN_READ_URL' };
+  const owner = str(env.COMPANY_DB_URL);
+  if (owner) return { url: owner, source: 'COMPANY_DB_URL' };
+  return { url: null, source: null };
+}
+
 /**
  * 接続 (client.query(sql, params) → { rows } の形・pg / PGlite) で、読むだけの取引の中で JAN を読む。
- * items = [{ code, jan }] (重なりは呼ぶ側で除く)。戻り値 rows (items と同じ順)
+ * items = [{ code, jan }] (重なりは呼ぶ側で除く)。戻り値 rows (items と同じ順・ord は items の 1 から)。
+ * statementTimeoutMs = 取引の中だけの statement_timeout (set_config の local = rollback で元に戻る)
  */
-export async function queryCdbJans(client, companyId, items) {
+export async function queryCdbJans(client, companyId, items, { statementTimeoutMs = null } = {}) {
   await client.query('begin transaction read only');
   try {
-    const r = await client.query(JAN_READ_SQL, [companyId, items.map((i) => i.code), items.map((i) => i.jan)]);
-    return r.rows;
+    if (statementTimeoutMs != null) await client.query(`select set_config('statement_timeout', $1, true)`, [`${Math.max(1, Math.floor(statementTimeoutMs))}ms`]);
+    const out = [];
+    for (let off = 0; off < items.length; off += JAN_READ_CHUNK) {
+      const part = items.slice(off, off + JAN_READ_CHUNK);
+      const r = await client.query(JAN_READ_SQL, [companyId, part.map((i) => i.code), part.map((i) => i.jan)]);
+      for (const row of r.rows) out.push({ ...row, ord: Number(row.ord) + off });
+    }
+    return out;
   } finally {
     try { await client.query('rollback'); } catch { /* 読むだけ = 戻しても何も変わらない */ }
   }
 }
 
 let reader = null;
-/** 試験用: 読み方を差し替える (本番では呼ばない)。fn(items) → { ok: true, rows } / { ok: false, reason } */
+/** 試験用: 読み方を丸ごと差し替える (本番では呼ばない)。fn(items) → { ok: true, rows } / { ok: false, reason } */
 export function __setCdbJanReader(fn) { reader = fn || null; }
+let connector = null;
+/** 試験用: 接続の作り方を差し替える (本番では呼ばない)。fn(url, opts) → client ({ query, end }) */
+export function __setCdbJanConnect(fn) { connector = fn || null; }
+
+const errText = (e) => String((e && e.message) || e).slice(0, 120);
+
+/** 期限つきで (接続して) 読む。期限が来たら接続を閉じて (= 走っている SELECT も止まる)「読めない」 */
+async function readRowsWithin(items, { env, deadlineMs }) {
+  if (reader) {
+    let timer;
+    try {
+      const r = await Promise.race([reader(items), new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, reason: `${(deadlineMs / 1000).toFixed(1)} 秒で読めなかった` }), deadlineMs); })]);
+      if (!r || !r.ok) return { ok: false, reason: (r && r.reason) || 'Company DB を読めない' };
+      return { ok: true, rows: r.rows || [] };
+    } catch (e) {
+      return { ok: false, reason: `Company DB を読めない (${errText(e)})` };
+    } finally { clearTimeout(timer); }
+  }
+  const { url } = janReadUrlFrom(env);
+  if (!url) return { ok: false, reason: 'Company DB の接続先が無い' };
+  const started = Date.now();
+  let client = null;
+  let timedOut = false;
+  let timer;
+  const closeClient = () => { const c = client; client = null; if (c) Promise.resolve().then(() => c.end()).catch(() => { /* 結果は変えない */ }); };
+  const work = (async () => {
+    try {
+      const connect = connector || (await import('../../../scripts/company-db/migrate.mjs')).openPgClient;
+      const { COMPANY_ID } = await import('../../../lib/master-write.mjs');
+      const c = await connect(url, { application_name: 'product-hub-cdb-jan', connectionTimeoutMillis: Math.min(JAN_CONNECT_TIMEOUT_MS, deadlineMs), statement_timeout: deadlineMs, query_timeout: deadlineMs });
+      if (timedOut) { try { await c.end(); } catch { /* */ } return { ok: false, reason: 'timeout' }; }
+      client = c;
+      const left = deadlineMs - (Date.now() - started);
+      const rows = await queryCdbJans(c, COMPANY_ID, items, { statementTimeoutMs: Math.max(100, left) });
+      return { ok: true, rows };
+    } catch (e) {
+      return { ok: false, reason: `Company DB を読めない (${errText(e)})` };
+    } finally { closeClient(); }
+  })();
+  try {
+    return await Promise.race([work, new Promise((resolve) => {
+      timer = setTimeout(() => { timedOut = true; closeClient(); resolve({ ok: false, reason: `${(deadlineMs / 1000).toFixed(1)} 秒で読めなかった (接続を閉じた)` }); }, deadlineMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 
 /**
  * (商品コード, JAN) の組をまとめて読む。戻り値 { ok: true, byPair: Map(pairKey → row) } / { ok: false, reason }
  */
-export async function readCdbJans(pairs, { env = process.env } = {}) {
+export async function readCdbJans(pairs, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS } = {}) {
   const seen = new Set();
   const items = [];
   for (const p of pairs || []) {
@@ -100,27 +168,9 @@ export async function readCdbJans(pairs, { env = process.env } = {}) {
   }
   if (!items.length) return { ok: true, byPair: new Map() };
   if (items.length > JAN_READ_MAX_ITEMS) return { ok: false, reason: `比べる組が多すぎる (${items.length} 組・上限 ${JAN_READ_MAX_ITEMS})` };
-  let rows;
-  if (reader) {
-    let r;
-    try { r = await reader(items); } catch (e) { return { ok: false, reason: `Company DB を読めない (${String((e && e.message) || e).slice(0, 120)})` }; }
-    if (!r || !r.ok) return { ok: false, reason: (r && r.reason) || 'Company DB を読めない' };
-    rows = r.rows || [];
-  } else {
-    const url = str(env.COMPANY_DB_URL) || str(env.COMPANY_DB_WATCH_URL);
-    if (!url) return { ok: false, reason: 'Company DB の接続先が無い' };
-    let client = null;
-    try {
-      const { openPgClient } = await import('../../../scripts/company-db/migrate.mjs');
-      const { COMPANY_ID } = await import('../../../lib/master-write.mjs');
-      client = await openPgClient(url, { application_name: 'product-hub-cdb-jan', connectionTimeoutMillis: 5000, statement_timeout: 5000, query_timeout: 6000 });
-      rows = await queryCdbJans(client, COMPANY_ID, items);
-    } catch (e) {
-      return { ok: false, reason: `Company DB を読めない (${String((e && e.message) || e).slice(0, 120)})` };
-    } finally {
-      if (client) { try { await client.end(); } catch { /* 結果は変えない */ } }
-    }
-  }
+  const got = await readRowsWithin(items, { env, deadlineMs });
+  if (!got.ok) return got;
+  const rows = got.rows;
   const byPair = new Map();
   for (const row of rows) {
     const it = items[Number(row.ord) - 1];
@@ -210,46 +260,61 @@ export function janWarningsOf(result) {
   return out;
 }
 
-/**
- * ドラフト 1 つを比べる。戻り値 { ok: true, mode, units: [...], summary } / { ok: false, reason, mode, units: [] }
- *   Company DB を読めないときも ok: true で、各単位が unreadable になる (読めないのも印)
- */
-export async function compareDraftJans(db, draft, { env = process.env } = {}) {
-  const { mode, units } = janUnitsForDraft(db, draft);
-  if (!units.length) return { ok: true, mode, units: [], summary: summarizeJanUnits([]) };
-  const read = await readCdbJans(units.map((u) => ({ code: u.code, jan: u.phJan })), { env });
-  const judged = units.map((u) => judgeJanUnit(u, read));
-  return { ok: true, mode, readable: read.ok, reason: read.ok ? null : read.reason, units: judged, summary: summarizeJanUnits(judged) };
-}
-
-/** 待つ上限つき (画面の要求の中で使う)。時間切れ = 読めない */
-export async function compareDraftJansWithin(db, draft, { env = process.env, waitMs = JAN_READ_WAIT_MS } = {}) {
-  let timer;
+/** 比べる単位 (janUnitsForDraft の戻り値) を Company DB と比べる。読めないときも ok: true で各単位が unreadable (読めないのも印)。投げない */
+export async function compareJanUnits({ mode, units }, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS } = {}) {
   try {
-    return await Promise.race([
-      compareDraftJans(db, draft, { env }),
-      new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, reason: `${Math.round(waitMs / 1000)} 秒で読めなかった`, units: [] }), waitMs); }),
-    ]);
+    if (!units.length) return { ok: true, mode, readable: true, reason: null, units: [], summary: summarizeJanUnits([]) };
+    const read = await readCdbJans(units.map((u) => ({ code: u.code, jan: u.phJan })), { env, deadlineMs });
+    const judged = units.map((u) => judgeJanUnit(u, read));
+    return { ok: true, mode, readable: read.ok, reason: read.ok ? null : read.reason, units: judged, summary: summarizeJanUnits(judged) };
   } catch (e) {
-    return { ok: false, reason: String((e && e.message) || e).slice(0, 160), units: [] };
-  } finally { clearTimeout(timer); }
+    return { ok: false, mode, reason: String((e && e.message) || e).slice(0, 160), units: [] };
+  }
+}
+
+/** 今の product-hub の値 (ドラフトを読み直す) で比べる単位を作る。🚨 呼ぶ側は payload を作った直後に await を挟まずに呼ぶ (同じ値で比べる) */
+export function janUnitsForDraftId(db, draftId) {
+  const d = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  return d ? janUnitsForDraft(db, d) : { mode: null, units: [] };
 }
 
 /**
- * ボード: product-hub に JAN があるドラフト全部を 1 回で読んで、直す必要がありそうな印 (warn) のドラフトだけ返す。
+ * ドラフト 1 つを比べる (詳細画面)。戻り値 { ok: true, mode, readable, reason, units: [...], summary } / { ok: false, reason, units: [] }
+ * 時間は JAN_READ_DEADLINE_MS まで (超えたら接続を閉じて「読めない」)
+ */
+export async function compareDraftJans(db, draft, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS } = {}) {
+  let units;
+  try { units = janUnitsForDraft(db, draft); } catch (e) { return { ok: false, reason: String((e && e.message) || e).slice(0, 160), units: [] }; }
+  return compareJanUnits(units, { env, deadlineMs });
+}
+
+/** ボードの画面から受け取るカードの ID の上限 (ボードの表示の上限 800 + 余裕) */
+export const BOARD_JAN_MAX_IDS = 1000;
+/** ボードの画面から来た ID の並び ("1,2,3") を数の配列に。形が違う・多すぎる = null */
+export function parseBoardDraftIds(raw) {
+  const t = String(raw ?? '').trim();
+  if (!t) return [];
+  if (!/^[0-9]{1,12}(,[0-9]{1,12})*$/.test(t)) return null;
+  const ids = [...new Set(t.split(',').map(Number).filter((n) => Number.isSafeInteger(n) && n > 0))];
+  return ids.length > BOARD_JAN_MAX_IDS ? null : ids;
+}
+
+/**
+ * ボード: 画面に出ているカード (ids) のうち、product-hub に JAN があるドラフトだけを 1 回で読み、直す必要がありそうな印 (warn) のドラフトだけ返す。
  * 戻り値 { ok: true, readable, reason, checked, byDraft: { [draftId]: { state, label, units: [{ code, phJan, label, detail }] } } }
  */
-export async function boardJanMarks(db, { env = process.env } = {}) {
-  const drafts = db.prepare(`SELECT * FROM product_drafts d
-    WHERE TRIM(COALESCE(d.jan_code, '')) <> '' OR EXISTS (SELECT 1 FROM draft_sku_jans j WHERE j.draft_id = d.id)
-    ORDER BY d.id`).all();
+export async function boardJanMarks(db, { ids = [], env = process.env, deadlineMs = JAN_READ_DEADLINE_MS } = {}) {
   const per = [];
-  for (const d of drafts) {
+  const pick = db.prepare(`SELECT * FROM product_drafts d WHERE d.id = ?
+    AND (TRIM(COALESCE(d.jan_code, '')) <> '' OR EXISTS (SELECT 1 FROM draft_sku_jans j WHERE j.draft_id = d.id))`);
+  for (const id of ids) {
+    const d = pick.get(id);
+    if (!d) continue;
     const { units } = janUnitsForDraft(db, d);
     const withJan = units.filter((u) => u.phJan);
     if (withJan.length) per.push({ id: d.id, units: withJan });
   }
-  const read = await readCdbJans(per.flatMap((p) => p.units.map((u) => ({ code: u.code, jan: u.phJan }))), { env });
+  const read = await readCdbJans(per.flatMap((p) => p.units.map((u) => ({ code: u.code, jan: u.phJan }))), { env, deadlineMs });
   if (!read.ok) return { ok: true, readable: false, reason: read.reason, checked: per.length, byDraft: {} };
   const byDraft = {};
   for (const p of per) {

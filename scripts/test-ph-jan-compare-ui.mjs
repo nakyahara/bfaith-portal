@@ -5,8 +5,8 @@
  *   1 詳細 (単品): 開いた後に JAN の欄の下に印 (違う + Company DB の JAN)・基本情報のまとめ・見かたの説明が開く・画面のエラーなし
  *   2 詳細 (まとまり): 子の SKU ごとに印 (違う / 一致 / product-hub は空)・印の無い子は空のまま
  *   3 JAN を直して保存 → 比べ直して印が変わる (待たずに)
- *   4 楽天に登録の確認の文に JAN の一言 (キャンセル = 登録しない)
- *   5 ボード: 違うカードにだけ札・上の欄に件数・読めない = 「読めない」だけ (札なし)
+ *   4 楽天に登録の確認の文に JAN の一言 (キャンセル = 登録しない)・比べている途中は待たずに「読めない」の一言 (詳細・ボード)
+ *   5 ボード: 画面に出ているカードの ID だけ照らす (除外は送らない・数えない)・違うカードにだけ札・上の欄に件数・読めない = 「読めない」だけ (札なし)
  *   6 390 幅: 詳細の印がページを横にはみ出させない
  * 使い方: node scripts/test-ph-jan-compare-ui.mjs   (Playwright / Chromium が無い = 失敗。飛ばすのは PH_UI_SKIP=1)
  */
@@ -43,7 +43,9 @@ async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${n
 // Company DB (差し替え): 商品コード → 有効な JAN
 const CDB = new Map([['a001', ['4900000001006']], ['a003', ['4900000001037']], ['g-red', ['4900000001075']], ['g-blue', ['4900000001082']], ['g-wht', ['4900000001099']]]);
 let readable = true;
+let slowMs = 0;   // Company DB の答えを遅らせる (待たないことの確かめ)
 J.__setCdbJanReader(async (items) => {
+  if (slowMs) await new Promise((r) => setTimeout(r, slowMs));
   if (!readable) return { ok: false, reason: 'テストで読めない' };
   return { ok: true, rows: items.map((it, i) => {
     const jans = CDB.get(it.code.toLowerCase());
@@ -66,6 +68,10 @@ const draft = (code, jan) => {
 const dA1 = draft('a001', '4900000001006');
 const dA3 = draft('a003', '4900000001006');   // a001 の JAN を入れてしまった = 違う + ほかの商品
 const dG = draft('grpx', null);
+// 除外のカード (ボードに出ない) = JAN が違っても照らさない・数えない
+mirror('a004', null);
+const dX = draft('a004', '4900000001006');
+ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(dX.id);
 ph.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(dG.id, 'g-red', '4900000001013');   // 違う
 ph.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(dG.id, 'g-blue', '4900000001082');  // 一致
 
@@ -147,16 +153,55 @@ try {
     assert.deepEqual(registerCalls, [], 'キャンセルしたのに登録を送った');
     await page.close();
   });
+  await ta('[4b] 🚨 登録の確認は Company DB を待たない: 比べている途中なら「読めない」の一言ですぐ確認を出す', async () => {
+    slowMs = 3000;
+    try {
+      const { page } = await openPage(`/apps/product-hub/detail/${dA3.id}`);
+      await page.locator('#rk-register-btn').waitFor({ state: 'attached' });
+      let dialogText = null;
+      page.once('dialog', async (d) => { dialogText = d.message(); await d.dismiss(); });
+      const t0 = Date.now();
+      const shown = page.waitForEvent('dialog', { timeout: 15000 }).catch(() => null);
+      await page.evaluate(() => document.getElementById('rk-register-btn').click());
+      await shown;
+      const took = Date.now() - t0;
+      assert.ok(dialogText, '確認が出ない');
+      assert.ok(took < 2000, `確認まで ${took} ms (Company DB を待った)`);
+      assert.match(dialogText, /⚠ JAN の比べ: 読めない \(商品マスタと比べ終わっていません\)/);
+      await page.close();
+    } finally { slowMs = 0; }
+  });
   await ta('[5] ボード: 違うカードにだけ札・上の欄に件数 / 読めない = 「読めない」だけ (札なし)', async () => {
-    const { page, errors } = await openPage('/apps/product-hub/board');
+    const asked = [];
+    const { page, errors } = await (async () => {
+      const page = await ctx.newPage();
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(String(e && e.message)));
+      page.on('request', (r) => { if (/\/api\/board\/jan-check/.test(r.url())) asked.push(new URL(r.url()).searchParams.get('ids')); });
+      await page.goto(ORIGIN + '/apps/product-hub/board', { waitUntil: 'domcontentloaded' });
+      return { page, errors };
+    })();
     await page.locator('#kb-jan-status:not([hidden])').waitFor();
-    assert.equal(await page.locator('#kb-jan-status').textContent(), '⚠ JAN 要確認 1 件');   // a003 (まとまりは [3] で直した)
+    // 照らすのは画面に出ているカードの ID だけ (除外のカードは出ていない = 送らない・数えない)
+    const onScreen = await page.$$eval('.kb-card[data-draft]', (cs) => [...new Set(cs.map((c) => c.dataset.draft))].sort());
+    assert.equal(asked.length, 1);
+    assert.deepEqual(asked[0].split(',').sort(), onScreen);
+    assert.ok(!onScreen.includes(String(dX.id)), '除外のカードがボードに出ている (試験の前提)');
+    assert.equal(await page.locator('#kb-jan-status').textContent(), '⚠ JAN 要確認 1 件');   // a003 (まとまりは [3] で直した・除外の a004 は数えない)
     assert.equal(await page.locator(`.kb-card[data-draft="${dA3.id}"] .kb-tag.jan-check`).count(), 1);
     assert.equal(await page.locator(`.kb-card[data-draft="${dA3.id}"] .kb-tag.jan-check`).textContent(), '⚠ JAN Company DB と違う');
     assert.equal(await page.locator(`.kb-card[data-draft="${dA1.id}"] .kb-tag.jan-check`).count(), 0);
     assert.equal(await page.locator('.kb-tag.jan-check').count(), 1);
     assert.deepEqual(errors, []);
     await page.close();
+    // 比べている途中にボードから出品 = 確認の文に「読めない」の一言 (待たない)
+    slowMs = 3000;
+    try {
+      const { page: pl } = await openPage('/apps/product-hub/board');
+      await pl.locator(`.kb-card[data-draft="${dA3.id}"]`).first().waitFor({ state: 'attached' });
+      assert.match(await pl.evaluate((id) => janNoteOf(id), dA3.id), /JAN の比べ: 読めない/);
+      await pl.close();
+    } finally { slowMs = 0; }
     readable = false;
     try {
       const { page: p2, errors: e2 } = await openPage('/apps/product-hub/board');

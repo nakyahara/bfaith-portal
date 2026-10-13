@@ -3603,6 +3603,7 @@ th.attr-unknown { color: #dc2626; }
   // 出品は止めない: 楽天への登録の確認の文に一言足すだけ。JAN を直すのは商品マスタ (master-edit) か、この画面の JAN の欄
   let janCheckSeq = 0;
   let janCheckLast = null;
+  let janCheckBusy = false;   // 比べている途中 (登録の確認は待たずに「読めない」で進める)
   const janKey = (s) => String(s == null ? '' : s).trim().toLowerCase();
   function janPill(text, severity) {
     const span = document.createElement('span');
@@ -3647,6 +3648,7 @@ th.attr-unknown { color: #dc2626; }
   }
   async function refreshJanCheck() {
     const seq = ++janCheckSeq;
+    janCheckBusy = true;
     let j;
     try {
       const res = await fetch(BASE + '/jan-check', { headers: { Accept: 'application/json' } });
@@ -3656,13 +3658,14 @@ th.attr-unknown { color: #dc2626; }
       j = { ok: true, readable: false, reason: '通信できませんでした', units: [] };
     }
     if (seq !== janCheckSeq) return janCheckLast;   // 後から始めた読みの結果を優先する (古い結果で上書きしない)
+    janCheckBusy = false;
     janCheckLast = j;
     renderJanCheck(j);
     return j;
   }
   // 楽天への登録の確認の文に足す一言 (違う / Company DB に無い / 読めない のときだけ)
   function janConfirmNote(j) {
-    if (!j) return '';
+    if (!j) return '⚠ JAN の比べ: 読めない (商品マスタと比べ終わっていません)。出品は止めません\n\n';
     if (j.readable === false) return '⚠ JAN を商品マスタ (Company DB) と比べられませんでした (' + (j.reason || '') + ')\n\n';
     const warn = (j.units || []).filter((u) => u.severity === 'warn');
     if (!warn.length) return '';
@@ -5264,10 +5267,8 @@ th.attr-unknown { color: #dc2626; }
 
   document.getElementById('rk-register-btn').addEventListener('click', async () => {
     if (!(await saveRakutenFields())) return;
-    // 🆕 B1: 保存した JAN を Company DB と比べ、違う / 無い / 読めない なら確認の文に一言足す (止めない)
-    rkResult.textContent = 'JAN を商品マスタと比べています…';
-    const janNote = janConfirmNote(await refreshJanCheck());
-    rkResult.textContent = '';
+    // 🆕 B1: 違う / 無い / 読めない なら確認の文に一言足す (止めない)。🚨 待たない: 比べている途中・まだ = 「読めない」で進める (Codex #1700 R1 M3)
+    const janNote = janConfirmNote(janCheckBusy ? null : janCheckLast);
     if (!confirm(janNote + '楽天に「公開」で登録します。\n在庫0のまま売り場に載ります (在庫はNE連携が入れます)。\n\nよろしいですか?')) return;
     const btn = document.getElementById('rk-register-btn');
     btn.disabled = true;

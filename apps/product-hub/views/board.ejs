@@ -998,21 +998,27 @@
     if (el) el.style.display = 'none';
   }
   // 🆕 JAN を Company DB と比べた印 (Company DB構想 21 B1・読むだけ・知らせだけ)。
-  //    ボードの表示を待たせないよう、開いた後に読んでカードに札を足す。出品は止めない (確認の文に一言足すだけ)
+  //    ボードの表示を待たせないよう、開いた後に読んでカードに札を足す。出品は止めない (確認の文に一言足すだけ・待たない)。
+  //    照らすのは画面に出ているカードだけ (ID を送る = 担当・確認中・ビュー・表示の上限の絞り込みの後・件数も画面の物だけ)
   const janMarks = {};
+  let janMarksState = 'none';   // none = 照らすカードが無い / loading / ok / unreadable
   (function initJanMarks() {
     const status = document.getElementById('kb-jan-status');
-    if (!document.querySelector('.kb-card[data-draft]')) return;
-    fetch('/apps/product-hub/api/board/jan-check', { headers: { Accept: 'application/json' } })
+    const ids = Array.from(new Set(Array.from(document.querySelectorAll('.kb-card[data-draft]'))
+      .map(function (c) { return String(c.dataset.draft || '').replace(/[^0-9]/g, ''); }).filter(Boolean)));
+    if (!ids.length) return;
+    janMarksState = 'loading';
+    fetch('/apps/product-hub/api/board/jan-check?ids=' + ids.join(','), { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.json(); })
       .then(function (j) {
-        if (!j || j.ok !== true) return;
+        if (!j || j.ok !== true) throw new Error((j && j.error) || 'jan-check');
         if (j.readable === false) {
+          janMarksState = 'unreadable';
           if (status) { status.hidden = false; status.textContent = 'JAN の比べ: 読めない'; status.title = 'JAN を Company DB と比べられませんでした (' + (j.reason || '') + ')。出品は止めません'; }
           return;
         }
-        const ids = Object.keys(j.byDraft || {});
-        ids.forEach(function (id) {
+        const marked = Object.keys(j.byDraft || {});
+        marked.forEach(function (id) {
           const m = j.byDraft[id];
           janMarks[id] = m;
           document.querySelectorAll('.kb-card[data-draft="' + String(id).replace(/[^0-9]/g, '') + '"] .kb-card-link').forEach(function (link) {
@@ -1027,13 +1033,17 @@
             link.insertBefore(wrap, link.firstChild);
           });
         });
-        if (status && ids.length) { status.hidden = false; status.classList.add('warn'); status.classList.remove('muted'); status.textContent = '⚠ JAN 要確認 ' + ids.length + ' 件'; status.title = 'product-hub の JAN が商品マスタ (Company DB) と違う / Company DB に無いカード'; }
+        janMarksState = 'ok';
+        if (status && marked.length) { status.hidden = false; status.classList.add('warn'); status.classList.remove('muted'); status.textContent = '⚠ JAN 要確認 ' + marked.length + ' 件'; status.title = 'このボードに出ているカードのうち、product-hub の JAN が商品マスタ (Company DB) と違う / Company DB に無いカード'; }
       })
       .catch(function () {
+        janMarksState = 'unreadable';
         if (status) { status.hidden = false; status.textContent = 'JAN の比べ: 読めない'; status.title = '通信できませんでした。出品は止めません'; }
       });
   })();
   function janNoteOf(draftId) {
+    // まだ比べ終わっていない / 読めない = 待たずに「読めない」と一言 (出品は止めない)
+    if (janMarksState === 'loading' || janMarksState === 'unreadable') return '⚠ JAN の比べ: 読めない (商品マスタと比べ終わっていません)。出品は止めません\n\n';
     const m = janMarks[String(draftId)];
     if (!m) return '';
     return '⚠ JAN ' + m.label + ' (' + (m.units || []).map(function (u) { return u.code; }).join('・') + ')\n'
