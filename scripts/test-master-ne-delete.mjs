@@ -94,7 +94,9 @@ for (const [name, expectFrom] of [['ops.sku_gone_from_ne_check', '0070'], ['ops.
     assert.ok(now, '0072 に無い');
     assert.notEqual(now, before, '何も足していない');
     assert.equal(strip0072(now), before, '印の行を外すと前の版と違う (写し間違い・印の無い変更)');
-    for (const later of migFiles.filter((x) => x > F72)) assert.equal(fnText(readMig(later), name), null, `${later} も ${name} を作り直している = この試験の元を見直す`);
+    // 🆕 0076 (日数の許可) は ops.sku_gone_from_ne_check を 0072 の版から写し直した (scripts/test-master-gone-day.mjs の [M1] がその写しを確かめる)
+    const allowLater = name === 'ops.sku_gone_from_ne_check' ? ['0076'] : [];
+    for (const later of migFiles.filter((x) => x > F72 && !allowLater.some((p) => x.startsWith(p)))) assert.equal(fnText(readMig(later), name), null, `${later} も ${name} を作り直している = この試験の元を見直す`);
   });
 }
 await ta('[M2] 約束の操作の CHECK = 0071 の全部 + ne_del_build・ne_del_withdraw・ne_handling_build (どちらの表も)', async () => {
