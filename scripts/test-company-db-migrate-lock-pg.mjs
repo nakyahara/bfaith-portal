@@ -850,7 +850,19 @@ ${tail}`;
   const whoami = async (c) => (await c.query('select current_user::text as cu, session_user::text as su')).rows[0];
 
   await t('O0 migration の file は全部、許さない役割の切り替えを持たない (grep の縛り) / 拒む形 = RESET ROLE・session の SET ROLE・SET SESSION ROLE・ROLE NONE・SESSION AUTHORIZATION・set_config(role)・DISCARD・一覧の外の SET LOCAL ROLE / 許す = 一覧の SET LOCAL ROLE (設計 13 v3.11 ③)', async () => {
-    for (const f of listMigrationFiles()) assert.deepEqual(roleSwitchStatements(f.text), [], f.file);
+    // 🆕 (master の直し 2026-10-13) 既知の例外 = 0072 (#1690) の ops.cancel_sku_gone_from_ne が、退避した 6 個の core.* の設定を jsonb_each で戻す
+    //   set_config(e.key, …) (名前は同じ関数の中の固定の配列だけ = role・session_authorization・字句の前提の GUC に届かない)。
+    //   runner は owner-transition より前の file (legacy) を字句で検査しない = 0072 は legacy で流れる (下で owner-transition が 0072 より後ろなのも確かめる)。
+    //   適用済みの file は書き換えない (checksum) ので file は直さず、例外は file と検査の結果の完全一致だけにする (0072 に別の切り替えが増える・ほかの file に同じ形が出る → NG)
+    const KNOWN_LEGACY_HITS = { '0072_ne_delete_csv.sql': ['(ドルの引用の中) set_config(<ただの文字列でない名前>, …)'] };
+    for (const f of listMigrationFiles()) assert.deepEqual(roleSwitchStatements(f.text), KNOWN_LEGACY_HITS[f.file] ?? [], f.file);
+    {
+      const files = listMigrationFiles();
+      const t72 = files.find((f) => f.file === '0072_ne_delete_csv.sql').text;
+      assert.equal((t72.match(/set_config\(e\.key,/g) || []).length, 1);   // 動的な名前は 1 か所だけ
+      assert.ok(t72.includes("from pg_catalog.unnest(array['core.actor_type', 'core.actor_id', 'core.source_system', 'core.request_id', 'core.reason', 'core.run_id']) as x(k);"));   // 戻す名前 = 退避した固定の 6 個
+      assert.deepEqual(files.filter((f) => f.ownerTransition && f.file <= '0072_ne_delete_csv.sql').map((f) => f.file), []);   // owner-transition が前にあると runner が 0072 を拒む
+    }
     // 🆕 Codex R2 High: 0001〜 に Unicode の escape は 1 つも無い (legacy の ⚠️ も出ない = 後方の互換を壊さない)
     for (const f of listMigrationFiles()) assert.deepEqual(unicodeEscapeLiterals(f.text), [], f.file);
     assert.deepEqual(ALLOWED_SET_LOCAL_ROLES, ['cdb_owner', 'profit_definer', 'heavy_guard_definer', 'heavy_read_definer', 'd60_calib_definer', 'finance_revision_definer']);
