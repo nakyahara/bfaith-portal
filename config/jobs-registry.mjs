@@ -1030,7 +1030,10 @@ export const JOBS_REGISTRY = [
       + 'どうしても届かない = 商品の画面の「発注の設定」で入れてから「閉じる」。'
       + '🆕 note が「段の失敗: 発注の設定の写し: 入れ替えない (前の世代のまま): …」= 写しは前の夜のまま (AI は purchasing.v_snapshot_status の read_at で古さが分かる・止めない)。'
       + 'no_table / no_column = 発注アプリの表の移行の途中 (翌晩に直るか見る)・shrink = 発注アプリの行が半分未満に減った (発注アプリのマスタ管理で本当に消したか確かめる。'
-      + '本当に消した = Render の env に PO_SNAPSHOT_ACCEPT_SHRINK_UNTIL=<翌日の ISO 時刻> を入れる (その時刻まで・7 日まで = 自然に切れる) → 翌晩に入る)・older_read = 同時に 2 本 (翌晩に直る)',
+      + '本当に消した = Render の env に PO_SNAPSHOT_ACCEPT_SHRINK=attrs:<今の件数> を入れる (1 回だけ効く・使った回は purchasing.snapshot_runs.override に残る・翌晩に入ったら env を消す)・'
+      + 'duplicate_key = 発注アプリに大文字小文字だけ違う商品コードが 2 行 (発注アプリのマスタ管理で 1 つにする)・older_read / ambiguous_read = 同時に 2 本 (翌晩に直る)。'
+      + '復元の後 (purchasing はバックアップに入れていない = 空) = 0076 を確かめ、Render の Shell で node apps/company-db/load/po-settings-snapshot.mjs --apply (写しの段だけ・夜間ロードは流さない) → '
+      + 'purchasing.snapshot_runs の最新が applied・件数・purchasing.v_snapshot_status の read_at・watcher の select の権限を確かめる',
   },
   {
     id: 'company-db-inventory-hourly',

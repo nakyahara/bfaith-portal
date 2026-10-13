@@ -64,26 +64,34 @@ try {
   const [A, B, W, E] = [await open(null), await open(null), await open('watcher'), await open('master_edit')];
   clients.push(A, B, W, E);
 
-  await ta('[P1] 同時に 2 本の写し = 鍵で順番・後の方は前の世代と比べて unchanged (行は 1 回分)・遅れて来た古い読み = 入れ替えない', async () => {
-    const s1 = S.readPoSettingsSnapshot(FILE);
-    await sleep(5);
-    const s2 = S.readPoSettingsSnapshot(FILE);
-    const [r1, r2] = await Promise.all([S.applyPoSettingsSnapshot(pgAdapter(A), s1), S.applyPoSettingsSnapshot(pgAdapter(B), s2)]);
-    const st = [r1, r2].map((r) => r.status).sort();
-    // どちらが先に鍵を取っても: 先 = applied / 後 = (新しい読みなら) unchanged・(古い読みなら) rejected (older_read)
-    assert.ok(JSON.stringify(st) === JSON.stringify(['applied', 'unchanged']) || JSON.stringify(st) === JSON.stringify(['applied', 'rejected']), JSON.stringify([r1, r2].map((r) => [r.status, r.problems])));
-    const rej = [r1, r2].find((r) => r.status === 'rejected');
-    if (rej) assert.match(rej.problems.join(), /^older_read/);
+  await ta('[P1] 同時に 2 本の写し (段の道 = 鍵を取ってから読む) = 読みも順番・後の方は前の写しより後の値を読む (unchanged)・行は 1 回分 / 前に読んだ値が同じ時刻 (ミリ秒) で競る = あいまい = 断る / 遅れて来た古い読み = 断る', async () => {
+    const reader = () => S.readPoSettingsSnapshot(FILE);
+    const [r1, r2] = await Promise.all([S.applyPoSettingsSnapshot(pgAdapter(A), reader), S.applyPoSettingsSnapshot(pgAdapter(B), reader)]);
+    assert.deepEqual([r1, r2].map((r) => r.status).sort(), ['applied', 'unchanged'], JSON.stringify([r1, r2].map((r) => [r.status, r.problems])));
+    const [first, second] = r1.status === 'applied' ? [r1, r2] : [r2, r1];
+    assert.ok(second.snap.readAt.getTime() >= first.snap.readAt.getTime(), '後の方が前の写しより前に読んだ (鍵の前に読んだ)');
     assert.equal((await M.query('select count(*)::int as n from purchasing.sku_order_settings')).rows[0].n, 25);
+    // 前に読んだ 2 つ (同じミリ秒・中身が違う) を 2 つの接続で同時に = どちらが先でも、後の方は ambiguous_read (古い中身で上書きしない)
+    const ra = S.readPoSettingsSnapshot(FILE);
+    podb.prepare(`UPDATE po_product_attrs SET order_lot = 55, updated_at = ? WHERE product_key = 'sp-03'`).run('2026-10-01T12:00:00.000Z');
+    const rb = S.readPoSettingsSnapshot(FILE);
+    const t = new Date(Math.max(ra.readAt.getTime(), rb.readAt.getTime()) + 1000);
+    ra.readAt = t; rb.readAt = new Date(t.getTime());
+    const [x1, x2] = await Promise.all([S.applyPoSettingsSnapshot(pgAdapter(A), ra), S.applyPoSettingsSnapshot(pgAdapter(B), rb)]);
+    // 先に鍵を取った方 = 入る (今と同じ中身なら unchanged・違えば applied)・後の方 = 同じ時刻で中身が違う = ambiguous_read
+    const st2 = [x1, x2].map((r) => r.status).sort();
+    assert.ok(['applied,rejected', 'rejected,unchanged'].includes(st2.join()), JSON.stringify([x1, x2].map((r) => [r.status, r.problems])));
+    assert.match([x1, x2].find((r) => r.status === 'rejected').problems.join(), /^ambiguous_read/);
+    await sleep(Math.max(0, t.getTime() - Date.now() + 20));   // 上で 1 秒先の時刻にした = 次の読みがそれより後になるまで
     assert.equal((await M.query(`select count(distinct run_id)::int as n from purchasing.sku_order_settings`)).rows[0].n, 1, '同じ行を 2 回入れた');
     // 後から古い読みを入れる = 断る (新しい値を戻さない)
     podb.prepare(`UPDATE po_product_attrs SET order_lot = 99, updated_at = ? WHERE product_key = 'sp-01'`).run('2026-10-02T00:00:00.000Z');
     const old = S.readPoSettingsSnapshot(FILE);
     podb.prepare(`UPDATE po_product_attrs SET order_lot = 100, updated_at = ? WHERE product_key = 'sp-01'`).run('2026-10-03T00:00:00.000Z');
-    await sleep(5);
-    assert.equal((await S.applyPoSettingsSnapshot(pgAdapter(A), S.readPoSettingsSnapshot(FILE))).status, 'applied');
+    assert.equal((await S.applyPoSettingsSnapshot(pgAdapter(A), () => S.readPoSettingsSnapshot(FILE))).status, 'applied');
     const r3 = await S.applyPoSettingsSnapshot(pgAdapter(B), old);
     assert.equal(r3.status, 'rejected');
+    assert.match(r3.problems.join(), /^(older_read|ambiguous_read)/);   // 同じミリ秒なら ambiguous・前なら older (どちらも古い中身で上書きしない)
     assert.equal(Number((await M.query(`select order_lot from purchasing.sku_order_settings where product_key = 'sp-01'`)).rows[0].order_lot), 100);
   });
 

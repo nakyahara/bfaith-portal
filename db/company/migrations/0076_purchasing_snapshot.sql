@@ -5,7 +5,8 @@
 --   Company DB からは見えない = AI や他の業務が読めない。→ Company DB に「読むだけの写し」を置く (正本にはしない・持ち主の表 master-ownership には入れない)。
 -- なにを:
 --   1. purchasing.snapshot_runs = 写しの世代 (1 回の読み = 1 行・追記だけ)。read_at = 発注アプリの SQLite を読んだ時刻 = 写しの値は「この時の発注アプリの値」。
---      状態 applied (入れ替えた) / unchanged (前と同じ = 行は触らない) / rejected (完全に読めなかった = 入れ替えない・前の世代のまま)。件数・hash・問題・変化の数
+--      状態 applied (入れ替えた) / unchanged (前と同じ = 行は触らない) / rejected (完全に読めなかった = 入れ替えない・前の世代のまま)。件数・hash・問題・変化の数・
+--      override (減りの受け入れを使った回 = env の値 token・表・件数。同じ token は 2 回目から効かない)
 --   2. 写しの表 (鍵は発注アプリと同じ・行ごとに最後に値を変えた世代 run_id):
 --      purchasing.sku_order_settings      = po_product_attrs (商品ごと: 発注ロット・発注条件グループ / 原料グループの紐づけ・容量/個・ケース)。
 --                                           sku_id = 写した時に Company DB のコードで結んだ SKU (無ければ null)・primary_supplier_code = 写した時の代表の仕入先 (core)
@@ -34,6 +35,7 @@ create table purchasing.snapshot_runs (
   hashes                 jsonb not null check (jsonb_typeof(hashes) = 'object'),
   problems               jsonb not null default '[]'::jsonb check (jsonb_typeof(problems) = 'array'),
   changes                jsonb check (changes is null or jsonb_typeof(changes) = 'object'),
+  override               jsonb check (override is null or (jsonb_typeof(override) = 'object' and override ? 'token')),   -- 減りの受け入れ (1 回だけ・Codex #1708 R1 M2)
   host                   text check (host is null or length(host) <= 100),
   started_at             timestamptz not null default now(),
   finished_at            timestamptz not null default clock_timestamp(),

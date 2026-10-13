@@ -2204,7 +2204,9 @@ git worktree remove C:\tmp\d60-revoke
 
 - **いつ入るか**: 夜間ロード (`company-db-nightly-load`) の**後ろの段** (`apps/company-db/load/po-settings-snapshot.mjs`・新しい定期実行は作らない)。本体のロードとは**別の接続・別の取引** = 写しが失敗しても本体は戻らない (段の失敗 = ジョブの ping が fail)。先の段 (発注の設定の知らせ = 0075) が届けた後に読む
 - **読み方**: SQLite の **1 つの読む取引**で 3 つの表を読む (同じ時点の値)。表・要る列がある・読めた・件数・hash を世代 `purchasing.snapshot_runs` (追記だけ) に残す
-- **完全に読めた回だけ入れ替える**: 表が無い・列が無い・読めない・前の世代より半分未満に減った (前が 20 行以上の表)・今の写しより前の読み = `rejected` (行は前の世代のまま・段の失敗)。同じ値 = `unchanged` (行は触らない)。変わった = 足す / 直す / 消す (行の `run_id` = 最後に値を変えた世代)
+- **PG の鍵を取ってから SQLite を読む** (同時に 2 本 = 読みも順番)。同じ時刻 (ミリ秒) で中身の違う読み = `ambiguous_read`・前の世代より前の読み = `older_read` で断る
+- **完全に読めた回だけ入れ替える**: 表が無い・列が無い・読めない・正規化した後に鍵が重なる (`duplicate_key`)・前の世代より半分未満に減った (前が 20 行以上の表)・今の写しより前の読み = `rejected` (行は前の世代のまま・段の失敗)。同じ値 = `unchanged` (行は触らない)。変わった = 足す / 直す / 消す (行の `run_id` = 最後に値を変えた世代)
+- **減りの受け入れは 1 回だけ**: 本当に発注アプリで半分以上消した = Render の env `PO_SNAPSHOT_ACCEPT_SHRINK=attrs:<今の件数>` (表 = attrs / conditions / materials・カンマで複数) → 減った表が全部その件数のときだけ 1 回受け入れ、世代の `override` に残す。同じ値は 2 回目から効かない (使った後は env を消す)
 - **写しの日付** = `read_at` (発注アプリの SQLite を読んだ時刻 = 「この時の発注アプリの値」)。`purchasing.v_snapshot_status` = 今の写しの `read_at`・`age_hours`・`stale` (36 時間超)・`rejected_since_at` (その後に完全に読めなかった回)
 - `mart.v_product_360` の最後の列 = `po_order_lot`・`po_condition_id`・`po_material_group_id`・`po_case_group`・`po_case_lot`・`po_capacity_per_unit`・`po_settings_read_at`・`po_settings_age_hours`。**決定 5 = b: 写しが古くても (36 時間超) AI はそのまま使ってよい = 行を外さない。答えには `po_settings_read_at` (いつの発注アプリの値か) を必ず添える**
 - `sku_id` / `primary_supplier_code` = 写した時に Company DB のコードで結んだ SKU と代表の仕入先 (発注アプリにしか無い商品 = `sku_id` null)。発注ロットは「弊社の在庫の個数の倍数」(`core.supplier_skus.order_multiple` = 先方の発注単位の倍数とは単位が違う = 混ぜない)
@@ -2319,6 +2321,10 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 - 検証 (`verify`) も復元も **1 行ずつ** 読む。ダンプ全体を 1 つの文字列にしない (Node の文字列は約 512 MB が上限。2026-09-26 の Company DB は gzip 前で 1.4 GB)。復元はファイルを 2 回読む = 1 回目は検証だけ (おかしければ何も消さずに止まる)、2 回目で流し込む。1 回目と 2 回目で行数が違えば巻き戻す (`RESTORE_SOURCE_CHANGED`)
 - 採番 (identity / serial) の記録がダンプと復元先で食い違っていたら、**何も消さずに** 止まる。抜けたまま戻すと次の登録が主キー重複で落ちるため
 - `ops.schema_migrations` は戻さない (復元先の履歴のまま) = 復元の行数は verify の行数より migration の数だけ少ない (正常)
+- 🚨 **purchasing (発注の設定の写し・0076) も取っていない** = 復元の後は空。手順: ① `select version from ops.schema_migrations where version = '0076'` で 0076 があるか ②
+  Render の Shell で写しの段だけを 1 回流す `node apps/company-db/load/po-settings-snapshot.mjs --apply` (夜間ロードの本体は流さない) ③ watcher で
+  `select status, counts, read_at from purchasing.snapshot_runs order by finished_at desc limit 1` (applied・件数 ≒ 発注アプリ)・`select * from purchasing.v_snapshot_status` (stale = false)・
+  `select has_table_privilege('watcher', 'purchasing.sku_order_settings', 'select')` (true。false = `create-watch-roles.mjs` を流し直す)
 - 🚨 **mart は取っていない** (`dump.mjs` の SCHEMAS)。mart の実体の表 = 売上日次 (`mart.sales_daily` ほか 5 表) と `finance_daily` は core から作り直せる派生データ → **復元の後に売上日次を作り直す** (売上日次を公開しているモールごとに `mall-orders.mjs --mall <m> --refresh-sales --all`。Render の受け口経由 = 復元した DB が本番の `COMPANY_DB_URL` になってから。途中で打ち切られたら `--all` を外して流し直す = 同じ回の続きから)。作り直すまで `mart.v_sales_daily` は空・見張りの W9 / W6 / W8 は blocked か breach になる。
   `finance_daily` (0012・Amazon 財務) は今は空で、この作り直しの対象ではない = 財務 (F2b) を入れるときに作り直し方を決める
 

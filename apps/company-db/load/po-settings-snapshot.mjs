@@ -11,11 +11,17 @@
  *      (前の世代のまま・rejected の世代を残す・段の失敗)。前と同じ hash = unchanged (行は触らない)
  *   3. 書くのは表の持ち主のロール (夜間ロードの COMPANY_DB_URL) だけ。画面・見張り・AI は読むだけ
  *   4. 写しの日付 = read_at (SQLite を読んだ時刻)。mart.v_product_360 の po_settings_read_at / po_settings_age_hours (決定 5 = b: 古くても使う・時刻を見せる)
+ *   5. 🆕 Codex #1708 R1 M1: **PG の鍵を取ってから SQLite を読む** (同時に 2 本 = 読みも順番 = 古い読みが新しい写しを上書きしない)。
+ *      それでも同じ時刻 (ミリ秒) で中身の違う読み = あいまい = 断る (ambiguous_read)・前の世代より前の読み = 断る (older_read)
+ *   6. 🆕 M2: 減りの受け入れ = env PO_SNAPSHOT_ACCEPT_SHRINK に「表:件数」(例 attrs:10) = **1 回だけ** (使った回を世代の override に残し、同じ値は 2 回目から効かない)
+ *   7. 🆕 M3: 正規化した後の鍵の重なり (大文字小文字・前後の空白だけ違う商品) = 不完全とみなして断る (duplicate_key・黙って捨てない)
+ * 手で 1 回だけ流す (復元の後など・本番ランナーは流さない) = Render の Shell で `node apps/company-db/load/po-settings-snapshot.mjs --apply` (README「バックアップと復元」)
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
+import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../../scripts/company-db/migrate.mjs';
 
 /** 前の世代よりこの割合を下回って減った表 = 不完全とみなす (途中の移行・壊れた読み) */
@@ -91,23 +97,57 @@ const SHAPES = {
 };
 const sameRow = (a, b, types) => Object.keys(types).every((k) => (types[k] === 'numeric' || types[k] === 'bigint' ? num(a[k]) === num(b[k]) : txt(a[k]) === txt(b[k])));
 
+/** 正規化した後の鍵 (attrs = 前後の空白を除いた小文字 = 写しの鍵・グループ = そのまま)。重なり = [鍵] (M3) */
+const keyOf = { attrs: (r) => String(r.product_key).trim().toLowerCase(), conditions: (r) => String(r.condition_id), materials: (r) => String(r.group_id) };
+function duplicateKeys(rows) {
+  const out = {};
+  for (const k of Object.keys(keyOf)) {
+    const seen = new Set(); const dup = new Set();
+    for (const r of rows[k] || []) { const key = keyOf[k](r); if (seen.has(key)) dup.add(key); seen.add(key); }
+    if (dup.size) out[k] = [...dup].sort();
+  }
+  return out;
+}
+const sameHashes = (a, b) => Object.keys(TABLES).every((k) => (a && a[k]) === (b && b[k]));
+
 /**
- * 写しを入れる (1 つの Postgres の取引・表の持ち主のロール)。snap = readPoSettingsSnapshot の答え。
- * 戻り値 { ok, status: applied | unchanged | rejected, run_id, counts, changes?, problems }
+ * 写しを入れる (1 つの Postgres の取引・表の持ち主のロール)。
+ * source = 読む関数 (() => readPoSettingsSnapshot の答え) = **鍵を取ってから読む** (段の道) / 読んだ答え (試験・前に読んだ値を入れてみる)。
+ * opts.shrinkOverride = parseShrinkOverride の答え (減りの受け入れ・1 回だけ)。
+ * 戻り値 { ok, status: applied | unchanged | rejected, run_id, counts, changes?, problems, snap, override? }
  */
-export async function applyPoSettingsSnapshot(db, snap, { host = null, acceptShrink = false } = {}) {
+export async function applyPoSettingsSnapshot(db, source, { host = null, shrinkOverride = null } = {}) {
   const runId = runIdOf();
   await db.query('begin');
   try {
-    await db.query(`select pg_advisory_xact_lock(hashtext('purchasing.snapshot'))`);   // 同時に 2 本 = 順番 (後の方は前の世代を見て比べる)
+    await db.query(`select pg_advisory_xact_lock(hashtext('purchasing.snapshot'))`);   // 同時に 2 本 = 順番 (読みも鍵の後 = 後の方は前の写しより後の値を読む)
+    const snap = typeof source === 'function' ? source() : source;
     const prev = (await db.query(`select run_id, counts, hashes, read_at from purchasing.snapshot_runs where status in ('applied', 'unchanged') order by read_at desc, finished_at desc limit 1`)).rows[0] || null;
     const problems = [...snap.problems];
-    // 前の世代より古い読み (同時に 2 本・遅れて来た読み) = 戻さない (新しい値を古い値で上書きしない)
+    // 前の世代より古い読み (遅れて来た読み) = 戻さない (新しい値を古い値で上書きしない)。同じ時刻 (ミリ秒) で中身が違う = どちらが新しいか決められない = 断る
     if (prev && new Date(prev.read_at).getTime() > snap.readAt.getTime()) problems.push(`older_read: 今の写し (${new Date(prev.read_at).toISOString()}) より前に読んだ値`);
-    if (!problems.length && prev && !acceptShrink) {
+    else if (prev && new Date(prev.read_at).getTime() === snap.readAt.getTime() && !sameHashes(prev.hashes, snap.hashes)) {
+      problems.push(`ambiguous_read: 今の写しと同じ時刻 (${snap.readAt.toISOString()}) で中身が違う読み (どちらが新しいか決められない)`);
+    }
+    // 正規化した後の鍵の重なり = 不完全 (黙って 1 行を捨てない・Codex #1708 R1 M3)
+    for (const [k, keys] of Object.entries(duplicateKeys(snap.rows))) problems.push(`duplicate_key: ${TABLES[k].table} の鍵が正規化で重なる (${keys.slice(0, 5).join(', ')}${keys.length > 5 ? ` ほか ${keys.length - 5}` : ''})`);
+    let override = null;
+    if (!problems.length && prev) {
+      const shrinks = [];
       for (const k of Object.keys(TABLES)) {
         const was = Number(prev.counts?.[k] ?? 0); const now = Number(snap.counts[k] ?? 0);
-        if (was >= SHRINK_MIN_PREV && now < was * SHRINK_RATIO) problems.push(`shrink: ${TABLES[k].table} が ${was} → ${now} 行 (前の世代の ${Math.round(SHRINK_RATIO * 100)}% 未満 = 途中の読み・移行の途中かもしれない)`);
+        if (was >= SHRINK_MIN_PREV && now < was * SHRINK_RATIO) shrinks.push({ table: k, was, now });
+      }
+      if (shrinks.length) {
+        // 減りの受け入れ (1 回だけ): env の「表:件数」が減った表の全部と件数まで合い、同じ値をまだ使っていないときだけ
+        let why = shrinkOverride ? null : '';
+        if (shrinkOverride) {
+          const used = (await db.query(`select 1 from purchasing.snapshot_runs where override ->> 'token' = $1 limit 1`, [shrinkOverride.token])).rows.length > 0;
+          if (used) why = ' (受け入れの env は使用済み = 2 回目は効かない)';
+          else if (!shrinks.every((x) => shrinkOverride.tables[x.table] === x.now)) why = ` (受け入れの env ${shrinkOverride.token} と表・件数が違う)`;
+        }
+        if (why === null) override = { kind: 'accept_shrink', token: shrinkOverride.token, tables: shrinkOverride.tables, accepted: shrinks };
+        else for (const x of shrinks) problems.push(`shrink: ${TABLES[x.table].table} が ${x.was} → ${x.now} 行 (前の世代の ${Math.round(SHRINK_RATIO * 100)}% 未満 = 途中の読み・移行の途中かもしれない)${why}`);
       }
     }
     const base = [runId, snap.readAt.toISOString(), snap.sourceMaxUpdatedAt, JSON.stringify(snap.counts), JSON.stringify(snap.hashes), host ? String(host).slice(0, 100) : null];
@@ -115,7 +155,7 @@ export async function applyPoSettingsSnapshot(db, snap, { host = null, acceptShr
       await db.query(`insert into purchasing.snapshot_runs (run_id, source, read_at, source_max_updated_at, counts, hashes, host, status, problems)
         values ($1, 'render-sqlite', $2::timestamptz, $3, $4::jsonb, $5::jsonb, $6, 'rejected', $7::jsonb)`, [...base, JSON.stringify(problems)]);
       await db.query('commit');
-      return { ok: false, status: 'rejected', run_id: runId, counts: snap.counts, problems };
+      return { ok: false, status: 'rejected', run_id: runId, counts: snap.counts, problems, snap };
     }
     // 結ぶ値 (写した時の Company DB の SKU と代表の仕入先)
     const codes = [...new Set(snap.rows.attrs.map((r) => String(r.product_code)))];
@@ -132,7 +172,7 @@ export async function applyPoSettingsSnapshot(db, snap, { host = null, acceptShr
       const up = []; let add = 0; let mod = 0;
       const seen = new Set();
       for (const r of want[k]) {
-        if (seen.has(r[sh.key])) continue;   // 鍵の重なり (SQLite の主キーなので起きない) = 先の行
+        if (seen.has(r[sh.key])) throw new Error(`duplicate_key: ${sh.table} ${r[sh.key]} (先に断っているはず)`);   // 上の duplicateKeys で断っている = ここには来ない
         seen.add(r[sh.key]);
         const c = cur.get(r[sh.key]);
         if (!c) { up.push(r); add++; } else if (!sameRow(c, r, sh.types)) { up.push(r); mod++; }
@@ -143,8 +183,8 @@ export async function applyPoSettingsSnapshot(db, snap, { host = null, acceptShr
     }
     const nChanged = Object.values(changes).reduce((a, c) => a + c.added + c.changed + c.removed, 0);
     const status = nChanged === 0 ? 'unchanged' : 'applied';
-    await db.query(`insert into purchasing.snapshot_runs (run_id, source, read_at, source_max_updated_at, counts, hashes, host, status, changes)
-      values ($1, 'render-sqlite', $2::timestamptz, $3, $4::jsonb, $5::jsonb, $6, $7, $8::jsonb)`, [...base, status, JSON.stringify(changes)]);
+    await db.query(`insert into purchasing.snapshot_runs (run_id, source, read_at, source_max_updated_at, counts, hashes, host, status, changes, override)
+      values ($1, 'render-sqlite', $2::timestamptz, $3, $4::jsonb, $5::jsonb, $6, $7, $8::jsonb, $9::jsonb)`, [...base, status, JSON.stringify(changes), override ? JSON.stringify(override) : null]);
     for (const [k, sh] of Object.entries(SHAPES)) {
       const { up, del } = plan[k];
       const cols = Object.keys(sh.types);
@@ -159,10 +199,10 @@ export async function applyPoSettingsSnapshot(db, snap, { host = null, acceptShr
     // 入れた後の件数 = 読んだ件数 (足りない = 取り消す)
     for (const [k, sh] of Object.entries(SHAPES)) {
       const n = Number((await db.query(`select count(*)::int as n from ${sh.table}`)).rows[0].n);
-      if (n !== new Set(want[k].map((r) => r[sh.key])).size) throw new Error(`count_mismatch: ${sh.table} ${n} 行 (読んだ ${want[k].length})`);
+      if (n !== want[k].length) throw new Error(`count_mismatch: ${sh.table} ${n} 行 (読んだ ${want[k].length})`);
     }
     await db.query('commit');
-    return { ok: true, status, run_id: runId, counts: snap.counts, changes, problems: [] };
+    return { ok: true, status, run_id: runId, counts: snap.counts, changes, problems: [], snap, override };
   } catch (e) {
     try { await db.query('rollback'); } catch { /* */ }
     throw e;
@@ -170,12 +210,21 @@ export async function applyPoSettingsSnapshot(db, snap, { host = null, acceptShr
 }
 
 /**
- * 減った表を受け入れるか (本当に発注アプリで半分以上消した = 人が決めた時だけ)。env PO_SNAPSHOT_ACCEPT_SHRINK_UNTIL = ISO の時刻 (その時刻まで = 自然に切れる・
- * 消し忘れても次の日からは元の守り)。読めない値・過ぎた時刻 = 受け入れない
+ * 減った表を受け入れる 1 回だけの印 (本当に発注アプリで半分以上消した = 人が決めた時だけ・Codex #1708 R1 M2)。
+ * env PO_SNAPSHOT_ACCEPT_SHRINK = 「表:今の件数」をカンマで (表 = attrs / conditions / materials。例 attrs:1520)。
+ * 減った表が全部、ちょうどその件数のときだけ 1 回受け入れる。使った回は世代の override に残る = 同じ値は 2 回目から効かない (env を消し忘れても次は守る)。
+ * 読めない値 = null (受け入れない)
  */
-export function acceptShrinkNow(env = process.env, now = Date.now()) {
-  const t = Date.parse(String(env.PO_SNAPSHOT_ACCEPT_SHRINK_UNTIL || ''));
-  return Number.isFinite(t) && now < t && t - now <= 7 * 86400e3;
+export function parseShrinkOverride(env = process.env) {
+  const raw = String(env.PO_SNAPSHOT_ACCEPT_SHRINK || '').trim();
+  if (!raw || raw.length > 200) return null;
+  const tables = {};
+  for (const part of raw.split(',')) {
+    const m = /^\s*(attrs|conditions|materials)\s*:\s*(\d{1,7})\s*$/.exec(part);
+    if (!m || Object.hasOwn(tables, m[1])) return null;
+    tables[m[1]] = Number(m[2]);
+  }
+  return { token: raw, tables };
 }
 
 /**
@@ -192,19 +241,34 @@ export async function runPoSettingsSnapshotStep({ url, dataDir = process.env.DAT
     const db = client.query && client.exec ? client : pgAdapter(client);
     await db.query(`set statement_timeout = '120s'`);
     if (!(await db.query(`select to_regclass('purchasing.snapshot_runs') is not null as ok`)).rows[0].ok) return { ok: true, skipped: true, note: '0076 の前 (写しの表が無い)' };
-    const snap = read(path.join(dataDir, 'warehouse-mirror.db'));
-    const r = await applyPoSettingsSnapshot(db, snap, { host, acceptShrink: acceptShrinkNow() });
+    // 鍵を取ってから読む (Codex #1708 R1 M1)
+    const r = await applyPoSettingsSnapshot(db, () => read(path.join(dataDir, 'warehouse-mirror.db')), { host, shrinkOverride: parseShrinkOverride() });
+    const snap = r.snap;
     const c = snap.counts;
     const at = snap.readAt.toISOString().slice(0, 16);
     if (!r.ok) return { ok: false, status: r.status, note: `入れ替えない (前の世代のまま): ${r.problems.join(' / ').slice(0, 140)}` };
     const ch = r.changes || {};
     const d = Object.values(ch).reduce((a, x) => ({ add: a.add + x.added, mod: a.mod + x.changed, del: a.del + x.removed }), { add: 0, mod: 0, del: 0 });
-    const note = `${r.status === 'unchanged' ? '変化なし' : `+${d.add} ~${d.mod} -${d.del}`} (${c.attrs}/${c.conditions}/${c.materials} 行・${at}Z)`;
+    const note = `${r.status === 'unchanged' ? '変化なし' : `+${d.add} ~${d.mod} -${d.del}`} (${c.attrs}/${c.conditions}/${c.materials} 行・${at}Z)${r.override ? '・減りを受け入れた (1 回だけ)' : ''}`;
     log(`発注の設定の写し: ${note}`);
     return { ok: true, status: r.status, note };
   } catch (e) {
     return { ok: false, note: `想定外: ${String((e && e.message) || e).slice(0, 140)}` };
   } finally {
     try { if (client && client.end) await client.end(); } catch { /* */ }
+  }
+}
+
+// ─── 手で 1 回だけ流す (復元の後など)。本番ランナー (夜間ロード) は流さない = この段だけ ───
+//   Render の Shell: node apps/company-db/load/po-settings-snapshot.mjs --apply   (COMPANY_DB_URL = 持ち主のロール・DATA_DIR = 発注アプリの SQLite)
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  if (!process.argv.includes('--apply')) {
+    console.log('使い方: node apps/company-db/load/po-settings-snapshot.mjs --apply  (発注の設定の写しを 1 回だけ入れる・夜間ロードの後ろの段と同じ・Render の Shell で)');
+    process.exitCode = 2;
+  } else {
+    const r = await runPoSettingsSnapshotStep({ url: process.env.COMPANY_DB_URL, dataDir: process.env.DATA_DIR, host: 'manual', log: (m) => console.log(m) });
+    console.log(JSON.stringify({ ok: r.ok, status: r.status ?? null, skipped: !!r.skipped, note: r.note }));
+    process.exitCode = r.ok ? 0 : 1;
   }
 }

@@ -10,6 +10,7 @@
  *   S5 入れる途中で落ちた = 全部巻き戻す (前の世代のまま・世代の行も残らない)
  *   S6 古い写し (36 時間超) = stale・それでも商品 360 は値を出す (決定 5 = b)・時刻が見える
  *   S9 遅れて来た古い読み = 入れ替えない
+ *   S10 正規化した後の鍵の重なり = 入れ替えない・S11 鍵を取ってから読む・同じ時刻で中身の違う読み = あいまい = 断る・減りの受け入れは 1 回だけ (S3)
  *   S7 権限: 書けるのは持ち主 (夜間ロード) だけ・見張りは読める・画面のロールは書けない・世代は追記だけ・重い入口の棚卸しに漏れが無い・夜間の段の順 (知らせ → 写し)
  * 使い方: node scripts/test-po-settings-snapshot.mjs
  */
@@ -157,22 +158,65 @@ await ta('[S3] 完全に読めない回は入れ替えない (前の世代のま
   assert.equal(st.run_id, cur);
   assert.ok(st.rejected_since_at, '断った回が今の写しの様子に出ない');
   assert.equal((await rows(`select status from purchasing.snapshot_runs where status = 'rejected'`)).length, 4);
-  // 人が決めた時だけ減った表を受け入れる (env の時刻まで・7 日より先は受けない・過ぎたら元の守り)
-  const now = Date.now();
-  assert.equal(S.acceptShrinkNow({ PO_SNAPSHOT_ACCEPT_SHRINK_UNTIL: new Date(now + 3600e3).toISOString() }, now), true);
-  assert.equal(S.acceptShrinkNow({ PO_SNAPSHOT_ACCEPT_SHRINK_UNTIL: new Date(now - 1).toISOString() }, now), false);
-  assert.equal(S.acceptShrinkNow({ PO_SNAPSHOT_ACCEPT_SHRINK_UNTIL: new Date(now + 8 * 86400e3).toISOString() }, now), false);
-  assert.equal(S.acceptShrinkNow({ PO_SNAPSHOT_ACCEPT_SHRINK_UNTIL: 'きょう' }, now), false);
-  assert.equal(S.acceptShrinkNow({}, now), false);
-  const shr = S.readPoSettingsSnapshot(path.join(broken, 'warehouse-mirror.db'));
-  const acc = await S.applyPoSettingsSnapshot(db, shr, { acceptShrink: true });
-  assert.deepEqual([acc.ok, acc.status, acc.changes.attrs.removed], [true, 'applied', 21]);
+  // Codex #1708 R1 M2: 人が決めた時だけ減った表を受け入れる = env「表:件数」・1 回だけ・使った回を世代に残す
+  assert.deepEqual(S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:10' }), { token: 'attrs:10', tables: { attrs: 10 } });
+  assert.deepEqual(S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:10, materials:3' }).tables, { attrs: 10, materials: 3 });
+  for (const bad of ['', 'attrs', 'attrs:x', 'items:10', 'attrs:10,attrs:11', 'x'.repeat(201)]) assert.equal(S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: bad }), null, bad);
+  const bfile = path.join(broken, 'warehouse-mirror.db');
+  // 件数が違う env = 受け入れない
+  let acc = await S.applyPoSettingsSnapshot(db, () => S.readPoSettingsSnapshot(bfile), { shrinkOverride: S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:11' }) });
+  assert.deepEqual([acc.ok, acc.status], [false, 'rejected']); assert.match(acc.problems.join(), /件数が違う/);
+  acc = await S.applyPoSettingsSnapshot(db, () => S.readPoSettingsSnapshot(bfile), { shrinkOverride: S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:10' }) });
+  assert.deepEqual([acc.ok, acc.status, acc.changes.attrs.removed, acc.override.token], [true, 'applied', 21, 'attrs:10']);
+  assert.deepEqual((await one(`select override from purchasing.snapshot_runs where run_id = $1`, [acc.run_id])).override,
+    { kind: 'accept_shrink', token: 'attrs:10', tables: { attrs: 10 }, accepted: [{ table: 'attrs', was: 31, now: 10 }] });
+  // 直れば入る (元の 31 行に戻る = 受け入れの後は前の世代 10 行から増えるだけ)
   // 直れば入る (元の 31 行に戻る = 受け入れの後は前の世代 10 行から増えるだけ)
   r = await step();
   assert.deepEqual([r.ok, r.status], [true, 'applied']);
   r = await step();
   assert.deepEqual([r.ok, r.status], [true, 'unchanged']);
   assert.equal((await one('select rejected_since_at from purchasing.v_snapshot_status')).rejected_since_at, null);
+  // 同じ env の 2 回目 = 効かない (env を消し忘れても次の減りは守る)
+  acc = await S.applyPoSettingsSnapshot(db, () => S.readPoSettingsSnapshot(bfile), { shrinkOverride: S.parseShrinkOverride({ PO_SNAPSHOT_ACCEPT_SHRINK: 'attrs:10' }) });
+  assert.deepEqual([acc.ok, acc.status], [false, 'rejected']); assert.match(acc.problems.join(), /使用済み/);
+  // 段の道でも env を読む (1 回だけ = もう使った値)
+  process.env.PO_SNAPSHOT_ACCEPT_SHRINK = 'attrs:10';
+  try { r = await step({ dataDir: broken }); } finally { delete process.env.PO_SNAPSHOT_ACCEPT_SHRINK; }
+  assert.equal(r.ok, false); assert.match(r.note, /使用済み/);
+  assert.equal(Number((await one(`select count(*)::int as n from purchasing.sku_order_settings`)).n), 31);
+});
+
+await ta('[S10] (Codex #1708 R1 M3) 正規化した後に鍵が重なる (大文字小文字・前後の空白だけ違う商品コード) = 入れ替えない (黙って 1 行を捨てない・どの鍵か)', async () => {
+  const before = await rows(`select * from purchasing.sku_order_settings order by product_key`);
+  podb.prepare('INSERT INTO po_product_attrs (product_key, product_code, order_lot, created_at, updated_at) VALUES (?,?,?,?,?)').run('SNAP-01', 'SNAP-01', 99, T0, T0);
+  try {
+    const r = await step();
+    assert.equal(r.ok, false); assert.match(r.note, /duplicate_key: po_product_attrs の鍵が正規化で重なる \(snap-01\)/);
+    assert.deepEqual(await rows(`select * from purchasing.sku_order_settings order by product_key`), before);
+  } finally { podb.prepare(`DELETE FROM po_product_attrs WHERE product_key = 'SNAP-01'`).run(); }
+  assert.equal((await step()).ok, true);
+});
+
+await ta('[S11] (Codex #1708 R1 M1) 鍵を取ってから読む (段の道)・同じ時刻 (ミリ秒) で中身の違う読み = あいまい = 断る', async () => {
+  // 読む関数は鍵の後に呼ばれる (取引の中・鍵を持っている)
+  let lockedWhenRead = null;
+  const r = await S.applyPoSettingsSnapshot(db, () => { lockedWhenRead = true; return S.readPoSettingsSnapshot(FILE); });
+  assert.equal(lockedWhenRead, true); assert.ok(r.ok);
+  const lk = await rows(`select count(*)::int as n from pg_locks where locktype = 'advisory'`);
+  assert.equal(lk[0].n, 0, '取引の後も鍵が残った');
+  // 同じ時刻・違う中身
+  const cur = await one(`select read_at from purchasing.v_snapshot_status`);
+  podb.prepare(`UPDATE po_product_attrs SET order_lot = 77, updated_at = ? WHERE product_key = 'snap-06'`).run('2026-10-05T00:00:00.000Z');
+  const odd = S.readPoSettingsSnapshot(FILE);
+  odd.readAt = new Date(cur.read_at);
+  const amb = await S.applyPoSettingsSnapshot(db, odd);
+  assert.deepEqual([amb.ok, amb.status], [false, 'rejected']); assert.match(amb.problems.join(), /^ambiguous_read/);
+  // 同じ時刻・同じ中身 = unchanged (あいまいでない)
+  podb.prepare(`UPDATE po_product_attrs SET order_lot = 6, updated_at = ? WHERE product_key = 'snap-06'`).run(T0);
+  const same = S.readPoSettingsSnapshot(FILE);
+  same.readAt = new Date(cur.read_at);
+  assert.equal((await S.applyPoSettingsSnapshot(db, same)).status, 'unchanged');
 });
 
 await ta('[S4] 1 つの読む取引: 1 つめの表を読んだ後に別の接続が書いても、同じ読みのほかの表には入らない (同じ時点の値)', async () => {
@@ -224,6 +268,10 @@ await ta('[S7] 権限: 書けるのは持ち主だけ (見張り・画面のロ�
     }
   }
   assert.equal((await one(`select has_schema_privilege('master_edit', 'purchasing', 'usage') as ok`)).ok, false);
+  // Codex #1708 R1 L1: 画面のロールは mart も使えない (v_product_360 の po_* 経由でも読めない)・画面のコードは v_product_360 を読んでいない
+  assert.equal((await one(`select has_schema_privilege('master_edit', 'mart', 'usage') as ok`)).ok, false);
+  const meSrc = fs.readdirSync(new URL('../apps/master-edit/', import.meta.url)).filter((f) => /\.m?js$/.test(f)).map((f) => fs.readFileSync(new URL(`../apps/master-edit/${f}`, import.meta.url), 'utf8')).join('\n');
+  assert.ok(!/v_product_360|purchasing\./.test(meSrc), 'マスタの入力のコードが v_product_360 / purchasing を読んでいる');
   assert.equal((await one(`select has_schema_privilege('public', 'purchasing', 'create') as ok`)).ok, false);
   await pg.query('set role watcher');
   try {
