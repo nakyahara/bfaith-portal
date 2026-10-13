@@ -26,9 +26,20 @@
 
   /* ---------- 欄の値・未保存 ---------- */
   var rowsEl = $('#comp-rows');
+  // 空の行 (コードが空で数がはじめの 1) は数えない = 開いたときの 1 行目・足しただけの行で「未保存」にしない・保存に送らない (新商品のセットの画面 me-new.js と同じ)
   function components() {
     return $$('tr.comp-row', rowsEl).map(function (tr) { return { code: $('.c-code', tr).value.trim(), qty: $('.c-qty', tr).value.trim() }; })
-      .filter(function (r) { return r.code || r.qty; });
+      .filter(function (r) { return r.code || (r.qty && r.qty !== '1'); });
+  }
+  /*
+   * 構成が 0 行 (新しい対応・墓標から戻す) = 開いたときに 1 行目 (空のコード・数 1・代表) を出しておく (中原さん 10/13「NE の商品を足すボタンがいらない。
+   * 最初からボタン押した後をデフォルト表示してほしい」)。比べる基準 (initial)・元に戻す の先もこの 1 行の形 = 開いただけで未保存にならない
+   */
+  var firstRowAdded = false;
+  if (rowsEl && D.canSave === '1' && !$('tr.comp-row', rowsEl)) {
+    rowsEl.appendChild($('#comp-tpl').content.firstElementChild.cloneNode(true));
+    relabel(rowsEl.firstElementChild, 0);   // 番号・読み上げの名前 (元に戻す の先の形にも入る)
+    firstRowAdded = true;
   }
   var compText = function (rows) { return rows.length ? rows.map(function (r) { return r.code + '×' + r.qty; }).join(', ') : 'なし'; };
   function valueOf(el) { return el.id === 'comp' ? JSON.stringify(components()) : el.value; }
@@ -378,6 +389,9 @@
       if (e.target.classList.contains('c-code')) { e.preventDefault(); var q = $('.c-qty', e.target.closest('tr')); if (q) { q.focus(); q.select(); } }
     });
     $('#comp-add').addEventListener('click', function () {
+      // 最後の行がまだ空 (コードなし) = 新しい行を足さずにその欄へ (空の行を重ねない)
+      var last = rowsEl.lastElementChild;
+      if (last && !$('.c-code', last).value.trim()) { $('.c-code', last).focus(); return; }
       if ($$('tr.comp-row', rowsEl).length >= (P.maxComponents || 20)) { ME.toast('構成は ' + (P.maxComponents || 20) + ' 行までです'); return; }
       rowsEl.appendChild($('#comp-tpl').content.firstElementChild.cloneNode(true));
       renumber();
@@ -524,4 +538,9 @@
   update();
   delState();
   showNote();
+  // 開いたときに足した 1 行目 = 番号・読み上げの名前・代表の印。マウスの画面 (pointer: fine) だけコードの欄へ (スマホ・タブレットは勝手にキーボードを出さない)
+  if (firstRowAdded) {
+    var fine = window.matchMedia && window.matchMedia('(pointer: fine)').matches;
+    if (fine && !$('#saved-note')) $('.c-code', rowsEl.firstElementChild).focus({ preventScroll: true });
+  }
 })();

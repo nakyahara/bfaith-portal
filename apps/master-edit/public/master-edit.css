@@ -1056,3 +1056,6 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .csug { max-height: min(360px, 55vh); }
 }
 @media (prefers-reduced-motion: reduce) { .csug { animation: none; } }
+/* 構成の行の下の「NE の商品を足す (セット)」= 1 行目は最初からあるので控えめ (文字だけのボタン・押せる大きさはスマホで 44px) */
+#comp-add.addrow { color: var(--muted); padding: 0 6px; }
+#comp-add.addrow:hover { color: var(--accent); }

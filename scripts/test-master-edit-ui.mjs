@@ -2299,6 +2299,79 @@ await ta('[58] Amazon SKU の名前 (社内) が空なら NE の商品名を入�
   } finally { await setRegUi('k003', keep); }
 });
 
+await ta('[61] Amazon SKU の新しい対応 (10/13): 開くと構成の 1 行目 (空のコード・数 1・代表) とコードの欄にフォーカス・未保存 0・構成 → 名前 (社内) の順 (Tab も)・「足す」は空の行があれば足さない・コード → 名前が入る・2 行目を足せる (空の行は数えない)・元に戻す・保存', async (p) => {
+  await p.goto(B + '/amazon/sku?sku=pr-row1-a');
+  const rows = p.locator('#comp-rows tr.comp-row');
+  assert.equal(await rows.count(), 1, '開くと 1 行目がある');
+  const r1 = rows.first();
+  assert.deepEqual([await r1.locator('.c-code').inputValue(), await r1.locator('.c-qty').inputValue(), (await r1.locator('.no').textContent()).trim()], ['', '1', '1']);
+  assert.match(await r1.textContent(), /代表/);
+  assert.equal(await r1.locator('.c-code').getAttribute('aria-label'), '1 行目の NE コード');
+  assert.equal(await active(p), '1 行目の NE コード', 'コードの欄にフォーカス (マウスの画面)');
+  assert.equal(await dirty(p), 0, '開いただけでは未保存にしない');
+  assert.equal(await p.isDisabled('#save'), true, '空の 1 行では保存できない');
+  // 並び = 構成の表 → 名前 (社内)。Tab も「足す」の次が名前
+  assert.equal(await p.evaluate(() => !!(document.getElementById('comp').compareDocumentPosition(document.getElementById('name')) & Node.DOCUMENT_POSITION_FOLLOWING)), true, '構成の後に名前');
+  await p.focus('#comp-add');
+  await p.keyboard.press('Tab');
+  assert.equal(await active(p), 'name', '「足す」の次の Tab = 名前 (社内)');
+  // 「足す」= 最後の行が空なら足さずにその欄へ
+  await p.click('#comp-add');
+  assert.equal(await rows.count(), 1, '空の行を重ねない');
+  assert.equal(await active(p), '1 行目の NE コード');
+  // コード → 空の名前に商品名 (#1692)
+  const c1 = r1.locator('.c-code');
+  await c1.fill('k004');
+  await c1.press('Tab');
+  await p.waitForFunction(() => document.getElementById('name').value !== '');
+  const nm = (await row('k004')).name;
+  assert.equal(await p.inputValue('#name'), nm);
+  assert.equal(await dirty(p), 2);
+  // 2 行目を足せる・空の 2 行目は数えない
+  await p.click('#comp-add');
+  assert.equal(await rows.count(), 2);
+  assert.equal(await active(p), '2 行目の NE コード');
+  assert.equal(await dirty(p), 2);
+  assert.match(await p.textContent('#save-diff'), /なし[\s\S]*→[\s\S]*k004×1(?!,)/, '構成 = k004×1 だけ (空の行は入らない)');
+  // 元に戻す = 1 行目だけの形・未保存 0
+  await p.click('#revert');
+  assert.equal(await rows.count(), 1);
+  assert.deepEqual([await rows.first().locator('.c-code').inputValue(), (await rows.first().locator('.no').textContent()).trim()], ['', '1']);
+  assert.match(await rows.first().textContent(), /代表/);
+  assert.equal(await p.inputValue('#name'), '');
+  assert.equal(await dirty(p), 0);
+  // 入れ直して保存 (空の 2 行目があっても送らない)
+  await rows.first().locator('.c-code').fill('k004');
+  await rows.first().locator('.c-code').press('Tab');
+  await p.waitForFunction(() => document.getElementById('name').value !== '');
+  await p.click('#comp-add');
+  await p.keyboard.press('Control+s');
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /新しい対応を作りました/);
+  assert.deepEqual(await mapOf('pr-row1-a'), { name: nm, state: 'active' });
+  assert.deepEqual(await compsUi('pr-row1-a'), [['k004', 1]]);
+  assert.equal(await rows.count(), 1, '読み直した後 = 保存した構成の 1 行 (空の行を足さない)');
+  assert.equal(await rows.first().locator('.c-code').inputValue(), 'k004');
+  // 対応を直す画面も同じ並び (構成 → 名前)
+  assert.equal(await p.evaluate(() => !!(document.getElementById('comp').compareDocumentPosition(document.getElementById('name')) & Node.DOCUMENT_POSITION_FOLLOWING)), true);
+});
+
+await ta('[62] Amazon SKU の新しい対応 (390・タッチ): 1 行目がある・勝手にキーボードを出さない (フォーカスしない)・「足す」は 44px・未保存 0', async (p, ctx) => {
+  await ctx.close().catch(() => {});
+  const c2 = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, locale: 'ja-JP' });
+  const m = await c2.newPage();
+  const errs = []; m.on('pageerror', (e) => errs.push(e.message));
+  try {
+    await m.goto(B + '/amazon/sku?sku=pr-row1-b');
+    assert.equal(await m.locator('#comp-rows tr.comp-row').count(), 1);
+    assert.equal(await m.evaluate(() => window.matchMedia('(pointer: fine)').matches), false, '前提: タッチの画面');
+    assert.equal(await m.evaluate(() => document.activeElement && document.activeElement.classList.contains('c-code')), false, 'スマホでは勝手にコードの欄へ行かない');
+    assert.ok((await m.locator('#comp-add').boundingBox()).height >= 43.5);
+    assert.equal(await m.evaluate(() => window.MasterEdit.dirty().n), 0);
+    assert.deepEqual(errs, [], '画面の JS の例外');
+  } finally { await c2.close(); }
+});
+
 await browser.close();
 server.close();
 try { mirrorDb.close(); fs.rmSync(DATA_TMP, { recursive: true, force: true }); } catch { /* 消せなくてもよい */ }
