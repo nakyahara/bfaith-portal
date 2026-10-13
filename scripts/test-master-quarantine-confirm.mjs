@@ -204,9 +204,9 @@ async function obsLikeCdb(codeNorm) {
 }
 const fp = (s) => crypto.createHash('sha256').update(s).digest('hex');
 /** 判断の候補 (照合 ② が出す形) */
-const cand = (code, col, { child = null, cls = 'rule', reason = 'company_owned', resolutions = ['accept_difference', 'fix_ne', 'fix_cdb'], tag = '' } = {}) => ({
-  fingerprint: fp(`${code}|${col}|${child}|${tag}`), subject_key: `${col === 'cost' ? 'cost' : 'value'}:${code}`, code_norm: code, col, child, cls, reason_kind: reason,
-  semantic: `${reason}@1`, print: { code_norm: code, col, child }, resolutions, proposal: { op: 'decide' } });
+const cand = (code, col, { child = null, c = null, cls = 'rule', reason = 'company_owned', resolutions = ['accept_difference', 'fix_ne', 'fix_cdb'], tag = '' } = {}) => ({
+  fingerprint: fp(`${code}|${col}|${child}|${tag}|${JSON.stringify(c)}`), subject_key: `${col === 'cost' ? 'cost' : 'value'}:${code}`, code_norm: code, col, child, cls, reason_kind: reason,
+  semantic: `${reason}@1`, print: { code_norm: code, col, child, c }, resolutions, proposal: { op: 'decide' } });
 /**
  * 照合 ② の回を 1 つ置く。obs = { code_norm: 観測 | (今と同じ観測) => 観測 }・decisions = 候補・fetchAgoMs = 取得の古さ・neCodes = false なら NE のコードの印を進めない
  */
@@ -290,29 +290,29 @@ await ta('[C3] 単品の必須の欄の 1 つ 1 つ (取引の中で変えて巻
   const cases = [
     [() => setSku('q02', { reorder_months: null }), ['reorder_months'], 'one'],
     [async () => q('update core.products set sales_class = null where product_id = $1', [await pidOf('q02')]), ['sales_class'], 'one'],
-    [async () => q('delete from core.sku_costs where sku_id = $1', [await sid('q02')]), ['cost'], 'ne_fill'],
-    [() => setCost('q02', 300, 'manual', 'PARTIAL'), ['cost'], 'one'],
-    [() => setCost('q02', 0, 'manual', 'COMPLETE'), ['cost'], 'one'],
-    [async () => q('update core.supplier_skus set is_primary = false where sku_id = $1', [await sid('q02')]), ['supplier'], 'ne_fill'],
-    [async () => q(`update core.suppliers set code = 'X1' where code = '0001'`), ['supplier'], 'one'],
+    [async () => q('delete from core.sku_costs where sku_id = $1', [await sid('q02')]), ['cost', 'ne.cost'], 'ne_fill'],
+    [() => setCost('q02', 300, 'manual', 'PARTIAL'), ['cost', 'ne.cost'], 'one'],
+    [() => setCost('q02', 0, 'manual', 'COMPLETE'), ['cost', 'ne.cost'], 'one'],
+    [async () => q('update core.supplier_skus set is_primary = false where sku_id = $1', [await sid('q02')]), ['ne.supplier', 'supplier'], 'ne_fill'],
+    [async () => q(`update core.suppliers set code = 'X1' where code = '0001'`), ['ne.supplier', 'supplier'], 'one'],
     [() => setSku('q02', { tax_class: 'REDUCED_8' }), ['tax'], 'ne_fill'],
-    [() => setSku('q02', { handling: 'unknown' }), ['handling'], 'ne_fill'],
-    [() => setSku('q02', { name: 'Q02' }), ['name'], 'ne_fill'],
-    [() => setSku('q02', { standard_price_jpy: null }), ['price'], 'ne_fill'],
+    [() => setSku('q02', { handling: 'unknown' }), ['handling', 'ne.handling'], 'ne_fill'],
+    [() => setSku('q02', { name: 'Q02' }), ['name', 'ne.name'], 'ne_fill'],
+    [() => setSku('q02', { standard_price_jpy: null }), ['ne.price', 'price'], 'ne_fill'],
   ];
   for (const [mut, keys, fix] of cases) {
     await rolledBack(async () => {
       await mut();
       const c = await check('q02');
-      // 照合の答え (ne.*) は候補が無い = ok のまま (欄の差は照合 ② の候補で見る)
+      // 照合の答え (ne.*) = 今の社内の値と封をした回の観測を比べる (照合の後に値を変えた = 判断が無い = だめ・#1715 Codex R1 High)
       assert.deepEqual(bad(c), keys, `${mut.toString()} → ${JSON.stringify(c.items.filter((x) => !x.ok))}`);
-      assert.equal(itemOf(c, keys[0]).fix, fix, mut.toString());
+      assert.equal(itemOf(c, keys.find((k) => !k.startsWith('ne.'))).fix, fix, mut.toString());
       assert.equal(c.ok, false); assert.equal(c.evidence, null);
     });
   }
   assert.equal((await check('q02')).ok, true);
 });
-await ta('[C4] セットの欄: 構成品が要確認 (qs2) / 開いている構成の依頼 / 税率・取扱が構成品から導いた値と違う / 売上分類が導けない (上書きで通る) / 原価 (合計と違う・例外原価で通る) / 構成品が無い', async () => {
+await ta('[C4] セットの欄: 構成品が要確認 (qs2) / 開いている構成の依頼 / 税率・取扱が構成品から導いた値と違う / 売上分類が導けない (上書きで通る) / 原価 (合計と違う・例外原価で通る・例外原価 0 円はだめ) / 構成品が無い', async () => {
   const s2 = await check('qs2');
   assert.deepEqual(bad(s2), ['components']);
   assert.match(itemOf(s2, 'components').text, /q01 \(quarantined\)/);
@@ -327,9 +327,10 @@ await ta('[C4] セットの欄: 構成品が要確認 (qs2) / 開いている構
     [async () => { await q('update core.products set sales_class = 4 where product_id = $1', [await pidOf('a01')]); await setSku('qs1', { set_sales_class_override: 1 }); }, []],
     [() => setCost('qs1', 251, 'set_calc', 'COMPLETE'), ['cost']],
     [() => setCost('qs1', 999, 'manual', 'OVERRIDDEN'), []],
+    [() => setCost('qs1', 0, 'manual', 'OVERRIDDEN'), ['cost']],   // #1715 Codex R1 M1: 例外原価 0 円は通さない (単品と同じ)
     [() => setCost('qs1', 250, 'manual', 'COMPLETE'), ['cost']],
     [async () => q(`update core.sku_costs set cost_status = 'MISSING' where sku_id = $1 and valid_to is null`, [await sid('a02')]), ['cost']],
-    [async () => q('delete from core.sku_components where parent_sku_id = $1', [await sid('qs1')]), ['components', 'cost', 'sales_class', 'tax']],
+    [async () => q('delete from core.sku_components where parent_sku_id = $1', [await sid('qs1')]), ['components', 'cost', 'ne.children', 'sales_class', 'tax']],
   ];
   for (const [mut, keys] of cases) {
     await rolledBack(async () => {
@@ -379,9 +380,9 @@ await ta('[C5] 照合の回: NE の元のコードの回が先に進んだ (封�
     assert.match(itemOf(c, 'ne_observed').text, /観測が無い/);
   });
 });
-await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承認 (差を残す・NE を直す・社内を直す) = ok / 却下・取り消し = だめ / 直す承認の完了の後にまた出た = だめ / 写した (今の社内 = 観測) = ok / 列に当たらない候補 = ne.other', async () => {
+await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承認 (差を残す・NE を直す・社内を直す) = ok / 却下・取り消し = だめ / 直す承認の完了の後にまた出た = だめ / 写した (今の社内 = 観測) = ok / 列に当たらない候補 = ne.other / 照合の後・承認の後に値を変えた = だめ (#1715 R1 High)', async () => {
   // q03: NE の原価 280・社内 300 = 照合 ② が原価の差を候補に (company_owned)
-  const cc = cand('q03', 'cost');
+  const cc = cand('q03', 'cost', { c: 300 });
   const neCost = (v) => (b) => ({ ...b, cols: { ...b.cols, cost: { st: 'ok', v } } });
   await rolledBack(async () => {
     await sealRun({ obs: { q03: neCost(280) }, decisions: [cc], at: new Date(Date.now() + 1000) });
@@ -396,7 +397,15 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
       c = await check('q03');
       assert.equal(c.ok, true, `${res}: ${JSON.stringify(c.items.filter((x) => !x.ok))}`);
       assert.deepEqual(c.evidence.decisions, [{ fingerprint: cc.fingerprint, col: 'cost', child: null, how: 'approved', event_id: String(ev), resolution: res }]);
-      assert.match(itemOf(c, 'ne.cost').text, /マスタの判断で決めてある/);
+      assert.match(itemOf(c, 'ne.cost').text, /今の社内の値でマスタの判断で決めてある/);
+      // 承認の後に社内の値を第三の値 (290) に変えた = 承認は効かない (承認した差は 300 ↔ 280) = 明日の照合の後に
+      await pg.query('savepoint s3');
+      await setCost('q03', 290);
+      const c3 = await check('q03');
+      assert.deepEqual(bad(c3), ['ne.cost'], res);
+      assert.match(itemOf(c3, 'ne.cost').text, /承認の後に社内の値が変わった \(照合の時 300・今 290\)/);
+      assert.equal(itemOf(c3, 'ne.cost').fix, 'after_compare');
+      await pg.query('rollback to savepoint s3');
       if (res === 'fix_ne') {
         // 直す承認の完了 (action_done) の後にまた同じ差が出た = 再発 = だめ
         await q(`insert into ops.master_decision_events (fingerprint, kind, approved_event_id, actor_type, actor, observed) values ($1, 'action_done', $2, 'system', 'mc_x', '{}'::jsonb)`, [cc.fingerprint, ev]);
@@ -415,31 +424,63 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
     }
     // 解決が spec / fix_input は数えない
     await pg.query('savepoint s');
-    const cs = cand('q03', 'cost', { tag: 'spec', resolutions: ['spec'] });
+    const cs = cand('q03', 'cost', { c: 300, tag: 'spec', resolutions: ['spec'] });
     const lastRun = (await one('select compare_run_id from ops.ne_reg_compare_receipts order by sealed_at desc limit 1')).compare_run_id;
     await as('watch_writer', () => pg.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: lastRun, observed_at: new Date().toISOString(), decisions: [cs] })]));
     await approve(cs.fingerprint, 'spec');
-    await approve(cc.fingerprint, 'accept_difference');
     assert.match(itemOf(await check('q03'), 'ne.cost').text, /解決 spec はこの確認では数えない/);
     await pg.query('rollback to savepoint s');
     // 社内の値を NE の値に写した (今の社内 280 = 観測 280) = ok (明日の照合で候補は消える)・違う値 (281) = だめ
     await setCost('q03', 280);
     c = await check('q03');
     assert.equal(c.ok, true, JSON.stringify(c.items.filter((x) => !x.ok)));
-    assert.deepEqual(c.evidence.decisions, [{ fingerprint: cc.fingerprint, col: 'cost', child: null, how: 'copied' }]);
+    assert.deepEqual(c.evidence.decisions, [{ col: 'cost', how: 'copied' }]);
     assert.match(itemOf(c, 'ne.cost').text, /社内の値を NE の値に合わせた/);
     await setCost('q03', 281);
     assert.deepEqual(bad(await check('q03')), ['ne.cost']);
   });
-  // 前の回の候補 (この回に見えていない) は数えない・列に当たらない候補 (exists など) = ne.other・構成 (components:子) = ne.children
+  // 前の回の候補 (この回に見えていない) は数えない・列に当たらない候補 (exists など) = ne.other
   await rolledBack(async () => {
-    await sealRun({ decisions: [cand('q03', 'cost', { tag: 'old' })], at: new Date(Date.now() + 1000) });
-    await sealRun({ decisions: [cand('q03', 'exists', { cls: 'reg_stale', reason: 'reg_stale' }), cand('qs1', 'components', { child: 'a02', reason: 'manual' })], at: new Date(Date.now() + 2000) });
+    const old = cand('q03', 'cost', { c: 300, tag: 'old' });
+    await sealRun({ obs: { q03: neCost(280) }, decisions: [old], at: new Date(Date.now() + 1000) });
+    await approve(old.fingerprint, 'accept_difference');
+    await sealRun({ obs: { q03: neCost(280) }, decisions: [cand('q03', 'exists', { c: true, cls: 'reg_stale', reason: 'reg_stale' })], at: new Date(Date.now() + 2000) });
     const c = await check('q03');
-    assert.deepEqual(bad(c), ['ne.other']);
+    assert.deepEqual(bad(c), ['ne.cost', 'ne.other']);
+    assert.match(itemOf(c, 'ne.cost').text, /照合の後に社内の値を変えた|NE \(照合の回/);
     assert.match(itemOf(c, 'ne.other').text, /exists \(reg_stale/);
-    assert.deepEqual(bad(await check('qs1')), ['ne.children']);
   });
+  // 構成 (components:子): NE の a02 は 2・社内は 1 = 子ごとに今の構成に結びついた承認が要る / 承認の後に社内を 3 にした = だめ
+  await rolledBack(async () => {
+    const neKids = (b) => ({ ...b, children: b.children.map((x) => (x.code_norm === 'a02' ? { ...x, v: 2 } : x)) });
+    const ck = cand('qs1', 'components', { child: 'a02', c: 1, reason: 'manual' });
+    await sealRun({ obs: { qs1: neKids }, decisions: [ck], at: new Date(Date.now() + 1000) });
+    assert.deepEqual(bad(await check('qs1')), ['ne.children']);
+    assert.equal(itemOf(await check('qs1'), 'ne.children').fix, 'decision');
+    await approve(ck.fingerprint, 'accept_difference');
+    assert.equal((await check('qs1')).ok, true, JSON.stringify((await check('qs1')).items.filter((x) => !x.ok)));
+    await q('update core.sku_components set qty = 3 where parent_sku_id = $1 and child_sku_id = $2', [await sid('qs1'), await sid('a02')]);
+    const c = await check('qs1');
+    assert.ok(bad(c).includes('ne.children'));
+    assert.match(itemOf(c, 'ne.children').text, /承認の後に社内の値が変わった \(照合の時 1・今 3\)/);
+    // 照合の後に子を足した (候補が無い) = だめ
+    await q('update core.sku_components set qty = 1 where parent_sku_id = $1 and child_sku_id = $2', [await sid('qs1'), await sid('a02')]);
+    await q(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, sort_order, source) values (1, $1, $2, 1, 9, 'ne')`, [await sid('qs1'), await sid('a03')]);
+    const c2 = await check('qs1');
+    assert.ok(bad(c2).includes('ne.children'));
+    assert.match(itemOf(c2, 'ne.children').text, /a03/);
+  });
+  // 照合の後に社内の値を NE と違う値に変えた (その回に候補が無い) = 判断なしでは通さない (#1715 Codex R1 High)
+  for (const [mut, key] of [[() => setSku('q04', { name: '照合の後の名前' }), 'ne.name'], [() => setSku('q04', { standard_price_jpy: 1234 }), 'ne.price'],
+    [() => setSku('q04', { tax_rate: 0.08, tax_class: 'REDUCED_8' }), 'ne.tax_rate'], [() => setSku('q04', { handling: 'discontinued' }), 'ne.handling'], [() => setCost('q04', 999), 'ne.cost']]) {
+    await rolledBack(async () => {
+      await mut();
+      const c = await check('q04');
+      assert.deepEqual(bad(c), [key], mut.toString());
+      assert.equal(itemOf(c, key).fix, 'after_compare');
+      assert.match(itemOf(c, key).text, /照合の後に社内の値を変えた/);
+    });
+  }
 });
 await ta('[C7] 代表 (まとまり): 親のある子 = まとまりの記録 (予約) が要る / 親の無い単品で NE に代表がある = 先に代表の採用 / 自分自身の代表 = なしと同じ', async () => {
   await rolledBack(async () => {
@@ -461,6 +502,7 @@ await ta('[C7] 代表 (まとまり): 親のある子 = まとまりの記録 (�
     assert.ok(bad(c).includes('parent'));
     assert.match(itemOf(c, 'parent').text, /先に代表の採用/);
     assert.equal(itemOf(await check('q06'), 'parent').ok, true);
+    assert.equal(itemOf(await check('q06'), 'ne.parent').ok, true);   // NE の「自分自身」= 親なし (照合 ② と同じ)
   });
 });
 await ta('[C8] 生きている NE 登録の CSV の品目 = live_file・check_hash は値が変われば変わる (推奨保有月数・照合の回)', async () => {
@@ -486,6 +528,53 @@ await ta('[C9] 一覧: null = 要確認の全部 (コードの順) / コード =
   assert.deepEqual(got.map((x) => [x.code, x.ok, bad(x).includes('state')]), [['a01', false, true], ['nope', false, true], ['q01', true, false]]);
   const e = await errOf(() => pg.query('select ops.quarantine_confirm_list($1::text[])', [Array.from({ length: 501 }, (_, i) => `c${i}`)]));
   assert.match(e?.message ?? '', /invalid_input/);
+});
+
+await ta('[C10] 一覧 (null) は要確認が 500 件を超えたら too_many (#1715 Codex R1 M3)・コードを渡せば読める', async () => {
+  await rolledBack(async () => {
+    await q(`with p as (insert into core.products (company_id, display_code, name, status, sales_class) select 1, 'bulk' || g, 'bulk' || g, 'active', 3 from generate_series(1, 495) g returning product_id, display_code)
+      insert into core.skus (company_id, product_id, code, sku_kind, name, tax_rate, tax_class, handling, standard_price_jpy) select 1, p.product_id, p.display_code, 'single', p.display_code, 0.1, 'STANDARD_10', 'active', 100 from p`);
+    assert.equal((await one(`select ops.quarantine_unregistered_skus('t') as n`)).n, 495);
+    assert.equal((await one(`select count(*)::int as n from ops.master_registrations where state = 'quarantined'`)).n, 504);   // 9 + 495
+    const e = await errOf(() => pg.query('select ops.quarantine_confirm_list(null)'));
+    assert.match(e?.message ?? '', /^too_many/);
+    assert.equal((await one('select jsonb_array_length(ops.quarantine_confirm_list($1::text[])) as n', [['bulk1', 'bulk2']])).n, 2);
+  });
+  await rolledBack(async () => {
+    await q(`with p as (insert into core.products (company_id, display_code, name, status, sales_class) select 1, 'bulk' || g, 'bulk' || g, 'active', 3 from generate_series(1, 491) g returning product_id, display_code)
+      insert into core.skus (company_id, product_id, code, sku_kind, name, tax_rate, tax_class, handling, standard_price_jpy) select 1, p.product_id, p.display_code, 'single', p.display_code, 0.1, 'STANDARD_10', 'active', 100 from p`);
+    await one(`select ops.quarantine_unregistered_skus('t') as n`);
+    assert.equal((await one('select jsonb_array_length(ops.quarantine_confirm_list(null)) as n')).n, 500);   // ちょうど 500 = 読める
+  });
+});
+await ta('[C11] コードが 80 字を超える要確認 = code_length (照合できない・直し方)・確かめ待ちには入らない (#1715 Codex R1 L1)', async () => {
+  await rolledBack(async () => {
+    const code = `l${'x'.repeat(80)}`;
+    const pid = (await one(`insert into core.products (company_id, display_code, name, status, sales_class) values (1, $1, 'long', 'active', 3) returning product_id`, [code])).product_id;
+    await q(`insert into core.skus (company_id, product_id, code, sku_kind, name, tax_rate, tax_class, handling, standard_price_jpy, reorder_months) values (1, $1, $2, 'single', '長いコード', 0.1, 'STANDARD_10', 'active', 1000, 1)`, [pid, code]);
+    await one(`select ops.quarantine_unregistered_skus('t') as n`);
+    assert.equal((await one(`select count(*)::int as n from ops.v_ne_reg_targets where code_norm = $1`, [code])).n, 0);
+    const c = await check(code);
+    assert.ok(bad(c).includes('code_length'));
+    assert.equal(itemOf(c, 'code_length').fix, 'one');
+    assert.match(itemOf(c, 'code_length').text, /81 字 \(80 字を超える\) = 照合 ② で NE と照らせない/);
+    assert.equal(itemOf(await check('q01'), 'code_length')?.ok ?? true, true);
+  });
+});
+await ta('[V2] 生きている NE 登録の CSV の品目を持つ要確認の SKU は確かめ待ちに 1 行だけ (品目の行・#1715 Codex R1 M2)', async () => {
+  await rolledBack(async () => {
+    await pg.query('alter table ops.ne_reg_export_items disable trigger trg_ne_reg_items_parent_gate');
+    await pg.query(`with e as (insert into ops.ne_reg_exports (kind, schema_version, header, encoding, trial, item_count, row_count, aggregate_token, payload_hash, sha256, file_bytes, request_id, ne_codes_run, cost_day, created_by)
+        values ('products', 'ne-reg-single-v2', 'syohin_code', 'utf8', false, 1, 1, repeat('a', 64), repeat('b', 64), repeat('c', 64), '\\x00', gen_random_uuid(), 'x', current_date, 't') returning export_id)
+      insert into ops.ne_reg_export_items (export_id, sku_id, code_norm, ne_code, sku_kind, item_token, expected, snapshot_hash, row_from, row_to, state_changed_by, state)
+      select e.export_id, k.sku_id, k.code_norm, k.code, k.sku_kind, repeat('e', 64), '{}'::jsonb, repeat('f', 64), 1, 1, 't', 'built' from e, core.skus k where k.code = 'q05'`);
+    await q(`update ops.ne_reg_export_items set state = 'issued', state_changed_by = 't' where code_norm = 'q05'`);   // 作る = built → 配った = issued (生きている品目)
+    const rows = await q(`select item_id, state from ops.v_ne_reg_targets where code_norm = 'q05'`);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].state, 'issued');
+    assert.ok(rows[0].item_id != null);
+  });
+  assert.equal((await one(`select count(*)::int as n from ops.v_ne_reg_targets where code_norm = 'q05'`)).n, 1);
 });
 
 // ═══════════ [F] 確認済みにする ═══════════

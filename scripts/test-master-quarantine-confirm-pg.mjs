@@ -5,11 +5,12 @@
  *   [R]  本物のログイン: master_edit (画面) = 確かめ・確認できる / master_ops が確認の関数を呼ぶ = 42501・ops.transition_sku_registration を直に呼んでも
  *        要確認は確認済みにならない (confirm_session_required) / watcher (読むだけの取引が既定) = 確かめ・一覧は読める・確認の関数は 42501
  *   [C1] 2 人が同じ商品を同時に確認: 後の人は SKU の鍵で待つ → 先の人の commit の後に not_quarantined (二重に確認しない・履歴は 1 行)
- *   [C2] 確認と保存 (同じ SKU の鍵) が並ぶ: 保存が先 = 確認は待って、保存の後の値で確かめ直す (推奨保有月数を消した = not_confirmable) /
- *        確認が先 = 保存は待つ (確認が commit してから進む)
+ *   [C2] 確認と保存 (本物の保存の入口 lib/master-write.mjs の saveSku・master_edit のログイン・同じ SKU の鍵) が並ぶ: 保存が先 = 確認は待って、
+ *        保存の後の値で確かめ直す (照合の後に名前を NE と違う値にした = not_confirmable) / 確認が先 = 保存は待つ (確認が commit してから進む・#1715 Codex R1 M4)
  *   [C3] 確認と照合 ② (NE のコードの入れ替え = 排他の鍵) が並ぶ: 照合が先 = 確認は待って、新しい回で確かめ直す (封をした回と NE のコードの回が違う = not_confirmable) /
  *        確認が先 = 照合は待つ (確認が commit してから進む)・デッドロックしない
- *   [C4] 確認とマスタの判断の取り消し (判断の候補の行 = for update) が並ぶ: 取り消しが先 = 確認は待って、取り消しの後の判断で確かめ直す (まだ決めていない = not_confirmable)
+ *   [C4] 確認とマスタの判断の取り消し (本物の入口 apps/master-decisions/decide.mjs の applyDecisions・持ち主のログイン = 画面と同じ・判断の候補の行 = for update) が並ぶ:
+ *        取り消しが先 = 確認は待って、取り消しの後の判断で確かめ直す (まだ決めていない = not_confirmable) / 確認が先 = 取り消しは待つ (#1715 Codex R1 M4)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-quarantine-confirm-pg.mjs
  *   (使い捨ての PG: node C:/tmp/pg-embed/run-qconfirm.mjs scripts/test-master-quarantine-confirm-pg.mjs <リポジトリ>)
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロールをクラスタに作る)。localhost 以外の URL は拒む (本番を渡さない)。TEST_PG_URL が無ければ飛ばす
@@ -22,6 +23,10 @@ import { createRoles as createWatchRoles } from './company-db/create-watch-roles
 import { runInitialLoad } from '../apps/company-db/load/engine.mjs';
 import { forceNewOpen, hex } from './fixtures/master-widen.mjs';
 import { OWNED_COLUMNS } from '../config/master-ownership.mjs';
+import * as W from '../lib/master-write.mjs';
+import { applyDecisions } from '../apps/master-decisions/decide.mjs';
+import * as OG from '../lib/master-owner-gate.mjs';
+OG.__setCapableForTest(OWNED_COLUMNS);   // 試験の DB は全部の列を company にする = このコードの能力も全部 (test-master-gone.mjs と同じ)
 
 const url = process.env.TEST_PG_URL || '';
 if (!url) { console.log('⏭️ TEST_PG_URL が無い (0078 の実 PostgreSQL の試験は飛ばす)'); process.exit(0); }
@@ -37,6 +42,11 @@ const errOf = async (p) => { try { await p; } catch (e) { return e; } return nul
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** p が ms の間に終わらないこと (= 鍵で待っている) */
 async function stillWaiting(p, ms = 700) { const t = Symbol('t'); return (await Promise.race([p.then(() => 'done', () => 'done'), sleep(ms).then(() => t)])) === t; }
+/** 外から開ける扉 (本物の入口の commit の直前で止める) */
+const gate = () => { let open; const p = new Promise((r) => { open = r; }); return { wait: () => p, open }; };
+const launch = (p) => { const s = { done: false }; s.promise = p.then((r) => { s.done = true; return { ok: r }; }, (e) => { s.done = true; return { err: e }; }); return s; };
+/** commit の文だけ扉で待たせる接続 (本物の入口 = applyDecisions の取引を開けたまま持つ) */
+const commitGated = (db, g) => ({ ...db, query: async (sql, params) => { if (/^\s*commit\s*$/i.test(String(sql))) await g.wait(); return db.query(sql, params); } });
 
 const ALL = Object.fromEntries(OWNED_COLUMNS.map((k) => [k, 'company']));
 const OWN = JSON.stringify(ALL);
@@ -113,8 +123,10 @@ try {
     return run;
   };
   const fp = (s) => crypto.createHash('sha256').update(s).digest('hex');
-  const candQ06 = { fingerprint: fp('q06|cost'), subject_key: 'cost:q06', code_norm: 'q06', col: 'cost', child: null, cls: 'rule', reason_kind: 'company_owned', semantic: 'company_owned@1',
-    print: { code_norm: 'q06', col: 'cost' }, resolutions: ['accept_difference', 'fix_ne', 'fix_cdb'], proposal: { op: 'decide' } };
+  const candOf = (code) => ({ fingerprint: fp(`${code}|cost`), subject_key: `cost:${code}`, code_norm: code, col: 'cost', child: null, cls: 'rule', reason_kind: 'company_owned', semantic: 'company_owned@1',
+    print: { code_norm: code, col: 'cost', c: 300 }, resolutions: ['accept_difference', 'fix_ne', 'fix_cdb'], proposal: { op: 'decide' } });
+  const candQ06 = candOf('q06');
+  const candQ05 = candOf('q05');
   await sealRun({ decisions: [candQ06] });
   await q(`insert into ops.master_decision_events (fingerprint, kind, resolution, actor_type, actor) values ($1, 'approved', 'accept_difference', 'user', 'naka@test')`, [candQ06.fingerprint]);
   const checkAs = async (c, code) => (await c.query('select ops.quarantine_confirm_check($1::bigint) as r', [await sid(code)])).rows[0].r;
@@ -154,28 +166,36 @@ try {
     assert.match(e?.message ?? '', /^not_quarantined/);
     assert.equal((await one(`select count(*)::int as n from ops.master_registration_events where sku_id = $1 and to_state = 'ne_confirmed'`, [await sid('q02')])).n, 1);
   });
-  await ta('[C2] 確認と保存 (同じ SKU の鍵): 保存が先 = 確認は待って保存の後の値で確かめ直す (推奨保有月数を消した = not_confirmable) / 確認が先 = 保存は待つ', async () => {
-    const id = await sid('q03');
+  const dbME2 = pgAdapter(ME2);
+  const tokenOf = async (code) => W.editTokenOf(await W.readCurrent(dbO, await sid(code), TODAY));
+  const save = async (code, values, { beforeCommit } = {}) => W.saveSku(dbME2, { actor: 'naka@test', requestId: crypto.randomUUID(), code, reason: 'pg', seen: { token: await tokenOf(code) }, values },
+    { open: true, beforeCommit });
+  await ta('[C2] 確認と本物の保存 (saveSku・master_edit のログイン): 保存が先 = 確認は待って保存の後の値で確かめ直す (照合の後に名前を変えた = NE と違う = not_confirmable) / 確認が先 = 保存は待つ', async () => {
     const args = await confirmArgs('q03');
-    await O2.query('begin');
-    await O2.query(`select pg_advisory_xact_lock(hashtextextended('core.sku:' || $1::text, 0))`, [id]);
-    await O2.query('update core.skus set reorder_months = null where sku_id = $1', [id]);
+    const g = gate();
+    const s = launch(save('q03', { name: '照合の後に変えた名前' }, { beforeCommit: g.wait }));
+    await sleep(500);
+    if (s.done) { const x = await s.promise; assert.fail(`保存が扉で止まっていない: ${x.err ? `${x.err.reason} ${x.err.message}` : JSON.stringify(x.ok)}`); }
     const p = ME.query(confirmSql, args);
-    assert.equal(await stillWaiting(p), true, '確認が保存を待っていない');
-    await O2.query('commit');
+    assert.equal(await stillWaiting(p), true, '確認が保存 (SKU の鍵) を待っていない');
+    g.open();
+    const rs = await s.promise;
+    assert.ok(rs.ok, rs.err?.message);
     const e = await errOf(p);
-    assert.match(e?.message ?? '', /^not_confirmable: q03 .*推奨保有月数が空/);
+    assert.match(e?.message ?? '', /^not_confirmable: q03 .*照合の後に社内の値を変えた/);
     assert.equal(await regOf('q03'), 'quarantined');
-    await q('update core.skus set reorder_months = 2 where sku_id = $1', [id]);
-    // 確認が先 = 保存は待つ
+    assert.equal((await one(`select count(*)::int as n from ops.master_edit_requests where operation = 'sku_edit' and target_code = 'q03' and status = 'done'`)).n, 1);
+    // 戻す (本物の保存)
+    assert.ok((await save('q03', { name: '商品 q03' })).ok !== false);
+    // 確認が先 = 保存は待つ (確認の取引の SKU の鍵)
     await ME.query('begin');
     await ME.query(confirmSql, await confirmArgs('q03'));
-    await O2.query('begin');
-    const ps = O2.query(`select pg_advisory_xact_lock(hashtextextended('core.sku:' || $1::text, 0))`, [id]);
-    assert.equal(await stillWaiting(ps), true, '保存が確認を待っていない');
+    const s2 = launch(save('q03', { reorder_months: '4' }));
+    await sleep(700);
+    assert.equal(s2.done, false, '保存が確認を待っていない');
     await ME.query('commit');
-    await ps;
-    await O2.query('rollback');
+    const r2 = await s2.promise;   // 確認の後 = 編集の印 (登録の状態) が変わった = 版の食い違いで断るか、通る (どちらでも確認の後)
+    assert.ok(r2.ok || r2.err?.reason === 'version_conflict', r2.err?.message);
     assert.equal(await regOf('q03'), 'ne_confirmed');
   });
   await ta('[C3] 確認と照合 ② の NE のコードの入れ替え: 照合が先 = 確認は待って新しい回で確かめ直す (封がまだ = not_confirmable) / 確認が先 = 照合は待つ・デッドロックしない', async () => {
@@ -209,21 +229,35 @@ try {
     await pw;
     assert.equal(await regOf('q04'), 'ne_confirmed');
   });
-  await ta('[C4] 確認とマスタの判断の取り消しが並ぶ: 取り消しが先 = 確認は待って、取り消しの後の判断で確かめ直す (まだ決めていない = not_confirmable)', async () => {
-    // 前の試験で NE のコードの回が進んだ = 封をした回で確かめ直す。NE の原価 280・社内 300 = 差 (候補は承認済み = ok・写した道では通らない)
-    await sealRun({ decisions: [candQ06], obs: { q06: (b) => ({ ...b, cols: { ...b.cols, cost: { st: 'ok', v: 280 } } }) } });
+  await ta('[C4] 確認と本物の判断の取り消し (applyDecisions・持ち主のログイン = 判断の画面と同じ): 取り消しが先 = 確認は待って取り消しの後の判断で確かめ直す (not_confirmable) / 確認が先 = 取り消しは待つ', async () => {
+    // 前の試験で NE のコードの回が進んだ = 封をした回で確かめ直す。NE の原価 280・社内 300 = 差 (候補は承認済み・社内の値 300 に結びつく = ok)
+    const neCost = { q05: (b) => ({ ...b, cols: { ...b.cols, cost: { st: 'ok', v: 280 } } }), q06: (b) => ({ ...b, cols: { ...b.cols, cost: { st: 'ok', v: 280 } } }) };
+    await sealRun({ decisions: [candQ06, candQ05], obs: neCost });
+    await q(`insert into ops.master_decision_events (fingerprint, kind, resolution, actor_type, actor) values ($1, 'approved', 'accept_difference', 'user', 'naka@test')`, [candQ05.fingerprint]);
+    const lastEv = async (f) => Number((await one(`select max(event_id) as e from ops.master_decision_events where fingerprint = $1 and kind in ('approved', 'rejected', 'revoked')`, [f])).e);
+    assert.equal((await checkAs(O, 'q06')).ok, true, JSON.stringify((await checkAs(O, 'q06')).items.filter((x) => !x.ok)));
     const args = await confirmArgs('q06');
-    assert.equal((await checkAs(O, 'q06')).ok, true);
-    await O2.query('begin');
-    await O2.query('select 1 from ops.master_decision_candidates where fingerprint = $1 for update', [candQ06.fingerprint]);
-    await O2.query(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor) values ($1, 'revoked', 'user', 'naka@test')`, [candQ06.fingerprint]);
+    const g = gate();
+    const rv = launch(applyDecisions(commitGated(pgAdapter(O2), g), { actor: 'naka@test', kind: 'revoked', items: [{ fingerprint: candQ06.fingerprint, shown_event_id: await lastEv(candQ06.fingerprint) }] }));
+    await sleep(500);
+    assert.equal(rv.done, false, '取り消しが扉で止まっていない');
     const p = ME.query(confirmSql, args);
-    assert.equal(await stillWaiting(p), true, '確認が判断の取り消しを待っていない');
-    await O2.query('commit');
+    assert.equal(await stillWaiting(p), true, '確認が判断の取り消し (候補の行) を待っていない');
+    g.open();
+    const r = await rv.promise;
+    assert.equal(r.ok?.applied?.length, 1, JSON.stringify(r.ok ?? r.err?.message));
     const e = await errOf(p);
     assert.match(e?.message ?? '', /^not_confirmable: q06 .*マスタの判断で決める/);
     assert.equal(await regOf('q06'), 'quarantined');
-    assert.equal((await ME.query(confirmSql, await confirmArgs('q05'))).rows[0].r.state, 'ne_confirmed');
+    // 確認が先 = 取り消しは待つ (確認の取引が候補の行を共有で持つ) → 確認の commit の後に取り消しが進む
+    await ME.query('begin');
+    await ME.query(confirmSql, await confirmArgs('q05'));
+    const rv2 = launch(applyDecisions(pgAdapter(O2), { actor: 'naka@test', kind: 'revoked', items: [{ fingerprint: candQ05.fingerprint, shown_event_id: await lastEv(candQ05.fingerprint) }] }));
+    await sleep(700);
+    assert.equal(rv2.done, false, '取り消しが確認を待っていない');
+    await ME.query('commit');
+    assert.equal((await rv2.promise).ok?.applied?.length, 1);
+    assert.equal(await regOf('q05'), 'ne_confirmed');
   });
 } finally {
   for (const c of clients.slice(1)) { try { await c.end(); } catch { /* */ } }

@@ -17,12 +17,13 @@
 --           代表の仕入先 (ちょうど 1 つ・NE の形)・今日の原価 (決まった値・1 円以上)。セット = 名前・標準売価・構成品 (1 つ以上・全部 NE 確認済み以降)・
 --           開いている構成の依頼が無い・税率と取扱と売上分類 = 構成品から導いた値 (売上分類は上書きでも)・推奨保有月数・今日の原価 (構成品の合計 set_calc か例外原価)
 --        ② NE と合っている: 最新の封をした照合 ② の回 = NE の元のコードの印の回・取得が ops.ne_gone_fresh_hours() 時間の中。その回の観測に、ある・信用できる・区分が同じ。
---           欄ごとは照合 ② の答え (判断の候補) を使う: その回に見えた候補が、全部「マスタの判断」で承認済み (差を残す / NE を直す / 社内を直す・直す承認の完了の後に
---           また出た = 再発はだめ) か、社内の値を NE の値に写した (名前・仕入先・原価・売価・税率・取扱 = 今の社内の値が観測と同じ) のときだけ (Q3 a)
+--           欄ごと (名前・仕入先・原価・売価・税率・取扱・代表 / 名前・売価・構成の子ごと): 今の社内の値 = その回の観測 か、違うなら「今の社内の値」に結びついた
+--           承認済みの判断 (その回に見えた候補で print.c = 今の社内の値・差を残す / NE を直す / 社内を直す・直す承認の完了の後にまた出た = 再発はだめ) があるときだけ (Q3 a)。
+--           照合の後に値を変えた (候補が無い)・承認の後に第三の値に変えた = だめ (明日の照合の後に) (#1715 Codex R1 High)
 --        ③ 代表 (色違いのまとまり): 親のある単品 = まとまりの記録 (予約) がある。親の無い単品で NE に代表がある = 先に代表の採用
 --        ④ そのほか: 生きている NE 登録の CSV の品目・NE から消す依頼が無い
 --      人が見る欄 (名前と構成の数・売上分類) は画面の「見たら ✓」(DB は ✓ の有無で断らない)
---   3. ops.quarantine_confirm_list(コード | null) = 一覧 (読むだけ・null = 要確認の全部・コードは 500 件まで) = 一括の inspect・毎朝のまとめ (Q-3・Q-4) の材料
+--   3. ops.quarantine_confirm_list(コード | null) = 一覧 (読むだけ・null = 要確認の全部 (500 件を超えたら too_many)・コードは 500 件まで) = 一括の inspect・毎朝のまとめ (Q-3・Q-4) の材料
 --   4. ops.confirm_quarantined_sku(request_id, 人, 理由, 持ち主表, SKU, check_hash) = 確認済みにする (security definer・1 件 = 1 取引)。
 --      同じ request_id の押し直し = 前の答え。鍵: 段階 → マスタの書き込み (共有) → SKU → 親子 (共有) → NE のコード (共有) → (親があれば) まとまりのコード → まとまり →
 --      登録の状態の行 (for update) → 構成品の登録の状態の行 (for share) → 判断の候補の行 (for share)。鍵の後に 2. をもう一度: ok でない = not_confirmable (理由を全部)・
@@ -50,7 +51,9 @@ create or replace view ops.v_ne_reg_targets as
   --   (確認済みにする根拠 = ops.quarantine_confirm_check・代表の採用の根拠 = 0067 の部分集合も含む)。コードが 80 字を超える SKU は入れない (観測の表の CHECK)
   select null::bigint, null::bigint, s.sku_id, s.code_norm, s.sku_kind, 'quarantined'::text
     from core.skus s join ops.master_registrations r on r.sku_id = s.sku_id
-   where r.state = 'quarantined' and s.sku_kind in ('single', 'set') and pg_catalog.length(s.code_norm) between 1 and 80;
+   where r.state = 'quarantined' and s.sku_kind in ('single', 'set') and pg_catalog.length(s.code_norm) between 1 and 80
+     -- #1715 Codex R1 M2: 上の枝 (生きている NE 登録の CSV の品目) にある SKU は重ねない (同じ SKU を 2 行にしない)
+     and not exists (select 1 from ops.ne_reg_export_items i where i.sku_id = s.sku_id and i.state in ('issued', 'import_declared', 'partial'));
 comment on view ops.v_ne_reg_targets is '翌朝の照合 ② が NE の完全な取得の値を送る商品 (0053・0063 から配っただけの品目も・0078 から要確認 (quarantined) の単品とセットの全部)';
 
 -- ═══════════ 2. 確認済みにしてよいかの表 (読むだけ) ═══════════
@@ -65,7 +68,7 @@ revoke all on function ops.quarantine_confirm_item(text, boolean, jsonb, jsonb, 
 /**
  * 要確認の商品を確認済み (NE 確認済み) にしてよいか。何も書かない (watcher の読むだけの取引でも動く = 鍵・行の鍵を取らない)。
  * 戻り値 = { sku_id (文字), code, sku_kind, reg_state, ok, items: [{ key, ok, cdb, ne, text, fix }], evidence (ok のときだけ), check_hash }
- *   key: state / kind / name / price / tax / handling / sales_class / reorder_months / supplier / cost / parent (単品) /
+ *   key: state / code_length / kind / name / price / tax / handling / sales_class / reorder_months / supplier / cost / parent (単品) /
  *        components / component_request (セット) / ne_run / ne_observed / ne.<列> (照合 ② の答え・列 = name supplier cost price tax_rate handling parent / name price children・
  *        ne.other = 列に当たらない候補) / live_file
  *   check_hash = 表 (items)・根拠・SKU と商品の version・今日 (東京) のハッシュ = 画面が見た表と、押した時の表が同じか (確認の関数が比べる)
@@ -103,10 +106,14 @@ declare
   v_exp    jsonb;
   v_cmp    jsonb;
   c        record;
-  v_ocol   text;
   v_dcol   text;
-  v_unres  jsonb := '{}'::jsonb;   -- 列 → [まだ決まっていない候補の文]
-  v_res    jsonb := '{}'::jsonb;   -- 列 → approved / copied
+  v_unres  jsonb := '{}'::jsonb;   -- 列 → [効かない候補の文]
+  v_appr   jsonb := '{}'::jsonb;   -- 列 (構成は 'children:<子>') → 今の社内の値に結びついた承認済みの判断
+  v_cands  jsonb := '{}'::jsonb;   -- 列 → その回に候補があった
+  v_cur    jsonb;                  -- 今の社内の値 (照合の読み方 = 候補の print.c と同じ形)
+  v_kids   jsonb;                  -- 今の構成 (子の code_norm → 数量)
+  v_tied   boolean;
+  v_diff   text[];
   v_used   jsonb := '[]'::jsonb;   -- 根拠: 使った判断・写した列
   v_cols   text[];
   k        text;
@@ -132,6 +139,10 @@ begin
   v_it := v_it || ops.quarantine_confirm_item('state', s.reg is not distinct from 'quarantined', pg_catalog.to_jsonb(s.reg), null,
     case when s.reg is not distinct from 'quarantined' then '要確認 (NE で直接作られた商品)'
          else pg_catalog.format('登録の状態が %s (確認済みにできるのは要確認だけ)', coalesce(s.reg, '行が無い')) end, 'one');
+  -- #1715 Codex R1 L1: コードが 80 字を超える = 照合 ② の確かめ待ちに入らない (観測の表の CHECK) = いつまでも観測が来ない → 専用の行で直し方を出す
+  v_it := v_it || ops.quarantine_confirm_item('code_length', pg_catalog.length(s.code_norm) between 1 and 80, pg_catalog.to_jsonb(pg_catalog.length(s.code_norm)), null,
+    case when pg_catalog.length(s.code_norm) between 1 and 80 then 'コードの長さ (照合できる)'
+         else pg_catalog.format('コードが %s 字 (80 字を超える) = 照合 ② で NE と照らせない = 確認済みにできない (NE と社内で短いコードの商品を作り直し、この要確認はやめる)', pg_catalog.length(s.code_norm)) end, 'one');
   v_it := v_it || ops.quarantine_confirm_item('kind', s.sku_kind in ('single', 'set'), pg_catalog.to_jsonb(s.sku_kind), null,
     case when s.sku_kind in ('single', 'set') then case s.sku_kind when 'single' then '単品' else 'セット' end else '例外の SKU は確認済みにしない' end, 'one');
 
@@ -279,20 +290,32 @@ begin
            else '構成品から売上分類を導けない (上書きを入れる)' end, 'one');
     -- 今日の原価 = 構成品の合計 (set_calc / COMPLETE・円に丸めて同じ) か例外原価 (manual / OVERRIDDEN)
     v_ok := (v_cost.cost_source = 'set_calc' and v_cost.cost_status = 'COMPLETE' and coalesce(v_all, false) and v_cost.cost_jpy = pg_catalog.round(pg_catalog.round(v_sum, 2), 0))
-            or (v_cost.cost_source = 'manual' and v_cost.cost_status = 'OVERRIDDEN');
+            or (v_cost.cost_source = 'manual' and v_cost.cost_status = 'OVERRIDDEN' and v_cost.cost_jpy >= 1);   -- #1715 Codex R1 M1: 0 円は通さない (単品と同じ)
     v_it := v_it || ops.quarantine_confirm_item('cost', v_ok,
       case when v_cost.sku_cost_id is null then null else pg_catalog.jsonb_build_object('cost_jpy', v_cost.cost_jpy, 'source', v_cost.cost_source, 'status', v_cost.cost_status) end,
       pg_catalog.jsonb_build_object('derived_cost_jpy', case when coalesce(v_all, false) then pg_catalog.round(pg_catalog.round(v_sum, 2), 0) end),
       case when v_ok then '今日の原価がある (構成品の合計か例外原価)'
            when v_cost.sku_cost_id is null then pg_catalog.format('今日 (%s) の原価が無い (構成品から計算・例外原価)', v_today)
            when not coalesce(v_all, false) then '構成品の原価がそろっていない (合計できない = 先に構成品の原価か、例外原価)'
+           when v_cost.cost_source = 'manual' and v_cost.cost_status = 'OVERRIDDEN' then '例外原価が 0 円 (1 円以上)'
            else '今日の原価が構成品の合計と違う (構成品から計算し直す・例外原価)' end, 'one');
   end if;
 
-  -- ─── ② 欄ごと = 照合 ② の答え (その回に見えた判断の候補) ───
+  -- ─── ② 欄ごと = 今の社内の値と封をした回の NE の観測が同じ / 違うなら「今の社内の値」に結びついた承認済みの判断 (Q3 a・#1715 Codex R1 High) ───
+  --   判断の候補は照合 ② がその回に見た差 (NE の値 = その回の観測・社内の値 = 候補の print.c)。承認が効くのは print.c = 今の社内の値 (照合の読み方と同じ形) のときだけ =
+  --   照合の後に社内の値を変えた (候補が無い)・承認の後に第三の値に変えた = 通さない (明日の照合の後に、新しい差をマスタの判断で)
   if v_obsok then
+    -- 今の社内の値 (apps/company-db/master-compare/compare-load.mjs の読み方 = 候補の print.c と同じ形)
+    v_cur := pg_catalog.jsonb_build_object('name', s.name, 'standard_price_jpy', s.standard_price_jpy, 'tax_rate', s.tax_rate, 'handling', s.handling, 'kind', s.sku_kind,
+      'exists', true,
+      'cost', (select y.cost_jpy from core.sku_costs y where y.sku_id = p_sku_id and y.valid_to is null order by y.sku_cost_id desc limit 1),
+      'primary_supplier', coalesce((select pg_catalog.jsonb_agg(su.code_norm order by su.code_norm) from core.supplier_skus x join core.suppliers su on su.supplier_id = x.supplier_id
+                                     where x.sku_id = p_sku_id and x.is_primary), '[]'::jsonb),
+      'parent', (select core.norm_code(pp.display_code) from core.products pp where pp.product_id = s.parent_product_id));
+    select pg_catalog.jsonb_object_agg(k2.code_norm, c2.qty) into v_kids from core.sku_components c2 join core.skus k2 on k2.sku_id = c2.child_sku_id where c2.parent_sku_id = p_sku_id;
+    v_kids := coalesce(v_kids, '{}'::jsonb);
     for c in
-      select x.fingerprint, x.col, x.child, x.cls, x.reason_kind, l.event_id, l.kind as dkind, l.resolution,
+      select x.fingerprint, x.col, x.child, x.cls, x.reason_kind, x.print -> 'c' as pc, l.event_id, l.kind as dkind, l.resolution,
              exists (select 1 from ops.master_decision_events d where d.kind = 'action_done' and d.approved_event_id = l.event_id) as done
         from ops.master_decision_candidates x
         left join lateral (select e1.event_id, e1.kind, e1.resolution from ops.master_decision_events e1
@@ -301,39 +324,67 @@ begin
          and exists (select 1 from ops.master_decision_observations ob where ob.fingerprint = x.fingerprint and ob.compare_run_id = v_run)
        order by x.col, x.child nulls first, x.fingerprint
     loop
-      v_ocol := case c.col when 'name' then 'name' when 'primary_supplier' then 'supplier' when 'cost' then 'cost' when 'standard_price_jpy' then 'price'
-                           when 'tax_rate' then 'tax_rate' when 'handling' then 'handling' end;
-      v_dcol := coalesce(v_ocol, case c.col when 'parent' then 'parent' when 'components' then 'children' else 'other' end);
-      if c.dkind = 'approved' and c.resolution in ('accept_difference', 'fix_ne', 'fix_cdb') and not (c.resolution in ('fix_ne', 'fix_cdb') and c.done) then
-        v_res := v_res || pg_catalog.jsonb_build_object(v_dcol, coalesce(v_res ->> v_dcol, 'approved'));
-        v_used := v_used || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('fingerprint', c.fingerprint, 'col', c.col, 'child', c.child, 'how', 'approved',
-          'event_id', c.event_id::text, 'resolution', c.resolution));
-      elsif v_ocol is not null and (v_cmp -> 'cols' -> v_ocol ->> 'ok') = 'true' then
-        -- 社内の値を NE の値に写した (今の社内の値 = 観測)。明日の照合で候補は消える
-        v_res := v_res || pg_catalog.jsonb_build_object(v_dcol, 'copied');
-        v_used := v_used || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('fingerprint', c.fingerprint, 'col', c.col, 'child', c.child, 'how', 'copied'));
+      v_dcol := case c.col when 'name' then 'name' when 'primary_supplier' then 'supplier' when 'cost' then 'cost' when 'standard_price_jpy' then 'price'
+                           when 'tax_rate' then 'tax_rate' when 'handling' then 'handling' when 'parent' then 'parent' when 'components' then 'children' else 'other' end;
+      v_tied := coalesce(c.pc = case when c.col = 'components' then coalesce(v_kids -> c.child, '"(無い)"'::jsonb) else v_cur -> c.col end, false);
+      if c.dkind = 'approved' and c.resolution in ('accept_difference', 'fix_ne', 'fix_cdb') and not (c.resolution in ('fix_ne', 'fix_cdb') and c.done) and v_tied then
+        -- 承認済みで、承認した差の社内の値 = 今の社内の値 (構成は子ごと)
+        v_appr := v_appr || pg_catalog.jsonb_build_object(v_dcol || coalesce(':' || c.child, ''), pg_catalog.jsonb_build_object('fingerprint', c.fingerprint, 'col', c.col,
+          'child', c.child, 'how', 'approved', 'event_id', c.event_id::text, 'resolution', c.resolution));
       else
         v_unres := v_unres || pg_catalog.jsonb_build_object(v_dcol, coalesce(v_unres -> v_dcol, '[]'::jsonb) || pg_catalog.jsonb_build_array(
           pg_catalog.format('%s%s (%s%s)', c.col, coalesce(':' || c.child, ''), c.reason_kind,
-            case when c.dkind is null then '・まだ決めていない' when c.dkind = 'approved' and c.done then '・直す承認の完了の後にまた出た'
-                 when c.dkind = 'approved' then '・解決 ' || c.resolution || ' はこの確認では数えない' else '・最新の判断が ' || c.dkind end)));
+            case when c.dkind is null then '・まだ決めていない'
+                 when c.dkind <> 'approved' then '・最新の判断が ' || c.dkind
+                 when c.resolution not in ('accept_difference', 'fix_ne', 'fix_cdb') then '・解決 ' || c.resolution || ' はこの確認では数えない'
+                 when c.resolution in ('fix_ne', 'fix_cdb') and c.done then '・直す承認の完了の後にまた出た'
+                 else pg_catalog.format('・承認の後に社内の値が変わった (照合の時 %s・今 %s)', c.pc,
+                        case when c.col = 'components' then coalesce(v_kids -> c.child, '"(無い)"'::jsonb) else v_cur -> c.col end) end)));
       end if;
+      v_cands := v_cands || pg_catalog.jsonb_build_object(v_dcol, true);
     end loop;
     v_cols := case when s.sku_kind = 'single' then array['name', 'supplier', 'cost', 'price', 'tax_rate', 'handling', 'parent'] else array['name', 'price', 'children'] end;
     if v_unres ? 'other' then v_cols := v_cols || 'other'::text; end if;
     foreach k in array v_cols loop
       e := case when k = 'other' then null else coalesce(v_exp -> 'values' -> k, 'null'::jsonb) end;
       o := case when k = 'children' then v_obs -> 'children' when k = 'other' then null else v_obs -> 'cols' -> k end;
-      v_same := case when k = 'children' then (v_cmp -> 'cols' -> 'children' ->> 'ok') = 'true'
-                     when k = 'other' then false
-                     else ((o ->> 'st') = 'ok' and coalesce(o -> 'v', 'null'::jsonb) = e) or ((o ->> 'st') = 'no_value' and e = 'null'::jsonb) end;
-      v_it := v_it || ops.quarantine_confirm_item('ne.' || k, not (v_unres ? k), e, o,
-        case when v_unres ? k then pg_catalog.format('NE と違う (照合の回 %s の差) = マスタの判断で決める: %s', v_run,
+      v_diff := null;
+      if k = 'children' then
+        -- 違う子 (社内の今の構成の数量 ↔ その回の観測。読めない子も違う) = 子ごとに、今の構成に結びついた承認済みの判断が要る
+        select pg_catalog.array_agg(coalesce(a.cn, b.cn) order by coalesce(a.cn, b.cn)) into v_diff
+          from (select t.key as cn, t.value as qty from pg_catalog.jsonb_each(v_kids) t) a
+          full join (select ch ->> 'code_norm' as cn, ch from pg_catalog.jsonb_array_elements(coalesce(o, '[]'::jsonb)) ch) b on b.cn = a.cn
+         where b.cn is null or a.cn is null or (b.ch ->> 'st') is distinct from 'ok' or (b.ch -> 'v') is distinct from a.qty;
+        v_same := v_diff is null;
+        v_ok := v_same or not exists (select 1 from pg_catalog.unnest(v_diff) dc where not (v_appr ? ('children:' || dc)));
+      elsif k = 'other' then
+        v_same := false; v_ok := false;
+      elsif k = 'parent' then
+        -- 代表: NE の「自分自身」= 親なし (照合 ② と同じ)・コードは norm で比べる
+        v_same := case when (o ->> 'st') = 'ok' and pg_catalog.jsonb_typeof(o -> 'v') = 'string' and coalesce(o ->> 'v', '') <> '' and core.norm_code(o ->> 'v') <> s.code_norm
+                       then pg_catalog.jsonb_typeof(e) = 'string' and core.norm_code(o ->> 'v') = (e #>> '{}')
+                       else e = 'null'::jsonb and (o ->> 'st') in ('ok', 'no_value') end;
+        v_same := coalesce(v_same, false);
+        v_ok := v_same or (v_appr ? k);
+      else
+        v_same := coalesce(((o ->> 'st') = 'ok' and coalesce(o -> 'v', 'null'::jsonb) = e) or ((o ->> 'st') = 'no_value' and e = 'null'::jsonb), false);
+        v_ok := v_same or (v_appr ? k);
+      end if;
+      if v_ok and not v_same then
+        v_used := v_used || coalesce((select pg_catalog.jsonb_agg(x.value order by x.key) from pg_catalog.jsonb_each(v_appr) x where x.key = k or x.key like k || ':%'), '[]'::jsonb);
+      elsif v_same and v_cands ? k then
+        v_used := v_used || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('col', k, 'how', 'copied'));
+      end if;
+      v_it := v_it || ops.quarantine_confirm_item('ne.' || k, v_ok, e, o,
+        case when v_same then case when v_cands ? k then '社内の値を NE の値に合わせた (明日の照合で差が消える)' else 'NE と同じ' end
+             when v_ok then 'NE と違うが、今の社内の値でマスタの判断で決めてある'
+             when v_unres ? k then pg_catalog.format('NE と違う (照合の回 %s) = マスタの判断で決める: %s', v_run,
                                      (select pg_catalog.string_agg(t, '・') from pg_catalog.jsonb_array_elements_text(v_unres -> k) t))
-             when (v_res ->> k) = 'approved' then 'NE と違うが、マスタの判断で決めてある'
-             when (v_res ->> k) = 'copied' then '社内の値を NE の値に合わせた (明日の照合で差が消える)'
-             when v_same then 'NE と同じ'
-             else pg_catalog.format('照合の回 %s では差になっていない', v_run) end, 'decision');
+             when k = 'children' then pg_catalog.format('構成が NE と違う子 (%s) に、今の構成でのマスタの判断が無い (照合の後に構成を変えた = 明日の照合の後に)', pg_catalog.array_to_string(v_diff, '・'))
+             else pg_catalog.format('NE (照合の回 %s) と違う。照合の後に社内の値を変えた = 明日の照合の後にマスタの判断で', v_run) end,
+        case when k not in ('children', 'other') and e = 'null'::jsonb and (o ->> 'st') = 'ok' then 'ne_fill'
+             when v_unres ? k and not exists (select 1 from pg_catalog.jsonb_array_elements_text(v_unres -> k) t where t like '%承認の後に社内の値が変わった%') then 'decision'
+             else 'after_compare' end);
     end loop;
   end if;
 
@@ -365,7 +416,7 @@ revoke all on function ops.quarantine_confirm_check(bigint) from public;
 
 -- ═══════════ 3. 一覧 (読むだけ・一括の inspect・毎朝のまとめの材料) ═══════════
 /**
- * p_codes = 確かめるコード (500 件まで・code_norm で探す・渡した順は code_norm の順) / null = 要確認 (quarantined) の全部 (コードの順)。
+ * p_codes = 確かめるコード (500 件まで・code_norm で探す・渡した順は code_norm の順) / null = 要確認 (quarantined) の全部 (コードの順・500 件を超えたら too_many)。
  * 戻り値 = [ops.quarantine_confirm_check の答え (無いコード = { sku_id: null, code, ok: false, items: [state = no_sku] })]
  */
 create function ops.quarantine_confirm_list(p_codes text[]) returns jsonb
@@ -377,6 +428,10 @@ begin
     raise exception 'invalid_input: コードは 1〜200 字で 500 件まで' using errcode = '22023';
   end if;
   if p_codes is null then
+    -- #1715 Codex R1 M3: 全部 = 500 件まで (超えたら断る = コードを 500 件ずつ渡す)。1 件ずつ確かめを呼ぶ = 件数に比例して重い
+    if (select pg_catalog.count(*) from core.skus k join ops.master_registrations r on r.sku_id = k.sku_id where k.company_id = 1 and r.state = 'quarantined') > 500 then
+      raise exception 'too_many: 要確認が 500 件を超える = コード (500 件まで) を渡して分けて読む' using errcode = '22023';
+    end if;
     select coalesce(pg_catalog.jsonb_agg(ops.quarantine_confirm_check(k.sku_id) order by k.code_norm), '[]'::jsonb) into v_out
       from core.skus k join ops.master_registrations r on r.sku_id = k.sku_id where k.company_id = 1 and r.state = 'quarantined';
   else
