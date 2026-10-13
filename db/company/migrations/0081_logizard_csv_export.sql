@@ -197,6 +197,9 @@ revoke all on function ops.lz_csv_cell(text) from public;
  * p_items = [{ sku_id, code, rule_row, kind, value, expiry_code, inbound_code }] (1〜2000)。鍵 = SKU の鍵 (sku_id の順) → 値の鍵 (値の順) = 書く関数と同じ順。品目ごとに確かめる:
  *   単品・会社 1・やめていない・コードが今の SKU のコード・rule_row がその SKU の一番新しい行で種類と値が同じ・値が今の決まりに合う・
  *   有効期限区分 = 有効期限の管理 (あり 02 / なし 01)・入荷日管理フラグ = 入荷日の管理 (あり 1 / なし・入力なし 0)・代表の仕入先がある・まだ出していない・
+ *   🆕 #1721 R2: 新商品の登録から来た商品だけ (ops.master_registrations.origin = new_entry)・p_lz_list_as_of (商品の一覧の写しの時刻) が 36 時間の中 (未来は 5 分まで)・
+ *   🚨 既知の限界 (#1721 R2): 写しの中身 (ロジザードにもうある商品・ほかの持ち主のバーコード) は Render の SQLite = DB は見られない = アプリ (lib/lz-new-export.mjs) が確かめる。
+ *     DB が確かめるのは時刻の新しさまで。この関数を呼べる master_edit の資格情報はアプリのサーバーだけが持つ (直に呼んで写しを偽るのは資格情報を持つ人だけ)
  *   値がほかの商品と重ならない (ops.lzbc_value_clash)・🆕 #1721 R1 High 2: 値のある品目は、保存のときの結果にかかわらず p_lz_bc_as_of (今照らした写しの時刻) が 36 時間の中 (未来は 5 分まで)。
  *   1 つでも違う = invalid_input / stale / lz_issued / lzbc_taken / lz_unchecked (何も書かない)
  * 同じ request_id の押し直し = 前の答え (人・要求の品目のハッシュが違う = request_id_reused)
@@ -243,6 +246,11 @@ begin
     end if;
     return pg_catalog.jsonb_build_object('ok', true, 'export_id', v_prev.export_id::text, 'text_sha256', v_prev.text_sha256, 'rows', v_prev.row_count, 'replayed', true);
   end if;
+  -- 🆕 #1721 R2: ロジザードの商品の一覧の写し (まだ無いの判定) の時刻 = 36 時間の中・未来は 5 分まで (古い写しで作らない)
+  if p_lz_list_as_of is null or p_lz_list_as_of <= pg_catalog.clock_timestamp() - interval '36 hours'
+     or p_lz_list_as_of > pg_catalog.clock_timestamp() + interval '5 minutes' then
+    raise exception 'lz_list_stale: ロジザードの商品の一覧の写しの時刻 (%) が 36 時間の中でない', coalesce(p_lz_list_as_of::text, 'なし') using errcode = '40001';
+  end if;
   if (select pg_catalog.count(distinct (x ->> 'sku_id')) from pg_catalog.jsonb_array_elements(p_items) x) <> v_n then
     raise exception 'invalid_input: 同じ SKU が 2 回ある' using errcode = '22023';
   end if;
@@ -260,7 +268,7 @@ begin
   v_fresh := p_lz_bc_as_of is not null and p_lz_bc_as_of > pg_catalog.clock_timestamp() - interval '36 hours'
              and p_lz_bc_as_of <= pg_catalog.clock_timestamp() + interval '5 minutes';
   for it in select x from pg_catalog.jsonb_array_elements(p_items) x loop
-    select s.sku_id, s.company_id, s.code, s.name, s.sku_kind, p.expiry_managed, p.inbound_date_managed, g.state as reg,
+    select s.sku_id, s.company_id, s.code, s.name, s.sku_kind, p.expiry_managed, p.inbound_date_managed, g.state as reg, g.origin,
            (select sc.cost_jpy::text from core.sku_costs sc where sc.sku_id = s.sku_id and sc.valid_to is null order by sc.valid_from desc limit 1) as cost,
            (select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id where x.sku_id = s.sku_id and x.is_primary limit 1) as supplier
       into k
@@ -268,6 +276,10 @@ begin
      where s.sku_id = (it ->> 'sku_id')::bigint;
     if k.sku_id is null or k.company_id <> 1 or k.sku_kind is distinct from 'single' or k.reg = 'cancelled' then
       raise exception 'invalid_input: % は単品で使える商品でない', coalesce(it ->> 'code', it ->> 'sku_id') using errcode = '22023';
+    end if;
+    -- 🆕 #1721 R2: 出すのは新商品の登録から来た商品だけ (前からある商品・NE で見つけた商品はロジザードにある前提)
+    if k.origin is distinct from 'new_entry' then
+      raise exception 'invalid_input: % は新商品の登録から来た商品でない (登録の状態の origin = %)', k.code, coalesce(k.origin, 'なし') using errcode = '22023';
     end if;
     if k.code is distinct from (it ->> 'code') then raise exception 'stale: % のコードが変わった', it ->> 'code' using errcode = '40001'; end if;
     select * into v_cur from ops.sku_logizard_barcode_rules r where r.sku_id = k.sku_id order by r.rule_row desc limit 1;

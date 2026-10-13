@@ -9,7 +9,7 @@
     // 🆕 0081 ロジザード登録の CSV (logizard_bc_upload.csv・CompanyDB構想 23 v4 §5')。今の GAS の「新規商品マスタを CSV 出力」(人が H 列などを手で入れる) の置き換え (GAS は予備)。
     //   作る → ダウンロード → ロジザードで取り込む (今までどおり auto-barcode.js / 手で)。画面の動き = public/me-lzcsv.js
     const C = cands;
-    const canAct = canApprove && !dbError && !!C && C.db_ready && mirror.ok;
+    const canAct = canApprove && !dbError && !!C && C.db_ready && mirror.ok && !mirror.stale;   // 🆕 #1721 R2: 写しが古い = 作れない (DB も断る)
     const dis = canAct ? '' : ' disabled';
     const when = (v) => (v ? String(v).replace('T', ' ').slice(0, 16) : '—');
     const kindBadge = { fnsku: 'info', jan: 'vio', lz_assign: 'mute' };
@@ -31,7 +31,7 @@
     <% if (C && !C.db_ready) { %><div class="callout warn" id="lzc-notready"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">Company DB に 0081 (ロジザード登録の CSV) がまだ入っていないか、権限の流し直しの前です。それまでは予備の GAS で作ってください。</div></div><% } %>
     <% if (C && C.db_ready && C.copy && C.copy.state !== 'checked') { %><div class="callout warn" id="lzc-copy"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">ロジザードのバーコードマスタの写し: <%= C.copy.words %></div><div class="hint">保存のときに写しと照らせていないバーコードは、新しい写し (<%= FRESH_HOURS %> 時間の中) で照らし直せるまで CSV に出しません (下の「止まっている商品」)。</div></div></div><% } %>
     <% if (!mirror.ok) { %><div class="callout err" id="lzc-mirror"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">ロジザードの商品の一覧の写しを読めません</div><div class="hint"><%= mirror.reason %> · ロジザードにまだ無い商品か確かめられないので、CSV は作れません。</div></div></div>
-    <% } else if (mirror.stale) { %><div class="callout warn" id="lzc-mirror"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">ロジザードの商品の一覧の写しが古い (<%= when(mirror.list_as_of) %>)</div><div class="hint">毎晩取り込む写しが <%= FRESH_HOURS %> 時間より前です。もうロジザードに登録した商品が混ざるかもしれません。作るときに確かめます。</div></div></div>
+    <% } else if (mirror.stale) { %><div class="callout warn" id="lzc-mirror"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">ロジザードの商品の一覧の写しが古い (<%= when(mirror.list_as_of) %>)</div><div class="hint">毎晩取り込む写しが <%= FRESH_HOURS %> 時間の中にありません。もうロジザードに登録した商品が混ざるかもしれないので、CSV は作れません。毎晩の取り込みの後に作るか、急ぐときは予備の GAS で作ってください。</div></div></div>
     <% } else { %><div class="hint" id="lzc-mirror" style="margin:0 0 12px">ロジザードの商品の一覧の写し: <%= when(mirror.list_as_of) %> (<%= Number(mirror.rows).toLocaleString('ja-JP') %> 件) · バーコードマスタ: <%= when(mirror.bc_as_of) %></div><% } %>
 
     <% if (C && C.db_ready) { %>
@@ -58,9 +58,9 @@
         </table>
       </div>
       <div class="buildbar">
-        <% if (mirror.stale) { %><label class="amc-chk"><input type="checkbox" id="lzc-stale-ok"<%= dis %>> 写しが古いことを確かめた (もうロジザードにある商品が混ざっていない)</label><% } %>
         <button class="btn pri" type="button" id="lzc-build"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg><%= C.ready.length %> 件の CSV を作ってダウンロード</button>
         <span class="hint">作ると帳面に残り、この商品は次から出しません (取り消すと出し直せる) · ファイル名 logizard_bc_upload.csv (Shift_JIS)</span>
+        <% if (C.rest) { %><span class="b warn" id="lzc-rest">残り <%= C.rest %> 件は次の回 (1 回の CSV は <%= C.max %> 件まで)</span><% } %>
       </div>
       <% } %>
       <div class="msgline" id="lzc-msg" role="status" aria-live="polite"></div>

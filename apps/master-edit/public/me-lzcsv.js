@@ -1,7 +1,7 @@
 /*
  * me-lzcsv.js — 「ロジザード登録の CSV」の画面の動き (views/lz-csv.ejs・lib/lz-new-export.mjs・0081)
  *   - 「N 件の CSV を作ってダウンロード」= POST /api/lz-csv/build (画面で見た商品と行番号)。作れたらファイルをダウンロードして画面を読み直す
- *   - 写しが古い = 「確かめた」の印が要る (confirm_stale)
+ *   - 写しが古い = 作れない (画面がボタンを止める・DB も断る = #1721 R2)
  *   - 通信が分からないまま終わった = 同じ request_id で送り直す (2 回作らない)
  *   - 「取り消す」= 理由を聞いて POST /api/lz-csv/:id/void
  */
@@ -27,13 +27,12 @@
   var btn = $('#lzc-build');
   if (btn) btn.addEventListener('click', function () {
     if (busy || !P.ready.length) return;
-    var stale = $('#lzc-stale-ok');
-    if (P.stale && !(stale && stale.checked)) { msg('写しが古いので、「確かめた」に印を付けてから作ってください', 'err'); return; }
+    if (P.stale) { msg('ロジザードの商品の一覧の写しが古いので作れません (毎晩の取り込みの後に作るか、予備の GAS で)', 'err'); return; }
     var items = P.ready.map(function (x) { return { sku_id: x.sku_id, rule_row: x.rule_row }; });
     var key = JSON.stringify(items);
     if (!pending || pending.key !== key) pending = { key: key, rid: uuid() };
     busy = true; btn.disabled = true; msg('作っています…');
-    post(P.base + '/api/lz-csv/build', { request_id: pending.rid, items: items, confirm_stale: !!(stale && stale.checked) }).then(function (x) {
+    post(P.base + '/api/lz-csv/build', { request_id: pending.rid, items: items }).then(function (x) {
       busy = false;
       var sure = !!x.j && (x.r.ok ? x.j.ok === true : x.r.status >= 400 && x.r.status < 500);
       if (!sure) { btn.disabled = false; msg('作れたか分かりません (HTTP ' + x.r.status + ')。もう一度押してください (同じ CSV として送り直します)', 'err'); return; }

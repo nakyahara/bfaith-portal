@@ -16,6 +16,9 @@
  *   X8 (#1721 R1 High 1) CSV の中身は DB が品目から作る = アプリが同じ品目から作る byte 列と 1 byte も違わない (引用符・カンマ・半角カナ・～)・byte 列は受け取らない (前の 6 つの引数の関数は無い)
  *   X9 (#1721 R1 High 2) 保存のときに照らせた値も、出すときの写しが古い・空・読めない間は止まる・DB も写しの時刻が無い / 古いと断る
  *   X10 (#1721 R1 Medium) 同じ request_id で違う品目 = 409 request_id_reused (アプリ・DB の関数とも)
+ *   X11 (#1721 R2 High) DB の関数を直に: 新商品の登録から来ていない商品 (origin が new_entry でない)・商品の一覧の写しの時刻が無い / 古い / 先 = 断る
+ *   X12 (#1721 R2 Medium) 候補が 1 回の上限を超える = 先の N 件だけ (商品コードの順)・残りは次の回 (画面に「残り N 件は次の回」)
+ *   X13 (#1721 R2 Low) 大文字と小文字のコードがまざる = DB とアプリが同じ並び (コードの文字の並び) = 同じ byte 列
  *   S1 守り: master_edit は帳面に直接書けない・持ち主も関数の外では書けない・取り消す以外は変えない・TRUNCATE できない・PUBLIC の実行権なし
  * 使い方: node scripts/test-lz-csv-export.mjs
  */
@@ -95,7 +98,7 @@ async function regApi(code, lz, values = {}, blanksDrop = []) {
 const skuId = async (code) => (await one('select sku_id::text as id from core.skus where code = $1', [code])).id;
 const latest = async (id) => (await one('select max(rule_row)::text as r from ops.sku_logizard_barcode_rules where sku_id = $1', [id])).r;
 const cand = async (m = MIRROR) => asEditor(() => LZE.lzNewCandidates(db, m, Date.now()));
-const issue = (want, o = {}) => asEditor(() => LZE.issueLzNewExport(db, { requestId: o.requestId ?? crypto.randomUUID(), actor: 'naka@test', want, mirror: o.mirror ?? MIRROR, confirmStale: !!o.confirmStale }));
+const issue = (want, o = {}) => asEditor(() => LZE.issueLzNewExport(db, { requestId: o.requestId ?? crypto.randomUUID(), actor: 'naka@test', want, mirror: o.mirror ?? MIRROR }));
 const pgErr = async (p) => { try { await p; } catch (e) { return e; } return null; };
 const mine = (list) => list.filter((x) => /^lzx-/.test(x.code));
 
@@ -223,7 +226,7 @@ await ta('[X4] Company DB で重なる値 (ops.lzbc_value_clash・取り込み�
   const e = await pgErr(asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), now())', [crypto.randomUUID(), 'naka@test', JSON.stringify(items)]); } finally { await pg.query('rollback'); } }));
   assert.match(String(e && e.message), /^lzbc_taken: lzx-k .*s003.*JAN/);
 });
-await ta('[X5] 画面を開いた後に値・有効期限が変わった = 409 changed (何も書かない)・写しが無い = 409・古い = 確かめの印が要る・DB の関数も直接の偽りを断る', async () => {
+await ta('[X5] 画面を開いた後に値・有効期限が変わった = 409 changed (何も書かない)・写しが無い = 409・古い = 作れない (#1721 R2・確かめの印は無い)・DB の関数も直接の偽りを断る', async () => {
   for (const c of ['lzx-f', 'lzx-g']) assert.equal((await regApi(c, { kind: 'lz_assign' })).status, 200);
   const c = await cand();
   const f = c.ready.find((x) => x.code === 'lzx-f'), g = c.ready.find((x) => x.code === 'lzx-g');
@@ -237,13 +240,14 @@ await ta('[X5] 画面を開いた後に値・有効期限が変わった = 409 c
   e = await pgErr(issue([{ sku_id: g.sku_id, rule_row: g.rule_row }], { mirror: old }));
   assert.deepEqual([e && e.status, e && e.reason], [409, 'lz_list_stale']);
   assert.equal((await one('select count(*)::int as n from ops.lz_new_exports')).n, n0, '断ったのに帳面に書いた');
-  const raw = (items) => asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, null, now())', [crypto.randomUUID(), 'naka@test', JSON.stringify(items)]); } finally { await pg.query('rollback'); } });
+  const raw = (items) => asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), now())', [crypto.randomUUID(), 'naka@test', JSON.stringify(items)]); } finally { await pg.query('rollback'); } });
   const base = { sku_id: g.sku_id, code: 'lzx-g', rule_row: String(g.rule_row), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' };
   for (const [x, re] of [[{ expiry_code: '02' }, /^stale/], [{ inbound_code: '1' }, /^stale/], [{ kind: 'jan', value: '4512345678906' }, /^stale/], [{ code: 'LZX-G' }, /^stale/], [{ rule_row: 'x' }, /^invalid_input/]]) {
     const er = await pgErr(raw([{ ...base, ...x }]));
     assert.match(String(er && er.message), re, JSON.stringify(x));
   }
-  const r = await issue([{ sku_id: g.sku_id, rule_row: g.rule_row }], { mirror: old, confirmStale: true });
+  // 🆕 #1721 R2: 「古いまま作る」は無い (DB も断る)。新しい写しなら作れる
+  const r = await issue([{ sku_id: g.sku_id, rule_row: g.rule_row }]);
   assert.equal(r.rows, 1);
 });
 await ta('[X6] 取り消す (理由が要る) = 品目が voided・また候補に出る・値を直せる・ファイルは出さない (409)・もう一度 = already', async () => {
@@ -311,6 +315,61 @@ await ta('[X8] CSV の中身は DB が品目から作る (#1721 R1 High 1): ア�
   // 画面のロールは中身を直接書けない
   const code = async (fn) => { const er = await pgErr(fn()); return er ? er.code : null; };
   assert.equal(await asEditor(() => code(() => pg.query("update ops.lz_new_exports set file_text = 'x' where export_id = $1", [r.export_id]))), '42501');
+});
+await ta('[X11] DB の関数を直に (#1721 R2 High): 新商品の登録から来ていない商品 = 断る・商品の一覧の写しの時刻が無い / 40 時間前 / 1 時間先 = 断る', async () => {
+  const H = 3600e3;
+  const s1 = await skuId('s001');   // 前からある商品 (backfill)
+  await asEditor(async () => { await pg.query('begin'); try { await LB.setLzBarcodeInTx(db, { requestId: crypto.randomUUID(), actor: 'naka@test', skuId: s1, kind: 'lz_assign', via: 'sku_page', seenRow: await latest(s1) }); await pg.query('commit'); } catch (e) { await pg.query('rollback'); throw e; } });
+  assert.notEqual((await one('select origin from ops.master_registrations where sku_id = $1', [s1])).origin, 'new_entry');
+  const direct = (items, listAt) => pgErr(asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, $4::timestamptz, now())', [crypto.randomUUID(), 'naka@test', JSON.stringify(items), listAt]); } finally { await pg.query('rollback'); } }));
+  let e = await direct([{ sku_id: s1, code: 's001', rule_row: await latest(s1), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' }], new Date().toISOString());
+  assert.match(String(e && e.message), /^invalid_input: s001 は新商品の登録から来た商品でない/);
+  assert.equal((await regApi('lzx-o', { kind: 'lz_assign' })).status, 200);
+  const so = await skuId('lzx-o');
+  const ok = [{ sku_id: so, code: 'lzx-o', rule_row: await latest(so), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' }];
+  for (const at of [null, new Date(Date.now() - 40 * H).toISOString(), new Date(Date.now() + H).toISOString()]) {
+    e = await direct(ok, at);
+    assert.match(String(e && e.message), /^lz_list_stale/, String(at));
+  }
+  assert.equal(await direct(ok, new Date().toISOString()), null, '新しい写しの時刻で断った');
+  // アプリも先の時刻は古いと同じ (作れない)
+  e = await pgErr(issue([{ sku_id: so, rule_row: await latest(so) }], { mirror: mirrorOf({ bc: [['zz-old', 'X00LZXWARE']], list: new Date(Date.now() + H).toISOString() }) }));
+  assert.deepEqual([e && e.status, e && e.reason], [409, 'lz_list_stale']);
+});
+await ta('[X12] 候補が 1 回の上限を超える (#1721 R2 Medium) = 先の N 件だけ・残りは次の回 (画面に「残り N 件は次の回」)・出すと次の N 件が出る', async () => {
+  for (const c of ['lzx-m1', 'lzx-m2', 'lzx-m3']) assert.equal((await regApi(c, { kind: 'lz_assign' })).status, 200);
+  const all = mine((await cand()).ready).map((x) => x.code);
+  assert.ok(all.length >= 4, all.join(','));
+  LZE.__setLzExportMaxRows(2);
+  try {
+    const c = await cand();
+    assert.equal(c.ready.length, 2);
+    assert.ok(c.rest >= 2, String(c.rest));
+    const page = await call('GET', '/lz-csv');
+    assert.ok(page.text.includes(`残り ${c.rest} 件は次の回 (1 回の CSV は 2 件まで)`), '画面に残りの件数が無い');
+    const data = JSON.parse(/<script type="application\/json" id="me-lzc">([\s\S]*?)<\/script>/.exec(page.text)[1].replace(/\\u003c/g, '<'));
+    assert.equal(data.ready.length, 2);
+    const first = c.ready.map((x) => x.code);
+    const r = await issue(c.ready.map((x) => ({ sku_id: x.sku_id, rule_row: x.rule_row })));
+    assert.equal(r.rows, 2);
+    const c2 = await cand();
+    assert.equal(c2.ready.length, 2);
+    assert.ok(!c2.ready.some((x) => first.includes(x.code)), '出した商品がまた出た');
+    // 上限を超える要求 = 400
+    const e = await pgErr(issue([...c2.ready, ...c2.ready].map((x, i) => ({ sku_id: x.sku_id, rule_row: x.rule_row, i }))));
+    assert.deepEqual([e && e.status], [400]);
+  } finally { LZE.__setLzExportMaxRows(null); }
+});
+await ta('[X13] 大文字と小文字のコードがまざる (#1721 R2 Low): DB とアプリが同じ並び (コードの文字の並び = 大文字が先)・同じ byte 列', async () => {
+  for (const c of ['lzx-aa', 'lzx-Zb', 'lzx-B1']) assert.equal((await regApi(c, { kind: 'lz_assign' })).status, 200, c);
+  const c = await cand();
+  const items = c.ready.filter((x) => ['lzx-aa', 'lzx-Zb', 'lzx-B1'].includes(x.code));
+  assert.equal(items.length, 3);
+  const appBytes = LZE.buildLzNewCsvBytes(items).bytes;
+  const r = await issue(items.map((x) => ({ sku_id: x.sku_id, rule_row: x.rule_row })));
+  const f = await asEditor(() => LZE.lzNewExportFile(db, r.export_id));
+  assert.equal(Buffer.compare(f.file_bytes, appBytes), 0, 'DB とアプリの並びが違う');
+  assert.deepEqual(iconv.decode(f.file_bytes, 'cp932').split('\r\n').slice(1).map((l) => l.split(',')[0]), ['lzx-B1', 'lzx-Zb', 'lzx-aa']);
 });
 await ta('[S1] 守り: master_edit は帳面に直接書けない・持ち主も関数の外では書けない・取り消す以外は変えない・TRUNCATE できない・PUBLIC の実行権なし・master_edit だけ実行できる', async () => {
   const code = async (fn) => { const e = await pgErr(fn()); return e ? e.code : null; };

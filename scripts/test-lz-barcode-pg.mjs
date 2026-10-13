@@ -268,7 +268,8 @@ try {
     assert.match(String(rl.err && rl.err.message), /^lzbc_taken: .*s003/, rl.err ? rl.err.message : JSON.stringify(rl.ok));
   });
   await ta('[7] ロジザード登録の CSV を出す取引と、同じ商品のバーコードを直す取引 (0081・#1719 R1 Medium 1): SKU の鍵で順に = 出した後は直せない (lz_issued)・直した後は出せない (stale)', async () => {
-    const s2 = (await q("select sku_id::text as id from core.skus where code = 's002'"))[0].id;
+    // 新商品の登録から来た商品 ([1] で登録した lzpg-s1) = ロジザード登録の CSV に出せる (#1721 R2: origin = new_entry だけ)
+    const s2 = (await q("select sku_id::text as id from core.skus where code = 'lzpg-s1'"))[0].id;
     const latest = async () => (await q('select max(rule_row)::text as r from ops.sku_logizard_barcode_rules where sku_id = $1', [s2]))[0].r;
     const waiting = async () => (await q("select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted"))[0].n;
     const until = async (n) => { for (let i = 0; i < 200 && (await waiting()) < n; i++) await sleep(50); assert.ok((await waiting()) >= n, '鍵で待たない'); };
@@ -278,7 +279,7 @@ try {
     const fixSql = "select ops.set_sku_logizard_barcode($1::uuid, 'naka@test', $2::bigint, 'fnsku', 'X00LZPGF01', 'sku_page', $3::bigint, 'checked', now()) as r";
     const issueSql = 'select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), now()) as r';
     await L.query(lzSql, [uuid(), s2, await latest()]);   // 今 = 空欄
-    const items = async () => JSON.stringify([{ sku_id: s2, code: 's002', rule_row: await latest(), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' }]);
+    const items = async () => JSON.stringify([{ sku_id: s2, code: 'lzpg-s1', rule_row: await latest(), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' }]);
     const tail = (c, sql, p) => launch((async () => { try { const r = (await c.query(sql, p)).rows[0].r; await c.query('commit'); return { ok: r }; } catch (e) { await c.query('rollback'); return { err: e }; } })());
     // ① CSV を出す取引が先 (まだ commit していない) → 直す取引は SKU の鍵で待つ → commit の後に lz_issued
     await E.query('begin');

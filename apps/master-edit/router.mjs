@@ -1447,8 +1447,7 @@ router.post('/api/lz-csv/build', (req, res) => {
   const rid = String(b.request_id ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid)) return res.status(400).json({ ok: false, error: '作る番号 (request_id) の形が違う。画面を開き直してください', reason: 'invalid_input' });
   return withPgApi(res, async (db) => {
-    const r = await issueLzNewExport(db, { requestId: rid, actor: String(req.session.email).trim().toLowerCase(), want: b.items, confirmStale: b.confirm_stale === true,
-      mirror: await lzMirrorProvider(), nowMs: clock() });
+    const r = await issueLzNewExport(db, { requestId: rid, actor: String(req.session.email).trim().toLowerCase(), want: b.items, mirror: await lzMirrorProvider(), nowMs: clock() });
     res.json({ ok: true, ...r });
   }, 'write');
 });
