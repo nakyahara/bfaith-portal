@@ -2689,10 +2689,16 @@ await ta('[BL6] #1706 Codex R2 M: 発注の設定の「入力なし」は要求�
 console.log('\nロジザードのバーコード (新商品の登録の API)');
 const LZ_NOW = new Date().toISOString();
 /** ロジザードの写し (試験) = 商品の一覧 (小文字の ID) とバーコードマスタ (書いたとおりの ID・値) */
-const lzMirror = ({ keys = [], bc = [], at = LZ_NOW, ok = true } = {}) => ({ ok, reason: ok ? null : '写しがありません', keys: new Set(keys.map((k) => k.toLowerCase())),
-  ids: bc.reduce((m, [id]) => { const l = id.toLowerCase(); if (!m.has(l)) m.set(l, new Set()); m.get(l).add(id); return m; }, new Map()),
-  barcodes: new Map(bc.map(([id, v]) => [v, id])), list_as_of: at, bc_as_of: at, rows: Math.max(1, keys.length) });
-let LZM = lzMirror();
+/** state = バーコードマスタの写し (checked = 読めて新しい / unavailable = 読めない / empty = 空 / stale = 40 時間前) */
+const lzMirror = ({ keys = [], bc = [], at = LZ_NOW, ok = true, state = 'checked' } = {}) => {
+  const rows = state === 'unavailable' || state === 'empty' ? [] : bc;
+  const bcAt = state === 'stale' ? new Date(Date.now() - 40 * 3600e3).toISOString() : rows.length ? at : null;
+  return { ok, reason: ok ? null : '写しがありません', keys: new Set(keys.map((k) => k.toLowerCase())),
+    ids: rows.reduce((m, [id]) => { const l = id.toLowerCase(); if (!m.has(l)) m.set(l, new Set()); m.get(l).add(id); return m; }, new Map()),
+    barcodes: new Map(rows.map(([id, v]) => [v, id])), list_as_of: at, bc_as_of: bcAt, rows: Math.max(1, keys.length),
+    bc: { ok: state === 'checked' ? rows.length > 0 : state === 'stale', reason: state === 'unavailable' ? '写しがありません' : null, rows: rows.length, empty: state === 'empty' } };
+};
+let LZM = lzMirror({ bc: [['zz-any', 'X00ZZZZANY']] });
 MR.__setLzMirrorProvider(async () => LZM);
 process.env.MASTER_DECISION_APPROVERS = 'naka@test';
 const regApi = async (code, lzb, extra = {}) => {
@@ -2722,11 +2728,29 @@ await ta('[LZ-H1] 新商品の登録の API: ロジザードのバーコード�
   r = await regApi('lzh-d', { kind: 'value', value: 'X00LZH0001' });
   assert.deepEqual([r.status, r.j.reason], [409, 'lzbc_taken'], r.text);
 });
-await ta('[LZ-H3] まとまりの確かめ: 打ったロジザードのバーコードの持ち主 (Company DB のほかの商品・ロジザードの写し) を返す', async () => {
-  const r = await call('POST', '/apps/master-edit/api/variation/check', { body: { codes: [], jans: [], lz_values: ['x00lzh0001', 'X00LZHWARE', '4900000000023', 'bad'] } });
-  if (r.status === 409 && r.j && r.j.reason === 'parent_not_company') return;   // このファイルの DB は代表の持ち主が load = まとまりの API は閉じている (まとまりの試験で見る)
-  assert.equal(r.status, 200, r.text);
-  assert.deepEqual(r.j.lz, { X00LZH0001: 'lzh-a', X00LZHWARE: 'zz-old' });
+await ta('[LZ-H2] 単品の登録 × ロジザードの写し (#1719 R1 High 2): 読めない / 空 / 古い = 登録は通る (200)・答えに lz_unchecked・値の行に印 / 照らせた = 印なし / 空欄 = 照らさない', async () => {
+  try {
+    for (const [st, code, v] of [['unavailable', 'lzh-u1', 'X00LZU0001'], ['empty', 'lzh-u2', 'X00LZU0002'], ['stale', 'lzh-u3', 'X00LZU0003']]) {
+      LZM = lzMirror({ state: st, bc: [['zz-old', 'X00LZHWARE']] });
+      const r = await regApi(code, { kind: 'value', value: v });
+      assert.equal(r.status, 200, `${st}: ${r.text}`);
+      assert.deepEqual([r.j.lz_unchecked && r.j.lz_unchecked.state, !!r.j.lz_unchecked.words], [st, true], st);
+      const row = await one('select r.lz_copy_state as st, r.lz_copy_as_of is not null as at from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = $1', [code]);
+      assert.deepEqual([row.st, row.at], [st, st === 'stale'], st);
+    }
+    // 古い写しでもほかの商品の値がある = 断る (登録ごと戻る)
+    LZM = lzMirror({ state: 'stale', bc: [['zz-old', 'X00LZHWARE']] });
+    const r0 = await regApi('lzh-u4', { kind: 'value', value: 'X00LZHWARE' });
+    assert.deepEqual([r0.status, r0.j.reason], [409, 'lzbc_taken']);
+    assert.equal((await one("select count(*)::int as n from core.skus where code = 'lzh-u4'")).n, 0);
+    LZM = lzMirror({ bc: [['zz-old', 'X00LZHWARE']] });
+    const r1 = await regApi('lzh-u5', { kind: 'value', value: 'X00LZU0005' });
+    assert.deepEqual([r1.status, r1.j.lz_unchecked], [200, undefined]);
+    assert.equal((await one("select r.lz_copy_state as st from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = 'lzh-u5'")).st, 'checked');
+    LZM = lzMirror({ state: 'unavailable' });
+    const r2 = await regApi('lzh-u6', { kind: 'lz_assign' });
+    assert.deepEqual([r2.status, r2.j.lz_unchecked], [200, undefined], '空欄に照らせていない印');
+  } finally { LZM = lzMirror({ bc: [['zz-any', 'X00ZZZZANY']] }); }
 });
 
 server.close();

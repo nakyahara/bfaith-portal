@@ -291,7 +291,9 @@
       if (k.jan) { var jp = janProblem(k.jan); if (jp) E(jp.c, 'JAN: ' + jp.m); else if (seenJan.has(k.jan)) E('dup', 'JAN が ' + seenJan.get(k.jan) + ' と同じ'); else seenJan.set(k.jan, k.code); }
       if (LZ_ON && k.lzbc) {
         var ls = lzShape(k.lzbc);
+        var janOf = kids.filter(function (o) { return o !== k && o.inc && String((S.edits[o.key] || {}).jan == null ? '' : S.edits[o.key].jan).normalize('NFKC').trim() === k.lzbc; })[0];
         if (ls && ls.c) E(ls.c, 'ロジザードのバーコード: ' + ls.m);
+        else if (janOf) E('dup', 'ロジザードのバーコードが ' + janOf.code + ' の JAN と同じ');
         else if (seenLz.has(k.lzbc)) E('dup', 'ロジザードのバーコードが ' + seenLz.get(k.lzbc) + ' と同じ');
         else { seenLz.set(k.lzbc, k.code); if (R.lz[k.lzbc]) E('dup', 'ロジザードのバーコード: ほかの商品 (' + R.lz[k.lzbc] + ') が使っています'); }
       }
@@ -1182,6 +1184,8 @@
           $('#result').innerHTML = '<div class="result ok"><div class="rt">' + icon('check', 's') + ' ' + kids.length + ' 件を下書きにしました' + (x.j.replayed ? ' (前の同じ保存の結果)' : '') + '</div><ul>'
             + '<li>まとまり ' + esc(x.j.group_code) + (x.j.group_created ? ' を作りました' : ' に足しました (今ある ' + (m.pk ? m.pk.kids.length : 0) + ' 件は変更なし)') + ' (軸・選択肢も一緒に記録)</li>'
             + '<li>' + afterCsvText(m.pk ? m.pk.pendingUnfiled : 0, kids.length, S.nextOpts.length > 0) + '</li>'
+            // 🆕 #1719 R1 High 2: ロジザードの写しが読めない・空・古い = 保存はした・照らせていない印 (CSV を出すときに照らし直す)
+            + (x.j.lz_unchecked ? '<li style="color:var(--warn)" data-lz-unchecked="' + esc(x.j.lz_unchecked.state) + '">ロジザードのバーコードは、ロジザードの写しと照らせていません (' + esc(x.j.lz_unchecked.words) + '・写しの時刻 ' + esc(x.j.lz_unchecked.as_of_jst || 'なし') + ')。ロジザード登録の CSV を出すときに照らし直します</li>' : '')
             + '<li>出品カードはまとまりで 1 枚 (NE の写し待ち)' + (x.j.card ? ' · ' + esc(x.j.card.label) + (x.j.card.status === 'done' ? '' : ' (product-hub のボードを開くと続きを作ります)') : '') + '</li>'
             + (po ? (po.ok ? '<li>発注の設定を ' + po.written + ' 件に入れました</li>'
               // 🆕 0075: 届いていない子 = 知らせは Company DB に残る (自動でもう一度届ける)・要確認の子 = 商品の画面で確かめる

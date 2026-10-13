@@ -109,7 +109,7 @@ const AMZ = 'main@A1VC38T7YXB528';
     components: comps, asinCandidates: [], fnskuCandidates: fnsku ? [{ fnsku, source: 'fba_sku_attrs' }] : [], evidenceSource: 'test' });
   const jan = (skuCode, v) => ({ skuCode, attribute: 'jan', scope: 'item', valueText: v, source: 'product_hub', sourceRef: `test:${skuCode}:${v}`, observedAt: '2030-01-01T00:00:00.000Z' });
   const plan = {
-    skus: ['lz1', 'lz2', 'lz3', 'lz4', 'oth1'].map((x) => sku(x)).concat([sku('set1', 'set')]), variationGroups: [],
+    skus: ['lz1', 'lz2', 'lz3', 'lz4', 'lz5', 'oth1'].map((x) => sku(x)).concat([sku('set1', 'set')]), variationGroups: [],
     setComponents: [{ parentCode: 'set1', childCode: 'lz1', qty: 2, source: 'ne' }],
     listings: [amazon('pr_lz1', [comp('lz1')], 'X00LZ10001'), amazon('pr_oth1', [comp('oth1')], 'X00OTH0001')],
     observations: [jan('lz1', J1), jan('oth1', J9)], physicals: [], compliance: [], workers: [],
@@ -119,7 +119,7 @@ const AMZ = 'main@A1VC38T7YXB528';
   assert.equal(r.ok, true, r.error);
 }
 const sid = async (code) => (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0]?.id;
-const ids = Object.fromEntries(await Promise.all(['lz1', 'lz2', 'lz3', 'lz4', 'oth1', 'set1'].map(async (k) => [k, await sid(k)])));
+const ids = Object.fromEntries(await Promise.all(['lz1', 'lz2', 'lz3', 'lz4', 'lz5', 'oth1', 'set1'].map(async (k) => [k, await sid(k)])));
 const rowsOf = async (code) => q('select rule, value, via, actor_id, db_user from ops.sku_logizard_barcode_rules where sku_id = $1 order by rule_row', [ids[code]]);
 const latestRow = async (code) => (await q('select max(rule_row)::text as r from ops.sku_logizard_barcode_rules where sku_id = $1', [ids[code]]))[0].r;
 const setBc = (code, kind, value = null, o = {}) => asEditor(async () => {
@@ -166,10 +166,15 @@ await ta('[F2] ほかの商品の値 = lzbc_taken (ほかの SKU の今の値・
   assert.equal((await setBc('lz2', 'fnsku', F2)).value, F2);
 });
 await ta('[F3] DB の形の確かめ (チェック数字・X00・空欄に値)・セット = not_single・無い SKU・人の形', async () => {
-  const raw = (kind, value) => asEditor(async () => { await pg.query('begin'); try { return await db.query('select ops.set_sku_logizard_barcode($1::uuid, $2, $3::bigint, $4, $5, $6, $7::bigint)', [uuid(), 'naka@test', ids.lz4, kind, value, 'sku_page', await latestRow('lz4')]); } finally { await pg.query('rollback'); } });
+  const raw = (kind, value, st = value == null ? null : 'checked') => asEditor(async () => { await pg.query('begin'); try { return await db.query('select ops.set_sku_logizard_barcode($1::uuid, $2, $3::bigint, $4, $5, $6, $7::bigint, $8, null)', [uuid(), 'naka@test', ids.lz4, kind, value, 'sku_page', await latestRow('lz4'), st]); } finally { await pg.query('rollback'); } });
   for (const [k, v] of [['jan', JBAD], ['fnsku', 'X0LZB00001'], ['fnsku', 'x00lzb0001'], ['lz_assign', J1], ['auto', null], ['jan', null]]) {
     const e = await pgErr(raw(k, v));
     assert.match(String(e && e.message), /^invalid_input/, `${k} ${v}`);
+  }
+  // 🆕 #1719 R1 High 2: 値があるときは写しと照らした結果が要る・空欄には要らない・知らない結果 = 断る
+  for (const [k, v, st] of [['fnsku', 'X00LZB0077', null], ['lz_assign', null, 'checked'], ['fnsku', 'X00LZB0077', 'maybe']]) {
+    const e = await pgErr(raw(k, v, st));
+    assert.match(String(e && e.message), /^invalid_input/, `${k} ${v} ${st}`);
   }
   let e = await pgErr(setBc('set1', 'lz_assign'));
   assert.equal(e && e.reason, 'not_single');
@@ -187,6 +192,34 @@ await ta('[F4] 0078 の「決め方」だけの行 (auto・値の無い fnsku) =
   } finally { await pg.query('set role deploy'); }
   const r = await read('oth1');
   assert.deepEqual([r.kind, r.value, r.legacy, !!r.rule_row], [null, null, true, true]);
+  // 0078 の空欄 (lz_assign・value = null) = そのまま空欄 (legacy でない・照らす値なし) (#1719 R1 Low)
+  await pg.query('reset role');
+  try {
+    await pg.query("set ops.logizard_barcode_protocol = '1'");
+    await pg.query("insert into ops.sku_logizard_barcode_rules (sku_id, rule, via, actor_id, request_id, db_user) values ($1, 'lz_assign', 'register', 'naka@test', $2, 'master_edit')", [ids.lz5, uuid()]);
+    await pg.query("set ops.logizard_barcode_protocol = ''");
+  } finally { await pg.query('set role deploy'); }
+  const r2 = await read('lz5');
+  assert.deepEqual([r2.kind, r2.value, r2.legacy, r2.lz_copy_state, r2.unchecked], ['lz_assign', null, false, null, null]);
+});
+await ta('[F5] 写しと照らした結果 (#1719 R1 High 2): 値の行に残る (checked / unavailable / empty / stale・写しの時刻)・照らせていない = 一言・照らせた = 一言なし・同じ値でも照らせたら書く', async () => {
+  const at = '2030-01-04T12:00:00.000Z';
+  const setC = (code, value, copy) => asEditor(async () => { await pg.query('begin'); try { const r = await LB.setLzBarcodeInTx(db, { requestId: uuid(), actor: 'naka@test', skuId: ids[code], kind: 'fnsku', value, via: 'sku_page', seenRow: await latestRow(code), copy }); await pg.query('commit'); return r; } catch (e) { await pg.query('rollback'); throw e; } });
+  for (const st of ['unavailable', 'empty', 'stale']) {
+    const r = await setC('lz4', `X00LZF${({ unavailable: '001', empty: '002', stale: '003' })[st]}0`, { state: st, as_of: st === 'unavailable' ? null : at });
+    assert.equal(r.lz_copy_state, st);
+    const v = await read('lz4');
+    assert.deepEqual([v.lz_copy_state, !!v.unchecked], [st, true], st);
+    assert.match(v.unchecked, /ロジザードの写しと照らせていません/);
+    if (st !== 'unavailable') assert.match(v.unchecked, /2030-01-04 21:00/, '写しの時刻 (日本時間)');
+  }
+  // 同じ値・照らせた = 書く (行が増える)・一言なし
+  const n0 = (await rowsOf('lz4')).length;
+  const r = await setC('lz4', 'X00LZF0030', { state: 'checked', as_of: at });
+  assert.deepEqual([r.changed, (await rowsOf('lz4')).length], [true, n0 + 1]);
+  assert.deepEqual([(await read('lz4')).lz_copy_state, (await read('lz4')).unchecked], ['checked', null]);
+  // 渡さない (呼び手が照らしていない) = unavailable 扱い
+  assert.equal((await setC('lz4', 'X00LZF0040', null)).lz_copy_state, 'unavailable');
 });
 await ta('[R1] 参考: Amazon の FNSKU・この商品の JAN と違う = 参考の一言だけ (保存はできる)・同じ / Amazon のデータが無い = 一言なし', async () => {
   // lz1 = JAN J1・Amazon の FNSKU X00LZ10001。違う FNSKU を打つ = 通る + 参考
@@ -207,14 +240,25 @@ await ta('[S1] 守り: master_edit は値の表に直接書けない・持ち主
   assert.equal(await asEditor(() => code(() => pg.query("update ops.sku_logizard_barcode_rules set value = null"))), '42501');
   assert.equal(await code(() => pg.query("update ops.sku_logizard_barcode_rules set value = null")), '42501', '持ち主が値を変えられた');
   assert.ok(await code(() => pg.query('truncate ops.sku_logizard_barcode_rules')), 'TRUNCATE できた');
-  assert.equal(await asRole('watcher', () => code(() => pg.query("select ops.set_sku_logizard_barcode($1::uuid, 'x@y', $2::bigint, 'lz_assign', null, 'sku_page', null)", [uuid(), ids.lz4]))), '42501');
-  for (const sig of ['ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint)', 'ops.lzbc_value_holder(bigint, text)']) {
+  assert.equal(await asRole('watcher', () => code(() => pg.query("select ops.set_sku_logizard_barcode($1::uuid, 'x@y', $2::bigint, 'lz_assign', null, 'sku_page', null, null, null)", [uuid(), ids.lz4]))), '42501');
+  for (const sig of ['ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint, text, timestamp with time zone)', 'ops.lzbc_value_holder(bigint, text)']) {
     const p = (await q(`select proacl::text as acl, prosecdef, proconfig::text as cfg from pg_proc where oid = $1::regprocedure`, [sig]))[0];
     assert.equal(p.prosecdef, true, sig); assert.match(p.cfg, /search_path=pg_catalog, pg_temp/, sig);
     assert.ok(!/(^|[{,])=X/.test(p.acl), `PUBLIC に実行権がある: ${sig} ${p.acl}`); assert.match(p.acl, /master_edit=X/, sig);
   }
   const old = (await q(`select proacl::text as acl from pg_proc where oid = 'ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)'::regprocedure`))[0];
   assert.ok(!/master_edit=X/.test(old.acl || ''), `0078 の決め方だけの関数を master_edit が実行できる: ${old.acl}`);
+  // #1719 R1 Medium 2: migration 0080 自身が master_edit の実行を外す (ロールの script の流し直しを待たない) = 付けてから 0080 の文を流す
+  await pg.query('reset role');
+  try {
+    await pg.query("grant execute on function ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint) to master_edit");
+    const mig = fs.readFileSync(new URL('../db/company/migrations/0080_logizard_barcode_values.sql', import.meta.url), 'utf8');
+    const block = /do \$\$ begin\s+if exists \(select 1 from pg_catalog\.pg_roles where rolname = 'master_edit'\)[\s\S]*?end \$\$;/.exec(mig);
+    assert.ok(block, '0080 に旧の関数の revoke が無い');
+    await pg.query(block[0]);
+  } finally { await pg.query('set role deploy'); }
+  const old2 = (await q(`select proacl::text as acl from pg_proc where oid = 'ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)'::regprocedure`))[0];
+  assert.ok(!/master_edit=X/.test(old2.acl || ''), `0080 の revoke が効かない: ${old2.acl}`);
 });
 
 // ─── H 画面 (本物の router) ───
@@ -229,7 +273,14 @@ MR.__setPgClientFactory(async (url) => {
 MR.__setClock(() => Date.now());
 MR.__setShippingRatesProvider(async () => new Map([['S02', { method: '宅急便', cost: 520 }]]));
 // ロジザードの写し (バーコードマスタ): X00LZWAREH = ロジザードでほかの商品 (zz-old) が使っている
-const LZ_MIRROR = { ok: true, reason: null, keys: new Set(['zz-old']), ids: new Map([['zz-old', new Set(['zz-old'])]]), barcodes: new Map([['X00LZWAREH', 'zz-old']]), list_as_of: new Date().toISOString(), bc_as_of: null, rows: 1 };
+const mirrorOf = ({ state = 'checked', bc = [['zz-old', 'X00LZWAREH']] } = {}) => {
+  const fresh = new Date().toISOString(), old = new Date(Date.now() - 40 * 3600e3).toISOString();
+  const rows = state === 'empty' || state === 'unavailable' ? [] : bc;
+  return { ok: true, reason: null, keys: new Set(rows.map(([id]) => id.toLowerCase())), ids: new Map(rows.map(([id]) => [id.toLowerCase(), new Set([id])])), barcodes: new Map(rows.map(([id, v]) => [v, id])),
+    list_as_of: fresh, bc_as_of: state === 'stale' ? old : rows.length ? fresh : null, rows: 1,
+    bc: { ok: state === 'checked' || state === 'stale', reason: state === 'unavailable' ? '写しがありません' : state === 'empty' ? '写しが空です' : null, rows: rows.length, empty: state === 'empty' } };
+};
+let LZ_MIRROR = mirrorOf();
 MR.__setLzMirrorProvider(async () => LZ_MIRROR);
 const SESS = {
   editor: { authenticated: true, email: 'naka@test', displayName: '中原', role: 'user', allowedApps: ['master-edit'] },
@@ -312,6 +363,34 @@ await ta('[H3] 保存の API: 名簿・Origin・形・stale = 409・ロジザー
   assert.deepEqual([r.status, r.j.reason], [409, 'stale']);
   assert.equal((await call('POST', api('set1'), { body: { request_id: uuid(), barcode: { kind: 'lz_assign' } } })).status, 400);
   assert.equal((await call('POST', api('nope-x'), { body: { request_id: uuid(), barcode: { kind: 'lz_assign' } } })).status, 404);
+});
+await ta('[H3b] 商品の画面の保存 × ロジザードの写し (#1719 R1 High 2): 読めない / 空 / 古い = 保存は通る (200)・答えに lz_unchecked・値の行に印・画面に「照らせていません」/ 照らせた = 印なし / 古い写しでもほかの商品の値 = 409', async () => {
+  try {
+    for (const [st, v] of [['unavailable', 'X00LZH3001'], ['empty', 'X00LZH3002'], ['stale', 'X00LZH3003']]) {
+      LZ_MIRROR = mirrorOf({ state: st });
+      const seen = lzData((await call('GET', '/apps/master-edit/sku/lz4')).text).seenRow;
+      const r = await call('POST', api('lz4'), { body: { request_id: uuid(), barcode: { kind: 'value', value: v }, seen_row: seen } });
+      assert.equal(r.status, 200, `${st}: ${r.text}`);
+      assert.equal(r.j.lz_unchecked && r.j.lz_unchecked.state, st, st);
+      assert.equal((await q('select lz_copy_state from ops.sku_logizard_barcode_rules where sku_id = $1 order by rule_row desc limit 1', [ids.lz4]))[0].lz_copy_state, st);
+      const page = await call('GET', '/apps/master-edit/sku/lz4');
+      assert.match(section(page.text), new RegExp(`id="lzbc-unchecked" data-state="${st}"`), st);
+    }
+    LZ_MIRROR = mirrorOf({ state: 'stale' });
+    let seen = lzData((await call('GET', '/apps/master-edit/sku/lz4')).text).seenRow;
+    let r = await call('POST', api('lz4'), { body: { request_id: uuid(), barcode: { kind: 'value', value: 'X00LZWAREH' }, seen_row: seen } });
+    assert.deepEqual([r.status, r.j.reason], [409, 'lzbc_taken'], '古い写しにあるほかの商品の値を通した');
+    LZ_MIRROR = mirrorOf();
+    r = await call('POST', api('lz4'), { body: { request_id: uuid(), barcode: { kind: 'value', value: 'X00LZH3004' }, seen_row: seen } });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.j.lz_unchecked, undefined);
+    assert.ok(!section((await call('GET', '/apps/master-edit/sku/lz4')).text).includes('id="lzbc-unchecked"'));
+    // 空欄 = 照らさない (写しが読めなくても印なし)
+    LZ_MIRROR = mirrorOf({ state: 'unavailable' });
+    seen = lzData((await call('GET', '/apps/master-edit/sku/lz4')).text).seenRow;
+    r = await call('POST', api('lz4'), { body: { request_id: uuid(), barcode: { kind: 'lz_assign' }, seen_row: seen } });
+    assert.deepEqual([r.status, r.j.lz_unchecked], [200, undefined]);
+  } finally { LZ_MIRROR = mirrorOf(); }
 });
 await ta('[H4] 画面の動き (Chromium): 値を打つと空欄の印が外れる・空欄に印で値が消える・形の一言・通信が切れた保存は同じ request_id で送り直す (2 回書かない)', async () => {
   let chromium;

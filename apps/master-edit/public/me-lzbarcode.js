@@ -87,7 +87,7 @@
         if (x.r.ok && x.j.ok) {
           P.seenRow = x.j.rule_row || P.seenRow;
           initial = JSON.stringify(now());
-          msg(x.j.changed ? '保存しました' : '今と同じです (書いていません)', 'ok');
+          msg((x.j.changed ? '保存しました' : '今と同じです (書いていません)') + (x.j.lz_unchecked ? ' · ロジザードの写しと照らせていません (' + x.j.lz_unchecked.words + ')。CSV を出すときに照らし直します' : ''), x.j.lz_unchecked ? 'warn' : 'ok');
           if (ME.toast && x.j.changed) ME.toast('ロジザードのバーコードを保存しました');
           if (ME.dirty && ME.dirty().n === 0 && ME.reloadPage) ME.reloadPage();
           changed();

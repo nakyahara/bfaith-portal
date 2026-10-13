@@ -260,7 +260,7 @@ export const LZ_BARCODE_SELECT = Object.freeze(['ops.sku_logizard_barcode_rules'
  *   値の持ち主 (画面のその場の確かめ・読むだけ) を master_edit に (ロジザード登録の CSV の関数は 2 本目)。0078 の「決め方だけ」の関数は画面から使わない = 持ち主だけ (下の OWNER_ONLY)。
  *   関数が無い DB (0080 の前) では付けない (流し直すと付く)
  */
-export const LZ_BARCODE_EDIT_FUNCTIONS = Object.freeze(['ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint)', 'ops.lzbc_value_holder(bigint, text)']);
+export const LZ_BARCODE_EDIT_FUNCTIONS = Object.freeze(['ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint, text, timestamp with time zone)', 'ops.lzbc_value_holder(bigint, text)']);
 export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_logizard_barcode_rules()', 'ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)',
   'ops.lzbc_jan_ok(text)']);
 

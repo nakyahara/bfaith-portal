@@ -27,6 +27,8 @@
         <div class="lzbc-ans"><span class="v mono" id="lzbc-v"><%= cur || '—' %></span><% if (lz.kind) { %><span class="b <%= lz.kind === 'fnsku' ? 'info' : lz.kind === 'jan' ? 'vio' : 'mute' %>"><%= K[lz.kind] || lz.kind %></span><% } %><% if (lz.issued) { %><span class="b ok">CSV #<%= lz.issued.export_id %> に出した</span><% } %></div>
         <% if (lz.rule_row && lz.kind) { %><span class="hint" id="lzbc-by"><%= VIA[lz.via] || lz.via %> · <%= lz.actor_id || '—' %> · <%= String(lz.created_at || '').slice(0, 16) %></span><% } %>
         <% for (const n of (lz.notes || [])) { %><span class="hint lzbc-note"><svg class="ic s" aria-hidden="true"><use href="#i-info"/></svg><%= n %></span><% } %>
+        <%# 🆕 #1719 R1 High 2: ロジザードの写しが読めない・空・古いときに保存した値 = 照らせていない印 %>
+        <% if (lz.unchecked) { %><span class="fmsg warn" id="lzbc-unchecked" data-state="<%= lz.lz_copy_state %>"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><%= lz.unchecked %></span><% } %>
       </div></div>
     <% if (pageData && lz.canWrite) { %>
     <div class="f" data-row="lzbc.value"><label class="lab" for="lzbc-in">バーコード</label>
