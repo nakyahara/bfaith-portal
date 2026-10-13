@@ -18,6 +18,9 @@
   details.jl-list { margin-top: 10px; }
   details.jl-list summary { cursor: pointer; font-weight: 700; font-size: 13px; }
   .jl-reason { font-size: 12px; color: #9a3412; }
+  .jl-flag { display: inline-block; border-radius: 999px; padding: 1px 10px; font-weight: 700; border: 1px solid #e2e8f0; }
+  .jl-flag.on { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
+  .jl-flag.off { background: #f0fdf4; color: #166534; border-color: #86efac; }
 </style>
 
 <div class="wrap wide">
@@ -42,10 +45,41 @@
       <div class="jl-step"><b>③ 移す</b>数えた内容のとおりに書きます。数えた後に中身が変わっていたら書かずに止まります (もう一度 ①)。</div>
     </div>
     <ul class="muted" style="margin:0; padding-left:18px; font-size:12px;">
-      <li>楽天の出品は、この作業の後も<strong>今までどおり</strong>動きます (出品の前に止める・選ぶ画面は次の段で有効にします)。</li>
+      <li>商品の画面の JAN は、<strong>商品マスタの JAN から選ぶ</strong>形になりました (カテゴリ・属性タブの「カタログID」)。ここで結べなかった物 (要確認) は、商品の画面で選びます。</li>
+      <li>楽天の出品を止めるのは、下の「出品の前に止める設定」を入れてからです。入れるまでは<strong>今までどおり</strong>出せます (印が出るだけ)。</li>
       <li><strong>要確認</strong> = 1 つに決まらない物 (商品マスタに JAN が無い・違う JAN がある・セット など)。消さずに印を付けるだけで、後で商品の画面で選びます。商品マスタの JAN を直すのは「マスタの入力」の商品の画面です。</li>
       <li>何回押しても同じ行を書き直しません (2 回目は「もう済んだ」と出ます)。だれがいつ押したかは下の記録と、商品ごとの履歴に残ります。</li>
       <li>商品マスタに今つながらないとき・混んでいるとき (ほかの画面が商品マスタを読んでいる) は何も書きません。少し待ってからやり直してください。</li>
+    </ul>
+  </div>
+
+  <!-- ═══ 出品の前に止める設定 (B2 の段 4・5) ═══ -->
+  <div class="card" id="jl-enforce">
+    <h2>出品の前に止める設定</h2>
+    <p style="margin:0 0 8px; font-size:13px;">
+      今: <% if (janEnforce) { %><span class="jl-flag on">止める (<code><%= janEnforceEnv %>=1</code>)</span><% } else { %><span class="jl-flag off">止めない (印だけ・今までどおり)</span><% } %>
+    </p>
+    <p style="margin:0 0 8px; font-size:13px;">
+      止めると、楽天に出す前に「カタログID が <strong>商品マスタの JAN 1 つ</strong> か <strong>カタログIDなしの理由</strong> のどちらか 1 つだけ」かを見ます。
+      JAN は送る直前に商品マスタ (Company DB) でもう一度確かめて、<strong>商品マスタの値</strong>を送ります。商品マスタを読めないときも止めます。
+    </p>
+    <% if (janForecast && !janForecast.error) { %>
+      <div class="jl-tiles">
+        <div class="jl-tile"><div class="n"><%= janForecast.drafts %></div><div class="l">楽天に未登録の商品</div></div>
+        <div class="jl-tile <%= janForecast.stopDrafts ? 'review' : 'link' %>" id="jl-forecast-stop"><div class="n"><%= janForecast.stopDrafts %></div><div class="l">今止めたら止まる商品</div></div>
+        <% if (janForecast.heldStopDrafts) { %><div class="jl-tile"><div class="n"><%= janForecast.heldStopDrafts %></div><div class="l">うち 保留・除外の商品</div></div><% } %>
+        <% for (const [k, n] of Object.entries(janForecast.byProblem || {})) { %>
+          <div class="jl-tile review"><div class="n"><%= n %></div><div class="l"><%= (janProblems[k] && janProblems[k].label) || k %> (SKU)</div></div>
+        <% } %>
+      </div>
+      <p class="muted" style="margin:0 0 8px; font-size:12px;">数は product-hub だけで、出品の門と同じ決まりで数えた物です (楽天に未登録の商品・保留や除外も含む。商品マスタで JAN が外れた物は、出品のときに確かめて止まります)。</p>
+    <% } else if (janForecast && janForecast.error) { %>
+      <div class="banner-warn" id="jl-forecast-error">⚠️ 止まる数を<strong>数えきれていません</strong> (<%= janForecast.error %>)。この画面の数は信用しないでください。直るまで止める設定は入れないでください。</div>
+    <% } %>
+    <ul class="muted" style="margin:0; padding-left:18px; font-size:12px;">
+      <li>入れ方: Render の環境変数に <code><%= janEnforceEnv %>=1</code> を入れて再起動します。戻すときは消して (か <code>0</code> にして) 再起動します。</li>
+      <li>入れる前に: 上の「数える → 移す」で今ある JAN を結び、「今止めたら止まる商品」が出品したい商品に残っていないかを見てください (推定で現場を止めない)。</li>
+      <li>入れた後は、商品の画面で JAN を手で打てなくなります (商品マスタから選ぶだけ)。</li>
     </ul>
   </div>
 

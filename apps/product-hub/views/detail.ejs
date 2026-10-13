@@ -115,6 +115,18 @@ th.attr-unknown { color: #dc2626; }
   .jan-cdb-help { margin-top:6px; font-size:12px; color:#475569; }
   .jan-cdb-help summary { cursor:pointer; color:#2563eb; }
   .jan-cdb-help ul { margin:6px 0 0 18px; padding:0; }
+  /* 🆕 商品マスタ (Company DB) の JAN から選ぶ (Company DB構想 21 B2 の段 3)。読んだ後に JS が選べる JAN を並べる */
+  .jan-pick { display:flex; flex-direction:column; gap:4px; }
+  .jan-pick-select { max-width:260px; font-size:12.5px; padding:5px 8px; border-radius:8px; border:1px solid #cbd5e1; background:#fff; }
+  .jan-pick-select:focus-visible { outline:2px solid #2563eb; outline-offset:1px; }
+  .jan-pick-select:disabled { background:#f1f5f9; color:#64748b; }
+  .jan-pick-links { font-size:11.5px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .jan-pick-links a { color:#2563eb; }
+  .jan-manual-toggle { border:0; background:none; padding:0; color:#64748b; font-size:11.5px; text-decoration:underline; cursor:pointer; }
+  .jan-pick-state { margin-top:4px; font-size:11.5px; line-height:1.45; }
+  .jan-pick-state:empty { display:none; }
+  .jan-pick-saving { opacity:.6; }
+  #f-jan[hidden], .sku-jan-input[hidden] { display:none; }
 </style>
 <div class="wrap wide">
 
@@ -889,6 +901,14 @@ th.attr-unknown { color: #dc2626; }
               <li><strong>Company DB と違う</strong> — 商品マスタの JAN が正しければ、ここの JAN を同じ値に直す。商品マスタの JAN が違う・足りないときは、<a href="/apps/master-edit/" target="_blank" rel="noopener">マスタの入力</a>の商品の画面で直す</li>
               <li><strong>Company DB に無い</strong> — ここの JAN が正しければ、マスタの入力の商品の画面でこの JAN を足す。違うなら、ここの JAN を直す。<strong>セット</strong>は商品マスタで JAN を持てない (ここの JAN がセットの物か確かめる)</li>
               <li><strong>Company DB に商品コードが無い</strong> — 商品マスタに商品が登録されてから確かめる</li>
+            </ul>
+            <div>🆕 <strong>JAN は商品マスタの JAN から選びます</strong> (カテゴリ・属性タブの「カタログID」の「IDあり」)。たとえると、手書きのメモをやめて、台帳の行を指で指す形です。</div>
+            <ul>
+              <li>選べるのは、商品マスタのその商品の<strong>今有効な JAN</strong>だけです。選ぶと、その JAN と「選んだ」印が残り、楽天にはその値を送ります (カタログIDなしの理由は自動で外れます)</li>
+              <li>商品マスタに JAN が無い・違うときは、欄の下の「商品マスタで JAN を足す・直す」(マスタの入力の商品の画面) で足してから、この画面を開き直して選びます</li>
+              <li>JAN が無い商品 (店舗オリジナル・セットなど) は「IDなし」で理由を選びます。楽天に送るのは <strong>JAN 1 つか理由のどちらか 1 つ</strong>だけです</li>
+              <li>欄の下の「楽天のカタログID」の印: <strong>商品マスタの JAN を選んである</strong> / <strong>カタログIDなし</strong> = 出せる。<strong>商品マスタに結ばれていない</strong>・<strong>要確認</strong>・<strong>両方</strong>・<strong>どちらも無い</strong> = 止める設定 (<%= locals.janEnforceEnv || 'PH_JAN_ENFORCE' %>) が入ると楽天に出せません<%= locals.janEnforce ? ' (今は入っています = 出品は止まります)' : ' (今は入っていない = 印だけで、出品は今までどおり)' %></li>
+              <% if (!locals.janEnforce) { %><li>止める設定が入るまでは「手で打つ」でも入れられます (今までどおり)。手で打った JAN は商品マスタに結ばれないので、後で選び直してください</li><% } %>
             </ul>
           </details>
         </div>
@@ -2437,7 +2457,7 @@ th.attr-unknown { color: #dc2626; }
             <tr class="sku-grid-catalog">
               <th class="sku-grid-head">
                 <div>カタログID <span style="color:#dc2626">*必須</span></div>
-                <div class="muted" style="font-size:11px; font-weight:400;">JAN (8/12/13桁)。無ければ「IDなし」+ 理由</div>
+                <div class="muted" style="font-size:11px; font-weight:400;">JAN は商品マスタから選ぶ。無ければ「IDなし」+ 理由</div>
               </th>
               <% for (const [mi, m] of variation.members.entries()) { const k = skuKeyOf(m); const jan = skuJans[k] || ''; const ex = gridExemptions[k] != null ? Number(gridExemptions[k]) : null; %>
                 <td class="sku-grid-catalog-cell" data-code="<%= m.商品コード %>">
@@ -2446,15 +2466,26 @@ th.attr-unknown { color: #dc2626; }
                     <label style="font-weight:400; cursor:pointer;"><input type="radio" class="sku-catalog-mode" name="sku-catalog-mode-<%= mi %>" value="without" <%= jan ? '' : 'checked' %>> IDなし</label>
                   </div>
                   <div class="sku-catalog-with" style="<%= jan ? '' : 'display:none;' %>">
-                    <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13"
-                           data-code="<%= m.商品コード %>" value="<%= jan %>" placeholder="8/12/13桁" style="font-size:12px; padding:4px 6px;">
+                    <%# 🆕 商品マスタ (Company DB) の JAN から選ぶ (B2 の段 3)。保存に使う入力 (.sku-jan-input) は隠して持つ。
+                        止める設定 (PH_JAN_ENFORCE) が無い間だけ「手で打つ」で出せる (今までどおりの入れ方・商品マスタには結ばれない) %>
+                    <div class="jan-pick" data-code="<%= m.商品コード %>">
+                      <select class="jan-pick-select" data-code="<%= m.商品コード %>" disabled aria-label="<%= m.商品コード %> の JAN (商品マスタから選ぶ)"><option value="">商品マスタの JAN を読んでいます…</option></select>
+                      <div class="jan-pick-links">
+                        <a href="/apps/master-edit/sku/<%= encodeURIComponent(String(m.商品コード || '').trim()) %>" target="_blank" rel="noopener">商品マスタで JAN を足す・直す</a>
+                        <% if (!locals.janEnforce) { %><button type="button" class="jan-manual-toggle">手で打つ</button><% } %>
+                      </div>
+                    </div>
+                    <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13" hidden
+                           data-code="<%= m.商品コード %>" value="<%= jan %>" placeholder="8/12/13桁" style="font-size:12px; padding:4px 6px; margin-top:4px;" title="手で打った JAN は商品マスタに結ばれません (止める設定を入れると出品が止まります)">
                   </div>
                   <div class="sku-catalog-without" style="<%= jan ? 'display:none;' : '' %>">
                     <select class="sku-exemption-select" data-code="<%= m.商品コード %>" style="font-size:12px; padding:4px;">
-                      <option value="" <%= ex == null ? 'selected' : '' %>>理由: <%= exReason != null ? 'ページ共通 (' + exReason + ')' : '未選択 = 5: 該当製品コードなし' %></option>
+                      <option value="" <%= ex == null ? 'selected' : '' %>>理由: <%= exReason != null ? 'ページ共通 (' + exReason + ')' : (locals.janEnforce ? '未選択 (選ぶまで出品は止まります)' : '未選択 = 5: 該当製品コードなし') %></option>
                       <% for (const [v, label] of exOptions) { %><option value="<%= v %>" <%= ex === v ? 'selected' : '' %>><%= label %></option><% } %>
                     </select>
                   </div>
+                  <%# 🆕 楽天に出せるか (B2 の段 4: 商品マスタに結んであるか・JAN か理由のどちらか 1 つか) %>
+                  <div class="jan-pick-state" data-code="<%= m.商品コード %>"></div>
                   <%# 🆕 Company DB の JAN と比べた印 (B1・知らせだけ) %>
                   <div class="jan-cdb-mark" data-code="<%= m.商品コード %>"></div>
                 </td>
@@ -2489,7 +2520,7 @@ th.attr-unknown { color: #dc2626; }
         <tr style="background:#f8fafc;">
           <td>
             <div style="padding:4px 2px; font-weight:600;">カタログID <span style="color:#dc2626">*必須</span></div>
-            <div class="muted" style="font-size:11px;">JAN (8/12/13桁)。無ければ「IDなし」+ 理由</div>
+            <div class="muted" style="font-size:11px;">JAN は商品マスタから選ぶ。無ければ「IDなし」+ 理由</div>
           </td>
           <td>
             <div style="display:flex; gap:14px; font-size:13px; margin-bottom:4px;">
@@ -2497,17 +2528,28 @@ th.attr-unknown { color: #dc2626; }
               <label style="font-weight:400; cursor:pointer;"><input type="radio" name="rk-catalog-mode" value="without" <%= draft.jan_code ? '' : 'checked' %>> IDなし</label>
             </div>
             <div id="rk-catalog-with" style="<%= draft.jan_code ? '' : 'display:none;' %>">
-              <input type="text" id="f-jan" inputmode="numeric" maxlength="13" style="max-width:220px;"
-                     value="<%= draft.jan_code || '' %>" placeholder="JANコード (8/12/13桁)">
+              <%# 🆕 商品マスタ (Company DB) の JAN から選ぶ (B2 の段 3)。保存に使う #f-jan は隠して持つ (保存の列・未保存の印はそのまま)。
+                  止める設定 (PH_JAN_ENFORCE) が無い間だけ「手で打つ」で出せる %>
+              <div class="jan-pick" data-code="<%= draft.ne_code %>">
+                <select class="jan-pick-select" data-code="<%= draft.ne_code %>" disabled aria-label="JAN (商品マスタから選ぶ)"><option value="">商品マスタの JAN を読んでいます…</option></select>
+                <div class="jan-pick-links">
+                  <a href="/apps/master-edit/sku/<%= encodeURIComponent(String(draft.ne_code || '').trim()) %>" target="_blank" rel="noopener">商品マスタで JAN を足す・直す</a>
+                  <% if (!locals.janEnforce) { %><button type="button" class="jan-manual-toggle">手で打つ (商品マスタに無い JAN・今だけ)</button><% } %>
+                </div>
+              </div>
+              <input type="text" id="f-jan" inputmode="numeric" maxlength="13" style="max-width:220px; margin-top:4px;" hidden
+                     value="<%= draft.jan_code || '' %>" placeholder="JANコード (8/12/13桁)" title="手で打った JAN は商品マスタに結ばれません (止める設定を入れると出品が止まります)">
             </div>
             <div id="rk-catalog-without" style="<%= draft.jan_code ? 'display:none;' : '' %>">
               <select id="rk-catalog-exemption" style="max-width:380px;">
-                <option value="" <%= exReason == null ? 'selected' : '' %>>カタログIDなしの理由 (未選択は 5: 該当製品コードなし で送ります)</option>
+                <option value="" <%= exReason == null ? 'selected' : '' %>><%= locals.janEnforce ? 'カタログIDなしの理由 (選んでください — 未選択のままでは出品は止まります)' : 'カタログIDなしの理由 (未選択は 5: 該当製品コードなし で送ります)' %></option>
                 <% for (const [v, label] of exOptions) { %>
                   <option value="<%= v %>" <%= exReason === v ? 'selected' : '' %>><%= label %></option>
                 <% } %>
               </select>
             </div>
+            <%# 🆕 楽天に出せるか (B2 の段 4: 商品マスタに結んであるか・JAN か理由のどちらか 1 つか) %>
+            <div class="jan-pick-state" data-code="<%= draft.ne_code %>"></div>
             <%# 🆕 Company DB の JAN と比べた印 (B1・知らせだけ) %>
             <div class="jan-cdb-mark" data-code="<%= draft.ne_code %>"></div>
           </td>
@@ -2576,6 +2618,7 @@ th.attr-unknown { color: #dc2626; }
     </table>
     <% } %>
     <button type="button" class="btn btn-sm" id="rk-attr-add">＋ 項目を追加</button>
+    <script type="application/json" id="jan-pick-config"><%- JSON.stringify({ enforce: !!(typeof janEnforce !== 'undefined' && janEnforce), env: (typeof janEnforceEnv !== 'undefined' && janEnforceEnv) || 'PH_JAN_ENFORCE' }).replace(/</g, '\\u003c') %></script>
     <script type="application/json" id="rk-mandatory-json"><%- JSON.stringify(genreDict ? genreDict.attributes.filter((a) => a.mandatory).map((a) => a.name) : []).replace(/</g, '\\u003c') %></script>
     <%# このジャンルで使える属性の候補 (2026-08-31 中原さん要望: 何を入れられるかが分からず、
         既存の類似商品を見て手打ちしている。押すと行が増える形にして、入力欄は必要な分だけにする) %>
@@ -3672,19 +3715,155 @@ th.attr-unknown { color: #dc2626; }
       janCheckBusy = false;
       janCheckLast = j;
       renderJanCheck(j);
+      renderJanPicks(j);   // 🆕 B2 の段 3: 同じ読みで「選ぶ欄」と「楽天に出せるか」の印
       return j;
     })().finally(() => { janCheckRunning = null; });
     return janCheckRunning;
   }
   // 楽天への登録の確認の文に足す一言 (違う / Company DB に無い / 読めない のときだけ)
   function janConfirmNote(j) {
-    if (!j) return '⚠ JAN の比べ: 読めない (商品マスタと比べ終わっていません)。出品は止めません\n\n';
-    if (j.readable === false) return '⚠ JAN を商品マスタ (Company DB) と比べられませんでした (' + (j.reason || '') + ')\n\n';
+    const enforced = !!JAN_PICK_CFG.enforce;
+    // 🆕 B2: 楽天に出せない単位 (商品マスタに結ばれていない など) を先に (止める設定の前は「今は止めません」)
+    const pickBad = ((j && j.picks && j.picks.units) || []).filter((u) => janPickSeverity(u) === 'warn');
+    const pickNote = pickBad.length
+      ? pickBad.map((u) => '⚠ カタログID ' + u.label + ': ' + u.code + (u.fix ? '\n   直し方: ' + u.fix : '')).join('\n')
+        + (enforced ? '\n   この状態では楽天への登録は止まります。\n\n' : '\n   今は止めませんが、止める設定を入れると出せなくなります。\n\n')
+      : '';
+    if (!j) return '⚠ JAN の比べ: 読めない (商品マスタと比べ終わっていません)。' + (enforced ? '登録のときにもう一度確かめます' : '出品は止めません') + '\n\n';
+    if (j.readable === false) return pickNote + '⚠ JAN を商品マスタ (Company DB) と比べられませんでした (' + (j.reason || '') + ')\n\n';
     const warn = (j.units || []).filter((u) => u.severity === 'warn');
-    if (!warn.length) return '';
-    return warn.map((u) => '⚠ JAN ' + u.label + ': ' + u.code + (u.phJan ? ' の JAN ' + u.phJan : '') + (u.detail ? ' — ' + u.detail : '') + (u.fix ? '\n   直し方: ' + u.fix : '')).join('\n')
-      + '\n   出品は止めませんが、確かめてから出してください。\n\n';
+    if (!warn.length) return pickNote;
+    return pickNote + warn.map((u) => '⚠ JAN ' + u.label + ': ' + u.code + (u.phJan ? ' の JAN ' + u.phJan : '') + (u.detail ? ' — ' + u.detail : '') + (u.fix ? '\n   直し方: ' + u.fix : '')).join('\n')
+      + (enforced ? '\n   確かめてから出してください。\n\n' : '\n   出品は止めませんが、確かめてから出してください。\n\n');
   }
+  // ─── 🆕 商品マスタ (Company DB) の JAN から選ぶ (Company DB構想 21 B2 の段 3・中原さんの決定 3 = a) ───
+  // /jan-check の同じ 1 回の読みで返る picks (単位ごとの今の状態と、商品マスタのその商品の有効な JAN) で、選ぶ欄と「楽天に出せるか」の印を出す。
+  // 選んだら /jan-select (サーバーが商品マスタで確かめてから書く)。保存に使う入力 (#f-jan / .sku-jan-input) は隠して持ち、選んだ値と「保存済み」の基準をそろえる。
+  // 止める設定 (PH_JAN_ENFORCE) が無い間は「手で打つ」で今までどおり入れられる (商品マスタには結ばれない = 印が出る)
+  const JAN_PICK_CFG = (() => { try { return JSON.parse(document.getElementById('jan-pick-config').textContent) || {}; } catch (e) { return {}; } })();
+  let skuJanSaver = null;         // SKU 表の JAN の即保存 (initSkuJans が入れる)
+  let skuExemptionSaver = null;   // SKU 表の「IDなしの理由」の即保存 (initSkuGrid が入れる)
+  let janPickSaving = false;
+  function janPickOption(sel, value, text) {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = text;
+    sel.appendChild(o);
+    return o;
+  }
+  function janPickSeverity(u) {
+    if (u.state === 'ok_jan') return 'ok';
+    if (u.state === 'ok_reason') return 'info';
+    if (u.state === 'unreadable') return 'muted';
+    return 'warn';
+  }
+  function renderJanPicks(j) {
+    const picks = j && j.picks;
+    const byCode = new Map(((picks && picks.units) || []).map((u) => [janKey(u.code), u]));
+    document.querySelectorAll('.jan-pick').forEach((box) => {
+      const sel = box.querySelector('.jan-pick-select');
+      if (!sel) return;
+      sel.textContent = '';
+      const u = byCode.get(janKey(box.dataset.code));
+      if (!picks || !picks.readable || !u) {
+        janPickOption(sel, '', '商品マスタを読めない (少し待って開き直す)');
+        sel.disabled = true;
+        sel.title = (picks && picks.reason) || (j && j.reason) || '';
+        return;
+      }
+      sel.title = '';
+      const jans = (u.cdb && u.cdb.jans) || [];
+      if (u.cdb && u.cdb.skuMissing) { janPickOption(sel, '', '商品マスタにこの商品が無い'); sel.disabled = true; return; }
+      if (u.cdb && u.cdb.noJanKind) { janPickOption(sel, '', u.cdb.noJanKind === 'set' ? 'セットは JAN を持たない (「IDなし」で理由を選ぶ)' : '商品マスタでは JAN を持たない商品'); sel.disabled = true; return; }
+      if (!jans.length) { janPickOption(sel, '', '商品マスタにこの商品の JAN が無い (右の「足す」から)'); sel.disabled = true; return; }
+      janPickOption(sel, '', u.linkedRow == null ? '— 商品マスタの JAN から選ぶ —' : '— 選び直す —');
+      for (const x of jans) {
+        const o = janPickOption(sel, String(x.row), x.value + (u.linkedRow === x.row ? '  ✓ 選んである' : ''));
+        o.dataset.value = x.value;
+        if (u.linkedRow === x.row) o.selected = true;
+      }
+      sel.disabled = janPickSaving;
+    });
+    document.querySelectorAll('.jan-pick-state').forEach((el) => {
+      el.textContent = '';
+      const u = byCode.get(janKey(el.dataset.code));
+      if (!picks || !u) return;
+      const sev = janPickSeverity(u);
+      el.appendChild(janPill('楽天のカタログID: ' + u.label + (sev === 'warn' ? (picks.enforce ? ' — 出品は止まります' : ' — 今は止めません') : ''), sev));
+      if (u.text) el.appendChild(janDetail(u.text + (u.detail ? ' (' + u.detail + ')' : '')));
+      if (u.fix) el.appendChild(janDetail('直し方: ' + u.fix));
+      if (sev === 'warn' && !picks.enforce) el.appendChild(janDetail('止める設定 (' + (JAN_PICK_CFG.env || 'PH_JAN_ENFORCE') + ') を入れると、この状態では楽天に出せなくなります'));
+    });
+  }
+  // 選んだ値を、保存に使う入力と「保存済み」の基準にそろえる (同じ値を手の道で送り直さない・未保存の印を出さない)
+  function applyPickedJan(code, jan, clearedReason) {
+    const single = document.getElementById('f-jan');
+    if (single) {
+      single.value = jan;
+      lastSavedJan = jan;
+      janSaveUnknown = false;
+      if (phKeep) phKeep.savedValue('f-jan', jan);
+      if (clearedReason) {
+        const ex = document.getElementById('rk-catalog-exemption');
+        if (ex) { ex.value = ''; if (phKeep) phKeep.savedValue('rk-catalog-exemption', ''); }
+      }
+      return;
+    }
+    const input = [...document.querySelectorAll('.sku-jan-input')].find((i) => janKey(i.dataset.code) === janKey(code));
+    if (input) {
+      input.value = jan;
+      if (skuJanSaver) skuJanSaver.markSaved(input, jan);
+    }
+    if (clearedReason) {
+      const ex = [...document.querySelectorAll('.sku-exemption-select')].find((i) => janKey(i.dataset.code) === janKey(code));
+      if (ex) { ex.value = ''; if (skuExemptionSaver) skuExemptionSaver.markSaved(ex, ''); }
+    }
+  }
+  async function pickJan(sel) {
+    const box = sel.closest('.jan-pick');
+    const o = sel.selectedOptions && sel.selectedOptions[0];
+    if (!box || !o || !o.value || !o.dataset.value) return;
+    const code = box.dataset.code;
+    janPickSaving = true;
+    document.querySelectorAll('.jan-pick-select').forEach((s) => { s.disabled = true; });
+    box.classList.add('jan-pick-saving');
+    const result = document.getElementById('rk-result');
+    try {
+      // 先に手の道の保存を確定させる (選んだ値を古い保存が後から上書きしないように)
+      if (!(await saveJanIfChanged())) return;
+      if (!(await flushSkuJanSaves())) return;
+      let json;
+      try {
+        json = await post(BASE + '/jan-select', { code, row: o.value, value: o.dataset.value });
+      } catch (e) {
+        alert('通信エラーで JAN を選べませんでした。画面を開き直して確かめてください');
+        return;
+      }
+      if (!json || !json.ok) { alert((json && json.error) || 'JAN を選べませんでした'); return; }
+      applyPickedJan(code, json.jan, json.clearedReason);
+      if (result) result.textContent = 'JAN を商品マスタから選びました (' + code + ' = ' + json.jan + (json.clearedReason ? '・カタログIDなしの理由は外しました' : '') + ')';
+    } finally {
+      janPickSaving = false;
+      box.classList.remove('jan-pick-saving');
+      refreshJanCheck();
+    }
+  }
+  document.addEventListener('change', (ev) => {
+    const t = ev.target;
+    if (t && t.classList && t.classList.contains('jan-pick-select')) pickJan(t);
+  });
+  // 「手で打つ」(止める設定の前だけ): 隠してある保存用の入力を出す
+  document.addEventListener('click', (ev) => {
+    const b = ev.target && ev.target.closest && ev.target.closest('.jan-manual-toggle');
+    if (!b) return;
+    const wrap = b.closest('#rk-catalog-with, .sku-catalog-with');
+    const input = wrap && wrap.querySelector('#f-jan, .sku-jan-input');
+    if (!input) return;
+    if (!b.dataset.label) b.dataset.label = b.textContent;
+    input.hidden = !input.hidden;
+    b.textContent = input.hidden ? b.dataset.label : 'しまう';
+    if (!input.hidden) input.focus();
+  });
   refreshJanCheck();
 
   // 読み直しの関所。この画面の読み直しは**すべてここを通す** (ほかの場所で location.reload を直に呼ばない)。
@@ -5857,7 +6036,7 @@ th.attr-unknown { color: #dc2626; }
   (function initSkuJans() {
     const inputs = [...document.querySelectorAll('.sku-jan-input')];
     if (inputs.length === 0) return;
-    createSkuSaver({
+    skuJanSaver = createSkuSaver({
       inputs, label: 'JANコード',
       send: (input, value) => {
         const p = post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
@@ -5879,7 +6058,7 @@ th.attr-unknown { color: #dc2626; }
       inputs: [...grid.querySelectorAll('.sku-attr-input')], label: '商品仕様',
       send: (input, value) => post(BASE + '/sku-attributes', { ne_code: input.dataset.code, name: input.dataset.name, value }),
     });
-    createSkuSaver({
+    skuExemptionSaver = createSkuSaver({
       inputs: [...grid.querySelectorAll('.sku-exemption-select')], label: 'カタログIDなしの理由',
       send: (input, value) => post(BASE + '/sku-catalog-exemptions', { ne_code: input.dataset.code, reason: value }),
     });
