@@ -222,6 +222,26 @@ await t('maintainInventory: 保持の日数より古い置き換え済みの観�
   const jr = await one(`select job_id, status, summary from ops.job_runs order by job_run_id desc limit 1`);
   assert.equal(jr.job_id, JOB_ID); assert.equal(jr.status, 'ok'); assert.match(jr.summary, /"purged_observations":1/); assert.match(jr.summary, new RegExp(`"keep_days":${keepDays}`)); assert.match(jr.summary, /db_mb/);
 });
+// 🆕 #1711 Codex R1 Medium: 既定 (keepDays を渡さない) の境目 = 今日から 30 日。別の DB で今日から相対の日付だけを使う (日がたっても結果が変わらない)
+await t('maintainInventory の既定の保持 (keepDays を渡さない) = 今日から 30 日: 置き換え済みでも 29 日前は残り、31 日前は消える。置き換わっていない古い観測は残る', async () => {
+  const pg2 = new PGlite();
+  const db2 = pgliteAdapter(pg2);
+  await applyMigrations(db2, { log: quiet });
+  const run = (id, daysAgo) => pg2.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, started_at, finished_at, status, complete, checksum) values ($1, 'logizard', 'inventory', $2, now() - make_interval(days => $3::integer), now() - make_interval(days => $3::integer), 'success', true, $1)`, [id, SCOPE, daysAgo]);
+  const obs = (runId, key, hash, daysAgo) => pg2.query(`insert into raw.${RAW_SRC}_observations (ingest_run_id, scope_key, business_key, content_hash, fetch_status, observed_at) values ($1, $2, $3, $4, 'ok', now() - make_interval(days => $5::integer))`, [runId, SCOPE, key, hash, daysAgo]);
+  await pg2.query(`insert into raw.${RAW_SRC}_contents (content_hash, payload) values ('h-31', '{"商品ID":"D31","在庫数":1}'), ('h-29', '{"商品ID":"D29","在庫数":1}'), ('h-40', '{"商品ID":"D40","在庫数":1}'), ('h-new', '{"商品ID":"NEW","在庫数":2}')`);
+  await run('r-40', 40); await run('r-31', 31); await run('r-29', 29); await run('r-1', 1);
+  await obs('r-40', 'D40|P3FA|001|良品|-|-', 'h-40', 40);   // 後の観測が無い = 鍵の最新の状態 = 古くても残る
+  await obs('r-31', 'D31|P3FA|001|良品|-|-', 'h-31', 31); await obs('r-1', 'D31|P3FA|001|良品|-|-', 'h-new', 1);
+  await obs('r-29', 'D29|P3FA|001|良品|-|-', 'h-29', 29); await obs('r-1', 'D29|P3FA|001|良品|-|-', 'h-new', 1);
+  const m = await maintainInventory(db2, { host: 'test' });
+  assert.equal(m.purged, 1);
+  const left = (await pg2.query(`select ingest_run_id || ':' || split_part(business_key, '|', 1) as k from raw.${RAW_SRC}_observations order by 1`)).rows.map((r) => r.k);
+  assert.deepEqual(left, ['r-1:D29', 'r-1:D31', 'r-29:D29', 'r-40:D40']);
+  assert.deepEqual((await pg2.query(`select content_hash from raw.${RAW_SRC}_contents order by 1`)).rows.map((r) => r.content_hash), ['h-29', 'h-40', 'h-new']);
+  assert.match((await pg2.query(`select summary from ops.job_runs order by job_run_id desc limit 1`)).rows[0].summary, /"keep_days":30[,}]/);
+  await pg2.close();
+});
 
 console.log('mirror の読み取り');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-inv-'));
