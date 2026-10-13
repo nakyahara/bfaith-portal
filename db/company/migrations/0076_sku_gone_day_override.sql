@@ -10,7 +10,7 @@
 -- なにを:
 --   1. ops.sku_gone_from_ne_day_overrides (許可: SKU・必要な日数 1〜3・だれ・理由・作った時刻・期限 (作った時刻 + 1〜14 日)・request_id・DB のロール)。
 --      追記だけ (変えない・消さない・TRUNCATE しない)・書くのは下の関数だけ (取引の中の印)。期限切れの許可は効かない (= 3 日に戻る)。同じ SKU に何件あっても
---      効くのは期限の中の一番新しい許可 1 つ
+--      効くのは一番新しい許可 1 つ (それが期限切れなら許可なし = 古い許可はよみがえらない)
 --   2. ops.add_sku_gone_day_overrides(request_id, 人, 理由, コードの配列, 日数, 有効な日数) = 許可を足す (security definer・運用のロール master_ops だけに実行・
 --      1〜100 件を 1 つの取引で全部か何も無いか・コードは Company DB の業務で使える単品 / セット・同じ request_id の押し直し = 前の答え・違う中身 = request_id_reused)
 --   3. ops.sku_gone_from_ne_check (0072 の版から写して 🆕 0076 の行だけ足した): 期限の中の許可がある SKU は「3 日」の代わりに許可の日数。
@@ -54,12 +54,15 @@ create trigger trg_sku_gone_day_overrides_no_truncate before truncate on ops.sku
   for each statement execute function core.reject_mutation();
 
 -- ═══════════ 4. 効いている許可 (読むだけ・部品) ═══════════
-/** その SKU に今効いている許可 (期限の中の一番新しい 1 つ)。無い = 全部の列が null の行 */
+/**
+ * その SKU に今効いている許可。**一番新しい許可を 1 つ選んでから期限を見る** (切れていれば許可なし = 3 日)。無い = 全部の列が null の行。
+ *   🆕 #1709 Codex R1 Low 1: 「期限の中の一番新しい」にしない = 新しい許可が先に切れたときに、古い許可がよみがえらない
+ */
 create function ops.sku_gone_day_override_active(p_sku_id bigint) returns ops.sku_gone_from_ne_day_overrides
   language sql stable security definer set search_path = pg_catalog, pg_temp as $$
-  select o.* from ops.sku_gone_from_ne_day_overrides o
-   where o.sku_id = p_sku_id and o.company_id = 1 and o.expires_at > pg_catalog.clock_timestamp()
-   order by o.created_at desc, o.override_id desc limit 1
+  select l.* from (select o.* from ops.sku_gone_from_ne_day_overrides o where o.sku_id = p_sku_id and o.company_id = 1
+                    order by o.created_at desc, o.override_id desc limit 1) l
+   where l.expires_at > pg_catalog.clock_timestamp()
 $$;
 revoke all on function ops.sku_gone_day_override_active(bigint) from public;
 

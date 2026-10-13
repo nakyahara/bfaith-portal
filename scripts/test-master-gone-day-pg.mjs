@@ -88,7 +88,7 @@ try {
       values ((select 1), 1, 'a@b', 'x', gen_random_uuid(), 't', now() + interval '1 day')`)))?.code, '42501');
     const dry0 = await runGone(pgAdapter(MO), { apply: false, codes: ['agnbathp-hw', 'smbhcg', 'smbhcs'] }, { log: quiet });
     assert.ok(dry0.checks.every((r) => !r.ok && r.problems.length === 1 && r.problems[0].reason === 'absent_short'), JSON.stringify(dry0.checks.map((r) => r.problems)));
-    const add = await runDayOverride(pgAdapter(MO), parseDayArgs(['--codes', 'agnbathp-hw,smbhcg', '--days', '1', '--apply', '--actor', 'naka@test', '--reason', '決定 B (1 日前倒し)', '--yes']), { log: quiet });
+    const add = await runDayOverride(pgAdapter(MO), parseDayArgs(['--codes', 'agnbathp-hw,smbhcg', '--days', '1', '--apply', '--request-id', crypto.randomUUID(), '--actor', 'naka@test', '--reason', '決定 B (1 日前倒し)', '--yes']), { log: quiet });
     assert.equal(add.exitCode, 0, JSON.stringify(add.error));
     assert.deepEqual((await q('select distinct db_user from ops.sku_gone_from_ne_day_overrides')).map((r) => r.db_user), ['master_ops']);
     const dry = await runGone(pgAdapter(MO), { apply: false, codes: ['agnbathp-hw', 'smbhcg', 'smbhcs'] }, { log: quiet });

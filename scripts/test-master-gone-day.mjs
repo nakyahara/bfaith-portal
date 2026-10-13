@@ -110,9 +110,9 @@ async function asOps(fn) { await pg.query('set role master_ops'); try { return a
 
 const single = (code) => ({ code, name: `商品 ${code}`, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 3,
   cost: { jpy: 100, source: 'ne', status: 'COMPLETE' }, standardPriceJpy: 1000, shippingCode: 'S02', shippingMethod: '宅急便', shippingCostJpy: 520, reorderMonths: 2 });
-const SINGLES = ['d01', 'd02', 'd03', 'd04', 'd05', 'd06', 'd07', 'd08', 'c01'];
+const SINGLES = ['d01', 'd02', 'd03', 'd04', 'd05', 'd06', 'd07', 'd08', 'c01', 'b01', 'b02', 'b03', 'b04', 'b05', 'b06', 'b07'];
 const PLAN = {
-  skus: [...SINGLES.map(single), { ...single('dset'), kind: 'set', cost: { jpy: 200, source: 'set_calc', status: 'COMPLETE' } }],
+  skus: [...SINGLES.map(single), { ...single('dset'), kind: 'set', cost: { jpy: 200, source: 'set_calc', status: 'COMPLETE' } }, { ...single('bset'), kind: 'set', cost: { jpy: 200, source: 'set_calc', status: 'COMPLETE' } }],
   variationGroups: [], setComponents: [{ parentCode: 'dset', childCode: 'c01', qty: 1, source: 'ne' }],
   listings: [], observations: [], physicals: [], compliance: [], workers: [],
   suppliers: [{ code: '0001', name: 'AMC' }], supplierSkus: [], reorder: { available: false, runId: null, reason: '試験' },
@@ -148,7 +148,7 @@ async function feed(gone, when) {
     await pg.query('commit');
   } catch (e) { await pg.query('rollback'); throw e; }
 }
-const GONE = ['d01', 'd02', 'd03', 'd04', 'd05', 'd06', 'd07', 'd08', 'c01'];
+const GONE = ['d01', 'd02', 'd03', 'd04', 'd05', 'd06', 'd07', 'd08', 'c01', 'b02', 'b03', 'b04', 'b05', 'b06', 'b07', 'bset'];   // b01 = 一番新しい取得にある
 await feed(GONE, new Date(Math.max(Date.now() - 20 * 60e3, Date.parse(`${jstToday()}T00:01:00+09:00`))));
 const check = async (code) => (await one('select ops.sku_gone_from_ne_check($1::bigint) as r', [await sid(code)])).r;
 const reasons = (c) => c.problems.map((p) => p.reason).sort();
@@ -178,12 +178,23 @@ await ta('[A2] 許可 (1 日) がある = 1 日でやめられる・答えと根
   // 許可の無い SKU は 3 日のまま
   assert.deepEqual(reasons(await check('d03')), ['absent_short']);
 });
-await ta('[A3] 期限切れの許可 = 効かない (3 日に戻る)・同じ SKU は期限の中の一番新しい許可が効く', async () => {
+await ta('[A3] 期限切れの許可 = 効かない (3 日に戻る)・同じ SKU は一番新しい許可が効く (それが期限切れなら許可なし = 古い許可はよみがえらない)', async () => {
   await pg.query('begin');
   try {
     await pg.query("select set_config('ops.gone_day_override_protocol', '1', true)");
     await q(`insert into ops.sku_gone_from_ne_day_overrides (sku_id, required_days, actor_id, reason, request_id, db_user, created_at, expires_at)
       values ($1, 1, 'naka@test', '古い許可', gen_random_uuid(), 't', now() - interval '3 days', now() - interval '1 day')`, [await sid('d03')]);
+    await pg.query("select set_config('ops.gone_day_override_protocol', '', true)");
+    const c = await check('d03');
+    assert.deepEqual(reasons(c), ['absent_short']); assert.equal(c.required_runs, 3); assert.equal(c.day_override, undefined);
+  } finally { await pg.query('rollback'); }
+  // 🆕 #1709 Codex R1 Low 1: 古い 1 日 (期限の中) + 新しい 3 日 (期限切れ) = 新しい方を選んでから期限を見る = 許可なし (3 日)・古い 1 日はよみがえらない
+  await pg.query('begin');
+  try {
+    await pg.query("select set_config('ops.gone_day_override_protocol', '1', true)");
+    await q(`insert into ops.sku_gone_from_ne_day_overrides (sku_id, required_days, actor_id, reason, request_id, db_user, created_at, expires_at)
+      values ($1, 1, 'naka@test', '古い 1 日 (期限の中)', gen_random_uuid(), 't', now() - interval '2 days', now() + interval '5 days'),
+             ($1, 3, 'naka@test', '新しい 3 日 (期限切れ)', gen_random_uuid(), 't', now() - interval '1 day', now() - interval '1 hour')`, [await sid('d03')]);
     await pg.query("select set_config('ops.gone_day_override_protocol', '', true)");
     const c = await check('d03');
     assert.deepEqual(reasons(c), ['absent_short']); assert.equal(c.required_runs, 3); assert.equal(c.day_override, undefined);
@@ -202,6 +213,53 @@ await ta('[B1] 許可があっても、出品の構成・セットの構成品�
   const e2 = await errOf(async () => opsDb.query('select ops.cancel_sku_gone_from_ne($1::uuid, $2, $3, $4::bigint)', [crypto.randomUUID(), 'naka@test', 'x', await sid('d04')]));
   assert.match(e2?.message ?? '', /not_gone_from_ne: .*販路の出品の構成/);
   assert.equal(await regOf('d04'), 'available');
+});
+
+await ta('[B2] 許可 (1 日) があっても止まる理由 (表): in_ne_latest・in_ne_codes・fetch_old・live_file・listing_component_deleted・parent_of_others・own_component_request (それぞれ取引の中で作って巻き戻す)', async () => {
+  await addOv(['b01', 'b02', 'b03', 'b04', 'b05', 'b06', 'b07', 'bset'], 1);
+  const TABLE = [
+    ['in_ne_latest', 'b01', async () => {}],
+    ['in_ne_codes', 'b02', async () => q(`insert into ops.master_ne_codes (code_norm, kind, state, ne_code, spellings) values ('b02', 'product', 'ok', 'b02', '["b02"]'::jsonb)`)],
+    ['fetch_old', 'b03', async () => {
+      await pg.query("select set_config('ops.parent_gate_protocol', '1', true)");
+      const old = (await one(`insert into ops.master_parent_gate_results (company_id, compare_run_id, ne_generation_id, ne_raw_hash, products_complete_at, setproducts_complete_at, material_generation_id,
+          evidence_sha256, obs_hash, counts, counted, excluded, samples, owner_at_record, recorded_by)
+        values (1, 'mc_old_x', 'ne_old', repeat('1', 64), now() - interval '40 hours', now() - interval '1 hour', 'mat_x', repeat('2', 64), repeat('3', 64), '{}'::jsonb, 0, '{}'::jsonb, '{}'::jsonb, 'load', 't') returning result_id`)).result_id;
+      await pg.query("select set_config('ops.ne_absence_protocol', '1', true)");
+      await q('update ops.master_ne_absence_mark set result_id = $1', [old]);
+      await q('update ops.master_ne_absence set last_absent_result_id = $1', [old]);
+    }],
+    ['live_file', 'b04', async () => {
+      await q('alter table ops.ne_reg_export_items disable trigger trg_ne_reg_items_parent_gate');   // 0068 の門はこの試験の外 (取引ごと戻す)
+      await q(`with e as (insert into ops.ne_reg_exports (kind, schema_version, header, encoding, trial, item_count, row_count, aggregate_token, payload_hash, sha256, file_bytes, request_id, ne_codes_run, cost_day, created_by)
+          values ('products', 'ne-reg-single-v2', 'syohin_code', 'utf8', false, 1, 1, repeat('a', 64), repeat('b', 64), repeat('c', 64), '\\x00', gen_random_uuid(), 'x', current_date, 't') returning export_id)
+        insert into ops.ne_reg_export_items (export_id, sku_id, code_norm, ne_code, sku_kind, item_token, expected, snapshot_hash, row_from, row_to, state_changed_by, state)
+        select e.export_id, k.sku_id, k.code_norm, k.code, k.sku_kind, repeat('e', 64), '{}'::jsonb, repeat('f', 64), 1, 1, 't', 'built' from e, core.skus k where k.code = 'b04'`);
+    }],
+    ['listing_component_deleted', 'b05', async () => {
+      const lid = (await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'rakuten', 'main', 'r-b05', 'deleted') returning listing_id`)).listing_id;
+      await q(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type) values (1, $1, $2, 1, 0, 'exact', 'system')`, [lid, await sid('b05')]);
+    }],
+    ['parent_of_others', 'b06', async () => {
+      await pg.query("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())");
+      await q(`update core.products set parent_product_id = (select product_id from core.skus where code = 'b06'), parent_set_by = 'manual' where product_id = (select product_id from core.skus where code = 'd07')`);
+    }],
+    ['own_component_request', 'bset', async () => q(`insert into ops.sku_component_requests (company_id, set_sku_id, rows, rows_hash, base_rows, requested_by, edit_request_id) values (1, $1, $2::jsonb, $3, '[]'::jsonb, 't', gen_random_uuid())`,
+      [await sid('bset'), JSON.stringify([{ sku_id: Number(await sid('b07')), code: 'b07', qty: 1, sort: 1 }]), '9'.repeat(64)])],
+  ];
+  for (const [want, code, setup] of TABLE) {
+    await pg.query('begin');
+    try {
+      await setup();
+      const c = await check(code);
+      assert.equal(c.required_runs, 1, code); assert.ok(c.day_override, code);
+      assert.deepEqual(reasons(c), [want], `${code}: ${JSON.stringify(c.problems)}`);
+      const e = await errOf(async () => pg.query('select ops.cancel_sku_gone_from_ne($1::uuid, $2, $3, $4::bigint)', [crypto.randomUUID(), 'naka@test', 'x', await sid(code)]));
+      assert.match(e?.message ?? '', /not_gone_from_ne/, code);
+    } finally { await pg.query('rollback'); }
+  }
+  // 止まる理由が無いもの (表の後) = 許可 1 日でやめてよい
+  for (const code of ['b02', 'b03', 'b04', 'b05', 'b06', 'bset']) assert.equal((await check(code)).ok, true, code);
 });
 
 // ═══════════ [P] 計画のハッシュ ═══════════
@@ -270,10 +328,18 @@ await ta('[K1] 引数: コードが要る・--apply は --actor・--reason・--y
   assert.throws(() => parseDayArgs(['--codes', 'a', '--apply', '--actor', 'a@b', '--reason', 'x']), /--yes/);
   assert.throws(() => parseDayArgs(['--codes', 'a', '--days', '0']), /1〜3/);
   assert.throws(() => parseDayArgs(['--codes', 'a', '--valid-days', '30']), /1〜14/);
-  const o = parseDayArgs(['--codes', 'a,b', '--days', '1', '--apply', '--actor', 'a@b', '--reason', '決定 B', '--yes']);
-  assert.deepEqual([o.codes, o.days, o.validDays, o.apply], [['a', 'b'], 1, 7, true]);
-  assert.equal(okWithDays({ ok: false, problems: [{ reason: 'absent_short' }], streak: 1 }, 1), true);
-  assert.equal(okWithDays({ ok: false, problems: [{ reason: 'absent_short' }, { reason: 'listing_component' }], streak: 1 }, 1), false);
+  // 🆕 #1709 Codex R1 M1: --apply は --request-id (確かめが出した UUID) が要る
+  assert.throws(() => parseDayArgs(['--codes', 'a,b', '--days', '1', '--apply', '--actor', 'a@b', '--reason', '決定 B', '--yes']), /--request-id/);
+  assert.throws(() => parseDayArgs(['--codes', 'a', '--request-id', 'x']), /UUID/);
+  const rid = crypto.randomUUID();
+  const o = parseDayArgs(['--codes', 'a,b', '--days', '1', '--apply', '--request-id', rid.toUpperCase(), '--actor', 'a@b', '--reason', '決定 B', '--yes']);
+  assert.deepEqual([o.codes, o.days, o.validDays, o.apply, o.requestId], [['a', 'b'], 1, 7, true, rid]);
+  assert.equal(okWithDays({ sku_id: '1', ok: false, problems: [{ reason: 'absent_short' }], streak: 1 }, 1), true);
+  assert.equal(okWithDays({ sku_id: '1', ok: false, problems: [{ reason: 'absent_short' }, { reason: 'listing_component' }], streak: 1 }, 1), false);
+  // 🆕 #1709 Codex R1 M2: 今の r.ok を信じない (今の 1 日の許可で ok・1 日無い SKU に --days 3 = やめない)
+  assert.equal(okWithDays({ sku_id: '1', ok: true, problems: [], streak: 1 }, 3), false);
+  assert.equal(okWithDays({ sku_id: '1', ok: true, problems: [], streak: 3 }, 3), true);
+  assert.equal(okWithDays({ sku_id: null, ok: false, problems: [{ reason: 'no_sku' }] }, 1), false);
 });
 await ta('[K2] 確かめ (既定) = 何も書かない・許可を足したらやめてよいか / --apply = 足す (master_ops・だれ・理由・期限)', async () => {
   const n0 = (await one('select count(*)::int as n from ops.sku_gone_from_ne_day_overrides')).n;
@@ -284,12 +350,24 @@ await ta('[K2] 確かめ (既定) = 何も書かない・許可を足したら�
   assert.equal(dry.mode, 'dry-run');
   assert.equal((await one('select count(*)::int as n from ops.sku_gone_from_ne_day_overrides')).n, n0);
   assert.ok(lines.some((l) => /✅ d03/.test(l)) && lines.some((l) => /⛔ d04/.test(l)), lines.join('\n'));
-  const r = await runDayOverride(opsDb, parseDayArgs(['--codes', 'd03', '--days', '1', '--valid-days', '3', '--apply', '--actor', 'Naka@Test', '--reason', '決定 B', '--yes']), { log: quiet });
+  // 今の許可 (b02 = 1 日) と違う --days 3 = 1/3 日なので やめない と出す (今の ok を信じない)
+  const l3 = [];
+  await runDayOverride(opsDb, parseDayArgs(['--codes', 'b02', '--days', '3']), { log: (l) => l3.push(l) });
+  assert.ok(l3.some((l) => /⛔ b02/.test(l)) && l3.some((l) => /今の許可 1 日/.test(l)), l3.join('\n'));
+  const rid = lines.map((l) => /--request-id ([0-9a-f-]{36})/.exec(l)).find(Boolean)?.[1];
+  assert.ok(rid && rid === dry.requestId, '確かめが --apply に使う request_id を出す');
+  const args = ['--codes', 'd03', '--days', '1', '--valid-days', '3', '--apply', '--request-id', rid, '--actor', 'Naka@Test', '--reason', '決定 B', '--yes'];
+  const r = await runDayOverride(opsDb, parseDayArgs(args), { log: quiet });
   assert.equal(r.exitCode, 0); assert.equal(r.added.overrides[0].code, 'd03');
+  // 🆕 #1709 Codex R1 M1: 同じコマンドの押し直し (接続が切れて答えが分からなかった) = 前の答え・許可は増えない・期限も延びない
+  const nBefore = (await one('select count(*)::int as n, max(expires_at)::text as e from ops.sku_gone_from_ne_day_overrides'));
+  const again = await runDayOverride(opsDb, parseDayArgs(args), { log: quiet });
+  assert.equal(again.exitCode, 0); assert.equal(again.added.replayed, true); assert.deepEqual(again.added.overrides, r.added.overrides);
+  assert.deepEqual(await one('select count(*)::int as n, max(expires_at)::text as e from ops.sku_gone_from_ne_day_overrides'), nBefore);
   const row = await one(`select o.actor_id, o.reason, o.required_days, o.db_user, extract(epoch from o.expires_at - o.created_at)::int as v from ops.sku_gone_from_ne_day_overrides o join core.skus k on k.sku_id = o.sku_id where k.code = 'd03'`);
   assert.deepEqual(row, { actor_id: 'naka@test', reason: '決定 B', required_days: 1, db_user: 'master_ops', v: 3 * 86400 });
   assert.equal((await check('d03')).ok, true);
-  const bad = await runDayOverride(opsDb, parseDayArgs(['--codes', 'zz-none', '--apply', '--actor', 'a@b', '--reason', 'x', '--yes']), { log: quiet });
+  const bad = await runDayOverride(opsDb, parseDayArgs(['--codes', 'zz-none', '--apply', '--request-id', crypto.randomUUID(), '--actor', 'a@b', '--reason', 'x', '--yes']), { log: quiet });
   assert.equal(bad.exitCode, 1);
 });
 

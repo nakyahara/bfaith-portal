@@ -10,8 +10,9 @@
  * 使い方 (miniPC の PowerShell・リポジトリ直下。接続 = env COMPANY_DB_MASTER_OPS_URL (運用のロール master_ops) か --url):
  *   # 確かめ (読むだけ・既定) = 今の答え (NE に無い日数・止まる理由・今効いている許可) と、許可を足したら やめてよい になるか
  *   node -r dotenv/config scripts/company-db/master-gone-day-override.mjs --codes-file drift18.txt --days 1
- *   # 許可を足す (🚨 確かめの答えを中原さんが見て OK の後だけ・全部か何も無いか)
- *   node -r dotenv/config scripts/company-db/master-gone-day-override.mjs --apply --codes-file drift18.txt --days 1 --valid-days 7 --actor <人のメール> --reason "<理由>" --yes
+ *   # 許可を足す (🚨 確かめの答えを中原さんが見て OK の後だけ・全部か何も無いか)。--request-id = 確かめが出した UUID (必須・🆕 #1709 Codex R1 M1:
+ *   #   接続が切れて答えが分からないときは、同じコマンド (同じ request_id) をもう一度 = 前の答えが返る・許可は増えない・期限も延びない)
+ *   node -r dotenv/config scripts/company-db/master-gone-day-override.mjs --apply --request-id <確かめが出した UUID> --codes-file drift18.txt --days 1 --valid-days 7 --actor <人のメール> --reason "<理由>" --yes
  * 終了コード: 0 = 確かめを出した / 許可を足した・1 = 断られた・つながらない・2 = 引数が違う
  */
 import fs from 'node:fs';
@@ -40,7 +41,7 @@ export function parseDayArgs(argv) {
     else if (a === '--valid-days') { o.validDays = int(need(i, a), a, 1, 14); i++; }
     else if (a === '--actor') { o.actor = need(i, a); i++; }
     else if (a === '--reason') { o.reason = need(i, a); i++; }
-    else if (a === '--request-id') { const v = need(i, a); if (!/^[0-9a-f-]{36}$/.test(v)) throw fail('--request-id は UUID'); o.requestId = v; i++; }
+    else if (a === '--request-id') { const v = need(i, a).toLowerCase(); if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(v)) throw fail('--request-id は UUID'); o.requestId = v; i++; }
     else if (a === '--json') { o.json = need(i, a); i++; }
     else if (a === '--url') { o.url = need(i, a); i++; }
     else throw fail(`知らない引数: ${a}`);
@@ -51,14 +52,20 @@ export function parseDayArgs(argv) {
     if (!o.actor || !/^[^\s@]+@[^\s@]+$/.test(o.actor)) throw fail('--apply は --actor <人のメール> が要る');
     try { o.reason = goneReasonOf(o.reason); } catch (e) { throw fail(`--reason: ${e.message}`); }
     if (!o.yes) throw fail('--apply は --yes が要る (確かめの答えを見て OK をもらった後だけ)');
+    // 🆕 #1709 Codex R1 M1: 押し直しを冪等に = request_id は人が渡す (確かめが出した UUID)。無いと、接続が切れた後の押し直しで別の許可が足され期限も延びる
+    if (!o.requestId) throw fail('--apply は --request-id <確かめが出した UUID> が要る (押し直しは同じ request_id で = 許可は増えない)');
   }
   return o;
 }
 
-/** 許可 (days 日) を足したら やめてよい になるか = 止まる理由が「日数が足りない」だけで、続けて無い日数 >= days */
+/**
+ * 許可 (days 日) を足したら やめてよい になるか = 「日数が足りない」のほかに止まる理由が無く、続けて無い日数 >= days。
+ *   🆕 #1709 Codex R1 M2: 今の r.ok は信じない (今効いている別の日数の許可で ok になっていることがある = --days 3 なら 1/3 日は やめない)
+ */
 export const okWithDays = (r, days) => {
-  const ps = (r.problems || []).map((p) => p.reason);
-  return r.ok === true || (ps.length > 0 && ps.every((x) => x === 'absent_short') && Number(r.streak || 0) >= days);
+  if (!r || !r.sku_id) return false;
+  const other = (r.problems || []).filter((p) => p.reason !== 'absent_short');
+  return other.length === 0 && Number(r.streak || 0) >= days;
 };
 
 /** 本体 (試験は db を渡す)。戻り値 = { mode, checks, added, exitCode, error? } */
@@ -73,8 +80,12 @@ export async function runDayOverride(db, opts, { log = console.log } = {}) {
     log(`${okWithDays(r, opts.days) ? '✅' : '⛔'} ${r.code ?? '(?)'}  NE に無い ${r.streak ?? 0}/${r.required_runs ?? '?'} 日${ov}`);
     for (const p of r.problems || []) log(`      - ${GONE_REASON_WORDS[p.reason] || p.reason}: ${p.text}`);
   }
-  if (!opts.apply) return { mode: 'dry-run', checks, added: null, exitCode: 0 };
-  const requestId = opts.requestId || crypto.randomUUID();
+  if (!opts.apply) {
+    const rid = crypto.randomUUID();
+    log(`足すときは、この request_id で --apply (押し直しも同じ request_id で): --request-id ${rid}`);
+    return { mode: 'dry-run', checks, added: null, exitCode: 0, requestId: rid };
+  }
+  const requestId = opts.requestId;
   try {
     const r = (await db.query(`select ops.add_sku_gone_day_overrides($1::uuid, $2, $3, $4::text[], $5::integer, $6::integer) as r`,
       [requestId, opts.actor.trim().toLowerCase(), opts.reason, codes, opts.days, opts.validDays])).rows[0].r;
