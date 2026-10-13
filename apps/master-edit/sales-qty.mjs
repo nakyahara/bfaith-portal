@@ -33,6 +33,8 @@ async function mirrorDb() {
   const { getMirrorDB } = await import('../warehouse-mirror/db.js');
   return getMirrorDB();
 }
+/** 🆕 #1702: ne-delete-pml.mjs (NE から消す確かめの NE の在庫の列) も同じ写しを読む = 試験の差し替え (__setSalesMirrorProvider) が両方に効く */
+export const salesMirrorDb = () => mirrorDb();
 
 /** 'YYYY-MM-DD' に日を足す */
 export function addDays(ymd, n) {
@@ -66,6 +68,7 @@ function runOf(pub, now) {
 }
 /** 読み取りの取引 (better-sqlite3 の transaction。無い db = そのまま) */
 const inTx = (db, fn) => (typeof db.transaction === 'function' ? db.transaction(fn)() : fn());
+export const salesMirrorTx = inTx;
 /**
  * 取引の中で公開の回を読み直す。変わっていたら run をその回に直す (同じ物を見出しにも使う)。読めない形になった = ok: false に直して null を返す
  */
@@ -169,40 +172,5 @@ function readSalesSkuTx(db, run, key) {
       malls = { ok: false, rows: [] };
     }
     return { ok: true, run, row: r ? rowOf(r) : null, malls };
-  }
-}
-
-/**
- * 🆕 0072 (NE から消す CSV・決定 Q3 a): 商品管理リストの公開の回の在庫の列 (NE の在庫・引当・発注残 (NE の古い値)・FBA の在庫)。
- *   総在庫数 = NE の在庫 + FBA の在庫 (build-product-management-snapshot.js) = NE の在庫 = 総在庫数 − FBA在庫数。
- *   いつの NE の在庫か = src_ne_products_synced_at (毎朝の NE の取得)。STOCK_PML_MAX_AGE_MS より古い・読めない = ok: false (= 消す CSV に入れない)。
- *   ポインタと明細を 1 つの読み取りの取引で (回の切り替えを挟んでも食い違わない)。
- * 戻り値 = { ok: true, runId, neSyncedAt, map: Map(normProductCode(コード) → { total, fba, allocated, onOrder }) } / { ok: false, error }
- *   Map に無いコード = 商品管理リストに無い (= 在庫を確かめられない)
- */
-export const STOCK_PML_MAX_AGE_MS = 36 * 3600e3;
-const intOrNull = (v) => (v == null || v === '' || !Number.isInteger(Number(v)) ? null : Number(v));
-export async function readPmlStock(codes, { now = Date.now() } = {}) {
-  const keys = [...new Set((codes || []).map((c) => normProductCode(c)).filter(Boolean))];
-  try {
-    const db = await mirrorDb();
-    return inTx(db, () => {
-      const pub = db.prepare('select run_id, src_ne_products_synced_at from mirror_pml_published where id = 1').get();
-      if (!pub || !pub.run_id) return { ok: false, error: '商品管理リストの写しがまだありません' };
-      const at = Date.parse(String(pub.src_ne_products_synced_at ?? ''));
-      if (!Number.isFinite(at)) return { ok: false, error: '商品管理リストの NE の在庫がいつのものか分かりません' };
-      if (now - at > STOCK_PML_MAX_AGE_MS) return { ok: false, error: `商品管理リストの NE の在庫が古い (${pub.src_ne_products_synced_at})` };
-      const map = new Map();
-      for (let i = 0; i < keys.length; i += CHUNK) {
-        const part = keys.slice(i, i + CHUNK);
-        const rows = db.prepare(`select 商品コード as code, 総在庫数 as total, FBA在庫数 as fba, 引当数 as alloc, 注残数 as onorder from mirror_pml_snapshot_rows
-          where run_id = ? and lower(trim(商品コード)) in (${part.map(() => '?').join(', ')})`).all(pub.run_id, ...part);
-        for (const r of rows) map.set(normProductCode(r.code), { total: intOrNull(r.total), fba: intOrNull(r.fba), allocated: intOrNull(r.alloc), onOrder: intOrNull(r.onorder) });
-      }
-      return { ok: true, runId: String(pub.run_id), neSyncedAt: String(pub.src_ne_products_synced_at), map };
-    });
-  } catch (e) {
-    console.error(`[master-edit] 商品管理リストの在庫を読めない: ${e && e.message}`);
-    return { ok: false, error: '商品管理リストの在庫を読めません' };
   }
 }

@@ -2422,7 +2422,7 @@ console.log('── 注残SSoT (正本ビュー/GAS endpoint差替/商品管理�
       'apps/purchase-orders/db.js',               // 正本ビュー定義
       'apps/purchase-orders/logic.js',            // NEオーバーレイ/override実装
       'apps/product-management-list/router.js',   // ロールバックfallback
-      'apps/master-edit/sales-qty.mjs',           // NE から消す (#1690) の確かめ = NE 自身の発注残 (NE が削除を断る理由) を 0 か見るだけ。業務の注残には使わない (発注アプリの注残は別に台帳で見る)
+      'apps/master-edit/ne-delete-pml.mjs',       // NE から消す (#1690) の確かめだけのファイル = NE 自身の発注残 (NE が削除を断る理由) を 0 か見るだけ。業務の注残には使わない (発注アプリの注残は別に台帳で見る)
       'apps/purchase-orders/scripts/',            // テスト自身
     ];
     const scanOne = p => {
