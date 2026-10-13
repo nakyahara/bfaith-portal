@@ -23,7 +23,7 @@
  *   🚨 見張りの watcher (COMPANY_DB_WATCH_URL・接続 3 本まで) には落ちない (lib/master-legacy-gate.mjs の phaseUrlFrom と同じ決まり)
  * 時間: どの道も JAN_READ_DEADLINE_MS (4.5 秒) まで。超えたら接続を閉じて (= 裏の SELECT も止まる)「読めない」
  */
-import { resolveVariationGroup } from '../lib/variation.js';
+import { resolveVariationGroup, mirrorReady } from '../lib/variation.js';
 
 /** 印の見出し (画面・プレビューで同じ言葉を使う) */
 export const JAN_STATE_LABELS = Object.freeze({
@@ -48,6 +48,10 @@ export const JAN_READ_MAX_ITEMS = 20000;
 export const JAN_READ_DEADLINE_MS = 4500;
 /** 接続を待つ上限 (残りは SELECT に) */
 export const JAN_CONNECT_TIMEOUT_MS = 2500;
+/** プロセス全体で同時に Company DB を読む数の上限 (Render の Postgres の接続を食い過ぎない)。超えた人は待たずに「読めない (混んでいる)」 */
+export const JAN_READ_MAX_CONCURRENT = 2;
+/** 残りの時間がこれより少なければ、読みに行かずに「読めない」(つないでもすぐ時間切れ) */
+export const JAN_READ_MIN_LEFT_MS = 200;
 
 /**
  * Company DB の有効な JAN を読む SQL。入れた (商品コード, product-hub の JAN) の組ごとに 1 行 (ord の順)。
@@ -111,12 +115,28 @@ export function __setCdbJanConnect(fn) { connector = fn || null; }
 
 const errText = (e) => String((e && e.message) || e).slice(0, 120);
 
-/** 期限つきで (接続して) 読む。期限が来たら接続を閉じて (= 走っている SELECT も止まる)「読めない」 */
+// ─── 同時に読む数の上限 (プロセス共通)。数えるのは「接続が本当に閉じるまで」(期限で先に答えを返しても、閉じ終わるまでは 1 本と数える) ───
+let inFlight = 0;
+/** 試験用: 今 Company DB を読んでいる数 */
+export function __janReadInFlight() { return inFlight; }
+function acquireRead() {
+  if (inFlight >= JAN_READ_MAX_CONCURRENT) return null;
+  inFlight++;
+  let done = false;
+  return () => { if (!done) { done = true; inFlight--; } };
+}
+const BUSY = Object.freeze({ ok: false, busy: true, reason: `混んでいる (ほかの画面が商品マスタを読んでいる・同時に ${JAN_READ_MAX_CONCURRENT} 本まで)` });
+
+/** 期限つきで (接続して) 読む。期限が来たら接続を閉じて (= 走っている SELECT も止まる)「読めない」。同時の上限を超えたら待たずに「混んでいる」 */
 async function readRowsWithin(items, { env, deadlineMs }) {
   if (reader) {
+    const release = acquireRead();
+    if (!release) return BUSY;
     let timer;
     try {
-      const r = await Promise.race([reader(items), new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, reason: `${(deadlineMs / 1000).toFixed(1)} 秒で読めなかった` }), deadlineMs); })]);
+      const pr = Promise.resolve().then(() => reader(items));
+      pr.then(release, release);
+      const r = await Promise.race([pr, new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, reason: `${(deadlineMs / 1000).toFixed(1)} 秒で読めなかった` }), deadlineMs); })]);
       if (!r || !r.ok) return { ok: false, reason: (r && r.reason) || 'Company DB を読めない' };
       return { ok: true, rows: r.rows || [] };
     } catch (e) {
@@ -125,6 +145,8 @@ async function readRowsWithin(items, { env, deadlineMs }) {
   }
   const { url } = janReadUrlFrom(env);
   if (!url) return { ok: false, reason: 'Company DB の接続先が無い' };
+  const release = acquireRead();
+  if (!release) return BUSY;
   const started = Date.now();
   let client = null;
   let timedOut = false;
@@ -144,6 +166,7 @@ async function readRowsWithin(items, { env, deadlineMs }) {
       return { ok: false, reason: `Company DB を読めない (${errText(e)})` };
     } finally { closeClient(); }
   })();
+  work.then(release, release);   // 接続を閉じ終わった後に 1 本を返す
   try {
     return await Promise.race([work, new Promise((resolve) => {
       timer = setTimeout(() => { timedOut = true; closeClient(); resolve({ ok: false, reason: `${(deadlineMs / 1000).toFixed(1)} 秒で読めなかった (接続を閉じた)` }); }, deadlineMs);
@@ -154,7 +177,7 @@ async function readRowsWithin(items, { env, deadlineMs }) {
 /**
  * (商品コード, JAN) の組をまとめて読む。戻り値 { ok: true, byPair: Map(pairKey → row) } / { ok: false, reason }
  */
-export async function readCdbJans(pairs, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS } = {}) {
+export async function readCdbJans(pairs, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS, deadlineAt = null } = {}) {
   const seen = new Set();
   const items = [];
   for (const p of pairs || []) {
@@ -168,7 +191,10 @@ export async function readCdbJans(pairs, { env = process.env, deadlineMs = JAN_R
   }
   if (!items.length) return { ok: true, byPair: new Map() };
   if (items.length > JAN_READ_MAX_ITEMS) return { ok: false, reason: `比べる組が多すぎる (${items.length} 組・上限 ${JAN_READ_MAX_ITEMS})` };
-  const got = await readRowsWithin(items, { env, deadlineMs });
+  // 期限は要求の入口から測る (deadlineAt = 入口の時刻 + 期限)。残りが少なければ読みに行かない
+  const left = deadlineAt != null ? Math.min(deadlineMs, deadlineAt - Date.now()) : deadlineMs;
+  if (deadlineAt != null && left < JAN_READ_MIN_LEFT_MS) return { ok: false, reason: '時間切れ (読む前に期限が来た)' };
+  const got = await readRowsWithin(items, { env, deadlineMs: left });
   if (!got.ok) return got;
   const rows = got.rows;
   const byPair = new Map();
@@ -261,10 +287,10 @@ export function janWarningsOf(result) {
 }
 
 /** 比べる単位 (janUnitsForDraft の戻り値) を Company DB と比べる。読めないときも ok: true で各単位が unreadable (読めないのも印)。投げない */
-export async function compareJanUnits({ mode, units }, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS } = {}) {
+export async function compareJanUnits({ mode, units }, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS, deadlineAt = null } = {}) {
   try {
     if (!units.length) return { ok: true, mode, readable: true, reason: null, units: [], summary: summarizeJanUnits([]) };
-    const read = await readCdbJans(units.map((u) => ({ code: u.code, jan: u.phJan })), { env, deadlineMs });
+    const read = await readCdbJans(units.map((u) => ({ code: u.code, jan: u.phJan })), { env, deadlineMs, deadlineAt });
     const judged = units.map((u) => judgeJanUnit(u, read));
     return { ok: true, mode, readable: read.ok, reason: read.ok ? null : read.reason, units: judged, summary: summarizeJanUnits(judged) };
   } catch (e) {
@@ -282,10 +308,84 @@ export function janUnitsForDraftId(db, draftId) {
  * ドラフト 1 つを比べる (詳細画面)。戻り値 { ok: true, mode, readable, reason, units: [...], summary } / { ok: false, reason, units: [] }
  * 時間は JAN_READ_DEADLINE_MS まで (超えたら接続を閉じて「読めない」)
  */
-export async function compareDraftJans(db, draft, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS } = {}) {
+export async function compareDraftJans(db, draft, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS, deadlineAt = null } = {}) {
   let units;
   try { units = janUnitsForDraft(db, draft); } catch (e) { return { ok: false, reason: String((e && e.message) || e).slice(0, 160), units: [] }; }
-  return compareJanUnits(units, { env, deadlineMs });
+  return compareJanUnits(units, { env, deadlineMs, deadlineAt });
+}
+
+// ─── ボード用: 多くのドラフトの比べる単位を、SQLite の一括の読みで作る (janUnitsForDraft と同じ答え・試験で突き合わせる) ───
+const IN_CHUNK = 400;
+const lc = (v) => (v == null ? '' : String(v).trim().toLowerCase());
+function inChunks(db, sqlOf, values) {
+  const rows = [];
+  for (let i = 0; i < values.length; i += IN_CHUNK) {
+    const part = values.slice(i, i + IN_CHUNK);
+    rows.push(...db.prepare(sqlOf(part.map(() => '?').join(','))).all(...part));
+  }
+  return rows;
+}
+/**
+ * janUnitsForDraft (resolveVariationGroup) と同じ決め方を、ドラフトの数によらず数回の SQL で。戻り値 Map(draftId → { mode, units })
+ *   外した SKU (どこかのドラフトの除外) = 単独 / 商品コードが写しに 2 行 = 決められない (単独) / 代表でまとまる子が 2 つ以上 (このドラフトで外した子を除く) = まとまり
+ */
+export function janUnitsForDrafts(db, drafts) {
+  const out = new Map();
+  const single = (d) => ({ mode: 'single', units: [{ code: str(d.ne_code), phJan: str(d.jan_code) }].filter((u) => u.code) });
+  if (!drafts.length) return out;
+  if (!mirrorReady(db)) { for (const d of drafts) out.set(d.id, single(d)); return out; }
+  const codes = [...new Set(drafts.map((d) => lc(d.ne_code)).filter(Boolean))];
+  const selves = new Map();
+  for (const r of inChunks(db, (ph) => `SELECT 商品コード, 代表商品コード FROM mirror_products WHERE LOWER(TRIM(商品コード)) IN (${ph})`, codes)) {
+    const k = lc(r.商品コード);
+    if (!selves.has(k)) selves.set(k, []);
+    selves.get(k).push(r);
+  }
+  let detached = new Set();
+  try {
+    detached = new Set(inChunks(db, (ph) => `SELECT DISTINCT LOWER(TRIM(ne_code)) AS k FROM draft_variation_exclusions WHERE LOWER(TRIM(ne_code)) IN (${ph})`, codes).map((r) => r.k));
+  } catch { /* 表が無くても止めない (resolveVariationGroup と同じ) */ }
+  const keyOf = new Map();
+  for (const d of drafts) {
+    const code = str(d.ne_code);
+    const rows = selves.get(lc(code)) || [];
+    const rep = rows.length === 1 && rows[0].代表商品コード && String(rows[0].代表商品コード).trim() !== '' ? String(rows[0].代表商品コード).trim() : null;
+    keyOf.set(d.id, rep || code);
+  }
+  const keys = [...new Set([...keyOf.values()].map(lc).filter(Boolean))];
+  const membersByKey = new Map();
+  for (const r of inChunks(db, (ph) => `SELECT 商品コード, 代表商品コード FROM mirror_products WHERE LOWER(TRIM(代表商品コード)) IN (${ph}) ORDER BY 商品コード`, keys)) {
+    const k = lc(r.代表商品コード);
+    if (!membersByKey.has(k)) membersByKey.set(k, []);
+    membersByKey.get(k).push(r);
+  }
+  const ids = drafts.map((d) => d.id);
+  const exclOf = new Map();
+  try {
+    for (const r of inChunks(db, (ph) => `SELECT draft_id, ne_code FROM draft_variation_exclusions WHERE draft_id IN (${ph})`, ids)) {
+      if (!exclOf.has(r.draft_id)) exclOf.set(r.draft_id, new Set());
+      exclOf.get(r.draft_id).add(lc(r.ne_code));
+    }
+  } catch { /* 表が無くても止めない */ }
+  const jansOf = new Map();
+  for (const r of inChunks(db, (ph) => `SELECT draft_id, sku_code, jan_code FROM draft_sku_jans WHERE draft_id IN (${ph})`, ids)) {
+    if (!jansOf.has(r.draft_id)) jansOf.set(r.draft_id, new Map());
+    jansOf.get(r.draft_id).set(String(r.sku_code), String(r.jan_code));
+  }
+  for (const d of drafts) {
+    const code = str(d.ne_code);
+    if (!code || detached.has(lc(code)) || (selves.get(lc(code)) || []).length > 1) { out.set(d.id, single(d)); continue; }
+    const all = membersByKey.get(lc(keyOf.get(d.id))) || [];
+    const excl = exclOf.get(d.id) || new Set();
+    const members = all.filter((m) => !excl.has(lc(m.商品コード)));
+    if (!all.length || members.length <= 1) { out.set(d.id, single(d)); continue; }
+    const janRows = jansOf.get(d.id) || new Map();
+    out.set(d.id, {
+      mode: 'variation',
+      units: members.map((m) => { const c = str(m.商品コード); return { code: c, phJan: str(janRows.get(c.toLowerCase())) }; }).filter((u) => u.code),
+    });
+  }
+  return out;
 }
 
 /** ボードの画面から受け取るカードの ID の上限 (ボードの表示の上限 800 + 余裕) */
@@ -303,18 +403,17 @@ export function parseBoardDraftIds(raw) {
  * ボード: 画面に出ているカード (ids) のうち、product-hub に JAN があるドラフトだけを 1 回で読み、直す必要がありそうな印 (warn) のドラフトだけ返す。
  * 戻り値 { ok: true, readable, reason, checked, byDraft: { [draftId]: { state, label, units: [{ code, phJan, label, detail }] } } }
  */
-export async function boardJanMarks(db, { ids = [], env = process.env, deadlineMs = JAN_READ_DEADLINE_MS } = {}) {
+export async function boardJanMarks(db, { ids = [], env = process.env, deadlineMs = JAN_READ_DEADLINE_MS, deadlineAt = null } = {}) {
+  // 画面のカードのうち JAN があるドラフトを 1 回で読み、まとまりの判定も一括で (1000 枚でも SQL は数回)
+  const drafts = ids.length ? db.prepare(`SELECT * FROM product_drafts d WHERE d.id IN (SELECT value FROM json_each(?))
+    AND (TRIM(COALESCE(d.jan_code, '')) <> '' OR EXISTS (SELECT 1 FROM draft_sku_jans j WHERE j.draft_id = d.id)) ORDER BY d.id`).all(JSON.stringify(ids)) : [];
+  const unitsOf = janUnitsForDrafts(db, drafts);
   const per = [];
-  const pick = db.prepare(`SELECT * FROM product_drafts d WHERE d.id = ?
-    AND (TRIM(COALESCE(d.jan_code, '')) <> '' OR EXISTS (SELECT 1 FROM draft_sku_jans j WHERE j.draft_id = d.id))`);
-  for (const id of ids) {
-    const d = pick.get(id);
-    if (!d) continue;
-    const { units } = janUnitsForDraft(db, d);
-    const withJan = units.filter((u) => u.phJan);
+  for (const d of drafts) {
+    const withJan = unitsOf.get(d.id).units.filter((u) => u.phJan);
     if (withJan.length) per.push({ id: d.id, units: withJan });
   }
-  const read = await readCdbJans(per.flatMap((p) => p.units.map((u) => ({ code: u.code, jan: u.phJan }))), { env, deadlineMs });
+  const read = await readCdbJans(per.flatMap((p) => p.units.map((u) => ({ code: u.code, jan: u.phJan }))), { env, deadlineMs, deadlineAt });
   if (!read.ok) return { ok: true, readable: false, reason: read.reason, checked: per.length, byDraft: {} };
   const byDraft = {};
   for (const p of per) {

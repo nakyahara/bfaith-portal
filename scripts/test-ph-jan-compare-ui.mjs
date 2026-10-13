@@ -153,6 +153,35 @@ try {
     assert.deepEqual(registerCalls, [], 'キャンセルしたのに登録を送った');
     await page.close();
   });
+  await ta('[3b] 🚨 続けて保存しても照らしは並べない: 走っている間の保存は、終わった後に 1 回だけやり直す (最後の値で印)', async () => {
+    const { page, errors } = await openPage(`/apps/product-hub/detail/${dG.id}`);
+    await page.locator('.jan-cdb-mark[data-code="g-red"] .jan-cdb-pill').waitFor({ state: 'attached' });
+    await page.locator('.tab-btn[data-tab="tab-category"]').click();
+    const checks = [];
+    page.on('request', (r) => { if (/\/jan-check$/.test(r.url())) checks.push(Date.now()); });
+    slowMs = 600;
+    try {
+      // 青 → 白 → 赤 の順に続けて直す (保存はすぐ・照らしは遅い)
+      for (const [code, v] of [['g-blue', '4900000001099'], ['g-wht', '4900000001082'], ['g-red', '4900000001020']]) {
+        const input = page.locator(`.sku-jan-input[data-code="${code}"]`);
+        if (!(await input.isVisible())) await page.locator(`.sku-catalog-cell[data-code="${code}"] .sku-catalog-mode[value="with"], .sku-grid-catalog-cell[data-code="${code}"] .sku-catalog-mode[value="with"]`).first().check();
+        await input.fill(v);
+        await input.dispatchEvent('change');
+        await page.waitForTimeout(60);
+      }
+      await page.waitForFunction(() => document.querySelector('.jan-cdb-mark[data-code="g-red"] .jan-cdb-pill')?.textContent === 'Company DB: Company DB と違う', null, { timeout: 15000 });
+      await page.waitForTimeout(800);
+      assert.ok(checks.length >= 1 && checks.length <= 2, `照らした回数 ${checks.length} (保存は 3 回)`);
+      assert.equal(await page.locator('.jan-cdb-mark[data-code="g-wht"] .jan-cdb-pill').textContent(), 'Company DB: Company DB と違う');
+      assert.equal(await page.locator('.jan-cdb-mark[data-code="g-blue"] .jan-cdb-pill').textContent(), 'Company DB: Company DB と違う');
+    } finally { slowMs = 0; }
+    assert.deepEqual(errors, []);
+    // 元に戻す (後の試験の前提)
+    ph.prepare(`UPDATE draft_sku_jans SET jan_code = '4900000001075' WHERE draft_id = ? AND sku_code = 'g-red'`).run(dG.id);
+    ph.prepare(`DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code IN ('g-blue', 'g-wht')`).run(dG.id);
+    ph.prepare(`INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, 'g-blue', '4900000001082')`).run(dG.id);
+    await page.close();
+  });
   await ta('[4b] 🚨 登録の確認は Company DB を待たない: 比べている途中なら「読めない」の一言ですぐ確認を出す', async () => {
     slowMs = 3000;
     try {

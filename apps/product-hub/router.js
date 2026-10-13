@@ -178,7 +178,7 @@ import {
 import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLegacyNewKind, checkLegacyGate, legacyHandler, legacyWriteFence, respondIfLegacyAborted } from '../../lib/master-legacy-gate.mjs';
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
-import { compareDraftJans, compareJanUnits, janUnitsForDraftId, boardJanMarks, parseBoardDraftIds, janWarningsOf } from './services/cdb-jan-compare.mjs';
+import { compareDraftJans, compareJanUnits, janUnitsForDraftId, boardJanMarks, parseBoardDraftIds, janWarningsOf, JAN_READ_DEADLINE_MS } from './services/cdb-jan-compare.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -2406,6 +2406,7 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   // 🆕 JAN を Company DB と比べた印 (Company DB構想 21 §5 B1)。知らせだけ = payload も送る値も変えない・出品も止めない。
   //    🚨 比べる値は payload を作った直後に await を挟まずに読み直す (= payload と同じ値。上の await の間に JAN が保存されてもずれない・Codex #1700 R1 M4)
   const janUnits = janUnitsForDraftId(db, draft.id);
+  // (プレビューの JAN の読みも 4.5 秒まで。プレビューのほかの待ち = 辞書・税率 は今までどおり)
   const warnings = [...(tax.warning ? [tax.warning] : []), ...janWarningsOf(await compareJanUnits(janUnits))];
   if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(warnings.length ? { warnings } : {}) });
   res.json({
@@ -2825,9 +2826,10 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
 //    単品 = 出品の商品コード ↔ product_drafts.jan_code / まとまり = 子の SKU ごと ↔ draft_sku_jans (楽天に送る値と同じ決め方)。
 //    Company DB も product-hub の SQLite も書かない。読めないときも 200 で「読めない」の印を返す
 router.get('/api/drafts/:id/jan-check', async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // 期限は要求の入口から (Codex #1700 R2 M2)
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  const r = await compareDraftJans(getDB(), draft);
+  const r = await compareDraftJans(getDB(), draft, { deadlineAt });
   res.json(r.ok ? r : { ok: true, readable: false, reason: r.reason, mode: null, units: [], summary: { state: 'unreadable', severity: 'muted', label: '読めない', counts: {} } });
 });
 
@@ -3318,10 +3320,11 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
 //    ?ids= = 画面に出ているカードの draft ID (担当・確認中・ビュー・表示の上限で絞った後の物)。そのうち product-hub に JAN があるカードだけを 1 回で比べ、
 //    「違う / Company DB に無い」のカードだけ返す (件数も画面のカードだけ・Codex #1700 R1 M2)。時間は 4.5 秒まで (超えたら接続を閉じて「読めない」)
 router.get('/api/board/jan-check', async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // 期限は要求の入口から (ID の読み・まとまりの判定の時間も入れる・Codex #1700 R2 M2)
   const ids = parseBoardDraftIds(req.query.ids);
   if (ids === null) return res.status(400).json({ ok: false, error: 'ids はカンマで区切った数 (1000 個まで)' });
   try {
-    res.json(await boardJanMarks(getDB(), { ids }));
+    res.json(await boardJanMarks(getDB(), { ids, deadlineAt }));
   } catch (e) {
     console.error('[product-hub] board jan-check:', e);
     res.json({ ok: true, readable: false, reason: '比べる途中で失敗した', checked: 0, byDraft: {} });

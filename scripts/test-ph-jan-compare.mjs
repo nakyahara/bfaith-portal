@@ -10,6 +10,8 @@
  *   U 比べる単位: 単品 = 出品の商品コード ↔ product_drafts.jan_code / まとまり = 子の SKU ごと ↔ draft_sku_jans (ページ代表の jan_code は比べない)・外した子は比べない
  *   C 接続 (Codex #1700 R1 M1・M3): URL の選び方 (画面用の読むだけ → COMPANY_DB_URL・watcher には落ちない)・取引の中の statement_timeout・期限で接続を閉じる
  *     (SELECT が返らない・接続が返らない)・多い組は同じ取引の中で分けて読む
+ *     (R2 M1・M2) 同時に読むのはプロセスで 2 本まで (超えたら待たずに「混んでいる」・接続が閉じるまで数える)・期限は要求の入口から (deadlineAt)
+ *   U4 ボードの一括の決め方 = 1 件ずつと同じ答え / R9 1000 枚のボード (一括の読み・時間)
  *   R router: GET /api/drafts/:id/jan-check・GET /api/board/jan-check?ids= (画面のカードだけ・warn のカードだけ)・楽天のプレビューの warnings に足す (payload と同じ値・止めない)・
  *     読めない = 200 で「読めない」・🚨 Company DB にも product-hub の SQLite にも何も書かない (行の数とハッシュが同じ)
  *   H 画面: 詳細 (単品 / まとまり) に印の置き場・見かたの説明・ボードに状態の欄・画面の JS が読める (vm)
@@ -295,6 +297,57 @@ await ta('[C4] 多い組 (2,500) は同じ読むだけの取引の中で 1,000 �
   const r = await J.readCdbJans(items);
   assert.equal(J.judgeJanUnit({ code: 'a002', phJan: JAN.a2y }, r).state, 'match');
 });
+await ta('[C5] 🚨 同時に読む数はプロセスで 2 本まで: 3 本目は待たずに「混んでいる」・期限で先に答えても、読み終わる (接続が閉じる) までは 1 本と数える', async () => {
+  assert.equal(J.JAN_READ_MAX_CONCURRENT, 2);
+  const gates = [];
+  let calls = 0;
+  J.__setCdbJanReader((items) => { calls++; return new Promise((resolve) => gates.push(() => resolve({ ok: true, rows: [] }))); });
+  try {
+    const p1 = J.readCdbJans([{ code: 'a001', jan: '1' }]);
+    const p2 = J.readCdbJans([{ code: 'a001', jan: '2' }]);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(J.__janReadInFlight(), 2);
+    const t0 = Date.now();
+    const r3 = await J.readCdbJans([{ code: 'a001', jan: '3' }]);
+    assert.deepEqual([r3.ok, r3.busy, /混んでいる/.test(r3.reason), calls], [false, true, true, 2]);
+    assert.ok(Date.now() - t0 < 100, '3 本目が待った');
+    gates.splice(0).forEach((g) => g());
+    await Promise.all([p1, p2]);
+    assert.equal(J.__janReadInFlight(), 0);
+    // 期限で先に「読めない」を返しても、読み手が終わるまでは数え続ける
+    const late = await J.readCdbJans([{ code: 'a001', jan: '4' }], { deadlineMs: 50 });
+    assert.equal(late.ok, false);
+    assert.equal(J.__janReadInFlight(), 1, '期限の後すぐに 1 本を返した (接続はまだ閉じていない)');
+    gates.splice(0).forEach((g) => g());
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(J.__janReadInFlight(), 0);
+  } finally { gates.splice(0).forEach((g) => g()); J.__setCdbJanReader(readWith(pgClient)); }
+  // 本物の道: SELECT が返らない = 期限で接続を閉じた後に 1 本を返す
+  J.__setCdbJanReader(null);
+  J.__setCdbJanConnect(async () => pgliteClient({ hangSelect: true }));
+  try {
+    const r = await J.readCdbJans([{ code: 'a001', jan: JAN.a1 }], { env: { COMPANY_DB_URL: 'postgres://x' }, deadlineMs: 200 });
+    assert.equal(r.ok, false);
+    await new Promise((res) => setTimeout(res, 50));
+    assert.equal(J.__janReadInFlight(), 0, '接続を閉じた後も数えたまま');
+  } finally { J.__setCdbJanConnect(null); J.__setCdbJanReader(readWith(pgClient)); }
+});
+await ta('[C6] 期限は要求の入口から (deadlineAt): 残りが少なければ読みに行かない・接続の時間切れも残りに合わせる', async () => {
+  let calls = 0;
+  J.__setCdbJanReader(async (items) => { calls++; return readWith(pgClient)(items); });
+  try {
+    const r = await J.readCdbJans([{ code: 'a001', jan: JAN.a1 }], { deadlineAt: Date.now() + 50 });
+    assert.deepEqual([r.ok, /読む前に期限が来た/.test(r.reason), calls], [false, true, 0]);
+  } finally { J.__setCdbJanReader(readWith(pgClient)); }
+  J.__setCdbJanReader(null);
+  const opts = [];
+  J.__setCdbJanConnect(async (url, o) => { opts.push(o); return pgliteClient(); });
+  try {
+    const r = await J.readCdbJans([{ code: 'a001', jan: JAN.a1 }], { env: { COMPANY_DB_URL: 'postgres://x' }, deadlineAt: Date.now() + 1200 });
+    assert.equal(r.ok, true);
+    assert.ok(opts[0].query_timeout <= 1200 && opts[0].statement_timeout <= 1200 && opts[0].connectionTimeoutMillis <= 1200, JSON.stringify(opts[0]));
+  } finally { J.__setCdbJanConnect(null); J.__setCdbJanReader(readWith(pgClient)); }
+});
 
 // ─── U 比べる単位 (product-hub の SQLite) ───
 console.log('U 比べる単位');
@@ -338,6 +391,44 @@ await ta('[U3] ドラフトを比べる: まとまり = 子ごとの印とまと
   assert.deepEqual(r.units.map((u) => [u.code, u.state]), [['g-blue', 'differs'], ['g-red', 'match'], ['g-wht', 'none']]);
   assert.equal(r.units[0].holder, 'a003');
   assert.deepEqual([r.summary.state, r.summary.label], ['differs', 'Company DB と違う (1 SKU)']);
+});
+await ta('[U4] ボードの一括の決め方 (janUnitsForDrafts) は 1 件ずつ (janUnitsForDraft) と同じ答え: 単品・写しに無い・まとまり (代表・子のコード)・外した子・外して 1 つ・どこかで外された SKU・写しに 2 行・大文字', () => {
+  const made = [];
+  const mk = (code, jan) => { const d = draft(code, jan); made.push(d.id); return d; };
+  const mirrorIds = [];
+  const mir = (code, rep) => { mirror(code, rep); mirrorIds.push(mirrorPid); };
+  try {
+    mir('eq-s1', null); mk('eq-s1', '111');
+    mk('eq-unk', '222');                                    // 写しに無い
+    for (const c of ['eq-g1-a', 'eq-g1-b', 'eq-g1-c']) mir(c, 'eq-g1');
+    const g1 = mk('eq-g1', '333');                          // 代表のコード
+    sj.run(g1.id, 'eq-g1-a', '444'); sj.run(g1.id, 'eq-g1-c', '555');
+    ph.prepare(`INSERT INTO draft_variation_exclusions (draft_id, ne_code) VALUES (?, 'eq-g1-c')`).run(g1.id);   // このドラフトで外した子
+    const g1child = mk('eq-g1-b', '666');                   // 子のコードのドラフト (どこかで外された SKU ではない)
+    sj.run(g1child.id, 'eq-g1-b', '777');
+    for (const c of ['eq-g2-a', 'eq-g2-b']) mir(c, 'eq-g2');
+    const g2 = mk('eq-g2', '888');
+    ph.prepare(`INSERT INTO draft_variation_exclusions (draft_id, ne_code) VALUES (?, 'eq-g2-b')`).run(g2.id);   // 外して 1 つ = 単品
+    for (const c of ['eq-d1', 'eq-d2']) mir(c, 'eq-g3');
+    const other = mk('eq-other', null);
+    ph.prepare(`INSERT INTO draft_variation_exclusions (draft_id, ne_code) VALUES (?, 'eq-d1')`).run(other.id);
+    mk('eq-d1', '999');                                     // どこかで外された SKU = 単独
+    mir('eq-c1', null); mir(' EQ-C1', null); mk('eq-c1', '121');   // 写しに 2 行 = 決められない
+    mir('eq-c2', null); mir('EQ-C2', null); mir('eq-c2-a', 'eq-c2'); mir('eq-c2-b', 'eq-c2');
+    const c2 = mk('eq-c2', '141');                          // 写しに 2 行 + 自分が代表の子が 2 つ = それでも決められない (単独)
+    sj.run(c2.id, 'eq-c2-a', '151');
+    mir('EQ-U1', 'eq-g4'); mir('eq-u2', 'eq-g4'); const u = mk('eq-g4', null); sj.run(u.id, 'eq-u1', '131');   // 大文字
+    const drafts = ph.prepare(`SELECT * FROM product_drafts ORDER BY id`).all();
+    const batch = J.janUnitsForDrafts(ph, drafts);
+    for (const d of drafts) assert.deepEqual(batch.get(d.id), J.janUnitsForDraft(ph, d), `ドラフト ${d.ne_code} の答えが違う`);
+    assert.equal(batch.get(g1.id).mode, 'variation');
+    assert.equal(batch.get(g2.id).mode, 'single');
+    assert.equal(batch.get(c2.id).mode, 'single');
+    assert.equal(J.janUnitsForDrafts(ph, []).size, 0);
+  } finally {
+    for (const id of made) { ph.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ?').run(id); ph.prepare('DELETE FROM draft_variation_exclusions WHERE draft_id = ?').run(id); ph.prepare('DELETE FROM product_drafts WHERE id = ?').run(id); }
+    for (const pid of mirrorIds) ph.prepare('DELETE FROM mirror_products WHERE product_id = ?').run(pid);
+  }
 });
 
 // ─── R router ───
@@ -480,7 +571,12 @@ try {
       assert.equal(J.janWarningsOf(slow).length, 1);
       const board = await J.boardJanMarks(ph, { ids: [dA3.id], deadlineMs: 50 });
       assert.deepEqual([board.readable, board.byDraft], [false, {}]);
-    } finally { J.__setCdbJanReader(readWith(pgClient)); }
+    } finally {
+      J.__setCdbJanReader(readWith(pgClient));
+      // 遅い読み手が終わる (= 同時の数が 0 に戻る) まで待つ (次の試験が「混んでいる」にならないように)
+      for (let i = 0; i < 100 && J.__janReadInFlight() > 0; i++) await new Promise((r) => setTimeout(r, 20));
+      assert.equal(J.__janReadInFlight(), 0);
+    }
     const src = fs.readFileSync(new URL('../apps/product-hub/router.js', import.meta.url), 'utf8');
     assert.ok(!/BOARD_JAN_WAIT_MS|compareDraftJansWithin/.test(src), '期限の長い古い待ち方が残っている');
   });
@@ -516,6 +612,49 @@ try {
     const r = fs.readFileSync(new URL('../apps/product-hub/router.js', import.meta.url), 'utf8');
     assert.match(r, /router\.get\('\/api\/drafts\/:id\/jan-check'/);
     assert.match(r, /router\.get\('\/api\/board\/jan-check'/);
+    // 期限は要求の入口から測る (どちらの入口も、最初の行で期限を決める)
+    for (const route of ["router.get('/api/drafts/:id/jan-check', async (req, res) => {", "router.get('/api/board/jan-check', async (req, res) => {"]) {
+      const at = r.indexOf(route);
+      assert.ok(at >= 0, route);
+      assert.match(r.slice(at + route.length, at + route.length + 200), /^\s*const deadlineAt = Date\.now\(\) \+ JAN_READ_DEADLINE_MS;/, `${route} の入口で期限を決めていない`);
+    }
+    assert.match(r, /compareDraftJans\(getDB\(\), draft, \{ deadlineAt \}\)/, '詳細の入口の期限を渡していない');
+    assert.match(r, /boardJanMarks\(getDB\(\), \{ ids, deadlineAt \}\)/, 'ボードの入口の期限を渡していない');
+  });
+  await ta('[R9] ボードに 1000 枚 (まとまり入り) = 一括で読んで速い (1 回の Company DB の読み)・期限が過ぎていれば読みに行かない', async () => {
+    const ids = [];
+    const ins = ph.prepare('INSERT INTO product_drafts (ne_code, name, jan_code) VALUES (?, ?, ?)');
+    ph.transaction(() => {
+      for (let i = 0; i < 1000; i++) {
+        const code = `bulk-${String(i).padStart(4, '0')}`;
+        if (i % 10 === 0) {
+          mirror(`${code}-x`, code); mirror(`${code}-y`, code);
+          const id = Number(ins.run(code, code, null).lastInsertRowid);
+          sj.run(id, `${code}-x`, JAN.a1); sj.run(id, `${code}-y`, JAN.a3);
+          ids.push(id);
+        } else {
+          mirror(code, null);
+          ids.push(Number(ins.run(code, code, JAN.a5).lastInsertRowid));
+        }
+      }
+    })();
+    let reads = 0;
+    let pairs = 0;
+    J.__setCdbJanReader(async (items) => { reads++; pairs += items.length; return readWith(pgClient)(items); });
+    try {
+      const t0 = Date.now();
+      const r = await call('GET', `/apps/product-hub/api/board/jan-check?ids=${ids.join(',')}`);
+      const took = Date.now() - t0;
+      assert.deepEqual([r.status, r.j.readable, r.j.checked, reads], [200, true, 1000, 1]);
+      assert.ok(pairs >= 3, `組 ${pairs}`);   // (商品コード, JAN) の組は重なりを除いて読む
+      assert.equal(Object.keys(r.j.byDraft).length, 1000, '1000 枚とも「違う / 無い」のはず');
+      assert.ok(took < 4500, `1000 枚で ${took} ms`);
+      console.log(`      (1000 枚: ${took} ms)`);
+      // 期限が過ぎていれば Company DB を読みに行かない (SQLite の時間も期限に入る)
+      reads = 0;
+      const late = await J.boardJanMarks(ph, { ids, deadlineAt: Date.now() - 1 });
+      assert.deepEqual([late.readable, /期限/.test(late.reason), reads], [false, true, 0]);
+    } finally { J.__setCdbJanReader(readWith(pgClient)); }
   });
 } finally {
   server.close();

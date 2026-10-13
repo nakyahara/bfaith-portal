@@ -3601,7 +3601,8 @@ th.attr-unknown { color: #dc2626; }
   // ─── 🆕 JAN を Company DB と比べた印 (Company DB構想 21 B1・読むだけ・知らせだけ) ───
   // 画面を開いた後と、JAN を保存した後に /jan-check を読んで、JAN の欄の下に印を出す (画面の表示は待たせない)。
   // 出品は止めない: 楽天への登録の確認の文に一言足すだけ。JAN を直すのは商品マスタ (master-edit) か、この画面の JAN の欄
-  let janCheckSeq = 0;
+  let janCheckRunning = null;   // 走っている照らし (1 つだけ・Codex #1700 R2 M1: 保存のたびに新しく始めて接続を並べない)
+  let janCheckAgain = false;    // 走っている間に保存があった = 終わった後に 1 回だけやり直す
   let janCheckLast = null;
   let janCheckBusy = false;   // 比べている途中 (登録の確認は待たずに「読めない」で進める)
   const janKey = (s) => String(s == null ? '' : s).trim().toLowerCase();
@@ -3646,22 +3647,28 @@ th.attr-unknown { color: #dc2626; }
     if (!s.severity || s.severity === 'none') return;
     summary.appendChild(janPill('商品マスタ (Company DB) と比べた JAN: ' + s.label, s.severity));
   }
-  async function refreshJanCheck() {
-    const seq = ++janCheckSeq;
-    janCheckBusy = true;
-    let j;
+  async function fetchJanCheckOnce() {
     try {
       const res = await fetch(BASE + '/jan-check', { headers: { Accept: 'application/json' } });
-      j = await res.json();
-      if (!j || j.ok !== true) j = { ok: true, readable: false, reason: (j && j.error) || '読めない', units: [] };
+      const j = await res.json();
+      return (j && j.ok === true) ? j : { ok: true, readable: false, reason: (j && j.error) || '読めない', units: [] };
     } catch (e) {
-      j = { ok: true, readable: false, reason: '通信できませんでした', units: [] };
+      return { ok: true, readable: false, reason: '通信できませんでした', units: [] };
     }
-    if (seq !== janCheckSeq) return janCheckLast;   // 後から始めた読みの結果を優先する (古い結果で上書きしない)
-    janCheckBusy = false;
-    janCheckLast = j;
-    renderJanCheck(j);
-    return j;
+  }
+  // 照らすのは同時に 1 つだけ。走っている間に呼ばれたら印を付けて同じ Promise を返し、終わった後に 1 回だけやり直す (最後の値で印を出す)
+  function refreshJanCheck() {
+    if (janCheckRunning) { janCheckAgain = true; return janCheckRunning; }
+    janCheckBusy = true;
+    janCheckRunning = (async () => {
+      let j;
+      do { janCheckAgain = false; j = await fetchJanCheckOnce(); } while (janCheckAgain);
+      janCheckBusy = false;
+      janCheckLast = j;
+      renderJanCheck(j);
+      return j;
+    })().finally(() => { janCheckRunning = null; });
+    return janCheckRunning;
   }
   // 楽天への登録の確認の文に足す一言 (違う / Company DB に無い / 読めない のときだけ)
   function janConfirmNote(j) {
