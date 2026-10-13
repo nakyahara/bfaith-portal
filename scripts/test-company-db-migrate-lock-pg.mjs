@@ -850,7 +850,34 @@ ${tail}`;
   const whoami = async (c) => (await c.query('select current_user::text as cu, session_user::text as su')).rows[0];
 
   await t('O0 migration の file は全部、許さない役割の切り替えを持たない (grep の縛り) / 拒む形 = RESET ROLE・session の SET ROLE・SET SESSION ROLE・ROLE NONE・SESSION AUTHORIZATION・set_config(role)・DISCARD・一覧の外の SET LOCAL ROLE / 許す = 一覧の SET LOCAL ROLE (設計 13 v3.11 ③)', async () => {
-    for (const f of listMigrationFiles()) assert.deepEqual(roleSwitchStatements(f.text), [], f.file);
+    // 🆕 (master の直し 2026-10-13) 既知の例外 = 0072 (#1690) の ops.cancel_sku_gone_from_ne が、退避した 6 個の core.* の設定を jsonb_each で戻す
+    //   set_config(e.key, …) (名前は同じ関数の中の固定の配列だけ = role・session_authorization・字句の前提の GUC に届かない)。
+    //   runner は owner-transition より前の file (legacy) を字句で検査しない = 0072 は legacy で流れる (下で owner-transition が 0072 より後ろなのも確かめる)。
+    //   適用済みの file は書き換えない (checksum) ので file は直さず、例外は file と検査の結果の完全一致だけにする (0072 に別の切り替えが増える・ほかの file に同じ形が出る → NG)
+    const KNOWN_LEGACY_HITS = { '0072_ne_delete_csv.sql': ['(ドルの引用の中) set_config(<ただの文字列でない名前>, …)'] };
+    for (const f of listMigrationFiles()) assert.deepEqual(roleSwitchStatements(f.text), KNOWN_LEGACY_HITS[f.file] ?? [], f.file);
+    {
+      // 🆕 #1711 Codex R1 High: 検査は set_config(e.key, …) の形しか見ない (e.key の値は見ない) = 例外の前提を関数の本文の完全一致で縛る
+      //   (v_cfg に 'role' を足す・戻す名前を変えるように 0072 の関数を変えたら、ここで落ちて例外が外れる。適用済みの migration は変えない前提)
+      const files = listMigrationFiles();
+      const t72 = files.find((f) => f.file === '0072_ne_delete_csv.sql').text.replace(/\r\n/g, '\n');
+      const head72 = 'create or replace function ops.cancel_sku_gone_from_ne(';
+      assert.equal(t72.split(head72).length, 2);   // 定義は 1 つだけ
+      const fnFrom = t72.indexOf(head72), fnTo = t72.indexOf('\nend $$;', fnFrom) + '\nend $$;'.length;
+      const fn72 = t72.slice(fnFrom, fnTo);
+      assert.equal(crypto.createHash('sha256').update(fn72, 'utf8').digest('hex'), 'cb84a46cf170a6954257a4372b8808f4250c588bd1575d11a763cd09978ac572', 'ops.cancel_sku_gone_from_ne の本文が変わった = 既知の例外の前提が崩れた');
+      assert.equal((t72.match(/set_config\(e\.key,/g) || []).length, 1);   // 動的な名前は 0072 に 1 か所だけ
+      assert.ok(fn72.includes("perform pg_catalog.set_config(e.key, e.value #>> '{}', true) from pg_catalog.jsonb_each(v_cfg) e;"));   // その 1 か所はこの関数の中・戻す元は v_cfg
+      // v_cfg は 宣言・代入 (select … into v_cfg) 1 か所・戻す所 の 3 回だけ (:= での足し込みが無い)
+      assert.equal((t72.match(/\bv_cfg\b/g) || []).length, 3);
+      assert.equal((fn72.match(/\binto\s+v_cfg\b/g) || []).length, 1);
+      assert.equal((t72.match(/\bv_cfg\s*:?=/g) || []).length, 0);
+      // 代入のキー = 固定の 6 個と完全一致 (unnest の配列の名前の集合)
+      const cfgArr = /select pg_catalog\.jsonb_object_agg\(x\.k, coalesce\(pg_catalog\.current_setting\(x\.k, true\), ''\)\) into v_cfg\n\s+from pg_catalog\.unnest\(array\[([^\]]*)\]\) as x\(k\);/.exec(fn72);
+      assert.ok(cfgArr, 'v_cfg の代入の形が変わった');
+      assert.deepEqual(cfgArr[1].split(',').map((x) => x.trim()).sort(), ["'core.actor_id'", "'core.actor_type'", "'core.reason'", "'core.request_id'", "'core.run_id'", "'core.source_system'"]);
+      assert.deepEqual(files.filter((f) => f.ownerTransition && f.file <= '0072_ne_delete_csv.sql').map((f) => f.file), []);   // owner-transition が前にあると runner が 0072 を拒む
+    }
     // 🆕 Codex R2 High: 0001〜 に Unicode の escape は 1 つも無い (legacy の ⚠️ も出ない = 後方の互換を壊さない)
     for (const f of listMigrationFiles()) assert.deepEqual(unicodeEscapeLiterals(f.text), [], f.file);
     assert.deepEqual(ALLOWED_SET_LOCAL_ROLES, ['cdb_owner', 'profit_definer', 'heavy_guard_definer', 'heavy_read_definer', 'd60_calib_definer', 'finance_revision_definer']);
