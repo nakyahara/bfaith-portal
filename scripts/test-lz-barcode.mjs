@@ -500,6 +500,20 @@ await ta('[H3d] 写しで同じ値を持つ商品が複数 (#1719 R3 Medium): �
     assert.equal(r.status, 200, r.text);
   } finally { LZ_MIRROR = mirrorOf(); }
 });
+await ta('[H3e] 保存できた後の再送 (#1719 R4 High): 1 回目は保存できた → 写しに同じ値のほかの商品が現れる → 同じ request_id で再送 = 保存済みの答え (409 にならない)・新しい request_id = 409', async () => {
+  try {
+    LZ_MIRROR = mirrorOf();
+    const seen = lzData((await call('GET', '/apps/master-edit/sku/lz4')).text).seenRow;
+    const body = { request_id: uuid(), barcode: { kind: 'value', value: 'X00LZR4001' }, seen_row: seen };
+    const r1 = await call('POST', api('lz4'), { body });   // この応答は届かなかったことにする
+    assert.equal(r1.status, 200, r1.text);
+    LZ_MIRROR = mirrorOf({ bc: [['zz-new', 'X00LZR4001']] });
+    const r2 = await call('POST', api('lz4'), { body });
+    assert.deepEqual([r2.status, r2.j.replayed, r2.j.kind, r2.j.value, r2.j.rule_row, r2.j.lz_unchecked], [200, true, 'fnsku', 'X00LZR4001', r1.j.rule_row, undefined], r2.text);
+    const r3 = await call('POST', api('lz4'), { body: { ...body, request_id: uuid(), seen_row: r1.j.rule_row } });
+    assert.deepEqual([r3.status, r3.j.reason], [409, 'lzbc_taken'], r3.text);
+  } finally { LZ_MIRROR = mirrorOf(); }
+});
 await ta('[H4] 画面の動き (Chromium): 値を打つと空欄の印が外れる・空欄に印で値が消える・形の一言・通信が切れた保存は同じ request_id で送り直す (2 回書かない)', async () => {
   let chromium;
   try { ({ chromium } = await import('playwright')); } catch (e) { throw new Error(`Playwright が無い: ${e.message}`); }

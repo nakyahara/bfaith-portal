@@ -2766,6 +2766,16 @@ await ta('[LZ-H2] 単品の登録 × ロジザードの写し (#1719 R1 High 2):
     LZM = lzMirror({ state: 'unavailable' });
     const f3 = await regApi('lzh-u8', { kind: 'value', value: 'X00LZU0008' }, { body: { request_id: rid2 } });
     assert.deepEqual([f3.status, f3.j.replayed, f3.j.lz_unchecked], [200, true, undefined], f3.text);
+    // 🆕 #1719 R4 High: 保存できた後に写しに同じ値のほかの商品が現れた → 同じ request_id で再送 = 保存済みの答え (409 にならない)
+    LZM = lzMirror({ bc: [['zz-old', 'X00LZHWARE']] });
+    const rid3 = uuid();
+    const g1 = await regApi('lzh-u9', { kind: 'value', value: 'X00LZU0009' }, { body: { request_id: rid3 } });   // この応答は届かなかったことにする
+    assert.equal(g1.status, 200, g1.text);
+    LZM = lzMirror({ bc: [['zz-new', 'X00LZU0009']] });
+    const g2 = await regApi('lzh-u9', { kind: 'value', value: 'X00LZU0009' }, { body: { request_id: rid3 } });
+    assert.deepEqual([g2.status, g2.j.replayed, g2.j.code, g2.j.lz_unchecked], [200, true, 'lzh-u9', undefined], g2.text);
+    const g3 = await regApi('lzh-u10', { kind: 'value', value: 'X00LZU0009' });
+    assert.deepEqual([g3.status, g3.j.reason], [409, 'lzbc_taken'], g3.text);
   } finally { LZM = lzMirror({ bc: [['zz-any', 'X00ZZZZANY']] }); }
 });
 

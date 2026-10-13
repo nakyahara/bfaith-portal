@@ -31,7 +31,7 @@ export const BASE_SKUS = Object.freeze([
 /**
  * 試験の DB を作る。戻り値 { pg, db, q, one, asRole, asEditor, ALL_COMPANY, OWN, SUP1, SUP2, sessionUser }
  */
-export async function setupVariationDb({ quiet = () => {}, extraSkus = [] } = {}) {
+export async function setupVariationDb({ quiet = () => {}, extraSkus = [], migrateTo = null } = {}) {
   const W2 = await import('./master-widen-pr1.mjs');
   const { PGlite } = await import('@electric-sql/pglite');
   const { applyMigrations, pgliteAdapter } = await import('../company-db/migrate.mjs');
@@ -90,7 +90,7 @@ export async function setupVariationDb({ quiet = () => {}, extraSkus = [] } = {}
     { code_norm: 'ws100', kind: 'rep', state: 'ok', ne_code: 'ws100', spellings: ['ws100'] }, { code_norm: 'towel-gift', kind: 'rep', state: 'ok', ne_code: 'towel-gift', spellings: ['towel-gift'] }];
   await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: RUN1, entries })]);
   await (await import('./master-widen.mjs')).seedNewEntryLease(db, { runId: RUN1, withSet: true });
-  await applyMigrations(db, { log: quiet });
+  await applyMigrations(db, { log: quiet, ...(migrateTo ? { to: migrateTo } : {}) });   // migrateTo = その番号まで (例: 0080 の前のアプリと DB の組み合わせ)
   await createMasterEditRoles(pg, {});
   // 🆕 0068: 照合 ② の代表 (親) の数えの記録 (products.parent が company の DB で新しい NE 登録の CSV の門が開く = 今日の回で数え 0)
   await (await import('./master-widen.mjs')).seedParentGate(db, { runId: RUN1 });

@@ -163,6 +163,19 @@ await ta('[C2] 応答が失われた後の再送 (同じ request_id) = 印は DB
     MIRROR = mirrorOf('unavailable');
     const again2 = await post('/api/new/variation', b2);
     assert.deepEqual([again2.status, again2.j.replayed, again2.j.lz_unchecked], [200, true, undefined], again2.text);
+    // 🆕 #1719 R4 High: 保存できた後に写しに同じ値のほかの商品が現れた → 同じ request_id で再送 = 保存済みの答え (409 にならない)
+    MIRROR = mirrorOf('checked');
+    const b3 = body('lzr3', [['-A', '', { kind: 'value', value: 'X00LZR3001' }], ['-B', '', { kind: 'lz_assign' }]]);
+    const s1 = await post('/api/new/variation', b3);   // この応答は届かなかったことにする
+    assert.equal(s1.status, 200, s1.text);
+    const withNew = mirrorOf('checked');
+    withNew.barcodes.set('X00LZR3001', new Set(['zz-new']));
+    MIRROR = withNew;
+    const s2 = await post('/api/new/variation', b3);
+    assert.deepEqual([s2.status, s2.j.replayed, (s2.j.children || []).map((k) => k.code)], [200, true, ['lzr3-A', 'lzr3-B']], s2.text);
+    const b4 = body('lzr4', [['-A', '', { kind: 'value', value: 'X00LZR3001' }]]);
+    const s3 = await post('/api/new/variation', b4);
+    assert.deepEqual([s3.status, s3.j.reason], [409, 'lzbc_taken'], s3.text);
   } finally { MIRROR = mirrorOf(); }
 });
 

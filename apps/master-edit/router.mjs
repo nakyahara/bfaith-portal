@@ -889,7 +889,8 @@ router.post('/api/new/variation', (req, res) => {
     const po = await orderBlanksFirstTime(db, req, gate, 'variation', b);
     if (!po.ok) return res.status(po.status).json(po.json);
     // 🆕 0080: 子ごとにロジザードのバーコード (値か空欄) が要る・ロジザードの写しでほかの商品の値 = 409 (何も書かない)
-    const lg = await lzRegisterGate(db, kids.map((k) => ({ code: k && typeof k.code === 'string' ? k.code : '', raw: k ? k.lz_barcode : undefined, field: 'children' })));
+    //   🆕 #1719 Codex R4 High: 同じ request_id の記録がある (押し直し) = 今の写しで確かめない (lib が前の答えを返す・印は DB に残した結果から)
+    const lg = po.replay ? { copy: null } : await lzRegisterGate(db, kids.map((k) => ({ code: k && typeof k.code === 'string' ? k.code : '', raw: k ? k.lz_barcode : undefined, field: 'children' })));
     if (lg.fail) return res.status(lg.fail.status).json(lg.fail.json);
     const r = await registerVariationBatch(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: b.reason ?? null,
@@ -1024,7 +1025,8 @@ router.post('/api/new', (req, res) => {
     if (!po.ok) return res.status(po.status).json(po.json);
     // 🆕 0080: 単品 = ロジザードのバーコード (値か空欄) が要る・ロジザードの写しでほかの商品の値 = 409 (何も書かない)
     let lzCopy = null;
-    if (String(b.kind ?? '') === 'single') {
+    //   🆕 #1719 Codex R4 High: 同じ request_id の記録がある (押し直し) = 今の写しで確かめない (lib が前の答えを返す)
+    if (String(b.kind ?? '') === 'single' && !po.replay) {
       const lg = await lzRegisterGate(db, [{ code: String(b.code ?? ''), raw: b.logizard_barcode, field: 'logizard_barcode' }]);
       if (lg.fail) return res.status(lg.fail.status).json(lg.fail.json);
       lzCopy = lg.copy;
@@ -1254,9 +1256,11 @@ router.post('/api/sku/:code/logizard-barcode', (req, res) => {
     const sku = (await db.query('select sku_id::text as id, code, sku_kind from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(req.params.code || '')])).rows[0];
     if (!sku) return res.status(404).json({ ok: false, error: `商品コード ${req.params.code} は Company DB にありません` });
     if (sku.sku_kind !== 'single') return res.status(400).json({ ok: false, error: 'ロジザードのバーコードは単品だけです', reason: 'not_single' });
-    if (!(await lzBarcodeReady(db))) return res.status(503).json({ ok: false, error: 'Company DB に 0080 (ロジザードのバーコードの値) がまだ入っていません。何も保存していません', reason: 'db_not_ready' });
-    const lzMirror = bc.value ? await lzMirrorProvider() : null;
-    const lzHit = bc.value ? lzMirrorOwner(lzMirror, sku.code, bc.value) : null;
+    if (!(await lzBarcodeReady(db))) return res.status(503).json({ ok: false, error: 'Company DB に 0080 (ロジザードのバーコードの値) がまだ入っていないか、権限の流し直しの前です。何も保存していません', reason: 'db_not_ready' });
+    // 🆕 #1719 Codex R4 High: この SKU に同じ request_id の行がある (押し直し) = 今の写しで確かめない (DB の関数が前の答えを返す・違う中身 = request_id_reused)
+    const saved = (await db.query('select 1 from ops.sku_logizard_barcode_rules where request_id = $1::uuid and sku_id = $2::bigint', [rid, sku.id])).rows.length > 0;
+    const lzMirror = bc.value && !saved ? await lzMirrorProvider() : null;
+    const lzHit = lzMirror ? lzMirrorOwner(lzMirror, sku.code, bc.value) : null;
     const lzCopy = lzMirror ? lzCopyCheck(lzMirror, clock()) : null;   // 🆕 #1719 R1 High 2: 照らせない = 通す・印を残す
     if (lzHit) return res.status(409).json({ ok: false, reason: 'lzbc_taken', field: 'logizard_barcode', error: `ロジザードのバーコード ${bc.value} はロジザードでほかの商品 (${lzHit}) が使っています。何も保存していません` });
     await db.query('begin');
