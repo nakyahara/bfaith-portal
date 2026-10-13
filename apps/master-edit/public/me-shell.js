@@ -25,6 +25,23 @@
 
   var ME = window.MasterEdit = window.MasterEdit || {};
   ME.fold = fold;
+
+  // 🆕 0075 (CompanyDB構想 21 C1): 上の帯の「発注の設定が届いていない商品 N 件」(発注アプリの権限がある人だけ = 帯の要素がある画面だけ)。
+  //   読むついでにサーバーが届け直す (60 秒に 1 回まで)。0 件・読めない = 出さない (読めないときは届け待ちの画面で分かる)
+  (function poqPill() {
+    var pill = document.getElementById('poq-pill');
+    if (!pill || !window.fetch) return;
+    fetch(pill.getAttribute('data-src'), { credentials: 'same-origin', headers: { Accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || !j.ok || !j.ready || !(j.open > 0)) return;
+        var t = document.getElementById('poq-pill-t');
+        if (t) t.textContent = '発注の設定が届いていない商品 ' + j.open + ' 件' + (j.overdue ? ' (24 時間超 ' + j.overdue + ')' : '');
+        if (j.overdue) pill.classList.add('late');
+        pill.hidden = false;
+      })
+      .catch(function () { /* 出さないだけ */ });
+  })();
   /** 画面が上書きする: 未保存の変更 { n, items: [文字], impacts: [文字] } */
   ME.dirty = ME.dirty || function () { return { n: 0, items: [], impacts: [] }; };
   ME.onSave = ME.onSave || null;      // Ctrl+S (保存のある画面だけ)

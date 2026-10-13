@@ -53,6 +53,8 @@
   <button class="search-trigger" id="open-palette" type="button" aria-haspopup="dialog" aria-keyshortcuts="Control+K">
     <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg><span class="grow">全体から探す (商品・Amazon SKU・操作)</span><span class="kbd" aria-hidden="true">Ctrl</span><span class="kbd" aria-hidden="true">K</span>
   </button>
+  <% if (locals.poAccess) { %><%# 🆕 0075: 発注の設定がまだ発注アプリに届いていない商品の数 (me-shell.js が /api/order-settings-outbox を読む・0 件 = 出さない) %>
+  <a class="poq-pill" id="poq-pill" href="<%= base %>/order-settings-outbox" data-src="<%= base %>/api/order-settings-outbox" hidden><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span id="poq-pill-t">発注の設定が届いていない商品</span></a><% } %>
   <div class="user">
     <button class="unsaved" id="unsaved" type="button" hidden>● <span id="unsaved-n">未保存 0 件</span></button>
     <span class="avatar" aria-hidden="true"><%= String(displayName || username || '?').trim().slice(0, 1) %></span><span><%= displayName || username %></span>
@@ -70,6 +72,7 @@
         ['new', base + '/new?kind=single', 'i-plus', '新商品の登録'],
         ['regcsv', base + '/reg-csv', 'i-send', 'NE 登録の CSV'],
         ['nedel', base + '/ne-delete', 'i-trash', 'NE から消す'],
+        ...(locals.poAccess ? [['poq', base + '/order-settings-outbox', 'i-box', '発注の設定の届け待ち']] : []),
         ['たすけ'],
         ['decisions', '/apps/master-decisions/', 'i-scale', 'マスタの判断 (NE との差)'],
         ['manual', base + '/manual', 'i-book', 'つかいかた'],

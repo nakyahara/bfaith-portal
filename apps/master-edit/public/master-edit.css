@@ -937,6 +937,27 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 .po-foot .hint { margin-right: auto; max-width: 460px; }
 #sec-order.po-dirty { border-color: rgba(255, 200, 87, 0.55); }
 #sec-order .ctl.col > .seg { align-self: flex-start; }
+/* AMC 商品ラベルのバーコード印字 (views/_amc-label.ejs・発注アプリに保存・Company DB構想 21 A1) */
+#sec-amc.po-dirty { border-color: rgba(255, 200, 87, 0.55); }
+#sec-amc .ctl.col > .seg { align-self: flex-start; }
+#sec-amc .amc-lead { margin: -4px 0 12px; color: var(--text2); }
+.amc-off { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; font-size: 14px; }
+.amc-off .hint { flex-basis: 100%; }
+.amc-cands { display: grid; gap: 8px; width: 100%; }
+.amc-cand { display: flex; gap: 12px; align-items: flex-start; padding: 10px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel); cursor: pointer; transition: border-color 0.15s, background 0.15s; min-width: 0; }
+.amc-cand:hover { border-color: var(--line-strong); }
+.amc-cand input { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--accent); flex: none; cursor: pointer; }
+.amc-cand input:disabled { cursor: not-allowed; }
+.amc-cand .body { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; min-width: 0; }
+.amc-cand .v { font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
+.amc-cand .meta { flex-basis: 100%; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.amc-cand.on { border-color: rgba(58, 231, 255, 0.65); background: linear-gradient(135deg, rgba(58, 231, 255, 0.11), rgba(16, 25, 44, 0.75)); box-shadow: 0 0 0 1px rgba(58, 231, 255, 0.18) inset; }
+.amc-cand.keep { border-style: dashed; }
+.amc-ex { padding: 3px 0; overflow-wrap: anywhere; }
+.amc-chk { display: inline-flex; gap: 8px; align-items: center; cursor: pointer; }
+.amc-chk input { width: 18px; height: 18px; accent-color: var(--accent); }
+#sec-amc .fmsg:not(:empty) { color: var(--warn); }
+@media (max-width: 760px) { #sec-amc .f, #sec-amc .po-sub .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #sec-amc .amc-cand { min-height: 44px; } #sec-amc .seg button, #amc-save { min-height: 44px; } #sec-amc .po-foot .btn { width: 100%; } }
 /* まとまりの操作の窓 (views/_vops.ejs・PR-7b): 名前を直す・子の廃止・代表の採用 (新商品の登録と商品の画面の両方) */
 .modal.vops { width: min(680px, 94vw); max-height: 90vh; overflow: auto; }
 .modal.vops .opttbl { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 4px 0 10px; }
@@ -1059,3 +1080,14 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 /* 構成の行の下の「NE の商品を足す (セット)」= 1 行目は最初からあるので控えめ (文字だけのボタン・押せる大きさはスマホで 44px) */
 #comp-add.addrow { color: var(--muted); padding: 0 6px; }
 #comp-add.addrow:hover { color: var(--accent); }
+/* 🆕 0075: 発注の設定の届け待ち (上の帯の件数・届け待ちの画面の行) */
+.poq-pill { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px; border-radius: 999px; font-size: 13px; font-weight: 600; color: var(--warn); background: var(--warn-bg); border: 1px solid rgba(255, 200, 87, 0.4); text-decoration: none; white-space: nowrap; }
+.poq-pill.late { color: var(--err); background: var(--err-bg); border-color: rgba(255, 112, 133, 0.45); }
+.poq-pill .ic { width: 15px; height: 15px; }
+.poq-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(150px, auto) minmax(0, 1.2fr) minmax(0, 1.4fr) auto; gap: 12px; align-items: center; padding: 9px 12px; border-radius: 10px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--line-soft); margin-bottom: 6px; font-size: 14px; }
+.poq-row .code { font-family: var(--mono); color: var(--accent); overflow-wrap: anywhere; }
+.poq-row .poq-err { font-size: 12.5px; color: var(--text2); overflow-wrap: anywhere; }
+.poq-row .poq-act { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.poq-row .poq-reason { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.poq-row .poq-reason input { min-width: 240px; }
+@media (max-width: 900px) { .poq-row { grid-template-columns: 1fr auto; } .poq-row .muted, .poq-row .poq-err { grid-column: 1 / -1; } }

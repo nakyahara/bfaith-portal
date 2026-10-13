@@ -20,6 +20,10 @@
  *     黙って見送り続けると「動いているのか止まっているのか分からない」時間ができる
  *   - 台帳 = config/jobs-registry.mjs の `company-db-nightly-load`。成功・失敗の両方を jobs-monitor に ping する
  *     (dead-man 方式なので、**動かなくなったら「締切超過」で催促が出る**)
+ *   - 🆕 後ろの段 (steps・AI_reference CompanyDB構想/21): 本体のロードが終わった後 (成功でも失敗でも・見送り / 打ち切りでは流さない) に、
+ *     **別の接続・別の取引**で 1 つずつ流す。段が失敗しても本体のロード (もう commit 済み) は戻さない。段の失敗 = ジョブの ping は fail (理由を先頭に)。
+ *     ・po-settings-outbox (C1・0075): 新商品の登録の発注の設定の知らせを発注アプリへ届け直す (lib/order-settings-outbox.mjs の runOrderSettingsNightlyStep)。
+ *       24 時間を超えて届いていない知らせが 1 つでもあれば段の失敗 (= jobs-monitor が知らせる)。新しい定期実行は作らない (この 1 本の後ろの段)
  *   - Dark Launch: env `COMPANY_DB_LOAD_CRON_ENABLED` が '1' / 'true' のときだけ起動する
  *   - 🚨 **待つのをやめる上限**はあるが、それでロード本体は止まらない (Postgres の 1 トランザクションを
  *     外から切る手段を持っていない)。上限に達したら失敗として ping し、あとは次の回の「見送りが長引いている」
@@ -46,6 +50,27 @@ import { isRender } from '../../lib/is-render.js';
 
 /** config/jobs-registry.mjs の id */
 export const JOB_ID = 'company-db-nightly-load';
+/**
+ * 🆕 本体のロードの後ろの段 (順に流す・別の接続・別の取引)。run({ url, log }) → { ok, note, skipped? }。投げても段の失敗として扱う。
+ *   試験は runNightlyLoad({ steps }) で差し替える
+ */
+export const DEFAULT_STEPS = Object.freeze([
+  Object.freeze({ id: 'po-settings-outbox', label: '発注の設定の知らせ',
+    run: async ({ url, log }) => (await import('../../lib/order-settings-outbox.mjs')).runOrderSettingsNightlyStep({ url, log }) }),
+]);
+
+/** 後ろの段を順に流す。戻り値 { ok, note (失敗した段を先に), results: [{ id, ok, note }] } */
+export async function runNightlySteps(steps, ctx) {
+  const results = [];
+  for (const st of steps || []) {
+    let r;
+    try { r = await st.run(ctx); } catch (e) { r = { ok: false, note: `想定外: ${e && e.message ? e.message : e}` }; }
+    results.push({ id: st.id, label: st.label || st.id, ok: !!(r && r.ok), skipped: !!(r && r.skipped), note: String((r && r.note) || '') });
+  }
+  const bad = results.filter((r) => !r.ok);
+  const parts = [...bad, ...results.filter((r) => r.ok && !r.skipped)].map((r) => `${r.label}: ${r.note}`);
+  return { ok: bad.length === 0, note: parts.join(' / '), results };
+}
 const DEFAULT_CRON = '0 17 * * *';        // UTC 17:00 = JST 02:00
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -94,6 +119,7 @@ async function runNightlyLoadInner({
   log = (m) => console.log(`[company-db nightly] ${m}`),
   start = startLoad,
   ping = pingJob,
+  steps = DEFAULT_STEPS,
 } = {}) {
   if (!isRender()) {
     // 🚨 miniPC でも env がそろえば動いてしまう。Render 以外では **何も言わずに何もしない**
@@ -162,16 +188,26 @@ async function runNightlyLoadInner({
     ping(JOB_ID, 'fail', note);
     return { ok: false, skipped: false, note };
   }
+  // 🆕 後ろの段 (本体のロードが終わった後 = 成功でも失敗でも。別の接続・別の取引 = 段の失敗で本体は戻らない)
+  const st = await runNightlySteps(steps, { url, log });
+  if (st.note) log(`後ろの段: ${st.note}`);
   if (cur.status !== 'done') {
-    const note = `失敗: ${cur.error || cur.error_code || '理由不明'} (run=${cur.run_id})`;
+    const note = `失敗: ${cur.error || cur.error_code || '理由不明'} (run=${cur.run_id})${st.ok ? '' : ` / 段の失敗: ${st.note}`}`;
     log(note);
     ping(JOB_ID, 'fail', note);
-    return { ok: false, skipped: false, note };
+    return { ok: false, skipped: false, note, steps: st.results };
   }
-  const note = `${summarize(cur)} / ${secs}秒`;
+  if (!st.ok) {
+    // 本体は成功 (commit 済み・戻さない)。段の失敗の理由を先頭に (ping の note は 180 字で切られる)
+    const note = `段の失敗: ${st.note} / 本体は成功 ${summarize(cur)} / ${secs}秒`;
+    log(note);
+    ping(JOB_ID, 'fail', note);
+    return { ok: false, skipped: false, note, steps: st.results };
+  }
+  const note = `${summarize(cur)} / ${secs}秒${st.note ? ` / ${st.note}` : ''}`;
   log(`成功: ${note}`);
   ping(JOB_ID, 'ok', note);
-  return { ok: true, skipped: false, note };
+  return { ok: true, skipped: false, note, steps: st.results };
 }
 
 /** server.js から呼ぶ。env で有効にしていなければ何もしない (Dark Launch) */

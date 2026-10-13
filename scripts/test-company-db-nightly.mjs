@@ -47,7 +47,7 @@ console.log('夜間の再ロード');
 
 await ta('成功したら ok を ping する。何が変わったかが note に入る', async () => {
   const ping = spyPing();
-  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: fakeStart(doneRun), ping }));
+  const r = await withEnv(configured, () => runNightlyLoad({ steps: [], log: quiet, start: fakeStart(doneRun), ping }));
   assert.equal(r.ok, true);
   assert.equal(r.skipped, false);
   assert.equal(ping.calls.length, 1);
@@ -65,7 +65,7 @@ await ta('成功したら ok を ping する。何が変わったかが note に
 await ta('何も変わらなかった晩は「変化なし」と書く (ロードは冪等なので、これが普通の晩)', async () => {
   const ping = spyPing();
   const same = { run_id: 'load_test_2', status: 'done', summary: { products: { planned: 10, applied: 0, same: 10 } }, conflicts: 0, unresolved: {} };
-  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: fakeStart(same), ping }));
+  const r = await withEnv(configured, () => runNightlyLoad({ steps: [], log: quiet, start: fakeStart(same), ping }));
   assert.equal(r.ok, true);
   assert.match(ping.calls[0][2], /変化なし/);
   assert.ok(!ping.calls[0][2].includes('不一致'));
@@ -74,7 +74,7 @@ await ta('何も変わらなかった晩は「変化なし」と書く (ロー�
 await ta('失敗したら fail を ping する (理由つき)', async () => {
   const ping = spyPing();
   const failed = { run_id: 'load_test_3', status: 'failed', error: 'connect ECONNREFUSED', error_code: 'ECONNREFUSED' };
-  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: fakeStart(failed), ping }));
+  const r = await withEnv(configured, () => runNightlyLoad({ steps: [], log: quiet, start: fakeStart(failed), ping }));
   assert.equal(r.ok, false);
   assert.deepEqual(ping.calls[0].slice(0, 2), [JOB_ID, 'fail']);
   assert.match(ping.calls[0][2], /ECONNREFUSED/);
@@ -84,7 +84,7 @@ await ta('失敗したら fail を ping する (理由つき)', async () => {
 await ta('別のロードが走っていたら見送る (二重に流さない・ping も打たない)', async () => {
   const ping = spyPing();
   const busy = () => ({ started: false, current: { run_id: 'load_manual_9', started_at: new Date().toISOString() }, done: Promise.resolve({}) });
-  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: busy, ping }));
+  const r = await withEnv(configured, () => runNightlyLoad({ steps: [], log: quiet, start: busy, ping }));
   assert.equal(r.skipped, true);
   assert.equal(r.ok, true, '見送りは失敗ではない');
   assert.equal(ping.calls.length, 0, '成功の ping を打つと「動いている」と誤解される');
@@ -96,7 +96,7 @@ await ta('見送りが長引いていたら「前の回が終わっていない�
   const ping = spyPing();
   const old = new Date(Date.now() - 5 * 3600 * 1000).toISOString();
   const stuck = () => ({ started: false, current: { run_id: 'load_stuck_1', started_at: old }, done: Promise.resolve({}) });
-  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: stuck, ping }));
+  const r = await withEnv(configured, () => runNightlyLoad({ steps: [], log: quiet, start: stuck, ping }));
   assert.equal(r.ok, false);
   assert.equal(r.skipped, true);
   assert.deepEqual(ping.calls[0].slice(0, 2), [JOB_ID, 'fail']);
@@ -104,7 +104,7 @@ await ta('見送りが長引いていたら「前の回が終わっていない�
   assert.match(ping.calls[0][2], /5\.0時間前から/);
   // 何時間で怒るかは env で変えられる
   const ping2 = spyPing();
-  const r2 = await withEnv({ ...configured, COMPANY_DB_LOAD_SKIP_ALERT_H: '6' }, () => runNightlyLoad({ log: quiet, start: stuck, ping: ping2 }));
+  const r2 = await withEnv({ ...configured, COMPANY_DB_LOAD_SKIP_ALERT_H: '6' }, () => runNightlyLoad({ steps: [], log: quiet, start: stuck, ping: ping2 }));
   assert.equal(r2.ok, true, '6 時間より短いのでまだ怒らない');
   assert.equal(ping2.calls.length, 0);
 });
@@ -114,7 +114,7 @@ await ta('見送りの判定は started_at が変でも壊れない (無い・�
   for (const bad of [undefined, '', 'こわれている', new Date(Date.now() + 86400000).toISOString()]) {
     const ping = spyPing();
     const busy = () => ({ started: false, current: { run_id: 'load_x', started_at: bad }, done: Promise.resolve({}) });
-    const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: busy, ping }));
+    const r = await withEnv(configured, () => runNightlyLoad({ steps: [], log: quiet, start: busy, ping }));
     assert.equal(r.skipped, true, JSON.stringify(bad));
     assert.equal(r.ok, true, JSON.stringify(bad));
     assert.equal(ping.calls.length, 0, JSON.stringify(bad));
@@ -151,7 +151,7 @@ await ta('材料 (warehouse-mirror.db) が無ければ始めない', async () =>
 await ta('開始のところが投げても、失敗として ping して終わる (cron の中で投げっぱなしにしない)', async () => {
   const ping = spyPing();
   const boom = () => { throw new Error('いきなり壊れた'); };
-  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: boom, ping }));
+  const r = await withEnv(configured, () => runNightlyLoad({ steps: [], log: quiet, start: boom, ping }));
   assert.equal(r.ok, false);
   assert.deepEqual(ping.calls[0].slice(0, 2), [JOB_ID, 'fail']);
   assert.match(ping.calls[0][2], /いきなり壊れた/);
@@ -160,7 +160,7 @@ await ta('開始のところが投げても、失敗として ping して終わ�
 await ta('待っても終わらないときは失敗にする (🚨 ロード自体は止まらない。次の回の見送り判定に任せる)', async () => {
   const ping = spyPing();
   const never = () => ({ started: true, current: { run_id: 'load_test_slow' }, done: new Promise(() => {}) });
-  const r = await withEnv({ ...configured, COMPANY_DB_LOAD_TIMEOUT_MS: '1000' }, () => runNightlyLoad({ log: quiet, start: never, ping }));
+  const r = await withEnv({ ...configured, COMPANY_DB_LOAD_TIMEOUT_MS: '1000' }, () => runNightlyLoad({ steps: [], log: quiet, start: never, ping }));
   assert.equal(r.ok, false);
   assert.match(r.note, /待っても終わらない/);
   assert.match(r.note, /走り続けている/, 'ロードを止めたわけではないと書く');
@@ -189,6 +189,57 @@ await ta('上限の env が不正なら、ロードを始めずに失敗にす�
   assert.equal(r.ok, false);
   assert.equal(startCalled, false);
   assert.match(ping.calls[0][2], /COMPANY_DB_LOAD_TIMEOUT_MS/);
+});
+
+console.log('\n後ろの段 (steps・🆕 AI_reference CompanyDB構想/21 C1 = 発注の設定の知らせ)');
+const step = (id, r, calls = []) => ({ id, label: `段 ${id}`, run: async (ctx) => { calls.push({ id, ctx }); if (r instanceof Error) throw r; return r; } });
+
+await ta('段: 本体のロードの後に順に流す (同じ URL を渡す)・全部 ok = ping ok (段の note を後ろに)', async () => {
+  const ping = spyPing(); const calls = [];
+  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: fakeStart(doneRun), ping, steps: [step('a', { ok: true, note: '届けた 2' }, calls), step('b', { ok: true, skipped: true, note: '飛ばした' }, calls)] }));
+  assert.equal(r.ok, true);
+  assert.deepEqual(calls.map((c) => [c.id, c.ctx.url]), [['a', configured.COMPANY_DB_URL], ['b', configured.COMPANY_DB_URL]]);
+  assert.deepEqual(ping.calls.map((c) => c.slice(0, 2)), [[JOB_ID, 'ok']]);
+  assert.match(ping.calls[0][2], /^run=load_test_1/);
+  assert.match(ping.calls[0][2], /段 a: 届けた 2/);
+  assert.ok(!ping.calls[0][2].includes('飛ばした'), '飛ばした段は ok の note に書かない');
+});
+
+await ta('段の失敗 = ping fail (理由を先頭に・本体は成功と書く)・ほかの段も流す・投げた段も失敗', async () => {
+  const ping = spyPing(); const calls = [];
+  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: fakeStart(doneRun), ping,
+    steps: [step('a', { ok: false, note: '24時間超 1: new-1' }, calls), step('b', new Error('こわれた'), calls), step('c', { ok: true, note: 'ok' }, calls)] }));
+  assert.equal(r.ok, false);
+  assert.equal(calls.length, 3, '1 つ失敗しても後の段を流す');
+  assert.deepEqual(ping.calls.map((c) => c.slice(0, 2)), [[JOB_ID, 'fail']]);
+  assert.match(ping.calls[0][2], /^段の失敗: 段 a: 24時間超 1: new-1 \/ 段 b: 想定外: こわれた/);
+  assert.match(ping.calls[0][2], /本体は成功 run=load_test_1/);
+  assert.deepEqual(r.steps.map((s) => [s.id, s.ok]), [['a', false], ['b', false], ['c', true]]);
+});
+
+await ta('本体のロードが失敗しても段は流す (届け直しは本体と関係ない)・ping は fail (本体の理由が先)', async () => {
+  const ping = spyPing(); const calls = [];
+  const failed = { run_id: 'load_test_4', status: 'failed', error: 'deadlock' };
+  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: fakeStart(failed), ping, steps: [step('a', { ok: false, note: '24時間超 1' }, calls)] }));
+  assert.equal(r.ok, false);
+  assert.equal(calls.length, 1);
+  assert.match(ping.calls[0][2], /^失敗: deadlock \(run=load_test_4\) \/ 段の失敗: 段 a: 24時間超 1/);
+});
+
+await ta('見送り・待っても終わらない = 段は流さない (本体が走っている間に別の取引を足さない)', async () => {
+  const calls = [];
+  const busy = () => ({ started: false, current: { run_id: 'load_manual_9', started_at: new Date().toISOString() }, done: Promise.resolve({}) });
+  await withEnv(configured, () => runNightlyLoad({ log: quiet, start: busy, ping: spyPing(), steps: [step('a', { ok: true, note: 'x' }, calls)] }));
+  const never = () => ({ started: true, current: { run_id: 'load_test_slow2' }, done: new Promise(() => {}) });
+  await withEnv({ ...configured, COMPANY_DB_LOAD_TIMEOUT_MS: '1000' }, () => runNightlyLoad({ log: quiet, start: never, ping: spyPing(), steps: [step('a', { ok: true, note: 'x' }, calls)] }));
+  assert.equal(calls.length, 0);
+});
+
+await ta('既定の段 = 発注の設定の知らせ (Render の外では飛ばす = 何も繋がない)', async () => {
+  const { DEFAULT_STEPS } = await import('../apps/company-db/nightly.mjs');
+  assert.deepEqual(DEFAULT_STEPS.map((s) => s.id), ['po-settings-outbox']);
+  const r = await withEnv({ RENDER: undefined }, () => DEFAULT_STEPS[0].run({ url: 'postgres://u:p@127.0.0.1:1/none', log: quiet }));
+  assert.deepEqual([r.ok, r.skipped], [true, true]);
 });
 
 console.log('\n開始の口 (startLoad)');

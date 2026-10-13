@@ -88,7 +88,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価', 'CompanyDB出品一覧(Amazon)'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB注文(メルカリ)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価', 'CompanyDB出品一覧(Amazon)'];
 // 🚨 Amazon の決済と財務は env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator「Amazon決済と財務」の 1 工程・無ければ今までの 2 工程「Amazon Settlement」→「CompanyDB財務(Amazon)」
 //   (finance-coordinator-switch.js・#1567。走るのはどちらか片方 = retry の対象には両方の名前を載せる)
 
@@ -582,8 +582,13 @@ async function main() {
     // 🚨 runScript は引数が無いと '7' を足すので --incremental を必ず付ける)
     const cdbShipResult = runScript('apps/company-db/push/ne-shipments.mjs --incremental', 'Company DB 出荷 push', 1800000);
     results.push({ name: 'CompanyDB出荷', ...cdbShipResult });
+    // Company DB へメルカリ shops の注文を送る (2026-10-13。メルカリの API の取込は動いていない → NE の受注伝票 (店舗 8) から。数量だけ・金額は null・売上日次は作らない)。
+    // 出荷 push の後 = 送った後の伝票との結び直しで、今朝の店舗 8 の伝票も注文に結ばれる。NE 失敗時は送らない (古い raw を世代として確定させない)。
+    // --require-backfilled = 台帳に完了印 (初回の投入 → 突合 → --mark-backfilled) が付くまでは送らずに「バックフィル前」と出す。🚨 runScript は引数が無いと '7' を足すので --mall を必ず付ける
+    const cdbMcResult = runScript('apps/company-db/push/mall-orders.mjs --mall mercari --incremental --require-backfilled', 'Company DB 注文 push (メルカリ)', 1800000);
+    results.push({ name: 'CompanyDB注文(メルカリ)', ...cdbMcResult });
   } else {
-    console.log('[DailySync] NE API 失敗のため出荷サマリ再構築と Company DB 出荷 push をスキップ');
+    console.log('[DailySync] NE API 失敗のため出荷サマリ再構築と Company DB 出荷 push・注文 push (メルカリ) をスキップ');
   }
 
   // SP-API

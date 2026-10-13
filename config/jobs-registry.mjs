@@ -470,6 +470,9 @@ export const JOBS_REGISTRY = [
       + '止まると mart.v_sales_daily が古びる。失敗・打ち切りは push のステップが ❌。手で流す・検算 = README「売上の日次」)。'
       + '「Qoo10」の取込の直後にも同じ送り手 (--mall qoo10 --incremental --require-backfilled。08 §9 D5b-4。API の行だけ = 2026-02-19 以降。旧データの行は送らない。手順 = README「Qoo10 の注文」) が走る。'
       + '「Yahoo!ショッピング」の取込の直後にも同じ送り手 (--mall yahoo --incremental --require-backfilled。08 §9 D5b-5。2026-09-26 に D-32 を「入れる」に。0031 の適用 → 初回の投入 → 突合 → --mark-backfilled まで「バックフィル前」と出して送らない。手順 = README「Yahoo の注文」) が走る。'
+      + '🆕 2026-10-13: 「Company DB 出荷 push」の直後に「Company DB 注文 push (メルカリ)」(mall-orders.mjs --mall mercari --incremental --require-backfilled。メルカリの API の取込は動いていない (raw_mercari_orders 0 行) ので、'
+      + 'NE の受注伝票 (raw_ne_order_base + raw_ne_orders の店舗 8) から core.orders (mall mercari) へ。注文番号 = NE の受注番号 = メルカリの注文番号・明細の受注番号でまとめる (同梱)。数量だけ・金額は null・売上日次は作らない。'
+      + 'NE が失敗した朝は送らない。初回の投入 → 突合 → --mark-backfilled まで「バックフィル前」と出して送らない。止まると core.orders のメルカリが古びる。手順 = README「メルカリ shops の注文」。新しい定期実行は無い) が走る。'
       + 'Qoo10 の取込が失敗した朝は送信を見送って retry に載せ、自動再試行で取込が成功した回に送る (retry-failed-jobs.js の UPSTREAM_OF)。'
       + '「Amazon Ads (SKU)」の直後に「Company DB 広告費 (Amazon)」(fact_ad_spend の Amazon SP を Render Postgres の core.ad_spend_daily へ。apps/company-db/push/ad-spend.mjs --mall amazon --days 35。'
       + 'Company DB構想 11 の ② / 0035。取込の取得の記録 (ads_fetch_days) がある日だけ・Render に日ごとの世代と指紋を聞いて違う日だけ・1 日 = 1 要求 = 1 取引・古い世代は受け口が拒む・送った後に出品の結び直し。'
@@ -992,7 +995,10 @@ export const JOBS_REGISTRY = [
       + 'これが止まると Company DB は「その日の写し」のまま古びていき、mart の 360 度ビュー・欠落フラグ・'
       + 'モール間の値ズレが実態とずれる (見ている人は気づけない)。ロードは冪等なので、'
       + '毎晩流せば前日に SQLite で起きたことが翌朝には入っている。1 回 6〜10 秒。'
-      + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
+      + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)。'
+      + '🆕 後ろの段 (本体のロードの後・別の接続・別の取引 = 段が失敗しても本体は戻さない・段の失敗 = この ping が fail): '
+      + '① 発注の設定の知らせ (AI_reference CompanyDB構想/21 C1・migration 0075・lib/order-settings-outbox.mjs) = 新商品の登録で入れた発注の設定を発注アプリ (Render の SQLite の po_*) へ届け直す。'
+      + '24 時間を超えて届いていない知らせが 1 つでもあれば段の失敗 (新しい定期実行は作らず、この 1 本の後ろに載せた)',
     where: 'Render bfaith-portal 内 node-cron (apps/company-db/nightly.mjs startCompanyDbNightlyLoadCron。'
       + 'COMPANY_DB_LOAD_CRON_ENABLED=1 かつ RENDER=true のときだけ起動。miniPC も同じ server.js を動かすので、'
       + 'lib/is-render.js の isRender() で Render 以外を弾く。材料 (warehouse-mirror.db) の有無は別の検査 = 「Render なのに材料が無い」の検知)',
@@ -1015,7 +1021,11 @@ export const JOBS_REGISTRY = [
       + 'Render Logs は「company-db nightly」で検索。失敗したら report の conflicts (不一致) と unresolved (未解決) を見る。'
       + '途中で Render が再起動した回は /status の interrupted に出る (本適用が commit 済みかは ops.ingest_runs で分かる)。'
       + '正本 = AI_reference『システム設計/CompanyDB構想/07_初期ロード_名寄せレポート_20260910.md』、'
-      + '約束と手順 = db/company/README.md',
+      + '約束と手順 = db/company/README.md。'
+      + '🆕 note が「段の失敗: 発注の設定の知らせ: … (24時間超 N: コード)」= 新商品の発注の設定がまだ発注アプリに届いていない (本体のロードは成功 = note の「本体は成功 run=…」)。'
+      + 'マスタの入力 → 左の列「発注の設定の届け待ち」(/apps/master-edit/order-settings-outbox) を開く → 理由を見て「もう一度届ける」。'
+      + '「要確認」(発注アプリにほかの画面がもう設定を作っていた) は商品の画面の「発注の設定」で今の値を確かめてから「閉じる」(理由を書く)。'
+      + 'どうしても届かない = 商品の画面の「発注の設定」で入れてから「閉じる」',
   },
   {
     id: 'company-db-inventory-hourly',

@@ -40,6 +40,8 @@ import { computeShortageRisk, shortageSettings, validateShortageSetting, shortag
 import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 import { startFbaAutoRefresh, nextBusinessDay9Jst } from './scheduler.js';
 import { masterLegacyGate, legacyRecheck } from '../../lib/master-legacy-gate.mjs';
+import { orderOutboxStatus, readOrderSettingsPendingFor } from '../../lib/order-settings-outbox.mjs';
+import { withCompanyDb } from '../../lib/product-hub-outbox.mjs';
 import {
   writeOrderSettings, clearProductLinks, writeGroup, deleteGroup, OrderSettingsError, ATTR_FIELDS, hasLinkage, orderLotSource,
 } from './order-settings.js';
@@ -602,12 +604,53 @@ router.get('/api/overview', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-router.get('/api/supplier/:code', (req, res) => {
+/**
+ * 🆕 0075 (AI_reference CompanyDB構想/21 C1・lib/order-settings-outbox.mjs): 新商品の登録で入れた発注の設定が、まだこのアプリに届いていない商品。
+ *   Company DB の知らせ (ops.order_settings_outbox) を読む (読むついでに届け直す = 60 秒に 1 回まで・Render の中だけ)。3 秒で諦める (画面は止めない)。
+ *   決定 2 = b (中原さん 10/13): すすめる発注数は止めない (今のこのアプリの設定で出す)。印 (「発注の設定がまだ届いていない」) を出すだけ
+ *   印は画面に出ている商品のコードで Company DB に照らす (届いていない知らせが何件あっても欠けない・Codex #1703 R1 L2)。
+ *   戻り値 { ok, open, overdue, keys: Set<商品コードの照合キー> }。読めない = { ok: false, keys: 空 }
+ */
+async function orderSettingsPending(codes = []) {
+  const none = { ok: false, open: 0, overdue: 0, keys: new Set() };
+  // 状態の確かめとコードの照らしで共通の 3 秒 (画面は最大 3 秒で出す・Codex #1703 R2 L2)
+  const both = (async () => {
+    const st = await orderOutboxStatus({ limit: 1 });
+    if (!st || !st.ok || !st.ready) return none;
+    const k = await withCompanyDb((db) => readOrderSettingsPendingFor(db, codes), { applicationName: 'po-settings-marks', statementTimeout: '3s' });
+    if (!k || !k.ok || !k.value) return none;
+    return { ok: true, open: st.open || 0, overdue: st.overdue || 0, keys: new Set([...k.value].map((c) => normProductCode(c))) };
+  })().catch((e) => { console.error(`[purchase-orders] 発注の設定の届け待ちを読めない: ${e && e.message}`); return none; });
+  try {
+    return (await Promise.race([both, new Promise((r) => setTimeout(() => r(null), 3000).unref())])) || none;
+  } catch (e) { console.error(`[purchase-orders] 発注の設定の届け待ちを読めない: ${e && e.message}`); return none; }
+}
+/** 仕入先の画面に出る商品のコード (要発注・追加候補・掘り起こし・下書きのリスト外) */
+const workspaceCodes = (data) => (data ? [data.targets, data.candidates, data.horikoshi, data.draftExtras].flatMap((l) => (l || []).map((p) => p.code)) : []);
+/** 行に印を付ける (届いていない商品 = poPending) */
+function markOrderSettingsPending(data, pend) {
+  if (!data) return data;
+  for (const list of [data.targets, data.candidates, data.horikoshi, data.draftExtras]) {
+    for (const p of list || []) if (pend.keys.has(normProductCode(p.code))) p.poPending = true;
+  }
+  data.poPending = { ok: pend.ok, open: pend.open, overdue: pend.overdue };
+  return data;
+}
+// 🆕 0075: 画面の上の「発注の設定がまだ届いていない新商品 N 件」(全部の画面の共通の帯・pageShell の script が読む)
+router.get('/api/order-settings-outbox', async (req, res) => {
+  const st = await Promise.race([orderOutboxStatus({ limit: 50 }), new Promise((r) => setTimeout(() => r(null), 3000).unref())]).catch(() => null);
+  res.set('Cache-Control', 'no-store');
+  if (!st) return res.json({ ok: false, ready: false, open: 0, overdue: 0, items: [], error: 'Company DB を読めません (時間切れ)' });
+  res.json({ ok: !!st.ok, ready: !!st.ready, open: st.open || 0, overdue: st.overdue || 0,
+    items: (st.items || []).slice(0, 50).map((i) => ({ code: i.code, status: i.status, overdue: !!i.overdue, created_at: i.created_at })) });
+});
+
+router.get('/api/supplier/:code', async (req, res) => {
   try {
     const code = normSupplierCode(req.params.code);
     const data = supplierWorkspaceData(code);
     if (!data) return res.status(404).json({ ok: false, error: '仕入先が見つかりません' });
-    res.json({ ok: true, ...data });
+    res.json({ ok: true, ...markOrderSettingsPending(data, await orderSettingsPending(workspaceCodes(data))) });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -3485,6 +3528,10 @@ const CSS = `
   .b-draft { background: var(--accent-soft); color: var(--accent-d); }
   .b-issued { background: var(--ok-soft); color: var(--ok); }
   .b-warn { background: var(--danger-soft); color: var(--danger); }
+  .b-posettings { background: var(--warn-soft); color: var(--warnc); border: 1px solid #f0d089; }
+  .po-outbox { background: var(--warn-soft); border: 1px solid #f0d089; color: var(--warnc); padding: 8px 14px; border-radius: 10px; margin-bottom: 12px; font-size: 13px; }
+  .po-outbox.late { background: var(--danger-soft); border-color: #f3b4b4; color: var(--danger); }
+  .po-outbox a { color: inherit; font-weight: 700; }
   table.t { border-collapse: separate; border-spacing: 0; width: 100%; background: var(--card); font-size: 13.5px; }
   table.t th, table.t td { border-bottom: 1px solid var(--line); padding: 9px 10px; text-align: left; line-height: 1.5; }
   /* top:0 = スクロール領域 (.bd) の上端に貼り付く */
@@ -3596,9 +3643,21 @@ function pageShell(title, active, body, script) {
   </nav>
   <a href="/" class="back sp">← ポータルに戻る</a>
 </header>
-<div class="wrap">${body}</div>
+<div class="wrap"><div class="po-outbox" id="poOutbox" hidden></div>${body}</div>
 <div id="toast"></div>
 <script>
+// 🆕 0075: 新商品の登録で入れた発注の設定が、まだこのアプリに届いていない商品の数 (0 件・読めない = 出さない)
+(function () {
+  var el = document.getElementById('poOutbox');
+  if (!el || !window.fetch) return;
+  fetch('/apps/purchase-orders/api/order-settings-outbox', { credentials: 'same-origin' }).then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+    if (!j || !j.ok || !j.ready || !(j.open > 0)) return;
+    el.innerHTML = '⚠️ 新商品の登録で入れた <b>発注の設定がまだ届いていない商品が ' + j.open + ' 件</b>' + (j.overdue ? ' (24 時間超 ' + j.overdue + ' 件)' : '')
+      + ' — すすめる発注数は今のこのアプリの設定で出しています。<a href="/apps/master-edit/order-settings-outbox">届け待ちを見る</a>';
+    if (j.overdue) el.className = 'po-outbox late';
+    el.hidden = false;
+  }).catch(function () {});
+})();
 function toast(msg) {
   var t = document.getElementById('toast');
   t.textContent = msg; t.style.display = 'block';
@@ -4126,12 +4185,14 @@ if (btnNeClear) btnNeClear.addEventListener('click', function() {
 });
 
 // ─── 画面2: 仕入先ワークスペース ───
-router.get('/supplier/:code', (req, res) => {
+router.get('/supplier/:code', async (req, res) => {
   let data;
   try {
     data = supplierWorkspaceData(normSupplierCode(req.params.code));
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
   if (!data) return res.status(404).send('仕入先が見つかりません: ' + he(req.params.code));
+  // 🆕 0075: 発注の設定がまだ届いていない新商品に印 (すすめる数は止めない = 決定 2 = b)
+  markOrderSettingsPending(data, await orderSettingsPending(workspaceCodes(data)));
 
   const body = `
     <div class="toolbar">
@@ -4237,6 +4298,11 @@ function boDateNote(p) {
 }
 // 要発注リストに「発注数を入れたから並んでいる」行 (本来は追加候補/掘り起こし)。renderTargetsで再構築
 var ADDED = {};
+// 🆕 0075: 新商品の登録で入れた発注の設定が、まだこのアプリに届いていない (すすめる数は今の設定で出している = 止めない)
+function poPendBadge(p) {
+  if (!p.poPending) return '';
+  return ' <span class="badge b-posettings" title="新商品の登録で入れた発注の設定 (ロット・グループ) が、まだこのアプリに届いていません。推奨発注は今のこのアプリの設定 (ロットが無ければ空) で出しています。届くと自動で変わります">⚠ 発注の設定がまだ届いていない</span>';
+}
 function addedBadge(p) {
   if (!ADDED[p.code]) return '';
   return ' <span class="badge" style="background:var(--accent-soft);color:var(--accent-d)" title="要発注判定ではないが発注数が入っているためこのグループに表示中 (発注数を消すと戻ります)">＋追加</span>';
@@ -4244,7 +4310,7 @@ function addedBadge(p) {
 function rowHtml(p, kind) {
   var rec = p.recQty ? p.recQty.toLocaleString('ja-JP') : '—';
   return '<tr>' +
-    '<td><a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + selBadge(p) + addedBadge(p) + bcBadge(p.code, p.barcode) + '</td>' +
+    '<td><a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + selBadge(p) + poPendBadge(p) + addedBadge(p) + bcBadge(p.code, p.barcode) + '</td>' +
     '<td><a class="pname" data-acc="' + esc(p.code) + '" title="クリックで詳細・発注条件・同グループ商品">' + esc(p.name) + '</a></td>' +
     '<td class="r">' + months(p) + '</td>' +
     '<td class="r">' + p.sales30.toLocaleString('ja-JP') + '</td>' +

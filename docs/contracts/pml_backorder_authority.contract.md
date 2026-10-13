@@ -25,6 +25,7 @@
 - `apps/warehouse-mirror/db.js` (mirror DDL) / `apps/warehouse-mirror/router.js` (ingest 検証・GAS endpoint の差替実装そのもの)
 - `apps/purchase-orders/db.js` (正本ビューの定義) / `apps/purchase-orders/logic.js` (NEオーバーレイの表示用)
 - `apps/product-management-list/router.js` (ロールバック fallback)
+- `apps/master-edit/ne-delete-pml.mjs` (NE から消す #1690 の確かめだけのファイル。NE は自分に発注残が残っている商品の削除を断るので、NE の値そのものを「0 か」だけ見る。業務の注残としては使わない = 発注アプリの注残は台帳で別に見る。ほかの用途のコードをこのファイルに足さない)
 
 ## ロールバック
 

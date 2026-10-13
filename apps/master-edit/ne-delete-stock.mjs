@@ -2,7 +2,7 @@
  * ne-delete-stock.mjs — NE から消す CSV (0072・決定 Q3 a = 在庫が残っている商品は入れない) の「アプリが読む在庫」(lib/master-ne-delete.mjs の stockReader)
  *
  * Postgres の取引の前に、Render の写し (warehouse-mirror.db) から読む (DB は確かめられない = DB が記録に残す):
- *   ne_own / ne_allocated / ne_on_order / fba = 商品管理リストの公開の回 (sales-qty.mjs の readPmlStock = 毎朝の NE の取得の 在庫数・引当数・発注残数 (NE の古い値)・FBA の在庫)
+ *   ne_own / ne_allocated / ne_on_order / fba = 商品管理リストの公開の回 (ne-delete-pml.mjs の readPmlStock = 注残の契約の許可リストはこのファイルだけ・毎朝の NE の取得の 在庫数・引当数・発注残数 (NE の古い値)・FBA の在庫)
  *   logizard / logizard_allocated = ロジザードの今の在庫と引当を別々に (毎時の写し mirror_logizard_stock を、この削除のためだけに読む = readLogizardForDelete)
  *     🆕 #1690 Codex R1 High 1: 一覧・商品の画面の在庫 (extras.mjs の readWarehouseStock / stockOf = 在庫数だけ・読めない値は 0) は変えない。
  *     ここは 商品ID ごとに 在庫数 と 引当数 を足し、1 行でも 0 以上の整数でない値があればその商品は「読めない」(0 にしない)・写しが古い = 全部「読めない」
@@ -12,7 +12,7 @@
  * 🚨 Company DB の在庫の日次 (NE・ロジザード) は DB の関数 (ops.ne_del_check) が自分で読む = ここでは読まない
  */
 import path from 'node:path';
-import { readPmlStock } from './sales-qty.mjs';
+import { readPmlStock } from './ne-delete-pml.mjs';
 import { readBackorders, stockStale } from './extras.mjs';
 import { readMirrorLogizardStock } from '../company-db/inventory/logizard.mjs';
 import { normProductCode } from '../purchase-orders/db.js';
