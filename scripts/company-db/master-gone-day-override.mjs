@@ -68,6 +68,12 @@ export const okWithDays = (r, days) => {
   return other.length === 0 && Number(r.streak || 0) >= days;
 };
 
+/**
+ * DB がはっきり返した誤りか (= 取引は巻き戻った・1 件も足していない)。SQLSTATE (5 文字) があって、接続の誤り (08xxx)・管理者の切断 (57P0x) でないとき。
+ * それ以外 (コードなし・ECONNRESET・時間切れ・接続の誤り) = 結果が分からない (commit の後に切れたかもしれない)
+ */
+export const definiteDbError = (e) => !!e && typeof e.code === 'string' && /^[0-9A-Z]{5}$/.test(e.code) && !/^08/.test(e.code) && !/^57P0/.test(e.code);
+
 /** 本体 (試験は db を渡す)。戻り値 = { mode, checks, added, exitCode, error? } */
 export async function runDayOverride(db, opts, { log = console.log } = {}) {
   const codes = opts.codesFile ? readCodesFile(opts.codesFile) : opts.codes;
@@ -77,7 +83,8 @@ export async function runDayOverride(db, opts, { log = console.log } = {}) {
   log(`確かめ (読むだけ・今の ops.sku_gone_from_ne_check): ${checks.length} 件・許可 ${opts.days} 日なら やめてよい ${willOk} 件`);
   for (const r of checks) {
     const ov = r.day_override ? ` [今の許可 ${r.day_override.required_days} 日・${r.day_override.actor_id}・期限 ${r.day_override.expires_at}]` : '';
-    log(`${okWithDays(r, opts.days) ? '✅' : '⛔'} ${r.code ?? '(?)'}  NE に無い ${r.streak ?? 0}/${r.required_runs ?? '?'} 日${ov}`);
+    // 🆕 #1709 Codex R2 L2: 今の答え (今の許可の分母) と、足す許可 (--days) の分母を分けて出す。記号は --days で計算した方
+    log(`${okWithDays(r, opts.days) ? '✅' : '⛔'} ${r.code ?? '(?)'}  今 NE に無い ${r.streak ?? 0}/${r.required_runs ?? '?'} 日${ov} → 許可 ${opts.days} 日なら ${r.streak ?? 0}/${opts.days} 日`);
     for (const p of r.problems || []) log(`      - ${GONE_REASON_WORDS[p.reason] || p.reason}: ${p.text}`);
   }
   if (!opts.apply) {
@@ -93,8 +100,13 @@ export async function runDayOverride(db, opts, { log = console.log } = {}) {
     log(`${x.replayed ? 'もう足してあった' : '許可を足した'} ${x.overrides.length} 件 (日数 ${x.required_days}・期限 ${x.expires_at}・request_id ${requestId})`);
     return { mode: 'apply', checks, added: x, exitCode: 0 };
   } catch (e) {
-    log(`⛔ 許可を足せなかった (1 件も足していない): ${e.message}`);
-    return { mode: 'apply', checks, added: null, exitCode: 1, error: { code: e.code, message: String(e.message || e) } };
+    // 🆕 #1709 Codex R2 M1: DB がはっきり断った (SQLSTATE がある = 取引は巻き戻った) と、接続・応答が無い (commit の後に切れたかもしれない) を分ける
+    if (!definiteDbError(e)) {
+      log(`⚠️ 結果が分からない (接続・応答が無い: ${e.message})。足せたかもしれない = 同じコマンド (同じ --request-id ${requestId}) をもう一度流す (足せていれば前の答えが返る・許可は増えない)`);
+      return { mode: 'apply', checks, added: null, exitCode: 1, error: { code: e.code ?? null, message: String(e.message || e), unknown: true } };
+    }
+    log(`⛔ 許可を足せなかった (DB が断った・1 件も足していない): ${e.message}`);
+    return { mode: 'apply', checks, added: null, exitCode: 1, error: { code: e.code, message: String(e.message || e), unknown: false } };
   }
 }
 

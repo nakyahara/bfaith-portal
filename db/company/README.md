@@ -2630,7 +2630,7 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 ### 「NE から消えた」の日数の許可 (0076・2026-10-13 夜 中原さんの決定 B = 色違いの登録 (widen) を 10/15 から 10/14 に 1 日前倒し)
 - **なぜ**: widen には代表のずれ 0 件が要る。今のずれ 18 件は 0070 の「NE から消えた」(完全な NE の取得に 3 日続けて無い) でやめる予定だが、今は全部 1 / 3 日 (ほかの止まる理由は無い)
 - **表** `ops.sku_gone_from_ne_day_overrides` (SKU・必要な日数 1〜3・だれ・理由・request_id・DB のロール・作った時刻・期限 = 作った時刻 + 1〜14 日)。追記だけ (変えない・消さない)・書くのは `ops.add_sku_gone_day_overrides` だけ (取引の中の印)。
-  効くのは期限の中の一番新しい 1 つ (`ops.sku_gone_day_override_active`)・期限切れ = 3 日に戻る
+  効くのは一番新しい許可 1 つ (`ops.sku_gone_day_override_active`)。それが期限切れなら許可なし (3 日)・古い許可はよみがえらない
 - **足す** `ops.add_sku_gone_day_overrides(request_id, 人, 理由, コード, 日数, 有効な日数)` = 運用のロール **master_ops だけ**に実行 (画面のロールには渡さない)。1〜100 件・全部か何も無いか (無い・available でない・例外のコードが 1 つでもある = 何も書かない)・押し直し = 前の答え
 - **確かめ** `ops.sku_gone_from_ne_check` (0072 の版から写して 🆕 0076 の行だけ) = 許可のある SKU は「3 日」の代わりに許可の日数。**ほかの決まりは全部そのまま**。答えと根拠 (evidence) に `day_override` (許可の番号・日数・ふだんの日数・だれ・理由・期限) = CLI の計画のハッシュ・登録の状態の履歴に許可の事実が入る
 - CLI = `scripts/company-db/master-gone-day-override.mjs` (確かめが既定 = 今の答えと「許可を足したらやめてよいか」/ `--apply --days 1 --valid-days 7 --actor --reason --yes`)。やめるのは今まで通り `master-gone-from-ne.mjs` (dry-run → `--apply --expect-hash`)

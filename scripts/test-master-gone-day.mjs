@@ -28,7 +28,7 @@ import { forceNewOpen } from './fixtures/master-widen.mjs';
 import { OWNED_COLUMNS } from '../config/master-ownership.mjs';
 import { cancelSkuGoneFromNe, gonePlanHash } from '../lib/master-gone.mjs';
 import { runGone } from './company-db/master-gone-from-ne.mjs';
-import { parseDayArgs, runDayOverride, okWithDays } from './company-db/master-gone-day-override.mjs';
+import { parseDayArgs, runDayOverride, okWithDays, definiteDbError } from './company-db/master-gone-day-override.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MIG = path.join(ROOT, 'db', 'company', 'migrations');
@@ -354,6 +354,8 @@ await ta('[K2] 確かめ (既定) = 何も書かない・許可を足したら�
   const l3 = [];
   await runDayOverride(opsDb, parseDayArgs(['--codes', 'b02', '--days', '3']), { log: (l) => l3.push(l) });
   assert.ok(l3.some((l) => /⛔ b02/.test(l)) && l3.some((l) => /今の許可 1 日/.test(l)), l3.join('\n'));
+  // 🆕 #1709 Codex R2 L2: 今の分母 (1/1) と --days の分母 (1/3) を分けて出す
+  assert.ok(l3.some((l) => /⛔ b02 +今 NE に無い 1\/1 日 \[今の許可 1 日.*\] → 許可 3 日なら 1\/3 日$/.test(l)), l3.join('\n'));
   const rid = lines.map((l) => /--request-id ([0-9a-f-]{36})/.exec(l)).find(Boolean)?.[1];
   assert.ok(rid && rid === dry.requestId, '確かめが --apply に使う request_id を出す');
   const args = ['--codes', 'd03', '--days', '1', '--valid-days', '3', '--apply', '--request-id', rid, '--actor', 'Naka@Test', '--reason', '決定 B', '--yes'];
@@ -367,8 +369,26 @@ await ta('[K2] 確かめ (既定) = 何も書かない・許可を足したら�
   const row = await one(`select o.actor_id, o.reason, o.required_days, o.db_user, extract(epoch from o.expires_at - o.created_at)::int as v from ops.sku_gone_from_ne_day_overrides o join core.skus k on k.sku_id = o.sku_id where k.code = 'd03'`);
   assert.deepEqual(row, { actor_id: 'naka@test', reason: '決定 B', required_days: 1, db_user: 'master_ops', v: 3 * 86400 });
   assert.equal((await check('d03')).ok, true);
-  const bad = await runDayOverride(opsDb, parseDayArgs(['--codes', 'zz-none', '--apply', '--request-id', crypto.randomUUID(), '--actor', 'a@b', '--reason', 'x', '--yes']), { log: quiet });
-  assert.equal(bad.exitCode, 1);
+  const badLines = [];
+  const bad = await runDayOverride(opsDb, parseDayArgs(['--codes', 'zz-none', '--apply', '--request-id', crypto.randomUUID(), '--actor', 'a@b', '--reason', 'x', '--yes']), { log: (l) => badLines.push(l) });
+  assert.equal(bad.exitCode, 1); assert.equal(bad.error.unknown, false);
+  assert.ok(badLines.some((l) => /⛔ 許可を足せなかった \(DB が断った・1 件も足していない\)/.test(l)), badLines.join('\n'));
+  // 🆕 #1709 Codex R2 M1: commit の後に応答が消える (接続が切れる) = 「結果が分からない・同じコマンドで押し直す」→ 押し直すと前の答え (許可は増えない)
+  const rid2 = crypto.randomUUID();
+  const args2 = ['--codes', 'd08', '--days', '1', '--apply', '--request-id', rid2, '--actor', 'naka@test', '--reason', '決定 B', '--yes'];
+  const lostDb = { query: async (t, p) => { const r = await opsDb.query(t, p); if (/add_sku_gone_day_overrides/.test(t)) throw new Error('Connection terminated unexpectedly'); return r; } };
+  const lostLines = [];
+  const lost = await runDayOverride(lostDb, parseDayArgs(args2), { log: (l) => lostLines.push(l) });
+  assert.equal(lost.exitCode, 1); assert.equal(lost.error.unknown, true);
+  assert.ok(lostLines.some((l) => /結果が分からない/.test(l) && l.includes(rid2)), lostLines.join('\n'));
+  assert.ok(!lostLines.some((l) => /1 件も足していない/.test(l)));
+  const n1 = (await one('select count(*)::int as n from ops.sku_gone_from_ne_day_overrides where request_id = $1', [rid2])).n;
+  assert.equal(n1, 1, 'commit はされている');
+  const re = await runDayOverride(opsDb, parseDayArgs(args2), { log: quiet });
+  assert.equal(re.exitCode, 0); assert.equal(re.added.replayed, true);
+  assert.equal((await one('select count(*)::int as n from ops.sku_gone_from_ne_day_overrides where request_id = $1', [rid2])).n, 1);
+  // 分け方: SQLSTATE がある = はっきり断った / コードなし・ECONNRESET・08xxx・57P01 = 分からない
+  assert.deepEqual(['P0001', '22023', '42501', '23505', '57014', undefined, 'ECONNRESET', '08006', '57P01'].map((code) => definiteDbError({ code })), [true, true, true, true, true, false, false, false, false]);
 });
 
 await pg.close();
