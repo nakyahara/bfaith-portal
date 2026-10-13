@@ -88,6 +88,8 @@ export const JOB_DEFINITIONS = {
   'CompanyDB注文(Qoo10)': { script: 'apps/company-db/push/mall-orders.mjs',       args: ['--mall', 'qoo10', '--incremental', '--require-backfilled'], timeoutMs: 1800000 },
   // Company DB へ Yahoo の注文を送る (D5b-5)。同上
   'CompanyDB注文(Yahoo)': { script: 'apps/company-db/push/mall-orders.mjs',       args: ['--mall', 'yahoo', '--incremental', '--require-backfilled'], timeoutMs: 1800000 },
+  // Company DB へメルカリ shops の注文を送る (2026-10-13。元 = NE の受注伝票 (店舗 8))。同上。上流の NE の取込は retry されない = 朝に見送った回は載せない (UPSTREAM_OF に入れない)
+  'CompanyDB注文(メルカリ)': { script: 'apps/company-db/push/mall-orders.mjs',    args: ['--mall', 'mercari', '--incremental', '--require-backfilled'], timeoutMs: 1800000 },
   // Amazon決済と財務 (2026-10-01・D7b-1b-3): 決済の取込 + Company DB の Amazon 財務 + 決済のそろい (coverage) を 1 回として回す coordinator。
   //   retry の単位も coverage の回の全体 (送り手だけの retry は、その世代の一覧が無いので complete にできない。設計 13 §3.1 R18 M4)。
   //   前の 'Amazon Settlement' (取込) と 'CompanyDB財務(Amazon)' (送り手) の 2 つをまとめた。冪等 (取込は INSERT OR IGNORE・送り手は台帳の指紋・新しい世代で回し直す)
@@ -146,7 +148,7 @@ export const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'm_products_history', 'CompanyDB観測原価', 'Amazon決済と財務', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'CompanyDB広告費(Amazon)', 'CompanyDB出品一覧(Amazon)', 'Amazon手数料', 'ABA検索ワード', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'DBバックアップ', 'CompanyDB見張り'];
+export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB注文(メルカリ)', 'm_products_history', 'CompanyDB観測原価', 'Amazon決済と財務', 'Amazon Settlement', 'CompanyDB財務(Amazon)', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'CompanyDB広告費(Amazon)', 'CompanyDB出品一覧(Amazon)', 'Amazon手数料', 'ABA検索ワード', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'DBバックアップ', 'CompanyDB見張り'];
 
 /**
  * 上流 (取込) → 下流 (その取込の結果を使うジョブ)。下流は、**同じ回で上流を再試行して失敗したら走らせない** (古い・途中の raw を送らない)。

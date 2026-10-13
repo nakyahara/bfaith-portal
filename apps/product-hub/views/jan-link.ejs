@@ -1,0 +1,198 @@
+<%- include('_header') %>
+<style>
+  .jl-steps { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 12px; }
+  .jl-step { flex: 1 1 200px; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; background: #f8fafc; font-size: 12.5px; }
+  .jl-step b { display: block; font-size: 13px; margin-bottom: 4px; color: #1e293b; }
+  .jl-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 10px 0; }
+  .jl-tile { border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; background: #fff; }
+  .jl-tile .n { font-size: 22px; font-weight: 800; line-height: 1.2; }
+  .jl-tile .l { font-size: 12px; color: #64748b; }
+  .jl-tile.link { border-color: #86efac; background: #f0fdf4; } .jl-tile.link .n { color: #166534; }
+  .jl-tile.review { border-color: #fdba74; background: #fff7ed; } .jl-tile.review .n { color: #9a3412; }
+  .jl-tile.clear { border-color: #bfdbfe; background: #eff6ff; } .jl-tile.clear .n { color: #1e40af; }
+  .jl-result { margin-top: 10px; font-size: 13px; }
+  .jl-result.ok { color: #166534; font-weight: 700; }
+  .jl-result.bad { color: #b91c1c; font-weight: 700; }
+  .jl-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .jl-table-wrap { overflow-x: auto; }
+  details.jl-list { margin-top: 10px; }
+  details.jl-list summary { cursor: pointer; font-weight: 700; font-size: 13px; }
+  .jl-reason { font-size: 12px; color: #9a3412; }
+</style>
+
+<div class="wrap wide">
+  <h1 style="font-size:18px; margin:0 0 4px;">🔗 JAN を商品マスタの JAN に結ぶ</h1>
+  <p class="muted" style="margin:0 0 16px;"><a href="/apps/product-hub/staff">← 担当者・工程の設定</a></p>
+
+  <% if (!isAdmin) { %>
+    <div class="banner-warn">この画面を使えるのは管理者だけです。</div>
+  <% } else { %>
+
+  <!-- ═══ つかいかた ═══ -->
+  <div class="card">
+    <h2>これは何のための作業か</h2>
+    <p style="margin:0 0 8px; font-size:13px;">
+      JAN の正本は<strong>商品マスタ (Company DB)</strong> です。product-hub はこれまで JAN を別に手で入れて楽天に送っていました (同じ JAN を 2 か所で持っている状態)。
+      これからは「商品マスタの JAN から選んだ物」だけを楽天に送ります。たとえると、手書きのメモを、台帳の行を指す付箋に貼り替える作業です。
+      この画面は、今あるメモ (product-hub の JAN) を台帳 (商品マスタ) と照らして、<strong>同じ商品・同じ JAN・今も有効</strong>の行が 1 つに決まる物だけ付箋を貼ります。
+    </p>
+    <div class="jl-steps">
+      <div class="jl-step"><b>① 数える</b>何件結べるか・何件が要確認かを数えて見せます。まだ何も書きません。</div>
+      <div class="jl-step"><b>② 中身を見る</b>要確認の一覧 (理由つき) を見て、多すぎないか・おかしくないかを確かめます。</div>
+      <div class="jl-step"><b>③ 移す</b>数えた内容のとおりに書きます。数えた後に中身が変わっていたら書かずに止まります (もう一度 ①)。</div>
+    </div>
+    <ul class="muted" style="margin:0; padding-left:18px; font-size:12px;">
+      <li>楽天の出品は、この作業の後も<strong>今までどおり</strong>動きます (出品の前に止める・選ぶ画面は次の段で有効にします)。</li>
+      <li><strong>要確認</strong> = 1 つに決まらない物 (商品マスタに JAN が無い・違う JAN がある・セット など)。消さずに印を付けるだけで、後で商品の画面で選びます。商品マスタの JAN を直すのは「マスタの入力」の商品の画面です。</li>
+      <li>何回押しても同じ行を書き直しません (2 回目は「もう済んだ」と出ます)。だれがいつ押したかは下の記録と、商品ごとの履歴に残ります。</li>
+      <li>商品マスタに今つながらないとき・混んでいるとき (ほかの画面が商品マスタを読んでいる) は何も書きません。少し待ってからやり直してください。</li>
+    </ul>
+  </div>
+
+  <!-- ═══ 数える → 移す ═══ -->
+  <div class="card" id="jl-card">
+    <h2>数える → 移す</h2>
+    <div class="jl-actions">
+      <button class="btn btn-primary" id="jl-preview">① 数える (まだ書かない)</button>
+      <button class="btn" id="jl-apply" disabled>③ 移す</button>
+      <span class="muted" id="jl-status"></span>
+    </div>
+    <div id="jl-tiles" class="jl-tiles" hidden></div>
+    <div id="jl-lists"></div>
+    <div id="jl-result" class="jl-result" aria-live="polite"></div>
+  </div>
+
+  <!-- ═══ 記録 ═══ -->
+  <div class="card">
+    <h2>記録 (だれがいつ押したか・新しい順 20 件)</h2>
+    <div class="jl-table-wrap">
+      <table class="list" id="jl-runs">
+        <thead><tr><th>いつ</th><th>だれ</th><th>押したボタン</th><th>結果</th><th>中身</th></tr></thead>
+        <tbody>
+          <% for (const r of runs) { %>
+            <tr>
+              <td style="white-space:nowrap;"><%= String(r.created_at).slice(0, 19).replace('T', ' ') %></td>
+              <td><%= r.actor %></td>
+              <td><%= r.kind === 'apply' ? '移す' : '数える' %></td>
+              <td><%= r.outcome === 'ok' ? 'できた' : r.outcome === 'refused' ? '止めた (書いていない)' : '失敗 (書いていない)' %></td>
+              <td class="muted"><%= r.counts ? `結べる ${r.counts.link}・要確認 ${r.counts.review}・外す ${r.counts.clear}・もう済み ${r.counts.same}` + (r.counts.written ? ` → 書いた: 結んだ ${r.counts.written.link}・要確認 ${r.counts.written.review}・外した ${r.counts.written.clear}` : '') : '' %><%= r.error ? ` ${r.error}` : '' %></td>
+            </tr>
+          <% } %>
+          <% if (!runs.length) { %><tr><td colspan="5" class="muted">まだ押されていません</td></tr><% } %>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <script type="application/json" id="jl-reasons"><%- JSON.stringify(reasons).replace(/</g, '\\u003c') %></script>
+  <% } %>
+</div>
+
+<% if (isAdmin) { %>
+<script>
+  (function initJanLink() {
+    const preview = document.getElementById('jl-preview');
+    const apply = document.getElementById('jl-apply');
+    const status = document.getElementById('jl-status');
+    const tiles = document.getElementById('jl-tiles');
+    const lists = document.getElementById('jl-lists');
+    const result = document.getElementById('jl-result');
+    let seenHash = null;
+    let seenCounts = null;
+    let busy = false;
+
+    async function postJson(url, body) {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body || {}) });
+      let j = null;
+      try { j = await res.json(); } catch (e) { j = { ok: false, error: '答えを読めませんでした (' + res.status + ')' }; }
+      return j;
+    }
+    function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+    function tile(cls, n, label) { const t = el('div', 'jl-tile ' + cls); t.appendChild(el('div', 'n', String(n))); t.appendChild(el('div', 'l', label)); return t; }
+    function listOf(title, rows, withReason, open) {
+      const d = el('details', 'jl-list');
+      if (open) d.open = true;
+      d.appendChild(el('summary', null, title + ' (' + rows.length + ' 件' + (rows.length >= 300 ? '・先頭 300 件' : '') + ')'));
+      if (!rows.length) { d.appendChild(el('div', 'muted', 'ありません')); return d; }
+      const wrap = el('div', 'jl-table-wrap');
+      const tbl = el('table', 'list');
+      const head = el('tr');
+      (withReason ? ['商品', '商品コード', 'product-hub の JAN', '理由', '直し方'] : ['商品', '商品コード', 'product-hub の JAN', '商品マスタの JAN']).forEach((h) => head.appendChild(el('th', null, h)));
+      const thead = el('thead'); thead.appendChild(head); tbl.appendChild(thead);
+      const tb = el('tbody');
+      rows.forEach((r) => {
+        const tr = el('tr');
+        const a = el('a', null, r.draftName || r.neCode);
+        a.href = '/apps/product-hub/detail/' + Number(r.draftId);
+        a.target = '_blank'; a.rel = 'noopener';
+        const td0 = el('td'); td0.appendChild(a); tr.appendChild(td0);
+        tr.appendChild(el('td', null, r.code));
+        tr.appendChild(el('td', null, r.phJan || '—'));
+        tr.appendChild(withReason ? el('td', 'jl-reason', r.reasonText || r.reason || '') : el('td', null, r.cdbJan || ''));
+        if (withReason) tr.appendChild(el('td', 'muted', r.fixText || ''));
+        tb.appendChild(tr);
+      });
+      tbl.appendChild(tb); wrap.appendChild(tbl); d.appendChild(wrap);
+      return d;
+    }
+    function show(j) {
+      const c = j.counts;
+      tiles.hidden = false;
+      tiles.textContent = '';
+      tiles.appendChild(tile('link', c.link, '結べる (同じ商品・同じ JAN・今も有効)'));
+      tiles.appendChild(tile('review', c.review, '要確認にする (1 つに決まらない)'));
+      tiles.appendChild(tile('clear', c.clear, '結びを外す (JAN が空になった)'));
+      tiles.appendChild(tile('', c.same, 'もう済み (書き直さない)'));
+      tiles.appendChild(tile('', c.empty, 'JAN が空 (結ぶ物なし)'));
+      lists.textContent = '';
+      lists.appendChild(listOf('要確認にする物', j.review, true, true));
+      lists.appendChild(listOf('結べる物', j.link, false, false));
+      if (j.clear.length) lists.appendChild(listOf('結びを外す物', j.clear, false, false));
+      if (j.stillReview.length) lists.appendChild(listOf('前から要確認のまま', j.stillReview, true, false));
+      seenHash = j.hash;
+      seenCounts = c;
+      const writes = c.link + c.review + c.clear;
+      apply.disabled = writes === 0;
+      apply.textContent = writes === 0 ? '③ 移す (書く物はありません)' : '③ 移す (' + writes + ' 件を書く)';
+    }
+
+    preview.addEventListener('click', async () => {
+      if (busy) return;
+      busy = true; preview.disabled = true; apply.disabled = true; result.textContent = ''; result.className = 'jl-result';
+      status.textContent = '商品マスタと照らしています…';
+      try {
+        const j = await postJson('/apps/product-hub/api/jan-link/preview');
+        if (!j.ok) { result.textContent = '❌ ' + (j.error || '数えられませんでした'); result.className = 'jl-result bad'; seenHash = null; return; }
+        show(j);
+        status.textContent = '数えました (まだ書いていません)。中身を見てから「移す」を押してください';
+      } catch (e) {
+        result.textContent = '❌ 通信できませんでした。何も書いていません'; result.className = 'jl-result bad';
+      } finally { busy = false; preview.disabled = false; }
+    });
+
+    apply.addEventListener('click', async () => {
+      if (busy || !seenHash) return;
+      const c = seenCounts || { link: 0, review: 0, clear: 0 };
+      if (!confirm('数えた内容のとおりに書きます。\n\n・結ぶ: ' + c.link + ' 件\n・要確認にする: ' + c.review + ' 件\n・結びを外す: ' + c.clear + ' 件\n\n楽天の出品は今までどおり動きます。よろしいですか?')) return;
+      busy = true; preview.disabled = true; apply.disabled = true;
+      status.textContent = '書いています…';
+      try {
+        const j = await postJson('/apps/product-hub/api/jan-link/apply', { confirm: true, hash: seenHash });
+        seenHash = null;
+        if (!j.ok) {
+          result.textContent = '❌ ' + (j.error || '移せませんでした');
+          result.className = 'jl-result bad';
+          if (j.counts) show(j);   // 今の中身を見せ直す (もう一度押すかは人が決める)
+          status.textContent = '';
+          return;
+        }
+        result.textContent = '✅ 書きました: 結んだ ' + j.written.link + ' 件・要確認 ' + j.written.review + ' 件・外した ' + j.written.clear + ' 件 (商品 ' + j.drafts + ' 件)。記録は画面を開き直すと下に出ます';
+        result.className = 'jl-result ok';
+        status.textContent = '';
+        apply.textContent = '③ 移す';
+      } catch (e) {
+        result.textContent = '❌ 通信できませんでした。書けたかどうかは「数える」をもう一度押して確かめてください'; result.className = 'jl-result bad';
+      } finally { busy = false; preview.disabled = false; }
+    });
+  })();
+</script>
+<% } %>

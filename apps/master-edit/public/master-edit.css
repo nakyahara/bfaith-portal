@@ -1092,6 +1092,9 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .csug { max-height: min(360px, 55vh); }
 }
 @media (prefers-reduced-motion: reduce) { .csug { animation: none; } }
+/* 構成の行の下の「NE の商品を足す (セット)」= 1 行目は最初からあるので控えめ (文字だけのボタン・押せる大きさはスマホで 44px) */
+#comp-add.addrow { color: var(--muted); padding: 0 6px; }
+#comp-add.addrow:hover { color: var(--accent); }
 /* 🆕 0075: 発注の設定の届け待ち (上の帯の件数・届け待ちの画面の行) */
 .poq-pill { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px; border-radius: 999px; font-size: 13px; font-weight: 600; color: var(--warn); background: var(--warn-bg); border: 1px solid rgba(255, 200, 87, 0.4); text-decoration: none; white-space: nowrap; }
 .poq-pill.late { color: var(--err); background: var(--err-bg); border-color: rgba(255, 112, 133, 0.45); }
