@@ -2676,7 +2676,7 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **書く** `ops.set_sku_logizard_barcode(request_id, 人, sku_id, 種類, 値, どこから, 開いたときの行番号, 写しと照らした結果, 写しの時刻)` = master_edit だけ。SKU の鍵 → 値の鍵 → 押し直し → stale → ほかの商品の値 (`ops.lzbc_value_holder` = ほかの SKU の値・ほかの商品の JAN・ほかの商品を含む出品の FNSKU) = 断る。
   0078 の `ops.set_sku_logizard_barcode_rule` は画面から外す (ロールの script で master_edit の実行を外す = 持ち主だけ)
 - **入口**: 新商品の登録 (単品 = 必須の欄・まとまり = 子ごと・登録と同じ取引・0080 がある DB は値か空欄が要る = 前の画面は 400)・商品の画面の「ロジザードのバーコード」(`POST /api/sku/:code/logizard-barcode`)。
-  ロジザードのバーコードマスタの写し (Render の SQLite) でほかの商品の値 = router が 409。ロジザードの新商品の CSV は今までどおり GAS (H 列に打った値を入れる)・ポータルから出すのは次の PR
+  ロジザードのバーコードマスタの写し (Render の SQLite) でほかの商品の値 = router が 409。ロジザードの新商品の CSV = 0081 の「ロジザード登録の CSV」(GAS は予備)
 - **写しと照らせたか** (#1719 Codex R1 High 2 / R2): 写しが読めない・空・古い (36 時間) = 保存は通す・値の行に `lz_copy_state` (checked / unavailable / empty / stale) と `lz_copy_as_of` を残す。
   組み合わせは表の CHECK (`ck_slbr_copy_as_of` = checked / stale は時刻あり・ほかは時刻なし) と書く関数 (DB の時計で checked = 36 時間より新しい・stale = 36 時間より前・境目の前後 5 分はどちらでも) で守る。
   同じ request_id の要求は router が待つ形の DB の鍵 (pg_advisory_lock・要求の間) で 1 つずつ通し、鍵の後に保存済みかを見る (同時の再送も保存済みの答え・#1719 R5)。
@@ -2688,6 +2688,17 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   照らせていない値 = 画面に「ロジザードの写しと照らせていません。GAS の H 列に入れる前に、ロジザードの商品マスタで同じバーコードが無いか確かめてください」(人の手順)・商品の一覧の「未入力 → ロジザードの確かめ待ち」で出せる
 - 当て方 (🚨 まだ流さない): **アプリ (マージ・miniPC の入れ替え) を先に** → `migrate.mjs --dry-run` (0080 だけ・列と関数を足すだけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す (引数なし)。🚨 0080 を先に当てると、古いアプリの新商品の登録が止まる (0080 が 0078 の決め方の関数の master_edit の実行を外す = 古いアプリは登録のときにそこへ書く = 登録ごと戻る・#1719 Codex R4 Medium)。新しいアプリは 0080 の前・0080 の後でロールの流し直しの前 (master_edit に書く関数の実行権が無い) のどちらでも欄を出さずに登録を続ける (`test-lz-barcode-before0080.mjs`)
 - 試験 = `node scripts/test-lz-barcode.mjs` / `test-lz-mirror.mjs` (写しを読む部品を本物の SQLite と本番の取込で) / `test-lz-barcode-before0080.mjs` (当てる順の途中の組み合わせ) / `test-lz-barcode-pg.mjs` (実 PG・同時の再送) / `test-master-register.mjs` [R-LZ]・[LZ-H*] / `test-master-variation-batch.mjs` [R-LZ] / 画面 (`test-master-edit-ui.mjs`・`test-master-variation-ui.mjs`)
+
+### ロジザード登録の CSV (0081 仮番号・AI_reference CompanyDB構想/23 v4 §5'・2 本目)
+- **なぜ**: 今は GAS (ロジザード情報連携シート) の「新規商品マスタを CSV 出力」で、人が H 列 (バーコード) などを手で入れている → ポータルの画面「ロジザード登録の CSV」で、新商品の登録で入れた値から作る。GAS は CSV が使えないときの予備として残す
+- **表** `ops.lz_new_exports` (ファイルの byte 列・ハッシュ・写しの時刻・取り消し) / `ops.lz_new_export_items` (SKU・値・E 列 有効期限区分 01/02・F 列 入荷日管理フラグ 0/1 (入力なし = 0)・照らし直したか)。
+  出した品目は SKU ごとに 1 つ・同じ値も 1 つ。書くのは関数だけ (印 `ops.lz_new_export_protocol`)・変えてよいのは「出した → 取り消した」だけ・消さない・TRUNCATE できない
+- **関数** `ops.lz_new_export_issue` (SKU の鍵 → 値の鍵の下で、今の値・有効期限・入荷日・まだ出していない・`ops.lzbc_value_clash` の重なりなし・保存のときに照らせていない値は 36 時間の中の写しで照らし直した、を確かめて帳面に書く) /
+  `ops.lz_new_export_void` (理由が要る)。`ops.set_sku_logizard_barcode` を作り直し、CSV に出した商品は SKU の鍵の下で `lz_issued` (#1719 R1 Medium 1)
+- **画面** `/lz-csv` (見る = 利用権の人・作る / ダウンロード (Shift_JIS・そのままの byte 列) / 取り消す = 名簿 MASTER_DECISION_APPROVERS の人)。止まっている商品は理由つき (値なし・仕入先なし・ロジザードでほかの商品の値・Company DB で重なる・写しと照らせていない・この CSV の中で同じ値・大文字小文字だけ違う ID)
+- 当て方 (🚨 まだ流さない): アプリ (マージ・miniPC の入れ替え) → `migrate.mjs --dry-run` (0081 だけ・表と関数を足す・書く関数を作り直す) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す (引数なし)。
+  ロールの流し直しの前は画面が「まだ入っていないか、権限の流し直しの前」と出す (予備の GAS で作る)
+- 試験 = `node scripts/test-lz-csv-export.mjs` (候補・CSV の形・帳面・出した後は直せない・照らし直し・重なり・取り消し・画面・守り) / `test-lz-barcode-pg.mjs` [7] (実 PG・出す取引と直す取引が SKU の鍵で順に)
 
 ### 要確認 (quarantined) の商品を確認済みにする (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える

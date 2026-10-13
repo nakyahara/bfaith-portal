@@ -2759,7 +2759,7 @@ await ta('[LZ-H2] 単品の登録 × ロジザードの写し (#1719 R1 High 2):
     const f2 = await regApi('lzh-u7', { kind: 'value', value: 'X00LZU0007' }, { body: { request_id: rid } });
     assert.deepEqual([f2.status, f2.j.replayed, f2.j.lz_unchecked && f2.j.lz_unchecked.state, f2.j.lz_unchecked && f2.j.lz_unchecked.codes], [200, true, 'stale', ['lzh-u7']], f2.text);
     assert.equal(f2.j.lz_unchecked.as_of, f1.j.lz_unchecked.as_of, '残した写しの時刻');
-    assert.ok(f2.j.lz_unchecked.note.includes('GAS の H 列に入れる前に'), f2.j.lz_unchecked.note);
+    assert.ok(f2.j.lz_unchecked.note.includes('ロジザード登録の CSV には、新しい写しで照らし直せるまで出しません'), f2.j.lz_unchecked.note);
     // 逆: 照らせた登録を写しが読めなくなってから再送 = 印なし
     const rid2 = uuid();
     assert.equal((await regApi('lzh-u8', { kind: 'value', value: 'X00LZU0008' }, { body: { request_id: rid2 } })).j.lz_unchecked, undefined);

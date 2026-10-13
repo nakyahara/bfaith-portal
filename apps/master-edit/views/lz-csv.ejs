@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // 🆕 0081 ロジザード登録の CSV (logizard_bc_upload.csv・CompanyDB構想 23 v4 §5')。今の GAS の「新規商品マスタを CSV 出力」(人が H 列などを手で入れる) の置き換え (GAS は予備)。
+    //   作る → ダウンロード → ロジザードで取り込む (今までどおり auto-barcode.js / 手で)。画面の動き = public/me-lzcsv.js
+    const C = cands;
+    const canAct = canApprove && !dbError && !!C && C.db_ready && mirror.ok;
+    const dis = canAct ? '' : ' disabled';
+    const when = (v) => (v ? String(v).replace('T', ' ').slice(0, 16) : '—');
+    const kindBadge = { fnsku: 'info', jan: 'vio', lz_assign: 'mute' };
+    const pageData = canAct ? { base, ready: C.ready.map((x) => ({ sku_id: x.sku_id, rule_row: x.rule_row, code: x.code })), stale: !!mirror.stale } : { base, ready: [], stale: !!mirror.stale };
+  %>
+  <div class="page" id="lzc" data-base="<%= base %>">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">ロジザード登録の CSV</span></nav>
+    <div class="ph">
+      <div>
+        <h1>ロジザード登録の CSV</h1>
+        <div class="lead">新商品をロジザードに登録する CSV (logizard_bc_upload.csv) を作ります。<b style="color:var(--text)">作る → ダウンロード → ロジザードで取り込む</b>。
+          バーコード・有効期限区分・入荷日管理は新商品の登録で入れた値がそのまま入ります (GAS のシートに手で入れなくてよい)。同じ商品は 2 回出しません。
+          <span class="hint" id="lzc-gas">この画面が使えないとき (開けない・作れない) だけ、予備として今までどおり GAS (ロジザード情報連携シート) で作れます (H 列に商品の画面のバーコードを入れる)。</span></div>
+      </div>
+      <div class="ph-actions"><a class="btn" href="<%= base %>/manual#lz-barcode"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
+    </div>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (!canApprove) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= approveMessage %></div></div><% } %>
+    <% if (C && !C.db_ready) { %><div class="callout warn" id="lzc-notready"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">Company DB に 0081 (ロジザード登録の CSV) がまだ入っていないか、権限の流し直しの前です。それまでは予備の GAS で作ってください。</div></div><% } %>
+    <% if (C && C.db_ready && C.copy && C.copy.state !== 'checked') { %><div class="callout warn" id="lzc-copy"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">ロジザードのバーコードマスタの写し: <%= C.copy.words %></div><div class="hint">保存のときに写しと照らせていないバーコードは、新しい写し (<%= FRESH_HOURS %> 時間の中) で照らし直せるまで CSV に出しません (下の「止まっている商品」)。</div></div></div><% } %>
+    <% if (!mirror.ok) { %><div class="callout err" id="lzc-mirror"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">ロジザードの商品の一覧の写しを読めません</div><div class="hint"><%= mirror.reason %> · ロジザードにまだ無い商品か確かめられないので、CSV は作れません。</div></div></div>
+    <% } else if (mirror.stale) { %><div class="callout warn" id="lzc-mirror"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">ロジザードの商品の一覧の写しが古い (<%= when(mirror.list_as_of) %>)</div><div class="hint">毎晩取り込む写しが <%= FRESH_HOURS %> 時間より前です。もうロジザードに登録した商品が混ざるかもしれません。作るときに確かめます。</div></div></div>
+    <% } else { %><div class="hint" id="lzc-mirror" style="margin:0 0 12px">ロジザードの商品の一覧の写し: <%= when(mirror.list_as_of) %> (<%= Number(mirror.rows).toLocaleString('ja-JP') %> 件) · バーコードマスタ: <%= when(mirror.bc_as_of) %></div><% } %>
+
+    <% if (C && C.db_ready) { %>
+    <section class="panel" aria-labelledby="h-lzready">
+      <div class="panel-h"><span class="hico" aria-hidden="true">①</span><h2 id="h-lzready">CSV にする商品</h2><span class="sub">ポータルで登録した単品で、ロジザードにまだ無い · ロジザードにもうある <%= C.in_lz %> 件は出しません</span></div>
+      <% if (!C.ready.length) { %><div class="empty">今 CSV にできる商品はありません。<% if (C.held.length) { %>下の「止まっている商品」を直すと出せます。<% } %></div><% } else { %>
+      <div class="tblwrap">
+        <table class="tbl" id="lzc-ready">
+          <caption class="sr">CSV にする商品</caption>
+          <thead><tr><th scope="col">商品ID (コード)</th><th scope="col">名前</th><th scope="col">バーコード</th><th scope="col">有効期限区分</th><th scope="col">入荷日管理</th><th scope="col">仕入単価</th><th scope="col">取引先</th></tr></thead>
+          <tbody>
+          <% for (const x of C.ready) { %>
+            <tr data-sku="<%= x.sku_id %>">
+              <td class="code"><a href="<%= base %>/sku/<%= encodeURIComponent(x.code) %>"><%= x.code %></a></td>
+              <td><%= x.name %></td>
+              <td><span class="mono"><%= x.value || '空欄' %></span> <span class="b <%= kindBadge[x.kind] || 'mute' %>"><%= x.kind === 'lz_assign' ? 'ロジザードが番号を付ける' : KINDS[x.kind] %></span><% if (x.rechecked) { %> <span class="b ok" data-rechecked="1">写しと照らし直した</span><% } %><% for (const n of x.notes) { %><div class="hint"><%= n %></div><% } %></td>
+              <td><span class="mono"><%= x.expiry_code %></span> <span class="hint"><%= x.expiry_code === '02' ? 'あり' : 'なし' %></span></td>
+              <td><span class="mono"><%= x.inbound_code %></span> <span class="hint"><%= x.inbound_code === '1' ? 'あり' : x.inbound_unknown ? 'なし (登録で入力なし)' : 'なし' %></span></td>
+              <td><%= x.cost == null ? '0 (原価なし)' : x.cost %></td>
+              <td class="mono"><%= x.supplier %></td>
+            </tr>
+          <% } %>
+          </tbody>
+        </table>
+      </div>
+      <div class="buildbar">
+        <% if (mirror.stale) { %><label class="amc-chk"><input type="checkbox" id="lzc-stale-ok"<%= dis %>> 写しが古いことを確かめた (もうロジザードにある商品が混ざっていない)</label><% } %>
+        <button class="btn pri" type="button" id="lzc-build"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg><%= C.ready.length %> 件の CSV を作ってダウンロード</button>
+        <span class="hint">作ると帳面に残り、この商品は次から出しません (取り消すと出し直せる) · ファイル名 logizard_bc_upload.csv (Shift_JIS)</span>
+      </div>
+      <% } %>
+      <div class="msgline" id="lzc-msg" role="status" aria-live="polite"></div>
+    </section>
+
+    <% if (C.held.length) { %>
+    <section class="panel" aria-labelledby="h-lzheld">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-lock"/></svg></span><h2 id="h-lzheld">止まっている商品 (<%= C.held.length %>)</h2><span class="sub">直すと上に出ます</span></div>
+      <div class="tblwrap"><table class="tbl" id="lzc-held"><thead><tr><th scope="col">コード</th><th scope="col">名前</th><th scope="col">止まっている理由</th></tr></thead><tbody>
+        <% for (const x of C.held) { %>
+        <tr><td class="code"><a href="<%= base %>/sku/<%= encodeURIComponent(x.code) %>"><%= x.code %></a></td><td><%= x.name %></td>
+          <td><% for (const h of x.holds) { %><div class="why-blk" data-hold="<%= h %>"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= (x.hold_notes && x.hold_notes[h]) || HOLD_WORDS[h] || h %><%= x.value && (h === 'lz_taken' || h === 'dup_in_file') ? ' (' + x.value + ')' : '' %></span></div><% } %></td></tr>
+        <% } %>
+      </tbody></table></div>
+    </section>
+    <% } %>
+
+    <section class="panel" aria-labelledby="h-lzexp">
+      <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-lzexp">作った CSV</h2><span class="sub">新しい順 · ダウンロードし直せます · ロジザードで取り込めなかったら取り消して作り直す</span></div>
+      <% if (!exports.length) { %><div class="empty">まだありません</div><% } else { %>
+      <div class="tblwrap"><table class="tbl" id="lzc-exports"><thead><tr><th scope="col">#</th><th scope="col">作った</th><th scope="col">件数</th><th scope="col">商品</th><th scope="col">状態</th><th scope="col"></th></tr></thead><tbody>
+        <% for (const e of exports) { %>
+        <tr data-export="<%= e.id %>"><td class="mono">#<%= e.id %></td><td><%= when(e.created_at) %> <span class="hint"><%= e.actor_id %></span></td><td><%= e.rows %></td><td class="hint"><%= e.codes %><%= e.rows > 6 ? ' …' : '' %></td>
+          <td><% if (e.state === 'issued') { %><span class="b ok">出した</span><% } else { %><span class="b mute">取り消した</span> <span class="hint"><%= when(e.voided_at) %> · <%= e.void_reason %></span><% } %></td>
+          <td><% if (e.state === 'issued' && canApprove) { %><a class="btn sm" href="<%= base %>/lz-csv/<%= e.id %>/file" download="logizard_bc_upload.csv"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>ダウンロード</a> <button class="btn sm ghost" type="button" data-void="<%= e.id %>">取り消す</button><% } %></td></tr>
+        <% } %>
+      </tbody></table></div>
+      <% } %>
+    </section>
+    <% } %>
+    <script type="application/json" id="me-lzc"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
+  </div>
+  <%- include('_footer') %>
+  <% if (canApprove && C && C.db_ready) { %><script src="<%= base %>/public/me-lzcsv.js?v=<%= assetV %>" defer></script><% } %>
+</body>
+</html>

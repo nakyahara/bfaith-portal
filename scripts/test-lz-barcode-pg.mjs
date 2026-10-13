@@ -267,6 +267,43 @@ try {
     const rl = await l.promise;
     assert.match(String(rl.err && rl.err.message), /^lzbc_taken: .*s003/, rl.err ? rl.err.message : JSON.stringify(rl.ok));
   });
+  await ta('[7] ロジザード登録の CSV を出す取引と、同じ商品のバーコードを直す取引 (0081・#1719 R1 Medium 1): SKU の鍵で順に = 出した後は直せない (lz_issued)・直した後は出せない (stale)', async () => {
+    const s2 = (await q("select sku_id::text as id from core.skus where code = 's002'"))[0].id;
+    const latest = async () => (await q('select max(rule_row)::text as r from ops.sku_logizard_barcode_rules where sku_id = $1', [s2]))[0].r;
+    const waiting = async () => (await q("select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted"))[0].n;
+    const until = async (n) => { for (let i = 0; i < 200 && (await waiting()) < n; i++) await sleep(50); assert.ok((await waiting()) >= n, '鍵で待たない'); };
+    // 画面のロールの接続の上限 (ロールの script の connection limit) = [6] の 2 つの接続を使い回す
+    const [L, E] = clients.slice(-2);
+    const lzSql = "select ops.set_sku_logizard_barcode($1::uuid, 'naka@test', $2::bigint, 'lz_assign', null, 'sku_page', $3::bigint, null, null) as r";
+    const fixSql = "select ops.set_sku_logizard_barcode($1::uuid, 'naka@test', $2::bigint, 'fnsku', 'X00LZPGF01', 'sku_page', $3::bigint, 'checked', now()) as r";
+    const issueSql = 'select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, $4::bytea, now(), now()) as r';
+    await L.query(lzSql, [uuid(), s2, await latest()]);   // 今 = 空欄
+    const items = async () => JSON.stringify([{ sku_id: s2, code: 's002', rule_row: await latest(), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' }]);
+    const tail = (c, sql, p) => launch((async () => { try { const r = (await c.query(sql, p)).rows[0].r; await c.query('commit'); return { ok: r }; } catch (e) { await c.query('rollback'); return { err: e }; } })());
+    // ① CSV を出す取引が先 (まだ commit していない) → 直す取引は SKU の鍵で待つ → commit の後に lz_issued
+    await E.query('begin');
+    await E.query(issueSql, [uuid(), 'naka@test', await items(), Buffer.from('x')]);
+    await L.query('begin');
+    const f = tail(L, fixSql, [uuid(), s2, await latest()]);
+    await until(1);
+    assert.equal(f.done, false);
+    await E.query('commit');
+    const rf = await f.promise;
+    assert.match(String(rf.err && rf.err.message), /^lz_issued:/, rf.err ? rf.err.message : JSON.stringify(rf.ok));
+    // 取り消す → ② 直す取引が先 (まだ commit していない) → CSV を出す取引は SKU の鍵で待つ → commit の後に stale
+    const ex = (await q("select export_id::text as id from ops.lz_new_export_items where sku_id = $1 and state = 'issued'", [s2]))[0].id;
+    await E.query('select ops.lz_new_export_void($1, $2::bigint, $3)', ['naka@test', ex, '試験']);
+    const it2 = await items();
+    await L.query('begin');
+    await L.query(fixSql, [uuid(), s2, await latest()]);
+    await E.query('begin');
+    const s = tail(E, issueSql, [uuid(), 'naka@test', it2, Buffer.from('y')]);
+    await until(1);
+    assert.equal(s.done, false);
+    await L.query('commit');
+    const rs = await s.promise;
+    assert.match(String(rs.err && rs.err.message), /^stale:/, rs.err ? rs.err.message : JSON.stringify(rs.ok));
+  });
 } finally {
   if (server) server.close();
   for (const c of clients) { try { await c.end(); } catch { /* */ } }
