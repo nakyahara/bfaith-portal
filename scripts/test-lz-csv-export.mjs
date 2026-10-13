@@ -13,6 +13,9 @@
  *   X5 画面を開いた後に値・有効期限が変わった = 409 changed・写しが無い = 409・古い = 確かめの印が要る・DB の関数も直接の偽りを断る
  *   X6 取り消す (理由が要る) = 品目が voided・また候補に出る・値を直せる・ファイルは出さない (409)・もう一度 = already
  *   X7 画面: ロジザード登録の CSV (作れる・止まっている・作った CSV・写しの時刻・予備の GAS)・作る API (名簿の人だけ)・ダウンロード (Shift_JIS)・取り消し・左の列に入口・つかいかた
+ *   X8 (#1721 R1 High 1) CSV の中身は DB が品目から作る = アプリが同じ品目から作る byte 列と 1 byte も違わない (引用符・カンマ・半角カナ・～)・byte 列は受け取らない (前の 6 つの引数の関数は無い)
+ *   X9 (#1721 R1 High 2) 保存のときに照らせた値も、出すときの写しが古い・空・読めない間は止まる・DB も写しの時刻が無い / 古いと断る
+ *   X10 (#1721 R1 Medium) 同じ request_id で違う品目 = 409 request_id_reused (アプリ・DB の関数とも)
  *   S1 守り: master_edit は帳面に直接書けない・持ち主も関数の外では書けない・取り消す以外は変えない・TRUNCATE できない・PUBLIC の実行権なし
  * 使い方: node scripts/test-lz-csv-export.mjs
  */
@@ -124,6 +127,21 @@ await ta('[X1] 候補: ポータルで登録した単品・ロジザードにま
   assert.deepEqual(held.holds, ['lz_taken']);
   assert.match(held.hold_notes.lz_taken, /zz-other/);
 });
+await ta('[X9] 保存のときに照らせた値も、出すときの写しが古い・空・読めない間は止まる (#1721 R1 High 2)・空欄は止まらない・DB も写しの時刻が無い / 古いと断る', async () => {
+  for (const st of ['stale', 'empty', 'unavailable']) {
+    const c = await cand(mirrorOf({ keys: ['lzx-d'], state: st, bc: [['zz-old', 'X00LZXWARE'], ['LZX-E', '4900000000016']] }));
+    const a = c.held.find((x) => x.code === 'lzx-a'), b = c.ready.find((x) => x.code === 'lzx-b');
+    assert.deepEqual(a && a.holds, ['lz_unchecked'], `${st}: 照らせた値が止まらない`);
+    assert.ok(b, `${st}: 空欄 (lzx-b) が止まった`);
+  }
+  const a = (await cand()).ready.find((x) => x.code === 'lzx-a');
+  assert.equal(a.rechecked, false, '保存のときに照らせた値を照らし直したことにした');
+  const items = [{ sku_id: a.sku_id, code: 'lzx-a', rule_row: String(a.rule_row), kind: 'fnsku', value: 'X00LZX0001', expiry_code: '02', inbound_code: '1' }];
+  for (const at of [null, new Date(Date.now() - 40 * 3600e3).toISOString()]) {
+    const e = await pgErr(asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), $4::timestamptz)', [crypto.randomUUID(), 'naka@test', JSON.stringify(items), at]); } finally { await pg.query('rollback'); } }));
+    assert.match(String(e && e.message), /^lz_unchecked: lzx-a/, String(at));
+  }
+});
 let EXPORT1 = null;
 await ta('[X2] CSV を出す: 8 列 (Shift_JIS・CRLF・E 列 / F 列 / H 列)・帳面・押し直し = 前の答え・同じ商品は 2 回出さない・出した後は値を直せない (DB = lz_issued・商品の画面の API = 409)', async () => {
   const c = await cand();
@@ -140,6 +158,11 @@ await ta('[X2] CSV を出す: 8 列 (Shift_JIS・CRLF・E 列 / F 列 / H 列)�
   assert.ok(!text.endsWith('\r\n'), '最後の行に改行がある (GAS と違う)');
   assert.equal(f.file_sha256, crypto.createHash('sha256').update(f.file_bytes).digest('hex'));
   assert.equal((await issue(want, { requestId: rid })).replayed, true);
+  // [X10] 同じ request_id で違う品目 (#1721 R1 Medium) = 409 request_id_reused (アプリ)・DB の関数も
+  const eR = await pgErr(issue(want.slice(0, 2), { requestId: rid }));
+  assert.deepEqual([eR && eR.status, eR && eR.reason], [409, 'request_id_reused']);
+  const eD = await pgErr(asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), now())', [rid, 'naka@test', JSON.stringify([{ ...c.ready.find((x) => x.code === 'lzx-b'), sku_id: c.ready.find((x) => x.code === 'lzx-b').sku_id, rule_row: String(c.ready.find((x) => x.code === 'lzx-b').rule_row) }])]); } finally { await pg.query('rollback'); } }));
+  assert.match(String(eD && eD.message), /^request_id_reused/);
   const items = await q('select code, kind, value, expiry_code, inbound_code, rechecked, state from ops.lz_new_export_items where export_id = $1 order by code', [r.export_id]);
   assert.deepEqual(items.map((x) => [x.code, x.kind, x.value, x.expiry_code, x.inbound_code, x.rechecked, x.state]),
     [['lzx-a', 'fnsku', 'X00LZX0001', '02', '1', false, 'issued'], ['lzx-b', 'lz_assign', null, '01', '0', false, 'issued'], ['lzx-c', 'jan', '4912345678904', '01', '0', false, 'issued']]);
@@ -168,7 +191,7 @@ await ta('[X3] 照らせていない値: 写しが照らせない間は止まる
   assert.ok(u && u.rechecked, '新しい写しで照らし直せない');
   const items = [{ sku_id: u.sku_id, code: 'lzx-u', rule_row: String(u.rule_row), kind: 'fnsku', value: 'X00LZXU001', expiry_code: '01', inbound_code: '0' }];
   for (const at of [null, new Date(Date.now() - 40 * 3600e3).toISOString()]) {
-    const e = await pgErr(asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, $4::bytea, now(), $5::timestamptz)', [crypto.randomUUID(), 'naka@test', JSON.stringify(items), Buffer.from('x'), at]); } finally { await pg.query('rollback'); } }));
+    const e = await pgErr(asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), $4::timestamptz)', [crypto.randomUUID(), 'naka@test', JSON.stringify(items), at]); } finally { await pg.query('rollback'); } }));
     assert.match(String(e && e.message), /^lz_unchecked: lzx-u/, String(at));
   }
   MIRROR = mirrorOf({ bc: [['zz-old', 'X00LZXWARE']] });
@@ -197,7 +220,7 @@ await ta('[X4] Company DB で重なる値 (ops.lzbc_value_clash・取り込み�
   assert.deepEqual(h && h.holds, ['clash']);
   assert.match(h.hold_notes.clash, /ほかの商品 \(s003\) の JAN と同じです/);
   const items = [{ sku_id: sk, code: 'lzx-k', rule_row: await latest(sk), kind: 'jan', value: J, expiry_code: '01', inbound_code: '0' }];
-  const e = await pgErr(asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, $4::bytea, now(), now())', [crypto.randomUUID(), 'naka@test', JSON.stringify(items), Buffer.from('x')]); } finally { await pg.query('rollback'); } }));
+  const e = await pgErr(asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), now())', [crypto.randomUUID(), 'naka@test', JSON.stringify(items)]); } finally { await pg.query('rollback'); } }));
   assert.match(String(e && e.message), /^lzbc_taken: lzx-k .*s003.*JAN/);
 });
 await ta('[X5] 画面を開いた後に値・有効期限が変わった = 409 changed (何も書かない)・写しが無い = 409・古い = 確かめの印が要る・DB の関数も直接の偽りを断る', async () => {
@@ -214,7 +237,7 @@ await ta('[X5] 画面を開いた後に値・有効期限が変わった = 409 c
   e = await pgErr(issue([{ sku_id: g.sku_id, rule_row: g.rule_row }], { mirror: old }));
   assert.deepEqual([e && e.status, e && e.reason], [409, 'lz_list_stale']);
   assert.equal((await one('select count(*)::int as n from ops.lz_new_exports')).n, n0, '断ったのに帳面に書いた');
-  const raw = (items) => asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, $4::bytea, null, now())', [crypto.randomUUID(), 'naka@test', JSON.stringify(items), Buffer.from('x')]); } finally { await pg.query('rollback'); } });
+  const raw = (items) => asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, null, now())', [crypto.randomUUID(), 'naka@test', JSON.stringify(items)]); } finally { await pg.query('rollback'); } });
   const base = { sku_id: g.sku_id, code: 'lzx-g', rule_row: String(g.rule_row), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' };
   for (const [x, re] of [[{ expiry_code: '02' }, /^stale/], [{ inbound_code: '1' }, /^stale/], [{ kind: 'jan', value: '4512345678906' }, /^stale/], [{ code: 'LZX-G' }, /^stale/], [{ rule_row: 'x' }, /^invalid_input/]]) {
     const er = await pgErr(raw([{ ...base, ...x }]));
@@ -265,6 +288,30 @@ await ta('[X7] 画面: ロジザード登録の CSV (作れる・止まってい
   for (const w of ['ロジザード登録の CSV</a>」の画面で作ります', 'E 列', 'F 列', '予備', 'CSV に出した商品を GAS からも出さない']) assert.ok(man.text.includes(w), `つかいかたに「${w}」が無い`);
   assert.ok(!man.text.includes('ポータルから CSV を出す画面はこの後に足します'), 'つかいかたに前の文が残っている');
 });
+await ta('[X8] CSV の中身は DB が品目から作る (#1721 R1 High 1): アプリが同じ品目から作る byte 列と同じ (引用符・カンマ・半角カナ・～)・byte 列は受け取らない', async () => {
+  const name = 'テスト, "引用" ～ｶﾅ';
+  const r0 = await regApi('lzx-q', { kind: 'value', value: '4512345678913' }, { name, expiry_managed: '1', cost: { jpy: '12' } });
+  assert.equal(r0.status, 200, r0.text);
+  const c = await cand();
+  const q1 = c.ready.find((x) => x.code === 'lzx-q');
+  assert.ok(q1, JSON.stringify(c.held.filter((x) => x.code === 'lzx-q')));
+  const others = mine(c.ready).filter((x) => x.code !== 'lzx-q').slice(0, 2);
+  const items = [q1, ...others];
+  const appBytes = LZE.buildLzNewCsvBytes(items).bytes;
+  const r = await issue(items.map((x) => ({ sku_id: x.sku_id, rule_row: x.rule_row })));
+  const f = await asEditor(() => LZE.lzNewExportFile(db, r.export_id));
+  assert.equal(Buffer.compare(f.file_bytes, appBytes), 0, `DB の中身とアプリの byte 列が違う\nDB : ${f.file_bytes.toString('hex')}\napp: ${appBytes.toString('hex')}`);
+  const text = iconv.decode(f.file_bytes, 'cp932');
+  assert.ok(text.includes('lzx-q,"テスト, ""引用"" ～ｶﾅ","テスト, ""引用"" ～ｶﾅ",12,02,0,0001,4512345678913'), text);
+  const t = await one('select file_text, text_sha256 from ops.lz_new_exports where export_id = $1', [r.export_id]);
+  assert.equal(t.text_sha256, crypto.createHash('sha256').update(t.file_text, 'utf8').digest('hex'));
+  // byte 列を渡す前の形 (6 つの引数) は無い = 直に呼んでも好きな中身を残せない
+  const e = await pgErr(asEditor(async () => { await pg.query('begin'); try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, $4::bytea, now(), now())', [crypto.randomUUID(), 'naka@test', '[]', Buffer.from('x')]); } finally { await pg.query('rollback'); } }));
+  assert.match(String(e && e.message), /does not exist|存在しません/);
+  // 画面のロールは中身を直接書けない
+  const code = async (fn) => { const er = await pgErr(fn()); return er ? er.code : null; };
+  assert.equal(await asEditor(() => code(() => pg.query("update ops.lz_new_exports set file_text = 'x' where export_id = $1", [r.export_id]))), '42501');
+});
 await ta('[S1] 守り: master_edit は帳面に直接書けない・持ち主も関数の外では書けない・取り消す以外は変えない・TRUNCATE できない・PUBLIC の実行権なし・master_edit だけ実行できる', async () => {
   const code = async (fn) => { const e = await pgErr(fn()); return e ? e.code : null; };
   assert.equal(await asEditor(() => code(() => pg.query("update ops.lz_new_exports set void_reason = 'x'"))), '42501');
@@ -278,7 +325,7 @@ await ta('[S1] 守り: master_edit は帳面に直接書けない・持ち主も
     await pg.query('rollback');
   } finally { await pg.query('set role deploy'); }
   assert.ok(await code(() => pg.query('truncate ops.lz_new_export_items')), 'TRUNCATE できた');
-  for (const sig of ['ops.lz_new_export_issue(uuid, text, jsonb, bytea, timestamp with time zone, timestamp with time zone)', 'ops.lz_new_export_void(text, bigint, text)']) {
+  for (const sig of ['ops.lz_new_export_issue(uuid, text, jsonb, timestamp with time zone, timestamp with time zone)', 'ops.lz_new_export_void(text, bigint, text)']) {
     const p = await one('select proacl::text as acl, prosecdef, proconfig::text as cfg from pg_proc where oid = $1::regprocedure', [sig]);
     assert.equal(p.prosecdef, true, sig); assert.match(p.cfg, /search_path=pg_catalog, pg_temp/, sig);
     assert.ok(!/(^|[{,])=X/.test(p.acl), `PUBLIC に実行権がある: ${sig} ${p.acl}`); assert.match(p.acl, /master_edit=X/, sig);

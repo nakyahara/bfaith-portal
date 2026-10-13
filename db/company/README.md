@@ -2691,10 +2691,11 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 
 ### ロジザード登録の CSV (0081 仮番号・AI_reference CompanyDB構想/23 v4 §5'・2 本目)
 - **なぜ**: 今は GAS (ロジザード情報連携シート) の「新規商品マスタを CSV 出力」で、人が H 列 (バーコード) などを手で入れている → ポータルの画面「ロジザード登録の CSV」で、新商品の登録で入れた値から作る。GAS は CSV が使えないときの予備として残す
-- **表** `ops.lz_new_exports` (ファイルの byte 列・ハッシュ・写しの時刻・取り消し) / `ops.lz_new_export_items` (SKU・値・E 列 有効期限区分 01/02・F 列 入荷日管理フラグ 0/1 (入力なし = 0)・照らし直したか)。
+- **表** `ops.lz_new_exports` (CSV の中身 = DB が品目から作った文字・そのハッシュ・要求の品目のハッシュ・写しの時刻・取り消し) / `ops.lz_new_export_items` (SKU・値・E 列 有効期限区分 01/02・F 列 入荷日管理フラグ 0/1 (入力なし = 0)・照らし直したか)。
   出した品目は SKU ごとに 1 つ・同じ値も 1 つ。書くのは関数だけ (印 `ops.lz_new_export_protocol`)・変えてよいのは「出した → 取り消した」だけ・消さない・TRUNCATE できない
 - **関数** `ops.lz_new_export_issue` (SKU の鍵 → 値の鍵の下で、今の値・有効期限・入荷日・まだ出していない・`ops.lzbc_value_clash` の重なりなし・保存のときに照らせていない値は 36 時間の中の写しで照らし直した、を確かめて帳面に書く) /
-  `ops.lz_new_export_void` (理由が要る)。`ops.set_sku_logizard_barcode` を作り直し、CSV に出した商品は SKU の鍵の下で `lz_issued` (#1719 R1 Medium 1)
+  `ops.lz_new_export_void` (理由が要る)。🆕 #1721 R1: CSV の中身は DB が確かめ直した品目から作る (アプリの byte 列は受け取らない・Shift_JIS はダウンロードのときに lz-csv.mjs の変換で = アプリが同じ品目から作る byte 列と同じ)・
+  値のある品目は保存のときの結果にかかわらず出すときの写し (36 時間の中) で照らす・押し直しは人と要求の品目のハッシュを比べる。`ops.set_sku_logizard_barcode` を作り直し、CSV に出した商品は SKU の鍵の下で `lz_issued` (#1719 R1 Medium 1)
 - **画面** `/lz-csv` (見る = 利用権の人・作る / ダウンロード (Shift_JIS・そのままの byte 列) / 取り消す = 名簿 MASTER_DECISION_APPROVERS の人)。止まっている商品は理由つき (値なし・仕入先なし・ロジザードでほかの商品の値・Company DB で重なる・写しと照らせていない・この CSV の中で同じ値・大文字小文字だけ違う ID)
 - 当て方 (🚨 まだ流さない): アプリ (マージ・miniPC の入れ替え) → `migrate.mjs --dry-run` (0081 だけ・表と関数を足す・書く関数を作り直す) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す (引数なし)。
   ロールの流し直しの前は画面が「まだ入っていないか、権限の流し直しの前」と出す (予備の GAS で作る)

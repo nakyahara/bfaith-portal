@@ -266,7 +266,7 @@ export const LZ_BARCODE_SELECT = Object.freeze(['ops.sku_logizard_barcode_rules'
 export const LZ_BARCODE_EDIT_FUNCTIONS = Object.freeze(['ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint, text, timestamp with time zone)', 'ops.lzbc_value_holder(bigint, text)',
   'ops.lzbc_value_clash(bigint, text)',
   // 🆕 0081: ロジザード登録の CSV を出す・取り消す (書くのは関数だけ)
-  'ops.lz_new_export_issue(uuid, text, jsonb, bytea, timestamp with time zone, timestamp with time zone)', 'ops.lz_new_export_void(text, bigint, text)']);
+  'ops.lz_new_export_issue(uuid, text, jsonb, timestamp with time zone, timestamp with time zone)', 'ops.lz_new_export_void(text, bigint, text)']);
 export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_logizard_barcode_rules()', 'ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)',
   'ops.lzbc_jan_ok(text)', 'ops.guard_sku_logizard_barcode_requests()', 'ops.guard_lz_new_exports()']);
 

@@ -5,10 +5,11 @@
 --   1. ops.lz_new_exports / ops.lz_new_export_items = 出した CSV の帳面 (ファイルの byte 列・ハッシュ・行 = SKU・値・有効期限区分・入荷日管理フラグ・照らした写しの時刻)。
 --      出した (issued) 品目は SKU ごとに 1 つ・同じ値も 1 つ。書くのは下の関数だけ (印 ops.lz_new_export_protocol)・取り消す以外は変えない・消さない
 --   2. ops.set_sku_logizard_barcode を作り直す = CSV に出した商品のバーコードは直さない (lz_issued) を SKU の鍵の下で確かめる (#1719 Codex R1 Medium 1)
---   3. ops.lz_new_export_issue (CSV を出す = 帳面に書く・品目ごとに SKU の鍵 → 値の鍵の下で今の値・有効期限・入荷日・重なり・照らした写しをもう一度確かめる) /
+--   3. ops.lz_new_export_issue (CSV を出す = 帳面に書く・品目ごとに SKU の鍵 → 値の鍵の下で今の値・有効期限・入荷日・重なり・照らした写しをもう一度確かめ、
+--      CSV の中身を DB が品目から作る = #1721 R1 High 1) /
 --      ops.lz_new_export_void (取り消す・理由が要る)
 --   E 列 (有効期限区分) = 有効期限の管理 あり 02 / なし 01・F 列 (入荷日管理フラグ) = 入荷日の管理 あり 1 / なし・入力なし 0 (中原さんの決定 Q1 a)
---   🚨 照らせていない値 (lz_copy_state が checked でない) は、出すときに新しい写し (36 時間の中) で照らし直せたときだけ出す (DB は写しの時刻を確かめる)。
+--   🚨 値のある品目は、保存のときの結果にかかわらず、出すときに新しい写し (36 時間の中) で照らせたときだけ出す (DB は写しの時刻を確かめる・#1721 R1 High 2)。
 --      ops.lzbc_value_clash で重なりのある値 (ほかの商品の JAN・Amazon の FNSKU・ロジザードのバーコード) は出さない
 -- 🚨 既にある行は変えない (表と関数を足す・書く関数を作り直す)。security definer = 一時の表を使わない・search_path = pg_catalog, pg_temp・public の実行権を外す
 
@@ -22,8 +23,10 @@ create table ops.lz_new_exports (
   created_at     timestamptz not null default pg_catalog.clock_timestamp(),
   schema_version text not null check (schema_version = 'lz-bc-v1'),
   file_name      text not null check (file_name = 'logizard_bc_upload.csv'),
-  file_bytes     bytea not null,
-  file_sha256    text not null check (file_sha256 ~ '^[0-9a-f]{64}$'),
+  file_text      text not null,             -- 🆕 #1721 R1 High 1: CSV の中身 = DB が確かめ直した品目から作った文字 (見出し・CRLF・最後に改行なし)。
+                                            --   Shift_JIS にするのはダウンロードのとき (アプリの lz-csv.mjs の encodeText = GAS と同じ変換・PGlite には文字の変換が無い)
+  text_sha256    text not null check (text_sha256 ~ '^[0-9a-f]{64}$'),   -- file_text (UTF-8) のハッシュ
+  request_hash   text not null check (request_hash ~ '^[0-9a-f]{64}$'),  -- 🆕 #1721 R1 Medium: 要求の品目 (sku_id:rule_row を sku_id の順) のハッシュ = 押し直しの比べ
   row_count      integer not null check (row_count between 1 and 2000),
   lz_list_as_of  timestamptz,               -- ロジザードの商品の一覧の写しの時刻 (まだ無いの判定)
   lz_bc_as_of    timestamptz,               -- ロジザードのバーコードマスタの写しの時刻 (値の照らし直し)
@@ -65,8 +68,8 @@ begin
     -- 変えてよいのは「出した → 取り消した」だけ (中身・byte 列・ハッシュは変えない)
     if old.state <> 'issued' or new.state <> 'voided' then raise exception 'lz_new_export: 変えてよいのは出した → 取り消した だけ' using errcode = '42501'; end if;
     if tg_table_name = 'lz_new_exports' then
-      if (new.export_id, new.request_id, new.actor_id, new.created_at, new.file_bytes, new.file_sha256, new.row_count, new.lz_list_as_of, new.lz_bc_as_of)
-         is distinct from (old.export_id, old.request_id, old.actor_id, old.created_at, old.file_bytes, old.file_sha256, old.row_count, old.lz_list_as_of, old.lz_bc_as_of) then
+      if (new.export_id, new.request_id, new.actor_id, new.created_at, new.file_text, new.text_sha256, new.request_hash, new.row_count, new.lz_list_as_of, new.lz_bc_as_of)
+         is distinct from (old.export_id, old.request_id, old.actor_id, old.created_at, old.file_text, old.text_sha256, old.request_hash, old.row_count, old.lz_list_as_of, old.lz_bc_as_of) then
         raise exception 'lz_new_export: ファイルの中身は変えない' using errcode = '42501';
       end if;
     else
@@ -181,20 +184,28 @@ end $$;
 revoke all on function ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint, text, timestamp with time zone) from public;
 
 -- ═══════════ 3. CSV を出す・取り消す ═══════════
+/** CSV の 1 つのセル (カンマ・"・改行を含む値だけ "…" で囲み、中の " は "" に重ねる = apps/master-decisions/lz-csv.mjs の cellBytes と同じ) */
+create function ops.lz_csv_cell(p text) returns text language sql immutable set search_path = pg_catalog, pg_temp as $$
+  select case when coalesce(p, '') ~ '[",\r\n]' then '"' || pg_catalog.replace(p, '"', '""') || '"' else coalesce(p, '') end
+$$;
+revoke all on function ops.lz_csv_cell(text) from public;
+
 /**
- * ロジザード登録の CSV を帳面に書く (ファイルの byte 列はアプリ = lz-csv.mjs が作る・ハッシュは DB が作る)。
+ * ロジザード登録の CSV を帳面に書く。🆕 #1721 R1 High 1: CSV の中身は DB が確かめ直した品目から作る (アプリの byte 列は受け取らない = 直に呼んでも別の中身を残せない)。
+ *   中身 = 見出し + 品目の行 (商品コードの順・C の並び)・CRLF・最後に改行なし。列 = 商品ID (コード)・商品名・検索名称 (= 名前)・仕入単価 (今の原価・無い = 0)・
+ *   有効期限区分 (02 / 01)・入荷日管理フラグ (1 / 0)・取引先コード (代表の仕入先・1〜3 桁は 4 桁に 0 埋め)・バーコード (空欄 = '')。Shift_JIS はダウンロードのときにアプリが付ける
  * p_items = [{ sku_id, code, rule_row, kind, value, expiry_code, inbound_code }] (1〜2000)。鍵 = SKU の鍵 (sku_id の順) → 値の鍵 (値の順) = 書く関数と同じ順。品目ごとに確かめる:
  *   単品・会社 1・やめていない・コードが今の SKU のコード・rule_row がその SKU の一番新しい行で種類と値が同じ・値が今の決まりに合う・
- *   有効期限区分 = 有効期限の管理 (あり 02 / なし 01)・入荷日管理フラグ = 入荷日の管理 (あり 1 / なし・入力なし 0)・まだ出していない・
- *   値がほかの商品と重ならない (ops.lzbc_value_clash)・保存のときに写しと照らせていない値 = p_lz_bc_as_of (照らし直した写しの時刻) が 36 時間の中 (未来は 5 分まで)。
+ *   有効期限区分 = 有効期限の管理 (あり 02 / なし 01)・入荷日管理フラグ = 入荷日の管理 (あり 1 / なし・入力なし 0)・代表の仕入先がある・まだ出していない・
+ *   値がほかの商品と重ならない (ops.lzbc_value_clash)・🆕 #1721 R1 High 2: 値のある品目は、保存のときの結果にかかわらず p_lz_bc_as_of (今照らした写しの時刻) が 36 時間の中 (未来は 5 分まで)。
  *   1 つでも違う = invalid_input / stale / lz_issued / lzbc_taken / lz_unchecked (何も書かない)
- * 同じ request_id の押し直し = 前の答え (人・ハッシュが違う = request_id_reused)
+ * 同じ request_id の押し直し = 前の答え (人・要求の品目のハッシュが違う = request_id_reused)
  */
-create function ops.lz_new_export_issue(p_request_id uuid, p_actor_id text, p_items jsonb, p_bytes bytea, p_lz_list_as_of timestamptz, p_lz_bc_as_of timestamptz) returns jsonb
+create function ops.lz_new_export_issue(p_request_id uuid, p_actor_id text, p_items jsonb, p_lz_list_as_of timestamptz, p_lz_bc_as_of timestamptz) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
   v_db_user text := case when coalesce(pg_catalog.current_setting('role', true), 'none') <> 'none' then pg_catalog.current_setting('role', true) else session_user::text end;
-  v_sha     text;
+  v_hash    text;
   v_prev    ops.lz_new_exports;
   v_n       integer;
   v_id      bigint;
@@ -204,31 +215,34 @@ declare
   c         record;
   v_cur     ops.sku_logizard_barcode_rules;
   v_fresh   boolean;
-  v_re      jsonb := '{}'::jsonb;   -- 照らし直した品目 (sku_id → true)
+  v_re      jsonb := '{}'::jsonb;   -- 照らし直した品目 (保存のときは照らせていなかった・sku_id → true)
+  v_lines   jsonb := '[]'::jsonb;   -- [{ code, line }]
+  v_text    text;
 begin
   if p_request_id is null then raise exception 'invalid_input: request_id が要る' using errcode = '22023'; end if;
   if ops.reg_actor_problem(p_actor_id, null) is not null or p_actor_id !~ '^[^[:space:]@]+@[^[:space:]@]+$' then
     raise exception 'invalid_input: 人 (メール) が要る' using errcode = '22023';
   end if;
-  if p_bytes is null or pg_catalog.length(p_bytes) = 0 then raise exception 'invalid_input: ファイルが空' using errcode = '22023'; end if;
   if pg_catalog.jsonb_typeof(p_items) is distinct from 'array' then raise exception 'invalid_input: 品目は配列' using errcode = '22023'; end if;
   v_n := pg_catalog.jsonb_array_length(p_items);
   if v_n not between 1 and 2000 then raise exception 'invalid_input: 品目は 1〜2000 件' using errcode = '22023'; end if;
-  v_sha := pg_catalog.encode(pg_catalog.sha256(p_bytes), 'hex');
-  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('ops.lz_new_export:' || p_request_id::text, 0));
-  select * into v_prev from ops.lz_new_exports e where e.request_id = p_request_id;
-  if v_prev.export_id is not null then
-    if v_prev.actor_id is distinct from p_actor_id or v_prev.file_sha256 is distinct from v_sha then
-      raise exception 'request_id_reused: request_id % はほかの人・中身で使われている', p_request_id using errcode = '23505';
-    end if;
-    return pg_catalog.jsonb_build_object('ok', true, 'export_id', v_prev.export_id::text, 'file_sha256', v_prev.file_sha256, 'rows', v_prev.row_count, 'replayed', true);
-  end if;
   for it in select x from pg_catalog.jsonb_array_elements(p_items) x loop
     if pg_catalog.jsonb_typeof(it -> 'sku_id') is distinct from 'string' or (it ->> 'sku_id') !~ '^[1-9][0-9]{0,17}$'
        or pg_catalog.jsonb_typeof(it -> 'rule_row') is distinct from 'string' or (it ->> 'rule_row') !~ '^[1-9][0-9]{0,17}$' then
       raise exception 'invalid_input: 品目の形が違う' using errcode = '22023';
     end if;
   end loop;
+  -- 要求のハッシュ = sku_id:rule_row を sku_id の順に「,」でつなぐ (lib/lz-new-export.mjs lzRequestHash と同じ)
+  v_hash := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to((select pg_catalog.string_agg((x ->> 'sku_id') || ':' || (x ->> 'rule_row'), ',' order by (x ->> 'sku_id')::bigint, (x ->> 'rule_row')::bigint)
+    from pg_catalog.jsonb_array_elements(p_items) x), 'UTF8')), 'hex');
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('ops.lz_new_export:' || p_request_id::text, 0));
+  select * into v_prev from ops.lz_new_exports e where e.request_id = p_request_id;
+  if v_prev.export_id is not null then
+    if v_prev.actor_id is distinct from p_actor_id or v_prev.request_hash is distinct from v_hash then
+      raise exception 'request_id_reused: request_id % はほかの人・中身で使われている', p_request_id using errcode = '23505';
+    end if;
+    return pg_catalog.jsonb_build_object('ok', true, 'export_id', v_prev.export_id::text, 'text_sha256', v_prev.text_sha256, 'rows', v_prev.row_count, 'replayed', true);
+  end if;
   if (select pg_catalog.count(distinct (x ->> 'sku_id')) from pg_catalog.jsonb_array_elements(p_items) x) <> v_n then
     raise exception 'invalid_input: 同じ SKU が 2 回ある' using errcode = '22023';
   end if;
@@ -246,7 +260,10 @@ begin
   v_fresh := p_lz_bc_as_of is not null and p_lz_bc_as_of > pg_catalog.clock_timestamp() - interval '36 hours'
              and p_lz_bc_as_of <= pg_catalog.clock_timestamp() + interval '5 minutes';
   for it in select x from pg_catalog.jsonb_array_elements(p_items) x loop
-    select s.sku_id, s.company_id, s.code, s.sku_kind, p.expiry_managed, p.inbound_date_managed, g.state as reg into k
+    select s.sku_id, s.company_id, s.code, s.name, s.sku_kind, p.expiry_managed, p.inbound_date_managed, g.state as reg,
+           (select sc.cost_jpy::text from core.sku_costs sc where sc.sku_id = s.sku_id and sc.valid_to is null order by sc.valid_from desc limit 1) as cost,
+           (select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id where x.sku_id = s.sku_id and x.is_primary limit 1) as supplier
+      into k
       from core.skus s left join core.products p on p.product_id = s.product_id left join ops.master_registrations g on g.sku_id = s.sku_id
      where s.sku_id = (it ->> 'sku_id')::bigint;
     if k.sku_id is null or k.company_id <> 1 or k.sku_kind is distinct from 'single' or k.reg = 'cancelled' then
@@ -264,6 +281,7 @@ begin
        or (it ->> 'inbound_code') is distinct from (case when k.inbound_date_managed then '1' else '0' end) then
       raise exception 'stale: % の有効期限・入荷日の管理が画面を開いた後に変わった', k.code using errcode = '40001';
     end if;
+    if k.supplier is null then raise exception 'invalid_input: % に代表の仕入先が無い', k.code using errcode = '22023'; end if;
     if exists (select 1 from ops.lz_new_export_items i where i.sku_id = k.sku_id and i.state = 'issued') then
       raise exception 'lz_issued: % はもうロジザード登録の CSV に出した', k.code using errcode = '23505';
     end if;
@@ -273,25 +291,31 @@ begin
         raise exception 'lzbc_taken: % のバーコード % はほかの商品 (%) の % と重なっている', k.code, v_cur.value, c.code,
           case c.kind when 'fnsku' then 'Amazon の FNSKU' when 'jan' then 'JAN' else 'ロジザードのバーコード' end using errcode = '23505';
       end if;
-      if v_cur.lz_copy_state is distinct from 'checked' then
-        if not v_fresh then
-          raise exception 'lz_unchecked: % のバーコードはロジザードの写しと照らせていない (36 時間の中の新しい写しで照らし直すまで出さない)', k.code using errcode = '40001';
-        end if;
-        v_re := v_re || pg_catalog.jsonb_build_object(k.sku_id::text, true);
+      -- 🆕 #1721 R1 High 2: 値のある品目は、保存のときの結果にかかわらず今の写しで照らす (照らした写しの時刻が 36 時間の中)
+      if not v_fresh then
+        raise exception 'lz_unchecked: % のバーコードを今のロジザードの写しと照らせない (36 時間の中の新しい写しで照らすまで出さない)', k.code using errcode = '40001';
       end if;
+      if v_cur.lz_copy_state is distinct from 'checked' then v_re := v_re || pg_catalog.jsonb_build_object(k.sku_id::text, true); end if;
     end if;
+    v_lines := v_lines || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('code', k.code, 'line', pg_catalog.concat_ws(',',
+      ops.lz_csv_cell(k.code), ops.lz_csv_cell(k.name), ops.lz_csv_cell(k.name), ops.lz_csv_cell(coalesce(k.cost, '0')),
+      ops.lz_csv_cell(case when k.expiry_managed then '02' else '01' end), ops.lz_csv_cell(case when k.inbound_date_managed then '1' else '0' end),
+      ops.lz_csv_cell(case when k.supplier ~ '^[0-9]{1,3}$' then pg_catalog.lpad(k.supplier, 4, '0') else k.supplier end), ops.lz_csv_cell(coalesce(v_cur.value, '')))));
   end loop;
+  v_text := '商品ID,商品名,検索名称,仕入単価,有効期限区分,入荷日管理フラグ,取引先コード,バーコード' || E'\r\n'
+    || (select pg_catalog.string_agg(l ->> 'line', E'\r\n' order by (l ->> 'code') collate "C") from pg_catalog.jsonb_array_elements(v_lines) l);
   perform pg_catalog.set_config('ops.lz_new_export_protocol', '1', true);
-  insert into ops.lz_new_exports (company_id, request_id, actor_id, db_user, schema_version, file_name, file_bytes, file_sha256, row_count, lz_list_as_of, lz_bc_as_of)
-    values (1, p_request_id, p_actor_id, v_db_user, 'lz-bc-v1', 'logizard_bc_upload.csv', p_bytes, v_sha, v_n, p_lz_list_as_of, p_lz_bc_as_of) returning export_id into v_id;
+  insert into ops.lz_new_exports (company_id, request_id, actor_id, db_user, schema_version, file_name, file_text, text_sha256, request_hash, row_count, lz_list_as_of, lz_bc_as_of)
+    values (1, p_request_id, p_actor_id, v_db_user, 'lz-bc-v1', 'logizard_bc_upload.csv', v_text, pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(v_text, 'UTF8')), 'hex'),
+            v_hash, v_n, p_lz_list_as_of, p_lz_bc_as_of) returning export_id into v_id;
   insert into ops.lz_new_export_items (export_id, company_id, sku_id, code, rule_row, kind, value, expiry_code, inbound_code, rechecked)
     select v_id, 1, (x ->> 'sku_id')::bigint, x ->> 'code', (x ->> 'rule_row')::bigint, x ->> 'kind', x ->> 'value', x ->> 'expiry_code', x ->> 'inbound_code',
            v_re ? (x ->> 'sku_id')
       from pg_catalog.jsonb_array_elements(p_items) x;
   perform pg_catalog.set_config('ops.lz_new_export_protocol', '', true);
-  return pg_catalog.jsonb_build_object('ok', true, 'export_id', v_id::text, 'file_sha256', v_sha, 'rows', v_n);
+  return pg_catalog.jsonb_build_object('ok', true, 'export_id', v_id::text, 'text_sha256', (select e.text_sha256 from ops.lz_new_exports e where e.export_id = v_id), 'rows', v_n);
 end $$;
-revoke all on function ops.lz_new_export_issue(uuid, text, jsonb, bytea, timestamptz, timestamptz) from public;
+revoke all on function ops.lz_new_export_issue(uuid, text, jsonb, timestamptz, timestamptz) from public;
 
 /** 出した CSV を取り消す (ロジザードに取り込めなかった・作り直す)。理由 1〜200 字。もう取り消した = already。取り消すと品目の SKU はもう一度出せる・値を直せる */
 create function ops.lz_new_export_void(p_actor_id text, p_export_id bigint, p_reason text) returns jsonb

@@ -276,13 +276,13 @@ try {
     const [L, E] = clients.slice(-2);
     const lzSql = "select ops.set_sku_logizard_barcode($1::uuid, 'naka@test', $2::bigint, 'lz_assign', null, 'sku_page', $3::bigint, null, null) as r";
     const fixSql = "select ops.set_sku_logizard_barcode($1::uuid, 'naka@test', $2::bigint, 'fnsku', 'X00LZPGF01', 'sku_page', $3::bigint, 'checked', now()) as r";
-    const issueSql = 'select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, $4::bytea, now(), now()) as r';
+    const issueSql = 'select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), now()) as r';
     await L.query(lzSql, [uuid(), s2, await latest()]);   // 今 = 空欄
     const items = async () => JSON.stringify([{ sku_id: s2, code: 's002', rule_row: await latest(), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' }]);
     const tail = (c, sql, p) => launch((async () => { try { const r = (await c.query(sql, p)).rows[0].r; await c.query('commit'); return { ok: r }; } catch (e) { await c.query('rollback'); return { err: e }; } })());
     // ① CSV を出す取引が先 (まだ commit していない) → 直す取引は SKU の鍵で待つ → commit の後に lz_issued
     await E.query('begin');
-    await E.query(issueSql, [uuid(), 'naka@test', await items(), Buffer.from('x')]);
+    await E.query(issueSql, [uuid(), 'naka@test', await items()]);
     await L.query('begin');
     const f = tail(L, fixSql, [uuid(), s2, await latest()]);
     await until(1);
@@ -297,7 +297,7 @@ try {
     await L.query('begin');
     await L.query(fixSql, [uuid(), s2, await latest()]);
     await E.query('begin');
-    const s = tail(E, issueSql, [uuid(), 'naka@test', it2, Buffer.from('y')]);
+    const s = tail(E, issueSql, [uuid(), 'naka@test', it2]);
     await until(1);
     assert.equal(s.done, false);
     await L.query('commit');
