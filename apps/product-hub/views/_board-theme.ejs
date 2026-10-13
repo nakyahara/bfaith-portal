@@ -2,8 +2,18 @@
     board.ejs の <style> と _header の共通スタイルより後に読み込み、後勝ちで色だけを上書きする。
     レイアウト (幅・余白・並び) には触らない = 既存の挙動とテストに影響させない。
     タグ類は「明るい地 + 濃い文字」を「色の薄い半透明の地 + 明るい文字 + 色の縁」に置き換え、
-    色の意味 (赤 = 要対応・緑 = 済・黄 = 保留 …) はそのまま残す %>
+    色の意味 (赤 = 要対応・緑 = 済・黄 = 保留 …) はそのまま残す。
+    黒背景は画面だけ (@media screen)。印刷は背景が落ちて白地に明るい文字が残るので、従来の明るい表示のまま %>
 <style>
+  /* inline style から外した色の、明るい表示 (印刷) での受け皿 */
+  .kb-col.kb-col-done { background: #f0fdf4; }
+  .chip[data-alert] { border-color: #3b82f6; color: #1e40af; }
+  .chip.chip-warn { border-color: #fdba74; color: #b45309; }
+  #kb-search { border-color: #cbd5e1; }
+  /* 重要度のセレクトは黒背景向けの色を inline で塗るので、印刷では地と文字を戻す */
+  @media print { .kb-priority { background: #fff !important; color: #1f2430 !important; } }
+
+@media screen {
   :root {
     --kb-bg: #05080f;
     --kb-panel: rgba(13, 20, 36, .82);
@@ -11,8 +21,9 @@
     --kb-line: rgba(56, 189, 248, .16);
     --kb-line-strong: rgba(56, 189, 248, .38);
     --kb-text: #e2e8f0;
-    --kb-sub: #94a3b8;
-    --kb-dim: #64748b;
+    --kb-sub: #b6c2d2;
+    /* 補助文字。10〜12px の地の文で 4.5:1 を割らない明るさ (#64748b だと 3.6:1 で読めない: Codex R3) */
+    --kb-dim: #94a3b8;
     --kb-cyan: #22d3ee;
     --kb-blue: #60a5fa;
     --kb-violet: #a78bfa;
@@ -173,4 +184,5 @@
   .ad-table tr.ad-warn > td { background: rgba(249, 115, 22, .08); }
   .ad-live.on { background: #34d399; box-shadow: 0 0 6px rgba(52, 211, 153, .8); }
   .ad-live.off { background: #475569; }
+}
 </style>
