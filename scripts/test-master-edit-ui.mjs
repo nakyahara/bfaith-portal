@@ -2394,9 +2394,18 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   await noneRest(p);
   assert.match(await p.textContent('#remain'), /下書きを保存できます/);
   assert.equal(await p.locator('#checklist li.todo').count(), 0);
+  // 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコード = 初めから「自動」が押された形 (入力なしは無い = 数えない)・押し替えると送る値が変わる
+  assert.equal(await p.getAttribute('#f-lzbc', 'data-value'), 'auto');
+  assert.equal(await p.locator('[data-row="logizard_barcode"] .nonechk').count(), 0, 'ロジザードのバーコードに入力なしがある');
+  await p.click('#f-lzbc button[data-v="fnsku"]');
+  assert.equal(await p.getAttribute('#f-lzbc', 'data-value'), 'fnsku');
   const bodies = [];
   p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url())) bodies.push(JSON.parse(rq.postData())); });
   await Promise.all([p.waitForURL(/\/sku\/ui-none-1$/), p.click('#save')]);
+  assert.equal(bodies[0].logizard_barcode, 'fnsku');
+  assert.deepEqual((await pg.query(`select r.rule, r.via from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code = 'ui-none-1'`)).rows, [{ rule: 'fnsku', via: 'register' }]);
+  // 登録の後の商品の画面に「ロジザードに送るバーコード」(決め方 = FNSKU・FNSKU はまだ無い = 待つ)
+  assert.match(await p.innerText('#sec-lzbc'), /待つ/);
   // 送る印 = サーバーと同じ並び (lib/master-register-blanks.mjs の BLANK_KEYS)
   assert.deepEqual(bodies[0].blanks, ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit',
     'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.reference_urls', 'card.set_decision', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);

@@ -120,7 +120,7 @@
       if (nv != null) out.push([0, P.todayLabel + ' から この商品の原価は ' + yen(nv) + ' 円 (いまの ' + (P.costNow == null ? '未入力' : yen(P.costNow) + ' 円') + ' は昨日で終わり)']);
       if (sets.length) out.push([0, 'セット ' + sets.join('・') + ' の原価 (構成品の合計) も今日から計算し直します']);
     }
-    if (!isSet && has('jan')) out.push([0, 'JAN はロジザード・product-hub でも使います。NE の JAN は NE の画面で直してください']);
+    if (!isSet && has('jan')) out.push([0, 'JAN は product-hub (楽天の出品) で使います。ロジザードに送るバーコードは「ロジザードに送るバーコード」の欄で (決め方が自動なら FNSKU が無いときに JAN)。NE の JAN は NE の画面で直してください']);
     var neCsv = keys.filter(function (k) { var el = firstEl(k); return el && el.getAttribute('data-ne') === 'NE へ CSV' && k !== 'handling'; });
     var notInNe = P.reg === 'draft' || P.reg === 'ne_pending';   // 新商品で NE にまだ無い = NE への登録は NE 登録の CSV
     if (neCsv.length && notInNe) out.push([0, '新商品なので、NE への登録は「NE 登録の CSV」で行います (翌朝の照合の差にはなりません)']);

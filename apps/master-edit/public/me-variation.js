@@ -1052,6 +1052,9 @@
     out.blanks = m.noneKeys.slice();
     var po = ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
+    // 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコードの決め方 (全部の子に同じ・欄が無い = 0078 の前 = 自動)
+    var lz = document.getElementById('c-lzbc');
+    out.logizard_barcode = (lz && lz.getAttribute('data-value')) || 'auto';
     return out;
   }
   function openConfirm() {

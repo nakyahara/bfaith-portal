@@ -182,6 +182,27 @@ await ta('[R1] 同じ request_id = 前の答え (replayed・何も足さない)�
   assert.deepEqual(await counts(), before);
 });
 
+await ta('[R-LZ] 🆕 0078 ロジザードに送るバーコードの決め方: 全部の子に同じ決め方を 1 行ずつ (同じ取引・via register)・送らない = 行なし・違う決め方の押し直し = 409・答えは子ごと (子の JAN)', async () => {
+  const LB = await import('../lib/logizard-barcode.mjs');
+  const rid = uuid();
+  const input = { ...hakamaInput('Lzb1'), requestId: rid, logizardBarcode: 'jan' };
+  const a = await reg(input);
+  const rows = await q(`select s.code, r.rule, r.via from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id
+     join core.products p on p.product_id = s.product_id where p.parent_product_id = $1 order by s.code`, [a.group_product_id]);
+  assert.equal(rows.length, a.children.length);
+  assert.ok(rows.every((x) => x.rule === 'jan' && x.via === 'register'), JSON.stringify(rows.slice(0, 2)));
+  assert.equal((await reg(input)).replayed, true);
+  await rejects(reg({ ...input, logizardBarcode: 'auto' }), 409, 'request_id_reused');
+  await rejects(reg({ ...input, logizardBarcode: undefined }), 409, 'request_id_reused');
+  // 子の JAN が無い = 決め方 jan は「待つ」(子ごとに決まる)
+  const m = await asEditor(() => LB.readLogizardBarcodes(db, a.children.map((k) => k.sku_id)));
+  assert.ok([...m.values()].every((x) => x.rule === 'jan' && x.pick.state === 'waiting'));
+  const b = await reg({ ...hakamaInput('Lzb2') });
+  assert.equal((await one(`select count(*)::int as n from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id
+     join core.products p on p.product_id = s.product_id where p.parent_product_id = $1`, [b.group_product_id])).n, 0, '送らないまとまりに行を書いた');
+  await rejects(reg({ ...hakamaInput('Lzb3'), logizardBarcode: 'none' }), 400, 'invalid_input');
+});
+
 await ta('[R2] 0069 (#1679 Codex R1 Medium 1): 同じ request_id で名前・売価・原価・JAN・カードの欄・理由だけを変えた押し直し = 409 request_id_reused (前の答えにしない・何も書かない)・要求の全部のハッシュを同じ取引で残す', async () => {
   const rid = uuid();
   const input = { ...hakamaInput('Rp2'), requestId: rid, reason: '最初の理由' };

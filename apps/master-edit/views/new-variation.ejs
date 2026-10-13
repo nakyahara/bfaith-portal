@@ -159,6 +159,10 @@
             <div class="ctl"><div class="seg" role="group" id="c-expiry" aria-labelledby="lab-c-expiry" data-field="expiry" data-value=""><button type="button" data-v="0" aria-pressed="false"<%= dis %>>なし</button><button type="button" data-v="1" aria-pressed="false"<%= dis %>>あり</button></div><span class="hint">賞味期限・使用期限のある商品は あり</span><div id="cf-expiry" style="flex-basis:100%"></div></div></div>
           <div class="f"><div class="lab" id="lab-c-inbound">ロジザードの入荷日の管理</div>
             <div class="ctl"><div class="seg" role="group" id="c-inbound" aria-labelledby="lab-c-inbound" data-field="inbound" data-value=""<%- part('inbound_date_managed') %>><button type="button" data-v="0" aria-pressed="false"<%= dis %>>なし</button><button type="button" data-v="1" aria-pressed="false"<%= dis %>>あり</button></div><%- none('inbound_date_managed') %><span class="hint">最初の値だけ · あとはロジザードが正 · 入力なし = 不明のまま</span><div id="cf-inbound" style="flex-basis:100%"></div></div></div>
+          <%# 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコードの決め方 = 全部の子に同じ (子ごとに FNSKU・JAN から答えが決まる)。子ごとに変えるのは登録の後に子の商品の画面で %>
+          <div class="f"><div class="lab" id="lab-c-lzbc">ロジザードに送るバーコード</div>
+            <div class="ctl"><% if (locals.lzBarcodeReady) { %><div class="seg" role="group" id="c-lzbc" aria-labelledby="lab-c-lzbc" data-value="auto"><% for (const [v, t, sm] of [['auto', '自動', 'おすすめ'], ['fnsku', 'FNSKU'], ['jan', 'JAN'], ['lz_assign', '空欄']]) { %><button type="button" data-v="<%= v %>" aria-pressed="<%= v === 'auto' ? 'true' : 'false' %>"<%= v === 'auto' ? ' class="on"' : '' %><%= dis %>><%= t %><% if (sm) { %> <small><%= sm %></small><% } %></button><% } %></div><% } else { %><span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg>自動</span><% } %>
+              <span class="hint">全部の子に同じ決め方 · 自動 = FNSKU があれば FNSKU・無ければ JAN (子の JAN)・JAN も無ければ空欄 (ロジザードが番号を付ける) · 子ごとに変えるのは登録の後に子の商品の画面で<%= locals.lzBarcodeReady ? '' : ' · 今は自動だけ (Company DB の準備中)' %></span></div></div>
         </section>
 
         <%# 5 のつづき: 発注の設定 (今の単品の画面と同じ部品 = _order.ejs・public/me-order.js)。全部の子に同じ値 (登録の後に子ごとに発注アプリへ) %>

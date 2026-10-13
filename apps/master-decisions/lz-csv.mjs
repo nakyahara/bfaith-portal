@@ -15,6 +15,7 @@
  */
 import { createRequire } from 'node:module';
 import iconv from 'iconv-lite';
+import { lzBarcodeValueOk } from '../../lib/logizard-barcode.mjs';
 
 export const LZ_CONVERTER_VERSION = 'lz-v1';
 /** CP932 の表は iconv-lite の版で決まる。版が変わったら表の実測をやり直す (契約 v2 M6) */
@@ -26,6 +27,8 @@ export const NEW = Object.freeze({
   file: 'logizard_bc_upload.csv',
   header: Object.freeze(['商品ID', '商品名', '検索名称', '仕入単価', '有効期限区分', '入荷日管理フラグ', '取引先コード', 'バーコード']),
   human: Object.freeze([4, 5, 7]),   // 人がシートに入れる 3 列 (有効期限区分・入荷日管理フラグ・バーコード) = 空で書き、突き合わせでは比べない (中原さん L-2)
+  // 🆕 2026-10-13 (CompanyDB構想 23): バーコード (7 列目) は、項目に barcode (lib/logizard-barcode.mjs の lzCsvBarcodeOf の答え) があれば書く。
+  //   今 (GAS の間) は GAS の H 列 (人) が正 = 影運転は barcode を渡さない = 今と同じ空・比べない (L-2 のまま)。③c-2 で Company DB から作るときに使う
 });
 
 const hexCp = (cp) => `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
@@ -117,7 +120,7 @@ export function rowTexts(it, kind) {
   const cost = it.cost_text != null ? { text: String(it.cost_text), unverified: it.cost_unverified || null } : costText(it.cost_src), sup = supplierText(it.supplier);
   if (cost.unverified) flags.push({ col: 3, why: cost.unverified });
   if (sup.unverified) flags.push({ col: kind === 'daily' ? 4 : 6, why: sup.unverified });
-  const texts = kind === 'daily' ? [code, name, name, cost.text, sup.text] : [code, name, name, cost.text, '', '', sup.text, ''];
+  const texts = kind === 'daily' ? [code, name, name, cost.text, sup.text] : [code, name, name, cost.text, '', '', sup.text, it.barcode == null ? '' : String(it.barcode)];
   return { texts, flags };
 }
 
@@ -135,6 +138,10 @@ export function buildLzCsv(items, kind) {
   const made = [];
   for (const it of items) {
     if (!it.ne_code) { unmade.push({ code_norm: it.code_norm, reason: it.code_reason || 'no_ne_code' }); continue; }
+    if (kind === 'new') {
+      const why = newBarcodeProblem(it);
+      if (why) { unmade.push({ code_norm: it.code_norm, reason: why }); continue; }
+    }
     made.push(it);
   }
   made.sort((a, b) => (a.ne_code < b.ne_code ? -1 : a.ne_code > b.ne_code ? 1 : 0));
@@ -160,6 +167,20 @@ export function buildLzCsv(items, kind) {
     file_unverified: rows.length ? [] : ['zero_rows'],   // 0 件のときの GAS の形は未実測 (見出しだけと推測)
     counts: { target: items.length, made: rows.length, unmade: unmade.length, rows_with_subs: rows.filter((r) => r.subs.length).length, rows_unverified: rows.filter((r) => r.unverified.length).length },
   };
+}
+/**
+ * 新商品の行のバーコード (CompanyDB構想 23 §5)。渡し方は { barcode: 値 ('' = 空欄 = ロジザードが番号を付ける) } か { barcode_hold: 理由 } のどちらか 1 つ・どちらも無い = 空 (今と同じ)。
+ *   要確認・待つ・決め方なし = 行を作らない (理由 = barcode_hold)。両方・形の違う値 = 例外で止める (黙って空欄にしない = 空欄はロジザードが別の番号を付ける)
+ */
+function newBarcodeProblem(it) {
+  const hasHold = it.barcode_hold != null, hasCode = it.barcode != null;
+  if (hasHold && hasCode) throw new Error(`新商品 ${it.ne_code}: barcode と barcode_hold の両方がある`);
+  if (hasHold) {
+    if (typeof it.barcode_hold !== 'string' || !/^lz_barcode_[a-z_]+$/.test(it.barcode_hold)) throw new Error(`新商品 ${it.ne_code}: 知らない barcode_hold ${String(it.barcode_hold).slice(0, 40)}`);
+    return it.barcode_hold;
+  }
+  if (hasCode && (typeof it.barcode !== 'string' || !lzBarcodeValueOk(it.barcode))) throw new Error(`新商品 ${it.ne_code}: バーコードの形が違う (${String(it.barcode).slice(0, 40)})`);
+  return null;
 }
 function joinCells(bufs) { const out = []; bufs.forEach((b, i) => { if (i) out.push(Buffer.from([0x2c])); out.push(b); }); return out; }
 /** 比べるのは引用符を外した中身 (引用符の付き方は別に比べる)。"" は " に戻す (lz-compare の parseCsvBytes と同じ復号) */
