@@ -1,0 +1,107 @@
+<%# 詳細画面の黒背景テーマ (2026-10-13 中原さん要望「カードも中身も同様に」)。
+    detail.ejs の色は CSS と inline style のどちらも var(--phd-<役割>-<元の色>, 元の色) の形で書いてある
+    (役割 = bg 地 / fg 文字 / bd 枠線・影)。ここで画面表示のときだけ変数に黒地向けの値を入れ、
+    変数が無い印刷は元の明るい色のまま描く。値は規則で決めている —
+      地: 白系 → 紺のパネル / 淡い色 → 同じ色相の薄い半透明 / 濃い色 (ボタンなど) → そのまま
+      文字: 濃い色 → 同じ色相の明るい色 / 白 → そのまま
+      枠線: 淡い色 → 同じ色相の半透明の線
+    新しい色を detail.ejs に足したら、ここにも 1 行足す (足さないと黒地に元の明るい色が出る) %>
+<%- include('_dark-theme') %>
+<style>
+  /* 画像の重要度: 地と文字は inline の --pri-bg / --pri-fg (選んだ重要度の色) から塗る */
+  #f-image-priority { background: var(--pri-bg, #fff); color: var(--pri-fg, inherit); }
+@media screen {
+  :root {
+    --phd-bd-86efac: hsl(142 77% 60% / 0.45);
+    --phd-bd-93c5fd: hsl(212 85% 60% / 0.45);
+    --phd-bd-bae6fd: hsl(201 85% 60% / 0.45);
+    --phd-bd-bbf7d0: hsl(141 79% 60% / 0.45);
+    --phd-bd-bfdbfe: hsl(213 85% 60% / 0.45);
+    --phd-bd-c7d2fe: hsl(228 85% 60% / 0.45);
+    --phd-bd-cbd5e1: rgba(148, 163, 184, 0.35);
+    --phd-bd-ddd6fe: hsl(251 85% 60% / 0.45);
+    --phd-bd-e2e8f0: hsl(214 32% 60% / 0.45);
+    --phd-bd-fca5a5: hsl(0 85% 60% / 0.45);
+    --phd-bd-fdba74: hsl(31 85% 60% / 0.45);
+    --phd-bd-fde68a: hsl(48 85% 60% / 0.45);
+    --phd-bd-fecaca: hsl(0 85% 60% / 0.45);
+    --phd-bd-fed7aa: hsl(32 85% 60% / 0.45);
+    --phd-bg-cbd5e1: #334155;
+    --phd-bg-dbeafe: hsl(214 85% 50% / 0.16);
+    --phd-bg-dcfce7: hsl(141 84% 50% / 0.16);
+    --phd-bg-e2e8f0: #1e293b;
+    --phd-bg-ede9fe: hsl(251 85% 50% / 0.1);
+    --phd-bg-eff6ff: hsl(214 85% 50% / 0.1);
+    --phd-bg-f0f9ff: hsl(204 85% 50% / 0.1);
+    --phd-bg-f0fdf4: hsl(138 76% 50% / 0.1);
+    --phd-bg-f1f5f9: #0b1322;
+    --phd-bg-f5f6f8: #101828;
+    --phd-bg-f8fafc: #0d1526;
+    --phd-bg-f8fbff: hsl(214 85% 50% / 0.1);
+    --phd-bg-f8fdff: hsl(197 85% 50% / 0.1);
+    --phd-bg-faf5ff: hsl(270 85% 50% / 0.1);
+    --phd-bg-faf8ff: hsl(257 85% 50% / 0.1);
+    --phd-bg-fbfbff: hsl(240 85% 50% / 0.1);
+    --phd-bg-fee2e2: hsl(0 85% 50% / 0.1);
+    --phd-bg-fef2f2: hsl(0 85% 50% / 0.1);
+    --phd-bg-fef3c7: hsl(48 85% 50% / 0.16);
+    --phd-bg-fef9ec: hsl(43 85% 50% / 0.1);
+    --phd-bg-fefce8: hsl(55 85% 50% / 0.1);
+    --phd-bg-fff: #111a2e;
+    --phd-bg-fff7ed: hsl(33 85% 50% / 0.1);
+    --phd-bg-fffbeb: hsl(48 85% 50% / 0.1);
+    --phd-bg-fffbfa: hsl(12 85% 50% / 0.1);
+    --phd-bg-fffdf5: hsl(48 85% 50% / 0.1);
+    --phd-fg-0f172a: hsl(222 47% 74%);
+    --phd-fg-15803d: hsl(142 72% 74%);
+    --phd-fg-166534: hsl(143 64% 74%);
+    --phd-fg-16a34a: hsl(142 76% 74%);
+    --phd-fg-1d4ed8: hsl(224 76% 74%);
+    --phd-fg-1e293b: hsl(217 33% 74%);
+    --phd-fg-1e3a8a: hsl(224 64% 74%);
+    --phd-fg-1e40af: hsl(226 71% 74%);
+    --phd-fg-2563eb: hsl(221 83% 74%);
+    --phd-fg-334155: hsl(215 25% 74%);
+    --phd-fg-475569: hsl(215 19% 76%);
+    --phd-fg-64748b: hsl(215 16% 67%);
+    --phd-fg-6d28d9: hsl(263 70% 74%);
+    --phd-fg-92400e: hsl(23 83% 74%);
+    --phd-fg-991b1b: hsl(0 70% 74%);
+    --phd-fg-9a3412: hsl(15 79% 74%);
+    --phd-fg-b45309: hsl(26 90% 74%);
+    --phd-fg-b91c1c: hsl(0 74% 74%);
+    --phd-fg-cbd5e1: hsl(213 27% 46%);
+    --phd-fg-dc2626: hsl(0 72% 74%);
+    --phd-fg-f59e0b: hsl(38 90% 66%);
+    /* 濃い色 (ボタン・点・白い文字) は黒地でもそのまま読めるので元の色のまま */
+    --phd-bd-16a34a: #16a34a;
+    --phd-bd-2563eb: #2563eb;
+    --phd-bd-3b82f6: #3b82f6;
+    --phd-bd-dc2626: #dc2626;
+    --phd-bd-ef4444: #ef4444;
+    --phd-bd-f59e0b: #f59e0b;
+    --phd-bd-fbbf24: #fbbf24;
+    --phd-bd-fcd34d: #fcd34d;
+    --phd-bd-fde047: #fde047;
+    --phd-bg-15803d: #15803d;
+    --phd-bg-16a34a: #16a34a;
+    --phd-bg-1e293b: #1e293b;
+    --phd-bg-2563eb: #2563eb;
+    --phd-bg-3b82f6: #3b82f6;
+    --phd-bg-94a3b8: #94a3b8;
+    --phd-bg-dc2626: #dc2626;
+    --phd-bg-f59e0b: #f59e0b;
+    --phd-fg-94a3b8: #94a3b8;
+    --phd-fg-fff: #fff;
+  }
+  /* 楽天に載る HTML のプレビューは「楽天の白地でどう見えるか」を見る枠なので、黒テーマでも白地・濃い文字のまま。
+     中の HTML は文字色を持たず親から継ぐ (ラベルのセルは bgcolor=#eeeeee) ので、明るい文字を継がせない (Codex R3) */
+  /* 表は別に塗る: この画面は doctype 無し (互換モード) で、表が親の文字色を継がない */
+  .desc3-render, #pi-preview, .desc3-render table, #pi-preview table { color: #1f2430; color-scheme: light; }
+  .desc3-render a, #pi-preview a { color: #1d4ed8; }
+  .desc3-render :is(code, pre, label, summary), #pi-preview :is(code, pre, label, summary) { color: inherit; }
+  /* 重要度は黒地で読めるよう、濃い色を地に・淡い色を文字に入れ替える */
+  #f-image-priority { background: color-mix(in srgb, var(--pri-fg, transparent) 30%, #0b1222);
+                      color: var(--pri-bg, var(--kb-text)); }
+}
+</style>
