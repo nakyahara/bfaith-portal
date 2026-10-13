@@ -74,6 +74,7 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   { sig: 'ops.claim_card_events(text, text, uuid, bigint, integer, integer, integer)', cls: 'light', public: false, reason: 'カードの出来事を件数の上限つきで借りる (SECURITY DEFINER・PUBLIC なし)' },
   { sig: 'ops.claim_outbox_events(text, text, text, uuid, bigint, integer, integer, integer)', cls: 'light', public: false, since: '0066', reason: '名前空間つきの知らせを件数の上限つきで借りる (0066・SECURITY DEFINER・PUBLIC なし)' },
   { sig: 'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer, uuid[])', cls: 'light', public: false, since: '0075', reason: '発注の設定の知らせを件数の上限 (200) つきで借りる (0075・SECURITY DEFINER・PUBLIC なし・master_edit と持ち主 = 夜間ロードの後ろの段)。知らせの表は新商品の数 (少数)・開いている知らせの部分 index' },
+  { sig: 'ops.add_sku_gone_day_overrides(uuid, text, text, text[], integer, integer)', cls: 'light', public: false, since: '0076', reason: '「NE から消えた → やめる」の日数の許可を足す (0076・SECURITY DEFINER・PUBLIC なし・master_ops にだけ実行)。' + '呼び手 = scripts/company-db/master-gone-day-override.mjs --apply (人が中原さんの OK の後に流す CLI だけ・定期実行なし)。p_days は許可の日数 (1〜3) で期間の集計ではない = 規則 (② RANGE_ARGS の p_days) にかかるが重くない。' + '件数の上限 = p_codes は 1〜100 件 (超えると 22023)・p_valid_days は 1〜14・コードごとに core.skus と登録の状態を主キー / code_norm の索引で引いて許可の表に 1 行ずつ足すだけ (読む・書くのは最大 100 行)' },
 ]);
 
 export const MANIFEST_CLASSES = Object.freeze(['revoke', 'guard_later', 'light']);
