@@ -426,7 +426,7 @@ await ta('[S7b] 状態の行の無い SKU が残っていたら (trigger を止�
 
 await ta('[S8] 要確認 (quarantined) は根拠の表ができるまで使える側に進めない (人の理由があっても not_ready)・やめるのは人の理由で', async () => {
   const id = await skuId('s900');
-  // 🆕 0078: 要確認 → NE 確認済みは「確認済みにする」の約束 (ops.confirm_quarantined_sku) の中だけ = 直に呼ぶと confirm_session_required (0078 の前は not_ready)
+  // 🆕 0079: 要確認 → NE 確認済みは「確認済みにする」の約束 (ops.confirm_quarantined_sku) の中だけ = 直に呼ぶと confirm_session_required (0079 の前は not_ready)
   await assert.rejects(() => transition(id, 'ne_confirmed', { reason: 'NE で確かめた正しい商品', evidence: { compare_run_id: RUN, matched: true } }), /confirm_session_required/);
   await assert.rejects(() => transition(id, 'available', { reason: '使う' }), /one_way/);
   assert.equal((await regOf('s900')).state, 'quarantined');

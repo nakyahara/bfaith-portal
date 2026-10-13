@@ -1,6 +1,6 @@
--- 0078: 要確認 (quarantined = NE で直接作られた商品) を「確認済み」(ne_confirmed = NE 確認済み) にする DB の道 (2026-10-13・Company DB構想 22 の Q-1)
+-- 0079: 要確認 (quarantined = NE で直接作られた商品) を「確認済み」(ne_confirmed = NE 確認済み) にする DB の道 (2026-10-13・Company DB構想 22 の Q-1)
 --       中原さんの決定 10/13 夜 = Q1〜Q5 全部 a (Q2 a = 推奨保有月数が要る・Q3 a = NE と違う欄はマスタの判断で決めてから・Q4 a = 人が見て押す (自動にしない))
--- 🚨 番号は仮置き (マージの順で付け替える・中身は番号に依らない)。前提 = 0073 (ops.transition_sku_registration の今の版)・0072 (約束の操作の CHECK の今の版)・
+-- 🚨 番号 = 0079 (0078 = #1716 ロジザードのバーコードの決め方の後・2026-10-14 に付け替えた。中身は番号に依らない)。前提 = 0073 (ops.transition_sku_registration の今の版)・0072 (約束の操作の CHECK の今の版)・
 --    0067 (ops.v_ne_reg_targets の今の版・まとまりの予約 ops.variation_group_codes・鍵の部品)・0065 / 0067 (ops.ne_reg_canonical・ops.ne_reg_compare)・
 --    0070 (ops.ne_gone_fresh_hours)・0053 (照合 ② の観測・封・ops.reg_write_gate・ops.close_reg_write)・0032 / 0034 (判断の台帳)
 --
@@ -29,7 +29,7 @@
 --      同じ request_id の押し直し = 前の答え。鍵: 段階 → マスタの書き込み (共有) → SKU → 親子 (共有) → NE のコード (共有) → (親があれば) まとまりのコード → まとまり →
 --      登録の状態の行 (for update) → 構成品の登録の状態の行 (for share) → 判断の候補の行 (for share)。鍵の後に 2. をもう一度: ok でない = not_confirmable (理由を全部)・
 --      check_hash が今の表と違う (画面を開いた後に値か照合が変わった) = stale。約束 (操作 quarantine_confirm・この関数だけが書く) → 登録の状態 → 保存の記録 done
---   5. ops.transition_sku_registration (0073 の版を写して 🆕 0078 のかたまりだけ足した): quarantined → ne_confirmed は約束 quarantine_confirm の中・同じ SKU・人・request_id・
+--   5. ops.transition_sku_registration (0073 の版を写して 🆕 0079 のかたまりだけ足した): quarantined → ne_confirmed は約束 quarantine_confirm の中・同じ SKU・人・request_id・
 --      人 (human) のときだけ。根拠は呼び手から受けず、DB が 2. の表から作る (照合の回・観測のハッシュ・check_hash・使った判断・まとまり)。2. が ok で、check_hash が
 --      約束の check_hash と同じときだけ。運用のロール・持ち主のロールが直に呼んでも断る (0070 の「NE から消えた」と同じ型)。🚨 0073 の本文の not_ready の行は残る
 --      (このかたまりが先に終わる = 届かない) = 0073 との差はこのかたまりだけ (試験が機械で比べる)
@@ -49,21 +49,21 @@ create or replace view ops.v_ne_reg_targets as
     from ops.ne_reg_export_items i
    where i.state in ('issued', 'import_declared', 'partial')
   union all
-  -- 🆕 0078: NE で直接作られた商品 (quarantined) を全部 (単品もセットも・親の有無・products.parent の持ち主を問わず) = 翌朝の照合が NE の観測を残す
+  -- 🆕 0079: NE で直接作られた商品 (quarantined) を全部 (単品もセットも・親の有無・products.parent の持ち主を問わず) = 翌朝の照合が NE の観測を残す
   --   (確認済みにする根拠 = ops.quarantine_confirm_check・代表の採用の根拠 = 0067 の部分集合も含む)。コードが 80 字を超える SKU は入れない (観測の表の CHECK)
   select null::bigint, null::bigint, s.sku_id, s.code_norm, s.sku_kind, 'quarantined'::text
     from core.skus s join ops.master_registrations r on r.sku_id = s.sku_id
    where r.state = 'quarantined' and s.sku_kind in ('single', 'set') and pg_catalog.length(s.code_norm) between 1 and 80
      -- #1715 Codex R1 M2: 上の枝 (生きている NE 登録の CSV の品目) にある SKU は重ねない (同じ SKU を 2 行にしない)
      and not exists (select 1 from ops.ne_reg_export_items i where i.sku_id = s.sku_id and i.state in ('issued', 'import_declared', 'partial'));
-comment on view ops.v_ne_reg_targets is '翌朝の照合 ② が NE の完全な取得の値を送る商品 (0053・0063 から配っただけの品目も・0078 から要確認 (quarantined) の単品とセットの全部)';
+comment on view ops.v_ne_reg_targets is '翌朝の照合 ② が NE の完全な取得の値を送る商品 (0053・0063 から配っただけの品目も・0079 から要確認 (quarantined) の単品とセットの全部)';
 
 -- ═══════════ 1b. 承認の時の組 (#1715 Codex R3 High) ═══════════
 -- 判断の承認 (ops.master_decision_events の approved) を書いた時の候補の print の組 (社内の値 c・NE の値 n) を、承認の出来事ごとに残す。
 --   書くのは承認の出来事の insert の後の trigger だけ (どの書き手も = 判断の画面 apps/master-decisions/decide.mjs の applyDecisions・持ち主の手)。
 --   確認 (ops.quarantine_confirm_check) は「承認の時の組 = 今の組 (今日の社内の値 ↔ 最新の観測の値)」のときだけ承認を効かせる = 候補の行ではなく承認に結びつける。
 --   組の記録が無い承認は効かせない。
--- 🚨 前からある承認 (0078 の前) には組を入れない (#1715 Codex R4 High・coordinator の判断 = 安全側): 0033〜0077 を通って承認の時と同じ print のままだったと
+-- 🚨 前からある承認 (0079 の前) には組を入れない (#1715 Codex R4 High・coordinator の判断 = 安全側): 0033〜0078 を通って承認の時と同じ print のままだったと
 --    実証できない = 効かせない。確認の表は「承認の時の組の記録が無い (マスタの判断で決め直す)」と出す → 判断の画面で決め直すと新しい承認に組が残って効く
 create table ops.master_decision_approval_prints (
   event_id    bigint primary key references ops.master_decision_events (event_id),
@@ -73,7 +73,7 @@ create table ops.master_decision_approval_prints (
   recorded_at timestamptz not null default pg_catalog.clock_timestamp()
 );
 select core.make_append_only('ops', 'master_decision_approval_prints');
-comment on table ops.master_decision_approval_prints is '判断の承認の時の候補の組 (社内の値・NE の値) (0078・#1715 Codex R3)。書くのは承認の出来事の後の trigger だけ。追記だけ';
+comment on table ops.master_decision_approval_prints is '判断の承認の時の候補の組 (社内の値・NE の値) (0079・#1715 Codex R3)。書くのは承認の出来事の後の trigger だけ。追記だけ';
 create function ops.guard_master_decision_approval_prints() returns trigger language plpgsql set search_path = pg_catalog, pg_temp as $$
 begin
   if coalesce(pg_catalog.current_setting('ops.approval_print_protocol', true), '') is distinct from '1' then
@@ -535,9 +535,9 @@ alter table ops.master_edit_requests add constraint ck_mer_operation check (oper
   'ne_del_build', 'ne_del_withdraw', 'ne_handling_build',
   'quarantine_confirm'));
 
--- ═══════════ 5. 状態を 1 つ進める (0073 の版を写して、🆕 0078 のかたまりだけ足した) ═══════════
+-- ═══════════ 5. 状態を 1 つ進める (0073 の版を写して、🆕 0079 のかたまりだけ足した) ═══════════
 /**
- * 0073 の版と同じ (ne_pending・ne_confirmed (ne_pending から)・cancelled の道・0070 / 0071 / 0073 の守り)。足したのは 🆕 0078 のかたまり:
+ * 0073 の版と同じ (ne_pending・ne_confirmed (ne_pending から)・cancelled の道・0070 / 0071 / 0073 の守り)。足したのは 🆕 0079 のかたまり:
  *   quarantined → ne_confirmed = 約束 quarantine_confirm (ops.confirm_quarantined_sku だけが書く) の中・同じ SKU・人・request_id・人 (human) のときだけ。
  *   呼び手の根拠は受けない。ops.quarantine_confirm_check をもう一度呼び、ok で check_hash が約束の check_hash と同じときだけ。根拠 = その表の evidence (DB が作る)
  */
@@ -562,7 +562,7 @@ begin
   if not ops.registration_transition_allowed(r.state, p_to) then
     raise exception 'one_way: 状態は % から % に進めない', r.state, p_to using errcode = 'P0001';
   end if;
-  -- 🆕 0078 ここから: 要確認 (NE で直接作られた商品) → NE 確認済み = 「確認済みにする」の約束 (ops.confirm_quarantined_sku・操作 quarantine_confirm) の中だけ・
+  -- 🆕 0079 ここから: 要確認 (NE で直接作られた商品) → NE 確認済み = 「確認済みにする」の約束 (ops.confirm_quarantined_sku・操作 quarantine_confirm) の中だけ・
   --   同じ SKU・人・request_id・人 (human)。呼び手の根拠は受けない。確かめ (ops.quarantine_confirm_check) をもう一度: ok で、check_hash が約束の check_hash と同じときだけ。
   --   根拠は DB が確かめの表から作る。運用のロール・持ち主のロールが直に呼んでも断る (0070 の「NE から消えた」と同じ型)。下の 0073 の not_ready の行には届かない
   if p_to = 'ne_confirmed' and r.state = 'quarantined' then
@@ -590,7 +590,7 @@ begin
       values (r.company_id, p_sku_id, r.state, p_to, p_actor_type, p_actor_id, p_reason, v_ev, p_request_id) returning event_id into v_event;
     return pg_catalog.jsonb_build_object('sku_id', p_sku_id, 'from', r.state, 'to', p_to, 'event_id', v_event);
   end if;
-  -- 🆕 0078 ここまで
+  -- 🆕 0079 ここまで
   if p_to in ('distributable', 'available') then
     raise exception 'not_ready: % への根拠 (%) の表がまだ無い = 進めない (④ で作る)', p_to, case p_to when 'distributable' then '配る世代' else '場所ごとの受け取り' end
       using errcode = 'P0001';

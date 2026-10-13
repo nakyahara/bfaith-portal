@@ -1,8 +1,8 @@
 /**
- * test-master-quarantine-confirm.mjs — 要確認 (quarantined) の商品を確認済み (ne_confirmed) にする DB の道 (0078・Company DB構想 22 の Q-1・中原さんの決定 10/13 Q1〜Q5 = a) を PGlite で確かめる
+ * test-master-quarantine-confirm.mjs — 要確認 (quarantined) の商品を確認済み (ne_confirmed) にする DB の道 (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 Q1〜Q5 = a) を PGlite で確かめる
  *
  * 固定する契約:
- *   [M]  migration の写し: ops.transition_sku_registration = 0073 の版 (前の最新) から写して 🆕 0078 のかたまりだけ足した (かたまりを外すと 0073 と 1 字も違わない)・
+ *   [M]  migration の写し: ops.transition_sku_registration = 0073 の版 (前の最新) から写して 🆕 0079 のかたまりだけ足した (かたまりを外すと 0073 と 1 字も違わない)・
  *        約束の操作の CHECK = 0072 の全部 + quarantine_confirm・確かめ待ちの view = 0067 の版の品目の行のまま (要確認の行だけ替えた)・
  *        security definer の関数は search_path = pg_catalog, pg_temp・public の実行権なし・一時の表なし
  *   [V]  照合 ② の確かめ待ち (ops.v_ne_reg_targets) に要確認を全部 (単品もセットも・親のある子も・products.parent の持ち主を問わず)・確認済みにしたら外れる
@@ -57,14 +57,14 @@ function fnText(text, name) {
   const j = text.indexOf('$$;', k + 6);
   return text.slice(i, j + 3).replace(/^create or replace function/, 'create function');
 }
-/** 「🆕 0078 ここから〜ここまで」のかたまりと「🆕 0078」の行を外す */
-function strip0078(t) {
+/** 「🆕 0079 ここから〜ここまで」のかたまりと「🆕 0079」の行を外す */
+function strip0079(t) {
   const out = [];
   let skip = false;
   for (const l of t.split('\n')) {
-    if (/-- 🆕 0078 ここから/.test(l)) { skip = true; continue; }
-    if (/-- 🆕 0078 ここまで/.test(l)) { skip = false; continue; }
-    if (skip || /🆕 0078/.test(l)) continue;
+    if (/-- 🆕 0079 ここから/.test(l)) { skip = true; continue; }
+    if (/-- 🆕 0079 ここまで/.test(l)) { skip = false; continue; }
+    if (skip || /🆕 0079/.test(l)) continue;
     out.push(l);
   }
   return out.join('\n');
@@ -72,19 +72,19 @@ function strip0078(t) {
 const lastDefBefore = (name, before = THIS_V) => migFiles.filter((f) => f < before && fnText(readMig(f), name)).pop();
 
 console.log('[M] migration の写し');
-await ta('[M1] ops.transition_sku_registration = 0073 の版 (前の最新) から写して 🆕 0078 のかたまりだけ足した (かたまりの中は要確認 → NE 確認済みの道だけ)', async () => {
+await ta('[M1] ops.transition_sku_registration = 0073 の版 (前の最新) から写して 🆕 0079 のかたまりだけ足した (かたまりの中は要確認 → NE 確認済みの道だけ)', async () => {
   const src = lastDefBefore('ops.transition_sku_registration');
   assert.ok(src && src.startsWith('0073'), `前の最新の版が ${src} (期待 0073)`);
   const before = fnText(readMig(src), 'ops.transition_sku_registration');
   const now = fnText(M78, 'ops.transition_sku_registration');
   assert.ok(now, `${THIS} に無い`);
   assert.notEqual(now, before, '何も足していない');
-  assert.equal(strip0078(now), before, 'かたまりを外すと 0073 の版と違う (写し間違い・印の無い変更)');
-  const block = now.slice(now.indexOf('-- 🆕 0078 ここから'), now.indexOf('-- 🆕 0078 ここまで'));
+  assert.equal(strip0079(now), before, 'かたまりを外すと 0073 の版と違う (写し間違い・印の無い変更)');
+  const block = now.slice(now.indexOf('-- 🆕 0079 ここから'), now.indexOf('-- 🆕 0079 ここまで'));
   assert.match(block, /if p_to = 'ne_confirmed' and r\.state = 'quarantined' then/);
-  assert.equal((now.match(/-- 🆕 0078 ここから/g) || []).length, 1);
+  assert.equal((now.match(/-- 🆕 0079 ここから/g) || []).length, 1);
   // かたまりは one_way の確かめの後・not_ready の前 (地図の外へは進めない・distributable / available は今までどおり)
-  assert.ok(now.indexOf('-- 🆕 0078 ここから') > now.indexOf("'one_way:") && now.indexOf('-- 🆕 0078 ここから') < now.indexOf("'not_ready:"));
+  assert.ok(now.indexOf('-- 🆕 0079 ここから') > now.indexOf("'one_way:") && now.indexOf('-- 🆕 0079 ここから') < now.indexOf("'not_ready:"));
 });
 await ta('[M2] 約束の操作の CHECK = 0072 の全部 + quarantine_confirm (どちらの表も)・0073〜前の番号は CHECK を変えていない', async () => {
   const ops = (text, tbl) => {
@@ -109,7 +109,7 @@ await ta('[M3] 確かめ待ちの view = 0067 の版 (前の最新) の品目の
   assert.match(now, /select null::bigint, null::bigint, s\.sku_id, s\.code_norm, s\.sku_kind, 'quarantined'::text/);
 });
 
-// ═══════════ DB の用意 (0078 まで・夜間ロード・切替・要確認を夜間ロードで作る) ═══════════
+// ═══════════ DB の用意 (0079 まで・夜間ロード・切替・要確認を夜間ロードで作る) ═══════════
 const pg = new PGlite();
 await pg.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
 await pg.query(`alter database ${(await pg.query('select current_database() as d')).rows[0].d} owner to deploy`);
@@ -843,7 +843,7 @@ await ta('[R1] master_edit = 確認・確かめ・一覧 / watcher = 確かめ�
   assert.equal((await one(`select has_function_privilege('watcher', 'ops.quarantine_confirm_check(bigint)', 'execute') as ok`)).ok, true);
   assert.equal((await one(`select has_function_privilege('master_edit', 'ops.confirm_quarantined_sku(uuid, text, text, jsonb, bigint, text)', 'execute') as ok`)).ok, true);
 });
-await ta('[R2] 0078 の security definer の関数 = search_path は pg_catalog, pg_temp・public の実行権なし・一時の表を作らない', async () => {
+await ta('[R2] 0079 の security definer の関数 = search_path は pg_catalog, pg_temp・public の実行権なし・一時の表を作らない', async () => {
   const rows = await q(`select p.proname, p.prosecdef, p.proconfig, has_function_privilege('public', p.oid, 'execute') as pub, p.prosrc ~* 'create\\s+(local\\s+)?temp' as tmp
     from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'ops' and p.proname in ('quarantine_confirm_check', 'quarantine_confirm_list', 'confirm_quarantined_sku', 'quarantine_confirm_item', 'transition_sku_registration', 'record_master_decision_approval_print')`);
   assert.equal(rows.length, 6);
@@ -854,7 +854,7 @@ await ta('[R2] 0078 の security definer の関数 = search_path は pg_catalog,
   }
 });
 
-await ta('[R3] 0078 の前からある承認には承認の時の組を入れない = 効かない (決め直しが要る・#1715 Codex R4 High)・0078 の後の承認は組が残る', async () => {
+await ta('[R3] 0079 の前からある承認には承認の時の組を入れない = 効かない (決め直しが要る・#1715 Codex R4 High)・0079 の後の承認は組が残る', async () => {
   const pg2 = new PGlite();
   const db2 = pgliteAdapter(pg2);
   const before = migFiles.filter((f) => f.slice(0, 4) < THIS_V).pop().slice(0, 4);
@@ -874,7 +874,7 @@ await ta('[R3] 0078 の前からある承認には承認の時の組を入れな
 
 // ═══════════ [H] 重い入口の棚卸し ═══════════
 console.log('[H] 重い入口');
-await ta('[H1] 全部の migration を流した DB で heavyEntryFindings が空・0078 の関数は manifest に分けてある (since = 作った migration の番号)', async () => {
+await ta('[H1] 全部の migration を流した DB で heavyEntryFindings が空・0079 の関数は manifest に分けてある (since = 作った migration の番号)', async () => {
   assert.deepEqual(await heavyEntryFindings(db), []);
   for (const f of ['ops.quarantine_confirm_check(bigint)', 'ops.quarantine_confirm_list(text[])', 'ops.confirm_quarantined_sku(uuid, text, text, jsonb, bigint, text)', 'ops.quarantine_confirm_item(text, boolean, jsonb, jsonb, text, text)']) {
     const e = HEAVY_ENTRY_MANIFEST.find((x) => x.sig === f);

@@ -726,7 +726,7 @@ await ta('[N3] まとまりの版のファイルを配る → 翌朝の照合で
 console.log('\nquarantined の代表の採用');
 
 let RUN2 = null;
-await ta('[A1] NE で直接作られた商品 (quarantined・親なし) が照合の確かめ待ちに入る (🆕 0078 から持ち主を問わず・採用の後も)・観測と封の後に採用: 今ある札 / 札を作る (ne_adopt) / 子の無い単品・1 回だけ', async () => {
+await ta('[A1] NE で直接作られた商品 (quarantined・親なし) が照合の確かめ待ちに入る (🆕 0079 から持ち主を問わず・採用の後も)・観測と封の後に採用: 今ある札 / 札を作る (ne_adopt) / 子の無い単品・1 回だけ', async () => {
   // 夜間ロードが NE で見つけた商品 (切替の後 = quarantined・products.parent が company = 親を付けない)
   const extra = [sku('q001', '袋 赤【赤】', { representativeCode: 'grp1', representativeState: 'value' }), sku('q002', '新しい代表の子【白】', { representativeCode: 'NewRep', representativeState: 'value' }),
     sku('q003', '単品が代表の子', { representativeCode: 's005', representativeState: 'value' }), sku('q004', '代表なし')];
@@ -737,7 +737,7 @@ await ta('[A1] NE で直接作られた商品 (quarantined・親なし) が照�
   const tg = async () => (await q(`select code_norm, state from ops.v_ne_reg_targets where state = 'quarantined' order by code_norm`)).map((r) => r.code_norm);
   assert.deepEqual(await tg(), ['q001', 'q002', 'q003', 'q004']);
   await W2.setActiveMapOnly(pg, { ...ALL_COMPANY, 'products.parent': 'load' });
-  // 🆕 0078: 要確認は全部 (products.parent の持ち主・採用の有無を問わず) 確かめ待ちに入る (確認済みにする根拠) = load でも 4 つ
+  // 🆕 0079: 要確認は全部 (products.parent の持ち主・採用の有無を問わず) 確かめ待ちに入る (確認済みにする根拠) = load でも 4 つ
   try { assert.deepEqual(await tg(), ['q001', 'q002', 'q003', 'q004']); } finally { await W2.setActiveMapOnly(pg, ALL_COMPANY); }
   // 照合 ②: 回 → NE の元のコード (代表 grp1 / NewRep・商品 s005) → 確かめ待ちの写し → 観測 → 封
   RUN2 = 'mc_20300111T000000000Z_bbbbbb';
@@ -777,7 +777,7 @@ await ta('[A1] NE で直接作られた商品 (quarantined・親なし) が照�
   assert.equal((await outboxOf(a3.group_product_id)).pop().payload.group.kind, 'single');
   await failsWith(adopt('q004'), /^ne_no_parent/);
   await failsWith(adopt('s001'), /^not_quarantined/);
-  // 採用した商品も要確認のまま = 🆕 0078 から確かめ待ちに残る (確認済みにする根拠の観測。0067 では外れた)
+  // 採用した商品も要確認のまま = 🆕 0079 から確かめ待ちに残る (確認済みにする根拠の観測。0067 では外れた)
   assert.deepEqual(await tg(), ['q001', 'q002', 'q003', 'q004']);
   // 夜間ロード (products.parent = company) は NE に無いポータルの札・子・親に触らない
   assert.deepEqual(await one('select display_code, name from core.products where product_id = $1', [HAKAMA]), { display_code: 'Hakama', name: '新しい袴' });

@@ -1,5 +1,5 @@
 /**
- * test-master-quarantine-confirm-pg.mjs — 0078 (要確認の商品を確認済みにする) を実 PostgreSQL の独立した接続と本物のログインのロールで確かめる
+ * test-master-quarantine-confirm-pg.mjs — 0079 (要確認の商品を確認済みにする) を実 PostgreSQL の独立した接続と本物のログインのロールで確かめる
  *
  * 固定する契約:
  *   [R]  本物のログイン: master_edit (画面) = 確かめ・確認できる / master_ops が確認の関数を呼ぶ = 42501・ops.transition_sku_registration を直に呼んでも
@@ -30,7 +30,7 @@ import * as OG from '../lib/master-owner-gate.mjs';
 OG.__setCapableForTest(OWNED_COLUMNS);   // 試験の DB は全部の列を company にする = このコードの能力も全部 (test-master-gone.mjs と同じ)
 
 const url = process.env.TEST_PG_URL || '';
-if (!url) { console.log('⏭️ TEST_PG_URL が無い (0078 の実 PostgreSQL の試験は飛ばす)'); process.exit(0); }
+if (!url) { console.log('⏭️ TEST_PG_URL が無い (0079 の実 PostgreSQL の試験は飛ばす)'); process.exit(0); }
 const u0 = new URL(url);
 if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(u0.hostname)) { console.error('localhost 以外の PostgreSQL には流さない'); process.exit(2); }
 
