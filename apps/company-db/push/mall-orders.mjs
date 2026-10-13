@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後) / Qoo10 (D5b-4。--mall qoo10。API の行だけ = 2026-02-19 以降) / Yahoo (D5b-5。--mall yahoo。2026-09-26 に D-32 を a = 入れる に。年 5 万注文前後)
+ * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後) / Qoo10 (D5b-4。--mall qoo10。API の行だけ = 2026-02-19 以降) / Yahoo (D5b-5。--mall yahoo。2026-09-26 に D-32 を a = 入れる に。年 5 万注文前後) /
+ *   メルカリ shops (--mall mercari。2026-10-13。元は NE の受注伝票 (店舗 8) = モールの API ではない。数量だけ・金額は null・売上日次は作らない。年 6 千注文前後)
  *
  * 流れは伝票 (ne-shipments.mjs) と同じ共通部 (pipeline.mjs): 台帳 (種類 'order:<mall>') の指紋で差分を決め、outbox から chunk で送り、失敗・stale は次回また送る。
  * 送った後、注文が入ったので伝票との結び直し (POST /shipments/relink = core.relink_shipments_bulk) を回す。
@@ -21,15 +22,17 @@
  * 🚨 秘密は表示しない。🚨 daily-sync の runScript は引数が無いと '7' を足すので、必ず --mall などの引数を付けて呼ぶ。warehouse.db は読むだけ
  */
 import 'dotenv/config';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { openLedger } from './ledger.mjs';
-import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
+import { runPush, summarizePush, splitWindows, isDate, jstDate, fetchAllKeys, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL,
   buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, isLinegiftJst,
   buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey,
-  buildYahooOrder, YAHOO_TRANSFORM_VERSION, YAHOO_COLUMNS, isYahooJst, isYahooOrderNo } from './mall-orders-transform.mjs';
+  buildYahooOrder, YAHOO_TRANSFORM_VERSION, YAHOO_COLUMNS, isYahooJst, isYahooOrderNo,
+  buildMercariOrder, groupMercariOrders, MERCARI_TRANSFORM_VERSION, MERCARI_BASE_COLUMNS, MERCARI_LINE_COLUMNS, MERCARI_NE_SHOP } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
 import { writeEvidence } from './evidence.mjs';
 
@@ -251,7 +254,120 @@ export const MALL_SPECS = {
       select d as order_date, count(*) as orders, sum(n_lines) as lines, sum(amt) as items_amount_jpy, sum(c) as cancelled
         from o where d >= ? and d <= ? group by d`,
   },
+  /**
+   * メルカリ shops (2026-10-13)。元 = **NE の受注伝票** (raw_ne_order_base + raw_ne_orders の NE 店舗 8)。メルカリの API の取込 (raw_mercari_orders) は動いていない (0 行) ので使わない。
+   * 注文 = 明細の受注番号 (= メルカリの注文番号) でまとめる (同梱で 1 注文の明細が別の注文の伝票に載る。整形の注釈)。1 回で店舗 8 の伝票と明細を全部読む (1 万件強・約 1.5 秒) → 注文ごとにまとめて返す。
+   * 🚨 金額は送らない (NE の受注金額は信頼できない・本当の金額は月次の CSV) → **売上日次 (mart.sales_daily) は作らない** (salesDaily: false)
+   */
+  mercari: {
+    label: 'メルカリ shops の注文', scope: 'main', transformVersion: MERCARI_TRANSFORM_VERSION,
+    salesDaily: false, salesDailyOffReason: 'メルカリ shops は NE の受注伝票から数量だけを入れている (金額は null) = 売上が出せない',
+    iterate: function* (warehouse) {
+      const bases = warehouse.prepare(`select ${MERCARI_BASE_COLUMNS.join(', ')} from raw_ne_order_base where 店舗コード = '${MERCARI_NE_SHOP}' order by 伝票番号`).all();
+      const lines = warehouse.prepare(`select ${MERCARI_LINE_COLUMNS.map((c) => `o.${c}`).join(', ')} from raw_ne_orders o join raw_ne_order_base b on b.伝票番号 = o.伝票番号
+         where b.店舗コード = '${MERCARI_NE_SHOP}' order by o.伝票番号, o.明細行番号`).all();
+      yield* groupMercariOrders(bases, lines);
+    },
+    dateOf: (group) => group.order_date.slice(0, 10),
+    /** floor 以降に出荷確定した店舗 8 の伝票に載っている注文 (D-28 = 年またぎの古い注文も入れる。実測 2024-09〜12 の受注で 2025 年に出荷した 19 注文)。注文日が floor 以降のものは範囲に入るので、注文日では絞らない */
+    referencedByShipments: (warehouse, floor) => new Set(warehouse.prepare(`select b.受注番号 as no from raw_ne_order_base b where b.店舗コード = '${MERCARI_NE_SHOP}' and b.出荷確定日 >= ?
+         union select case when o.受注番号 is null or o.受注番号 = '' then b.受注番号 else o.受注番号 end from raw_ne_order_base b join raw_ne_orders o on o.伝票番号 = b.伝票番号
+         where b.店舗コード = '${MERCARI_NE_SHOP}' and b.出荷確定日 >= ?`).all(`${floor} 00:00:00`, `${floor} 00:00:00`).map((x) => String(x.no))),
+    build: (group, ctx, stats) => buildMercariOrder(group, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString(), stats }),
+    /**
+     * 突合の材料 (miniPC 側): 注文日 (JST) ごとの 注文数 / 明細数 / 商品代 (いつも 0 = null を 0 として足す Render の式と同じ) / 取消の注文数。
+     * 注文のまとめ方 (同梱・分割) が SQL で書くと長くなるので、送り手と同じ まとめ方 + 整形 で数える (dailySql の代わり)。
+     * **送り手と同じ範囲** (注文日が floor 以降 か floor 以降に出荷確定した伝票に載っている) だけを数える = 2024 年の受注で 2025 年に出荷した注文も突合に入る (#1705 Codex R1 Medium 3)。
+     * 整形できない注文は数に入らない → errors に数える (突合は ❌)。🚨 送り手と同じ実装 = 送り手の抜けは見つけない → 独立の確かめは backfillGuard (SQL だけ) と --check-csv
+     */
+    dailyLocal: (warehouse, from, to, floor = DEFAULT_FLOOR) => {
+      const rows = new Map();
+      let errors = 0;
+      for (const x of mercariScoped(warehouse, floor)) {
+        if (x.error) { if (x.invalidDate || (x.order_date >= from && x.order_date <= to)) errors++; continue; }
+        const d = x.built.payload.header.ordered_at.slice(0, 10);
+        if (d < from || d > to) continue;
+        const r = rows.get(d) || { order_date: d, orders: 0, lines: 0, items_amount_jpy: 0, cancelled: 0 };
+        r.orders++; r.lines += x.built.payload.lines.length; if (x.built.payload.header.is_cancelled) r.cancelled++;
+        rows.set(d, r);
+      }
+      return { rows: [...rows.values()].sort((a, b) => (a.order_date < b.order_date ? -1 : 1)), errors };
+    },
+    /** --reconcile --all の始まり = 送り手の範囲に入る注文の一番早い注文日 (2024 年の受注で 2025 年に出荷した注文を含む。#1705 Codex R1 Medium 3)。無ければ floor */
+    reconcileAllFrom: (warehouse, floor = DEFAULT_FLOOR) => {
+      let min = floor;
+      for (const x of mercariScoped(warehouse, floor)) if (x.built) { const d = x.built.payload.header.ordered_at.slice(0, 10); if (d < min) min = d; }
+      return min;
+    },
+    /**
+     * 🚨 独立の確かめ (#1705 Codex R1 Medium 2。送り手の iterate / buildMercariOrder を通さない SQL だけ): 店舗 8 の明細 (raw_ne_orders) のうち、
+     * **受注ベース (raw_ne_order_base) が無いのに出荷確定している明細** (注文日か出荷確定日が floor 以降)。送り手は受注ベースのある明細しか読まない = これが 0 でないと、出荷した注文が Company DB に入らない。
+     * 2026-10-13 の実測 = 77 明細 / 70 伝票 (出荷確定日 2025-08-01〜04 = 受注ベースの取り直しの隙間。全店舗で同じ)。0 でなければ --mark-backfilled を拒む (--force でも)。
+     * 直し方 = node apps/warehouse/backfill-ne-order-base.js --from <月の初め> --to <月の終わり> (出荷確定日で NE の受注ベースを取り直す。README「メルカリ shops の注文」)
+     */
+    backfillGuard: (warehouse, floor = DEFAULT_FLOOR) => {
+      const rows = warehouse.prepare(`select substr(o.出荷確定日, 1, 7) as month, count(*) as lines, count(distinct o.伝票番号) as slips, min(o.出荷確定日) as first, max(o.出荷確定日) as last
+          from raw_ne_orders o
+         where o.店舗コード = '${MERCARI_NE_SHOP}' and coalesce(o.出荷確定日, '') <> '' and (o.受注日 >= ? or o.出荷確定日 >= ?)
+           and not exists (select 1 from raw_ne_order_base b where b.伝票番号 = o.伝票番号)
+         group by 1 order by 1`).all(floor, floor);
+      const lines = rows.reduce((s, r) => s + r.lines, 0);
+      return { ok: lines === 0, lines, slips: rows.reduce((s, r) => s + r.slips, 0), months: rows };
+    },
+  },
 };
+
+/**
+ * メルカリ: 送り手と同じ範囲 (注文日が floor 以降 か floor 以降に出荷確定した伝票に載っている = referencedByShipments) の注文を整形して返す (読み取り取引の中で)。
+ * 戻り値の要素 = { no, order_date ('YYYY-MM-DD' か ''), invalidDate, built } か { ..., error }。突合 (dailyLocal) と --reconcile --all の始まり (reconcileAllFrom) が使う
+ */
+export function* mercariScoped(warehouse, floor = DEFAULT_FLOOR) {
+  const spec = MALL_SPECS.mercari;
+  const now = new Date().toISOString();
+  warehouse.exec('begin');
+  try {
+    const referenced = spec.referencedByShipments(warehouse, floor);
+    const groups = [...spec.iterate(warehouse)];
+    for (const g of groups) {
+      const d = g.order_date.slice(0, 10);
+      if (!g.invalidDate && d < floor && !referenced.has(g.no)) continue;
+      let built = null, error = null;
+      try { built = buildMercariOrder(g, { fallbackSourceUpdatedAt: now }); } catch (e) { error = e.message; }
+      yield { no: g.no, order_date: d, invalidDate: !!g.invalidDate, built, error };
+    }
+  } finally { try { warehouse.exec('rollback'); } catch { /* 読むだけの取引 */ } }
+}
+
+/** CSV の 1 行を列に分ける (引用符の中のカンマを区切らない。apps/mercari-accounting の parseShiftJisCsv と同じ規則) */
+export function splitCsvLine(line) {
+  const out = []; let cur = '', q = false;
+  for (const ch of line) { if (ch === '"') q = !q; else if (ch === ',' && !q) { out.push(cur.trim()); cur = ''; } else cur += ch; }
+  out.push(cur.trim());
+  return out;
+}
+/**
+ * メルカリの月次 CSV (売上レポート = 先頭列「注文番号」/ 注文 CSV = 先頭列「order_id」。Shift_JIS か BOM つき UTF-8) の注文番号の集合 (#1705 Codex R1 Low = 独立の照合)。
+ * @param {Buffer} buf
+ */
+export function mercariCsvOrderNos(buf, decodeSjis) {
+  const text = buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF ? buf.toString('utf8').slice(1) : decodeSjis(buf);
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  if (!lines.length) throw new Error('CSV が空');
+  const header = splitCsvLine(lines[0]);
+  const col = header.findIndex((h) => h === '注文番号' || h === 'order_id');
+  if (col < 0) throw new Error(`CSV に「注文番号」も「order_id」の列も無い (先頭の列: ${header.slice(0, 3).join(', ')})`);
+  const nos = new Set();
+  for (const l of lines.slice(1)) { const v = splitCsvLine(l)[col]; if (v) nos.add(v); }
+  return nos;
+}
+/** CSV の注文番号のうち Company DB (Render の core.orders の mercari / main) に無いもの。読むだけ */
+export async function checkMercariCsv({ csvNos, fetchImpl = fetch, base, syncKey, log = console.log }) {
+  const keys = new Set(await fetchAllKeys(fetchImpl, { base, syncKey, path: '/orders/keys?mall=mercari&scope=main', keysOf: (j) => (j && Array.isArray(j.keys) ? j.keys : null) }));
+  const missing = [...csvNos].filter((n) => !keys.has(n)).sort();
+  log(`[company-db check-csv メルカリ] CSV の注文番号 ${csvNos.size} 件のうち Company DB にある ${csvNos.size - missing.length} / 無い ${missing.length} (Company DB のメルカリの注文 ${keys.size} 件)`);
+  for (const n of missing.slice(0, 30)) log(`  Company DB に無い: ${n}`);
+  return { ok: missing.length === 0, csv: csvNos.size, missing, remote: keys.size };
+}
 
 /** 素の MALL_SPECS[x] は 'toString' のような継承プロパティも拾う → 自前の鍵だけ (Codex D5b-2 R2 #2) */
 export const specOf = (mall) => (typeof mall === 'string' && Object.hasOwn(MALL_SPECS, mall) ? MALL_SPECS[mall] : null);
@@ -276,25 +392,28 @@ export async function reconcileOrdersDaily({ mall, warehouse, fetchImpl = fetch,
   const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
   if (!base) throw new Error('送り先が決まらない (RENDER_MIRROR_URL / RENDER_PORTAL_URL)');
   if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
-  const total = { ok: true, windows: [], matched: 0, mismatched: [], onlyLocal: [], onlyRemote: [], localOrders: 0, remoteOrders: 0 };
+  const total = { ok: true, windows: [], matched: 0, mismatched: [], onlyLocal: [], onlyRemote: [], localOrders: 0, remoteOrders: 0, localErrors: 0 };
   for (const [a, b] of splitWindows(from, to)) {
-    const local = warehouse.prepare(spec.dailySql).all(a, b);
+    // dailyLocal (メルカリ) = 送り手と同じまとめ方で数える。整形できない注文 (errors) があれば、数が合っても ❌ (その注文は Render にも無い)
+    const lres = spec.dailyLocal ? spec.dailyLocal(warehouse, a, b) : { rows: warehouse.prepare(spec.dailySql).all(a, b), errors: 0 };
+    const local = lres.rows;
+    if (lres.errors) log(`[company-db reconcile ${spec.label}] ${a}〜${b}: ❌ miniPC 側で整形できない注文が ${lres.errors} 件 (数に入っていない。--incremental --dry-run で中身を見る)`);
     const res = await fetchImpl(`${base}/orders/daily?mall=${mall}&scope=${spec.scope}&from=${a}&to=${b}`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
     if (!res.ok) throw new Error(`Render の日次が取れない (${a}〜${b}): HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     const remote = (await res.json()).rows;
     if (!Array.isArray(remote)) throw new Error('Render の応答に rows が無い');
     const d = diffDailyOrders(local, remote);
     const lo = local.reduce((s, x) => s + Number(x.orders), 0), ro = remote.reduce((s, x) => s + Number(x.orders), 0);
-    const ok = d.mismatched.length === 0 && d.onlyLocal.length === 0 && d.onlyRemote.length === 0;
+    const ok = d.mismatched.length === 0 && d.onlyLocal.length === 0 && d.onlyRemote.length === 0 && !lres.errors;
     log(`[company-db reconcile ${spec.label}] ${a}〜${b}: 日 miniPC ${local.length} / Render ${remote.length}、注文 miniPC ${lo} / Render ${ro}、一致 ${d.matched} / 不一致 ${d.mismatched.length} / miniPC だけ ${d.onlyLocal.length} / Render だけ ${d.onlyRemote.length} ${ok ? '✅' : '❌'}`);
     for (const m of d.mismatched.slice(0, 30)) log(`  不一致 ${m.key}: ${m.diffs.join(', ')}`);
     for (const x of d.onlyLocal.slice(0, 10)) log(`  miniPC だけ ${x.order_date}: 注文 ${x.orders}`);
     for (const x of d.onlyRemote.slice(0, 10)) log(`  Render だけ ${x.order_date}: 注文 ${x.orders}`);
     total.windows.push({ from: a, to: b, ok, ...d, localOrders: lo, remoteOrders: ro });
     total.ok = total.ok && ok; total.matched += d.matched; total.mismatched.push(...d.mismatched); total.onlyLocal.push(...d.onlyLocal); total.onlyRemote.push(...d.onlyRemote);
-    total.localOrders += lo; total.remoteOrders += ro;
+    total.localOrders += lo; total.remoteOrders += ro; total.localErrors += lres.errors || 0;
   }
-  log(`${total.ok ? '✅' : '❌'} 突合 ${spec.label} ${from}〜${to}: ${total.ok ? '全部一致' : `差 ${total.mismatched.length + total.onlyLocal.length + total.onlyRemote.length} 日`} (注文 miniPC ${total.localOrders} / Render ${total.remoteOrders}、${total.windows.length} 窓)`);
+  log(`${total.ok ? '✅' : '❌'} 突合 ${spec.label} ${from}〜${to}: ${total.ok ? '全部一致' : `差 ${total.mismatched.length + total.onlyLocal.length + total.onlyRemote.length} 日${total.localErrors ? `・整形できない注文 ${total.localErrors} 件` : ''}`} (注文 miniPC ${total.localOrders} / Render ${total.remoteOrders}、${total.windows.length} 窓)`);
   return total;
 }
 
@@ -432,7 +551,7 @@ export const DEFAULT_SALES_LIMIT = 31;                     // 1 回の呼び出�
 export const DEFAULT_SALES_BUDGET_MS = 10 * 60 * 1000;     // env CDB_SALES_BUDGET_MS
 export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey, limit = DEFAULT_SALES_LIMIT, reset = false, maxCalls = 100, budgetMs = DEFAULT_SALES_BUDGET_MS, now = () => Date.now(), log = console.log }) {
   const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
-  if (spec.salesDaily === false) throw new Error(`${mall} の売上日次は止めている (salesDaily = false。モール負担を取込が取っていない = 払った額が出せない)`);
+  if (spec.salesDaily === false) throw new Error(`${mall} の売上日次は止めている (salesDaily = false。${spec.salesDailyOffReason || 'モール負担を取込が取っていない = 払った額が出せない'})`);
   if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
   const started = now();
   let calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null, catchUp = false, staleAtStart = false;
@@ -478,8 +597,27 @@ export function resumeCommand({ next, limit }) {
   return `node apps/company-db/push/mall-orders.mjs --relink --relink-after ${next} --relink-limit ${limit}`;
 }
 
+/** 独立の確かめ (backfillGuard) の 1 行 */
+export const guardNote = (g) => (g.ok ? '受注ベースの無い出荷済みの明細 0 (独立の確かめ ✅)'
+  : `🚨 受注ベースの無い出荷済みの明細 ${g.lines} 行 / ${g.slips} 伝票 (${g.months.map((m) => `${m.month}: ${m.lines} 行 (出荷確定日 ${String(m.first).slice(0, 10)}〜${String(m.last).slice(0, 10)})`).join(' / ')}) = この注文は Company DB に入らない → node apps/warehouse/backfill-ne-order-base.js --from <出荷確定日の初め> --to <終わり> で受注ベースを取り直す`);
+/**
+ * バックフィルの完了印 (人が --reconcile --all の一致を見てから付ける)。
+ * 🚨 spec.backfillGuard (メルカリ = 受注ベースの無い出荷済みの明細) が 0 でなければ拒む (--force でも。#1705 Codex R1 Medium 2: 送り手と同じ実装の突合は、送り手が読まない明細の抜けを見つけない)
+ */
+export function markBackfilled({ mall, warehouse, ledger, force = false, log = console.log }) {
+  const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
+  // 早すぎる印は検出できない (人が突合を見てから付ける約束) が、1 件も送っていない台帳に付けるのは明らかな誤り
+  if (ledger.countConfirmed() === 0 && !force) throw new Error(`台帳 (${mall}) に送付確認済みが 1 件も無い = バックフィルをまだ流していない。流して --reconcile --all が一致してから付ける (それでも付けるなら --force)`);
+  if (spec.backfillGuard) {
+    const g = spec.backfillGuard(warehouse, DEFAULT_FLOOR);
+    if (!g.ok) throw new Error(`完了印を付けない (--force でも): ${guardNote(g)}。取り直した後に、送り直し (--incremental --no-relink) → --reconcile --all → もう一度 --mark-backfilled`);
+    log(`  ${guardNote(g)}`);
+  }
+  ledger.putMeta(BACKFILL_DONE_KEY, '1'); log(`台帳 (${mall}) にバックフィルの完了印を付けた (送付確認済み ${ledger.countConfirmed()} 件)。以後 daily-sync の --require-backfilled が送る`);
+}
+
 export function parseArgs(argv) {
-  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, requireBackfilled: false, markBackfilled: false, refreshSales: false, checkSales: false, noSales: false, from: null, to: null, days: null, dataDir: null, chunk: null, relinkLimit: null, relinkAfter: null };
+  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, requireBackfilled: false, markBackfilled: false, refreshSales: false, checkSales: false, noSales: false, from: null, to: null, days: null, dataDir: null, chunk: null, relinkLimit: null, relinkAfter: null, checkCsv: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     // 値を取るオプションに値が無い (末尾・次が別のオプション) のは入力の誤り = 既定値に黙って戻さない (--relink-after だけ書くと先頭に戻る。Codex #1347 R2 #2)
@@ -505,6 +643,7 @@ export function parseArgs(argv) {
     else if (a === '--days') out.days = val();
     else if (a === '--data-dir') out.dataDir = val();
     else if (a === '--chunk') out.chunk = val();
+    else if (a === '--check-csv') out.checkCsv = val();   // メルカリの月次 CSV のファイル (注文番号が Company DB に全部あるか。読むだけ)
     else throw new Error(`知らない引数: ${a}`);
   }
   if (out.incremental && (out.from || out.to)) throw new Error('--incremental と --from/--to は一緒に指定しない (範囲を流すなら --from/--to だけ。証跡の mode を取り違えない)');
@@ -534,7 +673,7 @@ async function main() {
     if (a.incremental || a.relink || a.reconcile || a.resetLedger || a.markBackfilled || a.dryRun) throw new Error('--refresh-sales / --check-sales はほかの操作と一緒に指定しない');
     // 売上日次だけ (Render を叩くだけ = DATA_DIR 不要)
     if (!a.mall || !specOf(a.mall)) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
-    if (a.refreshSales && specOf(a.mall).salesDaily === false) throw new Error(`${a.mall} の売上日次は止めている (モール負担の値引を取込が取っていない = 払った額が出せない。README「Yahoo の注文」)`);
+    if (a.refreshSales && specOf(a.mall).salesDaily === false) throw new Error(`${a.mall} の売上日次は止めている (${specOf(a.mall).salesDailyOffReason || 'モール負担の値引を取込が取っていない = 払った額が出せない'}。db/company/README.md)`);
     if (a.refreshSales) {
       // 手で流す作り直しも Company DB 側のモール負担を確かめる (warehouse.db は開かない = raw は見ない。送信が通った後に流す)
       const blocker = await salesDailyBlocker({ mall: a.mall, base, syncKey });
@@ -557,6 +696,17 @@ async function main() {
     process.exitCode = j.diffs.length ? 1 : 0;
     return;
   }
+  if (a.checkCsv) {
+    // メルカリの月次 CSV の注文番号が Company DB に全部あるか (読むだけ・Render を叩くだけ = DATA_DIR 不要。#1705 Codex R1 Low = 送り手と別の照合)
+    if (a.mall !== 'mercari') throw new Error('--check-csv は --mall mercari だけ');
+    if (a.incremental || a.relink || a.reconcile || a.resetLedger || a.markBackfilled || a.dryRun || a.from) throw new Error('--check-csv はほかの操作と一緒に指定しない');
+    const { default: iconv } = await import('iconv-lite');
+    const nos = mercariCsvOrderNos(fs.readFileSync(a.checkCsv), (b) => iconv.decode(b, 'Shift_JIS'));
+    const c = await checkMercariCsv({ csvNos: nos, base, syncKey });
+    console.log(c.ok ? `✅ CSV の注文番号 ${c.csv} 件が全部 Company DB にある` : `❌ CSV の注文番号 ${c.missing.length} 件が Company DB に無い (受注ベースの抜け・範囲の外 (2025 年より前の注文) を確かめる)`);
+    process.exitCode = c.ok ? 0 : 1;
+    return;
+  }
   // ここから先は warehouse.db と台帳を開く (単独 --relink は Render を叩くだけなので DATA_DIR 不要 = 再開コマンドにパスを載せなくてよい。Codex #1347 R3 #1)
   const dataDir = (process.env.DATA_DIR || a.dataDir || '').trim();
   if (!dataDir) throw new Error('DATA_DIR が無い (--data-dir でも可)');
@@ -568,16 +718,12 @@ async function main() {
   const warehouse = new Database(path.join(dataDir, 'warehouse.db'), { timeout: Number(process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS) || 60000 });   // 読むだけ
   const ledger = openLedger(dataDir, { kind: `order:${a.mall}` });
   try {
-    if (a.markBackfilled) {
-      // 早すぎる印は検出できない (人が突合を見てから付ける約束) が、1 件も送っていない台帳に付けるのは明らかな誤り
-      if (ledger.countConfirmed() === 0 && !a.force) throw new Error(`台帳 (${a.mall}) に送付確認済みが 1 件も無い = バックフィルをまだ流していない。流して --reconcile --all が一致してから付ける (それでも付けるなら --force)`);
-      ledger.putMeta(BACKFILL_DONE_KEY, '1'); console.log(`台帳 (${a.mall}) にバックフィルの完了印を付けた (送付確認済み ${ledger.countConfirmed()} 件)。以後 daily-sync の --require-backfilled が送る`);
-      return;
-    }
+    if (a.markBackfilled) { markBackfilled({ mall: a.mall, warehouse, ledger, force: a.force }); return; }
     if (a.resetLedger) { const n = ledger.resetFingerprints(); console.log(`台帳 (${a.mall}) の指紋を空にした: ${n} 件 (鍵は残す)。次の --incremental で全部送り直す ('same' が返るだけ)`); return; }
     if (a.reconcile) {
       let from = a.from, to = a.to;
-      if (a.all) { from = DEFAULT_FLOOR; to = jstDate(0); }
+      // --all = floor から今日まで。メルカリは送り手の範囲の一番早い注文日から (2024 年の受注で 2025 年に出荷した注文も突合する。#1705 Codex R1 Medium 3)
+      if (a.all) { const sp = specOf(a.mall); from = sp.reconcileAllFrom ? sp.reconcileAllFrom(warehouse, DEFAULT_FLOOR) : DEFAULT_FLOOR; to = jstDate(0); }
       else if (!from) { const days = a.days != null ? Number(a.days) : 90; if (!Number.isInteger(days) || days < 1 || days > 730) throw new Error('--days は 1〜730'); from = jstDate(-(days - 1)); to = jstDate(0); }
       const rr = await reconcileOrdersDaily({ mall: a.mall, warehouse, base, syncKey, from, to });
       process.exitCode = rr.ok ? 0 : 1;
@@ -596,6 +742,8 @@ async function main() {
     if (r.stats && (r.stats.sentinel || r.stats.negative)) console.log(`  金額を null にした: 番兵 (-9999) ${r.stats.sentinel} 個 / 負 ${r.stats.negative} 個`);
     if (a.mall === 'qoo10' && r.stats) console.log(`  Qoo10: 旧データの行 (legacy_migration。鍵がカート番号) で送らなかった ${r.stats.skippedLegacy} 行 / 単価 0 を「分からない」にした注文 ${r.stats.zeroPrice}`);
     if (a.mall === 'amazon' && r.stats && (r.stats.zeroPrice || r.stats.zeroQtyLive || r.stats.skippedNonAmazon)) console.log(`  Amazon: 金額 0 を null にした明細 ${r.stats.zeroPrice} 行 (範囲の中) / うち取消でない明細の金額が分からず合計を null にした注文 ${r.stats.partialAmountOrders} / 取消でないのに数量 0 の明細 ${r.stats.zeroQtyLive} 行 / Amazon.co.jp 以外 (マルチチャネル発送) で送らなかった注文 ${r.stats.skippedNonAmazon}`);
+    if (a.mall === 'mercari' && r.stats) console.log(`  メルカリ: 同梱 (別の注文の伝票に明細が載る) の参照 ${r.stats.mergedSlipRefs || 0} / 同梱元の取消の明細を同梱先の明細と相殺 ${r.stats.offsetLines || 0} 行 / 商品コードの無い明細 ${r.stats.noCode || 0} 行 / 明細の無い注文 ${r.stats.noLines || 0} (範囲の中・送った物に限らない)。金額は送らない (null)`);
+    if (a.mall === 'mercari' && a.dryRun) console.log(`  メルカリ: ${guardNote(MALL_SPECS.mercari.backfillGuard(warehouse, DEFAULT_FLOOR))}`);
     const rl = r.afterSend || { ran: false, pending: false, result: null, error: null };   // 結び直しは runPush の中 (lock の中) で済んでいる
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
     // 売上日次の作り直し: 注文を送れた・送る物が無かった どちらでも回す (前の回の取りこぼしを拾う)。別の送り手が走っている・dry-run・--no-sales のときは回さない
