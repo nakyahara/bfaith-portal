@@ -354,7 +354,7 @@ await ta('[N4] (Codex #1703 R2 L1) 除く知らせは 10,000 個まで (それ�
 
 await ta('[N2] 夜間ロード (apps/company-db/nightly.mjs) の既定の後ろの段に入っている (新しい定期実行は作らない)・台帳の夜間ロードの項目に段と手順', async () => {
   const N = await import('../apps/company-db/nightly.mjs');
-  assert.deepEqual(N.DEFAULT_STEPS.map((s) => s.id), ['po-settings-outbox']);
+  assert.deepEqual(N.DEFAULT_STEPS.map((s) => s.id), ['po-settings-outbox', 'po-settings-snapshot']);
   const { JOBS_REGISTRY: list, validateRegistry } = await import('../config/jobs-registry.mjs');
   const vr = validateRegistry();
   assert.ok(!vr || vr === true || (Array.isArray(vr) ? vr.length === 0 : vr.ok !== false), `台帳の確かめ: ${JSON.stringify(vr).slice(0, 300)}`);

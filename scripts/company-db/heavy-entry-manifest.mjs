@@ -103,8 +103,9 @@ export const HEAVY_VIEWS = Object.freeze([
   { view: 'ops.v_order_settings_outbox_open', cls: 'light', since: '0075', reason: '届いていない発注の設定の知らせ (0075・少数・開いている知らせの部分 index)' },
   { view: 'ops.v_sku_available', cls: 'light', reason: 'SKU の使える状態 (SKU の大きさ)' },
   { view: 'ops.v_sku_distributable', cls: 'light', reason: '配れる SKU (SKU の大きさ)' },
+  { view: 'purchasing.v_snapshot_status', cls: 'light', since: '0076', reason: '発注の設定の写しの今の世代 (0076・世代の表の 1 行)' },
 ]);
-export const VIEW_SCHEMAS = Object.freeze(['mart', 'ops']);
+export const VIEW_SCHEMAS = Object.freeze(['mart', 'ops', 'purchasing']);
 
 /** (c) アプリの側の重い処理 (DB の関数・view でない)。PR 4 で共通の lock の参加者にする候補。試験はファイルがあることだけを見る */
 export const APP_HEAVY_ENTRIES = Object.freeze([
@@ -120,7 +121,8 @@ export const RANGE_ARGS = Object.freeze({
   count: Object.freeze(['p_days', 'p_limit', 'p_keep_days']),                // smallint / integer / bigint
   dates: Object.freeze(['p_dates']),                                         // date[]
 });
-export const SCAN_SCHEMAS = Object.freeze(['core', 'mart', 'ops', 'raw', 'snapshots', 'events']);
+// 🆕 0076: purchasing (発注の設定の写し) も見る = これから関数を足したら漏れ止めにかかる (今は関数なし)
+export const SCAN_SCHEMAS = Object.freeze(['core', 'mart', 'ops', 'raw', 'snapshots', 'events', 'purchasing']);
 export const revokeSigs = () => HEAVY_ENTRY_MANIFEST.filter((e) => e.cls === 'revoke').map((e) => e.sig);
 
 /** 見つける規則にかかる関数 (pg_proc から。trigger を除く)。戻り = [{ oid, sig }] */

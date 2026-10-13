@@ -998,7 +998,9 @@ export const JOBS_REGISTRY = [
       + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)。'
       + '🆕 後ろの段 (本体のロードの後・別の接続・別の取引 = 段が失敗しても本体は戻さない・段の失敗 = この ping が fail): '
       + '① 発注の設定の知らせ (AI_reference CompanyDB構想/21 C1・migration 0075・lib/order-settings-outbox.mjs) = 新商品の登録で入れた発注の設定を発注アプリ (Render の SQLite の po_*) へ届け直す。'
-      + '24 時間を超えて届いていない知らせが 1 つでもあれば段の失敗 (新しい定期実行は作らず、この 1 本の後ろに載せた)',
+      + '24 時間を超えて届いていない知らせが 1 つでもあれば段の失敗 (新しい定期実行は作らず、この 1 本の後ろに載せた)。'
+      + '② 発注の設定の写し (CompanyDB構想/21 C2・migration 0076・apps/company-db/load/po-settings-snapshot.mjs) = 発注アプリの発注の設定を Company DB の purchasing に読むだけの写しとして入れる。'
+      + '完全に読めた回だけ入れ替える (表が無い・列が無い・大きく減った・古い読み = 入れ替えず段の失敗)',
     where: 'Render bfaith-portal 内 node-cron (apps/company-db/nightly.mjs startCompanyDbNightlyLoadCron。'
       + 'COMPANY_DB_LOAD_CRON_ENABLED=1 かつ RENDER=true のときだけ起動。miniPC も同じ server.js を動かすので、'
       + 'lib/is-render.js の isRender() で Render 以外を弾く。材料 (warehouse-mirror.db) の有無は別の検査 = 「Render なのに材料が無い」の検知)',
@@ -1025,7 +1027,10 @@ export const JOBS_REGISTRY = [
       + '🆕 note が「段の失敗: 発注の設定の知らせ: … (24時間超 N: コード)」= 新商品の発注の設定がまだ発注アプリに届いていない (本体のロードは成功 = note の「本体は成功 run=…」)。'
       + 'マスタの入力 → 左の列「発注の設定の届け待ち」(/apps/master-edit/order-settings-outbox) を開く → 理由を見て「もう一度届ける」。'
       + '「要確認」(発注アプリにほかの画面がもう設定を作っていた) は商品の画面の「発注の設定」で今の値を確かめてから「閉じる」(理由を書く)。'
-      + 'どうしても届かない = 商品の画面の「発注の設定」で入れてから「閉じる」',
+      + 'どうしても届かない = 商品の画面の「発注の設定」で入れてから「閉じる」。'
+      + '🆕 note が「段の失敗: 発注の設定の写し: 入れ替えない (前の世代のまま): …」= 写しは前の夜のまま (AI は purchasing.v_snapshot_status の read_at で古さが分かる・止めない)。'
+      + 'no_table / no_column = 発注アプリの表の移行の途中 (翌晩に直るか見る)・shrink = 発注アプリの行が半分未満に減った (発注アプリのマスタ管理で本当に消したか確かめる。'
+      + '本当に消した = Render の env に PO_SNAPSHOT_ACCEPT_SHRINK_UNTIL=<翌日の ISO 時刻> を入れる (その時刻まで・7 日まで = 自然に切れる) → 翌晩に入る)・older_read = 同時に 2 本 (翌晩に直る)',
   },
   {
     id: 'company-db-inventory-hourly',

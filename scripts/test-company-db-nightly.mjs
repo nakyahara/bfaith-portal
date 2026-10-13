@@ -237,7 +237,7 @@ await ta('見送り・待っても終わらない = 段は流さない (本体�
 
 await ta('既定の段 = 発注の設定の知らせ (Render の外では飛ばす = 何も繋がない)', async () => {
   const { DEFAULT_STEPS } = await import('../apps/company-db/nightly.mjs');
-  assert.deepEqual(DEFAULT_STEPS.map((s) => s.id), ['po-settings-outbox']);
+  assert.deepEqual(DEFAULT_STEPS.map((s) => s.id), ['po-settings-outbox', 'po-settings-snapshot']);
   const r = await withEnv({ RENDER: undefined }, () => DEFAULT_STEPS[0].run({ url: 'postgres://u:p@127.0.0.1:1/none', log: quiet }));
   assert.deepEqual([r.ok, r.skipped], [true, true]);
 });
