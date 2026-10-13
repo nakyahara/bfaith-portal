@@ -16,7 +16,8 @@ import express from 'express';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildMercariOrder, groupMercariOrders, isNeJst, isMercariOrderNo, MERCARI_TRANSFORM_VERSION, MERCARI_BASE_COLUMNS, MERCARI_LINE_COLUMNS } from '../apps/company-db/push/mall-orders-transform.mjs';
-import { pushOrders, reconcileOrdersDaily, refreshSalesDaily, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
+import { pushOrders, reconcileOrdersDaily, refreshSalesDaily, MALL_SPECS, markBackfilled, mercariCsvOrderNos, checkMercariCsv, BACKFILL_DONE_KEY } from '../apps/company-db/push/mall-orders.mjs';
+import iconv from 'iconv-lite';
 import { openLedger } from '../apps/company-db/push/ledger.mjs';
 import { fingerprintOf } from '../apps/company-db/push/pipeline.mjs';
 import { buildShipment } from '../apps/company-db/push/ne-shipments-transform.mjs';
@@ -72,7 +73,16 @@ await t('🚨 同梱 (実データの形): 同梱先の伝票に別の注文の�
   assert.deepEqual(a.payload.lines.map((l) => [l.line_key, l.qty, l.cancelled_qty]), [['1394864-1', 3, 0]], '同梱先の注文に同梱元の明細が混ざった');
   assert.deepEqual([b.payload.header.is_cancelled, b.payload.header.ordered_at, b.payload.header.status_source, b.payload.header.shipped_at_source, b.payload.header.cancelled_at],
     [false, '2026-03-30T17:30:00+09:00', '50', '2026-03-31T11:40:43+09:00', null]);
-  assert.deepEqual(b.payload.lines.map((l) => [l.line_key, l.qty, l.cancelled_qty]), [['1394860-1', 3, 3], ['1394864-2', 3, 0]]);
+  // 🚨 相殺 (#1705 Codex R1 Medium 1): 同梱元の取消の伝票の明細 (macchakuzuyu × 3) は同梱先の有効な明細と組になる → 除く = 数量 3 の商品が 1 行・qty 3・取消 0 (顧客の注文どおり)
+  assert.deepEqual(b.payload.lines.map((l) => [l.line_key, l.qty, l.cancelled_qty]), [['1394864-2', 3, 0]]);
+  const st0 = {}; buildMercariOrder(gs[0], { stats: st0 }); assert.equal(st0.offsetLines, 1);
+  // 組にならない取消の明細 (数量が違う・商品が違う・同梱先が取消) は残す (本当に取り消された分)
+  const mk = (ownLines, hostLines) => buildMercariOrder(groupsOf(bases, [{ slip: '1394864', ln: 1, no: NO_A }, ...hostLines.map((x, i) => ({ slip: '1394864', ln: i + 2, no: NO_B, ...x })), ...ownLines.map((x, i) => ({ slip: '1394860', ln: i + 1, no: NO_B, c: 'キャンセル', ...x }))]).find((g) => g.no === NO_B)).payload.lines.map((l) => [l.line_key, l.sku_code, l.qty, l.cancelled_qty]);
+  assert.deepEqual(mk([{ code: 'macchakuzuyu', qty: 2 }], [{ code: 'macchakuzuyu', qty: 3 }]), [['1394860-1', 'macchakuzuyu', 2, 2], ['1394864-2', 'macchakuzuyu', 3, 0]], '数量が違うのに相殺した');
+  assert.deepEqual(mk([{ code: 'a', qty: 1 }, { code: 'b', qty: 1 }], [{ code: 'a', qty: 1 }]), [['1394860-2', 'b', 1, 1], ['1394864-2', 'a', 1, 0]], '組の無い取消の明細を消した / 組を外した');
+  assert.deepEqual(mk([{ code: 'a', qty: 1 }, { code: 'a', qty: 1 }], [{ code: 'a', qty: 1 }]), [['1394860-2', 'a', 1, 1], ['1394864-2', 'a', 1, 0]], '多重集合 (1 対 1) でない');
+  assert.deepEqual(mk([{ code: 'a', qty: 1 }], [{ code: 'a', qty: 1, c: 'キャンセル' }]).length, 2, '同梱先の取消の明細と相殺した');
+  assert.deepEqual(mk([{ code: '', qty: 1 }], [{ code: '', qty: 1 }]).length, 2, '商品コードの無い明細を相殺した');
   // 同梱元の伝票がもう無い (実データ 63 行ぶん) → 注文日は同梱先の伝票の受注日
   const g2 = groupsOf([bases[0]], lines.slice(0, 2)).find((g) => g.no === NO_B);
   const c = buildMercariOrder(g2);
@@ -180,7 +190,6 @@ await t('送る: 店舗 8 の伝票だけ (ほかの店舗は読まない)・SKU
   const rows = (await pg.query(`select o.mall_order_no, o.source_system, o.shop_code, o.status, o.is_cancelled, o.items_amount_jpy, o.amount_source, o.order_date_jst::text as d, l.line_key, l.qty, l.cancelled_qty, l.sku_id, l.unresolved_code, l.line_amount_jpy
     from core.orders o join core.order_lines l using (order_id) where o.mall = 'mercari' and l.removed_at is null order by o.mall_order_no, l.line_key`)).rows;
   assert.deepEqual(rows.map((x) => [x.mall_order_no, x.source_system, x.shop_code, x.status, x.is_cancelled, x.items_amount_jpy, x.amount_source, x.d, x.line_key, x.qty, x.cancelled_qty, x.sku_id == null ? null : Number(x.sku_id), x.unresolved_code, x.line_amount_jpy]), [
-    [NO_B, 'ne', '8', 'shipped', false, null, 'unknown', '2026-03-30', '1394860-1', 1, 1, null, 'wakearihin', null],
     [NO_B, 'ne', '8', 'shipped', false, null, 'unknown', '2026-03-30', '1394864-2', 1, 0, null, 'wakearihin', null],
     [NO_C, 'ne', '8', 'ready', false, null, 'unknown', '2026-04-01', '1400001-1', 2, 0, Number(skuA), null, null],
     [NO_A, 'ne', '8', 'shipped', false, null, 'unknown', '2026-03-30', '1394864-1', 3, 0, Number(skuA), null, null]].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[8] < b[8] ? -1 : 1)));
@@ -202,7 +211,7 @@ await t('2 回目は変化なし (取込時刻だけ変わる) → 出荷確定�
   assert.deepEqual([r.changed, r.applied], [1, 1]);
   assert.equal((await one(`select status from core.orders where mall = 'mercari' and mall_order_no = $1`, [NO_C])).status, 'shipped');
   assert.deepEqual(MALL_SPECS.mercari.dailyLocal(W, '2026-03-30', '2026-04-02'), { rows: [
-    { order_date: '2026-03-30', orders: 2, lines: 3, items_amount_jpy: 0, cancelled: 0 }, { order_date: '2026-04-01', orders: 1, lines: 1, items_amount_jpy: 0, cancelled: 0 },
+    { order_date: '2026-03-30', orders: 2, lines: 2, items_amount_jpy: 0, cancelled: 0 }, { order_date: '2026-04-01', orders: 1, lines: 1, items_amount_jpy: 0, cancelled: 0 },
     { order_date: '2026-04-02', orders: 1, lines: 1, items_amount_jpy: 0, cancelled: 0 }], errors: 0 });
   assert.equal((await reconcileOrdersDaily({ mall: 'mercari', warehouse: W, fetchImpl: f, base: BASE_URL, syncKey: 'k', from: '2025-01-01', to: '2026-04-30', log: quiet })).ok, true);
   W.prepare(`update raw_ne_order_base set キャンセル区分 = 'キャンセル', 受注キャンセル日 = '2026-04-03 09:00:00' where 伝票番号 = '1400010'`).run();
@@ -238,6 +247,67 @@ await t('🚨 受注日・注文番号が読めない注文は、どの mode で
   }
   assert.equal(MALL_SPECS.mercari.dailyLocal(w, '2026-03-01', '2026-03-31').errors, 3, '突合が整形できない注文を数えていない');
   w.close();
+});
+await t('🚨 独立の確かめ (#1705 Codex R1 Medium 2): 受注ベースの無い出荷済みの店舗 8 の明細を SQL だけで数える (送り手を通さない)・0 でなければ --mark-backfilled を拒む (--force でも)・取り直して 0 になれば付く', async () => {
+  const w = openWarehouse();
+  addSlip(w, { slip: '1300000', no: '2JB0000000000000000001', date: '2025-07-30 10:00:00', ship: '2025-07-31 10:00:00' });
+  // 実データの形 = 出荷確定日 2025-08-01〜04 の伝票の受注ベースが無く、明細だけある
+  ins(w, 'raw_ne_orders', { ...nl({ slip: '1203697', no: '2JB0000000000000000002', date: '2025-07-31 20:00:00' }), 出荷確定日: '2025-08-01 10:07:30' });
+  ins(w, 'raw_ne_orders', { ...nl({ slip: '1203697', ln: 2, no: '2JB0000000000000000002', date: '2025-07-31 20:00:00' }), 出荷確定日: '2025-08-01 10:07:30' });
+  ins(w, 'raw_ne_orders', { ...nl({ slip: '1206534', no: '2JB0000000000000000003', date: '2025-08-02 09:00:00' }), 出荷確定日: '2025-08-04 14:13:48' });
+  // 数えないもの: 出荷していない (取消) / 2025 年より前 / ほかの店舗 / 受注ベースのある伝票
+  ins(w, 'raw_ne_orders', { ...nl({ slip: '1200001', no: '2JB0000000000000000004', date: '2025-07-01 09:00:00', c: 'キャンセル' }), 出荷確定日: '' });
+  ins(w, 'raw_ne_orders', { ...nl({ slip: '900001', no: 'oldorder00000000000001', date: '2024-05-01 09:00:00' }), 出荷確定日: '2024-05-02 10:00:00' });
+  ins(w, 'raw_ne_orders', { ...nl({ slip: '1203698', no: '411111111111', shop: '1', date: '2025-07-31 20:00:00' }), 出荷確定日: '2025-08-01 11:00:00' });
+  ins(w, 'raw_ne_orders', { ...nl({ slip: '1300000', ln: 2, no: '2JB0000000000000000001', date: '2025-07-30 10:00:00' }), 出荷確定日: '2025-07-31 10:00:00' });
+  const g = MALL_SPECS.mercari.backfillGuard(w);
+  assert.deepEqual([g.ok, g.lines, g.slips, g.months.map((m) => [m.month, m.lines, m.slips, m.first, m.last])], [false, 3, 2, [['2025-08', 3, 2, '2025-08-01 10:07:30', '2025-08-04 14:13:48']]]);
+  const l = openLedger(null, { memory: true, kind: 'order:mercari' }); l.markInitialized();
+  const msgs = [];
+  for (const force of [false, true]) {
+    let err = null; try { markBackfilled({ mall: 'mercari', warehouse: w, ledger: l, force, log: (m) => msgs.push(m) }); } catch (e) { err = e; }
+    if (force) assert.match(String(err && err.message), /完了印を付けない \(--force でも\).*受注ベースの無い出荷済みの明細 3 行 \/ 2 伝票 \(2025-08: 3 行 \(出荷確定日 2025-08-01〜2025-08-04\)\).*backfill-ne-order-base\.js/);
+    else assert.match(String(err && err.message), /送付確認済みが 1 件も無い/);
+  }
+  assert.notEqual(l.getMeta(BACKFILL_DONE_KEY), '1', '拒んだのに完了印が付いた');
+  // 受注ベースを取り直した (backfill-ne-order-base.js が入れる行) → 0 → 付く
+  ins(w, 'raw_ne_order_base', nb({ slip: '1203697', no: '2JB0000000000000000002', date: '2025-07-31 20:00:00', ship: '2025-08-01 10:07:30' }));
+  ins(w, 'raw_ne_order_base', nb({ slip: '1206534', no: '2JB0000000000000000003', date: '2025-08-02 09:00:00', ship: '2025-08-04 14:13:48' }));
+  assert.deepEqual([MALL_SPECS.mercari.backfillGuard(w).ok, MALL_SPECS.mercari.backfillGuard(w).lines], [true, 0]);
+  markBackfilled({ mall: 'mercari', warehouse: w, ledger: l, force: true, log: (m) => msgs.push(m) });
+  assert.equal(l.getMeta(BACKFILL_DONE_KEY), '1');
+  assert.ok(msgs.some((m) => /独立の確かめ ✅/.test(m)));
+  // 確かめを持たないモールは今までどおり
+  const l2 = openLedger(null, { memory: true, kind: 'order:yahoo' }); l2.markInitialized();
+  markBackfilled({ mall: 'yahoo', warehouse: w, ledger: l2, force: true, log: quiet });
+  assert.equal(l2.getMeta(BACKFILL_DONE_KEY), '1');
+  l.close(); l2.close(); w.close();
+});
+await t('突合の範囲 (#1705 Codex R1 Medium 3): --reconcile --all はメルカリでは送り手の範囲の一番早い注文日から = 2024 年の受注で 2025 年に出荷した注文も突合する。範囲の外の 2024 年の注文は数えない', async () => {
+  addSlip(W, { slip: '1036942', no: 'h73pxJj6srPkxctxYkKte0', date: '2024-12-28 08:53:49', ship: '2025-01-06 12:00:47' });   // 範囲の中 (2025 年に出荷)
+  addSlip(W, { slip: '1030000', no: 'h70000000000000000000a', date: '2024-12-20 10:00:00', ship: '2024-12-21 10:00:00' });   // 範囲の外 (送らない)
+  const allFrom = MALL_SPECS.mercari.reconcileAllFrom(W);
+  assert.equal(allFrom, '2024-12-28');
+  const rec = () => reconcileOrdersDaily({ mall: 'mercari', warehouse: W, fetchImpl: f, base: BASE_URL, syncKey: 'k', from: allFrom, to: '2026-04-30', log: quiet });
+  const before = await rec();
+  assert.equal(before.ok, false, 'まだ送っていない 2024 年の注文を突合が見ていない');
+  assert.deepEqual(before.onlyLocal.map((x) => x.order_date), ['2024-12-28']);
+  await push(W, L);
+  const after = await rec();
+  assert.deepEqual([after.ok, after.localOrders, after.remoteOrders], [true, 5, 5]);
+  assert.equal(await num(`select count(*) as n from core.orders where mall = 'mercari' and order_date_jst < '2025-01-01'`), 1, '範囲の外の 2024 年の注文を送った');
+  assert.deepEqual(MALL_SPECS.mercari.dailyLocal(W, '2024-12-01', '2024-12-31').rows.map((x) => [x.order_date, x.orders]), [['2024-12-28', 1]]);
+});
+await t('月次 CSV との照合 (--check-csv。#1705 Codex R1 Low): 売上レポート (注文番号・Shift_JIS) / 注文 CSV (order_id・BOM つき UTF-8) の注文番号のうち Company DB に無いものを出す (読むだけ)', async () => {
+  const sjis = iconv.encode(`注文番号,商品名,売上\r\n"${NO_A}","抹茶,くず湯",548\r\n${NO_C},訳あり品,698\r\n2JZZZZZZZZZZZZZZZZZZZZ,ない注文,100\r\n${NO_A},同じ注文の 2 行目,0\r\n`, 'Shift_JIS');
+  const nos = mercariCsvOrderNos(sjis, (b) => iconv.decode(b, 'Shift_JIS'));
+  assert.deepEqual([...nos].sort(), [NO_A, NO_C, '2JZZZZZZZZZZZZZZZZZZZZ'].sort());
+  const c = await checkMercariCsv({ csvNos: nos, fetchImpl: f, base: BASE_URL, syncKey: 'k', log: quiet });
+  assert.deepEqual([c.ok, c.csv, c.missing], [false, 3, ['2JZZZZZZZZZZZZZZZZZZZZ']]);
+  const utf8 = Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(`order_id,x\n${NO_A},1\n${NO_B},2\n`, 'utf8')]);
+  const c2 = await checkMercariCsv({ csvNos: mercariCsvOrderNos(utf8, () => { throw new Error('BOM つきは UTF-8 で読む'); }), fetchImpl: f, base: BASE_URL, syncKey: 'k', log: quiet });
+  assert.deepEqual([c2.ok, c2.csv], [true, 2]);
+  throws(() => mercariCsvOrderNos(Buffer.from('a,b\n1,2\n'), (b) => b.toString()), /「注文番号」も「order_id」の列も無い/);
 });
 await t('売上日次は作らない (salesDaily: false = 金額が null)・送り手は送り状番号・配送方法・商品名・小計金額を読まない', async () => {
   assert.equal(MALL_SPECS.mercari.salesDaily, false);

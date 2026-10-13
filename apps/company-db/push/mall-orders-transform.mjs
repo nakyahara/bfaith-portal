@@ -599,7 +599,8 @@ export function buildYahooOrder(rows, opts = {}) {
  *     → mall 'mercari' / scope 'main' / shop_code '8' (core.ne_shops 8。接頭辞なし = 伝票の受注番号そのままで注文に結ばれる)。月次の CSV (apps/mercari-accounting) の「注文番号」/ 注文 CSV の order_id と同じ値
  *   - 🚨 **注文は「明細の受注番号」でまとめる** (伝票の受注番号ではない): NE の同梱 = 同じ買い手の注文を 1 枚の伝票にまとめると、伝票の受注番号は 1 つだが、明細は元の注文番号を持ったまま載る
  *     (実測: 87 伝票に別の注文の明細 107 行・106 注文)。同梱元の注文の伝票は取消 (44 行ぶん) か、もう無い (63 行ぶん)。取消の伝票の明細は同梱先の明細と商品・数量が全部同じ (43 / 43 注文)
- *     → 伝票ごとに注文を作ると、同梱元の注文が「取消」になり、同梱先の注文の数量が増える。明細の受注番号でまとめれば、同梱元は 取消の伝票の明細 (取消の数) + 同梱先の明細 (有効) = 数量は 1 回だけ
+ *     → 伝票ごとに注文を作ると、同梱元の注文が「取消」になり、同梱先の注文の数量が増える。明細の受注番号でまとめ、さらに **同梱元の取消の伝票の明細のうち、同梱先の有効な明細と
+ *       (商品コード・数量) が組になるものは除く** (相殺。#1705 Codex R1 Medium 1) = 同梱元の注文の明細 = 顧客が注文したとおり (qty の合計・明細数とも 1 回ぶん)。組にならない取消の明細は残す
  *     (明細の受注番号が空のときは伝票の受注番号。店舗 8 の伝票の明細だけを読む = 伝票の無い明細 (同梱で消えた伝票の古い明細・取消など 2025 年以降 713 行) は読まない)
  *   - 注文日時 = その注文の **自分の伝票** (伝票の受注番号 = 注文番号) の受注日の一番早いもの。自分の伝票が無い (同梱で消えた) ときは、明細が載っている伝票の受注日 (= 同梱先の受注日。本当の注文日とずれ得る)
  *   - 状態 = NE の受注状態区分 → status_source (source_system 'ne' = core.order_status_map 'ne' の 1 / 2 / 20 / 40 / 50)。有効な明細が載る伝票のうち一番手前の状態 (分割で一部だけ出荷済みなら出荷済みにしない)
@@ -691,6 +692,7 @@ export function buildMercariOrder(group, opts = {}) {
   const lines = [];
   const seen = new Set();
   const liveSlips = [];
+  const meta = new Map();   // line_key → { own: 自分の伝票か, slipCancelled: 伝票がキャンセルか, cancelled: 明細が取消か } (同梱の相殺に使う)
   let liveLines = 0;   // 取消でない明細の数 (数量 0 の明細も「取消でない」なら数える = cancelled_qty と qty の比較では決めない)
   for (const s of group.slips) {
     const b = s.base;
@@ -718,12 +720,27 @@ export function buildMercariOrder(group, opts = {}) {
         line_key: key, listing_code: null, sku_code: code, qty, cancelled_qty: cancelled ? qty : 0,
         unit_price_jpy: null, line_amount_jpy: null, tax_rate: null, amount_source: 'unknown', source_line_ref: `ne_slip:${slip}|row:${ln}`,
       });
+      meta.set(key, { own: !!s.own, slipCancelled, cancelled });
     }
     if (live > 0) liveSlips.push(b);
     if (!s.own) bump('mergedSlipRefs');   // 同梱: 自分のでない伝票に明細が載っている
   }
-  if (!lines.length) bump('noLines');
   lines.sort((a, b) => cmpSlip(a.line_key.split('-')[0], b.line_key.split('-')[0]) || Number(a.line_key.split('-')[1]) - Number(b.line_key.split('-')[1]));
+  // 🚨 同梱の相殺 (#1705 Codex R1 Medium 1): 同梱元の注文は、自分の伝票 (キャンセル) の明細と、同梱先の伝票の有効な明細の両方を持つ = 商品も数量も同じ明細が 2 回載る
+  //   (取消の側を残すと qty の合計 = 注文の 2 倍・明細数も 2 倍 =「6 個注文して 3 個取消」に見える)。
+  //   → 自分の伝票がキャンセルの明細のうち、同梱先 (自分のでない伝票) の有効な明細と (商品コード・数量) が組になるものは、取消の側を除く (多重集合で 1 対 1)。
+  //   組にならない取消の明細 (本当に取り消された分・商品コードが空) はそのまま残す
+  const mateKey = (l) => (l.sku_code == null ? null : JSON.stringify([l.sku_code, l.qty]));
+  const pool = new Map();
+  for (const l of lines) { const m = meta.get(l.line_key), k = mateKey(l); if (k != null && !m.own && !m.cancelled) pool.set(k, (pool.get(k) || 0) + 1); }
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i], m = meta.get(l.line_key), k = mateKey(l);
+    if (k == null || !m.own || !m.slipCancelled || !(pool.get(k) > 0)) continue;
+    pool.set(k, pool.get(k) - 1);
+    lines.splice(i, 1); i--;
+    bump('offsetLines');
+  }
+  if (!lines.length) bump('noLines');
   const ownSlips = group.slips.filter((s) => s.own).map((s) => s.base);
   const cancelled = lines.length ? liveLines === 0 : ownSlips.length > 0 && ownSlips.every((b) => isCancelMark(b.キャンセル区分));
   const statusOf = (b) => { const v = nz(b.受注状態区分); if (v == null || !/^\d{1,3}$/.test(v)) throw new Error(`注文 ${no} の伝票 ${b.伝票番号} の受注状態区分が数字でない: "${b.受注状態区分}"`); return v; };
