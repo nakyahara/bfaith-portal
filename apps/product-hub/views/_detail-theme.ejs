@@ -94,6 +94,12 @@
     --phd-fg-94a3b8: #94a3b8;
     --phd-fg-fff: #fff;
   }
+  /* 楽天に載る HTML のプレビューは「楽天の白地でどう見えるか」を見る枠なので、黒テーマでも白地・濃い文字のまま。
+     中の HTML は文字色を持たず親から継ぐ (ラベルのセルは bgcolor=#eeeeee) ので、明るい文字を継がせない (Codex R3) */
+  /* 表は別に塗る: この画面は doctype 無し (互換モード) で、表が親の文字色を継がない */
+  .desc3-render, #pi-preview, .desc3-render table, #pi-preview table { color: #1f2430; color-scheme: light; }
+  .desc3-render a, #pi-preview a { color: #1d4ed8; }
+  .desc3-render :is(code, pre, label, summary), #pi-preview :is(code, pre, label, summary) { color: inherit; }
   /* 重要度は黒地で読めるよう、濃い色を地に・淡い色を文字に入れ替える */
   #f-image-priority { background: color-mix(in srgb, var(--pri-fg, transparent) 30%, #0b1222);
                       color: var(--pri-bg, var(--kb-text)); }
