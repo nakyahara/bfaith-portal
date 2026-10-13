@@ -102,6 +102,19 @@ th.attr-unknown { color: #dc2626; }
   /* 即保存の結果 (2026-09-21)。入力を確定した時点で保存されたことを、その欄のそばで知らせる */
   .autosave-mark { margin-left: 8px; font-size: 11.5px; color: #16a34a; }
   .autosave-mark.bad { color: #dc2626; font-weight: 600; }
+  /* 🆕 JAN を Company DB と比べた印 (Company DB構想 21 B1・知らせだけ)。画面を開いた後に読んで出す */
+  .jan-cdb-mark { margin-top:4px; font-size:11.5px; line-height:1.45; }
+  .jan-cdb-mark:empty { display:none; }
+  .jan-cdb-pill { display:inline-block; border-radius:999px; padding:1px 8px; font-weight:700; border:1px solid #e2e8f0; background:#f8fafc; color:#475569; }
+  .jan-cdb-pill.warn { background:#fff7ed; color:#9a3412; border-color:#fdba74; }
+  .jan-cdb-pill.ok { background:#f0fdf4; color:#166534; border-color:#86efac; }
+  .jan-cdb-pill.info { background:#eff6ff; color:#1e40af; border-color:#bfdbfe; }
+  .jan-cdb-pill.muted { background:#f1f5f9; color:#64748b; border-color:#cbd5e1; }
+  .jan-cdb-detail { display:block; color:#64748b; margin-top:2px; }
+  .jan-cdb-summary { margin-top:6px; font-size:12px; }
+  .jan-cdb-help { margin-top:6px; font-size:12px; color:#475569; }
+  .jan-cdb-help summary { cursor:pointer; color:#2563eb; }
+  .jan-cdb-help ul { margin:6px 0 0 18px; padding:0; }
 </style>
 <div class="wrap wide">
 
@@ -857,6 +870,27 @@ th.attr-unknown { color: #dc2626; }
           <div class="muted" style="font-size:12px; padding:6px 0;">
             <a href="#tab-category" class="jump-tab" data-tab="tab-category">カテゴリ・属性タブの「カタログID・商品仕様」の表</a>で<%= (variation.kind === 'variation' && variation.members.length > 1) ? 'SKUごとに' : '' %>入力します
           </div>
+          <%# 🆕 JAN を Company DB と比べた印 (Company DB構想 21 B1・読むだけ)。画面を開いた後に /jan-check を読んで出す %>
+          <div id="jan-cdb-summary" class="jan-cdb-summary" aria-live="polite"></div>
+          <details class="jan-cdb-help">
+            <summary>JAN の印の見かた</summary>
+            <div>JAN の正本は<strong>商品マスタ (Company DB)</strong> です。ここ (product-hub) の JAN は楽天に送る値で、商品マスタと同じはずのものです。
+              食い違いが無いか、開くたびに商品マスタと比べて印を出します (印は知らせだけ。出品は止めません)。</div>
+            <ul>
+              <li><strong>一致</strong> — 商品マスタの JAN と同じ。商品マスタに JAN が 2 つ以上あるときは、そのうちの 1 つ</li>
+              <li><strong>Company DB と違う</strong> — 商品マスタにはこの商品の JAN があるが、ここの値はそのどれでもない</li>
+              <li><strong>Company DB に無い</strong> — 商品マスタのこの商品に JAN が無い (セットは商品マスタで JAN を持ちません)</li>
+              <li><strong>Company DB に商品コードが無い</strong> — 商品マスタにまだ商品が無いので確かめられない</li>
+              <li><strong>product-hub は空</strong> — ここは空だが、商品マスタには JAN がある</li>
+              <li><strong>読めない</strong> — 商品マスタに今つながらない。少し待って開き直す</li>
+            </ul>
+            <div>直すとき (印の下にも、その印の直し方が出ます):</div>
+            <ul>
+              <li><strong>Company DB と違う</strong> — 商品マスタの JAN が正しければ、ここの JAN を同じ値に直す。商品マスタの JAN が違う・足りないときは、<a href="/apps/master-edit/" target="_blank" rel="noopener">マスタの入力</a>の商品の画面で直す</li>
+              <li><strong>Company DB に無い</strong> — ここの JAN が正しければ、マスタの入力の商品の画面でこの JAN を足す。違うなら、ここの JAN を直す。<strong>セット</strong>は商品マスタで JAN を持てない (ここの JAN がセットの物か確かめる)</li>
+              <li><strong>Company DB に商品コードが無い</strong> — 商品マスタに商品が登録されてから確かめる</li>
+            </ul>
+          </details>
         </div>
         <div style="flex:1">
           <!-- 税率は基本情報 (2026-08-06 中原さん指示: Yahoo!欄から移動)。楽天・Yahoo!両方の登録で使う -->
@@ -2421,6 +2455,8 @@ th.attr-unknown { color: #dc2626; }
                       <% for (const [v, label] of exOptions) { %><option value="<%= v %>" <%= ex === v ? 'selected' : '' %>><%= label %></option><% } %>
                     </select>
                   </div>
+                  <%# 🆕 Company DB の JAN と比べた印 (B1・知らせだけ) %>
+                  <div class="jan-cdb-mark" data-code="<%= m.商品コード %>"></div>
                 </td>
               <% } %>
             </tr>
@@ -2472,6 +2508,8 @@ th.attr-unknown { color: #dc2626; }
                 <% } %>
               </select>
             </div>
+            <%# 🆕 Company DB の JAN と比べた印 (B1・知らせだけ) %>
+            <div class="jan-cdb-mark" data-code="<%= draft.ne_code %>"></div>
           </td>
           <td></td>
         </tr>
@@ -3564,6 +3602,90 @@ th.attr-unknown { color: #dc2626; }
     });
     return res.json();
   }
+
+  // ─── 🆕 JAN を Company DB と比べた印 (Company DB構想 21 B1・読むだけ・知らせだけ) ───
+  // 画面を開いた後と、JAN を保存した後に /jan-check を読んで、JAN の欄の下に印を出す (画面の表示は待たせない)。
+  // 出品は止めない: 楽天への登録の確認の文に一言足すだけ。JAN を直すのは商品マスタ (master-edit) か、この画面の JAN の欄
+  let janCheckRunning = null;   // 走っている照らし (1 つだけ・Codex #1700 R2 M1: 保存のたびに新しく始めて接続を並べない)
+  let janCheckAgain = false;    // 走っている間に保存があった = 終わった後に 1 回だけやり直す
+  let janCheckLast = null;
+  let janCheckBusy = false;   // 比べている途中 (登録の確認は待たずに「読めない」で進める)
+  const janKey = (s) => String(s == null ? '' : s).trim().toLowerCase();
+  function janPill(text, severity) {
+    const span = document.createElement('span');
+    span.className = 'jan-cdb-pill ' + (severity || 'muted');
+    span.textContent = text;
+    return span;
+  }
+  function janDetail(text) {
+    const span = document.createElement('span');
+    span.className = 'jan-cdb-detail';
+    span.textContent = text;
+    return span;
+  }
+  function renderJanCheck(j) {
+    const unreadable = !j || j.readable === false;
+    const byCode = new Map();
+    ((j && j.units) || []).forEach((u) => byCode.set(janKey(u.code), u));
+    document.querySelectorAll('.jan-cdb-mark').forEach((el) => {
+      el.textContent = '';
+      if (unreadable) {
+        el.appendChild(janPill('Company DB: 読めない', 'muted'));
+        el.title = (j && j.reason) || '';
+        return;
+      }
+      el.title = '';
+      const u = byCode.get(janKey(el.dataset.code));
+      if (!u || u.severity === 'none') return;
+      el.appendChild(janPill('Company DB: ' + u.label, u.severity));
+      if (u.detail) el.appendChild(janDetail(u.detail));
+      if (u.fix && u.severity === 'warn') el.appendChild(janDetail('直し方: ' + u.fix));
+    });
+    const summary = document.getElementById('jan-cdb-summary');
+    if (!summary) return;
+    summary.textContent = '';
+    if (unreadable) {
+      summary.appendChild(janPill('JAN の比べ: 読めない', 'muted'));
+      summary.appendChild(janDetail('商品マスタ (Company DB) と比べられませんでした' + (j && j.reason ? ' (' + j.reason + ')' : '') + '。出品は止めません'));
+      return;
+    }
+    const s = (j && j.summary) || {};
+    if (!s.severity || s.severity === 'none') return;
+    summary.appendChild(janPill('商品マスタ (Company DB) と比べた JAN: ' + s.label, s.severity));
+  }
+  async function fetchJanCheckOnce() {
+    try {
+      const res = await fetch(BASE + '/jan-check', { headers: { Accept: 'application/json' } });
+      const j = await res.json();
+      return (j && j.ok === true) ? j : { ok: true, readable: false, reason: (j && j.error) || '読めない', units: [] };
+    } catch (e) {
+      return { ok: true, readable: false, reason: '通信できませんでした', units: [] };
+    }
+  }
+  // 照らすのは同時に 1 つだけ。走っている間に呼ばれたら印を付けて同じ Promise を返し、終わった後に 1 回だけやり直す (最後の値で印を出す)
+  function refreshJanCheck() {
+    if (janCheckRunning) { janCheckAgain = true; return janCheckRunning; }
+    janCheckBusy = true;
+    janCheckRunning = (async () => {
+      let j;
+      do { janCheckAgain = false; j = await fetchJanCheckOnce(); } while (janCheckAgain);
+      janCheckBusy = false;
+      janCheckLast = j;
+      renderJanCheck(j);
+      return j;
+    })().finally(() => { janCheckRunning = null; });
+    return janCheckRunning;
+  }
+  // 楽天への登録の確認の文に足す一言 (違う / Company DB に無い / 読めない のときだけ)
+  function janConfirmNote(j) {
+    if (!j) return '⚠ JAN の比べ: 読めない (商品マスタと比べ終わっていません)。出品は止めません\n\n';
+    if (j.readable === false) return '⚠ JAN を商品マスタ (Company DB) と比べられませんでした (' + (j.reason || '') + ')\n\n';
+    const warn = (j.units || []).filter((u) => u.severity === 'warn');
+    if (!warn.length) return '';
+    return warn.map((u) => '⚠ JAN ' + u.label + ': ' + u.code + (u.phJan ? ' の JAN ' + u.phJan : '') + (u.detail ? ' — ' + u.detail : '') + (u.fix ? '\n   直し方: ' + u.fix : '')).join('\n')
+      + '\n   出品は止めませんが、確かめてから出してください。\n\n';
+  }
+  refreshJanCheck();
 
   // 読み直しの関所。この画面の読み直しは**すべてここを通す** (ほかの場所で location.reload を直に呼ばない)。
   // 明示保存の欄に打ったまま保存していない値を退避してから読み直し、読み直した後に書き戻す
@@ -5049,6 +5171,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { alert(json.error || 'JANコードの保存に失敗しました'); return false; }
         janSaveUnknown = false;
         lastSavedJan = value;
+        if (typeof refreshJanCheck === 'function') refreshJanCheck();   // 🆕 B1: 保存した JAN で Company DB と比べ直す (待たない・保存の結果は変えない)
         if (phKeep) phKeep.savedValue('f-jan', value);   // 未保存の基準もここまで進める (Codex R1)
       }
       return el.value.trim() === lastSavedJan && !janSaveUnknown;
@@ -5157,7 +5280,9 @@ th.attr-unknown { color: #dc2626; }
 
   document.getElementById('rk-register-btn').addEventListener('click', async () => {
     if (!(await saveRakutenFields())) return;
-    if (!confirm('楽天に「公開」で登録します。\n在庫0のまま売り場に載ります (在庫はNE連携が入れます)。\n\nよろしいですか?')) return;
+    // 🆕 B1: 違う / 無い / 読めない なら確認の文に一言足す (止めない)。🚨 待たない: 比べている途中・まだ = 「読めない」で進める (Codex #1700 R1 M3)
+    const janNote = janConfirmNote(janCheckBusy ? null : janCheckLast);
+    if (!confirm(janNote + '楽天に「公開」で登録します。\n在庫0のまま売り場に載ります (在庫はNE連携が入れます)。\n\nよろしいですか?')) return;
     const btn = document.getElementById('rk-register-btn');
     btn.disabled = true;
     rkResult.textContent = '楽天に登録中…';
@@ -5734,7 +5859,12 @@ th.attr-unknown { color: #dc2626; }
     if (inputs.length === 0) return;
     createSkuSaver({
       inputs, label: 'JANコード',
-      send: (input, value) => post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value }),
+      send: (input, value) => {
+        const p = post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
+        // 🆕 B1: 保存した JAN で Company DB と比べ直す (待たない)。返す Promise は今までと同じ物 = 保存の順番・待ち方は変えない
+        p.then((json) => { if (json && json.ok && typeof refreshJanCheck === 'function') refreshJanCheck(); }, () => {});
+        return p;
+      },
     });
   })();
 

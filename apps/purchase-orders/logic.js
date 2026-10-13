@@ -299,33 +299,66 @@ export function loadPmlMerged() {
     const { pub, rows } = loadPml();
     const ov = loadNeOverlay();
     let overlay = null;
-    let applied = false;
+    const applied = overlayApplied(pub, ov.meta);
     if (ov.meta) {
-      applied = true;
-      if (pub && pub.src_ne_products_synced_at) {
-        const a = Date.parse(ov.meta.uploaded_at);
-        const b = Date.parse(pub.src_ne_products_synced_at);
-        if (!Number.isNaN(a) && !Number.isNaN(b) && a < b) applied = false; // 朝同期の方が新しい
-      }
       overlay = { uploaded_at: ov.meta.uploaded_at, row_count: ov.meta.row_count, filename: ov.meta.filename, source: ov.meta.source || 'ne', captured_at: ov.meta.captured_at || null, applied, mergedCount: 0 };
     }
     const merged = !applied ? rows : rows.map(r => {
       const o = ov.rows.get(normProductCode(r['商品コード']));
       if (!o) return r;
       overlay.mergedCount++;
-      return {
-        ...r,
-        '取扱区分': o.取扱区分 != null && o.取扱区分 !== '' ? o.取扱区分 : r['取扱区分'],
-        '仕入先': o.仕入先コード != null && o.仕入先コード !== '' ? o.仕入先コード : r['仕入先'],
-        '原価': o.原価 != null ? o.原価 : r['原価'],
-        '売価': o.売価 != null ? o.売価 : r['売価'],
-        '発注ロット単位': o.発注ロット単位 != null ? o.発注ロット単位 : r['発注ロット単位'],
-        '最終仕入日': o.最終仕入日 != null && o.最終仕入日 !== '' ? o.最終仕入日 : r['最終仕入日'],
-        '注残数': o.発注残数 != null ? o.発注残数 : r['注残数'],
-        '総在庫数': o.在庫数 != null ? o.在庫数 + num(r['FBA在庫数']) : r['総在庫数'],
-      };
+      return mergeOverlayRow(r, o);
     });
     return { pub, rows: merged, overlay };
+  })();
+}
+
+/** NEオーバーレイを使うか (朝のNE同期より古いオーバーレイは無視)。loadPmlMerged と loadPmlMergedFor の共通 */
+function overlayApplied(pub, meta) {
+  if (!meta) return false;
+  if (pub && pub.src_ne_products_synced_at) {
+    const a = Date.parse(meta.uploaded_at);
+    const b = Date.parse(pub.src_ne_products_synced_at);
+    if (!Number.isNaN(a) && !Number.isNaN(b) && a < b) return false; // 朝同期の方が新しい
+  }
+  return true;
+}
+
+/** PML の 1 行に NEオーバーレイの 1 行を重ねる (上書き対象は loadPmlMerged の説明のとおり) */
+function mergeOverlayRow(r, o) {
+  return {
+    ...r,
+    '取扱区分': o.取扱区分 != null && o.取扱区分 !== '' ? o.取扱区分 : r['取扱区分'],
+    '仕入先': o.仕入先コード != null && o.仕入先コード !== '' ? o.仕入先コード : r['仕入先'],
+    '原価': o.原価 != null ? o.原価 : r['原価'],
+    '売価': o.売価 != null ? o.売価 : r['売価'],
+    '発注ロット単位': o.発注ロット単位 != null ? o.発注ロット単位 : r['発注ロット単位'],
+    '最終仕入日': o.最終仕入日 != null && o.最終仕入日 !== '' ? o.最終仕入日 : r['最終仕入日'],
+    '注残数': o.発注残数 != null ? o.発注残数 : r['注残数'],
+    '総在庫数': o.在庫数 != null ? o.在庫数 + num(r['FBA在庫数']) : r['総在庫数'],
+  };
+}
+
+/** 1 商品の行だけ (索引 idx_mpsr_run_code_norm を必ず使う = warehouse-mirror/db.js が作る)。試験が EXPLAIN で照らす */
+export const PML_ONE_SQL = `SELECT ${PML_COLS.join(', ')} FROM mirror_pml_snapshot_rows INDEXED BY idx_mpsr_run_code_norm WHERE run_id=? AND LOWER(TRIM(商品コード))=?`;
+
+/**
+ * 1 商品だけの loadPmlMerged (公開の世代の行 + NEオーバーレイ・同じ重ね方)。商品管理リスト全体を読まない
+ * (マスタの入力の商品の画面・AMC ラベルの保存の確かめ。idx_mpsr_run_code_norm の索引で引く)。
+ * 返値: { pub, rows (その商品の行・大文字小文字の違う重なりがあれば全部) }。未同期 = { pub: null, rows: [] }
+ */
+export function loadPmlMergedFor(productCode) {
+  const db = getDB();
+  const key = normProductCode(productCode);
+  return db.transaction(() => {
+    const pub = db.prepare('SELECT * FROM mirror_pml_published WHERE id=1').get();
+    if (!pub || !key) return { pub: pub || null, rows: [] };
+    const rows = db.prepare(PML_ONE_SQL).all(pub.run_id, key)
+      .filter(r => normProductCode(r['商品コード']) === key);
+    const meta = db.prepare('SELECT * FROM po_ne_overlay_meta WHERE id=1').get() || null;
+    if (!overlayApplied(pub, meta)) return { pub, rows };
+    const o = db.prepare('SELECT * FROM po_ne_overlay_rows WHERE product_key=?').get(key);
+    return { pub, rows: o ? rows.map(r => mergeOverlayRow(r, o)) : rows };
   })();
 }
 

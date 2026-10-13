@@ -694,6 +694,28 @@ await ta('[K3] ロジザードの今の在庫と引当 (削除だけの読み方
   assert.equal((await readLogizardForDelete({ reader: async () => ({ capturedAt: '2020-01-01T00:00:00Z', rows }) })).stale, true);
 });
 
+await ta('[K4] 商品管理リストの在庫の列 (ne-delete-pml.mjs の readPmlStock・#1702 で sales-qty.mjs から移した): 写しの差し替え (__setSalesMirrorProvider) が効く・NE の在庫・引当・NE の発注残・FBA・古い = 読めない', async () => {
+  const { readPmlStock } = await import('../apps/master-edit/ne-delete-pml.mjs');
+  const { __setSalesMirrorProvider } = await import('../apps/master-edit/sales-qty.mjs');
+  const { default: Database } = await import('better-sqlite3');
+  const mdb = new Database(':memory:');
+  mdb.exec(`create table mirror_pml_published (id integer primary key, run_id text, src_ne_products_synced_at text);
+    create table mirror_pml_snapshot_rows (run_id text, 商品コード text, 総在庫数 integer, FBA在庫数 integer, 引当数 integer, 注残数 integer)`);
+  mdb.prepare('insert into mirror_pml_published values (1, ?, ?)').run('run9', new Date(Date.now() - 3600e3).toISOString());
+  mdb.prepare('insert into mirror_pml_snapshot_rows values (?, ?, ?, ?, ?, ?)').run('run9', 'Ab-1', 5, 2, 1, 4);
+  mdb.prepare('insert into mirror_pml_snapshot_rows values (?, ?, ?, ?, ?, ?)').run('old', 'Ab-1', 99, 0, 0, 0);
+  __setSalesMirrorProvider(() => mdb);
+  try {
+    const r = await readPmlStock(['AB-1', 'none']);
+    assert.equal(r.ok, true); assert.equal(r.runId, 'run9');
+    assert.deepEqual(r.map.get('ab-1'), { total: 5, fba: 2, allocated: 1, onOrder: 4 });
+    assert.equal(r.map.has('none'), false);
+    mdb.prepare('update mirror_pml_published set src_ne_products_synced_at = ? where id = 1').run(new Date(Date.now() - 40 * 3600e3).toISOString());
+    const old = await readPmlStock(['AB-1']);
+    assert.equal(old.ok, false); assert.match(old.error, /古い/);
+  } finally { __setSalesMirrorProvider(null); mdb.close(); }
+});
+
 // ═══════════ [S] 画面 (本物の router) ═══════════
 console.log('[S] 画面');
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');

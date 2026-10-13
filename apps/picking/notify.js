@@ -28,7 +28,7 @@
 
 import crypto from 'node:crypto';
 import { isJstWeekendOrHoliday } from './jp-holiday.js';
-import { fetchStockLocations, buildStockLocationsText, stockLookupConfigured } from './stock-locations.js';
+import { fetchStockLocations, buildStockLocationsText, stockLookupConfigured, stockSnapshotAt } from './stock-locations.js';
 
 const TIMEOUT_MS = 5000;
 
@@ -174,10 +174,13 @@ export async function notifyShortage(info, now = new Date()) {
   let stockText = null;
   if (stockLookupConfigured()) {
     try {
-      stockText = buildStockLocationsText(await fetchStockLocations(info.line?.sku), {
+      const data = await fetchStockLocations(info.line?.sku);
+      stockText = buildStockLocationsText(data, {
         excludeBlock: info.line?.block,
         excludeLocation: info.line?.location,
         now,
+        // 写しの後にピッキングで取る/取った数を引く (画面の他ロケ候補と同じ数にする)
+        draws: data && typeof info.stockDrawsFor === 'function' ? info.stockDrawsFor(stockSnapshotAt(data)) : null,
       });
     } catch (e) {
       console.warn(`[picking-notify] 他ロケ在庫の整形失敗 (通知は継続): ${e.message}`);
