@@ -590,6 +590,8 @@
           saved = true; lockAfterSave(); update();
           msg('登録しました (下書き)。' + code + ' の画面を開いています…', 'ok');
           var warns = (x.j.warnings || []).slice();
+          // 🆕 #1719 R2 High: ロジザードの写しと照らせていない値 = 手順の一文 (GAS の H 列に入れる前にロジザードの商品マスタで確かめる)。商品の画面にも同じ印が出る
+          if (x.j.lz_unchecked) warns.push('ロジザードのバーコード: ' + (x.j.lz_unchecked.note || 'ロジザードの写しと照らせていません (' + x.j.lz_unchecked.words + ')'));
           if (x.j.card && x.j.card.status !== 'done') warns.push('product-hub の出品カード: ' + (x.j.card_label || x.j.card.status) + ' (商品の画面の「カードをもう一度作る」か、product-hub のボードを開くと作り直します)');
           // 登録は成功・発注アプリへの書き込み (②) だけまだ = 🆕 0075: 知らせは Company DB に残る (自動でもう一度届ける) / 要確認 = 商品の画面で確かめる。
           //   0075 の前の DB = 商品の画面の「発注の設定」で入れ直す (知らせが無い)

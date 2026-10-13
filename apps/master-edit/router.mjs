@@ -131,7 +131,7 @@ import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, build
 import { readNeDeleteStock } from './ne-delete-stock.mjs';
 // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
-import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
+import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
 import { readLzMirror, lzCopyCheck } from '../../lib/lz-mirror.mjs';
 
 /**
@@ -261,9 +261,17 @@ async function lzRegisterGate(db, items) {
   }
   return { copy: mirror ? lzCopyCheck(mirror, clock()) : null };
 }
-/** 画面の答えに足す「ロジザードの写しと照らせていない」(照らせた・値が無い = 足さない) */
-const lzUncheckedOf = (copy) => (copy && copy.state !== 'checked' ? { lz_unchecked: { state: copy.state, as_of: copy.as_of, words: copy.words,
-  as_of_jst: copy.as_of ? new Date(Date.parse(copy.as_of) + 9 * 3600e3).toISOString().slice(0, 16).replace('T', ' ') : null } } : {});
+/**
+ * 画面の答えに足す「ロジザードの写しと照らせていない」(照らせた・値が無い = 足さない)。copy = { state, as_of } (lzCopyCheck の答えか、DB に残した結果)。
+ *   note = 画面に出す手順の一文 (#1719 Codex R2 High: GAS の H 列に入れる前にロジザードの商品マスタで確かめる・lib の lzCopyNote と同じ文)
+ */
+const lzUncheckedOf = (copy) => {
+  if (!copy || !copy.state || copy.state === 'checked') return {};
+  const ms = copy.as_of ? Date.parse(copy.as_of) : NaN;
+  const jst = Number.isNaN(ms) ? null : new Date(ms + 9 * 3600e3).toISOString().slice(0, 16).replace('T', ' ');
+  return { lz_unchecked: { state: copy.state, as_of: Number.isNaN(ms) ? null : new Date(ms).toISOString(), words: LZ_COPY_STATE_WORDS[copy.state] || copy.state,
+    as_of_jst: jst, note: lzCopyNote(copy.state, jst) } };
+};
 
 /**
  * FBA / FBM (seller SKU の正規化 → 'FBA' / 'FBM')。Render の warehouse-mirror.db の mirror_amazon_sku_fees.fulfillment_channel (読むだけ・16 §3 #9 = Company DB に列を作らない)。
@@ -1246,7 +1254,9 @@ router.post('/api/sku/:code/logizard-barcode', (req, res) => {
       try { await db.query('rollback'); } catch { /* 接続が切れていれば rollback も失敗する */ }
       throw e;
     }
-    res.json({ ok: true, kind: r.kind, value: r.value ?? null, changed: !!r.changed, rule_row: r.rule_row ?? null, replayed: !!r.replayed, ...lzUncheckedOf(lzCopy) });
+    // 印は DB に残した結果と時刻から (#1719 Codex R2 Low: 押し直し = 前に残した結果・今の写しで作らない)
+    res.json({ ok: true, kind: r.kind, value: r.value ?? null, changed: !!r.changed, rule_row: r.rule_row ?? null, replayed: !!r.replayed,
+      ...lzUncheckedOf(r.value ? { state: r.lz_copy_state, as_of: r.lz_copy_as_of } : null) });
   }, 'write');
 });
 

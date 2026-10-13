@@ -33,7 +33,8 @@ export async function selectableSuppliers(db) {
 
 export const LIST_LIMIT = 100;
 export const KINDS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
-export const MISSING = Object.freeze({ tax: '税率', sales: '売上分類', shipping: '送料', reorder: '推奨月数', cost: '原価' });
+// 🆕 lzbc (0080・#1719 Codex R2 High): ロジザードのバーコードの値が、ロジザードの写しと照らせていない (今の行の lz_copy_state が checked でない) 商品
+export const MISSING = Object.freeze({ tax: '税率', sales: '売上分類', shipping: '送料', reorder: '推奨月数', cost: '原価', lzbc: 'ロジザードの確かめ待ち' });
 export const STATES = Object.freeze({ available: '利用可', discontinued: '中止' });
 /** 登録の状態 (0052)。none = 状態の行が無い (切替の前の商品。backfill の後は無い = 使えない) */
 /** カードの知らせ (0052) の絞り込み (仮レビュー L6): 作成待ち (まだ・失敗)・衝突 */
@@ -191,6 +192,13 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   if (f.missing === 'tax') where.push('s.tax_rate is null');
   if (f.missing === 'shipping') where.push('s.shipping_code is null');
   if (f.missing === 'reorder') where.push('s.reorder_months is null');
+  if (f.missing === 'lzbc') {
+    // 今の行 (一番新しい行) に値があって、写しと照らせていない。0080 の前の DB = 何も当てない
+    const ready = (await db.query(`select exists (select 1 from pg_catalog.pg_attribute where attrelid = to_regclass('ops.sku_logizard_barcode_rules')
+      and attname = 'lz_copy_state' and not attisdropped) as ok`)).rows[0].ok === true;
+    where.push(ready ? `exists (select 1 from (select r.value, r.lz_copy_state from ops.sku_logizard_barcode_rules r where r.sku_id = s.sku_id
+      order by r.rule_row desc limit 1) lz where lz.value is not null and lz.lz_copy_state is distinct from 'checked')` : 'false');
+  }
   let costCte = '';
   const jsSort = JS_SORTS.includes(f.sort) ? f.sort : null;
   const profitSort = jsSort === 'profit' || jsSort === 'rate';

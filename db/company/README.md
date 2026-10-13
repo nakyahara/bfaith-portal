@@ -2673,12 +2673,15 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 ### ロジザードのバーコードの値 (0080 仮番号・AI_reference CompanyDB構想/23 v4・2026-10-13 夜 中原さん「新商品登録の画面で FNSKU を入れてすぐにロジザードと NE に登録する」)
 - **なぜ**: 0078 は「決め方だけ持つ (値は CSV を作るときに Amazon のデータから)」= 中原さんの使い方 (手元の FNSKU か JAN を登録のときに打つ) に合わない → **値を打つ形**に。Amazon の出品・対応とは切り離す (違えば参考の一言だけ)
 - **表** `ops.sku_logizard_barcode_rules` に `value` を足す (fnsku = X00 + 英数字 7 字 / jan = 8・13 桁 / lz_assign = 空欄 = ロジザードが番号を付ける)。0078 の決め方だけの行 (auto など) = 値なし (もう一度入れる)
-- **書く** `ops.set_sku_logizard_barcode(request_id, 人, sku_id, 種類, 値, どこから, 開いたときの行番号)` = master_edit だけ。SKU の鍵 → 値の鍵 → 押し直し → stale → ほかの商品の値 (`ops.lzbc_value_holder` = ほかの SKU の値・ほかの商品の JAN・ほかの商品を含む出品の FNSKU) = 断る。
+- **書く** `ops.set_sku_logizard_barcode(request_id, 人, sku_id, 種類, 値, どこから, 開いたときの行番号, 写しと照らした結果, 写しの時刻)` = master_edit だけ。SKU の鍵 → 値の鍵 → 押し直し → stale → ほかの商品の値 (`ops.lzbc_value_holder` = ほかの SKU の値・ほかの商品の JAN・ほかの商品を含む出品の FNSKU) = 断る。
   0078 の `ops.set_sku_logizard_barcode_rule` は画面から外す (ロールの script で master_edit の実行を外す = 持ち主だけ)
 - **入口**: 新商品の登録 (単品 = 必須の欄・まとまり = 子ごと・登録と同じ取引・0080 がある DB は値か空欄が要る = 前の画面は 400)・商品の画面の「ロジザードのバーコード」(`POST /api/sku/:code/logizard-barcode`)。
   ロジザードのバーコードマスタの写し (Render の SQLite) でほかの商品の値 = router が 409。ロジザードの新商品の CSV は今までどおり GAS (H 列に打った値を入れる)・ポータルから出すのは次の PR
+- **写しと照らせたか** (#1719 Codex R1 High 2 / R2): 写しが読めない・空・古い (36 時間) = 保存は通す・値の行に `lz_copy_state` (checked / unavailable / empty / stale) と `lz_copy_as_of` を残す。
+  組み合わせは表の CHECK (`ck_slbr_copy_as_of` = checked / stale は時刻あり・ほかは時刻なし) と書く関数 (DB の時計で checked = 36 時間より新しい・stale = 36 時間より前・境目の前後 5 分はどちらでも) で守る。
+  照らせていない値 = 画面に「ロジザードの写しと照らせていません。GAS の H 列に入れる前に、ロジザードの商品マスタで同じバーコードが無いか確かめてください」(人の手順)・商品の一覧の「未入力 → ロジザードの確かめ待ち」で出せる
 - 当て方 (🚨 まだ流さない): `migrate.mjs --dry-run` (0080 だけ・列を足すだけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す (引数なし) → アプリ (**0080 を先に** = 前にアプリが出ても欄を出さないだけ)
-- 試験 = `node scripts/test-lz-barcode.mjs` / `test-master-register.mjs` [R-LZ]・[LZ-H*] / `test-master-variation-batch.mjs` [R-LZ] / 画面 (`test-master-edit-ui.mjs`・`test-master-variation-ui.mjs`)
+- 試験 = `node scripts/test-lz-barcode.mjs` / `test-lz-mirror.mjs` (写しを読む部品を本物の SQLite と本番の取込で) / `test-master-register.mjs` [R-LZ]・[LZ-H*] / `test-master-variation-batch.mjs` [R-LZ] / 画面 (`test-master-edit-ui.mjs`・`test-master-variation-ui.mjs`)
 
 ### 要確認 (quarantined) の商品を確認済みにする (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える

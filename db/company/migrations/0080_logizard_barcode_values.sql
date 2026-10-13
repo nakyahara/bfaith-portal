@@ -27,6 +27,10 @@ create index ix_slbr_value on ops.sku_logizard_barcode_rules (value) where value
 alter table ops.sku_logizard_barcode_rules add column lz_copy_state text check (lz_copy_state in ('checked', 'unavailable', 'empty', 'stale'));
 alter table ops.sku_logizard_barcode_rules add column lz_copy_as_of timestamptz;
 alter table ops.sku_logizard_barcode_rules add constraint ck_slbr_copy check ((value is null) = (lz_copy_state is null));
+-- 🆕 #1719 Codex R2 Medium 1: 結果と写しの時刻の組み合わせ = checked / stale は時刻が要る・unavailable / empty / 値の無い行は時刻なし (写しの中に行が無い = 時刻も無い)。
+--   新しい・古い (36 時間) は書く関数が DB の時計で確かめる (行の CHECK は時計を見られない)
+alter table ops.sku_logizard_barcode_rules add constraint ck_slbr_copy_as_of check (
+  case when lz_copy_state in ('checked', 'stale') then lz_copy_as_of is not null else lz_copy_as_of is null end);
 comment on column ops.sku_logizard_barcode_rules.lz_copy_state is '🆕 0080: 値をロジザードのバーコードマスタの写しと照らせたか (checked / unavailable / empty / stale・値の無い行 = null)';
 comment on column ops.sku_logizard_barcode_rules.value is '🆕 0080: ロジザードに送るバーコードの値 (rule fnsku = X00 + 英数字 7 字 / jan = 8 か 13 桁)。rule lz_assign = null (空欄 = ロジザードが番号を付ける)。0078 の行は null (値なし = もう一度入れる)';
 
@@ -77,8 +81,11 @@ revoke all on function ops.lzbc_jan_ok(text) from public;
 /**
  * p_kind = fnsku / jan / lz_assign (空欄)・p_value = 値 (lz_assign = null)・p_via = register (新商品の登録の取引の中) / sku_page (商品の画面)・
  * p_seen_row = 画面を開いたときの一番新しい行番号 (行が無かった = null・新商品の登録 = null)。人 (メール形) が要る。
- * p_lz_state / p_lz_as_of = 呼び手 (アプリ) がロジザードのバーコードマスタの写しと照らした結果 (値があるときは要る・空欄 = null)
- * 戻り値 = { ok, sku_id, kind, value, lz_copy_state, changed, rule_row, replayed? }
+ * p_lz_state / p_lz_as_of = 呼び手 (アプリ) がロジザードのバーコードマスタの写しと照らした結果 (値があるときは要る・空欄 = null)。
+ *   🆕 #1719 Codex R2 Medium 1 = 結果と時刻が合わないと断る (直に呼んでも「照らした」と偽れない)。DB の時計で:
+ *     checked = 時刻が 36 時間より新しい (未来は 5 分まで)・stale = 時刻が 36 時間より前・unavailable / empty / 空欄 = 時刻なし。
+ *     36 時間のちょうど境目の前後 5 分は、アプリと DB の時計のずれ・待ち時間で断らないよう、どちらでも通す
+ * 戻り値 = { ok, sku_id, kind, value, lz_copy_state, lz_copy_as_of, changed, rule_row, replayed? }
  * 断る: invalid_input (形・チェック数字) / not_single / cancelled / stale / lzbc_taken (ほかの商品の値) / request_id_reused
  */
 create function ops.set_sku_logizard_barcode(p_request_id uuid, p_actor_id text, p_sku_id bigint, p_kind text, p_value text, p_via text, p_seen_row bigint,
@@ -110,6 +117,16 @@ begin
      or (p_lz_state is null and p_lz_as_of is not null) then
     raise exception 'invalid_input: 値があるときはロジザードの写しと照らした結果 (checked / unavailable / empty / stale) が要る・空欄には要らない' using errcode = '22023';
   end if;
+  if p_lz_state in ('unavailable', 'empty') and p_lz_as_of is not null then
+    raise exception 'invalid_input: 写しを読めない・空 (%) に写しの時刻は付けない', p_lz_state using errcode = '22023';
+  end if;
+  if p_lz_state = 'checked' and (p_lz_as_of is null or p_lz_as_of <= pg_catalog.clock_timestamp() - interval '36 hours 5 minutes'
+                                 or p_lz_as_of > pg_catalog.clock_timestamp() + interval '5 minutes') then
+    raise exception 'invalid_input: 照らした (checked) は 36 時間より新しい写しの時刻が要る (時刻 %)', coalesce(p_lz_as_of::text, 'なし') using errcode = '22023';
+  end if;
+  if p_lz_state = 'stale' and (p_lz_as_of is null or p_lz_as_of > pg_catalog.clock_timestamp() - interval '35 hours 55 minutes') then
+    raise exception 'invalid_input: 古い (stale) は 36 時間より前の写しの時刻が要る (時刻 %)', coalesce(p_lz_as_of::text, 'なし') using errcode = '22023';
+  end if;
   -- SKU の鍵 → 値の鍵 (同じ値を 2 つの商品に同時に付けない)。この後の文は鍵の後の姿を見る (read committed)
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || p_sku_id::text, 0));
   if p_value is not null then perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('ops.lzbc:' || p_value, 0)); end if;
@@ -119,7 +136,9 @@ begin
     if v_prev.actor_id is distinct from p_actor_id or v_prev.rule is distinct from p_kind or v_prev.value is distinct from p_value or v_prev.via is distinct from p_via then
       raise exception 'request_id_reused: request_id % はほかの人・中身で使われている', p_request_id using errcode = '23505';
     end if;
-    return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', v_prev.rule, 'value', v_prev.value, 'lz_copy_state', v_prev.lz_copy_state, 'changed', true, 'rule_row', v_prev.rule_row::text, 'replayed', true);
+    -- 答えの印は前に残した結果と時刻から (#1719 R2 Low: 押し直しの今の写しで作らない)
+    return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', v_prev.rule, 'value', v_prev.value, 'lz_copy_state', v_prev.lz_copy_state,
+      'lz_copy_as_of', v_prev.lz_copy_as_of, 'changed', true, 'rule_row', v_prev.rule_row::text, 'replayed', true);
   end if;
   select k.sku_id, k.company_id, k.sku_kind, r.state as reg into s from core.skus k left join ops.master_registrations r on r.sku_id = k.sku_id where k.sku_id = p_sku_id;
   if s.sku_id is null or s.company_id <> 1 then raise exception 'invalid_input: SKU % が Company DB に無い', p_sku_id using errcode = '22023'; end if;
@@ -135,13 +154,15 @@ begin
   end if;
   -- 今の一番新しい行と同じ (種類・値・写しと照らした結果) = 書かない (照らせなかった値を照らせた = 書く)
   if v_cur.rule_row is not null and v_cur.rule = p_kind and v_cur.value is not distinct from p_value and v_cur.lz_copy_state is not distinct from p_lz_state then
-    return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', p_lz_state, 'changed', false, 'rule_row', v_cur.rule_row::text);
+    return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', p_lz_state, 'lz_copy_as_of', p_lz_as_of,
+      'changed', false, 'rule_row', v_cur.rule_row::text);
   end if;
   perform pg_catalog.set_config('ops.logizard_barcode_protocol', '1', true);
   insert into ops.sku_logizard_barcode_rules (company_id, sku_id, rule, value, via, actor_id, request_id, db_user, lz_copy_state, lz_copy_as_of)
     values (1, p_sku_id, p_kind, p_value, p_via, p_actor_id, p_request_id, v_db_user, p_lz_state, p_lz_as_of) returning rule_row into v_row;
   perform pg_catalog.set_config('ops.logizard_barcode_protocol', '', true);
-  return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', p_lz_state, 'changed', true, 'rule_row', v_row::text);
+  return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', p_lz_state, 'lz_copy_as_of', p_lz_as_of,
+    'changed', true, 'rule_row', v_row::text);
 end $$;
 revoke all on function ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint, text, timestamp with time zone) from public;
 
