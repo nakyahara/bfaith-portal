@@ -34,6 +34,8 @@
  *        (41〜46 = 構成品の照合・カードを作らないときの欄・確かめ直しの上限・Yahoo! の残値と誤りの欄・Amazon の変わらない保存)
  *  49〜50 利益 (1 個あたり・10/6): 単品 / セットの欄を変えると保存の前にその場で計算し直す (保存すると ○ → ○)・数でない・マイナスは赤・元に戻す・一覧の列と利益の少ない順
  *  55 新しい seller SKU を自分で作る (10/11): 一覧の上の欄 = 打つとその場で確かめる・もしかしてを見た後は作る画面へ直行・まだ売れていない SKU を作って保存・もうある = 開く
+ *  60 NE 登録の CSV の「この形を実機で確かめた」(10/12 中原さん): 引退した版 (ne-reg-single-v1) の試し用のファイル = ボタンも「本番の行数で作れるようになります」も出さず一言・
+ *     門の無い版 (single-v2・variation-v1) も出さない・門のある版 (セット) は今までどおり出る (押すと記録)
  *  51 円の欄 (標準売価・原価・例外原価) の読みはサーバーと同じ (カンマ・全角の数字・空白): 保存すると変わること・前との差・保存するとこうなる・利益
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
@@ -1392,6 +1394,41 @@ await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウ
     const att = (await pg.query('select imported_at, declared_at from ops.ne_reg_attempts order by attempt_id desc limit 1')).rows[0];
     assert.ok(att.imported_at && new Date(att.imported_at) <= new Date(att.declared_at), JSON.stringify(att));
     assert.equal(await dirty(p), 0);
+  } finally { delete process.env.MASTER_DECISION_APPROVERS; }
+});
+
+await ta('[60] NE 登録の CSV (10/12 中原さんの画面の写真): 試し用・閉じた・商品が全部 NE で確かめ済みのファイル = 引退した v1 は「この形を実機で確かめた」「問題があった (ng)」と「本番の行数で作れるようになります」を出さず「引退しました … このファイルですることはありません」/ 門の無い v2・まとまりも出さない / セット (門のある版) は出て、押すと記録', async (p) => {
+  process.env.MASTER_DECISION_APPROVERS = 'naka@test';
+  const { seedTrialDoneExport } = await import('./fixtures/reg-csv-trial-done.mjs');
+  const ids = {};
+  for (const [schema, code] of [['ne-reg-single-v1', 's003'], ['ne-reg-set-v1', 'set001'], ['ne-reg-single-v2', 'k004'], ['ne-reg-variation-v1', 'k002']]) ids[schema] = await seedTrialDoneExport(pg, { sessionUser, schema, code });
+  try {
+    await p.goto(B + '/reg-csv');
+    const card = (k) => p.locator(`article.exp[data-id="${ids[k]}"]`);
+    const v1 = card('ne-reg-single-v1');
+    await v1.waitFor();
+    assert.equal(await v1.locator('button[data-act="verified"]').count(), 0, 'v1 = 確かめた / ng のボタンを出さない');
+    const t1 = await v1.textContent();
+    assert.match(t1, /形 ne-reg-single-v1/);
+    assert.match(t1, /この形 \(ne-reg-single-v1\) は引退しました。今の形 \(ne-reg-single-v2\) は実機の確かめが要らず、最初から本番の行数で作れます。このファイルですることはありません/);
+    assert.doesNotMatch(t1, /本番の行数で作れるようになります/);
+    assert.equal(await v1.locator('[data-verify-none="retired"]').isVisible(), true);
+    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1']) {
+      const c = card(k);
+      assert.equal(await c.locator('button[data-act="verified"]').count(), 0, k);
+      assert.equal(await c.locator('[data-verify-none="no_gate"]').isVisible(), true, k);
+      assert.match(await c.textContent(), /実機の確かめが要(らず|りません).*このファイルですることはありません/, k);
+    }
+    // 門のある版 (セット) = 今までどおり。押すと「実機で確かめた」の記録が残る (画面 → API → DB)
+    const set = card('ne-reg-set-v1');
+    assert.match(await set.textContent(), /本番の行数で作れるようになります/);
+    const ok = set.locator('button[data-act="verified"][data-result="ok"]');
+    assert.equal(await ok.isVisible(), true);
+    assert.equal(await set.locator('button[data-act="verified"][data-result="ng"]').isVisible(), true);
+    await ok.click();
+    await p.waitForSelector('.saved-note:has-text("この形を「実機で確かめた」にしました")');
+    const rec = (await pg.query(`select converter_version, result, reg_export_id::text as x from ops.ne_csv_verified where col = 'new_registration' and kind = 'sets' order by verified_id desc limit 1`)).rows[0];
+    assert.deepEqual([rec && rec.converter_version, rec && rec.result, rec && rec.x], ['ne-reg-set-v1', 'ok', ids['ne-reg-set-v1']]);
   } finally { delete process.env.MASTER_DECISION_APPROVERS; }
 });
 

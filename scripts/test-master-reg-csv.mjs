@@ -18,6 +18,7 @@
  *     確かめる前の仕入先は設定に依らず代表にできない・仕入先の関数は画面のロールに渡さない・⑤-2b の操作の一覧は 1 か所
  *   V 0065 (CompanyDB構想/20 v7 §⑤・§⑩ PR-2): 形の版の決まり (lib = DB・single-v2 / variation-v1)・関数の作り直しの差は決めた所だけ・一部だけ入ったときの申告 (partial → verified / failed → 作り直し・申告しないと待ち)・
  *     3 者一致 (NE は合うが Company DB が違う = partial + cdb_drift)・一度でも配った商品の代表は変えない (409 parent_frozen・🔒・DB)
+ *     🆕 10/12 (中原さん): 引退した版 (v1) の試し用のファイル = 実機の確かめのボタンを出さない・API は分かる文で断る (export_mismatch のまま)・門のある版 (セット) は今までどおり
  *   P 照合 ② の観測 (registrationObservations) の形
  *   H 画面: NE 登録の CSV の画面と JS・名簿・作る → 配る → ダウンロード → 申告・商品の画面の JAN と CSV の箱・新商品の JAN
  * 使い方: node scripts/test-master-reg-csv.mjs
@@ -293,6 +294,22 @@ await ta('[V5] 0065 の前に作った v1 のファイル (#1664 Codex R1 Medium
   assert.deepEqual(c.counts, { verified: 1 });
   assert.deepEqual([(await itemsOf(V1_ISSUED.export_id))[0].state, await regOf('old-v1-issued')], ['verified', 'ne_confirmed']);
   assert.equal((await q("select 1 from ops.ne_csv_verified where converter_version = 'ne-reg-single-v1' and verified_by = 'ne_compare'")).length, 0, '門のある前の版は記録を自動で残さない');
+  // 🆕 10/12 (中原さん・画面の写真のファイル #2 と同じ形 = v1・試し用・閉じた (全部の商品が終わった)・商品は全部 NE で確かめた):
+  //   画面の「この形を実機で確かめた」(ok / ng) を出さない = 押しても export_mismatch で断られる。断りの文は「引退した = することはない」と分かる文
+  const x1 = await expOf(V1_ISSUED.export_id);
+  assert.deepEqual([x1.state, x1.close_reason, x1.trial], ['closed', 'finished', true], 'v1 の試し用・閉じた (全部の商品が終わった)');
+  const sv = (await G.regSummary(db, { nowMs: NOW_MS })).exports.find((x) => String(x.export_id) === String(V1_ISSUED.export_id));
+  assert.ok(sv && sv.trial && sv.items.every((i) => i.state === 'verified'), '画面の「試し用の商品が全部 NE で確かめ済み」の形');
+  assert.deepEqual([sv.verify.can, sv.verify.why, sv.verify.schema, sv.verify.current_schema, sv.verify.current_trial_gate], [false, 'retired', 'ne-reg-single-v1', 'ne-reg-single-v2', false]);
+  assert.equal(sv.verify.message, 'この形 (ne-reg-single-v1) は引退しました。今の形 (ne-reg-single-v2) は実機の確かめが要らず、最初から本番の行数で作れます。このファイルですることはありません');
+  assert.equal(sv.verify.rule_why, G.REG_SCHEMA_RULES['ne-reg-single-v1'].why, '引退の理由 = 版の決まりの why (書き足さない)');
+  const nRec = (await q('select 1 from ops.ne_csv_verified')).length;
+  for (const result of ['ok', 'ng']) {
+    const er = await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'products', result, exportId: V1_ISSUED.export_id }, opts())), 409, 'export_mismatch');
+    assert.equal(er.message, sv.verify.message, `API (${result}) の断りの文 = 画面の文`);
+    assert.deepEqual([er.extra.why, er.extra.schema, er.extra.current_schema], ['retired', 'ne-reg-single-v1', 'ne-reg-single-v2']);
+  }
+  assert.equal((await q('select 1 from ops.ne_csv_verified')).length, nRec, '何も記録しない');
 });
 
 /** [V5] (0065 の前の v1 のファイルと作り直し) の後のファイルの数 = [C1]〜[C2b] の「何も作っていない」の基準 */
@@ -760,7 +777,13 @@ await ta('[C11] 実機の確かめの門: 試し用は 5 行まで・ok は試�
   const notDone = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'products' and close_reason = 'superseded' order by export_id desc limit 1")).id;
   await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok' }, opts())), 400);
   await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: notDone }, opts())), 409, 'export_mismatch');
-  await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'products', result: 'ok', exportId: notDone }, opts())), 409, 'not_verified');
+  // 🆕 #1699 Codex R1 Medium: 単品 (v2) のファイル = 門の無い版 = 今の版・今の見出しでも断る (画面にボタンが無いのと同じ)。商品が全部確かめ済みか (not_verified) は門のある版 (セット) で
+  assert.equal((await expOf(notDone)).schema_version, 'ne-reg-single-v2');
+  const eNg = await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'products', result: 'ok', exportId: notDone }, opts())), 409, 'export_mismatch');
+  assert.equal(eNg.extra.why, 'no_gate');
+  const setNotDone = (await one("select e.export_id::text as id from ops.ne_reg_exports e where e.kind = 'sets' and exists (select 1 from ops.ne_reg_export_items i where i.export_id = e.export_id and i.state <> 'verified') order by e.export_id desc limit 1"))?.id;
+  assert.ok(setNotDone, '商品がまだ全部は確かめ済みでないセットのファイル');
+  await rejectsWith(as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: setNotDone }, opts())), 409, 'not_verified');
   await as(E, 'master_edit', () => G.recordRegVerified(db, { actor: 'boss@test', kind: 'sets', result: 'ok', exportId: setExp, note: '中原さんと実機で' }, opts()));
   assert.equal(await G.regFormatVerified(db, G.REG_SCHEMAS.sets), true);
   assert.equal(await G.regFormatVerified(db, G.REG_SCHEMAS.products), true, '単品 (v2) = [C7] の翌朝の確かめが記録だけ残した (種類ごと)');
@@ -1186,6 +1209,32 @@ await ta('[V1] 0065 形の版の決まり: lib の REG_SCHEMA_RULES = DB の ops
   assert.deepEqual(rec.map((r) => [r.converter_version, r.result, r.verified_by]), [['ne-reg-single-v1', 'ok', 'v1@test'], ['ne-reg-single-v2', 'ok', 'ne_compare']]);
   assert.equal(rec[1].x, String(EXB));
   assert.match(rec[1].note, /記録だけ/);
+});
+
+await ta('[V6] 🆕 10/12 実機の確かめを押せるファイル (regVerifyTargetOf): 今の形 (版・見出し) で試し用の門がある版だけ = セット (ne-reg-set-v1)。引退した版 (buildable false) = retired・門の無い版 (single-v2・variation-v1) = no_gate・見出し違い / 知らない版 = mismatch。版の決まりは REG_SCHEMA_RULES (= DB) から読む', async () => {
+  const hdr = (schema) => G.REG_SCHEMA_RULES[schema].header.join(',');
+  const got = Object.fromEntries(Object.entries(G.REG_SCHEMA_RULES).map(([schema, r]) => {
+    const v = G.regVerifyTargetOf({ kind: r.kind, schema_version: schema, header: hdr(schema) }, G.regSchemaRuleOf(schema));
+    return [schema, [v.can, v.why]];
+  }));
+  assert.deepEqual(got, { 'ne-reg-single-v1': [false, 'retired'], 'ne-reg-single-v2': [false, 'no_gate'], 'ne-reg-variation-v1': [false, 'no_gate'], 'ne-reg-set-v1': [true, null] });
+  // 決まりから導く (版を足したときもこの式で決まる): 押せる = 今の形 (REG_SCHEMAS) かつ trialGate
+  for (const [schema, r] of Object.entries(G.REG_SCHEMA_RULES)) {
+    const cur = G.REG_SCHEMAS[r.kind];
+    assert.equal(got[schema][0], cur.schema === schema && cur.trialGate === true, schema);
+    assert.equal(got[schema][1] === 'retired', !got[schema][0] && r.buildable === false, schema);
+    // 決まり = DB の ops.ne_reg_schema_rule の buildable・why・trial_gate
+    const d = (await one('select ops.ne_reg_schema_rule($1) as r', [schema])).r;
+    assert.deepEqual(G.regSchemaRuleOf(schema), { buildable: d.buildable, why: d.why, trial_gate: d.trial_gate }, schema);
+  }
+  assert.equal(G.regSchemaRuleOf('ne-reg-single-v3'), null);
+  assert.equal(G.regSchemaRuleOf('__proto__'), null);
+  const mm = G.regVerifyTargetOf({ kind: 'sets', schema_version: 'ne-reg-set-v1', header: 'set_syohin_code' }, G.regSchemaRuleOf('ne-reg-set-v1'));
+  assert.deepEqual([mm.can, mm.why], [false, 'mismatch'], '見出しが今の形と違う = 押せない (API と同じ)');
+  assert.match(mm.message, /今の形 \(ne-reg-set-v1\)と違う/);
+  const unk = G.regVerifyTargetOf({ kind: 'products', schema_version: 'ne-reg-single-v9', header: hdr('ne-reg-single-v2') }, G.regSchemaRuleOf('ne-reg-single-v9'));
+  assert.deepEqual([unk.can, unk.why], [false, 'mismatch']);
+  assert.doesNotMatch(G.regVerifyTargetOf({ kind: 'products', schema_version: 'ne-reg-single-v1', header: hdr('ne-reg-single-v1') }, G.regSchemaRuleOf('ne-reg-single-v1')).message, /本番の行数で作れるようになります/);
 });
 
 await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版との差は決めた所だけ (ops.ne_reg_canonical = JAN を empty に・ops.ne_reg_build = 版の決まりと試し用・ops.ne_reg_issue = 初めて配るのは作れる版だけ・ops.record_ne_registration_check = 3 者一致・記録だけ・夜間ロードの鍵)・後の migration が作り直していない・権限', async () => {
@@ -2313,6 +2362,61 @@ try {
     assert.match(r.text, /名簿の人だけ/); assert.match(r.text, /value="new-web" disabled/);
     const s = await call('GET', '/apps/master-edit/api/reg-csv/summary');
     assert.equal(s.j.applied, true);
+  });
+
+  await ta('[H3] 🆕 10/12 画面の「この形を実機で確かめた」: 試し用で商品が全部 NE で確かめ済みのファイルのうち、押せる (今の形 + 門のある版 = セット) ものだけボタン・引退した版 (v1) はボタンも「本番の行数で作れるようになります」も出さず一言・API も同じ文で 409', async () => {
+    // 本物の v1 のファイル ([V5] の V1_ISSUED) は画面の「最近の 30 件」から外れている = 同じ形のファイルを版ごとに置く (fixtures/reg-csv-trial-done.mjs)
+    const { seedTrialDoneExport } = await import('./fixtures/reg-csv-trial-done.mjs');
+    const ids = {};
+    for (const [schema, code] of [['ne-reg-single-v1', 's003'], ['ne-reg-set-v1', 'set001'], ['ne-reg-single-v2', 's004'], ['ne-reg-variation-v1', 's006']]) ids[schema] = await seedTrialDoneExport(pg, { sessionUser: E.sessionUser, schema, code });
+    const r = await call('GET', '/apps/master-edit/reg-csv');
+    assert.equal(r.status, 200);
+    const S = (await call('GET', '/apps/master-edit/api/reg-csv/summary')).j;
+    const cardOf = (id) => { const m = new RegExp(`<article class="filecard exp[^"]*" data-id="${id}"[\\s\\S]*?</article>`).exec(r.text); assert.ok(m, `ファイル #${id} のカード`); return m[0]; };
+    const done = S.exports.filter((e) => e.trial && e.items.length && e.items.every((i) => i.state === 'verified'));
+    const v1 = done.find((e) => e.export_id === ids['ne-reg-single-v1']);
+    const set = done.find((e) => e.export_id === ids['ne-reg-set-v1']);
+    assert.ok(v1 && set, `引退した v1 とセットの試し用のファイル (全部確かめ済み) が画面に出ている: ${done.map((e) => e.schema_version).join(',')}`);
+    assert.deepEqual(Object.fromEntries(Object.entries(ids).map(([k, id]) => [k, ((x) => (x ? x.verify.why : 'none'))(done.find((e) => e.export_id === id))])),
+      { 'ne-reg-single-v1': 'retired', 'ne-reg-set-v1': null, 'ne-reg-single-v2': 'no_gate', 'ne-reg-variation-v1': 'no_gate' });
+    for (const e of done) {
+      const c = cardOf(e.export_id);
+      assert.equal((c.match(/data-act="verified"/g) || []).length, e.verify.can ? 2 : 0, `#${e.export_id} ${e.schema_version}`);
+      assert.equal(/本番の行数で作れるようになります/.test(c), e.verify.can, `#${e.export_id}`);
+    }
+    const c1 = cardOf(v1.export_id);
+    assert.match(c1, /data-verify-none="retired"/);
+    assert.ok(c1.includes('この形 (ne-reg-single-v1) は引退しました。今の形 (ne-reg-single-v2) は実機の確かめが要らず、最初から本番の行数で作れます。このファイルですることはありません'), c1.slice(-800));
+    assert.ok(c1.includes('引退の理由: ' + G.REG_SCHEMA_RULES['ne-reg-single-v1'].why), c1.slice(-800));
+    const cs = cardOf(set.export_id);
+    assert.match(cs, /data-act="verified" data-kind="sets" data-result="ok"/);
+    assert.doesNotMatch(cs, /data-verify-none/);
+    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1']) {
+      const c = cardOf(ids[k]);
+      assert.match(c, /data-verify-none="no_gate"/, k);
+      assert.ok(c.includes('このファイルですることはありません'), k);
+      assert.doesNotMatch(c, /引退/, k);
+    }
+    // API (画面のボタンと同じ道) = 引退した版は今までどおり 409 export_mismatch・文は画面と同じ
+    const a = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'products', result: 'ok', export_id: v1.export_id, request_id: uuid() } });
+    assert.deepEqual([a.status, a.j.reason, a.j.why, a.j.error], [409, 'export_mismatch', 'retired', v1.verify.message]);
+    // 🆕 #1699 Codex R1 Medium: 門の無い版 (single-v2・variation-v1) の試し用のファイルも、API に直に ok / ng を送ると 409 export_mismatch (画面と同じ理由)・何も記録しない
+    const nRec = (await q('select 1 from ops.ne_csv_verified')).length;
+    for (const k of ['ne-reg-single-v2', 'ne-reg-variation-v1']) {
+      const want = done.find((e) => e.export_id === ids[k]).verify.message;
+      for (const result of ['ok', 'ng']) {
+        const x = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'products', result, export_id: ids[k], request_id: uuid() } });
+        assert.deepEqual([x.status, x.j.reason, x.j.why, x.j.error], [409, 'export_mismatch', 'no_gate', want], `${k} ${result}`);
+      }
+    }
+    assert.equal((await q('select 1 from ops.ne_csv_verified')).length, nRec, '何も記録しない');
+    // 門のある版 (セット) = 今までどおり通る (ok = 記録が 1 行)
+    const xs = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'sets', result: 'ok', export_id: set.export_id, request_id: uuid() } });
+    assert.equal(xs.status, 200, xs.text);
+    const rs = await one("select converter_version, result, reg_export_id::text as x from ops.ne_csv_verified order by verified_id desc limit 1");
+    assert.deepEqual([rs.converter_version, rs.result, rs.x], ['ne-reg-set-v1', 'ok', set.export_id]);
+    const a2 = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'products', result: 'ng', export_id: String(V1_ISSUED.export_id), request_id: uuid() } });
+    assert.deepEqual([a2.status, a2.j.reason, a2.j.why], [409, 'export_mismatch', 'retired'], '本物の v1 のファイル ([V5]) も');
   });
 
   await ta('[H2] API: 名簿 (MASTER_DECISION_APPROVERS)・Origin・作る → 配る → ダウンロード (sha256) → 申告・商品の画面の CSV の箱と JAN', async () => {
