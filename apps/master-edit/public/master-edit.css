@@ -1106,3 +1106,46 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 .poq-row .poq-reason { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .poq-row .poq-reason input { min-width: 240px; }
 @media (max-width: 900px) { .poq-row { grid-template-columns: 1fr auto; } .poq-row .muted, .poq-row .poq-err { grid-column: 1 / -1; } }
+/* スマホの幅 (≤760px・10/13): ページは横にはみ出さない (表は表の箱の中で横に送る)・押す所は 44px。この中だけ = 1024 / 1440 の見た目は変えない。
+   マスタの判断 (apps/master-decisions) も同じファイルを読む。新商品の登録 (まとまり) は me-variation.css がさらに上から決める (左の列を隠す) */
+@media (max-width: 760px) {
+  /* 上の帯: 1 行のまま。名前は頭文字の丸だけ・「マスタの入力」の札とダッシュボードは隠す (左の列とポータルの名前から行ける)・全体から探すは虫めがねだけ */
+  .hdr { display: flex; gap: 8px; padding: 0 12px; }
+  .brand { gap: 8px; min-width: 0; }
+  .brand > a:first-child { display: inline-flex; align-items: center; min-height: 44px; }
+  .app-pill, .user > span:not(.avatar), .hdr .hdr-dash, .search-trigger .grow, .search-trigger .kbd { display: none; }
+  .search-trigger { margin-left: auto; flex: none; width: 44px; height: 44px; padding: 0; justify-content: center; }
+  .poq-pill { flex: none; height: 44px; min-width: 44px; padding: 0 12px; justify-content: center; }
+  .poq-pill #poq-pill-t { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .user { gap: 8px; flex: none; }
+  .unsaved { height: 44px; }
+  /* 左の列 (64px のアイコン) はそのまま・押す所は 44px。本文の余白を少し詰める */
+  .rail a.nav { min-height: 44px; }
+  main { padding: 16px 12px 120px; }
+  .stickyid { margin: 0 -12px 14px; padding: 8px 12px; }
+  .stickyid .nm { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stickyid .unsaved { display: none; }   /* 上の帯にも「未保存 n 件」が出ている = 名前の場所を残す */
+  .stickyid .btn { white-space: nowrap; }
+  .panel { padding: 14px; }
+  .f.dirty::before { left: -14px; }
+  /* 欄は名前の下に (横に並べると欄がはみ出す)・長いボタンは折り返す */
+  .f, .po-sub .f { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .w-m, .w-l { width: 100%; max-width: 100%; }
+  main .btn { max-width: 100%; white-space: normal; height: auto; min-height: 44px; }
+  main .seg button, main .chip, main .in, main select.in { min-height: 44px; }
+  main .exists-row .btn { min-height: 44px; }   /* .exists-row .btn の 38px より強く */
+  /* 一覧の上の「絞る」: 欄が縮む・キーの印 (/) は出さない */
+  .bigsearch { gap: 8px; padding: 0 6px 0 12px; }
+  .bigsearch input { min-width: 0; }
+  .bigsearch .kbd { display: none; }
+  /* 詳細検索: 1 列 */
+  .adv-grid { grid-template-columns: minmax(0, 1fr); }
+  .adv-grid .rng input.in { min-width: 0; }
+  /* 表の箱: 中の読み上げだけの文字 (.sr = position: absolute・置き場所の指定なし) は表の右端の見出しの位置に置かれ、箱の外の板を基準にするので
+     箱に切られずページを広げていた → .sr だけを基準の左上に置く (箱の position は変えない = 候補の一覧・吹き出しの基準はそのまま) */
+  .scrollx .sr, .tblwrap .sr { left: 0; top: 0; }
+  .doc table { display: block; max-width: 100%; overflow-x: auto; }
+  /* NE 登録の CSV のファイルの札: 長いファイル名 (区切りの無い英数字) を折り返す */
+  .filecard { padding: 14px 12px; }
+  .filecard .fmeta > span { min-width: 0; overflow-wrap: anywhere; }
+}
