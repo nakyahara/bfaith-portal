@@ -121,16 +121,16 @@ try {
     assert.equal(await page.locator('#f-jan').isVisible(), false, '手で打つ欄が最初から出ている');
     assert.equal(await page.locator('#rk-catalog-with .jan-pick-links a').getAttribute('href'), '/apps/master-edit/sku/b001');
     await shot(page, 'phjan3-single-before.png');
-    await sel.selectOption('12');
+    await sel.selectOption('11');   // 手で打った値 (…013) と違う JAN を選ぶ = 画面の「保存済み」がそろわないと、後の保存で手の道に送り直してしまう
     await page.waitForFunction(() => /選んである/.test(document.querySelector('.jan-pick-state[data-code="b001"] .jan-cdb-pill')?.textContent || ''));
     assert.match(await state.locator('.jan-cdb-pill').textContent(), /^楽天のカタログID: 商品マスタの JAN を選んである$/);
     assert.ok(await state.locator('.jan-cdb-pill').evaluate((el) => el.classList.contains('ok')));
     const row = ph.prepare('SELECT jan_code, jan_cdb_row, jan_link_state FROM product_drafts WHERE id = ?').get(dB1.id);
-    assert.deepEqual(row, { jan_code: '4900000001013', jan_cdb_row: 12, jan_link_state: 'linked' });
+    assert.deepEqual(row, { jan_code: '4900000001006', jan_cdb_row: 11, jan_link_state: 'linked' });
     assert.equal(ph.prepare('SELECT catalog_id_exemption_reason AS r FROM draft_rakuten WHERE draft_id = ?').get(dB1.id).r, null);
-    assert.equal(await page.locator('#f-jan').inputValue(), '4900000001013');
+    assert.equal(await page.locator('#f-jan').inputValue(), '4900000001006');
     assert.equal(await page.locator('#rk-catalog-exemption').inputValue(), '');
-    assert.match(await sel.locator('option:checked').textContent(), /4900000001013 {2}✓ 選んである/);
+    assert.match(await sel.locator('option:checked').textContent(), /4900000001006 {2}✓ 選んである/);
     await shot(page, 'phjan3-single-after.png');
     // 後の保存 (カテゴリ・属性を保存) で、JAN を手の道 (POST /api/drafts/:id) で送り直さない・理由も送り直さない
     const before = posts.length;
