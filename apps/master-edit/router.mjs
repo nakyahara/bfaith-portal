@@ -91,7 +91,7 @@ import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
-import { prepareRegisterBody, prepareOrderBlanks, BLANK_KEYS, blankLabelsOf } from '../../lib/master-register-blanks.mjs';
+import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf } from '../../lib/master-register-blanks.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
@@ -756,11 +756,9 @@ router.post('/api/variation/check', (req, res) => {
  *   数えるかは画面と同じ答え (orderNoneApplies)。押し直し (記録がある) = 確かめない・一言も作らない (lib が前の答え・前の誤りを返す) =
  *   その時の発注アプリの読める / 読めないで押し直しが変わらない。戻り値 = prepareOrderBlanks の答え ({ ok, note } / { ok: false, status, json })
  */
-async function orderBlanksFirstTime(db, req, gate, kind, b) {
-  const rid = String(b.request_id ?? '').trim().toLowerCase();
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid)
-    && (await db.query('select 1 from ops.master_edit_requests where request_id = $1::uuid', [rid])).rows.length) return { ok: true, note: null, replay: true };
-  return prepareOrderBlanks(kind, b, { orderApplicable: () => orderNoneApplies(orderScreen(req, gate, null)), reason: b.reason ?? null });
+function orderBlanksFirstTime(db, req, gate, kind, b) {
+  // 断る前に request の鍵を取って記録を読み直す (同じ request_id が同時に来た = 前の答え・#1706 Codex R3 M) = lib/master-register-blanks.mjs
+  return orderBlanksForRequest(db, kind, b, { orderApplicable: () => orderNoneApplies(orderScreen(req, gate, null)) });
 }
 router.post('/api/new/variation', (req, res) => {
   const gate = editorGate(req);

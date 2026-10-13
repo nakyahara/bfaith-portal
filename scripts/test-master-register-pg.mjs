@@ -46,6 +46,7 @@ const u0 = new URL(url);
 if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(u0.hostname)) { console.error('localhost 以外の PostgreSQL には流さない'); process.exit(2); }
 
 const R = await import('../lib/master-register.mjs');
+const RB = await import('../lib/master-register-blanks.mjs');
 const O = await import('../lib/product-hub-outbox.mjs');
 const C = await import('../lib/master-cutover.mjs');
 
@@ -376,6 +377,33 @@ try {
     const r = await reg(dbA, 'g8-2');
     assert.deepEqual(await q('select operation, actor_id, db_user, phase from ops.master_write_sessions where request_id = $1', [r.request_id]),
       [{ operation: 'sku_create', actor_id: 'naka@test', db_user: 'master_edit', phase: 'new_open' }]);
+  });
+
+  await ta('[9] 🆕 #1706 Codex R3 M: 同じ request_id を 2 本同時に (先 = 発注の設定の 6 つも入力なしで登録中・後 = 6 つの印なし) = 後は断らずに鍵で待ち、先の commit の後に前の答え (どちらも成功・400 にしない)', async () => {
+    const rid = crypto.randomUUID();
+    const g = gate();
+    const a = launch(reg(dbA, 'race-blk', { requestId: rid, beforeCommit: g.wait }));
+    await sleep(300);
+    const main = ['cost', 'inbound_date_managed'];
+    const bBody = { request_id: rid, kind: 'single', code: 'race-blk', card: { create: false }, values: {}, blanks: main };
+    // 印なしの本文を、初めての登録として確かめると 400 (鍵を取らない = 誰も登録していないとき)
+    const lone = await RB.orderBlanksForRequest(dbB, 'single', { ...bBody, request_id: crypto.randomUUID() }, { orderApplicable: true });
+    assert.deepEqual([lone.ok, lone.status, lone.json && lone.json.reason], [false, 400, 'blank_unmarked']);
+    const b = launch((async () => {
+      const o = await RB.orderBlanksForRequest(dbB, 'single', bBody, { orderApplicable: true });
+      if (!o.ok) return { o };
+      return { o, r: await reg(dbB, 'race-blk', { requestId: rid }) };
+    })());
+    await sleep(500);
+    assert.equal(b.done, false, '後は request の鍵で待つ (先の取引が終わるまで)');
+    g.open();
+    const ra = await a.promise;
+    assert.ok(ra.ok, ra.err && ra.err.message);
+    const rb = await b.promise;
+    assert.ok(rb.ok, rb.err && rb.err.message);
+    assert.deepEqual([rb.ok.o.ok, rb.ok.o.replay, rb.ok.o.note], [true, true, null], JSON.stringify(rb.ok.o));
+    assert.deepEqual([rb.ok.r.replayed, rb.ok.r.sku_id], [true, ra.ok.sku_id], '後 = 先の答え (同じ SKU)');
+    assert.equal((await q("select count(*)::int as n from core.skus where code = 'race-blk'"))[0].n, 1);
   });
 
 } finally {
