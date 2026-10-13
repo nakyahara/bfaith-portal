@@ -254,7 +254,8 @@ export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_setti
  *   決め方を書く関数の実行 (新商品の登録の取引の中・商品の画面)。表・関数が無い DB (0078 の前) では付けない (流し直すと付く)。
  *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・守りの trigger
  */
-export const LZ_BARCODE_SELECT = Object.freeze(['ops.sku_logizard_barcode_rules']);
+// 🆕 0080 (#1719 Codex R5): 答えの控え (ops.sku_logizard_barcode_requests) も読むだけ = 商品の画面の再送を見分ける (書くのは関数だけ)
+export const LZ_BARCODE_SELECT = Object.freeze(['ops.sku_logizard_barcode_rules', 'ops.sku_logizard_barcode_requests']);
 /**
  * 🆕 0080 (CompanyDB構想 23 v4・中原さん 10/13 夜「新商品登録の画面で入れてすぐにロジザードと NE に登録する」): 値を書く・
  *   値の持ち主 (画面のその場の確かめ・読むだけ) を master_edit に (ロジザード登録の CSV の関数は 2 本目)。0078 の「決め方だけ」の関数は画面から使わない = 持ち主だけ (下の OWNER_ONLY)。
@@ -262,7 +263,7 @@ export const LZ_BARCODE_SELECT = Object.freeze(['ops.sku_logizard_barcode_rules'
  */
 export const LZ_BARCODE_EDIT_FUNCTIONS = Object.freeze(['ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint, text, timestamp with time zone)', 'ops.lzbc_value_holder(bigint, text)']);
 export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_logizard_barcode_rules()', 'ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)',
-  'ops.lzbc_jan_ok(text)']);
+  'ops.lzbc_jan_ok(text)', 'ops.guard_sku_logizard_barcode_requests()']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;

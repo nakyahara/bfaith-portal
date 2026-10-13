@@ -230,6 +230,19 @@ async function defaultLzMirror() {
 }
 let lzMirrorProvider = defaultLzMirror;
 export function __setLzMirrorProvider(fn) { lzMirrorProvider = fn || defaultLzMirror; }
+/**
+ * 🆕 #1719 Codex R5 Medium: 同じ request_id の要求を 1 つずつ通す (待つ形の DB の鍵 = この接続の間・この要求の終わりで外す)。
+ *   鍵を取った後で「保存済みか」を確かめる = 先の要求が commit する前に重なった再送も、待ってから保存済みの答えを返す (今の写しで 409 にしない)。
+ *   接続は要求ごと (openPgClient・終わりに end) = 外し忘れても接続を閉じれば外れる
+ */
+async function withRequestLock(db, requestId, fn) {
+  const rid = String(requestId ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid)) return fn();
+  await db.query("select pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended('master-edit.request:' || $1::text, 0))", [rid]);
+  try { return await fn(); } finally {
+    try { await db.query("select pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended('master-edit.request:' || $1::text, 0))", [rid]); } catch { /* 接続が切れた = 鍵も外れている */ }
+  }
+}
 /** ロジザードのバーコードマスタの写しで、その値を持っているほかの商品の商品ID (無い = null) */
 function lzMirrorOwner(mirror, code, value) {
   return lzMirrorOwners(mirror, code, value);   // #1719 R3 Medium: 同じ値の商品が複数 = この商品以外が 1 つでもあれば断る
@@ -882,7 +895,7 @@ router.post('/api/new/variation', (req, res) => {
       catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
     }
   }
-  return withPgApi(res, async (db) => {
+  return withPgApi(res, async (db) => withRequestLock(db, b.request_id, async () => {   // 🆕 #1719 R5: 同じ request_id は 1 つずつ (鍵の後に保存済みかを見る)
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ (子ごと) → commit の後に届ける。入る前 = 今までどおり ② をすぐ書く。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
@@ -923,7 +936,7 @@ router.post('/api/new/variation', (req, res) => {
       if (t) card = { status: t.status, label: CARD_STATUS_LABELS[t.status] || t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null };
     }
     res.json({ ...r, card, ...(orderInput ? { order_settings: orderResult } : {}), ...(await lzSavedUncheckedOf(db, regId)) });
-  }, 'write');
+  }), 'write');
 });
 
 router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -1017,7 +1030,7 @@ router.post('/api/new', (req, res) => {
     try { if (!registrationOrderDone(b.request_id)) writeOrderSettings({ ...orderInput, via: 'master-edit:new', seen: 'validate-only' }, { dryRun: true }); }
     catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
   }
-  return withPgApi(res, async (db) => {
+  return withPgApi(res, async (db) => withRequestLock(db, b.request_id, async () => {   // 🆕 #1719 R5: 同じ request_id は 1 つずつ (鍵の後に保存済みかを見る)
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ → commit の後に届ける (届かなくても知らせは残る = 届け直す)。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
@@ -1064,7 +1077,7 @@ router.post('/api/new', (req, res) => {
     }
     res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null, ...(orderInput ? { order_settings: orderResult } : {}),
       ...(await lzSavedUncheckedOf(db, b.request_id)) });   // #1719 R3 High: 押し直しでも DB に残した結果から
-  }, 'write');
+  }), 'write');
 });
 
 // ─── 🆕 PR-7b: まとまりの名前を直す・子の廃止・quarantined の代表の採用 (名簿の人・保存を開く門 + products.parent が company・DB の関数が決まりを全部見る) ───
@@ -1252,13 +1265,14 @@ router.post('/api/sku/:code/logizard-barcode', (req, res) => {
   }
   const rid = String(b.request_id ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid)) return res.status(400).json({ ok: false, error: '保存の番号 (request_id) の形が違う。画面を開き直してください', reason: 'invalid_input' });
-  return withPgApi(res, async (db) => {
+  return withPgApi(res, async (db) => withRequestLock(db, rid, async () => {   // 🆕 #1719 R5: 同じ request_id は 1 つずつ (鍵の後に保存済みかを見る)
     const sku = (await db.query('select sku_id::text as id, code, sku_kind from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(req.params.code || '')])).rows[0];
     if (!sku) return res.status(404).json({ ok: false, error: `商品コード ${req.params.code} は Company DB にありません` });
     if (sku.sku_kind !== 'single') return res.status(400).json({ ok: false, error: 'ロジザードのバーコードは単品だけです', reason: 'not_single' });
     if (!(await lzBarcodeReady(db))) return res.status(503).json({ ok: false, error: 'Company DB に 0080 (ロジザードのバーコードの値) がまだ入っていないか、権限の流し直しの前です。何も保存していません', reason: 'db_not_ready' });
-    // 🆕 #1719 Codex R4 High: この SKU に同じ request_id の行がある (押し直し) = 今の写しで確かめない (DB の関数が前の答えを返す・違う中身 = request_id_reused)
-    const saved = (await db.query('select 1 from ops.sku_logizard_barcode_rules where request_id = $1::uuid and sku_id = $2::bigint', [rid, sku.id])).rows.length > 0;
+    // 🆕 #1719 Codex R4 High: この SKU に同じ request_id の答えがある (押し直し) = 今の写しで確かめない (DB の関数が前の答えを返す・違う中身 = request_id_reused)。
+    //   R5: 答えの控え (書かなかった回も残る) を、request_id の鍵を取った後に見る
+    const saved = (await db.query('select 1 from ops.sku_logizard_barcode_requests where request_id = $1::uuid and sku_id = $2::bigint', [rid, sku.id])).rows.length > 0;
     const lzMirror = bc.value && !saved ? await lzMirrorProvider() : null;
     const lzHit = lzMirror ? lzMirrorOwner(lzMirror, sku.code, bc.value) : null;
     const lzCopy = lzMirror ? lzCopyCheck(lzMirror, clock()) : null;   // 🆕 #1719 R1 High 2: 照らせない = 通す・印を残す
@@ -1275,7 +1289,7 @@ router.post('/api/sku/:code/logizard-barcode', (req, res) => {
     // 印は DB に残した結果と時刻から (#1719 Codex R2 Low: 押し直し = 前に残した結果・今の写しで作らない)
     res.json({ ok: true, kind: r.kind, value: r.value ?? null, changed: !!r.changed, rule_row: r.rule_row ?? null, replayed: !!r.replayed,
       ...lzUncheckedOf(r.value ? { state: r.lz_copy_state, as_of: r.lz_copy_as_of } : null) });
-  }, 'write');
+  }), 'write');
 });
 
 /**

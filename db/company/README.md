@@ -2679,10 +2679,12 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   ロジザードのバーコードマスタの写し (Render の SQLite) でほかの商品の値 = router が 409。ロジザードの新商品の CSV は今までどおり GAS (H 列に打った値を入れる)・ポータルから出すのは次の PR
 - **写しと照らせたか** (#1719 Codex R1 High 2 / R2): 写しが読めない・空・古い (36 時間) = 保存は通す・値の行に `lz_copy_state` (checked / unavailable / empty / stale) と `lz_copy_as_of` を残す。
   組み合わせは表の CHECK (`ck_slbr_copy_as_of` = checked / stale は時刻あり・ほかは時刻なし) と書く関数 (DB の時計で checked = 36 時間より新しい・stale = 36 時間より前・境目の前後 5 分はどちらでも) で守る。
+  同じ request_id の要求は router が待つ形の DB の鍵 (pg_advisory_lock・要求の間) で 1 つずつ通し、鍵の後に保存済みかを見る (同時の再送も保存済みの答え・#1719 R5)。
+  書く関数の答えは `ops.sku_logizard_barcode_requests` に控える (書かなかった回も = 書かなかった応答の再送を見分ける・追記だけ・関数の中だけ)。
   登録の答えの印は、その登録 (request_id) が残した行の結果と時刻から作る (応答が失われた後の再送でも同じ印・#1719 R3)。写しで同じ値を持つ商品が複数 = この商品以外が 1 つでもあれば断る。
   照らせていない値 = 画面に「ロジザードの写しと照らせていません。GAS の H 列に入れる前に、ロジザードの商品マスタで同じバーコードが無いか確かめてください」(人の手順)・商品の一覧の「未入力 → ロジザードの確かめ待ち」で出せる
 - 当て方 (🚨 まだ流さない): **アプリ (マージ・miniPC の入れ替え) を先に** → `migrate.mjs --dry-run` (0080 だけ・列と関数を足すだけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す (引数なし)。🚨 0080 を先に当てると、古いアプリの新商品の登録が止まる (0080 が 0078 の決め方の関数の master_edit の実行を外す = 古いアプリは登録のときにそこへ書く = 登録ごと戻る・#1719 Codex R4 Medium)。新しいアプリは 0080 の前・0080 の後でロールの流し直しの前 (master_edit に書く関数の実行権が無い) のどちらでも欄を出さずに登録を続ける (`test-lz-barcode-before0080.mjs`)
-- 試験 = `node scripts/test-lz-barcode.mjs` / `test-lz-mirror.mjs` (写しを読む部品を本物の SQLite と本番の取込で) / `test-lz-barcode-before0080.mjs` (当てる順の途中の組み合わせ) / `test-master-register.mjs` [R-LZ]・[LZ-H*] / `test-master-variation-batch.mjs` [R-LZ] / 画面 (`test-master-edit-ui.mjs`・`test-master-variation-ui.mjs`)
+- 試験 = `node scripts/test-lz-barcode.mjs` / `test-lz-mirror.mjs` (写しを読む部品を本物の SQLite と本番の取込で) / `test-lz-barcode-before0080.mjs` (当てる順の途中の組み合わせ) / `test-lz-barcode-pg.mjs` (実 PG・同時の再送) / `test-master-register.mjs` [R-LZ]・[LZ-H*] / `test-master-variation-batch.mjs` [R-LZ] / 画面 (`test-master-edit-ui.mjs`・`test-master-variation-ui.mjs`)
 
 ### 要確認 (quarantined) の商品を確認済みにする (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える

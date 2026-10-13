@@ -514,6 +514,32 @@ await ta('[H3e] 保存できた後の再送 (#1719 R4 High): 1 回目は保存�
     assert.deepEqual([r3.status, r3.j.reason], [409, 'lzbc_taken'], r3.text);
   } finally { LZ_MIRROR = mirrorOf(); }
 });
+await ta('[H3f] 書かなかった (changed: false) 応答が失われた後の再送 (#1719 R5): 答えの控えに残る → 写しに同じ値のほかの商品が現れても保存済みの答え (409 にならない)・控えは変えられない', async () => {
+  try {
+    LZ_MIRROR = mirrorOf();
+    const seen = lzData((await call('GET', '/apps/master-edit/sku/lz4')).text).seenRow;
+    const w1 = await call('POST', api('lz4'), { body: { request_id: uuid(), barcode: { kind: 'value', value: 'X00LZR5001' }, seen_row: seen } });
+    assert.deepEqual([w1.status, w1.j.changed], [200, true], w1.text);
+    const n0 = (await rowsOf('lz4')).length;
+    const body = { request_id: uuid(), barcode: { kind: 'value', value: 'X00LZR5001' }, seen_row: w1.j.rule_row };
+    const s1 = await call('POST', api('lz4'), { body });   // 同じ値・同じ結果 = 書かない。この応答は届かなかったことにする
+    assert.deepEqual([s1.status, s1.j.changed, s1.j.replayed], [200, false, false], s1.text);
+    assert.equal((await rowsOf('lz4')).length, n0, '書かない回に値の行を足した');
+    const ctl = await q('select rule, value, via, result from ops.sku_logizard_barcode_requests where request_id = $1', [body.request_id]);
+    assert.deepEqual(ctl.map((x) => [x.rule, x.value, x.via, x.result.changed]), [['fnsku', 'X00LZR5001', 'sku_page', false]]);
+    LZ_MIRROR = mirrorOf({ bc: [['zz-new', 'X00LZR5001']] });
+    const s2 = await call('POST', api('lz4'), { body });
+    assert.deepEqual([s2.status, s2.j.replayed, s2.j.changed, s2.j.rule_row], [200, true, false, w1.j.rule_row], s2.text);
+    // 違う中身で同じ request_id = 断る
+    const s3 = await call('POST', api('lz4'), { body: { ...body, barcode: { kind: 'lz_assign' } } });
+    assert.deepEqual([s3.status, s3.j.reason], [409, 'request_id_reused'], s3.text);
+    // 控えは画面のロールが書けない・持ち主も関数の外では書けない・変えられない
+    const code = async (fn) => { const e = await pgErr(fn()); return e ? e.code : null; };
+    assert.equal(await asEditor(() => code(() => pg.query(`insert into ops.sku_logizard_barcode_requests (request_id, sku_id, actor_id, rule, via, result) values ($1, $2, 'x@y', 'lz_assign', 'sku_page', '{}')`, [uuid(), ids.lz4]))), '42501');
+    assert.equal(await code(() => pg.query(`insert into ops.sku_logizard_barcode_requests (request_id, sku_id, actor_id, rule, via, result) values ($1, $2, 'x@y', 'lz_assign', 'sku_page', '{}')`, [uuid(), ids.lz4])), '42501');
+    assert.equal(await code(() => pg.query("update ops.sku_logizard_barcode_requests set result = '{}'")), '42501');
+  } finally { LZ_MIRROR = mirrorOf(); }
+});
 await ta('[H4] 画面の動き (Chromium): 値を打つと空欄の印が外れる・空欄に印で値が消える・形の一言・通信が切れた保存は同じ request_id で送り直す (2 回書かない)', async () => {
   let chromium;
   try { ({ chromium } = await import('playwright')); } catch (e) { throw new Error(`Playwright が無い: ${e.message}`); }

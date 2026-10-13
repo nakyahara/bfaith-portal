@@ -77,6 +77,36 @@ begin
 end $$;
 revoke all on function ops.lzbc_jan_ok(text) from public;
 
+-- ═══════════ 2b. 書く関数の答えの控え (押し直しを見分ける・#1719 Codex R5 Medium) ═══════════
+--   書く関数を呼んで通った回 (書いた・同じなので書かなかった の両方) の request_id と答え。値の行 (rules) は書かなかった回を残さない = 書かなかった応答が失われた後の再送を見分けるのはこの表。
+--   (request_id, sku_id) ごとに 1 行 (まとまりの登録は子ごとに同じ request_id)。書くのは関数の中だけ (印 ops.logizard_barcode_protocol)・追記だけ
+create table ops.sku_logizard_barcode_requests (
+  request_id uuid        not null,
+  sku_id     bigint      not null references core.skus (sku_id),
+  actor_id   text        not null,
+  rule       text        not null,
+  value      text,
+  via        text        not null,
+  result     jsonb       not null,
+  created_at timestamptz not null default pg_catalog.now(),
+  primary key (request_id, sku_id)
+);
+revoke all on ops.sku_logizard_barcode_requests from public;
+comment on table ops.sku_logizard_barcode_requests is '🆕 0080 (#1719 Codex R5): ops.set_sku_logizard_barcode の答えの控え (書いた・書かなかった の両方)。同じ request_id の押し直し = この答えを返す';
+create function ops.guard_sku_logizard_barcode_requests() returns trigger language plpgsql set search_path = pg_catalog, pg_temp as $$
+begin
+  if tg_op <> 'INSERT' then raise exception 'logizard_barcode_request: 答えの控えは変えない・消さない (追記だけ)' using errcode = '42501'; end if;
+  if coalesce(pg_catalog.current_setting('ops.logizard_barcode_protocol', true), '') is distinct from '1' then
+    raise exception 'logizard_barcode_request: 答えの控えは ops.set_sku_logizard_barcode の中でだけ書く' using errcode = '42501';
+  end if;
+  return new;
+end $$;
+revoke all on function ops.guard_sku_logizard_barcode_requests() from public;
+create trigger trg_sku_logizard_barcode_requests_guard before insert or update or delete on ops.sku_logizard_barcode_requests
+  for each row execute function ops.guard_sku_logizard_barcode_requests();
+create trigger trg_sku_logizard_barcode_requests_no_truncate before truncate on ops.sku_logizard_barcode_requests
+  for each statement execute function core.reject_mutation();
+
 -- ═══════════ 3. 値を書く ═══════════
 /**
  * p_kind = fnsku / jan / lz_assign (空欄)・p_value = 値 (lz_assign = null)・p_via = register (新商品の登録の取引の中) / sku_page (商品の画面)・
@@ -98,6 +128,8 @@ declare
   v_cur     ops.sku_logizard_barcode_rules;
   v_holder  text;
   v_row     bigint;
+  v_req     ops.sku_logizard_barcode_requests;
+  v_res     jsonb;
 begin
   if p_request_id is null or p_sku_id is null then raise exception 'invalid_input: request_id と SKU が要る' using errcode = '22023'; end if;
   if ops.reg_actor_problem(p_actor_id, null) is not null or p_actor_id !~ '^[^[:space:]@]+@[^[:space:]@]+$' then
@@ -130,7 +162,14 @@ begin
   -- SKU の鍵 → 値の鍵 (同じ値を 2 つの商品に同時に付けない)。この後の文は鍵の後の姿を見る (read committed)
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || p_sku_id::text, 0));
   if p_value is not null then perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('ops.lzbc:' || p_value, 0)); end if;
-  -- 押し直し (同じ request_id・同じ SKU) = 前の答え
+  -- 押し直し (同じ request_id・同じ SKU) = 前の答え。🆕 #1719 R5: 答えの控え (書かなかった回も) を先に見る
+  select * into v_req from ops.sku_logizard_barcode_requests x where x.request_id = p_request_id and x.sku_id = p_sku_id;
+  if v_req.request_id is not null then
+    if v_req.actor_id is distinct from p_actor_id or v_req.rule is distinct from p_kind or v_req.value is distinct from p_value or v_req.via is distinct from p_via then
+      raise exception 'request_id_reused: request_id % はほかの人・中身で使われている', p_request_id using errcode = '23505';
+    end if;
+    return v_req.result || pg_catalog.jsonb_build_object('replayed', true);
+  end if;
   select * into v_prev from ops.sku_logizard_barcode_rules r where r.request_id = p_request_id and r.sku_id = p_sku_id;
   if v_prev.rule_row is not null then
     if v_prev.actor_id is distinct from p_actor_id or v_prev.rule is distinct from p_kind or v_prev.value is distinct from p_value or v_prev.via is distinct from p_via then
@@ -154,16 +193,20 @@ begin
   end if;
   -- 今の一番新しい行と同じ (種類・値・写しと照らした結果) = 書かない (照らせなかった値を照らせた = 書く)
   if v_cur.rule_row is not null and v_cur.rule = p_kind and v_cur.value is not distinct from p_value and v_cur.lz_copy_state is not distinct from p_lz_state then
-    -- 書かない = 残っている行の時刻 (#1719 R3 Low: 今回渡された時刻を返すと、画面と DB の時刻が食い違う)
-    return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', v_cur.lz_copy_state, 'lz_copy_as_of', v_cur.lz_copy_as_of,
+    -- 書かない = 残っている行の時刻 (#1719 R3 Low: 今回渡された時刻を返すと、画面と DB の時刻が食い違う)。🆕 #1719 R5: 書かなかった回も答えの控えに残す (再送を見分ける)
+    v_res := pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', v_cur.lz_copy_state, 'lz_copy_as_of', v_cur.lz_copy_as_of,
       'changed', false, 'rule_row', v_cur.rule_row::text);
+  else
+    perform pg_catalog.set_config('ops.logizard_barcode_protocol', '1', true);
+    insert into ops.sku_logizard_barcode_rules (company_id, sku_id, rule, value, via, actor_id, request_id, db_user, lz_copy_state, lz_copy_as_of)
+      values (1, p_sku_id, p_kind, p_value, p_via, p_actor_id, p_request_id, v_db_user, p_lz_state, p_lz_as_of) returning rule_row into v_row;
+    v_res := pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', p_lz_state, 'lz_copy_as_of', p_lz_as_of,
+      'changed', true, 'rule_row', v_row::text);
   end if;
   perform pg_catalog.set_config('ops.logizard_barcode_protocol', '1', true);
-  insert into ops.sku_logizard_barcode_rules (company_id, sku_id, rule, value, via, actor_id, request_id, db_user, lz_copy_state, lz_copy_as_of)
-    values (1, p_sku_id, p_kind, p_value, p_via, p_actor_id, p_request_id, v_db_user, p_lz_state, p_lz_as_of) returning rule_row into v_row;
+  insert into ops.sku_logizard_barcode_requests (request_id, sku_id, actor_id, rule, value, via, result) values (p_request_id, p_sku_id, p_actor_id, p_kind, p_value, p_via, v_res);
   perform pg_catalog.set_config('ops.logizard_barcode_protocol', '', true);
-  return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', p_kind, 'value', p_value, 'lz_copy_state', p_lz_state, 'lz_copy_as_of', p_lz_as_of,
-    'changed', true, 'rule_row', v_row::text);
+  return v_res;
 end $$;
 revoke all on function ops.set_sku_logizard_barcode(uuid, text, bigint, text, text, text, bigint, text, timestamp with time zone) from public;
 
