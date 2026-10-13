@@ -14,7 +14,7 @@
 import { createHash } from 'crypto';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { loadPmlMerged } from './logic.js';
-import { getSetting } from './ledger.js';
+import { getSetting, audit } from './ledger.js';
 
 const nowIso = () => new Date().toISOString();
 const trimS = v => String(v == null ? '' : v).trim();
@@ -171,6 +171,72 @@ export function upsertLabel({ productKey, productCode, status, barcodeValue, not
       .run(key, now, actor || null, source, cur ? cur.status : null, status, value || null, noteV || null);
     return { label: rowToLabel(db.prepare('SELECT * FROM po_barcode_labels WHERE product_key=?').get(key)) };
   })();
+}
+
+// ─── 1 商品だけ (マスタの入力の商品の画面・Company DB構想 21 A1) ───
+
+/** 対象外の理由 (画面の言葉)。対象の決め方は loadBarcodeTargets と同じ (商品管理リスト + NE オーバーレイ) */
+export const BARCODE_TARGET_REASONS = Object.freeze({
+  pml_not_synced: '商品管理リストがまだ同期されていないので、対象か分かりません',
+  missing_from_pml: '商品管理リストにまだ出ていません (NE に登録した翌朝から対象になります)',
+  set: 'セットです (ラベルは中身の単品ごと)',
+  not_amc: '仕入先が AMC (アメージングクラフト) ではありません',
+  not_own_product: '自社商品 (売上分類 1) ではありません',
+});
+/** どの画面から書いたか (po_audit_log の via)。発注アプリのマスタ管理のポップオーバーは今までどおり events だけ (記録の形を変えない) */
+export const BARCODE_VIA = Object.freeze({ 'master-edit:sku': 'マスタの入力 (商品の画面)' });
+
+/**
+ * 1 商品の対象の判定と今の行。対象の決め方は発注アプリと同じ (loadBarcodeTargets)。
+ * { pmlSynced, target, reason (対象外の理由のキー・対象 = null), code, name, vendorCode, label (今の行・無ければ null) }
+ */
+export function barcodeTargetOf(productCode) {
+  const key = normProductCode(productCode);
+  const { pub, rows, targets } = loadBarcodeTargets();
+  const cur = key ? getDB().prepare('SELECT * FROM po_barcode_labels WHERE product_key=?').get(key) : null;
+  const label = cur ? rowToLabel(cur) : null;
+  if (!pub) return { pmlSynced: false, target: false, reason: 'pml_not_synced', code: trimS(productCode), name: '', vendorCode: null, label };
+  const t = targets.get(key);
+  if (t) return { pmlSynced: true, target: true, reason: null, code: t.code, name: t.name, vendorCode: t.vendorCode || null, label };
+  const r = rows.find((x) => normProductCode(x['商品コード']) === key);
+  let reason = 'missing_from_pml';
+  if (r) {
+    if (String(r['商品区分'] || '').trim() === 'セット') reason = 'set';
+    else if (normSupplierCode(r['仕入先']) !== barcodeTargetSupplier()) reason = 'not_amc';
+    else reason = 'not_own_product';
+  }
+  return { pmlSynced: true, target: false, reason, code: r ? String(r['商品コード']).trim() : trimS(productCode), name: r ? r['商品名'] || '' : '', vendorCode: null, label };
+}
+
+const labelCols = (l) => (l ? { status: l.status, barcode_value: l.barcodeValue || null, barcode_type: l.barcodeType || null, note: l.note || null, version: l.version } : null);
+
+/**
+ * マスタの入力から 1 件書く = upsertLabel (version の楽観ロック・events) + po_audit_log (だれ・どの画面・前と後・値の出どころ) を 1 つの即時の取引で。
+ *   対象かどうかも同じ取引の中で確かめ直す (対象外 = 409 not_target・何も書かない)。
+ *   pick = 値の出どころ (呼び手が Company DB で確かめた候補・手入力の理由・今の値のまま・空)。記録にそのまま残す
+ * 誤り = Error (status 409 = 版が違う・対象外 / それ以外 = 400)。e.reason・e.current
+ */
+export function writeLabelAudited({ productCode, status, barcodeValue, note, version, actor, via, requestId = null, pick = null }) {
+  if (!Object.hasOwn(BARCODE_VIA, String(via || ''))) throw Object.assign(new Error(`書いた画面 (via) が分からない: ${via}`), { status: 400, reason: 'invalid_input' });
+  const db = getDB();
+  return db.transaction(() => {
+    const t = barcodeTargetOf(productCode);
+    if (!t.target) {
+      throw Object.assign(new Error(`AMC 商品ラベルの対象ではありません: ${BARCODE_TARGET_REASONS[t.reason] || t.reason}`), { status: 409, reason: 'not_target', target_reason: t.reason, current: t.label });
+    }
+    const before = t.label;
+    let r;
+    try {
+      r = upsertLabel({ productKey: t.code, productCode: t.code, status, barcodeValue, note, version, actor, source: 'manual' });
+    } catch (e) {
+      if (e.status === 409) e.reason = 'stale';
+      else { e.status = 400; e.reason = e.reason || 'invalid_input'; }
+      throw e;
+    }
+    audit(db, { actorType: 'user', actor: actor || null, action: 'barcode_label_write', resource: `barcode:${normProductCode(t.code)}`, requestId,
+      detail: { via, code: t.code, before: labelCols(before), after: labelCols(r.label), pick } });
+    return { label: r.label, before };
+  }).immediate();
 }
 
 /** 状態変更履歴 */

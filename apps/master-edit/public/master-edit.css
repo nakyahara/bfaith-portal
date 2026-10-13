@@ -937,6 +937,25 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 .po-foot .hint { margin-right: auto; max-width: 460px; }
 #sec-order.po-dirty { border-color: rgba(255, 200, 87, 0.55); }
 #sec-order .ctl.col > .seg { align-self: flex-start; }
+/* AMC 商品ラベルのバーコード印字 (views/_amc-label.ejs・発注アプリに保存・Company DB構想 21 A1) */
+#sec-amc.po-dirty { border-color: rgba(255, 200, 87, 0.55); }
+#sec-amc .ctl.col > .seg { align-self: flex-start; }
+#sec-amc .amc-lead { margin: -4px 0 12px; color: var(--text2); }
+.amc-off { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; font-size: 14px; }
+.amc-off .hint { flex-basis: 100%; }
+.amc-cands { display: grid; gap: 8px; width: 100%; }
+.amc-cand { display: flex; gap: 12px; align-items: flex-start; padding: 10px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel); cursor: pointer; transition: border-color 0.15s, background 0.15s; min-width: 0; }
+.amc-cand:hover { border-color: var(--line-strong); }
+.amc-cand input { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--accent); flex: none; cursor: pointer; }
+.amc-cand input:disabled { cursor: not-allowed; }
+.amc-cand .body { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; min-width: 0; }
+.amc-cand .v { font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
+.amc-cand .meta { flex-basis: 100%; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.amc-cand.on { border-color: rgba(58, 231, 255, 0.65); background: linear-gradient(135deg, rgba(58, 231, 255, 0.11), rgba(16, 25, 44, 0.75)); box-shadow: 0 0 0 1px rgba(58, 231, 255, 0.18) inset; }
+.amc-cand.keep { border-style: dashed; }
+.amc-ex { padding: 3px 0; overflow-wrap: anywhere; }
+#sec-amc .fmsg:not(:empty) { color: var(--warn); }
+@media (max-width: 760px) { #sec-amc .f, #sec-amc .po-sub .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #sec-amc .amc-cand { min-height: 44px; } #sec-amc .seg button, #amc-save { min-height: 44px; } #sec-amc .po-foot .btn { width: 100%; } }
 /* まとまりの操作の窓 (views/_vops.ejs・PR-7b): 名前を直す・子の廃止・代表の採用 (新商品の登録と商品の画面の両方) */
 .modal.vops { width: min(680px, 94vw); max-height: 90vh; overflow: auto; }
 .modal.vops .opttbl { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 4px 0 10px; }

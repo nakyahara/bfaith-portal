@@ -118,6 +118,8 @@ import {
 import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
 import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, buildHandling, readNeDelOverview, neDelAvailable, hideBackorder, hideBackorderText, NE_DEL_STATUS_WORDS, NE_DEL_KIND_WORDS, NE_DEL_MAX } from '../../lib/master-ne-delete.mjs';
 import { readNeDeleteStock } from './ne-delete-stock.mjs';
+// AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
+import { amcLabelScreen, amcInputOf, verifyAmcPick, writeAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -749,6 +751,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     gone,
     // 🆕 0072: NE から消す (箱 = 依頼の途中の様子・「NE から消す」の画面へ)。0072 の前・読めない = null (出さない)
     nedel: nedel ? { live: nedelLive, canApprove: approverGate(req).ok, STATUS_WORDS: NE_DEL_STATUS_WORDS } : null,
+    // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリに保存・単品で AMC × 自社商品だけ欄を出す)
+    amcLabel: page ? { ...(await amcLabelScreen(req, editorGate(req), db, page.cur)), STATUSES: AMC_STATUSES, WORDS: AMC_STATUS_WORDS, HINTS: AMC_STATUS_HINTS } : null,
     ...pageLocals(req, page ? page.phase : null), ui2: true, nav: 'list', dbError, page, FIELD_DEFS: page ? fieldsOf(page.cur.sku_kind) : {}, REG_FIELDS: page ? (REG_CSV_FIELDS[page.cur.sku_kind] || []) : [], code: req.params.code, fmt, KINDS, STATES, REG_STATES, MAX_COMPONENTS, CARD_STATUS_LABELS, REG_ITEM_STATES,
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null, extras,
     // 発注の設定 (発注アプリ・単品だけ)。発注条件グループは代表の仕入先のものだけ選べる
@@ -935,6 +939,33 @@ router.post('/api/sku/:code/card-link', (req, res) => {
       ambiguous: `同じ商品コードのカードが product-hub に ${(r.draft_ids || []).length} 枚 (${(r.draft_ids || []).map((x) => '#' + x).join('・')}) あります。どれに結ぶか決められないので結んでいません。product-hub で 1 枚に片付けてから「カードをもう一度作る」` }[r.reason] || r.reason;
     res.status(409).json({ ok: false, error: msg, reason: r.reason, draft_id: r.draft_id ?? null, draft_ids: r.draft_ids ?? null });
   }, 'write');
+});
+
+/**
+ * 商品の画面の「AMC 商品ラベルの印字を保存」(Company DB構想 21 A1・発注アプリの po_barcode_labels に書く。Company DB の保存とは別)。
+ * 本文 = { request_id?, version (開いたときの行の版・行が無かった = null), status, note, pick: { kind: fnsku | jan | manual | keep | none, ... } }
+ * 書ける人 = 発注の設定と同じ (名簿 かつ 発注アプリの権限)。商品は Company DB で確かめ (ある・単品)、選んだ候補は Company DB で読み直す (今も有効・この商品に 1 対 1)。
+ * 対象 (AMC × 自社商品) かどうかは書く取引の中で発注アプリの決め方で確かめ直す。読むだけの接続
+ */
+router.post('/api/sku/:code/amc-label', (req, res) => {
+  const og = orderWriteGate(req, editorGate(req));
+  if (!og.ok) return res.status(403).json({ ok: false, error: og.message.replace('発注の設定', 'AMC ラベルの印字'), reason: og.reason });
+  let input;
+  try { input = amcInputOf(req.body); } catch (e) { if (e instanceof AmcLabelError) return res.status(e.status).json(amcErrorBody(e)); throw e; }
+  return withPgApi(res, async (db) => {
+    const sku = (await db.query(`select s.code, s.sku_kind, s.sku_id::text as sku_id, s.product_id::text as product_id from core.skus s
+       where s.company_id = 1 and s.code_norm = core.norm_code($1)`, [String(req.params.code || '')])).rows[0];
+    if (!sku) return res.status(404).json({ ok: false, error: `商品コード ${req.params.code} は Company DB にありません` });
+    if (sku.sku_kind !== 'single') return res.status(400).json({ ok: false, error: 'AMC 商品ラベルは単品だけです (セットのラベルは中身の単品ごと)', reason: 'not_target', target_reason: 'set' });
+    try {
+      const verified = await verifyAmcPick(db, sku, input.pick);
+      const w = writeAmcLabel({ code: sku.code, input, verified, actor: String(req.session.email).trim().toLowerCase() });
+      res.json({ ok: true, label: w.label, pick: verified.audit });
+    } catch (e) {
+      if (e instanceof AmcLabelError || (e && (e.status === 400 || e.status === 409))) return res.status(e.status).json(amcErrorBody(e));
+      throw e;
+    }
+  });
 });
 
 // ─── Amazon SKU の対応 (⑦-1) ───
