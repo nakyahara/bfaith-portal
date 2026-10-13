@@ -158,6 +158,11 @@
           <div class="f" data-row="inbound_date_managed"><div class="lab" id="lab-f-inbound">ロジザードの入荷日の管理</div>
             <div class="ctl"><%- segPart('inbound_date_managed', seg('f-inbound', 'inbound_date_managed', '', [['0', 'なし'], ['1', 'あり']], '入荷日の管理')) %><%- none('inbound_date_managed') %>
               <span class="hint">最初の値だけ · あとはロジザードが正 · 入力なし = 不明のまま</span></div></div>
+          <%# 🆕 0078 (CompanyDB構想 23・中原さん 10/13 夜): ロジザードに送るバーコードの決め方。初めから「自動」(FNSKU → JAN → 空欄) を選んだ形 = いつも値がある (入力なしは無い)。
+              値は CSV を作るときに決まる (FNSKU は Amazon の出品の後に付く)。0078 の前の DB = 自動だけ (固定) %>
+          <div class="f" data-row="logizard_barcode"><div class="lab" id="lab-f-lzbc">ロジザードに送るバーコード</div>
+            <div class="ctl"><% if (locals.lzBarcodeReady) { %><%- seg('f-lzbc', 'logizard_barcode', 'auto', [['auto', '自動', 'おすすめ'], ['fnsku', 'FNSKU'], ['jan', 'JAN'], ['lz_assign', '空欄']], 'ロジザードに送るバーコード') %><% } else { %><span class="lockval" id="f-lzbc-fixed"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg>自動</span><% } %>
+              <span class="hint">JAN の欄とは別 · 自動 = FNSKU があれば FNSKU・無ければ JAN・JAN も無ければ空欄 (ロジザードが番号を付ける) · 値はロジザードに載せるときに決まります · 商品に FNSKU のラベルが付くなら FNSKU · バーコードが無いなら 空欄<%= locals.lzBarcodeReady ? '' : ' · 今は自動だけ (Company DB の準備中)' %></span></div></div>
           <% } %>
         </section>
 

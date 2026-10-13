@@ -502,6 +502,8 @@
     // 発注の設定 (発注アプリ・単品だけ・public/me-order.js)。何も入れていない = 送らない (発注アプリに何も書かない)
     var po = !isSet && ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
+    // 🆕 0078 (CompanyDB構想 23): ロジザードに送るバーコードの決め方 (単品だけ・欄が無い = 0078 の前 = 自動)
+    if (!isSet) out.logizard_barcode = segVal('f-lzbc') || 'auto';
     return out;
   }
 

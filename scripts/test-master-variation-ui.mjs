@@ -547,6 +547,10 @@ await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発
   await p.waitForSelector('#result .result', { timeout: 60000 });
   assert.match(await p.innerText('#result'), /2 件を下書きにしました/);
   assert.deepEqual(bodies[0].blanks, ['cost', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan']);
+  // 🆕 0078: ロジザードに送るバーコード = 初めから「自動」(入力なしの一覧に入らない)・全部の子に 1 行ずつ
+  assert.equal(bodies[0].logizard_barcode, 'auto');
+  assert.deepEqual((await q(`select s.code, r.rule from ops.sku_logizard_barcode_rules r join core.skus s on s.sku_id = r.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK') order by s.code`)).map((r) => [r.code, r.rule]),
+    [['nonegrp-BK', 'auto'], ['nonegrp-WH', 'auto']]);
   // 子ごとの記録 (#1706 Codex R1 M1): 原価・JAN は その子に無いときだけ (WH = 子だけの原価 700・JAN あり / BK = どちらも無い)
   const reasons = Object.fromEntries((await q(`select s.code, e.reason from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK')`)).map((r) => [r.code, r.reason]));
   assert.deepEqual(reasons, {
