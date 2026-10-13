@@ -85,9 +85,10 @@ export function collectJanLinkUnits(db) {
 /** 1 つの単位の行き先を決める (読んだ Company DB の行から)。戻り値 { state, row, value, reason } (全部 null = 印なし) */
 export function decideJanLink(unit, read) {
   const none = { state: null, row: null, value: null, reason: null };
-  if (!unit.phJan) return none;
   const review = (reason) => ({ state: 'needs_review', row: null, value: null, reason });
+  // 大文字小文字だけ違う SKU の行が 2 つ以上 = JAN が空でも選ばずに要確認 (空の JAN より先に見る・Codex #1707 R2 M1)
   if (unit.dup) return review('ph_sku_dup');
+  if (!unit.phJan) return none;
   const r = read.byPair.get(pairKey(unit.code, unit.phJan));
   if (!r) throw new Error(`Company DB の答えに ${unit.code} が無い`);
   let jans = r.jans;
@@ -104,6 +105,7 @@ export function decideJanLink(unit, read) {
 
 const sameTarget = (a, b) => a.state === b.state && a.row === b.row && a.value === b.value && a.reason === b.reason;
 const actionOf = (unit, target) => {
+  if (unit.dup) return sameTarget(unit.cur, target) ? 'same' : 'review';   // 重なる行は空の JAN でも要確認 (前に結んだ空の行も「外す」でなく要確認に)
   if (!unit.phJan) return unit.cur.state || unit.cur.row != null ? 'clear' : 'empty';
   if (sameTarget(unit.cur, target)) return 'same';
   return target.state === 'linked' ? 'link' : 'review';
