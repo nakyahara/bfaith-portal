@@ -591,4 +591,172 @@ export function buildYahooOrder(rows, opts = {}) {
   return { key: `yahoo|main|${no}`, payload, n_lines: lines.length, source_updated_at: su.iso, no_synced_at: su.missing };
 }
 
+// ─── メルカリ shops (2026-10-13 中原さん「メルカリ shops の注文を NE の受注伝票から毎朝入れる」) ───
+/**
+ * メルカリ shops は API の取込が動いていない (raw_mercari_orders = 0 行) → **NE の受注伝票** (raw_ne_order_base + raw_ne_orders の NE 店舗 8 = 雑貨イズムメルカリshops) から作る。
+ * 2026-10-13 の実測 (miniPC の warehouse.db を読むだけ): 店舗 8 の伝票 10,732 (受注日 2024-09-22〜。2025-01 以降 10,713。月 400〜640・1 日 10〜30)・明細 11,152 行・伝票の無い明細 0。
+ *   - 注文の鍵 = **NE の受注番号 = メルカリの注文番号 (order_id)** (NE の受注番号は receive_order_shop_cut_form_id = 店舗の受注番号。22 文字の英数字 '2JY4WJifUnmFpJm5GiXSSX'・全件が受け口の ORDER_NO_RE に合う)
+ *     → mall 'mercari' / scope 'main' / shop_code '8' (core.ne_shops 8。接頭辞なし = 伝票の受注番号そのままで注文に結ばれる)。月次の CSV (apps/mercari-accounting) の「注文番号」/ 注文 CSV の order_id と同じ値
+ *   - 🚨 **注文は「明細の受注番号」でまとめる** (伝票の受注番号ではない): NE の同梱 = 同じ買い手の注文を 1 枚の伝票にまとめると、伝票の受注番号は 1 つだが、明細は元の注文番号を持ったまま載る
+ *     (実測: 87 伝票に別の注文の明細 107 行・106 注文)。同梱元の注文の伝票は取消 (44 行ぶん) か、もう無い (63 行ぶん)。取消の伝票の明細は同梱先の明細と商品・数量が全部同じ (43 / 43 注文)
+ *     → 伝票ごとに注文を作ると、同梱元の注文が「取消」になり、同梱先の注文の数量が増える。明細の受注番号でまとめれば、同梱元は 取消の伝票の明細 (取消の数) + 同梱先の明細 (有効) = 数量は 1 回だけ
+ *     (明細の受注番号が空のときは伝票の受注番号。店舗 8 の伝票の明細だけを読む = 伝票の無い明細 (同梱で消えた伝票の古い明細・取消など 2025 年以降 713 行) は読まない)
+ *   - 注文日時 = その注文の **自分の伝票** (伝票の受注番号 = 注文番号) の受注日の一番早いもの。自分の伝票が無い (同梱で消えた) ときは、明細が載っている伝票の受注日 (= 同梱先の受注日。本当の注文日とずれ得る)
+ *   - 状態 = NE の受注状態区分 → status_source (source_system 'ne' = core.order_status_map 'ne' の 1 / 2 / 20 / 40 / 50)。有効な明細が載る伝票のうち一番手前の状態 (分割で一部だけ出荷済みなら出荷済みにしない)
+ *   - 取消 = 明細ごと (伝票がキャンセル か 明細がキャンセル → 取消の数 = 数量)。**注文の取消 = 明細が全部取消** (明細が無ければ自分の伝票が全部キャンセル)。取消の時刻 = 伝票の受注キャンセル日の一番遅いもの
+ *   - 出荷の時刻 = 有効な明細が載る伝票が全部出荷確定していれば、その一番遅い出荷確定日 (どれかが未出荷なら null)
+ *   - 🚨 **金額は入れない (全部 null・amount_source 'unknown')**: NE の受注金額は信頼できない (数量ベースで使う約束。実測でも小計金額 0 の明細が 75 行) / 本当の金額はメルカリの月次 CSV (apps/mercari-accounting) が別に持つ /
+ *     core.orders の null = 「分からない」(0 円ではない。売上日次は null を 0 として足し「金額の分からない明細」に数える) → **売上日次 (mart.sales_daily) には出さない** (送り手の salesDaily: false)
+ *   - 明細: line_key = '<伝票番号>-<明細行番号>' (同梱・分割で 1 注文の明細が複数の伝票にまたがる) / sku_code = NE の商品コード (Render が core.skus で解決。2025 年以降の 99.5% が m_products に当たる。
+ *     当たらない = 'wakearihin' (訳あり品) など) / listing_code は無い / 商品コードが空の明細 (2 行) は sku_code null で送る (Render が unresolved_code '?' にする。注文ごと捨てない) / qty = 受注数 (欠落は例外) / 税率は null
+ *   - source_updated_at = 伝票と明細の synced_at (UTC) の一番遅いもの
+ */
+export const MERCARI_TRANSFORM_VERSION = 'mercari-ne-orders-1';
+export const MERCARI_NE_SHOP = '8';
+/** 送り手が raw_ne_order_base / raw_ne_orders から読む列 (送り状番号・配送方法・商品名は読まない) */
+export const MERCARI_BASE_COLUMNS = ['伝票番号', '受注番号', '店舗コード', '受注日', '出荷確定日', '受注状態区分', 'キャンセル区分', '受注キャンセル日', 'synced_at'];
+export const MERCARI_LINE_COLUMNS = ['伝票番号', '明細行番号', '受注番号', 'キャンセル区分', '商品コード', '受注数', 'synced_at'];
+/** 注文番号 = 原値のまま (文字列・前後の空白なし)・受け口の ORDER_NO_RE と同じ字種 */
+export const MERCARI_ORDER_NO_RE = /^[0-9A-Za-z][0-9A-Za-z._:-]{0,60}$/;
+export function isMercariOrderNo(v) { return typeof v === 'string' && MERCARI_ORDER_NO_RE.test(v); }
+/** NE の日時 'YYYY-MM-DD HH:MM:SS' (JST) として受けられるか (原値のまま・実在する日時)。範囲の判定と整形が同じ関数を使う */
+export const NE_DT_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
+export function isNeJst(s) { const m = typeof s === 'string' ? NE_DT_RE.exec(s) : null; return !!m && isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6]); }
+const neJstIso = (s, label) => {
+  if (s == null || s === '') return null;
+  if (!isNeJst(s)) throw new Error(`${label}が 'YYYY-MM-DD HH:MM:SS' の実在する日時でない (前後の空白も不可): "${s}"`);
+  return `${s.slice(0, 10)}T${s.slice(11)}+09:00`;
+};
+const isCancelMark = (v) => v === 'キャンセル';
+const cmpSlip = (a, b) => { const x = String(a), y = String(b); return /^\d+$/.test(x) && /^\d+$/.test(y) ? (x.length - y.length || (x < y ? -1 : x > y ? 1 : 0)) : (x < y ? -1 : x > y ? 1 : 0); };
+/** 明細が属する注文の番号 = 明細の受注番号 (空なら伝票の受注番号)。原値を返す (検証は呼ぶ側) */
+export const mercariLineOrderNo = (line, base) => (line.受注番号 == null || line.受注番号 === '' ? base.受注番号 : line.受注番号);
+
+/**
+ * 店舗 8 の伝票と、その明細を、注文 (明細の受注番号) ごとにまとめる。純粋関数。
+ * @param {object[]} bases raw_ne_order_base の行 (店舗 8)
+ * @param {object[]} lines raw_ne_orders の行 (店舗 8 の伝票の明細だけ)
+ * @returns {{ key, no, slips: { base, own: boolean, lines: object[] }[], order_date: string, invalidDate: boolean }[]} 注文番号の順。
+ *   slips = その注文に関わる伝票 (自分の伝票 = own・明細が載る伝票)。lines はその注文の明細だけ。order_date = 範囲の判定に使う ISO (読めなければ '' と invalidDate)
+ */
+export function groupMercariOrders(bases, lines) {
+  const bySlip = new Map();
+  for (const b of bases) bySlip.set(String(b.伝票番号), { base: b, lines: [] });
+  for (const l of lines) { const s = bySlip.get(String(l.伝票番号)); if (s) s.lines.push(l); }
+  const orders = new Map();
+  const slipOf = (no, slip) => {
+    if (!orders.has(no)) orders.set(no, new Map());
+    const m = orders.get(no);
+    if (!m.has(slip)) m.set(slip, { base: bySlip.get(slip).base, own: false, lines: [] });
+    return m.get(slip);
+  };
+  for (const [slip, s] of bySlip) {
+    // 自分の伝票 (明細が 1 つも無くても注文として持つ = 明細がまだ取れていない伝票・同梱で明細が全部よそに移った伝票)
+    const ownNo = s.base.受注番号;
+    const key = typeof ownNo === 'string' ? ownNo : String(ownNo ?? '');
+    slipOf(key, slip).own = true;
+    for (const l of s.lines) { const no = mercariLineOrderNo(l, s.base); slipOf(typeof no === 'string' ? no : String(no ?? ''), slip).lines.push(l); }
+  }
+  const out = [];
+  for (const no of [...orders.keys()].sort()) {
+    const slips = [...orders.get(no).entries()].sort((a, b) => cmpSlip(a[0], b[0])).map(([, v]) => v);
+    let iso = '';
+    try { iso = mercariOrderedAt(slips) || ''; } catch { iso = ''; }
+    // 範囲の判定に使う値 (注文番号・注文日時) が読めない注文は印を付ける = どの mode でも範囲に入れて build が例外にする (黙って範囲の外に落とさない)
+    const rawNos = slips.flatMap((s) => [s.own ? s.base.受注番号 : null, ...s.lines.map((l) => mercariLineOrderNo(l, s.base))]).filter((x) => x != null);
+    const okNo = rawNos.length > 0 && rawNos.every(isMercariOrderNo);
+    out.push({ key: `mercari|main|${no}`, no, slips, order_date: iso, invalidDate: !iso || !okNo });
+  }
+  return out;
+}
+/** 注文日時 = 自分の伝票の受注日の一番早いもの (無ければ明細が載る伝票の受注日の一番早いもの)。どれかが読めなければ例外 */
+export function mercariOrderedAt(slips, no = '') {
+  const own = slips.filter((s) => s.own), pool = own.length ? own : slips.filter((s) => s.lines.length);
+  if (!pool.length) return null;
+  const isos = pool.map((s) => neJstIso(s.base.受注日, `注文 ${no} の伝票 ${s.base.伝票番号} の受注日`));
+  if (isos.some((x) => x == null)) throw new Error(`注文 ${no} の伝票に受注日の無いものがある`);
+  return isos.sort()[0];
+}
+/**
+ * 1 注文 (groupMercariOrders の 1 つ) を送る形に整える。
+ * @param {{ no: string, slips: { base, own, lines }[] }} group
+ * @param {{ fallbackSourceUpdatedAt?: string, stats?: object }} [opts]
+ */
+export function buildMercariOrder(group, opts = {}) {
+  if (!group || !Array.isArray(group.slips) || !group.slips.length) throw new Error('伝票が無い');
+  const no = group.no;
+  if (!isMercariOrderNo(no)) throw new Error(`注文番号の形が違う: "${no}" (前後の空白も不可)`);
+  const stats = opts.stats || null;
+  const bump = (k) => { if (stats) stats[k] = (stats[k] || 0) + 1; };
+  const lines = [];
+  const seen = new Set();
+  const liveSlips = [];
+  let liveLines = 0;   // 取消でない明細の数 (数量 0 の明細も「取消でない」なら数える = cancelled_qty と qty の比較では決めない)
+  for (const s of group.slips) {
+    const b = s.base;
+    const slip = nz(b.伝票番号);
+    if (!slip) throw new Error(`注文 ${no} に伝票番号の無い伝票がある`);
+    if (nz(b.店舗コード) !== MERCARI_NE_SHOP) throw new Error(`注文 ${no} の伝票 ${slip} は店舗 ${b.店舗コード} (メルカリ shops = ${MERCARI_NE_SHOP} だけ)`);
+    if (s.own && b.受注番号 !== no) throw new Error(`注文 ${no} の自分の伝票 ${slip} の受注番号が違う: "${b.受注番号}"`);
+    const slipCancelled = isCancelMark(b.キャンセル区分);
+    let live = 0;
+    for (const l of s.lines) {
+      if (nz(l.伝票番号) !== slip) throw new Error(`注文 ${no} の伝票 ${slip} に別の伝票 ${l.伝票番号} の明細が混ざっている`);
+      if (mercariLineOrderNo(l, b) !== no) throw new Error(`注文 ${no} に別の注文 ${mercariLineOrderNo(l, b)} の明細が混ざっている`);
+      const ln = intOrNull(l.明細行番号, `注文 ${no} の伝票 ${slip} の明細行番号`);
+      if (ln == null || ln < 1) throw new Error(`注文 ${no} の伝票 ${slip} に明細行番号の無い明細がある`);
+      const key = `${slip}-${ln}`;
+      if (seen.has(key)) throw new Error(`注文 ${no} の明細 ${key} が重複している`);
+      seen.add(key);
+      const qty = intOrNull(l.受注数, `注文 ${no} 明細 ${key} の受注数`);
+      if (qty == null || qty < 0) throw new Error(`注文 ${no} 明細 ${key} の受注数が無い (欠落を 0 にしない)`);
+      const cancelled = slipCancelled || isCancelMark(l.キャンセル区分);
+      if (!cancelled) { live++; liveLines++; }
+      const code = nz(l.商品コード);
+      if (!code) bump('noCode');
+      lines.push({
+        line_key: key, listing_code: null, sku_code: code, qty, cancelled_qty: cancelled ? qty : 0,
+        unit_price_jpy: null, line_amount_jpy: null, tax_rate: null, amount_source: 'unknown', source_line_ref: `ne_slip:${slip}|row:${ln}`,
+      });
+    }
+    if (live > 0) liveSlips.push(b);
+    if (!s.own) bump('mergedSlipRefs');   // 同梱: 自分のでない伝票に明細が載っている
+  }
+  if (!lines.length) bump('noLines');
+  lines.sort((a, b) => cmpSlip(a.line_key.split('-')[0], b.line_key.split('-')[0]) || Number(a.line_key.split('-')[1]) - Number(b.line_key.split('-')[1]));
+  const ownSlips = group.slips.filter((s) => s.own).map((s) => s.base);
+  const cancelled = lines.length ? liveLines === 0 : ownSlips.length > 0 && ownSlips.every((b) => isCancelMark(b.キャンセル区分));
+  const statusOf = (b) => { const v = nz(b.受注状態区分); if (v == null || !/^\d{1,3}$/.test(v)) throw new Error(`注文 ${no} の伝票 ${b.伝票番号} の受注状態区分が数字でない: "${b.受注状態区分}"`); return v; };
+  const all = group.slips.map((s) => s.base);
+  for (const b of all) statusOf(b);
+  const status = liveSlips.length ? liveSlips.map(statusOf).sort((a, b) => Number(a) - Number(b))[0] : statusOf([...all].sort((a, b) => cmpSlip(a.伝票番号, b.伝票番号))[all.length - 1]);
+  const shipIsos = liveSlips.map((b) => neJstIso(b.出荷確定日, `注文 ${no} の伝票 ${b.伝票番号} の出荷確定日`));
+  for (const b of all) neJstIso(b.出荷確定日, `注文 ${no} の伝票 ${b.伝票番号} の出荷確定日`);
+  const cancelIsos = all.map((b) => neJstIso(b.受注キャンセル日, `注文 ${no} の伝票 ${b.伝票番号} の受注キャンセル日`)).filter(Boolean).sort();
+  const header = {
+    source_system: 'ne',
+    shop_code: MERCARI_NE_SHOP,
+    ordered_at: mercariOrderedAt(group.slips, no),
+    status_source: status,
+    is_cancelled: cancelled,
+    cancelled_at: cancelled && cancelIsos.length ? cancelIsos[cancelIsos.length - 1] : null,
+    shipped_at_source: !cancelled && shipIsos.length && shipIsos.every(Boolean) ? [...shipIsos].sort()[shipIsos.length - 1] : null,
+    total_amount_jpy: null,
+    items_amount_jpy: null,
+    shipping_fee_jpy: null,
+    shop_coupon_jpy: null,
+    mall_coupon_jpy: null,
+    points_used_jpy: null,
+    amount_source: 'unknown',
+    currency: 'JPY',
+  };
+  if (!header.ordered_at) throw new Error(`注文 ${no} の受注日が無い`);
+  const synced = [...all.map((b) => nz(b.synced_at)), ...group.slips.flatMap((s) => s.lines.map((l) => nz(l.synced_at)))].filter(Boolean).sort();
+  const last = synced.length ? synced[synced.length - 1] : null;
+  let su = last ? utcToIso(last, `注文 ${no} の synced_at`) : null, missing = false;
+  if (!su) { if (!opts.fallbackSourceUpdatedAt) throw new Error(`注文 ${no} に synced_at が 1 つも無い`); su = opts.fallbackSourceUpdatedAt; missing = true; }
+  const payload = { mall: 'mercari', scope_key: 'main', mall_order_no: no, header: { ...header, source_updated_at: su, transform_version: MERCARI_TRANSFORM_VERSION, content_hash: contentHash(header) }, lines };
+  return { key: `mercari|main|${no}`, payload, n_lines: lines.length, source_updated_at: su, no_synced_at: missing };
+}
+
 export { canonicalJson };

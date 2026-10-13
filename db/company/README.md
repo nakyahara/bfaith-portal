@@ -1762,6 +1762,46 @@ node apps\company-db\push\mall-orders.mjs --mall yahoo --mark-backfilled --data-
 
 試験 = `node scripts/test-company-db-orders-push-yahoo.mjs` (10 件: 整形 (金額の区分 = 単価はクーポン後・払った額・ポイント・モール負担は null / 明細の並びとサブコード・税率 / 取消 / 読めない値は例外 / 指紋) / 0031 (有効化・状態の対応表) / 通し (出品と SKU の解決・差分・突合・取消・NE 店舗 2 の伝票との結び・読めない日時と注文番号は 3 mode で ❌))
 
+### メルカリ shops の注文 (2026-10-13。migration は要らない = 0013 のまま)
+
+- **元 = NE の受注伝票** (`raw_ne_order_base` + `raw_ne_orders` の **NE 店舗 8 = 雑貨イズムメルカリshops**)。メルカリの API の取込 (`raw_mercari_orders`) は動いていない (0 行) ので使わない。いま出店していて Company DB に注文が無かった販路はここだけ (中原さん 10/13)。ヤフオク・ラクマ・卸・My Smart Store・d ショッピングは入れない (出店していない)
+- 2026-10-13 の実測 (miniPC の warehouse.db を読むだけ): 店舗 8 の伝票 **10,732** (受注日 2024-09-22〜・2025-01 以降 10,713。月 400〜640・1 日 10〜30)・明細 11,152 行 (1 明細の伝票が 97%)・キャンセルの伝票 87。伝票の無い明細は 0
+- **鍵** = **NE の受注番号 = メルカリの注文番号** (NE の受注番号は店舗の受注番号 = `receive_order_shop_cut_form_id`。22 文字の英数字 `2JY4WJifUnmFpJm5GiXSSX`・全件が受け口の形に合う・ほかの店舗とかぶらない) → `mercari` / `main` / shop_code `'8'`。
+  月次の CSV (`apps/mercari-accounting`) の「注文番号」・注文 CSV の `order_id` と同じ値 = 後で金額を CSV から結べる。伝票との結び = 0013 の core.ne_shops 8 (接頭辞なし) = 伝票の受注番号そのまま
+- 🚨 **注文は「明細の受注番号」でまとめる** (伝票の受注番号ではない): NE で同じ買い手の注文を同梱すると、伝票の受注番号は 1 つだが、明細は元の注文番号のまま載る (実測: 87 伝票に別の注文の明細 107 行・106 注文)。
+  同梱元の注文の伝票は「キャンセル」(44 行ぶん。明細は同梱先と商品・数量が全部同じ) か、もう無い (63 行ぶん)。伝票ごとに注文を作ると、同梱元の注文が取消に見え・同梱先の注文の数量が増える →
+  明細の受注番号でまとめると、同梱元の注文 = 取消の伝票の明細 (取消の数) + 同梱先の明細 (有効) = 数量は 1 回だけ・注文は有効。注文の数 (全期間) = 伝票の受注番号で数えると 10,732 / 明細の受注番号で数えると 10,795
+- **注文日時** = その注文の自分の伝票 (受注番号 = 注文番号) の受注日の一番早いもの。自分の伝票がもう無い同梱元は、明細が載る伝票 (同梱先) の受注日 = 本当の注文日とずれ得る (63 注文。数日以内のはず)
+- **状態** = NE の受注状態区分 (source_system `ne` = 0013 の対応表 `ne`: 1 new / 2 confirmed / 20・40 ready / 50 shipped)。有効な明細が載る伝票のうち一番手前 (分割で一部だけ出荷済みなら出荷済みにしない)。
+  **取消** = 明細ごと (伝票がキャンセル か 明細がキャンセル → 取消の数 = 数量)、**注文の取消 = 明細が全部取消** (ほかのモールと同じ規則 = 取消の注文は is_cancelled・明細の取消の数 = 数量)。出荷の時刻 = 有効な伝票が全部出荷確定したら一番遅い出荷確定日
+- 🚨 **金額は入れない** (ヘッダも明細も全部 null・amount_source `unknown`): NE の受注金額は信頼できない (数量で使う約束。実測でも小計金額 0 の明細が 75 行) / 本当の金額はメルカリの月次の CSV が持つ /
+  core.orders の null = 「分からない」(0 円ではない)。**売上日次 (mart.sales_daily) は作らない** (送り手の `salesDaily: false` = push の後に作り直さない・`--refresh-sales` も断る)。数量と商品はほかのモールと同じに入る
+- **明細**: line_key = `<伝票番号>-<明細行番号>` (同梱・分割で 1 注文の明細が複数の伝票にまたがる) / sku_code = NE の商品コード (Render が core.skus で解決。2025 年以降の明細の 99.5% が m_products に当たる。当たらない = `wakearihin` (訳あり品) など → unresolved_code) / 出品 (listing) は無い / 税率は null。
+  商品コードが空の明細 (2 行) は sku_code null で送る (Render が unresolved_code `?` にする。注文ごと捨てない)。送り状番号・配送方法・商品名・小計金額は読まない
+- **範囲** = 注文日 2025-01-01 以降 (D-28。NE にあるメルカリの一番古い受注は 2024-09-22 = 2025-01-01 のほうが遅い) **または 追跡中 または 2025-01-01 以降に出荷確定した店舗 8 の伝票に載っている注文** (2024 年の受注で 2025 年に出荷した 19 注文)
+- **突合** (`--reconcile`) = 注文日ごとの 注文数 / 明細数 / 商品代 (いつも 0) / 取消の注文数。まとめ方 (同梱・分割) を SQL に書くと長くなるので、miniPC 側は送り手と同じ まとめ方 + 整形 で数える (`dailyLocal`)。整形できない注文があれば ❌
+- **daily-sync** = 「Company DB 出荷 push」の直後に `--mall mercari --incremental --require-backfilled` (NE の取込が失敗した朝は送らない = 出荷 push と同じ)。送った後の伝票との結び直しで今朝の店舗 8 の伝票も結ばれる。
+  初回の投入 → 突合 → `--mark-backfilled` まで「バックフィル前」と出して送らない。送信の失敗は 8:30 / 10:00 / 11:30 の自動再試行に載る (NE の取込は再試行されないので、朝に見送った回は載せない)
+- 🚨 **わかっている穴** (直すなら別の作業):
+  - NE の受注伝票 (raw_ne_order_base) の過去の取り直しは **出荷確定日で** やった (2025-01〜) = 出荷しないまま取り消された 2025-01〜2026-03 ごろの伝票と、2025-07〜08 の出荷済みの伝票 77 行ぶんは raw_ne_order_base に無く、明細 (raw_ne_orders) にだけ残っている (2025 年以降 713 行のうち 649 行は注文番号もほかに無い)。
+    送り手は伝票のある明細しか読まない (同梱で消えた伝票の古い明細を二重に数えない) = **2025-07〜08 のメルカリの注文が約 70 件少なく入る・2026-03 より前の出荷前の取消は入らない**。直すなら NE の受注ベースをその月だけ受注日か更新日で取り直す
+  - 見張り (09) の ORDER_MALLS にはまだ入れていない (W7・W8・W11 のメルカリは別の PR。W8 の「金額不明の明細の割合」はメルカリでは常に 100% = 外す扱いが要る・W11 は同梱元の注文に伝票が結ばれないことを考える)
+
+```
+# 初回 (miniPC の PowerShell。中原さんの OK の後。daily-sync (07:00〜) の動いていない時間に。migration は要らない)
+cd C:\Users\bfaith\bfaith-portal
+node apps\company-db\push\mall-orders.mjs --mall mercari --incremental --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data      # 範囲 約 1.08 万注文・整形できない 0 を確かめる (送らない)
+node apps\company-db\push\mall-orders.mjs --mall mercari --from 2025-01-01 --to 2025-02-28 --no-relink --data-dir C:\Users\bfaith\bfaith-portal\data   # 2 か月ずつ (約 950 注文 / 回)
+node apps\company-db\push\mall-orders.mjs --mall mercari --reconcile --from 2025-01-01 --to 2025-02-28 --data-dir C:\Users\bfaith\bfaith-portal\data    # 1 回目の窓が一致するか
+...  (合っていたら 2025-03-01〜04-30 / 05-01〜06-30 / … / 2026-09-01〜今日。どれも --no-relink)
+node apps\company-db\push\mall-orders.mjs --mall mercari --incremental --no-relink --data-dir C:\Users\bfaith\bfaith-portal\data    # 残り (2024 年の受注で 2025 年に出荷した 19 注文など)
+node apps\company-db\push\mall-orders.mjs --relink                                      # 伝票との結び直しを 1 回 (店舗 8 の約 1.07 万伝票)
+node apps\company-db\push\mall-orders.mjs --mall mercari --reconcile --all --data-dir C:\Users\bfaith\bfaith-portal\data
+node apps\company-db\push\mall-orders.mjs --mall mercari --mark-backfilled --data-dir C:\Users\bfaith\bfaith-portal\data          # 上の突合が一致したのを見てから。翌朝から daily-sync が送る
+```
+
+試験 = `node scripts/test-company-db-orders-push-mercari.mjs` (15 件: 整形 (鍵・金額は null・同梱 (同梱元の伝票が取消 / もう無い)・取消 (伝票・明細・全部・数量 0)・分割・商品コードが空・明細の無い伝票・読めない値は例外・指紋) / 0013 の前提 / 通し (店舗 8 だけ・SKU の解決・NE の状態の対応表・伝票との結び (同梱先は同梱先の注文に)・差分・突合 (dailyLocal)・取消・年またぎ (D-28)・範囲指定・読めない受注日と注文番号は 3 mode で ❌・売上日次を作らない・送り状番号などを読まない) / daily-sync の段と retry の 3 か所)
+
 ## 売上の日次 mart.sales_daily (0021。08 §4.5 / §9 D7a)
 
 注文 (core.orders + 現行の明細) を **注文日 (JST) × モール × scope × shop_code × 出品 × SKU** に集計した表。08 §4.5 の最初の 1 本で、注文別の利益 (`v_order_profit`) は Amazon 財務 (F2b) と広告がそろってから。
