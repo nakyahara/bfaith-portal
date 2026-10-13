@@ -2667,7 +2667,8 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   ③ 代表 (親のある子 = まとまりの記録がある・NE に代表がある親なし = 先に代表の採用) ④ 生きている CSV・NE から消す依頼が無い・コードが 80 字まで (code_length)。fix = `one` / `ne_fill` / `decision` / `after_compare`
 - **一覧** `ops.quarantine_confirm_list(コード | null)` (null = 要確認の全部・500 件を超えたら too_many / コードは 500 件まで) = 一括の inspect と毎朝のまとめ (Q-3・Q-4) の材料
 - **確認** `ops.confirm_quarantined_sku(request_id, 人, 理由, 持ち主表, SKU, check_hash)` (master_edit = 名簿 MASTER_EDITORS の人 = Q1 a)。鍵の後に確かめ直す・画面の表と違う = `stale`・だめ = `not_confirmable`・
-  押し直し = 前の答え (同じ request_id は鍵で直列 = 同時の押し直しも前の答え)。`ops.transition_sku_registration` (0073 の版 + 🆕 0078 のかたまり) は約束 `quarantine_confirm` の中だけ要確認 → NE 確認済みにする (根拠は DB が確かめの表から作る・運用のロールが直に呼んでも断る)。自動では確認しない (Q4 a)
+  押し直し = 前の答え (同じ request_id は鍵で直列 = 同時の押し直しも前の答え)。`ops.transition_sku_registration` (0073 の版 + 🆕 0078 のかたまり) は約束 `quarantine_confirm` の中だけ要確認 → NE 確認済みにする (根拠は DB が確かめの表から作る・運用のロールが直に呼んでも断る)。自動では確認しない (Q4 a)。
+  🚨 **0078 の前に承認した差 (マスタの判断) は、要確認の商品を確認済みにするときにマスタの判断で決め直しが要る** (承認の時の組の記録が無い = 効かない・#1715 Codex R4)
 - 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え → `migrate.mjs --dry-run` (この 1 本だけ・今のデータは何も変えない) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す
   (master_edit に 3 つの関数の実行) → `heavy-entry-manifest.mjs --verify` → 次の朝の照合 ② の後に `select ops.quarantine_confirm_list(null)` (watcher) で 42 件の表を見る。画面 (Q-2・Q-3) は別の PR
 - 試験 = `node scripts/test-master-quarantine-confirm.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-quarantine-confirm-pg.mjs` (本物のログイン・並ぶ取引)

@@ -63,8 +63,8 @@ comment on view ops.v_ne_reg_targets is '翌朝の照合 ② が NE の完全な
 --   書くのは承認の出来事の insert の後の trigger だけ (どの書き手も = 判断の画面 apps/master-decisions/decide.mjs の applyDecisions・持ち主の手)。
 --   確認 (ops.quarantine_confirm_check) は「承認の時の組 = 今の組 (今日の社内の値 ↔ 最新の観測の値)」のときだけ承認を効かせる = 候補の行ではなく承認に結びつける。
 --   組の記録が無い承認は効かせない。
--- 🚨 前からある承認 (0078 の前) = 下で、その候補の今の print から入れる。候補の print は 0032 の trg_mdc_guard が作った時から変えさせない (不変の列) =
---    承認の時の print と同じ (この表を作る取引の中で入れる)
+-- 🚨 前からある承認 (0078 の前) には組を入れない (#1715 Codex R4 High・coordinator の判断 = 安全側): 0033〜0077 を通って承認の時と同じ print のままだったと
+--    実証できない = 効かせない。確認の表は「承認の時の組の記録が無い (マスタの判断で決め直す)」と出す → 判断の画面で決め直すと新しい承認に組が残って効く
 create table ops.master_decision_approval_prints (
   event_id    bigint primary key references ops.master_decision_events (event_id),
   fingerprint text not null references ops.master_decision_candidates (fingerprint),
@@ -97,14 +97,6 @@ begin
 end $$;
 revoke all on function ops.record_master_decision_approval_print() from public;
 create trigger trg_mde_approval_print after insert on ops.master_decision_events for each row execute function ops.record_master_decision_approval_print();
--- 前からある承認 (候補の print は不変 = 承認の時と同じ)
-select pg_catalog.set_config('ops.approval_print_protocol', '1', true);
-insert into ops.master_decision_approval_prints (event_id, fingerprint, print_c, print_n)
-  select e.event_id, e.fingerprint, coalesce(c.print -> 'c', 'null'::jsonb), coalesce(c.print -> 'n', 'null'::jsonb)
-    from ops.master_decision_events e join ops.master_decision_candidates c on c.fingerprint = e.fingerprint
-   where e.kind = 'approved'
-  on conflict (event_id) do nothing;
-select pg_catalog.set_config('ops.approval_print_protocol', '', true);
 
 -- ═══════════ 2. 確認済みにしてよいかの表 (読むだけ) ═══════════
 /** 表の 1 行 ({ key, ok, cdb, ne, text, fix })。fix = 直し方の組 (ok = null) */
@@ -341,7 +333,10 @@ begin
       case when s.set_sales_class_override between 1 and 4 then '売上分類の上書きがある' when v_sales is not null then '売上分類を構成品から導ける'
            else '構成品から売上分類を導けない (上書きを入れる)' end, 'one');
     -- 今日の原価 = 構成品の合計 (set_calc / COMPLETE・円に丸めて同じ) か例外原価 (manual / OVERRIDDEN)
-    --   #1715 Codex R1 M1・R2 M1: どちらの分岐も 1 円以上 (0 円は通さない = 単品と同じ)
+    --   #1715 Codex R1 M1・R2 M1: どちらの分岐も 1 円以上 (0 円は通さない = 単品と同じ)。
+    --   #1715 Codex R4: set_calc の分岐は v_all (構成品の今日の原価が全部 > 0) のときだけ = 原価は円の整数 (core.sku_costs.cost_jpy bigint・>= 0)・
+    --     数量は 1 以上の整数 (core.sku_components.qty integer・check qty > 0) = 合計は必ず 1 円以上 (丸めの後も)。共通の 1 円以上は例外原価 (manual) の 0 円と、
+    --     その前提 (型・CHECK) が変わったときの守り (試験 [C12] が型と CHECK を固定する)
     v_ok := v_cost.cost_jpy >= 1
             and ((v_cost.cost_source = 'set_calc' and v_cost.cost_status = 'COMPLETE' and coalesce(v_all, false) and v_cost.cost_jpy = pg_catalog.round(pg_catalog.round(v_sum, 2), 0))
                  or (v_cost.cost_source = 'manual' and v_cost.cost_status = 'OVERRIDDEN'));

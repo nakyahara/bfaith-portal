@@ -453,7 +453,11 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
     await pg.query('alter table ops.master_decision_events enable trigger trg_mde_approval_print');
     const c7 = await check('q03');
     assert.deepEqual(bad(c7), ['ne.cost']);
-    assert.match(itemOf(c7, 'ne.cost').text, /承認の時の組の記録が無い/);
+    assert.match(itemOf(c7, 'ne.cost').text, /承認の時の組の記録が無い \(マスタの判断で決め直す\)/);
+    assert.equal(itemOf(c7, 'ne.cost').fix, 'decision');
+    // 決め直す (今の判断の画面と同じ = 承認の出来事を書く → trigger が組を残す) = 効く
+    await approve(cc.fingerprint, 'accept_difference');
+    assert.equal((await check('q03')).ok, true);
     await pg.query('rollback to savepoint s7');
     for (const kind of ['rejected', 'revoked']) {
       await pg.query('savepoint s');
@@ -605,6 +609,23 @@ await ta('[C9] 一覧: null = 要確認の全部 (コードの順) / コード =
   assert.match(e?.message ?? '', /invalid_input/);
 });
 
+await ta('[C12] セットの原価の前提を固定: 構成の数量 = 1 以上の整数 (integer・CHECK qty > 0)・原価 = 円の整数 (bigint・CHECK >= 0) = set_calc (構成品の原価が全部 > 0) の合計は必ず 1 円以上 (#1715 Codex R4)', async () => {
+  const col = async (tbl, c) => one(`select data_type from information_schema.columns where table_schema = 'core' and table_name = $1 and column_name = $2`, [tbl, c]);
+  assert.equal((await col('sku_components', 'qty')).data_type, 'integer');
+  assert.equal((await col('sku_costs', 'cost_jpy')).data_type, 'bigint');
+  const checks = async (tbl) => (await q(`select pg_get_constraintdef(c.oid) as d from pg_constraint c where c.conrelid = $1::regclass and c.contype = 'c'`, [`core.${tbl}`])).map((r) => r.d);
+  assert.ok((await checks('sku_components')).some((d) => /\(qty > 0\)/.test(d)), JSON.stringify(await checks('sku_components')));
+  assert.ok((await checks('sku_costs')).some((d) => /\(cost_jpy >= 0\)/.test(d)), JSON.stringify(await checks('sku_costs')));
+  // 小数・0 の数量は入らない (= 正の小数の合計 1 円未満は作れない)
+  await rolledBack(async () => {
+    const qs1 = await sid('qs1');
+    assert.ok(await errOf(() => q('update core.sku_components set qty = 0 where parent_sku_id = $1', [qs1])));
+  });
+  await rolledBack(async () => {
+    await q('update core.sku_components set qty = 1.4 where parent_sku_id = $1 and child_sku_id = $2', [await sid('qs1'), await sid('a02')]);
+    assert.equal((await one('select qty from core.sku_components where parent_sku_id = $1 and child_sku_id = $2', [await sid('qs1'), await sid('a02')])).qty, 1);   // 整数に丸まる
+  });
+});
 await ta('[C10] 一覧 (null) は要確認が 500 件を超えたら too_many (#1715 Codex R1 M3)・コードを渡せば読める', async () => {
   await rolledBack(async () => {
     await q(`with p as (insert into core.products (company_id, display_code, name, status, sales_class) select 1, 'bulk' || g, 'bulk' || g, 'active', 3 from generate_series(1, 495) g returning product_id, display_code)
@@ -833,7 +854,7 @@ await ta('[R2] 0078 の security definer の関数 = search_path は pg_catalog,
   }
 });
 
-await ta('[R3] 0078 の前からある承認 = 当てる時に候補の print (不変) から承認の時の組を入れる (#1715 Codex R3 High)', async () => {
+await ta('[R3] 0078 の前からある承認には承認の時の組を入れない = 効かない (決め直しが要る・#1715 Codex R4 High)・0078 の後の承認は組が残る', async () => {
   const pg2 = new PGlite();
   const db2 = pgliteAdapter(pg2);
   const before = migFiles.filter((f) => f.slice(0, 4) < THIS_V).pop().slice(0, 4);
@@ -845,7 +866,9 @@ await ta('[R3] 0078 の前からある承認 = 当てる時に候補の print (�
   const ev = (await pg2.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, actor_type, actor) values ($1, 'approved', 'accept_difference', 'user', 'naka@test') returning event_id`, [c0.fingerprint])).rows[0].event_id;
   await pg2.query(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor) values ($1, 'revoked', 'user', 'naka@test')`, [c0.fingerprint]);
   await applyMigrations(db2, { log: quiet });
-  assert.deepEqual((await pg2.query('select event_id::text as e, print_c, print_n from ops.master_decision_approval_prints')).rows, [{ e: String(ev), print_c: 10, print_n: 9 }]);
+  assert.deepEqual((await pg2.query('select event_id::text as e from ops.master_decision_approval_prints')).rows, [], `前からの承認 ${ev} に組を入れた`);
+  const ev2 = (await pg2.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, actor_type, actor) values ($1, 'approved', 'accept_difference', 'user', 'naka@test') returning event_id`, [c0.fingerprint])).rows[0].event_id;
+  assert.deepEqual((await pg2.query('select event_id::text as e, print_c, print_n from ops.master_decision_approval_prints')).rows, [{ e: String(ev2), print_c: 10, print_n: 9 }]);
   await pg2.close();
 });
 
