@@ -120,7 +120,7 @@ begin
                                  and e.system = 'amazon' and e.id_kind = 'fnsku' and e.valid_to is null and e.external_norm = core.norm_code(p_pinned)
         where lc.company_id = 1 and lc.sku_id = p_sku_id and lc.qty = 1
           -- 出品の構成がこの SKU 1 個だけ (同じ FNSKU が 2 つの出品に付くことは無い = 0002 の ux_external_ids_active)
-          and (select pg_catalog.count(*) from core.listing_components x where x.listing_id = l.listing_id) = 1) then
+          and (select pg_catalog.count(*) from core.listing_components x where x.company_id = l.company_id and x.listing_id = l.listing_id) = 1) then   -- 同じ会社の構成だけ数える (Codex PR R3 M1)
     raise exception 'pinned_not_candidate: FNSKU % はこの商品だけの Amazon 日本の出品の今の FNSKU ではない', p_pinned using errcode = '22023';
   end if;
   -- 今の一番新しい行と同じ = 書かない

@@ -172,12 +172,13 @@ export function buildLzCsv(items, kind) {
  *   要確認・待つ・決め方なし = 行を作らない (理由 = barcode_hold)。両方・形の違う値 = 例外で止める (黙って空欄にしない = 空欄はロジザードが別の番号を付ける)
  */
 function newBarcodeProblem(it) {
-  // 有る / 無いは「欄があるか」で見る (Codex PR R2 M1: { barcode: null } を「無い」= 空欄にしない)
-  const has = (k) => Object.prototype.hasOwnProperty.call(it, k) && it[k] !== undefined;
+  // 有る / 無いは「欄があるか」だけで見る (Codex PR R2 M1: { barcode: null } / R3 M2: { barcode: undefined } を「無い」= 空欄にしない)。
+  //   影運転 (今と同じ空) は 2 つの欄が本当に無いときだけ。欄があれば値が undefined でも下の確かめで例外
+  const has = (k) => Object.prototype.hasOwnProperty.call(it, k);
   const hasHold = has('barcode_hold'), hasCode = has('barcode');
   if (hasHold && hasCode) throw new Error(`新商品 ${it.ne_code}: barcode と barcode_hold の両方がある`);
   if (hasHold) {
-    if (!LZ_BARCODE_HOLDS.includes(it.barcode_hold)) throw new Error(`新商品 ${it.ne_code}: 知らない barcode_hold ${String(it.barcode_hold).slice(0, 40)}`);
+    if (typeof it.barcode_hold !== 'string' || !LZ_BARCODE_HOLDS.includes(it.barcode_hold)) throw new Error(`新商品 ${it.ne_code}: 知らない barcode_hold ${String(it.barcode_hold).slice(0, 40)}`);
     return it.barcode_hold;
   }
   if (hasCode && (typeof it.barcode !== 'string' || !lzBarcodeValueOk(it.barcode))) throw new Error(`新商品 ${it.ne_code}: バーコードの形が違う (${String(it.barcode).slice(0, 40)})`);

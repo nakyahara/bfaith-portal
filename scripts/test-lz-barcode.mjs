@@ -128,6 +128,10 @@ await ta('[C2] 渡し方の誤り = 例外 (両方・形の違う値・知らな
   assert.throws(() => LZ.buildLzCsv([item('b4', { barcode_hold: 'later' })], 'new'), /知らない barcode_hold/);
   assert.throws(() => LZ.buildLzCsv([item('b5', { barcode_hold: 'lz_barcode_typo' })], 'new'), /知らない barcode_hold/, '決まった 3 つ以外の理由を受けた');
   assert.throws(() => LZ.buildLzCsv([item('b6', { barcode: null })], 'new'), /バーコードの形が違う/, '{ barcode: null } を空欄にした');
+  // Codex PR R3 M2: 欄があって値が undefined = 例外 (空欄の行 = ロジザードの自動採番にしない)・影運転は 2 つの欄が本当に無いときだけ
+  assert.throws(() => LZ.buildLzCsv([item('b8', { barcode: undefined })], 'new'), /バーコードの形が違う/, '{ barcode: undefined } を空欄にした');
+  assert.throws(() => LZ.buildLzCsv([item('b9', { barcode_hold: undefined })], 'new'), /知らない barcode_hold/, '{ barcode_hold: undefined } を空欄にした');
+  assert.throws(() => LZ.buildLzCsv([item('b10', { barcode: undefined, barcode_hold: undefined })], 'new'), /両方がある/);
   assert.throws(() => LZ.buildLzCsv([item('b7', { barcode: F1, barcode_hold: 'lz_barcode_waiting', ne_code: null })], 'new'), /両方がある/, '元のコードが無い項目の誤った渡し方を見逃した');
   assert.deepEqual(LB.lzCsvBarcodeOf(LB.pickLogizardBarcode('fnsku', c())), { barcode_hold: 'lz_barcode_waiting' });
   const d = LZ.buildLzCsv([item('d1', { barcode: F1 })], 'daily');
@@ -265,6 +269,32 @@ await ta('[F2] 選んだ 1 本: JS が出した候補は全部 DB でも選べ�
   const lz2 = (await read(['lz2'])).get(ids.lz2);
   assert.deepEqual([lz2.rule, lz2.pick.state, lz2.pick.value], ['fnsku', 'fnsku', lz2.pinned]);
 });
+await ta('[F4] 会社をまたいで構成を数えない (Codex PR R3 M1): 会社 2 の構成の行が同じ listing_id にあっても、会社 1 の 1 個だけの出品の FNSKU は候補のまま・DB でも選べる', async () => {
+  // listing_id は全体で 1 つ (identity) + FK (company_id, listing_id) = ふつうは作れない形 → 試験だけ FK の trigger を止めて作る (持ち主の接続の superuser で・終わったら消す)
+  const L = (await q("select listing_id::text as id from core.listings where listing_code = 'pr_lz1'"))[0].id;
+  await pg.query('reset role');
+  try {
+    await pg.query("insert into core.companies (company_id, name, kind) values (2, '試験の子会社', 'subsidiary') on conflict do nothing");
+    await pg.query("set session_replication_role = replica");
+    const s2 = (await pg.query("insert into core.skus (company_id, sku_kind, code, name) values (2, 'set', 'c2-lz1', 'c2-lz1') returning sku_id::text as id")).rows[0].id;
+    await pg.query("insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type, resolved_by_id) values (2, $1, $2, 1, 0, 'manual', 'human', 'test')", [L, s2]);
+    await pg.query("set session_replication_role = origin");
+    assert.equal((await pg.query('select count(*)::int as n from core.listing_components where listing_id = $1', [L])).rows[0].n, 2, '会社 2 の構成の行を作れなかった');
+    const m = (await read(['lz1'])).get(ids.lz1);   // read・setRule は master_edit で流して持ち主 (deploy) に戻る
+    assert.deepEqual(m.candidates.fnskus.map((x) => x.value), ['X00LZ10001'], '会社 2 の構成まで数えて「組んだ出品」にした');
+    const r = await setRule('lz1', 'fnsku', { pinned: 'X00LZ10001', seenRow: await latestRow('lz1') });
+    assert.equal(r.pinned, 'X00LZ10001', 'DB が会社 2 の構成まで数えた');
+    await pg.query('reset role');
+    await pg.query("set session_replication_role = replica");
+    await pg.query('delete from core.listing_components where company_id = 2');
+    await pg.query('delete from core.skus where company_id = 2');
+  } finally {
+    await pg.query('reset role');
+    await pg.query("set session_replication_role = origin");
+    await pg.query('set role deploy');
+  }
+});
+
 await ta('[F3] セット = not_single・無い SKU = invalid_input・人の形 = invalid_input', async () => {
   let e = await pgErr(setRule('set1', 'auto'));
   assert.equal(e && e.reason, 'not_single');
