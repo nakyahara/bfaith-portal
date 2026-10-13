@@ -172,14 +172,10 @@ begin
     end if;
     return v_req.result || pg_catalog.jsonb_build_object('replayed', true);
   end if;
+  -- 🆕 #1719 Codex R7 Low: 控えの無い行 (0078 の決め方の行など) と同じ request_id = 同じ要求か確かめられない = 再送として扱わず断る
   select * into v_prev from ops.sku_logizard_barcode_rules r where r.request_id = p_request_id and r.sku_id = p_sku_id;
   if v_prev.rule_row is not null then
-    if v_prev.actor_id is distinct from p_actor_id or v_prev.rule is distinct from p_kind or v_prev.value is distinct from p_value or v_prev.via is distinct from p_via then
-      raise exception 'request_id_reused: request_id % はほかの人・中身で使われている', p_request_id using errcode = '23505';
-    end if;
-    -- 答えの印は前に残した結果と時刻から (#1719 R2 Low: 押し直しの今の写しで作らない)
-    return pg_catalog.jsonb_build_object('ok', true, 'sku_id', p_sku_id::text, 'kind', v_prev.rule, 'value', v_prev.value, 'lz_copy_state', v_prev.lz_copy_state,
-      'lz_copy_as_of', v_prev.lz_copy_as_of, 'changed', true, 'rule_row', v_prev.rule_row::text, 'replayed', true);
+    raise exception 'request_id_reused: request_id % は前の行 (答えの控えが無い) で使われている', p_request_id using errcode = '23505';
   end if;
   select k.sku_id, k.company_id, k.sku_kind, r.state as reg into s from core.skus k left join ops.master_registrations r on r.sku_id = k.sku_id where k.sku_id = p_sku_id;
   if s.sku_id is null or s.company_id <> 1 then raise exception 'invalid_input: SKU % が Company DB に無い', p_sku_id using errcode = '22023'; end if;

@@ -203,6 +203,23 @@ await ta('[F4] 0078 の「決め方」だけの行 (auto・値の無い fnsku) =
   const r2 = await read('lz5');
   assert.deepEqual([r2.kind, r2.value, r2.legacy, r2.lz_copy_state, r2.unchecked], ['lz_assign', null, false, null, null]);
 });
+await ta('[F8] 控えの無い前の行 (0078 の決め方の行) と同じ request_id = 再送として扱わない = request_id_reused (#1719 R7 Low)', async () => {
+  const rid = uuid();
+  await pg.query('reset role');
+  try {
+    await pg.query("set ops.logizard_barcode_protocol = '1'");
+    await pg.query("insert into ops.sku_logizard_barcode_rules (sku_id, rule, via, actor_id, request_id, db_user) values ($1, 'lz_assign', 'sku_page', 'naka@test', $2, 'master_edit')", [ids.lz5, rid]);
+    await pg.query("set ops.logizard_barcode_protocol = ''");
+  } finally { await pg.query('set role deploy'); }
+  const n0 = (await rowsOf('lz5')).length;
+  // 同じ人・同じ中身 (空欄・商品の画面) でも、控えが無い = 断る (前の答えを返さない)
+  const e = await pgErr(setBc('lz5', 'lz_assign', null, { requestId: rid, seenRow: await latestRow('lz5') }));
+  assert.equal(e && e.reason, 'request_id_reused');
+  assert.equal((await rowsOf('lz5')).length, n0);
+  // 新しい request_id = ふつうに通る (今と同じ空欄 = 書かない)
+  const ok = await setBc('lz5', 'lz_assign', null, { seenRow: await latestRow('lz5') });
+  assert.deepEqual([ok.ok, ok.changed, ok.replayed ?? false], [true, false, false]);
+});
 await ta('[F5] 写しと照らした結果 (#1719 R1 High 2): 値の行に残る (checked / unavailable / empty / stale・写しの時刻)・照らせていない = 一言・照らせた = 一言なし・同じ値でも照らせたら書く', async () => {
   // #1719 R2 Medium 1: checked = 新しい時刻・stale = 36 時間より前の時刻・unavailable / empty = 時刻なし
   const at = '2025-01-04T12:00:00.000Z', fresh = () => new Date(Date.now() - 3600e3).toISOString();

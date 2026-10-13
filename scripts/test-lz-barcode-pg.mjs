@@ -178,6 +178,56 @@ try {
     assert.deepEqual([ra.j.changed, rb.j.rule_row], [true, ra.j.rule_row]);
     assert.equal(await lzCount('X00LZPG003'), 1);
   });
+  // [4] の注: 今は ops.variation_batch_open が親子の鍵 (core.parent_lock_key) を取引の終わりまで持つ = まとまりの登録どうしは先に 1 つずつになる。
+  //   値の鍵を先に並べ替えて取る (lockLzValuesInTx) はその上の守り (親子の鍵の取り方が変わっても値の鍵で取り合わない) = 部品そのものは [5] で確かめる
+  await ta('[4] まとまりを 2 つ同時に登録 (値の順が [A, B] と [B, A]・#1719 R7): デッドロックしない = 片方 200・もう片方 409 lzbc_taken (何も残さない)', async () => {
+    BC = [];
+    const A = 'X00LZPGA01', B = 'X00LZPGB01';
+    const two = (group, v1, v2) => {
+      const b = variation(group, v1);
+      b.children[1].lz_barcode = { kind: 'value', value: v2 };
+      b.blanks = RB.missingBlankKeys('variation', b, { orderApplicable: true });
+      return b;
+    };
+    const waiting = async () => (await q("select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted"))[0].n;
+    const until = async (n) => { for (let i = 0; i < 200 && (await waiting()) < n; i++) await sleep(50); assert.ok((await waiting()) >= n, `鍵を待つ要求が ${n} にならない`); };
+    // 外で B の鍵を持つ = 2 つの登録を「値の鍵のところ」で重ねる
+    const X = await open(null);
+    clients.push(X);
+    await X.query("select pg_advisory_lock(hashtextextended('ops.lzbc:' || $1::text, 0))", [B]);
+    const r2 = launch(post('/api/new/variation', two('lzpgd2', B, A)));   // [B, A]
+    await until(1);
+    const r1 = launch(post('/api/new/variation', two('lzpgd1', A, B)));   // [A, B]
+    await until(2);
+    await X.query("select pg_advisory_unlock(hashtextextended('ops.lzbc:' || $1::text, 0))", [B]);
+    const res = [await r1.promise, await r2.promise];
+    const ok = res.filter((r) => r.status === 200), taken = res.filter((r) => r.status === 409 && r.j && r.j.reason === 'lzbc_taken');
+    assert.deepEqual([ok.length, taken.length], [1, 1], res.map((r) => r.text).join(' / '));
+    assert.equal(await lzCount(A) + await lzCount(B), 2);
+    const lost = taken[0] === res[0] ? 'lzpgd1' : 'lzpgd2';
+    assert.equal((await q('select count(*)::int as n from core.skus where code like $1', [`${lost}-%`]))[0].n, 0, '断られた登録の子が残った');
+  });
+  await ta('[5] 値の鍵を先に取る部品 (lockLzValuesInTx・#1719 R7): 2 つの取引が [B, A] と [A, B] で取っても、並べ替えた順で取る = デッドロックしない (画面のロール)', async () => {
+    const LB = await import('../lib/logizard-barcode.mjs');
+    const A = 'X00LZPGA05', B = 'X00LZPGB05';
+    const waiting = async () => (await q("select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted"))[0].n;
+    const until = async (n) => { for (let i = 0; i < 200 && (await waiting()) < n; i++) await sleep(50); assert.ok((await waiting()) >= n, `鍵を待つ取引が ${n} にならない`); };
+    const [X, T1, T2] = [await open(null), await open('master_edit'), await open('master_edit')];
+    clients.push(X, T1, T2);
+    const tx = (c, vals) => (async () => {
+      await c.query('begin');
+      try { const got = await LB.lockLzValuesInTx(pgAdapter(c), vals); await c.query('commit'); return got; } catch (e) { try { await c.query('rollback'); } catch { /* */ } throw e; }
+    })().then((v) => ({ ok: v }), (e) => ({ err: e }));
+    await X.query("select pg_advisory_lock(hashtextextended('ops.lzbc:' || $1::text, 0))", [B]);
+    const r2 = launch(tx(T2, [B, A]));
+    await until(1);
+    const r1 = launch(tx(T1, [A, B, A]));
+    await until(2);
+    await X.query("select pg_advisory_unlock(hashtextextended('ops.lzbc:' || $1::text, 0))", [B]);
+    const [a1, a2] = [await r1.promise, await r2.promise];
+    assert.ok(!a1.err && !a2.err, `${a1.err?.code} ${a1.err?.message} / ${a2.err?.code} ${a2.err?.message}`);
+    assert.deepEqual([a1.ok, a2.ok], [[A, B], [A, B]], '並べ替えた順・重なりは 1 つ');
+  });
 } finally {
   if (server) server.close();
   for (const c of clients) { try { await c.end(); } catch { /* */ } }
