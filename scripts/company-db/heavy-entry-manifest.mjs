@@ -73,6 +73,7 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   { sig: 'ops.cutover_ts_between(text, timestamp with time zone, timestamp with time zone)', cls: 'light', public: true, reason: '文字の時刻の判定 (表を読まない)' },
   { sig: 'ops.claim_card_events(text, text, uuid, bigint, integer, integer, integer)', cls: 'light', public: false, reason: 'カードの出来事を件数の上限つきで借りる (SECURITY DEFINER・PUBLIC なし)' },
   { sig: 'ops.claim_outbox_events(text, text, text, uuid, bigint, integer, integer, integer)', cls: 'light', public: false, since: '0066', reason: '名前空間つきの知らせを件数の上限つきで借りる (0066・SECURITY DEFINER・PUBLIC なし)' },
+  { sig: 'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer)', cls: 'light', public: false, since: '0075', reason: '発注の設定の知らせを件数の上限 (200) つきで借りる (0075・SECURITY DEFINER・PUBLIC なし・master_edit と持ち主 = 夜間ロードの後ろの段)。知らせの表は新商品の数 (少数)・開いている知らせの部分 index' },
 ]);
 
 export const MANIFEST_CLASSES = Object.freeze(['revoke', 'guard_later', 'light']);
@@ -98,6 +99,7 @@ export const HEAVY_VIEWS = Object.freeze([
   { view: 'mart.v_purchase_backorder_by_sku', cls: 'light', reason: '発注残 (SKU の大きさ)' },
   { view: 'ops.v_ne_reg_targets', cls: 'light', reason: 'NE 登録の対象 (少数)' },
   { view: 'ops.v_product_hub_outbox_open', cls: 'light', reason: '開いている outbox (少数)' },
+  { view: 'ops.v_order_settings_outbox_open', cls: 'light', since: '0075', reason: '届いていない発注の設定の知らせ (0075・少数・開いている知らせの部分 index)' },
   { view: 'ops.v_sku_available', cls: 'light', reason: 'SKU の使える状態 (SKU の大きさ)' },
   { view: 'ops.v_sku_distributable', cls: 'light', reason: '配れる SKU (SKU の大きさ)' },
 ]);
@@ -179,7 +181,11 @@ export async function heavyEntryFindings(db) {
   }
   for (const v of HEAVY_VIEWS) {
     if (!['heavy', 'light'].includes(v.cls) || !v.reason) findings.push(`view の一覧の形が不正: ${v.view}`);
-    if ((await q('select to_regclass($1)::oid::text as o', [v.view]))[0].o == null) findings.push(`view の一覧の view が DB に無い: ${v.view}`);
+    if ((await q('select to_regclass($1)::oid::text as o', [v.view]))[0].o == null) {
+      // 🆕 0075: since = その migration で足した view。まだ流していない DB では「無い」を問題にしない (関数の since と同じ)
+      if (v.since && !(await q('select exists (select 1 from ops.schema_migrations where version = $1) as ok', [v.since]))[0].ok) continue;
+      findings.push(`view の一覧の view が DB に無い: ${v.view}`);
+    }
   }
   const views = (await q(`select n.nspname || '.' || c.relname as v from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('v', 'm') and n.nspname = any($1::text[]) order by 1`, [VIEW_SCHEMAS])).map((r) => r.v);
   const listed = new Set(HEAVY_VIEWS.map((v) => v.view));

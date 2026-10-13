@@ -1056,3 +1056,14 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .csug { max-height: min(360px, 55vh); }
 }
 @media (prefers-reduced-motion: reduce) { .csug { animation: none; } }
+/* 🆕 0075: 発注の設定の届け待ち (上の帯の件数・届け待ちの画面の行) */
+.poq-pill { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px; border-radius: 999px; font-size: 13px; font-weight: 600; color: var(--warn); background: var(--warn-bg); border: 1px solid rgba(255, 200, 87, 0.4); text-decoration: none; white-space: nowrap; }
+.poq-pill.late { color: var(--err); background: var(--err-bg); border-color: rgba(255, 112, 133, 0.45); }
+.poq-pill .ic { width: 15px; height: 15px; }
+.poq-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(150px, auto) minmax(0, 1.2fr) minmax(0, 1.4fr) auto; gap: 12px; align-items: center; padding: 9px 12px; border-radius: 10px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--line-soft); margin-bottom: 6px; font-size: 14px; }
+.poq-row .code { font-family: var(--mono); color: var(--accent); overflow-wrap: anywhere; }
+.poq-row .poq-err { font-size: 12.5px; color: var(--text2); overflow-wrap: anywhere; }
+.poq-row .poq-act { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.poq-row .poq-reason { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.poq-row .poq-reason input { min-width: 240px; }
+@media (max-width: 900px) { .poq-row { grid-template-columns: 1fr auto; } .poq-row .muted, .poq-row .poq-err { grid-column: 1 / -1; } }

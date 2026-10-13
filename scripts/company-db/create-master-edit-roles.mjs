@@ -43,6 +43,7 @@
  *   まとまりの知らせを書く部品 (ops.enqueue_group_snapshot)・形 / 値の確かめ・insert の trigger はだれにも渡さない
  * 🆕 0071 (新商品の下書きを消す): master_edit に ops.cancel_sku_draft と確かめ ops.sku_draft_cancel_check の実行 (DRAFT_CANCEL_FUNCTIONS)。表の権限は足さない (関数の中だけで書く)
  * 🆕 0074 (Amazon の出品一覧・まだつないでいない SKU): master_edit に 3 つの表の select (AMAZON_LISTING_SELECT) と、隠す・最後に売れた日の関数の実行 (AMAZON_LISTING_EDIT_FUNCTIONS)
+ * 🆕 0075 (発注の設定の知らせ): master_edit に知らせの表と view の select (ORDER_OUTBOX_SELECT) と、積む・借りる・結果を書く・閉じる の実行 (ORDER_OUTBOX_EDIT_FUNCTIONS)
  * 🆕 0067 (Company DB構想 20 の PR-5・まとまりの DB): master_edit にまとまりの 5 つの関数 (まとめての登録を開く / 閉じる・子の廃止・名前を直す・
  *   quarantined の代表の採用) と確かめの 4 つ (新しいまとまりのコードの決まり・products.parent が company か・子の request_id・子の数の上限) の実行と、
  *   まとまりの表 (予約・軸・選択肢・子の選択肢・revision・まとめての登録・採用の記録) の読み取りを足す (表が無い DB = 0067 の前は付けない = 流し直すと付く)。
@@ -219,6 +220,16 @@ export const NE_DEL_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_ne_del_writ
  */
 export const AMAZON_LISTING_SELECT = Object.freeze(['ops.amazon_listing_report', 'ops.amazon_listing_report_loads', 'ops.amazon_sku_hidden']);
 export const AMAZON_LISTING_EDIT_FUNCTIONS = Object.freeze(['ops.set_amazon_sku_hidden(text, text, boolean, text, text)', 'ops.amazon_sku_last_sold(text[], date)']);
+/**
+ * 🆕 0075 (CompanyDB構想 21 C1・新商品の登録の発注の設定の知らせ): master_edit に知らせの表の select (画面の上の件数・届け待ちの画面) と、
+ *   積む (登録と同じ取引の中だけ = DB が確かめる)・借りる・結果を書く・人が閉じる の 4 つの実行。表が無い DB (0075 の前) では付けない (流し直すと付く)。
+ *   🚨 渡さない: 知らせの表の insert / update / delete (関数だけが書く)・中身の形の確かめの部品・守りの trigger
+ */
+export const ORDER_OUTBOX_SELECT = Object.freeze(['ops.order_settings_outbox', 'ops.v_order_settings_outbox_open']);
+export const ORDER_OUTBOX_EDIT_FUNCTIONS = Object.freeze(['ops.enqueue_order_settings(uuid, text, jsonb)',
+  'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer)', 'ops.finish_order_settings_event(uuid, text, text, jsonb, text)',
+  'ops.dismiss_order_settings_event(uuid, text, text)']);
+export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -311,6 +322,10 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const t of AMAZON_LISTING_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of AMAZON_LISTING_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of AMAZON_LISTING_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0075 (発注の設定の知らせ): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (表は読むだけ・書くのは関数だけ)
+  for (const t of ORDER_OUTBOX_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
+  for (const f of [...ORDER_OUTBOX_EDIT_FUNCTIONS, ...ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of ORDER_OUTBOX_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、
