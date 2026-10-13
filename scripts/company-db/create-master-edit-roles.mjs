@@ -216,7 +216,8 @@ export const GONE_DAY_OVERRIDE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_
 export const QUARANTINE_CONFIRM_FUNCTIONS = Object.freeze(['ops.confirm_quarantined_sku(uuid, text, text, jsonb, bigint, text)', 'ops.quarantine_confirm_check(bigint)',
   'ops.quarantine_confirm_list(text[])']);
 /** 🆕 0078: だれにも渡さない (確かめの表の 1 行を作る部品 = 確かめの中から持ち主の権限で呼ぶ) */
-export const QUARANTINE_CONFIRM_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.quarantine_confirm_item(text, boolean, jsonb, jsonb, text, text)']);
+export const QUARANTINE_CONFIRM_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.quarantine_confirm_item(text, boolean, jsonb, jsonb, text, text)',
+  'ops.record_master_decision_approval_print()', 'ops.guard_master_decision_approval_prints()']);   // #1715 Codex R3: 承認の時の組の trigger と守り
 /** 🆕 0070: だれにも渡さない (照合 ② の記録の中の部品・表の守り・定数) */
 export const GONE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops._record_ne_absence(bigint, jsonb)', 'ops.guard_master_ne_absence()', 'ops.ne_gone_required_runs()', 'ops.ne_gone_fresh_hours()',
   'ops.sku_ref_cancelled(bigint[])', 'ops.guard_sku_ref_not_cancelled()']);   // #1683 R1 High 2: やめた SKU への参照を断る trigger とその部品

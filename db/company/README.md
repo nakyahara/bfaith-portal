@@ -2663,11 +2663,11 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **照合 ② の確かめ待ち** (`ops.v_ne_reg_targets`): 要確認を全部 (単品もセットも・親のある子も・持ち主を問わず・コード 80 字まで) = 毎朝の照合 ② が要確認の NE の観測を残す (miniPC のコードは変えない・新しい定期実行なし)
 - **確かめ** `ops.quarantine_confirm_check(SKU)` (読むだけ・watcher も) = 表 `items: [{ key, ok, cdb, ne, text, fix }]`・`check_hash`・`evidence` (ok のときだけ)。
   ① 必須の欄 (新商品と同じ: 推奨保有月数 = Q2 a・単品の売上分類・代表の仕入先・今日の原価 / セット = 構成品が全部 NE 確認済み以降・税率・取扱・売上分類・原価 = 構成品から導いた値か例外原価)
-  ② NE と合っている (最新の封をした照合 ② の回 = NE のコードの回・36 時間・観測がある / 信用できる / 区分が同じ・欄ごと (構成は子ごと) に今の社内の値 = その回の観測 か、違うなら今の組に結びついた承認済みの判断 (候補の print.c ↔ print.n = 今日の社内の値 ↔ 今の観測の値) = Q3 a。照合の後・承認の後に社内か NE の値が変わった = 明日の照合の後に)
+  ② NE と合っている (最新の封をした照合 ② の回 = NE のコードの回・36 時間・観測がある / 信用できる / 区分が同じ・欄ごと (構成は子ごと) に今の社内の値 = その回の観測 か、違うなら承認の時の組 (承認の出来事ごとに `ops.master_decision_approval_prints` に残る候補の print.c ↔ print.n) = 今の組 (今日の社内の値 ↔ 今の観測の値) の承認済みの判断 = Q3 a。照合の後・承認の後に社内か NE の値が変わった = 明日の照合の後に)
   ③ 代表 (親のある子 = まとまりの記録がある・NE に代表がある親なし = 先に代表の採用) ④ 生きている CSV・NE から消す依頼が無い・コードが 80 字まで (code_length)。fix = `one` / `ne_fill` / `decision` / `after_compare`
 - **一覧** `ops.quarantine_confirm_list(コード | null)` (null = 要確認の全部・500 件を超えたら too_many / コードは 500 件まで) = 一括の inspect と毎朝のまとめ (Q-3・Q-4) の材料
 - **確認** `ops.confirm_quarantined_sku(request_id, 人, 理由, 持ち主表, SKU, check_hash)` (master_edit = 名簿 MASTER_EDITORS の人 = Q1 a)。鍵の後に確かめ直す・画面の表と違う = `stale`・だめ = `not_confirmable`・
-  押し直し = 前の答え。`ops.transition_sku_registration` (0073 の版 + 🆕 0078 のかたまり) は約束 `quarantine_confirm` の中だけ要確認 → NE 確認済みにする (根拠は DB が確かめの表から作る・運用のロールが直に呼んでも断る)。自動では確認しない (Q4 a)
+  押し直し = 前の答え (同じ request_id は鍵で直列 = 同時の押し直しも前の答え)。`ops.transition_sku_registration` (0073 の版 + 🆕 0078 のかたまり) は約束 `quarantine_confirm` の中だけ要確認 → NE 確認済みにする (根拠は DB が確かめの表から作る・運用のロールが直に呼んでも断る)。自動では確認しない (Q4 a)
 - 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え → `migrate.mjs --dry-run` (この 1 本だけ・今のデータは何も変えない) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す
   (master_edit に 3 つの関数の実行) → `heavy-entry-manifest.mjs --verify` → 次の朝の照合 ② の後に `select ops.quarantine_confirm_list(null)` (watcher) で 42 件の表を見る。画面 (Q-2・Q-3) は別の PR
 - 試験 = `node scripts/test-master-quarantine-confirm.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-quarantine-confirm-pg.mjs` (本物のログイン・並ぶ取引)

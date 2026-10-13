@@ -329,6 +329,9 @@ await ta('[C4] セットの欄: 構成品が要確認 (qs2) / 開いている構
     [() => setCost('qs1', 999, 'manual', 'OVERRIDDEN'), []],
     [() => setCost('qs1', 0, 'manual', 'OVERRIDDEN'), ['cost']],   // #1715 Codex R1 M1: 例外原価 0 円は通さない (単品と同じ)
     [() => setCost('qs1', 0, 'set_calc', 'COMPLETE'), ['cost']],   // #1715 Codex R2 M1: 構成品の合計 (set_calc) でも 0 円は通さない
+    // #1715 Codex R3 M2: 構成品の原価が全部 0 円 (COMPLETE) = 合計 0 円・保存の原価も set_calc / COMPLETE / 0 円 (丸めた合計と同じ) = 通さない
+    //   (原価の列は円の整数 = 正の小数の合計が 1 円未満にはならない。0 円を合計に数えない条件と 1 円以上の条件の両方で止める)
+    [async () => { await setCost('a01', 0, 'manual', 'COMPLETE'); await setCost('a02', 0, 'manual', 'COMPLETE'); await setCost('qs1', 0, 'set_calc', 'COMPLETE'); }, ['cost']],
     [() => setCost('qs1', 250, 'manual', 'COMPLETE'), ['cost']],
     [async () => q(`update core.sku_costs set cost_status = 'MISSING' where sku_id = $1 and valid_to is null`, [await sid('a02')]), ['cost']],
     [async () => q('delete from core.sku_components where parent_sku_id = $1', [await sid('qs1')]), ['components', 'cost', 'ne.children', 'sales_class', 'tax']],
@@ -415,6 +418,19 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
       assert.match(itemOf(c4, 'ne.cost').text, /承認の後に NE の値が変わった \(承認の時 280・今 270\)/);
       assert.equal(itemOf(c4, 'ne.cost').fix, 'after_compare');
       await pg.query('rollback to savepoint s4');
+      // #1715 Codex R3 High: 同じ指紋の候補の行自身の print.n を 270 に更新し (0032 の守りを外して = 本番では断られる)、次の回の観測も 270 = 候補の行と今の組は同じでも、
+      //   承認の時の組 (300 ↔ 280) と違う = 承認は効かない
+      await pg.query('savepoint s5');
+      const upd = await errOf(() => q(`update ops.master_decision_candidates set print = print || '{"n": 270}'::jsonb where fingerprint = $1`, [cc.fingerprint]));
+      assert.match(upd?.message ?? '', /不変の列は変えない/);   // 本番の守り (0032)
+      await pg.query('alter table ops.master_decision_candidates disable trigger trg_mdc_guard');
+      await q(`update ops.master_decision_candidates set print = print || '{"n": 270}'::jsonb where fingerprint = $1`, [cc.fingerprint]);
+      await pg.query('alter table ops.master_decision_candidates enable trigger trg_mdc_guard');
+      await sealRun({ obs: { q03: neCost(270) }, decisions: [{ ...cc, print: { ...cc.print, n: 270 } }], at: new Date(Date.now() + 1800) });
+      const c5 = await check('q03');
+      assert.deepEqual(bad(c5), ['ne.cost'], res);
+      assert.match(itemOf(c5, 'ne.cost').text, /承認の後に NE の値が変わった \(承認の時 280・今 270\)/);
+      await pg.query('rollback to savepoint s5');
       if (res === 'fix_ne') {
         // 直す承認の完了 (action_done) の後にまた同じ差が出た = 再発 = だめ
         await q(`insert into ops.master_decision_events (fingerprint, kind, approved_event_id, actor_type, actor, observed) values ($1, 'action_done', $2, 'system', 'mc_x', '{}'::jsonb)`, [cc.fingerprint, ev]);
@@ -424,6 +440,21 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
       }
       await pg.query('rollback to savepoint s');
     }
+    // 承認の時の組は承認の出来事ごとに残る (trigger)・表は直に書けない / 記録の無い承認 (trigger を外して書いた = 組の残っていない過去の承認) は効かない
+    await pg.query('savepoint s6');
+    const ev6 = await approve(cc.fingerprint, 'accept_difference');
+    assert.deepEqual(await one('select fingerprint, print_c, print_n from ops.master_decision_approval_prints where event_id = $1', [ev6]), { fingerprint: cc.fingerprint, print_c: 300, print_n: 280 });
+    assert.ok(await errOf(() => q(`insert into ops.master_decision_approval_prints (event_id, fingerprint, print_c, print_n) values ($1, $2, '300', '270')`, [ev6, cc.fingerprint])));
+    assert.ok(await errOf(() => q(`update ops.master_decision_approval_prints set print_n = '270' where event_id = $1`, [ev6])));
+    await pg.query('rollback to savepoint s6');
+    await pg.query('savepoint s7');
+    await pg.query('alter table ops.master_decision_events disable trigger trg_mde_approval_print');
+    await approve(cc.fingerprint, 'accept_difference');
+    await pg.query('alter table ops.master_decision_events enable trigger trg_mde_approval_print');
+    const c7 = await check('q03');
+    assert.deepEqual(bad(c7), ['ne.cost']);
+    assert.match(itemOf(c7, 'ne.cost').text, /承認の時の組の記録が無い/);
+    await pg.query('rollback to savepoint s7');
     for (const kind of ['rejected', 'revoked']) {
       await pg.query('savepoint s');
       await approve(cc.fingerprint, 'accept_difference');
@@ -482,6 +513,16 @@ await ta('[C6] 判断の候補 (Q3 a): まだ決めていない = decision / 承
     assert.match(itemOf(c4, 'ne.children').text, /承認の後に NE の値が変わった \(承認の時 2・今 4\)/);
     assert.equal(itemOf(c4, 'ne.children').fix, 'after_compare');
     await pg.query('rollback to savepoint r2');
+    // #1715 Codex R3 High: 同じ指紋の候補の行自身の print.n を 4 に更新 (守りを外して) + 次の回の観測も 4 = 承認の時の組 (1 ↔ 2) と違う = 承認は効かない
+    await pg.query('savepoint r3');
+    await pg.query('alter table ops.master_decision_candidates disable trigger trg_mdc_guard');
+    await q(`update ops.master_decision_candidates set print = print || '{"n": 4}'::jsonb where fingerprint = $1`, [ck.fingerprint]);
+    await pg.query('alter table ops.master_decision_candidates enable trigger trg_mdc_guard');
+    await sealRun({ obs: { qs1: (b) => ({ ...b, children: b.children.map((x) => (x.code_norm === 'a02' ? { ...x, v: 4 } : x)) }) }, decisions: [{ ...ck, print: { ...ck.print, n: 4 } }], at: new Date(Date.now() + 2500) });
+    const c5 = await check('qs1');
+    assert.deepEqual(bad(c5), ['ne.children']);
+    assert.match(itemOf(c5, 'ne.children').text, /承認の後に NE の値が変わった \(承認の時 2・今 4\)/);
+    await pg.query('rollback to savepoint r3');
     // 照合の後に子を足した (候補が無い) = だめ
     await q('update core.sku_components set qty = 1 where parent_sku_id = $1 and child_sku_id = $2', [await sid('qs1'), await sid('a02')]);
     await q(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, sort_order, source) values (1, $1, $2, 1, 9, 'ne')`, [await sid('qs1'), await sid('a03')]);
@@ -783,13 +824,29 @@ await ta('[R1] master_edit = 確認・確かめ・一覧 / watcher = 確かめ�
 });
 await ta('[R2] 0078 の security definer の関数 = search_path は pg_catalog, pg_temp・public の実行権なし・一時の表を作らない', async () => {
   const rows = await q(`select p.proname, p.prosecdef, p.proconfig, has_function_privilege('public', p.oid, 'execute') as pub, p.prosrc ~* 'create\\s+(local\\s+)?temp' as tmp
-    from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'ops' and p.proname in ('quarantine_confirm_check', 'quarantine_confirm_list', 'confirm_quarantined_sku', 'quarantine_confirm_item', 'transition_sku_registration')`);
-  assert.equal(rows.length, 5);
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'ops' and p.proname in ('quarantine_confirm_check', 'quarantine_confirm_list', 'confirm_quarantined_sku', 'quarantine_confirm_item', 'transition_sku_registration', 'record_master_decision_approval_print')`);
+  assert.equal(rows.length, 6);
   for (const r of rows) {
     assert.deepEqual(r.proconfig, ['search_path=pg_catalog, pg_temp'], r.proname);
     assert.equal(r.pub, false, r.proname); assert.equal(r.tmp, false, r.proname);
     if (r.proname !== 'quarantine_confirm_item') assert.equal(r.prosecdef, true, r.proname);
   }
+});
+
+await ta('[R3] 0078 の前からある承認 = 当てる時に候補の print (不変) から承認の時の組を入れる (#1715 Codex R3 High)', async () => {
+  const pg2 = new PGlite();
+  const db2 = pgliteAdapter(pg2);
+  const before = migFiles.filter((f) => f.slice(0, 4) < THIS_V).pop().slice(0, 4);
+  await applyMigrations(db2, { log: quiet, to: before });
+  const c0 = cand('old0', 'cost', { c: 10, n: 9 });
+  await pg2.query(`insert into ops.master_decision_candidates (fingerprint, subject_key, code_norm, col, child, cls, reason_kind, semantic, print, resolutions, proposal, first_seen_run, first_seen_at, last_seen_run, last_seen_at)
+    values ($1, 'cost:old0', 'old0', 'cost', null, 'rule', 'company_owned', 'x@1', $2::jsonb, '["accept_difference"]'::jsonb, null, 'mc_20301010T000000000Z_aaaaaa', now(), 'mc_20301010T000000000Z_aaaaaa', now())`,
+    [c0.fingerprint, JSON.stringify(c0.print)]);
+  const ev = (await pg2.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, actor_type, actor) values ($1, 'approved', 'accept_difference', 'user', 'naka@test') returning event_id`, [c0.fingerprint])).rows[0].event_id;
+  await pg2.query(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor) values ($1, 'revoked', 'user', 'naka@test')`, [c0.fingerprint]);
+  await applyMigrations(db2, { log: quiet });
+  assert.deepEqual((await pg2.query('select event_id::text as e, print_c, print_n from ops.master_decision_approval_prints')).rows, [{ e: String(ev), print_c: 10, print_n: 9 }]);
+  await pg2.close();
 });
 
 // ═══════════ [H] 重い入口の棚卸し ═══════════

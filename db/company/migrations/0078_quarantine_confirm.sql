@@ -41,6 +41,7 @@
 -- 🚨 security definer の関数 = 一時の表を使わない・search_path = pg_catalog, pg_temp (名前は全部 schema つき)・public の実行権を外す。
 --    ロール (scripts/company-db/create-master-edit-roles.mjs) の流し直しで master_edit (画面・名簿 MASTER_EDITORS の人 = Q1 a) に 2. 3. 4. の実行を足す。
 --    watcher = 2. 3. の実行 (読むだけ・下の do で付ける・create-watch-roles.mjs の流し直しでも付く)
+--   7. (#1715 Codex R3) 判断の承認の時の組 (ops.master_decision_approval_prints・承認の出来事の後の trigger が書く) = 確認は承認の時の組と今の組を照らす
 
 -- ═══════════ 1. 照合 ② の確かめ待ちに要確認を全部 (0067 の版から写して、要確認の行の条件だけ替えた) ═══════════
 create or replace view ops.v_ne_reg_targets as
@@ -56,6 +57,54 @@ create or replace view ops.v_ne_reg_targets as
      -- #1715 Codex R1 M2: 上の枝 (生きている NE 登録の CSV の品目) にある SKU は重ねない (同じ SKU を 2 行にしない)
      and not exists (select 1 from ops.ne_reg_export_items i where i.sku_id = s.sku_id and i.state in ('issued', 'import_declared', 'partial'));
 comment on view ops.v_ne_reg_targets is '翌朝の照合 ② が NE の完全な取得の値を送る商品 (0053・0063 から配っただけの品目も・0078 から要確認 (quarantined) の単品とセットの全部)';
+
+-- ═══════════ 1b. 承認の時の組 (#1715 Codex R3 High) ═══════════
+-- 判断の承認 (ops.master_decision_events の approved) を書いた時の候補の print の組 (社内の値 c・NE の値 n) を、承認の出来事ごとに残す。
+--   書くのは承認の出来事の insert の後の trigger だけ (どの書き手も = 判断の画面 apps/master-decisions/decide.mjs の applyDecisions・持ち主の手)。
+--   確認 (ops.quarantine_confirm_check) は「承認の時の組 = 今の組 (今日の社内の値 ↔ 最新の観測の値)」のときだけ承認を効かせる = 候補の行ではなく承認に結びつける。
+--   組の記録が無い承認は効かせない。
+-- 🚨 前からある承認 (0078 の前) = 下で、その候補の今の print から入れる。候補の print は 0032 の trg_mdc_guard が作った時から変えさせない (不変の列) =
+--    承認の時の print と同じ (この表を作る取引の中で入れる)
+create table ops.master_decision_approval_prints (
+  event_id    bigint primary key references ops.master_decision_events (event_id),
+  fingerprint text not null references ops.master_decision_candidates (fingerprint),
+  print_c     jsonb not null,   -- 承認の時の社内の値 (候補の print.c・無い = JSON の null)
+  print_n     jsonb not null,   -- 承認の時の NE の値 (候補の print.n・無い = JSON の null)
+  recorded_at timestamptz not null default pg_catalog.clock_timestamp()
+);
+select core.make_append_only('ops', 'master_decision_approval_prints');
+comment on table ops.master_decision_approval_prints is '判断の承認の時の候補の組 (社内の値・NE の値) (0078・#1715 Codex R3)。書くのは承認の出来事の後の trigger だけ。追記だけ';
+create function ops.guard_master_decision_approval_prints() returns trigger language plpgsql set search_path = pg_catalog, pg_temp as $$
+begin
+  if coalesce(pg_catalog.current_setting('ops.approval_print_protocol', true), '') is distinct from '1' then
+    raise exception '% は承認の出来事の trigger (ops.record_master_decision_approval_print) の中でだけ書く', tg_table_name using errcode = '42501';
+  end if;
+  return new;
+end $$;
+revoke all on function ops.guard_master_decision_approval_prints() from public;
+create trigger trg_mdap_guard before insert on ops.master_decision_approval_prints for each row execute function ops.guard_master_decision_approval_prints();
+create function ops.record_master_decision_approval_print() returns trigger
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+begin
+  if new.kind = 'approved' then
+    perform pg_catalog.set_config('ops.approval_print_protocol', '1', true);
+    insert into ops.master_decision_approval_prints (event_id, fingerprint, print_c, print_n)
+      select new.event_id, new.fingerprint, coalesce(c.print -> 'c', 'null'::jsonb), coalesce(c.print -> 'n', 'null'::jsonb)
+        from ops.master_decision_candidates c where c.fingerprint = new.fingerprint;
+    perform pg_catalog.set_config('ops.approval_print_protocol', '', true);
+  end if;
+  return null;
+end $$;
+revoke all on function ops.record_master_decision_approval_print() from public;
+create trigger trg_mde_approval_print after insert on ops.master_decision_events for each row execute function ops.record_master_decision_approval_print();
+-- 前からある承認 (候補の print は不変 = 承認の時と同じ)
+select pg_catalog.set_config('ops.approval_print_protocol', '1', true);
+insert into ops.master_decision_approval_prints (event_id, fingerprint, print_c, print_n)
+  select e.event_id, e.fingerprint, coalesce(c.print -> 'c', 'null'::jsonb), coalesce(c.print -> 'n', 'null'::jsonb)
+    from ops.master_decision_events e join ops.master_decision_candidates c on c.fingerprint = e.fingerprint
+   where e.kind = 'approved'
+  on conflict (event_id) do nothing;
+select pg_catalog.set_config('ops.approval_print_protocol', '', true);
 
 -- ═══════════ 2. 確認済みにしてよいかの表 (読むだけ) ═══════════
 /** 表の 1 行 ({ key, ok, cdb, ne, text, fix })。fix = 直し方の組 (ok = null) */
@@ -322,11 +371,12 @@ begin
     v_kids := coalesce(v_kids, '{}'::jsonb);
     for c in
       select x.fingerprint, x.col, x.child, x.cls, x.reason_kind, coalesce(x.print -> 'c', 'null'::jsonb) as pc, coalesce(x.print -> 'n', 'null'::jsonb) as pn,
-             l.event_id, l.kind as dkind, l.resolution,
+             l.event_id, l.kind as dkind, l.resolution, ap.print_c as ac, ap.print_n as an,
              exists (select 1 from ops.master_decision_events d where d.kind = 'action_done' and d.approved_event_id = l.event_id) as done
         from ops.master_decision_candidates x
         left join lateral (select e1.event_id, e1.kind, e1.resolution from ops.master_decision_events e1
                             where e1.fingerprint = x.fingerprint and e1.kind in ('approved', 'rejected', 'revoked') order by e1.event_id desc limit 1) l on true
+        left join ops.master_decision_approval_prints ap on ap.event_id = l.event_id and ap.fingerprint = x.fingerprint   -- 承認の時の組 (#1715 Codex R3 High)
        where x.company_id = 1 and x.code_norm = s.code_norm
          and exists (select 1 from ops.master_decision_observations ob where ob.fingerprint = x.fingerprint and ob.compare_run_id = v_run)
        order by x.col, x.child nulls first, x.fingerprint
@@ -348,7 +398,8 @@ begin
                           else coalesce(oc -> 'v', 'null'::jsonb) end
                 from (select v_obs -> 'cols' -> (case c.col when 'standard_price_jpy' then 'price' when 'primary_supplier' then 'supplier' else c.col end) as oc) y)
       end;
-      v_tied := coalesce(c.pc = v_ccur and c.pn = v_ncur, false);
+      -- #1715 Codex R3 High: 照らすのは承認の時の組 (承認の出来事に結びついた記録)。候補の行の今の print ではない。記録が無い承認は効かせない
+      v_tied := coalesce(c.ac = v_ccur and c.an = v_ncur, false);
       if c.dkind = 'approved' and c.resolution in ('accept_difference', 'fix_ne', 'fix_cdb') and not (c.resolution in ('fix_ne', 'fix_cdb') and c.done) and v_tied then
         -- 承認済みで、承認した差の社内の値 = 今の社内の値 (構成は子ごと)
         v_appr := v_appr || pg_catalog.jsonb_build_object(v_dcol || coalesce(':' || c.child, ''), pg_catalog.jsonb_build_object('fingerprint', c.fingerprint, 'col', c.col,
@@ -360,8 +411,9 @@ begin
                  when c.dkind <> 'approved' then '・最新の判断が ' || c.dkind
                  when c.resolution not in ('accept_difference', 'fix_ne', 'fix_cdb') then '・解決 ' || c.resolution || ' はこの確認では数えない'
                  when c.resolution in ('fix_ne', 'fix_cdb') and c.done then '・直す承認の完了の後にまた出た'
-                 when c.pc is distinct from v_ccur then pg_catalog.format('・承認の後に社内の値が変わった (照合の時 %s・今 %s)', c.pc, coalesce(v_ccur::text, '読めない'))
-                 else pg_catalog.format('・承認の後に NE の値が変わった (承認の時 %s・今 %s)', c.pn, coalesce(v_ncur::text, '読めない')) end)));
+                 when c.ac is null then '・承認の時の組の記録が無い (マスタの判断で決め直す)'
+                 when c.ac is distinct from v_ccur then pg_catalog.format('・承認の後に社内の値が変わった (照合の時 %s・今 %s)', c.ac, coalesce(v_ccur::text, '読めない'))
+                 else pg_catalog.format('・承認の後に NE の値が変わった (承認の時 %s・今 %s)', c.an, coalesce(v_ncur::text, '読めない')) end)));
       end if;
       v_cands := v_cands || pg_catalog.jsonb_build_object(v_dcol, true);
     end loop;
@@ -690,6 +742,8 @@ begin
     raise exception 'invalid_input: 確かめの表のハッシュ (check_hash・64 桁の 16 進) が要る (画面で表を読んでから押す)' using errcode = '22023';
   end if;
   perform ops.reg_write_gate(p_ownership, '{}'::text[]);   -- 段階 (共有) → マスタの書き込み (共有) → 段階 new_open・持ち主表 = 段階の記録
+  -- #1715 Codex R3 M1: 同じ request_id の押し直しを直列に (保存 lib/master-write.mjs の REQUEST_LOCK_SQL と同じ鍵) → その後に前の結果を読む = 同時の押し直しも前の答え
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('ops.master_edit_request:' || p_request_id::text, 0));
   v_hash := ops.reg_hash(pg_catalog.jsonb_build_object('op', 'quarantine_confirm', 'sku_id', p_sku_id::text, 'reason', v_reason, 'check_hash', p_check_hash));
   select x.operation, x.actor_id, x.status, x.result, x.payload_hash, x.sku_id into v_prev from ops.master_edit_requests x where x.request_id = p_request_id;
   if found then
@@ -745,5 +799,6 @@ do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then
     execute 'grant execute on function ops.quarantine_confirm_check(bigint) to watcher';
     execute 'grant execute on function ops.quarantine_confirm_list(text[]) to watcher';
+    execute 'grant select on ops.master_decision_approval_prints to watcher';
   end if;
 end $$;

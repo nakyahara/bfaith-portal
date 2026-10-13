@@ -4,6 +4,7 @@
  * 固定する契約:
  *   [R]  本物のログイン: master_edit (画面) = 確かめ・確認できる / master_ops が確認の関数を呼ぶ = 42501・ops.transition_sku_registration を直に呼んでも
  *        要確認は確認済みにならない (confirm_session_required) / watcher (読むだけの取引が既定) = 確かめ・一覧は読める・確認の関数は 42501
+ *   [C0] 同じ request_id の同時の押し直し: 後の方は request_id の鍵で待つ → 前の答え (replayed)・履歴は 1 行 (#1715 Codex R3 M1)
  *   [C1] 2 人が同じ商品を同時に確認: 後の人は SKU の鍵で待つ → 先の人の commit の後に not_quarantined (二重に確認しない・履歴は 1 行)
  *   [C2] 確認と保存 (本物の保存の入口 lib/master-write.mjs の saveSku・master_edit のログイン・同じ SKU の鍵) が並ぶ: 保存が先 = 確認は待って、
  *        保存の後の値で確かめ直す (照合の後に名前を NE と違う値にした = not_confirmable) / 確認が先 = 保存は待つ (確認が commit してから進む・#1715 Codex R1 M4)
@@ -56,7 +57,7 @@ const WPW = { watcher: `w_${crypto.randomBytes(12).toString('hex')}`, watch_writ
 const single = (code) => ({ code, name: `商品 ${code}`, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 3,
   cost: { jpy: 100, source: 'ne', status: 'COMPLETE' }, standardPriceJpy: 1000, reorderMonths: 2 });
 const BASE = ['a01', 'a02'];
-const QS = ['q01', 'q02', 'q03', 'q04', 'q05', 'q06'];
+const QS = ['q01', 'q02', 'q03', 'q04', 'q05', 'q06', 'q07'];
 const planOf = (extra = []) => ({ skus: [...BASE, ...extra].map(single), variationGroups: [], setComponents: [], listings: [], observations: [], physicals: [], compliance: [], workers: [],
   suppliers: [{ code: '0001', name: 'AMC' }], supplierSkus: [...BASE, ...extra].map((c) => ({ supplierCode: '0001', skuCode: c })),
   primarySuppliers: [...BASE, ...extra].map((c) => ({ skuCode: c, supplierCode: '0001' })), reorder: { available: false, runId: null, reason: '試験' } });
@@ -153,8 +154,21 @@ try {
   });
 
   console.log('[C] 競り合い');
+  await ta('[C0] 同じ request_id の同時の押し直し (2 つの接続): 後の方は request_id の鍵で待つ → 先の commit の後に前の答え (replayed)・履歴は 1 行 (#1715 Codex R3 M1)', async () => {
+    const a = await confirmArgs('q02');
+    await ME.query('begin');
+    const r1 = (await ME.query(confirmSql, a)).rows[0].r;
+    const p2 = ME2.query(confirmSql, a);
+    assert.equal(await stillWaiting(p2), true, '同じ request_id の押し直しが待っていない');
+    await ME.query('commit');
+    const r2 = (await p2).rows[0].r;
+    assert.equal(r2.replayed, true);
+    assert.equal(r2.event_id, r1.event_id);
+    assert.equal((await one(`select count(*)::int as n from ops.master_registration_events where sku_id = $1 and to_state = 'ne_confirmed'`, [await sid('q02')])).n, 1);
+    assert.equal(await regOf('q02'), 'ne_confirmed');
+  });
   await ta('[C1] 2 人が同じ商品を同時に確認: 後の人は SKU の鍵で待つ → 先の commit の後に not_quarantined・履歴は 1 行', async () => {
-    const [a1, a2] = [await confirmArgs('q02'), await confirmArgs('q02')];
+    const [a1, a2] = [await confirmArgs('q07'), await confirmArgs('q07')];
     await ME.query('begin');
     await ME.query(confirmSql, a1);
     await ME2.query('begin');
@@ -164,7 +178,7 @@ try {
     const e = await errOf(p2);
     await ME2.query('rollback');
     assert.match(e?.message ?? '', /^not_quarantined/);
-    assert.equal((await one(`select count(*)::int as n from ops.master_registration_events where sku_id = $1 and to_state = 'ne_confirmed'`, [await sid('q02')])).n, 1);
+    assert.equal((await one(`select count(*)::int as n from ops.master_registration_events where sku_id = $1 and to_state = 'ne_confirmed'`, [await sid('q07')])).n, 1);
   });
   const dbME2 = pgAdapter(ME2);
   const tokenOf = async (code) => W.editTokenOf(await W.readCurrent(dbO, await sid(code), TODAY));
