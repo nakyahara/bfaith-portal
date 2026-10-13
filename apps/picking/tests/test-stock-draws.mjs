@@ -11,9 +11,9 @@ await temporaryTestRoot(import.meta.url);
  *   ① 写しの後に取り込んだピッキングの明細の数をそのロケから引く (残り 0 の棚は候補に出ない・残りがあれば減らして出す)
  *   ② 写しより前に取り込んだピッキングは引かない (写しの引当数に入っている = 二重に引かない)
  *   ③ 写しの後に欠品と報告された棚は出さない・他ロケで確保した数はそのロケから引く
- *   ④ 取消・無効のバッチ・別の商品・元のピックロケの再ピックは数えない / 写しの時刻が読めないときは何も引かない
+ *   ④ 取消・無効のバッチ・別の商品は数えない / 写しの時刻が読めないときは何も引かない
  *   ⑤ 同じロケの期限違いは期限の近い順に引く (通知本文 = ロットごとの行)
- *   ⑥ 上書き取込は最後の取込の時刻で見る ⑦ 写しから選んだ棚の再ピックは引く ⑧ 特殊ロケは名前のまま
+ *   ⑥ 上書き取込は最初の取込の時刻で見る (受け入れる限界) ⑦ 🔴再ピックは引かない ⑧ 特殊ロケは名前のまま (除外も)
  *   API: 境目は「在庫を取った時刻」(sourceAt)。取り込み完了 (importedAt) だとその間の取込を取りこぼす
  *
  * 実行: node apps/picking/tests/test-stock-draws.mjs
@@ -124,7 +124,7 @@ t('③ 写しの後に欠品と報告された棚は出さない・他ロケで�
   assert.deepEqual(labels(out), ['R2FD-003-013-01=30', 'R2FD-002-014-02=28', 'R2FD-003-003-01=2']);
 });
 
-t('④ 取消・無効のバッチ・別の商品・梱包タスクの無い🔴再ピックは数えない / 写しの時刻が読めなければ何も引かない', () => {
+t('④ 取消・無効のバッチ・別の商品・🔴再ピックは数えない / 写しの時刻が読めなければ何も引かない', () => {
   db.exec('DELETE FROM pk_lines; DELETE FROM pk_batches;');
   mkBatch({ createdAt: AFTER, status: 'cancelled', lines: [{ block: 'P3FC', location: '00200305', qty: 1 }] });
   mkBatch({ createdAt: AFTER, validity: 'invalid', lines: [{ block: 'P3FC', location: '00200305', qty: 1 }] });
@@ -137,54 +137,39 @@ t('④ 取消・無効のバッチ・別の商品・梱包タスクの無い🔴
   assert.equal(pickingStockDraws('', SNAP).size, 0);
 });
 
-t('⑥ 上書き取込: 写しより前に作ったバッチでも、最後の取込が写しの後なら新しい明細を引く (Codex R1 Medium)', () => {
+t('⑥ 上書き取込は最初の取込 (created_at) で見る — 受け入れる限界 (中原さん 10/13・Codex R2 Medium)', () => {
   db.exec('DELETE FROM pk_lines; DELETE FROM pk_batches; DELETE FROM pk_import_logs;');
+  // 写しより前に作り、写しの後に上書き: 変わっていない明細まで二重に引かないよう、引かない (直す前と同じ表示)
   const id = mkBatch({ createdAt: BEFORE, status: 'ready', lines: [{ block: 'P3FC', location: '00200305', qty: 2 }] });
-  const log = db.prepare(`INSERT INTO pk_import_logs (batch_id, tb_no, action, csv_sha256, hikiate_class, line_count, slip_count, total_qty, actor, at)
-    VALUES (?, 'TBx', ?, 'sha', 'AES', 1, 1, 2, 'test', ?)`);
-  log.run(id, 'create', BEFORE);
-  assert.equal(pickingStockDraws('hiragushi240', SNAP).size, 0, '取込が写しより前だけなら引かない');
-  // 写しの後に上書き (明細が入れ替わり updated_at が進む)
-  log.run(id, 'overwrite', AFTER);
+  db.prepare(`INSERT INTO pk_import_logs (batch_id, tb_no, action, csv_sha256, hikiate_class, line_count, slip_count, total_qty, actor, at)
+    VALUES (?, 'TBx', 'overwrite', 'sha', 'AES', 1, 1, 2, 'test', ?)`).run(id, AFTER);
   db.prepare('UPDATE pk_batches SET updated_at = ? WHERE id = ?').run(AFTER, id);
-  assert.deepEqual(pickingStockDraws('hiragushi240', SNAP).get(stockDrawKey('P3FC', '00200305')), { qty: 2, depleted: false });
-  // 取込は写しの前で、写しの後に作業を始めただけ (updated_at だけ進む) なら引かない (写しの引当数に入っている)
-  db.exec('DELETE FROM pk_import_logs;');
-  log.run(id, 'create', BEFORE);
   assert.equal(pickingStockDraws('hiragushi240', SNAP).size, 0);
 });
 
-t('⑦ 🔴再ピック: 写しから選んだ棚 (stock) の分だけ引く・元のピックロケ (picked) は元の引当で足りているので引かない (Codex R1 Medium)', () => {
+t('⑦ 🔴再ピックは引かない (元のピックロケから取る = 元のピッキングの引当で足りている。引くと二重)', () => {
   db.exec('DELETE FROM pk_import_logs; DELETE FROM pk_lines; DELETE FROM pk_batches;');
-  // pk_pack_tasks は梱包アプリの表 (同じ picking.db)。このクエリが見る列だけの最小の表で試す
-  db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_tasks (id INTEGER PRIMARY KEY, location_source TEXT)`);
-  db.exec(`DELETE FROM pk_pack_tasks; INSERT INTO pk_pack_tasks (id, location_source) VALUES (1, 'stock'), (2, 'picked'), (3, 'stock')`);
-  const rp = (task, line, createdAt = BEFORE) => {
-    const id = mkBatch({ createdAt, origin: 'repick', status: 'ready', lines: [line] });
-    db.prepare('UPDATE pk_lines SET pack_task_id = ? WHERE batch_id = ?').run(task, id);
-  };
-  rp(1, { block: 'R2FD', location: '00201402', qty: 2, status: 'pending' });                    // 写しより前に作られた未ピック → 引く
-  rp(2, { block: 'P3FC', location: '00200305', qty: 1, status: 'pending' }, AFTER);             // 元のピックロケ → 引かない
-  rp(3, { block: 'R2FD', location: '00301301', qty: 5, status: 'done', doneAt: BEFORE });       // 写しより前にピック済み → 引かない
-  const draws = pickingStockDraws('hiragushi240', SNAP);
-  assert.deepEqual([...draws.keys()], [stockDrawKey('R2FD', '002-014-02')]);
-  assert.equal(draws.get(stockDrawKey('R2FD', '002-014-02')).qty, 2);
-  db.exec('DROP TABLE pk_pack_tasks');
-  assert.equal(pickingStockDraws('hiragushi240', SNAP).size, 0, '梱包の表が無い環境でも落ちない');
+  mkBatch({ createdAt: AFTER, origin: 'repick', status: 'ready', lines: [{ block: 'P3FC', location: '00200305', qty: 1, status: 'pending' }] });
+  mkBatch({ createdAt: AFTER, origin: 'repick', lines: [{ block: 'P3FC', location: '00200305', qty: 1, status: 'done', doneAt: AFTER }] });
+  assert.equal(pickingStockDraws('hiragushi240', SNAP).size, 0);
 });
 
-t('⑧ ロケのキー: 棚ロケは表記の違いを揃え、特殊ロケは名前のまま (数字だけにして別のロケと重ねない — Codex R1 Low)', () => {
+t('⑧ ロケのキー: 棚ロケは表記の違いを揃え、特殊ロケは名前のまま (数字だけにして別のロケと重ねない — Codex R1/R2 Low)', () => {
   assert.equal(stockDrawKey('P3FC', '00200305'), stockDrawKey('P3FC', '002-003-05'));
   assert.notEqual(stockDrawKey('ZZZ', 'ZZZ-ZZZ-ZZ'), stockDrawKey('ZZZ', 'ZZZ-ZZZ-ZY'));
   assert.notEqual(stockDrawKey('X', 'AAA-01'), stockDrawKey('X', 'BBB-01'));
   assert.equal(stockDrawKey('ZZZ', ' zzz-zzz-zz '), stockDrawKey('ZZZ', 'ZZZ-ZZZ-ZZ'));
   // 特殊ロケの欠品は、同じブロックの別の特殊ロケを消さない
   const draws = new Map([[stockDrawKey('X', 'AAA-01'), { qty: 0, depleted: true }]]);
-  const out = listStockCandidates(snapshot([
+  const data = snapshot([
     { block: 'X', location: 'AAA-01', free: 3 },
     { block: 'X', location: 'BBB-01', free: 4 },
-  ]), { draws });
-  assert.deepEqual(labels(out), ['X-BBB-01=4']);
+    { block: 'ZZZ', location: 'ZZZ-ZZZ-ZZ', free: 1 },
+  ]);
+  assert.deepEqual(labels(listStockCandidates(data, { draws })), ['X-BBB-01=4', 'ZZZ-ZZZ-ZZ=1']);
+  // 現ロケの除外も同じキー: 特殊ロケの自分は外れ、数字が同じ別の特殊ロケは外さない
+  assert.deepEqual(labels(listStockCandidates(data, { excludeBlock: 'ZZZ', excludeLocation: 'ZZZ-ZZZ-ZZ' })), ['X-BBB-01=4', 'X-AAA-01=3']);
+  assert.deepEqual(labels(listStockCandidates(data, { excludeBlock: 'X', excludeLocation: 'AAA-01' })), ['X-BBB-01=4', 'ZZZ-ZZZ-ZZ=1']);
 });
 
 t('⑤ 同じロケの期限違いは期限の近い順に引く (通知本文はロットごとの行)', () => {

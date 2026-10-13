@@ -199,12 +199,11 @@ export function listStockCandidates(data, {
   draws = null,
 } = {}) {
   if (!data) return { fetched: false, stamp: null, stale: true, rows: [] };
-  const excludeDigits = normalizeLocationDigits(excludeLocation);
+  // 現ロケの判定は stockDrawKey (特殊ロケ ZZZ-ZZZ-ZZ も自分を外せる・数字が同じ別の特殊ロケは外さない — PR #1697 Codex R2 Low)
+  const excludeKey = String(excludeLocation || '').trim() ? stockDrawKey(excludeBlock, excludeLocation) : null;
   const candidates = applyStockDraws((data.locations || [])
     .filter((r) => String(r.quality || '') === '良品')
-    .filter((r) => !(excludeDigits
-      && String(r.block || '') === String(excludeBlock || '')
-      && normalizeLocationDigits(r.location) === excludeDigits)), draws)
+    .filter((r) => !(excludeKey && stockDrawKey(r.block, r.location) === excludeKey)), draws)
     .filter((r) => Number(r.free) > 0);
   // 棚ロケ (8桁数字に正規化できるもの) を先に、それ以外 (ロジザード上の特殊ロケ。
   // 実データに ZZZ-ZZZ-ZZ が存在) を後ろに並べる。特殊ロケも実在のロケコードなので、

@@ -1532,24 +1532,24 @@ export async function returnCandidates(task, { fetchFn = fetch, now = new Date()
   if (!base.configured || !task?.sku) return base;
   const data = await fetchStockLocationsSafe(sl, task.sku, fetchFn);
   const c = sl.listStockCandidates(data, { groupByLocation: true, maxRows, now });
-  const same = (r) => picked && String(r.block || '') === String(picked.block || '')
-    && sl.normalizeLocationDigits(r.location) === sl.normalizeLocationDigits(picked.location);
+  // 同じロケの判定は stockDrawKey (特殊ロケを数字だけにして別のロケと重ねない — PR #1697 Codex R2 Low)
+  const same = (r) => picked && sl.stockDrawKey(r.block, r.location) === sl.stockDrawKey(picked.block, picked.location);
   return { ...base, rows: c.rows.filter((r) => !same(r)), fetched: c.fetched, stale: c.stale, stamp: c.stamp, truncated: c.truncated || 0 };
 }
 /**
  * 他ロケ候補から引く「ロジザード在庫の写し (毎時) の後にピッキングで取る/取った数」(2026-10-12 現場の要望)。
  *   現場の声: 同じピッキングで引き当たっている棚が「他の棚から取る」の候補に出て、行ったら取れなかった。
  *   - 写しの後に取り込んだピッキング (origin=import) の明細 = ロジザードの引当が写しにまだ入っていない
- *     → 未ピック・ピック済みとも明細の数を引く (写しより前の取込は写しの引当数に入っているので引かない)。
- *     取込の時刻は最後の取込 (上書き取込で明細が入れ替わる — pk_import_logs。PR #1697 Codex R1 Medium)
+ *     → 未ピック・ピック済みとも明細の数を引く (写しより前の取込は写しの引当数に入っているので引かない)
  *   - 写しの後に欠品と報告された棚 → depleted (行っても無い)
  *   - 写しの後に他ロケで確保した数 → そのロケから引く (ロジザードの減算は事務の手作業で、写しに入っていない)
- *   - 🔴再ピックのうち、参考ロケがロジザードの在庫候補 (location_source='stock' = 余り・バッチ外の品違い) のもの
- *     → 引当の外の持ち出しなので、未ピックは時刻に関係なく・ピック済みは写しの後なら引く。
- *     元のピックロケ (picked) の再ピックは元のピッキングの引当で足りているので引かない (引くと二重)
+ *   - 🔴再ピックは引かない (元のピックロケから取る = 元のピッキングの引当で足りている。引くと二重)
  * 写しの境目 = 在庫を取った時刻 (stockSnapshotAt。取り込み完了の時刻だと、その間の取込を取りこぼす — Codex R1 High)。
- * ロジザードで引き当ててから取込までの数分の間に写しが取られると二重に引く (棚が少なく見える)。
- * そのときも「後で取りに行く」で逃げられるので、空の棚に歩かせない方を選ぶ。
+ * 受け入れる限界 (中原さん 10/13 判断):
+ *   - ロジザードで引き当ててから取込までの数分の間に写しが取られると二重に引く (棚が少なく見える)。
+ *     そのときも「後で取りに行く」で逃げられるので、空の棚に歩かせない方を選ぶ
+ *   - 上書き取込は最初の取込 (created_at) で見る。写しの後の上書きで増えた棚の分は引かない (直す前と同じ表示)。
+ *     最後の取込で見ると、変わっていない明細まで二重に引いてしまう (Codex R2 Medium)。上書きはまれ
  * @returns {Map<string, {qty:number, depleted:boolean}>} キー = stockDrawKey(block, location)
  */
 export function pickingStockDraws(sku, snapshotAt, db = getDB()) {
@@ -1563,22 +1563,11 @@ export function pickingStockDraws(sku, snapshotAt, db = getDB()) {
     if (!draws.has(k)) draws.set(k, { qty: 0, depleted: false });
     return draws.get(k);
   };
-  // updated_at は上書き取込で必ず進むので先に絞る (pk_batches 全件の取込ログを引かない)
   const lines = db.prepare(`
     SELECT l.block, l.location, l.qty FROM pk_lines l JOIN pk_batches b ON b.id = l.batch_id
-    WHERE b.updated_at >= ? AND b.origin = 'import' AND b.validity = 'valid' AND b.status != 'cancelled'
-      AND COALESCE((SELECT MAX(g.at) FROM pk_import_logs g WHERE g.batch_id = b.id), b.created_at) >= ?
-      AND l.status IN ('pending', 'done') AND lower(trim(l.sku)) = ?`).all(since, since, code);
+    WHERE b.created_at >= ? AND b.origin = 'import' AND b.validity = 'valid' AND b.status != 'cancelled'
+      AND l.status IN ('pending', 'done') AND lower(trim(l.sku)) = ?`).all(since, code);
   for (const l of lines) at(l.block, l.location).qty += Number(l.qty) || 0;
-  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pk_pack_tasks'").get()) {
-    const repicks = db.prepare(`
-      SELECT l.block, l.location, l.qty FROM pk_lines l JOIN pk_batches b ON b.id = l.batch_id
-        JOIN pk_pack_tasks k ON k.id = l.pack_task_id
-      WHERE b.origin = 'repick' AND b.validity = 'valid' AND b.status != 'cancelled' AND k.location_source = 'stock'
-        AND (l.status = 'pending' OR (l.status = 'done' AND l.done_at >= ?))
-        AND l.location != '' AND lower(trim(l.sku)) = ?`).all(since, code);
-    for (const l of repicks) at(l.block, l.location).qty += Number(l.qty) || 0;
-  }
   const shorts = db.prepare(`
     SELECT l.block, l.location, l.alt_block, l.alt_location, l.alt_qty FROM pk_lines l JOIN pk_batches b ON b.id = l.batch_id
     WHERE l.status = 'shortage' AND l.done_at >= ? AND b.validity = 'valid' AND b.status != 'cancelled'
