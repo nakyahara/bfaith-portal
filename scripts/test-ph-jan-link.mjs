@@ -11,6 +11,8 @@
  *     Company DB を読めない = 何も書かない・JAN が空になった = 結びを外す・商品マスタで JAN が外れた = 要確認に変える
  *     商品マスタを読むのが混んでいる (B1 の同時 2 本) = 何も書かない・期限は要求の入口から (B1 と同じ)
  *   P3 対象を集めるのは B1 の一括の関数 (janUnitsForDrafts) = 1 件ずつと同じ単位 (大文字の子のコードも)・直し方は B1 の JAN_FIX と同じ言葉
+ *   R1 (Codex #1707): 数えた後に商品コード / まとまりの所属が変わった = 取引の中の印と UPDATE の条件の両方で断る・成功の記録は更新と同じ取引・
+ *     NULL の JAN の行も外せる・SKU の大文字小文字 (片方だけ = 同じ子・2 つ = 要確認)・計画の印は見せた全部・CSRF (Origin + JSON)・cdb_multiple・古い形の SQLite から ALTER
  *   G 管理者だけ (画面・数える・移す)
  *   H 画面: 管理者の画面・担当者・工程の設定から入れる・画面の JS が読める
  *   B 楽天の出品は今の列 (jan_code) のまま = 移しても payload は同じ
@@ -24,6 +26,7 @@ import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import express from 'express';
+import Database from 'better-sqlite3';
 
 const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'phjan-data-link-'));
 process.env.DATA_DIR = DATA_DIR;
@@ -130,6 +133,35 @@ await ta('[M1] jan_* の列 (product_drafts・draft_sku_jans) と記録の表が
   const before = ph.prepare(`SELECT sql FROM sqlite_master WHERE name IN ('product_drafts', 'draft_sku_jans', 'ph_jan_link_runs') ORDER BY name`).all();
   PHDB.initProductHubDB();
   assert.deepEqual(ph.prepare(`SELECT sql FROM sqlite_master WHERE name IN ('product_drafts', 'draft_sku_jans', 'ph_jan_link_runs') ORDER BY name`).all(), before);
+});
+
+await ta('[M2] 古い形の SQLite (jan_* の列も記録の表も無い・行はある) から起動 = 列を足す・今ある行はそのまま (jan_* は空)', () => {
+  const before = {
+    drafts: ph.prepare('SELECT id, ne_code, name, jan_code FROM product_drafts ORDER BY id').all(),
+    skus: ph.prepare('SELECT draft_id, sku_code, jan_code FROM draft_sku_jans ORDER BY draft_id, sku_code').all(),
+  };
+  assert.ok(before.drafts.length >= 7 && before.skus.length >= 3, '行が無い (試験の前提)');
+  for (const t of ['product_drafts', 'draft_sku_jans']) for (const c of ['jan_cdb_row', 'jan_cdb_value', 'jan_link_state', 'jan_link_reason', 'jan_linked_at', 'jan_linked_by']) ph.exec(`ALTER TABLE ${t} DROP COLUMN ${c}`);
+  ph.exec('DROP TABLE ph_jan_link_runs');
+  assert.ok(!ph.prepare('PRAGMA table_info(product_drafts)').all().some((c) => c.name.startsWith('jan_cdb')), '古い形にできていない');
+  PHDB._resetInitForTest();
+  PHDB.getDB();
+  for (const t of ['product_drafts', 'draft_sku_jans']) {
+    const cols = ph.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+    for (const c of ['jan_cdb_row', 'jan_cdb_value', 'jan_link_state', 'jan_link_reason', 'jan_linked_at', 'jan_linked_by']) assert.ok(cols.includes(c), `${t}.${c} を足していない`);
+  }
+  assert.deepEqual(ph.prepare('SELECT id, ne_code, name, jan_code FROM product_drafts ORDER BY id').all(), before.drafts);
+  assert.deepEqual(ph.prepare('SELECT draft_id, sku_code, jan_code FROM draft_sku_jans ORDER BY draft_id, sku_code').all(), before.skus);
+  assert.equal(ph.prepare('SELECT COUNT(*) AS n FROM product_drafts WHERE jan_link_state IS NOT NULL OR jan_cdb_row IS NOT NULL').get().n, 0);
+  assert.throws(() => ph.prepare(`UPDATE draft_sku_jans SET jan_link_state = 'x'`).run(), /CHECK/);
+  assert.equal(ph.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'ph_jan_link_runs'`).get().n, 1);
+});
+await ta('[L7a] Company DB に同じ JAN が 2 つ以上 (cdb_multiple) = 選ばずに要確認', () => {
+  const read = { ok: true, byPair: new Map([['a001\u0000111', { sku_id: '1', sku_kind: 'single', product_id: '10', jan_norm: '111', jan_holder: null,
+    jans: [{ row: '5', value: '111', norm: '111' }, { row: '6', value: ' 111', norm: '111' }] }]]) };
+  const t = L.decideJanLink({ code: 'a001', phJan: '111', dup: false }, read);
+  assert.deepEqual(t, { state: 'needs_review', row: null, value: null, reason: 'cdb_multiple' });
+  assert.ok(L.JAN_LINK_REASONS.cdb_multiple && L.JAN_LINK_FIX.cdb_multiple);
 });
 
 // ─── P 計画 ───
@@ -283,9 +315,10 @@ try {
     assert.deepEqual(fingerprint(), before);
     assert.equal(runs().at(-1).outcome, 'refused');
     const p = await preview();
-    assert.deepEqual([p.j.counts.link, p.j.counts.review, p.j.counts.same, p.j.hash], [0, 0, 7, 'none']);
+    assert.deepEqual([p.j.counts.link, p.j.counts.review, p.j.counts.same], [0, 0, 7]);
+    assert.match(p.j.hash, /^[0-9a-f]{64}$/);
     // 書く物が無いときの「移す」= 何も書かずに ok
-    const n = await applyReq('none');
+    const n = await applyReq(p.j.hash);
     assert.deepEqual([n.status, n.j.written], [200, { link: 0, review: 0, clear: 0 }]);
     assert.deepEqual(fingerprint(), before);
   });
@@ -383,10 +416,113 @@ try {
       assert.equal(r.status, 200, JSON.stringify(r.j));
       assert.deepEqual(r.j.written, { link: p.j.counts.link, review: p.j.counts.review, clear: p.j.counts.clear });
       const again = await preview();
-      assert.equal(again.j.hash, 'none', '書いた後に数え直しても書く物が残った');
+      assert.equal(again.j.counts.link + again.j.counts.review + again.j.counts.clear, 0, '書いた後に数え直しても書く物が残った');
     }
   });
 
+  await ta('[R1-H1] 🚨 数えた後 (取引の前) に商品コードが変わった = 取引の中で気づいて何も書かない・印を素通りしても UPDATE が商品コードで断る', async () => {
+    ph.prepare('UPDATE product_drafts SET jan_cdb_row = NULL, jan_cdb_value = NULL, jan_link_state = NULL, jan_link_reason = NULL, jan_linked_at = NULL, jan_linked_by = NULL WHERE id = ?').run(dA1.id);
+    const plan = await L.buildJanLinkPlan(ph);
+    assert.ok(plan.items.some((i) => i.draftId === dA1.id && i.action === 'link'), '試験の前提 (a001 を結ぶ計画)');
+    ph.prepare(`UPDATE product_drafts SET ne_code = 'a001-new' WHERE id = ?`).run(dA1.id);
+    try {
+      const before = fingerprint();
+      assert.throws(() => L.applyJanLinkPlan(ph, plan, { actor: 'boss@test' }), (e) => e instanceof L.JanLinkConflict && /数えた後に product-hub の JAN が変わりました/.test(e.message), '取引の中の印で気づかない');
+      assert.deepEqual(fingerprint(), before);
+      // 取引の中の印を素通りしたとしても (印だけ今に合わせる)、UPDATE の条件が商品コードで断る
+      const forged = { ...plan, snapshot: (await L.buildJanLinkPlan(ph)).snapshot };
+      assert.throws(() => L.applyJanLinkPlan(ph, forged, { actor: 'boss@test' }), (e) => e instanceof L.JanLinkConflict && /書けなかった行があります/.test(e.message), 'UPDATE が商品コードで断らない');
+      assert.deepEqual(fingerprint(), before);
+      // まとまりの所属が変わった (子が 1 つ増えた) も印が変わる
+      const g0 = await L.buildJanLinkPlan(ph);
+      mirror('b-new', 'grpb'); const pidNew = mirrorPid;
+      try { assert.notEqual((await L.buildJanLinkPlan(ph)).snapshot, g0.snapshot, 'まとまりの所属の変化に気づかない'); }
+      finally { ph.prepare('DELETE FROM mirror_products WHERE product_id = ?').run(pidNew); }
+    } finally { ph.prepare(`UPDATE product_drafts SET ne_code = 'a001' WHERE id = ?`).run(dA1.id); }
+  });
+  await ta('[R1-H2] 🚨 成功の記録は JAN の更新と同じ取引: 記録に失敗 = 更新も戻る (500「全部 元に戻しました」が本当)・成功なら更新と記録がそろう', async () => {
+    const p = await preview();
+    assert.ok(p.j.counts.link + p.j.counts.review + p.j.counts.clear >= 1, '試験の前提 (書く物がある)');
+    const before = fingerprint();
+    const runsBefore = runs().length;
+    ph.exec('ALTER TABLE ph_jan_link_runs RENAME TO ph_jan_link_runs_hidden');
+    let r;
+    try { r = await applyReq(p.j.hash); } finally { ph.exec('ALTER TABLE ph_jan_link_runs_hidden RENAME TO ph_jan_link_runs'); }
+    assert.equal(r.status, 500);
+    assert.match(r.j.error, /全部 元に戻しました/);
+    assert.deepEqual(fingerprint(), before, '記録に失敗したのに JAN の更新が残った');
+    assert.equal(runs().length, runsBefore);
+    // 成功: 更新と記録がそろう
+    const ok = await applyReq((await preview()).j.hash);
+    assert.equal(ok.status, 200);
+    const last = runs().at(-1);
+    assert.deepEqual([last.kind, last.outcome, JSON.parse(last.counts_json).written], ['apply', 'ok', ok.j.written]);
+    assert.equal(draftState(dA1.id).jan_link_state, 'linked');
+  });
+  await ta('[R1-M4] SKU コードの大文字小文字: 片方だけ大文字 = 同じ子として結ぶ / 大文字小文字だけ違う行が 2 つ = 選ばずに両方 要確認', async () => {
+    // b-red の行を大文字に (同じ子として扱う)
+    ph.prepare(`UPDATE draft_sku_jans SET sku_code = 'B-RED', jan_cdb_row = NULL, jan_cdb_value = NULL, jan_link_state = NULL, jan_link_reason = NULL WHERE draft_id = ? AND sku_code = 'b-red'`).run(dG.id);
+    await pg.query('update core.external_ids set valid_to = null where external_id_row = $1', [rowB1]).catch(() => {});
+    const added = [];
+    try {
+      const plan = await L.buildJanLinkPlan(ph);
+      const red = plan.items.find((i) => i.draftId === dG.id && i.code === 'b-red');
+      assert.ok(red, '大文字の行を見落とした');
+      assert.equal(red.skuKey, 'B-RED');
+      // 大文字小文字だけ違う行が 2 つ (b-blu と B-BLU)
+      ph.prepare(`INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, 'B-BLU', ?)`).run(dG.id, JAN.b2); added.push('B-BLU');
+      const plan2 = await L.buildJanLinkPlan(ph);
+      const blus = plan2.items.filter((i) => i.draftId === dG.id && i.code === 'b-blu');
+      assert.deepEqual(blus.map((i) => [i.skuKey, i.target.state, i.target.reason]).sort(), [['B-BLU', 'needs_review', 'ph_sku_dup'], ['b-blu', 'needs_review', 'ph_sku_dup']]);
+      const r = await applyReq((await preview()).j.hash);
+      assert.equal(r.status, 200, JSON.stringify(r.j));
+      assert.deepEqual([skuState(dG.id, 'B-BLU').jan_link_reason, skuState(dG.id, 'b-blu').jan_link_reason], ['ph_sku_dup', 'ph_sku_dup']);
+    } finally {
+      for (const k of added) ph.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?').run(dG.id, k);
+      ph.prepare(`UPDATE draft_sku_jans SET sku_code = 'b-red' WHERE draft_id = ? AND sku_code = 'B-RED'`).run(dG.id);
+    }
+  });
+  await ta('[R1-M5] 計画の印は見せた計画の全部: 書かない単位 (JAN が空) が増えただけでも印が変わる = 移すは 409', async () => {
+    const p = await preview();
+    const d = draft('empty2', null);
+    try {
+      const r = await applyReq(p.j.hash);
+      assert.equal(r.status, 409, '数えた後に件数が変わったのに書いた');
+      assert.equal(r.j.counts.empty, p.j.counts.empty + 1);
+    } finally { ph.prepare('DELETE FROM product_drafts WHERE id = ?').run(d.id); }
+  });
+  await ta('[R1-M6] CSRF: Origin が無い / 違う = 403・JSON でない = 415 (数える・移す とも・何も書かない・記録も書かない)', async () => {
+    const before = fingerprint();
+    const n0 = runs().length;
+    const raw = (url, headers, body) => fetch(ORIGIN + url, { method: 'POST', headers: { 'x-test-session': 'admin', ...headers }, body, signal: AbortSignal.timeout(30000) }).then((r) => r.status);
+    for (const url of ['/apps/product-hub/api/jan-link/preview', '/apps/product-hub/api/jan-link/apply']) {
+      assert.equal(await raw(url, { 'Content-Type': 'application/json' }, '{}'), 403, `${url} Origin なし`);
+      assert.equal(await raw(url, { 'Content-Type': 'application/json', Origin: 'https://evil.example' }, '{}'), 403, `${url} 違う Origin`);
+      assert.equal(await raw(url, { 'Content-Type': 'text/plain', Origin: ORIGIN }, 'confirm=true'), 415, `${url} JSON でない`);
+    }
+    assert.deepEqual(fingerprint(), before);
+    assert.equal(runs().length, n0);
+  });
+  await ta('[R1-M3] SKU 別の JAN が NULL の行 (古い形の表) も「外す」で書ける (TRIM(COALESCE))', () => {
+    // NOT NULL の無い古い形の表を持つ別の SQLite (メモリ) で、計画を作って書く (Company DB は読まない = JAN が空の単位だけ)
+    const mem = new Database(':memory:');
+    mem.exec(`CREATE TABLE product_drafts (id INTEGER PRIMARY KEY, ne_code TEXT, name TEXT, jan_code TEXT, jan_cdb_row INTEGER, jan_cdb_value TEXT, jan_link_state TEXT, jan_link_reason TEXT, jan_linked_at TEXT, jan_linked_by TEXT);
+      CREATE TABLE draft_sku_jans (draft_id INTEGER, sku_code TEXT, jan_code TEXT, jan_cdb_row INTEGER, jan_cdb_value TEXT, jan_link_state TEXT, jan_link_reason TEXT, jan_linked_at TEXT, jan_linked_by TEXT);
+      CREATE TABLE mirror_products (product_id INTEGER, 商品コード TEXT, 代表商品コード TEXT);
+      CREATE TABLE draft_variation_exclusions (draft_id INTEGER, ne_code TEXT);
+      CREATE TABLE draft_events (id INTEGER PRIMARY KEY, draft_id INTEGER, event TEXT, detail TEXT, actor TEXT);
+      INSERT INTO product_drafts (id, ne_code, name) VALUES (1, 'gx', 'まとまり');
+      INSERT INTO mirror_products VALUES (1, 'x1', 'gx'), (2, 'x2', 'gx');
+      INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code, jan_cdb_row, jan_cdb_value, jan_link_state) VALUES (1, 'x1', NULL, 9, '4900000000000', 'linked');`);
+    return L.buildJanLinkPlan(mem).then((plan) => {
+      assert.equal(plan.ok, true, plan.reason);
+      assert.deepEqual(plan.items.map((i) => [i.code, i.phJan, i.action]), [['x1', '', 'clear']]);
+      const r = L.applyJanLinkPlan(mem, plan, { actor: 'boss@test' });
+      assert.deepEqual(r.written, { link: 0, review: 0, clear: 1 });
+      assert.deepEqual(mem.prepare('SELECT jan_cdb_row, jan_link_state FROM draft_sku_jans').get(), { jan_cdb_row: null, jan_link_state: null });
+      mem.close();
+    });
+  });
   await ta('[A10] 商品マスタを読むのが混んでいる (B1 の同時 2 本の上限) = 数える・移す とも 503「混んでいる」・何も書かない', async () => {
     const p = await preview();
     const gates = [];
@@ -413,7 +549,7 @@ try {
   });
   await ta('[A11] 期限は要求の入口から (数える・移す とも入口で決めて計画まで渡す)', async () => {
     const src = fs.readFileSync(new URL('../apps/product-hub/router.js', import.meta.url), 'utf8');
-    for (const route of ["router.post('/api/jan-link/preview', async (req, res) => {", "router.post('/api/jan-link/apply', async (req, res) => {"]) {
+    for (const route of ["router.post('/api/jan-link/preview', janLinkCsrfGuard, async (req, res) => {", "router.post('/api/jan-link/apply', janLinkCsrfGuard, async (req, res) => {"]) {
       const at = src.indexOf(route);
       assert.ok(at >= 0, route);
       assert.match(src.slice(at + route.length, at + route.length + 200), /^\s*const deadlineAt = Date\.now\(\) \+ JAN_READ_DEADLINE_MS;/, `${route} の入口で期限を決めていない`);
