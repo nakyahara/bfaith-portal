@@ -52,6 +52,9 @@
  *   ファイルのバイト列は ops.ne_del_download だけ)。🚨 渡さない: 表の守り・行き先・CSV のバイト列を作る部品・参照の守りの部品 (NE_DEL_OWNER_ONLY_FUNCTIONS)
  * 🆕 0070 (NE から消えた商品をやめる): master_edit と master_ops に ops.cancel_sku_gone_from_ne と確かめの 2 つ (ops.sku_gone_from_ne_check / _list) の実行
  *   (GONE_FUNCTIONS)。🚨 渡さない: ops.master_ne_absence の表・照合 ② の記録の中の部品 (ops._record_ne_absence ほか = GONE_OWNER_ONLY_FUNCTIONS)
+ * 🆕 0079 (要確認を確認済みにする・Company DB構想 22 の Q-1): master_edit に確認の関数と確かめ・一覧 (読むだけ) の実行 (QUARANTINE_CONFIRM_FUNCTIONS・
+ *   名簿 MASTER_EDITORS の人 = 中原さんの決定 Q1 a)。master_ops には渡さない。表の権限は足さない (関数の中だけで書く)。
+ *   🚨 渡さない: 確かめの表の 1 行を作る部品 (QUARANTINE_CONFIRM_OWNER_ONLY_FUNCTIONS)
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
  *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
@@ -206,6 +209,15 @@ export const GONE_FUNCTIONS = Object.freeze(['ops.cancel_sku_gone_from_ne(uuid, 
 export const GONE_DAY_OVERRIDE_FUNCTIONS = Object.freeze(['ops.add_sku_gone_day_overrides(uuid, text, text, text[], integer, integer)']);
 /** 🆕 0076: だれにも渡さない (表の守り・効いている許可を読む部品 = 確かめの中から持ち主の権限で呼ぶ) */
 export const GONE_DAY_OVERRIDE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_gone_day_overrides()', 'ops.sku_gone_day_override_active(bigint)']);
+/**
+ * 🆕 0079 (要確認を確認済みにする・中原さんの決定 10/13 Q1 a): 確認の関数 (ops.confirm_quarantined_sku) と確かめ・一覧 (読むだけ) を master_edit (画面・名簿 MASTER_EDITORS の人) に実行だけ。
+ *   master_ops (CLI) には渡さない。watcher の確かめ・一覧は migration と create-watch-roles.mjs が付ける。無い DB (0079 の前) では付けない (流し直すと付く)
+ */
+export const QUARANTINE_CONFIRM_FUNCTIONS = Object.freeze(['ops.confirm_quarantined_sku(uuid, text, text, jsonb, bigint, text)', 'ops.quarantine_confirm_check(bigint)',
+  'ops.quarantine_confirm_list(text[])']);
+/** 🆕 0079: だれにも渡さない (確かめの表の 1 行を作る部品 = 確かめの中から持ち主の権限で呼ぶ) */
+export const QUARANTINE_CONFIRM_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.quarantine_confirm_item(text, boolean, jsonb, jsonb, text, text)',
+  'ops.record_master_decision_approval_print()', 'ops.guard_master_decision_approval_prints()']);   // #1715 Codex R3: 承認の時の組の trigger と守り
 /** 🆕 0070: だれにも渡さない (照合 ② の記録の中の部品・表の守り・定数) */
 export const GONE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops._record_ne_absence(bigint, jsonb)', 'ops.guard_master_ne_absence()', 'ops.ne_gone_required_runs()', 'ops.ne_gone_fresh_hours()',
   'ops.sku_ref_cancelled(bigint[])', 'ops.guard_sku_ref_not_cancelled()']);   // #1683 R1 High 2: やめた SKU への参照を断る trigger とその部品
@@ -332,6 +344,9 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0076 (日数の許可): 関数がある DB だけ。前に付けた実行権を外してから、運用のロール (master_ops) だけに付け直す
   for (const f of [...GONE_DAY_OVERRIDE_FUNCTIONS, ...GONE_DAY_OVERRIDE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of GONE_DAY_OVERRIDE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_ops';`));
+  // 🆕 0079 (要確認を確認済みにする): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (watcher の確かめ・一覧は migration が付ける = ここでは外さない)
+  for (const f of [...QUARANTINE_CONFIRM_FUNCTIONS, ...QUARANTINE_CONFIRM_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of QUARANTINE_CONFIRM_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   // 🆕 0072 (NE から消す CSV): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (watcher の確かめ・一覧は migration が付ける = ここでは外さない)
   for (const f of [...NE_DEL_FUNCTIONS, ...NE_DEL_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of NE_DEL_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
