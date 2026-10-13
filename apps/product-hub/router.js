@@ -2391,6 +2391,7 @@ router.get('/api/drafts/:id/rakuten/desc-preview', (req, res) => {
 });
 
 router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
+  const janDeadlineAt = Date.now() + JAN_READ_DEADLINE_MS;   // JAN の読みの期限も要求の入口から (辞書・税率を待った分も入る・Codex #1700 R3 M2)
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
@@ -2406,8 +2407,8 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   // 🆕 JAN を Company DB と比べた印 (Company DB構想 21 §5 B1)。知らせだけ = payload も送る値も変えない・出品も止めない。
   //    🚨 比べる値は payload を作った直後に await を挟まずに読み直す (= payload と同じ値。上の await の間に JAN が保存されてもずれない・Codex #1700 R1 M4)
   const janUnits = janUnitsForDraftId(db, draft.id);
-  // (プレビューの JAN の読みも 4.5 秒まで。プレビューのほかの待ち = 辞書・税率 は今までどおり)
-  const warnings = [...(tax.warning ? [tax.warning] : []), ...janWarningsOf(await compareJanUnits(janUnits))];
+  // (プレビューの JAN の読みは入口から 4.5 秒まで。辞書・税率で使い切っていれば読みに行かず「読めない」の一言)
+  const warnings = [...(tax.warning ? [tax.warning] : []), ...janWarningsOf(await compareJanUnits(janUnits, { deadlineAt: janDeadlineAt }))];
   if (!built.ok) return res.json({ ok: false, reasons: built.reasons, ...(warnings.length ? { warnings } : {}) });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,

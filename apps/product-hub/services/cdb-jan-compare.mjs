@@ -35,6 +35,17 @@ export const JAN_STATE_LABELS = Object.freeze({
   none: 'どちらにも無い',
   unreadable: '読めない',
 });
+/** 直し方 (状態ごと・詳細画面の「JAN の印の見かた」と同じ言葉)。セットは state ではなく not_in_cdb の中で分ける (fix は判定で決める) */
+export const JAN_FIX = Object.freeze({
+  differs: 'product-hub の JAN を商品マスタの JAN と同じ値に直す (商品マスタの JAN が違う・足りないときは、マスタの入力の商品の画面で直す)',
+  not_in_cdb: '商品マスタ (マスタの入力の商品の画面) にこの JAN を足す (product-hub の JAN が正しいとき。違うなら product-hub の JAN を直す)',
+  not_in_cdb_set: 'セットは商品マスタで JAN を持てない (product-hub の JAN がセットの物か確かめる)',
+  sku_missing: '商品マスタに商品が登録されてから確かめる (新商品の登録)',
+  ph_empty: '楽天に JAN を出すなら、商品マスタの JAN を product-hub に入れる',
+  unreadable: '少し待って開き直す',
+  match: '',
+  none: '',
+});
 /** 重さ: warn = 直す必要がありそう / muted = 比べられない / info = 知らせ / ok = 一致 / none = 何も出さない */
 export const JAN_STATE_SEVERITY = Object.freeze({
   differs: 'warn', not_in_cdb: 'warn', sku_missing: 'warn', unreadable: 'muted', ph_empty: 'info', match: 'ok', none: 'none',
@@ -151,22 +162,32 @@ async function readRowsWithin(items, { env, deadlineMs }) {
   let client = null;
   let timedOut = false;
   let timer;
-  const closeClient = () => { const c = client; client = null; if (c) Promise.resolve().then(() => c.end()).catch(() => { /* 結果は変えない */ }); };
+  // 閉じるのは 1 回だけ。閉じ終わり (end() の完了 = 成功 / 失敗) を Promise で持ち、同時の枠はその後に返す (Codex #1700 R3 M1)
+  let closing = null;
+  const closeClient = () => {
+    if (closing) return closing;
+    const c = client;
+    if (!c) return Promise.resolve();   // まだつながっていない (つながった後で閉じる)
+    client = null;
+    closing = Promise.resolve().then(() => c.end()).catch(() => { /* 結果は変えない */ });
+    return closing;
+  };
   const work = (async () => {
     try {
       const connect = connector || (await import('../../../scripts/company-db/migrate.mjs')).openPgClient;
       const { COMPANY_ID } = await import('../../../lib/master-write.mjs');
       const c = await connect(url, { application_name: 'product-hub-cdb-jan', connectionTimeoutMillis: Math.min(JAN_CONNECT_TIMEOUT_MS, deadlineMs), statement_timeout: deadlineMs, query_timeout: deadlineMs });
-      if (timedOut) { try { await c.end(); } catch { /* */ } return { ok: false, reason: 'timeout' }; }
       client = c;
+      if (timedOut) return { ok: false, reason: 'timeout' };   // 期限の後につながった = 読まずに閉じる (finally)
       const left = deadlineMs - (Date.now() - started);
       const rows = await queryCdbJans(c, COMPANY_ID, items, { statementTimeoutMs: Math.max(100, left) });
       return { ok: true, rows };
     } catch (e) {
       return { ok: false, reason: `Company DB を読めない (${errText(e)})` };
-    } finally { closeClient(); }
+    } finally { closeClient(); }   // 閉じ始める (答えは閉じ終わりを待たずに返す)
   })();
-  work.then(release, release);   // 接続を閉じ終わった後に 1 本を返す
+  // 同時の枠は、読み終わり + 接続を閉じ終わった (end() の完了・成功 / 失敗) 後に返す。期限で先に答えても、閉じ終わるまでは 1 本と数える
+  work.then(() => closeClient(), () => closeClient()).then(release, release);
   try {
     return await Promise.race([work, new Promise((resolve) => {
       timer = setTimeout(() => { timedOut = true; closeClient(); resolve({ ok: false, reason: `${(deadlineMs / 1000).toFixed(1)} 秒で読めなかった (接続を閉じた)` }); }, deadlineMs);
@@ -210,7 +231,7 @@ export function judgeJanUnit({ code, phJan }, read) {
   const c = str(code);
   const j = str(phJan);
   const base = { code: c, phJan: j, cdbJans: [], cdbCount: 0, holder: null };
-  const done = (state, detail) => ({ ...base, state, label: JAN_STATE_LABELS[state], severity: JAN_STATE_SEVERITY[state], detail: detail || '' });
+  const done = (state, detail, fixKey = state) => ({ ...base, state, label: JAN_STATE_LABELS[state], severity: JAN_STATE_SEVERITY[state], detail: detail || '', fix: JAN_FIX[fixKey] || '' });
   if (!read || !read.ok) return done('unreadable', (read && read.reason) || 'Company DB を読めない');
   const row = read.byPair.get(pairKey(c, j));
   if (!row) return done('unreadable', 'Company DB の答えにこの商品コードが無い');
@@ -230,7 +251,7 @@ export function judgeJanUnit({ code, phJan }, read) {
     return done('ph_empty', base.cdbCount === 1 ? `Company DB の JAN = ${list}` : `Company DB に JAN が ${base.cdbCount} 個 (${list})`);
   }
   if (row.product_id == null) {
-    return done('not_in_cdb', [`Company DB では${row.sku_kind === 'set' ? 'セット' : '例外の商品'}は JAN を持たない`, holderNote].filter(Boolean).join('。'));
+    return done('not_in_cdb', [`Company DB では${row.sku_kind === 'set' ? 'セット' : '例外の商品'}は JAN を持たない`, holderNote].filter(Boolean).join('。'), 'not_in_cdb_set');
   }
   const norm = row.jan_norm == null ? null : String(row.jan_norm);
   if (norm && jans.some((x) => String(x.norm) === norm)) {
@@ -281,7 +302,7 @@ export function janWarningsOf(result) {
   const out = [];
   for (const u of result.units) {
     if (u.severity !== 'warn' && u.severity !== 'muted') continue;
-    out.push(`JAN ${u.label}: ${u.code}${u.phJan ? ` の JAN ${u.phJan}` : ''}${u.detail ? ` — ${u.detail}` : ''}。直すのは商品マスタ (master-edit) の JAN です (この印は知らせだけ・出品は止めません)`);
+    out.push(`JAN ${u.label}: ${u.code}${u.phJan ? ` の JAN ${u.phJan}` : ''}${u.detail ? ` — ${u.detail}` : ''}。${u.fix ? `直し方: ${u.fix}。` : ''}(この印は知らせだけ・出品は止めません)`);
   }
   return out;
 }
@@ -421,7 +442,7 @@ export async function boardJanMarks(db, { ids = [], env = process.env, deadlineM
     const warn = judged.filter((u) => u.severity === 'warn');
     if (!warn.length) continue;
     const s = summarizeJanUnits(warn);
-    byDraft[p.id] = { state: s.state, label: s.label, units: warn.map((u) => ({ code: u.code, phJan: u.phJan, label: u.label, detail: u.detail })) };
+    byDraft[p.id] = { state: s.state, label: s.label, units: warn.map((u) => ({ code: u.code, phJan: u.phJan, label: u.label, detail: u.detail, fix: u.fix })) };
   }
   return { ok: true, readable: true, reason: null, checked: per.length, byDraft };
 }

@@ -884,7 +884,12 @@ th.attr-unknown { color: #dc2626; }
               <li><strong>product-hub は空</strong> — ここは空だが、商品マスタには JAN がある</li>
               <li><strong>読めない</strong> — 商品マスタに今つながらない。少し待って開き直す</li>
             </ul>
-            <div>直すとき: 商品マスタの JAN が正しければ、ここの JAN を同じ値にします。商品マスタの JAN が違う・足りないときは、<a href="/apps/master-edit/" target="_blank" rel="noopener">マスタの入力</a>の商品の画面で直します (JAN を直せるのは商品マスタだけ)。</div>
+            <div>直すとき (印の下にも、その印の直し方が出ます):</div>
+            <ul>
+              <li><strong>Company DB と違う</strong> — 商品マスタの JAN が正しければ、ここの JAN を同じ値に直す。商品マスタの JAN が違う・足りないときは、<a href="/apps/master-edit/" target="_blank" rel="noopener">マスタの入力</a>の商品の画面で直す</li>
+              <li><strong>Company DB に無い</strong> — ここの JAN が正しければ、マスタの入力の商品の画面でこの JAN を足す。違うなら、ここの JAN を直す。<strong>セット</strong>は商品マスタで JAN を持てない (ここの JAN がセットの物か確かめる)</li>
+              <li><strong>Company DB に商品コードが無い</strong> — 商品マスタに商品が登録されてから確かめる</li>
+            </ul>
           </details>
         </div>
         <div style="flex:1">
@@ -3634,6 +3639,7 @@ th.attr-unknown { color: #dc2626; }
       if (!u || u.severity === 'none') return;
       el.appendChild(janPill('Company DB: ' + u.label, u.severity));
       if (u.detail) el.appendChild(janDetail(u.detail));
+      if (u.fix && u.severity === 'warn') el.appendChild(janDetail('直し方: ' + u.fix));
     });
     const summary = document.getElementById('jan-cdb-summary');
     if (!summary) return;
@@ -3676,8 +3682,8 @@ th.attr-unknown { color: #dc2626; }
     if (j.readable === false) return '⚠ JAN を商品マスタ (Company DB) と比べられませんでした (' + (j.reason || '') + ')\n\n';
     const warn = (j.units || []).filter((u) => u.severity === 'warn');
     if (!warn.length) return '';
-    return warn.map((u) => '⚠ JAN ' + u.label + ': ' + u.code + (u.phJan ? ' の JAN ' + u.phJan : '') + (u.detail ? ' — ' + u.detail : '')).join('\n')
-      + '\n   JAN の正本は商品マスタです。出品は止めませんが、確かめてから出してください。\n\n';
+    return warn.map((u) => '⚠ JAN ' + u.label + ': ' + u.code + (u.phJan ? ' の JAN ' + u.phJan : '') + (u.detail ? ' — ' + u.detail : '') + (u.fix ? '\n   直し方: ' + u.fix : '')).join('\n')
+      + '\n   出品は止めませんが、確かめてから出してください。\n\n';
   }
   refreshJanCheck();
 

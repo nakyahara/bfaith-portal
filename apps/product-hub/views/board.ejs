@@ -1027,8 +1027,8 @@
             const tag = document.createElement('span');
             tag.className = 'kb-tag jan-check';
             tag.textContent = '⚠ JAN ' + m.label;
-            tag.title = (m.units || []).map(function (u) { return u.code + (u.phJan ? ' の JAN ' + u.phJan : '') + ': ' + u.label + (u.detail ? ' — ' + u.detail : ''); }).join('\n')
-              + '\n\nJAN の正本は商品マスタ (Company DB)。直すのは商品マスタの画面です (この札は知らせだけ・出品は止めません)';
+            tag.title = (m.units || []).map(function (u) { return u.code + (u.phJan ? ' の JAN ' + u.phJan : '') + ': ' + u.label + (u.detail ? ' — ' + u.detail : '') + (u.fix ? '\n  直し方: ' + u.fix : ''); }).join('\n')
+              + '\n\n(この札は知らせだけ・出品は止めません)';
             wrap.appendChild(tag);
             link.insertBefore(wrap, link.firstChild);
           });
@@ -1047,7 +1047,8 @@
     const m = janMarks[String(draftId)];
     if (!m) return '';
     return '⚠ JAN ' + m.label + ' (' + (m.units || []).map(function (u) { return u.code; }).join('・') + ')\n'
-      + '   JAN の正本は商品マスタ (Company DB) です。出品は止めませんが、確かめてから出してください。\n\n';
+      + (m.units || []).filter(function (u) { return u.fix; }).map(function (u) { return '   ' + u.code + ' の直し方: ' + u.fix + '\n'; }).join('')
+      + '   出品は止めませんが、確かめてから出してください。\n\n';
   }
   function confirmListing(name, draftId) {
     return confirm('「' + name + '」を楽天に出品しますか?\n\n'

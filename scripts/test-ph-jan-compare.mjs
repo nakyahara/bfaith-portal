@@ -102,9 +102,26 @@ await ta('[J6] まとめ = 一番重い印と数・注意の文は warn と読�
   assert.equal(J.janWarningsOf({ ok: true, units: [u('match'), u('ph_empty'), u('none')] }).length, 0);
   const w = J.janWarningsOf({ ok: true, units: [u('differs'), u('not_in_cdb'), u('match')] });
   assert.equal(w.length, 2);
-  assert.ok(w.every((x) => /出品は止めません/.test(x) && /master-edit/.test(x)));
+  assert.ok(w.every((x) => /出品は止めません/.test(x)));
   assert.equal(J.janWarningsOf({ ok: true, readable: false, reason: 'x', units: [u('unreadable'), u('unreadable')] }).length, 1);
   assert.equal(J.janWarningsOf({ ok: false, reason: '6 秒で読めなかった', units: [] }).length, 1);
+});
+
+await ta('[J7] 直し方は状態ごと (Codex #1700 R3 L1): 違う = product-hub の JAN を直す / 無い = 商品マスタに足す / セット = JAN を持てない / 商品コードが無い = 登録の後', () => {
+  const differs = J.judgeJanUnit({ code: 'A', phJan: '999' }, rd([['A', '999', R0({ jans: J2('111'), jan_norm: '999' })]]));
+  assert.match(differs.fix, /^product-hub の JAN を商品マスタの JAN と同じ値に直す/);
+  const none = J.judgeJanUnit({ code: 'A', phJan: '999' }, rd([['A', '999', R0({ jan_norm: '999' })]]));
+  assert.match(none.fix, /^商品マスタ .* にこの JAN を足す/);
+  const set = J.judgeJanUnit({ code: 'S', phJan: '999' }, rd([['S', '999', R0({ sku_kind: 'set', product_id: null, jan_norm: '999' })]]));
+  assert.deepEqual([set.state, set.fix], ['not_in_cdb', J.JAN_FIX.not_in_cdb_set]);
+  assert.match(set.fix, /セットは商品マスタで JAN を持てない/);
+  const miss = J.judgeJanUnit({ code: 'Z', phJan: '9' }, rd([['Z', '9', R0({ sku_id: null, product_id: null, sku_kind: null })]]));
+  assert.match(miss.fix, /商品マスタに商品が登録されてから/);
+  assert.equal(J.judgeJanUnit({ code: 'A', phJan: '111' }, rd([['A', '111', R0({ jans: J2('111'), jan_norm: '111' })]])).fix, '');
+  // 注意の文も状態ごと (いつも「商品マスタ」ではない)
+  const w = J.janWarningsOf({ ok: true, units: [differs, set] });
+  assert.match(w[0], /直し方: product-hub の JAN を商品マスタの JAN と同じ値に直す/);
+  assert.match(w[1], /直し方: セットは商品マスタで JAN を持てない/);
 });
 
 // ─── P 本物の SQL (PGlite) ───
@@ -222,15 +239,16 @@ await ta('[P6] 接続先が無い = 読めない (接続しない)・組が多�
 // ─── C 接続 (本物の道 = 差し替えるのは接続の作り方だけ) ───
 console.log('C 接続');
 /** PGlite を pg の client の形に (end を数える・SELECT を止められる) */
-function pgliteClient({ hangSelect = false } = {}) {
-  const c = { ended: 0, stmts: [], abort: null };
+/** endGate = end() の完了を手で止める (Promise を渡すと、それが済むまで end() が終わらない = 本物の接続の閉じ終わりの待ち) */
+function pgliteClient({ hangSelect = false, endGate = null } = {}) {
+  const c = { ended: 0, endDone: 0, stmts: [], abort: null };
   c.query = (sql, params) => {
     c.stmts.push(String(sql).split('\n')[0].trim());
     if (c.ended) return Promise.reject(new Error('Connection terminated'));
     if (hangSelect && /^select x\.ord/.test(String(sql).trim())) return new Promise((_, reject) => { c.abort = reject; });
     return pg.query(sql, params);
   };
-  c.end = async () => { c.ended++; if (c.abort) c.abort(new Error('Connection terminated')); };
+  c.end = async () => { c.ended++; if (c.abort) c.abort(new Error('Connection terminated')); if (endGate) await endGate; c.endDone++; };
   return c;
 }
 await ta('[C1] URL の選び方: 画面用の読むだけ (COMPANY_DB_SCREEN_READ_URL) → COMPANY_DB_URL・🚨 watcher (COMPANY_DB_WATCH_URL) には落ちない', async () => {
@@ -322,15 +340,43 @@ await ta('[C5] 🚨 同時に読む数はプロセスで 2 本まで: 3 本目�
     await new Promise((r) => setTimeout(r, 10));
     assert.equal(J.__janReadInFlight(), 0);
   } finally { gates.splice(0).forEach((g) => g()); J.__setCdbJanReader(readWith(pgClient)); }
-  // 本物の道: SELECT が返らない = 期限で接続を閉じた後に 1 本を返す
+  // 本物の道: 🚨 枠を返すのは接続を閉じ終わった (end() が終わった) 後 (Codex #1700 R3 M1)。end() の完了を手で止めて確かめる
   J.__setCdbJanReader(null);
-  J.__setCdbJanConnect(async () => pgliteClient({ hangSelect: true }));
+  for (const [label, hangSelect] of [['SELECT が返らない (期限で閉じる)', true], ['読めた (読み終わって閉じる)', false]]) {
+    let openGate;
+    const gate = new Promise((r) => { openGate = r; });
+    let cli = null;
+    J.__setCdbJanConnect(async () => { cli = pgliteClient({ hangSelect, endGate: gate }); return cli; });
+    try {
+      const t0 = Date.now();
+      const r = await J.readCdbJans([{ code: 'a001', jan: JAN.a1 }], { env: { COMPANY_DB_URL: 'postgres://x' }, deadlineMs: 200 });
+      assert.equal(r.ok, !hangSelect, label);
+      assert.ok(Date.now() - t0 < 1000, `${label}: 閉じ終わりを待って答えを遅らせた`);
+      await new Promise((res) => setTimeout(res, 80));
+      assert.deepEqual([cli.ended, cli.endDone, J.__janReadInFlight()], [1, 0, 1], `${label}: 閉じ終わる前に枠を返した`);
+      // 閉じ終わる前の 2 本目は通る・3 本目は「混んでいる」(閉じ途中の 1 本も数える)
+      openGate();
+      await new Promise((res) => setTimeout(res, 30));
+      assert.deepEqual([cli.endDone, J.__janReadInFlight()], [1, 0], `${label}: 閉じ終わった後も数えたまま`);
+    } finally { openGate(); J.__setCdbJanConnect(null); }
+  }
+  // end() が失敗しても枠は返す (読めた道・期限で閉じる道)。期限の道で失敗を拾い損ねて、プロセスを落とさない (unhandled rejection)
+  const unhandled = [];
+  const onUnhandled = (e) => unhandled.push(String((e && e.message) || e));
+  process.on('unhandledRejection', onUnhandled);
   try {
-    const r = await J.readCdbJans([{ code: 'a001', jan: JAN.a1 }], { env: { COMPANY_DB_URL: 'postgres://x' }, deadlineMs: 200 });
-    assert.equal(r.ok, false);
-    await new Promise((res) => setTimeout(res, 50));
-    assert.equal(J.__janReadInFlight(), 0, '接続を閉じた後も数えたまま');
-  } finally { J.__setCdbJanConnect(null); J.__setCdbJanReader(readWith(pgClient)); }
+    for (const hangSelect of [false, true]) {
+      J.__setCdbJanConnect(async () => { const c = pgliteClient({ hangSelect }); const end0 = c.end; c.end = async () => { await end0(); throw new Error('end failed'); }; return c; });
+      const r = await J.readCdbJans([{ code: 'a001', jan: JAN.a1 }], { env: { COMPANY_DB_URL: 'postgres://x' }, deadlineMs: 200 });
+      assert.equal(r.ok, !hangSelect);
+      await new Promise((res) => setTimeout(res, 50));
+      assert.equal(J.__janReadInFlight(), 0, 'end() が失敗したら枠を返さない');
+    }
+    assert.deepEqual(unhandled, [], 'end() の失敗を拾い損ねた');
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    J.__setCdbJanConnect(null); J.__setCdbJanReader(readWith(pgClient));
+  }
 });
 await ta('[C6] 期限は要求の入口から (deadlineAt): 残りが少なければ読みに行かない・接続の時間切れも残りに合わせる', async () => {
   let calls = 0;
@@ -486,6 +532,8 @@ try {
     assert.deepEqual(Object.keys(r.j.byDraft).map(Number).sort((x, y) => x - y), [dA3.id, dSet.id, dG.id].sort((x, y) => x - y));
     assert.deepEqual(r.j.byDraft[dG.id].units.map((u) => u.code), ['g-blue']);
     assert.equal(r.j.byDraft[dA3.id].label, 'Company DB と違う');
+    assert.match(r.j.byDraft[dA3.id].units[0].fix, /^product-hub の JAN を商品マスタの JAN と同じ値に直す/);
+    assert.match(r.j.byDraft[dSet.id].units[0].fix, /セットは商品マスタで JAN を持てない/);
   });
   await ta('[R3b] ボードは画面に出ているカード (ids) だけ照らす・件数もその分だけ・ids の形が違う / 多すぎる = 400', async () => {
     const r = await call('GET', `/apps/product-hub/api/board/jan-check?ids=${dA1.id},${dA3.id}`);
@@ -524,6 +572,35 @@ try {
       assert.ok(!(r.j.warnings || []).some((w) => /JAN/.test(w)), JSON.stringify(r.j.warnings));
     } finally { ph.prepare('UPDATE product_drafts SET jan_code = ? WHERE id = ?').run(JAN.a9, dA3.id); }
     assert.deepEqual(J.janUnitsForDraftId(ph, 999999), { mode: null, units: [] });
+  });
+  await ta('[R4d] 🚨 プレビューの JAN の読みも期限は入口から: 辞書を 4.5 秒以上待った後は読みに行かず「読めない」の一言 (payload は同じ・Codex #1700 R3 M2)', async () => {
+    const saved = { WAREHOUSE_URL: process.env.WAREHOUSE_URL, CF_ACCESS_CLIENT_ID: process.env.CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET: process.env.CF_ACCESS_CLIENT_SECRET, WAREHOUSE_SERVICE_TOKEN: process.env.WAREHOUSE_SERVICE_TOKEN };
+    Object.assign(process.env, { WAREHOUSE_URL: 'http://warehouse.invalid', CF_ACCESS_CLIENT_ID: 'x', CF_ACCESS_CLIENT_SECRET: 'x', WAREHOUSE_SERVICE_TOKEN: 'x' });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      if (!String(url).startsWith('http://warehouse.invalid')) return realFetch(url, opts);
+      await new Promise((r) => setTimeout(r, J.JAN_READ_DEADLINE_MS + 100));
+      return new Response(JSON.stringify({ message: 'x' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+    };
+    let reads = 0;
+    J.__setCdbJanReader(async (items) => { reads++; return readWith(pgClient)(items); });
+    ph.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id) VALUES (?, '100000')`).run(dA3.id);
+    try {
+      const r = await call('GET', `/apps/product-hub/api/drafts/${dA3.id}/rakuten/preview`);
+      assert.equal(r.status, 200);
+      assert.equal(reads, 0, '期限が過ぎた後に Company DB を読みに行った');
+      assert.ok((r.j.warnings || []).some((w) => /JAN を Company DB と比べられませんでした \(時間切れ/.test(w)), JSON.stringify(r.j.warnings));
+    } finally {
+      globalThis.fetch = realFetch;
+      J.__setCdbJanReader(readWith(pgClient));
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      ph.prepare('DELETE FROM draft_rakuten WHERE draft_id = ?').run(dA3.id);
+    }
+    const src = fs.readFileSync(new URL('../apps/product-hub/router.js', import.meta.url), 'utf8');
+    const route = "router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {";
+    const at = src.indexOf(route);
+    assert.match(src.slice(at + route.length, at + route.length + 200), /^\s*const janDeadlineAt = Date\.now\(\) \+ JAN_READ_DEADLINE_MS;/);
+    assert.match(src, /compareJanUnits\(janUnits, \{ deadlineAt: janDeadlineAt \}\)/);
   });
   await ta('[R4c] 🚨 プレビューの途中 (ジャンルの辞書を待つ間) に JAN が保存されても、payload と同じ今の値で比べる (Codex #1700 R1 M4)', async () => {
     const saved = { WAREHOUSE_URL: process.env.WAREHOUSE_URL, CF_ACCESS_CLIENT_ID: process.env.CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET: process.env.CF_ACCESS_CLIENT_SECRET, WAREHOUSE_SERVICE_TOKEN: process.env.WAREHOUSE_SERVICE_TOKEN };

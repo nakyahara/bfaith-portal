@@ -106,7 +106,9 @@ try {
     await mark.locator('.jan-cdb-pill').waitFor({ state: 'attached' });
     assert.equal(await mark.locator('.jan-cdb-pill').textContent(), 'Company DB: Company DB と違う');
     assert.ok(await mark.locator('.jan-cdb-pill').evaluate((el) => el.classList.contains('warn')));
-    assert.match(await mark.locator('.jan-cdb-detail').textContent(), /Company DB の JAN = 4900000001037。この JAN は Company DB ではほかの商品 \(a001\) の JAN/);
+    assert.match(await mark.locator('.jan-cdb-detail').first().textContent(), /Company DB の JAN = 4900000001037。この JAN は Company DB ではほかの商品 \(a001\) の JAN/);
+    // 直し方は状態ごと (違う = ここの JAN を直す)
+    assert.match(await mark.locator('.jan-cdb-detail').nth(1).textContent(), /^直し方: product-hub の JAN を商品マスタの JAN と同じ値に直す/);
     assert.equal(await page.locator('#jan-cdb-summary .jan-cdb-pill').textContent(), '商品マスタ (Company DB) と比べた JAN: Company DB と違う');
     await page.locator('details.jan-cdb-help summary').click();
     assert.ok(await page.locator('details.jan-cdb-help li').first().isVisible());
