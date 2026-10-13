@@ -1966,6 +1966,7 @@ await ta('[PO7] 🆕 0075 の前の DB (知らせの関数が無い) = 今まで
     const r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
     assert.equal(r.status, 200, r.text);
     assert.deepEqual([r.j.order_settings.ok, r.j.order_settings.status, attrsOf('po-web-7').order_lot], [true, undefined, 9]);
+    assert.equal(await one('select 1 from ops.order_settings_registrations where registration_request_id = $1::uuid', [body.request_id]), undefined, '0075 の前の登録に印を積んだ');
     assert.equal(await poOutboxOf('po-web-7'), undefined, '0075 の前に知らせを積んだ');
     // Codex #1703 R1 M2: 0075 の前に ② が失敗した登録 (旧の道)
     MR.__setOrderWriter(() => { throw new Error('SQLite に書けない'); });

@@ -225,7 +225,7 @@ export const AMAZON_LISTING_EDIT_FUNCTIONS = Object.freeze(['ops.set_amazon_sku_
  *   積む (登録と同じ取引の中だけ = DB が確かめる)・借りる・結果を書く・人が閉じる の 4 つの実行。表が無い DB (0075 の前) では付けない (流し直すと付く)。
  *   🚨 渡さない: 知らせの表の insert / update / delete (関数だけが書く)・中身の形の確かめの部品・守りの trigger
  */
-export const ORDER_OUTBOX_SELECT = Object.freeze(['ops.order_settings_outbox', 'ops.v_order_settings_outbox_open']);
+export const ORDER_OUTBOX_SELECT = Object.freeze(['ops.order_settings_outbox', 'ops.order_settings_registrations', 'ops.v_order_settings_outbox_open']);
 export const ORDER_OUTBOX_EDIT_FUNCTIONS = Object.freeze(['ops.enqueue_order_settings(uuid, text, jsonb)',
   'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer, uuid[])', 'ops.finish_order_settings_event(uuid, text, text, jsonb, text)',
   'ops.dismiss_order_settings_event(uuid, text, text)']);

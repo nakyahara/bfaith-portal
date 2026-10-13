@@ -110,7 +110,7 @@ import { sessionHasApp } from '../../lib/app-access.js';
 import { writeOrderSettings, writeRegistrationOrderSettings, registrationOrderDone, OrderSettingsError } from '../purchase-orders/order-settings.js';
 import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf } from './order-settings.mjs';
 import { orderOutboxReady, runOrderSettingsOutbox, readOrderSettingsForRegistration, deliveryInputOf, orderDeliveryEnabled, orderOutboxStatus, readOrderSettingsOutbox,
-  dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS } from '../../lib/order-settings-outbox.mjs';
+  dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, readRegistrationOrderMark, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS } from '../../lib/order-settings-outbox.mjs';
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
@@ -273,16 +273,22 @@ const ORDER_PENDING_WORDS = '発注の設定はまだ発注アプリに届いて
 const ORDER_MISMATCH_WORDS = '同じ登録の番号 (request_id) で、前と違う発注の設定が来ました。前の発注の設定のままです (変えていません)。商品の画面の「発注の設定」で確かめてください';
 /**
  * 🆕 0075: 登録 (押し直しも) の後の発注の設定 (Codex #1703 R1 M2 = 発注の設定は登録の要求のハッシュの外 = 0075 の前後で同じ要求が冪等)。
- *   押し直し (replayed): その登録の知らせがある = 中身の hash を今の発注の設定と照らす (違う = mismatch・何も変えない) → 同じなら届け直す /
- *                        知らせが無い = 0075 の前 (か知らせを使えなかった時) の登録 = legacy (今までの ② をすぐ書く・部品が request_id で 1 回だけ)
+ *   押し直し (replayed): 「知らせの道で登録した」印 (ops.order_settings_registrations・Codex #1703 R2 M) で見分ける:
+ *     印が無い = 0075 の前 (かロールの流し直しの前) の登録 = legacy (今までの ② をすぐ書く・部品が request_id で 1 回だけ)
+ *     印がある = 知らせと照らす: 知らせ 0 件 (発注の設定なしで登録) なのに発注の設定が来た・中身の hash が違う = mismatch (何も変えない) / 同じ = 届け直す
  *   新しい登録 = 届ける。戻り値 { mode: 'events', evs } | { mode: 'mismatch', codes } | { mode: 'legacy' }
  */
 async function ordersAfterRegistration(db, regId, replayed, base) {
   if (replayed) {
-    let cur = null;
-    try { cur = await readOrderSettingsForRegistration(db, regId); } catch (e) { console.error(`[master-edit] 発注の設定の知らせを読めない (${regId}): ${e && e.message}`); }
-    if (cur && cur.length === 0) return { mode: 'legacy' };
-    const bad = (cur || []).filter((e) => orderPayloadHash(orderPayloadOf(e.code, base)) !== e.payload_hash);
+    let mark; let cur;
+    try { mark = await readRegistrationOrderMark(db, regId); cur = await readOrderSettingsForRegistration(db, regId); } catch (e) {
+      // 読めない = どちらの道か決められない = 書かない (届け直しは画面を開いたとき・夜間)
+      console.error(`[master-edit] 発注の設定の知らせを読めない (${regId}): ${e && e.message}`);
+      return { mode: 'events', evs: null };
+    }
+    if (!mark) return { mode: 'legacy' };
+    if (cur.length === 0) return { mode: 'mismatch', codes: [] };
+    const bad = cur.filter((e) => orderPayloadHash(orderPayloadOf(e.code, base)) !== e.payload_hash);
     if (bad.length) return { mode: 'mismatch', codes: bad.map((e) => e.code) };
   }
   return { mode: 'events', evs: await deliverRegistrationOrders(db, regId) };
@@ -759,15 +765,16 @@ router.post('/api/new/variation', (req, res) => {
     }
   }
   return withPgApi(res, async (db) => {
-    // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ (子ごと) → commit の後に届ける。入る前 = 今までどおり ② をすぐ書く
-    const outbox = orderBase ? await orderOutboxReady(db) : false;
+    // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ (子ごと) → commit の後に届ける。入る前 = 今までどおり ② をすぐ書く。
+    //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
+    const outbox = await orderOutboxReady(db);
     const r = await registerVariationBatch(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: b.reason ?? null,
       group: b.group, axes: b.axes ?? null, options: b.options, children: b.children, values: b.values, card: b.card, order: outbox ? orderBase : null,
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
-    const after = orderInput && outbox ? await ordersAfterRegistration(db, regId, !!r.replayed, orderBase) : { mode: 'legacy' };
+    const after = orderInput && outbox ? await ordersAfterRegistration(db, regId, !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
     if (after.mode === 'mismatch') orderResult = { ok: false, reason: 'request_id_reused', written: 0, pending: 0, failed: (r.children || []).map((k) => ({ code: k.code, status: 'mismatch', error: ORDER_MISMATCH_WORDS })) };
     else if (after.mode === 'events' && after.evs && after.evs.length) orderResult = orderEventsView(after.evs, r.children);
     else if (after.mode === 'events') orderResult = orderEventsView([], r.children);
@@ -875,14 +882,15 @@ router.post('/api/new', (req, res) => {
     catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
   }
   return withPgApi(res, async (db) => {
-    // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ → commit の後に届ける (届かなくても知らせは残る = 届け直す)
-    const outbox = orderBase ? await orderOutboxReady(db) : false;
+    // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ → commit の後に届ける (届かなくても知らせは残る = 届け直す)。
+    //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
+    const outbox = await orderOutboxReady(db);
     const r = await registerNewSku(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
       order: outbox ? orderBase : null,
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox });
     let orderResult = null;
-    const after = orderInput && outbox ? await ordersAfterRegistration(db, String(b.request_id).trim().toLowerCase(), !!r.replayed, orderBase) : { mode: 'legacy' };
+    const after = orderInput && outbox ? await ordersAfterRegistration(db, String(b.request_id).trim().toLowerCase(), !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
     if (after.mode === 'mismatch') orderResult = { ok: false, status: 'mismatch', reason: 'request_id_reused', pending: false, error: ORDER_MISMATCH_WORDS };
     else if (after.mode === 'events' && after.evs && after.evs.length) orderResult = orderEventView(after.evs[0], r.replayed);
     else if (after.mode === 'events') orderResult = orderEventView({ status: 'pending', last_error: null }, false);

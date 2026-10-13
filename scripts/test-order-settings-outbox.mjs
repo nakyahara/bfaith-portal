@@ -55,9 +55,9 @@ const errOf = async (p) => { try { await p; } catch (e) { return e; } return nul
 const RATES = new Map([['S01', { method: 'ゆうパケット', cost: 210 }], ['S02', { method: '宅急便', cost: 520 }]]);
 const VALUES = Object.freeze({ standard_price: '1500', tax_rate: '0.1', sales_class: '3', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0', shipping_code: 'S01' });
 const baseOf = (patch = { order_lot: '12', condition_id: 'amc-30000' }, extra = {}) => MEO.orderBaseOf({ order: { patch, newCondition: extra.newCondition ?? null, newMaterial: extra.newMaterial ?? null }, supplierCode: '0001' });
-const regSingle = (code, { order = baseOf(), rid = uuid(), actor = 'naka@test', beforeCommit = undefined, kind = 'single' } = {}) => asEditor(() => R.registerNewSku(db, {
+const regSingle = (code, { order = baseOf(), rid = uuid(), actor = 'naka@test', beforeCommit = undefined, kind = 'single', outbox = true } = {}) => asEditor(() => R.registerNewSku(db, {
   actor, requestId: rid, kind, code, values: { name: `発注つき ${code}`, ...VALUES }, card: { create: false }, order,
-}, { open: true, shippingRates: RATES, orderOutbox: true, beforeCommit }));
+}, { open: true, shippingRates: RATES, orderOutbox: outbox, beforeCommit }));
 const rowsOf = (sql, p) => pg.query(sql, p).then((r) => r.rows);
 const outboxOf = async (code) => one(`select o.event_id::text as event_id, o.status, o.attempts, o.registration_kind, o.registration_request_id::text as reg, o.delivery_request_id::text as del,
     o.payload, o.payload_hash, o.created_by, o.last_error, o.result, o.lease_owner from ops.order_settings_outbox o join core.skus s on s.sku_id = o.sku_id where s.code_norm = lower($1)`, [code]);
@@ -111,8 +111,15 @@ await ta('[E1] 単品の登録 + 発注の設定 = 同じ取引で知らせ 1 �
   assert.equal(diff.replayed, true);
   assert.equal((await outboxOf('posync-s1')).payload.patch.order_lot, '12', '押し直しで知らせを変えた');
   const rid0 = uuid();
-  await regSingle('posync-s0', { order: null, rid: rid0 });
+  await regSingle('posync-s0', { order: null, rid: rid0, outbox: false });   // 0075 の前の道 (印なし) = 下の [E3] の「取引の外」で使う
   assert.equal(await outboxOf('posync-s0'), undefined);
+  // Codex #1703 R2 M: 知らせの道の登録は、発注の設定が無くても「知らせの道で登録した」印 (知らせ 0 件)
+  const ridN = uuid();
+  await regSingle('posync-sn', { order: null, rid: ridN });
+  assert.equal(await outboxOf('posync-sn'), undefined);
+  assert.deepEqual(await one('select registration_kind, item_count, created_by from ops.order_settings_registrations where registration_request_id = $1::uuid', [ridN]), { registration_kind: 'single', item_count: 0, created_by: 'naka@test' });
+  assert.deepEqual(await one('select registration_kind, item_count from ops.order_settings_registrations where registration_request_id = $1::uuid', [rid]), { registration_kind: 'single', item_count: 1 });
+  assert.equal(await one('select 1 from ops.order_settings_registrations where registration_request_id = $1::uuid', [rid0]), undefined);
   E1 = { rid, code: 'posync-s1', rid0 };
 });
 
@@ -133,7 +140,7 @@ await ta('[E3] 断る: 取引の外 (もう commit した登録)・ほかの人�
   const rid = uuid();
   const seen = {};
   const sp = async (k, fn) => { await pg.query('savepoint t'); seen[k] = await errOf(fn()); await pg.query('rollback to savepoint t'); };
-  const boom = await errOf(regSingle('posync-e3', { rid, order: null, beforeCommit: async () => {
+  const boom = await errOf(regSingle('posync-e3', { rid, order: null, outbox: false, beforeCommit: async () => {
     await sp('actor', () => enq(rid, 'other@test', [item('posync-e3')]));
     await sp('other_sku', () => enq(rid, 'naka@test', [item('s001')]));
     await sp('two', () => enq(rid, 'naka@test', [item('posync-e3'), item('s001')]));
@@ -147,12 +154,16 @@ await ta('[E3] 断る: 取引の外 (もう commit した登録)・ほかの人�
   assert.match(String(boom && boom.message), /最後に巻き戻す/);
   assert.match(String(seen.actor && seen.actor.message), /^not_in_registration/);
   assert.match(String(seen.other_sku && seen.other_sku.message), /^not_in_registration/);
-  assert.match(String(seen.two && seen.two.message), /^invalid_input: 単品の登録の知らせは 1 件/);
+  assert.match(String(seen.two && seen.two.message), /^invalid_input: 単品の登録の知らせは 0〜1 件/);
   assert.match(String(seen.shape && seen.shape.message), /^invalid_input: .*patch_value/);
   assert.match(String(seen.code_mismatch && seen.code_mismatch.message), /^invalid_input: 知らせの中身のコード/);
   assert.equal(seen.direct && seen.direct.code, '42501', '画面のロールが知らせを直接書けた');
   assert.ok(Array.isArray(seen.ok) && seen.ok.length === 1, `同じ取引の正しい知らせは積める: ${JSON.stringify(seen.ok)}`);
   assert.equal((await one(`select count(*)::int as n from ops.order_settings_outbox where code = 'posync-e3'`)).n, 0, '巻き戻した登録の知らせが残った');
+  // 印の表も画面のロールは直接書けない・持ち主でも変えない (追記だけ)
+  e = await asEditor(() => errOf(pg.query(`insert into ops.order_settings_registrations (registration_request_id, registration_kind, item_count, created_by) values ($1::uuid, 'single', 0, 'naka@test')`, [uuid()])));
+  assert.equal(e && e.code, '42501');
+  assert.ok(await errOf(pg.query(`update ops.order_settings_registrations set item_count = 5`)), '印の表を変えられた');
   // 画面のロールは状態の列も書けない
   e = await asEditor(() => errOf(pg.query(`update ops.order_settings_outbox set status = 'done' where code = 'posync-s1'`)));
   assert.equal(e && e.code, '42501');
@@ -327,6 +338,20 @@ await ta('[N3] (Codex #1703 R1 M1) 夜間の段: いつも失敗する古い知�
   for (const c of fail) await asEditor(async () => X.dismissOrderSettingsEvent(db, { eventId: (await outboxOf(c)).event_id, actor: 'naka@test', reason: '試験の後片付け' }));
 });
 
+await ta('[N4] (Codex #1703 R2 L1) 除く知らせは 10,000 個まで (それより多い = 断る)・null の要素は除く', async () => {
+  const many = Array.from({ length: 10001 }, () => uuid());
+  const e = await asEditor(() => errOf(pg.query(`select * from ops.claim_order_settings_events('n4', 'sweep', null, null, 1, 10, 5, $1::uuid[])`, [many])));
+  assert.match(String(e && e.message), /^invalid_input: 除く知らせは 10,000 個まで/);
+  await regSingle('posync-n4', { order: baseOf({ order_lot: '2' }) });
+  const ev = (await outboxOf('posync-n4')).event_id;
+  const got = await asEditor(() => rowsOf(`select event_id::text as id from ops.claim_order_settings_events('n4', 'sweep', null, null, 200, 10, 5, $1::uuid[])`, [[null, uuid(), ...many.slice(0, 9997)]]));
+  assert.ok(got.some((r) => r.id === ev), 'null を含む除く知らせで借りられない');
+  const got2 = await asEditor(() => rowsOf(`select event_id::text as id from ops.claim_order_settings_events('n4b', 'manual', null, $2::uuid, 1, 10, 5, $1::uuid[])`, [[null, ev], ev]));
+  assert.equal(got2.length, 0, '除いた知らせを借りた');
+  await pg.query(`update ops.order_settings_outbox set leased_until = now() - interval '1 second' where event_id = $1::uuid`, [ev]);
+  await deliver({ mode: 'manual', eventId: ev });
+});
+
 await ta('[N2] 夜間ロード (apps/company-db/nightly.mjs) の既定の後ろの段に入っている (新しい定期実行は作らない)・台帳の夜間ロードの項目に段と手順', async () => {
   const N = await import('../apps/company-db/nightly.mjs');
   assert.deepEqual(N.DEFAULT_STEPS.map((s) => s.id), ['po-settings-outbox']);
@@ -442,15 +467,38 @@ await ta('[R1] まとまりの登録 (画面の API) + 発注の設定 = 子ご�
   assert.match(js, /まだ発注アプリに届いていません/);
 });
 
+let npb = null;
 await ta('[R2] (Codex #1703 R1 L1) migration の後・ロールの流し直しの前 (画面のロールに知らせの関数の権限が無い) = 登録は止めない・今までどおり ② をすぐ書く (知らせは積まない)', async () => {
   await pg.query('revoke execute on function ops.enqueue_order_settings(uuid, text, jsonb) from master_edit');
   try {
     const body = { request_id: uuid(), kind: 'single', code: 'posync-np', card: { create: false }, values: { name: '権限の前', ...VALUES }, order_settings: { order_lot: '30' } };
+    npb = { request_id: uuid(), kind: 'single', code: 'posync-np2', card: { create: false }, values: { name: '権限の前 2', ...VALUES }, order_settings: { order_lot: '31' } };
     const r = await call('POST', '/apps/master-edit/api/new', body);
     assert.equal(r.status, 200, r.text);
     assert.deepEqual([r.j.ok, r.j.order_settings.ok, r.j.order_settings.status, attrsOf('posync-np').order_lot], [true, true, undefined, 30]);
     assert.equal(await outboxOf('posync-np'), undefined);
+    // 権限の前に ② が失敗した登録も
+    MR.__setOrderWriter(() => { throw new Error('SQLite に書けない'); });
+    try { assert.equal((await call('POST', '/apps/master-edit/api/new', npb)).j.order_settings.ok, false); } finally { MR.__setOrderWriter(null); }
   } finally { await pg.query('grant execute on function ops.enqueue_order_settings(uuid, text, jsonb) to master_edit'); }
+  // ロールを流し直した後に押し直す = 印が無い (知らせの道でない登録) = 今までの道で書く (mismatch にしない)
+  const again = await call('POST', '/apps/master-edit/api/new', npb);
+  assert.deepEqual([again.status, again.j.replayed, again.j.order_settings.ok, attrsOf('posync-np2').order_lot], [200, true, true, 31], again.text);
+  assert.equal(await outboxOf('posync-np2'), undefined);
+});
+
+await ta('[R3] (Codex #1703 R2 M) 0075 の後に発注の設定なしで登録 → 同じ request_id に発注の設定を足して押し直す = 違う中身 (mismatch・黙って書かない)・単品もまとまりも', async () => {
+  const sb = { request_id: uuid(), kind: 'single', code: 'posync-r3', card: { create: false }, values: { name: '設定なし', ...VALUES } };
+  assert.equal((await call('POST', '/apps/master-edit/api/new', sb)).status, 200);
+  const r = await call('POST', '/apps/master-edit/api/new', { ...sb, order_settings: { order_lot: '30' } });
+  assert.deepEqual([r.status, r.j.replayed, r.j.order_settings.ok, r.j.order_settings.status, r.j.order_settings.reason, attrsOf('posync-r3')], [200, true, false, 'mismatch', 'request_id_reused', null], r.text);
+  assert.equal(await outboxOf('posync-r3'), undefined);
+  const vb = { request_id: uuid(), group: { mode: 'new', code: 'posync-r3g', name: 'まとまり (設定なし)' }, axes: [{ axis: 1, name: 'カラー' }],
+    options: [{ axis: 1, code: '-A', name: 'A' }], children: [{ code: 'posync-r3g-A', choices: { 1: '-A' }, name: 'まとまり【A】' }], values: { ...VALUES }, card: {} };
+  assert.equal((await call('POST', '/apps/master-edit/api/new/variation', vb)).status, 200);
+  const v = await call('POST', '/apps/master-edit/api/new/variation', { ...vb, order_settings: { order_lot: '30' } });
+  assert.deepEqual([v.status, v.j.replayed, v.j.order_settings.ok, v.j.order_settings.reason, v.j.order_settings.failed.map((f) => f.status), attrsOf('posync-r3g-A')],
+    [200, true, false, 'request_id_reused', ['mismatch'], null], v.text);
 });
 
 await ta('[P1] 発注アプリ: 届いていない新商品に「発注の設定がまだ届いていない」の印 (すすめる数は今の設定で出す = 止めない)・全部の画面の上の帯・API の件数・Company DB が読めなくても画面は出る', async () => {
@@ -500,6 +548,16 @@ await ta('[P1] 発注アプリ: 届いていない新商品に「発注の設定
     assert.equal(D2.poPending.ok, false);
     assert.equal((await call('GET', '/apps/purchase-orders/api/order-settings-outbox')).j.ok, false);
   } finally { PHO.__setCompanyDbClientFactory(roleClient); }
+  // Codex #1703 R2 L2: Company DB が遅い (1 回の接続に 2 秒) = 状態と照らしの合計 3 秒で諦めて画面を出す (印なし)
+  PHO.__setCompanyDbClientFactory(async (u) => { await new Promise((r) => setTimeout(r, 2000)); return roleClient(u); });
+  X.__resetOrderOutboxCacheForTest();
+  try {
+    const t0 = Date.now();
+    const slow = await call('GET', '/apps/purchase-orders/supplier/1');
+    const ms = Date.now() - t0;
+    assert.equal(slow.status, 200);
+    assert.ok(ms < 3700, `仕入先の画面が ${ms} ms 待った (3 秒で諦める)`);
+  } finally { await new Promise((r) => setTimeout(r, 2500)); PHO.__setCompanyDbClientFactory(roleClient); }
   // 届け直し (Render の中) = 開いたら届く → 印は消える
   X.__setOrderDeliveryEnabledForTest(true);
   X.__resetOrderOutboxCacheForTest();

@@ -11,7 +11,10 @@
 --      = 今の router.mjs の作り)。中身 (schema・payload・hash・作った人・時刻) は変えない・消さない。
 --      状態: pending (まだ) → done (発注アプリに書けた / 前に書いてあった) / failed (失敗 = 自動で 5 回まで・夜間の段はその後も毎晩) /
 --            conflict (発注アプリにほかの画面がもうこの商品の行を作っていた = 上書きしない・人が確かめる) / dismissed (人が理由をつけて閉じた)
---   2. ops.enqueue_order_settings(登録の ID, 人, 中身の配列) = 知らせを積む (security definer)。🚨 登録と同じ取引の中だけ:
+--   1b. ops.order_settings_registrations = 「知らせの道で登録した」印 (登録 1 つに 1 行・発注の設定が無い登録も = 知らせ 0 件・追記だけ)。
+--       押し直しの照らし (Codex #1703 R2 M): 印あり = 0075 の後の登録 (知らせと照らす・知らせ 0 件なのに発注の設定が来た = 違う中身) /
+--       印なし = 0075 の前 (かロールの流し直しの前) の登録 = 今までの道 (② をすぐ書く)
+--   2. ops.enqueue_order_settings(登録の ID, 人, 中身の配列 (0〜120 件)) = 印と知らせを積む (security definer)。🚨 登録と同じ取引の中だけ:
 --        単品 = ops.master_edit_requests の sku_create・done・同じ人・**この取引で書いた行** (xmin) の SKU だけ (1 件)
 --        まとまり = ops.variation_batches の closed・同じ人・**この取引で開いた** (txid) まとめての登録の子だけ (子の sku_create もこの取引)
 --      = 画面のロールが後から別の取引で知らせを作れない (知らせの表の insert は渡さない)。hash は DB が作る (ops.js_stable_sha256 = 画面・届け手の stable と同じ形)
@@ -58,6 +61,17 @@ create table ops.order_settings_outbox (
 create index ix_order_settings_outbox_open on ops.order_settings_outbox (created_at) where status in ('pending', 'failed', 'conflict');
 create index ix_order_settings_outbox_reg on ops.order_settings_outbox (registration_request_id);
 comment on table ops.order_settings_outbox is '新商品の登録の発注の設定を発注アプリ (SQLite の po_*) へ届ける知らせ (0075・CompanyDB構想 21 C1)。登録と同じ取引で書く。中身は変えない・消さない。正本は発注アプリ';
+
+create table ops.order_settings_registrations (
+  registration_request_id  uuid primary key,
+  company_id               smallint not null default 1 references core.companies,
+  registration_kind        text not null check (registration_kind in ('single', 'variation')),
+  item_count               integer not null check (item_count between 0 and 120),
+  created_by               text not null check (length(created_by) between 1 and 320),
+  created_at               timestamptz not null default now()
+);
+select core.make_append_only('ops', 'order_settings_registrations');
+comment on table ops.order_settings_registrations is '知らせの道 (0075 の後) で登録した印 (0075)。発注の設定が無い登録も 1 行 (item_count 0)。押し直しで 0075 の前の登録と見分ける。追記だけ';
 
 create function ops.guard_order_settings_outbox() returns trigger language plpgsql as $$
 begin
@@ -131,8 +145,8 @@ declare
 begin
   if p_registration_request_id is null then raise exception 'invalid_input: 登録の ID (request_id) が要る' using errcode = '22023'; end if;
   if p_actor_id is null or pg_catalog.length(p_actor_id) not between 1 and 320 then raise exception 'invalid_input: 人 (actor) が要る' using errcode = '22023'; end if;
-  if p_items is null or pg_catalog.jsonb_typeof(p_items) <> 'array' or pg_catalog.jsonb_array_length(p_items) not between 1 and 120 then
-    raise exception 'invalid_input: 知らせは 1〜120 件の配列' using errcode = '22023';
+  if p_items is null or pg_catalog.jsonb_typeof(p_items) <> 'array' or pg_catalog.jsonb_array_length(p_items) not between 0 and 120 then
+    raise exception 'invalid_input: 知らせは 0〜120 件の配列' using errcode = '22023';
   end if;
   -- 登録 = この取引で書いた単品の登録 (sku_create・done) か、この取引で開いて閉じたまとめての登録
   select m.request_id, m.operation, m.status, m.actor_id, m.sku_id, m.xmin = pg_catalog.pg_current_xact_id()::xid as fresh
@@ -142,7 +156,7 @@ begin
       raise exception 'not_in_registration: 発注の設定の知らせは、同じ人の登録 (sku_create) と同じ取引の中だけで積む' using errcode = '42501';
     end if;
     v_kind := 'single';
-    if pg_catalog.jsonb_array_length(p_items) <> 1 then raise exception 'invalid_input: 単品の登録の知らせは 1 件' using errcode = '22023'; end if;
+    if pg_catalog.jsonb_array_length(p_items) > 1 then raise exception 'invalid_input: 単品の登録の知らせは 0〜1 件' using errcode = '22023'; end if;
   else
     select * into v_batch from ops.variation_batches b where b.request_id = p_registration_request_id;
     if not found or v_batch.status <> 'closed' or v_batch.txid <> pg_catalog.txid_current() or v_batch.actor_id is distinct from p_actor_id then
@@ -150,6 +164,9 @@ begin
     end if;
     v_kind := 'variation';
   end if;
+  -- 知らせの道で登録した印 (登録 1 つに 1 回 = 同じ取引で 2 回呼ぶと主キーで断る)
+  insert into ops.order_settings_registrations (registration_request_id, registration_kind, item_count, created_by)
+    values (p_registration_request_id, v_kind, pg_catalog.jsonb_array_length(p_items), p_actor_id);
   for v_item in select x from pg_catalog.jsonb_array_elements(p_items) x loop
     if pg_catalog.jsonb_typeof(v_item) <> 'object' or pg_catalog.jsonb_typeof(v_item -> 'code') <> 'string' then
       raise exception 'invalid_input: 知らせの 1 件 = { code, payload }' using errcode = '22023';
@@ -199,6 +216,9 @@ create function ops.claim_order_settings_events(p_owner text, p_mode text, p_reg
 begin
   if p_owner is null or p_owner !~ '^[A-Za-z0-9_.:-]{1,100}$' then raise exception 'invalid_input: 借りる人 (owner) の形が違う' using errcode = '22023'; end if;
   if p_mode is null or p_mode not in ('auto', 'sweep', 'manual') then raise exception 'invalid_input: mode は auto / sweep / manual' using errcode = '22023'; end if;
+  -- 除く知らせ = 10,000 個まで (夜間の段の最大 = 50 周 × 200・Codex #1703 R2 L1)・null の要素は除く
+  if p_exclude is not null and pg_catalog.cardinality(p_exclude) > 10000 then raise exception 'invalid_input: 除く知らせは 10,000 個まで' using errcode = '22023'; end if;
+  p_exclude := pg_catalog.array_remove(p_exclude, null);
   return query
   with c as (
     select o.event_id from ops.order_settings_outbox o
@@ -267,6 +287,6 @@ comment on view ops.v_order_settings_outbox_open is '発注の設定がまだ発
 -- 見張りは読むだけ。画面のロールの権限は scripts/company-db/create-master-edit-roles.mjs (migration の後に流し直す)
 do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then
-    execute 'grant select on ops.order_settings_outbox, ops.v_order_settings_outbox_open to watcher';
+    execute 'grant select on ops.order_settings_outbox, ops.order_settings_registrations, ops.v_order_settings_outbox_open to watcher';
   end if;
 end $$;

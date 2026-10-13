@@ -613,13 +613,16 @@ router.get('/api/overview', (req, res) => {
  */
 async function orderSettingsPending(codes = []) {
   const none = { ok: false, open: 0, overdue: 0, keys: new Set() };
-  const timeout = (ms) => new Promise((r) => setTimeout(() => r(null), ms).unref());
-  try {
-    const st = await Promise.race([orderOutboxStatus({ limit: 1 }), timeout(3000)]);
+  // 状態の確かめとコードの照らしで共通の 3 秒 (画面は最大 3 秒で出す・Codex #1703 R2 L2)
+  const both = (async () => {
+    const st = await orderOutboxStatus({ limit: 1 });
     if (!st || !st.ok || !st.ready) return none;
-    const k = await Promise.race([withCompanyDb((db) => readOrderSettingsPendingFor(db, codes), { applicationName: 'po-settings-marks', statementTimeout: '5s' }), timeout(3000)]);
+    const k = await withCompanyDb((db) => readOrderSettingsPendingFor(db, codes), { applicationName: 'po-settings-marks', statementTimeout: '3s' });
     if (!k || !k.ok || !k.value) return none;
     return { ok: true, open: st.open || 0, overdue: st.overdue || 0, keys: new Set([...k.value].map((c) => normProductCode(c))) };
+  })().catch((e) => { console.error(`[purchase-orders] 発注の設定の届け待ちを読めない: ${e && e.message}`); return none; });
+  try {
+    return (await Promise.race([both, new Promise((r) => setTimeout(() => r(null), 3000).unref())])) || none;
   } catch (e) { console.error(`[purchase-orders] 発注の設定の届け待ちを読めない: ${e && e.message}`); return none; }
 }
 /** 仕入先の画面に出る商品のコード (要発注・追加候補・掘り起こし・下書きのリスト外) */
