@@ -88,6 +88,8 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
+/** 毎朝のまとめの段の名前 (Company DB構想 22 の Q-4。再試行には載せない) */
+const REGISTER_SUMMARY_STEP = '新商品と要確認のまとめ';
 const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', '新商品の許可', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB写し(Amazon SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon決済と財務', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB注文(メルカリ)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'm_products_history', 'CompanyDB観測原価', 'CompanyDB出品一覧(Amazon)'];
 // 🚨 Amazon の決済と財務は env CDB_FINANCE_COORDINATOR=1 のときだけ coordinator「Amazon決済と財務」の 1 工程・無ければ今までの 2 工程「Amazon Settlement」→「CompanyDB財務(Amazon)」
 //   (finance-coordinator-switch.js・#1567。走るのはどちらか片方 = retry の対象には両方の名前を載せる)
@@ -1524,6 +1526,17 @@ async function main() {
     const newEntryGateResult = runScript('apps/company-db/master-compare/new-entry-gate.mjs --daily', NEW_ENTRY_GATE_STEP, 120000);
     results.push({ name: NEW_ENTRY_GATE_STEP, ...newEntryGateResult, warn: newEntryGateResult.success && isWarnSummary(newEntryGateResult.summary) });
   }
+
+  // ─── 新商品と要確認のまとめ (Company DB構想 22 の Q-4・中原さんの決定 10/13 Q5 a = 毎朝のまとめに「要確認 N 件」と一覧。新しい定期実行ではない = この 1 段) ───
+  // 照合 ② の後 (要確認の確かめの表は最新の封をした照合の回を読む)。読むだけ (見張りのロール watcher・COMPANY_DB_WATCH_URL)。
+  // 最後の行 = 登録の状態の数・カード作成待ち・要確認 N 件 (確認済みにできる件数とコード・直す所の多い理由・一覧のはじめの 10 件)。1 件ずつの行はログだけ。
+  // 要確認が 500 件を超える = 一覧は出さない (ops.quarantine_confirm_list の上限)。読めない・届かない = 止めずに ⚠️「読めない」(--daily = exit 0)。
+  // RETRYABLE_JOBS に入れない (読むだけ・翌朝また読めば足りる)。⚠️「読めない」の朝だけ warn (要確認があるだけでは朝の見出しを ⚠️ にしない)
+  // 子の中の期限 (60 秒) でも終わらず親の 120 秒で殺された・子が落ちた = これも止めずに ⚠️ 読めない (❌ にしない。Codex #1717 R1 High)
+  const registerSummaryRaw = runScript('scripts/company-db/master-register-summary.mjs --daily', REGISTER_SUMMARY_STEP, 120000);
+  const registerSummaryResult = registerSummaryRaw.success || registerSummaryRaw.gated ? registerSummaryRaw
+    : { success: true, summary: `⚠️ 新商品と要確認のまとめ: 読めない (${String(registerSummaryRaw.summary || '').split('\n')[0].slice(0, 200)}) = 毎朝の通知は止めない・明日また読む` };
+  results.push({ name: REGISTER_SUMMARY_STEP, ...registerSummaryResult, warn: registerSummaryResult.success && /読めない/.test(String(registerSummaryResult.summary || '')) });
 
   // Amazon手数料カバー率の監視 (SLO 監視、Codex+Claude 議論結果 2026-05-15)
   // 売上加重カバー率 (件数じゃなく金額) を主指標、warn 30日<98%、critical <95% or 売上TOP20未カバー

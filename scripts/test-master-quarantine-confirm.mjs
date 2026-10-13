@@ -887,4 +887,120 @@ await ta('[H1] 全部の migration を流した DB で heavyEntryFindings が空
   }
 });
 
+// ═══════════ [Q4] 毎朝のまとめ (Company DB構想 22 の Q-4・中原さんの決定 10/13 Q5 a) ═══════════
+console.log('[Q4] 毎朝のまとめ');
+const SUM = await import('./company-db/master-register-summary.mjs');
+await ta('[Q4-1] まとめの最後の行 = 要確認 N 件・確認済みにできる件数とコード・直す所の多い理由・一覧 (はじめの 10 件)・1 件ずつの行 = 確かめの表 (ops.quarantine_confirm_list) と同じ答え・watcher でも同じ', async () => rolledBack(async () => {
+  await setSku('q02', { reorder_months: null });   // 直す所がある要確認を 1 つ (取引の中だけ)
+  await setSku('q04', { name: '照合の後に変えた名前' });   // NE と違う (ne.name) の要確認を 1 つ
+  const list = (await one('select ops.quarantine_confirm_list(null) as r')).r;
+  const ready = list.filter((x) => x.ok).map((x) => x.code);
+  const notReady = list.filter((x) => !x.ok).map((x) => x.code);
+  assert.ok(ready.length >= 1 && notReady.length >= 1, `確認済みにできる ${ready.length}・直す所あり ${notReady.length} (試験の前提)`);
+  const r = await SUM.summarize(db);
+  assert.equal(r.quarantine.state, 'ok');
+  assert.deepEqual(r.quarantine.ready, ready);
+  assert.deepEqual(r.quarantine.notReady.map((x) => x.code), notReady);
+  assert.match(r.line, new RegExp(`要確認 ${list.length} 件: 確認済みにできる ${ready.length} \\(${ready.slice(0, 10).join('・')}`));
+  assert.match(r.line, new RegExp(`直す所あり ${notReady.length} \\(`));
+  assert.match(r.line, /→ マスタの入力の商品の画面で確かめる・一覧: /);
+  // 一覧 = 確かめの表の順のまま はじめの 10 件 (確認済みにできるものを先に集めない。Codex #1717 R1 Medium)
+  const shownWant = list.slice(0, 10).map((x) => x.code).join('・');
+  assert.ok(r.line.endsWith(`一覧: ${shownWant}${list.length > 10 ? ` ほか ${list.length - 10} 件` : ''}`), r.line);
+  assert.ok(r.line.includes(`新商品の登録: `) && r.line.includes(`要確認 ${list.length}`), r.line);
+  assert.equal(r.details.length, list.length);
+  for (const code of ready) assert.ok(r.details.includes(`  ✅ ${code}: 確認済みにできる`), code);
+  // 理由の言葉 = 確かめの表のだめな行 (ne.* は「NE と違う (マスタの判断)」にまとめる)
+  const want = {};
+  for (const x of list.filter((y) => !y.ok)) for (const k of new Set(x.items.filter((i) => !i.ok).map((i) => SUM.QUARANTINE_KEY_LABELS[i.key.startsWith('ne.') ? 'ne' : i.key] ?? i.key))) want[k] = (want[k] || 0) + 1;
+  assert.deepEqual(r.quarantine.reasonCounts, want);
+  assert.deepEqual(r.counts.quarantine, { state: 'ok', total: list.length, ready: ready.length, not_ready: notReady.length, reasons: want });
+  const w = await as('watcher', () => SUM.summarize(db));
+  assert.equal(w.line, r.line);
+  assert.ok(r.details.includes('  ・ q02: 推奨保有月数'), JSON.stringify(r.details));
+  assert.ok(r.details.includes('  ・ q04: NE と違う (マスタの判断)'), JSON.stringify(r.details));
+  assert.equal(r.quarantine.reasonCounts['NE と違う (マスタの判断)'], 1);
+  assert.equal(r.quarantine.reasonCounts['推奨保有月数'], 1);
+}));
+await ta('[Q4-2] 一覧の上限 500 件: 要確認が 500 件を超える = 一覧は出さない (件数だけ) / ちょうど 500 = 出す / 要確認なし = 要確認の部分を出さない', async () => {
+  const n0 = (await one(`select count(*)::int as n from ops.master_registrations where state = 'quarantined'`)).n;
+  await rolledBack(async () => {
+    await q(`with p as (insert into core.products (company_id, display_code, name, status, sales_class) select 1, 'sum' || g, 'sum' || g, 'active', 3 from generate_series(1, $1::int) g returning product_id, display_code)
+      insert into core.skus (company_id, product_id, code, sku_kind, name, tax_rate, tax_class, handling, standard_price_jpy) select 1, p.product_id, p.display_code, 'single', p.display_code, 0.1, 'STANDARD_10', 'active', 100 from p`, [501 - n0]);
+    await one(`select ops.quarantine_unregistered_skus('t') as n`);
+    const r = await SUM.summarize(db);
+    assert.equal(r.quarantine.state, 'too_many');
+    assert.match(r.line, /要確認 501 件 \(500 件を超える = 一覧は出さない/);
+    assert.deepEqual(r.details, []);
+  });
+  await rolledBack(async () => {
+    await q(`with p as (insert into core.products (company_id, display_code, name, status, sales_class) select 1, 'sum' || g, 'sum' || g, 'active', 3 from generate_series(1, $1::int) g returning product_id, display_code)
+      insert into core.skus (company_id, product_id, code, sku_kind, name, tax_rate, tax_class, handling, standard_price_jpy) select 1, p.product_id, p.display_code, 'single', p.display_code, 0.1, 'STANDARD_10', 'active', 100 from p`, [500 - n0]);
+    await one(`select ops.quarantine_unregistered_skus('t') as n`);
+    const r = await SUM.summarize(db);
+    assert.equal(r.quarantine.state, 'ok');
+    assert.match(r.line, /要確認 500 件: .* ほか 490 件$/);
+  });
+  await rolledBack(async () => {
+    await pg.query("select set_config('ops.registration_protocol', '1', true)");
+    await q(`update ops.master_registrations set state = 'cancelled', state_changed_by = 't' where state = 'quarantined'`);
+    const r = await SUM.summarize(db);
+    assert.equal(r.quarantine.state, 'none');
+    assert.doesNotMatch(r.line, /要確認/);
+  });
+});
+await ta('[Q4-3] 読めない・0079 の前・届かない: 要確認の部分だけ「読めない」/「0079 の前」(行は出す)・--daily は届かないときも止めずに ⚠️ 読めない (exit 0)・--daily でなければ ❌ (exit 1)', async () => {
+  const fake = (over) => ({ query: async (sql, p) => (over(sql) ?? db.query(sql, p)) });
+  const broken = await SUM.summarize(fake((sql) => (/quarantine_confirm_list\(null\)/.test(sql) ? Promise.reject(new Error('canceling statement due to statement timeout')) : null)));
+  assert.equal(broken.quarantine.state, 'unreadable');
+  assert.match(broken.line, /要確認 \d+ 件 \(確かめの表を読めない: canceling statement due to statement timeout\)/);
+  const before = await SUM.summarize(fake((sql) => (/to_regprocedure\('ops\.quarantine_confirm_list/.test(sql) ? Promise.resolve({ rows: [{ ok: false }] }) : null)));
+  assert.equal(before.quarantine.state, 'not_applied');
+  assert.match(before.line, /確かめの表は 0079 の前/);
+  assert.deepEqual(SUM.failureLine(new Error('connect ECONNREFUSED'), { daily: true }), { line: '⚠️ 新商品と要確認のまとめ: 読めない (connect ECONNREFUSED) = 毎朝の通知は止めない・明日また読む', code: 0 });
+  assert.equal(SUM.failureLine(new Error('x')).code, 1);
+  // コードは 1 行・40 文字まで (改行・制御文字・向きを変える文字でログの行や朝のまとめを壊さない。Codex #1717 R1 Medium)
+  assert.equal(SUM.safeCode('a\nb\r\u0000c\u202ed'), 'a b c d');
+  assert.equal(SUM.safeCode('x'.repeat(41)), 'x'.repeat(39) + '…');
+  assert.equal(SUM.safeCode('x'.repeat(40)), 'x'.repeat(40));
+  assert.equal(SUM.safeCode(null), '?');
+  const odd = await SUM.summarizeQuarantine({ query: async (sql) => (/to_regprocedure/.test(sql) ? { rows: [{ ok: true }] }
+    : { rows: [{ r: [{ code: 'z1', ok: false, items: [{ key: 'cost', ok: false }] }, { code: 'bad\n✅ fake: 確認済みにできる', ok: true, items: [] }, { code: 'y'.repeat(300), ok: true, items: [] }] }] }) }, 3);
+  assert.deepEqual(odd.details, ['  ・ z1: 原価', '  ✅ bad ✅ fake: 確認済みにできる: 確認済みにできる', `  ✅ ${'y'.repeat(39)}…: 確認済みにできる`]);
+  assert.ok(!odd.text.includes('\n') && odd.text.endsWith(`一覧: z1・bad ✅ fake: 確認済みにできる・${'y'.repeat(39)}…`), odd.text);
+  // 中の期限: 終わらない約束を打ち切る・終わる約束はそのまま
+  await assert.rejects(SUM.withDeadline(new Promise(() => {}), 50, 'まとめ'), /^Error: まとめが 0 秒で終わらない$/);
+  assert.equal(await SUM.withDeadline(Promise.resolve(7), 1000, 'x'), 7);
+  // 本物の CLI (届かない DB)
+  const { spawnSync } = await import('node:child_process');
+  const run = (args) => spawnSync(process.execPath, [path.join(ROOT, 'scripts/company-db/master-register-summary.mjs'), ...args],
+    { encoding: 'utf8', timeout: 60000, env: { ...process.env, COMPANY_DB_WATCH_URL: 'postgres://u:p@127.0.0.1:9/none', COMPANY_DB_URL: '' } });
+  const d = run(['--daily']);
+  assert.equal(d.status, 0, d.stderr);
+  assert.match(d.stdout.trim().split('\n').pop(), /^⚠️ 新商品と要確認のまとめ: 読めない \(/);
+  const nd = run([]);
+  assert.equal(nd.status, 1);
+  assert.match(nd.stdout.trim().split('\n').pop(), /^❌ 新商品の登録のまとめ: /);
+  // 本物の CLI (つながるが何も答えない DB) = --daily は中の期限で ⚠️ 読めない (exit 0)・親の 120 秒を待たずに終わる (Codex #1717 R1 High)
+  const net = await import('node:net');
+  const socks = [];
+  const srv = net.createServer((s) => { s.on('error', () => {}); socks.push(s); });   // 受けるだけ・何も返さない (子が切ったときの ECONNRESET は受け流す)
+  await new Promise((res) => srv.listen(0, '127.0.0.1', res));
+  try {
+    const { spawn } = await import('node:child_process');
+    const t0 = Date.now();
+    const h = await new Promise((res) => {
+      const c = spawn(process.execPath, [path.join(ROOT, 'scripts/company-db/master-register-summary.mjs'), '--daily'],
+        { env: { ...process.env, COMPANY_DB_WATCH_URL: `postgres://u:p@127.0.0.1:${srv.address().port}/none`, COMPANY_DB_URL: '', REGISTER_SUMMARY_DEADLINE_MS: '2000' } });
+      let out = '', err = '';
+      c.stdout.on('data', (b) => { out += b; }); c.stderr.on('data', (b) => { err += b; });
+      const kill = setTimeout(() => c.kill(), 30000);
+      c.on('close', (status) => { clearTimeout(kill); res({ status, out, err }); });
+    });
+    assert.equal(h.status, 0, h.err);
+    assert.match(h.out.trim().split('\n').pop(), /^⚠️ 新商品と要確認のまとめ: 読めない \(まとめが 2 秒で終わらない\) = 毎朝の通知は止めない/);
+    assert.ok(Date.now() - t0 < 15000, `${Date.now() - t0}ms`);
+  } finally { for (const s of socks) s.destroy(); srv.close(); }
+});
+
 console.log(`\n${passed} 件 ok${process.exitCode ? ' (NG あり)' : ''}`);
