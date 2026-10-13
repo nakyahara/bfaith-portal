@@ -13,7 +13,7 @@
  */
 import { createHash } from 'crypto';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
-import { loadPmlMerged } from './logic.js';
+import { loadPmlMerged, loadPmlMergedFor } from './logic.js';
 import { getSetting, audit } from './ledger.js';
 
 const nowIso = () => new Date().toISOString();
@@ -39,6 +39,14 @@ export function detectBarcodeType(value) {
   return 'unknown';
 }
 
+/** PML の 1 行が対象か。対象 = null / 対象外 = 理由のキー (set / not_amc / not_own_product)。loadBarcodeTargets と barcodeTargetOf の共通 */
+function targetReasonOfRow(r, supplier) {
+  if (String(r['商品区分'] || '').trim() === 'セット') return 'set';
+  if (normSupplierCode(r['仕入先']) !== supplier) return 'not_amc';
+  if (String(r['売上分類'] == null ? '' : r['売上分類']).trim() !== '1') return 'not_own_product';
+  return null;
+}
+
 /**
  * バーコード管理対象の商品一覧を PML(+NEオーバーレイ) から取得。
  * 返値: { pub, rows (PML全行=orphan理由の算出等で再利用可), targets: Map<product_key, {code, name, active, vendorCode}> }
@@ -50,9 +58,7 @@ export function loadBarcodeTargets() {
   const targets = new Map();
   if (!pub) return { pub: null, rows: [], targets };
   for (const r of rows) {
-    if (String(r['商品区分'] || '').trim() === 'セット') continue;
-    if (normSupplierCode(r['仕入先']) !== supplier) continue;
-    if (String(r['売上分類'] == null ? '' : r['売上分類']).trim() !== '1') continue;
+    if (targetReasonOfRow(r, supplier)) continue;
     const key = normProductCode(r['商品コード']);
     if (!key) continue;
     targets.set(key, {
@@ -191,21 +197,23 @@ export const BARCODE_VIA = Object.freeze({ 'master-edit:sku': 'マスタの入�
  * { pmlSynced, target, reason (対象外の理由のキー・対象 = null), code, name, vendorCode, label (今の行・無ければ null) }
  */
 export function barcodeTargetOf(productCode) {
+  // 商品管理リスト全体は読まない = その商品の行だけ (公開の世代 + NE オーバーレイ・loadPmlMergedFor)。決め方は loadBarcodeTargets と同じ (targetReasonOfRow)
   const key = normProductCode(productCode);
-  const { pub, rows, targets } = loadBarcodeTargets();
-  const cur = key ? getDB().prepare('SELECT * FROM po_barcode_labels WHERE product_key=?').get(key) : null;
+  const db = getDB();
+  const supplier = barcodeTargetSupplier();
+  const { pub, rows } = loadPmlMergedFor(key);
+  const cur = key ? db.prepare('SELECT * FROM po_barcode_labels WHERE product_key=?').get(key) : null;
   const label = cur ? rowToLabel(cur) : null;
   if (!pub) return { pmlSynced: false, target: false, reason: 'pml_not_synced', code: trimS(productCode), name: '', vendorCode: null, label };
-  const t = targets.get(key);
-  if (t) return { pmlSynced: true, target: true, reason: null, code: t.code, name: t.name, vendorCode: t.vendorCode || null, label };
-  const r = rows.find((x) => normProductCode(x['商品コード']) === key);
-  let reason = 'missing_from_pml';
-  if (r) {
-    if (String(r['商品区分'] || '').trim() === 'セット') reason = 'set';
-    else if (normSupplierCode(r['仕入先']) !== barcodeTargetSupplier()) reason = 'not_amc';
-    else reason = 'not_own_product';
+  // 重なり (大文字小文字だけ違う行) があっても loadBarcodeTargets と同じ = どれかが対象なら対象 (後の行の名前)
+  const hits = rows.filter((r) => !targetReasonOfRow(r, supplier));
+  if (hits.length) {
+    const t = hits[hits.length - 1];
+    const m = db.prepare('SELECT vendor_code FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(supplier, key);
+    return { pmlSynced: true, target: true, reason: null, code: String(t['商品コード']).trim(), name: t['商品名'] || '', vendorCode: m ? m.vendor_code : null, label };
   }
-  return { pmlSynced: true, target: false, reason, code: r ? String(r['商品コード']).trim() : trimS(productCode), name: r ? r['商品名'] || '' : '', vendorCode: null, label };
+  const r = rows[0];
+  return { pmlSynced: true, target: false, reason: r ? targetReasonOfRow(r, supplier) : 'missing_from_pml', code: r ? String(r['商品コード']).trim() : trimS(productCode), name: r ? r['商品名'] || '' : '', vendorCode: null, label };
 }
 
 const labelCols = (l) => (l ? { status: l.status, barcode_value: l.barcodeValue || null, barcode_type: l.barcodeType || null, note: l.note || null, version: l.version } : null);
@@ -236,6 +244,36 @@ export function writeLabelAudited({ productCode, status, barcodeValue, note, ver
     audit(db, { actorType: 'user', actor: actor || null, action: 'barcode_label_write', resource: `barcode:${normProductCode(t.code)}`, requestId,
       detail: { via, code: t.code, before: labelCols(before), after: labelCols(r.label), pick } });
     return { label: r.label, before };
+  }).immediate();
+}
+
+/** 戻したときのメモの印 (前に行が無かった = 「未設定 + 要確認」の行を残す) */
+export const RECHECK_NOTE = '要確認: マスタの入力の保存を、書いた後の確かめで戻しました';
+
+/**
+ * 書いた後の読み直しで Company DB の値が変わっていた = その書き込みを戻す (要確認)。2 つの DB をまたぐ取引は作らない代わり (Codex #1701 R1 H2)。
+ *   version = 書いた後の版 (その後にだれかが直していたら戻さない = 409 のまま記録だけ)。
+ *   before = 書く前の行 (無かった = null → 状態「未設定」・値なし・メモ = RECHECK_NOTE の行にする = 依頼中 / 印字済みのまま残さない)。
+ *   po_audit_log に barcode_label_revert (戻した) / barcode_label_revert_failed (版が違って戻せなかった) と理由を残す。
+ * 返値 = { reverted, label (今の行) }
+ */
+export function revertLabelAudited({ productCode, version, before, actor, via, requestId = null, why, detail = null }) {
+  if (!Object.hasOwn(BARCODE_VIA, String(via || ''))) throw Object.assign(new Error(`書いた画面 (via) が分からない: ${via}`), { status: 400, reason: 'invalid_input' });
+  const db = getDB();
+  const key = normProductCode(productCode);
+  return db.transaction(() => {
+    const cur = db.prepare('SELECT * FROM po_barcode_labels WHERE product_key=?').get(key);
+    const to = before ? { status: before.status, value: before.barcodeValue || '', note: before.note || '' } : { status: 'unset', value: '', note: RECHECK_NOTE };
+    let r = null;
+    try {
+      r = upsertLabel({ productKey: key, productCode: cur ? cur.product_code : productCode, status: to.status, barcodeValue: to.value, note: to.note, version, actor, source: 'manual' });
+    } catch (e) {
+      if (e.status !== 409) throw e;
+    }
+    const after = r ? r.label : (cur ? rowToLabel(db.prepare('SELECT * FROM po_barcode_labels WHERE product_key=?').get(key)) : null);
+    audit(db, { actorType: 'user', actor: actor || null, action: r ? 'barcode_label_revert' : 'barcode_label_revert_failed', resource: `barcode:${key}`, requestId,
+      detail: { via, code: productCode, why, recheck: detail, before: labelCols(cur ? rowToLabel(cur) : null), after: labelCols(after) } });
+    return { reverted: !!r, label: after };
   }).immediate();
 }
 

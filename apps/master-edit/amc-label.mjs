@@ -20,7 +20,7 @@
 import { orderWriteGate } from './order-settings.mjs';
 import { COMPANY_ID } from '../../lib/master-write.mjs';
 import { getDB } from '../purchase-orders/db.js';
-import { barcodeTargetOf, writeLabelAudited, detectBarcodeType, BARCODE_TARGET_REASONS } from '../purchase-orders/barcode-labels.js';
+import { barcodeTargetOf, writeLabelAudited, revertLabelAudited, detectBarcodeType, BARCODE_TARGET_REASONS } from '../purchase-orders/barcode-labels.js';
 
 export const AMC_STATUSES = Object.freeze(['printed', 'requested', 'unset', 'not_needed']);
 /** 画面の言葉 (発注アプリの admin では printed = 「設定済み」と出る = 同じもの) */
@@ -33,7 +33,7 @@ const LISTING_STATUS_WORDS = Object.freeze({ active: '出品中', inactive: '停
 export const MAX_REASON = 200;
 const MAX_VALUE = 64;
 const MAX_NOTE = 500;
-const PICK_KINDS = new Set(['fnsku', 'jan', 'manual', 'keep', 'none']);
+const PICK_KINDS = new Set(['fnsku', 'jan', 'manual', 'manual_other', 'keep', 'none']);
 const BODY_KEYS = new Set(['request_id', 'version', 'status', 'pick', 'note']);
 const CTRL_RE = new RegExp(`[\\x00-\\x1f\\x7f${String.fromCharCode(0x2028, 0x2029)}]`);
 
@@ -163,16 +163,28 @@ export function amcInputOf(raw) {
   if (p.kind === 'fnsku' || p.kind === 'jan') {
     if (!ROW_RE.test(str(p.row))) throw bad('選んだ候補の番号が違う。画面を開き直してください', 'value');
     pick.row = str(p.row);
+    // 候補の値はいつも送らせて比べる (Codex #1701 R1 L1)
     pick.value = str(p.value).trim();
+    if (!pick.value) throw bad('選んだ候補の値がありません。画面を開き直してください', 'value');
     if (p.kind === 'fnsku') {
       if (!ROW_RE.test(str(p.listing_id))) throw bad('選んだ出品の番号が違う。画面を開き直してください', 'value');
       pick.listing_id = str(p.listing_id);
     }
-  } else if (p.kind === 'manual') {
-    const value = str(p.value).trim();
+  } else if (p.kind === 'manual' || p.kind === 'manual_other') {
+    let value = str(p.value).trim();
     if (!value) throw bad('手で打つ値が空です', 'manual_value');
     if (value.length > MAX_VALUE) throw bad(`バーコードの値は ${MAX_VALUE} 文字まで`, 'manual_value');
     if (CTRL_RE.test(value) || /\s/.test(value)) throw bad('バーコードの値に空白や改行は入れられません', 'manual_value');
+    // 形 (Codex #1701 R1 M1): ふつうの手入力 = FNSKU (X0 + 英数 8) か JAN-8 / JAN-13 (チェック数字まで)。ほかの形は「例外の形」を明示で選ぶ
+    const form = barcodeFormOf(value);
+    if (p.kind === 'manual') {
+      if (form === 'fnsku') value = value.toUpperCase();
+      else if (form !== 'jan') {
+        throw bad(looksLikeJan(value) ? `${value} は JAN のチェック数字が合いません (打ち間違い?)` : `${value} は FNSKU (X0 で始まる 10 文字) でも JAN (8 桁・13 桁) でもありません。ほかの形なら「例外の形」に印を付けて理由を書いてください`, 'manual_value');
+      }
+    } else if (form || looksLikeJan(value) || /^X0/i.test(value)) {
+      throw bad(form ? `${value} は ${form === 'jan' ? 'JAN' : 'FNSKU'} の形です。「例外の形」の印を外して、ふつうに手で打ってください` : `${value} は JAN / FNSKU に似ていますが形が合いません (打ち間違い?)。例外の形にはできません`, 'manual_value');
+    }
     const reason = str(p.reason).trim();
     if (!reason) throw bad('手で打つときは理由が要ります (候補に無いわけ)', 'manual_reason');
     if (reason.length > MAX_REASON) throw bad(`理由は ${MAX_REASON} 文字まで`, 'manual_reason');
@@ -184,69 +196,135 @@ export function amcInputOf(raw) {
   return { status, version, note, pick, requestId };
 }
 
+/** JAN のチェック数字 (8 桁・13 桁。右から 3・1・3… の重み) */
+export function janCheckOk(v) {
+  const t = str(v);
+  if (!/^\d{8}$/.test(t) && !/^\d{13}$/.test(t)) return false;
+  const d = [...t].map(Number);
+  const check = d.pop();
+  let sum = 0;
+  for (let i = d.length - 1, w = 3; i >= 0; i--, w = w === 3 ? 1 : 3) sum += d[i] * w;
+  return (10 - (sum % 10)) % 10 === check;
+}
+const looksLikeJan = (v) => /^\d{8}$/.test(str(v)) || /^\d{13}$/.test(str(v));
+/** 手入力の形: 'fnsku' (X0 + 英数 8・大文字小文字は問わない) / 'jan' (チェック数字まで合う 8・13 桁) / null */
+export function barcodeFormOf(v) {
+  const t = str(v).trim();
+  if (/^X0[0-9A-Z]{8}$/i.test(t)) return 'fnsku';
+  if (janCheckOk(t)) return 'jan';
+  return null;
+}
+
+/**
+ * 値の持ち主 (Company DB)。この商品の JAN / この商品 1 個だけの出品の FNSKU = mine。
+ * { hits (有効な JAN・FNSKU の行), other (ほかの商品のもの・無ければ null) }。Company DB に無い値 = hits 空 (不明 = 通す)
+ */
+async function ownerOf(db, sku, value) {
+  const hits = (await db.query(`
+    select e.system, e.external_value,
+           case when e.entity_type = 'product' then k.code
+                else (select string_agg(k2.code, '・' order by k2.code_norm) from core.listing_components c2 join core.skus k2 on k2.sku_id = c2.sku_id where c2.listing_id = e.entity_id) end as owner,
+           case when e.entity_type = 'product' then (k.sku_id = $3::bigint)
+                else (exists (select 1 from core.listing_components c where c.listing_id = e.entity_id and c.sku_id = $3::bigint and c.qty = 1)
+                      and (select count(*) from core.listing_components c where c.listing_id = e.entity_id) = 1) end as mine
+      from core.external_ids e
+      left join core.skus k on e.entity_type = 'product' and k.company_id = e.company_id and k.product_id = e.entity_id and k.sku_kind = 'single'
+     where e.company_id = $1 and e.valid_to is null and e.external_norm = core.norm_code($2)
+       and ((e.system = 'jan' and e.id_kind = 'jan' and e.entity_type = 'product') or (e.system = 'amazon' and e.id_kind = 'fnsku' and e.entity_type = 'listing'))`,
+  [COMPANY_ID, value, sku.sku_id])).rows;
+  return { hits, other: hits.find((h) => !h.mine) || null };
+}
+const otherWords = (value, other) => `${value} は Company DB では${other.owner ? `ほかの商品 (${other.owner}) の` : 'ほかの'} ${other.system === 'jan' ? 'JAN' : 'FNSKU'} です (この商品の 1 個だけの出品・JAN ではない)`;
+
 /**
  * 保存の前に Company DB で確かめ直す (Codex R3 M5)。sku = { code, sku_id, product_id }。
  * 戻り値 = { value (書く値・候補は Company DB の値)・audit (記録に残す出どころ) }。誤り = AmcLabelError 409
  *   fnsku: その行が今も有効・その出品に付いている・出品の構成がこの商品 1 個だけ・消えた出品でない・値が画面と同じ
  *   jan:   その行が今も有効・この商品 (product) の JAN・値が画面と同じ
- *   manual: Company DB でほかの商品の JAN / 1 個だけの出品の FNSKU なら断る (この商品のものなら通す = 記録は手入力)
- *   keep / none: Company DB は読まない (keep の値は書く直前の行から部品が読む・ここでは値を返さない)
+ *   manual / manual_other / keep: Company DB でほかの商品の JAN / FNSKU なら断る (この商品のもの・Company DB に無い値 = 通す)。
+ *     keep = 発注アプリの今の行の値 (current) を照らす (Codex #1701 R1 H1: 状態・メモだけの直しでも)
  */
-export async function verifyAmcPick(db, sku, pick) {
+export async function verifyAmcPick(db, sku, pick, { current = null } = {}) {
   if (pick.kind === 'fnsku') {
     const r = (await db.query(`${FNSKU_SQL} and e.external_id_row = $3::bigint and l.listing_id = $4::bigint`, [COMPANY_ID, sku.sku_id, pick.row, pick.listing_id])).rows[0];
     if (!r) throw new AmcLabelError(409, 'candidate_gone', '選んだ FNSKU は、もうこの商品の出品に付いていません (外された・付け替えられた)。画面を開き直して選び直してください', { field: 'value' });
     const c = fnskuCand(r);
     if (c.why) throw new AmcLabelError(409, 'candidate_gone', `選んだ FNSKU は選べなくなりました (${c.why})。画面を開き直して選び直してください`, { field: 'value' });
-    if (pick.value && pick.value !== c.value) throw new AmcLabelError(409, 'candidate_changed', `選んだ FNSKU の値が変わりました (今は ${c.value})。画面を開き直して選び直してください`, { field: 'value' });
+    if (pick.value !== c.value) throw new AmcLabelError(409, 'candidate_changed', `選んだ FNSKU の値が変わりました (今は ${c.value})。画面を開き直して選び直してください`, { field: 'value' });
     return { value: c.value, audit: { kind: 'fnsku', external_id_row: c.row, listing_id: c.listing_id, listing_code: c.listing_code, mall: c.mall, market: c.market, value: c.value } };
   }
   if (pick.kind === 'jan') {
     const r = sku.product_id ? (await db.query(`${JAN_SQL} and e.external_id_row = $3::bigint`, [COMPANY_ID, sku.product_id, pick.row])).rows[0] : null;
     if (!r) throw new AmcLabelError(409, 'candidate_gone', '選んだ JAN は、もうこの商品の JAN ではありません (外された・付け替えられた)。画面を開き直して選び直してください', { field: 'value' });
-    if (pick.value && pick.value !== r.value) throw new AmcLabelError(409, 'candidate_changed', `選んだ JAN の値が変わりました (今は ${r.value})。画面を開き直して選び直してください`, { field: 'value' });
+    if (pick.value !== r.value) throw new AmcLabelError(409, 'candidate_changed', `選んだ JAN の値が変わりました (今は ${r.value})。画面を開き直して選び直してください`, { field: 'value' });
     return { value: r.value, audit: { kind: 'jan', external_id_row: r.row, value: r.value } };
   }
-  if (pick.kind === 'manual') {
-    const hits = (await db.query(`
-      select e.system, e.external_value,
-             case when e.entity_type = 'product' then k.code
-                  else (select string_agg(k2.code, '・' order by k2.code_norm) from core.listing_components c2 join core.skus k2 on k2.sku_id = c2.sku_id where c2.listing_id = e.entity_id) end as owner,
-             case when e.entity_type = 'product' then (k.sku_id = $3::bigint)
-                  else (exists (select 1 from core.listing_components c where c.listing_id = e.entity_id and c.sku_id = $3::bigint and c.qty = 1)
-                        and (select count(*) from core.listing_components c where c.listing_id = e.entity_id) = 1) end as mine
-        from core.external_ids e
-        left join core.skus k on e.entity_type = 'product' and k.company_id = e.company_id and k.product_id = e.entity_id and k.sku_kind = 'single'
-       where e.company_id = $1 and e.valid_to is null and e.external_norm = core.norm_code($2)
-         and ((e.system = 'jan' and e.id_kind = 'jan' and e.entity_type = 'product') or (e.system = 'amazon' and e.id_kind = 'fnsku' and e.entity_type = 'listing'))`,
-    [COMPANY_ID, pick.value, sku.sku_id])).rows;
-    const other = hits.find((h) => !h.mine);
-    if (other) {
-      const what = other.system === 'jan' ? 'JAN' : 'FNSKU';
-      throw new AmcLabelError(409, 'value_of_other', `${pick.value} は Company DB では${other.owner ? `ほかの商品 (${other.owner}) の` : 'ほかの'} ${what} です (この商品の 1 個だけの出品・JAN ではない)。パッケージに刷る値を確かめてください`, { field: 'manual_value' });
-    }
-    return { value: pick.value, audit: { kind: 'manual', value: pick.value, reason: pick.reason, type: detectBarcodeType(pick.value), known_in_company_db: hits.length > 0 } };
+  if (pick.kind === 'manual' || pick.kind === 'manual_other') {
+    const { hits, other } = await ownerOf(db, sku, pick.value);
+    if (other) throw new AmcLabelError(409, 'value_of_other', `${otherWords(pick.value, other)}。パッケージに刷る値を確かめてください`, { field: 'manual_value' });
+    return { value: pick.value, audit: { kind: pick.kind, value: pick.value, reason: pick.reason, type: detectBarcodeType(pick.value), known_in_company_db: hits.length > 0 } };
   }
-  if (pick.kind === 'none') return { value: '', audit: { kind: 'none' } };
-  return { value: null, audit: { kind: 'keep' } };
+  if (pick.kind === 'keep') {
+    const value = current ? current.barcodeValue || '' : '';
+    if (value) {
+      const { hits, other } = await ownerOf(db, sku, value);
+      if (other) throw new AmcLabelError(409, 'value_of_other', `今の値の ${otherWords(value, other)}。「今の値のまま」にはできません。候補から選ぶか、手で打ち直してください`, { field: 'value' });
+      return { value, audit: { kind: 'keep', value, known_in_company_db: hits.length > 0 } };
+    }
+    return { value, audit: { kind: 'keep', value: '' } };
+  }
+  return { value: '', audit: { kind: 'none' } };
 }
 
 /**
- * 1 件書く (確かめた後)。keep = 書く直前の行の値をそのまま (版が違えば部品が 409)。
- * 戻り値 = { label, before }。誤り = 部品の Error (status 409 / 400・reason・current)
+ * 書いた後の読み直し (Codex #1701 R1 H2)。確かめた時から Company DB が変わっていた (FNSKU が外された・出品の構成・JAN / 値の持ち主) = 理由の文 / 変わっていない = null
  */
-export function writeAmcLabel({ code, input, verified, actor }) {
-  let value = verified.value;
+export async function recheckAmcPick(db, sku, pick, verified) {
+  if (pick.kind === 'none' || !verified.value) return null;
+  try {
+    if (pick.kind === 'fnsku' || pick.kind === 'jan') await verifyAmcPick(db, sku, { ...pick, value: verified.value });
+    else {
+      const { other } = await ownerOf(db, sku, verified.value);
+      if (other) return otherWords(verified.value, other);
+    }
+    return null;
+  } catch (e) {
+    if (e instanceof AmcLabelError) return e.message;
+    throw e;
+  }
+}
+
+/** 試験だけ: 確かめた後・書く前に差し込む (その間に Company DB を変える) */
+let beforeWrite = null;
+export function __setAmcBeforeWrite(fn) { beforeWrite = fn || null; }
+
+/**
+ * 保存の全部 (router から): ① 確かめ (keep = 発注アプリの今の行の値も) → ② 発注アプリに書く → ③ Company DB を読み直す。
+ *   ③ で変わっていた = ② を戻す (前の行へ・前が無かった = 未設定 + 要確認のメモ。依頼中 / 印字済みのまま残さない)・po_audit_log に残す・409 recheck_failed。
+ *   2 つの DB をまたぐ取引は作らない。受け入れた残り = ① と ② の間に変わり、③ までに元へ戻る (極めてまれ) 場合
+ * 戻り値 = { label, pick (記録の出どころ) }
+ */
+export async function saveAmcLabel(db, { sku, input, actor }) {
+  let current = null;
   if (input.pick.kind === 'keep') {
-    const t = barcodeTargetOf(code);
+    const t = barcodeTargetOf(sku.code);
     if (!t.label) throw new AmcLabelError(409, 'stale', 'まだ発注アプリに行がありません (今の値のままにはできません)。画面を開き直してください');
     if (input.version == null || t.label.version !== input.version) throw new AmcLabelError(409, 'stale', '他の画面で先に更新されています。画面を開き直してから入れ直してください', { current: t.label });
-    value = t.label.barcodeValue || '';
+    current = t.label;
   }
-  return writeLabelAudited({
-    productCode: code, status: input.status, barcodeValue: value, note: input.note, version: input.version,
+  const verified = await verifyAmcPick(db, sku, input.pick, { current });
+  if (beforeWrite) await beforeWrite({ sku, input, verified });
+  const w = writeLabelAudited({
+    productCode: sku.code, status: input.status, barcodeValue: verified.value, note: input.note, version: input.version,
     actor, via: 'master-edit:sku', requestId: input.requestId, pick: verified.audit,
   });
+  const why = await recheckAmcPick(db, sku, input.pick, verified);
+  if (!why) return { label: w.label, pick: verified.audit };
+  const rv = revertLabelAudited({ productCode: sku.code, version: w.label.version, before: w.before, actor, via: 'master-edit:sku', requestId: input.requestId, why, detail: verified.audit });
+  throw new AmcLabelError(409, 'recheck_failed', rv.reverted
+    ? `保存した直後に Company DB の値が変わっていたので、保存を戻しました (要確認): ${why}。画面を開き直して選び直してください`
+    : `保存した直後に Company DB の値が変わっていましたが、その間にほかの人が直したので戻せませんでした (要確認・発注アプリの値を確かめてください): ${why}`,
+  { field: 'value', reverted: rv.reverted, current: rv.label });
 }
 
 /** 誤り → 応答の本文 */

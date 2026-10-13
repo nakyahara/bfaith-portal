@@ -12,6 +12,10 @@
  *   R 保存のときの確かめ直し (Codex R3 M5): 選んだ FNSKU が外された・出品がまとめ売りになった・値が違う・ほかの商品の JAN の行 = 409 (何も書かない)
  *   M 手で打つ: 理由が要る (400)・ほかの商品の JAN / FNSKU の値 = 409・通れば記録に理由・この商品の候補の値でも手入力の記録
  *   K 今の値のまま / 値なし: 状態とメモだけ直せる・版が違う = 409 (発注アプリのポップオーバーが先に直した = 上書きしない)
+ *   K2 今の値のまま でも、発注アプリの今の値が Company DB でほかの商品の JAN / FNSKU なら 409 (Codex #1701 R1 H1)
+ *   H2 書いた後に Company DB を読み直し、確かめた時から変わっていたら書き込みを戻す (要確認・409 recheck_failed・記録) (R1 H2)
+ *   M 手で打つ形: FNSKU / JAN-8・13 (チェック数字) だけ・ほかの形は「例外の形」(manual_other) を明示 (R1 M1)・候補の値はいつも比べる (R1 L1)
+ *   P2 1 商品だけの読み方 (索引・NE オーバーレイ・重なり) = 発注アプリの一覧の決め方と同じ (R1 M2)
  *   G 門: 発注アプリの権限なし・名簿でない = 403・Origin・セット = 400・無い商品 = 404・対象外 = 409 not_target・本文の形 = 400
  *   U つかいかた (同じ PR)・画面の JS が読める・me-amclabel.js は me-sku.js の後
  * 使い方: node scripts/test-master-amc-label.mjs
@@ -25,7 +29,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import express from 'express';
 
-const killer = setTimeout(() => { console.error('時間切れ (240 秒)'); process.exit(3); }, 240e3);
+const killer = setTimeout(() => { console.error('時間切れ (360 秒)'); process.exit(3); }, 360e3);
 killer.unref();
 
 const W2 = await import('./fixtures/master-widen-pr1.mjs');
@@ -64,7 +68,7 @@ const q = async (sql, params) => (await db.query(sql, params)).rows;
 
 const AMZ = 'main@A1VC38T7YXB528';
 const J1 = '4901234567894';   // amc1 の JAN
-const J9 = '4900000000008';   // oth1 の JAN (ほかの商品)
+const J9 = '4900000000009';   // oth1 の JAN (ほかの商品・チェック数字も合う)
 function makePlan() {
   const sku = (code, name, kind, salesClass) => ({ code, name, kind, taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass,
     cost: { jpy: 100, source: kind === 'set' ? 'set_calc' : 'ne', status: 'COMPLETE' }, standardPriceJpy: 1000, shippingCode: 'S02', shippingMethod: '宅急便', shippingCostJpy: 520, reorderMonths: 2 });
@@ -76,7 +80,7 @@ function makePlan() {
     skus: [
       sku('amc1', 'AMC の自社商品 1', 'single', 1), sku('amc2', 'AMC の自社商品 2', 'single', 1), sku('amc3', 'AMC の自社商品 3 (今の値が候補に無い)', 'single', 1),
       sku('amc4', 'AMC の自社商品 4 (手で打つ)', 'single', 1), sku('amc-c3', 'AMC の仕入商品 (売上分類 3)', 'single', 3), sku('oth1', 'ほかの仕入先の商品', 'single', 1),
-      sku('fresh1', '商品管理リストにまだ無い', 'single', 1), sku('set1', 'セット', 'set', null),
+      sku('fresh1', '商品管理リストにまだ無い', 'single', 1), sku('amc5', 'AMC の自社商品 5 (書いた後の読み直し)', 'single', 1), sku('set1', 'セット', 'set', null),
     ],
     variationGroups: [],
     setComponents: [{ parentCode: 'set1', childCode: 'amc1', qty: 2, source: 'ne' }],
@@ -86,11 +90,12 @@ function makePlan() {
       amazon('pr_mix', [comp('amc1'), comp('oth1')], 'X00MIX0001'),
       amazon('pr_amc2', [comp('amc2')], 'X00AMC0003'),
       amazon('pr_oth1', [comp('oth1')], 'X00OTH0001'),
+      amazon('pr_amc5', [comp('amc5')], 'X00AMC0005'),
     ],
     observations: [jan('amc1', J1), jan('oth1', J9)], physicals: [], compliance: [], workers: [],
     suppliers: [{ code: '0001', name: 'AMC' }, { code: '0002', name: 'ほかの仕入先' }],
     supplierSkus: [],
-    primarySuppliers: [...['amc1', 'amc2', 'amc3', 'amc4', 'amc-c3', 'fresh1'].map((s) => ({ skuCode: s, supplierCode: '0001' })), { skuCode: 'oth1', supplierCode: '0002' }],
+    primarySuppliers: [...['amc1', 'amc2', 'amc3', 'amc4', 'amc5', 'amc-c3', 'fresh1'].map((s) => ({ skuCode: s, supplierCode: '0001' })), { skuCode: 'oth1', supplierCode: '0002' }],
     reorder: { available: true, runId: 'pml_test' },
   };
 }
@@ -110,7 +115,9 @@ const podb = POD.getDB();
   const T0 = new Date(Date.now() - 86400e3).toISOString();
   podb.prepare(`INSERT INTO mirror_pml_published (id, run_id, status, as_of_date, synced_at) VALUES (1, 'run_t', 'ok', ?, ?)`).run(T0.slice(0, 10), T0);
   const ins = podb.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 商品区分, 売上分類) VALUES ('run_t', ?, ?, ?, '取扱中', ?, ?)`);
-  for (const [c, sup, kind, cls] of [['amc1', '0001', '', 1], ['amc2', '0001', '', 1], ['amc3', '0001', '', 1], ['amc4', '0001', '', 1], ['amc-c3', '0001', '', 3], ['oth1', '0002', '', 1], ['set1', '0001', 'セット', 1]]) ins.run(c, c, sup, kind, cls);
+  for (const [c, sup, kind, cls] of [['amc1', '0001', '', 1], ['amc2', '0001', '', 1], ['amc3', '0001', '', 1], ['amc4', '0001', '', 1], ['amc5', '0001', '', 1], ['amc-c3', '0001', '', 3], ['oth1', '0002', '', 1], ['set1', '0001', 'セット', 1],
+    // 1 商品だけの読み方 (Codex #1701 R1 M2) の照らし合わせ用: NE オーバーレイで仕入先が変わる行・大文字小文字だけ違う重なり (Company DB には無い)
+    ['amc-ov', '0002', '', 1], ['ov-off', '0001', '', 1], ['Dup1', '0002', '', 1], ['dup1', '0001', '', 1]]) ins.run(c, c, sup, kind, cls);
   podb.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1', 'amc1', 'amc1', 'AMC-0001', ?)").run(T0);
   // amc3 = 前からの行 (旧 Excel の取込・候補に無い値)
   podb.prepare(`INSERT INTO po_barcode_labels (product_key, product_code, status, barcode_value, barcode_type, note, source, version, created_at, updated_at, updated_by)
@@ -306,6 +313,22 @@ await ta('[M1] 手で打つ: 理由が要る (400)・ほかの商品の JAN / FN
   assert.deepEqual([r.status, r.j.reason, r.j.field], [400, 'invalid_input', 'manual_reason'], r.text);
   r = await send({ kind: 'manual', value: 'X00 NEW', reason: 'x' });
   assert.deepEqual([r.status, r.j.field], [400, 'manual_value']);
+  // 形 (Codex #1701 R1 M1): FNSKU (X0 + 英数 8) / JAN-8・JAN-13 (チェック数字まで)。ほかの形は「例外の形」(manual_other) を明示で
+  for (const [pick, re] of [
+    [{ kind: 'manual', value: '4901234567890', reason: 'x' }, /チェック数字が合いません/],
+    [{ kind: 'manual', value: '49012345', reason: 'x' }, /チェック数字が合いません/],
+    [{ kind: 'manual', value: 'ABC-123', reason: 'x' }, /FNSKU .* でも JAN .* でもありません/],
+    [{ kind: 'manual', value: 'X00SHORT', reason: 'x' }, /でもありません/],
+    [{ kind: 'manual_other', value: J1, reason: 'x' }, /JAN の形です/],
+    [{ kind: 'manual_other', value: 'X00AMC0001', reason: 'x' }, /FNSKU の形です/],
+    [{ kind: 'manual_other', value: '4901234567890', reason: 'x' }, /似ていますが形が合いません/],
+    [{ kind: 'manual_other', value: 'X0ABC', reason: 'x' }, /似ていますが形が合いません/],
+    [{ kind: 'manual_other', value: 'ABC-123', reason: '' }, /理由が要ります/],
+  ]) {
+    const x = await send(pick);
+    assert.equal(x.status, 400, JSON.stringify(pick) + x.text);
+    assert.match(x.j.error, re, JSON.stringify(pick));
+  }
   r = await send({ kind: 'manual', value: J9, reason: 'JAN を刷った' });
   assert.deepEqual([r.status, r.j.reason, r.j.field], [409, 'value_of_other', 'manual_value'], r.text);
   assert.match(r.j.error, /ほかの商品 \(oth1\) の JAN/);
@@ -315,11 +338,15 @@ await ta('[M1] 手で打つ: 理由が要る (400)・ほかの商品の JAN / FN
   r = await send({ kind: 'manual', value: 'X00MIX0001', reason: '組んだ出品の FNSKU' });
   assert.deepEqual([r.status, r.j.reason], [409, 'value_of_other'], '組んだ出品の FNSKU を 1 個のパッケージに刷らせた');
   assert.deepEqual(counts(), c0);
-  r = await send({ kind: 'manual', value: 'X00NEW0004', reason: '米国の FNSKU (Company DB に無い)' });
+  r = await send({ kind: 'manual', value: 'x00new0004', reason: '米国の FNSKU (Company DB に無い)' });
   assert.equal(r.status, 200, r.text);
   const a = auditOf('amc4').at(-1);
   assert.deepEqual(a.detail.pick, { kind: 'manual', value: 'X00NEW0004', reason: '米国の FNSKU (Company DB に無い)', type: 'fnsku', known_in_company_db: false });
-  assert.equal(labelOf('amc4').barcode_value, 'X00NEW0004');
+  assert.equal(labelOf('amc4').barcode_value, 'X00NEW0004', 'FNSKU は大文字にそろえる');
+  // 例外の形 = 明示で選ぶ + 理由 (記録は manual_other)
+  r = await call('POST', url('amc4'), { body: { version: labelOf('amc4').version, status: 'printed', note: '', pick: { kind: 'manual_other', value: 'AMC-LOT-77', reason: '昔の社内コードを刷った' } } });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual(auditOf('amc4').at(-1).detail.pick, { kind: 'manual_other', value: 'AMC-LOT-77', reason: '昔の社内コードを刷った', type: 'unknown', known_in_company_db: false });
   // この商品の候補の値を手で打った = 通す (記録は手入力・Company DB にある印)
   r = await call('POST', url('amc1'), { body: { version: labelOf('amc1').version, status: 'printed', note: '', pick: { kind: 'manual', value: 'X00AMC0001', reason: '候補を手で' } } });
   assert.equal(r.status, 200, r.text);
@@ -330,7 +357,7 @@ await ta('[K1] 今の値のまま・値なし: 状態とメモだけ直す・発
   let r = await call('POST', url('amc3'), { body: { version: 1, status: 'printed', note: '確かめた', pick: { kind: 'keep' } } });
   assert.equal(r.status, 200, r.text);
   assert.deepEqual([labelOf('amc3').barcode_value, labelOf('amc3').note, labelOf('amc3').version, labelOf('amc3').source], ['X00OLD0003', '確かめた', 2, 'manual']);
-  assert.deepEqual(auditOf('amc3').at(-1).detail.pick, { kind: 'keep' });
+  assert.deepEqual(auditOf('amc3').at(-1).detail.pick, { kind: 'keep', value: 'X00OLD0003', known_in_company_db: false });
   // 発注アプリのポップオーバー (PUT) が先に直す → 古い版の保存 = 409 (今の値を返す)
   const put = await call('PUT', '/apps/purchase-orders/api/barcode-labels/amc3', { body: { productCode: 'amc3', status: 'printed', barcodeValue: 'X00OLD0003', note: '発注アプリで', version: 2 } });
   assert.equal(put.status, 200, put.text);
@@ -348,6 +375,68 @@ await ta('[K1] 今の値のまま・値なし: 状態とメモだけ直す・発
   // 行が無いのに「今の値のまま」/ 新しく作るのに版を送る
   r = await call('POST', url('amc2'), { body: { version: null, status: 'printed', note: '', pick: { kind: 'keep' } } });
   assert.equal(r.status, 409, r.text);   // amc2 は [R1] で行ができた = 版 null = 409
+});
+
+await ta('[K2] 今の値のまま (Codex #1701 R1 H1): 発注アプリの今の値が Company DB でほかの商品の FNSKU / JAN = 状態・メモだけの直しでも 409 value_of_other・値なし / 候補に直すのは通す', async () => {
+  const v = labelOf('amc4').version;
+  podb.prepare("UPDATE po_barcode_labels SET barcode_value = 'X00OTH0001', barcode_type = 'fnsku', version = version + 1 WHERE product_key = 'amc4'").run();   // 旧 Excel の取込で入った他の商品の値
+  const c0 = counts();
+  let r = await call('POST', url('amc4'), { body: { version: v + 1, status: 'printed', note: 'メモだけ', pick: { kind: 'keep' } } });
+  assert.deepEqual([r.status, r.j.reason, r.j.field], [409, 'value_of_other', 'value'], r.text);
+  assert.match(r.j.error, /ほかの商品 \(oth1\) の FNSKU/);
+  podb.prepare("UPDATE po_barcode_labels SET barcode_value = ?, barcode_type = 'jan', version = version + 1 WHERE product_key = 'amc4'").run(J9);
+  r = await call('POST', url('amc4'), { body: { version: v + 2, status: 'unset', note: '', pick: { kind: 'keep' } } });
+  assert.deepEqual([r.status, r.j.reason], [409, 'value_of_other'], r.text);
+  assert.deepEqual(counts(), c0, '他の商品の値のまま書いた');
+  r = await call('POST', url('amc4'), { body: { version: v + 2, status: 'unset', note: '', pick: { kind: 'none' } } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(labelOf('amc4').barcode_value, null);
+});
+
+await ta('[H2] 書いた後に Company DB を読み直す (Codex #1701 R1 H2): 確かめと書くの間に FNSKU が外された / まとめ売りになった / 手で打った値がほかの商品の FNSKU になった = 書き込みを戻す (要確認)・409 recheck_failed・記録', async () => {
+  const AMC = await import('../apps/master-edit/amc-label.mjs');
+  // 保存の途中 (接続は画面のロール master_edit) で Company DB を変える = 持ち主のロールで書いて画面のロールに戻す
+  const asOwner = async (fn) => { await pg.query('set role deploy'); try { return await fn(); } finally { await pg.query('set role master_edit'); } };
+  const row = await extRow('X00AMC0003'); const lid = await listingId('pr_amc2');
+  // ① 前の行がある (amc2) → 前の値に戻す
+  const before = labelOf('amc2');
+  AMC.__setAmcBeforeWrite(async () => asOwner(() => pg.query('update core.external_ids set valid_to = now() where external_id_row = $1', [row]))); 
+  let r;
+  try { r = await call('POST', url('amc2'), { body: { request_id: uuid(), version: before.version, status: 'requested', note: '頼んだ', pick: { kind: 'fnsku', row, listing_id: lid, value: 'X00AMC0003' } } }); }
+  finally { AMC.__setAmcBeforeWrite(null); await pg.query('update core.external_ids set valid_to = null where external_id_row = $1', [row]); }
+  assert.deepEqual([r.status, r.j.reason, r.j.reverted], [409, 'recheck_failed', true], r.text);
+  assert.match(r.j.error, /保存を戻しました \(要確認\)/);
+  const after = labelOf('amc2');
+  assert.deepEqual([after.status, after.barcode_value, after.note, after.version], [before.status, before.barcode_value, before.note, before.version + 2], '前の値に戻っていない');
+  const au = auditOf('amc2').slice(-2);
+  assert.deepEqual(au.map((x) => x.action), ['barcode_label_write', 'barcode_label_revert']);
+  assert.match(au[1].detail.why, /もうこの商品の出品に付いていません/);
+  assert.deepEqual([au[1].detail.before.status, au[1].detail.after.status, au[1].detail.recheck.kind], ['requested', before.status, 'fnsku']);
+  // ② 前の行が無い (amc5) → 未設定 + 要確認のメモ (依頼中 / 印字済みのまま残さない)
+  const lid5 = await listingId('pr_amc5');
+  AMC.__setAmcBeforeWrite(async () => asOwner(() => pg.query('update core.listing_components set qty = 2 where listing_id = $1', [lid5])));
+  try { r = await call('POST', url('amc5'), { body: { version: null, status: 'printed', note: '', pick: { kind: 'fnsku', row: await extRow('X00AMC0005'), listing_id: lid5, value: 'X00AMC0005' } } }); }
+  finally { AMC.__setAmcBeforeWrite(null); await pg.query('update core.listing_components set qty = 1 where listing_id = $1', [lid5]); }
+  assert.deepEqual([r.status, r.j.reason], [409, 'recheck_failed'], r.text);
+  assert.deepEqual([labelOf('amc5').status, labelOf('amc5').barcode_value, labelOf('amc5').note], ['unset', null, BL.RECHECK_NOTE]);
+  assert.match(auditOf('amc5').at(-1).detail.why, /まとめ売り \(2 個\)/);
+  // ③ 手で打った「Company DB に無い」値が、その間にほかの商品の出品の FNSKU になった
+  const v5 = labelOf('amc5').version;
+  const lidOth = await listingId('pr_oth1');
+  AMC.__setAmcBeforeWrite(async () => asOwner(() => pg.query("insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type) values (1, 'listing', $1, 'amazon', 'fnsku', 'X00NEW0099', 'manual', 'human')", [lidOth])));
+  try { r = await call('POST', url('amc5'), { body: { version: v5, status: 'printed', note: '', pick: { kind: 'manual', value: 'X00NEW0099', reason: '新しい FNSKU' } } }); }
+  finally { AMC.__setAmcBeforeWrite(null); }
+  assert.deepEqual([r.status, r.j.reason], [409, 'recheck_failed'], r.text);
+  assert.deepEqual([labelOf('amc5').status, labelOf('amc5').barcode_value], ['unset', null]);
+  assert.match(auditOf('amc5').at(-1).detail.why, /ほかの商品 \(oth1\) の FNSKU/);
+  await pg.query("delete from core.external_ids where external_value = 'X00NEW0099'");
+  // ④ 変わっていない = ふつうに通る
+  r = await call('POST', url('amc5'), { body: { version: labelOf('amc5').version, status: 'printed', note: '', pick: { kind: 'fnsku', row: await extRow('X00AMC0005'), listing_id: lid5, value: 'X00AMC0005' } } });
+  assert.equal(r.status, 200, r.text);
+  // ⑤ 戻す前にほかの人が直した = 戻さない・revert_failed の記録
+  const cur = labelOf('amc5');
+  const rv = BL.revertLabelAudited({ productCode: 'amc5', version: cur.version - 1, before: null, actor: 't@test', via: 'master-edit:sku', why: '試験' });
+  assert.deepEqual([rv.reverted, labelOf('amc5').barcode_value, auditOf('amc5').at(-1).action], [false, 'X00AMC0005', 'barcode_label_revert_failed']);
 });
 
 await ta('[G1] 門: 発注アプリの権限なし・名簿でない = 403・Origin・セット = 400・無い商品 = 404・対象外 = 409 not_target・本文の形 = 400 (どれも何も書かない)', async () => {
@@ -371,9 +460,43 @@ await ta('[G1] 門: 発注アプリの権限なし・名簿でない = 403・Ori
   assert.deepEqual(counts(), c0);
 });
 
+await ta('[P2] 1 商品だけの読み方 (Codex #1701 R1 M2): 商品管理リスト全体を読まない・NE オーバーレイ (使う / 朝の同期より古い = 使わない)・大文字小文字の重なりまで、発注アプリの一覧の決め方と同じ', async () => {
+  const LG = await import('../apps/purchase-orders/logic.js');
+  const all = ['amc1', 'amc2', 'amc3', 'amc4', 'amc5', 'amc-c3', 'oth1', 'set1', 'fresh1', 'amc-ov', 'ov-off', 'dup1', 'DUP1', ' Amc1 '];
+  const same = (label) => {
+    const { targets } = BL.loadBarcodeTargets();
+    for (const c of all) {
+      const t = BL.barcodeTargetOf(c);
+      const k = c.trim().toLowerCase();
+      assert.equal(t.target, targets.has(k), `${label}: ${c} の対象の判定が一覧と違う`);
+      if (t.target) assert.deepEqual([t.code, t.name, t.vendorCode], [targets.get(k).code, targets.get(k).name, targets.get(k).vendorCode || null], `${label}: ${c}`);
+    }
+  };
+  same('オーバーレイなし');
+  assert.deepEqual([BL.barcodeTargetOf('amc-ov').reason, BL.barcodeTargetOf('dup1').target], ['not_amc', true]);
+  const now = new Date().toISOString();
+  podb.prepare("INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename) VALUES (1, ?, 2, 't.csv')").run(now);
+  podb.prepare("INSERT INTO po_ne_overlay_rows (product_key, product_code, 仕入先コード) VALUES ('amc-ov', 'amc-ov', '0001'), ('ov-off', 'ov-off', '0002')").run();
+  try {
+    same('オーバーレイあり');
+    assert.deepEqual([BL.barcodeTargetOf('amc-ov').target, BL.barcodeTargetOf('ov-off').reason], [true, 'not_amc']);
+    // 朝の NE 同期の方が新しい = オーバーレイは使わない (loadPmlMerged と同じ)
+    podb.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at = ? WHERE id = 1').run(new Date(Date.now() + 60e3).toISOString());
+    same('古いオーバーレイ');
+    assert.deepEqual([BL.barcodeTargetOf('amc-ov').target, BL.barcodeTargetOf('ov-off').target], [false, true]);
+    // 1 商品だけ = 全件を読む loadPmlMerged を呼ばない (索引で 1 商品の行だけ)
+    const plan = podb.prepare(`EXPLAIN QUERY PLAN ${LG.PML_ONE_SQL}`).all('run_t', 'amc1').map((x) => x.detail).join(' ');
+    assert.match(plan, /idx_mpsr_run_code_norm/, plan);
+    assert.deepEqual(LG.loadPmlMergedFor('AMC1').rows.map((x) => x['商品コード']), ['amc1']);
+  } finally {
+    podb.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at = NULL WHERE id = 1').run();
+    podb.prepare('DELETE FROM po_ne_overlay_rows').run(); podb.prepare('DELETE FROM po_ne_overlay_meta').run();
+  }
+});
+
 await ta('[U1] つかいかた (同じ PR): AMC ラベルの節 (3 つを混ぜない・候補・手で打つ理由・確かめ直し・権限)', async () => {
   const m = await call('GET', '/apps/master-edit/manual');
-  for (const w of ['<h2 id="amc-label">AMC 商品ラベルのバーコード印字 (発注アプリに保存)</h2>', '3 つを混ぜません', 'ラベルの印字を保存', '理由が要ります', 'この商品 1 個だけの出品', 'Company DB でもう一度確かめます', '名簿の人で、発注アプリの権限もある人', '「設定済み」']) {
+  for (const w of ['<h2 id="amc-label">AMC 商品ラベルのバーコード印字 (発注アプリに保存)</h2>', '3 つを混ぜません', 'ラベルの印字を保存', '理由が要ります', 'この商品 1 個だけの出品', 'Company DB でもう一度確かめます', '名簿の人で、発注アプリの権限もある人', '「設定済み」', '例外の形', 'チェック数字まで確かめます', '書いた後にもう一度', '保存を戻して']) {
     assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
   }
 });
@@ -382,7 +505,7 @@ await ta('[P1] 部品 (barcode-labels.js): 対象の判定は発注アプリと�
   assert.deepEqual(['amc1', 'oth1', 'amc-c3', 'fresh1', 'set1'].map((c) => [BL.barcodeTargetOf(c).target, BL.barcodeTargetOf(c).reason]),
     [[true, null], [false, 'not_amc'], [false, 'not_own_product'], [false, 'missing_from_pml'], [false, 'set']]);
   const ov = BL.listBarcodeOverview();
-  assert.deepEqual(ov.targets.map((t) => t.code).sort(), ['amc1', 'amc2', 'amc3', 'amc4']);
+  assert.deepEqual(ov.targets.map((t) => t.key).sort(), ['amc1', 'amc2', 'amc3', 'amc4', 'amc5', 'dup1', 'ov-off']);
   assert.throws(() => BL.writeLabelAudited({ productCode: 'amc2', status: 'unset', barcodeValue: '', note: '', version: null, actor: 'x', via: 'po-admin' }), /via/);
   assert.throws(() => BL.writeLabelAudited({ productCode: 'oth1', status: 'unset', barcodeValue: '', note: '', version: null, actor: 'x', via: 'master-edit:sku' }), (e) => e.status === 409 && e.reason === 'not_target');
   assert.equal(labelOf('oth1'), null);
@@ -426,6 +549,14 @@ else {
       assert.equal(await p.isVisible('#amc-manual'), true);
       await p.fill('#amc-mv', 'X00UI00001');
       assert.match(await p.textContent('#amc-mv-type'), /FNSKU の形/);
+      await p.fill('#amc-mv', '4901234567890');
+      assert.match(await p.textContent('#amc-mv-type'), /チェック数字が合いません/);
+      await p.fill('#amc-mv', 'AMC-LOT-1');
+      assert.match(await p.textContent('#amc-mv-type'), /「例外の形」に印/);
+      await p.check('#amc-mx');
+      assert.match(await p.textContent('#amc-mv-type'), /例外の形 \(理由を/);
+      await p.uncheck('#amc-mx');
+      await p.fill('#amc-mv', 'X00UI00001');
       const ev0 = eventsOf('amc1').length;
       await p.click('#amc-save');
       assert.match(await p.textContent('#amc-msg'), /理由が要ります/);

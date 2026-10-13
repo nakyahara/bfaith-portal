@@ -954,6 +954,8 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 .amc-cand.on { border-color: rgba(58, 231, 255, 0.65); background: linear-gradient(135deg, rgba(58, 231, 255, 0.11), rgba(16, 25, 44, 0.75)); box-shadow: 0 0 0 1px rgba(58, 231, 255, 0.18) inset; }
 .amc-cand.keep { border-style: dashed; }
 .amc-ex { padding: 3px 0; overflow-wrap: anywhere; }
+.amc-chk { display: inline-flex; gap: 8px; align-items: center; cursor: pointer; }
+.amc-chk input { width: 18px; height: 18px; accent-color: var(--accent); }
 #sec-amc .fmsg:not(:empty) { color: var(--warn); }
 @media (max-width: 760px) { #sec-amc .f, #sec-amc .po-sub .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #sec-amc .amc-cand { min-height: 44px; } #sec-amc .seg button, #amc-save { min-height: 44px; } #sec-amc .po-foot .btn { width: 100%; } }
 /* まとまりの操作の窓 (views/_vops.ejs・PR-7b): 名前を直す・子の廃止・代表の採用 (新商品の登録と商品の画面の両方) */

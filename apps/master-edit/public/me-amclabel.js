@@ -21,12 +21,22 @@
 
   function statusNow() { var s = $('#amc-status'); return s ? s.getAttribute('data-value') || '' : ''; }
   function pickNow() { var r = $('input[name="amc-pick"]:checked', box); return r ? r.value : ''; }
+  /** JAN のチェック数字 (サーバーの amc-label.mjs janCheckOk と同じ) */
+  function janOk(v) {
+    if (!/^\d{8}$/.test(v) && !/^\d{13}$/.test(v)) return false;
+    var d = v.split('').map(Number), check = d.pop(), sum = 0;
+    for (var i = d.length - 1, w = 3; i >= 0; i--, w = w === 3 ? 1 : 3) sum += d[i] * w;
+    return (10 - (sum % 10)) % 10 === check;
+  }
+  function isOther() { var c = $('#amc-mx'); return !!(c && c.checked); }
   function typeOf(v) {
     v = String(v || '').trim();
+    var other = isOther();
     if (!v) return '';
-    if (/^X0[0-9A-Z]{8}$/i.test(v)) return 'FNSKU の形';
-    if (/^\d{8}$/.test(v) || /^\d{13}$/.test(v)) return 'JAN の形';
-    return 'FNSKU・JAN の形ではありません (確かめてください)';
+    if (/^X0[0-9A-Z]{8}$/i.test(v)) return other ? 'FNSKU の形です (例外の印を外してください)' : 'FNSKU の形';
+    if (janOk(v)) return other ? 'JAN の形です (例外の印を外してください)' : 'JAN の形 (チェック数字 OK)';
+    if (/^\d{8}$/.test(v) || /^\d{13}$/.test(v)) return 'JAN のチェック数字が合いません (打ち間違い?)';
+    return other ? '例外の形 (理由を書いてください)' : 'FNSKU・JAN の形ではありません (ほかの形なら「例外の形」に印)';
   }
   /** 今の選びで刷る値 (画面の見え方だけ。保存はサーバーが Company DB の値で決める) */
   function valueNow() {
@@ -45,7 +55,7 @@
       var c = P.cands[+i[1]];
       pick = { kind: c.kind, row: c.row, value: c.value };
       if (c.kind === 'fnsku') pick.listing_id = c.listing_id;
-    } else if (p === 'manual') pick = { kind: 'manual', value: $('#amc-mv').value.trim(), reason: $('#amc-mr').value.trim() };
+    } else if (p === 'manual') pick = { kind: isOther() ? 'manual_other' : 'manual', value: $('#amc-mv').value.trim(), reason: $('#amc-mr').value.trim() };
     else pick = { kind: p || 'none' };
     return { version: P.version, status: statusNow(), note: ($('#amc-note') || {}).value ? $('#amc-note').value.trim() : '', pick: pick };
   }
@@ -107,7 +117,7 @@
   function save() {
     if (!saveBtn || busy || !P.canWrite) return;
     var body = collect();
-    if (body.pick.kind === 'manual' && !body.pick.reason) { msg('手で打つときは理由が要ります', 'err'); markErr('manual_reason'); return; }
+    if ((body.pick.kind === 'manual' || body.pick.kind === 'manual_other') && !body.pick.reason) { msg('手で打つときは理由が要ります', 'err'); markErr('manual_reason'); return; }
     body.request_id = uuid();
     busy = true; changed(); msg('発注アプリに保存しています…');
     fetch(P.base + '/api/sku/' + encodeURIComponent(P.code) + '/amc-label', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) })
@@ -128,7 +138,7 @@
           return;
         }
         var t = x.j.error || ('HTTP ' + x.r.status);
-        if (x.j.reason === 'stale' || x.j.reason === 'candidate_gone' || x.j.reason === 'candidate_changed') t += ' (画面を開き直すと今の値が出ます)';
+        if (x.j.reason === 'stale' || x.j.reason === 'candidate_gone' || x.j.reason === 'candidate_changed' || x.j.reason === 'recheck_failed' || x.j.reason === 'value_of_other') t += ' (画面を開き直すと今の値が出ます)';
         msg(t, 'err');
         markErr(x.j.field);
         changed();

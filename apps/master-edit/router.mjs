@@ -119,7 +119,7 @@ import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-g
 import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, buildHandling, readNeDelOverview, neDelAvailable, hideBackorder, hideBackorderText, NE_DEL_STATUS_WORDS, NE_DEL_KIND_WORDS, NE_DEL_MAX } from '../../lib/master-ne-delete.mjs';
 import { readNeDeleteStock } from './ne-delete-stock.mjs';
 // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
-import { amcLabelScreen, amcInputOf, verifyAmcPick, writeAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
+import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -943,7 +943,7 @@ router.post('/api/sku/:code/card-link', (req, res) => {
 
 /**
  * 商品の画面の「AMC 商品ラベルの印字を保存」(Company DB構想 21 A1・発注アプリの po_barcode_labels に書く。Company DB の保存とは別)。
- * 本文 = { request_id?, version (開いたときの行の版・行が無かった = null), status, note, pick: { kind: fnsku | jan | manual | keep | none, ... } }
+ * 本文 = { request_id?, version (開いたときの行の版・行が無かった = null), status, note, pick: { kind: fnsku | jan | manual | manual_other (例外の形) | keep | none, ... } }。書いた後に Company DB を読み直し、変わっていたら戻す (要確認)
  * 書ける人 = 発注の設定と同じ (名簿 かつ 発注アプリの権限)。商品は Company DB で確かめ (ある・単品)、選んだ候補は Company DB で読み直す (今も有効・この商品に 1 対 1)。
  * 対象 (AMC × 自社商品) かどうかは書く取引の中で発注アプリの決め方で確かめ直す。読むだけの接続
  */
@@ -958,9 +958,9 @@ router.post('/api/sku/:code/amc-label', (req, res) => {
     if (!sku) return res.status(404).json({ ok: false, error: `商品コード ${req.params.code} は Company DB にありません` });
     if (sku.sku_kind !== 'single') return res.status(400).json({ ok: false, error: 'AMC 商品ラベルは単品だけです (セットのラベルは中身の単品ごと)', reason: 'not_target', target_reason: 'set' });
     try {
-      const verified = await verifyAmcPick(db, sku, input.pick);
-      const w = writeAmcLabel({ code: sku.code, input, verified, actor: String(req.session.email).trim().toLowerCase() });
-      res.json({ ok: true, label: w.label, pick: verified.audit });
+      // 確かめ → 発注アプリに書く → Company DB を読み直す (変わっていたら戻して 409 recheck_failed・Codex #1701 R1 H2)
+      const w = await saveAmcLabel(db, { sku, input, actor: String(req.session.email).trim().toLowerCase() });
+      res.json({ ok: true, label: w.label, pick: w.pick });
     } catch (e) {
       if (e instanceof AmcLabelError || (e && (e.status === 400 || e.status === 409))) return res.status(e.status).json(amcErrorBody(e));
       throw e;

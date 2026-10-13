@@ -80,7 +80,8 @@
         </div>
         <% if (!cands.length && al.cands && al.cands.ok) { %><span class="hint" id="amc-nocand">Company DB にこの商品の FNSKU (1 個だけの Amazon の出品) も JAN もありません。JAN はこの画面の「JAN」で、FNSKU は Amazon の出品が Company DB に入ってから選べます。</span><% } %>
         <div class="po-sub" id="amc-manual" hidden>
-          <div class="f" data-row="amc.manual_value"><label class="lab" for="amc-mv">値</label><div class="ctl"><input class="in w-m mono" id="amc-mv" maxlength="64" autocomplete="off" spellcheck="false" placeholder="例: X0019R42C5 / 4901234567894"<%= D %>><span class="hint" id="amc-mv-type"></span></div></div>
+          <div class="f" data-row="amc.manual_value"><label class="lab" for="amc-mv">値</label><div class="ctl"><input class="in w-m mono" id="amc-mv" maxlength="64" autocomplete="off" spellcheck="false" placeholder="例: X0019R42C5 / 4901234567894"<%= D %>><span class="hint" id="amc-mv-type"></span><span class="hint">FNSKU (X0 で始まる 10 文字) か JAN (8 桁・13 桁・チェック数字まで確かめます)</span></div></div>
+          <div class="f" data-row="amc.manual_other"><div class="lab">例外の形</div><div class="ctl"><label class="amc-chk"><input type="checkbox" id="amc-mx"<%= D %>> FNSKU・JAN の形ではない値を刷る (例外)</label><span class="hint">ふつうは使いません · 理由に「なぜこの形か」を書いてください</span></div></div>
           <div class="f" data-row="amc.manual_reason"><label class="lab" for="amc-mr">理由<span class="req">必須</span></label><div class="ctl"><input class="in w-l" id="amc-mr" maxlength="200" autocomplete="off" placeholder="例: 米国の FNSKU を刷った (Company DB に無い)"<%= D %>></div></div>
         </div>
         <% if (excluded.length) { %>
