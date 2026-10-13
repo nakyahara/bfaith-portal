@@ -15,6 +15,7 @@
  *   K2 今の値のまま でも、発注アプリの今の値が Company DB でほかの商品の JAN / FNSKU なら 409 (Codex #1701 R1 H1)
  *   H2 書いた後に Company DB を読み直し、確かめた時から変わっていたら書き込みを戻す (要確認・409 recheck_failed・記録) (R1 H2)
  *   M 手で打つ形: FNSKU / JAN-8・13 (チェック数字) だけ・ほかの形は「例外の形」(manual_other) を明示 (R1 M1)・候補の値はいつも比べる (R1 L1)
+ *   UI5 未登録 (行が無い) = 何も変えずに保存できる = 「未設定・値なし」の行ができる (Codex #1701 R3 M)
  *   P2 1 商品だけの読み方 (索引・NE オーバーレイ・重なり) = 発注アプリの一覧の決め方と同じ (R1 M2)
  *   G 門: 発注アプリの権限なし・名簿でない = 403・Origin・セット = 400・無い商品 = 404・対象外 = 409 not_target・本文の形 = 400
  *   U つかいかた (同じ PR)・画面の JS が読める・me-amclabel.js は me-sku.js の後
@@ -80,7 +81,7 @@ function makePlan() {
     skus: [
       sku('amc1', 'AMC の自社商品 1', 'single', 1), sku('amc2', 'AMC の自社商品 2', 'single', 1), sku('amc3', 'AMC の自社商品 3 (今の値が候補に無い)', 'single', 1),
       sku('amc4', 'AMC の自社商品 4 (手で打つ)', 'single', 1), sku('amc-c3', 'AMC の仕入商品 (売上分類 3)', 'single', 3), sku('oth1', 'ほかの仕入先の商品', 'single', 1),
-      sku('fresh1', '商品管理リストにまだ無い', 'single', 1), sku('amc5', 'AMC の自社商品 5 (書いた後の読み直し)', 'single', 1), sku('set1', 'セット', 'set', null),
+      sku('fresh1', '商品管理リストにまだ無い', 'single', 1), sku('amc5', 'AMC の自社商品 5 (書いた後の読み直し)', 'single', 1), sku('amc6', 'AMC の自社商品 6 (未登録のまま保存)', 'single', 1), sku('set1', 'セット', 'set', null),
     ],
     variationGroups: [],
     setComponents: [{ parentCode: 'set1', childCode: 'amc1', qty: 2, source: 'ne' }],
@@ -95,7 +96,7 @@ function makePlan() {
     observations: [jan('amc1', J1), jan('oth1', J9)], physicals: [], compliance: [], workers: [],
     suppliers: [{ code: '0001', name: 'AMC' }, { code: '0002', name: 'ほかの仕入先' }],
     supplierSkus: [],
-    primarySuppliers: [...['amc1', 'amc2', 'amc3', 'amc4', 'amc5', 'amc-c3', 'fresh1'].map((s) => ({ skuCode: s, supplierCode: '0001' })), { skuCode: 'oth1', supplierCode: '0002' }],
+    primarySuppliers: [...['amc1', 'amc2', 'amc3', 'amc4', 'amc5', 'amc6', 'amc-c3', 'fresh1'].map((s) => ({ skuCode: s, supplierCode: '0001' })), { skuCode: 'oth1', supplierCode: '0002' }],
     reorder: { available: true, runId: 'pml_test' },
   };
 }
@@ -115,7 +116,7 @@ const podb = POD.getDB();
   const T0 = new Date(Date.now() - 86400e3).toISOString();
   podb.prepare(`INSERT INTO mirror_pml_published (id, run_id, status, as_of_date, synced_at) VALUES (1, 'run_t', 'ok', ?, ?)`).run(T0.slice(0, 10), T0);
   const ins = podb.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 商品区分, 売上分類) VALUES ('run_t', ?, ?, ?, '取扱中', ?, ?)`);
-  for (const [c, sup, kind, cls] of [['amc1', '0001', '', 1], ['amc2', '0001', '', 1], ['amc3', '0001', '', 1], ['amc4', '0001', '', 1], ['amc5', '0001', '', 1], ['amc-c3', '0001', '', 3], ['oth1', '0002', '', 1], ['set1', '0001', 'セット', 1],
+  for (const [c, sup, kind, cls] of [['amc1', '0001', '', 1], ['amc2', '0001', '', 1], ['amc3', '0001', '', 1], ['amc4', '0001', '', 1], ['amc5', '0001', '', 1], ['amc6', '0001', '', 1], ['amc-c3', '0001', '', 3], ['oth1', '0002', '', 1], ['set1', '0001', 'セット', 1],
     // 1 商品だけの読み方 (Codex #1701 R1 M2) の照らし合わせ用: NE オーバーレイで仕入先が変わる行・大文字小文字だけ違う重なり (Company DB には無い)
     ['amc-ov', '0002', '', 1], ['ov-off', '0001', '', 1], ['Dup1', '0002', '', 1], ['dup1', '0001', '', 1]]) ins.run(c, c, sup, kind, cls);
   podb.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1', 'amc1', 'amc1', 'AMC-0001', ?)").run(T0);
@@ -547,7 +548,7 @@ await ta('[P1] 部品 (barcode-labels.js): 対象の判定は発注アプリと�
   assert.deepEqual(['amc1', 'oth1', 'amc-c3', 'fresh1', 'set1'].map((c) => [BL.barcodeTargetOf(c).target, BL.barcodeTargetOf(c).reason]),
     [[true, null], [false, 'not_amc'], [false, 'not_own_product'], [false, 'missing_from_pml'], [false, 'set']]);
   const ov = BL.listBarcodeOverview();
-  assert.deepEqual(ov.targets.map((t) => t.key).sort(), ['amc1', 'amc2', 'amc3', 'amc4', 'amc5', 'dup1', 'ov-off']);
+  assert.deepEqual(ov.targets.map((t) => t.key).sort(), ['amc1', 'amc2', 'amc3', 'amc4', 'amc5', 'amc6', 'dup1', 'ov-off']);
   assert.throws(() => BL.writeLabelAudited({ productCode: 'amc2', status: 'unset', barcodeValue: '', note: '', version: null, actor: 'x', via: 'po-admin' }), /via/);
   assert.throws(() => BL.writeLabelAudited({ productCode: 'oth1', status: 'unset', barcodeValue: '', note: '', version: null, actor: 'x', via: 'master-edit:sku' }), (e) => e.status === 409 && e.reason === 'not_target');
   assert.equal(labelOf('oth1'), null);
@@ -662,6 +663,29 @@ else {
       await p.click('#amc-save');
       await p.waitForFunction(() => /開き直す/.test(document.getElementById('amc-msg').textContent));
       assert.equal(labelOf('amc2').note, '発注アプリが先');
+    } finally { await ctx.close(); }
+  });
+
+  await tu('[UI5] 未登録 (発注アプリに行が無い) = 何も変えずに「ラベルの印字を保存」できる = 未設定・値なしの行ができる・記録が残る・未保存には数えない (Codex #1701 R3 M)', async () => {
+    assert.equal(labelOf('amc6'), null);
+    const { ctx, p, errors } = await open('amc6');
+    try {
+      assert.match(await p.textContent('#amc-now'), /未登録/);
+      assert.equal(await p.isChecked('input[name="amc-pick"][value="none"]'), true);
+      assert.equal(await p.getAttribute('#amc-status', 'data-value'), 'unset');
+      assert.equal(await p.isDisabled('#amc-save'), false, '未登録なのに保存のボタンが閉じている');
+      assert.match(await p.textContent('#amc-status-hint'), /保存すると発注アプリに行ができます/);
+      assert.equal(await p.evaluate(() => window.MasterEdit.dirty().n), 0, '何も変えていないのに未保存に数えた');
+      await Promise.all([p.waitForEvent('load'), p.click('#amc-save')]);
+      const l = labelOf('amc6');
+      assert.deepEqual([l && l.status, l && l.barcode_value, l && l.version, l && l.source], ['unset', null, 1, 'manual']);
+      assert.deepEqual(eventsOf('amc6').map((e) => [e.from_status, e.to_status]), [[null, 'unset']]);
+      const a = auditOf('amc6');
+      assert.deepEqual([a.length, a[0].action, a[0].detail.before, a[0].detail.after.status, a[0].detail.pick], [1, 'barcode_label_write', null, 'unset', { kind: 'none' }]);
+      await p.waitForFunction(() => !!(window.MasterEdit && window.MasterEdit.dirty));
+      assert.match(await p.textContent('#amc-now'), /未設定/);
+      assert.equal(await p.isDisabled('#amc-save'), true, '行ができた後は変えるまで閉じる');
+      assert.deepEqual(errors, []);
     } finally { await ctx.close(); }
   });
 

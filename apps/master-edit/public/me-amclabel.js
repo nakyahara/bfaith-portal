@@ -81,7 +81,9 @@
     show();
     var d = isDirty();
     box.classList.toggle('po-dirty', d);
-    if (saveBtn) saveBtn.disabled = !P.canWrite || busy || !d;
+    // まだ発注アプリに行が無い (未登録・version = null) = 変えなくても保存できる (「未設定・値なし」の行を作る。Codex #1701 R3 M)。
+    //   離れるときの確認 (未保存) には数えない (何も変えていない)
+    if (saveBtn) saveBtn.disabled = !P.canWrite || busy || !(d || P.version == null);
     if (ME.setUnsaved && ME.dirty) ME.setUnsaved(ME.dirty().n);
   }
   // 離れるときの確認 (me-shell.js) に AMC ラベルの未保存も出す
