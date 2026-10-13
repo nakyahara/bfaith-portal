@@ -92,19 +92,7 @@
       mark(key);
     });
   }
-  // 「空の欄を全部『入力なし』にする」(Yahoo!・ケース・容量 = ふだんは使わない欄だけに置く)。値のある欄・押せない欄はそのまま
-  document.addEventListener('click', function (e) {
-    var b = e.target && e.target.closest ? e.target.closest('[data-none-all]') : null;
-    if (!b || b.disabled) return;
-    var root = document.querySelector(b.getAttribute('data-none-all'));
-    if (!root) return;
-    $$('input[type="checkbox"][data-none]', root).forEach(function (c) {
-      var key = c.getAttribute('data-none');
-      if (c.disabled || c.checked || has(key)) return;
-      c.checked = true;
-      c.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-  });
+  // 「入力なし」は 1 つずつ押す (まとめて押すボタンは置かない = 中原さん 2026-10-13「1 つずつ押す」)
   ME.none = {
     on: on,
     has: has,

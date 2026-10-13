@@ -2377,12 +2377,14 @@ await ta('[61] 入力なし (単品・1440): 必須がそろっても押せな�
   // 発注条件グループ = 「なし」が入力なし (右の一覧も「なし」)
   await p.click('#po-cond-mode button[data-v="none"]');
   assert.match(await liOf(p, '発注条件グループ').getAttribute('class'), /\bnone\b/);
-  // Yahoo! は「空の欄を全部『入力なし』にする」で 5 つ (値のある欄はそのまま)
+  // 🆕 中原さん 10/13 (答え 2 = b): まとめて「入力なし」にするボタンは無い (Yahoo!・ケース・容量も 1 つずつ押す)
+  assert.equal(await p.locator('[data-none-all], .nonebulk').count(), 0, 'まとめて入力なしにするボタンがある');
+  assert.match(await p.textContent('#sec-yahoo'), /欄ごとに「入力なし」を押します/);
   await p.click('#sec-yahoo > summary');
   await p.fill('#y-price', '1500');
-  await p.click('#sec-yahoo [data-none-all]');
+  for (const k of ['card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']) await p.click(`[data-row="${k}"] .nonechk`);
   assert.deepEqual(await p.evaluate(() => ['card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'].map((k) => document.querySelector(`[data-none="${k}"]`).checked)), [false, true, true, true, true]);
-  assert.equal(await p.inputValue('#y-price'), '1500', '値のある欄は入力なしにしない');
+  assert.equal(await p.inputValue('#y-price'), '1500', 'ほかの欄の入力なしで値は消えない');
   // 押す所は 44px 以上
   const small = await p.evaluate(() => [...document.querySelectorAll('.nonechk')].filter((x) => x.offsetParent !== null).map((x) => x.getBoundingClientRect()).filter((r) => r.height < 44 || r.width < 44).length);
   assert.equal(small, 0, '入力なしの押す所が 44px より小さい');
@@ -2406,9 +2408,9 @@ await ta('[62] 入力なし (スマホ 390): 横にはみ出さない・押す�
   await p.goto(B + '/new?kind=single');
   await fillSingleReq(p, 'ui-none-390');
   // 🚨 単品の登録の画面は前から 390 幅では上の帯 (ログインの名前)・円の欄・参考 URL の行が少しはみ出す (携帯向けに作っていない・この PR の外)。
-  //    ここでは「入力なし」の札と「まとめて入力なし」がはみ出さない・小さくないことを見る (まとまりの画面は [📱390] が全体を見る)
-  const out0 = await p.evaluate(() => [...document.querySelectorAll('.nonebulk, .refsfoot')].filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > document.documentElement.clientWidth + 1).length);
-  assert.equal(out0, 0, '「まとめて入力なし」の行がはみ出す');
+  //    ここでは「入力なし」の札と参考 URL の下の行がはみ出さない・小さくないことを見る (まとまりの画面は [📱390] が全体を見る)
+  const out0 = await p.evaluate(() => [...document.querySelectorAll('.refsfoot')].filter((x) => x.offsetParent !== null && x.getBoundingClientRect().right > document.documentElement.clientWidth + 1).length);
+  assert.equal(out0, 0, '参考 URL の下の行がはみ出す');
   const small = await p.evaluate(() => [...document.querySelectorAll('.nonechk')].filter((x) => x.offsetParent !== null).map((x) => x.getBoundingClientRect()).filter((r) => r.height < 44 || r.width < 44).length);
   assert.equal(small, 0, '入力なしの押す所が 44px より小さい');
   const out = await p.evaluate(() => [...document.querySelectorAll('.nonechk')].filter((x) => x.offsetParent !== null).filter((x) => { const r = x.getBoundingClientRect(); return r.right > document.documentElement.clientWidth + 1; }).length);

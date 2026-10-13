@@ -2400,6 +2400,7 @@ await ta('[BL4] 画面とつかいかた: 新商品の画面に「入力なし�
   assert.deepEqual(pageOf(r.text).blankKeys, [...BLK.BLANK_KEYS.single]);
   for (const part of ['cost', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision', 'card.yahoo.path']) assert.ok(r.text.includes(`data-none-part="${part}"`), part);
   assert.ok(!r.text.includes('まだ決めない</button>'), '「まだ決めない」は「入力なし」に');
+  assert.ok(!r.text.includes('data-none-all') && !r.text.includes('空の欄を全部'), 'まとめて入力なしにするボタンは置かない (中原さん 10/13: 1 つずつ押す)');
   assert.ok(r.text.indexOf('/public/me-none.js') < r.text.indexOf('/public/me-new.js'), 'me-none.js を先に読む');
   r = await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' });
   assert.deepEqual(nonesOf(r.text).filter((k) => k.startsWith('order_settings.')), ['order_settings.order_lot', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit']);
@@ -2413,7 +2414,8 @@ await ta('[BL4] 画面とつかいかた: 新商品の画面に「入力なし�
   assert.deepEqual(nonesOf(r.text), []);
   const m = await call('GET', '/apps/master-edit/manual');
   for (const w of ['必須でない項目も全部決めます', '値を入れると「入力なし」は自動で外れます', '入力なしは「登録の時点で なし と決めた」だけ', '後の門は今までどおり', 'NE 登録の CSV を作る前には原価が要ります',
-    '· 入力なし: 原価・発送方法…', '空の欄を全部『入力なし』にする', 'JAN の無い子']) assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
+    '· 入力なし: 原価・発送方法…', '<b>1 つずつ</b>「入力なし」を押します', 'JAN の無い子']) assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
+  assert.ok(!m.text.includes('空の欄を全部'), 'つかいかたに、外したまとめてのボタンが残っている');
 });
 
 server.close();

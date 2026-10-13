@@ -95,12 +95,10 @@
     <details class="more"<%= cur.case_lot != null || cur.case_group || cur.capacity_per_unit != null ? ' open' : '' %>>
       <summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>ケース・容量 (使う商品だけ)</summary>
       <div class="body">
-        <% if (noneOn) { %><div class="nonebulk"><span class="hint">使わない商品は「入力なし」</span><button class="btn sm soft" type="button" data-none-all="#po-case-box">空の欄を全部「入力なし」にする</button></div><% } %>
-        <div id="po-case-box">
+        <% if (noneOn) { %><div class="hint" style="padding:4px 0 6px">使わない商品は、欄ごとに「入力なし」を押します</div><% } %>
         <div class="f" data-row="order_settings.case_lot"><label class="lab" for="po-case_lot">ケースロット</label><div class="ctl"><input class="in w-s" id="po-case_lot" inputmode="numeric" autocomplete="off" placeholder="—" value="<%= num(cur.case_lot) %>"<%- track('case_lot', 'ケースロット') %><%- part('case_lot') %><%= D %>><span class="unit">個 / ケース</span><%- none('case_lot', 'ケースロット') %><span class="hint">ケース単位で発注する仕入先だけ</span></div></div>
         <div class="f" data-row="order_settings.case_group"><label class="lab" for="po-case_group">ケースグループ</label><div class="ctl"><input class="in w-m" id="po-case_group" maxlength="100" autocomplete="off" placeholder="—" value="<%= cur.case_group || '' %>"<%- track('case_group', 'ケースグループ') %><%- part('case_group') %><%= D %>><%- none('case_group', 'ケースグループ') %><span class="hint">同じケースに混ぜて入れられる商品に同じ名前</span></div></div>
         <div class="f" data-row="order_settings.capacity_per_unit"><label class="lab" for="po-capacity_per_unit">容量 / 個</label><div class="ctl"><input class="in w-s" id="po-capacity_per_unit" inputmode="decimal" autocomplete="off" placeholder="—" value="<%= num(cur.capacity_per_unit) %>"<%- track('capacity_per_unit', '容量/個') %><%- part('capacity_per_unit') %><%= D %>><%- none('capacity_per_unit', '容量 / 個') %><span class="hint">原料グループの最低発注量を見るとき (例: 100ml の商品 = 100)</span></div></div>
-        </div>
       </div>
     </details>
 

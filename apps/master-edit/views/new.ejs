@@ -189,7 +189,7 @@
         <details class="panel soft" id="sec-yahoo">
           <summary><span class="stepno" data-step="sec-yahoo" aria-hidden="true" style="width:26px;height:26px;font-size:13px"><%= no('sec-yahoo') %></span>Yahoo! を楽天と変えるときだけ <span class="b mute" id="yahoo-sum">ふだんは全部「入力なし」</span><svg class="ic s chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
           <div class="body">
-            <div class="nonebulk"><span class="hint">楽天と同じにする欄は「入力なし」 · 売価は 1 円以上 (0 は入れない)</span><button class="btn sm soft" type="button" data-none-all="#sec-yahoo"<%= dis %>>空の欄を全部「入力なし」にする</button></div>
+            <div class="hint" style="padding:4px 0 6px">楽天と同じにする欄は、欄ごとに「入力なし」を押します · 売価は 1 円以上 (0 は入れない)</div>
             <div class="f" data-row="card.yahoo.price"><label class="lab" for="y-price">Yahoo!売価</label>
               <div class="ctl"><span class="yen"><input class="in w-s" id="y-price" inputmode="numeric" autocomplete="off" data-dirty-field="y_price" data-label="Yahoo!売価" placeholder="0"<%- part('card.yahoo.price') %><%= dis %>></span><span class="unit">円</span><%- none('card.yahoo.price') %></div></div>
             <div class="f" data-row="card.yahoo.price_sagawa"><label class="lab" for="y-price-sagawa">Yahoo!売価 (佐川)</label>

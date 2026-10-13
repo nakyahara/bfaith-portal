@@ -697,8 +697,6 @@ details.adv[open] > summary { border-color: var(--line-strong); color: #fff; }
 .nonechk:has(input:disabled) { opacity: 0.4; cursor: not-allowed; }
 .f.isnone .in, .f.isnone .seg, .f.isnone .stepper, .f.isnone .yen { opacity: 0.45; }
 .f.isnone .nonechk { opacity: 1; }
-.nonebulk { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 4px 0 8px; }
-.nonebulk .btn { min-height: 44px; }
 .refsfoot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .checklist li.none .mark { border-color: var(--accent2); background: rgba(139, 155, 255, 0.14); color: var(--accent2); font-size: 9.5px; font-weight: 700; letter-spacing: -0.02em; }
 .checklist li.none .lbl { color: var(--text2); }
