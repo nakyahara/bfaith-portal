@@ -228,6 +228,45 @@ try {
     assert.ok(!a1.err && !a2.err, `${a1.err?.code} ${a1.err?.message} / ${a2.err?.code} ${a2.err?.message}`);
     assert.deepEqual([a1.ok, a2.ok], [[A, B], [A, B]], '並べ替えた順・重なりは 1 つ');
   });
+  await ta('[6] 逆の向きを同時に (#1719 R8 High): ロジザードのバーコードを書く取引と、ほかの商品の JAN を同じ値にする取引 = 後の方が鍵で待ち、先の commit の後に断られる (両方の向き)', async () => {
+    const { jan13 } = await import('./fixtures/master-variation-db.mjs');
+    const idOf = async (code) => (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0].id;
+    const s1 = await idOf('s001'), s3 = await idOf('s003');
+    const latest = async (id) => (await q('select max(rule_row)::text as r from ops.sku_logizard_barcode_rules where sku_id = $1', [id]))[0].r;
+    const jansOf = async (id) => (await q(`select e.external_value as v from core.external_ids e join core.skus s on s.product_id = e.entity_id and e.entity_type = 'product' where s.sku_id = $1 and e.system = 'jan' and e.valid_to is null order by 1`, [id])).map((x) => x.v);
+    const waiting = async () => (await q("select count(*)::int as n from pg_locks where locktype = 'advisory' and not granted"))[0].n;
+    const until = async (n) => { for (let i = 0; i < 200 && (await waiting()) < n; i++) await sleep(50); assert.ok((await waiting()) >= n, '鍵で待たない'); };
+    const [L, J] = [await open('master_edit'), await open('master_edit')];
+    clients.push(L, J);
+    const lzSql = "select ops.set_sku_logizard_barcode($1::uuid, 'naka@test', $2::bigint, 'jan', $3, 'sku_page', $4::bigint, 'checked', now()) as r";
+    const janSql = 'select ops.edit_sku_jan($1::uuid, $2, $3, $4::jsonb, $5::bigint, $6::jsonb, $7::jsonb) as r';
+    const tail = (c, sql, p) => launch((async () => { try { const r = (await c.query(sql, p)).rows[0].r; await c.query('commit'); return { ok: r }; } catch (e) { await c.query('rollback'); return { err: e }; } })());
+    // ① ロジザードのバーコード (s001 = X) が先 (まだ commit していない) → s003 の JAN を X に = 待つ → commit の後に断られる
+    const X = jan13('458777700401');
+    await L.query('begin');
+    await L.query(lzSql, [uuid(), s1, X, await latest(s1)]);
+    await J.query('begin');
+    const seen3 = await jansOf(s3);
+    const j = tail(J, janSql, [uuid(), 'naka@test', '試験', JSON.stringify(ALL_COMPANY), s3, JSON.stringify(seen3), JSON.stringify([...seen3, X])]);
+    await until(1);
+    assert.equal(j.done, false);
+    await L.query('commit');
+    const rj = await j.promise;
+    assert.match(String(rj.err && rj.err.message), /^jan_taken: .*s001/, rj.err ? rj.err.message : JSON.stringify(rj.ok));
+    assert.deepEqual(await jansOf(s3), seen3);
+    // ② JAN (s003 = Y) が先 (まだ commit していない) → s001 のロジザードのバーコードを Y に = 待つ → commit の後に断られる
+    const Y = jan13('458777700402');
+    await J.query('begin');
+    const seen3b = await jansOf(s3);
+    await J.query(janSql, [uuid(), 'naka@test', '試験', JSON.stringify(ALL_COMPANY), s3, JSON.stringify(seen3b), JSON.stringify([...seen3b, Y])]);
+    await L.query('begin');
+    const l = tail(L, lzSql, [uuid(), s1, Y, await latest(s1)]);
+    await until(1);
+    assert.equal(l.done, false);
+    await J.query('commit');
+    const rl = await l.promise;
+    assert.match(String(rl.err && rl.err.message), /^lzbc_taken: .*s003/, rl.err ? rl.err.message : JSON.stringify(rl.ok));
+  });
 } finally {
   if (server) server.close();
   for (const c of clients) { try { await c.end(); } catch { /* */ } }

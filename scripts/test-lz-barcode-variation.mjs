@@ -25,6 +25,7 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'lzbarcode2-var-'))
 
 const { setupVariationDb, jan13 } = await import('./fixtures/master-variation-db.mjs');
 const RB = await import('../lib/master-register-blanks.mjs');
+const LB = await import('../lib/logizard-barcode.mjs');
 const T = await setupVariationDb();
 const { pg, q, one, asEditor } = T;
 // ほかの商品の JAN (s003)
@@ -177,6 +178,32 @@ await ta('[C2] 応答が失われた後の再送 (同じ request_id) = 印は DB
     const s3 = await post('/api/new/variation', b4);
     assert.deepEqual([s3.status, s3.j.reason], [409, 'lzbc_taken'], s3.text);
   } finally { MIRROR = mirrorOf(); }
+});
+
+await ta('[J1] 逆の向き (#1719 R8 High): ロジザードのバーコードを先に保存 → ほかの商品の JAN を同じ値に = 断る (商品の画面の JAN・まとまりの子の JAN)・同じ商品は通る', async () => {
+  MIRROR = mirrorOf('checked');
+  const X = jan13('458777700301');
+  const sku = async (code) => (await one('select sku_id::text as id from core.skus where code = $1', [code])).id;
+  const s1 = await sku('s001'), s2 = await sku('s002');
+  const latest = async (id) => (await one('select max(rule_row)::text as r from ops.sku_logizard_barcode_rules where sku_id = $1', [id])).r;
+  await asEditor(async () => { await pg.query('begin'); try { await LB.setLzBarcodeInTx(T.db, { requestId: crypto.randomUUID(), actor: 'naka@test', skuId: s1, kind: 'jan', value: X, via: 'sku_page', seenRow: await latest(s1), copy: { state: 'checked', as_of: new Date().toISOString() } }); await pg.query('commit'); } catch (e) { await pg.query('rollback'); throw e; } });
+  const janOf = async (id) => (await q(`select e.external_value as v from core.external_ids e join core.skus s on s.product_id = e.entity_id and e.entity_type = 'product' where s.sku_id = $1 and e.system = 'jan' and e.valid_to is null order by 1`, [id])).map((x) => x.v);
+  const editJan = (id, seen, want) => asEditor(async () => { await pg.query('begin'); try { const r = (await pg.query('select ops.edit_sku_jan($1::uuid, $2, $3, $4::jsonb, $5::bigint, $6::jsonb, $7::jsonb) as r', [crypto.randomUUID(), 'naka@test', '試験', T.OWN, id, JSON.stringify(seen), JSON.stringify(want)])).rows[0].r; await pg.query('commit'); return r; } catch (e) { await pg.query('rollback'); throw e; } });
+  // ほかの商品 (s002) の JAN を X に = 断る (何も書かない)
+  const seen2 = await janOf(s2);
+  const e = await editJan(s2, seen2, [...seen2, X]).then(() => null, (x) => x);
+  assert.match(String(e && e.message), /^jan_taken: JAN \d+ はほかの商品 \(s001\) のロジザードのバーコード/);
+  assert.deepEqual(await janOf(s2), seen2);
+  // 同じ商品 (s001) の JAN を X に = 通る (自分の値)
+  const seen1 = await janOf(s1);
+  assert.equal((await editJan(s1, seen1, [...seen1, X])).ok, true);
+  // まとまりの子の JAN を、ほかの商品のロジザードのバーコードと同じ値に = 409 jan_taken (何も残さない)
+  const Y = jan13('458777700302');
+  await asEditor(async () => { await pg.query('begin'); try { await LB.setLzBarcodeInTx(T.db, { requestId: crypto.randomUUID(), actor: 'naka@test', skuId: s2, kind: 'jan', value: Y, via: 'sku_page', seenRow: await latest(s2), copy: { state: 'checked', as_of: new Date().toISOString() } }); await pg.query('commit'); } catch (x) { await pg.query('rollback'); throw x; } });
+  const r = await post('/api/new/variation', body('lzj1', [['-A', Y, { kind: 'lz_assign' }], ['-B', '', { kind: 'lz_assign' }]]));
+  assert.deepEqual([r.status, r.j && r.j.reason, r.j && r.j.code], [409, 'jan_taken', 'lzj1-A'], r.text);
+  assert.match(r.j.error, /s002/);
+  assert.deepEqual(await counts('lzj1'), { skus: 0, jans: 0, lz: 0, groups: 0 });
 });
 
 server.close();

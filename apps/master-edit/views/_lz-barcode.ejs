@@ -28,6 +28,8 @@
         <% if (lz.rule_row && lz.kind) { %><span class="hint" id="lzbc-by"><%= VIA[lz.via] || lz.via %> · <%= lz.actor_id || '—' %> · <%= String(lz.created_at || '').slice(0, 16) %></span><% } %>
         <% for (const n of (lz.notes || [])) { %><span class="hint lzbc-note"><svg class="ic s" aria-hidden="true"><use href="#i-info"/></svg><%= n %></span><% } %>
         <%# 🆕 #1719 R1 High 2: ロジザードの写しが読めない・空・古いときに保存した値 = 照らせていない印 %>
+        <%# 🆕 #1719 R8: ほかの商品の Amazon の FNSKU・JAN・ロジザードのバーコードと重なっている (取り込みは止めない = ここで知らせる) %>
+        <% if (lz.clash) { %><span class="fmsg err" id="lzbc-clash" data-kind="<%= lz.clash.kind %>"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><%= lz.clash.note %></span><% } %>
         <% if (lz.unchecked) { %><span class="fmsg warn" id="lzbc-unchecked" data-state="<%= lz.lz_copy_state %>"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg><%= lz.unchecked %></span><% } %>
       </div></div>
     <% if (pageData && lz.canWrite) { %>

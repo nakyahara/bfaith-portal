@@ -215,3 +215,125 @@ do $$ begin
     execute 'revoke execute on function ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint) from master_edit';
   end if;
 end $$;
+
+-- ═══════════ 5. 逆の向き: JAN を足す道 (#1719 Codex R8 High) ═══════════
+--   ロジザードのバーコードを X で保存した後に、ほかの商品の JAN を X にする = 重なり。JAN を足す・付け替える関数 (ops.edit_sku_jan = 商品の画面の JAN・
+--   まとまりの子の JAN) を作り直し、同じ値の鍵を取って、ほかの商品の今のロジザードのバーコードと同じなら断る (jan_taken)。
+--   🚨 夜間ロードの JAN (切替の前の NE)・Amazon の FNSKU の取り込みは断らない (正は NE / Amazon = 止めると現場が止まる) =
+--   重なったら商品の画面と一覧 (ロジザードの確かめ待ち) に印を出すだけ (ops.lzbc_value_clash)
+create or replace function ops.edit_sku_jan(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb, p_sku_id bigint, p_seen jsonb, p_jans jsonb) returns jsonb
+  language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+  v_sku     record;
+  v_skus    bigint[];
+  v_cur     text[];
+  v_seen    text[];
+  v_want    text[];
+  v_add     text[];
+  v_rem     text[];
+  v_holder  text;
+  v_lz      text;
+  v_sup     jsonb;
+  v_result  jsonb;
+  x         text;
+begin
+  if ops.reg_actor_problem(p_actor_id, p_reason) is not null then raise exception 'invalid_input: 人・理由の形が違う' using errcode = '22023'; end if;
+  if p_request_id is null then raise exception 'invalid_input: request_id が要る' using errcode = '22023'; end if;
+  if pg_catalog.jsonb_typeof(p_jans) is distinct from 'array' or pg_catalog.jsonb_typeof(p_seen) is distinct from 'array'
+     or exists (select 1 from pg_catalog.jsonb_array_elements(p_jans) j where pg_catalog.jsonb_typeof(j) <> 'string' or not ops.jan_check_ok(j #>> '{}'))
+     or exists (select 1 from pg_catalog.jsonb_array_elements(p_seen) j where pg_catalog.jsonb_typeof(j) <> 'string') then
+    raise exception 'invalid_input: JAN は 8 桁か 13 桁の数字でチェック数字が合うものの配列 (画面が見ていた JAN も配列)' using errcode = '22023';
+  end if;
+  select coalesce(pg_catalog.array_agg(distinct t order by t), '{}') into v_want from pg_catalog.jsonb_array_elements_text(p_jans) t;
+  if pg_catalog.cardinality(v_want) > 5 then raise exception 'invalid_input: JAN は 5 つまで' using errcode = '22023'; end if;
+  select coalesce(pg_catalog.array_agg(distinct t order by t), '{}') into v_seen from pg_catalog.jsonb_array_elements_text(p_seen) t;
+  perform ops.reg_write_gate(p_ownership, array['external_ids.jan']);
+  select k.sku_id, k.code, k.sku_kind, k.product_id into v_sku from core.skus k where k.sku_id = p_sku_id;
+  if not found then raise exception 'not_found: SKU % が無い', p_sku_id using errcode = 'P0002'; end if;
+  if v_sku.sku_kind is distinct from 'single' or v_sku.product_id is null then raise exception 'invalid_input: JAN は商品のある単品だけ' using errcode = '22023'; end if;
+  -- 鍵: 同じ商品の SKU (sku_id の順) → CSV → 商品・SKU の行 (JAN は商品の値 = 同じ商品の SKU の CSV に入る)
+  select pg_catalog.array_agg(k.sku_id order by k.sku_id) into v_skus from core.skus k where k.product_id = v_sku.product_id;
+  perform ops.ne_reg_lock_skus(v_skus);
+  -- 🆕 0080 (#1719 Codex R8 High): 足す (かもしれない) JAN の値の鍵を並べ替えた順で取る = ops.set_sku_logizard_barcode と同じ鍵 (ops.lzbc:<値>)。
+  --   鍵の順は書く関数と同じ「SKU の鍵 → 値の鍵」= 同時でも、どちらかが待ってから相手の commit を見る
+  foreach x in array v_want loop
+    perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('ops.lzbc:' || x, 0));
+  end loop;
+  perform 1 from core.products p where p.product_id = v_sku.product_id for update;
+  perform 1 from core.skus k where k.sku_id = any (v_skus) order by k.sku_id for update;
+  select coalesce(pg_catalog.array_agg(e.external_value order by e.external_value), '{}') into v_cur from core.external_ids e
+   where e.entity_type = 'product' and e.entity_id = v_sku.product_id and e.system = 'jan' and e.id_kind = 'jan' and e.valid_to is null;
+  if v_cur is distinct from v_seen then
+    raise exception 'version_conflict: 画面を開いた後にこの商品の JAN が変わった (今 %)', pg_catalog.array_to_string(v_cur, '・') using errcode = 'P0001';
+  end if;
+  select coalesce(pg_catalog.array_agg(t order by t), '{}') into v_add from pg_catalog.unnest(v_want) t where not (t = any (v_cur));
+  select coalesce(pg_catalog.array_agg(t order by t), '{}') into v_rem from pg_catalog.unnest(v_cur) t where not (t = any (v_want));
+  if pg_catalog.cardinality(v_add) = 0 and pg_catalog.cardinality(v_rem) = 0 then
+    return pg_catalog.jsonb_build_object('ok', true, 'code', v_sku.code, 'no_change', true, 'jan', pg_catalog.to_jsonb(v_cur));
+  end if;
+  foreach x in array v_add loop
+    select coalesce((select s.code from core.skus s where e.entity_type = 'product' and s.product_id = e.entity_id order by s.code_norm limit 1), e.entity_type || ' ' || e.entity_id)
+      into v_holder from core.external_ids e
+     where e.system = 'jan' and e.id_kind = 'jan' and e.external_norm = core.norm_code(x) and e.valid_to is null
+       and not (e.entity_type = 'product' and e.entity_id = v_sku.product_id) limit 1;
+    if v_holder is not null then raise exception 'jan_taken: JAN % はほかの商品 (%) の有効な JAN', x, v_holder using errcode = 'P0001'; end if;
+    -- 🆕 0080: ほかの商品の今のロジザードのバーコードと同じ JAN = 断る (同じ商品の SKU は自分の値)
+    --   (一度でも x を持った SKU の一番新しい行が x のもの = 今の値。前の値は効かない)
+    select k.code into v_lz from (select distinct on (r.sku_id) r.sku_id, r.value from ops.sku_logizard_barcode_rules r
+                                    where r.company_id = 1 and r.sku_id in (select r0.sku_id from ops.sku_logizard_barcode_rules r0 where r0.value = x)
+                                    order by r.sku_id, r.rule_row desc) c
+      join core.skus k on k.sku_id = c.sku_id left join ops.master_registrations g on g.sku_id = c.sku_id
+     where c.value = x and k.product_id is distinct from v_sku.product_id and g.state is distinct from 'cancelled'
+     order by k.code_norm limit 1;
+    if v_lz is not null then raise exception 'jan_taken: JAN % はほかの商品 (%) のロジザードのバーコード (ロジザードに送る値) と同じ', x, v_lz using errcode = 'P0001'; end if;
+  end loop;
+  if exists (select 1 from ops.ne_reg_export_items i where i.sku_id = any (v_skus) and i.state in ('issued', 'import_declared', 'partial')) then
+    raise exception 'reg_csv_issued: この商品の NE 登録の CSV を配った後なので JAN は直せない (先にそのファイルを使わないにする)' using errcode = 'P0001';
+  end if;
+  perform ops.open_reg_write('jan_edit', p_request_id, p_actor_id, p_reason, p_ownership, p_sku_id,
+    (select coalesce(pg_catalog.array_agg(s order by s), '{}') from pg_catalog.unnest(v_skus) s where s <> p_sku_id), array[v_sku.product_id],
+    ops.reg_hash(pg_catalog.jsonb_build_object('op', 'jan_edit', 'sku_id', p_sku_id, 'from', v_cur, 'to', v_want, 'reason', p_reason)),
+    pg_catalog.jsonb_build_object('sku_ids', pg_catalog.to_jsonb(v_skus), 'product_id', v_sku.product_id::text));
+  v_sup := ops.ne_reg_supersede_built(v_skus, p_actor_id, 'JAN');
+  update core.external_ids set valid_to = pg_catalog.now()
+   where entity_type = 'product' and entity_id = v_sku.product_id and system = 'jan' and id_kind = 'jan' and valid_to is null and external_value = any (v_rem);
+  insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id, evidence)
+    select 1, 'product', v_sku.product_id, 'jan', 'jan', t, 'manual', 'human', p_actor_id,
+           pg_catalog.jsonb_build_object('request_id', p_request_id::text, 'reason', p_reason, 'source', 'portal_master_edit')
+      from pg_catalog.unnest(v_add) t order by t;
+  v_result := pg_catalog.jsonb_build_object('ok', true, 'code', v_sku.code, 'kind', 'single', 'request_id', p_request_id::text,
+    'changed', pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('field', 'jan', 'label', 'JAN', 'from', pg_catalog.to_jsonb(v_cur), 'to', pg_catalog.to_jsonb(v_want), 'ne', 'manual')),
+    'superseded', v_sup -> 'superseded');
+  perform ops.close_reg_write(v_result, v_sku.code);
+  return v_result;
+end $$;
+revoke all on function ops.edit_sku_jan(uuid, text, text, jsonb, bigint, jsonb, jsonb) from public;
+
+/**
+ * 🆕 #1719 Codex R8: この SKU のロジザードのバーコード p_value が、ほかの商品の何と重なっているか (無い = 0 行)。読むだけ (画面の印)。
+ *   kind = sku (ほかの SKU の今の値) / jan (ほかの商品の有効な JAN) / fnsku (ほかの商品を含む出品の Amazon の FNSKU)。ops.lzbc_value_holder と同じ 3 つを順に
+ */
+create function ops.lzbc_value_clash(p_sku_id bigint, p_value text) returns table (kind text, code text)
+  language sql stable security definer set search_path = pg_catalog, pg_temp as $$
+  select x.kind, x.code from (
+    (select 1 as o, 'sku'::text as kind, k.code from (select distinct on (r.sku_id) r.sku_id, r.value from ops.sku_logizard_barcode_rules r
+                          where r.company_id = 1 and r.sku_id <> p_sku_id order by r.sku_id, r.rule_row desc) x
+       join core.skus k on k.sku_id = x.sku_id left join ops.master_registrations g on g.sku_id = x.sku_id
+      where x.value = p_value and g.state is distinct from 'cancelled' order by k.code_norm limit 1)
+    union all
+    (select 2, 'jan', coalesce(k.code, 'product ' || e.entity_id::text) from core.external_ids e
+       left join core.skus k on k.company_id = 1 and k.product_id = e.entity_id
+      where e.company_id = 1 and e.entity_type = 'product' and e.system = 'jan' and e.id_kind = 'jan' and e.valid_to is null
+        and e.external_norm = core.norm_code(p_value)
+        and e.entity_id is distinct from (select s.product_id from core.skus s where s.sku_id = p_sku_id)
+      order by k.code_norm limit 1)
+    union all
+    (select 3, 'fnsku', k.code from core.external_ids e
+       join core.listings l on l.company_id = e.company_id and l.listing_id = e.entity_id
+       join core.listing_components c on c.company_id = l.company_id and c.listing_id = l.listing_id and c.sku_id <> p_sku_id
+       join core.skus k on k.sku_id = c.sku_id
+      where e.company_id = 1 and e.entity_type = 'listing' and e.system = 'amazon' and e.id_kind = 'fnsku' and e.valid_to is null
+        and e.external_norm = core.norm_code(p_value)
+      order by k.code_norm limit 1)) x order by x.o
+$$;
+revoke all on function ops.lzbc_value_clash(bigint, text) from public;

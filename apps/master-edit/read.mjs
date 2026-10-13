@@ -196,8 +196,10 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     // 今の行 (一番新しい行) に値があって、写しと照らせていない。0080 の前の DB = 何も当てない
     const ready = (await db.query(`select exists (select 1 from pg_catalog.pg_attribute where attrelid = to_regclass('ops.sku_logizard_barcode_rules')
       and attname = 'lz_copy_state' and not attisdropped) as ok`)).rows[0].ok === true;
+    //   🆕 #1719 R8: ほかの商品の Amazon の FNSKU・JAN・ロジザードのバーコードと重なっている値も (ops.lzbc_value_holder を実行できる DB だけ)
+    const clash = ready && (await db.query(`select coalesce(pg_catalog.has_function_privilege(to_regprocedure('ops.lzbc_value_holder(bigint, text)'), 'EXECUTE'), false) as ok`)).rows[0].ok === true;
     where.push(ready ? `exists (select 1 from (select r.value, r.lz_copy_state from ops.sku_logizard_barcode_rules r where r.sku_id = s.sku_id
-      order by r.rule_row desc limit 1) lz where lz.value is not null and lz.lz_copy_state is distinct from 'checked')` : 'false');
+      order by r.rule_row desc limit 1) lz where lz.value is not null and (lz.lz_copy_state is distinct from 'checked'${clash ? ' or ops.lzbc_value_holder(s.sku_id, lz.value) is not null' : ''}))` : 'false');
   }
   let costCte = '';
   const jsSort = JS_SORTS.includes(f.sort) ? f.sort : null;

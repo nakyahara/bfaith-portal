@@ -102,6 +102,7 @@ async function asRole(role, fn) { await pg.query(`set role ${role}`); try { retu
 const asEditor = (fn) => asRole('master_edit', fn);
 
 const AMZ = 'main@A1VC38T7YXB528';
+let LOAD = null;   // 夜間ロードの材料 (#1719 R8 の試験で出品を足してもう一度流す)
 {
   const sku = (code, kind = 'single') => ({ code, name: `商品 ${code}`, kind, taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 1,
     cost: { jpy: 100, source: kind === 'set' ? 'set_calc' : 'ne', status: 'COMPLETE' }, standardPriceJpy: 1000, shippingCode: 'S02', shippingMethod: '宅急便', shippingCostJpy: 520, reorderMonths: 2 });
@@ -117,6 +118,7 @@ const AMZ = 'main@A1VC38T7YXB528';
     suppliers: [{ code: '0001', name: 'AMC' }], supplierSkus: [], primarySuppliers: [], reorder: { available: true, runId: 'pml_test' },
   };
   const r = await runInitialLoad(db, plan, { log: quiet, runId: 'load_lzb2', ownership: MASTER_OWNERSHIP, now: new Date('2030-01-05T03:00:00Z') });
+  LOAD = { plan, amazon, comp };
   assert.equal(r.ok, true, r.error);
 }
 const sid = async (code) => (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0]?.id;
@@ -559,6 +561,23 @@ await ta('[H3f] 書かなかった (changed: false) 応答が失われた後の�
     assert.equal(await code(() => pg.query(`insert into ops.sku_logizard_barcode_requests (request_id, sku_id, actor_id, rule, via, result) values ($1, $2, 'x@y', 'lz_assign', 'sku_page', '{}')`, [uuid(), ids.lz4])), '42501');
     assert.equal(await code(() => pg.query("update ops.sku_logizard_barcode_requests set result = '{}'")), '42501');
   } finally { LZ_MIRROR = mirrorOf(); }
+});
+await ta('[H6] Amazon の FNSKU の取り込みで重なった (#1719 R8): 夜間ロードは止まらない・商品の画面に赤い印 (Amazon が 1 つずつ配る値 = 打った値が間違いの見込み)・一覧の「ロジザードの確かめ待ち」に出る', async () => {
+  const V = 'X00LZIMP01';
+  await asEditor(async () => { await pg.query('begin'); try { await LB.setLzBarcodeInTx(db, { requestId: uuid(), actor: 'naka@test', skuId: ids.lz3, kind: 'fnsku', value: V, via: 'sku_page', seenRow: await latestRow('lz3'), copy: { state: 'checked', as_of: new Date().toISOString() } }); await pg.query('commit'); } catch (e) { await pg.query('rollback'); throw e; } });
+  const R = await import('../apps/master-edit/read.mjs');
+  const inList = async () => (await asEditor(() => R.listSkus(db, { missing: 'lzbc' }))).rows.map((x) => x.code).includes('lz3');
+  assert.equal(await inList(), false, '照らせた値で重なりも無いのに確かめ待ちに出た');
+  assert.ok(!section((await call('GET', '/apps/master-edit/sku/lz3')).text).includes('id="lzbc-clash"'));
+  // 夜間ロード: oth1 の出品に同じ FNSKU (Amazon が正) = 止めずに取り込む
+  const plan = { ...LOAD.plan, listings: [...LOAD.plan.listings, LOAD.amazon('pr_oth1b', [LOAD.comp('oth1')], V)] };
+  const r = await runInitialLoad(db, plan, { log: quiet, runId: 'load_lzb2_r8', ownership: MASTER_OWNERSHIP, now: new Date('2030-01-06T03:00:00Z') });
+  assert.equal(r.ok, true, r.error);
+  assert.equal((await q("select count(*)::int as n from core.external_ids where system = 'amazon' and id_kind = 'fnsku' and external_value = $1 and valid_to is null", [V]))[0].n, 1);
+  const s = section((await call('GET', '/apps/master-edit/sku/lz3')).text);
+  assert.match(s, /id="lzbc-clash" data-kind="fnsku"/);
+  assert.ok(s.includes('ほかの商品 (oth1) の Amazon の FNSKU と同じです。Amazon の FNSKU は Amazon が商品ごとに 1 つずつ配る値なので、ここで打ったロジザードのバーコードが間違っている見込みが高いです'), s);
+  assert.equal(await inList(), true, '重なった値が確かめ待ちに出ない');
 });
 await ta('[H4] 画面の動き (Chromium): 値を打つと空欄の印が外れる・空欄に印で値が消える・形の一言・通信が切れた保存は同じ request_id で送り直す (2 回書かない)', async () => {
   let chromium;
