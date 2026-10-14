@@ -402,7 +402,7 @@ try {
     await reg(`lk-k${n}`);
     assert.equal((await E2.query('select sha256 from ops.ne_reg_file($1::bigint)', [e.export_id])).rows[0].sha256, e.sha256);
     // 結果を書く前に落ちた (close_21 の結果が無い) = 今回の回では grant できない・前の許可のまま
-    await assert.rejects(NG.query("select ops.grant_new_entry_lease('single', 'close_21')"), /compare_run_mismatch/);
+    await assert.rejects(NG.query("select ops.grant_new_entry_lease('single', 'close_21')"), /lease_denied: current_result_missing/);
     assert.equal((await one("select ops.new_entry_lease_valid('single') as v")).v, true);
   });
 

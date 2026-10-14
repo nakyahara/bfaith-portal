@@ -194,7 +194,13 @@ await ta('[3] 拒まれた = 新しい接続で revoke → 閉じたのを確か
   assert.deepEqual([rmk.code, rmk.state], [1, 'denied']);
   assertFreshCloseVerify(mk);
   assert.equal(mk.isOpen(), false);
-  assert.deepEqual(S.NOT_RECORDED_CODES, ['compare_run_mismatch']);
+  assert.deepEqual(S.NOT_RECORDED_CODES, ['current_result_missing', 'compare_run_mismatch']);
+  // 🆕 #1722 R1 High 2: 今朝の記録が落ちた (current_result_missing だけ) = 閉じない・exit 1
+  const cm = fakeDb({ grantError: 'lease_denied: current_result_missing: 今回の照合の回 (mc_x) の結果の行が無い (記録の前に落ちた) = 新しい許可は出さない', openAtStart: true });
+  const rcm = await run(cm);
+  assert.deepEqual([rcm.code, rcm.state], [1, 'error']);
+  assertKept(rcm, cm, /今朝の照合の結果が記録されていない: current_result_missing/);
+  assert.equal(cm.isOpen(), true);
   assert.deepEqual(S.deniedCodes('lease_denied: kind_gate: a / shape: {"x": 1} / not_today: b'), ['kind_gate', 'shape', 'not_today']);
   assert.deepEqual(S.deniedCodes('別の失敗'), []);
 });

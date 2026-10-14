@@ -121,6 +121,8 @@ const materialOf = (genId, completeAt) => ({
 /** 0065 の 1 つ前の migration の番号 (0065 の前の DB で ne-reg-single-v1 のファイルを作る = #1664 Codex R1 Medium の移行の試験) */
 const PRE_0065 = fs.readdirSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations'))
   .filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) < '0065').map((x) => x.slice(0, 4)).sort().pop();
+const PRE_0082 = fs.readdirSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations'))
+  .filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) < '0082').map((x) => x.slice(0, 4)).sort().pop();
 async function setupDb() {
   const pg = new PGlite();
   const sessionUser = (await pg.query('select session_user::text as u')).rows[0].u;   // 試験の接続のログイン (superuser)。門のログインから戻るときに使う
@@ -266,7 +268,7 @@ const V1_ISSUED = await buildV1('old-v1-issued');
 assert.equal((await one('select cells from ops.ne_reg_export_rows where export_id = $1', [V1_BUILT.export_id])).cells[8], jan13('490000000081'), '前の版は JAN を送る');
 assert.equal((await issue(V1_ISSUED.export_id)).export.state, 'issued');
 assert.equal((await one("select count(*)::int as n from ops.ne_reg_exports where schema_version = 'ne-reg-single-v1'")).n, 2);
-await applyMigrations(db, { log: quiet });   // ここで 0065
+await applyMigrations(db, { log: quiet, to: PRE_0082 });   // ここで 0065 (0082 は [V5] の後 = 当てた時の許可の出し直しを確かめる)
 // 🆕 0068: この DB は products.parent も company = 代表の数えの門が効く。0068 の前に置いた許可の照合の回の数え (NE = Company DB = 0) も置く (本番 = 翌朝の照合 ② が残す)
 { const g = (await db.query('select compare_run_id from ops.new_entry_gate_results order by result_id desc limit 1')).rows[0];
   if (g) await (await import('./fixtures/master-widen.mjs')).seedParentGate(db, { runId: g.compare_run_id }); }
@@ -311,6 +313,18 @@ await ta('[V5] 0065 の前に作った v1 のファイル (#1664 Codex R1 Medium
   }
   assert.equal((await q('select 1 from ops.ne_csv_verified')).length, nRec, '何も記録しない');
 });
+// 🆕 0082 (#1722 Codex R1 Medium): ここで 0082 を当てる = 当てた時に有効な許可 (0058 の期限 = 翌日 07:00) を、同じ結果の行・同じ granted_at・期限 = granted_at + 72 時間の許可に出し直す
+{
+  const before = await one("select lease_id::text as id, result_id::text as r, compare_run_id as c, granted_at, extract(epoch from expires_at - granted_at)::int as s from ops.master_new_entry_leases where kind = 'single' order by lease_id desc limit 1");
+  assert.equal((await one("select ops.new_entry_lease_valid('single') as v")).v, true);
+  assert.ok(before.s < 72 * 3600, '0058 の期限 (翌日 07:00) = 72 時間より短い');
+  await applyMigrations(db, { log: quiet });
+  const after = await one("select lease_id::text as id, result_id::text as r, compare_run_id as c, granted_at, granted_by, extract(epoch from expires_at - granted_at)::int as s, revoked_at from ops.master_new_entry_leases where kind = 'single' order by lease_id desc limit 1");
+  assert.deepEqual([after.r, after.c, after.s, after.revoked_at, after.granted_at.getTime()], [before.r, before.c, 72 * 3600, null, before.granted_at.getTime()]);
+  assert.ok(after.granted_by.startsWith(`0082 で 72 時間に出し直し (lease ${before.id}・`), after.granted_by);
+  assert.equal((await one('select revoke_reason from ops.master_new_entry_leases where lease_id = $1::bigint', [before.id])).revoke_reason, `0082 で 72 時間に出し直し (lease ${after.id})`);
+  assert.equal((await one("select ops.new_entry_lease_valid('single') as v")).v, true, '出し直した許可は有効 = 当てても切れ目は無い');
+}
 
 /** [V5] (0065 の前の v1 のファイルと作り直し) の後のファイルの数 = [C1]〜[C2b] の「何も作っていない」の基準 */
 const EXP_BEFORE_C = (await one('select count(*)::int as n from ops.ne_reg_exports')).n;
@@ -1342,7 +1356,17 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
       '--   (新しい回のコード + 消さない履歴 ops.master_ne_code_history = 許可の回より広く確かめる)。許可の回より古い印・回の記録が無い印は今までどおり ne_codes_stale',
       'if v_mark is distinct from v_run and not exists (',
       'select 1 from ops.master_compare_runs a, ops.master_compare_runs b',
-      'where a.compare_run_id = v_mark and b.compare_run_id = v_run and (a.observed_at, a.compare_run_id) > (b.observed_at, b.compare_run_id)) then'] }, '0082 の ops.ne_reg_issue と 0065 との差');
+      'where a.compare_run_id = v_mark and b.compare_run_id = v_run and (a.observed_at, a.compare_run_id) > (b.observed_at, b.compare_run_id)) then',
+      // 🆕 #1722 Codex R1 High 1: 新しい回は、その回の照合 ② の結果の行 (問題なし) があるときだけ (無い = ne_codes_unverified = 配るのだけ止める)
+      '-- 🆕 0082 (#1722 Codex R1 High 1): 許可の回より新しい印の回は、その回の照合 ② が終わって問題なしの印 (ops.new_entry_gate_results のその回の行・',
+      '--   kind_gate の 5 つ (integrity_untrusted = 取得の件数・取込の整合 / raw_unverifiable_affected_existing_cdb ほか) と最終形の 2 つが 0) があるときだけ使う。',
+      '--   無い (照合の途中・記録の前に落ちた)・問題がある = 配るのだけ止める (ne_codes_unverified。登録・build・許可は止めない = 閉じる時間は作らない)',
+      'if v_mark is distinct from v_run and not exists (',
+      'select 1 from ops.new_entry_gate_results g',
+      'where g.compare_run_id = v_mark and g.single_product_mismatch = 0 and g.non_set_parent_components = 0',
+      "and not exists (select 1 from pg_catalog.jsonb_each(g.kind_gate) x where (x.value #>> '{}')::bigint <> 0)) then",
+      "raise exception 'ne_codes_unverified: NE のコードの回 (%) の照合 ② の結果がまだ無い・問題がある = 配るのだけ止める (その回の結果の記録の後に配る)', v_mark using errcode = 'P0001';",
+      'end if;'] }, '0082 の ops.ne_reg_issue と 0065 との差');
   // 権限: create or replace = 前の権限のまま (作る = 画面のロール・確かめ = watch_writer)・新しい部品はだれにも渡さない
   const priv = async (sig) => one(`select has_function_privilege('public', $1::regprocedure, 'execute') as pub, has_function_privilege('master_edit', $1::regprocedure, 'execute') as me,
       has_function_privilege('watch_writer', $1::regprocedure, 'execute') as ww, (select prosecdef from pg_proc where oid = $1::regprocedure) as d,
@@ -1498,6 +1522,15 @@ await ta('[W1] 0058 (広げる道 PR-1): 初回の配る (ne_reg_issue) の直�
   //   = 許可の回のコードに無い new-x1 も、新しい回のコードにあれば配らない (新しい回 + 履歴 = 広く確かめる)
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T035000000Z_0a5800', '2030-01-10T03:50:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T035000000Z_0a5800', ['new-dup', 'new-x1'], { lease: false });
+  //   🆕 #1722 Codex R1 High 1: その回の照合 ② の結果の行 (= 取得が完全・問題なしの印) がまだ無い (照合の途中・記録の前に落ちた) = 配るのだけ止める
+  const eUnv = await rejectsWith(issue(b1.export.export_id), 409, 'ne_codes_unverified');
+  assert.match(eUnv.message, /NE のコードの回 \(mc_20300110T035000000Z_0a5800\) の照合 ② の結果がまだ無い/);
+  assert.equal((await expOf(b1.export.export_id)).state, 'built');
+  assert.equal((await one("select ops.new_entry_lease_valid('single') as v")).v, true, '許可 (登録・build) は止めない');
+  const bUnv = await build('products', ['new-x5']);   // build は通る
+  await supersede(bUnv.export.export_id);
+  //   その回の結果の行 (問題なし) を書いた後 = 新しい回のコードで確かめて配る
+  await pg.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', ['mc_20300110T035000000Z_0a5800', new Date(Date.now() - 1000).toISOString(), JSON.stringify(ZERO_GATE)]);
   await pgErr(issue(b1.export.export_id), /new-x1 は NE にもうある/);
   assert.equal((await expOf(b1.export.export_id)).state, 'built');
   // NE のコードの回が許可の回より古い (許可の回のコードを書けなかった) = 配らない (R16 M5 ne_codes_stale・今までどおり)

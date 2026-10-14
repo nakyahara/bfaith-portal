@@ -156,7 +156,9 @@ await ta('[15] 照合 ② の新商品のゲートの結果: 5 つの数の形�
   await assert.rejects(q("select ops.grant_new_entry_lease('set', 'mc_gate_1')"), /invalid_input/);
   await rec('mc_gate_2');
   await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_2')"), (e) => !/kind_gate/.test(e.message) && !/compare_run_mismatch/.test(e.message) && !/not_closed/.test(e.message) && /sku_kind_not_company/.test(e.message));   // 一番新しい行を見る
-  await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_1')"), /compare_run_mismatch/);   // 今回の回が一番新しい行でない = 出さない (結果を書く前に落ちた再実行)
+  await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_1')"), /compare_run_mismatch/);
+  // 🆕 0082 (#1722 R1 High 2): 今回の回の結果の行が無い = current_result_missing だけ (一番新しい行の問題 = 区分の持ち主・widen の前 などを混ぜない)
+  await assert.rejects(q("select ops.grant_new_entry_lease('single', 'mc_gate_none')"), (e) => /^lease_denied: current_result_missing: /.test(e.message) && !/sku_kind_not_company|not_widened|compare_run_mismatch/.test(e.message));   // 今回の回が一番新しい行でない = 出さない (結果を書く前に落ちた再実行)
   await assert.rejects(q("select ops.close_new_entry_for_compare('bad id!')"), /invalid_input/);
   assert.equal((await q("select ops.new_entry_lease_valid('single') as v"))[0].v, false);
   // 取り消し = 許可が無くても停止の床 (一番新しい結果の行の番号) を足す → 前の行ではもう出せない

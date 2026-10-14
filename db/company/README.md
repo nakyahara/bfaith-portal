@@ -2716,13 +2716,15 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **照合 ② の始めに閉じない**: `apps/company-db/master-compare/run.mjs` は `ops.close_new_entry_for_compare` を呼ばない。関数は古いアプリの互換で残す = 何もしない (`{ revoked: 0, noop: true }`・鍵も取らない)。`ops.record_new_entry_gate` は「同じ回が始めに閉じた床」を求めない (`close_floor_id` = null)・`ops._new_entry_gate_problems` から `not_closed` を外した。
   閉じていた理由 (#1641 Codex R3 = 照合の途中に作られた新商品) は、照合が repeatable read の 1 つの snapshot で読む = 途中に作られた新商品はその回の数に入らず次の朝の照合が確かめる (許可を出した後に作られた新商品と同じ扱い・最終形の 2 つは記録のときに DB が今の表で数える) で足りる
 - **配る** `ops.ne_reg_issue` (0065 の版から写す): NE のコードの印の回 = 許可の回、**または許可の回より新しい照合の回** (`ops.master_compare_runs` の順) を通す = 照合の途中で印だけ先に進んだ朝 (次の許可の前) も配れる (新しい回のコード + 消さない履歴 = 許可の回より広く確かめる)。許可の回より古い印は今までどおり `ne_codes_stale`。
+  🆕 #1722 Codex R1 High 1: 新しい回の印は、**その回の照合 ② の結果の行 (`ops.new_entry_gate_results`・kind_gate の 5 つ (integrity_untrusted = 取得の件数・取込の整合) と最終形の 2 つが 0) = 取得が完全・問題なしの印** があるときだけ使う。無い (照合の途中・記録の前に落ちた)・問題がある = `ne_codes_unverified` (409) で**配るのだけ**止める (登録・build・許可は止めない)。
   配ったファイル (`ops.ne_reg_file`) は配った時の許可が一番新しく有効な間だけ = 次の朝の許可に置き換わると渡さない (今までの 07:00 の代わり)
-- **毎朝の段** `new-entry-gate.mjs`: 閉じる (revoke → 閉じたのを確かめる) のは DB に拒まれたとき (`lease_denied`) だけ。理由が「回の不一致」だけ (今朝の結果の行が無い)・照合 ② が判定できない / 落ちた・接続の失敗・grant の応答が切れた・DATA_DIR が無い = 閉じない (「新しい許可は出していない・今の許可はそのまま」・exit は今までどおり = retry)
+- **毎朝の段** `new-entry-gate.mjs`: 閉じる (revoke → 閉じたのを確かめる) のは DB に拒まれたとき (`lease_denied`) だけ。理由が `current_result_missing` だけ (🆕 #1722 R1 High 2: grant は渡した回の結果の行が無いと、古い行の not_today などを混ぜずにこれだけを返す = 今朝の記録が落ちた)・`compare_run_mismatch` だけ・照合 ② が判定できない / 落ちた・接続の失敗・grant の応答が切れた・DATA_DIR が無い = 閉じない (「新しい許可は出していない・今の許可はそのまま」・exit は今までどおり = retry)
 - 当て方 (🚨 まだ流さない): `migrate.mjs --dry-run` (0082 だけ・表の列の NOT NULL を外す・関数を create or replace = 実行権はそのまま) → 中原さんの OK → 本適用 → アプリ (マージ・miniPC の pull)。
+  **当てた時の許可**: 0082 の最後 (9.) が、当てた時に有効な一番新しい許可 (0058 の期限 = 翌日 07:00・本番は 10/14 朝に手で出した lease 8 = 10/15 07:00) を、取り消し (理由 = 0082 で 72 時間に出し直し) + 同じ結果の行・同じ回・同じ granted_at で期限 = granted_at + 72 時間の新しい行に出し直す (行の中身は書き換えない決まりのまま・許可の排他の鍵の下・有効でない / もう 72 時間の許可は何もしない = 流し直しても同じ)。dry-run の NOTICE「0082: 許可 8 (single) を 72 時間の許可 N に出し直した」を見る。出し直す前の許可で配ったファイルは渡さない (使わないにして作り直す)。
   **0082 を先に**: 古い run.mjs は close を呼ぶが 0082 では何もしない = 先に当てても切れ目は増えない。アプリを先にすると古い `record_new_entry_gate` が `not_closed` で拒む (その朝は許可が出ない)。
   **ロールの流し直しは要らない** (新しい関数・表は無い・`create or replace` は実行権を変えない・watch_writer の close の実行権はそのまま)。当てた次の朝の要約で「🆕 新商品の入口: 開 (〜3 日後の時刻 JST …)」を確かめる
-- 試験 = `node scripts/test-master-widen.mjs` [15] (close は何もしない・72 時間) / `test-master-reg-csv.mjs` [V2]・[W1]・[W2] (ne_reg_issue の差・新しい回の印で配る・置き換え・72 時間) / `test-new-entry-gate-step.mjs` (閉じるのは拒まれたときだけ) /
-  `test-master-compare-ne.mjs` [39] (照合の始めに閉じない) / 本物の PG = `test-master-widen-pg.mjs` [18]・[18c] (朝の照合の間ずっと有効・照合の途中に保存できる・途中の新商品は snapshot に入らない・翌朝の照合の後まで有効・問題が出たらその場で閉じる)・`test-master-widen-locks-pg.mjs` [18]・[21] (close は鍵を取らない・照合の途中も配る / 登録 / 渡すが通る)
+- 試験 = `node scripts/test-master-widen.mjs` [15] (close は何もしない・72 時間) / `test-master-reg-csv.mjs` [V2]・[W1]・[W2] (ne_reg_issue の差・新しい回の印は結果の行の後だけ配る・置き換え・72 時間)・[V5] の後 (0082 を当てた時の許可の出し直し) / `test-new-entry-gate-step.mjs` (閉じるのは拒まれたときだけ) /
+  `test-master-compare-ne.mjs` [39] (照合の始めに閉じない) / 本物の PG = `test-master-widen-pg.mjs` [18]・[18c] (朝の照合の間ずっと有効・照合の途中に保存できる・途中の新商品は snapshot に入らない・翌朝の照合の後まで有効・問題が出たらその場で閉じる)・[18d] (今朝の記録が落ちた = current_result_missing だけ・本物の毎朝の段は閉じない・0082 の 9. の出し直し)・`test-master-widen-locks-pg.mjs` [18]・[21] (close は鍵を取らない・照合の途中も配る / 登録 / 渡すが通る)
 
 ### 要確認 (quarantined) の商品を確認済みにする (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える

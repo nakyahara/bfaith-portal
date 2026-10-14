@@ -15,6 +15,7 @@
  *   7  復元の 3 種類 (sku_kind が load のダンプ = 最終形が崩れていても通る / company で整合 = 通る / company で不整合 = 復元全体が rollback)
  *  18  開放の許可 (🆕 0082: 照合 ② の始めに閉じない・期限 72 時間・次の許可が置き換える・問題のある結果でその場で閉じる / 結果 → 今回の回で grant・権限・取り消しと閉じるは保存の取引を待つ・停止の床・結果を書く前に落ちた再実行では出ない)
  *  18c 🆕 0082 切れ目 0 (朝の照合 ② の間ずっと有効・照合の途中に保存できる・途中の新商品は snapshot に入らない・翌朝の照合の後まで有効・問題が出たら閉じる)
+ *  18d 🆕 0082 今朝の記録が落ちた = current_result_missing だけ・毎朝の段は閉じない / 当てた時の 07:00 の期限の許可を 72 時間に出し直す
  *  19  復元で新商品の許可が生き返らない (有効な許可のときのダンプ → 復元 = 閉じる・新しい照合 ② の後だけ開く)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-widen-pg.mjs
  *   (この PC では C:/tmp/pg-embed の run-conc.mjs が使い捨ての PostgreSQL を起動して TEST_PG_URL を渡す)
@@ -528,7 +529,7 @@ try {
     const clr = await cl.promise; assert.ok(clr.ok, clr.err?.message); assert.deepEqual([clr.ok.revoked, clr.ok.noop], [0, true]);
     await O2.query('commit');
     assert.equal(await valid(), true, '照合 ② の途中も前の許可は有効');
-    await assert.rejects(grant(NG, 'mc_lease_3'), /compare_run_mismatch/);                     // 今回の回の結果がまだ無い = 新しい許可は出さない
+    await assert.rejects(grant(NG, 'mc_lease_3'), /lease_denied: current_result_missing: /);   // 今回の回の結果がまだ無い = 新しい許可は出さない (#1722 R1 High 2)
     assert.equal(await valid(), true, '前の許可のまま');
     // 確かめで問題が出た (区分のずれ) = 結果を書いた瞬間に前の許可は無効・新しい許可も出さない
     await result('mc_lease_3', { ...ZERO_GATE, raw_mismatch: 1 });
@@ -609,6 +610,63 @@ try {
     assert.ok(l1.lease_id);
   });
 
+  await ta('[18d] 🆕 0082 (#1722 Codex R1 High 2・Medium): 今朝の照合の記録が落ちた (今回の回の結果の行が無い・一番新しい行は昨日) = grant は current_result_missing だけ (not_today を混ぜない)・本物の毎朝の段は閉じない / 0082 を当てた時の 07:00 の期限の許可は 72 時間に出し直す', async () => {
+    const valid = async () => (await E.query("select ops.new_entry_lease_valid('single') as v")).rows[0].v;
+    const GATE = await import('../apps/company-db/master-compare/new-entry-gate.mjs');
+    const { jstDateStr } = await import('../lib/jst-date.js');
+    assert.equal(await valid(), true);
+    // 昨日の結果の行 (問題なし) が一番新しい = 照合の結果の記録の印を立てて owner が 1 行足す (試験だけ)
+    await O.query('begin');
+    await O.query("select set_config('ops.gate_result_protocol', '1', true)");
+    await O.query(`insert into ops.new_entry_gate_results (compare_run_id, products_complete_at, setproducts_complete_at, kind_gate, single_product_mismatch, non_set_parent_components, recorded_by, created_at)
+      values ('mc_gap_yesterday', clock_timestamp() - interval '25 hours', clock_timestamp() - interval '25 hours', $1::jsonb, 0, 0, 'test', clock_timestamp() - interval '24 hours')`, [JSON.stringify(ZERO_GATE)]);
+    await O.query('commit');
+    assert.equal(await valid(), true, '問題のない行 = 許可はそのまま');
+    // 今朝の回 (mc_gap_today) の記録が落ちた = 行が無い → current_result_missing だけ (古い行の not_today を混ぜない)
+    const e1 = await errOf(NG, "select ops.grant_new_entry_lease('single', 'mc_gap_today')");
+    assert.match(String(e1?.message), /^lease_denied: current_result_missing: /);
+    assert.doesNotMatch(String(e1?.message), /not_today|compare_run_mismatch|kind_gate/);
+    assert.deepEqual(GATE.deniedCodes(e1.message), ['current_result_missing']);
+    // 本物の毎朝の段 (new_entry_gate のログイン) = 閉じない・今の許可はそのまま・exit 1 (retry は照合から)
+    const now = new Date();
+    const conn = async () => { const c = await open('new_entry_gate'); return { db: pgAdapter(c), close: () => c.end(), kill: () => { try { c.connection.stream.destroy(); } catch { /* */ } } }; };
+    const step = await GATE.runGateStep({ env: { COMPANY_DB_NEW_ENTRY_GATE_URL: 'postgres://test', DAILY_SYNC_RUN_ID: 'ds_gap' }, dataDir: 'D:/fake', now, connect: conn,
+      readEv: () => ({ 'master-compare': { state: 'complete', as_of: jstDateStr(now), sync_run_id: 'ds_gap', compare_run_id: 'mc_gap_today', ne: { verdict: 'pass' } } }) });
+    assert.deepEqual([step.code, step.state], [1, 'error']);
+    assert.match(step.line, /^🆕 新商品の入口: 新しい許可は出していない \(今朝の照合の結果が記録されていない: current_result_missing: .*\)・今の許可はそのまま/);
+    assert.equal(await valid(), true, '毎朝の段は閉じない');
+    assert.equal((await O.query("select count(*)::int as n from ops.master_new_entry_stop_floors where reason like '%mc_gap_today%'")).rows[0].n, 0, '停止の床も足さない');
+    // 0082 を当てた時の許可 (0058 の期限 = 翌日 07:00 = 72 時間より短い) → 0082 の 9. (本物の migration の文) が 72 時間に出し直す
+    const fs = await import('node:fs');
+    const mig = fs.readFileSync(new URL('../db/company/migrations/0082_new_entry_no_gap.sql', import.meta.url), 'utf8');
+    const block = mig.slice(mig.indexOf('-- @@REISSUE_BEGIN@@'), mig.indexOf('-- @@REISSUE_END@@'));
+    assert.match(block, /^-- @@REISSUE_BEGIN@@\r?\ndo \$\$/);
+    const latest = (await O.query('select result_id::text as r, compare_run_id as c from ops.new_entry_gate_results order by result_id desc limit 1')).rows[0];
+    await O.query('begin'); await O.query("select set_config('ops.lease_protocol', '1', true)");
+    const old = (await O.query(`insert into ops.master_new_entry_leases (kind, result_id, compare_run_id, granted_by, granted_at, expires_at)
+      values ('single', $1::bigint, $2, 'manual: 試験 (0058 の期限)', clock_timestamp() - interval '2 hours', clock_timestamp() + interval '20 hours') returning lease_id::text as id, granted_at`, [latest.r, latest.c])).rows[0];
+    await O.query('commit');
+    assert.equal(await valid(), true);
+    await O.query(block);
+    const rows = (await O.query("select lease_id::text as id, result_id::text as r, compare_run_id as c, granted_by, granted_at, extract(epoch from expires_at - granted_at)::int as s, revoke_reason from ops.master_new_entry_leases where kind = 'single' order by lease_id desc limit 2")).rows;
+    assert.equal(rows[1].id, old.id);
+    assert.equal(rows[1].revoke_reason, `0082 で 72 時間に出し直し (lease ${rows[0].id})`);
+    assert.deepEqual([rows[0].r, rows[0].c, rows[0].s, rows[0].revoke_reason, rows[0].granted_at.getTime()], [latest.r, latest.c, 72 * 3600, null, old.granted_at.getTime()]);
+    assert.equal(rows[0].granted_by, `0082 で 72 時間に出し直し (lease ${old.id}・manual: 試験 (0058 の期限))`);
+    assert.equal(await valid(), true, '出し直した許可が有効');
+    // もう一度流しても何もしない (72 時間の許可)・取り消した許可は出し直さない
+    const n0 = (await O.query('select count(*)::int as n from ops.master_new_entry_leases')).rows[0].n;
+    await O.query(block);
+    assert.equal((await O.query('select count(*)::int as n from ops.master_new_entry_leases')).rows[0].n, n0, '72 時間の許可はそのまま');
+    await NG.query("select ops.revoke_new_entry_lease('single', '試験: 出し直しの前に取り消す')");
+    await O.query(block);
+    assert.equal((await O.query('select count(*)::int as n from ops.master_new_entry_leases')).rows[0].n, n0, '取り消した許可は出し直さない');
+    assert.equal(await valid(), false);
+    // 後の試験 ([19] = 有効な許可のときのダンプ) のために開け直す (今日の回の結果 → grant)
+    await WW.query('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', ['mc_gap_reopen', new Date(Date.now() - 1000).toISOString(), JSON.stringify(ZERO_GATE)]);
+    await NG.query("select ops.grant_new_entry_lease('single', 'mc_gap_reopen')");
+    assert.equal(await valid(), true);
+  });
   await ta('[19] 復元で新商品の許可が生き返らない (#1644 Codex R2 High): 有効な許可のときのダンプ → 照合 ② の始め (0082: 閉じない) → 復元 = 閉じる・新しい record → grant の後だけ開く', async () => {
     const valid = async () => (await E.query("select ops.new_entry_lease_valid('single') as v")).rows[0].v;
     assert.equal(await valid(), true);
@@ -621,7 +679,8 @@ try {
     const maxR = (await O.query('select max(result_id)::text as m from ops.new_entry_gate_results')).rows[0].m;
     assert.deepEqual((await O.query("select kind, floor_result_id::text as f from ops.master_new_entry_stop_floors where reason = '復元' order by floor_id desc limit 2")).rows.map((x) => [x.kind, x.f]).sort(),
       [['set', maxR], ['single', maxR]]);
-    await assert.rejects(NG.query("select ops.grant_new_entry_lease('single', 'mc_lease_5')"), /stop_floor/);   // 戻った結果の行ではもう出せない
+    const lastRun = (await O.query('select compare_run_id as c from ops.new_entry_gate_results order by result_id desc limit 1')).rows[0].c;
+    await assert.rejects(NG.query("select ops.grant_new_entry_lease('single', $1)", [lastRun]), /stop_floor/);   // 戻った結果の行ではもう出せない (0082: 一番新しい行の回で確かめる)
     await assert.rejects(E.query("select ops.stop_new_entry_for_restore('stop')"), (e) => e.code === '42501');   // 画面のロールは呼べない
     // 新しい照合 ② (閉じる → 結果 → その回で grant) の後だけ開く
     await WW.query("select ops.close_new_entry_for_compare('mc_restore_2')");

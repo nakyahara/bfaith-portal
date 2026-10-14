@@ -11,7 +11,10 @@
 --   4. 照合 ② の始めに閉じない: ops.close_new_entry_for_compare は何もしない (古いアプリの互換で残す)・結果の記録は「閉じた床」を求めない
 --      (close_floor_id は null)。照合は repeatable read の 1 つの snapshot で読む = 照合の途中に作られた新商品はこの回の数に入らず、
 --      次の朝の照合が確かめる (許可を出した後に作られた新商品と同じ扱い)。結果の行の最終形の 2 つの数は記録のとき DB が今の表で数える (途中の商品も入る)
---   5. 配る (ops.ne_reg_issue) の NE のコードの回 = 許可の回、または許可の回より新しい照合の回 (照合の途中で NE のコードの印だけ先に進んだ朝も配れる)
+--   5. 配る (ops.ne_reg_issue) の NE のコードの回 = 許可の回、または許可の回より新しい照合の回 (照合の途中で NE のコードの印だけ先に進んだ朝も配れる)。
+--      新しい回はその回の照合 ② の結果の行 (問題なし) があるときだけ (#1722 Codex R1 High 1)・無い / 問題がある = 配るのだけ止める (ne_codes_unverified)
+--   6. grant: 今回の回の結果の行が無い = current_result_missing だけを返す (古い行の not_today などを混ぜない = 毎朝の段は閉じない・#1722 R1 High 2)
+--   7. 当てた時点で有効な許可 (0058 の期限 = 翌日 07:00) を 72 時間の許可に出し直す (#1722 R1 Medium・最後の 9.)
 -- 🚨 変えないもの: 取り消し (ops.revoke_new_entry_lease = 停止の床)・復元の停止・grant の条件 (今回の回・全部 0・今日・widen の後・停止の床より新しい)・
 --    配ったファイルは配った時の許可が一番新しく有効な間だけ (ops.ne_reg_file)。新しい関数は作らない (create or replace だけ = 実行権はそのまま = ロールの流し直しは要らない)
 -- 🚨 全部の関数: search_path = pg_catalog, pg_temp・完全修飾・一時の表を使わない
@@ -154,6 +157,11 @@ declare
 begin
   if p_kind is distinct from 'single' then raise exception 'invalid_input: 知らない新商品の種類 % (今は single だけ)', p_kind using errcode = '22023'; end if;
   perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key(p_kind));
+  -- 🆕 0082 (#1722 Codex R1 High 2): 今回の回の結果の行が無い (今朝の記録の前に落ちた) = 古い行の問題 (not_today など) を混ぜずに current_result_missing だけ
+  --   (毎朝の段はこの理由では閉じない = 今の許可はそのまま)
+  if not exists (select 1 from ops.new_entry_gate_results x where x.compare_run_id = p_compare_run_id) then
+    raise exception 'lease_denied: current_result_missing: 今回の照合の回 (%) の結果の行が無い (記録の前に落ちた) = 新しい許可は出さない', coalesce(p_compare_run_id, 'null') using errcode = 'P0001';
+  end if;
   select * into r from ops.new_entry_gate_results x order by x.result_id desc limit 1;
   v_problems := ops._new_entry_gate_problems(p_kind, r.result_id);
   if r.compare_run_id is distinct from p_compare_run_id then
@@ -239,6 +247,15 @@ begin
             where a.compare_run_id = v_mark and b.compare_run_id = v_run and (a.observed_at, a.compare_run_id) > (b.observed_at, b.compare_run_id)) then
         raise exception 'ne_codes_stale: NE のコードの回 (%) が許可を出した照合の回 (%) と違う = 配らない (新しい照合とゲートの後に)', coalesce(v_mark, 'なし'), coalesce(v_run, 'なし') using errcode = 'P0001';
       end if;
+      -- 🆕 0082 (#1722 Codex R1 High 1): 許可の回より新しい印の回は、その回の照合 ② が終わって問題なしの印 (ops.new_entry_gate_results のその回の行・
+      --   kind_gate の 5 つ (integrity_untrusted = 取得の件数・取込の整合 / raw_unverifiable_affected_existing_cdb ほか) と最終形の 2 つが 0) があるときだけ使う。
+      --   無い (照合の途中・記録の前に落ちた)・問題がある = 配るのだけ止める (ne_codes_unverified。登録・build・許可は止めない = 閉じる時間は作らない)
+      if v_mark is distinct from v_run and not exists (
+           select 1 from ops.new_entry_gate_results g
+            where g.compare_run_id = v_mark and g.single_product_mismatch = 0 and g.non_set_parent_components = 0
+              and not exists (select 1 from pg_catalog.jsonb_each(g.kind_gate) x where (x.value #>> '{}')::bigint <> 0)) then
+        raise exception 'ne_codes_unverified: NE のコードの回 (%) の照合 ② の結果がまだ無い・問題がある = 配るのだけ止める (その回の結果の記録の後に配る)', v_mark using errcode = 'P0001';
+      end if;
     end if;
     select pg_catalog.array_agg(k.code order by k.code) into v_gone from ops.ne_reg_export_items i join core.skus k on k.sku_id = i.sku_id
      where i.export_id = p_export_id and i.state = 'built'
@@ -255,3 +272,32 @@ begin
   perform ops.close_reg_write(v_result, 'reg-csv #' || p_export_id);
   return v_result;
 end $$;
+
+-- ─── 9. 0082 を当てた時点で有効な許可を 72 時間に出し直す (#1722 Codex R1 Medium) ───
+--   0058 の期限 (翌日 07:00) で出した今の許可は、関数を置き換えても expires_at が変わらない = 当てた次の朝 07:00 に切れる。
+--   許可の行の中身は書き換えない決まり (guard: 取り消しを 1 回だけ) = 種類ごとに、今有効な一番新しい許可を「取り消し (理由 = 0082 の出し直し) + 同じ結果の行・
+--   同じ回・同じ granted_at で新しい行 (期限 = granted_at + 72 時間)」にする。許可の排他の鍵 (種類ごと) の下で・有効でない・もう 72 時間の許可は何もしない。
+--   🚨 出し直す前の許可で配ったファイル (ops.ne_reg_file) は「配った時の許可 = 一番新しい許可」でなくなる = 渡さない (使わないにして作り直す)
+-- @@REISSUE_BEGIN@@
+do $$
+declare
+  k   text;
+  l   ops.master_new_entry_leases;
+  v_new bigint;
+begin
+  foreach k in array ops.new_entry_lease_kinds() loop
+    perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key(k));
+    select * into l from ops.master_new_entry_leases x where x.kind = k order by x.lease_id desc limit 1;
+    continue when not found or l.revoked_at is not null or pg_catalog.clock_timestamp() >= l.expires_at
+      or l.expires_at >= l.granted_at + interval '72 hours' or not ops._new_entry_lease_ok(k);
+    perform pg_catalog.set_config('ops.lease_protocol', '1', true);
+    insert into ops.master_new_entry_leases (kind, result_id, compare_run_id, granted_by, granted_at, expires_at)
+      values (l.kind, l.result_id, l.compare_run_id, pg_catalog.left('0082 で 72 時間に出し直し (lease ' || l.lease_id::text || '・' || l.granted_by || ')', 500), l.granted_at, l.granted_at + interval '72 hours')
+      returning lease_id into v_new;
+    update ops.master_new_entry_leases set revoked_at = pg_catalog.clock_timestamp(), revoke_reason = pg_catalog.left('0082 で 72 時間に出し直し (lease ' || v_new::text || ')', 500), revoked_by = session_user::text
+     where lease_id = l.lease_id;
+    perform pg_catalog.set_config('ops.lease_protocol', '', true);
+    raise notice '0082: 許可 % (%) を 72 時間の許可 % に出し直した (期限 %)', l.lease_id, k, v_new, l.granted_at + interval '72 hours';
+  end loop;
+end $$;
+-- @@REISSUE_END@@

@@ -34,8 +34,12 @@ export const ENV_URL = 'COMPANY_DB_NEW_ENTRY_GATE_URL';
 export const KIND = 'single';
 /** 拒まれた理由がこれだけ = widen の前 (準備中)。閉じたまま ⏸️ (exit 0) */
 export const PREP_CODES = Object.freeze(['sku_kind_not_company', 'not_widened']);
-/** 🆕 0082: 拒まれた理由がこれだけ = 今朝の照合の結果の行が無い (記録に失敗した・別の回の結果が一番新しい) = 確かめが終わっていない = 閉じない (今の許可はそのまま) */
-export const NOT_RECORDED_CODES = Object.freeze(['compare_run_mismatch']);
+/**
+ * 🆕 0082: 拒まれた理由がこれだけ = 今朝の照合の結果の行が無い = 確かめが終わっていない = 閉じない (今の許可はそのまま)
+ *   current_result_missing = 渡した回の結果の行が無い (DB は古い行の not_today などを混ぜずにこれだけを返す・#1722 Codex R1 High 2) /
+ *   compare_run_mismatch = 渡した回の行はあるが、別の回の結果が一番新しい
+ */
+export const NOT_RECORDED_CODES = Object.freeze(['current_result_missing', 'compare_run_mismatch']);
 const HEAD = '🆕 新商品の入口:';
 
 /**
