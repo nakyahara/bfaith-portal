@@ -1516,8 +1516,8 @@ async function main() {
   results.push({ name: 'マスタ照合', ...masterCompareResult, warn: masterCompareResult.success && isWarnSummary(masterCompareResult.summary) });
 
   // ─── 新商品の許可 (照合 ② の次の 1 段・計画 newentry_min_plan.md §3 の 2・PR-7。新しい定期実行ではない) ───
-  // その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ = 単品の新商品をポータルで開ける (〜翌日 07:00)。
-  // 照合が失敗・見送り = 流さない (入口は照合の始めで閉じたまま。retry で照合が直ったら RERUN_AFTER でこの段も流す)。照合 ② が判定できない回はこの段が grant を呼ばない。
+  // その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ = 単品の新商品をポータルで開ける (前の許可を置き換える・期限 72 時間・🆕 0082)。
+  // 照合が失敗・見送り = 流さない (🆕 0082: 今の許可はそのまま = 閉じない。retry で照合が直ったら RERUN_AFTER でこの段も流す)。照合 ② が判定できない回はこの段が grant を呼ばない。
   // 接続 COMPANY_DB_NEW_ENTRY_GATE_URL が無い・関数が無い (0058 の前) = 飛ばして要約に一言 (exit 0)。拒まれた = 新しい接続で revoke → 閉じたのを確かめて理由つきで閉・❌
   // (確かめられない = ⚠️ 状態不明)。失敗した朝の retry は「マスタ照合」からやり直す (下の gateRetryJobs)
   const newEntryGateSkip = skipAfterCompare(masterCompareResult);
@@ -1817,7 +1817,7 @@ async function main() {
   // ─── retry-state 書き込み (リトライ対象の失敗があれば) ───
 
   // 「新商品の許可」が失敗した朝は「マスタ照合」も載せる (拒まれた後の revoke で停止の床が進む = 同じ照合の回では開かない。
-  //   retry は新しい照合の回で close → record → grant の順。#1645 Codex R1 Medium・gateRetryJobs)
+  //   retry は新しい照合の回で record → grant の順。#1645 Codex R1 Medium・gateRetryJobs)
   const retryableFailed = gateRetryJobs(results
     // blocked:true は「失敗だが構成不備等で retry しても無駄」なので除外 (Codex Round 3 #medium)
     .filter(r => RETRYABLE_JOBS.includes(r.name) && !r.success && !r.blocked)

@@ -43,13 +43,15 @@ export async function useReal0058(db, { leases = [], futureSetLease = false } = 
   return { lease: 'real' };
 }
 
-/** 種類ごとに「生きている許可の行」があるか (取り消しなし・期限の前・一番新しい結果の行・停止の床より新しい)。区分の持ち主は見ない (それは本物の判定の残り) */
+/** 種類ごとに「生きている許可の行」があるか (取り消しなし・期限の前・許可の後の結果の行が全部問題なし (0082)・停止の床より新しい)。区分の持ち主は見ない (それは本物の判定の残り) */
 export async function liveLeaseKinds(db) {
   const rows = (await db.query(`select k.kind,
       exists (select 1 from ops.master_new_entry_leases l
                where l.lease_id = (select max(x.lease_id) from ops.master_new_entry_leases x where x.kind = k.kind)
                  and l.revoked_at is null and clock_timestamp() < l.expires_at
-                 and l.result_id = (select max(r.result_id) from ops.new_entry_gate_results r)
+                 and not exists (select 1 from ops.new_entry_gate_results r where r.result_id > l.result_id   -- 0082: 許可の後の結果の行が全部問題なし
+                                  and (r.single_product_mismatch <> 0 or r.non_set_parent_components <> 0
+                                       or exists (select 1 from jsonb_each(r.kind_gate) e where (e.value #>> '{}')::bigint <> 0)))
                  and l.result_id > coalesce((select max(f.floor_result_id) from ops.master_new_entry_stop_floors f where f.kind = k.kind), 0)) as live
     from unnest($1::text[]) as k(kind)`, [LEASE_KINDS])).rows;
   return rows.filter((r) => r.live === true).map((r) => r.kind);

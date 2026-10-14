@@ -3,7 +3,8 @@
  *
  *   その朝の照合 ② の回 (証跡 master-compare の compare_run_id) で ops.grant_new_entry_lease('single', 回) を呼ぶ (ログイン new_entry_gate)。
  *   DB の関数が全部を確かめる (一番新しいゲートの結果の行の回 = 渡した回・kind_gate の 5 つが 0・最終形が 0・今日・区分の持ち主が company・widen の後・停止の床より新しい)。
- *   許可が出た = 単品の新商品をポータルで開ける (期限 = DB の expires_at = 翌日 07:00 JST = daily-sync の始まり)。
+ *   許可が出た = 単品の新商品をポータルで開ける。🆕 0082: 新しい許可は前の許可を置き換える (期限 = DB の expires_at = 出してから 72 時間 = 見張りの安全弁)。
+ *   予定で閉じる時間は無い (朝 07:00 にも照合 ② の始めにも閉じない = 前の朝の許可が次の許可まで生きる)。照合 ② の結果に問題があれば DB がその場で無効にする。
  *
  * 使い方 (miniPC): node apps/company-db/master-compare/new-entry-gate.mjs --daily [--data-dir D]
  *   (--daily は daily-sync の runScript が引数の無いときに '7' を足すのを避ける印)
@@ -11,12 +12,16 @@
  *
  * 終わり方 (最後の行 = 朝の要約):
  *   exit 0 = 開いた / 未設定 (接続が無い = この段は飛ばす) / 関数が無い (0058 の前) / 照合 ② が判定できない・落ちた・流れていない (grant を呼ばない) /
- *            widen の前で拒まれた (準備中 = 毎朝 ❌ にしない)。🚨 0058 の前・設定の前に毎朝の処理を止めない
+ *            widen の前で拒まれた (準備中 = 毎朝 ❌ にしない・閉じない)。🚨 0058 の前・設定の前に毎朝の処理を止めない
  *   exit 1 = 拒まれた (理由つき) / 接続・関数の失敗 / その回の照合の証跡が無い / 状態不明 (retry に載る。retry は「マスタ照合」からやり直す = gateRetryJobs)
- *   開かなかった回は、いつも新しい接続で revoke_new_entry_lease → new_entry_lease_valid = false を確かめる (closeAndVerify)。
- *   「閉」と出すのは閉じたのを確かめたときだけ。確かめられない (grant の応答が切れた・返り値が壊れた・新しい接続も落ちた) = 「⚠️ 状態不明 (開いている可能性)」・exit 1 (#1645 Codex R1 High)
- *   🚨 0058 で new_entry_gate に ops.new_entry_lease_valid(text) の EXECUTE が要る (無いと毎回「状態不明」)
- *   DATA_DIR が無い・引数の間違い・最上位の例外も、URL があれば同じ (runCli・#1645 Codex R2 High)。URL が無い = 「未設定」exit 0 (今の本番のまま)
+ *   🆕 0082: 閉じる (新しい接続で revoke_new_entry_lease → new_entry_lease_valid = false を確かめる = closeAndVerify) のは DB に拒まれ (lease_denied)、
+ *   その理由に「確かめで実データの問題を見つけた理由」(CLOSE_CODES = kind_gate・shape_at_compare・shape) があるときだけ (allowlist・#1722 Codex R2 High)。
+ *   ほかの拒まれた理由 (今日でない・回の不一致・widen の前・停止の床・知らない理由) は閉じない (exit 1 = retry・widen の前だけは exit 0)。
+ *   照合 ② が判定できない・落ちた・証跡が無い・接続の失敗・grant の応答が切れた・返り値が読めない・DATA_DIR が無い・引数の間違い = 閉じない
+ *   (「新しい許可は出していない・今の許可はそのまま」。今ある許可は前の朝の照合で確かめた許可・毎朝流れなければ 72 時間で切れる)。
+ *   「閉」と出すのは閉じたのを確かめたときだけ。拒まれて閉じるのを確かめられない = 「⚠️ 状態不明 (開いている可能性)」・exit 1 (#1645 Codex R1 High)
+ *   🚨 0058 で new_entry_gate に ops.new_entry_lease_valid(text) の EXECUTE が要る (無いと拒まれた朝が毎回「状態不明」)
+ *   URL が無い = 「未設定」exit 0 (今の本番のまま)
  */
 import 'dotenv/config';
 import fs from 'node:fs';
@@ -28,23 +33,35 @@ export const STEP_NAME = '新商品の許可';
 export const EVIDENCE_NAME = 'master-compare';
 export const ENV_URL = 'COMPANY_DB_NEW_ENTRY_GATE_URL';
 export const KIND = 'single';
-/** 拒まれた理由がこれだけ = widen の前 (準備中)。閉じたまま ⏸️ (exit 0) */
+/** 拒まれた理由がこれだけ = widen の前 (準備中)。🆕 0082: 閉じない・exit 0 (毎朝 ❌ にしない) */
 export const PREP_CODES = Object.freeze(['sku_kind_not_company', 'not_widened']);
+/**
+ * 🆕 0082: 拒まれた理由がこれだけ = 今朝の照合の結果の行が無い = 確かめが終わっていない = 閉じない (今の許可はそのまま)
+ *   current_result_missing = 渡した回の結果の行が無い (DB は古い行の not_today などを混ぜずにこれだけを返す・#1722 Codex R1 High 2) /
+ *   compare_run_mismatch = 渡した回の行はあるが、別の回の結果が一番新しい
+ */
+export const NOT_RECORDED_CODES = Object.freeze(['current_result_missing', 'compare_run_mismatch']);
+/**
+ * 🆕 0082 (#1722 Codex R2 High): 閉じる (revoke) 理由の allowlist = 0058 / 0082 の ops._new_entry_gate_problems のうち、確かめで実データの問題を見つけたもの
+ *   (kind_gate = 区分のゲートの 5 つの数が 0 でない・shape_at_compare = 照合のときの最終形が 0 でない・shape = 今の最終形が 0 でない)。
+ *   これが 1 つでもあれば閉じる。ほか (not_today・before_widen・sku_kind_not_company・not_widened・stop_floor・not_latest・回の不一致・これから増える知らない理由) は閉じない
+ */
+export const CLOSE_CODES = Object.freeze(['kind_gate', 'shape_at_compare', 'shape']);
 const HEAD = '🆕 新商品の入口:';
 
 /**
  * daily-sync: 照合 (マスタ照合) の結果を見て、この段を流すか。流さない = 結果の行 (流す = null)。
- *   照合が失敗・見送り = 流さない (入口は照合の始めで閉じたまま)。retry で照合が直ったら RERUN_AFTER がこの段も流す = blocked (この段だけを再試行に載せない)
+ *   照合が失敗・見送り = 流さない (🆕 0082: 今の許可はそのまま = 閉じない)。retry で照合が直ったら RERUN_AFTER がこの段も流す = blocked (この段だけを再試行に載せない)
  */
 export function skipAfterCompare(compareResult) {
   if (compareResult && compareResult.success) return null;
-  return { name: STEP_NAME, success: false, skipped: true, blocked: true, summary: `⏭️ 見送り (マスタ照合が失敗 = この段は流さない・今朝は許可を出していない。照合の再試行が成功したらこの段も流す)` };
+  return { name: STEP_NAME, success: false, skipped: true, blocked: true, summary: `⏭️ 見送り (マスタ照合が失敗 = この段は流さない・新しい許可は出していない (今の許可はそのまま)。照合の再試行が成功したらこの段も流す)` };
 }
 
 /**
  * retry に載せる工程の名前 (#1645 Codex R1 Medium)。「新商品の許可」が残っていれば「マスタ照合」も足す。
  *   拒まれた後の revoke は停止の床を今の結果の行まで進める = 同じ照合の回では二度と開かない。
- *   retry は必ず新しい照合の回 (close → record) からやり直し、RERUN_AFTER で許可を出す。daily-sync と retry-failed-jobs の両方が使う
+ *   retry は必ず新しい照合の回 (record) からやり直し、RERUN_AFTER で許可を出す。daily-sync と retry-failed-jobs の両方が使う
  */
 export function gateRetryJobs(names) {
   const out = Array.isArray(names) ? [...names] : [];
@@ -84,7 +101,7 @@ export function jstShort(ts) {
 }
 
 /**
- * client 側の期限 (#1645 Codex R3 High)。親 (daily-sync / retry) は 120 秒で子を強制終了する = その前に必ず閉じる道 (closeAndVerify) を通す。
+ * client 側の期限 (#1645 Codex R3 High)。親 (daily-sync / retry) は 120 秒で子を強制終了する = その前に段を終える (拒まれた回は閉じる道 closeAndVerify を通す)。
  *   許可を出す側 (接続 + 確かめ + grant) は mainMs まで・閉じる側 (新しい接続 + revoke + 確かめ) は closeMs まで。1 回の接続 connectMs・1 回の問い合わせ queryMs。
  *   段全体 = mainMs + closeMs (+ 切断) ≦ 60 秒 = 親の 120 秒から CLI の終わりの待ち (10 秒) を引いても余る。期限が来たら応答を待たずに接続を壊す
  *   (DB の statement_timeout では「SQL は終わったが応答だけ失われた」を解けない)。試験は timeouts で縮める
@@ -151,6 +168,11 @@ export async function closeAndVerify(url, reason, { connect = connectGate, timeo
 
 /** 閉じられたか確かめられない = 「状態不明」(開いている可能性)・exit 1。「閉」と出すのは閉じたのを確かめたときだけ */
 const unknownLine = (why, note) => `⚠️ ${HEAD} 状態不明 (開いている可能性・${why} / ${note})`;
+/**
+ * 🆕 0082: 新しい許可を出さなかったが閉じない回の終わり方 (確かめが終わっていない・段の失敗)。今ある許可はそのまま
+ *   (前の朝の照合で確かめた許可・DB の期限 = 出してから 72 時間・照合 ② の結果に問題があれば DB が無効にする)。「閉」の語は使わない
+ */
+export const keepOut = (why, { code = 1, state = 'error' } = {}) => ({ code, state, line: `${HEAD} 新しい許可は出していない (${why})・今の許可はそのまま (期限まで・確かめで問題が出たら閉じる)` });
 
 /**
  * 1 回ぶん。戻り値 = { code, state, line }
@@ -159,13 +181,13 @@ const unknownLine = (why, note) => `⚠️ ${HEAD} 状態不明 (開いている
 export async function runGateStep({ env = process.env, dataDir, now = new Date(), connect = connectGate, readEv = (d, a) => readEvidence(d, a), timeouts = TIMEOUTS } = {}) {
   const url = String(env[ENV_URL] || '').trim();
   if (!url) return { code: 0, state: 'not_configured', line: `${HEAD} 未設定 (${ENV_URL} が無い = この段は飛ばした)` };
-  /** 開かなかった回の終わり方: 新しい接続で閉じたのを確かめた = 閉 (closedCode) / 確かめられない = 状態不明 (exit 1)。「閉」の語はここ (と runCli) だけ (#1645 Codex R2 High) */
+  /** 拒まれた回の終わり方: 新しい接続で閉じたのを確かめた = 閉 (closedCode) / 確かめられない = 状態不明 (exit 1)。「閉」の語はここだけ (#1645 Codex R2 High) */
   const closeOut = async (why, revokeReason, { closedCode = 1, state = 'error', line = null } = {}) => {
     const v = await closeAndVerify(url, revokeReason, { connect, timeouts });
     if (!v.ok) return { code: 1, state: 'unknown', line: unknownLine(why, v.note) };
     return { code: closedCode, state, line: line || `${HEAD} 閉 (${why})` };
   };
-  if (!dataDir) return closeOut('DATA_DIR が無い = 照合の証跡を読めない', '新商品の許可の段: DATA_DIR が無い');
+  if (!dataDir) return keepOut('DATA_DIR が無い = 照合の証跡を読めない');
   const asOf = jstDateStr(now);
   const syncRunId = String(env.DAILY_SYNC_RUN_ID || '').trim() || null;
   let ev;
@@ -177,7 +199,7 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
   const end = Date.now() + timeouts.mainMs;
   let c;
   try { c = await openConn(connect, url, left(end, timeouts.connectMs)); }
-  catch (e) { const why = `接続できない: ${short(e).slice(0, 120)}`; return closeOut(why, `新商品の許可の段: ${why}`); }
+  catch (e) { return keepOut(`接続できない: ${short(e).slice(0, 120)}`); }
   let phase = 'check', granted = false, g = null, grantError = null;
   try {
     const has = (await query(c, "select to_regprocedure('ops.grant_new_entry_lease(text, text)') is not null as ok", undefined, left(end, timeouts.queryMs), '関数の確かめ')).rows[0]?.ok === true;
@@ -194,9 +216,9 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
   }
 
   if (!cr.ok) {
-    // 照合 ② が判定できない・落ちた・その回の証跡が無い = grant を呼ばない (閉じる向きだけ)
-    if (grantError) { const why = `確かめられない: ${short(grantError).slice(0, 120)}`; return closeOut(why, `新商品の許可の段: ${why}`); }
-    return closeOut(cr.reason, `照合 ② の次の段: ${cr.reason}`, { closedCode: cr.kind === 'error' ? 1 : 0, state: cr.kind === 'error' ? 'error' : 'compare_not_ready' });
+    // 照合 ② が判定できない・落ちた・その回の証跡が無い = grant を呼ばない。🆕 0082: 閉じない (確かめが終わっていない = 問題が見つかったのではない)
+    if (grantError) return keepOut(`確かめられない: ${short(grantError).slice(0, 120)}`);
+    return keepOut(cr.reason, { code: cr.kind === 'error' ? 1 : 0, state: cr.kind === 'error' ? 'error' : 'compare_not_ready' });
   }
   if (grantError) {
     const msg = short(grantError);
@@ -204,23 +226,25 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
     const codes = denied ? deniedCodes(msg) : [];
     const why = denied ? msg.replace(/^.*?lease_denied:\s*/, '') : msg;
     const revokeReason = `許可を出せない (${cr.compareRunId}): ${msg}`;
-    if (denied && codes.length > 0 && codes.every((k) => PREP_CODES.includes(k))) {
-      return closeOut(`widen の前 = 準備中: ${why.slice(0, 160)}`, revokeReason, { closedCode: 0, state: 'prep', line: `⏸️ ${HEAD} 閉 (widen の前 = 準備中: ${why.slice(0, 160)})` });
-    }
-    // grant の応答が切れた (DB では開いたかもしれない) も、拒まれたのと同じく新しい接続で閉じて確かめる
-    return closeOut(`${denied ? '拒まれた' : '許可を出せない'}: ${why.slice(0, 220)}`, revokeReason, { state: denied ? 'denied' : 'error' });
+    // 🆕 0082 (#1722 Codex R2 High): 閉じるのは「実データの問題を確かめた理由」(CLOSE_CODES = 区分のゲートの差・最終形) が 1 つでもあるときだけ (allowlist)。
+    //   鮮度 (not_today)・回 (current_result_missing・compare_run_mismatch・not_latest)・準備 (widen の前)・止めた (stop_floor)・知らない理由 = 閉じない (今の許可はそのまま・retry)
+    if (denied && codes.some((k) => CLOSE_CODES.includes(k))) return closeOut(`拒まれた: ${why.slice(0, 220)}`, revokeReason, { state: 'denied' });
+    if (denied && codes.length > 0 && codes.every((k) => PREP_CODES.includes(k))) return keepOut(`widen の前 = 準備中: ${why.slice(0, 160)}`, { code: 0, state: 'prep' });
+    if (denied && codes.length > 0 && codes.every((k) => NOT_RECORDED_CODES.includes(k))) return keepOut(`今朝の照合の結果が記録されていない: ${why.slice(0, 160)}`);
+    if (denied) return keepOut(`拒まれた (問題の確かめではない理由・閉じない): ${why.slice(0, 200)}`, { state: 'denied_kept' });
+    // 🆕 0082: 拒むのでない失敗 (応答が切れた・鍵の待ちの打ち切りなど) = 閉じない。DB で通っていれば新しい許可 (今朝の確かめが通った許可)・通っていなければ今の許可のまま
+    return keepOut(`${phase === 'grant' ? '許可を出せたか分からない' : '許可を出せない'}: ${why.slice(0, 200)}`);
   }
   if (!granted || !g || typeof g !== 'object' || !g.expires_at || !Number.isFinite(Date.parse(g.expires_at))) {
-    // grant は返ったが返り値が読めない = 開いたかどうか分からない → 新しい接続で閉じて確かめる
-    const why = `許可の返り値が読めない: ${JSON.stringify(g ?? null).slice(0, 80)}`;
-    return closeOut(why, `許可を出せない (${cr.compareRunId}): ${why}`);
+    // grant は返ったが返り値が読めない = 開いたかどうか分からない。🆕 0082: 閉じない (どちらでも DB の確かめを通った許可)
+    return keepOut(`許可の返り値が読めない: ${JSON.stringify(g ?? null).slice(0, 80)}`);
   }
   return { code: 0, state: 'opened', grant: g, line: `${HEAD} 開 (〜${jstShort(g.expires_at)} JST・照合 ${cr.compareRunId}・許可 #${g.lease_id ?? '?'})` };
 }
 
 /**
- * CLI の 1 回 (試験が env・接続を差し替える)。引数の間違い・最上位の例外 = URL があれば新しい接続で閉じて確かめる (#1645 Codex R2 High)。
- *   確かめた = 閉・exit 1 / 確かめられない = 状態不明・exit 1 / URL が無い = 許可は出していない (「閉」とは言わない)・exit 1
+ * CLI の 1 回 (試験が env・接続を差し替える)。引数の間違い・最上位の例外 = exit 1。
+ *   🆕 0082: 閉じない (段の失敗は問題が見つかったのではない = 今の許可はそのまま)。URL が無い = 許可は出していない (「閉」とは言わない)
  */
 export async function runCli(argv, { env = process.env, connect = connectGate, readEv = undefined, now = undefined, timeouts = TIMEOUTS } = {}) {
   try {
@@ -230,8 +254,7 @@ export async function runCli(argv, { env = process.env, connect = connectGate, r
     const why = `この段が落ちた: ${short(e).slice(0, 160)}`;
     const url = String(env[ENV_URL] || '').trim();
     if (!url) return { code: 1, state: 'error', line: `${HEAD} ${why} (${ENV_URL} が無い = 許可は出していない)` };
-    const v = await closeAndVerify(url, `新商品の許可の段: ${why}`, { connect, timeouts });
-    return v.ok ? { code: 1, state: 'error', line: `${HEAD} 閉 (${why})` } : { code: 1, state: 'unknown', line: unknownLine(why, v.note) };
+    return keepOut(why);
   }
 }
 
