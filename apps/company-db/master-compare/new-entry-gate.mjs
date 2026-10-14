@@ -12,10 +12,11 @@
  *
  * 終わり方 (最後の行 = 朝の要約):
  *   exit 0 = 開いた / 未設定 (接続が無い = この段は飛ばす) / 関数が無い (0058 の前) / 照合 ② が判定できない・落ちた・流れていない (grant を呼ばない) /
- *            widen の前で拒まれた (準備中 = 毎朝 ❌ にしない)。🚨 0058 の前・設定の前に毎朝の処理を止めない
+ *            widen の前で拒まれた (準備中 = 毎朝 ❌ にしない・閉じない)。🚨 0058 の前・設定の前に毎朝の処理を止めない
  *   exit 1 = 拒まれた (理由つき) / 接続・関数の失敗 / その回の照合の証跡が無い / 状態不明 (retry に載る。retry は「マスタ照合」からやり直す = gateRetryJobs)
- *   🆕 0082: 閉じる (新しい接続で revoke_new_entry_lease → new_entry_lease_valid = false を確かめる = closeAndVerify) のは DB に拒まれたとき (lease_denied) だけ
- *   (確かめで問題が出た = 区分の差・最終形・停止の床 など)。ただし理由が「回の不一致」だけ (今朝の結果の行が記録されていない = 確かめが終わっていない) は閉じない。
+ *   🆕 0082: 閉じる (新しい接続で revoke_new_entry_lease → new_entry_lease_valid = false を確かめる = closeAndVerify) のは DB に拒まれ (lease_denied)、
+ *   その理由に「確かめで実データの問題を見つけた理由」(CLOSE_CODES = kind_gate・shape_at_compare・shape) があるときだけ (allowlist・#1722 Codex R2 High)。
+ *   ほかの拒まれた理由 (今日でない・回の不一致・widen の前・停止の床・知らない理由) は閉じない (exit 1 = retry・widen の前だけは exit 0)。
  *   照合 ② が判定できない・落ちた・証跡が無い・接続の失敗・grant の応答が切れた・返り値が読めない・DATA_DIR が無い・引数の間違い = 閉じない
  *   (「新しい許可は出していない・今の許可はそのまま」。今ある許可は前の朝の照合で確かめた許可・毎朝流れなければ 72 時間で切れる)。
  *   「閉」と出すのは閉じたのを確かめたときだけ。拒まれて閉じるのを確かめられない = 「⚠️ 状態不明 (開いている可能性)」・exit 1 (#1645 Codex R1 High)
@@ -32,7 +33,7 @@ export const STEP_NAME = '新商品の許可';
 export const EVIDENCE_NAME = 'master-compare';
 export const ENV_URL = 'COMPANY_DB_NEW_ENTRY_GATE_URL';
 export const KIND = 'single';
-/** 拒まれた理由がこれだけ = widen の前 (準備中)。閉じたまま ⏸️ (exit 0) */
+/** 拒まれた理由がこれだけ = widen の前 (準備中)。🆕 0082: 閉じない・exit 0 (毎朝 ❌ にしない) */
 export const PREP_CODES = Object.freeze(['sku_kind_not_company', 'not_widened']);
 /**
  * 🆕 0082: 拒まれた理由がこれだけ = 今朝の照合の結果の行が無い = 確かめが終わっていない = 閉じない (今の許可はそのまま)
@@ -40,6 +41,12 @@ export const PREP_CODES = Object.freeze(['sku_kind_not_company', 'not_widened'])
  *   compare_run_mismatch = 渡した回の行はあるが、別の回の結果が一番新しい
  */
 export const NOT_RECORDED_CODES = Object.freeze(['current_result_missing', 'compare_run_mismatch']);
+/**
+ * 🆕 0082 (#1722 Codex R2 High): 閉じる (revoke) 理由の allowlist = 0058 / 0082 の ops._new_entry_gate_problems のうち、確かめで実データの問題を見つけたもの
+ *   (kind_gate = 区分のゲートの 5 つの数が 0 でない・shape_at_compare = 照合のときの最終形が 0 でない・shape = 今の最終形が 0 でない)。
+ *   これが 1 つでもあれば閉じる。ほか (not_today・before_widen・sku_kind_not_company・not_widened・stop_floor・not_latest・回の不一致・これから増える知らない理由) は閉じない
+ */
+export const CLOSE_CODES = Object.freeze(['kind_gate', 'shape_at_compare', 'shape']);
 const HEAD = '🆕 新商品の入口:';
 
 /**
@@ -219,12 +226,12 @@ export async function runGateStep({ env = process.env, dataDir, now = new Date()
     const codes = denied ? deniedCodes(msg) : [];
     const why = denied ? msg.replace(/^.*?lease_denied:\s*/, '') : msg;
     const revokeReason = `許可を出せない (${cr.compareRunId}): ${msg}`;
-    if (denied && codes.length > 0 && codes.every((k) => PREP_CODES.includes(k))) {
-      return closeOut(`widen の前 = 準備中: ${why.slice(0, 160)}`, revokeReason, { closedCode: 0, state: 'prep', line: `⏸️ ${HEAD} 閉 (widen の前 = 準備中: ${why.slice(0, 160)})` });
-    }
-    // 🆕 0082: 今朝の結果の行が無い (回の不一致だけ) = 確かめが終わっていない = 閉じない (retry が照合から)
+    // 🆕 0082 (#1722 Codex R2 High): 閉じるのは「実データの問題を確かめた理由」(CLOSE_CODES = 区分のゲートの差・最終形) が 1 つでもあるときだけ (allowlist)。
+    //   鮮度 (not_today)・回 (current_result_missing・compare_run_mismatch・not_latest)・準備 (widen の前)・止めた (stop_floor)・知らない理由 = 閉じない (今の許可はそのまま・retry)
+    if (denied && codes.some((k) => CLOSE_CODES.includes(k))) return closeOut(`拒まれた: ${why.slice(0, 220)}`, revokeReason, { state: 'denied' });
+    if (denied && codes.length > 0 && codes.every((k) => PREP_CODES.includes(k))) return keepOut(`widen の前 = 準備中: ${why.slice(0, 160)}`, { code: 0, state: 'prep' });
     if (denied && codes.length > 0 && codes.every((k) => NOT_RECORDED_CODES.includes(k))) return keepOut(`今朝の照合の結果が記録されていない: ${why.slice(0, 160)}`);
-    if (denied) return closeOut(`拒まれた: ${why.slice(0, 220)}`, revokeReason, { state: 'denied' });
+    if (denied) return keepOut(`拒まれた (問題の確かめではない理由・閉じない): ${why.slice(0, 200)}`, { state: 'denied_kept' });
     // 🆕 0082: 拒むのでない失敗 (応答が切れた・鍵の待ちの打ち切りなど) = 閉じない。DB で通っていれば新しい許可 (今朝の確かめが通った許可)・通っていなければ今の許可のまま
     return keepOut(`${phase === 'grant' ? '許可を出せたか分からない' : '許可を出せない'}: ${why.slice(0, 200)}`);
   }

@@ -4,7 +4,8 @@
  * 固定する契約:
  *   1 照合 (マスタ照合) が失敗・見送り = この段を流さない (⏭️・blocked = この段だけを retry に載せない)。成功 (⚠️ を含む) = 流す
  *   2 許可が出た = 「🆕 新商品の入口: 開 (〜10/08 07:00 JST」(DB の expires_at)・exit 0・grant は ('single', その朝の照合の回) で 1 回
- *   3 拒まれた = 新しい接続で revoke → 閉じたのを確かめて理由つきで「閉」・exit 1。widen の前だけで拒まれた = ⏸️ 閉・exit 0 (準備中)
+ *   3 拒まれた理由に実データの問題 (kind_gate・shape_at_compare・shape = allowlist) がある = 新しい接続で revoke → 閉じたのを確かめて理由つきで「閉」・exit 1。
+ *     ほかの理由 (今日でない・回の不一致・停止の床・知らない理由) = 閉じない・exit 1 / widen の前だけ = 閉じない・exit 0 (準備中)
  *   4 接続先が無い = 「未設定」・exit 0・接続しない / 関数が無い (0058 の前) = 「0058 の前」・exit 0・grant も revoke も呼ばない
  *   (🆕 0082: 閉じるのは DB に拒まれたときだけ。理由が「回の不一致」だけ = 今朝の結果が記録されていない = 閉じない)
  *   5 照合 ② が判定できない・落ちた・完了していない = grant を呼ばない・閉じない (今の許可はそのまま・exit 0) / 証跡が無い・別の回・別の日 = exit 1 (閉じない)
@@ -147,7 +148,7 @@ await ta('[2] 許可が出た = 開 (〜DB の期限)・exit 0・grant は (sing
   assert.equal((await run(g, { ev: evOk({ verdict: 'breach', ne: { verdict: 'breach' } }) })).state, 'opened');
 });
 
-await ta('[3] 拒まれた = 新しい接続で revoke → 閉じたのを確かめて閉・exit 1 / widen の前だけ = ⏸️ 閉・exit 0 / 確かめられない = 状態不明・exit 1', async () => {
+await ta('[3] 拒まれた理由に実データの問題 (kind_gate・shape_at_compare・shape) がある = 新しい接続で revoke → 閉じたのを確かめて閉・exit 1 / 🆕 #1722 R2: ほか (今日でない・回・widen の前・停止の床・知らない理由) = 閉じない / 確かめられない = 状態不明・exit 1', async () => {
   const f = fakeDb({ grantError: 'lease_denied: kind_gate: 区分のゲートの数が 0 でない (E_only) / stop_floor: 結果の行 41 は止めた時点の行 (41) より新しくない' });
   const r = await run(f);
   assert.deepEqual([r.code, r.state], [1, 'denied']);
@@ -155,20 +156,48 @@ await ta('[3] 拒まれた = 新しい接続で revoke → 閉じたのを確か
   assertFreshCloseVerify(f);
   assert.equal(revokes(f)[0].params[0], 'single');
   assert.match(revokes(f)[0].params[1], /^許可を出せない \(mc_20261006T221500123Z_abc123\): lease_denied: kind_gate/);
-  // widen の前 (区分の持ち主が company でない・widen の記録が無い) だけ = 準備中
-  const p = fakeDb({ grantError: 'lease_denied: sku_kind_not_company: 区分の持ち主が company でない (widen の前) / not_widened: skus.sku_kind を広げた記録が無い' });
+  // 🆕 0082 (#1722 R2 High): widen の前 (区分の持ち主が company でない・widen の記録が無い) だけ = 準備中 = 閉じない・exit 0
+  const p = fakeDb({ grantError: 'lease_denied: sku_kind_not_company: 区分の持ち主が company でない (widen の前) / not_widened: skus.sku_kind を広げた記録が無い', openAtStart: true });
   const rp = await run(p);
   assert.deepEqual([rp.code, rp.state], [0, 'prep']);
-  assert.match(rp.line, /^⏸️ 🆕 新商品の入口: 閉 \(widen の前 = 準備中: sku_kind_not_company/);
-  assertFreshCloseVerify(p);
-  // widen の前 + ほかの理由 = 拒まれた (exit 1)
-  const q = await run(fakeDb({ grantError: 'lease_denied: not_widened: x / compare_run_mismatch: y' }));
-  assert.deepEqual([q.code, q.state], [1, 'denied']);
-  // 取り消しが落ちた = 状態不明・exit 1 (準備中でも)
-  const v = fakeDb({ grantError: 'lease_denied: not_widened: x', revokeError: 'permission denied' });
+  assertKept(rp, p, /\(widen の前 = 準備中: sku_kind_not_company/);
+  assert.equal(p.isOpen(), true);
+  // widen の前 + ほかの理由 (問題の確かめでない) = 閉じない・exit 1
+  const q0 = fakeDb({ grantError: 'lease_denied: not_widened: x / compare_run_mismatch: y', openAtStart: true });
+  const q = await run(q0);
+  assert.deepEqual([q.code, q.state], [1, 'denied_kept']);
+  assertKept(q, q0, /拒まれた \(問題の確かめではない理由・閉じない\): not_widened/);
+  // 🆕 #1722 R2 High (1): 今日でない (日付をまたいだ再実行)・今日でない + 回の不一致・停止の床・widen の前の結果 = 閉じない (今の許可はそのまま)・exit 1
+  for (const msg of ['lease_denied: not_today: 結果の行が今日 (JST) のものでない',
+    'lease_denied: not_today: 結果の行が今日 (JST) のものでない / compare_run_mismatch: 一番新しい結果の行の回 (mc_a) が今回の照合の回 (mc_b) でない',
+    'lease_denied: stop_floor: 結果の行 41 は止めた時点の行 (41) より新しくない', 'lease_denied: before_widen: 結果の行が widen の前']) {
+    const f0 = fakeDb({ grantError: msg, openAtStart: true });
+    const r0 = await run(f0);
+    assert.deepEqual([r0.code, r0.state], [1, 'denied_kept'], msg);
+    assertKept(r0, f0);
+    assert.equal(f0.isOpen(), true, msg);
+  }
+  // 🆕 #1722 R2 High (2): 知らない理由 (これから DB に増える理由) = 閉じない・exit 1
+  const u0 = fakeDb({ grantError: 'lease_denied: something_new: 新しい理由', openAtStart: true });
+  const ru = await run(u0);
+  assert.deepEqual([ru.code, ru.state], [1, 'denied_kept']);
+  assertKept(ru, u0, /something_new/);
+  assert.equal(u0.isOpen(), true);
+  // 🆕 #1722 R2 High (3): 実データの問題 (kind_gate・shape_at_compare・shape) が 1 つでもある = 閉じる (ほかの理由と一緒でも)
+  for (const msg of ['lease_denied: kind_gate: 区分のゲートの数が 0 でない (raw_mismatch)', 'lease_denied: not_today: x / shape_at_compare: 照合のときの最終形が 0 でない',
+    'lease_denied: shape: {"single_product_mismatch": 1} / something_new: y']) {
+    const f1 = fakeDb({ grantError: msg, openAtStart: true });
+    const r1 = await run(f1);
+    assert.deepEqual([r1.code, r1.state], [1, 'denied'], msg);
+    assertFreshCloseVerify(f1);
+    assert.equal(f1.isOpen(), false, msg);
+  }
+  assert.deepEqual(S.CLOSE_CODES, ['kind_gate', 'shape_at_compare', 'shape']);
+  // 取り消しが落ちた = 状態不明・exit 1
+  const v = fakeDb({ grantError: 'lease_denied: kind_gate: x', revokeError: 'permission denied' });
   const rv = await run(v);
   assert.deepEqual([rv.code, rv.state], [1, 'unknown']);
-  assert.match(rv.line, /^⚠️ 🆕 新商品の入口: 状態不明 \(開いている可能性・widen の前 = 準備中: .* \/ 取り消しも失敗 \(permission denied\)\)$/);
+  assert.match(rv.line, /^⚠️ 🆕 新商品の入口: 状態不明 \(開いている可能性・拒まれた: kind_gate: x \/ 取り消しも失敗 \(permission denied\)\)$/);
   // 取り消したのに有効と読めた・確かめが落ちた (new_entry_gate に EXECUTE が無いなど) = 状態不明
   const w = await run(fakeDb({ grantError: 'lease_denied: kind_gate: x', validAfterRevoke: true }));
   assert.deepEqual([w.code, w.state], [1, 'unknown']);
@@ -431,13 +460,14 @@ await ta('[12] (#1645 R2 High → 0082) DATA_DIR が無い・引数の間違い�
   // 本体の「閉」の語の出口は、拒まれて閉じたのを確かめた後 (closeOut) だけ
   const src = fs.readFileSync(path.join(ROOT, 'apps/company-db/master-compare/new-entry-gate.mjs'), 'utf8').replace(/\r\n/g, '\n');
   const outs = src.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*\*)/.test(l) && /\$\{HEAD\} 閉(?!じ)/.test(l));
-  assert.equal(outs.length, 2, outs.join('\n'));
-  assert.ok(outs.every((l) => /line: line \|\| `\$\{HEAD\} 閉 \(\$\{why\}\)`|closeOut\(`widen の前/.test(l)), outs.join('\n'));
+  assert.equal(outs.length, 1, outs.join('\n'));
+  assert.ok(outs.every((l) => /line: line \|\| `\$\{HEAD\} 閉 \(\$\{why\}\)`/.test(l)), outs.join('\n'));
   // revoke を呼ぶのは closeAndVerify だけ・closeAndVerify を呼ぶのは closeOut だけ (拒まれた回)
   const code = src.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*\*)/.test(l)).join('\n');
   assert.equal([...code.matchAll(/revoke_new_entry_lease/g)].length, 1);
   assert.equal([...code.matchAll(/await closeAndVerify\(/g)].length, 1);
-  assert.equal([...code.matchAll(/return closeOut\(/g)].length, 2);   // widen の前 (準備中) と拒まれた
+  assert.equal([...code.matchAll(/closeOut\(/g)].length, 1);   // 🆕 #1722 R2: 閉じる道は 1 つだけ = 実データの問題 (CLOSE_CODES) で拒まれた
+  assert.match(code, /if \(denied && codes\.some\(\(k\) => CLOSE_CODES\.includes\(k\)\)\) return closeOut\(/);
 });
 
 await ta('[13] (#1645 R3 High) 返らない grant・接続・revoke・確かめ = client 側の期限で切って終わる (拒まれた回 = 閉じる道 = 閉 / 状態不明・ほか = 閉じない)・段全体が期限の中で終わる', async () => {
