@@ -11,6 +11,7 @@
  * 読むのは DB の関数 ops.ne_reg_ne_codes (画面のロール master_edit に ops.master_ne_codes の select は無い = 0053)。
  *   関数は 1 回 1,000 コードまで = 1,000 ずつに分けて、1 つの SQL で全部の塊を呼ぶ (往復は権限の確かめと合わせて 2 回)
  */
+import { ListTimeoutError } from './deadline.mjs';
 
 /** ops.ne_reg_ne_codes が 1 回で読むコードの数 (0053 の関数の上限と同じ) */
 export const NE_CODES_CHUNK = 1000;
@@ -24,20 +25,30 @@ export const SPELLING_NOTES = Object.freeze({
 });
 
 /**
- * NE の元のコード (kind = product) を読む。戻り値 = Map<code_norm, { state, ne_code }> / null = 読めない (関数が無い・実行の権限が無い)
+ * NE の元のコード (kind = product) を読む。戻り値 = Map<code_norm, { state, ne_code }> / null = 読めない (関数が無い・実行の権限が無い・読む SQL の失敗)
+ *   🚨 CSV 全体の期限切れ (ListTimeoutError・statement_timeout = 57014) は投げる (呼び手が 503「時間がかかりすぎました」)。
+ *   それ以外の失敗 (ロック待ち 55P03 など) = null = 今のコード + 「読めない」の注意で CSV は出す (補助の値で CSV を 500 にしない。Codex R1 Medium)。
+ *   画面の接続は取引を開いていない (autocommit) = 失敗しても後の SQL は流せる
  * @param {{ query: Function }} db
  * @param {string[]} norms  core.skus.code_norm
  */
-export async function readNeSpellings(db, norms) {
+export async function readNeSpellings(db, norms, { warn = console.warn } = {}) {
   const want = [...new Set((norms || []).filter((x) => typeof x === 'string' && x))];
   const map = new Map();
   if (!want.length) return map;
-  const ok = (await db.query(`select coalesce(pg_catalog.has_function_privilege(to_regprocedure('ops.ne_reg_ne_codes(text[])'), 'EXECUTE'), false) as ok`)).rows[0].ok === true;
-  if (!ok) return null;
-  const rows = (await db.query(`select ops.ne_reg_ne_codes(g.codes) as r
-      from (select array_agg(u.c order by u.c) as codes
-              from (select t.c, (row_number() over (order by t.c) - 1) / ${NE_CODES_CHUNK} as grp from unnest($1::text[]) as t(c)) u
-             group by u.grp) g`, [want])).rows;
+  let rows;
+  try {
+    const ok = (await db.query(`select coalesce(pg_catalog.has_function_privilege(to_regprocedure('ops.ne_reg_ne_codes(text[])'), 'EXECUTE'), false) as ok`)).rows[0].ok === true;
+    if (!ok) return null;
+    rows = (await db.query(`select ops.ne_reg_ne_codes(g.codes) as r
+        from (select array_agg(u.c order by u.c) as codes
+                from (select t.c, (row_number() over (order by t.c) - 1) / ${NE_CODES_CHUNK} as grp from unnest($1::text[]) as t(c)) u
+               group by u.grp) g`, [want])).rows;
+  } catch (e) {
+    if (e instanceof ListTimeoutError || (e && e.code === '57014')) throw e;
+    warn(`[master-edit] NE の元のコードを読めない (CSV は今のコード + 注意で出す): ${String(e && e.message).slice(0, 160)}`);
+    return null;
+  }
   for (const { r } of rows) {
     for (const e of (r && r.entries) || []) if (e.kind === 'product') map.set(e.code_norm, { state: e.state, ne_code: e.ne_code ?? null });
   }

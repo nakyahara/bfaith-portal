@@ -2613,6 +2613,27 @@ await ta('[21] CSV の商品コード = NE から来た商品なら NE の書き
   // ok でも小文字にすると別のコード = 使わない (0041 の CHECK と同じ向き)
   assert.deepEqual(N.exportCode({ code: 's001', code_norm: 's001', origin: null }, new Map([['s001', { state: 'ok', ne_code: 'S0011' }]])), { code: 's001', note: N.SPELLING_NOTES.invalid });
   assert.deepEqual(await N.readNeSpellings(noFn, []), new Map(), 'コードが無い = 何も読まない');
+  // 読む SQL の失敗 (ロック待ち 55P03 など) = 読めない (CSV は今のコード + 注意で出す・500 にしない) / CSV 全体の期限切れ = 投げる (呼び手が 503。Codex R1 Medium)
+  const { ListTimeoutError } = await import('../apps/master-edit/deadline.mjs');
+  const failWith = (mk) => ({ query: (sql, p) => { if (/ne_reg_ne_codes\(g\.codes\)/.test(sql)) throw mk(); return db.query(sql, p); } });
+  const lockErr = () => Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' });
+  const warns = [];
+  await pg.query('set role master_edit');
+  try {
+    assert.equal(await N.readNeSpellings(failWith(lockErr), ['s001'], { warn: (x) => warns.push(x) }), null);
+    assert.equal(warns.length, 1);
+    await assert.rejects(N.readNeSpellings(failWith(() => new ListTimeoutError()), ['s001'], { warn: () => {} }), ListTimeoutError);
+    await assert.rejects(N.readNeSpellings(failWith(() => Object.assign(new Error('statement timeout'), { code: '57014' })), ['s001'], { warn: () => {} }), /statement timeout/);
+  } finally { await pg.query('set role deploy'); }
+  // CSV でも: 読む SQL が 55P03 で落ちた = 200・今のコード + 「読めない」の注意 (deadlineDb は 57014 だけを期限切れにする)
+  const { __setPgClientFactory: setF } = await import('../apps/master-edit/router.mjs');
+  setF(async (url, extra) => { const c = await pgFactory(url, extra); return { ...c, query: (t, p) => { if (/ne_reg_ne_codes\(g\.codes\)/.test(t)) throw lockErr(); return c.query(t, p); } }; });
+  try {
+    const got = await fetch(BASE + '/list.csv?codes=' + encodeURIComponent('s001\ns002'), { headers: { 'x-test-session': 'editor' } });
+    assert.equal(got.status, 200);
+    const t2 = table(Buffer.from(await got.arrayBuffer()));
+    assert.deepEqual(byCode(t2), { s001: N.SPELLING_NOTES.unreadable, s002: N.SPELLING_NOTES.unreadable });
+  } finally { setF(pgFactory); }
 });
 
 server.close();
