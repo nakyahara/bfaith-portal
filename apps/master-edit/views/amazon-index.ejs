@@ -110,8 +110,8 @@
               <td><a class="rowlink" href="sku?sku=<%= encodeURIComponent(r.seller_sku) %>"><%= r.seller_sku %></a></td>
               <td class="nm"><%= r.name %></td>
               <td><% if (r.comps) { for (const [c, q] of comps(r.comps)) { %><span class="compchip"><span class="mono"><%= c %></span><span class="x">×<%= q %></span></span><% } } else { %><span class="muted">—<%= del ? ' (外した)' : '' %></span><% } %></td>
-              <td><% if (r.channel) { %><span class="b <%= r.channel === 'FBM' ? 'vio' : 'mute' %>"><%= chLabel(r.channel) %></span><% } else { %><span class="muted">—</span><% } %></td>
-              <td class="mono" style="font-size:13px"><%= r.asin || '' %><% if (!r.asin) { %><span class="muted">—</span><% } %></td>
+              <td><% if (r.channel) { %><span class="b <%= r.channel === 'FBM' ? 'vio' : 'mute' %>"<%- r.channel_from === 'report' ? ' title="Amazon の出品一覧 (前の夜の出品レポート) の区分"' : '' %>><%= chLabel(r.channel) %></span><% } else { %><span class="muted">—</span><% } %></td>
+              <td class="mono" style="font-size:13px"><%= r.asin || '' %><% if (!r.asin) { %><span class="muted" title="出品にも Amazon の出品一覧にもありません (Amazon で削除した出品など)">—</span><% } else if (r.asin_from === 'report') { %> <span class="b mute" style="font-family:inherit" title="出品 (夜間ロード) に ASIN が無いので、Amazon の出品一覧 (前の夜の出品レポート) の ASIN を出しています">出品一覧</span><% } %></td>
               <td><span class="b <%= del ? 'mute' : 'ok' %>"><% if (!del) { %><span class="dot" aria-hidden="true"></span><% } %><%= MAP_STATES[r.state] || r.state %></span><% if (r.origin === 'legacy') { %> <span class="b mute" title="切替の日の移行で入った対応">移行</span><% } %></td>
               <td class="num" style="white-space:nowrap"><%= ui.fmtJst(r.changed_at, { nowMs }) %><span class="sub"><%= r.changed_by || '' %></span></td>
             </tr>

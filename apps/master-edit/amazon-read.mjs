@@ -59,9 +59,41 @@ function amazonWhere(f) {
   if (f.state) { params.push(f.state); where.push(`m.state = $${params.length}`); }
   return { where: where.join(' and '), params };
 }
-const AMAZON_LIST_SELECT = `select m.seller_sku, m.name, m.state, m.origin, ${TS('m.changed_at')} as changed_at, m.changed_by, m.listing_id::text as listing_id, ci.asin,
+/**
+ * 一覧と CSV の select。reportParam = Amazon の出品一覧 (0074・前の夜の出品レポート GET_MERCHANT_LISTINGS_ALL_DATA = Amazon の API) の今の取り込みの
+ *   load_id の $番号 (読めない・無い = null = 出品一覧を使わない)。
+ * ASIN = 出品の ASIN (夜間ロードの catalog_items) が無いときだけ出品一覧の ASIN で埋める (中原さん 10/16「ASIN が空なら Amazon の API で取得して埋めて」)。
+ *   asin_from = 'listing' (出品) / 'report' (出品一覧で埋めた) / null。出品一覧に同じ正規化の SKU が 2 行あって ASIN が食い違う = 埋めない (どちらとも決めない)。
+ *   区分も同じ決まりで出品一覧の FBA / FBM を report_fulfillment に出す (呼び手が fees の区分が無いときだけ使う)。
+ *   🚨 停止中の出品も出品一覧に載る (ALL_DATA)。Amazon で削除した出品は載らない = 空のまま
+ */
+function amazonListSelect(reportParam) {
+  const rep = reportParam ? `left join lateral (
+          select case when count(distinct r.asin) = 1 then min(r.asin) end as asin,
+                 case when count(*) = count(r.fulfillment) and count(distinct r.fulfillment) = 1 then min(r.fulfillment) end as fulfillment
+            from ops.amazon_listing_report r
+           where r.company_id = l.company_id and r.shop_code = l.shop_code and r.load_id = $${reportParam}::bigint and r.sku_norm = l.listing_norm) rp on true` : '';
+  const asin = reportParam ? `coalesce(ci.asin, rp.asin) as asin, case when ci.asin is not null then 'listing' when rp.asin is not null then 'report' end as asin_from, rp.fulfillment as report_fulfillment`
+    : `ci.asin, case when ci.asin is not null then 'listing' end as asin_from, null::text as report_fulfillment`;
+  return `select m.seller_sku, m.name, m.state, m.origin, ${TS('m.changed_at')} as changed_at, m.changed_by, m.listing_id::text as listing_id, ${asin},
         (select string_agg(k.code || '×' || c.qty, ', ' order by c.sort_order) from core.listing_components c join core.skus k on k.sku_id = c.sku_id where c.listing_id = m.listing_id) as comps
-      from core.amazon_sku_maps m join core.listings l on l.listing_id = m.listing_id left join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id`;
+      from core.amazon_sku_maps m join core.listings l on l.listing_id = m.listing_id left join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id ${rep}`;
+}
+/** 出品一覧の今の取り込みの load_id (読めない・無い = null = 使わない・投げない)。古くても ASIN は使う (ASIN は出品の間は変わらない) */
+async function reportLoadId(db) {
+  try {
+    const head = await readReportLoad(db, { nowMs: Date.now() });
+    return head.state === 'ok' && head.load ? String(head.load.load_id) : null;
+  } catch (e) { console.error(`[master-edit] Amazon の出品一覧の見出しを読めない: ${e && e.message}`); return null; }
+}
+/** 区分 = 手数料の写し (fees) → 無ければ出品一覧の FBA / FBM (channel_from で出どころ) */
+function setChannels(rows, channels) {
+  for (const r of rows) {
+    const ch = channels ? (channels.get(normSku(r.seller_sku)) ?? null) : null;
+    r.channel = ch || r.report_fulfillment || null;
+    r.channel_from = ch ? 'fees' : r.report_fulfillment ? 'report' : null;
+  }
+}
 
 /** 一覧 = Company DB の対応 (墓標も)。今 (切替の前) は 0 件 = 正は miniPC の SKU マスタ */
 export async function listAmazonMaps(db, filters, { channels = null } = {}) {
@@ -69,11 +101,14 @@ export async function listAmazonMaps(db, filters, { channels = null } = {}) {
   if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], total: 0, offset: 0, limit: AMAZON_LIST_LIMIT, filters: f, tableMissing: true };
   const { where, params } = amazonWhere(f);
   const total = Number((await db.query(`select count(*)::int as n from core.amazon_sku_maps m where ${where}`, params)).rows[0].n);
+  const loadId = await reportLoadId(db);
+  if (loadId) params.push(loadId);
+  const repP = loadId ? params.length : null;
   params.push(AMAZON_LIST_LIMIT, f.offset);
-  const rows = (await db.query(`${AMAZON_LIST_SELECT}
+  const rows = (await db.query(`${amazonListSelect(repP)}
      where ${where}
      order by m.changed_at desc, m.seller_sku limit $${params.length - 1} offset $${params.length}`, params)).rows;
-  for (const r of rows) r.channel = channels ? (channels.get(normSku(r.seller_sku)) ?? null) : null;
+  setChannels(rows, channels);
   return { rows, total, offset: f.offset, limit: AMAZON_LIST_LIMIT, filters: f, tableMissing: false };
 }
 
@@ -87,12 +122,15 @@ export async function listAmazonMapsAll(db, filters, { channels = null, max = AM
   const total = Number((await db.query(`select count(*)::int as n from core.amazon_sku_maps m where ${where}`, params)).rows[0].n);
   if (total > max) return { rows: [], total, max, filters: f, tableMissing: false, tooMany: true };
   // 数えた後に増えた (別の保存・移行) ときも上限を超えて読まない = 読むのも max + 1 件で切る (Codex R1 P2)
+  const loadId = await reportLoadId(db);
+  if (loadId) params.push(loadId);
+  const repP = loadId ? params.length : null;
   params.push(max + 1);
-  const rows = (await db.query(`${AMAZON_LIST_SELECT}
+  const rows = (await db.query(`${amazonListSelect(repP)}
      where ${where}
      order by m.seller_sku limit $${params.length}`, params)).rows;
   if (rows.length > max) return { rows: [], total: rows.length, max, filters: f, tableMissing: false, tooMany: true, atLeast: true };
-  for (const r of rows) r.channel = channels ? (channels.get(normSku(r.seller_sku)) ?? null) : null;
+  setChannels(rows, channels);
   return { rows, total, max, filters: f, tableMissing: false };
 }
 
