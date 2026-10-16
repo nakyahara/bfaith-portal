@@ -183,7 +183,7 @@
       .catch(function () { cell.textContent = '引き当てできません (通信)'; cell.classList.add('bad'); });
   }
   /* ---------- 構成の行の「NE の商品」の欄で探す (10/12 中原さん「既存の商品コードを検索して選んで登録できるように」) ----------
-   *   打つと (P.searchMin 文字から・250ms 待って) GET /api/amazon/components?q= → 欄の下に候補 (コード・名前・単品 / セット / 例外・登録の状態・在庫)。
+   *   打つと (P.searchMin 文字から・250ms 待って・日本語入力の変換中も) GET /api/amazon/components?q= → 欄の下に候補 (コード・名前・単品 / セット / 例外・登録の状態・在庫)。
    *   ↑↓ と Enter・マウス・タッチで選ぶ → その行の欄にコードが入り、今までの引き当て (名前が出る) が走る (change と同じ)。
    *   使えない商品 (サーバーが理由を付けた物・この構成のほかの行にもうある物) は灰色で選べない = 画面で選べる物は保存で断られない。
    *   ぴったりのコードが一番上で使えるときだけ、はじめから選んだ状態 (Enter で入る)。ほかは ↓ で選ぶまで Enter は今までどおり (数の欄へ)。
@@ -369,16 +369,32 @@
     if (e.key === 'Enter' || e.key === 'Tab') closeSug();
     return false;
   }
+  /*
+   * 日本語入力の確定の Enter (10/16 中原さん「名前を日本語で打つと何も出ない」)。Windows の Chrome・Edge では、確定の Enter の keydown が
+   *   compositionend の後に keyCode 13・isComposing なしで来ることがある = 今までは「選んでいない Enter」と見て候補の箱を閉じ、数の欄へ移っていた
+   *   (欄を出た change で「見つかりません」)。compositionend の後、次のキーを離す (keyup) までの 1 秒以内の Enter は確定の Enter と見て、箱も欄もそのまま。
+   *   (1 秒まで = マウス・タッチで変換の候補を選んで確定した (keyup が来ない) 後に、人が押した Enter を食べない)
+   *   iPhone の Safari (compositionend の後に keyCode 229) も、keydown 229 が確定より先に来る並び (keydown 229 → compositionend → keyup) も同じに動く。
+   *   変換中も探すので、確定の前から候補が出る (下の input)
+   */
+  var imeEnd = null, imeEndAt = 0;   // いま確定した欄と時刻 (次のキーで消す)
   if (sug && rowsEl && canSave) {
     rowsEl.addEventListener('input', function (e) {
       if (!e.target.classList.contains('c-code')) return;
       // 手でコードを変えた = 候補から選んだ印は捨てる (同じコードを打ち直しても、使えるかを確かめて名前を入れる・#1692 Codex R1 Medium)
       var row = e.target.closest('tr'); if (row) row.__picked = null;
-      staleSug(e.target);   // 変換中も、値が変わった時点で古い候補は選べなくする
-      if (!e.isComposing) queueSug(e.target);
+      // 変換中も探す (ぐあーがむ = サーバーでカタカナと同じに見る)。値が変わった時点で古い候補は選べない (staleSug)。
+      // 変換中の ↑↓ と Enter は日本語入力のもの (sugKey は触らない)
+      queueSug(e.target);
     });
-    rowsEl.addEventListener('compositionend', function (e) { if (e.target.classList.contains('c-code')) queueSug(e.target); });
-    rowsEl.addEventListener('focusout', function (e) { if (e.target === S.input) closeSug(); });
+    // 確定の後の input が来ないブラウザのため (もう同じ字で探していれば、探し直さない)
+    rowsEl.addEventListener('compositionend', function (e) {
+      if (!e.target.classList.contains('c-code')) return;
+      imeEnd = e.target; imeEndAt = e.timeStamp;
+      if (S.input !== e.target || e.target.value.trim() !== S.q) queueSug(e.target);
+    });
+    rowsEl.addEventListener('keyup', function () { imeEnd = null; });
+    rowsEl.addEventListener('focusout', function (e) { imeEnd = null; if (e.target === S.input) closeSug(); });
     // 押した所へフォーカスを移さない (欄から出ない = 閉じない)。タッチも同じ (mousedown が後から来る)
     sug.addEventListener('mousedown', function (e) { e.preventDefault(); });
     sug.addEventListener('click', function (e) { var o = e.target.closest('.co'); if (o) chooseSug(Number(o.getAttribute('data-i'))); });
@@ -397,6 +413,8 @@
     });
     rowsEl.addEventListener('change', function (e) { if (e.target.classList.contains('c-code')) { var tr = e.target.closest('tr'); relabel(tr, $$('tr.comp-row', rowsEl).indexOf(tr)); lookup(tr); } });
     rowsEl.addEventListener('keydown', function (e) {
+      var confirmed = imeEnd === e.target && e.timeStamp - imeEndAt < 1000; imeEnd = null;
+      if (confirmed && e.key === 'Enter') { e.preventDefault(); return; }   // 日本語入力の確定の Enter = 字が確かまるだけ (上の imeEnd)
       if (e.target.classList.contains('c-code') && sugKey(e)) return;
       if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
       if (e.target.classList.contains('c-code')) { e.preventDefault(); var q = $('.c-qty', e.target.closest('tr')); if (q) { q.focus(); q.select(); } }

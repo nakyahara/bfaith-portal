@@ -42,6 +42,8 @@
  *     44px で真ん中を押すとその物に当たる・本文の最後が下の保存の箱に隠れない
  *  68 スマホ 390: 開く物 (Amazon SKU の構成の候補・全体から探す・左の列の吹き出し・列の板・マスタの判断の引き出し・隠すの窓・離れるときの確認) が画面の中で切れていない・押せる
  *  69 スマホ 390: 上の帯から行ける道 (ポータル・左の列・全体から探す)。隠すのはダッシュボードと「マスタの入力」の札だけ (ほかの .btn は隠さない)。写し = MASTER_EDIT_UI_SHOTS_390=フォルダ
+ *  70 Amazon SKU の構成の欄を日本語の名前で探す (10/16): 本物の IME (CDP) で変換中から候補・確定の Enter の 3 つの並び (Windows の Chrome・Edge / Safari) で箱を閉じない・数の欄へ移らない・
+ *     マウスで確定した後の Enter は食べない
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -2256,6 +2258,69 @@ await ta('[59] Amazon SKU の構成に まだ NE に無い新商品・要確認 
     await inp2.press('Enter');
     assert.equal(await inp2.inputValue(), 'k002', '要確認も選べる');
   } finally { await setRegUi('k004', keep); await setRegUi('k002', 'available'); }
+});
+
+await ta('[70] Amazon SKU の構成で 日本語の名前で探す (10/16 中原さん「名前を日本語で打つと何も出ない」): 本物の IME (CDP)・変換中から候補・確定の Enter で箱を閉じない / 数の欄へ移らない (Windows の Chrome・Edge で compositionend の後に keyCode 13 で来る並び・keydown 229 が先・Safari = 後に 229)・空白の後の言葉・↓ Enter で選ぶ・確定の後の Enter は今までどおり数の欄へ', async (p) => {
+  await p.goto(B + '/amazon/sku?sku=pr-ime-a');
+  const inp = p.locator('#comp-rows tr.comp-row').first().locator('.c-code');
+  assert.equal(await active(p), '1 行目の NE コード');
+  const cdp = await p.context().newCDPSession(p);
+  const key = (type, k, vk) => cdp.send('Input.dispatchKeyEvent', { type, key: k, code: k === 'Enter' ? 'Enter' : 'KeyA', windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+  // 変換中のキー = keyCode 229 (Process)。字は 1 つずつ増える
+  const compose = async (steps) => { for (const s of steps) { await key('rawKeyDown', 'Process', 229); await cdp.send('Input.imeSetComposition', { text: s, selectionStart: s.length, selectionEnd: s.length }); await key('keyUp', 'a', 65); } };
+  // 確定の Enter: win = keydown 229 → 確定 → keyup / late = 確定 → keydown 13 (isComposing なし) → keyup / safari = 確定 → keydown 229 → keyup
+  const commit = async (text, order) => {
+    if (order === 'win') await key('rawKeyDown', 'Process', 229);
+    await cdp.send('Input.insertText', { text });
+    if (order === 'late') await key('rawKeyDown', 'Enter', 13);
+    if (order === 'safari') await key('rawKeyDown', 'Enter', 229);
+    await key('keyUp', 'Enter', 13);
+  };
+  const hasHoney = async (why) => { const c = await sugCodes(p); assert.ok(c.includes('k001') && c.includes('k002'), why + ': ' + JSON.stringify(c)); };
+  for (const [order, text] of [['late', 'ハチミツ'], ['win', 'ハチミツ'], ['safari', 'はちみつ']]) {
+    await inp.fill('');
+    await compose(['は', 'はち', 'はちみ', 'はちみつ']);
+    await sugOpen(p);
+    await hasHoney(order + ': 変換中 (はちみつ) から候補');
+    if (text !== 'はちみつ') await compose([text]);
+    await commit(text, order);
+    await p.waitForTimeout(100);
+    assert.equal(await active(p), '1 行目の NE コード', order + ': 確定の Enter で数の欄へ移らない');
+    assert.equal(await inp.inputValue(), text);
+    await sugOpen(p);
+    await hasHoney(order + ': 確定の後も候補 (' + text + ')');
+    assert.equal(await p.textContent('#comp-rows .c-name'), '', order + ': 欄を出ない = 引き当て (見つかりません) をしない');
+    await inp.press('Escape');
+    assert.equal(await p.isHidden('#comp-suggest'), true, 'Esc で閉じる');
+  }
+  // 空白の後に言葉を足す → 絞れる・↓ Enter で選ぶ
+  await inp.fill('');
+  await compose(['は', 'はちみつ', 'ハチミツ']);
+  await commit('ハチミツ', 'late');
+  await p.keyboard.type(' 500g');
+  await sugOpen(p);
+  assert.deepEqual(await sugCodes(p), ['k001'], '空白で区切ると全部を含む');
+  await inp.press('ArrowDown');
+  await inp.press('Enter');
+  assert.equal(await inp.inputValue(), 'k001');
+  assert.equal(await active(p), '1 行目 (k001) の数', '選ぶと数の欄へ');
+  await p.waitForFunction(() => /国産 はちみつ/.test(document.querySelector('#comp-rows .c-name').textContent));
+  // 確定の後に選ばずに Enter = 今までどおり数の欄へ (閉じる)
+  await inp.fill('');
+  await compose(['み', 'みかん']);
+  await commit('みかん', 'win');
+  await sugOpen(p);
+  await inp.press('Enter');
+  assert.equal(await p.isHidden('#comp-suggest'), true);
+  assert.match(await active(p), /の数$/, '確定の後の Enter は数の欄へ');
+  // マウス・タッチで変換の候補を選んで確定 (キーなし = keyup が来ない) → しばらく後の Enter は人の Enter (食べない)
+  await inp.fill('');
+  await compose(['み', 'みかん']);
+  await cdp.send('Input.insertText', { text: 'みかん' });
+  await sugOpen(p);
+  await p.waitForTimeout(1100);
+  await inp.press('Enter');
+  assert.match(await active(p), /の数$/, 'マウスで確定した後の Enter は数の欄へ');
 });
 
 await ta('[58] Amazon SKU の名前 (社内) が空なら NE の商品名を入れる (10/12): 候補から選ぶ = 入る (変更の印・保存すると変わること・一言)・次の行では上書きしない・人が直すと一言が消える・元に戻す / 空白だけも空 / コードをぴったり打つ = 入る / 使えない商品 (灰色・打っても) = 入らない / 名前のある対応 = 入らない', async (p) => {
