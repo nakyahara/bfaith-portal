@@ -21,6 +21,7 @@ import multer from 'multer';
 import iconv from 'iconv-lite';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { readNeCodesForRequest, resolveLzCode, neCodesStatus } from './ne-codes.js';
+import { readNewSkusForRequest, checkNewSku, newSkusStatus, NEW_SKU_USABLE_STATES, NEW_SKU_STATE_WORDS, NEW_SKU_NOT_IN_NE } from './new-skus.js';
 import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition, logizardMirrorLatestCapture, targetRule } from './logic.js';
 import {
   ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand,
@@ -1685,7 +1686,8 @@ router.post('/api/vendor-map/qty-per-unit', (req, res) => {
 // ─── 対応表の1件管理 (マスタ管理「先方番号対応表」タブ。CSV全置換と違い1商品ずつ追加・修正できる) ───
 
 // 一覧 (商品名はPMLから解決。廃番等でPMLに無い商品は名前空欄のまま表示)
-router.get('/api/vendor-map/entries', (req, res) => {
+// PMLに無い商品は新商品の登録 (Company DB) の名前で補う (NE登録の前の新商品・new-skus.js)。読めなければ空欄のまま
+router.get('/api/vendor-map/entries', async (req, res) => {
   try {
     const db = getDB();
     const supplier = normSupplierCode(req.query.supplier);
@@ -1694,41 +1696,78 @@ router.get('/api/vendor-map/entries', (req, res) => {
     if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
     const nameByKey = new Map();
     for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || '');
-    const rows = db.prepare('SELECT product_code, product_key, vendor_code, qty_per_unit, updated_at FROM po_vendor_code_map WHERE supplier_code=? ORDER BY product_code')
-      .all(supplier).map(r => ({ ...r, name: nameByKey.get(r.product_key) || '' }));
+    let rows = db.prepare('SELECT product_code, product_key, vendor_code, qty_per_unit, updated_at FROM po_vendor_code_map WHERE supplier_code=? ORDER BY product_code')
+      .all(supplier);
+    const newSkus = rows.some(r => !nameByKey.has(r.product_key)) ? await readNewSkusForRequest() : null;
+    rows = rows.map(r => {
+      const n = !nameByKey.has(r.product_key) && newSkus ? newSkus.map.get(r.product_key) : null;
+      return { ...r, name: nameByKey.get(r.product_key) || (n ? n.name : ''), ...(n ? { newSkuState: n.state } : {}) };
+    });
     res.json({ ok: true, supplierName: sup.name, rows });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // 追加フォームの商品検索 (コード/商品名の部分一致、上限30件)。
 // 仕入先指定時はその仕入先の商品のみ返す (他仕入先の商品はupsertでも拒否されるため候補に出さない)
-router.get('/api/vendor-map/products', (req, res) => {
+// PMLに無い新商品 (新商品の登録で作った・NE登録の前) も候補に出す (代表の仕入先で絞る・やめた商品は出さない。new-skus.js)
+router.get('/api/vendor-map/products', async (req, res) => {
   try {
     const q = trimS(req.query.q).toLowerCase();
     if (!q) return res.json({ ok: true, rows: [] });
     const supplier = normSupplierCode(req.query.supplier);
     const hits = [];
+    const pmlKeys = new Set();
     for (const r of loadPml().rows) {
       const code = trimS(r['商品コード']);
       if (!code) continue;
+      pmlKeys.add(normProductCode(code));
       const prodSup = normSupplierCode(r['仕入先']);
       if (supplier && prodSup !== supplier) continue; // 仕入先未設定 (空欄) の商品も候補に出さない (Codex R2 High)
       const name = r['商品名'] || '';
       if (code.toLowerCase().includes(q) || name.toLowerCase().includes(q)) hits.push({ code, name, supplier: prodSup });
     }
+    const newSkus = await readNewSkusForRequest();
+    for (const [key, n] of newSkus.map) {
+      if (pmlKeys.has(key) || n.ambiguous || !NEW_SKU_USABLE_STATES.includes(n.state) || !n.supplier) continue;
+      if (supplier && n.supplier !== supplier) continue;
+      if (n.code.toLowerCase().includes(q) || n.name.toLowerCase().includes(q)) {
+        hits.push({ code: n.code, name: n.name, supplier: n.supplier, newSku: true, newSkuState: n.state, newSkuStateWord: NEW_SKU_STATE_WORDS[n.state] || n.state });
+      }
+    }
     hits.sort((a, b) => a.code.localeCompare(b.code));
-    res.json({ ok: true, rows: hits.slice(0, 30), total: hits.length });
+    res.json({ ok: true, rows: hits.slice(0, 30), total: hits.length, newSkus: newSkusStatus(newSkus) });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
+
+/**
+ * 対応表の登録・紐づけで使う商品の確かめ: PML にあればその行、無ければ新商品 (Company DB) で確かめる。
+ * @returns {Promise<{ prodSup: string, error: string|null, newSku: object|null }>} error = 断る文 (400)
+ */
+async function productForVendorMap(productCode, supplier, notFoundHint) {
+  const key = normProductCode(productCode);
+  const pmlRow = loadPml().rows.find(r => normProductCode(r['商品コード']) === key);
+  if (pmlRow) {
+    const prodSup = normSupplierCode(pmlRow['仕入先']);
+    return { prodSup, error: prodSup ? null : `この商品は商品マスタで仕入先が未設定です: ${productCode} (先に商品マスタ側を直してください)`, newSku: null };
+  }
+  const nc = checkNewSku(await readNewSkusForRequest(), key, supplier);
+  if (nc.error) return { prodSup: '', error: nc.error, newSku: null };
+  if (nc.sku) return { prodSup: nc.sku.supplier, error: null, newSku: nc.sku };
+  return { prodSup: '', error: `商品マスタに無い商品コードです: ${productCode} (${notFoundHint})`, newSku: null };
+}
 
 const VENDOR_CODE_MAX = 100; // 先方管理番号の実仕様は十数文字。誤貼り付けの肥大化 (監査ログ・添付CSVに複製される) を防ぐ
 
 // 1件追加・更新 (upsert)。商品コードはPML実在+仕入先一致チェックでタイポ・誤仕入先登録を防ぐ (廃番をあえて残す用途はCSV取込で)。
+// PMLに無い商品は新商品の登録 (Company DB) で確かめる (下書きから使える・仕入先は代表の仕入先。new-skus.js)
 // baseUpdatedAt: 楽観ロック (UIは常に送る。表示後に他者が変更/CSV全置換していたら409)。未指定なら無条件upsert (スクリプト/AI連携用)
-router.post('/api/vendor-map/entry', (req, res) => {
+router.post('/api/vendor-map/entry', async (req, res) => {
   try {
-    const db = getDB();
     const b = req.body || {};
+    // 新商品の確かめ (Company DB・3 秒まで) は台帳を読む前に済ませる (待っている間の変更を取りこぼさない)
+    const prod = trimS(b.product_code) && trimS(b.product_code).length <= 200
+      ? await productForVendorMap(trimS(b.product_code), normSupplierCode(b.supplier_code), '廃番等を登録する場合はCSV取込で') : null;
+    const db = getDB();
     const supplier = normSupplierCode(b.supplier_code);
     const productCode = trimS(b.product_code);
     const vendorCode = trimS(b.vendor_code);
@@ -1741,10 +1780,8 @@ router.post('/api/vendor-map/entry', (req, res) => {
     if (/[\r\n]/.test(vendorCode)) return res.status(400).json({ ok: false, error: '先方管理番号に改行は使えません' });
     if (vendorCode.length > VENDOR_CODE_MAX) return res.status(400).json({ ok: false, error: `先方管理番号が長すぎます (${VENDOR_CODE_MAX}文字まで)` });
     const key = normProductCode(productCode);
-    const pmlRow = loadPml().rows.find(r => normProductCode(r['商品コード']) === key);
-    if (!pmlRow) return res.status(400).json({ ok: false, error: `商品マスタに無い商品コードです: ${productCode} (廃番等を登録する場合はCSV取込で)` });
-    const prodSup = normSupplierCode(pmlRow['仕入先']);
-    if (!prodSup) return res.status(400).json({ ok: false, error: `この商品は商品マスタで仕入先が未設定です: ${productCode} (先に商品マスタ側を直してください)` });
+    if (prod.error) return res.status(400).json({ ok: false, error: prod.error });
+    const prodSup = prod.prodSup;
     if (prodSup !== supplier) {
       return res.status(400).json({ ok: false, error: `この商品の仕入先は ${prodSup} です (${sup.name} の対応表には登録できません)` });
     }
@@ -1829,8 +1866,10 @@ const QPU_ERR = `入数は0より大きく${QPU_MAX.toLocaleString('ja-JP')}以�
 // lines = 明細を元の順序のまま「左=仕入先 (番号/商品名/数量)・右=弊社 (コード/商品名/入数換算後の入荷予定数/単価)」で返す
 /**
  * ne = Company DB の NE の元の書き方 (ne-codes.js readNeCodesForRequest の結果。M6)。無い・読めない = 今の動き
+ * newSkus = Company DB の新商品 (new-skus.js readNewSkusForRequest の結果)。PMLに無い商品の商品名・原価・商品IDの書き方を補う。
+ *   登録をやめた・要確認・大文字小文字だけ違う 2 つ = 貼り付けから外す。無い・読めない = 今の動き (PMLだけ)
  */
-function convertShipmentItems(db, supplier, supplierName, items, skipped = [], ne = null) {
+function convertShipmentItems(db, supplier, supplierName, items, skipped = [], ne = null, newSkus = null) {
   // 対応表の逆引き: 先方番号 → 弊社商品コード (同じ先方番号が複数商品に付いている場合は ambiguous)
   const rev = new Map();
   const mappedByKey = new Map(); // 弊社商品コード → 対応表の行 (仮商品コードとの衝突検出用)
@@ -1851,6 +1890,35 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
     nameByKey.set(key, r['商品名'] || '');
     codeByKey.set(key, String(r['商品コード']).trim());
   }
+  // PMLに無い新商品 (新商品の登録で作った・NE登録の前)。商品IDは新商品の登録で打った書き方 (ロジザード登録の CSV の商品IDと同じ)
+  const newByKey = new Map(), newBlockedByKey = new Map();
+  if (newSkus && newSkus.ok) {
+    for (const [key, n] of newSkus.map) {
+      if (codeByKey.has(key)) continue; // PMLにある = NE の値が正 (補わない)
+      if (n.ambiguous) { newBlockedByKey.set(key, { ...n, reason: 'ambiguous' }); continue; }
+      if (!NEW_SKU_USABLE_STATES.includes(n.state)) { newBlockedByKey.set(key, { ...n, reason: n.state }); continue; }
+      // 対応表・仮登録の後に代表の仕入先が変わった・消えた = この仕入先の入荷に入れない (Codex R1 High: 別の仕入先の商品を貼り付けない)
+      if (!n.supplier || n.supplier !== supplier) { newBlockedByKey.set(key, { ...n, reason: 'supplier' }); continue; }
+      newByKey.set(key, n);
+      nameByKey.set(key, n.name);
+      costByKey.set(key, n.cost);
+      codeByKey.set(key, n.code);
+    }
+  }
+  const newSkuOf = (key) => {
+    const n = newByKey.get(key);
+    return n ? { newSku: { state: n.state, stateWord: NEW_SKU_STATE_WORDS[n.state] || n.state, notInNe: NEW_SKU_NOT_IN_NE.includes(n.state), lzIssued: n.lzIssued } } : {};
+  };
+  const newSkuBlocked = [];
+  const blockNew = (key, base) => {
+    const b = newBlockedByKey.get(key);
+    const reason = b.reason;
+    const why = reason === 'ambiguous' ? '新商品の登録に大文字・小文字だけ違う商品コードが 2 つあります'
+      : reason === 'supplier' ? (b.supplier ? `新商品の代表の仕入先が ${b.supplier} です (この仕入先 ${supplier} の商品ではありません)` : '新商品の代表の仕入先が未設定です')
+        : `新商品の登録で${NEW_SKU_STATE_WORDS[reason] || `「${reason}」`}の状態です`;
+    newSkuBlocked.push({ vendorCode: base.vendorCode, productCode: b.code, qty: base.qty ?? null, reason, why });
+    return { ...base, type: 'newskublocked', productCode: b.code, productName: b.name || '', newSkuBlockedWhy: why };
+  };
   // NE本来の大小表記 (NE手動CSV取込で蓄積)。ロジザードはNE登録表記と大小まで一致しないと登録エラーのため最優先
   const canonicalByKey = new Map(db.prepare('SELECT product_key, product_code FROM po_product_code_canonical').all()
     .map(r => [r.product_key, r.product_code]));
@@ -1889,6 +1957,12 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
         ? Number(prov.provisional_qty_per_unit) : 1;
       const praw = it.qty * pqpu;
       const pqty = Math.round(praw);
+      // 仮商品コードが新商品の登録でやめた商品など = 貼り付けから外す (ロジザードに無い商品・入れてはいけない商品)
+      if (newBlockedByKey.has(pkey)) {
+        lines.push(blockNew(pkey, { vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty, qty: pqty,
+          provisional: true, provisionalCode: trimS(prov.provisional_product_code), pendingId: prov.id }));
+        continue;
+      }
       const provRow = {
         vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty,
         // 商品コードの優先順 (M6): NE本来表記 (canonical) → Company DB の NE の元の書き方 → PML表記 → 仮コードの入力値
@@ -1897,6 +1971,7 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
         qtyPerUnit: pqpu, qty: pqty,
         cost: costByKey.has(pkey) ? costByKey.get(pkey) : null,
         provisional: true, provisionalCode: trimS(prov.provisional_product_code), pendingId: prov.id,
+        ...newSkuOf(pkey),
       };
       if (!Number.isSafeInteger(pqty) || pqty <= 0 || Math.abs(praw - pqty) > 1e-6) {
         qtyInvalid.push({ vendorCode: it.vendorCode, vendorQty: it.qty, productCode: provRow.productCode, qtyPerUnit: pqpu });
@@ -1920,6 +1995,11 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
       continue;
     }
     const hit = hits[0];
+    // 対応表の商品が、PMLに無く新商品の登録でやめた商品など = 貼り付けから外す
+    if (newBlockedByKey.has(hit.product_key)) {
+      lines.push(blockNew(hit.product_key, { vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty }));
+      continue;
+    }
     const qpu = hit.qty_per_unit != null && Number.isFinite(Number(hit.qty_per_unit)) && Number(hit.qty_per_unit) > 0 ? Number(hit.qty_per_unit) : 1;
     // 入数換算 (先方数量 × 入数 = 弊社の入荷予定数)。結果が「正の整数」になる行だけ貼り付けに含める
     // (1×1.5=1.5 のような端数を黙って丸めない、Codex 入数R2 High)。浮動小数の計算誤差 (1.2×5=6.000…001) だけは許容
@@ -1939,6 +2019,7 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
       ...resolveLzCode({ key: hit.product_key, canonical: canonicalByKey.get(hit.product_key) || null, fallback: codeByKey.get(hit.product_key) || hit.product_code, ne }),
       productName: nameByKey.get(hit.product_key) || '',
       qtyPerUnit: qpu, qty, cost: cost == null ? null : cost,
+      ...newSkuOf(hit.product_key),
     };
     if (row.pasteBlocked) { // NE に大文字・小文字だけ違うコードが 2 つ = 貼り付けから外す (M6 v3 H1)
       caseBlocked.push({ vendorCode: it.vendorCode, productCode: row.productCode, qty, reason: row.pasteBlocked });
@@ -1952,12 +2033,20 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
   // ロジザード「入荷予定登録(Excel貼り付け)」の列: 商品ID / 入荷予定数 / 仕入単価 (原価不明は空欄=手作業時のiferror("")と同じ)。
   // 商品IDはNE商品マスタの表記どおり (ロジザードは大文字小文字を区別するため、NE登録の大小表記に一致させる。中原さん実測 2026-07-14)
   const pasteText = okRows.map(r2 => `${r2.productCode}\t${r2.qty}\t${r2.cost == null ? '' : r2.cost}`).join('\n');
+  // 新商品の行: ロジザードの写し (毎晩) に無く、ロジザード登録の CSV もまだ出していない = 貼り付けがロジザードでエラーになるおそれ (警告だけ・中原さん 10/16)
+  const lzKnown = lzKnownKeys(db, okRows.filter(r2 => r2.newSku).map(r2 => normProductCode(r2.productCode)));
+  for (const r2 of okRows) if (r2.newSku) r2.newSku.lzMissing = lzKnown != null && !lzKnown.has(normProductCode(r2.productCode)) && r2.newSku.lzIssued !== true;
   return {
     ok: true, supplierName, supplierCode: supplier, // 仮登録は変換時の仕入先に固定する (Codex plan-R1 High)
     rows: okRows, lines, pasteText, totalQty, totalVendorQty, rowCount: okRows.length,
     costMissing: okRows.filter(r2 => r2.cost == null).map(r2 => r2.productCode),
-    // NE本来表記が未蓄積 (小文字のまま出力)。仮商品コードの行はそもそもNE未登録なので別枠で警告する
-    caseUnverified: okRows.filter(r2 => !r2.caseVerified && !r2.provisional).map(r2 => r2.productCode),
+    // NE本来表記が未蓄積 (小文字のまま出力)。仮商品コードの行はそもそもNE未登録なので別枠で警告する。
+    // 新商品の行は新商品の登録で打った書き方 (= ロジザード登録の CSV の商品ID) なので数えない
+    caseUnverified: okRows.filter(r2 => !r2.caseVerified && !r2.provisional && !r2.newSku).map(r2 => r2.productCode),
+    // 新商品 (PMLに無い・新商品の登録で作った) の行と、貼り付けから外した新商品の行
+    newSkuRows: okRows.filter(r2 => r2.newSku).map(r2 => ({ vendorCode: r2.vendorCode, productCode: r2.productCode, ...r2.newSku })),
+    newSkuBlocked,
+    newSkus: newSkusStatus(newSkus),
     // Company DB の NE の書き方から分かった注意 (出どころに関係なく) と、貼り付けから外した行 (M6)
     caseWarnings: lines.filter(l => l.caseWarning).map(l => ({ productCode: l.productCode, reason: l.caseWarning, neCode: l.neCode })),
     caseBlocked,
@@ -1968,10 +2057,33 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
   };
 }
 
+/**
+ * ロジザードの写し (毎晩・商品の一覧とバーコードマスタ。lib/lz-mirror.mjs と同じ表) にある照合キー (小文字)。
+ * 写しが無い・空・読めない = null (分からない = 警告しない)
+ */
+function lzKnownKeys(db, keys) {
+  if (!keys.length) return new Set();
+  try {
+    const has = (t) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
+    if (!has('f_inbound_check_product_flags')) return null;
+    if (!db.prepare("SELECT 1 FROM f_inbound_check_product_flags WHERE source = 'logizard' LIMIT 1").get()) return null;
+    const want = [...new Set(keys)];
+    const ph = want.map(() => '?').join(',');
+    const found = new Set(db.prepare(`SELECT lower(code_key) AS k FROM f_inbound_check_product_flags WHERE source = 'logizard' AND lower(code_key) IN (${ph})`).all(...want).map(r => r.k));
+    if (has('f_inbound_check_barcode_master')) {
+      for (const r of db.prepare(`SELECT lower(coalesce(product_id, code_key)) AS k FROM f_inbound_check_barcode_master WHERE lower(coalesce(product_id, code_key)) IN (${ph})`).all(...want)) found.add(r.k);
+    }
+    return found;
+  } catch (e) {
+    console.error(`[purchase-orders] ロジザードの写しを読めない: ${e && e.message}`);
+    return null;
+  }
+}
+
 router.post('/api/inbound-plan/convert', async (req, res) => {
   try {
-    // Company DB の NE の元の書き方 (3 秒まで。読めなくても変換は止めない)。台帳などを読む前に待つ (待っている間の変更を取りこぼさない)
-    const ne = await readNeCodesForRequest();
+    // Company DB の NE の元の書き方・新商品 (どちらも 3 秒まで。読めなくても変換は止めない)。台帳などを読む前に待つ (待っている間の変更を取りこぼさない)
+    const [ne, newSkus] = await Promise.all([readNeCodesForRequest(), readNewSkusForRequest()]);
     const db = getDB();
     const supplier = normSupplierCode((req.body || {}).supplier_code);
     if (!supplier) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
@@ -1979,7 +2091,7 @@ router.post('/api/inbound-plan/convert', async (req, res) => {
     if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
     const { items, skipped } = parseShipmentLines((req.body || {}).text);
     if (!items.length) return res.status(400).json({ ok: false, error: '解析できる行がありません (出荷明細の「商品コード〜出荷数量」の行を貼り付けてください)', skipped });
-    res.json(convertShipmentItems(db, supplier, sup.name, items, skipped, ne));
+    res.json(convertShipmentItems(db, supplier, sup.name, items, skipped, ne, newSkus));
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -1999,7 +2111,7 @@ router.get('/api/inbound-plan/mails', (req, res) => {
 // メールの解析済み明細を変換 (手動貼り付けと同じ応答形+mailId)
 router.post('/api/inbound-plan/mails/:id/convert', async (req, res) => {
   try {
-    const ne = await readNeCodesForRequest();   // メール・対応表を読む前に待つ
+    const [ne, newSkus] = await Promise.all([readNeCodesForRequest(), readNewSkusForRequest()]);   // メール・対応表を読む前に待つ
     const db = getDB();
     const id = Number(req.params.id);
     const mail = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
@@ -2009,7 +2121,7 @@ router.post('/api/inbound-plan/mails/:id/convert', async (req, res) => {
     if (!Array.isArray(items)) return res.status(400).json({ ok: false, error: 'このメールは発注書参照方式です (🔁 変換 (発注書参照) を使ってください)' });
     if (!items.length) return res.status(400).json({ ok: false, error: '解析済みの明細がありません' });
     const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(mail.supplier_code);
-    res.json({ ...convertShipmentItems(db, mail.supplier_code, (sup && sup.name) || mail.supplier_code, items, [], ne), mailId: id });
+    res.json({ ...convertShipmentItems(db, mail.supplier_code, (sup && sup.name) || mail.supplier_code, items, [], ne, newSkus), mailId: id });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -2225,8 +2337,11 @@ const PROV_CODE_RE = /^[\x21-\x7E]+$/;
 //   未指定 (undefined) = 既存の仮商品コードを変更しない / '' = 消す (❓対応表になしに戻す)
 // items[].provisionalQtyPerUnit も同じ三値。コードと入数は独立して更新する
 //   (コードだけ直したときに入数が黙って消えない、Codex 仮コードR1 Medium)
-router.post('/api/vendor-map/pending', (req, res) => {
+router.post('/api/vendor-map/pending', async (req, res) => {
   try {
+    // 仮商品コードに新商品 (Company DB) を打ったときの確かめに使う (3 秒まで・読めない = 今の確かめのまま)。台帳を読む前に待つ
+    const anyProv = (Array.isArray((req.body || {}).items) ? req.body.items : []).some(it => it && trimS(it.provisionalProductCode));
+    const newSkus = anyProv ? await readNewSkusForRequest() : null;
     const db = getDB();
     const supplier = normSupplierCode((req.body || {}).supplier_code);
     const items = Array.isArray((req.body || {}).items) ? (req.body || {}).items : [];
@@ -2286,6 +2401,11 @@ router.post('/api/vendor-map/pending', (req, res) => {
         const pmlRow = pmlByKey.get(pk);
         const prodSup = pmlRow ? normSupplierCode(pmlRow['仕入先']) : '';
         if (prodSup && prodSup !== supplier) { provErrors.push(`${p.code}: 商品 ${p.prov} の仕入先は ${prodSup} です (この仕入先の商品ではありません)`); continue; }
+        // PMLに無く、新商品の登録 (Company DB) にあるコード = 代表の仕入先・登録をやめていないかを確かめる (新商品の登録に無いコードは今までどおり通す)
+        if (!pmlRow) {
+          const nc = checkNewSku(newSkus, pk, supplier);
+          if (nc.error) { provErrors.push(`${p.code}: ${nc.error}`); continue; }
+        }
       }
     }
     for (const p of prepared) {
@@ -2344,22 +2464,22 @@ router.get('/api/vendor-map/pending', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// 仮登録 → 商品と紐づけて対応表へ昇格 (NE登録→翌朝PML反映後に行う)
-router.post('/api/vendor-map/pending/:id/link', (req, res) => {
+// 仮登録 → 商品と紐づけて対応表へ昇格。PMLに無い新商品 (新商品の登録で作った・NE登録の前) もすぐ紐づけられる (new-skus.js)
+router.post('/api/vendor-map/pending/:id/link', async (req, res) => {
   try {
-    const db = getDB();
     const id = Number(req.params.id);
     const productCode = trimS((req.body || {}).product_code);
     if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
     if (!productCode) return res.status(400).json({ ok: false, error: '商品コードが必要です' });
+    // 新商品の確かめ (Company DB・3 秒まで) は台帳を読む前に済ませる。仕入先の比べは下で仮登録の仕入先と
+    const prod = await productForVendorMap(productCode, null, '新商品の登録で作った商品か、NE登録の翌朝からです');
+    const db = getDB();
     const pend = db.prepare('SELECT * FROM po_vendor_code_pending WHERE id=?').get(id);
     if (!pend) return res.status(404).json({ ok: false, error: '仮登録が見つかりません' });
     if (pend.status !== 'pending') return res.status(400).json({ ok: false, error: `既に処理済みです (${pend.status})` });
     const key = normProductCode(productCode);
-    const pmlRow = loadPml().rows.find(r => normProductCode(r['商品コード']) === key);
-    if (!pmlRow) return res.status(400).json({ ok: false, error: `商品マスタに無い商品コードです: ${productCode} (NE登録の翌朝にPMLへ反映されます)` });
-    const prodSup = normSupplierCode(pmlRow['仕入先']);
-    if (!prodSup) return res.status(400).json({ ok: false, error: `この商品は商品マスタで仕入先が未設定です: ${productCode}` });
+    if (prod.error) return res.status(400).json({ ok: false, error: prod.error });
+    const prodSup = prod.prodSup;
     if (prodSup !== pend.supplier_code) return res.status(400).json({ ok: false, error: `この商品の仕入先は ${prodSup} です (仮登録の仕入先 ${pend.supplier_code} と一致しません)` });
     // 同じ先方番号が別商品に既に登録済みなら拒否 (逆引きが曖昧になり変換が止まる、Codex plan-R1 Medium)。
     // 正規化は登録側と同じ normVendorCode (JS) で行う — SQLiteのupper()はASCII限定で不一致になる (Codex plan-R2)
@@ -6041,7 +6161,7 @@ router.get('/inbound-plan', (req, res) => {
       <div class="hint">
         「📬 メールから取得」を押すと、AMC (@am-craft.jp のxlsx添付) / ビーフリー (@be-free.biz の本文の表) / サロンジェ (@salonge.co.jp、<b>発注書参照</b>) の出荷連絡を自動で取り込んで変換できます。
         結果 (商品ID / 入荷予定数 / 仕入単価) を📋コピーして、ロジザードの「入荷予定登録 (Excel貼り付け)」へ貼り付け → 済んだら ✅ ロジザード登録済み。<br>
-        対応表に無い先方番号は一覧されます — <b>番号変更</b>ならその行で既存商品を検索して「🔁この番号で再登録」(その場で対応表を上書き)、<b>新商品</b>はその行に<b>仮商品コード</b> (弊社で決めた商品コード) を入れて「🕗仮登録」すると<b>貼り付けデータに含まれます</b>。NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から正式に紐づけます。<br>
+        対応表に無い先方番号は一覧されます — <b>番号変更</b>ならその行で既存商品を検索して「🔁この番号で再登録」(その場で対応表を上書き)、<b>マスタの入力の新商品の登録で作った商品</b>は NE 登録の前でもその行で商品名で検索して選び「🔁この番号で再登録」できます。それ以外の<b>新商品</b>はその行に<b>仮商品コード</b> (弊社で決めた商品コード) を入れて「🕗仮登録」すると<b>貼り付けデータに含まれます</b>。NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から正式に紐づけます。<br>
         <b>サロンジェ</b>は出荷明細が無い代わりにこちらの発注書どおり出荷されます — 変換で該当POを選ぶと台帳の明細から入荷予定を作り、本文の「※…終売/在庫無し」は除外候補と➖減数の提案になります。
       </div>
       <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px">
@@ -6308,7 +6428,7 @@ function renderIpResult(j, req) {
             '<td colspan="5"><span class="badge b-warn">❓ 対応表になし</span> ' +
             '<span style="white-space:nowrap"><input type="text" list="ipProdDl" data-iprelinkq="' + li + '" placeholder="🔍 既存商品を検索 / 新商品は仮商品コード" style="width:250px" title="番号が変わっただけの既存商品 → 商品を検索して選び🔁。新商品 → 弊社で決めた商品コード (仮商品コード) を入れて下の🕗仮登録 (貼り付けデータに含まれます)"> ' +
             '<button class="ghost sm" data-iprelink="' + li + '" title="選んだ商品の先方番号をこの番号に更新して対応表へ登録し、変換し直します (入数は維持)">🔁 この番号で再登録</button></span> ' +
-            '<span class="muted">新商品は<b>仮商品コード</b>を入れて下の🕗仮登録 → 貼り付けに含まれます</span></td></tr>';
+            '<span class="muted">新商品の登録で作った商品は名前で検索して選び🔁 (NE登録の前でも使えます)。それ以外の新商品は<b>仮商品コード</b>を入れて下の🕗仮登録 → 貼り付けに含まれます</span></td></tr>';
           return;
         }
         // 仮商品コードの行: NE未登録でも貼り付けに含める。コード/入数はこの場で直せる (空にすると❓に戻る)
@@ -6325,7 +6445,7 @@ function renderIpResult(j, req) {
           }
           h += '<tr style="background:#eff6ff">' + left +
             '<td style="white-space:nowrap"><span class="badge">🕗仮</span> <input type="text" value="' + esc(l.provisionalCode) + '" data-ipprovcode="' + li + '" style="width:160px" title="仮商品コード (ロジザードへ貼り付ける商品ID)"></td>' +
-            '<td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
+            '<td class="muted">' + newSkuBadge(l) + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
             '<td class="r" style="white-space:nowrap"><input type="number" min="0" step="any" value="' + (l.qtyPerUnit === 1 ? '' : l.qtyPerUnit) + '" placeholder="1" style="width:64px" data-ipprovqpu="' + li + '" title="先方数量1あたりの弊社個数。空欄=換算なし">' +
               '<button class="ghost sm" data-ipprovsave="' + li + '" title="仮商品コードと入数を保存して変換し直します (コードを空にすると❓対応表になしに戻ります)">💾</button></td>' +
             '<td class="r">' + (l.qtyBad
@@ -6337,6 +6457,18 @@ function renderIpResult(j, req) {
         if (l.type === 'ambiguous') {
           h += '<tr style="background:#fff7e6">' + left +
             '<td colspan="5"><span class="badge b-warn">⚠ 複数候補</span> ' + esc(l.candidates.join(' / ')) + ' <span class="muted">(📇対応表を確認してください — この行は貼り付けに含まれません)</span></td></tr>';
+          return;
+        }
+        if (l.type === 'newskublocked') {
+          // 仮商品コードの行はコードを直せる欄を残す (直して💾 = 変換し直し・空にすると❓に戻る。Codex R2 Medium)
+          h += '<tr style="background:#fee2e2">' + left +
+            (l.provisional
+              ? '<td style="white-space:nowrap"><span class="badge">🕗仮</span> <input type="text" value="' + esc(l.provisionalCode) + '" data-ipprovcode="' + li + '" style="width:160px" title="仮商品コード (ロジザードへ貼り付ける商品ID)">' +
+                '<button class="ghost sm" data-ipprovsave="' + li + '" title="仮商品コードを直して変換し直します (空にすると❓対応表になしに戻ります)">💾</button></td>'
+              : '<td><b>' + esc(l.productCode) + '</b></td>') +
+            '<td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
+            '<td colspan="3"><span class="badge b-warn">⛔ 貼り付けから除外</span> <span class="muted">' + esc(l.newSkuBlockedWhy || '') +
+            '。マスタの入力で商品を確かめてください (' + (l.provisional ? '仮商品コードを直すか' : '📇対応表を直すか') + '、この行はロジザードに手で入れないでください)</span></td></tr>';
           return;
         }
         if (l.type === 'caseblocked') {
@@ -6355,7 +6487,7 @@ function renderIpResult(j, req) {
           return;
         }
         h += '<tr>' + left +
-          '<td>' + esc(l.productCode) + '</td><td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
+          '<td>' + esc(l.productCode) + '</td><td class="muted">' + newSkuBadge(l) + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
           '<td class="r" style="white-space:nowrap"><input type="number" min="0" step="any" value="' + (l.qtyPerUnit === 1 ? '' : l.qtyPerUnit) + '" placeholder="1" style="width:64px" data-ipqpu="' + esc(l.productCode) + '" title="先方数量1あたりの弊社個数 (例: 1ケース=240個なら240)。空欄=換算なし">' +
             '<button class="ghost sm" data-ipqpusave="' + esc(l.productCode) + '" title="入数を対応表に保存して変換し直す">💾</button></td>' +
           '<td class="r"><b>' + l.qty.toLocaleString('ja-JP') + '</b>' + (l.qtyPerUnit !== 1 ? ' <span class="muted" style="font-size:10px">(' + l.vendorQty.toLocaleString('ja-JP') + '×' + l.qtyPerUnit + ')</span>' : '') + '</td>' +
@@ -6376,6 +6508,7 @@ function renderIpResult(j, req) {
           esc(j.caseUnverified.slice(0, 10).join(', ')) + (j.caseUnverified.length > 10 ? ' …' : '') + '</div>';
       }
       h += caseNotes(j);
+      h += newSkuNotes(j);
       if (j.qtyInvalid && j.qtyInvalid.length) h += '<div class="warn" style="margin-top:6px">⚠️ 入数換算が不正のため貼り付けから除外 ' + j.qtyInvalid.length + '行 — 表の該当行 (⚠換算不正) の入数を直して💾してください</div>';
       if (provCount) {
         h += '<div class="warn" style="margin-top:6px">🕗 <b>仮商品コードで出力 ' + provCount + '行</b> — ' +
@@ -6422,7 +6555,7 @@ function renderIpResult(j, req) {
               .then(function(r2) {
                 if (!r2.ok || g !== ipQGen || ipRenderGen !== IP_CONV_GEN) return;
                 var dl = document.getElementById('ipProdDl');
-                if (dl) dl.innerHTML = r2.rows.map(function(p){ return '<option value="' + esc(p.code + ' — ' + p.name) + '"></option>'; }).join('');
+                if (dl) dl.innerHTML = r2.rows.map(function(p){ return '<option value="' + esc(p.code + ' — ' + p.name) + '"' + (p.newSku ? ' label="🆕 新商品・' + esc(p.newSkuStateWord || '') + '"' : '') + '></option>'; }).join('');
               }).catch(function(){});
           }, 250);
         });
@@ -6604,6 +6737,35 @@ function caseNotes(j) {
   var nc = j.neCodes;
   if (nc && !nc.ok) h += '<div class="muted" style="margin-top:4px;font-size:11px">ℹ️ Company DB の NE の書き方を読めませんでした (' + esc(nc.reason || '') + ') — これまでの書き方で出しています</div>';
   else if (nc && nc.stale) h += '<div class="muted" style="margin-top:4px;font-size:11px">ℹ️ Company DB の NE の書き方が 7 日より古いです (照合 ' + esc(nc.mark ? nc.mark.observed_at : '') + ')</div>';
+  return h;
+}
+/** 新商品 (新商品の登録で作った・商品管理リストにまだ無い) の行の印 */
+function newSkuBadge(l) {
+  if (!l.newSku) return '';
+  return '<span class="badge" style="background:#ecfeff;color:#0e7490" title="新商品の登録で作った商品 (商品管理リストにはまだありません)。商品名・原価は新商品の登録の値です">🆕 新商品・' + esc(l.newSku.stateWord || '') + '</span> ' +
+    (l.newSku.lzMissing ? '<span class="badge b-warn" title="ロジザードの商品マスタの写し (毎晩) に無く、ロジザード登録の CSV もまだ出していません">ロジザード未登録?</span> ' : '');
+}
+/** 新商品の注意 (ロジザード未登録・NE 未登録・貼り付けから外した行・Company DB を読めなかった) */
+function newSkuNotes(j) {
+  var h = '';
+  var rows = j.newSkuRows || [];
+  var lzMissing = rows.filter(function(r){ return r.lzMissing; });
+  if (lzMissing.length) {
+    h += '<div class="warn" style="margin-top:6px">⚠️ <b>ロジザードにまだ無いかもしれない新商品 ' + lzMissing.length + '行</b> — ' + esc(lzMissing.map(function(r){ return r.productCode; }).join(', ')) +
+      '<br><span class="muted">ロジザードの商品マスタの写し (毎晩) に無く、ロジザード登録の CSV もまだ出していません。先に<a href="/apps/master-edit/lz-csv" target="_blank" rel="noopener">マスタの入力 → ロジザード登録の CSV</a> を出してロジザードに取り込まないと、貼り付けでエラーになります (貼り付けデータには含めています)</span></div>';
+  }
+  var notInNe = rows.filter(function(r){ return r.notInNe; });
+  if (notInNe.length) {
+    h += '<div class="muted" style="margin-top:4px;font-size:12px">🆕 NE にまだ入っていない新商品 ' + notInNe.length + '行 (' + esc(notInNe.map(function(r){ return r.productCode; }).join(', ')) +
+      ') — 入荷予定には使えます。NE 登録の CSV を NE に取り込むのを忘れないでください</div>';
+  }
+  var bl = j.newSkuBlocked || [];
+  if (bl.length) {
+    h += '<div class="warn" style="margin-top:6px">⛔ <b>新商品の登録で使えない商品 ' + bl.length + '行を貼り付けから除外</b> — ' +
+      esc(bl.map(function(b){ return b.productCode + ' (' + b.why + ')'; }).join(' / ')) + '</div>';
+  }
+  var ns = j.newSkus;
+  if (ns && !ns.ok && ns.reason !== 'not_configured') h += '<div class="muted" style="margin-top:4px;font-size:11px">ℹ️ 新商品の登録 (Company DB) を読めませんでした (' + esc(ns.reason || '') + ') — 商品管理リストにある商品だけで変換しています</div>';
   return h;
 }
 function renderPoResult(j) {
