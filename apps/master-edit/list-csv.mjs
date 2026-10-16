@@ -108,6 +108,9 @@ export function buildAmazonCsv(data, { mapStates = {}, channels = {} } = {}) {
     ['移行で入った', (r) => (r.origin === 'legacy' ? '移行' : '')],
     ['変えた日時 (日本時間)', (r) => jstFull(r.changed_at)],
     ['変えた人', (r) => r.changed_by || ''],
+    // ASIN・区分が出品 (夜間ロード)・手数料の写しに無く、Amazon の出品一覧 (前の夜の出品レポート) で埋めた行 = 「出品一覧」(10/16 中原さん)。前の列の並びは変えない (後ろに足す)
+    ['ASIN の出どころ', (r) => (r.asin_from === 'report' ? '出品一覧' : r.asin_from === 'listing' ? '出品' : '')],
+    ['区分の出どころ', (r) => (r.channel_from === 'report' ? '出品一覧' : r.channel_from === 'fees' ? '手数料' : '')],
   ];
   const lines = [cols.map(([h]) => csvCell(h)).join(',')];
   for (const r of data.rows) lines.push(cols.map(([, f]) => csvCell(f(r))).join(','));

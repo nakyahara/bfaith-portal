@@ -1652,6 +1652,50 @@ await ta('[15] #1690 (0072) の守り: NE から消す依頼の途中の商品�
   assert.equal(await lidOf('nedel_live'), null, '何も保存していない');
 });
 
+await ta('[16] ASIN が出品 (夜間ロード) に無い対応 = Amazon の出品一覧 (0074・出品レポート) の ASIN・区分で埋める (一覧・CSV)・出品の ASIN は上書きしない・食い違う 2 行 = 埋めない・出品一覧が無い = 今のまま (10/16 中原さん)', async () => {
+  const I = await import('../apps/company-db/ingest/amazon-listings.mjs');
+  const noAsin = (await q(`select m.seller_sku from core.amazon_sku_maps m join core.listings l on l.listing_id = m.listing_id
+     where l.catalog_item_id is null and m.state = 'active' order by m.seller_sku`)).map((x) => x.seller_sku);
+  const withAsin = (await q(`select m.seller_sku, ci.asin from core.amazon_sku_maps m join core.listings l on l.listing_id = m.listing_id join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id
+     where m.state = 'active' order by m.seller_sku limit 1`))[0];
+  assert.ok(noAsin.length >= 2 && withAsin, `材料: ASIN の無い対応 2 つ以上と ASIN のある対応 (${noAsin.join(',')})`);
+  const [fillSku, clashSku] = noAsin;
+  const csvRow = async (sku) => {
+    const lines = (await call('GET', '/amazon/list.csv')).text.split('\r\n');
+    const head = lines[0].split('","').map((h) => h.replace(/"/g, ''));
+    const line = lines.find((l) => l.startsWith(`"${sku}",`));
+    assert.ok(line, `CSV に ${sku} がある`);
+    const cells = line.slice(1, -1).split('","');
+    return Object.fromEntries(head.map((h, i) => [h, cells[i]]));
+  };
+  // 出品一覧に無い = ASIN は空のまま・出どころも空
+  let c = await csvRow(fillSku);
+  assert.deepEqual([c.ASIN, c['ASIN の出どころ']], ['', '']);
+  // 出品一覧: fillSku = ASIN と FBA (大文字で来ても正規化で同じ)・clashSku = 正規化で同じ 2 行の ASIN が違う・ASIN のある対応 = 別の ASIN (上書きしない)
+  const rowsR = [
+    [fillSku.toUpperCase(), 'B0FILL0001', 'FBA'], [clashSku, 'B0CLASH001', 'FBA'], [clashSku.toUpperCase(), 'B0CLASH002', 'FBA'], [withAsin.seller_sku, 'B0OTHER001', 'FBM'],
+  ].map(([s, a, f]) => I.listingRowOf({ seller_sku: s, item_name: s, asin: a, open_date: null, open_date_raw: null, fulfillment: f, channel_raw: f === 'FBM' ? 'DEFAULT' : 'AMAZON_JP', status: 'inactive', status_raw: 'Inactive', quantity: null, price: null }));
+  const gen = Date.parse('2030-02-01T00:00:00Z');
+  const r0 = await I.ingestAmazonListings(db, { shop_code: I.SHOP_CODE, generation: gen, snapshot_at: new Date(gen).toISOString(), report_run_id: 'r_asin_fill', checksum: I.listingChecksum(rowsR), row_count: rowsR.length, skipped_count: 0, rows: rowsR, force: true }, { nowMs: gen });
+  assert.ok(['applied', 'refreshed'].includes(r0.status), JSON.stringify(r0));
+  c = await csvRow(fillSku);
+  assert.deepEqual([c.ASIN, c['ASIN の出どころ'], c['区分'], c['区分の出どころ']], ['B0FILL0001', '出品一覧', 'FBA', '出品一覧'], '停止中の出品でも出品一覧の ASIN・区分で埋める');
+  c = await csvRow(clashSku);
+  assert.deepEqual([c.ASIN, c['ASIN の出どころ']], ['', ''], '正規化で同じ 2 行の ASIN が食い違う = 埋めない');
+  c = await csvRow(withAsin.seller_sku);
+  assert.deepEqual([c.ASIN, c['ASIN の出どころ']], [withAsin.asin, '出品'], '出品の ASIN は出品一覧で上書きしない');
+  // 一覧の画面: 埋めた ASIN に「出品一覧」の札
+  const page = await call('GET', '/amazon/?q=' + encodeURIComponent(fillSku));
+  assert.equal(page.status, 200);
+  assert.ok(page.text.includes('B0FILL0001') && page.text.includes('>出品一覧</span>'), '一覧に出品一覧の ASIN と札');
+  // 出品一覧を読めない (表が無い) = 今のまま (一覧・CSV は出す)
+  const RD = await import('../apps/master-edit/amazon-read.mjs');
+  const noReport = { query: (t, p) => (/to_regclass\('ops\.amazon_listing_report'\)/.test(t) ? { rows: [{ ok: false }] } : db.query(t, p)) };
+  const all = await asRole(E, 'master_edit', () => RD.listAmazonMapsAll(noReport, {}));
+  const fr = all.rows.find((x) => x.seller_sku === fillSku);
+  assert.deepEqual([fr.asin, fr.asin_from, fr.report_fulfillment], [null, null, null], '出品一覧が無い = 埋めない');
+});
+
 server.close();
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n${passed} ok${process.exitCode ? ' (NG あり)' : ''}`);
