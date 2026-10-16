@@ -214,6 +214,8 @@
         busy = false;
         if (x.r.ok && x.j.ok) {
           seen = x.j.row ? x.j.row.updated_at : null;
+          // 保存したグループ = もう人が決めた値 (絞り込みが選んだ印を外す = 打ち直しても取り消さない・Codex R2 Medium)
+          ['po-condition_id', 'po-material_group_id'].forEach(function (id) { var s = document.getElementById(id); if (s) s.removeAttribute('data-auto-pick'); });
           initial = JSON.stringify(collect({ all: true }));
           markErr(null);
           msg(x.j.changed ? '発注アプリに保存しました' : '変わっていません (同じ値)', 'ok');
