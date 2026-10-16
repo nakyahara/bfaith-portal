@@ -1897,6 +1897,8 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
       if (codeByKey.has(key)) continue; // PMLにある = NE の値が正 (補わない)
       if (n.ambiguous) { newBlockedByKey.set(key, { ...n, reason: 'ambiguous' }); continue; }
       if (!NEW_SKU_USABLE_STATES.includes(n.state)) { newBlockedByKey.set(key, { ...n, reason: n.state }); continue; }
+      // 対応表・仮登録の後に代表の仕入先が変わった・消えた = この仕入先の入荷に入れない (Codex R1 High: 別の仕入先の商品を貼り付けない)
+      if (!n.supplier || n.supplier !== supplier) { newBlockedByKey.set(key, { ...n, reason: 'supplier' }); continue; }
       newByKey.set(key, n);
       nameByKey.set(key, n.name);
       costByKey.set(key, n.cost);
@@ -1910,8 +1912,10 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
   const newSkuBlocked = [];
   const blockNew = (key, base) => {
     const b = newBlockedByKey.get(key);
-    const reason = b.reason === 'ambiguous' ? 'ambiguous' : b.reason;
-    const why = reason === 'ambiguous' ? '新商品の登録に大文字・小文字だけ違う商品コードが 2 つあります' : `新商品の登録で${NEW_SKU_STATE_WORDS[reason] || `「${reason}」`}の状態です`;
+    const reason = b.reason;
+    const why = reason === 'ambiguous' ? '新商品の登録に大文字・小文字だけ違う商品コードが 2 つあります'
+      : reason === 'supplier' ? (b.supplier ? `新商品の代表の仕入先が ${b.supplier} です (この仕入先 ${supplier} の商品ではありません)` : '新商品の代表の仕入先が未設定です')
+        : `新商品の登録で${NEW_SKU_STATE_WORDS[reason] || `「${reason}」`}の状態です`;
     newSkuBlocked.push({ vendorCode: base.vendorCode, productCode: b.code, qty: base.qty ?? null, reason, why });
     return { ...base, type: 'newskublocked', productCode: b.code, productName: b.name || '', newSkuBlockedWhy: why };
   };

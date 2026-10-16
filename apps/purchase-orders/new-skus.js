@@ -9,7 +9,7 @@
  * Company DB が読めない (URL が無い・つながらない・3 秒を超えた) = 今の動きのまま (PML だけ)。変換・登録は止めない
  * 🚨 PML にある商品は PML のまま (NE の値が正)。ここで補うのは PML に無い商品だけ
  */
-import { withCompanyDb } from '../../lib/product-hub-outbox.mjs';
+import { pgClientOptions } from '../../scripts/company-db/migrate.mjs';
 import { COMPANY_ID } from '../../lib/master-write.mjs';
 import { normProductCode, normSupplierCode } from './db.js';
 
@@ -51,18 +51,49 @@ export function newSkuMap(rows) {
   return map;
 }
 
+/** 接続を待たずに捨てる (つなぎかけでも)。失敗は無視 (ne-codes.js の discard と同じ) */
+function discard(client) {
+  if (!client) return;
+  try { const s = client.connection && client.connection.stream; if (s && typeof s.destroy === 'function') s.destroy(); } catch { /* */ }
+  try { const p = client.end(); if (p && typeof p.catch === 'function') p.catch(() => {}); } catch { /* */ }
+}
+
 /**
- * Company DB を読む (3 秒まで)。投げない。
+ * Company DB を読む。全体の期限 (接続・文・後始末を含む) を過ぎたら、接続を捨てて「読めない」で返す (ne-codes.js readNeCodes と同じ形・Codex R1 Medium)。投げない。
+ * 接続先 = 画面のロール (COMPANY_DB_MASTER_EDIT_URL) → 無ければ COMPANY_DB_URL (lib/product-hub-outbox.mjs withCompanyDb の read と同じ)
+ * @param {object} [o]
+ * @param {() => Promise<{ query: Function, end: Function }>} [o.connect]  試験用 (接続の作り方を差し替える)
  * @returns {Promise<{ ok: boolean, reason: string|null, map: Map<string, { code, name, state, cost, supplier, lzIssued, ambiguous? }> }>}
  */
-export async function readNewSkus({ deadlineMs = NEW_SKUS_DEADLINE_MS } = {}) {
+export async function readNewSkus({ url = process.env.COMPANY_DB_MASTER_EDIT_URL || process.env.COMPANY_DB_URL, connect = null, deadlineMs = NEW_SKUS_DEADLINE_MS } = {}) {
   const none = (reason) => ({ ok: false, reason, map: new Map() });
-  const work = withCompanyDb((db) => loadNewSkus(db), { applicationName: 'po-new-skus', statementTimeout: `${Math.max(1, Math.ceil(deadlineMs / 1000))}s` })
-    .then((r) => (r && r.ok ? { ok: true, reason: null, map: newSkuMap(r.value) } : none(r && r.error === 'no_url' ? 'not_configured' : 'unreachable')))
-    .catch((e) => { console.error(`[purchase-orders] 新商品を読めない: ${e && e.message}`); return none('error'); });
-  let timer;
-  const deadline = new Promise((resolve) => { timer = setTimeout(() => resolve(none('timeout')), deadlineMs); if (timer.unref) timer.unref(); });
-  try { return await Promise.race([work, deadline]); } finally { clearTimeout(timer); }
+  if (!url && !connect) return none('not_configured');
+  let client = null, timer = null, timedOut = false;
+  const work = (async () => {
+    if (connect) { client = await connect(); if (timedOut) { discard(client); throw new Error('timeout'); } }
+    else {
+      const { default: pg } = await import('pg');
+      const base = pgClientOptions(url);
+      // pg の時間切れは予備 (期限の 2 倍)。先に効くのはこちらの全体の期限 (接続を捨てる)
+      client = new pg.Client({ ...base, application_name: 'po-new-skus', connectionTimeoutMillis: deadlineMs * 2, statement_timeout: deadlineMs, query_timeout: deadlineMs * 2,
+        connectionString: base.connectionString, ssl: base.ssl });
+      client.on('error', () => {});   // つないだ後に相手が切れたとき (受け手が無いとプロセスごと落ちる)
+      if (timedOut) { discard(client); throw new Error('timeout'); }
+      await client.connect();
+    }
+    return loadNewSkus({ query: (sql, p) => client.query(sql, p) });
+  })();
+  const deadline = new Promise((resolve) => { timer = setTimeout(() => { timedOut = true; resolve({ timeout: true }); }, deadlineMs); });
+  let r;
+  try {
+    r = await Promise.race([work.then((v) => ({ v }), (e) => ({ e })), deadline]);
+  } finally {
+    clearTimeout(timer);
+    discard(client);   // 期限切れでも成功でも、後始末は待たない
+  }
+  if (r.timeout) return none('timeout');
+  if (r.e) { console.error(`[purchase-orders] 新商品を読めない: ${r.e && r.e.message}`); return none('error'); }
+  return { ok: true, reason: null, map: newSkuMap(r.v) };
 }
 
 let readerOverride = null;

@@ -75,6 +75,29 @@ await ta('[3] checkNewSku: 使える / やめた / 要確認 / 仕入先が違�
   assert.deepEqual(NS.checkNewSku({ ok: false, reason: 'timeout', map: new Map() }, 'a-1', '2'), { sku: null, error: null }, '読めない = 新商品でない扱い (今の動き)');
 });
 
+await ta('[5] 読み手: 接続をつないで読む (画面のロール) / 応答しない相手でも期限で戻る・接続を捨てる / 失敗 = error (Codex R1 Medium)', async () => {
+  const conn = async () => ({ query: (sql, p) => db.query(sql, p), end: async () => {} });
+  const r = await asEditor(() => NS.readNewSkus({ connect: conn }));
+  assert.deepEqual([r.ok, r.reason, r.map.get('newpo-01').code], [true, null, 'NewPo-01']);
+  // 問い合わせが返らない相手: 期限で timeout・end を呼ぶ
+  let ended = 0;
+  const hang = async () => ({ query: () => new Promise(() => {}), end: async () => { ended++; } });
+  const t0 = Date.now();
+  const h = await NS.readNewSkus({ connect: hang, deadlineMs: 200 });
+  assert.deepEqual([h.ok, h.reason], [false, 'timeout']);
+  assert.ok(Date.now() - t0 < 2000, '期限で戻る');
+  assert.equal(ended, 1, '期限切れの接続を捨てる');
+  // つなぐところで止まる相手: 期限で戻り、後でつながっても捨てる
+  let ended2 = 0, late;
+  const slow = () => new Promise((res) => { late = () => res({ query: async () => ({ rows: [] }), end: async () => { ended2++; } }); });
+  const s = await NS.readNewSkus({ connect: slow, deadlineMs: 100 });
+  assert.deepEqual([s.ok, s.reason], [false, 'timeout']);
+  late(); await new Promise((res) => setTimeout(res, 20));
+  assert.equal(ended2, 1, '期限の後につながった接続も捨てる');
+  const bad = await NS.readNewSkus({ connect: async () => ({ query: async () => { throw new Error('boom'); }, end: async () => {} }) });
+  assert.deepEqual([bad.ok, bad.reason], [false, 'error']);
+});
+
 await ta('[4] 読み手: Company DB の URL が無い = not_configured (投げない)', async () => {
   const saved = [process.env.COMPANY_DB_URL, process.env.COMPANY_DB_MASTER_EDIT_URL];
   delete process.env.COMPANY_DB_URL; delete process.env.COMPANY_DB_MASTER_EDIT_URL;

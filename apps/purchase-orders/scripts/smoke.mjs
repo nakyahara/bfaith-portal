@@ -3439,6 +3439,16 @@ console.log('── 新商品 (PMLに無い) を入荷予定・対応表で使�
   ok(r.body.ok && r.body.rowCount === 1 && r.body.pasteText === 'NewItem-01\t1\t120' && r.body.lines[0].type === 'newskublocked' &&
     r.body.newSkuBlocked.length === 1 && r.body.newSkuBlocked[0].productCode === 'Gone-01' && r.body.newSkuBlocked[0].reason === 'cancelled',
     '新商品: やめた新商品の行は貼り付けから外す (ほかの行はそのまま)', r.body);
+  // 対応表に入れた後で代表の仕入先が変わった・消えた = この仕入先の入荷には入れない (Codex R1 High)
+  const moved = (sup) => async () => ({ ok: true, reason: null, map: nsMod.newSkuMap(nsRows.map(x => (x.code === 'NewItem-01' ? { ...x, supplier: sup } : x))) });
+  nsMod.setNewSkuReaderForTest(moved('3'));
+  r = await convNew();
+  ok(r.body.ok && r.body.rowCount === 0 && r.body.pasteText === '' && r.body.lines[0].type === 'newskublocked' && r.body.newSkuBlocked[0].reason === 'supplier' &&
+    /代表の仕入先が 3/.test(r.body.newSkuBlocked[0].why), '新商品: 代表の仕入先が変わった新商品は前の仕入先の貼り付けに入れない', r.body);
+  nsMod.setNewSkuReaderForTest(moved(null));
+  r = await convNew();
+  ok(r.body.ok && r.body.rowCount === 0 && r.body.newSkuBlocked[0].reason === 'supplier' && /未設定/.test(r.body.newSkuBlocked[0].why),
+    '新商品: 代表の仕入先が消えた新商品は貼り付けに入れない', r.body.newSkuBlocked);
   // Company DB を読めない = 今の動き (PML だけ: 新商品の行は名前・原価が空のまま・変換は止めない)
   nsMod.setNewSkuReaderForTest(async () => ({ ok: false, reason: 'timeout', map: new Map() }));
   r = await convNew();
