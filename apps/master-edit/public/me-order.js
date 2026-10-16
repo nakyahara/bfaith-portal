@@ -55,7 +55,65 @@
       : n ? '代表の仕入先 (' + sup + ') のグループだけ選べます (最低金額・最低数量など)' : '代表の仕入先 (' + sup + ') のグループはまだありません。「新しく作る」で作れます';
     var ns = $('#po-cond-new-sup'); if (ns) ns.textContent = sup ? ' ' + sup : ' (先に代表の仕入先を)';
   }
-  if (P.mode === 'new') { var supSel = document.getElementById('f-primary_supplier'); if (supSel) supSel.addEventListener('change', filterConditions); }
+  if (P.mode === 'new') { var supSel = document.getElementById('f-primary_supplier'); if (supSel) supSel.addEventListener('change', function () { filterConditions(); groupFilter('po-condition_id', { pick: false }); }); }
+
+  /* ---------- グループを名前・ID で絞る (10/16 中原さん「グループ名で検索できるように」) ----------
+   *   選ぶ欄の上の「名前・ID で絞る」に打つと、選ぶ欄の候補をその言葉を全部含むものだけにする (空白で区切ると全部を含む)。
+   *   かなの同一視 = search-fold.mjs と同じ (NFKC・小文字・ひらがな → カタカナ)。選んでいるグループは絞っても消さない。
+   *   当たりが 1 つで、まだ選んでいない = それを選ぶ (change を出す = 未保存・数え直し)。
+   *   候補は消して並べ直す (option の hidden は Safari が見ない)。発注条件は並べ直した後に代表の仕入先の絞り込みをかけ直す */
+  function fold(s) { return String(s == null ? '' : s).normalize('NFKC').toLowerCase().replace(/[ぁ-ゖゝゞ]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) + 0x60); }); }
+  var groupAll = {};
+  // 絞り込みが出す change (未保存・数え直しのため) と、人が選んだ change を分ける
+  var autoFiring = false;
+  function fireAuto(sel) { autoFiring = true; try { sel.dispatchEvent(new Event('change', { bubbles: true })); } finally { autoFiring = false; } }
+  /** opts.pick = false: 当たりが 1 つでも選ばない (代表の仕入先を変えたときの絞り直し) */
+  function groupFilter(selId, opts) {
+    var q = $('.po-gq[data-for="' + selId + '"]'), sel = document.getElementById(selId);
+    if (!q || !sel || !groupAll[selId]) return;
+    var words = fold(q.value).split(/\s+/).filter(Boolean);
+    var hit = function (o) { var t = fold(o.value + ' ' + o.textContent); return words.every(function (w) { return t.indexOf(w) >= 0; }); };
+    // 絞り込みが自分で選んだグループ (人が選んだのではない) が、打ち直した言葉に当たらなくなった = 選ぶのを取り消す (Codex R1 Medium)
+    var auto = sel.getAttribute('data-auto-pick');
+    if (auto && sel.value === auto) {
+      var ao = groupAll[selId].filter(function (o) { return o.value === auto; })[0];
+      if (!ao || (words.length && !hit(ao))) { sel.value = ''; sel.removeAttribute('data-auto-pick'); fireAuto(sel); }
+    }
+    var cur = sel.value;
+    var keep = groupAll[selId].filter(function (o) { return (o.value === cur && cur !== '') || hit(o); });
+    $$('option', sel).forEach(function (o) { if (o.value !== '') sel.removeChild(o); });
+    keep.forEach(function (o) { sel.appendChild(o); });
+    sel.value = cur;
+    if (selId === 'po-condition_id') filterConditions();
+    // 当たり = 言葉を含み、選べる (代表の仕入先の絞り込みで消えていない) もの。選んでいるだけで当たらないグループは数えない
+    var live = $$('option', sel).filter(function (o) { return o.value !== '' && !o.disabled && hit(o); });
+    if ((!opts || opts.pick !== false) && words.length && live.length === 1 && !sel.value) {
+      sel.value = live[0].value;
+      sel.setAttribute('data-auto-pick', sel.value);
+      fireAuto(sel);
+    }
+    var n = document.getElementById(q.id + '-n');
+    if (n) {
+      n.hidden = !words.length;
+      n.textContent = live.length ? '当たり ' + live.length + ' 件' + (live.length > 1 ? ' (下の欄から選ぶ)' : '') : '当たるグループはありません (言葉を短くする・「新しく作る」)';
+    }
+  }
+  $$('.po-gq').forEach(function (q) {
+    var selId = q.getAttribute('data-for'), sel = document.getElementById(selId);
+    if (!sel) return;
+    groupAll[selId] = $$('option', sel).filter(function (o) { return o.value !== ''; });
+    // 変換中 (IME) は絞るだけで選ばない = 確定 (compositionend) の後に選ぶ (Codex R1 Medium: 「かみ」の変換中に「カミ」を選んで「紙」に確定しても残る)
+    q.addEventListener('input', function (e) { groupFilter(selId, { pick: !e.isComposing }); });
+    q.addEventListener('compositionend', function () { groupFilter(selId); });
+    // 人が選ぶ欄で選んだ = 絞り込みが選んだ印を外す (打ち直しても取り消さない)
+    sel.addEventListener('change', function (e) { if (!autoFiring) sel.removeAttribute('data-auto-pick'); });
+    // 絞る欄の Enter = 登録 (form) に送らない。選べていれば選ぶ欄へ
+    q.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      if (sel.value) sel.focus();
+    });
+  });
 
   /* ---------- 集める ---------- */
   /** 送る値。何も入れていない (全部空・なし) = null (新商品の登録では発注アプリに何も書かない) */
@@ -156,6 +214,8 @@
         busy = false;
         if (x.r.ok && x.j.ok) {
           seen = x.j.row ? x.j.row.updated_at : null;
+          // 保存したグループ = もう人が決めた値 (絞り込みが選んだ印を外す = 打ち直しても取り消さない・Codex R2 Medium)
+          ['po-condition_id', 'po-material_group_id'].forEach(function (id) { var s = document.getElementById(id); if (s) s.removeAttribute('data-auto-pick'); });
           initial = JSON.stringify(collect({ all: true }));
           markErr(null);
           msg(x.j.changed ? '発注アプリに保存しました' : '変わっていません (同じ値)', 'ok');
