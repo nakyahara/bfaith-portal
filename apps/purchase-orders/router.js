@@ -8763,7 +8763,6 @@ var BC_QTIMER = null;
 // quiet=1: 保存の後の読み直し (「読み込み中…」で表を消さない = スクロール位置・検索・表示件数をそのまま)
 function loadBarcode(quiet) {
   var gen = ++BC_GEN;
-  var y = window.scrollY;
   if (!quiet) { document.getElementById('tabBody').textContent = '読み込み中…'; BC_SHOWN = BC_PAGE; }
   fetch('/apps/purchase-orders/api/barcode-labels').then(function(r){ return r.json(); }).then(function(j) {
     if (gen !== BC_GEN || TAB !== 'barcode') return;
@@ -8771,6 +8770,7 @@ function loadBarcode(quiet) {
     BC_DATA = j;
     // 検索用の文字は読み込んだときに 1 回だけ作る (毎回の入力で全行の DOM を読まない)
     (j.targets || []).forEach(function(r) { r._q = bcSearchText(r); });
+    var y = window.scrollY; // 描き直す直前の位置 (読み直しを待つ間にスクロールしていても巻き戻さない、Codex R1 Medium)
     renderBarcode();
     if (quiet) window.scrollTo(0, y);
   }).catch(function(e){ if (gen === BC_GEN && TAB === 'barcode') document.getElementById('tabBody').textContent = '通信エラー: ' + e.message; });
@@ -8780,7 +8780,8 @@ function bcStatusOf(r) { return r.label ? r.label.status : 'unregistered'; }
 function bcSearchText(r) {
   var l = r.label;
   var st = BC_META[bcStatusOf(r)];
-  return [r.code, r.name, r.vendorCode || (l && l.vendorCodeHint) || '', st ? st.l : '', l ? l.barcodeValue : '', l ? l.note : '',
+  var vc = r.vendorCode || (l && l.vendorCodeHint ? l.vendorCodeHint + ' (Excel由来)' : ''); // 表に出す「(Excel由来)」も当たるように (Codex R1 Medium)
+  return [r.code, r.name, vc, st ? st.l : '', l ? l.barcodeValue : '', l ? l.note : '',
     l ? String(l.updatedAt).slice(0, 10) : '', l ? l.updatedBy : '', r.active ? '' : '取扱中止'].join(' ').toLowerCase();
 }
 function renderBarcode() {
