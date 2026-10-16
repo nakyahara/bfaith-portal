@@ -56,6 +56,9 @@
       <div class="ctl col" style="gap:8px">
         <%- segPo('po-cond-mode', condMode, [['none', 'なし'], ['pick', '今あるグループ'], ['new', '新しく作る']], '発注条件グループ') %><% if (noneOn) { %><span class="hint">使わないときは「なし」(= 入力なし)</span><% } %>
         <div id="po-cond-pick"<%= condMode === 'pick' ? '' : ' hidden' %>>
+          <%# グループを名前・ID で絞る (10/16 中原さん「グループ名で検索できるように」・public/me-order.js の絞り込み) %>
+          <input type="search" class="in w-l po-gq" id="po-cond-q" data-for="po-condition_id" autocomplete="off" spellcheck="false" placeholder="🔍 名前・ID で絞る" aria-label="発注条件グループを名前・ID で絞る" aria-controls="po-condition_id" style="margin-bottom:6px"<%= D %>>
+          <div class="hint" id="po-cond-q-n" role="status" aria-live="polite" hidden></div>
           <select class="in w-l" id="po-condition_id" aria-label="発注条件グループを選ぶ"<%- track('condition_id', '発注条件グループ') %><%= D %>>
             <option value="">(選ぶ)</option>
             <% for (const c of d.conditions) { const mine = !!sup && c.supplier === sup; const sel = c.id === cur.condition_id; if (!mine && !sel && mode === 'sku') continue; %><option value="<%= c.id %>" data-sup="<%= c.supplier %>"<%= sel ? ' selected' : '' %>><%= condLabel(c) %><%= !mine && sel ? ' · 代表の仕入先ではない' : '' %></option><% } %>
@@ -78,6 +81,8 @@
       <div class="ctl col" style="gap:8px">
         <%- segPo('po-mat-mode', matMode, [['none', 'なし'], ['pick', '今あるグループ'], ['new', '新しく作る']], '原料グループ') %><% if (noneOn) { %><span class="hint">使わないときは「なし」(= 入力なし)</span><% } %>
         <div id="po-mat-pick"<%= matMode === 'pick' ? '' : ' hidden' %>>
+          <input type="search" class="in w-l po-gq" id="po-mat-q" data-for="po-material_group_id" autocomplete="off" spellcheck="false" placeholder="🔍 名前・ID で絞る (例: ダウン)" aria-label="原料グループを名前・ID で絞る" aria-controls="po-material_group_id" style="margin-bottom:6px"<%= D %>>
+          <div class="hint" id="po-mat-q-n" role="status" aria-live="polite" hidden></div>
           <select class="in w-l" id="po-material_group_id" aria-label="原料グループを選ぶ"<%- track('material_group_id', '原料グループ') %><%= D %>>
             <option value="">(選ぶ)</option>
             <% for (const m of d.materials) { %><option value="<%= m.id %>"<%= m.id === cur.material_group_id ? ' selected' : '' %>><%= m.id %> — <%= m.name %><%= m.min != null ? ' (最低 ' + m.min + (m.unit || '') + ')' : '' %></option><% } %>

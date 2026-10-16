@@ -2807,6 +2807,52 @@ await ta('[69] スマホ 390: 上の帯から行ける道 = ポータル (B-Fait
   await Promise.all([p.waitForURL(/\/reg-csv$/), op.click()]);
 }, { width: 390, height: 844 });
 
+await ta('[71] 発注の設定のグループを名前・ID で絞る (10/16 中原さん): ひらがなでカタカナの名前に当たる・空白で全部を含む・当たり 1 つ = 選ぶ・選んだグループは絞っても消えない・代表の仕入先のグループだけ・絞る欄の Enter で登録に送らない', async (p) => {
+  const now = new Date().toISOString();
+  const insM = mirrorDb.prepare('insert or replace into po_material_groups (group_id, name, min_order_qty, unit, created_at, updated_at) values (?, ?, ?, ?, ?, ?)');
+  for (const [id, name] of [['djktcleaner', 'ダウンジャケット 洗剤'], ['handcream-base', 'ハンドクリーム 原料'], ['gum-base', 'ガムベース']]) insM.run(id, name, 100, 'kg', now, now);
+  const insC = mirrorDb.prepare('insert or replace into po_order_conditions (condition_id, supplier_code, display_name, condition_type, condition_value, unit, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)');
+  for (const [id, sup, name] of [['maruma-30000', '1', 'マルマ商事 3 万円以上'], ['maruma-box', '1', 'マルマ 箱単位'], ['maruma-other', '2', 'マルマ よその仕入先']]) insC.run(id, sup, name, 'min_amount', 30000, '円', now, now);
+  const opts = (sel) => p.$$eval(`${sel} option`, (os) => os.filter((o) => o.value && !o.disabled).map((o) => o.value));
+  try {
+    await p.goto(B + '/new?kind=single');
+    await p.waitForSelector('#po-mat-mode');
+    // 原料グループ
+    await p.click('#po-mat-mode button[data-v="pick"]');
+    assert.deepEqual((await opts('#po-material_group_id')).sort(), ['djktcleaner', 'gum-base', 'handcream-base']);
+    await p.fill('#po-mat-q', 'だうん');
+    assert.deepEqual(await opts('#po-material_group_id'), ['djktcleaner'], 'ひらがなでカタカナの名前に当たる');
+    assert.equal(await p.inputValue('#po-material_group_id'), 'djktcleaner', '当たり 1 つ = 選ぶ');
+    assert.match(await p.textContent('#po-mat-q-n'), /当たり 1 件/);
+    await p.fill('#po-mat-q', 'base');
+    assert.deepEqual((await opts('#po-material_group_id')).sort(), ['djktcleaner', 'gum-base', 'handcream-base'], 'ID でも当たる・選んでいるグループは消えない');
+    assert.equal(await p.inputValue('#po-material_group_id'), 'djktcleaner', '当たりが複数 = 選び直さない');
+    assert.match(await p.textContent('#po-mat-q-n'), /当たり 2 件/, '選んでいるだけで当たらないグループは数えない');
+    await p.fill('#po-mat-q', 'zzz');
+    assert.match(await p.textContent('#po-mat-q-n'), /当たるグループはありません/);
+    await p.fill('#po-mat-q', '');
+    assert.equal(await p.isHidden('#po-mat-q-n'), true);
+    assert.equal((await opts('#po-material_group_id')).length, 3, '消すと全部に戻る');
+    // 絞る欄の Enter = 登録に送らない (画面はそのまま)
+    const url = p.url();
+    await p.focus('#po-mat-q'); await p.keyboard.press('Enter');
+    assert.equal(p.url(), url);
+    // 発注条件グループ = 代表の仕入先のグループだけ・空白で全部を含む
+    await p.selectOption('#f-primary_supplier', '0001');
+    await p.click('#po-cond-mode button[data-v="pick"]');
+    await p.fill('#po-cond-q', 'まるま');
+    assert.deepEqual((await opts('#po-condition_id')).sort(), ['maruma-30000', 'maruma-box'], 'よその仕入先のグループは当たらない');
+    assert.equal(await p.inputValue('#po-condition_id'), '', '当たり 2 つ = まだ選ばない');
+    await p.fill('#po-cond-q', 'まるま　箱');
+    assert.deepEqual(await opts('#po-condition_id'), ['maruma-box'], '空白 (全角も) で区切った言葉を全部含む');
+    assert.equal(await p.inputValue('#po-condition_id'), 'maruma-box');
+    assert.ok((await dirty(p)) >= 1, '選んだ = 未保存に数える');
+  } finally {
+    mirrorDb.prepare("delete from po_material_groups where group_id in ('djktcleaner', 'handcream-base', 'gum-base')").run();
+    mirrorDb.prepare("delete from po_order_conditions where condition_id in ('maruma-30000', 'maruma-box', 'maruma-other')").run();
+  }
+});
+
 await browser.close();
 server.close();
 try { mirrorDb.close(); fs.rmSync(DATA_TMP, { recursive: true, force: true }); } catch { /* 消せなくてもよい */ }
