@@ -59,6 +59,7 @@
  *   POST /api/order-settings-outbox/:id/dismiss 閉じる { reason } (名簿 かつ 発注アプリの権限・失敗 / 要確認だけ・商品の画面で入れ直した後など)
  *   ── Amazon SKU の対応 (⑦-1・0054・Company DB構想 16。保存を開く門は上と同じ + 持ち主 listing_components.amazon が 'company') ──
  *   GET  /amazon/            一覧 (Company DB の対応・墓標も)。?q=&state=&offset=
+ *   GET  /amazon/list.csv    絞った一覧 (?q=&state=) を全部 CSV で (ページ分けに関係なく・seller SKU の順・EXPORT_MAX 件まで・読むだけ)
  *   GET  /amazon/new?sku=    新しい seller SKU の対応を自分で作る入口 (まだ売れていない SKU も)。形 → もうある (対応・墓標) = その画面へ案内 →
  *                            似た SKU・気をつけること (打ち間違いの守り) があれば見せて「このまま作る」/ 無ければ /amazon/sku?sku= へ (checked = 画面でもう見た)
  *   GET  /api/amazon/check?sku=  同じ確かめ (読むだけ・打つとその場で)
@@ -100,7 +101,7 @@ import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
 import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
 import { bulkInspect, bulkPreview, bulkApplyChunk, editableOf, BULK_MAX, BULK_CHUNK, COST_REASONS, FIX_GROUPS } from './bulk.mjs';
-import { buildListCsv, csvFileName } from './list-csv.mjs';
+import { buildListCsv, csvFileName, buildAmazonCsv, amazonCsvFileName } from './list-csv.mjs';
 import { LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, ViewPrefsInputError } from './list-columns.mjs';
 import { readViewPrefs, saveViewPrefs } from './view-prefs.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
@@ -117,7 +118,7 @@ import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, newSellerSkuCheckInDb, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
-import { listAmazonMaps, readAmazonPage, amazonHistory, amazonUnmapped, channelsFromFeeRows, normalizeAmazonFilters, checkNewAmazonSku, searchMapComponents, COMPONENT_SEARCH_Q_MAX, COMPONENT_SEARCH_MIN, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
+import { listAmazonMaps, listAmazonMapsAll, readAmazonPage, amazonHistory, amazonUnmapped, channelsFromFeeRows, normalizeAmazonFilters, checkNewAmazonSku, searchMapComponents, COMPONENT_SEARCH_Q_MAX, COMPONENT_SEARCH_MIN, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
 import { registerAmazonUnlinkedRoutes, readAmazonReportFor } from './amazon-unlinked.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
@@ -1333,8 +1334,35 @@ router.get('/amazon', (req, res) => {
     const landing = !filters.q && !filters.state && !filters.offset;
     // 読めない = 札を出さないだけ (一覧は出す)
     const unmapped = db && landing && !data.tableMissing ? await amazonUnmapped(db, { now: new Date(clock()), channels }).catch((e) => { console.error(`[master-edit] 未登録の要約を読めない: ${e && e.message}`); return null; }) : null;
-    res.render(view('amazon-index.ejs'), { ...pageLocals(req, phase), nav: 'amazon', listPage: true, dbError, data, filters, MAP_STATES, CHANNELS, unmapped, UNMAPPED_DAYS });
+    res.render(view('amazon-index.ejs'), { ...pageLocals(req, phase), nav: 'amazon', listPage: true, dbError, data, filters, MAP_STATES, CHANNELS, unmapped, UNMAPPED_DAYS, exportMax: EXPORT_LIMITS.max });
   });
+});
+/**
+ * Amazon SKU の対応の CSV (10/16 中原さん)。一覧の URL の条件 (?q=&state=) のまま、ページ分けに関係なく全件 (EXPORT_MAX 件まで)。
+ * 見られる人 = 一覧を見られる人 (server.js の requireAppAccess('master-edit'))・読むだけ
+ */
+router.get('/amazon/list.csv', (req, res) => {
+  const deadline = Date.now() + EXPORT_LIMITS.timeMs;
+  return withPgPage(req, res, async (db, dbError) => {
+    const text = (status, msg) => res.status(status).type('text/plain; charset=utf-8').send(msg);
+    if (!db) return text(503, dbError || 'Company DB につながりません');
+    let data;
+    try {
+      const channels = await amazonChannelsProvider();
+      data = await listAmazonMapsAll(deadlineDb(db, deadline), normalizeAmazonFilters(req.query), { channels, max: EXPORT_LIMITS.max });
+    } catch (e) {
+      if (e instanceof ListTimeoutError || isStatementTimeout(e)) return text(503, `時間がかかりすぎました (${EXPORT_LIMITS.timeMs / 1000} 秒)。絞ってからもう一度出してください`);
+      throw e;
+    }
+    if (data.tableMissing) return text(503, 'Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)');
+    if (data.tooMany) return text(413, `${data.total.toLocaleString('ja-JP')} 件あります。CSV は ${data.max.toLocaleString('ja-JP')} 件までです。絞ってから出してください`);
+    const body = buildAmazonCsv(data, { mapStates: MAP_STATES, channels: CHANNELS });
+    const name = amazonCsvFileName(clock());
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+    res.set('Cache-Control', 'no-store');
+    res.send(body);
+  }, { deadline });
 });
 // FBA だけ (自社発送は 商品コード = Amazon SKU = 対応が要らない・10/12)。区分の引数 (?channel=) は捨てる
 router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbError) => {

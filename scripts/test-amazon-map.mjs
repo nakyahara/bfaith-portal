@@ -52,7 +52,7 @@ const M = await import('../lib/amazon-map-migrate.mjs');
 const K = await import('../lib/sku-map-canonical.js');
 const CLI = await import('./company-db/amazon-map-migrate.mjs');
 const { MasterWriteError } = await import('../lib/master-write.mjs');
-const { default: router, __setPgClientFactory, __setClock, __setAmazonChannelsProvider } = await import('../apps/master-edit/router.mjs');
+const { default: router, __setPgClientFactory, __setClock, __setAmazonChannelsProvider, __setExportLimits } = await import('../apps/master-edit/router.mjs');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -945,6 +945,29 @@ await ta('[12] 一覧・1 つ・変更の記録・つかいかた・末尾の / 
   assert.ok(r.text.includes('sku?sku=new_sku1') && !r.text.includes('sku?sku=a004"'));
   r = await call('GET', '/amazon/?q=a006');   // NE コードでも探せる (pr_new1 は無い = この DB では無し)
   assert.equal(r.status, 200);
+  // CSV (10/16): 一覧の右上のリンク (絞り込みのまま)・BOM・見出し・全件・状態で絞る・上限を超える = 413
+  r = await call('GET', '/amazon/?state=active');
+  assert.ok(r.text.includes('href="list.csv?state=active"'), 'CSV のリンクが絞り込みを持っていない');
+  r = await call('GET', '/amazon/list.csv');
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get('content-type'), /^text\/csv/);
+  assert.match(r.headers.get('content-disposition'), /attachment; filename="amazon-sku_\d{8}-\d{4}\.csv"/);
+  assert.ok(r.text.startsWith('"seller SKU","名前","構成 (NE の商品 × 数)"'));   // r.text = fetch の text() は BOM を外す
+  const raw = Buffer.from(await (await fetch(`${BASE}/amazon/list.csv`, { headers: { 'x-test-session': 'editor' } })).arrayBuffer());
+  assert.deepEqual([...raw.subarray(0, 3)], [0xef, 0xbb, 0xbf], 'BOM が無い (Excel で文字化けする)');
+  const csvAll = r.text.split('\r\n').filter(Boolean);
+  assert.ok(csvAll.some((l) => l.startsWith('"pr_a001",')) && csvAll.some((l) => l.startsWith('"new_sku1",') && l.includes('"削除済み (墓標)"')));
+  const nMaps = Number((await q('select count(*)::int as n from core.amazon_sku_maps'))[0].n);
+  assert.equal(csvAll.length - 1, nMaps, 'CSV が全件でない');
+  r = await call('GET', '/amazon/list.csv?state=deleted');
+  assert.ok(r.text.includes('"new_sku1",') && !r.text.includes('"pr_a001",'));
+  __setExportLimits({ max: 1 });
+  try {
+    r = await call('GET', '/amazon/list.csv');
+    assert.equal(r.status, 413); assert.ok(r.text.includes('絞ってから'));
+    r = await call('GET', '/amazon/');
+    assert.ok(r.text.includes('id="csv-link" aria-disabled="true"'));
+  } finally { __setExportLimits(null); }
   r = await call('GET', '/amazon/sku?sku=PR_A001');
   assert.equal(r.status, 200);
   const amzJs = (await checkScripts(r.text, 0)).find((x) => x.includes('me-amazon.js — Amazon SKU の対応')) || '';

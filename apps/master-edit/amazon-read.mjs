@@ -44,10 +44,8 @@ export function normalizeAmazonFilters(q = {}) {
   return { q: String(q.q ?? '').trim().slice(0, 100), state, offset };
 }
 
-/** 一覧 = Company DB の対応 (墓標も)。今 (切替の前) は 0 件 = 正は miniPC の SKU マスタ */
-export async function listAmazonMaps(db, filters, { channels = null } = {}) {
-  const f = normalizeAmazonFilters(filters);
-  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], total: 0, offset: 0, limit: AMAZON_LIST_LIMIT, filters: f, tableMissing: true };
+/** 一覧の絞り込みの where (画面・CSV で同じ) */
+function amazonWhere(f) {
   const params = [];
   const where = ['true'];
   if (f.q) {
@@ -59,15 +57,40 @@ export async function listAmazonMaps(db, filters, { channels = null } = {}) {
       or exists (select 1 from core.listing_components c join core.skus k on k.sku_id = c.sku_id where c.listing_id = m.listing_id and k.code_norm like $${norm}))`);
   }
   if (f.state) { params.push(f.state); where.push(`m.state = $${params.length}`); }
-  const total = Number((await db.query(`select count(*)::int as n from core.amazon_sku_maps m where ${where.join(' and ')}`, params)).rows[0].n);
-  params.push(AMAZON_LIST_LIMIT, f.offset);
-  const rows = (await db.query(`select m.seller_sku, m.name, m.state, m.origin, ${TS('m.changed_at')} as changed_at, m.changed_by, m.listing_id::text as listing_id, ci.asin,
+  return { where: where.join(' and '), params };
+}
+const AMAZON_LIST_SELECT = `select m.seller_sku, m.name, m.state, m.origin, ${TS('m.changed_at')} as changed_at, m.changed_by, m.listing_id::text as listing_id, ci.asin,
         (select string_agg(k.code || '×' || c.qty, ', ' order by c.sort_order) from core.listing_components c join core.skus k on k.sku_id = c.sku_id where c.listing_id = m.listing_id) as comps
-      from core.amazon_sku_maps m join core.listings l on l.listing_id = m.listing_id left join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id
-     where ${where.join(' and ')}
+      from core.amazon_sku_maps m join core.listings l on l.listing_id = m.listing_id left join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id`;
+
+/** 一覧 = Company DB の対応 (墓標も)。今 (切替の前) は 0 件 = 正は miniPC の SKU マスタ */
+export async function listAmazonMaps(db, filters, { channels = null } = {}) {
+  const f = normalizeAmazonFilters(filters);
+  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], total: 0, offset: 0, limit: AMAZON_LIST_LIMIT, filters: f, tableMissing: true };
+  const { where, params } = amazonWhere(f);
+  const total = Number((await db.query(`select count(*)::int as n from core.amazon_sku_maps m where ${where}`, params)).rows[0].n);
+  params.push(AMAZON_LIST_LIMIT, f.offset);
+  const rows = (await db.query(`${AMAZON_LIST_SELECT}
+     where ${where}
      order by m.changed_at desc, m.seller_sku limit $${params.length - 1} offset $${params.length}`, params)).rows;
   for (const r of rows) r.channel = channels ? (channels.get(normSku(r.seller_sku)) ?? null) : null;
   return { rows, total, offset: f.offset, limit: AMAZON_LIST_LIMIT, filters: f, tableMissing: false };
+}
+
+/** CSV の件数の上限 (商品の一覧の CSV と同じ) */
+export const AMAZON_EXPORT_MAX = 10000;
+/** CSV 用 = 絞った一覧 (状態・検索) を全部 (ページ分けに関係なく・seller SKU の順)。max 件を超える = { tooMany: true } (行は読まない) */
+export async function listAmazonMapsAll(db, filters, { channels = null, max = AMAZON_EXPORT_MAX } = {}) {
+  const f = normalizeAmazonFilters(filters);
+  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], total: 0, max, filters: f, tableMissing: true };
+  const { where, params } = amazonWhere(f);
+  const total = Number((await db.query(`select count(*)::int as n from core.amazon_sku_maps m where ${where}`, params)).rows[0].n);
+  if (total > max) return { rows: [], total, max, filters: f, tableMissing: false, tooMany: true };
+  const rows = (await db.query(`${AMAZON_LIST_SELECT}
+     where ${where}
+     order by m.seller_sku`, params)).rows;
+  for (const r of rows) r.channel = channels ? (channels.get(normSku(r.seller_sku)) ?? null) : null;
+  return { rows, total, max, filters: f, tableMissing: false };
 }
 
 /** 1 つの seller SKU の画面。対応が無くても、Company DB の出品と今の構成 (夜間ロードの写し) を見せる */

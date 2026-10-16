@@ -80,3 +80,36 @@ function salesValue(r, k) {
   if (!s || s.missing || r.kind === 'set') return null;
   return s[k];
 }
+
+/** Amazon SKU の対応の CSV のファイル名 (日本の日時)。例 amazon-sku_20261016-1830.csv */
+export function amazonCsvFileName(nowMs = Date.now()) {
+  return csvFileName(nowMs).replace(/^master-list_/, 'amazon-sku_');
+}
+/** ISO (UTC) → 日本時間の 'YYYY/MM/DD HH:MM' (Excel で日時として読める・年も付ける)。読めない = 元の文字 */
+function jstFull(iso) {
+  const t = Date.parse(String(iso ?? ''));
+  if (Number.isNaN(t)) return iso == null ? '' : String(iso);
+  const d = new Date(t + 9 * 3600e3).toISOString();
+  return `${d.slice(0, 10).replace(/-/g, '/')} ${d.slice(11, 16)}`;
+}
+/**
+ * Amazon SKU の対応 (絞った全件) の CSV (BOM + 見出し + 行・CRLF・形は上の一覧の CSV と同じ)。data = listAmazonMapsAll の結果。
+ * 列 = 画面の一覧の列 (seller SKU・名前・構成・区分・ASIN・状態・変えた) + 構成の行の数・移行で入ったか・変えた人
+ */
+export function buildAmazonCsv(data, { mapStates = {}, channels = {} } = {}) {
+  const cols = [
+    ['seller SKU', (r) => r.seller_sku],
+    ['名前', (r) => r.name],
+    ['構成 (NE の商品 × 数)', (r) => r.comps || ''],
+    ['構成の行の数', (r) => (r.comps ? String(r.comps).split(', ').filter(Boolean).length : 0)],
+    ['区分', (r) => (r.channel ? channels[r.channel] || r.channel : '')],
+    ['ASIN', (r) => r.asin || ''],
+    ['状態', (r) => mapStates[r.state] || r.state],
+    ['移行で入った', (r) => (r.origin === 'legacy' ? '移行' : '')],
+    ['変えた日時 (日本時間)', (r) => jstFull(r.changed_at)],
+    ['変えた人', (r) => r.changed_by || ''],
+  ];
+  const lines = [cols.map(([h]) => csvCell(h)).join(',')];
+  for (const r of data.rows) lines.push(cols.map(([, f]) => csvCell(f(r))).join(','));
+  return `﻿${lines.join('\r\n')}\r\n`;
+}

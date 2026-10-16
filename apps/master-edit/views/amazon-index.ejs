@@ -91,7 +91,14 @@
     </section>
 
     <section class="panel" aria-label="一覧">
-      <div class="tbl-top"><span><b><%= data.total.toLocaleString('ja-JP') %></b> 件<% if (data.total) { %> <span class="muted">(<%= data.offset + 1 %>〜<%= data.offset + data.rows.length %> 件目)</span><% } %></span><span class="dotsep" aria-hidden="true"></span><span>時刻は日本時間</span></div>
+      <div class="tbl-top"><span><b><%= data.total.toLocaleString('ja-JP') %></b> 件<% if (data.total) { %> <span class="muted">(<%= data.offset + 1 %>〜<%= data.offset + data.rows.length %> 件目)</span><% } %></span><span class="dotsep" aria-hidden="true"></span><span>時刻は日本時間</span>
+        <% if (data.total) {
+          // 絞った一覧の全件 (ページ分けに関係なく) = 今の絞り込み (検索・状態) のまま。上限 = exportMax 件
+          const qsNow = hrefWith({}); const qsTail = qsNow === './' ? '' : qsNow;
+          const overMax = data.total > exportMax;
+          const exTitle = data.total.toLocaleString('ja-JP') + ' 件あります。' + exportMax.toLocaleString('ja-JP') + ' 件までなので、絞ってから'; %>
+        <span class="right"><% if (overMax) { %><span class="btn sm ghost" id="csv-link" aria-disabled="true" title="<%= exTitle %>"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>CSV</span><% } else { %><a class="btn sm ghost" id="csv-link" href="list.csv<%= qsTail %>" download title="絞った一覧を全部 (ページに関係なく) CSV で (Excel で開ける・UTF-8)"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>CSV (<%= data.total.toLocaleString('ja-JP') %> 件)</a><% } %></span>
+        <% } %></div>
       <div class="tblwrap">
         <table class="tbl click" id="list-tbl">
           <caption class="sr">Amazon SKU の対応の一覧 (seller SKU を押すと開きます)</caption>
