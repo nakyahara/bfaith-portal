@@ -2824,15 +2824,36 @@ await ta('[71] 発注の設定のグループを名前・ID で絞る (10/16 中
     assert.deepEqual(await opts('#po-material_group_id'), ['djktcleaner'], 'ひらがなでカタカナの名前に当たる');
     assert.equal(await p.inputValue('#po-material_group_id'), 'djktcleaner', '当たり 1 つ = 選ぶ');
     assert.match(await p.textContent('#po-mat-q-n'), /当たり 1 件/);
+    // 絞り込みが選んだグループは、打ち直した言葉に当たらなくなったら取り消す (Codex R1 Medium)
     await p.fill('#po-mat-q', 'base');
-    assert.deepEqual((await opts('#po-material_group_id')).sort(), ['djktcleaner', 'gum-base', 'handcream-base'], 'ID でも当たる・選んでいるグループは消えない');
-    assert.equal(await p.inputValue('#po-material_group_id'), 'djktcleaner', '当たりが複数 = 選び直さない');
-    assert.match(await p.textContent('#po-mat-q-n'), /当たり 2 件/, '選んでいるだけで当たらないグループは数えない');
+    assert.deepEqual((await opts('#po-material_group_id')).sort(), ['gum-base', 'handcream-base'], 'ID でも当たる');
+    assert.equal(await p.inputValue('#po-material_group_id'), '', '絞り込みが選んだグループは当たらなくなったら取り消す');
+    assert.match(await p.textContent('#po-mat-q-n'), /当たり 2 件/);
+    // 人が選んだグループは、絞っても消えない・取り消さない
+    await p.selectOption('#po-material_group_id', 'gum-base');
+    await p.fill('#po-mat-q', 'だうん');
+    assert.deepEqual((await opts('#po-material_group_id')).sort(), ['djktcleaner', 'gum-base'], '人が選んだグループは消えない');
+    assert.equal(await p.inputValue('#po-material_group_id'), 'gum-base', '人が選んだグループは選び直さない');
+    assert.match(await p.textContent('#po-mat-q-n'), /当たり 1 件/, '選んでいるだけで当たらないグループは数えない');
     await p.fill('#po-mat-q', 'zzz');
     assert.match(await p.textContent('#po-mat-q-n'), /当たるグループはありません/);
     await p.fill('#po-mat-q', '');
     assert.equal(await p.isHidden('#po-mat-q-n'), true);
     assert.equal((await opts('#po-material_group_id')).length, 3, '消すと全部に戻る');
+    assert.equal(await p.inputValue('#po-material_group_id'), 'gum-base');
+    // 変換中 (IME) は選ばない = 「かみ」の変換中に「カミ」を選んで「紙」に確定しても残る、をしない (Codex R1 Medium)
+    insM.run('kami-a', 'カミ 原料', 1, 'kg', now, now); insM.run('paper-b', '紙 原料', 1, 'kg', now, now);
+    await p.goto(B + '/new?kind=single');
+    await p.waitForSelector('#po-mat-mode');
+    await p.click('#po-mat-mode button[data-v="pick"]');
+    await p.focus('#po-mat-q');
+    const cdp = await p.context().newCDPSession(p);
+    await cdp.send('Input.imeSetComposition', { text: 'かみ', selectionStart: 2, selectionEnd: 2 });
+    assert.deepEqual(await opts('#po-material_group_id'), ['kami-a'], '変換中も絞る');
+    assert.equal(await p.inputValue('#po-material_group_id'), '', '変換中は選ばない');
+    await cdp.send('Input.insertText', { text: '紙' });
+    await p.waitForFunction(() => document.getElementById('po-material_group_id').value !== '');
+    assert.equal(await p.inputValue('#po-material_group_id'), 'paper-b', '確定した言葉で選ぶ');
     // 絞る欄の Enter = 登録に送らない (画面はそのまま)
     const url = p.url();
     await p.focus('#po-mat-q'); await p.keyboard.press('Enter');
@@ -2848,7 +2869,7 @@ await ta('[71] 発注の設定のグループを名前・ID で絞る (10/16 中
     assert.equal(await p.inputValue('#po-condition_id'), 'maruma-box');
     assert.ok((await dirty(p)) >= 1, '選んだ = 未保存に数える');
   } finally {
-    mirrorDb.prepare("delete from po_material_groups where group_id in ('djktcleaner', 'handcream-base', 'gum-base')").run();
+    mirrorDb.prepare("delete from po_material_groups where group_id in ('djktcleaner', 'handcream-base', 'gum-base', 'kami-a', 'paper-b')").run();
     mirrorDb.prepare("delete from po_order_conditions where condition_id in ('maruma-30000', 'maruma-box', 'maruma-other')").run();
   }
 });
