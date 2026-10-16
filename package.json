@@ -24,7 +24,7 @@
     "test:keyword-suggest": "node scripts/test-keyword-suggest-service.mjs",
     "test:supplier-sales": "node apps/supplier-sales/smoke-zero.mjs && node apps/supplier-sales/test-amazon-sales-tax.mjs",
     "test:fba-db": "node scripts/test-fba-db-single-writer.mjs && node scripts/test-sqljs-guard.mjs",
-    "test:po-ne-codes": "node scripts/test-po-ne-codes.mjs && node apps/purchase-orders/scripts/smoke.mjs && node scripts/test-po-order-settings.mjs",
+    "test:po-ne-codes": "node scripts/test-po-ne-codes.mjs && node scripts/test-po-new-skus.mjs && node apps/purchase-orders/scripts/smoke.mjs && node scripts/test-po-order-settings.mjs",
     "test:po-order-settings": "node scripts/test-po-order-settings.mjs",
     "test:fba-self-reserve": "node scripts/test-fba-self-reserve.mjs && node apps/fba-replenishment/smoke.mjs",
     "test:fba-decision-job": "node scripts/test-fba-decision-job.mjs",

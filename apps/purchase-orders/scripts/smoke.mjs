@@ -3362,6 +3362,101 @@ console.log('── M6 Company DB の NE の元の書き方 ──');
   neMod.setNeCodeReaderForTest(null);
 }
 
+// ═══ 新商品の登録で作った商品を NE 登録の前から入荷予定・対応表で使う (new-skus.js・中原さん 10/14・10/16) ═══
+console.log('── 新商品 (PMLに無い) を入荷予定・対応表で使う ──');
+{
+  const nsMod = await imp('apps/purchase-orders/new-skus.js');
+  const jp6 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const nsRows = [
+    { code: 'NewItem-01', name: '新しい商品 テスト', state: 'draft', cost: '120', supplier: '0002', lz_issued: false },
+    { code: 'NewItem-02', name: '新しい商品 その2', state: 'ne_pending', cost: null, supplier: '2', lz_issued: true },
+    { code: 'Gone-01', name: 'やめた新商品', state: 'cancelled', cost: '50', supplier: '2', lz_issued: false },
+    { code: 'Other-01', name: '新しい商品 よその仕入先', state: 'draft', cost: '80', supplier: '1', lz_issued: false },
+    { code: 'NoSup-01', name: '新しい商品 仕入先なし', state: 'draft', cost: '80', supplier: null, lz_issued: false },
+  ];
+  nsMod.setNewSkuReaderForTest(async () => ({ ok: true, reason: null, map: nsMod.newSkuMap(nsRows) }));
+  // 候補: 名前でも当たる・PMLに無い新商品だけ・やめた・よその仕入先・仕入先なしは出さない
+  r = await j('/api/vendor-map/products?supplier=2&q=' + encodeURIComponent('新しい商品'));
+  const codes = (r.body.rows || []).map(x => x.code);
+  ok(r.body.ok && codes.includes('NewItem-01') && codes.includes('NewItem-02') && !codes.includes('Other-01') && !codes.includes('NoSup-01') &&
+    r.body.rows.find(x => x.code === 'NewItem-01').newSku === true && r.body.rows.find(x => x.code === 'NewItem-01').newSkuStateWord === '下書き',
+    '新商品: 対応表の候補に名前で出る (この仕入先・使える状態だけ)', r.body.rows);
+  r = await j('/api/vendor-map/products?supplier=2&q=gone');
+  ok(r.body.ok && !(r.body.rows || []).some(x => x.code === 'Gone-01'), '新商品: 登録をやめた商品は候補に出ない', r.body.rows);
+  // 対応表の 1 件登録: 新商品は PML に無くても登録できる・やめた / よその仕入先 / 仕入先なし は断る
+  r = await jp6('/api/vendor-map/entry', { supplier_code: '2', product_code: 'NewItem-01', vendor_code: 'V-NEW-1', baseUpdatedAt: null });
+  ok(r.status === 200 && r.body.ok, '新商品: 対応表に PML に無い新商品を登録できる', r.body);
+  r = await jp6('/api/vendor-map/entry', { supplier_code: '2', product_code: 'Gone-01', vendor_code: 'V-GONE-1' });
+  ok(r.status === 400 && /登録をやめた/.test(r.body.error), '新商品: 登録をやめた商品は対応表に入れない', r.body);
+  r = await jp6('/api/vendor-map/entry', { supplier_code: '2', product_code: 'Other-01', vendor_code: 'V-OTHER-1' });
+  ok(r.status === 400 && /代表の仕入先は 1/.test(r.body.error), '新商品: 代表の仕入先が違う商品は断る', r.body);
+  r = await jp6('/api/vendor-map/entry', { supplier_code: '2', product_code: 'NoSup-01', vendor_code: 'V-NOSUP-1' });
+  ok(r.status === 400 && /代表の仕入先が未設定/.test(r.body.error), '新商品: 代表の仕入先が無い商品は断る', r.body);
+  r = await jp6('/api/vendor-map/entry', { supplier_code: '2', product_code: 'NoSuchItem-99', vendor_code: 'V-NONE-1' });
+  ok(r.status === 400 && /商品マスタに無い商品コード/.test(r.body.error), '新商品: どこにも無いコードは今までどおり断る', r.body);
+  // 一覧: PMLに無い新商品は新商品の名前
+  r = await j('/api/vendor-map/entries?supplier=2');
+  const ent = (r.body.rows || []).find(x => x.product_key === 'newitem-01');
+  ok(r.body.ok && ent && ent.name === '新しい商品 テスト' && ent.newSkuState === 'draft', '新商品: 対応表の一覧に新商品の名前', ent);
+  // 変換: 新商品の書き方・名前・原価で貼り付けに入る・NE 未登録の印・書き方の未確認には数えない
+  const convNew = () => jp6('/api/inbound-plan/convert', { supplier_code: '2', text: 'V-NEW-1\tx\t4\n' });
+  r = await convNew();
+  const nr = (r.body.rows || [])[0] || {};
+  ok(r.body.ok && r.body.rowCount === 1 && nr.productCode === 'NewItem-01' && nr.productName === '新しい商品 テスト' && nr.cost === 120 && nr.qty === 4 &&
+    r.body.pasteText === 'NewItem-01\t4\t120' && nr.newSku && nr.newSku.state === 'draft' && nr.newSku.notInNe === true && r.body.caseUnverified.length === 0 &&
+    r.body.newSkuRows.length === 1 && r.body.newSkus.ok === true,
+    '新商品: 入荷予定の変換で新商品の書き方・名前・原価になる', r.body);
+  // ロジザードの写し: 写しが無い・空 = 分からない = 警告しない / 写しにほかの商品だけ = 警告 / 写しにある = 警告しない
+  ok(nr.newSku && nr.newSku.lzMissing === false, '新商品: ロジザードの写しが無い = 分からない = 警告しない', nr.newSku);
+  db.exec(`CREATE TABLE IF NOT EXISTS f_inbound_check_product_flags (code_key TEXT PRIMARY KEY, expiry_managed INTEGER NOT NULL CHECK (expiry_managed IN (0,1)),
+    source TEXT NOT NULL CHECK (source IN ('manual','logizard')), updated_at TEXT NOT NULL, updated_by TEXT)`);
+  db.prepare("INSERT OR IGNORE INTO f_inbound_check_product_flags (code_key, expiry_managed, source, updated_at) VALUES ('lz-some-other', 0, 'logizard', '2026-10-16T00:00:00Z')").run();
+  r = await convNew();
+  ok(r.body.ok && r.body.rows[0].newSku.lzMissing === true && r.body.newSkuRows[0].lzMissing === true && r.body.rowCount === 1,
+    '新商品: ロジザードの写しに無く CSV も出していない = 警告 (貼り付けには含める)', r.body.newSkuRows);
+  db.prepare("INSERT OR IGNORE INTO f_inbound_check_product_flags (code_key, expiry_managed, source, updated_at) VALUES ('newitem-01', 0, 'logizard', '2026-10-16T00:00:00Z')").run();
+  r = await convNew();
+  ok(r.body.ok && r.body.rows[0].newSku.lzMissing === false, '新商品: ロジザードの写しにある = 警告しない', r.body.newSkuRows);
+  // 仮登録 → 紐づけ: PML に無い新商品にすぐ紐づけられる (CSV を出した新商品 = ロジザードの警告なし)
+  r = await jp6('/api/vendor-map/pending', { supplier_code: '2', items: [{ vendorCode: 'V-NEW-2', qty: 1 }] });
+  const pend2 = db.prepare("SELECT id FROM po_vendor_code_pending WHERE supplier_code='2' AND vendor_code='V-NEW-2'").get();
+  ok(r.body.ok && pend2, '新商品: 仮登録 (材料)', r.body);
+  if (pend2) {
+    r = await jp6('/api/vendor-map/pending/' + pend2.id + '/link', { product_code: 'NewItem-02' });
+    ok(r.status === 200 && r.body.ok, '新商品: 仮登録を PML に無い新商品へ紐づけられる', r.body);
+    r = await jp6('/api/inbound-plan/convert', { supplier_code: '2', text: 'V-NEW-2\tx\t2\n' });
+    ok(r.body.ok && r.body.rows[0].productCode === 'NewItem-02' && r.body.rows[0].cost == null && r.body.rows[0].newSku.lzMissing === false &&
+      r.body.rows[0].newSku.stateWord === 'NE登録待ち', '新商品: ロジザード登録の CSV を出した新商品は警告しない', r.body.rows);
+  }
+  // 仮商品コード: やめた新商品・よその仕入先の新商品は断る (新商品の登録に無いコードは今までどおり通す)
+  r = await jp6('/api/vendor-map/pending', { supplier_code: '2', items: [{ vendorCode: 'V-PROV-1', qty: 1, provisionalProductCode: 'Gone-01' }] });
+  ok(r.status === 400 && /登録をやめた/.test(r.body.error), '新商品: 仮商品コードにやめた新商品は使えない', r.body);
+  r = await jp6('/api/vendor-map/pending', { supplier_code: '2', items: [{ vendorCode: 'V-PROV-1', qty: 1, provisionalProductCode: 'Other-01' }] });
+  ok(r.status === 400 && /代表の仕入先は 1/.test(r.body.error), '新商品: 仮商品コードによその仕入先の新商品は使えない', r.body);
+  // 対応表に入っていた新商品を後でやめた = 貼り付けから外す
+  db.prepare("INSERT OR REPLACE INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('2', 'gone-01', 'Gone-01', 'V-GONE-1', '2026-10-16T00:00:00Z')").run();
+  r = await jp6('/api/inbound-plan/convert', { supplier_code: '2', text: 'V-GONE-1\tx\t5\nV-NEW-1\tx\t1\n' });
+  ok(r.body.ok && r.body.rowCount === 1 && r.body.pasteText === 'NewItem-01\t1\t120' && r.body.lines[0].type === 'newskublocked' &&
+    r.body.newSkuBlocked.length === 1 && r.body.newSkuBlocked[0].productCode === 'Gone-01' && r.body.newSkuBlocked[0].reason === 'cancelled',
+    '新商品: やめた新商品の行は貼り付けから外す (ほかの行はそのまま)', r.body);
+  // Company DB を読めない = 今の動き (PML だけ: 新商品の行は名前・原価が空のまま・変換は止めない)
+  nsMod.setNewSkuReaderForTest(async () => ({ ok: false, reason: 'timeout', map: new Map() }));
+  r = await convNew();
+  ok(r.body.ok && r.body.rowCount === 1 && r.body.rows[0].productName === '' && r.body.rows[0].cost == null && !r.body.rows[0].newSku && r.body.newSkus.reason === 'timeout',
+    '新商品: Company DB を読めない = 今の動き (変換は止めない)', r.body);
+  nsMod.setNewSkuReaderForTest(async () => { throw new Error('boom'); });
+  r = await convNew();
+  ok(r.body.ok && r.body.newSkus.ok === false && r.body.newSkus.reason === 'error', '新商品: 読み手の失敗 = 今の動き', r.body.newSkus);
+  // 既定の読み手 (COMPANY_DB_URL が無い) = not_configured
+  nsMod.setNewSkuReaderForTest(null);
+  r = await convNew();
+  ok(r.body.ok && r.body.newSkus.ok === false && r.body.newSkus.reason === 'not_configured', '新商品: Company DB が無い = not_configured', r.body.newSkus);
+  // 片付け (後の試験に残さない)
+  db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='2' AND product_key IN ('newitem-01','newitem-02','gone-01')").run();
+  db.prepare("DELETE FROM po_vendor_code_pending WHERE supplier_code='2' AND vendor_code='V-NEW-2'").run();
+  db.prepare("DELETE FROM f_inbound_check_product_flags WHERE code_key IN ('lz-some-other','newitem-01')").run();
+}
+
 // ═══ 入庫取込プレビュー + ⚡一括割当 (中原さん要望 2026-07-14) ═══
 console.log('── 入庫取込プレビュー+一括割当 ──');
 {
