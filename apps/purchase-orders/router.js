@@ -6460,8 +6460,13 @@ function renderIpResult(j, req) {
           return;
         }
         if (l.type === 'newskublocked') {
+          // 仮商品コードの行はコードを直せる欄を残す (直して💾 = 変換し直し・空にすると❓に戻る。Codex R2 Medium)
           h += '<tr style="background:#fee2e2">' + left +
-            '<td><b>' + esc(l.productCode) + '</b></td><td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
+            (l.provisional
+              ? '<td style="white-space:nowrap"><span class="badge">🕗仮</span> <input type="text" value="' + esc(l.provisionalCode) + '" data-ipprovcode="' + li + '" style="width:160px" title="仮商品コード (ロジザードへ貼り付ける商品ID)">' +
+                '<button class="ghost sm" data-ipprovsave="' + li + '" title="仮商品コードを直して変換し直します (空にすると❓対応表になしに戻ります)">💾</button></td>'
+              : '<td><b>' + esc(l.productCode) + '</b></td>') +
+            '<td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
             '<td colspan="3"><span class="badge b-warn">⛔ 貼り付けから除外</span> <span class="muted">' + esc(l.newSkuBlockedWhy || '') +
             '。マスタの入力で商品を確かめてください (' + (l.provisional ? '仮商品コードを直すか' : '📇対応表を直すか') + '、この行はロジザードに手で入れないでください)</span></td></tr>';
           return;
