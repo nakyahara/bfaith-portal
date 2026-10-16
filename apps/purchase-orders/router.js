@@ -8751,20 +8751,38 @@ function loadUnlinked(days) {
 }
 // ── 🏷️ バーコードラベルタブ (自社商品=AMC×売上分類1 の全対象商品を未登録含めて一覧管理。
 //     旧Excel「BFバーコード管理_既存商品.xlsx」の移行先。バッジクリックで状態変更) ──
+// 対象は数千件あるので、表は絞り込んだ結果の先頭 BC_PAGE 件だけ描く (残りは「もっと見る」)。
+// 全件を一度に描くと、表示・状態ボタン・検索・保存後の再読込のたびに数秒止まっていた (中原さん 2026-10-16「よく画面がフリーズする」)
 var BC_FILTER = 'all';
 var BC_DATA = null;
 var BC_GEN = 0;
-function loadBarcode() {
+var BC_PAGE = 300;      // 一度に描く行数
+var BC_SHOWN = BC_PAGE; // 今描いている行数の上限 (「もっと見る」で増やす。絞り込みを変えたら戻す)
+var BC_Q = '';          // 検索の文字 (描き直しても消さない)
+var BC_QTIMER = null;
+// quiet=1: 保存の後の読み直し (「読み込み中…」で表を消さない = スクロール位置・検索・表示件数をそのまま)
+function loadBarcode(quiet) {
   var gen = ++BC_GEN;
-  document.getElementById('tabBody').textContent = '読み込み中…';
+  var y = window.scrollY;
+  if (!quiet) { document.getElementById('tabBody').textContent = '読み込み中…'; BC_SHOWN = BC_PAGE; }
   fetch('/apps/purchase-orders/api/barcode-labels').then(function(r){ return r.json(); }).then(function(j) {
     if (gen !== BC_GEN || TAB !== 'barcode') return;
     if (!j.ok) { document.getElementById('tabBody').textContent = j.error || '取得に失敗しました'; return; }
     BC_DATA = j;
+    // 検索用の文字は読み込んだときに 1 回だけ作る (毎回の入力で全行の DOM を読まない)
+    (j.targets || []).forEach(function(r) { r._q = bcSearchText(r); });
     renderBarcode();
+    if (quiet) window.scrollTo(0, y);
   }).catch(function(e){ if (gen === BC_GEN && TAB === 'barcode') document.getElementById('tabBody').textContent = '通信エラー: ' + e.message; });
 }
 function bcStatusOf(r) { return r.label ? r.label.status : 'unregistered'; }
+// 検索の対象 = 前と同じく行に見えている文字 (コード・商品名・AMC管理番号・状態・バーコード値・備考・更新日と更新者・取扱中止)
+function bcSearchText(r) {
+  var l = r.label;
+  var st = BC_META[bcStatusOf(r)];
+  return [r.code, r.name, r.vendorCode || (l && l.vendorCodeHint) || '', st ? st.l : '', l ? l.barcodeValue : '', l ? l.note : '',
+    l ? String(l.updatedAt).slice(0, 10) : '', l ? l.updatedBy : '', r.active ? '' : '取扱中止'].join(' ').toLowerCase();
+}
 function renderBarcode() {
   var j = BC_DATA;
   if (!j) return;
@@ -8780,11 +8798,37 @@ function renderBarcode() {
   ];
   var h = '<div class="toolbar" style="flex-wrap:wrap;gap:6px">' +
     chips.map(function(c){ return '<button class="' + (BC_FILTER === c[0] ? 'pri' : 'ghost') + ' sm" data-bcfilter="' + c[0] + '">' + c[1] + '</button>'; }).join('') +
-    '<input type="text" id="bcQ" placeholder="🔍 商品コード / 商品名で絞り込み" style="margin-left:auto;min-width:260px"></div>' +
-    '<div class="hint">状態バッジをクリックすると変更できます。「未登録」= 旧Excelにも無かった管理漏れの自社商品 — 状態を付けてください。</div>';
-  var rows = j.targets.filter(function(r){ return BC_FILTER === 'all' || bcStatusOf(r) === BC_FILTER; });
-  h += '<table class="t" id="bcTable"><tr><th>商品コード</th><th>商品名</th><th>AMC管理番号</th><th>状態</th><th>バーコード値</th><th>備考</th><th>更新</th></tr>';
-  rows.forEach(function(r) {
+    '<input type="text" id="bcQ" placeholder="🔍 商品コード / 商品名で絞り込み" style="margin-left:auto;min-width:260px" value="' + esc(BC_Q) + '"></div>' +
+    '<div class="hint">状態バッジをクリックすると変更できます。「未登録」= 旧Excelにも無かった管理漏れの自社商品 — 状態を付けてください。</div>' +
+    '<div id="bcList"></div>';
+  if (j.orphans.length) {
+    var BC_REASONS = { missing_from_pml: '商品マスタにない', became_set: 'セット商品になった', supplier_changed: '仕入先が変わった', sales_class_changed: '売上分類が変わった' };
+    h += '<details style="margin-top:14px"><summary style="cursor:pointer">⚠️ 対象外になった登録済み商品 (' + j.orphans.length + '件) — 商品マスタ変更で「AMC×自社商品」の条件から外れた分 (登録は消していません)</summary>' +
+      '<table class="t"><tr><th>商品コード</th><th>状態</th><th>理由</th><th>バーコード値</th><th>備考</th></tr>' +
+      j.orphans.map(function(o) {
+        return '<tr><td>' + esc(o.code) + '</td><td>' + (BC_META[o.status] ? BC_META[o.status].l : esc(o.status)) + '</td>' +
+          '<td>' + (BC_REASONS[o.orphanReason] || esc(o.orphanReason)) + '</td><td>' + esc(o.barcodeValue || '') + '</td><td class="muted">' + esc(o.note || '') + '</td></tr>';
+      }).join('') + '</table></details>';
+  }
+  document.getElementById('tabBody').innerHTML = h;
+  renderBarcodeRows();
+  // 検索は打つのが止まってから 200ms 後に 1 回だけ (日本語の変換中も 1 打鍵ごとに input が来る)。描き直すのは表だけ (入力欄は作り直さない)
+  document.getElementById('bcQ').addEventListener('input', function(ev) {
+    BC_Q = ev.target.value;
+    clearTimeout(BC_QTIMER);
+    BC_QTIMER = setTimeout(function() { BC_SHOWN = BC_PAGE; renderBarcodeRows(); }, 200);
+  });
+}
+// 表だけを描く (状態ボタンと検索で絞った結果の先頭 BC_SHOWN 件)
+function renderBarcodeRows() {
+  var box = document.getElementById('bcList');
+  if (!box || !BC_DATA) return;
+  var q = BC_Q.trim().toLowerCase();
+  var rows = BC_DATA.targets.filter(function(r) {
+    return (BC_FILTER === 'all' || bcStatusOf(r) === BC_FILTER) && (!q || r._q.indexOf(q) >= 0);
+  });
+  var h = '<table class="t" id="bcTable"><tr><th>商品コード</th><th>商品名</th><th>AMC管理番号</th><th>状態</th><th>バーコード値</th><th>備考</th><th>更新</th></tr>';
+  rows.slice(0, BC_SHOWN).forEach(function(r) {
     var b = r.label
       ? { status: r.label.status, value: r.label.barcodeValue, note: r.label.note, version: r.label.version }
       : { status: 'unregistered', value: '', note: '', version: null };
@@ -8798,28 +8842,18 @@ function renderBarcode() {
   });
   h += '</table>';
   if (!rows.length) h += '<div class="muted">該当なし</div>';
-  if (j.orphans.length) {
-    var BC_REASONS = { missing_from_pml: '商品マスタにない', became_set: 'セット商品になった', supplier_changed: '仕入先が変わった', sales_class_changed: '売上分類が変わった' };
-    h += '<details style="margin-top:14px"><summary style="cursor:pointer">⚠️ 対象外になった登録済み商品 (' + j.orphans.length + '件) — 商品マスタ変更で「AMC×自社商品」の条件から外れた分 (登録は消していません)</summary>' +
-      '<table class="t"><tr><th>商品コード</th><th>状態</th><th>理由</th><th>バーコード値</th><th>備考</th></tr>' +
-      j.orphans.map(function(o) {
-        return '<tr><td>' + esc(o.code) + '</td><td>' + (BC_META[o.status] ? BC_META[o.status].l : esc(o.status)) + '</td>' +
-          '<td>' + (BC_REASONS[o.orphanReason] || esc(o.orphanReason)) + '</td><td>' + esc(o.barcodeValue || '') + '</td><td class="muted">' + esc(o.note || '') + '</td></tr>';
-      }).join('') + '</table></details>';
+  else if (rows.length > BC_SHOWN) {
+    h += '<div style="margin-top:8px"><span class="muted">' + rows.length + '件中 ' + BC_SHOWN + '件を表示 (状態ボタンか検索で絞り込めます)</span> ' +
+      '<button class="ghost sm" data-bcmore="1">もっと見る (+' + Math.min(BC_PAGE, rows.length - BC_SHOWN) + '件)</button></div>';
   }
-  document.getElementById('tabBody').innerHTML = h;
-  document.getElementById('bcQ').addEventListener('input', function(ev) {
-    var q = ev.target.value.trim().toLowerCase();
-    document.querySelectorAll('#bcTable tr[data-bcrow]').forEach(function(tr) {
-      tr.style.display = !q || tr.textContent.toLowerCase().indexOf(q) >= 0 ? '' : 'none';
-    });
-  });
+  box.innerHTML = h;
 }
-// バッジクリック編集 + 状態フィルタ (バーコードタブ)
+// バッジクリック編集 + 状態フィルタ + もっと見る (バーコードタブ)
 document.addEventListener('click', function(ev) {
   var t = ev.target;
   var f = t.getAttribute && t.getAttribute('data-bcfilter');
-  if (f) { BC_FILTER = f; renderBarcode(); return; }
+  if (f) { BC_FILTER = f; BC_SHOWN = BC_PAGE; renderBarcode(); return; }
+  if (t.getAttribute && t.getAttribute('data-bcmore')) { BC_SHOWN += BC_PAGE; renderBarcodeRows(); return; }
   var c = t.getAttribute && t.getAttribute('data-bcedit');
   if (c && BC_DATA) {
     var row = null;
@@ -8828,7 +8862,7 @@ document.addEventListener('click', function(ev) {
     var b = row.label
       ? { status: row.label.status, value: row.label.barcodeValue, note: row.label.note, version: row.label.version }
       : { status: 'unregistered', value: '', note: '', version: null };
-    bcOpenEditor(t, c, b, function(){ loadBarcode(); });
+    bcOpenEditor(t, c, b, function(){ loadBarcode(1); });
   }
 });
 // CSV取込 (プレビュー→取込の二段。fileHashでプレビューと同一ファイルであることを保証)
