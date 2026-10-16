@@ -23,6 +23,7 @@ import { regItemsOfSku } from '../../lib/master-reg-csv.mjs';
 import { hasRegisteredOn, parseNeCreationDate, REGISTERED_ON_SOURCES } from '../../lib/sku-registered-on.mjs';
 import { normalizeSort, sortColumnOf } from './list-columns.mjs';
 import { masterProfit } from '../../lib/profit-estimate.js';
+import { readNeSpellings, exportCode } from './ne-spelling.mjs';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
 export async function selectableSuppliers(db) {
@@ -408,6 +409,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
         s.standard_price_jpy::text as standard_price, s.shipping_code, s.shipping_cost_jpy::text as shipping_cost, s.reorder_months::text as reorder_months, s.set_sales_class_override,
         p.sales_class, c.cost_jpy::text as cost_jpy, c.cost_source, c.cost_status, ps.code as primary_supplier, ps.name as primary_supplier_name, s.product_id::text as product_id,
         ${hasReg ? '(select mr.state from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_state,
+        ${hasReg && mode === 'all' ? '(select mr.origin from ops.master_registrations mr where mr.sku_id = s.sku_id)' : 'null::text'} as reg_origin,
         ${hasRegOn ? 's.registered_on::text as registered_on, s.registered_on_source' : 'null::text as registered_on, null::text as registered_on_source'}
       from core.skus s
       left join core.products p on p.product_id = s.product_id
@@ -442,6 +444,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
       profit: pr.ok ? pr.profit : null, profit_rate: pr.ok ? pr.rate : null, profit_reason: pr.ok ? null : pr.reason, profit_notes: pr.notes, profit_detail: pr,
       state: r.handling === 'discontinued' ? 'discontinued' : 'available',
       reg_state: r.reg_state ?? 'none',
+      reg_origin: r.reg_origin ?? null,
       comp_count: isSet ? (compClasses.get(r.sku_id) || []).length : null,
       registered_on: r.registered_on ?? null, registered_on_source: r.registered_on_source ?? null,
       // 参考 (ほかのアプリの値・読めなければ null): 注文残 = 発注アプリの台帳 / 在庫 = ロジザード (セットは作れる数)
@@ -466,6 +469,15 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
           where entity_type = 'product' and system = 'jan' and id_kind = 'jan' and valid_to is null and entity_id = any($1::bigint[]) group by entity_id`, [pids])).rows) janOf.set(j.pid, j.jan);
     }
     for (const r of pageRows) r.jan = (r.product_id && janOf.get(r.product_id)) || '';
+    // 外へ出す商品コード (CSV だけ・10/16 中原さん。ne-spelling.mjs): NE から来た商品 = NE の書き方 (0041 が ok のとき)・決まらない = 今のコード + 注意 /
+    //   新商品の入口の商品 = 打った書き方のまま。書き方を推測しない (小文字のコードを大文字に直したりしない)
+    const spell = await readNeSpellings(db, pageRows.filter((r) => r.reg_origin !== 'new_entry').map((r) => r.code_norm));
+    for (const r of pageRows) {
+      const x = exportCode({ code: r.code, code_norm: r.code_norm, origin: r.reg_origin }, spell);
+      r.export_code = x.code;
+      r.code_note = x.note;
+    }
+    tick();
   }
   // ⚠ の印 (NE との差・CSV 待ち・構成の依頼) はこのページの分だけ
   const norms = pageRows.map((r) => r.code_norm);

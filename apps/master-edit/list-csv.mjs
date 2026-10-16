@@ -7,6 +7,8 @@
  * 列 = 画面の一覧の列 (コード・区分・名前・状態・登録日・売価・原価・税率・売上分類・在庫・FBA (JP)・売れた数・注文残) + 画面の詳細にあるもの
  *   (構成品の数・登録の状態・代表の仕入先・JAN・送料コード・推奨月数・対応が必要)。利益・利益率 (10/6・1 個あたりの参考 = 一覧と同じ lib/profit-estimate.js。計算できない = 空)。参考の値の見出しに時点 (例「在庫 (ロジザード 10/5 18:01 時点)」)。
  *   読めない参考の値 = 空 + 見出しに「読めない」。注文残 = 発注アプリの利用権がある人だけ (無い人には列ごと出さない)
+ * 商品コード (10/16 中原さん): NE から来た商品 = NE の書き方 (NE の元のコードの記録が ok のとき)・決まらない = 今のコード + 最後の列「商品コードの注意」に理由 /
+ *   新商品の入口の商品 = 打った書き方 (ne-spelling.mjs)。新しい列は最後に足す (前の列の並びは変えない)
  */
 import { fmtJst, fmtDay } from './ui-format.mjs';
 import { PLATFORM_FEE_RATES, ratePct1 } from '../../lib/profit-estimate.js';
@@ -44,7 +46,7 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
   const fbH = !fb || !fb.ok ? 'FBA (JP) 販売可能 (読めない)' : `FBA (JP) 販売可能 (${hm(fb.asOf, nowMs)} 時点${fb.stale ? '・古い' : ''})`;
   const saWhen = !sa || !sa.ok ? '読めない' : `${dd(sa.asOf)} まで${sa.stale ? '・古い' : ''}`;
   const cols = [
-    ['商品コード', (r) => r.code],
+    ['商品コード', (r) => r.export_code ?? r.code],   // NE から来た商品 = NE の書き方 (read.mjs の mode 'all' が入れる)
     ['区分', (r) => KIND_LABELS[r.kind] || r.kind],
     ['構成品の数', (r) => (r.kind === 'set' ? r.comp_count : null)],
     ['名前', (r) => r.name],
@@ -69,6 +71,8 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
     [`売れた 30 日 (${saWhen})`, (r) => salesValue(r, 'd30')],
     ...(poOk ? [[!bo || !bo.ok ? '注文残 (発注アプリ 読めない)' : '注文残 (発注アプリ)', (r) => (r.backorder == null ? null : r.backorder)]] : []),
     ['対応が必要', (r) => (r.flags || []).join('・')],
+    // NE の書き方が決まらない商品 = 今のコードのまま出して理由を添える (確かめずに NE・ロジザードに上げないように。10/16 中原さん)
+    ['商品コードの注意', (r) => r.code_note || ''],
   ];
   const lines = [cols.map(([h]) => csvCell(h)).join(',')];
   for (const r of data.rows) lines.push(cols.map(([, f]) => csvCell(f(r))).join(','));
@@ -111,6 +115,8 @@ export function buildAmazonCsv(data, { mapStates = {}, channels = {} } = {}) {
     // ASIN・区分が出品 (夜間ロード)・手数料の写しに無く、Amazon の出品一覧 (前の夜の出品レポート) で埋めた行 = 「出品一覧」(10/16 中原さん)。前の列の並びは変えない (後ろに足す)
     ['ASIN の出どころ', (r) => (r.asin_from === 'report' ? '出品一覧' : r.asin_from === 'listing' ? '出品' : '')],
     ['区分の出どころ', (r) => (r.channel_from === 'report' ? '出品一覧' : r.channel_from === 'fees' ? '手数料' : '')],
+    // 構成の商品コード = NE から来た商品なら NE の書き方 (amazon-read.mjs の setExportComps)。決まらない構成品 = 今のコード + ここに理由 (10/16 中原さん。後ろに足す)
+    ['構成の商品コードの注意', (r) => r.comp_notes || ''],
   ];
   const lines = [cols.map(([h]) => csvCell(h)).join(',')];
   for (const r of data.rows) lines.push(cols.map(([, f]) => csvCell(f(r))).join(','));

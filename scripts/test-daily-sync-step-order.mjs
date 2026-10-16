@@ -135,4 +135,21 @@ await ta('[8] 新商品と要確認のまとめ (Company DB構想 22 の Q-4) = 
   assert.ok(entry.includes('「新商品と要確認のまとめ」が ⚠️ 読めない'), '台帳の runbook に無い');
 });
 
+await ta('[9] NE の商品コードの書き方 (10/16 中原さん) = ロジザードの影の直後にこの回の報告を読む (段ではない = results に足さない・新しい runScript なし)・まとめの最後 (ディスクの知らせの後・切り詰めの前) に足す・台帳に書いてある', async () => {
+  const iLz = first(LZ);
+  const iRead = body.indexOf('const lzCodeNotice = readLzCodeNotice({');
+  assert.ok(iRead > iLz && iRead < first(WATCH), 'ロジザードの影の後・見張りの前に読む');
+  assert.ok(body.slice(iLz - 200, iLz).includes('const lzDailyAsOf = toJstDate(new Date());'), 'as_of は影を流す前の JST の日付');
+  assert.match(body, /readLzCodeNotice\(\{ dataDir: process\.env\.DATA_DIR \|\| path\.join\(PROJECT_DIR, 'data'\), asOf: lzDailyAsOf, syncRunId: process\.env\.DAILY_SYNC_RUN_ID,/);
+  assert.equal(count('apps/master-decisions/lz-code-notice.mjs'), 0, '段 (runScript) にしない');
+  assert.ok(!/results\.push\([^)]*lzCodeNotice/.test(body), 'results に足さない = 見出し・retry は今のまま');
+  const iAdd = body.indexOf('if (lzCodeNotice.length > 0) msg += ');
+  const iDisk = body.indexOf('for (const w of diskWarnings) msg += ');
+  assert.ok(iDisk > 0 && iAdd > iDisk && iAdd < body.indexOf('const GCHAT_MAX = 3900;'), 'まとめの最後・切り詰めの前');
+  assert.match(ds, /\nimport \{ readLzCodeNotice \} from '\.\.\/master-decisions\/lz-code-notice\.mjs';\n/);
+  const reg = fs.readFileSync(path.join(ROOT, 'config/jobs-registry.mjs'), 'utf8');
+  const entry = reg.slice(reg.indexOf("id: 'warehouse-daily-sync'"), reg.indexOf("id: 'mf-daily-sync'"));
+  assert.ok(entry.includes('まとめの最後に「⚠️ NE の商品コードの書き方 N 件」') && entry.includes('「⚠️ NE の商品コードの書き方」が出た:'), '台帳に説明と runbook が無い');
+});
+
 console.log(`\n${passed} passed${process.exitCode ? ' (失敗あり)' : ''}`);

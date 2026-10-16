@@ -1696,6 +1696,53 @@ await ta('[16] ASIN が出品 (夜間ロード) に無い対応 = Amazon の出�
   assert.deepEqual([fr.asin, fr.asin_from, fr.report_fulfillment], [null, null, null], '出品一覧が無い = 埋めない');
 });
 
+await ta('[17] CSV の構成の商品コード = NE から来た商品なら NE の書き方 (10/16 中原さん・商品の一覧の CSV と同じ決まり): ok = NE の書き方 / 書き方が 2 つ・記録に無い = 今のコード + 最後の列「構成の商品コードの注意」/ 読めない = 1 つの注意 / 画面の一覧は今のまま', async () => {
+  const RD = await import('../apps/master-edit/amazon-read.mjs');
+  const NS = await import('../apps/master-edit/ne-spelling.mjs');
+  // 材料: 構成が 2 行以上ある対応 (NE から来た商品だけ)
+  const comps = await q(`select m.seller_sku, k.code, k.code_norm, c.qty, c.sort_order from core.amazon_sku_maps m join core.listing_components c on c.listing_id = m.listing_id
+      join core.skus k on k.sku_id = c.sku_id left join ops.master_registrations mr on mr.sku_id = k.sku_id
+     where m.state = 'active' and m.listing_id in (select listing_id from core.listing_components group by listing_id having count(*) >= 2)
+       and not exists (select 1 from core.listing_components c2 join ops.master_registrations mr2 on mr2.sku_id = c2.sku_id where c2.listing_id = m.listing_id and mr2.origin = 'new_entry')
+       and not exists (select 1 from core.listing_components c3 join core.skus k3 on k3.sku_id = c3.sku_id where c3.listing_id = m.listing_id and k3.code_norm !~ '^[a-z0-9_-]{1,30}$')
+     order by m.seller_sku, c.sort_order`);
+  assert.ok(comps.length >= 2, '材料: 構成が 2 行以上の対応');
+  const sku = comps[0].seller_sku;
+  const mine = comps.filter((x) => x.seller_sku === sku);
+  const [okC, colC] = mine;
+  assert.notEqual(okC.code_norm, colC.code_norm);
+  const rowOf = async (dbx = db) => (await asRole(E, 'master_edit', () => RD.listAmazonMapsAll(dbx, {}))).rows.find((x) => x.seller_sku === sku);
+  // NE の元のコードの記録がまだ無い = 今のコード + 「分からない」
+  let r = await rowOf();
+  const before = mine.map((x) => `${x.code}×${x.qty}`).join(', ');
+  assert.equal(r.comps, before);
+  assert.equal(r.comp_notes, mine.map((x) => `${x.code}: ${NS.SPELLING_NOTES.missing}`).join(' / '));
+  assert.ok(!('comp_list' in r), '材料の列は CSV に渡さない');
+  // 照合の回として入れる: 1 つ目 = ok (大文字の書き方)・2 つ目 = 書き方が 2 つ・ほかは記録に無い
+  await q(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300301T220100000Z_a5a5a5', '2030-03-01T22:01:00Z', 0)`);
+  await q('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: 'mc_20300301T220100000Z_a5a5a5', entries: [
+    { code_norm: okC.code_norm, kind: 'product', state: 'ok', ne_code: okC.code_norm.toUpperCase(), spellings: [okC.code_norm.toUpperCase()] },
+    { code_norm: colC.code_norm, kind: 'product', state: 'collided', ne_code: null, spellings: [colC.code_norm.toUpperCase(), colC.code_norm] },
+  ] })]);
+  r = await rowOf();
+  const want = mine.map((x, i) => `${i === 0 ? okC.code_norm.toUpperCase() : x.code}×${x.qty}`).join(', ');
+  assert.equal(r.comps, want);
+  assert.equal(r.comp_notes, mine.slice(1).map((x, i) => `${x.code}: ${i === 0 ? NS.SPELLING_NOTES.collided : NS.SPELLING_NOTES.missing}`).join(' / '));
+  // CSV: 構成の列は NE の書き方・新しい列は最後 (前の列の並びは変えない)
+  const csv = (await call('GET', '/amazon/list.csv')).text.split('\r\n');
+  const head = csv[0].slice(1, -1).split('","');
+  assert.deepEqual([head[0], head[2], head.at(-1)], ['seller SKU', '構成 (NE の商品 × 数)', '構成の商品コードの注意']);
+  const cells = csv.find((l) => l.startsWith(`"${sku}",`)).slice(1, -1).split('","');
+  assert.deepEqual([cells[2], cells.at(-1)], [want, r.comp_notes]);
+  // 画面の一覧は今のまま (core.skus.code)
+  const page = await call('GET', '/amazon/?q=' + encodeURIComponent(sku));
+  assert.ok(page.text.includes(okC.code) && !page.text.includes(okC.code_norm.toUpperCase() + '×'), '画面の一覧は変えない');
+  // NE の元のコードを読めない (関数の権限が無い) = 構成は今のまま・注意は 1 つ
+  const noFn = { query: (t, p) => (/has_function_privilege/.test(t) ? { rows: [{ ok: false }] } : db.query(t, p)) };
+  r = await rowOf(noFn);
+  assert.deepEqual([r.comps, r.comp_notes], [before, NS.SPELLING_NOTES.unreadable]);
+});
+
 server.close();
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n${passed} ok${process.exitCode ? ' (NG あり)' : ''}`);

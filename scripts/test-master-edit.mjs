@@ -2175,7 +2175,7 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   assert.equal(got.disp, `attachment; filename="master-list_20300110-1200.csv"; filename*=UTF-8''master-list_20300110-1200.csv`, 'ファイル名に日時 (日本の 1/10 12:00)');
   let t = table(got);
   assert.deepEqual(t[0], ['商品コード', '区分', '構成品の数', '名前', '状態', '登録の状態', '登録日', '売価', '原価', '原価は構成品から計算', '税率 (%)', '利益 (1 個あたり・参考・手数料 10%・円)', '利益率 (%)', '売上分類', '代表の仕入先コード', '代表の仕入先', 'JAN', '送料コード', '推奨月数',
-    '在庫 (ロジザード 読めない)', 'FBA (JP) 販売可能 (1/10 08:05 時点)', '売れた 7 日 (読めない)', '売れた 30 日 (読めない)', '対応が必要'], '注文残の列は発注アプリの権限が無い人には無い・読めない参考の値は見出しに「読めない」');
+    '在庫 (ロジザード 読めない)', 'FBA (JP) 販売可能 (1/10 08:05 時点)', '売れた 7 日 (読めない)', '売れた 30 日 (読めない)', '対応が必要', '商品コードの注意'], '注文残の列は発注アプリの権限が無い人には無い・読めない参考の値は見出しに「読めない」');
   assert.deepEqual(t.slice(1).map((x) => x[0]), listOrder((await call('GET', '/?kind=single')).text), 'offset に関係なく絞った全件・一覧と同じ並び');
   const row = (code) => Object.fromEntries(t[0].map((h, i) => [h, t.find((x) => x[0] === code)[i]]));
   {
@@ -2212,7 +2212,8 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   // 注文残 = 発注アプリの利用権がある人だけ (admin = 全部のアプリ)
   t = table(await raw('/list.csv?kind=single', 'admin'));
   assert.ok(t[0].includes('注文残 (発注アプリ 読めない)') || t[0].includes('注文残 (発注アプリ)'), t[0].join('|'));
-  assert.equal(t[0].indexOf('対応が必要'), t[0].length - 1);
+  assert.equal(t[0].indexOf('対応が必要'), t[0].length - 2);
+  assert.equal(t[0].indexOf('商品コードの注意'), t[0].length - 1, '新しい列は最後 (注文残の列があっても)');
   // 詳細検索の印 (?s=) でも出せる・並び (区分の順) も一覧と同じ
   const sr = await call('POST', '/api/search', { body: { codes: 'set001\ns002\ns001', sort: 'kind' } });
   assert.equal(sr.status, 200, sr.text);
@@ -2552,6 +2553,66 @@ await ta('[19] 大きめの見本 (#1627 Codex R1 M3 / Low): CSV・全部コピ�
   assert.ok(nSets >= 51, String(nSets));
   assert.match(pg3, new RegExp(`<span class="k">セット ${nSets} 件 \\(50 件を表示\\)</span>`), '数えた数 (表示の 50 件ではない)');
   assert.equal((pg3.match(/class="linkchip" href="[^"]*\/sku\/[^"]*" title=/g) || []).length, 50, '表示は 50 件まで');
+});
+
+await ta('[21] CSV の商品コード = NE から来た商品なら NE の書き方 (10/16 中原さん): ok = NE の書き方 / 書き方が 2 つ・使えない・記録に無い = 今のコード + 最後の列「商品コードの注意」/ 新商品の入口の商品 = 打った書き方 / 代表の名札 (rep) は使わない / 1,000 コードより多くても読む / 関数を使えない = 注意', async () => {
+  const raw = async (url) => Buffer.from(await (await fetch(BASE + url, { headers: { 'x-test-session': 'editor' } })).arrayBuffer());
+  const table = (buf) => buf.subarray(3).toString('utf8').slice(0, -2).split('\r\n').map((line) => [...line.matchAll(/"((?:[^"]|"")*)"(?:,|$)/g)].map((m) => m[1].replace(/""/g, '"')));
+  const byCode = (t) => Object.fromEntries(t.slice(1).map((x) => [x[0], x[t[0].indexOf('商品コードの注意')]]));
+  const lastBulk = (await q("select code_norm from core.skus where code like 'bulk%' order by code_norm desc limit 1"))[0].code_norm;
+  const nBulk = Number((await q("select count(*)::int as n from core.skus where sku_kind = 'exception'"))[0].n);
+  assert.ok(nBulk > 1000, `1,000 コードより多い材料 (${nBulk})`);
+  // NE の元のコード (0041) を照合の回として入れる (書くのは照合 = 持ち主の関数)
+  await q(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T220100000Z_c5c5c5', '2030-01-10T22:01:00Z', 0)`);
+  await q('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: 'mc_20300110T220100000Z_c5c5c5', entries: [
+    { code_norm: 's001', kind: 'product', state: 'ok', ne_code: 'S001', spellings: ['S001'] },
+    { code_norm: 's002', kind: 'product', state: 'collided', ne_code: null, spellings: ['S002', 's002'] },
+    { code_norm: 's003', kind: 'product', state: 'invalid', ne_code: null, spellings: ['s003'] },
+    { code_norm: 's004', kind: 'product', state: 'ok', ne_code: 'S004', spellings: ['S004'] },
+    { code_norm: 's006', kind: 'rep', state: 'ok', ne_code: 'S006', spellings: ['S006'] },   // 代表の名札 = 商品のコードには使わない
+    { code_norm: lastBulk, kind: 'product', state: 'ok', ne_code: lastBulk.toUpperCase(), spellings: [lastBulk.toUpperCase()] },
+  ] })]);
+  // s004 = 新商品の入口で作った商品 (登録の始まり new_entry)。出どころは関数でも変えられない = 試験だけ守りの trigger を外して置く
+  const s004 = (await q("select sku_id from core.skus where code = 's004'"))[0].sku_id;
+  await pg.query('begin');
+  await pg.query('alter table ops.master_registrations disable trigger trg_master_registrations_guard');
+  await pg.query("update ops.master_registrations set origin = 'new_entry' where sku_id = $1", [s004]);
+  await pg.query('alter table ops.master_registrations enable trigger trg_master_registrations_guard');
+  await pg.query('commit');
+  let t = table(await raw('/list.csv?codes=' + encodeURIComponent('s001\ns002\ns003\ns004\ns005\ns006')));
+  assert.equal(t[0].at(-1), '商品コードの注意', '新しい列は最後');
+  assert.equal(t[0][0], '商品コード', '前の列の並びは変えない');
+  assert.deepEqual(byCode(t), {
+    S001: '',   // ok = NE の書き方
+    s002: 'NE に大文字・小文字だけ違う書き方が 2 つ以上 (NE の書き方が決まらない)',
+    s003: 'NE の書き方が使えない (使えない文字・壊れた記録)',
+    s004: '',   // 新商品の入口の商品 = 打った書き方 (NE の記録が ok でも変えない)
+    s005: 'NE の書き方が分からない (NE の元のコードの記録に無い)',
+    s006: 'NE の書き方が分からない (NE の元のコードの記録に無い)',   // rep の ok は使わない
+  });
+  // 画面の一覧・全部のコードは今のまま (core.skus.code)
+  const j = (await call('GET', '/api/codes?codes=' + encodeURIComponent('s001\ns002'))).j;
+  assert.deepEqual(j.codes, ['s001', 's002']);
+  // 例外の見本 (1,500 件) は新商品の入口の関数で作った商品 (new_entry) = NE の記録が ok でも打った書き方のまま・注意なし
+  t = table(await raw('/list.csv?kind=exception'));
+  assert.equal(t.length - 1, nBulk);
+  assert.deepEqual([byCode(t)[lastBulk], byCode(t)[lastBulk.toUpperCase()]], ['', undefined]);
+  // 1,000 コードより多くても全部の塊を読む (関数は 1 回 1,000 コードまで・画面のロールで)
+  const N = await import('../apps/master-edit/ne-spelling.mjs');
+  const allBulk = (await q("select code_norm from core.skus where code like 'bulk%' order by code_norm")).map((x) => x.code_norm);
+  await pg.query('set role master_edit');
+  let many;
+  try { many = await N.readNeSpellings(db, [...allBulk, 's001', 's001']); } finally { await pg.query('set role deploy'); }
+  assert.deepEqual([...many].sort(), [['s001', { state: 'ok', ne_code: 'S001' }], [lastBulk, { state: 'ok', ne_code: lastBulk.toUpperCase() }]].sort(), `コード順で最後の ${lastBulk} (1,001 個目より後) も読む`);
+  // 関数を使えない (0053 の前・権限なし) = 今のコード + 「読めない」の注意 (書き方を推測しない)
+  const noFn = { query: (sql, p) => (/has_function_privilege/.test(sql) ? { rows: [{ ok: false }] } : db.query(sql, p)) };
+  const spell = await N.readNeSpellings(noFn, ['s001']);
+  assert.equal(spell, null);
+  assert.deepEqual(N.exportCode({ code: 's001', code_norm: 's001', origin: 'backfill' }, spell), { code: 's001', note: N.SPELLING_NOTES.unreadable });
+  assert.deepEqual(N.exportCode({ code: 's001', code_norm: 's001', origin: 'new_entry' }, spell), { code: 's001', note: '' });
+  // ok でも小文字にすると別のコード = 使わない (0041 の CHECK と同じ向き)
+  assert.deepEqual(N.exportCode({ code: 's001', code_norm: 's001', origin: null }, new Map([['s001', { state: 'ok', ne_code: 'S0011' }]])), { code: 's001', note: N.SPELLING_NOTES.invalid });
+  assert.deepEqual(await N.readNeSpellings(noFn, []), new Map(), 'コードが無い = 何も読まない');
 });
 
 server.close();

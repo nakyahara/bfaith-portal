@@ -13,6 +13,7 @@ import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage,
 import { stockOf } from './extras.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
 import { readReportLoad } from './amazon-unlinked.mjs';
+import { readNeSpellings, exportCode, SPELLING_NOTES } from './ne-spelling.mjs';
 
 export { AMAZON_SKU_MAX_LEN };
 
@@ -66,8 +67,9 @@ function amazonWhere(f) {
  *   asin_from = 'listing' (出品) / 'report' (出品一覧で埋めた) / null。出品一覧に同じ正規化の SKU が 2 行あって ASIN が食い違う = 埋めない (どちらとも決めない)。
  *   区分も同じ決まりで出品一覧の FBA / FBM を report_fulfillment に出す (呼び手が fees の区分が無いときだけ使う)。
  *   🚨 停止中の出品も出品一覧に載る (ALL_DATA)。Amazon で削除した出品は載らない = 空のまま
+ * csv = CSV の回だけ、構成の行を 1 つずつ (コード・正規化・数・登録の始まり) comp_list に出す = 構成の商品コードを NE の書き方にそろえる材料 (setExportComps)
  */
-function amazonListSelect(reportParam) {
+function amazonListSelect(reportParam, { csv = false } = {}) {
   const rep = reportParam ? `left join lateral (
           select case when count(distinct r.asin) = 1 then min(r.asin) end as asin,
                  case when count(*) = count(r.fulfillment) and count(distinct r.fulfillment) = 1 then min(r.fulfillment) end as fulfillment
@@ -77,6 +79,9 @@ function amazonListSelect(reportParam) {
     : `ci.asin, case when ci.asin is not null then 'listing' end as asin_from, null::text as report_fulfillment`;
   return `select m.seller_sku, m.name, m.state, m.origin, ${TS('m.changed_at')} as changed_at, m.changed_by, m.listing_id::text as listing_id, ${asin},
         (select string_agg(k.code || '×' || c.qty, ', ' order by c.sort_order) from core.listing_components c join core.skus k on k.sku_id = c.sku_id where c.listing_id = m.listing_id) as comps
+        ${csv ? `, (select jsonb_agg(jsonb_build_object('code', k.code, 'norm', k.code_norm, 'qty', c.qty::text, 'origin', mr.origin) order by c.sort_order)
+             from core.listing_components c join core.skus k on k.sku_id = c.sku_id left join ops.master_registrations mr on mr.sku_id = k.sku_id
+            where c.listing_id = m.listing_id) as comp_list` : ''}
       from core.amazon_sku_maps m join core.listings l on l.listing_id = m.listing_id left join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id ${rep}`;
 }
 /** 出品一覧の今の取り込みの load_id (読めない・無い = null = 使わない・投げない)。古くても ASIN は使う (ASIN は出品の間は変わらない) */
@@ -126,12 +131,36 @@ export async function listAmazonMapsAll(db, filters, { channels = null, max = AM
   if (loadId) params.push(loadId);
   const repP = loadId ? params.length : null;
   params.push(max + 1);
-  const rows = (await db.query(`${amazonListSelect(repP)}
+  const rows = (await db.query(`${amazonListSelect(repP, { csv: true })}
      where ${where}
      order by m.seller_sku limit $${params.length}`, params)).rows;
   if (rows.length > max) return { rows: [], total: rows.length, max, filters: f, tableMissing: false, tooMany: true, atLeast: true };
   setChannels(rows, channels);
+  await setExportComps(db, rows);
   return { rows, total, max, filters: f, tableMissing: false };
+}
+/**
+ * CSV の構成 (NE の商品 × 数) の商品コードを、NE から来た商品なら NE の書き方にする (10/16 中原さん・商品の一覧の CSV と同じ決まり = ne-spelling.mjs)。
+ * 決まらない構成品 = 今のコードのまま + comp_notes (CSV の最後の列「構成の商品コードの注意」)。NE の元のコードを読めない = 1 つの注意だけ (構成品ごとに並べない)
+ */
+async function setExportComps(db, rows) {
+  const norms = rows.flatMap((r) => (Array.isArray(r.comp_list) ? r.comp_list : []).filter((c) => c.origin !== 'new_entry').map((c) => c.norm));
+  const spell = await readNeSpellings(db, norms);
+  for (const r of rows) {
+    const list = Array.isArray(r.comp_list) ? r.comp_list : null;
+    delete r.comp_list;
+    r.comp_notes = '';
+    if (!list || !list.length) continue;
+    const notes = [];
+    let unreadable = false;
+    r.comps = list.map((c) => {
+      const x = exportCode({ code: c.code, code_norm: c.norm, origin: c.origin ?? null }, spell);
+      if (x.note === SPELLING_NOTES.unreadable) unreadable = true;
+      else if (x.note) notes.push(`${x.code}: ${x.note}`);
+      return `${x.code}×${c.qty}`;
+    }).join(', ');
+    r.comp_notes = unreadable ? SPELLING_NOTES.unreadable : notes.join(' / ');
+  }
 }
 
 /** 1 つの seller SKU の画面。対応が無くても、Company DB の出品と今の構成 (夜間ロードの写し) を見せる */
