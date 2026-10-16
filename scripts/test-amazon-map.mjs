@@ -968,6 +968,11 @@ await ta('[12] 一覧・1 つ・変更の記録・つかいかた・末尾の / 
     r = await call('GET', '/amazon/');
     assert.ok(r.text.includes('id="csv-link" aria-disabled="true"'));
   } finally { __setExportLimits(null); }
+  // 数えた後に増えた (Codex R1 P2) = 読むのも max + 1 件で切って tooMany (数えた件数が 0 でも上限を超えて出さない)
+  const { listAmazonMapsAll } = await import('../apps/master-edit/amazon-read.mjs');
+  const staleCount = { query: (t, p) => (/^select count\(\*\)::int as n from core\.amazon_sku_maps/.test(t) ? { rows: [{ n: 0 }] } : db.query(t, p)) };
+  const raced = await listAmazonMapsAll(staleCount, {}, { max: 1 });
+  assert.equal(raced.tooMany, true); assert.equal(raced.atLeast, true); assert.equal(raced.rows.length, 0);
   r = await call('GET', '/amazon/sku?sku=PR_A001');
   assert.equal(r.status, 200);
   const amzJs = (await checkScripts(r.text, 0)).find((x) => x.includes('me-amazon.js — Amazon SKU の対応')) || '';

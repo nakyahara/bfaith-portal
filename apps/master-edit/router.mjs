@@ -1355,7 +1355,7 @@ router.get('/amazon/list.csv', (req, res) => {
       throw e;
     }
     if (data.tableMissing) return text(503, 'Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)');
-    if (data.tooMany) return text(413, `${data.total.toLocaleString('ja-JP')} 件あります。CSV は ${data.max.toLocaleString('ja-JP')} 件までです。絞ってから出してください`);
+    if (data.tooMany) return text(413, `${tooManyWords(data, 'CSV ')}出してください`);
     const body = buildAmazonCsv(data, { mapStates: MAP_STATES, channels: CHANNELS });
     const name = amazonCsvFileName(clock());
     res.set('Content-Type', 'text/csv; charset=utf-8');

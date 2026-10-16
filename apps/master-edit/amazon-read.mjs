@@ -86,9 +86,12 @@ export async function listAmazonMapsAll(db, filters, { channels = null, max = AM
   const { where, params } = amazonWhere(f);
   const total = Number((await db.query(`select count(*)::int as n from core.amazon_sku_maps m where ${where}`, params)).rows[0].n);
   if (total > max) return { rows: [], total, max, filters: f, tableMissing: false, tooMany: true };
+  // 数えた後に増えた (別の保存・移行) ときも上限を超えて読まない = 読むのも max + 1 件で切る (Codex R1 P2)
+  params.push(max + 1);
   const rows = (await db.query(`${AMAZON_LIST_SELECT}
      where ${where}
-     order by m.seller_sku`, params)).rows;
+     order by m.seller_sku limit $${params.length}`, params)).rows;
+  if (rows.length > max) return { rows: [], total: rows.length, max, filters: f, tableMissing: false, tooMany: true, atLeast: true };
   for (const r of rows) r.channel = channels ? (channels.get(normSku(r.seller_sku)) ?? null) : null;
   return { rows, total, max, filters: f, tableMissing: false };
 }
