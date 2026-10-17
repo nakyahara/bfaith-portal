@@ -2985,6 +2985,13 @@ await ta('[71] 前へ・次へ (10/17): 来た一覧 (同じ絞り込み・並�
     assert.match(p.url(), new RegExp(`sku/${byName[i]}$`), `${i + 1} 番目`);
     assert.equal((await pnState(p)).pos, `${i + 1} / ${byName.length}`);
   }
+  // 在庫 (ロジザードの写し) で並べた一覧・在庫で絞った一覧でも同じ並び (写しが読める = この試験の見本)
+  for (const qs of ['sort=stock&dir=desc', 'stock_min=1&sort=stock']) {
+    const sc = await codesFor(p, '?' + qs);
+    assert.ok(sc.length >= 2, qs);
+    const got = await p.evaluate((u) => fetch(u).then((r) => r.json()), `${B}/api/neighbors?${qs}&cur=${encodeURIComponent(sc[1])}`);
+    assert.deepEqual(got, { ok: true, total: sc.length, pos: 2, prev: sc[0], next: sc[2] ?? null, offset: 0 }, qs);
+  }
   // パンくずの戻り先 = この商品が載る一覧のページ (覚えた一覧が 2 ページ目でも、商品が 1 ページ目にあれば offset を外す)
   await p.evaluate((base) => sessionStorage.setItem('master-edit:list-url', base + '/?kind=single&offset=100'), new URL(B).pathname);
   await p.goto(B + '/sku/s002');

@@ -736,6 +736,11 @@ router.get('/api/neighbors', (req, res) => {
   try {
     // 在庫の範囲・注文残あり・在庫の並びは、一覧と同じ参考の値で絞る・並べる (全部コピーと同じ)
     const extras = filters.stock_min || filters.stock_max || filters.po || filters.sort === 'stock' ? await listExtras(tdb, poOk, deadline) : {};
+    // 絞る・並べるのに要る参考の値が今は読めない = 一覧で見た並びと違うかもしれない (在庫順 → コード順など) = 前後を出さない (Codex R1 Medium)
+    const needStock = !!(filters.stock_min || filters.stock_max || filters.sort === 'stock');
+    if ((needStock && !(extras.stock && extras.stock.ok)) || (filters.po && !(extras.backorders && extras.backorders.ok))) {
+      return res.status(503).json({ ok: false, error: '在庫・注文残を読めないので、一覧と同じ並びを出せません', reason: 'extras_unreadable' });
+    }
     data = await listNeighbors(tdb, filters, cur, { now: new Date(clock()), extras, max: EXPORT_LIMITS.max, deadline });
   } catch (e) {
     if (e instanceof ListTimeoutError || isStatementTimeout(e)) return res.status(503).json({ ok: false, error: '時間がかかりすぎました', reason: 'timeout' });

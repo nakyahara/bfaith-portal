@@ -2715,6 +2715,11 @@ await ta('[22] 1 つの商品の画面の「← 前へ」「次へ →」(10/17 
   // つながらない = 503
   factoryMode = 'down';
   try { assert.equal((await nb('kind=single', 's002')).status, 503); } finally { factoryMode = 'ok'; }
+  // 在庫で並べる・在庫で絞るのに在庫 (ロジザードの写し) が読めない (この試験の DATA_DIR には無い) = 一覧と同じ並びか分からない = 503 (出さない。Codex R1 Medium)
+  for (const qs of ['sort=stock', 'stock_min=0', 'kind=single&stock_max=5']) {
+    r = await nb(qs, 's002');
+    assert.deepEqual([r.status, r.j.reason], [503, 'extras_unreadable'], qs);
+  }
   // 読む関数 (read.mjs) を直接: 並べる列が JS (利益) でも一覧の 'codes' と同じ
   const all = (await R.listSkus(db, { sort: 'profit' }, { now: NOW, mode: 'codes' })).codes;
   const mid = Math.floor(all.length / 2);
