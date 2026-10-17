@@ -497,6 +497,24 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
 }
 
 /**
+ * 1 つの商品の画面の「← 前へ」「次へ →」(10/17 中原さん): 来た一覧 (同じ絞り込み・詳細検索・印 ?s=・並び) の中で、この商品の前と次の商品。
+ * 一覧と同じ listSkus の 'codes' (絞った全件のコードだけ・一覧と同じ並び = 既定のコード順・同じ値はコード順・JS で並べる列も同じ) を読み、その中の場所を探す。
+ * 中身 (② の読み) は読まない = 軽い。ページ分け (offset) は見ない。
+ * 戻り値: { ok: true, total, pos (1 から・一覧に無い = null), prev, next (コード・端 = null), offset (この商品が載る一覧のページの offset・無い = null) } /
+ *   { ok: false, reason: 'too_many', total, atLeast } (件数の上限を超える = ボタンを出さない)
+ */
+export async function listNeighbors(db, filters, code, opts = {}) {
+  const data = await listSkus(db, filters, { ...opts, mode: 'codes' });
+  if (data.tooMany) return { ok: false, reason: 'too_many', total: data.total, atLeast: !!data.atLeast };
+  const codes = data.codes;
+  // 画面が送るのは DB のコードそのもの。打ち方が違う (大文字・全角) ときは正規化して探す
+  let i = codes.indexOf(String(code ?? ''));
+  if (i < 0) { const k = normSku(code); i = k ? codes.findIndex((c) => normSku(c) === k) : -1; }
+  if (i < 0) return { ok: true, total: codes.length, pos: null, prev: null, next: null, offset: null };
+  return { ok: true, total: codes.length, pos: i + 1, prev: i > 0 ? codes[i - 1] : null, next: i + 1 < codes.length ? codes[i + 1] : null, offset: Math.floor(i / LIST_LIMIT) * LIST_LIMIT };
+}
+
+/**
  * 一覧の札の数 (会社全体・絞り込みとは別。1 回の集計)。売上分類の未入力はセットを JS で導くので数えない (札は数なしで出す)。
  * 表が無い DB (0052 の前など) の札は null (= 数を出さない)
  * 🚨 その日の原価は SKU ごとの lateral (costAsOfJoin) にしない = sku_costs を SKU の数だけ走査する (#1589 Codex R1 M1)。
