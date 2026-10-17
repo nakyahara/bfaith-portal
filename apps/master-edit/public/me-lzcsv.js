@@ -136,6 +136,8 @@
       cell.appendChild(top);
       if (s && s.downloads) cell.appendChild(el('div', { cls: 'hint', 'data-bc-dl': s.downloads, text: 'ダウンロード ' + s.downloads + ' 回' }));
       if (!CAN || e.state !== 'issued') return;
+      // 取り込めたか分からない回は、その CSV の行でも記せる (下の③に出るのは最後の回だけ。Codex R1 Medium)
+      if (s && s.unresolved_job) cell.appendChild(resolveForm({ job_id: s.unresolved_job }, 'cell'));
       if (s && s.active_job) {
         if (S.active && (S.active.state === 'queued' || S.active.state === 'claimed') && !S.active.cancel_requested) {
           cell.appendChild(el('button', { cls: 'btn sm ghost', type: 'button', 'data-bc-cancel': S.active.job_id, text: 'やめる', on: { click: function () { cancel(S.active.job_id); } } }));
@@ -226,12 +228,15 @@
     if (j.log) kids.push(el('details', null, [el('summary', { text: 'ログ' }), el('pre', { cls: 'mono', 'data-bc-log': j.job_id, style: 'white-space:pre-wrap;max-height:320px;overflow:auto', text: j.log })]));
     return el('div', { cls: 'callout ' + (j.state === 'imported' ? 'ok' : j.state === 'unknown' || j.state === 'import_error' ? 'warn' : 'info'), id: 'lzc-bc-job' }, [el('div', { cls: 'grow' }, kids)]);
   }
-  function resolveForm(j) {
+  var resolveForms = {};   // 読み直しで作り直さない (打ちかけのメモ・選んだものを保つ)
+  function resolveForm(j, where) {
+    var key = (where || 'panel') + ':' + j.job_id;
+    if (resolveForms[key]) return resolveForms[key];
     var note = el('textarea', { rows: '2', maxlength: '200', placeholder: 'ロジザードのインポート履歴で見たこと (日時・ファイル名・件数など。4〜200 字)', style: 'width:100%' });
-    var r1 = el('input', { type: 'radio', name: 'bc-res-' + j.job_id, value: 'imported' });
-    var r2 = el('input', { type: 'radio', name: 'bc-res-' + j.job_id, value: 'not_imported' });
+    var r1 = el('input', { type: 'radio', name: 'bc-res-' + key, value: 'imported' });
+    var r2 = el('input', { type: 'radio', name: 'bc-res-' + key, value: 'not_imported' });
     var line = el('div', { cls: 'msgline', role: 'status' });
-    var go = el('button', { cls: 'btn sm', type: 'button', 'data-bc-resolve': j.job_id, text: '確かめたことを記す' });
+    var go = el('button', { cls: 'btn sm', type: 'button', 'data-bc-resolve': where === 'cell' ? null : j.job_id, 'data-bc-resolve-cellbtn': where === 'cell' ? j.job_id : null, text: '確かめたことを記す' });
     go.addEventListener('click', function () {
       var outcome = r1.checked ? 'imported' : r2.checked ? 'not_imported' : null;
       if (!outcome) { line.textContent = '「取り込んだ」か「取り込んでいない」を選んでください'; return; }
@@ -240,10 +245,12 @@
         msg('取り込み #' + j.job_id + ' に記しました', 'ok'); poll(true);
       }).catch(function () { line.textContent = '通信できませんでした'; });
     });
-    return el('div', { 'data-bc-resolve-form': j.job_id }, [
-      el('div', { cls: 'hint', text: 'ロジザードの「インポート履歴」でこの時刻の取込 (logizard_bc_upload.csv) を見て記してください。記すまで、この CSV は取り込み直せません。' }),
+    var box = el('div', where === 'cell' ? { 'data-bc-resolve-cell': j.job_id } : { 'data-bc-resolve-form': j.job_id }, [
+      el('div', { cls: 'hint', text: '取り込み #' + j.job_id + ': ロジザードの「インポート履歴」でこの時刻の取込 (logizard_bc_upload.csv) を見て記してください。記すまで、この CSV は取り込み直せません。' }),
       el('label', null, [r1, ' 取り込んだ']), ' ', el('label', null, [r2, ' 取り込んでいない']), note, go, line,
     ]);
+    resolveForms[key] = box;
+    return box;
   }
   function renderPanel() {
     var rn = $('#lzc-bc-runner');

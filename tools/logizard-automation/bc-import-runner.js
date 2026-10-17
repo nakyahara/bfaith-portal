@@ -90,13 +90,17 @@ export function verifyJobFile(buf, job, claimSha) {
 }
 
 /** 終わりの知らせを送る (届かない = pending に残す)。送れた / 送り直さなくてよい (形の断り) = true */
-async function sendFinal(client, pendingDir, jobId, body, { tries = 3, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = console.log } = {}) {
+async function sendFinal(client, pendingDir, jobId, body0, { tries = 3, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = console.log } = {}) {
+  let body = body0;
+  let shrunk = false;
   for (let i = 1; i <= tries; i++) {
     try {
       const r = await client.final(jobId, body);
       log(`📨 終わりを知らせた (#${jobId} → ${r.state}${r.already ? '・もう書いてあった' : ''})`);
       return true;
     } catch (e) {
+      // 本文が大きすぎる = ログを短くして送り直す (日本語のログは文字の数より byte が多い。Codex R1 Medium)
+      if (e && e.status === 413 && !shrunk && body.log) { shrunk = true; body = { ...body, log: tailBytes(body.log, 2000) }; log(`⚠ 終わりの知らせが大きすぎる (#${jobId}) → ログを短くして送り直す`); i--; continue; }
       // 鍵が違う・その回が無い = 送り直しても同じ (残さない)
       if (e && (e.status === 403 || e.status === 404 || e.status === 400)) { log(`⚠ 終わりの知らせを断られた (#${jobId}・${e.code}: ${e.message})`); return true; }
       log(`⚠ 終わりの知らせが届かない (#${jobId}・${i}/${tries}・${e && e.message})`);
@@ -135,7 +139,15 @@ function captureConsole() {
   const orig = { log: console.log, error: console.error, warn: console.warn };
   const tee = (k) => (...a) => { lines.push(a.map((x) => (typeof x === 'string' ? x : x instanceof Error ? x.message : JSON.stringify(x))).join(' ')); orig[k](...a); };
   console.log = tee('log'); console.error = tee('error'); console.warn = tee('warn');
-  return { text: () => lines.join('\n').slice(-60000), restore: () => Object.assign(console, orig) };
+  return { text: () => tailBytes(lines.join('\n'), LOG_BYTES), restore: () => Object.assign(console, orig) };
+}
+/** ポータルに送るログの上限 (UTF-8 の byte・機械の口の本文の上限 256KB より十分小さく) */
+export const LOG_BYTES = 24 * 1024;
+/** 後ろの max byte を残す (文字の途中で切らない) */
+export function tailBytes(s, max) {
+  const b = Buffer.from(String(s || ''), 'utf8');
+  if (b.length <= max) return String(s || '');
+  return '…(前は省いた)\n' + b.subarray(b.length - max).toString('utf8').replace(/^\uFFFD+/, '');
 }
 
 /**
@@ -146,7 +158,7 @@ function captureConsole() {
  * @param {string} p.workDir  ファイルを置く所 (このフォルダの work\bc-import)
  * @param {() => string | null} p.localBusy  取らない理由 (null = 取ってよい)
  * @param {(job) => string | null} [p.afterClaimCheck]  取った後・押す前の確かめ (ブラウザでロジザードが開いている・② の保存先が無い など)。理由 = 押さない
- * @param {(o: { csvPath, withExport, beforeExecute, onImported }) => Promise<{ export: object | null }>} p.session  ロジザード (① ②)
+ * @param {(o: { csvPath, withExport, beforeExecute, onImported, pressGuard }) => Promise<{ export: object | null }>} p.session  ロジザード (① ②)
  * @param {{ read: () => object, record: (info) => void }} p.imported  この PC の取込済みの記録 (logs\barcode_imported.json の import1)
  */
 export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCheck = () => null, session, imported, runnerId = 'minipc', now = () => Date.now(), log = console.log, sleep, onExitHook = (f) => process.once('exit', f), offExitHook = (f) => process.removeListener('exit', f) }) {
@@ -163,6 +175,14 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
   const token = r.claim_token;
   const body = { claim_token: token, executed: false, import_result: null, export_result: null, reason: null, detail: null, log: '' };
   let finalSent = false;
+  // 「押す」の後に押してよい間 (ポータルの press_window_ms・この PC の時計で数える)。過ぎたら実行ボタン・始める確認の OK を押さない (Codex R1 High)
+  let pressUntil = null;
+  const pressGuard = (where) => {
+    if (pressUntil == null) return 30000;
+    const left = pressUntil - now();
+    if (left <= 0) { const e = new Error(`${where}: 「押す」から押してよい間を過ぎた (押さない)`); e.pressStop = true; throw e; }
+    return left;
+  };
   const cap = captureConsole();
   // 途中で process が終わった (共通部品の process.exit など) = 終わりの知らせを残す (押したかどうかもそのまま・次の回が送る)
   const onExit = () => {
@@ -189,16 +209,24 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
     fs.writeFileSync(csvPath, buf, { flag: 'wx' });
     if (sha256(fs.readFileSync(csvPath)) !== job.file_sha256) { const e = new Error('置いたファイルの sha256 が違う'); e.code = 'file_check'; throw e; }
     const out = await session({
-      csvPath, withExport: !!job.with_export,
+      csvPath, withExport: !!job.with_export, pressGuard,
       beforeExecute: async () => {
-        await client.executing(job.job_id, token);   // 断られた・届かない = 例外 = 押さない
+        const t0 = now();
+        const x = await client.executing(job.job_id, token);   // 断られた・届かない = 例外 = 押さない
+        pressUntil = t0 + Math.max(10e3, Math.min(Number(x && x.press_window_ms) || 90e3, 120e3)) - 5e3;   // 送る前の時刻から数える (応答が遅れた分も使ったことにする)
         body.executed = true;
         console.log('📨 ポータルに「押す」を知らせた → 実行ボタンを押します');
       },
       onImported: async (imp) => {
+        pressUntil = null;   // ① の押すのは終わり (② は夜の止めだけで押す)
         body.import_result = { status: 'ok', summary: imp.summary || null, counts: imp.counts || null };
         try { imported.record({ sha256: job.file_sha256, path: csvPath, importedAt: new Date(now() + 9 * 3600e3).toISOString().replace('T', ' ').slice(0, 16) + ' (JST)', via: 'portal', job_id: job.job_id }); } catch (e) { console.log(`⚠ 取込済みの記録を残せない (${e.message})`); }
-        try { await client.reportImport(job.job_id, { claim_token: token, import_result: body.import_result, log: cap.text() }); } catch (e) { console.log(`⚠ ① の結果の知らせが届かない (終わりの知らせで送る): ${e && e.message}`); }
+        let portal = null;
+        try { portal = await client.reportImport(job.job_id, { claim_token: token, import_result: body.import_result, log: cap.text() }); } catch (e) { console.log(`⚠ ① の結果の知らせが届かない (終わりの知らせで送る): ${e && e.message}`); }
+        // 件数が合わない (エラー件数 0・総件数 = 行数 でない) = ② はしない (ポータルの決まりと同じ・ポータルが ② に進めと言わないときも。Codex R1 Medium)
+        const c = imp.counts || {};
+        if (!(c.errors === 0 && c.total === job.rows)) { const e = new Error(`① の結果の件数が合わない (総件数 ${c.total ?? '読めない'}・エラー件数 ${c.errors ?? '読めない'}・CSV ${job.rows} 行)。② はしない`); e.code = 'count_mismatch'; throw e; }
+        if (job.with_export && portal && portal.state !== 'exporting') { const e = new Error(`ポータルが ② に進めと言わない (状態 ${portal.state})。② はしない`); e.code = 'portal_stop'; throw e; }
       },
     });
     if (!body.import_result) throw new Error('① の結果が無いまま終わった');
@@ -212,6 +240,9 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
     if (!body.executed) {
       body.reason = e && e.nightBlock ? 'night' : (e && typeof e.code === 'string' && /^[a-z_]{2,40}$/.test(e.code) ? e.code : 'failed_before_execute');
       body.detail = `押す前に止めた (取り込んでいない): ${msg}`;
+    } else if (body.import_result && e && (e.code === 'count_mismatch' || e.code === 'portal_stop')) {
+      body.export_result = { status: 'skipped', rows: null, detail: msg };
+      body.detail = msg;
     } else if (body.import_result) {
       body.export_result = { status: 'failed', rows: null, detail: msg };
       body.detail = `② で止まった: ${msg}`;
@@ -307,7 +338,7 @@ async function main() {
     if (lockWhy) return lockWhy;
     return null;
   };
-  const session = async ({ csvPath, withExport, beforeExecute, onImported }) => {
+  const session = async ({ csvPath, withExport, beforeExecute, onImported, pressGuard }) => {
     common.assertNoLogizardBrowserOpen();   // 開いている = その場で終わる (押していない・終わりの知らせは pending に残る)
     common.acquireLock();   // 共通の鍵 (毎晩の取込・在庫・値札と同じ)。取れない = その場で終わる (押していない)
     const releaseOnExit = () => { try { common.releaseLock(); } catch { /* */ } };
@@ -315,7 +346,7 @@ async function main() {
     try {
       const { browser, page } = await common.launchBrowser({ headless });
       try {
-        const steps = createBarcodeSteps({ page, dry: false, cfg, beforeExecute });
+        const steps = createBarcodeSteps({ page, dry: false, cfg, beforeExecute, pressGuard });
         const loginOpts = () => ({ label: 'ボタンの取込 (共通アカウント)', beforeSubmit: () => mode.clickBudgetMs('ログインのボタンの前') });
         const withRelogin = makeWithRelogin({ page, loginOpts });
         mode.assertOutsideNightBlock('ログインの前');

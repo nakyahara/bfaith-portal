@@ -310,7 +310,7 @@ await ta('[S5] 動いているのは 1 つだけ (表の索引で)・出来事�
   assert.throws(() => u.prepare('delete from bc_events').run(), /追記だけ/);
 });
 
-await ta('[S6] 取り消し: 動いている・分からない・取り込んだ = 断る / エラーのあった回は取り消せる / 分からない回を記す (取り込んだ = 断る)', async () => {
+await ta('[S6] 取り消し: 動いている・分からない・取り込んだ・エラーのあった回 (一部入った見込み) = 断る / 分からない回を記す / 取り消しの途中 = 積む・渡す・押すを断る / 積んだ CSV はダウンロードさせない', async () => {
   const u = U(); alive(u);
   const a = BC.enqueue(u, base());
   assert.equal(BC.voidBlock(u, '7', jst('10:00')).code, 'import_running');
@@ -324,13 +324,35 @@ await ta('[S6] 取り消し: 動いている・分からない・取り込んだ
   BC.resolveJob(u, { jobId: a.job_id, outcome: 'imported', note: '履歴 10:00 logizard_bc_upload.csv 2 件', by: 'naka@test', now: jst('10:02') });
   assert.equal(BC.voidBlock(u, '7', jst('10:02')).code, 'imported', '取り込んだと記した = 取り消さない');
   assert.equal(err(() => BC.enqueue(u, base({ now: jst('10:03') }))).code, 'already_imported');
-  // エラーのあった回 (直して作り直す) = 取り消せる
+  // エラーのあった回 (2 件中 1 件は入った見込み) = 取り消さない (Codex R1 High)。前に成功した回の後のもう一度がエラーでも同じ
   const u2 = U(); alive(u2);
   const b = BC.enqueue(u2, base());
   const c2 = BC.claimJob(u2, { jobId: b.job_id, runnerId: 'pc', now: jst('10:00') });
   BC.markExecuting(u2, { jobId: b.job_id, claimToken: c2.claimToken, now: jst('10:00') });
   BC.reportFinal(u2, { jobId: b.job_id, claimToken: c2.claimToken, executed: true, importResult: { status: 'error', counts: { total: 2, errors: 1 } }, now: jst('10:01') });
-  assert.equal(BC.voidBlock(u2, '7', jst('10:02')), null);
+  assert.equal(BC.voidBlock(u2, '7', jst('10:02')).code, 'imported');
+  // 押す前に止まった回だけ = 取り消せる
+  const u3 = U(); alive(u3);
+  const d3 = BC.enqueue(u3, base());
+  BC.cancelJob(u3, { jobId: d3.job_id, by: 'naka@test', now: jst('10:00') });
+  assert.equal(BC.voidBlock(u3, '7', jst('10:00')), null);
+  // 取り消しの途中の印: 確かめと印は 1 つの取引 → 積む・押すを断る / 外すと積める
+  BC.reserveVoid(u3, { exportId: '7', by: 'naka@test', now: jst('10:00') });
+  assert.equal(err(() => BC.enqueue(u3, base({ now: jst('10:00') }))).code, 'voiding');
+  BC.releaseVoid(u3, '7');
+  const d4 = BC.enqueue(u3, base({ now: jst('10:00') }));
+  assert.equal(err(() => BC.reserveVoid(u3, { exportId: '7', by: 'naka@test', now: jst('10:00') })).code, 'import_running', '積んだ後は印を付けない');
+  const c4 = BC.claimJob(u3, { jobId: d4.job_id, runnerId: 'pc', now: jst('10:00') });
+  u3.prepare("insert into bc_void_holds (export_id, by, until) values ('7', 'x', ?)").run(jst('10:05'));   // (もしも) 取った後に印が付いた
+  assert.equal(err(() => BC.markExecuting(u3, { jobId: d4.job_id, claimToken: c4.claimToken, now: jst('10:01') })).code, 'voiding');
+  assert.equal(u3.prepare('select state from bc_jobs where job_id = ?').get(d4.job_id).state, 'not_executed');
+  u3.prepare("delete from bc_void_holds").run();
+  // 積んだ・取り込んでいる CSV はダウンロードさせない (手とボタンで 2 回取り込まない。Codex R1 High)
+  alive(u3, jst('10:02'));
+  BC.enqueue(u3, base({ now: jst('10:02'), exportId: '30' }));
+  assert.equal(err(() => BC.recordDownload(u3, { exportId: '30', by: 'naka@test', now: jst('10:02') })).code, 'import_running');
+  assert.equal(u3.prepare("select count(*) as n from bc_downloads where export_id = '30'").get().n, 0);
+  assert.doesNotThrow(() => BC.recordDownload(u3, { exportId: '31', by: 'naka@test', now: jst('10:02') }));
 });
 
 await ta('[S7] ロジザードの取込の状態の止め (lz-state.js): 鍵・取込の途中・確かめ待ち・手の取込 = 止める / 読めない = 止める / 初期化前・止めてある = 止めない', async () => {
@@ -435,7 +457,22 @@ await ta('[I2] 本物の流れ: 積む → 取る (帳面と同じ byte 列) →
   assert.deepEqual([r.status, r.j.reason], [409, 'downloaded']);
   r = await call('POST', `/api/lz-csv/${other.id}/import`, importBody(other, { confirm_not_manual: true, with_export: false }));
   assert.equal(r.status, 200, r.text);
+  // 積んだ後はダウンロードさせない (Codex R1 High)
+  const d2 = await fetch(`${ORIGIN}/apps/master-edit/lz-csv/${other.id}/file`);
+  assert.equal(d2.status, 409);
+  assert.equal((await d2.json()).reason, 'import_running');
   assert.equal((await call('POST', `/api/lz-csv/import/${r.j.job_id}/cancel`, {})).j.state, 'cancelled');
+  // 取り消し (押す前にやめた回だけ = 取り消せる) → 印は残って積めない (Company DB でも取り消し済み)
+  const vv = await newExport(1);
+  r = await call('POST', `/api/lz-csv/${vv.id}/void`, { reason: '試しの取り消し' });
+  assert.equal(r.status, 200, r.text);
+  r = await call('POST', `/api/lz-csv/${vv.id}/import`, importBody(vv));
+  assert.equal(r.status, 409);
+  // 取り消しが DB で断られた (理由なし) = 印を外す (積める)
+  const vw = await newExport(1);
+  r = await call('POST', `/api/lz-csv/${vw.id}/void`, { reason: '' });
+  assert.equal(r.status, 400, r.text);
+  assert.equal(BC.voidHeld(BC.getLzBcDb(), vw.id, NOW), false, '取り消せなかった = 印を外した');
   // 画面
   const page = await call('GET', '/lz-csv');
   for (const w of ['id="lzc-bc"', 'ロジザードへの取り込み (miniPC)', `data-bc-cell="${e.id}"`, 'id="lzc-manual"', 'id="lzc-gas"', 'me-lzcsv.js']) assert.ok(page.text.includes(w), `画面に「${w}」が無い`);
@@ -615,6 +652,34 @@ await ta('[R] miniPC の 1 回: 成功 / 押すを断られた = 押さない / 
   const pend = JSON.parse(fs.readFileSync(path.join(env.logDir, 'bc-import-pending', `job-${id}.json`), 'utf8'));
   assert.deepEqual([pend.body.executed, pend.body.reason], [true, 'process_exit']);
   assert.equal(jobRow(id).state, 'unknown', '本当の終わりの知らせ = 押した後に止まった');
+  // 「押す」の後に押してよい間 (ポータルの press_window_ms) を過ぎた = 押さない (止まった miniPC が後で押さない。Codex R1 High)
+  {
+    e = await newExport(1);
+    id = await queue(e);
+    let local = Date.now();
+    let seen = null;
+    out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit, now: () => local,
+      session: async (o) => {
+        assert.equal(o.pressGuard('ログインの前'), 30000, '「押す」の前は夜の止めの持ち時間だけ');
+        await o.beforeExecute();
+        seen = o.pressGuard('①の実行ボタンの前');
+        local += 90e3;   // ここで 90 秒止まった
+        o.pressGuard('①の確認の OK の前');
+      } });
+    assert.ok(seen > 80e3 && seen <= 85e3, String(seen));
+    assert.match(jobRow(id).detail, /押してよい間を過ぎた/);
+  }
+  // ① の件数が合わない = ② はしない (② は skipped・ポータルは import_error)
+  e = await newExport(1);
+  id = await queue(e);
+  let exported = false;
+  out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit,
+    session: async (o) => { await o.beforeExecute(); await o.onImported({ summary: '総件数 : 2 エラー件数 : 0', counts: { total: 2, errors: 0 } }); exported = true; return { export: { status: 'SUCCESS', rows: 1 } }; } });
+  assert.deepEqual([exported, jobRow(id).state, jobRow(id).export_state], [false, 'import_error', 'skipped']);
+  // ポータルに送るログは byte で切る (日本語でも本文の上限に入る)
+  const big = 'あ'.repeat(40000);
+  assert.ok(Buffer.byteLength(RUN.tailBytes(big, RUN.LOG_BYTES), 'utf8') <= RUN.LOG_BYTES + 40);
+  assert.equal(RUN.tailBytes('短い', 100), '短い');
   // 夜・セッションの鍵 (この PC の印)
   assert.deepEqual(['23:49', '23:50', '00:20', '01:29', '01:30'].map((t) => RUN.nightBusy(jst(t))), [false, true, true, true, false]);
   // ほかの定時の前後 (毎時 00 分の在庫・08:30 の値札は鍵があると待たずに終わる)
@@ -787,13 +852,22 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
     await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit, session: async (o) => { await o.beforeExecute(); throw new Error('取込の完了表示を確認できず'); } });
     assert.equal(jobRow(id).state, 'unknown');
     await page.reload();
-    const rf = page.locator(`[data-bc-resolve-form="${id}"]`);
+    await page.locator(`[data-bc-resolve-form="${id}"]`).waitFor();   // 最後の回 = 下の③にも出る
+    // 後からほかの CSV の回が来た (最後の回でなくなった) = その CSV の行で記す (Codex R1 Medium)
+    const e3 = await newExport(1);
+    const id3 = await queue(e3);
+    await call('POST', `/api/lz-csv/import/${id3}/cancel`, {});
+    await page.reload();
+    const rf = page.locator(`[data-bc-resolve-cell="${id}"]`);
     await rf.waitFor();
+    assert.equal(await page.locator(`[data-bc-resolve-form="${id}"]`).count(), 0, '下の③は最後の回だけ');
     assert.match(await page.locator(`[data-bc-why="${e2.id}"]`).textContent(), /取り込めたか分からない/);
     await rf.locator('input[value="imported"]').check();
     await rf.locator('textarea').fill('履歴 16:00 logizard_bc_upload.csv 1 件 エラー 0');
-    await rf.locator(`button[data-bc-resolve="${id}"]`).click();
-    await page.waitForFunction((jid) => !document.querySelector(`[data-bc-resolve-form="${jid}"]`), id, { timeout: 10000 });
+    await page.waitForTimeout(31000);   // 読み直し (30 秒) の後も打ったメモが残る
+    assert.equal(await rf.locator('textarea').inputValue(), '履歴 16:00 logizard_bc_upload.csv 1 件 エラー 0');
+    await rf.locator(`button[data-bc-resolve-cellbtn="${id}"]`).click();
+    await page.waitForFunction((jid) => !document.querySelector(`[data-bc-resolve-cell="${jid}"]`), id, { timeout: 10000 });
     assert.equal(jobRow(id).resolved_outcome, 'imported');
     assert.equal(await page.locator(`button[data-bc-import="${e2.id}"]`).textContent(), 'もう一度取り込む');
     // 信用しない値は文字のまま (ログに HTML)

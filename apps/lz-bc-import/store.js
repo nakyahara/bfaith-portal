@@ -39,6 +39,7 @@ export const LIMITS = Object.freeze({
   queueTtlMs: 15 * 60e3,      // 積んでから取りに来るまで
   claimLeaseMs: 10 * 60e3,    // 取ってから「押す」まで (ログイン・プレビュー)
   execLeaseMs: 8 * 60e3,      // 「押す」から ① の結果まで (結果の待ちは最長 180 秒)
+  pressWindowMs: 90e3,        // 「押す」から 実行ボタン・始める確認の OK を押し終えるまで (miniPC が守る・期限 execLeaseMs より十分短い)
   exportLeaseMs: 10 * 60e3,   // ① の結果から ② の結果まで
   runnerAliveMs: 3 * 60e3,    // miniPC が来ていると見る間 (1 分おきの定時)
   logBytes: 32 * 1024,        // 1 回の記録に残すログ (後ろを残す)
@@ -132,6 +133,11 @@ export function openLzBcDb(file = path.join(process.env.DATA_DIR || path.join(pr
       at        INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS ix_bc_downloads_export ON bc_downloads (export_id);
+    CREATE TABLE IF NOT EXISTS bc_void_holds (
+      export_id TEXT PRIMARY KEY,
+      by        TEXT NOT NULL,
+      until     INTEGER NOT NULL
+    );
   `);
   return db;
 }
@@ -233,6 +239,7 @@ export function enqueue(db, { requestId, exportId, exportState, fileSha256, text
       return { job_id: prev.job_id, state: prev.state, replayed: true };
     }
     if (exportState !== 'issued') fail('voided', '取り消した CSV は取り込めません (作り直してください)');
+    if (voidHeld(db, exportId, now)) fail('voiding', 'この CSV はいま取り消しの途中です。画面を開き直してください');
     if (seenTextSha256 && seenTextSha256 !== textSha256) fail('changed', '画面を開いた後にファイルの中身が変わりました。画面を開き直してください');
     if (!/^[0-9a-f]{64}$/.test(String(fileSha256)) || !/^[0-9a-f]{64}$/.test(String(textSha256)) || !Number.isInteger(rows) || rows < 1 || rows > 2000) fail('invalid_input', 'ファイルの形が違います', 400);
     const n = nightOf(now);
@@ -314,9 +321,11 @@ export function markExecuting(db, { jobId, claimToken, importBlock = null, now }
     const n = nightOf(now);
     if (n.claim) return stop('night', `いま ${n.hhmm} (JST)。夜の時間なので押しません (取り込んでいない)`);
     if (importBlock) return stop(importBlock.code || 'lz_import_busy', `${importBlock.message} (押していない = 取り込んでいない)`);
+    if (voidHeld(db, j.export_id, now)) return stop('voiding', 'CSV の取り消しの途中なので押しません (取り込んでいない)');
     db.prepare("UPDATE bc_jobs SET state = 'executing', executing_at = ?, lease_until = ? WHERE job_id = ?").run(now, now + LIMITS.execLeaseMs, jobId);
     ev(db, jobId, now, 'executing', j.runner_id);
-    return { ok: true, state: 'executing' };
+    // 押してよい間 (miniPC は自分の時計でこの間だけ実行ボタンと始める確認の OK を押す = 止まった miniPC が期限の後に押さない。Codex R1 High)
+    return { ok: true, state: 'executing', press_window_ms: LIMITS.pressWindowMs };
   })();
   if (r.refused) fail(r.refused.reason, r.refused.detail);
   return r;
@@ -454,17 +463,47 @@ export function resolveJob(db, { jobId, outcome, note, by, now }) {
 
 /** ダウンロードの記録 (手で取り込んだかもしれない印) */
 export function recordDownload(db, { exportId, by, now }) {
-  db.prepare('INSERT INTO bc_downloads (export_id, by, at) VALUES (?, ?, ?)').run(String(exportId), String(by || ''), now);
+  sweep(db, now);
+  // 積んだ・取り込んでいる CSV はダウンロードさせない (ボタンの道と手の道で 2 回取り込まない。Codex R1 High)。
+  //   確かめと印は 1 つの取引 = 積むときの「ダウンロードしたか」の確かめと入れ違わない
+  db.transaction(() => {
+    const act = exportImportState(db, exportId).active;
+    if (act) fail('import_running', `この CSV はボタンでロジザードに取り込む途中です (#${act.job_id})。手で取り込むなら、先に画面で「やめる」(押す前だけ) か終わるのを待ってください`);
+    db.prepare('INSERT INTO bc_downloads (export_id, by, at) VALUES (?, ?, ?)').run(String(exportId), String(by || ''), now);
+  })();
+}
+
+/** 取り消しの途中の印 (確かめ → Company DB で取り消す までの間に、積む・渡す・押すをさせない。Codex R1 High) */
+export const VOID_HOLD_MS = 2 * 60e3;
+export function voidHeld(db, exportId, now) {
+  const h = db.prepare('SELECT * FROM bc_void_holds WHERE export_id = ?').get(String(exportId));
+  return !!(h && h.until > now);
+}
+/** 取り消してよいかを確かめて、その場で取り消しの途中の印を付ける (1 つの取引)。だめ = 例外 */
+export function reserveVoid(db, { exportId, by, now }) {
+  sweep(db, now);
+  db.transaction(() => {
+    const blk = voidBlockIn(db, exportId);
+    if (blk) fail(blk.code, blk.message);
+    db.prepare('INSERT INTO bc_void_holds (export_id, by, until) VALUES (?, ?, ?) ON CONFLICT(export_id) DO UPDATE SET by = excluded.by, until = excluded.until').run(String(exportId), String(by || ''), now + VOID_HOLD_MS);
+  })();
+}
+/** 取り消せなかった = 印を外す (取り消せた = 印を残す。Company DB でも取り消してあるので、渡すときにも断る) */
+export function releaseVoid(db, exportId) {
+  db.prepare('DELETE FROM bc_void_holds WHERE export_id = ?').run(String(exportId));
 }
 
 /** CSV を取り消してよいか (動いている・分からないまま・取り込んだ = 断る)。null = よい */
 export function voidBlock(db, exportId, now) {
   sweep(db, now);
+  return voidBlockIn(db, exportId);
+}
+function voidBlockIn(db, exportId) {
   const st = exportImportState(db, exportId);
   if (st.active) return { code: 'import_running', message: `この CSV をロジザードに取り込んでいます (#${st.active.job_id})。終わってから取り消してください` };
   if (st.unresolved) return { code: 'import_unresolved', message: `この CSV の取り込み (#${st.unresolved.job_id}) が「取り込めたか分からない」のままです。ロジザードのインポート履歴を確かめて記してから取り消してください` };
-  const cleanImport = st.imported && (st.imported.state === 'imported' || st.imported.resolved_outcome === 'imported');
-  if (cleanImport) return { code: 'imported', message: `この CSV はロジザードに取り込みました (#${st.imported.job_id})。取り消すと同じ商品がまた CSV に出て 2 回登録になるので、取り消せません (直すのはロジザードで)` };
+  // 1 件でも入ったかもしれない回 (取り込んだ・エラーや件数違い = 一部は入った見込み・確かめで「取り込んだ」) が 1 つでもあれば取り消さない (Codex R1 High)
+  if (st.imported) return { code: 'imported', message: `この CSV はロジザードに取り込みました (#${st.imported.job_id}・${STATE_WORDS[st.imported.state]})。取り消すと同じ商品がまた CSV に出て 2 回登録になるので、取り消せません (入らなかった商品は、ロジザードで直すか、ロジザードの写しが新しくなった後に Claude と相談)` };
   return null;
 }
 

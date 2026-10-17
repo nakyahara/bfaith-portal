@@ -58,7 +58,7 @@ export function createLzBcRunnerRouter({ readExportFile, getDb = S.getLzBcDb, no
     if (req.method === 'POST' && !/^application\/json\b/i.test(String(req.headers['content-type'] || ''))) return res.status(415).json({ ok: false, error: 'bad_content_type', message: 'application/json だけ' });
     return next();
   });
-  router.use('/api', express.json({ limit: '128kb' }));
+  router.use('/api', express.json({ limit: '256kb' }));
   router.use('/api', (err, req, res, next) => {
     if (!err) return next();
     return res.status(err.status === 413 ? 413 : 400).json({ ok: false, error: err.status === 413 ? 'too_large' : 'bad_json', message: err.status === 413 ? '本文が大きすぎる' : 'JSON として読めない' });
@@ -88,6 +88,7 @@ export function createLzBcRunnerRouter({ readExportFile, getDb = S.getLzBcDb, no
     if (S.nightOf(t).claim) return { job: null, why: 'night' };
     const j = S.nextQueued(db, t);
     if (!j) return { job: null, why: 'none' };
+    if (S.voidHeld(db, j.export_id, t)) return { job: null, why: 'voiding' };   // 取り消しの途中 (待ちは残す・取り消せたら渡すときに断る)
     const blk = importBlock(t);
     if (blk) return { job: null, why: blk.code };   // 待ちは残す (15 分で expired)
     let f;

@@ -89,9 +89,10 @@ export function makeWithRelogin({ page, loginOpts }) {
  * @param {boolean} [p.dry]  各画面の条件設定まで (実行ボタンは押さない)
  * @param {object} p.cfg  { importFiletypeLabel, exportTypeLabel, exportPattern, exportDays, minRows, exportOut }
  * @param {(stepName: string) => Promise<void>} [p.beforeExecute]  ① の実行ボタンを押す直前 (例外 = 押さない)
+ * @param {(where: string) => number} [p.pressGuard]  ボタンを押す前に呼ぶ: 押してよい残りの ms (click の timeout の上限)・もう押さない = 例外 (pressStop)
  * @returns {{ runImport, runExport, assertNoUnexpectedDialog, nightDialogSeen: () => boolean }}
  */
-export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = null }) {
+export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = null, pressGuard = null }) {
   const DRY_RUN = !!dry;
   const IMPORT_FILETYPE_LABEL = cfg.importFiletypeLabel || '商品マスタ';
   const EXPORT_TYPE_LABEL = cfg.exportTypeLabel || 'SKU';
@@ -125,8 +126,10 @@ export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = nul
   // 持ち時間切れ・00:00 の直前 = 押さずに夜の止め (Codex #1518 R2)
   async function nightClick(target, where) {
     const timeout = clickBudgetMs(where);
+    // ボタンの道: 「押す」の後に押してよい間 (pressGuard・過ぎた = 例外 pressStop = 押さない)。CLI は渡さない = 今までどおり
+    const ms = pressGuard ? Math.min(timeout, pressGuard(where)) : timeout;
     try {
-      await (typeof target === 'string' ? page.click(target, { timeout }) : target.click({ timeout }));
+      await (typeof target === 'string' ? page.click(target, { timeout: ms }) : target.click({ timeout: ms }));
     } catch (e) {
       throw asNightError(e, where);
     }
@@ -259,7 +262,7 @@ export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = nul
         console.log('💬 アップロード開始確認モーダル → OK');
         await nightClick(page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first(), `${stepName} (確認の OK の前)`);
       } catch (e) {
-        if (e && e.nightBlock) throw e;
+        if (e && (e.nightBlock || e.pressStop)) throw e;
         console.log('ℹ アップロード開始確認モーダルの OK を押せず (そのまま続行)');
       }
     } else {
