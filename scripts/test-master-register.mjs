@@ -3068,6 +3068,24 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
   ph.prepare(`UPDATE ph_cdb_set_plans SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours') WHERE request_id = ?`).run(ridOld);
   assert.equal(SPS.setCodeHeld('sp-old-2'), null);
   assert.equal(SPS.setCodeHeld('sp-old-2', { includeStale: true }).reason, 'ph_set_plan');
+  // (Codex R8 Medium 3) 親の下書きを消した (登録をやめた) = まだ下書きを作っていない作るセットを閉じる (画面の「下書きを消す」・別の道で消した = 次の確かめで登録の状態から)
+  applierMode = 'boom';
+  const bC1 = spBody('sp-cancel1', [{ qty: 2, code: 'sp-cancel1-2', name: 'x' }]);
+  const bC2 = spBody('sp-cancel2', [{ qty: 2, code: 'sp-cancel2-2', name: 'x' }]);
+  const c1 = await call('POST', '/apps/master-edit/api/new', { body: bC1 });
+  const c2 = await call('POST', '/apps/master-edit/api/new', { body: bC2 });
+  applierMode = 'real';
+  assert.deepEqual([c1.status, c2.status, SPS.readSetPlan(bC1.request_id).state, SPS.readSetPlan(bC2.request_id).state], [200, 200, 'registered', 'registered']);
+  const cx = await call('POST', '/apps/master-edit/api/sku/sp-cancel1/draft-cancel', { body: { request_id: uuid(), reason: '試験でやめた', confirm: true } });
+  assert.equal(cx.status, 200, cx.text);
+  assert.equal(SPS.readSetPlan(bC1.request_id).state, 'dropped');
+  assert.equal(SPS.setCodeHeld('sp-cancel1-2'), null);
+  const DC = await import('../lib/master-draft-cancel.mjs');
+  await asEditor(() => DC.cancelSkuDraft(db, { actor: 'naka@test', code: 'sp-cancel2', reason: '別の道でやめた', requestId: uuid(), confirm: true }, { open: true }));
+  assert.equal(SPS.readSetPlan(bC2.request_id).state, 'registered');
+  const chkC = await call('GET', '/apps/master-edit/api/set-code-check?code=sp-cancel2-2&parent=sp-x');
+  assert.equal(chkC.j.ok, true, chkC.text);
+  assert.equal(SPS.readSetPlan(bC2.request_id).state, 'dropped');
   // ⑩ (Codex R5 Medium 1) 登録の成否が分からない誤り (MasterWriteError でない = 接続が切れた・commit の後など) = 作るセットは waiting のまま (dropped にしない)
   MR.__setShippingRatesProvider(async () => { throw new Error('接続が切れた'); });
   const bUnk = spBody('sp-unknown', [{ qty: 2, code: 'sp-unknown-2', name: 'x' }]);

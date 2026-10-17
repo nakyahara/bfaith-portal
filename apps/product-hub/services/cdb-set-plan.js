@@ -61,13 +61,24 @@ export function staleWaitingPlansFor(codes, { db = getDB(), actor = null, parent
   const keys = [...new Set((codes || []).map((c) => String(c ?? '').trim().toLowerCase()).filter(Boolean))];
   if (!keys.length) return [];
   // 🆕 Codex R6 Medium 1: 時間の中でも、同じ人・同じ単品の waiting (前の保存の答えが「分からない」で、画面が新しい番号で押し直した) は呼び手が記録と照らす
+  // 🆕 Codex R8 Medium 3: registered (カードの取り込み待ち) も返す = 呼び手が親の下書きを消した (登録の状態 cancelled) かを照らす
   return db.prepare(`
-    SELECT DISTINCT p.request_id, p.created_by, p.parent_code, (p.created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)) AS old
-    FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
-    WHERE i.code_key IN (${keys.map(() => '?').join(',')}) AND p.state = 'waiting'
-      AND (p.created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?) OR (LOWER(p.created_by) = LOWER(?) AND LOWER(TRIM(p.parent_code)) = LOWER(TRIM(?))))
-  `).all(`-${WAITING_HOLD_MINUTES} minutes`, ...keys, `-${WAITING_HOLD_MINUTES} minutes`, String(actor ?? ''), String(parentCode ?? ''))
-    .map((r) => ({ request_id: r.request_id, old: !!r.old, mine: !r.old }));
+    SELECT DISTINCT p.request_id, p.state, p.cdb_sku_id FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
+    WHERE i.code_key IN (${keys.map(() => '?').join(',')})
+      AND ((p.state = 'waiting' AND (p.created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?) OR (LOWER(p.created_by) = LOWER(?) AND LOWER(TRIM(p.parent_code)) = LOWER(TRIM(?)))))
+           OR (p.state = 'registered' AND p.cdb_sku_id IS NOT NULL))
+  `).all(...keys, `-${WAITING_HOLD_MINUTES} minutes`, String(actor ?? ''), String(parentCode ?? ''))
+    .map((r) => ({ request_id: r.request_id, state: r.state, sku_id: r.cdb_sku_id == null ? null : String(r.cdb_sku_id) }));
+}
+
+/** 照らすのを保留した waiting (その登録がまだ動いている) = 時間を延ばす (予約のまま・Codex R8 Medium 1) */
+export function touchWaitingPlan(requestId, { db = getDB() } = {}) {
+  return db.prepare(`UPDATE ph_cdb_set_plans SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE request_id = ? AND state = 'waiting'`).run(String(requestId)).changes;
+}
+
+/** 親の下書きを消した (登録をやめた) = まだ下書きを作っていない作るセット (registered / waiting) を閉じる = 予約を外す (Codex R8 Medium 3) */
+export function dropPlansForSku(skuId, { db = getDB(), note = '親の下書きを消した (登録をやめた)' } = {}) {
+  return db.prepare(`UPDATE ph_cdb_set_plans SET state = 'dropped', note = ? WHERE cdb_sku_id = ? AND state IN ('registered', 'waiting')`).run(String(note).slice(0, 500), Number(skuId)).changes;
 }
 
 /**

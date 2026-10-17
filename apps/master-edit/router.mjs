@@ -446,7 +446,8 @@ export function __setSetPlanStore(st) { setPlanStore = st || null; }
 async function setPlans() {
   if (setPlanStore) return setPlanStore;
   const m = await import('../product-hub/services/cdb-set-plan.js');
-  return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o), stale: (codes, o) => m.staleWaitingPlansFor(codes, o || {}) };
+  return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o), stale: (codes, o) => m.staleWaitingPlansFor(codes, o || {}),
+    touch: (rid) => m.touchWaitingPlan(rid), dropForSku: (sid, o) => m.dropPlansForSku(sid, o || {}) };
 }
 /**
  * 🆕 Codex R4 Medium 1: 予約の時間を過ぎた waiting の作るセット (このコードを持つもの) を、Company DB の保存の記録で決める。
@@ -456,21 +457,31 @@ async function resolveStaleSetPlans(db, codes, { actor = null, parentCode = null
   const st = await setPlans();
   if (typeof st.stale !== 'function') return;
   //   🆕 Codex R6 Medium 1: 同じ人・同じ単品の waiting (前の保存の答えが分からず、新しい番号で押し直した) も照らす。記録が無い = 登録は入っていない = 外す
-  const cands = st.stale(codes, { actor, parentCode }).map((x) => (typeof x === 'string' ? { request_id: x, old: true } : x)).filter((x) => x.request_id !== requestId);
+  const cands = st.stale(codes, { actor, parentCode }).map((x) => (typeof x === 'string' ? { request_id: x, state: 'waiting' } : x)).filter((x) => x.request_id !== requestId);
   if (!cands.length) return;
-  const ids = cands.map((x) => x.request_id);
-  const rows = (await db.query(`select request_id::text as id, status, result ->> 'sku_id' as sku_id from ops.master_edit_requests where request_id = any($1::uuid[])`, [ids])).rows;
-  const byId = new Map(rows.map((x) => [x.id, x]));
-  for (const id of ids) {
-    const rec = byId.get(id);
-    if (!rec) {
-      // 記録が見えない = まだ commit していない登録かもしれない。その request_id の鍵 (withRequestLock・保存の間ずっと持つ) が取れない = 動いている = 外さない (Codex R7 Medium 2)
-      const free = (await db.query("select pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended('master-edit.request:' || $1::text, 0)) as ok", [id])).rows[0].ok === true;
-      if (free) await db.query("select pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended('master-edit.request:' || $1::text, 0))", [id]);
-      if (!free) continue;
+  // 🆕 Codex R8 Medium 3: registered = 親の下書きを消した (登録の状態 cancelled) なら閉じる (取り消しの後でも予約が残らない)
+  const reg = cands.filter((x) => x.state === 'registered' && x.sku_id);
+  if (reg.length && typeof st.dropForSku === 'function') {
+    const gone = (await db.query(`select sku_id::text as id from ops.master_registrations where sku_id = any($1::bigint[]) and state = 'cancelled'`, [reg.map((x) => x.sku_id)])).rows;
+    for (const g of gone) st.dropForSku(g.id);
+  }
+  const LOCK = "pg_catalog.hashtextextended('master-edit.request:' || $1::text, 0)";
+  for (const c of cands.filter((x) => x.state === 'waiting')) {
+    const id = c.request_id;
+    // その request_id の鍵 (withRequestLock・保存の間ずっと持つ) を取ってから記録を読む (Codex R8 Medium 2 = 読んだ後に commit した登録を外さない)。
+    //   取れない = その登録がまだ動いている = 予約のまま (時間を延ばす = ほかの登録の確かめでも押さえる・Codex R8 Medium 1)
+    const free = (await db.query(`select pg_catalog.pg_try_advisory_lock(${LOCK}) as ok`, [id])).rows[0].ok === true;
+    if (!free) { if (typeof st.touch === 'function') st.touch(id); continue; }
+    try {
+      const rec = (await db.query(`select status, result ->> 'sku_id' as sku_id from ops.master_edit_requests where request_id = $1::uuid`, [id])).rows[0];
+      if (rec && rec.status === 'done') {
+        const cancelled = rec.sku_id ? (await db.query(`select 1 from ops.master_registrations where sku_id = $1::bigint and state = 'cancelled'`, [rec.sku_id])).rows.length > 0 : false;
+        if (cancelled) st.mark(id, { state: 'dropped', note: '親の下書きを消した (登録をやめた)' });
+        else st.mark(id, { state: 'registered', skuId: rec.sku_id ?? null });
+      } else st.mark(id, { state: 'dropped', note: rec ? `登録は ${rec.status} (記録で確かめた)` : '登録の記録が無い (予約の時間を過ぎたか、同じ人が押し直した)' });
+    } finally {
+      await db.query(`select pg_catalog.pg_advisory_unlock(${LOCK})`, [id]);
     }
-    if (rec && rec.status === 'done') st.mark(id, { state: 'registered', skuId: rec.sku_id ?? null });
-    else st.mark(id, { state: 'dropped', note: rec ? `登録は ${rec.status} (記録で確かめた)` : '登録の記録が無い (予約の時間を過ぎたか、同じ人が押し直した)' });
   }
 }
 /**
@@ -1305,7 +1316,14 @@ router.post('/api/sku/:code/draft-cancel', (req, res) => {
       if (lc.error) return res.status(503).json({ ok: false, reason: 'card_unreadable', error: `product-hub のカードを読めないので、消していません (${lc.error})。少し待ってからもう一度` });
       if (lc.cards.length) return res.status(409).json({ ok: false, reason: 'card_exists', error: cardExistsWords(lc.cards), cards: lc.cards });
     }
-    res.json(await cancelSkuDraft(db, { actor, code: req.params.code, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen(), requireConfirm: true }));
+    const out = await cancelSkuDraft(db, { actor, code: req.params.code, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen(), requireConfirm: true });
+    // 🆕 2026-10-17 (Codex R8 Medium 3): 登録をやめた単品の、まだ下書きを作っていない作るセットを閉じる (予約を外す)。できなくても次の確かめで登録の状態から閉じる
+    const sid = out && (out.sku_id ?? out.skuId);
+    if (out && out.ok !== false && sid != null) {
+      try { const st = await setPlans(); if (typeof st.dropForSku === 'function') st.dropForSku(String(sid)); }
+      catch (e) { console.error(`[master-edit] 作るセットを閉じられなかった (SKU ${sid}): ${e && e.message}`); }
+    }
+    res.json(out);
   }, 'write');
 });
 
