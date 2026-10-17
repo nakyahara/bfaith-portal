@@ -19,7 +19,7 @@ import { skuValuesForLoad, costForLoad, SKU_OWNED_COLUMNS, SKU_0027_COLUMNS } fr
 import { readMaterialSnapshot } from '../../warehouse/material-lineage.js';
 import { readEvidence } from '../push/evidence.mjs';
 import { planFromSnapshot, subjectKey, sameValue } from './compare-load.mjs';
-import { evaluateBaseline } from './baseline.mjs';
+import { evaluateBaseline, neValue, BASELINE_NORM_VERSION } from './baseline.mjs';
 import { readNeFetchCounts } from '../../warehouse/ne-fetch-counts.js';
 import { parentObservations, parentObsTrust, repSpellingsOf, fetchTimeRfc3339 } from './parent-gate.mjs';
 
@@ -1314,6 +1314,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   //   台帳を読めない回は「読めない」と理由を持たせる = run.mjs は記録しない (#1676 Codex R2 High)
   //   🆕 #1676 Codex R4: 信用 = 許可の一覧 (parentObsTrust): 取得の件数・取込の整合 (行の落ち・C1 のセットの行の欠け)・区分のゲートの integrity_untrusted・台帳。
   //   全部が明示的に ok のときだけ complete (どれか 1 つでも = 記録しない)
+  // 🆕 0083 (設計 25 PR-1・影): 今朝の NE の値 (同じ読み取りで決めたもの)。JSON には件数だけ (書くのは run.mjs が NE のコードの書き方の後に)
+  const neValues = neValuesOf({ nm, collided: nCollided, intBlocked, fetchCounts: ne.fetchCounts, products: ne.products, sets: ne.sets });
+  out.ne_values = neValues.ok ? { state: 'built', counts: neValues.counts } : { state: 'unavailable', reason: neValues.reason };
   const repSp = repSpellingsOf(neCodes);
   const trust = parentObsTrust({ fetch_counts: ne.fetchCounts, integrity: integ, kind_gate: out.kind_gate, rep_spellings: repSp });
   const parentObs = { obs: parentObservations(nm, { untrusted: [...nCollided, ...intBlocked.keys()], trust, repSpellings: repSp }),
@@ -1321,7 +1324,51 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     material_generation_id: out.generation ? out.generation.generation_id : null };
   out.parent_obs = { rows: parentObs.obs.rows.length, untrusted: parentObs.obs.untrusted.length, rep_collided: parentObs.obs.rep_collided.length, rep_spellings: parentObs.obs.rep_spellings,
     complete: parentObs.obs.complete, incomplete_reason: parentObs.obs.incomplete_reason ?? null };
-  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes, regObs, parentObs };
+  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes, regObs, parentObs, neValues };
+}
+
+/** 🆕 0083: 今朝の NE の値に残す列 (NE 更新の CSV の対象 = 設計 25 §2.2 の 1。代表 (parent) は商品の画面で変えないので入れない) */
+export const NE_VALUE_COLS = Object.freeze({ single: Object.freeze(['name', 'handling', 'tax_rate', 'standard_price_jpy', 'cost', 'primary_supplier']), set: Object.freeze(['name', 'standard_price_jpy']) });
+/**
+ * 🆕 0083 (設計 25 §2.5・PR-1): 今朝の NE の値 (ops.record_ne_values に送る形)。nm = nModelOf の結果 (② の前提を全部通った完全な取得の集合)。
+ *   値 = 照合の D2 の正規化 (baseline.mjs の neValue = 最後に一致した値と同じ)。比べられない値は状態だけ:
+ *     unknown = 記録なし (raw_unknown)・正規化で同じになる別の書き方 (collided)・取込の整合で保持した商品 (int_blocked) / invalid = 値の形が不正
+ *   取得の件数 (ne-fetch-counts.js) が両方 ok で取得の版が同じときだけ作る (取得中・記録なし・形の崩れ・版の違い = 作らない = 書かない)。
+ *   照合が読んだ生の行の数とコードの数も送る (DB が stored_rows・正規化した単位の数と照らす。設計 25 R2 M5)
+ * @returns {{ ok: boolean, reason?: string, payload?: object, counts?: object }}
+ */
+export function neValuesOf({ nm, collided = new Set(), intBlocked = new Map(), fetchCounts, products, sets }) {
+  const fc = fetchCounts;
+  if (!fc || fc.ok !== true || typeof fc.fetch_fingerprint !== 'string') return { ok: false, reason: `fetch_counts_${fc ? (fc.fetch_fingerprint_mismatch ? 'fingerprint_mismatch' : fc.error ? 'error' : 'not_ok') : 'missing'}` };
+  const rec = { products: fc.products && fc.products.counts, sets: fc.setproducts && fc.setproducts.counts };
+  if (!isPlainObj(rec.products) || !isPlainObj(rec.sets)) return { ok: false, reason: 'fetch_counts_unreadable' };
+  const P = new Set((products || []).map((r) => normSku(r.code)).filter(Boolean));
+  const S = new Set((sets || []).map((r) => normSku(r.parent)).filter(Boolean));
+  const side = (c, rawRows, extra) => ({ started_at: c.started_at, finished_at: c.finished_at, complete_rev: c.complete_rev, fetched_rows: c.fetched_rows, write_attempts: c.write_attempts,
+    stored_rows: c.stored_rows, dropped_no_code: c.dropped_no_code, dropped_missing_fields: c.dropped_missing_fields, raw_rows: rawRows, ...extra });
+  const entries = [];
+  const counts = { single: 0, set: 0, ok: 0, unknown: 0, invalid: 0 };
+  for (const [norm, n] of [...nm].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+    const cols = NE_VALUE_COLS[n.kind];
+    if (!cols) continue;
+    counts[n.kind]++;
+    const hold = collided.has(norm) ? 'collided' : intBlocked.has(norm) ? 'int_blocked' : null;
+    for (const col of cols) {
+      const st = n.cols[col];
+      const v = hold ? { ok: false } : neValue(col, st);
+      const e = { code_norm: norm, col, ne_kind: n.kind };
+      if (v.ok) Object.assign(e, { state: 'ok', value: v.value === undefined ? null : v.value });
+      else if (hold) Object.assign(e, { state: 'unknown', reason: hold });
+      else if (!st || st.raw === 'unknown') Object.assign(e, { state: 'unknown', reason: 'raw_unknown' });
+      else e.state = 'invalid';
+      counts[e.state]++;
+      entries.push(e);
+    }
+  }
+  return { ok: true, counts: { ...counts, rows: entries.length },
+    payload: { norm_version: BASELINE_NORM_VERSION, fetch: { fingerprint: fc.fetch_fingerprint,
+      products: side(rec.products, (products || []).length, { codes: P.size, set_overlap: [...P].filter((k) => S.has(k)).length }),
+      sets: side(rec.sets, (sets || []).length, { codes: S.size }) }, entries } };
 }
 
 /**

@@ -1900,6 +1900,77 @@ await ta('[40] (#1676 Codex R6) 本物の取込 (fetchProducts / fetchSetProduct
   } finally { globalThis.fetch = realFetch; }
 });
 
+await ta('[41] 🆕 0083 (設計 25 PR-1 = 影): 今朝の NE の値 = ② が最後まで走り、NE のコードの書き方をこの回で書けた回だけ ops.record_ne_values で全部を入れ替える (D2 の正規化・単品 6 列 / セット 2 列・比べられない値は状態だけ: 記録なし = unknown・正規化の衝突 = collided・取込の整合で保持 = int_blocked・不正 = invalid) / 同じ朝の 2 回目の照合 = 新しい回で受け付ける / 書き方を書けない回・書く接続が無い回・関数が無い DB = 書かない (照合は止めない・要約は変えない)', async () => {
+  const NE = baseNe();
+  const P = (code) => NE.products.find((r) => r.code === code);
+  P('b002').cost_src = J('');             // 値なし = ok の null
+  P('c003').handling = '知らない語';      // 不正 = invalid
+  P('d004').tax_src = null;               // 記録なし = unknown (raw_unknown)
+  NE.products.push({ ...P('f006'), code: 'F006' });   // f006 / F006 = 正規化で同じになる別の書き方 = collided
+  const sp = (o) => new Map(Object.entries(o).map(([k, v]) => [k, new Set(v)]));
+  const spell = { products: { single: sp({ a001: ['a001'], b002: ['b002'], c003: ['c003'], d004: ['d004'], e005: ['e005'], f006: ['F006', 'f006'] }), rep: sp({}) },
+    sets: { set: sp({ s001: ['s001'], s002: ['s002'] }), child: sp({ a001: ['a001'], b002: ['b002'] }), set_rep: sp({}) } };
+  const integrity = { intP: { dup_code_count: 1, dup_codes: ['e005'] } };   // e005 = 取込の整合で保持
+  const vals = async () => Object.fromEntries((await db.query('select code_norm, col, ne_kind, state, reason, value from ops.master_ne_values order by 1, 2')).rows
+    .map((r) => [`${r.code_norm}|${r.col}`, [r.ne_kind, r.state, r.reason, r.value]]));
+  const mark = async () => (await db.query('select compare_run_id, products_started_at, sets_started_at, code_mark_run, norm_version from ops.master_ne_values_mark')).rows;
+  const x = await day('2031-01-10', { ne: NE, spellings: spell, integrity });
+  assert.notEqual(x.ne.verdict, 'blocked', x.ne.blocked_reason);
+  assert.equal(x.ne.ne_codes.write, 'ok', JSON.stringify(x.ne.ne_codes));
+  assert.deepEqual([x.ne.ne_values.state, x.ne.ne_values.write, x.ne.ne_values.written?.state], ['built', 'ok', 'written'], JSON.stringify(x.ne.ne_values));
+  assert.equal(x.ne.ne_values.written.code_mark_same_run, true, '値と書き方が同じ回');
+  const v = await vals();
+  assert.equal(Object.keys(v).length, 6 * 6 + 2 * 2);
+  assert.deepEqual([v['a001|name'], v['a001|handling'], v['a001|tax_rate'], v['a001|standard_price_jpy'], v['a001|cost'], v['a001|primary_supplier']],
+    [['single', 'ok', null, '単品A'], ['single', 'ok', null, 'active'], ['single', 'ok', null, 0.1], ['single', 'ok', null, 1000], ['single', 'ok', null, 100], ['single', 'ok', null, ['0001']]]);
+  assert.deepEqual(v['b002|cost'], ['single', 'ok', null, null]);
+  assert.deepEqual(v['b002|tax_rate'], ['single', 'ok', null, 0.08]);
+  assert.deepEqual(v['c003|handling'], ['single', 'invalid', null, null]);
+  assert.deepEqual(v['d004|tax_rate'], ['single', 'unknown', 'raw_unknown', null]);
+  assert.deepEqual(v['f006|name'], ['single', 'unknown', 'collided', null]);
+  assert.deepEqual(v['e005|cost'], ['single', 'unknown', 'int_blocked', null]);
+  assert.deepEqual([v['s001|name'], v['s001|standard_price_jpy'], v['s002|standard_price_jpy'], v['s001|cost']], [['set', 'ok', null, 'セット1'], ['set', 'ok', null, 5000], ['set', 'ok', null, 900], undefined]);
+  const ts = new Date(`${utcText(at('2031-01-10', '07:00')).replace(' ', 'T')}Z`).toISOString();
+  let m = await mark();
+  assert.deepEqual(m.map((r) => [r.compare_run_id, new Date(r.products_started_at).toISOString(), new Date(r.sets_started_at).toISOString(), r.code_mark_run, r.norm_version]),
+    [[x.result.compare_run_id, ts, ts, x.result.compare_run_id, 1]]);
+  assert.deepEqual([x.evidence.ne.ne_values.state, x.evidence.ne.ne_values.write, x.evidence.ne.ne_values.written_state], ['built', 'ok', 'written']);
+  assert.doesNotMatch(x.line, /NE の値/, '影 = 要約は変えない');
+  // 全件 JSON には件数だけ (値は DB だけ)
+  assert.deepEqual(x.result.ne.ne_values.counts, { single: 6, set: 2, ok: 26, unknown: 13, invalid: 1, rows: 40 });
+  // 同じ朝の 2 回目の照合 (同じ取得) = 新しい回として受け付ける (取得は戻っていない)
+  const y = await compare('2031-01-10', { now: at('2031-01-10', '09:10'), cdbReadAt: at('2031-01-10', '09:10') });
+  assert.deepEqual([y.result.ne.ne_values.write, y.result.ne.ne_values.written?.state], ['ok', 'written'], JSON.stringify(y.result.ne.ne_values));
+  m = await mark();
+  assert.equal(m[0].compare_run_id, y.result.compare_run_id);
+  assert.equal(Number((await db.query('select count(*)::int as n from ops.master_ne_values_runs where compare_run_id = any($1::text[])', [[x.result.compare_run_id, y.result.compare_run_id]])).rows[0].n), 2);
+  // NE のコードの書き方を書けない回 (照合の回の記録が無い = 判断の台帳を書けない) = 値も書かない (前の回のまま)
+  const failDecisions = { query: async (t, p) => { if (/record_decision_candidates/.test(t)) throw new Error('writer down'); return db.query(t, p); } };
+  const z = await compare('2031-01-10', { now: at('2031-01-10', '09:40'), cdbReadAt: at('2031-01-10', '09:40'), writerDb: failDecisions });
+  assert.match(z.result.ne.ne_values.write, /^skipped_codes_skipped_decisions_failed$/, JSON.stringify(z.result.ne.ne_values));
+  assert.equal((await mark())[0].compare_run_id, y.result.compare_run_id);
+  // 書く接続が無い = 書かない
+  const w = await compare('2031-01-10', { now: at('2031-01-10', '10:10'), cdbReadAt: at('2031-01-10', '10:10'), writerDb: null });
+  assert.match(String(w.result.ne.ne_values.write), /^skipped_codes_/);
+  // 関数が無い DB (0083 の前) = not_applied (照合は通る)
+  await db.exec('alter function ops.record_ne_values(jsonb) rename to record_ne_values__0083_hidden');
+  try {
+    const n = await day('2031-01-11', { ne: NE, spellings: spell, integrity });
+    assert.notEqual(n.ne.verdict, 'blocked');
+    assert.deepEqual([n.ne.ne_codes.write, n.ne.ne_values.write], ['ok', 'not_applied']);
+    assert.equal((await mark())[0].compare_run_id, y.result.compare_run_id);
+  } finally { await db.exec('alter function ops.record_ne_values__0083_hidden(jsonb) rename to record_ne_values'); }
+  // 取得の件数が読めない朝 (取得中の印が残った) = 作らない (unavailable)・書かない
+  const k = await day('2031-01-12', { ne: NE, spellings: spell, integrity });
+  assert.equal(k.ne.ne_values.write, 'ok');   // ふつうの朝は書く (前の確かめ)
+  wh().prepare('INSERT OR REPLACE INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)').run('ne_api_products_in_progress', '{}', 'x');
+  try {
+    const f = await compare('2031-01-12', { now: at('2031-01-12', '09:10'), cdbReadAt: at('2031-01-12', '09:10') });
+    assert.deepEqual([f.result.ne.ne_values.state, f.result.ne.ne_values.reason, f.result.ne.ne_values.write], ['unavailable', 'fetch_counts_not_ok', 'skipped_fetch_counts_not_ok']);
+    assert.equal((await mark())[0].compare_run_id, k.result.compare_run_id);
+  } finally { wh().prepare('DELETE FROM sync_meta WHERE key = ?').run('ne_api_products_in_progress'); }
+});
+
 await pg.close();
 try { WH.getDB().close(); } catch { /* */ }
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }
