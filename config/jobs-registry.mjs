@@ -1567,6 +1567,27 @@ export const JOBS_REGISTRY = [
       + '3 つ済んだら 2 ファイルを消す PR を出し、このエントリも消す',
   },
   {
+    id: 'sku-kind-to-set',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん + Claude',
+    purpose: '人が 1 回ずつ流す道具: Company DB で単品の SKU を、NE と同じセットにする (区分 single → set・product_id を外す・NE の構成を入れる・セットの導く値を計算し直す) '
+      + 'scripts/company-db/sku-kind-to-set.mjs + 試験 scripts/test-sku-kind-to-set.mjs。'
+      + '10/15 にスタッフが NE で nametag30 / nametag50 をセットにした = 照合の区分のゲート raw_mismatch = 2 で新商品の許可が出ない (10/16 の朝から)。中原さん 10/17 = Company DB もセットにする。'
+      + '区分の持ち主が company の間は 0058 の保守の印 (DB の持ち主) でしか区分を変えられない = 画面の道は無い。定期実行はしない',
+    where: 'bfaith-portal リポジトリ (miniPC で手で、dry-run → --apply --expect-hash を 1 回)',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: 'miniPC の PowerShell (リポジトリ直下・値は一重引用符): 準備 = $env:DOTENV_CONFIG_PATH = \'C:\\Users\\bfaith\\bfaith-portal\\.env\'; $A = \'<人のメール>\'; $R = \'<理由>\'。'
+      + ' (1) dry-run (読むだけ・COMPANY_DB_URL・DATA_DIR の warehouse.db): node -r dotenv/config scripts/company-db/sku-kind-to-set.mjs --code nametag30 --code nametag50 --actor $A --reason $R'
+      + ' → 表 (構成・原価・照合の区分の生の差の見込み「直した後 0」) を中原さんが見る'
+      + ' (2) 書く: 同じ日 (JST)・同じ --code / --actor / --reason で ... --apply --expect-hash \'<(1) のハッシュ>\' --yes。'
+      + ' (3) 許可を今日のうちに: 手で「マスタ照合」(node -r dotenv/config apps/company-db/master-compare/run.mjs --daily) → 「新商品の許可」(node -r dotenv/config apps/company-db/master-compare/new-entry-gate.mjs --daily) の順 '
+      + '(NE の取得は流し直さない = 朝の作り直しと合わなくなり照合 ② が blocked になる)。'
+      + ' commit の答えが分からないと出たら、出た「書けた / 書けていない / 分からない」に従う (分からない = select sku_kind, product_id from core.skus where code in (...) と events.master_change_events の request_id で確かめる)。'
+      + '済んだら 2 ファイルを消す PR を出し、このエントリも消す',
+  },
+  {
     id: 'lz-gas-rollback',
     type: 'temporary_asset',
     importance: 'TMP',
