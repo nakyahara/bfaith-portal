@@ -74,6 +74,8 @@ export function createAdminRouter({ getDb = null, now = () => Date.now(), notify
   // 🆕 2026-10-17「ロジザードに取り込む」ボタン (apps/lz-bc-import) が押した後の間は、手の取込を始めない (同じ時にロジザードに 2 つの取込を重ねない。Codex R5 High)
   const refuseIfBcBusy = () => {
     const j = bcBusy(now());
+    if (j && j.error) throw new S.ImportStateError('bc_state_unreadable', 'ボタンの取り込みの帳面を読めないので、手の取込は始めません (少し待ってからもう一度・続くなら Claude に)', 503);
+    if (j && j.state === 'unknown') throw new S.ImportStateError('bc_import_running', `「ロジザードに取り込む」ボタンの回 (#${j.job_id}・新商品の CSV #${j.export_id}) が「取り込めたか分からない」のままです (ロジザード側の取込が終わったと言えない)。ロジザード登録の CSV の画面でその回を確かめて記してから始めてください`, 409);
     if (j) throw new S.ImportStateError('bc_import_running', `いま「ロジザードに取り込む」ボタンの回 (#${j.job_id}・新商品の CSV #${j.export_id}) がロジザードに取り込んでいます。終わってから始めてください`, 409);
   };
   let db = null;

@@ -123,6 +123,7 @@
     if (S.night && S.night.enqueue) return P.nightWords;
     if (!S.runner || !S.runner.alive) return 'miniPC が来ていません (最後 ' + when(S.runner && S.runner.seen_at) + ')。ダウンロードして予備の道で';
     if (BLOCK) return BLOCK.message;
+    if (S.unresolved_any && String(S.unresolved_any.export_id) !== String(e.id)) return 'ほかの取り込み (#' + S.unresolved_any.job_id + '・CSV #' + S.unresolved_any.export_id + ') が「取り込めたか分からない」のまま (その CSV の行で確かめて記す)';
     if (s && s.unresolved_job) return '前の取り込み (#' + s.unresolved_job + ') が「取り込めたか分からない」のまま (下の③で確かめて記す)';
     return null;
   }

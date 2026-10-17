@@ -21,7 +21,7 @@ export const REFUSAL_CODES = Object.freeze(new Set([
   'disabled', 'retired', 'manual_open', 'needs_review', 'not_open', 'not_found', 'artifact_missing', 'artifact_broken', 'mismatch', 'conflict',
   'bad_csv', 'bad_account', 'gas_closed', 'one_way',
   // 「ロジザードに取り込む」ボタンの回が押した後 = 手の取込を始めない (admin-router.js・2026-10-17)
-  'bc_import_running',
+  'bc_import_running', 'bc_state_unreadable',
   // 毎晩の本番 (③c-1b-2b-2 N1)
   'bad_run_id', 'outside_window', 'stale_target',
   // 口 (router.js・admin-router.js)

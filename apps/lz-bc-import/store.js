@@ -165,21 +165,29 @@ export function __setLzBcDb(db) { shared = db; }
 
 /**
  * ロジザードの毎日の商品マスタの「手の取込」を始める口 (apps/logizard-import-state/admin-router.js) が呼ぶ:
- * いまボタンの回が押した後 (executing / exporting) か。そう = 手の取込を始めさせない (Codex R5 High)。
+ * いまボタンの回が押した後 (executing / exporting)、または押した後に「取り込めたか分からない」のまま (人が記していない) か。
+ * そう = 手の取込を始めさせない (Codex R5・R6 High。分からない回はロジザード側の取込が終わったと言えない = 記すか、遅れて届いた結果で外れる)。
  * 逆向き (手の取込が開いている間は押させない) は markExecuting が見る。どちらも同じ process の中の同期の処理 = 確かめと始めるの間に入れ違わない。
- * 帳面のファイルがまだ無い (ボタンを一度も使っていない) = 動いていない。読めない = 動いていない扱い (帳面に書けなければボタンも押せない)
+ * 帳面のファイルがまだ無い (ボタンを一度も使っていない) = 動いていない。ファイルがあるのに読めない = { error } (呼び手は始めない側に倒す。Codex R6 High)
+ * @returns {null | { job_id, export_id, state } | { error: string }}
  */
 export function bcPressInProgress(now = Date.now()) {
+  const file = path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'lz-bc-import.db');
   try {
-    const file = path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'lz-bc-import.db');
     if (!shared && !fs.existsSync(file)) return null;
+  } catch { /* 下で開いて確かめる */ }
+  try {
     const db = getLzBcDb();
     sweep(db, now);
-    return db.prepare("SELECT job_id, export_id, state FROM bc_jobs WHERE state IN ('executing','exporting') LIMIT 1").get() || null;
+    return busyJobIn(db);
   } catch (e) {
-    console.error(`[lz-bc-import] 帳面を読めない (手の取込は止めない): ${e && e.message}`);
-    return null;
+    console.error(`[lz-bc-import] 帳面を読めない (手の取込は始めない): ${e && e.message}`);
+    return { error: String((e && e.message) || e).slice(0, 160) };
   }
+}
+/** 押した後 (executing / exporting) か、押した後に分からないまま (unknown・記していない) の回 (全部の CSV で 1 つ) */
+function busyJobIn(db) {
+  return db.prepare("SELECT job_id, export_id, state FROM bc_jobs WHERE state IN ('executing','exporting') OR (state = 'unknown' AND resolved_outcome IS NULL) ORDER BY job_id LIMIT 1").get() || null;
 }
 
 // ── 時刻 (JST) ──
@@ -293,6 +301,9 @@ export function enqueue(db, { requestId, exportId, exportState, fileSha256, text
     if (act) fail('busy', `ほかの取り込み (#${act.job_id}・CSV #${act.export_id}) が動いています。終わってから押してください`, 409, { job_id: act.job_id });
     const st = exportImportState(db, exportId);
     if (st.unresolved) fail('unresolved', `前の取り込み (#${st.unresolved.job_id}) が「取り込めたか分からない」のままです。ロジザードのインポート履歴を確かめて、その回に「取り込んだ / 取り込んでいない」を記してから押してください`, 409, { job_id: st.unresolved.job_id });
+    // ほかの CSV の回が「取り込めたか分からない」のまま = その取込がロジザードで終わったと言えない = 新しく積まない (Codex R6 High)
+    const other = busyJobIn(db);
+    if (other) fail('unresolved_other', `ほかの取り込み (#${other.job_id}・CSV #${other.export_id}) が「取り込めたか分からない」のままです。その回をロジザードのインポート履歴で確かめて記してから押してください`, 409, { job_id: other.job_id });
     let reason = null;
     if (st.imported) {
       if (rerunReason == null || rerunReason === '') fail('already_imported', `この CSV はもう取り込みました (#${st.imported.job_id})。もう一度取り込むときは理由を書いてください (ロジザードに 2 回登録されることがあります)`, 409, { job_id: st.imported.job_id });
@@ -594,6 +605,7 @@ export function screenStatus(db, { now, exportIds = [] }) {
   return {
     now, started_at: startedAt(db), night: nightOf(now), runner: runnerView(db, now),
     active: jobView(active, { withLog: true }),
+    unresolved_any: jobView(db.prepare("SELECT * FROM bc_jobs WHERE state = 'unknown' AND resolved_outcome IS NULL ORDER BY job_id LIMIT 1").get() || null),
     latest: jobView(recent[0] || null, { withLog: true }),
     recent: recent.map((j) => jobView(j)), byExport,
   };

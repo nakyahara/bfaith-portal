@@ -585,12 +585,19 @@ function runnerEnv() {
 }
 const client = () => createBcImportClient({ url: ORIGIN, token: TOKEN });
 async function queue(e, x = {}) {
+  clearUnknown();   // 前の試験の「分からない」回 (残る間はほかの CSV を積めない)
   await runnerSeen();
   const r = await call('POST', `/api/lz-csv/${e.id}/import`, importBody(e, x));
   assert.equal(r.status, 200, r.text);
   return r.j.job_id;
 }
 const jobRow = (id) => BC.getLzBcDb().prepare('select * from bc_jobs where job_id = ?').get(id);
+/** 前の試験が残した「分からない」回を記して片付ける (分からない回が残る間はほかの CSV も積めない = 次の試験のため) */
+const clearUnknown = () => {
+  for (const j of BC.getLzBcDb().prepare("select job_id from bc_jobs where state = 'unknown' and resolved_outcome is null").all()) {
+    BC.resolveJob(BC.getLzBcDb(), { jobId: j.job_id, outcome: 'not_imported', note: '試験の片付け', by: 'naka@test', now: NOW });
+  }
+};
 const noExit = { onExitHook: () => {}, offExitHook: () => {}, sleep: async () => {} };
 
 await ta('[R] miniPC の 1 回: 成功 / 押すを断られた = 押さない / 押した後に止まった = unknown → 記す / エラー / ファイルの確かめ / この PC の取込済み / 届かない = 残して次に送る / 忙しい / 途中で終わった', async () => {
@@ -695,6 +702,7 @@ await ta('[R] miniPC の 1 回: 成功 / 押すを断られた = 押さない / 
   const pend = JSON.parse(fs.readFileSync(path.join(env.logDir, 'bc-import-pending', `job-${id}.json`), 'utf8'));
   assert.deepEqual([pend.body.executed, pend.body.reason], [true, 'process_exit']);
   assert.equal(jobRow(id).state, 'unknown', '本当の終わりの知らせ = 押した後に止まった');
+  clearUnknown();
   // 「押す」の後に押してよい間 (ポータルの press_window_ms) を過ぎた = 押さない (止まった miniPC が後で押さない。Codex R1 High)
   {
     e = await newExport(1);
@@ -864,6 +872,7 @@ await ta('[P] 本物の barcode-steps.js の ①: 実行ボタンの前にポー
     out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, session: sessionWith(m), log: () => {}, ...noExit, now: () => local });
     assert.deepEqual([m.st.exec, m.st.ok, out.executed, jobRow(id).state], [1, 0, true, 'unknown'], '確認を承認しない = 取込は始まっていない (押した後なので分からない側)');
     assert.match(jobRow(id).log, /ブラウザの確認 dialog を承認しない .*\(押してよい間も過ぎている\)/);
+    clearUnknown();
     await m.ctx.close();
     // 間の中でも、ボタンの道ではブラウザの確認 dialog は承認しない (承認は node から送る = 時刻を見た後に止まると締め切りの後に承認しうる。Codex R5 High)
     e = await newExport(1);
@@ -907,6 +916,7 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
     const page = await browser.newPage();
     const errs = [];
     page.on('pageerror', (x) => errs.push(String(x)));
+    clearUnknown();
     NOW = jst('15:00');   // 来た印が切れている (前の回は 14:00 台)
     const e = await newExport(1);
     await page.goto(`${ORIGIN}/apps/master-edit/lz-csv`);
@@ -968,14 +978,16 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
     assert.equal(jobRow(id).state, 'unknown');
     await page.reload();
     await page.locator(`[data-bc-resolve-form="${id}"]`).waitFor();   // 最後の回 = 下の③にも出る
-    // 後からほかの CSV の回が来た (最後の回でなくなった) = その CSV の行で記す (Codex R1 Medium)
+    // 分からない回が残る間は、ほかの CSV も積めない (ロジザード側の取込が終わったと言えない。Codex R6 High)・その CSV の行でも記せる (Codex R1 Medium)
     const e3 = await newExport(1);
-    const id3 = await queue(e3);
-    await call('POST', `/api/lz-csv/import/${id3}/cancel`, {});
+    await runnerSeen();
+    const r3 = await call('POST', `/api/lz-csv/${e3.id}/import`, importBody(e3));
+    assert.deepEqual([r3.status, r3.j.reason], [409, 'unresolved_other']);
     await page.reload();
+    assert.equal(await page.locator(`button[data-bc-import="${e3.id}"]`).isDisabled(), true);
+    assert.match(await page.locator(`[data-bc-why="${e3.id}"]`).textContent(), /ほかの取り込み .*取り込めたか分からない/);
     const rf = page.locator(`[data-bc-resolve-cell="${id}"]`);
     await rf.waitFor();
-    assert.equal(await page.locator(`[data-bc-resolve-form="${id}"]`).count(), 0, '下の③は最後の回だけ');
     assert.match(await page.locator(`[data-bc-why="${e2.id}"]`).textContent(), /取り込めたか分からない/);
     await rf.locator('input[value="imported"]').check();
     await rf.locator('textarea').fill('履歴 16:00 logizard_bc_upload.csv 1 件 エラー 0');
@@ -991,6 +1003,7 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
 });
 
 await ta('[X] ボタンの回が押した後 (executing / exporting) は、別の PC の「手の取込」を始めさせない (手の取込が開いている間は押させない = I3)・同期の処理の中で確かめる (Codex R5 High)', async () => {
+  clearUnknown();
   NOW = jst('10:00', '2030-01-12');
   const e = await newExport(1);
   const id = await queue(e);
@@ -1008,6 +1021,35 @@ await ta('[X] ボタンの回が押した後 (executing / exporting) は、別�
   await mcall(`/jobs/${id}/final`, { claim_token: cl.j.claim_token, executed: true, import_result: { status: 'ok', counts: { total: 1, errors: 0 } }, export_result: { status: 'ok', rows: 3 } });
   r = await openManual();
   assert.notEqual(r.j.error, 'bc_import_running', '終わった後 = 手の取込のほかの決まりで判断');
+  // 押した後に「分からない」のまま = ロジザード側の取込が終わったと言えない = 手の取込も、ほかの CSV のボタンの取り込みも始めない (Codex R6 High)
+  {
+    const e2 = await newExport(1);
+    const id2 = await queue(e2);
+    const c2 = await runnerSeen();
+    await mcall(`/jobs/${id2}/executing`, { claim_token: c2.j.claim_token });
+    await mcall(`/jobs/${id2}/final`, { claim_token: c2.j.claim_token, executed: true, import_result: { status: 'unknown', summary: '途切れた' } });
+    assert.equal(jobRow(id2).state, 'unknown');
+    r = await openManual();
+    assert.deepEqual([r.status, r.j.error], [409, 'bc_import_running']);
+    assert.match(r.j.message, /取り込めたか分からない/);
+    const e3 = await newExport(1);
+    await runnerSeen();
+    const q3 = await call('POST', `/api/lz-csv/${e3.id}/import`, importBody(e3));
+    assert.deepEqual([q3.status, q3.j.reason], [409, 'unresolved_other']);
+    assert.equal((await call('POST', `/api/lz-csv/import/${id2}/resolve`, { outcome: 'not_imported', note: '履歴に取込なし' })).status, 200);
+    assert.notEqual((await openManual()).j.error, 'bc_import_running', '人が記した後 = 手の取込のほかの決まりで判断');
+  }
+  // 帳面のファイルがあるのに読めない = 手の取込を始めない (503・Codex R6 High)
+  {
+    const keep0 = BC.getLzBcDb();
+    const broken = BC.openLzBcDb(':memory:');
+    broken.close();
+    BC.__setLzBcDb(broken);
+    try {
+      r = await openManual();
+      assert.deepEqual([r.status, r.j.error], [503, 'bc_state_unreadable']);
+    } finally { BC.__setLzBcDb(keep0); }
+  }
   // 帳面のファイルが無い (ボタンを一度も使っていない) = 動いていない
   const prev = process.env.DATA_DIR;
   const keep = BC.getLzBcDb();
