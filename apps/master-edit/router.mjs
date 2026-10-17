@@ -473,8 +473,11 @@ async function resolveStaleSetPlans(db, codes, { actor = null, parentCode = null
     const free = (await db.query(`select pg_catalog.pg_try_advisory_lock(${LOCK}) as ok`, [id])).rows[0].ok === true;
     if (!free) { if (typeof st.touch === 'function') st.touch(id); continue; }
     try {
-      const rec = (await db.query(`select status, result ->> 'sku_id' as sku_id from ops.master_edit_requests where request_id = $1::uuid`, [id])).rows[0];
-      if (rec && rec.status === 'done') {
+      const rec = (await db.query(`select status, result ->> 'sku_id' as sku_id, result ->> 'request_payload_hash' as request_hash from ops.master_edit_requests where request_id = $1::uuid`, [id])).rows[0];
+      // 通った登録の中身 (要求のハッシュ) がこの作るセットと違う = 同じ番号で断られた押し直しの作るセット = 外す (取り込みも付けない・Codex R9 Medium)
+      const sameReq = !!(rec && c.request_hash && rec.request_hash === c.request_hash);
+      if (rec && rec.status === 'done' && !sameReq) st.mark(id, { state: 'dropped', note: '通った登録の中身と違う (同じ番号の押し直しの作るセット)' });
+      else if (rec && rec.status === 'done') {
         const cancelled = rec.sku_id ? (await db.query(`select 1 from ops.master_registrations where sku_id = $1::bigint and state = 'cancelled'`, [rec.sku_id])).rows.length > 0 : false;
         if (cancelled) st.mark(id, { state: 'dropped', note: '親の下書きを消した (登録をやめた)' });
         else st.mark(id, { state: 'registered', skuId: rec.sku_id ?? null });

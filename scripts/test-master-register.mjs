@@ -3086,6 +3086,15 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
   const chkC = await call('GET', '/apps/master-edit/api/set-code-check?code=sp-cancel2-2&parent=sp-x');
   assert.equal(chkC.j.ok, true, chkC.text);
   assert.equal(SPS.readSetPlan(bC2.request_id).state, 'dropped');
+  // (Codex R9 Medium) 通った登録 (done) でも中身 (要求のハッシュ) が違う waiting の作るセット = 同じ番号で断られた押し直しの残り = 外す
+  const ridDone = uuid();
+  const plainDone = await call('POST', '/apps/master-edit/api/new', { body: { request_id: ridDone, kind: 'single', code: 'sp-donehash', values: withReq('single', single()), card: { create: false } } });
+  assert.equal(plainDone.status, 200, plainDone.text);
+  SPS.writeSetPlan({ requestId: ridDone, requestHash: '5'.repeat(64), parentCode: 'sp-donehash', parentName: 'x', sets: [{ qty: 2, code: 'sp-donehash-2', name: 'x' }], actor: 'x@test' });
+  ph.prepare(`UPDATE ph_cdb_set_plans SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours') WHERE request_id = ?`).run(ridDone);
+  const chkD = await call('GET', '/apps/master-edit/api/set-code-check?code=sp-donehash-2&parent=sp-x');
+  assert.equal(chkD.j.ok, true, chkD.text);
+  assert.equal(SPS.readSetPlan(ridDone).state, 'dropped');
   // ⑩ (Codex R5 Medium 1) 登録の成否が分からない誤り (MasterWriteError でない = 接続が切れた・commit の後など) = 作るセットは waiting のまま (dropped にしない)
   MR.__setShippingRatesProvider(async () => { throw new Error('接続が切れた'); });
   const bUnk = spBody('sp-unknown', [{ qty: 2, code: 'sp-unknown-2', name: 'x' }]);
