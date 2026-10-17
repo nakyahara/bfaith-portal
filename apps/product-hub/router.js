@@ -44,7 +44,7 @@ import {
   progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
-  moveBoardCard, saveBoardOrder, assertStepOperable, canOperateSetStep, neRegistrationRows, neRegistrationCount,
+  moveBoardCard, saveBoardOrder, assertStepOperable, canOperateSetStep, neRegistrationRows, neRegistrationCount, reconcileConfirmableSets,
   composeStateOf, roleCodesOf,
 } from './lib/workflow-progress.js';
 import {
@@ -3377,6 +3377,7 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
     mallSummary: mallSummaryFor, reconcileSet: reconcileProvisionalCode });
   // 🆕 2026-10-17: 新商品の登録で作ったセットの下書き (NE で本コードを確かめるまで出品しない)。作ってから SET_PLAN_ALERT_DAYS 日を過ぎても NE に無い = 知らせ
   //   (タブの印・NE要対応の表の印と「それだけ見る」・カードの札)。確定の取り込み (NE要対応の表 / boardData) の後に数える (Codex R6 Low)
+  if (boardView === 'ad') reconcileConfirmableSets(db, reconcileProvisionalCode);   // 広告のタブは表もボードも作らない = 確定の取り込みだけ先に (Codex R7 Low)
   const setPlanAges = setPlanDraftAges(db);
   const setPlanLate = [...setPlanAges.values()].filter((x) => x.late).length;
   const setPlanLateOnly = boardView === 'ne' && filterParam === 'set_plan_late';
@@ -4048,7 +4049,7 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
     .get(code.trim().toLowerCase(), draft.id);
   if (dup) return res.status(400).json({ ok: false, error: `商品コード「${code}」は別のドラフト (#${dup.id}) が使っています` });
   // 🆕 2026-10-17 (Codex R6 Medium 2): 新商品の登録で作るセットに決まったコード (カードの取り込み待ち) にも差し替えない (取り込みでその下書きが作れなくなる)
-  const held = setCodeHeld(code.trim(), { db });
+  const held = setCodeHeld(code.trim(), { db, includeStale: true });   // 時間を過ぎた waiting も (ここでは登録の記録と照らせない・Codex R7 Medium 1)
   if (held && held.reason === 'ph_set_plan') return res.status(400).json({ ok: false, error: `${held.message}。別のコードを入れてください` });
 
   // NE 商品マスタに無いコードでも差し替えは許すが、**仮フラグは落とさない** (Codex R1 medium)。

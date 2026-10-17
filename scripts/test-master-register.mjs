@@ -3062,6 +3062,12 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
   const chkGone = await call('GET', '/apps/master-edit/api/set-code-check?code=sp-gone-2&parent=sp-x');
   assert.equal(chkGone.j.ok, true, chkGone.text);
   assert.equal(SPS.readSetPlan(ridGone).state, 'dropped');
+  // (Codex R7 Medium 1) 記録と照らせない product-hub の本コードの差し替えは、時間を過ぎた waiting も押さえる (includeStale)
+  const ridOld = uuid();
+  SPS.writeSetPlan({ requestId: ridOld, requestHash: '4'.repeat(64), parentCode: 'sp-old', parentName: 'x', sets: [{ qty: 2, code: 'sp-old-2', name: 'x' }], actor: 'x@test' });
+  ph.prepare(`UPDATE ph_cdb_set_plans SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours') WHERE request_id = ?`).run(ridOld);
+  assert.equal(SPS.setCodeHeld('sp-old-2'), null);
+  assert.equal(SPS.setCodeHeld('sp-old-2', { includeStale: true }).reason, 'ph_set_plan');
   // ⑩ (Codex R5 Medium 1) 登録の成否が分からない誤り (MasterWriteError でない = 接続が切れた・commit の後など) = 作るセットは waiting のまま (dropped にしない)
   MR.__setShippingRatesProvider(async () => { throw new Error('接続が切れた'); });
   const bUnk = spBody('sp-unknown', [{ qty: 2, code: 'sp-unknown-2', name: 'x' }]);

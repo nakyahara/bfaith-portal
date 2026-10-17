@@ -33,7 +33,7 @@ function refuse(status, reason, message, extra = {}) {
  *   カード (product_drafts・大文字小文字は同じと見る) か、ほかの登録の作るセット (登録できた / 書いたばかり) にあれば、その一言
  * @returns {null | { reason: 'ph_draft' | 'ph_set_plan', message, draft_id?, is_set? }} is_set = そのカードがセット (の下書き) = ふつうの単品のコードにもさせない
  */
-export function setCodeHeld(code, { requestId = null, db = getDB() } = {}) {
+export function setCodeHeld(code, { requestId = null, db = getDB(), includeStale = false } = {}) {
   const key = String(code ?? '').trim().toLowerCase();
   if (!key) return null;
   const d = db.prepare('SELECT id, parent_draft_id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY parent_draft_id IS NULL, id LIMIT 1').get(key);
@@ -44,9 +44,10 @@ export function setCodeHeld(code, { requestId = null, db = getDB() } = {}) {
   const p = db.prepare(`
     SELECT p.request_id, p.parent_code FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
     WHERE i.code_key = ? AND (? IS NULL OR p.request_id <> ?)
-      AND (p.state = 'registered' OR (p.state = 'waiting' AND p.created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)))
+      AND (p.state = 'registered' OR (p.state = 'waiting' AND (? = 1 OR p.created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?))))
     LIMIT 1
-  `).get(key, requestId, requestId, `-${WAITING_HOLD_MINUTES} minutes`);
+  `).get(key, requestId, requestId, includeStale ? 1 : 0, `-${WAITING_HOLD_MINUTES} minutes`);
+  //   includeStale = 時間を過ぎた waiting も押さえる (Company DB の保存の記録と照らせない呼び手 = product-hub の本コードの差し替え。照らせる master-edit は先に記録で決める)
   if (p) return { reason: 'ph_set_plan', message: `商品コード ${code} は ${p.parent_code} の登録で作るセットに決まっています` };
   return null;
 }

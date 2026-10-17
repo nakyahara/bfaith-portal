@@ -463,6 +463,12 @@ async function resolveStaleSetPlans(db, codes, { actor = null, parentCode = null
   const byId = new Map(rows.map((x) => [x.id, x]));
   for (const id of ids) {
     const rec = byId.get(id);
+    if (!rec) {
+      // 記録が見えない = まだ commit していない登録かもしれない。その request_id の鍵 (withRequestLock・保存の間ずっと持つ) が取れない = 動いている = 外さない (Codex R7 Medium 2)
+      const free = (await db.query("select pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended('master-edit.request:' || $1::text, 0)) as ok", [id])).rows[0].ok === true;
+      if (free) await db.query("select pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended('master-edit.request:' || $1::text, 0))", [id]);
+      if (!free) continue;
+    }
     if (rec && rec.status === 'done') st.mark(id, { state: 'registered', skuId: rec.sku_id ?? null });
     else st.mark(id, { state: 'dropped', note: rec ? `登録は ${rec.status} (記録で確かめた)` : '登録の記録が無い (予約の時間を過ぎたか、同じ人が押し直した)' });
   }
