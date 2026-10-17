@@ -11,6 +11,7 @@
  *   5 次の夜間ロード (同じ NE の材料) = 直した 2 つは sku_kind_held に出ない・構成は「同じ」で触らない (行も作った人もそのまま)
  *   6 断る: NE でセットでない・夜間ロードの記録が無い・ほかのセットの構成品・まとまりの子・NE の取得が古い・もうセット・NE の構成品が Company DB に無い
  *   7 (Codex R1) 今日以降を覆う閉じた原価の行 = 断る・commit の答えが分からない = SKU の鍵の後に読む・構成の判断の記録の形が違う = 断る
+ *   8 (Codex R2) 夜間ロードが読んだ構成の材料の控え (構成品と数量) が NE の取得と違う・控えが無い = 断る・構成品に今回セットにするコードがある (入れ子) = 断る
  * 使い方: node scripts/test-sku-kind-to-set.mjs
  */
 import assert from 'node:assert/strict';
@@ -27,6 +28,7 @@ const { setupVariationDb, basePlan, skuOf } = await import('./fixtures/master-va
 const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
 const { MASTER_OWNERSHIP } = await import('../config/master-ownership.mjs');
 const X = await import('./company-db/sku-kind-to-set.mjs');
+const ML = await import('../apps/warehouse/material-lineage.js');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -54,7 +56,16 @@ function nePlan(sets = NE_SETS) {
   p.setComponents = sets.map(([parent, , child, qty]) => ({ parentCode: parent, childCode: child, qty, source: 'ne' }));
   return p;
 }
-const nightly = async (runId, plan = nePlan()) => { const r = await runInitialLoad(db, plan, { log: quiet, runId, ownership: MASTER_OWNERSHIP }); assert.equal(r.ok, true, r.error); return r; };
+/** 夜間ロードが読んだ構成の材料 (世代と miniPC の DATA_DIR の控え = 本番の sync-to-render と同じ形)。matSets = 材料のセット (既定 = NE と同じ) */
+function withMaterial(plan, matSets = NE_SETS) {
+  const set_components = matSets.map(([parent, , child, qty]) => ({ セット商品コード: parent, 構成商品コード: child, 数量: qty }));
+  const products = [{ product_id: 1, 商品コード: 'x' }];
+  const g = ML.buildMaterialGeneration({ products, set_components, now: new Date() });
+  ML.saveMaterialSnapshot({ dataDir: tmp, generation: g, products, set_components });
+  plan.material = { set_components: { status: 'matched', content_hash: g.set_components.content_hash, row_count: g.set_components.row_count, generation: { generation_id: g.generation_id, created_at: g.created_at } } };
+  return plan;
+}
+const nightly = async (runId, plan = withMaterial(nePlan())) => { const r = await runInitialLoad(db, plan, { log: quiet, runId, ownership: MASTER_OWNERSHIP }); assert.equal(r.ok, true, r.error); return r; };
 
 // ── miniPC の warehouse.db の NE の完全な取得 (照合 ② が読む形・test-master-compare-ne.mjs の setNe と同じ書き方) ──
 const J = (v) => JSON.stringify(v);
@@ -222,8 +233,32 @@ await ta('[8] (Codex R1 Medium) commit の答えが分からないとき = SKU �
   assert.equal((await X.outcomeOf(null, ev, ids)).state, 'unknown');
 });
 
+await ta('[8b] (Codex R2) 夜間ロードの材料の構成の数量が NE の取得と違う = 断る・構成品に今回セットにするコードがある (入れ子) = 断る・材料の控えが無い = 断る', async () => {
+  // 材料の nametag70 = nametag10 × 6 (NE の取得は × 7)
+  await nightly('load_kind_qty', withMaterial(nePlan(), NE_SETS.map((x) => (x[0] === 'nametag70' ? [x[0], x[1], x[2], 6, x[4]] : x))));
+  await pg.query(`update core.sku_costs set valid_to = null where sku_id = $1 and valid_to is not null and valid_to >= (now() at time zone 'Asia/Tokyo')::date`, [await id('nametag70')]);   // [7] の閉じた行を戻す
+  let r = await run(opts(['nametag70']), await neNow());
+  assert.match(r.problems.join(' '), /夜間ロードの材料の構成 \(nametag10 × 6\) と NE の取得の構成 \(nametag10 × 7\) が違う/);
+  assert.equal(r.problems.length, 1, r.problems.join('\n'));
+  await nightly('load_kind_qty2');   // 材料 = NE と同じ
+  assert.deepEqual((await run(opts(['nametag70']), await neNow())).problems, []);
+  // 入れ子: NE で nametag70 の構成品が nametag99 (どちらも今回セットにする)
+  const nest = NE_SETS.map((x) => (x[0] === 'nametag70' ? [x[0], x[1], 'nametag99', 1, x[4]] : x));
+  await nightly('load_kind_nest', withMaterial(nePlan(nest), nest));
+  r = await run(opts(['nametag70', 'nametag99']), await neNow({ sets: nest }));
+  assert.match(r.problems.join(' '), /構成品 nametag99 も今回セットにする/);
+  // 材料の控えが DATA_DIR に無い
+  const lm = (await one(`select generation_id from ops.load_materials where ingest_run_id = 'load_kind_nest' and entity = 'set_components'`)).generation_id;
+  const file = path.join(tmp, fs.readdirSync(tmp).find((d) => fs.existsSync(path.join(tmp, d, `${lm}.json.gz`))), `${lm}.json.gz`);
+  fs.renameSync(file, `${file}.bak`);
+  r = await run(opts(['nametag70']), await neNow({ sets: nest }));
+  assert.match(r.problems.join(' '), /材料の控え .* が DATA_DIR に無い/);
+  fs.renameSync(`${file}.bak`, file);
+  await nightly('load_kind_back');   // 元の NE に戻す
+});
+
 await ta('[9] (Codex R1 Medium) 構成の持ち主が load なのに最新の夜間ロードの構成の判断の記録が持ち主 company の形 = 断る (夜間ロードの材料の構成と照らせない)', async () => {
-  const r0 = await runInitialLoad(db, nePlan(), { log: quiet, runId: 'load_kind_3', ownership: { ...MASTER_OWNERSHIP, sku_components: 'company' } });
+  const r0 = await runInitialLoad(db, withMaterial(nePlan()), { log: quiet, runId: 'load_kind_3', ownership: { ...MASTER_OWNERSHIP, sku_components: 'company' } });
   assert.equal(r0.ok, true, r0.error);
   const r = await run(opts(['nametag70']), await neNow());
   assert.match(r.problems.join(' '), /構成の判断の記録 \(set_components\) が無い \/ 形が違う/);
