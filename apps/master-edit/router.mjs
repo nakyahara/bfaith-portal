@@ -791,7 +791,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     entryClosed: gated || !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || VARIATION_KEYS.some((k) => own[k] !== 'company') || !lease.open
       || !writeConfigured() || !(page && page.backfillDone),
     entryWhy,
-    maxKids: VARIATION_MAX_CHILDREN,
+    maxKids: VARIATION_MAX_CHILDREN, maxRefs: MAX_REFERENCE_URLS,   // 🆕 2026-10-17: 参考 URL (単品の登録と同じ上限)
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     orderSettings: orderScreen(req, editorGate(req), null),
     orderNoneApplies,
