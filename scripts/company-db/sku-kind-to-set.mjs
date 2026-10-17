@@ -206,6 +206,16 @@ export async function readKindPlan(db, opts, { ne, now = new Date() } = {}) {
     compDec = rows.find((r) => r.section === 'set_components')?.payload ?? null;
     if (!sk || !Array.isArray(sk.payload?.kind_held)) problems.push(`最新の夜間ロード (${lastLoad.ingest_run_id}) の判断の記録 skus.kind_held が無い`);
     else held = new Map(sk.payload.kind_held.filter((x) => Array.isArray(x)).map((x) => [normSku(x[0]), { ne_kind: x[1], cdb_kind: x[2] }]));
+    // 構成の持ち主が load = 夜間ロードの構成の判断の記録が要る (形が違う・持ち主が合わない = 夜間ロードの材料と入れる構成を照らせない = 断る。#R1 Medium)
+    if (context.components_owner === 'load') {
+      if (!compDec || compDec.owned !== true || !Array.isArray(compDec.skipped)) {
+        problems.push(`最新の夜間ロード (${lastLoad.ingest_run_id}) の構成の判断の記録 (set_components) が無い / 形が違う / 持ち主が load でない = 夜間ロードの材料の構成と照らせない`);
+        compDec = null;
+      }
+    } else {
+      warnings.push('構成の持ち主が company = 夜間ロードは構成を入れない・直さない (この道具の行がそのまま残る)。夜間ロードの材料の構成とは照らさない');
+      compDec = null;
+    }
   }
 
   // SKU ごと
@@ -259,7 +269,7 @@ export async function readKindPlan(db, opts, { ne, now = new Date() } = {}) {
     const f = facts.get(norm) || { children: [] };
     // 構成の持ち主が load なら、夜間ロードが飛ばした構成品 (kind_held) = NE の構成品 (2 つの NE の写しが同じ構成)
     let loadChildren = null;
-    if (compDec && compDec.owned === true && Array.isArray(compDec.skipped)) {
+    if (compDec) {
       loadChildren = compDec.skipped.filter((x) => Array.isArray(x) && normSku(x[0]) === norm && x[2] === 'kind_held').map((x) => normSku(x[1])).sort();
       const neKids = f.children.map((c) => c.code_norm);
       if (f.children.length && stable(loadChildren) !== stable(neKids)) {
@@ -285,6 +295,10 @@ export async function readKindPlan(db, opts, { ne, now = new Date() } = {}) {
     const open = (await db.query(`select sku_cost_id::text as id, cost_jpy::text as cost_jpy, cost_source, cost_status, valid_from::text as valid_from
        from core.sku_costs where sku_id = $1 and valid_to is null`, [k.sku_id])).rows;
     if (open.length > 1) problems.push(`${code}: 閉じていない原価の行が ${open.length} 行`);
+    // 今日以降を覆う閉じた原価の行 (今の開いている行のほか) = 今日からの行を足すと期間が重なる。
+    //   0051 の core.guard_sku_cost_overlap は DB の持ち主の書き込みを source_system が画面・観測のときしか見ない = ここで断る (#R1 High)
+    const later = (await db.query(`select count(*)::int as n from core.sku_costs where sku_id = $1 and valid_to is not null and valid_to >= $2::date`, [k.sku_id, today])).rows[0].n;
+    if (later) problems.push(`${code}: 今日 (${today}) 以降を覆う閉じた原価の行が ${later} 行ある = 今日からの原価を足すと期間が重なる (画面で原価を確かめてから)`);
     const openCost = open[0] ? { ...open[0], cost_jpy: Number(open[0].cost_jpy) } : null;
     let derived = { changes: [], notes: [], costPlan: null };
     if (derivedOwned && kids.length === f.children.length && kids.length) {
@@ -355,8 +369,15 @@ export async function outcomeOf(reconnect, requestId, skuIds) {
   let c = null;
   try {
     c = await reconnect();
-    const r = (await c.db.query(`select (select count(*)::int from events.master_change_events e where e.request_id = $1) as events,
-        (select count(*)::int from core.skus k where k.sku_id = any ($2::bigint[]) and k.sku_kind = 'set') as sets`, [requestId, skuIds])).rows[0];
+    // 元の取引は commit / rollback まで SKU の鍵を持つ = 同じ鍵を取れた = 元の取引は終わった (取れない = lock_timeout = 分からない)。
+    //   その後に読む (read committed = 鍵の後の文は元の取引の commit を見る。#R1 Medium: 終わる前に読んで「書けていない」と言わない)
+    await c.db.query('begin');
+    let r;
+    try {
+      for (const id of [...skuIds].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0))) await c.db.query(SKU_LOCK_SQL, [id]);
+      r = (await c.db.query(`select (select count(*)::int from events.master_change_events e where e.request_id = $1) as events,
+          (select count(*)::int from core.skus k where k.sku_id = any ($2::bigint[]) and k.sku_kind = 'set') as sets`, [requestId, skuIds])).rows[0];
+    } finally { try { await c.db.query('rollback'); } catch { /* */ } }
     if (r.events > 0 && r.sets === skuIds.length) return { state: 'written' };
     if (r.events === 0 && r.sets === 0) return { state: 'not_written' };
     return { state: 'unknown', why: `変更の記録 ${r.events} 件・セットになった SKU ${r.sets} / ${skuIds.length}` };
@@ -422,11 +443,15 @@ export async function applyKind(db, opts, { ne, now = new Date(), reconnect = nu
     for (const it of r.plan.items) {
       const v = (await db.query(`select s.sku_kind, s.product_id, (select coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(c.child_sku_id::text, c.qty) order by c.child_sku_id), '[]'::jsonb)
            from core.sku_components c where c.parent_sku_id = s.sku_id) as comps,
-           (select count(*)::int from core.sku_costs x where x.sku_id = s.sku_id and x.valid_to is null) as open_costs
-         from core.skus s where s.sku_id = $1`, [it.sku_id])).rows[0];
+           (select count(*)::int from core.sku_costs x where x.sku_id = s.sku_id and x.valid_to is null) as open_costs,
+           (select count(*)::int from core.sku_costs x where x.sku_id = s.sku_id and coalesce(x.valid_to, 'infinity'::date) >= $2::date) as from_today
+         from core.skus s where s.sku_id = $1`, [it.sku_id, r.context.today])).rows[0];
       const want = [...it.components].sort((a, b) => (BigInt(a.sku_id) < BigInt(b.sku_id) ? -1 : 1)).map((c) => [c.sku_id, c.qty]);
-      if (v.sku_kind !== 'set' || v.product_id != null || stable(v.comps) !== stable(want) || v.open_costs > 1) {
-        throw Object.assign(new Error(`${it.code}: 書いた後の形が計画と違う (${v.sku_kind}・product ${v.product_id}・構成 ${JSON.stringify(v.comps)}・原価の行 ${v.open_costs})`), { reason: 'verify_failed' });
+      // 今日を覆う原価の行 = 原価を付け替えた (set_calc) なら 1 行・空にした (clear) なら 0 行・変えないなら前と同じ (期間を重ねない・#R1 High)
+      const cp = it.derived.cost_plan;
+      const wantToday = cp === 'clear' ? 0 : cp ? 1 : null;
+      if (v.sku_kind !== 'set' || v.product_id != null || stable(v.comps) !== stable(want) || v.open_costs > 1 || (wantToday != null && v.from_today !== wantToday)) {
+        throw Object.assign(new Error(`${it.code}: 書いた後の形が計画と違う (${v.sku_kind}・product ${v.product_id}・構成 ${JSON.stringify(v.comps)}・開いた原価の行 ${v.open_costs}・今日を覆う原価の行 ${v.from_today})`), { reason: 'verify_failed' });
       }
     }
   } catch (e) {
