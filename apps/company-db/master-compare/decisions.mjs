@@ -61,6 +61,25 @@ export async function writeNeCodes(writer, { compareRunId, entries }) {
 }
 
 const jsonOf = (r) => (typeof r === 'string' ? JSON.parse(r) : r);
+
+/**
+ * 🆕 0083: 関数があって、この接続のロールが実行できるか ('ok' / 'not_applied' = 関数が無い (migration の前) / 'no_privilege' = ロールの流し直しの前)。
+ *   有無だけでなく実行権も見る (設計 25 R3 L3 = 関数があっても実行権が無い間に落ちない)
+ */
+export async function functionReady(writer, signature) {
+  return (await writer.query(`select case when to_regprocedure($1::text) is null then 'not_applied'
+      when has_function_privilege(to_regprocedure($1::text)::oid, 'execute') then 'ok' else 'no_privilege' end as s`, [signature])).rows[0].s;
+}
+/**
+ * 🆕 0083 (設計 25 §2.5・PR-1 = 影): 今朝の NE の値を書く (writer = watch_writer の接続・関数だけ・1 回 = 1 つの取引で全部を入れ替えて印を進める)。
+ *   payload = compare-ne.mjs の neValuesOf の payload。関数が無い・実行権が無い = 書かない (state だけ返す)。断られた = 例外 (呼び手が失敗として残す)
+ */
+export async function writeNeValues(writer, { compareRunId, payload }) {
+  const ready = await functionReady(writer, 'ops.record_ne_values(jsonb)');
+  if (ready !== 'ok') return { write: ready };
+  const r = jsonOf((await writer.query('select ops.record_ne_values($1::jsonb) as r', [JSON.stringify({ compare_run_id: compareRunId, ...payload })])).rows[0].r);
+  return { write: 'ok', written: r };
+}
 /**
  * 新商品の NE 登録の CSV の確かめ待ちの商品を、照合の回の始まりに DB が回へ写す (0053 の ops.snapshot_ne_reg_targets・#1571 Codex R2 Medium 1)。
  * 観測はこの写しとちょうど同じ商品だけ (DB が確かめる) = 呼び手は商品を選べない・取得の途中の配る / 申告 / 使わないと競わない。

@@ -18,7 +18,7 @@
   const none = (key) => '<label class="nonechk"><input type="checkbox" data-none="' + hx(key) + '" aria-label="' + hx((blankLabels[key] || {}).label || key) + 'を入力なしにする"' + dis + '><span>入力なし</span></label>';
   const part = (key) => ' data-none-part="' + hx(key) + '"';
   const pageData = showForm ? {
-    base, canSave, maxKids, blankKeys, blankLabels, lzReady: !!locals.lzBarcodeReady,
+    base, canSave, maxKids, maxRefs, blankKeys, blankLabels, lzReady: !!locals.lzBarcodeReady,
     suppliers: page.activeSuppliers.map((s) => [s.code, s.name]),
     shipping: shippingRates ? shippingRates.map((r) => [r.code, r.method || '', r.cost]) : null,
   } : null;
@@ -171,6 +171,12 @@
           <div id="card-fields">
             <div class="f" data-row="card.official_url"><label class="lab" for="official-url">公式ページ URL</label><div class="ctl"><input class="in w-l" id="official-url" placeholder="https://"<%- part('card.official_url') %><%= dis %>><%- none('card.official_url') %></div></div>
             <div class="f" data-row="card.amazon_url"><label class="lab" for="amazon-url">Amazon URL</label><div class="ctl"><input class="in w-l" id="amazon-url" placeholder="https://www.amazon.co.jp/dp/…"<%- part('card.amazon') %><%= dis %>><%- none('card.amazon') %><span class="hint" style="flex-basis:100%">Amazon に無い商品は「入力なし」</span></div></div>
+            <%# 🆕 2026-10-17: 参考 URL (単品の登録 = new.ejs と同じ欄・何行でも・まとまりのカードに入る。動き = public/me-variation.js) %>
+            <div class="f" data-row="card.reference_urls" style="align-items:start"><div class="lab" id="lab-refs" style="padding-top:8px">参考 URL</div>
+              <div class="ctl col" style="gap:0" id="refs" role="group" aria-labelledby="lab-refs"<%- part('card.reference_urls') %>>
+                <div id="ref-rows"><div class="urlrow"><span class="idx" aria-hidden="true">1</span><input class="in ref-url" autocomplete="off" aria-label="参考 URL 1" placeholder="https://"<%= dis %>><button class="iconbtn del" type="button" data-ref-del aria-label="参考 URL 1 を外す"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg></button></div></div>
+                <div class="refsfoot"><button class="btn sm" type="button" id="ref-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>URL を足す</button><%- none('card.reference_urls') %><span class="hint"><%= maxRefs %> 個まで</span></div>
+              </div></div>
           </div>
         </section>
 

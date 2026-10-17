@@ -13,6 +13,7 @@
  *   S 探す・読む・確かめる: コード・名前・子の商品コードで探す・まとまりでない単品は出さない・今ある子の値・確かめの答え (重なり・product-hub の下書き・JAN)
  *   E 商品の画面の保存 (saveSku) に代表の欄は無い = parent_code は 400 parent_not_editable
  *   C NE 登録の CSV: まとまりの子は回ごとに並ぶ・1 回目の CSV を先に作ってから残りを足す・未処理の回が重なると 1 つのファイル (代表商品コード = まとまりのコード・JAN = empty)・1 つのファイルの上限を超える登録は断る
+ *   U 🆕 2026-10-17: 参考 URL (形・20 個まで・まとまりの共通の欄・知らせ・product-hub のまとまりのカード・入力なし)・読む API の子の商品名 (前からある子の名前を仮に入れる元)
  * 使い方: node scripts/test-master-variation-batch.mjs
  */
 import assert from 'node:assert/strict';
@@ -471,6 +472,84 @@ await ta('[C2] 未処理の子 (CSV にしていない) + 今回 が 1 つのフ
     assert.equal((await V.readVariationGroup(db, gid)).pending_unfiled, 2);
   } finally { V.__setMaxFileRowsForTest(null); }
   assert.equal(V.variationMaxFileRows(), G.REG_MAX_ROWS);
+});
+
+await ta('[SP-V] 🆕 2026-10-17 (Codex R4): 作るセットに決まったコード (product-hub の予約・セットの下書き) = 新しいまとまりのコードにも子のコードにもさせない (開いた後 = コードの鍵の後にもう一度・何も保存しない)', async () => {
+  const one1 = (code) => ({ group: { mode: 'new', code, name: 'x' }, axes: [{ axis: 1, name: 'カラー' }], options: [{ axis: 1, code: '-WH', name: 'ホワイト' }],
+    children: [{ code: `${code}-WH`, choices: { 1: '-WH' }, name: 'x【ホワイト】' }], values: VALUES });
+  const resv = (hit) => async (c) => (c.toLowerCase() === hit ? { status: 409, reason: 'set_code_reserved', message: `${c} はほかの登録の作るセットに決まっています` } : null);
+  const e1 = await rejects(reg(one1('spv1'), { codeReserved: resv('spv1-wh') }), 409, 'set_code_reserved');
+  assert.deepEqual([e1.extra.field, e1.extra.code], ['children', 'spv1-WH']);
+  const e2 = await rejects(reg(one1('spv2'), { codeReserved: resv('spv2') }), 409, 'set_code_reserved');
+  assert.equal(e2.extra.field, 'group.code');
+  assert.equal((await q("select count(*)::int as n from core.skus where code_norm in ('spv1-wh', 'spv2-wh')"))[0].n, 0, '何も保存しない');
+  const ok = await reg(one1('spv3'), { codeReserved: resv('zzz') });
+  assert.equal(ok.ok, true);
+});
+
+console.log('\n参考 URL・前からある子の名前 (2026-10-17)');
+await ta('[U1] 参考 URL (単品の登録と同じ決まり = parseCard): 形 (http(s)://・1,000 字・改行なし)・20 個まで・空は捨てる・同じ URL は 1 つ・どの欄か = card.reference_urls・要求のハッシュに入る', async () => {
+  const base = { actor: 'naka@test', requestId: uuid(), group: { mode: 'new', code: 'refg', name: '参考' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-A', name: 'A' }],
+    children: [{ code: 'refg-A', choices: { 1: '-A' }, name: '参考【A】' }], values: { ...VALUES } };
+  const bad = (refs) => { try { V.parseVariationRequest({ ...base, card: { reference_urls: refs } }); } catch (e) { return [e.status, e.extra.field]; } return null; };
+  for (const refs of [['ftp://x.example'], ['example.com/a'], ['https://a.example/ b'], [`https://a.example/${'x'.repeat(1000)}`], ['https://a.example/\nb'], 'https://a.example', [1],
+    Array.from({ length: 21 }, (_, i) => `https://a.example/${i}`)]) assert.deepEqual(bad(refs), [400, 'card.reference_urls'], JSON.stringify(refs).slice(0, 80));
+  const r = V.parseVariationRequest({ ...base, card: { reference_urls: [' https://a.example/1 ', '', 'https://a.example/1', 'http://b.example/2'] } });
+  assert.deepEqual(r.card.reference_urls, ['https://a.example/1', 'http://b.example/2']);
+  assert.equal(V.parseVariationRequest({ ...base, card: { reference_urls: Array.from({ length: 20 }, (_, i) => `https://a.example/${i}`) } }).card.reference_urls.length, 20);
+  // 参考 URL が無い要求のハッシュは前と同じ (card.reference_urls = [] はもとから入っていた)・違う URL = 違うハッシュ
+  const h0 = V.variationPayloadHashOf(V.parseVariationRequest(base));
+  assert.equal(V.variationPayloadHashOf(V.parseVariationRequest({ ...base, card: { reference_urls: [] } })), h0);
+  assert.notEqual(V.variationPayloadHashOf(r), h0);
+});
+
+await ta('[U2] 参考 URL を付けたまとまりの登録: まとまりの共通の欄 (ops.variation_group_revisions.common) とまとまりの知らせ (ph-group-v1 の common) に入る → product-hub のまとまりのカードの参考 URL (draft_reference_urls) / 足す登録の知らせにも出る', async () => {
+  const refs = ['https://maker.example/refs/1', 'http://shop.example/item?id=2'];
+  const r = await reg({ group: { mode: 'new', code: 'refgrp', name: '参考のまとまり' }, axes: [{ axis: 1, name: 'カラー' }], options: [{ axis: 1, code: '-WH', name: 'ホワイト' }, { axis: 1, code: '-BK', name: 'ブラック' }],
+    children: [{ code: 'refgrp-WH', choices: { 1: '-WH' }, name: '参考のまとまり【ホワイト】' }, { code: 'refgrp-BK', choices: { 1: '-BK' }, name: '参考のまとまり【ブラック】' }], values: VALUES,
+    card: { official_url: 'https://maker.example/x', amazon_url: '', asin: '', reference_urls: [...refs, refs[0]] } });
+  assert.equal(r.ok, true);
+  assert.deepEqual((await one('select common from ops.variation_group_revisions where group_product_id = $1', [r.group_product_id])).common.reference_urls, refs);
+  const ob = await q('select event_id::text as id, payload from ops.product_hub_outbox where group_product_id = $1 order by revision', [r.group_product_id]);
+  assert.equal(ob.length, 1);
+  assert.equal(O.groupSnapshotShapeProblem(ob[0].payload), null);
+  assert.deepEqual(ob[0].payload.common.reference_urls, refs);
+  // product-hub のまとまりのカード (作るときだけ Company DB の値を入れる = 公式 URL・Amazon と同じ)
+  (await import('../apps/warehouse-mirror/db.js')).initMirrorDB();   // product-hub の DB はミラーの DB の上 (試験の DATA_DIR = 一時の場所)
+  const PG = await import('../apps/product-hub/services/cdb-group-intake.js');
+  const ph = (await import('../apps/product-hub/db.js')).getDB();
+  const res = await asEditor(() => O.runGroupOutbox(db, (ev) => PG.applyCdbGroupEvent(ev), { eventId: ob[0].id, limit: 1 }));
+  assert.equal(res[0].status, 'done', JSON.stringify(res));
+  const d = ph.prepare('SELECT id, official_url FROM product_drafts WHERE cdb_group_product_id = ?').get(Number(r.group_product_id));
+  assert.equal(d.official_url, 'https://maker.example/x');
+  assert.deepEqual(ph.prepare('SELECT url FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id').all(d.id).map((x) => x.url), refs);
+  // 足す登録: 共通の欄はその登録の値で置き換わる (知らせにも出る)。カードの欄は作るときだけ = 今あるカードの参考 URL は変えない (公式 URL・Amazon と同じ)
+  const r2 = await reg({ group: { mode: 'add', product_id: r.group_product_id }, options: [{ axis: 1, code: '-NV', name: 'ネイビー' }], children: [{ code: 'refgrp-NV', choices: { 1: '-NV' }, name: '参考のまとまり【ネイビー】' }],
+    values: VALUES, card: { reference_urls: ['https://maker.example/refs/3'] } });
+  assert.equal(r2.ok, true);
+  assert.deepEqual((await q('select payload from ops.product_hub_outbox where group_product_id = $1 order by revision', [r.group_product_id])).pop().payload.common.reference_urls, ['https://maker.example/refs/3']);
+  // 読む API (画面の「今あるまとまりに足す」) は子の商品名も返す = 前からある子の名前を仮に入れる元
+  const g = await V.readVariationGroup(db, (await one(`select product_id::text as id from core.products where display_code = 'ws100'`)).id);
+  assert.ok(g.children.length >= 3 && g.children.every((k) => typeof k.name === 'string' && k.name), JSON.stringify(g.children.map((k) => k.name)));
+});
+
+await ta('[U3] 入力なし (まとまり): 参考 URL も 値か入力なし (lib/master-register-blanks.mjs)・両方 = 400 blank_with_value・どちらも無い = 400 blank_unmarked (field = card.reference_urls)・理由に「参考URL」', async () => {
+  const BLK = await import('../lib/master-register-blanks.mjs');
+  assert.ok(BLK.BLANK_KEYS.variation.includes('card.reference_urls'));
+  assert.deepEqual(BLK.BLANK_KEYS.variation.slice(BLK.BLANK_KEYS.variation.indexOf('card.official_url')), ['card.official_url', 'card.amazon', 'card.reference_urls', 'children.jan'], '画面の上からの順');
+  const body = (refs) => ({ values: { standard_price: '1', cost: { jpy: '1' }, shipping_code: 'S01', inbound_date_managed: '0' }, card: { official_url: 'https://a.example', amazon_url: 'https://www.amazon.co.jp/dp/B000000000', reference_urls: refs },
+    children: [{ code: 'g-A', jan: JAN_A }] });
+  assert.ok(BLK.missingBlankKeys('variation', body([])).includes('card.reference_urls'));
+  assert.ok(BLK.missingBlankKeys('variation', body(['', '  '])).includes('card.reference_urls'), '空の行だけ = 値が無い');
+  assert.ok(!BLK.missingBlankKeys('variation', body(['https://r.example'])).includes('card.reference_urls'));
+  const err = (fn) => { try { fn(); } catch (e) { return [e.status, e.reason, e.extra.field]; } return null; };
+  assert.deepEqual(err(() => BLK.checkRegisterBlanks('variation', { ...body([]), blanks: [] })), [400, 'blank_unmarked', 'card.reference_urls']);
+  assert.deepEqual(err(() => BLK.checkRegisterBlanks('variation', { ...body(['https://r.example']), blanks: ['card.reference_urls'] })), [400, 'blank_with_value', 'card.reference_urls']);
+  assert.deepEqual(BLK.checkRegisterBlanks('variation', { ...body([]), blanks: ['card.reference_urls'] }), ['card.reference_urls']);
+  const pre = BLK.prepareRegisterBody('variation', { ...body([]), blanks: ['card.reference_urls'] });
+  assert.equal(pre.body.reason, '新商品の登録 (色違い・サイズ違い) · 入力なし: 参考URL');
+  assert.deepEqual(pre.childReasons, { 'g-A': '新商品の登録 (色違い・サイズ違い) · 入力なし: 参考URL' });
+  assert.equal(BLK.blankLabelsOf('variation')['card.reference_urls'].label, '参考 URL');
 });
 
 console.log(`\n${passed} ok`);

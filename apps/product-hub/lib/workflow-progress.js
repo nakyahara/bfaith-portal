@@ -1576,7 +1576,7 @@ export function reconcileConfirmableSets(db, reconcile, { max = 200 } = {}) {
  * @param {(db, draft) => void} [reconcile] 本コードの取り込みを追いかける関数 (注入。
  *   mirror は毎時なので、この画面を開くだけで追いつく。新しい定期実行は作らない)
  */
-export function neRegistrationRows(db, { reconcile = null, limit = 300 } = {}) {
+export function neRegistrationRows(db, { reconcile = null, limit = 300, ids = null } = {}) {
   // 🚨 確定の取り込みは **表示のクエリより先に** 走らせる (Codex R2 medium)。
   // 先に LIMIT で切ってから確定分を落とすと、表示件数に穴が空く
   // (先頭 300 件が全部確定したら、301 件目以降に要対応があってもレスポンスは空になる)
@@ -1595,6 +1595,8 @@ export function neRegistrationRows(db, { reconcile = null, limit = 300 } = {}) {
     LEFT JOIN product_drafts p ON p.id = d.parent_draft_id
     WHERE d.parent_draft_id IS NOT NULL AND d.provisional_code = 1
       AND d.status NOT IN ('on_hold', 'excluded')
+      ${/* 🆕 2026-10-17: ids = この id のセットだけ (新商品の登録で作った下書きの「それだけを見る」)。LIMIT より前に絞る (Codex R5 Medium 2) */''}
+      ${Array.isArray(ids) ? `AND d.id IN (SELECT value FROM json_each(?))` : ''}
     ORDER BY CASE COALESCE(d.ne_registration_state, 'not_requested')
                WHEN 'needs_action' THEN 0
                WHEN 'requested' THEN 1
@@ -1603,7 +1605,7 @@ export function neRegistrationRows(db, { reconcile = null, limit = 300 } = {}) {
              COALESCE(d.ne_registration_requested_at, d.updated_at),
              d.id
     LIMIT ?
-  `).all(limit);
+  `).all(...(Array.isArray(ids) ? [JSON.stringify(ids.map(Number).filter(Number.isSafeInteger))] : []), limit);
   // 確定済みは上の SELECT が provisional_code=1 で弾いているので、ここでの選別は要らない
   // 並び順も SQL が決めている (ここで並べ替え直さない = 判断を 2 箇所に持たない)
   return rows.map((r) => {
