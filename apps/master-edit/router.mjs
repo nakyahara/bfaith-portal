@@ -135,7 +135,7 @@ import { readNeDeleteStock } from './ne-delete-stock.mjs';
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
 import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
-// 🆕 0083 (メーカー・中原さん 2026-10-17): 名簿・名簿に足す・欄を出すか (0083 があってロールの流し直しの後)
+// 🆕 0084 (メーカー・中原さん 2026-10-17): 名簿・名簿に足す・欄を出すか (0084 があってロールの流し直しの後)
 import { makerReady, readMakers, createMaker, MAKER_NAME_MAX } from '../../lib/master-maker.mjs';
 import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
 
@@ -810,11 +810,11 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     blankKeys: BLANK_KEYS[kind], blankLabels: blankLabelsOf(kind),
     // 🆕 0080: ロジザードに送るバーコードの欄を出すか (0080 がある DB だけ)
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,
-    // 🆕 0083: メーカーの欄 (単品だけ・0083 があってロールの流し直しの後)。名簿は画面で探す (search-fold.mjs と同じかなの同一視)
+    // 🆕 0084: メーカーの欄 (単品だけ・0084 があってロールの流し直しの後)。名簿は画面で探す (search-fold.mjs と同じかなの同一視)
     ...(await makerLocals(db, kind === 'single')),
   });
 }));
-/** 🆕 0083: メーカーの欄に渡す値 { makerReady, makers: [{ id, name }], makerMax }。出さない・読めない = 欄なし */
+/** 🆕 0084: メーカーの欄に渡す値 { makerReady, makers: [{ id, name }], makerMax }。出さない・読めない = 欄なし */
 async function makerLocals(db, want = true) {
   const ready = want && db ? await makerReady(db).catch(() => false) : false;
   return { makerReady: ready, makers: ready ? await readMakers(db).catch(() => []) : [], makerMax: MAKER_NAME_MAX };
@@ -841,7 +841,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     orderNoneApplies,
     blankKeys: BLANK_KEYS.variation, blankLabels: blankLabelsOf('variation'),
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,   // 🆕 0080 (子ごとのロジザードのバーコードの欄を出すか)
-    ...(await makerLocals(db, !gated)),   // 🆕 0083: メーカー (全部の子に同じ値)
+    ...(await makerLocals(db, !gated)),   // 🆕 0084: メーカー (全部の子に同じ値)
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
@@ -913,15 +913,15 @@ router.post('/api/variation/check', (req, res) => {
  *   その時の発注アプリの読める / 読めないで押し直しが変わらない。戻り値 = prepareOrderBlanks の答え ({ ok, note } / { ok: false, status, json })
  */
 /**
- * 🆕 0083: メーカーの欄が出る DB (0083 があって画面のロールが書ける = makerReady) = メーカーも「値か入力なし」を数えて、理由・子ごとの理由を作り直す。
- *   出ない DB (0083 の前・ロールの流し直しの前) = 上の確かめ (pre) のまま (メーカーを数えない = 前の画面・前の登録と同じ)。単品とまとまりだけ
+ * 🆕 0084: メーカーの欄が出る DB (0084 があって画面のロールが書ける = makerReady) = メーカーも「値か入力なし」を数えて、理由・子ごとの理由を作り直す。
+ *   出ない DB (0084 の前・ロールの流し直しの前) = 上の確かめ (pre) のまま (メーカーを数えない = 前の画面・前の登録と同じ)。単品とまとまりだけ
  */
 async function makerBlanks(db, kind, raw, pre, actor, skip = null) {
   const plain = { ok: true, body: pre.body, childReasons: pre.childReasons };
   if (!(kind === 'single' || kind === 'variation')) return plain;
   const ready = await makerReady(db);
   const p = ready ? prepareRegisterBody(kind, raw, { makerApplicable: true, ...(skip ? { skip } : {}) }) : null;   // skip = 前の画面の押し直しで数えない項目 (参考 URL・#1732)
-  // 🆕 #maker Codex R1 M: 押し直し (この request_id の保存の記録がある) = 初回と同じ数え方で照らす。0083 の前・ロールの流し直しの前の初回 (メーカーを数えなかった) の押し直しを
+  // 🆕 #maker Codex R1 M: 押し直し (この request_id の保存の記録がある) = 初回と同じ数え方で照らす。0084 の前・ロールの流し直しの前の初回 (メーカーを数えなかった) の押し直しを
   //   流し直しの後に送っても 400 にしない・理由 (= 要求のハッシュ) を変えない。記録の要求のハッシュと合う方 (メーカーを数えた / 数えない) を使う。どちらも合わない = 数えた方 (lib が 409 か前の誤り)
   const prev = await prevRequestHash(db, raw.request_id, kind);
   if (prev) {
@@ -999,7 +999,7 @@ router.post('/api/new/variation', (req, res) => {
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ (子ごと) → commit の後に届ける。入る前 = 今までどおり ② をすぐ書く。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
-    // 🆕 0083: メーカーの欄が出る DB (0083 があってロールの流し直しの後) = メーカーも「値か入力なし」を数え直す (上の確かめは DB を見ないので数えていない)
+    // 🆕 0084: メーカーの欄が出る DB (0084 があってロールの流し直しの後) = メーカーも「値か入力なし」を数え直す (上の確かめは DB を見ないので数えていない)
     const mk = await makerBlanks(db, 'variation', req.body || {}, pre, String(req.session.email).trim().toLowerCase(), legacyRefs ? ['card.reference_urls'] : null);
     if (!mk.ok) return res.status(mk.status).json(mk.json);
     const vb = mk.body;
@@ -1087,7 +1087,7 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     // 🆕 0071: 下書きだけ「この下書きを消す」の確かめを読む (DB の ops.sku_draft_cancel_check・読めない = 出さない)。押せるのは名簿 MASTER_EDITORS の人
     deldraft: page && page.cur.registration && page.cur.registration.state === 'draft'
       ? draftCancelView(await readDraftCancelCheck(db, page.cur.sku_id), await liveCardsSafe({ skuId: page.cur.sku_id, code: page.cur.code })) : null,
-    // 🆕 0083: メーカー (単品だけ・代表の仕入先のすぐ下・保存は「保存する」と一緒 = saveSku)
+    // 🆕 0084: メーカー (単品だけ・代表の仕入先のすぐ下・保存は「保存する」と一緒 = saveSku)
     ...(await makerLocals(db, !!page && page.cur.sku_kind === 'single')),
   });
 }));
@@ -1106,7 +1106,7 @@ router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
 }));
 
 /**
- * 🆕 0083: メーカーを名簿に足す (新商品の登録・まとまり・商品の画面の「＋ 新しいメーカーとして登録」「仕入先と同じ」)。名簿の人だけ・Origin・JSON (上の守り)。
+ * 🆕 0084: メーカーを名簿に足す (新商品の登録・まとまり・商品の画面の「＋ 新しいメーカーとして登録」「仕入先と同じ」)。名簿の人だけ・Origin・JSON (上の守り)。
  *   同じと見る名前 (NFKC・小文字・ひらがな = カタカナ・空白を除く) が既にある = 足さずにそれを返す (existed)。同じ request_id の押し直し = 前の答え
  */
 router.post('/api/makers', (req, res) => {
@@ -1153,7 +1153,7 @@ router.post('/api/new', (req, res) => {
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ → commit の後に届ける (届かなくても知らせは残る = 届け直す)。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
-    // 🆕 0083: メーカーの欄が出る DB = メーカーも「値か入力なし」を数え直す (単品だけ・セットは聞かない)
+    // 🆕 0084: メーカーの欄が出る DB = メーカーも「値か入力なし」を数え直す (単品だけ・セットは聞かない)
     const mk = await makerBlanks(db, String(b.kind ?? ''), req.body || {}, pre, String(req.session.email).trim().toLowerCase());
     if (!mk.ok) return res.status(mk.status).json(mk.json);
     const sb = mk.body;

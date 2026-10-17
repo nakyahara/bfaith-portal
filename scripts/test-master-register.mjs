@@ -2427,12 +2427,12 @@ const regEvents = async (code) => q(`select e.reason from ops.master_registratio
 
 await ta('[BL1] 入力なしの決まり (lib): 種類ごとの項目と並び・カードを作らない = カードの欄は数えない・発注の設定は欄が出るときだけ・値と入力なしの両方 / どちらでもない / 知らない名前 = 400・古い画面の印なし・理由に残す・長すぎる理由', async () => {
   const single = blankBody('bl-lib');
-  // 🆕 0083: メーカー (原価の次 = 画面の上からの順)。missingBlankKeys は渡さない = 数える (サーバーの checkRegisterBlanks は makerApplicable のときだけ)
+  // 🆕 0084: メーカー (原価の次 = 画面の上からの順)。missingBlankKeys は渡さない = 数える (サーバーの checkRegisterBlanks は makerApplicable のときだけ)
   assert.deepEqual(BLK.missingBlankKeys('single', single), ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.set_decision',
     'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
   assert.deepEqual(BLK.missingBlankKeys('single', single, { orderApplicable: true }).slice(2, 8), ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit']);
   assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }), ['cost', 'maker', 'shipping_code', 'inbound_date_managed'], 'カードを作らない = カードの欄は数えない');
-  assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }, { makerApplicable: false }), ['cost', 'shipping_code', 'inbound_date_managed'], '0083 の欄が無い = メーカーは数えない');
+  assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }, { makerApplicable: false }), ['cost', 'shipping_code', 'inbound_date_managed'], '0084 の欄が無い = メーカーは数えない');
   assert.deepEqual(BLK.missingBlankKeys('set', { kind: 'set', values: {}, card: {} }, { orderApplicable: true }), ['exception_cost', 'shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls',
     'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'], 'セットに発注の設定は無い');
   // 値があれば数えない (原価 = jpy・Amazon = URL か ASIN・参考 URL = 1 つ以上・発注条件 = 選んだか新しく作る)
@@ -2448,7 +2448,7 @@ await ta('[BL1] 入力なしの決まり (lib): 種類ごとの項目と並び�
   // 確かめ: 全部の項目に印 = 印の項目を画面の順で返す
   const all = BLK.missingBlankKeys('single', single);
   assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, blanks: [...all].reverse() }, { makerApplicable: true }), all);
-  assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, blanks: [...all].reverse() }), all.filter((k) => k !== 'maker'), '0083 の欄が無い = メーカーの印は使わない');
+  assert.deepEqual(BLK.checkRegisterBlanks('single', { ...single, blanks: [...all].reverse() }), all.filter((k) => k !== 'maker'), '0084 の欄が無い = メーカーの印は使わない');
   const err = (fn) => { try { fn(); } catch (e) { return e; } assert.fail('断らなかった'); };
   let e = err(() => BLK.checkRegisterBlanks('single', { ...single, blanks: all.filter((k) => k !== 'shipping_code') }));
   assert.deepEqual([e.status, e.reason, e.extra.field, e.extra.blank_key, e.extra.screen_outdated], [400, 'blank_unmarked', 'shipping_code', 'shipping_code', undefined]);
@@ -2517,7 +2517,7 @@ await ta('[BL2] 登録の API (単品): 印の無い項目 = 400 (どの項目�
   // 印を変えた同じ request_id = 中身が違う (409)
   const diff = await call('POST', '/apps/master-edit/api/new', { body: { ...body, reason: '10 月の新商品', values: { ...body.values, cost: { jpy: '100' } }, blanks: all.filter((k) => k !== 'cost') }, blanks: 'raw' });
   assert.deepEqual([diff.status, diff.j.reason], [409, 'request_id_reused'], diff.text);
-  // 古い画面でも全部に値があれば受ける (理由はそのまま)。🆕 0083: メーカーも値 (名簿に足したメーカー)
+  // 古い画面でも全部に値があれば受ける (理由はそのまま)。🆕 0084: メーカーも値 (名簿に足したメーカー)
   const mk = await call('POST', '/apps/master-edit/api/makers', { body: { request_id: uuid(), name: '全部入れた製作所' } });
   assert.equal(mk.status, 200, mk.text);
   const full = blankBody('bl-web-2', { reason: '全部入れた', values: { ...body.values, name: '全部入れた', cost: { jpy: '400' }, shipping_code: 'S01', inbound_date_managed: '0', maker: mk.j.maker.id },
@@ -2652,7 +2652,7 @@ await ta('[BL5] #1706 Codex R1: まとまりの原価は子ごとの実際の原
 await ta('[BL6] #1706 Codex R2 M: 発注の設定の「入力なし」は要求のハッシュ (理由) に入れない (記録 = 理由の後ろの一言)・押し直しは初回の記録で決める = 発注アプリが 読めた → 読めない / 読めない → 読めた の押し直しも 200 replayed・発注ロットを足した押し直し = 登録は replayed・発注の設定は mismatch', async () => {
   // 理由 (ハッシュに入る) は発注の設定の入力なしで変わらない
   const one0 = blankBody('bl6-x', { card: { create: false } });
-  const main = ['cost', 'maker', 'shipping_code', 'inbound_date_managed'];   // 🆕 0083: メーカーも (この DB は 0083 の欄が出る)
+  const main = ['cost', 'maker', 'shipping_code', 'inbound_date_managed'];   // 🆕 0084: メーカーも (この DB は 0084 の欄が出る)
   const ord = ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit'];
   assert.equal(BLK.prepareRegisterBody('single', { ...one0, blanks: [...main, ...ord] }).body.reason, BLK.prepareRegisterBody('single', { ...one0, blanks: main }).body.reason);
   assert.equal(BLK.blankReasonOf('single', null, [...main, ...ord]), '新商品の登録 · 入力なし: 原価・メーカー・発送方法・入荷日の管理');

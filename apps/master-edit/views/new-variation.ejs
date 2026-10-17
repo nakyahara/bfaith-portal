@@ -150,7 +150,7 @@
             <div class="ctl"><div class="seg" role="group" id="c-sales" aria-labelledby="lab-c-sales" data-field="sales" data-value=""><button type="button" data-v="1" aria-pressed="false"<%= dis %>>1 自社</button><button type="button" data-v="2" aria-pressed="false"<%= dis %>>2 取引先限定</button><button type="button" data-v="3" aria-pressed="false"<%= dis %>>3 仕入</button><button type="button" data-v="4" aria-pressed="false"<%= dis %>>4 輸出</button></div><div id="cf-sales" style="flex-basis:100%"></div></div></div>
           <div class="f"><label class="lab" for="f-primary_supplier">代表の仕入先<span class="req">必須</span></label>
             <div class="ctl"><select class="in w-m" id="f-primary_supplier"<%= dis %>><option value="">(選ぶ)</option><% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"><%= s.code %> <%= s.name %></option><% } %></select><span class="hint">NE で必須の項目です · 発注条件グループはこの仕入先のものから選びます</span><div id="cf-supplier" style="flex-basis:100%"></div></div></div>
-          <%# 🆕 0083 メーカー (中原さん 2026-10-17・代表の仕入先のすぐ下・全部の子に同じ値)。Company DB だけ。値 か 入力なし。0083 の前の DB = 欄を出さない %>
+          <%# 🆕 0084 メーカー (中原さん 2026-10-17・代表の仕入先のすぐ下・全部の子に同じ値)。Company DB だけ。値 か 入力なし。0084 の前の DB = 欄を出さない %>
           <% if (locals.makerReady) { %>
           <div class="f" data-row="maker"><label class="lab" for="f-maker-in">メーカー</label>
             <div class="ctl"><%- include('_maker', { base, mk: { makers, max: makerMax }, cur: null, dis, noneHtml: none('maker'), suppliers: page.activeSuppliers.map((s) => [s.code, s.name]), supplierSel: '#f-primary_supplier', canCreate: canSave, extraHidden: part('maker') }) %>

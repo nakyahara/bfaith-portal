@@ -461,7 +461,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     };
   });
   tick();
-  // 🆕 0083: メーカー (単品の商品の行だけ・一覧の「メーカー」の列と CSV の最後の列)。表が無い・読めない = 空
+  // 🆕 0084: メーカー (単品の商品の行だけ・一覧の「メーカー」の列と CSV の最後の列)。表が無い・読めない = 空
   {
     const names = await makerNamesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
     for (const r of pageRows) r.maker = (r.kind === 'single' && r.product_id && names.get(r.product_id)) || null;

@@ -1,5 +1,5 @@
 /**
- * test-master-maker-ui.mjs — メーカーの欄 (views/_maker.ejs・public/me-maker.js・Company DB の 0083) を本物の router で描いたページで動かす (Playwright・Chromium)
+ * test-master-maker-ui.mjs — メーカーの欄 (views/_maker.ejs・public/me-maker.js・Company DB の 0084) を本物の router で描いたページで動かす (Playwright・Chromium)
  *
  * 固定する動き:
  *   ① 単品の新商品: 名簿から探す (ひらがなで打ってカタカナの名前・半角カナ)・↑↓ と Enter で選ぶ・打っただけでは値にしない (あと N つに残る・欄を出ると一言)・

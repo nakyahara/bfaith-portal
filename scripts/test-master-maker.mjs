@@ -1,14 +1,14 @@
 /**
- * test-master-maker.mjs — メーカー (製造元) の名簿と商品ごとのメーカー (中原さん 2026-10-17・Company DB の 0083・lib/master-maker.mjs)
+ * test-master-maker.mjs — メーカー (製造元) の名簿と商品ごとのメーカー (中原さん 2026-10-17・Company DB の 0084・lib/master-maker.mjs)
  *
  * Company DB = PGlite (scripts/fixtures/master-variation-db.mjs = 全部の migration を流した新しい DB・切替の後・products.parent も company)。本物の router を HTTP 越しに通す。
  * 固定する契約:
  *   N 名前の形: JS (lib/master-maker.mjs) と DB (core.maker_name_clean / core.maker_name_norm / ops.maker_name_problem) が同じ答え (かな・半角カナ・全角英数・空白)
- *   D 0083 (新しい DB に流す): 表・関数・security definer・search_path・public の実行権なし・守り (関数の外では書けない・記録は追記だけ・TRUNCATE できない)・
+ *   D 0084 (新しい DB に流す): 表・関数・security definer・search_path・public の実行権なし・守り (関数の外では書けない・記録は追記だけ・TRUNCATE できない)・
  *     画面のロール master_edit = 3 つの表の select と 4 つの関数の実行だけ (insert / update / delete は無い)・ロールの流し直しの前 = 欄を出さない
  *   C 名簿に足す (POST /api/makers): 足す・同じと見る名前 = 足さずにそれを返す (かな・幅・空白)・押し直し = 前の答え・同じ番号で違う名前 = 409・形・名簿の人・Origin
  *   R 単品の登録 (POST /api/new): メーカーを付ける・入力なし (理由に「入力なし: メーカー」)・どちらでもない = 400・両方 = 400・名簿に無い = 400 (何も作らない)・
- *     セットは聞かない・押し直し = 前の答え (2 回書かない)・🆕 0083 の欄が無い DB (ロールの流し直しの前) = 数えない・値を送ったら 503
+ *     セットは聞かない・押し直し = 前の答え (2 回書かない)・🆕 0084 の欄が無い DB (ロールの流し直しの前) = 数えない・値を送ったら 503
  *   V まとまりの登録 (POST /api/new/variation): 全部の子に同じメーカー・入力なしも数える・今あるまとまりの読み込み = 子のメーカー
  *   S 商品の画面の保存 (POST /api/sku/:code = saveSku): 付ける・変える・外す・ほかの人が変えた後 = 409 (編集の印)・DB の関数も見ていたメーカーと照らす・押し直し
  *   L 一覧 (メーカーの列は いつもの列に出さない・出せる) と CSV (最後の列「メーカー」)・商品の画面の見出し・欄の場所 (代表の仕入先のすぐ下)
@@ -102,7 +102,7 @@ const create = (name, rid = uuid(), session = 'editor') => call('POST', '/api/ma
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
-console.log('メーカー (0083)');
+console.log('メーカー (0084)');
 
 await ta('[N] 名前の形: JS と DB が同じ答え (ひらがな = カタカナ・半角カナ・全角英数・大文字小文字・空白)・問題 (空・長い・改行)', async () => {
   const samples = ['ハチミツ本舗', 'はちみつ 本舗', 'ﾊﾁﾐﾂ本舗', '　はちみつ　　本舗 ', 'ＡＢＣ　Ｃｏ．', 'abc co.', 'ABC CO.', 'ヴィ゙', 'ゝゞ堂', '株式会社 山田'];
@@ -119,7 +119,7 @@ await ta('[N] 名前の形: JS と DB が同じ答え (ひらがな = カタカ�
   assert.equal(MK.makerNameProblem('a'.repeat(100)), null);
 });
 
-await ta('[D1] 0083 を新しい DB に流した形: 表・関数 (security definer・search_path 固定・public の実行権なし)・画面のロールの権限 (読む・関数だけ)', async () => {
+await ta('[D1] 0084 を新しい DB に流した形: 表・関数 (security definer・search_path 固定・public の実行権なし)・画面のロールの権限 (読む・関数だけ)', async () => {
   for (const t of ['core.makers', 'core.product_makers', 'ops.product_maker_events']) assert.ok((await one('select to_regclass($1) is not null as ok', [t])).ok, t);
   const fns = await q(`select p.proname as n, p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p
     join pg_namespace s on s.oid = p.pronamespace where s.nspname = 'ops' and p.proname in ('create_maker', 'set_product_maker') order by 1`);
@@ -138,7 +138,7 @@ await ta('[D1] 0083 を新しい DB に流した形: 表・関数 (security defi
   for (const f of ROLES.MAKER_EDIT_FUNCTIONS) assert.equal((await one("select has_function_privilege('master_edit', $1::regprocedure, 'execute') as ok", [f])).ok, true, f);
   for (const f of ROLES.MAKER_OWNER_ONLY_FUNCTIONS) assert.equal((await one("select has_function_privilege('master_edit', $1::regprocedure, 'execute') as ok", [f])).ok, false, f);
   assert.equal(await MK.makerReady(db), true);
-  // どの security definer の関数も一時の表を作らない (0083 も)
+  // どの security definer の関数も一時の表を作らない (0084 も)
   assert.deepEqual(await q(`select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prosecdef and n.nspname = 'ops' and p.proname like '%maker%' and p.prosrc ~* 'temp(orary)?\\s+table'`), []);
 });
 

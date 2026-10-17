@@ -1,4 +1,4 @@
--- 0083 (仮の番号・マージの時に付け替える。並行の PR が 0083 を使うなら 0084 へ): メーカー (製造元) の名簿と、商品ごとのメーカー (中原さん 2026-10-17)
+-- 0084 (仮の番号・マージの時に付け替える。0083 = #1734。先に 0084 を使う PR があれば次の空き番号へ): メーカー (製造元) の名簿と、商品ごとのメーカー (中原さん 2026-10-17)
 --   中原さん「マスタの入力で、仕入先とは別にメーカーの情報を入れたい。問屋から仕入れるとメーカー名と仕入先名が違う」
 --   決まり: Company DB だけに持つ (NE・ロジザード・product-hub には送らない)・入れ方 = 名簿から選ぶ (探せる) + その場で新しいメーカーを足す・
 --     「仕入先と同じ」= 代表の仕入先の名前のメーカー (名簿に無ければ足す)。単品だけ (セットのメーカーは構成品から)
@@ -56,7 +56,7 @@ create table core.makers (
   unique (company_id, name_norm),
   unique (company_id, maker_id)
 );
-comment on table core.makers is '🆕 0083: メーカー (製造元) の名簿。Company DB だけに持つ (NE・ロジザード・product-hub には送らない)。同じと見る名前 (name_norm) は会社の中で 1 つ。書くのは ops.create_maker だけ';
+comment on table core.makers is '🆕 0084: メーカー (製造元) の名簿。Company DB だけに持つ (NE・ロジザード・product-hub には送らない)。同じと見る名前 (name_norm) は会社の中で 1 つ。書くのは ops.create_maker だけ';
 
 create table core.product_makers (
   product_id bigint primary key references core.products,
@@ -69,7 +69,7 @@ create table core.product_makers (
   foreign key (company_id, maker_id) references core.makers (company_id, maker_id)   -- メーカーも同じ会社
 );
 create index ix_product_makers_maker on core.product_makers (maker_id);
-comment on table core.product_makers is '🆕 0083: 商品 (単品の商品の行) ごとの今のメーカー (行が無い = メーカーなし)。夜間ロードは触らない (core.products.manufacturer とは別)。書くのは ops.set_product_maker だけ';
+comment on table core.product_makers is '🆕 0084: 商品 (単品の商品の行) ごとの今のメーカー (行が無い = メーカーなし)。夜間ロードは触らない (core.products.manufacturer とは別)。書くのは ops.set_product_maker だけ';
 
 create table ops.product_maker_events (
   event_id      bigint generated always as identity primary key,
@@ -88,7 +88,7 @@ create table ops.product_maker_events (
   unique (request_id, product_id)
 );
 create index ix_product_maker_events_product on ops.product_maker_events (product_id, event_id desc);
-comment on table ops.product_maker_events is '🆕 0083: 商品のメーカーを付けた・変えた・外した記録 (追記だけ・書くのは ops.set_product_maker だけ)';
+comment on table ops.product_maker_events is '🆕 0084: 商品のメーカーを付けた・変えた・外した記録 (追記だけ・書くのは ops.set_product_maker だけ)';
 revoke all on core.makers, core.product_makers, ops.product_maker_events from public;
 
 -- 守り: 書くのは 2 つの関数の中だけ (印 ops.maker_protocol)・記録は追記だけ・TRUNCATE できない
@@ -119,7 +119,7 @@ create table ops.maker_requests (
   created_at timestamptz not null default now()
 );
 revoke all on ops.maker_requests from public;
-comment on table ops.maker_requests is '🆕 0083: ops.create_maker の要求の控え (足した回・既にあった名前を返した回の両方)。同じ request_id = この答え・違う名前 / 人 = request_id_reused';
+comment on table ops.maker_requests is '🆕 0084: ops.create_maker の要求の控え (足した回・既にあった名前を返した回の両方)。同じ request_id = この答え・違う名前 / 人 = request_id_reused';
 create trigger trg_maker_requests_guard before insert or update or delete on ops.maker_requests for each row execute function ops.guard_maker_tables();
 create trigger trg_maker_requests_no_truncate before truncate on ops.maker_requests for each statement execute function core.reject_mutation();
 

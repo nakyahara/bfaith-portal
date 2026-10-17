@@ -2726,7 +2726,7 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 試験 = `node scripts/test-master-widen.mjs` [15] (close は何もしない・72 時間) / `test-master-reg-csv.mjs` [V2]・[W1]・[W2] (ne_reg_issue の差・新しい回の印は結果の行の後だけ配る・置き換え・72 時間)・[V5] の後 (0082 を当てた時の許可の出し直し) / `test-new-entry-gate-step.mjs` (閉じるのは拒まれたときだけ) /
   `test-master-compare-ne.mjs` [39] (照合の始めに閉じない) / 本物の PG = `test-master-widen-pg.mjs` [18]・[18c] (朝の照合の間ずっと有効・照合の途中に保存できる・途中の新商品は snapshot に入らない・翌朝の照合の後まで有効・問題が出たらその場で閉じる)・[18d] (今朝の記録が落ちた = current_result_missing だけ・本物の毎朝の段は閉じない・0082 の 9. の出し直し)・`test-master-widen-locks-pg.mjs` [18]・[21] (close は鍵を取らない・照合の途中も配る / 登録 / 渡すが通る)
 
-### メーカー (製造元) の名簿と商品ごとのメーカー (0083 仮番号・2026-10-17 中原さん「仕入先とは別にメーカーの情報を入れたい。問屋から仕入れるとメーカー名と仕入先名が違う」)
+### メーカー (製造元) の名簿と商品ごとのメーカー (0084 仮番号・2026-10-17 中原さん「仕入先とは別にメーカーの情報を入れたい。問屋から仕入れるとメーカー名と仕入先名が違う」)
 - **なぜ別の表か**: `core.products.manufacturer` (0002) は夜間ロードの属性の解決 (`apps/company-db/load/engine.mjs` の 10. = product_hub / amazon_catalog の観測) が書く列 = ポータルで入れた値を上書きする・未来の観測の取り消しで空にする道がある。持ち主の表 (`config/master-ownership.mjs`) にも無い (足すと広げる道 = epoch・widen が要る)。
   → **Company DB だけに持つ別の表** (夜間ロード・写し・NE / ロジザード / product-hub は触らない・送らない)。mart の `p.manufacturer` (0007 / 0009 / 0077) はそのまま (ポータルのメーカーを mart に出すのは後の PR)
 - **表** `core.makers` (名簿・`name_norm` = NFKC → 小文字 → ひらがなをカタカナ → 空白を除く = `core.maker_name_norm`・会社の中で一意 = 同じメーカーを 2 つ作らない・`created_request_id` で押し直しを見分ける) /
@@ -2734,10 +2734,10 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **関数** `ops.create_maker(request_id, 人, 名前)` = 名前を掃除して足す (同じと見る名前があれば足さずにそれ = existed・同じ request_id = 前の答え・違う名前 = request_id_reused) /
   `ops.set_product_maker(request_id, 人, sku_id, メーカー, 見ていたメーカー, どこから, 理由)` = 単品・やめていない・名簿にある有効なメーカー・今のメーカーが見ていたものと違う = version_conflict。どちらも切替の段階が new_open のときだけ
 - **入口**: 新商品の登録 (単品 = 登録と同じ取引・値か「入力なし」= `lib/master-register-blanks.mjs` の maker)・まとまりの登録 (全部の子に同じ値)・商品の画面 (`saveSku` の欄 maker = 保存と同じ取引・編集の印に入れる (メーカーがあるときだけ = 無い商品の印は前と同じ))・`POST /api/makers` (名簿に足す)
-- 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え (並行の PR が 0083 を使うなら 0084) → **アプリを先に** (マージ・Render の配り) → `migrate.mjs --dry-run` (この 1 本だけ・表と関数を足すだけ・今のデータは変えない) → 中原さんの OK → 本適用 →
-  `create-master-edit-roles.mjs` を流し直す (引数なし = master_edit に 3 つの表の select と 4 つの関数の実行)。アプリは 0083 の前・0083 の後でロールの流し直しの前のどちらでも欄を出さない (`makerReady` = 関数があって master_edit が実行できる)・数えない・値が来たら 503。
+- 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え (0083 は #1734 の今朝の NE の値 = この PR は 0084。さらに先に 0084 を使う PR があれば次の空き番号へ) → **アプリを先に** (マージ・Render の配り) → `migrate.mjs --dry-run` (この 1 本だけ・表と関数を足すだけ・今のデータは変えない) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (引数なし = master_edit に 3 つの表の select と 4 つの関数の実行)。アプリは 0084 の前・0084 の後でロールの流し直しの前のどちらでも欄を出さない (`makerReady` = 関数があって master_edit が実行できる)・数えない・値が来たら 503。
   🚨 ロールを流し直した瞬間から、開いたままの古い新商品の画面 (メーカーの欄も「入力なし」も無い) の登録は「画面を開き直してください」(400) になる (ほかの「入力なし」の項目を足したときと同じ)
-- 試験 = `node scripts/test-master-maker.mjs` (名前の形・0083 の形と権限・守り・名簿・登録・まとまり・商品の画面・一覧 / CSV・夜間ロード・ロールの流し直しの前) / `test-master-maker-ui.mjs` (画面の動き・日本語入力の確定の Enter・スマホの幅)
+- 試験 = `node scripts/test-master-maker.mjs` (名前の形・0084 の形と権限・守り・名簿・登録・まとまり・商品の画面・一覧 / CSV・夜間ロード・ロールの流し直しの前) / `test-master-maker-ui.mjs` (画面の動き・日本語入力の確定の Enter・スマホの幅)
 
 ### 要確認 (quarantined) の商品を確認済みにする (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える

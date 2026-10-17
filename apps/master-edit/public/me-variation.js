@@ -454,7 +454,7 @@
       var N = ME.none;
       var need = function (key, t, go, step) { if (!N.present(key)) return; if (N.on(key) && !N.has(key)) { noneKeys.push(key); return; } if (!N.has(key)) Pi(step, 'miss', t + ' (値か「入力なし」)', go); };
       NONE_ITEMS.forEach(function (x) { if (!S.conflicts[x[3]] || S.picks[x[3]]) need(x[0], x[1], x[2], 5); });
-      // 🆕 0083: メーカー (全部の子に同じ値・値 = 名簿から選んだ = 打っただけでは値でない)。欄がある (0083 がある DB) ときだけ
+      // 🆕 0084: メーカー (全部の子に同じ値・値 = 名簿から選んだ = 打っただけでは値でない)。欄がある (0084 がある DB) ときだけ
       need('maker', 'メーカー (一覧から選ぶ)', '#f-maker-in', 5);
       if (ME.orderSettings && ME.orderSettings.items) ME.orderSettings.items().forEach(function (x) { if (x.none) noneKeys.push(x.key); else if (!x.ok) Pi(5, 'miss', '発注の設定: ' + x.t + ' (値か「入力なし」)', x.focus); });
       NONE_CARD.forEach(function (x) { need(x[0], x[1], x[2], 5); });
@@ -1035,7 +1035,7 @@
     S.copied = rows.length ? { from: rows[0].code, n: rows.length, dropped: dropped } : null;
     if (!pk.axes) initOldKids(pk);
     full();
-    // 🆕 0083: 今ある子のメーカーが全部同じ = 写す。違う・無い子がある = 空にする (前に選んだまとまりのメーカーを持ち越さない = 人が選ぶ・#maker Codex R1 M)
+    // 🆕 0084: 今ある子のメーカーが全部同じ = 写す。違う・無い子がある = 空にする (前に選んだまとまりのメーカーを持ち越さない = 人が選ぶ・#maker Codex R1 M)
     if (ME.maker) {
       var mks = rows.map(function (k) { return String((k.values && k.values.maker) || ''); });
       if (mks.length && mks[0] && mks.every(function (x) { return x === mks[0]; })) ME.maker.set(mks[0]); else ME.maker.clear();
@@ -1240,7 +1240,7 @@
     if (d.act === 'next') return continueNext();
     if (d.act === 'again') { if (ME.replacePage) ME.replacePage(BASE + '/new?kind=variation'); else location.replace(BASE + '/new?kind=variation'); return; }
     if (S.done && !d.go && !d.stepnav && !d.filter && !d.open) return;
-    // 🆕 0083 (#maker Codex R2 M): 種類を切り替える・選び直す = メーカーも空に (ほかの共通の欄 = S.common と同じく前のまとまりの値を持ち越さない)
+    // 🆕 0084 (#maker Codex R2 M): 種類を切り替える・選び直す = メーカーも空に (ほかの共通の欄 = S.common と同じく前のまとまりの値を持ち越さない)
     if (d.mode) { if (S.mode !== d.mode) { var keep = { gcode: S.gcode, gname: S.gname }; S = fresh(); S.mode = d.mode; if (d.mode === 'new') Object.assign(S, keep); else searchGroups(); if (ME.maker) ME.maker.clear(); full(); } return; }
     if (d.pick) return pickGroup(d.pick);
     if (d.gotopick) { S.mode = 'add'; return pickGroup(d.gotopick); }
@@ -1287,7 +1287,7 @@
     if (C.inbound !== '') values.inbound_date_managed = C.inbound;
     if (C.ship) values.shipping_code = C.ship;
     if (String(C.cost).trim() !== '') values.cost = { jpy: C.cost };
-    // 🆕 0083: メーカー (隠した欄 = 名簿の番号・欄が無い / 選んでいない = 送らない)
+    // 🆕 0084: メーカー (隠した欄 = 名簿の番号・欄が無い / 選んでいない = 送らない)
     var mkEl = $('#f-maker'); if (mkEl && mkEl.value) values.maker = mkEl.value;
     var opts = [];
     m.axes.forEach(function (ax) {

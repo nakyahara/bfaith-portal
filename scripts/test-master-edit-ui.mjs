@@ -990,7 +990,7 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   assert.match(p.url(), /new\?kind=single$/);
   assert.equal(await dirty(p), 0);
   // 🆕 2026-10-13 (入力なし): 必須 8 + 必須でない 18 (原価・Amazon・公式ページ・発送方法・セット商品・発注の設定 6・入荷日の管理・参考 URL・Yahoo! 5) = 26
-  //   🆕 0080: + ロジザードのバーコード (必須 = 値か空欄) = 27 / 🆕 0083: + メーカー (値か入力なし) = 28
+  //   🆕 0080: + ロジザードのバーコード (必須 = 値か空欄) = 27 / 🆕 0084: + メーカー (値か入力なし) = 28
   assert.match(await p.textContent('#remain'), /あと\s*28\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
   assert.match(await p.textContent('#save'), /あと 28 つ: 商品コード/);

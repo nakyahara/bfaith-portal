@@ -1106,7 +1106,7 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .csug { max-height: min(360px, 55vh); }
 }
 @media (prefers-reduced-motion: reduce) { .csug { animation: none; } }
-/* 🆕 0083 メーカーの欄 (views/_maker.ejs・public/me-maker.js)。候補は欄のすぐ下 (同じ .csug の見た目)・押す所は 44px */
+/* 🆕 0084 メーカーの欄 (views/_maker.ejs・public/me-maker.js)。候補は欄のすぐ下 (同じ .csug の見た目)・押す所は 44px */
 .mkpick { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; max-width: 100%; }
 .mkbox { position: relative; display: inline-block; max-width: 100%; }
 .mkbox .csug { top: calc(100% + 4px); left: 0; width: min(440px, 86vw); }

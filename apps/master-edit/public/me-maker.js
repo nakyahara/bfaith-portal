@@ -1,5 +1,5 @@
 /*
- * me-maker.js — メーカー (製造元) の欄 (中原さん 2026-10-17・Company DB の 0083・部品 = views/_maker.ejs)
+ * me-maker.js — メーカー (製造元) の欄 (中原さん 2026-10-17・Company DB の 0084・部品 = views/_maker.ejs)
  *   新商品の登録 (単品)・色違い・サイズ違いのまとまり・商品の画面 (単品) の 3 つで同じ動き。
  *   - 打つと名簿から探す: かなの同一視 (サーバーの apps/master-edit/search-fold.mjs と同じ = NFKC・小文字・ひらがな → カタカナ) +
  *     空白で区切った言葉が全部入っている。日本語の変換中も探す。確定の Enter (Windows の Chrome・Edge は確定の後に keyCode 13 が来る) では選ばない
