@@ -176,6 +176,30 @@ await t('maxCodes: 楽天に投げるコード (probe の候補を含む) を予
   assert.ok(db.prepare('SELECT 1 FROM pk_product_images WHERE ne_code = ?').get('big0x-aa-bb'));
 });
 
+await t('ownOnly (セット): そのコード自身の写真だけ (ハイフン削りで親の商品に当たった写真は出さない)', async () => {
+  put('setx-aa-3', { mn: 'setx-aa', white: 'https://image.rakuten.co.jp/b-faith/cabinet/parent.jpg' });
+  put('sety-aa', { mn: 'SETY-AA', white: 'https://image.rakuten.co.jp/b-faith/cabinet/sety.jpg' });
+  put('setz-aa-2', { mn: 'setz-aa', variant: 'https://image.rakuten.co.jp/b-faith/cabinet/setz-2.jpg', white: 'https://image.rakuten.co.jp/b-faith/cabinet/setz.jpg' });
+  const codes = ['setx-aa-3', 'sety-aa', 'setz-aa-2'];
+  const m = imagesFor(codes, { deps, canQueue: false, ownOnly: codes });
+  assert.deepEqual(m.get('setx-aa-3'), { url: null, state: 'not_own' }, '親の商品の写真は出さない');
+  assert.equal(m.get('sety-aa').url, 'https://image.rakuten.co.jp/b-faith/cabinet/sety.jpg', '商品管理番号 = 自分のコード (大文字小文字は同じ)');
+  assert.equal(m.get('setz-aa-2').url, 'https://image.rakuten.co.jp/b-faith/cabinet/setz-2.jpg', '自分のバリエーション画像');
+  // ownOnly でない (単品) = 今までどおり
+  assert.equal(imagesFor(['setx-aa-3'], { deps, canQueue: false }).get('setx-aa-3').url, 'https://image.rakuten.co.jp/b-faith/cabinet/parent.jpg');
+});
+
+await t('予算付きのジョブが待っている間に、同じ SKU の予算なしの要求 (ピッキング) が来ても落とさない', async () => {
+  calls.length = 0;
+  const codes = Array.from({ length: 6 }, (_, i) => `dd${i}x-aa-bb`);
+  imagesFor(codes, { deps, lane: 'dd', maxCodes: 7 });
+  queueEnsureImages(codes, 'ピッキング', deps);   // 同じ集合・予算なし
+  await drain();
+  const written = codes.filter((c) => db.prepare('SELECT 1 FROM pk_product_images WHERE ne_code = ?').get(c));
+  assert.equal(written.length, 6, `ピッキングの要求で残りも取る (${written.length})`);
+  assert.equal(calls.length, 2);
+});
+
 await t('空・null の並びでも壊れない', async () => {
   assert.equal(imagesFor([]).size, 0);
   assert.equal(imagesFor(null).size, 0);

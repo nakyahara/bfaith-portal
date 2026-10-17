@@ -557,8 +557,10 @@ export function isImageQueueBusy() { return _queueDepth > 0; }
 
 export function queueEnsureImages(skus, label = '', deps = undefined) {
   const set = [...new Set(skus.map(norm).filter(Boolean))].sort();
-  // force は「同じ集合でも取り直す」操作なのでキーを分ける (通常キューと重複排除を共有しない)
-  const key = JSON.stringify([deps?.force ? 'force' : 'ttl', set]);
+  // force は「同じ集合でも取り直す」操作なのでキーを分ける (通常キューと重複排除を共有しない)。
+  // 予算付き (maxCodes = 一覧) のジョブも分ける — 同じ集合のピッキングの要求 (予算なし) を「積み済み」で落とすと、
+  // 予算から外れた SKU が取られないまま残る (Codex 2026-10-17 R2 Medium)
+  const key = JSON.stringify([deps?.force ? 'force' : 'ttl', deps?.maxCodes > 0 ? deps.maxCodes : 0, set]);
   if (set.length === 0 || _pendingKeys.has(key)) return _chain;
   _pendingKeys.add(key);
   _queueDepth++;
@@ -605,13 +607,15 @@ export function queueEnsureImages(skus, label = '', deps = undefined) {
  * @param opts.notFoundRetryMs 「楽天に無い」を取り直すまでの間 (null = ensureImagesFor と同じ JST 翌日)。
  *                      マスタの一覧は楽天に出していない商品 (Amazon だけ・セット) が多く、毎日問い合わせ直すと無駄が多いので長くする
  * @param opts.maxCodes 1 つのジョブで楽天に投げるコードの予算 (probe の候補を含む。0 = 決めない)。収まらない SKU は次の回へ
+ * @param opts.ownOnly  そのコード自身の写真だけ出すコード (セット)。ハイフン削りで親の商品に当たった写真は出さない
  * @param opts.deps     ensureImagesFor へ渡す差し替え (試験用)
- * @returns {Map<string, {url: string|null, state: 'ok'|'pending'|'not_found'|'error'|'uncached'}>}
+ * @returns {Map<string, {url: string|null, state: 'ok'|'pending'|'not_found'|'not_own'|'error'|'uncached'}>}
  *   キー = norm(ne_code)。url は楽天の画像ドメインの https だけ (読むときにも確かめる)。
  *   state: ok = 画像あり / pending = キューに載っている (取得中) / not_found = 楽天に画像が無い /
+ *          not_own = 画像はあるが別の商品の写真 (ownOnly のとき) /
  *          error = 取れなかった (時期が来たら取り直す) / uncached = まだ取っていない (今回は積めなかった)
  */
-export function imagesFor(skus, { queueMax = 50, canQueue = true, label = '', lane = null, notFoundRetryMs = null, maxCodes = 0, deps = undefined, nowMs = Date.now() } = {}) {
+export function imagesFor(skus, { queueMax = 50, canQueue = true, label = '', lane = null, notFoundRetryMs = null, maxCodes = 0, ownOnly = null, deps = undefined, nowMs = Date.now() } = {}) {
   const keys = [...new Set((skus || []).map(norm).filter(Boolean))];
   const out = new Map();
   if (keys.length === 0) return out;
@@ -621,10 +625,11 @@ export function imagesFor(skus, { queueMax = 50, canQueue = true, label = '', la
   for (let i = 0; i < keys.length; i += CH) {
     const chunk = keys.slice(i, i + CH);
     for (const r of db.prepare(
-      `SELECT ne_code, variant_image_url, white_bg_url, top_image_url, status, fetched_at FROM pk_product_images
+      `SELECT ne_code, manage_number, variant_image_url, white_bg_url, top_image_url, status, fetched_at FROM pk_product_images
        WHERE ne_code IN (${chunk.map(() => '?').join(',')})`
     ).all(...chunk)) rows.set(r.ne_code, r);
   }
+  const own = new Set((ownOnly || []).map(norm).filter(Boolean));
   // 画像の URL は書くときに楽天ドメインへ絞ってあるが、<img src> に出す前にもう一度確かめる (http は https に直す)
   const safeUrl = (u) => {
     if (typeof u !== 'string' || !u) return null;
@@ -638,7 +643,15 @@ export function imagesFor(skus, { queueMax = 50, canQueue = true, label = '', la
   for (const k of keys) {
     const row = rows.get(k) || null;
     // 第一候補 = そのSKU自身のバリエーション画像 (別の色の写真を出さない)。getImageMap と同じ順
-    const url = row ? (safeUrl(row.variant_image_url) || safeUrl(row.white_bg_url) || safeUrl(row.top_image_url)) : null;
+    let url = row ? (safeUrl(row.variant_image_url) || safeUrl(row.white_bg_url) || safeUrl(row.top_image_url)) : null;
+    // ownOnly (セットなど): ハイフン削りで別の商品 (単品の親) に当たった写真は出さない (Codex 2026-10-17 R2 Medium)。
+    //   出してよい = そのコード自身のバリエーション画像 / 商品管理番号がそのコードと同じ商品ページの写真
+    let notOwn = false;
+    if (url && own.has(k)) {
+      const ownUrl = safeUrl(row.variant_image_url)
+        || (norm(row.manage_number) === k ? (safeUrl(row.white_bg_url) || safeUrl(row.top_image_url)) : null);
+      if (!ownUrl) { url = null; notOwn = true; } else url = ownUrl;
+    }
     let due = isDue(row, nowMs);
     if (due && row && row.status === 'not_found' && notFoundRetryMs != null) {
       const at = Date.parse(row.fetched_at);
@@ -648,6 +661,9 @@ export function imagesFor(skus, { queueMax = 50, canQueue = true, label = '', la
     let state;
     if (url) {
       state = 'ok';
+      if (due && !queued) refresh.push(k);
+    } else if (notOwn) {
+      state = 'not_own';   // 画像はあるが別の商品の写真 (印で出す。取り直しは ok と同じ 7 日)
       if (due && !queued) refresh.push(k);
     } else if (queued) {
       state = 'pending';

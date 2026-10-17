@@ -8,6 +8,7 @@
  *    積むのはこのページに出す商品だけ・1 回に LIST_IMAGE_QUEUE_MAX 件まで (楽天に投げるコードは LIST_IMAGE_MAX_CODES = bulk 1 回まで)・一覧の待ちジョブは 1 つまで (開くたびに積み増さない)・「楽天に無い」は 7 日は聞き直さない。
  *    楽天につながらない環境 (WAREHOUSE_URL が無い = 開発の PC・試験) では積まない (画像の無い商品は「まだ取っていない」のまま)。
  * セット = セット自身のコードで楽天の画像を引く (楽天にセットの商品ページがあればその写真)。無ければ「画像なし」の印。
+ *   ハイフン削りで単品の親の商品ページに当たった写真も出さない (そのセットのバリエーション画像 / 商品管理番号がセットのコードと同じ商品だけ)。
  *   構成品の写真では代わりにしない (1 つの構成品の写真を出すと、別の商品に見えて取り違えの元になる)。
  * 読めない (picking.db が開けない など) = 全部「画像なし」の印で一覧は出す (画像は「あれば嬉しい」もの)。CSV には入れない。
  */
@@ -32,7 +33,7 @@ const rmsConfigured = () => !!String(process.env.WAREHOUSE_URL || '').trim();
 
 /**
  * このページの行の画像。戻り値 = 行のコード → { url, state } を引く関数 (読めない = いつも { url: null, state: 'none' })。
- *   state: ok / pending (取得中) / not_found (楽天に画像なし) / error (取れなかった・あとで取り直す) / uncached (まだ取っていない) / none (読めない)
+ *   state: ok / pending (取得中) / not_found (楽天に画像なし) / not_own (セットで、楽天の写真が単品などほかの商品の物) / error (取れなかった・あとで取り直す) / uncached (まだ取っていない) / none (読めない)
  */
 export function listImages(rows, { queue = true } = {}) {
   const NONE = Object.freeze({ url: null, state: 'none' });
@@ -45,6 +46,8 @@ export function listImages(rows, { queue = true } = {}) {
       lane: LANE,
       notFoundRetryMs: LIST_IMAGE_NOT_FOUND_RETRY_MS,
       maxCodes: LIST_IMAGE_MAX_CODES,
+      // セット = セット自身の写真だけ (ハイフン削りで単品の親の商品に当たった写真は出さない・Codex 10/17 R2 Medium)
+      ownOnly: (rows || []).filter((r) => r && r.kind === 'set').map((r) => r.code),
       deps: testDeps || undefined,
     });
   } catch (e) {
@@ -57,6 +60,7 @@ export function listImages(rows, { queue = true } = {}) {
 export const IMAGE_STATE_WORDS = Object.freeze({
   pending: '楽天の画像を取得中 (開き直すと出ます)',
   not_found: '楽天に画像がありません',
+  not_own: 'セット自身の楽天の画像がありません (単品・構成品の写真は出しません)',
   error: '楽天の画像を取れませんでした (あとで取り直します)',
   uncached: '楽天の画像をまだ取っていません (開き直すと取りに行きます)',
   none: '画像を読めません',

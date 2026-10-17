@@ -473,12 +473,13 @@ await ta('[7] 画像の列 (10/17 中原さん): キャッシュの URL を出�
   const LI = await import('../apps/master-edit/list-images.mjs');
   const pdb = PK.getDB();
   const put = (ne, o) => pdb.prepare(`INSERT OR REPLACE INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, variant_image_url, status, fetched_at)
-    VALUES (?, NULL, ?, NULL, ?, ?, ?)`).run(ne, o.white ?? null, o.variant ?? null, o.status ?? 'ok', PK.utcNow());
+    VALUES (?, ?, ?, NULL, ?, ?, ?)`).run(ne, o.mn ?? null, o.white ?? null, o.variant ?? null, o.status ?? 'ok', PK.utcNow());
   put('a01', { variant: 'https://image.rakuten.co.jp/b-faith/cabinet/a01-red.jpg', white: 'https://image.rakuten.co.jp/b-faith/cabinet/a01.jpg' });
   put('a02', { status: 'not_found' });
   put('a03', { white: 'https://evil.example.com/a03.jpg' });
   put('a06', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/q"><script>x</script>.jpg' });
-  put('b01', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/set-b01.jpg' });
+  put('b01', { mn: 'b01', white: 'https://image.rakuten.co.jp/b-faith/cabinet/set-b01.jpg' });   // セット自身の商品ページ
+  put('b02', { mn: 'a04', white: 'https://image.rakuten.co.jp/b-faith/cabinet/a04-single.jpg' });   // ハイフン削りなどで単品の商品に当たった
   const calls = [];
   let open = null;
   const gate = new Promise((res) => { open = res; });   // 楽天の応答を止めておく (解決の途中で開き直す)
@@ -505,6 +506,8 @@ await ta('[7] 画像の列 (10/17 中原さん): キャッシュの URL を出�
     // キャッシュ済み = <img> (大きさ固定・lazy・referrer を送らない・alt = 名前)・バリエーション画像が先
     assert.equal(imgCell(r.text, 'a01')[2], '<span class="thumb"><img src="https://image.rakuten.co.jp/b-faith/cabinet/a01-red.jpg" alt="あいう 石鹸" width="52" height="52" loading="lazy" decoding="async" referrerpolicy="no-referrer"></span>');
     assert.match(imgCell(r.text, 'b01')[2], /src="https:\/\/image\.rakuten\.co\.jp\/b-faith\/cabinet\/set-b01\.jpg"/, 'セット = セット自身の画像');
+    assert.match(imgCell(r.text, 'b02')[2], /^<span class="thumb none not_own" title="セット自身の楽天の画像がありません/, 'セットに単品の商品の写真は出さない');
+    assert.ok(!r.text.includes('a04-single.jpg'));
     // 楽天に無い = 印 (img は出さない)
     assert.match(imgCell(r.text, 'a02')[2], /^<span class="thumb none not_found" title="楽天に画像がありません">/);
     assert.ok(!imgCell(r.text, 'a02')[2].includes('<img'));
