@@ -3041,6 +3041,47 @@ await ta('[72] 未登録の一覧の「その場で登録」(10/17): 行の下�
   assert.ok((await p.textContent('#comp-cost')).includes(`${(c6 * 2).toLocaleString('ja-JP')} 円`), '小計 = 原価 × 数');
 });
 
+await ta('[73] CSV でまとめて登録 (10/17): ファイルを選ぶ → 試し取込 (表・絞る札・だめな理由・何も書かない) → 離れるときに確かめる → 保存 (20 件ずつ・結果の列) → 出し直すと「変わらない」/ Shift_JIS の CSV / スマホ 390 で横にはみ出さない', async (p) => {
+  const iconv = (await import('iconv-lite')).default;
+  await p.goto(B + '/amazon/');
+  await Promise.all([p.waitForURL(/\/amazon\/bulk$/), p.click('a[href="bulk"]')]);
+  assert.equal(await p.isDisabled('#bulk-preview'), true, 'ファイルを選ぶまで押せない');
+  const NL = String.fromCharCode(13, 10);
+  const csv = ['seller_sku,name,ne_code,qty', 'pr-ui-bulk-1,一括 1,k001,2', 'pr-ui-bulk-1,一括 1,k002,1', 'pr-ui-bulk-2,,k004,1', 'pr-ui-bulk-3,無いコード,nope-x,1'].join(NL) + NL;
+  await p.setInputFiles('#bulk-file', { name: '一括の試験.csv', mimeType: 'text/csv', buffer: iconv.encode(csv, 'cp932') });
+  await p.click('#bulk-preview');
+  await p.locator('#bulk-result').waitFor({ state: 'visible' });
+  assert.match(await p.textContent('#bulk-file-info'), /一括の試験\.csv · Shift_JIS/);
+  assert.equal(await p.locator('#bulk-rows tr').count(), 3);
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-3"]'), /だめ[\s\S]*nope-x は Company DB にありません/);
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-2"]'), /ＡＢＣ 保存袋/, '名前が空 = 代表の NE の商品名');
+  assert.equal(await p.textContent('#bulk-apply'), '保存する (2 件)');
+  assert.equal(await dirty(p), 1, '試し取込の後に保存していない = 離れるときに確かめる');
+  assert.equal(await mapOf('pr-ui-bulk-1'), undefined, '試し取込は何も書かない');
+  await p.click('#bulk-filter button[data-f="error"]');
+  assert.equal(await p.locator('#bulk-rows tr').count(), 1, 'だめだけに絞る');
+  await p.click('#bulk-filter button[data-f="all"]');
+  // スマホ 390: 横にはみ出さない (表は表の箱の中で横に送る)
+  await p.setViewportSize({ width: 390, height: 844 });
+  const [sw, cw] = await p.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+  assert.ok(sw <= cw + 1, `390 で横にはみ出す (${sw} > ${cw})`);
+  await p.setViewportSize({ width: 1440, height: 900 });
+  await p.click('#bulk-apply');
+  await p.waitForFunction(() => /終わりました/.test(document.getElementById('bulk-apply-msg').textContent));
+  assert.match(await p.textContent('#bulk-apply-msg'), /できた 2 件 · だめ 0 件/);
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-1"] .bulk-res'), /作りました \(出品も\)/);
+  assert.deepEqual(await compsUi('pr-ui-bulk-1'), [['k001', 2], ['k002', 1]], 'DB に入った (1 行目が代表)');
+  assert.equal((await mapOf('pr-ui-bulk-2')).name, 'ＡＢＣ 保存袋');
+  assert.equal(await dirty(p), 0, '保存した後 = 確かめない');
+  assert.equal(await p.isDisabled('#bulk-apply'), true);
+  // 同じ CSV をもう一度 = 「変わらない」(保存する SKU が無い)
+  await p.setInputFiles('#bulk-file', { name: '一括の試験.csv', mimeType: 'text/csv', buffer: Buffer.from(csv, 'utf8') });
+  await p.click('#bulk-preview');
+  await p.waitForFunction(() => /試し取込をしました/.test(document.getElementById('bulk-msg').textContent) && /UTF-8/.test(document.getElementById('bulk-file-info').textContent));
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-1"]'), /変わらない/);
+  assert.equal(await p.textContent('#bulk-apply'), '保存する SKU がありません');
+});
+
 await browser.close();
 server.close();
 try { mirrorDb.close(); fs.rmSync(DATA_TMP, { recursive: true, force: true }); } catch { /* 消せなくてもよい */ }
