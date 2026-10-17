@@ -82,7 +82,7 @@ function checkExistingLedger(file) {
   try {
     const names = new Set(ro.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name));
     for (const t of LEDGER_TABLES) if (!names.has(t)) throw new Error(`帳面の表 ${t} が無い`);
-    if (!ro.prepare("SELECT value FROM bc_meta WHERE key = 'started_at'").get()) throw new Error('帳面の始めた時刻が無い');
+    startedAtOf(ro.prepare("SELECT value FROM bc_meta WHERE key = 'started_at'").get());   // 無い・形が違う = 例外 (Codex R9 Medium)
   } finally { ro.close(); }
   return false;
 }
@@ -174,8 +174,13 @@ export function openLzBcDb(file = ledgerFile()) {
 }
 /** 帳面を始めた時刻 (ms) */
 export function startedAt(db) {
-  const r = db.prepare("SELECT value FROM bc_meta WHERE key = 'started_at'").get();
-  return r ? Number(r.value) : 0;
+  return startedAtOf(db.prepare("SELECT value FROM bc_meta WHERE key = 'started_at'").get());
+}
+/** 始めた時刻の値 = 正の安全な整数 (ms・2001 年〜) だけ。無い・空・数でない・0 = 壊れた帳面 = 例外 (「前に作った CSV」の見分けが効かなくなる) */
+function startedAtOf(row) {
+  const v = row ? String(row.value) : '';
+  if (!/^[1-9][0-9]{11,15}$/.test(v) || !Number.isSafeInteger(Number(v))) throw new Error('帳面の始めた時刻が無いか形が違う');
+  return Number(v);
 }
 /** ダウンロードの記録が当てにならない CSV か (帳面を始める前に作った・作った時刻が分からない) */
 export function legacyExport(db, createdMs) {

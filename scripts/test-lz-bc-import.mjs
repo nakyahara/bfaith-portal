@@ -1078,6 +1078,20 @@ await ta('[X] ボタンの回が押した後 (executing / exporting) は、別�
     const half = new Database(f); half.exec('CREATE TABLE bc_jobs (job_id INTEGER)'); half.close();
     assert.match(String(BC.bcPressInProgress(NOW).error), /表 bc_meta が無い/);
     fs.rmSync(f);
+    // 始めた時刻の値が空・数でない・0 = 壊れた帳面 (前に作った CSV の見分けが効かない。Codex R9 Medium)
+    for (const v of ['', 'NaN', '0', '12abc']) {
+      const okDb = BC.openLzBcDb(f);
+      okDb.prepare("update bc_meta set value = ? where key = 'started_at'").run(v);
+      assert.throws(() => BC.startedAt(okDb), /始めた時刻/, `開いている接続でも: ${v}`);
+      alive(okDb, NOW);
+      assert.throws(() => BC.enqueue(okDb, base({ now: NOW })), /始めた時刻/, `積めない: ${v}`);
+      okDb.close();
+      assert.match(String(BC.bcPressInProgress(NOW).error), /始めた時刻/, v);
+      assert.throws(() => BC.openLzBcDb(f), /始めた時刻/, v);
+      r = await openManual();
+      assert.deepEqual([r.status, r.j.error], [503, 'bc_state_unreadable'], v);
+      fs.rmSync(f, { force: true }); fs.rmSync(`${f}-wal`, { force: true }); fs.rmSync(`${f}-shm`, { force: true });
+    }
     fs.mkdirSync(f);   // ファイルの代わりにフォルダ = 読めない
     assert.ok(BC.bcPressInProgress(NOW).error);
     // 手の取込の口も 503
