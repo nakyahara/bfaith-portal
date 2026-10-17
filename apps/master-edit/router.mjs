@@ -916,11 +916,11 @@ router.post('/api/variation/check', (req, res) => {
  * 🆕 0083: メーカーの欄が出る DB (0083 があって画面のロールが書ける = makerReady) = メーカーも「値か入力なし」を数えて、理由・子ごとの理由を作り直す。
  *   出ない DB (0083 の前・ロールの流し直しの前) = 上の確かめ (pre) のまま (メーカーを数えない = 前の画面・前の登録と同じ)。単品とまとまりだけ
  */
-async function makerBlanks(db, kind, raw, pre, actor) {
+async function makerBlanks(db, kind, raw, pre, actor, skip = null) {
   const plain = { ok: true, body: pre.body, childReasons: pre.childReasons };
   if (!(kind === 'single' || kind === 'variation')) return plain;
   const ready = await makerReady(db);
-  const p = ready ? prepareRegisterBody(kind, raw, { makerApplicable: true }) : null;
+  const p = ready ? prepareRegisterBody(kind, raw, { makerApplicable: true, ...(skip ? { skip } : {}) }) : null;   // skip = 前の画面の押し直しで数えない項目 (参考 URL・#1732)
   // 🆕 #maker Codex R1 M: 押し直し (この request_id の保存の記録がある) = 初回と同じ数え方で照らす。0083 の前・ロールの流し直しの前の初回 (メーカーを数えなかった) の押し直しを
   //   流し直しの後に送っても 400 にしない・理由 (= 要求のハッシュ) を変えない。記録の要求のハッシュと合う方 (メーカーを数えた / 数えない) を使う。どちらも合わない = 数えた方 (lib が 409 か前の誤り)
   const prev = await prevRequestHash(db, raw.request_id, kind);
@@ -1000,7 +1000,7 @@ router.post('/api/new/variation', (req, res) => {
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
     // 🆕 0083: メーカーの欄が出る DB (0083 があってロールの流し直しの後) = メーカーも「値か入力なし」を数え直す (上の確かめは DB を見ないので数えていない)
-    const mk = await makerBlanks(db, 'variation', req.body || {}, pre, String(req.session.email).trim().toLowerCase());
+    const mk = await makerBlanks(db, 'variation', req.body || {}, pre, String(req.session.email).trim().toLowerCase(), legacyRefs ? ['card.reference_urls'] : null);
     if (!mk.ok) return res.status(mk.status).json(mk.json);
     const vb = mk.body;
     const po = await orderBlanksFirstTime(db, req, gate, 'variation', vb);
