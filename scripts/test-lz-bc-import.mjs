@@ -1061,8 +1061,18 @@ await ta('[X] ボタンの回が押した後 (executing / exporting) は、別�
     // あるのに壊れている帳面 = 空として作り直さず「読めない」(Codex R7 High)
     const f = path.join(process.env.DATA_DIR, 'lz-bc-import.db');
     fs.writeFileSync(f, '');
-    assert.match(String(BC.bcPressInProgress(NOW).error), /0 byte/);
+    // 先に画面・状態・miniPC の取りに来るが帳面を開こうとしても、作り直さない (Codex R8 High)
+    const pg0 = await call('GET', '/lz-csv');
+    assert.equal(pg0.status, 200);
+    assert.ok(pg0.text.includes('取り込みの帳面 (Render の lz-bc-import.db) を読めません'));
+    assert.equal((await call('GET', '/api/lz-csv/import-status')).status, 500);
+    assert.equal((await runnerSeen()).status, 500);
     assert.equal(fs.statSync(f).size, 0, '0 byte のまま (作り直していない)');
+    assert.match(String(BC.bcPressInProgress(NOW).error), /0 byte/);
+    r = await openManual();
+    assert.deepEqual([r.status, r.j.error], [503, 'bc_state_unreadable'], '画面・miniPC の後でも手の取込は始めない');
+    assert.equal(fs.statSync(f).size, 0, '0 byte のまま (作り直していない)');
+    assert.throws(() => BC.openLzBcDb(f), /0 byte/);
     fs.rmSync(f);
     const Database = (await import('better-sqlite3')).default;
     const half = new Database(f); half.exec('CREATE TABLE bc_jobs (job_id INTEGER)'); half.close();

@@ -66,8 +66,32 @@ export class BcImportError extends Error {
 }
 const fail = (code, message, status = 409, extra = {}) => { throw new BcImportError(code, message, status, extra); };
 
-export function openLzBcDb(file = path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'lz-bc-import.db')) {
-  if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
+export const LEDGER_TABLES = Object.freeze(['bc_jobs', 'bc_meta', 'bc_runner', 'bc_downloads', 'bc_void_holds']);
+export const ledgerFile = () => path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'lz-bc-import.db');
+/**
+ * もうある帳面を、表を足す前に確かめる (0 byte・表が欠けた・始めた時刻が無い = 壊れた帳面。空として作り直すと、
+ * 押した後の回の記録が消えて「動いていない」になる = 例外で止める。Codex R7・R8 High)
+ * @returns {boolean}  true = まだ無い (新しく作ってよい)
+ */
+function checkExistingLedger(file) {
+  let st;
+  try { st = fs.statSync(file); } catch (e) { if (e && e.code === 'ENOENT') return true; throw e; }   // 無いと言えるのは ENOENT だけ
+  if (!st.isFile()) throw new Error('帳面がファイルでない');
+  if (!st.size) throw new Error('帳面のファイルが 0 byte');
+  const ro = new Database(file, { readonly: true, fileMustExist: true });
+  try {
+    const names = new Set(ro.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name));
+    for (const t of LEDGER_TABLES) if (!names.has(t)) throw new Error(`帳面の表 ${t} が無い`);
+    if (!ro.prepare("SELECT value FROM bc_meta WHERE key = 'started_at'").get()) throw new Error('帳面の始めた時刻が無い');
+  } finally { ro.close(); }
+  return false;
+}
+
+export function openLzBcDb(file = ledgerFile()) {
+  if (file !== ':memory:') {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    checkExistingLedger(file);   // 壊れている = 例外 (作り直さない)
+  }
   const db = new Database(file);
   if (file !== ':memory:') db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 5000');
@@ -172,21 +196,11 @@ export function __setLzBcDb(db) { shared = db; }
  * @returns {null | { job_id, export_id, state } | { error: string }}
  */
 export function bcPressInProgress(now = Date.now()) {
-  const file = path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'lz-bc-import.db');
+  const file = ledgerFile();
   try {
-    if (!shared) {
-      // 「まだ無い」と言えるのは ENOENT のときだけ (アクセス拒否などは読めない側。Codex R7 High)
-      let st;
-      try { st = fs.statSync(file); } catch (e) { if (e && e.code === 'ENOENT') return null; throw e; }
-      // あるファイルは、作り直す前に中身を確かめる (0 byte・表が無い・始めた時刻が無い = 壊れた帳面 = 空として作り直さない。Codex R7 High)
-      if (!st.size) throw new Error('帳面のファイルが 0 byte');
-      const ro = new Database(file, { readonly: true, fileMustExist: true });
-      try {
-        const names = new Set(ro.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name));
-        for (const t of ['bc_jobs', 'bc_meta', 'bc_runner', 'bc_downloads', 'bc_void_holds']) if (!names.has(t)) throw new Error(`帳面の表 ${t} が無い`);
-        if (!ro.prepare("SELECT value FROM bc_meta WHERE key = 'started_at'").get()) throw new Error('帳面の始めた時刻が無い');
-      } finally { ro.close(); }
-    }
+    // まだ接続が無く、帳面のファイルも無い (ENOENT) = ボタンを一度も使っていない = 動いていない (ファイルは作らない)。
+    //   ある帳面は getLzBcDb (openLzBcDb) が作り直す前に確かめる = 壊れている = 例外 = 読めない側
+    if (!shared && checkExistingLedger(file)) return null;
     const db = getLzBcDb();
     sweep(db, now);
     return busyJobIn(db);
