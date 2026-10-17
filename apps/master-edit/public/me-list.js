@@ -187,5 +187,16 @@
   });
   window.addEventListener('pageshow', function () { tbl.classList.remove('loading'); });
 
+  /* ---------- 画像の列 (10/17): 読み込めなかった画像 (楽天で消えた など) は「画像なし」の印に替える (壊れた画像の印を出さない) ---------- */
+  function brokenImg(img) {
+    var t = img.closest('.thumb'); if (!t) return;
+    var w = '画像を読み込めませんでした';
+    t.className = 'thumb none not_found'; t.title = w;
+    t.innerHTML = ic('i-image').replace('ic s', 'ic') + '<span class="sr">' + esc(w) + '</span>';
+  }
+  tbl.addEventListener('error', function (e) { var x = e.target; if (x && x.tagName === 'IMG' && x.closest('.thumb')) brokenImg(x); }, true);
+  // この JS より先に読み込みに失敗した画像 (complete = 読み終えた / 失敗した。まだ読んでいない lazy の画像は false)
+  $$('.thumb img', tbl).forEach(function (img) { if (img.complete && !img.naturalWidth) brokenImg(img); });
+
   apply();
 })();

@@ -46,6 +46,7 @@
  *     マウスで確定した後の Enter は食べない
  *  72〜74 1 つの商品の画面の「← 前へ」「次へ →」(10/17): 来た一覧と同じ並び・絞り込みの前・次と場所・続けて次へ・最初 / 最後・一覧に無い・出さないとき・
  *     未保存のまま押す = 離れるときの確認 (ここに残る / 捨てて移る)・スマホ 390 ではみ出さない・44px
+ *  75 一覧の画像の列 (10/17): コードのすぐ後ろ・52px の四角・取得中 / 画像なしの印・読み込めない画像は印・列の板で外す / 出す・画像を押しても開く・390 ではみ出さない
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -718,7 +719,7 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible:not(.c-chk)').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible:not(.c-chk)').count(), 16, '行の欄も 1 つ少ない (17 → 16。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない・10/17 の画像の列はいつも出す)');
     assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td[data-col="po"]').count(), 0, '注文残のセルは描かない (隠すだけでなく)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
@@ -1855,7 +1856,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);   // 前の試験の設定を消す
   await p.goto(B + '/?q=' + encodeURIComponent('単品'));
   assert.deepEqual(await shownHeads(p), LIST_DEFAULT.shown, 'いつもの列 (仕入先は出さない)');
-  assert.equal(await p.textContent('#colcnt'), '16/17');
+  assert.equal(await p.textContent('#colcnt'), '17/18');
   assert.equal(await p.isVisible('#list-tbl tbody tr:first-child .sup-sub'), true, '仕入先の列が無い = 名前の下に「仕入先」');
   // 板を開く: コードは外せない・↑↓ も押せない・FBA などは「並べられない」
   await p.click('#colbtn');
@@ -1863,7 +1864,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.equal(await p.getAttribute('#colbtn', 'aria-expanded'), 'true');
   assert.equal(await p.isDisabled('#collist li[data-id="code"] input'), true);
   assert.equal(await p.isDisabled('#collist li[data-id="code"] [data-mv="1"]'), true);
-  assert.equal(await p.isDisabled('#collist li[data-id="name"] [data-mv="-1"]'), true, 'コードより上には行かない');
+  assert.equal(await p.isDisabled('#collist li[data-id="img"] [data-mv="-1"]'), true, 'コードより上には行かない (コードのすぐ後ろ = 画像 10/17)');
   assert.match(await p.textContent('#collist li[data-id="fba"]'), /並べられない/);
   assert.equal(await p.isDisabled('#cp-save'), true, '変えていない = 保存は押せない');
   // 出さない: 状態 → 表から消える (見出しも行も)・「未保存」
@@ -1878,13 +1879,13 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.match(await p.textContent('#list-tbl tbody tr:first-child td[data-col="sup"]'), /0001\s*AMC/);
   // ↑ で仕入先をコードのすぐ後ろへ (押した後もそのボタンにフォーカス = 続けて押せる)
   for (let i = 0; i < 20 && (await shownHeads(p))[1] !== 'sup'; i++) await p.click('#collist li[data-id="sup"] [data-mv="-1"]');
-  assert.deepEqual((await shownHeads(p)).slice(0, 3), ['code', 'sup', 'name']);
+  assert.deepEqual((await shownHeads(p)).slice(0, 4), ['code', 'sup', 'img', 'name'], '仕入先はコードのすぐ後ろ (画像 10/17 は 1 つ後ろへ)');
   assert.equal(await p.evaluate(() => document.activeElement.closest('li')?.getAttribute('data-id')), 'sup');
-  assert.deepEqual(await p.$$eval('#list-tbl tbody tr:first-child td:not(.c-chk)', (tds) => tds.filter((td) => !td.hidden).slice(0, 3).map((td) => td.getAttribute('data-col'))), ['code', 'sup', 'name'], '行のセルも同じ並び');
+  assert.deepEqual(await p.$$eval('#list-tbl tbody tr:first-child td:not(.c-chk)', (tds) => tds.filter((td) => !td.hidden).slice(0, 4).map((td) => td.getAttribute('data-col'))), ['code', 'sup', 'img', 'name'], '行のセルも同じ並び');
   // つまみで動かす (売価を名前の前へ)
   await p.dragAndDrop('#collist li[data-id="price"] .grip', '#collist li[data-id="name"]');
-  assert.deepEqual((await shownHeads(p)).slice(0, 4), ['code', 'sup', 'price', 'name']);
-  assert.equal(await p.textContent('#colcnt'), '16/17');
+  assert.deepEqual((await shownHeads(p)).slice(0, 5), ['code', 'sup', 'img', 'price', 'name']);
+  assert.equal(await p.textContent('#colcnt'), '17/18');
   if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1280_cols.png` });
   // 保存 → 「未保存」が消える・別の窓 (= 別の PC。同じログイン) で開いても同じ列
   await p.click('#cp-save');
@@ -1974,6 +1975,73 @@ await ta('[54] 一覧の列の板 (狭い画面 390): 下から出る・板は�
   assert.ok(r.left <= 1 && r.right >= r.vw - 1 && Math.abs(r.bottom - r.vh) <= 1, JSON.stringify(r));
   if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/390_cols.png` });
 }, { width: 390, height: 844 });
+await ta('[75] 一覧の画像の列 (10/17 中原さん「楽天の白抜き商品画像でいい。サムネイルみたいなかたちで」): コードのすぐ後ろ・明るい台の 52px の四角 (行の高さが画像の有無で変わらない)・取得中 / 画像なしの印・読み込めない画像は印に替える・画像を押しても商品が開く・列の板で外す / 出す・390 で横にはみ出さない', async (p, ctx) => {
+  // 画像のキャッシュ = picking.db (同じ DATA_DIR)。楽天の呼び出しは止めておく (取得中のまま)・画像の取得は Playwright が返す (外へ出ない)
+  const PK = await import('../apps/picking/db.js');
+  const LI = await import('../apps/master-edit/list-images.mjs');
+  const IM = await import('../apps/picking/images.js');
+  const pdb = PK.getDB();
+  const put = (ne, o) => pdb.prepare(`INSERT OR REPLACE INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, variant_image_url, status, fetched_at)
+    VALUES (?, NULL, ?, NULL, NULL, ?, ?)`).run(ne, o.white ?? null, o.status ?? 'ok', PK.utcNow());
+  put('s001', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/ui-s001.jpg' });
+  put('z002', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/ui-broken.jpg' });
+  put('s003', { status: 'not_found' });
+  let open = null;
+  const gate = new Promise((res) => { open = res; });
+  LI.__setListImageDeps({ loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map() }), fetchDetails: async (mns) => { await gate; return { items: [], failed: mns.map((m) => ({ manageNumber: m, reason: 'Not found' })) }; } });
+  const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  await ctx.route('https://image.rakuten.co.jp/**', (route) => (route.request().url().includes('ui-broken') ? route.fulfill({ status: 404, body: '' }) : route.fulfill({ status: 200, contentType: 'image/png', body: PNG })));
+  try {
+    await p.goto(B + '/');
+    assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);
+    // コードで絞る (前の試験が名前を直した商品があっても同じ行が出る)
+    await p.goto(B + '/?' + new URLSearchParams({ codes: ['s001', 's003', 'z000', 'z001', 'z002'].join('\n') }));
+    assert.deepEqual((await shownHeads(p)).slice(0, 3), ['code', 'img', 'name'], '画像はコードのすぐ後ろ');
+    const cell = (code) => `#list-tbl tbody tr:has(a.rowlink[href="sku/${code}"]) td.c-img`;
+    // 画像あり: 52px の四角・明るい台・object-fit: contain・referrer を送らない
+    await p.waitForFunction((sel) => { const i = document.querySelector(sel + ' img'); return i && i.complete && i.naturalWidth > 0; }, cell('s001'));
+    const box = await p.$eval(cell('s001') + ' .thumb', (t) => { const r = t.getBoundingClientRect(); const i = t.querySelector('img'); const ir = i.getBoundingClientRect(); const s = getComputedStyle(t); return { w: r.width, h: r.height, iw: ir.width, ih: ir.height, bg: s.backgroundColor, fit: getComputedStyle(i).objectFit, ref: i.referrerPolicy, lazy: i.loading, altIsName: !!i.alt && i.alt === t.closest('tr').querySelector('.nm').textContent }; });
+    assert.deepEqual(box, { w: 52, h: 52, iw: 50, ih: 50, bg: 'rgb(243, 245, 249)', fit: 'contain', ref: 'no-referrer', lazy: 'lazy', altIsName: true }, 'alt = 名前');
+    // 読み込めない画像 (楽天で消えた) = 画像なしの印に替える (壊れた画像の印を出さない)
+    await p.waitForSelector(cell('z002') + ' .thumb.none');
+    assert.equal(await p.locator(cell('z002') + ' img').count(), 0);
+    // 楽天に無い = 印・キャッシュに無い = 取得中
+    assert.equal(await p.getAttribute(cell('s003') + ' .thumb', 'class'), 'thumb none not_found');
+    assert.equal(await p.getAttribute(cell('s003') + ' .thumb', 'title'), '楽天に画像がありません');
+    assert.equal(await p.getAttribute(cell('z000') + ' .thumb', 'class'), 'thumb none pending');
+    assert.equal((await p.textContent(cell('z000') + ' .thumb .tw')).trim(), '取得中');
+    // 行の高さは画像の有無で同じ (読み込みで動かない)
+    const hs = [];
+    for (const c of ['s001', 's003', 'z000', 'z001']) hs.push(await p.$eval(cell(c), (td) => Math.round(td.closest('tr').getBoundingClientRect().height)));
+    assert.ok(Math.max(...hs) - Math.min(...hs) <= 1, `行の高さ ${hs}`);
+    // 列の板で外す / 出す (保存しない)
+    await p.click('#colbtn');
+    await p.click('#collist li[data-id="img"] input');
+    assert.ok(!(await shownHeads(p)).includes('img'));
+    assert.equal(await p.isHidden(cell('s001')), true);
+    assert.equal(await p.textContent('#colcnt'), '16/18');
+    await p.click('#collist li[data-id="img"] input');
+    assert.deepEqual((await shownHeads(p)).slice(0, 2), ['code', 'img']);
+    assert.match(await p.textContent('#collist li[data-id="img"]'), /画像\s*新/);
+    assert.match(await p.textContent('#collist li[data-id="img"]'), /並べられない/);
+    await p.keyboard.press('Escape');
+    // 390: 横にはみ出さない (表は表の箱の中で送る)・画像の大きさはそのまま
+    await p.setViewportSize({ width: 390, height: 844 });
+    const [sw, cw] = await p.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+    assert.ok(sw <= cw + 1, `390 で横にはみ出さない ${sw} > ${cw}`);
+    assert.deepEqual(await p.$eval(cell('s001') + ' .thumb', (t) => [t.getBoundingClientRect().width, t.getBoundingClientRect().height]), [52, 52]);
+    if (LIST_SHOTS) await p.screenshot({ path: `${LIST_SHOTS}/390_images.png` });
+    await p.setViewportSize({ width: 1440, height: 900 });
+    if (LIST_SHOTS) await p.screenshot({ path: `${LIST_SHOTS}/1440_images.png` });
+    // 画像を押しても商品が開く (行のどこを押しても開くのと同じ)
+    await Promise.all([p.waitForURL(/\/sku\/s001$/), p.click(cell('s001') + ' img')]);
+  } finally {
+    open();
+    await IM.queueEnsureImages([], '');
+    LI.__setListImageDeps(null);
+    pdb.prepare("DELETE FROM pk_product_images WHERE ne_code IN ('s001', 'z002', 's003')").run();
+  }
+});
 
 // 拡大 125% / 150% = 画面の CSS の幅が 1/1.25・1/1.5 になる。MASTER_EDIT_UI_SHOTS=フォルダ を付けると、そのフォルダに写しを残す (目で見る用)
 const SHOTS = process.env.MASTER_EDIT_UI_SHOTS || '';
