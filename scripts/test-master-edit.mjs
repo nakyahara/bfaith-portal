@@ -2636,6 +2636,91 @@ await ta('[21] CSV の商品コード = NE から来た商品なら NE の書き
   } finally { setF(pgFactory); }
 });
 
+await ta('[22] 1 つの商品の画面の「← 前へ」「次へ →」(10/17 中原さん): 来た一覧と同じ絞り込み・並び (既定のコード順・SQL / JS で並べる列・かなの同一視・印 ?s=) の中の前・次と場所・最初 / 最後・一覧に無い・打ち方の違うコード・期限切れ 410・件数 413・時間 503・offset は見ない・載るページ', async () => {
+  const { __setExportLimits } = await import('../apps/master-edit/router.mjs');
+  const T = await import('../apps/master-edit/search-token.mjs');
+  /** 一覧の正しい並び = 全部コピー (api/codes = 一覧と同じ並びは [18] [20] が確かめている) */
+  const codesOf = async (qs) => { const r = await call('GET', `/api/codes${qs ? `?${qs}` : ''}`); assert.equal(r.status, 200, r.text); return r.j.codes; };
+  const nb = (qs, cur) => call('GET', `/api/neighbors?${qs ? `${qs}&` : ''}cur=${encodeURIComponent(cur)}`);
+  const expect = (codes, i) => ({ ok: true, total: codes.length, pos: i + 1, prev: i > 0 ? codes[i - 1] : null, next: i + 1 < codes.length ? codes[i + 1] : null, offset: Math.floor(i / R.LIST_LIMIT) * R.LIST_LIMIT });
+  // 画面: 前へ・次へを出す場所 (最初は隠す) と画面の JS
+  const page = await call('GET', '/sku/s002');
+  assert.match(page.text, /<nav class="pn" id="sku-pn" aria-label="一覧の前後の商品" data-code="s002" hidden><\/nav>/);
+  assert.ok((await checkScripts(page.text, 0)).some((s) => s.includes("'api/neighbors?'")), '画面の JS (me-prevnext.js) を読む');
+  // 絞り込み・並びのいろいろ: 前・次・場所が全部コピーの並びと同じ (最初・真ん中・最後)
+  for (const qs of ['', 'kind=single', 'kind=single&sort=name&dir=desc', 'sort=kind', 'sort=profit', 'sort=rate&dir=desc', 'sort=sales_class', 'q=s00', 'q=' + encodeURIComponent('ｓ００'), 'state=available&sort=price', 'missing=reorder']) {
+    const codes = await codesOf(qs);
+    if (!codes.length) continue;
+    for (const i of [...new Set([0, Math.floor(codes.length / 2), codes.length - 1])]) {
+      const r = await nb(qs, codes[i]);
+      assert.equal(r.status, 200, r.text);
+      assert.deepEqual(r.j, expect(codes, i), `${qs || '(条件なし)'} の ${i + 1} 番目 ${codes[i]}`);
+    }
+    const first = (await nb(qs, codes[0])).j; assert.equal(first.prev, null, `${qs}: 最初は前が無い`);
+    const last = (await nb(qs, codes[codes.length - 1])).j; assert.equal(last.next, null, `${qs}: 最後は次が無い`);
+  }
+  // offset (一覧のページ) は見ない = 全件の中の場所
+  {
+    const codes = await codesOf('kind=single');
+    assert.deepEqual((await nb('kind=single&offset=100', codes[1])).j, expect(codes, 1));
+  }
+  // 打ち方の違うコード (大文字・全角) も同じ商品
+  {
+    const codes = await codesOf('kind=single');
+    const i = codes.indexOf('s002');
+    assert.ok(i >= 0);
+    assert.deepEqual((await nb('kind=single', 'S002')).j, expect(codes, i));
+    assert.deepEqual((await nb('kind=single', 'ｓ００２')).j, expect(codes, i));
+  }
+  // 一覧に無い (絞り込みに合わない・直して外れた) = 場所なし・前後なし (件数は返す)
+  {
+    const codes = await codesOf('kind=single');
+    assert.deepEqual((await nb('kind=single', 'set001')).j, { ok: true, total: codes.length, pos: null, prev: null, next: null, offset: null });
+    assert.deepEqual((await nb('kind=single', 'no-such-code')).j.pos, null);
+  }
+  // 載るページ: 100 件より後の商品 = その商品が載る一覧のページの offset ([19] の例外 1,500 件)
+  {
+    const codes = await codesOf('kind=exception');
+    assert.ok(codes.length > 250, String(codes.length));
+    assert.deepEqual((await nb('kind=exception', codes[150])).j, expect(codes, 150));
+    assert.equal((await nb('kind=exception', codes[150])).j.offset, 100);
+    assert.equal((await nb('kind=exception', codes[99])).j.offset, 0);
+    assert.equal((await nb('kind=exception', codes[200])).j.offset, 200);
+  }
+  // 詳細検索の印 (?s=): 印の中身 (コード 3 つ)・並び (区分の順) のまま
+  const sr = await call('POST', '/api/search', { body: { codes: 'set001\ns002\ns001', sort: 'kind' } });
+  assert.equal(sr.status, 200, sr.text);
+  const qs = sr.j.url.split('?')[1];
+  assert.match(qs, /(^|&)s=/);
+  assert.deepEqual((await nb(qs, 's002')).j, { ok: true, total: 3, pos: 2, prev: 's001', next: 'set001', offset: 0 });
+  assert.deepEqual((await nb(qs, 'set001')).j, { ok: true, total: 3, pos: 3, prev: 's002', next: null, offset: 0 });
+  // 期限切れ = 410 (画面はボタンを出さない)
+  T.__clearSearchTokens();
+  let r = await nb(qs, 's002');
+  assert.deepEqual([r.status, r.j.reason], [410, 'expired']);
+  // 商品コードが無い = 400
+  assert.equal((await call('GET', '/api/neighbors?kind=single')).status, 400);
+  // 件数の上限 = 413・時間の上限 = 503 (全部コピーと同じ上限)
+  __setExportLimits({ max: 2 });
+  try {
+    r = await nb('kind=single', 's002');
+    assert.deepEqual([r.status, r.j.reason], [413, 'too_many']);
+    assert.equal((await nb('codes=' + encodeURIComponent('s001\ns002'), 's002')).status, 200, '2 件までは出す');
+  } finally { __setExportLimits(null); }
+  __setExportLimits({ timeMs: 0 });
+  try {
+    r = await nb('kind=single', 's002');
+    assert.deepEqual([r.status, r.j.reason], [503, 'timeout']);
+  } finally { __setExportLimits(null); }
+  // つながらない = 503
+  factoryMode = 'down';
+  try { assert.equal((await nb('kind=single', 's002')).status, 503); } finally { factoryMode = 'ok'; }
+  // 読む関数 (read.mjs) を直接: 並べる列が JS (利益) でも一覧の 'codes' と同じ
+  const all = (await R.listSkus(db, { sort: 'profit' }, { now: NOW, mode: 'codes' })).codes;
+  const mid = Math.floor(all.length / 2);
+  assert.deepEqual(await R.listNeighbors(db, { sort: 'profit' }, all[mid], { now: NOW }), expect(all, mid));
+});
+
 server.close();
 console.log(`\n${passed} 件 ok`);
 if (process.exitCode) console.error('NG があります');
