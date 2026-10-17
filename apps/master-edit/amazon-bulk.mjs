@@ -155,10 +155,11 @@ export function groupCsvRows(records) {
     }
     const key = normSku(sku);
     let g = by.get(key);
-    if (!g) { g = { key, sku, rawSku: rawSku.trim(), line: r.no, name: '', names: [], lines: [], codes: new Set(), over: 0, errors: [], warnings: [] }; by.set(key, g); }
+    if (!g) { g = { key, sku, rawSku: rawSku.trim(), line: r.no, name: '', names: new Set(), lines: [], codes: new Set(), over: 0, errors: [], warnings: [] }; by.set(key, g); }
     if (sku !== g.sku) g.errors.push(`${r.no} 行目: 同じ seller SKU が ${g.line} 行目と違う書き方 (${g.sku} と ${sku}) です。どちらかにそろえてください`);
     const name = cellAt(r, col.name).replace(CTRL_ALL, ' ').trim();
-    if (name) { if (!g.name) g.name = name; else if (name !== g.name && !g.names.includes(name)) g.names.push(name); }
+    // 違う名前は気をつけることに 3 つまで出す = 3 つまで持つ (行が多くても 2 乗にしない・#Codex A R2 M2)
+    if (name) { if (!g.name) g.name = name; else if (name !== g.name && g.names.size < 3) g.names.add(name); }
     const code = cellAt(r, col.ne_code).trim();
     const qRaw = toHalfDigits(cellAt(r, col.qty)).trim();
     if (!code) { g.errors.push(`${r.no} 行目: NE の商品コードが空です`); continue; }
@@ -178,7 +179,8 @@ export function groupCsvRows(records) {
     if (g.over) g.errors.push(`構成品が ${g.lines.length + g.over} 行あります (1〜${MAX_MAP_COMPONENTS} 行)`);
     delete g.codes;
     if (g.errors.length > 50) g.errors = [...g.errors.slice(0, 50), `ほか ${g.errors.length - 50} 件の誤り`];
-    if (g.names.length) g.warnings.push(`名前が行によって違います。上の行の名前「${g.name}」を使います (ほか: ${g.names.slice(0, 3).join(' / ')})`);
+    if (g.names.size) g.warnings.push(`名前が行によって違います。上の行の名前「${g.name}」を使います (ほか: ${[...g.names].join(' / ')})`);
+    delete g.names;
     if (g.name) {
       if ([...g.name].length > MAX_MAP_NAME) g.errors.push(`名前は ${MAX_MAP_NAME} 文字までです`);
       else if (nameBlank(g.name)) g.name = '';

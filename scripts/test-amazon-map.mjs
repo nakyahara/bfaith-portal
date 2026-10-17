@@ -2093,7 +2093,7 @@ await ta('[20] 画面・見本の CSV・結果の CSV (式の注入の対策): �
   assert.equal(r.status, 200);
   const js = await checkScripts(r.text);
   assert.ok(r.text.includes('id="bulk-file"') && js.some((x) => x.includes('me-amazon-bulk.js — CSV でまとめて登録')));
-  for (const api of ["'/api/amazon/bulk/preview'", "'/api/amazon/bulk/apply'", "'/api/amazon/bulk/report.csv'"]) assert.ok(js.some((x) => x.includes(api)), api);
+  for (const api of ["'/api/amazon/bulk/preview'", "'/api/amazon/bulk/apply'"]) assert.ok(js.some((x) => x.includes(api)), api);
   r = await call('GET', '/amazon/bulk', { session: 'viewer' });
   assert.ok(!r.text.includes('id="bulk-file"') && !r.text.includes('me-amazon-bulk.js') && r.text.includes('試し取込も名簿の人だけ'));
   process.env.MASTER_EDIT_OPEN = '0';
@@ -2103,11 +2103,6 @@ await ta('[20] 画面・見本の CSV・結果の CSV (式の注入の対策): �
   assert.deepEqual([...tb.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
   const tg = BK.groupCsvRows(BK.parseCsvText(BK.decodeCsvBytes(tb).text));
   assert.deepEqual([tg.format, tg.skus.length, tg.skus[1].lines.length], ['simple', 2, 2], '見本の CSV は自分の読み方で読める (2 行 = セット)');
-  r = await call('POST', '/api/amazon/bulk/report.csv', { body: { rows: [{ seller_sku: '=HYPERLINK("x")', line: 2, action: 'error', name: '+cmd', components: [{ code: '@a', qty: 1 }], result: '送らない', errors: ['-1'], warnings: [], notes: [] }] } });
-  assert.equal(r.status, 200);
-  assert.ok(r.text.includes(`"'=HYPERLINK(""x"")","2","だめ","'+cmd","'@a×1","送らない","'-1"`), r.text);
-  r = await call('POST', '/api/amazon/bulk/report.csv', { body: { rows: [] }, session: 'viewer' });
-  assert.equal(r.status, 403);
   r = await call('GET', '/amazon/');
   assert.ok(r.text.includes('href="bulk"'), '一覧の右上に入口');
   r = await call('GET', '/manual');

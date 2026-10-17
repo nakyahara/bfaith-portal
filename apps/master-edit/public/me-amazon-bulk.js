@@ -4,7 +4,8 @@
  *   2. 結果の表 (seller SKU ごとに する事・名前・構成・理由)・絞る札 (全部 / 保存する / 変わらない / だめ / 気をつける)
  *   3. 「保存する」= 保存してよい SKU だけを 20 件ずつ POST /api/amazon/bulk/apply { ticket, items } (印つきのまま返す)。
  *      通信が切れた = そこで止める。もう一度押すと続きから (同じ切符 = 同じ request_id = 保存済みの分は前の結果が返る・2 回入らない)
- *   「結果を CSV で保存」= 表の結果を POST /api/amazon/bulk/report.csv (式の注入の対策はサーバー = 一覧の CSV と同じ)
+ *   「結果を CSV で保存」= 表の結果を画面の中で CSV にする (BOM つき UTF-8・CRLF・式の注入の対策 = list-csv.mjs の csvCell と同じ決まり)。
+ *     サーバーに送り返さない (2,000 件の結果でも本文の上限に当たらない・#Codex A R2 M1)
  *   試し取込の後に保存していない = 離れるときに確かめる (MasterEdit.dirty)
  */
 (function () {
@@ -161,14 +162,29 @@
     })();
   });
 
+  /** 1 つの欄 (list-csv.mjs の csvCell と同じ: 先頭の空白・制御文字を除いた最初の字が = + - @ タブ CR なら ' を付ける・" は "")。数は数のまま */
+  var LEAD = new RegExp('^[\\s\\x00-\\x1f\\x7f-\\x9f' + String.fromCharCode(0x200b, 0xfeff) + ']+');
+  function csvCell(v) {
+    if (v == null) return '""';
+    var s = typeof v === 'number' ? (isFinite(v) ? String(v) : '') : String(v);
+    if (typeof v !== 'number') { var first = s.replace(LEAD, '').charAt(0); if (/^[=+\-@\t\r]$/.test(first) || /^[\t\r]/.test(s)) s = "'" + s; }
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  ME.bulkCsvCell = csvCell;   // 試験が list-csv.mjs と同じ答えかを確かめる
   reportBtn.addEventListener('click', function () {
     if (!S.data) return;
-    var cut = function (a) { return (a || []).map(function (t) { return String(t).slice(0, 500); }); };
-    var rows = S.data.rows.map(function (r) { return { seller_sku: r.seller_sku, line: r.line, action: r.action, name: r.name, components: r.components, result: String(resultText(r)).slice(0, 500), errors: cut(r.errors), warnings: cut(r.warnings), notes: cut(r.notes) }; })
-      .concat(S.data.line_errors.map(function (e) { return { seller_sku: e.raw, line: e.no, action: 'error', name: '', components: [], result: '送らない', errors: [e.message], warnings: [], notes: [] }; }));
-    fetch(BASE + '/api/amazon/bulk/report.csv', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rows: rows }) })
-      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); var name = /filename="([^"]+)"/.exec(r.headers.get('content-disposition') || ''); return r.blob().then(function (b) { return { b: b, name: name ? name[1] : 'amazon-bulk-result.csv' }; }); })
-      .then(function (x) { var a = document.createElement('a'); a.href = URL.createObjectURL(x.b); a.download = x.name; document.body.appendChild(a); a.click(); setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000); })
-      .catch(function (e) { msg('bulk-apply-msg', '結果の CSV を作れませんでした (' + e.message + ')', 'err'); });
+    var join = function (a) { return (a || []).join(' / '); };
+    var comps = function (a) { return (a || []).map(function (c) { return c.code + '×' + c.qty; }).join(', '); };
+    var head = ['seller SKU', 'CSV の行', '試し取込', '名前', '構成 (NE の商品 × 数)', '保存の結果', 'だめな理由', '気をつけること', 'メモ'];
+    var lines = [head.map(csvCell).join(',')];
+    S.data.rows.forEach(function (r) { lines.push([r.seller_sku, String(r.line), CFG.actions[r.action] || r.action, r.name || '', comps(r.components), resultText(r), join(r.errors), join(r.warnings), join(r.notes)].map(csvCell).join(',')); });
+    S.data.line_errors.forEach(function (e) { lines.push([e.raw, String(e.no), CFG.actions.error, '', '', '送らない', e.message, '', ''].map(csvCell).join(',')); });
+    var blob = new Blob([String.fromCharCode(0xfeff) + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
+    var d = new Date(Date.now() + 9 * 3600e3).toISOString();
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'amazon-bulk-result_' + d.slice(0, 10).replace(/-/g, '') + '-' + d.slice(11, 13) + d.slice(14, 16) + '.csv';
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
   });
 })();

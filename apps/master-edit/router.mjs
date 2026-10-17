@@ -104,7 +104,7 @@ import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
 import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
 import { bulkInspect, bulkPreview, bulkApplyChunk, editableOf, BULK_MAX, BULK_CHUNK, COST_REASONS, FIX_GROUPS } from './bulk.mjs';
-import { buildListCsv, csvFileName, buildAmazonCsv, amazonCsvFileName, buildUnmappedCsv, unmappedCsvFileName, buildBulkReportCsv, bulkReportFileName } from './list-csv.mjs';
+import { buildListCsv, csvFileName, buildAmazonCsv, amazonCsvFileName, buildUnmappedCsv, unmappedCsvFileName } from './list-csv.mjs';
 import { LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, ViewPrefsInputError } from './list-columns.mjs';
 import { readViewPrefs, saveViewPrefs } from './view-prefs.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
@@ -461,10 +461,9 @@ router.use('/api/', (req, res, next) => {
   next();
 });
 // 🆕 10/17 CSV の一括登録の試し取込 = ファイルの中身 (base64・2 MB まで → 約 2.7 MB) を受ける道だけ大きく (ほかの道は今までどおり 256kb)。名簿の人の確かめは道の中で
-//   結果の CSV (2,000 件の結果) も同じく大きく。どれも名簿の人でなければ本文を読む前に断る
+//   保存 (apply) も、名簿の人でなければ本文を読む前に断る
 const bulkEditorOnly = (req, res, next) => { const g = editorGate(req); if (!g.ok) return res.status(403).json({ ok: false, error: g.message, reason: 'not_editor' }); next(); };
 router.use('/api/amazon/bulk/preview', bulkEditorOnly, express.json({ limit: '4mb' }));
-router.use('/api/amazon/bulk/report.csv', bulkEditorOnly, express.json({ limit: '12mb' }));   // 2,000 件の名前 (255 字)・前と後・理由 (#Codex A R1 M)
 router.use('/api/amazon/bulk/apply', bulkEditorOnly);   // 保存の本文 (256kb) も名簿の人でなければ読む前に断る (#Codex A R1 M)
 router.use(express.json({ limit: '256kb' }));
 
@@ -1499,7 +1498,7 @@ router.post('/api/amazon/delete', (req, res) => {
 });
 
 // ─── CSV でまとめて登録 (試し取込つき・10/17 中原さん・apps/master-edit/amazon-bulk.mjs) ───
-//   見る = この画面の利用権の人 (画面と見本の CSV)・試し取込 / 保存 / 結果の CSV = 名簿 (MASTER_EDITORS) の人だけ。保存は 1 件ずつ 1 つの画面と同じ saveAmazonMap
+//   見る = この画面の利用権の人 (画面と見本の CSV)・試し取込 / 保存 = 名簿 (MASTER_EDITORS) の人だけ (結果の CSV は画面が手元で作る)。保存は 1 件ずつ 1 つの画面と同じ saveAmazonMap
 const BULK_VIEW = Object.freeze({ maxBytes: BULK_MAX_BYTES, maxRows: BULK_MAX_ROWS, maxSkus: BULK_MAX_SKUS, chunk: BULK_APPLY_CHUNK, similarMax: BULK_SIMILAR_MAX, formats: BULK_FORMATS, actions: BULK_ACTIONS });
 router.get('/amazon/bulk', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const phase = await readPhaseView(db);
@@ -1528,19 +1527,6 @@ router.post('/api/amazon/bulk/apply', (req, res) => {
     res.json(await amazonBulkApplyChunk(db, req.body || {}, { actor: String(req.session.email).trim().toLowerCase(), open: isOpen(), nowMs: Date.now() }));
   }, 'write');
 });
-// 結果の CSV (試し取込・保存の結果を画面から送る = Company DB は読まない)。式の注入の対策は一覧の CSV と同じ (csvCell)
-router.post('/api/amazon/bulk/report.csv', (req, res) => {
-  const gate = editorGate(req);
-  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
-  const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
-  if (!rows || rows.length > BULK_MAX_SKUS + BULK_MAX_ROWS) return res.status(400).json({ ok: false, error: '結果の行の形が違います' });
-  const name = bulkReportFileName(clock());
-  res.set('Content-Type', 'text/csv; charset=utf-8');
-  res.set('Content-Disposition', `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`);
-  res.set('Cache-Control', 'no-store');
-  res.send(buildBulkReportCsv(rows, { actions: BULK_ACTIONS }));
-});
-
 // ─── 🆕 0081 ロジザード登録の CSV (logizard_bc_upload.csv・CompanyDB構想 23 v4 §5'・lib/lz-new-export.mjs) ───
 //   見る = この画面の利用権の人・作る / 取り消す / ファイル = 名簿 (MASTER_DECISION_APPROVERS) の人 (NE 登録の CSV と同じ)
 router.get('/lz-csv', (req, res) => withPgPage(req, res, async (db, dbError) => {

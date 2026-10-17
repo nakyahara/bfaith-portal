@@ -135,29 +135,6 @@ export function buildUnmappedCsv(data, { withFbm = false, mapStates = {}, channe
   return csvOf(cols, list);
 }
 
-/** CSV の一括登録の結果の CSV のファイル名。例 amazon-bulk-result_20261017-0930.csv */
-export const bulkReportFileName = (nowMs = Date.now()) => csvFileName(nowMs).replace(/^master-list_/, 'amazon-bulk-result_');
-/**
- * CSV の一括登録 (10/17) の結果の CSV。rows = 画面が持っている試し取込・保存の結果 (画面から送る = 値は人が上げた CSV の字を含む = 必ず csvCell)。
- *   形の違う値は文字にして 2,000 字で切る (結果を見るためのファイル・取り込み直しには使わない)
- */
-export function buildBulkReportCsv(rows, { actions = {} } = {}) {
-  const t = (v) => (v == null ? '' : [...String(Array.isArray(v) ? v.join(' / ') : typeof v === 'object' ? JSON.stringify(v) : v)].slice(0, 2000).join(''));
-  const comps = (v) => (Array.isArray(v) ? v.map((c) => `${t(c && c.code)}×${t(c && c.qty)}`).join(', ') : t(v));
-  const cols = [
-    ['seller SKU', (r) => t(r.seller_sku)],
-    ['CSV の行', (r) => t(r.line)],
-    ['試し取込', (r) => t(actions[r.action] || r.action)],
-    ['名前', (r) => t(r.name)],
-    ['構成 (NE の商品 × 数)', (r) => comps(r.components)],
-    ['保存の結果', (r) => t(r.result)],
-    ['だめな理由', (r) => t(r.errors)],
-    ['気をつけること', (r) => t(r.warnings)],
-    ['メモ', (r) => t(r.notes)],
-  ];
-  return csvOf(cols, rows.filter((r) => r && typeof r === 'object'));
-}
-
 /** まだつないでいない SKU の CSV のファイル名。例 amazon-unlinked_20261017-0930.csv */
 export const unlinkedCsvFileName = (nowMs = Date.now()) => csvFileName(nowMs).replace(/^master-list_/, 'amazon-unlinked_');
 /** まだつないでいない SKU の CSV (10/17)。data = listUnlinked(…, { all: true }) の結果 (画面と同じ絞り込み・ページに分けない) */

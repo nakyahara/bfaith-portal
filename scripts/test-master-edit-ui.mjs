@@ -3047,7 +3047,7 @@ await ta('[73] CSV でまとめて登録 (10/17): ファイルを選ぶ → 試�
   await Promise.all([p.waitForURL(/\/amazon\/bulk$/), p.click('a[href="bulk"]')]);
   assert.equal(await p.isDisabled('#bulk-preview'), true, 'ファイルを選ぶまで押せない');
   const NL = String.fromCharCode(13, 10);
-  const csv = ['seller_sku,name,ne_code,qty', 'pr-ui-bulk-1,一括 1,k001,2', 'pr-ui-bulk-1,一括 1,k002,1', 'pr-ui-bulk-2,,k004,1', 'pr-ui-bulk-3,無いコード,nope-x,1'].join(NL) + NL;
+  const csv = ['seller_sku,name,ne_code,qty', 'pr-ui-bulk-1,一括 1,k001,2', 'pr-ui-bulk-1,一括 1,k002,1', 'pr-ui-bulk-2,,k004,1', 'pr-ui-bulk-3,=無いコード,nope-x,1'].join(NL) + NL;
   await p.setInputFiles('#bulk-file', { name: '一括の試験.csv', mimeType: 'text/csv', buffer: iconv.encode(csv, 'cp932') });
   await p.click('#bulk-preview');
   await p.locator('#bulk-result').waitFor({ state: 'visible' });
@@ -3074,6 +3074,16 @@ await ta('[73] CSV でまとめて登録 (10/17): ファイルを選ぶ → 試�
   assert.equal((await mapOf('pr-ui-bulk-2')).name, 'ＡＢＣ 保存袋');
   assert.equal(await dirty(p), 0, '保存した後 = 確かめない');
   assert.equal(await p.isDisabled('#bulk-apply'), true);
+  // 結果の CSV (画面が手元で作る・BOM・式の注入の対策 = list-csv.mjs の csvCell と同じ答え)
+  const [dl] = await Promise.all([p.waitForEvent('download'), p.click('#bulk-report')]);
+  assert.match(dl.suggestedFilename(), /^amazon-bulk-result_[0-9]{8}-[0-9]{4}[.]csv$/);
+  const rep = fs.readFileSync(await dl.path());
+  assert.deepEqual([...rep.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+  const repText = rep.toString('utf8');
+  assert.ok(repText.includes(`"pr-ui-bulk-3","5","だめ","'=無いコード"`), repText);
+  assert.ok(repText.includes('"pr-ui-bulk-1","2","作る (出品も)","一括 1","k001×2, k002×1","作った"'), '保存の結果も入る');
+  const { csvCell } = await import('../apps/master-edit/list-csv.mjs');
+  for (const v of ['=a', ' +b', '	-c', '@d', 'ok', 'x"y', String.fromCharCode(0xfeff) + '=e', String.fromCharCode(0x200b) + '-f']) assert.equal(await p.evaluate((x) => window.MasterEdit.bulkCsvCell(x), v), csvCell(v), JSON.stringify(v));
   // 同じ CSV をもう一度 = 「変わらない」(保存する SKU が無い)
   await p.setInputFiles('#bulk-file', { name: '一括の試験.csv', mimeType: 'text/csv', buffer: Buffer.from(csv, 'utf8') });
   await p.click('#bulk-preview');
