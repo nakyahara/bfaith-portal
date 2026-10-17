@@ -73,6 +73,8 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
     ['対応が必要', (r) => (r.flags || []).join('・')],
     // NE の書き方が決まらない商品 = 今のコードのまま出して理由を添える (確かめずに NE・ロジザードに上げないように。10/16 中原さん)
     ['商品コードの注意', (r) => r.code_note || ''],
+    // 🆕 0083 (2026-10-17): メーカー (Company DB だけの値・単品だけ・セットは空)。前の列の並びは変えない (最後に足す)
+    ['メーカー', (r) => r.maker || ''],
   ];
   const lines = [cols.map(([h]) => csvCell(h)).join(',')];
   for (const r of data.rows) lines.push(cols.map(([, f]) => csvCell(f(r))).join(','));

@@ -130,6 +130,12 @@
               <option value="">(選ぶ)</option>
               <% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"><%= s.code %> <%= s.name %></option><% } %>
             </select><span class="hint">NE で必須の項目です · 発注条件グループはこの仕入先のものから選びます (下の「発注の設定」)</span><a class="hint" href="/apps/purchase-orders" target="_blank" rel="noopener">先方品番は 発注アプリ ↗</a></div></div>
+          <%# 🆕 0083 メーカー (中原さん 2026-10-17・代表の仕入先のすぐ下)。Company DB だけに持つ (NE・ロジザード・product-hub には送らない)。値 か 入力なし。0083 の前の DB = 欄を出さない %>
+          <% if (locals.makerReady) { %>
+          <div class="f" data-row="maker"><label class="lab" for="f-maker-in">メーカー</label>
+            <div class="ctl"><%- include('_maker', { base, mk: { makers, max: makerMax }, cur: null, dis, noneHtml: none('maker'), suppliers: page.activeSuppliers.map((s) => [s.code, s.name]), supplierSel: '#f-primary_supplier', canCreate: canSave, extraHidden: part('maker') }) %>
+              <span class="hint" style="flex-basis:100%">問屋から仕入れるときは、仕入先とは別に作っている会社を · 一覧に無いときは打って「新しいメーカーとして登録」 · 「仕入先と同じ」= 代表の仕入先の名前 · Company DB だけ (NE・ロジザードには送りません)</span></div></div>
+          <% } %>
         </section>
         <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。下書きの保存と一緒に送る = Company DB の登録が通った後に発注アプリへ (部品 = _order.ejs・public/me-order.js) %>
         <%- include('_order', { os: orderSettings, mode: 'new', dis, stepNo: no('sec-order'), base, code: null }) %>
@@ -251,8 +257,9 @@
     <% } %>
   </div>
   <%- include('_footer') %>
-  <%# 並び: 入力なし (me-none) → 画面 → 発注の設定 (読み終わったら画面に数え直してもらう = MasterEdit.recount) %>
+  <%# 並び: 入力なし (me-none) → メーカー (me-maker・0083 の欄があるときだけ) → 画面 → 発注の設定 (読み終わったら画面に数え直してもらう = MasterEdit.recount) %>
   <% if (page) { %><script src="<%= base %>/public/me-none.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && !isSet && locals.makerReady) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-new.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page && !isSet && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
 </body>

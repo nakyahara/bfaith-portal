@@ -70,6 +70,7 @@
   function showVal(el, v) {
     if (el.classList.contains('seg')) return segText(el, v);
     if (el.tagName === 'SELECT') { var o = $$('option', el).filter(function (x) { return x.value === v; })[0]; return o ? o.textContent : v; }
+    if (el.id === 'f-maker' && ME.maker) return ME.maker.label(v);   // 🆕 0083: 名簿の番号 → 名前 (空 = なし)
     if (v === '' || v == null) return '(空)';
     var unit = el.getAttribute('data-unit') || '';
     if (unit === ' 円' && intOf(v) != null) return yen(intOf(v)) + unit;
@@ -372,6 +373,7 @@
     if (costBox) { costBox.hidden = true; if (costOpen) costOpen.setAttribute('aria-expanded', 'false'); costDelta(); }
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });
     clearNameError();
+    if (ME.maker) ME.maker.sync();   // 🆕 0083: 隠した欄 (名簿の番号) に合わせて、メーカーの名前の欄も戻す
     update();
     if (nameBox && !nameBox.hidden) closeName();
     ME.toast('変更を元に戻しました');
@@ -388,7 +390,7 @@
   // 保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度保存するときは新しい番号
   var requestId = uuid();
   var FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
-    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)
+    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed', 'maker'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0083 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)
   function collect() {
     var values = {};
     FIELDS.forEach(function (f) {

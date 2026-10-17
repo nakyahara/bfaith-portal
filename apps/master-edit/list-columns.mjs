@@ -37,6 +37,8 @@ export const LIST_COLUMNS = Object.freeze([
   { id: 'sold', label: '売れた 7日/30日', num: true, ref: true, width: 'width:96px', th: 'th-sales', cell: 'sales' },
   { id: 'po', label: '注文残', num: true, ref: true, width: 'width:76px', po: true },
   { id: 'flags', label: '対応が必要', width: 'width:150px' },
+  // 🆕 0083 (2026-10-17): メーカー (Company DB だけの値・単品だけ)。前の列の並びを変えないよう最後に足す・いつもの列では出さない (列の板で出す)・並べられない
+  { id: 'maker', label: 'メーカー', isNew: true, width: 'min-width:140px', th: 'th-maker' },
 ].map((c) => Object.freeze({ ...c, cell: c.cell || c.id })));
 
 export const COLUMN_IDS = Object.freeze(LIST_COLUMNS.map((c) => c.id));
@@ -51,7 +53,7 @@ const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
  */
 export const DEFAULT_VIEW = Object.freeze({
   order: Object.freeze([...COLUMN_IDS]),
-  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup')),
+  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup' && id !== 'maker')),   // 🆕 0083: メーカーも新しい列 = 出さない
 });
 
 /**

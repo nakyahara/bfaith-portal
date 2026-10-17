@@ -128,6 +128,7 @@
         <div class="meta">
           <% if (last) { %><span>最後に直した人 <%= ui.actorWords(last) %></span><span class="dotsep" aria-hidden="true"></span><span><%= ui.fmtJst(last.recorded_at, { nowMs }) %></span><% } else { %><span>変更の記録はまだありません</span><% } %>
           <% if (!isSet && c.primary_supplier) { %><span class="dotsep" aria-hidden="true"></span><span>仕入先 <%= c.primary_supplier %> <%= supName(c.primary_supplier) %></span><% } %>
+          <% if (!isSet && c.maker) { %><span class="dotsep" aria-hidden="true"></span><span id="maker-head">メーカー <%= c.maker.name %></span><% } %>
           <% if (page.registered) { %><span class="dotsep" aria-hidden="true"></span><span id="registered-on">登録日 <%= page.registered.date ? page.registered.date.replace(/-/g, '/') + ' (' + page.registered.label + ')' : '— (分かりません)' %></span><% } %>
         </div>
       </div>
@@ -251,6 +252,11 @@
         <section class="panel" aria-labelledby="h-sup">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-building"/></svg></span><h2 id="h-sup">仕入先</h2><span class="right"><a href="/apps/purchase-orders" class="hint">先方品番は 発注アプリ <svg class="ic s" style="vertical-align:-2px" aria-hidden="true"><use href="#i-ext"/></svg></a></span></div>
           <%- row('primary_supplier', '代表の仕入先', '<select class="in w-m" id="f-primary_supplier" ' + meta('primary_supplier') + '>' + (!c.primary_supplier ? '<option value="" selected>(なし)</option>' : '') + page.activeSuppliers.map((s) => '<option value="' + h(s.code) + '"' + (s.code === c.primary_supplier ? ' selected' : '') + '>' + h(s.code) + ' · ' + h(s.name) + '</option>').join('') + (c.primary_supplier && !page.activeSuppliers.some((s) => s.code === c.primary_supplier) ? '<option value="' + h(c.primary_supplier) + '" selected>' + h(c.primary_supplier) + ' (取引停止)</option>' : '') + '</select>', c.primary_supplier ? c.primary_supplier + ' · ' + supName(c.primary_supplier) : 'なし', { forId: 'f-primary_supplier', hint: '選べるのは取引中で、NE への登録の申告が済んだ仕入先だけです' }) %>
+          <%# 🆕 0083 メーカー (中原さん 2026-10-17・代表の仕入先のすぐ下)。Company DB だけ (NE・ロジザード・product-hub には送らない)。保存は右の「保存する」と一緒。0083 の前の DB = 出さない %>
+          <% if (locals.makerReady) { %>
+            <%- row('maker', 'メーカー', include('_maker', { base, mk: { makers, max: makerMax }, cur: c.maker, dis: '', noneHtml: '', suppliers: page.activeSuppliers.map((s) => [s.code, s.name]).concat(page.suppliers.filter((s) => !page.activeSuppliers.some((a) => a.code === s.code)).map((s) => [s.code, s.name])), supplierSel: '#f-primary_supplier', supplierNow: c.primary_supplier || '', canCreate: canSave, extraHidden: '' }),
+              c.maker ? c.maker.name : 'なし', { forId: 'f-maker-in', hint: '問屋から仕入れるときは、仕入先とは別に作っている会社 · 一覧に無いときは打って「新しいメーカーとして登録」· 空にして保存 = メーカーを外す · Company DB だけ (NE・ロジザードには送りません)' }) %>
+          <% } %>
           <div class="f"><div class="lab">この商品の仕入先</div><div class="ctl"><% if (!page.suppliers.length) { %><span class="muted">まだありません</span><% } %><% for (const s of page.suppliers) { %><span class="linkchip"><span class="mono"><%= s.code %></span> <%= s.name %><span class="n2"><%= s.vendor_code ? ' 先方品番 ' + s.vendor_code : '' %><%= s.is_primary ? ' · ★代表' : '' %></span></span><% } %></div></div>
         </section>
 
@@ -617,6 +623,8 @@
   <%- include('_footer') %>
   <%# 🆕 PR-7b: まとまりの操作の窓 (名前を直す・子の廃止・代表の採用) %>
   <% if (page && locals.variationOn && canEdit && !closed) { %><%- include('_vops') %><script src="<%= base %>/public/me-vops.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0083: メーカーの欄 (直せるときだけ・me-sku.js の前 = 未保存の「前 → 後」に名前を出す) %>
+  <% if (page && locals.makerReady && c.sku_kind === 'single' && editable('maker')) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-sku.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 10/17: 一覧の前・次の商品へ (離れるときの確認は me-shell.js のリンクの見張りがそのまま効く) %>
   <% if (page) { %><script src="<%= base %>/public/me-prevnext.js?v=<%= assetV %>" defer></script><% } %>
