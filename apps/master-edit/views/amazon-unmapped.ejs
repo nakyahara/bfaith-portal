@@ -8,23 +8,42 @@
   <%
     // 未登録 = 直近 N 日に売れたのに構成が無い FBA の seller SKU (新しいデザイン・第 2 段 10/5)。1 行 = 1 SKU と「対応を作る」
     // 🚨 自社発送は出さない (商品コード = Amazon SKU = 対応が要らない・10/12)・区分の切り替えも無い。区分が分からない SKU は表の下に別の一言
+    // 🆕 10/17 中原さん: 期間の切り替え (直近 7 日 = 既定 / 30 日 / 90 日 / 全期間)・CSV・その場で登録 (public/me-amazon-inline.js)・
+    //   自社発送で seller SKU が NE コードでない SKU (夜間の取り込みが結べない = 対応が要る) は別の一覧 (?fbm=1。既定は件数の一言だけ)
     const chLabel = (ch) => (ch ? (CHANNELS[ch] || ch) : '—');
+    const per = uq.key;
+    const qs = (over) => { const p = { days: per, fbm: uq.fbm ? '1' : '', ...over }; if (p.days === String(UNMAPPED_DAYS)) delete p.days; if (!p.fbm) delete p.fbm; const s = new URLSearchParams(p).toString(); return s ? '?' + s : '?'; };
+    const csvQs = qs({}) === '?' ? '' : qs({});
+    const periodWords = UNMAPPED_PERIODS[per];
+    const undecidedText = (list) => list.length <= 10 ? list.join('・') : `${list.length} 日 (${list[0]} 〜 ${list[list.length - 1]})`;
+    const rowLi = (r) => {
+      const sk = String(r.code).trim().toLowerCase();
+      return { sk, label: r.map_state ? (MAP_STATES[r.map_state] || r.map_state) : (r.listing_id ? '出品はある (構成なし)' : '出品なし') };
+    };
   %>
   <div class="page" id="unmapped-page">
     <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/amazon/" data-list-back>Amazon SKU</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">未登録</span></nav>
     <div class="ph">
       <div>
         <h1>売れたのに対応が無い SKU (FBA)</h1>
-        <div class="lead">直近 <%= UNMAPPED_DAYS %> 日の Amazon の注文のうち、Company DB の出品が無い (コードだけ) か、出品に構成 (NE コード × 数量) が無い FBA の seller SKU です。売上の日次で商品に分けられていません。自社発送は 商品コード = Amazon SKU なので出しません。</div>
+        <div class="lead"><%= periodWords %><%= per === 'all' && data && !data.tableMissing ? ` (${ui.fmtDay(data.from)} から)` : '' %> の Amazon の注文のうち、Company DB の出品が無い (コードだけ) か、出品に構成 (NE コード × 数量) が無い FBA の seller SKU です。売上の日次で商品に分けられていません。自社発送は 商品コード = Amazon SKU なので出しません。</div>
       </div>
-      <div class="ph-actions"><a class="btn" href="<%= base %>/manual#amazon"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
+      <div class="ph-actions">
+        <% if (data && !data.tableMissing && data.decidable) { %><a class="btn" id="unmapped-csv" href="unmapped.csv<%= csvQs %>" download><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg>CSV で保存</a><% } %>
+        <a class="btn" href="<%= base %>/manual#amazon"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a>
+      </div>
     </div>
     <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
     <% if (data) { %>
       <% if (data.tableMissing) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)。</div></div><% } %>
-      <% if (data.undecided.length) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">未判定: 売上の日次がまだ公開されていない日があります (<%= data.undecided.join('・') %>)</div><div class="hint">その日の注文が入っていない = 「0 件」とは言えません。</div></div></div><% } %>
+      <% if (data.undecided.length) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">未判定: 売上の日次がまだ公開されていない日があります (<%= undecidedText(data.undecided) %>)</div><div class="hint">その日の注文が入っていない = 「0 件」とは言えません。</div></div></div><% } %>
       <% if (!data.tableMissing && !data.decidable) { %><div class="callout warn" id="unmapped-undecidable"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">FBA か自社発送かを読めないので、一覧を出せません</div><div class="hint">手数料の写し (fees) も Amazon の出品一覧も読めません。「0 件」ではありません。</div></div></div><% } %>
+      <% if (!inline && !dbError && canEdit && amazonClosed) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow">対応の保存はまだ開いていません (<%= amazonClosedWhy %>)。一覧を見る・CSV はできます。</div></div><% } %>
       <section class="panel">
+        <div class="chips" style="margin-bottom:10px" id="unmapped-period" role="group" aria-label="期間">
+          <span class="chip-lab">期間</span>
+          <% for (const [k, t] of Object.entries(UNMAPPED_PERIODS)) { %><a class="chip<%= per === k ? ' on' : '' %>" href="<%= qs({ days: k }) %>"<%- per === k ? ' aria-current="true"' : '' %>><%= t %></a><% } %>
+        </div>
         <div class="chips" style="margin-bottom:14px">
           <span class="hint" id="unmapped-count"><% if (data.decidable) { %><b style="color:var(--text)"><%= data.rows.length %></b> 件 (FBA)<% } else { %><b style="color:var(--warn)">件数は読めない</b> (FBA か自社発送かを読めない)<% } %> · 今日 (東京) <%= ui.fmtDay(data.today) %></span>
         </div>
@@ -32,19 +51,38 @@
           <div class="empty"><%= !data.decidable ? 'FBA か自社発送かを読めないので出せません (上の帯)' : data.undecided.length ? '未判定の日があります (上の帯)。分かっている日の分では、当てはまる SKU はありません。' : '当てはまる SKU はありません' %></div>
         <% } else { %>
         <div class="todo-row head" aria-hidden="true"><span>seller SKU</span><span>区分</span><span>個数</span><span>注文</span><span class="lastd">最後に売れた日</span><span>いまの対応</span><span></span></div>
-        <ul style="list-style:none" aria-label="売れたのに対応が無い SKU">
-          <% for (const r of data.rows) { const sk = String(r.code).trim().toLowerCase(); %>
-          <li class="todo-row"><span class="code"><%= r.code %></span><span><span class="b <%= r.channel === 'FBM' ? 'vio' : 'mute' %>"><%= chLabel(r.channel) %></span></span><span class="num"><%= r.units %> 個</span><span class="num"><%= r.orders %> 件</span><span class="lastd"><%= ui.fmtDay(r.last_date, data.today) %></span>
-            <span class="muted"><%= r.map_state ? (MAP_STATES[r.map_state] || r.map_state) : (r.listing_id ? '出品はある (構成なし)' : '出品なし') %></span>
-            <a class="btn soft sm" href="sku?sku=<%= encodeURIComponent(sk) %>" aria-label="<%= r.code %> の対応を<%= r.map_state ? '直す' : '作る' %>"><%= r.map_state ? '対応を直す' : '対応を作る' %></a></li>
+        <ul style="list-style:none" aria-label="売れたのに対応が無い SKU" id="unmapped-list">
+          <% for (const r of data.rows) { const x = rowLi(r); %>
+          <li class="todo-row" data-sku="<%= x.sk %>"><span class="code"><%= r.code %><% if (r.title) { %><span class="um-title"><%= r.title %></span><% } %></span><span><span class="b <%= r.channel === 'FBM' ? 'vio' : 'mute' %>"><%= chLabel(r.channel) %></span></span><span class="num"><%= r.units %> 個</span><span class="num"><%= r.orders %> 件</span><span class="lastd"><%= ui.fmtDay(r.last_date, data.today) %></span>
+            <span class="muted"><%= x.label %></span>
+            <span class="um-acts"><% if (inline) { %><button type="button" class="btn soft sm" data-inline data-sku="<%= x.sk %>" aria-expanded="false" aria-label="<%= r.code %> の対応をその場で作る">その場で登録</button><% } %><a class="btn <%= inline ? 'ghost' : 'soft' %> sm" href="sku?sku=<%= encodeURIComponent(x.sk) %>" aria-label="<%= r.code %> の対応を<%= r.map_state ? '直す' : '作る' %>"><%= r.map_state ? '対応を直す' : '対応を作る' %></a></span></li>
           <% } %>
         </ul>
         <% } %>
         <% if (data.decidable && data.unknown.length) { %><div class="hint" id="unmapped-unknown" style="margin-top:10px">FBA か自社発送かが分からない SKU (Amazon の出品一覧にも手数料の写しにも新しい区分が無い・食い違う) が <b style="color:var(--text)"><%= data.unknown.length %></b> 件あります (一覧と件数には入れていません): <% for (const r of data.unknown.slice(0, 10)) { %><a class="mono" href="sku?sku=<%= encodeURIComponent(String(r.code).trim().toLowerCase()) %>"><%= r.code %></a> <% } %><%= data.unknown.length > 10 ? 'ほか' : '' %></div><% } %>
-        <div class="hint" style="margin-top:10px">seller SKU の「対応を作る」で構成を入れられます (保存を開いた後)。FBA / 自社発送は Amazon の出品一覧 (毎日の今の姿・36 時間以内) の区分、無ければ・古ければ Amazon の手数料の取得 (fees・7 日以内) の区分です。どちらも古い・無い・大文字小文字だけ違う SKU で食い違う = 分からない。自社発送は 商品コード = Amazon SKU なので出しません。</div>
+        <div class="hint" style="margin-top:10px">「その場で登録」で、この画面のまま構成 (NE の商品 × 数) と名前を入れて保存できます (保存を開いた後・名簿の人。保存の決まりは 1 つの画面と同じ)。FBA / 自社発送は Amazon の出品一覧 (毎日の今の姿・36 時間以内) の区分、無ければ・古ければ Amazon の手数料の取得 (fees・7 日以内) の区分です。どちらも古い・無い・大文字小文字だけ違う SKU で食い違う = 分からない。自社発送は 商品コード = Amazon SKU なので出しません。</div>
       </section>
+
+      <% if (data.decidable && (data.fbm.length || data.fbmNeCode)) { %>
+      <section class="panel" aria-labelledby="h-fbm" id="unmapped-fbm">
+        <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-warn"/></svg></span><h2 id="h-fbm">自社発送で seller SKU が NE の商品コードでない SKU — <%= data.fbm.length %> 件</h2>
+          <% if (data.fbm.length) { %><span class="right"><a class="btn sm" id="fbm-toggle" href="<%= qs({ fbm: uq.fbm ? '' : '1' }) %>"><%= uq.fbm ? '一覧を閉じる' : '一覧を見る' %></a></span><% } %></div>
+        <div class="hint">自社発送は ふつう 商品コード = Amazon SKU なので対応が要りません。でも seller SKU が NE の商品コードと違う SKU は、夜間の取り込みが商品に結べません = 対応が要ります (<%= periodWords %> に売れた分)。<% if (data.fbmNeCode) { %>seller SKU が NE の商品コードと同じなのに構成がまだ無い自社発送の SKU が <%= data.fbmNeCode %> 件あります (夜間の取り込みが結びます)。<% } %></div>
+        <% if (uq.fbm && data.fbm.length) { %>
+        <div class="todo-row head" aria-hidden="true" style="margin-top:12px"><span>seller SKU</span><span>区分</span><span>個数</span><span>注文</span><span class="lastd">最後に売れた日</span><span>いまの対応</span><span></span></div>
+        <ul style="list-style:none" aria-label="自社発送で seller SKU が NE の商品コードでない SKU" id="unmapped-fbm-list">
+          <% for (const r of data.fbm) { const x = rowLi(r); %>
+          <li class="todo-row" data-sku="<%= x.sk %>"><span class="code"><%= r.code %><% if (r.title) { %><span class="um-title"><%= r.title %></span><% } %></span><span><span class="b vio"><%= chLabel(r.channel) %></span></span><span class="num"><%= r.units %> 個</span><span class="num"><%= r.orders %> 件</span><span class="lastd"><%= ui.fmtDay(r.last_date, data.today) %></span>
+            <span class="muted"><%= x.label %></span>
+            <span class="um-acts"><% if (inline) { %><button type="button" class="btn soft sm" data-inline data-sku="<%= x.sk %>" aria-expanded="false" aria-label="<%= r.code %> の対応をその場で作る">その場で登録</button><% } %><a class="btn <%= inline ? 'ghost' : 'soft' %> sm" href="sku?sku=<%= encodeURIComponent(x.sk) %>" aria-label="<%= r.code %> の対応を作る">対応を作る</a></span></li>
+          <% } %>
+        </ul>
+        <% } %>
+      </section>
+      <% } %>
     <% } %>
   </div>
+  <% if (data && inline) { %><%- include('_amazon-inline', { inlineReason: '未登録の一覧からその場で登録' }) %><% } %>
   <%- include('_footer') %>
 </body>
 </html>

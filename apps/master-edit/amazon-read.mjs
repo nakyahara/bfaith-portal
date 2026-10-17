@@ -9,7 +9,7 @@
 import { normSku } from '../../lib/sku-norm.js';
 import { foldSearch, foldSql, likeOf, HIRA_CHARS, KATA_CHARS } from './search-fold.mjs';
 import { COMPANY_ID, jstDate, MasterWriteError } from '../../lib/master-write.mjs';
-import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage, componentUnusable, USABLE_REG_STATES, NOT_IN_NE_REG_STATES, USABLE_SKU_KINDS, MAP_STATES, AMAZON_JP_SHOP_CODE, AMAZON_SKU_MAX_LEN } from '../../lib/amazon-map-write.mjs';
+import { readAmazonMap, sellerSkuIn, newSellerSkuProblems, newSkuRefusedMessage, newSellerSkuCheckInDb, MAX_MAP_NAME, componentUnusable, USABLE_REG_STATES, NOT_IN_NE_REG_STATES, USABLE_SKU_KINDS, MAP_STATES, AMAZON_JP_SHOP_CODE, AMAZON_SKU_MAX_LEN } from '../../lib/amazon-map-write.mjs';
 import { stockOf } from './extras.mjs';
 import { readCutoverPhase } from '../../lib/master-cutover.mjs';
 import { readReportLoad } from './amazon-unlinked.mjs';
@@ -19,6 +19,23 @@ export { AMAZON_SKU_MAX_LEN };
 
 export const AMAZON_LIST_LIMIT = 100;
 export const UNMAPPED_DAYS = 7;
+/**
+ * 未登録の期間 (10/17 中原さん「未登録の範囲を広げる切り替え」)。既定 = 直近 7 日 (今までどおり)。all = 全期間 (売上の日次が始まった日から)。
+ *   0054 の SQL の関数は 1 回に 60 日まで (least(p_days, 60)) = 長い期間は 60 日ずつに区切って何回か呼び、アプリで足す (migration を足さない)。
+ *   画面のロールは注文の表を直接読めない (関数だけ) = 区切って呼ぶのがいちばん小さい
+ */
+export const UNMAPPED_PERIODS = Object.freeze({ 7: '直近 7 日', 30: '直近 30 日', 90: '直近 90 日', all: '全期間' });
+/** SQL の関数が 1 回に見る日数の上限 (0054 の ops.amazon_map_unmapped_recent・ops.amazon_map_sales_coverage の least(p_days, 60)) */
+export const UNMAPPED_WINDOW_MAX = 60;
+/** 全期間の上限 (売上の日次が 1 日も無い 60 日の幅に来たら、その前は見ない。来なくても 5 年まで = 関数を呼ぶのは多くて 31 回ずつ) */
+export const UNMAPPED_ALL_MAX_DAYS = 1830;
+/** 画面・CSV の ?days= → { key, days (all = null) }。知らない値 = 既定の 7 日 */
+export function unmappedPeriodOf(q = {}) {
+  const v = String(q.days ?? '');
+  if (v === 'all') return { key: 'all', days: null };
+  return Object.hasOwn(UNMAPPED_PERIODS, v) ? { key: v, days: Number(v) } : { key: String(UNMAPPED_DAYS), days: UNMAPPED_DAYS };
+}
+const addDaysYmd = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 864e5).toISOString().slice(0, 10);
 export const CHANNELS = Object.freeze({ FBA: 'FBA', FBM: 'FBM (自社発送)' });
 const TS = (col) => `to_char((${col}) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
 
@@ -164,7 +181,7 @@ async function setExportComps(db, rows) {
 }
 
 /** 1 つの seller SKU の画面。対応が無くても、Company DB の出品と今の構成 (夜間ロードの写し) を見せる */
-export async function readAmazonPage(db, sellerSku, { channels = null } = {}) {
+export async function readAmazonPage(db, sellerSku, { channels = null, today = null } = {}) {
   const cur = await readAmazonMap(db, sellerSku);
   const phase = await readCutoverPhase(db);
   const related = cur.listing ? (await db.query(`select distinct m2.seller_sku, m2.name from core.listing_components c1
@@ -173,7 +190,44 @@ export async function readAmazonPage(db, sellerSku, { channels = null } = {}) {
       where c1.listing_id = $1 order by m2.seller_sku limit 50`, [cur.listing.listing_id])).rows : [];
   const lastRequest = cur.listing ? (await db.query(`select operation, actor_id, status, ${TS('finished_at')} as finished_at from ops.master_edit_requests
       where listing_id = $1 order by finished_at desc limit 1`, [cur.listing.listing_id])).rows[0] || null : null;
-  return { cur, phase, related, lastRequest, channel: channels ? (channels.get(normSku(sellerSku)) ?? null) : null };
+  const costs = await componentCosts(db, cur.components, { today });
+  return { cur, phase, related, lastRequest, channel: channels ? (channels.get(normSku(sellerSku)) ?? null) : null, costs };
+}
+
+/** 原価の状態 (core.sku_costs.cost_status の CHECK と同じ 4 つ) */
+export const COST_STATUS_WORDS = Object.freeze({ COMPLETE: '確定', OVERRIDDEN: '上書き', PARTIAL: '一部が足りない', MISSING: '不明' });
+export const COST_SOURCE_WORDS = Object.freeze({ ne: 'NE から', manual: '人が入れた', set_calc: '構成品の合計', override_zero: '0 円の上書き', imported: '取込' });
+/**
+ * 構成の原価 (10/17 中原さん「構成の原価の表示」・見るだけ)。今日 (東京) の原価の行 = 商品の画面と同じ選び方 (read.mjs の costTodaySql:
+ *   valid_from が今日まで・valid_to が無いか今日から先 → valid_from が新しい → created_at → sku_cost_id)。原価の表は 1 回だけ読む。
+ *   components = readAmazonMap の構成 (保存してある構成)。戻り値 { today, lines: [{ code, name, qty, cost, subtotal, status, source, valid_from }], total, known, missing, warn }
+ *   total = 全部の構成品に原価があるときだけ Σ 原価 × 数 (欠けている = null・known に分かる分だけの合計)。warn = 状態が 一部が足りない / 不明 の構成品がある
+ *   読めない (権限・DB の誤り) = { error } (画面は「読めない」。保存には関係しない)
+ */
+export async function componentCosts(db, components, { today = null } = {}) {
+  const list = Array.isArray(components) ? components : [];
+  if (!list.length) return { today, lines: [], total: null, known: 0, missing: 0, warn: false };
+  try {
+    const day = today || (await db.query(`select (now() at time zone 'Asia/Tokyo')::date::text as d`)).rows[0].d;
+    const rows = (await db.query(`select distinct on (y.sku_id) y.sku_id::text as sku_id, y.cost_jpy::text as cost_jpy, y.cost_source, y.cost_status, y.valid_from::text as valid_from
+        from core.sku_costs y
+       where y.sku_id = any($1::bigint[]) and y.valid_from <= $2::date and (y.valid_to is null or y.valid_to >= $2::date)
+       order by y.sku_id, y.valid_from desc, y.created_at desc, y.sku_cost_id desc`, [list.map((c) => String(c.sku_id)), day])).rows;
+    const by = new Map(rows.map((r) => [r.sku_id, r]));
+    let known = 0; let missing = 0; let warn = false;
+    const lines = list.map((c) => {
+      const y = by.get(String(c.sku_id));
+      const cost = y ? Number(y.cost_jpy) : null;
+      const qty = Number(c.qty);
+      if (cost == null) missing++; else known += cost * qty;
+      if (!y || y.cost_status === 'PARTIAL' || y.cost_status === 'MISSING') warn = true;
+      return { code: c.code, name: c.name, qty, cost, subtotal: cost == null ? null : cost * qty, status: y ? y.cost_status : null, source: y ? y.cost_source : null, valid_from: y ? y.valid_from : null };
+    });
+    return { today: day, lines, total: missing ? null : known, known, missing, warn };
+  } catch (e) {
+    console.error(`[master-edit] 構成の原価を読めない: ${e && e.message}`);
+    return { today, lines: [], total: null, known: 0, missing: 0, warn: false, error: '原価を読めません' };
+  }
 }
 
 /**
@@ -241,15 +295,23 @@ export function channelsFromFeeRows(rows) {
  *   区分の出どころが両方とも古い・読めない = decidable: false (画面は件数も「読めない」・0 件と言わない・R4 M3)。候補が 0 件なら読めなくても 0 件と確定 (R4 L1)
  * 売上の日次の公開がそろっていない日があれば undecided = その日の一覧 (画面は「未判定」)
  */
-export async function amazonUnmapped(db, { now = new Date(), channels = null } = {}) {
+/*
+ * 🆕 10/17 中原さん「未登録の範囲を広げる切り替え」:
+ *   days = 期間 (7 / 30 / 90 / null = 全期間)。既定の 7 日は今までどおり関数を 1 回ずつ呼ぶ (区切りは 60 日ずつ・unmappedRange)。
+ *   fbm = 自社発送 (FBM) で、seller SKU が NE の商品コード (core.skus) でない SKU。自社発送は ふつう 商品コード = Amazon SKU で対応が要らない (10/12) が、
+ *     コードが違う SKU は夜間の取り込みが結べない = 今まではどこにも出なかった (対応が要る)。区分を読めない (decidable: false) ときは出さない (0 件と言わない)。
+ *     fbmNeCode = 自社発送で seller SKU が NE の商品コードと同じなのに構成が無い件数 (夜間の取り込みが次に結ぶ・数だけ出す)
+ *   titles = 行の Amazon の商品名 (出品一覧 → 出品のタイトル)。その場で登録するときの名前の初めの値・CSV
+ */
+export async function amazonUnmapped(db, { now = new Date(), channels = null, days = UNMAPPED_DAYS } = {}) {
   const today = jstDate(now);
   const nowMs = now.getTime();
-  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], unknown: [], today, undecided: [], tableMissing: true, channelsAvailable: !!channels, decidable: false };
-  const missing = (await db.query('select ops.amazon_map_sales_coverage($1::date, $2) as d', [today, UNMAPPED_DAYS])).rows[0].d || [];
-  const all = (await db.query('select code, listing_id::text as listing_id, map_state, units::int as units, orders::int as orders, last_date::text as last_date from ops.amazon_map_unmapped_recent($1::date, $2) order by units desc, code',
-    [today, UNMAPPED_DAYS])).rows;
-  const base = { today, undecided: missing.map(dateOnly), tableMissing: false, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID };
-  if (!all.length) return { ...base, rows: [], unknown: [], decidable: true, source: null };   // 候補が無い = 区分によらず 0 件 (R4 L1)
+  const period = days == null ? 'all' : String(days);
+  if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], unknown: [], fbm: [], fbmNeCode: 0, today, undecided: [], tableMissing: true, channelsAvailable: !!channels, decidable: false, days, period, from: today };
+  const range = await unmappedRange(db, today, days);
+  const all = range.rows;
+  const base = { today, undecided: range.undecided, tableMissing: false, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID, days, period, from: range.from };
+  if (!all.length) return { ...base, rows: [], unknown: [], fbm: [], fbmNeCode: 0, decidable: true, source: null };   // 候補が無い = 区分によらず 0 件 (R4 L1)
   // ① 出品一覧 (古くないときだけ)。鍵ごとに区分が 1 つのときだけ採る (食い違い = 'conflict')
   let report = null;
   const head = await readReportLoad(db, { nowMs });
@@ -278,8 +340,103 @@ export async function amazonUnmapped(db, { now = new Date(), channels = null } =
   const decidable = (reportFresh && !!report) || anyFeesFresh;
   const rows = decidable ? all.filter((r) => r.channel === 'FBA') : [];
   const unknown = all.filter((r) => !r.channel);
-  return { ...base, rows, unknown, decidable, reportFresh: reportFresh && !!report, feesFresh: anyFeesFresh };
+  // 自社発送のうち seller SKU が NE の商品コードでない SKU (区分を読めないときは出さない)
+  const fbmAll = decidable ? all.filter((r) => r.channel === 'FBM') : [];
+  const neCodes = fbmAll.length ? new Set((await db.query(`select x as raw from unnest($1::text[]) as t(x)
+      where exists (select 1 from core.skus k where k.company_id = $2 and k.code_norm = core.norm_code(x))`, [fbmAll.map((r) => r.code), COMPANY_ID])).rows.map((x) => x.raw)) : new Set();
+  const fbm = fbmAll.filter((r) => !neCodes.has(r.code));
+  await setUnmappedTitles(db, [...rows, ...fbm, ...unknown], head);
+  return { ...base, rows, unknown, fbm, fbmNeCode: fbmAll.length - fbm.length, decidable, reportFresh: reportFresh && !!report, feesFresh: anyFeesFresh };
 }
+
+const UNMAPPED_SQL = 'select code, listing_id::text as listing_id, map_state, units::int as units, orders::int as orders, last_date::text as last_date from ops.amazon_map_unmapped_recent($1::date, $2)';
+/**
+ * 期間の注文の未登録 (関数を 60 日ずつ・新しい幅から呼んで足す)。days = null (全期間) は、売上の日次が 1 日も公開されていない 60 日の幅に来たら止める
+ *   (= 売上の日次が始まる前。注文の取り込みも同じ頃に始まった)。止まらなくても UNMAPPED_ALL_MAX_DAYS まで。
+ *   足し方: 関数の行の鍵 (コード・出品・対応の状態) ごとに 個数 = 和・注文 = 和 (1 つの注文は 1 つの日 = 幅をまたがない)・最後に売れた日 = いちばん新しい日。
+ *   未判定の日 = 公開されていない日。全期間は、公開がいちばん初めの日より前の日を数えない (始まる前の日 = 未判定ではない)
+ *   戻り値 { rows (個数の多い順・コード順), undecided: ['YYYY-MM-DD'], from (見た幅のいちばん古い日) }
+ */
+async function unmappedRange(db, today, days) {
+  const allTime = days == null;
+  let left = allTime ? UNMAPPED_ALL_MAX_DAYS : Math.max(1, Math.floor(days));
+  let end = today; let from = today;
+  const merged = new Map();
+  const missing = new Set();
+  while (left > 0) {
+    const n = Math.min(UNMAPPED_WINDOW_MAX, left);
+    const miss = ((await db.query('select ops.amazon_map_sales_coverage($1::date, $2) as d', [end, n])).rows[0].d || []).map(dateOnly);
+    for (const d of miss) missing.add(d);
+    for (const r of (await db.query(UNMAPPED_SQL, [end, n])).rows) {
+      const k = `${r.code}\u0000${r.listing_id ?? ''}\u0000${r.map_state ?? ''}`;
+      const x = merged.get(k);
+      if (!x) { merged.set(k, { ...r, units: Number(r.units), orders: Number(r.orders) }); continue; }
+      x.units += Number(r.units); x.orders += Number(r.orders);
+      if (r.last_date && (!x.last_date || r.last_date > x.last_date)) x.last_date = r.last_date;
+    }
+    from = addDaysYmd(end, -(n - 1));
+    left -= n;
+    if (allTime && miss.length >= n) break;   // この幅に公開が 1 日も無い = 売上の日次が始まる前
+    end = addDaysYmd(from, -1);
+  }
+  let undecided = [...missing].sort();
+  if (allTime) {
+    // 公開のいちばん初めの日 (見た幅の中で、公開されていない日でない最初の日)。1 日も無い = 全部を未判定のまま
+    let first = null;
+    for (let d = from; d <= today; d = addDaysYmd(d, 1)) { if (!missing.has(d)) { first = d; break; } }
+    if (first) undecided = undecided.filter((d) => d >= first);
+  }
+  const rows = [...merged.values()].sort((a, b) => b.units - a.units || (a.code < b.code ? -1 : a.code > b.code ? 1 : 0));
+  return { rows, undecided, from };
+}
+
+/** 行の Amazon の商品名 (title): 出品一覧の今の取り込み (読めるときだけ) → 出品のタイトル。読めない = 付けない (画面・CSV は空) */
+async function setUnmappedTitles(db, list, head) {
+  if (!list.length) return;
+  try {
+    const loadId = head && head.state === 'ok' && head.load ? String(head.load.load_id) : null;
+    const m = new Map((await db.query(`select x as raw,
+          ${loadId ? `(select r.item_name from ops.amazon_listing_report r where r.company_id = $2 and r.shop_code = $3 and r.load_id = $4::bigint and r.sku_norm = core.norm_code(x)
+                        and nullif(btrim(r.item_name), '') is not null order by r.seller_sku limit 1)` : 'null::text'} as report_title,
+          (select l.title from core.listings l where l.company_id = $2 and l.mall = 'amazon' and l.shop_code = $3 and l.listing_norm = core.norm_code(x)) as listing_title
+        from unnest($1::text[]) as t(x)`, [[...new Set(list.map((r) => r.code))], COMPANY_ID, AMAZON_JP_SHOP_CODE, ...(loadId ? [loadId] : [])])).rows
+      .map((x) => [x.raw, x.report_title || x.listing_title || null]));
+    for (const r of list) r.title = m.get(r.code) ?? null;
+  } catch (e) { console.error(`[master-edit] 未登録の Amazon の商品名を読めない: ${e && e.message}`); }
+}
+
+const NAME_CTRL_RE = new RegExp(`[\x00-\x1f\x7f${String.fromCharCode(0x2028, 0x2029)}]`, 'g');
+/** 名前の初めの値 = 改行・制御文字は空白に・前後の空白を除く・255 文字まで (保存の決まり = 前後の空白・制御文字は断る) */
+export function cleanName(v) {
+  const s = String(v ?? '').replace(NAME_CTRL_RE, ' ').trim();
+  return [...s].slice(0, MAX_MAP_NAME).join('').trim();
+}
+/**
+ * その場で登録する欄 (未登録・まだつないでいない SKU の一覧の行) が開くときに読む 1 つの seller SKU (読むだけ・10/17)。
+ *   版 (保存の seen.versions)・今の対応 (名前・状態)・今の構成・名前の初めの値 (今の対応の名前 → Amazon の出品一覧の商品名 → 出品のタイトル)・
+ *   まだ出品の無い SKU を先に作れない形 (new_sku_problems = 保存も断る)。保存は今までどおり POST /api/amazon/save (lib の門・版・request_id)
+ */
+export async function readMapForInline(db, sellerSku, { nowMs = Date.now() } = {}) {
+  const cur = await readAmazonMap(db, sellerSku);
+  let reportTitle = null;
+  try {
+    const head = await readReportLoad(db, { nowMs });
+    if (head.state === 'ok') {
+      reportTitle = (await db.query(`select r.item_name from ops.amazon_listing_report r where r.company_id = $1 and r.shop_code = $2 and r.load_id = $3::bigint
+          and r.sku_norm = core.norm_code($4) and nullif(btrim(r.item_name), '') is not null order by r.seller_sku limit 1`, [COMPANY_ID, AMAZON_JP_SHOP_CODE, head.load.load_id, sellerSku])).rows[0]?.item_name ?? null;
+    }
+  } catch (e) { console.error(`[master-edit] その場で登録の Amazon の商品名を読めない: ${e && e.message}`); }
+  const nameDefault = (cur.map && cur.map.name) || reportTitle || (cur.listing && cur.listing.title) || '';
+  const nameFrom = cur.map && cur.map.name ? 'map' : reportTitle ? 'report' : cur.listing && cur.listing.title ? 'listing' : null;
+  const problems = cur.listing ? [] : (await newSellerSkuCheckInDb(db, sellerSku)).problems;
+  return {
+    seller_sku: sellerSku, versions: cur.versions, open_sku: cur.map ? cur.map.seller_sku : sellerSku,
+    map: cur.map ? { name: cur.map.name, state: cur.map.state } : null, listing: cur.listing ? { title: cur.listing.title, asin: cur.listing.asin } : null,
+    components: cur.map && cur.map.state === 'deleted' ? [] : cur.components.map((c) => ({ code: c.code, name: c.name, qty: c.qty, sku_kind: c.sku_kind, reg_state: c.reg_state })),
+    name_default: cleanName(nameDefault), name_from: nameFrom, new_sku_problems: problems,
+  };
+}
+
 
 // ─── 新しい seller SKU の対応を自分で作る入口 (10/11 中原さん「売れてから作るしかない」→ まだ売れていない SKU も先に作れる) ───
 

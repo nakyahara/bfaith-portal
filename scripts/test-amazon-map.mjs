@@ -1743,6 +1743,182 @@ await ta('[17] CSV の構成の商品コード = NE から来た商品なら NE 
   assert.deepEqual([r.comps, r.comp_notes], [before, NS.SPELLING_NOTES.unreadable]);
 });
 
+console.log('\n未登録の広げる切り替え・CSV・その場で登録・構成の原価 (10/17 中原さん)');
+await ta('[18] 未登録の期間 (7 / 30 / 90 日・全期間): 60 日ずつ区切って関数を呼んで足す (個数・注文・最後の日)・7 日は今までと同じ・全期間は売上の日次が始まる前で止まる・未判定の日の数え方 / 知らない ?days= は 7 日', async () => {
+  const RU = await import('../apps/master-edit/amazon-read.mjs');
+  let n = 0;
+  const order = async (date, code, qty) => {
+    n++;
+    const o = (await pg.query(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash)
+      values (1, 'amazon', 'amazon', $1, 'mall_api', $2::date, $2::date, 'shipped', false, 1, now(), 't', 'h') returning order_id`, [`p18-${n}`, date])).rows[0].order_id;
+    await pg.query(`insert into core.order_lines (company_id, order_id, line_key, listing_id, unresolved_code, qty, cancelled_qty, received_batch_seq) values (1, $1, 'l1', null, $2, $3, 0, 1)`, [o, code, qty]);
+  };
+  // zz_sold: 今の 60 日の幅 (2029-11-12〜) の外の 2029-10-20 にも売れた = 90 日 / 全期間だけ足す。zz_old (2029-12-01) は 30 日より前・60 日の中
+  await order('2029-10-20', 'zz_sold', 2);
+  const um = (days) => asRole(E, 'master_edit', () => RU.amazonUnmapped(db, { now: new Date('2030-01-10T03:00:00Z'), channels: FEES_NOW, days }));
+  const pick = (d) => Object.fromEntries([...d.rows, ...d.unknown, ...d.fbm].map((x) => [x.code, [x.units, x.orders, x.last_date]]));
+  const d7 = await um(7);
+  const direct = (await q(`select code, units::int as units, orders::int as orders, last_date::text as last_date from ops.amazon_map_unmapped_recent('2030-01-10', 7)`));
+  assert.deepEqual(Object.keys(pick(d7)).sort(), direct.map((x) => x.code).sort(), '7 日 = 関数 1 回と同じ SKU');
+  assert.deepEqual([d7.days, d7.period, d7.from], [7, '7', '2030-01-04']);
+  const d30 = await um(30);
+  assert.ok(!pick(d30).zz_old && pick(d30).zz_sold[0] === 5, '30 日: zz_old (40 日前) は出ない');
+  const d90 = await um(90);
+  assert.deepEqual(pick(d90).zz_sold, [7, 4, '2030-01-10'], '90 日: 2 つの幅の個数・注文を足す・最後の日はいちばん新しい日');
+  assert.ok(pick(d90).zz_old, '90 日: zz_old が出る');
+  assert.equal(d90.from, '2029-10-13');
+  assert.equal(d90.undecided.length, 83, '90 日: 公開されていない日 (公開は 2030-01-04〜10 の 7 日だけ) = 83 日');
+  const dAll = await um(null);
+  assert.deepEqual([dAll.period, dAll.from], ['all', '2029-09-13'], '全期間: 公開が 1 日も無い 60 日の幅 (2029-09-13〜11-11) まで見て止まる');
+  assert.deepEqual(pick(dAll).zz_sold, [7, 4, '2030-01-10']);
+  assert.deepEqual(dAll.undecided, [], '全期間: 公開がいちばん初めの日より前は未判定に数えない');
+  assert.deepEqual(RU.unmappedPeriodOf({ days: '3' }), { key: '7', days: 7 });
+  assert.deepEqual(RU.unmappedPeriodOf({ days: 'all' }), { key: 'all', days: null });
+  // 画面: 期間の札・90 日で zz_old・URL は ?days=90・既定の 7 日は引数なし
+  let r = await call('GET', '/amazon/unmapped?days=90');
+  assert.equal(r.status, 200); await checkScripts(r.text);
+  assert.ok(r.text.includes('zz_old') && r.text.includes('aria-current="true">直近 90 日'), '90 日の画面');
+  assert.ok(r.text.includes('83 日 (2029-10-13 〜'), '未判定の日が多い = 数と範囲');
+  r = await call('GET', '/amazon/unmapped');
+  assert.ok(!r.text.includes('zz_old') && r.text.includes('aria-current="true">直近 7 日') && r.text.includes('href="?days=all"'));
+});
+
+await ta('[18] 自社発送で seller SKU が NE の商品コードでない SKU = 別の一覧 (?fbm=1・既定は件数の一言だけ)・NE コードと同じ自社発送は数だけ・区分を読めないときは出さない', async () => {
+  const RU = await import('../apps/master-edit/amazon-read.mjs');
+  // a008 = NE の商品コード (Company DB にある) の自社発送の注文 (構成が無い)
+  const o = (await pg.query(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash)
+    values (1, 'amazon', 'amazon', 'p18-fbm', 'mall_api', '2030-01-09'::date, '2030-01-09'::date, 'shipped', false, 1, now(), 't', 'h') returning order_id`)).rows[0].order_id;
+  await pg.query(`insert into core.order_lines (company_id, order_id, line_key, listing_id, unresolved_code, qty, cancelled_qty, received_batch_seq) values (1, $1, 'l1', null, 'a008', 1, 0, 1)`, [o]);
+  const fees = RU.channelsFromFeeRows([['pr_a001', 'FBA'], ['a003', 'FBM'], ['zz_sold', 'FBA'], ['zz_fbm', 'FBM'], ['a008', 'FBM']].map(([s, c]) => ({ seller_sku: s, fulfillment_channel: c, fetched_at: '2030-01-09 12:00:00' })));
+  __setAmazonChannelsProvider(async () => fees);
+  try {
+    const d = await asRole(E, 'master_edit', () => RU.amazonUnmapped(db, { now: new Date('2030-01-10T03:00:00Z'), channels: fees }));
+    assert.deepEqual([d.fbm.map((x) => x.code), d.fbmNeCode], [['zz_fbm'], 1], 'zz_fbm = NE コードでない / a008 = NE コードと同じ (数だけ)');
+    assert.ok(!d.rows.some((x) => x.code === 'zz_fbm'), 'FBA の一覧には入れない');
+    let r = await call('GET', '/amazon/unmapped');
+    assert.ok(r.text.includes('id="unmapped-fbm"') && r.text.includes('NE の商品コードでない SKU — 1 件') && !r.text.includes('zz_fbm'), '既定は件数の一言だけ (今までの画面のまま)');
+    assert.ok(r.text.includes('構成がまだ無い自社発送の SKU が 1 件'));
+    r = await call('GET', '/amazon/unmapped?fbm=1');
+    assert.ok(r.text.includes('id="unmapped-fbm-list"') && r.text.includes('data-sku="zz_fbm"') && !r.text.includes('data-sku="a008"'));
+    // 区分を読めない = 出さない (0 件と言わない)
+    const none = await asRole(E, 'master_edit', () => RU.amazonUnmapped(db, { now: new Date('2031-01-10T03:00:00Z'), channels: null, days: null }));
+    assert.equal(none.decidable === false ? none.fbm.length : 0, 0);
+  } finally { __setAmazonChannelsProvider(async () => FEES_NOW); }
+  await pg.query(`delete from core.order_lines where order_id = $1`, [o]);
+  await pg.query(`delete from core.orders where order_id = $1`, [o]);
+});
+
+await ta('[18] 未登録の CSV (?days=&fbm=): BOM・CRLF・見出し・一覧の列 (FBA / 自社発送 / 区分が分からない)・期間の列・式の注入の対策・区分を読めない = 503 / まだつないでいない SKU の CSV の形', async () => {
+  const LC = await import('../apps/master-edit/list-csv.mjs');
+  const res = await fetch(`${BASE}/amazon/unmapped.csv?days=90&fbm=1`, { headers: { 'x-test-session': 'viewer' } });
+  assert.equal(res.status, 200, '見る人も CSV を出せる (読むだけ)');
+  assert.match(res.headers.get('content-disposition'), /attachment; filename="amazon-unmapped_\d{8}-\d{4}\.csv"/);
+  const raw = Buffer.from(await res.arrayBuffer());
+  assert.deepEqual([...raw.subarray(0, 3)], [0xef, 0xbb, 0xbf], 'BOM');
+  const lines = raw.toString('utf8').slice(1).split('\r\n');
+  assert.equal(lines.at(-1), '', '最後も CRLF');
+  assert.ok(lines[0].startsWith('"一覧","seller SKU","Amazon の商品名","区分"'));
+  const row = (code) => lines.find((l) => l.split('","')[1] === code);
+  assert.ok(row('zz_sold').startsWith('"FBA",') && row('zz_sold').includes(',"7","4","2030/01/10"'), '90 日の足した数');
+  assert.ok(row('zz_fbm').startsWith('"自社発送 (seller SKU が NE コードでない)",'));
+  assert.ok(row('pr_pack2').startsWith('"区分が分からない",'));
+  assert.ok(lines[1].includes('"直近 90 日 (2029/10/13 〜 2030/01/10)"'), '期間の列');
+  let r = await call('GET', '/amazon/unmapped.csv');
+  assert.ok(!r.text.includes('zz_fbm') && !r.text.includes('zz_old'), '既定 = 7 日・自社発送の一覧は閉じたまま');
+  // 式の注入の対策 (seller SKU・商品名が = + - @ で始まる)
+  const csv = LC.buildUnmappedCsv({ rows: [{ code: '=1+2', title: '@SUM(A1)', channel: 'FBA', channel_from: 'fees', units: 1, orders: 1, last_date: '2030-01-10', map_state: null, listing_id: null }], unknown: [], fbm: [], today: '2030-01-10', from: '2030-01-04', undecided: [] }, { channels: { FBA: 'FBA' }, periodLabel: '直近 7 日' });
+  assert.ok(csv.includes(`"'=1+2","'@SUM(A1)"`), csv);
+  const ul = LC.buildUnlinkedCsv({ rows: [{ seller_sku: '-cmd', item_name: '+x', asin: null, open_date: '2030-01-01', status: 'active', listing_id: null, map_state: null, fba_row: true, fba_available: 3, last_sold: null, price: '1280' }], fba: { ok: true, date: '2030-01-10' }, sold: { ok: true }, load: { snapshot_at: '2030-01-09T14:30:00Z' } }, { statusWords: { active: '出品中' } });
+  assert.ok(ul.startsWith('﻿"seller SKU","Amazon の商品名","ASIN","出品日"') && ul.includes(`"'-cmd","'+x","","2030/01/01","出品中","対応なし","3","","1280"`), ul);
+  // 区分を読めない = 503 (0 件の CSV にしない)
+  __setAmazonChannelsProvider(async () => null);
+  const I = await import('../apps/company-db/ingest/amazon-listings.mjs');
+  const keep = (await q('select load_id, snapshot_at from ops.amazon_listing_report_loads order by generation desc limit 1'))[0];
+  await q(`update ops.amazon_listing_report_loads set snapshot_at = '2029-01-01T00:00:00Z' where load_id = $1`, [keep.load_id]);
+  try {
+    r = await call('GET', '/amazon/unmapped.csv');
+    assert.equal(r.status, 503); assert.match(r.text, /読めない/);
+  } finally {
+    await q('update ops.amazon_listing_report_loads set snapshot_at = $2 where load_id = $1', [keep.load_id, keep.snapshot_at]);
+    __setAmazonChannelsProvider(async () => FEES_NOW);
+  }
+  assert.ok(I.SHOP_CODE);
+});
+
+await ta('[18] その場で登録: 行のボタン (名簿の人・保存を開いているときだけ)・欄が読む API (版・名前の初めの値 = 出品一覧の商品名・先に作れない形)・保存は 1 つの画面と同じ道 (版・request_id の押し直し)', async () => {
+  const I = await import('../apps/company-db/ingest/amazon-listings.mjs');
+  // 出品一覧に zz_sold の Amazon の商品名 (前後に空白)
+  const rowsR = [['zz_sold', '  国産 はちみつ' + String.fromCharCode(0x3000) + '2 個組  ', 'FBA'], ['zz_fbm', 'zz_fbm の商品', 'FBM']].map(([s, t, f]) => I.listingRowOf({ seller_sku: s, item_name: t, asin: null, open_date: null, open_date_raw: null, fulfillment: f, channel_raw: f === 'FBM' ? 'DEFAULT' : 'AMAZON_JP', status: 'active', status_raw: 'Active', quantity: null, price: null }));
+  const gen = Date.parse('2030-02-02T00:00:00Z');
+  const r0 = await I.ingestAmazonListings(db, { shop_code: I.SHOP_CODE, generation: gen, snapshot_at: new Date(gen).toISOString(), report_run_id: 'r_inline', checksum: I.listingChecksum(rowsR), row_count: rowsR.length, skipped_count: 0, rows: rowsR, force: true }, { nowMs: gen });
+  assert.ok(['applied', 'refreshed'].includes(r0.status), JSON.stringify(r0));
+  let r = await call('GET', '/amazon/unmapped');
+  assert.ok(r.text.includes('data-inline data-sku="zz_sold"') && r.text.includes('id="me-inline"'), '名簿の人にはその場で登録のボタン');
+  const js = await checkScripts(r.text);
+  const inl = js.find((x) => x.includes('me-amazon-inline.js — 一覧の行で')) || '';
+  for (const api of ["'/api/amazon/map?sku='", "'/api/amazon/save'", "'/api/amazon/components?q='"]) assert.ok(inl.includes(api) || js.some((x) => x.includes(api)), `画面が ${api} を呼んでいない`);
+  assert.ok(r.text.includes('国産 はちみつ'), '行に Amazon の商品名');
+  r = await call('GET', '/amazon/unmapped', { session: 'viewer' });
+  assert.ok(!r.text.includes('data-inline') && !r.text.includes('me-amazon-inline.js'), '見る人には出さない');
+  process.env.MASTER_EDIT_OPEN = '0';
+  try { r = await call('GET', '/amazon/unmapped'); assert.ok(!r.text.includes('data-inline'), '保存を開いていない = 出さない'); } finally { process.env.MASTER_EDIT_OPEN = '1'; }
+  // 欄が読む API
+  r = await call('GET', '/api/amazon/map?sku=ZZ_SOLD', { session: 'viewer' });
+  assert.equal(r.status, 200);
+  assert.deepEqual([r.j.seller_sku, r.j.versions, r.j.map, r.j.listing, r.j.components, r.j.name_default, r.j.name_from, r.j.new_sku_problems],
+    ['zz_sold', { listing: null, map: null }, null, null, [], '国産 はちみつ' + String.fromCharCode(0x3000) + '2 個組', 'report', []], '名前の初めの値 = 出品一覧の商品名 (前後の空白なし)');
+  r = await call('GET', '/api/amazon/map?sku=pr_pack2');
+  assert.deepEqual([r.j.map.state, r.j.components, r.j.name_default, r.j.name_from], ['deleted', [], '2 個組', 'map'], '墓標 = 構成なし・今の名前');
+  r = await call('GET', '/api/amazon/map?sku=' + encodeURIComponent('zz' + String.fromCharCode(9) + 'x'));
+  assert.equal(r.status, 400);
+  r = await call('GET', '/api/amazon/map?sku=' + encodeURIComponent('ｚｚ_full'));
+  assert.ok(r.j.new_sku_problems.length > 0, '先に作れない形 = 理由を返す (保存も断る)');
+  // 保存 = POST /api/amazon/save (1 つの画面と同じ)。同じ request_id の押し直し = 前の結果
+  const m = (await call('GET', '/api/amazon/map?sku=zz_sold')).j;
+  const rid = uuid();
+  const body = { request_id: rid, seller_sku: 'zz_sold', name: m.name_default, components: [{ code: 'a006', qty: '2' }, { code: 'a007', qty: 1 }], reason: '未登録の一覧からその場で登録', seen: { versions: m.versions } };
+  r = await call('POST', '/api/amazon/save', { body, session: 'viewer' });
+  assert.equal(r.status, 403, '見る人は保存できない');
+  r = await call('POST', '/api/amazon/save', { body });
+  assert.equal(r.status, 200, r.text); assert.equal(r.j.created, true); assert.equal(r.j.listing_created, true);
+  r = await call('POST', '/api/amazon/save', { body });
+  assert.equal(r.status, 200); assert.equal(r.j.replayed, true, '押し直し = 前の結果 (2 回入らない)');
+  assert.deepEqual(await compsOfListing('zz_sold'), [['a006', 2, 0, 'manual'], ['a007', 1, 1, 'manual']]);
+  assert.equal((await q(`select reason_text from events.master_change_events where request_id = $1 and entity_type = 'amazon_sku_map' limit 1`, [rid]))[0]?.reason_text, '未登録の一覧からその場で登録', '記録に理由');
+  // 開いた後に作られた = 古い版で保存 = 409 (何も保存しない)
+  r = await call('POST', '/api/amazon/save', { body: { ...body, request_id: uuid(), components: [{ code: 'a006', qty: 1 }] } });
+  assert.equal(r.status, 409); assert.equal(r.j.reason, 'version_conflict');
+  r = await call('GET', '/api/amazon/map?sku=zz_sold');
+  assert.deepEqual(r.j.components.map((c) => [c.code, c.qty]), [['a006', 2], ['a007', 1]], 'もう構成がある = 画面はその場では直さない (1 つの画面へ)');
+});
+
+await ta('[19] 構成の原価 (見るだけ): 保存してある構成の今日の原価 × 数・合計・状態 / 原価の無い構成品 = 合計は出せない (分かる分だけ)・読めない = 一言 (画面は出る)', async () => {
+  const RU = await import('../apps/master-edit/amazon-read.mjs');
+  const costOf = async (code) => Number((await q(`select cost_jpy from core.sku_costs where sku_id = (select sku_id from core.skus where code = $1) and valid_to is null`, [code]))[0].cost_jpy);
+  const c6 = await costOf('a006'); const c7 = await costOf('a007');
+  let r = await call('GET', '/amazon/sku?sku=zz_sold');
+  assert.equal(r.status, 200);
+  assert.ok(r.text.includes('id="comp-cost"') && r.text.includes('構成の原価'));
+  const yen = (v) => `${v.toLocaleString('ja-JP')} 円`;
+  const tot = /id="cost-total"><b>([^<]*)<\/b>/.exec(r.text)[1];
+  assert.equal(tot, yen(c6 * 2 + c7), '合計 = Σ 原価 × 数');
+  assert.ok(r.text.includes(yen(c6 * 2)) && r.text.includes('>確定</span>'), '小計と状態');
+  // 原価の無い構成品 (例外の SKU には原価の行が無い) = 合計は出せない
+  const ids = Object.fromEntries((await q(`select code, sku_id::text as id from core.skus where code in ('a006', 'aexc')`)).map((x) => [x.code, x.id]));
+  const cc = await asRole(E, 'master_edit', () => RU.componentCosts(db, [{ sku_id: ids.a006, code: 'a006', name: 'x', qty: 3 }, { sku_id: ids.aexc, code: 'aexc', name: 'y', qty: 1 }], { today: '2030-01-10' }));
+  assert.deepEqual([cc.total, cc.known, cc.missing, cc.warn, cc.lines[1].cost, cc.lines[0].subtotal], [null, c6 * 3, 1, true, null, c6 * 3]);
+  // 原価の日の決まり: 今日より先の日の行は使わない (今日の行)
+  const early = await asRole(E, 'master_edit', () => RU.componentCosts(db, [{ sku_id: ids.a006, code: 'a006', name: 'x', qty: 1 }], { today: '2000-01-01' }));
+  assert.equal(early.total, null, 'その日にまだ原価が無い');
+  // 読めない = 一言 (保存の画面は出る)
+  const broken = { query: (t, p) => (/from core\.sku_costs y/.test(t) ? Promise.reject(Object.assign(new Error('x'), { code: '42501' })) : db.query(t, p)) };
+  const bad = await RU.componentCosts(broken, [{ sku_id: ids.a006, code: 'a006', qty: 1 }], { today: '2030-01-10' });
+  assert.equal(bad.error, '原価を読めません');
+  // 構成が無い (墓標) = 原価の欄を出さない
+  r = await call('GET', '/amazon/sku?sku=pr_pack2');
+  assert.ok(!r.text.includes('id="comp-cost"'));
+});
+
 server.close();
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`\n${passed} ok${process.exitCode ? ' (NG あり)' : ''}`);

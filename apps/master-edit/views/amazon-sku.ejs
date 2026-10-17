@@ -104,6 +104,32 @@
           <div class="f" data-row="name"><label class="lab" for="name">名前 (社内)</label><div class="ctl"><input class="in w-l" id="name" value="<%= startName %>" maxlength="255" autocomplete="off" data-dirty-field="name" data-label="名前 (社内)"<%= dis %>></div></div>
         </section>
 
+        <%
+          // 構成の原価 (10/17 中原さん・見るだけ)。保存してある構成の今日の原価 × 数 と合計。欄を直しても変わらない (保存した後に読み直すと変わる)
+          const cc = page.costs || null;
+          const yen0 = (v) => Number(v).toLocaleString('ja-JP') + ' 円';
+          const CST = { COMPLETE: 'ok', OVERRIDDEN: 'info', PARTIAL: 'warn', MISSING: 'err' };
+        %>
+        <% if (cc && (cc.lines.length || cc.error)) { %>
+        <section class="panel soft" aria-labelledby="h-cost" id="comp-cost">
+          <div class="panel-h"><span class="hico" aria-hidden="true" style="color:var(--text2);background:rgba(255,255,255,.05)"><svg class="ic"><use href="#i-yen"/></svg></span><h2 id="h-cost">構成の原価</h2><span class="sub">見るだけ · 保存してある構成 · <%= cc.today ? ui.fmtDay(cc.today) + ' の原価' : '今日の原価' %></span></div>
+          <% if (cc.error) { %><div class="hint" style="color:var(--warn)"><%= cc.error %> (保存には関係しません)</div><% } else { %>
+          <div class="scrollx"><table class="comp" id="cost-tbl"><caption class="sr">構成の原価 (NE の商品ごとの今日の原価 × 数・合計)</caption>
+            <thead><tr><th scope="col">NE の商品</th><th scope="col" class="n">原価 (1 個)</th><th scope="col" class="n">数</th><th scope="col" class="n">小計</th><th scope="col">原価の状態</th></tr></thead>
+            <tbody>
+              <% for (const x of cc.lines) { %>
+              <tr><td><a class="mono" href="<%= base %>/sku/<%= encodeURIComponent(x.code) %>"><%= x.code %></a> <span class="muted"><%= x.name %></span></td>
+                <td class="n"><%= x.cost == null ? '未入力' : yen0(x.cost) %></td><td class="n">× <%= x.qty %></td><td class="n"><%= x.subtotal == null ? '—' : yen0(x.subtotal) %></td>
+                <td><% if (x.status) { %><span class="b <%= CST[x.status] || 'mute' %>"><%= COST_STATUS_WORDS[x.status] || x.status %></span> <span class="hint"><%= COST_SOURCE_WORDS[x.source] || x.source || '' %></span><% } else { %><span class="b err">原価なし</span><% } %></td></tr>
+              <% } %>
+            </tbody>
+            <tfoot><tr><th scope="row" colspan="3">合計 (この SKU 1 個)</th><td class="n" id="cost-total"><b><%= cc.total == null ? '出せない' : yen0(cc.total) %></b></td><td class="hint"><%= cc.total == null ? `原価の無い構成品が ${cc.missing} つ (分かる分だけで ${yen0(cc.known)})` : cc.warn ? '一部が足りない・不明の原価があります' : '' %></td></tr></tfoot>
+          </table></div>
+          <div class="hint" style="margin-top:6px">原価は商品の画面の原価 (今日の行) です。ここでは直せません (商品の画面で)。上の構成を直したときは、保存した後にここも変わります。</div>
+          <% } %>
+        </section>
+        <% } %>
+
         <% if (map && !deleted) { %>
         <details class="danger-zone" id="del-box">
           <summary><svg class="ic" aria-hidden="true"><use href="#i-trash"/></svg>この対応を削除する (墓標にする)</summary>

@@ -1155,3 +1155,32 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .filecard { padding: 14px 12px; }
   .filecard .fmeta > span { min-width: 0; overflow-wrap: anywhere; }
 }
+/* 🆕 10/17 一覧の行で「その場で登録」(未登録・まだつないでいない SKU・public/me-amazon-inline.js) と 未登録の行の Amazon の商品名 */
+.todo-row .um-title { display: block; margin-top: 2px; font-family: inherit; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.todo-row .um-acts { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.todo-row.done, .ul-row.done { opacity: 0.6; }
+.inl-box { list-style: none; margin: -2px 0 10px; }
+.inl { position: relative; padding: 12px 14px; border-radius: 12px; border: 1px solid rgba(58, 231, 255, 0.35); background: rgba(58, 231, 255, 0.04); min-width: 0; }
+.inl-h { display: flex; gap: 8px 10px; align-items: center; flex-wrap: wrap; font-size: 14px; margin-bottom: 8px; }
+.inl-h .inl-st.bad { color: var(--err); }
+.inl-line { display: flex; gap: 8px 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; min-width: 0; }
+.inl-line .lab2 { font-size: 13px; color: var(--muted); }
+.inl-line .inl-name { flex: 1 1 260px; min-width: 0; }
+.inl .inl-warn { margin-bottom: 8px; }
+.inl .scrollx > table.comp { min-width: 480px; }
+.inl .c-name.bad { color: var(--err); }
+/* 構成の原価 (Amazon SKU の画面・見るだけ) */
+#cost-tbl td.n, #cost-tbl th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+#cost-tbl tfoot th, #cost-tbl tfoot td { border-top: 1px solid var(--line-soft); padding-top: 8px; }
+@media (max-width: 1100px) { .todo-row .um-acts { justify-content: flex-start; } }
+@media (max-width: 760px) {
+  .inl .c-code, .inl .c-qty, .inl .iconbtn { min-height: 44px; min-width: 44px; }
+  .inl .scrollx > table.comp { min-width: 0; }
+  .todo-row .um-acts .btn { flex: 1 1 auto; justify-content: center; }
+}
+/* スマホの幅: 未登録の行は 2 列に折り返す (横にはみ出さない)・見出しの行は出さない・操作のボタンは下の段に広げる */
+@media (max-width: 760px) {
+  .todo-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 10px; }
+  .todo-row.head { display: none; }
+  .todo-row .um-acts, .todo-row > a.btn { grid-column: 1 / -1; }
+}
