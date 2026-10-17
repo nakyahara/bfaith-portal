@@ -337,13 +337,13 @@ await ta('[S6] 取り消し: 動いている・分からない・取り込んだ
   BC.cancelJob(u3, { jobId: d3.job_id, by: 'naka@test', now: jst('10:00') });
   assert.equal(BC.voidBlock(u3, '7', jst('10:00')), null);
   // 取り消しの途中の印: 確かめと印は 1 つの取引 → 積む・押すを断る / 外すと積める
-  BC.reserveVoid(u3, { exportId: '7', by: 'naka@test', now: jst('10:00') });
+  const t7 = BC.reserveVoid(u3, { exportId: '7', by: 'naka@test', now: jst('10:00') });
   assert.equal(err(() => BC.enqueue(u3, base({ now: jst('10:00') }))).code, 'voiding');
-  BC.releaseVoid(u3, '7');
+  BC.releaseVoid(u3, '7', t7);
   const d4 = BC.enqueue(u3, base({ now: jst('10:00') }));
   assert.equal(err(() => BC.reserveVoid(u3, { exportId: '7', by: 'naka@test', now: jst('10:00') })).code, 'import_running', '積んだ後は印を付けない');
   const c4 = BC.claimJob(u3, { jobId: d4.job_id, runnerId: 'pc', now: jst('10:00') });
-  u3.prepare("insert into bc_void_holds (export_id, by, until) values ('7', 'x', ?)").run(jst('10:05'));   // (もしも) 取った後に印が付いた
+  u3.prepare("insert into bc_void_holds (export_id, by, token, until) values ('7', 'x', 't', ?)").run(jst('10:05'));   // (もしも) 取った後に印が付いた
   assert.equal(err(() => BC.markExecuting(u3, { jobId: d4.job_id, claimToken: c4.claimToken, now: jst('10:01') })).code, 'voiding');
   assert.equal(u3.prepare('select state from bc_jobs where job_id = ?').get(d4.job_id).state, 'not_executed');
   u3.prepare("delete from bc_void_holds").run();
@@ -704,14 +704,17 @@ await ta('[R] miniPC の 1 回: 成功 / 押すを断られた = 押さない / 
 });
 
 // ───────────── 本物の barcode-steps.js の ① (P・偽物のロジザードの画面) ─────────────
-const PM07 = (total, errors) => `<html><body><a onclick="openFunctionBar('FM07_01')" href="#">import</a>
+// native = 実行ボタンの後にブラウザの確認 (confirm) を出す形 (承認しない = SUSPENDED へ = 結果は分からない側ですぐ終わる)
+const PM07 = (total, errors, native = false) => `<html><body><a onclick="openFunctionBar('FM07_01')" href="#">import</a>
 <div id="FM07_01_FORM"><select id="FM07_01_fileId"><option value="">-</option><option value="5">商品マスタ</option></select>
 <select id="FM07_01_ptrnId"><option value="">-</option><option value="1">新商品バーコード登録</option></select>
 <input type="file" id="FM07_01_impFile"><input type="button" id="FM07_01_executeBtn" value="実行"></div>
 <div id="cfm" class="ui-dialog" style="display:none">ファイルアップロードを開始します <input type="button" value="OK" id="cfmOk"></div>
 <div id="res" class="ui-dialog" style="display:none">インポート結果 総件数 : ${total} 処理件数 : ${total} 処理不要件数 : 0 エラー件数 : ${errors} <input type="button" value="OK" onclick="this.parentNode.style.display='none'"></div>
 <script>function openFunctionBar() {}
-document.getElementById('FM07_01_executeBtn').onclick = async () => { await fetch('/LPSTD405/mock/exec', { method: 'POST' }); document.getElementById('cfm').style.display = 'block'; };
+document.getElementById('FM07_01_executeBtn').onclick = async () => { await fetch('/LPSTD405/mock/exec', { method: 'POST' });
+  if (${native ? 'true' : 'false'}) { if (confirm('ファイルアップロードを開始します。よろしいですか')) { await fetch('/LPSTD405/mock/ok', { method: 'POST' }); document.getElementById('res').style.display = 'block'; } else { location.href = '/LPSTD405/SUSPENDED'; } return; }
+  document.getElementById('cfm').style.display = 'block'; };
 document.getElementById('cfmOk').onclick = async () => { document.getElementById('cfm').style.display = 'none'; await fetch('/LPSTD405/mock/ok', { method: 'POST' }); document.getElementById('res').style.display = 'block'; };
 </script></body></html>`;
 await ta('[P] 本物の barcode-steps.js の ①: 実行ボタンの前にポータルへ「押す」・断られたら押さない・結果の件数を読む (偽物のロジザード・ほかへの通信は止める)', async () => {
@@ -725,21 +728,22 @@ await ta('[P] 本物の barcode-steps.js の ①: 実行ボタンの前にポー
   const { chromium } = await import('playwright');
   const browser = await chromium.launch({ headless: true });
   try {
-    const mk = async (total, errors) => {
+    const mk = async (total, errors, { native = false, onExec = () => {} } = {}) => {
       const ctx = await browser.newContext();
       const st = { exec: 0, ok: 0, other: [] };
       await ctx.route('**/*', async (route) => {
         const u = new URL(route.request().url());
         if (u.host !== 'ap003.logizard.net') { st.other.push(u.href); return route.abort(); }
-        if (u.pathname === '/LPSTD405/PM07/Index') return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: PM07(total, errors) });
-        if (u.pathname === '/LPSTD405/mock/exec') { st.exec++; return route.fulfill({ status: 200, body: 'ok' }); }
+        if (u.pathname === '/LPSTD405/PM07/Index') return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: PM07(total, errors, native) });
+        if (u.pathname === '/LPSTD405/SUSPENDED') return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: '<html><body>suspended</body></html>' });
+        if (u.pathname === '/LPSTD405/mock/exec') { st.exec++; onExec(); return route.fulfill({ status: 200, body: 'ok' }); }
         if (u.pathname === '/LPSTD405/mock/ok') { st.ok++; return route.fulfill({ status: 200, body: 'ok' }); }
         st.other.push(u.href); return route.abort();
       });
       return { page: await ctx.newPage(), st, ctx };
     };
     const sessionWith = (m) => async (o) => {
-      const steps = ST.createBarcodeSteps({ page: m.page, cfg: {}, beforeExecute: o.beforeExecute });
+      const steps = ST.createBarcodeSteps({ page: m.page, cfg: {}, beforeExecute: o.beforeExecute, pressGuard: o.pressGuard });
       const imp = await steps.runImport(o.csvPath, ST.IMPORT1_PATTERN_DEFAULT, '①新商品バーコード登録');
       await o.onImported(imp);
       return { export: null };
@@ -777,6 +781,24 @@ await ta('[P] 本物の barcode-steps.js の ①: 実行ボタンの前にポー
     j = jobRow(id);
     assert.deepEqual([m.st.exec, j.state, j.import_errors], [1, 'import_error', 1]);
     assert.ok(fs.readdirSync(path.join(tmp, 'error-shots')).some((f) => /bc-import-error/.test(f)), 'エラーの画面は写しのフォルダに残る');
+    await m.ctx.close();
+    // ブラウザの確認 (confirm) が出るまでに「押してよい間」を過ぎた = 承認しない (Codex R2 High)
+    e = await newExport(1);
+    id = await queue(e, { with_export: false });
+    let local = Date.now();
+    m = await mk(1, 0, { native: true, onExec: () => { local += 100e3; } });
+    const logs = [];
+    out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, session: sessionWith(m), log: () => {}, ...noExit, now: () => local });
+    assert.deepEqual([m.st.exec, m.st.ok, out.executed, jobRow(id).state], [1, 0, true, 'unknown'], '確認を承認しない = 取込は始まっていない (押した後なので分からない側)');
+    assert.match(jobRow(id).log, /押してよい間を過ぎたので dialog を承認しない/);
+    await m.ctx.close();
+    // 間の中なら承認する (同じ形で時計を進めない = 取り込んだ)
+    e = await newExport(1);
+    id = await queue(e, { with_export: false });
+    m = await mk(1, 0, { native: true });
+    out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, session: sessionWith(m), log: () => {}, ...noExit });
+    assert.deepEqual([m.st.exec, m.st.ok, jobRow(id).state], [1, 1, 'imported']);
+    assert.ok(logs);
     await m.ctx.close();
   } finally {
     await browser.close();

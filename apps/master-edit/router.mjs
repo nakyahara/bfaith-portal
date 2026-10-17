@@ -1573,7 +1573,8 @@ router.post('/api/lz-csv/:id/void', (req, res) => {
   const exportId = String(req.params.id);
   const actor = String(req.session.email || '').trim().toLowerCase();
   if (!/^[1-9]\d{0,17}$/.test(exportId)) return res.status(404).json({ ok: false, error: 'ファイルがありません' });
-  try { BC.reserveVoid(BC.getLzBcDb(), { exportId, by: actor, now: bcClock() }); } catch (e) {
+  let holdToken;
+  try { holdToken = BC.reserveVoid(BC.getLzBcDb(), { exportId, by: actor, now: bcClock() }); } catch (e) {
     if (e instanceof BC.BcImportError) return res.status(e.status).json({ ok: false, error: e.message, reason: e.code });
     console.error(`[master-edit] 取り込みの帳面を読めない: ${e && e.message}`);
     return res.status(503).json({ ok: false, error: '取り込みの帳面を読めないので、いまは取り消せません', reason: 'bc_db_unavailable' });
@@ -1585,7 +1586,7 @@ router.post('/api/lz-csv/:id/void', (req, res) => {
     res.json({ ok: true, ...r });
   }, 'write').finally(() => {
     // 取り消せなかった = 印を外す (取り消せた = 残す。期限 2 分で切れる・その後は Company DB の取り消しで断る)
-    if (!voided) { try { BC.releaseVoid(BC.getLzBcDb(), exportId); } catch (e) { console.error(`[master-edit] 取り消しの途中の印を外せない: ${e && e.message}`); } }
+    if (!voided) { try { BC.releaseVoid(BC.getLzBcDb(), exportId, holdToken); } catch (e) { console.error(`[master-edit] 取り消しの途中の印を外せない: ${e && e.message}`); } }
   });
 });
 

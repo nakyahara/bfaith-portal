@@ -105,6 +105,12 @@ export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = nul
   const DIALOG_CONFIRM_OK = /(実行|出力|取込|取り込み|インポート|エクスポート|アップロード|ダウンロード)[^。]{0,20}(よろしい|しますか|開始します)/;
   let unexpectedDialog = null;
   let nightDialog = false;
+  let pressStopDialog = false;
+  /** ボタンの道の「押してよい間」を過ぎたか (pressGuard が例外 = 過ぎた。CLI は pressGuard なし = いつも false) */
+  const pressStopped = (where) => {
+    if (!pressGuard) return false;
+    try { pressGuard(where); return false; } catch { return true; }
+  };
   page.on('dialog', async (d) => {
     const msg = d.message();
     if (inNightBlock()) {
@@ -112,6 +118,12 @@ export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = nul
       unexpectedDialog = `[${d.type()}] ${msg.slice(0, 200)}`;
       nightDialog = true;
       console.log(`🛑 夜の止め (00:00〜01:30) のため dialog を承認しない ${unexpectedDialog} → dismiss`);
+      await d.dismiss().catch(() => {});
+    } else if (pressStopped('dialog の承認')) {
+      // ボタンの道: 「押す」から押してよい間を過ぎた = 始める確認でも承認しない (Codex R2 High)
+      unexpectedDialog = `[${d.type()}] ${msg.slice(0, 200)}`;
+      pressStopDialog = true;
+      console.log(`🛑 押してよい間を過ぎたので dialog を承認しない ${unexpectedDialog} → dismiss`);
       await d.dismiss().catch(() => {});
     } else if (d.type() === 'confirm' && DIALOG_CONFIRM_OK.test(msg)) {
       console.log(`💬 confirm "${msg.slice(0, 120)}" → accept`);
@@ -138,6 +150,7 @@ export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = nul
     if (!unexpectedDialog) return;
     const e = new Error(`${nightDialog ? nightBlockMessage(new Date(), 'dialog の承認') + ' ' : ''}想定外ダイアログが発生: ${unexpectedDialog}`);
     if (nightDialog) e.nightBlock = true;
+    if (pressStopDialog) e.pressStop = true;
     throw e;
   }
 

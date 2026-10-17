@@ -226,7 +226,8 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
         // 件数が合わない (エラー件数 0・総件数 = 行数 でない) = ② はしない (ポータルの決まりと同じ・ポータルが ② に進めと言わないときも。Codex R1 Medium)
         const c = imp.counts || {};
         if (!(c.errors === 0 && c.total === job.rows)) { const e = new Error(`① の結果の件数が合わない (総件数 ${c.total ?? '読めない'}・エラー件数 ${c.errors ?? '読めない'}・CSV ${job.rows} 行)。② はしない`); e.code = 'count_mismatch'; throw e; }
-        if (job.with_export && portal && portal.state !== 'exporting') { const e = new Error(`ポータルが ② に進めと言わない (状態 ${portal.state})。② はしない`); e.code = 'portal_stop'; throw e; }
+        // ② はポータルが「② に進め」(exporting) と答えたときだけ (届かない・ほかの答え = ② はしない。① の結果は終わりの知らせで送る。Codex R2 Medium)
+        if (job.with_export && !(portal && portal.state === 'exporting')) { const e = new Error(`ポータルが ② に進めと言わない (${portal ? `状態 ${portal.state}` : '① の結果の知らせが届かない'})。② はしない`); e.code = 'portal_stop'; throw e; }
       },
     });
     if (!body.import_result) throw new Error('① の結果が無いまま終わった');

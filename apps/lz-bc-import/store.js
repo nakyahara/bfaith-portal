@@ -136,6 +136,7 @@ export function openLzBcDb(file = path.join(process.env.DATA_DIR || path.join(pr
     CREATE TABLE IF NOT EXISTS bc_void_holds (
       export_id TEXT PRIMARY KEY,
       by        TEXT NOT NULL,
+      token     TEXT NOT NULL,
       until     INTEGER NOT NULL
     );
   `);
@@ -474,23 +475,30 @@ export function recordDownload(db, { exportId, by, now }) {
 }
 
 /** 取り消しの途中の印 (確かめ → Company DB で取り消す までの間に、積む・渡す・押すをさせない。Codex R1 High) */
-export const VOID_HOLD_MS = 2 * 60e3;
+// 長め (Company DB の取り消しは文 20 秒・鍵 10 秒で切れる = 途中で切れない。process が落ちて外せなかった印もこの後は効かない)
+export const VOID_HOLD_MS = 10 * 60e3;
 export function voidHeld(db, exportId, now) {
   const h = db.prepare('SELECT * FROM bc_void_holds WHERE export_id = ?').get(String(exportId));
   return !!(h && h.until > now);
 }
-/** 取り消してよいかを確かめて、その場で取り消しの途中の印を付ける (1 つの取引)。だめ = 例外 */
+/**
+ * 取り消してよいかを確かめて、その場で取り消しの途中の印を付ける (1 つの取引)。だめ = 例外。
+ * ほかの人の取り消しの途中 (生きた印) = 断る (上書きしない・Codex R2 High)。返す token でだけ外せる
+ */
 export function reserveVoid(db, { exportId, by, now }) {
   sweep(db, now);
+  const token = crypto.randomBytes(16).toString('hex');
   db.transaction(() => {
+    if (voidHeld(db, exportId, now)) fail('voiding', 'この CSV はいまほかの人が取り消しています。画面を開き直してください');
     const blk = voidBlockIn(db, exportId);
     if (blk) fail(blk.code, blk.message);
-    db.prepare('INSERT INTO bc_void_holds (export_id, by, until) VALUES (?, ?, ?) ON CONFLICT(export_id) DO UPDATE SET by = excluded.by, until = excluded.until').run(String(exportId), String(by || ''), now + VOID_HOLD_MS);
+    db.prepare('INSERT INTO bc_void_holds (export_id, by, token, until) VALUES (?, ?, ?, ?) ON CONFLICT(export_id) DO UPDATE SET by = excluded.by, token = excluded.token, until = excluded.until').run(String(exportId), String(by || ''), token, now + VOID_HOLD_MS);
   })();
+  return token;
 }
-/** 取り消せなかった = 印を外す (取り消せた = 印を残す。Company DB でも取り消してあるので、渡すときにも断る) */
-export function releaseVoid(db, exportId) {
-  db.prepare('DELETE FROM bc_void_holds WHERE export_id = ?').run(String(exportId));
+/** 取り消せなかった = 自分の印だけ外す (取り消せた = 印を残す。Company DB でも取り消してあるので、渡すときにも断る) */
+export function releaseVoid(db, exportId, token) {
+  db.prepare('DELETE FROM bc_void_holds WHERE export_id = ? AND token = ?').run(String(exportId), String(token || ''));
 }
 
 /** CSV を取り消してよいか (動いている・分からないまま・取り込んだ = 断る)。null = よい */
