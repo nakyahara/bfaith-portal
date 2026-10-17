@@ -45,21 +45,25 @@ $$;
 revoke all on function ops.sku_shipment_totals(bigint, timestamptz[]) from public;
 
 -- ─── 3. 出荷の行 (伝票ごと) ───
---   (p_after, p_before] の出荷確定。新しい順。p_limit は 1〜5,000 (既定 200)。同じ伝票に同じ商品の明細が 2 つあれば足す
-create function ops.sku_movement_shipments(p_sku_id bigint, p_after timestamptz, p_before timestamptz, p_limit integer)
+--   新しい順 (出荷確定の時刻・伝票番号 (C の並び) の降順)。(p_after, 続きの位置] の出荷確定。p_limit は 1〜5,000 (既定 200)。同じ伝票に同じ商品の明細が 2 つあれば足す。
+--   続きの位置 = p_before (時刻) と p_before_slip (伝票番号)。p_before_slip が null = その時刻まで全部 (時刻ちょうどを含む)・あり = 同じ時刻ならその伝票番号より前だけ
+--   (同じ時刻に伝票が多くて上限で切れたとき、同じ時刻の残りを次のページで読む = 取りこぼさない。Codex R1)
+create function ops.sku_movement_shipments(p_sku_id bigint, p_after timestamptz, p_before timestamptz, p_before_slip text, p_limit integer)
   returns table (shipped_at timestamptz, ship_date_jst date, ne_slip_no text, shop_code text, shop_name text, qty bigint)
   language sql stable security definer set search_path = pg_catalog, pg_temp as $$
   select s.shipped_at, s.ship_date_jst, s.ne_slip_no, s.shop_code, n.shop_name, pg_catalog.sum(l.qty)::bigint
     from core.shipment_lines l join core.shipments s on s.shipment_id = l.shipment_id
     left join core.ne_shops n on n.company_id = s.company_id and n.shop_code = s.shop_code
    where l.sku_id = p_sku_id and l.removed_at is null and not l.is_cancelled and not s.is_cancelled and s.shipped_at is not null
-     and s.shipped_at > coalesce(p_after, '-infinity'::timestamptz) and s.shipped_at <= coalesce(p_before, 'infinity'::timestamptz)
+     and s.shipped_at > coalesce(p_after, '-infinity'::timestamptz)
+     and (s.shipped_at < coalesce(p_before, 'infinity'::timestamptz)
+          or (s.shipped_at = p_before and (p_before_slip is null or s.ne_slip_no collate "C" < p_before_slip collate "C")))
    group by s.shipment_id, s.shipped_at, s.ship_date_jst, s.ne_slip_no, s.shop_code, n.shop_name
   having pg_catalog.sum(l.qty) > 0
-   order by s.shipped_at desc, s.ne_slip_no desc
+   order by s.shipped_at desc, s.ne_slip_no collate "C" desc
    limit least(greatest(coalesce(p_limit, 200), 1), 5000)
 $$;
-revoke all on function ops.sku_movement_shipments(bigint, timestamptz, timestamptz, integer) from public;
+revoke all on function ops.sku_movement_shipments(bigint, timestamptz, timestamptz, text, integer) from public;
 
 -- ─── 4. 月ごとの受注数・売上数 ───
 --   受注数 = NE の受注日 (order_date_jst) の月・出荷していない伝票も入る。売上数 = 出荷確定日 (ship_date_jst) の月。p_from の月から

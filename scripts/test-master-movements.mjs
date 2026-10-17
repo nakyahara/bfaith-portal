@@ -89,6 +89,23 @@ await t('最後の締めの後: いまのロジザードの写しの時刻で合
   const same = M.buildMovementRows({ anchors, totals: new Map(), receipts: [], ships, after: null, before: null, live: { ...live, qty: 120 }, truncated: false, poNote: null });
   assert.deepEqual(same.map((r) => [r.kind, r.balance]), [['ship', 119], ['ship', 120]], '合う = 調整の行なし');
 });
+await t('同じ時刻の出荷 (Codex R1): 在庫数の積み上げと表の並びがちょうど逆 = 区間の最後の行がロジザードの数と同じ', () => {
+  const anchors = [A('2026-10-01', 100), A('2026-10-02', 95)];
+  const ships = [{ at: isoJ('2026-10-02T10:00:00'), qty: 3, slip: 'S2' }, { at: isoJ('2026-10-02T10:00:00'), qty: 2, slip: 'S1' }];
+  const rows = M.buildMovementRows({ anchors, totals: new Map([[1, 5]]), receipts: [], ships, after: null, before: null, live: null, truncated: false, poNote: null });
+  assert.deepEqual(rows.map((r) => [r.slip, r.balance]), [['S2', 95], ['S1', 98]]);
+  const rev = M.buildMovementRows({ anchors, totals: new Map([[1, 5]]), receipts: [], ships: [...ships].reverse(), after: null, before: null, live: null, truncated: false, poNote: null });
+  assert.deepEqual(rev.map((r) => [r.slip, r.balance]), [['S2', 95], ['S1', 98]], '受け取った順に依らない');
+});
+await t('最後の締めの後が上限で切れた (Codex R1): いまの写しとの調整は出さない・写しの後の行は全部読めていれば写しから数える', () => {
+  const anchors = [A('2026-10-06', 4000)];
+  const ships = [{ at: isoJ('2026-10-07T12:00:00'), qty: 1, slip: 'X3' }, { at: isoJ('2026-10-07T10:30:00'), qty: 1, slip: 'X2' }, { at: isoJ('2026-10-07T10:00:00'), qty: 1, slip: 'X1' }];
+  const live = { asOf: isoJ('2026-10-07T11:00:00'), qty: 999 };
+  const rows = M.buildMovementRows({ anchors, totals: new Map(), receipts: [], ships, after: Date.parse(isoJ('2026-10-07T10:00:00')), before: null, live, truncated: true, poNote: null });
+  assert.deepEqual(rows.map((r) => [r.kind, r.slip, r.balance]), [['ship', 'X3', 998], ['ship', 'X2', null], ['ship', 'X1', null]]);
+  const late = M.buildMovementRows({ anchors, totals: new Map(), receipts: [], ships: ships.slice(0, 1), after: Date.parse(isoJ('2026-10-07T12:00:00')), before: null, live, truncated: true, poNote: null });
+  assert.deepEqual(late.map((r) => [r.slip, r.balance]), [['X3', null]], '写しと読めた行の間に読めていない行があるかもしれない = 空欄');
+});
 await t('ページの切れ目 = 区間の始まり (錨の前は日の始まり)・窓の外の行は出さない', () => {
   const anchors = [A('2026-10-01', 100), A('2026-10-02', 90)];
   assert.equal(M.pageFloorOf(anchors, Date.parse(isoJ('2026-10-02T10:00:00'))), Date.parse(isoJ('2026-10-01T18:00:00')));
@@ -157,11 +174,11 @@ await t('master_edit は 4 つの関数を呼べる・出荷の表と取得の�
     const bounds = ['2026-10-01T09:00:00Z', '2026-10-02T09:00:00Z', '2026-10-04T09:00:00Z', '2026-10-05T09:00:00Z', '2026-10-06T09:00:00Z'];
     const tot = (await pg.query('select bucket, qty::int as q from ops.sku_shipment_totals($1::bigint, $2::timestamptz[]) order by 1', [skuA, bounds])).rows;
     assert.deepEqual(tot.map((r) => [r.bucket, r.q]), [[1, 10], [2, 10], [4, 2]]);
-    const sh = (await pg.query(`select ne_slip_no, shop_name, qty::int as q from ops.sku_movement_shipments($1::bigint, null, null, 10)`, [skuA])).rows;
+    const sh = (await pg.query(`select ne_slip_no, shop_name, qty::int as q from ops.sku_movement_shipments($1::bigint, null, null, null, 10)`, [skuA])).rows;
     assert.deepEqual(sh.map((r) => [r.ne_slip_no, r.q]), [['S6', 1], ['S5', 3], ['S4', 2], ['S3', 5], ['S2', 5], ['S1', 10], ['S0', 4]]);
     assert.equal(sh.find((r) => r.ne_slip_no === 'S2').shop_name, 'FBA納品');
     assert.equal(Object.keys(sh[0]).includes('tracking_no'), false);
-    const lim = (await pg.query(`select count(*)::int as n from ops.sku_movement_shipments($1::bigint, null, null, 99999)`, [skuB])).rows[0].n;
+    const lim = (await pg.query(`select count(*)::int as n from ops.sku_movement_shipments($1::bigint, null, null, null, 99999)`, [skuB])).rows[0].n;
     assert.equal(lim, 255);
     const mo = (await pg.query(`select month::text as m, order_qty::int as o, ship_qty::int as s from ops.sku_shipments_monthly($1::bigint, '2026-09-01')`, [skuA])).rows;
     assert.deepEqual(mo.map((r) => [r.m, r.o, r.s]), [['2026-09-01', 4, 4], ['2026-10-01', 32, 26]]);   // 10 月の受注 = 出荷 26 + 出していない 6
@@ -175,6 +192,32 @@ await t('master_edit は 4 つの関数を呼べる・出荷の表と取得の�
   assert.equal(fns.length, 4);
   assert.deepEqual(fns.map((f) => f.f.replace(/,\s*/g, ',')).sort(), MOVEMENT_FUNCTIONS.map((f) => f.replace(/,\s*/g, ',')).sort());
   for (const f of fns) { assert.equal(f.d, true, f.f); assert.match(f.c, /search_path=pg_catalog, pg_temp/, f.f); assert.equal(f.pub, false, f.f); assert.equal(f.me, true, f.f); assert.equal(f.w, false, f.f); }
+});
+
+await t('上限で切れたページ (Codex R1): 同じ時刻の伝票の残りを次のページで読む = 全部のページで取りこぼしも重なりも無い', async () => {
+  await pg.query(`insert into core.products (company_id, name) values (1, '見本C')`);
+  await pg.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) select 1, product_id, 'single', 'mv-c', name from core.products where name = '見本C'`);
+  const skuC = (await one(`select sku_id::text as id from core.skus where code = 'mv-c'`)).id;
+  let n = 0;
+  const shipC = async (slip, at) => {
+    const s = await one(`insert into core.shipments (company_id, ne_slip_no, shop_code, status, shipped_at, ship_date_jst, order_date_jst, received_batch_seq, source_updated_at, transform_version, content_hash)
+      values (1, $1, '1', 'shipped', $2::timestamptz, ($2::timestamptz at time zone 'Asia/Tokyo')::date, ($2::timestamptz at time zone 'Asia/Tokyo')::date, $3, now(), 't', 'h') returning shipment_id`, [slip, J(at), 9000 + ++n]);
+    await pg.query(`insert into core.shipment_lines (company_id, shipment_id, line_no, sku_id, qty, received_batch_seq) values (1, $1, '1', $2, 1, $3)`, [s.shipment_id, skuC, 9000 + n]);
+  };
+  for (const s of ['C1', 'C2', 'C3', 'C4', 'C5']) await shipC(s, '2026-10-06T10:00:00');   // 同じ時刻に 5 伝票
+  await shipC('C0', '2026-10-05T10:00:00');
+  const dbE = pgliteAdapter(pg);
+  const seen = [];
+  await asEditor(async () => {
+    let before = null, pages = 0;
+    do {
+      const r = await M.readMovementsPage(dbE, { sku_id: skuC, code: 'mv-c' }, { before, pageRows: 2, cap: 3 });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      seen.push(...r.rows.filter((x) => x.kind === 'ship').map((x) => x.slip));   // 調整の行も出る (mv-c はロジザードに無い = 在庫 0 のまま出荷)
+      before = r.next; pages++;
+    } while (before && pages < 10);
+  });
+  assert.deepEqual(seen, ['C5', 'C4', 'C3', 'C2', 'C1', 'C0']);
 });
 
 console.log('3 API (本物の router)');

@@ -275,7 +275,7 @@ export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_log
  *   出荷の表 (core.shipments ほか)・取得の回の表 (ops.ingest_runs) の select は渡さない (送り状番号などまで読めてしまう)。関数が無い DB (0083 の前) では付けない (流し直すと付く)
  */
 export const MOVEMENT_FUNCTIONS = Object.freeze(['ops.sku_stock_anchors(bigint, date)', 'ops.sku_shipment_totals(bigint, timestamp with time zone[])',
-  'ops.sku_movement_shipments(bigint, timestamp with time zone, timestamp with time zone, integer)', 'ops.sku_shipments_monthly(bigint, date)']);
+  'ops.sku_movement_shipments(bigint, timestamp with time zone, timestamp with time zone, text, integer)', 'ops.sku_shipments_monthly(bigint, date)']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;

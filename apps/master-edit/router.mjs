@@ -1007,7 +1007,7 @@ router.get('/api/sku/:code/movements', (req, res) => withPgApi(res, async (db) =
   const sku = await movementSku(db, req.params.code);
   if (!sku) return res.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
   if (sku.sku_kind !== 'single') return res.status(400).json(MOVEMENT_SINGLE_ONLY);
-  const before = typeof req.query.before === 'string' && req.query.before ? req.query.before.slice(0, 40) : null;
+  const before = typeof req.query.before === 'string' && req.query.before ? req.query.before.slice(0, 100) : null;
   const st = before ? null : await readWarehouseStock({ now: clock() });
   const live = st && st.ok ? { asOf: st.asOf, stale: st.stale, qty: stockOf(st, sku.code_norm) } : null;
   const out = await readMovementsPage(db, sku, { before, poAccess: canSeeBackorders(req), live });

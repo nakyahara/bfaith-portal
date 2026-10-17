@@ -88,9 +88,9 @@ export async function readShipmentTotals(db, skuId, bounds) {
   return m;
 }
 /** 出荷の行 (伝票ごと)。(after, before] の新しい順 */
-export async function readShipments(db, skuId, { after = null, before = null, limit = PAGE_ROWS } = {}) {
-  const r = await db.query('select shipped_at, ship_date_jst::text as date, ne_slip_no, shop_code, shop_name, qty from ops.sku_movement_shipments($1::bigint, $2::timestamptz, $3::timestamptz, $4::integer)',
-    [skuId, after, before, limit]);
+export async function readShipments(db, skuId, { after = null, before = null, beforeSlip = null, limit = PAGE_ROWS } = {}) {
+  const r = await db.query('select shipped_at, ship_date_jst::text as date, ne_slip_no, shop_code, shop_name, qty from ops.sku_movement_shipments($1::bigint, $2::timestamptz, $3::timestamptz, $4::text, $5::integer)',
+    [skuId, after, before, beforeSlip, limit]);
   return r.rows.map((x) => ({ at: iso(x.shipped_at), date: x.date, slip: x.ne_slip_no, shopCode: x.shop_code, shopName: x.shop_name, qty: Number(x.qty) }));
 }
 
@@ -187,6 +187,8 @@ function intervalOf(cps, t) {
   return lo;
 }
 
+/** 伝票番号の並び (DB の collate "C" と同じ = 文字のコードの順) */
+const cmpSlip = (a, b) => { const x = String(a ?? ''), y = String(b ?? ''); return x < y ? -1 : x > y ? 1 : 0; };
 const fmtMd = (ymd) => `${Number(ymd.slice(5, 7))}/${Number(ymd.slice(8, 10))}`;
 
 /**
@@ -201,11 +203,11 @@ export function buildMovementRows(o) {
   const placed = placeReceipts(o.receipts || [], o.anchors);
   const { cps, adj } = adjustmentsOf(o.anchors, o.totals, placed);
   const inWin = (t) => (o.after == null || t > o.after) && (o.before == null || t <= o.before);
-  // 動き (時刻の順・同じ時刻は出荷 → 仕入)
+  // 動き (時刻の順・同じ時刻は出荷 → 仕入 → 伝票番号の順)。表は同じ鍵のちょうど逆 (新しい順) = 在庫数の積み上げと表の並びがそろう (Codex R1)
   const moves = [
     ...o.ships.map((s) => ({ t: ms(s.at), seq: 0, kind: 'ship', delta: -s.qty, src: s })),
     ...placed.filter((r) => inWin(r.t)).map((r) => ({ t: r.t, seq: 1, kind: 'receipt', delta: r.qty, src: r })),
-  ].sort((a, b) => a.t - b.t || a.seq - b.seq);
+  ].sort((a, b) => a.t - b.t || a.seq - b.seq || cmpSlip(a.src.slip, b.src.slip));
   // 区間ごとの在庫数 (窓の中の区間 = 動きは全部この窓にある)
   const byK = new Map();
   for (const m of moves) { const k = intervalOf(cps, m.t); if (!byK.has(k)) byK.set(k, []); byK.get(k).push(m); }
@@ -231,10 +233,17 @@ export function buildMovementRows(o) {
   const last = cps.length ? cps[cps.length - 1] : null;
   if (o.live && last && Number.isFinite(ms(o.live.asOf)) && ms(o.live.asOf) > last.t && inWin(ms(o.live.asOf))) {
     lt = ms(o.live.asOf);
-    const expect = last.qty + moves.filter((m) => m.t > last.t && m.t <= lt).reduce((s, m) => s + m.delta, 0);
-    liveU = Number(o.live.qty) - expect;
-    let bal = Number(o.live.qty);
-    for (const m of moves) if (m.t > lt) { bal += m.delta; m.balance = bal; }
+    // 最後の締めの後の区間が上限で切れた = 読めていない動きがある: 写しとの差 (調整) は出さない (架空の調整にしない・Codex R1)。
+    //   写しの後の動きは、読めた中のいちばん古い行が写しより前なら全部読めている = 写しの数から数えられる
+    const tailBroken = o.truncated && oldestK === cps.length;
+    if (!tailBroken) {
+      const expect = last.qty + moves.filter((m) => m.t > last.t && m.t <= lt).reduce((s, m) => s + m.delta, 0);
+      liveU = Number(o.live.qty) - expect;
+    }
+    if (!tailBroken || (moves.length && moves[0].t <= lt)) {
+      let bal = Number(o.live.qty);
+      for (const m of moves) if (m.t > lt) { bal += m.delta; m.balance = bal; }
+    }
   }
   for (const m of moves) {
     const s = m.src;
@@ -260,7 +269,7 @@ export function buildMovementRows(o) {
     rows.push({ at: new Date(lt).toISOString(), t: lt, seq: 2, dateOnly: false, kind: 'adjust', label: ADJUST_LABEL, in: liveU > 0 ? liveU : null, out: liveU < 0 ? -liveU : null, balance: Number(o.live.qty), slip: null, party: '',
       reason: ['いまのロジザードの写しとの差 (理由は分かりません)', ...(o.poNote ? [o.poNote] : [])].join(' · '), actor: null, live: true });
   }
-  rows.sort((a, b) => b.t - a.t || b.seq - a.seq || String(b.slip || '').localeCompare(String(a.slip || '')));
+  rows.sort((a, b) => b.t - a.t || b.seq - a.seq || cmpSlip(b.slip, a.slip));
   return rows.map(({ t, seq, ...r }) => r);
 }
 
@@ -282,45 +291,56 @@ export function pageFloorOf(anchors, t) {
  * @param opt.before ISO (この時刻まで = 前のページの切れ目)・opt.poAccess・opt.live ({ asOf, qty } | null)・opt.poReader (試験)
  * @returns { ok, rows, next (ISO|null), lastClose { day, at }, firstDay, liveAt, po: 'ok'|'denied'|'error', truncated }
  */
-export async function readMovementsPage(db, sku, { before = null, poAccess = false, live = null, poReader = readPoForSku } = {}) {
-  const beforeMs = before == null ? null : ms(before);
-  if (before != null && !Number.isFinite(beforeMs)) return { ok: false, reason: 'bad_cursor', error: '続きの位置が読めません (画面を開き直してください)' };
+export async function readMovementsPage(db, sku, { before = null, poAccess = false, live = null, poReader = readPoForSku, pageRows = PAGE_ROWS, cap = PAGE_CAP } = {}) {
+  // 続きの位置 = 'ISO' (区間の切れ目 = その時刻まで全部) か 'ISO|伝票番号' (上限で切れた = 同じ時刻はその伝票番号より前)
+  const cur = before == null ? null : String(before);
+  const bar = cur == null ? -1 : cur.indexOf('|');
+  const beforeAt = cur == null ? null : bar >= 0 ? cur.slice(0, bar) : cur;
+  const beforeSlip = bar >= 0 ? cur.slice(bar + 1) || null : null;
+  const beforeMs = beforeAt == null ? null : ms(beforeAt);
+  if (cur != null && (!/^\d{4}-\d{2}-\d{2}T/.test(beforeAt) || !Number.isFinite(beforeMs))) return { ok: false, reason: 'bad_cursor', error: '続きの位置が読めません (画面を開き直してください)' };
+  const B = { before: beforeAt, beforeSlip };
   try {
     const anchors = await readAnchors(db, sku.sku_id);
     const gens = anchors.filter((a) => a.status === 'complete' && a.gen).map((a) => a.gen).sort((a, b) => ms(a) - ms(b));
     const totals = await readShipmentTotals(db, sku.sku_id, gens);
     const floor = new Date(dayStartMs(SHIPMENTS_FROM)).toISOString();
-    const first = await readShipments(db, sku.sku_id, { after: floor, before, limit: PAGE_ROWS + 1 });
+    const first = await readShipments(db, sku.sku_id, { after: floor, ...B, limit: pageRows + 1 });
     let ships = first, after = dayStartMs(SHIPMENTS_FROM), next = null, truncated = false;
-    if (first.length > PAGE_ROWS) {
-      after = pageFloorOf(anchors, ms(first[PAGE_ROWS - 1].at));
-      ships = await readShipments(db, sku.sku_id, { after: new Date(after).toISOString(), before, limit: PAGE_CAP });
-      truncated = ships.length >= PAGE_CAP;
-      // 上限で切れた (1 つの区間に 3,000 伝票より多い = ふつうは起きない): 続きは読めた中でいちばん古い行の手前から (その区間の在庫数は出さない)
-      if (truncated) after = ms(ships[ships.length - 1].at) - 1;
+    if (first.length > pageRows) {
+      after = pageFloorOf(anchors, ms(first[pageRows - 1].at));
+      ships = await readShipments(db, sku.sku_id, { after: new Date(after).toISOString(), ...B, limit: cap });
+      truncated = ships.length >= cap;
       next = new Date(after).toISOString();
+      if (truncated) {
+        // 上限で切れた (1 つの区間に 3,000 伝票より多い = ふつうは起きない): 続きは読めた中でいちばん古い行 (時刻・伝票番号) の次から = 同じ時刻の残りも次のページで読む。
+        //   仕入・調整の行は、その時刻ちょうどまでを次のページに回す。切れた区間の在庫数は出さない
+        const o = ships[ships.length - 1];
+        after = ms(o.at);
+        next = `${new Date(after).toISOString()}|${o.slip}`;
+      }
     }
     const po = poAccess ? poReader(sku.code) : null;
     const receipts = po && po.ok ? po.receipts : [];
     const poState = !poAccess ? 'denied' : po && po.ok ? 'ok' : 'error';
     // 続きがあるか: 切れ目より前に出荷・仕入・調整のどれかがある (無いのに「もっと前」を出さない)
     if (next && !truncated) {
-      const older = (await readShipments(db, sku.sku_id, { after: floor, before: next, limit: 1 })).length > 0;
+      const older = (await readShipments(db, sku.sku_id, { after: floor, before: next, beforeSlip: null, limit: 1 })).length > 0;
       const placed = placeReceipts(receipts, anchors);
       const { adj } = adjustmentsOf(anchors, totals, placed);
       if (!older && !placed.some((r) => r.t <= after) && !adj.some((a) => a.u && a.t <= after)) next = null;
     }
     const poNote = poState === 'denied' ? '発注アプリの権限が無いので、仕入もここに入っています' : poState === 'error' ? '発注アプリを読めないので、仕入もここに入っています' : null;
     // 窓の外 (前のページより新しい) の仕入は出さない。窓の下 (after) より古い仕入も出さない (次のページ)
-    const rows = buildMovementRows({ anchors, totals, receipts, ships, after: next ? after : null, before: beforeMs, live: before == null ? live : null, truncated, poNote });
+    const rows = buildMovementRows({ anchors, totals, receipts, ships, after: next ? after : null, before: beforeMs, live: cur == null ? live : null, truncated, poNote });
     const cps = anchors.filter((a) => a.status === 'complete' && a.gen);
     const lastA = cps.length ? cps[cps.length - 1] : null;
     return {
       ok: true, rows, next, truncated, po: poState,
       lastClose: lastA ? { day: lastA.day, at: lastA.gen } : null,
       firstDay: cps.length ? cps[0].day : null,
-      liveAt: before == null && live ? live.asOf : null,
-      liveStale: before == null && live ? !!live.stale : null,
+      liveAt: cur == null && live ? live.asOf : null,
+      liveStale: cur == null && live ? !!live.stale : null,
     };
   } catch (e) {
     return fnError(e);

@@ -83,7 +83,7 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   // 🆕 0083 仮 (商品ごとの入出庫履歴と月別のまとめ・CompanyDB構想 26)。p_from / p_after / p_limit が規則にかかる = ここで分ける。🚨 番号を付け替えたら since も
   { sig: 'ops.sku_stock_anchors(bigint, date)', cls: 'light', public: false, since: '0083', reason: 'SKU 1 つのロジザードの毎日の在庫 (0083 仮・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。取得の日 (日次は 13 か月の保持 = 400 行まで) × その日の SKU の行を ix_sku_stock_daily_sku で引く。商品の画面の「入出庫の履歴」を開くたびに 1 回' },
   { sig: 'ops.sku_shipment_totals(bigint, timestamp with time zone[])', cls: 'light', public: false, since: '0083', reason: 'SKU 1 つの出荷を取得時刻の区切り (1,000 個まで) ごとに足す (0083 仮・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。明細は ix_shipment_lines_sku・伝票は主キー。本番を測った売れ筋 (明細 1,048 行) で出荷の 13 か月の読みが 0.4 秒' },
-  { sig: 'ops.sku_movement_shipments(bigint, timestamp with time zone, timestamp with time zone, integer)', cls: 'light', public: false, since: '0083', reason: 'SKU 1 つの出荷の行 (伝票ごと・新しい順・p_limit は 1〜5,000 に丸める) (0083 仮・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。ix_shipment_lines_sku + 主キー。画面のロールの statement_timeout 20 秒が上限' },
+  { sig: 'ops.sku_movement_shipments(bigint, timestamp with time zone, timestamp with time zone, text, integer)', cls: 'light', public: false, since: '0083', reason: 'SKU 1 つの出荷の行 (伝票ごと・新しい順・p_limit は 1〜5,000 に丸める) (0083 仮・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。ix_shipment_lines_sku + 主キー。画面のロールの statement_timeout 20 秒が上限' },
   { sig: 'ops.sku_shipments_monthly(bigint, date)', cls: 'light', public: false, since: '0083', reason: 'SKU 1 つの月ごとの受注数・売上数 (0083 仮・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。画面は 13 か月 (p_from = 13 か月前の月初)。本番を測った売れ筋で 7 ms' },
 ]);
 
