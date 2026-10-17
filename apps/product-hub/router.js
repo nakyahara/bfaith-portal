@@ -74,7 +74,7 @@ import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 // Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
 import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
-import { setPlanDraftAges } from './services/cdb-set-plan.js';
+import { setPlanDraftAges, setCodeHeld } from './services/cdb-set-plan.js';
 import { SET_PLAN_ALERT_DAYS } from '../../lib/set-plan.mjs';
 // 🆕 まとまり (色違い・サイズ違い) のカード (Company DB構想 20 v7 §⑤・PR-4): 取り込み・「要確認」・状態 (NE の写し待ち / 2 軸 = 出品の門)
 import { applyCdbGroupEvent, ackCdbGroupAttention } from './services/cdb-group-intake.js';
@@ -3372,8 +3372,11 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
   // NE要対応は列ではなく表 (§5.5)。表示のついでに本コードの取り込みを追いかける
   // (mirror は毎時なので、画面を開くだけで追いつく。新しい定期実行は作らない)
   const neRowsAll = boardView === 'ne' ? neRegistrationRows(db, { reconcile: reconcileProvisionalCode }) : [];
+  // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)。boardData も仮コードのセットの確定を取り込む
+  const boardMain = boardView === 'ne' || boardView === 'ad' ? null : boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind,
+    mallSummary: mallSummaryFor, reconcileSet: reconcileProvisionalCode });
   // 🆕 2026-10-17: 新商品の登録で作ったセットの下書き (NE で本コードを確かめるまで出品しない)。作ってから SET_PLAN_ALERT_DAYS 日を過ぎても NE に無い = 知らせ
-  //   (タブの印・NE要対応の表の印と「それだけ見る」・カードの札)。上の reconcile (NE に取り込まれたら確定) の後に数える
+  //   (タブの印・NE要対応の表の印と「それだけ見る」・カードの札)。確定の取り込み (NE要対応の表 / boardData) の後に数える (Codex R6 Low)
   const setPlanAges = setPlanDraftAges(db);
   const setPlanLate = [...setPlanAges.values()].filter((x) => x.late).length;
   const setPlanLateOnly = boardView === 'ne' && filterParam === 'set_plan_late';
@@ -3382,11 +3385,8 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
   // 📣 広告 (2026-09-28) も列ではなく表 — 自社商品を段階・実績で見比べる。工程には足さない
   // (足すと listing_gate で楽天出品が止まる副作用)。実績は mirror を画面を開いたときに読む (定期実行を増やさない)
   const adOps = boardView === 'ad' ? adOpsRows(db) : null;
-  // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
-  const board = boardView === 'ne' || boardView === 'ad'
-    ? { view: boardView, columns: [], doneCards: [], doneTotal: 0, total: boardView === 'ne' ? neRows.length : adOps.rows.length, truncated: false, checkingTotal: 0 }
-    : boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind,
-      mallSummary: mallSummaryFor, reconcileSet: reconcileProvisionalCode });
+  const board = boardMain
+    || { view: boardView, columns: [], doneCards: [], doneTotal: 0, total: boardView === 'ne' ? neRows.length : adOps.rows.length, truncated: false, checkingTotal: 0 };
   // NE要対応の件数はどのタブでもバッジに出す (件数だけ。上の reconcile が済んだ後に数える)
   const neCount = neRegistrationCount(db);
   res.render(view('board.ejs'), {
@@ -4047,6 +4047,9 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
   const dup = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? AND id != ?')
     .get(code.trim().toLowerCase(), draft.id);
   if (dup) return res.status(400).json({ ok: false, error: `商品コード「${code}」は別のドラフト (#${dup.id}) が使っています` });
+  // 🆕 2026-10-17 (Codex R6 Medium 2): 新商品の登録で作るセットに決まったコード (カードの取り込み待ち) にも差し替えない (取り込みでその下書きが作れなくなる)
+  const held = setCodeHeld(code.trim(), { db });
+  if (held && held.reason === 'ph_set_plan') return res.status(400).json({ ok: false, error: `${held.message}。別のコードを入れてください` });
 
   // NE 商品マスタに無いコードでも差し替えは許すが、**仮フラグは落とさない** (Codex R1 medium)。
   // 登録直後で mirror 未取込のことがあるので入力自体は通し、出品ゲートは閉じたままにする。

@@ -446,23 +446,25 @@ export function __setSetPlanStore(st) { setPlanStore = st || null; }
 async function setPlans() {
   if (setPlanStore) return setPlanStore;
   const m = await import('../product-hub/services/cdb-set-plan.js');
-  return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o), stale: (codes) => m.staleWaitingPlansFor(codes) };
+  return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o), stale: (codes, o) => m.staleWaitingPlansFor(codes, o || {}) };
 }
 /**
  * 🆕 Codex R4 Medium 1: 予約の時間を過ぎた waiting の作るセット (このコードを持つもの) を、Company DB の保存の記録で決める。
  *   登録が通っていた (done) = registered (予約のまま・SKU の番号) / 記録が無い・失敗 = dropped (予約を外す)。読めない = throw (呼び手は 503)
  */
-async function resolveStaleSetPlans(db, codes) {
+async function resolveStaleSetPlans(db, codes, { actor = null, parentCode = null, requestId = null } = {}) {
   const st = await setPlans();
   if (typeof st.stale !== 'function') return;
-  const ids = st.stale(codes);
-  if (!ids.length) return;
+  //   🆕 Codex R6 Medium 1: 同じ人・同じ単品の waiting (前の保存の答えが分からず、新しい番号で押し直した) も照らす。記録が無い = 登録は入っていない = 外す
+  const cands = st.stale(codes, { actor, parentCode }).map((x) => (typeof x === 'string' ? { request_id: x, old: true } : x)).filter((x) => x.request_id !== requestId);
+  if (!cands.length) return;
+  const ids = cands.map((x) => x.request_id);
   const rows = (await db.query(`select request_id::text as id, status, result ->> 'sku_id' as sku_id from ops.master_edit_requests where request_id = any($1::uuid[])`, [ids])).rows;
   const byId = new Map(rows.map((x) => [x.id, x]));
   for (const id of ids) {
     const rec = byId.get(id);
     if (rec && rec.status === 'done') st.mark(id, { state: 'registered', skuId: rec.sku_id ?? null });
-    else st.mark(id, { state: 'dropped', note: rec ? `登録は ${rec.status} (予約の時間を過ぎて確かめた)` : '登録の記録が無い (予約の時間を過ぎて確かめた)' });
+    else st.mark(id, { state: 'dropped', note: rec ? `登録は ${rec.status} (記録で確かめた)` : '登録の記録が無い (予約の時間を過ぎたか、同じ人が押し直した)' });
   }
 }
 /**
@@ -1167,7 +1169,7 @@ router.post('/api/new', (req, res) => {
     }
     if (hasPlan) {
       try {
-        await resolveStaleSetPlans(db, parsed.card.sets.map((sp) => sp.code));   // 予約の時間を過ぎた waiting を Company DB の記録で決めてから (Codex R4 Medium 1)
+        await resolveStaleSetPlans(db, parsed.card.sets.map((sp) => sp.code), { actor, parentCode: parsed.code, requestId: rid });   // 予約の時間を過ぎた waiting・同じ人の押し直しを Company DB の記録で決めてから (Codex R4 / R6)
         (await setPlans()).write({ requestId: rid, requestHash: registerPayloadHashOf(parsed), parentCode: parsed.code, parentName: parsed.values.name || '', sets: parsed.card.sets, actor });
       } catch (e) {
         if (e && e.status) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, field: e.field || 'card.sets', ...(e.index == null ? {} : { index: e.index }) });
@@ -1188,6 +1190,11 @@ router.post('/api/new', (req, res) => {
       // 登録が断られた (決まった誤り = MasterWriteError) = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)。
       //   成否が分からない誤り (接続が切れた・commit の後など) = waiting のまま (予約を外さない)。時間を過ぎたら Company DB の保存の記録で決める (Codex R5 Medium 1)
       if (hasPlan && e instanceof MasterWriteError) await markSetPlanSafe(rid, { state: 'dropped', note: String((e && e.message) || e).slice(0, 300) });
+      // 🆕 Codex R6 Medium 1: 成否が分からない = 画面は同じ番号 (request_id) のまま押し直す (同じ登録は 2 回入らない・前の答えが返る)
+      if (hasPlan && !(e instanceof MasterWriteError) && !(e && ['55P03', '40P01', '40001'].includes(e.code))) {
+        console.error(`[master-edit] 作るセットつきの登録の成否が分からない (${rid}): ${e && e.stack || e}`);
+        return res.status(503).json({ ok: false, reason: 'outcome_unknown', keep_request_id: true, error: '登録できたかどうか分かりません (通信・サーバーの誤り)。同じ内容のまま、もう一度「下書きを保存する」を押してください (同じ登録は 2 回入りません)' });
+      }
       throw e;
     }
     if (hasPlan) await markSetPlanSafe(rid, { state: 'registered', skuId: r.sku_id });

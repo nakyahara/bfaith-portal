@@ -3067,10 +3067,16 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
   const bUnk = spBody('sp-unknown', [{ qty: 2, code: 'sp-unknown-2', name: 'x' }]);
   try {
     const u = await call('POST', '/apps/master-edit/api/new', { body: bUnk });
-    assert.equal(u.status, 500, u.text);
+    // 🆕 Codex R6 Medium 1: 成否が分からない = 503 outcome_unknown + keep_request_id (画面は同じ番号のまま押し直す)
+    assert.deepEqual([u.status, u.j.reason, u.j.keep_request_id], [503, 'outcome_unknown', true], u.text);
   } finally { MR.__setShippingRatesProvider(async () => RATES); }
   assert.equal(SPS.readSetPlan(bUnk.request_id).state, 'waiting');
   assert.equal(SPS.setCodeHeld('sp-unknown-2').reason, 'ph_set_plan', '予約は外れない');
+  // 前の画面 (新しい番号で押し直す) でも、同じ人・同じ単品の waiting は記録と照らす (記録が無い = 外す) = 自分の予約で止まらない
+  const retryNew = await call('POST', '/apps/master-edit/api/new', { body: { ...bUnk, request_id: uuid() } });
+  assert.equal(retryNew.status, 200, retryNew.text);
+  assert.equal(SPS.readSetPlan(bUnk.request_id).state, 'dropped');
+  assert.deepEqual(setsOf(draftOf('sp-unknown').id).map((x) => x.ne_code), ['sp-unknown-2']);
 });
 
 server.close();

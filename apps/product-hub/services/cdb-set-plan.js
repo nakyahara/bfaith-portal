@@ -56,13 +56,17 @@ export function setCodeHeld(code, { requestId = null, db = getDB() } = {}) {
  *   🚨 時間だけで予約を外さない: 登録が通った後に registered を書く前に落ちた (か書けなかった) 作るセットも waiting のまま。
  *      呼び手 (apps/master-edit/router.mjs) が Company DB の保存の記録 (ops.master_edit_requests) と照らし、done = registered・それ以外 = dropped にしてから予約を見る
  */
-export function staleWaitingPlansFor(codes, { db = getDB() } = {}) {
+export function staleWaitingPlansFor(codes, { db = getDB(), actor = null, parentCode = null } = {}) {
   const keys = [...new Set((codes || []).map((c) => String(c ?? '').trim().toLowerCase()).filter(Boolean))];
   if (!keys.length) return [];
+  // 🆕 Codex R6 Medium 1: 時間の中でも、同じ人・同じ単品の waiting (前の保存の答えが「分からない」で、画面が新しい番号で押し直した) は呼び手が記録と照らす
   return db.prepare(`
-    SELECT DISTINCT p.request_id FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
-    WHERE i.code_key IN (${keys.map(() => '?').join(',')}) AND p.state = 'waiting' AND p.created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
-  `).all(...keys, `-${WAITING_HOLD_MINUTES} minutes`).map((r) => r.request_id);
+    SELECT DISTINCT p.request_id, p.created_by, p.parent_code, (p.created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)) AS old
+    FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
+    WHERE i.code_key IN (${keys.map(() => '?').join(',')}) AND p.state = 'waiting'
+      AND (p.created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?) OR (LOWER(p.created_by) = LOWER(?) AND LOWER(TRIM(p.parent_code)) = LOWER(TRIM(?))))
+  `).all(`-${WAITING_HOLD_MINUTES} minutes`, ...keys, `-${WAITING_HOLD_MINUTES} minutes`, String(actor ?? ''), String(parentCode ?? ''))
+    .map((r) => ({ request_id: r.request_id, old: !!r.old, mine: !r.old }));
 }
 
 /**

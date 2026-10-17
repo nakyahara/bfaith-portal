@@ -778,7 +778,9 @@
         }
         msg('', 'err');
         showError(x.j, x.r.status);
-        requestId = uuid();   // 返事が来た = この番号の登録は終わった。直してもう一度押すときは新しい番号
+        // 返事が来た = この番号の登録は終わった。直してもう一度押すときは新しい番号。
+        //   🆕 成否が分からない (keep_request_id・作るセットの予約を持ったまま) = 同じ番号のまま押し直す (Codex R6 Medium 1)
+        if (!x.j.keep_request_id) requestId = uuid();
         update();
       })
       .catch(function () { busy = false; update(); msg('通信できませんでした。もう一度「下書きを保存する」を押してください (同じ登録は 2 回入りません)', 'err'); });
