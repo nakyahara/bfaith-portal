@@ -55,6 +55,7 @@
  * 🆕 0079 (要確認を確認済みにする・Company DB構想 22 の Q-1): master_edit に確認の関数と確かめ・一覧 (読むだけ) の実行 (QUARANTINE_CONFIRM_FUNCTIONS・
  *   名簿 MASTER_EDITORS の人 = 中原さんの決定 Q1 a)。master_ops には渡さない。表の権限は足さない (関数の中だけで書く)。
  *   🚨 渡さない: 確かめの表の 1 行を作る部品 (QUARANTINE_CONFIRM_OWNER_ONLY_FUNCTIONS)
+ * 🆕 0083 仮 (商品ごとの入出庫履歴と月別のまとめ・CompanyDB構想 26): master_edit に読むだけの関数 4 つの実行 (MOVEMENT_FUNCTIONS)。出荷の表の select は渡さない
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
  *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
@@ -269,6 +270,12 @@ export const LZ_BARCODE_EDIT_FUNCTIONS = Object.freeze(['ops.set_sku_logizard_ba
   'ops.lz_new_export_issue(uuid, text, jsonb, timestamp with time zone, timestamp with time zone)', 'ops.lz_new_export_void(text, bigint, text)']);
 export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_logizard_barcode_rules()', 'ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)',
   'ops.lzbc_jan_ok(text)', 'ops.guard_sku_logizard_barcode_requests()', 'ops.guard_lz_new_exports()']);
+/**
+ * 🆕 0083 仮 (商品ごとの入出庫履歴と月別のまとめ・CompanyDB構想 26 の PR-1・PR-2): 読むだけの関数 4 つ (security definer) を master_edit に実行だけ。
+ *   出荷の表 (core.shipments ほか)・取得の回の表 (ops.ingest_runs) の select は渡さない (送り状番号などまで読めてしまう)。関数が無い DB (0083 の前) では付けない (流し直すと付く)
+ */
+export const MOVEMENT_FUNCTIONS = Object.freeze(['ops.sku_stock_anchors(bigint, date)', 'ops.sku_shipment_totals(bigint, timestamp with time zone[])',
+  'ops.sku_movement_shipments(bigint, timestamp with time zone, timestamp with time zone, integer)', 'ops.sku_shipments_monthly(bigint, date)']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -375,6 +382,9 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const t of LZ_BARCODE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...LZ_BARCODE_EDIT_FUNCTIONS, ...LZ_BARCODE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of LZ_BARCODE_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0083 仮 (入出庫の履歴・月別のまとめ): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (読むだけ)
+  for (const f of MOVEMENT_FUNCTIONS) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of MOVEMENT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、

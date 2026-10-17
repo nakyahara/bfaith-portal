@@ -1155,3 +1155,16 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .filecard { padding: 14px 12px; }
   .filecard .fmeta > span { min-width: 0; overflow-wrap: anywhere; }
 }
+
+/* ---------- 入出庫の履歴・月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・商品の画面の下) ---------- */
+.panel.moves { margin-top: 18px; min-width: 0; }
+.mv-head { margin-bottom: 10px; }
+.tbl.mv td, .tbl.mv th { padding: 8px 10px; font-size: 13.5px; }
+.tbl.mv .mv-when { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tbl.mv .mv-why { min-width: 220px; color: var(--text2); }
+.tbl.mv .sub { display: block; font-size: 11.5px; color: var(--muted); }
+.tbl.mv tr.mv-adj td { color: var(--muted); background: rgba(255, 200, 87, 0.035); }
+.tbl.mv tr.mv-adj td.n { color: var(--warn); }
+.mv-foot { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.mv-notes { margin-top: 8px; }
+.tbl.mv td:nth-child(2) { white-space: nowrap; }

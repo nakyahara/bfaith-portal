@@ -597,6 +597,35 @@
         </section>
       </aside>
     </form>
+    <%# 🆕 入出庫の履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・参考 = 読むだけ)。表は画面の JS (public/me-moves.js) が API から読んで描く。
+        単品だけ (セットには在庫が無い = 構成品の画面へ・Q10 = a)。仕入・発注は発注アプリの権限がある人だけ (Q9 = a) %>
+    <% if (c.sku_kind === 'single') { %>
+    <section class="panel moves" id="p-moves" aria-labelledby="h-moves" data-base="<%= base %>" data-code="<%= c.code %>" data-po="<%= poAccess ? '1' : '0' %>">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-truck"/></svg></span><h2 id="h-moves">入出庫の履歴</h2><span class="sub">参考 · 出荷 (NE の出荷確定)<%= poAccess ? '・仕入 (発注アプリの入荷)' : '' %> · 在庫数はロジザードの毎日の在庫で合わせています</span></div>
+      <div class="hint mv-head" id="mv-head" aria-live="polite">読んでいます…</div>
+      <div class="tblwrap"><table class="tbl mv" id="mv-tbl"><caption class="sr">入出庫の履歴 (新しい順)</caption>
+        <thead><tr><th scope="col">日時</th><th scope="col">処理</th><th scope="col" class="n">入庫</th><th scope="col" class="n">出庫</th><th scope="col" class="n">在庫数</th><th scope="col">伝票番号</th><th scope="col">店舗・仕入先</th><th scope="col">理由</th><th scope="col">担当者</th></tr></thead>
+        <tbody id="mv-rows"></tbody>
+      </table></div>
+      <div class="mv-foot"><button class="btn sm" type="button" id="mv-more" hidden>もっと前を見る</button><span class="hint" id="mv-msg" aria-live="polite"></span></div>
+      <div class="hint mv-notes">伝票番号: 出荷 = NE の伝票番号 / 仕入 = ロジザードの伝票NO (NE の仕入伝票の番号とは別) · 「<%= '在庫の調整 (ずれ)' %>」= ロジザードの毎日の在庫と、出荷<%= poAccess ? '・仕入' : '' %>の差 (NE の他勘定出庫・棚卸し・返品など。理由は分かりません) · 担当者 = 仕入の CSV を発注アプリに取り込んだ人 (倉庫で受けた人ではありません) · FBA のお客の注文は倉庫の在庫が動かないので入りません</div>
+    </section>
+    <section class="panel moves" id="p-monthly" aria-labelledby="h-monthly">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-yen"/></svg></span><h2 id="h-monthly">月別のまとめ</h2><span class="sub">参考 · 直近 13 か月 · 受注数 = NE の受注日 · 売上数 = 出荷確定日<%= poAccess ? ' · 仕入数 = 良品数 (入庫日) · 発注数 = 発行した数 (減数・取消は引かない)' : '' %></span></div>
+      <div class="hint" id="mo-head" aria-live="polite">読んでいます…</div>
+      <div class="tblwrap"><table class="tbl mv" id="mo-tbl"><caption class="sr">月別のまとめ</caption>
+        <thead><tr><th scope="col">月</th><th scope="col" class="n">受注数</th><th scope="col" class="n">売上数</th><% if (poAccess) { %><th scope="col" class="n">仕入数</th><th scope="col" class="n">発注数</th><% } %><th scope="col" class="n">受注金額</th><th scope="col" class="n">売上金額</th><% if (poAccess) { %><th scope="col" class="n">仕入金額</th><th scope="col" class="n">発注金額</th><% } %></tr></thead>
+        <tbody id="mo-rows"></tbody>
+      </table></div>
+      <div class="hint mv-notes">空欄 = データの無い月 (0 ではありません): 受注金額・売上金額はまだ出せません (NE の明細の金額を Company DB に送っていない)<%= poAccess ? ' · 仕入・発注は発注アプリを使い始めた 2026-07 から (それより前は NE だけで持っています)' : '' %></div>
+    </section>
+    <% } else if (isSet) { %>
+    <section class="panel moves" id="p-moves" aria-labelledby="h-moves">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-truck"/></svg></span><h2 id="h-moves">入出庫の履歴</h2></div>
+      <div class="hint" id="mv-set">セットには在庫がありません (在庫は構成品が持ちます)。入出庫の履歴は構成品の画面で見ます<% if (c.components.length) { %>:
+        <% c.components.forEach((x, i) => { %><%= i ? ' · ' : '' %><a class="code" href="<%= base %>/sku/<%= encodeURIComponent(x.code) %>"><%= x.code %></a><% }) %><% } %></div>
+    </section>
+    <% } %>
     <% if (typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %>
     <div class="modal-bg" id="gone-bg">
       <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="gone-t" aria-describedby="gone-d">
@@ -624,6 +653,8 @@
   <% if (page && typeof lzBarcode !== 'undefined' && lzBarcode && lzBarcode.show && !lzBarcode.error && lzBarcode.canWrite) { %><script src="<%= base %>/public/me-lzbarcode.js?v=<%= assetV %>" defer></script><% } %>
   <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 入出庫の履歴と月別のまとめ (単品だけ・読むだけ) %>
+  <% if (page && page.cur.sku_kind === 'single') { %><script src="<%= base %>/public/me-moves.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0070: NE から消えた (やめる) = 押せる人・押せるときだけ %>
   <% if (page && typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %><script src="<%= base %>/public/me-gone.js?v=<%= assetV %>" defer></script><% } %>
 </body>
