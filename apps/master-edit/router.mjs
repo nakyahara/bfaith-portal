@@ -92,7 +92,7 @@ import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
-import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf } from '../../lib/master-register-blanks.mjs';
+import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf, legacyRefsScreen, hasRequestRecord } from '../../lib/master-register-blanks.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
@@ -791,7 +791,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     entryClosed: gated || !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || VARIATION_KEYS.some((k) => own[k] !== 'company') || !lease.open
       || !writeConfigured() || !(page && page.backfillDone),
     entryWhy,
-    maxKids: VARIATION_MAX_CHILDREN,
+    maxKids: VARIATION_MAX_CHILDREN, maxRefs: MAX_REFERENCE_URLS,   // 🆕 2026-10-17: 参考 URL (単品の登録と同じ上限)
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     orderSettings: orderScreen(req, editorGate(req), null),
     orderNoneApplies,
@@ -876,7 +876,18 @@ router.post('/api/new/variation', (req, res) => {
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
   // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか。どちらでもない = 400 (何も書かない)・入力なしの一覧は理由に足す (lib/master-register-blanks.mjs)
   //   発注の設定の 6 つは、ここでは数えない (下 = その request_id の記録がまだ無いときだけ・要求のハッシュに入らない = #1706 Codex R2 M)
-  const pre = prepareRegisterBody('variation', req.body || {});
+  let pre = prepareRegisterBody('variation', req.body || {});
+  // 🆕 2026-10-17 (#Codex R1 M3): 参考 URL の欄が無かった前の画面の本文 = 参考 URL を数えずに確かめ直しておき、下で request_id の記録があるとき
+  //   (前の画面で保存できた登録の押し直し = lib が前の答えを返す) だけ通す。記録が無い = 新しい登録 = 断る (画面を開き直してもらう)
+  let legacyRefs = null;
+  if (!pre.ok && pre.json.blank_key === 'card.reference_urls' && legacyRefsScreen('variation', req.body)) {
+    const alt = prepareRegisterBody('variation', req.body || {}, { skip: ['card.reference_urls'] });
+    if (alt.ok) {
+      legacyRefs = { status: pre.status, json: { ...pre.json, screen_outdated: true,
+        error: '「参考 URL」は、値を入れるか「入力なし」を選んでください (前の画面には参考 URL の欄がありません。画面を開き直してください)。何も保存していません' } };
+      pre = alt;
+    }
+  }
   if (!pre.ok) return res.status(pre.status).json(pre.json);
   const b = pre.body;
   const rid = String(b.request_id ?? '').trim().toLowerCase();
@@ -898,6 +909,8 @@ router.post('/api/new/variation', (req, res) => {
     }
   }
   return withPgApi(res, async (db) => withRequestLock(db, b.request_id, async () => {   // 🆕 #1719 R5: 同じ request_id は 1 つずつ (鍵の後に保存済みかを見る)
+    // 🆕 #Codex R1 M3: 前の画面の本文は、保存の記録がある (押し直し) ときだけ (鍵の後に見る)
+    if (legacyRefs && !(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid) && (await hasRequestRecord(db, rid)))) return res.status(legacyRefs.status).json(legacyRefs.json);
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ (子ごと) → commit の後に届ける。入る前 = 今までどおり ② をすぐ書く。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
