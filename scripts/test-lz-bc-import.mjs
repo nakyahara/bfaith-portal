@@ -148,7 +148,7 @@ console.log('ロジザードに取り込む (lz-bc-import)');
 // ───────────── 帳面の関数 (S) ─────────────
 const U = () => BC.openLzBcDb(':memory:');
 const H = (c) => crypto.createHash('sha256').update(String(c)).digest('hex');
-const base = (x = {}) => ({ requestId: crypto.randomUUID(), exportId: '7', exportState: 'issued', fileSha256: H('f'), textSha256: H('t'), rows: 2, by: 'naka@test', now: jst('10:00'), ...x });
+const base = (x = {}) => ({ requestId: crypto.randomUUID(), exportId: '7', exportState: 'issued', fileSha256: H('f'), textSha256: H('t'), rows: 2, by: 'naka@test', now: jst('10:00'), exportCreatedMs: Date.now() + 1000, ...x });
 const alive = (u, t = jst('10:00')) => BC.touchRunner(u, { runnerId: 'pc', now: t });
 const err = (fn) => { try { fn(); } catch (e) { return e; } return null; };
 
@@ -191,6 +191,14 @@ await ta('[S1] 積む: miniPC・夜・取り消し・取込の状態・ほかの
   alive(u2, jst('10:04'));
   assert.equal(err(() => BC.enqueue(u2, base({ exportId: '12', now: jst('10:04') }))).code, 'downloaded');
   assert.equal(BC.enqueue(u2, base({ exportId: '12', now: jst('10:04'), confirmNotManual: true })).state, 'queued');
+  // ボタンができる前に作った CSV (ダウンロードの記録が無い)・作った時刻が分からない = 確かめが要る (Codex R3 High)
+  const u4 = U(); alive(u4);
+  for (const ms of [BC.startedAt(u4) - 1, NaN]) {
+    const e4 = err(() => BC.enqueue(u4, base({ exportCreatedMs: ms })));
+    assert.deepEqual([e4.code, e4.extra.legacy], ['downloaded', true], String(ms));
+  }
+  assert.equal(BC.enqueue(u4, base({ exportCreatedMs: BC.startedAt(u4) - 1, confirmNotManual: true })).state, 'queued');
+  assert.equal(BC.legacyExport(u4, BC.startedAt(u4)), false);
 });
 
 await ta('[S2] 状態: 取る → 押す → ① → ② = 取り込んだ / 件数違い・エラー = import_error / 押した後に分からない = unknown / 押す前 = not_executed / 食い違い = unknown', async () => {
@@ -450,6 +458,20 @@ await ta('[I2] 本物の流れ: 積む → 取る (帳面と同じ byte 列) →
   assert.deepEqual([r.status, r.j.reason], [409, 'already_imported']);
   r = await call('POST', `/api/lz-csv/${e.id}/void`, { reason: '試しの取り消し' });
   assert.deepEqual([r.status, r.j.reason], [409, 'imported'], '取り込んだ CSV は取り消さない');
+  // ボタンができる前に作った CSV = 画面の口でも確かめが要る (帳面を始めた時刻を先へずらして試す)
+  {
+    const L = await newExport(1);
+    const bdb = BC.getLzBcDb();
+    const saved = BC.startedAt(bdb);
+    bdb.prepare("update bc_meta set value = ? where key = 'started_at'").run(String(Date.now() + 3600e3));
+    try {
+      r = await call('POST', `/api/lz-csv/${L.id}/import`, importBody(L));
+      assert.deepEqual([r.status, r.j.reason, r.j.legacy], [409, 'downloaded', true], r.text);
+      const pg2 = await call('GET', '/lz-csv');
+      const d2 = JSON.parse(/<script type="application\/json" id="me-lzc">([\s\S]*?)<\/script>/.exec(pg2.text)[1].replace(/\\u003c/g, '<'));
+      assert.equal(d2.bc.byExport[L.id].legacy, true, '画面にも「前に作った」の印');
+    } finally { bdb.prepare("update bc_meta set value = ? where key = 'started_at'").run(String(saved)); }
+  }
   // ダウンロードした CSV = 「手で取り込んでいない」が要る
   const d = await fetch(`${ORIGIN}/apps/master-edit/lz-csv/${other.id}/file`);
   assert.equal(d.status, 200);
@@ -680,6 +702,21 @@ await ta('[R] miniPC の 1 回: 成功 / 押すを断られた = 押さない / 
   const big = 'あ'.repeat(40000);
   assert.ok(Buffer.byteLength(RUN.tailBytes(big, RUN.LOG_BYTES), 'utf8') <= RUN.LOG_BYTES + 40);
   assert.equal(RUN.tailBytes('短い', 100), '短い');
+  // 23:50 の手前で「押す」が通った = 押してよいのは 23:50 の 2 秒前まで (ポータルが押させない時間をまたがない。Codex R3 Medium)
+  {
+    NOW = jst('23:44');   // 積めるのは 23:45 の前
+    e = await newExport(1);
+    id = await queue(e);
+    NOW = jst('23:49');   // 渡す・押すのは 23:50 の前
+    let local = jst('23:49') + 50e3;   // この PC の時計 23:49:50
+    let first = null;
+    out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit, now: () => local,
+      session: async (o) => { await o.beforeExecute(); first = o.pressGuard('①の実行ボタンの前'); local += 9e3; o.pressGuard('①の確認の OK の前'); } });
+    assert.ok(first > 0 && first <= 8000, String(first));
+    assert.match(jobRow(id).detail, /押してよい間を過ぎた/);
+    assert.deepEqual([RUN.msUntilNightBusy(jst('23:49')), RUN.msUntilNightBusy(jst('23:50')), RUN.msUntilNightBusy(jst('01:30'))], [60e3, 0, (22 * 60 + 20) * 60e3]);
+    NOW = jst('13:30');
+  }
   // 夜・セッションの鍵 (この PC の印)
   assert.deepEqual(['23:49', '23:50', '00:20', '01:29', '01:30'].map((t) => RUN.nightBusy(jst(t))), [false, true, true, true, false]);
   // ほかの定時の前後 (毎時 00 分の在庫・08:30 の値札は鍵があると待たずに終わる)

@@ -40,6 +40,13 @@ export function nightBusy(now = Date.now()) {
   const m = d.getUTCHours() * 60 + d.getUTCMinutes();
   return m >= 23 * 60 + 50 || m < 90;
 }
+/** 次の 23:50 (JST・押さない時間の始まり) までの ms。もう押さない時間 = 0 */
+export function msUntilNightBusy(now = Date.now()) {
+  if (nightBusy(now)) return 0;
+  const DAY = 24 * 3600e3;
+  const msOfDay = ((now + 9 * 3600e3) % DAY + DAY) % DAY;
+  return (23 * 60 + 50) * 60e3 - msOfDay;
+}
 
 /**
  * ほかの定時の前後は取らない (JST): 毎時 :50〜:02 (在庫の毎時の取込 auto-zaiko.js・1 回 = 長くて 5 分ほどなので 00 分にかからないように)・08:26〜08:34 (値札の CSV 08:30)。
@@ -179,7 +186,8 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
   let pressUntil = null;
   const pressGuard = (where) => {
     if (pressUntil == null) return 30000;
-    const left = pressUntil - now();
+    // 押してよい間と 23:50 (ポータルが押させない時間の始まり) の早い方まで (Codex R3 Medium)
+    const left = Math.min(pressUntil - now(), msUntilNightBusy(now()) - 2000);
     if (left <= 0) { const e = new Error(`${where}: 「押す」から押してよい間を過ぎた (押さない)`); e.pressStop = true; throw e; }
     return left;
   };

@@ -133,6 +133,10 @@ export function openLzBcDb(file = path.join(process.env.DATA_DIR || path.join(pr
       at        INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS ix_bc_downloads_export ON bc_downloads (export_id);
+    CREATE TABLE IF NOT EXISTS bc_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS bc_void_holds (
       export_id TEXT PRIMARY KEY,
       by        TEXT NOT NULL,
@@ -140,7 +144,18 @@ export function openLzBcDb(file = path.join(process.env.DATA_DIR || path.join(pr
       until     INTEGER NOT NULL
     );
   `);
+  // 帳面を始めた時刻 (これより前に作った CSV はダウンロードの記録が無い = 手で取り込んだか分からない。Codex R3 High)
+  db.prepare("INSERT OR IGNORE INTO bc_meta (key, value) VALUES ('started_at', ?)").run(String(Date.now()));
   return db;
+}
+/** 帳面を始めた時刻 (ms) */
+export function startedAt(db) {
+  const r = db.prepare("SELECT value FROM bc_meta WHERE key = 'started_at'").get();
+  return r ? Number(r.value) : 0;
+}
+/** ダウンロードの記録が当てにならない CSV か (帳面を始める前に作った・作った時刻が分からない) */
+export function legacyExport(db, createdMs) {
+  return !Number.isFinite(createdMs) || createdMs < startedAt(db);
 }
 
 let shared = null;
@@ -228,7 +243,7 @@ export function exportImportState(db, exportId) {
  * 画面のボタン = 積む。呼び手 (画面の口) が Company DB の帳面を読んだ答え (exportState・fileSha256・textSha256・rows) と
  * ロジザードの取込の状態の止め (importBlock = null か { code, message }) を渡す。
  */
-export function enqueue(db, { requestId, exportId, exportState, fileSha256, textSha256, seenTextSha256 = null, rows, withExport = true, by, rerunReason = null, confirmNotManual = false, importBlock = null, now }) {
+export function enqueue(db, { requestId, exportId, exportState, fileSha256, textSha256, seenTextSha256 = null, rows, withExport = true, by, rerunReason = null, confirmNotManual = false, importBlock = null, exportCreatedMs = NaN, now }) {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(requestId || ''))) fail('invalid_input', '押した番号 (request_id) の形が違います。画面を開き直してください', 400);
   if (!/^[1-9]\d{0,17}$/.test(String(exportId || ''))) fail('not_found', 'ファイルがありません', 404);
   if (!by) fail('invalid_input', '誰が押したか分かりません', 400);
@@ -257,6 +272,7 @@ export function enqueue(db, { requestId, exportId, exportState, fileSha256, text
       if (rerunReason == null || rerunReason === '') fail('already_imported', `この CSV はもう取り込みました (#${st.imported.job_id})。もう一度取り込むときは理由を書いてください (ロジザードに 2 回登録されることがあります)`, 409, { job_id: st.imported.job_id });
       reason = checkText(rerunReason, 'もう一度取り込む理由');
     } else if (rerunReason != null && rerunReason !== '') reason = checkText(rerunReason, 'もう一度取り込む理由');
+    if (legacyExport(db, exportCreatedMs) && confirmNotManual !== true) fail('downloaded', 'この CSV はボタンができる前に作ったので、ダウンロードして手で取り込んだかポータルでは分かりません。手でロジザードに取り込んでいないことを確かめてから、印を付けて押してください (2 回取り込まない)', 409, { legacy: true });
     if (st.downloads.n > 0 && confirmNotManual !== true) fail('downloaded', 'この CSV はダウンロードされています。手でロジザードに取り込んでいないことを確かめてから、印を付けて押してください (2 回取り込まない)', 409, { downloads: st.downloads.n });
     const info = db.prepare(`INSERT INTO bc_jobs (request_id, export_id, file_sha256, text_sha256, rows, with_export, requested_by, requested_at, rerun_reason, confirm_not_manual, state)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`).run(requestId, String(exportId), fileSha256, textSha256, rows, withExport ? 1 : 0, by, now, reason, confirmNotManual === true ? 1 : 0);
@@ -544,7 +560,7 @@ export function screenStatus(db, { now, exportIds = [] }) {
     };
   }
   return {
-    now, night: nightOf(now), runner: runnerView(db, now),
+    now, started_at: startedAt(db), night: nightOf(now), runner: runnerView(db, now),
     active: jobView(active, { withLog: true }),
     latest: jobView(recent[0] || null, { withLog: true }),
     recent: recent.map((j) => jobView(j)), byExport,

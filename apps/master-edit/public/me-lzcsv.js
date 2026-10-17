@@ -79,6 +79,9 @@
   var P = JSON.parse(dataEl.textContent || 'null');
   if (!P || !P.bc) return;
   var S = P.bc, BLOCK = P.importBlock || null, CAN = !!P.canImport;
+  // ボタンができる前に作った CSV (ダウンロードの記録が無い = 手で取り込んだか分からない)。最初の値だけが持つ = 読み直しでも保つ
+  var LEGACY = {};
+  Object.keys(S.byExport || {}).forEach(function (id) { if (S.byExport[id] && S.byExport[id].legacy) LEGACY[id] = true; });
   var forms = {};   // CSV ごとの開いている確かめ (押し直しの request_id を保つ)
   var timer = null, sending = false;
   var ACTIVE = { queued: 1, claimed: 1, executing: 1, exporting: 1 };
@@ -164,7 +167,8 @@
     var f = forms[e.id];
     if (old) return;   // もう出ている (読み直しで消さない = 打った理由を保つ)
     var again = !!(s && s.imported_job);
-    var dl = s && s.downloads > 0;
+    var legacy = !!LEGACY[e.id];
+    var dl = (s && s.downloads > 0) || legacy;
     var withExp = el('input', { type: 'checkbox', checked: true, id: 'bc-exp-' + e.id });
     var notManual = dl ? el('input', { type: 'checkbox', id: 'bc-nm-' + e.id }) : null;
     var reason = again ? el('textarea', { rows: '2', maxlength: '200', id: 'bc-rr-' + e.id, placeholder: '例: ロジザードで商品を消したので入れ直す (4〜200 字)', style: 'width:100%' }) : null;
@@ -175,7 +179,7 @@
       el('div', { cls: 't', text: 'CSV #' + e.id + ' (' + e.rows + ' 件) を miniPC がロジザードに取り込みます' }),
       el('div', { cls: 'hint', text: '① インポート [商品マスタ / 新商品バーコード登録] にこの CSV そのもの (帳面のファイル・sha256 を確かめる) → ② (印があれば) バーコード情報を書き出してバーコードマスタ.csv を上書き。1〜2 分かかります。' }),
       el('label', null, [withExp, ' ② バーコードマスタ.csv も書き出す']),
-      notManual ? el('div', null, [el('label', null, [notManual, ' この CSV はダウンロードされています。手でロジザードに取り込んでいないことを確かめた'])]) : null,
+      notManual ? el('div', null, [el('label', null, [notManual, legacy && !(s && s.downloads > 0) ? ' この CSV はボタンができる前に作りました (ダウンロードしたかポータルでは分からない)。手でロジザードに取り込んでいないことを確かめた' : ' この CSV はダウンロードされています。手でロジザードに取り込んでいないことを確かめた'])]) : null,
       again ? el('div', null, [el('div', { cls: 'hint', text: 'この CSV はもう取り込みました (#' + s.imported_job + ')。もう一度取り込むとロジザードに 2 回登録されることがあります。理由:' }), reason]) : null,
       el('div', { style: 'margin-top:6px' }, [go, ' ', stop]), line,
     ])]);

@@ -1521,7 +1521,15 @@ router.get('/lz-csv', (req, res) => withPgPage(req, res, async (db, dbError) => 
   const ig = lzImportGate(req);
   // 🆕「ロジザードに取り込む」の様子 (帳面 = Render の SQLite。読めない = ボタンを出さず理由を出す)
   let bc = null, bcError = null;
-  try { bc = BC.screenStatus(BC.getLzBcDb(), { now: bcClock(), exportIds: exports.map((e) => e.id) }); } catch (e) { console.error(`[master-edit] 取り込みの帳面を読めない: ${e && e.message}`); bcError = '取り込みの帳面 (Render の lz-bc-import.db) を読めません'; }
+  // ボタンができる前に作った CSV = ダウンロードの記録が無い = 押すときに「手で取り込んでいない」の確かめを求める (Codex R3 High)
+  const createdMs = new Map();
+  if (db && exports.length) {
+    try { for (const x of (await db.query('select export_id::text as id, (extract(epoch from created_at) * 1000)::float8 as ms from ops.lz_new_exports where export_id = any($1::bigint[])', [exports.map((e) => e.id)])).rows) createdMs.set(x.id, Number(x.ms)); } catch (e) { console.error(`[master-edit] CSV の作った時刻を読めない: ${e && e.message}`); }
+  }
+  try {
+    bc = BC.screenStatus(BC.getLzBcDb(), { now: bcClock(), exportIds: exports.map((e) => e.id) });
+    for (const e of exports) if (bc.byExport[e.id]) bc.byExport[e.id].legacy = BC.legacyExport(BC.getLzBcDb(), createdMs.get(e.id));
+  } catch (e) { console.error(`[master-edit] 取り込みの帳面を読めない: ${e && e.message}`); bcError = '取り込みの帳面 (Render の lz-bc-import.db) を読めません'; }
   res.render(view('lz-csv.ejs'), {
     ...pageLocals(req, phase), nav: 'lzcsv', ui2: true, dbError, cands, exports, canApprove: gate.ok, approveMessage: gate.message || '',
     mirror: { ok: mirror.ok, reason: mirror.reason, list_as_of: mirror.list_as_of, bc_as_of: mirror.bc_as_of, rows: mirror.rows, stale: mirror.ok && lzListStale(mirror, clock()) },
@@ -1628,10 +1636,11 @@ router.post('/api/lz-csv/:id/import', (req, res) => {
     // ファイルは Company DB の帳面のものだけ (画面から中身は受け取らない)。byte 列の sha256 を積む = miniPC に渡すときにもう一度照らす
     const f = await lzNewExportFile(db, req.params.id);
     if (!f) return res.status(404).json({ ok: false, error: 'ファイルがありません', reason: 'not_found' });
-    const rows = (await db.query('select row_count from ops.lz_new_exports where export_id = $1', [f.id])).rows[0]?.row_count;
+    const meta = (await db.query('select row_count, (extract(epoch from created_at) * 1000)::float8 as created_ms from ops.lz_new_exports where export_id = $1', [f.id])).rows[0] || {};
+    const rows = meta.row_count;
     try {
       const r = BC.enqueue(BC.getLzBcDb(), {
-        requestId: rid, exportId: f.id, exportState: f.state, fileSha256: f.file_sha256, textSha256: f.text_sha256, seenTextSha256: String(b.text_sha256), rows: Number(rows),
+        requestId: rid, exportId: f.id, exportState: f.state, fileSha256: f.file_sha256, textSha256: f.text_sha256, seenTextSha256: String(b.text_sha256), rows: Number(rows), exportCreatedMs: Number(meta.created_ms),
         withExport: b.with_export !== false, by: String(req.session.email).trim().toLowerCase(), rerunReason: b.rerun_reason ?? null, confirmNotManual: b.confirm_not_manual === true,
         importBlock: lzBcImportBlock(bcClock()), now: bcClock(),
       });
