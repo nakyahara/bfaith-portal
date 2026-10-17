@@ -48,24 +48,34 @@ await pg.query(`insert into core.sku_components (company_id, parent_sku_id, chil
 // NE (今の本番の形): nametag30 / 50 / 99 は NE ではセット
 const NE_SETS = [['nametag30', 'ボトルキープ ネームタグ 【10枚】3個セット', 'nametag10', 3, 980], ['nametag50', 'ボトルキープ ネームタグ 【10枚】5個セット', 'nametag10', 5, 1480],
   ['nametag99', 'ネームタグ 2個', 'nametag10', 2, 600], ['nametag70', 'ネームタグ 7個', 'nametag10', 7, 1980], ['giftbox', 'ギフトボックス', 'nametag99', 1, 2980]];
-/** 夜間ロードの材料 (NE の形)。sets = NE でセットのコード */
-function nePlan(sets = NE_SETS) {
+/** 夜間ロードの plan (材料の形)。sets = 材料でセットのコード (構成あり) */
+function nePlan(sets) {
   const p = basePlan(extra);
   const setCodes = new Set(sets.map((x) => x[0]));
   p.skus = p.skus.map((s) => (setCodes.has(s.code) ? { ...s, kind: 'set', name: sets.find((x) => x[0] === s.code)[1] } : s));
   p.setComponents = sets.map(([parent, , child, qty]) => ({ parentCode: parent, childCode: child, qty, source: 'ne' }));
   return p;
 }
-/** 夜間ロードが読んだ構成の材料 (世代と miniPC の DATA_DIR の控え = 本番の sync-to-render と同じ形)。matSets = 材料のセット (既定 = NE と同じ) */
-function withMaterial(plan, matSets = NE_SETS) {
+/**
+ * 材料 = 作り直し (apps/warehouse/rebuild-m-products.js) の形: 区分の持ち主が company = 社内の区分の写しを重ねる
+ *   (NE はセット・社内は単品 = 材料は「単品・構成なし」= 10/17 の本番の dry-run で分かった形)。matOf(社内でセットのコード) = 材料のセットの行
+ */
+const matOf = (cdbSets) => NE_SETS.filter((x) => cdbSets.includes(x[0]));
+const MAT_BEFORE = matOf(['giftbox']);
+/** 夜間ロードが読んだ材料 (世代と miniPC の DATA_DIR の控え = 本番の sync-to-render と同じ形)。plan も同じ材料から */
+function withMaterial(plan, matSets) {
+  const setCodes = new Set(matSets.map((x) => x[0]));
   const set_components = matSets.map(([parent, , child, qty]) => ({ セット商品コード: parent, 構成商品コード: child, 数量: qty }));
-  const products = [{ product_id: 1, 商品コード: 'x' }];
+  const products = plan.skus.map((x, i) => ({ product_id: i + 1, 商品コード: x.code, 商品区分: setCodes.has(x.code) ? 'セット' : '単品' }));
   const g = ML.buildMaterialGeneration({ products, set_components, now: new Date() });
   ML.saveMaterialSnapshot({ dataDir: tmp, generation: g, products, set_components });
-  plan.material = { set_components: { status: 'matched', content_hash: g.set_components.content_hash, row_count: g.set_components.row_count, generation: { generation_id: g.generation_id, created_at: g.created_at } } };
+  const m = (e) => ({ status: 'matched', content_hash: g[e].content_hash, row_count: g[e].row_count, generation: { generation_id: g.generation_id, created_at: g.created_at } });
+  plan.material = { products: m('products'), set_components: m('set_components') };
   return plan;
 }
-const nightly = async (runId, plan = withMaterial(nePlan())) => { const r = await runInitialLoad(db, plan, { log: quiet, runId, ownership: MASTER_OWNERSHIP }); assert.equal(r.ok, true, r.error); return r; };
+const nightly = async (runId, matSets = MAT_BEFORE) => {
+  const r = await runInitialLoad(db, withMaterial(nePlan(matSets), matSets), { log: quiet, runId, ownership: MASTER_OWNERSHIP }); assert.equal(r.ok, true, r.error); return r;
+};
 
 // ── miniPC の warehouse.db の NE の完全な取得 (照合 ② が読む形・test-master-compare-ne.mjs の setNe と同じ書き方) ──
 const J = (v) => JSON.stringify(v);
@@ -101,9 +111,9 @@ const run = (o, ne, extraOpts = {}) => X.runKind(db, o, { ne, log: quiet, ...ext
 const counts = async () => one(`select (select count(*)::int from core.skus where sku_kind = 'set') as sets, (select count(*)::int from core.sku_components) as comps,
   (select count(*)::int from core.sku_costs) as costs, (select count(*)::int from events.master_change_events) as events, (select count(*)::int from core.products) as products`);
 
-// 夜間ロード (10/16 の朝の形 = NE はセット・社内は単品 → sku_kind_held を記録するだけ)
+// 夜間ロード (10/17 の本番の形 = NE はセット・社内は単品・材料は社内の区分の写し = 単品・構成なし)
 const before = await nightly('load_kind_1');
-assert.deepEqual(before.conflicts.filter((c) => c.kind === 'sku_kind_held').map((c) => c.code).sort(), ['nametag30', 'nametag50', 'nametag70', 'nametag99']);
+assert.deepEqual(before.conflicts.filter((c) => c.kind === 'sku_kind_held').map((c) => c.code), []);   // 材料は社内の区分の写し = 区分のずれは記録されない (本番の 10/17 と同じ)
 
 await ta('[1] 引数: --code・--actor・--reason が要る・--apply は --expect-hash と --yes・同じコード 2 回は断る', async () => {
   assert.throws(() => X.parseKindArgs(['--actor', ACTOR, '--reason', 'x']), /--code/);
@@ -174,15 +184,21 @@ await ta('[4] apply = セット・product_id なし・NE の構成 (source ne)�
   assert.deepEqual(r99.estimate.now, ['nametag70', 'nametag99']);
 });
 
-await ta('[5] 次の夜間ロード (同じ NE の材料) = 直した 2 つは sku_kind_held に出ない・構成は「同じ」(行も作った人もそのまま)・判断の記録の kind_held も nametag70 / nametag99 だけ', async () => {
+await ta('[5] 次の夜間ロード: 材料がまだ単品 (写しの前) = sku_kind_held (材料 単品・社内 セット) を記録するだけで区分・構成・商品は変えない / 翌朝の写しの後の材料 (セット + 構成) = 何も記録しない・構成は「同じ」', async () => {
   const comps0 = await q(`select parent_sku_id::text, child_sku_id::text, qty, source, created_by_id from core.sku_components order by 1, 2`);
-  const r = await nightly('load_kind_2');
-  assert.deepEqual(r.conflicts.filter((c) => c.kind === 'sku_kind_held').map((c) => c.code).sort(), ['nametag70', 'nametag99']);
+  const p0 = (await counts()).products;
+  let r = await nightly('load_kind_2');   // 材料 = 直す前の写し (単品・構成なし)
+  assert.deepEqual(r.conflicts.filter((c) => c.kind === 'sku_kind_held').map((c) => [c.code, c.ne_kind, c.cdb_kind]).sort(), [['nametag30', 'single', 'set'], ['nametag50', 'single', 'set']]);
   assert.deepEqual(await q(`select parent_sku_id::text, child_sku_id::text, qty, source, created_by_id from core.sku_components order by 1, 2`), comps0);
-  const d = (await one(`select payload from ops.load_decisions where ingest_run_id = 'load_kind_2' and section = 'skus'`)).payload;
-  assert.deepEqual(d.kind_held.map((x) => x[0]).sort(), ['nametag70', 'nametag99']);
   const k = await q(`select code, sku_kind, product_id from core.skus where code in ('nametag30', 'nametag50') order by code`);
   assert.deepEqual(k.map((x) => [x.sku_kind, x.product_id]), [['set', null], ['set', null]]);
+  assert.equal((await counts()).products, p0);   // 単品の商品を作り直さない
+  assert.deepEqual((await one('select ops.sku_kind_shape_counts(1) as c')).c, { single_product_mismatch: 0, non_set_parent_components: 0 });
+  r = await nightly('load_kind_2b', matOf(['giftbox', 'nametag30', 'nametag50']));   // 翌朝の写し → 作り直しの後の材料
+  assert.deepEqual(r.conflicts.filter((c) => c.kind === 'sku_kind_held').map((c) => c.code), []);
+  assert.deepEqual(await q(`select parent_sku_id::text, child_sku_id::text, qty, source, created_by_id from core.sku_components order by 1, 2`), comps0);
+  const d = (await one(`select payload from ops.load_decisions where ingest_run_id = 'load_kind_2b' and section = 'skus'`)).payload;
+  assert.deepEqual(d.kind_held, []);
   assert.deepEqual((await one('select ops.sku_kind_shape_counts(1) as c')).c, { single_product_mismatch: 0, non_set_parent_components: 0 });
 });
 
@@ -194,7 +210,6 @@ await ta('[6] 断る: ほかのセットの構成品 (nametag99)・まとまり�
   r = await run(opts(['ws100-BR']), ne);
   assert.match(r.problems.join(' '), /まとまり \(色違い\) の子/);
   assert.match(r.problems.join(' '), /NE の取得でセットでない/);
-  assert.match(r.problems.join(' '), /最新の夜間ロード .*と記録していない/);
   // NE の取得が 40 時間前
   r = await run(opts(['nametag99']), await neNow({ at: new Date(Date.now() - 40 * 3600e3) }));
   assert.match(r.problems.join(' '), /36 時間より古い/);
@@ -235,16 +250,16 @@ await ta('[8] (Codex R1 Medium) commit の答えが分からないとき = SKU �
 
 await ta('[8b] (Codex R2) 夜間ロードの材料の構成の数量が NE の取得と違う = 断る・構成品に今回セットにするコードがある (入れ子) = 断る・材料の控えが無い = 断る', async () => {
   // 材料の nametag70 = nametag10 × 6 (NE の取得は × 7)
-  await nightly('load_kind_qty', withMaterial(nePlan(), NE_SETS.map((x) => (x[0] === 'nametag70' ? [x[0], x[1], x[2], 6, x[4]] : x))));
+  await nightly('load_kind_qty', [...MAT_BEFORE, ['nametag70', 'ネームタグ 7個', 'nametag10', 6, 1980]]);   // 写しを重ねない材料の形 (セット) で数量だけ違う
   await pg.query(`update core.sku_costs set valid_to = null where sku_id = $1 and valid_to is not null and valid_to >= (now() at time zone 'Asia/Tokyo')::date`, [await id('nametag70')]);   // [7] の閉じた行を戻す
   let r = await run(opts(['nametag70']), await neNow());
-  assert.match(r.problems.join(' '), /夜間ロードの材料の構成 \(nametag10 × 6\) と NE の取得の構成 \(nametag10 × 7\) が違う/);
+  assert.match(r.problems.join(' '), /受け入れる形でない \(材料の商品区分 セット・材料の構成 nametag10 × 6・NE の取得の構成 nametag10 × 7・判断の記録 set \/ single\)/);
   assert.equal(r.problems.length, 1, r.problems.join('\n'));
-  await nightly('load_kind_qty2');   // 材料 = NE と同じ
+  await nightly('load_kind_qty2', [...MAT_BEFORE, ['nametag70', 'ネームタグ 7個', 'nametag10', 7, 1980]]);   // 材料 = セット・NE と同じ (形 B)
   assert.deepEqual((await run(opts(['nametag70']), await neNow())).problems, []);
   // 入れ子: NE で nametag70 の構成品が nametag99 (どちらも今回セットにする)
   const nest = NE_SETS.map((x) => (x[0] === 'nametag70' ? [x[0], x[1], 'nametag99', 1, x[4]] : x));
-  await nightly('load_kind_nest', withMaterial(nePlan(nest), nest));
+  await nightly('load_kind_nest');
   r = await run(opts(['nametag70', 'nametag99']), await neNow({ sets: nest }));
   assert.match(r.problems.join(' '), /構成品 nametag99 も今回セットにする/);
   // 材料の控えが DATA_DIR に無い
@@ -258,7 +273,7 @@ await ta('[8b] (Codex R2) 夜間ロードの材料の構成の数量が NE の�
 });
 
 await ta('[9] (Codex R1 Medium) 構成の持ち主が load なのに最新の夜間ロードの構成の判断の記録が持ち主 company の形 = 断る (夜間ロードの材料の構成と照らせない)', async () => {
-  const r0 = await runInitialLoad(db, withMaterial(nePlan()), { log: quiet, runId: 'load_kind_3', ownership: { ...MASTER_OWNERSHIP, sku_components: 'company' } });
+  const r0 = await runInitialLoad(db, withMaterial(nePlan(MAT_BEFORE), MAT_BEFORE), { log: quiet, runId: 'load_kind_3', ownership: { ...MASTER_OWNERSHIP, sku_components: 'company' } });
   assert.equal(r0.ok, true, r0.error);
   const r = await run(opts(['nametag70']), await neNow());
   assert.match(r.problems.join(' '), /構成の判断の記録 \(set_components\) が無い \/ 形が違う/);
