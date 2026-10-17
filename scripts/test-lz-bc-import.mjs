@@ -1085,6 +1085,13 @@ await ta('[X] ボタンの回が押した後 (executing / exporting) は、別�
       assert.throws(() => BC.startedAt(okDb), /始めた時刻/, `開いている接続でも: ${v}`);
       alive(okDb, NOW);
       assert.throws(() => BC.enqueue(okDb, base({ now: NOW })), /始めた時刻/, `積めない: ${v}`);
+      assert.throws(() => BC.enqueue(okDb, base({ now: NOW, exportCreatedMs: NaN, confirmNotManual: true })), /始めた時刻/, `作った時刻が分からない + 確かめでも積めない: ${v} (Codex R10)`);
+      // 開いている接続 (shared) のまま壊れた = 手の取込は始めない (Codex R10)
+      BC.__setLzBcDb(okDb);
+      assert.match(String(BC.bcPressInProgress(NOW).error), /始めた時刻/, `開いた後に壊れた: ${v}`);
+      r = await openManual();
+      assert.deepEqual([r.status, r.j.error], [503, 'bc_state_unreadable'], `開いた後に壊れた: ${v}`);
+      BC.__setLzBcDb(null);
       okDb.close();
       assert.match(String(BC.bcPressInProgress(NOW).error), /始めた時刻/, v);
       assert.throws(() => BC.openLzBcDb(f), /始めた時刻/, v);
