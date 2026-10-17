@@ -42,7 +42,9 @@
   function say(t, cls) { if (!msgEl) return; msgEl.className = 'fmsg' + (cls ? ' ' + cls : ''); msgEl.textContent = t || ''; }
   function recount() { if (typeof ME.recount === 'function') ME.recount(); }
   /** 値を決める (m = { id, name } / null = なし)。keepText = 打った名前を残す (選んだのをやめただけ) */
+  var gen = 0;   // 選んでいる値を変えた回数 (名簿に足す返事を待つ間に人が選び直したかを見る・#maker Codex R2)
   function setVal(m, keepText) {
+    gen++;
     picked = m || null;
     if (!keepText) inp.value = m ? m.name : '';
     var v = m ? String(m.id) : '';
@@ -151,8 +153,12 @@
     if (!window.confirm(ask)) { say('登録しませんでした', ''); return; }
     var k = norm(name);
     if (!lastReq || lastReq.k !== k) lastReq = { k: k, id: uuid() };
+    // 待つ間は前に選んでいたメーカーを使わない (隠した欄を空に = 保存も「あと N つ」も止まる・#maker Codex R2 M)
+    setVal(null, true); inp.value = name;
+    var my = gen;
     busy = true; say('登録しています…', 'info');
     if (sameBtn) sameBtn.disabled = true;
+    recount();
     fetch(BASE + '/api/makers', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ request_id: lastReq.id, name: name }) })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
@@ -160,10 +166,12 @@
         lastReq = null;   // 返事が来た = 次は新しい番号
         if (!x.r.ok || !x.j.ok || !x.j.maker) { say(x.j.error || ('登録できませんでした (HTTP ' + x.r.status + ')'), 'err'); return; }
         var m = add(x.j.maker);
+        // 待つ間に人が選び直した (入力なし・別のメーカー・打ち直し・まとまりの選び直し) = 名簿に足しただけで選ばない (後から選んだ値を上書きしない・#maker Codex R2 M)
+        if (gen !== my || clean(inp.value) !== name) { say('「' + m.name + '」を名簿に登録しました (待つ間に選び直したので、この欄には入れていません)', 'info'); recount(); return; }
         setVal(m);
         say(x.j.existed ? '名簿にもうある「' + m.name + '」を選びました (同じ名前と見なしました)' : '「' + m.name + '」を名簿に登録して選びました', 'ok');
       })
-      .catch(function () { busy = false; if (sameBtn) sameBtn.disabled = false; say('通信できませんでした。もう一度押してください (同じ名前は 2 つ登録されません)', 'err'); });
+      .catch(function () { busy = false; if (sameBtn) sameBtn.disabled = false; recount(); say('通信できませんでした。もう一度押してください (同じ名前は 2 つ登録されません)', 'err'); });
   }
 
   /* ---------- 仕入先と同じ ---------- */
@@ -210,7 +218,7 @@
     inp.addEventListener('focus', function () { if (clean(inp.value) && !picked) render(); });
     inp.addEventListener('blur', function () {
       setTimeout(function () {
-        if (document.activeElement === inp) return;
+        if (document.activeElement === inp || busy) return;   // 名簿に足す返事を待つ間 (「仕入先と同じ」を押した) = 一言を上書きしない
         close();
         if (clean(inp.value) && !picked) { say('一覧から選ぶか「新しいメーカーとして登録」を押してください (選ぶまでメーカーは入りません)', 'warn'); inp.setAttribute('aria-invalid', 'true'); }
         else if (!clean(inp.value) && inp.value) inp.value = '';
@@ -224,19 +232,24 @@
   hid.addEventListener('change', function () { if (!hid.value && picked) { picked = null; inp.value = ''; close(); recount(); } });
   document.addEventListener('change', function (e) {
     var t = e.target;
-    if (t && t.matches && t.matches('input[type="checkbox"][data-none="maker"]') && t.checked) { picked = null; inp.value = ''; close(); say(''); inp.setAttribute('aria-invalid', 'false'); }
+    if (t && t.matches && t.matches('input[type="checkbox"][data-none="maker"]') && t.checked) { gen++; picked = null; inp.value = ''; close(); say(''); inp.setAttribute('aria-invalid', 'false'); }
   });
 
   ME.maker = {
     /** 名簿の番号 → 名前 (空 = なし) */
     label: function (id) { if (!id) return 'なし'; var m = byId(id); return m ? m.name : (picked && picked.id === String(id) ? picked.name : '(番号 ' + id + ')'); },
-    /** 番号で選ぶ (名簿にある番号だけ) */
-    set: function (id) { var m = byId(id); if (m) { setVal(m); say(''); } },
+    /** 番号で選ぶ。名簿に無い番号 (画面を開いた後にほかの人が足した) = 前の値を残さず空にして選び直してもらう (#maker Codex R2 M) */
+    set: function (id) {
+      var m = byId(id);
+      if (m) { setVal(m); say(''); return; }
+      setVal(null); close();
+      say('写すメーカー (番号 ' + id + ') は画面を開いた後に名簿に足されたので、ここでは出せません。打って選んでください (画面を開き直すと出ます)', 'warn');
+    },
     /** 隠した欄の値に名前の欄を合わせる (画面の「元に戻す」の後) */
     sync: function () { var m = byId(hid.value); picked = m; inp.value = m ? m.name : ''; close(); say(''); },
     value: function () { return hid.value; },
     /** 名前を打ったが一覧から選んでいない (= 保存しても入らない・商品の画面は保存を止める・#maker Codex R1) */
-    pending: function () { return !!clean(inp.value) && !picked; },
+    pending: function () { return busy || (!!clean(inp.value) && !picked); },
     /** メーカーを空にする (まとまりを選び直したとき) */
     clear: function () { setVal(null); say(''); close(); },
   };

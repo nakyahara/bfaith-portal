@@ -389,7 +389,7 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   const cfg = cfgOf(r.text);
   assert.deepEqual(cfg.columns.map((c) => c.id), want);
   assert.deepEqual(cfg.columns.filter((c) => c.fixed).map((c) => c.id), ['code']);
-  assert.deepEqual(cfg.columns.filter((c) => !c.sortable).map((c) => c.id), ['fba', 'sold', 'flags']);
+  assert.deepEqual(cfg.columns.filter((c) => !c.sortable).map((c) => c.id), ['fba', 'sold', 'flags', 'maker']);   // 🆕 0083: メーカーの列も並べられない
   assert.deepEqual(cfg.view, goodView(), '設定は全部の列 (注文残も) のまま渡す = 保存し直しで注文残の設定を消さない');
   assert.deepEqual(cfg.defaultView, { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] });
   assert.deepEqual([cfg.saved, cfg.readable, cfg.who], [true, true, '中原']);

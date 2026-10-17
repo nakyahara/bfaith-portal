@@ -315,6 +315,31 @@ await ta('②b まとまり: 今あるまとまりを選ぶ = 子のメーカー
   assert.equal(await p.inputValue('#f-maker-in'), '');
 });
 
+await ta('①c 名簿に足す返事を待つ間: 前に選んだメーカーを使わない (保存・あと N つは止まる)・待つ間に「入力なし」を押した = 返事が来ても上書きしない (#maker Codex R2 M)', async (p) => {
+  let release = null;
+  await p.route('**/api/makers', async (route) => { await new Promise((r) => { release = r; }); await route.continue(); });
+  p.on('dialog', (d) => d.accept());
+  await p.goto(B + '/new?kind=single');
+  await fillSingle(p, 'mkui-3');
+  await p.selectOption('#f-primary_supplier', '0001');   // AMC = 名簿に無い
+  await p.fill('#f-maker-in', '山田');
+  await p.keyboard.press('ArrowDown');
+  await p.keyboard.press('Enter');
+  assert.equal(await hid(p), YAMADA.id);
+  const n1 = await remain(p);
+  await p.click('#f-maker-same');
+  await p.waitForFunction(() => /登録しています/.test(document.getElementById('f-maker-msg').textContent), null, { timeout: 5000 }).catch(async (e) => { throw new Error(e.message + ' msg=' + await p.textContent('#f-maker-msg') + ' hid=' + await hid(p) + ' in=' + await p.inputValue('#f-maker-in')); });
+  assert.equal(await hid(p), '', '待つ間も前に選んだメーカー (山田) のまま');
+  assert.equal(await p.inputValue('#f-maker-in'), 'AMC');
+  assert.equal(await remain(p), n1 + 1, '待つ間は「あと N つ」に戻る');
+  await p.check('input[data-none="maker"]');
+  release();
+  await p.waitForFunction(() => /選び直したので/.test(document.getElementById('f-maker-msg').textContent));
+  assert.equal(await hid(p), '', '返事で「入力なし」を上書きした');
+  assert.equal(await p.isChecked('input[data-none="maker"]'), true);
+  assert.equal((await one("select count(*)::int as n from core.makers where name = 'AMC'")).n, 1, '名簿には足してある');
+});
+
 await ta('④ スマホの幅 (390): 横にはみ出さない・押す所は 44px・候補は画面の中', async (p) => {
   await p.goto(B + '/new?kind=single');
   const sw0 = await p.evaluate(() => document.documentElement.scrollWidth);

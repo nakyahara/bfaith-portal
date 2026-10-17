@@ -990,10 +990,10 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   assert.match(p.url(), /new\?kind=single$/);
   assert.equal(await dirty(p), 0);
   // 🆕 2026-10-13 (入力なし): 必須 8 + 必須でない 18 (原価・Amazon・公式ページ・発送方法・セット商品・発注の設定 6・入荷日の管理・参考 URL・Yahoo! 5) = 26
-  //   🆕 0080: + ロジザードのバーコード (必須 = 値か空欄) = 27
-  assert.match(await p.textContent('#remain'), /あと\s*27\s*つ/);
+  //   🆕 0080: + ロジザードのバーコード (必須 = 値か空欄) = 27 / 🆕 0083: + メーカー (値か入力なし) = 28
+  assert.match(await p.textContent('#remain'), /あと\s*28\s*つ/);
   assert.equal(await p.isDisabled('#save'), true);
-  assert.match(await p.textContent('#save'), /あと 27 つ: 商品コード/);
+  assert.match(await p.textContent('#save'), /あと 28 つ: 商品コード/);
   await p.fill('#reason', '理由だけ');
   assert.equal(await dirty(p), 0, '保存の理由は数えない');
   await p.click('#checklist button:has-text("税率")');
@@ -1018,25 +1018,25 @@ await ta('[35] 新商品の登録 (単品・10/5): あと N つ (① がそろ�
   await p.waitForSelector('#code-msg.ok');
   await p.fill('#f-name', 'UI 新商品 1');
   await p.fill('#f-standard_price', '1280');
-  assert.match(await p.textContent('#save'), /あと 24 つ: 税率/);
+  assert.match(await p.textContent('#save'), /あと 25 つ: 税率/);
   await p.click('#f-tax_rate button[data-v="0.08"]');
   // 2026-10-08 中原さん: 代表の仕入先は ① (必須)・発送方法は ③ (あとでも可) = 発送方法を選んでも保存できない
   await p.selectOption('#shipping', 'S02');
-  assert.match(await p.textContent('#save'), /あと 22 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 23 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true, '代表の仕入先が無い = 押せない');
   await p.selectOption('#f-primary_supplier', '0001');
   // 🆕 0061: 売上分類・推奨保有月数・ロジザードの有効期限の管理もそろうまで押せない
-  assert.match(await p.textContent('#save'), /あと 21 つ: 売上分類/);
+  assert.match(await p.textContent('#save'), /あと 22 つ: 売上分類/);
   assert.equal(await p.isDisabled('#save'), true);
   await fillReq(p);
   // 🆕 2026-10-13: 必須がそろっても、必須でない項目が「値」も「入力なし」も無いうちは押せない
-  assert.match(await p.textContent('#save'), /あと 17 つ: 原価/);
+  assert.match(await p.textContent('#save'), /あと 18 つ: 原価/);
   assert.equal(await p.isDisabled('#save'), true);
   // 出品カードを作らない = ③ と Yahoo! を数えない (product-hub につながない)
   await p.click('#card-create button[data-v="0"]');
   assert.equal(await p.isHidden('#card-fields'), true);
   assert.match(await p.textContent('#checklist'), /カードを作らない/);
-  assert.match(await p.textContent('#save'), /あと 8 つ: 原価/, 'カードを作らない = 原価・発注の設定 6・入荷日の管理');
+  assert.match(await p.textContent('#save'), /あと 9 つ: 原価/, 'カードを作らない = 原価・メーカー・発注の設定 6・入荷日の管理');
   // ② (NE 登録の CSV まで) も入れる・残りは入力なし
   await p.fill('#cost-jpy', '500');
   await noneRest(p);
@@ -1071,7 +1071,7 @@ await ta('[35b] 新商品の登録 (2026-10-08 中原さん): 発送方法を選
   await p.fill('#f-name', '発送方法なしの単品');
   await p.fill('#f-standard_price', '990');
   await p.click('#f-tax_rate button[data-v="0.1"]');
-  assert.match(await p.textContent('#save'), /あと 23 つ: 代表の仕入先/);
+  assert.match(await p.textContent('#save'), /あと 24 つ: 代表の仕入先/);
   assert.equal(await p.isDisabled('#save'), true);
   await p.selectOption('#f-primary_supplier', '0001');
   await fillReq(p);
@@ -1855,7 +1855,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);   // 前の試験の設定を消す
   await p.goto(B + '/?q=' + encodeURIComponent('単品'));
   assert.deepEqual(await shownHeads(p), LIST_DEFAULT.shown, 'いつもの列 (仕入先は出さない)');
-  assert.equal(await p.textContent('#colcnt'), '16/17');
+  assert.equal(await p.textContent('#colcnt'), '16/18');
   assert.equal(await p.isVisible('#list-tbl tbody tr:first-child .sup-sub'), true, '仕入先の列が無い = 名前の下に「仕入先」');
   // 板を開く: コードは外せない・↑↓ も押せない・FBA などは「並べられない」
   await p.click('#colbtn');
@@ -1884,7 +1884,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   // つまみで動かす (売価を名前の前へ)
   await p.dragAndDrop('#collist li[data-id="price"] .grip', '#collist li[data-id="name"]');
   assert.deepEqual((await shownHeads(p)).slice(0, 4), ['code', 'sup', 'price', 'name']);
-  assert.equal(await p.textContent('#colcnt'), '16/17');
+  assert.equal(await p.textContent('#colcnt'), '16/18');
   if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1280_cols.png` });
   // 保存 → 「未保存」が消える・別の窓 (= 別の PC。同じログイン) で開いても同じ列
   await p.click('#cp-save');
@@ -2428,7 +2428,7 @@ await ta('[64] 入力なし (単品・1440): 必須がそろっても押せな�
   await p.goto(B + '/new?kind=single');
   await fillSingleReq(p, 'ui-none-1');
   assert.equal(await p.isDisabled('#save'), true, '必須だけでは押せない');
-  assert.match(await p.textContent('#save'), /あと 18 つ: 原価/);
+  assert.match(await p.textContent('#save'), /あと 19 つ: 原価/);
   assert.match(await p.textContent('#checklist'), /④ そのほかの項目/);
   // 原価: 値を入れてから「入力なし」= 値を消す・印
   await p.fill('#cost-jpy', '300');

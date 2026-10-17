@@ -1240,11 +1240,12 @@
     if (d.act === 'next') return continueNext();
     if (d.act === 'again') { if (ME.replacePage) ME.replacePage(BASE + '/new?kind=variation'); else location.replace(BASE + '/new?kind=variation'); return; }
     if (S.done && !d.go && !d.stepnav && !d.filter && !d.open) return;
-    if (d.mode) { if (S.mode !== d.mode) { var keep = { gcode: S.gcode, gname: S.gname }; S = fresh(); S.mode = d.mode; if (d.mode === 'new') Object.assign(S, keep); else searchGroups(); full(); } return; }
+    // 🆕 0083 (#maker Codex R2 M): 種類を切り替える・選び直す = メーカーも空に (ほかの共通の欄 = S.common と同じく前のまとまりの値を持ち越さない)
+    if (d.mode) { if (S.mode !== d.mode) { var keep = { gcode: S.gcode, gname: S.gname }; S = fresh(); S.mode = d.mode; if (d.mode === 'new') Object.assign(S, keep); else searchGroups(); if (ME.maker) ME.maker.clear(); full(); } return; }
     if (d.pick) return pickGroup(d.pick);
     if (d.gotopick) { S.mode = 'add'; return pickGroup(d.gotopick); }
     if (d.act === 'rename') { if (S.pk && ME.vops) { var gid0 = S.pk.id; ME.vops.openLabels(gid0, { onDone: function () { refreshGroup(gid0); } }); } return; }
-    if (d.act === 'repick') { S = fresh(); S.mode = 'add'; full(); searchGroups(); setTimeout(function () { $('#g-q').focus(); }, 0); return; }
+    if (d.act === 'repick') { S = fresh(); S.mode = 'add'; if (ME.maker) ME.maker.clear(); full(); searchGroups(); setTimeout(function () { $('#g-q').focus(); }, 0); return; }
     if (d.act === 'split') return doSplit();
     if (d.act === 'unsplit') return unSplit();
     if (d.act === 'janpaste') { S.janPaste = !S.janPaste; S.janMsg = ''; update(); if (S.janPaste) setTimeout(function () { var jp = $('#jan-paste'); if (jp) jp.focus(); }, 0); return; }

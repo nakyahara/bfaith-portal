@@ -216,7 +216,9 @@ begin
     if v_sess.session_id is null or v_sess.operation is distinct from 'sku_edit' or v_sess.sku_id is distinct from p_sku_id then
       raise exception 'master_write_session_required: 商品の画面のメーカーは、同じ取引でこの SKU の保存 (ops.begin_master_write) を始めた後だけ' using errcode = '42501';
     end if;
-  elsif not exists (select 1 from ops.master_write_sessions w where w.txid = pg_catalog.txid_current() and w.operation = 'sku_create' and w.sku_id = p_sku_id) then
+  -- 🆕 #maker Codex R2 M: 取引の番号だけでなく、約束の行がこの取引の中で作られたこと (created_at = 入れた時の clock_timestamp ≧ この取引の始まり now()) も見る
+  --   (バックアップから戻した DB で古い約束の行の取引の番号が今と重なっても、過去の登録を今の登録と見ない)
+  elsif not exists (select 1 from ops.master_write_sessions w where w.txid = pg_catalog.txid_current() and w.created_at >= pg_catalog.now() and w.operation = 'sku_create' and w.sku_id = p_sku_id) then
     raise exception 'master_write_session_required: 新商品のメーカーは、その SKU を登録した同じ取引の中だけ (ops.register_new_sku の後)' using errcode = '42501';
   end if;
   -- 鍵: SKU の鍵 → 商品の行 (商品の画面の保存・登録の取引はもう持っている = 同じ取引で取り直しても待たない)
