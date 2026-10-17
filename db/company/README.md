@@ -2726,6 +2726,32 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 試験 = `node scripts/test-master-widen.mjs` [15] (close は何もしない・72 時間) / `test-master-reg-csv.mjs` [V2]・[W1]・[W2] (ne_reg_issue の差・新しい回の印は結果の行の後だけ配る・置き換え・72 時間)・[V5] の後 (0082 を当てた時の許可の出し直し) / `test-new-entry-gate-step.mjs` (閉じるのは拒まれたときだけ) /
   `test-master-compare-ne.mjs` [39] (照合の始めに閉じない) / 本物の PG = `test-master-widen-pg.mjs` [18]・[18c] (朝の照合の間ずっと有効・照合の途中に保存できる・途中の新商品は snapshot に入らない・翌朝の照合の後まで有効・問題が出たらその場で閉じる)・[18d] (今朝の記録が落ちた = current_result_missing だけ・本物の毎朝の段は閉じない・0082 の 9. の出し直し)・`test-master-widen-locks-pg.mjs` [18]・[21] (close は鍵を取らない・照合の途中も配る / 登録 / 渡すが通る)
 
+### 今朝の NE の値・ロジザードの書き方 (0083 仮番号・AI_reference CompanyDB構想/25 v3 §2.5 の PR-1 = 影・画面なし。中原さんの決定 10/17 Q1〜Q6 = 全部 a)
+- **なぜ**: 「NE 更新の CSV」(設計 25・PR-2 / PR-3) は「今朝の NE の値 ≠ Company DB の今の値」の列を出し、翌朝「NE の値 = 期待の値」で届いたかを確かめる。今の Company DB には今朝の NE の値を全部の (商品・列) で持つ表が無い (候補の print と最後に一致した値 0033 だけ)。
+  大文字・小文字を直す行の「正しい書き方 = ロジザードの書き方」も、lz-daily のロジザードの全件を Company DB に残していなかった (Render の写し `lib/lz-mirror.mjs` はバーコードマスタ由来 = 書き方の正に使えない・設計 25 R1 H4)
+- **今朝の NE の値** `ops.master_ne_values` = (code_norm・列 → NE の区分 single / set・状態 ok / unknown (理由 = raw_unknown 記録なし・collided 正規化の衝突・int_blocked 取込の整合で保持) / invalid・値)。
+  列 = 単品 6 列 (名前・取扱・税率・売価・原価・代表の仕入先) / セット 2 列 (名前・売価)。値 = 照合の D2 の正規化 (`baseline.mjs` の `neValue` = 最後に一致した値と同じ・版 1)。値の形は CHECK (取扱 = active / discontinued / unknown・税率 = 0.1 / 0.08 / null・金額 = 正の数 / null・仕入先 = 0 か 1 つの配列)。
+  印 `ops.master_ne_values_mark` (1 行) と受け付けた回 `ops.master_ne_values_runs` (追記だけ) = 照合の回・単品とセットの取得の始め / 完了の時刻・通し番号・取得の件数 (`fetch_counts`)・取得の版・正規化の版・中身のハッシュ・`clean` (落とした行・重なりが無いか = DB が件数から決める)・書いたときの NE のコードの印の回 (`code_mark_run`)。
+  「今日の値」= 取得の始めの JST の日 (単品は単品・セットはセットの時刻。読む側 = PR-2)
+- **書く** `ops.record_ne_values(p)` (照合 ② = `apps/company-db/master-compare/run.mjs`・watch_writer・1 回 = 1 つの取引で全部を入れ替え)。照合 ② が最後まで走り、**NE のコードの書き方 (`record_ne_codes`) をこの回で書けた回だけ**呼ぶ (値と書き方を同じ回に結ぶ = 設計 25 R2 H3)。
+  受ける条件: 照合の回が `ops.master_compare_runs` にある (時刻はその表の値)・正規化の版 1・取得の版の形・取得の件数の式 (fetched = write_attempts + 落とした行・stored ≦ write_attempts)・照合が読んだ生の行 = stored_rows・
+  正規化した単位の数 = 生の行のコードの数 (単品 = 商品の表のコード − セットの表と重なるコード・セット = セットの表のコード)・どのコードも区分の列が全部そろう・空は断る・取得の完了が照合の回の 10 分より後 = 断る・
+  照合の回 / 取得の始め / 通し番号が今の印より古い = `stale_run` / `stale_fetch`・同じ取得の始めで通し番号が違う = `fetch_conflict`・同じ回の再送 = ハッシュが同じなら `unchanged` (違えば `run_conflict`)。同じ取得で新しい回 (同じ朝の 2 回目の照合) は受け付ける。
+  取得の件数 (`ne-fetch-counts.js`) が両方 ok で取得の版が同じ朝だけ作る (取得中の印・記録なし・版の違い = 作らない)。書けない・断られた・関数が無い (`not_applied`)・実行権が無い (`no_privilege`) = 全件 JSON と証跡の `ne.ne_values` に残すだけ (照合は失敗にしない・**要約は変えない**)
+- **ロジザードの書き方** `ops.master_lz_codes` = (code_norm → 状態 one / many / invalid・one のときだけ `lz_code`・書き方の一覧)。組み分けは **DB が `core.norm_code` で**する (送られた組み分けを信じない)。削除フラグの付いた ID も入る (同じ code_norm で 2 つ = many = 作らない)。
+  印 `ops.master_lz_codes_mark` と受け付けた書き出し `ops.master_lz_codes_runs` (追記だけ) = lz-daily の回・書き出しの時刻 (= auto-shohin-csv.js の保存 = 一覧のファイルの mtime。auto-shohin-csv.js は回の ID を持たない)・成功の印の時刻・CSV の sha256・行数
+- **書く** `ops.record_lz_codes(p)` (毎朝の lz-daily = `scripts/company-db/lz-daily.mjs`・watch_writer)。ロジザードの全件の一覧の確かめ (見出し・列の数・空の ID・重複・行数・半減) を全部通った **daily-sync の回だけ** (手の試し `--out-dir`・`--daily` なしは書かない)・書く接続 `COMPANY_DB_WATCH_WRITER_URL` があるときだけ。成功の印を読んだ後にも一覧のファイルが読んだときと同じ (mtime・sha256) か確かめ、違えば送らない (`skipped_lz_master_changed`・失敗した書き出しと後の書き出しの印を組み合わせない)。
+  受ける条件: 書き出しが今の印より前 = `stale_export`・同じ書き出しで中身が違う / 同じ lz-daily の回が別の書き出し = `run_conflict`・36 時間より前 = `stale_export`・未来は 5 分まで (`future_export`)・成功の印が書き出しの後 15 分の外 / 印の日付が書き出しの JST の日と違う = `export_not_confirmed`・
+  ID の数 = 行数・同じ ID・空の ID・空の一覧 = 断る。同じ書き出し・同じ中身 = `unchanged`。書けなくても lz-daily の合否・終わり方・要約は変えない (証跡の `lz_codes`)
+- **鍵**: `record_ne_values` = CSV の鍵 `hashtext('ops.ne_csv')` (排他) → NE のコードの共有の鍵 → NE の値の排他の鍵 `hashtext('ops.ne_values')` (PR-2 はこの同じ取引で配ったファイルの行を確かめる)。`record_ne_codes` (0041) は今のまま (NE のコードの排他の鍵だけ) = 輪にならない。`record_lz_codes` = `hashtext('ops.lz_codes')` (排他) だけ
+- **守り**: 表へは書く関数の中でだけ書ける (印 `ops.ne_values_protocol` / `ops.lz_codes_protocol` が無い INSERT / UPDATE / DELETE / TRUNCATE は持ち主のロールでも statement の trigger が断る)・受け付けた回の 2 表は追記だけ (`core.make_append_only`)。
+  security definer = `search_path = pg_catalog, pg_temp`・名前は全部 schema つき・public の実行権なし。**watch_writer = 書く関数 2 つの実行だけ / watcher = 表を読むだけ / master_edit (画面) = 何も渡さない** (読むのは PR-2 の関数だけ)
+- 当て方 (🚨 まだ流さない): **アプリが先** (マージ → Render と miniPC を同じ build に。0083 の前は `not_applied` で書かないだけ = 照合・lz-daily は今までどおり) → `migrate.mjs --dry-run` (0083 だけ・表と関数を足すだけ・今のデータは何も変えない) → 中原さんの OK → 本適用 →
+  `create-watch-roles.mjs` を流し直す (0083 の中でもロールがあれば watch_writer の実行権・watcher の select を付ける = 流し直しの前でも書ける。流し直しは決まりの姿にそろえるため)。翌朝の照合・lz-daily の後に `ops.master_ne_values_mark` / `ops.master_lz_codes_mark` が今朝の回になったことを読むだけで確かめる (PR-2 はそれを見てから)
+- 試験 = `node scripts/test-ne-values-lz-codes.mjs` (受ける条件・形・権限・ロールが先でも同じ・鍵の種類) / `test-master-compare-ne.mjs` [41] (照合が書く・D2 の正規化・状態・同じ朝の 2 回目・書き方を書けない回 / 書く接続が無い / 関数が無い / 取得中 = 書かない) /
+  `test-lz-daily.mjs` [14] (確かめを通った回だけ送る・送れなくても合否は同じ・本物の DB が lz-daily の形を受ける・cli は daily-sync の回だけ) / `test-master-decisions.mjs` [9] (呼び手の一時の型で持ち主の権限を使えない・watch_writer の実行できる関数の一覧) /
+  本物の PG = `test-ne-values-locks-pg.mjs` (CSV を作る取引・record_ne_codes・NE のコードの共有の鍵と待ち合ってもデッドロックしない・同時の再送 = unchanged・古い回は待った後に断る)
+
 ### 要確認 (quarantined) の商品を確認済みにする (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える
 - **照合 ② の確かめ待ち** (`ops.v_ne_reg_targets`): 要確認を全部 (単品もセットも・親のある子も・持ち主を問わず・コード 80 字まで) = 毎朝の照合 ② が要確認の NE の観測を残す (miniPC のコードは変えない・新しい定期実行なし)
