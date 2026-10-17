@@ -264,9 +264,12 @@
         var r = S.oldKid[c];
         var hc = norm(String(r.hnum || '').slice(1)), vc = norm(String(r.vnum || '').slice(1));
         var swapped = (r.hg && vc && nameAt(r, 0) === vc && vc !== hc) || (r.vg && hc && nameAt(r, 1) === hc && vc !== hc);
-        if (swapped) { drop(r, 0); drop(r, 1); }
+        // 🆕 #Codex R1 M2: 消すのは仮の名前だけ (人が打った名前は残す)
+        if (swapped) { if (r.hg) drop(r, 0); if (r.vg) drop(r, 1); }
       });
     }
+    // 🆕 #Codex R1 M1: 仮に入れた値を覚えておく (直した後に元の値へ戻した = まだ仮 = 確かめが要る)
+    g.kids.forEach(function (c) { var r = S.oldKid[c]; r.hgs = r.hg ? r.hname : ''; r.vgs = r.vg ? r.vname : ''; });
   }
 
   // 子 = 横 × 縦 の組み合わせ (今ある子は出さない・前に作らなかった組み合わせは「前回は作らなかった」)
@@ -1083,7 +1086,12 @@
       var r = S.oldKid[t.getAttribute('data-oc')]; if (!r) return;
       var of = t.getAttribute('data-of');
       r[of] = t.value;
-      if (of === 'hname' || of === 'vname') { r[of.charAt(0) + 'u'] = true; r[of.charAt(0) + 'g'] = false; }   // 人が直した = 仮ではない (縦軸を足す・外すでも残す)
+      // 人が直した = 仮ではない (縦軸を足す・外すでも残す)。仮に入れた値のままに戻した (取り消し・同じ値) = 仮のまま (確かめが要る・Codex R1 M1)
+      if (of === 'hname' || of === 'vname') {
+        var pf = of.charAt(0), gv = r[pf + 'gs'] || '';
+        var back = !!gv && t.value.trim() === gv;
+        r[pf + 'u'] = !back; r[pf + 'g'] = back;
+      }
       lightOld(); return;
     }
     else if (t.classList.contains('kin')) {

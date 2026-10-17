@@ -303,13 +303,15 @@ await ta('[④] NE で作ったまとまり (記録なし) に足す: 前から�
   assert.equal(await p.locator('#old-box input[data-oc="ws100-GY"].guess').count(), 0, '人が直した = 仮の印が外れる');
   assert.equal(await p.locator('#old-box .gtag:not([hidden])').count(), 2);
   await fill(p, '#old-box input[data-oc="ws100-GY"][data-of="hname"]', 'グレー');
+  assert.equal(await p.locator('#old-box .gtag:not([hidden])').count(), 3, '仮に入れた値に戻した = 仮のまま (確かめが要る・Codex R1 M1)');
+  await fill(p, '#old-box input[data-oc="ws100-GY"][data-of="hname"]', 'グレー杢');
   // 縦軸を足す = かっこ 1 つの名前は 2 軸では読めない (空)・人が直した GY は残る → 外す = 仮に戻る (確かめたのチェックも出し直し)
   await p.click('#ax-v button[data-v="1"]');
   await settle(p);
-  assert.deepEqual(await hnames(), ['', 'グレー', '']);
+  assert.deepEqual(await hnames(), ['', 'グレー杢', '']);
   await p.click('#ax-v button[data-v="0"]');
   await settle(p);
-  assert.deepEqual(await hnames(), ['ブラウン', 'グレー', 'ネイビー']);
+  assert.deepEqual(await hnames(), ['ブラウン', 'グレー杢', 'ネイビー']);
   i4 = await info(p);
   assert.ok(i4.issues.some((x) => /^前からある子の名前 \(商品名から仮に入れた 2 件\)/.test(x)), JSON.stringify(i4.issues));
   await p.check('#old-ok');
@@ -323,7 +325,7 @@ await ta('[④] NE で作ったまとまり (記録なし) に足す: 前から�
   const r = await saveViaConfirm(p);
   assert.match(r, /1 件を下書きにしました/);
   const g = await V.readVariationGroup(db, (await one(`select product_id::text as id from core.products where display_code = 'ws100'`)).id);
-  assert.deepEqual(g.options.map((o) => [o.code, o.name]), [['-BR', 'ブラウン'], ['-GY', 'グレー'], ['-NV', 'ネイビー'], ['-WR', 'ワインレッド']]);
+  assert.deepEqual(g.options.map((o) => [o.code, o.name]), [['-BR', 'ブラウン'], ['-GY', 'グレー杢'], ['-NV', 'ネイビー'], ['-WR', 'ワインレッド']]);
   // 2 回目 = 記録のあるまとまり (確かめの欄は出ない・軸は 🔒)
   await p.goto(B + '/new?kind=variation');
   await pickGroup(p, 'ws1', 'ws100');

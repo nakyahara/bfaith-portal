@@ -43,10 +43,12 @@ const EXTRA = [
   rep('kz300-NV-S', 'キッズ浴衣【ネイビー・S】', 'kz300'), rep('kz300-NV-M', 'キッズ浴衣 ネイビー M', 'kz300'),
   rep('kz400-BR', 'ポーチ【ブラウン】', 'kz400'), rep('kz400-BE', 'ポーチ【ブラウン】', 'kz400'),
   rep('kz400-GY', 'ポーチ【グレー】【4901234567894】', 'kz400'), rep('kz400-NV', '旧ポーチ【ネイビー】', 'kz400'),
+  rep('kz500-BR-S', 'バッグ【S / BR】', 'kz500'),   // 横と縦が入れ替わっていそう (縦の名前 = 横の文字)
 ];
 const T = await setupVariationDb({ extraSkus: EXTRA, extraGroups: [
   { code: 'kz300', name: 'キッズ浴衣', childCodes: ['kz300-RD-S', 'kz300-RD-M', 'kz300-NV-S', 'kz300-NV-M'], status: 'active' },
-  { code: 'kz400', name: 'ポーチ', childCodes: ['kz400-BR', 'kz400-BE', 'kz400-GY', 'kz400-NV'], status: 'active' }] });
+  { code: 'kz400', name: 'ポーチ', childCodes: ['kz400-BR', 'kz400-BE', 'kz400-GY', 'kz400-NV'], status: 'active' },
+  { code: 'kz500', name: 'バッグ', childCodes: ['kz500-BR-S'], status: 'active' }] });
 const { db, q, one } = T;
 const RATES = new Map([['A1', { method: 'ネコポス', cost: 280 }], ['B2', { method: '宅急便コンパクト', cost: 520 }], ['C3', { method: '宅急便 60', cost: 780 }]]);
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
@@ -231,6 +233,24 @@ await ta('[N2] 2 軸の NE のまとまり (kz300): 名前を仮に入れる (�
   assert.equal(await p.locator('#old-box .oldbox').count(), 0);
 });
 
+await ta('[N3b] 横と縦が入れ替わっていそう (kz500「バッグ【S / BR】」・コード -BR-S) = 仮の名前だけ空に戻す・人が打った名前は残す (Codex R1 M2)', async (p) => {
+  await p.goto(B + '/new?kind=variation');
+  await pickGroup(p, 'kz5', 'kz500');
+  await fill(p, '#ax-0', 'カラー');
+  await settle(p);
+  assert.deepEqual(await oldNames(p), { 'kz500-BR-S': ['S / BR'] }, '1 軸 = かっこの中を丸ごと (仮)');
+  await fill(p, '#old-box input[data-oc="kz500-BR-S"][data-of="hname"]', 'ブラウン');
+  await p.click('#ax-v button[data-v="1"]');
+  await fill(p, '#ax-1', 'サイズ');
+  await settle(p);
+  assert.deepEqual(await oldNames(p), { 'kz500-BR-S': ['ブラウン', ''] }, '縦の仮「BR」= 横の文字 = 空・人が打った「ブラウン」は残る');
+  assert.equal(await guessTags(p), 0);
+  await p.click('#ax-v button[data-v="0"]');
+  await p.click('#ax-v button[data-v="1"]');
+  await settle(p);
+  assert.deepEqual(await oldNames(p), { 'kz500-BR-S': ['ブラウン', ''] });
+});
+
 await ta('[N3] 1 軸の迷う名前 (kz400): 同じ名前の子が 2 つ (違う文字) = 両方空・まとまりの名前で始まらない = 空・終わりの【JAN】は外す・読めた 1 つだけ「仮」', async (p) => {
   await p.goto(B + '/new?kind=variation');
   await pickGroup(p, 'kz4', 'kz400');
@@ -321,9 +341,25 @@ await ta('[N5] 参考 URL は 20 個まで (足すボタン)・API: 形の違う
   let r = await post({ ...base, card: { ...base.card, reference_urls: ['ftp://x.example'] }, blanks: [...ORDER, 'children.jan'] });
   assert.deepEqual([r[0], r[1].field], [400, 'card.reference_urls'], JSON.stringify(r));
   assert.match(r[1].error, /参考 URL 1 つ目は http:\/\/ か https:\/\/ で始まる URL/);
-  r = await post({ ...base, blanks: [...ORDER, 'children.jan'] });
-  assert.deepEqual([r[0], r[1].reason, r[1].field], [400, 'blank_unmarked', 'card.reference_urls'], JSON.stringify(r));
+  r = await post({ ...base, card: { ...base.card, reference_urls: [] }, blanks: [...ORDER, 'children.jan'] });
+  assert.deepEqual([r[0], r[1].reason, r[1].field, r[1].screen_outdated], [400, 'blank_unmarked', 'card.reference_urls', undefined], JSON.stringify(r));
+  // 前の画面 (card に reference_urls が無い) の新しい登録 = 400 (画面を開き直す)
+  const legacy = { ...base, blanks: [...ORDER, 'children.jan'] };
+  r = await post(legacy);
+  assert.deepEqual([r[0], r[1].reason, r[1].field, r[1].screen_outdated], [400, 'blank_unmarked', 'card.reference_urls', true], JSON.stringify(r));
+  assert.match(r[1].error, /前の画面には参考 URL の欄がありません/);
   assert.equal((await q(`select 1 from core.skus where code = 'refapi-WH'`)).length, 0, '何も保存しない');
+  // 🆕 #Codex R1 M3: 前の画面で保存できた登録 (デプロイの前) の押し直し = 前の答え (参考 URL で断らない)
+  const BLK = await import('../lib/master-register-blanks.mjs');
+  const rid = crypto.randomUUID();
+  const old = BLK.prepareRegisterBody('variation', { ...legacy, request_id: rid }, { skip: ['card.reference_urls'] });
+  assert.equal(old.ok, true, JSON.stringify(old.json));
+  const first = await T.asEditor(() => V.registerVariationBatch(db, { actor: 'naka@test', requestId: rid, reason: old.body.reason, group: legacy.group, axes: legacy.axes, options: legacy.options,
+    children: legacy.children, values: legacy.values, card: legacy.card, childReasons: old.childReasons }, { open: true, shippingRates: RATES, requireLz: true, orderOutbox: true }));
+  assert.equal(first.ok, true);
+  r = await post({ ...legacy, request_id: rid });
+  assert.deepEqual([r[0], r[1].ok, r[1].replayed], [200, true, true], JSON.stringify(r).slice(0, 400));
+  assert.equal((await q(`select 1 from core.skus where code = 'refapi-WH'`)).length, 1, '1 回だけ');
 });
 
 console.log(`\n${passed} ok`);
