@@ -67,6 +67,9 @@
  *   GET  /amazon/sku?sku=    1 つの seller SKU (見る・直す・墓標にする・墓標から戻す)。対応が無ければ「新しい対応」(今の構成は夜間ロードの写しとして見せる)
  *   GET  /amazon/sku/history?sku=  変更の記録 (対応・構成・出品)
  *   GET  /amazon/unmapped    未登録 = 直近 7 日に売れたのに構成が無い FBA の seller SKU (自社発送は出さない・区分が分からない SKU は別の一言・売上の公開が欠けた日は「未判定」)
+ *                            🆕 10/17: ?days=7|30|90|all (期間)・?fbm=1 (自社発送で seller SKU が NE コードでない SKU の一覧)・行の「その場で登録」(POST /api/amazon/save)
+ *   GET  /amazon/unmapped.csv  同じ期間・同じ一覧の CSV (読むだけ)
+ *   GET  /api/amazon/map?sku=  その場で登録の欄が読む 1 つの seller SKU (版・名前の初めの値・今の構成・先に作れない形。読むだけ)
  *   POST /api/amazon/save    保存 { request_id, seller_sku, name, components: [{ code, qty }], reason?, seen: { versions } } (lib/amazon-map-write.mjs)
  *   POST /api/amazon/delete  墓標にする { request_id, seller_sku, reason, seen: { versions } }
  *   NE 登録の CSV (⑤-2b・0053・lib/master-reg-csv.mjs。作る・配る・申告・使わない・実機の確かめは MASTER_DECISION_APPROVERS の名簿の人だけ = マスタの判断の CSV と同じ):
@@ -89,7 +92,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
-import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
+import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS, jstDate } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
 import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf, legacyRefsScreen, hasRequestRecord } from '../../lib/master-register-blanks.mjs';
@@ -101,7 +104,7 @@ import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
 import { listSkus, listNeighbors, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
 import { bulkInspect, bulkPreview, bulkApplyChunk, editableOf, BULK_MAX, BULK_CHUNK, COST_REASONS, FIX_GROUPS } from './bulk.mjs';
-import { buildListCsv, csvFileName, buildAmazonCsv, amazonCsvFileName } from './list-csv.mjs';
+import { buildListCsv, csvFileName, buildAmazonCsv, amazonCsvFileName, buildUnmappedCsv, unmappedCsvFileName } from './list-csv.mjs';
 import { LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, ViewPrefsInputError } from './list-columns.mjs';
 import { readViewPrefs, saveViewPrefs } from './view-prefs.mjs';
 import { listImages, IMAGE_STATE_WORDS } from './list-images.mjs';
@@ -119,7 +122,7 @@ import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
 import { saveAmazonMap, deleteAmazonMap, sellerSkuIn, newSellerSkuCheckInDb, AMAZON_MAP_OWNER_KEY, MAP_STATES, MAX_MAP_COMPONENTS, MAX_MAP_QTY } from '../../lib/amazon-map-write.mjs';
-import { listAmazonMaps, listAmazonMapsAll, readAmazonPage, amazonHistory, amazonUnmapped, channelsFromFeeRows, normalizeAmazonFilters, checkNewAmazonSku, searchMapComponents, COMPONENT_SEARCH_Q_MAX, COMPONENT_SEARCH_MIN, CHANNELS, UNMAPPED_DAYS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
+import { listAmazonMaps, listAmazonMapsAll, readAmazonPage, amazonHistory, amazonUnmapped, channelsFromFeeRows, normalizeAmazonFilters, checkNewAmazonSku, searchMapComponents, readMapForInline, unmappedPeriodOf, COMPONENT_SEARCH_Q_MAX, COMPONENT_SEARCH_MIN, CHANNELS, UNMAPPED_DAYS, UNMAPPED_PERIODS, COST_STATUS_WORDS, COST_SOURCE_WORDS, AMAZON_SKU_MAX_LEN, SIMILAR_SCAN_MAX, SIMILAR_SYMBOLS_MAX } from './amazon-read.mjs';
 import { registerAmazonUnlinkedRoutes, readAmazonReportFor } from './amazon-unlinked.mjs';
 import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
@@ -1415,14 +1418,48 @@ router.get('/amazon/list.csv', (req, res) => {
   }, { deadline });
 });
 // FBA だけ (自社発送は 商品コード = Amazon SKU = 対応が要らない・10/12)。区分の引数 (?channel=) は捨てる
+// 🆕 10/17: ?days=7|30|90|all (既定 7 = 今までどおり)・?fbm=1 = 自社発送で seller SKU が NE コードでない SKU の一覧も出す (既定は件数の一言だけ)
+const unmappedQueryOf = (q) => ({ ...unmappedPeriodOf(q), fbm: q.fbm === '1' });
 router.get('/amazon/unmapped', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const uq = unmappedQueryOf(req.query);
   const channels = db ? await amazonChannelsProvider() : null;
-  const data = db ? await amazonUnmapped(db, { now: new Date(clock()), channels }) : null;
+  const data = db ? await amazonUnmapped(db, { now: new Date(clock()), channels, days: uq.days }) : null;
   const phase = await readPhaseView(db);
-  res.render(view('amazon-unmapped.ejs'), { ...pageLocals(req, phase), nav: 'amazon', dbError, data, CHANNELS, UNMAPPED_DAYS, MAP_STATES });
+  const locals = pageLocals(req, phase);
+  // その場で登録 (10/17) = 保存できる人・保存を開いているときだけ (保存は POST /api/amazon/save = lib の門が確かめ直す)
+  const inline = locals.canEdit && !locals.amazonClosed && !dbError;
+  res.render(view('amazon-unmapped.ejs'), { ...locals, nav: 'amazon', dbError, data, CHANNELS, UNMAPPED_DAYS, UNMAPPED_PERIODS, MAP_STATES, uq, inline,
+    MAX_MAP_COMPONENTS, MAX_MAP_QTY, COMPONENT_SEARCH_MIN });
 }));
+// 未登録の CSV (10/17 中原さん): 画面と同じ期間・同じ一覧 (?days=&fbm=)。読むだけ・見られる人 = 画面と同じ。区分を読めない = 出さない (0 件と言わない)
+router.get('/amazon/unmapped.csv', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const text = (status, msg) => res.status(status).type('text/plain; charset=utf-8').send(msg);
+  if (!db) return text(503, dbError || 'Company DB につながりません');
+  const uq = unmappedQueryOf(req.query);
+  const data = await amazonUnmapped(db, { now: new Date(clock()), channels: await amazonChannelsProvider(), days: uq.days });
+  if (data.tableMissing) return text(503, 'Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)');
+  if (!data.decidable) return text(503, 'FBA か自社発送かを読めないので、CSV を出せません (0 件ではありません)。手数料の写しか Amazon の出品一覧が届いた後にもう一度');
+  const name = unmappedCsvFileName(clock());
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+  res.set('Cache-Control', 'no-store');
+  res.send(buildUnmappedCsv(data, { withFbm: uq.fbm, mapStates: MAP_STATES, channels: CHANNELS, periodLabel: UNMAPPED_PERIODS[uq.key] }));
+}));
+/**
+ * その場で登録する欄が開くときに読む 1 つの seller SKU (10/17・読むだけ)。?sku= → { ok, seller_sku, versions, map, listing, components, name_default, name_from, new_sku_problems }。
+ * 見られる人 = この画面と同じ (保存は名簿の人だけ = POST /api/amazon/save)
+ */
+router.get('/api/amazon/map', (req, res) => {
+  let sku;
+  try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).json({ ok: false, error: e.message, reason: 'invalid_input' }); }
+  return withPgApi(res, async (db) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, ...(await readMapForInline(db, sku, { nowMs: clock() })) });
+  });
+});
 // まだつないでいない Amazon の SKU (Amazon の出品一覧にあって構成が無い・隠す / 元に戻す。10/12・amazon-unlinked.mjs)
-registerAmazonUnlinkedRoutes(router, { withPgPage, withPgApi, pageLocals, editorGate, view, readPhaseView, clock: () => clock() });
+registerAmazonUnlinkedRoutes(router, { withPgPage, withPgApi, pageLocals, editorGate, view, readPhaseView, clock: () => clock(),
+  inlineLocals: { MAX_MAP_COMPONENTS, MAX_MAP_QTY, COMPONENT_SEARCH_MIN } });
 /**
  * 新しい seller SKU の対応を作る入口 (読むだけ・保存は今までどおり /amazon/sku の画面から POST /api/amazon/save)。
  * 作ってよい (形が合う・対応が無い・似た SKU も気をつけることも無い、または checked = 画面でもう見た) = /amazon/sku?sku= へ 303
@@ -1473,13 +1510,13 @@ router.get('/amazon/sku', (req, res) => withPgPage(req, res, async (db, dbError)
   let sku;
   try { sku = sellerSkuIn(String(req.query.sku ?? '')); } catch (e) { return res.status(400).render(view('error.ejs'), { ...pageLocals(req), nav: 'amazon', message: e.message }); }
   const channels = db ? await amazonChannelsProvider() : null;
-  const page = db ? await readAmazonPage(db, sku, { channels }) : null;
+  const page = db ? await readAmazonPage(db, sku, { channels, today: jstDate(new Date(clock())) }) : null;
   if (page) page.phase = { ...page.phase, owner: await screenOwner(db) };
   // 出品も対応も無い seller SKU = 先に作る形の決まり (#1685 Codex R1 High)。合わなければ画面で先に知らせて保存のボタンを出さない (保存の lib も断る)
   const newSkuProblems = page && !page.cur.listing ? (await newSellerSkuCheckInDb(db, sku)).problems : [];
   // Amazon の出品一覧 (前の夜のレポート) にこの seller SKU があれば、Amazon の商品名・ASIN・出品日・FBA / 自社・状態を見せる (無い = 何も出さない・読めない = 読めないと出す)
   const amazonReport = db ? await readAmazonReportFor(db, sku, { nowMs: clock() }) : null;
-  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY, COMPONENT_SEARCH_MIN, amazonReport });
+  res.render(view('amazon-sku.ejs'), { ...pageLocals(req, page ? page.phase : null), nav: 'amazon', dbError, page, sku, newSkuProblems, MAP_STATES, CHANNELS, MAX_MAP_COMPONENTS, MAX_MAP_QTY, COMPONENT_SEARCH_MIN, amazonReport, COST_STATUS_WORDS, COST_SOURCE_WORDS });
 }));
 router.post('/api/amazon/save', (req, res) => {
   const gate = editorGate(req);

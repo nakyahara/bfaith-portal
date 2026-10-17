@@ -47,6 +47,7 @@
  *  72〜74 1 つの商品の画面の「← 前へ」「次へ →」(10/17): 来た一覧と同じ並び・絞り込みの前・次と場所・続けて次へ・最初 / 最後・一覧に無い・出さないとき・
  *     未保存のまま押す = 離れるときの確認 (ここに残る / 捨てて移る)・スマホ 390 ではみ出さない・44px
  *  75 一覧の画像の列 (10/17): コードのすぐ後ろ・52px の四角・取得中 / 画像なしの印・読み込めない画像は印・列の板で外す / 出す・画像を押しても開く・390 ではみ出さない
+ *  76 Amazon SKU の未登録の一覧の「その場で登録」(10/17): 行の下に欄・名前 = Amazon の商品名・構成の原価
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -3132,6 +3133,108 @@ await ta('[74] 前へ・次へ スマホ 390 (10/17): パンくずと前へ・�
   await Promise.all([p.waitForNavigation(), p.click('#pn-next')]);
   assert.match(p.url(), new RegExp(`sku/${codes[2]}$`));
 }, { width: 390, height: 844 });
+
+// ── 未登録の一覧の「その場で登録」(10/17 中原さん)・構成の原価 ──
+{
+  // 売れたのに対応が無い FBA の SKU 2 つ (出品一覧 = FBA・Amazon の商品名つき) と、今日の注文
+  const IL = await import('../apps/company-db/ingest/amazon-listings.mjs');
+  const today = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+  const lr = (sku, name) => ({ seller_sku: sku, item_name: name, asin: null, open_date: today, open_date_raw: null, fulfillment: 'FBA', channel_raw: 'AMAZON_NA', status: 'active', status_raw: 'Active', quantity: 1, price: '980.00' });
+  const rows = [lr('pr-ui-inl-a', 'Amazon の名前 みかん 2 個'), lr('pr-ui-inl-b', 'Amazon の名前 セット')];
+  const gen = Date.now() - 600e3;
+  const got = await IL.ingestAmazonListings(db, { shop_code: IL.SHOP_CODE, generation: gen, snapshot_at: new Date(gen).toISOString(), report_run_id: 'r_ui_inline', checksum: IL.listingChecksum(rows.map((r) => IL.listingRowOf(r))), row_count: rows.length, skipped_count: 0, rows, force: true }, { nowMs: Date.now() });
+  assert.ok(['applied', 'refreshed'].includes(got.status), JSON.stringify(got));
+  let n = 0;
+  for (const code of ['pr-ui-inl-a', 'pr-ui-inl-b']) {
+    const o = (await pg.query(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash)
+      values (1, 'amazon', 'amazon', $1, 'mall_api', now(), $2::date, 'shipped', false, 1, now(), 't', 'h') returning order_id`, [`ui-inl-${++n}`, today])).rows[0].order_id;
+    await pg.query(`insert into core.order_lines (company_id, order_id, line_key, listing_id, unresolved_code, qty, cancelled_qty, received_batch_seq) values (1, $1, 'l1', null, $2, 2, 0, 1)`, [o, code]);
+  }
+}
+const inlSugOpen = (p) => p.waitForFunction(() => { const s = document.querySelector('.inl .csug'); return s && !s.hidden && !s.classList.contains('stale') && s.querySelector('.co, .cs-h'); });
+const inlCodes = (p) => p.evaluate(() => [...document.querySelectorAll('.inl .csug .co')].map((o) => (o.classList.contains('off') ? '×' : '') + o.querySelector('.cc').textContent));
+await ta('[76] 未登録の一覧の「その場で登録」(10/17): 行の下に欄・名前 = Amazon の商品名・NE の商品の候補 (日本語入力の確定の Enter で閉じない・ほかの行にある商品は選べない)・↓ Enter で選ぶ → 数の欄・足す・保存 = 1 つの画面と同じ道 (DB に入る)・押し直しても 2 回入らない・離れるときに確かめる / 構成の原価', async (p) => {
+  await p.goto(B + '/amazon/unmapped');
+  const btn = p.locator('button[data-inline][data-sku="pr-ui-inl-a"]');
+  assert.equal(await btn.count(), 1, 'その場で登録のボタン');
+  assert.ok((await p.textContent('#unmapped-list')).includes('Amazon の名前 みかん 2 個'), '行に Amazon の商品名');
+  await btn.click();
+  const box = p.locator('li.inl-box[data-inline-for="pr-ui-inl-a"]');
+  await box.locator('.inl-body').waitFor({ state: 'visible' });
+  assert.equal(await btn.getAttribute('aria-expanded'), 'true');
+  assert.equal(await box.locator('.inl-name').inputValue(), 'Amazon の名前 みかん 2 個', '名前の初めの値 = Amazon の出品一覧の商品名');
+  assert.equal(await active(p), '1 行目の NE コード (代表)', '開くと 1 行目の欄へ');
+  assert.equal(await dirty(p), 0, '開いただけ = 未保存ではない');
+  const in1 = box.locator('tr.comp-row').nth(0).locator('.c-code');
+  // 日本語入力 (CDP): 変換中から候補・確定の Enter (Windows の並び = 確定の後に keyCode 13) で閉じない・数の欄へ移らない
+  const cdp = await p.context().newCDPSession(p);
+  const key = (type, k, vk) => cdp.send('Input.dispatchKeyEvent', { type, key: k, code: k === 'Enter' ? 'Enter' : 'KeyA', windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+  for (const s of ['み', 'みか', 'みかん']) { await key('rawKeyDown', 'Process', 229); await cdp.send('Input.imeSetComposition', { text: s, selectionStart: s.length, selectionEnd: s.length }); await key('keyUp', 'a', 65); }
+  await inlSugOpen(p);
+  assert.ok((await inlCodes(p)).includes('k006'), '変換中から候補');
+  await cdp.send('Input.insertText', { text: 'みかん' });
+  await key('rawKeyDown', 'Enter', 13); await key('keyUp', 'Enter', 13);
+  await p.waitForTimeout(100);
+  assert.equal(await active(p), '1 行目の NE コード (代表)', '確定の Enter で数の欄へ移らない');
+  await inlSugOpen(p);
+  await in1.press('ArrowDown');
+  await in1.press('Enter');
+  assert.equal(await in1.inputValue(), 'k006');
+  assert.equal(await active(p), '1 行目 (k006) の数', '選ぶと数の欄へ');
+  assert.equal(await box.locator('tr.comp-row').nth(0).locator('.c-name').textContent(), 'みかん');
+  assert.equal(await dirty(p), 1, '入れた = 離れるときに確かめる');
+  await p.keyboard.press('Control+a'); await p.keyboard.type('2');
+  // 足す → 2 行目で同じ k006 は選べない・k005 を選ぶ
+  await box.locator('.inl-add').click();
+  const in2 = box.locator('tr.comp-row').nth(1).locator('.c-code');
+  assert.equal(await active(p), '2 行目の NE コード');
+  await in2.fill('k00');
+  await inlSugOpen(p);
+  assert.ok((await inlCodes(p)).includes('×k006'), 'ほかの行にある商品は灰色');
+  await in2.fill('k005');
+  await inlSugOpen(p);
+  await in2.press('Enter');
+  assert.equal(await in2.inputValue(), 'k005', 'ぴったりのコードは Enter で入る');
+  // 保存 (通信が切れた 1 回目 → 押し直し = 同じ request_id)
+  const ids = [];
+  // 1 回目: 保存は入るが、途中の機械が 502 の JSON を返す (#Codex R2 M1 = JSON の誤りでも確かな返事でない = 送り直しに残す)
+  let first = true;
+  await p.route('**/api/amazon/save', async (r) => {
+    ids.push(JSON.parse(r.request().postData()).request_id);
+    if (first) { first = false; await r.fetch(); await r.fulfill({ status: 502, contentType: 'application/json', body: JSON.stringify({ error: 'Bad Gateway' }) }); return; }
+    await r.continue();
+  });
+  await box.locator('.inl-save').click();
+  await p.waitForFunction(() => /通信できませんでした/.test(document.querySelector('.inl-msg').textContent));
+  assert.equal(await in1.isDisabled(), true, '結果の分からない保存の後 = 欄を閉じる (同じ中身だけを送り直す・#Codex R1 M)');
+  await box.locator('.inl-save').click();
+  await box.locator('.result.ok').waitFor();
+  assert.equal(ids.length, 2); assert.equal(ids[0], ids[1], '押し直し = 同じ request_id');
+  assert.match(await box.locator('.result.ok').textContent(), /保存しました \(前に保存した結果\)/, '2 回目は前の結果');
+  assert.deepEqual(await compsUi('pr-ui-inl-a'), [['k006', 2], ['k005', 1]], 'DB に入った (1 行目が代表)');
+  assert.equal((await mapOf('pr-ui-inl-a')).name, 'Amazon の名前 みかん 2 個');
+  assert.equal(await btn.textContent(), '登録しました'); assert.equal(await btn.isDisabled(), true);
+  assert.equal(await dirty(p), 0, '保存した後 = 離れても確かめない');
+  // もう 1 つの行: 名前を空にして NE の商品を選ぶ = 選んだ商品の名前が入る
+  await p.locator('button[data-inline][data-sku="pr-ui-inl-b"]').click();
+  const box2 = p.locator('li.inl-box[data-inline-for="pr-ui-inl-b"]');
+  await box2.locator('.inl-body').waitFor({ state: 'visible' });
+  await box2.locator('.inl-name').fill('');
+  const c2 = box2.locator('tr.comp-row').nth(0).locator('.c-code');
+  await c2.fill('k004');
+  await inlSugOpen(p);
+  await c2.press('Enter');
+  assert.equal(await box2.locator('.inl-name').inputValue(), 'ＡＢＣ 保存袋', '名前が空 = 選んだ NE の商品の名前');
+  await box2.locator('.inl-cancel').click();
+  assert.equal(await box2.count(), 1, '入れた欄を「やめる」= 確かめる (試験のブラウザは「キャンセル」)');
+  // 構成の原価 (1 つの画面・見るだけ): k006 × 2 + k005 × 1 (原価は前の試験で変わることがある = 今日の原価の行を読む)
+  const costNow = async (code) => Number((await pg.query(`select y.cost_jpy from core.sku_costs y join core.skus s on s.sku_id = y.sku_id where s.code = $1
+    and y.valid_from <= (now() at time zone 'Asia/Tokyo')::date and (y.valid_to is null or y.valid_to >= (now() at time zone 'Asia/Tokyo')::date) order by y.valid_from desc, y.created_at desc, y.sku_cost_id desc limit 1`, [code])).rows[0].cost_jpy);
+  const c6 = await costNow('k006'), c5 = await costNow('k005');
+  await p.goto(B + '/amazon/sku?sku=pr-ui-inl-a');
+  assert.equal(await p.textContent('#cost-total'), `${(c6 * 2 + c5).toLocaleString('ja-JP')} 円`);
+  assert.ok((await p.textContent('#comp-cost')).includes(`${(c6 * 2).toLocaleString('ja-JP')} 円`), '小計 = 原価 × 数');
+});
 
 await browser.close();
 server.close();

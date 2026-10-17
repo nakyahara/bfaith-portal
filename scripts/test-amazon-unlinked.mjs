@@ -687,6 +687,32 @@ await ta('つかいかた (#amazon-unlinked)・Amazon SKU の一覧の右上の�
     assert.ok(r.text.includes('>古い<'));
   } finally { await pg.query('update ops.amazon_listing_report_loads set snapshot_at = $2 where load_id = $1', [keep.load_id, keep.snapshot_at]); }
 });
+await ta('CSV (10/17): 画面の右上のリンク (今の絞り込みのまま)・BOM・CRLF・ページに分けずに全部・絞り込み (状態・言葉・隠した SKU)・見る人も出せる・読めない = 503 / 保存を開いていない = その場で登録のボタンは出さない', async () => {
+  let r = await call('GET', '/amazon/unlinked?st=active&q=fba');
+  assert.ok(r.text.includes('href="unlinked.csv?q=fba&amp;st=active"') || r.text.includes('href="unlinked.csv?st=active&amp;q=fba"'), 'CSV のリンクが絞り込みを持つ');
+  assert.ok(!r.text.includes('data-inline'), '保存を開いていない (切替の前) = その場で登録は出さない');
+  const res = await fetch(`${BASE}/amazon/unlinked.csv`, { headers: { 'x-test-session': 'viewer' } });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-disposition'), /attachment; filename="amazon-unlinked_\d{8}-\d{4}\.csv"/);
+  const raw = Buffer.from(await res.arrayBuffer());
+  assert.deepEqual([...raw.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+  const lines = raw.toString('utf8').slice(1).split('\r\n').filter(Boolean);
+  assert.ok(lines[0].startsWith('"seller SKU","Amazon の商品名","ASIN","出品日","状態","いまの対応"'));
+  const skus = lines.slice(1).map((l) => l.slice(1).split('","')[0]);
+  const page = await asEdit(() => U.listUnlinked(db, U.normalizeUnlinkedFilters({}, { today: TODAY }), { nowMs: NOW, all: true }));
+  assert.deepEqual(skus, page.rows.map((x) => x.seller_sku), 'CSV = 画面と同じ並び・全部');
+  assert.ok(skus.includes('PR_NOCOMP') && !skus.includes('fbm_1') && !skus.includes('pr_a001'), 'FBA の つないでいない SKU だけ');
+  r = await call('GET', '/amazon/unlinked.csv?q=nocomp');
+  assert.deepEqual(r.text.split('\r\n').filter(Boolean).slice(1).map((l) => l.slice(1).split('","')[0]), ['PR_NOCOMP'], '言葉で絞る');
+  // 読めない (0074 の前と同じ = 表の権限が無い) = 503 (0 件の CSV にしない)
+  const keep = (await pg.query('select load_id from ops.amazon_listing_report_loads order by generation desc limit 1')).rows[0];
+  await pg.query('revoke select on ops.amazon_listing_report from master_edit');
+  try {
+    r = await call('GET', '/amazon/unlinked.csv');
+    assert.equal(r.status, 503); assert.match(r.text, /0 件ではありません/);
+  } finally { await pg.query('grant select on ops.amazon_listing_report to master_edit'); }
+  assert.ok(keep);
+});
 
 // ─────────────────────────────────────────────────────────
 console.log('\n7 毎朝のランナー・台帳');
