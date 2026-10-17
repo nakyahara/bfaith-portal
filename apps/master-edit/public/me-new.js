@@ -485,7 +485,9 @@
   function setPlanRows() {
     return $$('#set-plan-rows tr.sp-row').map(function (tr) { var raw = $('.sp-qty', tr).value; return { tr: tr, qty: spQty(raw), qtyRaw: raw.trim(), code: $('.sp-code', tr).value, name: $('.sp-name', tr).value.trim() }; });
   }
-  var spChecks = new Map();   // 行 → サーバーの確かめ { code, ok (true / false / null = 確かめられない), message }
+  var spChecks = new Map();   // 行 → サーバーの確かめ { key (セットのコード + 単品のコード), ok (true / false / null = 確かめられない), message }
+  /** 確かめの答えの鍵 = セットのコードと単品のコードの組 (単品のコードで答えが変わる = 単品と同じコード・Codex R3 Medium 4) */
+  function spKey(code) { return code + '|' + $('#code').value.trim(); }
   /** 行ごとの形の一言 (問題が無ければ '')。重なり = 上の行と同じ個数・同じコード (大文字小文字は同じと見る・後の行に印 = サーバーと同じ)・単品のコードと同じ */
   function spProblem(r, rows) {
     if (r.qty == null) return '個数は ' + SP_MIN + '〜' + SP_QMAX + ' の整数';
@@ -497,7 +499,7 @@
     if (!r.name) return 'セット商品名を入れてください';
     if (r.name.length > SP_NMAX) return 'セット商品名は ' + SP_NMAX + ' 字まで';
     var c = spChecks.get(r.tr);
-    if (c && c.code === r.code && c.ok === false) return c.message || '使えないコードです';
+    if (c && c.key === spKey(r.code) && c.ok === false) return c.message || '使えないコードです';
     return '';
   }
   /** 数える答え { rows, bad, firstBad (直す欄のセレクタ) } と、行ごとの一言を出す */
@@ -507,8 +509,8 @@
       var prob = spProblem(r, rows);
       var m = $('.sp-msg', r.tr);
       var c = spChecks.get(r.tr);
-      var t = prob || (c && c.code === r.code ? (c.ok ? '使えます' : c.ok === null ? (c.message || 'いまは確かめられません (保存のときにもう一度)') : '') : r.code ? '確かめています…' : '');
-      var cls = prob ? 'err' : c && c.code === r.code && c.ok ? 'ok' : c && c.code === r.code && c.ok === null ? 'warn' : 'info';
+      var t = prob || (c && c.key === spKey(r.code) ? (c.ok ? '使えます' : c.ok === null ? (c.message || 'いまは確かめられません (保存のときにもう一度)') : '') : r.code ? '確かめています…' : '');
+      var cls = prob ? 'err' : c && c.key === spKey(r.code) && c.ok ? 'ok' : c && c.key === spKey(r.code) && c.ok === null ? 'warn' : 'info';
       if (m && (m.textContent !== t || m.className !== 'fmsg sp-msg ' + cls)) { m.textContent = t; m.className = 'fmsg sp-msg ' + cls; }
       if (prob) { bad++; if (!firstBad) firstBad = '#set-plan-rows tr.sp-row:nth-child(' + (i + 1) + ') ' + (/個数|個セット/.test(prob) ? '.sp-qty' : /名/.test(prob) ? '.sp-name' : '.sp-code'); }
     });
@@ -520,18 +522,19 @@
     clearTimeout(tr.__spTimer);
     var code = $('.sp-code', tr).value;
     if (codeShape(code)) { spChecks.delete(tr); return; }
+    var key = spKey(code);
     tr.__spTimer = setTimeout(function () {
       var my = ++spSeq; tr.__spSeq = my;
       fetch(BASE + '/api/set-code-check?code=' + encodeURIComponent(code) + '&parent=' + encodeURIComponent($('#code').value.trim()) + '&request_id=' + encodeURIComponent(requestId), { headers: { Accept: 'application/json' } })
         .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
         .then(function (x) {
-          if (tr.__spSeq !== my || !tr.isConnected || $('.sp-code', tr).value !== code) return;
-          if (x.r.ok && x.j.ok) spChecks.set(tr, { code: code, ok: true });
-          else if (x.r.status === 200 || x.r.status === 400) spChecks.set(tr, { code: code, ok: false, message: x.j.message || x.j.error || '使えません' });
-          else spChecks.set(tr, { code: code, ok: null, message: 'いまは確かめられません (保存のときにもう一度確かめます)' });
+          if (tr.__spSeq !== my || !tr.isConnected || spKey($('.sp-code', tr).value) !== key) return;   // 打ち直した (単品のコードも) = 古い答えは使わない
+          if (x.r.ok && x.j.ok) spChecks.set(tr, { key: key, ok: true });
+          else if (x.r.status === 200 || x.r.status === 400) spChecks.set(tr, { key: key, ok: false, message: x.j.message || x.j.error || '使えません' });
+          else spChecks.set(tr, { key: key, ok: null, message: 'いまは確かめられません (保存のときにもう一度確かめます)' });
           update();
         })
-        .catch(function () { if (tr.__spSeq === my) { spChecks.set(tr, { code: code, ok: null, message: '確かめられません (通信)。保存のときにもう一度確かめます' }); update(); } });
+        .catch(function () { if (tr.__spSeq === my) { spChecks.set(tr, { key: key, ok: null, message: '確かめられません (通信)。保存のときにもう一度確かめます' }); update(); } });
     }, 450);
   }
   /** 行の初めの値 (直していない欄 = data-auto) を単品のコード・名前・個数に合わせる */
@@ -590,7 +593,13 @@
     update();
   });
   // 単品のコード・名前を打ったら、直していない行の初めの値も付いていく
-  ['code', 'f-name'].forEach(function (id) { var e = document.getElementById(id); if (e) e.addEventListener('input', function () { $$('#set-plan-rows tr.sp-row').forEach(spFollow); }); });
+  // 単品のコードを打ち直したら、直したコードの行も確かめ直す (答えは単品のコードとの組)
+  ['code', 'f-name'].forEach(function (id) {
+    var e = document.getElementById(id);
+    if (e) e.addEventListener('input', function () {
+      $$('#set-plan-rows tr.sp-row').forEach(function (tr) { var before = $('.sp-code', tr).value; spFollow(tr); if (id === 'code' && $('.sp-code', tr).value === before) spCheckLater(tr); });
+    });
+  });
 
   ['card-create', 'set-plan'].forEach(function (id) {
     var e = document.getElementById(id);
@@ -706,7 +715,7 @@
         row = $('#row-set-plans'); row.hidden = false;
         var spTr = typeof j.index === 'number' ? $$('#set-plan-rows tr.sp-row')[j.index] : null;
         target = spTr ? $(/個数|個セット/.test(String(j.error || '')) ? '.sp-qty' : /名/.test(String(j.error || '')) && !/コード/.test(String(j.error || '')) ? '.sp-name' : '.sp-code', spTr) : $('#set-plan-add');
-        if (spTr && /^(code_|ph_|set_code)/.test(String(j.reason || ''))) { spChecks.set(spTr, { code: $('.sp-code', spTr).value, ok: false, message: j.error }); }
+        if (spTr && /^(code_|ph_|set_code)/.test(String(j.reason || ''))) { spChecks.set(spTr, { key: spKey($('.sp-code', spTr).value), ok: false, message: j.error }); }
       }
       if (!row && target) { try { target.focus(); } catch (e) { /* */ } }
       if (row) {

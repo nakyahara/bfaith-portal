@@ -3024,6 +3024,23 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
     { open: true, now: NOW, shippingRates: RATES, codeReserved: async () => ({ status: 409, reason: 'set_code_reserved', message: '商品コード sp-race-1 は x の登録で作るセットに決まっています' }) })), 409, 'set_code_reserved');
   assert.match(e.message, /作るセットに決まっています。何も保存していません/);
   assert.equal(await skuId('sp-race-1'), undefined);
+  // ⑦ (Codex R3 Medium 2) 書いたまま答えの来なかった作るセット (waiting) の予約が切れた後に、ほかの登録が同じコードを予約 → 元の押し直し = 確かめ直して断る
+  const ridA = uuid();
+  SPS.writeSetPlan({ requestId: ridA, requestHash: '1'.repeat(64), parentCode: 'sp-exp', parentName: 'x', sets: [{ qty: 2, code: 'sp-exp-2', name: 'x' }], actor: 'x@test' });
+  ph.prepare(`UPDATE ph_cdb_set_plans SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours') WHERE request_id = ?`).run(ridA);
+  SPS.writeSetPlan({ requestId: uuid(), requestHash: '2'.repeat(64), parentCode: 'sp-exp-b', parentName: 'y', sets: [{ qty: 2, code: 'sp-exp-2', name: 'y' }], actor: 'y@test' });
+  assert.throws(() => SPS.writeSetPlan({ requestId: ridA, requestHash: '1'.repeat(64), parentCode: 'sp-exp', parentName: 'x', sets: [{ qty: 2, code: 'sp-exp-2', name: 'x' }], actor: 'x@test' }),
+    (x) => x.status === 409 && x.reason === 'set_code_taken');
+  // ⑧ (Codex R3 Medium 3) 通った登録の押し直し = 作るセットの表に書けなくても前の答え (「登録していません」と言わない)
+  const bRep = spBody('sp-rep1', [{ qty: 2, code: 'sp-rep1-2', name: 'x 2個セット' }]);
+  const first = await call('POST', '/apps/master-edit/api/new', { body: bRep });
+  assert.equal(first.status, 200, first.text);
+  MR.__setSetPlanStore({ write: () => { throw new Error('SQLite に書けない'); }, mark: () => 0, held: () => null });
+  try {
+    const again = await call('POST', '/apps/master-edit/api/new', { body: bRep });
+    assert.deepEqual([again.status, again.j.replayed], [200, true], again.text);
+  } finally { MR.__setSetPlanStore(null); }
+  assert.equal(setsOf(draftOf('sp-rep1').id).length, 1);
 });
 
 server.close();

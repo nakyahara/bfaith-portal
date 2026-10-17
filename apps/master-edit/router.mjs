@@ -448,6 +448,19 @@ async function setPlans() {
   const m = await import('../product-hub/services/cdb-set-plan.js');
   return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o) };
 }
+/**
+ * このコードがほかの登録の作るセットに決まっているか (予約・セットの下書き)。決まっている = { status 409, reason, message } / 読めない = 503 / 無い = null
+ *   新商品の登録 (単品の入口と登録の取引の中 = codeReserved)・まとまりの子 (入口) が使う
+ */
+async function setCodeReservedFor(code, requestId) {
+  let held;
+  try { held = (await setPlans()).held(code, { requestId }); } catch (e) {
+    console.error(`[master-edit] 作るセットの予約を読めない: ${e && e.message}`);
+    return { status: 503, reason: 'ph_unreadable', message: 'product-hub の作るセットの予約を読めないので、このコードを使えるか確かめられません (少し待ってからもう一度)' };
+  }
+  if (held && (held.reason === 'ph_set_plan' || (held.reason === 'ph_draft' && held.is_set))) return { status: 409, reason: 'set_code_reserved', message: `${held.message}。別のコードにしてください` };
+  return null;
+}
 /** 作るセットの答えを残す (登録の後)。失敗しても投げない (取り込みは知らせの request_id で表を引く = 状態は見ない) */
 async function markSetPlanSafe(requestId, x) {
   try { (await setPlans()).mark(requestId, x); } catch (e) { console.error(`[master-edit] 作るセットの答えを残せなかった (${requestId}): ${e && e.message}`); }
@@ -927,6 +940,14 @@ router.post('/api/new/variation', (req, res) => {
     //   🆕 #1719 Codex R4 High: 同じ request_id の記録がある (押し直し) = 今の写しで確かめない (lib が前の答えを返す・印は DB に残した結果から)
     const lg = po.replay ? { copy: null } : await lzRegisterGate(db, kids.map((k) => ({ code: k && typeof k.code === 'string' ? k.code : '', raw: k ? k.lz_barcode : undefined, field: 'children' })));
     if (lg.fail) return res.status(lg.fail.status).json(lg.fail.json);
+    // 🆕 2026-10-17 (Codex R3 Medium 1): ほかの登録の作るセットに決まったコード (予約・セットの下書き) は子のコードにもさせない (入口だけ。押し直しは前の答え)
+    if (!po.replay) {
+      for (const k of kids) {
+        if (!k || typeof k.code !== 'string' || !k.code) continue;
+        const held = await setCodeReservedFor(k.code, rid);
+        if (held) return res.status(held.status).json({ ok: false, reason: held.reason, field: 'children', code: k.code, error: `${k.code}: ${held.message}。何も保存していません` });
+      }
+    }
     const r = await registerVariationBatch(db, {
       actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: b.reason ?? null,
       group: b.group, axes: b.axes ?? null, options: b.options, children: b.children, values: b.values, card: b.card, order: outbox ? orderBase : null,
@@ -1099,15 +1120,7 @@ router.post('/api/new', (req, res) => {
     const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
     // ほかの登録が作るセットに決めたコード (カードの取り込み待ち) は、ふつうの商品コードにもさせない (Codex R1 Medium 1)。押し直しは前の答え (確かめない)
     //   (Codex R2: セットの下書きのコードも・読めない = 登録しない・登録の取引でコードの鍵を取った後にもう一度 = codeReserved)
-    const codeReserved = async (code) => {
-      let held;
-      try { held = (await setPlans()).held(code, { requestId: rid }); } catch (e) {
-        console.error(`[master-edit] 作るセットの予約を読めない: ${e && e.message}`);
-        return { status: 503, reason: 'ph_unreadable', message: 'product-hub の作るセットの予約を読めないので、このコードを使えるか確かめられません (少し待ってからもう一度)' };
-      }
-      if (held && (held.reason === 'ph_set_plan' || (held.reason === 'ph_draft' && held.is_set))) return { status: 409, reason: 'set_code_reserved', message: `${held.message}。別のコードにしてください` };
-      return null;
-    };
+    const codeReserved = (code) => setCodeReservedFor(code, rid);
     if (parsed && !po.replay) {
       const held = await codeReserved(parsed.code);
       if (held) return res.status(held.status).json({ ok: false, reason: held.reason, field: 'code', error: `${held.message}。何も保存していません` });
@@ -1118,7 +1131,8 @@ router.post('/api/new', (req, res) => {
       } catch (e) {
         if (e && e.status) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, field: e.field || 'card.sets', ...(e.index == null ? {} : { index: e.index }) });
         console.error(`[master-edit] 作るセットを product-hub に残せない: ${e && e.stack || e}`);
-        return res.status(503).json({ ok: false, reason: 'ph_unwritable', field: 'card.sets', error: '作るセットを product-hub に残せないので、登録していません (少し待ってからもう一度。急ぐときは「セット商品を作るか」を「保留」にして登録し、あとで product-hub の「セット商品を作る」で作ってください)' });
+        // 押し直し (同じ request_id の保存の記録がある) = 前の答えを返す登録の lib へ (表の障害で「登録していません」と言わない・Codex R3 Medium 3)
+        if (!po.replay) return res.status(503).json({ ok: false, reason: 'ph_unwritable', field: 'card.sets', error: '作るセットを product-hub に残せないので、登録していません (少し待ってからもう一度。急ぐときは「セット商品を作るか」を「保留」にして登録し、あとで product-hub の「セット商品を作る」で作ってください)' });
       }
     }
     let r;

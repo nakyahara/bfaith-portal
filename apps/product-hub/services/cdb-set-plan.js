@@ -72,6 +72,13 @@ export function writeSetPlan({ requestId, requestHash, parentCode, parentName, s
     const prev = db.prepare('SELECT plan_hash, request_hash, state FROM ph_cdb_set_plans WHERE request_id = ?').get(rid);
     if (prev) {
       if (prev.plan_hash !== hash || prev.request_hash !== requestHash) throw refuse(409, 'request_id_reused', '同じ保存の番号 (request_id) で違う作るセットが来ました。画面を開き直してください');
+      if (prev.state === 'waiting' || prev.state === 'dropped') {
+        plans.forEach((sp, i) => {
+          const held = setCodeHeld(sp.code, { requestId: rid, db });
+          if (held) throw refuse(409, 'set_code_taken', `作るセットの ${i + 1} 行目: ${held.message}。何も保存していません`, { field: 'card.sets', index: i });
+        });
+        db.prepare(`UPDATE ph_cdb_set_plans SET state = 'waiting', created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE request_id = ? AND state IN ('waiting', 'dropped')`).run(rid);
+      }
       return { ok: true, replayed: true };
     }
     plans.forEach((sp, i) => {
