@@ -1946,6 +1946,9 @@ await ta('[20] 文字コード (UTF-8 の BOM あり / なし・Shift_JIS)・CSV
   assert.deepEqual(recs.map((r) => [r.no, r.cells]), [[1, ['seller_sku', 'name', 'ne_code', 'qty']], [2, ['pr_x', 'はちみつ, 2 個組', 'a001', '2']], [3, ['pr_x', 'はちみつ, 2 個組', 'a002', '']],
     [5, ['pr_y', `名前の"中"${NL}2 行`, 'a003', '1']], [7, ['pr_z', '', 'ａ００４', '３']]], '空の行は飛ばす・行の番号は見出しを 1 行目に');
   assert.equal(errBulk(() => BK.parseCsvText(`a,b${NL}"x,1${NL}`))?.reason, 'bad_csv', '閉じていない引用符');
+  assert.equal(errBulk(() => BK.parseCsvText(`a,b${NL}"a001"x,1${NL}`))?.reason, 'bad_csv', '閉じた引用符の後に字 (黙って a001x にしない)');
+  assert.equal(errBulk(() => BK.parseCsvText(`a,b${NL}a0"01,1${NL}`))?.reason, 'bad_csv', '引用符の無い欄の途中の "');
+  assert.deepEqual(BK.parseCsvText(`a,b${NL}"","x""y"${NL}`)[1].cells, ['', 'x"y'], '空の引用符・中の "" はそのまま');
   assert.equal(errBulk(() => BK.parseCsvText(['h', '1', '2', '3', ''].join(NL), { maxRows: 3 }))?.status, 413, '行が多すぎる');
   // 形
   assert.deepEqual(BK.detectFormat(['qty', 'NE_CODE', ' Seller_SKU ', 'name']), { format: 'simple', col: { seller_sku: 2, name: 3, ne_code: 1, qty: 0 } }, '見出しの名前で列 (並びは自由・大文字も)');
@@ -2038,6 +2041,8 @@ await ta('[20] 保存 (20 件ずつ・1 つの画面と同じ saveAmazonMap): �
   assert.equal(await nReq(), n0, '閉じている = 保存の記録も作らない');
   r = await call('POST', '/api/amazon/bulk/apply', { body: { ticket: pv.ticket, items }, session: 'viewer' });
   assert.equal(r.status, 403);
+  const bad = await fetch(`${BASE}/api/amazon/bulk/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: new URL(BASE).origin, 'x-test-session': 'viewer' }, body: '{壊れた' });
+  assert.equal(bad.status, 403, '名簿の外の人 = 本文を読む前に断る (壊れた JSON でも 403)');
   // 印と違う中身 (数を変えた) = この 20 件は何も保存しない
   r = await call('POST', '/api/amazon/bulk/apply', { body: { ticket: pv.ticket, items: items.map((x, i) => (i === 0 ? { ...x, components: [{ code: 'a001', qty: 9 }] } : x)) } });
   assert.equal(r.status, 400); assert.equal(r.j.reason, 'ticket_mismatch');

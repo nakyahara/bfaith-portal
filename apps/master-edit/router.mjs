@@ -461,10 +461,11 @@ router.use('/api/', (req, res, next) => {
   next();
 });
 // 🆕 10/17 CSV の一括登録の試し取込 = ファイルの中身 (base64・2 MB まで → 約 2.7 MB) を受ける道だけ大きく (ほかの道は今までどおり 256kb)。名簿の人の確かめは道の中で
-//   結果の CSV (2,000 件の結果) も同じく大きく。どちらも名簿の人でなければ本文を読む前に断る
+//   結果の CSV (2,000 件の結果) も同じく大きく。どれも名簿の人でなければ本文を読む前に断る
 const bulkEditorOnly = (req, res, next) => { const g = editorGate(req); if (!g.ok) return res.status(403).json({ ok: false, error: g.message, reason: 'not_editor' }); next(); };
 router.use('/api/amazon/bulk/preview', bulkEditorOnly, express.json({ limit: '4mb' }));
-router.use('/api/amazon/bulk/report.csv', bulkEditorOnly, express.json({ limit: '2mb' }));
+router.use('/api/amazon/bulk/report.csv', bulkEditorOnly, express.json({ limit: '12mb' }));   // 2,000 件の名前 (255 字)・前と後・理由 (#Codex A R1 M)
+router.use('/api/amazon/bulk/apply', bulkEditorOnly);   // 保存の本文 (256kb) も名簿の人でなければ読む前に断る (#Codex A R1 M)
 router.use(express.json({ limit: '256kb' }));
 
 /** 書ける人か。env MASTER_EDITORS にメールをカンマ区切りで。名簿がすべて (admin でも名簿に無ければ不可・空なら誰も書けない) */

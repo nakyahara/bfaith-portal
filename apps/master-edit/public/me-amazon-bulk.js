@@ -141,14 +141,13 @@
             msg('bulk-apply-msg', ((x.j && x.j.error) || '保存できませんでした (HTTP ' + x.r.status + ')') + ' — ' + S.next + ' 件目まで送りました', 'err');
             return;
           }
-          var stop = false;
-          (x.j.results || []).forEach(function (res) { S.results[res.seller_sku] = res; if (!res.ok && res.error && res.error.reason === 'not_sent') stop = true; });
-          if (stop) {
-            // 接続が切れて送っていない分がある = その件から続ける (同じ番号)
-            var firstNot = chunk.findIndex(function (r) { var y = S.results[r.seller_sku]; return y && !y.ok && y.error.reason === 'not_sent'; });
-            S.next += Math.max(0, firstNot);
+          (x.j.results || []).forEach(function (res) { S.results[res.seller_sku] = res; });
+          // 結果の分からない件 (サーバーの誤り = 保存したか分からない) と送っていない件 = その件から続ける (同じ番号 = 保存していれば前の結果・#Codex A R1 M)
+          var firstNot = chunk.findIndex(function (r) { var y = S.results[r.seller_sku]; return !y || (!y.ok && (y.error.reason === 'not_sent' || y.error.reason === 'error')); });
+          if (firstNot >= 0) {
+            S.next += firstNot;
             S.busy = false; render();
-            msg('bulk-apply-msg', 'Company DB との接続が切れました。もう一度押すと続きから保存します (保存した分は 2 回入りません)', 'err');
+            msg('bulk-apply-msg', 'Company DB との接続が切れたか、サーバーの誤りで結果が分からない SKU があります。もう一度押すと、その SKU から同じ番号で続けます (保存した分は 2 回入りません)', 'err');
             return;
           }
           S.next += chunk.length;
@@ -164,7 +163,8 @@
 
   reportBtn.addEventListener('click', function () {
     if (!S.data) return;
-    var rows = S.data.rows.map(function (r) { return { seller_sku: r.seller_sku, line: r.line, action: r.action, name: r.name, components: r.components, result: resultText(r), errors: r.errors, warnings: r.warnings, notes: r.notes }; })
+    var cut = function (a) { return (a || []).map(function (t) { return String(t).slice(0, 500); }); };
+    var rows = S.data.rows.map(function (r) { return { seller_sku: r.seller_sku, line: r.line, action: r.action, name: r.name, components: r.components, result: String(resultText(r)).slice(0, 500), errors: cut(r.errors), warnings: cut(r.warnings), notes: cut(r.notes) }; })
       .concat(S.data.line_errors.map(function (e) { return { seller_sku: e.raw, line: e.no, action: 'error', name: '', components: [], result: '送らない', errors: [e.message], warnings: [], notes: [] }; }));
     fetch(BASE + '/api/amazon/bulk/report.csv', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rows: rows }) })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); var name = /filename="([^"]+)"/.exec(r.headers.get('content-disposition') || ''); return r.blob().then(function (b) { return { b: b, name: name ? name[1] : 'amazon-bulk-result.csv' }; }); })

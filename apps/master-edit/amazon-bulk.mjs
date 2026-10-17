@@ -76,8 +76,10 @@ export const ENCODING_WORDS = Object.freeze({ 'utf-8-bom': 'UTF-8 (BOM つき)',
 export function parseCsvText(text, { maxRows = BULK_MAX_ROWS + 1 } = {}) {
   const s = String(text).startsWith(BOM) ? String(text).slice(1) : String(text);
   const out = [];
-  let cells = []; let cell = ''; let inQ = false; let no = 1; let startNo = 1;
-  const endCell = () => { cells.push(cell); cell = ''; };
+  let cells = []; let cell = ''; let inQ = false; let closedQ = false; let no = 1; let startNo = 1;
+  // 🆕 #Codex A R1 Low: 壊れた引用符 ("a001"x・引用符の無い欄の途中の ") は黙って読まずに断る (違う商品コードに変わらないように)
+  const broken = () => bad(400, 'bad_csv', `CSV が壊れています (${no} 行目: 引用符 " の使い方が違います。" を含む欄は全体を "…" で囲み、中の " は "" にしてください)`);
+  const endCell = () => { cells.push(cell); cell = ''; closedQ = false; };
   const endRow = () => {
     endCell();
     if (cells.some((c) => c.trim() !== '')) {
@@ -89,10 +91,11 @@ export function parseCsvText(text, { maxRows = BULK_MAX_ROWS + 1 } = {}) {
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (inQ) {
-      if (c === '"') { if (s[i + 1] === '"') { cell += '"'; i++; } else inQ = false; } else { if (c === '\n' || (c === '\r' && s[i + 1] !== '\n')) no++; cell += c; }
+      if (c === '"') { if (s[i + 1] === '"') { cell += '"'; i++; } else { inQ = false; closedQ = true; } } else { if (c === '\n' || (c === '\r' && s[i + 1] !== '\n')) no++; cell += c; }
       continue;
     }
-    if (c === '"' && cell === '') { inQ = true; continue; }
+    if (closedQ && c !== ',' && c !== '\r' && c !== '\n') throw broken();
+    if (c === '"') { if (cell !== '') throw broken(); inQ = true; continue; }
     if (c === ',') { endCell(); continue; }
     if (c === '\r' || c === '\n') {
       if (c === '\r' && s[i + 1] === '\n') i++;
@@ -152,7 +155,7 @@ export function groupCsvRows(records) {
     }
     const key = normSku(sku);
     let g = by.get(key);
-    if (!g) { g = { key, sku, rawSku: rawSku.trim(), line: r.no, name: '', names: [], lines: [], errors: [], warnings: [] }; by.set(key, g); }
+    if (!g) { g = { key, sku, rawSku: rawSku.trim(), line: r.no, name: '', names: [], lines: [], codes: new Set(), over: 0, errors: [], warnings: [] }; by.set(key, g); }
     if (sku !== g.sku) g.errors.push(`${r.no} 行目: 同じ seller SKU が ${g.line} 行目と違う書き方 (${g.sku} と ${sku}) です。どちらかにそろえてください`);
     const name = cellAt(r, col.name).replace(CTRL_ALL, ' ').trim();
     if (name) { if (!g.name) g.name = name; else if (name !== g.name && !g.names.includes(name)) g.names.push(name); }
@@ -162,13 +165,19 @@ export function groupCsvRows(records) {
     if (CTRL_RE.test(code) || [...code].length > 60) { g.errors.push(`${r.no} 行目: NE の商品コード ${code.replace(CTRL_ALL, ' ').slice(0, 60)} が使えない形です (60 文字まで・改行なし)`); continue; }
     const qty = qRaw === '' ? 1 : /^\d{1,4}$/.test(qRaw) ? Number(qRaw) : NaN;
     if (!Number.isInteger(qty) || qty < 1 || qty > MAX_MAP_QTY) { g.errors.push(`${r.no} 行目: ${code} の数「${qRaw}」は 1〜${MAX_MAP_QTY} の整数にしてください`); continue; }
-    if (g.lines.some((x) => normSku(x.code) === normSku(code))) { g.errors.push(`${r.no} 行目: ${code} が同じ seller SKU に 2 回あります (同じ品は 1 行にして数で)`); continue; }
+    // 同じ品の確かめは Set (行が多くても 2 乗にしない・#Codex A R1 M)。構成品の上限を超えた行は数えるだけ (持たない)
+    const nk = normSku(code);
+    if (g.codes.has(nk)) { g.errors.push(`${r.no} 行目: ${code} が同じ seller SKU に 2 回あります (同じ品は 1 行にして数で)`); continue; }
+    if (g.lines.length >= MAX_MAP_COMPONENTS) { g.over++; continue; }
+    g.codes.add(nk);
     g.lines.push({ no: r.no, code, qty });
   }
   const skus = [...by.values()];
   if (skus.length > BULK_MAX_SKUS) throw bad(413, 'too_many_skus', `seller SKU が多すぎます (1 回に ${BULK_MAX_SKUS} 件まで・いま ${skus.length} 件)。ファイルを分けてください`, { max: BULK_MAX_SKUS, count: skus.length });
   for (const g of skus) {
-    if (g.lines.length > MAX_MAP_COMPONENTS) g.errors.push(`構成品が ${g.lines.length} 行あります (1〜${MAX_MAP_COMPONENTS} 行)`);
+    if (g.over) g.errors.push(`構成品が ${g.lines.length + g.over} 行あります (1〜${MAX_MAP_COMPONENTS} 行)`);
+    delete g.codes;
+    if (g.errors.length > 50) g.errors = [...g.errors.slice(0, 50), `ほか ${g.errors.length - 50} 件の誤り`];
     if (g.names.length) g.warnings.push(`名前が行によって違います。上の行の名前「${g.name}」を使います (ほか: ${g.names.slice(0, 3).join(' / ')})`);
     if (g.name) {
       if ([...g.name].length > MAX_MAP_NAME) g.errors.push(`名前は ${MAX_MAP_NAME} 文字までです`);
@@ -396,9 +405,10 @@ export async function bulkApplyChunk(db, input, { actor, open = false, nowMs = D
       const r = await saveAmazonMap(db, { actor, requestId: bulkRequestIdOf(t.id, it.seller_sku), sellerSku: it.seller_sku, name: it.name, components: it.components, reason, seen: { versions: it.versions } }, { open });
       results.push({ seller_sku: it.seller_sku, ok: true, result: { created: !!r.created, listing_created: !!r.listing_created, revived: !!r.revived, no_change: !!r.no_change, replayed: !!r.replayed, components: r.components || null } });
     } catch (e) {
-      if (e instanceof MasterWriteError) { results.push({ seller_sku: it.seller_sku, ok: false, error: { reason: e.reason, message: e.message } }); continue; }
+      // 保存の lib の誤り = 確かな答え。前に残した「サーバーエラー」の押し直し (reason error・replayed) も確かな失敗 = failed (画面がその件で止まり続けない)
+      if (e instanceof MasterWriteError) { results.push({ seller_sku: it.seller_sku, ok: false, error: { reason: e.reason === 'error' ? 'failed' : e.reason, message: e.message } }); continue; }
       const locked = e && (e.code === '55P03' || e.code === '40P01' || e.code === '40001');
-      if (locked) { results.push({ seller_sku: it.seller_sku, ok: false, error: { reason: 'locked', message: 'ほかの処理とぶつかりました。何も保存していません (もう一度押すとやり直します)' } }); continue; }
+      if (locked) { results.push({ seller_sku: it.seller_sku, ok: false, error: { reason: 'locked', message: 'ほかの処理とぶつかりました。何も保存していません (CSV をもう一度「試し取込」してから保存してください)' } }); continue; }
       console.error(`[amazon-bulk] ${it.seller_sku}: ${e && e.stack || e}`);
       broken = e;
       results.push({ seller_sku: it.seller_sku, ok: false, error: { reason: 'error', message: 'サーバーエラー (この seller SKU は保存していないかもしれません。もう一度押すと確かめて続けます)' } });
