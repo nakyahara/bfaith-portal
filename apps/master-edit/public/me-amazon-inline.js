@@ -7,7 +7,9 @@
  *   - 保存 = POST /api/amazon/save (1 つの画面と同じ道 = lib/amazon-map-write.mjs の門・版・request_id・構成品の決まり)。
  *     request_id は保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない・返事が来たら新しい番号)。理由 = 「◯◯ の一覧からその場で登録」
  *   - もう構成がある SKU (開いた間に誰かが作った) = その場では直さない (1 つの画面へ)
- *   - 開いて何か入れた欄がある = 離れるときに確かめる (MasterEdit.dirty)
+ *   - 開いて何か入れた欄がある (構成・名前を開いたときから変えた) = 離れるときに確かめる (MasterEdit.dirty)
+ *   - 🆕 #Codex R1 M: 結果の分からない保存 (通信が切れた) の後は、欄を閉じて同じ番号・同じ中身だけを送り直す (中身を変えて同じ番号で送らない)。
+ *     送っている間も欄は触れない
  */
 (function () {
   'use strict';
@@ -88,7 +90,9 @@
     open.push(E);
     E.load(true);
   }
-  Editor.prototype.touched = function () { return $$('.c-code', this.rows).some(function (x) { return x.value.trim(); }); };
+  Editor.prototype.touched = function () { return $$('.c-code', this.rows).some(function (x) { return x.value.trim(); }) || (this.name0 != null && this.name.value !== this.name0); };
+  /** 欄を触れなくする / 戻す (送っている間・結果の分からない保存の後) */
+  Editor.prototype.lock = function (on) { $$('input, button.iconbtn, .inl-add', this.body).forEach(function (x) { x.disabled = !!on; }); };
   Editor.prototype.msg = function (t, cls) { this.msgEl.className = 'msgline inl-msg' + (cls ? ' ' + cls : ''); this.msgEl.textContent = t || ''; };
   Editor.prototype.addRow = function (c) {
     var E = this, i = $$('tr', E.rows).length, sid = 'inl' + E.n;
@@ -154,6 +158,7 @@
         if (first) {
           E.addRow();
           E.name.value = j.name_default || '';
+          E.name0 = E.name.value;
           $('.inl-from', E.li).textContent = j.name_default ? (j.name_from === 'report' ? 'Amazon の出品一覧の商品名を入れました。直してもかまいません' : j.name_from === 'listing' ? '出品のタイトルを入れました。直してもかまいません' : '今の名前です') : '空なら、選んだ NE の商品の名前が入ります';
           if (!blocked) $('.c-code', E.rows).focus();
         }
@@ -163,7 +168,7 @@
   Editor.prototype.close = function () {
     var E = this;
     if (!E.saved && E.touched() && !window.confirm(E.sku + ' に入れた構成を捨てて閉じますか')) return;
-    E.sug.close();
+    E.sug.close(); E.sug.destroy();
     E.li.remove(); open = open.filter(function (x) { return x !== E; });
     E.btn.setAttribute('aria-expanded', 'false');
     if (!E.saved) E.btn.focus();
@@ -172,6 +177,8 @@
   Editor.prototype.save = function () {
     var E = this, saveBtn = $('.inl-save', E.li);
     if (E.busy || E.saved || saveBtn.disabled) return;
+    // 結果の分からない保存の後 = 同じ番号で同じ中身をもう一度 (欄は閉じてある)
+    if (E.pendingBody) { E.send(E.pendingBody); return; }
     var trs = $$('tr', E.rows), comps = [];
     for (var i = 0; i < trs.length; i++) {
       var code = $('.c-code', trs[i]).value.trim(), qty = $('.c-qty', trs[i]).value.trim();
@@ -180,12 +187,18 @@
     }
     if (!comps.length) { E.msg('NE の商品を 1 つ以上入れてください。何も保存していません', 'err'); $('.c-code', E.rows).focus(); return; }
     if (!E.name.value.trim()) { E.msg('名前 (社内) を入れてください。何も保存していません', 'err'); E.name.focus(); return; }
-    E.busy = true; saveBtn.disabled = true; E.msg('保存しています…');
-    var body = { request_id: E.requestId, seller_sku: E.sku, name: E.name.value.trim(), components: comps, reason: CFG.reason || 'その場で登録', seen: { versions: E.versions } };
+    E.send({ request_id: E.requestId, seller_sku: E.sku, name: E.name.value.trim(), components: comps, reason: CFG.reason || 'その場で登録', seen: { versions: E.versions } });
+  };
+  Editor.prototype.send = function (body) {
+    var E = this, saveBtn = $('.inl-save', E.li), comps = body.components;
+    E.busy = true; saveBtn.disabled = true; E.lock(true); E.msg('保存しています…');
     fetch(BASE + '/api/amazon/save', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
         E.busy = false;
+        // 返事が読めない (JSON でない = 途中の機械の誤りなど) = 保存されたか分からない = 送り直しと同じに扱う
+        if (!x.j || (!x.j.ok && !x.j.reason && !x.j.error)) { E.unknown(body); return; }
+        E.pendingBody = null;
         if (x.r.ok && x.j.ok) {
           E.saved = true; E.sug.close();
           var comp = (x.j.components || []).map(function (c) { return c.code + '×' + c.qty; }).join(', ');
@@ -201,7 +214,7 @@
           return;
         }
         E.requestId = uuid();   // 返事が来た = この番号の保存は終わった。直してもう一度は新しい番号
-        saveBtn.disabled = false;
+        saveBtn.disabled = false; E.lock(false);
         var reopen = REOPEN.indexOf(x.j.reason) >= 0;
         E.msg((x.j.error || '保存できませんでした (HTTP ' + x.r.status + ')') + (reopen ? ' →「読み直す」で今の版を読んでから、もう一度保存してください' : ''), 'err');
         if (reopen) {
@@ -211,7 +224,13 @@
           E.msgEl.appendChild(document.createTextNode(' ')); E.msgEl.appendChild(rb);
         }
       })
-      .catch(function () { E.busy = false; saveBtn.disabled = false; E.msg('通信できませんでした。もう一度押してください (同じ保存は 2 回入りません)', 'err'); });
+      .catch(function () { E.busy = false; E.unknown(body); });
+  };
+  /** 保存されたか分からない = 欄を閉じたまま、もう一度押すと同じ番号・同じ中身で送る */
+  Editor.prototype.unknown = function (body) {
+    this.pendingBody = body;
+    $('.inl-save', this.li).disabled = false;
+    this.msg('通信できませんでした。もう一度「保存する」を押すと、同じ中身をもう一度送ります (同じ保存は 2 回入りません。欄は送った中身のまま閉じています)', 'err');
   };
 
   document.addEventListener('click', function (e) {

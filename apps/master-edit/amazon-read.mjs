@@ -20,14 +20,17 @@ export { AMAZON_SKU_MAX_LEN };
 export const AMAZON_LIST_LIMIT = 100;
 export const UNMAPPED_DAYS = 7;
 /**
- * 未登録の期間 (10/17 中原さん「未登録の範囲を広げる切り替え」)。既定 = 直近 7 日 (今までどおり)。all = 全期間 (売上の日次が始まった日から)。
+ * 未登録の期間 (10/17 中原さん「未登録の範囲を広げる切り替え」)。既定 = 直近 7 日 (今までどおり)。all = 全期間 (直近 UNMAPPED_ALL_MAX_DAYS 日 = 5 年まで・画面に見た範囲を出す)。
  *   0054 の SQL の関数は 1 回に 60 日まで (least(p_days, 60)) = 長い期間は 60 日ずつに区切って何回か呼び、アプリで足す (migration を足さない)。
  *   画面のロールは注文の表を直接読めない (関数だけ) = 区切って呼ぶのがいちばん小さい
  */
-export const UNMAPPED_PERIODS = Object.freeze({ 7: '直近 7 日', 30: '直近 30 日', 90: '直近 90 日', all: '全期間' });
+export const UNMAPPED_PERIODS = Object.freeze({ 7: '直近 7 日', 30: '直近 30 日', 90: '直近 90 日', all: '全期間 (5 年まで)' });
 /** SQL の関数が 1 回に見る日数の上限 (0054 の ops.amazon_map_unmapped_recent・ops.amazon_map_sales_coverage の least(p_days, 60)) */
 export const UNMAPPED_WINDOW_MAX = 60;
-/** 全期間の上限 (売上の日次が 1 日も無い 60 日の幅に来たら、その前は見ない。来なくても 5 年まで = 関数を呼ぶのは多くて 31 回ずつ) */
+/**
+ * 全期間の上限 = 5 年 (関数を 31 回ずつ)。🆕 #Codex R1 High: 公開の無い 60 日の幅で途中で止めない (途中に長い欠けがあっても、それより古い注文を落とさない)。
+ *   画面のロールは注文・公開の始まりの日を直接読めない = 上限までいつも見る (始まる前の幅は関数が空を返すだけ = 軽い)
+ */
 export const UNMAPPED_ALL_MAX_DAYS = 1830;
 /** 画面・CSV の ?days= → { key, days (all = null) }。知らない値 = 既定の 7 日 */
 export function unmappedPeriodOf(q = {}) {
@@ -310,7 +313,7 @@ export async function amazonUnmapped(db, { now = new Date(), channels = null, da
   if (!(await regclass(db, 'core.amazon_sku_maps'))) return { rows: [], unknown: [], fbm: [], fbmNeCode: 0, today, undecided: [], tableMissing: true, channelsAvailable: !!channels, decidable: false, days, period, from: today };
   const range = await unmappedRange(db, today, days);
   const all = range.rows;
-  const base = { today, undecided: range.undecided, tableMissing: false, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID, days, period, from: range.from };
+  const base = { today, undecided: range.undecided, tableMissing: false, channelsAvailable: !!channels, shopCode: AMAZON_JP_SHOP_CODE, companyId: COMPANY_ID, days, period, from: range.from, publishedFrom: range.publishedFrom };
   if (!all.length) return { ...base, rows: [], unknown: [], fbm: [], fbmNeCode: 0, decidable: true, source: null };   // 候補が無い = 区分によらず 0 件 (R4 L1)
   // ① 出品一覧 (古くないときだけ)。鍵ごとに区分が 1 つのときだけ採る (食い違い = 'conflict')
   let report = null;
@@ -351,11 +354,10 @@ export async function amazonUnmapped(db, { now = new Date(), channels = null, da
 
 const UNMAPPED_SQL = 'select code, listing_id::text as listing_id, map_state, units::int as units, orders::int as orders, last_date::text as last_date from ops.amazon_map_unmapped_recent($1::date, $2)';
 /**
- * 期間の注文の未登録 (関数を 60 日ずつ・新しい幅から呼んで足す)。days = null (全期間) は、売上の日次が 1 日も公開されていない 60 日の幅に来たら止める
- *   (= 売上の日次が始まる前。注文の取り込みも同じ頃に始まった)。止まらなくても UNMAPPED_ALL_MAX_DAYS まで。
+ * 期間の注文の未登録 (関数を 60 日ずつ・新しい幅から呼んで足す)。days = null (全期間) は UNMAPPED_ALL_MAX_DAYS 日まで (途中で止めない)。
  *   足し方: 関数の行の鍵 (コード・出品・対応の状態) ごとに 個数 = 和・注文 = 和 (1 つの注文は 1 つの日 = 幅をまたがない)・最後に売れた日 = いちばん新しい日。
- *   未判定の日 = 公開されていない日。全期間は、公開がいちばん初めの日より前の日を数えない (始まる前の日 = 未判定ではない)
- *   戻り値 { rows (個数の多い順・コード順), undecided: ['YYYY-MM-DD'], from (見た幅のいちばん古い日) }
+ *   未判定の日 = 公開されていない日。全期間は、見た範囲で公開がいちばん初めの日 (publishedFrom) より前の日を未判定に数えない (売上の日次が始まる前 = 画面に一言で出す)
+ *   戻り値 { rows (個数の多い順・コード順), undecided: ['YYYY-MM-DD'], from (見た幅のいちばん古い日), publishedFrom (全期間だけ・無い = null) }
  */
 async function unmappedRange(db, today, days) {
   const allTime = days == null;
@@ -376,18 +378,19 @@ async function unmappedRange(db, today, days) {
     }
     from = addDaysYmd(end, -(n - 1));
     left -= n;
-    if (allTime && miss.length >= n) break;   // この幅に公開が 1 日も無い = 売上の日次が始まる前
     end = addDaysYmd(from, -1);
   }
   let undecided = [...missing].sort();
+  let publishedFrom = null;
   if (allTime) {
     // 公開のいちばん初めの日 (見た幅の中で、公開されていない日でない最初の日)。1 日も無い = 全部を未判定のまま
     let first = null;
     for (let d = from; d <= today; d = addDaysYmd(d, 1)) { if (!missing.has(d)) { first = d; break; } }
     if (first) undecided = undecided.filter((d) => d >= first);
+    publishedFrom = first;
   }
   const rows = [...merged.values()].sort((a, b) => b.units - a.units || (a.code < b.code ? -1 : a.code > b.code ? 1 : 0));
-  return { rows, undecided, from };
+  return { rows, undecided, from, publishedFrom };
 }
 
 /** 行の Amazon の商品名 (title): 出品一覧の今の取り込み (読めるときだけ) → 出品のタイトル。読めない = 付けない (画面・CSV は空) */

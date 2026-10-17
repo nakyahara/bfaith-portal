@@ -1755,8 +1755,10 @@ await ta('[18] 未登録の期間 (7 / 30 / 90 日・全期間): 60 日ずつ区
   };
   // zz_sold: 今の 60 日の幅 (2029-11-12〜) の外の 2029-10-20 にも売れた = 90 日 / 全期間だけ足す。zz_old (2029-12-01) は 30 日より前・60 日の中
   await order('2029-10-20', 'zz_sold', 2);
+  await order('2028-06-01', 'zz_ancient', 1);   // 公開の無い長い幅のさらに前 (#Codex R1 High: 途中で止めない)
   const um = (days) => asRole(E, 'master_edit', () => RU.amazonUnmapped(db, { now: new Date('2030-01-10T03:00:00Z'), channels: FEES_NOW, days }));
   const pick = (d) => Object.fromEntries([...d.rows, ...d.unknown, ...d.fbm].map((x) => [x.code, [x.units, x.orders, x.last_date]]));
+  let r0; let r;
   const d7 = await um(7);
   const direct = (await q(`select code, units::int as units, orders::int as orders, last_date::text as last_date from ops.amazon_map_unmapped_recent('2030-01-10', 7)`));
   assert.deepEqual(Object.keys(pick(d7)).sort(), direct.map((x) => x.code).sort(), '7 日 = 関数 1 回と同じ SKU');
@@ -1769,13 +1771,17 @@ await ta('[18] 未登録の期間 (7 / 30 / 90 日・全期間): 60 日ずつ区
   assert.equal(d90.from, '2029-10-13');
   assert.equal(d90.undecided.length, 83, '90 日: 公開されていない日 (公開は 2030-01-04〜10 の 7 日だけ) = 83 日');
   const dAll = await um(null);
-  assert.deepEqual([dAll.period, dAll.from], ['all', '2029-09-13'], '全期間: 公開が 1 日も無い 60 日の幅 (2029-09-13〜11-11) まで見て止まる');
+  assert.deepEqual([dAll.period, dAll.from, dAll.publishedFrom], ['all', new Date(Date.parse('2030-01-10T00:00:00Z') - (RU.UNMAPPED_ALL_MAX_DAYS - 1) * 864e5).toISOString().slice(0, 10), '2030-01-04'], '全期間: 5 年までいつも見る (公開の無い幅で止めない)');
+  assert.ok(pick(dAll).zz_ancient, '公開の無い長い幅より前の注文も出る');
+  assert.ok(!pick(d90).zz_ancient);
   assert.deepEqual(pick(dAll).zz_sold, [7, 4, '2030-01-10']);
   assert.deepEqual(dAll.undecided, [], '全期間: 公開がいちばん初めの日より前は未判定に数えない');
   assert.deepEqual(RU.unmappedPeriodOf({ days: '3' }), { key: '7', days: 7 });
+  r0 = await call('GET', '/amazon/unmapped?days=all');
+  assert.ok(r0.text.includes('id="unmapped-published-from"') && r0.text.includes('zz_ancient') && r0.text.includes('aria-current="true">全期間 (5 年まで)'), '全期間の画面: 公開の始まりの一言');
   assert.deepEqual(RU.unmappedPeriodOf({ days: 'all' }), { key: 'all', days: null });
   // 画面: 期間の札・90 日で zz_old・URL は ?days=90・既定の 7 日は引数なし
-  let r = await call('GET', '/amazon/unmapped?days=90');
+  r = await call('GET', '/amazon/unmapped?days=90');
   assert.equal(r.status, 200); await checkScripts(r.text);
   assert.ok(r.text.includes('zz_old') && r.text.includes('aria-current="true">直近 90 日'), '90 日の画面');
   assert.ok(r.text.includes('83 日 (2029-10-13 〜'), '未判定の日が多い = 数と範囲');

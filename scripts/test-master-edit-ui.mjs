@@ -3007,6 +3007,7 @@ await ta('[72] 未登録の一覧の「その場で登録」(10/17): 行の下�
   await p.evaluate(() => { const f = window.fetch; let once = true; window.fetch = function (u, o) { if (once && /\/api\/amazon\/save$/.test(String(u))) { once = false; return f(u, o).then(() => { throw new TypeError('切れた'); }); } return f(u, o); }; });
   await box.locator('.inl-save').click();
   await p.waitForFunction(() => /通信できませんでした/.test(document.querySelector('.inl-msg').textContent));
+  assert.equal(await in1.isDisabled(), true, '結果の分からない保存の後 = 欄を閉じる (同じ中身だけを送り直す・#Codex R1 M)');
   await box.locator('.inl-save').click();
   await box.locator('.result.ok').waitFor();
   assert.equal(ids.length, 2); assert.equal(ids[0], ids[1], '押し直し = 同じ request_id');

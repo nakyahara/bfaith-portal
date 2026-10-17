@@ -190,6 +190,8 @@
     sug.addEventListener('click', function (e) { var x = e.target.closest('.co'); if (x) chooseSug(Number(x.getAttribute('data-i'))); });
     window.addEventListener('resize', placeSug);
     window.addEventListener('scroll', placeSug, true);
-    return { onKey: onKey, close: closeSug, place: placeSug };
+    // 欄を閉じたら外す (開くたびに足した window の見張りを残さない・#Codex R1 Low)
+    function destroy() { closeSug(); window.removeEventListener('resize', placeSug); window.removeEventListener('scroll', placeSug, true); }
+    return { onKey: onKey, close: closeSug, place: placeSug, destroy: destroy };
   };
 })();
