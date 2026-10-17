@@ -2593,7 +2593,7 @@ await ta('[BL5] #1706 Codex R1: まとまりの原価は子ごとの実際の原
   assert.ok(!BLK.missingBlankKeys('variation', vb(two('', ''), '300')).includes('cost'), '共通の原価 = 全部の子にある');
   assert.ok(!BLK.missingBlankKeys('variation', vb([], '300')).includes('cost'), '子がまだ無い = 共通の原価で見る');
   const err = (fn) => { try { fn(); } catch (e) { return e; } assert.fail('断らなかった'); };
-  const others = ['shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'children.jan'];
+  const others = ['shipping_code', 'inbound_date_managed', 'card.official_url', 'card.amazon', 'card.reference_urls', 'children.jan'];   // 🆕 2026-10-17: まとまりにも参考 URL
   let e = err(() => BLK.checkRegisterBlanks('variation', { ...vb(two('100', '200')), blanks: ['cost', ...others] }));
   assert.deepEqual([e.status, e.reason, e.extra.field], [400, 'blank_with_value', 'cost'], '子に全部原価があるのに「入力なし: 原価」= 断る');
   assert.deepEqual(BLK.checkRegisterBlanks('variation', { ...vb(two('100', '')), blanks: ['cost', ...others] }), ['cost', ...others]);
@@ -2601,8 +2601,8 @@ await ta('[BL5] #1706 Codex R1: まとまりの原価は子ごとの実際の原
   const body = { ...vb([{ code: 'g-A', cost: '100', jan: '4901234567894' }, { code: 'g-B', cost: '', jan: '' }]), reason: '秋' };
   const pre = BLK.prepareRegisterBody('variation', { ...body, blanks: ['cost', ...others] });
   assert.equal(pre.ok, true, JSON.stringify(pre.json));
-  assert.equal(pre.body.reason, '秋 · 入力なし: 原価・発送方法・入荷日の管理・公式ページURL・Amazon・JAN');
-  assert.deepEqual(pre.childReasons, { 'g-A': '秋 · 入力なし: 発送方法・入荷日の管理・公式ページURL・Amazon', 'g-B': '秋 · 入力なし: 原価・発送方法・入荷日の管理・公式ページURL・Amazon・JAN' });
+  assert.equal(pre.body.reason, '秋 · 入力なし: 原価・発送方法・入荷日の管理・公式ページURL・Amazon・参考URL・JAN');
+  assert.deepEqual(pre.childReasons, { 'g-A': '秋 · 入力なし: 発送方法・入荷日の管理・公式ページURL・Amazon・参考URL', 'g-B': '秋 · 入力なし: 原価・発送方法・入荷日の管理・公式ページURL・Amazon・参考URL・JAN' });
   assert.equal(BLK.prepareRegisterBody('single', { ...blankBody('x'), blanks: BLK.missingBlankKeys('single', blankBody('x')) }).childReasons, null, '単品に子ごとの理由は無い');
   // lib の子ごとの理由: 子ごとに使う・無い登録のハッシュは前と同じ・知らない子は断る
   const vin = { actor: 'a@test', requestId: uuid(), group: { mode: 'new', code: 'g', name: 'G' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-A', name: 'A' }, { axis: 1, code: '-B', name: 'B' }],
