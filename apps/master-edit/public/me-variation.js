@@ -229,47 +229,52 @@
     S.oldOk = false;
     var nameOf = {};
     (g.kidRows || []).forEach(function (k) { nameOf[k.code] = k.name; });
+    // 1. 仮の名前 (hgs / vgs) = 商品名から読んだ値。人が打ったかどうかに関わらず全部の子で決める (Codex R2 M1: 打った後に元の値へ戻した = 仮のまま と見るため)
     g.kids.forEach(function (c) {
       var tail = norm(c).indexOf(norm(g.code)) === 0 ? c.slice(g.code.length) : '';
       var toks = tail.match(/-[A-Za-z0-9]+/g) || [];
-      var p = prev[c] || {};
       var gs = guessOldNames(g.name, nameOf[c], ac);
-      S.oldKid[c] = { hnum: two ? (toks[0] || '') : (OPT_RE.test(tail) ? tail : (toks[0] || tail)), vnum: two ? (toks.slice(1).join('') || '') : '',
-        // 人が打った縦の名前は 1 軸にしている間も持っておく (縦軸を足し直したら戻る = 前と同じ)
-        hname: p.hu ? (p.hname || '') : gs[0], vname: p.vu ? (p.vname || '') : (two ? gs[1] : ''),
-        hu: !!p.hu, vu: !!p.vu, hg: !p.hu && !!gs[0], vg: two && !p.vu && !!gs[1] };
+      S.oldKid[c] = { hnum: two ? (toks[0] || '') : (OPT_RE.test(tail) ? tail : (toks[0] || tail)), vnum: two ? (toks.slice(1).join('') || '') : '', hgs: gs[0], vgs: two ? gs[1] : '' };
     });
-    // 迷う仮の名前は空に戻す: 同じ「コードにつける文字」に違う名前・同じ名前に違う文字 (読み違いのしるし)・横と縦が入れ替わっていそう (名前 = もう一方の文字)
-    var drop = function (r, j) { if (j === 0) { r.hname = ''; r.hg = false; } else { r.vname = ''; r.vg = false; } };
+    // 2. 迷う仮の名前は空に戻す: 同じ「コードにつける文字」に違う名前・同じ名前に違う文字 (読み違いのしるし)・横と縦が入れ替わっていそう (名前 = もう一方の文字)
     var numOf = function (r, j) { return norm(j === 0 ? r.hnum : r.vnum); };
-    var nameAt = function (r, j) { return nkey(j === 0 ? r.hname : r.vname); };
-    var guessed = function (r, j) { return j === 0 ? r.hg : r.vg; };
+    var gsAt = function (r, j) { return j === 0 ? r.hgs : r.vgs; };
+    var drop = function (r, j) { if (j === 0) r.hgs = ''; else r.vgs = ''; };
+    var bad = [];
     for (var j = 0; j < ac; j++) {
       var byNum = new Map(), byName = new Map();
       g.kids.forEach(function (c) {
-        var r = S.oldKid[c];
-        if (!guessed(r, j)) return;
-        if (!byNum.has(numOf(r, j))) byNum.set(numOf(r, j), new Set());
-        byNum.get(numOf(r, j)).add(nameAt(r, j));
-        if (!byName.has(nameAt(r, j))) byName.set(nameAt(r, j), new Set());
-        byName.get(nameAt(r, j)).add(numOf(r, j));
+        var r = S.oldKid[c]; if (!gsAt(r, j)) return;
+        var kn = numOf(r, j), nm = nkey(gsAt(r, j));
+        if (!byNum.has(kn)) byNum.set(kn, new Set());
+        byNum.get(kn).add(nm);
+        if (!byName.has(nm)) byName.set(nm, new Set());
+        byName.get(nm).add(kn);
       });
       g.kids.forEach(function (c) {
-        var r = S.oldKid[c];
-        if (guessed(r, j) && (byNum.get(numOf(r, j)).size > 1 || byName.get(nameAt(r, j)).size > 1)) drop(r, j);
+        var r = S.oldKid[c]; if (!gsAt(r, j)) return;
+        if (byNum.get(numOf(r, j)).size > 1 || byName.get(nkey(gsAt(r, j))).size > 1) bad.push([r, j]);
       });
     }
+    bad.forEach(function (x) { drop(x[0], x[1]); });
     if (two) {
       g.kids.forEach(function (c) {
         var r = S.oldKid[c];
         var hc = norm(String(r.hnum || '').slice(1)), vc = norm(String(r.vnum || '').slice(1));
-        var swapped = (r.hg && vc && nameAt(r, 0) === vc && vc !== hc) || (r.vg && hc && nameAt(r, 1) === hc && vc !== hc);
-        // 🆕 #Codex R1 M2: 消すのは仮の名前だけ (人が打った名前は残す)
-        if (swapped) { if (r.hg) drop(r, 0); if (r.vg) drop(r, 1); }
+        if ((r.hgs && vc && nkey(r.hgs) === vc && vc !== hc) || (r.vgs && hc && nkey(r.vgs) === hc && vc !== hc)) { drop(r, 0); drop(r, 1); }
       });
     }
-    // 🆕 #Codex R1 M1: 仮に入れた値を覚えておく (直した後に元の値へ戻した = まだ仮 = 確かめが要る)
-    g.kids.forEach(function (c) { var r = S.oldKid[c]; r.hgs = r.hg ? r.hname : ''; r.vgs = r.vg ? r.vname : ''; });
+    // 3. 画面の値: 人が打った名前 (hu / vu) はそのまま (縦の名前は 1 軸の間も持っておく)・ほかは仮の名前 (hg / vg = 仮のまま)
+    g.kids.forEach(function (c) {
+      var r = S.oldKid[c], p = prev[c] || {};
+      r.hu = !!p.hu; r.vu = !!p.vu;
+      r.hname = r.hu ? (p.hname || '') : r.hgs;
+      r.vname = r.vu ? (p.vname || '') : r.vgs;
+      r.hg = !r.hu && !!r.hgs; r.vg = two && !r.vu && !!r.vgs;
+      // 人が打った値が仮の名前と同じ = 仮のまま (確かめが要る)
+      if (r.hu && r.hgs && String(r.hname).trim() === r.hgs) { r.hu = false; r.hg = true; }
+      if (two && r.vu && r.vgs && String(r.vname).trim() === r.vgs) { r.vu = false; r.vg = true; }
+    });
   }
 
   // 子 = 横 × 縦 の組み合わせ (今ある子は出さない・前に作らなかった組み合わせは「前回は作らなかった」)
@@ -598,7 +603,8 @@
             }).join('')
             + '<td class="st">' + (row.errs.length ? row.errs.map(errLine).join('') : '<span class="why-ok">' + icon('check', 's') + 'OK</span>') + '</td></tr>';
         }).join('') + '</tbody></table></div>'
-        + (m.oldGuessed ? '<label class="oldok"><input type="checkbox" id="old-ok"' + (S.oldOk ? ' checked' : '') + dis + '><span>仮に入れた名前 (<b id="old-ok-n">' + m.oldGuessed + '</b> 件) を見て、合っているのを確かめた</span></label>' : '')
+        // 確かめたのチェックはいつも置く (仮の名前が 0 件 = 隠す・打っている間に仮の名前が戻ったら出す = Codex R2 M2)
+        + '<label class="oldok"' + (m.oldGuessed ? '' : ' hidden') + '><input type="checkbox" id="old-ok"' + (S.oldOk ? ' checked' : '') + dis + '><span>仮に入れた名前 (<b id="old-ok-n">' + m.oldGuessed + '</b> 件) を見て、合っているのを確かめた</span></label>'
         + '</div>';
     }
     var obEl = $('#old-box');
@@ -650,6 +656,7 @@
       });
     });
     var on = $('#old-ok-n'); if (on) on.textContent = String(m.oldGuessed);
+    var ol = $('#old-box .oldok'); if (ol) ol.hidden = !m.oldGuessed;
   }
 
   function renderCommon(m) {

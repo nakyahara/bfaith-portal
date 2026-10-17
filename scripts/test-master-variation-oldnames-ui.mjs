@@ -261,6 +261,26 @@ await ta('[N3] 1 軸の迷う名前 (kz400): 同じ名前の子が 2 つ (違う
   const i = await info(p);
   assert.ok(i.issues.some((x) => /^前からある子の名前 \(商品名から仮に入れた 1 件\)/.test(x)), JSON.stringify(i.issues));
   for (const c of ['kz400-BE', 'kz400-BR', 'kz400-NV']) assert.ok(i.issues.some((x) => x.startsWith(`前からある ${c}: カラーの名前`)), c);
+  // 🆕 Codex R2: 直した後に (縦軸を足す / 外すを挟んでも) 元の仮の値へ戻した = 仮のまま・確かめたのチェックも出し直す (ほかの欄で描き直した後でも)
+  const GY = '#old-box input[data-oc="kz400-GY"][data-of="hname"]';
+  const ask = async () => (await info(p)).issues.some((x) => /^前からある子の名前 \(商品名から仮に入れた 1 件\)/.test(x));
+  await fill(p, GY, 'グレー杢');
+  await p.click('#ax-v button[data-v="1"]');
+  await p.click('#ax-v button[data-v="0"]');
+  await settle(p);
+  assert.equal(await p.inputValue(GY), 'グレー杢', '人が打った名前は残る');
+  assert.equal(await ask(), false);
+  await fill(p, '#c-months', '3');   // ほかの欄 = 全部描き直す (仮が 0 件 = チェックは隠れる)
+  await settle(p);
+  assert.equal(await p.isVisible('#old-ok'), false);
+  await fill(p, GY, 'グレー');
+  await settle(p);
+  assert.equal(await ask(), true, '元の仮の値 = 確かめが要る');
+  assert.equal(await guessTags(p), 1);
+  assert.equal(await p.isVisible('#old-ok'), true, '確かめたのチェックが出る');
+  await p.check('#old-ok');
+  await settle(p);
+  assert.equal(await ask(), false);
 });
 
 console.log('\n参考 URL (まとまりの登録)');
