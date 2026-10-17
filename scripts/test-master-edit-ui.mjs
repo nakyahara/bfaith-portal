@@ -44,6 +44,8 @@
  *  69 スマホ 390: 上の帯から行ける道 (ポータル・左の列・全体から探す)。隠すのはダッシュボードと「マスタの入力」の札だけ (ほかの .btn は隠さない)。写し = MASTER_EDIT_UI_SHOTS_390=フォルダ
  *  70 Amazon SKU の構成の欄を日本語の名前で探す (10/16): 本物の IME (CDP) で変換中から候補・確定の Enter の 3 つの並び (Windows の Chrome・Edge / Safari) で箱を閉じない・数の欄へ移らない・
  *     マウスで確定した後の Enter は食べない
+ *  72〜74 1 つの商品の画面の「← 前へ」「次へ →」(10/17): 来た一覧と同じ並び・絞り込みの前・次と場所・続けて次へ・最初 / 最後・一覧に無い・出さないとき・
+ *     未保存のまま押す = 離れるときの確認 (ここに残る / 捨てて移る)・スマホ 390 ではみ出さない・44px
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -2939,7 +2941,7 @@ await ta('[71] 発注の設定のグループを名前・ID で絞る (10/16 中
   }
 });
 
-// ── [71] 1 つの商品の画面の「← 前へ」「次へ →」(10/17 中原さん) ──
+// ── [72]〜[74] 1 つの商品の画面の「← 前へ」「次へ →」(10/17 中原さん) ──
 /** 前へ・次へが出るまで待って、{ pos, prev, next } (押せない = null) */
 const pnState = async (p) => {
   await p.waitForSelector('#sku-pn:not([hidden]) #pn-pos', { timeout: 5000 });
@@ -2950,7 +2952,7 @@ const pnState = async (p) => {
   });
 };
 const codesFor = (p, qs) => p.evaluate((u) => fetch(u).then((r) => r.json()).then((j) => j.codes), `${B}/api/codes${qs}`);
-await ta('[71] 前へ・次へ (10/17): 来た一覧 (同じ絞り込み・並び) の中の前・次と「2 / 3」・続けて押しても同じ一覧・最初 / 最後は押せない・一覧に無い・一覧から来ていない / 期限切れ = 出さない・パンくずは同じ一覧へ', async (p) => {
+await ta('[72] 前へ・次へ (10/17): 来た一覧 (同じ絞り込み・並び) の中の前・次と「2 / 3」・続けて押しても同じ一覧・最初 / 最後は押せない・一覧に無い・一覧から来ていない / 期限切れ = 出さない・パンくずは同じ一覧へ', async (p) => {
   await p.goto(B + '/?q=' + encodeURIComponent('はちみつ'));
   const codes = await listCodes(p);
   assert.deepEqual(codes, await codesFor(p, '?q=' + encodeURIComponent('はちみつ')));
@@ -3014,7 +3016,7 @@ await ta('[71] 前へ・次へ (10/17): 来た一覧 (同じ絞り込み・並�
   assert.equal(await p.locator('#sku-pn').isHidden(), true, '一覧から来ていない = 出さない');
 });
 
-await ta('[72] 前へ・次へ と未保存 (10/17): 変えたまま「次へ」= 離れるときの確認 (ここに残る = 同じ画面・押した所へフォーカス / 捨てて移る = 次の商品・保存していない)', async (p) => {
+await ta('[73] 前へ・次へ と未保存 (10/17): 変えたまま「次へ」= 離れるときの確認 (ここに残る = 同じ画面・押した所へフォーカス / 捨てて移る = 次の商品・保存していない)', async (p) => {
   await p.goto(B + '/?q=s00');
   const codes = await listCodes(p);
   assert.ok(codes.length >= 3, codes.join(','));
@@ -3045,7 +3047,7 @@ await ta('[72] 前へ・次へ と未保存 (10/17): 変えたまま「次へ」
   assert.equal((await pnState(p)).pos, `3 / ${codes.length}`, '移った先も同じ一覧');
 });
 
-await ta('[73] 前へ・次へ スマホ 390 (10/17): パンくずと前へ・次へが横にはみ出さない・押す所は 44px で押せる (長いコードでも)', async (p) => {
+await ta('[74] 前へ・次へ スマホ 390 (10/17): パンくずと前へ・次へが横にはみ出さない・押す所は 44px で押せる (長いコードでも)', async (p) => {
   await p.goto(B + '/?q=' + encodeURIComponent('はちみつ'));
   const codes = await listCodes(p);
   await Promise.all([p.waitForNavigation(), p.click(`a.rowlink:text-is("${codes[1]}")`)]);
