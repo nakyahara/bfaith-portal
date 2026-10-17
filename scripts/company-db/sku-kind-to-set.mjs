@@ -29,9 +29,11 @@
  *   - NE: warehouse.db の NE の完全な取得 (36 時間以内) で、そのコードがセットの表にある (セット)・取込の整合で保持していない・
  *     構成品がちょうど読める (数量 1〜999 の整数・1〜20 品・自分自身でない・重ならない)
  *   - 構成品は Company DB の単品・やめた / NE から消す途中でない
- *   - 最新の夜間ロード (ops.master_load_commits の最後) の判断の記録 skus.kind_held に [コード, set, single] がある・構成の持ち主が load なら
- *     その回が読んだ構成の材料の控え (ops.load_materials の世代・DATA_DIR) の構成品と数量が NE の取得と同じ (次の夜間ロードが構成を変えない)・構成品に今回セットにするコードが無い
- *     (= Render の材料 (NE) もセットと見ている = 直した後の夜間ロードも区分のずれを出さない)・構成の持ち主が load なら飛ばした構成品が NE の構成品と同じ
+ *   - 最新の夜間ロード (ops.master_load_commits の最後) が読んだ材料の控え (ops.load_materials の世代・DATA_DIR = 照合 ① と同じ) と判断の記録が次のどちらか:
+ *       A = 材料は「単品・構成なし」・kind_held なし (材料は作り直し rebuild-m-products.js が社内の区分の写しを重ねて作る = NE はセット・社内は単品のとき。10/17 の本番)
+ *       B = 材料は「セット」で構成品と数量が NE の取得と同じ・kind_held に [コード, set, single] (写しを重ねない材料)
+ *     構成の持ち主が load なら構成の判断の記録の形も確かめる・構成品に今回セットにするコードが無い (入れ子にしない)
+ *     (A のとき直した後の夜間ロードは sku_kind_held (材料 単品・社内 セット) を記録するだけ = 区分・構成・商品の行は変えない。翌朝の写し → 作り直しから材料もセット + 構成)
  *   - 計画のハッシュ = 人・理由・コード・今の値・NE の観測・書くもの全部 (apply は dry-run のハッシュ --expect-hash と同じときだけ)
  * 鍵 (apply): 段階 (共有) → マスタの書き込み (共有 = 夜間ロードと並ばない) → SKU ごと (sku_id の順・構成品も) → NE の CSV → 商品の行 → SKU の行 → 読み直す → ハッシュ
  *
@@ -213,26 +215,35 @@ export async function readKindPlan(db, opts, { ne, now = new Date() } = {}) {
         problems.push(`最新の夜間ロード (${lastLoad.ingest_run_id}) の構成の判断の記録 (set_components) が無い / 形が違う / 持ち主が load でない = 夜間ロードの材料の構成と照らせない`);
         compDec = null;
       }
-      // 夜間ロードが読んだ構成の材料 (ops.load_materials の世代 = miniPC の DATA_DIR の控え。照合 ① と同じ読み方) = 構成品と数量を NE の取得と照らす
-      //   (#R2 High: 数量が違えば次の夜間ロードが構成を材料の数量に直し、計算した原価だけが残る)。読めない = 断る
-      const lm = (await db.query(`select status, generation_id, content_hash from ops.load_materials where ingest_run_id = $1 and entity = 'set_components'`, [lastLoad.ingest_run_id])).rows[0] || null;
-      loadInfo.set_components_generation = lm ? lm.generation_id : null;
-      if (!lm || lm.status !== 'matched' || !lm.generation_id) problems.push(`最新の夜間ロード (${lastLoad.ingest_run_id}) の構成の材料の世代 (ops.load_materials) が無い / matched でない (${lm ? lm.status : 'なし'})`);
-      else if (!ne || ne.error || !ne.dataDir) problems.push('夜間ロードの構成の材料の控えを読めない (DATA_DIR が無い)');
+      // 夜間ロードが読んだ材料 (ops.load_materials の世代 = miniPC の DATA_DIR の控え。照合 ① と同じ読み方) の商品区分と構成を NE の取得と照らす。読めない = 断る
+      //   🚨 材料 (m_products・m_set_components) は Company DB の区分の写しを重ねて作る (rebuild-m-products.js の pub.kindOf = 区分の持ち主が company)。
+      //   NE はセット・社内は単品 = 材料も「単品・構成なし」= 夜間ロードは区分のずれを記録しない (kind_held なし。10/17 の本番の dry-run で分かった)。
+      //   直した後の朝の写し → 作り直しから材料もセット + 構成 (同じ warehouse.db の NE の行から作る = 構成と数量は NE の取得と同じ)。
+      //   #R2 High: 材料がセットなら構成品と数量が NE の取得と同じこと
+      const lms = (await db.query(`select entity, status, generation_id, content_hash from ops.load_materials where ingest_run_id = $1 and entity in ('products', 'set_components')`, [lastLoad.ingest_run_id])).rows;
+      const lmP = lms.find((x) => x.entity === 'products'); const lmS = lms.find((x) => x.entity === 'set_components');
+      loadInfo.material_generation = lmS ? lmS.generation_id : null;
+      if (!lmP || !lmS || lmP.status !== 'matched' || lmS.status !== 'matched' || !lmS.generation_id || lmP.generation_id !== lmS.generation_id) {
+        problems.push(`最新の夜間ロード (${lastLoad.ingest_run_id}) の材料の世代 (ops.load_materials) が無い / matched でない / 商品と構成で世代が違う`);
+      } else if (!ne || ne.error || !ne.dataDir) problems.push('夜間ロードの材料の控えを読めない (DATA_DIR が無い)');
       else {
         try {
           const { readMaterialSnapshot } = await import('../../apps/warehouse/material-lineage.js');
-          const snap = readMaterialSnapshot({ dataDir: ne.dataDir, generationId: lm.generation_id, expected: { set_components: lm.content_hash } });
-          if (!snap) problems.push(`夜間ロードの構成の材料の控え (${lm.generation_id}) が DATA_DIR に無い`);
+          const snap = readMaterialSnapshot({ dataDir: ne.dataDir, generationId: lmS.generation_id, expected: { products: lmP.content_hash, set_components: lmS.content_hash } });
+          if (!snap) problems.push(`夜間ロードの材料の控え (${lmS.generation_id}) が DATA_DIR に無い`);
           else {
-            loadMat = new Map();
+            loadMat = { kinds: new Map(), comps: new Map() };
+            for (const row of snap.products || []) {
+              const p = normSku(row['商品コード']);
+              if (p) loadMat.kinds.set(p, loadMat.kinds.has(p) ? '(重なり)' : (row['商品区分'] ?? null));
+            }
             for (const row of snap.set_components || []) {
               const p = normSku(row['セット商品コード']);
-              if (!loadMat.has(p)) loadMat.set(p, []);
-              loadMat.get(p).push([normSku(row['構成商品コード']), Number(row['数量'])]);
+              if (!loadMat.comps.has(p)) loadMat.comps.set(p, []);
+              loadMat.comps.get(p).push([normSku(row['構成商品コード']), Number(row['数量'])]);
             }
           }
-        } catch (e) { problems.push(`夜間ロードの構成の材料の控え (${lm.generation_id}) を読めない (${String(e && e.message).slice(0, 120)})`); }
+        } catch (e) { problems.push(`夜間ロードの材料の控え (${lmS.generation_id}) を読めない (${String(e && e.message).slice(0, 120)})`); }
       }
     } else {
       warnings.push('構成の持ち主が company = 夜間ロードは構成を入れない・直さない (この道具の行がそのまま残る)。夜間ロードの材料の構成とは照らさない');
@@ -284,28 +295,26 @@ export async function readKindPlan(db, opts, { ne, now = new Date() } = {}) {
       ['reg_csv_live', 'NE 登録の CSV の途中'], ['ne_del_live', 'NE から消す CSV の途中'], ['logizard', 'ロジザードのバーコードの決め方・依頼・CSV がある (単品だけの表)'],
       ['case_content', 'ほかの商品のケースの中身 (product_physicals.case_content_sku_id)']];
     for (const [key, words] of stop) if (ref[key]) problems.push(`${code}: ${words} (${ref[key]} 件) = 直さない`);
-    // 夜間ロードの判断の記録: NE (Render の材料) = セット・社内 = 単品
-    const h = held ? held.get(norm) : null;
-    if (held && !(h && h.ne_kind === 'set' && h.cdb_kind === 'single')) {
-      problems.push(`${code}: 最新の夜間ロード (${loadInfo.ingest_run_id}) が「NE はセット・社内は単品」と記録していない (${h ? `${h.ne_kind} / ${h.cdb_kind}` : '記録なし'}) = 夜間ロードの材料がまだセットと見ていない`);
-    }
     const f = facts.get(norm) || { children: [] };
-    // 構成の持ち主が load なら、夜間ロードが飛ばした構成品 (kind_held) = NE の構成品 (2 つの NE の写しが同じ構成)
-    let loadChildren = null;
-    if (compDec) {
-      loadChildren = compDec.skipped.filter((x) => Array.isArray(x) && normSku(x[0]) === norm && x[2] === 'kind_held').map((x) => normSku(x[1])).sort();
-      const neKids = f.children.map((c) => c.code_norm);
-      if (f.children.length && stable(loadChildren) !== stable(neKids)) {
-        problems.push(`${code}: 夜間ロードの材料の構成品 (${loadChildren.join('・') || 'なし'}) と NE の取得の構成品 (${neKids.join('・')}) が違う`);
-      }
-    }
-    // 夜間ロードの材料の構成 (構成品と数量) = NE の取得の構成 (#R2 High)
-    let loadComps = null;
+    // 夜間ロードの材料 (Company DB の区分を重ねた写し) と判断の記録。受け入れる形は 2 つだけ (ほか = 断る):
+    //   A = 材料は「単品・構成なし」(社内の区分 単品の写し)・判断の記録に kind_held なし = 今の本番の形 (10/17 の dry-run)
+    //   B = 材料は「セット」で構成品と数量が NE の取得と同じ・判断の記録に [コード, set, single] (写しを重ねない材料の形)
+    const h = held ? held.get(norm) : null;
+    let loadComps = null; let loadKind = null; let loadCase = null;
     if (loadMat) {
-      loadComps = (loadMat.get(norm) || []).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+      loadKind = loadMat.kinds.has(norm) ? loadMat.kinds.get(norm) : null;
+      loadComps = (loadMat.comps.get(norm) || []).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
       const neComps = f.children.map((c) => [c.code_norm, c.qty]);
-      if (f.children.length && stable(loadComps) !== stable(neComps)) {
-        problems.push(`${code}: 夜間ロードの材料の構成 (${loadComps.map((x) => `${x[0]} × ${x[1]}`).join('・') || 'なし'}) と NE の取得の構成 (${neComps.map((x) => `${x[0]} × ${x[1]}`).join('・')}) が違う (構成品か数量)`);
+      const show = (xs) => xs.map((x) => `${x[0]} × ${x[1]}`).join('・') || 'なし';
+      if (loadKind === '単品' && !loadComps.length && held && !h) loadCase = 'A';
+      else if (loadKind === 'セット' && f.children.length && stable(loadComps) === stable(neComps) && h && h.ne_kind === 'set' && h.cdb_kind === 'single') loadCase = 'B';
+      else {
+        problems.push(`${code}: 夜間ロード (${loadInfo.ingest_run_id}) の材料と判断の記録が受け入れる形でない (材料の商品区分 ${loadKind ?? '材料に無い'}・材料の構成 ${show(loadComps)}・`
+          + `NE の取得の構成 ${show(neComps)}・判断の記録 ${h ? `${h.ne_kind} / ${h.cdb_kind}` : 'kind_held なし'})`);
+      }
+      if (loadCase === 'A') {
+        warnings.push(`${code}: 夜間ロードの材料は社内の区分の写し (単品・構成なし)。直した後の夜間ロードがこの材料のままなら sku_kind_held (材料 単品・社内 セット) を記録するだけ `
+          + '(区分・構成・商品の行は変えない)。翌朝の写し → 作り直しから材料もセット + 構成 (同じ NE の行)');
       }
     }
     // 構成品に今回セットにするコードがある = セットの入れ子になる (#R2 Medium)
@@ -351,7 +360,7 @@ export async function readKindPlan(db, opts, { ne, now = new Date() } = {}) {
       before: { sku_kind: 'single', product_id: k.product_id, product_code: k.display_code ?? null, product_status: k.product_status ?? null,
         name: k.name, price: k.price, tax_rate: k.tax_rate, tax_class: k.tax_class, handling: k.handling, handling_own: k.handling_own ?? null, open_cost: openCost },
       refs: ref,
-      ne: { ne_code: f.ne_code, name: f.name, price: f.price, children: f.children, load_children: loadChildren, load_components: loadComps },
+      ne: { ne_code: f.ne_code, name: f.name, price: f.price, children: f.children, load_kind: loadKind, load_components: loadComps, load_case: loadCase },
       components: kids.map((c) => ({ sku_id: c.sku_id, code: c.code, qty: c.qty })),
       derived: { changes: derived.changes, notes: derived.notes, cost_plan: derived.costPlan },
     });
