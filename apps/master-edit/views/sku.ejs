@@ -96,7 +96,11 @@
   <div class="page" id="sku-page">
   <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
   <% if (page) { %>
+    <div class="crumb-row">
     <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span class="mono" aria-current="page"><%= c.code %></span></nav>
+    <%# 🆕 10/17: 来た一覧の中の前・次の商品 (me-prevnext.js が来た一覧の条件で api/neighbors に聞いて出す。一覧から来ていない・読めない = 出さない) %>
+    <nav class="pn" id="sku-pn" aria-label="一覧の前後の商品" data-code="<%= c.code %>" hidden></nav>
+    </div>
     <div class="ph" id="sku-ph">
       <div>
         <div class="idrow">
@@ -614,6 +618,8 @@
   <%# 🆕 PR-7b: まとまりの操作の窓 (名前を直す・子の廃止・代表の採用) %>
   <% if (page && locals.variationOn && canEdit && !closed) { %><%- include('_vops') %><script src="<%= base %>/public/me-vops.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-sku.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 10/17: 一覧の前・次の商品へ (離れるときの確認は me-shell.js のリンクの見張りがそのまま効く) %>
+  <% if (page) { %><script src="<%= base %>/public/me-prevnext.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0071: 下書きを消す = 押せる人・押せるときだけ (me-sku.js の後 = 未保存の数を読む) %>
   <% if (page && typeof deldraft !== 'undefined' && deldraft && deldraft.show && deldraft.canGo && canEdit && !dbError && !closed) { %><script src="<%= base %>/public/me-draft-cancel.js?v=<%= assetV %>" defer></script><% } %>
   <%# me-order.js は me-sku.js の後 (MasterEdit.dirty に発注の設定の未保存を足す) %>

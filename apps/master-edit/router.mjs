@@ -95,18 +95,19 @@ import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS, jstDate } from '../../lib/master-write.mjs';
 import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
-import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf } from '../../lib/master-register-blanks.mjs';
+import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf, legacyRefsScreen, hasRequestRecord } from '../../lib/master-register-blanks.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
+import { listSkus, listNeighbors, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
 import { bulkInspect, bulkPreview, bulkApplyChunk, editableOf, BULK_MAX, BULK_CHUNK, COST_REASONS, FIX_GROUPS } from './bulk.mjs';
 import { buildListCsv, csvFileName, buildAmazonCsv, amazonCsvFileName, buildUnmappedCsv, unmappedCsvFileName } from './list-csv.mjs';
 import { LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, ViewPrefsInputError } from './list-columns.mjs';
 import { readViewPrefs, saveViewPrefs } from './view-prefs.mjs';
+import { listImages, IMAGE_STATE_WORDS } from './list-images.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
@@ -635,11 +636,13 @@ router.get('/', (req, res) => {
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
     // 列の設定 (人ごと・Render の SQLite)。読めない = いつもの列 (一覧は出す)
     const listView = await readViewPrefs(req.session?.email);
+    // 画像の列 (10/17): このページの行だけ・キャッシュを読むだけ (無い物は裏で楽天に取りに行く)。列を出していない人の分は取りに行かない
+    const imgOf = listImages(data.rows, { queue: listView.view.shown.includes('img') });
     const locals = pageLocals(req, phase);
     // まとめて変える (PR2): 書ける人 (名簿) で、保存を開いていて、Company DB を読めたときだけ左のチェックを出す
     const bulk = { on: !!db && locals.canEdit && !locals.closed, max: BULK_MAX, chunk: BULK_CHUNK, costReasons: COST_REASONS, groups: FIX_GROUPS, multiMax: MULTI_MAX };
     res.render(view('index.ejs'), { ...locals, ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max,
-      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk });
+      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk, imgOf, IMAGE_STATE_WORDS });
   });
 });
 /**
@@ -720,6 +723,40 @@ router.get('/api/codes', (req, res) => {
   }, 'read', { deadline });
 });
 /**
+ * 1 つの商品の画面の「← 前へ」「次へ →」(10/17 中原さん)。?cur=<商品コード> + 来た一覧の URL の条件 (札・絞る欄・詳細検索・印 ?s=・並び) のまま。
+ * 返す = { ok, total, pos, prev, next, offset } (read.mjs の listNeighbors) / 410 (条件の期限切れ) / 413 (件数の上限) / 503 (時間・つながらない)。
+ * 画面を開いた後に画面の JS が聞く (画面の表示は待たせない)。時間は全部コピーより短く (NEIGHBOR_TIME_MS)・1 つの文も残りの時間まで (deadlineDb)。
+ * 読めない = 画面はボタンを出さないだけ (一覧へ戻るパンくずはそのまま)
+ */
+const NEIGHBOR_TIME_MS = 8e3;
+router.get('/api/neighbors', (req, res) => {
+  const deadline = Date.now() + Math.min(EXPORT_LIMITS.timeMs, NEIGHBOR_TIME_MS);
+  return withPgApi(res, async (db) => {
+  res.set('Cache-Control', 'no-store');
+  const cur = String(req.query.cur ?? '').trim().slice(0, 100);
+  if (!cur) return res.status(400).json({ ok: false, error: '商品コード (cur) がありません' });
+  const { filters, searchExpired, poOk } = listQuery(req);
+  if (searchExpired) return res.status(410).json({ ok: false, error: '条件の期限が切れました', reason: 'expired' });
+  let data;
+  const tdb = deadlineDb(db, deadline);
+  try {
+    // 在庫の範囲・注文残あり・在庫の並びは、一覧と同じ参考の値で絞る・並べる (全部コピーと同じ)
+    const extras = filters.stock_min || filters.stock_max || filters.po || filters.sort === 'stock' ? await listExtras(tdb, poOk, deadline) : {};
+    // 絞る・並べるのに要る参考の値が今は読めない = 一覧で見た並びと違うかもしれない (在庫順 → コード順など) = 前後を出さない (Codex R1 Medium)
+    const needStock = !!(filters.stock_min || filters.stock_max || filters.sort === 'stock');
+    if ((needStock && !(extras.stock && extras.stock.ok)) || (filters.po && !(extras.backorders && extras.backorders.ok))) {
+      return res.status(503).json({ ok: false, error: '在庫・注文残を読めないので、一覧と同じ並びを出せません', reason: 'extras_unreadable' });
+    }
+    data = await listNeighbors(tdb, filters, cur, { now: new Date(clock()), extras, max: EXPORT_LIMITS.max, deadline });
+  } catch (e) {
+    if (e instanceof ListTimeoutError || isStatementTimeout(e)) return res.status(503).json({ ok: false, error: '時間がかかりすぎました', reason: 'timeout' });
+    throw e;
+  }
+  if (!data.ok) return res.status(413).json({ ok: false, error: '一覧の件数が多すぎます', reason: data.reason, total: data.total, atLeast: data.atLeast });
+  res.json(data);
+  }, 'read', { deadline });
+});
+/**
  * 列の設定 (10/8 PR1・人ごと)。読み書きは自分の分だけ = 鍵はセッションのメール (本文・URL に人の名前を受けない)。
  * 書くのは一覧を見られる人なら誰でも (自分の見え方だけ・Company DB には書かない)。POST は /api/ の守り (Origin が Host と同じ・JSON) を通る
  */
@@ -794,7 +831,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     entryClosed: gated || !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || VARIATION_KEYS.some((k) => own[k] !== 'company') || !lease.open
       || !writeConfigured() || !(page && page.backfillDone),
     entryWhy,
-    maxKids: VARIATION_MAX_CHILDREN,
+    maxKids: VARIATION_MAX_CHILDREN, maxRefs: MAX_REFERENCE_URLS,   // 🆕 2026-10-17: 参考 URL (単品の登録と同じ上限)
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     orderSettings: orderScreen(req, editorGate(req), null),
     orderNoneApplies,
@@ -879,7 +916,18 @@ router.post('/api/new/variation', (req, res) => {
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
   // 🆕 必須でない項目 = 値か「入力なし」(印 blanks) のどちらか。どちらでもない = 400 (何も書かない)・入力なしの一覧は理由に足す (lib/master-register-blanks.mjs)
   //   発注の設定の 6 つは、ここでは数えない (下 = その request_id の記録がまだ無いときだけ・要求のハッシュに入らない = #1706 Codex R2 M)
-  const pre = prepareRegisterBody('variation', req.body || {});
+  let pre = prepareRegisterBody('variation', req.body || {});
+  // 🆕 2026-10-17 (#Codex R1 M3): 参考 URL の欄が無かった前の画面の本文 = 参考 URL を数えずに確かめ直しておき、下で request_id の記録があるとき
+  //   (前の画面で保存できた登録の押し直し = lib が前の答えを返す) だけ通す。記録が無い = 新しい登録 = 断る (画面を開き直してもらう)
+  let legacyRefs = null;
+  if (!pre.ok && pre.json.blank_key === 'card.reference_urls' && legacyRefsScreen('variation', req.body)) {
+    const alt = prepareRegisterBody('variation', req.body || {}, { skip: ['card.reference_urls'] });
+    if (alt.ok) {
+      legacyRefs = { status: pre.status, json: { ...pre.json, screen_outdated: true,
+        error: '「参考 URL」は、値を入れるか「入力なし」を選んでください (前の画面には参考 URL の欄がありません。画面を開き直してください)。何も保存していません' } };
+      pre = alt;
+    }
+  }
   if (!pre.ok) return res.status(pre.status).json(pre.json);
   const b = pre.body;
   const rid = String(b.request_id ?? '').trim().toLowerCase();
@@ -901,6 +949,8 @@ router.post('/api/new/variation', (req, res) => {
     }
   }
   return withPgApi(res, async (db) => withRequestLock(db, b.request_id, async () => {   // 🆕 #1719 R5: 同じ request_id は 1 つずつ (鍵の後に保存済みかを見る)
+    // 🆕 #Codex R1 M3: 前の画面の本文は、保存の記録がある (押し直し) ときだけ (鍵の後に見る)
+    if (legacyRefs && !(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid) && (await hasRequestRecord(db, rid)))) return res.status(legacyRefs.status).json(legacyRefs.json);
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ (子ごと) → commit の後に届ける。入る前 = 今までどおり ② をすぐ書く。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);

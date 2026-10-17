@@ -208,6 +208,16 @@ await ta('[9] 権限: 呼び手 (watch_writer) の一時の型 (domain) の CHEC
       // NE の元のコード (0041・③b-1b): jsonb_to_recordset の列の型・%rowtype も pg_catalog / ops で解く
       assert.equal((await p3.query('select ops.record_ne_codes($1::pg_catalog.jsonb) as r', [JSON.stringify({ compare_run_id: run(10),
         entries: [{ code_norm: 'x1', kind: 'product', state: 'ok', ne_code: 'X1', spellings: ['X1'] }] })])).rows[0].r.state, 'written');
+      // 🆕 0083 (設計 25 PR-1): 今朝の NE の値・ロジザードの書き方 (jsonb の要素・時刻の比べ・%rowtype・core.norm_code も持ち主の側で解く)
+      const side = (n, extra) => ({ started_at: '2030-01-09T22:00:00.000Z', finished_at: '2030-01-09T22:05:00.000Z', complete_rev: 1, fetched_rows: n, write_attempts: n, stored_rows: n,
+        dropped_no_code: 0, dropped_missing_fields: 0, raw_rows: n, ...extra });
+      assert.equal((await p3.query('select ops.record_ne_values($1::pg_catalog.jsonb) as r', [JSON.stringify({ compare_run_id: run(10), norm_version: 1,
+        fetch: { fingerprint: 'c'.repeat(64), products: side(1, { codes: 1, set_overlap: 0 }), sets: side(0, { codes: 0 }) },
+        entries: ['name', 'handling', 'tax_rate', 'standard_price_jpy', 'cost', 'primary_supplier'].map((col) => ({ code_norm: 'x1', col, ne_kind: 'single', state: 'unknown', reason: 'raw_unknown' })) })])).rows[0].r.state, 'written');
+      const ex = new Date(Date.now() - 3600000);
+      assert.equal((await p3.query('select ops.record_lz_codes($1::pg_catalog.jsonb) as r', [JSON.stringify({ lz_daily_run_id: 'lzd_20300110T000000000Z_abcdef',
+        export: { exported_at: ex.toISOString(), stamp_at: new Date(ex.getTime() + 45000).toISOString(), stamp_date: new Date(ex.getTime() + 9 * 3600000).toISOString().slice(0, 10), csv_sha256: 'd'.repeat(64), rows: 1 },
+        ids: ['X1'] })])).rows[0].r.state, 'written');
       // 新商品の NE 登録の CSV の確かめ (0053・⑤-2b・#1571 R1 High 2・R2 Medium 1 = 回の始まりの写し → 観測 → 受け取り → 確かめの 4 つ)
       assert.equal((await p3.query('select ops.snapshot_ne_reg_targets($1::pg_catalog.text) as r', [run(10)])).rows[0].r.state, 'taken');
       const w = (await p3.query('select ops.record_ne_registration_observations($1::pg_catalog.jsonb) as r', [JSON.stringify({ compare_run_id: run(10),
@@ -224,9 +234,9 @@ await ta('[9] 権限: 呼び手 (watch_writer) の一時の型 (domain) の CHEC
     assert.equal((await p3.query(`select value from ops.master_ne_baseline where code_norm = 'x1' and col = 'name'`)).rows[0].value, 'X');
     assert.deepEqual((await p3.query(`select ne_code from ops.master_ne_codes`)).rows, [{ ne_code: 'X1' }]);
     const rows = (await p3.query(`select p.proname, p.proconfig from pg_proc p where p.prosecdef and has_function_privilege('watch_writer', p.oid, 'execute')`)).rows;
-    assert.deepEqual(rows.map((r) => r.proname).sort(), ['close_new_entry_for_compare', 'record_decision_candidates', 'record_decision_done', 'record_ne_baseline', 'record_ne_codes', 'record_ne_registration_check', 'record_ne_registration_observations', 'record_new_entry_gate', 'record_parent_gate', 'seal_ne_registration_run', 'snapshot_ne_reg_targets']);   // 🆕 0068: 照合 ② の代表 (親) の数えの記録 / 0058: 照合 ② の始めに閉じる・新商品のゲートの結果 (広げる道 PR-1)
+    assert.deepEqual(rows.map((r) => r.proname).sort(), ['close_new_entry_for_compare', 'record_decision_candidates', 'record_decision_done', 'record_lz_codes', 'record_ne_baseline', 'record_ne_codes', 'record_ne_registration_check', 'record_ne_registration_observations', 'record_ne_values', 'record_new_entry_gate', 'record_parent_gate', 'seal_ne_registration_run', 'snapshot_ne_reg_targets']);   // 🆕 0068: 照合 ② の代表 (親) の数えの記録 / 0058: 照合 ② の始めに閉じる・新商品のゲートの結果 (広げる道 PR-1) / 🆕 0083: 今朝の NE の値・ロジザードの書き方
     // 0053 (⑤-2b) の確かめの関数は ops も外す (名前は全部 schema つき = ⑤-2a の約束)。ほかは 0034〜0041 の決まり (最後に pg_temp)
-    const want = Object.fromEntries(['close_new_entry_for_compare', 'record_new_entry_gate', 'record_parent_gate', 'record_ne_registration_check', 'record_ne_registration_observations', 'seal_ne_registration_run', 'snapshot_ne_reg_targets'].map((n) => [n, ['search_path=pg_catalog, pg_temp']]));
+    const want = Object.fromEntries(['close_new_entry_for_compare', 'record_new_entry_gate', 'record_parent_gate', 'record_ne_registration_check', 'record_ne_registration_observations', 'seal_ne_registration_run', 'snapshot_ne_reg_targets', 'record_ne_values', 'record_lz_codes'].map((n) => [n, ['search_path=pg_catalog, pg_temp']]));
     for (const r of rows) assert.deepEqual(r.proconfig, want[r.proname] ?? ['search_path=pg_catalog, ops, pg_temp'], `${r.proname} の search_path が決まりと違う (先頭に別の schema を足しても見つける)`);
   } finally { await p3.close(); }
 });
