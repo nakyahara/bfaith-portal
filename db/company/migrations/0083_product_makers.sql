@@ -161,7 +161,7 @@ revoke all on function ops.create_maker(uuid, text, text) from public;
  * p_via = register / variation (登録の取引の中) / sku_page (商品の画面の保存の取引の中)・p_reason = 記録に残す理由 (無くてよい)
  * 戻り値 = { ok, sku_id, product_id, maker_id, maker_name, from_maker_id, from_maker_name, changed }
  * 断る: invalid_input / before_cutover / not_single (セット・例外・商品の行の無い SKU) / cancelled (登録をやめた) / maker_unknown (名簿に無い・使わない) /
- *       version_conflict (今のメーカーが画面の見ていたものと違う)
+ *       master_write_session_required (門を通った保存・登録の取引の外) / version_conflict (今のメーカーが画面の見ていたものと違う)
  */
 create function ops.set_product_maker(p_request_id uuid, p_actor_id text, p_sku_id bigint, p_maker_id bigint, p_seen_maker_id bigint, p_via text, p_reason text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
@@ -171,6 +171,7 @@ declare
   v_mk      core.makers;
   v_cur     core.product_makers;
   v_from    text;
+  v_sess    ops.master_write_sessions;
 begin
   if p_request_id is null or p_sku_id is null then raise exception 'invalid_input: request_id と SKU が要る' using errcode = '22023'; end if;
   if ops.reg_actor_problem(p_actor_id, p_reason) is not null or p_actor_id !~ '^[^[:space:]@]+@[^[:space:]@]+$' then
@@ -188,6 +189,16 @@ begin
     raise exception 'not_single: メーカーは単品の商品だけ (SKU %・セットのメーカーは構成品から)', p_sku_id using errcode = '22023';
   end if;
   if s.reg = 'cancelled' then raise exception 'cancelled: 登録をやめた商品 (SKU %) には書かない', p_sku_id using errcode = '22023'; end if;
+  -- 守り: 門を通った保存・登録の取引の中だけ (直に呼んでも、段階・持ち主表・MASTER_EDIT_OPEN・新規開始の許可を見た約束が無ければ書かない)。
+  --   sku_page = この取引の今の約束 (ops.begin_master_write = sku_edit・この SKU) / register・variation = この取引でこの SKU を登録した約束 (ops.register_new_sku = sku_create) の行
+  if p_via = 'sku_page' then
+    v_sess := ops.current_master_write_session();
+    if v_sess.session_id is null or v_sess.operation is distinct from 'sku_edit' or v_sess.sku_id is distinct from p_sku_id then
+      raise exception 'master_write_session_required: 商品の画面のメーカーは、同じ取引でこの SKU の保存 (ops.begin_master_write) を始めた後だけ' using errcode = '42501';
+    end if;
+  elsif not exists (select 1 from ops.master_write_sessions w where w.txid = pg_catalog.txid_current() and w.operation = 'sku_create' and w.sku_id = p_sku_id) then
+    raise exception 'master_write_session_required: 新商品のメーカーは、その SKU を登録した同じ取引の中だけ (ops.register_new_sku の後)' using errcode = '42501';
+  end if;
   -- 鍵: SKU の鍵 → 商品の行 (商品の画面の保存・登録の取引はもう持っている = 同じ取引で取り直しても待たない)
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.sku:' || p_sku_id::text, 0));
   perform 1 from core.products p where p.product_id = s.product_id for update;

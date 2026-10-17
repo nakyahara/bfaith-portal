@@ -312,14 +312,30 @@ await ta('[S2] ほかの人が変えた後の保存 = 409 version_conflict (編�
   const b = await call('POST', '/api/sku/s002', { body: { request_id: uuid(), seen: { token: old }, values: { maker: MIKAWA.id } } });
   assert.deepEqual([b.status, b.j.reason], [409, 'version_conflict']);
   assert.deepEqual(await makerOf('s002'), { id: HONPO.id, name: 'はちみつ 本舗' });
-  // DB の関数を直に呼んでも、見ていたメーカーが違えば断る
+  // DB の関数を直に呼ぶ = 門を通った保存・登録の取引の外 = 断る (商品の画面 = 保存の約束が無い / 登録 = この取引でその SKU を登録していない)
   await asEditor(async () => {
+    for (const via of ['sku_page', 'register', 'variation']) {
+      await pg.query('begin');
+      try { await assert.rejects(pg.query('select ops.set_product_maker($1::uuid, $2, $3::bigint, $4::bigint, $5::bigint, $6, null)', [uuid(), 'naka@test', id2, MIKAWA.id, via === 'sku_page' ? HONPO.id : null, via]), /master_write_session_required/, via); }
+      finally { await pg.query('rollback'); }
+    }
+  });
+  // 保存の約束 (ops.begin_master_write・この SKU) の中でも、見ていたメーカーが今と違えば断る (DB でも照らす)・ほかの SKU の約束では書けない
+  await asEditor(async () => {
+    const cur = await W.readCurrent(db, id2, today);
+    const begin = () => pg.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb, $5, $6::bigint, $7, $8, $9::jsonb)',
+      [uuid(), 'naka@test', null, T.OWN, 'sku_edit', id2, W.editTokenOf(cur), 'a'.repeat(64), JSON.stringify(W.editVersionsOf(cur))]);
     await pg.query('begin');
-    try { await assert.rejects(pg.query('select ops.set_product_maker($1::uuid, $2, $3::bigint, $4::bigint, null, $5, null)', [uuid(), 'naka@test', id2, MIKAWA.id, 'sku_page']), /version_conflict/); }
-    finally { await pg.query('rollback'); }
+    try {
+      await begin();
+      await assert.rejects(pg.query("select ops.set_product_maker($1::uuid, 'naka@test', $2::bigint, $3::bigint, null, 'sku_page', null)", [uuid(), id2, MIKAWA.id]), /version_conflict/);
+    } finally { await pg.query('rollback'); }
+    const id1 = (await one("select sku_id::text as id from core.skus where code = 's001'")).id;
     await pg.query('begin');
-    try { await assert.rejects(pg.query("select ops.set_product_maker($1::uuid, 'naka@test', $2::bigint, null, null, 'register', null)", [uuid(), id2]), /version_conflict/); }
-    finally { await pg.query('rollback'); }
+    try {
+      await begin();
+      await assert.rejects(pg.query("select ops.set_product_maker($1::uuid, 'naka@test', $2::bigint, $3::bigint, null, 'sku_page', null)", [uuid(), id1, MIKAWA.id]), /master_write_session_required/);
+    } finally { await pg.query('rollback'); }
   });
   page = await call('GET', '/sku/s002');
   const c = await call('POST', '/api/sku/s002', { body: { request_id: uuid(), seen: { token: tok(page.text) }, values: { maker: '999999' } } });
