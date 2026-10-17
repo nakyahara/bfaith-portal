@@ -9,11 +9,12 @@
  *   - 子 = 横 × 縦 の全部の組み合わせ (マス目で 作る ⇄ 作らない)・今ある子は出さない・前回作らなかった組み合わせは最初は「作らない」(押すと作る)
  *   - 子の名前 = 共通の商品名【横の選択肢名】【縦の選択肢名】【JAN】(JAN 無しは省く)。人が直した名前は自動では変えない
  *   - 上限 120 を超えたら保存を止めて、色そのものを分ける案 (残りの色は「次に足す色」に残す → 保存の後に「残りを足す」)
- *   - NE で作った古いまとまり = 最初の 1 回だけ、前からある子の「コードにつける文字」(コードの末尾から仮に入れる) と色の名前 (空 = 人が打つ) を確かめる
+ *   - NE で作った古いまとまり = 最初の 1 回だけ、前からある子の「コードにつける文字」(コードの末尾から仮に入れる) と色の名前を確かめる
+ *     🆕 2026-10-17: 色の名前も子の商品名 (まとまりの名前のあとの【…】) から仮に入れる (読めない・迷う = 空 = 人が打つ)。仮のままの名前は「確かめた」のチェックが要る
  *   - 今あるまとまりに足す = 今ある子の値を写す (どの子から・値が違う項目は人が選ぶ = 自動では選ばない)
  *   - スマホの幅: 手順の帯は「4/7 選択肢 ← 前へ / 次へ →」・キーボードの間は下の帯を小さく・子が 30 件をこえたら「パソコンがおすすめ」
  *   🆕 2026-10-13 中原さん「全部そろわないと入力できない」: 必須でない項目 (原価・発送方法・入荷日の管理・発注の設定 6 つ・公式ページ URL・Amazon URL・
- *     JAN の無い子) は「値」か「入力なし」(public/me-none.js)。どちらでもない = 「まだ入れていない」に数える (保存できない)。
+ *     参考 URL (🆕 2026-10-17・単品の登録と同じ欄)・JAN の無い子) は「値」か「入力なし」(public/me-none.js)。どちらでもない = 「まだ入れていない」に数える (保存できない)。
  *     送る本文の blanks = 入力なしにした項目 (サーバー = lib/master-register-blanks.mjs がもう一度確かめて、登録の理由に残す)
  */
 (function () {
@@ -61,7 +62,15 @@
   var COMMON0 = { price: '', cost: '', tax: '', sales: '', supplier: '', months: '', expiry: '', inbound: '', ship: '' };
   /** 「入力なし」にできる項目 (key → [画面の名前, 飛ぶ所, 共通の欄の名前 (今ある子の値が違うときは選ぶまで数えない)]) */
   var NONE_ITEMS = [['cost', '原価', '#c-cost', 'cost'], ['shipping_code', '発送方法', '#c-ship', 'ship'], ['inbound_date_managed', 'ロジザードの入荷日の管理', '#c-inbound button', 'inbound']];
-  var NONE_CARD = [['card.official_url', '公式ページ URL', '#official-url'], ['card.amazon', 'Amazon URL', '#amazon-url']];
+  var NONE_CARD = [['card.official_url', '公式ページ URL', '#official-url'], ['card.amazon', 'Amazon URL', '#amazon-url'], ['card.reference_urls', '参考 URL', '#ref-rows .ref-url']];
+  // 🆕 2026-10-17: 参考 URL (単品の登録と同じ = 何行でも・20 個まで・形はサーバー (lib/master-register.mjs parseCard の urlIn) と同じ決まり)
+  var MAX_REFS = P.maxRefs || 20;
+  var refUrls = function () { return $$('#ref-rows .ref-url').map(function (x) { return x.value.trim(); }).filter(Boolean); };
+  var urlProblem = function (s) {
+    if (s.length > 1000) return '1,000 字までです';
+    if (/[\x00-\x1f\x7f\u2028\u2029]/.test(s) || !/^https?:\/\/\S+$/i.test(s)) return 'http:// か https:// で始まる URL を入れてください';
+    return null;
+  };
   var janAll = false;   // 作る子が全部 JAN を持つ (= JAN の「入力なし」は要らない)
   var lzAll = false;    // 🆕 0080: 作る子が全部ロジザードのバーコード (形の合う値) を持つ (= 「空欄で送る」は要らない)
   var LZ_ON = !!P.lzReady;   // 🆕 0080: ロジザードのバーコードの欄を出すか (0080 がある DB だけ)
@@ -80,7 +89,7 @@
   // ---------- 画面の状態 ----------
   var fresh = function () {
     return { mode: 'new', gcode: '', gname: '', pk: null, q: '', results: null, axisName: ['', ''], vOn: false, optText: ['', ''], nextOpts: [],
-      common: Object.assign({}, COMMON0), copied: null, conflicts: {}, picks: {}, oldKid: {},
+      common: Object.assign({}, COMMON0), copied: null, conflicts: {}, picks: {}, oldKid: {}, oldOk: false,
       excluded: new Set(), optIn: new Set(), edits: {}, filter: 'all', open: null, janPaste: false, janMsg: '', lzPaste: false, lzMsg: '', flash: null, done: null };
   };
   var S = fresh();
@@ -143,16 +152,128 @@
       cancelled: g.children.filter(function (k) { return k.cancelled; }).map(function (k) { return k.code; }) };
   }
 
-  // NE で作ったまとまり: 前からある子のコードの末尾から、コードにつける文字を仮に入れる (名前は空 = 人が打つ)
+  /**
+   * 🆕 2026-10-17 中原さん「既存のバリエーションに新規追加をする際に既存の過去のバリエーションの名前もすべて入力する必要があり大変だった」:
+   *   前からある子の選択肢名を、子の商品名から仮に読み取る (まとまりの名前のあとの【…】= 新しい子の名前の作り方 (名前【横】【縦】【JAN】) と同じ形)。
+   *   読める形 (ac = 軸の数): 1 軸 = 「名前【ブラウン】」(かっこ 1 つ)・かっこの無い 1 語「名前 ブラウン」
+   *     2 軸 = 「名前【ブラウン】【M】」(かっこ 2 つ)・「名前【ブラウン / M】」「名前【ブラウン・M】」(かっこ 1 つの中に区切り 1 つ)・「名前 ブラウン / M」
+   *   かっこ = 【】［］[]（）()。終わりの【JAN】(8 けた・13 けたの数字) は外す。
+   *   迷う (まとまりの名前で始まらない・かっこの外に文字・かっこが多い・区切りが 2 つ・名前とくっついている…) = 空 (人が打つ)。
+   *   戻り値 [横の名前, 縦の名前] (読めない = '')。合っているかは人が確かめる (画面の「仮」・「確かめた」のチェック)
+   */
+  var BRACKETS = { '【': '】', '［': '］', '[': ']', '（': '）', '(': ')' };
+  var BRACKET_RE = /[【】［］\[\]（）()]/;
+  function guessOldNames(base, name, ac) {
+    var none = ['', ''];
+    var b = String(base == null ? '' : base).trim(), n = String(name == null ? '' : name).trim();
+    if (!b || !n) return none;
+    var raw = null;
+    if (n.indexOf(b) === 0) raw = n.slice(b.length);
+    else if (n.normalize('NFKC').indexOf(b.normalize('NFKC')) === 0) raw = n.normalize('NFKC').slice(b.normalize('NFKC').length);
+    if (raw == null) return none;
+    var rest = raw.replace(/　/g, ' ').trim();
+    if (!rest) return none;
+    var bracketed = !!BRACKETS[rest[0]];
+    var parts = [];
+    if (bracketed) {
+      var s = rest;
+      while (s) {
+        var close = BRACKETS[s[0]];
+        if (!close) return none;   // かっこの外に文字 = 迷う
+        var end = s.indexOf(close, 1);
+        if (end < 0) return none;
+        var inner = s.slice(1, end).trim();
+        if (!inner || BRACKET_RE.test(inner)) return none;
+        parts.push(inner);
+        s = s.slice(end + 1).replace(/^\s+/, '');
+      }
+    } else {
+      if (BRACKET_RE.test(rest)) return none;          // かっこの前に文字 = 迷う
+      if (!/^[\s　]/.test(raw)) return none;       // 名前とくっついている (「ウールストールブラウン」) = 迷う
+      parts.push(rest);
+    }
+    // 終わりの JAN (新しい子の名前の【JAN】) は外す
+    while (parts.length > 1 && /^(\d{8}|\d{13})$/.test(parts[parts.length - 1])) parts.pop();
+    var ok = function (x) { x = String(x || '').trim(); return x && x.length <= 100 && !/[\x00-\x1f\x7f]/.test(x) && !/^(\d{8}|\d{13})$/.test(x) ? x : ''; };
+    if (ac !== 2) {
+      if (parts.length !== 1) return none;
+      if (!bracketed && /\s/.test(parts[0])) return none;   // かっこの無い名前は 1 語だけ (「大判 ブラウン」= 迷う)
+      return [ok(parts[0]), ''];
+    }
+    if (parts.length === 2) {
+      var h2 = ok(parts[0]), v2 = ok(parts[1]);
+      return h2 && v2 ? [h2, v2] : none;
+    }
+    if (parts.length !== 1) return none;
+    // かっこ 1 つの中の区切り: 先に「/」、無ければ「×」、無ければ「・」「,」「、」(かっこ無し = 「/」だけ)。その区切りがちょうど 1 つのときだけ
+    var seps = bracketed ? [/[\/／]/g, /[×✕]/g, /[・･,，、]/g] : [/[\/／]/g];
+    for (var i = 0; i < seps.length; i++) {
+      var hits = parts[0].match(seps[i]);
+      if (!hits) continue;
+      if (hits.length !== 1) return none;
+      var two = parts[0].split(seps[i]);
+      var h1 = ok(two[0]), v1 = ok(two[1]);
+      return h1 && v1 ? [h1, v1] : none;
+    }
+    return none;
+  }
+  ME.__guessOldNames = guessOldNames;   // 試験から呼ぶ (画面の動きは変えない)
+
+  // NE で作ったまとまり: 前からある子のコードの末尾から「コードにつける文字」を、子の商品名から名前を仮に入れる (読めない = 空 = 人が打つ)。
+  //   人が打った名前 (hu / vu) は縦軸を足す・外すで作り直しても残す。仮のまま (hg / vg) の名前は「確かめた」にチェックするまで保存できない
   function initOldKids(g) {
     var two = S.vOn;
+    var ac = two ? 2 : 1;
     var prev = S.oldKid;
     S.oldKid = {};
+    S.oldOk = false;
+    var nameOf = {};
+    (g.kidRows || []).forEach(function (k) { nameOf[k.code] = k.name; });
+    // 1. 仮の名前 (hgs / vgs) = 商品名から読んだ値。人が打ったかどうかに関わらず全部の子で決める (Codex R2 M1: 打った後に元の値へ戻した = 仮のまま と見るため)
     g.kids.forEach(function (c) {
       var tail = norm(c).indexOf(norm(g.code)) === 0 ? c.slice(g.code.length) : '';
       var toks = tail.match(/-[A-Za-z0-9]+/g) || [];
-      var p = prev[c] || {};
-      S.oldKid[c] = { hnum: two ? (toks[0] || '') : (OPT_RE.test(tail) ? tail : (toks[0] || tail)), vnum: two ? (toks.slice(1).join('') || '') : '', hname: p.hname || '', vname: p.vname || '' };
+      var gs = guessOldNames(g.name, nameOf[c], ac);
+      S.oldKid[c] = { hnum: two ? (toks[0] || '') : (OPT_RE.test(tail) ? tail : (toks[0] || tail)), vnum: two ? (toks.slice(1).join('') || '') : '', hgs: gs[0], vgs: two ? gs[1] : '' };
+    });
+    // 2. 迷う仮の名前は空に戻す: 同じ「コードにつける文字」に違う名前・同じ名前に違う文字 (読み違いのしるし)・横と縦が入れ替わっていそう (名前 = もう一方の文字)
+    var numOf = function (r, j) { return norm(j === 0 ? r.hnum : r.vnum); };
+    var gsAt = function (r, j) { return j === 0 ? r.hgs : r.vgs; };
+    var drop = function (r, j) { if (j === 0) r.hgs = ''; else r.vgs = ''; };
+    var bad = [];
+    for (var j = 0; j < ac; j++) {
+      var byNum = new Map(), byName = new Map();
+      g.kids.forEach(function (c) {
+        var r = S.oldKid[c]; if (!gsAt(r, j)) return;
+        var kn = numOf(r, j), nm = nkey(gsAt(r, j));
+        if (!byNum.has(kn)) byNum.set(kn, new Set());
+        byNum.get(kn).add(nm);
+        if (!byName.has(nm)) byName.set(nm, new Set());
+        byName.get(nm).add(kn);
+      });
+      g.kids.forEach(function (c) {
+        var r = S.oldKid[c]; if (!gsAt(r, j)) return;
+        if (byNum.get(numOf(r, j)).size > 1 || byName.get(nkey(gsAt(r, j))).size > 1) bad.push([r, j]);
+      });
+    }
+    bad.forEach(function (x) { drop(x[0], x[1]); });
+    if (two) {
+      g.kids.forEach(function (c) {
+        var r = S.oldKid[c];
+        var hc = norm(String(r.hnum || '').slice(1)), vc = norm(String(r.vnum || '').slice(1));
+        if ((r.hgs && vc && nkey(r.hgs) === vc && vc !== hc) || (r.vgs && hc && nkey(r.vgs) === hc && vc !== hc)) { drop(r, 0); drop(r, 1); }
+      });
+    }
+    // 3. 画面の値: 人が打った名前 (hu / vu) はそのまま (縦の名前は 1 軸の間も持っておく)・ほかは仮の名前 (hg / vg = 仮のまま)
+    g.kids.forEach(function (c) {
+      var r = S.oldKid[c], p = prev[c] || {};
+      r.hu = !!p.hu; r.vu = !!p.vu;
+      r.hname = r.hu ? (p.hname || '') : r.hgs;
+      r.vname = r.vu ? (p.vname || '') : r.vgs;
+      r.hg = !r.hu && !!r.hgs; r.vg = two && !r.vu && !!r.vgs;
+      // 人が打った値が仮の名前と同じ = 仮のまま (確かめが要る)
+      if (r.hu && r.hgs && String(r.hname).trim() === r.hgs) { r.hu = false; r.hg = true; }
+      if (two && r.vu && r.vgs && String(r.vname).trim() === r.vgs) { r.vu = false; r.vg = true; }
     });
   }
 
@@ -199,6 +320,7 @@
     var ac = recorded ? pk.axes.length : (S.vOn ? 2 : 1);
     var axes = [];
     var oldRows = [];
+    var oldGuessed = 0;
     if (!add || pk) {
       for (var i = 0; i < ac; i++) {
         var name = recorded ? pk.axes[i].name : S.axisName[i].trim();
@@ -235,6 +357,9 @@
           oldRows.push(row);
         });
         for (var a2 = 0; a2 < ac; a2++) axes[a2].old = Array.from(maps[a2].values());
+        // 🆕 2026-10-17: 商品名から仮に入れた名前 (人が直していない) は、見て「確かめた」にチェックするまで保存できない (読み違いをそのまま登録しない)
+        oldGuessed = pk.kids.filter(function (c) { var r = S.oldKid[c] || {}; return !!r.hg || (ac === 2 && !!r.vg); }).length;
+        if (oldGuessed && !S.oldOk) Pi(4, 'miss', '前からある子の名前 (商品名から仮に入れた ' + oldGuessed + ' 件) を見て「確かめた」にチェック', '#old-ok');
       }
       axes.forEach(function (ax) {
         ax.rows = parseOpts(S.optText[ax.i], ax.old);
@@ -258,6 +383,13 @@
     if (mo === '') { if (!S.conflicts.months) Pi(5, 'miss', '推奨保有月数', '#c-months'); }
     else if (!/^\d{1,2}(\.\d)?$/.test(mo) || Number(mo) > 60) Pi(5, 'shape', '推奨保有月数: 0〜60 (小数は 1 けたまで)', '#c-months');
     if (C.expiry === '' && !S.conflicts.expiry) Pi(5, 'miss', 'ロジザードの有効期限の管理', '#c-expiry');
+    // 🆕 2026-10-17: 参考 URL の形 (空の行は送らない = 数えない)・個数
+    $$('#ref-rows .ref-url').forEach(function (x, ri) {
+      var u = x.value.trim(); if (!u) return;
+      var up = urlProblem(u);
+      if (up) Pi(5, 'shape', '参考 URL ' + (ri + 1) + ' つ目: ' + up, '#ref-rows .urlrow:nth-child(' + (ri + 1) + ') .ref-url');
+    });
+    if (refUrls().length > MAX_REFS) Pi(5, 'shape', '参考 URL は ' + MAX_REFS + ' 個までです', '#ref-rows .ref-url');
 
     var kids = axes.length ? buildKids(axes, gcode, pk) : [];
     var seenCode = new Map(), seenJan = new Map(), seenLz = new Map();
@@ -343,7 +475,7 @@
       }
       Pi(6, 'count', '子が ' + n + ' 件。1 回に作れるのは ' + MAX_KIDS + ' 件まで' + (plan ? ' → 「この分け方にする」で ' + plan.cnt + ' 件と残り ' + plan.rest + ' ' + (axes[0].name === 'カラー' ? '色' : 'つ') + 'に分ける' : ''), '#sec-kids');
     }
-    return { add: add, pk: pk, gcode: gcode, baseName: baseName, recorded: recorded, firstTime: firstTime, ac: ac, axes: axes, oldRows: oldRows, kids: kids, live: live, n: n, issues: issues, cp: cp, cc: cc, plan: plan, noneKeys: noneKeys };
+    return { add: add, pk: pk, gcode: gcode, baseName: baseName, recorded: recorded, firstTime: firstTime, ac: ac, axes: axes, oldRows: oldRows, oldGuessed: oldGuessed, kids: kids, live: live, n: n, issues: issues, cp: cp, cc: cc, plan: plan, noneKeys: noneKeys };
   }
 
   // ---------- 描く ----------
@@ -459,13 +591,21 @@
     if (m.firstTime) {
       var dis = canSave ? '' : ' disabled';
       ob = '<div class="oldbox"><div class="ot">' + icon('warn') + '前からある子 ' + m.pk.kids.length + ' 件の選択肢を確かめる (このまとまりで最初の 1 回だけ)</div>'
-        + '<div class="hint" style="margin-top:4px">コードの終わりから「コードにつける文字」を仮に入れました。合っているか見て、色の名前を入れてください。同じ色を別の文字で足してしまうのを防ぎます。</div>'
-        + '<div class="scrollx"><table class="opttbl"><thead><tr><th>今ある子のコード</th>' + m.axes.map(function (ax) { return '<th>' + esc(ax.name || (ax.i ? '縦' : '横')) + 'につける文字 <span class="autotag">仮</span></th><th>' + esc(ax.name || (ax.i ? '縦' : '横')) + 'の名前</th>'; }).join('') + '<th>確かめ</th></tr></thead><tbody>'
+        + '<div class="hint" style="margin-top:4px">コードの終わりから「コードにつける文字」を、子の商品名 (まとまりの名前のあとの【…】) から名前を仮に入れました (<span class="autotag">仮</span>)。合っているか見て、違うところは直してください。読み取れなかった名前は空のままです (入れてください)。同じ色を別の文字で足してしまうのを防ぎます。</div>'
+        + '<div class="scrollx"><table class="opttbl"><thead><tr><th>今ある子のコード</th><th>今の商品名</th>' + m.axes.map(function (ax) { return '<th>' + esc(ax.name || (ax.i ? '縦' : '横')) + 'につける文字 <span class="autotag">仮</span></th><th>' + esc(ax.name || (ax.i ? '縦' : '横')) + 'の名前</th>'; }).join('') + '<th>確かめ</th></tr></thead><tbody>'
         + m.oldRows.map(function (row) {
-          return '<tr id="old-' + row.idx + '"' + (row.errs.some(function (e) { return e.c !== 'miss'; }) ? ' class="bad"' : '') + '><td class="num">' + esc(row.code) + '</td>'
-            + m.axes.map(function (ax) { var p = ax.i === 0 ? 'h' : 'v'; return '<td><input class="in mono oldin" data-oc="' + esc(row.code) + '" data-of="' + p + 'num" value="' + esc(row.r[p + 'num']) + '" aria-label="' + esc(row.code) + ' のコードにつける文字"' + dis + '></td><td><input class="in oldin" data-oc="' + esc(row.code) + '" data-of="' + p + 'name" value="' + esc(row.r[p + 'name']) + '" placeholder="例: ブラウン" aria-label="' + esc(row.code) + ' の名前"' + dis + '></td>'; }).join('')
+          var kr = (m.pk.kidRows || []).filter(function (k) { return k.code === row.code; })[0];
+          return '<tr id="old-' + row.idx + '"' + (row.errs.some(function (e) { return e.c !== 'miss'; }) ? ' class="bad"' : '') + '><td class="num">' + esc(row.code) + '</td><td class="oldname">' + esc(kr ? kr.name : '') + '</td>'
+            + m.axes.map(function (ax) {
+              var p = ax.i === 0 ? 'h' : 'v'; var g = !!row.r[p + 'g'];
+              return '<td><input class="in mono oldin" data-oc="' + esc(row.code) + '" data-of="' + p + 'num" value="' + esc(row.r[p + 'num']) + '" aria-label="' + esc(row.code) + ' のコードにつける文字"' + dis + '></td>'
+                + '<td class="oldnm"><input class="in oldin' + (g ? ' guess' : '') + '" data-oc="' + esc(row.code) + '" data-of="' + p + 'name" value="' + esc(row.r[p + 'name']) + '" placeholder="例: ブラウン" aria-label="' + esc(row.code) + ' の名前' + (g ? ' (商品名から仮に入れた)' : '') + '"' + dis + '><span class="autotag gtag"' + (g ? '' : ' hidden') + '>仮</span></td>';
+            }).join('')
             + '<td class="st">' + (row.errs.length ? row.errs.map(errLine).join('') : '<span class="why-ok">' + icon('check', 's') + 'OK</span>') + '</td></tr>';
-        }).join('') + '</tbody></table></div></div>';
+        }).join('') + '</tbody></table></div>'
+        // 確かめたのチェックはいつも置く (仮の名前が 0 件 = 隠す・打っている間に仮の名前が戻ったら出す = Codex R2 M2)
+        + '<label class="oldok"' + (m.oldGuessed ? '' : ' hidden') + '><input type="checkbox" id="old-ok"' + (S.oldOk ? ' checked' : '') + dis + '><span>仮に入れた名前 (<b id="old-ok-n">' + m.oldGuessed + '</b> 件) を見て、合っているのを確かめた</span></label>'
+        + '</div>';
     }
     var obEl = $('#old-box');
     if (!obEl.contains(document.activeElement)) obEl.innerHTML = ob;
@@ -508,7 +648,15 @@
       var tr = $('#old-' + row.idx); if (!tr) return;
       tr.classList.toggle('bad', row.errs.some(function (e) { return e.c !== 'miss'; }));
       tr.querySelector('.st').innerHTML = row.errs.length ? row.errs.map(errLine).join('') : '<span class="why-ok">' + icon('check', 's') + 'OK</span>';
+      // 🆕 人が直した名前 = 「仮」の印を外す
+      $$('input[data-of$="name"]', tr).forEach(function (inp) {
+        var g = !!row.r[inp.getAttribute('data-of').charAt(0) + 'g'];
+        inp.classList.toggle('guess', g);
+        var tag = inp.parentNode.querySelector('.gtag'); if (tag) tag.hidden = !g;
+      });
     });
+    var on = $('#old-ok-n'); if (on) on.textContent = String(m.oldGuessed);
+    var ol = $('#old-box .oldok'); if (ol) ol.hidden = !m.oldGuessed;
   }
 
   function renderCommon(m) {
@@ -683,7 +831,7 @@
     var po = ME.orderSettings ? ME.orderSettings.collect() : null;
     return [
       ['まとまり', '<span class="mono">' + esc(m.gcode) + '</span> 「' + esc(m.baseName) + '」 ' + (m.add ? '<span class="b mute">今あるまとまりに足す</span>' : '<span class="b info">新しく作る</span>')],
-      ['軸と選択肢', m.axes.map(function (a) { return esc(a.name) + ' ' + (a.old.length ? '前から ' + a.old.length + ' + ' : '') + '足す ' + a.good.length; }).join('<br>') + (m.firstTime ? '<br><span class="hint aux">前からある子 ' + m.pk.kids.length + ' 件の選択肢も記録します</span>' : '')],
+      ['軸と選択肢', m.axes.map(function (a) { return esc(a.name) + ' ' + (a.old.length ? '前から ' + a.old.length + ' + ' : '') + '足す ' + a.good.length; }).join('<br>') + (m.firstTime ? '<br><span class="hint aux">前からある子 ' + m.pk.kids.length + ' 件の選択肢も記録します' + (m.oldGuessed ? ' (うち名前を商品名から仮に入れた ' + m.oldGuessed + ' 件 = 確かめ済み)' : '') + '</span>' : '')],
       ['作る商品', '<b>' + m.n + ' 件</b> · JAN あり ' + jans + ' 件 · ほかは共通の値どおり'],
       ['共通と違う所', ex.length ? list(ex, 12) : 'なし'],
       ['作らない商品', offs.length ? list(offs.map(function (k) { return '<span class="mono">' + esc(k.code) + '</span> ' + esc(k.h.name + (k.v ? ' × ' + k.v.name : '')) + (k.prev ? ' (前回も作らなかった)' : ''); }), 12) : 'なし'],
@@ -941,7 +1089,18 @@
       var f = Object.keys(INPUT_ID).filter(function (x) { return INPUT_ID[x] === id; })[0];
       S.common[f] = t.value; if (S.conflicts[f]) S.picks[f] = true;
       if (f === 'supplier' || f === 'ship') { renderCommon(model()); }
-    } else if (t.classList.contains('oldin')) { var r = S.oldKid[t.getAttribute('data-oc')]; if (!r) return; r[t.getAttribute('data-of')] = t.value; lightOld(); return; }
+    } else if (t.classList.contains('oldin')) {
+      var r = S.oldKid[t.getAttribute('data-oc')]; if (!r) return;
+      var of = t.getAttribute('data-of');
+      r[of] = t.value;
+      // 人が直した = 仮ではない (縦軸を足す・外すでも残す)。仮に入れた値のままに戻した (取り消し・同じ値) = 仮のまま (確かめが要る・Codex R1 M1)
+      if (of === 'hname' || of === 'vname') {
+        var pf = of.charAt(0), gv = r[pf + 'gs'] || '';
+        var back = !!gv && t.value.trim() === gv;
+        r[pf + 'u'] = !back; r[pf + 'g'] = back;
+      }
+      lightOld(); return;
+    }
     else if (t.classList.contains('kin')) {
       var key = t.closest('.krow').getAttribute('data-key'), k = t.getAttribute('data-k');
       var e = S.edits[key] || (S.edits[key] = {});
@@ -961,6 +1120,7 @@
     // 🆕 入力なしのチェック (me-none.js が先に値を空にする) = 数え直す
     if (t.matches && t.matches('input[type="checkbox"][data-none]') && form.contains(t) && !S.done) { light(); return; }
     if (t.id === 'lz-blank-rest' && !S.done) { light(); return; }   // 🆕 0080: ロジザードのバーコードの無い子を「空欄で送る」
+    if (t.id === 'old-ok' && !S.done) { S.oldOk = t.checked; lightOld(); return; }   // 🆕 前からある子の仮の名前を確かめた
     if (t.id === 'fix-ok') $('#confirm-yes').disabled = !t.checked || busy;
     // 切り替えボタン (me-shell.js が押された状態と data-value を付けて change を出す)
     if (t.classList && t.classList.contains('seg') && form.contains(t)) {
@@ -981,6 +1141,23 @@
   // スマホでキーボードが出ている間は、下の固定の帯を小さく
   document.addEventListener('focusin', function (e) { if (isPhone() && e.target.matches && e.target.matches('input:not([type=checkbox]), textarea, select')) document.body.classList.add('kb'); });
   document.addEventListener('focusout', function () { setTimeout(function () { var a = document.activeElement; if (!a || !a.matches || !a.matches('input:not([type=checkbox]), textarea, select')) document.body.classList.remove('kb'); }, 50); });
+
+  // 🆕 2026-10-17: 参考 URL の行を足す・外す (単品の登録 = public/me-new.js と同じ動き。最後の 1 行は外さずに空にする)
+  var refRows = $('#ref-rows');
+  function refRenumber() { $$('#ref-rows .urlrow').forEach(function (r, i) { $('.idx', r).textContent = String(i + 1); $('.ref-url', r).setAttribute('aria-label', '参考 URL ' + (i + 1)); $('[data-ref-del]', r).setAttribute('aria-label', '参考 URL ' + (i + 1) + ' を外す'); }); }
+  var refAdd = $('#ref-add');
+  if (refAdd && canSave) refAdd.addEventListener('click', function () {
+    if (S.done) return;
+    if ($$('#ref-rows .urlrow').length >= MAX_REFS) { toast('参考 URL は ' + MAX_REFS + ' 個までです'); return; }
+    var row = $('#ref-rows .urlrow').cloneNode(true); $('.ref-url', row).value = '';
+    refRows.appendChild(row); refRenumber(); $('.ref-url', row).focus(); light();
+  });
+  if (refRows) refRows.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-ref-del]'); if (!b || b.disabled || S.done) return;
+    var rows = $$('#ref-rows .urlrow'), row = b.closest('.urlrow');
+    if (rows.length === 1) $('.ref-url', row).value = ''; else row.remove();
+    refRenumber(); var first = $('#ref-rows .ref-url'); if (first) first.focus(); light();
+  });
 
   function doSplit() {
     var m = model(); if (!m.plan) return;
@@ -1121,7 +1298,7 @@
         return kid;
       }),
       values: values,
-      card: { official_url: val('official-url'), amazon_url: amz, asin: asin ? asin.toUpperCase() : '' },
+      card: { official_url: val('official-url'), amazon_url: amz, asin: asin ? asin.toUpperCase() : '', reference_urls: refUrls() },
     };
     if (!m.add || m.firstTime) out.axes = m.axes.map(function (ax) { return { axis: ax.i + 1, name: ax.name }; });
     // 🆕 2026-10-13: 入力なしにした項目 (サーバーがもう一度確かめて、登録の理由に残す)
@@ -1157,6 +1334,7 @@
     if (MAP[f]) return MAP[f];
     if (f === 'card.amazon_url' || f === 'card.asin') return '#amazon-url';
     if (f === 'children.jan') return '#row-jan-none';
+    if (f === 'card.reference_urls') return '#ref-rows .ref-url';
     if (f === 'reason') return '#reason';
     if (/^card/.test(f)) return '#official-url';
     if (/^order_settings/.test(f)) { var row = document.querySelector('[data-row="' + f.replace(/"/g, '') + '"]'); return row ? '[data-row="' + f.replace(/"/g, '') + '"]' : '#sec-order'; }
