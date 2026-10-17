@@ -3002,9 +3002,13 @@ await ta('[72] 未登録の一覧の「その場で登録」(10/17): 行の下�
   assert.equal(await in2.inputValue(), 'k005', 'ぴったりのコードは Enter で入る');
   // 保存 (通信が切れた 1 回目 → 押し直し = 同じ request_id)
   const ids = [];
-  await p.route('**/api/amazon/save', async (r) => { ids.push(JSON.parse(r.request().postData()).request_id); await r.continue(); });
-  // 1 回目は応答を捨てる (保存は入るが画面に返事が来ない = 通信が切れた) を作る: fetch を 1 回だけ失敗にする
-  await p.evaluate(() => { const f = window.fetch; let once = true; window.fetch = function (u, o) { if (once && /\/api\/amazon\/save$/.test(String(u))) { once = false; return f(u, o).then(() => { throw new TypeError('切れた'); }); } return f(u, o); }; });
+  // 1 回目: 保存は入るが、途中の機械が 502 の JSON を返す (#Codex R2 M1 = JSON の誤りでも確かな返事でない = 送り直しに残す)
+  let first = true;
+  await p.route('**/api/amazon/save', async (r) => {
+    ids.push(JSON.parse(r.request().postData()).request_id);
+    if (first) { first = false; await r.fetch(); await r.fulfill({ status: 502, contentType: 'application/json', body: JSON.stringify({ error: 'Bad Gateway' }) }); return; }
+    await r.continue();
+  });
   await box.locator('.inl-save').click();
   await p.waitForFunction(() => /通信できませんでした/.test(document.querySelector('.inl-msg').textContent));
   assert.equal(await in1.isDisabled(), true, '結果の分からない保存の後 = 欄を閉じる (同じ中身だけを送り直す・#Codex R1 M)');

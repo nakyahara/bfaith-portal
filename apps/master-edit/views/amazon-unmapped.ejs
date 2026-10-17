@@ -37,7 +37,7 @@
     <% if (data) { %>
       <% if (data.tableMissing) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">Company DB に Amazon SKU の対応の表がまだありません (migration 0054 の前)。</div></div><% } %>
       <% if (data.undecided.length) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">未判定: 売上の日次がまだ公開されていない日があります (<%= undecidedText(data.undecided) %>)</div><div class="hint">その日の注文が入っていない = 「0 件」とは言えません。</div></div></div><% } %>
-      <% if (per === 'all' && data.publishedFrom && data.publishedFrom > data.from) { %><div class="hint" id="unmapped-published-from" style="margin-bottom:12px">売上の日次は <%= ui.fmtDay(data.publishedFrom) %> から公開されています。それより前の日は「未判定」に数えていません (注文があれば一覧には出します)。</div><% } %>
+      <% if (per === 'all' && data.publishedFrom && data.publishedFrom > data.from) { %><div class="hint" id="unmapped-published-from" style="margin-bottom:12px">この範囲で最初に確かめられた売上の日次の公開は <%= ui.fmtDay(data.publishedFrom) %> です。それより前の日は「未判定」に数えていません (注文があれば一覧には出します)。</div><% } %>
       <% if (!data.tableMissing && !data.decidable) { %><div class="callout warn" id="unmapped-undecidable"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">FBA か自社発送かを読めないので、一覧を出せません</div><div class="hint">手数料の写し (fees) も Amazon の出品一覧も読めません。「0 件」ではありません。</div></div></div><% } %>
       <% if (!inline && !dbError && canEdit && amazonClosed) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow">対応の保存はまだ開いていません (<%= amazonClosedWhy %>)。一覧を見る・CSV はできます。</div></div><% } %>
       <section class="panel">

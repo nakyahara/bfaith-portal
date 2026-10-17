@@ -167,6 +167,10 @@
   };
   Editor.prototype.close = function () {
     var E = this;
+    // 送っている間は閉じない・結果の分からない保存がある = 保存されたかもしれないと伝えてから (#Codex R2 M2)
+    if (E.busy) { if (ME.toast) ME.toast('保存しています。返事が来るまで閉じられません'); return; }
+    if (E.pendingBody && !window.confirm(E.sku + ' は保存されたかもしれません (通信が切れて分からない)。閉じると、送り直しはできなくなります (1 つの画面で今の対応を確かめてください)。閉じますか')) return;
+    if (E.pendingBody) { E.pendingBody = null; E.saved = true; }
     if (!E.saved && E.touched() && !window.confirm(E.sku + ' に入れた構成を捨てて閉じますか')) return;
     E.sug.close(); E.sug.destroy();
     E.li.remove(); open = open.filter(function (x) { return x !== E; });
@@ -196,8 +200,9 @@
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
         E.busy = false;
-        // 返事が読めない (JSON でない = 途中の機械の誤りなど) = 保存されたか分からない = 送り直しと同じに扱う
-        if (!x.j || (!x.j.ok && !x.j.reason && !x.j.error)) { E.unknown(body); return; }
+        // 確かな返事 = 保存の API の答え (200 の ok / 500 より下の誤りで reason つき = lib の誤り・門)。それ以外 (500 以上・途中の機械の 502 など・JSON でない) =
+        //   保存されたか分からない = 送り直しと同じに扱う (#Codex R2 M1)
+        if (!((x.r.ok && x.j && x.j.ok) || (x.r.status < 500 && x.j && x.j.reason))) { E.unknown(body); return; }
         E.pendingBody = null;
         if (x.r.ok && x.j.ok) {
           E.saved = true; E.sug.close();
