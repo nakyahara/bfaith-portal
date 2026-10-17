@@ -635,5 +635,83 @@ await ta('[13] 朝のまとめの「NE の商品コードの書き方」(10/16 �
   assert.match(many[11], /^・ほか 2 件/);
 });
 
+await ta('[14] 🆕 0083 (設計 25 PR-1 = 影): ロジザードの全件の一覧の確かめを全部通った回だけ、商品 ID の全件 (削除の ID も) と書き出しの回 (保存の時刻・成功の印・sha256・行数) を送る / 一覧の確かめの前に止まった回は送らない・後で止まった回の証跡にも残す / 送れない・断られた = 合否と終わり方は変えない / 本物の DB (0083) が lz-daily の形を受け付ける (関数と実行権を確かめてから呼ぶ・無い = not_applied) / cli = daily-sync の回で書く接続があるときだけ', async () => {
+  const lzRows = [{ id: 'A-1', name: 'x' }, { id: 'B-2' }, { id: 'U60E-10', del: '1' }];
+  const sent = [];
+  const cap = async (p) => { sent.push(p); return { state: 'ok', written: 'written' }; };
+  let s = setup({ lzRows });
+  let r = await run(s, { writeLzCodes: cap });
+  assert.equal(r.state, 'complete');
+  assert.equal(sent.length, 1);
+  const p = sent[0];
+  const st = fs.statSync(s.lzPath), stS = fs.statSync(s.stampPath);
+  assert.deepEqual(p, { lz_daily_run_id: r.runId, export: { exported_at: st.mtime.toISOString(), stamp_at: stS.mtime.toISOString(), stamp_date: asOf, csv_sha256: sha(fs.readFileSync(s.lzPath)), rows: 3 },
+    ids: ['A-1', 'B-2', 'U60E-10'] });   // 削除フラグの付いた ID も
+  assert.deepEqual(evOf(s.dataDir).lz_codes, { state: 'ok', written: 'written' });
+  // 送れない (例外)・断られた = 合否・終わり方は変えない (証跡に残すだけ)
+  s = setup({ lzRows });
+  r = await run(s, { writeLzCodes: async () => { throw new Error('stale_export: 前の書き出し'); } });
+  assert.deepEqual([r.state, evOf(s.dataDir).verdict, evOf(s.dataDir).lz_codes], ['complete', 'pass', { state: 'failed', error: 'stale_export: 前の書き出し' }]);
+  assert.doesNotMatch(r.line, /書き方/);
+  // 書く接続が無い = not_configured
+  s = setup({ lzRows });
+  r = await run(s);
+  assert.deepEqual(evOf(s.dataDir).lz_codes, { state: 'not_configured' });
+  // 一覧の確かめの前に止まった回 = 送らない (成功の印が無い・一覧が今日でない・半減)
+  sent.length = 0;
+  for (const [why, ss] of [['lz_stamp_missing', setup({ lzRows, stamp: null })], ['lz_master_not_today', setup({ lzRows, lzTime: new Date('2030-01-13T15:30:00Z') })]]) {
+    const x = await run(ss, { writeLzCodes: cap });
+    assert.deepEqual([x.reason, sent.length, 'lz_codes' in evOf(ss.dataDir)], [why, 0, false]);
+  }
+  s = setup({ lzRows }); prevEv(s.dataDir, '2030-01-14', 7);
+  assert.deepEqual([(await run(s, { writeLzCodes: cap })).reason, sent.length], ['lz_master_shrunk', 0]);
+  // 一覧の確かめの後で止まった回 (元のコードの印が別の回) = 送った記録は証跡に残る
+  s = setup({ lzRows });
+  r = await run(s, { writeLzCodes: cap, readCdb: cdbFake({ mark: { compare_run_id: 'mc_20300114T000000000Z_bbbbbb' } }) });
+  assert.deepEqual([r.reason, sent.length, evOf(s.dataDir).lz_codes], ['codes_not_this_run', 1, { state: 'ok', written: 'written' }]);
+
+  // 本物の DB (0083): lz-daily が作った形を、時刻だけ今に寄せて受け付ける (DB は本物の今で 36 時間を見る)
+  const pg = new PGlite();
+  try {
+    await applyMigrations(pgliteAdapter(pg), { log: () => {} });
+    const conn = async () => ({ db: pgliteAdapter(pg), close: async () => {} });
+    const shifted = (x) => { const ex = Date.now() - 3600000; const lag = Date.parse(x.export.stamp_at) - Date.parse(x.export.exported_at);
+      return { ...x, export: { ...x.export, exported_at: new Date(ex).toISOString(), stamp_at: new Date(ex + lag).toISOString(), stamp_date: new Date(ex + 9 * 3600000).toISOString().slice(0, 10) } }; };
+    const w = RUN.lzCodesWriter(conn);
+    const p1 = shifted(p);
+    assert.deepEqual(await w(p1), { state: 'ok', written: 'written', counts: { ids: 3, one: 3, many: 0, codes: 3, invalid: 0 } });
+    assert.deepEqual((await w(p1)).written, 'unchanged');
+    // 同じ lz-daily の回が別の書き出しを送る = 断る (書き手は投げる = recordLzCodes が failed に)
+    const later = (t) => new Date(Date.parse(t) + 1000).toISOString();
+    await assert.rejects(w({ ...p1, export: { ...p1.export, exported_at: later(p1.export.exported_at), stamp_at: later(p1.export.stamp_at) } }), /run_conflict/);
+    assert.deepEqual((await pg.query(`select code_norm, state, lz_code from ops.master_lz_codes order by 1`)).rows.map((x) => [x.code_norm, x.state, x.lz_code]),
+      [['a-1', 'one', 'A-1'], ['b-2', 'one', 'B-2'], ['u60e-10', 'one', 'U60E-10']]);
+    // 関数が無い DB (0083 の前) = not_applied (呼ばない)
+    await pg.exec('alter function ops.record_lz_codes(jsonb) rename to record_lz_codes__hidden');
+    assert.deepEqual(await w(p1), { state: 'not_applied' });
+    await pg.exec('alter function ops.record_lz_codes__hidden(jsonb) rename to record_lz_codes');
+  } finally { await pg.close(); }
+
+  // cli: daily-sync の回 (--daily・--out-dir なし) で書く接続 (COMPANY_DB_WATCH_WRITER_URL) があるときだけ書き手を作る
+  const urls = [];
+  const go = async (argv, env = {}) => {
+    const ss = setup({ lzRows });
+    await RUN.cli(argv, { env: { DATA_DIR: ss.dataDir, COMPANY_DB_WATCH_URL: 'postgres://fake', LZ_SHOHIN_MASTER_PATH: ss.lzPath, LZ_SHOHIN_STAMP_PATH: ss.stampPath, ...env },
+      now, runBuild: (o) => RUN.runLzDaily({ ...o, readNe: neFake(), readCdb: cdbFake(), lzMinRows: 1 }),
+      writerFor: (u) => { urls.push(u); return cap; }, makeClient: () => ({ putArtifact: async () => { throw Object.assign(new Error('x'), { code: 'rejected', status: 400 }); } }),
+      ping: async () => {}, log: () => {}, write: (d, n, pp) => writeEvidence(d, n, pp, { now, warn: () => {} }), sleep: async () => {} });
+    return ss;
+  };
+  let ss = await go(['--daily', '--as-of', asOf], { COMPANY_DB_WATCH_WRITER_URL: 'postgres://writer' });
+  assert.deepEqual([urls, evOf(ss.dataDir).lz_codes.state], [['postgres://writer'], 'ok']);
+  ss = await go(['--daily', '--as-of', asOf]);   // 書く接続が無い
+  assert.deepEqual([urls.length, evOf(ss.dataDir).lz_codes.state], [1, 'not_configured']);
+  ss = await go(['--as-of', asOf], { COMPANY_DB_WATCH_WRITER_URL: 'postgres://writer' });   // 手の試し (--daily なし)
+  assert.equal(urls.length, 1);
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'lzd-cli-'));
+  await go(['--daily', '--as-of', asOf, '--out-dir', out], { COMPANY_DB_WATCH_WRITER_URL: 'postgres://writer' });   // 手の試し (--out-dir) = 本番の DB に書かない
+  assert.equal(urls.length, 1);
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

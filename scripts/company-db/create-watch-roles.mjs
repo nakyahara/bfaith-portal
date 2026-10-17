@@ -103,6 +103,9 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   //   🆕 0068 (代表の数えと門 PR-6): 照合 ② の代表 (親) の生の数えの記録 (ops.record_parent_gate) = watch_writer が関数だけで書く /
   //   生の数え (ops.parent_raw_gate = drift-list・要約の読み直し)・門の状態 (ops.parent_gate_state) = watcher が読むだけ
   for (const f of secdefFunctions) if (/^ops\.record_parent_gate\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
+  //   🆕 0083 (設計 25 PR-1): 今朝の NE の値 (照合 ②・ops.record_ne_values) とロジザードの書き方 (lz-daily・ops.record_lz_codes) = watch_writer が関数だけで書く
+  //   (表は watcher が読むだけ = 上の「ops の全部の表」の select。画面のロール master_edit には渡さない)
+  for (const f of secdefFunctions) if (/^ops\.(record_ne_values|record_lz_codes)\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
   for (const f of secdefFunctions) if (/^ops\.(parent_raw_gate|parent_gate_state)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
   //   🆕 0070 (NE から消えた商品をやめる): やめてよいかの確かめ (読むだけ) = watcher も読める (動かす関数は渡さない = create-master-edit-roles.mjs の master_edit / master_ops だけ)
   for (const f of secdefFunctions) if (/^ops\.sku_gone_from_ne_(check|list)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);

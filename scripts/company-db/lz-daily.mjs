@@ -7,6 +7,9 @@
  *   --out-dir = 出す場所 (CSV・報告・証跡)。既定 = DATA_DIR。手で試すときは別の場所にする (本番の証跡を書かない・ping も打たない)
  * env: DATA_DIR / COMPANY_DB_WATCH_URL (watcher = 読むだけ) / LZ_SHOHIN_MASTER_PATH (既定 C:\tools\logizard-automation\out\shohin_master.csv)
  *   / LZ_SHOHIN_STAMP_PATH (既定 C:\tools\logizard-automation\logs\shohin-last-success.txt) / JOBS_MONITOR_TOKEN・JOBS_MONITOR_URL (ping)
+ *   / 🆕 COMPANY_DB_WATCH_WRITER_URL (watch_writer。0083 = ロジザードの書き方を ops.record_lz_codes で残す。無ければ残さない)
+ * 🆕 0083 (設計 25 §2.5・PR-1 = 影): ロジザードの全件の一覧の確かめを全部通った回 (daily-sync の回だけ) は、商品 ID の全件と書き出しの回 (保存の時刻・成功の印・sha256・行数) を
+ *   Company DB に送る (NE 更新の CSV の「正しい書き方 = ロジザードの書き方」)。送れなくても合否・終わり方・要約は変えない (証跡の lz_codes に残すだけ)
  *
  * 材料の条件 (v2 H2・H4・v3 H3・M6)。1 つでも欠ける = 作らない (⏭️ 理由つき):
  *   - その朝の照合の証跡が complete (DATA_DIR/company-db-evidence/<今日>/master-compare.json)・全件 JSON の sha256 が合う
@@ -38,6 +41,7 @@ import { writeEvidence, readEvidence } from '../../apps/company-db/push/evidence
 import { readCdbMaster } from '../../apps/company-db/master-compare/compare-load.mjs';
 import { jstDateOfUtcText } from '../../apps/company-db/master-compare/compare-ne.mjs';
 import { connectWatcher } from '../../apps/company-db/master-compare/run.mjs';
+import { connectDecisionWriter, functionReady } from '../../apps/company-db/master-compare/decisions.mjs';
 import { readNeForLz, joinLzSnapshot } from '../../apps/master-decisions/lz-snapshot.mjs';
 import { buildLzCsv, DAILY, LZ_CONVERTER_VERSION } from '../../apps/master-decisions/lz-csv.mjs';
 import { compareLz, LZ_COMPARE_VERSION } from '../../apps/master-decisions/lz-compare.mjs';
@@ -90,13 +94,14 @@ export function previousLzRows(dir, asOf, days = PREV_LOOKBACK_DAYS) {
  */
 export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath, lzStampPath = DEFAULT_LZ_STAMP, connect, now = new Date(), readNe = readNeForLz,
   write = (d, n, p) => writeEvidence(d, n, p, { now }), lzMinRows = undefined,
-  readCdb = async () => { const c = await connect(); try { return await readCdbForLz(c.db); } finally { await c.close(); } } }) {
+  readCdb = async () => { const c = await connect(); try { return await readCdbForLz(c.db); } finally { await c.close(); } }, writeLzCodes = null }) {
   const runId = makeRunId(now);
   const save = (payload) => { if (!write(outDir, EVIDENCE_NAME, { as_of: asOf, run_id: runId, version: LZ_DAILY_VERSION, ...payload })) throw new Error('証跡 lz-daily を書けない'); };
   // 始めに「実行中」= 同じ日の前の回の完了の印を無効にする (途中で失敗しても、前の合格が今の完了の印として残らない。Codex #1507 R1 High)
   save({ state: 'running', started_at: now.toISOString() });
+  let lzCodes = null;   // 🆕 0083: ロジザードの書き方を Company DB に残したか (一覧の確かめを通った後だけ入る)
   const skip = (reason, detail = {}) => {
-    const evidence = { state: 'skipped', reason, ...detail };
+    const evidence = { state: 'skipped', reason, ...detail, ...(lzCodes ? { lz_codes: lzCodes } : {}) };
     save(evidence);
     return { state: 'skipped', reason, evidence, runId, line: `⏭️ ロジザード毎日の商品マスタ (影): 作らない (${reason})` };
   };
@@ -138,6 +143,9 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
   // 前回は本番の履歴 (dataDir) から読む = 出す場所を分けた手の試しでも同じ検査になる (Codex #1507 R2 Medium)
   lzInfo.prev = previousLzRows(dataDir, asOf);
   if (lzInfo.prev && lz.rows * 2 < lzInfo.prev.rows) return skip('lz_master_shrunk', { lz_master: lzInfo });
+  // 🆕 0083 (設計 25 §2.5・PR-1 = 影): ロジザードの書き方を Company DB に残す (全件の一覧の確かめ = 見出し・列の数・空の ID・重複・行数・半減を全部通った回だけ)。
+  //   書けない・断られた・関数が無い = 状態を証跡に残すだけ (lz-daily の合否・終わり方・要約は変えない)
+  lzCodes = await recordLzCodes(writeLzCodes, { runId, lz, lzInfo });
   // ── 4. Company DB (元のコードと値を 1 つの読み取りの取引で) ──
   const cdbRead = await readCdb();
   if (!cdbRead.mark || cdbRead.mark.compare_run_id !== ev.compare_run_id) return skip('codes_not_this_run', { code_mark: cdbRead.mark, compare_run_id: ev.compare_run_id });
@@ -188,6 +196,7 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
     counts: { ...cls.counts, lagging_held: lagCheck.held.length, lagging_stale: lagCheck.stale.length, lagging_undeterminable: lagCheck.undeterminable.length },
     summary: { ...result.summary, same_rows: result.counts.same_rows, ne_rows: result.counts.gas_rows },
     allowed_by: result.allowed.reduce((m, a) => ((m[a.why || a.what] = (m[a.why || a.what] || 0) + 1), m), {}),
+    lz_codes: lzCodes,   // 🆕 0083: ロジザードの書き方を Company DB に残したか (影)
   };
   save(evidence);
   const s = evidence.summary;
@@ -195,6 +204,38 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
     + ` / 比べる ${cls.counts.compare}・新商品待ち ${cls.counts.awaiting}・Company DB 待ち ${cls.counts.lagging} (値が同じ ${lagCheck.held.length})・不正 ${cls.counts.invalid}`
     + ` / 同じ ${s.same_rows}・許す差 ${s.allowed}・説明できない ${s.unexplained}・判定できない ${s.undeterminable}・形の差 ${s.shape}`;
   return { state: 'complete', evidence: { as_of: asOf, run_id: runId, version: LZ_DAILY_VERSION, ...evidence }, line, runId, report };
+}
+
+/**
+ * 🆕 0083 (設計 25 §2.5・PR-1 = 影): ロジザードの書き方を Company DB に送る形。商品 ID は全件 (削除フラグの付いたものも)・組み分けは DB がする。
+ *   書き出しの回 = auto-shohin-csv.js の保存の時刻 (一覧のファイルの mtime = 取り終えた時刻。auto-shohin-csv.js は回の ID を持たない) と成功の印 (中身 = 日付・mtime)
+ */
+export function lzCodesPayload({ runId, lz, lzInfo }) {
+  return { lz_daily_run_id: runId,
+    export: { exported_at: lzInfo.mtime, stamp_at: lzInfo.stamp?.mtime ?? null, stamp_date: lzInfo.stamp?.text ?? null, csv_sha256: lzInfo.sha256, rows: lz.rows },
+    ids: [...lz.byId.keys()] };
+}
+/** 送る (writeLzCodes = (payload) => Promise<{ state, ... }>。無い = not_configured)。投げない */
+export async function recordLzCodes(writeLzCodes, { runId, lz, lzInfo }) {
+  if (!writeLzCodes) return { state: 'not_configured' };
+  try { return await writeLzCodes(lzCodesPayload({ runId, lz, lzInfo })); }
+  catch (e) { return { state: 'failed', error: String(e && e.message).slice(0, 200) }; }
+}
+/**
+ * 本番の書き手 (watch_writer の接続を開いて 1 回だけ呼んで閉じる)。関数が無い (0083 の前) = not_applied・実行権が無い (ロールの流し直しの前) = no_privilege
+ * @param {() => Promise<{ db, close }>} connect
+ */
+export function lzCodesWriter(connect) {
+  return async (payload) => {
+    const c = await connect();
+    try {
+      const ready = await functionReady(c.db, 'ops.record_lz_codes(jsonb)');
+      if (ready !== 'ok') return { state: ready };
+      const r = (await c.db.query('select ops.record_lz_codes($1::jsonb) as r', [JSON.stringify(payload)])).rows[0].r;
+      const w = typeof r === 'string' ? JSON.parse(r) : r;
+      return { state: 'ok', written: w && w.state, counts: (w && w.counts) ?? null };
+    } finally { try { await c.close(); } catch { /* */ } }
+  };
 }
 
 /**
@@ -299,6 +340,7 @@ export function parseArgs(argv) {
  * @param {object} [deps]  試験で差し替える (env・作る・口・ping・時刻・証跡の書き手・待ち)
  */
 export async function cli(argv, { env = process.env, now = new Date(), runBuild = runLzDaily, connectFor = (url) => () => connectWatcher(url),
+  writerFor = (url) => lzCodesWriter(() => connectDecisionWriter(url)),
   makeClient = () => createImportStateClient({ url: env.LZ_IMPORT_STATE_URL || undefined, token: env.LZ_LOCK_TOKEN }),
   ping = (jobId, p) => sendPing(jobId, p, { env }), log = console.log, write = undefined, sleep = undefined } = {}) {
   let code = EXIT.error, last = '', doPing = false;
@@ -317,7 +359,10 @@ export async function cli(argv, { env = process.env, now = new Date(), runBuild 
     } else {
       const lzMasterPath = (a.lzMaster || env.LZ_SHOHIN_MASTER_PATH || DEFAULT_LZ_MASTER).trim();
       const lzStampPath = (a.lzStamp || env.LZ_SHOHIN_STAMP_PATH || DEFAULT_LZ_STAMP).trim();
-      const r = await runBuild({ dataDir, outDir, asOf, lzMasterPath, lzStampPath, connect: connectFor(url), now, write: w });
+      // 🆕 0083: ロジザードの書き方を Company DB に残すのは daily-sync の回だけ (手の試し --out-dir は本番の DB に書かない)・書く接続 (watch_writer) があるときだけ
+      const wurl = (env.COMPANY_DB_WATCH_WRITER_URL || '').trim();
+      const writeLzCodes = doPing && wurl ? writerFor(wurl) : null;
+      const r = await runBuild({ dataDir, outDir, asOf, lzMasterPath, lzStampPath, connect: connectFor(url), now, write: w, writeLzCodes });
       last = r.line; code = r.state === 'complete' ? EXIT.complete : EXIT.skipped;
       // daily-sync の回は成果物をポータルへ送る (受け取れたときだけ成功。K3-1)。口の用意の失敗 (LZ_LOCK_TOKEN が無い) も送れない = 失敗・証跡に残す
       if (r.state === 'complete' && doPing) ({ code, line: last } = await afterBuild({ outDir, r, makeClient, now, write: w, send: sleep ? (x) => sendArtifact({ ...x, sleep }) : sendArtifact }));
