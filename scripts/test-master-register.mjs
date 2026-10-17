@@ -3041,6 +3041,23 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
     assert.deepEqual([again.status, again.j.replayed], [200, true], again.text);
   } finally { MR.__setSetPlanStore(null); }
   assert.equal(setsOf(draftOf('sp-rep1').id).length, 1);
+  // ⑨ (Codex R4 Medium 1) 登録は通ったのに registered を書く前に落ちた作るセット (waiting のまま・予約の時間を過ぎた) = Company DB の保存の記録で registered に戻す = 予約は外れない
+  applierMode = 'boom';
+  const bSt = spBody('sp-stale', [{ qty: 2, code: 'sp-stale-2', name: 'x 2個セット' }]);
+  const st1 = await call('POST', '/apps/master-edit/api/new', { body: bSt });
+  applierMode = 'real';
+  assert.equal(st1.status, 200, st1.text);
+  ph.prepare(`UPDATE ph_cdb_set_plans SET state = 'waiting', cdb_sku_id = NULL, created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours') WHERE request_id = ?`).run(bSt.request_id);
+  const other = await call('POST', '/apps/master-edit/api/new', { body: spBody('sp-stale-b', [{ qty: 2, code: 'sp-stale-2', name: 'y' }]) });
+  assert.deepEqual([other.status, other.j.reason], [409, 'set_code_taken'], other.text);
+  assert.deepEqual([SPS.readSetPlan(bSt.request_id).state, String(SPS.readSetPlan(bSt.request_id).cdb_sku_id)], ['registered', String(st1.j.sku_id)]);
+  // 記録の無い waiting (登録の前に落ちた) で時間を過ぎたもの = dropped (予約を外す)
+  const ridGone = uuid();
+  SPS.writeSetPlan({ requestId: ridGone, requestHash: '3'.repeat(64), parentCode: 'sp-gone', parentName: 'x', sets: [{ qty: 2, code: 'sp-gone-2', name: 'x' }], actor: 'x@test' });
+  ph.prepare(`UPDATE ph_cdb_set_plans SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours') WHERE request_id = ?`).run(ridGone);
+  const chkGone = await call('GET', '/apps/master-edit/api/set-code-check?code=sp-gone-2&parent=sp-x');
+  assert.equal(chkGone.j.ok, true, chkGone.text);
+  assert.equal(SPS.readSetPlan(ridGone).state, 'dropped');
 });
 
 server.close();

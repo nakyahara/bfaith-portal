@@ -473,4 +473,17 @@ await ta('[C2] 未処理の子 (CSV にしていない) + 今回 が 1 つのフ
   assert.equal(V.variationMaxFileRows(), G.REG_MAX_ROWS);
 });
 
+await ta('[SP-V] 🆕 2026-10-17 (Codex R4): 作るセットに決まったコード (product-hub の予約・セットの下書き) = 新しいまとまりのコードにも子のコードにもさせない (開いた後 = コードの鍵の後にもう一度・何も保存しない)', async () => {
+  const one1 = (code) => ({ group: { mode: 'new', code, name: 'x' }, axes: [{ axis: 1, name: 'カラー' }], options: [{ axis: 1, code: '-WH', name: 'ホワイト' }],
+    children: [{ code: `${code}-WH`, choices: { 1: '-WH' }, name: 'x【ホワイト】' }], values: VALUES });
+  const resv = (hit) => async (c) => (c.toLowerCase() === hit ? { status: 409, reason: 'set_code_reserved', message: `${c} はほかの登録の作るセットに決まっています` } : null);
+  const e1 = await rejects(reg(one1('spv1'), { codeReserved: resv('spv1-wh') }), 409, 'set_code_reserved');
+  assert.deepEqual([e1.extra.field, e1.extra.code], ['children', 'spv1-WH']);
+  const e2 = await rejects(reg(one1('spv2'), { codeReserved: resv('spv2') }), 409, 'set_code_reserved');
+  assert.equal(e2.extra.field, 'group.code');
+  assert.equal((await q("select count(*)::int as n from core.skus where code_norm in ('spv1-wh', 'spv2-wh')"))[0].n, 0, '何も保存しない');
+  const ok = await reg(one1('spv3'), { codeReserved: resv('zzz') });
+  assert.equal(ok.ok, true);
+});
+
 console.log(`\n${passed} ok`);

@@ -52,6 +52,20 @@ export function setCodeHeld(code, { requestId = null, db = getDB() } = {}) {
 }
 
 /**
+ * 予約の時間 (WAITING_HOLD_MINUTES) を過ぎた waiting の作るセットのうち、このコードを持つものの request_id (Codex R4 Medium 1)。
+ *   🚨 時間だけで予約を外さない: 登録が通った後に registered を書く前に落ちた (か書けなかった) 作るセットも waiting のまま。
+ *      呼び手 (apps/master-edit/router.mjs) が Company DB の保存の記録 (ops.master_edit_requests) と照らし、done = registered・それ以外 = dropped にしてから予約を見る
+ */
+export function staleWaitingPlansFor(codes, { db = getDB() } = {}) {
+  const keys = [...new Set((codes || []).map((c) => String(c ?? '').trim().toLowerCase()).filter(Boolean))];
+  if (!keys.length) return [];
+  return db.prepare(`
+    SELECT DISTINCT p.request_id FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
+    WHERE i.code_key IN (${keys.map(() => '?').join(',')}) AND p.state = 'waiting' AND p.created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
+  `).all(...keys, `-${WAITING_HOLD_MINUTES} minutes`).map((r) => r.request_id);
+}
+
+/**
  * ① 登録の前に作るセットを残す (同じ request_id = 押し直し = 同じ中身なら何もしない)。
  *   input = { requestId, requestHash (登録の要求のハッシュ = lib/master-register.mjs の registerPayloadHashOf), parentCode, parentName, sets (lib/set-plan.mjs の形), actor }
  *   断る (throw status/reason/message/field/index): 形が違う 400・カード / ほかの作るセットとコードが重なる 409・同じ request_id で違う中身 409

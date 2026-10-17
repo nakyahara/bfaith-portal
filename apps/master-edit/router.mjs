@@ -446,15 +446,35 @@ export function __setSetPlanStore(st) { setPlanStore = st || null; }
 async function setPlans() {
   if (setPlanStore) return setPlanStore;
   const m = await import('../product-hub/services/cdb-set-plan.js');
-  return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o) };
+  return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o), stale: (codes) => m.staleWaitingPlansFor(codes) };
+}
+/**
+ * 🆕 Codex R4 Medium 1: 予約の時間を過ぎた waiting の作るセット (このコードを持つもの) を、Company DB の保存の記録で決める。
+ *   登録が通っていた (done) = registered (予約のまま・SKU の番号) / 記録が無い・失敗 = dropped (予約を外す)。読めない = throw (呼び手は 503)
+ */
+async function resolveStaleSetPlans(db, codes) {
+  const st = await setPlans();
+  if (typeof st.stale !== 'function') return;
+  const ids = st.stale(codes);
+  if (!ids.length) return;
+  const rows = (await db.query(`select request_id::text as id, status, result ->> 'sku_id' as sku_id from ops.master_edit_requests where request_id = any($1::uuid[])`, [ids])).rows;
+  const byId = new Map(rows.map((x) => [x.id, x]));
+  for (const id of ids) {
+    const rec = byId.get(id);
+    if (rec && rec.status === 'done') st.mark(id, { state: 'registered', skuId: rec.sku_id ?? null });
+    else st.mark(id, { state: 'dropped', note: rec ? `登録は ${rec.status} (予約の時間を過ぎて確かめた)` : '登録の記録が無い (予約の時間を過ぎて確かめた)' });
+  }
 }
 /**
  * このコードがほかの登録の作るセットに決まっているか (予約・セットの下書き)。決まっている = { status 409, reason, message } / 読めない = 503 / 無い = null
  *   新商品の登録 (単品の入口と登録の取引の中 = codeReserved)・まとまりの子 (入口) が使う
  */
-async function setCodeReservedFor(code, requestId) {
+async function setCodeReservedFor(code, requestId, db = null) {
   let held;
-  try { held = (await setPlans()).held(code, { requestId }); } catch (e) {
+  try {
+    if (db) await resolveStaleSetPlans(db, [code]);
+    held = (await setPlans()).held(code, { requestId });
+  } catch (e) {
     console.error(`[master-edit] 作るセットの予約を読めない: ${e && e.message}`);
     return { status: 503, reason: 'ph_unreadable', message: 'product-hub の作るセットの予約を読めないので、このコードを使えるか確かめられません (少し待ってからもう一度)' };
   }
@@ -940,11 +960,18 @@ router.post('/api/new/variation', (req, res) => {
     //   🆕 #1719 Codex R4 High: 同じ request_id の記録がある (押し直し) = 今の写しで確かめない (lib が前の答えを返す・印は DB に残した結果から)
     const lg = po.replay ? { copy: null } : await lzRegisterGate(db, kids.map((k) => ({ code: k && typeof k.code === 'string' ? k.code : '', raw: k ? k.lz_barcode : undefined, field: 'children' })));
     if (lg.fail) return res.status(lg.fail.status).json(lg.fail.json);
-    // 🆕 2026-10-17 (Codex R3 Medium 1): ほかの登録の作るセットに決まったコード (予約・セットの下書き) は子のコードにもさせない (入口だけ。押し直しは前の答え)
+    // 🆕 2026-10-17 (Codex R3 Medium 1・R4 Medium 2 / 3): ほかの登録の作るセットに決まったコード (予約・セットの下書き) は、新しいまとまりのコードにも子のコードにもさせない。
+    //   入口で見て、登録の取引の中 (まとまりと子のコードの鍵を取った後) にもう一度 (codeReserved)。押し直しは前の答え
+    const codeReserved = (code) => setCodeReservedFor(code, rid, db);
     if (!po.replay) {
+      const g = b.group && typeof b.group === 'object' ? b.group : null;
+      if (g && g.mode === 'new' && typeof g.code === 'string' && g.code) {
+        const held = await codeReserved(g.code);
+        if (held) return res.status(held.status).json({ ok: false, reason: held.reason, field: 'group.code', error: `${held.message}。何も保存していません` });
+      }
       for (const k of kids) {
         if (!k || typeof k.code !== 'string' || !k.code) continue;
-        const held = await setCodeReservedFor(k.code, rid);
+        const held = await codeReserved(k.code);
         if (held) return res.status(held.status).json({ ok: false, reason: held.reason, field: 'children', code: k.code, error: `${k.code}: ${held.message}。何も保存していません` });
       }
     }
@@ -954,7 +981,7 @@ router.post('/api/new/variation', (req, res) => {
       childReasons: pre.childReasons,   // 🆕 子ごとの入力なしの理由 (原価・JAN はその子に無いときだけ・#1706 Codex R1 M1)
       reasonNote: po.note,              // 🆕 発注の設定の入力なし (DB に書く理由にだけ・ハッシュに入らない・#1706 Codex R2 M)
       lzCopy: lg.copy,                  // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果 (値の行に残す・ハッシュに入らない)
-    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox, requireLz: true });
+    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox, requireLz: true, codeReserved });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
     const after = orderInput && outbox ? await ordersAfterRegistration(db, regId, !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
@@ -1063,7 +1090,7 @@ router.get('/api/set-code-check', (req, res) => withPgApi(res, async (db) => {
   if (!cc.ok) return res.json({ ok: false, reason: cc.reason, message: cc.message });
   const rq = String(req.query.request_id || '').toLowerCase();
   let held = null;
-  try { held = (await setPlans()).held(code, { requestId: /^[0-9a-f-]{36}$/.test(rq) ? rq : null }); }
+  try { await resolveStaleSetPlans(db, [code]); held = (await setPlans()).held(code, { requestId: /^[0-9a-f-]{36}$/.test(rq) ? rq : null }); }
   catch (e) { return res.status(503).json({ ok: false, reason: 'ph_unreadable', error: `product-hub のカードを読めません (${String((e && e.message) || e).slice(0, 120)})` }); }
   if (held) return res.json({ ok: false, reason: held.reason, message: held.message });
   res.json({ ok: true, reason: null, message: null, code });
@@ -1120,13 +1147,14 @@ router.post('/api/new', (req, res) => {
     const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
     // ほかの登録が作るセットに決めたコード (カードの取り込み待ち) は、ふつうの商品コードにもさせない (Codex R1 Medium 1)。押し直しは前の答え (確かめない)
     //   (Codex R2: セットの下書きのコードも・読めない = 登録しない・登録の取引でコードの鍵を取った後にもう一度 = codeReserved)
-    const codeReserved = (code) => setCodeReservedFor(code, rid);
+    const codeReserved = (code) => setCodeReservedFor(code, rid, db);
     if (parsed && !po.replay) {
       const held = await codeReserved(parsed.code);
       if (held) return res.status(held.status).json({ ok: false, reason: held.reason, field: 'code', error: `${held.message}。何も保存していません` });
     }
     if (hasPlan) {
       try {
+        await resolveStaleSetPlans(db, parsed.card.sets.map((sp) => sp.code));   // 予約の時間を過ぎた waiting を Company DB の記録で決めてから (Codex R4 Medium 1)
         (await setPlans()).write({ requestId: rid, requestHash: registerPayloadHashOf(parsed), parentCode: parsed.code, parentName: parsed.values.name || '', sets: parsed.card.sets, actor });
       } catch (e) {
         if (e && e.status) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, field: e.field || 'card.sets', ...(e.index == null ? {} : { index: e.index }) });
