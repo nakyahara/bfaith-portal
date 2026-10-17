@@ -1055,7 +1055,25 @@ await ta('[X] ボタンの回が押した後 (executing / exporting) は、別�
   const keep = BC.getLzBcDb();
   process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'lzbc-none-'));
   BC.__setLzBcDb(null);
-  try { assert.equal(BC.bcPressInProgress(NOW), null); assert.ok(!fs.existsSync(path.join(process.env.DATA_DIR, 'lz-bc-import.db')), '確かめるだけで帳面のファイルを作らない'); } finally { process.env.DATA_DIR = prev; BC.__setLzBcDb(keep); }
+  try {
+    assert.equal(BC.bcPressInProgress(NOW), null);
+    assert.ok(!fs.existsSync(path.join(process.env.DATA_DIR, 'lz-bc-import.db')), '確かめるだけで帳面のファイルを作らない');
+    // あるのに壊れている帳面 = 空として作り直さず「読めない」(Codex R7 High)
+    const f = path.join(process.env.DATA_DIR, 'lz-bc-import.db');
+    fs.writeFileSync(f, '');
+    assert.match(String(BC.bcPressInProgress(NOW).error), /0 byte/);
+    assert.equal(fs.statSync(f).size, 0, '0 byte のまま (作り直していない)');
+    fs.rmSync(f);
+    const Database = (await import('better-sqlite3')).default;
+    const half = new Database(f); half.exec('CREATE TABLE bc_jobs (job_id INTEGER)'); half.close();
+    assert.match(String(BC.bcPressInProgress(NOW).error), /表 bc_meta が無い/);
+    fs.rmSync(f);
+    fs.mkdirSync(f);   // ファイルの代わりにフォルダ = 読めない
+    assert.ok(BC.bcPressInProgress(NOW).error);
+    // 手の取込の口も 503
+    r = await openManual();
+    assert.deepEqual([r.status, r.j.error], [503, 'bc_state_unreadable']);
+  } finally { process.env.DATA_DIR = prev; BC.__setLzBcDb(keep); }
 });
 
 await ta('[D] 配り方・台帳・つかいかた: miniPC に runner と手順の部品・Stream Deck に barcode-steps.js / 台帳 lz-bc-import-runner / server.js は parser の前に機械の口 / つかいかた', async () => {

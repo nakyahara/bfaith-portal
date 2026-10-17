@@ -174,9 +174,19 @@ export function __setLzBcDb(db) { shared = db; }
 export function bcPressInProgress(now = Date.now()) {
   const file = path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'lz-bc-import.db');
   try {
-    if (!shared && !fs.existsSync(file)) return null;
-  } catch { /* 下で開いて確かめる */ }
-  try {
+    if (!shared) {
+      // 「まだ無い」と言えるのは ENOENT のときだけ (アクセス拒否などは読めない側。Codex R7 High)
+      let st;
+      try { st = fs.statSync(file); } catch (e) { if (e && e.code === 'ENOENT') return null; throw e; }
+      // あるファイルは、作り直す前に中身を確かめる (0 byte・表が無い・始めた時刻が無い = 壊れた帳面 = 空として作り直さない。Codex R7 High)
+      if (!st.size) throw new Error('帳面のファイルが 0 byte');
+      const ro = new Database(file, { readonly: true, fileMustExist: true });
+      try {
+        const names = new Set(ro.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name));
+        for (const t of ['bc_jobs', 'bc_meta', 'bc_runner', 'bc_downloads', 'bc_void_holds']) if (!names.has(t)) throw new Error(`帳面の表 ${t} が無い`);
+        if (!ro.prepare("SELECT value FROM bc_meta WHERE key = 'started_at'").get()) throw new Error('帳面の始めた時刻が無い');
+      } finally { ro.close(); }
+    }
     const db = getLzBcDb();
     sweep(db, now);
     return busyJobIn(db);
@@ -185,7 +195,11 @@ export function bcPressInProgress(now = Date.now()) {
     return { error: String((e && e.message) || e).slice(0, 160) };
   }
 }
-/** 押した後 (executing / exporting) か、押した後に分からないまま (unknown・記していない) の回 (全部の CSV で 1 つ) */
+/**
+ * 押した後 (executing / exporting) か、押した後に分からないまま (unknown・記していない) の回 (全部の CSV で 1 つ)。
+ * ② の途中で期限が切れた回 (imported・② は分からない) は外す: ① はロジザードの結果の文で取り込みが終わったと確かめてあり、
+ * ② はロジザードの書き出し (照会) だけ = 手の取込 (別のアカウント・商品マスタへの取込) と重なっても登録は重ならない
+ */
 function busyJobIn(db) {
   return db.prepare("SELECT job_id, export_id, state FROM bc_jobs WHERE state IN ('executing','exporting') OR (state = 'unknown' AND resolved_outcome IS NULL) ORDER BY job_id LIMIT 1").get() || null;
 }
