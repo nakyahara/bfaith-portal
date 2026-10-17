@@ -99,7 +99,7 @@ import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
-import { listSkus, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
+import { listSkus, listNeighbors, listCounts, readSkuPage, lookupSku, skuHistory, normalizeFilters, readNewPage, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, splitMulti, EXPORT_MAX, ListTimeoutError, selectableSuppliers } from './read.mjs';
 import { bulkInspect, bulkPreview, bulkApplyChunk, editableOf, BULK_MAX, BULK_CHUNK, COST_REASONS, FIX_GROUPS } from './bulk.mjs';
 import { buildListCsv, csvFileName, buildAmazonCsv, amazonCsvFileName } from './list-csv.mjs';
 import { LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, ViewPrefsInputError } from './list-columns.mjs';
@@ -714,6 +714,40 @@ router.get('/api/codes', (req, res) => {
   if (data.tooMany) return res.status(413).json({ ok: false, error: tooManyWords(data, '全部コピー'), total: data.total, atLeast: !!data.atLeast, max: data.max });
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, codes: data.codes, total: data.total });
+  }, 'read', { deadline });
+});
+/**
+ * 1 つの商品の画面の「← 前へ」「次へ →」(10/17 中原さん)。?cur=<商品コード> + 来た一覧の URL の条件 (札・絞る欄・詳細検索・印 ?s=・並び) のまま。
+ * 返す = { ok, total, pos, prev, next, offset } (read.mjs の listNeighbors) / 410 (条件の期限切れ) / 413 (件数の上限) / 503 (時間・つながらない)。
+ * 画面を開いた後に画面の JS が聞く (画面の表示は待たせない)。時間は全部コピーより短く (NEIGHBOR_TIME_MS)・1 つの文も残りの時間まで (deadlineDb)。
+ * 読めない = 画面はボタンを出さないだけ (一覧へ戻るパンくずはそのまま)
+ */
+const NEIGHBOR_TIME_MS = 8e3;
+router.get('/api/neighbors', (req, res) => {
+  const deadline = Date.now() + Math.min(EXPORT_LIMITS.timeMs, NEIGHBOR_TIME_MS);
+  return withPgApi(res, async (db) => {
+  res.set('Cache-Control', 'no-store');
+  const cur = String(req.query.cur ?? '').trim().slice(0, 100);
+  if (!cur) return res.status(400).json({ ok: false, error: '商品コード (cur) がありません' });
+  const { filters, searchExpired, poOk } = listQuery(req);
+  if (searchExpired) return res.status(410).json({ ok: false, error: '条件の期限が切れました', reason: 'expired' });
+  let data;
+  const tdb = deadlineDb(db, deadline);
+  try {
+    // 在庫の範囲・注文残あり・在庫の並びは、一覧と同じ参考の値で絞る・並べる (全部コピーと同じ)
+    const extras = filters.stock_min || filters.stock_max || filters.po || filters.sort === 'stock' ? await listExtras(tdb, poOk, deadline) : {};
+    // 絞る・並べるのに要る参考の値が今は読めない = 一覧で見た並びと違うかもしれない (在庫順 → コード順など) = 前後を出さない (Codex R1 Medium)
+    const needStock = !!(filters.stock_min || filters.stock_max || filters.sort === 'stock');
+    if ((needStock && !(extras.stock && extras.stock.ok)) || (filters.po && !(extras.backorders && extras.backorders.ok))) {
+      return res.status(503).json({ ok: false, error: '在庫・注文残を読めないので、一覧と同じ並びを出せません', reason: 'extras_unreadable' });
+    }
+    data = await listNeighbors(tdb, filters, cur, { now: new Date(clock()), extras, max: EXPORT_LIMITS.max, deadline });
+  } catch (e) {
+    if (e instanceof ListTimeoutError || isStatementTimeout(e)) return res.status(503).json({ ok: false, error: '時間がかかりすぎました', reason: 'timeout' });
+    throw e;
+  }
+  if (!data.ok) return res.status(413).json({ ok: false, error: '一覧の件数が多すぎます', reason: data.reason, total: data.total, atLeast: data.atLeast });
+  res.json(data);
   }, 'read', { deadline });
 });
 /**

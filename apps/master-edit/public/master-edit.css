@@ -104,6 +104,14 @@ main { padding: 22px 28px 90px; min-width: 0; }
 .crumb { font-size: 13px; color: var(--muted); display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
 .crumb a { color: var(--muted); }
 .crumb a:hover { color: var(--accent); }
+/* 1 つの商品の画面: パンくずと「← 前へ 12 / 340 次へ →」(10/17・me-prevnext.js) を 1 行に。狭い幅では折り返す (前へ・次へは下の行の右) */
+.crumb-row { display: flex; align-items: center; justify-content: space-between; gap: 6px 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.crumb-row .crumb { margin-bottom: 0; min-width: 0; }
+.crumb-row .crumb .mono { overflow-wrap: anywhere; }
+.pn { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.pn .btn { white-space: nowrap; }
+.pn-pos { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pn-pos.out { color: var(--warn); }
 .ph { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
 .ph h1 { font-size: 25px; font-weight: 700; letter-spacing: 0.01em; line-height: 1.3; }
 .ph .lead { font-size: 14px; color: var(--muted); margin-top: 4px; }

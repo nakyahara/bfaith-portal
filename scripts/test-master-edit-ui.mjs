@@ -44,6 +44,8 @@
  *  69 スマホ 390: 上の帯から行ける道 (ポータル・左の列・全体から探す)。隠すのはダッシュボードと「マスタの入力」の札だけ (ほかの .btn は隠さない)。写し = MASTER_EDIT_UI_SHOTS_390=フォルダ
  *  70 Amazon SKU の構成の欄を日本語の名前で探す (10/16): 本物の IME (CDP) で変換中から候補・確定の Enter の 3 つの並び (Windows の Chrome・Edge / Safari) で箱を閉じない・数の欄へ移らない・
  *     マウスで確定した後の Enter は食べない
+ *  72〜74 1 つの商品の画面の「← 前へ」「次へ →」(10/17): 来た一覧と同じ並び・絞り込みの前・次と場所・続けて次へ・最初 / 最後・一覧に無い・出さないとき・
+ *     未保存のまま押す = 離れるときの確認 (ここに残る / 捨てて移る)・スマホ 390 ではみ出さない・44px
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -2938,6 +2940,130 @@ await ta('[71] 発注の設定のグループを名前・ID で絞る (10/16 中
     mirrorDb.prepare("delete from po_order_conditions where condition_id in ('maruma-30000', 'maruma-box', 'maruma-other')").run();
   }
 });
+
+// ── [72]〜[74] 1 つの商品の画面の「← 前へ」「次へ →」(10/17 中原さん) ──
+/** 前へ・次へが出るまで待って、{ pos, prev, next } (押せない = null) */
+const pnState = async (p) => {
+  await p.waitForSelector('#sku-pn:not([hidden]) #pn-pos', { timeout: 5000 });
+  return p.evaluate(() => {
+    const hrefOf = (id) => { const el = document.getElementById(id); return el && el.tagName === 'A' ? decodeURIComponent(el.getAttribute('href').split('/sku/')[1]) : null; };
+    return { pos: document.getElementById('pn-pos').textContent.trim(), prev: hrefOf('pn-prev'), next: hrefOf('pn-next'),
+      prevOff: document.getElementById('pn-prev').disabled === true, nextOff: document.getElementById('pn-next').disabled === true };
+  });
+};
+const codesFor = (p, qs) => p.evaluate((u) => fetch(u).then((r) => r.json()).then((j) => j.codes), `${B}/api/codes${qs}`);
+await ta('[72] 前へ・次へ (10/17): 来た一覧 (同じ絞り込み・並び) の中の前・次と「2 / 3」・続けて押しても同じ一覧・最初 / 最後は押せない・一覧に無い・一覧から来ていない / 期限切れ = 出さない・パンくずは同じ一覧へ', async (p) => {
+  await p.goto(B + '/?q=' + encodeURIComponent('はちみつ'));
+  const codes = await listCodes(p);
+  assert.deepEqual(codes, await codesFor(p, '?q=' + encodeURIComponent('はちみつ')));
+  assert.equal(codes.length, 3);
+  await Promise.all([p.waitForNavigation(), p.click(`a.rowlink:text-is("${codes[1]}")`)]);
+  assert.deepEqual(await pnState(p), { pos: '2 / 3', prev: codes[0], next: codes[2], prevOff: false, nextOff: false });
+  // 次へ → 最後 (次へは押せない)
+  await Promise.all([p.waitForNavigation(), p.click('#pn-next')]);
+  assert.match(p.url(), new RegExp(`sku/${codes[2]}$`));
+  assert.deepEqual(await pnState(p), { pos: '3 / 3', prev: codes[1], next: null, prevOff: false, nextOff: true });
+  // 前へを 2 回 = 最初 (前へは押せない)。続けて押しても同じ一覧の中
+  await Promise.all([p.waitForNavigation(), p.click('#pn-prev')]);
+  assert.deepEqual((await pnState(p)).pos, '2 / 3');
+  await Promise.all([p.waitForNavigation(), p.click('#pn-prev')]);
+  assert.match(p.url(), new RegExp(`sku/${codes[0]}$`));
+  assert.deepEqual(await pnState(p), { pos: '1 / 3', prev: null, next: codes[1], prevOff: true, nextOff: false });
+  // パンくずの「商品・セット」= 同じ絞り込みの一覧のまま
+  assert.equal(new URL(await p.locator('.crumb a').first().evaluate((a) => a.href)).searchParams.get('q'), 'はちみつ');
+  // 一覧に無い商品 (同じタブで別の商品を開いた・直して絞り込みに合わなくなった) = 「一覧に無い」・前へ・次へは押せない
+  await p.goto(B + '/sku/s001');
+  const out = await pnState(p);
+  assert.match(out.pos, /^一覧に無い \(全 3 件\)$/);
+  assert.deepEqual([out.prevOff, out.nextOff], [true, true]);
+  // 並び (名前の逆順・区分で絞る) も一覧と同じ
+  await p.goto(B + '/?kind=single&sort=name&dir=desc');
+  const byName = await codesFor(p, '?kind=single&sort=name&dir=desc');
+  assert.deepEqual(await listCodes(p), byName.slice(0, 100));
+  await Promise.all([p.waitForNavigation(), p.click(`a.rowlink:text-is("${byName[4]}")`)]);
+  assert.deepEqual(await pnState(p), { pos: `5 / ${byName.length}`, prev: byName[3], next: byName[5], prevOff: false, nextOff: false });
+  for (let i = 5; i < 8; i++) {
+    await Promise.all([p.waitForNavigation(), p.click('#pn-next')]);
+    assert.match(p.url(), new RegExp(`sku/${byName[i]}$`), `${i + 1} 番目`);
+    assert.equal((await pnState(p)).pos, `${i + 1} / ${byName.length}`);
+  }
+  // 在庫 (ロジザードの写し) で並べた一覧・在庫で絞った一覧でも同じ並び (写しが読める = この試験の見本)
+  for (const qs of ['sort=stock&dir=desc', 'stock_min=1&sort=stock']) {
+    const sc = await codesFor(p, '?' + qs);
+    assert.ok(sc.length >= 2, qs);
+    const got = await p.evaluate((u) => fetch(u).then((r) => r.json()), `${B}/api/neighbors?${qs}&cur=${encodeURIComponent(sc[1])}`);
+    assert.deepEqual(got, { ok: true, total: sc.length, pos: 2, prev: sc[0], next: sc[2] ?? null, offset: 0 }, qs);
+  }
+  // パンくずの戻り先 = この商品が載る一覧のページ (覚えた一覧が 2 ページ目でも、商品が 1 ページ目にあれば offset を外す)
+  await p.evaluate((base) => sessionStorage.setItem('master-edit:list-url', base + '/?kind=single&offset=100'), new URL(B).pathname);
+  await p.goto(B + '/sku/s002');
+  await pnState(p);
+  const crumb = new URL(await p.locator('.crumb a').first().evaluate((a) => a.href));
+  assert.deepEqual([crumb.searchParams.get('kind'), crumb.searchParams.has('offset')], ['single', false]);
+  // 条件の印 (?s=) が消えた (期限切れ・再起動) = 出さない (パンくずはそのまま)
+  await p.evaluate((base) => sessionStorage.setItem('master-edit:list-url', base + '/?s=AAAAAAAAAAAAAAAAAAAAAA'), new URL(B).pathname);
+  const [gone] = await Promise.all([p.waitForResponse((r) => r.url().includes('/api/neighbors?')), p.goto(B + '/sku/s002')]);
+  assert.equal(gone.status(), 410);
+  await p.waitForTimeout(200);
+  assert.equal(await p.locator('#sku-pn').isHidden(), true, '期限切れ = 出さない');
+  // 一覧から来ていない (覚えた一覧が無い) = 聞かない・出さない
+  await p.evaluate(() => sessionStorage.clear());
+  const asked = [];
+  p.on('request', (r) => { if (r.url().includes('/api/neighbors?')) asked.push(r.url()); });
+  await p.goto(B + '/sku/s002');
+  await p.waitForTimeout(300);
+  assert.deepEqual(asked, [], '一覧から来ていない = 聞かない');
+  assert.equal(await p.locator('#sku-pn').isHidden(), true, '一覧から来ていない = 出さない');
+});
+
+await ta('[73] 前へ・次へ と未保存 (10/17): 変えたまま「次へ」= 離れるときの確認 (ここに残る = 同じ画面・押した所へフォーカス / 捨てて移る = 次の商品・保存していない)', async (p) => {
+  await p.goto(B + '/?q=s00');
+  const codes = await listCodes(p);
+  assert.ok(codes.length >= 3, codes.join(','));
+  await Promise.all([p.waitForNavigation(), p.click(`a.rowlink:text-is("${codes[1]}")`)]);
+  const st = await pnState(p);
+  assert.equal(st.next, codes[2]);
+  const before = (await row(codes[1])).months;
+  await p.fill('#f-reorder_months', String(before + 3));
+  assert.equal(await dirty(p), 1);
+  await p.click('#pn-next');
+  assert.equal(await p.locator('#leave-bg.on').count(), 1, '次へでも聞く');
+  assert.match(await p.textContent('#leave-list'), /推奨保有月数/);
+  await p.click('#leave-stay');
+  assert.match(p.url(), new RegExp(`sku/${codes[1]}$`), 'ここに残る = 同じ画面');
+  assert.equal(await active(p), 'pn-next', '押した所へフォーカスが戻る');
+  assert.equal(await dirty(p), 1, '変えた値は残る');
+  // キーボード (Enter) でも聞く
+  await p.keyboard.press('Enter');
+  assert.equal(await p.locator('#leave-bg.on').count(), 1, 'Enter でも聞く');
+  await p.click('#leave-stay');
+  await p.click('#pn-prev');
+  assert.equal(await p.locator('#leave-bg.on').count(), 1, '前へでも聞く');
+  await p.click('#leave-stay');
+  await p.click('#pn-next');
+  await Promise.all([p.waitForNavigation(), p.click('#leave-drop')]);
+  assert.match(p.url(), new RegExp(`sku/${codes[2]}$`), '捨てて移る = 次の商品');
+  assert.equal((await row(codes[1])).months, before, '捨てたので保存していない');
+  assert.equal((await pnState(p)).pos, `3 / ${codes.length}`, '移った先も同じ一覧');
+});
+
+await ta('[74] 前へ・次へ スマホ 390 (10/17): パンくずと前へ・次へが横にはみ出さない・押す所は 44px で押せる (長いコードでも)', async (p) => {
+  await p.goto(B + '/?q=' + encodeURIComponent('はちみつ'));
+  const codes = await listCodes(p);
+  await Promise.all([p.waitForNavigation(), p.click(`a.rowlink:text-is("${codes[1]}")`)]);
+  await pnState(p);
+  await p.evaluate(() => Promise.all(document.getAnimations().map((a) => a.finished.catch(() => {}))));
+  const m = await measureMobile(p);
+  assert.ok(m.sw <= m.W && !m.wide.length && !m.small.length && !m.blocked.length, `横幅 ${m.sw} / ${m.W}・はみ出す ${JSON.stringify(m.wide)}・小さい ${JSON.stringify(m.small)}・押せない ${JSON.stringify(m.blocked)}`);
+  const box = await p.evaluate(() => ['pn-prev', 'pn-next'].map((id) => { const r = document.getElementById(id).getBoundingClientRect(); return [Math.round(r.height), Math.round(r.right)]; }));
+  for (const [h, right] of box) { assert.ok(h >= 44, `高さ ${h}`); assert.ok(right <= 390, `右 ${right}`); }
+  // 長いコードの見出し (パンくず) でも はみ出さない
+  await p.evaluate(() => { document.querySelector('.crumb .mono').textContent = 'pr-ui390-unlinked-very-long-seller-sku-0001-0002-0003'; });
+  const m2 = await measureMobile(p);
+  assert.ok(m2.sw <= m2.W && !m2.wide.length, `長いコード: 横幅 ${m2.sw} / ${m2.W}・はみ出す ${JSON.stringify(m2.wide)}`);
+  await Promise.all([p.waitForNavigation(), p.click('#pn-next')]);
+  assert.match(p.url(), new RegExp(`sku/${codes[2]}$`));
+}, { width: 390, height: 844 });
 
 await browser.close();
 server.close();
