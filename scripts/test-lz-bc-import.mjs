@@ -95,6 +95,11 @@ app.use('/apps/lz-bc-import', createLzBcRunnerRouter({ readExportFile: (id) => R
 app.use(express.json({ limit: '10mb' }));   // 後ろの共通の parser (機械の口には届かないこと)
 app.use((req, res, next) => { req.session = SESS[who]; next(); });
 app.use('/apps/master-edit', MR.default);
+// ロジザードの取込の状態の画面の口 (手の取込を始める口・ボタンの回が押した後なら断る)
+const IS = await import('../apps/logizard-import-state/store.js');
+const { createAdminRouter } = await import('../apps/logizard-import-state/admin-router.js');
+const ISDB = IS.openImportStateDb(':memory:');
+app.use('/lzadmin', createAdminRouter({ getDb: () => ISDB, now: clock, notify: async () => true }));
 const server = http.createServer(app);
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const ORIGIN = `http://127.0.0.1:${server.address().port}`;
@@ -858,14 +863,15 @@ await ta('[P] 本物の barcode-steps.js の ①: 実行ボタンの前にポー
     const logs = [];
     out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, session: sessionWith(m), log: () => {}, ...noExit, now: () => local });
     assert.deepEqual([m.st.exec, m.st.ok, out.executed, jobRow(id).state], [1, 0, true, 'unknown'], '確認を承認しない = 取込は始まっていない (押した後なので分からない側)');
-    assert.match(jobRow(id).log, /押してよい間を過ぎたので dialog を承認しない/);
+    assert.match(jobRow(id).log, /ブラウザの確認 dialog を承認しない .*\(押してよい間も過ぎている\)/);
     await m.ctx.close();
-    // 間の中なら承認する (同じ形で時計を進めない = 取り込んだ)
+    // 間の中でも、ボタンの道ではブラウザの確認 dialog は承認しない (承認は node から送る = 時刻を見た後に止まると締め切りの後に承認しうる。Codex R5 High)
     e = await newExport(1);
     id = await queue(e, { with_export: false });
     m = await mk(1, 0, { native: true });
     out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, session: sessionWith(m), log: () => {}, ...noExit });
-    assert.deepEqual([m.st.exec, m.st.ok, jobRow(id).state], [1, 1, 'imported']);
+    assert.deepEqual([m.st.exec, m.st.ok, jobRow(id).state], [1, 0, 'unknown']);
+    assert.match(jobRow(id).log, /ボタンの道ではブラウザの確認 dialog を承認しない/);
     assert.ok(logs);
     await m.ctx.close();
     // 確かめの後に node が止まり、古い持ち時間で押し始めても、ページの中で押した瞬間の時刻を見て捨てる (Codex R4 High)
@@ -982,6 +988,32 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
     // 信用しない値は文字のまま (ログに HTML)
     assert.deepEqual(errs, [], errs.join('\n'));
   } finally { await browser.close(); }
+});
+
+await ta('[X] ボタンの回が押した後 (executing / exporting) は、別の PC の「手の取込」を始めさせない (手の取込が開いている間は押させない = I3)・同期の処理の中で確かめる (Codex R5 High)', async () => {
+  NOW = jst('10:00', '2030-01-12');
+  const e = await newExport(1);
+  const id = await queue(e);
+  const cl = await runnerSeen();
+  assert.equal(cl.j.job.job_id, id);
+  const openManual = () => fetch(`${ORIGIN}/lzadmin/manual/open`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: ORIGIN }, body: JSON.stringify({ lz_account: 'x', source_run_id: 'lzd_x', expected_halt_revision: 1 }) }).then(async (r) => ({ status: r.status, j: await r.json() }));
+  let r = await openManual();
+  assert.notEqual(r.j.error, 'bc_import_running', '取っただけ (押す前) = 手の取込の側では止めない (押す側が手の取込を見て断る)');
+  assert.equal((await mcall(`/jobs/${id}/executing`, { claim_token: cl.j.claim_token })).status, 200);
+  r = await openManual();
+  assert.deepEqual([r.status, r.j.error], [409, 'bc_import_running'], JSON.stringify(r.j));
+  await mcall(`/jobs/${id}/import`, { claim_token: cl.j.claim_token, import_result: { status: 'ok', counts: { total: 1, errors: 0 } } });
+  assert.equal(jobRow(id).state, 'exporting');
+  assert.equal((await openManual()).j.error, 'bc_import_running', '② の間も');
+  await mcall(`/jobs/${id}/final`, { claim_token: cl.j.claim_token, executed: true, import_result: { status: 'ok', counts: { total: 1, errors: 0 } }, export_result: { status: 'ok', rows: 3 } });
+  r = await openManual();
+  assert.notEqual(r.j.error, 'bc_import_running', '終わった後 = 手の取込のほかの決まりで判断');
+  // 帳面のファイルが無い (ボタンを一度も使っていない) = 動いていない
+  const prev = process.env.DATA_DIR;
+  const keep = BC.getLzBcDb();
+  process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'lzbc-none-'));
+  BC.__setLzBcDb(null);
+  try { assert.equal(BC.bcPressInProgress(NOW), null); assert.ok(!fs.existsSync(path.join(process.env.DATA_DIR, 'lz-bc-import.db')), '確かめるだけで帳面のファイルを作らない'); } finally { process.env.DATA_DIR = prev; BC.__setLzBcDb(keep); }
 });
 
 await ta('[D] 配り方・台帳・つかいかた: miniPC に runner と手順の部品・Stream Deck に barcode-steps.js / 台帳 lz-bc-import-runner / server.js は parser の前に機械の口 / つかいかた', async () => {

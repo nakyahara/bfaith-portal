@@ -163,6 +163,25 @@ let shared = null;
 export function getLzBcDb() { return (shared ||= openLzBcDb()); }
 export function __setLzBcDb(db) { shared = db; }
 
+/**
+ * ロジザードの毎日の商品マスタの「手の取込」を始める口 (apps/logizard-import-state/admin-router.js) が呼ぶ:
+ * いまボタンの回が押した後 (executing / exporting) か。そう = 手の取込を始めさせない (Codex R5 High)。
+ * 逆向き (手の取込が開いている間は押させない) は markExecuting が見る。どちらも同じ process の中の同期の処理 = 確かめと始めるの間に入れ違わない。
+ * 帳面のファイルがまだ無い (ボタンを一度も使っていない) = 動いていない。読めない = 動いていない扱い (帳面に書けなければボタンも押せない)
+ */
+export function bcPressInProgress(now = Date.now()) {
+  try {
+    const file = path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'lz-bc-import.db');
+    if (!shared && !fs.existsSync(file)) return null;
+    const db = getLzBcDb();
+    sweep(db, now);
+    return db.prepare("SELECT job_id, export_id, state FROM bc_jobs WHERE state IN ('executing','exporting') LIMIT 1").get() || null;
+  } catch (e) {
+    console.error(`[lz-bc-import] 帳面を読めない (手の取込は止めない): ${e && e.message}`);
+    return null;
+  }
+}
+
 // ── 時刻 (JST) ──
 const jstMin = (now) => { const d = new Date(now + 9 * 3600e3); return d.getUTCHours() * 60 + d.getUTCMinutes(); };
 const hhmm = (now) => { const m = jstMin(now); return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; };

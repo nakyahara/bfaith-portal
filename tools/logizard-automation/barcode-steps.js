@@ -120,11 +120,13 @@ export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = nul
       nightDialog = true;
       console.log(`🛑 夜の止め (00:00〜01:30) のため dialog を承認しない ${unexpectedDialog} → dismiss`);
       await d.dismiss().catch(() => {});
-    } else if (pressStopped('dialog の承認')) {
-      // ボタンの道: 「押す」から押してよい間を過ぎた = 始める確認でも承認しない (Codex R2 High)
+    } else if (pressGuard) {
+      // ボタンの道 (pressGuard あり): ブラウザの確認 dialog はどれも承認しない (Codex R2・R5 High)。
+      //   承認は node から送る = 時刻を見た後・送る前に止まると締め切りの後に承認しうる (ページの中の止めが効かない)。
+      //   本物のロジザードの取込の確認は画面の中の箱 (jAlerts) = nightClick (ページの中の止めつき) で押す。CLI (pressGuard なし) は今までどおり
       unexpectedDialog = `[${d.type()}] ${msg.slice(0, 200)}`;
       pressStopDialog = true;
-      console.log(`🛑 押してよい間を過ぎたので dialog を承認しない ${unexpectedDialog} → dismiss`);
+      console.log(`🛑 ボタンの道ではブラウザの確認 dialog を承認しない ${unexpectedDialog} → dismiss${pressStopped('dialog の承認') ? ' (押してよい間も過ぎている)' : ''}`);
       await d.dismiss().catch(() => {});
     } else if (d.type() === 'confirm' && DIALOG_CONFIRM_OK.test(msg)) {
       console.log(`💬 confirm "${msg.slice(0, 120)}" → accept`);
