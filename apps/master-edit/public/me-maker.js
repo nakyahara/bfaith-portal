@@ -153,7 +153,10 @@
     if (!window.confirm(ask)) { say('登録しませんでした', ''); return; }
     var k = norm(name);
     if (!lastReq || lastReq.k !== k) lastReq = { k: k, id: uuid() };
-    // 待つ間は前に選んでいたメーカーを使わない (隠した欄を空に = 保存も「あと N つ」も止まる・#maker Codex R2 M)
+    // 待つ間は前に選んでいたメーカーを使わない (隠した欄を空に = 保存も「あと N つ」も止まる・#maker Codex R2 M)。
+    //   前の「入力なし」も外す (メーカーを決めに行った = 返事が来るまで決まっていない・#maker Codex R3 M)
+    var nb = document.querySelector('input[type="checkbox"][data-none="maker"]');
+    if (nb && nb.checked) { nb.checked = false; nb.dispatchEvent(new Event('change', { bubbles: true })); }
     setVal(null, true); inp.value = name;
     var my = gen;
     busy = true; say('登録しています…', 'info');

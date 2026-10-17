@@ -315,29 +315,44 @@ await ta('②b まとまり: 今あるまとまりを選ぶ = 子のメーカー
   assert.equal(await p.inputValue('#f-maker-in'), '');
 });
 
-await ta('①c 名簿に足す返事を待つ間: 前に選んだメーカーを使わない (保存・あと N つは止まる)・待つ間に「入力なし」を押した = 返事が来ても上書きしない (#maker Codex R2 M)', async (p) => {
+await ta('①c 名簿に足す返事を待つ間: 前に選んだメーカー・前の「入力なし」を使わない (あと N つに戻る)・待つ間に選び直した = 返事が来ても上書きしない (#maker Codex R2 M・R3 M)', async (p) => {
   let release = null;
   await p.route('**/api/makers', async (route) => { await new Promise((r) => { release = r; }); await route.continue(); });
   p.on('dialog', (d) => d.accept());
   await p.goto(B + '/new?kind=single');
   await fillSingle(p, 'mkui-3');
-  await p.selectOption('#f-primary_supplier', '0001');   // AMC = 名簿に無い
+  // (1) 山田を選んだ後に、名簿に無い名前を新しく登録 → 待つ間は山田を使わない → 待つ間に「入力なし」→ 返事が来ても入力なしのまま
   await p.fill('#f-maker-in', '山田');
   await p.keyboard.press('ArrowDown');
   await p.keyboard.press('Enter');
   assert.equal(await hid(p), YAMADA.id);
   const n1 = await remain(p);
-  await p.click('#f-maker-same');
-  await p.waitForFunction(() => /登録しています/.test(document.getElementById('f-maker-msg').textContent), null, { timeout: 5000 }).catch(async (e) => { throw new Error(e.message + ' msg=' + await p.textContent('#f-maker-msg') + ' hid=' + await hid(p) + ' in=' + await p.inputValue('#f-maker-in')); });
+  await p.fill('#f-maker-in', 'ほげ製作所');
+  await p.click('#f-maker-list .co.mk-new');
+  await p.waitForFunction(() => /登録しています/.test(document.getElementById('f-maker-msg').textContent));
   assert.equal(await hid(p), '', '待つ間も前に選んだメーカー (山田) のまま');
-  assert.equal(await p.inputValue('#f-maker-in'), 'AMC');
   assert.equal(await remain(p), n1 + 1, '待つ間は「あと N つ」に戻る');
   await p.check('input[data-none="maker"]');
   release();
   await p.waitForFunction(() => /選び直したので/.test(document.getElementById('f-maker-msg').textContent));
   assert.equal(await hid(p), '', '返事で「入力なし」を上書きした');
   assert.equal(await p.isChecked('input[data-none="maker"]'), true);
-  assert.equal((await one("select count(*)::int as n from core.makers where name = 'AMC'")).n, 1, '名簿には足してある');
+  assert.equal((await one("select count(*)::int as n from core.makers where name = 'ほげ製作所'")).n, 1, '名簿には足してある');
+  // (2) 「入力なし」のまま「仕入先と同じ」(AMC = 名簿に無い) → 待つ間は入力なしを外す (数え直す) → 待つ間に山田を選ぶ → 返事が来ても山田のまま
+  await p.selectOption('#f-primary_supplier', '0001');
+  const n2 = await remain(p);
+  await p.click('#f-maker-same');
+  await p.waitForFunction(() => /登録しています/.test(document.getElementById('f-maker-msg').textContent));
+  assert.equal(await p.isChecked('input[data-none="maker"]'), false, '待つ間も前の「入力なし」のまま');
+  assert.equal(await remain(p), n2 + 1);
+  assert.equal(await p.inputValue('#f-maker-in'), 'AMC');
+  await p.fill('#f-maker-in', '山田');
+  await p.keyboard.press('ArrowDown');
+  await p.keyboard.press('Enter');
+  release();
+  await p.waitForFunction(() => /選び直したので/.test(document.getElementById('f-maker-msg').textContent));
+  assert.equal(await hid(p), YAMADA.id, '返事で後から選んだ山田を上書きした');
+  assert.equal((await one("select count(*)::int as n from core.makers where name = 'AMC'")).n, 1);
 });
 
 await ta('④ スマホの幅 (390): 横にはみ出さない・押す所は 44px・候補は画面の中', async (p) => {

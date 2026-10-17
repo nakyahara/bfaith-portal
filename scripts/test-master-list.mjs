@@ -413,7 +413,7 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   assert.match(r.text, /id="colcnt">16\/18</);
   // 中身が無い一覧の行 = 全部の列にまたがる
   r = await call('GET', '/?q=' + encodeURIComponent('当たらない名前'));
-  assert.match(r.text, /<td colspan="16" class="muted"/);
+  assert.match(r.text, /<td colspan="17" class="muted"/);
   // 名前の下の「仕入先」の字はいつもの列のときは出る (仕入先の列を出していない)
   assert.equal((await call('POST', '/api/view-prefs', { body: { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] } })).status, 200);
   r = await call('GET', '/');

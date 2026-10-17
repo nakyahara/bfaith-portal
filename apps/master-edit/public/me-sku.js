@@ -184,6 +184,7 @@
   var busy = false;
   var mustReload = false;
   ME.dirty = function () { return { n: lastState.n, items: lastState.items, impacts: lastState.impacts }; };
+  ME.recount = function () { update(); };   // 🆕 0083: メーカーの欄 (public/me-maker.js) が名簿に足す返事を待つ間・来た後に保存できるかを数え直す (#maker Codex R3 M)
   scope.addEventListener('input', update);
   scope.addEventListener('change', update);
 
