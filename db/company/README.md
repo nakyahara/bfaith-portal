@@ -2730,7 +2730,7 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **なぜ別の表か**: `core.products.manufacturer` (0002) は夜間ロードの属性の解決 (`apps/company-db/load/engine.mjs` の 10. = product_hub / amazon_catalog の観測) が書く列 = ポータルで入れた値を上書きする・未来の観測の取り消しで空にする道がある。持ち主の表 (`config/master-ownership.mjs`) にも無い (足すと広げる道 = epoch・widen が要る)。
   → **Company DB だけに持つ別の表** (夜間ロード・写し・NE / ロジザード / product-hub は触らない・送らない)。mart の `p.manufacturer` (0007 / 0009 / 0077) はそのまま (ポータルのメーカーを mart に出すのは後の PR)
 - **表** `core.makers` (名簿・`name_norm` = NFKC → 小文字 → ひらがなをカタカナ → 空白を除く = `core.maker_name_norm`・会社の中で一意 = 同じメーカーを 2 つ作らない・`created_request_id` で押し直しを見分ける) /
-  `core.product_makers` (単品の商品の行ごとの今のメーカー・行が無い = なし) / `ops.product_maker_events` (付けた・変えた・外した記録・追記だけ・request_id と商品で一意)。書くのは 2 つの関数の中だけ (印 `ops.maker_protocol`・持ち主のロールでも直には書けない)・TRUNCATE できない
+  `core.product_makers` (単品の商品の行ごとの今のメーカー・行が無い = なし) / `ops.product_maker_events` (付けた・変えた・外した記録・追記だけ・request_id と商品で一意)。`ops.maker_requests` (名簿に足す要求の控え = 既にあった名前を返した回も・同じ番号の違う名前を断る)。書くのは 2 つの関数の中だけ (印 `ops.maker_protocol`・持ち主のロールでも直には書けない)・TRUNCATE できない
 - **関数** `ops.create_maker(request_id, 人, 名前)` = 名前を掃除して足す (同じと見る名前があれば足さずにそれ = existed・同じ request_id = 前の答え・違う名前 = request_id_reused) /
   `ops.set_product_maker(request_id, 人, sku_id, メーカー, 見ていたメーカー, どこから, 理由)` = 単品・やめていない・名簿にある有効なメーカー・今のメーカーが見ていたものと違う = version_conflict。どちらも切替の段階が new_open のときだけ
 - **入口**: 新商品の登録 (単品 = 登録と同じ取引・値か「入力なし」= `lib/master-register-blanks.mjs` の maker)・まとまりの登録 (全部の子に同じ値)・商品の画面 (`saveSku` の欄 maker = 保存と同じ取引・編集の印に入れる (メーカーがあるときだけ = 無い商品の印は前と同じ))・`POST /api/makers` (名簿に足す)

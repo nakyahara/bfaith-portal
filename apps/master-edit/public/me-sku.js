@@ -147,6 +147,8 @@
     if (keys.indexOf(isSet ? 'handling_own' : 'handling') >= 0 && el && valueOf(el) === 'discontinued' && !reason) out.push({ t: '取扱を中止にするときは理由が要ります (下の「理由」)', focus: '#reason' });
     if (keys.indexOf('cost') >= 0 && !costReason().trim()) out.push({ t: '原価を変える理由で「その他」を選んだときは、理由を書いてください', focus: '#cost-reason' });
     if (keys.indexOf('exception_cost') >= 0 && !$('#xcost-reason').value.trim()) out.push({ t: '例外原価を変えるときは、その「理由」が要ります', focus: '#xcost-reason' });
+    // 🆕 0083 (#maker Codex R1 M): メーカーの名前を打ったが一覧から選んでいない = 保存しない (そのまま送ると今のメーカーを外してしまう)
+    if (ME.maker && ME.maker.pending()) out.push({ t: 'メーカーは一覧から選ぶか「新しいメーカーとして登録」を押してください (外すときは欄を空に)', focus: '#f-maker-in' });
     return out;
   }
 

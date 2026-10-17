@@ -94,7 +94,7 @@ revoke all on core.makers, core.product_makers, ops.product_maker_events from pu
 -- 守り: 書くのは 2 つの関数の中だけ (印 ops.maker_protocol)・記録は追記だけ・TRUNCATE できない
 create function ops.guard_maker_tables() returns trigger language plpgsql set search_path = pg_catalog, pg_temp as $$
 begin
-  if tg_table_name = 'product_maker_events' and tg_op <> 'INSERT' then
+  if tg_table_name in ('product_maker_events', 'maker_requests') and tg_op <> 'INSERT' then
     raise exception 'product_maker_events: 記録は変えない・消さない (追記だけ)' using errcode = '42501';
   end if;
   if coalesce(pg_catalog.current_setting('ops.maker_protocol', true), '') is distinct from '1' then
@@ -109,11 +109,24 @@ create trigger trg_product_maker_events_guard before insert or update or delete 
 create trigger trg_makers_no_truncate before truncate on core.makers for each statement execute function core.reject_mutation();
 create trigger trg_product_makers_no_truncate before truncate on core.product_makers for each statement execute function core.reject_mutation();
 create trigger trg_product_maker_events_no_truncate before truncate on ops.product_maker_events for each statement execute function core.reject_mutation();
+-- 名簿に足す要求の控え (#maker Codex R1 Low: 既にあった名前を返した回も控える = 同じ request_id で違う名前を送っても新しく作らない)。追記だけ・関数の中だけ
+create table ops.maker_requests (
+  request_id uuid        primary key,
+  actor_id   text        not null,
+  name_norm  text        not null,
+  maker_id   bigint      not null references core.makers,
+  existed    boolean     not null,
+  created_at timestamptz not null default now()
+);
+revoke all on ops.maker_requests from public;
+comment on table ops.maker_requests is '🆕 0083: ops.create_maker の要求の控え (足した回・既にあった名前を返した回の両方)。同じ request_id = この答え・違う名前 / 人 = request_id_reused';
+create trigger trg_maker_requests_guard before insert or update or delete on ops.maker_requests for each row execute function ops.guard_maker_tables();
+create trigger trg_maker_requests_no_truncate before truncate on ops.maker_requests for each statement execute function core.reject_mutation();
 
 -- ═══════════ 2. 名簿に足す ═══════════
 /**
  * p_name = 人が打った名前 (掃除してから確かめる)。戻り値 = { ok, maker_id, name, existed, replayed? }
- *   existed = 同じと見る名前のメーカーが既にあった (足さずにそれを返す = 重ねない)。押し直し (同じ request_id・同じと見る名前) = 前の答え (replayed)
+ *   existed = 同じと見る名前のメーカーが既にあった (足さずにそれを返す = 重ねない)。押し直し (同じ request_id・同じと見る名前・同じ人) = 控え (ops.maker_requests) の答え (replayed)
  * 断る: invalid_input (形・人) / before_cutover (切替の段階が new_open でない) / request_id_reused (同じ request_id で違う名前・人)
  */
 create function ops.create_maker(p_request_id uuid, p_actor_id text, p_name text) returns jsonb
@@ -123,6 +136,7 @@ declare
   v_norm text;
   v_prob text := ops.maker_name_problem(p_name);
   v_m    core.makers;
+  v_q    ops.maker_requests;
 begin
   if p_request_id is null then raise exception 'invalid_input: request_id が要る' using errcode = '22023'; end if;
   if ops.reg_actor_problem(p_actor_id, null) is not null or p_actor_id !~ '^[^[:space:]@]+@[^[:space:]@]+$' then
@@ -135,21 +149,27 @@ begin
     raise exception 'before_cutover: 切替の段階が new_open でない' using errcode = 'P0001';
   end if;
   v_norm := core.maker_name_norm(v_name);
-  -- 同じと見る名前の鍵 (2 人が同時に同じメーカーを足しても 1 つ)
+  -- 鍵: 同じ request_id (同じ番号の要求は 1 つずつ) → 同じと見る名前 (2 人が同時に同じメーカーを足しても 1 つ)
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.maker_request:' || p_request_id::text, 0));
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.maker:' || v_norm, 0));
-  select * into v_m from core.makers m where m.created_request_id = p_request_id;
-  if v_m.maker_id is not null then
-    if v_m.name_norm is distinct from v_norm or v_m.created_by_id is distinct from p_actor_id then
+  -- 押し直し = 控えの答え (足した回も・既にあった名前を返した回も)。違う名前・人 = 断る
+  select * into v_q from ops.maker_requests r where r.request_id = p_request_id;
+  if v_q.request_id is not null then
+    if v_q.name_norm is distinct from v_norm or v_q.actor_id is distinct from p_actor_id then
       raise exception 'request_id_reused: request_id % はほかの名前・人で使われている', p_request_id using errcode = '23505';
     end if;
-    return pg_catalog.jsonb_build_object('ok', true, 'maker_id', v_m.maker_id::text, 'name', v_m.name, 'existed', false, 'replayed', true);
-  end if;
-  select * into v_m from core.makers m where m.company_id = 1 and m.name_norm = v_norm;
-  if v_m.maker_id is not null then
-    return pg_catalog.jsonb_build_object('ok', true, 'maker_id', v_m.maker_id::text, 'name', v_m.name, 'existed', true, 'active', v_m.active);
+    select * into v_m from core.makers m where m.maker_id = v_q.maker_id;
+    return pg_catalog.jsonb_build_object('ok', true, 'maker_id', v_m.maker_id::text, 'name', v_m.name, 'existed', v_q.existed, 'replayed', true);
   end if;
   perform pg_catalog.set_config('ops.maker_protocol', '1', true);
+  select * into v_m from core.makers m where m.company_id = 1 and m.name_norm = v_norm;
+  if v_m.maker_id is not null then
+    insert into ops.maker_requests (request_id, actor_id, name_norm, maker_id, existed) values (p_request_id, p_actor_id, v_norm, v_m.maker_id, true);
+    perform pg_catalog.set_config('ops.maker_protocol', '', true);
+    return pg_catalog.jsonb_build_object('ok', true, 'maker_id', v_m.maker_id::text, 'name', v_m.name, 'existed', true, 'active', v_m.active);
+  end if;
   insert into core.makers (company_id, name, name_norm, created_by_id, created_request_id) values (1, v_name, v_norm, p_actor_id, p_request_id) returning * into v_m;
+  insert into ops.maker_requests (request_id, actor_id, name_norm, maker_id, existed) values (p_request_id, p_actor_id, v_norm, v_m.maker_id, false);
   perform pg_catalog.set_config('ops.maker_protocol', '', true);
   return pg_catalog.jsonb_build_object('ok', true, 'maker_id', v_m.maker_id::text, 'name', v_m.name, 'existed', false);
 end $$;

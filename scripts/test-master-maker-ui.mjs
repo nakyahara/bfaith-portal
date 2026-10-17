@@ -68,6 +68,17 @@ const MK = await import('../lib/master-maker.mjs');
 const addMaker = async (name) => { await pg.query('set role master_edit'); try { return (await MK.createMaker(T.db, { requestId: crypto.randomUUID(), actor: 'naka@test', name })).maker; } finally { await pg.query('set role deploy'); } };
 const HONPO = await addMaker('ハチミツ本舗');
 const YAMADA = await addMaker('山田製作所');
+// メーカーの付いた今あるまとまり (②b)
+{
+  const V = await import('../lib/master-variation.mjs');
+  await pg.query('set role master_edit');
+  try {
+    await V.registerVariationBatch(T.db, { actor: 'naka@test', requestId: crypto.randomUUID(), group: { mode: 'new', code: 'mkgrp', name: 'メーカーのまとまり' }, axes: [{ axis: 1, name: 'カラー' }],
+      options: [{ axis: 1, code: '-A', name: 'A' }, { axis: 1, code: '-B', name: 'B' }],
+      children: [{ code: 'mkgrp-A', choices: { 1: '-A' }, name: 'メーカーのまとまり【A】' }, { code: 'mkgrp-B', choices: { 1: '-B' }, name: 'メーカーのまとまり【B】' }],
+      values: { standard_price: '1000', tax_rate: '0.1', sales_class: '3', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0', maker: HONPO.id } }, { open: true, shippingRates: new Map() });
+  } finally { await pg.query('set role deploy'); }
+}
 const makerOf = async (code) => (await q(`select m.name from core.skus k join core.product_makers x on x.product_id = k.product_id join core.makers m on m.maker_id = x.maker_id where k.code = $1`, [code]))[0]?.name ?? null;
 
 let passed = 0;
@@ -263,6 +274,45 @@ await ta('③ 商品の画面: 選ぶと未保存の「前 → 後」に名前�
   await p.click('#save');
   for (let i = 0; i < 50 && (await makerOf('s002')) !== null; i++) await p.waitForTimeout(200);
   assert.equal(await makerOf('s002'), null);
+});
+
+await ta('③b 商品の画面: メーカーの名前を打って選んでいない = 保存を止める (そのまま送ると今のメーカーを外す・#maker Codex R1 M)', async (p0, ctx) => {
+  let p = p0;
+  await p.goto(B + '/sku/s003');
+  await p.fill('#f-maker-in', '山田');
+  await p.keyboard.press('ArrowDown');
+  await p.keyboard.press('Enter');
+  await p.click('#save');
+  for (let i = 0; i < 50 && (await makerOf('s003')) !== '山田製作所'; i++) await p.waitForTimeout(200);
+  assert.equal(await makerOf('s003'), '山田製作所');
+  p = await ctx.newPage();   // 保存の後の読み直しとぶつけない
+  await p.goto(B + '/sku/s003');
+  await p.fill('#f-maker-in', 'まだ選んでいない会社');
+  await p.fill('#f-reorder_months', '4');
+  assert.equal(await p.isDisabled('#save'), true, '選んでいないメーカーのまま保存できる');
+  assert.match(await p.textContent('#needreason-t'), /メーカーは一覧から選ぶか/);
+  // 空にする = 外す (はっきり空にしたときは保存できる)
+  await p.fill('#f-maker-in', '');
+  assert.equal(await p.isDisabled('#save'), false);
+  assert.equal(await makerOf('s003'), '山田製作所', 'まだ保存していない');
+});
+
+await ta('②b まとまり: 今あるまとまりを選ぶ = 子のメーカーが全部同じなら写す・選び直したら前のまとまりのメーカーを持ち越さない (#maker Codex R1 M)', async (p) => {
+  await p.goto(B + '/new?kind=variation');
+  const pick = async (code) => {
+    await p.click('[data-mode="add"]');
+    await p.fill('#g-q', code);
+    await p.waitForSelector(`#g-results .gitem:has(.code:text-is("${code}"))`);
+    await p.click(`#g-results .gitem:has(.code:text-is("${code}"))`);
+    await p.waitForSelector('#g-picked .picked');
+  };
+  await pick('mkgrp');
+  await p.waitForFunction((id) => document.getElementById('f-maker').value === id, HONPO.id);
+  assert.equal(await p.inputValue('#f-maker-in'), 'ハチミツ本舗');
+  await p.click('#g-picked [data-act="repick"]');
+  await pick('ws100');
+  await p.waitForFunction(() => document.getElementById('f-maker').value === '');
+  assert.equal(await p.inputValue('#f-maker-in'), '');
 });
 
 await ta('④ スマホの幅 (390): 横にはみ出さない・押す所は 44px・候補は画面の中', async (p) => {

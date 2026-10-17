@@ -170,6 +170,15 @@ await ta('[C1] 名簿に足す: 足す → 同じと見る名前 (ひらがな�
   }
   const again = await create('はちみつ 本舗', rid);
   assert.deepEqual([again.status, again.j.maker.id, again.j.replayed], [200, HONPO.id, true]);
+  // 既にあった名前を返した回も控える (#maker Codex R1 Low): 同じ番号で違う名前 = 409 (新しく作らない)・同じ名前の押し直し = 同じ答え
+  const rid2 = uuid();
+  const ex = await create('ﾊﾁﾐﾂ 本舗', rid2);
+  assert.deepEqual([ex.status, ex.j.maker.id, ex.j.existed], [200, HONPO.id, true]);
+  const ex2 = await create('ﾊﾁﾐﾂ 本舗', rid2);
+  assert.deepEqual([ex2.status, ex2.j.maker.id, ex2.j.existed, ex2.j.replayed], [200, HONPO.id, true, true]);
+  const ex3 = await create('まったく別の会社', rid2);
+  assert.deepEqual([ex3.status, ex3.j.reason], [409, 'request_id_reused']);
+  assert.equal((await one("select count(*)::int as n from core.makers where name = 'まったく別の会社'")).n, 0);
   const other = await create('別の会社', rid);
   assert.deepEqual([other.status, other.j.reason], [409, 'request_id_reused']);
   assert.equal((await one("select count(*)::int as n from core.makers where name_norm = core.maker_name_norm('ハチミツ本舗')")).n, 1);
@@ -262,6 +271,7 @@ await ta('[V1] まとまりの登録: 全部の子に同じメーカー (記録�
 });
 
 let MIKAWA = null;
+let B1_BODY = null;
 await ta('[S1] 商品の画面の保存: 付ける → 変える → 外す (記録・via sku_page)・見出しと欄 (代表の仕入先のすぐ下)・押し直し = 前の答え', async () => {
   MIKAWA = (await create('三河テキスタイル')).j.maker;
   let page = await call('GET', '/sku/s001');
@@ -410,6 +420,7 @@ await ta('[B1] ロールの流し直しの前 (master_edit に関数の実行が
     assert.ok(!/data-row="maker"/.test(page.text) && !/me-maker\.js/.test(page.text), '欄が出ている');
     // 古い画面と同じ = メーカーを送らない・入力なしの印も無い = 通る (数えない)
     const b = single('mk-b1'); b.blanks = b.blanks.filter((k) => k !== 'maker');
+    B1_BODY = b;
     const r = await call('POST', '/api/new', { body: b });
     assert.equal(r.status, 200, r.text);
     const reason = (await one("select reason from ops.master_registration_events e join core.skus k on k.sku_id = e.sku_id where k.code = 'mk-b1' order by e.event_id limit 1")).reason;
@@ -433,6 +444,13 @@ await ta('[B1] ロールの流し直しの前 (master_edit に関数の実行が
     await (await import('./company-db/create-master-edit-roles.mjs')).createMasterEditRoles(pg, {});
   }
   assert.equal(await MK.makerReady(db), true, 'ロールを流し直すと戻る');
+  // 流し直しの前に登録した要求 (メーカーを数えなかった) の押し直し = 流し直しの後でも前の答え (400 にしない・理由 = 要求のハッシュを変えない・#maker Codex R1 M)
+  const again = await call('POST', '/api/new', { body: B1_BODY });
+  assert.deepEqual([again.status, again.j && again.j.replayed], [200, true], again.text);
+  // 流し直しの後の新しい要求 = メーカーも数える (前の画面 = 400)
+  const fresh = { ...B1_BODY, request_id: uuid(), code: 'mk-b4' };
+  const n = await call('POST', '/api/new', { body: fresh });
+  assert.deepEqual([n.status, n.j.reason, n.j.field], [400, 'blank_unmarked', 'maker']);
 });
 
 console.log(`\n${passed} ok${process.exitCode ? ' (NG あり)' : ''}`);

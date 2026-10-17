@@ -187,6 +187,9 @@
     inp.addEventListener('input', function () {
       // 打ち直した = 選んでいたメーカーはやめる (打った名前は残す・選ぶまで値にしない)。変換中も探す (確定の前から候補が出る)
       if (picked && inp.value !== picked.name) setVal(null, true);
+      // 🆕 #maker Codex R1: 「入力なし」のまま名前を打った = 入力なしを外す (選ぶまで「あと N つ」に残す = 打った名前が黙って捨てられない)
+      var nb = document.querySelector('input[type="checkbox"][data-none="maker"]');
+      if (nb && nb.checked && clean(inp.value)) { nb.checked = false; nb.dispatchEvent(new Event('change', { bubbles: true })); }
       say('');
       render();
     });
@@ -232,5 +235,9 @@
     /** 隠した欄の値に名前の欄を合わせる (画面の「元に戻す」の後) */
     sync: function () { var m = byId(hid.value); picked = m; inp.value = m ? m.name : ''; close(); say(''); },
     value: function () { return hid.value; },
+    /** 名前を打ったが一覧から選んでいない (= 保存しても入らない・商品の画面は保存を止める・#maker Codex R1) */
+    pending: function () { return !!clean(inp.value) && !picked; },
+    /** メーカーを空にする (まとまりを選び直したとき) */
+    clear: function () { setVal(null); say(''); close(); },
   };
 })();

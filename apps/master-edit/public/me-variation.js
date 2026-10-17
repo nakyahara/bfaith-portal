@@ -1035,10 +1035,10 @@
     S.copied = rows.length ? { from: rows[0].code, n: rows.length, dropped: dropped } : null;
     if (!pk.axes) initOldKids(pk);
     full();
-    // 🆕 0083: 今ある子のメーカーが全部同じ = 写す (違う・無い子がある = 写さない = 人が選ぶ)
-    if (ME.maker && rows.length) {
+    // 🆕 0083: 今ある子のメーカーが全部同じ = 写す。違う・無い子がある = 空にする (前に選んだまとまりのメーカーを持ち越さない = 人が選ぶ・#maker Codex R1 M)
+    if (ME.maker) {
       var mks = rows.map(function (k) { return String((k.values && k.values.maker) || ''); });
-      if (mks[0] && mks.every(function (x) { return x === mks[0]; })) ME.maker.set(mks[0]);
+      if (mks.length && mks[0] && mks.every(function (x) { return x === mks[0]; })) ME.maker.set(mks[0]); else ME.maker.clear();
     }
   }
   var pickSeq = 0;

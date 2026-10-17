@@ -90,10 +90,11 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
-import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
+import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS, parseRegisterRequest, registerPayloadHashOf } from '../../lib/master-register.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
 import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf, legacyRefsScreen, hasRequestRecord } from '../../lib/master-register-blanks.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
+  parseVariationRequest, variationPayloadHashOf,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
@@ -915,11 +916,41 @@ router.post('/api/variation/check', (req, res) => {
  * 🆕 0083: メーカーの欄が出る DB (0083 があって画面のロールが書ける = makerReady) = メーカーも「値か入力なし」を数えて、理由・子ごとの理由を作り直す。
  *   出ない DB (0083 の前・ロールの流し直しの前) = 上の確かめ (pre) のまま (メーカーを数えない = 前の画面・前の登録と同じ)。単品とまとまりだけ
  */
-async function makerBlanks(db, kind, raw, pre) {
-  if (!(kind === 'single' || kind === 'variation') || !(await makerReady(db))) return { ok: true, body: pre.body, childReasons: pre.childReasons };
-  const p = prepareRegisterBody(kind, raw, { makerApplicable: true });
+async function makerBlanks(db, kind, raw, pre, actor) {
+  const plain = { ok: true, body: pre.body, childReasons: pre.childReasons };
+  if (!(kind === 'single' || kind === 'variation')) return plain;
+  const ready = await makerReady(db);
+  const p = ready ? prepareRegisterBody(kind, raw, { makerApplicable: true }) : null;
+  // 🆕 #maker Codex R1 M: 押し直し (この request_id の保存の記録がある) = 初回と同じ数え方で照らす。0083 の前・ロールの流し直しの前の初回 (メーカーを数えなかった) の押し直しを
+  //   流し直しの後に送っても 400 にしない・理由 (= 要求のハッシュ) を変えない。記録の要求のハッシュと合う方 (メーカーを数えた / 数えない) を使う。どちらも合わない = 数えた方 (lib が 409 か前の誤り)
+  const prev = await prevRequestHash(db, raw.request_id, kind);
+  if (prev) {
+    for (const c of [p, plain]) if (c && c.ok && requestHashOf(kind, raw, c, actor) === prev) return { ok: true, body: c.body, childReasons: c.childReasons };
+  }
+  if (!ready) return plain;
   if (!p.ok) return p;
   return { ok: true, body: p.body, childReasons: p.childReasons };
+}
+/** その request_id の保存の記録が持つ要求のハッシュ (無い・読めない = null)。単品 = 成功の結果の request_payload_hash / 失敗の payload_hash。まとまり = 成功は 0069 の要求のハッシュ */
+async function prevRequestHash(db, rid0, kind) {
+  const rid = String(rid0 ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid)) return null;
+  const r = (await db.query('select status, payload_hash, result from ops.master_edit_requests where request_id = $1::uuid', [rid])).rows[0];
+  if (!r) return null;
+  if (r.status !== 'done') return r.payload_hash || null;
+  if (kind === 'single') return (r.result && r.result.request_payload_hash) || r.payload_hash || null;
+  const has = (await db.query("select to_regclass('ops.variation_batch_requests') is not null as ok")).rows[0].ok === true;
+  return has ? ((await db.query('select request_hash from ops.variation_batch_requests where request_id = $1::uuid', [rid])).rows[0]?.request_hash ?? null) : null;
+}
+/** 登録の lib が作るのと同じ要求のハッシュ (lib の parse と hash = 同じ決まり)。形が違う = null */
+function requestHashOf(kind, raw, c, actor) {
+  try {
+    if (kind === 'single') {
+      return registerPayloadHashOf(parseRegisterRequest({ actor, requestId: raw.request_id, kind: raw.kind, code: raw.code, reason: c.body.reason ?? null, values: raw.values, card: raw.card, logizardBarcode: raw.logizard_barcode }));
+    }
+    return variationPayloadHashOf(parseVariationRequest({ actor, requestId: raw.request_id, reason: c.body.reason ?? null, group: raw.group, axes: raw.axes ?? null, options: raw.options,
+      children: raw.children, values: raw.values, card: raw.card, childReasons: c.childReasons }));
+  } catch { return null; }
 }
 function orderBlanksFirstTime(db, req, gate, kind, b) {
   // 断る前に request の鍵を取って記録を読み直す (同じ request_id が同時に来た = 前の答え・#1706 Codex R3 M) = lib/master-register-blanks.mjs
@@ -969,7 +1000,7 @@ router.post('/api/new/variation', (req, res) => {
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
     // 🆕 0083: メーカーの欄が出る DB (0083 があってロールの流し直しの後) = メーカーも「値か入力なし」を数え直す (上の確かめは DB を見ないので数えていない)
-    const mk = await makerBlanks(db, 'variation', req.body || {}, pre);
+    const mk = await makerBlanks(db, 'variation', req.body || {}, pre, String(req.session.email).trim().toLowerCase());
     if (!mk.ok) return res.status(mk.status).json(mk.json);
     const vb = mk.body;
     const po = await orderBlanksFirstTime(db, req, gate, 'variation', vb);
@@ -1123,7 +1154,7 @@ router.post('/api/new', (req, res) => {
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
     // 🆕 0083: メーカーの欄が出る DB = メーカーも「値か入力なし」を数え直す (単品だけ・セットは聞かない)
-    const mk = await makerBlanks(db, String(b.kind ?? ''), req.body || {}, pre);
+    const mk = await makerBlanks(db, String(b.kind ?? ''), req.body || {}, pre, String(req.session.email).trim().toLowerCase());
     if (!mk.ok) return res.status(mk.status).json(mk.json);
     const sb = mk.body;
     const po = await orderBlanksFirstTime(db, req, gate, String(b.kind ?? ''), sb);
