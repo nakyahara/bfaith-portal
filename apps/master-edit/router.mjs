@@ -104,6 +104,7 @@ import { bulkInspect, bulkPreview, bulkApplyChunk, editableOf, BULK_MAX, BULK_CH
 import { buildListCsv, csvFileName, buildAmazonCsv, amazonCsvFileName } from './list-csv.mjs';
 import { LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, ViewPrefsInputError } from './list-columns.mjs';
 import { readViewPrefs, saveViewPrefs } from './view-prefs.mjs';
+import { listImages, IMAGE_STATE_WORDS } from './list-images.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
@@ -641,11 +642,13 @@ router.get('/', (req, res) => {
     const counts = db ? await listCounts(db, { now: new Date(clock()) }) : null;
     // 列の設定 (人ごと・Render の SQLite)。読めない = いつもの列 (一覧は出す)
     const listView = await readViewPrefs(req.session?.email);
+    // 画像の列 (10/17): このページの行だけ・キャッシュを読むだけ (無い物は裏で楽天に取りに行く)。列を出していない人の分は取りに行かない
+    const imgOf = listImages(data.rows, { queue: listView.view.shown.includes('img') });
     const locals = pageLocals(req, phase);
     // まとめて変える (PR2): 書ける人 (名簿) で、保存を開いていて、Company DB を読めたときだけ左のチェックを出す
     const bulk = { on: !!db && locals.canEdit && !locals.closed, max: BULK_MAX, chunk: BULK_CHUNK, costReasons: COST_REASONS, groups: FIX_GROUPS, multiMax: MULTI_MAX };
     res.render(view('index.ejs'), { ...locals, ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max,
-      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk });
+      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk, imgOf, IMAGE_STATE_WORDS });
   });
 });
 /**
