@@ -236,9 +236,8 @@ begin
     raise exception 'units_mismatch: 単位の数 (単品 %・セット %) が生の行のコードの数 (単品 %・セット %) と合わない', v_single, v_set,
       (fp ->> 'codes')::bigint - (fp ->> 'set_overlap')::bigint, fs ->> 'codes' using errcode = '22023';
   end if;
-  -- 中身のハッシュ (行の順に依らない・取得の印と正規化の版も入れる)
-  select pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.concat_ws(E'\n', 'nev1', v_nv::text, v_fp,
-      fp ->> 'started_at', fp ->> 'complete_rev', fs ->> 'started_at', fs ->> 'complete_rev',
+  -- 中身のハッシュ (行の順に依らない・正規化の版と取得の印・件数・時刻の全部も入れる = 同じ回の再送で取得の記録が違えば run_conflict。#PR-1 Codex R1 Medium)
+  select pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.concat_ws(E'\n', 'nev1', v_nv::text, v_fp, fp::text, fs::text,
       coalesce(pg_catalog.string_agg(pg_catalog.concat_ws('|', x ->> 'code_norm', x ->> 'col', x ->> 'ne_kind', x ->> 'state', coalesce(x ->> 'reason', ''),
         case when x ->> 'state' = 'ok' then (x -> 'value')::text else '' end), E'\n' order by (x ->> 'code_norm') collate "C", (x ->> 'col') collate "C"), '')), 'UTF8')), 'hex')
     into v_hash from pg_catalog.jsonb_array_elements(p -> 'entries') x;

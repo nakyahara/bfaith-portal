@@ -97,6 +97,11 @@ await ta('[N1] 書ける・同じ回の再送 = unchanged・同じ回で中身�
   await assert.rejects(recNe(changed), /run_conflict/);
   // 取得の印 (通し番号) だけ違う = 中身が違う
   await assert.rejects(recNe(nev(1, { prodRev: 999 })), /run_conflict/);
+  // 取得の件数・完了の時刻だけ違う (式は合う) = 中身が違う (#PR-1 Codex R1 Medium: 取得の記録の全部をハッシュに入れる)
+  await assert.rejects(recNe(nev(1, { pExtra: { fetched_rows: 4, dropped_no_code: 1 } })), /run_conflict/);
+  const s1 = BASE + 24 * H - 2 * H;
+  await assert.rejects(recNe(nev(1, { sExtra: { finished_at: iso(s1 + 1000 + 180000) } })), /run_conflict/);
+  assert.deepEqual((await neMark())[0].clean, { products: true, sets: true });
   assert.equal((await q(`select value from ops.master_ne_values where code_norm = 'a-1' and col = 'cost'`)).rows[0].value, 300);
   // NE のコードの書き方の印がこの回 = 同じ回
   await addRun(2);
