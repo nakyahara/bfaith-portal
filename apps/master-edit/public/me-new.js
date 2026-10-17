@@ -553,7 +553,10 @@
   function addSetPlanRow(qty) {
     var tpl = $('#set-plan-tpl'); if (!tpl) return null;
     var used = setPlanRows().map(function (r) { return r.qty; });
-    var q = qty; while (used.indexOf(q) >= 0 && q < SP_QMAX) q++;
+    // 個数 = 決まりの中 (2〜99) で使っていない数 (望みの数から上へ・無ければ下から = Codex R2 Low)
+    var free = function (n) { return n >= SP_MIN && n <= SP_QMAX && used.indexOf(n) < 0; };
+    var q = qty; while (!free(q) && q < SP_QMAX) q++;
+    if (!free(q)) { q = SP_MIN; while (!free(q) && q < SP_QMAX) q++; }
     var tr = tpl.content.firstElementChild.cloneNode(true);
     $('.sp-qty', tr).value = String(q);
     $('.sp-code', tr).setAttribute('data-auto', '1'); $('.sp-name', tr).setAttribute('data-auto', '1');

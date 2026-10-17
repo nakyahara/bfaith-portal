@@ -3008,6 +3008,22 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
   const plain = await call('POST', '/apps/master-edit/api/new', { body: { request_id: uuid(), kind: 'single', code: 'SP-RESV-2', values: withReq('single', single()), card: { create: false } } });
   assert.deepEqual([plain.status, plain.j.reason, plain.j.field], [409, 'set_code_reserved', 'code'], plain.text);
   assert.equal(await skuId('SP-RESV-2'), undefined);
+  // ④ (Codex R2 High) セットの下書きになった後 (取り込み済み) のコードも、ふつうの単品のコードにさせない
+  const plain2 = await call('POST', '/apps/master-edit/api/new', { body: { request_id: uuid(), kind: 'single', code: 'sp-ridfail-2', values: withReq('single', single()), card: { create: false } } });
+  assert.deepEqual([plain2.status, plain2.j.reason], [409, 'set_code_reserved'], plain2.text);
+  assert.match(plain2.j.error, /セットのカード \(下書き\)/);
+  // ⑤ (Codex R2 Medium) 予約を読めない = 登録しない (503)
+  MR.__setSetPlanStore({ write: () => { throw new Error('x'); }, mark: () => 0, held: () => { throw new Error('SQLite を読めない'); } });
+  try {
+    const p3 = await call('POST', '/apps/master-edit/api/new', { body: { request_id: uuid(), kind: 'single', code: 'sp-unread-1', values: withReq('single', single()), card: { create: false } } });
+    assert.deepEqual([p3.status, p3.j.reason], [503, 'ph_unreadable'], p3.text);
+  } finally { MR.__setSetPlanStore(null); }
+  assert.equal(await skuId('sp-unread-1'), undefined);
+  // ⑥ (Codex R2 Medium) 登録の取引の中 (コードの鍵の後) でも予約を見る = 入口の確かめの後に予約されても通さない
+  const e = await rejectsWith(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'single', code: 'sp-race-1', values: withReq('single', single()), card: { create: false } },
+    { open: true, now: NOW, shippingRates: RATES, codeReserved: async () => ({ status: 409, reason: 'set_code_reserved', message: '商品コード sp-race-1 は x の登録で作るセットに決まっています' }) })), 409, 'set_code_reserved');
+  assert.match(e.message, /作るセットに決まっています。何も保存していません/);
+  assert.equal(await skuId('sp-race-1'), undefined);
 });
 
 server.close();

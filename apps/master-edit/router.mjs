@@ -1098,10 +1098,19 @@ router.post('/api/new', (req, res) => {
     } catch (e) { if (!(e instanceof MasterWriteError)) throw e; /* 形の誤りは登録の lib が同じ文で断る */ }
     const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
     // ほかの登録が作るセットに決めたコード (カードの取り込み待ち) は、ふつうの商品コードにもさせない (Codex R1 Medium 1)。押し直しは前の答え (確かめない)
+    //   (Codex R2: セットの下書きのコードも・読めない = 登録しない・登録の取引でコードの鍵を取った後にもう一度 = codeReserved)
+    const codeReserved = async (code) => {
+      let held;
+      try { held = (await setPlans()).held(code, { requestId: rid }); } catch (e) {
+        console.error(`[master-edit] 作るセットの予約を読めない: ${e && e.message}`);
+        return { status: 503, reason: 'ph_unreadable', message: 'product-hub の作るセットの予約を読めないので、このコードを使えるか確かめられません (少し待ってからもう一度)' };
+      }
+      if (held && (held.reason === 'ph_set_plan' || (held.reason === 'ph_draft' && held.is_set))) return { status: 409, reason: 'set_code_reserved', message: `${held.message}。別のコードにしてください` };
+      return null;
+    };
     if (parsed && !po.replay) {
-      let held = null;
-      try { held = (await setPlans()).held(parsed.code, { requestId: rid }); } catch (e) { console.error(`[master-edit] 作るセットの予約を読めない: ${e && e.message}`); }
-      if (held && held.reason === 'ph_set_plan') return res.status(409).json({ ok: false, reason: 'set_code_reserved', field: 'code', error: `${held.message}。別のコードにしてください。何も保存していません` });
+      const held = await codeReserved(parsed.code);
+      if (held) return res.status(held.status).json({ ok: false, reason: held.reason, field: 'code', error: `${held.message}。何も保存していません` });
     }
     if (hasPlan) {
       try {
@@ -1119,7 +1128,7 @@ router.post('/api/new', (req, res) => {
         order: outbox ? orderBase : null, reasonNote: po.note,
         logizardBarcode: b.logizard_barcode,   // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコードの値か空欄 (単品だけ・要るかは上の lzRegisterGate)
         lzCopy,                                // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果
-      }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true });
+      }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true, codeReserved });
     } catch (e) {
       // 登録が断られた = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)
       if (hasPlan) await markSetPlanSafe(rid, { state: 'dropped', note: String((e && e.message) || e).slice(0, 300) });

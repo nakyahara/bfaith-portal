@@ -31,13 +31,16 @@ function refuse(status, reason, message, extra = {}) {
 /**
  * 作るセットのコードが product-hub で使われているか (読むだけ・画面の確かめと登録の前)。
  *   カード (product_drafts・大文字小文字は同じと見る) か、ほかの登録の作るセット (登録できた / 書いたばかり) にあれば、その一言
- * @returns {null | { reason: 'ph_draft' | 'ph_set_plan', message, draft_id? }}
+ * @returns {null | { reason: 'ph_draft' | 'ph_set_plan', message, draft_id?, is_set? }} is_set = そのカードがセット (の下書き) = ふつうの単品のコードにもさせない
  */
 export function setCodeHeld(code, { requestId = null, db = getDB() } = {}) {
   const key = String(code ?? '').trim().toLowerCase();
   if (!key) return null;
-  const d = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id LIMIT 1').get(key);
-  if (d) return { reason: 'ph_draft', draft_id: d.id, message: `商品コード ${code} は product-hub のカード (#${d.id}) が使っています` };
+  const d = db.prepare('SELECT id, parent_draft_id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY parent_draft_id IS NULL, id LIMIT 1').get(key);
+  if (d) {
+    const isSet = d.parent_draft_id != null;
+    return { reason: 'ph_draft', draft_id: d.id, is_set: isSet, message: `商品コード ${code} は product-hub の${isSet ? 'セットのカード (下書き)' : 'カード'} (#${d.id}) が使っています` };
+  }
   const p = db.prepare(`
     SELECT p.request_id, p.parent_code FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
     WHERE i.code_key = ? AND (? IS NULL OR p.request_id <> ?)
