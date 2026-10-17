@@ -48,6 +48,7 @@
  *     未保存のまま押す = 離れるときの確認 (ここに残る / 捨てて移る)・スマホ 390 ではみ出さない・44px
  *  75 一覧の画像の列 (10/17): コードのすぐ後ろ・52px の四角・取得中 / 画像なしの印・読み込めない画像は印・列の板で外す / 出す・画像を押しても開く・390 ではみ出さない
  *  76 Amazon SKU の未登録の一覧の「その場で登録」(10/17): 行の下に欄・名前 = Amazon の商品名・構成の原価
+ *  77 新商品 (10/17): 「セット商品を作るか = 作る」の作るセットの表 (初めの値・付いていく・重なり / 0 行は ③ で止める・保留で隠す・保存で product-hub にセットの下書き)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -3234,6 +3235,72 @@ await ta('[76] 未登録の一覧の「その場で登録」(10/17): 行の下�
   await p.goto(B + '/amazon/sku?sku=pr-ui-inl-a');
   assert.equal(await p.textContent('#cost-total'), `${(c6 * 2 + c5).toLocaleString('ja-JP')} 円`);
   assert.ok((await p.textContent('#comp-cost')).includes(`${(c6 * 2).toLocaleString('ja-JP')} 円`), '小計 = 原価 × 数');
+});
+
+await ta('[77] 新商品 (2026-10-17 中原さん): 「セット商品を作るか = 作る」で作るセットの表 (初めの値 = 単品-2・単品の名前 2個セット / 単品の名前に付いていく / 足すと 3 個)・行どうしの重なりと 0 行は ③ で止める・保留で隠して数えない・保存で card.sets を送り product-hub にセットの下書き', async (p) => {
+  const sent = [];
+  p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url()) && rq.method() === 'POST') sent.push(JSON.parse(rq.postData() || '{}')); });
+  await p.goto(B + '/new?kind=single');
+  assert.equal(await p.isHidden('#row-set-plans'), true, '作るを選ぶまで出さない');
+  await p.fill('#code', 'ui-sp-1');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', 'UI ネームタグ 【100枚】');
+  await p.fill('#f-standard_price', '1000');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  await p.selectOption('#f-primary_supplier', '0001');
+  await fillReq(p);
+  await p.click('#set-plan button[data-v="create"]');
+  assert.equal(await p.isHidden('#row-set-plans'), false);
+  const rows = p.locator('#set-plan-rows tr.sp-row');
+  assert.equal(await rows.count(), 1, '初めに 1 行');
+  assert.deepEqual([await rows.nth(0).locator('.sp-qty').inputValue(), await rows.nth(0).locator('.sp-code').inputValue(), await rows.nth(0).locator('.sp-name').inputValue()],
+    ['2', 'ui-sp-1-2', 'UI ネームタグ 【100枚】 2個セット']);
+  await p.waitForSelector('#set-plan-rows .sp-msg.ok');
+  // 直していない行は単品の名前に付いていく
+  await p.fill('#f-name', 'UI ネームタグ 【50枚】');
+  assert.equal(await rows.nth(0).locator('.sp-name').inputValue(), 'UI ネームタグ 【50枚】 2個セット');
+  // 足す = 次の個数 (3)・コードの重なり (大文字小文字だけ違う) = ③ で止める
+  await p.click('#set-plan-add');
+  assert.deepEqual([await rows.nth(1).locator('.sp-qty').inputValue(), await rows.nth(1).locator('.sp-code').inputValue()], ['3', 'ui-sp-1-3']);
+  await rows.nth(1).locator('.sp-code').fill('UI-SP-1-2');
+  assert.match(await rows.nth(1).locator('.sp-msg').textContent(), /2 行あります/);
+  assert.match(await p.textContent('#checklist'), /作るセットを直す \(1 行\)/);
+  // 直したコードは単品の名前を変えても付いていかない
+  await rows.nth(1).locator('.sp-code').fill('ui-sp-1-3x');
+  await p.fill('#f-name', 'UI ネームタグ');
+  assert.equal(await rows.nth(1).locator('.sp-code').inputValue(), 'ui-sp-1-3x');
+  assert.equal(await rows.nth(0).locator('.sp-name').inputValue(), 'UI ネームタグ 2個セット');
+  await p.waitForFunction(() => document.querySelectorAll('#set-plan-rows .sp-msg.ok').length === 2);
+  await noneRest(p);
+  assert.match(await p.textContent('#checklist'), /作るセット \(2 個\)/);
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  // 0 行 = 止める (「作る」なら 1 つ以上)
+  await rows.nth(1).locator('[data-sp-del]').click();
+  await rows.nth(0).locator('[data-sp-del]').click();
+  assert.equal(await rows.count(), 0);
+  assert.match(await p.textContent('#checklist'), /作るセット \(個数・コード・名前を 1 つ以上\)/);
+  assert.equal(await p.isDisabled('#save'), true);
+  // 保留 = 隠す・数えない / 作るに戻すと 1 行 (2 個) から
+  await p.click('#set-plan button[data-v="hold"]');
+  assert.equal(await p.isHidden('#row-set-plans'), true);
+  assert.ok(!/作るセット/.test(await p.textContent('#checklist')));
+  await p.click('#set-plan button[data-v="create"]');
+  assert.equal(await rows.count(), 1);
+  await p.click('#set-plan-add');
+  await p.waitForFunction(() => document.querySelectorAll('#set-plan-rows .sp-msg.ok').length === 2);
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  await Promise.all([p.waitForURL(/\/sku\/ui-sp-1$/), p.click('#save')]);
+  const body = sent[sent.length - 1];
+  assert.deepEqual(body.card.set_decision.decision, 'create');
+  assert.deepEqual(body.card.sets, [{ qty: 2, code: 'ui-sp-1-2', name: 'UI ネームタグ 2個セット' }, { qty: 3, code: 'ui-sp-1-3', name: 'UI ネームタグ 3個セット' }]);
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /セット商品 ui-sp-1-2 \(2個\)・ui-sp-1-3 \(3個\) も NE に登録してください/);
+  const { getDB: phDb } = await import('../apps/product-hub/db.js');
+  const parent = phDb().prepare("SELECT id FROM product_drafts WHERE ne_code = 'ui-sp-1'").get();
+  assert.ok(parent, 'カードができた');
+  assert.deepEqual(phDb().prepare('SELECT ne_code, name, provisional_code, price FROM product_drafts WHERE parent_draft_id = ? ORDER BY id').all(parent.id),
+    [{ ne_code: 'ui-sp-1-2', name: 'UI ネームタグ 2個セット', provisional_code: 1, price: 2000 }, { ne_code: 'ui-sp-1-3', name: 'UI ネームタグ 3個セット', provisional_code: 1, price: 3000 }]);
 });
 
 await browser.close();
