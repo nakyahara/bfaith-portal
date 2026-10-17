@@ -1172,8 +1172,9 @@ router.post('/api/new', (req, res) => {
         lzCopy,                                // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果
       }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true, codeReserved });
     } catch (e) {
-      // 登録が断られた = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)
-      if (hasPlan) await markSetPlanSafe(rid, { state: 'dropped', note: String((e && e.message) || e).slice(0, 300) });
+      // 登録が断られた (決まった誤り = MasterWriteError) = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)。
+      //   成否が分からない誤り (接続が切れた・commit の後など) = waiting のまま (予約を外さない)。時間を過ぎたら Company DB の保存の記録で決める (Codex R5 Medium 1)
+      if (hasPlan && e instanceof MasterWriteError) await markSetPlanSafe(rid, { state: 'dropped', note: String((e && e.message) || e).slice(0, 300) });
       throw e;
     }
     if (hasPlan) await markSetPlanSafe(rid, { state: 'registered', skuId: r.sku_id });

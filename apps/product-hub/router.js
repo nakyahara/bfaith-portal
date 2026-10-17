@@ -3377,7 +3377,8 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
   const setPlanAges = setPlanDraftAges(db);
   const setPlanLate = [...setPlanAges.values()].filter((x) => x.late).length;
   const setPlanLateOnly = boardView === 'ne' && filterParam === 'set_plan_late';
-  const neRows = setPlanLateOnly ? neRowsAll.filter((r) => setPlanAges.get(r.id)?.late) : neRowsAll;
+  //   「それだけを見る」= 表の件数の上限 (300) より前に絞る (Codex R5 Medium 2)。確定の取り込みは上で済んだ
+  const neRows = setPlanLateOnly ? neRegistrationRows(db, { ids: [...setPlanAges].filter(([, x]) => x.late).map(([id]) => id) }) : neRowsAll;
   // 📣 広告 (2026-09-28) も列ではなく表 — 自社商品を段階・実績で見比べる。工程には足さない
   // (足すと listing_gate で楽天出品が止まる副作用)。実績は mirror を画面を開いたときに読む (定期実行を増やさない)
   const adOps = boardView === 'ad' ? adOpsRows(db) : null;

@@ -2929,6 +2929,10 @@ await ta('[SP5] 知らせ (product-hub のボード): 作ってから 3 日を�
   ph.prepare('UPDATE product_drafts SET provisional_code = 0 WHERE id = ?').run(a.id);
   assert.equal(SPS.setPlanDraftAges(ph).has(a.id), false);
   ph.prepare('UPDATE product_drafts SET provisional_code = 1 WHERE id = ?').run(a.id);
+  // 「それだけを見る」= 表の件数の上限 (300) より前に絞る (Codex R5 Medium 2): 上限 1 でも、絞った id の行が出る
+  const WP = await import('../apps/product-hub/lib/workflow-progress.js');
+  assert.deepEqual(WP.neRegistrationRows(ph, { ids: [b.id], limit: 1 }).map((x) => x.id), [b.id]);
+  assert.deepEqual(WP.neRegistrationRows(ph, { ids: [], limit: 300 }), []);
 });
 
 await ta('[SP6] 衝突を解く (既存のカードに結ぶ): 判断の無いカード = 作るセットの下書きを作る / 判断があるカード = 作らない (作っていないと残す・コードを押さえない)', async () => {
@@ -3058,6 +3062,15 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
   const chkGone = await call('GET', '/apps/master-edit/api/set-code-check?code=sp-gone-2&parent=sp-x');
   assert.equal(chkGone.j.ok, true, chkGone.text);
   assert.equal(SPS.readSetPlan(ridGone).state, 'dropped');
+  // ⑩ (Codex R5 Medium 1) 登録の成否が分からない誤り (MasterWriteError でない = 接続が切れた・commit の後など) = 作るセットは waiting のまま (dropped にしない)
+  MR.__setShippingRatesProvider(async () => { throw new Error('接続が切れた'); });
+  const bUnk = spBody('sp-unknown', [{ qty: 2, code: 'sp-unknown-2', name: 'x' }]);
+  try {
+    const u = await call('POST', '/apps/master-edit/api/new', { body: bUnk });
+    assert.equal(u.status, 500, u.text);
+  } finally { MR.__setShippingRatesProvider(async () => RATES); }
+  assert.equal(SPS.readSetPlan(bUnk.request_id).state, 'waiting');
+  assert.equal(SPS.setCodeHeld('sp-unknown-2').reason, 'ph_set_plan', '予約は外れない');
 });
 
 server.close();
