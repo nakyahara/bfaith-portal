@@ -94,7 +94,7 @@ export function previousLzRows(dir, asOf, days = PREV_LOOKBACK_DAYS) {
  */
 export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath, lzStampPath = DEFAULT_LZ_STAMP, connect, now = new Date(), readNe = readNeForLz,
   write = (d, n, p) => writeEvidence(d, n, p, { now }), lzMinRows = undefined,
-  readCdb = async () => { const c = await connect(); try { return await readCdbForLz(c.db); } finally { await c.close(); } }, writeLzCodes = null }) {
+  readCdb = async () => { const c = await connect(); try { return await readCdbForLz(c.db); } finally { await c.close(); } }, writeLzCodes = null, recheckLz = lzMasterUnchanged }) {
   const runId = makeRunId(now);
   const save = (payload) => { if (!write(outDir, EVIDENCE_NAME, { as_of: asOf, run_id: runId, version: LZ_DAILY_VERSION, ...payload })) throw new Error('証跡 lz-daily を書けない'); };
   // 始めに「実行中」= 同じ日の前の回の完了の印を無効にする (途中で失敗しても、前の合格が今の完了の印として残らない。Codex #1507 R1 High)
@@ -145,7 +145,8 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
   if (lzInfo.prev && lz.rows * 2 < lzInfo.prev.rows) return skip('lz_master_shrunk', { lz_master: lzInfo });
   // 🆕 0083 (設計 25 §2.5・PR-1 = 影): ロジザードの書き方を Company DB に残す (全件の一覧の確かめ = 見出し・列の数・空の ID・重複・行数・半減を全部通った回だけ)。
   //   書けない・断られた・関数が無い = 状態を証跡に残すだけ (lz-daily の合否・終わり方・要約は変えない)
-  lzCodes = await recordLzCodes(writeLzCodes, { runId, lz, lzInfo });
+  //   🆕 PR-1 Codex R2 Medium: 成功の印を読んだ後にも一覧が同じ (mtime・sha256) か確かめる = 読んだ一覧 (失敗した書き出し A) と後の書き出し B の成功の印を組み合わせて送らない
+  lzCodes = writeLzCodes && !recheckLz(lzMasterPath, lzInfo) ? { state: 'skipped_lz_master_changed' } : await recordLzCodes(writeLzCodes, { runId, lz, lzInfo });
   // ── 4. Company DB (元のコードと値を 1 つの読み取りの取引で) ──
   const cdbRead = await readCdb();
   if (!cdbRead.mark || cdbRead.mark.compare_run_id !== ev.compare_run_id) return skip('codes_not_this_run', { code_mark: cdbRead.mark, compare_run_id: ev.compare_run_id });
@@ -214,6 +215,14 @@ export function lzCodesPayload({ runId, lz, lzInfo }) {
   return { lz_daily_run_id: runId,
     export: { exported_at: lzInfo.mtime, stamp_at: lzInfo.stamp?.mtime ?? null, stamp_date: lzInfo.stamp?.text ?? null, csv_sha256: lzInfo.sha256, rows: lz.rows },
     ids: [...lz.byId.keys()] };
+}
+/** 🆕 PR-1 Codex R2 Medium: 一覧のファイルが読んだときと同じか (mtime・大きさ・sha256)。読めない = 同じでない */
+export function lzMasterUnchanged(lzMasterPath, lzInfo) {
+  try {
+    const buf = fs.readFileSync(lzMasterPath);
+    const st = fs.statSync(lzMasterPath);
+    return st.mtime.toISOString() === lzInfo.mtime && buf.length === lzInfo.bytes && sha256(buf) === lzInfo.sha256;
+  } catch { return false; }
 }
 /** 送る (writeLzCodes = (payload) => Promise<{ state, ... }>。無い = not_configured)。投げない */
 export async function recordLzCodes(writeLzCodes, { runId, lz, lzInfo }) {

@@ -657,6 +657,13 @@ await ta('[14] 🆕 0083 (設計 25 PR-1 = 影): ロジザードの全件の一�
   s = setup({ lzRows });
   r = await run(s);
   assert.deepEqual(evOf(s.dataDir).lz_codes, { state: 'not_configured' });
+  // 🆕 PR-1 Codex R2 Medium: 一覧 (書き出し A) を読んだ後、成功の印を読む前後に別の書き出し B が一覧を置き換えた = 送らない (A と B の印を組み合わせない)
+  sent.length = 0;
+  s = setup({ lzRows });
+  const replaceThenCheck = (p0, info) => { fs.writeFileSync(p0, lzCsv([...lzRows, { id: 'Z-9' }])); fs.utimesSync(p0, new Date('2030-01-14T15:35:00Z'), new Date('2030-01-14T15:35:00Z')); return RUN.lzMasterUnchanged(p0, info); };
+  r = await run(s, { writeLzCodes: cap, recheckLz: replaceThenCheck });
+  assert.deepEqual([r.state, sent.length, evOf(s.dataDir).lz_codes], ['complete', 0, { state: 'skipped_lz_master_changed' }]);
+  assert.equal(RUN.lzMasterUnchanged(setup({ lzRows }).lzPath, { mtime: 'x', bytes: 0, sha256: 'y' }), false);
   // 一覧の確かめの前に止まった回 = 送らない (成功の印が無い・一覧が今日でない・半減)
   sent.length = 0;
   for (const [why, ss] of [['lz_stamp_missing', setup({ lzRows, stamp: null })], ['lz_master_not_today', setup({ lzRows, lzTime: new Date('2030-01-13T15:30:00Z') })]]) {
