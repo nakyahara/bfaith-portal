@@ -184,7 +184,8 @@ function startedAtOf(row) {
 }
 /** ダウンロードの記録が当てにならない CSV か (帳面を始める前に作った・作った時刻が分からない) */
 export function legacyExport(db, createdMs) {
-  return !Number.isFinite(createdMs) || createdMs < startedAt(db);
+  const started = startedAt(db);   // 先に確かめる (壊れた帳面 = 例外 = 積まない。Codex R10 Medium)
+  return !Number.isFinite(createdMs) || createdMs < started;
 }
 
 let shared = null;
@@ -207,6 +208,7 @@ export function bcPressInProgress(now = Date.now()) {
     //   ある帳面は getLzBcDb (openLzBcDb) が作り直す前に確かめる = 壊れている = 例外 = 読めない側
     if (!shared && checkExistingLedger(file)) return null;
     const db = getLzBcDb();
+    startedAt(db);   // 開いた後に壊れた (始めた時刻が空・形が違う) = 読めない側 (Codex R10 Medium)
     sweep(db, now);
     return busyJobIn(db);
   } catch (e) {
