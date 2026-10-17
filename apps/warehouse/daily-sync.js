@@ -19,6 +19,7 @@ import { waitOtherRunGone, isAliveNodeSince, remainingRetrySlots } from './retry
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS } from './amazon-finance-months.js';
 import { financeCoordinatorEnabled, settlementStep, financePushStep, FINANCE_COORDINATOR_ENV, legacyGateCheck } from './finance-coordinator-switch.js';
 import { skipAfterCompare, gateRetryJobs, STEP_NAME as NEW_ENTRY_GATE_STEP } from '../company-db/master-compare/new-entry-gate.mjs';
+import { readLzCodeNotice } from '../master-decisions/lz-code-notice.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -1710,8 +1711,14 @@ async function main() {
   // Company DB の値で作り、NE の取得の値から作ったもの (GAS と同じ変換と確かめ済み) と突き合わせる。**まだロジザードに取り込まない**。
   // マスタ照合の後 (その朝の照合の全件 JSON と元のコードの印を使う)。作れた = ✅ / ⚠️ (exit 0)。材料が欠ける = ⏭️ (exit 3 = 失敗として retry に載る)。
   // 作ること自体の失敗 = ❌ (exit 1・retry)。作れた回だけ lz-daily.mjs が自分で ok の ping (台帳 lz-daily-build)
+  const lzDailyAsOf = toJstDate(new Date());   // lz-daily.mjs の as_of (その日の JST) = 証跡の日付
   const lzDailyResult = runScript('scripts/company-db/lz-daily.mjs --daily', 'ロジザード毎日の商品マスタ(影)', 300000);
   results.push({ name: 'ロジザード毎日の商品マスタ(影)', ...lzDailyResult, warn: lzDailyResult.success && isWarnSummary(lzDailyResult.summary) });
+  // 「NE の商品コードの書き方」の問題 (NE に大文字・小文字だけ違う書き方が 2 つ・NE とロジザードで書き方が違う など) を、商品と直し方つきでまとめの最後に出す (10/16 中原さん)。
+  // 材料 = いま流した lz-daily の報告 (この回の証跡・sha256 が合うときだけ)。新しい問い合わせ・定期実行はしない・lz-daily の合否は変えない。
+  // 読めない = 何も足さない (まとめを止めない・壊さない)。段の結果 (results) には足さない = 見出しの ✅ / ⚠️ と retry は今のまま
+  const lzCodeNotice = readLzCodeNotice({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data'), asOf: lzDailyAsOf, syncRunId: process.env.DAILY_SYNC_RUN_ID,
+    warn: (s) => console.warn(s) });
 
   // ─── Company DB の見張り (設計 = AI_reference CompanyDB構想/09。全部の push の後・要約の前) ───
   // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
@@ -1906,6 +1913,8 @@ async function main() {
     msg += `\n*💾 ディスク容量アラート:*\n`;
     for (const w of diskWarnings) msg += `${w}\n`;
   }
+  // NE の商品コードの書き方 (lz-daily の報告から。上限 10 行 + ほか N 件)。いちばん後ろ = 本文が長い朝に切られても上の大事な知らせは残る
+  if (lzCodeNotice.length > 0) msg += `\n*${lzCodeNotice[0]}*\n${lzCodeNotice.slice(1).join('\n')}\n`;
 
   console.log('\n' + msg);  // ローカルログには全文を残す
   // GChat は 4096 字上限。多重失敗で本文が超えると HTTP 400 で最重要通知そのものが落ちる

@@ -568,5 +568,72 @@ await ta('[12] 入口 (cli): daily-sync の回 (--daily・--out-dir なし) だ�
   assert.deepEqual([x.code, x.pings, sent.length, 'portal' in evOf(x.s.dataDir)], [0, [], before, false]);
 });
 
+await ta('[13] 朝のまとめの「NE の商品コードの書き方」(10/16 中原さん): 報告に NE とロジザードの書き方を添える (合否・件数は変えない) / 商品と直し方の行・上限 10 行 + ほか N 件 / この回の証跡・sha256 が合うときだけ・読めない = 何も足さない', async () => {
+  const N = await import('../apps/master-decisions/lz-code-notice.mjs');
+  // b-2 = NE に書き方が 2 つ (collided)・u60e-10 = NE は小文字・ロジザードは大文字 (2026-10-13 の小文字の予約アップと同じ形)
+  const neCase = () => { const n = neFake()(); n.products = [...n.products, { code: 'u60e-10', name: '商品U', cost_src: J('10.00'), supplier: '0001' }];
+    n.entries = [n.entries[0], { code_norm: 'b-2', kind: 'product', state: 'collided', ne_code: null, spellings: ['B-2', 'b-2'] }, n.entries[2],
+      { code_norm: 'u60e-10', kind: 'product', state: 'ok', ne_code: 'u60e-10', spellings: ['u60e-10'] }]; return n; };
+  const cdbCase = cdbFake({ codes: [{ code_norm: 'a-1', state: 'ok', ne_code: 'A-1' }, { code_norm: 'b-2', state: 'collided', ne_code: null }, { code_norm: 'new-1', state: 'ok', ne_code: 'NEW-1' },
+    { code_norm: 'u60e-10', state: 'ok', ne_code: 'u60e-10' }] });
+  const s = setup({ lzRows: [{ id: 'A-1', name: 'x' }, { id: 'B-2' }, { id: 'U60E-10' }] });
+  const r = await run(s, { readNe: neCase, readCdb: cdbCase });
+  const ev = evOf(s.dataDir);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.invalid, ev.counts.invalid_reasons], ['fail', ['invalid'], 2, { code_collided: 1, lz_case_collision: 1 }], '合否と件数は今までどおり');
+  const rep = JSON.parse(fs.readFileSync(path.join(s.dataDir, ev.report.path), 'utf8'));
+  assert.deepEqual(rep.classes.invalid, [
+    { code_norm: 'b-2', ne_code: null, reason: 'code_collided', ne_spellings: ['B-2', 'b-2'], lz_ids: ['B-2'] },
+    { code_norm: 'u60e-10', ne_code: 'u60e-10', reason: 'lz_case_collision', lz_ids: ['U60E-10'] }]);
+  assert.match(r.line, /不合格 \(invalid\).*不正 2/);
+  // この daily-sync の回 (DAILY_SYNC_RUN_ID = ds_test) の証跡 → まとめの行
+  const want = ['⚠️ NE の商品コードの書き方 2 件 (ロジザードに取り込んでいません)',
+    '・b-2: NE に大文字・小文字だけ違う書き方が 2 つ (B-2 / b-2)・ロジザード = B-2 → NE で 1 つにそろえる',
+    '・u60e-10: NE = u60e-10 / ロジザード = U60E-10 → NE を U60E-10 に直す'];
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_test' }), want);
+  // 別の回・別の日・回の印が無い (手で流した) = 何も足さない
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_other' }), []);
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf: '2030-01-14', syncRunId: 'ds_test' }), []);
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: null }), []);
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: null, asOf, syncRunId: 'ds_test' }), []);
+  // 報告が証跡と違う (書き換わった)・壊れた証跡 = 何も足さない (投げない・警告だけ)
+  const warns = [];
+  const repPath = path.join(s.dataDir, ev.report.path);
+  const keep = fs.readFileSync(repPath);
+  fs.writeFileSync(repPath, Buffer.concat([keep, Buffer.from(' ')]));
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_test', warn: (x) => warns.push(x) }), []);
+  assert.equal(warns.length, 1);
+  fs.writeFileSync(repPath, keep);
+  const evFile = path.join(s.dataDir, 'company-db-evidence', asOf, 'lz-daily.json');
+  const evKeep = fs.readFileSync(evFile);
+  fs.writeFileSync(evFile, '{壊れた');
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_test' }), []);
+  fs.writeFileSync(evFile, JSON.stringify({ ...JSON.parse(evKeep), report: { path: '../../outside.json', sha256: 'x' } }));
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_test' }), [], 'DATA_DIR の外の報告は読まない');
+  fs.writeFileSync(evFile, evKeep);
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_test' }), want);
+  // 不正がほかの理由だけ (原価が無い など) = 何も足さない
+  assert.deepEqual(N.noticeLines([{ code_norm: 'x-1', ne_code: 'X-1', reason: 'cdb_cost_missing' }, { code_norm: 'x-2', reason: 'no_spelling' }]), []);
+  // ほかの書き方の理由・書き方が分からない・ロジザードに書き方が 2 つ・制御文字のコード
+  assert.deepEqual([
+    N.noticeLine({ code_norm: 'c-1', ne_code: null, reason: 'code_collided' }),
+    N.noticeLine({ code_norm: 'c-2', ne_code: null, reason: 'code_invalid', ne_spellings: [], lz_ids: [] }),
+    N.noticeLine({ code_norm: 'c-3', ne_code: null, reason: 'norm_collided', lz_ids: ['C-3'] }),
+    N.noticeLine({ code_norm: 'c-4', ne_code: 'c-4', reason: 'lz_case_collision', lz_ids: ['C-4', 'c-4'] }),
+    N.noticeLine({ code_norm: 'c-5\n\u202e', ne_code: 'c-5', reason: 'lz_case_collision', lz_ids: ['C-5'] }),
+  ], [
+    '・c-1: NE に大文字・小文字だけ違う書き方が 2 つ以上 → NE で 1 つにそろえる',
+    '・c-2: NE の書き方が使えない (使えない文字・壊れた記録) → NE の商品コードを確かめる',
+    '・c-3: NE に同じコードに読める商品が 2 つ以上・ロジザード = C-3 → NE で 1 つにそろえる',
+    '・c-4: NE = c-4 / ロジザード = C-4 / c-4 (書き方が 2 つ) → どれが正しいか確かめて NE とロジザードをそろえる',
+    '・c-5: NE = c-5 / ロジザード = C-5 → NE を C-5 に直す',
+  ]);
+  // 上限 10 行 + ほか N 件 (件数は全部)
+  const many = N.noticeLines(Array.from({ length: 12 }, (_, i) => ({ code_norm: `m-${String(i).padStart(2, '0')}`, ne_code: null, reason: 'code_collided' })));
+  assert.equal(many.length, 12);
+  assert.equal(many[0], '⚠️ NE の商品コードの書き方 12 件 (ロジザードに取り込んでいません)');
+  assert.equal(many[10], '・m-09: NE に大文字・小文字だけ違う書き方が 2 つ以上 → NE で 1 つにそろえる');
+  assert.match(many[11], /^・ほか 2 件/);
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

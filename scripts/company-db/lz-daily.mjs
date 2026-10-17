@@ -162,13 +162,18 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
     ['no_compare', cls.compare.length ? 0 : 1],   // 比べた商品が無い = 何も確かめていない
   ].filter(([, n]) => n > 0).map(([k]) => k);
   const verdict = failBy.length ? 'fail' : 'pass';
+  // 書き方の問題で出さない商品には、NE の書き方 (この世代の書き方の集め) とロジザードの書き方を報告に添える
+  //   = 朝のまとめ (daily-sync・apps/master-decisions/lz-code-notice.mjs) が商品と直し方つきで知らせる材料 (10/16 中原さん)。合否・件数は変えない
+  const spellOf = new Map((ne.entries || []).map((e) => [e.code_norm, Array.isArray(e.spellings) ? e.spellings : null]));
+  const invalidOut = cls.invalid.map((x) => (x.reason === 'code_collided' || x.reason === 'code_invalid' || x.reason === 'norm_collided'
+    ? { ...x, ne_spellings: spellOf.get(x.code_norm) ?? null, lz_ids: lz.lowerGroups.get(x.code_norm) ?? [] } : x));
   // ── 6. 出す (変えない CSV + 報告 + 完了の印) ──
   const rel = path.join(OUT_DIR, asOf, runId);
   const dir = path.join(outDir, rel);
   fs.mkdirSync(dir, { recursive: true });
   const csvRel = path.join(rel, `cdb_${DAILY.file}`).replace(/\\/g, '/');
   fs.writeFileSync(path.join(outDir, csvRel), cdbCsv.bytes, { flag: 'wx' });
-  const report = { run_id: runId, as_of: asOf, verdict, fail_by: failBy, classes: { counts: cls.counts, awaiting: cls.awaiting, lagging: cls.lagging.map(({ ne, ...x }) => x), lagging_check: lagCheck, invalid: cls.invalid, cost_zero_over_lz: cls.cost_zero_over_lz }, compare: result,
+  const report = { run_id: runId, as_of: asOf, verdict, fail_by: failBy, classes: { counts: cls.counts, awaiting: cls.awaiting, lagging: cls.lagging.map(({ ne, ...x }) => x), lagging_check: lagCheck, invalid: invalidOut, cost_zero_over_lz: cls.cost_zero_over_lz }, compare: result,
     build: { counts: cdbCsv.counts, unmade: cdbCsv.unmade, subs: cdbCsv.rows.flatMap((r) => r.subs.map((x) => ({ code: r.key, ...x }))) } };
   const reportBuf = Buffer.from(JSON.stringify(report, null, 1), 'utf8');
   fs.writeFileSync(path.join(dir, 'report.json'), reportBuf, { flag: 'wx' });
