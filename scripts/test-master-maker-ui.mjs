@@ -297,6 +297,27 @@ await ta('③b 商品の画面: メーカーの名前を打って選んでいな
   assert.equal(await makerOf('s003'), '山田製作所', 'まだ保存していない');
 });
 
+await ta('③c 商品の画面: 名簿に足す間は保存を止める・待つ間に別のメーカーを選んで足すのが失敗 (HTTP エラー) = 選んだメーカーで保存できる (#maker Codex R3 M・R4 M)', async (p) => {
+  let release = null;
+  await p.route('**/api/makers', async (route) => { await new Promise((r) => { release = r; }); await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ ok: false, error: '試験の失敗' }) }); });
+  p.on('dialog', (d) => d.accept());
+  await p.goto(B + '/sku/s001');
+  await p.fill('#f-reorder_months', '5');   // ほかの欄を変えて保存できる形に
+  assert.equal(await p.isDisabled('#save'), false);
+  await p.fill('#f-maker-in', 'まだ無い工房');
+  await p.click('#f-maker-list .co.mk-new');
+  await p.waitForFunction(() => /登録しています/.test(document.getElementById('f-maker-msg').textContent));
+  assert.equal(await p.isDisabled('#save'), true, '名簿に足す返事を待つ間に保存できる');
+  await p.fill('#f-maker-in', '山田');
+  await p.keyboard.press('ArrowDown');
+  await p.keyboard.press('Enter');
+  assert.equal(await hid(p), YAMADA.id);
+  release();
+  await p.waitForFunction(() => /試験の失敗/.test(document.getElementById('f-maker-msg').textContent));
+  assert.equal(await p.isDisabled('#save'), false, '失敗の後も保存できないまま');
+  assert.equal(await hid(p), YAMADA.id);
+});
+
 await ta('②b まとまり: 今あるまとまりを選ぶ = 子のメーカーが全部同じなら写す・選び直したら前のまとまりのメーカーを持ち越さない (#maker Codex R1 M)', async (p) => {
   await p.goto(B + '/new?kind=variation');
   const pick = async (code) => {

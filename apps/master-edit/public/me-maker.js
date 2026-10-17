@@ -167,7 +167,7 @@
       .then(function (x) {
         busy = false; if (sameBtn) sameBtn.disabled = false;
         lastReq = null;   // 返事が来た = 次は新しい番号
-        if (!x.r.ok || !x.j.ok || !x.j.maker) { say(x.j.error || ('登録できませんでした (HTTP ' + x.r.status + ')'), 'err'); return; }
+        if (!x.r.ok || !x.j.ok || !x.j.maker) { say(x.j.error || ('登録できませんでした (HTTP ' + x.r.status + ')'), 'err'); recount(); return; }   // 失敗も数え直す (待つ間に選び直した値で保存できるように・#maker Codex R4 M)
         var m = add(x.j.maker);
         // 待つ間に人が選び直した (入力なし・別のメーカー・打ち直し・まとまりの選び直し) = 名簿に足しただけで選ばない (後から選んだ値を上書きしない・#maker Codex R2 M)
         if (gen !== my || clean(inp.value) !== name) { say('「' + m.name + '」を名簿に登録しました (待つ間に選び直したので、この欄には入れていません)', 'info'); recount(); return; }
