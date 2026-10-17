@@ -717,7 +717,7 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible:not(.c-chk)').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible:not(.c-chk)').count(), 16, '行の欄も 1 つ少ない (17 → 16。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない・10/17 の画像の列はいつも出す)');
     assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td[data-col="po"]').count(), 0, '注文残のセルは描かない (隠すだけでなく)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
@@ -1862,7 +1862,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.equal(await p.getAttribute('#colbtn', 'aria-expanded'), 'true');
   assert.equal(await p.isDisabled('#collist li[data-id="code"] input'), true);
   assert.equal(await p.isDisabled('#collist li[data-id="code"] [data-mv="1"]'), true);
-  assert.equal(await p.isDisabled('#collist li[data-id="name"] [data-mv="-1"]'), true, 'コードより上には行かない');
+  assert.equal(await p.isDisabled('#collist li[data-id="img"] [data-mv="-1"]'), true, 'コードより上には行かない (コードのすぐ後ろ = 画像 10/17)');
   assert.match(await p.textContent('#collist li[data-id="fba"]'), /並べられない/);
   assert.equal(await p.isDisabled('#cp-save'), true, '変えていない = 保存は押せない');
   // 出さない: 状態 → 表から消える (見出しも行も)・「未保存」
@@ -1982,7 +1982,7 @@ await ta('[72] 一覧の画像の列 (10/17 中原さん「楽天の白抜き商
   const put = (ne, o) => pdb.prepare(`INSERT OR REPLACE INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, variant_image_url, status, fetched_at)
     VALUES (?, NULL, ?, NULL, NULL, ?, ?)`).run(ne, o.white ?? null, o.status ?? 'ok', PK.utcNow());
   put('s001', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/ui-s001.jpg' });
-  put('s002', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/ui-broken.jpg' });
+  put('z002', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/ui-broken.jpg' });
   put('s003', { status: 'not_found' });
   let open = null;
   const gate = new Promise((res) => { open = res; });
@@ -1992,22 +1992,23 @@ await ta('[72] 一覧の画像の列 (10/17 中原さん「楽天の白抜き商
   try {
     await p.goto(B + '/');
     assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);
-    await p.goto(B + '/?q=' + encodeURIComponent('単品'));
+    // コードで絞る (前の試験が名前を直した商品があっても同じ行が出る)
+    await p.goto(B + '/?' + new URLSearchParams({ codes: ['s001', 's003', 'z000', 'z001', 'z002'].join('\n') }));
     assert.deepEqual((await shownHeads(p)).slice(0, 3), ['code', 'img', 'name'], '画像はコードのすぐ後ろ');
     const cell = (code) => `#list-tbl tbody tr:has(a.rowlink[href="sku/${code}"]) td.c-img`;
     // 画像あり: 52px の四角・明るい台・object-fit: contain・referrer を送らない
     await p.waitForFunction((sel) => { const i = document.querySelector(sel + ' img'); return i && i.complete && i.naturalWidth > 0; }, cell('s001'));
-    const box = await p.$eval(cell('s001') + ' .thumb', (t) => { const r = t.getBoundingClientRect(); const i = t.querySelector('img'); const ir = i.getBoundingClientRect(); const s = getComputedStyle(t); return { w: r.width, h: r.height, iw: ir.width, ih: ir.height, bg: s.backgroundColor, fit: getComputedStyle(i).objectFit, ref: i.referrerPolicy, lazy: i.loading, alt: i.alt }; });
-    assert.deepEqual(box, { w: 52, h: 52, iw: 50, ih: 50, bg: 'rgb(243, 245, 249)', fit: 'contain', ref: 'no-referrer', lazy: 'lazy', alt: '単品 1' });
+    const box = await p.$eval(cell('s001') + ' .thumb', (t) => { const r = t.getBoundingClientRect(); const i = t.querySelector('img'); const ir = i.getBoundingClientRect(); const s = getComputedStyle(t); return { w: r.width, h: r.height, iw: ir.width, ih: ir.height, bg: s.backgroundColor, fit: getComputedStyle(i).objectFit, ref: i.referrerPolicy, lazy: i.loading, altIsName: !!i.alt && i.alt === t.closest('tr').querySelector('.nm').textContent }; });
+    assert.deepEqual(box, { w: 52, h: 52, iw: 50, ih: 50, bg: 'rgb(243, 245, 249)', fit: 'contain', ref: 'no-referrer', lazy: 'lazy', altIsName: true }, 'alt = 名前');
     // 読み込めない画像 (楽天で消えた) = 画像なしの印に替える (壊れた画像の印を出さない)
-    await p.waitForSelector(cell('s002') + ' .thumb.none');
-    assert.equal(await p.locator(cell('s002') + ' img').count(), 0);
+    await p.waitForSelector(cell('z002') + ' .thumb.none');
+    assert.equal(await p.locator(cell('z002') + ' img').count(), 0);
     // 楽天に無い = 印・キャッシュに無い = 取得中
     assert.equal(await p.getAttribute(cell('s003') + ' .thumb', 'class'), 'thumb none not_found');
     assert.equal(await p.getAttribute(cell('s003') + ' .thumb', 'title'), '楽天に画像がありません');
     assert.equal(await p.getAttribute(cell('z000') + ' .thumb', 'class'), 'thumb none pending');
     assert.equal((await p.textContent(cell('z000') + ' .thumb .tw')).trim(), '取得中');
-    // 行の高さは画像の有無で同じ (読み込みで動かない)。名前が 1 行の行で比べる (s002 は長い名前で 2 行)
+    // 行の高さは画像の有無で同じ (読み込みで動かない)
     const hs = [];
     for (const c of ['s001', 's003', 'z000', 'z001']) hs.push(await p.$eval(cell(c), (td) => Math.round(td.closest('tr').getBoundingClientRect().height)));
     assert.ok(Math.max(...hs) - Math.min(...hs) <= 1, `行の高さ ${hs}`);
@@ -2036,7 +2037,7 @@ await ta('[72] 一覧の画像の列 (10/17 中原さん「楽天の白抜き商
     open();
     await IM.queueEnsureImages([], '');
     LI.__setListImageDeps(null);
-    pdb.prepare("DELETE FROM pk_product_images WHERE ne_code IN ('s001', 's002', 's003')").run();
+    pdb.prepare("DELETE FROM pk_product_images WHERE ne_code IN ('s001', 'z002', 's003')").run();
   }
 });
 
