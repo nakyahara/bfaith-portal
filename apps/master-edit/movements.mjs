@@ -202,7 +202,9 @@ const fmtMd = (ymd) => `${Number(ymd.slice(5, 7))}/${Number(ymd.slice(8, 10))}`;
 export function buildMovementRows(o) {
   const placed = placeReceipts(o.receipts || [], o.anchors);
   const { cps, adj } = adjustmentsOf(o.anchors, o.totals, placed);
-  const inWin = (t) => (o.after == null || t > o.after) && (o.before == null || t <= o.before);
+  // 窓の端: 上限で切れたページの下の端 (afterInclusive) = その時刻の仕入・調整は切れた出荷より新しい (同じ時刻なら 出荷 → 仕入 → 調整 の順) = このページ。
+  //   その続きのページの上の端 (beforeExclusive) = その時刻ちょうどの仕入・調整は前のページで出した (Codex R2)
+  const inWin = (t) => (o.after == null || (o.afterInclusive ? t >= o.after : t > o.after)) && (o.before == null || (o.beforeExclusive ? t < o.before : t <= o.before));
   // 動き (時刻の順・同じ時刻は出荷 → 仕入 → 伝票番号の順)。表は同じ鍵のちょうど逆 (新しい順) = 在庫数の積み上げと表の並びがそろう (Codex R1)
   const moves = [
     ...o.ships.map((s) => ({ t: ms(s.at), seq: 0, kind: 'ship', delta: -s.qty, src: s })),
@@ -212,11 +214,15 @@ export function buildMovementRows(o) {
   const byK = new Map();
   for (const m of moves) { const k = intervalOf(cps, m.t); if (!byK.has(k)) byK.set(k, []); byK.get(k).push(m); }
   const oldestK = moves.length ? intervalOf(cps, moves[0].t) : null;
+  // 動きが全部そろっていない区間 = 在庫数を出さない: 上限で切れたページのいちばん古い区間・その続きのページのいちばん新しい区間 (前のページに同じ区間の行がある)
+  const brokenK = new Set();
+  if (o.truncated && oldestK != null) brokenK.add(oldestK);
+  if (o.beforeExclusive && o.before != null) brokenK.add(intervalOf(cps, o.before));
   const rows = [];
   for (const [k, ms2] of byK) {
     const startQty = k >= 1 && k <= cps.length ? cps[k - 1].qty : null;   // k = 0 = 錨の前 (空欄)
     let bal = startQty;
-    const broken = o.truncated && k === oldestK;
+    const broken = brokenK.has(k);
     for (const m of ms2) {
       if (bal != null) bal += m.delta;
       m.balance = broken ? null : bal;
@@ -304,7 +310,8 @@ export async function readMovementsPage(db, sku, { before = null, poAccess = fal
     const anchors = await readAnchors(db, sku.sku_id);
     const gens = anchors.filter((a) => a.status === 'complete' && a.gen).map((a) => a.gen).sort((a, b) => ms(a) - ms(b));
     const totals = await readShipmentTotals(db, sku.sku_id, gens);
-    const floor = new Date(dayStartMs(SHIPMENTS_FROM)).toISOString();
+    // 出荷の始まりの日の 0:00 ちょうども入れる (関数の p_after は含まない = 1 ミリ秒前から。Codex R2 Low)
+    const floor = new Date(dayStartMs(SHIPMENTS_FROM) - 1).toISOString();
     const first = await readShipments(db, sku.sku_id, { after: floor, ...B, limit: pageRows + 1 });
     let ships = first, after = dayStartMs(SHIPMENTS_FROM), next = null, truncated = false;
     if (first.length > pageRows) {
@@ -332,7 +339,8 @@ export async function readMovementsPage(db, sku, { before = null, poAccess = fal
     }
     const poNote = poState === 'denied' ? '発注アプリの権限が無いので、仕入もここに入っています' : poState === 'error' ? '発注アプリを読めないので、仕入もここに入っています' : null;
     // 窓の外 (前のページより新しい) の仕入は出さない。窓の下 (after) より古い仕入も出さない (次のページ)
-    const rows = buildMovementRows({ anchors, totals, receipts, ships, after: next ? after : null, before: beforeMs, live: cur == null ? live : null, truncated, poNote });
+    const rows = buildMovementRows({ anchors, totals, receipts, ships, after: next ? after : null, afterInclusive: truncated, before: beforeMs, beforeExclusive: beforeSlip != null,
+      live: cur == null ? live : null, truncated, poNote });
     const cps = anchors.filter((a) => a.status === 'complete' && a.gen);
     const lastA = cps.length ? cps[cps.length - 1] : null;
     return {

@@ -106,6 +106,18 @@ await t('最後の締めの後が上限で切れた (Codex R1): いまの写し�
   const late = M.buildMovementRows({ anchors, totals: new Map(), receipts: [], ships: ships.slice(0, 1), after: Date.parse(isoJ('2026-10-07T12:00:00')), before: null, live, truncated: true, poNote: null });
   assert.deepEqual(late.map((r) => [r.slip, r.balance]), [['X3', null]], '写しと読めた行の間に読めていない行があるかもしれない = 空欄');
 });
+await t('上限で切れたページの境目 (Codex R2): 同じ時刻の仕入は切れたページに 1 回だけ (出荷より新しい)・続きのページの最初の区間も在庫数を出さない', () => {
+  const anchors = [A('2026-10-01', 10000), { day: '2026-10-02', status: 'missing', gen: null, qty: null }, A('2026-10-03', 11996)];
+  const noon = Date.parse(isoJ('2026-10-02T12:00:00'));
+  const receipts = [{ slip: 'R', date: '2026-10-02', qty: 5000, defective: 0 }];   // 錨の無い日 = 12:00 に置く = 出荷と同じ時刻
+  const at = isoJ('2026-10-02T12:00:00');
+  const p1 = M.buildMovementRows({ anchors, totals: new Map([[1, 4]]), receipts, ships: [{ at, qty: 1, slip: 'S4' }, { at, qty: 1, slip: 'S3' }],
+    after: noon, afterInclusive: true, before: null, live: null, truncated: true, poNote: null });
+  assert.deepEqual(p1.map((r) => [r.kind, r.slip, r.balance]), [['adjust', null, 11996], ['receipt', 'R', null], ['ship', 'S4', null], ['ship', 'S3', null]]);
+  const p2 = M.buildMovementRows({ anchors, totals: new Map([[1, 4]]), receipts, ships: [{ at, qty: 1, slip: 'S2' }, { at: isoJ('2026-10-02T09:00:00'), qty: 1, slip: 'S1' }],
+    after: null, before: noon, beforeExclusive: true, live: null, truncated: false, poNote: null });
+  assert.deepEqual(p2.map((r) => [r.kind, r.slip, r.balance]), [['ship', 'S2', null], ['ship', 'S1', null]], '仕入は前のページで出した・前のページに同じ区間の行がある = 在庫数は空欄');
+});
 await t('ページの切れ目 = 区間の始まり (錨の前は日の始まり)・窓の外の行は出さない', () => {
   const anchors = [A('2026-10-01', 100), A('2026-10-02', 90)];
   assert.equal(M.pageFloorOf(anchors, Date.parse(isoJ('2026-10-02T10:00:00'))), Date.parse(isoJ('2026-10-01T18:00:00')));
@@ -206,6 +218,7 @@ await t('上限で切れたページ (Codex R1): 同じ時刻の伝票の残り�
   };
   for (const s of ['C1', 'C2', 'C3', 'C4', 'C5']) await shipC(s, '2026-10-06T10:00:00');   // 同じ時刻に 5 伝票
   await shipC('C0', '2026-10-05T10:00:00');
+  await shipC('CZ', '2025-01-01T00:00:00');   // 出荷の始まりの日の 0:00 ちょうど (Codex R2 Low)
   const dbE = pgliteAdapter(pg);
   const seen = [];
   await asEditor(async () => {
@@ -217,7 +230,7 @@ await t('上限で切れたページ (Codex R1): 同じ時刻の伝票の残り�
       before = r.next; pages++;
     } while (before && pages < 10);
   });
-  assert.deepEqual(seen, ['C5', 'C4', 'C3', 'C2', 'C1', 'C0']);
+  assert.deepEqual(seen, ['C5', 'C4', 'C3', 'C2', 'C1', 'C0', 'CZ']);
 });
 
 console.log('3 API (本物の router)');
