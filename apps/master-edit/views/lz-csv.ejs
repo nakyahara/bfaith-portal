@@ -7,21 +7,26 @@
   <%- include('_header') %>
   <%
     // 🆕 0081 ロジザード登録の CSV (logizard_bc_upload.csv・CompanyDB構想 23 v4 §5')。今の GAS の「新規商品マスタを CSV 出力」(人が H 列などを手で入れる) の置き換え (GAS は予備)。
-    //   作る → ダウンロード → ロジザードで取り込む (今までどおり auto-barcode.js / 手で)。画面の動き = public/me-lzcsv.js
+    //   作る → 「ロジザードに取り込む」(🆕 2026-10-17・miniPC が取りに来て ① 取込 → ② 書き出し・帳面 = apps/lz-bc-import) / 予備 = ダウンロードして手で・Stream Deck の auto-barcode.js・GAS。
+    //   画面の動き = public/me-lzcsv.js (取り込みの様子は数秒おきに読み直す)
     const C = cands;
     const canAct = canApprove && !dbError && !!C && C.db_ready && mirror.ok && !mirror.stale;   // 🆕 #1721 R2: 写しが古い = 作れない (DB も断る)
     const dis = canAct ? '' : ' disabled';
     const when = (v) => (v ? String(v).replace('T', ' ').slice(0, 16) : '—');
     const kindBadge = { fnsku: 'info', jan: 'vio', lz_assign: 'mute' };
     const pageData = canAct ? { base, ready: C.ready.map((x) => ({ sku_id: x.sku_id, rule_row: x.rule_row, code: x.code })), stale: !!mirror.stale } : { base, ready: [], stale: !!mirror.stale };
+    // 🆕「ロジザードに取り込む」: 画面の JS が読み直して描く (最初の値はここから)
+    Object.assign(pageData, { canImport: !!canImport, importMessage, bc, importBlock, exports: exports.map((e) => ({ id: e.id, sha: e.sha, rows: e.rows, state: e.state })), words: BC_STATE_WORDS, nightWords: BC_NIGHT_WORDS });
+    const bcCell = (id) => { const s = bc && bc.byExport[id]; return s && s.last ? s.last.state_words : 'まだ取り込んでいない'; };
   %>
   <div class="page" id="lzc" data-base="<%= base %>">
     <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">ロジザード登録の CSV</span></nav>
     <div class="ph">
       <div>
         <h1>ロジザード登録の CSV</h1>
-        <div class="lead">新商品をロジザードに登録する CSV (logizard_bc_upload.csv) を作ります。<b style="color:var(--text)">作る → ダウンロード → ロジザードで取り込む</b>。
+        <div class="lead">新商品をロジザードに登録する CSV (logizard_bc_upload.csv) を作ります。<b style="color:var(--text)">作る → 「ロジザードに取り込む」</b> (miniPC がその CSV をロジザードに取り込み、バーコードマスタ.csv も書き出す)。
           バーコード・有効期限区分・入荷日管理は新商品の登録で入れた値がそのまま入ります (GAS のシートに手で入れなくてよい)。同じ商品は 2 回出しません。
+          <span class="hint" id="lzc-manual">ボタンが使えないとき (miniPC が止まっている など) は、ダウンロードして手でロジザードに取り込めます (Stream Deck の auto-barcode.js でも可)。ボタンと手の両方で取り込まない。</span>
           <span class="hint" id="lzc-gas">この画面が使えないとき (開けない・作れない) だけ、予備として今までどおり GAS (ロジザード情報連携シート) で作れます (H 列に商品の画面のバーコードを入れる)。</span></div>
       </div>
       <div class="ph-actions"><a class="btn" href="<%= base %>/manual#lz-barcode"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
@@ -58,7 +63,7 @@
         </table>
       </div>
       <div class="buildbar">
-        <button class="btn pri" type="button" id="lzc-build"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg><%= C.ready.length %> 件の CSV を作ってダウンロード</button>
+        <button class="btn pri" type="button" id="lzc-build"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg><%= C.ready.length %> 件の CSV を<%= canImport ? '作る' : '作ってダウンロード' %></button>
         <span class="hint">作ると帳面に残り、この商品は次から出しません (取り消すと出し直せる) · ファイル名 logizard_bc_upload.csv (Shift_JIS)</span>
         <% if (C.rest) { %><span class="b warn" id="lzc-rest">残り <%= C.rest %> 件は次の回 (1 回の CSV は <%= C.max %> 件まで)</span><% } %>
       </div>
@@ -79,16 +84,27 @@
     <% } %>
 
     <section class="panel" aria-labelledby="h-lzexp">
-      <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-lzexp">作った CSV</h2><span class="sub">新しい順 · ダウンロードし直せます · ロジザードで取り込めなかったら取り消して作り直す</span></div>
+      <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-lzexp">作った CSV</h2><span class="sub">新しい順 · 「ロジザードに取り込む」で miniPC が取り込む · 予備 = ダウンロードして手で · 取り込めなかったら取り消して作り直す</span></div>
       <% if (!exports.length) { %><div class="empty">まだありません</div><% } else { %>
-      <div class="tblwrap"><table class="tbl" id="lzc-exports"><thead><tr><th scope="col">#</th><th scope="col">作った</th><th scope="col">件数</th><th scope="col">商品</th><th scope="col">状態</th><th scope="col"></th></tr></thead><tbody>
+      <div class="tblwrap"><table class="tbl" id="lzc-exports"><thead><tr><th scope="col">#</th><th scope="col">作った</th><th scope="col">件数</th><th scope="col">商品</th><th scope="col">状態</th><th scope="col">ロジザード</th><th scope="col"></th></tr></thead><tbody>
         <% for (const e of exports) { %>
         <tr data-export="<%= e.id %>"><td class="mono">#<%= e.id %></td><td><%= when(e.created_at) %> <span class="hint"><%= e.actor_id %></span></td><td><%= e.rows %></td><td class="hint"><%= e.codes %><%= e.rows > 6 ? ' …' : '' %></td>
           <td><% if (e.state === 'issued') { %><span class="b ok">出した</span><% } else { %><span class="b mute">取り消した</span> <span class="hint"><%= when(e.voided_at) %> · <%= e.void_reason %></span><% } %></td>
+          <td data-bc-cell="<%= e.id %>"><span class="hint"><%= bcCell(e.id) %></span></td>
           <td><% if (e.state === 'issued' && canApprove) { %><a class="btn sm" href="<%= base %>/lz-csv/<%= e.id %>/file" download="logizard_bc_upload.csv"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>ダウンロード</a> <button class="btn sm ghost" type="button" data-void="<%= e.id %>">取り消す</button><% } %></td></tr>
         <% } %>
       </tbody></table></div>
       <% } %>
+      <div class="msgline" id="lzc-bc-msg" role="status" aria-live="polite"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-lzbc" id="lzc-bc">
+      <div class="panel-h"><span class="hico" aria-hidden="true">③</span><h2 id="h-lzbc">ロジザードへの取り込み (miniPC)</h2><span class="sub">① 新商品の取込 (商品マスタ / 新商品バーコード登録) → ② バーコード情報の書き出し (バーコードマスタ.csv) · 夜 23:45〜01:30 は取り込まない</span></div>
+      <% if (bcError) { %><div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><%= bcError %></div></div><% } %>
+      <% if (!canImport && !bcError) { %><div class="hint" id="lzc-bc-who"><%= importMessage %></div><% } %>
+      <div id="lzc-bc-runner" class="hint"><% if (bc) { %>miniPC: <%= bc.runner.alive ? '来ている' : '来ていない' %><% } %></div>
+      <div id="lzc-bc-latest"></div>
+      <details id="lzc-bc-recent-wrap"><summary>最近の取り込み</summary><div id="lzc-bc-recent"></div></details>
     </section>
     <% } %>
     <script type="application/json" id="me-lzc"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
