@@ -216,8 +216,16 @@ await ta('[S2] 状態: 取る → 押す → ① → ② = 取り込んだ / 件
   assert.equal(j.state, 'unknown');
   j = flow({ executed: true, importResult: null });
   assert.equal(j.state, 'unknown', '押した後に結果が無い');
-  j = flow({ executed: false, reason: 'precheck', detail: 'ブラウザが開いている' });
+  j = flow({ executed: false, reason: 'precheck', detail: 'ブラウザが開いている' }, { viaImport: false, ...{} });
   assert.deepEqual([j.state, j.reason], ['not_executed', 'precheck']);
+  // 「押す」はポータルで通ったが応答が届かず、miniPC は押す前に止めた = 押していない
+  {
+    const u = U(); alive(u);
+    const a = BC.enqueue(u, base());
+    const c = BC.claimJob(u, { jobId: a.job_id, runnerId: 'pc', now: jst('10:00') });
+    BC.markExecuting(u, { jobId: a.job_id, claimToken: c.claimToken, now: jst('10:01') });
+    assert.deepEqual(Object.values(BC.reportFinal(u, { jobId: a.job_id, claimToken: c.claimToken, executed: false, reason: 'unreachable', now: jst('10:02') })), [true, 'not_executed']);
+  }
   j = flow({ executed: true }, { viaImport: false, withExport: true, rows: 2, ...{} });
   assert.equal(j.state, 'unknown');
   // 押すと言っていないのに押したと言う = 食い違い = 分からない側

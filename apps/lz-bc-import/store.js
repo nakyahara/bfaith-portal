@@ -392,6 +392,10 @@ export function reportFinal(db, { jobId, claimToken, executed = false, importRes
       if (executed) return done('unknown', 'mismatch', 'miniPC は押したと言うが、ポータルは「押す」を受けていない。ロジザードのインポート履歴で確かめてください');
       return done('not_executed', clean(reason, 60) || 'failed_before_execute', detail || '押す前に止まった (取り込んでいない)');
     }
+    if ((j.state === 'executing' || late) && !executed && !importResult) {
+      // 「押す」はポータルで通ったが、その応答が miniPC に届かなかった (miniPC は押す前に止めた = 実行ボタンは押していない)
+      return done('not_executed', clean(reason, 60) || 'not_pressed', detail || '「押す」の応答が届かず、押す前に止めた (取り込んでいない)');
+    }
     if (j.state === 'executing' || late) {
       const v = importVerdict(j.rows, importResult);
       if (importResult) setImport(db, j, importResult, v, now, null);
