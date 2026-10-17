@@ -256,7 +256,8 @@ await ta('[3] 許していない列名・向き = コード順 / 昇順 (SQL に
 });
 
 console.log('列の設定 (人ごと)');
-const goodView = () => ({ order: ['code', 'sup', 'name', 'price', 'cost', 'kind', 'state', 'reg', 'tax', 'profit', 'rate', 'sales_class', 'stock', 'fba', 'sold', 'po', 'flags'],
+// 画像の列 (10/17) は並びにあって出さない (出さない列の描き方・取りに行かないを見る)
+const goodView = () => ({ order: ['code', 'img', 'sup', 'name', 'price', 'cost', 'kind', 'state', 'reg', 'tax', 'profit', 'rate', 'sales_class', 'stock', 'fba', 'sold', 'po', 'flags'],
   shown: ['code', 'sup', 'name', 'price', 'cost', 'stock', 'flags'] });
 const rowsIn = () => prefsDb.prepare('select email, prefs_json from master_edit_view_prefs order by email').all();
 await ta('[4] 列の設定: 保存・読む・初期に戻す・他人の設定は読めない / 変えない・入力の確かめ・Origin と JSON の守り・置き場が無い', async () => {
@@ -264,7 +265,7 @@ await ta('[4] 列の設定: 保存・読む・初期に戻す・他人の設定�
   let r = await call('GET', '/api/view-prefs');
   assert.equal(r.status, 200);
   assert.deepEqual([r.j.ok, r.j.saved, r.j.view], [true, false, { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] }]);
-  assert.deepEqual(r.j.view.shown, ['code', 'name', 'kind', 'state', 'reg', 'price', 'cost', 'tax', 'profit', 'rate', 'sales_class', 'stock', 'fba', 'sold', 'po', 'flags'], 'いつもの列 = 10/8 までの一覧の列');
+  assert.deepEqual(r.j.view.shown, ['code', 'img', 'name', 'kind', 'state', 'reg', 'price', 'cost', 'tax', 'profit', 'rate', 'sales_class', 'stock', 'fba', 'sold', 'po', 'flags'], 'いつもの列 = 10/8 までの一覧の列 + 画像 (10/17・コードのすぐ後ろ)');
   // 保存 → 読む (同じ人の別の書き方のメール = 同じ設定)
   r = await call('POST', '/api/view-prefs', { body: goodView() });
   assert.equal(r.status, 200, r.text);
@@ -279,6 +280,17 @@ await ta('[4] 列の設定: 保存・読む・初期に戻す・他人の設定�
   assert.deepEqual((await call('GET', '/api/view-prefs')).j.view, goodView(), '他人の保存で中原さんの設定は変わらない');
   assert.deepEqual((await call('GET', '/api/view-prefs', { session: 'other' })).j.view, otherView);
   assert.deepEqual(rowsIn().map((x) => x.email), ['naka@test', 'other@test']);
+  // 画像の列 (10/17) より前に保存した設定 (並びに img が無い) = コードのすぐ後ろに画像を出す (ほかの列の並び・出す / 出さないはそのまま)
+  {
+    const old = { v: 1, order: goodView().order.filter((x) => x !== 'img'), shown: goodView().shown.filter((x) => x !== 'img') };
+    prefsDb.prepare('update master_edit_view_prefs set prefs_json = ? where email = ?').run(JSON.stringify(old), 'naka@test');
+    const v = (await call('GET', '/api/view-prefs')).j.view;
+    assert.deepEqual(v.order, ['code', 'img', ...old.order.slice(1)], '画像はコードのすぐ後ろ');
+    assert.deepEqual(v.shown, ['code', 'img', ...old.shown.slice(1)], '画像は出す・ほかはそのまま');
+    // 画像を外して保存した人 = その後は出さない (並びに img がある)
+    assert.equal((await call('POST', '/api/view-prefs', { body: goodView() })).status, 200);
+    assert.deepEqual((await call('GET', '/api/view-prefs')).j.view, goodView(), '外した画像は出さないまま');
+  }
   // 人の名前を送っても使わない (知らない項目 = 400)
   for (const extra of [{ email: 'other@test' }, { user: 'other@test' }, { reset: true }]) {
     r = await call('POST', '/api/view-prefs', { body: { ...goodView(), ...extra } });
@@ -314,9 +326,10 @@ await ta('[4] 列の設定: 保存・読む・初期に戻す・他人の設定�
   // 足りない列は後ろに出さない形で足す (後から列を足した・板に出さない列)
   r = await call('POST', '/api/view-prefs', { body: { order: ['code', 'name', 'price'], shown: ['code', 'price'] } });
   assert.equal(r.status, 200);
-  assert.deepEqual(r.j.view.order.slice(0, 3), ['code', 'name', 'price']);
+  // 画像 (10/17・addShown) だけは足りなければコードのすぐ後ろに出す (列を足す前の画面から送った設定でも画像が出る)
+  assert.deepEqual(r.j.view.order.slice(0, 4), ['code', 'img', 'name', 'price']);
   assert.equal(r.j.view.order.length, LC.COLUMN_IDS.length);
-  assert.deepEqual(r.j.view.shown, ['code', 'price']);
+  assert.deepEqual(r.j.view.shown, ['code', 'img', 'price']);
   // Origin・JSON の守り (書く API)
   assert.equal((await call('POST', '/api/view-prefs', { body: goodView(), origin: false })).status, 403, 'Origin が無い');
   assert.equal((await call('POST', '/api/view-prefs', { body: goodView(), ctype: false })).status, 415, 'JSON でない');
@@ -374,7 +387,7 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   // コードは左端 (横に送っても残る印)・列の数
   assert.match(thead(r.text), /^<tr><th scope="col" class="c-code sortable"/);
   assert.match(tr, /<td class="c-code" data-col="code">/);
-  assert.match(r.text, /id="colcnt">7\/16</);
+  assert.match(r.text, /id="colcnt">7\/17</);
   // 仕入先の列: 単品 = コード + 名前・セット = 構成品から・代表なし = —。出している間は名前の下の「仕入先」の字を消す (class)
   assert.match(r.text, /<table class="tbl click show-sup" id="list-tbl">/);
   const cell = (code, id) => { const t = r.text.split('<tr>').find((x) => x.includes(`href="sku/${code}"`)); return new RegExp(`<td [^>]*data-col="${LC.COLUMN_BY_ID[id].cell}"[^>]*>([\\s\\S]*?)<\\/td>`).exec(t)[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim(); };
@@ -389,7 +402,7 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   const cfg = cfgOf(r.text);
   assert.deepEqual(cfg.columns.map((c) => c.id), want);
   assert.deepEqual(cfg.columns.filter((c) => c.fixed).map((c) => c.id), ['code']);
-  assert.deepEqual(cfg.columns.filter((c) => !c.sortable).map((c) => c.id), ['fba', 'sold', 'flags']);
+  assert.deepEqual(cfg.columns.filter((c) => !c.sortable).map((c) => c.id), ['img', 'fba', 'sold', 'flags']);
   assert.deepEqual(cfg.view, goodView(), '設定は全部の列 (注文残も) のまま渡す = 保存し直しで注文残の設定を消さない');
   assert.deepEqual(cfg.defaultView, { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] });
   assert.deepEqual([cfg.saved, cfg.readable, cfg.who], [true, true, '中原']);
@@ -410,10 +423,10 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   assert.ok(!/ hidden/.test(thOf(r.text, 'po').split('>')[0]), '注文残を出す');
   assert.ok(/ hidden/.test(thOf(r.text, 'sup').split('>')[0]), 'いつもの列 = 仕入先は出さない');
   assert.match(r.text, /<table class="tbl click" id="list-tbl">/);
-  assert.match(r.text, /id="colcnt">16\/17</);
+  assert.match(r.text, /id="colcnt">17\/18</);
   // 中身が無い一覧の行 = 全部の列にまたがる
   r = await call('GET', '/?q=' + encodeURIComponent('当たらない名前'));
-  assert.match(r.text, /<td colspan="16" class="muted"/);
+  assert.match(r.text, /<td colspan="17" class="muted"/);
   // 名前の下の「仕入先」の字はいつもの列のときは出る (仕入先の列を出していない)
   assert.equal((await call('POST', '/api/view-prefs', { body: { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] } })).status, 200);
   r = await call('GET', '/');
@@ -451,6 +464,97 @@ await ta('[6] 在庫の並び (ロジザード・セットは作れる数) = 一
   setStock([]);
   assert.deepEqual(await codesOf('?sort=stock&dir=desc'), [...ALL_CODES].sort(), '写しが無い = コード順');
   assert.deepEqual(listOrder((await call('GET', '/?sort=stock&dir=desc')).text), [...ALL_CODES].sort());
+});
+
+await ta('[7] 画像の列 (10/17 中原さん): キャッシュの URL を出す (楽天を待たない)・無い = 取得中で 1 回だけ取りに行く・楽天に無い = 印・楽天のドメイン以外は出さない・列を出さない人は取りに行かない・CSV に入れない', async () => {
+  // 画像のキャッシュ = picking.db (同じ DATA_DIR)。楽天の呼び出しは差し替え (実 API は叩かない)
+  const PK = await import('../apps/picking/db.js');
+  const IM = await import('../apps/picking/images.js');
+  const LI = await import('../apps/master-edit/list-images.mjs');
+  const pdb = PK.getDB();
+  const put = (ne, o) => pdb.prepare(`INSERT OR REPLACE INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, variant_image_url, status, fetched_at)
+    VALUES (?, NULL, ?, NULL, ?, ?, ?)`).run(ne, o.white ?? null, o.variant ?? null, o.status ?? 'ok', PK.utcNow());
+  put('a01', { variant: 'https://image.rakuten.co.jp/b-faith/cabinet/a01-red.jpg', white: 'https://image.rakuten.co.jp/b-faith/cabinet/a01.jpg' });
+  put('a02', { status: 'not_found' });
+  put('a03', { white: 'https://evil.example.com/a03.jpg' });
+  put('a06', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/q"><script>x</script>.jpg' });
+  put('b01', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/set-b01.jpg' });
+  const calls = [];
+  let open = null;
+  const gate = new Promise((res) => { open = res; });   // 楽天の応答を止めておく (解決の途中で開き直す)
+  LI.__setListImageDeps({
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['a04', 'a04']]) }),
+    fetchDetails: async (mns) => {
+      calls.push([...mns]);
+      await gate;
+      return { items: mns.includes('a04') ? [{ manageNumber: 'a04', whiteBgImage: { location: '/a04.jpg' } }] : [], failed: mns.filter((m) => m !== 'a04').map((m) => ({ manageNumber: m, reason: `Not found for inputs; manageNumber=${m}` })) };
+    },
+  });
+  const drain = () => IM.queueEnsureImages([], '');
+  const imgCell = (text, code) => {
+    const tr = text.split('<tr>').find((x) => x.includes(`href="sku/${code}"`));
+    return /<td class="c-img" data-col="img"([^>]*)>([\s\S]*?)<\/td>/.exec(tr);
+  };
+  try {
+    assert.equal((await call('POST', '/api/view-prefs', { body: { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] } })).status, 200);
+    let r = await call('GET', '/');
+    assert.equal(r.status, 200);
+    // 見出し = コードのすぐ後ろ・並べられない (リンクなし)
+    assert.deepEqual(headIds(r.text).slice(0, 3), ['code', 'img', 'name']);
+    assert.ok(!thOf(r.text, 'img').includes('class="sorth"'), '並べられない');
+    // キャッシュ済み = <img> (大きさ固定・lazy・referrer を送らない・alt = 名前)・バリエーション画像が先
+    assert.equal(imgCell(r.text, 'a01')[2], '<span class="thumb"><img src="https://image.rakuten.co.jp/b-faith/cabinet/a01-red.jpg" alt="あいう 石鹸" width="52" height="52" loading="lazy" decoding="async" referrerpolicy="no-referrer"></span>');
+    assert.match(imgCell(r.text, 'b01')[2], /src="https:\/\/image\.rakuten\.co\.jp\/b-faith\/cabinet\/set-b01\.jpg"/, 'セット = セット自身の画像');
+    // 楽天に無い = 印 (img は出さない)
+    assert.match(imgCell(r.text, 'a02')[2], /^<span class="thumb none not_found" title="楽天に画像がありません">/);
+    assert.ok(!imgCell(r.text, 'a02')[2].includes('<img'));
+    // 楽天のドメイン以外 = 出さない
+    assert.ok(!r.text.includes('evil.example.com'), 'ドメイン外の URL は画面に出さない');
+    assert.match(imgCell(r.text, 'a03')[2], /thumb none not_found/);
+    // URL の中の " < > は属性の外に出ない
+    assert.match(imgCell(r.text, 'a06')[2], /src="https:\/\/image\.rakuten\.co\.jp\/b-faith\/cabinet\/q&#34;&gt;&lt;script&gt;x&lt;\/script&gt;\.jpg"/);
+    assert.ok(!r.text.includes('<script>x</script>'));
+    // キャッシュに無い = 取得中 (画面は待たずに出す)・裏で 1 回だけ取りに行く
+    assert.match(imgCell(r.text, 'a04')[2], /^<span class="thumb none pending" title="楽天の画像を取得中[^"]*"><svg class="ic" aria-hidden="true"><use href="#i-image"\/><\/svg><span class="tw" aria-hidden="true">取得中<\/span>/);
+    assert.match(imgCell(r.text, 'x02')[2], /thumb none pending/, '例外の SKU もコードで引く');
+    r = await call('GET', '/');   // 解決が終わる前に開き直した = 積み増さない
+    assert.match(imgCell(r.text, 'a04')[2], /thumb none pending/);
+    open();
+    await drain();
+    assert.equal(calls.length, 1, `楽天は 1 回 (${JSON.stringify(calls)})`);
+    assert.ok(calls[0].includes('a04'));
+    assert.ok(!calls[0].includes('a01') && !calls[0].includes('a02'), 'キャッシュ済み・今日の「楽天に無い」は取りに行かない');
+    r = await call('GET', '/');
+    assert.match(imgCell(r.text, 'a04')[2], /src="https:\/\/image\.rakuten\.co\.jp\/b-faith\/cabinet\/a04\.jpg"/, '解決した後は画像');
+    // 3 字のコードで変換表にも無い = 楽天に問い合わせる候補が無い = error (30 分後にまた見る。楽天は呼ばない)
+    assert.match(imgCell(r.text, 'a05')[2], /thumb none error" title="楽天の画像を取れませんでした/);
+    await drain();
+    assert.equal(calls.length, 1, '開き直しても取りに行かない');
+    // 列を出していない人 = セルは hidden・キャッシュは読む・取りに行かない
+    pdb.prepare('DELETE FROM pk_product_images WHERE ne_code = ?').run('a05');
+    assert.equal((await call('POST', '/api/view-prefs', { body: goodView() })).status, 200);
+    r = await call('GET', '/');
+    assert.match(imgCell(r.text, 'a05')[1], / hidden/);
+    assert.match(imgCell(r.text, 'a05')[2], /thumb none uncached/);
+    assert.match(imgCell(r.text, 'a01')[2], /<img src=/, '出していない列でもキャッシュの画像は描く (列の板で出したらすぐ見える)');
+    await drain();
+    assert.equal(calls.length, 1, '列を出していない = 取りに行かない');
+    // CSV に画像は入れない
+    const csv = await (await fetch(`${BASE}/list.csv`, { headers: { 'x-test-session': 'editor' } })).text();
+    assert.ok(!/画像|rakuten\.co\.jp/.test(csv.split('\r\n')[0]) && !csv.includes('a01-red.jpg'), 'CSV に画像の列・URL は無い');
+    // picking.db が読めない = 全部印で一覧は出す (画像は「あれば嬉しい」もの)
+    LI.__setListImageDeps(null);
+    pdb.exec('ALTER TABLE pk_product_images RENAME TO pk_product_images_x');
+    try {
+      r = await call('GET', '/');
+      assert.equal(r.status, 200);
+      assert.match(imgCell(r.text, 'a01')[2], /thumb none none/);
+    } finally { pdb.exec('ALTER TABLE pk_product_images_x RENAME TO pk_product_images'); }
+  } finally {
+    LI.__setListImageDeps(null);
+    await call('POST', '/api/view-prefs', { body: { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] } });
+    try { pdb.close(); } catch { /* 閉じられなくてもよい */ }
+  }
 });
 
 server.close();
