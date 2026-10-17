@@ -90,7 +90,8 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
-import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS } from '../../lib/master-register.mjs';
+import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS, parseCard } from '../../lib/master-register.mjs';
+import { MAX_SET_PLANS, SET_QTY_MIN, SET_QTY_MAX, SET_NAME_MAX, SET_PLAN_ALERT_DAYS, setCodeShapeProblem } from '../../lib/set-plan.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
 import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf } from '../../lib/master-register-blanks.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
@@ -435,6 +436,23 @@ async function liveCardsSafe(input) {
   try { return { cards: await liveCards(input) }; } catch (e) { return { error: String((e && e.message) || e).slice(0, 200) }; }
 }
 const cardExistsWords = (cards) => `product-hub に除外していない出品カード (${cards.map((c) => '#' + c.draft_id).join('・')}) があります。先に product-hub でカードを確かめて「除外」にしてから消してください (出品済み・出品中ならこの下書きは消さない)。何もしていません`;
+/**
+ * 🆕 2026-10-17: 新商品の登録で決めた作るセット (product-hub の表 ph_cdb_set_plans・Render の SQLite・同じプロセス)。
+ *   本番 = apps/product-hub/services/cdb-set-plan.js (使うときに読む = この画面の試験は SQLite 無しで動く)。試験は差し替える
+ *   { write(input) (登録の前・断る = throw {status, reason, message, field, index}), mark(requestId, {state, skuId, note}), held(code, {requestId}) (読むだけ) }
+ */
+let setPlanStore = null;
+export function __setSetPlanStore(st) { setPlanStore = st || null; }
+async function setPlans() {
+  if (setPlanStore) return setPlanStore;
+  const m = await import('../product-hub/services/cdb-set-plan.js');
+  return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o) };
+}
+/** 作るセットの答えを残す (登録の後)。失敗しても投げない (取り込みは知らせの request_id で表を引く = 状態は見ない) */
+async function markSetPlanSafe(requestId, x) {
+  try { (await setPlans()).mark(requestId, x); } catch (e) { console.error(`[master-edit] 作るセットの答えを残せなかった (${requestId}): ${e && e.message}`); }
+}
+
 /** 知らせを 1 つ取り込む (保存の直後・「もう一度」)。誤りは投げない (画面に「カード作成待ち」を出す) */
 async function tryCard(db, { eventId = null, skuId = null, manual = false }) {
   try {
@@ -765,6 +783,8 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
       || (!(page && page.backfillDone) ? '切替の手順の「既存の商品の登録の状態 (backfill)」がまだ' : ''),
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
     yahooDeliveries: Object.values(SHIPPING_METHOD_GROUPS), setPlanChoices: SET_PLAN_CHOICES, setDecisionReasons: SET_DECISION_REASONS,
+    // 🆕 2026-10-17: 「作る」のときの作るセット (個数・セット商品コード・セット商品名) の決まり (lib/set-plan.mjs)
+    setPlanLimits: { max: MAX_SET_PLANS, qtyMin: SET_QTY_MIN, qtyMax: SET_QTY_MAX, nameMax: SET_NAME_MAX, alertDays: SET_PLAN_ALERT_DAYS },
     // 発注の設定 (発注アプリ・単品だけ。発注アプリはセットを扱わない)
     orderSettings: kind === 'single' ? orderScreen(req, editorGate(req), null) : null,
     orderNoneApplies,   // 発注の設定の「入力なし」を出すか (API と同じ関数・views/_order.ejs)
@@ -1007,6 +1027,27 @@ router.get('/api/code-check', (req, res) => withPgApi(res, async (db) => {
   res.json(await checkNewCodeInDb(db, code));
 }));
 
+/**
+ * 🆕 2026-10-17: 作るセットのコードを確かめる (読むだけ・画面がその場で)。?code= セット商品コード・&parent= 単品のコード・&request_id= (自分の登録の作るセットは数えない)
+ *   形 (新商品のコードと同じ)・単品のコードと同じでない・Company DB / NE / 消したコード (ops.new_sku_code_problem)・product-hub のカード / ほかの登録の作るセット
+ */
+router.get('/api/set-code-check', (req, res) => withPgApi(res, async (db) => {
+  const code = String(req.query.code ?? '');
+  const parent = String(req.query.parent ?? '');
+  if (code.length > 60 || parent.length > 60) return res.status(400).json({ ok: false, error: '長すぎます' });
+  const shape = setCodeShapeProblem(code);
+  if (shape) return res.json({ ok: false, reason: 'code_shape', message: shape });
+  if (parent && code.toLowerCase() === parent.trim().toLowerCase()) return res.json({ ok: false, reason: 'same_as_single', message: 'セット商品コードが単品のコードと同じです' });
+  const cc = await checkNewCodeInDb(db, code);
+  if (!cc.ok) return res.json({ ok: false, reason: cc.reason, message: cc.message });
+  const rq = String(req.query.request_id || '').toLowerCase();
+  let held = null;
+  try { held = (await setPlans()).held(code, { requestId: /^[0-9a-f-]{36}$/.test(rq) ? rq : null }); }
+  catch (e) { return res.status(503).json({ ok: false, reason: 'ph_unreadable', error: `product-hub のカードを読めません (${String((e && e.message) || e).slice(0, 120)})` }); }
+  if (held) return res.json({ ok: false, reason: held.reason, message: held.message });
+  res.json({ ok: true, reason: null, message: null, code });
+}));
+
 router.post('/api/new', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
@@ -1046,12 +1087,36 @@ router.post('/api/new', (req, res) => {
       if (lg.fail) return res.status(lg.fail.status).json(lg.fail.json);
       lzCopy = lg.copy;
     }
-    const r = await registerNewSku(db, {
-      actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
-      order: outbox ? orderBase : null, reasonNote: po.note,
-      logizardBarcode: b.logizard_barcode,   // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコードの値か空欄 (単品だけ・要るかは上の lzRegisterGate)
-      lzCopy,                                // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果
-    }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true });
+    // 🆕 2026-10-17: 作るセット (「作る」のときの個数・コード・名前) は登録の前に product-hub に残す (書けない・コードが重なる = 登録しない)。
+    //   Company DB の知らせには入れない (0061 の登録の関数が知らない欄を断る)。カードの取り込みが同じ request_id で引いて下書きを作る (cdb-set-plan.js)
+    const actor = String(req.session.email).trim().toLowerCase();
+    const rid = String(b.request_id ?? '').trim().toLowerCase();
+    let planCard = null;
+    try { planCard = parseCard(b.card, String(b.kind ?? ''), typeof b.code === 'string' ? b.code : ''); } catch (e) { if (!(e instanceof MasterWriteError)) throw e; /* 形の誤りは登録の lib が同じ文で断る */ }
+    const hasPlan = !!(planCard && planCard.sets && planCard.sets.length);
+    if (hasPlan) {
+      try {
+        (await setPlans()).write({ requestId: rid, parentCode: b.code, parentName: b.values && typeof b.values.name === 'string' ? b.values.name.trim() : '', sets: planCard.sets, actor });
+      } catch (e) {
+        if (e && e.status) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, field: e.field || 'card.sets', ...(e.index == null ? {} : { index: e.index }) });
+        console.error(`[master-edit] 作るセットを product-hub に残せない: ${e && e.stack || e}`);
+        return res.status(503).json({ ok: false, reason: 'ph_unwritable', field: 'card.sets', error: '作るセットを product-hub に残せないので、登録していません (少し待ってからもう一度。急ぐときは「セット商品を作るか」を「保留」にして登録し、あとで product-hub の「セット商品を作る」で作ってください)' });
+      }
+    }
+    let r;
+    try {
+      r = await registerNewSku(db, {
+        actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
+        order: outbox ? orderBase : null, reasonNote: po.note,
+        logizardBarcode: b.logizard_barcode,   // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコードの値か空欄 (単品だけ・要るかは上の lzRegisterGate)
+        lzCopy,                                // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果
+      }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true });
+    } catch (e) {
+      // 登録が断られた = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)
+      if (hasPlan) await markSetPlanSafe(rid, { state: 'dropped', note: String((e && e.message) || e).slice(0, 300) });
+      throw e;
+    }
+    if (hasPlan) await markSetPlanSafe(rid, { state: 'registered', skuId: r.sku_id });
     let orderResult = null;
     const after = orderInput && outbox ? await ordersAfterRegistration(db, String(b.request_id).trim().toLowerCase(), !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
     if (after.mode === 'mismatch') orderResult = { ok: false, status: 'mismatch', reason: 'request_id_reused', pending: false, error: ORDER_MISMATCH_WORDS };
@@ -1075,7 +1140,7 @@ router.post('/api/new', (req, res) => {
     let card = r.card || null;
     if (card && card.status !== 'done') {
       const t = await tryCard(db, { eventId: card.event_id });
-      if (t) card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null };
+      if (t) card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null, set_drafts: t.result?.set_drafts ?? null, set_skipped: t.result?.set_skipped ?? null };
     }
     res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null, ...(orderInput ? { order_settings: orderResult } : {}),
       ...(await lzSavedUncheckedOf(db, b.request_id)) });   // #1719 R3 High: 押し直しでも DB に残した結果から

@@ -74,6 +74,8 @@ import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 // Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
 import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
+import { setPlanDraftAges } from './services/cdb-set-plan.js';
+import { SET_PLAN_ALERT_DAYS } from '../../lib/set-plan.mjs';
 // 🆕 まとまり (色違い・サイズ違い) のカード (Company DB構想 20 v7 §⑤・PR-4): 取り込み・「要確認」・状態 (NE の写し待ち / 2 軸 = 出品の門)
 import { applyCdbGroupEvent, ackCdbGroupAttention } from './services/cdb-group-intake.js';
 import { cdbGroupCardView, cdbGroupBoardTags } from './services/cdb-group-gate.js';
@@ -3369,7 +3371,13 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
   const imageKind = null;
   // NE要対応は列ではなく表 (§5.5)。表示のついでに本コードの取り込みを追いかける
   // (mirror は毎時なので、画面を開くだけで追いつく。新しい定期実行は作らない)
-  const neRows = boardView === 'ne' ? neRegistrationRows(db, { reconcile: reconcileProvisionalCode }) : [];
+  const neRowsAll = boardView === 'ne' ? neRegistrationRows(db, { reconcile: reconcileProvisionalCode }) : [];
+  // 🆕 2026-10-17: 新商品の登録で作ったセットの下書き (NE で本コードを確かめるまで出品しない)。作ってから SET_PLAN_ALERT_DAYS 日を過ぎても NE に無い = 知らせ
+  //   (タブの印・NE要対応の表の印と「それだけ見る」・カードの札)。上の reconcile (NE に取り込まれたら確定) の後に数える
+  const setPlanAges = setPlanDraftAges(db);
+  const setPlanLate = [...setPlanAges.values()].filter((x) => x.late).length;
+  const setPlanLateOnly = boardView === 'ne' && filterParam === 'set_plan_late';
+  const neRows = setPlanLateOnly ? neRowsAll.filter((r) => setPlanAges.get(r.id)?.late) : neRowsAll;
   // 📣 広告 (2026-09-28) も列ではなく表 — 自社商品を段階・実績で見比べる。工程には足さない
   // (足すと listing_gate で楽天出品が止まる副作用)。実績は mirror を画面を開いたときに読む (定期実行を増やさない)
   const adOps = boardView === 'ad' ? adOpsRows(db) : null;
@@ -3419,6 +3427,8 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
     isAdmin: req.session?.role === 'admin',
     // Company DB の新商品の登録で、発送方法 (送料コード) に楽天の配送方法の対応が無かったカード (2026-10-01)
     cdbShippingCheck: cdbShippingCheckIds(db),
+    // 🆕 2026-10-17: 新商品の登録で作ったセットの下書き (id → 作ってからの日数・知らせの日数を過ぎたか)
+    setPlanAges, setPlanLate, setPlanLateOnly, setPlanAlertDays: SET_PLAN_ALERT_DAYS,
     // 🆕 まとまりのカード (PR-4): NE の写し待ち / 2 軸 = 出品を止めている・要確認 の札
     cdbGroupTags: cdbGroupBoardTags(db),
   });
