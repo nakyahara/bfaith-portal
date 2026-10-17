@@ -50,13 +50,14 @@ export function setCodeHeld(code, { requestId = null, db = getDB() } = {}) {
 
 /**
  * ① 登録の前に作るセットを残す (同じ request_id = 押し直し = 同じ中身なら何もしない)。
- *   input = { requestId, parentCode, parentName, sets (lib/set-plan.mjs の形), actor }
+ *   input = { requestId, requestHash (登録の要求のハッシュ = lib/master-register.mjs の registerPayloadHashOf), parentCode, parentName, sets (lib/set-plan.mjs の形), actor }
  *   断る (throw status/reason/message/field/index): 形が違う 400・カード / ほかの作るセットとコードが重なる 409・同じ request_id で違う中身 409
  * @returns {{ ok: true, replayed: boolean }}
  */
-export function writeSetPlan({ requestId, parentCode, parentName, sets, actor }, { db = getDB() } = {}) {
+export function writeSetPlan({ requestId, requestHash, parentCode, parentName, sets, actor }, { db = getDB() } = {}) {
   const rid = String(requestId ?? '').trim().toLowerCase();
   if (!UUID_RE.test(rid)) throw refuse(400, 'invalid_input', '保存の番号 (request_id) の形が違う', { field: 'request_id' });
+  if (!/^[0-9a-f]{64}$/.test(String(requestHash ?? ''))) throw new Error('登録の要求のハッシュが無い');
   let plans;
   try { plans = parseSetPlans(sets, { parentCode }); } catch (e) {
     if (e instanceof SetPlanShapeError) throw refuse(400, 'invalid_input', e.message, { field: 'card.sets', index: e.index });
@@ -65,17 +66,17 @@ export function writeSetPlan({ requestId, parentCode, parentName, sets, actor },
   if (!plans.length) throw refuse(400, 'invalid_input', '作るセットを 1 つ以上入れてください', { field: 'card.sets' });
   const hash = setPlanHash(plans);
   return db.transaction(() => {
-    const prev = db.prepare('SELECT plan_hash, state FROM ph_cdb_set_plans WHERE request_id = ?').get(rid);
+    const prev = db.prepare('SELECT plan_hash, request_hash, state FROM ph_cdb_set_plans WHERE request_id = ?').get(rid);
     if (prev) {
-      if (prev.plan_hash !== hash) throw refuse(409, 'request_id_reused', '同じ保存の番号 (request_id) で違う作るセットが来ました。画面を開き直してください');
+      if (prev.plan_hash !== hash || prev.request_hash !== requestHash) throw refuse(409, 'request_id_reused', '同じ保存の番号 (request_id) で違う作るセットが来ました。画面を開き直してください');
       return { ok: true, replayed: true };
     }
     plans.forEach((sp, i) => {
       const held = setCodeHeld(sp.code, { requestId: rid, db });
       if (held) throw refuse(409, 'set_code_taken', `作るセットの ${i + 1} 行目: ${held.message}。何も保存していません`, { field: 'card.sets', index: i });
     });
-    db.prepare(`INSERT INTO ph_cdb_set_plans (request_id, schema, parent_code, parent_name, plan_hash, state, created_by) VALUES (?, ?, ?, ?, ?, 'waiting', ?)`)
-      .run(rid, SET_PLAN_SCHEMA, String(parentCode), String(parentName ?? ''), hash, String(actor || ACTOR));
+    db.prepare(`INSERT INTO ph_cdb_set_plans (request_id, schema, parent_code, parent_name, plan_hash, request_hash, state, created_by) VALUES (?, ?, ?, ?, ?, ?, 'waiting', ?)`)
+      .run(rid, SET_PLAN_SCHEMA, String(parentCode), String(parentName ?? ''), hash, String(requestHash), String(actor || ACTOR));
     const ins = db.prepare('INSERT INTO ph_cdb_set_plan_items (request_id, sort, qty, code, code_key, name) VALUES (?, ?, ?, ?, ?, ?)');
     plans.forEach((sp, i) => ins.run(rid, i, sp.qty, sp.code, sp.code.toLowerCase(), sp.name));
     return { ok: true, replayed: false };
@@ -107,14 +108,26 @@ export function readSetPlan(requestId, { db = getDB() } = {}) {
 /**
  * ④ カードの取り込み (cdb-card-intake.js の SQLite の取引の中) で、その登録の作るセットの下書きを作る。
  *   作るセットが無い = null (今までどおり)。もう作った (applied) = 前の答え (何度届いても 1 回だけ)。
+ *   🚨 結ぶのは 登録の要求のハッシュ (保存の記録 = 通った登録の中身) と単品のコードが同じときだけ (Codex R1 High 2)。
+ *      違う = 同じ request_id で断られた押し直しの作るセット = 付けない (null = 作るセットなし)
  *   行ごと: 同じコードのカードがもうある = 作らない (skipped・記録)・作った = set_draft_id。全部の行が済んだら applied
  * @returns {null | { created: [{ code, draft_id }], skipped: [{ code, why }], replayed: boolean }}
  */
-export function applySetPlanInTx(db, { requestId, parentDraftId, skuId, actor = ACTOR }) {
+/** その知らせの登録の作るセット (登録の要求のハッシュ・単品のコードが同じときだけ) */
+function acceptedPlan(db, { requestId, requestHash, parentCode }) {
   const rid = String(requestId ?? '').trim().toLowerCase();
   if (!UUID_RE.test(rid)) return null;
   const p = db.prepare('SELECT * FROM ph_cdb_set_plans WHERE request_id = ?').get(rid);
   if (!p) return null;
+  if (!requestHash || p.request_hash !== requestHash) return null;
+  if (parentCode != null && String(p.parent_code).trim().toLowerCase() !== String(parentCode).trim().toLowerCase()) return null;
+  return p;
+}
+
+export function applySetPlanInTx(db, { requestId, requestHash, parentCode = null, parentDraftId, skuId, actor = ACTOR }) {
+  const p = acceptedPlan(db, { requestId, requestHash, parentCode });
+  if (!p) return null;
+  const rid = p.request_id;
   const items = db.prepare('SELECT * FROM ph_cdb_set_plan_items WHERE request_id = ? ORDER BY sort').all(rid);
   const view = () => {
     const now = db.prepare('SELECT * FROM ph_cdb_set_plan_items WHERE request_id = ? ORDER BY sort').all(rid);
@@ -143,10 +156,10 @@ export function applySetPlanInTx(db, { requestId, parentDraftId, skuId, actor = 
  * 作るセットを作らずに閉じる (人が既存のカードに結んだら、そのカードにもうセットの判断があった = カードの判断が正)。
  *   まだの行を全部 skipped (理由つき) にして applied にする (決めたコードを押さえ続けない)。作るセットが無い・もう済んだ = null
  */
-export function skipSetPlanInTx(db, { requestId, parentDraftId, skuId = null, why }) {
-  const rid = String(requestId ?? '').trim().toLowerCase();
-  const p = UUID_RE.test(rid) ? db.prepare('SELECT state FROM ph_cdb_set_plans WHERE request_id = ?').get(rid) : null;
+export function skipSetPlanInTx(db, { requestId, requestHash, parentCode = null, parentDraftId, skuId = null, why }) {
+  const p = acceptedPlan(db, { requestId, requestHash, parentCode });
   if (!p || p.state === 'applied') return null;
+  const rid = p.request_id;
   const todo = db.prepare('SELECT sort, code FROM ph_cdb_set_plan_items WHERE request_id = ? AND outcome IS NULL ORDER BY sort').all(rid);
   db.prepare(`UPDATE ph_cdb_set_plan_items SET outcome = 'skipped', outcome_note = ? WHERE request_id = ? AND outcome IS NULL`).run(String(why).slice(0, 500), rid);
   db.prepare(`UPDATE ph_cdb_set_plans SET state = 'applied', applied_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parent_draft_id = ?,

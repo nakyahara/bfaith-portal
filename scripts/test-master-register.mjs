@@ -2787,6 +2787,9 @@ const RL = await import('../apps/product-hub/services/rakuten-listing.js');
 const spBody = (code, sets, over = {}) => ({ request_id: uuid(), kind: 'single', code, values: withReq('single', single({ name: `ネームタグ 【100枚】 ${code}`, standard_price: '1200' })),
   card: { create: true, set_decision: { decision: 'create' }, sets }, ...over });
 const setsOf = (parentId) => ph.prepare('SELECT * FROM product_drafts WHERE parent_draft_id = ? ORDER BY id').all(parentId);
+/** その SKU のカードの知らせ (知らせの request_id と、登録の要求のハッシュ = 取り込みに渡すもの) */
+const evOf = (sid) => one(`select o.event_id::text as event_id, o.sku_id::text as sku_id, o.payload, o.request_id::text as request_id, r.result ->> 'request_payload_hash' as request_hash
+    from ops.product_hub_outbox o left join ops.master_edit_requests r on r.request_id = o.request_id where o.sku_id = $1`, [sid]);
 
 await ta('[SP1] 決まり (lib/set-plan.mjs): 初めのコード = 単品-個数・名前 = 単品の名前 + 半角の空白 + N個セット・個数 2〜99・同じ個数 / コード (大文字小文字) / 単品と同じ / set- / 長さ / 知らない欄 / 11 行 = 断る', async () => {
   assert.equal(SP.defaultSetCode('u60e-05', 2), 'u60e-05-2');
@@ -2824,6 +2827,7 @@ await ta('[SP2] 登録の形 (parseCard): 作るセットは 単品・カード�
 
 await ta('[SP3] 登録の API: 作るセット 2 つ = カードと一緒にセットの下書き 2 枚 (本コードの予定・仮 provisional = 1・構成 = 単品 × 個数・売価 = 単品 × 個数・判断「作成」)・Company DB にセットは作らない・知らせの形は前と同じ・押し直し / 届け直しでも 2 枚', async () => {
   const body = spBody('sp-tag100', [{ qty: 2, code: 'sp-tag100-2', name: 'ネームタグ 【100枚】 sp-tag100 2個セット' }, { qty: '3', code: 'SP-tag100-3', name: '3個セット (直した)' }]);
+  body.card.yahoo = { category_id: '12345', path: 'ネームタグ:100枚' };
   const r = await call('POST', '/apps/master-edit/api/new', { body });
   assert.equal(r.status, 200, r.text);
   assert.equal(r.j.card.status, 'done');
@@ -2833,6 +2837,8 @@ await ta('[SP3] 登録の API: 作るセット 2 つ = カードと一緒にセ�
   assert.deepEqual(sets.map((d) => [d.ne_code, d.name, d.provisional_code, d.ne_registration_state, d.price]),
     [['sp-tag100-2', 'ネームタグ 【100枚】 sp-tag100 2個セット', 1, 'not_requested', 2400], ['SP-tag100-3', '3個セット (直した)', 1, 'not_requested', 3600]]);
   assert.deepEqual(ph.prepare('SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ?').all(sets[0].id), [{ member_ne_code: 'sp-tag100', qty: 2 }]);
+  // 単品のカードの Yahoo! の欄を書いた後に作る = 「セット商品を作る」と同じく写る (Codex R1 Medium 2)
+  assert.deepEqual(ph.prepare('SELECT yahoo_category_id, yahoo_path FROM draft_yahoo WHERE draft_id = ?').get(sets[0].id), { yahoo_category_id: 12345, yahoo_path: 'ネームタグ:100枚' });
   assert.deepEqual(ph.prepare('SELECT decision, linked_set_draft_id FROM draft_set_decisions WHERE draft_id = ? ORDER BY id').all(parent.id).map((x) => [x.decision, x.linked_set_draft_id]),
     [['create', sets[0].id], ['create', sets[1].id]]);   // 「保留 (作る予定)」は入れない
   const plan = SPS.readSetPlan(body.request_id);
@@ -2847,10 +2853,10 @@ await ta('[SP3] 登録の API: 作るセット 2 つ = カードと一緒にセ�
   assert.deepEqual([again.status, again.j.replayed], [200, true], again.text);
   assert.equal(setsOf(parent.id).length, 2);
   // 届け直し (同じ知らせ・別の知らせの番号) = 増えない
-  const ev = await one('select event_id::text as event_id, sku_id::text as sku_id, payload, request_id::text as request_id from ops.product_hub_outbox where sku_id = $1', [r.j.sku_id]);
-  assert.equal(PH.applyCdbCardEvent({ event_id: ev.event_id, sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id }).replayed, true);
-  assert.equal(PH.applyCdbCardEvent({ event_id: uuid(), sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id }).outcome, 'linked');
-  assert.equal(SPS.applySetPlanInTx(ph, { requestId: ev.request_id, parentDraftId: parent.id, skuId: ev.sku_id }).replayed, true);
+  const ev = await evOf(r.j.sku_id);
+  assert.equal(PH.applyCdbCardEvent({ event_id: ev.event_id, sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id, request_hash: ev.request_hash }).replayed, true);
+  assert.equal(PH.applyCdbCardEvent({ event_id: uuid(), sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id, request_hash: ev.request_hash }).outcome, 'linked');
+  assert.equal(SPS.applySetPlanInTx(ph, { requestId: ev.request_id, requestHash: ev.request_hash, parentCode: 'sp-tag100', parentDraftId: parent.id, skuId: ev.sku_id }).replayed, true);
   assert.equal(setsOf(parent.id).length, 2);
   assert.equal(ph.prepare("SELECT COUNT(*) AS c FROM product_drafts WHERE LOWER(TRIM(ne_code)) IN ('sp-tag100-2', 'sp-tag100-3')").get().c, 2);
   // 🚨 NE 登録の前はモールに出さない: 楽天の出品の門が止める (NE の商品マスタに無い)・Notion に書かない・モールの完了も止める
@@ -2880,7 +2886,7 @@ await ta('[SP4] 作るセットのコードの重なり = 登録しない (何�
   r = await call('POST', '/apps/master-edit/api/new', { body: spBody('sp-dup3', [{ qty: 2, code: 'sp-dup3-2', name: 'a' }, { qty: 3, code: 'SP-DUP3-2', name: 'b' }]) });
   assert.deepEqual([r.status, r.j.field, r.j.index], [400, 'card.sets', 1], r.text);
   // ほかの登録が決めたばかりの作るセット (waiting) = 押さえる
-  SPS.writeSetPlan({ requestId: uuid(), parentCode: 'sp-other', parentName: 'x', sets: [{ qty: 2, code: 'sp-held-2', name: 'x' }], actor: 'x@test' });
+  SPS.writeSetPlan({ requestId: uuid(), requestHash: 'e'.repeat(64), parentCode: 'sp-other', parentName: 'x', sets: [{ qty: 2, code: 'sp-held-2', name: 'x' }], actor: 'x@test' });
   r = await call('POST', '/apps/master-edit/api/new', { body: spBody('sp-dup4', [{ qty: 2, code: 'sp-held-2', name: 'a' }]) });
   assert.deepEqual([r.status, r.j.reason], [409, 'set_code_taken'], r.text);
   // その場の確かめ
@@ -2935,8 +2941,8 @@ await ta('[SP6] 衝突を解く (既存のカードに結ぶ): 判断の無い�
     const r = await call('POST', '/apps/master-edit/api/new', { body });
     assert.equal(r.status, 200, r.text);
     assert.equal(r.j.card.status, 'conflict');
-    const ev = await one('select event_id::text as event_id, sku_id::text as sku_id, payload, request_id::text as request_id from ops.product_hub_outbox where sku_id = $1', [r.j.sku_id]);
-    const out = PH.linkCdbCardToExisting({ event_id: ev.event_id, sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id }, { draftId: oldId, actor: 'naka@test' });
+    const ev = await evOf(r.j.sku_id);
+    const out = PH.linkCdbCardToExisting({ event_id: ev.event_id, sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id, request_hash: ev.request_hash }, { draftId: oldId, actor: 'naka@test' });
     assert.equal(out.outcome, 'linked');
     const plan = SPS.readSetPlan(body.request_id);
     if (!decided) {
@@ -2966,6 +2972,42 @@ await ta('[SP7] 新商品の画面: 「作るセット」の表 (はじめは隠
   assert.match(js, /function spDefName\(q\) \{ return \(val\('f-name'\) \+ ' ' \+ q \+ '個セット'\)\.trim\(\); \}/);
   const setPage = await call('GET', '/apps/master-edit/new?kind=set');
   assert.ok(!setPage.text.includes('id="row-set-plans"'), 'セットの画面に作るセットは出さない');
+});
+
+await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った登録のカードに付けない (要求のハッシュで結ぶ)・知らせの request_id を読めない = 取り込まない (failed・後で作るセットも付く)・作るセットに決めたコードはふつうの登録にもさせない', async () => {
+  // ① 作るセットなしで登録 (カードは作れなかった) → 同じ request_id で作るセットつきを送る = 409 (作るセットは dropped) → カードを作り直す = 「作る予定」だけ・セットは作らない
+  applierMode = 'boom';
+  const body = spBody('sp-reuse', undefined);
+  delete body.card.sets;
+  let r = await call('POST', '/apps/master-edit/api/new', { body });
+  assert.deepEqual([r.status, r.j.card.status], [200, 'failed'], r.text);
+  const bad = await call('POST', '/apps/master-edit/api/new', { body: { ...body, card: { ...body.card, sets: [{ qty: 2, code: 'sp-reuse-2', name: 'x' }] } } });
+  assert.deepEqual([bad.status, bad.j.reason], [409, 'request_id_reused'], bad.text);
+  assert.equal(SPS.readSetPlan(body.request_id).state, 'dropped');
+  applierMode = 'real';
+  const retry = await call('POST', '/apps/master-edit/api/sku/sp-reuse/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'done'], retry.text);
+  const d = draftOf('sp-reuse');
+  assert.equal(setsOf(d.id).length, 0, '断られた作るセットを付けない');
+  assert.deepEqual(ph.prepare('SELECT decision, reason_text FROM draft_set_decisions WHERE draft_id = ?').all(d.id), [{ decision: 'hold', reason_text: '作る予定 (新商品の登録で「作る」)' }]);
+  // ② 知らせの request_id を読めない = 取り込まない (failed)。読めるようになったら作るセットも付く
+  applierMode = 'boom';
+  const b2 = spBody('sp-ridfail', [{ qty: 2, code: 'sp-ridfail-2', name: 'x 2個セット' }]);
+  r = await call('POST', '/apps/master-edit/api/new', { body: b2 });
+  assert.equal(r.status, 200, r.text);
+  applierMode = 'real';
+  const broken = { query: (t, p) => (/master_edit_requests/.test(t) ? Promise.reject(new Error('読めない')) : db.query(t, p)) };
+  const out = await asEditor(() => O.runCardOutbox(broken, (ev) => PH.applyCdbCardEvent(ev), { skuId: r.j.sku_id, manual: true, limit: 1 }));
+  assert.equal(out[0].status, 'failed'); assert.match(out[0].error, /request_id_unreadable/);
+  assert.equal(draftOf('sp-ridfail'), undefined, 'カードも作らない (作るセットを落とさない)');
+  const out2 = await asEditor(() => O.runCardOutbox(db, (ev) => PH.applyCdbCardEvent(ev), { skuId: r.j.sku_id, manual: true, limit: 1 }));
+  assert.equal(out2[0].status, 'done', JSON.stringify(out2));
+  assert.deepEqual(setsOf(draftOf('sp-ridfail').id).map((x) => x.ne_code), ['sp-ridfail-2']);
+  // ③ ほかの登録が作るセットに決めたコード (登録の途中 = waiting・カードの取り込み待ち = registered) は、ふつうの単品のコードにもさせない
+  SPS.writeSetPlan({ requestId: uuid(), requestHash: 'f'.repeat(64), parentCode: 'sp-resv', parentName: 'x', sets: [{ qty: 2, code: 'sp-resv-2', name: 'x' }], actor: 'x@test' });
+  const plain = await call('POST', '/apps/master-edit/api/new', { body: { request_id: uuid(), kind: 'single', code: 'SP-RESV-2', values: withReq('single', single()), card: { create: false } } });
+  assert.deepEqual([plain.status, plain.j.reason, plain.j.field], [409, 'set_code_reserved', 'code'], plain.text);
+  assert.equal(await skuId('SP-RESV-2'), undefined);
 });
 
 server.close();

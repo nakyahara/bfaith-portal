@@ -90,7 +90,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS } from '../../lib/master-write.mjs';
-import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS, parseCard } from '../../lib/master-register.mjs';
+import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS, parseRegisterRequest, registerPayloadHashOf } from '../../lib/master-register.mjs';
 import { MAX_SET_PLANS, SET_QTY_MIN, SET_QTY_MAX, SET_NAME_MAX, SET_PLAN_ALERT_DAYS, setCodeShapeProblem } from '../../lib/set-plan.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
 import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf } from '../../lib/master-register-blanks.mjs';
@@ -1091,12 +1091,21 @@ router.post('/api/new', (req, res) => {
     //   Company DB の知らせには入れない (0061 の登録の関数が知らない欄を断る)。カードの取り込みが同じ request_id で引いて下書きを作る (cdb-set-plan.js)
     const actor = String(req.session.email).trim().toLowerCase();
     const rid = String(b.request_id ?? '').trim().toLowerCase();
-    let planCard = null;
-    try { planCard = parseCard(b.card, String(b.kind ?? ''), typeof b.code === 'string' ? b.code : ''); } catch (e) { if (!(e instanceof MasterWriteError)) throw e; /* 形の誤りは登録の lib が同じ文で断る */ }
-    const hasPlan = !!(planCard && planCard.sets && planCard.sets.length);
+    //   作るセットは登録の要求のハッシュ (lib と同じ = 保存の記録の request_payload_hash) で結ぶ = 取り込みは通った登録の作るセットだけを付ける (Codex R1 High 2)
+    let parsed = null;
+    try {
+      parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode });
+    } catch (e) { if (!(e instanceof MasterWriteError)) throw e; /* 形の誤りは登録の lib が同じ文で断る */ }
+    const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
+    // ほかの登録が作るセットに決めたコード (カードの取り込み待ち) は、ふつうの商品コードにもさせない (Codex R1 Medium 1)。押し直しは前の答え (確かめない)
+    if (parsed && !po.replay) {
+      let held = null;
+      try { held = (await setPlans()).held(parsed.code, { requestId: rid }); } catch (e) { console.error(`[master-edit] 作るセットの予約を読めない: ${e && e.message}`); }
+      if (held && held.reason === 'ph_set_plan') return res.status(409).json({ ok: false, reason: 'set_code_reserved', field: 'code', error: `${held.message}。別のコードにしてください。何も保存していません` });
+    }
     if (hasPlan) {
       try {
-        (await setPlans()).write({ requestId: rid, parentCode: b.code, parentName: b.values && typeof b.values.name === 'string' ? b.values.name.trim() : '', sets: planCard.sets, actor });
+        (await setPlans()).write({ requestId: rid, requestHash: registerPayloadHashOf(parsed), parentCode: parsed.code, parentName: parsed.values.name || '', sets: parsed.card.sets, actor });
       } catch (e) {
         if (e && e.status) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, field: e.field || 'card.sets', ...(e.index == null ? {} : { index: e.index }) });
         console.error(`[master-edit] 作るセットを product-hub に残せない: ${e && e.stack || e}`);

@@ -71,7 +71,9 @@ function checkPayload(event) {
   if (!/^[0-9a-f-]{36}$/.test(eventId)) throw fail(`event_id が不正: ${event.event_id}`);
   // 🆕 2026-10-17: 登録の request_id (知らせの行の request_id = 作るセットの表 ph_cdb_set_plans の鍵)。無い (前の呼び手) = 作るセットは見ない
   const requestId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(event.request_id ?? '').toLowerCase()) ? String(event.request_id).toLowerCase() : null;
-  return { p, skuId, code, codeKey, name, eventId, requestId };
+  // 登録の要求のハッシュ (保存の記録の result.request_payload_hash)。作るセットはこれが同じときだけ付ける (断られた押し直しの作るセットを付けない)
+  const requestHash = /^[0-9a-f]{64}$/.test(String(event.request_hash ?? '')) ? String(event.request_hash) : null;
+  return { p, skuId, code, codeKey, name, eventId, requestId, requestHash };
 }
 
 /**
@@ -81,7 +83,7 @@ function checkPayload(event) {
  *   作っていないのに「セットを作成」を記録すると⑤が閉じる = product-hub の set-decision API と同じく create は記録しない)
  * @returns 作るセットの答え (applySetPlanInTx・無い = null)
  */
-function writeSetDecisionInTx(db, draftId, p, { requestId, skuId }) {
+function writeSetDecisionInTx(db, draftId, p, { requestId, requestHash, skuId }) {
   const sd = p.set_decision;
   if (!sd || p.kind !== 'single') return null;
   const by = p.created_by || ACTOR;
@@ -91,7 +93,7 @@ function writeSetDecisionInTx(db, draftId, p, { requestId, skuId }) {
     return null;
   }
   if (sd.decision !== 'hold' && sd.decision !== 'create') return null;
-  const plan = sd.decision === 'create' && requestId ? applySetPlanInTx(db, { requestId, parentDraftId: draftId, skuId, actor: by }) : null;
+  const plan = sd.decision === 'create' && requestId ? applySetPlanInTx(db, { requestId, requestHash, parentCode: p.code, parentDraftId: draftId, skuId, actor: by }) : null;
   if (plan && plan.created.length) return plan;
   const skippedNote = plan && plan.skipped.length ? ` (決めたセット ${plan.skipped.map((x) => x.code).join('・')} は作れませんでした)` : '';
   const text = sd.decision === 'create' ? `作る予定 (新商品の登録で「作る」)${skippedNote}${sd.reason_text ? `: ${sd.reason_text}` : ''}` : (sd.reason_text || null);
@@ -105,7 +107,7 @@ function writeSetDecisionInTx(db, draftId, p, { requestId, skuId }) {
  * 失敗 (SQLite の誤り・不正な payload) は throw = Postgres 側で failed (後でもう一度)
  */
 export function applyCdbCardEvent(event, { db = getDB() } = {}) {
-  const { p, skuId, code, codeKey, name, eventId, requestId } = checkPayload(event);
+  const { p, skuId, code, codeKey, name, eventId, requestId, requestHash } = checkPayload(event);
   return db.transaction(() => {
     // 同じ商品コードのカードを最初に全部数える (一意の index が無い DB でも 2 枚以上を 1 枚と見ない。前の答えを使い回す前にも見る)。鍵 = 小文字 (大文字小文字だけ違うカードも同じコード)
     const ids = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(codeKey).map((x) => x.id);
@@ -158,8 +160,6 @@ export function applyCdbCardEvent(event, { db = getDB() } = {}) {
     const draftId = Number(info.lastInsertRowid);
     const refs = Array.isArray(p.reference_urls) ? p.reference_urls.filter((u) => typeof u === 'string' && /^https?:\/\/\S+$/i.test(u)) : [];
     refs.forEach((u, i) => db.prepare('INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, ?, ?)').run(draftId, u, i));
-    // セット商品を作るか (🆕 作る + 作るセット = セットの下書きも同じ取引で作る = 知らせが何度届いても 1 回だけ)
-    const plan = writeSetDecisionInTx(db, draftId, p, { requestId, skuId });
     // セットの構成品 (仮レビュー L3)。Company DB の構成の依頼と同じ並び・数量。product-hub のセットの派生 (parent_draft_id) にはしない = 工程は単品と同じ
     if (p.kind === 'set') writeSetMembers(db, draftId, p.components);
     // 楽天の配送方法 (対応があるときだけ)
@@ -177,6 +177,9 @@ export function applyCdbCardEvent(event, { db = getDB() } = {}) {
         yahoo_path: y.path ?? null,
       });
     }
+    // セット商品を作るか (🆕 作る + 作るセット = セットの下書きも同じ取引で作る = 知らせが何度届いても 1 回だけ)。
+    //   単品のカードの欄 (楽天の配送方法・Yahoo!) を書いた後 = セットは「セット商品を作る」と同じく親のカテゴリ・path などを写す (Codex R1 Medium 2)
+    const plan = writeSetDecisionInTx(db, draftId, p, { requestId, requestHash, skuId });
     record('created', draftId, null, ship);
     logEvent(db, draftId, 'created_from_cdb', `Company DB の新商品の登録 (SKU ${skuId}・${p.kind === 'set' ? 'セット' : '単品'})`, p.created_by || ACTOR);
     if (ship.status === 'unmapped') {
@@ -206,8 +209,9 @@ function writeSetMembers(db, draftId, components) {
  * 結ぶときにカードの空の欄を画面 D の値で埋める (仮レビュー L2)。入っている欄は変えない = not_applied に (欄・カードの値・画面 D の値) を返す。
  * 戻り値 { applied: [欄の名前], not_applied: [{ field, label, card, entered }] }
  */
-function fillEmptyCardFields(db, id, p, { requestId = null, skuId = null } = {}) {
+function fillEmptyCardFields(db, id, p, { requestId = null, requestHash = null, skuId = null } = {}) {
   const applied = []; const notApplied = [];
+  let planLater = false;
   const d = db.prepare('SELECT price, official_url, asin, amazon_url FROM product_drafts WHERE id = ?').get(id);
   const empty = (v) => v == null || String(v).trim() === '';
   const one = (field, label, cardVal, entered, write) => {
@@ -232,12 +236,11 @@ function fillEmptyCardFields(db, id, p, { requestId = null, skuId = null } = {})
     if (has) {
       notApplied.push({ field: 'set_decision', label: 'セット商品を作るか', card: '判断あり', entered: sd.decision });
       // 🆕 作るセットも作らない (カードの判断が正)。決めたコードを押さえ続けないよう「作っていない」と残す
-      const sk = requestId ? skipSetPlanInTx(db, { requestId, parentDraftId: id, skuId, why: '結んだカードにセットの判断がもうあったので作っていません' }) : null;
+      const sk = requestId ? skipSetPlanInTx(db, { requestId, requestHash, parentCode: p.code, parentDraftId: id, skuId, why: '結んだカードにセットの判断がもうあったので作っていません' }) : null;
       if (sk && sk.skipped.length) notApplied.push({ field: 'set_plans', label: '作るセット', card: '判断あり', entered: sk.skipped.map((x) => x.code).join(', ') });
     } else {
-      const plan = writeSetDecisionInTx(db, id, p, { requestId, skuId });
+      planLater = true;   // 作るセットは Yahoo! などの欄を埋めた後 (下)
       applied.push('セット商品を作るか');
-      if (plan && plan.created.length) applied.push(`セットの下書き ${plan.created.length} 件`);
     }
   }
   if (p.kind === 'set') {
@@ -262,6 +265,10 @@ function fillEmptyCardFields(db, id, p, { requestId = null, skuId = null } = {})
     if (patch.delivery_label) patch.shipping_override = patch.delivery_label !== (ship.label ?? null) ? 1 : 0;
     if (Object.keys(patch).length) upsertDraftYahoo(db, id, patch);
   }
+  if (planLater) {
+    const plan = writeSetDecisionInTx(db, id, p, { requestId, requestHash, skuId });
+    if (plan && plan.created.length) applied.push(`セットの下書き ${plan.created.length} 件`);
+  }
   return { applied, not_applied: notApplied };
 }
 
@@ -273,7 +280,7 @@ function fillEmptyCardFields(db, id, p, { requestId = null, skuId = null } = {})
  * 戻り値 { outcome: 'linked', draft_id, already, applied: [欄], not_applied: [{ field, label, card, entered }] }
  */
 export function linkCdbCardToExisting(event, { draftId, actor = ACTOR, db = getDB() } = {}) {
-  const { skuId, code, codeKey, eventId, requestId } = checkPayload(event);
+  const { skuId, code, codeKey, eventId, requestId, requestHash } = checkPayload(event);
   const id = Number(draftId);
   if (!Number.isSafeInteger(id) || id <= 0) throw fail(`結ぶカードの番号が不正: ${draftId}`);
   return db.transaction(() => {
@@ -302,7 +309,7 @@ export function linkCdbCardToExisting(event, { draftId, actor = ACTOR, db = getD
       if (u.changes !== 1) throw fail(`カード #${id} をちょうどほかの処理が変えました`);
       logEvent(db, id, 'cdb_card_linked', `Company DB の新商品 ${code} (SKU ${skuId}) に結んだ (人が決めた)`, actor);
     }
-    const fill = already ? { applied: [], not_applied: [] } : fillEmptyCardFields(db, id, event.payload || {}, { requestId, skuId });
+    const fill = already ? { applied: [], not_applied: [] } : fillEmptyCardFields(db, id, event.payload || {}, { requestId, requestHash, skuId });
     if (fill.applied.length || fill.not_applied.length) {
       logEvent(db, id, 'cdb_card_link_fields', `埋めた: ${fill.applied.join('・') || 'なし'} / 入っていたので変えなかった: ${fill.not_applied.map((x) => x.label).join('・') || 'なし'}`, actor);
     }

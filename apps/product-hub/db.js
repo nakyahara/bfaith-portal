@@ -1867,7 +1867,8 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_ph_cdb_card_events_draft ON ph_cdb_card_events(draft_id);
   `);
   // 🆕 新商品の登録 (単品) で「セット商品を作るか = 作る」のときに決めた、作るセット (2026-10-17 中原さん・services/cdb-set-plan.js)。
-  //   登録の request_id (= Company DB の ops.product_hub_outbox.request_id) で 1 つ。登録の前に書き (書けなければ登録しない)、
+  //   登録の request_id (= Company DB の ops.product_hub_outbox.request_id) で 1 つ。request_hash = 登録の要求のハッシュ (保存の記録と同じ = 通った登録の作るセットだけ付ける)。
+  //   登録の前に書き (書けなければ登録しない)、
   //   カードの取り込みが同じ request_id の知らせでセットの下書き (provisional_code = 1 = NE で確かめるまで出品しない) を作る = 何度届いても 1 回だけ。
   //   state: waiting (登録の前に書いた) → registered (登録できた・SKU の番号) → applied (下書きを作った) / dropped (登録が断られた = 下書きは作らない)
   //   items = 1 行 1 セット (個数・コード・名前・作った下書き)。あとで Company DB のセットの登録 (設計 24) が開いたら、この行がセットの SKU の元になる
@@ -1878,6 +1879,7 @@ export function initProductHubDB() {
       parent_code     TEXT NOT NULL,
       parent_name     TEXT NOT NULL,
       plan_hash       TEXT NOT NULL,
+      request_hash    TEXT NOT NULL,
       state           TEXT NOT NULL CHECK (state IN ('waiting', 'registered', 'dropped', 'applied')),
       cdb_sku_id      INTEGER,
       parent_draft_id INTEGER,
