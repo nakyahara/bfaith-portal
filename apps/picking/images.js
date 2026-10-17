@@ -382,6 +382,31 @@ async function resolveAndCache(db, need, deps, stats) {
     if (cands.length > 0) probeBySku.set(sku, cands);
   }
 
+  // 楽天に投げるコードの予算 (deps.maxCodes。マスタの一覧など急がないジョブ用・2026-10-17)。
+  // probe の候補展開で 1 SKU が最大5コードに膨らみ、50 SKU でも bulk を何回も呼んで共有の直列キュー
+  // (ピッキング取込の画像) を長く塞ぐため、予算に収まる SKU だけ解決する (Codex 2026-10-17 Medium)。
+  // 予算から外した SKU は台帳に何も書かない = 「まだ取っていない」のまま次の回に回る (not_found / error にしない)
+  if (deps.maxCodes > 0) {
+    const budgeted = new Set();
+    const kept = [];
+    for (const sku of need) {
+      const add = [...new Set([mnBySku.get(sku), ...(probeBySku.get(sku) || [])].filter(Boolean))].filter((c) => !budgeted.has(c));
+      if (kept.length > 0 && budgeted.size + add.length > deps.maxCodes) continue;
+      for (const c of add) budgeted.add(c);
+      kept.push(sku);
+    }
+    if (kept.length < need.length) {
+      const keep = new Set(kept);
+      for (const sku of need) {
+        if (keep.has(sku)) continue;
+        mnBySku.delete(sku); probeBySku.delete(sku); codesBySku.delete(sku); fromCache.delete(sku);
+      }
+      stats.deferred = need.length - kept.length;
+      stats.fetched = kept.length;
+      need = kept;
+    }
+  }
+
   const manageNumbers = [...new Set([
     ...[...mnBySku.values()].filter(Boolean),
     ...[...probeBySku.values()].flat(),
@@ -555,7 +580,7 @@ export function queueEnsureImages(skus, label = '', deps = undefined) {
     .then((stats) => {
       if (deps?.onStats) { try { deps.onStats(stats); } catch { /* 呼び出し側の都合は無視 */ } }
       if (stats.fetched > 0) {
-        console.log(`[picking-images] ${label} 解決 ${stats.fetched}件: ok=${stats.ok} (うちバリエーション画像=${stats.variant || 0}) なし=${stats.notFound} 失敗=${stats.errors}`);
+        console.log(`[picking-images] ${label} 解決 ${stats.fetched}件: ok=${stats.ok} (うちバリエーション画像=${stats.variant || 0}) なし=${stats.notFound} 失敗=${stats.errors}${stats.deferred ? ` 次の回へ=${stats.deferred}` : ''}`);
       }
     })
     .catch((e) => {
@@ -579,13 +604,14 @@ export function queueEnsureImages(skus, label = '', deps = undefined) {
  * @param opts.lane     待ちジョブを 1 つに抑える列の名前
  * @param opts.notFoundRetryMs 「楽天に無い」を取り直すまでの間 (null = ensureImagesFor と同じ JST 翌日)。
  *                      マスタの一覧は楽天に出していない商品 (Amazon だけ・セット) が多く、毎日問い合わせ直すと無駄が多いので長くする
+ * @param opts.maxCodes 1 つのジョブで楽天に投げるコードの予算 (probe の候補を含む。0 = 決めない)。収まらない SKU は次の回へ
  * @param opts.deps     ensureImagesFor へ渡す差し替え (試験用)
  * @returns {Map<string, {url: string|null, state: 'ok'|'pending'|'not_found'|'error'|'uncached'}>}
  *   キー = norm(ne_code)。url は楽天の画像ドメインの https だけ (読むときにも確かめる)。
  *   state: ok = 画像あり / pending = キューに載っている (取得中) / not_found = 楽天に画像が無い /
  *          error = 取れなかった (時期が来たら取り直す) / uncached = まだ取っていない (今回は積めなかった)
  */
-export function imagesFor(skus, { queueMax = 50, canQueue = true, label = '', lane = null, notFoundRetryMs = null, deps = undefined, nowMs = Date.now() } = {}) {
+export function imagesFor(skus, { queueMax = 50, canQueue = true, label = '', lane = null, notFoundRetryMs = null, maxCodes = 0, deps = undefined, nowMs = Date.now() } = {}) {
   const keys = [...new Set((skus || []).map(norm).filter(Boolean))];
   const out = new Map();
   if (keys.length === 0) return out;
@@ -635,7 +661,10 @@ export function imagesFor(skus, { queueMax = 50, canQueue = true, label = '', la
     out.set(k, { url, state });
   }
   if (allow) for (const k of refresh) { if (toQueue.length >= queueMax) break; toQueue.push(k); }
-  if (toQueue.length > 0) queueEnsureImages(toQueue, label, lane ? { ...(deps || {}), lane } : deps);
+  if (toQueue.length > 0) {
+    const d = (lane || maxCodes > 0) ? { ...(deps || {}), ...(lane ? { lane } : {}), ...(maxCodes > 0 ? { maxCodes } : {}) } : deps;
+    queueEnsureImages(toQueue, label, d);
+  }
   return out;
 }
 

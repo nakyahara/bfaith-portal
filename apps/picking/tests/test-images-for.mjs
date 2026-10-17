@@ -152,6 +152,30 @@ await t('1 回に積むのは queueMax 件まで (画像の無い物が先)・�
   assert.deepEqual(calls[0].length, 4, '残りの 3 件 + 古い画像の 1 件 (空きがあるので取り直す)');
 });
 
+await t('maxCodes: 楽天に投げるコード (probe の候補を含む) を予算に収める・外した SKU は台帳に書かない (次の回へ)', async () => {
+  calls.length = 0;
+  // 変換表にも mirror にも無い = 候補を投げて確かめる。'mc-a-b-c' 型 = 候補 3 つ (mc-a-b-c / mc-a-b / mc-a は 4 字以上)
+  const codes = Array.from({ length: 6 }, (_, i) => `mc${i}x-aa-bb`);
+  const m = imagesFor(codes, { deps, lane: 'mc', maxCodes: 7 });
+  assert.equal(codes.filter((c) => m.get(c).state === 'pending').length, 6, '画面には全部「取得中」');
+  await drain();
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].length <= 7, `予算 7 に収める (${calls[0].length})`);
+  const written = codes.filter((c) => db.prepare('SELECT 1 FROM pk_product_images WHERE ne_code = ?').get(c));
+  assert.equal(written.length, 2, `3 候補 × 2 SKU = 6 ≦ 7 (${written})`);
+  // 外した SKU = まだ取っていない (次に開いたときに積む)
+  const m2 = imagesFor(codes, { deps, lane: 'mc', maxCodes: 7 });
+  assert.equal(codes.filter((c) => m2.get(c).state === 'pending').length, 4);
+  assert.equal(codes.filter((c) => m2.get(c).state === 'not_found').length, 2);
+  await drain();
+  // 予算より大きい 1 SKU でも止まらない (最初の 1 つは必ず解決する)
+  calls.length = 0;
+  imagesFor(['big0x-aa-bb'], { deps, lane: 'mc', maxCodes: 1 });
+  await drain();
+  assert.equal(calls.length, 1);
+  assert.ok(db.prepare('SELECT 1 FROM pk_product_images WHERE ne_code = ?').get('big0x-aa-bb'));
+});
+
 await t('空・null の並びでも壊れない', async () => {
   assert.equal(imagesFor([]).size, 0);
   assert.equal(imagesFor(null).size, 0);
