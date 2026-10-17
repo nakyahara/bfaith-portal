@@ -4,6 +4,7 @@
  *   反映待ちの台帳 (pending.mjs) は排他を取ってから読み、② が最後まで走った回だけ新しい版を書いて HEAD を進める
  *   ②b (compare-old-tables.mjs) = 持ち主が C で NE に欄が無い列 (税区分・売上分類・送料・推奨保有月数) の C ↔ 古い表。② の後に同じ取引で、別の try で流す (④a・Codex #1564 R1 H3)。
  *     今は持ち主が全部 load = 比べない (not_applied・要約に出さない)
+ *   🆕 0083 (設計 25 PR-1 = 影): ② が最後まで走った回は、NE のコードの書き方を書いた後に今朝の NE の値 (ops.record_ne_values) も書く (watch_writer・関数だけ・要約は変えない)
  *
  * 使い方 (miniPC):
  *   node apps/company-db/master-compare/run.mjs --daily [--data-dir D] [--as-of YYYY-MM-DD] [--json]
@@ -27,7 +28,7 @@ import { writeEvidence } from '../push/evidence.mjs';
 import { compareLoad, readCdbMaster, LOAD_CTX } from './compare-load.mjs';
 import { compareNe, NE_FORMAT, readRegistrations, regTroubleCounts } from './compare-ne.mjs';
 import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteFailed } from './pending.mjs';
-import { readDecisionLedger, writeDecisions, writeNeCodes, connectDecisionWriter, snapshotRegTargets, writeRegistrationObservations, sealRegistrationRun, runRegistrationCheck } from './decisions.mjs';
+import { readDecisionLedger, writeDecisions, writeNeCodes, writeNeValues, connectDecisionWriter, snapshotRegTargets, writeRegistrationObservations, sealRegistrationRun, runRegistrationCheck } from './decisions.mjs';
 import { readBaseline, writeBaseline, holdAllDirections } from './baseline.mjs';
 import { compareOldTables, oldTablesSummary, oldTablesBad, OLD_FORMAT } from './compare-old-tables.mjs';
 import { recordParentGate, parentGateUnrecorded, parentTrouble, parentNote, parentEnforced, fetchTimeRfc3339 } from './parent-gate.mjs';
@@ -289,7 +290,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     //   下の repeatable read の snapshot に入らない新商品は次の朝の照合が確かめる)
     // ② の台帳は排他を取ってから読む (取れなければ台帳を使う判定は blocked = pending_locked。C2 v6-3)
     const release = neCompare ? (() => { try { return acquireLock(pendingDir(dataDir, RESULT_DIR)); } catch { return null; } })() : null;
-    let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [], neCodes = null, regObs = null, regRead = null, parentObs = null;
+    let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [], neCodes = null, regObs = null, regRead = null, parentObs = null, neValues = null;
     // 新商品の NE 登録の CSV の確かめ待ち (0053) = 回の始まりに DB が回へ写す (読み取りの取引の前・#1571 Codex R2 Medium 1)。写せない = 送らない (② は続ける)
     if (neCompare) regRead = await snapshotRegTargets(writerDb || connectWriter ? writer : null, { compareRunId });
     try {
@@ -315,6 +316,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
             result.ne = r2.result; pendingEntries = r2.pendingEntries; decisionsDone = r2.decisionsDone || []; baselineWrites = r2.baselineWrites || []; neCodes = r2.neCodes || null;
             regObs = r2.regObs || null;
             parentObs = r2.parentObs || null;   // 🆕 0068: 代表 (親) の生の数えの元 (JSON には入れない)
+            neValues = r2.neValues || null;     // 🆕 0083: 今朝の NE の値 (JSON には件数だけ)
             if (pendingEntries) result.ne.pending_entries = pendingEntries;   // 台帳の保存に失敗した回の復旧の元 (restore-pending.mjs)
           } catch (e) {
             result.ne = { format: NE_FORMAT, verdict: 'error', error: String(e && e.message).slice(0, 300) };   // ① は残す
@@ -363,6 +365,17 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       else {
         try { nc.written = await writeNeCodes(await writer(), { compareRunId, entries: neCodes.entries }); nc.write = 'ok'; }
         catch (e) { Object.assign(nc, { write: 'failed', write_error: String(e && e.message).slice(0, 200) }); }
+      }
+    }
+    // 🆕 0083 (設計 25 §2.5・PR-1 = 影・画面なし): 今朝の NE の値。NE のコードの書き方をこの回で書けたときだけ (値と書き方を同じ回に結ぶ = 設計 25 R2 H3)。
+    //   関数が無い (0083 の前)・実行権が無い (ロールの流し直しの前)・断られた・落ちた = 書かない (状態だけ残す・照合は失敗にしない・要約も変えない)
+    if (result.ne && result.ne.ne_values) {
+      const nv = result.ne.ne_values;
+      if (nv.state !== 'built' || !neValues || !neValues.ok) nv.write = `skipped_${nv.reason || nv.state}`;
+      else if (!result.ne.ne_codes || result.ne.ne_codes.write !== 'ok') nv.write = `skipped_codes_${result.ne.ne_codes ? result.ne.ne_codes.write ?? 'none' : 'none'}`;
+      else {
+        try { Object.assign(nv, await writeNeValues(await writer(), { compareRunId, payload: neValues.payload })); }
+        catch (e) { Object.assign(nv, { write: 'failed', write_error: String(e && e.message).slice(0, 200) }); }
       }
     }
     // 新商品の NE 登録の CSV の確かめ (0053・契約 v3 H5・#1571 Codex R1 High 2) の 1 段目 = NE の観測を DB に残すだけ (状態は変えない)。
@@ -416,6 +429,9 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       ne: result.ne ? { verdict: result.ne.verdict, blocked_reason: result.ne.blocked_reason ?? null, error: result.ne.error ?? null, counts: result.ne.counts ?? null,
         decisions_read: result.ne.decisions_read ?? null, decisions_write: result.ne.decisions_write ?? null,
         ne_codes: result.ne.ne_codes ? { state: result.ne.ne_codes.state, reason: result.ne.ne_codes.reason ?? null, counts: result.ne.ne_codes.counts ?? null, write: result.ne.ne_codes.write ?? null } : null,
+        // 🆕 0083 (設計 25 PR-1・影): 今朝の NE の値 (件数と書けたか。値そのものは DB だけ)
+        ne_values: result.ne.ne_values ? { state: result.ne.ne_values.state, reason: result.ne.ne_values.reason ?? null, counts: result.ne.ne_values.counts ?? null,
+          write: result.ne.ne_values.write ?? null, write_error: result.ne.ne_values.write_error ?? null, written_state: result.ne.ne_values.written?.state ?? null } : null,
         registrations: regEvidence(),
         // 新商品の確かめがこの後に走る回 = 確かめの前の完了の証跡には「確かめの後の数はまだ」の印 (fail-closed)。最後の書き直しが成功したときだけ ok / skipped に変わる
         //   (書き直しも failed の書き込みも落ちた = 印が残る = W13:ne は blocked。#1635 Codex R4)
