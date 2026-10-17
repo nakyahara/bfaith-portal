@@ -184,6 +184,7 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
   let finalSent = false;
   // 「押す」の後に押してよい間 (ポータルの press_window_ms・この PC の時計で数える)。過ぎたら実行ボタン・始める確認の OK を押さない (Codex R1 High)
   let pressUntil = null;
+  let pressUntilReal = null;   // ページの中の止めに置く絶対時刻 (この PC の Date.now)
   const pressGuard = (where) => {
     if (pressUntil == null) return 30000;
     // 押してよい間と 23:50 (ポータルが押させない時間の始まり) の早い方まで (Codex R3 Medium)
@@ -191,6 +192,7 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
     if (left <= 0) { const e = new Error(`${where}: 「押す」から押してよい間を過ぎた (押さない)`); e.pressStop = true; throw e; }
     return left;
   };
+  pressGuard.deadlineEpoch = () => pressUntilReal;
   const cap = captureConsole();
   // 途中で process が終わった (共通部品の process.exit など) = 終わりの知らせを残す (押したかどうかもそのまま・次の回が送る)
   const onExit = () => {
@@ -220,13 +222,19 @@ export async function runOnce({ client, logDir, workDir, localBusy, afterClaimCh
       csvPath, withExport: !!job.with_export, pressGuard,
       beforeExecute: async () => {
         const t0 = now();
+        const t0Real = Date.now();
         const x = await client.executing(job.job_id, token);   // 断られた・届かない = 例外 = 押さない
-        pressUntil = t0 + Math.max(10e3, Math.min(Number(x && x.press_window_ms) || 90e3, 120e3)) - 5e3;   // 送る前の時刻から数える (応答が遅れた分も使ったことにする)
+        // 押してよい間 = ポータル (Render の時計) が 23:50 の手前で短くした値。送る前の時刻から数える (応答が遅れた分も使ったことにする・Codex R4 Medium)
+        const win = Math.min(Number(x && x.press_window_ms) || 0, 120e3) - 5e3;
+        if (!(win > 0)) { const e = new Error('ポータルの「押してよい間」が無い・短すぎる (押さない)'); e.code = 'no_press_window'; throw e; }
+        pressUntil = t0 + win;
+        pressUntilReal = t0Real + win;
         body.executed = true;
         console.log('📨 ポータルに「押す」を知らせた → 実行ボタンを押します');
       },
       onImported: async (imp) => {
         pressUntil = null;   // ① の押すのは終わり (② は夜の止めだけで押す)
+        pressUntilReal = null;
         body.import_result = { status: 'ok', summary: imp.summary || null, counts: imp.counts || null };
         try { imported.record({ sha256: job.file_sha256, path: csvPath, importedAt: new Date(now() + 9 * 3600e3).toISOString().replace('T', ' ').slice(0, 16) + ' (JST)', via: 'portal', job_id: job.job_id }); } catch (e) { console.log(`⚠ 取込済みの記録を残せない (${e.message})`); }
         let portal = null;

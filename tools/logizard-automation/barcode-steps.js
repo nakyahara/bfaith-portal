@@ -89,7 +89,8 @@ export function makeWithRelogin({ page, loginOpts }) {
  * @param {boolean} [p.dry]  各画面の条件設定まで (実行ボタンは押さない)
  * @param {object} p.cfg  { importFiletypeLabel, exportTypeLabel, exportPattern, exportDays, minRows, exportOut }
  * @param {(stepName: string) => Promise<void>} [p.beforeExecute]  ① の実行ボタンを押す直前 (例外 = 押さない)
- * @param {(where: string) => number} [p.pressGuard]  ボタンを押す前に呼ぶ: 押してよい残りの ms (click の timeout の上限)・もう押さない = 例外 (pressStop)
+ * @param {(where: string) => number} [p.pressGuard]  ボタンを押す前に呼ぶ: 押してよい残りの ms (click の timeout の上限)・もう押さない = 例外 (pressStop)。
+ *   pressGuard.deadlineEpoch() があれば その絶対時刻 (Date.now) をページの中の止めにも置く (押した瞬間にブラウザが時刻を見る)
  * @returns {{ runImport, runExport, assertNoUnexpectedDialog, nightDialogSeen: () => boolean }}
  */
 export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = null, pressGuard = null }) {
@@ -140,10 +141,47 @@ export function createBarcodeSteps({ page, dry = false, cfg, beforeExecute = nul
     const timeout = clickBudgetMs(where);
     // ボタンの道: 「押す」の後に押してよい間 (pressGuard・過ぎた = 例外 pressStop = 押さない)。CLI は渡さない = 今までどおり
     const ms = pressGuard ? Math.min(timeout, pressGuard(where)) : timeout;
+    // ページの中の止め (Codex R4 High): 確かめた後に node が止まって、古い持ち時間で押し始めても、
+    //   ブラウザの中で押した瞬間の時刻を見て、締め切り (この PC の時計の絶対時刻) を過ぎていれば押した操作を捨てる (ボタンの処理まで届かない)
+    const deadline = pressGuard && typeof pressGuard.deadlineEpoch === 'function' ? pressGuard.deadlineEpoch() : null;
+    if (deadline != null) await armPageGuard(deadline, where);
     try {
       await (typeof target === 'string' ? page.click(target, { timeout: ms }) : target.click({ timeout: ms }));
     } catch (e) {
       throw asNightError(e, where);
+    }
+    if (deadline != null) await checkPageGuard(where);
+  }
+  /** ページの中に「締め切りの後の押す操作を捨てる」止めを置く (置けない = 押さない) */
+  async function armPageGuard(deadline, where) {
+    try {
+      await page.evaluate((d) => {
+        window.__bcPressDeadline = d;
+        window.__bcPressBlocked = false;
+        if (window.__bcPressGuardOn) return;
+        window.__bcPressGuardOn = true;
+        const h = (ev) => {
+          if (window.__bcPressDeadline != null && Date.now() > window.__bcPressDeadline) {
+            window.__bcPressBlocked = true;
+            ev.stopImmediatePropagation();
+            ev.preventDefault();
+          }
+        };
+        for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) window.addEventListener(t, h, true);
+      }, deadline);
+    } catch (e) {
+      const x = new Error(`${where}: ページの中の止めを置けない (押さない): ${String(e && e.message).slice(0, 120)}`);
+      x.pressStop = true;
+      throw x;
+    }
+  }
+  /** ページの中の止めが押す操作を捨てた = 押していない (pressStop) */
+  async function checkPageGuard(where) {
+    const blocked = await page.evaluate(() => window.__bcPressBlocked === true).catch(() => false);
+    if (blocked) {
+      const x = new Error(`${where}: 押してよい時刻を過ぎてから押そうとした (ページの中で止めた・押していない)`);
+      x.pressStop = true;
+      throw x;
     }
   }
   function assertNoUnexpectedDialog() {

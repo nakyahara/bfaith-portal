@@ -172,6 +172,13 @@ export function nightOf(now) {
   const inRange = (from) => m >= from || m < 90;
   return { enqueue: inRange(23 * 60 + 45), claim: inRange(23 * 60 + 50), hhmm: hhmm(now) };
 }
+/** 次の 23:50 (JST・渡さない / 押させない時間の始まり) までの ms (Render の時計)。もうその時間 = 0 */
+export function msUntilClaimNight(now) {
+  if (nightOf(now).claim) return 0;
+  const DAY = 24 * 3600e3;
+  const msOfDay = ((now + 9 * 3600e3) % DAY + DAY) % DAY;
+  return (23 * 60 + 50) * 60e3 - msOfDay;
+}
 export const NIGHT_WORDS = 'JST 23:45〜01:30 は取り込みません (miniPC が毎晩の商品マスタを同じアカウントで取り込む時間。01:30 を過ぎてから押してください)';
 
 const ev = (db, jobId, now, kind, by = null, detail = null) =>
@@ -339,10 +346,13 @@ export function markExecuting(db, { jobId, claimToken, importBlock = null, now }
     if (n.claim) return stop('night', `いま ${n.hhmm} (JST)。夜の時間なので押しません (取り込んでいない)`);
     if (importBlock) return stop(importBlock.code || 'lz_import_busy', `${importBlock.message} (押していない = 取り込んでいない)`);
     if (voidHeld(db, j.export_id, now)) return stop('voiding', 'CSV の取り消しの途中なので押しません (取り込んでいない)');
+    // 押してよい間 = 90 秒と、Render の時計で 23:50 (押させない時間の始まり) の 5 秒前までの短い方。10 秒も無い = 押させない (Codex R4 Medium)
+    const win = Math.min(LIMITS.pressWindowMs, msUntilClaimNight(now) - 5000);
+    if (win < 10e3) return stop('night', `いま ${n.hhmm} (JST)。23:50 までに押し終えられないので押しません (取り込んでいない)`);
     db.prepare("UPDATE bc_jobs SET state = 'executing', executing_at = ?, lease_until = ? WHERE job_id = ?").run(now, now + LIMITS.execLeaseMs, jobId);
     ev(db, jobId, now, 'executing', j.runner_id);
     // 押してよい間 (miniPC は自分の時計でこの間だけ実行ボタンと始める確認の OK を押す = 止まった miniPC が期限の後に押さない。Codex R1 High)
-    return { ok: true, state: 'executing', press_window_ms: LIMITS.pressWindowMs };
+    return { ok: true, state: 'executing', press_window_ms: win };
   })();
   if (r.refused) fail(r.refused.reason, r.refused.detail);
   return r;
@@ -484,7 +494,10 @@ export function recordDownload(db, { exportId, by, now }) {
   // 積んだ・取り込んでいる CSV はダウンロードさせない (ボタンの道と手の道で 2 回取り込まない。Codex R1 High)。
   //   確かめと印は 1 つの取引 = 積むときの「ダウンロードしたか」の確かめと入れ違わない
   db.transaction(() => {
-    const act = exportImportState(db, exportId).active;
+    const st = exportImportState(db, exportId);
+    // 取り込めたか分からない回が残る = 人が確かめて記すまでダウンロードもさせない (手で取り込み直さない。Codex R4 High)
+    if (st.unresolved) fail('import_unresolved', `この CSV の取り込み (#${st.unresolved.job_id}) が「取り込めたか分からない」のままです。ロジザードのインポート履歴を確かめて画面で記してからダウンロードしてください`);
+    const act = st.active;
     if (act) fail('import_running', `この CSV はボタンでロジザードに取り込む途中です (#${act.job_id})。手で取り込むなら、先に画面で「やめる」(押す前だけ) か終わるのを待ってください`);
     db.prepare('INSERT INTO bc_downloads (export_id, by, at) VALUES (?, ?, ?)').run(String(exportId), String(by || ''), now);
   })();
