@@ -443,7 +443,7 @@ await ta('[F1] 初めて売った日: NE の出荷 (受注日・FBA 納品 / 取
 
 await ta('[L1] 一覧の列 (いつもの列に出さない・メーカーの後ろ)・絞り込み (終売の予定が近い・予定日あり・区分・区分なし)・詳細検索の印でも残る・CSV の最後の 4 列', async () => {
   for (const id of ['brand', 'stage', 'end_on']) { assert.ok(COLS.COLUMN_IDS.includes(id)); assert.ok(!COLS.DEFAULT_VIEW.shown.includes(id)); assert.ok(!COLS.SORTABLE.includes(id)); }
-  assert.deepEqual(COLS.COLUMN_IDS.slice(-4), ['maker', 'brand', 'stage', 'end_on']);
+  assert.deepEqual(COLS.COLUMN_IDS.slice(-5), ['maker', 'pkg', 'brand', 'stage', 'end_on']);   // 🆕 0087 の大きさ・重さの列はメーカーのすぐ後ろ
   // 段階を付けておく: bl-r1 = 季節・2027-03-31 / blv1-* = 試し・2027-01-15 / s002 = 試し / 近い = towel-gift (今日 + 30) / 過ぎた = towel-gift-2p (今日 − 3)
   const setLife = async (code, values) => {
     const page = await call('GET', `/sku/${code}`);
@@ -473,11 +473,12 @@ await ta('[L1] 一覧の列 (いつもの列に出さない・メーカーの後
   // 詳細検索の印 (POST /api/search) でも残る
   const s = await call('POST', '/api/search', { body: { codes: 'towel-gift', life: 'end_soon' } });
   assert.match(s.j.url, /life=end_soon/);
-  // CSV = メーカーの後ろに 4 列
+  // CSV = いちばん後ろに 4 列 (メーカー・🆕 0087 の大きさ・重さの 5 列の後ろ)
   const data = await asEditor(() => RD.listSkus(db, RD.normalizeFilters({ q: 'towel-gift' }), { mode: 'all' }));
   const csv = CSV.buildListCsv(data, {}, {});
   const lines = csv.replace(/^﻿/, '').trim().split('\r\n');
-  assert.deepEqual(lines[0].split(',').slice(-5), ['"メーカー"', '"ブランド"', '"自社ブランド"', '"定番/季節/試し"', '"終売の予定日"']);
+  assert.deepEqual(lines[0].split(',').slice(-5), ['"大きさ・重さの出どころ"', '"ブランド"', '"自社ブランド"', '"定番/季節/試し"', '"終売の予定日"']);
+  assert.equal(lines[0].split(',').at(-10), '"メーカー"');
   const row = lines.find((l) => l.startsWith('"towel-gift"'));
   assert.deepEqual(row.split(',').slice(-4), ['"はちみつ工房"', '"自社"', '""', `"${addDays(today, 30).replace(/-/g, '/')}"`]);
   const rowR1 = (await asEditor(() => RD.listSkus(db, RD.normalizeFilters({ q: 'bl-r1' }), { mode: 'all' })));

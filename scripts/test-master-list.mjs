@@ -387,7 +387,7 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   // コードは左端 (横に送っても残る印)・列の数
   assert.match(thead(r.text), /^<tr><th scope="col" class="c-code sortable"/);
   assert.match(tr, /<td class="c-code" data-col="code">/);
-  assert.match(r.text, /id="colcnt">7\/19</);   // 🆕 0084: メーカー・🆕 0087: 大きさ・重さ・🆕 0088: ブランド・段階の 3 列 (出さない) で 5 つ増えた
+  assert.match(r.text, /id="colcnt">7\/22</);   // 🆕 0084: メーカー・🆕 0087: 大きさ・重さ・🆕 0088: ブランド・段階の 3 列 (出さない) で 5 つ増えた
   // 仕入先の列: 単品 = コード + 名前・セット = 構成品から・代表なし = —。出している間は名前の下の「仕入先」の字を消す (class)
   assert.match(r.text, /<table class="tbl click show-sup" id="list-tbl">/);
   const cell = (code, id) => { const t = r.text.split('<tr>').find((x) => x.includes(`href="sku/${code}"`)); return new RegExp(`<td [^>]*data-col="${LC.COLUMN_BY_ID[id].cell}"[^>]*>([\\s\\S]*?)<\\/td>`).exec(t)[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim(); };
@@ -423,7 +423,7 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   assert.ok(!/ hidden/.test(thOf(r.text, 'po').split('>')[0]), '注文残を出す');
   assert.ok(/ hidden/.test(thOf(r.text, 'sup').split('>')[0]), 'いつもの列 = 仕入先は出さない');
   assert.match(r.text, /<table class="tbl click" id="list-tbl">/);
-  assert.match(r.text, /id="colcnt">17\/20</);   // 画像の列 (出す)・メーカー (0084)・大きさ・重さ (0087)・ブランド・段階の 3 列 (0088) (出さない)
+  assert.match(r.text, /id="colcnt">17\/23</);   // 画像の列 (出す)・メーカー (0084)・大きさ・重さ (0087)・ブランド・段階の 3 列 (0088) (出さない)
   // 中身が無い一覧の行 = 全部の列にまたがる
   r = await call('GET', '/?q=' + encodeURIComponent('当たらない名前'));
   assert.match(r.text, /<td colspan="22" class="muted"/);   // 画像の列 + 🆕 0084 メーカー + 🆕 0087 大きさ・重さ + 🆕 0088 の 3 列
