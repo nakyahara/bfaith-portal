@@ -53,7 +53,7 @@
  *   POST /api/sku/:code/vendor-code         { supplier_code, vendor_code, qty_per_unit, base_updated_at (null = まだ無いつもり / 開いたときの版・必須) }
  *        直せるのは仕入先一致を通る 1 社 (発注アプリのマスタ管理と同じ決まり)・同じ番号がほかの商品にも = 警告 (止めない)・版が違う = 409
  *   POST /api/sku/:code/vendor-code/delete  { supplier_code, base_updated_at (開いたときの版・必須) } (仕入先は確かめない = 発注アプリと同じ)
- *   POST /api/new の order_settings に vendor_code・qty_per_unit (単品・代表の仕入先・知らせ v2 = 0099 の後だけ。前 = 400 で何も書かない)
+ *   POST /api/new の order_settings に vendor_code・qty_per_unit (単品・代表の仕入先・知らせ v2 = 0089 の後だけ。前 = 400 で何も書かない)
  *   書ける人 = 名簿 (MASTER_EDITORS) かつ 発注アプリの利用権。Company DB の切替の門は見ない (発注アプリのマスタ管理と同じく、いつでも)
  *   🆕 0075 (CompanyDB構想 21 C1・lib/order-settings-outbox.mjs): 新商品の登録 (単品・まとまり) の発注の設定は ① と同じ Postgres の取引に「発注の設定の知らせ」を積み、
  *        commit の後に発注アプリへ届ける (届かなくても知らせは残る = 画面を開いたとき・人の「もう一度」・夜間ロードの後ろの段で届け直す・24 時間で知らせる)。
@@ -1375,7 +1375,7 @@ router.post('/api/new', (req, res) => {
     const sb = mk.body;
     const po = await orderBlanksFirstTime(db, req, gate, String(b.kind ?? ''), sb);
     if (!po.ok) return res.status(po.status).json(po.json);
-    // 🆕 ⑤-2 (CompanyDB構想 27 §2.4 の 4・5): 先方品番つき = 知らせ v2。DB が v2 を受けない (0075 の前・0099 の前) = 何も書かずに断る
+    // 🆕 ⑤-2 (CompanyDB構想 27 §2.4 の 4・5): 先方品番つき = 知らせ v2。DB が v2 を受けない (0075 の前・0089 の前) = 何も書かずに断る
     //   (Company DB の登録だけ通って先方品番が消える、を作らない)。押し直し (記録がある) = lib が前の答えを返す = 確かめない
     if (orderBase && orderBase.vendor && !po.replay && !(outbox && (await orderPayloadV2Ready(db)))) {
       return res.status(400).json({ ok: false, reason: 'vendor_not_ready', field: 'order_settings.vendor_code',

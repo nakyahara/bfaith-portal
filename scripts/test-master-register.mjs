@@ -2058,7 +2058,7 @@ const vmapOf = (sup, code) => podb.prepare('SELECT * FROM po_vendor_code_map WHE
 { const t0 = new Date().toISOString(); podb.prepare('INSERT OR IGNORE INTO po_suppliers (supplier_code, name, created_at, updated_at) VALUES (?,?,?,?)').run('1', 'アメージングクラフト', t0, t0); podb.prepare('INSERT OR IGNORE INTO po_suppliers (supplier_code, name, created_at, updated_at) VALUES (?,?,?,?)').run('3', 'ほかの仕入先', t0, t0); podb.prepare('UPDATE po_suppliers SET lead_days = 21 WHERE supplier_code = ?').run('1'); }
 const emptyPatch = { order_lot: '', condition_id: '', material_group_id: '', capacity_per_unit: '', case_group: '', case_lot: '' };
 
-await ta('[PO9] ⑤-2 新商品の登録の先方品番・入数 = 知らせ v2 (0099) → 発注アプリの対応表 (代表の仕入先・記録 via master-edit:new)・先方品番だけでも積む・入数だけ = 400・まとまり = 400・行がもうある = 409 (何も書かない)・v2 の印が無い DB = 400 (何も書かない)・届ける前に人が足して消した = 要確認 (戻さない)', async () => {
+await ta('[PO9] ⑤-2 新商品の登録の先方品番・入数 = 知らせ v2 (0089) → 発注アプリの対応表 (代表の仕入先・記録 via master-edit:new)・先方品番だけでも積む・入数だけ = 400・まとまり = 400・行がもうある = 409 (何も書かない)・v2 の印が無い DB = 400 (何も書かない)・届ける前に人が足して消した = 要確認 (戻さない)', async () => {
   // 画面: 単品の新商品の登録には 2 つの欄 (未保存に数える)・まとまりの登録には無い
   let page = await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' });
   assert.ok(page.text.includes('id="po-vendor_code"') && page.text.includes('id="po-qty_per_unit"') && page.text.includes('data-dirty-field="po_vendor_code"'), '新商品の画面に先方品番の欄が無い');
@@ -2096,7 +2096,7 @@ await ta('[PO9] ⑤-2 新商品の登録の先方品番・入数 = 知らせ v2 
   podb.prepare("INSERT INTO po_audit_log (occurred_at, actor_type, actor, action, resource, detail_json) VALUES (?, 'user', 'x', 'vendor_map_entry_delete', 'supplier:1', ?)").run(new Date().toISOString(), JSON.stringify({ productCode: 'po-web-9x', vendorCode: 'HUMAN', product_key: 'po-web-9x' }));
   const hist = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9x', { ...emptyPatch, vendor_code: 'AC-9X' }), session: 'po-editor' });
   assert.deepEqual([hist.status, hist.j.reason, await skuId('po-web-9x')], [409, 'stale', undefined], hist.text);
-  // v2 の印の関数が無い DB (0099 の前) = 400 vendor_not_ready (何も書かない)・先方品番が無い登録は通る
+  // v2 の印の関数が無い DB (0089 の前) = 400 vendor_not_ready (何も書かない)・先方品番が無い登録は通る
   await pg.query('alter function ops.order_settings_payload_versions() rename to order_settings_payload_versions_hidden');
   try {
     const nr = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9n', { ...emptyPatch, vendor_code: 'AC-9N' }), session: 'po-editor' });

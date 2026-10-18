@@ -72,7 +72,7 @@ await ta('[K1] 知らせの中身の形 = JS と DB が同じ答え (正しい�
   const ok = X.orderPayloadOf('kp-1', baseOf({ order_lot: '12', case_lot: null, capacity_per_unit: '1.5' }, { newCondition: { condition_id: 'c-new', display_name: '新しい条件', condition_type: '金額', unit: '円', condition_value: '30000' },
     newMaterial: { group_id: 'honey', name: 'はちみつ', min_order_qty: '20', unit: 'kg' } }));
   assert.equal(ok.patch.capacity_per_unit, '1.5'); assert.equal(ok.new_condition.maker_name, null);
-  // 🆕 0099 (仮・⑤-2): v2 = v1 の鍵 + vendor。v2 の版で v1 の鍵 = 鍵の誤り (版の誤りは知らない版だけ)
+  // 🆕 0089 (⑤-2): v2 = v1 の鍵 + vendor。v2 の版で v1 の鍵 = 鍵の誤り (版の誤りは知らない版だけ)
   const samples = [ok, { ...ok, extra: 1 }, (({ patch, ...o }) => o)(ok), { ...ok, schema: 'po-settings-v3' }, { ...ok, code: '' }, { ...ok, supplier_code: 1 },
     { ...ok, patch: { bogus: '1' } }, { ...ok, patch: { order_lot: 12 } }, { ...ok, patch: [] }, { ...ok, new_condition: { condition_id: 'x' } },
     { ...ok, new_condition: { ...ok.new_condition, condition_value: 30000 } }, { ...ok, new_condition: 'x' }, { ...ok, new_material: null, new_condition: null },
@@ -90,7 +90,7 @@ await ta('[K1] 知らせの中身の形 = JS と DB が同じ答え (正しい�
   }
 });
 
-await ta('[K2] 🆕 0099 (仮・⑤-2) 知らせ v2 (先方品番・入数つき) = JS と DB が同じ答え・先方品番が無い = v1 のまま・hash も DB と同じ・印の関数がある = v2 を積める', async () => {
+await ta('[K2] 🆕 0089 (⑤-2) 知らせ v2 (先方品番・入数つき) = JS と DB が同じ答え・先方品番が無い = v1 のまま・hash も DB と同じ・印の関数がある = v2 を積める', async () => {
   const v1 = X.orderPayloadOf('kp-2', baseOf({ order_lot: '3' }));
   assert.equal(v1.schema, 'po-settings-v1');
   const base2 = MEO.orderBaseOf({ order: { patch: { order_lot: '3' }, newCondition: null, newMaterial: null, vendor: { vendor_code: ' AC-9 ', qty_per_unit: '２４' } }, supplierCode: '0001' });

@@ -1,4 +1,4 @@
--- 0099 (仮の番号・マージの時に空き番号へ付け替える): 発注の設定の知らせ v2 = 先方品番・入数つき (AI_reference CompanyDB構想/27 §2.4 の ⑤-2)
+-- 0089 (0088 = ブランド・商品の段階の次。migrate は欠番を断る): 発注の設定の知らせ v2 = 先方品番・入数つき (AI_reference CompanyDB構想/27 §2.4 の ⑤-2)
 --
 -- なぜ: 新商品の登録で入れた先方品番・入数 (先方 1 単位 = 弊社何個) を、発注の設定の知らせ (0075・ops.order_settings_outbox) で
 --   発注アプリ (Render の SQLite の po_vendor_code_map) に届けたい。0075 の形の確かめ ops.order_settings_payload_problem は
