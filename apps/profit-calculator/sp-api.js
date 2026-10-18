@@ -167,8 +167,8 @@ function convertMeasure(m, table, legacyUnit) {
  * volumeCm3 は丸める前の cm で計算する。
  * ⚠ 送料の判定 (router.js calcFbmShippingServer / bulk-research.html calcFbmShipping) は '-' を 0 として
  *   「制限内」とみなすので、一部だけ分かる寸法は渡さない:
- *   - 知らない単位が 1 つでもあれば、寸法も重さも全部 '-' (全部不明 = 既存の「寸法不明」の扱いになる)
- *   - 3 辺のどれかが無ければ、3 辺とも '-' (重さは分かればそのまま)
+ *   - 3 辺のどれかが無い・知らない単位なら、3 辺とも '-' (全部不明 = 既存の「寸法不明」の扱いになる)
+ *   - 重さは 3 辺とは別に決める (3 辺が分からなくても重さは残す・重さが分からなくても 3 辺と体積は残す)
  */
 export function normalizePackageDimensions(pkg) {
   const p = pkg || {};
@@ -176,11 +176,14 @@ export function normalizePackageDimensions(pkg) {
   let w = convertMeasure(p.width, CM_PER_UNIT, 'inches');
   let h = convertMeasure(p.height, CM_PER_UNIT, 'inches');
   let kg = convertMeasure(p.weight, KG_PER_UNIT, 'pounds');
-  if ([l, w, h, kg].includes(UNKNOWN_UNIT)) {
-    console.warn(`[SP-API] 知らない単位があるので寸法・重さを使いません: ${['length', 'width', 'height', 'weight'].map((k) => p[k]?.unit).join(' / ')}`);
-    l = w = h = kg = null;
+  if ([l, w, h].includes(UNKNOWN_UNIT)) {
+    console.warn(`[SP-API] 寸法に知らない単位があるので 3 辺とも使いません: ${['length', 'width', 'height'].map((k) => p[k]?.unit).join(' / ')}`);
   }
-  if (l == null || w == null || h == null) l = w = h = null;
+  if (kg === UNKNOWN_UNIT) {
+    console.warn(`[SP-API] 重さに知らない単位があるので使いません: ${p.weight?.unit}`);
+    kg = null;
+  }
+  if (typeof l !== 'number' || typeof w !== 'number' || typeof h !== 'number') l = w = h = null;
   const cm = (v) => v == null ? '-' : v.toFixed(1);
   return {
     dimensions: {

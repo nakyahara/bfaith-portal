@@ -113,21 +113,26 @@ await t('単位の欄が無いときだけ、これまでどおりインチ・�
 
 const ALL_UNKNOWN = { length: '-', width: '-', height: '-', weight: '-' };
 
-await t('知らない単位は推測しない: 1 つでもあれば寸法も重さも全部 - (体積 0)', async () => {
+await t('知らない単位は推測しない: 寸法に 1 つでもあれば 3 辺とも - (体積 0)・重さは残す', async () => {
   useCatalog({
     length: { unit: 'cubits', value: 10 }, width: { unit: 'centimeters', value: 5 }, height: { unit: 'centimeters', value: 2 },
-    weight: { unit: 'kilograms', value: 1 },
+    weight: { unit: 'kilograms', value: 0.5 },
   });
   let p = await getProduct('B000TEST01');
-  assert.deepEqual(p.dimensions, ALL_UNKNOWN);
+  assert.deepEqual(p.dimensions, { length: '-', width: '-', height: '-', weight: '0.50' });
   assert.equal(p.volumeCm3, 0);
-  // 重さだけ知らない単位でも全部 -
+  // 重さだけ知らない単位なら重さだけ - (3 辺と体積は残す = index.html の保管料が 0 円にならない)
   useCatalog({
-    length: { unit: 'centimeters', value: 20 }, width: { unit: 'centimeters', value: 10 }, height: { unit: 'centimeters', value: 2 },
+    length: { unit: 'centimeters', value: 30 }, width: { unit: 'centimeters', value: 20 }, height: { unit: 'centimeters', value: 10 },
     weight: { unit: 'stones', value: 1 },
   });
   p = await getProduct('B000TEST01');
-  assert.deepEqual(p.dimensions, ALL_UNKNOWN);
+  assert.deepEqual(p.dimensions, { length: '30.0', width: '20.0', height: '10.0', weight: '-' });
+  near(p.volumeCm3, 6000);
+  // 全部知らない単位なら全部 -
+  assert.deepEqual(normalizePackageDimensions({
+    length: { unit: 'cubits', value: 1 }, width: { unit: 'cubits', value: 1 }, height: { unit: 'cubits', value: 1 }, weight: { unit: 'stones', value: 1 },
+  }).dimensions, ALL_UNKNOWN);
 });
 
 await t('3 辺のどれかが無ければ 3 辺とも - (重さは残す)', async () => {
