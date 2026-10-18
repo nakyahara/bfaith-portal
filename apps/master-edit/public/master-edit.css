@@ -1204,3 +1204,20 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .todo-row.head { display: none; }
   .todo-row .um-acts, .todo-row > a.btn { grid-column: 1 / -1; }
 }
+/* 🆕 10/17 CSV でまとめて登録 (views/amazon-bulk.ejs・public/me-amazon-bulk.js) */
+.bulk-help { margin: 0 0 12px 18px; display: grid; gap: 6px; font-size: 13.5px; color: var(--text2); }
+.bulk-help code { font-family: var(--mono); color: var(--accent); }
+.bulk-drop { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px; border: 1px dashed rgba(58, 231, 255, 0.4); border-radius: 12px; }
+.bulk-drop input[type="file"] { flex: 1 1 260px; min-width: 0; }
+#bulk-filter { margin-bottom: 10px; }
+#bulk-tbl td { vertical-align: top; }
+#bulk-tbl td.mono { font-family: var(--mono); overflow-wrap: anywhere; }
+.bulk-notes { list-style: none; display: grid; gap: 3px; font-size: 12.5px; }
+.bulk-notes li.err { color: var(--err); }
+.bulk-notes li.warn { color: var(--warn); }
+.bulk-why { font-size: 12.5px; color: var(--text2); }
+.bulk-acts { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+.bulk-prog { display: flex; gap: 10px; align-items: center; margin-top: 10px; font-size: 13px; color: var(--muted); }
+.bulk-prog .bar { flex: 1 1 auto; height: 6px; border-radius: 999px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
+.bulk-prog .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+@media (max-width: 760px) { .bulk-acts .btn { flex: 1 1 auto; justify-content: center; } }

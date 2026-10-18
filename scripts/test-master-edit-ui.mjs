@@ -49,6 +49,7 @@
  *  75 一覧の画像の列 (10/17): コードのすぐ後ろ・52px の四角・取得中 / 画像なしの印・読み込めない画像は印・列の板で外す / 出す・画像を押しても開く・390 ではみ出さない
  *  76 Amazon SKU の未登録の一覧の「その場で登録」(10/17): 行の下に欄・名前 = Amazon の商品名・構成の原価
  *  77 新商品 (10/17): 「セット商品を作るか = 作る」の作るセットの表 (初めの値・付いていく・重なり / 0 行は ③ で止める・保留で隠す・保存で product-hub にセットの下書き)
+ *  78 Amazon SKU を CSV でまとめて登録 (10/17): 試し取込 (Shift_JIS・表・絞る札・だめな理由・何も書かない)・保存 (DB に入る)・結果の CSV (BOM・式の注入の対策)・同じ CSV = 変わらない・390 ではみ出さない
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -3301,6 +3302,57 @@ await ta('[77] 新商品 (2026-10-17 中原さん): 「セット商品を作る�
   assert.ok(parent, 'カードができた');
   assert.deepEqual(phDb().prepare('SELECT ne_code, name, provisional_code, price FROM product_drafts WHERE parent_draft_id = ? ORDER BY id').all(parent.id),
     [{ ne_code: 'ui-sp-1-2', name: 'UI ネームタグ 2個セット', provisional_code: 1, price: 2000 }, { ne_code: 'ui-sp-1-3', name: 'UI ネームタグ 3個セット', provisional_code: 1, price: 3000 }]);
+});
+
+await ta('[78] CSV でまとめて登録 (10/17): ファイルを選ぶ → 試し取込 (表・絞る札・だめな理由・何も書かない) → 離れるときに確かめる → 保存 (20 件ずつ・結果の列) → 出し直すと「変わらない」/ Shift_JIS の CSV / スマホ 390 で横にはみ出さない', async (p) => {
+  const iconv = (await import('iconv-lite')).default;
+  await p.goto(B + '/amazon/');
+  await Promise.all([p.waitForURL(/\/amazon\/bulk$/), p.click('a[href="bulk"]')]);
+  assert.equal(await p.isDisabled('#bulk-preview'), true, 'ファイルを選ぶまで押せない');
+  const NL = String.fromCharCode(13, 10);
+  const csv = ['seller_sku,name,ne_code,qty', 'pr-ui-bulk-1,一括 1,k001,2', 'pr-ui-bulk-1,一括 1,k002,1', 'pr-ui-bulk-2,,k004,1', 'pr-ui-bulk-3,=無いコード,nope-x,1'].join(NL) + NL;
+  await p.setInputFiles('#bulk-file', { name: '一括の試験.csv', mimeType: 'text/csv', buffer: iconv.encode(csv, 'cp932') });
+  await p.click('#bulk-preview');
+  await p.locator('#bulk-result').waitFor({ state: 'visible' });
+  assert.match(await p.textContent('#bulk-file-info'), /一括の試験\.csv · Shift_JIS/);
+  assert.equal(await p.locator('#bulk-rows tr').count(), 3);
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-3"]'), /だめ[\s\S]*nope-x は Company DB にありません/);
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-2"]'), /ＡＢＣ 保存袋/, '名前が空 = 代表の NE の商品名');
+  assert.equal(await p.textContent('#bulk-apply'), '保存する (2 件)');
+  assert.equal(await dirty(p), 1, '試し取込の後に保存していない = 離れるときに確かめる');
+  assert.equal(await mapOf('pr-ui-bulk-1'), undefined, '試し取込は何も書かない');
+  await p.click('#bulk-filter button[data-f="error"]');
+  assert.equal(await p.locator('#bulk-rows tr').count(), 1, 'だめだけに絞る');
+  await p.click('#bulk-filter button[data-f="all"]');
+  // スマホ 390: 横にはみ出さない (表は表の箱の中で横に送る)
+  await p.setViewportSize({ width: 390, height: 844 });
+  const [sw, cw] = await p.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+  assert.ok(sw <= cw + 1, `390 で横にはみ出す (${sw} > ${cw})`);
+  await p.setViewportSize({ width: 1440, height: 900 });
+  await p.click('#bulk-apply');
+  await p.waitForFunction(() => /終わりました/.test(document.getElementById('bulk-apply-msg').textContent));
+  assert.match(await p.textContent('#bulk-apply-msg'), /できた 2 件 · だめ 0 件/);
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-1"] .bulk-res'), /作りました \(出品も\)/);
+  assert.deepEqual(await compsUi('pr-ui-bulk-1'), [['k001', 2], ['k002', 1]], 'DB に入った (1 行目が代表)');
+  assert.equal((await mapOf('pr-ui-bulk-2')).name, 'ＡＢＣ 保存袋');
+  assert.equal(await dirty(p), 0, '保存した後 = 確かめない');
+  assert.equal(await p.isDisabled('#bulk-apply'), true);
+  // 結果の CSV (画面が手元で作る・BOM・式の注入の対策 = list-csv.mjs の csvCell と同じ答え)
+  const [dl] = await Promise.all([p.waitForEvent('download'), p.click('#bulk-report')]);
+  assert.match(dl.suggestedFilename(), /^amazon-bulk-result_[0-9]{8}-[0-9]{4}[.]csv$/);
+  const rep = fs.readFileSync(await dl.path());
+  assert.deepEqual([...rep.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+  const repText = rep.toString('utf8');
+  assert.ok(repText.includes(`"pr-ui-bulk-3","5","だめ","'=無いコード"`), repText);
+  assert.ok(repText.includes('"pr-ui-bulk-1","2","作る (出品も)","一括 1","k001×2, k002×1","作った"'), '保存の結果も入る');
+  const { csvCell } = await import('../apps/master-edit/list-csv.mjs');
+  for (const v of ['=a', ' +b', '	-c', '@d', 'ok', 'x"y', String.fromCharCode(0xfeff) + '=e', String.fromCharCode(0x200b) + '-f']) assert.equal(await p.evaluate((x) => window.MasterEdit.bulkCsvCell(x), v), csvCell(v), JSON.stringify(v));
+  // 同じ CSV をもう一度 = 「変わらない」(保存する SKU が無い)
+  await p.setInputFiles('#bulk-file', { name: '一括の試験.csv', mimeType: 'text/csv', buffer: Buffer.from(csv, 'utf8') });
+  await p.click('#bulk-preview');
+  await p.waitForFunction(() => /試し取込をしました/.test(document.getElementById('bulk-msg').textContent) && /UTF-8/.test(document.getElementById('bulk-file-info').textContent));
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-1"]'), /変わらない/);
+  assert.equal(await p.textContent('#bulk-apply'), '保存する SKU がありません');
 });
 
 await browser.close();
