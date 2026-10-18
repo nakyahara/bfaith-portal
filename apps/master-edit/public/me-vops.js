@@ -109,7 +109,7 @@
   var K = null;   // { kind: cancel | adopt, code, rid, onDone, busy }
   var KIND = {
     cancel: { t: 'このまとまりから外す (廃止)', yes: '廃止する', need: true, path: '/variation-cancel',
-      d: 'この子 (<b class="mono">%c</b>) の登録をやめます (登録の状態 = やめた)。コードは使い回しません。まとまりやほかの子は変えません。廃止できるのは、下書き / NE 登録待ちで、終わっていない NE 登録の CSV が無く、NE に一度も現れていない子だけです (Company DB が確かめます)。' },
+      d: 'この子 (<b class="mono">%c</b>) の登録をやめます (登録の状態 = やめた)。コードは使い回しません。まとまりやほかの子は変えません。廃止できるのは、下書き / NE 登録待ちで、終わっていない NE 登録の CSV が無く、NE に一度も現れていない子で、ロジザード登録の CSV に出していない子だけです (Company DB が確かめます)。' },
     adopt: { t: 'NE の代表を採用する', yes: '採用する', need: false, path: '/adopt-parent',
       d: 'NE で直接作られた商品 (<b class="mono">%c</b>・要確認) の代表を、最新の照合で NE に見えた代表から 1 回だけ Company DB に入れます。採用した後は変えません。NE の代表が読めない・無い・2 つ以上に当たるときは何もしません。' },
   };

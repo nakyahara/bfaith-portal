@@ -1,6 +1,6 @@
 <%#
   🆕 0071: 新商品の下書きを消す (登録をやめた)。lib/master-draft-cancel.mjs の draftCancelView = deldraft { show, canGo, variation, will, why }。
-  押せる = DB の確かめが ok・名簿 MASTER_EDITORS の人・保存を開いている。動き = public/me-draft-cancel.js (確かめの窓 → POST /api/sku/:code/draft-cancel → 読み直し)
+  押せる = DB の確かめが ok (🆕 0099: ロジザード登録の CSV に出した = lz_issued で押せない・理由に出す)・名簿 MASTER_EDITORS の人・保存を開いている。動き = public/me-draft-cancel.js (確かめの窓 → POST /api/sku/:code/draft-cancel → 読み直し)
   置き場所 = 商品の画面の上の「下書きです」の帯のすぐ下 (下書きのときだけ出る = 下書きの間に気づく所)
 %>
 <% const D = typeof deldraft !== 'undefined' && deldraft && deldraft.show ? deldraft : null; const delCan = !!D && D.canGo && canEdit && !dbError && !closed; %>
@@ -10,7 +10,7 @@
   <div class="grow">
     <% if (delCan) { %>
       <div class="t">入れ間違い・発売中止なら、この下書きを消せます</div>
-      <div class="hint">NE にはまだ配っていません (ロジザードの商品マスタへ出す CSV も NE にある商品だけ = この下書きは出していません)。消すと「やめた」になり、一覧に出なくなります (記録は残ります)。値を直すだけなら、消さずにこの画面で直してください。</div>
+      <div class="hint">NE にはまだ配っていません。ロジザード登録の CSV にもまだ出していません (出した下書きは、ロジザードから消してその CSV を取り消すまで消せません)。消すと「やめた」になり、一覧に出なくなります (記録は残ります)。値を直すだけなら、消さずにこの画面で直してください。</div>
     <% } else if (D.variation) { %>
       <div class="t">この下書きは色違い・サイズ違いのまとまりの子です</div>
       <div class="hint">消すときは、上の「基本」の「このまとまりから外す (廃止)」を使います (まとまりのカードも一緒に直ります)。</div>

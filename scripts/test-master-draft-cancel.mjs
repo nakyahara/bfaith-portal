@@ -21,6 +21,10 @@
  *   [S] 画面 (本物の router): 消せる下書き = 「この下書きを消す」と窓・片付けるもの / まとまりの子 = 子の廃止へ案内 / 業務で使える商品 = 何も出さない /
  *       名簿の人だけ (403)・確かめの窓の印・除外していないカード = 409 card_exists・除外すれば通る・カードを読めない = 503・消した後の画面 = やめた・カードは作らない
  *   [U] 画面の JS (Playwright・Chromium): 押す → 窓 → 理由で押せる → 消す → 読み直し = やめた / 携帯の幅で横にはみ出さない (MASTER_EDIT_UI_SKIP=1 で飛ばす)
+ *   🆕 [M4][M5] (0099) ops.sku_draft_cancel_check (0071 の版)・ops.cancel_variation_child (0073 の版) は前の最新の版から写して「🆕 0099」の行だけ足した・関数の外で値を変えない
+ *   🆕 [Z] (0099・中原さんの決定 2026-10-18) ロジザード登録の CSV に出した (issued) 下書き = 消さない (確かめ lz_issued・lib 409・DB の関数を直に・画面の理由・API 409) /
+ *       0099 の前の DB でも lib が同じ理由で断る / 取り消した (voided) だけ = また消せる・消した後は CSV に出せない / まとまりの子の廃止も同じ (lz_issued)。
+ *       出すと消すの競り (同時に片方だけ) は scripts/test-master-draft-cancel-pg.mjs [8]
  * 使い方: node scripts/test-master-draft-cancel.mjs
  */
 import assert from 'node:assert/strict';
@@ -122,6 +126,45 @@ await ta('[M3] 一時の表を使わない・security definer の関数は全部
     assert.ok(M71.includes(`revoke all on function ${d[1]}(`), `${d[1]} の public の実行権を外していない`);
   }
 });
+// 🆕 0099 (仮の番号 = マージの時に付け替える。名前で探す): ロジザード登録の CSV に出した下書きは消さない
+const F99 = migFiles.find((f) => /^\d{4}_deldraft_lz_exported\.sql$/.test(f));
+const M99 = F99 ? readMig(F99) : '';
+function strip0099(t) {
+  const out = [];
+  let skip = false;
+  for (const l of t.split('\n')) {
+    if (/-- 🆕 0099 ここから/.test(l)) { skip = true; continue; }
+    if (/-- 🆕 0099 ここまで/.test(l)) { skip = false; continue; }
+    if (skip || /🆕 0099/.test(l)) continue;
+    out.push(l);
+  }
+  return out.join('\n');
+}
+for (const [name, expectFrom] of [['ops.sku_draft_cancel_check', '0071'], ['ops.cancel_variation_child', '0073']]) {
+  await ta(`[M4] (0099) ${name} = ${expectFrom} の版 (前の最新) から写して 🆕 0099 の行だけ足した`, async () => {
+    assert.ok(F99, '0099 (deldraft_lz_exported) が無い');
+    const src = lastDefBefore(name, F99.slice(0, 4));
+    assert.ok(src && src.startsWith(expectFrom), `前の最新の版が ${src} (期待 ${expectFrom})`);
+    const before = fnText(readMig(src), name);
+    const now = fnText(M99, name);
+    assert.ok(before && now, '関数が見つからない');
+    assert.notEqual(now, before, '何も足していない');
+    assert.equal(strip0099(now), before, '印の行を外すと前の版と違う (写し間違い・印の無い変更)');
+    assert.match(now, /lz_issued/);
+    // 0099 より後の migration はこの関数を書き換えていない (書き換えたら、この写しが今の版でなくなる)
+    for (const f of migFiles.filter((x) => x > F99)) assert.equal(fnText(readMig(f), name), null, `${f} にも ${name} がある`);
+  });
+}
+await ta('[M5] (0099) 一時の表を使わない・security definer の関数は search_path = pg_catalog, pg_temp・revoke from public・値を変える文が無い', async () => {
+  assert.doesNotMatch(M99, /\b(create\s+(temp|temporary)\s+table|on commit drop)\b/i);
+  assert.doesNotMatch(M99.replace(/\$\$[\s\S]*?\$\$/g, ''), /^\s*(insert|update|delete|alter|drop|grant|truncate)\b/im, '関数の外で値・表・権限を変えない');
+  const defs = [...M99.matchAll(/create (?:or replace )?function ([a-z_.]+)\(([^)]*)\)[^$]*?security definer[^$]*?as \$\$/g)];
+  assert.equal(defs.length, 2);
+  for (const d of defs) {
+    assert.match(d[0], /set search_path = pg_catalog, pg_temp as \$\$/, d[1]);
+    assert.ok(M99.includes(`revoke all on function ${d[1]}(`), `${d[1]} の public の実行権を外していない`);
+  }
+});
 
 // ═══════════ DB の用意 ═══════════
 const T = await setupVariationDb();
@@ -153,7 +196,7 @@ const PHDB = await import('../apps/product-hub/db.js');
 const PH = await import('../apps/product-hub/services/cdb-card-intake.js');
 const phdb = PHDB.getDB();
 
-for (const c of ['d-ok', 'd-busy', 'd-k1', 'd-k2', 'd-k3', 'd-k4', 'd-k5', 'd-k6', 'd-comp', 'd-list', 'd-listdel', 'd-par', 'd-kid', 'd-iss', 'd-seen', 'd-l1', 'd-s1', 'd-s2', 'd-u1', 'd-u2', 'd-t1']) await draft(c);
+for (const c of ['d-ok', 'd-busy', 'd-k1', 'd-k2', 'd-k3', 'd-k4', 'd-k5', 'd-k6', 'd-comp', 'd-list', 'd-listdel', 'd-par', 'd-kid', 'd-iss', 'd-seen', 'd-l1', 'd-s1', 'd-s2', 'd-u1', 'd-u2', 'd-t1', 'd-lz1', 'd-lz2']) await draft(c);
 await draft('d-nocard', { card: { create: false } });
 
 console.log('\n[C] 確かめ');
@@ -553,6 +596,112 @@ await ta('[S3] 一覧 = やめた商品を出さない・札「やめた商品�
   assert.match(await r2.text(), /sku\/d-s1/);
   const r3 = await fetch(`${B}/?q=D-S1`);
   assert.match(await r3.text(), /sku\/d-s1/, '上の絞る欄にコードをぴったり = 出す');
+});
+
+// ═══════════ 🆕 [Z] (0099) ロジザード登録の CSV に出した下書きは消さない (中原さんの決定 2026-10-18) ═══════════
+console.log('\n[Z] ロジザード登録の CSV に出した下書き (0099)');
+/** 画面のロールで: バーコード = 空欄 (ロジザードが番号を付ける) を入れて、ロジザード登録の CSV を出す (DB の関数を直に・1 品目)。戻り値 = 出したファイルの番号 */
+const lzIssue = (code, { expiry = '01', inbound = '0' } = {}) => asEditor(async () => {
+  const id = await sid(code);
+  const b = (await pg.query("select ops.set_sku_logizard_barcode($1::uuid, $2, $3::bigint, 'lz_assign', null, 'sku_page', null, null, null) as r", [uuid(), 'naka@test', id])).rows[0].r;
+  const items = [{ sku_id: id, code, rule_row: String(b.rule_row), kind: 'lz_assign', value: null, expiry_code: expiry, inbound_code: inbound }];
+  await pg.query('begin');
+  try {
+    const r = (await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), null) as r', [uuid(), 'naka@test', JSON.stringify(items)])).rows[0].r;
+    await pg.query('commit');
+    return r.export_id;
+  } catch (e) { await pg.query('rollback'); throw e; }
+});
+const lzVoid = (exportId) => asEditor(async () => (await pg.query('select ops.lz_new_export_void($1, $2::bigint, $3) as r', ['naka@test', exportId, 'ロジザードから消した'])).rows[0].r);
+let LZ1 = null;
+await ta('[Z1] 出した (issued) = 確かめが lz_issued (ファイルの番号・ロジザードから消すのが先)・lib = 409 not_cancellable・DB の関数を直に呼んでも断る・画面は押せず理由を出す・API = 409', async () => {
+  LZ1 = await lzIssue('d-lz1');
+  assert.match(String(LZ1), /^\d+$/);
+  const c = await check('d-lz1');
+  assert.deepEqual([c.ok, reasons(c)], [false, ['lz_issued']]);
+  const t = c.problems[0].text;
+  assert.ok(t.includes(`ファイル #${LZ1}`) && t.includes('ロジザードから消すのが先です'), t);
+  assert.equal(t, D.lzIssuedText([LZ1]), 'lib の文 = DB の文 (0099 の前の DB でも同じ文)');
+  const v = D.draftCancelView(c);
+  assert.deepEqual([v.show, v.canGo], [true, false]);
+  assert.deepEqual(v.why.map((w) => [w.reason, w.word]), [['lz_issued', 'ロジザード登録の CSV に出した']]);
+  const e = await rejects(cancel('d-lz1'), 409, 'not_cancellable');
+  assert.match(e.message, new RegExp(`消せません: ロジザード登録の CSV に出しています \\(ファイル #${LZ1}\\)`));
+  const direct = await errOf(asEditor(async () => pg.query('select ops.cancel_sku_draft($1::uuid, $2, $3, $4::bigint) as r', [uuid(), 'naka@test', '理由', await sid('d-lz1')])));
+  assert.match(String(direct && direct.message), new RegExp(`^not_cancellable: d-lz1 は消せない \\(ロジザード登録の CSV に出しています \\(ファイル #${LZ1}\\)`));
+  assert.equal(await regOf('d-lz1'), 'draft');
+  const p = await page('d-lz1');
+  assert.match(p.html, /この下書きは、いまは消せません[\s\S]*data-reason="lz_issued"[\s\S]*ロジザード登録の CSV に出した[\s\S]*ロジザードから消すのが先です/);
+  assert.ok(p.html.includes(`ファイル #${LZ1}`));
+  assert.doesNotMatch(p.html, /id="deldraft-open"/);
+  const n = await post('d-lz1', { request_id: uuid(), reason: '理由', confirm: true });
+  assert.deepEqual([n.status, n.j.reason], [409, 'not_cancellable']);
+  assert.match(n.j.error, /ロジザード登録の CSV に出しています/);
+  assert.equal(await regOf('d-lz1'), 'draft');
+});
+await ta('[Z2] 0099 の前の DB (確かめに lz_issued が無い) でも lib が同じ理由を足す (画面は押せない)・消す前に断る (DB の関数を呼ばない)', async () => {
+  const calls = [];
+  const old = { query: async (t, p) => {
+    calls.push(t);
+    const r = await db.query(t, p);
+    if (/ops\.sku_draft_cancel_check\(/.test(t) && r.rows[0] && r.rows[0].r) {
+      const c0 = typeof r.rows[0].r === 'string' ? JSON.parse(r.rows[0].r) : r.rows[0].r;
+      const problems = c0.problems.filter((x) => x.reason !== 'lz_issued');
+      return { ...r, rows: [{ r: { ...c0, ok: problems.length === 0, problems } }] };
+    }
+    return r;
+  } };
+  const lz1 = await sid('d-lz1');
+  const c = await asEditor(() => D.readDraftCancelCheck(old, lz1));
+  assert.deepEqual([c.ok, reasons(c)], [false, ['lz_issued']]);
+  assert.equal(c.problems[0].text, D.lzIssuedText([LZ1]));
+  assert.equal(D.draftCancelView(c).canGo, false);
+  calls.length = 0;
+  await rejects(asEditor(() => D.cancelSkuDraft(old, { actor: 'naka@test', code: 'd-lz1', reason: '理由', requestId: uuid(), confirm: true }, { open: true })), 409, 'not_cancellable');
+  assert.ok(!calls.some((t) => /ops\.cancel_sku_draft\(/.test(t)), 'DB の関数の前に断る');
+  // 出していない下書き = lib は何も足さない
+  const ok = await asEditor(async () => D.readDraftCancelCheck(old, await sid('d-lz2')));
+  assert.deepEqual([ok.ok, ok.problems], [true, []]);
+  assert.deepEqual(await asEditor(async () => D.lzIssuedOf(db, await sid('d-lz2'))), []);
+});
+await ta('[Z3] 取り消した (voided) ファイルだけ = また消せる (画面に「この下書きを消す」)・消した後は CSV にもう出せない', async () => {
+  assert.equal((await lzVoid(LZ1)).ok, true);
+  const c = await check('d-lz1');
+  assert.deepEqual([c.ok, c.problems], [true, []]);
+  assert.deepEqual(await asEditor(async () => D.lzIssuedOf(db, await sid('d-lz1'))), []);
+  assert.match((await page('d-lz1')).html, /id="deldraft-open"/);
+  const r = await cancel('d-lz1', 'ロジザードから消した後に消す');
+  assert.equal(r.state, 'cancelled');
+  const e = await errOf(lzIssue('d-lz1'));
+  assert.match(String(e && e.message), /^cancelled: 登録をやめた商品/, '消した (やめた) 下書きにはバーコードを書かない');
+  // 前のバーコードの行のまま CSV を出す関数を直に呼んでも = やめた商品は出さない
+  const id = await sid('d-lz1');
+  const rr = (await one('select max(rule_row)::text as r from ops.sku_logizard_barcode_rules where sku_id = $1', [id])).r;
+  const e2 = await errOf(asEditor(async () => {
+    await pg.query('begin');
+    try { return await pg.query('select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), null)', [uuid(), 'naka@test', JSON.stringify([{ sku_id: id, code: 'd-lz1', rule_row: rr, kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' }])]); }
+    finally { await pg.query('rollback'); }
+  }));
+  assert.match(String(e2 && e2.message), /^invalid_input: d-lz1 は単品で使える商品でない/);
+});
+await ta('[Z4] まとまりの子の廃止も同じ: 出した = 409 lz_issued (ファイルの番号)・DB の関数を直に呼んでも断る・取り消すと廃止できる', async () => {
+  await asEditor(() => V.registerVariationBatch(db, { actor: 'naka@test', requestId: uuid(), group: { mode: 'new', code: 'dd-grp3', name: 'ロジザードの試験' }, axes: [{ axis: 1, name: 'カラー' }],
+    options: [{ axis: 1, code: '-GR', name: 'グリーン' }], children: [{ code: 'dd-grp3-GR', choices: { 1: '-GR' }, name: 'ロジザードの試験【グリーン】' }],
+    values: { standard_price: '1980', cost: { jpy: '500' }, tax_rate: '0.1', sales_class: '3', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0', inbound_date_managed: '0', shipping_code: 'S01' } },
+  { open: true, shippingRates: RATES }));
+  const f = await lzIssue('dd-grp3-GR');
+  const vc = (o = {}) => asEditor(() => V.cancelVariationChild(db, { actor: 'naka@test', requestId: o.requestId ?? uuid(), code: 'dd-grp3-GR', reason: '作らない' }, { open: true }));
+  const e = await rejects(vc(), 409, 'lz_issued');
+  assert.match(e.message, new RegExp(`ロジザード登録の CSV に出しています \\(ファイル #${f}\\)。ロジザードから消すのが先です`));
+  const direct = await errOf(asEditor(async () => {
+    await pg.query('begin');
+    try { return await pg.query('select ops.cancel_variation_child($1::uuid, $2, $3, $4::jsonb, $5::bigint) as r', [uuid(), 'naka@test', 'やめる', T.OWN, await sid('dd-grp3-GR')]); }
+    finally { await pg.query('rollback'); }
+  }));
+  assert.match(String(direct && direct.message), /^lz_issued: dd-grp3-GR はロジザード登録の CSV に出しています/);
+  assert.equal(await regOf('dd-grp3-GR'), 'draft');
+  await lzVoid(f);
+  assert.equal((await vc()).state, 'cancelled');
 });
 
 // ═══════════ [U] 画面の JS (Playwright) ═══════════

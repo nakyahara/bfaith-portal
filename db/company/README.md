@@ -2594,7 +2594,8 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   product-hub のカード (SQLite) は画面が Postgres の取引の前に読む (`liveCdbCardsForSku`): この SKU に結んだ / 同じコードのカードで除外していないものが 1 枚でもある = 409 `card_exists` (人が先に product-hub で除外する = 出品済み・出品中・RMS の実行中を人が確かめる)・読めない = 503 (消さない)。自動の除外はしない (Codex #1688 R1 High 2・3)。
   🚨 受け入れ: カードの取り込みの借り (120 秒) が切れた後もまだ SQLite に書いている、のまれな競りだけは閉じない = 消した後にカードが出たら product-hub で除外 (人の手順)
 - 🆕 Codex #1688 R1 High 1: `ops.transition_sku_registration` (0070 の版から写して 🆕 0071 の行だけ足した) = 下書き・NE 登録待ち → cancelled は 約束 `sku_draft_cancel` / `variation_child_cancel` の中だけ (同じ SKU・人・request_id)。master_ops が直に呼ぶと `draft_cancel_session_required` (42501)。表の持ち主のロールとそのメンバーは求めない
-- ロジザード: ロジザードの商品マスタへ出す CSV (`scripts/company-db/lz-daily.mjs`) は NE の取得の商品だけを回す (`apps/master-decisions/lz-cdb.mjs` の `classifyForLz`) = NE に配る前の下書きは出さない。手でロジザードに登録する道は人の決まり
+- ロジザード: ロジザードの商品マスタへ出す CSV (`scripts/company-db/lz-daily.mjs`) は NE の取得の商品だけを回す (`apps/master-decisions/lz-cdb.mjs` の `classifyForLz`) = NE に配る前の下書きは出さない。手でロジザードに登録する道は人の決まり。
+  🆕 ただし 0081 のロジザード登録の CSV は NE に配る前の下書きも出す = 出した下書きは 0099 から消さない (下の「ロジザード登録の CSV に出した下書きは消さない」)
 - 守りの写し: `ops.master_write_allowed` (0067 の版 + 6 行 = CSV の 2 表・構成の依頼・JAN・JAN を外したときの SKU / 商品の version)・`core.guard_master_edit_jan` (0053 の版 + 約束 `sku_draft_cancel` の UPDATE だけ)・約束の操作の CHECK (0070 の版 + `sku_draft_cancel`)
 - 画面 = 商品の画面の「この下書きを消す」(名簿 MASTER_EDITORS の人 = 下書きを作れる人と同じ・MASTER_EDIT_OPEN の後)。一覧はやめた商品をふだん出さない (札「やめた商品」・商品コードでぴったり探すと出る)
 - 当て方 (🚨 まだ流さない): 0070 の後 → `migrate.mjs --dry-run` (0071 だけ) → 中原さんの OK → 本適用 → **ロールの script を流し直す** (`create-master-edit-roles.mjs` = master_edit に 2 つの関数の実行・`create-watch-roles.mjs` = watcher に確かめ。どちらも引数なし = パスワードは変えない)。流さなくても今の動きは変わらない (画面は確かめを読めない = 何も出さない)
@@ -2790,3 +2791,14 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): 番号 = 0085 (0083 = #1734・0084 = #1739 メーカーの次) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を足すだけ・表は変えない) → 中原さんの OK → 本適用 →
   `create-master-edit-roles.mjs` を流し直す (引数なし)。それまで画面の欄は「画面のロールに出荷を読む関数がまだありません」と出す (画面のほかの所は動く)
 - 試験 = `node scripts/test-master-movements.mjs` (計算・関数の権限・API) / `test-master-movements-ui.mjs` (画面) / 測る道具 `scripts/company-db/movements-measure.mjs` (PR-0・watcher で読むだけ)
+
+### ロジザード登録の CSV に出した下書きは消さない (0099 仮番号・マージの時に付け替える・2026-10-18 中原さんの決定)
+- **なぜ**: 0071 は「ロジザードへ出す CSV は NE にある商品だけ = NE に配る前の下書きは出さない」が前提だった。0081 のロジザード登録の CSV (`lib/lz-new-export.mjs`) は
+  新商品の登録から来た単品を NE に配る前の下書きのうちから出す = 出した下書きを消すと、ロジザードにだけ商品が残る
+- **関数を作り直す** (どちらも前の版を写して 🆕 0099 の行だけ足した・値は変えない): `ops.sku_draft_cancel_check` (0071 の版) = 品目が issued のロジザード登録の CSV がある = 理由 `lz_issued` (ファイルの番号)・
+  `ops.cancel_variation_child` (0073 の版) = 子の廃止も `lz_issued` で断る。取り消した (voided) ファイルだけなら消せる・廃止できる。`ops.cancel_sku_draft` は確かめを鍵の後に呼ぶだけ = 変えない
+- **競り**: CSV を出す関数 (`ops.lz_new_export_issue`) も消す関数も、同じ SKU の鍵 (`core.sku:<id>`) を行の鍵より先に取り、鍵の後に相手の結果を読む (出す = やめていないか・消す = 出していないか) = 片方だけが通る。
+  CSV を出す関数はほかの鍵 (段階・NE の CSV・NE のコード・まとまり) を取らない = 待ちの輪ができない
+- 画面 = 商品の画面の「この下書きを消す」の帯に理由 (「ロジザード登録の CSV に出しています (ファイル #N)。ロジザードから消すのが先です」)。lib (`lib/master-draft-cancel.mjs`) は 0099 の前の DB でも同じ理由で断る (鍵なしの先回り)
+- 当て方 (🚨 まだ流さない): アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を作り直すだけ) → 中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま)
+- 試験 = `node scripts/test-master-draft-cancel.mjs` ([M4]・[Z]) / `scripts/test-master-draft-cancel-pg.mjs` ([8] 出すと消すの競り・実 PostgreSQL)
