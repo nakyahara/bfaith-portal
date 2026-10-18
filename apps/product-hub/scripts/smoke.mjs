@@ -11842,6 +11842,23 @@ for (const [name, file, data] of renders) {
     bh.includes('title="裏面の成分表示を確認"'));
   check('ボード: 「🔍 確認中」チップが件数付きで出る',
     /🔍 確認中 \d+/.test(bh), bh.includes('🔍 確認中') ? '件数が付いていない' : 'チップが無い');
+  // 黒背景テーマ (2026-10-13): 詳細画面の色は var(--phd-<役割>-<色>, 元の色) で書き、_detail-theme で黒地向けの値を入れる。
+  // 変数の定義が抜けると黒地に元の明るい色がそのまま出るので、描画結果で「使った変数はすべて定義済み」を確かめる
+  {
+    const missing = new Set(); let pages = 0;
+    for (const [name, html] of renderedHtml) {
+      if (!name.startsWith('detail.ejs')) continue;
+      pages += 1;
+      const defined = new Set([...html.matchAll(/(--phd-(?:bg|fg|bd)-[0-9a-f]{3,6})\s*:/g)].map((m) => m[1]));
+      for (const m of html.matchAll(/var\((--phd-(?:bg|fg|bd)-[0-9a-f]{3,6})\b/g)) if (!defined.has(m[1])) missing.add(m[1]);
+    }
+    check('黒テーマ: 詳細画面で使う色の変数はすべて _detail-theme に定義がある', pages > 0 && missing.size === 0,
+      pages === 0 ? '詳細画面の描画が無い' : [...missing].join(', '));
+    const bh0 = renderedHtml.get('board.ejs') || '';
+    check('黒テーマ: ボードと詳細の両方に共通テーマが入り、黒地は画面だけ (@media screen)',
+      bh0.includes('--kb-bg:') && (renderedHtml.get('detail.ejs') || [...renderedHtml].find(([n]) => n.startsWith('detail.ejs'))?.[1] || '').includes('--kb-bg:')
+      && /@media screen \{\s*:root \{\s*--kb-bg:/.test(bh0));
+  }
   const bhOnly = renderedHtml.get('board.ejs (確認中で絞り込み)') || '';
   check('ボード: 確認中で絞ると そのチップだけが on になる',
     /<a class="chip on"\s+href="[^"]*filter=checking/.test(bhOnly)
@@ -13720,7 +13737,9 @@ for (const [name, file, data] of renders) {
     const mkEl = (extra = {}) => {
       const ls = {};
       return {
-        dataset: {}, style: {}, value: '', checked: false, disabled: false, textContent: '',
+        // style は CSS 変数 (--pri-bg / --pri-fg) を setProperty / removeProperty で書く (2026-10-13 黒テーマ)
+        dataset: {}, style: { setProperty(k, v) { this[k] = v; }, removeProperty(k) { delete this[k]; } },
+        value: '', checked: false, disabled: false, textContent: '',
         addEventListener(t, fn) { (ls[t] = ls[t] || []).push(fn); },
         fire(t) { return Promise.all((ls[t] || []).map((fn) => fn())); },
         ...extra,

@@ -4,6 +4,7 @@
     タグ類は「明るい地 + 濃い文字」を「色の薄い半透明の地 + 明るい文字 + 色の縁」に置き換え、
     色の意味 (赤 = 要対応・緑 = 済・黄 = 保留 …) はそのまま残す。
     黒背景は画面だけ (@media screen)。印刷は背景が落ちて白地に明るい文字が残るので、従来の明るい表示のまま %>
+<%- include('_dark-theme') %>
 <style>
   /* inline style から外した色の、明るい表示 (印刷) での受け皿 */
   .kb-col.kb-col-done { background: #f0fdf4; }
@@ -14,64 +15,6 @@
   @media print { .kb-priority { background: #fff !important; color: #1f2430 !important; } }
 
 @media screen {
-  :root {
-    --kb-bg: #05080f;
-    --kb-panel: rgba(13, 20, 36, .82);
-    --kb-panel-2: rgba(18, 28, 50, .9);
-    --kb-line: rgba(56, 189, 248, .16);
-    --kb-line-strong: rgba(56, 189, 248, .38);
-    --kb-text: #e2e8f0;
-    --kb-sub: #b6c2d2;
-    /* 補助文字。10〜12px の地の文で 4.5:1 を割らない明るさ (#64748b だと 3.6:1 で読めない: Codex R3) */
-    --kb-dim: #94a3b8;
-    --kb-cyan: #22d3ee;
-    --kb-blue: #60a5fa;
-    --kb-violet: #a78bfa;
-    --kb-glow: 0 0 0 1px rgba(34, 211, 238, .35), 0 0 18px rgba(34, 211, 238, .18);
-  }
-  html { background: var(--kb-bg); color-scheme: dark; }
-  body {
-    color: var(--kb-text);
-    background:
-      radial-gradient(1200px 600px at 10% -10%, rgba(34, 211, 238, .10), transparent 60%),
-      radial-gradient(900px 500px at 100% 0%, rgba(139, 92, 246, .12), transparent 60%),
-      linear-gradient(rgba(56, 189, 248, .045) 1px, transparent 1px) 0 0 / 32px 32px,
-      linear-gradient(90deg, rgba(56, 189, 248, .045) 1px, transparent 1px) 0 0 / 32px 32px,
-      var(--kb-bg);
-    background-attachment: fixed;
-  }
-  ::selection { background: rgba(34, 211, 238, .35); }
-  * { scrollbar-color: rgba(56, 189, 248, .35) transparent; }
-  ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-thumb { background: rgba(56, 189, 248, .3); border-radius: 999px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-
-  /* ---- 共通部品 (_header の白基調を上書き) ---- */
-  .topbar { background: rgba(5, 8, 15, .85); border-bottom: 1px solid var(--kb-line-strong);
-            box-shadow: 0 1px 24px rgba(34, 211, 238, .12); backdrop-filter: blur(8px); }
-  .topbar .app-title { color: #fff; text-shadow: 0 0 10px rgba(34, 211, 238, .55); letter-spacing: .04em; }
-  .topbar a { color: var(--kb-sub); }
-  .topbar a:hover { color: var(--kb-cyan); }
-  .card { background: var(--kb-panel); border-color: var(--kb-line); color: var(--kb-text);
-          box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03); }
-  .btn { background: rgba(15, 23, 42, .7); border-color: var(--kb-line-strong); color: var(--kb-text); }
-  .btn:hover { background: rgba(34, 211, 238, .12); border-color: var(--kb-cyan); }
-  .btn-primary { background: linear-gradient(135deg, #0891b2, #2563eb); border-color: #22d3ee; color: #fff; }
-  .btn-primary:hover { background: linear-gradient(135deg, #06b6d4, #3b82f6); }
-  .btn-danger { color: #fca5a5; border-color: rgba(248, 113, 113, .5); }
-  .muted, .kb-set-note, .kb-empty, .mini, .kb-code { color: var(--kb-dim); }
-  label { color: var(--kb-sub); }
-  a { color: var(--kb-blue); }
-  input[type=text], input[type=number], input[type=url], input[type=search], textarea, select {
-    background: rgba(2, 6, 14, .8); color: var(--kb-text); border-color: var(--kb-line-strong); }
-  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--kb-cyan); box-shadow: var(--kb-glow); }
-  input::placeholder, textarea::placeholder { color: var(--kb-dim); }
-  option { background: #0b1222; color: var(--kb-text); }
-  .banner-warn { background: rgba(250, 204, 21, .1); border-color: rgba(250, 204, 21, .45); color: #fde68a; }
-  table.list th { color: var(--kb-cyan); border-bottom-color: var(--kb-line-strong); letter-spacing: .03em; }
-  table.list td { border-bottom-color: rgba(56, 189, 248, .08); }
-  table.list tr:hover td { background: rgba(34, 211, 238, .05); }
-  .thumb, .kb-thumb { background: #0b1222; border-color: var(--kb-line); }
 
   /* ---- 見出し・絞り込み・タブ ---- */
   .kb-board-title { color: #fff; letter-spacing: .06em;
