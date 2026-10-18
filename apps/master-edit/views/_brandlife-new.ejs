@@ -1,0 +1,20 @@
+<%#
+  🆕 0085 新商品の登録のブランド・商品の段階 (単品 = 別の板 / まとまり = 共通の欄の中の 1 つの塊 = 全部の子に同じ値)。どれも必須でない (「値か入力なし」に数えない = 空 = なし)。
+  Company DB だけ (NE・ロジザード・product-hub には送らない)。発売日 (初めて売った日) は入れない = 売れたら Company DB の注文・出荷から自動で出る (商品の画面)
+  渡す値: bl = { brands, max, stages }・dis・canCreate・forAll = まとまり (全部の子に同じ値) か
+%>
+<%
+  const all = forAll ? '全部の子に同じ値 · ' : '';
+%>
+<div class="f" data-row="brand"><label class="lab" for="f-brand-in">ブランド<span class="opt">任意</span></label>
+  <div class="ctl"><%- include('_brand', { base, bl, cur: null, dis, canCreate, extraHidden: '' }) %>
+    <span class="hint" style="flex-basis:100%"><%= all %>メーカーとは別 (自社ブランド・他社ブランド) · 一覧に無いときは打って「新しいブランドとして登録」か「自社ブランドとして登録」 · 入れないときは空のまま · Company DB だけ (NE・ロジザードには送りません)</span></div></div>
+<div class="f" data-row="life_stage"><label class="lab" for="f-life_stage">区分<span class="opt">任意</span></label>
+  <div class="ctl"><select class="in w-s" id="f-life_stage" data-field="life_stage" data-dirty-field="life_stage" data-label="区分 (定番・季節・試し)"<%= dis %>>
+    <option value="">(なし)</option><% for (const [k, v] of Object.entries(bl.stages)) { %><option value="<%= k %>"><%= v %></option><% } %>
+  </select><span class="hint"><%= all %>定番 = ずっと売る · 季節 = 時季だけ · 試し = 売れ行きを見る</span></div></div>
+<div class="f" data-row="end_planned_on"><label class="lab" for="f-end_planned_on">終売の予定日<span class="opt">任意</span></label>
+  <div class="ctl"><input class="in w-s" type="date" id="f-end_planned_on" min="2000-01-01" max="2099-12-31" data-field="end_planned_on" data-dirty-field="end_planned_on" data-label="終売の予定日"<%= dis %>>
+    <span class="hint"><%= all %>決まっていれば · 一覧の「終売の予定が近い」で探せます</span></div></div>
+<div class="f" data-row="first_sold"><div class="lab">発売日</div>
+  <div class="ctl"><span class="muted">入れなくてよい · 初めて売れた日を Company DB の注文・出荷から自動で出します (商品の画面)</span></div></div>

@@ -2765,6 +2765,19 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   🚨 ロールを流し直した瞬間から、開いたままの古い新商品の画面 (メーカーの欄も「入力なし」も無い) の登録は「画面を開き直してください」(400) になる (ほかの「入力なし」の項目を足したときと同じ)
 - 試験 = `node scripts/test-master-maker.mjs` (名前の形・0084 の形と権限・守り・名簿・登録・まとまり・商品の画面・一覧 / CSV・夜間ロード・ロールの流し直しの前) / `test-master-maker-ui.mjs` (画面の動き・日本語入力の確定の Enter・スマホの幅)
 
+### ブランドの名簿と商品ごとのブランド・商品の段階 (区分・終売の予定日)・初めて売った日 (0085 仮番号 = マージの時に 0087 などの空き番号へ・2026-10-17 中原さん)
+- **なぜ別の表か**: `core.products.brand` (0002) は夜間ロードの属性の解決 (`engine.mjs` の 10. = qoo10 / product_hub の観測) が書く列 = ポータルで入れた値を翌朝に上書きする / 消す道がある。`own_brand` は商品の行の印 (ブランドの印ではない・持ち主の表にも無い)。
+  `release_date` も夜間ロードが書く列 (カタログの発売日) = 「初めて売った日」とは別。→ メーカー (0084) と同じく **Company DB だけの別の表** (夜間ロード・NE / ロジザード / product-hub は触らない・送らない)。mart の `p.brand` / `p.own_brand` はそのまま
+- **表** `core.brands` (名簿・`name_norm` = メーカーと同じ決まり `core.maker_name_norm`・会社の中で一意・`own_brand` = 自社ブランド) / `core.product_brands` (単品の商品の行ごとの今のブランド) /
+  `core.product_lifecycle` (区分 `stage` = staple 定番 / seasonal 季節 / trial 試し・終売の予定日 `end_planned_on`・どちらも無い = 行が無い) /
+  記録 (追記だけ) `ops.product_brand_events`・`ops.brand_requests` (名簿に足す要求の控え)・`ops.brand_flag_events` (自社ブランドの印)・`ops.product_lifecycle_events`。書くのは関数の中だけ (印 `ops.brand_life_protocol`)・TRUNCATE できない
+- **関数** `ops.create_brand(request_id, 人, 名前, 自社か)` / `ops.set_brand_own(request_id, 人, ブランド, 印, 見ていた印, 理由)` / `ops.set_product_brand(…)`・`ops.set_product_lifecycle(…)` (メーカーと同じ門 = 新商品の登録・まとまりの登録・商品の画面の保存の取引の中だけ・見ていた値と違う = version_conflict) /
+  読む `ops.sku_first_sold(sku_ids)` (初めて売った日 = NE の出荷 (受注日・platform `_ignore` の店 = FBA 納品などは数えない) とモールの注文 (出品の構成・セットの構成品 1 段) のいちばん早い日と出どころ) / `ops.sales_records_from()` (記録の始まり)。注文・出荷の表は画面のロールに読ませない
+- **必須でない**: 新商品の登録の「値か入力なし」(`lib/master-register-blanks.mjs`) に数えない = 送らなくても登録できる (送ったときだけ確かめる)
+- 当て方 (🚨 まだ流さない): 番号を付け替え (0084 メーカー・0085 入出庫・0086 寸法の後 = 0087 の見込み) → **アプリを先に** → `migrate.mjs --dry-run` (この 1 本だけ・表と関数を足すだけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す。
+  アプリは 0085 の前・ロールの流し直しの前のどちらでも欄を出さない (`brandLifeReady`)・値が来たら 503。「入力なし」に数えないので、流し直しで開いたままの古い画面が 400 になることは無い
+- 試験 = `node scripts/test-master-brand-life.mjs` / `test-master-brand-life-ui.mjs`
+
 ### 要確認 (quarantined) の商品を確認済みにする (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える
 - **照合 ② の確かめ待ち** (`ops.v_ne_reg_targets`): 要確認を全部 (単品もセットも・親のある子も・持ち主を問わず・コード 80 字まで) = 毎朝の照合 ② が要確認の NE の観測を残す (miniPC のコードは変えない・新しい定期実行なし)

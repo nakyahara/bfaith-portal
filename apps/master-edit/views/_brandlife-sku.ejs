@@ -1,0 +1,29 @@
+<%#
+  🆕 0085 商品の画面のブランド・商品の段階の板 (中原さん 2026-10-17・単品だけ・仕入先の板の下・別の板 = ほかの欄と混ぜない)。Company DB だけ (NE・ロジザード・product-hub には送らない)。
+  ブランド・区分・終売の予定日 = 右の「保存する」と一緒に保存 (lib/master-write.mjs の saveSku → ops.set_product_brand / ops.set_product_lifecycle)。空にして保存 = 外す
+  発売日 = 初めて売った日 (人は入れない・Company DB の注文・出荷から毎回出す = ops.sku_first_sold・出どころと記録の始まりも出す)
+  渡す値: c = 今 (readCurrent)・bl = router の brandLife ({ brands, max, stages, soonDays, first, end })・row / meta / editable = sku.ejs の部品・canSave・base
+%>
+<%
+  const STAGE = bl.stages || {};
+  const stageNow = c.lifecycle ? c.lifecycle.stage : null;
+  const endNow = c.lifecycle ? c.lifecycle.end_planned_on : null;
+  const fs = bl.first || { text: '—', source: '', note: '', beforeRecords: false };
+  const eb = bl.end && bl.end.badge;
+  const stageSel = '<select class="in w-s" id="f-life_stage" ' + meta('life_stage') + '><option value=""' + (stageNow ? '' : ' selected') + '>(なし)</option>'
+    + Object.entries(STAGE).map(([k, v]) => '<option value="' + k + '"' + (stageNow === k ? ' selected' : '') + '>' + v + '</option>').join('') + '</select>';
+  const endIn = '<input class="in w-s" type="date" id="f-end_planned_on" min="2000-01-01" max="2099-12-31" ' + meta('end_planned_on') + ' value="' + (endNow || '') + '">';
+  const endHint = (eb && eb.text ? '<span class="b ' + eb.tone + '" id="end-badge">' + eb.text + '</span> ' : '') + '一覧の「終売の予定が近い」(' + bl.soonDays + ' 日以内・過ぎたものも) で探せます · 空にして保存 = なし';
+%>
+<section class="panel" id="sec-brandlife" aria-labelledby="h-brandlife">
+  <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-tag"/></svg></span><h2 id="h-brandlife">ブランド・商品の段階</h2><span class="sub">Company DB だけ (NE・ロジザードには送りません)</span></div>
+  <%- row('brand', 'ブランド', include('_brand', { base, bl, cur: c.brand, dis: '', canCreate: canSave, extraHidden: '' }),
+    c.brand ? c.brand.name + (c.brand.own_brand ? ' (自社ブランド)' : '') : 'なし',
+    { forId: 'f-brand-in', hint: 'メーカーとは別 (自社ブランド・他社ブランド) · 一覧に無いときは打って「新しいブランドとして登録」か「自社ブランドとして登録」· 空にして保存 = ブランドを外す' }) %>
+  <div class="f" data-row="first_sold"><div class="lab" id="lab-first_sold">発売日</div>
+    <div class="ctl"><span id="first-sold"<%- fs.error ? ' class="muted"' : '' %>><b><%= fs.text %></b></span><% if (fs.beforeRecords) { %><span class="b warn" id="first-sold-early">これより前かも</span><% } %>
+      <span class="hint" id="first-sold-src">初めて売った日 · 自動 (人は入れません)<%= fs.source ? ' · ' + fs.source + 'から' : '' %></span>
+      <span class="hint" style="flex-basis:100%" id="first-sold-note"><%= fs.note %></span></div></div>
+  <%- row('life_stage', '区分', stageSel, stageNow ? (STAGE[stageNow] || stageNow) : 'なし', { forId: 'f-life_stage', hint: '定番 = ずっと売る · 季節 = 時季だけ · 試し = 売れ行きを見る' }) %>
+  <%- row('end_planned_on', '終売の予定日', endIn, endNow ? endNow.replace(/-/g, '/') + (eb && eb.text ? ' (' + eb.text + ')' : '') : 'なし', { forId: 'f-end_planned_on', hint: endHint }) %>
+</section>

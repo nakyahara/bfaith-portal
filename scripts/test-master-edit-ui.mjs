@@ -1855,7 +1855,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);   // 前の試験の設定を消す
   await p.goto(B + '/?q=' + encodeURIComponent('単品'));
   assert.deepEqual(await shownHeads(p), LIST_DEFAULT.shown, 'いつもの列 (仕入先は出さない)');
-  assert.equal(await p.textContent('#colcnt'), '16/18');
+  assert.equal(await p.textContent('#colcnt'), '16/21');   // 🆕 0085: ブランド・段階の 3 列 (出さない)
   assert.equal(await p.isVisible('#list-tbl tbody tr:first-child .sup-sub'), true, '仕入先の列が無い = 名前の下に「仕入先」');
   // 板を開く: コードは外せない・↑↓ も押せない・FBA などは「並べられない」
   await p.click('#colbtn');
@@ -1884,7 +1884,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   // つまみで動かす (売価を名前の前へ)
   await p.dragAndDrop('#collist li[data-id="price"] .grip', '#collist li[data-id="name"]');
   assert.deepEqual((await shownHeads(p)).slice(0, 4), ['code', 'sup', 'price', 'name']);
-  assert.equal(await p.textContent('#colcnt'), '16/18');
+  assert.equal(await p.textContent('#colcnt'), '16/21');   // 🆕 0085: ブランド・段階の 3 列 (出さない)
   if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1280_cols.png` });
   // 保存 → 「未保存」が消える・別の窓 (= 別の PC。同じログイン) で開いても同じ列
   await p.click('#cp-save');

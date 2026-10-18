@@ -39,9 +39,15 @@ export const LIST_COLUMNS = Object.freeze([
   { id: 'flags', label: '対応が必要', width: 'width:150px' },
   // 🆕 0084 (2026-10-17): メーカー (Company DB だけの値・単品だけ)。前の列の並びを変えないよう最後に足す・いつもの列では出さない (列の板で出す)・並べられない
   { id: 'maker', label: 'メーカー', isNew: true, width: 'min-width:140px', th: 'th-maker' },
+  // 🆕 0085 (2026-10-17): ブランド・定番 / 季節 / 試し・終売の予定日 (Company DB だけの値・単品だけ)。メーカーの後ろに足す・いつもの列では出さない・並べられない
+  { id: 'brand', label: 'ブランド', isNew: true, width: 'min-width:140px', th: 'th-brand' },
+  { id: 'stage', label: '定番/季節/試し', isNew: true, width: 'width:96px', th: 'th-stage' },
+  { id: 'end_on', label: '終売の予定日', isNew: true, width: 'width:120px', th: 'th-end-on' },
 ].map((c) => Object.freeze({ ...c, cell: c.cell || c.id })));
 
 export const COLUMN_IDS = Object.freeze(LIST_COLUMNS.map((c) => c.id));
+/** 🆕 0085 の新しい列 (いつもの列では出さない) */
+const NEW_0085 = Object.freeze(['brand', 'stage', 'end_on']);
 export const COLUMN_BY_ID = Object.freeze(Object.fromEntries(LIST_COLUMNS.map((c) => [c.id, c])));
 /** 並べられる列 (URL の ?sort= で受ける名前)。これ以外は使わない (= コード順) */
 export const SORTABLE = Object.freeze(LIST_COLUMNS.filter((c) => c.sort).map((c) => c.id));
@@ -53,7 +59,7 @@ const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
  */
 export const DEFAULT_VIEW = Object.freeze({
   order: Object.freeze([...COLUMN_IDS]),
-  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup' && id !== 'maker')),   // 🆕 0084: メーカーも新しい列 = 出さない
+  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup' && id !== 'maker' && !NEW_0085.includes(id))),   // 🆕 0084: メーカーも新しい列 = 出さない
 });
 
 /**

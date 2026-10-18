@@ -32,6 +32,11 @@
   // 画面の JS に渡す値 (JSON = EJS の出力を JS の値の位置に直に置かない)
   const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs, blankKeys, blankLabels } : null;
 %>
+<%
+  // 🆕 0085: ブランド・商品の段階の板 (単品だけ・0085 の欄が使えるときだけ)。飛び先の帯は「税・分類・仕入先」の次 (どれも必須でない = 「あと N つ」には数えない)
+  const showBrandLife = !!page && !isSet && !!locals.brandLife;
+  if (showBrandLife) secs.splice(secs.findIndex((x) => x[0] === 'sec-tax') + 1, 0, ['sec-brandlife', 'ブランド・段階']);
+%>
   <%- include('_header', { hasSave: canSave }) %>
   <div class="page" id="new-page">
     <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">新商品の登録</span></nav>
@@ -137,6 +142,13 @@
               <span class="hint" style="flex-basis:100%">問屋から仕入れるときは、仕入先とは別に作っている会社を · 一覧に無いときは打って「新しいメーカーとして登録」 · 「仕入先と同じ」= 代表の仕入先の名前 · Company DB だけ (NE・ロジザードには送りません)</span></div></div>
           <% } %>
         </section>
+        <%# 🆕 0085 ブランド・商品の段階 (中原さん 2026-10-17)。Company DB だけ・どれも必須でない (空 = なし)。部品 = _brandlife-new.ejs (まとまりと同じ) %>
+        <% if (showBrandLife) { %>
+        <section class="panel" id="sec-brandlife" aria-labelledby="h-brandlife">
+          <div class="panel-h"><span class="stepno" data-step="sec-brandlife" aria-hidden="true"><%= no('sec-brandlife') %></span><h2 id="h-brandlife">ブランド・商品の段階</h2><span class="sub">どれも入れなくてよい · あとで商品の画面でも入れられます</span></div>
+          <%- include('_brandlife-new', { base, bl: brandLife, dis, canCreate: canSave, forAll: false }) %>
+        </section>
+        <% } %>
         <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。下書きの保存と一緒に送る = Company DB の登録が通った後に発注アプリへ (部品 = _order.ejs・public/me-order.js) %>
         <%- include('_order', { os: orderSettings, mode: 'new', dis, stepNo: no('sec-order'), base, code: null }) %>
         <% } %>
@@ -259,7 +271,7 @@
   <%- include('_footer') %>
   <%# 並び: 入力なし (me-none) → メーカー (me-maker・0084 の欄があるときだけ) → 画面 → 発注の設定 (読み終わったら画面に数え直してもらう = MasterEdit.recount) %>
   <% if (page) { %><script src="<%= base %>/public/me-none.js?v=<%= assetV %>" defer></script><% } %>
-  <% if (page && !isSet && locals.makerReady) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && !isSet && (locals.makerReady || showBrandLife)) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-new.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page && !isSet && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
 </body>
