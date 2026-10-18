@@ -72,7 +72,8 @@ await ta('[K1] 知らせの中身の形 = JS と DB が同じ答え (正しい�
   const ok = X.orderPayloadOf('kp-1', baseOf({ order_lot: '12', case_lot: null, capacity_per_unit: '1.5' }, { newCondition: { condition_id: 'c-new', display_name: '新しい条件', condition_type: '金額', unit: '円', condition_value: '30000' },
     newMaterial: { group_id: 'honey', name: 'はちみつ', min_order_qty: '20', unit: 'kg' } }));
   assert.equal(ok.patch.capacity_per_unit, '1.5'); assert.equal(ok.new_condition.maker_name, null);
-  const samples = [ok, { ...ok, extra: 1 }, (({ patch, ...o }) => o)(ok), { ...ok, schema: 'po-settings-v2' }, { ...ok, code: '' }, { ...ok, supplier_code: 1 },
+  // 🆕 0099 (仮・⑤-2): v2 = v1 の鍵 + vendor。v2 の版で v1 の鍵 = 鍵の誤り (版の誤りは知らない版だけ)
+  const samples = [ok, { ...ok, extra: 1 }, (({ patch, ...o }) => o)(ok), { ...ok, schema: 'po-settings-v3' }, { ...ok, code: '' }, { ...ok, supplier_code: 1 },
     { ...ok, patch: { bogus: '1' } }, { ...ok, patch: { order_lot: 12 } }, { ...ok, patch: [] }, { ...ok, new_condition: { condition_id: 'x' } },
     { ...ok, new_condition: { ...ok.new_condition, condition_value: 30000 } }, { ...ok, new_condition: 'x' }, { ...ok, new_material: null, new_condition: null },
     { ...ok, new_material: [] }, { ...ok, new_material: { ...ok.new_material, unit: true } }, [], 'x'];
@@ -87,6 +88,36 @@ await ta('[K1] 知らせの中身の形 = JS と DB が同じ答え (正しい�
   for (const p of [ok, { ...ok, new_condition: null, new_material: null, patch: {} }, X.orderPayloadOf('ﾃｽﾄ-日本', baseOf())]) {
     assert.equal(X.orderPayloadHash(p), (await one('select ops.js_stable_sha256($1::jsonb) as h', [JSON.stringify(p)])).h);
   }
+});
+
+await ta('[K2] 🆕 0099 (仮・⑤-2) 知らせ v2 (先方品番・入数つき) = JS と DB が同じ答え・先方品番が無い = v1 のまま・hash も DB と同じ・印の関数がある = v2 を積める', async () => {
+  const v1 = X.orderPayloadOf('kp-2', baseOf({ order_lot: '3' }));
+  assert.equal(v1.schema, 'po-settings-v1');
+  const base2 = MEO.orderBaseOf({ order: { patch: { order_lot: '3' }, newCondition: null, newMaterial: null, vendor: { vendor_code: ' AC-9 ', qty_per_unit: '２４' } }, supplierCode: '0001' });
+  assert.deepEqual(base2.vendor, { vendor_code: 'AC-9', qty_per_unit: '24' });
+  const ok = X.orderPayloadOf('kp-2', base2);
+  assert.equal(ok.schema, 'po-settings-v2');
+  const samples = [ok, { ...ok, vendor: { vendor_code: 'X', qty_per_unit: null } }, (({ vendor, ...o }) => o)(ok), { ...ok, schema: 'po-settings-v1' },
+    { ...ok, vendor: null }, { ...ok, vendor: { vendor_code: 'X' } }, { ...ok, vendor: { vendor_code: '', qty_per_unit: null } }, { ...ok, vendor: { vendor_code: 'x'.repeat(101), qty_per_unit: null } },
+    { ...ok, vendor: { vendor_code: 7, qty_per_unit: null } }, { ...ok, vendor: { vendor_code: 'X', qty_per_unit: 24 } }, { ...ok, code: '' }, { ...v1, vendor: { vendor_code: 'X', qty_per_unit: null } }];
+  const want = [null, null, 'payload_keys', 'payload_keys', 'vendor', 'vendor_keys', 'vendor_code', 'vendor_code', 'vendor_code', 'vendor_value', 'code', 'payload_keys'];
+  for (const [i, p] of samples.entries()) {
+    const js = X.orderPayloadShapeProblem(p);
+    const dbp = (await one('select ops.order_settings_payload_problem($1::jsonb) as p', [JSON.stringify(p)])).p;
+    assert.equal(js, want[i], `JS ${i}: ${JSON.stringify(p).slice(0, 80)}`);
+    assert.equal(dbp, js, `DB と JS が違う ${i}`);
+  }
+  assert.equal(X.orderPayloadHash(ok), (await one('select ops.js_stable_sha256($1::jsonb) as h', [JSON.stringify(ok)])).h);
+  assert.equal(await X.orderPayloadV2Ready(pg), true);
+  // 届けの入力: v2 = vendor を渡す・v1 = 今までと同じ (vendor の鍵が無い)
+  assert.deepEqual(X.deliveryInputOf({ payload: ok, created_by: 'a', delivery_request_id: 'r' }).vendor, { vendor_code: 'AC-9', qty_per_unit: '24' });
+  assert.ok(!('vendor' in X.deliveryInputOf({ payload: v1, created_by: 'a', delivery_request_id: 'r' })));
+  // 先方品番だけ = 全部空ではない (知らせを積む)・入数だけ = 断る・商品の画面の「発注の設定を保存」は先方品番を受けない
+  assert.deepEqual(MEO.orderInputOf({ vendor_code: 'AC-1', qty_per_unit: '' }).vendor, { vendor_code: 'AC-1', qty_per_unit: null });
+  assert.throws(() => MEO.orderInputOf({ vendor_code: '', qty_per_unit: '3' }), (e) => e.status === 400 && e.extra.field === 'vendor_code');
+  assert.equal(MEO.orderInputOf({ vendor_code: '', qty_per_unit: '' }), null);
+  assert.throws(() => MEO.orderInputOf({ order_lot: '1', vendor_code: 'A' }, { allowEmpty: true, allowVendor: false }), (e) => e.status === 400);
+  assert.throws(() => MEO.orderBaseOf({ order: { patch: {}, vendor: { vendor_code: 'A', qty_per_unit: null } }, supplierCode: '' }), (e) => e.status === 400 && e.extra.field === 'vendor_code');
 });
 
 console.log('\n積む (登録と同じ取引)');

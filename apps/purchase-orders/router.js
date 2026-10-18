@@ -42,6 +42,7 @@ import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 import { startFbaAutoRefresh, nextBusinessDay9Jst } from './scheduler.js';
 import { masterLegacyGate, legacyRecheck } from '../../lib/master-legacy-gate.mjs';
 import { orderOutboxStatus, readOrderSettingsPendingFor } from '../../lib/order-settings-outbox.mjs';
+import { productForVendorMap, upsertVendorCode, setQtyPerUnit, deleteVendorCode, vendorStamp, normVendorCode, QPU_MAX, QPU_ERR } from './vendor-codes.js';
 import { withCompanyDb } from '../../lib/product-hub-outbox.mjs';
 import {
   writeOrderSettings, clearProductLinks, writeGroup, deleteGroup, OrderSettingsError, ATTR_FIELDS, hasLinkage, orderLotSource,
@@ -1607,6 +1608,11 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
       // 全置換で入数 (単位換算) を消さない: 既存値を控えて同一商品に引き継ぐ (CSVに入数列があればそちら優先)
       const oldQpu = new Map(db.prepare('SELECT product_key, qty_per_unit FROM po_vendor_code_map WHERE supplier_code=? AND qty_per_unit IS NOT NULL')
         .all(supplierCode).map(r => [r.product_key, r.qty_per_unit]));
+      // 商品ごとの記録 (changed_keys = 足した・消した・番号 / 入数が変わった商品)。新商品の登録の知らせが「だれかがもう触った」を見る (CompanyDB構想 27 §2.4 の 10)
+      const sig = (vc, q) => JSON.stringify([vc, q ?? null]);
+      const oldRows = new Map(db.prepare('SELECT product_key, vendor_code, qty_per_unit FROM po_vendor_code_map WHERE supplier_code=?')
+        .all(supplierCode).map(r => [r.product_key, sig(r.vendor_code, r.qty_per_unit)]));
+      const newRows = new Map();
       db.prepare('DELETE FROM po_vendor_code_map WHERE supplier_code=?').run(supplierCode);
       const ins = db.prepare('INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) VALUES (?,?,?,?,?,?)');
       const seen = new Set();
@@ -1624,7 +1630,9 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
           if (Number.isFinite(v) && v > 0 && v <= QPU_MAX) qpu = v;
           else warnings.push(`行${n + 1} (${our}): 入数「${rows[n][iQpu]}」が不正 (${QPU_ERR}) のため${oldQpu.has(key) ? '既存値を保持' : '未設定 (=1)'}にしました`);
         }
-        ins.run(supplierCode, key, our, vendor, qpu, nowIso());
+        // 版の印は前より必ず新しく (消して作り直しても前の版と同じ印にしない・vendor-codes.js)
+        ins.run(supplierCode, key, our, vendor, qpu, vendorStamp());
+        newRows.set(key, sig(vendor, qpu));
         count++;
       }
       // 誤CSV・空データで正常な対応表を消さない (0件はロールバック)
@@ -1640,8 +1648,9 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
       for (const [vk, codes] of byVendor) {
         if (codes.length > 1) warnings.push(`先方番号 ${vk} が複数商品 (${codes.join(', ')}) に付いています — 入荷予定変換では曖昧扱いになります`);
       }
+      const changedKeys = [...new Set([...oldRows.keys(), ...newRows.keys()])].filter(k => oldRows.get(k) !== newRows.get(k)).sort();
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_import', resource: `supplier:${supplierCode}`,
-        detail: { oldCount, newCount: count, skipped } });
+        detail: { oldCount, newCount: count, skipped, via: 'po-admin', changed_keys: changedKeys } });
     })();
     res.json({ ok: true, supplier: sup.name, count, skipped, oldCount, warnings });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
@@ -1656,29 +1665,12 @@ router.get('/api/vendor-map', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// 入数 (単位換算) だけを更新する。入荷予定タブの変換結果からその場で登録する用
+// 入数 (単位換算) だけを更新する。入荷予定タブの変換結果からその場で登録する用。
+// 書くのは vendor-codes.js の部品 (マスタの入力と同じ確かめ・同じ記録。答えは今までと同じ・先に読んだ印は取らない = 今のまま)
 router.post('/api/vendor-map/qty-per-unit', (req, res) => {
   try {
-    const db = getDB();
     const b = req.body || {};
-    const supplier = normSupplierCode(b.supplier_code);
-    const key = normProductCode(trimS(b.product_code));
-    if (!supplier || !key) return res.status(400).json({ ok: false, error: '仕入先コードと商品コードが必要です' });
-    // 空欄 = 換算なし (NULL=1扱い)。それ以外は正の数のみ
-    let qpu = null;
-    if (b.qty_per_unit != null && trimS(b.qty_per_unit) !== '') {
-      qpu = Number(String(b.qty_per_unit).replace(/,/g, ''));
-      if (!Number.isFinite(qpu) || qpu <= 0 || qpu > QPU_MAX) return res.status(400).json({ ok: false, error: `${QPU_ERR}: ${b.qty_per_unit}` });
-    }
-    let out = null;
-    db.transaction(() => {
-      const old = db.prepare('SELECT vendor_code, qty_per_unit FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(supplier, key);
-      if (!old) { out = { status: 404, body: { ok: false, error: 'この商品は対応表に未登録です (先に先方番号を登録してください)' } }; return; }
-      db.prepare('UPDATE po_vendor_code_map SET qty_per_unit=?, updated_at=? WHERE supplier_code=? AND product_key=?').run(qpu, nowIso(), supplier, key);
-      audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_qty_per_unit', resource: `supplier:${supplier}`,
-        detail: { productKey: key, old: old.qty_per_unit, new: qpu } });
-      out = { status: 200, body: { ok: true, qtyPerUnit: qpu == null ? 1 : qpu } };
-    })();
+    const out = setQtyPerUnit({ supplierCode: b.supplier_code, productCode: b.product_code, qtyPerUnit: b.qty_per_unit, actor: actorOf(req), via: 'po-inbound' });
     res.status(out.status).json(out.body);
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
@@ -1739,90 +1731,20 @@ router.get('/api/vendor-map/products', async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-/**
- * 対応表の登録・紐づけで使う商品の確かめ: PML にあればその行、無ければ新商品 (Company DB) で確かめる。
- * @returns {Promise<{ prodSup: string, error: string|null, newSku: object|null }>} error = 断る文 (400)
- */
-async function productForVendorMap(productCode, supplier, notFoundHint) {
-  const key = normProductCode(productCode);
-  const pmlRow = loadPml().rows.find(r => normProductCode(r['商品コード']) === key);
-  if (pmlRow) {
-    const prodSup = normSupplierCode(pmlRow['仕入先']);
-    return { prodSup, error: prodSup ? null : `この商品は商品マスタで仕入先が未設定です: ${productCode} (先に商品マスタ側を直してください)`, newSku: null };
-  }
-  const nc = checkNewSku(await readNewSkusForRequest(), key, supplier);
-  if (nc.error) return { prodSup: '', error: nc.error, newSku: null };
-  if (nc.sku) return { prodSup: nc.sku.supplier, error: null, newSku: nc.sku };
-  return { prodSup: '', error: `商品マスタに無い商品コードです: ${productCode} (${notFoundHint})`, newSku: null };
-}
-
-const VENDOR_CODE_MAX = 100; // 先方管理番号の実仕様は十数文字。誤貼り付けの肥大化 (監査ログ・添付CSVに複製される) を防ぐ
+// 対応表の登録・紐づけで使う商品の確かめ (仕入先一致) = vendor-codes.js の productForVendorMap (マスタの入力の商品の画面と同じ決まり)
 
 // 1件追加・更新 (upsert)。商品コードはPML実在+仕入先一致チェックでタイポ・誤仕入先登録を防ぐ (廃番をあえて残す用途はCSV取込で)。
 // PMLに無い商品は新商品の登録 (Company DB) で確かめる (下書きから使える・仕入先は代表の仕入先。new-skus.js)
 // baseUpdatedAt: 楽観ロック (UIは常に送る。表示後に他者が変更/CSV全置換していたら409)。未指定なら無条件upsert (スクリプト/AI連携用)
+// 書くのは vendor-codes.js の部品 (マスタの入力と同じ確かめ・同じ記録。答えは今までと同じ)
 router.post('/api/vendor-map/entry', async (req, res) => {
   try {
     const b = req.body || {};
     // 新商品の確かめ (Company DB・3 秒まで) は台帳を読む前に済ませる (待っている間の変更を取りこぼさない)
     const prod = trimS(b.product_code) && trimS(b.product_code).length <= 200
       ? await productForVendorMap(trimS(b.product_code), normSupplierCode(b.supplier_code), '廃番等を登録する場合はCSV取込で') : null;
-    const db = getDB();
-    const supplier = normSupplierCode(b.supplier_code);
-    const productCode = trimS(b.product_code);
-    const vendorCode = trimS(b.vendor_code);
-    if (!supplier) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
-    const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(supplier);
-    if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
-    if (!productCode) return res.status(400).json({ ok: false, error: '商品コードが必要です' });
-    if (productCode.length > 200) return res.status(400).json({ ok: false, error: '商品コードが長すぎます' });
-    if (!vendorCode) return res.status(400).json({ ok: false, error: '先方管理番号が必要です' });
-    if (/[\r\n]/.test(vendorCode)) return res.status(400).json({ ok: false, error: '先方管理番号に改行は使えません' });
-    if (vendorCode.length > VENDOR_CODE_MAX) return res.status(400).json({ ok: false, error: `先方管理番号が長すぎます (${VENDOR_CODE_MAX}文字まで)` });
-    const key = normProductCode(productCode);
-    if (prod.error) return res.status(400).json({ ok: false, error: prod.error });
-    const prodSup = prod.prodSup;
-    if (prodSup !== supplier) {
-      return res.status(400).json({ ok: false, error: `この商品の仕入先は ${prodSup} です (${sup.name} の対応表には登録できません)` });
-    }
-    // 入数 (任意): undefined=変更しない / 空欄=クリア (換算なし=1扱い) / 正の数=設定
-    let qpu;
-    if (b.qty_per_unit !== undefined) {
-      if (b.qty_per_unit == null || trimS(b.qty_per_unit) === '') qpu = null;
-      else {
-        qpu = Number(String(b.qty_per_unit).replace(/,/g, ''));
-        if (!Number.isFinite(qpu) || qpu <= 0 || qpu > QPU_MAX) return res.status(400).json({ ok: false, error: `${QPU_ERR}: ${b.qty_per_unit}` });
-      }
-    }
-    let out = null;
-    db.transaction(() => {
-      const old = db.prepare('SELECT vendor_code, updated_at FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(supplier, key);
-      if (b.baseUpdatedAt !== undefined) {
-        // 楽観ロック: null=「新規のつもり」、文字列=「この版を見て編集した」
-        if (b.baseUpdatedAt == null && old) {
-          out = { status: 409, body: { ok: false, conflict: true, error: `この商品は既に登録されています (現在: ${old.vendor_code})。一覧のセルを編集してください`, current: old } };
-          return;
-        }
-        if (b.baseUpdatedAt != null && (!old || old.updated_at !== b.baseUpdatedAt)) {
-          out = { status: 409, body: { ok: false, conflict: true, error: old ? `他の画面で変更されています (現在: ${old.vendor_code})。最新を確認してください` : '他の画面で削除されています。最新を確認してください', current: old || null } };
-          return;
-        }
-      }
-      db.prepare(`INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES (?,?,?,?,?)
-        ON CONFLICT(supplier_code, product_key) DO UPDATE SET product_code=excluded.product_code, vendor_code=excluded.vendor_code, updated_at=excluded.updated_at`)
-        .run(supplier, key, productCode, vendorCode, nowIso());
-      // 入数は指定されたときだけ更新 (未指定なら既存値を保持)
-      if (qpu !== undefined) db.prepare('UPDATE po_vendor_code_map SET qty_per_unit=? WHERE supplier_code=? AND product_key=?').run(qpu, supplier, key);
-      audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_entry_upsert', resource: `supplier:${supplier}`,
-        detail: { productCode, vendorCode, oldVendorCode: old ? old.vendor_code : null, qtyPerUnit: qpu === undefined ? '(変更なし)' : qpu } });
-      // 同じ先方番号が別商品にも付いていたら警告 (入荷予定変換の逆引きが ambiguous になる。ブロックはしない —
-      // 実データに単位違い等の正当な重複がありうるため。Codex plan-R2 Medium)
-      const dupOf = db.prepare('SELECT product_code, vendor_code FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)
-        .filter(m => normVendorCode(m.vendor_code) === normVendorCode(vendorCode) && normProductCode(m.product_code) !== key)
-        .map(m => m.product_code);
-      out = { status: 200, body: { ok: true, updated: !!old, oldVendorCode: old ? old.vendor_code : null,
-        warning: dupOf.length ? `この先方番号は商品 ${dupOf.join(', ')} にも登録されています (入荷予定変換で曖昧扱いになります)` : null } };
-    })();
+    const out = upsertVendorCode({ supplierCode: b.supplier_code, productCode: b.product_code, vendorCode: b.vendor_code,
+      qtyPerUnit: b.qty_per_unit, baseUpdatedAt: b.baseUpdatedAt, prod, actor: actorOf(req), via: 'po-admin' });
     res.status(out.status).json(out.body);
   } catch (e) {
     console.error('[purchase-orders] vendor-map entry upsert failed:', e);
@@ -1858,9 +1780,7 @@ function parseShipmentLines(text) {
   return { items, skipped };
 }
 
-const normVendorCode = v => trimS(v).toUpperCase();
-const QPU_MAX = 1000000; // 入数の上限 (極端な値による換算結果の桁あふれ防止)
-const QPU_ERR = `入数は0より大きく${QPU_MAX.toLocaleString('ja-JP')}以下の数で入力してください`;
+// normVendorCode・QPU_MAX・QPU_ERR は vendor-codes.js (マスタの入力と同じ決まり)
 
 // 変換コア: 明細 [{vendorCode, vendorName, qty}] → ロジザード貼り付けデータ (手動貼り付け/メール自動取得の共通処理)。
 // lines = 明細を元の順序のまま「左=仕入先 (番号/商品名/数量)・右=弊社 (コード/商品名/入数換算後の入荷予定数/単価)」で返す
@@ -2497,11 +2417,11 @@ router.post('/api/vendor-map/pending/:id/link', async (req, res) => {
       db.prepare(`INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) VALUES (?,?,?,?,?,?)
         ON CONFLICT(supplier_code, product_key) DO UPDATE SET product_code=excluded.product_code, vendor_code=excluded.vendor_code,
           qty_per_unit=COALESCE(qty_per_unit, excluded.qty_per_unit), updated_at=excluded.updated_at`)
-        .run(pend.supplier_code, key, productCode, pend.vendor_code, pqpu, nowIso());
+        .run(pend.supplier_code, key, productCode, pend.vendor_code, pqpu, vendorStamp());   // 版の印は前より必ず新しく (vendor-codes.js)
       db.prepare("UPDATE po_vendor_code_pending SET status='linked', linked_product_code=?, updated_at=? WHERE id=?")
         .run(productCode, nowIso(), id);
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_pending_link', resource: `supplier:${pend.supplier_code}`,
-        detail: { vendorCode: pend.vendor_code, productCode, oldVendorCode: old ? old.vendor_code : null,
+        detail: { via: 'po-admin', product_key: key, vendorCode: pend.vendor_code, productCode, oldVendorCode: old ? old.vendor_code : null,
           provisionalProductCode: pend.provisional_product_code || null, provisionalQtyPerUnit: pqpu, oldQtyPerUnit: oldQpu } });
       const warnings = [];
       // 仮商品コードで入荷予定を作った後に別コードへ紐づけた場合はロジザード側が食い違う
@@ -2535,26 +2455,10 @@ router.post('/api/vendor-map/pending/:id/dismiss', (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
-// 1件削除。base=表示時のupdated_at (楽観ロック、未指定なら無条件)
+// 1件削除。base=表示時のupdated_at (楽観ロック、未指定なら無条件)。書くのは vendor-codes.js の部品 (答えは今までと同じ)
 router.delete('/api/vendor-map/entry', (req, res) => {
   try {
-    const db = getDB();
-    const supplier = normSupplierCode(req.query.supplier);
-    const key = normProductCode(req.query.product);
-    if (!supplier || !key) return res.status(400).json({ ok: false, error: '仕入先コードと商品コードが必要です' });
-    let out = null;
-    db.transaction(() => {
-      const old = db.prepare('SELECT product_code, vendor_code, updated_at FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(supplier, key);
-      if (!old) { out = { status: 404, body: { ok: false, error: '対象の対応がありません (既に削除済みかもしれません)' } }; return; }
-      if (req.query.base != null && req.query.base !== '' && old.updated_at !== req.query.base) {
-        out = { status: 409, body: { ok: false, conflict: true, error: `他の画面で変更されています (現在: ${old.vendor_code})。最新を確認してください`, current: old } };
-        return;
-      }
-      db.prepare('DELETE FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').run(supplier, key);
-      audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_entry_delete', resource: `supplier:${supplier}`,
-        detail: { productCode: old.product_code, vendorCode: old.vendor_code } });
-      out = { status: 200, body: { ok: true } };
-    })();
+    const out = deleteVendorCode({ supplierCode: req.query.supplier, productCode: req.query.product, base: req.query.base, actor: actorOf(req), via: 'po-admin' });
     res.status(out.status).json(out.body);
   } catch (e) {
     console.error('[purchase-orders] vendor-map entry delete failed:', e);

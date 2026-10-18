@@ -11,9 +11,12 @@
  */
 import { sessionHasApp } from '../../lib/app-access.js';
 import { readOrderSettingsForScreen, ATTR_FIELDS, OrderSettingsError, parseAttrPatch, parseNewCondition, parseNewMaterial } from '../purchase-orders/order-settings.js';
+import { parseVendorInput, VendorCodeError, readVendorCodesForProduct, productForVendorMap } from '../purchase-orders/vendor-codes.js';
 
 export const PO_APP_ID = 'purchase-orders';
-const BODY_KEYS = new Set([...ATTR_FIELDS, 'new_condition', 'new_material']);
+/** 🆕 ⑤-2 (CompanyDB構想 27 §2.4): 新商品の登録 (単品) の先方品番・入数。「入力なし」の 6 項目には数えない (先方品番を使う仕入先は一部だけ) */
+export const VENDOR_BODY_KEYS = Object.freeze(['vendor_code', 'qty_per_unit']);
+const BODY_KEYS = new Set([...ATTR_FIELDS, 'new_condition', 'new_material', ...VENDOR_BODY_KEYS]);
 const blank = (v) => v == null || (typeof v === 'string' && v.trim() === '');
 
 /** 書けるか。editor = editorGate(req) の答え */
@@ -44,10 +47,12 @@ export function orderNoneApplies(os) {
 }
 
 /**
- * 画面の本文 (order_settings / values) → 部品の入力 { patch, newCondition, newMaterial }。
+ * 画面の本文 (order_settings / values) → 部品の入力 { patch, newCondition, newMaterial, vendor? }。
  * 新商品の登録: 全部空 = null (発注アプリに何も書かない)。商品の画面 (allowEmpty) = 全部空でも送る (空にする)
+ * 🆕 ⑤-2: vendor_code / qty_per_unit (新商品の登録の単品だけ) = vendor: { vendor_code, qty_per_unit } (形は vendor-codes.js の parseVendorInput)。
+ *   「全部空」には先方品番も入れる (先方品番だけの登録 = 知らせ v2)。入数だけ = 400。商品の画面の「発注の設定を保存」は先方品番を受けない (別の保存)
  */
-export function orderInputOf(raw, { allowEmpty = false } = {}) {
+export function orderInputOf(raw, { allowEmpty = false, allowVendor = true } = {}) {
   if (raw == null) return null;
   if (typeof raw !== 'object' || Array.isArray(raw)) throw new OrderSettingsError(400, 'invalid_input', '発注の設定の入れ方が違う');
   for (const k of Object.keys(raw)) {
@@ -57,9 +62,17 @@ export function orderInputOf(raw, { allowEmpty = false } = {}) {
   for (const k of ATTR_FIELDS) if (Object.prototype.hasOwnProperty.call(raw, k)) patch[k] = raw[k];
   const newCondition = raw.new_condition == null ? null : raw.new_condition;
   const newMaterial = raw.new_material == null ? null : raw.new_material;
-  const empty = Object.values(patch).every(blank) && !newCondition && !newMaterial;
+  let vendor = null;
+  if (VENDOR_BODY_KEYS.some((k) => Object.prototype.hasOwnProperty.call(raw, k))) {
+    if (!allowVendor) throw new OrderSettingsError(400, 'invalid_input', '先方品番・入数は、先方品番の欄の「保存」で直してください', { field: 'vendor_code' });
+    let v;
+    try { v = parseVendorInput({ vendor_code: raw.vendor_code ?? null, qty_per_unit: raw.qty_per_unit ?? null }); }
+    catch (e) { if (e instanceof VendorCodeError) throw new OrderSettingsError(e.status, e.reason, e.message, { field: e.field }); throw e; }
+    vendor = v ? { vendor_code: v.vendorCode, qty_per_unit: v.qtyPerUnit == null ? null : String(v.qtyPerUnit) } : null;
+  }
+  const empty = Object.values(patch).every(blank) && !newCondition && !newMaterial && !vendor;
   if (empty && !allowEmpty) return null;
-  return { patch, newCondition, newMaterial };
+  return vendor ? { patch, newCondition, newMaterial, vendor } : { patch, newCondition, newMaterial };
 }
 
 /** 部品の誤り → 応答 (欄の名前は画面の行 data-row = order_settings.<欄>) */
@@ -80,11 +93,43 @@ export function orderBaseOf({ order, supplierCode }) {
   const patch = parseAttrPatch(order.patch ?? {});
   const nc = parseNewCondition(order.newCondition ?? null);
   const nm = parseNewMaterial(order.newMaterial ?? null);
+  // 🆕 ⑤-2: 先方品番がある = 知らせ v2 (vendor の鍵が付く)。無い = 今までと同じ形 (v1・同じハッシュ)
+  let vendor = null;
+  if (order.vendor != null) {
+    let v;
+    try { v = parseVendorInput(order.vendor); }
+    catch (e) { if (e instanceof VendorCodeError) throw new OrderSettingsError(e.status, e.reason, e.message, { field: e.field }); throw e; }
+    if (v && (supplierCode == null || String(supplierCode).trim() === '')) throw new OrderSettingsError(400, 'invalid_input', '先方品番を入れるときは、代表の仕入先を選んでください', { field: 'vendor_code' });
+    vendor = v ? { vendor_code: v.vendorCode, qty_per_unit: v.qtyPerUnit == null ? null : String(v.qtyPerUnit) } : null;
+  }
   return {
+    ...(vendor ? { vendor } : {}),
     supplier_code: supplierCode == null || String(supplierCode).trim() === '' ? null : String(supplierCode),
     patch: Object.fromEntries(Object.entries(patch).map(([k, v]) => [k, str(v)])),
     new_condition: nc ? { condition_id: nc.condition_id, display_name: nc.display_name, condition_type: nc.condition_type, unit: nc.unit,
       condition_value: str(nc.condition_value), maker_name: str(nc.maker_name) } : null,
     new_material: nm ? { group_id: nm.group_id, name: nm.name, min_order_qty: str(nm.min_order_qty), unit: str(nm.unit) } : null,
   };
+}
+
+/**
+ * 🆕 ⑤-1 (CompanyDB構想 27 §2.4): 商品の画面の「先方品番・入数 (仕入先ごと)」に出す値 (発注アプリの対応表 = 正本を直接読む)。
+ *   見られる人 = 発注アプリの権限がある人 (発注の設定と同じ)。直せる人 = orderWriteGate (名簿 かつ 発注アプリの権限)。
+ *   直せる (足す・直す) 仕入先 = 仕入先一致を通る 1 社 (vendor-codes.js の productForVendorMap = 発注アプリのマスタ管理と同じ決まり)。
+ *   ほかの仕入先の行は「消す」だけ。primarySupplier = Company DB の代表の仕入先 (見せる・食い違いの知らせ用)
+ * 戻り値 { canSee, canWrite, why, data (readVendorCodesForProduct の答え | null), editable: { supplier, error } , primarySupplier }
+ */
+export async function vendorScreen(req, editor, code, { primarySupplier = null } = {}) {
+  const gate = orderWriteGate(req, editor);
+  if (gate.reason === 'no_po_access') return { canSee: false, canWrite: false, why: gate.message, data: null, editable: null, primarySupplier };
+  let editable = { supplier: null, error: null };
+  try {
+    const prod = await productForVendorMap(code, null, '商品管理リストに載ってから (NE 登録の翌朝) か、新商品の登録で作った商品だけです');
+    editable = prod.error ? { supplier: null, error: prod.error } : { supplier: prod.prodSup, error: null };
+  } catch (e) {
+    console.error(`[master-edit] 先方品番の仕入先を確かめられない (${code}): ${e && e.message}`);
+    editable = { supplier: null, error: '商品の仕入先を確かめられません (少し待ってから開き直してください)' };
+  }
+  const data = readVendorCodesForProduct(code, { extraSuppliers: [editable.supplier, primarySupplier].filter(Boolean) });
+  return { canSee: true, canWrite: gate.ok && data.ok, why: gate.ok ? (data.ok ? '' : data.error) : gate.message, data, editable, primarySupplier };
 }

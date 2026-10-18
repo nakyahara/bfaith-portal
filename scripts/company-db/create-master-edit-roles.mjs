@@ -248,7 +248,8 @@ export const ORDER_OUTBOX_SELECT = Object.freeze(['ops.order_settings_outbox', '
 export const ORDER_OUTBOX_EDIT_FUNCTIONS = Object.freeze(['ops.enqueue_order_settings(uuid, text, jsonb)',
   'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer, uuid[])', 'ops.finish_order_settings_event(uuid, text, text, jsonb, text)',
   'ops.dismiss_order_settings_event(uuid, text, text)']);
-export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()']);
+// 🆕 0099 (仮): ops.order_settings_payload_versions() = v2 の印 (アプリは「あるか」だけを見る = 実行権は持ち主だけ)
+export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()', 'ops.order_settings_payload_versions()']);
 /**
  * 🆕 0078 (ロジザードに送るバーコードの決め方・CompanyDB構想 23・中原さんの決定 10/13 夜): master_edit に決め方の表の select (商品の画面) と、
  *   決め方を書く関数の実行 (新商品の登録の取引の中・商品の画面)。表・関数が無い DB (0078 の前) では付けない (流し直すと付く)。

@@ -169,6 +169,72 @@ await ta('[6] 0025 の後に夜間ロードを流しても二重は戻らない 
   assert.equal((await q("select count(*)::int as n from core.suppliers group by core.canonical_supplier_code(code) having count(*) > 1")).length, 0);
 });
 
+// 🆕 ⑤-3 (AI_reference CompanyDB構想 27 §2.4 の 7・11): 先方品番・入数の写し = 発注アプリ (正本) と同じ (消した・空にしたも届く)
+const mirrorDo = (fn) => { const m = new Database(path.join(dataDir, 'warehouse-mirror.db')); try { fn(m); } finally { m.close(); } };
+const ssOf = async (code) => (await q("select x.vendor_code, x.stock_units_per_order_unit as units from core.supplier_skus x join core.skus s on s.sku_id = x.sku_id join core.suppliers p on p.supplier_id = x.supplier_id where s.code = $1 and p.code = '0001'", [code]))[0] || null;
+const loadNow = (opts = {}) => runInitialLoad(db, buildPlanFromRender({ dataDir, log: quiet }), { log: quiet, runId: `vc_${Math.random().toString(36).slice(2, 8)}`, ...opts });
+
+await ta('[8] ⑤-3 写し = 発注アプリと同じ: 番号を直した = そのまま (coalesce しない)・整数でない入数 = 写しは空 + 報告の数・1 回目の行もそのまま', async () => {
+  assert.deepEqual(await ssOf('ska'), { vendor_code: 'V-A', units: 12 });
+  mirrorDo((m) => m.prepare("update po_vendor_code_map set vendor_code = 'V-A2', qty_per_unit = 2.5 where product_key = 'ska'").run());
+  const r = await loadNow();
+  assert.equal(r.ok, true, r.error);
+  assert.deepEqual(await ssOf('ska'), { vendor_code: 'V-A2', units: null }, '整数でない入数の前の値を残した');
+  const vc = r.sections.supplier_skus.vendor_codes;
+  assert.deepEqual([vc.synced, vc.qpu_non_integer], [1, 1]);
+  assert.ok(r.unresolved.vendor_codes.some((x) => x.reason.includes('整数でない入数') && x.sku === 'ska'));
+  assert.match(r.sections.supplier_skus.notes.join(' / '), /整数でない入数 1 件は写しが空/);
+  mirrorDo((m) => m.prepare("update po_vendor_code_map set qty_per_unit = 24 where product_key = 'ska'").run());
+  assert.equal((await loadNow()).ok, true);
+  assert.deepEqual(await ssOf('ska'), { vendor_code: 'V-A2', units: 24 });
+});
+
+await ta('[9] ⑤-3 発注アプリで消した = 写しも空に戻す (行は残す)・dry-run は数だけ (変えない)・表が 0 行 / 上限超え = 戻さずに報告・--vendor-clear-max で流せる', async () => {
+  mirrorDo((m) => {
+    m.prepare("delete from po_vendor_code_map where product_key = 'ska'").run();
+    m.prepare("insert into po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at, qty_per_unit) values ('1', 'no-such-sku', 'no-such-sku', 'V-NONE', 'x', null)").run();
+  });
+  // dry-run = 全部やって巻き戻す (数は報告に出る)
+  let r = await loadNow({ dryRun: true });
+  assert.equal(r.ok, true, r.error);
+  assert.deepEqual([r.sections.supplier_skus.vendor_codes.clear_candidates >= 1, r.sections.supplier_skus.vendor_codes.cleared >= 1], [true, true]);
+  assert.deepEqual(await ssOf('ska'), { vendor_code: 'V-A2', units: 24 }, 'dry-run で写しを変えた');
+  // 上限を 0 = 戻さない (報告)
+  r = await loadNow({ vendorClearMax: 0 });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.sections.supplier_skus.vendor_codes.clear_skipped, 'too_many');
+  assert.deepEqual(await ssOf('ska'), { vendor_code: 'V-A2', units: 24 });
+  assert.ok(r.unresolved.vendor_codes.some((x) => /上限 0 超/.test(x.reason)));
+  // 既定の上限 (30) = 戻す。行は消さない (代表の仕入先の印を残す)
+  r = await loadNow();
+  assert.equal(r.ok, true, r.error);
+  assert.ok(r.sections.supplier_skus.vendor_codes.cleared >= 1);
+  assert.deepEqual(await ssOf('ska'), { vendor_code: null, units: null });
+  // 表が 0 行 = 戻さない (違うファイル・空のファイルの事故で写しを消さない)
+  await q("update core.supplier_skus x set vendor_code = 'KEEP' from core.skus s, core.suppliers p where s.sku_id = x.sku_id and p.supplier_id = x.supplier_id and s.code = 'ska' and p.code = '0001'");
+  mirrorDo((m) => m.prepare('delete from po_vendor_code_map').run());
+  r = await loadNow();
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.sections.supplier_skus.vendor_codes.clear_skipped, 'empty_map');
+  assert.equal((await ssOf('ska')).vendor_code, 'KEEP');
+  // 表が無い = 触らない
+  mirrorDo((m) => m.exec('alter table po_vendor_code_map rename to po_vendor_code_map_gone'));
+  try {
+    r = await loadNow();
+    assert.equal(r.ok, true, r.error);
+    assert.match(r.sections.supplier_skus.notes.join(' / '), /対応表が無い/);
+    assert.equal((await ssOf('ska')).vendor_code, 'KEEP');
+  } finally { mirrorDo((m) => m.exec('alter table po_vendor_code_map_gone rename to po_vendor_code_map')); }
+});
+
+await ta('[10] ⑤-3「行が無い」は対応表の生の (仕入先, 商品) で比べる: 大文字・小文字・仕入先の書き方 (1 / 0001) が違っても写しを消さない', async () => {
+  mirrorDo((m) => m.prepare("insert into po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at, qty_per_unit) values ('0001', 'ska', 'SKA', 'V-UP', 'x', 6)").run());
+  const r = await loadNow();
+  assert.equal(r.ok, true, r.error);
+  assert.deepEqual(await ssOf('ska'), { vendor_code: 'V-UP', units: 6 });
+  assert.equal(r.sections.supplier_skus.vendor_codes.cleared, 0);
+});
+
 await pg.close();
 try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }
 console.log(`\n${passed} 件 PASS`);

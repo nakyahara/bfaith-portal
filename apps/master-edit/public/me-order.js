@@ -7,6 +7,10 @@
  *     未保存の数は MasterEdit.dirty() に足す (離れるときの確認に出る)
  *   🆕 2026-10-13 (入力なし): 新商品の登録では、6 つの項目 (発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量) は
  *     どれも「値」か「入力なし」(グループは「なし」= 入力なし)。MasterEdit.orderSettings.items() = 画面が数える項目 (書けないとき = 空)
+ *   🆕 ⑤-1 / ⑤-2 (CompanyDB構想 27 §2.4): 先方品番・入数 (発注アプリの先方番号対応表・仕入先ごと)
+ *     - 新商品の登録 (単品): 2 つの欄を collect() の vendor_code / qty_per_unit に入れる (任意・「入力なし」には数えない)
+ *     - 商品の画面: 1 行ずつ「保存」(POST /api/sku/:code/vendor-code・開いたときの版 base_updated_at)・「消す」(…/delete)。
+ *       発注の設定の保存とは別。未保存の行は MasterEdit.dirty() に足す
  */
 (function () {
   'use strict';
@@ -132,6 +136,8 @@
       out.new_material = { group_id: val('po-nm-id'), name: val('po-nm-name'), min_order_qty: val('po-nm-min'), unit: val('po-nm-unit') };
       delete out.material_group_id;
     }
+    // 🆕 ⑤-2: 新商品の登録の先方品番・入数 (欄がある画面だけ)
+    if (document.getElementById('po-vendor_code')) { out.vendor_code = val('po-vendor_code'); out.qty_per_unit = val('po-qty_per_unit'); }
     if (all) return out;
     var empty = Object.keys(out).every(function (k) { return k === 'new_condition' || k === 'new_material' ? !out[k] : out[k] === ''; });
     return empty ? null : out;
@@ -178,12 +184,14 @@
     if (ME.setUnsaved && ME.dirty) ME.setUnsaved(ME.dirty().n);
   }
   if (P.mode === 'sku') {
-    // 離れるときの確認 (me-shell.js) に発注の設定の未保存も出す (Company DB の欄の数に 1 足す)
+    // 離れるときの確認 (me-shell.js) に発注の設定の未保存も出す (Company DB の欄の数に 1 足す)。🆕 先方品番の行の未保存も 1 行ずつ足す
     var base = ME.dirty;
     ME.dirty = function () {
       var d = base ? base() : { n: 0, items: [], impacts: [] };
-      if (!isDirty()) return d;
-      return { n: d.n + 1, items: d.items.concat(['発注の設定 (発注アプリ): まだ保存していません']), impacts: d.impacts };
+      var items = d.items.slice(); var n = d.n;
+      if (isDirty()) { n++; items.push('発注の設定 (発注アプリ): まだ保存していません'); }
+      vRows().forEach(function (r) { if (vDirty(r)) { n++; items.push('先方品番 (仕入先 ' + r.getAttribute('data-sup') + '・発注アプリ): まだ保存していません'); } });
+      return { n: n, items: items, impacts: d.impacts };
     };
     box.addEventListener('input', changed);
     box.addEventListener('change', changed);
@@ -233,6 +241,95 @@
       .catch(function () { busy = false; changed(); msg('通信できませんでした。もう一度「発注の設定を保存」を押してください', 'err'); });
   }
   if (saveBtn) saveBtn.addEventListener('click', save);
+
+  /* ---------- 🆕 ⑤-1 商品の画面: 先方品番・入数 (仕入先ごと・1 行ずつ保存) ---------- */
+  function vRows() { return $$('.po-vrow', box); }
+  function vVals(r) { var c = $('.po-v-code', r), q = $('.po-v-qpu', r); return JSON.stringify([c ? c.value.trim() : '', q ? q.value.trim() : '']); }
+  function vDirty(r) { return r.getAttribute('data-init') != null && vVals(r) !== r.getAttribute('data-init'); }
+  function vMsg(r, t, cls) { var m = $('.po-v-msg', r); if (m) { m.className = 'msgline po-v-msg ' + (cls || ''); m.textContent = t || ''; } }
+  function vState(r) {
+    var s = $('.po-v-save', r); var busyRow = r.getAttribute('data-busy') === '1';
+    if (s) s.disabled = busyRow || !vDirty(r) || !$('.po-v-code', r).value.trim();
+    var del = $('.po-v-del', r); if (del) del.disabled = busyRow;
+    r.classList.toggle('po-dirty', vDirty(r));
+    if (ME.setUnsaved && ME.dirty) ME.setUnsaved(ME.dirty().n);
+  }
+  function vPost(path, body) {
+    return fetch(P.base + '/api/sku/' + encodeURIComponent(P.code) + path, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) })
+      .then(function (x) { return x.json().catch(function () { return {}; }).then(function (j) { return { r: x, j: j }; }); });
+  }
+  function vSave(r) {
+    if (r.getAttribute('data-busy') === '1') return;
+    var b = r.getAttribute('data-base');
+    r.setAttribute('data-busy', '1'); vState(r); vMsg(r, '発注アプリに保存しています…');
+    vPost('/vendor-code', { request_id: uuid(), supplier_code: r.getAttribute('data-sup'), vendor_code: $('.po-v-code', r).value.trim(), qty_per_unit: $('.po-v-qpu', r).value.trim(), base_updated_at: b ? b : null })
+      .then(function (x) {
+        r.removeAttribute('data-busy');
+        if (x.r.ok && x.j.ok) {
+          if (x.j.row) {
+            r.setAttribute('data-base', x.j.row.updated_at || '');
+            $('.po-v-qpu', r).value = x.j.row.qty_per_unit == null ? '' : String(x.j.row.qty_per_unit);
+          }
+          r.setAttribute('data-init', vVals(r));
+          var sb = $('.po-v-save', r); if (sb) sb.textContent = '保存';
+          // 足した行 = もう対応表にある = 「消す」を出す
+          if (sb && !$('.po-v-del', r)) {
+            var del = document.createElement('button');
+            del.type = 'button'; del.className = 'btn soft sm po-v-del'; del.textContent = '消す';
+            del.addEventListener('click', function () { vDelete(r); });
+            sb.parentNode.insertBefore(del, sb.nextSibling);
+          }
+          vMsg(r, '発注アプリに保存しました' + (x.j.warning ? ' · ⚠ ' + x.j.warning : ''), x.j.warning ? '' : 'ok');
+          if (ME.toast) ME.toast('先方品番を保存しました (発注アプリ)');
+        } else {
+          vMsg(r, (x.j.error || ('HTTP ' + x.r.status)) + (x.j.conflict ? ' (画面を開き直すと今の値が出ます)' : ''), 'err');
+        }
+        vState(r);
+      })
+      .catch(function () { r.removeAttribute('data-busy'); vState(r); vMsg(r, '通信できませんでした。もう一度「保存」を押してください', 'err'); });
+  }
+  function vDelete(r) {
+    if (r.getAttribute('data-busy') === '1') return;
+    var b = r.getAttribute('data-base');
+    if (!b) return;
+    if (!window.confirm('仕入先 ' + r.getAttribute('data-sup') + ' の先方品番「' + ($('.po-v-code', r).value.trim() || '') + '」を対応表から消しますか? (発注書の CSV・入荷予定の変換で使えなくなります)')) return;
+    r.setAttribute('data-busy', '1'); vState(r); vMsg(r, '発注アプリから消しています…');
+    vPost('/vendor-code/delete', { request_id: uuid(), supplier_code: r.getAttribute('data-sup'), base_updated_at: b })
+      .then(function (x) {
+        r.removeAttribute('data-busy');
+        if (x.r.ok && x.j.ok) {
+          if (r.getAttribute('data-mine') === '1') {
+            // 直せる仕入先の行 = 空の「足す」行に戻す (まだ無い = 版は null)
+            r.setAttribute('data-base', '');
+            $('.po-v-code', r).value = ''; $('.po-v-qpu', r).value = '';
+            r.setAttribute('data-init', vVals(r));
+            var sb = $('.po-v-save', r); if (sb) sb.textContent = '足す';
+            var del = $('.po-v-del', r); if (del) del.parentNode.removeChild(del);
+            vMsg(r, '消しました', 'ok');
+          } else {
+            r.parentNode.removeChild(r);
+          }
+          if (ME.toast) ME.toast('先方品番を消しました (発注アプリ)');
+          if (ME.setUnsaved && ME.dirty) ME.setUnsaved(ME.dirty().n);
+          return;
+        }
+        vMsg(r, (x.j.error || ('HTTP ' + x.r.status)) + (x.j.conflict ? ' (画面を開き直すと今の値が出ます)' : ''), 'err');
+        vState(r);
+      })
+      .catch(function () { r.removeAttribute('data-busy'); vState(r); vMsg(r, '通信できませんでした。もう一度「消す」を押してください', 'err'); });
+  }
+  if (P.mode === 'sku') {
+    vRows().forEach(function (r) {
+      r.setAttribute('data-init', vVals(r));
+      r.addEventListener('input', function (e) { e.stopPropagation(); vState(r); });
+      r.addEventListener('change', function (e) { e.stopPropagation(); vState(r); });
+      var s = $('.po-v-save', r); if (s) s.addEventListener('click', function () { vSave(r); });
+      var dl = $('.po-v-del', r); if (dl) dl.addEventListener('click', function () { vDelete(r); });
+      // 欄の Enter = その行の保存 (ページの form に送らない)
+      $$('input', r).forEach(function (inp) { inp.addEventListener('keydown', function (e) { if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); var sb = $('.po-v-save', r); if (sb && !sb.disabled) vSave(r); } }); });
+      vState(r);
+    });
+  }
 
   showModes();
   showUnit();
