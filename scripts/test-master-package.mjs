@@ -400,7 +400,7 @@ await ta('[L1] 一覧の「大きさ・重さ」の列 (いつもは出さない
   const csv = CSV.buildListCsv(data, {}, {});
   const lines = csv.replace(/^﻿/, '').trim().split('\r\n');
   const head = lines[0].split(',');
-  assert.deepEqual(head.slice(-6), ['"商品コードの注意"', '"梱包の縦 (cm)"', '"梱包の横 (cm)"', '"梱包の高さ (cm)"', '"梱包の重さ (g)"', '"大きさ・重さの出どころ"']);
+  assert.deepEqual(head.slice(-7), ['"商品コードの注意"', '"メーカー"', '"梱包の縦 (cm)"', '"梱包の横 (cm)"', '"梱包の高さ (cm)"', '"梱包の重さ (g)"', '"大きさ・重さの出どころ"']);
   assert.ok(lines.find((l) => l.startsWith('"pk-r1"')).endsWith('"20","15.5","2.5","180","縦・横・高さ・重さ = 人"'));
   // 出どころが混ざる商品 (s002 = 人の値なし・重さ = FBA 納品・高さ = 定形外)
   const d2 = await asEditor(() => RD.listSkus(db, RD.normalizeFilters({ q: 's002' }), { mode: 'all' }));
