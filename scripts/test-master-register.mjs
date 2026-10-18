@@ -1792,7 +1792,7 @@ await ta('[PO1] 新商品の画面: 発注の設定の欄 (発注ロット・発
   assert.ok(!r.text.includes('id="sec-order"') && !r.text.includes('me-order.js'));
   // つかいかた (同じ PR で)
   const m = await call('GET', '/apps/master-edit/manual');
-  for (const w of ['<h2 id="order">発注の設定 (発注アプリに保存)</h2>', '発注の設定を保存', 'NE 登録待ち', '名簿の人で、発注アプリの権限もある人', '発注の設定だけ保存できませんでした', 'すすめる数が出ません']) {
+  for (const w of ['<h3 id="order">発注の設定 (発注アプリに保存)</h3>', '発注の設定を保存', 'NE 登録待ち', '名簿の人で、発注アプリの権限もある人', '発注の設定だけ保存できませんでした', 'すすめる数が出ません']) {
     assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
   }
 });
@@ -2003,7 +2003,7 @@ await ta('[PO6] 🆕 0075 届け待ち: 上の帯の件数 (発注アプリの�
   // 届け待ち (pending) は閉じない (= 届け直しに任せる)
   // つかいかた (同じ PR で)
   const m = await call('GET', '/apps/master-edit/manual');
-  for (const w of ['<h2 id="order-outbox">発注の設定の届け待ち', 'もう一度届ける', '要確認', '24 時間たっても届いていない', 'すすめる発注数は止めません', '毎晩 2 時']) {
+  for (const w of ['<h3 id="order-outbox">発注の設定の届け待ち', 'もう一度届ける', '要確認', '24 時間たっても届いていない', 'すすめる発注数は止めません', '毎晩 2 時']) {
     assert.ok(m.text.includes(w), `つかいかたに「${w}」が無い`);
   }
 });

@@ -579,6 +579,56 @@ a.chip, a.chip:hover { text-decoration: none; }
 .doc ul { margin: 0 0 6px 20px; display: grid; gap: 6px; color: var(--text2); font-size: 14.5px; line-height: 1.75; }
 .doc b { color: #fff; }
 .doc code { font-family: var(--mono); font-size: 13px; background: rgba(255, 255, 255, 0.06); padding: 0 5px; border-radius: 5px; }
+/* 🆕 10/18 マスタの入力のつかいかた (views/manual.ejs・.man の中だけ = マスタの判断のつかいかたは変えない):
+   目次 (.toc)・上に残る章の札 (.man-jump)・章 (h2 + 番号)・節 (h3)・まとめ (.sum)・番号つきの手順 (ol.steps)・流れ (ol.flow)・表 (table.kv)・くわしく (details.more) */
+.man [id] { scroll-margin-top: 122px; }
+.man p { color: var(--text2); font-size: 14.5px; line-height: 1.75; margin: 0 0 10px; }
+.man .hint { color: var(--muted); font-size: 13px; }
+.man h2 { font-size: 19px; margin: 36px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); }
+.man h2::before { display: none; }
+.man h2 .no { flex: none; display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; background: var(--accent-bg); border: 1px solid rgba(58, 231, 255, 0.4); color: var(--accent); font-size: 15px; font-weight: 700; }
+.man h3 { font-size: 16px; margin: 26px 0 8px; color: #fff; }
+.man h3::before { content: ""; display: inline-block; width: 4px; height: 15px; margin-right: 8px; border-radius: 2px; background: var(--accent); vertical-align: -2px; }
+.man .sum { color: var(--text); padding: 10px 14px; border-left: 3px solid var(--accent); background: rgba(58, 231, 255, 0.05); border-radius: 0 10px 10px 0; }
+.man ol.steps { list-style: none; counter-reset: st; margin: 6px 0 12px; padding: 0; display: grid; gap: 8px; }
+.man ol.steps > li { counter-increment: st; position: relative; padding-left: 36px; color: var(--text2); font-size: 14.5px; line-height: 1.7; min-width: 0; overflow-wrap: anywhere; }
+.man ol.steps > li::before { content: counter(st); position: absolute; left: 0; top: 1px; width: 25px; height: 25px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700; color: #04202b; background: var(--accent); }
+.man ol.steps ol { margin: 6px 0 4px 20px; display: grid; gap: 4px; }
+.man ol.flow { list-style: none; margin: 6px 0 8px; padding: 0; display: flex; flex-wrap: wrap; gap: 8px 22px; }
+.man ol.flow > li { position: relative; display: grid; gap: 1px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--panel); font-size: 14px; }
+.man ol.flow > li > span { font-size: 12.5px; color: var(--muted); }
+.man ol.flow > li + li::before { content: "→"; position: absolute; left: -17px; top: 50%; transform: translateY(-50%); color: var(--accent); }
+.man .toc { list-style: none; margin: 4px 0 14px; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.man .toc a { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 12px; align-items: center; height: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel); color: var(--text); text-decoration: none; }
+.man .toc a:hover { border-color: var(--line-strong); text-decoration: none; }
+.man .toc .no { grid-row: span 2; display: grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; background: var(--accent-bg); color: var(--accent); font-weight: 700; }
+.man .toc .t { font-weight: 700; font-size: 15px; }
+.man .toc .d { font-size: 13px; color: var(--muted); }
+.man .man-jump { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; margin-top: 4px; }
+.man .man-jump a { flex: none; white-space: nowrap; }
+.man details.more { margin: 4px 0 14px; }
+.man details.more > .body > ul { margin-left: 20px; }
+.man .callout ul { margin: 4px 0 0 18px; gap: 4px; font-size: 14px; }
+.man table.kv { width: 100%; border-collapse: collapse; margin: 6px 0 12px; font-size: 14px; }
+.man table.kv th, .man table.kv td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line-soft); color: var(--text2); line-height: 1.6; }
+.man table.kv thead th { color: var(--muted); font-size: 12.5px; font-weight: 600; border-bottom-color: var(--line); }
+.man table.kv tbody th { color: #fff; font-weight: 600; min-width: 9em; }
+@media (max-width: 760px) {
+  .man [id] { scroll-margin-top: 112px; }
+  .man h2 { font-size: 18px; }
+  .man .toc { grid-template-columns: minmax(0, 1fr); }
+  .man .man-jump a { min-height: 40px; }
+  .man details.more > summary { min-height: 44px; }
+  .man ol.flow { flex-direction: column; gap: 18px; }
+  .man ol.flow > li + li::before { content: "↓"; left: 14px; top: -17px; transform: none; }
+  /* 表は 1 行ずつの札にする (横に送らない): 見出しの行は隠し、欄の名前 (data-l) を前に出す */
+  .man table.kv, .man table.kv tbody, .man table.kv tr, .man table.kv th, .man table.kv td { display: block; width: 100%; }
+  .man table.kv { overflow: visible; }
+  .man table.kv thead { display: none; }
+  .man table.kv tr { padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+  .man table.kv th, .man table.kv td { border: 0; padding: 2px 4px; min-width: 0; overflow-wrap: anywhere; }
+  .man table.kv td[data-l]::before { content: attr(data-l) " : "; color: var(--muted); font-size: 12.5px; }
+}
 @media (max-width: 1100px) {
   .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .costhead { grid-template-columns: 1fr 1fr; }

@@ -2385,7 +2385,7 @@ await ta('[20] 利益 (1 個あたり・参考・10/6): 一覧の列・並び (�
   assert.equal(await lib.text(), fs.readFileSync(new URL('../lib/profit-estimate.js', import.meta.url), 'utf8'), 'lib のファイルそのもの');
   // つかいかた
   const man = await call('GET', '/manual');
-  assert.match(man.text, /<h2 id="profit">利益 \(1 個あたり・参考\)<\/h2>/); assert.match(man.text, /売価の 10%/); assert.match(man.text, /参考の値です/);
+  assert.match(man.text, /<h3 id="profit">利益 \(1 個あたり・参考\)<\/h3>/); assert.match(man.text, /売価の 10%/); assert.match(man.text, /参考の値です/);
 });
 
 await ta('[19] 大きめの見本 (#1627 Codex R1 M3 / Low): CSV・全部コピーは SQL で上限 + 1 件までしか読まない (中身の段に進まない)・JS で絞る条件のとき・期限は参考の値と販売数の読みにも効く・含むセット 51 件', async () => {
