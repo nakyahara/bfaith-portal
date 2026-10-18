@@ -304,7 +304,12 @@
       SER.forEach(function (s) { html('td', 'n', b.noData ? '' : num(b.qty[s.key]), r); });
       html('td', 'n', b.noData ? '' : num(b.total), r);
       html('td', 'n', b.noData ? '' : num(b.viaSet), r);
-      if (single) { html('td', 'n', b.stock ? num(b.stock.end) : '', r); html('td', 'n', b.stock ? String(b.stock.zeroDays) : '', r); }
+      if (single) {
+        // 在庫はどの日の締めの数かも書く (週・月の途中に取れなかった日があっても読み違えない。Codex R1 Low)
+        var cs = html('td', 'n', b.stock ? num(b.stock.end) : '', r);
+        if (b.stock && unit !== 'day') html('span', 'sub', md(b.stock.endDay) + ' の締め', cs);
+        html('td', 'n', b.stock ? String(b.stock.zeroDays) : '', r);
+      }
     });
     tableBox.hidden = false;
   }

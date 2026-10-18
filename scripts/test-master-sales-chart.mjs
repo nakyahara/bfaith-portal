@@ -87,14 +87,45 @@ await pg.query('reset role');
 const ids = await seedSalesChartDb(pg, db);
 await pg.query('reset role');
 const all = async (sql, p = []) => (await pg.query(sql, p)).rows;
+// ── 境目の見本 (Codex R1 Medium 3): sc-d と 入れ子 6 段のセット (N1 ⊃ D・N2 ⊃ N1 … N6 ⊃ N5)・循環 (C1 = D + C2・C2 = C1)・
+//    出品 lx = D×1 + N1×1 (同じ出品に D そのものと D を含むセット)・ln5 = N5×1 (出品から 5 段)・ln6 = N6×1 (6 段 = 届かない)
+const mkSku = async (code, kind) => {
+  const p = kind === 'single' ? (await all(`insert into core.products (company_id, name) values (1, $1) returning product_id`, [`見本 ${code}`]))[0].product_id : null;
+  return Number((await all(`insert into core.skus (company_id, product_id, sku_kind, code, name) values (1, $1, $2, $3, $3) returning sku_id`, [p, kind, code]))[0].sku_id);
+};
+ids.D = await mkSku('sc-d', 'single');
+const N = [ids.D];
+for (let i = 1; i <= 6; i++) N.push(await mkSku(`sc-n${i}`, 'set'));
+for (let i = 1; i <= 6; i++) await pg.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) values (1, $1, $2, 1, 'ne')`, [N[i], N[i - 1]]);
+const C1 = await mkSku('sc-c1', 'set'), C2 = await mkSku('sc-c2', 'set');
+await pg.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) values (1, $1, $2, 1, 'ne'), (1, $1, $3, 1, 'ne'), (1, $3, $1, 1, 'ne')`, [C1, ids.D, C2]);
+for (const [mall, code, comps] of [['rakuten', 'lx', [[ids.D, 1], [N[1], 1]]], ['amazon', 'ln5', [[N[5], 1]]], ['amazon', 'ln6', [[N[6], 1]]]]) {
+  const lid = (await all(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, $1, '', $2, 'active') returning listing_id`, [mall, code]))[0].listing_id;
+  for (const [s, q] of comps) await pg.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (1, $1, $2, $3, 'imported', 'system')`, [lid, s, q]);
+}
+{
+  let seq = 5000;
+  const order = (mall, scope, no, at, line, shop) => pg.query(`select core.apply_order_batch(1::smallint, $1, $2, $3, $4::bigint, $5::jsonb, $6::jsonb)`, [mall, scope, no, ++seq,
+    JSON.stringify({ source_system: 'mall_api', shop_code: shop, ordered_at: `${at}T10:00:00+09:00`, status: 'shipped', amount_source: 'mall_api', source_updated_at: '2026-10-18T00:00:00Z', transform_version: 't-1', content_hash: 'b' + seq }),
+    JSON.stringify([{ line_key: '1', listing_code: null, sku_code: null, qty: 1, cancelled_qty: 0, unit_price_jpy: null, line_amount_jpy: 1000, tax_rate: null, amount_source: 'mall_api', ...line }])]);
+  await order('yahoo', 'main', 'Y-N5', '2026-10-02', { sku_code: 'sc-n5' }, '2');            // 5 段のセット = D に届く
+  await order('yahoo', 'main', 'Y-N6', '2026-10-03', { sku_code: 'sc-n6' }, '2');            // 6 段 = 届かない (0042 も深すぎて展開しない)
+  await order('aupay', 'main', 'U-C2', '2026-10-04', { sku_code: 'sc-c2' }, '5');            // 循環 (C2 → C1 → D・C1 → C2 は止める)
+  await order('rakuten', 'main', 'R-LX', '2026-10-05', { listing_code: 'lx' }, '1');         // 同じ出品に D と D を含むセット = 2 (うちセット経由 1)
+  await order('rakuten', 'main', 'R-DL', '2026-10-06', { sku_code: 'sc-d', listing_code: 'lx' }, '1');   // SKU と出品の両方が分かる明細 = SKU だけで数える (二重にしない)
+  await order('amazon', 'jp', 'M-L5', '2026-10-07', { listing_code: 'ln5' }, '4');           // 出品から 5 段 = 届く
+  await order('amazon', 'jp', 'M-L6', '2026-10-08', { listing_code: 'ln6' }, '4');           // 出品から 6 段 = 届かない
+  await order('aupay', 'main', 'U-C1', '2026-10-09', { sku_code: 'sc-c1', qty: 2 }, '5');    // 循環の入口のセット 2 つ
+  await order('rakuten', 'main', 'R-FUT', '2099-01-01', { sku_code: 'sc-d' }, '1');          // 先の日付 = 入れない (Codex R1 Medium 1)
+}
 async function asEditor(fn) { await pg.query('set role master_edit'); try { return await fn(); } finally { await pg.query('reset role'); } }
 const fnRows = (sku, from = '2024-01-01') => all(`select date_jst::text as d, mall, qty::int as q, via_set::int as v from ops.sku_sales_daily($1::bigint, $2::date) order by 1, 2`, [sku, from]);
 
 await t('数え方: 取消の注文・明細の取消・外れた明細は数えない・出品だけの明細は出品の構成・NE のセット (入れ子も) は構成品へ・メルカリも入る・セット経由を分ける', async () => {
   const a = await asEditor(() => fnRows(ids.A));
   assert.deepEqual(a.map((r) => [r.d, r.mall, r.q, r.v]), [
-    ['2024-12-20', 'rakuten', 9, 0],      // 記録の前 (関数は返す・グラフは空欄)
-    ['2026-09-01', 'aupay', 3, 0],        // 4 − 明細の取消 1
+    // 2024-12-20 の 9 個 = Company DB の注文の始まり (2025-01-01) より前 = 返さない
+    ['2026-09-01', 'aupay', 3, 0],       // 4 − 明細の取消 1
     ['2026-10-01', 'mercari', 1, 0],      // メルカリ (売上日次には無い)
     ['2026-10-10', 'yahoo', 3, 3],        // セット S2 (= S×1 + A×1 = A 3 個) を 1 つ・取消の注文 (A 5) は 0 = 足して 3
     ['2026-10-15', 'amazon', 8, 2],       // 出品 am-s (セット S = A×2) 1 つ + まとめ売りの出品 am-a3 (A×3) 2 つ (セット経由ではない)
@@ -107,18 +138,31 @@ await t('数え方: 取消の注文・明細の取消・外れた明細は数え
   assert.deepEqual(s.map((r) => [r.d, r.mall, r.q, r.v]), [['2026-10-10', 'yahoo', 1, 1], ['2026-10-15', 'amazon', 1, 0]], 'セットの画面 = そのセットとして売れた数 (大きいセット S2 の分はセット経由)');
   assert.deepEqual((await asEditor(() => fnRows(ids.A, '2026-10-15'))).map((r) => r.d), ['2026-10-15', '2026-10-16', '2026-10-18'], 'p_from から');
 });
+await t('境目 (Codex R1 Medium 3): 入れ子 5 段は届く・6 段は届かない (出品からも)・循環は止める・同じ出品に SKU とそれを含むセット・SKU と出品の両方が分かる明細は二重にしない・先の日付は入れない', async () => {
+  const d = await asEditor(() => fnRows(ids.D));
+  assert.deepEqual(d.map((r) => [r.d, r.mall, r.q, r.v]), [
+    ['2026-10-02', 'yahoo', 1, 1], ['2026-10-04', 'aupay', 1, 1], ['2026-10-05', 'rakuten', 2, 1], ['2026-10-06', 'rakuten', 1, 0], ['2026-10-07', 'amazon', 1, 1], ['2026-10-09', 'aupay', 2, 2]]);
+});
 await t('売上日次 (0021) を末端の SKU まで展開した数 (0042 の mart.sales_expanded_to_skus) と同じ (日 × モール・メルカリは売上日次に無い)', async () => {
   for (const m of ['rakuten', 'amazon', 'yahoo', 'aupay']) {
     const scope = m === 'amazon' ? 'jp' : 'main';
     let r = (await all(`select * from mart.refresh_sales_daily(1::smallint, $1, $2, 31, true, 'test')`, [m, scope]))[0];
     while (Number(r.remaining) > 0) r = (await all(`select * from mart.refresh_sales_daily(1::smallint, $1, $2, 31, false, 'test')`, [m, scope]))[0];
   }
-  for (const [name, sku] of [['A', ids.A], ['B', ids.B]]) {
-    const mart = await all(`select date_jst::text as d, mall, sum(units)::int as q, coalesce(sum(units) filter (where via_set), 0)::int as v from mart.sales_expanded_to_skus(1::smallint, '2024-01-01', '2026-12-31')
+  for (const [name, sku] of [['A', ids.A], ['B', ids.B], ['D (境目)', ids.D]]) {
+    // 0042 は期間を引数で受ける = こちらの関数と同じ期間 (2025-01-01 〜 先の日付の前) にそろえて比べる
+    const mart = await all(`select date_jst::text as d, mall, sum(units)::int as q, coalesce(sum(units) filter (where via_set), 0)::int as v from mart.sales_expanded_to_skus(1::smallint, '2025-01-01', '2098-12-31')
       where sku_id = $1 group by 1, 2 order by 1, 2`, [sku]);
     const mine = (await fnRows(sku)).filter((r) => r.mall !== 'mercari');
     assert.ok(mart.length > 0, name);
-    assert.deepEqual(mine, mart, name);
+    // 数 (q) は全部同じ。うちセット経由 (v) だけ、同じ出品に D そのものと D を含むセットがある行 (10/05 の lx) で違う:
+    //   0042 は行 × SKU に 1 つの印 (どれかの道がセットを通れば全部をセット経由) / こちらは道ごと (2 のうちセットを通ったのは 1) = こちらを正とする (README に書いた)
+    const known = name.startsWith('D') ? { d: '2026-10-05', mart: 2, mine: 1 } : null;
+    if (known) {
+      assert.deepEqual([mart.find((r) => r.d === known.d).v, mine.find((r) => r.d === known.d).v], [known.mart, known.mine]);
+      for (const r of mart) if (r.d === known.d) r.v = known.mine;
+    }
+    assert.deepEqual(mine, mart, `${name}: ${JSON.stringify(mine)} != 0042 ${JSON.stringify(mart)}`);
   }
 });
 await t('master_edit は呼べる・注文の表は読めない・public の実行権なし・security definer・search_path 固定・見張りには渡さない・重い入口の棚卸しにある', async () => {
@@ -132,7 +176,7 @@ await t('master_edit は呼べる・注文の表は読めない・public の実�
   for (const f of fns) { assert.equal(f.d, true); assert.match(f.c, /search_path=pg_catalog, pg_temp/); assert.equal(f.pub, false); assert.equal(f.me, true); assert.equal(f.w, false); }
   assert.ok(HEAVY_ENTRY_MANIFEST.some((e) => e.sig === SALES_CHART_FUNCTIONS[0] && e.cls === 'light' && e.public === false));
   const old = await all(`select count(*)::int as n from ops.sku_sales_daily($1::bigint, '1900-01-01')`, [ids.A]);
-  assert.equal(old[0].n, 7, 'p_from が古すぎても 800 日まで (この見本は全部その中)');
+  assert.equal(old[0].n, 6, 'p_from が古すぎても 2025-01-01 から (2024-12-20 の注文は返さない)');
 });
 
 console.log('3 API (本物の router)');

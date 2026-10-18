@@ -122,7 +122,7 @@ try {
     assert.deepEqual(await p.$$eval('#sc-thead th', (x) => x.map((th) => th.textContent)), ['期間', '楽天', 'Amazon', 'Yahoo!', 'その他', '合計', 'うちセット経由', '在庫 (最後の締め)', '欠品の日']);
     const rows = await cells(p, '#sc-rows tr');
     assert.equal(rows.length, 52);
-    assert.deepEqual(rows[0], ['2026/10/12〜10/18途中 (前日まで)', '3', '8', '0', '0', '11', '2', '3', '1']);
+    assert.deepEqual(rows[0], ['2026/10/12〜10/18途中 (前日まで)', '3', '8', '0', '0', '11', '2', '310/16 の締め', '1']);
     assert.deepEqual(rows[1], ['2026/10/5〜10/11', '0', '0', '3', '0', '3', '3', '', '']);
     if (process.env.MASTER_SALES_SHOT) await p.locator('#p-sales').screenshot({ path: process.env.MASTER_SALES_SHOT });   // 目で見るとき (写しの置き場)
   });
@@ -136,7 +136,7 @@ try {
     assert.match(await p.textContent('#sc-sum'), /直近 24 か月の合計 18 個 \(月平均 [\d.]+ 個・途中の月を除く\) · いちばん多い月 2026年10月 の 15 個/);
     let rows = await cells(p, '#sc-rows tr');
     assert.equal(rows.length, 24);
-    assert.deepEqual(rows[0], ['2026年10月途中 (前日まで)', '3', '8', '3', '1', '15', '5', '3', '1']);
+    assert.deepEqual(rows[0], ['2026年10月途中 (前日まで)', '3', '8', '3', '1', '15', '5', '310/16 の締め', '1']);
     assert.deepEqual(rows[1], ['2026年9月', '0', '0', '0', '3', '3', '0', '', '']);
     assert.deepEqual(rows[23], ['2024年11月注文の記録の前', '', '', '', '', '', '', '', ''], '記録の前 = 空欄 (0 と出さない)');
     assert.match(await p.textContent('#sc-stock-h'), /その月の最後の締め/);
