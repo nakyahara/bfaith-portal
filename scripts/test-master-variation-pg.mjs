@@ -376,29 +376,42 @@ try {
     const regOf = async (id) => (await q('select state from ops.master_registrations where sku_id = $1', [id]))[0].state;
     await batchTx(A, { group: { product_id: GRP1 }, options: [{ axis: 1, code: '-Z1', name: 'Z1' }, { axis: 1, code: '-Z2', name: 'Z2' }],
       children: [{ code: 'grp1-Z1', choices: { 1: '-Z1' } }, { code: 'grp1-Z2', choices: { 1: '-Z2' } }] });
+    /** 先の取引を開いたまま相手を走らせる。試験が途中で落ちても先の取引を閉じ、相手の終わりを待つ (後の試験 [5] に開いた取引・aborted を残さない・Codex R1 Medium) */
+    const race = async (first, body) => {
+      let other = null;
+      try {
+        await first.query('begin');
+        await body((s) => { other = launch(s); return other; });
+      } finally {
+        try { await first.query('rollback'); } catch { /* commit の後 = 何もしない */ }
+        if (other) await other.promise;
+      }
+    };
     // (a) 出すが先 (commit 前)
     const z1 = await lzPrep('grp1-Z1');
-    await A.query('begin');
-    const f = (await A.query(LZ_ISSUE, [uuid(), 'naka@test', z1.items])).rows[0].r;
-    const ca = launch(B.query(CANCEL, [uuid(), 'naka@test', 'やめる', OWN, z1.id]));
-    await sleep(400);
-    assert.equal(ca.done, false, '子の廃止は CSV を出すの commit を待つ');
-    await A.query('commit');
-    const rca = await ca.promise;
-    assert.notEqual(rca.err?.code, '40P01');
-    assert.match(String(rca.err?.message), new RegExp(`^lz_issued: grp1-Z1 はロジザード登録の CSV に出しています \\(ファイル #${f.export_id}\\)`), rca.err?.message ?? JSON.stringify(rca.ok));
+    await race(A, async (start) => {
+      const f = (await A.query(LZ_ISSUE, [uuid(), 'naka@test', z1.items])).rows[0].r;
+      const ca = start(B.query(CANCEL, [uuid(), 'naka@test', 'やめる', OWN, z1.id]));
+      await sleep(400);
+      assert.equal(ca.done, false, '子の廃止は CSV を出すの commit を待つ');
+      await A.query('commit');
+      const rca = await ca.promise;
+      assert.notEqual(rca.err?.code, '40P01');
+      assert.match(String(rca.err?.message), new RegExp(`^lz_issued: grp1-Z1 はロジザード登録の CSV に出しています \\(ファイル #${f.export_id}\\)`), rca.err?.message ?? JSON.stringify(rca.ok));
+    });
     assert.equal(await regOf(z1.id), 'draft');
     // (b) 廃止が先 (commit 前)
     const z2 = await lzPrep('grp1-Z2');
-    await B.query('begin');
-    await B.query(CANCEL, [uuid(), 'naka@test', 'やめる', OWN, z2.id]);
-    const ib = launch(A.query(LZ_ISSUE, [uuid(), 'naka@test', z2.items]));
-    await sleep(400);
-    assert.equal(ib.done, false, 'CSV を出すは子の廃止の commit を待つ');
-    await B.query('commit');
-    const rib = await ib.promise;
-    assert.notEqual(rib.err?.code, '40P01');
-    assert.match(String(rib.err?.message), /^invalid_input: grp1-Z2 は単品で使える商品でない/, rib.err?.message ?? JSON.stringify(rib.ok));
+    await race(B, async (start) => {
+      await B.query(CANCEL, [uuid(), 'naka@test', 'やめる', OWN, z2.id]);
+      const ib = start(A.query(LZ_ISSUE, [uuid(), 'naka@test', z2.items]));
+      await sleep(400);
+      assert.equal(ib.done, false, 'CSV を出すは子の廃止の commit を待つ');
+      await B.query('commit');
+      const rib = await ib.promise;
+      assert.notEqual(rib.err?.code, '40P01');
+      assert.match(String(rib.err?.message), /^invalid_input: grp1-Z2 は単品で使える商品でない/, rib.err?.message ?? JSON.stringify(rib.ok));
+    });
     assert.equal(await regOf(z2.id), 'cancelled');
   });
 

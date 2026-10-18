@@ -255,28 +255,40 @@ try {
   await ta('[8a] (0099) CSV を出すが先 (commit 前) = 消すは SKU の鍵で待ち、出すの commit の後に「ロジザード登録の CSV に出しています (ファイル #N)」で断る', async () => {
     await draft(dbA, 'q-8a');
     const items = await lzPrep(A, 'q-8a');
-    await A.query('begin');
-    let r;
-    try { r = (await A.query(LZ_ISSUE, [uuid(), 'naka@test', items])).rows[0].r; } catch (e) { await A.query('rollback'); throw e; }
-    const c = launch(cancel(dbB, 'q-8a'));
-    await sleep(500);
-    assert.equal(c.done, false, '消すは CSV を出すの commit を待つ');
-    await A.query('commit');
-    const rc = await c.promise;
-    assert.equal(rc.err?.reason, 'not_cancellable', rc.err?.message ?? JSON.stringify(rc.ok));
-    assert.match(rc.err.message, new RegExp(`ロジザード登録の CSV に出しています \\(ファイル #${r.export_id}\\)`));
+    let c = null;
+    try {
+      await A.query('begin');
+      const r = (await A.query(LZ_ISSUE, [uuid(), 'naka@test', items])).rows[0].r;
+      c = launch(cancel(dbB, 'q-8a'));
+      await sleep(500);
+      assert.equal(c.done, false, '消すは CSV を出すの commit を待つ');
+      await A.query('commit');
+      const rc = await c.promise;
+      assert.equal(rc.err?.reason, 'not_cancellable', rc.err?.message ?? JSON.stringify(rc.ok));
+      assert.match(rc.err.message, new RegExp(`ロジザード登録の CSV に出しています \\(ファイル #${r.export_id}\\)`));
+    } finally {
+      // 途中で落ちても開いた取引を残さない (後の試験に aborted を渡さない)・相手の終わりを待つ
+      try { await A.query('rollback'); } catch { /* commit の後 = 何もしない */ }
+      if (c) await c.promise;
+    }
     assert.deepEqual([await regOf('q-8a'), await lzIssued('q-8a')], ['draft', 1]);
   });
   await ta('[8b] (0099) 消すが先 (commit 前) = CSV を出すは SKU の鍵で待ち、消すの commit の後に「使える商品でない」で断る (やめた下書きをロジザードに出さない)', async () => {
     await draft(dbA, 'q-8b');
     const items = await lzPrep(A, 'q-8b');
-    await holdCancel(B, 'q-8b');
-    const iss = launch(A.query(LZ_ISSUE, [uuid(), 'naka@test', items]));
-    await sleep(500);
-    assert.equal(iss.done, false, 'CSV を出すは消すの commit を待つ');
-    await B.query('commit');
-    const ri = await iss.promise;
-    assert.match(String(ri.err?.message ?? JSON.stringify(ri.ok)), /^invalid_input: q-8b は単品で使える商品でない/);
+    let iss = null;
+    try {
+      await holdCancel(B, 'q-8b');
+      iss = launch(A.query(LZ_ISSUE, [uuid(), 'naka@test', items]));
+      await sleep(500);
+      assert.equal(iss.done, false, 'CSV を出すは消すの commit を待つ');
+      await B.query('commit');
+      const ri = await iss.promise;
+      assert.match(String(ri.err?.message ?? JSON.stringify(ri.ok)), /^invalid_input: q-8b は単品で使える商品でない/);
+    } finally {
+      try { await B.query('rollback'); } catch { /* commit の後 = 何もしない */ }
+      if (iss) await iss.promise;
+    }
     assert.deepEqual([await regOf('q-8b'), await lzIssued('q-8b')], ['cancelled', 0]);
   });
   await ta('[8c] (0099) 同時に押す (4 回) = いつもどちらか片方だけが通る (両方通る・両方断る = 無い)・待ちの輪 (deadlock) にならない', async () => {
