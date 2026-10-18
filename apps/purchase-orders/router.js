@@ -42,7 +42,7 @@ import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 import { startFbaAutoRefresh, nextBusinessDay9Jst } from './scheduler.js';
 import { masterLegacyGate, legacyRecheck } from '../../lib/master-legacy-gate.mjs';
 import { orderOutboxStatus, readOrderSettingsPendingFor } from '../../lib/order-settings-outbox.mjs';
-import { productForVendorMap, upsertVendorCode, setQtyPerUnit, deleteVendorCode, vendorStamp, normVendorCode, QPU_MAX, QPU_ERR } from './vendor-codes.js';
+import { productForVendorMap, upsertVendorCode, setQtyPerUnit, deleteVendorCode, vendorStamp, vendorStampMark, normVendorCode, QPU_MAX, QPU_ERR } from './vendor-codes.js';
 import { withCompanyDb } from '../../lib/product-hub-outbox.mjs';
 import {
   writeOrderSettings, clearProductLinks, writeGroup, deleteGroup, OrderSettingsError, ATTR_FIELDS, hasLinkage, orderLotSource,
@@ -1613,6 +1613,7 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
       const oldRows = new Map(db.prepare('SELECT product_key, vendor_code, qty_per_unit FROM po_vendor_code_map WHERE supplier_code=?')
         .all(supplierCode).map(r => [r.product_key, sig(r.vendor_code, r.qty_per_unit)]));
       const newRows = new Map();
+      vendorStampMark();   // 全部消す前に版の印の始まりを決める (消した行の版を使い回さない・vendor-codes.js)
       db.prepare('DELETE FROM po_vendor_code_map WHERE supplier_code=?').run(supplierCode);
       const ins = db.prepare('INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) VALUES (?,?,?,?,?,?)');
       const seen = new Set();
@@ -1650,7 +1651,7 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
       }
       const changedKeys = [...new Set([...oldRows.keys(), ...newRows.keys()])].filter(k => oldRows.get(k) !== newRows.get(k)).sort();
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_import', resource: `supplier:${supplierCode}`,
-        detail: { oldCount, newCount: count, skipped, via: 'po-admin', changed_keys: changedKeys } });
+        detail: { oldCount, newCount: count, skipped, via: 'po-admin', changed_keys: changedKeys, max_stamp: vendorStampMark() } });
     })();
     res.json({ ok: true, supplier: sup.name, count, skipped, oldCount, warnings });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
@@ -2421,7 +2422,7 @@ router.post('/api/vendor-map/pending/:id/link', async (req, res) => {
       db.prepare("UPDATE po_vendor_code_pending SET status='linked', linked_product_code=?, updated_at=? WHERE id=?")
         .run(productCode, nowIso(), id);
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_pending_link', resource: `supplier:${pend.supplier_code}`,
-        detail: { via: 'po-admin', product_key: key, vendorCode: pend.vendor_code, productCode, oldVendorCode: old ? old.vendor_code : null,
+        detail: { via: 'po-admin', product_key: key, max_stamp: vendorStampMark(), vendorCode: pend.vendor_code, productCode, oldVendorCode: old ? old.vendor_code : null,
           provisionalProductCode: pend.provisional_product_code || null, provisionalQtyPerUnit: pqpu, oldQtyPerUnit: oldQpu } });
       const warnings = [];
       // 仮商品コードで入荷予定を作った後に別コードへ紐づけた場合はロジザード側が食い違う

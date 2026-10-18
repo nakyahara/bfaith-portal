@@ -97,6 +97,26 @@ await ta('[U0] 版の印は表と記録のいちばん新しい時刻より後�
   db.prepare("DELETE FROM po_vendor_code_map WHERE product_key = 'seed-x'").run();
 });
 
+await ta('[U0b] 時計が止まったまま続けて直す → 消す → 起動し直す (時計は同じ) → 作り直す = 前の版の印にならない (古い画面の保存は 409・Codex R2 M3)', () => {
+  const realNow = Date.now;
+  const FIX = realNow() + 7200e3;
+  Date.now = () => FIX;
+  try {
+    let r = up({ productCode: 'stamp-x', baseUpdatedAt: null, vendorCode: 'S1' });
+    const v1 = r.row.updated_at;
+    r = up({ productCode: 'stamp-x', baseUpdatedAt: v1, vendorCode: 'S2' });
+    const v2 = r.row.updated_at;
+    assert.ok(v2 > v1);
+    VC.deleteVendorCode({ supplierCode: '1', productCode: 'stamp-x', base: v2, actor: 'naka@test', via: 'po-admin' });
+    VC.__resetVendorStampForTest();
+    r = up({ productCode: 'stamp-x', baseUpdatedAt: null, vendorCode: 'S3' });
+    assert.ok(r.row.updated_at > v2, `作り直した版 ${r.row.updated_at} が前の版 ${v2} 以下`);
+    assert.equal(up({ productCode: 'stamp-x', baseUpdatedAt: v2, vendorCode: 'OLD' }).status, 409);
+    assert.equal(up({ productCode: 'stamp-x', baseUpdatedAt: v1, vendorCode: 'OLD' }).status, 409);
+    VC.deleteVendorCode({ supplierCode: '1', productCode: 'stamp-x', base: r.row.updated_at, actor: 'naka@test', via: 'po-admin' });
+  } finally { Date.now = realNow; }
+});
+
 await ta('[U1] 足す (版 null)・仕入先一致・未登録の仕入先・商品の確かめの誤り・記録 (via・product_key)', () => {
   let r = up({ supplierCode: '9' });
   assert.deepEqual([r.status, r.body.error], [400, '仕入先が未登録です: 9']);

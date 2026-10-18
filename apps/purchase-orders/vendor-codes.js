@@ -51,23 +51,36 @@ export class VendorCodeError extends Error {
 let lastStamp = null;
 /**
  * 対応表の updated_at。必ず前より新しい (同じミリ秒・時計の戻りでも前の版と同じ印にしない)。
- * 初めて使うときに、表の版と先方番号の記録の時刻のいちばん新しいものから始める = 再起動の後に時計が戻っても、
- * 消した行・前の版と同じ印を出さない (Codex #⑤ R1 M3)。発注アプリの SQLite を書くのは Render の 1 プロセスだけ
+ * 出した印のいちばん新しいもの = 先方番号の記録 (po_audit_log) の detail.max_stamp に書き込みと同じ取引で残す (vendorStampMark)。
+ * 初めて使うときに、表の版・記録の max_stamp・記録の時刻のいちばん新しいものから始める = 再起動の後に時計が戻っても、
+ * 消した行・前の版と同じ印を出さない (Codex #⑤ R1 M3・R2 M3)。発注アプリの SQLite を書くのは Render の 1 プロセスだけ
  */
+function seedStamp() {
+  if (lastStamp != null) return;
+  lastStamp = 0;
+  try {
+    const db = getDB();
+    const marks = VENDOR_HISTORY_ACTIONS.map(() => '?').join(',');
+    const a = db.prepare('SELECT max(updated_at) AS t FROM po_vendor_code_map').get().t;
+    const b = db.prepare(`SELECT max(occurred_at) AS t FROM po_audit_log WHERE action IN (${marks})`).get(...VENDOR_HISTORY_ACTIONS).t;
+    const c = db.prepare(`SELECT max(json_extract(detail_json, '$.max_stamp')) AS t FROM po_audit_log WHERE action IN (${marks}) AND json_valid(detail_json)`).get(...VENDOR_HISTORY_ACTIONS).t;
+    const d = db.prepare(`SELECT max(json_extract(detail_json, '$.deleted_updated_at')) AS t FROM po_audit_log WHERE action IN (${marks}) AND json_valid(detail_json)`).get(...VENDOR_HISTORY_ACTIONS).t;
+    for (const v of [a, b, c, d]) { const ms = v ? Date.parse(v) : NaN; if (Number.isFinite(ms) && ms > lastStamp) lastStamp = ms; }
+  } catch (e) { console.error(`[po-vendor-codes] 版の印の始まりを読めない: ${e && e.message}`); }
+}
 export function vendorStamp() {
-  if (lastStamp == null) {
-    lastStamp = 0;
-    try {
-      const db = getDB();
-      const a = db.prepare('SELECT max(updated_at) AS t FROM po_vendor_code_map').get().t;
-      const b = db.prepare(`SELECT max(occurred_at) AS t FROM po_audit_log WHERE action IN (${VENDOR_HISTORY_ACTIONS.map(() => '?').join(',')})`).get(...VENDOR_HISTORY_ACTIONS).t;
-      for (const v of [a, b]) { const ms = v ? Date.parse(v) : NaN; if (Number.isFinite(ms) && ms > lastStamp) lastStamp = ms; }
-    } catch (e) { console.error(`[po-vendor-codes] 版の印の始まりを読めない: ${e && e.message}`); }
-  }
+  seedStamp();
   const t = Math.max(Date.now(), lastStamp + 1);
   lastStamp = t;
   return new Date(t).toISOString();
 }
+/** 今までに出した (と表・記録にある) いちばん新しい印。先方番号の記録の detail.max_stamp に入れる (消した行の版も次の起動で使い回さない) */
+export function vendorStampMark() {
+  seedStamp();
+  return lastStamp ? new Date(lastStamp).toISOString() : null;
+}
+/** 試験用: 起動し直したことにする (次の印は表と記録から始め直す) */
+export function __resetVendorStampForTest() { lastStamp = null; }
 
 /** 入数の文字 → 数 (今までの発注アプリと同じ決まり: カンマを除いて 0 より大きく 1,000,000 以下)。空 = null・不正 = undefined */
 export function qtyPerUnitOf(v) {
@@ -186,7 +199,7 @@ export function upsertVendorCode(input) {
     if (qpu !== undefined) db.prepare('UPDATE po_vendor_code_map SET qty_per_unit=? WHERE supplier_code=? AND product_key=?').run(qpu, supplier, key);
     audit(db, { actorType: b.actorType || 'user', actor: b.actor, action: 'vendor_map_entry_upsert', resource: `supplier:${supplier}`, requestId: b.requestId ?? null,
       detail: { productCode, vendorCode, oldVendorCode: old ? old.vendor_code : null, qtyPerUnit: qpu === undefined ? '(変更なし)' : qpu,
-        oldQtyPerUnit: old ? old.qty_per_unit : null, via, product_key: key } });
+        oldQtyPerUnit: old ? old.qty_per_unit : null, via, product_key: key, max_stamp: vendorStampMark() } });
     const warning = dupWarning(db, supplier, key, vendorCode);
     out = { status: 200, body: { ok: true, updated: !!old, oldVendorCode: old ? old.vendor_code : null, warning }, row: rowOf(db, supplier, key) };
   })();
@@ -213,7 +226,7 @@ export function setQtyPerUnit(input) {
     if (!old) { out = { status: 404, body: { ok: false, error: 'この商品は対応表に未登録です (先に先方番号を登録してください)' } }; return; }
     db.prepare('UPDATE po_vendor_code_map SET qty_per_unit=?, updated_at=? WHERE supplier_code=? AND product_key=?').run(qpu, vendorStamp(), supplier, key);
     audit(db, { actorType: b.actorType || 'user', actor: b.actor, action: 'vendor_map_qty_per_unit', resource: `supplier:${supplier}`,
-      detail: { productKey: key, old: old.qty_per_unit, new: qpu, via, product_key: key } });
+      detail: { productKey: key, old: old.qty_per_unit, new: qpu, via, product_key: key, max_stamp: vendorStampMark() } });
     out = { status: 200, body: { ok: true, qtyPerUnit: qpu == null ? 1 : qpu } };
   })();
   return out;
@@ -238,9 +251,10 @@ export function deleteVendorCode(input) {
       out = { status: 409, body: { ok: false, conflict: true, error: `他の画面で変更されています (現在: ${old.vendor_code})。最新を確認してください`, current: { product_code: old.product_code, vendor_code: old.vendor_code, updated_at: old.updated_at } } };
       return;
     }
+    vendorStampMark();   // 消す前に印の始まりを決める (消した行の版を次の印より古くする)
     db.prepare('DELETE FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').run(supplier, key);
     audit(db, { actorType: b.actorType || 'user', actor: b.actor, action: 'vendor_map_entry_delete', resource: `supplier:${supplier}`, requestId: b.requestId ?? null,
-      detail: { productCode: old.product_code, vendorCode: old.vendor_code, qtyPerUnit: old.qty_per_unit, via, product_key: key } });
+      detail: { productCode: old.product_code, vendorCode: old.vendor_code, qtyPerUnit: old.qty_per_unit, via, product_key: key, deleted_updated_at: old.updated_at, max_stamp: vendorStampMark() } });
     out = { status: 200, body: { ok: true } };
   })();
   return out;

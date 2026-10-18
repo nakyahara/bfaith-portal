@@ -25,7 +25,7 @@
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { createHash } from 'crypto';
 import { audit, getSetting, stableStringify } from './ledger.js';
-import { parseVendorInput, VendorCodeError, vendorStamp, vendorHistoryExists, pendingCandidates, normVendorCode } from './vendor-codes.js';
+import { parseVendorInput, VendorCodeError, vendorStamp, vendorStampMark, vendorHistoryExists, pendingCandidates, normVendorCode } from './vendor-codes.js';
 
 /** 商品ごとの列 (po_product_attrs) */
 export const ATTR_FIELDS = Object.freeze(['order_lot', 'condition_id', 'material_group_id', 'capacity_per_unit', 'case_group', 'case_lot']);
@@ -427,7 +427,7 @@ function writeRegistrationVendor(db, { supplierCode, key, code, vendor, actor, r
   db.prepare('INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) VALUES (?,?,?,?,?,?)')
     .run(supplier, key, code || key, vendor.vendorCode, vendor.qtyPerUnit, vendorStamp());
   audit(db, { actorType: 'user', actor: String(actor ?? ''), action: 'vendor_map_entry_upsert', resource: `supplier:${supplier}`, requestId,
-    detail: { productCode: code || key, vendorCode: vendor.vendorCode, oldVendorCode: null, qtyPerUnit: vendor.qtyPerUnit, oldQtyPerUnit: null, via: 'master-edit:new', product_key: key } });
+    detail: { productCode: code || key, vendorCode: vendor.vendorCode, oldVendorCode: null, qtyPerUnit: vendor.qtyPerUnit, oldQtyPerUnit: null, via: 'master-edit:new', product_key: key, max_stamp: vendorStampMark() } });
   const dup = db.prepare('SELECT product_code, vendor_code FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)
     .filter((m) => normVendorCode(m.vendor_code) === normVendorCode(vendor.vendorCode) && normProductCode(m.product_code) !== key).map((m) => m.product_code);
   const pending = pendingCandidates(db, key, new Map([[supplier, new Set([normVendorCode(vendor.vendorCode)])]])).map((p) => p.id);
