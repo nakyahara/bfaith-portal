@@ -1118,6 +1118,17 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .csug { max-height: min(360px, 55vh); }
 }
 @media (prefers-reduced-motion: reduce) { .csug { animation: none; } }
+/* 🆕 0084 メーカーの欄 (views/_maker.ejs・public/me-maker.js)。候補は欄のすぐ下 (同じ .csug の見た目)・押す所は 44px */
+.mkpick { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; max-width: 100%; }
+.mkbox { position: relative; display: inline-block; max-width: 100%; }
+.mkbox .csug { top: calc(100% + 4px); left: 0; width: min(440px, 86vw); }
+.csug .co.mk-new .cn { color: var(--accent); font-weight: 600; }
+#f-maker-same { min-height: 36px; }
+@media (max-width: 760px) {
+  #f-maker-in, #f-maker-same { min-height: 44px; }
+  .mkpick, .mkbox, #f-maker-in { width: 100%; }
+  .mkbox .csug { width: 100%; }
+}
 /* 構成の行の下の「NE の商品を足す (セット)」= 1 行目は最初からあるので控えめ (文字だけのボタン・押せる大きさはスマホで 44px) */
 #comp-add.addrow { color: var(--muted); padding: 0 6px; }
 #comp-add.addrow:hover { color: var(--accent); }
@@ -1221,3 +1232,16 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 .bulk-prog .bar { flex: 1 1 auto; height: 6px; border-radius: 999px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
 .bulk-prog .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
 @media (max-width: 760px) { .bulk-acts .btn { flex: 1 1 auto; justify-content: center; } }
+
+/* ---------- 入出庫の履歴・月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・商品の画面の下) ---------- */
+.panel.moves { margin-top: 18px; min-width: 0; }
+.mv-head { margin-bottom: 10px; }
+.tbl.mv td, .tbl.mv th { padding: 8px 10px; font-size: 13.5px; }
+.tbl.mv .mv-when { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tbl.mv .mv-why { min-width: 220px; color: var(--text2); }
+.tbl.mv .sub { display: block; font-size: 11.5px; color: var(--muted); }
+.tbl.mv tr.mv-adj td { color: var(--muted); background: rgba(255, 200, 87, 0.035); }
+.tbl.mv tr.mv-adj td.n { color: var(--warn); }
+.mv-foot { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.mv-notes { margin-top: 8px; }
+.tbl.mv td:nth-child(2) { white-space: nowrap; }

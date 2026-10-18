@@ -8,7 +8,7 @@
  *      [N3] 1 軸の迷う名前 (同じ名前の子が 2 つ = 両方空・まとまりの名前で始まらない = 空・終わりの【JAN】は外す)
  *   2. まとまりの登録にも参考 URL (単品の登録と同じ欄・動き):
  *      [N4] 値か入力なし (あと N つ・入力なしで値を消す・値を入れると外れる)・形の確かめ・行を足す / 外す・送る本文・まとまりの共通の欄・product-hub のまとまりのカード
- *      [N5] 20 個まで (足すボタン)・API の確かめ (形 = 400 card.reference_urls・印の無い本文 = 400 blank_unmarked)
+ *      [N5] 20 個まで (足すボタン)・API の確かめ (形 = 400 card.reference_urls・印の無い本文 = 400 blank_unmarked・🆕 0084 メーカーの印も無い = 400 maker)
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 のときだけ
  * 使い方: node scripts/test-master-variation-oldnames-ui.mjs   (1 つだけ = VG7_UI_ONLY=N2)
  */
@@ -331,6 +331,9 @@ await ta('[N4] 参考 URL: 値か入力なし (あと N つ)・形の確かめ�
   assert.match(result, /2 件を下書きにしました/);
   assert.deepEqual(body.card.reference_urls, ['https://maker.example/b', 'https://maker.example/c']);
   assert.ok(!body.blanks.includes('card.reference_urls'));
+  // 🆕 0084: メーカーの欄も出ていて (noneRest で「入力なし」)、参考 URL と一緒に登録できる
+  assert.equal(await p.locator('[data-row="maker"]').count(), 1, 'メーカーの欄');
+  assert.ok(body.blanks.includes('maker'), JSON.stringify(body.blanks));
   const gid = (await one(`select group_product_id::text as id from ops.variation_group_codes where code_norm = 'refui'`)).id;
   assert.deepEqual((await one('select common from ops.variation_group_revisions where group_product_id = $1', [gid])).common.reference_urls, ['https://maker.example/b', 'https://maker.example/c']);
   assert.deepEqual((await q('select payload from ops.product_hub_outbox where group_product_id = $1', [gid]))[0].payload.common.reference_urls, ['https://maker.example/b', 'https://maker.example/c']);
@@ -358,10 +361,14 @@ await ta('[N5] 参考 URL は 20 個まで (足すボタン)・API: 形の違う
     card: { official_url: 'https://a.example', amazon_url: 'https://www.amazon.co.jp/dp/B000000000' } };
   const post = (body) => p.evaluate(async ([b0, x]) => { const r = await fetch(b0 + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), ...x }) }); return [r.status, await r.json()]; }, [B, body]);
   const ORDER = ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit'];
-  let r = await post({ ...base, card: { ...base.card, reference_urls: ['ftp://x.example'] }, blanks: [...ORDER, 'children.jan'] });
+  // 🆕 0084: 今の画面はメーカーも「値か入力なし」を送る (送らない = 参考 URL の形より先にメーカーで 400)。下の前の画面 (legacy) はメーカーも無いまま = 参考 URL の前の画面の答え・押し直しも前の答え
+  let r = await post({ ...base, card: { ...base.card, reference_urls: ['ftp://x.example'] }, blanks: [...ORDER, 'children.jan', 'maker'] });
   assert.deepEqual([r[0], r[1].field], [400, 'card.reference_urls'], JSON.stringify(r));
   assert.match(r[1].error, /参考 URL 1 つ目は http:\/\/ か https:\/\/ で始まる URL/);
-  r = await post({ ...base, card: { ...base.card, reference_urls: [] }, blanks: [...ORDER, 'children.jan'] });
+  // 🆕 0084: メーカーの値も「入力なし」も無い (今の画面は送れない) = メーカーで 400 (形の確かめより前・何も保存しない)
+  r = await post({ ...base, card: { ...base.card, reference_urls: ['https://ref.example'] }, blanks: [...ORDER, 'children.jan'] });
+  assert.deepEqual([r[0], r[1].reason, r[1].field], [400, 'blank_unmarked', 'maker'], JSON.stringify(r));
+  r = await post({ ...base, card: { ...base.card, reference_urls: [] }, blanks: [...ORDER, 'children.jan', 'maker'] });
   assert.deepEqual([r[0], r[1].reason, r[1].field, r[1].screen_outdated], [400, 'blank_unmarked', 'card.reference_urls', undefined], JSON.stringify(r));
   // 前の画面 (card に reference_urls が無い) の新しい登録 = 400 (画面を開き直す)
   const legacy = { ...base, blanks: [...ORDER, 'children.jan'] };
