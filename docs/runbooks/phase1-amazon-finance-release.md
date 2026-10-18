@@ -8,7 +8,7 @@
 
 ## 前提環境
 
-- ホスト: miniPC (192.168.68.65、`bfaith` ユーザー)
+- ホスト: miniPC (192.168.68.50、`bfaith` ユーザー、旧 .65 だったが 2026-05-18 防犯カメラ配線変更で DHCP 再割当)
 - DB: `C:\Users\bfaith\bfaith-portal\data\warehouse.db` (better-sqlite3 + WAL)
 - Node: 24.x
 - 必須環境変数: `DATA_DIR=C:\Users\bfaith\bfaith-portal\data`
