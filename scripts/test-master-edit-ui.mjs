@@ -3375,8 +3375,15 @@ await ta('[78] ⑤-1 商品の画面の先方品番・入数 (CompanyDB構想 27
     await p.fill(`${r1} .po-v-code`, 'AC-K1');
     await p.fill(`${r1} .po-v-qpu`, '２４');
     assert.equal(await dirty(p), d0 + 1, '打った先方品番の行を未保存に数えない');
+    // 送っている間は欄も閉じる (送っていない値を「保存した」にしない・Codex R1 M1)
+    let release; const gate = new Promise((r) => { release = r; });
+    await p.route('**/vendor-code', async (route) => { await gate; await route.continue(); });
     await p.click(`${r1} .po-v-save`);
+    await p.waitForFunction((s) => document.querySelector(s + ' .po-v-code').disabled && document.querySelector(s + ' .po-v-qpu').disabled, r1);
+    release();
     await p.waitForFunction((s) => /保存しました/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
+    await p.unroute('**/vendor-code');
+    assert.equal(await p.isDisabled(`${r1} .po-v-code`), false, '保存の後に欄が開かない');
     assert.deepEqual([vrow('1').vendor_code, vrow('1').qty_per_unit], ['AC-K1', 24]);
     assert.equal(await p.inputValue(`${r1} .po-v-qpu`), '24');
     assert.equal(await dirty(p), d0, '保存した後も未保存に数えている');

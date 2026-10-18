@@ -90,6 +90,13 @@ await ta('[P1] 形: 空 = null・入数だけ = 断る・全角の数・改行�
   err([], 'vendor_code');
 });
 
+await ta('[U0] 版の印は表と記録のいちばん新しい時刻より後から始める (再起動の後に時計が戻っても前の版を出さない・Codex R1 M3)', () => {
+  const future = new Date(Date.now() + 3600e3).toISOString();
+  db.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('2', 'seed-x', 'seed-x', 'S', ?)").run(future);
+  assert.ok(VC.vendorStamp() > future, '表の版より古い印を出した');
+  db.prepare("DELETE FROM po_vendor_code_map WHERE product_key = 'seed-x'").run();
+});
+
 await ta('[U1] 足す (版 null)・仕入先一致・未登録の仕入先・商品の確かめの誤り・記録 (via・product_key)', () => {
   let r = up({ supplierCode: '9' });
   assert.deepEqual([r.status, r.body.error], [400, '仕入先が未登録です: 9']);
@@ -272,6 +279,8 @@ await ta('[S1] 画面に出す値: この商品の全部の仕入先の行・仮
   assert.throws(() => VC.checkRegistrationVendor({ supplierCode: '0001', code: 'vc-a' }), (e) => e.status === 409);
   assert.throws(() => VC.checkRegistrationVendor({ supplierCode: '', code: 'x' }), (e) => e.status === 400);
   assert.throws(() => VC.checkRegistrationVendor({ supplierCode: '0099', code: 'x' }), (e) => e.status === 400);
+  // 行は無いが記録がある (足して消した) = 登録の前に 409 (Codex R1 M2)
+  assert.throws(() => VC.checkRegistrationVendor({ supplierCode: '0001', code: 'reg-4' }), (e) => e.status === 409 && e.reason === 'stale');
 });
 
 server.close();

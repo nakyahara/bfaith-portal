@@ -251,6 +251,8 @@
     var s = $('.po-v-save', r); var busyRow = r.getAttribute('data-busy') === '1';
     if (s) s.disabled = busyRow || !vDirty(r) || !$('.po-v-code', r).value.trim();
     var del = $('.po-v-del', r); if (del) del.disabled = busyRow;
+    // 送っている間は欄も閉じる (送っていない値を「保存した」にしない・Codex #⑤ R1 M1)
+    $$('input[data-v-edit]', r).forEach(function (inp) { inp.disabled = busyRow; });
     r.classList.toggle('po-dirty', vDirty(r));
     if (ME.setUnsaved && ME.dirty) ME.setUnsaved(ME.dirty().n);
   }
@@ -321,6 +323,7 @@
   if (P.mode === 'sku') {
     vRows().forEach(function (r) {
       r.setAttribute('data-init', vVals(r));
+      $$('input', r).forEach(function (inp) { if (!inp.disabled) inp.setAttribute('data-v-edit', '1'); });
       r.addEventListener('input', function (e) { e.stopPropagation(); vState(r); });
       r.addEventListener('change', function (e) { e.stopPropagation(); vState(r); });
       var s = $('.po-v-save', r); if (s) s.addEventListener('click', function () { vSave(r); });

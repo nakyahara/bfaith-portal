@@ -48,9 +48,22 @@ export class VendorCodeError extends Error {
 }
 
 // ─── 時刻 (先に読んだ値の印) ───
-let lastStamp = 0;
-/** 対応表の updated_at。プロセスの中で必ず前より新しい (同じミリ秒・時計の戻りでも前の版と同じ印にしない) */
+let lastStamp = null;
+/**
+ * 対応表の updated_at。必ず前より新しい (同じミリ秒・時計の戻りでも前の版と同じ印にしない)。
+ * 初めて使うときに、表の版と先方番号の記録の時刻のいちばん新しいものから始める = 再起動の後に時計が戻っても、
+ * 消した行・前の版と同じ印を出さない (Codex #⑤ R1 M3)。発注アプリの SQLite を書くのは Render の 1 プロセスだけ
+ */
 export function vendorStamp() {
+  if (lastStamp == null) {
+    lastStamp = 0;
+    try {
+      const db = getDB();
+      const a = db.prepare('SELECT max(updated_at) AS t FROM po_vendor_code_map').get().t;
+      const b = db.prepare(`SELECT max(occurred_at) AS t FROM po_audit_log WHERE action IN (${VENDOR_HISTORY_ACTIONS.map(() => '?').join(',')})`).get(...VENDOR_HISTORY_ACTIONS).t;
+      for (const v of [a, b]) { const ms = v ? Date.parse(v) : NaN; if (Number.isFinite(ms) && ms > lastStamp) lastStamp = ms; }
+    } catch (e) { console.error(`[po-vendor-codes] 版の印の始まりを読めない: ${e && e.message}`); }
+  }
   const t = Math.max(Date.now(), lastStamp + 1);
   lastStamp = t;
   return new Date(t).toISOString();
@@ -301,4 +314,6 @@ export function checkRegistrationVendor({ supplierCode, code }) {
   if (!key) return;
   const old = rowOf(db, supplier, key);
   if (old) throw new VendorCodeError(409, 'stale', `この商品コードには発注アプリの対応表にもう先方品番 (${old.vendor_code}) があります。何も保存していません`, 'vendor_code');
+  // 行が無くても、この商品の先方番号の記録 (足して消した・CSV) がある = 届けるときに要確認になる = 登録の前に断る (Codex #⑤ R1 M2)
+  if (vendorHistoryExists(db, supplier, key)) throw new VendorCodeError(409, 'stale', 'この商品コードの先方品番は発注アプリでもう扱われました (足して消した など)。登録の後に商品の画面で入れてください。何も保存していません', 'vendor_code');
 }

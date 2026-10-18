@@ -2091,6 +2091,11 @@ await ta('[PO9] ⑤-2 新商品の登録の先方品番・入数 = 知らせ v2 
   const taken = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9x', { ...emptyPatch, vendor_code: 'AC-9X' }), session: 'po-editor' });
   assert.deepEqual([taken.status, taken.j.field], [409, 'order_settings.vendor_code'], taken.text);
   assert.equal(await skuId('po-web-9x'), undefined, '断ったのに Company DB に登録した');
+  // 行は無いが記録がある (前に足して消した) = 登録の前に 409 (Codex R1 M2)
+  podb.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code = '1' AND product_key = 'po-web-9x'").run();
+  podb.prepare("INSERT INTO po_audit_log (occurred_at, actor_type, actor, action, resource, detail_json) VALUES (?, 'user', 'x', 'vendor_map_entry_delete', 'supplier:1', ?)").run(new Date().toISOString(), JSON.stringify({ productCode: 'po-web-9x', vendorCode: 'HUMAN', product_key: 'po-web-9x' }));
+  const hist = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9x', { ...emptyPatch, vendor_code: 'AC-9X' }), session: 'po-editor' });
+  assert.deepEqual([hist.status, hist.j.reason, await skuId('po-web-9x')], [409, 'stale', undefined], hist.text);
   // v2 の印の関数が無い DB (0099 の前) = 400 vendor_not_ready (何も書かない)・先方品番が無い登録は通る
   await pg.query('alter function ops.order_settings_payload_versions() rename to order_settings_payload_versions_hidden');
   try {
