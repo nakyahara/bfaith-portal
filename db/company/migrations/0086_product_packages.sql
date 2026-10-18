@@ -19,7 +19,7 @@
 --   2. ops.product_package_events = 入れた・変えた・外したの記録 (追記だけ・request_id と商品で一意)
 --   3. ops.set_product_package(...) = 人の値を入れる / 変える / 外す (新商品の登録・まとまりの登録 = 登録と同じ取引 / 商品の画面 = 保存と同じ取引)。
 --      守りはメーカー (0084 ops.set_product_maker) と同じ: 単品・会社 1・やめていない・切替の段階 new_open・門を通った保存 / 登録の取引の中・
---      今の値が画面の見ていたもの (最後の記録の番号) と違う = version_conflict
+--      記録の request_id・人 = 約束 (保存 = ops.begin_master_write・登録 = その SKU の sku_create) と同じ・今の値が画面の見ていたもの (最後の記録の番号) と違う = version_conflict
 --   4. core.package_source_rank(出どころ) と core.v_product_packages (まとめた値)
 -- 🚨 既にある表・関数は変えない (表・関数・ビューを足すだけ)。security definer = search_path = pg_catalog, pg_temp・public の実行権を外す。
 --    画面のロール (master_edit) の権限 (表・ビュー・core.product_physicals の select・書く関数の実行) は scripts/company-db/create-master-edit-roles.mjs を流し直して付ける
@@ -126,10 +126,12 @@ begin
   --   (約束の行がこの取引の中で作られたこと = created_at ≧ この取引の始まり も見る = バックアップから戻した DB で古い約束を今のものと見ない)
   if p_via = 'sku_page' then
     v_sess := ops.current_master_write_session();
-    if v_sess.session_id is null or v_sess.operation is distinct from 'sku_edit' or v_sess.sku_id is distinct from p_sku_id then
+    if v_sess.session_id is null or v_sess.operation is distinct from 'sku_edit' or v_sess.sku_id is distinct from p_sku_id
+       or v_sess.request_id is distinct from p_request_id or v_sess.actor_id is distinct from p_actor_id then   -- 記録の request_id・人 = 保存の約束と同じ (#0086 Codex R1 M)
       raise exception 'master_write_session_required: 商品の画面の梱包の大きさ・重さは、同じ取引でこの SKU の保存 (ops.begin_master_write) を始めた後だけ' using errcode = '42501';
     end if;
-  elsif not exists (select 1 from ops.master_write_sessions w where w.txid = pg_catalog.txid_current() and w.created_at >= pg_catalog.now() and w.operation = 'sku_create' and w.sku_id = p_sku_id) then
+  elsif not exists (select 1 from ops.master_write_sessions w where w.txid = pg_catalog.txid_current() and w.created_at >= pg_catalog.now() and w.operation = 'sku_create' and w.sku_id = p_sku_id
+                      and w.request_id = p_request_id and w.actor_id = p_actor_id) then   -- 登録の約束の request_id (まとまり = 子の番号)・人と同じ (#0086 Codex R1 M)
     raise exception 'master_write_session_required: 新商品の梱包の大きさ・重さは、その SKU を登録した同じ取引の中だけ (ops.register_new_sku の後)' using errcode = '42501';
   end if;
   -- 鍵: SKU の鍵 → 商品の行 (商品の画面の保存・登録の取引はもう持っている = 同じ取引で取り直しても待たない)
@@ -181,22 +183,22 @@ $$;
  *   🚨 security_invoker にしない = 読む人には core.product_physicals の権限が無くてもよい (このビューの select だけ渡す)
  */
 create view core.v_product_packages as
-with latest as (
+with latest as not materialized (
   select distinct on (ph.product_id, ph.source_system, coalesce(ph.source_ref, ''))
          ph.product_id, ph.source_system, ph.source_ref, ph.length_mm, ph.width_mm, ph.height_mm, ph.weight_g, ph.observed_at, ph.product_physical_id
     from core.product_physicals ph
    where ph.scope = 'package' and ph.observed_at <= pg_catalog.now()
    order by ph.product_id, ph.source_system, coalesce(ph.source_ref, ''), ph.observed_at desc, ph.product_physical_id desc
-), cand as (
-  select l.product_id, 'length_mm'::text as axis, l.length_mm as v, l.source_system as src, l.source_ref as ref, l.observed_at as at, l.product_physical_id as id from latest l where l.length_mm is not null
-  union all select l.product_id, 'width_mm', l.width_mm, l.source_system, l.source_ref, l.observed_at, l.product_physical_id from latest l where l.width_mm is not null
-  union all select l.product_id, 'height_mm', l.height_mm, l.source_system, l.source_ref, l.observed_at, l.product_physical_id from latest l where l.height_mm is not null
-  union all select l.product_id, 'weight_g', l.weight_g, l.source_system, l.source_ref, l.observed_at, l.product_physical_id from latest l where l.weight_g is not null
-  union all select h.product_id, 'length_mm', h.length_mm, 'human', null, h.set_at, null from core.product_packages h where h.length_mm is not null
-  union all select h.product_id, 'width_mm', h.width_mm, 'human', null, h.set_at, null from core.product_packages h where h.width_mm is not null
-  union all select h.product_id, 'height_mm', h.height_mm, 'human', null, h.set_at, null from core.product_packages h where h.height_mm is not null
-  union all select h.product_id, 'weight_g', h.weight_g, 'human', null, h.set_at, null from core.product_packages h where h.weight_g is not null
-), win as (
+), cand as not materialized (
+  -- 軸ごとに縦に並べる (出どころの行も人の行も 1 回だけ読む = 商品の絞り込みが元の表まで届く・#0086 Codex R1 M)
+  select l.product_id, x.axis, x.v, l.source_system as src, l.source_ref as ref, l.observed_at as at, l.product_physical_id as id
+    from latest l cross join lateral (values ('length_mm'::text, l.length_mm), ('width_mm', l.width_mm), ('height_mm', l.height_mm), ('weight_g', l.weight_g)) as x(axis, v)
+   where x.v is not null
+  union all
+  select h.product_id, x.axis, x.v, 'human', null, h.set_at, null
+    from core.product_packages h cross join lateral (values ('length_mm'::text, h.length_mm), ('width_mm', h.width_mm), ('height_mm', h.height_mm), ('weight_g', h.weight_g)) as x(axis, v)
+   where x.v is not null
+), win as not materialized (
   select distinct on (c.product_id, c.axis) c.product_id, c.axis, c.v, c.src, c.ref, c.at
     from cand c
    order by c.product_id, c.axis, core.package_source_rank(c.src), c.at desc, c.id desc nulls first

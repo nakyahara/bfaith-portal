@@ -1108,6 +1108,7 @@
       if (k === 'name') { e.manual = true; e.name = t.value; } else e[k] = t.value;
       light(); return;
     } else if (t.closest && t.closest('#sec-order, #sec-card')) { light(); return; }
+    else if (/^np-(length|width|height|weight)$/.test(id)) { light(); return; }   // 🆕 0086: 大きさ・重さ (未保存の数・確かめの中身を数え直す)
     else return;
     update();
   }
@@ -1418,6 +1419,7 @@
     if (FIELDS.some(function (f) { return S.common[f] !== COMMON0[f]; }) && S.mode === 'new') items.push('共通の欄');
     if (Object.keys(S.edits).length) items.push('子の一覧の変更');
     if (ME.orderSettings && ME.orderSettings.collect()) items.push('発注の設定');
+    if (pkgBody()) items.push('大きさ・重さ');   // 🆕 0086: 大きさ・重さだけ入れた後に離れても未保存の確認を出す
     return { n: items.length, items: items, impacts: [] };
   };
 

@@ -159,7 +159,15 @@ await ta('③ まとまり: 共通の欄に大きさ・重さ (全部の子に�
   await p.goto(B + '/new?kind=variation');
   assert.equal(await p.locator('#sec-common #np-length').count(), 1);
   assert.match(await p.textContent('#sec-common'), /全部の子に同じ値 \(サイズで違うときは空のまま登録して/);
+  assert.deepEqual(await p.evaluate(() => window.MasterEdit.dirty().items), [], '開いただけで未保存');
   await p.fill('#np-weight', '400');
+  // 🆕 Codex R1 M: 大きさ・重さだけ入れた = 未保存に数える (離れるときの確認が出る)
+  assert.deepEqual(await p.evaluate(() => window.MasterEdit.dirty().items), ['大きさ・重さ']);
+  let asked = null;
+  p.once('dialog', async (d) => { asked = d.type(); await d.dismiss(); });
+  await p.evaluate(() => { location.href = '/'; }).catch(() => {});
+  await p.waitForTimeout(500);
+  assert.equal(asked, 'beforeunload', '離れるときの確認が出ない');
 });
 
 await ta('④ スマホの幅 (390): 商品の画面の「大きさ・重さ」が横にはみ出さない', async (p) => {

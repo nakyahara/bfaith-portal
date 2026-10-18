@@ -183,6 +183,15 @@ await ta('[M1] まとめた値: 軸ごとに 人 → 実測 → Amazon → 定�
   assert.deepEqual(pv.resolved.height_mm && [pv.resolved.height_mm.value, pv.resolved.height_mm.words], [30, '定形外 (実測)']);
   assert.deepEqual(pv.conflicts, { weight_g: [260, 250, 300] });
   assert.equal(pv.human, null);
+  // 🆕 Codex R1 M: 商品の絞り込みが元の表 (出どころ・人) の読み取りまで届く (全部の商品の履歴を読んで並べない)
+  const plan = (await q('explain select * from core.v_product_packages where product_id = $1', [await pidOf('s002')])).map((r) => r['QUERY PLAN']).join('\n');
+  for (const t of ['product_physicals', 'product_packages']) {
+    const i = plan.search(new RegExp(`on ${t}\\b`));
+    assert.ok(i >= 0, `${t} を読む行が無い:\n${plan}`);
+    const block = plan.slice(i).split('\n').slice(0, 3).join('\n');
+    assert.match(block, /product_id = /, `${t} の読み取りに商品の条件が届いていない:\n${plan}`);
+  }
+  assert.ok(!/CTE Scan/.test(plan), `CTE を実体化している:\n${plan}`);
 });
 
 let PAGE_TOKEN_BEFORE = null;
@@ -261,16 +270,46 @@ await ta('[S2] ほかの人が変えた後 = 409 (編集の印)・記録の無�
   // 保存の約束の中でも、見ていた記録が今と違えば断る・ほかの SKU の約束では書けない・範囲の外は断る
   await asEditor(async () => {
     const cur = await W.readCurrent(db, id1, today);
+    const RID = uuid();
     const begin = (sid) => pg.query('select ops.begin_master_write($1::uuid, $2, $3, $4::jsonb, $5, $6::bigint, $7, $8, $9::jsonb)',
-      [uuid(), 'naka@test', null, T.OWN, 'sku_edit', sid, W.editTokenOf(cur), 'a'.repeat(64), JSON.stringify(W.editVersionsOf(cur))]);
-    const fn = (sid, seen, g = 50) => pg.query("select ops.set_product_package($1::uuid, 'naka@test', $2::bigint, null, null, null, $3, $4::bigint, 'sku_page', null)", [uuid(), sid, g, seen]);
+      [RID, 'naka@test', null, T.OWN, 'sku_edit', sid, W.editTokenOf(cur), 'a'.repeat(64), JSON.stringify(W.editVersionsOf(cur))]);
+    const fn = (sid, seen, g = 50, { rid = RID, actor = 'naka@test' } = {}) => pg.query("select ops.set_product_package($1::uuid, $5, $2::bigint, null, null, null, $3, $4::bigint, 'sku_page', null)", [rid, sid, g, seen, actor]);
     await pg.query('begin');
     try { await begin(id1); await assert.rejects(fn(id1, null), /version_conflict/); } finally { await pg.query('rollback'); }
     await pg.query('begin');
     try { await begin(id1); await assert.rejects(fn(id1, cur.pkg.event_id, 0), /invalid_input/); } finally { await pg.query('rollback'); }
     await pg.query('begin');
     try { await begin(id1); await assert.rejects(fn(await skuIdOf('s003'), null), /master_write_session_required/); } finally { await pg.query('rollback'); }
+    // 🆕 Codex R1 M: 約束と違う request_id・人の記録は書かない (保存の記録と大きさ・重さの記録がずれない)
+    await pg.query('begin');
+    try { await begin(id1); await assert.rejects(fn(id1, cur.pkg.event_id, 50, { rid: uuid() }), /master_write_session_required/, 'ほかの request_id'); } finally { await pg.query('rollback'); }
+    await pg.query('begin');
+    try { await begin(id1); await assert.rejects(fn(id1, cur.pkg.event_id, 50, { actor: 'other@test' }), /master_write_session_required/, 'ほかの人'); } finally { await pg.query('rollback'); }
+    await pg.query('begin');
+    try { await begin(id1); const r = (await fn(id1, cur.pkg.event_id, 50)).rows[0]; assert.equal(Object.values(r)[0].changed, true, '約束どおりの request_id・人 = 書ける'); } finally { await pg.query('rollback'); }
   });
+  // 新商品の登録の約束も request_id・人と結ぶ (まとまりの子 = 子の登録の番号): 登録だけ別の番号で呼ぶと断る
+  {
+    const R = await import('../lib/master-register.mjs');
+    const b = single('pk-s2x');
+    await asEditor(async () => {
+      // registerNewSku は自分で begin / commit する = 登録の関数の後・同じ取引の中で直に呼ぶ形を beforeCommit で見る
+      let seen = null;
+      const r = await R.registerNewSku(db, { actor: 'naka@test', requestId: b.request_id, kind: 'single', code: b.code, reason: null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode },
+        { open: true, shippingRates: RATES, beforeCommit: async () => {
+          const sid = (await one('select sku_id::text as id from core.skus where code = $1', [b.code])).id;
+          for (const [rid, actor] of [[uuid(), 'naka@test'], [b.request_id, 'other@test']]) {
+            await pg.query('savepoint s');
+            try { await assert.rejects(pg.query("select ops.set_product_package($1::uuid, $2, $3::bigint, null, null, null, 50, null, 'register', null)", [rid, actor, sid]), /master_write_session_required/); }
+            finally { await pg.query('rollback to savepoint s'); }
+          }
+          seen = (await pg.query("select ops.set_product_package($1::uuid, 'naka@test', $2::bigint, null, null, null, 50, null, 'register', null) as r", [b.request_id, sid])).rows[0].r;
+        } });
+      assert.equal(r.code, b.code);
+      assert.equal(seen && seen.changed, true, '登録の約束どおり = 書ける');
+    });
+    assert.equal((await humanOf('pk-s2x')).weight_g, 50);
+  }
   // 形の誤り = 400 (欄つき)・何も書かない
   page = await call('GET', '/sku/s001');
   for (const [values, field] of [[{ pkg_length: '1.25' }, 'package'], [{ pkg_height: '0' }, 'package'], [{ pkg_weight: '1.5' }, 'pkg_weight'], [{ pkg_weight: '100001' }, 'pkg_weight']]) {
