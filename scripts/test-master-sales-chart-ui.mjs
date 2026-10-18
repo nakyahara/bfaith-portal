@@ -202,7 +202,7 @@ try {
     await pg.query('set role deploy');
     try {
       await p.goto(B + '/sku/sc-a');
-      await p.waitForFunction(() => /0084/.test(document.getElementById('sc-sum').textContent));
+      await p.waitForFunction(() => /0086/.test(document.getElementById('sc-sum').textContent));
       assert.equal(await p.isHidden('#sc-chart'), true);
       assert.equal(await p.isHidden('#sc-table-box'), true);
     } finally {

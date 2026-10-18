@@ -85,8 +85,8 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   { sig: 'ops.sku_shipment_totals(bigint, timestamp with time zone[])', cls: 'light', public: false, since: '0085', reason: 'SKU 1 つの出荷を取得時刻の区切り (1,000 個まで) ごとに足す (0085・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。明細は ix_shipment_lines_sku・伝票は主キー。本番を測った売れ筋 (明細 1,048 行) で出荷の 13 か月の読みが 0.4 秒' },
   { sig: 'ops.sku_movement_shipments(bigint, timestamp with time zone, timestamp with time zone, text, integer)', cls: 'light', public: false, since: '0085', reason: 'SKU 1 つの出荷の行 (伝票ごと・新しい順・p_limit は 1〜5,000 に丸める) (0085・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。ix_shipment_lines_sku + 主キー。画面のロールの statement_timeout 20 秒が上限' },
   { sig: 'ops.sku_shipments_monthly(bigint, date)', cls: 'light', public: false, since: '0085', reason: 'SKU 1 つの月ごとの受注数・売上数 (0085・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。画面は 13 か月 (p_from = 13 か月前の月初)。本番を測った売れ筋で 7 ms' },
-  // 🆕 0084 仮 (販売数のグラフ・10/17 中原さん)。p_from が規則にかかる = ここで分ける。🚨 番号を付け替えたら since も
-  { sig: 'ops.sku_sales_daily(bigint, date)', cls: 'light', public: false, since: '0084', reason: 'SKU 1 つの日 × モールの正味の販売数 (0084 仮・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行・金額は返さない)。' + 'その SKU を含むセット (上へ 5 段・セットの構成の表は数千行) と出品の構成 (ix_listing_components_sku) から、明細を ix_order_lines_sku / ix_order_lines_listing・注文を主キーで引く (会社の全部の売上を展開しない)。' + '期間は 2025-01-01 (p_from をそれより古くできない) 〜 今日 (JST) の決まった日付 = 返す行はその日数 × 8 モールまで (画面は 24 か月だけ頼む)。商品の画面の「販売数のグラフ」を開くたびに 1 回 (画面の期限 8 秒・ロールの statement_timeout 20 秒)' },
+  // 🆕 0086 (販売数のグラフ・10/17 中原さん)。p_from が規則にかかる = ここで分ける。🚨 番号を付け替えたら since も
+  { sig: 'ops.sku_sales_daily(bigint, date)', cls: 'light', public: false, since: '0086', reason: 'SKU 1 つの日 × モールの正味の販売数 (0086・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行・金額は返さない)。' + 'その SKU を含むセット (上へ 5 段・セットの構成の表は数千行) と出品の構成 (ix_listing_components_sku) から、明細を ix_order_lines_sku / ix_order_lines_listing・注文を主キーで引く (会社の全部の売上を展開しない)。' + '期間は 2025-01-01 (p_from をそれより古くできない) 〜 今日 (JST) の決まった日付 = 返す行はその日数 × 8 モールまで (画面は 24 か月だけ頼む)。商品の画面の「販売数のグラフ」を開くたびに 1 回 (画面の期限 8 秒・ロールの statement_timeout 20 秒)' },
 ]);
 
 export const MANIFEST_CLASSES = Object.freeze(['revoke', 'guard_later', 'light']);

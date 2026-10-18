@@ -1,5 +1,5 @@
 /**
- * test-master-sales-chart.mjs — 商品の画面の「販売数のグラフ」(apps/master-edit/sales-chart.mjs・0084 仮の読むだけの関数 ops.sku_sales_daily・10/17 中原さん)
+ * test-master-sales-chart.mjs — 商品の画面の「販売数のグラフ」(apps/master-edit/sales-chart.mjs・0086 の読むだけの関数 ops.sku_sales_daily・10/17 中原さん)
  *
  * Company DB = PGlite (migration・見張りと画面のロール)。注文は本物の取込 (core.apply_order_batch)・在庫は本物の取込 → 日の締め。本物の router を HTTP 越しに通す (画面のロール master_edit で読む)
  * 確かめること:
@@ -232,7 +232,7 @@ try {
     try {
       const { status, j } = await get('/api/sku/sc-a/sales-chart');
       assert.deepEqual([status, j.reason], [503, 'no_privilege']);
-      assert.match(j.error, /0084/);
+      assert.match(j.error, /0086/);
     } finally { for (const f of SALES_CHART_FUNCTIONS) await pg.query(`grant execute on function ${f} to master_edit`); }
     const keep = SALES_CHART_LIMITS.timeMs;
     SALES_CHART_LIMITS.timeMs = 0;

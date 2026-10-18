@@ -115,7 +115,7 @@ import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
 // 🆕 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・0085 の読むだけの関数)
 import { readMovementsPage, readMonthly } from './movements.mjs';
-// 🆕 販売数のグラフ (10/17 中原さん・0084 仮の読むだけの関数)
+// 🆕 販売数のグラフ (10/17 中原さん・0086 の読むだけの関数)
 import { readSalesChart } from './sales-chart.mjs';
 import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
@@ -1245,7 +1245,7 @@ router.get('/api/sku/:code/monthly', (req, res) => withPgApi(res, async (db) => 
   res.status(out.ok ? 200 : 503).json(out);
 }));
 /**
- * 🆕 販売数のグラフ (10/17 中原さん): 日 × モールの正味の販売数 (0084 仮の読むだけの関数) と、単品はロジザードの毎日の在庫。SQL は 1 回 (商品を引くのと合わせて 2 回)。
+ * 🆕 販売数のグラフ (10/17 中原さん): 日 × モールの正味の販売数 (0086 の読むだけの関数) と、単品はロジザードの毎日の在庫。SQL は 1 回 (商品を引くのと合わせて 2 回)。
  *   期限 = ルートに入ってから 8 秒 (接続の待ちも入れる・1 つの文は残りの時間まで)。過ぎた・関数が無い = 503 と言葉 (画面のほかの所は動く)。セットも出す (そのセットとして売れた数)
  */
 export const SALES_CHART_LIMITS = { timeMs: 8e3 };

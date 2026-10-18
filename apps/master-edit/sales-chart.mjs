@@ -2,10 +2,10 @@
  * sales-chart.mjs — 商品の画面の「販売数のグラフ」(2026-10-17 中原さん「販売数量のグラフが見れるようになるといいかも」。読むだけ。書かない)
  *
  * 材料 (1 回の SQL = 読むだけの関数 2 つ):
- *   - 販売数 = Company DB のモールの注文 (core.orders / order_lines) を日 × モールに足した正味の数 (数量 − 取消) = ops.sku_sales_daily (0084 仮)。
+ *   - 販売数 = Company DB のモールの注文 (core.orders / order_lines) を日 × モールに足した正味の数 (数量 − 取消) = ops.sku_sales_daily (0086)。
  *       数え方は売上日次 (mart.sales_daily・0021) と商品の動き (mart.sku_activity・0042) と同じ規則: 日 = 注文日 (JST)・セットで売れた分は構成品に入る
  *       (セットの画面 = そのセットとして売れた数)。金額は読まない
- *   - 在庫 = ロジザードの毎日の在庫 (締めた日) = ops.sku_stock_anchors (0083 仮・入出庫の履歴と同じ)。単品だけ (セットは在庫を持たない)
+ *   - 在庫 = ロジザードの毎日の在庫 (締めた日) = ops.sku_stock_anchors (0085・入出庫の履歴と同じ)。単品だけ (セットは在庫を持たない)
  * 数える範囲: Company DB に注文を入れている 7 モール (楽天・Amazon (FBA も)・Yahoo!・au PAY・Qoo10・LINE ギフト・メルカリ)。
  *   卸・そのほかの NE の店・FBA 納品は入らない = 上の「売れた数 (7 日・30 日)」(商品管理リスト = NE の全部の店 + FBA) と少し違う (画面にそう書く)
  *   注文が日ごとにそろっているのは 2025-01-01 から (SALES_FROM・LINE ギフト 2026-02-07・Qoo10 2026-03-01 から)。その前の期間は空欄 (0 と出さない)
@@ -99,10 +99,10 @@ export function buildSalesChart({ sales, anchors, through }) {
   return { through, dataFrom: SALES_FROM, stockFrom: stockDays && stockDays.length ? stockDays[0].day : null, views };
 }
 
-/** DB の関数の誤り → 画面の言葉。関数が無い (0084 / 0083 の前)・権限が無い (流し直しの前) = no_privilege。期限切れ = timeout */
+/** DB の関数の誤り → 画面の言葉。関数が無い (0086 / 0085 の前)・権限が無い (流し直しの前) = no_privilege。期限切れ = timeout */
 function chartError(e) {
   if (e instanceof ListTimeoutError || (e && e.code === '57014')) return { ok: false, reason: 'timeout', error: '販売数の読み出しに時間がかかりすぎました。少し待ってから画面を開き直してください' };
-  if (e && (e.code === '42883' || e.code === '42501')) return { ok: false, reason: 'no_privilege', error: '画面のロールに販売数を読む関数がまだありません (migration 0084 と create-master-edit-roles.mjs の流し直しが要ります)' };
+  if (e && (e.code === '42883' || e.code === '42501')) return { ok: false, reason: 'no_privilege', error: '画面のロールに販売数を読む関数がまだありません (migration 0086 と create-master-edit-roles.mjs の流し直しが要ります)' };
   console.error(`[master-edit] 販売数のグラフを読めない: ${e && e.message}`);
   return { ok: false, reason: 'error', error: '販売数を読めません' };
 }
