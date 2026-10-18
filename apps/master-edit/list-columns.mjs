@@ -5,6 +5,7 @@
  *   cell = 一覧の td の data-col (前からの名前を変えない = 試験・画面の JS がそのまま読める)。無ければ id と同じ
  *   sort = 並べられる列の種類 (見出しの「押すと ○○順」の言葉)。無い = 並べられない (FBA・売れた数・注文残・対応が必要 = 全件を読まないと並べられない)
  *   fixed = 外せない・動かせない列 (コード = いつも左端・横に送っても残る)
+ *   addShown = 後から足した列で、前に列を保存した人にも出す列 (保存してある並びに無ければコードのすぐ後ろに出す。外して保存すればその後は出さない)
  * 並べ方そのもの (SQL / JS) は read.mjs の listSkus。この表は名前と言葉だけ (サーバー・画面の JS が同じ物を使う)
  */
 
@@ -21,6 +22,8 @@ export const SORT_WORDS = Object.freeze({
 
 export const LIST_COLUMNS = Object.freeze([
   { id: 'code', label: 'コード', sort: 'code', fixed: true, width: 'width:130px' },
+  // 画像 (10/17 中原さん「楽天の白抜き商品画像でいい。サムネイルみたいなかたちで」) = list-images.mjs。並べられない・CSV に入れない
+  { id: 'img', label: '画像', isNew: true, addShown: true, width: 'width:68px', th: 'th-img' },
   { id: 'name', label: '名前', sort: 'text', width: 'min-width:260px' },
   { id: 'kind', label: '区分', sort: 'kind', width: 'width:74px', th: 'th-kind' },
   { id: 'state', label: '状態', sort: 'state', width: 'width:150px' },
@@ -37,6 +40,8 @@ export const LIST_COLUMNS = Object.freeze([
   { id: 'sold', label: '売れた 7日/30日', num: true, ref: true, width: 'width:96px', th: 'th-sales', cell: 'sales' },
   { id: 'po', label: '注文残', num: true, ref: true, width: 'width:76px', po: true },
   { id: 'flags', label: '対応が必要', width: 'width:150px' },
+  // 🆕 0084 (2026-10-17): メーカー (Company DB だけの値・単品だけ)。前の列の並びを変えないよう最後に足す・いつもの列では出さない (列の板で出す)・並べられない
+  { id: 'maker', label: 'メーカー', isNew: true, width: 'min-width:140px', th: 'th-maker' },
 ].map((c) => Object.freeze({ ...c, cell: c.cell || c.id })));
 
 export const COLUMN_IDS = Object.freeze(LIST_COLUMNS.map((c) => c.id));
@@ -51,7 +56,7 @@ const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
  */
 export const DEFAULT_VIEW = Object.freeze({
   order: Object.freeze([...COLUMN_IDS]),
-  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup')),
+  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup' && id !== 'maker')),   // 🆕 0084: メーカーも新しい列 = 出さない
 });
 
 /**
@@ -111,16 +116,20 @@ export function parseViewInput(body) {
 }
 
 /**
- * 保存してあった列の設定を今の列に合わせる (後から列を足した・消した): 知らない列は捨てる・無い列は後ろに足す (出さない)・コードはいつも左端で出す。
+ * 保存してあった列の設定を今の列に合わせる (後から列を足した・消した): 知らない列は捨てる・無い列は後ろに足す (出さない。addShown の列 = コードのすぐ後ろに出す)・コードはいつも左端で出す。
  * 読めない形 = null (いつもの列)
  */
 export function normalizeView(v) {
   if (!v || !Array.isArray(v.order) || !Array.isArray(v.shown)) return null;
   const order = [];
   for (const x of v.order) if (typeof x === 'string' && has(COLUMN_BY_ID, x) && !order.includes(x)) order.push(x);
-  for (const id of COLUMN_IDS) if (!order.includes(id)) order.push(id);
-  const ordered = ['code', ...order.filter((x) => x !== 'code')];
   const shownSet = new Set(v.shown.filter((x) => typeof x === 'string' && has(COLUMN_BY_ID, x)));
+  const late = [];   // 後から足した「前に保存した人にも出す」列 (コードのすぐ後ろ・出す)
+  for (const id of COLUMN_IDS) {
+    if (order.includes(id)) continue;
+    if (COLUMN_BY_ID[id].addShown) { late.push(id); shownSet.add(id); } else order.push(id);
+  }
+  const ordered = ['code', ...late, ...order.filter((x) => x !== 'code')];
   shownSet.add('code');
   return { order: ordered, shown: ordered.filter((x) => shownSet.has(x)) };
 }

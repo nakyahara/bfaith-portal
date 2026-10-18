@@ -5,7 +5,7 @@
  *   ① 新しいまとまり (色 4 × サイズ 4・エンジ × 90 を作らない・JAN・この商品だけの売価・手で直した名前・JAN をまとめて貼る・作らないを見る・確かめの窓 = 直せない 3 つにチェックで保存)
  *   ② 今あるまとまりに新色 (売価が 2 種類 = 写した元の子・選ぶまで保存できない)
  *   ③ 前回作らなかった組み合わせ (最初は「作らない」・押したら作る)
- *   ④ NE で作ったまとまりに足す (前からある子の文字 = コードの末尾から仮に・色の名前は空 = 人が打つ)
+ *   ④ NE で作ったまとまりに足す (前からある子の文字 = コードの末尾から仮に・色の名前 = 子の商品名から仮に (🆕 2026-10-17・「確かめた」まで保存できない))
  *   ⑤ 40 色 × 3 サイズ = 120 (上限ちょうど・保存できる)
  *   ⑥ 上限を超える (45 色) = 保存を止め、色そのものを分ける → 保存 → 「残りを足す」→ 同じまとまりに続けて保存 / NE 登録の CSV = 1 回目の CSV を先に作ってから残りを足す・未処理の回が重なると 1 つのファイル
  *   ⑦ 誤り (「-」の付け忘れ = 誤り + 「- を付ける」・重なり・JAN の形とほかの商品の JAN・まとまりのコードがもうある = 「このまとまりに足す」)
@@ -279,19 +279,44 @@ await ta('[③] 前回作らなかった組み合わせ: ブラック × 110 は
   assert.deepEqual(await kidsOf('hakama-kids'), ['hakama-kids-BK-100', 'hakama-kids-BK-110', 'hakama-kids-NV-100', 'hakama-kids-NV-110', 'hakama-kids-WH-100', 'hakama-kids-WH-110']);
 });
 
-await ta('[④] NE で作ったまとまり (記録なし) に足す: 前からある子の文字 = コードの末尾から仮・色の名前は空 (人が打つまで保存できない)・最初の 1 回だけ記録', async (p) => {
+await ta('[④] NE で作ったまとまり (記録なし) に足す: 前からある子の文字 = コードの末尾から仮・色の名前 = 子の商品名から仮 (「確かめた」まで保存できない)・人が直した名前は残る・確かめ (重なり) は仮の名前にも効く・最初の 1 回だけ記録', async (p) => {
   await p.goto(B + '/new?kind=variation');
   await pickGroup(p, 'ws1', 'ws100');
   await fill(p, '#ax-0', 'カラー');
   await fill(p, '#opt-0', 'ワインレッド / -WR');
   await settle(p);
   assert.deepEqual(await p.$$eval('#old-box input[data-of="hnum"]', (els) => els.map((e) => [e.dataset.oc, e.value])), [['ws100-BR', '-BR'], ['ws100-GY', '-GY'], ['ws100-NV', '-NV']]);
-  assert.deepEqual(await p.$$eval('#old-box input[data-of="hname"]', (els) => els.map((e) => e.value)), ['', '', '']);
-  assert.equal((await info(p)).save, 'disabled');
+  // 🆕 2026-10-17: 色の名前 = 子の商品名 (ウールストール【ブラウン】) から仮に入れる (印「仮」)・確かめたのチェックまで保存できない
+  const hnames = () => p.$$eval('#old-box input[data-of="hname"]', (els) => els.map((e) => e.value));
+  assert.deepEqual(await hnames(), ['ブラウン', 'グレー', 'ネイビー']);
+  assert.match(await p.innerText('#old-box .oldbox'), /ウールストール【ブラウン】/, '今の商品名も見せる');
+  assert.equal(await p.locator('#old-box input.guess').count(), 3);
+  assert.equal(await p.locator('#old-box .gtag:not([hidden])').count(), 3);
+  let i4 = await info(p);
+  assert.equal(i4.save, 'disabled');
+  assert.ok(i4.issues.some((x) => /^前からある子の名前 \(商品名から仮に入れた 3 件\) を見て「確かめた」にチェック/.test(x)), JSON.stringify(i4.issues));
   await shot(p, '9-ne', '#sec-opts');
-  await fill(p, '#old-box input[data-oc="ws100-BR"][data-of="hname"]', 'ブラウン');
+  // 確かめ (重なり) は仮の名前と人が直した名前の間でも効く・直した名前は「仮」ではない
+  await fill(p, '#old-box input[data-oc="ws100-GY"][data-of="hname"]', 'ブラウン');
+  await settle(p);
+  assert.ok((await info(p)).issues.some((x) => /前からある ws100-GY: 名前「ブラウン」の文字が 2 つ/.test(x)), JSON.stringify((await info(p)).issues));
+  assert.equal(await p.locator('#old-box input[data-oc="ws100-GY"].guess').count(), 0, '人が直した = 仮の印が外れる');
+  assert.equal(await p.locator('#old-box .gtag:not([hidden])').count(), 2);
   await fill(p, '#old-box input[data-oc="ws100-GY"][data-of="hname"]', 'グレー');
-  await fill(p, '#old-box input[data-oc="ws100-NV"][data-of="hname"]', 'ネイビー');
+  assert.equal(await p.locator('#old-box .gtag:not([hidden])').count(), 3, '仮に入れた値に戻した = 仮のまま (確かめが要る・Codex R1 M1)');
+  await fill(p, '#old-box input[data-oc="ws100-GY"][data-of="hname"]', 'グレー杢');
+  // 縦軸を足す = かっこ 1 つの名前は 2 軸では読めない (空)・人が直した GY は残る → 外す = 仮に戻る (確かめたのチェックも出し直し)
+  await p.click('#ax-v button[data-v="1"]');
+  await settle(p);
+  assert.deepEqual(await hnames(), ['', 'グレー杢', '']);
+  await p.click('#ax-v button[data-v="0"]');
+  await settle(p);
+  assert.deepEqual(await hnames(), ['ブラウン', 'グレー杢', 'ネイビー']);
+  i4 = await info(p);
+  assert.ok(i4.issues.some((x) => /^前からある子の名前 \(商品名から仮に入れた 2 件\)/.test(x)), JSON.stringify(i4.issues));
+  await p.check('#old-ok');
+  await settle(p);
+  assert.ok(!(await info(p)).issues.some((x) => /確かめた/.test(x)));
   // 今ある子で売価・仕入先が違う (グレーだけ 3,280 円・三河) = 自動では選ばない = 人が選ぶ
   assert.match(await p.innerText('#cf-price'), /売価が 2 種類あります/);
   await p.click('[data-cf="price"][data-v="2980"]');
@@ -300,7 +325,7 @@ await ta('[④] NE で作ったまとまり (記録なし) に足す: 前から�
   const r = await saveViaConfirm(p);
   assert.match(r, /1 件を下書きにしました/);
   const g = await V.readVariationGroup(db, (await one(`select product_id::text as id from core.products where display_code = 'ws100'`)).id);
-  assert.deepEqual(g.options.map((o) => [o.code, o.name]), [['-BR', 'ブラウン'], ['-GY', 'グレー'], ['-NV', 'ネイビー'], ['-WR', 'ワインレッド']]);
+  assert.deepEqual(g.options.map((o) => [o.code, o.name]), [['-BR', 'ブラウン'], ['-GY', 'グレー杢'], ['-NV', 'ネイビー'], ['-WR', 'ワインレッド']]);
   // 2 回目 = 記録のあるまとまり (確かめの欄は出ない・軸は 🔒)
   await p.goto(B + '/new?kind=variation');
   await pickGroup(p, 'ws1', 'ws100');
@@ -374,7 +399,7 @@ await ta('[⑥b] 1 つのファイルの上限 (試験は 136 行) を超える:
     const before = (await kidsOf('roomwear2')).length;
     const gid = (await one("select group_product_id::text as id from ops.variation_group_codes where code_norm = 'roomwear2'")).id;
     const r = await p.evaluate(async ([base, gid]) => { const x = await fetch(base + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), group: { mode: 'add', product_id: gid }, options: [{ axis: 1, code: '-ZZ', name: 'テスト色' }], children: ['-S', '-M', '-L'].map((v) => ({ code: 'roomwear2-ZZ' + v, choices: { 1: '-ZZ', 2: v }, name: 'x' + v })), values: { standard_price: '2980', cost: { jpy: '1200' }, tax_rate: '0.1', sales_class: '3', primary_supplier: '0034', reorder_months: '2', expiry_managed: '0', inbound_date_managed: '0' },
-      blanks: ['shipping_code', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan'] }) }); return [x.status, (await x.json()).reason]; }, [B, gid]);
+      blanks: ['maker', 'shipping_code', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'card.reference_urls', 'children.jan'] }) }); return [x.status, (await x.json()).reason]; }, [B, gid]);
     assert.deepEqual(r, [409, 'variation_pending_too_many']);
     assert.equal((await kidsOf('roomwear2')).length, before);
     // NE 登録の CSV の画面: 上限 14 行 = roomwear2 (2 回・135 行) も hakama (1 回・15 行) も作れない → 理由と手順・ボタンは押せない
@@ -490,7 +515,7 @@ await ta('[⑧] 空から: あと N つ・7 の確かめは「まだ入れてい
     assert.ok(await p.locator('#code').isVisible(), '単品の欄は今までどおり');
     // API も断る (DB が持ち主を見る)
     const r = await p.evaluate(async (base) => (await fetch(base + '/api/new/variation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request_id: crypto.randomUUID(), group: { mode: 'new', code: 'gx', name: 'x' }, axes: [{ axis: 1, name: '色' }], options: [{ axis: 1, code: '-A', name: 'A' }], children: [{ code: 'gx-A', choices: { 1: '-A' }, name: 'x' }], values: { standard_price: '1', tax_rate: '0.1', sales_class: '1', primary_supplier: '0001', reorder_months: '1', expiry_managed: '0' },
-      blanks: ['cost', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan'] }) })).json(), B);
+      blanks: ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'card.reference_urls', 'children.jan'] }) })).json(), B);
     assert.equal(r.reason, 'parent_not_company');
     // 🆕 #1679 Codex R1 Low: 読むだけのまとまりの API (探す・1 つを読む・確かめる) も同じ持ち主の門で閉じる
     assert.deepEqual(await readApis(p), [[409, 'parent_not_company'], [409, 'parent_not_company'], [409, 'parent_not_company']]);
@@ -527,7 +552,7 @@ await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発
   let i0 = await info(p);
   assert.equal(i0.save, 'disabled');
   for (const re of [/^原価 \(値か「入力なし」\)/, /^発送方法 \(値か「入力なし」\)/, /^ロジザードの入荷日の管理 \(値か「入力なし」\)/, /^発注の設定: 発注ロット \(値か「入力なし」\)/,
-    /^公式ページ URL \(値か「入力なし」\)/, /^Amazon URL \(値か「入力なし」\)/, /^JAN の無い子 \(2 件\) \(値か「入力なし」\)/]) assert.ok(i0.issues.some((x) => re.test(x)), re + ' ' + JSON.stringify(i0.issues));
+    /^公式ページ URL \(値か「入力なし」\)/, /^Amazon URL \(値か「入力なし」\)/, /^参考 URL \(値か「入力なし」\)/, /^JAN の無い子 \(2 件\) \(値か「入力なし」\)/]) assert.ok(i0.issues.some((x) => re.test(x)), re + ' ' + JSON.stringify(i0.issues));
   // 原価: 入力なし → 値を入れると外れる
   await p.click('#sec-common .f:has(#c-cost) .nonechk');
   await settle(p);
@@ -582,14 +607,14 @@ await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発
   assert.equal((await info(p)).save, 'enabled', JSON.stringify(await info(p)));
   await p.click('#save2');
   await p.waitForSelector('#confirm-bg.on');
-  assert.match(await p.innerText('#confirm-body'), /入力なし\s*原価・発送方法・ロジザードの入荷日の管理・発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量 \/ 個・公式ページ URL・Amazon URL か ASIN・JAN \(JAN の無い子\)/);
+  assert.match(await p.innerText('#confirm-body'), /入力なし\s*原価・メーカー・発送方法・ロジザードの入荷日の管理・発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量 \/ 個・公式ページ URL・Amazon URL か ASIN・参考 URL・JAN \(JAN の無い子\)/);
   await p.check('#fix-ok');
   const bodies = [];
   p.on('request', (rq) => { if (/\/api\/new\/variation$/.test(rq.url())) bodies.push(JSON.parse(rq.postData())); });
   await p.click('#confirm-yes');
   await p.waitForSelector('#result .result', { timeout: 60000 });
   assert.match(await p.innerText('#result'), /2 件を下書きにしました/);
-  assert.deepEqual(bodies[0].blanks, ['cost', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'children.jan']);
+  assert.deepEqual(bodies[0].blanks, ['cost', 'maker', 'shipping_code', 'inbound_date_managed', 'order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit', 'card.official_url', 'card.amazon', 'card.reference_urls', 'children.jan']);
   // 🆕 0080: ロジザードのバーコード = 子ごと (JAN のある子 = 初めは JAN・無い子 = 「空欄で送る」の印で空欄)・全部の子に 1 行ずつ
   const lzOf = Object.fromEntries(bodies[0].children.map((k) => [k.code, k.lz_barcode]));
   assert.deepEqual(lzOf['nonegrp-BK'], { kind: 'lz_assign' });
@@ -599,8 +624,8 @@ await ta('[⑪] 入力なし (まとまり): 必須でない項目 (原価・発
   // 子ごとの記録 (#1706 Codex R1 M1): 原価・JAN は その子に無いときだけ (WH = 子だけの原価 700・JAN あり / BK = どちらも無い)
   const reasons = Object.fromEntries((await q(`select s.code, e.reason from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK')`)).map((r) => [r.code, r.reason]));
   assert.deepEqual(reasons, {
-    'nonegrp-BK': '新商品の登録 (色違い・サイズ違い) · 入力なし: 原価・発送方法・入荷日の管理・公式ページURL・Amazon・JAN · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量',
-    'nonegrp-WH': '新商品の登録 (色違い・サイズ違い) · 入力なし: 発送方法・入荷日の管理・公式ページURL・Amazon · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量',
+    'nonegrp-BK': '新商品の登録 (色違い・サイズ違い) · 入力なし: 原価・メーカー・発送方法・入荷日の管理・公式ページURL・Amazon・参考URL・JAN · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量',
+    'nonegrp-WH': '新商品の登録 (色違い・サイズ違い) · 入力なし: メーカー・発送方法・入荷日の管理・公式ページURL・Amazon・参考URL · 発注の設定の入力なし: 発注ロット・発注条件グループ・原料グループ・ケースロット・ケースグループ・容量',
   });
   assert.deepEqual((await q(`select s.code, c.cost_jpy::int as c from core.sku_costs c join core.skus s on s.sku_id = c.sku_id where s.code in ('nonegrp-WH', 'nonegrp-BK') order by s.code`)).map((r) => [r.code, r.c]), [['nonegrp-WH', 700]]);
   assert.equal((await one("select inbound_date_managed from core.products where display_code = 'nonegrp-WH'")).inbound_date_managed, null, '入荷日の管理を入力なし = 不明のまま');

@@ -1,6 +1,6 @@
--- 0083 (仮番号): 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2) = マスタの入力の画面 (master_edit) が読むだけの関数 4 つ
+-- 0085: 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2) = マスタの入力の画面 (master_edit) が読むだけの関数 4 つ
 --
---   🚨 番号は仮。0083 はほかの作業ブランチ (feat/ne-update-csv-pr1) も使っている = マージの順で空いている番号に付け替える (欠番は migrate が断る)。
+--   番号: 0083 = #1734 (今朝の NE の値)・0084 = #1739 (メーカー) の次 = 0085 (マージの順に付け替えた。欠番は migrate が断る)。
 --
 --   画面のロール master_edit は core.shipments / shipment_lines / ne_shops と ops.ingest_runs を読めない (create-master-edit-roles.mjs)。
 --   表の select を渡すと送り状番号なども読めてしまう・行の数の上限を決められない = 読むだけの関数 (security definer) だけを渡す (0070 と同じ形):

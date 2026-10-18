@@ -104,6 +104,14 @@ main { padding: 22px 28px 90px; min-width: 0; }
 .crumb { font-size: 13px; color: var(--muted); display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
 .crumb a { color: var(--muted); }
 .crumb a:hover { color: var(--accent); }
+/* 1 つの商品の画面: パンくずと「← 前へ 12 / 340 次へ →」(10/17・me-prevnext.js) を 1 行に。狭い幅では折り返す (前へ・次へは下の行の右) */
+.crumb-row { display: flex; align-items: center; justify-content: space-between; gap: 6px 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.crumb-row .crumb { margin-bottom: 0; min-width: 0; }
+.crumb-row .crumb .mono { overflow-wrap: anywhere; }
+.pn { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.pn .btn { white-space: nowrap; }
+.pn-pos { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pn-pos.out { color: var(--warn); }
 .ph { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
 .ph h1 { font-size: 25px; font-weight: 700; letter-spacing: 0.01em; line-height: 1.3; }
 .ph .lead { font-size: 14px; color: var(--muted); margin-top: 4px; }
@@ -899,6 +907,18 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 #list-tbl thead th.c-code { z-index: 4; }
 #tblwrap.scrolled #list-tbl .c-code { box-shadow: 8px 0 12px -8px rgba(0, 0, 0, 0.8); }
 #tblwrap.scrolled #list-tbl tbody tr.kb td.c-code, #tblwrap.scrolled #list-tbl tbody tr:focus-within td.c-code { box-shadow: inset 3px 0 0 var(--accent), 8px 0 12px -8px rgba(0, 0, 0, 0.8); }
+/* 画像の列 (10/17): 楽天の白抜き画像を明るい台に載せる (暗い画面でも白抜きの写真がそのまま見える)。大きさは固定 = 読み込みで行の高さが動かない */
+#list-tbl th[data-c="img"], #list-tbl td.c-img { width: 68px; min-width: 68px; padding-left: 8px; padding-right: 8px; }
+#list-tbl td.c-img { padding-top: 6px; padding-bottom: 6px; }
+#list-tbl .thumb { display: grid; place-items: center; width: 52px; height: 52px; border-radius: 8px; overflow: hidden; background: #f3f5f9; border: 1px solid rgba(255, 255, 255, 0.14); }
+#list-tbl .thumb img { display: block; width: 100%; height: 100%; object-fit: contain; }
+#list-tbl .thumb.none { position: relative; align-content: center; gap: 1px; background: rgba(255, 255, 255, 0.03); border: 1px dashed rgba(160, 190, 240, 0.24); color: var(--faint); }
+#list-tbl .thumb.none .ic { width: 20px; height: 20px; }
+#list-tbl .thumb.pending { border-style: solid; border-color: rgba(58, 231, 255, 0.32); color: var(--accent); }
+#list-tbl .thumb.pending .ic { animation: thumbwait 1.6s ease-in-out infinite; }
+#list-tbl .thumb .tw { font-size: 10px; line-height: 1; letter-spacing: 0.02em; color: var(--muted); }
+@keyframes thumbwait { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { #list-tbl .thumb.pending .ic { animation: none; } }
 /* 見出しを押して並べる (リンク = 押すと並べ直した一覧を読む) */
 #list-tbl th.sortable { padding: 0; vertical-align: bottom; }
 #list-tbl .sorth { display: flex; align-items: center; gap: 6px; width: 100%; padding: 10px 12px; color: var(--muted); text-decoration: none; letter-spacing: 0.06em; }
@@ -1098,6 +1118,17 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .csug { max-height: min(360px, 55vh); }
 }
 @media (prefers-reduced-motion: reduce) { .csug { animation: none; } }
+/* 🆕 0084 メーカーの欄 (views/_maker.ejs・public/me-maker.js)。候補は欄のすぐ下 (同じ .csug の見た目)・押す所は 44px */
+.mkpick { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; max-width: 100%; }
+.mkbox { position: relative; display: inline-block; max-width: 100%; }
+.mkbox .csug { top: calc(100% + 4px); left: 0; width: min(440px, 86vw); }
+.csug .co.mk-new .cn { color: var(--accent); font-weight: 600; }
+#f-maker-same { min-height: 36px; }
+@media (max-width: 760px) {
+  #f-maker-in, #f-maker-same { min-height: 44px; }
+  .mkpick, .mkbox, #f-maker-in { width: 100%; }
+  .mkbox .csug { width: 100%; }
+}
 /* 構成の行の下の「NE の商品を足す (セット)」= 1 行目は最初からあるので控えめ (文字だけのボタン・押せる大きさはスマホで 44px) */
 #comp-add.addrow { color: var(--muted); padding: 0 6px; }
 #comp-add.addrow:hover { color: var(--accent); }
@@ -1155,6 +1186,52 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .filecard { padding: 14px 12px; }
   .filecard .fmeta > span { min-width: 0; overflow-wrap: anywhere; }
 }
+/* 🆕 10/17 一覧の行で「その場で登録」(未登録・まだつないでいない SKU・public/me-amazon-inline.js) と 未登録の行の Amazon の商品名 */
+.todo-row .um-title { display: block; margin-top: 2px; font-family: inherit; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.todo-row .um-acts { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.todo-row.done, .ul-row.done { opacity: 0.6; }
+.inl-box { list-style: none; margin: -2px 0 10px; }
+.inl { position: relative; padding: 12px 14px; border-radius: 12px; border: 1px solid rgba(58, 231, 255, 0.35); background: rgba(58, 231, 255, 0.04); min-width: 0; }
+.inl-h { display: flex; gap: 8px 10px; align-items: center; flex-wrap: wrap; font-size: 14px; margin-bottom: 8px; }
+.inl-h .inl-st.bad { color: var(--err); }
+.inl-line { display: flex; gap: 8px 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; min-width: 0; }
+.inl-line .lab2 { font-size: 13px; color: var(--muted); }
+.inl-line .inl-name { flex: 1 1 260px; min-width: 0; }
+.inl .inl-warn { margin-bottom: 8px; }
+.inl .scrollx > table.comp { min-width: 480px; }
+.inl .c-name.bad { color: var(--err); }
+/* 構成の原価 (Amazon SKU の画面・見るだけ) */
+#cost-tbl td.n, #cost-tbl th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+#cost-tbl tfoot th, #cost-tbl tfoot td { border-top: 1px solid var(--line-soft); padding-top: 8px; }
+@media (max-width: 1100px) { .todo-row .um-acts { justify-content: flex-start; } }
+@media (max-width: 760px) {
+  .inl .c-code, .inl .c-qty, .inl .iconbtn { min-height: 44px; min-width: 44px; }
+  .inl .scrollx > table.comp { min-width: 0; }
+  .todo-row .um-acts .btn { flex: 1 1 auto; justify-content: center; }
+}
+/* スマホの幅: 未登録の行は 2 列に折り返す (横にはみ出さない)・見出しの行は出さない・操作のボタンは下の段に広げる */
+@media (max-width: 760px) {
+  .todo-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 10px; }
+  .todo-row.head { display: none; }
+  .todo-row .um-acts, .todo-row > a.btn { grid-column: 1 / -1; }
+}
+/* 🆕 10/17 CSV でまとめて登録 (views/amazon-bulk.ejs・public/me-amazon-bulk.js) */
+.bulk-help { margin: 0 0 12px 18px; display: grid; gap: 6px; font-size: 13.5px; color: var(--text2); }
+.bulk-help code { font-family: var(--mono); color: var(--accent); }
+.bulk-drop { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px; border: 1px dashed rgba(58, 231, 255, 0.4); border-radius: 12px; }
+.bulk-drop input[type="file"] { flex: 1 1 260px; min-width: 0; }
+#bulk-filter { margin-bottom: 10px; }
+#bulk-tbl td { vertical-align: top; }
+#bulk-tbl td.mono { font-family: var(--mono); overflow-wrap: anywhere; }
+.bulk-notes { list-style: none; display: grid; gap: 3px; font-size: 12.5px; }
+.bulk-notes li.err { color: var(--err); }
+.bulk-notes li.warn { color: var(--warn); }
+.bulk-why { font-size: 12.5px; color: var(--text2); }
+.bulk-acts { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+.bulk-prog { display: flex; gap: 10px; align-items: center; margin-top: 10px; font-size: 13px; color: var(--muted); }
+.bulk-prog .bar { flex: 1 1 auto; height: 6px; border-radius: 999px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
+.bulk-prog .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+@media (max-width: 760px) { .bulk-acts .btn { flex: 1 1 auto; justify-content: center; } }
 
 /* ---------- 入出庫の履歴・月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・商品の画面の下) ---------- */
 .panel.moves { margin-top: 18px; min-width: 0; }

@@ -130,6 +130,12 @@
               <option value="">(選ぶ)</option>
               <% for (const s of page.activeSuppliers) { %><option value="<%= s.code %>"><%= s.code %> <%= s.name %></option><% } %>
             </select><span class="hint">NE で必須の項目です · 発注条件グループはこの仕入先のものから選びます (下の「発注の設定」)</span><a class="hint" href="/apps/purchase-orders" target="_blank" rel="noopener">先方品番は 発注アプリ ↗</a></div></div>
+          <%# 🆕 0084 メーカー (中原さん 2026-10-17・代表の仕入先のすぐ下)。Company DB だけに持つ (NE・ロジザード・product-hub には送らない)。値 か 入力なし。0084 の前の DB = 欄を出さない %>
+          <% if (locals.makerReady) { %>
+          <div class="f" data-row="maker"><label class="lab" for="f-maker-in">メーカー</label>
+            <div class="ctl"><%- include('_maker', { base, mk: { makers, max: makerMax }, cur: null, dis, noneHtml: none('maker'), suppliers: page.activeSuppliers.map((s) => [s.code, s.name]), supplierSel: '#f-primary_supplier', canCreate: canSave, extraHidden: part('maker') }) %>
+              <span class="hint" style="flex-basis:100%">問屋から仕入れるときは、仕入先とは別に作っている会社を · 一覧に無いときは打って「新しいメーカーとして登録」 · 「仕入先と同じ」= 代表の仕入先の名前 · Company DB だけ (NE・ロジザードには送りません)</span></div></div>
+          <% } %>
         </section>
         <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。下書きの保存と一緒に送る = Company DB の登録が通った後に発注アプリへ (部品 = _order.ejs・public/me-order.js) %>
         <%- include('_order', { os: orderSettings, mode: 'new', dis, stepNo: no('sec-order'), base, code: null }) %>
@@ -187,6 +193,25 @@
             <% if (!isSet) { %>
             <div class="f" data-row="card.set_decision"><div class="lab" id="lab-set-plan">セット商品を作るか</div>
               <div class="ctl"><%- segPart('card.set_decision', seg('set-plan', 'set_plan', '', Object.entries(setPlanChoices), 'セット商品を作るか')) %><%- none('card.set_decision') %><span class="hint">まだ決めないときは「入力なし」</span></div></div>
+            <%# 🆕 2026-10-17 中原さん: 「作る」のときは何個セットを作るかも聞いて、セット商品コードと名前をここで作る (lib/set-plan.mjs の決まり・画面の動き = public/me-new.js)。
+                コード = 単品のコード-個数・名前 = 単品の名前 個数個セット (どちらも直せる)。保存すると product-hub に「セットの下書き」ができる
+                (NE に登録して取り込まれるまで出品しない・Company DB にはまだ作らない) %>
+            <% const spl = locals.setPlanLimits || { max: 10, qtyMin: 2, qtyMax: 99, nameMax: 255, alertDays: 3 }; %>
+            <div class="f" data-row="card.sets" id="row-set-plans" hidden style="align-items:start" data-max="<%= spl.max %>" data-qty-min="<%= spl.qtyMin %>" data-qty-max="<%= spl.qtyMax %>" data-name-max="<%= spl.nameMax %>">
+              <div class="lab" id="lab-set-plans" style="padding-top:8px">作るセット</div>
+              <div class="ctl col" style="gap:0">
+                <div class="scrollx"><table class="comp" id="set-plans" data-dirty-field="set_plans" data-label="作るセット" aria-labelledby="lab-set-plans"><caption class="sr">作るセット (個数・セット商品コード・セット商品名)</caption>
+                  <thead><tr><th scope="col">個数</th><th scope="col">セット商品コード</th><th scope="col">セット商品名</th><th scope="col"><span class="sr">外す</span></th></tr></thead>
+                  <tbody id="set-plan-rows"></tbody>
+                </table></div>
+                <template id="set-plan-tpl"><tr class="sp-row"><td><input class="in sp-qty" style="width:60px;text-align:right" inputmode="numeric" autocomplete="off" aria-label="個数"<%= dis %>> 個</td>
+                  <td><input class="in mono sp-code" style="width:190px" maxlength="30" autocomplete="off" spellcheck="false" aria-label="セット商品コード"<%= dis %>><div class="fmsg sp-msg" role="status" aria-live="polite"></div></td>
+                  <td><input class="in sp-name" style="width:100%;min-width:220px" maxlength="<%= spl.nameMax %>" autocomplete="off" aria-label="セット商品名"<%= dis %>></td>
+                  <td class="acts"><button type="button" class="iconbtn del" data-sp-del aria-label="このセットを外す"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-trash"/></svg></button></td></tr></template>
+                <div style="display:flex;gap:12px;align-items:center;margin:6px 0 4px;flex-wrap:wrap"><button class="btn sm" type="button" id="set-plan-add"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-plus"/></svg>セットを足す</button>
+                  <span class="hint"><%= spl.qtyMin %>〜<%= spl.qtyMax %> 個 · <%= spl.max %> セットまで · コード = 単品のコード-個数・名前 = 単品の名前 個数個セット (直せます) · 使ったことのないコード (打つとその場で確かめます)</span></div>
+                <span class="hint">保存すると product-hub に「セットの下書き」ができます (構成 = この単品 × 個数・売価の初めの値 = 単品の売価 × 個数)。NE にセット商品を登録して取り込まれるまで、どのモールにも出品しません。<%= spl.alertDays %> 日たっても NE に無いと product-hub のボードに ⚠ が出ます</span>
+              </div></div>
             <div class="f" id="row-set-reason" hidden><label class="lab" for="set-reason">作らない理由・メモ</label>
               <div class="ctl"><select class="in w-m" id="set-reason" data-dirty-field="set_reason" data-label="作らない理由"<%= dis %>>
                 <option value="">(作らないときに選ぶ)</option>
@@ -251,8 +276,9 @@
     <% } %>
   </div>
   <%- include('_footer') %>
-  <%# 並び: 入力なし (me-none) → 画面 → 発注の設定 (読み終わったら画面に数え直してもらう = MasterEdit.recount) %>
+  <%# 並び: 入力なし (me-none) → メーカー (me-maker・0084 の欄があるときだけ) → 画面 → 発注の設定 (読み終わったら画面に数え直してもらう = MasterEdit.recount) %>
   <% if (page) { %><script src="<%= base %>/public/me-none.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && !isSet && locals.makerReady) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-new.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page && !isSet && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
 </body>

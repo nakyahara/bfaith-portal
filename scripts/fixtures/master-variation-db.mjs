@@ -31,7 +31,7 @@ export const BASE_SKUS = Object.freeze([
 /**
  * 試験の DB を作る。戻り値 { pg, db, q, one, asRole, asEditor, ALL_COMPANY, OWN, SUP1, SUP2, sessionUser }
  */
-export async function setupVariationDb({ quiet = () => {}, extraSkus = [], migrateTo = null } = {}) {
+export async function setupVariationDb({ quiet = () => {}, extraSkus = [], migrateTo = null, extraGroups = [] } = {}) {   // 🆕 extraGroups = 足す NE で作ったまとまり ({ code, name, childCodes, status })
   const W2 = await import('./master-widen-pr1.mjs');
   const { PGlite } = await import('@electric-sql/pglite');
   const { applyMigrations, pgliteAdapter } = await import('../company-db/migrate.mjs');
@@ -62,7 +62,7 @@ export async function setupVariationDb({ quiet = () => {}, extraSkus = [], migra
     await pg.query(`set session authorization master_gate_${host}`);
     try { return await fn(); } finally { await pg.query(`set session authorization ${sessionUser}`); await pg.query('set role deploy'); }
   }
-  const plan = basePlan(extraSkus);
+  const plan = basePlan(extraSkus, extraGroups);
   const skus = plan.skus;
   const lr = await runInitialLoad(db, plan, { log: quiet, runId: 'load_vg7', ownership: MASTER_OWNERSHIP, now: new Date(Date.now() - 5 * 86400e3) });
   if (!lr.ok) throw new Error(`夜間ロードの失敗: ${lr.error}`);
@@ -87,7 +87,8 @@ export async function setupVariationDb({ quiet = () => {}, extraSkus = [], migra
   await toPhase('new_open');
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, '2030-01-10T00:00:00Z', 0)`, [RUN1]);
   const entries = [...skus.map((s) => ({ code_norm: s.code.toLowerCase(), kind: 'product', state: 'ok', ne_code: s.code, spellings: [s.code] })),
-    { code_norm: 'ws100', kind: 'rep', state: 'ok', ne_code: 'ws100', spellings: ['ws100'] }, { code_norm: 'towel-gift', kind: 'rep', state: 'ok', ne_code: 'towel-gift', spellings: ['towel-gift'] }];
+    { code_norm: 'ws100', kind: 'rep', state: 'ok', ne_code: 'ws100', spellings: ['ws100'] }, { code_norm: 'towel-gift', kind: 'rep', state: 'ok', ne_code: 'towel-gift', spellings: ['towel-gift'] },
+    ...extraGroups.map((g) => ({ code_norm: g.code.toLowerCase(), kind: 'rep', state: 'ok', ne_code: g.code, spellings: [g.code] }))];
   await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: RUN1, entries })]);
   await (await import('./master-widen.mjs')).seedNewEntryLease(db, { runId: RUN1, withSet: true });
   await applyMigrations(db, { log: quiet, ...(migrateTo ? { to: migrateTo } : {}) });   // migrateTo = その番号まで (例: 0080 の前のアプリと DB の組み合わせ)
