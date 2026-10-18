@@ -512,9 +512,9 @@ async function connect(kind = 'read', { deadline = null } = {}) {
       let timer;
       const running = left2 > 0 ? init() : null;
       if (running) running.catch(() => {});   // 打ち切った後に失敗しても落とさない (打ち切る前の失敗は下の race から catch へ)
-      const done = !!running && await Promise.race([running.then(() => true),new Promise((ok) => { timer = setTimeout(() => ok(false), left2); })]).finally(() => clearTimeout(timer));
+      const done = !!running && await Promise.race([running.then(() => true), new Promise((ok) => { timer = setTimeout(() => ok(false), left2); })]).finally(() => clearTimeout(timer));
       if (!done) {
-        try { await client.end(); } catch { /* */ }
+        Promise.resolve().then(() => client.end()).catch(() => {});   // 閉じるのは待たない (閉じるのが遅くても期限で返す・Codex R3 Medium)
         return { error: TIMEOUT_WORDS, reason: 'timeout' };
       }
     }

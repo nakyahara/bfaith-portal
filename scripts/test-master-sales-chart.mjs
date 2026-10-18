@@ -240,9 +240,9 @@ try {
       const { status, j } = await get('/api/sku/sc-a/sales-chart');
       assert.deepEqual([status, j.reason], [503, 'timeout']);
     } finally { SALES_CHART_LIMITS.timeMs = keep; }
-    // 接続の初めの設定 (set statement_timeout ほか) が遅い = 期限で打ち切り、接続を閉じる (Codex R2 Medium)
+    // 接続の初めの設定 (set statement_timeout ほか) が遅い = 期限で打ち切り、接続を閉じる (Codex R2 Medium)・閉じるのが遅くても待たない (R3 Medium)
     let ended = 0;
-    __setPgClientFactory(async () => ({ query: (q) => (/^set /.test(q) ? new Promise((ok) => setTimeout(() => ok({ rows: [] }), 1500)) : Promise.resolve({ rows: [] })), end: async () => { ended++; }, on: () => {} }));
+    __setPgClientFactory(async () => ({ query: (q) => (/^set /.test(q) ? new Promise((ok) => setTimeout(() => ok({ rows: [] }), 1500)) : Promise.resolve({ rows: [] })), end: () => { ended++; return new Promise((ok) => setTimeout(ok, 3000)); }, on: () => {} }));
     SALES_CHART_LIMITS.timeMs = 300;
     try {
       const t0 = Date.now();
