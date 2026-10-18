@@ -26,6 +26,9 @@ function getClient() {
   return spClient;
 }
 
+/** テスト用: SP-API の呼び出し口を差し替える (本物の API は叩かない) */
+export function _setClientForTest(client) { spClient = client; }
+
 const MARKETPLACE_ID = () => process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 
 /**
@@ -63,13 +66,8 @@ export async function getProduct(asin) {
   // メーカー名
   const manufacturer = attrs.manufacturer?.[0]?.value || '';
 
-  const toCm = (inches) => inches ? (inches * 2.54).toFixed(1) : '-';
-  const toKg = (pounds) => pounds ? (pounds * 0.4536).toFixed(2) : '-';
-
-  const lengthCm = dims.length?.value ? dims.length.value * 2.54 : 0;
-  const widthCm = dims.width?.value ? dims.width.value * 2.54 : 0;
-  const heightCm = dims.height?.value ? dims.height.value * 2.54 : 0;
-  const volumeCm3 = lengthCm * widthCm * heightCm;
+  // 寸法・重さは単位を見て cm / kg に直す (以前はいつもインチ・ポンドとみなしていた)
+  const { dimensions, volumeCm3 } = normalizePackageDimensions(dims);
 
   // 競合価格・ランキング
   let currentPrice = 0;
@@ -104,12 +102,7 @@ export async function getProduct(asin) {
     category: summary.browseClassification?.displayName || '',
     size: summary.size || '',
     image: mainImage,
-    dimensions: {
-      length: toCm(dims.length?.value),
-      width: toCm(dims.width?.value),
-      height: toCm(dims.height?.value),
-      weight: toKg(dims.weight?.value),
-    },
+    dimensions,
     volumeCm3,
     currentPrice,
     salesRank,
@@ -131,6 +124,64 @@ export function pickLocalized(list) {
   const ja = list.filter((x) => x && /^ja/i.test(String(x.language_tag || ''))).map((x) => clean(x.value)).filter(Boolean);
   if (ja.length) return ja;
   return list.filter((x) => x && !x.language_tag).map((x) => clean(x.value)).filter(Boolean);
+}
+
+// 長さの単位 → 1 単位あたりの cm。SP-API カタログ (2022-04-01) の dimensions は { unit, value } で、
+// unit は "inches" / "centimeters" などの文字列 (商品によって違う)
+const CM_PER_UNIT = {
+  inches: 2.54, inch: 2.54, in: 2.54,
+  centimeters: 1, centimeter: 1, centimetres: 1, centimetre: 1, cm: 1,
+  millimeters: 0.1, millimeter: 0.1, millimetres: 0.1, millimetre: 0.1, mm: 0.1,
+  meters: 100, meter: 100, metres: 100, metre: 100, m: 100,
+  feet: 30.48, foot: 30.48, ft: 30.48,
+};
+// 重さの単位 → 1 単位あたりの kg
+const KG_PER_UNIT = {
+  pounds: 0.45359237, pound: 0.45359237, lb: 0.45359237, lbs: 0.45359237,
+  kilograms: 1, kilogram: 1, kg: 1,
+  grams: 0.001, gram: 0.001, g: 0.001,
+  milligrams: 0.000001, milligram: 0.000001, mg: 0.000001,
+  ounces: 0.028349523125, ounce: 0.028349523125, oz: 0.028349523125,
+};
+
+/**
+ * { unit, value } を単位表で換算する。値が無い・0 以下・単位が分からないときは null。
+ * 単位の欄そのものが無いときだけ、これまでどおりの単位 (インチ・ポンド) とみなす
+ * (2026-09-06 に miniPC で見た実物は "pounds" だった・fba-box/images.js の説明)
+ */
+function convertMeasure(m, table, legacyUnit) {
+  const value = Number(m?.value);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const unit = String(m?.unit ?? '').trim().toLowerCase();
+  const factor = unit ? table[unit] : table[legacyUnit];
+  if (!factor) {
+    console.warn(`[SP-API] 知らない単位なので寸法・重さを使いません: ${m?.unit}`);
+    return null;
+  }
+  return value * factor;
+}
+
+/**
+ * カタログの dimensions[0].package → 画面と計算で使う形。
+ * 返す形はこれまでと同じ: dimensions は cm (小数1桁) / kg (小数2桁) の文字列、分からない値は '-'。
+ * volumeCm3 は丸める前の cm で計算する (3 辺のどれかが分からなければ 0)
+ */
+export function normalizePackageDimensions(pkg) {
+  const p = pkg || {};
+  const l = convertMeasure(p.length, CM_PER_UNIT, 'inches');
+  const w = convertMeasure(p.width, CM_PER_UNIT, 'inches');
+  const h = convertMeasure(p.height, CM_PER_UNIT, 'inches');
+  const kg = convertMeasure(p.weight, KG_PER_UNIT, 'pounds');
+  const cm = (v) => v == null ? '-' : v.toFixed(1);
+  return {
+    dimensions: {
+      length: cm(l),
+      width: cm(w),
+      height: cm(h),
+      weight: kg == null ? '-' : kg.toFixed(2),
+    },
+    volumeCm3: l && w && h ? l * w * h : 0,
+  };
 }
 
 /**

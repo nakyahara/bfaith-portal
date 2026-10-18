@@ -47,6 +47,7 @@ import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatu
   createBulkSessionWithItems, listBulkSessions, getBulkSession, patchBulkSession,
   listBulkItems, getAllBulkItems, updateBulkItem, updateBulkItemFromResearch, persistToDisk, getDbGeneration, discardUnsavedChanges,
   upsertBookmark, getRecentBookmarks } from './db.js';
+import { estimateStorageCost } from './storage-estimate.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
@@ -731,18 +732,7 @@ router.get('/bulk-research', (req, res) => {
 
 // ── 一括リサーチ: ヘルパー関数群（v2.1） ──
 
-/** 概算保管コスト（月額、寸法情報から簡易推定） */
-function estimateStorageCost(dimensions) {
-  if (!dimensions) return 50; // 不明時のデフォルト
-  const l = dimensions.lengthCm || 0;
-  const w = dimensions.widthCm || 0;
-  const h = dimensions.heightCm || 0;
-  const total = l + w + h;
-  if (total <= 0) return 50;
-  if (total <= 60) return 30;   // 小型
-  if (total <= 100) return 80;  // 標準
-  return 250;                   // 大型
-}
+// 概算保管コスト (月額、寸法情報から簡易推定) は storage-estimate.js に移した (テストのため)
 
 /** 競合強度スコア算出（0〜100） */
 function calcCompetitionScore(offerCount, competitorData) {
