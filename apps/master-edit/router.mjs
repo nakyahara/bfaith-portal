@@ -98,6 +98,7 @@ import { MAX_SET_PLANS, SET_QTY_MIN, SET_QTY_MAX, SET_NAME_MAX, SET_PLAN_ALERT_D
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
 import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf, legacyRefsScreen, hasRequestRecord } from '../../lib/master-register-blanks.mjs';
 import { registerVariationBatch, searchVariationGroups, readVariationGroup, checkVariationCodes, defaultPhDraftExists, subRequestId, VARIATION_MAX_CHILDREN, VARIATION_KEYS, variationMaxFileRows,
+  parseVariationRequest, variationPayloadHashOf,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
@@ -140,6 +141,8 @@ import { readNeDeleteStock } from './ne-delete-stock.mjs';
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
 import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
+// 🆕 0084 (メーカー・中原さん 2026-10-17): 名簿・名簿に足す・欄を出すか (0084 があってロールの流し直しの後)
+import { makerReady, readMakers, createMaker, MAKER_NAME_MAX } from '../../lib/master-maker.mjs';
 // 🆕 0099 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・Company DB構想 27 ④-1)
 import { readLabelView, labelReady, defaultPhLabelLookup, COUNTRY_SUGGEST, NET_UOMS } from '../../lib/master-label.mjs';
 import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
@@ -916,10 +919,17 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     blankKeys: BLANK_KEYS[kind], blankLabels: blankLabelsOf(kind),
     // 🆕 0080: ロジザードに送るバーコードの欄を出すか (0080 がある DB だけ)
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,
+    // 🆕 0084: メーカーの欄 (単品だけ・0084 があってロールの流し直しの後)。名簿は画面で探す (search-fold.mjs と同じかなの同一視)
+    ...(await makerLocals(db, kind === 'single')),
     // 🆕 0099: 表示の項目の欄を出すか (0099 がある DB・単品だけ・入れなくてよい)
     labelNew: db && kind === 'single' && await labelReady(db).catch(() => false) ? { suggest: COUNTRY_SUGGEST, uoms: NET_UOMS } : null,
   });
 }));
+/** 🆕 0084: メーカーの欄に渡す値 { makerReady, makers: [{ id, name }], makerMax }。出さない・読めない = 欄なし */
+async function makerLocals(db, want = true) {
+  const ready = want && db ? await makerReady(db).catch(() => false) : false;
+  return { makerReady: ready, makers: ready ? await readMakers(db).catch(() => []) : [], makerMax: MAKER_NAME_MAX };
+}
 /**
  * 新商品の登録の「色違い・サイズ違いのまとまり」(PR-7・見本 v2 = 中原さんと Codex の UI レビューで決めた形)。
  * products.parent が company でない = まとまりの欄は出さない (「切替の前」の帯と種類の札だけ)。開いている = 単品の登録と同じ門 + 代表の持ち主
@@ -942,6 +952,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     orderNoneApplies,
     blankKeys: BLANK_KEYS.variation, blankLabels: blankLabelsOf('variation'),
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,   // 🆕 0080 (子ごとのロジザードのバーコードの欄を出すか)
+    ...(await makerLocals(db, !gated)),   // 🆕 0084: メーカー (全部の子に同じ値)
     // 🆕 0099: 表示の項目の欄 (全部の子に同じ値・型番は聞かない・入れなくてよい・0099 の前の DB = 出さない)
     labelNew: db && await labelReady(db).catch(() => false) ? { suggest: COUNTRY_SUGGEST, uoms: NET_UOMS } : null,
   });
@@ -1014,6 +1025,46 @@ router.post('/api/variation/check', (req, res) => {
  *   数えるかは画面と同じ答え (orderNoneApplies)。押し直し (記録がある) = 確かめない・一言も作らない (lib が前の答え・前の誤りを返す) =
  *   その時の発注アプリの読める / 読めないで押し直しが変わらない。戻り値 = prepareOrderBlanks の答え ({ ok, note } / { ok: false, status, json })
  */
+/**
+ * 🆕 0084: メーカーの欄が出る DB (0084 があって画面のロールが書ける = makerReady) = メーカーも「値か入力なし」を数えて、理由・子ごとの理由を作り直す。
+ *   出ない DB (0084 の前・ロールの流し直しの前) = 上の確かめ (pre) のまま (メーカーを数えない = 前の画面・前の登録と同じ)。単品とまとまりだけ
+ */
+async function makerBlanks(db, kind, raw, pre, actor, skip = null) {
+  const plain = { ok: true, body: pre.body, childReasons: pre.childReasons };
+  if (!(kind === 'single' || kind === 'variation')) return plain;
+  const ready = await makerReady(db);
+  const p = ready ? prepareRegisterBody(kind, raw, { makerApplicable: true, ...(skip ? { skip } : {}) }) : null;   // skip = 前の画面の押し直しで数えない項目 (参考 URL・#1732)
+  // 🆕 #maker Codex R1 M: 押し直し (この request_id の保存の記録がある) = 初回と同じ数え方で照らす。0084 の前・ロールの流し直しの前の初回 (メーカーを数えなかった) の押し直しを
+  //   流し直しの後に送っても 400 にしない・理由 (= 要求のハッシュ) を変えない。記録の要求のハッシュと合う方 (メーカーを数えた / 数えない) を使う。どちらも合わない = 数えた方 (lib が 409 か前の誤り)
+  const prev = await prevRequestHash(db, raw.request_id, kind);
+  if (prev) {
+    for (const c of [p, plain]) if (c && c.ok && requestHashOf(kind, raw, c, actor) === prev) return { ok: true, body: c.body, childReasons: c.childReasons };
+  }
+  if (!ready) return plain;
+  if (!p.ok) return p;
+  return { ok: true, body: p.body, childReasons: p.childReasons };
+}
+/** その request_id の保存の記録が持つ要求のハッシュ (無い・読めない = null)。単品 = 成功の結果の request_payload_hash / 失敗の payload_hash。まとまり = 成功は 0069 の要求のハッシュ */
+async function prevRequestHash(db, rid0, kind) {
+  const rid = String(rid0 ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid)) return null;
+  const r = (await db.query('select status, payload_hash, result from ops.master_edit_requests where request_id = $1::uuid', [rid])).rows[0];
+  if (!r) return null;
+  if (r.status !== 'done') return r.payload_hash || null;
+  if (kind === 'single') return (r.result && r.result.request_payload_hash) || r.payload_hash || null;
+  const has = (await db.query("select to_regclass('ops.variation_batch_requests') is not null as ok")).rows[0].ok === true;
+  return has ? ((await db.query('select request_hash from ops.variation_batch_requests where request_id = $1::uuid', [rid])).rows[0]?.request_hash ?? null) : null;
+}
+/** 登録の lib が作るのと同じ要求のハッシュ (lib の parse と hash = 同じ決まり)。形が違う = null */
+function requestHashOf(kind, raw, c, actor) {
+  try {
+    if (kind === 'single') {
+      return registerPayloadHashOf(parseRegisterRequest({ actor, requestId: raw.request_id, kind: raw.kind, code: raw.code, reason: c.body.reason ?? null, values: raw.values, card: raw.card, logizardBarcode: raw.logizard_barcode }));
+    }
+    return variationPayloadHashOf(parseVariationRequest({ actor, requestId: raw.request_id, reason: c.body.reason ?? null, group: raw.group, axes: raw.axes ?? null, options: raw.options,
+      children: raw.children, values: raw.values, card: raw.card, childReasons: c.childReasons }));
+  } catch { return null; }
+}
 function orderBlanksFirstTime(db, req, gate, kind, b) {
   // 断る前に request の鍵を取って記録を読み直す (同じ request_id が同時に来た = 前の答え・#1706 Codex R3 M) = lib/master-register-blanks.mjs
   return orderBlanksForRequest(db, kind, b, { orderApplicable: () => orderNoneApplies(orderScreen(req, gate, null)) });
@@ -1061,7 +1112,11 @@ router.post('/api/new/variation', (req, res) => {
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ (子ごと) → commit の後に届ける。入る前 = 今までどおり ② をすぐ書く。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
-    const po = await orderBlanksFirstTime(db, req, gate, 'variation', b);
+    // 🆕 0084: メーカーの欄が出る DB (0084 があってロールの流し直しの後) = メーカーも「値か入力なし」を数え直す (上の確かめは DB を見ないので数えていない)
+    const mk = await makerBlanks(db, 'variation', req.body || {}, pre, String(req.session.email).trim().toLowerCase(), legacyRefs ? ['card.reference_urls'] : null);
+    if (!mk.ok) return res.status(mk.status).json(mk.json);
+    const vb = mk.body;
+    const po = await orderBlanksFirstTime(db, req, gate, 'variation', vb);
     if (!po.ok) return res.status(po.status).json(po.json);
     // 🆕 0080: 子ごとにロジザードのバーコード (値か空欄) が要る・ロジザードの写しでほかの商品の値 = 409 (何も書かない)
     //   🆕 #1719 Codex R4 High: 同じ request_id の記録がある (押し直し) = 今の写しで確かめない (lib が前の答えを返す・印は DB に残した結果から)
@@ -1083,9 +1138,9 @@ router.post('/api/new/variation', (req, res) => {
       }
     }
     const r = await registerVariationBatch(db, {
-      actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: b.reason ?? null,
+      actor: String(req.session.email).trim().toLowerCase(), requestId: b.request_id, reason: vb.reason ?? null,
       group: b.group, axes: b.axes ?? null, options: b.options, children: b.children, values: b.values, card: b.card, order: outbox ? orderBase : null,
-      childReasons: pre.childReasons,   // 🆕 子ごとの入力なしの理由 (原価・JAN はその子に無いときだけ・#1706 Codex R1 M1)
+      childReasons: mk.childReasons,    // 🆕 子ごとの入力なしの理由 (原価・JAN はその子に無いときだけ・#1706 Codex R1 M1・🆕 メーカーは全部の子)
       reasonNote: po.note,              // 🆕 発注の設定の入力なし (DB に書く理由にだけ・ハッシュに入らない・#1706 Codex R2 M)
       lzCopy: lg.copy,                  // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果 (値の行に残す・ハッシュに入らない)
       label: b.label,                   // 🆕 0099: 表示の項目 (原産国・内容量・消費期限の目安) = 全部の子に同じ値 (型番は聞かない・入れなくてよい)
@@ -1163,6 +1218,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     // 🆕 0071: 下書きだけ「この下書きを消す」の確かめを読む (DB の ops.sku_draft_cancel_check・読めない = 出さない)。押せるのは名簿 MASTER_EDITORS の人
     deldraft: page && page.cur.registration && page.cur.registration.state === 'draft'
       ? draftCancelView(await readDraftCancelCheck(db, page.cur.sku_id), await liveCardsSafe({ skuId: page.cur.sku_id, code: page.cur.code })) : null,
+    // 🆕 0084: メーカー (単品だけ・代表の仕入先のすぐ下・保存は「保存する」と一緒 = saveSku)
+    ...(await makerLocals(db, !!page && page.cur.sku_kind === 'single')),
   });
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -1178,6 +1235,19 @@ router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
   if (!item) return res.status(404).json({ ok: false, error: `${code} は Company DB にありません` });
   res.json({ ok: true, item });
 }));
+
+/**
+ * 🆕 0084: メーカーを名簿に足す (新商品の登録・まとまり・商品の画面の「＋ 新しいメーカーとして登録」「仕入先と同じ」)。名簿の人だけ・Origin・JSON (上の守り)。
+ *   同じと見る名前 (NFKC・小文字・ひらがな = カタカナ・空白を除く) が既にある = 足さずにそれを返す (existed)。同じ request_id の押し直し = 前の答え
+ */
+router.post('/api/makers', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    res.json(await createMaker(db, { requestId: b.request_id, actor: String(req.session.email).trim().toLowerCase(), name: b.name }));
+  }, 'write');
+});
 
 router.get('/api/code-check', (req, res) => withPgApi(res, async (db) => {
   const code = String(req.query.code ?? '');
@@ -1235,7 +1305,11 @@ router.post('/api/new', (req, res) => {
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ → commit の後に届ける (届かなくても知らせは残る = 届け直す)。
     //   発注の設定が無い登録も「知らせの道で登録した」印を積む (Codex #1703 R2 M)
     const outbox = await orderOutboxReady(db);
-    const po = await orderBlanksFirstTime(db, req, gate, String(b.kind ?? ''), b);
+    // 🆕 0084: メーカーの欄が出る DB = メーカーも「値か入力なし」を数え直す (単品だけ・セットは聞かない)
+    const mk = await makerBlanks(db, String(b.kind ?? ''), req.body || {}, pre, String(req.session.email).trim().toLowerCase());
+    if (!mk.ok) return res.status(mk.status).json(mk.json);
+    const sb = mk.body;
+    const po = await orderBlanksFirstTime(db, req, gate, String(b.kind ?? ''), sb);
     if (!po.ok) return res.status(po.status).json(po.json);
     // 🆕 0080: 単品 = ロジザードのバーコード (値か空欄) が要る・ロジザードの写しでほかの商品の値 = 409 (何も書かない)
     let lzCopy = null;
@@ -1252,7 +1326,7 @@ router.post('/api/new', (req, res) => {
     //   作るセットは登録の要求のハッシュ (lib と同じ = 保存の記録の request_payload_hash) で結ぶ = 取り込みは通った登録の作るセットだけを付ける (Codex R1 High 2)
     let parsed = null;
     try {
-      parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode,
+      parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: sb.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode,   // 🆕 0084: 理由はメーカーを数え直した後 (sb) = 登録の lib と同じ要求のハッシュ
         label: b.label });   // 🆕 0099: 表示の項目も要求のハッシュに入る (作るセットを結ぶハッシュを lib と同じにする)
     } catch (e) { if (!(e instanceof MasterWriteError)) throw e; /* 形の誤りは登録の lib が同じ文で断る */ }
     const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
@@ -1277,7 +1351,7 @@ router.post('/api/new', (req, res) => {
     let r;
     try {
       r = await registerNewSku(db, {
-        actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card,
+        actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: sb.reason ?? null, values: b.values, card: b.card,
         order: outbox ? orderBase : null, reasonNote: po.note,
         logizardBarcode: b.logizard_barcode,   // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコードの値か空欄 (単品だけ・要るかは上の lzRegisterGate)
         lzCopy,                                // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果

@@ -454,6 +454,8 @@
       var N = ME.none;
       var need = function (key, t, go, step) { if (!N.present(key)) return; if (N.on(key) && !N.has(key)) { noneKeys.push(key); return; } if (!N.has(key)) Pi(step, 'miss', t + ' (値か「入力なし」)', go); };
       NONE_ITEMS.forEach(function (x) { if (!S.conflicts[x[3]] || S.picks[x[3]]) need(x[0], x[1], x[2], 5); });
+      // 🆕 0084: メーカー (全部の子に同じ値・値 = 名簿から選んだ = 打っただけでは値でない)。欄がある (0084 がある DB) ときだけ
+      need('maker', 'メーカー (一覧から選ぶ)', '#f-maker-in', 5);
       if (ME.orderSettings && ME.orderSettings.items) ME.orderSettings.items().forEach(function (x) { if (x.none) noneKeys.push(x.key); else if (!x.ok) Pi(5, 'miss', '発注の設定: ' + x.t + ' (値か「入力なし」)', x.focus); });
       NONE_CARD.forEach(function (x) { need(x[0], x[1], x[2], 5); });
       if (n && !janAll) need('children.jan', 'JAN の無い子 (' + live.filter(function (k) { return !k.jan; }).length + ' 件)', '#row-jan-none', 6);
@@ -835,7 +837,7 @@
       ['作る商品', '<b>' + m.n + ' 件</b> · JAN あり ' + jans + ' 件 · ほかは共通の値どおり'],
       ['共通と違う所', ex.length ? list(ex, 12) : 'なし'],
       ['作らない商品', offs.length ? list(offs.map(function (k) { return '<span class="mono">' + esc(k.code) + '</span> ' + esc(k.h.name + (k.v ? ' × ' + k.v.name : '')) + (k.prev ? ' (前回も作らなかった)' : ''); }), 12) : 'なし'],
-      ['共通の欄', '売価 ' + (m.cp ? yen(m.cp) + ' 円' : '—') + (m.cc != null && !Number.isNaN(m.cc) ? ' · 原価 ' + yen(m.cc) + ' 円' : ' · 原価はあとで') + ' · 税 ' + fv('tax', S.common.tax) + ' · 仕入先 ' + esc(fv('supplier', S.common.supplier))],
+      ['共通の欄', '売価 ' + (m.cp ? yen(m.cp) + ' 円' : '—') + (m.cc != null && !Number.isNaN(m.cc) ? ' · 原価 ' + yen(m.cc) + ' 円' : ' · 原価はあとで') + ' · 税 ' + fv('tax', S.common.tax) + ' · 仕入先 ' + esc(fv('supplier', S.common.supplier)) + (ME.maker ? ' · メーカー ' + esc(ME.maker.label($('#f-maker') ? $('#f-maker').value : '')) : '')],
       ['発注の設定', po ? '発注アプリへ (全部の子に同じ値)' : 'なし (あとで商品の画面で)'],
       ['入力なし', m.noneKeys.length ? esc(m.noneKeys.map(function (k) { return (P.blankLabels && P.blankLabels[k] ? P.blankLabels[k].label : k); }).join('・')) + ' <span class="hint aux">(わざと空けた = 登録の記録に残ります)</span>' : 'なし (全部の項目に値)'],
       ['出品カード', 'まとまりで 1 枚' + (m.ac === 2 ? ' (2 軸なので出品は止めたまま)' : '')],
@@ -1034,6 +1036,11 @@
     S.copied = rows.length ? { from: rows[0].code, n: rows.length, dropped: dropped } : null;
     if (!pk.axes) initOldKids(pk);
     full();
+    // 🆕 0084: 今ある子のメーカーが全部同じ = 写す。違う・無い子がある = 空にする (前に選んだまとまりのメーカーを持ち越さない = 人が選ぶ・#maker Codex R1 M)
+    if (ME.maker) {
+      var mks = rows.map(function (k) { return String((k.values && k.values.maker) || ''); });
+      if (mks.length && mks[0] && mks.every(function (x) { return x === mks[0]; })) ME.maker.set(mks[0]); else ME.maker.clear();
+    }
   }
   var pickSeq = 0;
   function pickGroup(id, then) {
@@ -1235,11 +1242,12 @@
     if (d.act === 'next') return continueNext();
     if (d.act === 'again') { if (ME.replacePage) ME.replacePage(BASE + '/new?kind=variation'); else location.replace(BASE + '/new?kind=variation'); return; }
     if (S.done && !d.go && !d.stepnav && !d.filter && !d.open) return;
-    if (d.mode) { if (S.mode !== d.mode) { var keep = { gcode: S.gcode, gname: S.gname }; S = fresh(); S.mode = d.mode; if (d.mode === 'new') Object.assign(S, keep); else searchGroups(); full(); } return; }
+    // 🆕 0084 (#maker Codex R2 M): 種類を切り替える・選び直す = メーカーも空に (ほかの共通の欄 = S.common と同じく前のまとまりの値を持ち越さない)
+    if (d.mode) { if (S.mode !== d.mode) { var keep = { gcode: S.gcode, gname: S.gname }; S = fresh(); S.mode = d.mode; if (d.mode === 'new') Object.assign(S, keep); else searchGroups(); if (ME.maker) ME.maker.clear(); full(); } return; }
     if (d.pick) return pickGroup(d.pick);
     if (d.gotopick) { S.mode = 'add'; return pickGroup(d.gotopick); }
     if (d.act === 'rename') { if (S.pk && ME.vops) { var gid0 = S.pk.id; ME.vops.openLabels(gid0, { onDone: function () { refreshGroup(gid0); } }); } return; }
-    if (d.act === 'repick') { S = fresh(); S.mode = 'add'; full(); searchGroups(); setTimeout(function () { $('#g-q').focus(); }, 0); return; }
+    if (d.act === 'repick') { S = fresh(); S.mode = 'add'; if (ME.maker) ME.maker.clear(); full(); searchGroups(); setTimeout(function () { $('#g-q').focus(); }, 0); return; }
     if (d.act === 'split') return doSplit();
     if (d.act === 'unsplit') return unSplit();
     if (d.act === 'janpaste') { S.janPaste = !S.janPaste; S.janMsg = ''; update(); if (S.janPaste) setTimeout(function () { var jp = $('#jan-paste'); if (jp) jp.focus(); }, 0); return; }
@@ -1281,6 +1289,8 @@
     if (C.inbound !== '') values.inbound_date_managed = C.inbound;
     if (C.ship) values.shipping_code = C.ship;
     if (String(C.cost).trim() !== '') values.cost = { jpy: C.cost };
+    // 🆕 0084: メーカー (隠した欄 = 名簿の番号・欄が無い / 選んでいない = 送らない)
+    var mkEl = $('#f-maker'); if (mkEl && mkEl.value) values.maker = mkEl.value;
     var opts = [];
     m.axes.forEach(function (ax) {
       if (m.firstTime) ax.old.forEach(function (o) { opts.push({ axis: ax.i + 1, code: o.num, name: o.name }); });
@@ -1340,7 +1350,7 @@
     if (f === 'options') return '#sec-opts';
     if (f === 'children' && j.code && M) { var k = M.kids.filter(function (x) { return norm(x.code) === norm(j.code); })[0]; return k ? '#kid-' + k.idx : '#sec-kids'; }
     if (f === 'children') return '#sec-kids';
-    var MAP = { standard_price: '#c-price', cost: '#c-cost', tax_rate: '#c-tax', sales_class: '#c-sales', primary_supplier: '#f-primary_supplier', reorder_months: '#c-months', expiry_managed: '#c-expiry', inbound_date_managed: '#c-inbound', shipping_code: '#c-ship' };
+    var MAP = { standard_price: '#c-price', cost: '#c-cost', tax_rate: '#c-tax', sales_class: '#c-sales', primary_supplier: '#f-primary_supplier', reorder_months: '#c-months', expiry_managed: '#c-expiry', inbound_date_managed: '#c-inbound', shipping_code: '#c-ship', maker: '#f-maker-in' };
     if (MAP[f]) return MAP[f];
     if (f === 'card.amazon_url' || f === 'card.asin') return '#amazon-url';
     if (f === 'children.jan') return '#row-jan-none';

@@ -1118,6 +1118,17 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .csug { max-height: min(360px, 55vh); }
 }
 @media (prefers-reduced-motion: reduce) { .csug { animation: none; } }
+/* 🆕 0084 メーカーの欄 (views/_maker.ejs・public/me-maker.js)。候補は欄のすぐ下 (同じ .csug の見た目)・押す所は 44px */
+.mkpick { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; max-width: 100%; }
+.mkbox { position: relative; display: inline-block; max-width: 100%; }
+.mkbox .csug { top: calc(100% + 4px); left: 0; width: min(440px, 86vw); }
+.csug .co.mk-new .cn { color: var(--accent); font-weight: 600; }
+#f-maker-same { min-height: 36px; }
+@media (max-width: 760px) {
+  #f-maker-in, #f-maker-same { min-height: 44px; }
+  .mkpick, .mkbox, #f-maker-in { width: 100%; }
+  .mkbox .csug { width: 100%; }
+}
 /* 構成の行の下の「NE の商品を足す (セット)」= 1 行目は最初からあるので控えめ (文字だけのボタン・押せる大きさはスマホで 44px) */
 #comp-add.addrow { color: var(--muted); padding: 0 6px; }
 #comp-add.addrow:hover { color: var(--accent); }
