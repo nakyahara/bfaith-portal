@@ -61,10 +61,11 @@ ph.exec(`CREATE TABLE product_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, ne_c
   CREATE TABLE draft_page_info (draft_id INTEGER PRIMARY KEY, origin_type TEXT, origin_country TEXT, content_volume TEXT);
   CREATE TABLE draft_rakuten (draft_id INTEGER PRIMARY KEY, article_number TEXT);
   CREATE TABLE draft_sku_attributes (draft_id INTEGER NOT NULL, sku_code TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (draft_id, sku_code, name));`);
-ph.prepare("INSERT INTO product_drafts (id, ne_code, name) VALUES (11, 's002', '単品 2'), (12, 'ws100', 'ウールストール'), (13, 's003', '単品 3')").run();
+ph.prepare("INSERT INTO product_drafts (id, ne_code, name) VALUES (11, 's002', '単品 2'), (12, 'ws100', 'ウールストール'), (13, 's003', '単品 3'), (14, 'ws100-old', '除外した古いまとまり')").run();
 ph.prepare("INSERT INTO draft_page_info (draft_id, origin_type, origin_country, content_volume) VALUES (11, '海外製', '中国', '0.5L'), (12, '日本製', '', '200g'), (13, '海外製', '', '30錠')").run();
 ph.prepare("INSERT INTO draft_rakuten (draft_id, article_number) VALUES (11, 'MDL-2'), (12, 'WS-PAGE')").run();
-ph.prepare("INSERT INTO draft_sku_attributes (draft_id, sku_code, name, value) VALUES (12, 'ws100-br', 'メーカー型番', 'WS-BR')").run();
+ph.prepare("INSERT INTO draft_sku_attributes (draft_id, sku_code, name, value) VALUES (12, 'ws100-br', 'メーカー型番', 'WS-BR'), (13, 's003', 'メーカー型番', 'S3-SKU'), (14, 'ws100-nv', 'メーカー型番', 'OLD-NV')").run();
+ph.prepare("UPDATE product_drafts SET status = 'excluded' WHERE id = 14").run();   // 除外した下書きの子の型番は拾わない (Codex R1 M3)
 let phBroken = false;
 MR.__setPhLabelLookup(async (code) => { if (phBroken) throw new Error('product-hub の表が読めない (試験)'); return LB.readPhLabelRefs(ph, code); });
 
@@ -315,6 +316,13 @@ await ta('[S2] ほかの人が変えた後 = 409・記録の無い商品の印�
   assert.match(p3.text, /30錠 = ml \/ g \/ 枚 \/ 個 にちょうど直せないので入れられません/);
   assert.match(p3.text, /海外製 \(国名なし\) = 入れられません/);
   assert.ok(!/data-lbl-use="net"/.test(p3.text));
+  // 型番は楽天に出す値と同じ決め方 = SKU ごとの型番の行があればそれ (Codex R1 M1)
+  assert.match(p3.text, /\(SKU ごとの型番\): <span class="mono">S3-SKU<\/span>/);
+  // 🆕 Codex R1 M2: 単位だけ選んだ (数は空) = 差なしで黙って捨てずに 400 (ほかの欄と一緒でも)
+  const onlyUom = await save('s003', { lbl_net: '', lbl_net_uom: 'g' });
+  assert.deepEqual([onlyUom.status, onlyUom.j.field], [400, 'lbl_net']);
+  const onlyUom2 = await save('s003', { reorder_months: '4', lbl_net: '', lbl_net_uom: 'g' });
+  assert.deepEqual([onlyUom2.status, onlyUom2.j.field], [400, 'lbl_net'], 'ほかの欄だけ保存して単位を捨てた');
 });
 
 await ta('[S3] まとまりの子: 子の SKU の型番の行だけ参考に出す (親のページの型番・原産国・内容量は子に出さない)・product-hub が読めない = 知らせだけ (画面は止めない)', async () => {
@@ -325,6 +333,7 @@ await ta('[S3] まとまりの子: 子の SKU の型番の行だけ参考に出�
   assert.ok(!/200g/.test(p.text) && !/data-lbl-use="country"/.test(p.text), '親のページの値を子に出した');
   const p2 = await call('GET', '/sku/ws100-NV');
   assert.ok(!/product-hub の下書き/.test(p2.text), '型番の行の無い子に参考が出た');
+  assert.ok(!/OLD-NV/.test(p2.text), '除外した下書きの型番を参考に出した (Codex R1 M3)');
   phBroken = true;
   try {
     const p3 = await call('GET', '/sku/s001');

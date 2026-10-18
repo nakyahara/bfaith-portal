@@ -100,7 +100,7 @@ async function human(code, { c = null, n = null, u = null, m = null, d = null } 
   await pg.query('commit');
 }
 await human('a001', { c: '中国', n: '500', u: 'ml', m: 'AB-1', d: 365 });
-await human('a002', { c: '中国', n: '200', u: 'g' });
+await human('a002', { c: '中国', n: '200', u: 'g', m: 'A2-M' });
 await human('g-red', { c: '日本', n: '50', u: 'ml', m: 'G-RED' });
 await human('g-blue', { c: '日本', n: '50', u: 'ml', m: 'G-BLUE' });
 const cdbFingerprint = async () => (await pg.query(`select (select count(*) from core.product_label_facts)::int as n, (select count(*) from ops.product_label_fact_events)::int as e,
@@ -161,6 +161,8 @@ const draft = (code, { pi = null, article = null } = {}) => {
 };
 const dA1 = draft('a001', { pi: { type: '日本製', volume: '0.5L' }, article: 'AB-1' });   // 原産国 = 違う・内容量 = 一致・型番 = 一致
 const dA3 = draft('a003', { pi: { volume: '120ml' } });                                   // 内容量 = 夜間の値 (product-hub 自身) = 比べない
+const dA2 = draft('a002', { article: 'A2-M' });                                           // 型番: ページの型番は同じだが SKU ごとの型番の行が違う = 違う (Codex R1 M1)
+ph.prepare("INSERT INTO draft_sku_attributes (draft_id, sku_code, name, value) VALUES (?, 'a002', 'メーカー型番', 'A2-OTHER')").run(dA2.id);
 const dSet = draft('set001', { pi: { type: '日本製' } });                                  // セット: 構成品が全部 中国 = 参考 (違う)
 const dSet2 = draft('set002');                                                             // セット: 原産国の無い構成品がある = 参考なし
 const dG = draft('grpx', { pi: { type: '日本製', volume: '50ml' } });                     // まとまり: 全部の子が 日本・50ml
@@ -211,6 +213,12 @@ try {
     const I = r.j.items;
     assert.deepEqual([I.net.state, I.net.put, I.country.state, I.model.state], ['from_ph', null, 'master_empty', 'master_empty']);
     assert.deepEqual(r.j.summary, { severity: 'none', label: '' });
+  });
+  await ta('[R2b] 型番は楽天に出す値と同じ決め方 (SKU ごとの型番の行があればそれ)・その行がある = ページの欄に入れても変わらない =「入れる」を出さない (Codex R1 M1)', async () => {
+    const r = await check(dA2);
+    const M = r.j.items.model;
+    assert.deepEqual([M.state, M.ph, M.put], ['differs', 'A2-OTHER', null]);
+    assert.match(M.detail, /SKU ごとの型番の表/);
   });
   await ta('[R3] セット: 構成品が全部同じ人の原産国 = 参考 (違う・入れる 1 組)・内容量と型番は出さない / 原産国の無い構成品がある = 参考なし', async () => {
     const r = await check(dSet);

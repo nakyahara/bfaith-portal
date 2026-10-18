@@ -16,7 +16,7 @@
  * 比べ方は lib/master-label.mjs と同じ (countryNorm・netEqual・phCountryOf…) = マスタの入力の画面と同じ決まり
  */
 import { janReadUrlFrom, readCdbRowsWithin, janUnitsForDraft, JAN_READ_DEADLINE_MS, JAN_READ_MIN_LEFT_MS } from './cdb-jan-compare.mjs';
-import { countryNorm, phCountryOf, phCountryFields, netFromText, netToMaster, netText, numText, sourceWords } from '../../../lib/master-label.mjs';
+import { countryNorm, phCountryOf, phCountryFields, netFromText, netToMaster, netText, numText, sourceWords, phModelOf } from '../../../lib/master-label.mjs';
 
 export const LABEL_STATE_WORDS = Object.freeze({
   match: '一致', differs: '商品マスタと違う', ph_empty: 'product-hub は空', master_empty: '商品マスタに無い', not_comparable: '比べられない', from_ph: '',
@@ -134,7 +134,6 @@ export async function compareDraftLabels(db, draft, { env = process.env, deadlin
   let ju;
   try { ju = janUnitsForDraft(db, draft); } catch (e) { return { ok: false, reason: String((e && e.message) || e).slice(0, 160) }; }
   const pi = db.prepare('SELECT origin_type, origin_country, content_volume FROM draft_page_info WHERE draft_id = ?').get(draft.id) || null;
-  const rk = db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
   const codes = ju.units.map((u) => u.code);
   const empty = (readable, reason, ready = true) => ({ ok: true, readable, ready, reason, mode: null, units: [], items: null, set: null, kids: null, summary: { severity: readable ? 'none' : 'muted', label: readable ? '' : '読めない' } });
   if (!codes.length) return empty(true, null);
@@ -161,7 +160,11 @@ export async function compareDraftLabels(db, draft, { env = process.env, deadlin
     };
   } else if (ju.mode === 'single') {
     const m = units[0].master;
-    items = { country: judgeCountry(m.country, pi), net: judgeNet(m.net, pi?.content_volume), model: judgeModel(m.model, rk?.article_number), shelf: m.shelf };
+    // 型番は楽天に出す値と同じ決め方 (SKU ごとの型番の行があればそれ・Codex R1 M1)。SKU ごとの行がある = ページの欄に入れても楽天の値は変わらない = 「入れる」を出さない
+    const pm = phModelOf(db, draft.id, codes[0]);
+    const model = judgeModel(m.model, pm.value);
+    if (pm.from === 'sku') Object.assign(model, { put: null, detail: 'SKU ごとの型番の表の値 (直すときはカテゴリ・属性タブの表で)' });
+    items = { country: judgeCountry(m.country, pi), net: judgeNet(m.net, pi?.content_volume), model, shelf: m.shelf };
   } else {
     // まとまり: 子ごとに並べる。原産国・内容量は全部の子で同じ人の値のときだけページの欄と比べて「入れる」を出す。型番は子ごとの参考だけ
     kids = units.map((u) => ({ code: u.code, missing: u.missing, country: u.master.country, net: u.master.net, model: u.master.model, shelf: u.master.shelf }));
