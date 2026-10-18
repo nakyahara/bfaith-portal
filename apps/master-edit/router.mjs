@@ -115,6 +115,8 @@ import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
 // 🆕 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・0085 の読むだけの関数)
 import { readMovementsPage, readMonthly } from './movements.mjs';
+// 🆕 販売数のグラフ (10/17 中原さん・0086 の読むだけの関数)
+import { readSalesChart } from './sales-chart.mjs';
 import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
@@ -584,9 +586,24 @@ async function connect(kind = 'read', { deadline = null } = {}) {
       client = got;
     }
     if (client.on) client.on('error', (e) => console.error(`[master-edit] 接続のエラー: ${e.message}`));   // 切れた接続でプロセスを落とさない
-    await client.query(`set statement_timeout = '20s'`);
-    await client.query(`set lock_timeout = '10s'`);
-    await client.query(`set idle_in_transaction_session_timeout = '60s'`);
+    const init = async () => {
+      await client.query(`set statement_timeout = '20s'`);
+      await client.query(`set lock_timeout = '10s'`);
+      await client.query(`set idle_in_transaction_session_timeout = '60s'`);
+    };
+    if (deadline == null) await init();
+    else {
+      // 🆕 期限のある読み (販売数のグラフ・CSV): 接続の初めの設定も残りの時間で打ち切る (遅い = 接続を閉じて timeout。販売数のグラフ Codex R2 Medium)
+      const left2 = deadline - Date.now();
+      let timer;
+      const running = left2 > 0 ? init() : null;
+      if (running) running.catch(() => {});   // 打ち切った後に失敗しても落とさない (打ち切る前の失敗は下の race から catch へ)
+      const done = !!running && await Promise.race([running.then(() => true), new Promise((ok) => { timer = setTimeout(() => ok(false), left2); })]).finally(() => clearTimeout(timer));
+      if (!done) {
+        Promise.resolve().then(() => client.end()).catch(() => {});   // 閉じるのは待たない (閉じるのが遅くても期限で返す・Codex R3 Medium)
+        return { error: TIMEOUT_WORDS, reason: 'timeout' };
+      }
+    }
     return { client };
   } catch (e) {
     console.error(`[master-edit] Company DB につながらない: ${e && e.message}`);
@@ -1227,6 +1244,22 @@ router.get('/api/sku/:code/monthly', (req, res) => withPgApi(res, async (db) => 
   const out = await readMonthly(db, sku, { poAccess: canSeeBackorders(req), now: new Date(clock()) });
   res.status(out.ok ? 200 : 503).json(out);
 }));
+/**
+ * 🆕 販売数のグラフ (10/17 中原さん): 日 × モールの正味の販売数 (0086 の読むだけの関数) と、単品はロジザードの毎日の在庫。SQL は 1 回 (商品を引くのと合わせて 2 回)。
+ *   期限 = ルートに入ってから 8 秒 (接続の待ちも入れる・1 つの文は残りの時間まで)。過ぎた・関数が無い = 503 と言葉 (画面のほかの所は動く)。セットも出す (そのセットとして売れた数)
+ */
+export const SALES_CHART_LIMITS = { timeMs: 8e3 };
+router.get('/api/sku/:code/sales-chart', (req, res) => {
+  const deadline = Date.now() + SALES_CHART_LIMITS.timeMs;
+  return withPgApi(res, async (db0) => {
+    const db = deadlineDb(db0, deadline);
+    let sku;
+    try { sku = await movementSku(db, req.params.code); } catch (e) { if (e instanceof ListTimeoutError) return res.status(503).json({ ok: false, reason: 'timeout', error: '販売数の読み出しに時間がかかりすぎました。少し待ってから画面を開き直してください' }); throw e; }
+    if (!sku) return res.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
+    const out = await readSalesChart(db, sku, { now: clock() });
+    res.status(out.ok ? 200 : 503).json(out);
+  }, 'read', { deadline });
+});
 
 router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
   const code = String(req.query.code || '').trim();
