@@ -2801,4 +2801,4 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   CSV を出す関数はほかの鍵 (段階・NE の CSV・NE のコード・まとまり) を取らない = 待ちの輪ができない
 - 画面 = 商品の画面の「この下書きを消す」の帯に理由 (「ロジザード登録の CSV に出しています (ファイル #N)。ロジザードから消すのが先です」)。lib (`lib/master-draft-cancel.mjs`) は 0099 の前の DB でも同じ理由で断る (鍵なしの先回り)
 - 当て方 (🚨 まだ流さない): アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を作り直すだけ) → 中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま)
-- 試験 = `node scripts/test-master-draft-cancel.mjs` ([M4]・[Z]) / `scripts/test-master-draft-cancel-pg.mjs` ([8] 出すと消すの競り・実 PostgreSQL)
+- 試験 = `node scripts/test-master-draft-cancel.mjs` ([M4]・[Z]) / `scripts/test-master-draft-cancel-pg.mjs` ([8] 出すと消すの競り・実 PostgreSQL) / `scripts/test-master-variation-pg.mjs` ([7] 出すと子の廃止の競り)
