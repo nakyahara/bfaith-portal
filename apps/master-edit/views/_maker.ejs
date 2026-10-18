@@ -1,0 +1,28 @@
+<%#
+  🆕 0084 メーカー (製造元) の欄 (中原さん 2026-10-17「仕入先とは別にメーカーの情報を入れたい。問屋から仕入れるとメーカー名と仕入先名が違う」)。
+  新商品の登録 (単品)・色違い・サイズ違いのまとまり (全部の子に同じ値)・商品の画面 (単品) の 3 つで同じ部品。動き = public/me-maker.js
+  - 打つと名簿から探す (かなの同一視 = search-fold.mjs と同じ・日本語の変換中も探す・確定の Enter では選ばない)
+  - 名簿に無い名前 = 候補の最後の「＋ 〇〇 を新しいメーカーとして登録」→ 確かめて名簿に足す (同じと見る名前が既にあればそれを選ぶ)
+  - 「仕入先と同じ」= 代表の仕入先の名前のメーカー (名簿に無ければ確かめて足す)
+  - 送る値 = 隠した欄 #f-maker (名簿の番号)。打っただけで選んでいない名前は送らない
+  渡す値: mk = { makers: [{ id, name }], max }・cur = 今のメーカー { maker_id, name } | null・dis = ' disabled' | ''・noneHtml = 「入力なし」の札 (新商品だけ)・
+          suppliers = [[コード, 名前]]・supplierSel = 代表の仕入先の欄のセレクタ・canCreate = 名簿に足せるか・extraHidden = 隠した欄に足す属性
+%>
+<%
+  const hm = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  // supplierNow = 代表の仕入先の欄が無い (🔒) ときに使う今の代表の仕入先 (商品の画面だけ渡す)
+  const mkData = { base, makers: (mk.makers || []).map((m) => [String(m.id), m.name]), max: mk.max, canCreate: !!canCreate && !dis, suppliers: suppliers || [], supplierSel,
+    supplierNow: typeof supplierNow !== 'undefined' ? (supplierNow || '') : '' };
+%>
+<span class="mkpick" id="maker-pick">
+  <span class="mkbox">
+    <input class="in w-m" id="f-maker-in" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="f-maker-list" autocomplete="off" spellcheck="false"
+      maxlength="<%= mk.max %>" placeholder="メーカー名を打って選ぶ" aria-describedby="f-maker-msg" value="<%= cur ? cur.name : '' %>"<%= dis %>>
+    <span class="csug" id="f-maker-list" role="listbox" aria-label="メーカーの候補" hidden></span>
+  </span>
+  <input type="hidden" id="f-maker" data-field="maker" data-dirty-field="maker" data-label="メーカー" data-ne="NE へ送らない" value="<%= cur ? cur.maker_id : '' %>"<%- extraHidden || '' %><%= dis %>>
+  <button type="button" class="btn sm" id="f-maker-same"<%= dis %> title="代表の仕入先の名前のメーカーにします (名簿に無ければ足します)">仕入先と同じ</button>
+  <%- noneHtml || '' %>
+  <span class="fmsg" id="f-maker-msg" role="status" aria-live="polite"></span>
+</span>
+<script type="application/json" id="me-maker"><%- JSON.stringify(mkData).replace(/</g, '\\u003c') %></script>

@@ -70,6 +70,7 @@
   function showVal(el, v) {
     if (el.classList.contains('seg')) return segText(el, v);
     if (el.tagName === 'SELECT') { var o = $$('option', el).filter(function (x) { return x.value === v; })[0]; return o ? o.textContent : v; }
+    if (el.id === 'f-maker' && ME.maker) return ME.maker.label(v);   // 🆕 0084: 名簿の番号 → 名前 (空 = なし)
     if (v === '' || v == null) return '(空)';
     var unit = el.getAttribute('data-unit') || '';
     if (unit === ' 円' && intOf(v) != null) return yen(intOf(v)) + unit;
@@ -146,6 +147,8 @@
     if (keys.indexOf(isSet ? 'handling_own' : 'handling') >= 0 && el && valueOf(el) === 'discontinued' && !reason) out.push({ t: '取扱を中止にするときは理由が要ります (下の「理由」)', focus: '#reason' });
     if (keys.indexOf('cost') >= 0 && !costReason().trim()) out.push({ t: '原価を変える理由で「その他」を選んだときは、理由を書いてください', focus: '#cost-reason' });
     if (keys.indexOf('exception_cost') >= 0 && !$('#xcost-reason').value.trim()) out.push({ t: '例外原価を変えるときは、その「理由」が要ります', focus: '#xcost-reason' });
+    // 🆕 0084 (#maker Codex R1 M): メーカーの名前を打ったが一覧から選んでいない = 保存しない (そのまま送ると今のメーカーを外してしまう)
+    if (ME.maker && ME.maker.pending()) out.push({ t: 'メーカーは一覧から選ぶか「新しいメーカーとして登録」を押してください (外すときは欄を空に)', focus: '#f-maker-in' });
     return out;
   }
 
@@ -181,6 +184,7 @@
   var busy = false;
   var mustReload = false;
   ME.dirty = function () { return { n: lastState.n, items: lastState.items, impacts: lastState.impacts }; };
+  ME.recount = function () { update(); };   // 🆕 0084: メーカーの欄 (public/me-maker.js) が名簿に足す返事を待つ間・来た後に保存できるかを数え直す (#maker Codex R3 M)
   scope.addEventListener('input', update);
   scope.addEventListener('change', update);
 
@@ -372,6 +376,7 @@
     if (costBox) { costBox.hidden = true; if (costOpen) costOpen.setAttribute('aria-expanded', 'false'); costDelta(); }
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });
     clearNameError();
+    if (ME.maker) ME.maker.sync();   // 🆕 0084: 隠した欄 (名簿の番号) に合わせて、メーカーの名前の欄も戻す
     update();
     if (nameBox && !nameBox.hidden) closeName();
     ME.toast('変更を元に戻しました');
@@ -388,8 +393,8 @@
   // 保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度保存するときは新しい番号
   var requestId = uuid();
   var FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
-    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed',
-      'pkg_length', 'pkg_width', 'pkg_height', 'pkg_weight'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0086 梱包の大きさ・重さは 0086 があって直せるときだけ欄が出る
+    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed', 'maker',
+      'pkg_length', 'pkg_width', 'pkg_height', 'pkg_weight'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0084 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)・🆕 0086 梱包の大きさ・重さは 0086 があって直せるときだけ欄が出る
   function collect() {
     var values = {};
     FIELDS.forEach(function (f) {

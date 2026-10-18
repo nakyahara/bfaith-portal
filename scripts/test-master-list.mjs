@@ -257,7 +257,7 @@ await ta('[3] 許していない列名・向き = コード順 / 昇順 (SQL に
 
 console.log('列の設定 (人ごと)');
 // 画像の列 (10/17) は並びにあって出さない (出さない列の描き方・取りに行かないを見る)
-const goodView = () => ({ order: ['code', 'img', 'sup', 'name', 'price', 'cost', 'kind', 'state', 'reg', 'tax', 'profit', 'rate', 'sales_class', 'stock', 'fba', 'sold', 'po', 'flags', 'pkg'],   // 🆕 0086: 大きさ・重さ (並びの最後・出さない)
+const goodView = () => ({ order: ['code', 'img', 'sup', 'name', 'price', 'cost', 'kind', 'state', 'reg', 'tax', 'profit', 'rate', 'sales_class', 'stock', 'fba', 'sold', 'po', 'flags', 'maker', 'pkg'],   // 🆕 0084: メーカー・🆕 0086: 大きさ・重さ (最後・出さない)
   shown: ['code', 'sup', 'name', 'price', 'cost', 'stock', 'flags'] });
 const rowsIn = () => prefsDb.prepare('select email, prefs_json from master_edit_view_prefs order by email').all();
 await ta('[4] 列の設定: 保存・読む・初期に戻す・他人の設定は読めない / 変えない・入力の確かめ・Origin と JSON の守り・置き場が無い', async () => {
@@ -387,7 +387,7 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   // コードは左端 (横に送っても残る印)・列の数
   assert.match(thead(r.text), /^<tr><th scope="col" class="c-code sortable"/);
   assert.match(tr, /<td class="c-code" data-col="code">/);
-  assert.match(r.text, /id="colcnt">7\/18</);   // 🆕 0086: 大きさ・重さの列で 1 つ増える
+  assert.match(r.text, /id="colcnt">7\/19</);   // 🆕 0084: メーカー・🆕 0086: 大きさ・重さの列 (出さない) で 2 つ増えた
   // 仕入先の列: 単品 = コード + 名前・セット = 構成品から・代表なし = —。出している間は名前の下の「仕入先」の字を消す (class)
   assert.match(r.text, /<table class="tbl click show-sup" id="list-tbl">/);
   const cell = (code, id) => { const t = r.text.split('<tr>').find((x) => x.includes(`href="sku/${code}"`)); return new RegExp(`<td [^>]*data-col="${LC.COLUMN_BY_ID[id].cell}"[^>]*>([\\s\\S]*?)<\\/td>`).exec(t)[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim(); };
@@ -402,7 +402,7 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   const cfg = cfgOf(r.text);
   assert.deepEqual(cfg.columns.map((c) => c.id), want);
   assert.deepEqual(cfg.columns.filter((c) => c.fixed).map((c) => c.id), ['code']);
-  assert.deepEqual(cfg.columns.filter((c) => !c.sortable).map((c) => c.id), ['img', 'fba', 'sold', 'flags', 'pkg']);
+  assert.deepEqual(cfg.columns.filter((c) => !c.sortable).map((c) => c.id), ['img', 'fba', 'sold', 'flags', 'maker', 'pkg']);   // 🆕 0084 メーカー・🆕 0086 大きさ・重さも並べられない
   assert.deepEqual(cfg.view, goodView(), '設定は全部の列 (注文残も) のまま渡す = 保存し直しで注文残の設定を消さない');
   assert.deepEqual(cfg.defaultView, { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] });
   assert.deepEqual([cfg.saved, cfg.readable, cfg.who], [true, true, '中原']);
@@ -423,10 +423,10 @@ await ta('[5] 画面の描画: 保存した列の並び・出さない列は hid
   assert.ok(!/ hidden/.test(thOf(r.text, 'po').split('>')[0]), '注文残を出す');
   assert.ok(/ hidden/.test(thOf(r.text, 'sup').split('>')[0]), 'いつもの列 = 仕入先は出さない');
   assert.match(r.text, /<table class="tbl click" id="list-tbl">/);
-  assert.match(r.text, /id="colcnt">17\/19</);   // 🆕 0086: 大きさ・重さ (いつもは出さない)
+  assert.match(r.text, /id="colcnt">17\/20</);   // 画像の列 (出す)・メーカー (0084)・大きさ・重さ (0086) の列 (出さない)
   // 中身が無い一覧の行 = 全部の列にまたがる
   r = await call('GET', '/?q=' + encodeURIComponent('当たらない名前'));
-  assert.match(r.text, /<td colspan="18" class="muted"/);   // 🆕 0086: 大きさ・重さの列 (出さない列も数える) で 18
+  assert.match(r.text, /<td colspan="19" class="muted"/);   // 画像の列 + 🆕 0084 メーカー + 🆕 0086 大きさ・重さの列
   // 名前の下の「仕入先」の字はいつもの列のときは出る (仕入先の列を出していない)
   assert.equal((await call('POST', '/api/view-prefs', { body: { order: [...LC.DEFAULT_VIEW.order], shown: [...LC.DEFAULT_VIEW.shown] } })).status, 200);
   r = await call('GET', '/');
