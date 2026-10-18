@@ -42,7 +42,7 @@ export const LIST_COLUMNS = Object.freeze([
   { id: 'flags', label: '対応が必要', width: 'width:150px' },
   // 🆕 0084 (2026-10-17): メーカー (Company DB だけの値・単品だけ)。前の列の並びを変えないよう最後に足す・いつもの列では出さない (列の板で出す)・並べられない
   { id: 'maker', label: 'メーカー', isNew: true, width: 'min-width:140px', th: 'th-maker' },
-  // 🆕 0086 (10/17 中原さん): 梱包した状態の 縦×横×高さ (cm)・重さ (g) = まとめた値 (人 → 出どころ)。いつもは出さない (列の板で出す)・並べられない
+  // 🆕 0087 (10/17 中原さん): 梱包した状態の 縦×横×高さ (cm)・重さ (g) = まとめた値 (人 → 出どころ)。いつもは出さない (列の板で出す)・並べられない
   { id: 'pkg', label: '大きさ・重さ', sub: '梱包', isNew: true, width: 'min-width:150px', th: 'th-pkg' },
 ].map((c) => Object.freeze({ ...c, cell: c.cell || c.id })));
 
@@ -58,7 +58,7 @@ const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
  */
 export const DEFAULT_VIEW = Object.freeze({
   order: Object.freeze([...COLUMN_IDS]),
-  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup' && id !== 'maker' && id !== 'pkg')),   // 🆕 0084: メーカー・🆕 0086: 大きさ・重さも新しい列 = 出さない (列の板で出す)
+  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup' && id !== 'maker' && id !== 'pkg')),   // 🆕 0084: メーカー・🆕 0087: 大きさ・重さも新しい列 = 出さない (列の板で出す)
 });
 
 /**

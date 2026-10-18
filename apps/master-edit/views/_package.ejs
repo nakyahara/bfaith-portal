@@ -1,5 +1,5 @@
 <%#
-  🆕 0086 梱包した状態の 縦・横・高さ・重さ (中原さん 2026-10-17「FBA 納品のアプリとか、定形外の発送方法で情報をもっていたはずだから集約して」)。
+  🆕 0087 梱包した状態の 縦・横・高さ・重さ (中原さん 2026-10-17「FBA 納品のアプリとか、定形外の発送方法で情報をもっていたはずだから集約して」)。
   商品の画面 (単品) の「大きさ・重さ」。人の値は右の「保存する」で一緒に保存 (欄 = pkg_length / pkg_width / pkg_height / pkg_weight)。動き = public/me-package.js
   - 欄 = 人の値 (空 = 人の値なし)。空の欄の薄い字 = いま使っている出どころの値
   - いま使う値 = 軸ごとに 人 → 出どころの順位 (実測 → Amazon のカタログ → …) → 新しい順 (Company DB の core.v_product_packages)
@@ -26,7 +26,7 @@
 <section class="panel" id="p-pkg" aria-labelledby="h-pkg">
   <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-box"/></svg></span><h2 id="h-pkg">大きさ・重さ</h2><span class="sub">梱包した状態 · Company DB だけ (NE・ロジザードには送りません) · 入れなくても登録できます</span>
     <% if (conflictAxes.length) { %><span class="right"><span class="b warn" id="pkg-conflict" title="出どころ (人・定形外・FBA 納品…) で値が違います。下の表で確かめて、正しい値を入れてください"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>食い違い: <%= conflictAxes.map((a) => AXW[a]).join('・') %></span></span><% } %></div>
-  <% if (!pkg.ready) { %><div class="callout info" id="pkg-not-ready"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">梱包の大きさ・重さは、Company DB に 0086 が入って権限を流し直した後に入れられます (いまは見るだけ)。</div></div><% } %>
+  <% if (!pkg.ready) { %><div class="callout info" id="pkg-not-ready"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">梱包の大きさ・重さは、Company DB に 0087 が入って権限を流し直した後に入れられます (いまは見るだけ)。</div></div><% } %>
   <div class="f wide" data-row="package">
     <div class="lab" id="lab-pkg-size">大きさ (縦 × 横 × 高さ)</div>
     <div class="ctl">

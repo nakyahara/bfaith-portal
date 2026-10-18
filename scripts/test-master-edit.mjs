@@ -2217,8 +2217,8 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   assert.ok(t[0].includes('注文残 (発注アプリ 読めない)') || t[0].includes('注文残 (発注アプリ)'), t[0].join('|'));
   assert.equal(t[0].indexOf('対応が必要'), t[0].length - 8);
   assert.equal(t[0].indexOf('商品コードの注意'), t[0].length - 7, '新しい列は後ろ (注文残の列があっても)');
-  assert.equal(t[0].indexOf('メーカー'), t[0].length - 6, '🆕 0084: メーカーは 0086 の大きさ・重さの 5 列の前');
-  assert.equal(t[0].at(-1), '大きさ・重さの出どころ', '🆕 0086: 大きさ・重さの 5 列はいちばん後ろ');
+  assert.equal(t[0].indexOf('メーカー'), t[0].length - 6, '🆕 0084: メーカーは 0087 の大きさ・重さの 5 列の前');
+  assert.equal(t[0].at(-1), '大きさ・重さの出どころ', '🆕 0087: 大きさ・重さの 5 列はいちばん後ろ');
   // 詳細検索の印 (?s=) でも出せる・並び (区分の順) も一覧と同じ
   const sr = await call('POST', '/api/search', { body: { codes: 'set001\ns002\ns001', sort: 'kind' } });
   assert.equal(sr.status, 200, sr.text);
@@ -2585,8 +2585,8 @@ await ta('[21] CSV の商品コード = NE から来た商品なら NE の書き
   await pg.query('alter table ops.master_registrations enable trigger trg_master_registrations_guard');
   await pg.query('commit');
   let t = table(await raw('/list.csv?codes=' + encodeURIComponent('s001\ns002\ns003\ns004\ns005\ns006')));
-  assert.equal(t[0].at(-7), '商品コードの注意', '新しい列は後ろ (🆕 0084 のメーカー・🆕 0086 の大きさ・重さの 5 列の前)');
-  assert.equal(t[0].at(-6), 'メーカー', '🆕 0084: メーカーは 0086 の大きさ・重さの 5 列の前');
+  assert.equal(t[0].at(-7), '商品コードの注意', '新しい列は後ろ (🆕 0084 のメーカー・🆕 0087 の大きさ・重さの 5 列の前)');
+  assert.equal(t[0].at(-6), 'メーカー', '🆕 0084: メーカーは 0087 の大きさ・重さの 5 列の前');
   assert.equal(t[0][0], '商品コード', '前の列の並びは変えない');
   assert.deepEqual(byCode(t), {
     S001: '',   // ok = NE の書き方

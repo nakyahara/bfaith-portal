@@ -1,5 +1,5 @@
 /**
- * test-master-package-ui.mjs — 「大きさ・重さ」(views/_package.ejs・_package-new.ejs・public/me-package.js・Company DB の 0086) を本物の router で描いたページで動かす (Playwright・Chromium)
+ * test-master-package-ui.mjs — 「大きさ・重さ」(views/_package.ejs・_package-new.ejs・public/me-package.js・Company DB の 0087) を本物の router で描いたページで動かす (Playwright・Chromium)
  *
  * 固定する動き:
  *   ① 商品の画面: 「この値を入れる」= その出どころの持っている軸だけ欄に入れる (未保存の「前 → 後」に出る)・cm で打つ・保存 → Company DB (mm・g)・元に戻す

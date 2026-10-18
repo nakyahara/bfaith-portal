@@ -14,9 +14,9 @@ import { fmtJst, fmtDay } from './ui-format.mjs';
 import { PLATFORM_FEE_RATES, ratePct1 } from '../../lib/profit-estimate.js';
 import { PACKAGE_AXES, sourceWords } from '../../lib/master-package.mjs';
 
-/** 🆕 0086: mm → cm の数 (小数 1 けた)。無い = null */
+/** 🆕 0087: mm → cm の数 (小数 1 けた)。無い = null */
 const cmNum = (mm) => (mm == null ? null : Math.round(Number(mm)) / 10);
-/** 🆕 0086: 軸ごとの出どころの言葉 (同じ出どころの軸はまとめる)。例「縦・横・高さ = 人 / 重さ = FBA 納品 (実測)」 */
+/** 🆕 0087: 軸ごとの出どころの言葉 (同じ出どころの軸はまとめる)。例「縦・横・高さ = 人 / 重さ = FBA 納品 (実測)」 */
 function pkgSourcesText(p) {
   if (!p) return '';
   const by = new Map();
@@ -92,7 +92,7 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
     ['商品コードの注意', (r) => r.code_note || ''],
     // 🆕 0084 (2026-10-17): メーカー (Company DB だけの値・単品だけ・セットは空)。前の列の並びは変えない (最後に足す)
     ['メーカー', (r) => r.maker || ''],
-    // 🆕 0086: 梱包した状態の 縦・横・高さ (cm)・重さ (g) = まとめた値 (人 → 出どころの順位 → 新しい順)・出どころ (単品だけ・無い = 空)。最後に足す
+    // 🆕 0087: 梱包した状態の 縦・横・高さ (cm)・重さ (g) = まとめた値 (人 → 出どころの順位 → 新しい順)・出どころ (単品だけ・無い = 空)。最後に足す
     ['梱包の縦 (cm)', (r) => cmNum(r.pkg && r.pkg.length_mm)],
     ['梱包の横 (cm)', (r) => cmNum(r.pkg && r.pkg.width_mm)],
     ['梱包の高さ (cm)', (r) => cmNum(r.pkg && r.pkg.height_mm)],

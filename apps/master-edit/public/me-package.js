@@ -1,5 +1,5 @@
 /*
- * me-package.js — 商品の画面の「大きさ・重さ」(0086・views/_package.ejs)
+ * me-package.js — 商品の画面の「大きさ・重さ」(0087・views/_package.ejs)
  *   「この値を入れる」= その出どころの値を欄に入れる (出どころが持っている軸だけ・持っていない軸はそのまま)。
  *   保存は右の「保存する」(欄は data-dirty-field = 未保存に数える)。欄を変えたら input を送って画面 (me-sku.js) に数え直してもらう
  */

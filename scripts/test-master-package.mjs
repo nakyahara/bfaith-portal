@@ -1,10 +1,10 @@
 /**
- * test-master-package.mjs — 梱包した状態の 縦・横・高さ・重さ (中原さん 2026-10-17・Company DB の 0086・lib/master-package.mjs)
+ * test-master-package.mjs — 梱包した状態の 縦・横・高さ・重さ (中原さん 2026-10-17・Company DB の 0087・lib/master-package.mjs)
  *
  * Company DB = PGlite (scripts/fixtures/master-variation-db.mjs = 全部の migration を流した新しい DB・切替の後)。本物の router を HTTP 越しに通す。
  * 固定する契約:
  *   U 値の形: cm (小数 1 けた) → mm・g (整数)・範囲・全角・空 = null・登録の値の形 (知らない項目 = 400)・出どころの言葉・順位 (JS = DB の core.package_source_rank)
- *   D 0086 の形: 表・関数 (security definer・search_path・public の実行権なし)・守り (関数の外では書けない・記録は追記だけ・TRUNCATE できない)・
+ *   D 0087 の形: 表・関数 (security definer・search_path・public の実行権なし)・守り (関数の外では書けない・記録は追記だけ・TRUNCATE できない)・
  *     画面のロール master_edit = 人の値・記録・ビュー・出どころ (core.product_physicals) の select と書く関数の実行だけ
  *   M まとめた値 (core.v_product_packages): 軸ごとに 人 → 実測 → Amazon のカタログ → … → 定形外の見込み・同じ順位は新しい観測・出どころ × 参照ごとの最新の行だけ・先の時刻の行は使わない
  *   S 商品の画面: 「大きさ・重さ」の節 (欄・いま使う値・出どころの表・食い違いの印)・保存 (入れる・変える・軸を外す・全部外す・記録 via sku_page)・押し直し・
@@ -110,7 +110,7 @@ async function phys(code, { src, ref, l = null, w = null, h = null, g = null, at
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
-console.log('梱包の大きさ・重さ (0086)');
+console.log('梱包の大きさ・重さ (0087)');
 
 await ta('[U1] 値の形: cm (小数 1 けた) → mm・g (整数)・全角・単位の字・空 = null・範囲・形の誤りの一言と欄', async () => {
   assert.equal(PK.cmIn('23.5'), 235); assert.equal(PK.cmIn('２３．５'), 235); assert.equal(PK.cmIn(' 12 '), 120); assert.equal(PK.cmIn('3cm'), 30); assert.equal(PK.cmIn(0.1), 1);
@@ -143,7 +143,7 @@ await ta('[U2] 出どころの順位: JS (SOURCE_RANK) と DB (core.package_sour
   assert.ok(PK.sourceRank('measured') < PK.sourceRank('amazon_catalog') && PK.sourceRank('amazon_catalog') < PK.sourceRank('postage_estimate'));
 });
 
-await ta('[D1] 0086 の形: 表・関数 (security definer・search_path 固定・public の実行権なし)・画面のロールの権限 (読む・関数だけ)・ほかのロールは読めない', async () => {
+await ta('[D1] 0087 の形: 表・関数 (security definer・search_path 固定・public の実行権なし)・画面のロールの権限 (読む・関数だけ)・ほかのロールは読めない', async () => {
   for (const t of ['core.product_packages', 'ops.product_package_events', 'core.v_product_packages']) assert.ok((await one('select to_regclass($1) is not null as ok', [t])).ok, t);
   const f = await one(`select p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p
     join pg_namespace s on s.oid = p.pronamespace where s.nspname = 'ops' and p.proname = 'set_product_package'`);

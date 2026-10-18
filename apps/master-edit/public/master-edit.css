@@ -1344,7 +1344,7 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .sc svg .sc-line { stroke: CanvasText; }
 }
 
-/* 🆕 0086 大きさ・重さ (商品の画面・views/_package.ejs) */
+/* 🆕 0087 大きさ・重さ (商品の画面・views/_package.ejs) */
 .pkgdims { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .pkgdims .in { text-align: right; }
 #pkg-sources td.pkg-diff { color: var(--warn); background: var(--warn-bg); }

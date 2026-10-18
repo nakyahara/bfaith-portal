@@ -1,4 +1,4 @@
--- 0086 (マージの時に「すぐ次の番号」に付け替える。0084 = メーカー・0085 = 商品の動きが先に入る見込み。migrate は欠番を断る): 商品 (単品) の梱包した状態の 縦・横・高さ・重さ (中原さん 2026-10-17)
+-- 0087 (0084 = メーカー #1739・0085 = 入出庫の履歴 #1741・0086 = 販売数のグラフ #1742 の次。migrate は欠番を断る): 商品 (単品) の梱包した状態の 縦・横・高さ・重さ (中原さん 2026-10-17)
 --   中原さん「マスタの入力に 梱包した状態の 縦・横・高さ・重さ を入れたい。登録の時は必須にしない。
 --             この情報は FBA 納品のアプリとか、定形外の発送方法で情報をもっていたはずだから集約して」
 --
@@ -40,7 +40,7 @@ create table core.product_packages (
   constraint ck_product_packages_any check (length_mm is not null or width_mm is not null or height_mm is not null or weight_g is not null),
   foreign key (company_id, product_id) references core.products (company_id, product_id)
 );
-comment on table core.product_packages is '🆕 0086: 商品 (単品の商品の行) の梱包した状態の 縦・横・高さ (mm)・重さ (g) の人の値 (行が無い = 人の値なし)。夜間ロードは触らない。書くのは ops.set_product_package だけ。出どころの値は core.product_physicals・まとめた値は core.v_product_packages';
+comment on table core.product_packages is '🆕 0087: 商品 (単品の商品の行) の梱包した状態の 縦・横・高さ (mm)・重さ (g) の人の値 (行が無い = 人の値なし)。夜間ロードは触らない。書くのは ops.set_product_package だけ。出どころの値は core.product_physicals・まとめた値は core.v_product_packages';
 
 create table ops.product_package_events (
   event_id   bigint generated always as identity primary key,
@@ -59,7 +59,7 @@ create table ops.product_package_events (
   unique (request_id, product_id)
 );
 create index ix_product_package_events_product on ops.product_package_events (product_id, event_id desc);
-comment on table ops.product_package_events is '🆕 0086: 梱包の 縦・横・高さ・重さ の人の値を入れた・変えた・外した記録 (追記だけ・書くのは ops.set_product_package だけ)。商品の最後の記録の番号 = 画面が見ていた版';
+comment on table ops.product_package_events is '🆕 0087: 梱包の 縦・横・高さ・重さ の人の値を入れた・変えた・外した記録 (追記だけ・書くのは ops.set_product_package だけ)。商品の最後の記録の番号 = 画面が見ていた版';
 revoke all on core.product_packages, ops.product_package_events from public;
 
 -- 守り: 書くのは関数の中だけ (印 ops.package_protocol)・記録は追記だけ・TRUNCATE できない
@@ -127,11 +127,11 @@ begin
   if p_via = 'sku_page' then
     v_sess := ops.current_master_write_session();
     if v_sess.session_id is null or v_sess.operation is distinct from 'sku_edit' or v_sess.sku_id is distinct from p_sku_id
-       or v_sess.request_id is distinct from p_request_id or v_sess.actor_id is distinct from p_actor_id then   -- 記録の request_id・人 = 保存の約束と同じ (#0086 Codex R1 M)
+       or v_sess.request_id is distinct from p_request_id or v_sess.actor_id is distinct from p_actor_id then   -- 記録の request_id・人 = 保存の約束と同じ (#0087 Codex R1 M)
       raise exception 'master_write_session_required: 商品の画面の梱包の大きさ・重さは、同じ取引でこの SKU の保存 (ops.begin_master_write) を始めた後だけ' using errcode = '42501';
     end if;
   elsif not exists (select 1 from ops.master_write_sessions w where w.txid = pg_catalog.txid_current() and w.created_at >= pg_catalog.now() and w.operation = 'sku_create' and w.sku_id = p_sku_id
-                      and w.request_id = p_request_id and w.actor_id = p_actor_id) then   -- 登録の約束の request_id (まとまり = 子の番号)・人と同じ (#0086 Codex R1 M)
+                      and w.request_id = p_request_id and w.actor_id = p_actor_id) then   -- 登録の約束の request_id (まとまり = 子の番号)・人と同じ (#0087 Codex R1 M)
     raise exception 'master_write_session_required: 新商品の梱包の大きさ・重さは、その SKU を登録した同じ取引の中だけ (ops.register_new_sku の後)' using errcode = '42501';
   end if;
   -- 鍵: SKU の鍵 → 商品の行 (商品の画面の保存・登録の取引はもう持っている = 同じ取引で取り直しても待たない)
@@ -190,7 +190,7 @@ with latest as not materialized (
    where ph.scope = 'package' and ph.observed_at <= pg_catalog.now()
    order by ph.product_id, ph.source_system, coalesce(ph.source_ref, ''), ph.observed_at desc, ph.product_physical_id desc
 ), cand as not materialized (
-  -- 軸ごとに縦に並べる (出どころの行も人の行も 1 回だけ読む = 商品の絞り込みが元の表まで届く・#0086 Codex R1 M)
+  -- 軸ごとに縦に並べる (出どころの行も人の行も 1 回だけ読む = 商品の絞り込みが元の表まで届く・#0087 Codex R1 M)
   select l.product_id, x.axis, x.v, l.source_system as src, l.source_ref as ref, l.observed_at as at, l.product_physical_id as id
     from latest l cross join lateral (values ('length_mm'::text, l.length_mm), ('width_mm', l.width_mm), ('height_mm', l.height_mm), ('weight_g', l.weight_g)) as x(axis, v)
    where x.v is not null
@@ -214,5 +214,5 @@ select w.product_id,
        max(w.ref) filter (where w.axis = 'weight_g') as weight_ref, max(w.at) filter (where w.axis = 'weight_g') as weight_at
   from win w
  group by w.product_id;
-comment on view core.v_product_packages is '🆕 0086: 商品ごとのまとめた梱包の 縦・横・高さ (mm)・重さ (g)。軸ごとに 人 → 出どころの順位 (core.package_source_rank) → 新しい順。FBA 納品・定形外・利益の計算はここを読む';
+comment on view core.v_product_packages is '🆕 0087: 商品ごとのまとめた梱包の 縦・横・高さ (mm)・重さ (g)。軸ごとに 人 → 出どころの順位 (core.package_source_rank) → 新しい順。FBA 納品・定形外・利益の計算はここを読む';
 revoke all on core.v_product_packages from public;

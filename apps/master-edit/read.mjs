@@ -467,7 +467,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     const names = await makerNamesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
     for (const r of pageRows) r.maker = (r.kind === 'single' && r.product_id && names.get(r.product_id)) || null;
   }
-  // 🆕 0086: 梱包した状態の 縦・横・高さ・重さ (単品の商品の行だけ・まとめた値 = 一覧の「大きさ・重さ」の列と CSV の最後の列)。表が無い・読めない = 空
+  // 🆕 0087: 梱包した状態の 縦・横・高さ・重さ (単品の商品の行だけ・まとめた値 = 一覧の「大きさ・重さ」の列と CSV の最後の列)。表が無い・読めない = 空
   {
     const pk = await packagesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
     for (const r of pageRows) r.pkg = (r.kind === 'single' && r.product_id && pk.get(String(r.product_id))) || null;

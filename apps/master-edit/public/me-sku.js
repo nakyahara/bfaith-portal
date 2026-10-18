@@ -394,7 +394,7 @@
   var requestId = uuid();
   var FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
     : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed', 'maker',
-      'pkg_length', 'pkg_width', 'pkg_height', 'pkg_weight'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0084 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)・🆕 0086 梱包の大きさ・重さは 0086 があって直せるときだけ欄が出る
+      'pkg_length', 'pkg_width', 'pkg_height', 'pkg_weight'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0084 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)・🆕 0087 梱包の大きさ・重さは 0087 があって直せるときだけ欄が出る
   function collect() {
     var values = {};
     FIELDS.forEach(function (f) {

@@ -255,9 +255,9 @@ export const ORDER_OUTBOX_EDIT_FUNCTIONS = Object.freeze(['ops.enqueue_order_set
   'ops.dismiss_order_settings_event(uuid, text, text)']);
 export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()']);
 /**
- * 🆕 0086 (梱包の 縦・横・高さ・重さ・中原さん 2026-10-17): master_edit に人の値・記録の表とまとめた値のビューの select (PACKAGE_SELECT)・
+ * 🆕 0087 (梱包の 縦・横・高さ・重さ・中原さん 2026-10-17): master_edit に人の値・記録の表とまとめた値のビューの select (PACKAGE_SELECT)・
  *   出どころの値 (夜間ロードが書く core.product_physicals) の select (PACKAGE_SOURCE_SELECT・ほかのロールの権限は触らない)・人の値を書く関数の実行 (PACKAGE_EDIT_FUNCTIONS)。
- *   表・関数が無い DB (0086 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
+ *   表・関数が無い DB (0087 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
  *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・守りの trigger (PACKAGE_OWNER_ONLY_FUNCTIONS)
  */
 export const PACKAGE_SELECT = Object.freeze(['core.product_packages', 'ops.product_package_events', 'core.v_product_packages']);
@@ -402,8 +402,8 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const t of ORDER_OUTBOX_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...ORDER_OUTBOX_EDIT_FUNCTIONS, ...ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of ORDER_OUTBOX_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
-  // 🆕 0086 (梱包の大きさ・重さ): 表・ビュー・関数がある DB だけ。人の値の表・記録・ビューは前に付けた権限を外してから画面のロールに付け直す (読むだけ・書くのは関数だけ)。
-  //   出どころの core.product_physicals は select を足すだけ (夜間ロード・ほかのロールの権限は変えない)。0086 の前の DB では付けない (表があっても画面は 0086 が無いと読まない)
+  // 🆕 0087 (梱包の大きさ・重さ): 表・ビュー・関数がある DB だけ。人の値の表・記録・ビューは前に付けた権限を外してから画面のロールに付け直す (読むだけ・書くのは関数だけ)。
+  //   出どころの core.product_physicals は select を足すだけ (夜間ロード・ほかのロールの権限は変えない)。0087 の前の DB では付けない (表があっても画面は 0087 が無いと読まない)
   for (const t of PACKAGE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const t of PACKAGE_SOURCE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null and to_regclass('core.v_product_packages') is not null then execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...PACKAGE_EDIT_FUNCTIONS, ...PACKAGE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
