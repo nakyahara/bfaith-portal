@@ -805,28 +805,34 @@ function getCompositeRank(score) {
 // ── Phase 1A: FBM 送料計算（サーバー側）──
 // クライアント側 calcFbmShipping(dims) と同等のロジック。
 // SSE ハンドラーが items の fbm_* を書き込むために使用する。
+// ⚠ 寸法・重さが分からないときは送料を決めない (cost: null)。以前は '-' を 0 とみなして
+//   「重さ 0g = どの便にも入る」「寸法不明 = ネコポス / EasyShip小型」と安い側に決めていた。
+//   cost が null のときは FBM 利益も出さない (画面は「寸法不明」「重さ不明」と出す)
 export function calcFbmShippingServer(dims, settings, shippingTable) {
   const mode = settings?.fbmShippingMode || 'auto';
-  const l = parseFloat(dims?.length) || 0;
-  const w = parseFloat(dims?.width) || 0;
-  const h = parseFloat(dims?.height) || 0;
-  const weightG = (parseFloat(dims?.weight) || 0) * 1000;
+  const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+  const l = num(dims?.length) || 0;
+  const w = num(dims?.width) || 0;
+  const h = num(dims?.height) || 0;
+  const dimsKnown = l > 0 && w > 0 && h > 0;
+  const kg = num(dims?.weight);
+  // "0.00" (10g 未満を小数2桁に丸めた値) は「分かっていてとても軽い」なので不明にしない
+  const weightKnown = kg != null && kg >= 0;
+  const weightG = weightKnown ? kg * 1000 : 0;
   const threeSum = l + w + h;
 
-  if (mode === 'easyship') {
-    const smallCost = parseInt(settings?.easyshipSmall) || 165;
-    const largeCost = parseInt(settings?.easyshipLarge) || 210;
-    const minDim = (l > 0 && w > 0 && h > 0) ? Math.min(l, w, h) : h;
-    if (minDim === 0) return { cost: smallCost, method: 'EasyShip小型(寸法不明)' };
-    if (minDim <= 3) return { cost: smallCost, method: 'EasyShip小型' };
-    return { cost: largeCost, method: 'EasyShip大型' };
-  }
   if (mode === 'fixed') {
     return { cost: parseInt(settings?.fixedShipping) || 0, method: '固定額' };
   }
-  if (l === 0 && w === 0 && h === 0) {
-    return { cost: 237, method: 'ネコポス(寸法不明)' };
+  if (!dimsKnown) return { cost: null, method: '寸法不明' };
+  if (mode === 'easyship') {
+    const smallCost = parseInt(settings?.easyshipSmall) || 165;
+    const largeCost = parseInt(settings?.easyshipLarge) || 210;
+    // 最小辺を厚さとみなす (Amazon の寸法は長い順でない場合がある)
+    if (Math.min(l, w, h) <= 3) return { cost: smallCost, method: 'EasyShip小型' };
+    return { cost: largeCost, method: 'EasyShip大型' };
   }
+  if (!weightKnown) return { cost: null, method: '重さ不明' };
   for (const s of (shippingTable || [])) {
     if (s.name.includes('定形内') && l <= 23.5 && w <= 12 && h <= 1 && weightG <= parseInt(s.weight || 0)) return { cost: s.total, method: s.name };
     if (s.name === 'ネコポス' && l <= 31.2 && w <= 22.8 && h <= 3 && weightG <= 1000) return { cost: s.total, method: s.name };
@@ -1118,12 +1124,15 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         const shipping = calcFbmShippingServer(product.dimensions, settings, shippingTable);
         fbmShippingCost = shipping.cost;
         fbmShippingMethod = shipping.method;
-        // Codex P1 (5回目) 対応: estimatedShipping (仕入送料) も差し引く
-        // FBA の利益計算 (上の Step5) では引いているが、ここで引き忘れていたため
-        // 仕入送料指定時に保存される FBM 利益が過大になっていた
-        fbmTotalProfit = sellingPrice - wholesalePriceWithTax - fbmFees.totalFee - fbmShippingCost - estimatedShipping;
-        fbmTotalProfitRate = sellingPrice > 0 ? Math.round((fbmTotalProfit / sellingPrice * 100) * 10) / 10 : 0;
-        fbmTotalJudgment = fbmTotalProfitRate >= 30 ? '◎' : fbmTotalProfitRate >= 20 ? '○' : fbmTotalProfitRate >= 10 ? '△' : '×';
+        // 送料が決められない (寸法・重さ不明) ときは FBM 利益・判定を出さない (null のまま)
+        if (fbmShippingCost != null) {
+          // Codex P1 (5回目) 対応: estimatedShipping (仕入送料) も差し引く
+          // FBA の利益計算 (上の Step5) では引いているが、ここで引き忘れていたため
+          // 仕入送料指定時に保存される FBM 利益が過大になっていた
+          fbmTotalProfit = sellingPrice - wholesalePriceWithTax - fbmFees.totalFee - fbmShippingCost - estimatedShipping;
+          fbmTotalProfitRate = sellingPrice > 0 ? Math.round((fbmTotalProfit / sellingPrice * 100) * 10) / 10 : 0;
+          fbmTotalJudgment = fbmTotalProfitRate >= 30 ? '◎' : fbmTotalProfitRate >= 20 ? '○' : fbmTotalProfitRate >= 10 ? '△' : '×';
+        }
       }
 
       // === DB UPDATE（SSE ハンドラー特権）===

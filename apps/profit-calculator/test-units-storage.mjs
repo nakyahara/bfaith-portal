@@ -148,10 +148,10 @@ await t('🚨 一部だけ分かる寸法で送料が安い便に決まらない
     length: { unit: 'centimeters', value: 20 }, width: { unit: 'centimeters', value: 10 }, height: { unit: 'decimeters', value: 2 },
     weight: { unit: 'kilograms', value: 0.5 },
   });
-  assert.equal(calcFbmShippingServer(unknownH.dimensions, {}, table).method, 'ネコポス(寸法不明)');
+  assert.deepEqual(calcFbmShippingServer(unknownH.dimensions, {}, table), { cost: null, method: '寸法不明' });
   // 高さが無い
   const noH = normalizePackageDimensions({ length: { unit: 'centimeters', value: 20 }, width: { unit: 'centimeters', value: 10 }, weight: { unit: 'kilograms', value: 0.5 } });
-  assert.equal(calcFbmShippingServer(noH.dimensions, {}, table).method, 'ネコポス(寸法不明)');
+  assert.deepEqual(calcFbmShippingServer(noH.dimensions, {}, table), { cost: null, method: '寸法不明' });
   // ちゃんと分かれば寸法どおり (20 × 10 × 20cm = 3 辺 50cm・厚さでネコポス不可 → 60 サイズ)
   const ok = normalizePackageDimensions({
     length: { unit: 'centimeters', value: 20 }, width: { unit: 'centimeters', value: 10 }, height: { unit: 'centimeters', value: 20 },
@@ -208,6 +208,62 @@ await t('🚨 以前のキー名 (lengthCm など) の誤りの再発防止: get
   assert.equal(estimateStorageCost((await getProduct('B000TEST01')).dimensions), 80); // 38.1 + 25.4 + 20.3 = 83.8
   useCatalog({ length: { unit: 'centimeters', value: 70 }, width: { unit: 'centimeters', value: 50 }, height: { unit: 'centimeters', value: 40 }, weight: { unit: 'kilograms', value: 9 } });
   assert.equal(estimateStorageCost((await getProduct('B000TEST01')).dimensions), 250);
+});
+
+console.log('\nFBM 送料の判定 (寸法・重さ不明を安い便に決めつけない)');
+
+// 画面側 (bulk-research.html) の calcFbmShipping を取り出して、サーバー側と同じ答えになるかも見る
+const html = fs.readFileSync(new URL('./bulk-research.html', import.meta.url), 'utf8');
+const startAt = html.indexOf('function calcFbmShipping(dims) {');
+const endAt = html.indexOf('\n}', startAt);
+assert.ok(startAt > 0 && endAt > startAt, 'bulk-research.html に calcFbmShipping が見つからない');
+const clientSrc = html.slice(startAt, endAt + 2);
+function clientShipping(dims, settings, table) {
+  const values = { fbmShippingMode: settings.fbmShippingMode || 'auto', easyshipSmall: settings.easyshipSmall ?? '', easyshipLarge: settings.easyshipLarge ?? '', fixedShipping: settings.fixedShipping ?? '' };
+  const document = { getElementById: (id) => ({ value: values[id] ?? '' }) };
+  return new Function('document', 'shippingTable', `${clientSrc}\nreturn calcFbmShipping;`)(document, table)(dims);
+}
+const TABLE = [
+  { name: 'ネコポス', total: 237 },
+  { name: '宅急便60サイズ', total: 900 },
+  { name: '宅急便80サイズ', total: 1100 },
+];
+const both = (dims, settings = {}) => {
+  const s = calcFbmShippingServer(dims, settings, TABLE);
+  assert.deepEqual(clientShipping(dims, settings, TABLE), s, '画面側とサーバー側で答えが違う');
+  return s;
+};
+
+await t('🚨 自動判定: 重さが分からなければ便を決めない (以前は 0g = ネコポスに入る扱い)', async () => {
+  const dims = { length: '30.0', width: '20.0', height: '2.5', weight: '-' };
+  assert.deepEqual(both(dims), { cost: null, method: '重さ不明' });
+  assert.deepEqual(both({ length: '30.0', width: '20.0', height: '2.5' }), { cost: null, method: '重さ不明' });
+  // 重さが分かれば今までどおり
+  assert.deepEqual(both({ ...dims, weight: '0.30' }), { cost: 237, method: 'ネコポス' });
+  assert.deepEqual(both({ ...dims, weight: '3.00' }), { cost: 1100, method: '宅急便80サイズ' });
+  // "0.00" は「分かっていて 10g 未満」なので不明にしない
+  assert.deepEqual(both({ ...dims, weight: '0.00' }), { cost: 237, method: 'ネコポス' });
+});
+
+await t('🚨 自動判定: 寸法が分からなければ便を決めない (以前はネコポス 237 円の決めつけ)', async () => {
+  assert.deepEqual(both({ length: '-', width: '-', height: '-', weight: '0.30' }), { cost: null, method: '寸法不明' });
+  assert.deepEqual(both(null), { cost: null, method: '寸法不明' });
+  assert.deepEqual(both({ length: '30.0', width: '-', height: '2.5', weight: '0.30' }), { cost: null, method: '寸法不明' });
+});
+
+await t('🚨 EasyShip: 寸法が分からなければ小型と決めつけない', async () => {
+  const es = { fbmShippingMode: 'easyship', easyshipSmall: '165', easyshipLarge: '210' };
+  assert.deepEqual(both({ length: '-', width: '-', height: '-', weight: '-' }, es), { cost: null, method: '寸法不明' });
+  // 以前は 3 辺そろわないと高さだけで見ていたので、高さ 2cm だけ分かれば小型にしていた
+  assert.deepEqual(both({ length: '-', width: '-', height: '2.0', weight: '-' }, es), { cost: null, method: '寸法不明' });
+  // 寸法が分かれば今までどおり (重さは EasyShip の判定に使わない)
+  assert.deepEqual(both({ length: '30.0', width: '20.0', height: '2.5', weight: '-' }, es), { cost: 165, method: 'EasyShip小型' });
+  assert.deepEqual(both({ length: '30.0', width: '2.0', height: '20.0', weight: '1.0' }, es), { cost: 165, method: 'EasyShip小型' }); // 最小辺が厚さ
+  assert.deepEqual(both({ length: '30.0', width: '20.0', height: '10.0', weight: '1.0' }, es), { cost: 210, method: 'EasyShip大型' });
+});
+
+await t('固定額は寸法・重さに関係なく今までどおり', async () => {
+  assert.deepEqual(both({ length: '-', width: '-', height: '-', weight: '-' }, { fbmShippingMode: 'fixed', fixedShipping: '500' }), { cost: 500, method: '固定額' });
 });
 
 console.log(`\n${passed} 件 OK${process.exitCode ? ' (失敗あり)' : ''}`);
