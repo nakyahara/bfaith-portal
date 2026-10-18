@@ -71,6 +71,7 @@
     if (el.classList.contains('seg')) return segText(el, v);
     if (el.tagName === 'SELECT') { var o = $$('option', el).filter(function (x) { return x.value === v; })[0]; return o ? o.textContent : v; }
     if (el.id === 'f-maker' && ME.maker) return ME.maker.label(v);   // 🆕 0084: 名簿の番号 → 名前 (空 = なし)
+    if (el.id === 'f-brand' && ME.brand) return ME.brand.label(v);   // 🆕 0088: ブランドも同じ
     if (v === '' || v == null) return '(空)';
     var unit = el.getAttribute('data-unit') || '';
     if (unit === ' 円' && intOf(v) != null) return yen(intOf(v)) + unit;
@@ -149,6 +150,8 @@
     if (keys.indexOf('exception_cost') >= 0 && !$('#xcost-reason').value.trim()) out.push({ t: '例外原価を変えるときは、その「理由」が要ります', focus: '#xcost-reason' });
     // 🆕 0084 (#maker Codex R1 M): メーカーの名前を打ったが一覧から選んでいない = 保存しない (そのまま送ると今のメーカーを外してしまう)
     if (ME.maker && ME.maker.pending()) out.push({ t: 'メーカーは一覧から選ぶか「新しいメーカーとして登録」を押してください (外すときは欄を空に)', focus: '#f-maker-in' });
+    // 🆕 0088: ブランドも同じ (打っただけで選んでいない = 今のブランドを外してしまう)
+    if (ME.brand && ME.brand.pending()) out.push({ t: 'ブランドは一覧から選ぶか「新しいブランドとして登録」を押してください (外すときは欄を空に)', focus: '#f-brand-in' });
     return out;
   }
 
@@ -377,6 +380,7 @@
     $$('.f.err', scope).forEach(function (f) { f.classList.remove('err'); });
     clearNameError();
     if (ME.maker) ME.maker.sync();   // 🆕 0084: 隠した欄 (名簿の番号) に合わせて、メーカーの名前の欄も戻す
+    if (ME.brand) ME.brand.sync();   // 🆕 0088: ブランドも同じ
     update();
     if (nameBox && !nameBox.hidden) closeName();
     ME.toast('変更を元に戻しました');
@@ -395,6 +399,8 @@
   var FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
     : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed', 'maker',
       'pkg_length', 'pkg_width', 'pkg_height', 'pkg_weight'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0084 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)・🆕 0087 梱包の大きさ・重さは 0087 があって直せるときだけ欄が出る
+  // 🆕 0088: ブランド (隠した欄 = 名簿の番号・空 = 外す)・区分・終売の予定日 (単品だけ・欄が無い = 送らない)
+  if (!isSet) FIELDS = FIELDS.concat(['brand', 'life_stage', 'end_planned_on']);
   function collect() {
     var values = {};
     FIELDS.forEach(function (f) {

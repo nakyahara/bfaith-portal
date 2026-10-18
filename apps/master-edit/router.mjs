@@ -154,6 +154,9 @@ import { readPackageView, packageReady } from '../../lib/master-package.mjs';
 import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
 // 🆕 0084 (メーカー・中原さん 2026-10-17): 名簿・名簿に足す・欄を出すか (0084 があってロールの流し直しの後)
 import { makerReady, readMakers, createMaker, MAKER_NAME_MAX } from '../../lib/master-maker.mjs';
+// 🆕 0088 (ブランド・商品の段階・中原さん 2026-10-17): 名簿・名簿に足す・自社ブランドの印・欄を出すか・初めて売った日
+import { brandLifeReady, brandLifeTablesExist, readBrands, createBrand, setBrandOwn, firstSoldOf, salesRecordsFrom, firstSoldView, endBadge, daysUntil,
+  BRAND_NAME_MAX, LIFE_STAGES, LIFE_FILTERS, END_SOON_DAYS } from '../../lib/master-brand-life.mjs';
 import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
 
 /**
@@ -750,7 +753,9 @@ router.get('/', (req, res) => {
     // まとめて変える (PR2): 書ける人 (名簿) で、保存を開いていて、Company DB を読めたときだけ左のチェックを出す
     const bulk = { on: !!db && locals.canEdit && !locals.closed, max: BULK_MAX, chunk: BULK_CHUNK, costReasons: COST_REASONS, groups: FIX_GROUPS, multiMax: MULTI_MAX };
     res.render(view('index.ejs'), { ...locals, ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max,
-      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk, imgOf, IMAGE_STATE_WORDS });
+      listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk, imgOf, IMAGE_STATE_WORDS,
+      // 🆕 0088: ブランド・商品の段階の列と絞り込み (ready = 表を読める = 札と絞り込みを出す)
+      brandLifeList: { ready: db ? await brandLifeTablesExist(db).catch(() => false) : false, today: jstDate(new Date(clock())), stages: LIFE_STAGES, filters: LIFE_FILTERS, soonDays: END_SOON_DAYS, endBadge } });
   });
 });
 /**
@@ -774,7 +779,7 @@ router.post('/api/search', (req, res) => {
   const f = normalizeFilters(b);
   const cond = Object.fromEntries(ADV_KEYS.filter((k) => f[k]).map((k) => [k, f[k]]));
   if (Buffer.byteLength(JSON.stringify(cond)) > SEARCH_COND_MAX_BYTES) return tooLarge(`検索の条件が大きすぎます (全部で ${SEARCH_COND_MAX_BYTES / 1024}KB まで。複数の欄を分けて検索してください)`);
-  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff', 'sort', 'dir'].filter((k) => f[k]).map((k) => [k, f[k]]));
+  const rest = Object.fromEntries(['q', 'kind', 'state', 'missing', 'reg', 'card', 'diff', 'sort', 'dir', 'life'].filter((k) => f[k]).map((k) => [k, f[k]]));
   const qs = new URLSearchParams({ ...rest, ...(Object.keys(cond).length ? { s: putSearch(cond, clock()) } : {}) }).toString();
   res.json({ ok: true, url: `${req.baseUrl}/${qs ? `?${qs}` : ''}` });
 });
@@ -927,8 +932,31 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     // 🆕 0084: メーカーの欄 (単品だけ・0084 があってロールの流し直しの後)。名簿は画面で探す (search-fold.mjs と同じかなの同一視)
     ...(await makerLocals(db, kind === 'single')),
     packageReady: db && kind === 'single' ? await packageReady(db).catch(() => false) : false,   // 🆕 0087 (梱包の大きさ・重さの欄を出すか・入れなくてよい)
+    // 🆕 0088: ブランド・商品の段階 (単品だけ・必須でない)
+    ...(await brandLifeLocals(db, kind === 'single')),
   });
 }));
+/**
+ * 🆕 0088: ブランド・商品の段階の欄に渡す値 { brandLife: { brands, max, stages, first? } | null }。出さない・読めない (0088 の前・ロールの流し直しの前) = null = 欄なし。
+ *   cur (商品の画面) = 初めて売った日 (ops.sku_first_sold・読めない = 「読めませんでした」) と終売の予定日までの日数
+ */
+async function brandLifeLocals(db, want = true, cur = null) {
+  const ready = want && db ? await brandLifeReady(db).catch(() => false) : false;
+  if (!ready) return { brandLife: null };
+  const out = { brands: await readBrands(db).catch(() => []), max: BRAND_NAME_MAX, stages: LIFE_STAGES, soonDays: END_SOON_DAYS, first: null, end: null };
+  if (cur) {
+    try {
+      const fs = (await firstSoldOf(db, [cur.sku_id])).get(String(cur.sku_id)) || null;
+      out.first = firstSoldView(fs, await salesRecordsFrom(db));
+    } catch (e) {
+      console.error(`[master-edit] 初めて売った日を読めなかった: ${e && e.message}`);
+      out.first = { date: null, text: '読めませんでした', source: '', note: '少し待ってから画面を開き直してください', beforeRecords: false, error: true };
+    }
+    const end = cur.lifecycle && cur.lifecycle.end_planned_on;
+    if (end) { const today = jstDate(new Date(clock())); out.end = { days: daysUntil(end, today), badge: endBadge(end, today) }; }
+  }
+  return { brandLife: out };
+}
 /** 🆕 0084: メーカーの欄に渡す値 { makerReady, makers: [{ id, name }], makerMax }。出さない・読めない = 欄なし */
 async function makerLocals(db, want = true) {
   const ready = want && db ? await makerReady(db).catch(() => false) : false;
@@ -958,6 +986,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,   // 🆕 0080 (子ごとのロジザードのバーコードの欄を出すか)
     ...(await makerLocals(db, !gated)),   // 🆕 0084: メーカー (全部の子に同じ値)
     packageReady: db ? await packageReady(db).catch(() => false) : false,   // 🆕 0087 (梱包の大きさ・重さの欄を出すか・全部の子に同じ値・入れなくてよい)
+    ...(await brandLifeLocals(db, !gated)),   // 🆕 0088: ブランド・商品の段階 (全部の子に同じ値・必須でない)
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
@@ -1236,6 +1265,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
       ? draftCancelView(await readDraftCancelCheck(db, page.cur.sku_id), await liveCardsSafe({ skuId: page.cur.sku_id, code: page.cur.code })) : null,
     // 🆕 0084: メーカー (単品だけ・代表の仕入先のすぐ下・保存は「保存する」と一緒 = saveSku)
     ...(await makerLocals(db, !!page && page.cur.sku_kind === 'single')),
+    // 🆕 0088: ブランド・商品の段階 (単品だけ・別の板・保存は「保存する」と一緒 = saveSku)・初めて売った日 (読むだけ)
+    ...(await brandLifeLocals(db, !!page && page.cur.sku_kind === 'single', page ? page.cur : null)),
   });
 }));
 router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, dbError) => {
@@ -1305,6 +1336,28 @@ router.post('/api/makers', (req, res) => {
   const b = req.body || {};
   return withPgApi(res, async (db) => {
     res.json(await createMaker(db, { requestId: b.request_id, actor: String(req.session.email).trim().toLowerCase(), name: b.name }));
+  }, 'write');
+});
+
+/**
+ * 🆕 0088: ブランドを名簿に足す (「＋ 新しいブランドとして登録」「＋ 自社ブランドとして登録」)。名簿の人だけ・Origin・JSON (上の守り)。
+ *   同じと見る名前 (メーカーと同じ決まり) が既にある = 足さずにそれを返す (existed・印も名簿のまま)。同じ request_id の押し直し = 前の答え
+ */
+router.post('/api/brands', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    res.json(await createBrand(db, { requestId: b.request_id, actor: String(req.session.email).trim().toLowerCase(), name: b.name, own: b.own == null ? false : b.own }));
+  }, 'write');
+});
+/** 🆕 0088: ブランドの「自社ブランド」の印を変える (名簿の行 = そのブランドの全部の商品に効く)。名簿の人だけ。seen_own = 画面が見ていた印 (違う = 409) */
+router.post('/api/brands/own', (req, res) => {
+  const gate = editorGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const b = req.body || {};
+  return withPgApi(res, async (db) => {
+    res.json(await setBrandOwn(db, { requestId: b.request_id, actor: String(req.session.email).trim().toLowerCase(), brandId: b.brand_id, own: b.own, seenOwn: b.seen_own }));
   }, 'write');
 });
 

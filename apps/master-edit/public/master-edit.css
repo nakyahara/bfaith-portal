@@ -1179,6 +1179,16 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .mkpick, .mkbox, #f-maker-in { width: 100%; }
   .mkbox .csug { width: 100%; }
 }
+/* 🆕 0088 ブランドの欄 (views/_brand.ejs・メーカーと同じ部品の見た目)・商品の段階 (区分・終売の予定日)。押す所は 44px */
+#f-brand-own { min-height: 36px; }
+#first-sold b { font-variant-numeric: tabular-nums; }
+/* 一覧の「もっと絞る」の商品の段階 = 狭い画面で横にはみ出さない (選ぶ欄が縮む) */
+.filters-more .row2 label:has(#f-life) { max-width: 100%; }
+#f-life { min-width: 0; max-width: 100%; flex: 1 1 auto; }
+@media (max-width: 760px) {
+  #f-brand-in, #f-brand-own, #f-life_stage, #f-end_planned_on { min-height: 44px; }
+  #f-brand-in { width: 100%; }
+}
 /* 構成の行の下の「NE の商品を足す (セット)」= 1 行目は最初からあるので控えめ (文字だけのボタン・押せる大きさはスマホで 44px) */
 #comp-add.addrow { color: var(--muted); padding: 0 6px; }
 #comp-add.addrow:hover { color: var(--accent); }

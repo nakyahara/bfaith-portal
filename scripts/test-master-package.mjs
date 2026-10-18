@@ -391,7 +391,7 @@ await ta('[V1] まとまりの登録: 全部の子に同じ値 (記録は子ご�
 });
 
 await ta('[L1] 一覧の「大きさ・重さ」の列 (いつもは出さない・並べられない・最後に足す)・CSV の最後の 5 列 (まとめた値と出どころ)', async () => {
-  assert.equal(COLS.COLUMN_IDS.at(-1), 'pkg', '前の列の並びを変えない (最後に足す)');
+  assert.equal(COLS.COLUMN_IDS[COLS.COLUMN_IDS.indexOf('maker') + 1], 'pkg', '前の列の並びを変えない (メーカーの後ろに足す・🆕 0088 のブランドなどはその後ろ)');
   assert.ok(!COLS.DEFAULT_VIEW.shown.includes('pkg'));
   assert.ok(!COLS.SORTABLE.includes('pkg'));
   const data = await asEditor(() => RD.listSkus(db, RD.normalizeFilters({ q: 'pk-r1' }), { mode: 'all' }));
@@ -400,12 +400,13 @@ await ta('[L1] 一覧の「大きさ・重さ」の列 (いつもは出さない
   const csv = CSV.buildListCsv(data, {}, {});
   const lines = csv.replace(/^﻿/, '').trim().split('\r\n');
   const head = lines[0].split(',');
-  assert.deepEqual(head.slice(-7), ['"商品コードの注意"', '"メーカー"', '"梱包の縦 (cm)"', '"梱包の横 (cm)"', '"梱包の高さ (cm)"', '"梱包の重さ (g)"', '"大きさ・重さの出どころ"']);
-  assert.ok(lines.find((l) => l.startsWith('"pk-r1"')).endsWith('"20","15.5","2.5","180","縦・横・高さ・重さ = 人"'));
+  const iPkg = head.indexOf('"梱包の縦 (cm)"');
+  assert.deepEqual(head.slice(iPkg - 2, iPkg + 5), ['"商品コードの注意"', '"メーカー"', '"梱包の縦 (cm)"', '"梱包の横 (cm)"', '"梱包の高さ (cm)"', '"梱包の重さ (g)"', '"大きさ・重さの出どころ"']);
+  assert.ok(lines.find((l) => l.startsWith('"pk-r1"')).split(',').slice(iPkg, iPkg + 5).join(',') === '"20","15.5","2.5","180","縦・横・高さ・重さ = 人"');
   // 出どころが混ざる商品 (s002 = 人の値なし・重さ = FBA 納品・高さ = 定形外)
   const d2 = await asEditor(() => RD.listSkus(db, RD.normalizeFilters({ q: 's002' }), { mode: 'all' }));
   const l2 = CSV.buildListCsv(d2, {}, {}).replace(/^﻿/, '').trim().split('\r\n').find((l) => l.startsWith('"s002"'));
-  assert.ok(l2.endsWith('"","","3","260","高さ = 定形外 (実測) / 重さ = FBA 納品 (実測)"'), l2);
+  assert.ok(l2.split(',').slice(iPkg, iPkg + 5).join(',') === '"","","3","260","高さ = 定形外 (実測) / 重さ = FBA 納品 (実測)"', l2);
   const list = await call('GET', '/?q=pk-r1');
   assert.match(list.text, /<td data-col="pkg" hidden><span title="[^"]*">20×15.5×2.5 cm · 180 g<\/span><\/td>/);
 });
@@ -464,7 +465,7 @@ await ta('[B2] 見るだけの人: 欄は 🔒 (人の値)・「この値を入�
 
 await ta('[H1] つかいかた: 大きさ・重さの節 (入れなくても登録できる・出どころ・食い違い・CSV)', async () => {
   const r = await call('GET', '/manual');
-  for (const w of ['id="package"', '入れなくても登録できます', '食い違い', 'この値を入れる', '縦・横はまだどのアプリにもありません', '一覧の CSV の最後の 5 列']) assert.ok(r.text.includes(w), `つかいかたに「${w}」が無い`);
+  for (const w of ['id="package"', '入れなくても登録できます', '食い違い', 'この値を入れる', '縦・横はまだどのアプリにもありません', '一覧の CSV の 5 列']) assert.ok(r.text.includes(w), `つかいかたに「${w}」が無い`);
 });
 
 console.log(`\n${passed} ok${process.exitCode ? ' (NG あり)' : ''}`);
