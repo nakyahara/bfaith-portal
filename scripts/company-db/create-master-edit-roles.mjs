@@ -56,6 +56,7 @@
  *   名簿 MASTER_EDITORS の人 = 中原さんの決定 Q1 a)。master_ops には渡さない。表の権限は足さない (関数の中だけで書く)。
  *   🚨 渡さない: 確かめの表の 1 行を作る部品 (QUARANTINE_CONFIRM_OWNER_ONLY_FUNCTIONS)
  * 🆕 0083 仮 (商品ごとの入出庫履歴と月別のまとめ・CompanyDB構想 26): master_edit に読むだけの関数 4 つの実行 (MOVEMENT_FUNCTIONS)。出荷の表の select は渡さない
+ * 🆕 0084 仮 (販売数のグラフ・10/17 中原さん): master_edit に読むだけの関数 1 つの実行 (SALES_CHART_FUNCTIONS)。注文の表の select は渡さない
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
  *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
@@ -276,6 +277,11 @@ export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_log
  */
 export const MOVEMENT_FUNCTIONS = Object.freeze(['ops.sku_stock_anchors(bigint, date)', 'ops.sku_shipment_totals(bigint, timestamp with time zone[])',
   'ops.sku_movement_shipments(bigint, timestamp with time zone, timestamp with time zone, text, integer)', 'ops.sku_shipments_monthly(bigint, date)']);
+/**
+ * 🆕 0084 仮 (販売数のグラフ・商品の画面): 日 × モールの正味の販売数 (数量だけ・金額なし) を読むだけの関数 (security definer) を master_edit に実行だけ。
+ *   注文の表 (core.orders・order_lines) の select は渡さない (注文番号・金額まで読めてしまう)。関数が無い DB (0084 の前) では付けない (流し直すと付く)
+ */
+export const SALES_CHART_FUNCTIONS = Object.freeze(['ops.sku_sales_daily(bigint, date)']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -385,6 +391,9 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0083 仮 (入出庫の履歴・月別のまとめ): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (読むだけ)
   for (const f of MOVEMENT_FUNCTIONS) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of MOVEMENT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0084 仮 (販売数のグラフ): 同じ形 (関数がある DB だけ・前に付けた実行権を外してから画面のロールに付け直す)
+  for (const f of SALES_CHART_FUNCTIONS) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of SALES_CHART_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、

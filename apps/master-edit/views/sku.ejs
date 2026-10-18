@@ -597,6 +597,29 @@
         </section>
       </aside>
     </form>
+    <%# 🆕 販売数のグラフ (10/17 中原さん・参考 = 読むだけ)。グラフと表は画面の JS (public/me-sales-chart.js) が API (/api/sku/:code/sales-chart) から読んで描く。
+        単品 = セットで売れた分も入れた数 + ロジザードの在庫の線 (別のグラフ・軸を 2 つにしない) / セット = そのセットとして売れた数 (在庫の線なし) %>
+    <section class="panel moves sc" id="p-sales" aria-labelledby="h-sales" data-base="<%= base %>" data-code="<%= c.code %>" data-kind="<%= c.sku_kind %>">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-cart"/></svg></span><h2 id="h-sales">販売数のグラフ</h2><span class="sub">参考 · モールの注文の数 (注文日・キャンセルを引いた数)<%= isSet ? ' · このセットとして売れた数' : ' · セットで売れた分も入れた数' %></span></div>
+      <div class="sc-bar">
+        <div class="seg" id="sc-unit" role="group" aria-label="グラフの期間" data-value="week">
+          <button type="button" class="on" aria-pressed="true" data-v="week">週<small>52 週</small></button><button type="button" aria-pressed="false" data-v="month">月<small>24 か月</small></button><button type="button" aria-pressed="false" data-v="day">日<small>90 日</small></button>
+        </div>
+      </div>
+      <div class="hint sc-sum" id="sc-sum" aria-live="polite">読んでいます…</div>
+      <ul class="sc-legend" id="sc-legend" hidden></ul>
+      <div class="sc-chart" id="sc-chart" tabindex="0" role="group" aria-roledescription="グラフ" aria-label="販売数のグラフ (左右の矢印で期間を選ぶ)" aria-describedby="sc-sum" hidden>
+        <div class="sc-svg" id="sc-sales"></div>
+        <div class="sc-stock-h hint" id="sc-stock-h" hidden></div>
+        <div class="sc-svg" id="sc-stock"></div>
+        <div class="sc-tip" id="sc-tip" aria-hidden="true" hidden></div>
+      </div>
+      <div class="sr" id="sc-live" aria-live="polite"></div>
+      <details class="more sc-table" id="sc-table-box" hidden><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>表で見る (グラフと同じ数)</summary>
+        <div class="tblwrap"><table class="tbl mv" id="sc-tbl"><caption class="sr">販売数 (新しい順)</caption><thead id="sc-thead"></thead><tbody id="sc-rows"></tbody></table></div>
+      </details>
+      <div class="hint mv-notes" id="sc-notes">数える範囲 = Company DB に注文を入れているモール (楽天・Amazon (FBA も)・Yahoo!・その他 = au PAY・Qoo10・LINE ギフト・メルカリ)。卸・ほかの NE の店・FBA 納品は入りません = 上の「売れた数」(商品管理リスト) と少し違います · 今日は入れない (前日まで) · 注文は 2025-01 から (LINE ギフト 2026-02・Qoo10 2026-03 から) = それより前は空欄<%= isSet ? '' : ' · 在庫 = ロジザードの毎日の在庫 (その日の締め・倉庫だけ。FBA の在庫は入りません)' %></div>
+    </section>
     <%# 🆕 入出庫の履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・参考 = 読むだけ)。表は画面の JS (public/me-moves.js) が API から読んで描く。
         単品だけ (セットには在庫が無い = 構成品の画面へ・Q10 = a)。仕入・発注は発注アプリの権限がある人だけ (Q9 = a) %>
     <% if (c.sku_kind === 'single') { %>
@@ -655,6 +678,8 @@
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 入出庫の履歴と月別のまとめ (単品だけ・読むだけ) %>
   <% if (page && page.cur.sku_kind === 'single') { %><script src="<%= base %>/public/me-moves.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 販売数のグラフ (読むだけ・単品とセット) %>
+  <% if (page) { %><script src="<%= base %>/public/me-sales-chart.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0070: NE から消えた (やめる) = 押せる人・押せるときだけ %>
   <% if (page && typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %><script src="<%= base %>/public/me-gone.js?v=<%= assetV %>" defer></script><% } %>
 </body>

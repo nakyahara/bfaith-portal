@@ -1168,3 +1168,51 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 .mv-foot { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
 .mv-notes { margin-top: 8px; }
 .tbl.mv td:nth-child(2) { white-space: nowrap; }
+
+/* ---------- 販売数のグラフ (10/17 中原さん・商品の画面の下) ----------
+   色の役 (dataviz の手順・検査の道具で暗い面 #0e1626 に対して確かめた = 明るさ・彩度・色覚の差 (隣り合う組 ΔE 8.4 以上)・面との比 3:1 以上):
+   モールの 4 色は決まった順 (楽天 → Amazon → Yahoo! → その他)・在庫の線は文字の色に近い明るい灰 (別のグラフ = モールの色と並べない)・欠品は赤の帯 + 凡例の言葉。
+   画面は暗いデザインだけ (明るい画面は無い) = 暗い面の色だけを持つ */
+.sc { --sc-1: #3987e5; --sc-2: #d95926; --sc-3: #199e70; --sc-4: #c98500; --sc-stock: #cdd9f0; --sc-out: rgba(255, 112, 133, 0.16); --sc-out-line: rgba(255, 112, 133, 0.6);
+  --sc-grid: rgba(125, 170, 255, 0.10); --sc-axis: rgba(125, 170, 255, 0.32); --sc-hl: rgba(233, 238, 252, 0.07); }
+.sc-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.sc-bar .seg button { height: 32px; padding: 0 12px; }
+.sc-legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 8px 0 6px; font-size: 13px; color: var(--text2); }
+.sc-legend li { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.sc-legend b { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.sc-legend .sw { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+.sc-legend .ln { width: 16px; height: 2px; border-radius: 1px; background: var(--sc-stock); flex: none; }
+.sc-legend .sw.out { background: var(--sc-out); border: 1px solid var(--sc-out-line); }
+.sc-legend .sw.part { background: var(--sc-1); opacity: 0.45; }
+.sc .sw.sc-c1, .sc-tip .k.sc-k1 { background: var(--sc-1); } .sc .sw.sc-c2, .sc-tip .k.sc-k2 { background: var(--sc-2); }
+.sc .sw.sc-c3, .sc-tip .k.sc-k3 { background: var(--sc-3); } .sc .sw.sc-c4, .sc-tip .k.sc-k4 { background: var(--sc-4); }
+.sc-chart { position: relative; min-width: 0; border-radius: 10px; outline: none; margin-top: 4px; touch-action: pan-y; }
+.sc-chart:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+.sc-svg svg { display: block; max-width: 100%; }
+.sc svg text { font-family: var(--font); font-size: 11px; fill: var(--muted); }
+.sc svg .tick { font-variant-numeric: tabular-nums; }
+.sc svg .sc-nd { fill: var(--faint); font-size: 12px; }
+.sc svg .sc-c1 { fill: var(--sc-1); } .sc svg .sc-c2 { fill: var(--sc-2); } .sc svg .sc-c3 { fill: var(--sc-3); } .sc svg .sc-c4 { fill: var(--sc-4); }
+.sc svg .sc-partial { opacity: 0.45; }
+.sc svg .sc-out { fill: var(--sc-out); }
+.sc svg .sc-grid { stroke: var(--sc-grid); stroke-width: 1; }
+.sc svg .sc-axis { stroke: var(--sc-axis); stroke-width: 1; }
+.sc svg .sc-hl { fill: var(--sc-hl); }
+.sc svg .sc-line { fill: none; stroke: var(--sc-stock); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.sc svg .sc-dot { fill: var(--sc-stock); stroke: #0e1626; stroke-width: 2; }
+.sc-stock-h { margin: 8px 0 0; font-size: 12.5px; }
+.sc-tip { position: absolute; top: 4px; left: 0; z-index: 5; min-width: 160px; max-width: 240px; padding: 8px 10px; border-radius: 10px; background: #0b1220; border: 1px solid var(--line-strong);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5); font-size: 12.5px; color: var(--text2); pointer-events: none; line-height: 1.5; }
+.sc-tip .h { color: var(--muted); font-size: 12px; margin-bottom: 2px; }
+.sc-tip .row { display: flex; justify-content: space-between; gap: 12px; }
+.sc-tip .v { font-weight: 600; color: var(--text); font-size: 14px; }
+.sc-tip .n { font-variant-numeric: tabular-nums; color: var(--text); }
+.sc-tip .k { display: inline-block; width: 12px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }
+.sc-tip .k.ln { background: var(--sc-stock); }
+.sc-tip .k.out { background: var(--sc-out-line); }
+.sc-table { margin-top: 12px; }
+.sc-table .tblwrap { margin-top: 8px; }
+@media (forced-colors: active) {
+  .sc svg .sc-c1, .sc svg .sc-c2, .sc svg .sc-c3, .sc svg .sc-c4 { fill: CanvasText; }
+  .sc svg .sc-line { stroke: CanvasText; }
+}

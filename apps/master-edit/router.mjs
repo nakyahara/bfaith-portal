@@ -109,6 +109,8 @@ import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
 // 🆕 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・0083 仮の読むだけの関数)
 import { readMovementsPage, readMonthly } from './movements.mjs';
+// 🆕 販売数のグラフ (10/17 中原さん・0084 仮の読むだけの関数)
+import { readSalesChart } from './sales-chart.mjs';
 import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
@@ -1021,6 +1023,22 @@ router.get('/api/sku/:code/monthly', (req, res) => withPgApi(res, async (db) => 
   const out = await readMonthly(db, sku, { poAccess: canSeeBackorders(req), now: new Date(clock()) });
   res.status(out.ok ? 200 : 503).json(out);
 }));
+/**
+ * 🆕 販売数のグラフ (10/17 中原さん): 日 × モールの正味の販売数 (0084 仮の読むだけの関数) と、単品はロジザードの毎日の在庫。SQL は 1 回 (商品を引くのと合わせて 2 回)。
+ *   期限 = ルートに入ってから 8 秒 (接続の待ちも入れる・1 つの文は残りの時間まで)。過ぎた・関数が無い = 503 と言葉 (画面のほかの所は動く)。セットも出す (そのセットとして売れた数)
+ */
+export const SALES_CHART_LIMITS = { timeMs: 8e3 };
+router.get('/api/sku/:code/sales-chart', (req, res) => {
+  const deadline = Date.now() + SALES_CHART_LIMITS.timeMs;
+  return withPgApi(res, async (db0) => {
+    const db = deadlineDb(db0, deadline);
+    let sku;
+    try { sku = await movementSku(db, req.params.code); } catch (e) { if (e instanceof ListTimeoutError) return res.status(503).json({ ok: false, reason: 'timeout', error: '販売数の読み出しに時間がかかりすぎました。少し待ってから画面を開き直してください' }); throw e; }
+    if (!sku) return res.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
+    const out = await readSalesChart(db, sku, { now: clock() });
+    res.status(out.ok ? 200 : 503).json(out);
+  }, 'read', { deadline });
+});
 
 router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
   const code = String(req.query.code || '').trim();
