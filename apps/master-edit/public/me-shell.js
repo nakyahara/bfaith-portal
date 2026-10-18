@@ -377,6 +377,10 @@
       if (last && last.split('?')[0] === basePath && last.indexOf('?') > 0) back.setAttribute('href', last);
     } catch (err) { /* そのまま */ }
   }
+  /** 最後に見た一覧の URL (path + 条件)。basePath = 一覧の path。覚えていない・よその path = null (1 つの商品の画面の「前へ・次へ」= me-prevnext.js が読む) */
+  ME.lastList = function (basePath) {
+    try { var v = sessionStorage.getItem(listKeyOf(basePath)); return v && v.split('?')[0] === basePath ? v : null; } catch (err) { return null; }
+  };
 
   /* ---------- 一覧の絞り込みを送った = 読み込み中と分かるように (一覧の読み込みに時間がかかっても押せたと分かる) ---------- */
   document.addEventListener('submit', function (e) {

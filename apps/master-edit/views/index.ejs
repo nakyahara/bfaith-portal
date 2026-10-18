@@ -168,6 +168,9 @@
       const curCol = COLS[sortCol];
       const curWords = SORT_WORDS[curCol.sort] || SORT_WORDS.text;
       const supShown = colShown.has('sup');
+      // 画像の列 (10/17): 行のコード → { url, state } (list-images.mjs。キャッシュを読むだけ = 楽天の応答を待たない)
+      const imgOf = locals.imgOf || (() => ({ url: null, state: 'none' }));
+      const IMG_WORDS = locals.IMAGE_STATE_WORDS || {};
     %>
     <div class="panel">
       <div class="tbl-top" id="tbl-top">
@@ -201,6 +204,8 @@
           </div>
         </div>
       </div>
+      <%# 画像の列の「画像なし」の印 (この画面だけで使う = 共通の _header の印の束に足さない) %>
+      <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="M4 18l5.5-5.5 4 4 2.5-2.5 4 4"/></symbol></svg>
       <div class="tblwrap" id="tblwrap">
         <table class="tbl click<%= supShown ? ' show-sup' : '' %>" id="list-tbl">
           <caption class="sr">商品・セットの一覧 (<%= data.total %> 件・並び: <%= curCol.label %> <%= curWords[sortDesc ? 1 : 0] %>)</caption>
@@ -229,6 +234,7 @@
               profit: { title: '1 個あたりの参考の利益 = 売価 − 手数料 (売価の ' + Math.round(PF.PLATFORM_FEE_RATES.standard * 1000) / 10 + '%) − 原価 × (1 + 税率) − 送料 (自社の計算用)。モールごとの手数料・送料の違いは入れていません' },
               stock: { sub: stSub, cls: refCls(st), title: stTitle },
               sup: { title: '代表の仕入先 (セットは構成品の仕入先)' },
+              maker: { title: 'メーカー (Company DB だけの値・セットは構成品のメーカー)' },
               fba: { sub: fbSub, cls: refCls(fb), title: fbTitle },
               sold: { sub: saSub, cls: refCls(sa), title: saTitle },
               po: { sub: !bo || !bo.ok ? '読めない' : '発注', cls: !bo || !bo.ok ? ' bad' : '', title: !bo || !bo.ok ? '発注アプリの台帳を読めない' : '発注アプリの注文残 (発注したがまだ入庫していない数)' },
@@ -250,6 +256,7 @@
               <% if (bk) { %><td class="c-chk" data-col="chk"><label class="chkcell"><input type="checkbox" class="ck rowck" data-code="<%= r.code %>" data-kind="<%= r.kind %>" data-state="<%= r.state %>" aria-label="<%= r.code %> を選ぶ"></label></td><% } %>
               <% for (const id of colOrder) { const hide = colShown.has(id) ? '' : ' hidden'; %>
               <% if (id === 'code') { %><td class="c-code" data-col="code"><span class="codecell"><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a><button type="button" class="copybtn" data-copy="<%= r.code %>" aria-label="商品コード <%= r.code %> をコピー" title="コピー"><svg class="ic s" aria-hidden="true"><use href="#i-copy"/></svg></button></span></td>
+              <% } else if (id === 'img') { const im = imgOf(r.code); %><td class="c-img" data-col="img"<%= hide %>><% if (im.url) { %><span class="thumb"><img src="<%= im.url %>" alt="<%= r.name %>" width="52" height="52" loading="lazy" decoding="async" referrerpolicy="no-referrer"></span><% } else { %><span class="thumb none <%= im.state %>" title="<%= IMG_WORDS[im.state] || '' %>"><svg class="ic" aria-hidden="true"><use href="#i-image"/></svg><% if (im.state === 'pending') { %><span class="tw" aria-hidden="true">取得中</span><% } %><span class="sr"><%= IMG_WORDS[im.state] || '画像なし' %></span></span><% } %></td>
               <% } else if (id === 'name') { %><td data-col="name"<%= hide %>><span class="nm"><%= r.name %></span><% if (isSet) { %><% } else if (r.kind === 'exception') { %><span class="sub">例外の SKU (NE に無い)</span><% } else { %><span class="sub sup-sub"><%= r.primary_supplier ? '仕入先 ' + r.primary_supplier : '代表の仕入先なし' %></span><% } %></td>
               <% } else if (id === 'kind') { %><td data-col="kind"<%= hide %>><% if (isSet) { %><span class="b info kind">セット</span><span class="sub kindn" title="構成品の数"><svg class="ic s" aria-hidden="true" style="vertical-align:-2px"><use href="#i-box"/></svg> <%= r.comp_count %> 品</span><% } else if (r.kind === 'exception') { %><span class="b warn kind">例外</span><% } else { %><span class="b mute kind">単品</span><% } %></td>
               <% } else if (id === 'state') { %><td data-col="state"<%= hide %>>
@@ -265,6 +272,7 @@
               <% } else if (id === 'sales_class') { %><td data-col="sales_class"<%= hide %>><% if (r.sales_class == null) { %><% if (r.kind !== 'exception') { %><span class="b warn">未入力</span><% } %><% } else { %><%= SALES[r.sales_class] || r.sales_class %><% if (r.sales_derived) { %><span class="fx">計算</span><% } %><% } %></td>
               <% } else if (id === 'stock') { %><td class="n ref" data-col="stock"<%= hide %>><% if (isSet) { %><% if (r.buildable != null) { %><span title="構成品の在庫から作れる数 (参考)"><%= r.buildable.toLocaleString('ja-JP') %></span><span class="fx">作れる</span><% } %><% } else if (r.stock != null) { %><%= r.stock ? r.stock.toLocaleString('ja-JP') : '0' %><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'sup') { %><td data-col="sup"<%= hide %>><% if (isSet) { %><span class="muted" title="セットの仕入先は構成品の仕入先">構成品から</span><% } else if (r.primary_supplier) { %><span class="supc mono"><%= r.primary_supplier %></span> <%= r.primary_supplier_name || '' %><% } else { %><span class="muted"<%- r.kind === 'exception' ? '' : ' title="代表の仕入先なし"' %>>—</span><% } %></td>
+              <% } else if (id === 'maker') { %><td data-col="maker"<%= hide %>><% if (isSet) { %><span class="muted" title="セットのメーカーは構成品のメーカー">構成品から</span><% } else if (r.maker) { %><%= r.maker %><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'fba') { %><td class="n ref" data-col="fba"<%= hide %>><% if (r.fba != null) { %><%= r.fba.toLocaleString('ja-JP') %><% if (!r.fba_row) { %><span class="fx" title="その日の FBA のレポートに、この SKU 1 個だけの出品の行が無い (販売可能 0 と数える)">出品なし</span><% } %><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'sold') { %><td class="n ref" data-col="sales"<%= hide %>><% const sq = r.sales; if (sq && !sq.missing && !isSet) { %><span title="7 日 <%= sq.d7.toLocaleString('ja-JP') %> (FBA <%= sq.d7fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d7other.toLocaleString('ja-JP') %>) / 30 日 <%= sq.d30.toLocaleString('ja-JP') %> (FBA <%= sq.d30fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d30other.toLocaleString('ja-JP') %>)"><%= sq.d7.toLocaleString('ja-JP') %> / <%= sq.d30.toLocaleString('ja-JP') %></span><% } else if (sq && isSet) { %><span class="muted" title="セットで売れた分は構成品の数に入る (商品管理リスト・発注アプリと同じ数え方)">—</span><% } else if (sq) { %><span class="muted" title="商品管理リストに無い商品 (NE にまだ無いなど)">—</span><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'po') { %><td class="n ref" data-col="po"<%= hide %>><% if (r.backorder) { %><%= r.backorder.toLocaleString('ja-JP') %><% } else if (r.backorder == null) { %><span class="muted">—</span><% } %></td>

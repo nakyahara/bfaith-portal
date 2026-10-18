@@ -22,6 +22,7 @@ import { COMPANY_ID, jstDate, MasterWriteError } from '../../lib/master-write.mj
 import { sellerSkuIn, AMAZON_JP_SHOP_CODE } from '../../lib/amazon-map-write.mjs';
 import { foldSearch } from './search-fold.mjs';
 import { readFbaDay, FBA_SOURCE } from './fba-stock.mjs';
+import { buildUnlinkedCsv, unlinkedCsvFileName } from './list-csv.mjs';
 
 export const UNLINKED_PAGE = 100;
 export const SOLD_LOOKBACK_DAYS = 365;
@@ -119,8 +120,9 @@ export function sortUnlinked(rows, sort) {
  * 「まだつないでいない Amazon の SKU」。filters = normalizeUnlinkedFilters の形。
  * 戻り値 = { state: 'ok', load, stale, rows (このページ), total (絞り込みの後), offset, limit, filters, counts: { report (FBA の行), linked, unlinked, hidden }, sold: { ok, since }, fba: readFbaDay の答え }
  *   / { state: 'unreadable', reason, message, filters }
+ *   all = true (CSV・10/17): ページに分けず、絞った全部の行 (FBA の在庫も全部の行の分)
  */
-export async function listUnlinked(db, filters, { nowMs = Date.now() } = {}) {
+export async function listUnlinked(db, filters, { nowMs = Date.now(), all: wantAll = false } = {}) {
   const head = await readReportLoad(db, { nowMs });
   if (head.state !== 'ok') return { ...head, filters };
   const today = jstDate(new Date(nowMs));
@@ -167,7 +169,7 @@ export async function listUnlinked(db, filters, { nowMs = Date.now() } = {}) {
   if (!sold.ok && filters.sort === 'sold_desc') filters = { ...filters, sort: 'open_desc' };
   sortUnlinked(rows, filters.sort);
   const total = rows.length;
-  const page = rows.slice(filters.offset, filters.offset + UNLINKED_PAGE);
+  const page = wantAll ? rows : rows.slice(filters.offset, filters.offset + UNLINKED_PAGE);
   // FBA の在庫 (販売可能・このページの FBA の行だけ)。出品 SKU (source_code) の正規化で結ぶ = 構成が無くても数は出る
   const fba = await readFbaDay(db, { now: nowMs });
   if (fba.ok) {
@@ -224,6 +226,7 @@ export async function setHidden(db, { actor, ...input }) {
 /**
  * 画面の道 (apps/master-edit/router.mjs から呼ぶ・router の中の部品を h で受け取る = router.mjs の変更を小さく)。
  *   GET  /amazon/unlinked               まだつないでいない Amazon の SKU (読むだけ)
+ *   GET  /amazon/unlinked.csv           同じ絞り込みのまま全部を CSV で (10/17・読むだけ)
  *   POST /api/amazon/unlinked/hide      隠す / 元に戻す { seller_sku, hide, reason?, note? } (名簿 MASTER_EDITORS の人・この画面だけのロール)
  * h = { withPgPage, withPgApi, pageLocals, editorGate, view, readPhaseView, clock }
  */
@@ -237,7 +240,23 @@ export function registerAmazonUnlinkedRoutes(router, h) {
     res.render(h.view('amazon-unlinked.ejs'), {
       ...locals, nav: 'amazon', dbError, data, filters: data && data.filters ? data.filters : filters,
       canHide: locals.canEdit && !dbError, HIDE_REASONS, LISTING_STATUS_WORDS, SORTS, SOLD_LOOKBACK_DAYS, NOTE_MAX,
+      // その場で登録 (10/17) = 保存できる人・保存を開いているときだけ (保存は POST /api/amazon/save = lib の門が確かめ直す)
+      inline: locals.canEdit && !locals.amazonClosed && !dbError, ...(h.inlineLocals || {}),
     });
+  }));
+  // 🆕 10/17 中原さん「未登録一覧の CSV ダウンロード」: 今の絞り込み (?q=&st=&from=&to=&sort=&hidden=) のまま、ページに分けずに全部 (読むだけ・見られる人 = この画面と同じ)
+  router.get('/amazon/unlinked.csv', (req, res) => h.withPgPage(req, res, async (db, dbError) => {
+    const text = (status, msg) => res.status(status).type('text/plain; charset=utf-8').send(msg);
+    if (!db) return text(503, dbError || 'Company DB につながりません');
+    const nowMs = h.clock();
+    const filters = normalizeUnlinkedFilters(req.query, { today: jstDate(new Date(nowMs)) });
+    const data = await listUnlinked(db, { ...filters, offset: 0 }, { nowMs, all: true });
+    if (data.state !== 'ok') return text(503, `${data.message}。CSV を出せません (0 件ではありません)`);
+    const name = unlinkedCsvFileName(nowMs);
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+    res.set('Cache-Control', 'no-store');
+    res.send(buildUnlinkedCsv(data, { statusWords: LISTING_STATUS_WORDS, hideReasons: HIDE_REASONS }));
   }));
   router.post('/api/amazon/unlinked/hide', (req, res) => {
     const gate = h.editorGate(req);

@@ -88,6 +88,15 @@ button.kindcard { font: inherit; cursor: pointer; width: 100%; }
 .oldbox { border: 1px solid rgba(255, 200, 87, 0.5); border-radius: 12px; padding: 14px; background: rgba(255, 200, 87, 0.05); margin-bottom: 14px; }
 .oldbox .ot { font-weight: 700; display: flex; gap: 8px; align-items: center; font-size: 15px; }
 .oldbox .ot .ic { color: var(--warn); }
+/* 🆕 2026-10-17: 商品名から仮に入れた名前 (人が直すと外れる)・確かめたのチェック (押す所 44px) */
+.opttbl td.oldname { color: var(--muted); font-size: 12.5px; min-width: 140px; }
+.opttbl td.oldnm { white-space: nowrap; }
+.opttbl td.oldnm .in { width: calc(100% - 32px); }
+.opttbl td.oldnm .gtag { margin-left: 4px; }
+.opttbl .in.guess { border-style: dashed; border-color: rgba(255, 200, 87, 0.7); }
+.oldbox .oldok { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; margin-top: 8px; cursor: pointer; font-size: 14px; }
+.oldbox .oldok input { width: 18px; height: 18px; }
+.oldbox .oldok[hidden] { display: none; }
 .nextbox { border: 1px dashed rgba(139, 155, 255, 0.75); background: var(--vio-bg); border-radius: 12px; padding: 12px 14px; margin-top: 12px; }
 .nextbox .nt { font-weight: 700; color: #d3d9ff; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .nextbox .nt .right { margin-left: auto; }

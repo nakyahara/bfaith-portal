@@ -24,6 +24,7 @@ import { hasRegisteredOn, parseNeCreationDate, REGISTERED_ON_SOURCES } from '../
 import { normalizeSort, sortColumnOf } from './list-columns.mjs';
 import { masterProfit } from '../../lib/profit-estimate.js';
 import { readNeSpellings, exportCode } from './ne-spelling.mjs';
+import { makerNamesOf } from '../../lib/master-maker.mjs';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
 export async function selectableSuppliers(db) {
@@ -460,6 +461,11 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     };
   });
   tick();
+  // 🆕 0084: メーカー (単品の商品の行だけ・一覧の「メーカー」の列と CSV の最後の列)。表が無い・読めない = 空
+  {
+    const names = await makerNamesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
+    for (const r of pageRows) r.maker = (r.kind === 'single' && r.product_id && names.get(r.product_id)) || null;
+  }
   // JAN (CSV だけ = 画面の一覧には出さない)。商品ごと・今の JAN (終わっていない) を並べる
   if (mode === 'all') {
     const pids = [...new Set(pageRows.map((r) => r.product_id).filter(Boolean))];
@@ -494,6 +500,24 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   tick();
   return { rows: pageRows, total: matched.length, offset: f.offset, limit: LIST_LIMIT, filters: f, latestRun: run, diffAvailable, notFound, multiCut, registeredOnAvailable: hasRegOn,
     cancelledHidden: hasReg && !f.reg && !f.codes };
+}
+
+/**
+ * 1 つの商品の画面の「← 前へ」「次へ →」(10/17 中原さん): 来た一覧 (同じ絞り込み・詳細検索・印 ?s=・並び) の中で、この商品の前と次の商品。
+ * 一覧と同じ listSkus の 'codes' (絞った全件のコードだけ・一覧と同じ並び = 既定のコード順・同じ値はコード順・JS で並べる列も同じ) を読み、その中の場所を探す。
+ * 中身 (② の読み) は読まない = 軽い。ページ分け (offset) は見ない。
+ * 戻り値: { ok: true, total, pos (1 から・一覧に無い = null), prev, next (コード・端 = null), offset (この商品が載る一覧のページの offset・無い = null) } /
+ *   { ok: false, reason: 'too_many', total, atLeast } (件数の上限を超える = ボタンを出さない)
+ */
+export async function listNeighbors(db, filters, code, opts = {}) {
+  const data = await listSkus(db, filters, { ...opts, mode: 'codes' });
+  if (data.tooMany) return { ok: false, reason: 'too_many', total: data.total, atLeast: !!data.atLeast };
+  const codes = data.codes;
+  // 画面が送るのは DB のコードそのもの。打ち方が違う (大文字・全角) ときは正規化して探す
+  let i = codes.indexOf(String(code ?? ''));
+  if (i < 0) { const k = normSku(code); i = k ? codes.findIndex((c) => normSku(c) === k) : -1; }
+  if (i < 0) return { ok: true, total: codes.length, pos: null, prev: null, next: null, offset: null };
+  return { ok: true, total: codes.length, pos: i + 1, prev: i > 0 ? codes[i - 1] : null, next: i + 1 < codes.length ? codes[i + 1] : null, offset: Math.floor(i / LIST_LIMIT) * LIST_LIMIT };
 }
 
 /**

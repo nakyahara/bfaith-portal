@@ -12,6 +12,9 @@
  *     どちらでもない項目があるうちは保存を押せない (あと N つに数える)。並び = ① 必須 → ② NE 登録の CSV までに要る → ③ 出品カードに要る → ④ そのほか。
  *     入力なしにした項目は「なし」の印。送る本文の blanks = 入力なしにした項目 (サーバー = lib/master-register-blanks.mjs が同じ決まりでもう一度確かめる)。
  *     カードを作らない = カードの欄 (Yahoo! も) は数えない・送らない。発注の設定は欄が出る (書ける) ときだけ (public/me-order.js の items)
+ *   🆕 2026-10-17 中原さん: 「セット商品を作るか」= 作る のときは「作るセット」(個数・セット商品コード・セット商品名) を 1 つ以上 (③ に数える)。
+ *     コード = 単品のコード-個数・名前 = 単品の名前 個数個セット を初めに入れる (直すまでは単品のコード・名前に付いていく)。決まり = lib/set-plan.mjs (サーバーも同じ)。
+ *     コードは打つとその場で確かめる (/api/set-code-check = Company DB・NE・product-hub)。送る = card.sets (作る かつ カードを作るときだけ)
  */
 (function () {
   'use strict';
@@ -42,6 +45,7 @@
   function valueOf(el) {
     if (el.id === 'comp') return JSON.stringify(components());
     if (el.id === 'refs') return JSON.stringify(refUrls());
+    if (el.id === 'set-plans') return JSON.stringify(setPlanRows().map(function (r) { return [r.qty, r.code, r.name]; }));
     if (el.classList.contains('seg')) return el.getAttribute('data-value') || '';
     if (el.type === 'checkbox') return el.checked ? '1' : '';
     return el.value;
@@ -56,8 +60,10 @@
     var v = valueOf(el);
     if (el.id === 'comp') { var rows = components(); return rows.length ? rows.map(function (r) { return r.code + '×' + r.qty; }).join(', ') : 'なし'; }
     if (el.id === 'refs') return refUrls().length + ' 個';
+    if (el.id === 'set-plans') { var sp = setPlanRows(); return sp.length ? sp.map(function (r) { return r.code + ' (' + r.qty + '個)'; }).join(', ') : 'なし'; }
     if (el.classList.contains('seg')) return segText(el, v);
     if (el.tagName === 'SELECT') { var o = $$('option', el).filter(function (x) { return x.value === v; })[0]; return o ? o.textContent.trim() : v; }
+    if (el.id === 'f-maker' && ME.maker) return ME.maker.label(v);   // 🆕 0084: 名簿の番号 → 名前
     return v === '' ? '(空)' : v;
   }
 
@@ -144,8 +150,16 @@
     // 発送方法 = 出品カードの楽天の配送方法にも使う (届いてサイズを見てから = 入力なし・商品の画面で入れる)。カードを作らないときは ④
     opt('shipping_code', 'sec-ship', '発送方法 (届いてからでも可)', document.getElementById('shipping') ? '#shipping' : '[data-row="shipping_code"] .nonechk input', card ? 3 : 4);
     if (!isSet && card) opt('card.set_decision', 'sec-card', 'セット商品を作るか', '#set-plan button', 3);
+    // 🆕 2026-10-17: 「作る」= 作るセットが 1 つ以上・全部の行の形が正しい (サーバーの確かめで「使えない」と分かった行も直すまで止める。確かめ中・確かめられない = 保存のときにサーバーがもう一度)
+    if (!isSet && card && segVal('set-plan') === 'create') {
+      var spc = setPlanCheck();
+      list.push({ id: 'card.sets', sec: 'sec-card', t: spc.rows === 0 ? '作るセット (個数・コード・名前を 1 つ以上)' : spc.bad ? '作るセットを直す (' + spc.bad + ' 行)' : '作るセット (' + spc.rows + ' 個)',
+        ok: spc.rows > 0 && spc.bad === 0, focus: spc.firstBad || '#set-plan-add', level: 3 });
+    }
     // ④ そのほか (画面の上からの順)
     if (isSet) opt('exception_cost', 'sec-comp', '例外原価 (入力なし = 構成品の合計)', '#xcost-jpy', 4);
+    // 🆕 0084: メーカー (代表の仕入先のすぐ下・値 = 名簿から選んだ = 打っただけでは値でない)。欄がある (0084 がある DB) ときだけ
+    if (!isSet) opt('maker', 'sec-tax', 'メーカー (一覧から選ぶ)', '#f-maker-in', 4);
     if (!isSet && ME.orderSettings && ME.orderSettings.items) {
       ME.orderSettings.items().forEach(function (x) { list.push({ id: x.key, sec: 'sec-order', t: x.t, ok: x.ok, none: x.none, focus: x.focus, level: 4, opt: true }); });
     }
@@ -434,7 +448,7 @@
   /** カードの欄に値が残っているか (カードを作らないときも送る = 形が違えば保存で断られる) */
   function filled(boxSel) {
     var box = $(boxSel); if (!box) return false;
-    return $$('input, select, textarea', box).some(function (el) { return el.type !== 'checkbox' && el.type !== 'radio' && el.type !== 'file' && el.value.trim() !== ''; })
+    return $$('input, select, textarea', box).some(function (el) { return el.type !== 'checkbox' && el.type !== 'radio' && el.type !== 'file' && el.value.trim() !== '' && !el.closest('#row-set-plans'); })
       || $$('.seg', box).some(function (sg) { return !!sg.getAttribute('data-value'); });
   }
   /** カードの欄・Yahoo! の欄に値が残っているか (DOM から全部見る = 漏れが無い・#1628 Codex R4 M2)。カードを作らないときも送る = 形が違えば保存で断られる */
@@ -456,8 +470,148 @@
     // 作らない理由・メモは「作らない / 保留」なら出す (カードを作らないときも、値は送って確かめる = 直せるように・#1628 Codex R3 M2)
     var rr = $('#row-set-reason'); if (rr) rr.hidden = !(plan === 'none' || plan === 'hold');
     var sr = $('#set-reason'); if (sr) sr.disabled = !canSave || plan !== 'none';
+    // 🆕 作るセット: 「作る」かつカードを作るときだけ出す (行を足すのは「作る」を押したとき = 全部外したら 0 行のまま ③ で止める)
+    var sp = $('#row-set-plans');
+    if (sp) sp.hidden = !(plan === 'create' && on);
   }
-  ['card-create', 'set-plan'].forEach(function (id) { var e = document.getElementById(id); if (e) e.addEventListener('change', function () { cardShow(); update(); }); });
+  /* ---------- 🆕 作るセット (「作る」のときの個数・セット商品コード・セット商品名・lib/set-plan.mjs と同じ決まり) ---------- */
+  var spRowEl = $('#row-set-plans');
+  var SP_MAX = spRowEl ? Number(spRowEl.getAttribute('data-max')) || 10 : 10;
+  var SP_MIN = spRowEl ? Number(spRowEl.getAttribute('data-qty-min')) || 2 : 2;
+  var SP_QMAX = spRowEl ? Number(spRowEl.getAttribute('data-qty-max')) || 99 : 99;
+  var SP_NMAX = spRowEl ? Number(spRowEl.getAttribute('data-name-max')) || 255 : 255;
+  /** 初めのコード・名前 (lib/set-plan.mjs の defaultSetCode / defaultSetName と同じ = 名前は半角の空白 1 つ・2026-10-17 中原さん) */
+  function spDefCode(q) { return $('#code').value.trim() + '-' + q; }
+  function spDefName(q) { return (val('f-name') + ' ' + q + '個セット').trim(); }
+  function spQty(v) { var t = half(v).trim(); if (!/^\d{1,2}$/.test(t)) return null; var n = Number(t); return n >= SP_MIN && n <= SP_QMAX ? n : null; }
+  /** 行 → { tr, qty (数か null), qtyRaw, code, name } (入れた順) */
+  function setPlanRows() {
+    return $$('#set-plan-rows tr.sp-row').map(function (tr) { var raw = $('.sp-qty', tr).value; return { tr: tr, qty: spQty(raw), qtyRaw: raw.trim(), code: $('.sp-code', tr).value, name: $('.sp-name', tr).value.trim() }; });
+  }
+  var spChecks = new Map();   // 行 → サーバーの確かめ { key (セットのコード + 単品のコード), ok (true / false / null = 確かめられない), message }
+  /** 確かめの答えの鍵 = セットのコードと単品のコードの組 (単品のコードで答えが変わる = 単品と同じコード・Codex R3 Medium 4) */
+  function spKey(code) { return code + '|' + $('#code').value.trim(); }
+  /** 行ごとの形の一言 (問題が無ければ '')。重なり = 上の行と同じ個数・同じコード (大文字小文字は同じと見る・後の行に印 = サーバーと同じ)・単品のコードと同じ */
+  function spProblem(r, rows) {
+    if (r.qty == null) return '個数は ' + SP_MIN + '〜' + SP_QMAX + ' の整数';
+    if (rows.slice(0, rows.indexOf(r)).some(function (x) { return x.qty === r.qty; })) return r.qty + '個セットが 2 行あります';
+    var shape = codeShape(r.code);
+    if (shape) return shape.replace(/^商品コード/, 'セット商品コード');
+    if (r.code.toLowerCase() === $('#code').value.trim().toLowerCase()) return 'セット商品コードが単品のコードと同じです';
+    if (rows.slice(0, rows.indexOf(r)).some(function (x) { return x.code.toLowerCase() === r.code.toLowerCase(); })) return 'セット商品コードが 2 行あります';
+    if (!r.name) return 'セット商品名を入れてください';
+    if (r.name.length > SP_NMAX) return 'セット商品名は ' + SP_NMAX + ' 字まで';
+    var c = spChecks.get(r.tr);
+    if (c && c.key === spKey(r.code) && c.ok === false) return c.message || '使えないコードです';
+    return '';
+  }
+  /** 数える答え { rows, bad, firstBad (直す欄のセレクタ) } と、行ごとの一言を出す */
+  function setPlanCheck() {
+    var rows = setPlanRows(); var bad = 0; var firstBad = null;
+    rows.forEach(function (r, i) {
+      var prob = spProblem(r, rows);
+      var m = $('.sp-msg', r.tr);
+      var c = spChecks.get(r.tr);
+      var t = prob || (c && c.key === spKey(r.code) ? (c.ok ? '使えます' : c.ok === null ? (c.message || 'いまは確かめられません (保存のときにもう一度)') : '') : r.code ? '確かめています…' : '');
+      var cls = prob ? 'err' : c && c.key === spKey(r.code) && c.ok ? 'ok' : c && c.key === spKey(r.code) && c.ok === null ? 'warn' : 'info';
+      if (m && (m.textContent !== t || m.className !== 'fmsg sp-msg ' + cls)) { m.textContent = t; m.className = 'fmsg sp-msg ' + cls; }
+      if (prob) { bad++; if (!firstBad) firstBad = '#set-plan-rows tr.sp-row:nth-child(' + (i + 1) + ') ' + (/個数|個セット/.test(prob) ? '.sp-qty' : /名/.test(prob) ? '.sp-name' : '.sp-code'); }
+    });
+    return { rows: rows.length, bad: bad, firstBad: firstBad };
+  }
+  var spSeq = 0;
+  /** サーバーで確かめる (打った後・少し待って)。答えはそのコードのときだけ使う */
+  function spCheckLater(tr) {
+    clearTimeout(tr.__spTimer);
+    var code = $('.sp-code', tr).value;
+    if (codeShape(code)) { spChecks.delete(tr); return; }
+    var key = spKey(code);
+    tr.__spTimer = setTimeout(function () {
+      var my = ++spSeq; tr.__spSeq = my;
+      fetch(BASE + '/api/set-code-check?code=' + encodeURIComponent(code) + '&parent=' + encodeURIComponent($('#code').value.trim()) + '&request_id=' + encodeURIComponent(requestId), { headers: { Accept: 'application/json' } })
+        .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
+        .then(function (x) {
+          if (tr.__spSeq !== my || !tr.isConnected || spKey($('.sp-code', tr).value) !== key) return;   // 打ち直した (単品のコードも) = 古い答えは使わない
+          if (x.r.ok && x.j.ok) spChecks.set(tr, { key: key, ok: true });
+          else if (x.r.status === 200 || x.r.status === 400) spChecks.set(tr, { key: key, ok: false, message: x.j.message || x.j.error || '使えません' });
+          else spChecks.set(tr, { key: key, ok: null, message: 'いまは確かめられません (保存のときにもう一度確かめます)' });
+          update();
+        })
+        .catch(function () { if (tr.__spSeq === my) { spChecks.set(tr, { key: key, ok: null, message: '確かめられません (通信)。保存のときにもう一度確かめます' }); update(); } });
+    }, 450);
+  }
+  /** 行の初めの値 (直していない欄 = data-auto) を単品のコード・名前・個数に合わせる */
+  function spFollow(tr) {
+    var q = spQty($('.sp-qty', tr).value);
+    if (q == null) return;
+    var c = $('.sp-code', tr), n = $('.sp-name', tr);
+    if (c.getAttribute('data-auto') === '1' && c.value !== spDefCode(q)) { c.value = spDefCode(q); spCheckLater(tr); }
+    if (n.getAttribute('data-auto') === '1') n.value = spDefName(q);
+  }
+  function spRelabel() {
+    $$('#set-plan-rows tr.sp-row').forEach(function (tr, i) {
+      var who = (i + 1) + ' 行目の';
+      $('.sp-qty', tr).setAttribute('aria-label', who + '個数'); $('.sp-code', tr).setAttribute('aria-label', who + 'セット商品コード');
+      $('.sp-name', tr).setAttribute('aria-label', who + 'セット商品名'); $('[data-sp-del]', tr).setAttribute('aria-label', (i + 1) + ' 行目のセットを外す');
+    });
+  }
+  /** 行を足す (個数 = 次の空いている数)。初めのコード・名前は直すまで単品に付いていく */
+  function addSetPlanRow(qty) {
+    var tpl = $('#set-plan-tpl'); if (!tpl) return null;
+    var used = setPlanRows().map(function (r) { return r.qty; });
+    // 個数 = 決まりの中 (2〜99) で使っていない数 (望みの数から上へ・無ければ下から = Codex R2 Low)
+    var free = function (n) { return n >= SP_MIN && n <= SP_QMAX && used.indexOf(n) < 0; };
+    var q = qty; while (!free(q) && q < SP_QMAX) q++;
+    if (!free(q)) { q = SP_MIN; while (!free(q) && q < SP_QMAX) q++; }
+    var tr = tpl.content.firstElementChild.cloneNode(true);
+    $('.sp-qty', tr).value = String(q);
+    $('.sp-code', tr).setAttribute('data-auto', '1'); $('.sp-name', tr).setAttribute('data-auto', '1');
+    $('#set-plan-rows').appendChild(tr);
+    spFollow(tr); spRelabel();
+    if (!$('.sp-code', tr).value.trim() || codeShape($('.sp-code', tr).value)) spChecks.delete(tr);
+    return tr;
+  }
+  var spRowsEl = $('#set-plan-rows');
+  if (spRowsEl && canSave) {
+    spRowsEl.addEventListener('input', function (e) {
+      var tr = e.target.closest('tr.sp-row'); if (!tr) return;
+      if (e.target.classList.contains('sp-qty')) spFollow(tr);
+      if (e.target.classList.contains('sp-code')) { e.target.setAttribute('data-auto', e.target.value === '' ? '1' : '0'); spChecks.delete(tr); spCheckLater(tr); }
+      if (e.target.classList.contains('sp-name')) e.target.setAttribute('data-auto', e.target.value === '' ? '1' : '0');
+    });
+    spRowsEl.addEventListener('click', function (e) {
+      var b = e.target.closest('[data-sp-del]'); if (!b || b.disabled) return;
+      var tr = b.closest('tr.sp-row'); var next = tr.nextElementSibling || tr.previousElementSibling;
+      clearTimeout(tr.__spTimer); spChecks.delete(tr); tr.remove(); spRelabel();
+      if (next) $('.sp-qty', next).focus(); else { var add = $('#set-plan-add'); if (add) add.focus(); }
+      update();
+    });
+  }
+  var spAdd = $('#set-plan-add');
+  if (spAdd && canSave) spAdd.addEventListener('click', function () {
+    if ($$('#set-plan-rows tr.sp-row').length >= SP_MAX) { ME.toast('作るセットは ' + SP_MAX + ' 個までです'); return; }
+    var used = setPlanRows().map(function (r) { return r.qty || 0; });
+    var tr = addSetPlanRow(Math.max(SP_MIN, (used.length ? Math.max.apply(null, used) : SP_MIN - 1) + 1));
+    if (tr) $('.sp-qty', tr).focus();
+    update();
+  });
+  // 単品のコード・名前を打ったら、直していない行の初めの値も付いていく
+  // 単品のコードを打ち直したら、直したコードの行も確かめ直す (答えは単品のコードとの組)
+  ['code', 'f-name'].forEach(function (id) {
+    var e = document.getElementById(id);
+    if (e) e.addEventListener('input', function () {
+      $$('#set-plan-rows tr.sp-row').forEach(function (tr) { var before = $('.sp-code', tr).value; spFollow(tr); if (id === 'code' && $('.sp-code', tr).value === before) spCheckLater(tr); });
+    });
+  });
+
+  ['card-create', 'set-plan'].forEach(function (id) {
+    var e = document.getElementById(id);
+    if (e) e.addEventListener('change', function () {
+      // 「作る」にした (かカードを作るに戻した) とき、作るセットが 1 行も無ければ 2個セットを 1 行 (初めの値)
+      if (segVal('set-plan') === 'create' && cardOn() && canSave && !saved && !$$('#set-plan-rows tr.sp-row').length) addSetPlanRow(SP_MIN);
+      cardShow(); update();
+    });
+  });
   // カードを作らないときに欄を空にしていったら、全部空になった時点で畳む (打っている途中では畳まない = 欄を離れたとき)
   var cardFieldsEl = $('#card-fields'); if (cardFieldsEl) cardFieldsEl.addEventListener('focusout', function () { setTimeout(cardShow, 0); });
   var yahooEl = $('#sec-yahoo'); if (yahooEl) { yahooEl.addEventListener('focusout', function () { setTimeout(cardShow, 0); }); yahooEl.addEventListener('change', cardShow); }
@@ -511,7 +665,7 @@
   function collect() {
     var values = {};
     var keys = isSet ? ['name', 'standard_price', 'shipping_code', 'reorder_months', 'handling_own', 'set_sales_class_override']
-      : ['name', 'standard_price', 'shipping_code', 'tax_rate', 'sales_class', 'primary_supplier', 'reorder_months', 'expiry_managed', 'inbound_date_managed'];
+      : ['name', 'standard_price', 'shipping_code', 'tax_rate', 'sales_class', 'primary_supplier', 'reorder_months', 'expiry_managed', 'inbound_date_managed', 'maker'];   // maker = 🆕 0084 (隠した欄 = 名簿の番号・欄が無い = 送らない)
     keys.forEach(function (k) { var v = fieldValue(k); if (v !== undefined && v !== '') values[k] = v; });
     if (isSet) {
       values.components = components();
@@ -527,6 +681,8 @@
     if (!isSet) {
       var plan = segVal('set-plan');
       if (plan) card.set_decision = { decision: plan, reason_code: plan === 'none' ? val('set-reason') : '', reason_text: val('set-text') };
+      // 🆕 作るセット (作る かつ カードを作るときだけ・1 つ以上 = 新しい画面は必ず送る)。個数は数・コードは打ったとおり・名前は前後の空白を落とす
+      if (plan === 'create' && cardOn()) card.sets = setPlanRows().map(function (r) { return { qty: r.qty == null ? r.qtyRaw : r.qty, code: r.code, name: r.name }; });
     }
     // 🆕 2026-10-13: 入力なしにした項目 (サーバーが「値か入力なし」をもう一度確かめる・登録の記録 (理由) に残す)
     var out = { request_id: requestId, kind: P.kind, code: $('#code').value, reason: val('reason'), values: values, card: card, blanks: blanks() };
@@ -544,7 +700,7 @@
    * サーバーの誤りの項目 → 直す欄 (1 つの行に欄が 2 つある Yahoo! など。#1628 Codex R5 L1)。
    * ここに無い項目は data-row の行の最初の欄
    */
-  var FIELD_INPUT = { logizard_barcode: '#f-lzbc-in', 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path', reason: '#reason' };
+  var FIELD_INPUT = { logizard_barcode: '#f-lzbc-in', maker: '#f-maker-in', 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path', reason: '#reason' };
   function showError(j, status) {
     var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
     if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) h += '<ul>' + j.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>';
@@ -557,6 +713,13 @@
       // セット判断の誤りで「作らない / 保留」を選んでいる = 直すのは理由・メモの欄
       var plan0 = segVal('set-plan');
       if (j.field === 'card.set_decision' && (plan0 === 'none' || plan0 === 'hold') && $('#row-set-reason')) { row = $('#row-set-reason'); row.hidden = false; }
+      // 作るセットの誤り = その行のコードの欄 (何行目か = j.index)
+      if (j.field === 'card.sets' && $('#row-set-plans')) {
+        row = $('#row-set-plans'); row.hidden = false;
+        var spTr = typeof j.index === 'number' ? $$('#set-plan-rows tr.sp-row')[j.index] : null;
+        target = spTr ? $(/個数|個セット/.test(String(j.error || '')) ? '.sp-qty' : /名/.test(String(j.error || '')) && !/コード/.test(String(j.error || '')) ? '.sp-name' : '.sp-code', spTr) : $('#set-plan-add');
+        if (spTr && /^(code_|ph_|set_code)/.test(String(j.reason || ''))) { spChecks.set(spTr, { key: spKey($('.sp-code', spTr).value), ok: false, message: j.error }); }
+      }
       if (!row && target) { try { target.focus(); } catch (e) { /* */ } }
       if (row) {
         row.classList.add('err');
@@ -593,6 +756,16 @@
           // 🆕 #1719 R2 High: ロジザードの写しと照らせていない値 = 手順の一文 (GAS の H 列に入れる前にロジザードの商品マスタで確かめる)。商品の画面にも同じ印が出る
           if (x.j.lz_unchecked) warns.push('ロジザードのバーコード: ' + (x.j.lz_unchecked.note || 'ロジザードの写しと照らせていません (' + x.j.lz_unchecked.words + ')'));
           if (x.j.card && x.j.card.status !== 'done') warns.push('product-hub の出品カード: ' + (x.j.card_label || x.j.card.status) + ' (商品の画面の「カードをもう一度作る」か、product-hub のボードを開くと作り直します)');
+          // 🆕 作るセット: 下書きを作った = NE でやること (セット商品を NE に登録する)・作れなかった行 = 気をつけること
+          var nes = (x.j.ne_steps || []).slice();
+          var sent = body.card && body.card.sets ? body.card.sets : [];
+          if (sent.length) {
+            var made = x.j.card && Array.isArray(x.j.card.set_drafts) ? x.j.card.set_drafts : null;
+            var skipped = x.j.card && Array.isArray(x.j.card.set_skipped) ? x.j.card.set_skipped : [];
+            nes.push('セット商品 ' + sent.map(function (s) { return s.code + ' (' + s.qty + '個)'; }).join('・') + ' も NE に登録してください。product-hub の「セットの下書き」は NE に取り込まれると本コード確定になり、それまで出品しません'
+              + (made ? '' : ' (下書きはカードができたときに作ります)'));
+            skipped.forEach(function (k) { warns.push('セットの下書き ' + k.code + ' は作っていません: ' + (k.why || '')); });
+          }
           // 登録は成功・発注アプリへの書き込み (②) だけまだ = 🆕 0075: 知らせは Company DB に残る (自動でもう一度届ける) / 要確認 = 商品の画面で確かめる。
           //   0075 の前の DB = 商品の画面の「発注の設定」で入れ直す (知らせが無い)
           var po = x.j.order_settings;
@@ -601,14 +774,16 @@
             else if (po.status) warns.push('発注の設定は要確認です (' + (po.error || '発注アプリにもう設定がある') + ')。商品の画面の「発注の設定」で確かめて、「発注の設定の届け待ち」の画面で閉じてください');
             else warns.push('発注の設定だけ保存できませんでした (' + (po.error || '発注アプリに書けない') + ')。商品の画面の「発注の設定」で入れてください');
           }
-          try { sessionStorage.setItem(NOTE_KEY, JSON.stringify({ code: String(code), at: Date.now(), j: { replayed: !!x.j.replayed, changed: [], derived: [], ne_steps: x.j.ne_steps || [], warnings: warns } })); } catch (e) { /* 置けない = 知らせを出さないだけ */ }
+          try { sessionStorage.setItem(NOTE_KEY, JSON.stringify({ code: String(code), at: Date.now(), j: { replayed: !!x.j.replayed, changed: [], derived: [], ne_steps: nes, warnings: warns } })); } catch (e) { /* 置けない = 知らせを出さないだけ */ }
           var url = BASE + '/sku/' + encodeURIComponent(code);
           if (ME.replacePage) ME.replacePage(url); else location.replace(url);
           return;
         }
         msg('', 'err');
         showError(x.j, x.r.status);
-        requestId = uuid();   // 返事が来た = この番号の登録は終わった。直してもう一度押すときは新しい番号
+        // 返事が来た = この番号の登録は終わった。直してもう一度押すときは新しい番号。
+        //   🆕 成否が分からない (keep_request_id・作るセットの予約を持ったまま) = 同じ番号のまま押し直す (Codex R6 Medium 1)
+        if (!x.j.keep_request_id) requestId = uuid();
         update();
       })
       .catch(function () { busy = false; update(); msg('通信できませんでした。もう一度「下書きを保存する」を押してください (同じ登録は 2 回入りません)', 'err'); });

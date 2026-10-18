@@ -1,0 +1,8 @@
+<%
+  // 一覧の行で「その場で登録」(10/17・未登録 / まだつないでいない SKU)。行の button[data-inline] を押すと public/me-amazon-inline.js が行の下に欄を開く。
+  // 候補の部品 = public/me-comp-suggest.js (Amazon SKU の画面と同じ API・同じ決まり)。保存 = POST /api/amazon/save (1 つの画面と同じ道)
+  const inl = { base, min: locals.COMPONENT_SEARCH_MIN || 2, maxComponents: locals.MAX_MAP_COMPONENTS || 20, maxQty: locals.MAX_MAP_QTY || 999, reason: locals.inlineReason || 'その場で登録' };
+%>
+<script type="application/json" id="me-inline"><%- JSON.stringify(inl).replace(/</g, '\\u003c') %></script>
+<script src="<%= base %>/public/me-comp-suggest.js?v=<%= assetV %>" defer></script>
+<script src="<%= base %>/public/me-amazon-inline.js?v=<%= assetV %>" defer></script>
