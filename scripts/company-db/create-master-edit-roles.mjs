@@ -55,6 +55,9 @@
  * 🆕 0079 (要確認を確認済みにする・Company DB構想 22 の Q-1): master_edit に確認の関数と確かめ・一覧 (読むだけ) の実行 (QUARANTINE_CONFIRM_FUNCTIONS・
  *   名簿 MASTER_EDITORS の人 = 中原さんの決定 Q1 a)。master_ops には渡さない。表の権限は足さない (関数の中だけで書く)。
  *   🚨 渡さない: 確かめの表の 1 行を作る部品 (QUARANTINE_CONFIRM_OWNER_ONLY_FUNCTIONS)
+ * 🆕 0084 (メーカー・中原さん 2026-10-17): master_edit に名簿・商品ごとのメーカー・記録の 3 つの表の select (MAKER_SELECT) と、名簿に足す・商品に付ける の 2 つの関数と
+ *   名前の形の 2 つ (掃除・同じと見る形 = 読むだけ) の実行 (MAKER_EDIT_FUNCTIONS)。表が無い DB (0084 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
+ *   🚨 渡さない: 3 つの表の insert / update / delete (関数だけが書く)・守りの trigger・名前の問題の部品 (MAKER_OWNER_ONLY_FUNCTIONS)
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
  *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
@@ -269,6 +272,11 @@ export const LZ_BARCODE_EDIT_FUNCTIONS = Object.freeze(['ops.set_sku_logizard_ba
   'ops.lz_new_export_issue(uuid, text, jsonb, timestamp with time zone, timestamp with time zone)', 'ops.lz_new_export_void(text, bigint, text)']);
 export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_logizard_barcode_rules()', 'ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)',
   'ops.lzbc_jan_ok(text)', 'ops.guard_sku_logizard_barcode_requests()', 'ops.guard_lz_new_exports()']);
+/** 🆕 0084 (メーカー): 画面が読む表・画面が実行する関数・持ち主だけの部品 */
+export const MAKER_SELECT = Object.freeze(['core.makers', 'core.product_makers', 'ops.product_maker_events']);
+export const MAKER_EDIT_FUNCTIONS = Object.freeze(['ops.create_maker(uuid, text, text)', 'ops.set_product_maker(uuid, text, bigint, bigint, bigint, text, text)',
+  'core.maker_name_clean(text)', 'core.maker_name_norm(text)']);
+export const MAKER_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_maker_tables()', 'ops.maker_name_problem(text)']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -375,6 +383,10 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const t of LZ_BARCODE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...LZ_BARCODE_EDIT_FUNCTIONS, ...LZ_BARCODE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of LZ_BARCODE_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0084 (メーカー): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (表は読むだけ・書くのは関数だけ)
+  for (const t of MAKER_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
+  for (const f of [...MAKER_EDIT_FUNCTIONS, ...MAKER_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of MAKER_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、
