@@ -40,6 +40,8 @@ export const LIST_COLUMNS = Object.freeze([
   { id: 'sold', label: '売れた 7日/30日', num: true, ref: true, width: 'width:96px', th: 'th-sales', cell: 'sales' },
   { id: 'po', label: '注文残', num: true, ref: true, width: 'width:76px', po: true },
   { id: 'flags', label: '対応が必要', width: 'width:150px' },
+  // 🆕 0086 (10/17 中原さん): 梱包した状態の 縦×横×高さ (cm)・重さ (g) = まとめた値 (人 → 出どころ)。いつもは出さない (列の板で出す)・並べられない
+  { id: 'pkg', label: '大きさ・重さ', sub: '梱包', isNew: true, width: 'min-width:150px', th: 'th-pkg' },
 ].map((c) => Object.freeze({ ...c, cell: c.cell || c.id })));
 
 export const COLUMN_IDS = Object.freeze(LIST_COLUMNS.map((c) => c.id));
@@ -54,7 +56,7 @@ const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
  */
 export const DEFAULT_VIEW = Object.freeze({
   order: Object.freeze([...COLUMN_IDS]),
-  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup')),
+  shown: Object.freeze(COLUMN_IDS.filter((id) => id !== 'sup' && id !== 'pkg')),   // 🆕 0086: 大きさ・重さも出さない (列の板で出す)
 });
 
 /**

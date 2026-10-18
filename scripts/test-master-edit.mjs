@@ -2177,7 +2177,8 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   assert.equal(got.disp, `attachment; filename="master-list_20300110-1200.csv"; filename*=UTF-8''master-list_20300110-1200.csv`, 'ファイル名に日時 (日本の 1/10 12:00)');
   let t = table(got);
   assert.deepEqual(t[0], ['商品コード', '区分', '構成品の数', '名前', '状態', '登録の状態', '登録日', '売価', '原価', '原価は構成品から計算', '税率 (%)', '利益 (1 個あたり・参考・手数料 10%・円)', '利益率 (%)', '売上分類', '代表の仕入先コード', '代表の仕入先', 'JAN', '送料コード', '推奨月数',
-    '在庫 (ロジザード 読めない)', 'FBA (JP) 販売可能 (1/10 08:05 時点)', '売れた 7 日 (読めない)', '売れた 30 日 (読めない)', '対応が必要', '商品コードの注意'], '注文残の列は発注アプリの権限が無い人には無い・読めない参考の値は見出しに「読めない」');
+    '在庫 (ロジザード 読めない)', 'FBA (JP) 販売可能 (1/10 08:05 時点)', '売れた 7 日 (読めない)', '売れた 30 日 (読めない)', '対応が必要', '商品コードの注意',
+    '梱包の縦 (cm)', '梱包の横 (cm)', '梱包の高さ (cm)', '梱包の重さ (g)', '大きさ・重さの出どころ'], '注文残の列は発注アプリの権限が無い人には無い・読めない参考の値は見出しに「読めない」');
   assert.deepEqual(t.slice(1).map((x) => x[0]), listOrder((await call('GET', '/?kind=single')).text), 'offset に関係なく絞った全件・一覧と同じ並び');
   const row = (code) => Object.fromEntries(t[0].map((h, i) => [h, t.find((x) => x[0] === code)[i]]));
   {
@@ -2214,8 +2215,9 @@ await ta('[18] 一覧の区分の列・コードのコピー・絞った一覧�
   // 注文残 = 発注アプリの利用権がある人だけ (admin = 全部のアプリ)
   t = table(await raw('/list.csv?kind=single', 'admin'));
   assert.ok(t[0].includes('注文残 (発注アプリ 読めない)') || t[0].includes('注文残 (発注アプリ)'), t[0].join('|'));
-  assert.equal(t[0].indexOf('対応が必要'), t[0].length - 2);
-  assert.equal(t[0].indexOf('商品コードの注意'), t[0].length - 1, '新しい列は最後 (注文残の列があっても)');
+  assert.equal(t[0].indexOf('対応が必要'), t[0].length - 7);
+  assert.equal(t[0].indexOf('商品コードの注意'), t[0].length - 6, '新しい列は最後 (注文残の列があっても)');
+  assert.equal(t[0].at(-1), '大きさ・重さの出どころ', '🆕 0086: 大きさ・重さの 5 列はいちばん後ろ');
   // 詳細検索の印 (?s=) でも出せる・並び (区分の順) も一覧と同じ
   const sr = await call('POST', '/api/search', { body: { codes: 'set001\ns002\ns001', sort: 'kind' } });
   assert.equal(sr.status, 200, sr.text);
@@ -2582,7 +2584,7 @@ await ta('[21] CSV の商品コード = NE から来た商品なら NE の書き
   await pg.query('alter table ops.master_registrations enable trigger trg_master_registrations_guard');
   await pg.query('commit');
   let t = table(await raw('/list.csv?codes=' + encodeURIComponent('s001\ns002\ns003\ns004\ns005\ns006')));
-  assert.equal(t[0].at(-1), '商品コードの注意', '新しい列は最後');
+  assert.equal(t[0].at(-6), '商品コードの注意', '新しい列は最後 (🆕 0086 の大きさ・重さの 5 列の前)');
   assert.equal(t[0][0], '商品コード', '前の列の並びは変えない');
   assert.deepEqual(byCode(t), {
     S001: '',   // ok = NE の書き方

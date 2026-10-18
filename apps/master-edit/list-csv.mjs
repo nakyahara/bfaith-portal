@@ -12,6 +12,23 @@
  */
 import { fmtJst, fmtDay } from './ui-format.mjs';
 import { PLATFORM_FEE_RATES, ratePct1 } from '../../lib/profit-estimate.js';
+import { PACKAGE_AXES, sourceWords } from '../../lib/master-package.mjs';
+
+/** 🆕 0086: mm → cm の数 (小数 1 けた)。無い = null */
+const cmNum = (mm) => (mm == null ? null : Math.round(Number(mm)) / 10);
+/** 🆕 0086: 軸ごとの出どころの言葉 (同じ出どころの軸はまとめる)。例「縦・横・高さ = 人 / 重さ = FBA 納品 (実測)」 */
+function pkgSourcesText(p) {
+  if (!p) return '';
+  const by = new Map();
+  for (const a of PACKAGE_AXES) {
+    const src = p.sources && p.sources[a.axis];
+    if (!src || p[a.axis] == null) continue;
+    const w = sourceWords(src, p.refs && p.refs[a.axis]);
+    if (!by.has(w)) by.set(w, []);
+    by.get(w).push(a.label);
+  }
+  return [...by].map(([w, ls]) => `${ls.join('・')} = ${w}`).join(' / ');
+}
 
 export const KIND_LABELS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
 const SALES_LABELS = Object.freeze({ 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' });
@@ -73,6 +90,12 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
     ['対応が必要', (r) => (r.flags || []).join('・')],
     // NE の書き方が決まらない商品 = 今のコードのまま出して理由を添える (確かめずに NE・ロジザードに上げないように。10/16 中原さん)
     ['商品コードの注意', (r) => r.code_note || ''],
+    // 🆕 0086: 梱包した状態の 縦・横・高さ (cm)・重さ (g) = まとめた値 (人 → 出どころの順位 → 新しい順)・出どころ (単品だけ・無い = 空)。最後に足す
+    ['梱包の縦 (cm)', (r) => cmNum(r.pkg && r.pkg.length_mm)],
+    ['梱包の横 (cm)', (r) => cmNum(r.pkg && r.pkg.width_mm)],
+    ['梱包の高さ (cm)', (r) => cmNum(r.pkg && r.pkg.height_mm)],
+    ['梱包の重さ (g)', (r) => (r.pkg && r.pkg.weight_g != null ? r.pkg.weight_g : null)],
+    ['大きさ・重さの出どころ', (r) => pkgSourcesText(r.pkg)],
   ];
   const lines = [cols.map(([h]) => csvCell(h)).join(',')];
   for (const r of data.rows) lines.push(cols.map(([, f]) => csvCell(f(r))).join(','));

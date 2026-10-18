@@ -839,7 +839,8 @@
       ['発注の設定', po ? '発注アプリへ (全部の子に同じ値)' : 'なし (あとで商品の画面で)'],
       ['入力なし', m.noneKeys.length ? esc(m.noneKeys.map(function (k) { return (P.blankLabels && P.blankLabels[k] ? P.blankLabels[k].label : k); }).join('・')) + ' <span class="hint aux">(わざと空けた = 登録の記録に残ります)</span>' : 'なし (全部の項目に値)'],
       ['出品カード', 'まとまりで 1 枚' + (m.ac === 2 ? ' (2 軸なので出品は止めたまま)' : '')],
-    ].concat(S.nextOpts.length ? [['次に足す' + unitOf(m), S.nextOpts.length + ' ' + unitOf(m) + ' (今回は保存しない · 保存の後に続けて足す)']] : []);
+    ].concat(document.getElementById('np-length') ? [['大きさ・重さ', (function () { var pk = pkgBody(); return pk ? esc([pk.length, pk.width, pk.height].map(function (x) { return x || '?'; }).join(' × ') + ' cm · ' + (pk.weight ? pk.weight + ' g' : '重さ なし')) + ' (全部の子に同じ値)' : 'なし (あとで商品の画面で)'; })()]] : [])   // 🆕 0086 (欄があるときだけ)
+      .concat(S.nextOpts.length ? [['次に足す' + unitOf(m), S.nextOpts.length + ' ' + unitOf(m) + ' (今回は保存しない · 保存の後に続けて足す)']] : []);
   }
 
   var CAT = { count: '子の数', dup: '重なり', shape: '形の誤り', miss: 'まだ入れていない' };
@@ -1303,9 +1304,17 @@
     if (!m.add || m.firstTime) out.axes = m.axes.map(function (ax) { return { axis: ax.i + 1, name: ax.name }; });
     // 🆕 2026-10-13: 入力なしにした項目 (サーバーがもう一度確かめて、登録の理由に残す)
     out.blanks = m.noneKeys.slice();
+    // 🆕 0086: 梱包の大きさ・重さ (全部の子に同じ値・入れなくてよい・欄が無い / 全部空 = 送らない)
+    var pk = pkgBody(); if (pk) out.package = pk;
     var po = ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
     return out;
+  }
+  /** 🆕 0086: 梱包の 縦・横・高さ (cm)・重さ (g) の欄 (views/_package-new.ejs) → { length, width, height, weight } (全部空・欄が無い = null = 送らない。形はサーバーが確かめる) */
+  function pkgBody() {
+    var ids = { length: 'np-length', width: 'np-width', height: 'np-height', weight: 'np-weight' }, o = {}, any = false;
+    Object.keys(ids).forEach(function (k) { var e = document.getElementById(ids[k]); var v = e && !e.disabled ? String(e.value || '').trim() : ''; o[k] = v; if (v) any = true; });
+    return any ? o : null;
   }
   function openConfirm() {
     if (!canSave || S.done || busy) return;

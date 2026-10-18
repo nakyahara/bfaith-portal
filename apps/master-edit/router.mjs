@@ -139,6 +139,7 @@ import { readNeDeleteStock } from './ne-delete-stock.mjs';
 // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
+import { readPackageView, packageReady } from '../../lib/master-package.mjs';
 import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
 import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
 
@@ -894,6 +895,7 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     blankKeys: BLANK_KEYS[kind], blankLabels: blankLabelsOf(kind),
     // 🆕 0080: ロジザードに送るバーコードの欄を出すか (0080 がある DB だけ)
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,
+    packageReady: db && kind === 'single' ? await packageReady(db).catch(() => false) : false,   // 🆕 0086 (梱包の大きさ・重さの欄を出すか・入れなくてよい)
   });
 }));
 /**
@@ -918,6 +920,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     orderNoneApplies,
     blankKeys: BLANK_KEYS.variation, blankLabels: blankLabelsOf('variation'),
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,   // 🆕 0080 (子ごとのロジザードのバーコードの欄を出すか)
+    packageReady: db ? await packageReady(db).catch(() => false) : false,   // 🆕 0086 (梱包の大きさ・重さの欄を出すか・全部の子に同じ値・入れなくてよい)
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
@@ -1062,6 +1065,7 @@ router.post('/api/new/variation', (req, res) => {
       childReasons: pre.childReasons,   // 🆕 子ごとの入力なしの理由 (原価・JAN はその子に無いときだけ・#1706 Codex R1 M1)
       reasonNote: po.note,              // 🆕 発注の設定の入力なし (DB に書く理由にだけ・ハッシュに入らない・#1706 Codex R2 M)
       lzCopy: lg.copy,                  // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果 (値の行に残す・ハッシュに入らない)
+      package: b.package,               // 🆕 0086: 梱包の 縦・横・高さ (cm)・重さ (g) = 全部の子に同じ値 (入れなくてよい)
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox, requireLz: true, codeReserved });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
@@ -1118,6 +1122,10 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   const gone = goneChk ? { ...goneView(goneChk), canApprove: approverGate(req).ok, fromRequest: nedelLive.length > 0, kind: page.cur.sku_kind } : null;
   res.render(view('sku.ejs'), {
     gone,
+    // 🆕 0086: 梱包した状態の 縦・横・高さ・重さ (単品の商品の行だけ・人の値 + 出どころ (定形外・FBA 納品) + まとめた値)。読めない = 出さない (画面は止めない)
+    pkg: page && page.cur.sku_kind === 'single' && page.cur.product_id
+      ? await (async () => ({ ...(await readPackageView(db, page.cur.product_id)), ready: await packageReady(db) }))().catch((e) => { console.error(`[master-edit] 大きさ・重さを読めない: ${e && e.message}`); return null; })
+      : null,
     // 🆕 0072: NE から消す (箱 = 依頼の途中の様子・「NE から消す」の画面へ)。0072 の前・読めない = null (出さない)
     nedel: nedel ? { live: nedelLive, canApprove: approverGate(req).ok, STATUS_WORDS: NE_DEL_STATUS_WORDS } : null,
     // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリに保存・単品で AMC × 自社商品だけ欄を出す)
@@ -1223,7 +1231,7 @@ router.post('/api/new', (req, res) => {
     //   作るセットは登録の要求のハッシュ (lib と同じ = 保存の記録の request_payload_hash) で結ぶ = 取り込みは通った登録の作るセットだけを付ける (Codex R1 High 2)
     let parsed = null;
     try {
-      parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode });
+      parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode, package: b.package });
     } catch (e) { if (!(e instanceof MasterWriteError)) throw e; /* 形の誤りは登録の lib が同じ文で断る */ }
     const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
     // ほかの登録が作るセットに決めたコード (カードの取り込み待ち) は、ふつうの商品コードにもさせない (Codex R1 Medium 1)。押し直しは前の答え (確かめない)
@@ -1251,6 +1259,7 @@ router.post('/api/new', (req, res) => {
         order: outbox ? orderBase : null, reasonNote: po.note,
         logizardBarcode: b.logizard_barcode,   // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコードの値か空欄 (単品だけ・要るかは上の lzRegisterGate)
         lzCopy,                                // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果
+        package: b.package,                    // 🆕 0086: 梱包の 縦・横・高さ (cm)・重さ (g) (入れなくてよい・単品だけ)
       }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true, codeReserved });
     } catch (e) {
       // 登録が断られた (決まった誤り = MasterWriteError) = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)。

@@ -688,9 +688,17 @@
     if (po) out.order_settings = po;
     // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコード (単品だけ・欄が無い = 0080 の前 = 送らない)
     if (!isSet && $('#f-lzbc-in')) out.logizard_barcode = lzbc().body;
+    // 🆕 0086: 梱包の大きさ・重さ (単品だけ・入れなくてよい・欄が無い / 全部空 = 送らない)
+    if (!isSet) { var pk = pkgBody(); if (pk) out.package = pk; }
     return out;
   }
 
+  /** 🆕 0086: 梱包の 縦・横・高さ (cm)・重さ (g) の欄 (views/_package-new.ejs) → { length, width, height, weight } (全部空・欄が無い = null = 送らない。形はサーバーが確かめる) */
+  function pkgBody() {
+    var ids = { length: 'np-length', width: 'np-width', height: 'np-height', weight: 'np-weight' }, o = {}, any = false;
+    Object.keys(ids).forEach(function (k) { var e = document.getElementById(ids[k]); var v = e && !e.disabled ? String(e.value || '').trim() : ''; o[k] = v; if (v) any = true; });
+    return any ? o : null;
+  }
   /* ---------- 登録 ---------- */
   function msg(t, cls) { var m = $('#msg'); m.className = 'msgline ' + (cls || ''); m.textContent = t || ''; }
   /**

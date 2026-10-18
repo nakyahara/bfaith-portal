@@ -2766,3 +2766,18 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え → `migrate.mjs --dry-run` (この 1 本だけ・今のデータは何も変えない) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す
   (master_edit に 3 つの関数の実行) → `heavy-entry-manifest.mjs --verify` → 次の朝の照合 ② の後に `select ops.quarantine_confirm_list(null)` (watcher) で 42 件の表を見る。画面 (Q-2・Q-3) は別の PR
 - 試験 = `node scripts/test-master-quarantine-confirm.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-quarantine-confirm-pg.mjs` (本物のログイン・並ぶ取引)
+
+### 梱包した状態の 縦・横・高さ・重さ (0086 仮番号・マージの時に「すぐ次の番号」に付け替える・2026-10-17 中原さん「FBA 納品のアプリとか、定形外の発送方法で情報をもっていたはずだから集約して」)
+- **なぜ**: 梱包した状態の大きさ・重さは、定形外 (postage.db `pm_skus` の重さ g・厚み mm) と FBA 納品 (fba-box.db の 1 個の重さ = 実測 / Amazon のカタログ) にばらばらにあった。
+  縦・横はどこにも無い (profit-calculator は SP-API のカタログの寸法をその場で読むだけで残さない)。マスタの入力で人が入れられる 1 つの置き場にまとめる
+- **出どころの値** = `core.product_physicals` (0003・scope = package・夜間ロード `engine.mjs` の 11. が毎晩 pm_skus / fbx_weight_refs / fbx_weight_current から足す・ここでは変えない)
+- **人の値** = 🆕 `core.product_packages` (商品ごとに 1 行・縦・横・高さ = mm・重さ = g・軸ごとに空でよい・4 つとも空の行は持たない)・記録 `ops.product_package_events` (追記だけ)。
+  書くのは `ops.set_product_package` だけ (security definer・メーカー 0084 と同じ守り = 単品・やめていない・new_open・門を通った保存 (sku_edit) / 登録 (sku_create) の取引の中・
+  最後の記録の番号が画面の見ていたものと違う = version_conflict)。夜間ロードは触らない (product_physicals に人の行を足さない = 夜間ロードが有効行を規則 v1 で選び直すと消える)
+- **まとめた値** = 🆕 `core.v_product_packages` (軸ごとに 人 → `core.package_source_rank` (実測 1・Amazon のカタログ 2・Yahoo 3・仕入先 4・そのほか 5・定形外の見込み 8) → 新しい観測)。
+  出どころ × 参照ごとの最新の行だけ・先の時刻の行は使わない。FBA 納品・定形外・利益の計算がこれを読むのは次の PR (いまは画面・一覧・CSV だけ)
+- **画面**: 商品の画面の「大きさ・重さ」(人の値の欄 = cm / g・いま使う値・出どころの表・食い違いの印・「この値を入れる」)・新商品の登録 (単品・まとまり = 全部の子に同じ値)。
+  入れなくても登録できる (「値か入力なし」に数えない)。一覧の列「大きさ・重さ」(いつもは出さない)・一覧の CSV の最後の 5 列
+- 当て方 (🚨 まだ流さない): 番号を付け替える (0084 メーカー・0085 商品の動きの後 = 欠番にしない) → アプリ (マージ) と `migrate.mjs --dry-run` (表・関数・ビューを足すだけ) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (master_edit に 3 つの select・`core.product_physicals` の select・書く関数の実行)。どちらが先でもよい (0086 の前・流し直しの前は画面が欄を出さない = 見るだけ・値を送ったら 503)
+- 試験 = `node scripts/test-master-package.mjs` (形・守り・まとめた値・商品の画面・登録・まとまり・一覧・CSV・夜間ロード・流し直しの前) / 画面 = `test-master-package-ui.mjs`

@@ -1221,3 +1221,11 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 .bulk-prog .bar { flex: 1 1 auto; height: 6px; border-radius: 999px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
 .bulk-prog .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
 @media (max-width: 760px) { .bulk-acts .btn { flex: 1 1 auto; justify-content: center; } }
+
+/* 🆕 0086 大きさ・重さ (商品の画面・views/_package.ejs) */
+.pkgdims { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pkgdims .in { text-align: right; }
+#pkg-sources td.pkg-diff { color: var(--warn); background: var(--warn-bg); }
+#p-pkg .f.wide { grid-template-columns: minmax(0, 1fr); }   /* 出どころの表は .tblwrap の中で横に送る (ページははみ出さない) */
+#p-pkg .ctl.col { flex-wrap: nowrap; }   /* 縦に並べる欄で折り返しの行を作らない (作ると長い一言の幅に広がる) */
+@media (max-width: 760px) { #p-pkg .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #p-pkg .btn.sm { min-height: 44px; } }

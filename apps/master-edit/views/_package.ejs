@@ -1,0 +1,72 @@
+<%#
+  🆕 0086 梱包した状態の 縦・横・高さ・重さ (中原さん 2026-10-17「FBA 納品のアプリとか、定形外の発送方法で情報をもっていたはずだから集約して」)。
+  商品の画面 (単品) の「大きさ・重さ」。人の値は右の「保存する」で一緒に保存 (欄 = pkg_length / pkg_width / pkg_height / pkg_weight)。動き = public/me-package.js
+  - 欄 = 人の値 (空 = 人の値なし)。空の欄の薄い字 = いま使っている出どころの値
+  - いま使う値 = 軸ごとに 人 → 出どころの順位 (実測 → Amazon のカタログ → …) → 新しい順 (Company DB の core.v_product_packages)
+  - 出どころの表 = 夜間の取り込みが Company DB に入れた値 (定形外・FBA 納品)。値が違うときは「食い違い」の印 (黙って 1 つにしない)
+  渡す値: pkg = router の pkg (lib/master-package.mjs readPackageView + ready)・editable = 直せるか・lockWhyHtml = 直せない理由の札
+%>
+<%
+  const hp = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const cm = (mm) => (mm == null ? '' : (Math.round(Number(mm)) / 10).toFixed(1).replace(/\.0$/, ''));
+  const gtext = (g) => (g == null ? '' : Number(g).toLocaleString('ja-JP'));
+  const H = pkg.human || {};
+  const R = pkg.resolved || {};
+  const C = pkg.conflicts || {};
+  const AX = [['length_mm', 'pkg_length', '縦'], ['width_mm', 'pkg_width', '横'], ['height_mm', 'pkg_height', '高さ']];
+  const day = (iso) => { if (!iso) return ''; const d = new Date(new Date(iso).getTime() + 9 * 3600e3); return d.getUTCFullYear() + '/' + (d.getUTCMonth() + 1) + '/' + d.getUTCDate(); };
+  const fromWords = (r) => (r ? (r.source === 'human' ? '人' : r.words) : '');
+  const used = (axis, txt) => { const r = R[axis]; return r ? txt(r.value) + (axis === 'weight_g' ? ' g' : ' cm') + ' (' + fromWords(r) + ')' : '—'; };
+  const conflictAxes = Object.keys(C);
+  const AXW = { length_mm: '縦', width_mm: '横', height_mm: '高さ', weight_g: '重さ' };
+  const meta = (f, label) => 'data-field="' + f + '" data-dirty-field="' + f + '" data-label="' + hp(label) + '" data-ne="NE へ送らない"';
+  const ph = (axis, txt) => (R[axis] && R[axis].source !== 'human' ? ' placeholder="' + hp(txt(R[axis].value)) + '"' : '');
+  const pageData = { editable: !!editable, sources: (pkg.sources || []).map((s) => ({ words: s.words, length: cm(s.length_mm), width: cm(s.width_mm), height: cm(s.height_mm), weight: s.weight_g == null ? '' : String(s.weight_g) })) };
+%>
+<section class="panel" id="p-pkg" aria-labelledby="h-pkg">
+  <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-box"/></svg></span><h2 id="h-pkg">大きさ・重さ</h2><span class="sub">梱包した状態 · Company DB だけ (NE・ロジザードには送りません) · 入れなくても登録できます</span>
+    <% if (conflictAxes.length) { %><span class="right"><span class="b warn" id="pkg-conflict" title="出どころ (人・定形外・FBA 納品…) で値が違います。下の表で確かめて、正しい値を入れてください"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>食い違い: <%= conflictAxes.map((a) => AXW[a]).join('・') %></span></span><% } %></div>
+  <% if (!pkg.ready) { %><div class="callout info" id="pkg-not-ready"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">梱包の大きさ・重さは、Company DB に 0086 が入って権限を流し直した後に入れられます (いまは見るだけ)。</div></div><% } %>
+  <div class="f wide" data-row="package">
+    <div class="lab" id="lab-pkg-size">大きさ (縦 × 横 × 高さ)</div>
+    <div class="ctl">
+      <% if (editable) { %>
+        <span class="pkgdims" role="group" aria-labelledby="lab-pkg-size">
+        <% AX.forEach(([axis, f, label], i) => { %><% if (i) { %><span class="unit" aria-hidden="true">×</span><% } %><label class="sr" for="f-<%= f %>">梱包の<%= label %> (cm)</label><input class="in w-xs" id="f-<%= f %>" inputmode="decimal" autocomplete="off" maxlength="6" <%- meta(f, '梱包の' + label + ' (cm)') %> data-unit=" cm" value="<%= cm(H[axis]) %>"<%- ph(axis, cm) %> title="<%= label %> (cm・小数 1 けたまで)"><% }) %>
+        <span class="unit">cm</span></span>
+      <% } else { %>
+        <span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= AX.map(([axis]) => cm(H[axis]) || '—').join(' × ') %> cm (人の値)</span></span><%- lockWhyHtml || '' %>
+      <% } %>
+      <span class="hint" id="pkg-size-now">いま使う値: <%= AX.map(([axis, , label]) => label + ' ' + used(axis, cm)).join(' · ') %></span>
+      <span class="hint">cm で小数 1 けたまで (例: 23.5) · 縦・横 = 大きい 2 辺、高さ = 厚み (定形外・ネコポスは厚みで決まります) · 空の欄の薄い字 = 出どころの値 · 空にして保存 = 人の値を外す</span>
+    </div>
+  </div>
+  <div class="f" data-row="pkg_weight">
+    <% if (editable) { %><label class="lab" for="f-pkg_weight">重さ</label><% } else { %><div class="lab">重さ</div><% } %>
+    <div class="ctl">
+      <% if (editable) { %>
+        <input class="in w-s" id="f-pkg_weight" inputmode="numeric" autocomplete="off" maxlength="7" <%- meta('pkg_weight', '梱包の重さ (g)') %> data-unit=" g" value="<%= H.weight_g == null ? '' : H.weight_g %>"<%- ph('weight_g', (g) => String(g)) %>><span class="unit">g</span>
+      <% } else { %>
+        <span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= H.weight_g == null ? '—' : gtext(H.weight_g) + ' g' %> (人の値)</span></span>
+      <% } %>
+      <span class="hint" id="pkg-weight-now">いま使う値: <%= used('weight_g', gtext) %> · 梱包材を含めた重さ (g の整数)</span>
+    </div>
+  </div>
+  <div class="f wide" data-row="pkg_sources">
+    <div class="lab">出どころ</div>
+    <div class="ctl col">
+      <% if (!(pkg.sources || []).length && !pkg.human) { %><span class="muted" id="pkg-no-source">まだどこにもありません (定形外の重さの表・FBA 納品で量った重さも無い商品です)</span><% } else { %>
+      <div class="tblwrap"><table class="tbl" id="pkg-sources"><caption class="sr">梱包の大きさ・重さの出どころ</caption>
+        <thead><tr><th scope="col">出どころ</th><th scope="col" class="n">縦</th><th scope="col" class="n">横</th><th scope="col" class="n">高さ</th><th scope="col" class="n">重さ</th><th scope="col">いつ</th><% if (editable) { %><th scope="col"><span class="sr">入れる</span></th><% } %></tr></thead>
+        <tbody>
+        <% const cell = (axis, v, txt, unit) => { const isC = C[axis] && v != null; return '<td class="n' + (isC ? ' pkg-diff' : '') + '">' + (v == null ? '<span class="muted">—</span>' : hp(txt(v)) + ' ' + unit) + '</td>'; }; %>
+        <% if (pkg.human) { %><tr data-src="human"><th scope="row">人<span class="muted"> · <%= H.set_by || '' %></span></th><%- cell('length_mm', H.length_mm, cm, 'cm') %><%- cell('width_mm', H.width_mm, cm, 'cm') %><%- cell('height_mm', H.height_mm, cm, 'cm') %><%- cell('weight_g', H.weight_g, gtext, 'g') %><td class="muted"><%= day(H.set_at) %></td><% if (editable) { %><td></td><% } %></tr><% } %>
+        <% (pkg.sources || []).forEach((s, i) => { %><tr data-src="<%= s.source %>"><th scope="row"><%= s.words %></th><%- cell('length_mm', s.length_mm, cm, 'cm') %><%- cell('width_mm', s.width_mm, cm, 'cm') %><%- cell('height_mm', s.height_mm, cm, 'cm') %><%- cell('weight_g', s.weight_g, gtext, 'g') %><td class="muted"><%= day(s.observed_at) %></td>
+          <% if (editable) { %><td><button type="button" class="btn sm" data-pkg-use="<%= i %>" title="この出どころの値を欄に入れます (保存は右の「保存する」)">この値を入れる</button></td><% } %></tr><% }) %>
+        </tbody></table></div>
+      <% } %>
+      <span class="hint">出どころ = 夜間の取り込みが Company DB に入れた値 (定形外の重さの表・FBA 納品で量った重さ・FBA 納品が Amazon から取った重さ)。値が違う欄は色を付けています · 縦・横はまだどの出どころにもありません</span>
+    </div>
+  </div>
+  <script type="application/json" id="me-package"><%- JSON.stringify(pageData).replace(/</g, '\\u003c') %></script>
+</section>

@@ -1,0 +1,15 @@
+<%#
+  🆕 0086 梱包した状態の 縦・横・高さ・重さ (新商品の登録の単品・まとまりの共通の欄)。入れなくてよい (「値か入力なし」にも数えない)。
+  送る値 = 本文の package = { length, width, height (cm の文字), weight (g の文字) } (me-new.js / me-variation.js の pkgBody・全部空 = 送らない)
+  渡す値: dis = ' disabled' | ''・forAll = まとまり (全部の子に同じ値) か
+%>
+<div class="f wide" data-row="package"><div class="lab" id="lab-np-size">梱包の大きさ<span class="opt">入れなくても可</span></div>
+  <div class="ctl"><span class="pkgdims" role="group" aria-labelledby="lab-np-size">
+    <label class="sr" for="np-length">梱包の縦 (cm)</label><input class="in w-xs" id="np-length" inputmode="decimal" autocomplete="off" maxlength="6" placeholder="縦" data-dirty-field="package_length" data-label="梱包の縦"<%= dis %>>
+    <span class="unit" aria-hidden="true">×</span><label class="sr" for="np-width">梱包の横 (cm)</label><input class="in w-xs" id="np-width" inputmode="decimal" autocomplete="off" maxlength="6" placeholder="横" data-dirty-field="package_width" data-label="梱包の横"<%= dis %>>
+    <span class="unit" aria-hidden="true">×</span><label class="sr" for="np-height">梱包の高さ (cm)</label><input class="in w-xs" id="np-height" inputmode="decimal" autocomplete="off" maxlength="6" placeholder="高さ" data-dirty-field="package_height" data-label="梱包の高さ"<%= dis %>>
+    <span class="unit">cm</span></span>
+    <span class="hint">梱包した状態 · cm で小数 1 けたまで (例: 23.5) · 縦・横 = 大きい 2 辺、高さ = 厚み<%= forAll ? ' · 全部の子に同じ値 (サイズで違うときは空のまま登録して、あとで商品の画面で子ごとに)' : '' %> · 届いてから商品の画面の「大きさ・重さ」で入れても構いません</span></div></div>
+<div class="f" data-row="pkg_weight"><label class="lab" for="np-weight">梱包の重さ<span class="opt">入れなくても可</span></label>
+  <div class="ctl"><input class="in w-s" id="np-weight" inputmode="numeric" autocomplete="off" maxlength="7" placeholder="0" data-dirty-field="package_weight" data-label="梱包の重さ"<%= dis %>><span class="unit">g</span>
+    <span class="hint">梱包材を含めた重さ (g の整数) · Company DB だけ (NE・ロジザードには送りません)</span></div></div>
