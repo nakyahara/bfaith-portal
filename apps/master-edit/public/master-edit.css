@@ -1343,3 +1343,11 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .sc svg .sc-c1, .sc svg .sc-c2, .sc svg .sc-c3, .sc svg .sc-c4 { fill: CanvasText; }
   .sc svg .sc-line { stroke: CanvasText; }
 }
+
+/* 🆕 0087 大きさ・重さ (商品の画面・views/_package.ejs) */
+.pkgdims { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pkgdims .in { text-align: right; }
+#pkg-sources td.pkg-diff { color: var(--warn); background: var(--warn-bg); }
+#p-pkg .f.wide { grid-template-columns: minmax(0, 1fr); }   /* 出どころの表は .tblwrap の中で横に送る (ページははみ出さない) */
+#p-pkg .ctl.col { flex-wrap: nowrap; }   /* 縦に並べる欄で折り返しの行を作らない (作ると長い一言の幅に広がる) */
+@media (max-width: 760px) { #p-pkg .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #p-pkg .btn.sm { min-height: 44px; } }

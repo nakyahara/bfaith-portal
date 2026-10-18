@@ -243,6 +243,9 @@
           <% } %>
         </section>
 
+        <%# 🆕 0087 梱包した状態の 縦・横・高さ・重さ (単品だけ・人の値は右の「保存する」で一緒に・出どころの値と食い違いも見せる・部品 = _package.ejs・public/me-package.js) %>
+        <% if (typeof pkg !== 'undefined' && pkg && c.sku_kind === 'single') { %><%- include('_package', { pkg, editable: !!pkg.ready && editable('pkg_length'), lockWhyHtml: pkg.ready ? lockWhy('pkg_length') : '' }) %><% } %>
+
         <section class="panel" aria-labelledby="h-tax">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-percent"/></svg></span><h2 id="h-tax">税・分類</h2></div>
           <%- row('tax_rate', '税率', seg('tax_rate', c.tax_rate == null ? '' : String(c.tax_rate), [['0.08', '8%', '軽減'], ['0.1', '10%', '標準']]) + (c.tax_rate == null ? '<span class="misslabel"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ入っていません</span>' : ''), taxText(c.tax_rate)) %>
@@ -690,6 +693,8 @@
   <% if (page && typeof lzBarcode !== 'undefined' && lzBarcode && lzBarcode.show && !lzBarcode.error && lzBarcode.canWrite) { %><script src="<%= base %>/public/me-lzbarcode.js?v=<%= assetV %>" defer></script><% } %>
   <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0087: 大きさ・重さの「この値を入れる」(直せるときだけ・欄の数え直しは me-sku.js) %>
+  <% if (page && typeof pkg !== 'undefined' && pkg && pkg.ready && c.sku_kind === 'single' && editable('pkg_length')) { %><script src="<%= base %>/public/me-package.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 入出庫の履歴と月別のまとめ (単品だけ・読むだけ) %>
   <% if (page && page.cur.sku_kind === 'single') { %><script src="<%= base %>/public/me-moves.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 販売数のグラフ (読むだけ・単品とセット) %>

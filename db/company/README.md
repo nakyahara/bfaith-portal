@@ -2802,3 +2802,18 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): 番号 = 0086 (0085 = #1741 入出庫の履歴の次) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を足すだけ) → 中原さんの OK → 本適用 →
   `create-master-edit-roles.mjs` を流し直す (引数なし)。それまでグラフの欄は「画面のロールに販売数を読む関数がまだありません」と出す (画面のほかの所は動く)
 - 試験 = `node scripts/test-master-sales-chart.mjs` (計算・0042 と同じ数・関数の権限・API) / `test-master-sales-chart-ui.mjs` (画面)
+
+### 梱包した状態の 縦・横・高さ・重さ (0087・2026-10-17 中原さん「FBA 納品のアプリとか、定形外の発送方法で情報をもっていたはずだから集約して」)
+- **なぜ**: 梱包した状態の大きさ・重さは、定形外 (postage.db `pm_skus` の重さ g・厚み mm) と FBA 納品 (fba-box.db の 1 個の重さ = 実測 / Amazon のカタログ) にばらばらにあった。
+  縦・横はどこにも無い (profit-calculator は SP-API のカタログの寸法をその場で読むだけで残さない)。マスタの入力で人が入れられる 1 つの置き場にまとめる
+- **出どころの値** = `core.product_physicals` (0003・scope = package・夜間ロード `engine.mjs` の 11. が毎晩 pm_skus / fbx_weight_refs / fbx_weight_current から足す・ここでは変えない)
+- **人の値** = 🆕 `core.product_packages` (商品ごとに 1 行・縦・横・高さ = mm・重さ = g・軸ごとに空でよい・4 つとも空の行は持たない)・記録 `ops.product_package_events` (追記だけ)。
+  書くのは `ops.set_product_package` だけ (security definer・メーカー 0084 と同じ守り = 単品・やめていない・new_open・門を通った保存 (sku_edit) / 登録 (sku_create) の取引の中・
+  最後の記録の番号が画面の見ていたものと違う = version_conflict)。夜間ロードは触らない (product_physicals に人の行を足さない = 夜間ロードが有効行を規則 v1 で選び直すと消える)
+- **まとめた値** = 🆕 `core.v_product_packages` (軸ごとに 人 → `core.package_source_rank` (実測 1・Amazon のカタログ 2・Yahoo 3・仕入先 4・そのほか 5・定形外の見込み 8) → 新しい観測)。
+  出どころ × 参照ごとの最新の行だけ・先の時刻の行は使わない。FBA 納品・定形外・利益の計算がこれを読むのは次の PR (いまは画面・一覧・CSV だけ)
+- **画面**: 商品の画面の「大きさ・重さ」(人の値の欄 = cm / g・いま使う値・出どころの表・食い違いの印・「この値を入れる」)・新商品の登録 (単品・まとまり = 全部の子に同じ値)。
+  入れなくても登録できる (「値か入力なし」に数えない)。一覧の列「大きさ・重さ」(いつもは出さない)・一覧の CSV の最後の 5 列
+- 当て方 (🚨 まだ流さない): 番号 = 0087 (0084 メーカー・0085 入出庫の履歴・0086 販売数のグラフの次 = 欠番にしない) → アプリ (マージ) と `migrate.mjs --dry-run` (表・関数・ビューを足すだけ) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (master_edit に 3 つの select・`core.product_physicals` の select・書く関数の実行)。どちらが先でもよい (0087 の前・流し直しの前は画面が欄を出さない = 見るだけ・値を送ったら 503)
+- 試験 = `node scripts/test-master-package.mjs` (形・守り・まとめた値・商品の画面・登録・まとまり・一覧・CSV・夜間ロード・流し直しの前) / 画面 = `test-master-package-ui.mjs`

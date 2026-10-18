@@ -372,16 +372,17 @@ await ta('[L1] 一覧のメーカーの列 (いつもの列に出さない・出
   assert.ok(COLS.COLUMN_IDS.includes('maker'));
   assert.ok(!COLS.DEFAULT_VIEW.shown.includes('maker'));
   assert.ok(!COLS.SORTABLE.includes('maker'));
-  assert.equal(COLS.COLUMN_IDS.at(-1), 'maker', '前の列の並びを変えない (最後に足す)');
+  assert.equal(COLS.COLUMN_IDS.at(-2), 'maker', '前の列の並びを変えない (後ろに足す・🆕 0087 の大きさ・重さの列の前)');
   const data = await asEditor(() => RD.listSkus(db, RD.normalizeFilters({ q: 'mk-r1' }), { mode: 'all' }));
   const row = data.rows.find((r) => r.code === 'mk-r1');
   assert.equal(row.maker, 'はちみつ 本舗');
   const csv = CSV.buildListCsv(data, {}, {});
   const lines = csv.replace(/^﻿/, '').trim().split('\r\n');
   const head = lines[0].split(',');
-  assert.equal(head.at(-1), '"メーカー"');
-  assert.equal(head.at(-2), '"商品コードの注意"');
-  assert.ok(lines.find((l) => l.startsWith('"mk-r1"')).endsWith('"はちみつ 本舗"'));
+  // 🆕 0087: 大きさ・重さの 5 列がメーカーの後ろ (いちばん後ろ)
+  assert.equal(head.at(-6), '"メーカー"');
+  assert.equal(head.at(-7), '"商品コードの注意"');
+  assert.equal(lines.find((l) => l.startsWith('"mk-r1"')).split(',').at(-6), '"はちみつ 本舗"');
   const list = await call('GET', '/?q=mk-r1');
   assert.match(list.text, /<td data-col="maker" hidden>はちみつ 本舗<\/td>/);
   const page = await call('GET', '/new?kind=single');

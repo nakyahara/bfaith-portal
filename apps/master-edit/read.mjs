@@ -25,6 +25,7 @@ import { normalizeSort, sortColumnOf } from './list-columns.mjs';
 import { masterProfit } from '../../lib/profit-estimate.js';
 import { readNeSpellings, exportCode } from './ne-spelling.mjs';
 import { makerNamesOf } from '../../lib/master-maker.mjs';
+import { packagesOf } from '../../lib/master-package.mjs';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
 export async function selectableSuppliers(db) {
@@ -465,6 +466,11 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   {
     const names = await makerNamesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
     for (const r of pageRows) r.maker = (r.kind === 'single' && r.product_id && names.get(r.product_id)) || null;
+  }
+  // 🆕 0087: 梱包した状態の 縦・横・高さ・重さ (単品の商品の行だけ・まとめた値 = 一覧の「大きさ・重さ」の列と CSV の最後の列)。表が無い・読めない = 空
+  {
+    const pk = await packagesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
+    for (const r of pageRows) r.pkg = (r.kind === 'single' && r.product_id && pk.get(String(r.product_id))) || null;
   }
   // JAN (CSV だけ = 画面の一覧には出さない)。商品ごと・今の JAN (終わっていない) を並べる
   if (mode === 'all') {
