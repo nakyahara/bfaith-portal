@@ -805,7 +805,7 @@ function getCompositeRank(score) {
 // ── Phase 1A: FBM 送料計算（サーバー側）──
 // クライアント側 calcFbmShipping(dims) と同等のロジック。
 // SSE ハンドラーが items の fbm_* を書き込むために使用する。
-function calcFbmShippingServer(dims, settings, shippingTable) {
+export function calcFbmShippingServer(dims, settings, shippingTable) {
   const mode = settings?.fbmShippingMode || 'auto';
   const l = parseFloat(dims?.length) || 0;
   const w = parseFloat(dims?.width) || 0;

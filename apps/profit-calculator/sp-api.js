@@ -144,8 +144,11 @@ const KG_PER_UNIT = {
   ounces: 0.028349523125, ounce: 0.028349523125, oz: 0.028349523125,
 };
 
+/** 単位が分からなかったしるし (値が無い null とは分ける) */
+const UNKNOWN_UNIT = Symbol('unknown-unit');
+
 /**
- * { unit, value } を単位表で換算する。値が無い・0 以下・単位が分からないときは null。
+ * { unit, value } を単位表で換算する。値が無い・0 以下なら null、単位が分からないなら UNKNOWN_UNIT。
  * 単位の欄そのものが無いときだけ、これまでどおりの単位 (インチ・ポンド) とみなす
  * (2026-09-06 に miniPC で見た実物は "pounds" だった・fba-box/images.js の説明)
  */
@@ -154,24 +157,30 @@ function convertMeasure(m, table, legacyUnit) {
   if (!Number.isFinite(value) || value <= 0) return null;
   const unit = String(m?.unit ?? '').trim().toLowerCase();
   const factor = unit ? table[unit] : table[legacyUnit];
-  if (!factor) {
-    console.warn(`[SP-API] 知らない単位なので寸法・重さを使いません: ${m?.unit}`);
-    return null;
-  }
+  if (!factor) return UNKNOWN_UNIT;
   return value * factor;
 }
 
 /**
  * カタログの dimensions[0].package → 画面と計算で使う形。
  * 返す形はこれまでと同じ: dimensions は cm (小数1桁) / kg (小数2桁) の文字列、分からない値は '-'。
- * volumeCm3 は丸める前の cm で計算する (3 辺のどれかが分からなければ 0)
+ * volumeCm3 は丸める前の cm で計算する。
+ * ⚠ 送料の判定 (router.js calcFbmShippingServer / bulk-research.html calcFbmShipping) は '-' を 0 として
+ *   「制限内」とみなすので、一部だけ分かる寸法は渡さない:
+ *   - 知らない単位が 1 つでもあれば、寸法も重さも全部 '-' (全部不明 = 既存の「寸法不明」の扱いになる)
+ *   - 3 辺のどれかが無ければ、3 辺とも '-' (重さは分かればそのまま)
  */
 export function normalizePackageDimensions(pkg) {
   const p = pkg || {};
-  const l = convertMeasure(p.length, CM_PER_UNIT, 'inches');
-  const w = convertMeasure(p.width, CM_PER_UNIT, 'inches');
-  const h = convertMeasure(p.height, CM_PER_UNIT, 'inches');
-  const kg = convertMeasure(p.weight, KG_PER_UNIT, 'pounds');
+  let l = convertMeasure(p.length, CM_PER_UNIT, 'inches');
+  let w = convertMeasure(p.width, CM_PER_UNIT, 'inches');
+  let h = convertMeasure(p.height, CM_PER_UNIT, 'inches');
+  let kg = convertMeasure(p.weight, KG_PER_UNIT, 'pounds');
+  if ([l, w, h, kg].includes(UNKNOWN_UNIT)) {
+    console.warn(`[SP-API] 知らない単位があるので寸法・重さを使いません: ${['length', 'width', 'height', 'weight'].map((k) => p[k]?.unit).join(' / ')}`);
+    l = w = h = kg = null;
+  }
+  if (l == null || w == null || h == null) l = w = h = null;
   const cm = (v) => v == null ? '-' : v.toFixed(1);
   return {
     dimensions: {
@@ -180,7 +189,7 @@ export function normalizePackageDimensions(pkg) {
       height: cm(h),
       weight: kg == null ? '-' : kg.toFixed(2),
     },
-    volumeCm3: l && w && h ? l * w * h : 0,
+    volumeCm3: l == null ? 0 : l * w * h,
   };
 }
 

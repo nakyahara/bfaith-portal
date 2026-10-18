@@ -5,9 +5,16 @@
  * 実行: node apps/profit-calculator/test-units-storage.mjs
  */
 import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+// router.js (送料の判定) を読むときに本物のデータの場所を触らないよう、空の一時フォルダを使う
+process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-units-test-'));
 
 const { getProduct, normalizePackageDimensions, _setClientForTest } = await import('./sp-api.js');
 const { estimateStorageCost, STORAGE_UNKNOWN_COST } = await import('./storage-estimate.js');
+const { calcFbmShippingServer } = await import('./router.js');
 
 let passed = 0;
 async function t(name, fn) {
@@ -104,14 +111,51 @@ await t('単位の欄が無いときだけ、これまでどおりインチ・�
   assert.deepEqual(p.dimensions, { length: '25.4', width: '12.7', height: '5.1', weight: '0.45' });
 });
 
-await t('知らない単位は推測しない (- にして体積 0)', async () => {
+const ALL_UNKNOWN = { length: '-', width: '-', height: '-', weight: '-' };
+
+await t('知らない単位は推測しない: 1 つでもあれば寸法も重さも全部 - (体積 0)', async () => {
   useCatalog({
     length: { unit: 'cubits', value: 10 }, width: { unit: 'centimeters', value: 5 }, height: { unit: 'centimeters', value: 2 },
+    weight: { unit: 'kilograms', value: 1 },
+  });
+  let p = await getProduct('B000TEST01');
+  assert.deepEqual(p.dimensions, ALL_UNKNOWN);
+  assert.equal(p.volumeCm3, 0);
+  // 重さだけ知らない単位でも全部 -
+  useCatalog({
+    length: { unit: 'centimeters', value: 20 }, width: { unit: 'centimeters', value: 10 }, height: { unit: 'centimeters', value: 2 },
     weight: { unit: 'stones', value: 1 },
   });
-  const p = await getProduct('B000TEST01');
-  assert.deepEqual(p.dimensions, { length: '-', width: '5.0', height: '2.0', weight: '-' });
-  assert.equal(p.volumeCm3, 0);
+  p = await getProduct('B000TEST01');
+  assert.deepEqual(p.dimensions, ALL_UNKNOWN);
+});
+
+await t('3 辺のどれかが無ければ 3 辺とも - (重さは残す)', async () => {
+  const r = normalizePackageDimensions({ length: { unit: 'centimeters', value: 20 }, width: { unit: 'centimeters', value: 10 }, weight: { unit: 'grams', value: 500 } });
+  assert.deepEqual(r.dimensions, { length: '-', width: '-', height: '-', weight: '0.50' });
+  assert.equal(r.volumeCm3, 0);
+});
+
+await t('🚨 一部だけ分かる寸法で送料が安い便に決まらない (calcFbmShippingServer まで通す)', async () => {
+  const table = [{ name: 'ネコポス', total: 237 }, { name: '宅急便60サイズ', total: 900 }];
+  // 20cm × 10cm × 高さ 2 デシメートル (知らない単位) → 高さ 0 扱いならネコポス確定になってしまう形
+  const unknownH = normalizePackageDimensions({
+    length: { unit: 'centimeters', value: 20 }, width: { unit: 'centimeters', value: 10 }, height: { unit: 'decimeters', value: 2 },
+    weight: { unit: 'kilograms', value: 0.5 },
+  });
+  assert.equal(calcFbmShippingServer(unknownH.dimensions, {}, table).method, 'ネコポス(寸法不明)');
+  // 高さが無い
+  const noH = normalizePackageDimensions({ length: { unit: 'centimeters', value: 20 }, width: { unit: 'centimeters', value: 10 }, weight: { unit: 'kilograms', value: 0.5 } });
+  assert.equal(calcFbmShippingServer(noH.dimensions, {}, table).method, 'ネコポス(寸法不明)');
+  // ちゃんと分かれば寸法どおり (20 × 10 × 20cm = 3 辺 50cm・厚さでネコポス不可 → 60 サイズ)
+  const ok = normalizePackageDimensions({
+    length: { unit: 'centimeters', value: 20 }, width: { unit: 'centimeters', value: 10 }, height: { unit: 'centimeters', value: 20 },
+    weight: { unit: 'kilograms', value: 0.5 },
+  });
+  assert.equal(calcFbmShippingServer(ok.dimensions, {}, table).method, '宅急便60サイズ');
+  // 以前のようにセンチをインチとみなすと 50.8 + 25.4 + 50.8 = 127cm で 60 サイズに入らない
+  const asInches = normalizePackageDimensions({ length: { unit: 'inches', value: 20 }, width: { unit: 'inches', value: 10 }, height: { unit: 'inches', value: 20 }, weight: { unit: 'kilograms', value: 0.5 } });
+  assert.equal(calcFbmShippingServer(asInches.dimensions, {}, table).method, '宅急便140(該当なし)');
 });
 
 await t('寸法が無い商品は全部 - (以前と同じ形)', async () => {
@@ -134,6 +178,10 @@ await t('小型 (3 辺合計 60cm 以下) = 30 円', async () => {
 await t('標準 (60cm 超〜100cm 以下) = 80 円', async () => {
   assert.equal(estimateStorageCost({ length: '30.1', width: '20.0', height: '10.0', weight: '0.5' }), 80);
   assert.equal(estimateStorageCost({ length: '40.0', width: '35.0', height: '25.0', weight: '2.0' }), 80); // ちょうど 100
+  // 小数の足し算の誤差で区切りを越えない (40.1 + 35.2 + 24.7 は JS だと 100.00000000000001)
+  assert.equal(estimateStorageCost({ length: '40.1', width: '35.2', height: '24.7', weight: '2.0' }), 80);
+  assert.equal(estimateStorageCost({ length: '20.1', width: '20.2', height: '19.7', weight: '1.0' }), 30); // ちょうど 60
+  assert.equal(estimateStorageCost({ length: '40.1', width: '35.2', height: '24.8', weight: '2.0' }), 250); // 100.1
 });
 
 await t('大型 (100cm 超) = 250 円', async () => {

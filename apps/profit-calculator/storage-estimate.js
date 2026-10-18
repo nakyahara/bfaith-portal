@@ -28,6 +28,7 @@ export function estimateStorageCost(dimensions) {
   const h = side(dimensions.height);
   // 3 辺のどれかが分からないと大きさを決められないので「不明」扱い
   if (!l || !w || !h) return STORAGE_UNKNOWN_COST;
-  const total = l + w + h;
-  return STORAGE_TIERS.find((t) => total <= t.maxSumCm).cost;
+  // 小数の足し算の誤差 (40.1 + 35.2 + 24.7 = 100.00000000000001) で区切りを越えないよう、0.1cm 単位の整数で比べる
+  const totalTenths = Math.round(l * 10) + Math.round(w * 10) + Math.round(h * 10);
+  return STORAGE_TIERS.find((t) => totalTenths <= t.maxSumCm * 10).cost;
 }
