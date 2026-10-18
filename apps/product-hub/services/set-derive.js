@@ -130,106 +130,7 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
 
   return db.transaction(() => {
     const neCode = nextProvisionalCode(db, parent.ne_code);
-    // 売価の初期値 = 構成の「単品売価 × 個数」の和 (§4.4 決⑦)。1 件でも単価が引けなければ
-    // null (空のまま) — 欠けた合計を入れると人が気づかずに出品する
-    const priceInit = setPriceFromMembers(db, members);
-    const info = db.prepare(`
-      INSERT INTO product_drafts (
-        ne_code, name, status, official_url, amazon_url, own_brand, has_variation,
-        memo, source, created_by, parent_draft_id, provisional_code,
-        ne_registration_state, parent_snapshot_at, price
-      ) VALUES (?, ?, 'draft', ?, ?, ?, 0, ?, 'portal', ?, ?, 1, 'not_requested', ?, ?)
-    `).run(
-      neCode, name.slice(0, 300),
-      parent.official_url, parent.amazon_url, parent.own_brand,
-      `${parent.ne_code} から作ったセット商品`,
-      actor || null, parentId,
-      // 派生した時点の親。親がこの後に変わったら「親が更新されています」を出す (§4.5)
-      parent.updated_at || null,
-      priceInit.total,
-    );
-    const setId = Number(info.lastInsertRowid);
-
-    const insMember = db.prepare(
-      'INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, ?)'
-    );
-    members.forEach((m, i) => insMember.run(setId, m.code, m.qty, i));
-
-    // 参考URL・仕様表・Yahoo 項目・ページ表記・カテゴリ属性は単品と同じものが使える
-    db.prepare(`
-      INSERT INTO draft_reference_urls (draft_id, url, sort)
-      SELECT ?, url, sort FROM draft_reference_urls WHERE draft_id = ?
-    `).run(setId, parentId);
-    // 仕様表も**数量で変わる行は落とす** (Codex R2 high)。
-    // ページ表記の内容量だけ除外しても、仕様表に「サイズ 10cm」「内容量 50ml」が残ると
-    // 2 個セットの商品ページに単品の値が出る。素材・原産国などはそのまま使える
-    const specs = db.prepare('SELECT spec_key, spec_value, sort FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(parentId);
-    const insSpec = db.prepare('INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, ?, ?, ?)');
-    let dropped = 0;
-    for (const sp of specs) {
-      if (isQuantityDependentSpec(sp.spec_key)) { dropped++; continue; }
-      insSpec.run(setId, sp.spec_key, sp.spec_value, sp.sort);
-    }
-    // 売価・佐川売価はセットで変わるのでコピーしない (税率・配送・カテゴリだけ引き継ぐ)
-    const py = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(parentId);
-    if (py) {
-      // shipping_override (ヤフーだけ別配送) は配送方法の一部なので一緒に引き継ぐ。
-      // 抜かすと親が「定形外（ヤフーのみネコポス）」でもセットは楽天と同じ扱いになる
-      db.prepare(`
-        INSERT INTO draft_yahoo (draft_id, delivery_label, shipping_override, tax_rate, yahoo_category_id, yahoo_path)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(setId, py.delivery_label, py.shipping_override ?? 0, ctx.withTax === false ? null : py.tax_rate, py.yahoo_category_id, py.yahoo_path);   // 切替で閉じた後は税率を写さない (PR #1565 R1 H4)
-    }
-    // 商品ページ表記は**許可リスト**でコピーする (Codex R1 high 2026-08-23)。
-    // 全列コピーすると「50ml」の 2 個セットが内容量 50ml のまま出て、法定表示が誤る。
-    // 数量で変わるもの (内容量・サイズ) と食品表示は空にして、人に入れ直させる。
-    // ブランド名は数量で変わらないのでコピーする (2026-08-28)。
-    // その他注意事項 (「箱から出して配送します」等) も数量で変わらないのでコピーする (2026-09-13)
-    const pinfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(parentId);
-    if (pinfo) {
-      db.prepare(`
-        INSERT INTO draft_page_info (
-          draft_id, product_type, brand_name, ingredients, usage_notes, other_notes, origin_type, origin_country,
-          category_label, seller_name, importer_name
-        )
-        SELECT ?, product_type, brand_name, ingredients, usage_notes, other_notes, origin_type, origin_country,
-               category_label, seller_name, importer_name
-        FROM draft_page_info WHERE draft_id = ?
-      `).run(setId, parentId);
-    }
-    // 楽天のジャンル・属性はそのまま使える (画像と登録状態は引き継がない)。
-    // article_number (メーカー型番) も引き継ぐ (2026-08-31 / Codex R1 high): 入口を
-    // article_number に統一したので、ここを抜かすと派生したセット商品から型番が消える
-    // 🚨 配送方法 (shipping_method_group / postage_included / normal_delivery_date_id) は
-    //    **コピーしない** (2026-09-04 §4.4 決⑥)。セットは重く・大きくなるので親と変わる。
-    //    空にしておけば effectiveShippingForDraft が NE の配送方法へフォールバックするので、
-    //    本コードが確定した時点で自動的に NE の値になる。誤った初期値を置いて後から直す方式は
-    //    「直し忘れ」が残り、親の配送方法のまま出品されるほうが危ない。親の値は画面に参考表示する
-    const prk = db.prepare('SELECT genre_id, attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(parentId);
-    if (prk) {
-      db.prepare(`
-        INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
-        VALUES (?, ?, ?, ?)
-      `).run(setId, prk.genre_id, prk.attributes_json, prk.article_number);
-    }
-    db.prepare(`
-      INSERT INTO draft_shop_categories (draft_id, shop_category_id, slot)
-      SELECT ?, shop_category_id, slot FROM draft_shop_categories WHERE draft_id = ?
-    `).run(setId, parentId);
-
-    // 工程を作る。セットは**セット専用のテンプレート** (構成決定 → NE登録 → 商品情報作成・確認 →
-    // 出品準備 → 出品・展開) を持つので、単品の「基本情報入力」「AI情報入力待ち」は無い。
-    // どちらのモードでも「構成決定」から始まり、モードの違いは**説明文の初期値**だけ
-    // (2026-09-04 要件定義 §4.1/§5.6):
-    //   ai   … 説明文を持たせず、AI にセット用へ書かせる
-    //   copy … 単品の説明文を引き継いで、人がセット用に直す
-    ensureProgress(db, setId);
-    if (mode === 'copy') {
-      db.prepare(`
-        INSERT INTO draft_ai_outputs (draft_id, kind, content, generated_at, model_note, edited_by_human)
-        SELECT ?, kind, content, generated_at, '単品からコピー', 0 FROM draft_ai_outputs WHERE draft_id = ?
-      `).run(setId, parentId);
-    }
+    const { setId, dropped, priceInit } = insertSetDraftRows(db, parent, { members, name, neCode, mode, actor, ctx, memo: `${parent.ne_code} から作ったセット商品` });
 
     // 「セットを作った」という判断を先に残す (2026-09-04 §4.2)。
     // ⑤はこの記録があるときだけ閉じられる — 記録の前に閉じると順序が逆になる
@@ -245,34 +146,180 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
 
     const memberText = members.map((m) => `${m.code}×${m.qty}`).join(' + ');
     logEvent(db, parentId, 'set_draft_created', `${neCode} (${memberText}) を作成 [${mode === 'ai' ? 'AIに書き換え' : 'コピーして手直し'}]`, actor);
-    logEvent(db, setId, 'created_from_parent',
-      `${parent.ne_code} から作成 (${memberText})`
-      + (dropped > 0 ? ` ／ 仕様表 ${dropped} 行はセットで値が変わるため引き継いでいません (要入力)` : ''),
-      actor);
-    // 売価の初期値と配送方法は「なぜそうなっているか」が後から分かるように残す (§4.4)。
-    // どちらも人が直す前提なので、痕跡が無いと「誰かが入れた値」に見えて触りにくい
-    logEvent(db, setId, 'price_prefilled',
-      priceInit.total != null
-        ? `売価の初期値 ${describeSetPrice(priceInit)} を入れました (税込。送料・値引きは含みません)`
-        : `売価の初期値は入れていません (単価が引けない商品: ${priceInit.missing.filter(Boolean).join(', ') || '不明'})`,
-      actor);
-    // 画像の引き継ぎ計画 (§4.7)。親の全枠を「そのまま使う」で作り、その画像をコピーする。
-    // 直したい枠は作成後に画像タブで変える (変えると制作工程が戻る)
-    const planned = seedImagePlans(db, setId, parentId);
-    const copiedImages = applyReuseImages(db, setId).copied;
-    applyImagePlanToTrack(db, setId, actor);
-    if (planned > 0) {
-      logEvent(db, setId, 'set_image_plan_seeded',
-        `画像の計画を作りました (親の ${planned} 枠。既定は「そのまま使う」で ${copiedImages} 枚コピー)。`
-        + '直したい枠は画像タブで「直して使う」に変えてください',
-        actor);
-    }
-    logEvent(db, setId, 'shipping_not_copied',
-      '配送方法は親からコピーしていません (セットは個数で重さ・大きさが変わるため)。'
-      + 'NE の本コードが確定すると NE の配送方法が使われます',
-      actor);
+    afterSetDraftRows(db, setId, parent, { memberText, dropped, priceInit, actor, fromText: `${parent.ne_code} から作成` });
     return { draftId: setId, neCode };
   })();
+}
+
+/**
+ * 🆕 新商品の登録 (単品) で決めたセット (個数・コード・名前) の下書きを作る (2026-10-17 中原さん・services/cdb-set-plan.js から。取引の中で呼ぶ)。
+ *   構成 = 親 (単品) × 個数・売価の初期値・画像の計画・コピーする欄は「セット商品を作る」(createSetDraft) と同じ。
+ *   違うのは: 商品コード = 登録の画面で決めた本コードの予定 (仮コード SET-… ではない)・説明文は AI に書かせる (親にまだ無い)・
+ *   親の「セット展開判断」の工程は閉じない (取り込みは人の操作でない = 担当・版数を通さない。判断の記録 (作成) は残すので、人がボードで閉じられる)。
+ *   🚨 provisional_code = 1 のまま (insertSetDraftRows)。NE の商品マスタにこのコードが取り込まれたら reconcileProvisionalCode が確定する。
+ *      それまで楽天の出品 (buildItemPayload の門)・モールの完了・Notion への書き戻しは止まる = 下書きのまま。コードは /set-code で直せる (確定の前だけ)
+ * @returns {{draftId: number, neCode: string} | {skipped: string, conflictDraftId?: number}}
+ */
+export function createPlannedSetDraft(db, parentDraftId, { qty, code, name }, actor) {
+  const parent = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(Number(parentDraftId));
+  if (!parent) return { skipped: '元の商品のカードが見つかりません' };
+  if (parent.parent_draft_id) return { skipped: '元の商品がセットです (セットからさらにセットは作れません)' };
+  const neCode = String(code || '').trim();
+  const dup = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id LIMIT 1').get(neCode.toLowerCase());
+  if (dup) return { skipped: `同じ商品コード ${neCode} のカード (#${dup.id}) がもうあります (増やしていません)`, conflictDraftId: dup.id };
+  const n = db.prepare('SELECT COUNT(*) AS c FROM product_drafts WHERE parent_draft_id = ?').get(parent.id).c;
+  if (n >= MAX_SET_PER_PARENT) return { skipped: `この商品のセットは ${MAX_SET_PER_PARENT} 件までです` };
+  const members = [{ code: parent.ne_code, qty: Number(qty) }];
+  const memberText = `${parent.ne_code}×${Number(qty)}`;
+  const { setId, dropped, priceInit } = insertSetDraftRows(db, parent, {
+    members, name: String(name || '').trim(), neCode, mode: 'ai', actor, ctx: { withTax: false },
+    memo: `${parent.ne_code} の新商品の登録で作ったセットの下書き (NE に登録するまで出品しません)`,
+  });
+  recordSetDecision(db, parent.id, { decision: 'create', linked_set_draft_id: setId }, actor);
+  logEvent(db, parent.id, 'set_draft_created', `${neCode} (${memberText}) をセットの下書きとして作成 [新商品の登録]`, actor);
+  afterSetDraftRows(db, setId, parent, { memberText, dropped, priceInit, actor, fromText: `${parent.ne_code} の新商品の登録で作ったセットの下書き (NE 登録待ち)` });
+  return { draftId: setId, neCode };
+}
+
+/**
+ * セットの派生ドラフトの行を作る (createSetDraft と、新商品の登録で決めたセットの下書き createPlannedSetDraft で同じ)。取引の中で呼ぶ。
+ * 商品コードは呼び手が決める (仮コード SET-<親>-01 か、新商品の登録で決めた本コードの予定)。どちらも provisional_code = 1 (NE で確かめるまで出品しない)
+ * @returns {{setId: number, dropped: number, priceInit: object}}
+ */
+function insertSetDraftRows(db, parent, { members, name, neCode, mode, actor, ctx = {}, memo }) {
+  const parentId = Number(parent.id);
+  // 売価の初期値 = 構成の「単品売価 × 個数」の和 (§4.4 決⑦)。1 件でも単価が引けなければ
+  // null (空のまま) — 欠けた合計を入れると人が気づかずに出品する
+  const priceInit = setPriceFromMembers(db, members);
+  const info = db.prepare(`
+    INSERT INTO product_drafts (
+      ne_code, name, status, official_url, amazon_url, own_brand, has_variation,
+      memo, source, created_by, parent_draft_id, provisional_code,
+      ne_registration_state, parent_snapshot_at, price
+    ) VALUES (?, ?, 'draft', ?, ?, ?, 0, ?, 'portal', ?, ?, 1, 'not_requested', ?, ?)
+  `).run(
+    neCode, name.slice(0, 300),
+    parent.official_url, parent.amazon_url, parent.own_brand,
+    memo,
+    actor || null, parentId,
+    // 派生した時点の親。親がこの後に変わったら「親が更新されています」を出す (§4.5)
+    parent.updated_at || null,
+    priceInit.total,
+  );
+  const setId = Number(info.lastInsertRowid);
+
+  const insMember = db.prepare(
+    'INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, ?)'
+  );
+  members.forEach((m, i) => insMember.run(setId, m.code, m.qty, i));
+
+  // 参考URL・仕様表・Yahoo 項目・ページ表記・カテゴリ属性は単品と同じものが使える
+  db.prepare(`
+    INSERT INTO draft_reference_urls (draft_id, url, sort)
+    SELECT ?, url, sort FROM draft_reference_urls WHERE draft_id = ?
+  `).run(setId, parentId);
+  // 仕様表も**数量で変わる行は落とす** (Codex R2 high)。
+  // ページ表記の内容量だけ除外しても、仕様表に「サイズ 10cm」「内容量 50ml」が残ると
+  // 2 個セットの商品ページに単品の値が出る。素材・原産国などはそのまま使える
+  const specs = db.prepare('SELECT spec_key, spec_value, sort FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(parentId);
+  const insSpec = db.prepare('INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, ?, ?, ?)');
+  let dropped = 0;
+  for (const sp of specs) {
+    if (isQuantityDependentSpec(sp.spec_key)) { dropped++; continue; }
+    insSpec.run(setId, sp.spec_key, sp.spec_value, sp.sort);
+  }
+  // 売価・佐川売価はセットで変わるのでコピーしない (税率・配送・カテゴリだけ引き継ぐ)
+  const py = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(parentId);
+  if (py) {
+    // shipping_override (ヤフーだけ別配送) は配送方法の一部なので一緒に引き継ぐ。
+    // 抜かすと親が「定形外（ヤフーのみネコポス）」でもセットは楽天と同じ扱いになる
+    db.prepare(`
+      INSERT INTO draft_yahoo (draft_id, delivery_label, shipping_override, tax_rate, yahoo_category_id, yahoo_path)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(setId, py.delivery_label, py.shipping_override ?? 0, ctx.withTax === false ? null : py.tax_rate, py.yahoo_category_id, py.yahoo_path);   // 切替で閉じた後は税率を写さない (PR #1565 R1 H4)
+  }
+  // 商品ページ表記は**許可リスト**でコピーする (Codex R1 high 2026-08-23)。
+  // 全列コピーすると「50ml」の 2 個セットが内容量 50ml のまま出て、法定表示が誤る。
+  // 数量で変わるもの (内容量・サイズ) と食品表示は空にして、人に入れ直させる。
+  // ブランド名は数量で変わらないのでコピーする (2026-08-28)。
+  // その他注意事項 (「箱から出して配送します」等) も数量で変わらないのでコピーする (2026-09-13)
+  const pinfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(parentId);
+  if (pinfo) {
+    db.prepare(`
+      INSERT INTO draft_page_info (
+        draft_id, product_type, brand_name, ingredients, usage_notes, other_notes, origin_type, origin_country,
+        category_label, seller_name, importer_name
+      )
+      SELECT ?, product_type, brand_name, ingredients, usage_notes, other_notes, origin_type, origin_country,
+             category_label, seller_name, importer_name
+      FROM draft_page_info WHERE draft_id = ?
+    `).run(setId, parentId);
+  }
+  // 楽天のジャンル・属性はそのまま使える (画像と登録状態は引き継がない)。
+  // article_number (メーカー型番) も引き継ぐ (2026-08-31 / Codex R1 high): 入口を
+  // article_number に統一したので、ここを抜かすと派生したセット商品から型番が消える
+  // 🚨 配送方法 (shipping_method_group / postage_included / normal_delivery_date_id) は
+  //    **コピーしない** (2026-09-04 §4.4 決⑥)。セットは重く・大きくなるので親と変わる。
+  //    空にしておけば effectiveShippingForDraft が NE の配送方法へフォールバックするので、
+  //    本コードが確定した時点で自動的に NE の値になる。誤った初期値を置いて後から直す方式は
+  //    「直し忘れ」が残り、親の配送方法のまま出品されるほうが危ない。親の値は画面に参考表示する
+  const prk = db.prepare('SELECT genre_id, attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(parentId);
+  if (prk) {
+    db.prepare(`
+      INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
+      VALUES (?, ?, ?, ?)
+    `).run(setId, prk.genre_id, prk.attributes_json, prk.article_number);
+  }
+  db.prepare(`
+    INSERT INTO draft_shop_categories (draft_id, shop_category_id, slot)
+    SELECT ?, shop_category_id, slot FROM draft_shop_categories WHERE draft_id = ?
+  `).run(setId, parentId);
+
+  // 工程を作る。セットは**セット専用のテンプレート** (構成決定 → NE登録 → 商品情報作成・確認 →
+  // 出品準備 → 出品・展開) を持つので、単品の「基本情報入力」「AI情報入力待ち」は無い。
+  // どちらのモードでも「構成決定」から始まり、モードの違いは**説明文の初期値**だけ
+  // (2026-09-04 要件定義 §4.1/§5.6):
+  //   ai   … 説明文を持たせず、AI にセット用へ書かせる
+  //   copy … 単品の説明文を引き継いで、人がセット用に直す
+  ensureProgress(db, setId);
+  if (mode === 'copy') {
+    db.prepare(`
+      INSERT INTO draft_ai_outputs (draft_id, kind, content, generated_at, model_note, edited_by_human)
+      SELECT ?, kind, content, generated_at, '単品からコピー', 0 FROM draft_ai_outputs WHERE draft_id = ?
+    `).run(setId, parentId);
+  }
+  return { setId, dropped, priceInit };
+}
+
+/** セットの派生ドラフトを作った後の記録・画像の計画・配送の一言 (createSetDraft と createPlannedSetDraft で同じ) */
+function afterSetDraftRows(db, setId, parent, { memberText, dropped, priceInit, actor, fromText }) {
+  const parentId = Number(parent.id);
+  logEvent(db, setId, 'created_from_parent',
+    `${fromText} (${memberText})`
+    + (dropped > 0 ? ` ／ 仕様表 ${dropped} 行はセットで値が変わるため引き継いでいません (要入力)` : ''),
+    actor);
+  // 売価の初期値と配送方法は「なぜそうなっているか」が後から分かるように残す (§4.4)。
+  // どちらも人が直す前提なので、痕跡が無いと「誰かが入れた値」に見えて触りにくい
+  logEvent(db, setId, 'price_prefilled',
+    priceInit.total != null
+      ? `売価の初期値 ${describeSetPrice(priceInit)} を入れました (税込。送料・値引きは含みません)`
+      : `売価の初期値は入れていません (単価が引けない商品: ${priceInit.missing.filter(Boolean).join(', ') || '不明'})`,
+    actor);
+  // 画像の引き継ぎ計画 (§4.7)。親の全枠を「そのまま使う」で作り、その画像をコピーする。
+  // 直したい枠は作成後に画像タブで変える (変えると制作工程が戻る)
+  const planned = seedImagePlans(db, setId, parentId);
+  const copiedImages = applyReuseImages(db, setId).copied;
+  applyImagePlanToTrack(db, setId, actor);
+  if (planned > 0) {
+    logEvent(db, setId, 'set_image_plan_seeded',
+      `画像の計画を作りました (親の ${planned} 枠。既定は「そのまま使う」で ${copiedImages} 枚コピー)。`
+      + '直したい枠は画像タブで「直して使う」に変えてください',
+      actor);
+  }
+  logEvent(db, setId, 'shipping_not_copied',
+    '配送方法は親からコピーしていません (セットは個数で重さ・大きさが変わるため)。'
+    + 'NE の本コードが確定すると NE の配送方法が使われます',
+    actor);
 }
 
 /**

@@ -13,6 +13,23 @@
 import { fmtJst, fmtDay } from './ui-format.mjs';
 import { PLATFORM_FEE_RATES, ratePct1 } from '../../lib/profit-estimate.js';
 import { LIFE_STAGES } from '../../lib/master-brand-life.mjs';
+import { PACKAGE_AXES, sourceWords } from '../../lib/master-package.mjs';
+
+/** 🆕 0087: mm → cm の数 (小数 1 けた)。無い = null */
+const cmNum = (mm) => (mm == null ? null : Math.round(Number(mm)) / 10);
+/** 🆕 0087: 軸ごとの出どころの言葉 (同じ出どころの軸はまとめる)。例「縦・横・高さ = 人 / 重さ = FBA 納品 (実測)」 */
+function pkgSourcesText(p) {
+  if (!p) return '';
+  const by = new Map();
+  for (const a of PACKAGE_AXES) {
+    const src = p.sources && p.sources[a.axis];
+    if (!src || p[a.axis] == null) continue;
+    const w = sourceWords(src, p.refs && p.refs[a.axis]);
+    if (!by.has(w)) by.set(w, []);
+    by.get(w).push(a.label);
+  }
+  return [...by].map(([w, ls]) => `${ls.join('・')} = ${w}`).join(' / ');
+}
 
 export const KIND_LABELS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
 const SALES_LABELS = Object.freeze({ 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' });
@@ -76,6 +93,12 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
     ['商品コードの注意', (r) => r.code_note || ''],
     // 🆕 0084 (2026-10-17): メーカー (Company DB だけの値・単品だけ・セットは空)。前の列の並びは変えない (最後に足す)
     ['メーカー', (r) => r.maker || ''],
+    // 🆕 0087: 梱包した状態の 縦・横・高さ (cm)・重さ (g) = まとめた値 (人 → 出どころの順位 → 新しい順)・出どころ (単品だけ・無い = 空)。最後に足す
+    ['梱包の縦 (cm)', (r) => cmNum(r.pkg && r.pkg.length_mm)],
+    ['梱包の横 (cm)', (r) => cmNum(r.pkg && r.pkg.width_mm)],
+    ['梱包の高さ (cm)', (r) => cmNum(r.pkg && r.pkg.height_mm)],
+    ['梱包の重さ (g)', (r) => (r.pkg && r.pkg.weight_g != null ? r.pkg.weight_g : null)],
+    ['大きさ・重さの出どころ', (r) => pkgSourcesText(r.pkg)],
     // 🆕 0085 (2026-10-17): ブランド・自社ブランド・定番 / 季節 / 試し・終売の予定日 (Company DB だけの値・単品だけ)。メーカーの後ろに足す (前の列の並びは変えない)。
     //   発売日 (初めて売った日) は出さない (全部の商品の注文・出荷を読むと重い = 商品の画面だけ)
     ['ブランド', (r) => r.brand || ''],
@@ -105,6 +128,69 @@ function jstFull(iso) {
   const d = new Date(t + 9 * 3600e3).toISOString();
   return `${d.slice(0, 10).replace(/-/g, '/')} ${d.slice(11, 16)}`;
 }
+/** 日付 'YYYY-MM-DD' → 'YYYY/MM/DD' (Excel で日付として読める)。無い = 空 */
+const ymdSlash = (v) => (v ? String(v).slice(0, 10).replace(/-/g, '/') : '');
+/** 行を CSV に (BOM + 見出し + 行・CRLF・式の注入の対策 = csvCell) */
+function csvOf(cols, rows) {
+  const lines = [cols.map(([h]) => csvCell(h)).join(',')];
+  for (const r of rows) lines.push(cols.map(([, f]) => csvCell(f(r))).join(','));
+  return `﻿${lines.join('\r\n')}\r\n`;
+}
+
+/** 未登録 (売れたのに対応が無い SKU) の CSV のファイル名。例 amazon-unmapped_20261017-0930.csv */
+export const unmappedCsvFileName = (nowMs = Date.now()) => csvFileName(nowMs).replace(/^master-list_/, 'amazon-unmapped_');
+/**
+ * 未登録の CSV (10/17 中原さん「未登録一覧の CSV ダウンロード」)。data = amazonUnmapped の結果 (画面と同じ期間)。
+ *   行 = 画面の一覧 (FBA) + 自社発送で seller SKU が NE コードでない SKU (withFbm = 画面でその一覧を開いているとき) + 区分が分からない SKU (画面の下の一言の SKU)。
+ *   「一覧」の列で分ける。期間・今日も列に (Excel で開いた後も、いつのどの範囲か分かる)
+ */
+export function buildUnmappedCsv(data, { withFbm = false, mapStates = {}, channels = {}, periodLabel = '' } = {}) {
+  const FROM = { report: '出品一覧', fees: '手数料', conflict: '食い違い', stale: '古い', none: '無い' };
+  const list = [
+    ...data.rows.map((r) => ({ ...r, group: 'FBA' })),
+    ...(withFbm ? (data.fbm || []).map((r) => ({ ...r, group: '自社発送 (seller SKU が NE コードでない)' })) : []),
+    ...(data.unknown || []).map((r) => ({ ...r, group: '区分が分からない' })),
+  ];
+  const cols = [
+    ['一覧', (r) => r.group],
+    ['seller SKU', (r) => r.code],
+    ['Amazon の商品名', (r) => r.title || ''],
+    ['区分', (r) => (r.channel ? channels[r.channel] || r.channel : '')],
+    ['区分の出どころ', (r) => FROM[r.channel_from] || ''],
+    ['個数', (r) => Number(r.units)],
+    ['注文', (r) => Number(r.orders)],
+    ['最後に売れた日', (r) => ymdSlash(r.last_date)],
+    ['いまの対応', (r) => (r.map_state ? mapStates[r.map_state] || r.map_state : r.listing_id ? '出品はある (構成なし)' : '出品なし')],
+    ['期間', () => `${periodLabel}${data.from ? ` (${ymdSlash(data.from)} 〜 ${ymdSlash(data.today)})` : ''}`],
+    ['未判定の日 (売上の日次が未公開)', () => (data.undecided || []).length],
+  ];
+  return csvOf(cols, list);
+}
+
+/** まだつないでいない SKU の CSV のファイル名。例 amazon-unlinked_20261017-0930.csv */
+export const unlinkedCsvFileName = (nowMs = Date.now()) => csvFileName(nowMs).replace(/^master-list_/, 'amazon-unlinked_');
+/** まだつないでいない SKU の CSV (10/17)。data = listUnlinked(…, { all: true }) の結果 (画面と同じ絞り込み・ページに分けない) */
+export function buildUnlinkedCsv(data, { statusWords = {}, hideReasons = {} } = {}) {
+  const mapWords = (r) => (r.map_state === 'deleted' ? '対応を削除済み (墓標)' : r.listing_id ? '出品はある (構成なし)' : '対応なし');
+  const cols = [
+    ['seller SKU', (r) => r.seller_sku],
+    ['Amazon の商品名', (r) => r.item_name || ''],
+    ['ASIN', (r) => r.asin || ''],
+    ['出品日', (r) => (r.open_date ? ymdSlash(r.open_date) : r.open_date_raw || '')],
+    ['状態', (r) => statusWords[r.status] || r.status || ''],
+    ['いまの対応', mapWords],
+    [`FBA 在庫 (販売可能${data.fba && data.fba.ok ? `・${ymdSlash(data.fba.date)}` : '・読めない'})`, (r) => (!data.fba || !data.fba.ok || !r.fba_row ? null : r.fba_available)],
+    [`最後に売れた日${data.sold && data.sold.ok ? '' : ' (読めない)'}`, (r) => ymdSlash(r.last_sold)],
+    ['価格 (円)', (r) => (r.price == null ? null : Number(r.price))],
+    ['隠した理由', (r) => (r.hidden_reason ? hideReasons[r.hidden_reason] || r.hidden_reason : '')],
+    ['隠した理由の文', (r) => r.hidden_note || ''],
+    ['隠した人', (r) => r.hidden_by || ''],
+    ['隠した日時 (日本時間)', (r) => (r.hidden_at ? jstFull(r.hidden_at) : '')],
+    ['出品一覧の取得 (日本時間)', () => (data.load ? jstFull(data.load.snapshot_at) : '')],
+  ];
+  return csvOf(cols, data.rows);
+}
+
 /**
  * Amazon SKU の対応 (絞った全件) の CSV (BOM + 見出し + 行・CRLF・形は上の一覧の CSV と同じ)。data = listAmazonMapsAll の結果。
  * 列 = 画面の一覧の列 (seller SKU・名前・構成・区分・ASIN・状態・変えた) + 構成の行の数・移行で入ったか・変えた人

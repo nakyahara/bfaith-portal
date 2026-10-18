@@ -46,6 +46,10 @@
  *     マウスで確定した後の Enter は食べない
  *  72〜74 1 つの商品の画面の「← 前へ」「次へ →」(10/17): 来た一覧と同じ並び・絞り込みの前・次と場所・続けて次へ・最初 / 最後・一覧に無い・出さないとき・
  *     未保存のまま押す = 離れるときの確認 (ここに残る / 捨てて移る)・スマホ 390 ではみ出さない・44px
+ *  75 一覧の画像の列 (10/17): コードのすぐ後ろ・52px の四角・取得中 / 画像なしの印・読み込めない画像は印・列の板で外す / 出す・画像を押しても開く・390 ではみ出さない
+ *  76 Amazon SKU の未登録の一覧の「その場で登録」(10/17): 行の下に欄・名前 = Amazon の商品名・構成の原価
+ *  77 新商品 (10/17): 「セット商品を作るか = 作る」の作るセットの表 (初めの値・付いていく・重なり / 0 行は ③ で止める・保留で隠す・保存で product-hub にセットの下書き)
+ *  78 Amazon SKU を CSV でまとめて登録 (10/17): 試し取込 (Shift_JIS・表・絞る札・だめな理由・何も書かない)・保存 (DB に入る)・結果の CSV (BOM・式の注入の対策)・同じ CSV = 変わらない・390 ではみ出さない
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -718,7 +722,7 @@ await ta('[22] 注文残は発注アプリの利用権がある人だけ (#1620 
     await p.goto(B + '/?' + new URLSearchParams({ codes: 'k001\ns002' }));
     assert.doesNotMatch(await p.textContent('#list-tbl thead'), /注文残/, '列を出さない');
     assert.deepEqual((await cells(p)).map((x) => x.code), ['k001', 's002']);
-    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible:not(.c-chk)').count(), 15, '行の欄も 1 つ少ない (16 → 15。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない)');
+    assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td:visible:not(.c-chk)').count(), 16, '行の欄も 1 つ少ない (17 → 16。FBA (JP)・区分・売れた数・利益・利益率の列を足した・10/8 の仕入先の列はいつもは出さない・10/17 の画像の列はいつも出す)');
     assert.equal(await p.locator('#list-tbl tbody tr').first().locator('td[data-col="po"]').count(), 0, '注文残のセルは描かない (隠すだけでなく)');
     assert.equal(await p.locator('input[name="po"]').count(), 0, '「注文残あり」を出さない');
     assert.match(await p.textContent('#po-denied'), /注文残 \(発注アプリの権限がないので出せません\)/);
@@ -1855,7 +1859,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);   // 前の試験の設定を消す
   await p.goto(B + '/?q=' + encodeURIComponent('単品'));
   assert.deepEqual(await shownHeads(p), LIST_DEFAULT.shown, 'いつもの列 (仕入先は出さない)');
-  assert.equal(await p.textContent('#colcnt'), '16/21');   // 🆕 0085: ブランド・段階の 3 列 (出さない)
+  assert.equal(await p.textContent('#colcnt'), '17/23');   // 画像の列 (出す)・🆕 0084 メーカー・🆕 0087 大きさ・重さ・🆕 0085 ブランド・段階の 3 列 (出さない)
   assert.equal(await p.isVisible('#list-tbl tbody tr:first-child .sup-sub'), true, '仕入先の列が無い = 名前の下に「仕入先」');
   // 板を開く: コードは外せない・↑↓ も押せない・FBA などは「並べられない」
   await p.click('#colbtn');
@@ -1863,7 +1867,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.equal(await p.getAttribute('#colbtn', 'aria-expanded'), 'true');
   assert.equal(await p.isDisabled('#collist li[data-id="code"] input'), true);
   assert.equal(await p.isDisabled('#collist li[data-id="code"] [data-mv="1"]'), true);
-  assert.equal(await p.isDisabled('#collist li[data-id="name"] [data-mv="-1"]'), true, 'コードより上には行かない');
+  assert.equal(await p.isDisabled('#collist li[data-id="img"] [data-mv="-1"]'), true, 'コードより上には行かない (コードのすぐ後ろ = 画像 10/17)');
   assert.match(await p.textContent('#collist li[data-id="fba"]'), /並べられない/);
   assert.equal(await p.isDisabled('#cp-save'), true, '変えていない = 保存は押せない');
   // 出さない: 状態 → 表から消える (見出しも行も)・「未保存」
@@ -1878,13 +1882,13 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.match(await p.textContent('#list-tbl tbody tr:first-child td[data-col="sup"]'), /0001\s*AMC/);
   // ↑ で仕入先をコードのすぐ後ろへ (押した後もそのボタンにフォーカス = 続けて押せる)
   for (let i = 0; i < 20 && (await shownHeads(p))[1] !== 'sup'; i++) await p.click('#collist li[data-id="sup"] [data-mv="-1"]');
-  assert.deepEqual((await shownHeads(p)).slice(0, 3), ['code', 'sup', 'name']);
+  assert.deepEqual((await shownHeads(p)).slice(0, 4), ['code', 'sup', 'img', 'name'], '仕入先はコードのすぐ後ろ (画像 10/17 は 1 つ後ろへ)');
   assert.equal(await p.evaluate(() => document.activeElement.closest('li')?.getAttribute('data-id')), 'sup');
-  assert.deepEqual(await p.$$eval('#list-tbl tbody tr:first-child td:not(.c-chk)', (tds) => tds.filter((td) => !td.hidden).slice(0, 3).map((td) => td.getAttribute('data-col'))), ['code', 'sup', 'name'], '行のセルも同じ並び');
+  assert.deepEqual(await p.$$eval('#list-tbl tbody tr:first-child td:not(.c-chk)', (tds) => tds.filter((td) => !td.hidden).slice(0, 4).map((td) => td.getAttribute('data-col'))), ['code', 'sup', 'img', 'name'], '行のセルも同じ並び');
   // つまみで動かす (売価を名前の前へ)
   await p.dragAndDrop('#collist li[data-id="price"] .grip', '#collist li[data-id="name"]');
-  assert.deepEqual((await shownHeads(p)).slice(0, 4), ['code', 'sup', 'price', 'name']);
-  assert.equal(await p.textContent('#colcnt'), '16/21');   // 🆕 0085: ブランド・段階の 3 列 (出さない)
+  assert.deepEqual((await shownHeads(p)).slice(0, 5), ['code', 'sup', 'img', 'price', 'name']);
+  assert.equal(await p.textContent('#colcnt'), '17/23');   // 画像の列 (出す)・🆕 0084 メーカー・🆕 0087 大きさ・重さ・🆕 0085 ブランド・段階の 3 列 (出さない)
   if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1280_cols.png` });
   // 保存 → 「未保存」が消える・別の窓 (= 別の PC。同じログイン) で開いても同じ列
   await p.click('#cp-save');
@@ -1974,6 +1978,73 @@ await ta('[54] 一覧の列の板 (狭い画面 390): 下から出る・板は�
   assert.ok(r.left <= 1 && r.right >= r.vw - 1 && Math.abs(r.bottom - r.vh) <= 1, JSON.stringify(r));
   if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/390_cols.png` });
 }, { width: 390, height: 844 });
+await ta('[75] 一覧の画像の列 (10/17 中原さん「楽天の白抜き商品画像でいい。サムネイルみたいなかたちで」): コードのすぐ後ろ・明るい台の 52px の四角 (行の高さが画像の有無で変わらない)・取得中 / 画像なしの印・読み込めない画像は印に替える・画像を押しても商品が開く・列の板で外す / 出す・390 で横にはみ出さない', async (p, ctx) => {
+  // 画像のキャッシュ = picking.db (同じ DATA_DIR)。楽天の呼び出しは止めておく (取得中のまま)・画像の取得は Playwright が返す (外へ出ない)
+  const PK = await import('../apps/picking/db.js');
+  const LI = await import('../apps/master-edit/list-images.mjs');
+  const IM = await import('../apps/picking/images.js');
+  const pdb = PK.getDB();
+  const put = (ne, o) => pdb.prepare(`INSERT OR REPLACE INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, variant_image_url, status, fetched_at)
+    VALUES (?, NULL, ?, NULL, NULL, ?, ?)`).run(ne, o.white ?? null, o.status ?? 'ok', PK.utcNow());
+  put('s001', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/ui-s001.jpg' });
+  put('z002', { white: 'https://image.rakuten.co.jp/b-faith/cabinet/ui-broken.jpg' });
+  put('s003', { status: 'not_found' });
+  let open = null;
+  const gate = new Promise((res) => { open = res; });
+  LI.__setListImageDeps({ loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map() }), fetchDetails: async (mns) => { await gate; return { items: [], failed: mns.map((m) => ({ manageNumber: m, reason: 'Not found' })) }; } });
+  const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  await ctx.route('https://image.rakuten.co.jp/**', (route) => (route.request().url().includes('ui-broken') ? route.fulfill({ status: 404, body: '' }) : route.fulfill({ status: 200, contentType: 'image/png', body: PNG })));
+  try {
+    await p.goto(B + '/');
+    assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);
+    // コードで絞る (前の試験が名前を直した商品があっても同じ行が出る)
+    await p.goto(B + '/?' + new URLSearchParams({ codes: ['s001', 's003', 'z000', 'z001', 'z002'].join('\n') }));
+    assert.deepEqual((await shownHeads(p)).slice(0, 3), ['code', 'img', 'name'], '画像はコードのすぐ後ろ');
+    const cell = (code) => `#list-tbl tbody tr:has(a.rowlink[href="sku/${code}"]) td.c-img`;
+    // 画像あり: 52px の四角・明るい台・object-fit: contain・referrer を送らない
+    await p.waitForFunction((sel) => { const i = document.querySelector(sel + ' img'); return i && i.complete && i.naturalWidth > 0; }, cell('s001'));
+    const box = await p.$eval(cell('s001') + ' .thumb', (t) => { const r = t.getBoundingClientRect(); const i = t.querySelector('img'); const ir = i.getBoundingClientRect(); const s = getComputedStyle(t); return { w: r.width, h: r.height, iw: ir.width, ih: ir.height, bg: s.backgroundColor, fit: getComputedStyle(i).objectFit, ref: i.referrerPolicy, lazy: i.loading, altIsName: !!i.alt && i.alt === t.closest('tr').querySelector('.nm').textContent }; });
+    assert.deepEqual(box, { w: 52, h: 52, iw: 50, ih: 50, bg: 'rgb(243, 245, 249)', fit: 'contain', ref: 'no-referrer', lazy: 'lazy', altIsName: true }, 'alt = 名前');
+    // 読み込めない画像 (楽天で消えた) = 画像なしの印に替える (壊れた画像の印を出さない)
+    await p.waitForSelector(cell('z002') + ' .thumb.none');
+    assert.equal(await p.locator(cell('z002') + ' img').count(), 0);
+    // 楽天に無い = 印・キャッシュに無い = 取得中
+    assert.equal(await p.getAttribute(cell('s003') + ' .thumb', 'class'), 'thumb none not_found');
+    assert.equal(await p.getAttribute(cell('s003') + ' .thumb', 'title'), '楽天に画像がありません');
+    assert.equal(await p.getAttribute(cell('z000') + ' .thumb', 'class'), 'thumb none pending');
+    assert.equal((await p.textContent(cell('z000') + ' .thumb .tw')).trim(), '取得中');
+    // 行の高さは画像の有無で同じ (読み込みで動かない)
+    const hs = [];
+    for (const c of ['s001', 's003', 'z000', 'z001']) hs.push(await p.$eval(cell(c), (td) => Math.round(td.closest('tr').getBoundingClientRect().height)));
+    assert.ok(Math.max(...hs) - Math.min(...hs) <= 1, `行の高さ ${hs}`);
+    // 列の板で外す / 出す (保存しない)
+    await p.click('#colbtn');
+    await p.click('#collist li[data-id="img"] input');
+    assert.ok(!(await shownHeads(p)).includes('img'));
+    assert.equal(await p.isHidden(cell('s001')), true);
+    assert.equal(await p.textContent('#colcnt'), '16/23');   // 画像の列 (出す)・🆕 0084 メーカー・🆕 0087 大きさ・重さ・🆕 0085 ブランド・段階の 3 列 (出さない)
+    await p.click('#collist li[data-id="img"] input');
+    assert.deepEqual((await shownHeads(p)).slice(0, 2), ['code', 'img']);
+    assert.match(await p.textContent('#collist li[data-id="img"]'), /画像\s*新/);
+    assert.match(await p.textContent('#collist li[data-id="img"]'), /並べられない/);
+    await p.keyboard.press('Escape');
+    // 390: 横にはみ出さない (表は表の箱の中で送る)・画像の大きさはそのまま
+    await p.setViewportSize({ width: 390, height: 844 });
+    const [sw, cw] = await p.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+    assert.ok(sw <= cw + 1, `390 で横にはみ出さない ${sw} > ${cw}`);
+    assert.deepEqual(await p.$eval(cell('s001') + ' .thumb', (t) => [t.getBoundingClientRect().width, t.getBoundingClientRect().height]), [52, 52]);
+    if (LIST_SHOTS) await p.screenshot({ path: `${LIST_SHOTS}/390_images.png` });
+    await p.setViewportSize({ width: 1440, height: 900 });
+    if (LIST_SHOTS) await p.screenshot({ path: `${LIST_SHOTS}/1440_images.png` });
+    // 画像を押しても商品が開く (行のどこを押しても開くのと同じ)
+    await Promise.all([p.waitForURL(/\/sku\/s001$/), p.click(cell('s001') + ' img')]);
+  } finally {
+    open();
+    await IM.queueEnsureImages([], '');
+    LI.__setListImageDeps(null);
+    pdb.prepare("DELETE FROM pk_product_images WHERE ne_code IN ('s001', 'z002', 's003')").run();
+  }
+});
 
 // 拡大 125% / 150% = 画面の CSS の幅が 1/1.25・1/1.5 になる。MASTER_EDIT_UI_SHOTS=フォルダ を付けると、そのフォルダに写しを残す (目で見る用)
 const SHOTS = process.env.MASTER_EDIT_UI_SHOTS || '';
@@ -3064,6 +3135,225 @@ await ta('[74] 前へ・次へ スマホ 390 (10/17): パンくずと前へ・�
   await Promise.all([p.waitForNavigation(), p.click('#pn-next')]);
   assert.match(p.url(), new RegExp(`sku/${codes[2]}$`));
 }, { width: 390, height: 844 });
+
+// ── 未登録の一覧の「その場で登録」(10/17 中原さん)・構成の原価 ──
+{
+  // 売れたのに対応が無い FBA の SKU 2 つ (出品一覧 = FBA・Amazon の商品名つき) と、今日の注文
+  const IL = await import('../apps/company-db/ingest/amazon-listings.mjs');
+  const today = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+  const lr = (sku, name) => ({ seller_sku: sku, item_name: name, asin: null, open_date: today, open_date_raw: null, fulfillment: 'FBA', channel_raw: 'AMAZON_NA', status: 'active', status_raw: 'Active', quantity: 1, price: '980.00' });
+  const rows = [lr('pr-ui-inl-a', 'Amazon の名前 みかん 2 個'), lr('pr-ui-inl-b', 'Amazon の名前 セット')];
+  const gen = Date.now() - 600e3;
+  const got = await IL.ingestAmazonListings(db, { shop_code: IL.SHOP_CODE, generation: gen, snapshot_at: new Date(gen).toISOString(), report_run_id: 'r_ui_inline', checksum: IL.listingChecksum(rows.map((r) => IL.listingRowOf(r))), row_count: rows.length, skipped_count: 0, rows, force: true }, { nowMs: Date.now() });
+  assert.ok(['applied', 'refreshed'].includes(got.status), JSON.stringify(got));
+  let n = 0;
+  for (const code of ['pr-ui-inl-a', 'pr-ui-inl-b']) {
+    const o = (await pg.query(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash)
+      values (1, 'amazon', 'amazon', $1, 'mall_api', now(), $2::date, 'shipped', false, 1, now(), 't', 'h') returning order_id`, [`ui-inl-${++n}`, today])).rows[0].order_id;
+    await pg.query(`insert into core.order_lines (company_id, order_id, line_key, listing_id, unresolved_code, qty, cancelled_qty, received_batch_seq) values (1, $1, 'l1', null, $2, 2, 0, 1)`, [o, code]);
+  }
+}
+const inlSugOpen = (p) => p.waitForFunction(() => { const s = document.querySelector('.inl .csug'); return s && !s.hidden && !s.classList.contains('stale') && s.querySelector('.co, .cs-h'); });
+const inlCodes = (p) => p.evaluate(() => [...document.querySelectorAll('.inl .csug .co')].map((o) => (o.classList.contains('off') ? '×' : '') + o.querySelector('.cc').textContent));
+await ta('[76] 未登録の一覧の「その場で登録」(10/17): 行の下に欄・名前 = Amazon の商品名・NE の商品の候補 (日本語入力の確定の Enter で閉じない・ほかの行にある商品は選べない)・↓ Enter で選ぶ → 数の欄・足す・保存 = 1 つの画面と同じ道 (DB に入る)・押し直しても 2 回入らない・離れるときに確かめる / 構成の原価', async (p) => {
+  await p.goto(B + '/amazon/unmapped');
+  const btn = p.locator('button[data-inline][data-sku="pr-ui-inl-a"]');
+  assert.equal(await btn.count(), 1, 'その場で登録のボタン');
+  assert.ok((await p.textContent('#unmapped-list')).includes('Amazon の名前 みかん 2 個'), '行に Amazon の商品名');
+  await btn.click();
+  const box = p.locator('li.inl-box[data-inline-for="pr-ui-inl-a"]');
+  await box.locator('.inl-body').waitFor({ state: 'visible' });
+  assert.equal(await btn.getAttribute('aria-expanded'), 'true');
+  assert.equal(await box.locator('.inl-name').inputValue(), 'Amazon の名前 みかん 2 個', '名前の初めの値 = Amazon の出品一覧の商品名');
+  assert.equal(await active(p), '1 行目の NE コード (代表)', '開くと 1 行目の欄へ');
+  assert.equal(await dirty(p), 0, '開いただけ = 未保存ではない');
+  const in1 = box.locator('tr.comp-row').nth(0).locator('.c-code');
+  // 日本語入力 (CDP): 変換中から候補・確定の Enter (Windows の並び = 確定の後に keyCode 13) で閉じない・数の欄へ移らない
+  const cdp = await p.context().newCDPSession(p);
+  const key = (type, k, vk) => cdp.send('Input.dispatchKeyEvent', { type, key: k, code: k === 'Enter' ? 'Enter' : 'KeyA', windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+  for (const s of ['み', 'みか', 'みかん']) { await key('rawKeyDown', 'Process', 229); await cdp.send('Input.imeSetComposition', { text: s, selectionStart: s.length, selectionEnd: s.length }); await key('keyUp', 'a', 65); }
+  await inlSugOpen(p);
+  assert.ok((await inlCodes(p)).includes('k006'), '変換中から候補');
+  await cdp.send('Input.insertText', { text: 'みかん' });
+  await key('rawKeyDown', 'Enter', 13); await key('keyUp', 'Enter', 13);
+  await p.waitForTimeout(100);
+  assert.equal(await active(p), '1 行目の NE コード (代表)', '確定の Enter で数の欄へ移らない');
+  await inlSugOpen(p);
+  await in1.press('ArrowDown');
+  await in1.press('Enter');
+  assert.equal(await in1.inputValue(), 'k006');
+  assert.equal(await active(p), '1 行目 (k006) の数', '選ぶと数の欄へ');
+  assert.equal(await box.locator('tr.comp-row').nth(0).locator('.c-name').textContent(), 'みかん');
+  assert.equal(await dirty(p), 1, '入れた = 離れるときに確かめる');
+  await p.keyboard.press('Control+a'); await p.keyboard.type('2');
+  // 足す → 2 行目で同じ k006 は選べない・k005 を選ぶ
+  await box.locator('.inl-add').click();
+  const in2 = box.locator('tr.comp-row').nth(1).locator('.c-code');
+  assert.equal(await active(p), '2 行目の NE コード');
+  await in2.fill('k00');
+  await inlSugOpen(p);
+  assert.ok((await inlCodes(p)).includes('×k006'), 'ほかの行にある商品は灰色');
+  await in2.fill('k005');
+  await inlSugOpen(p);
+  await in2.press('Enter');
+  assert.equal(await in2.inputValue(), 'k005', 'ぴったりのコードは Enter で入る');
+  // 保存 (通信が切れた 1 回目 → 押し直し = 同じ request_id)
+  const ids = [];
+  // 1 回目: 保存は入るが、途中の機械が 502 の JSON を返す (#Codex R2 M1 = JSON の誤りでも確かな返事でない = 送り直しに残す)
+  let first = true;
+  await p.route('**/api/amazon/save', async (r) => {
+    ids.push(JSON.parse(r.request().postData()).request_id);
+    if (first) { first = false; await r.fetch(); await r.fulfill({ status: 502, contentType: 'application/json', body: JSON.stringify({ error: 'Bad Gateway' }) }); return; }
+    await r.continue();
+  });
+  await box.locator('.inl-save').click();
+  await p.waitForFunction(() => /通信できませんでした/.test(document.querySelector('.inl-msg').textContent));
+  assert.equal(await in1.isDisabled(), true, '結果の分からない保存の後 = 欄を閉じる (同じ中身だけを送り直す・#Codex R1 M)');
+  await box.locator('.inl-save').click();
+  await box.locator('.result.ok').waitFor();
+  assert.equal(ids.length, 2); assert.equal(ids[0], ids[1], '押し直し = 同じ request_id');
+  assert.match(await box.locator('.result.ok').textContent(), /保存しました \(前に保存した結果\)/, '2 回目は前の結果');
+  assert.deepEqual(await compsUi('pr-ui-inl-a'), [['k006', 2], ['k005', 1]], 'DB に入った (1 行目が代表)');
+  assert.equal((await mapOf('pr-ui-inl-a')).name, 'Amazon の名前 みかん 2 個');
+  assert.equal(await btn.textContent(), '登録しました'); assert.equal(await btn.isDisabled(), true);
+  assert.equal(await dirty(p), 0, '保存した後 = 離れても確かめない');
+  // もう 1 つの行: 名前を空にして NE の商品を選ぶ = 選んだ商品の名前が入る
+  await p.locator('button[data-inline][data-sku="pr-ui-inl-b"]').click();
+  const box2 = p.locator('li.inl-box[data-inline-for="pr-ui-inl-b"]');
+  await box2.locator('.inl-body').waitFor({ state: 'visible' });
+  await box2.locator('.inl-name').fill('');
+  const c2 = box2.locator('tr.comp-row').nth(0).locator('.c-code');
+  await c2.fill('k004');
+  await inlSugOpen(p);
+  await c2.press('Enter');
+  assert.equal(await box2.locator('.inl-name').inputValue(), 'ＡＢＣ 保存袋', '名前が空 = 選んだ NE の商品の名前');
+  await box2.locator('.inl-cancel').click();
+  assert.equal(await box2.count(), 1, '入れた欄を「やめる」= 確かめる (試験のブラウザは「キャンセル」)');
+  // 構成の原価 (1 つの画面・見るだけ): k006 × 2 + k005 × 1 (原価は前の試験で変わることがある = 今日の原価の行を読む)
+  const costNow = async (code) => Number((await pg.query(`select y.cost_jpy from core.sku_costs y join core.skus s on s.sku_id = y.sku_id where s.code = $1
+    and y.valid_from <= (now() at time zone 'Asia/Tokyo')::date and (y.valid_to is null or y.valid_to >= (now() at time zone 'Asia/Tokyo')::date) order by y.valid_from desc, y.created_at desc, y.sku_cost_id desc limit 1`, [code])).rows[0].cost_jpy);
+  const c6 = await costNow('k006'), c5 = await costNow('k005');
+  await p.goto(B + '/amazon/sku?sku=pr-ui-inl-a');
+  assert.equal(await p.textContent('#cost-total'), `${(c6 * 2 + c5).toLocaleString('ja-JP')} 円`);
+  assert.ok((await p.textContent('#comp-cost')).includes(`${(c6 * 2).toLocaleString('ja-JP')} 円`), '小計 = 原価 × 数');
+});
+
+await ta('[77] 新商品 (2026-10-17 中原さん): 「セット商品を作るか = 作る」で作るセットの表 (初めの値 = 単品-2・単品の名前 2個セット / 単品の名前に付いていく / 足すと 3 個)・行どうしの重なりと 0 行は ③ で止める・保留で隠して数えない・保存で card.sets を送り product-hub にセットの下書き', async (p) => {
+  const sent = [];
+  p.on('request', (rq) => { if (/\/api\/new$/.test(rq.url()) && rq.method() === 'POST') sent.push(JSON.parse(rq.postData() || '{}')); });
+  await p.goto(B + '/new?kind=single');
+  assert.equal(await p.isHidden('#row-set-plans'), true, '作るを選ぶまで出さない');
+  await p.fill('#code', 'ui-sp-1');
+  await p.waitForSelector('#code-msg.ok');
+  await p.fill('#f-name', 'UI ネームタグ 【100枚】');
+  await p.fill('#f-standard_price', '1000');
+  await p.click('#f-tax_rate button[data-v="0.1"]');
+  await p.selectOption('#shipping', 'S01');
+  await p.selectOption('#f-primary_supplier', '0001');
+  await fillReq(p);
+  await p.click('#set-plan button[data-v="create"]');
+  assert.equal(await p.isHidden('#row-set-plans'), false);
+  const rows = p.locator('#set-plan-rows tr.sp-row');
+  assert.equal(await rows.count(), 1, '初めに 1 行');
+  assert.deepEqual([await rows.nth(0).locator('.sp-qty').inputValue(), await rows.nth(0).locator('.sp-code').inputValue(), await rows.nth(0).locator('.sp-name').inputValue()],
+    ['2', 'ui-sp-1-2', 'UI ネームタグ 【100枚】 2個セット']);
+  await p.waitForSelector('#set-plan-rows .sp-msg.ok');
+  // 直していない行は単品の名前に付いていく
+  await p.fill('#f-name', 'UI ネームタグ 【50枚】');
+  assert.equal(await rows.nth(0).locator('.sp-name').inputValue(), 'UI ネームタグ 【50枚】 2個セット');
+  // 足す = 次の個数 (3)・コードの重なり (大文字小文字だけ違う) = ③ で止める
+  await p.click('#set-plan-add');
+  assert.deepEqual([await rows.nth(1).locator('.sp-qty').inputValue(), await rows.nth(1).locator('.sp-code').inputValue()], ['3', 'ui-sp-1-3']);
+  await rows.nth(1).locator('.sp-code').fill('UI-SP-1-2');
+  assert.match(await rows.nth(1).locator('.sp-msg').textContent(), /2 行あります/);
+  assert.match(await p.textContent('#checklist'), /作るセットを直す \(1 行\)/);
+  // 直したコードは単品の名前を変えても付いていかない
+  await rows.nth(1).locator('.sp-code').fill('ui-sp-1-3x');
+  await p.fill('#f-name', 'UI ネームタグ');
+  assert.equal(await rows.nth(1).locator('.sp-code').inputValue(), 'ui-sp-1-3x');
+  assert.equal(await rows.nth(0).locator('.sp-name').inputValue(), 'UI ネームタグ 2個セット');
+  await p.waitForFunction(() => document.querySelectorAll('#set-plan-rows .sp-msg.ok').length === 2);
+  await noneRest(p);
+  assert.match(await p.textContent('#checklist'), /作るセット \(2 個\)/);
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  // 0 行 = 止める (「作る」なら 1 つ以上)
+  await rows.nth(1).locator('[data-sp-del]').click();
+  await rows.nth(0).locator('[data-sp-del]').click();
+  assert.equal(await rows.count(), 0);
+  assert.match(await p.textContent('#checklist'), /作るセット \(個数・コード・名前を 1 つ以上\)/);
+  assert.equal(await p.isDisabled('#save'), true);
+  // 保留 = 隠す・数えない / 作るに戻すと 1 行 (2 個) から
+  await p.click('#set-plan button[data-v="hold"]');
+  assert.equal(await p.isHidden('#row-set-plans'), true);
+  assert.ok(!/作るセット/.test(await p.textContent('#checklist')));
+  await p.click('#set-plan button[data-v="create"]');
+  assert.equal(await rows.count(), 1);
+  await p.click('#set-plan-add');
+  await p.waitForFunction(() => document.querySelectorAll('#set-plan-rows .sp-msg.ok').length === 2);
+  assert.match(await p.textContent('#remain'), /下書きを保存できます/);
+  await Promise.all([p.waitForURL(/\/sku\/ui-sp-1$/), p.click('#save')]);
+  const body = sent[sent.length - 1];
+  assert.deepEqual(body.card.set_decision.decision, 'create');
+  assert.deepEqual(body.card.sets, [{ qty: 2, code: 'ui-sp-1-2', name: 'UI ネームタグ 2個セット' }, { qty: 3, code: 'ui-sp-1-3', name: 'UI ネームタグ 3個セット' }]);
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), /セット商品 ui-sp-1-2 \(2個\)・ui-sp-1-3 \(3個\) も NE に登録してください/);
+  const { getDB: phDb } = await import('../apps/product-hub/db.js');
+  const parent = phDb().prepare("SELECT id FROM product_drafts WHERE ne_code = 'ui-sp-1'").get();
+  assert.ok(parent, 'カードができた');
+  assert.deepEqual(phDb().prepare('SELECT ne_code, name, provisional_code, price FROM product_drafts WHERE parent_draft_id = ? ORDER BY id').all(parent.id),
+    [{ ne_code: 'ui-sp-1-2', name: 'UI ネームタグ 2個セット', provisional_code: 1, price: 2000 }, { ne_code: 'ui-sp-1-3', name: 'UI ネームタグ 3個セット', provisional_code: 1, price: 3000 }]);
+});
+
+await ta('[78] CSV でまとめて登録 (10/17): ファイルを選ぶ → 試し取込 (表・絞る札・だめな理由・何も書かない) → 離れるときに確かめる → 保存 (20 件ずつ・結果の列) → 出し直すと「変わらない」/ Shift_JIS の CSV / スマホ 390 で横にはみ出さない', async (p) => {
+  const iconv = (await import('iconv-lite')).default;
+  await p.goto(B + '/amazon/');
+  await Promise.all([p.waitForURL(/\/amazon\/bulk$/), p.click('a[href="bulk"]')]);
+  assert.equal(await p.isDisabled('#bulk-preview'), true, 'ファイルを選ぶまで押せない');
+  const NL = String.fromCharCode(13, 10);
+  const csv = ['seller_sku,name,ne_code,qty', 'pr-ui-bulk-1,一括 1,k001,2', 'pr-ui-bulk-1,一括 1,k002,1', 'pr-ui-bulk-2,,k004,1', 'pr-ui-bulk-3,=無いコード,nope-x,1'].join(NL) + NL;
+  await p.setInputFiles('#bulk-file', { name: '一括の試験.csv', mimeType: 'text/csv', buffer: iconv.encode(csv, 'cp932') });
+  await p.click('#bulk-preview');
+  await p.locator('#bulk-result').waitFor({ state: 'visible' });
+  assert.match(await p.textContent('#bulk-file-info'), /一括の試験\.csv · Shift_JIS/);
+  assert.equal(await p.locator('#bulk-rows tr').count(), 3);
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-3"]'), /だめ[\s\S]*nope-x は Company DB にありません/);
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-2"]'), /ＡＢＣ 保存袋/, '名前が空 = 代表の NE の商品名');
+  assert.equal(await p.textContent('#bulk-apply'), '保存する (2 件)');
+  assert.equal(await dirty(p), 1, '試し取込の後に保存していない = 離れるときに確かめる');
+  assert.equal(await mapOf('pr-ui-bulk-1'), undefined, '試し取込は何も書かない');
+  await p.click('#bulk-filter button[data-f="error"]');
+  assert.equal(await p.locator('#bulk-rows tr').count(), 1, 'だめだけに絞る');
+  await p.click('#bulk-filter button[data-f="all"]');
+  // スマホ 390: 横にはみ出さない (表は表の箱の中で横に送る)
+  await p.setViewportSize({ width: 390, height: 844 });
+  const [sw, cw] = await p.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+  assert.ok(sw <= cw + 1, `390 で横にはみ出す (${sw} > ${cw})`);
+  await p.setViewportSize({ width: 1440, height: 900 });
+  await p.click('#bulk-apply');
+  await p.waitForFunction(() => /終わりました/.test(document.getElementById('bulk-apply-msg').textContent));
+  assert.match(await p.textContent('#bulk-apply-msg'), /できた 2 件 · だめ 0 件/);
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-1"] .bulk-res'), /作りました \(出品も\)/);
+  assert.deepEqual(await compsUi('pr-ui-bulk-1'), [['k001', 2], ['k002', 1]], 'DB に入った (1 行目が代表)');
+  assert.equal((await mapOf('pr-ui-bulk-2')).name, 'ＡＢＣ 保存袋');
+  assert.equal(await dirty(p), 0, '保存した後 = 確かめない');
+  assert.equal(await p.isDisabled('#bulk-apply'), true);
+  // 結果の CSV (画面が手元で作る・BOM・式の注入の対策 = list-csv.mjs の csvCell と同じ答え)
+  const [dl] = await Promise.all([p.waitForEvent('download'), p.click('#bulk-report')]);
+  assert.match(dl.suggestedFilename(), /^amazon-bulk-result_[0-9]{8}-[0-9]{4}[.]csv$/);
+  const rep = fs.readFileSync(await dl.path());
+  assert.deepEqual([...rep.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+  const repText = rep.toString('utf8');
+  assert.ok(repText.includes(`"pr-ui-bulk-3","5","だめ","'=無いコード"`), repText);
+  assert.ok(repText.includes('"pr-ui-bulk-1","2","作る (出品も)","一括 1","k001×2, k002×1","作った"'), '保存の結果も入る');
+  const { csvCell } = await import('../apps/master-edit/list-csv.mjs');
+  for (const v of ['=a', ' +b', '	-c', '@d', 'ok', 'x"y', String.fromCharCode(0xfeff) + '=e', String.fromCharCode(0x200b) + '-f']) assert.equal(await p.evaluate((x) => window.MasterEdit.bulkCsvCell(x), v), csvCell(v), JSON.stringify(v));
+  // 同じ CSV をもう一度 = 「変わらない」(保存する SKU が無い)
+  await p.setInputFiles('#bulk-file', { name: '一括の試験.csv', mimeType: 'text/csv', buffer: Buffer.from(csv, 'utf8') });
+  await p.click('#bulk-preview');
+  await p.waitForFunction(() => /試し取込をしました/.test(document.getElementById('bulk-msg').textContent) && /UTF-8/.test(document.getElementById('bulk-file-info').textContent));
+  assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-1"]'), /変わらない/);
+  assert.equal(await p.textContent('#bulk-apply'), '保存する SKU がありません');
+});
 
 await browser.close();
 server.close();

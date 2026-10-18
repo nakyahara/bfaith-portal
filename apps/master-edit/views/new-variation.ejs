@@ -170,6 +170,8 @@
             <div class="ctl"><div class="seg" role="group" id="c-expiry" aria-labelledby="lab-c-expiry" data-field="expiry" data-value=""><button type="button" data-v="0" aria-pressed="false"<%= dis %>>なし</button><button type="button" data-v="1" aria-pressed="false"<%= dis %>>あり</button></div><span class="hint">賞味期限・使用期限のある商品は あり</span><div id="cf-expiry" style="flex-basis:100%"></div></div></div>
           <div class="f"><div class="lab" id="lab-c-inbound">ロジザードの入荷日の管理</div>
             <div class="ctl"><div class="seg" role="group" id="c-inbound" aria-labelledby="lab-c-inbound" data-field="inbound" data-value=""<%- part('inbound_date_managed') %>><button type="button" data-v="0" aria-pressed="false"<%= dis %>>なし</button><button type="button" data-v="1" aria-pressed="false"<%= dis %>>あり</button></div><%- none('inbound_date_managed') %><span class="hint">最初の値だけ · あとはロジザードが正 · 入力なし = 不明のまま</span><div id="cf-inbound" style="flex-basis:100%"></div></div></div>
+          <%# 🆕 0087: 梱包した状態の 縦・横・高さ・重さ (全部の子に同じ値・入れなくてよい・0087 の前の DB = 欄を出さない) %>
+          <% if (locals.packageReady) { %><div class="subh"><svg class="ic" aria-hidden="true"><use href="#i-box"/></svg>大きさ・重さ</div><%- include('_package-new', { dis, forAll: true }) %><% } %>
         </section>
 
         <%# 5 のつづき: 発注の設定 (今の単品の画面と同じ部品 = _order.ejs・public/me-order.js)。全部の子に同じ値 (登録の後に子ごとに発注アプリへ) %>

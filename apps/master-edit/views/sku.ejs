@@ -244,6 +244,9 @@
           <% } %>
         </section>
 
+        <%# 🆕 0087 梱包した状態の 縦・横・高さ・重さ (単品だけ・人の値は右の「保存する」で一緒に・出どころの値と食い違いも見せる・部品 = _package.ejs・public/me-package.js) %>
+        <% if (typeof pkg !== 'undefined' && pkg && c.sku_kind === 'single') { %><%- include('_package', { pkg, editable: !!pkg.ready && editable('pkg_length'), lockWhyHtml: pkg.ready ? lockWhy('pkg_length') : '' }) %><% } %>
+
         <section class="panel" aria-labelledby="h-tax">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-percent"/></svg></span><h2 id="h-tax">税・分類</h2></div>
           <%- row('tax_rate', '税率', seg('tax_rate', c.tax_rate == null ? '' : String(c.tax_rate), [['0.08', '8%', '軽減'], ['0.1', '10%', '標準']]) + (c.tax_rate == null ? '<span class="misslabel"><svg class="ic s" aria-hidden="true"><use href="#i-warn"/></svg>まだ入っていません</span>' : ''), taxText(c.tax_rate)) %>
@@ -611,6 +614,58 @@
         </section>
       </aside>
     </form>
+    <%# 🆕 販売数のグラフ (10/17 中原さん・参考 = 読むだけ)。グラフと表は画面の JS (public/me-sales-chart.js) が API (/api/sku/:code/sales-chart) から読んで描く。
+        単品 = セットで売れた分も入れた数 + ロジザードの在庫の線 (別のグラフ・軸を 2 つにしない) / セット = そのセットとして売れた数 (在庫の線なし) %>
+    <section class="panel moves sc" id="p-sales" aria-labelledby="h-sales" data-base="<%= base %>" data-code="<%= c.code %>" data-kind="<%= c.sku_kind %>">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-cart"/></svg></span><h2 id="h-sales">販売数のグラフ</h2><span class="sub">参考 · モールの注文の数 (注文日・キャンセルを引いた数)<%= isSet ? ' · このセットとして売れた数' : ' · セットで売れた分も入れた数' %></span></div>
+      <div class="sc-bar">
+        <div class="seg" id="sc-unit" role="group" aria-label="グラフの期間" data-value="week">
+          <button type="button" class="on" aria-pressed="true" data-v="week">週<small>52 週</small></button><button type="button" aria-pressed="false" data-v="month">月<small>24 か月</small></button><button type="button" aria-pressed="false" data-v="day">日<small>90 日</small></button>
+        </div>
+      </div>
+      <div class="hint sc-sum" id="sc-sum" aria-live="polite">読んでいます…</div>
+      <ul class="sc-legend" id="sc-legend" hidden></ul>
+      <div class="sc-chart" id="sc-chart" tabindex="0" role="group" aria-roledescription="グラフ" aria-label="販売数のグラフ (左右の矢印で期間を選ぶ)" aria-describedby="sc-sum" hidden>
+        <div class="sc-svg" id="sc-sales"></div>
+        <div class="sc-stock-h hint" id="sc-stock-h" hidden></div>
+        <div class="sc-svg" id="sc-stock"></div>
+        <div class="sc-tip" id="sc-tip" aria-hidden="true" hidden></div>
+      </div>
+      <div class="sr" id="sc-live" aria-live="polite"></div>
+      <details class="more sc-table" id="sc-table-box" hidden><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>表で見る (グラフと同じ数)</summary>
+        <div class="tblwrap"><table class="tbl mv" id="sc-tbl"><caption class="sr">販売数 (新しい順)</caption><thead id="sc-thead"></thead><tbody id="sc-rows"></tbody></table></div>
+      </details>
+      <div class="hint mv-notes" id="sc-notes">数える範囲 = Company DB に注文を入れているモール (楽天・Amazon (FBA も)・Yahoo!・その他 = au PAY・Qoo10・LINE ギフト・メルカリ)。卸・ほかの NE の店・FBA 納品は入りません = 上の「売れた数」(商品管理リスト) と少し違います · 今日は入れない (前日まで) · 注文は 2025-01 から (LINE ギフト 2026-02・Qoo10 2026-03 から) = それより前は空欄<%= isSet ? '' : ' · 在庫 = ロジザードの毎日の在庫 (その日の締め・倉庫だけ。FBA の在庫は入りません)' %></div>
+    </section>
+    <%# 🆕 入出庫の履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・参考 = 読むだけ)。表は画面の JS (public/me-moves.js) が API から読んで描く。
+        単品だけ (セットには在庫が無い = 構成品の画面へ・Q10 = a)。仕入・発注は発注アプリの権限がある人だけ (Q9 = a) %>
+    <% if (c.sku_kind === 'single') { %>
+    <section class="panel moves" id="p-moves" aria-labelledby="h-moves" data-base="<%= base %>" data-code="<%= c.code %>" data-po="<%= poAccess ? '1' : '0' %>">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-truck"/></svg></span><h2 id="h-moves">入出庫の履歴</h2><span class="sub">参考 · 出荷 (NE の出荷確定)<%= poAccess ? '・仕入 (発注アプリの入荷)' : '' %> · 在庫数はロジザードの毎日の在庫で合わせています</span></div>
+      <div class="hint mv-head" id="mv-head" aria-live="polite">読んでいます…</div>
+      <div class="tblwrap"><table class="tbl mv" id="mv-tbl"><caption class="sr">入出庫の履歴 (新しい順)</caption>
+        <thead><tr><th scope="col">日時</th><th scope="col">処理</th><th scope="col" class="n">入庫</th><th scope="col" class="n">出庫</th><th scope="col" class="n">在庫数</th><th scope="col">伝票番号</th><th scope="col">店舗・仕入先</th><th scope="col">理由</th><th scope="col">担当者</th></tr></thead>
+        <tbody id="mv-rows"></tbody>
+      </table></div>
+      <div class="mv-foot"><button class="btn sm" type="button" id="mv-more" hidden>もっと前を見る</button><span class="hint" id="mv-msg" aria-live="polite"></span></div>
+      <div class="hint mv-notes">伝票番号: 出荷 = NE の伝票番号 / 仕入 = ロジザードの伝票NO (NE の仕入伝票の番号とは別) · 「<%= '在庫の調整 (ずれ)' %>」= ロジザードの毎日の在庫と、出荷<%= poAccess ? '・仕入' : '' %>の差 (NE の他勘定出庫・棚卸し・返品など。理由は分かりません) · 担当者 = 仕入の CSV を発注アプリに取り込んだ人 (倉庫で受けた人ではありません) · FBA のお客の注文は倉庫の在庫が動かないので入りません</div>
+    </section>
+    <section class="panel moves" id="p-monthly" aria-labelledby="h-monthly">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-yen"/></svg></span><h2 id="h-monthly">月別のまとめ</h2><span class="sub">参考 · 直近 13 か月 · 受注数 = NE の受注日 · 売上数 = 出荷確定日<%= poAccess ? ' · 仕入数 = 良品数 (入庫日) · 発注数 = 発行した数 (減数・取消は引かない)' : '' %></span></div>
+      <div class="hint" id="mo-head" aria-live="polite">読んでいます…</div>
+      <div class="tblwrap"><table class="tbl mv" id="mo-tbl"><caption class="sr">月別のまとめ</caption>
+        <thead><tr><th scope="col">月</th><th scope="col" class="n">受注数</th><th scope="col" class="n">売上数</th><% if (poAccess) { %><th scope="col" class="n">仕入数</th><th scope="col" class="n">発注数</th><% } %><th scope="col" class="n">受注金額</th><th scope="col" class="n">売上金額</th><% if (poAccess) { %><th scope="col" class="n">仕入金額</th><th scope="col" class="n">発注金額</th><% } %></tr></thead>
+        <tbody id="mo-rows"></tbody>
+      </table></div>
+      <div class="hint mv-notes">空欄 = データの無い月 (0 ではありません): 受注金額・売上金額はまだ出せません (NE の明細の金額を Company DB に送っていない)<%= poAccess ? ' · 仕入・発注は発注アプリを使い始めた 2026-07 から (それより前は NE だけで持っています)' : '' %></div>
+    </section>
+    <% } else if (isSet) { %>
+    <section class="panel moves" id="p-moves" aria-labelledby="h-moves">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-truck"/></svg></span><h2 id="h-moves">入出庫の履歴</h2></div>
+      <div class="hint" id="mv-set">セットには在庫がありません (在庫は構成品が持ちます)。入出庫の履歴は構成品の画面で見ます<% if (c.components.length) { %>:
+        <% c.components.forEach((x, i) => { %><%= i ? ' · ' : '' %><a class="code" href="<%= base %>/sku/<%= encodeURIComponent(x.code) %>"><%= x.code %></a><% }) %><% } %></div>
+    </section>
+    <% } %>
     <% if (typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %>
     <div class="modal-bg" id="gone-bg">
       <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="gone-t" aria-describedby="gone-d">
@@ -642,6 +697,12 @@
   <% if (page && typeof lzBarcode !== 'undefined' && lzBarcode && lzBarcode.show && !lzBarcode.error && lzBarcode.canWrite) { %><script src="<%= base %>/public/me-lzbarcode.js?v=<%= assetV %>" defer></script><% } %>
   <%# 利益 (1 個あたり) をその場で計算し直す = lib/profit-estimate.js を同じ版で import する (public/me-profit.js) %>
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0087: 大きさ・重さの「この値を入れる」(直せるときだけ・欄の数え直しは me-sku.js) %>
+  <% if (page && typeof pkg !== 'undefined' && pkg && pkg.ready && c.sku_kind === 'single' && editable('pkg_length')) { %><script src="<%= base %>/public/me-package.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 入出庫の履歴と月別のまとめ (単品だけ・読むだけ) %>
+  <% if (page && page.cur.sku_kind === 'single') { %><script src="<%= base %>/public/me-moves.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 販売数のグラフ (読むだけ・単品とセット) %>
+  <% if (page) { %><script src="<%= base %>/public/me-sales-chart.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0070: NE から消えた (やめる) = 押せる人・押せるときだけ %>
   <% if (page && typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %><script src="<%= base %>/public/me-gone.js?v=<%= assetV %>" defer></script><% } %>
 </body>

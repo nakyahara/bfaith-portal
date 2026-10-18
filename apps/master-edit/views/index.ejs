@@ -173,6 +173,9 @@
       const curCol = COLS[sortCol];
       const curWords = SORT_WORDS[curCol.sort] || SORT_WORDS.text;
       const supShown = colShown.has('sup');
+      // 画像の列 (10/17): 行のコード → { url, state } (list-images.mjs。キャッシュを読むだけ = 楽天の応答を待たない)
+      const imgOf = locals.imgOf || (() => ({ url: null, state: 'none' }));
+      const IMG_WORDS = locals.IMAGE_STATE_WORDS || {};
     %>
     <div class="panel">
       <div class="tbl-top" id="tbl-top">
@@ -206,6 +209,8 @@
           </div>
         </div>
       </div>
+      <%# 画像の列の「画像なし」の印 (この画面だけで使う = 共通の _header の印の束に足さない) %>
+      <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="M4 18l5.5-5.5 4 4 2.5-2.5 4 4"/></symbol></svg>
       <div class="tblwrap" id="tblwrap">
         <table class="tbl click<%= supShown ? ' show-sup' : '' %>" id="list-tbl">
           <caption class="sr">商品・セットの一覧 (<%= data.total %> 件・並び: <%= curCol.label %> <%= curWords[sortDesc ? 1 : 0] %>)</caption>
@@ -235,6 +240,7 @@
               stock: { sub: stSub, cls: refCls(st), title: stTitle },
               sup: { title: '代表の仕入先 (セットは構成品の仕入先)' },
               maker: { title: 'メーカー (Company DB だけの値・セットは構成品のメーカー)' },
+              pkg: { title: '梱包した状態の 縦×横×高さ (cm)・重さ (g)。人が入れた値、無ければ出どころ (定形外・FBA 納品) の値 (セットは持たない)' },
               brand: { title: 'ブランド (Company DB だけの値・「自社」= 自社ブランド・セットは構成品から)' },
               stage: { title: '商品の区分 = 定番・季節・試し (Company DB だけの値・単品だけ)' },
               end_on: { title: '終売の予定日 (Company DB だけの値・単品だけ)' + (BL ? ' · 「あと N 日」= ' + BL.soonDays + ' 日以内' : '') },
@@ -259,6 +265,7 @@
               <% if (bk) { %><td class="c-chk" data-col="chk"><label class="chkcell"><input type="checkbox" class="ck rowck" data-code="<%= r.code %>" data-kind="<%= r.kind %>" data-state="<%= r.state %>" aria-label="<%= r.code %> を選ぶ"></label></td><% } %>
               <% for (const id of colOrder) { const hide = colShown.has(id) ? '' : ' hidden'; %>
               <% if (id === 'code') { %><td class="c-code" data-col="code"><span class="codecell"><a class="rowlink" href="sku/<%= encodeURIComponent(r.code) %>"><%= r.code %></a><button type="button" class="copybtn" data-copy="<%= r.code %>" aria-label="商品コード <%= r.code %> をコピー" title="コピー"><svg class="ic s" aria-hidden="true"><use href="#i-copy"/></svg></button></span></td>
+              <% } else if (id === 'img') { const im = imgOf(r.code); %><td class="c-img" data-col="img"<%= hide %>><% if (im.url) { %><span class="thumb"><img src="<%= im.url %>" alt="<%= r.name %>" width="52" height="52" loading="lazy" decoding="async" referrerpolicy="no-referrer"></span><% } else { %><span class="thumb none <%= im.state %>" title="<%= IMG_WORDS[im.state] || '' %>"><svg class="ic" aria-hidden="true"><use href="#i-image"/></svg><% if (im.state === 'pending') { %><span class="tw" aria-hidden="true">取得中</span><% } %><span class="sr"><%= IMG_WORDS[im.state] || '画像なし' %></span></span><% } %></td>
               <% } else if (id === 'name') { %><td data-col="name"<%= hide %>><span class="nm"><%= r.name %></span><% if (isSet) { %><% } else if (r.kind === 'exception') { %><span class="sub">例外の SKU (NE に無い)</span><% } else { %><span class="sub sup-sub"><%= r.primary_supplier ? '仕入先 ' + r.primary_supplier : '代表の仕入先なし' %></span><% } %></td>
               <% } else if (id === 'kind') { %><td data-col="kind"<%= hide %>><% if (isSet) { %><span class="b info kind">セット</span><span class="sub kindn" title="構成品の数"><svg class="ic s" aria-hidden="true" style="vertical-align:-2px"><use href="#i-box"/></svg> <%= r.comp_count %> 品</span><% } else if (r.kind === 'exception') { %><span class="b warn kind">例外</span><% } else { %><span class="b mute kind">単品</span><% } %></td>
               <% } else if (id === 'state') { %><td data-col="state"<%= hide %>>
@@ -281,6 +288,7 @@
               <% } else if (id === 'fba') { %><td class="n ref" data-col="fba"<%= hide %>><% if (r.fba != null) { %><%= r.fba.toLocaleString('ja-JP') %><% if (!r.fba_row) { %><span class="fx" title="その日の FBA のレポートに、この SKU 1 個だけの出品の行が無い (販売可能 0 と数える)">出品なし</span><% } %><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'sold') { %><td class="n ref" data-col="sales"<%= hide %>><% const sq = r.sales; if (sq && !sq.missing && !isSet) { %><span title="7 日 <%= sq.d7.toLocaleString('ja-JP') %> (FBA <%= sq.d7fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d7other.toLocaleString('ja-JP') %>) / 30 日 <%= sq.d30.toLocaleString('ja-JP') %> (FBA <%= sq.d30fba.toLocaleString('ja-JP') %> · FBA 以外 <%= sq.d30other.toLocaleString('ja-JP') %>)"><%= sq.d7.toLocaleString('ja-JP') %> / <%= sq.d30.toLocaleString('ja-JP') %></span><% } else if (sq && isSet) { %><span class="muted" title="セットで売れた分は構成品の数に入る (商品管理リスト・発注アプリと同じ数え方)">—</span><% } else if (sq) { %><span class="muted" title="商品管理リストに無い商品 (NE にまだ無いなど)">—</span><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'po') { %><td class="n ref" data-col="po"<%= hide %>><% if (r.backorder) { %><%= r.backorder.toLocaleString('ja-JP') %><% } else if (r.backorder == null) { %><span class="muted">—</span><% } %></td>
+              <% } else if (id === 'pkg') { const pk = r.pkg; const dimsTxt = pk && [pk.length_mm, pk.width_mm, pk.height_mm].some((x) => x != null) ? [pk.length_mm, pk.width_mm, pk.height_mm].map((x) => (x == null ? '?' : (Math.round(x) / 10).toFixed(1).replace(/\.0$/, ''))).join('×') + ' cm' : ''; %><td data-col="pkg"<%= hide %>><% if (isSet) { %><span class="muted" title="セットの大きさ・重さは持ちません (構成品から)">構成品から</span><% } else if (dimsTxt || (pk && pk.weight_g != null)) { %><span title="梱包した状態 (人の値 → 出どころの値)"><%= dimsTxt %><% if (dimsTxt && pk.weight_g != null) { %> · <% } %><%= pk.weight_g != null ? pk.weight_g.toLocaleString('ja-JP') + ' g' : '' %></span><% } else { %><span class="muted">—</span><% } %></td>
               <% } else if (id === 'flags') { %><td data-col="flags"<%= hide %>><div class="flags"><% for (const f of r.flags) { %><span class="b <%= FLAG_BADGE[f] || 'mute' %>"><%= f %></span><% } %></div></td>
               <% } %>
               <% } %>

@@ -397,7 +397,8 @@
   // 保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度保存するときは新しい番号
   var requestId = uuid();
   var FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
-    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed', 'maker'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0084 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)
+    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed', 'maker',
+      'pkg_length', 'pkg_width', 'pkg_height', 'pkg_weight'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0084 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)・🆕 0087 梱包の大きさ・重さは 0087 があって直せるときだけ欄が出る
   // 🆕 0085: ブランド (隠した欄 = 名簿の番号・空 = 外す)・区分・終売の予定日 (単品だけ・欄が無い = 送らない)
   if (!isSet) FIELDS = FIELDS.concat(['brand', 'life_stage', 'end_planned_on']);
   function collect() {
