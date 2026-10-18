@@ -269,6 +269,14 @@ export const LZ_BARCODE_EDIT_FUNCTIONS = Object.freeze(['ops.set_sku_logizard_ba
   'ops.lz_new_export_issue(uuid, text, jsonb, timestamp with time zone, timestamp with time zone)', 'ops.lz_new_export_void(text, bigint, text)']);
 export const LZ_BARCODE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_sku_logizard_barcode_rules()', 'ops.set_sku_logizard_barcode_rule(uuid, text, bigint, text, text, text, bigint)',
   'ops.lzbc_jan_ok(text)', 'ops.guard_sku_logizard_barcode_requests()', 'ops.guard_lz_new_exports()']);
+/**
+ * 🆕 0099 (表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安・Company DB構想 27 ④-1): master_edit に人の値・記録の表とまとめた値のビューの select (LABEL_SELECT)・
+ *   人の値を書く関数の実行 (LABEL_EDIT_FUNCTIONS)。表・関数が無い DB (0099 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
+ *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・守りの trigger (LABEL_OWNER_ONLY_FUNCTIONS)。ビューは security_invoker でない = core.products・観測の表の権限は足さない
+ */
+export const LABEL_SELECT = Object.freeze(['core.product_label_facts', 'ops.product_label_fact_events', 'core.v_product_label_facts']);
+export const LABEL_EDIT_FUNCTIONS = Object.freeze(['ops.set_product_label_facts(uuid, text, bigint, text, numeric, text, text, integer, bigint, text, text)']);
+export const LABEL_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_label_tables()']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -375,6 +383,10 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const t of LZ_BARCODE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...LZ_BARCODE_EDIT_FUNCTIONS, ...LZ_BARCODE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of LZ_BARCODE_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0099 (表示の項目): 表・ビュー・関数がある DB だけ。人の値の表・記録・ビューは前に付けた権限を外してから画面のロールに付け直す (読むだけ・書くのは関数だけ)
+  for (const t of LABEL_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
+  for (const f of [...LABEL_EDIT_FUNCTIONS, ...LABEL_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of LABEL_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、

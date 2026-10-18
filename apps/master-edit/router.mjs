@@ -140,6 +140,8 @@ import { readNeDeleteStock } from './ne-delete-stock.mjs';
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
 import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
+// 🆕 0099 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・Company DB構想 27 ④-1)
+import { readLabelView, labelReady, defaultPhLabelLookup, COUNTRY_SUGGEST, NET_UOMS } from '../../lib/master-label.mjs';
 import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
 
 /**
@@ -417,6 +419,26 @@ function orderEventsView(evs, kids) {
 /** product-hub の下書きカードに同じ管理番号があるか (まとまりのコード = 楽天の商品管理番号・Render の SQLite)。試験は差し替える */
 let phDraftLookup = defaultPhDraftExists;
 export function __setPhDraftLookup(fn) { phDraftLookup = fn || defaultPhDraftExists; }
+/** 🆕 0099: product-hub の今の値 (商品の画面の「表示の項目」の参考・読むだけ・Render の SQLite)。試験は差し替える */
+let phLabelLookup = defaultPhLabelLookup;
+export function __setPhLabelLookup(fn) { phLabelLookup = fn || defaultPhLabelLookup; }
+/**
+ * 🆕 0099: 商品の画面の「表示の項目」= readLabelView (人の値・記録の番号・いま使う値) + ready (書けるか) + ph (product-hub の今の値・読めない = { error })。
+ *   Company DB が読めない = null (節を出さない・画面は止めない)
+ */
+async function readLabelBlock(db, cur) {
+  try {
+    const v = await readLabelView(db, cur.product_id);
+    // 欄に出す人の値と番号は、編集の印 (page.token) を作った読み (readCurrent の cur.label) と同じ物を使う (別の読みの値を欄に出さない)
+    if (cur.label) Object.assign(v, { human: cur.label.human, event_id: cur.label.event_id });
+    let ph = null;
+    try { ph = await phLabelLookup(cur.code); } catch (e) { ph = { error: String((e && e.message) || e).slice(0, 120) }; }
+    return { ...v, ready: await labelReady(db), ph, suggest: COUNTRY_SUGGEST, uoms: NET_UOMS };
+  } catch (e) {
+    console.error(`[master-edit] 表示の項目を読めない: ${e && e.message}`);
+    return null;
+  }
+}
 /** 衝突を解く (既存のカードに結ぶ)。本番 = cdb-card-intake.js の linkCdbCardToExisting。試験は差し替える */
 let cardLinker = null;
 export function __setCardLinker(fn) { cardLinker = fn || null; }
@@ -894,6 +916,8 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     blankKeys: BLANK_KEYS[kind], blankLabels: blankLabelsOf(kind),
     // 🆕 0080: ロジザードに送るバーコードの欄を出すか (0080 がある DB だけ)
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,
+    // 🆕 0099: 表示の項目の欄を出すか (0099 がある DB・単品だけ・入れなくてよい)
+    labelNew: db && kind === 'single' && await labelReady(db).catch(() => false) ? { suggest: COUNTRY_SUGGEST, uoms: NET_UOMS } : null,
   });
 }));
 /**
@@ -918,6 +942,8 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     orderNoneApplies,
     blankKeys: BLANK_KEYS.variation, blankLabels: blankLabelsOf('variation'),
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,   // 🆕 0080 (子ごとのロジザードのバーコードの欄を出すか)
+    // 🆕 0099: 表示の項目の欄 (全部の子に同じ値・型番は聞かない・入れなくてよい・0099 の前の DB = 出さない)
+    labelNew: db && await labelReady(db).catch(() => false) ? { suggest: COUNTRY_SUGGEST, uoms: NET_UOMS } : null,
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
@@ -1062,6 +1088,7 @@ router.post('/api/new/variation', (req, res) => {
       childReasons: pre.childReasons,   // 🆕 子ごとの入力なしの理由 (原価・JAN はその子に無いときだけ・#1706 Codex R1 M1)
       reasonNote: po.note,              // 🆕 発注の設定の入力なし (DB に書く理由にだけ・ハッシュに入らない・#1706 Codex R2 M)
       lzCopy: lg.copy,                  // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果 (値の行に残す・ハッシュに入らない)
+      label: b.label,                   // 🆕 0099: 表示の項目 (原産国・内容量・消費期限の目安) = 全部の子に同じ値 (型番は聞かない・入れなくてよい)
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox, requireLz: true, codeReserved });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
@@ -1117,6 +1144,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   const nedelLive = nedel ? nedel.items.filter((i) => i.action === 'delete' && i.state === 'live') : [];
   const gone = goneChk ? { ...goneView(goneChk), canApprove: approverGate(req).ok, fromRequest: nedelLive.length > 0, kind: page.cur.sku_kind } : null;
   res.render(view('sku.ejs'), {
+    // 🆕 0099: 表示の項目 (単品の商品の行だけ・人の値 + いま使う値 + product-hub の今の値 (参考・読むだけ))。読めない = 出さない (画面は止めない)
+    label: page && page.cur.sku_kind === 'single' && page.cur.product_id ? await readLabelBlock(db, page.cur) : null,
     gone,
     // 🆕 0072: NE から消す (箱 = 依頼の途中の様子・「NE から消す」の画面へ)。0072 の前・読めない = null (出さない)
     nedel: nedel ? { live: nedelLive, canApprove: approverGate(req).ok, STATUS_WORDS: NE_DEL_STATUS_WORDS } : null,
@@ -1223,7 +1252,8 @@ router.post('/api/new', (req, res) => {
     //   作るセットは登録の要求のハッシュ (lib と同じ = 保存の記録の request_payload_hash) で結ぶ = 取り込みは通った登録の作るセットだけを付ける (Codex R1 High 2)
     let parsed = null;
     try {
-      parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode });
+      parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: b.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode,
+        label: b.label });   // 🆕 0099: 表示の項目も要求のハッシュに入る (作るセットを結ぶハッシュを lib と同じにする)
     } catch (e) { if (!(e instanceof MasterWriteError)) throw e; /* 形の誤りは登録の lib が同じ文で断る */ }
     const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
     // ほかの登録が作るセットに決めたコード (カードの取り込み待ち) は、ふつうの商品コードにもさせない (Codex R1 Medium 1)。押し直しは前の答え (確かめない)
@@ -1251,6 +1281,7 @@ router.post('/api/new', (req, res) => {
         order: outbox ? orderBase : null, reasonNote: po.note,
         logizardBarcode: b.logizard_barcode,   // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコードの値か空欄 (単品だけ・要るかは上の lzRegisterGate)
         lzCopy,                                // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果
+        label: b.label,                        // 🆕 0099: 表示の項目 (原産国・内容量・型番・消費期限の目安) (入れなくてよい・単品だけ)
       }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true, codeReserved });
     } catch (e) {
       // 登録が断られた (決まった誤り = MasterWriteError) = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)。

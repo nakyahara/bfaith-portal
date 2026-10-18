@@ -168,6 +168,8 @@
               <span class="fmsg" id="f-lzbc-msg" aria-live="polite"></span>
               <span class="hint">商品に付いているバーコード = FNSKU (X00 で始まる 10 文字) か JAN (8・13 けた) · バーコードが無い商品は「空欄」= ロジザードが番号を付けます · JAN の欄とは別 · ロジザードの新商品の CSV のバーコードに入れる値</span></div></div>
           <% } %>
+          <%# 🆕 0099: 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・入れなくてよい・0099 の前の DB = 欄を出さない) %>
+          <% if (locals.labelNew) { %><%- include('_label-new', { dis, forAll: false, ln: labelNew }) %><% } %>
           <% } %>
         </section>
 

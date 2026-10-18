@@ -1,0 +1,84 @@
+<%#
+  🆕 0099 表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安 (日数) (Company DB構想 27 ④-1・中原さんの決定 Q1〜Q9 = 全部 a・2026-10-18)。
+  商品の画面 (単品) の節。人の値は右の「保存する」で一緒に保存 (欄 = lbl_country / lbl_net + lbl_net_uom / lbl_model / lbl_shelf)。動き = public/me-label.js
+  - 欄 = 人の値 (空 = 人の値なし)。いま使う値 = Company DB の core.v_product_label_facts (人 → 内容量だけ夜間の取り込みの値)
+  - product-hub の今の値 = 同じ商品コードの下書き (ページ表記・楽天の型番) を読むだけ (参考)。「この値を入れる」= 欄に入れるだけ (保存は人)
+  渡す値: lb = router の label (readLabelBlock)・editable = 直せるか・lockWhyHtml = 直せない理由の札・suggest = 原産国の候補・uoms = 内容量の単位
+%>
+<%
+  const hl = (x) => String(x ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const H = lb.human || {};
+  const R = lb.resolved || {};
+  const ph = lb.ph || null;
+  const phErr = ph && ph.error;
+  const lmeta = (f, label) => 'data-field="' + f + '" data-dirty-field="' + f + '" data-label="' + hl(label) + '" data-ne="NE へ送らない"';
+  const nowText = (r) => (r ? hl(r.value ?? r.text) + ' (' + hl(r.words) + ')' : '—');
+  const useBtn = (kind, attrs, title) => (editable ? '<button type="button" class="btn sm" data-lbl-use="' + kind + '"' + attrs + ' title="' + hl(title) + '">この値を入れる</button>' : '');
+  const phLine = (html) => '<span class="hint lbl-ph">' + html + '</span>';
+  const draftRef = ph && !phErr ? 'product-hub の下書き #' + ph.draftId + (ph.page ? '' : ' (まとまりの子の行)') : '';
+  const lockShow = (v) => '<span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span>' + (v == null || v === '' ? '—' : hl(v)) + ' (人の値)</span></span>';
+%>
+<section class="panel" id="p-label" aria-labelledby="h-label">
+  <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-info"/></svg></span><h2 id="h-label">表示の項目</h2><span class="sub">原産国・内容量・メーカー型番・消費期限の目安 · Company DB だけ (NE・ロジザードには送りません) · product-hub (楽天の出品) が読みます · 入れなくても登録できます</span></div>
+  <% if (!lb.ready) { %><div class="callout info" id="lbl-not-ready"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">表示の項目は、Company DB に 0099 が入って権限を流し直した後に入れられます (いまは見るだけ)。</div></div><% } %>
+  <% if (phErr) { %><div class="callout info" id="lbl-ph-error"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">product-hub の今の値を読めませんでした (<%= ph.error %>)。欄はそのまま使えます。</div></div><% } %>
+
+  <div class="f" data-row="lbl_country">
+    <% if (editable) { %><label class="lab" for="f-lbl_country">原産国</label><% } else { %><div class="lab">原産国</div><% } %>
+    <div class="ctl">
+      <% if (editable) { %>
+        <input class="in w-m" id="f-lbl_country" list="lbl-country-list" autocomplete="off" maxlength="40" <%- lmeta('lbl_country', '原産国') %> value="<%= H.country_of_origin || '' %>" placeholder="例: 日本">
+        <datalist id="lbl-country-list"><% for (const s of suggest) { %><option value="<%= s %>"></option><% } %></datalist>
+      <% } else { %><%- lockShow(H.country_of_origin) %><%- lockWhyHtml || '' %><% } %>
+      <span class="hint" id="lbl-country-now">いま使う値: <%- nowText(R.country_of_origin) %> · 国名で (例: 日本・中国) · 「製」は付けません (「中国製」→ 中国)</span>
+      <% if (ph && !phErr && ph.page) { %>
+        <% if (ph.country.state === 'value') { %><%- phLine(hl(draftRef) + ': ' + hl(ph.country.raw || ph.country.value) + ' = ' + hl(ph.country.value) + ' ' + (ph.country.value !== (H.country_of_origin || null) ? useBtn('country', ' data-v="' + hl(ph.country.value) + '"', 'product-hub の原産国を欄に入れます (保存は右の「保存する」)') : '<span class="b ok">同じ</span>')) %>
+        <% } else if (ph.country.state === 'no_country') { %><%- phLine(hl(draftRef) + ': 海外製 (国名なし) = 入れられません') %><% } %>
+      <% } %>
+    </div>
+  </div>
+
+  <div class="f" data-row="lbl_net">
+    <div class="lab" id="lab-lbl_net">内容量</div>
+    <div class="ctl">
+      <% if (editable) { %>
+        <span class="lbl-net" role="group" aria-labelledby="lab-lbl_net">
+          <label class="sr" for="f-lbl_net">内容量の数</label><input class="in w-s" id="f-lbl_net" inputmode="decimal" autocomplete="off" maxlength="12" <%- lmeta('lbl_net', '内容量') %> value="<%= H.net_content || '' %>" placeholder="<%= R.net && R.net.source !== 'human' ? R.net.num : '例: 50' %>">
+          <label class="sr" for="f-lbl_net_uom">内容量の単位</label><select class="in w-xs" id="f-lbl_net_uom" <%- lmeta('lbl_net_uom', '内容量の単位') %>>
+            <option value=""<%= !H.net_content_uom ? ' selected' : '' %>>単位</option>
+            <% for (const u of uoms) { %><option value="<%= u %>"<%= H.net_content_uom === u ? ' selected' : '' %>><%= u %></option><% } %>
+          </select>
+        </span>
+      <% } else { %><%- lockShow(H.net_content != null ? H.net_content + (H.net_content_uom || '') : null) %><% } %>
+      <span class="hint" id="lbl-net-now">いま使う値: <%- R.net ? hl(R.net.text) + ' (' + hl(R.net.words) + ')' : '—' %>
+        <% if (R.net && R.net.source !== 'human') { %><% if (R.net.master) { %> <%- useBtn('net', ' data-v="' + hl(R.net.master.num) + '" data-uom="' + hl(R.net.master.uom) + '"', '夜間の取り込みの内容量を欄に入れます (保存は右の「保存する」)') %><% } else { %> · ml / g / 枚 / 個 にちょうど直せないので入れられません<% } %><% } %>
+        · 数 + 単位 (ml / g / 枚 / 個) · 小数は 2 けたまで · 空の欄 = 夜間の取り込みの値を使う</span>
+      <% if (ph && !phErr && ph.page && ph.netRaw) { %>
+        <% const same = ph.net && ph.net.master && H.net_content && ph.net.master.num === H.net_content && ph.net.master.uom === H.net_content_uom; %>
+        <%- phLine(hl(draftRef) + ': ' + hl(ph.netRaw) + ' ' + (same ? '<span class="b ok">同じ</span>' : ph.net && ph.net.master ? useBtn('net', ' data-v="' + hl(ph.net.master.num) + '" data-uom="' + hl(ph.net.master.uom) + '"', 'product-hub の内容量を欄に入れます (保存は右の「保存する」)') : '= ml / g / 枚 / 個 にちょうど直せないので入れられません')) %>
+      <% } %>
+    </div>
+  </div>
+
+  <div class="f" data-row="lbl_model">
+    <% if (editable) { %><label class="lab" for="f-lbl_model">メーカー型番</label><% } else { %><div class="lab">メーカー型番</div><% } %>
+    <div class="ctl">
+      <% if (editable) { %><input class="in w-m mono" id="f-lbl_model" autocomplete="off" maxlength="60" <%- lmeta('lbl_model', 'メーカー型番') %> value="<%= H.model_number || '' %>">
+      <% } else { %><%- lockShow(H.model_number) %><% } %>
+      <span class="hint">メーカーが付けた型番 (楽天の商品仕様の「メーカー型番」) · 60 字まで · JAN・自社の商品コードとは別</span>
+      <% if (ph && !phErr && ph.model) { %>
+        <%- phLine(hl(draftRef) + (ph.model.from === 'sku' ? ' (SKU ごとの型番)' : ' (ページの型番)') + ': <span class="mono">' + hl(ph.model.value) + '</span> ' + (ph.model.value === (H.model_number || null) ? '<span class="b ok">同じ</span>' : useBtn('model', ' data-v="' + hl(ph.model.value) + '"', 'product-hub の型番を欄に入れます (保存は右の「保存する」)'))) %>
+      <% } %>
+    </div>
+  </div>
+
+  <div class="f" data-row="lbl_shelf">
+    <% if (editable) { %><label class="lab" for="f-lbl_shelf">消費期限の目安</label><% } else { %><div class="lab">消費期限の目安</div><% } %>
+    <div class="ctl">
+      <% if (editable) { %><input class="in w-xs" id="f-lbl_shelf" inputmode="numeric" autocomplete="off" maxlength="5" <%- lmeta('lbl_shelf', '消費期限の目安 (日数)') %> data-unit=" 日" value="<%= H.shelf_life_days == null ? '' : H.shelf_life_days %>"><span class="unit">日</span>
+      <% } else { %><%- lockShow(H.shelf_life_days == null ? null : H.shelf_life_days + ' 日') %><% } %>
+      <span class="hint">製造 (入荷) から何日もつか (1〜3650) · 食品・化粧品など期限のある商品だけ (ほかは空のまま) · ロジザードの有効期限の管理・商品ページの賞味期限の文とは別</span>
+    </div>
+  </div>
+  <% if (H.set_by) { %><div class="f wide"><div class="lab">人の値</div><div class="ctl"><span class="muted" id="lbl-set-by"><%= H.set_by %> が入れた値です</span></div></div><% } %>
+</section>

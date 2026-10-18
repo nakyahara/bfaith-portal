@@ -839,7 +839,8 @@
       ['発注の設定', po ? '発注アプリへ (全部の子に同じ値)' : 'なし (あとで商品の画面で)'],
       ['入力なし', m.noneKeys.length ? esc(m.noneKeys.map(function (k) { return (P.blankLabels && P.blankLabels[k] ? P.blankLabels[k].label : k); }).join('・')) + ' <span class="hint aux">(わざと空けた = 登録の記録に残ります)</span>' : 'なし (全部の項目に値)'],
       ['出品カード', 'まとまりで 1 枚' + (m.ac === 2 ? ' (2 軸なので出品は止めたまま)' : '')],
-    ].concat(S.nextOpts.length ? [['次に足す' + unitOf(m), S.nextOpts.length + ' ' + unitOf(m) + ' (今回は保存しない · 保存の後に続けて足す)']] : []);
+    ].concat(document.getElementById('np-lbl-country') ? [['表示の項目', (function () { var lb = labelBody(); return lb ? esc([lb.country, lb.net ? lb.net + (lb.net_uom || '') : '', lb.shelf ? lb.shelf + ' 日' : ''].filter(Boolean).join(' · ')) + ' (全部の子に同じ値)' : 'なし (あとで商品の画面で)'; })()]] : [])   // 🆕 0099 (欄があるときだけ)
+      .concat(S.nextOpts.length ? [['次に足す' + unitOf(m), S.nextOpts.length + ' ' + unitOf(m) + ' (今回は保存しない · 保存の後に続けて足す)']] : []);
   }
 
   var CAT = { count: '子の数', dup: '重なり', shape: '形の誤り', miss: 'まだ入れていない' };
@@ -1107,6 +1108,7 @@
       if (k === 'name') { e.manual = true; e.name = t.value; } else e[k] = t.value;
       light(); return;
     } else if (t.closest && t.closest('#sec-order, #sec-card')) { light(); return; }
+    else if (/^np-lbl-(country|net|net-uom|shelf)$/.test(id)) { light(); return; }   // 🆕 0099: 表示の項目 (未保存の数・確かめの中身を数え直す)
     else return;
     update();
   }
@@ -1303,9 +1305,17 @@
     if (!m.add || m.firstTime) out.axes = m.axes.map(function (ax) { return { axis: ax.i + 1, name: ax.name }; });
     // 🆕 2026-10-13: 入力なしにした項目 (サーバーがもう一度確かめて、登録の理由に残す)
     out.blanks = m.noneKeys.slice();
+    // 🆕 0099: 表示の項目 (全部の子に同じ値・入れなくてよい・欄が無い / 全部空 = 送らない)
+    var lb = labelBody(); if (lb) out.label = lb;
     var po = ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
     return out;
+  }
+  /** 🆕 0099: 表示の項目の欄 (views/_label-new.ejs・まとまりは型番を聞かない) → { country, net, net_uom, shelf } (全部空・欄が無い = null = 送らない) */
+  function labelBody() {
+    var ids = { country: 'np-lbl-country', net: 'np-lbl-net', net_uom: 'np-lbl-net-uom', shelf: 'np-lbl-shelf' }, o = {}, any = false;
+    Object.keys(ids).forEach(function (k) { var e = document.getElementById(ids[k]); if (!e) return; var v = !e.disabled ? String(e.value || '').trim() : ''; o[k] = v; if (v) any = true; });
+    return any ? o : null;
   }
   function openConfirm() {
     if (!canSave || S.done || busy) return;
@@ -1409,6 +1419,7 @@
     if (FIELDS.some(function (f) { return S.common[f] !== COMMON0[f]; }) && S.mode === 'new') items.push('共通の欄');
     if (Object.keys(S.edits).length) items.push('子の一覧の変更');
     if (ME.orderSettings && ME.orderSettings.collect()) items.push('発注の設定');
+    if (labelBody()) items.push('表示の項目');   // 🆕 0099: 表示の項目だけ入れた後に離れても未保存の確認を出す
     return { n: items.length, items: items, impacts: [] };
   };
 

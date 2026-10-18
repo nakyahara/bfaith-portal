@@ -388,7 +388,8 @@
   // 保存 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度保存するときは新しい番号
   var requestId = uuid();
   var FIELDS = isSet ? ['name', 'standard_price', 'set_sales_class_override', 'handling_own', 'shipping_code', 'reorder_months']
-    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)
+    : ['name', 'handling', 'standard_price', 'tax_rate', 'sales_class', 'primary_supplier', 'shipping_code', 'reorder_months', 'jan', 'expiry_managed', 'inbound_date_managed']   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)
+      .concat(['lbl_country', 'lbl_net', 'lbl_net_uom', 'lbl_model', 'lbl_shelf']);   // 🆕 0099 表示の項目 (0099 があって直せるときだけ欄が出る・無ければ送らない)
   function collect() {
     var values = {};
     FIELDS.forEach(function (f) {

@@ -2766,3 +2766,14 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え → `migrate.mjs --dry-run` (この 1 本だけ・今のデータは何も変えない) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す
   (master_edit に 3 つの関数の実行) → `heavy-entry-manifest.mjs --verify` → 次の朝の照合 ② の後に `select ops.quarantine_confirm_list(null)` (watcher) で 42 件の表を見る。画面 (Q-2・Q-3) は別の PR
 - 試験 = `node scripts/test-master-quarantine-confirm.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-quarantine-confirm-pg.mjs` (本物のログイン・並ぶ取引)
+
+### 表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安 (0099 仮番号・AI_reference CompanyDB構想/27 §3.4 ④ v2・中原さんの決定 10/18 Q1〜Q9 = 全部 a)
+- **なぜ**: 原産国・内容量・メーカー型番・消費期限の目安 (日数) をマスタの入力で入れ、Company DB を正本にする (product-hub は読んで見せるだけ・差の印と「マスタの値を入れる」)。
+- **持ち方**: 人の値 = `core.product_label_facts` (商品ごとに 1 行・項目ごとに空でよい・単品だけ)・記録 `ops.product_label_fact_events` (追記だけ)・**いま使う値 = `core.v_product_label_facts`** (正式な読み口・項目ごとに 人 → 内容量だけ夜間ロードの `core.products.net_content`)。
+  🚨 0003 の観測 + 規則の版 v2 にはしない (夜間ロードは規則 v1 に固定で内容量を毎晩選び直す = 人の観測は次の夜に戻る・v1 に規則は足せない)。夜間ロードのコード・規則・`core.products` の列は変えない (列の注釈だけ)。
+  `core.products.net_content` と mart の内容量 = 夜間ロードの参考の値 (人の値はビューだけ)。`country_of_origin` / `model_number` / `product_compliance.shelf_life_days` は空のまま。
+- **書く** `ops.set_product_label_facts(request_id, 人, SKU, 原産国, 内容量, 単位, 型番, 日数, 見ていた記録, via, 理由)` (master_edit・security definer)。門 = 商品の画面の保存の約束 (`ops.begin_master_write` の sku_edit・同じ request_id・人) / 新商品の登録・まとまりの登録 = この取引でその SKU を登録した sku_create の約束。
+  最後の記録の番号が画面の見ていた番号と違う = `version_conflict`。全部空 = 行を消す (記録は残る)。単位 = ml / g / 枚 / 個・数 = 小数 2 けた・原産国 40 字 (「製」を付けない)・型番 60 字・日数 1〜3650。
+- 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え → `migrate.mjs --dry-run` (この 1 本だけ・表と関数とビューを足す・既にある列は注釈だけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す
+  (流すまで画面は欄を出さない・値が来たら 503)。アプリは先でも後でもよい (0099 の前は `labelReady` = false で欄を出さない・product-hub の箱も出さない)。
+- 試験 = `node scripts/test-master-label.mjs` (PGlite・画面・登録・夜間ロードが人の値を変えない) / `test-master-label-ui.mjs` (画面) / `test-ph-label-compare.mjs`・`test-ph-label-compare-ui.mjs` (product-hub の箱)

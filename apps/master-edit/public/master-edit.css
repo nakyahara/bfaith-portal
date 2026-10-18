@@ -1221,3 +1221,9 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 .bulk-prog .bar { flex: 1 1 auto; height: 6px; border-radius: 999px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
 .bulk-prog .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
 @media (max-width: 760px) { .bulk-acts .btn { flex: 1 1 auto; justify-content: center; } }
+
+/* 🆕 0099 表示の項目 (商品の画面・views/_label.ejs) */
+.lbl-net { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.lbl-net .in { text-align: right; }
+#p-label .lbl-ph { flex-basis: 100%; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+@media (max-width: 760px) { #p-label .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #p-label .btn.sm { min-height: 44px; } }

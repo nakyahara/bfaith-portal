@@ -254,6 +254,9 @@
           <div class="f"><div class="lab">この商品の仕入先</div><div class="ctl"><% if (!page.suppliers.length) { %><span class="muted">まだありません</span><% } %><% for (const s of page.suppliers) { %><span class="linkchip"><span class="mono"><%= s.code %></span> <%= s.name %><span class="n2"><%= s.vendor_code ? ' 先方品番 ' + s.vendor_code : '' %><%= s.is_primary ? ' · ★代表' : '' %></span></span><% } %></div></div>
         </section>
 
+        <%# 🆕 0099 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・単品だけ・人の値は右の「保存する」で一緒に・product-hub の今の値は参考・部品 = _label.ejs・public/me-label.js) %>
+        <% if (typeof label !== 'undefined' && label && c.sku_kind === 'single') { %><%- include('_label', { lb: label, editable: !!label.ready && editable('lbl_country'), lockWhyHtml: label.ready ? lockWhy('lbl_country') : '', suggest: label.suggest || [], uoms: label.uoms || [] }) %><% } %>
+
         <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。Company DB の「保存する」とは別のボタン (部品 = _order.ejs・public/me-order.js) %>
         <% if (orderSettings) { %><%- include('_order', { os: orderSettings, mode: 'sku', dis: '', stepNo: null, base, code: c.code }) %><% } %>
         <%# AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリに保存・部品 = _amc-label.ejs・public/me-amclabel.js)。JAN・FNSKU・入庫の BC シールとは別 %>
@@ -632,5 +635,7 @@
   <% if (page) { %><script src="<%= base %>/public/me-profit.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0070: NE から消えた (やめる) = 押せる人・押せるときだけ %>
   <% if (page && typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %><script src="<%= base %>/public/me-gone.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0099: 表示の項目の「この値を入れる」(直せるときだけ・欄の数え直しは me-sku.js) %>
+  <% if (page && typeof label !== 'undefined' && label && label.ready && c.sku_kind === 'single' && editable('lbl_country')) { %><script src="<%= base %>/public/me-label.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>
