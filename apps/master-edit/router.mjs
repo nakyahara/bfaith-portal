@@ -113,6 +113,8 @@ import { listImages, IMAGE_STATE_WORDS } from './list-images.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
+// 🆕 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・0085 の読むだけの関数)
+import { readMovementsPage, readMonthly } from './movements.mjs';
 import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
@@ -1197,6 +1199,33 @@ router.get('/sku/:code/history', (req, res) => withPgPage(req, res, async (db, d
   const h = db ? await skuHistory(db, req.params.code) : null;
   if (db && !h) return res.status(404).render(view('error.ejs'), { ...pageLocals(req), nav: 'list', message: `商品コード ${req.params.code} は Company DB にありません` });
   res.render(view('history.ejs'), { ...pageLocals(req), nav: 'list', dbError, h, code: req.params.code });
+}));
+
+/**
+ * 🆕 入出庫の履歴 (CompanyDB構想 26 PR-1): 単品だけ・新しい順に出荷 200 行ずつ (?before= 前のページの切れ目)。
+ *   仕入の行は発注アプリの権限がある人だけ (無い人は「在庫の調整」に入る)。最初のページだけ、いまのロジザードの写しで合わせる
+ */
+async function movementSku(db, code) {
+  return (await db.query('select sku_id::text as sku_id, code, code_norm, sku_kind from core.skus where company_id = 1 and code_norm = core.norm_code($1)', [String(code ?? '')])).rows[0] || null;
+}
+const MOVEMENT_SINGLE_ONLY = Object.freeze({ ok: false, reason: 'not_single', error: '入出庫の履歴は単品だけです (セットには在庫がありません。構成品の画面で見ます)' });
+router.get('/api/sku/:code/movements', (req, res) => withPgApi(res, async (db) => {
+  const sku = await movementSku(db, req.params.code);
+  if (!sku) return res.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
+  if (sku.sku_kind !== 'single') return res.status(400).json(MOVEMENT_SINGLE_ONLY);
+  const before = typeof req.query.before === 'string' && req.query.before ? req.query.before.slice(0, 100) : null;
+  const st = before ? null : await readWarehouseStock({ now: clock() });
+  const live = st && st.ok ? { asOf: st.asOf, stale: st.stale, qty: stockOf(st, sku.code_norm) } : null;
+  const out = await readMovementsPage(db, sku, { before, poAccess: canSeeBackorders(req), live });
+  res.status(out.ok ? 200 : out.reason === 'bad_cursor' ? 400 : 503).json(out);
+}));
+/** 🆕 月別のまとめ (CompanyDB構想 26 PR-2): 直近 13 か月。仕入・発注の数と金額は発注アプリの権限がある人だけ */
+router.get('/api/sku/:code/monthly', (req, res) => withPgApi(res, async (db) => {
+  const sku = await movementSku(db, req.params.code);
+  if (!sku) return res.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
+  if (sku.sku_kind !== 'single') return res.status(400).json(MOVEMENT_SINGLE_ONLY);
+  const out = await readMonthly(db, sku, { poAccess: canSeeBackorders(req), now: new Date(clock()) });
+  res.status(out.ok ? 200 : 503).json(out);
 }));
 
 router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
