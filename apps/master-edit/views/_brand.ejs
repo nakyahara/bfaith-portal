@@ -1,0 +1,24 @@
+<%#
+  🆕 0088 ブランドの欄 (中原さん 2026-10-17「メーカーとは別にブランド (自社ブランド・他社ブランド)」)。必須でない (「入力なし」は無い = 空 = なし)。
+  新商品の登録 (単品)・色違い・サイズ違いのまとまり (全部の子に同じ値)・商品の画面 (単品) の 3 つで同じ部品。動き = public/me-maker.js (メーカーと同じ動き・KINDS の brand)
+  - 打つと名簿から探す (かなの同一視・日本語の変換中も探す・確定の Enter では選ばない)。候補の「自社」= 自社ブランド
+  - 名簿に無い名前 = 候補の最後の「＋ 〇〇 を新しいブランドとして登録」/「＋ 〇〇 を自社ブランドとして登録」→ 確かめて名簿に足す (同じと見る名前が既にあればそれを選ぶ)
+  - 「自社ブランドにする / 外す」= 名簿の印をその場で変える (このブランドの全部の商品に効く)
+  - 送る値 = 隠した欄 #f-brand (名簿の番号)。打っただけで選んでいない名前は送らない
+  渡す値: bl = { brands: [{ id, name, own }], max }・cur = 今のブランド { brand_id, name, own_brand } | null・dis = ' disabled' | ''・canCreate = 名簿に足せるか・extraHidden = 隠した欄に足す属性
+%>
+<%
+  const blData = { base, items: (bl.brands || []).map((b) => [String(b.id), b.name, !!b.own]), max: bl.max, canCreate: !!canCreate && !dis };
+%>
+<span class="mkpick" id="brand-pick">
+  <span class="mkbox">
+    <input class="in w-m" id="f-brand-in" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="f-brand-list" autocomplete="off" spellcheck="false"
+      maxlength="<%= bl.max %>" placeholder="ブランド名を打って選ぶ" aria-describedby="f-brand-msg" value="<%= cur ? cur.name : '' %>"<%= dis %>>
+    <span class="csug" id="f-brand-list" role="listbox" aria-label="ブランドの候補" hidden></span>
+  </span>
+  <input type="hidden" id="f-brand" data-field="brand" data-dirty-field="brand" data-label="ブランド" data-ne="NE へ送らない" value="<%= cur ? cur.brand_id : '' %>"<%- extraHidden || '' %><%= dis %>>
+  <span class="b ok" id="f-brand-owntag"<%= cur && cur.own_brand ? '' : ' hidden' %>>自社ブランド</span>
+  <button type="button" class="btn sm ghost" id="f-brand-own"<%= dis %> hidden title="名簿の印を変えます (このブランドの全部の商品に効きます)">自社ブランドにする</button>
+  <span class="fmsg" id="f-brand-msg" role="status" aria-live="polite"></span>
+</span>
+<script type="application/json" id="me-brand"><%- JSON.stringify(blData).replace(/</g, '\\u003c') %></script>

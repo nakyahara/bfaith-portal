@@ -26,6 +26,7 @@ import { masterProfit } from '../../lib/profit-estimate.js';
 import { readNeSpellings, exportCode } from './ne-spelling.mjs';
 import { makerNamesOf } from '../../lib/master-maker.mjs';
 import { packagesOf } from '../../lib/master-package.mjs';
+import { brandLifeOf, brandLifeTablesExist, LIFE_FILTERS, END_SOON_DAYS } from '../../lib/master-brand-life.mjs';
 
 /** 代表の仕入先に選べる仕入先 = 取引中・「NE に登録した」の申告が済んだ (新しい仕入先) か前からある仕入先 (0053) */
 export async function selectableSuppliers(db) {
@@ -137,6 +138,8 @@ export function normalizeFilters(q = {}) {
     tax: pick(String(q.tax ?? ''), TAX_FILTERS),
     sales: pick(String(q.sales ?? ''), SALES_FILTERS),
     po: q.po === '1' ? '1' : '',
+    // 🆕 0088: 商品の段階 (終売の予定が近い・区分)。lib/master-brand-life.mjs の LIFE_FILTERS
+    life: pick(String(q.life ?? ''), LIFE_FILTERS),
     // 登録日の範囲 (0057)。'YYYY-MM-DD' (input type=date) か 'YYYY/M/D'。読めない日付は捨てる
     reg_from: dateText(q.reg_from), reg_to: dateText(q.reg_to),
     // 長い詳細検索の条件の印 (search-token.mjs・router が中身に戻してから渡す)。形だけ確かめる
@@ -274,6 +277,16 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
         where.push(`(s.sku_kind = 'set' or s.code_norm = any($${inRange}::text[]) or not (s.code_norm = any($${params.length}::text[])))`);
       } else where.push(`(s.sku_kind = 'set' or s.code_norm = any($${inRange}::text[]))`);
     }
+  }
+  // 🆕 0088: 商品の段階 (単品の商品の行だけ)。表が無い・読めない = 何も当てない (区分なし = 単品の全部)
+  if (f.life) {
+    const lifeOn = await brandLifeTablesExist(db);
+    const ex = (cond) => `exists (select 1 from core.product_lifecycle l where l.product_id = s.product_id and ${cond})`;
+    if (f.life === 'stage_none') where.push(lifeOn ? `s.sku_kind = 'single' and not ${ex('l.stage is not null')}` : `s.sku_kind = 'single'`);
+    else if (!lifeOn) where.push('false');
+    else if (f.life === 'end_soon') { params.push(today); where.push(ex(`l.end_planned_on <= $${params.length}::date + ${END_SOON_DAYS}`)); }
+    else if (f.life === 'end_set') where.push(ex('l.end_planned_on is not null'));
+    else { params.push(f.life); where.push(ex(`l.stage = $${params.length}`)); }
   }
   // 登録の状態とカードは別々の絞り込み (両方 = 両方に合う商品。PR #1566 Codex R2 Low)
   const hasReg = await regclass(db, 'ops.master_registrations');
@@ -471,6 +484,17 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
   {
     const pk = await packagesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
     for (const r of pageRows) r.pkg = (r.kind === 'single' && r.product_id && pk.get(String(r.product_id))) || null;
+  }
+  // 🆕 0088: ブランド・区分・終売の予定日 (単品の商品の行だけ・一覧の列と CSV の最後の列)。表が無い・読めない = 空
+  {
+    const bl = await brandLifeOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
+    for (const r of pageRows) {
+      const x = r.kind === 'single' && r.product_id ? bl.get(String(r.product_id)) : null;
+      r.brand = x && x.brand ? x.brand.name : null;
+      r.brand_own = !!(x && x.brand && x.brand.own_brand);
+      r.life_stage = x ? x.stage : null;
+      r.end_planned_on = x ? x.end_planned_on : null;
+    }
   }
   // JAN (CSV だけ = 画面の一覧には出さない)。商品ごと・今の JAN (終わっていない) を並べる
   if (mode === 'all') {

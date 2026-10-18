@@ -129,6 +129,7 @@
           <% if (last) { %><span>最後に直した人 <%= ui.actorWords(last) %></span><span class="dotsep" aria-hidden="true"></span><span><%= ui.fmtJst(last.recorded_at, { nowMs }) %></span><% } else { %><span>変更の記録はまだありません</span><% } %>
           <% if (!isSet && c.primary_supplier) { %><span class="dotsep" aria-hidden="true"></span><span>仕入先 <%= c.primary_supplier %> <%= supName(c.primary_supplier) %></span><% } %>
           <% if (!isSet && c.maker) { %><span class="dotsep" aria-hidden="true"></span><span id="maker-head">メーカー <%= c.maker.name %></span><% } %>
+          <% if (!isSet && c.brand) { %><span class="dotsep" aria-hidden="true"></span><span id="brand-head">ブランド <%= c.brand.name %><%= c.brand.own_brand ? ' (自社)' : '' %></span><% } %>
           <% if (page.registered) { %><span class="dotsep" aria-hidden="true"></span><span id="registered-on">登録日 <%= page.registered.date ? page.registered.date.replace(/-/g, '/') + ' (' + page.registered.label + ')' : '— (分かりません)' %></span><% } %>
         </div>
       </div>
@@ -262,6 +263,9 @@
           <% } %>
           <div class="f"><div class="lab">この商品の仕入先</div><div class="ctl"><% if (!page.suppliers.length) { %><span class="muted">まだありません</span><% } %><% for (const s of page.suppliers) { %><span class="linkchip"><span class="mono"><%= s.code %></span> <%= s.name %><span class="n2"><%= s.vendor_code ? ' 先方品番 ' + s.vendor_code : '' %><%= s.is_primary ? ' · ★代表' : '' %></span></span><% } %></div></div>
         </section>
+
+        <%# 🆕 0088 ブランド・商品の段階 (中原さん 2026-10-17・単品だけ・別の板 = 部品 _brandlife-sku.ejs)。0088 の前の DB・ロールの流し直しの前 = 出さない %>
+        <% if (!isSet && locals.brandLife) { %><%- include('_brandlife-sku', { c, bl: brandLife, row, meta, editable, canSave, base }) %><% } %>
 
         <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。Company DB の「保存する」とは別のボタン (部品 = _order.ejs・public/me-order.js) %>
         <% if (orderSettings) { %><%- include('_order', { os: orderSettings, mode: 'sku', dis: '', stepNo: null, base, code: c.code }) %><% } %>
@@ -679,7 +683,7 @@
   <%# 🆕 PR-7b: まとまりの操作の窓 (名前を直す・子の廃止・代表の採用) %>
   <% if (page && locals.variationOn && canEdit && !closed) { %><%- include('_vops') %><script src="<%= base %>/public/me-vops.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0084: メーカーの欄 (直せるときだけ・me-sku.js の前 = 未保存の「前 → 後」に名前を出す) %>
-  <% if (page && locals.makerReady && c.sku_kind === 'single' && editable('maker')) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (page && c.sku_kind === 'single' && ((locals.makerReady && editable('maker')) || (locals.brandLife && editable('brand')))) { %><script src="<%= base %>/public/me-maker.js?v=<%= assetV %>" defer></script><% } %>
   <% if (page) { %><script src="<%= base %>/public/me-sku.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 10/17: 一覧の前・次の商品へ (離れるときの確認は me-shell.js のリンクの見張りがそのまま効く) %>
   <% if (page) { %><script src="<%= base %>/public/me-prevnext.js?v=<%= assetV %>" defer></script><% } %>
