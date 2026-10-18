@@ -187,13 +187,14 @@ process.env.COMPANY_DB_URL = 'postgres://owner@localhost/sc';
 process.env.COMPANY_DB_MASTER_EDIT_URL = 'postgres://master_edit@localhost/sc';
 process.env.MASTER_EDITORS = 'naka@test';
 let chain = Promise.resolve();
-__setPgClientFactory(async (url) => {
+const factory = async (url) => {
   let release;
   const prev = chain; chain = new Promise((r) => { release = r; });
   await prev;
   await pg.query(`set role ${/master_edit@/.test(url) ? 'master_edit' : 'deploy'}`);
   return { query: (q, p) => pg.query(q, p), end: async () => { await pg.query('reset role'); release(); }, on: () => {} };
-});
+};
+__setPgClientFactory(factory);
 __setClock(() => SALES_NOW);
 const app = express();
 app.use((req, res, next) => { req.session = { authenticated: true, email: 'naka@test', allowedApps: ['master-edit'] }; next(); });
@@ -239,6 +240,17 @@ try {
       const { status, j } = await get('/api/sku/sc-a/sales-chart');
       assert.deepEqual([status, j.reason], [503, 'timeout']);
     } finally { SALES_CHART_LIMITS.timeMs = keep; }
+    // 接続の初めの設定 (set statement_timeout ほか) が遅い = 期限で打ち切り、接続を閉じる (Codex R2 Medium)
+    let ended = 0;
+    __setPgClientFactory(async () => ({ query: (q) => (/^set /.test(q) ? new Promise((ok) => setTimeout(() => ok({ rows: [] }), 1500)) : Promise.resolve({ rows: [] })), end: async () => { ended++; }, on: () => {} }));
+    SALES_CHART_LIMITS.timeMs = 300;
+    try {
+      const t0 = Date.now();
+      const { status, j } = await get('/api/sku/sc-a/sales-chart');
+      const ms = Date.now() - t0;
+      assert.deepEqual([status, j.reason, ended], [503, 'timeout', 1]);
+      assert.ok(ms < 1200, `期限で止まる (${ms} ms)`);
+    } finally { SALES_CHART_LIMITS.timeMs = keep; __setPgClientFactory(factory); }
     const bad = await C.readSalesChart({ query: async () => { throw Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' }); } }, { sku_id: '1', sku_kind: 'single' });
     assert.deepEqual([bad.ok, bad.reason], [false, 'timeout']);
   });

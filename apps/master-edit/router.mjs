@@ -500,9 +500,24 @@ async function connect(kind = 'read', { deadline = null } = {}) {
       client = got;
     }
     if (client.on) client.on('error', (e) => console.error(`[master-edit] 接続のエラー: ${e.message}`));   // 切れた接続でプロセスを落とさない
-    await client.query(`set statement_timeout = '20s'`);
-    await client.query(`set lock_timeout = '10s'`);
-    await client.query(`set idle_in_transaction_session_timeout = '60s'`);
+    const init = async () => {
+      await client.query(`set statement_timeout = '20s'`);
+      await client.query(`set lock_timeout = '10s'`);
+      await client.query(`set idle_in_transaction_session_timeout = '60s'`);
+    };
+    if (deadline == null) await init();
+    else {
+      // 🆕 期限のある読み (販売数のグラフ・CSV): 接続の初めの設定も残りの時間で打ち切る (遅い = 接続を閉じて timeout。販売数のグラフ Codex R2 Medium)
+      const left2 = deadline - Date.now();
+      let timer;
+      const running = left2 > 0 ? init() : null;
+      if (running) running.catch(() => {});   // 打ち切った後に失敗しても落とさない (打ち切る前の失敗は下の race から catch へ)
+      const done = !!running && await Promise.race([running.then(() => true),new Promise((ok) => { timer = setTimeout(() => ok(false), left2); })]).finally(() => clearTimeout(timer));
+      if (!done) {
+        try { await client.end(); } catch { /* */ }
+        return { error: TIMEOUT_WORDS, reason: 'timeout' };
+      }
+    }
     return { client };
   } catch (e) {
     console.error(`[master-edit] Company DB につながらない: ${e && e.message}`);
