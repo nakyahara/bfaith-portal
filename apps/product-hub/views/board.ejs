@@ -33,6 +33,11 @@
   .ne-table td { vertical-align: top; }
   .ne-err { margin-top:4px; font-size:11px; color:#991b1b; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .ne-late { color:#b91c1c; font-weight:700; }
+  /* 🆕 2026-10-17: 新商品の登録で作ったセットの下書き (NE 登録待ち)。日数を過ぎたら橙 (= 注意) */
+  .kb-tag.set-plan { background: #f8fafc; color: #475569; border-color: #cbd5e1; }
+  .kb-tag.set-plan.late { background: #fff7ed; color: #9a3412; border-color: #fdba74; font-weight: 700; }
+  .kb-tab-n.late { background:#fed7aa; color:#9a3412; }
+  .set-plan-callout { margin: 0 0 8px; padding: 6px 10px; border: 1px solid #fdba74; background: #fff7ed; color: #9a3412; border-radius: 6px; font-size: 12px; }
   .ne-table .prov { color: #92400e; font-weight: 600; font-size: 11px; }
   .kb-setline { font-size: 10px; color: #64748b; line-height: 1.4; }
   .kb-setline .prov { color: #92400e; font-weight: 600; }
@@ -252,7 +257,7 @@
       <a class="kb-tab <%= boardView === 'single' ? 'on' : '' %>" href="<%= boardUrl({ view: 'single' }) %>">単品</a>
       <a class="kb-tab <%= boardView === 'set' ? 'on' : '' %>" href="<%= boardUrl({ view: 'set' }) %>">🧩 セット工程</a>
       <a class="kb-tab <%= boardView === 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'image' }) %>">🖼 画像で並べる</a>
-      <a class="kb-tab <%= boardView === 'ne' ? 'on' : '' %>" href="<%= boardUrl({ view: 'ne' }) %>">📮 NE要対応<% if (typeof neCount !== 'undefined' && neCount > 0) { %> <span class="kb-tab-n"><%= neCount %></span><% } %></a>
+      <a class="kb-tab <%= boardView === 'ne' ? 'on' : '' %>" href="<%= boardUrl({ view: 'ne' }) %>">📮 NE要対応<% if (typeof neCount !== 'undefined' && neCount > 0) { %> <span class="kb-tab-n"><%= neCount %></span><% } %><% if (locals.setPlanLate) { %> <span class="kb-tab-n late" title="新商品の登録で作ったセットの下書きが <%= setPlanAlertDays %> 日以上 NE に登録されていません">⚠ <%= setPlanLate %></span><% } %></a>
       <a class="kb-tab <%= boardView === 'ad' ? 'on' : '' %>" href="<%= boardUrl({ view: 'ad', assignee: '', filter: '' }) %>">📣 広告</a>
     </span>
     <% if (boardView !== 'ad') { %>
@@ -358,6 +363,15 @@
       1画面で見比べるためのもので、カードに散らすと比べられない %>
   <% if (boardView === 'ne') { %>
     <div class="card" style="margin-top:10px;">
+      <%# 🆕 2026-10-17: 新商品の登録 (単品) の「セット商品を作るか = 作る」で作ったセットの下書き。NE に登録するまで出品しない (仮のまま)。
+          作ってから日数を過ぎても NE に無い = 知らせる (登録し忘れ・コードの打ち間違い)。NE に取り込まれると自動で本コード確定 = 表から消える %>
+      <% if (locals.setPlanLate || locals.setPlanLateOnly) { %>
+        <div class="set-plan-callout">
+          ⚠ 新商品の登録で作ったセットの下書きが <b><%= setPlanLate %></b> 件、<%= setPlanAlertDays %> 日以上 NE に登録されていません。
+          NE にセット商品を登録すると、取り込まれたときに自動で本コード確定になります (コードを変えたときは「本コードを入力」)。
+          <% if (setPlanLateOnly) { %><a href="<%= boardUrl({ view: 'ne', filter: '' }) %>">全部を見る</a><% } else { %><a href="<%= boardUrl({ view: 'ne', filter: 'set_plan_late' }) %>">それだけを見る</a><% } %>
+        </div>
+      <% } %>
       <% if (!neRows.length) { %>
         <p class="muted" style="margin:0;">NE登録を待っているセット商品はありません。</p>
       <% } else { %>
@@ -387,6 +401,8 @@
                   <code style="font-size:11px;"><%= r.neCode %></code>
                   <% if (r.stillTemporary) { %><span class="prov">(仮)</span>
                   <% } else { %><div class="muted" style="font-size:11px;">NE取込待ち</div><% } %>
+                  <% const spa = locals.setPlanAges && setPlanAges.get(r.id); %>
+                  <% if (spa) { %><div><span class="kb-tag set-plan<%= spa.late ? ' late' : '' %>" title="新商品の登録 (<%= spa.parentCode %>) で作ったセットの下書きです。NE に登録するまで出品しません"><%= spa.late ? '⚠ ' : '' %>登録の画面の下書き · <%= spa.days %>日</span></div><% } %>
                 </td>
                 <td class="muted" style="font-size:12px;">
                   <% if (r.waitingDays == null) { %>—
@@ -623,6 +639,11 @@
               <% } %>
               <%# Company DB の新商品の登録から作ったカードで、発送方法 (送料コード) に楽天の配送方法の対応が無かった (2026-10-01)。
                   推し量らずに空のまま置いている = 人が選ぶ。楽天の配送方法を保存すると札は消える %>
+              <%# 🆕 2026-10-17: 新商品の登録で作ったセットの下書き (NE 登録待ち = 出品しない)。日数を過ぎたら ⚠ %>
+              <% const spc = locals.setPlanAges && setPlanAges.get(c.id); %>
+              <% if (spc) { %>
+                <div class="kb-tags"><span class="kb-tag set-plan<%= spc.late ? ' late' : '' %>" title="新商品の登録 (<%= spc.parentCode %>) で作ったセットの下書きです。NE にセット商品を登録すると自動で本コード確定になります (それまで出品しません)"><%= spc.late ? '⚠ ' : '📝 ' %>セットの下書き · NE 未登録 <%= spc.days %>日</span></div>
+              <% } %>
               <% if (locals.cdbShippingCheck && locals.cdbShippingCheck.has(c.id)) { %>
                 <div class="kb-tags"><span class="kb-tag ship-check" title="新商品の登録の発送方法 (送料コード) に楽天の配送方法の対応がありません。詳細画面で配送方法を選んでください">⚠ 発送方法 要確認</span></div>
               <% } %>

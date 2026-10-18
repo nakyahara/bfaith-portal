@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <%- include('_head') %>
+</head>
+<body>
+  <%- include('_header') %>
+  <%
+    // CSV でまとめて登録 (試し取込つき・10/17 中原さん・apps/master-edit/amazon-bulk.mjs)。画面の動き = public/me-amazon-bulk.js
+    //   1 ファイルを選ぶ → 2 試し取込 (読むだけ・SKU ごとに 作る / 直す / 変わらない / だめ) → 3 保存 (20 件ずつ・1 件ずつ 1 つの画面と同じ保存)
+    const canPreview = canEdit && !dbError;
+    const canApply = canPreview && !amazonClosed;
+    const mb = (BULK.maxBytes / 1024 / 1024).toLocaleString('ja-JP');
+    const cfg = { base, canApply, maxBytes: BULK.maxBytes, chunk: BULK.chunk, actions: BULK.actions };
+  %>
+  <div class="page" id="amazon-bulk-page">
+    <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/amazon/" data-list-back>Amazon SKU</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">CSV でまとめて登録</span></nav>
+    <div class="ph">
+      <div>
+        <h1>CSV でまとめて登録</h1>
+        <div class="lead">seller SKU ごとの構成 (NE の商品 × 数・1 行目が代表) と名前を CSV でまとめて登録します。まず「試し取込」で、SKU ごとに 作る / 直す / 変わらない / だめ (理由) を確かめてから保存します。保存の決まり (名簿の人・保存を開いた後・版・構成品の決まり) は 1 つの画面と同じです。</div>
+      </div>
+      <div class="ph-actions">
+        <a class="btn" href="bulk/template.csv" download id="bulk-template"><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg>見本の CSV</a>
+        <a class="btn" href="<%= base %>/manual#amazon-bulk"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a>
+      </div>
+    </div>
+    <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
+    <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %> (試し取込も名簿の人だけ)</div></div><% } %>
+    <% if (canPreview && amazonClosed) { %><div class="callout warn" id="bulk-closed"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= amazonClosedWhy %>)</div><div class="hint">試し取込 (読むだけ) はできます。保存は開いた後に。</div></div></div><% } %>
+
+    <section class="panel" aria-labelledby="h-bulk-file">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-file"/></svg></span><h2 id="h-bulk-file">1. CSV を選ぶ</h2><span class="sub"><%= mb %> MB まで · <%= BULK.maxRows.toLocaleString('ja-JP') %> 行まで · seller SKU <%= BULK.maxSkus.toLocaleString('ja-JP') %> 件まで</span></div>
+      <ul class="bulk-help">
+        <li><b>この画面の形</b>: 1 行目 = <code>seller_sku,name,ne_code,qty</code>。1 行 = 構成品 1 つ。<b>同じ seller SKU の行が続くとセット</b> (上の行から順に構成・<b>1 行目が代表</b>)。name (名前) が空なら 今の名前 → Amazon の出品一覧の商品名 → 代表の NE の商品名、qty (数) が空なら 1。</li>
+        <li><b>古い SKU マスタの CSV</b> (/apps/warehouse の「商品コード変換テーブル」・19 列) もそのまま読めます: 1 列目 = seller SKU・3 列目 = 名前・4 列目 = NE の商品コード・5 列目 = 数。</li>
+        <li>文字コードは UTF-8 (BOM あり / なし)・Shift_JIS (Excel の「CSV」) を見分けます。構成は 1〜<%= MAX_MAP_COMPONENTS %> 行・数は 1〜<%= MAX_MAP_QTY %>。<b>CSV の構成で置き換えます</b> (今ある構成に足すのではありません)。</li>
+      </ul>
+      <% if (canPreview) { %>
+      <div class="bulk-drop" id="bulk-drop">
+        <input type="file" id="bulk-file" accept=".csv,text/csv" class="in">
+        <button class="btn pri" type="button" id="bulk-preview" disabled><svg class="ic s" aria-hidden="true"><use href="#i-search"/></svg>試し取込 (読むだけ)</button>
+      </div>
+      <% } %>
+      <div class="msgline" id="bulk-msg" role="status" aria-live="polite"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-bulk-res" id="bulk-result" hidden>
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-check"/></svg></span><h2 id="h-bulk-res">2. 試し取込の結果</h2><span class="sub" id="bulk-file-info"></span></div>
+      <div class="chips" id="bulk-filter" role="group" aria-label="絞る"></div>
+      <div class="callout err" id="bulk-line-errors" hidden></div>
+      <div class="scrollx"><table class="tbl" id="bulk-tbl"><caption class="sr">試し取込の結果 (seller SKU ごと)</caption>
+        <thead><tr><th scope="col">seller SKU</th><th scope="col">する事</th><th scope="col">名前 (社内)</th><th scope="col">構成 (NE の商品 × 数・1 つ目が代表)</th><th scope="col">理由・気をつけること</th><th scope="col">保存</th></tr></thead>
+        <tbody id="bulk-rows"></tbody></table></div>
+      <div class="hint" id="bulk-similar-note" hidden></div>
+    </section>
+
+    <section class="panel hud" aria-labelledby="h-bulk-save" id="bulk-save-box" hidden>
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-send"/></svg></span><h2 id="h-bulk-save">3. 保存する</h2><span class="sub"><%= BULK.chunk %> 件ずつ · 1 件ずつ 1 つの画面と同じ保存 · 押し直しても 2 回入りません</span></div>
+      <div class="hint">「作る・直す・墓標から戻す」の SKU だけを保存します (変わらない・だめな SKU は送りません)。途中でだめな SKU があっても、ほかは保存します。古い表 (miniPC の SKU マスタ) と FBA 補充には翌朝 7:00 の写しで届きます。</div>
+      <div class="bulk-acts">
+        <button class="btn pri lg" type="button" id="bulk-apply" disabled>保存する</button>
+        <button class="btn ghost" type="button" id="bulk-report" disabled><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg>結果を CSV で保存</button>
+      </div>
+      <div class="bulk-prog" id="bulk-prog" hidden><div class="bar"><span id="bulk-bar"></span></div><span id="bulk-prog-t"></span></div>
+      <div class="msgline" id="bulk-apply-msg" role="status" aria-live="polite"></div>
+    </section>
+  </div>
+  <script type="application/json" id="me-bulk-cfg"><%- JSON.stringify(cfg).replace(/</g, '\\u003c') %></script>
+  <%- include('_footer') %>
+  <% if (canPreview) { %><script src="<%= base %>/public/me-amazon-bulk.js?v=<%= assetV %>" defer></script><% } %>
+</body>
+</html>

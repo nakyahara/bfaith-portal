@@ -1866,6 +1866,45 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_ph_cdb_card_events_draft ON ph_cdb_card_events(draft_id);
   `);
+  // 🆕 新商品の登録 (単品) で「セット商品を作るか = 作る」のときに決めた、作るセット (2026-10-17 中原さん・services/cdb-set-plan.js)。
+  //   登録の request_id (= Company DB の ops.product_hub_outbox.request_id) で 1 つ。request_hash = 登録の要求のハッシュ (保存の記録と同じ = 通った登録の作るセットだけ付ける)。
+  //   登録の前に書き (書けなければ登録しない)、
+  //   カードの取り込みが同じ request_id の知らせでセットの下書き (provisional_code = 1 = NE で確かめるまで出品しない) を作る = 何度届いても 1 回だけ。
+  //   state: waiting (登録の前に書いた) → registered (登録できた・SKU の番号) → applied (下書きを作った) / dropped (登録が断られた = 下書きは作らない)
+  //   items = 1 行 1 セット (個数・コード・名前・作った下書き)。あとで Company DB のセットの登録 (設計 24) が開いたら、この行がセットの SKU の元になる
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_cdb_set_plans (
+      request_id      TEXT PRIMARY KEY,
+      schema          TEXT NOT NULL,
+      parent_code     TEXT NOT NULL,
+      parent_name     TEXT NOT NULL,
+      plan_hash       TEXT NOT NULL,
+      request_hash    TEXT NOT NULL,
+      state           TEXT NOT NULL CHECK (state IN ('waiting', 'registered', 'dropped', 'applied')),
+      cdb_sku_id      INTEGER,
+      parent_draft_id INTEGER,
+      created_by      TEXT NOT NULL,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      registered_at   TEXT,
+      applied_at      TEXT,
+      note            TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_cdb_set_plans_sku ON ph_cdb_set_plans(cdb_sku_id);
+    CREATE TABLE IF NOT EXISTS ph_cdb_set_plan_items (
+      request_id    TEXT NOT NULL REFERENCES ph_cdb_set_plans(request_id),
+      sort          INTEGER NOT NULL,
+      qty           INTEGER NOT NULL CHECK (qty BETWEEN 2 AND 99),
+      code          TEXT NOT NULL,
+      code_key      TEXT NOT NULL,
+      name          TEXT NOT NULL,
+      set_draft_id  INTEGER,
+      outcome       TEXT CHECK (outcome IS NULL OR outcome IN ('created', 'skipped')),
+      outcome_note  TEXT,
+      PRIMARY KEY (request_id, sort)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_cdb_set_plan_items_code ON ph_cdb_set_plan_items(code_key);
+    CREATE INDEX IF NOT EXISTS idx_ph_cdb_set_plan_items_draft ON ph_cdb_set_plan_items(set_draft_id);
+  `);
   // 🆕 まとまり (色違い・サイズ違い) のカード (2026-10-09・Company DB構想 20 v7 §⑤ / §⑩ の PR-4)。
   // Company DB の知らせ (ops.product_hub_outbox の entity_kind = variation_group・kind = group_snapshot・ph-group-v1) から
   // まとまりで 1 枚のカードを作る (services/cdb-group-intake.js)。
