@@ -25,6 +25,61 @@
  * (aupay/linegift/amazon-accounting が揃って `* 100` している / 書き込み側は `/ 100`)
  * ただし取り込み経路によっては百分率が入る余地があるので両方を吸収する。
  */
+// 配送方法の名前の正本 (楽天の配送方法セット一覧の写し)。試算の合わせ先を決めるのに使う
+import { RAKUTEN_SHIPPING_METHODS } from '../../price-update/shipping-labels.js';
+// 運送会社・サービスの系統 (佐川=飛脚 / ヤマト宅急便=クロネコ / ネコポス …)。
+// 目安の語の部分一致だけだと「ヤマト(ネコポス)」が 宅急便 の候補に入ってしまう (Codex R9 P1)
+import { familyOf } from '../../price-update/shipping-cost.js';
+
+/**
+ * 試算の合わせ先を探すときの「同じ配送方法か」の単位 (2026-10-08)。
+ *
+ * familyOf は**運送会社の大枠**までなので、同じ系統の中の別サービスを一緒にしてしまう。
+ * 🚨 「宅急便コンパクト」は専用箱の別サービスで宅急便より安い。在庫全体でコンパクトの方が
+ * 多いと、楽天「宅急便50サイズ以下」の商品がコンパクトの送料で試算されて利益を良く見せる
+ * (Codex R19 P1)。page-info.js の mapNeShippingToRakuten も「宅急便コンパクト→宅急便」を
+ * 誤マッピングの例として挙げている。
+ * 同じ理由で「飛脚メール便」(宅配便ではない)・「クール便」も分ける (Codex R24)。
+ * 楽天の配送方法の名前にこれらの語は出てこないので、**分けた分は自動では選ばれない** =
+ * 管理画面で割り当てるまで候補にしない (安全側)。足すときは実データの配送方法名を棚卸しする:
+ *   node apps/product-hub/scripts/shipping-map-report.mjs
+ */
+/**
+ * 同じ運送会社の中の**別サービス**を表す語 (2026-10-08)。通常の宅配便より安いものが多く、
+ * 混ぜると利益を良く見せる。足すときは実データの配送方法名を棚卸しする:
+ *   node apps/product-hub/scripts/shipping-map-report.mjs
+ */
+const SHIP_SERVICE_QUALIFIERS = ['コンパクト', 'クール', 'メール', 'DM便', 'こねこ便', 'タイムサービス'];
+
+/**
+ * 楽天の配送方法グループ → その**サービスそのもの**を指す語 (2026-10-08)。
+ *
+ * 🚨 RAKUTEN_GROUP_NE_HINTS (候補を上に集める目安) は運送会社の名前まで含むゆるい表で、
+ * 自動で試算に使うと「クロネコゆうメール 180円」「クロネコDM便」「ヤマト（こねこ便420）」の
+ * ように**同じ運送会社の安い別サービス**を宅急便の送料として選んでしまう (Codex R24/R25)。
+ * 名前を1つずつ除外して追いかけるのは終わらないので、**その語を必ず含むこと**を条件にする。
+ * ここに無い書き方 (例: ヤマトの「発払い」) は自動では選ばず、
+ * 管理画面の割当 (ph_shipping_method_map) で人が決める = 安全側に倒す。
+ */
+export const RAKUTEN_GROUP_NE_CORE = {
+  '1': ['定形'],                      // 定形内 / 定形外規格内 / 定形外規格外
+  '2': ['クリックポスト'],
+  '3': ['飛脚宅配便', '佐川急便'],
+  '4': ['ゆうパック'],
+  '5': ['ネコポス'],
+  '6': ['クリックポスト'],
+  '7': ['宅急便'],
+  '8': ['宅急便'],
+  '9': ['ゆうパケット'],
+};
+
+export function shipServiceOf(name) {
+  const f = familyOf(name);
+  if (!f) return null;
+  const n = String(name ?? '');
+  const q = SHIP_SERVICE_QUALIFIERS.find((w) => n.includes(w));
+  return q ? `${f}/${q}` : f;
+}
 export const ALLOWED_TAX_PERCENTS = [8, 10];
 
 export function taxToPercent(v) {
@@ -435,15 +490,24 @@ export function listNeShippingOptions(db) {
  * (最終的に人が選ぶ)。掲載HTMLに出る mapNeShippingToRakuten の割当とは別物 —
  * あちらは誤ると商品ページの表記が誤るので部分一致を避けている
  */
+// 🚨 語は price-update/shipping-cost.js の **familyOf (運送会社・サービスの系統)** と
+// 同じ分け方にそろえる。ここだけで考えると取りこぼす:
+//   - 4 を ['宅急便'] のままにしていた (2026-09-04 に楽天のラベルを「ゆうパック」へ直した
+//     ときの取りこぼし)。自動で試算に使うと**別の運送会社の送料で利益を出す** (Codex R4 P1)
+//   - 3 を ['飛脚'] だけにしていたので、NE の「佐川急便〜」が候補にならなかった (Codex R8 P2)
+// smoke が「語の系統 = 楽天の配送方法の名前の系統」を不変条件として見張っている
 export const RAKUTEN_GROUP_NE_HINTS = {
-  '1': ['定形'],          // 定形外 → 定形内 / 定形外規格内 / 定形外規格外
-  '3': ['飛脚'],          // 飛脚宅配便
-  '4': ['宅急便'],        // 宅急便
+  '1': ['定形'],                          // 定形外 → 定形内 / 定形外規格内 / 定形外規格外
+  // 2 は「現在使用不可」で選べないが、**過去に保存された商品は開ける**。
+  // 抜かすとその商品だけ試算が配送方法に追従しない (Codex R6 P2)
+  '2': ['クリックポスト'],                 // クリックポスト（現在使用不可）
+  '3': ['飛脚', '佐川'],                   // 飛脚宅配便 (NE の表記は「佐川急便〜」もある)
+  '4': ['ゆうパック'],                     // ゆうパック
   '5': ['ネコポス'],
   '6': ['クリックポスト'],
-  '7': ['宅急便'],        // ヤマト運輸宅急便
-  '8': ['宅急便'],        // 宅急便50サイズ以下
-  '9': ['ゆうパケット'],  // ゆうパケットパフ
+  '7': ['宅急便', 'クロネコ', 'ヤマト'],   // ヤマト運輸宅急便 (NE に「ヤマト(発払い)〜」もある)
+  '8': ['宅急便', 'クロネコ', 'ヤマト'],   // 宅急便50サイズ以下
+  '9': ['ゆうパケット'],                   // ゆうパケットパフ
 };
 
 /**
@@ -475,4 +539,114 @@ export function profitShipChoices(options, neMethod, neShippingCost) {
   return list
     .map((o) => (o.isCurrent && hasActual ? { ...o, cost: actual } : o))
     .filter((o) => o.cost != null);
+}
+
+/**
+ * 楽天の配送方法グループ → その系統の NE の配送方法 (画面で候補を上に集めるのに使う)。
+ *
+ * 🚨 目安の語の**部分一致で集めてはいけない**。「ヤマト(ネコポス)」が 宅急便 (7/8) の
+ * 「楽天の指定に近いもの」に並び、人がそれを選ぶと宅急便なのに 237円 で試算できてしまう
+ * (Codex R9 P1 / R10 P2)。自動で選ぶ側 (profitShipPickByGroup) と同じ familyOf で分ける。
+ *
+ * @returns {Record<string, string[]>} 楽天グループ → NE の配送方法名 (画面の選択肢と同じ並び)
+ */
+
+/**
+ * 楽天の配送方法グループ → 利益試算で使う NE の配送方法 (2026-10-06 中原さん報告)。
+ *
+ * 背景: #1167 で「配送方法で試算」を足したが、**基本情報の配送方法を変えても利益が動かない**
+ * ままだった (候補を上に集めるだけで、選択は NE の登録値に留まっていた)。
+ * 中原さんの報告 = 「配送方法を定形外にしているが利益計算が更新されない」。
+ *
+ * グループは粒度が粗く送料が一意に決まらない (定形外 → 定形内 / 定形外規格内 / 定形外規格外)
+ * ので、1つを選んで試算し、**何で試算しているか・ほかに何通りあるか**を画面に書く:
+ *   0) 候補は、管理画面の割当 (ph_shipping_method_map) があればそのグループのもの、
+ *      無ければ**同じサービス** (shipServiceOf = 運送会社 + コンパクト等の別サービス) の便だけ
+ *   1) NE に登録されている配送方法がそのグループに当てはまるなら**それ** (= 実送料。一番確か)
+ *   2) 当てはまらないなら、そのグループの候補のうち**いちばん多く使われている**もの
+ *      (同数なら高い方 = 利益を実際より良く見せない側。listNeShippingOptions と同じ倒し方)
+ *   3) 送料 0 円の便は候補にしない (NE の 0 は「無料」でなく「未入力」が多い)
+ *   4) 候補が無ければキーを作らない → 画面は試算の配送方法を**変えない**
+ * ⚠️ 1) 2) より先に、**楽天の配送方法の名前そのものを含む便があればそこへ絞る**
+ *    (楽天「定形外」の目安 '定形' は 定形内 まで拾う。NE が 定形内 でも 定形外 で試算する)
+ *
+ * @param {Array<{method:string, cost:number, count:number, isCurrent?:boolean}>} choices
+ *        profitShipChoices の結果 (画面の選択肢とまったく同じ並び・同じ送料)
+ * @param {Record<string,string[]>} hints 楽天グループ → 配送方法名にかかる語
+ * @returns {Record<string, {method:string, cost:number, isNe:boolean, from:number, min:number, max:number}>}
+ */
+export function profitShipNearByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, labels = RAKUTEN_SHIPPING_METHODS, assigned = null) {
+  const out = {};
+  for (const [group, words] of Object.entries(hints || {})) {
+    const near = (choices || [])
+      .filter((o) => o && o.method && shipBelongsToGroup(o.method, group, words, labels, assigned))
+      .map((o) => o.method);
+    if (near.length) out[group] = near;
+  }
+  return out;
+}
+
+/**
+ * その NE の配送方法は、この楽天の配送方法グループのものか (2026-10-08)。
+ *   1) 管理画面の割当 (ph_shipping_method_map) があればそれが正。**別のグループに
+ *      割り当てられているものは入れない** (人が決めた対応を推測で上書きしない)
+ *   2) 無ければサービス単位 (shipServiceOf) で同じもの
+ *   3) サービスが分からない楽天配送方法だけ、目安の語の部分一致に落ちる
+ */
+function shipBelongsToGroup(method, group, words, labels, assigned) {
+  // 1) 管理画面の割当があればそれが正 (別のグループに割り当てられているものは入れない)
+  const given = assigned ? (assigned[method] ?? assigned.get?.(method)) : undefined;
+  if (given != null && given !== '') return String(given) === String(group);
+  // 2) 同じ運送会社の**別サービス** (コンパクト・クール・メール・DM便 …) は入れない
+  const svc = shipServiceOf(labels?.[group]);
+  if (svc && shipServiceOf(method) !== svc) return false;
+  // 3) そのサービスそのものを指す語を**必ず含む**こと。ここに無い書き方は自動で選ばない
+  const core = RAKUTEN_GROUP_NE_CORE[group];
+  if (core) return core.some((w) => method.includes(w));
+  return (words || []).some((w) => method.includes(w));
+}
+
+export function profitShipPickByGroup(choices, hints = RAKUTEN_GROUP_NE_HINTS, labels = RAKUTEN_SHIPPING_METHODS, assigned = null) {
+  // ⚠️ Number(null) は 0。null を先に弾かないと「送料0円」の便で試算して利益を過大に見せる
+  //    (profitShipChoices / profit.js の computeProfit と同じ注意)
+  const num = (v) => (v == null || v === '' ? NaN : Number(v));
+  const list = (choices || []).filter((o) => o && o.method && Number.isFinite(num(o.cost)));
+  const out = {};
+  for (const [group, words] of Object.entries(hints || {})) {
+    // 🚨 候補は**運送会社・サービスの系統が同じ便**だけ (familyOf)。目安の語の部分一致だと
+    //    「ヤマト(ネコポス) 237円」が 宅急便 (7/8) の候補に入って、宅急便より安い送料で
+    //    利益を良く見せる (Codex R9 P1)。系統が分からない楽天配送方法だけ目安の語に落ちる
+    // 🚨 送料 0 円の便は **NE の登録値でも** 自動選択しない (Codex R3 P1 / R4 P1)。
+    //    NE の 送料 0 は「無料」ではなく「まだ入っていない」ことが多く、選ぶと利益を
+    //    過大に見せる。人が選ぶぶんは今までどおり選択肢に残る (決めるのは人)
+    const belongs = (o) => shipBelongsToGroup(o.method, group, words, labels, assigned);
+    const cand = list.filter((o) => belongs(o) && num(o.cost) > 0);
+    if (!cand.length) continue;   // 当てはまる便なし / 0円の便だけ = 画面は何も変えない
+    // 🚨 目安の語はゆるいので、楽天「定形外」の候補に **定形内** (別の段・安い) まで入る。
+    //    楽天の名前そのものを含む便があれば**まずそこへ絞る** — NE の登録値を先に見ると、
+    //    NE が 定形内 146円 の商品で「定形外に合わせて定形内」になり利益を良く見せる
+    //    (Codex R5 P2 / R6 P1)。名前の正本 = RAKUTEN_SHIPPING_METHODS
+    //    「クリックポスト（現在使用不可）」のような楽天側だけの飾りは落として照合する。
+    //    楽天の名前が NE の名前に出てこないグループ (8=宅急便50サイズ以下 等) は絞りが効かず、
+    //    今までどおり「NE の登録値 → 最多 → 高い方」に落ちる (安全側なのでそれでよい)
+    const label = String(labels?.[group] ?? '').replace(/（[^）]*）/g, '').trim();
+    const named = label ? cand.filter((o) => o.method.includes(label)) : [];
+    const pool = named.length ? named : cand;
+    // 絞ったあとで NE の登録値 (実送料) → 最多 → 高い方 (利益を実際より良く見せない側)
+    const ne = pool.find((o) => o.isCurrent);
+    const pick = ne || [...pool]
+      .sort((a, b) => (b.count || 0) - (a.count || 0) || num(b.cost) - num(a.cost))[0];
+    const costs = pool.map((o) => num(o.cost));
+    out[group] = {
+      method: pick.method, cost: num(pick.cost), isNe: !!ne,
+      // なぜその便にしたか (画面の注記がこれで言い分ける。Codex R6 P3)
+      //   ne … NE に登録されている配送方法 / label … 楽天の名前に合う中で最多 / count … 最多
+      reason: ne ? 'ne' : (named.length ? 'label' : 'count'),
+      // 🚨 candidates は「**自動で選べる候補**の数」、min/max はその**代表送料**の幅。
+      //    listNeShippingOptions が配送方法ごとに代表送料 1 件へ畳んでいるので、
+      //    「大きさで何通り」や「実送料の幅」ではない。画面の文もそう書く (Codex R4 P2)
+      candidates: pool.length, min: Math.min(...costs), max: Math.max(...costs),
+    };
+  }
+  return out;
 }
