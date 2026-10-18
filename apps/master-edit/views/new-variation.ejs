@@ -156,7 +156,7 @@
             <div class="ctl"><%- include('_maker', { base, mk: { makers, max: makerMax }, cur: null, dis, noneHtml: none('maker'), suppliers: page.activeSuppliers.map((s) => [s.code, s.name]), supplierSel: '#f-primary_supplier', canCreate: canSave, extraHidden: part('maker') }) %>
               <span class="hint" style="flex-basis:100%">全部の子に同じメーカー · 問屋から仕入れるときは作っている会社を · 一覧に無いときは打って「新しいメーカーとして登録」 · Company DB だけ (NE・ロジザードには送りません)</span></div></div>
           <% } %>
-          <%# 🆕 0085 ブランド・商品の段階 (中原さん 2026-10-17・全部の子に同じ値・どれも必須でない)。部品 = _brandlife-new.ejs (単品と同じ)。0085 の前の DB = 出さない %>
+          <%# 🆕 0088 ブランド・商品の段階 (中原さん 2026-10-17・全部の子に同じ値・どれも必須でない)。部品 = _brandlife-new.ejs (単品と同じ)。0088 の前の DB = 出さない %>
           <% if (locals.brandLife) { %>
           <div class="subh" id="sub-brandlife"><svg class="ic" aria-hidden="true"><use href="#i-tag"/></svg>ブランド・商品の段階 <span class="opt">任意</span></div>
           <%- include('_brandlife-new', { base, bl: brandLife, dis, canCreate: canSave, forAll: true }) %>

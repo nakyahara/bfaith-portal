@@ -391,7 +391,7 @@ await ta('[V1] まとまりの登録: 全部の子に同じ値 (記録は子ご�
 });
 
 await ta('[L1] 一覧の「大きさ・重さ」の列 (いつもは出さない・並べられない・最後に足す)・CSV の最後の 5 列 (まとめた値と出どころ)', async () => {
-  assert.equal(COLS.COLUMN_IDS[COLS.COLUMN_IDS.indexOf('maker') + 1], 'pkg', '前の列の並びを変えない (メーカーの後ろに足す・🆕 0085 のブランドなどはその後ろ)');
+  assert.equal(COLS.COLUMN_IDS[COLS.COLUMN_IDS.indexOf('maker') + 1], 'pkg', '前の列の並びを変えない (メーカーの後ろに足す・🆕 0088 のブランドなどはその後ろ)');
   assert.ok(!COLS.DEFAULT_VIEW.shown.includes('pkg'));
   assert.ok(!COLS.SORTABLE.includes('pkg'));
   const data = await asEditor(() => RD.listSkus(db, RD.normalizeFilters({ q: 'pk-r1' }), { mode: 'all' }));

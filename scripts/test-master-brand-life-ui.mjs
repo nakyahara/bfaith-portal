@@ -1,5 +1,5 @@
 /**
- * test-master-brand-life-ui.mjs — ブランド・商品の段階の欄 (views/_brand.ejs・_brandlife-new.ejs・_brandlife-sku.ejs・public/me-maker.js の brand・Company DB の 0085) を
+ * test-master-brand-life-ui.mjs — ブランド・商品の段階の欄 (views/_brand.ejs・_brandlife-new.ejs・_brandlife-sku.ejs・public/me-maker.js の brand・Company DB の 0088) を
  * 本物の router で描いたページで動かす (Playwright・Chromium)
  *
  * 固定する動き:

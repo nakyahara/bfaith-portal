@@ -138,7 +138,7 @@ export function normalizeFilters(q = {}) {
     tax: pick(String(q.tax ?? ''), TAX_FILTERS),
     sales: pick(String(q.sales ?? ''), SALES_FILTERS),
     po: q.po === '1' ? '1' : '',
-    // 🆕 0085: 商品の段階 (終売の予定が近い・区分)。lib/master-brand-life.mjs の LIFE_FILTERS
+    // 🆕 0088: 商品の段階 (終売の予定が近い・区分)。lib/master-brand-life.mjs の LIFE_FILTERS
     life: pick(String(q.life ?? ''), LIFE_FILTERS),
     // 登録日の範囲 (0057)。'YYYY-MM-DD' (input type=date) か 'YYYY/M/D'。読めない日付は捨てる
     reg_from: dateText(q.reg_from), reg_to: dateText(q.reg_to),
@@ -278,7 +278,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
       } else where.push(`(s.sku_kind = 'set' or s.code_norm = any($${inRange}::text[]))`);
     }
   }
-  // 🆕 0085: 商品の段階 (単品の商品の行だけ)。表が無い・読めない = 何も当てない (区分なし = 単品の全部)
+  // 🆕 0088: 商品の段階 (単品の商品の行だけ)。表が無い・読めない = 何も当てない (区分なし = 単品の全部)
   if (f.life) {
     const lifeOn = await brandLifeTablesExist(db);
     const ex = (cond) => `exists (select 1 from core.product_lifecycle l where l.product_id = s.product_id and ${cond})`;
@@ -485,7 +485,7 @@ export async function listSkus(db, filters, { now = new Date(), extras = {}, mod
     const pk = await packagesOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
     for (const r of pageRows) r.pkg = (r.kind === 'single' && r.product_id && pk.get(String(r.product_id))) || null;
   }
-  // 🆕 0085: ブランド・区分・終売の予定日 (単品の商品の行だけ・一覧の列と CSV の最後の列)。表が無い・読めない = 空
+  // 🆕 0088: ブランド・区分・終売の予定日 (単品の商品の行だけ・一覧の列と CSV の最後の列)。表が無い・読めない = 空
   {
     const bl = await brandLifeOf(db, pageRows.filter((r) => r.kind === 'single').map((r) => r.product_id));
     for (const r of pageRows) {

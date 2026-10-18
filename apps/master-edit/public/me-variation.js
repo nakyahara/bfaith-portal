@@ -456,7 +456,7 @@
       NONE_ITEMS.forEach(function (x) { if (!S.conflicts[x[3]] || S.picks[x[3]]) need(x[0], x[1], x[2], 5); });
       // 🆕 0084: メーカー (全部の子に同じ値・値 = 名簿から選んだ = 打っただけでは値でない)。欄がある (0084 がある DB) ときだけ
       need('maker', 'メーカー (一覧から選ぶ)', '#f-maker-in', 5);
-      // 🆕 0085: ブランドは必須でない (数えない)。打っただけで一覧から選んでいない = 保存を止める (黙って捨てない)
+      // 🆕 0088: ブランドは必須でない (数えない)。打っただけで一覧から選んでいない = 保存を止める (黙って捨てない)
       if (ME.brand && ME.brand.pending()) Pi(5, 'miss', 'ブランドを一覧から選ぶ (入れないときは欄を空に)', '#f-brand-in');
       if (ME.orderSettings && ME.orderSettings.items) ME.orderSettings.items().forEach(function (x) { if (x.none) noneKeys.push(x.key); else if (!x.ok) Pi(5, 'miss', '発注の設定: ' + x.t + ' (値か「入力なし」)', x.focus); });
       NONE_CARD.forEach(function (x) { need(x[0], x[1], x[2], 5); });
@@ -1043,7 +1043,7 @@
       var mks = rows.map(function (k) { return String((k.values && k.values.maker) || ''); });
       if (mks.length && mks[0] && mks.every(function (x) { return x === mks[0]; })) ME.maker.set(mks[0]); else ME.maker.clear();
     }
-    copyBrandLife(rows);   // 🆕 0085: ブランド・区分・終売の予定日も同じ (全部の子で同じ = 写す・違う / 無い = 空)
+    copyBrandLife(rows);   // 🆕 0088: ブランド・区分・終売の予定日も同じ (全部の子で同じ = 写す・違う / 無い = 空)
   }
   var pickSeq = 0;
   function pickGroup(id, then) {
@@ -1286,7 +1286,7 @@
   // 登録 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度押すときは新しい番号
   var requestId = uuid();
   var val = function (id) { var e = document.getElementById(id); return e ? e.value.trim() : ''; };
-  /* ---------- 🆕 0085: ブランド・区分・終売の予定日 (共通の欄の 1 つの塊・必須でない) ---------- */
+  /* ---------- 🆕 0088: ブランド・区分・終売の予定日 (共通の欄の 1 つの塊・必須でない) ---------- */
   /** 今あるまとまりの子の値を写す (全部の子で同じ = 写す・違う / 無い子がある = 空 = 前のまとまりの値を持ち越さない)。rows = [] = 空にする */
   function copyBrandLife(rows) {
     var same = function (k) { var xs = rows.map(function (r) { return String((r.values && r.values[k]) || ''); }); return xs.length && xs[0] && xs.every(function (x) { return x === xs[0]; }) ? xs[0] : ''; };
@@ -1311,7 +1311,7 @@
     if (String(C.cost).trim() !== '') values.cost = { jpy: C.cost };
     // 🆕 0084: メーカー (隠した欄 = 名簿の番号・欄が無い / 選んでいない = 送らない)
     var mkEl = $('#f-maker'); if (mkEl && mkEl.value) values.maker = mkEl.value;
-    // 🆕 0085: ブランド (隠した欄 = 名簿の番号)・区分・終売の予定日 (欄が無い / 空 = 送らない)
+    // 🆕 0088: ブランド (隠した欄 = 名簿の番号)・区分・終売の予定日 (欄が無い / 空 = 送らない)
     ['brand', 'life_stage', 'end_planned_on'].forEach(function (k) { var el = $('#f-' + k); if (el && el.value) values[k] = el.value; });
     var opts = [];
     m.axes.forEach(function (ax) {

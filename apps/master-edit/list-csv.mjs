@@ -99,7 +99,7 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
     ['梱包の高さ (cm)', (r) => cmNum(r.pkg && r.pkg.height_mm)],
     ['梱包の重さ (g)', (r) => (r.pkg && r.pkg.weight_g != null ? r.pkg.weight_g : null)],
     ['大きさ・重さの出どころ', (r) => pkgSourcesText(r.pkg)],
-    // 🆕 0085 (2026-10-17): ブランド・自社ブランド・定番 / 季節 / 試し・終売の予定日 (Company DB だけの値・単品だけ)。メーカーの後ろに足す (前の列の並びは変えない)。
+    // 🆕 0088 (2026-10-17): ブランド・自社ブランド・定番 / 季節 / 試し・終売の予定日 (Company DB だけの値・単品だけ)。メーカーの後ろに足す (前の列の並びは変えない)。
     //   発売日 (初めて売った日) は出さない (全部の商品の注文・出荷を読むと重い = 商品の画面だけ)
     ['ブランド', (r) => r.brand || ''],
     ['自社ブランド', (r) => (r.brand ? (r.brand_own ? '自社' : '') : '')],

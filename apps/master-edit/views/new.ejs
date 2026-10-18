@@ -33,7 +33,7 @@
   const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs, blankKeys, blankLabels } : null;
 %>
 <%
-  // 🆕 0085: ブランド・商品の段階の板 (単品だけ・0085 の欄が使えるときだけ)。飛び先の帯は「税・分類・仕入先」の次 (どれも必須でない = 「あと N つ」には数えない)
+  // 🆕 0088: ブランド・商品の段階の板 (単品だけ・0088 の欄が使えるときだけ)。飛び先の帯は「税・分類・仕入先」の次 (どれも必須でない = 「あと N つ」には数えない)
   const showBrandLife = !!page && !isSet && !!locals.brandLife;
   if (showBrandLife) secs.splice(secs.findIndex((x) => x[0] === 'sec-tax') + 1, 0, ['sec-brandlife', 'ブランド・段階']);
 %>
@@ -142,7 +142,7 @@
               <span class="hint" style="flex-basis:100%">問屋から仕入れるときは、仕入先とは別に作っている会社を · 一覧に無いときは打って「新しいメーカーとして登録」 · 「仕入先と同じ」= 代表の仕入先の名前 · Company DB だけ (NE・ロジザードには送りません)</span></div></div>
           <% } %>
         </section>
-        <%# 🆕 0085 ブランド・商品の段階 (中原さん 2026-10-17)。Company DB だけ・どれも必須でない (空 = なし)。部品 = _brandlife-new.ejs (まとまりと同じ) %>
+        <%# 🆕 0088 ブランド・商品の段階 (中原さん 2026-10-17)。Company DB だけ・どれも必須でない (空 = なし)。部品 = _brandlife-new.ejs (まとまりと同じ) %>
         <% if (showBrandLife) { %>
         <section class="panel" id="sec-brandlife" aria-labelledby="h-brandlife">
           <div class="panel-h"><span class="stepno" data-step="sec-brandlife" aria-hidden="true"><%= no('sec-brandlife') %></span><h2 id="h-brandlife">ブランド・商品の段階</h2><span class="sub">どれも入れなくてよい · あとで商品の画面でも入れられます</span></div>

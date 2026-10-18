@@ -38,8 +38,8 @@
     const c = counts || {};
     // 札で出せない絞り込み (状態 = 取扱中・登録の下書き以外・札の無い未入力) のときは「もっと絞る」を開いておく
     const moreOn = (filters.state && filters.state !== 'discontinued') || (filters.reg && filters.reg !== 'draft') || (filters.missing && !['cost', 'sales', 'tax'].includes(filters.missing))
-      || (filters.life && filters.life !== 'end_soon');   // 🆕 0085: 商品の段階 (札は「終売の予定が近い」だけ)
-    // 🆕 0085: ブランド・商品の段階 (router の brandLifeList = { today, stages, filters, endBadge })。無い = 0085 の前の画面と同じ
+      || (filters.life && filters.life !== 'end_soon');   // 🆕 0088: 商品の段階 (札は「終売の予定が近い」だけ)
+    // 🆕 0088: ブランド・商品の段階 (router の brandLifeList = { today, stages, filters, endBadge })。無い = 0088 の前の画面と同じ
     const BL = locals.brandLifeList || null;
   %>
   <div class="page" id="list-page">

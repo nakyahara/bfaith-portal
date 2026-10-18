@@ -264,7 +264,7 @@
           <div class="f"><div class="lab">この商品の仕入先</div><div class="ctl"><% if (!page.suppliers.length) { %><span class="muted">まだありません</span><% } %><% for (const s of page.suppliers) { %><span class="linkchip"><span class="mono"><%= s.code %></span> <%= s.name %><span class="n2"><%= s.vendor_code ? ' 先方品番 ' + s.vendor_code : '' %><%= s.is_primary ? ' · ★代表' : '' %></span></span><% } %></div></div>
         </section>
 
-        <%# 🆕 0085 ブランド・商品の段階 (中原さん 2026-10-17・単品だけ・別の板 = 部品 _brandlife-sku.ejs)。0085 の前の DB・ロールの流し直しの前 = 出さない %>
+        <%# 🆕 0088 ブランド・商品の段階 (中原さん 2026-10-17・単品だけ・別の板 = 部品 _brandlife-sku.ejs)。0088 の前の DB・ロールの流し直しの前 = 出さない %>
         <% if (!isSet && locals.brandLife) { %><%- include('_brandlife-sku', { c, bl: brandLife, row, meta, editable, canSave, base }) %><% } %>
 
         <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。Company DB の「保存する」とは別のボタン (部品 = _order.ejs・public/me-order.js) %>

@@ -1,5 +1,5 @@
 <%#
-  🆕 0085 商品の画面のブランド・商品の段階の板 (中原さん 2026-10-17・単品だけ・仕入先の板の下・別の板 = ほかの欄と混ぜない)。Company DB だけ (NE・ロジザード・product-hub には送らない)。
+  🆕 0088 商品の画面のブランド・商品の段階の板 (中原さん 2026-10-17・単品だけ・仕入先の板の下・別の板 = ほかの欄と混ぜない)。Company DB だけ (NE・ロジザード・product-hub には送らない)。
   ブランド・区分・終売の予定日 = 右の「保存する」と一緒に保存 (lib/master-write.mjs の saveSku → ops.set_product_brand / ops.set_product_lifecycle)。空にして保存 = 外す
   発売日 = 初めて売った日 (人は入れない・Company DB の注文・出荷から毎回出す = ops.sku_first_sold・出どころと記録の始まりも出す)
   渡す値: c = 今 (readCurrent)・bl = router の brandLife ({ brands, max, stages, soonDays, first, end })・row / meta / editable = sku.ejs の部品・canSave・base

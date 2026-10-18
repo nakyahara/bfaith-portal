@@ -60,9 +60,9 @@
  *   🚨 渡さない: 3 つの表の insert / update / delete (関数だけが書く)・守りの trigger・名前の問題の部品 (MAKER_OWNER_ONLY_FUNCTIONS)
  * 🆕 0085 (商品ごとの入出庫履歴と月別のまとめ・CompanyDB構想 26): master_edit に読むだけの関数 4 つの実行 (MOVEMENT_FUNCTIONS)。出荷の表の select は渡さない
  * 🆕 0086 (販売数のグラフ・10/17 中原さん): master_edit に読むだけの関数 1 つの実行 (SALES_CHART_FUNCTIONS)。注文の表の select は渡さない
- * 🆕 0085 (ブランド・商品の段階・中原さん 2026-10-17): master_edit にブランドの名簿・商品ごとのブランド・商品の段階と記録の表の select (BRAND_LIFE_SELECT) と、
+ * 🆕 0088 (ブランド・商品の段階・中原さん 2026-10-17): master_edit にブランドの名簿・商品ごとのブランド・商品の段階と記録の表の select (BRAND_LIFE_SELECT) と、
  *   名簿に足す・自社ブランドの印・商品に付ける (ブランド・段階) の 4 つの関数と、初めて売った日・記録の始まりを読む 2 つ (注文・出荷の表は読ませない) の実行 (BRAND_LIFE_EDIT_FUNCTIONS)。
- *   表が無い DB (0085 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
+ *   表が無い DB (0088 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
  *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・要求の控え ops.brand_requests の select・守りの trigger・商品の行を確かめる部品 (BRAND_LIFE_OWNER_ONLY_FUNCTIONS)
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
@@ -304,7 +304,7 @@ export const MOVEMENT_FUNCTIONS = Object.freeze(['ops.sku_stock_anchors(bigint, 
  *   注文の表 (core.orders・order_lines) の select は渡さない (注文番号・金額まで読めてしまう)。関数が無い DB (0086 の前) では付けない (流し直すと付く)
  */
 export const SALES_CHART_FUNCTIONS = Object.freeze(['ops.sku_sales_daily(bigint, date)']);
-/** 🆕 0085 (ブランド・商品の段階): 画面が読む表・画面が実行する関数・持ち主だけの部品 */
+/** 🆕 0088 (ブランド・商品の段階): 画面が読む表・画面が実行する関数・持ち主だけの部品 */
 export const BRAND_LIFE_SELECT = Object.freeze(['core.brands', 'core.product_brands', 'core.product_lifecycle', 'ops.product_brand_events', 'ops.brand_flag_events', 'ops.product_lifecycle_events']);
 export const BRAND_LIFE_EDIT_FUNCTIONS = Object.freeze(['ops.create_brand(uuid, text, text, boolean)', 'ops.set_brand_own(uuid, text, bigint, boolean, boolean, text)',
   'ops.set_product_brand(uuid, text, bigint, bigint, bigint, text, text)', 'ops.set_product_lifecycle(uuid, text, bigint, text, date, text, date, text, text)',
@@ -432,7 +432,7 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0086 (販売数のグラフ): 同じ形 (関数がある DB だけ・前に付けた実行権を外してから画面のロールに付け直す)
   for (const f of SALES_CHART_FUNCTIONS) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of SALES_CHART_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
-  // 🆕 0085 (ブランド・商品の段階): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (表は読むだけ・書くのは関数だけ・要求の控えは読ませない)
+  // 🆕 0088 (ブランド・商品の段階): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (表は読むだけ・書くのは関数だけ・要求の控えは読ませない)
   for (const t of [...BRAND_LIFE_SELECT, 'ops.brand_requests']) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; end if; end $$`);
   for (const t of BRAND_LIFE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...BRAND_LIFE_EDIT_FUNCTIONS, ...BRAND_LIFE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));

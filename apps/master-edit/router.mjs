@@ -148,7 +148,7 @@ import { readPackageView, packageReady } from '../../lib/master-package.mjs';
 import { readLzMirror, lzCopyCheck, lzMirrorOwners } from '../../lib/lz-mirror.mjs';
 // 🆕 0084 (メーカー・中原さん 2026-10-17): 名簿・名簿に足す・欄を出すか (0084 があってロールの流し直しの後)
 import { makerReady, readMakers, createMaker, MAKER_NAME_MAX } from '../../lib/master-maker.mjs';
-// 🆕 0085 (ブランド・商品の段階・中原さん 2026-10-17): 名簿・名簿に足す・自社ブランドの印・欄を出すか・初めて売った日
+// 🆕 0088 (ブランド・商品の段階・中原さん 2026-10-17): 名簿・名簿に足す・自社ブランドの印・欄を出すか・初めて売った日
 import { brandLifeReady, brandLifeTablesExist, readBrands, createBrand, setBrandOwn, firstSoldOf, salesRecordsFrom, firstSoldView, endBadge, daysUntil,
   BRAND_NAME_MAX, LIFE_STAGES, LIFE_FILTERS, END_SOON_DAYS } from '../../lib/master-brand-life.mjs';
 import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
@@ -748,7 +748,7 @@ router.get('/', (req, res) => {
     const bulk = { on: !!db && locals.canEdit && !locals.closed, max: BULK_MAX, chunk: BULK_CHUNK, costReasons: COST_REASONS, groups: FIX_GROUPS, multiMax: MULTI_MAX };
     res.render(view('index.ejs'), { ...locals, ui2: true, nav: 'list', listPage: true, dbError, data, counts, filters, KINDS, MISSING, STATES, REG_STATES, CARD_FILTERS, ADV_KEYS, TAX_FILTERS, SALES_FILTERS, MULTI_MAX, extras, searchExpired, fmt, exportMax: EXPORT_LIMITS.max,
       listView, LIST_COLUMNS, SORT_WORDS, DEFAULT_VIEW, bulk, imgOf, IMAGE_STATE_WORDS,
-      // 🆕 0085: ブランド・商品の段階の列と絞り込み (ready = 表を読める = 札と絞り込みを出す)
+      // 🆕 0088: ブランド・商品の段階の列と絞り込み (ready = 表を読める = 札と絞り込みを出す)
       brandLifeList: { ready: db ? await brandLifeTablesExist(db).catch(() => false) : false, today: jstDate(new Date(clock())), stages: LIFE_STAGES, filters: LIFE_FILTERS, soonDays: END_SOON_DAYS, endBadge } });
   });
 });
@@ -925,12 +925,12 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     // 🆕 0084: メーカーの欄 (単品だけ・0084 があってロールの流し直しの後)。名簿は画面で探す (search-fold.mjs と同じかなの同一視)
     ...(await makerLocals(db, kind === 'single')),
     packageReady: db && kind === 'single' ? await packageReady(db).catch(() => false) : false,   // 🆕 0087 (梱包の大きさ・重さの欄を出すか・入れなくてよい)
-    // 🆕 0085: ブランド・商品の段階 (単品だけ・必須でない)
+    // 🆕 0088: ブランド・商品の段階 (単品だけ・必須でない)
     ...(await brandLifeLocals(db, kind === 'single')),
   });
 }));
 /**
- * 🆕 0085: ブランド・商品の段階の欄に渡す値 { brandLife: { brands, max, stages, first? } | null }。出さない・読めない (0085 の前・ロールの流し直しの前) = null = 欄なし。
+ * 🆕 0088: ブランド・商品の段階の欄に渡す値 { brandLife: { brands, max, stages, first? } | null }。出さない・読めない (0088 の前・ロールの流し直しの前) = null = 欄なし。
  *   cur (商品の画面) = 初めて売った日 (ops.sku_first_sold・読めない = 「読めませんでした」) と終売の予定日までの日数
  */
 async function brandLifeLocals(db, want = true, cur = null) {
@@ -979,7 +979,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     lzBarcodeReady: db ? await lzBarcodeReady(db).catch(() => false) : false,   // 🆕 0080 (子ごとのロジザードのバーコードの欄を出すか)
     ...(await makerLocals(db, !gated)),   // 🆕 0084: メーカー (全部の子に同じ値)
     packageReady: db ? await packageReady(db).catch(() => false) : false,   // 🆕 0087 (梱包の大きさ・重さの欄を出すか・全部の子に同じ値・入れなくてよい)
-    ...(await brandLifeLocals(db, !gated)),   // 🆕 0085: ブランド・商品の段階 (全部の子に同じ値・必須でない)
+    ...(await brandLifeLocals(db, !gated)),   // 🆕 0088: ブランド・商品の段階 (全部の子に同じ値・必須でない)
   });
 }
 // ─── 色違い・サイズ違いのまとまり (PR-7) ───
@@ -1247,7 +1247,7 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
       ? draftCancelView(await readDraftCancelCheck(db, page.cur.sku_id), await liveCardsSafe({ skuId: page.cur.sku_id, code: page.cur.code })) : null,
     // 🆕 0084: メーカー (単品だけ・代表の仕入先のすぐ下・保存は「保存する」と一緒 = saveSku)
     ...(await makerLocals(db, !!page && page.cur.sku_kind === 'single')),
-    // 🆕 0085: ブランド・商品の段階 (単品だけ・別の板・保存は「保存する」と一緒 = saveSku)・初めて売った日 (読むだけ)
+    // 🆕 0088: ブランド・商品の段階 (単品だけ・別の板・保存は「保存する」と一緒 = saveSku)・初めて売った日 (読むだけ)
     ...(await brandLifeLocals(db, !!page && page.cur.sku_kind === 'single', page ? page.cur : null)),
   });
 }));
@@ -1322,7 +1322,7 @@ router.post('/api/makers', (req, res) => {
 });
 
 /**
- * 🆕 0085: ブランドを名簿に足す (「＋ 新しいブランドとして登録」「＋ 自社ブランドとして登録」)。名簿の人だけ・Origin・JSON (上の守り)。
+ * 🆕 0088: ブランドを名簿に足す (「＋ 新しいブランドとして登録」「＋ 自社ブランドとして登録」)。名簿の人だけ・Origin・JSON (上の守り)。
  *   同じと見る名前 (メーカーと同じ決まり) が既にある = 足さずにそれを返す (existed・印も名簿のまま)。同じ request_id の押し直し = 前の答え
  */
 router.post('/api/brands', (req, res) => {
@@ -1333,7 +1333,7 @@ router.post('/api/brands', (req, res) => {
     res.json(await createBrand(db, { requestId: b.request_id, actor: String(req.session.email).trim().toLowerCase(), name: b.name, own: b.own == null ? false : b.own }));
   }, 'write');
 });
-/** 🆕 0085: ブランドの「自社ブランド」の印を変える (名簿の行 = そのブランドの全部の商品に効く)。名簿の人だけ。seen_own = 画面が見ていた印 (違う = 409) */
+/** 🆕 0088: ブランドの「自社ブランド」の印を変える (名簿の行 = そのブランドの全部の商品に効く)。名簿の人だけ。seen_own = 画面が見ていた印 (違う = 409) */
 router.post('/api/brands/own', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });

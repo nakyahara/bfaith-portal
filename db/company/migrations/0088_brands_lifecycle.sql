@@ -1,4 +1,4 @@
--- 0085 (仮の番号・マージの時に付け替える。0084 = メーカー (feat/master-edit-maker) の上に積む。先に 0085・0086 を使う PR (入出庫履歴・寸法) が入れば次の空き番号 = 0087 へ):
+-- 0088 (0084 = メーカー #1739・0085 = 入出庫の履歴 #1741・0086 = 販売数のグラフ #1742・0087 = 大きさ・重さ #1744 の次。migrate は欠番を断る):
 --   ブランドの名簿と商品ごとのブランド・商品の段階 (区分 = 定番 / 季節 / 試し・終売の予定日)・初めて売った日 (発売日) を読む関数 (中原さん 2026-10-17)
 --   中原さん「メーカーとは別にブランド (自社ブランド・他社ブランド) を入れたい」「商品の段階: 発売日 (= 初めて売った日)・定番 / 季節 / 試し・終売の予定日」
 --   決まり: Company DB だけに持つ (NE・ロジザード・product-hub には送らない)・どれも必須でない (新商品の登録の「値か入力なし」に数えない)・単品だけ (セットは構成品から)
@@ -37,7 +37,7 @@ create table core.brands (
   unique (company_id, name_norm),
   unique (company_id, brand_id)
 );
-comment on table core.brands is '🆕 0085: ブランドの名簿 (own_brand = 自社ブランド)。Company DB だけに持つ。同じと見る名前 (name_norm) は会社の中で 1 つ。書くのは ops.create_brand / ops.set_brand_own だけ';
+comment on table core.brands is '🆕 0088: ブランドの名簿 (own_brand = 自社ブランド)。Company DB だけに持つ。同じと見る名前 (name_norm) は会社の中で 1 つ。書くのは ops.create_brand / ops.set_brand_own だけ';
 
 create table core.product_brands (
   product_id bigint primary key references core.products,
@@ -50,7 +50,7 @@ create table core.product_brands (
   foreign key (company_id, brand_id) references core.brands (company_id, brand_id)
 );
 create index ix_product_brands_brand on core.product_brands (brand_id);
-comment on table core.product_brands is '🆕 0085: 商品 (単品の商品の行) ごとの今のブランド (行が無い = なし)。夜間ロードは触らない (core.products.brand とは別)。書くのは ops.set_product_brand だけ';
+comment on table core.product_brands is '🆕 0088: 商品 (単品の商品の行) ごとの今のブランド (行が無い = なし)。夜間ロードは触らない (core.products.brand とは別)。書くのは ops.set_product_brand だけ';
 
 create table core.product_lifecycle (
   product_id     bigint primary key references core.products,
@@ -64,7 +64,7 @@ create table core.product_lifecycle (
   constraint ck_product_lifecycle_some check (stage is not null or end_planned_on is not null)
 );
 create index ix_product_lifecycle_end on core.product_lifecycle (end_planned_on) where end_planned_on is not null;
-comment on table core.product_lifecycle is '🆕 0085: 商品ごとの区分 (staple = 定番 / seasonal = 季節 / trial = 試し) と終売の予定日。どちらも無い = 行が無い。書くのは ops.set_product_lifecycle だけ';
+comment on table core.product_lifecycle is '🆕 0088: 商品ごとの区分 (staple = 定番 / seasonal = 季節 / trial = 試し) と終売の予定日。どちらも無い = 行が無い。書くのは ops.set_product_lifecycle だけ';
 
 create table ops.product_brand_events (
   event_id      bigint generated always as identity primary key,
@@ -83,7 +83,7 @@ create table ops.product_brand_events (
   unique (request_id, product_id)
 );
 create index ix_product_brand_events_product on ops.product_brand_events (product_id, event_id desc);
-comment on table ops.product_brand_events is '🆕 0085: 商品のブランドを付けた・変えた・外した記録 (追記だけ・書くのは ops.set_product_brand だけ)';
+comment on table ops.product_brand_events is '🆕 0088: 商品のブランドを付けた・変えた・外した記録 (追記だけ・書くのは ops.set_product_brand だけ)';
 
 create table ops.brand_requests (
   request_id uuid        primary key,
@@ -94,7 +94,7 @@ create table ops.brand_requests (
   existed    boolean     not null,
   created_at timestamptz not null default now()
 );
-comment on table ops.brand_requests is '🆕 0085: ops.create_brand の要求の控え (足した回・既にあった名前を返した回の両方)。同じ request_id = この答え・違う名前 / 人 / 印 = request_id_reused';
+comment on table ops.brand_requests is '🆕 0088: ops.create_brand の要求の控え (足した回・既にあった名前を返した回の両方)。同じ request_id = この答え・違う名前 / 人 / 印 = request_id_reused';
 
 create table ops.brand_flag_events (
   event_id   bigint generated always as identity primary key,
@@ -109,7 +109,7 @@ create table ops.brand_flag_events (
   created_at timestamptz not null default now(),
   constraint ck_bfe_changed check (changed = (from_own <> to_own))
 );
-comment on table ops.brand_flag_events is '🆕 0085: ブランドの「自社ブランド」の印の要求の記録 (追記だけ・書くのは ops.set_brand_own だけ)。変えなかった (もうその印だった) 要求も changed = false で残す = 押し直しはいつもこの答え (#brand Codex R1 M)';
+comment on table ops.brand_flag_events is '🆕 0088: ブランドの「自社ブランド」の印の要求の記録 (追記だけ・書くのは ops.set_brand_own だけ)。変えなかった (もうその印だった) 要求も changed = false で残す = 押し直しはいつもこの答え (#brand Codex R1 M)';
 
 create table ops.product_lifecycle_events (
   event_id   bigint generated always as identity primary key,
@@ -130,7 +130,7 @@ create table ops.product_lifecycle_events (
   unique (request_id, product_id)
 );
 create index ix_product_lifecycle_events_product on ops.product_lifecycle_events (product_id, event_id desc);
-comment on table ops.product_lifecycle_events is '🆕 0085: 商品の区分・終売の予定日を付けた・変えた・外した記録 (追記だけ・書くのは ops.set_product_lifecycle だけ)';
+comment on table ops.product_lifecycle_events is '🆕 0088: 商品の区分・終売の予定日を付けた・変えた・外した記録 (追記だけ・書くのは ops.set_product_lifecycle だけ)';
 revoke all on core.brands, core.product_brands, core.product_lifecycle, ops.product_brand_events, ops.brand_requests, ops.brand_flag_events, ops.product_lifecycle_events from public;
 
 -- 守り: 書くのは関数の中だけ (印 ops.brand_life_protocol)・記録は追記だけ・TRUNCATE できない

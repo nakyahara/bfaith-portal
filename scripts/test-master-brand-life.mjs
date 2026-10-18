@@ -1,9 +1,9 @@
 /**
- * test-master-brand-life.mjs — ブランドの名簿と商品ごとのブランド・商品の段階 (区分・終売の予定日)・初めて売った日 (中原さん 2026-10-17・Company DB の 0085・lib/master-brand-life.mjs)
+ * test-master-brand-life.mjs — ブランドの名簿と商品ごとのブランド・商品の段階 (区分・終売の予定日)・初めて売った日 (中原さん 2026-10-17・Company DB の 0088・lib/master-brand-life.mjs)
  *
  * Company DB = PGlite (scripts/fixtures/master-variation-db.mjs = 全部の migration を流した新しい DB・切替の後)。本物の router を HTTP 越しに通す。
  * 固定する契約:
- *   D 0085 の形と権限: 表・関数 (security definer・search_path・public の実行権なし)・画面のロール = 表の select と関数の実行だけ (要求の控え・部品は無い)・守り (関数の外では書けない・記録は追記だけ・TRUNCATE できない)
+ *   D 0088 の形と権限: 表・関数 (security definer・search_path・public の実行権なし)・画面のロール = 表の select と関数の実行だけ (要求の控え・部品は無い)・守り (関数の外では書けない・記録は追記だけ・TRUNCATE できない)
  *   C 名簿に足す (POST /api/brands): 足す・自社ブランドとして足す・同じと見る名前 (メーカーと同じ決まり) = 足さずにそれ (印も名簿のまま)・押し直し = 前の答え・同じ番号で違う中身 = 409・形・名簿の人・Origin
  *   O 自社ブランドの印 (POST /api/brands/own): 変える・押し直し・見ていた印と違う = 409・同じ = 変えない
  *   R 単品の登録: ブランド・区分・終売の予定日を付ける (同じ取引)・🚨 「値か入力なし」に数えない (無くても通る)・名簿に無い / 形が違う = 400 (何も作らない)・セットは聞かない・押し直し = 2 回書かない
@@ -105,9 +105,9 @@ const create = (name, { own, rid = uuid(), session = 'editor' } = {}) => call('P
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
-console.log('ブランド・商品の段階 (0085)');
+console.log('ブランド・商品の段階 (0088)');
 
-await ta('[D1] 0085 の形と権限: 表・関数 (security definer・search_path 固定・public の実行権なし)・画面のロール = select と関数の実行だけ', async () => {
+await ta('[D1] 0088 の形と権限: 表・関数 (security definer・search_path 固定・public の実行権なし)・画面のロール = select と関数の実行だけ', async () => {
   for (const t of ['core.brands', 'core.product_brands', 'core.product_lifecycle', 'ops.product_brand_events', 'ops.brand_requests', 'ops.brand_flag_events', 'ops.product_lifecycle_events']) {
     assert.ok((await one('select to_regclass($1) is not null as ok', [t])).ok, t);
   }

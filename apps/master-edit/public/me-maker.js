@@ -1,6 +1,6 @@
 /*
  * me-maker.js — メーカー (製造元) の欄 (中原さん 2026-10-17・Company DB の 0084・部品 = views/_maker.ejs)
- *   🆕 0085: 同じ動きをブランドの欄 (views/_brand.ejs・#f-brand…) にも使う = 下の名簿ごとの違い (K) で 1 回ずつ動かす。ブランドだけ:
+ *   🆕 0088: 同じ動きをブランドの欄 (views/_brand.ejs・#f-brand…) にも使う = 下の名簿ごとの違い (K) で 1 回ずつ動かす。ブランドだけ:
  *     候補の「自社」の札・「＋ 自社ブランドとして登録」(POST /api/brands の own)・「自社ブランドにする / 外す」(#f-brand-own = POST /api/brands/own・名簿の印をその場で変える)。
  *     「仕入先と同じ」「入力なし」はメーカーだけ (ボタン・札がある欄だけ動く)。MasterEdit.brand もメーカーと同じ形
  *   新商品の登録 (単品)・色違い・サイズ違いのまとまり・商品の画面 (単品) の 3 つで同じ動き。
@@ -28,7 +28,7 @@
   var list = document.getElementById('f-' + K.key + '-list');
   var sameBtn = document.getElementById('f-' + K.key + '-same');
   var msgEl = document.getElementById('f-' + K.key + '-msg');
-  var ownBtn = K.own ? document.getElementById('f-' + K.key + '-own') : null;     // 🆕 0085: ブランドだけ
+  var ownBtn = K.own ? document.getElementById('f-' + K.key + '-own') : null;     // 🆕 0088: ブランドだけ
   var ownTag = K.own ? document.getElementById('f-' + K.key + '-owntag') : null;
   var NOUN = K.noun;
   var NONE_SEL = 'input[type="checkbox"][data-none="' + K.key + '"]';
@@ -52,14 +52,14 @@
   if (!picked && hid.value) picked = { id: hid.value, name: inp.value };
   function say(t, cls) { if (!msgEl) return; msgEl.className = 'fmsg' + (cls ? ' ' + cls : ''); msgEl.textContent = t || ''; }
   function recount() { if (typeof ME.recount === 'function') ME.recount(); }
-  /** 🆕 0085: 自社ブランドの札とボタン (ブランドだけ) = 選んでいるブランドの名簿の印 */
+  /** 🆕 0088: 自社ブランドの札とボタン (ブランドだけ) = 選んでいるブランドの名簿の印 */
   function ownShow() {
     if (!K.own) return;
     var m = picked && byId(picked.id);
     if (ownTag) ownTag.hidden = !(m && m.own);
     if (ownBtn) { ownBtn.hidden = !m || !P.canCreate; if (m) ownBtn.textContent = m.own ? '自社ブランドから外す' : '自社ブランドにする'; }
   }
-  var lastPend = false;   // 🆕 0085: 前に数えたときの「打っただけで選んでいない」
+  var lastPend = false;   // 🆕 0088: 前に数えたときの「打っただけで選んでいない」
   /** 値を決める (m = { id, name } / null = なし)。keepText = 打った名前を残す (選んだのをやめただけ) */
   var gen = 0;   // 選んでいる値を変えた回数 (名簿に足す返事を待つ間に人が選び直したかを見る・#maker Codex R2)
   function setVal(m, keepText) {
@@ -122,7 +122,7 @@
     S.items = hits.map(function (m) { return { m: m }; });
     var tooLong = Array.from(q).length > MAX;
     if (!exact && P.canCreate && !tooLong) S.items.push({ create: q });
-    if (!exact && P.canCreate && !tooLong && K.own) S.items.push({ create: q, own: true });   // 🆕 0085: ブランド = 自社ブランドとして足す
+    if (!exact && P.canCreate && !tooLong && K.own) S.items.push({ create: q, own: true });   // 🆕 0088: ブランド = 自社ブランドとして足す
     var h = '';
     if (hits.length) h += '<div class="cs-h"><span>' + NOUN + ' ' + hits.length + ' 件' + (more ? ' (上から 30 件。もっと打つと絞れます)' : '') + '</span></div>';
     else h += '<div class="cs-empty">「' + esc(q) + '」に当たる' + NOUN + 'は名簿にありません</div>';
@@ -215,7 +215,7 @@
     createAndPick(s.name, true, false);
   });
 
-  /* ---------- 🆕 0085: 自社ブランドの印 (ブランドだけ・名簿の行をその場で変える = 保存の箱とは別・このブランドの全部の商品に効く) ---------- */
+  /* ---------- 🆕 0088: 自社ブランドの印 (ブランドだけ・名簿の行をその場で変える = 保存の箱とは別・このブランドの全部の商品に効く) ---------- */
   var ownBusy = false;
   var ownReq = null;   // { k, id } 通信が切れたときの押し直し = 同じ番号
   if (ownBtn && !ownBtn.disabled) ownBtn.addEventListener('click', function () {
@@ -249,7 +249,7 @@
       if (nb && nb.checked && clean(inp.value)) { nb.checked = false; nb.dispatchEvent(new Event('change', { bubbles: true })); }
       say('');
       render();
-      // 🆕 0085: 「打っただけで選んでいない」が変わった = 画面に数え直してもらう (まとまりの画面は欄の input で数え直さない = すすみぐあいに出す・消す)
+      // 🆕 0088: 「打っただけで選んでいない」が変わった = 画面に数え直してもらう (まとまりの画面は欄の input で数え直さない = すすみぐあいに出す・消す)
       var pn = !!clean(inp.value) && !picked;
       if (pn !== lastPend) { lastPend = pn; recount(); }
     });
