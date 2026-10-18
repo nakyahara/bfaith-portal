@@ -2,7 +2,7 @@
  * movements.mjs — 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2。読むだけ。書かない)
  *
  * 材料 (画面と同じ Render の中で読む):
- *   - 出荷 = Company DB の NE の伝票 (core.shipments / shipment_lines)。画面のロールは表を読めない = 読むだけの関数 (0083 仮) で:
+ *   - 出荷 = Company DB の NE の伝票 (core.shipments / shipment_lines)。画面のロールは表を読めない = 読むだけの関数 (0085) で:
  *       ops.sku_movement_shipments (伝票ごとの行) / ops.sku_shipment_totals (区間ごとの数) / ops.sku_shipments_monthly (月ごとの受注数・売上数)
  *   - ロジザードの毎日の在庫 (錨) = ops.sku_stock_anchors (締めた日・取得時刻・その SKU の数)
  *   - 仕入 (入荷) と発注 = 発注アプリの SQLite (warehouse-mirror.db の po_inbound_* / po_order*)。注文残と同じく発注アプリの権限がある人だけ (extras.mjs の readBackorderLines と同じ流儀)
@@ -58,10 +58,10 @@ export function shortShop(name) {
   return s.replace(/^雑貨イズム\s*/, '').replace(/店$/, '') || s;
 }
 
-/** DB の関数の誤り → 画面の言葉。関数が無い (0083 の前)・権限が無い (流し直しの前) = no_privilege */
+/** DB の関数の誤り → 画面の言葉。関数が無い (0085 の前)・権限が無い (流し直しの前) = no_privilege */
 export function fnError(e) {
   if (e instanceof ListTimeoutError) throw e;
-  if (e && (e.code === '42883' || e.code === '42501')) return { ok: false, reason: 'no_privilege', error: '画面のロールに出荷を読む関数がまだありません (migration 0083 と create-master-edit-roles.mjs の流し直しが要ります)' };
+  if (e && (e.code === '42883' || e.code === '42501')) return { ok: false, reason: 'no_privilege', error: '画面のロールに出荷を読む関数がまだありません (migration 0085 と create-master-edit-roles.mjs の流し直しが要ります)' };
   console.error(`[master-edit] 入出庫の履歴を読めない: ${e && e.message}`);
   return { ok: false, reason: 'error', error: '入出庫の履歴を読めません' };
 }

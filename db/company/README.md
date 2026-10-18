@@ -2780,13 +2780,13 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   (master_edit に 3 つの関数の実行) → `heavy-entry-manifest.mjs --verify` → 次の朝の照合 ② の後に `select ops.quarantine_confirm_list(null)` (watcher) で 42 件の表を見る。画面 (Q-2・Q-3) は別の PR
 - 試験 = `node scripts/test-master-quarantine-confirm.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-quarantine-confirm-pg.mjs` (本物のログイン・並ぶ取引)
 
-### 商品ごとの入出庫履歴と月別のまとめ (0083 仮番号・AI_reference CompanyDB構想/26・2026-10-17 中原さん Q1〜Q10 = a・Q11・Q12)
+### 商品ごとの入出庫履歴と月別のまとめ (0085・AI_reference CompanyDB構想/26・2026-10-17 中原さん Q1〜Q10 = a・Q11・Q12)
 - **なぜ**: NE の商品の画面の「入出庫履歴」と「月別のまとめ」を、マスタの入力の商品の画面 (`/sku/:code`) に出す (参考・読むだけ)
 - **関数** (読むだけ・security definer・`master_edit` に実行だけ・出荷の表と `ops.ingest_runs` の select は渡さない = 送り状番号などは読めない):
   `ops.sku_stock_anchors` (ロジザードの毎日の在庫 = 錨・取得時刻・SKU の数) / `ops.sku_shipment_totals` (取得時刻の区切りごとの出荷の数) /
   `ops.sku_movement_shipments` (伝票ごとの出荷の行・新しい順・5,000 行まで) / `ops.sku_shipments_monthly` (月ごとの受注数 = 受注日・売上数 = 出荷確定日)
 - **計算はアプリ** (`apps/master-edit/movements.mjs`): 仕入・発注は発注アプリの SQLite (同じ Render) から・発注アプリの権限がある人だけ。在庫数 = ロジザードの毎日の在庫で合わせ、
   合わない分は「在庫の調整 (ずれ)」の 1 行 (前後で打ち消し合う組 = 出荷確定の時刻のずれの見込みと書く・消さない)。ロジザードの日次の前は在庫数が空欄
-- 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を足すだけ・表は変えない) → 中原さんの OK → 本適用 →
+- 当て方 (🚨 まだ流さない): 番号 = 0085 (0083 = #1734・0084 = #1739 メーカーの次) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を足すだけ・表は変えない) → 中原さんの OK → 本適用 →
   `create-master-edit-roles.mjs` を流し直す (引数なし)。それまで画面の欄は「画面のロールに出荷を読む関数がまだありません」と出す (画面のほかの所は動く)
 - 試験 = `node scripts/test-master-movements.mjs` (計算・関数の権限・API) / `test-master-movements-ui.mjs` (画面) / 測る道具 `scripts/company-db/movements-measure.mjs` (PR-0・watcher で読むだけ)

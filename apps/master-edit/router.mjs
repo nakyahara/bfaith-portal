@@ -113,7 +113,7 @@ import { listImages, IMAGE_STATE_WORDS } from './list-images.mjs';
 import { readBackorders, readBackorderLines, readWarehouseStock, stockOf, buildableOf } from './extras.mjs';
 import { readFbaDay, readFbaSku } from './fba-stock.mjs';
 import { readSalesRun, readSalesSku } from './sales-qty.mjs';
-// 🆕 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・0083 仮の読むだけの関数)
+// 🆕 商品ごとの入出庫履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・0085 の読むだけの関数)
 import { readMovementsPage, readMonthly } from './movements.mjs';
 import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';

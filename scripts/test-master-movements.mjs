@@ -1,5 +1,5 @@
 /**
- * test-master-movements.mjs — 商品ごとの入出庫履歴と月別のまとめ (apps/master-edit/movements.mjs・0083 仮の読むだけの関数・CompanyDB構想 26 の PR-1・PR-2)
+ * test-master-movements.mjs — 商品ごとの入出庫履歴と月別のまとめ (apps/master-edit/movements.mjs・0085 の読むだけの関数・CompanyDB構想 26 の PR-1・PR-2)
  *
  * Company DB = PGlite (migration・見張りと画面のロール)。ロジザードの日次は本物の取込 → 日の締めで作る。発注アプリ = 一時の DATA_DIR の warehouse-mirror.db。
  * 本物の router を HTTP 越しに通す (画面のロール master_edit で読む = 権限が足りているかも確かめる)
@@ -8,7 +8,7 @@
  *     仕入は取得の直前・最後の締めの後はいまのロジザードで合わせる・ページの切れ目は区間の始まり・月別の空欄 (データの無い月)・移行の発注は除く・単価の無い行 = 一部
  *   2 DB の関数: master_edit は 4 つの関数を呼べる・出荷の表 / 取得の回の表は読めない (42501)・public の実行権なし・search_path 固定・取消の伝票 / 明細は数えない
  *   3 API: 単品の履歴 (区間の最後 = ロジザードの数)・発注アプリの権限が無い人には仕入の行を出さない (調整に入る)・ページ (200 行・区間の途中で切らない・続き)・
- *     セット = 400・無いコード = 404・関数が無い (0083 の前) = 503 と言葉
+ *     セット = 400・無いコード = 404・関数が無い (0085 の前) = 503 と言葉
  * 使い方: node scripts/test-master-movements.mjs
  */
 import assert from 'node:assert/strict';
@@ -151,7 +151,7 @@ await t('関数が無い・権限が無い = no_privilege の言葉 (落とさ�
   const bad = { query: async () => { throw Object.assign(new Error('function ops.sku_stock_anchors does not exist'), { code: '42883' }); } };
   const r = await M.readMovementsPage(bad, { sku_id: '1', code: 'x' }, {});
   assert.deepEqual([r.ok, r.reason], [false, 'no_privilege']);
-  assert.match(r.error, /0083/);
+  assert.match(r.error, /0085/);
   const m = await M.readMonthly({ query: async () => { throw Object.assign(new Error('permission denied'), { code: '42501' }); } }, { sku_id: '1', code: 'x' }, {});
   assert.deepEqual([m.ok, m.reason], [false, 'no_privilege']);
   assert.deepEqual(await M.readMovementsPage(bad, { sku_id: '1', code: 'x' }, { before: 'nope' }).then((x) => [x.ok, x.reason]), [false, 'bad_cursor']);
