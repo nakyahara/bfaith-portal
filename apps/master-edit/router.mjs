@@ -2284,7 +2284,7 @@ router.post('/api/ne-delete/items/:id/withdraw', (req, res) => neDelApi(req, res
 router.post('/api/ne-delete/handling', (req, res) => neDelApi(req, res, async (db, actor, b) => res.json(await buildHandling(db,
   { actor, itemIds: b.item_ids, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen() }))));
 
-// ─── NE へ送る (🆕 0093・lib/master-ne-update.mjs) ───
+// ─── NE へ送る (🆕 0094・lib/master-ne-update.mjs) ───
 router.get('/ne-update', (req, res) => withPgPage(req, res, async (db, dbError) => {
   const phase = await readPhaseView(db);
   const view0 = db ? await readNeUpdate(db) : null;
