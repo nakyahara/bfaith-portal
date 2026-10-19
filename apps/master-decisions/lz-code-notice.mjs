@@ -45,7 +45,7 @@ export function noticeLine(x) {
   }
   if (x.reason === 'lz_case_collision') {
     const neCode = showCode(x.ne_code ?? x.code_norm);
-    if (lz.length === 1) return `・${code}: NE = ${neCode} / ロジザード = ${showCode(lz[0])} → NE を ${showCode(lz[0])} に直す`;
+    if (lz.length === 1) return `・${code}: NE = ${neCode} / ロジザード = ${showCode(lz[0])} → NE を ${showCode(lz[0])} に直す (NE の試しの後はポータルの「NEへ送る」が直します)`;
     return `・${code}: NE = ${neCode} / ロジザード = ${lz.length ? `${list(lz)} (書き方が ${lz.length} つ)` : '大文字・小文字の違う書き方'} → どれが正しいか確かめて NE とロジザードをそろえる`;
   }
   if (x.reason === 'code_invalid') return `・${code}: NE の書き方が使えない (使えない文字・壊れた記録${ne.length ? `: ${list(ne)}` : ''})${lzText} → NE の商品コードを確かめる`;
