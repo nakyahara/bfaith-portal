@@ -2,10 +2,18 @@
     赤 = 通知 (「確認して閉じる」= 既読のみ・全端末から消える)
     緑 = 再ピック完了で受領待ち (タスク状態から導出。「現物を受け取った」= 業務アクション。
          対象バッチの作業画面なら受領ボタン、それ以外は対象伝票を開くリンク) %>
-<div id="floorAlerts" style="position:sticky; top:0; z-index:9999;"></div>
+<%# 件数が多いと縦に積み上がって画面全体を覆い、作業画面のボタンが押せなくなった (現場 2026-10-19)。
+    一覧は高さ上限 (35vh) の中でスクロールし、3 件以上なら件数の見出し + たたむ/開く を出す %>
+<div id="floorAlerts" style="position:sticky; top:0; z-index:9999;">
+  <div id="floorAlertsHead" style="display:none; background:#212529; color:#fff; padding:8px 16px; align-items:center; gap:12px; font-size:16px; font-weight:800"></div>
+  <div id="floorAlertsList" style="max-height:35vh; overflow-y:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain"></div>
+</div>
 <script>
 (function () {
-  var box = document.getElementById('floorAlerts');
+  var box = document.getElementById('floorAlertsList');
+  var head = document.getElementById('floorAlertsHead');
+  var collapsed = false;
+  var seenKeys = {};   // たたんでいても、新しいお知らせが来たら開き直す (見落とし防止)
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); };
   var lastReadyKey = null;
@@ -41,6 +49,24 @@
         + action
         + '</div>';
     }).join('');
+    var total = alerts.length + ready.length;
+    var hasNew = false, nextSeen = {};
+    alerts.forEach(function (a) { var k = 'a' + a.id; nextSeen[k] = 1; if (!seenKeys[k]) hasNew = true; });
+    ready.forEach(function (g) { var k = 'r' + g.batch_id + ':' + g.slip_seq; nextSeen[k] = 1; if (!seenKeys[k]) hasNew = true; });
+    seenKeys = nextSeen;
+    if (hasNew) collapsed = false;
+    if (total >= 3) {
+      head.style.display = 'flex';
+      head.innerHTML = '<span style="flex:1">⚠ お知らせ ' + total + ' 件'
+        + '<small style="font-weight:400"> (赤・橙 ' + alerts.length + ' / 緑 ' + ready.length + ')' + (collapsed ? '' : ' — 枠の中を下へスクロールで全部見られます') + '</small></span>'
+        + btn('data-toggle="1"', collapsed ? '▼ 開く' : '▲ たたむ', '#212529', '#fff');
+      head.querySelector('[data-toggle]').addEventListener('click', function () { collapsed = !collapsed; render(alerts, ready); });
+    } else {
+      head.style.display = 'none';
+      head.innerHTML = '';
+      collapsed = false;
+    }
+    box.style.display = collapsed ? 'none' : '';
     box.innerHTML = html;
     box.querySelectorAll('[data-ack]').forEach(function (b) {
       b.addEventListener('click', function () {
