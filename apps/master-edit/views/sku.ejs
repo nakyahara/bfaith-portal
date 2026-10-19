@@ -645,7 +645,8 @@
     <section class="panel moves" id="p-moves" aria-labelledby="h-moves" data-base="<%= base %>" data-code="<%= c.code %>" data-po="<%= poAccess ? '1' : '0' %>">
       <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-truck"/></svg></span><h2 id="h-moves">入出庫の履歴</h2><span class="sub">参考 · 出荷 (NE の出荷確定)<%= poAccess ? '・仕入 (発注アプリの入荷)' : '' %> · 在庫数はロジザードの毎日の在庫で合わせています</span></div>
       <div class="hint mv-head" id="mv-head" aria-live="polite">読んでいます…</div>
-      <div class="tblwrap"><table class="tbl mv" id="mv-tbl"><caption class="sr">入出庫の履歴 (新しい順)</caption>
+      <%# 🆕 10/19 中原さん「下にスクロールするのが長すぎる」: 履歴は高さを決めた枠の中でスクロールする (見出しの行は枠の上に残す・Tab で枠に来て矢印で送れる)。件数は枠の下 (#mv-msg) %>
+      <div class="tblwrap mv-scroll" id="mv-box" tabindex="0" role="region" aria-label="入出庫の履歴の表 (枠の中でスクロール)"><table class="tbl mv" id="mv-tbl"><caption class="sr">入出庫の履歴 (新しい順)</caption>
         <thead><tr><th scope="col">日時</th><th scope="col">処理</th><th scope="col" class="n">入庫</th><th scope="col" class="n">出庫</th><th scope="col" class="n">在庫数</th><th scope="col">伝票番号</th><th scope="col">店舗・仕入先</th><th scope="col">理由</th><th scope="col">担当者</th></tr></thead>
         <tbody id="mv-rows"></tbody>
       </table></div>

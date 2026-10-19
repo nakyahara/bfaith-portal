@@ -7,7 +7,11 @@
  *   2 「もっと前を見る」で続きが足される (区間の途中で切れない・錨の前は在庫数「—」)・最後まで読んだらボタンを隠す
  *   3 発注アプリの権限が無い人: 仕入の行も仕入・発注の欄も出さない (見出しにそう書く)
  *   4 セット: 表を出さず、構成品の画面へのリンク (画面の JS も読まない)
- *   5 スマホ 390 の幅でページが横にはみ出さない (表は表の箱の中で横に送る)
+ *   5 スマホ 390 の幅でページが横にはみ出さない (表は表の箱の中で横に送る)・履歴の枠は画面の高さの 65% まで
+ *   6 履歴の枠 (10/19 中原さん「下にスクロールするのが長すぎる」): 高さを決めて枠の中でスクロール (14 行ほど)・見出しの行は枠の上に残る・
+ *     件数 (新しい方から N 件 / 全 N 件・枠の中でスクロール)・「もっと前を見る」は枠の中の末尾に足し、枠のスクロールの位置を変えない・
+ *     Tab で枠に来て (tabindex・role=region・aria-label) キーで送れる・その下の月別のまとめはページの近くにある
+ *   7 件数の言い方: 1 日の出荷を全部は読めなかった = 「読めた N 件」(全 と言わない)・画面の高さが変わったら「枠の中でスクロール」を数え直す
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ
  * 使い方: node scripts/test-master-movements-ui.mjs
  */
@@ -124,7 +128,9 @@ try {
     assert.match(head, /2026\/10\/01 より前は在庫数を出せません/);
     assert.match(head, /いまのロジザード 2026\/10\/07 11:00 で合わせています/);
     assert.equal(await p.isHidden('#mv-more'), true);
-    assert.match(await p.textContent('#mv-msg'), /12 行 \(ここまで\)/);
+    // 「枠の中でスクロール」は枠に入りきらないときだけ添える
+    const over = await p.evaluate(() => { const b = document.getElementById('mv-box'); return b.scrollHeight > b.clientHeight + 1; });
+    assert.equal(await p.textContent('#mv-msg'), '全 12 件' + (over ? ' (枠の中でスクロール)' : ''));
     await p.waitForSelector('#mo-rows tr');
     const mo = await cells(p, '#mo-rows tr');
     assert.equal(mo.length, 13);
@@ -145,7 +151,7 @@ try {
     const last = await cells(p, '#mv-rows tr:last-child');
     assert.deepEqual([last[0][0], last[0][4]], ['2026/09/30 10:00', '—']);
     assert.equal(await p.isHidden('#mv-more'), true);
-    assert.match(await p.textContent('#mv-msg'), /255 行 \(ここまで\)/);
+    assert.equal(await p.textContent('#mv-msg'), '全 255 件 (枠の中でスクロール)');
   });
 
   await ta('[3] 発注アプリの権限が無い人: 仕入の行も仕入・発注の欄も出さない (見出しにそう書く)', async (p) => {
@@ -178,7 +184,72 @@ try {
     const w = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: window.innerWidth, box: document.querySelector('#p-moves .tblwrap').scrollWidth > document.querySelector('#p-moves .tblwrap').clientWidth }));
     assert.ok(w.doc <= w.view, `横にはみ出す: ${w.doc} > ${w.view}`);
     assert.equal(w.box, true, '表は箱の中で横に送る');
+    // 行の多い商品: 枠は画面の高さの 65% まで (844 × 0.65 = 548)・横も枠の中で送る・ページははみ出さない
+    await p.goto(B + '/sku/mv-b');
+    await p.waitForSelector('#mv-rows tr');
+    const v = await p.evaluate(() => { const b = document.getElementById('mv-box'); return { h: b.clientHeight, sh: b.scrollHeight, sw: b.scrollWidth > b.clientWidth, doc: document.documentElement.scrollWidth, view: window.innerWidth }; });
+    assert.ok(v.h <= 549 && v.sh > v.h, `スマホの枠の高さ ${v.h}`);
+    assert.equal(v.sw, true, '表は枠の中で横に送る');
+    assert.ok(v.doc <= v.view, `横にはみ出す: ${v.doc} > ${v.view}`);
   }, { width: 390, height: 844 });
+
+  await ta('[6] 履歴の枠: 高さを決めて中でスクロール・見出しの行が残る・件数・続きは枠の中に足してスクロールの位置を変えない・キーボード', async (p) => {
+    await p.goto(B + '/sku/mv-b');
+    await p.waitForSelector('#mv-rows tr');
+    assert.equal(await p.textContent('#mv-msg'), '新しい方から 225 件 (枠の中でスクロール) · もっと前があります');
+    const a11y = await p.$eval('#mv-box', (b) => ({ tab: b.getAttribute('tabindex'), role: b.getAttribute('role'), label: b.getAttribute('aria-label'), inBox: !!document.getElementById('mv-rows').closest('#mv-box') }));
+    assert.deepEqual(a11y, { tab: '0', role: 'region', label: '入出庫の履歴の表 (枠の中でスクロール)', inBox: true });
+    const m = await p.evaluate(() => {
+      const b = document.getElementById('mv-box');
+      b.scrollIntoView({ block: 'center' });   // 上の帯 (sticky) に隠れない所で測る
+      const rows = [...document.querySelectorAll('#mv-rows tr')];
+      const head = document.querySelector('#mv-tbl thead tr').getBoundingClientRect().height;
+      const bt = b.getBoundingClientRect();
+      const seen = rows.filter((r) => { const x = r.getBoundingClientRect(); return x.top >= bt.top + head - 1 && x.bottom <= bt.bottom + 1; }).length;
+      return { h: b.clientHeight, sh: b.scrollHeight, seen, gap: document.getElementById('p-monthly').getBoundingClientRect().top - bt.bottom };
+    });
+    console.log(`      (枠の高さ ${m.h}px・中身 ${m.sh}px・見える行 ${m.seen}・枠の下から月別のまとめまで ${Math.round(m.gap)}px)`);
+    assert.ok(m.h <= 600 && m.h >= 400, `枠の高さ ${m.h} (min(600px, 65vh) = 900 の 65% = 585)`);
+    assert.ok(m.sh > m.h * 5, '225 行は枠の中でスクロール');
+    assert.ok(m.seen >= 12 && m.seen <= 15, `見える行 ${m.seen} (12〜15 行ほど)`);
+    assert.ok(m.gap < 400, '月別のまとめが枠のすぐ下にある (225 行でページが伸びない)');
+    // 枠の中を送っても見出しの行は枠の上に残る
+    await p.$eval('#mv-box', (b) => { b.scrollTop = 2000; });
+    const stick = await p.evaluate(() => {
+      const b = document.getElementById('mv-box').getBoundingClientRect();
+      const th = document.querySelector('#mv-tbl thead th').getBoundingClientRect();
+      const under = document.elementFromPoint(th.left + 5, th.top + th.height / 2);
+      return { d: th.top - b.top, isHead: !!(under && under.closest('thead')), bg: getComputedStyle(document.querySelector('#mv-tbl thead th')).backgroundColor };
+    });
+    assert.match(stick.bg, /^rgb\(\d+, \d+, \d+\)$/, `見出しの背景は塗りつぶし (透けない): ${stick.bg}`);
+    assert.ok(stick.d >= 0 && stick.d <= 2, `見出しの行が枠の上に残る (${stick.d})`);
+    assert.equal(stick.isHead, true, '見出しの行が行の上に描かれる (下の行が透けない)');
+    // 「もっと前を見る」= 枠の中の末尾に足す・枠のスクロールの位置はそのまま
+    const before = await p.$eval('#mv-box', (b) => b.scrollTop);
+    assert.equal(before, 2000);
+    await p.click('#mv-more');
+    await p.waitForFunction(() => document.querySelectorAll('#mv-rows tr').length === 255);
+    assert.equal(await p.$eval('#mv-box', (b) => b.scrollTop), before, '続きを足してもスクロールの位置を変えない');
+    assert.equal(await p.$eval('#mv-rows tr:last-child', (tr) => !!tr.closest('#mv-box')), true);
+    // キーボード: Tab で枠に来られる・矢印 / PageDown で送れる
+    await p.$eval('#mv-box', (b) => { b.scrollTop = 0; });
+    await p.focus('#mv-box');
+    assert.equal(await p.evaluate(() => document.activeElement.id), 'mv-box');
+    await p.keyboard.press('PageDown');
+    await p.waitForFunction(() => document.getElementById('mv-box').scrollTop > 100);
+  });
+
+  await ta('[7] 件数の言い方: 1 日の出荷を全部は読めなかった = 「全」と言わない・画面の高さが変わったら「枠の中でスクロール」を数え直す', async (p) => {
+    // API の答えを差し替える (読めなかった日がある・続きは無い・6 行)
+    const row = (i) => ({ kind: 'ship', at: new Date(SEED_NOW - i * 3600e3).toISOString(), label: '出荷', in: null, out: 1, balance: null, slip: 'S' + i, party: '楽天', reason: '', actor: null });
+    await p.route('**/api/sku/mv-a/movements*', (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, rows: [0, 1, 2, 3, 4, 5].map(row), next: null, truncated: true, lastClose: null, firstDay: null }) }));
+    await p.goto(B + '/sku/mv-a');
+    await p.waitForFunction(() => document.querySelectorAll('#mv-rows tr').length === 6);
+    const cutMsg = '1 日の出荷が多すぎて全部は読めませんでした (その日の在庫数は出していません) · 読めた 6 件';
+    assert.equal(await p.textContent('#mv-msg'), cutMsg + ' (枠の中でスクロール)', '低い画面 (300 の 65% = 195px) では 6 行が入りきらない');
+    await p.setViewportSize({ width: 1440, height: 900 });
+    await p.waitForFunction((t) => document.getElementById('mv-msg').textContent === t, cutMsg);
+  }, { width: 1440, height: 300 });
 } finally {
   await browser.close();
   server.close();
