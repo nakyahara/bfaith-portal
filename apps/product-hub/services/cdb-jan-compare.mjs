@@ -156,6 +156,15 @@ async function readRowsWithin(items, { env, deadlineMs }) {
       return { ok: false, reason: `Company DB を読めない (${errText(e)})` };
     } finally { clearTimeout(timer); }
   }
+  return readCdbRowsWithin((c, COMPANY_ID, left) => queryCdbJans(c, COMPANY_ID, items, { statementTimeoutMs: Math.max(100, left) }), { env, deadlineMs, appName: 'product-hub-cdb-jan' });
+}
+
+/**
+ * 🆕 0090 (表示の項目・services/cdb-label-compare.mjs と共通): 期限つきで接続して run(client, COMPANY_ID, 残りの ms) → rows を読む。
+ *   JAN と同じ接続先 (janReadUrlFrom)・同じ同時の上限 (JAN_READ_MAX_CONCURRENT = 2 本・JAN と表示の項目で合わせて)・同じ期限と閉じ方。
+ *   run は読むだけの取引の中で読む (呼び手が begin transaction read only … rollback)。戻り値 { ok: true, rows } / { ok: false, reason, busy? }
+ */
+export async function readCdbRowsWithin(run, { env = process.env, deadlineMs = JAN_READ_DEADLINE_MS, appName = 'product-hub-cdb-read' } = {}) {
   const { url } = janReadUrlFrom(env);
   if (!url) return { ok: false, reason: 'Company DB の接続先が無い' };
   const release = acquireRead();
@@ -178,11 +187,11 @@ async function readRowsWithin(items, { env, deadlineMs }) {
     try {
       const connect = connector || (await import('../../../scripts/company-db/migrate.mjs')).openPgClient;
       const { COMPANY_ID } = await import('../../../lib/master-write.mjs');
-      const c = await connect(url, { application_name: 'product-hub-cdb-jan', connectionTimeoutMillis: Math.min(JAN_CONNECT_TIMEOUT_MS, deadlineMs), statement_timeout: deadlineMs, query_timeout: deadlineMs });
+      const c = await connect(url, { application_name: appName, connectionTimeoutMillis: Math.min(JAN_CONNECT_TIMEOUT_MS, deadlineMs), statement_timeout: deadlineMs, query_timeout: deadlineMs });
       client = c;
       if (timedOut) return { ok: false, reason: 'timeout' };   // 期限の後につながった = 読まずに閉じる (finally)
       const left = deadlineMs - (Date.now() - started);
-      const rows = await queryCdbJans(c, COMPANY_ID, items, { statementTimeoutMs: Math.max(100, left) });
+      const rows = await run(c, COMPANY_ID, left);
       return { ok: true, rows };
     } catch (e) {
       return { ok: false, reason: `Company DB を読めない (${errText(e)})` };

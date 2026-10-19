@@ -349,7 +349,7 @@ await ta('[S1] 探す: コードの前の方・名前の一部・子の商品コ
 await ta('[S2] 読む: 今ある子の値 (共通の欄の形)・まとまりでない (子の無い単品・子・無い番号) = null', async () => {
   const g = await V.readVariationGroup(db, (await one(`select product_id::text as id from core.products where display_code = 'ws100'`)).id);
   const gy = g.children.find((k) => k.code === 'ws100-GY');
-  assert.deepEqual(gy.values, { price: '3280', cost: '1100', tax: '0.1', sales: '3', supplier: '0034', months: '2', expiry: '0', inbound: '', ship: 'S01', maker: '' });   // 🆕 0084: メーカー (無い = 空)
+  assert.deepEqual(gy.values, { price: '3280', cost: '1100', tax: '0.1', sales: '3', supplier: '0034', months: '2', expiry: '0', inbound: '', ship: 'S01', maker: '', brand: '', life_stage: '', end_planned_on: '' });   // 🆕 0084: メーカー (無い = 空)・🆕 0088: ブランド・段階 (無い = 空)
   assert.equal(g.children.find((k) => k.code === 'ws100-WR').values.expiry, '0');
   assert.equal(await V.readVariationGroup(db, (await one(`select product_id::text as id from core.skus where code = 's001'`)).id), null);
   assert.equal(await V.readVariationGroup(db, (await one(`select product_id::text as id from core.skus where code = 'ws100-BR'`)).id), null);

@@ -64,6 +64,7 @@
     if (el.classList.contains('seg')) return segText(el, v);
     if (el.tagName === 'SELECT') { var o = $$('option', el).filter(function (x) { return x.value === v; })[0]; return o ? o.textContent.trim() : v; }
     if (el.id === 'f-maker' && ME.maker) return ME.maker.label(v);   // 🆕 0084: 名簿の番号 → 名前
+    if (el.id === 'f-brand' && ME.brand) return ME.brand.label(v);   // 🆕 0088: ブランドも同じ
     return v === '' ? '(空)' : v;
   }
 
@@ -160,6 +161,8 @@
     if (isSet) opt('exception_cost', 'sec-comp', '例外原価 (入力なし = 構成品の合計)', '#xcost-jpy', 4);
     // 🆕 0084: メーカー (代表の仕入先のすぐ下・値 = 名簿から選んだ = 打っただけでは値でない)。欄がある (0084 がある DB) ときだけ
     if (!isSet) opt('maker', 'sec-tax', 'メーカー (一覧から選ぶ)', '#f-maker-in', 4);
+    // 🆕 0088: ブランドは必須でない (数えない)。打っただけで一覧から選んでいない = 保存を止める (黙って捨てない)
+    if (!isSet && ME.brand && ME.brand.pending()) list.push({ id: 'brand_pending', sec: 'sec-brandlife', t: 'ブランドを一覧から選ぶ (入れないときは欄を空に)', ok: false, focus: '#f-brand-in', level: 4 });
     if (!isSet && ME.orderSettings && ME.orderSettings.items) {
       ME.orderSettings.items().forEach(function (x) { list.push({ id: x.key, sec: 'sec-order', t: x.t, ok: x.ok, none: x.none, focus: x.focus, level: 4, opt: true }); });
     }
@@ -667,6 +670,8 @@
     var keys = isSet ? ['name', 'standard_price', 'shipping_code', 'reorder_months', 'handling_own', 'set_sales_class_override']
       : ['name', 'standard_price', 'shipping_code', 'tax_rate', 'sales_class', 'primary_supplier', 'reorder_months', 'expiry_managed', 'inbound_date_managed', 'maker'];   // maker = 🆕 0084 (隠した欄 = 名簿の番号・欄が無い = 送らない)
     keys.forEach(function (k) { var v = fieldValue(k); if (v !== undefined && v !== '') values[k] = v; });
+    // 🆕 0088: ブランド (隠した欄 = 名簿の番号)・区分・終売の予定日 (欄が無い / 空 = 送らない)
+    if (!isSet) ['brand', 'life_stage', 'end_planned_on'].forEach(function (k) { var v = fieldValue(k); if (v !== undefined && v !== '') values[k] = v; });
     if (isSet) {
       values.components = components();
       // 原価の理由は送らない (新規登録では要らない・サーバーが「新商品の登録」を入れる = 2026-10-08 中原さん)
@@ -691,7 +696,25 @@
     if (po) out.order_settings = po;
     // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコード (単品だけ・欄が無い = 0080 の前 = 送らない)
     if (!isSet && $('#f-lzbc-in')) out.logizard_barcode = lzbc().body;
+    // 🆕 0087: 梱包の大きさ・重さ (単品だけ・入れなくてよい・欄が無い / 全部空 = 送らない)
+    if (!isSet) { var pk = pkgBody(); if (pk) out.package = pk; }
+    // 🆕 0090: 表示の項目 (単品だけ・入れなくてよい・欄が無い / 全部空 = 送らない)
+    if (!isSet) { var lb = labelBody(); if (lb) out.label = lb; }
     return out;
+  }
+
+  /** 🆕 0087: 梱包の 縦・横・高さ (cm)・重さ (g) の欄 (views/_package-new.ejs) → { length, width, height, weight } (全部空・欄が無い = null = 送らない。形はサーバーが確かめる) */
+  function pkgBody() {
+    var ids = { length: 'np-length', width: 'np-width', height: 'np-height', weight: 'np-weight' }, o = {}, any = false;
+    Object.keys(ids).forEach(function (k) { var e = document.getElementById(ids[k]); var v = e && !e.disabled ? String(e.value || '').trim() : ''; o[k] = v; if (v) any = true; });
+    return any ? o : null;
+  }
+
+  /** 🆕 0090: 表示の項目の欄 (views/_label-new.ejs) → { country, net, net_uom, model, shelf } (全部空・欄が無い = null = 送らない。形はサーバーが確かめる) */
+  function labelBody() {
+    var ids = { country: 'np-lbl-country', net: 'np-lbl-net', net_uom: 'np-lbl-net-uom', model: 'np-lbl-model', shelf: 'np-lbl-shelf' }, o = {}, any = false;
+    Object.keys(ids).forEach(function (k) { var e = document.getElementById(ids[k]); if (!e) return; var v = !e.disabled ? String(e.value || '').trim() : ''; o[k] = v; if (v) any = true; });
+    return any ? o : null;
   }
 
   /* ---------- 登録 ---------- */
@@ -700,7 +723,7 @@
    * サーバーの誤りの項目 → 直す欄 (1 つの行に欄が 2 つある Yahoo! など。#1628 Codex R5 L1)。
    * ここに無い項目は data-row の行の最初の欄
    */
-  var FIELD_INPUT = { logizard_barcode: '#f-lzbc-in', maker: '#f-maker-in', 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path', reason: '#reason' };
+  var FIELD_INPUT = { logizard_barcode: '#f-lzbc-in', maker: '#f-maker-in', brand: '#f-brand-in', 'card.yahoo': '#y-price', 'card.yahoo.price': '#y-price', 'card.yahoo.price_sagawa': '#y-price-sagawa', 'card.yahoo.delivery_label': '#y-delivery', 'card.yahoo.category_id': '#y-category', 'card.yahoo.path': '#y-path', reason: '#reason' };
   function showError(j, status) {
     var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
     if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) h += '<ul>' + j.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>';

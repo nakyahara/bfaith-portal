@@ -181,6 +181,8 @@ import { masterLegacyGate, legacyBannerHtml, legacyNewKindNoticeHtml, refuseLega
 import { resolveCdbDraftTax } from './services/cdb-tax-rate.mjs';
 import { resolveListingTax } from './services/listing-tax.mjs';
 import { compareJanUnits, janUnitsForDraftId, boardJanMarks, parseBoardDraftIds, janWarningsOf, readCdbJans, JAN_READ_DEADLINE_MS } from './services/cdb-jan-compare.mjs';
+// 🆕 0090 表示の項目を商品マスタと比べる (Company DB構想 27 ④-2・読むだけ)
+import { compareDraftLabels } from './services/cdb-label-compare.mjs';
 import {
   janEnforceOn, listingJanUnits, resolveListingJans, janLinkNotices, pickViewOf, verifySelection, enforceForecast, looseJan, JAN_ENFORCE_ENV, JAN_GATE_PROBLEMS,
 } from './services/listing-jan.mjs';
@@ -2855,6 +2857,20 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
   })();
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
   res.json({ ok: true });
+});
+
+// 🆕 0090 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安) を商品マスタ (Company DB) と比べる印 (Company DB構想 27 ④-2・読むだけ)。
+//    詳細画面が開いた後に読む (画面の表示を Company DB で待たせない)。Company DB も product-hub の SQLite も書かない (「マスタの値を入れる」は画面の欄に入れるだけ)。
+//    読めないときも 200 で「読めない」を返す
+router.get('/api/drafts/:id/label-check', async (req, res) => {
+  const deadlineAt = Date.now() + JAN_READ_DEADLINE_MS;
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    res.json(await compareDraftLabels(getDB(), draft, { deadlineAt }));
+  } catch (e) {
+    res.json({ ok: true, readable: false, ready: true, reason: String((e && e.message) || e).slice(0, 160), mode: null, units: [], items: null, set: null, kids: null, summary: { severity: 'muted', label: '読めない' } });
+  }
 });
 
 // 🆕 JAN を Company DB と比べる印 (Company DB構想 21 §5 B1・読むだけ)。詳細画面が開いた後に読む (画面の表示を Company DB で待たせない)。

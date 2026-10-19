@@ -579,6 +579,56 @@ a.chip, a.chip:hover { text-decoration: none; }
 .doc ul { margin: 0 0 6px 20px; display: grid; gap: 6px; color: var(--text2); font-size: 14.5px; line-height: 1.75; }
 .doc b { color: #fff; }
 .doc code { font-family: var(--mono); font-size: 13px; background: rgba(255, 255, 255, 0.06); padding: 0 5px; border-radius: 5px; }
+/* 🆕 10/18 マスタの入力のつかいかた (views/manual.ejs・.man の中だけ = マスタの判断のつかいかたは変えない):
+   目次 (.toc)・上に残る章の札 (.man-jump)・章 (h2 + 番号)・節 (h3)・まとめ (.sum)・番号つきの手順 (ol.steps)・流れ (ol.flow)・表 (table.kv)・くわしく (details.more) */
+.man [id] { scroll-margin-top: 122px; }
+.man p { color: var(--text2); font-size: 14.5px; line-height: 1.75; margin: 0 0 10px; }
+.man .hint { color: var(--muted); font-size: 13px; }
+.man h2 { font-size: 19px; margin: 36px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); }
+.man h2::before { display: none; }
+.man h2 .no { flex: none; display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; background: var(--accent-bg); border: 1px solid rgba(58, 231, 255, 0.4); color: var(--accent); font-size: 15px; font-weight: 700; }
+.man h3 { font-size: 16px; margin: 26px 0 8px; color: #fff; }
+.man h3::before { content: ""; display: inline-block; width: 4px; height: 15px; margin-right: 8px; border-radius: 2px; background: var(--accent); vertical-align: -2px; }
+.man .sum { color: var(--text); padding: 10px 14px; border-left: 3px solid var(--accent); background: rgba(58, 231, 255, 0.05); border-radius: 0 10px 10px 0; }
+.man ol.steps { list-style: none; counter-reset: st; margin: 6px 0 12px; padding: 0; display: grid; gap: 8px; }
+.man ol.steps > li { counter-increment: st; position: relative; padding-left: 36px; color: var(--text2); font-size: 14.5px; line-height: 1.7; min-width: 0; overflow-wrap: anywhere; }
+.man ol.steps > li::before { content: counter(st); position: absolute; left: 0; top: 1px; width: 25px; height: 25px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700; color: #04202b; background: var(--accent); }
+.man ol.steps ol { margin: 6px 0 4px 20px; display: grid; gap: 4px; }
+.man ol.flow { list-style: none; margin: 6px 0 8px; padding: 0; display: flex; flex-wrap: wrap; gap: 8px 22px; }
+.man ol.flow > li { position: relative; display: grid; gap: 1px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--panel); font-size: 14px; }
+.man ol.flow > li > span { font-size: 12.5px; color: var(--muted); }
+.man ol.flow > li + li::before { content: "→"; position: absolute; left: -17px; top: 50%; transform: translateY(-50%); color: var(--accent); }
+.man .toc { list-style: none; margin: 4px 0 14px; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.man .toc a { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 12px; align-items: center; height: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel); color: var(--text); text-decoration: none; }
+.man .toc a:hover { border-color: var(--line-strong); text-decoration: none; }
+.man .toc .no { grid-row: span 2; display: grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; background: var(--accent-bg); color: var(--accent); font-weight: 700; }
+.man .toc .t { font-weight: 700; font-size: 15px; }
+.man .toc .d { font-size: 13px; color: var(--muted); }
+.man .man-jump { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; margin-top: 4px; }
+.man .man-jump a { flex: none; white-space: nowrap; }
+.man details.more { margin: 4px 0 14px; }
+.man details.more > .body > ul { margin-left: 20px; }
+.man .callout ul { margin: 4px 0 0 18px; gap: 4px; font-size: 14px; }
+.man table.kv { width: 100%; border-collapse: collapse; margin: 6px 0 12px; font-size: 14px; }
+.man table.kv th, .man table.kv td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line-soft); color: var(--text2); line-height: 1.6; }
+.man table.kv thead th { color: var(--muted); font-size: 12.5px; font-weight: 600; border-bottom-color: var(--line); }
+.man table.kv tbody th { color: #fff; font-weight: 600; min-width: 9em; }
+@media (max-width: 760px) {
+  .man [id] { scroll-margin-top: 112px; }
+  .man h2 { font-size: 18px; }
+  .man .toc { grid-template-columns: minmax(0, 1fr); }
+  .man .man-jump a { min-height: 40px; }
+  .man details.more > summary { min-height: 44px; }
+  .man ol.flow { flex-direction: column; gap: 18px; }
+  .man ol.flow > li + li::before { content: "↓"; left: 14px; top: -17px; transform: none; }
+  /* 表は 1 行ずつの札にする (横に送らない): 見出しの行は隠し、欄の名前 (data-l) を前に出す */
+  .man table.kv, .man table.kv tbody, .man table.kv tr, .man table.kv th, .man table.kv td { display: block; width: 100%; }
+  .man table.kv { overflow: visible; }
+  .man table.kv thead { display: none; }
+  .man table.kv tr { padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+  .man table.kv th, .man table.kv td { border: 0; padding: 2px 4px; min-width: 0; overflow-wrap: anywhere; }
+  .man table.kv td[data-l]::before { content: attr(data-l) " : "; color: var(--muted); font-size: 12.5px; }
+}
 @media (max-width: 1100px) {
   .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .costhead { grid-template-columns: 1fr 1fr; }
@@ -1129,6 +1179,16 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   .mkpick, .mkbox, #f-maker-in { width: 100%; }
   .mkbox .csug { width: 100%; }
 }
+/* 🆕 0088 ブランドの欄 (views/_brand.ejs・メーカーと同じ部品の見た目)・商品の段階 (区分・終売の予定日)。押す所は 44px */
+#f-brand-own { min-height: 36px; }
+#first-sold b { font-variant-numeric: tabular-nums; }
+/* 一覧の「もっと絞る」の商品の段階 = 狭い画面で横にはみ出さない (選ぶ欄が縮む) */
+.filters-more .row2 label:has(#f-life) { max-width: 100%; }
+#f-life { min-width: 0; max-width: 100%; flex: 1 1 auto; }
+@media (max-width: 760px) {
+  #f-brand-in, #f-brand-own, #f-life_stage, #f-end_planned_on { min-height: 44px; }
+  #f-brand-in { width: 100%; }
+}
 /* 構成の行の下の「NE の商品を足す (セット)」= 1 行目は最初からあるので控えめ (文字だけのボタン・押せる大きさはスマホで 44px) */
 #comp-add.addrow { color: var(--muted); padding: 0 6px; }
 #comp-add.addrow:hover { color: var(--accent); }
@@ -1245,3 +1305,65 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 .mv-foot { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
 .mv-notes { margin-top: 8px; }
 .tbl.mv td:nth-child(2) { white-space: nowrap; }
+
+/* ---------- 販売数のグラフ (10/17 中原さん・商品の画面の下) ----------
+   色の役 (dataviz の手順・検査の道具で暗い面 #0e1626 に対して確かめた = 明るさ・彩度・色覚の差 (隣り合う組 ΔE 8.4 以上)・面との比 3:1 以上):
+   モールの 4 色は決まった順 (楽天 → Amazon → Yahoo! → その他)・在庫の線は文字の色に近い明るい灰 (別のグラフ = モールの色と並べない)・欠品は赤の帯 + 凡例の言葉。
+   画面は暗いデザインだけ (明るい画面は無い) = 暗い面の色だけを持つ */
+.sc { --sc-1: #3987e5; --sc-2: #d95926; --sc-3: #199e70; --sc-4: #c98500; --sc-stock: #cdd9f0; --sc-out: rgba(255, 112, 133, 0.16); --sc-out-line: rgba(255, 112, 133, 0.6);
+  --sc-grid: rgba(125, 170, 255, 0.10); --sc-axis: rgba(125, 170, 255, 0.32); --sc-hl: rgba(233, 238, 252, 0.07); }
+.sc-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.sc-bar .seg button { height: 32px; padding: 0 12px; }
+.sc-legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 8px 0 6px; font-size: 13px; color: var(--text2); }
+.sc-legend li { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.sc-legend b { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.sc-legend .sw { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+.sc-legend .ln { width: 16px; height: 2px; border-radius: 1px; background: var(--sc-stock); flex: none; }
+.sc-legend .sw.out { background: var(--sc-out); border: 1px solid var(--sc-out-line); }
+.sc-legend .sw.part { background: var(--sc-1); opacity: 0.45; }
+.sc .sw.sc-c1, .sc-tip .k.sc-k1 { background: var(--sc-1); } .sc .sw.sc-c2, .sc-tip .k.sc-k2 { background: var(--sc-2); }
+.sc .sw.sc-c3, .sc-tip .k.sc-k3 { background: var(--sc-3); } .sc .sw.sc-c4, .sc-tip .k.sc-k4 { background: var(--sc-4); }
+.sc-chart { position: relative; min-width: 0; border-radius: 10px; outline: none; margin-top: 4px; touch-action: pan-y; }
+.sc-chart:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+.sc-svg svg { display: block; max-width: 100%; }
+.sc svg text { font-family: var(--font); font-size: 11px; fill: var(--muted); }
+.sc svg .tick { font-variant-numeric: tabular-nums; }
+.sc svg .sc-nd { fill: var(--faint); font-size: 12px; }
+.sc svg .sc-c1 { fill: var(--sc-1); } .sc svg .sc-c2 { fill: var(--sc-2); } .sc svg .sc-c3 { fill: var(--sc-3); } .sc svg .sc-c4 { fill: var(--sc-4); }
+.sc svg .sc-partial { opacity: 0.45; }
+.sc svg .sc-out { fill: var(--sc-out); }
+.sc svg .sc-grid { stroke: var(--sc-grid); stroke-width: 1; }
+.sc svg .sc-axis { stroke: var(--sc-axis); stroke-width: 1; }
+.sc svg .sc-hl { fill: var(--sc-hl); }
+.sc svg .sc-line { fill: none; stroke: var(--sc-stock); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.sc svg .sc-dot { fill: var(--sc-stock); stroke: #0e1626; stroke-width: 2; }
+.sc-stock-h { margin: 8px 0 0; font-size: 12.5px; }
+.sc-tip { position: absolute; top: 4px; left: 0; z-index: 5; min-width: 160px; max-width: 240px; padding: 8px 10px; border-radius: 10px; background: #0b1220; border: 1px solid var(--line-strong);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5); font-size: 12.5px; color: var(--text2); pointer-events: none; line-height: 1.5; }
+.sc-tip .h { color: var(--muted); font-size: 12px; margin-bottom: 2px; }
+.sc-tip .row { display: flex; justify-content: space-between; gap: 12px; }
+.sc-tip .v { font-weight: 600; color: var(--text); font-size: 14px; }
+.sc-tip .n { font-variant-numeric: tabular-nums; color: var(--text); }
+.sc-tip .k { display: inline-block; width: 12px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }
+.sc-tip .k.ln { background: var(--sc-stock); }
+.sc-tip .k.out { background: var(--sc-out-line); }
+.sc-table { margin-top: 12px; }
+.sc-table .tblwrap { margin-top: 8px; }
+@media (forced-colors: active) {
+  .sc svg .sc-c1, .sc svg .sc-c2, .sc svg .sc-c3, .sc svg .sc-c4 { fill: CanvasText; }
+  .sc svg .sc-line { stroke: CanvasText; }
+}
+
+/* 🆕 0087 大きさ・重さ (商品の画面・views/_package.ejs) */
+.pkgdims { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pkgdims .in { text-align: right; }
+#pkg-sources td.pkg-diff { color: var(--warn); background: var(--warn-bg); }
+#p-pkg .f.wide { grid-template-columns: minmax(0, 1fr); }   /* 出どころの表は .tblwrap の中で横に送る (ページははみ出さない) */
+#p-pkg .ctl.col { flex-wrap: nowrap; }   /* 縦に並べる欄で折り返しの行を作らない (作ると長い一言の幅に広がる) */
+@media (max-width: 760px) { #p-pkg .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #p-pkg .btn.sm { min-height: 44px; } }
+
+/* 🆕 0090 表示の項目 (商品の画面・views/_label.ejs) */
+.lbl-net { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.lbl-net .in { text-align: right; }
+#p-label .lbl-ph { flex-basis: 100%; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+@media (max-width: 760px) { #p-label .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #p-label .btn.sm { min-height: 44px; } }

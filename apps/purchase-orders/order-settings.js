@@ -25,6 +25,7 @@
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { createHash } from 'crypto';
 import { audit, getSetting, stableStringify } from './ledger.js';
+import { parseVendorInput, VendorCodeError, vendorStamp, vendorStampMark, vendorHistoryExists, pendingCandidates, normVendorCode } from './vendor-codes.js';
 
 /** 商品ごとの列 (po_product_attrs) */
 export const ATTR_FIELDS = Object.freeze(['order_lot', 'condition_id', 'material_group_id', 'capacity_per_unit', 'case_group', 'case_lot']);
@@ -370,15 +371,26 @@ export function registrationOrderDone(requestId) {
  *   2. 無い = 「行がまだ無い」(updated_at null) を確かめて書く (ほかの画面がもう作っていた = 409 stale・記録しない)
  *   3. 書いたら request_id + 商品 + 中身のハッシュ + 結果を記録する
  * input = writeOrderSettings と同じ (seen・via は使わない = 'master-edit:new' と「行が無い」)・requestId は必須
+ *   🆕 ⑤-2 (CompanyDB構想 27 §2.4): input.vendor = { vendor_code, qty_per_unit } (知らせ v2 の中身・無い = 今までと同じ)。
+ *     同じ取引で先方番号対応表 (po_vendor_code_map) にも書く (writeRegistrationVendor)。
+ *     6 つの項目が全部空で先方品番だけ = 発注の設定の行は作らない (行の確かめもしない)
  */
 export function writeRegistrationOrderSettings(input) {
   const requestId = String((input && input.requestId) ?? '').trim();
   if (!requestId || requestId.length > 200) throw bad('登録の番号 (request_id) がありません', 'request_id');
-  const { db, run, key } = buildWrite({ ...input, via: 'master-edit:new', seen: { updated_at: null }, requestId });
+  let vendor = null;
+  try { vendor = input && input.vendor != null ? parseVendorInput(input.vendor) : null; }
+  catch (e) { if (e instanceof VendorCodeError) throw new OrderSettingsError(e.status, e.reason, e.message, { field: e.field }); throw e; }
+  const attrsInput = { ...input };
+  delete attrsInput.vendor;
+  const { db, run, key } = buildWrite({ ...attrsInput, via: 'master-edit:new', seen: { updated_at: null }, requestId });
+  // やり直しの比べ: 先方品番が無い = 今までと同じハッシュ (v1 のやり直しが request_id_reused にならない)・ある = 番号と入数も入れる
   const hash = createHash('sha256').update(stableStringify({
     key, patch: input.patch ?? null, newCondition: input.newCondition ?? null, newMaterial: input.newMaterial ?? null,
     supplier: input.supplierCode === undefined ? null : normSupplierCode(input.supplierCode),
+    ...(vendor ? { vendor: { vendor_code: vendor.vendorCode, qty_per_unit: vendor.qtyPerUnit } } : {}),
   })).digest('hex');
+  const attrsEmpty = Object.values(input.patch || {}).every(blank) && !input.newCondition && !input.newMaterial;
   return db.transaction(() => {
     const prev = db.prepare('SELECT * FROM po_order_settings_requests WHERE request_id=?').get(requestId);
     if (prev) {
@@ -387,12 +399,40 @@ export function writeRegistrationOrderSettings(input) {
       }
       return { ...JSON.parse(prev.result_json), replayed: true };
     }
-    const out = run();
-    const result = { ok: true, changed: out.changed, created: out.created };
+    const out = vendor && attrsEmpty ? { changed: false, row: null, created: { condition: false, material: false } } : run();
+    const vend = vendor ? writeRegistrationVendor(db, { supplierCode: input.supplierCode, key, code: String(input.code ?? '').trim(), vendor, actor: input.actor, requestId }) : null;
+    const result = { ok: true, changed: out.changed || !!vend, created: out.created, ...(vend ? { vendor: vend } : {}) };
     db.prepare('INSERT INTO po_order_settings_requests (request_id, product_key, payload_hash, result_json, actor, created_at) VALUES (?,?,?,?,?,?)')
       .run(requestId, key, hash, JSON.stringify(result), String(input.actor ?? ''), new Date().toISOString());
     return { ...result, row: out.row, replayed: false };
   }).immediate();
+}
+
+/**
+ * 🆕 ⑤-2: 新商品の登録の先方品番を対応表に書く (writeRegistrationOrderSettings の取引の中)。
+ *   代表の仕入先 (登録のときの値 = 知らせの中身) が要る・発注アプリにある・(仕入先, 商品) の行がまだ無く、この商品の先方番号の記録
+ *   (足す・直す・消す・入数・仮登録の昇格・CSV の changed_keys) も無い。ある = 409 stale (上書きしない・同じ値でも = 人が確かめて閉じる)。
+ *   同じ番号がほかの商品にも = 警告だけ。同じ番号の仮登録 (出荷明細で見た番号) = 結ぶ候補の id (自動では結ばない)
+ */
+function writeRegistrationVendor(db, { supplierCode, key, code, vendor, actor, requestId }) {
+  const supplier = normSupplierCode(supplierCode);
+  if (!supplier) throw bad('先方品番を入れるときは、代表の仕入先が要ります', 'vendor_code');
+  if (!db.prepare('SELECT 1 FROM po_suppliers WHERE supplier_code=?').get(supplier)) throw bad(`代表の仕入先 ${supplier} は発注アプリにありません (先方品番を書けません)`, 'vendor_code');
+  const old = db.prepare('SELECT vendor_code FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(supplier, key);
+  if (old || vendorHistoryExists(db, supplier, key)) {
+    throw new OrderSettingsError(409, 'stale', old
+      ? `この商品の先方品番は発注アプリの対応表にもうあります (現在: ${old.vendor_code})。上書きしていません`
+      : 'この商品の先方品番は発注アプリでもう直されました (足して消した など)。上書きしていません', { field: 'vendor_code' });
+  }
+  db.prepare('INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) VALUES (?,?,?,?,?,?)')
+    .run(supplier, key, code || key, vendor.vendorCode, vendor.qtyPerUnit, vendorStamp());
+  audit(db, { actorType: 'user', actor: String(actor ?? ''), action: 'vendor_map_entry_upsert', resource: `supplier:${supplier}`, requestId,
+    detail: { productCode: code || key, vendorCode: vendor.vendorCode, oldVendorCode: null, qtyPerUnit: vendor.qtyPerUnit, oldQtyPerUnit: null, via: 'master-edit:new', product_key: key, max_stamp: vendorStampMark() } });
+  const dup = db.prepare('SELECT product_code, vendor_code FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)
+    .filter((m) => normVendorCode(m.vendor_code) === normVendorCode(vendor.vendorCode) && normProductCode(m.product_code) !== key).map((m) => m.product_code);
+  const pending = pendingCandidates(db, key, new Map([[supplier, new Set([normVendorCode(vendor.vendorCode)])]])).map((p) => p.id);
+  return { written: true, supplier_code: supplier, vendor_code: vendor.vendorCode, qty_per_unit: vendor.qtyPerUnit,
+    warning: dup.length ? `この先方番号は商品 ${dup.join(', ')} にも登録されています (入荷予定変換で曖昧扱いになります)` : null, pending_ids: pending };
 }
 
 /**
