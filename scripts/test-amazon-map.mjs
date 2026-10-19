@@ -1615,7 +1615,9 @@ await ta('[15] 下書き・NE 登録待ちの商品で対応を作れる (代表
   assert.notEqual(strip(now2), now2);
   assert.equal(strip(now2), fnText(rd('0067_variation_groups.sql'), 'ops.cancel_variation_child'), 'cancel_variation_child = 0067 の版 + 🆕 0073 の行だけ');
   for (const [name, after] of [['ops.amazon_map_components', '0055'], ['ops.cancel_variation_child', '0068']]) {
-    const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.+\.sql$/.test(x) && x >= after && x !== mine);
+    // 🆕 0091 (deldraft_lz_exported) は cancel_variation_child をこの 0073 の版から写して 🆕 0091 の行だけ足した (その写しは scripts/test-master-draft-cancel.mjs [M4] が確かめる)
+    const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.+\.sql$/.test(x) && x >= after && x !== mine
+      && !(name === 'ops.cancel_variation_child' && /^\d{4}_deldraft_lz_exported\.sql$/.test(x)));
     // 検査が空回りしない (#1694 Codex R1 Low): 0055〜 / 0068〜 の migration を本当に見ている (今の master で 0055〜0071 = 17 個・0068〜0071 = 4 個。増えるのはよい)
     assert.ok(later.length >= (after === '0055' ? 17 : 4), `${name}: 見た migration が少ない (${later.length} 個)`);
     assert.ok(later.every((f) => /^\d{4}_/.test(f) && f >= after) && later.includes('0071_sku_draft_cancel.sql'), later.join(','));

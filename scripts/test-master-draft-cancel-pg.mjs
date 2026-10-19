@@ -11,6 +11,8 @@
  *   [4]  同じ番号の押し直しが同時に 2 つ: 後の方は SKU の鍵で待ち、前の commit の後に前の答え (replayed)・登録の状態の履歴は 1 行
  *   [5]  夜間ロード (マスタの書き込みの鍵の排他) の間 = 画面の lib は少し待って 409 nightly_load (何もしない)
  *   [7]  出品の構成の insert が先 (commit 前) = 消すは SKU の行 (外部キーの共有の鍵と並ぶ) で待って「出品の構成」で断る
+ *   🆕 [8] (0091) ロジザード登録の CSV を出す取引と競る: (a) 出すが先 (commit 前) = 消すは SKU の鍵で待ち、出すの commit の後に「ロジザード登録の CSV に出しています」で断る /
+ *        (b) 消すが先 = 出すは SKU の鍵で待ち、消すの commit の後に「使える商品でない」で断る / (c) 同時に押す = いつも片方だけ・deadlock にならない
  *   [6]  0070 の参照の守り (ops.guard_sku_ref_not_cancelled・#1683) がある DB だけ: 消すが先 = 出品の構成の insert は登録の状態の行で待ち、commit の後に sku_cancelled
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-draft-cancel-pg.mjs
  *   (使い捨ての PG: node C:/tmp/pg-embed/run-deldraft.mjs scripts/test-master-draft-cancel-pg.mjs <リポジトリ>)
@@ -239,6 +241,69 @@ try {
     assert.equal(rc.err?.reason, 'not_cancellable', rc.err?.message ?? JSON.stringify(rc.ok));
     assert.match(rc.err.message, /出品の構成/);
     assert.equal(await regOf('q-7'), 'draft');
+  });
+
+  // 🆕 [8] (0091) ロジザード登録の CSV を出す取引 (ops.lz_new_export_issue) と競る = 同時でも片方だけが通る
+  /** 画面のロールで: バーコード = 空欄 を入れて (別の取引)、CSV に出す品目を返す */
+  const lzPrep = async (c, code) => {
+    const id = await sid(code);
+    const b = (await c.query("select ops.set_sku_logizard_barcode($1::uuid, $2, $3::bigint, 'lz_assign', null, 'sku_page', null, null, null) as r", [uuid(), 'naka@test', id])).rows[0].r;
+    return JSON.stringify([{ sku_id: id, code, rule_row: String(b.rule_row), kind: 'lz_assign', value: null, expiry_code: '01', inbound_code: '0' }]);
+  };
+  const LZ_ISSUE = 'select ops.lz_new_export_issue($1::uuid, $2, $3::jsonb, now(), null) as r';
+  const lzIssued = async (code) => (await q(`select count(*)::int as n from ops.lz_new_export_items i join core.skus k on k.sku_id = i.sku_id where k.code = $1 and i.state = 'issued'`, [code]))[0].n;
+  await ta('[8a] (0091) CSV を出すが先 (commit 前) = 消すは SKU の鍵で待ち、出すの commit の後に「ロジザード登録の CSV に出しています (ファイル #N)」で断る', async () => {
+    await draft(dbA, 'q-8a');
+    const items = await lzPrep(A, 'q-8a');
+    let c = null;
+    try {
+      await A.query('begin');
+      const r = (await A.query(LZ_ISSUE, [uuid(), 'naka@test', items])).rows[0].r;
+      c = launch(cancel(dbB, 'q-8a'));
+      await sleep(500);
+      assert.equal(c.done, false, '消すは CSV を出すの commit を待つ');
+      await A.query('commit');
+      const rc = await c.promise;
+      assert.equal(rc.err?.reason, 'not_cancellable', rc.err?.message ?? JSON.stringify(rc.ok));
+      assert.match(rc.err.message, new RegExp(`ロジザード登録の CSV に出しています \\(ファイル #${r.export_id}\\)`));
+    } finally {
+      // 途中で落ちても開いた取引を残さない (後の試験に aborted を渡さない)・相手の終わりを待つ
+      try { await A.query('rollback'); } catch { /* commit の後 = 何もしない */ }
+      if (c) await c.promise;
+    }
+    assert.deepEqual([await regOf('q-8a'), await lzIssued('q-8a')], ['draft', 1]);
+  });
+  await ta('[8b] (0091) 消すが先 (commit 前) = CSV を出すは SKU の鍵で待ち、消すの commit の後に「使える商品でない」で断る (やめた下書きをロジザードに出さない)', async () => {
+    await draft(dbA, 'q-8b');
+    const items = await lzPrep(A, 'q-8b');
+    let iss = null;
+    try {
+      await holdCancel(B, 'q-8b');
+      iss = launch(A.query(LZ_ISSUE, [uuid(), 'naka@test', items]));
+      await sleep(500);
+      assert.equal(iss.done, false, 'CSV を出すは消すの commit を待つ');
+      await B.query('commit');
+      const ri = await iss.promise;
+      assert.match(String(ri.err?.message ?? JSON.stringify(ri.ok)), /^invalid_input: q-8b は単品で使える商品でない/);
+    } finally {
+      try { await B.query('rollback'); } catch { /* commit の後 = 何もしない */ }
+      if (iss) await iss.promise;
+    }
+    assert.deepEqual([await regOf('q-8b'), await lzIssued('q-8b')], ['cancelled', 0]);
+  });
+  await ta('[8c] (0091) 同時に押す (4 回) = いつもどちらか片方だけが通る (両方通る・両方断る = 無い)・待ちの輪 (deadlock) にならない', async () => {
+    for (let i = 0; i < 4; i++) {
+      const code = `q-8c${i}`;
+      await draft(dbA, code);
+      const items = await lzPrep(A, code);
+      const [ri, rc] = await Promise.all([launch(A.query(LZ_ISSUE, [uuid(), 'naka@test', items])).promise, launch(cancel(dbB, code)).promise]);
+      for (const x of [ri.err, rc.err]) if (x) assert.doesNotMatch(String(x.message), /deadlock/i);
+      const issued = !ri.err, cancelled = !rc.err;
+      assert.equal(issued !== cancelled, true, `${code}: 出す ${issued ? '通った' : ri.err.message} / 消す ${cancelled ? '通った' : rc.err.message}`);
+      assert.deepEqual([await regOf(code), await lzIssued(code)], issued ? ['draft', 1] : ['cancelled', 0]);
+      if (!cancelled) assert.match(rc.err.message, /ロジザード登録の CSV に出しています/);
+      else assert.match(ri.err.message, /使える商品でない/);
+    }
   });
 
   const hasRefGuard = (await q("select to_regprocedure('ops.guard_sku_ref_not_cancelled()') is not null as ok"))[0].ok;
