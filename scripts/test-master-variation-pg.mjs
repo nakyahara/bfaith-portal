@@ -12,7 +12,7 @@
  *     取引全体も短い (測った値を出す)・121 子は断る (上限 120 = 中原さんの決定 10/10)
  *   4b 上限ちょうど: 40 色 × 3 サイズ = 120 子 (上限 120 のまま通る・時間を測る)
  *   6 NE のコードの鍵 (#1677 Codex R1 High): 照合の ops.record_ne_codes と まとめての登録・子の廃止・代表の採用・CSV を作る取引を並べる = 待って順に・後の方は新しい NE のコードを見る・40P01 なし
- *   🆕 7 (0099) 子の廃止とロジザード登録の CSV を出す取引が競る: 出すが先 = 廃止は SKU の鍵で待って lz_issued / 廃止が先 = 出すは待って「使える商品でない」(片方だけ・40P01 なし)
+ *   🆕 7 (0091) 子の廃止とロジザード登録の CSV を出す取引が競る: 出すが先 = 廃止は SKU の鍵で待って lz_issued / 廃止が先 = 出すは待って「使える商品でない」(片方だけ・40P01 なし)
  *   5 本物のログイン: 画面のロールはまとまりの表を直接書けない・部品を実行できない・関数は実行できる
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-variation-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す・ロール master_* をクラスタに作る)。localhost 以外の URL は拒む。TEST_PG_URL が無ければ飛ばす
@@ -365,7 +365,7 @@ try {
     assert.ok(a2.close.revision >= 1);
   });
 
-  await ta('[7] (0099) 子の廃止とロジザード登録の CSV を出す取引が競る = 同時でも片方だけ: 出すが先 = 廃止は SKU の鍵で待って lz_issued / 廃止が先 = 出すは待って「使える商品でない」・40P01 なし', async () => {
+  await ta('[7] (0091) 子の廃止とロジザード登録の CSV を出す取引が競る = 同時でも片方だけ: 出すが先 = 廃止は SKU の鍵で待って lz_issued / 廃止が先 = 出すは待って「使える商品でない」・40P01 なし', async () => {
     const lzPrep = async (code) => {
       const id = (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0].id;
       const b = (await A.query("select ops.set_sku_logizard_barcode($1::uuid, $2, $3::bigint, 'lz_assign', null, 'sku_page', null, null, null) as r", [uuid(), 'naka@test', id])).rows[0].r;

@@ -1,6 +1,6 @@
 <%#
   🆕 0071: 新商品の下書きを消す (登録をやめた)。lib/master-draft-cancel.mjs の draftCancelView = deldraft { show, canGo, variation, will, why }。
-  押せる = DB の確かめが ok (🆕 0099: ロジザード登録の CSV に出した = lz_issued で押せない・理由に出す)・名簿 MASTER_EDITORS の人・保存を開いている。動き = public/me-draft-cancel.js (確かめの窓 → POST /api/sku/:code/draft-cancel → 読み直し)
+  押せる = DB の確かめが ok (🆕 0091: ロジザード登録の CSV に出した = lz_issued で押せない・理由に出す)・名簿 MASTER_EDITORS の人・保存を開いている。動き = public/me-draft-cancel.js (確かめの窓 → POST /api/sku/:code/draft-cancel → 読み直し)
   置き場所 = 商品の画面の上の「下書きです」の帯のすぐ下 (下書きのときだけ出る = 下書きの間に気づく所)
 %>
 <% const D = typeof deldraft !== 'undefined' && deldraft && deldraft.show ? deldraft : null; const delCan = !!D && D.canGo && canEdit && !dbError && !closed; %>

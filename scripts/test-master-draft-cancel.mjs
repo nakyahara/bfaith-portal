@@ -21,9 +21,9 @@
  *   [S] 画面 (本物の router): 消せる下書き = 「この下書きを消す」と窓・片付けるもの / まとまりの子 = 子の廃止へ案内 / 業務で使える商品 = 何も出さない /
  *       名簿の人だけ (403)・確かめの窓の印・除外していないカード = 409 card_exists・除外すれば通る・カードを読めない = 503・消した後の画面 = やめた・カードは作らない
  *   [U] 画面の JS (Playwright・Chromium): 押す → 窓 → 理由で押せる → 消す → 読み直し = やめた / 携帯の幅で横にはみ出さない (MASTER_EDIT_UI_SKIP=1 で飛ばす)
- *   🆕 [M4][M5] (0099) ops.sku_draft_cancel_check (0071 の版)・ops.cancel_variation_child (0073 の版) は前の最新の版から写して「🆕 0099」の行だけ足した・関数の外で値を変えない
- *   🆕 [Z] (0099・中原さんの決定 2026-10-18) ロジザード登録の CSV に出した (issued) 下書き = 消さない (確かめ lz_issued・lib 409・DB の関数を直に・画面の理由・API 409) /
- *       0099 の前の DB でも lib が同じ理由で断る / 取り消した (voided) だけ = また消せる・消した後は CSV に出せない / まとまりの子の廃止も同じ (lz_issued)。
+ *   🆕 [M4][M5] (0091) ops.sku_draft_cancel_check (0071 の版)・ops.cancel_variation_child (0073 の版) は前の最新の版から写して「🆕 0091」の行だけ足した・関数の外で値を変えない
+ *   🆕 [Z] (0091・中原さんの決定 2026-10-18) ロジザード登録の CSV に出した (issued) 下書き = 消さない (確かめ lz_issued・lib 409・DB の関数を直に・画面の理由・API 409) /
+ *       0091 の前の DB でも lib が同じ理由で断る / 取り消した (voided) だけ = また消せる・消した後は CSV に出せない / まとまりの子の廃止も同じ (lz_issued)。
  *       出すと消すの競り (同時に片方だけ) は scripts/test-master-draft-cancel-pg.mjs [8]
  * 使い方: node scripts/test-master-draft-cancel.mjs
  */
@@ -126,36 +126,36 @@ await ta('[M3] 一時の表を使わない・security definer の関数は全部
     assert.ok(M71.includes(`revoke all on function ${d[1]}(`), `${d[1]} の public の実行権を外していない`);
   }
 });
-// 🆕 0099 (仮の番号 = マージの時に付け替える。名前で探す): ロジザード登録の CSV に出した下書きは消さない
+// 🆕 0091 (名前で探す): ロジザード登録の CSV に出した下書きは消さない
 const F99 = migFiles.find((f) => /^\d{4}_deldraft_lz_exported\.sql$/.test(f));
 const M99 = F99 ? readMig(F99) : '';
-function strip0099(t) {
+function strip0091(t) {
   const out = [];
   let skip = false;
   for (const l of t.split('\n')) {
-    if (/-- 🆕 0099 ここから/.test(l)) { skip = true; continue; }
-    if (/-- 🆕 0099 ここまで/.test(l)) { skip = false; continue; }
-    if (skip || /🆕 0099/.test(l)) continue;
+    if (/-- 🆕 0091 ここから/.test(l)) { skip = true; continue; }
+    if (/-- 🆕 0091 ここまで/.test(l)) { skip = false; continue; }
+    if (skip || /🆕 0091/.test(l)) continue;
     out.push(l);
   }
   return out.join('\n');
 }
 for (const [name, expectFrom] of [['ops.sku_draft_cancel_check', '0071'], ['ops.cancel_variation_child', '0073']]) {
-  await ta(`[M4] (0099) ${name} = ${expectFrom} の版 (前の最新) から写して 🆕 0099 の行だけ足した`, async () => {
-    assert.ok(F99, '0099 (deldraft_lz_exported) が無い');
+  await ta(`[M4] (0091) ${name} = ${expectFrom} の版 (前の最新) から写して 🆕 0091 の行だけ足した`, async () => {
+    assert.ok(F99, '0091 (deldraft_lz_exported) が無い');
     const src = lastDefBefore(name, F99.slice(0, 4));
     assert.ok(src && src.startsWith(expectFrom), `前の最新の版が ${src} (期待 ${expectFrom})`);
     const before = fnText(readMig(src), name);
     const now = fnText(M99, name);
     assert.ok(before && now, '関数が見つからない');
     assert.notEqual(now, before, '何も足していない');
-    assert.equal(strip0099(now), before, '印の行を外すと前の版と違う (写し間違い・印の無い変更)');
+    assert.equal(strip0091(now), before, '印の行を外すと前の版と違う (写し間違い・印の無い変更)');
     assert.match(now, /lz_issued/);
-    // 0099 より後の migration はこの関数を書き換えていない (書き換えたら、この写しが今の版でなくなる)
+    // 0091 より後の migration はこの関数を書き換えていない (書き換えたら、この写しが今の版でなくなる)
     for (const f of migFiles.filter((x) => x > F99)) assert.equal(fnText(readMig(f), name), null, `${f} にも ${name} がある`);
   });
 }
-await ta('[M5] (0099) 一時の表を使わない・security definer の関数は search_path = pg_catalog, pg_temp・revoke from public・値を変える文が無い', async () => {
+await ta('[M5] (0091) 一時の表を使わない・security definer の関数は search_path = pg_catalog, pg_temp・revoke from public・値を変える文が無い', async () => {
   assert.doesNotMatch(M99, /\b(create\s+(temp|temporary)\s+table|on commit drop)\b/i);
   assert.doesNotMatch(M99.replace(/\$\$[\s\S]*?\$\$/g, ''), /^\s*(insert|update|delete|alter|drop|grant|truncate)\b/im, '関数の外で値・表・権限を変えない');
   const defs = [...M99.matchAll(/create (?:or replace )?function ([a-z_.]+)\(([^)]*)\)[^$]*?security definer[^$]*?as \$\$/g)];
@@ -598,8 +598,8 @@ await ta('[S3] 一覧 = やめた商品を出さない・札「やめた商品�
   assert.match(await r3.text(), /sku\/d-s1/, '上の絞る欄にコードをぴったり = 出す');
 });
 
-// ═══════════ 🆕 [Z] (0099) ロジザード登録の CSV に出した下書きは消さない (中原さんの決定 2026-10-18) ═══════════
-console.log('\n[Z] ロジザード登録の CSV に出した下書き (0099)');
+// ═══════════ 🆕 [Z] (0091) ロジザード登録の CSV に出した下書きは消さない (中原さんの決定 2026-10-18) ═══════════
+console.log('\n[Z] ロジザード登録の CSV に出した下書き (0091)');
 /** 画面のロールで: バーコード = 空欄 (ロジザードが番号を付ける) を入れて、ロジザード登録の CSV を出す (DB の関数を直に・1 品目)。戻り値 = 出したファイルの番号 */
 const lzIssue = (code, { expiry = '01', inbound = '0' } = {}) => asEditor(async () => {
   const id = await sid(code);
@@ -621,7 +621,7 @@ await ta('[Z1] 出した (issued) = 確かめが lz_issued (ファイルの番�
   assert.deepEqual([c.ok, reasons(c)], [false, ['lz_issued']]);
   const t = c.problems[0].text;
   assert.ok(t.includes(`ファイル #${LZ1}`) && t.includes('ロジザードから消すのが先です'), t);
-  assert.equal(t, D.lzIssuedText([LZ1]), 'lib の文 = DB の文 (0099 の前の DB でも同じ文)');
+  assert.equal(t, D.lzIssuedText([LZ1]), 'lib の文 = DB の文 (0091 の前の DB でも同じ文)');
   const v = D.draftCancelView(c);
   assert.deepEqual([v.show, v.canGo], [true, false]);
   assert.deepEqual(v.why.map((w) => [w.reason, w.word]), [['lz_issued', 'ロジザード登録の CSV に出した']]);
@@ -639,7 +639,7 @@ await ta('[Z1] 出した (issued) = 確かめが lz_issued (ファイルの番�
   assert.match(n.j.error, /ロジザード登録の CSV に出しています/);
   assert.equal(await regOf('d-lz1'), 'draft');
 });
-await ta('[Z2] 0099 の前の DB (確かめに lz_issued が無い) でも lib が同じ理由を足す (画面は押せない)・消す前に断る (DB の関数を呼ばない)', async () => {
+await ta('[Z2] 0091 の前の DB (確かめに lz_issued が無い) でも lib が同じ理由を足す (画面は押せない)・消す前に断る (DB の関数を呼ばない)', async () => {
   const calls = [];
   const old = { query: async (t, p) => {
     calls.push(t);

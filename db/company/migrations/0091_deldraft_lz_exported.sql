@@ -1,4 +1,4 @@
--- 0099 (仮の番号・マージの時に付け替える。master は 0085 まで・0086〜0090 は作業中のブランチの予約): ロジザード登録の CSV に出した新商品の下書きは「下書きを消す」で消さない
+-- 0091 (0090 = 表示の項目 #1748 の次。migrate は欠番を断る): ロジザード登録の CSV に出した新商品の下書きは「下書きを消す」で消さない
 --   (2026-10-18・中原さんの決定「ロジザード登録の CSV に出した (issued) ものは消せないようにする」)
 -- 前提 = 0071 (ops.sku_draft_cancel_check・ops.cancel_sku_draft)・0073 (ops.cancel_variation_child の今の版)・0081 (ops.lz_new_export_items)。
 --   0074〜0085 はこの 2 つの関数を書き換えていない (試験 scripts/test-master-draft-cancel.mjs [M4] で確かめる)
@@ -7,9 +7,9 @@
 --   0081 (#1721) から、ポータルのロジザード登録の CSV (lib/lz-new-export.mjs) は新商品の登録から来た単品 (origin = new_entry・やめていない) を
 --   NE に配る前の下書きのうちから出す = 下書きを消すと、ロジザードにだけ商品が残る (Company DB では「やめた」・ロジザードには登録の CSV で入った)
 -- なにを:
---   1. ops.sku_draft_cancel_check (0071 の版を写して 🆕 0099 の行だけ足した): ロジザード登録の CSV に出した (品目が issued) = 消さない (理由 lz_issued・ファイルの番号)。
+--   1. ops.sku_draft_cancel_check (0071 の版を写して 🆕 0091 の行だけ足した): ロジザード登録の CSV に出した (品目が issued) = 消さない (理由 lz_issued・ファイルの番号)。
 --      取り消した (voided) ファイルの品目は数えない = 取り消せば (ロジザードから消した後) また消せる。ops.cancel_sku_draft はこの確かめを鍵の後に呼ぶ = 書き換えない
---   2. ops.cancel_variation_child (0073 の版を写して 🆕 0099 の行だけ足した): まとまりの子の廃止も同じ決まり (lz_issued で断る)
+--   2. ops.cancel_variation_child (0073 の版を写して 🆕 0091 の行だけ足した): まとまりの子の廃止も同じ決まり (lz_issued で断る)
 -- 鍵 (競り): CSV を出す関数 (ops.lz_new_export_issue) = 要求の鍵 → SKU の鍵 (core.sku:<id>・sku_id の順) → 値の鍵 → 鍵の後に「やめていない」を読む。
 --   消す (ops.cancel_sku_draft) = 段階・マスタの書き込み (共有) → SKU の鍵 (ops.ne_reg_lock_skus) → … → 鍵の後にこの確かめ。
 --   子の廃止 = SKU の鍵 → … → 鍵の後に lz_issued を読む。どちらも同じ SKU の鍵を行の鍵より先に取る・CSV を出す関数はほかの鍵 (段階・NE の CSV・NE のコード・まとまり) を取らない
@@ -17,7 +17,7 @@
 -- 変えない: ops.cancel_sku_draft (確かめを呼ぶだけ)・CSV を出す関数・取り消す関数・0070 の「NE から消えた」・0072 の「NE から消す」(NE にある商品 = 下書きではない)
 -- 🚨 この migration は値を何も変えない (関数を作り直すだけ)。security definer = 一時の表を使わない・search_path = pg_catalog, pg_temp・public の実行権を外す
 
--- ═══════════ 1. 消してよいかの確かめ (0071 の版から写して 🆕 0099 の行だけ足した) ═══════════
+-- ═══════════ 1. 消してよいかの確かめ (0071 の版から写して 🆕 0091 の行だけ足した) ═══════════
 create or replace function ops.sku_draft_cancel_check(p_sku_id bigint) returns jsonb
   language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
 declare
@@ -49,7 +49,7 @@ begin
     v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'ever_issued',
       'text', pg_catalog.format('NE 登録の CSV (ファイル %s) を一度配った = NE に入ったかもしれない (消さない)', v_txt)));
   end if;
-  -- 🆕 0099 ここから: ロジザード登録の CSV (0081 の ops.lz_new_export_items) に出した (issued) 下書きは消さない (中原さんの決定 2026-10-18)。
+  -- 🆕 0091 ここから: ロジザード登録の CSV (0081 の ops.lz_new_export_items) に出した (issued) 下書きは消さない (中原さんの決定 2026-10-18)。
   --   消すとロジザードにだけ商品が残る = 先にロジザードから消す。取り消した (voided) ファイルだけなら消せる。出した品目は SKU ごとに 1 つ (ux_lz_new_items_issued_sku)。
   --   CSV を出す関数 (ops.lz_new_export_issue) は SKU の鍵の下で「やめていない」を確かめる・消す関数はこの確かめを SKU の鍵の後に呼ぶ = 同時でも片方だけが通る
   select pg_catalog.string_agg('#' || i.export_id::text, '・' order by i.export_id) into v_txt
@@ -58,7 +58,7 @@ begin
     v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'lz_issued',
       'text', pg_catalog.format('ロジザード登録の CSV に出しています (ファイル %s)。ロジザードから消すのが先です (ロジザードから消した後、ロジザード登録の CSV の画面でそのファイルを取り消すと消せます)', v_txt)));
   end if;
-  -- 🆕 0099 ここまで
+  -- 🆕 0091 ここまで
   if ops.ne_code_seen(s.code_norm) then
     v_p := v_p || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'seen_in_ne', 'text', 'NE に一度でも現れたコード (NE にある商品を隠さない)'));
   end if;
@@ -120,7 +120,7 @@ begin
 end $$;
 revoke all on function ops.sku_draft_cancel_check(bigint) from public;
 
--- ═══════════ 2. まとまりの子の廃止 (0073 の版から写して 🆕 0099 の行だけ足した) ═══════════
+-- ═══════════ 2. まとまりの子の廃止 (0073 の版から写して 🆕 0091 の行だけ足した) ═══════════
 create or replace function ops.cancel_variation_child(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb, p_sku_id bigint) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
@@ -130,7 +130,7 @@ declare
   v_bump   jsonb;
   v_result jsonb;
   v_txt    text;   -- 🆕 0073
-  v_lz     bigint;   -- 🆕 0099
+  v_lz     bigint;   -- 🆕 0091
 begin
   if p_request_id is null or p_sku_id is null then raise exception 'invalid_input: request_id と SKU が要る' using errcode = '22023'; end if;
   if ops.reg_actor_problem(p_actor_id, p_reason) is not null or coalesce(pg_catalog.length(pg_catalog.btrim(p_reason)), 0) = 0 then
@@ -155,14 +155,14 @@ begin
   if exists (select 1 from ops.ne_reg_export_items i where i.sku_id = p_sku_id and i.state in ('built', 'issued', 'import_declared', 'partial')) then
     raise exception 'live_file: % には終わっていない NE 登録の CSV がある (配っていない = 使わないにする・配った = 申告して確かめを待つ)', v_s.code using errcode = 'P0001';
   end if;
-  -- 🆕 0099 ここから: ロジザード登録の CSV (0081) に出した (issued) 子は廃止しない = 下書きを消す (ops.sku_draft_cancel_check の lz_issued) と同じ決まり。
+  -- 🆕 0091 ここから: ロジザード登録の CSV (0081) に出した (issued) 子は廃止しない = 下書きを消す (ops.sku_draft_cancel_check の lz_issued) と同じ決まり。
   --   取り消した (voided) ファイルだけなら廃止できる。SKU の鍵 (上) の後に読む = CSV を出す関数 (SKU の鍵の下で「やめていない」を確かめる) と同時でも片方だけが通る
   select i.export_id into v_lz from ops.lz_new_export_items i where i.sku_id = p_sku_id and i.state = 'issued' order by i.export_id limit 1;
   if v_lz is not null then
     raise exception 'lz_issued: % はロジザード登録の CSV に出しています (ファイル #%)。ロジザードから消すのが先です (ロジザードから消した後、ロジザード登録の CSV の画面でそのファイルを取り消すと廃止できます)',
       v_s.code, v_lz using errcode = 'P0001';
   end if;
-  -- 🆕 0099 ここまで
+  -- 🆕 0091 ここまで
   if ops.ne_code_seen(v_s.code_norm) then
     raise exception 'seen_in_ne: % は NE に一度でも現れた = 廃止しない (NE にある商品を隠さない)', v_s.code using errcode = 'P0001';
   end if;
