@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * test-ne-update-pg.mjs — 0093 (NE へ送る・AI_reference CompanyDB構想/25 の PR-2) の鍵を本物の PostgreSQL の別々の接続で確かめる
+ * test-ne-update-pg.mjs — 0094 (NE へ送る・AI_reference CompanyDB構想/25 の PR-2) の鍵を本物の PostgreSQL の別々の接続で確かめる
  *
  * 固定する契約 (作る = ops.ne_upd (排他) → NE のコードの共有 → NE の値の共有 → ロジザードの書き方の共有):
  *   K1 照合の record_ne_values (CSV の鍵 → NE のコードの共有 → NE の値の排他) の取引の間は、作る (ops.ne_upd_build) が NE の値の鍵で待つ → 終われば新しい回で作る

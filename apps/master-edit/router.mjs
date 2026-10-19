@@ -44,7 +44,7 @@
  *   POST /api/ne-delete/exports/:id/download  ファイルを受け取る (作った JST の日だけ・中の品目が全部まだ依頼の途中のときだけ・初めてのダウンロードを残す = GET にしない)
  *   POST /api/ne-delete/items/:id/withdraw    依頼を取り下げる { reason, request_id }
  *   POST /api/ne-delete/handling    断られた単品の代わりに取扱中止の CSV を作る { item_ids, reason, request_id, confirm: true }
- *   ── NE へ送る (🆕 0093・AI_reference CompanyDB構想/25・10/19 中原さん「差分がある部分を 1 日 1 回アップ・都度アップも」・lib/master-ne-update.mjs) ──
+ *   ── NE へ送る (🆕 0094・AI_reference CompanyDB構想/25・10/19 中原さん「差分がある部分を 1 日 1 回アップ・都度アップも」・lib/master-ne-update.mjs) ──
  *   GET  /ne-update                 画面「NEへ送る」= 自社で直したけれど今朝の NE と違う所の一覧とボタン 1 つ (見るのはだれでも)
  *   POST /api/ne-update/send-now    今すぐ NE へ送る { request_id } (頼みを積む = miniPC の送り手が数分で上げる・名簿 MASTER_EDITORS の人)
  *   POST /api/ne-update/csv         CSV を作る (NE にアップする用) { request_id } (送り手が止まっているとき・名簿 MASTER_EDITORS の人)

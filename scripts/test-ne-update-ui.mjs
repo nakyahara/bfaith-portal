@@ -1,5 +1,5 @@
 /**
- * test-ne-update-ui.mjs — 画面「NEへ送る」(0093・AI_reference CompanyDB構想/25 の PR-3・10/19 中原さん「わかりにくい」→ 一覧とボタン 1 つ)
+ * test-ne-update-ui.mjs — 画面「NEへ送る」(0094・AI_reference CompanyDB構想/25 の PR-3・10/19 中原さん「わかりにくい」→ 一覧とボタン 1 つ)
  *
  * 固定する契約 (本物の router・PGlite):
  *   [S1] 画面: 見出し「NEへ送る」・左の列に「NEへ送る」・一覧 = 商品・欄・NE の今の値 → 自社の値・止めている欄はふつうの言葉の 1 行・
@@ -8,7 +8,7 @@
  *   [S3] API: 名簿に無い = 403・今すぐ = 頼みを積む (同じ request_id = 前の答え)・CSV を作る → 受け取る (POST・sha256・UTF-8)・GET では受け取れない・
  *        試しの記録 = MASTER_DECISION_APPROVERS の人だけ
  *   [S4] 商品の画面: 「NE とちがう所が N つあります → NEへ送る」の 1 行 / 差が無い = 「NE と同じ」/ 保存の後の「NE でやること」が「NEへ送る」を言う
- *   [S5] 0093 の前 (関数が無い) = 画面は「まだ使えません」・商品の画面の 1 行は出さない
+ *   [S5] 0094 の前 (関数が無い) = 画面は「まだ使えません」・商品の画面の 1 行は出さない
  *   [U1] 画面の JS (Chrome): CSV を作る → ダウンロード (sha256 を照らして保存) / 今すぐ NE へ送る → 「送るように頼みました」
  * 使い方: node scripts/test-ne-update-ui.mjs (MASTER_EDIT_UI_SKIP=1 で画面の JS を飛ばす)
  */
@@ -197,8 +197,8 @@ await ta('[S4] 商品の画面: 「NE とちがう所が N つあります → N
   assert.ok(saved.ne_steps.some((s) => /「NEへ送る」の画面で CSV を作って取り込みます/.test(s)), JSON.stringify(saved.ne_steps));
   assert.match(await page('/manual'), /id="ne-update"/);
 });
-await ta('[S5] 0093 の前 (関数が無い) = 画面は「まだ使えません」・商品の画面の 1 行は出さない', async () => {
-  const before = (fs.readdirSync(new URL('../db/company/migrations/', import.meta.url)).find((f) => /_ne_update_send\.sql$/.test(f)) || '0093').slice(0, 4);
+await ta('[S5] 0094 の前 (関数が無い) = 画面は「まだ使えません」・商品の画面の 1 行は出さない', async () => {
+  const before = (fs.readdirSync(new URL('../db/company/migrations/', import.meta.url)).find((f) => /_ne_update_send\.sql$/.test(f)) || '0094').slice(0, 4);
   const old = await makeDb({ upTo: String(Number(before) - 1).padStart(4, '0') });
   assert.equal((await runInitialLoad(old.db, PLAN, { log: quiet, runId: 'neupd_ui_old', host: 'test', now: new Date(Date.now() - 5 * 86400e3) })).ok, true);
   CUR = { pg: old.pg };

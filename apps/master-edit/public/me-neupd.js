@@ -1,5 +1,5 @@
 /*
- * me-neupd.js — 「NEへ送る」の画面の動き (views/ne-update.ejs・lib/master-ne-update.mjs・0093)
+ * me-neupd.js — 「NEへ送る」の画面の動き (views/ne-update.ejs・lib/master-ne-update.mjs・0094)
  *   - 「今すぐ NE へ送る」= POST /api/ne-update/send-now (頼みを積む = miniPC の送り手が数分で上げる)
  *   - 「CSV を作る (NE にアップする用)」= POST /api/ne-update/csv → 作ったファイルを 1 つずつ「ダウンロード」(POST /api/ne-update/files/:id/download・sha256 を照らしてから保存)
  *   - 通信が分からないまま終わった = 同じ request_id で送り直す (2 回作らない・2 回頼まない)
