@@ -229,13 +229,13 @@ else {
         const [dl] = await Promise.all([p.waitForEvent('download', { timeout: 15000 }), p.click('#nu-csv')]);
         assert.equal(fs.readFileSync(await dl.path(), 'utf8'), 'syohin_code,baika_tnk\r\na03,1300\r\n');
         await p.waitForFunction(() => /NE に取り込んでください|保存しました/.test(document.querySelector('#nu-msg')?.textContent || ''), null, { timeout: 15000 });
+        assert.equal(await p.locator('#nu-csv').isDisabled(), false, 'CSV を作った後も次を作れる');
         await q('select ops.ne_upd_worker_seen($1, true, false, $2)', ['minipc', 'v']);
         await save('a03', { standard_price: '1400' });
         await p.goto(`${B}/ne-update`);
         if (process.env.NEUPD_SHOT) await p.screenshot({ path: process.env.NEUPD_SHOT, fullPage: true });   // 見た目を人が見るとき (試験の判定には使わない)
         await p.click('#nu-send');
         await p.waitForFunction(() => /NE へ送る頼みを受け付けました/.test(document.querySelector('#nu-msg')?.textContent || ''), null, { timeout: 15000 });
-        assert.equal(await p.locator('#nu-csv').isDisabled(), false, '作った後も次を作れる');
         assert.deepEqual(errors, []);
       } finally { await ctx.close(); }
     });
