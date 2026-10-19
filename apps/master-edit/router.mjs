@@ -741,13 +741,14 @@ async function listExtras(db, poOk, deadline = null) {
  */
 const STATEMENT_MAX_MS = 20e3;
 const isStatementTimeout = (e) => !!e && e.code === '57014';
-function deadlineDb(db, deadline) {
+/** maxMs = 1 つの文の上限 (ふつう 20 秒。販売数のグラフの「もう一度読む」だけ 30 秒 = SALES_CHART_LIMITS.longMs) */
+function deadlineDb(db, deadline, { maxMs = STATEMENT_MAX_MS } = {}) {
   let last = null;
   return {
     async query(t, p) {
       const left = Math.floor(deadline - Date.now());
       if (left <= 0) throw new ListTimeoutError();
-      const ms = Math.min(STATEMENT_MAX_MS, left);
+      const ms = Math.min(maxMs, left);
       if (ms !== last) { await db.query(`set statement_timeout = '${ms}ms'`); last = ms; }
       try { return await db.query(t, p); } catch (e) { if (isStatementTimeout(e)) throw new ListTimeoutError(); throw e; }
     },
@@ -1333,18 +1334,47 @@ router.get('/api/sku/:code/monthly', (req, res) => withPgApi(res, async (db) => 
 /**
  * 🆕 販売数のグラフ (10/17 中原さん): 日 × モールの正味の販売数 (0086 の読むだけの関数) と、単品はロジザードの毎日の在庫。SQL は 1 回 (商品を引くのと合わせて 2 回)。
  *   期限 = ルートに入ってから 8 秒 (接続の待ちも入れる・1 つの文は残りの時間まで)。過ぎた・関数が無い = 503 と言葉 (画面のほかの所は動く)。セットも出す (そのセットとして売れた数)
+ * 🆕 10/19 中原さん「表示できなかったものはボタンを押したら表示されるように」: 画面を開いたときは今のまま 8 秒。時間切れ (reason = timeout) の後に
+ *   画面の「もう一度読む」を押す = ?wait=long = 期限 30 秒 (longMs・1 つの文の statement_timeout も残りの時間まで = 期限で DB が文を止める = 接続を握ったままにしない)。
+ *   wait はこの値だけ (ほかの値・2 つ付いた = ふつうの 8 秒)。長い読みは 1 つのプロセスで同時に longMax 本まで (画面のロール master_edit の接続の上限は 5 本 =
+ *   create-master-edit-roles.mjs の CONN_LIMIT。接続は 1 回の要求ごとに開いて閉じる = 貸し借りの溜めは無い) = 越えた = 503 busy (DB に触らない)
  */
-export const SALES_CHART_LIMITS = { timeMs: 8e3 };
-router.get('/api/sku/:code/sales-chart', (req, res) => {
-  const deadline = Date.now() + SALES_CHART_LIMITS.timeMs;
-  return withPgApi(res, async (db0) => {
-    const db = deadlineDb(db0, deadline);
-    let sku;
-    try { sku = await movementSku(db, req.params.code); } catch (e) { if (e instanceof ListTimeoutError) return res.status(503).json({ ok: false, reason: 'timeout', error: '販売数の読み出しに時間がかかりすぎました。少し待ってから画面を開き直してください' }); throw e; }
-    if (!sku) return res.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
-    const out = await readSalesChart(db, sku, { now: clock() });
-    res.status(out.ok ? 200 : 503).json(out);
-  }, 'read', { deadline });
+/** answerGraceMs = 長い読みが期限 + これを過ぎても DB から何も返らない (道が黙って止まった) = 画面には時間切れと答える (読み込み中のままにしない) */
+export const SALES_CHART_LIMITS = { timeMs: 8e3, longMs: 30e3, longMax: 1, answerGraceMs: 5e3 };
+const SALES_CHART_TIMEOUT = Object.freeze({ ok: false, reason: 'timeout', error: '販売数の読み出しに時間がかかりすぎました。少し待ってからもう一度読んでください' });
+let salesChartLongNow = 0;   // いま走っている長い読み (?wait=long) の数
+router.get('/api/sku/:code/sales-chart', async (req, res) => {
+  const long = req.query.wait === 'long';
+  if (long && salesChartLongNow >= SALES_CHART_LIMITS.longMax) return res.status(503).json({ ok: false, reason: 'busy', error: 'ほかの画面で販売数を長く待って読んでいます。少し待ってからもう一度押してください' });
+  const ms = long ? SALES_CHART_LIMITS.longMs : SALES_CHART_LIMITS.timeMs;
+  const deadline = Date.now() + ms;
+  // 先に答えた (下の時間切れ) 後に来た答え (withPgApi の誤りの答えも) は捨てる = 2 度送って落ちない
+  const out1 = { get headersSent() { return res.headersSent; }, status: (code) => ({ json: (body) => { if (!res.headersSent) res.status(code).json(body); } }) };
+  let timer = null;
+  if (long) {
+    salesChartLongNow++;
+    // 期限 + answerGraceMs で答えだけ先に返す。枠 (同時 1 本) は接続を閉じ終わる (下の finally) まで返さない = 止まった接続が残っている間に次の長い読みを重ねない
+    //   (Codex R2 High: 枠を先に返すと、止まった接続が積み上がって画面のロールの接続の上限 5 本を使い切りうる)
+    timer = setTimeout(() => {
+      if (res.headersSent) return;
+      console.error(`[master-edit] 販売数のグラフ (長く待つ読み) が期限を過ぎても終わらない: ${req.params.code}`);
+      res.status(503).json(SALES_CHART_TIMEOUT);
+    }, ms + SALES_CHART_LIMITS.answerGraceMs);
+    if (timer.unref) timer.unref();
+  }
+  try {
+    await withPgApi(out1, async (db0) => {
+      const db = deadlineDb(db0, deadline, { maxMs: Math.max(STATEMENT_MAX_MS, ms) });
+      let sku;
+      try { sku = await movementSku(db, req.params.code); } catch (e) { if (e instanceof ListTimeoutError) return out1.status(503).json(SALES_CHART_TIMEOUT); throw e; }
+      if (!sku) return out1.status(404).json({ ok: false, error: `${req.params.code} は Company DB にありません` });
+      const out = await readSalesChart(db, sku, { now: clock() });
+      out1.status(out.ok ? 200 : 503).json(out);
+    }, 'read', { deadline });
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (long) salesChartLongNow--;
+  }
 });
 
 router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {

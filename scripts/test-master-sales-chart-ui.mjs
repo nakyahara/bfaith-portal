@@ -9,6 +9,8 @@
  *   4 セット: そのセットとして売れた数・在庫のグラフは出さない
  *   5 スマホ 390 の幅でページが横にはみ出さない (グラフは箱の幅で描く)
  *   6 読めない (関数の実行権が無い) = 言葉だけ出す (グラフは出さない・画面のほかの所は動く)
+ *   7 時間切れ (8 秒) = 言葉と「もう一度読む」→ ?wait=long で読み直す: 読む間はボタンを止めて「読み込み中…」・2 度押しでも 1 回だけ読む・
+ *     また時間切れ = 言葉とボタンがまた出る・読めたらグラフ (ボタンは消える)・読めない (時間切れ以外) はボタンを出さない / 8 スマホ 390 でボタンがはみ出さない
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ
  * 使い方: node scripts/test-master-sales-chart-ui.mjs
  */
@@ -67,7 +69,7 @@ const { initPurchaseOrders } = await import('../apps/purchase-orders/db.js');
 initPurchaseOrders();
 
 // ── 本物の router ──
-const { default: router, __setPgClientFactory, __setClock, __setShippingRatesProvider } = await import('../apps/master-edit/router.mjs');
+const { default: router, __setPgClientFactory, __setClock, __setShippingRatesProvider, SALES_CHART_LIMITS } = await import('../apps/master-edit/router.mjs');
 process.env.COMPANY_DB_URL = 'postgres://owner@localhost/scui';
 process.env.COMPANY_DB_MASTER_EDIT_URL = 'postgres://master_edit@localhost/scui';
 process.env.MASTER_EDITORS = 'naka@test';
@@ -211,6 +213,62 @@ try {
       await pg.query('set role deploy');
     }
   });
+  // 🆕 10/19 中原さん「表示できなかったものはボタンを押したら表示されるように」: ふつうの期限を 0 にする = 画面を開いたときの読みは必ず時間切れ (本物のサーバーの答え)
+  const SHORT_MS = SALES_CHART_LIMITS.timeMs;
+  await ta('[7] 時間切れ = 言葉と「もう一度読む」→ 長く待って読む (読む間はボタンを止める・2 度押しでも 1 回)・また時間切れ = もう一度出す・読めたらグラフ', async (p) => {
+    SALES_CHART_LIMITS.timeMs = 0;
+    try {
+      const longCalls = [];
+      p.on('request', (q) => { if (/\/sales-chart\?wait=long$/.test(q.url())) longCalls.push(q.url()); });
+      // 1 回目の長い読み = 手前の中継の時間切れ (504・reason の無い JSON) にする (30 秒は待たない)。サーバーの時間切れ (503 timeout) と同じ扱いになる (Codex R1 Medium)
+      await p.route('**/sales-chart?wait=long', (route) => route.fulfill({ status: 504, contentType: 'application/json', body: JSON.stringify({ error: 'Gateway Timeout' }) }));
+      await p.goto(B + '/sku/sc-a');
+      await p.waitForSelector('#sc-retry:not([hidden])');
+      assert.match(await p.textContent('#sc-sum'), /時間がかかりました \(よく売れる商品は時間がかかることがあります\)/);
+      assert.equal(await p.textContent('#sc-retry-btn'), 'もう一度読む (時間がかかることがあります)');
+      assert.deepEqual([await p.isHidden('#sc-chart'), await p.isHidden('#sc-wait'), await p.isEnabled('#sc-retry-btn')], [true, true, true]);
+      await p.click('#sc-retry-btn');
+      await p.waitForFunction(() => /長く待っても読み切れませんでした/.test(document.getElementById('sc-sum').textContent));
+      assert.deepEqual([await p.isVisible('#sc-retry-btn'), await p.isEnabled('#sc-retry-btn'), await p.isHidden('#sc-wait'), await p.isHidden('#sc-chart')], [true, true, true, true], 'また時間切れ = 言葉とボタン');
+      // 2 回目 = 本物のサーバー (?wait=long = 30 秒まで) へ。答えを止めておいて、読む間の様子を見る
+      await p.unroute('**/sales-chart?wait=long');
+      let release; const held = new Promise((ok) => { release = ok; });
+      await p.route('**/sales-chart?wait=long', async (route) => { await held; await route.continue(); });
+      await p.click('#sc-retry-btn');
+      await p.waitForSelector('#sc-wait:not([hidden])');
+      assert.equal(await p.isDisabled('#sc-retry-btn'), true, '読む間はボタンを止める');
+      assert.match(await p.textContent('#sc-sum'), /^読み込み中…/);
+      assert.equal(await p.getAttribute('#p-sales', 'aria-busy'), 'true');
+      await p.evaluate(() => { const b = document.getElementById('sc-retry-btn'); b.click(); b.dispatchEvent(new MouseEvent('click', { bubbles: true })); });   // 止めたボタンを押しても読まない
+      release();
+      await ready(p);
+      assert.equal(longCalls.length, 2, `長い読みは押した 2 回だけ: ${longCalls.length}`);
+      assert.deepEqual([await p.isHidden('#sc-retry'), await p.getAttribute('#p-sales', 'aria-busy')], [true, 'false'], '読めたらボタンは消える');
+      assert.match(await p.textContent('#sc-sum'), /直近 52 週の合計 18 個/);
+      assert.equal((await cells(p, '#sc-rows tr')).length, 52);
+    } finally { SALES_CHART_LIMITS.timeMs = SHORT_MS; }
+  });
+
+  await ta('[8] スマホ 390: 時間切れの言葉とボタンが横にはみ出さない / 時間切れ以外で読めない = ボタンは出さない', async (p) => {
+    SALES_CHART_LIMITS.timeMs = 0;
+    try {
+      await p.goto(B + '/sku/sc-a');
+      await p.waitForSelector('#sc-retry:not([hidden])');
+      const w = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: window.innerWidth, btn: document.getElementById('sc-retry-btn').getBoundingClientRect().right, box: document.getElementById('p-sales').getBoundingClientRect().right }));
+      assert.ok(w.doc <= w.view && w.btn <= w.box + 0.5, JSON.stringify(w));
+      if (process.env.MASTER_SALES_SHOT_RETRY) await p.locator('#p-sales').screenshot({ path: process.env.MASTER_SALES_SHOT_RETRY });
+    } finally { SALES_CHART_LIMITS.timeMs = SHORT_MS; }
+    await p.route('**/sales-chart', (route) => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ ok: false, reason: 'error', error: '販売数を読めません' }) }));
+    await p.goto(B + '/sku/sc-a');
+    await p.waitForFunction(() => document.getElementById('sc-sum').textContent === '販売数を読めません');
+    assert.equal(await p.isHidden('#sc-retry'), true);
+    // 画面を開いたときにつながらない = ボタンは出さない (時間切れだけ・Codex R1 Medium)
+    await p.unroute('**/sales-chart');
+    await p.route('**/sales-chart', (route) => route.abort());
+    await p.goto(B + '/sku/sc-a');
+    await p.waitForFunction(() => /つながりませんでした/.test(document.getElementById('sc-sum').textContent));
+    assert.equal(await p.isHidden('#sc-retry'), true);
+  }, { width: 390, height: 844 });
 } finally {
   await browser.close();
   server.close();

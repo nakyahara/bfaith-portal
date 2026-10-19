@@ -1,6 +1,7 @@
 /*
  * me-sales-chart.js — 1 つの商品の画面の「販売数のグラフ」(10/17 中原さん。読むだけ)
  *   - GET /api/sku/:code/sales-chart (週 52・月 24・日 90 の数をまとめて 1 回で読む) → 切り替えは読み直さない
+ *   - 時間切れ (8 秒) = 言葉と「もう一度読む (時間がかかることがあります)」= ?wait=long (30 秒まで待つ・10/19)
  *   - 上 = モール別の積み上げの棒 (楽天・Amazon・Yahoo!・その他)。下 = ロジザードの在庫の線 (単品だけ・別のグラフ = 軸を 2 つ重ねない)
  *   - 在庫 0 の日 (欠品) がある期間は両方のグラフで帯を付ける (凡例に「欠品」の言葉)。いちばん新しい期間 (途中) は薄い棒
  *   - 値は棒にかざす / グラフを選んで ← → で見る (同じ中身を読み上げにも)。表 (表で見る) にも全部ある = ツールチップだけに頼らない
@@ -16,6 +17,7 @@
   var $ = function (id) { return document.getElementById(id); };
   var sumEl = $('sc-sum'), legendEl = $('sc-legend'), chartEl = $('sc-chart'), salesEl = $('sc-sales'), stockEl = $('sc-stock'), stockHead = $('sc-stock-h');
   var tip = $('sc-tip'), live = $('sc-live'), tableBox = $('sc-table-box'), thead = $('sc-thead'), rowsEl = $('sc-rows'), unitSeg = $('sc-unit');
+  var retryBox = $('sc-retry'), retryBtn = $('sc-retry-btn'), waitEl = $('sc-wait');
   var data = null, unit = 'week', active = -1, lastW = 0;
   var SER = [{ key: 'rakuten', label: '楽天' }, { key: 'amazon', label: 'Amazon' }, { key: 'yahoo', label: 'Yahoo!' }, { key: 'other', label: 'その他' }];
   var UNIT = { week: { n: '52 週', per: '週', avg: '週平均' }, month: { n: '24 か月', per: '月', avg: '月平均' }, day: { n: '90 日', per: '日', avg: '1 日平均' } };
@@ -59,8 +61,13 @@
   }
   function api(path) {
     return fetch(BASE + path, { headers: { Accept: 'application/json' }, credentials: 'same-origin' })
-      .then(function (r) { return r.json().catch(function () { return { ok: false, error: '読めませんでした (' + r.status + ')' }; }); })
-      .catch(function () { return { ok: false, error: 'つながりませんでした。少し待ってから画面を開き直してください' }; });
+      .then(function (r) {
+        return r.json().catch(function () { return { ok: false, error: '読めませんでした (' + r.status + ')' }; }).then(function (j) {
+          if (j && !j.ok && !j.reason && r.status === 504) j.reason = 'timeout';   // 手前の中継の時間切れ (JSON でも JSON でなくても) = サーバーの時間切れと同じ扱い
+          return j;
+        });
+      })
+      .catch(function () { return { ok: false, reason: 'network', error: 'つながりませんでした。少し待ってから画面を開き直してください' }; });
   }
 
   function view() { return data.views[unit]; }
@@ -334,9 +341,40 @@
     new ResizeObserver(function () { if (data && !chartEl.hidden && Math.abs((chartEl.clientWidth || 0) - lastW) >= 2) draw(); }).observe(chartEl);
   } else window.addEventListener('resize', function () { if (data) draw(); });
 
-  api('/api/sku/' + encodeURIComponent(CODE) + '/sales-chart').then(function (j) {
-    if (!j || !j.ok) { sumEl.textContent = (j && j.error) || '読めませんでした'; return; }
-    data = j;
-    render();
-  });
+  // 🆕 10/19 中原さん「表示できなかったものはボタンを押したら表示されるように」: 画面を開いたときはサーバーの 8 秒で読む。
+  //   時間切れ (よく売れる商品) = 言葉と「もう一度読む」→ ?wait=long (サーバーで 30 秒まで待つ)。読む間はボタンを止めて「読み込み中…」(2 度押しで 2 本読まない)
+  //   ボタンを出す = 時間切れ。押した後 (長い読み) は、混んでいる (busy)・つながらない (network) もボタンを残す (もう一度押せる)
+  var RETRY_AFTER_LONG = { timeout: 1, busy: 1, network: 1 };
+  var loading = false;
+  function setLoading(on) {
+    loading = on;
+    retryBtn.disabled = on;
+    waitEl.hidden = !on;
+    box.setAttribute('aria-busy', on ? 'true' : 'false');
+  }
+  function failText(j, long) {
+    if (j.reason === 'timeout') return long ? '長く待っても読み切れませんでした (DB が混んでいるかもしれません)。少し待ってからもう一度押してください'
+      : '販売数の読み出しに時間がかかりました (よく売れる商品は時間がかかることがあります)。下のボタンで、長く待って読み直せます';
+    if (j.reason === 'network' && long) return 'つながりませんでした。少し待ってからもう一度押してください';
+    return j.error || '読めませんでした';
+  }
+  function load(long) {
+    if (loading) return;
+    setLoading(true);
+    if (long) sumEl.textContent = '読み込み中… (30 秒ほどかかることがあります)';
+    api('/api/sku/' + encodeURIComponent(CODE) + '/sales-chart' + (long ? '?wait=long' : '')).then(function (j) {
+      setLoading(false);
+      if (!j || !j.ok) {
+        j = j || {};
+        sumEl.textContent = failText(j, long);
+        retryBox.hidden = !(j.reason === 'timeout' || (long && RETRY_AFTER_LONG[j.reason]));
+        return;
+      }
+      retryBox.hidden = true;
+      data = j;
+      render();
+    });
+  }
+  retryBtn.addEventListener('click', function () { load(true); });
+  load(false);
 })();

@@ -101,7 +101,7 @@ export function buildSalesChart({ sales, anchors, through }) {
 
 /** DB の関数の誤り → 画面の言葉。関数が無い (0086 / 0085 の前)・権限が無い (流し直しの前) = no_privilege。期限切れ = timeout */
 function chartError(e) {
-  if (e instanceof ListTimeoutError || (e && e.code === '57014')) return { ok: false, reason: 'timeout', error: '販売数の読み出しに時間がかかりすぎました。少し待ってから画面を開き直してください' };
+  if (e instanceof ListTimeoutError || (e && e.code === '57014')) return { ok: false, reason: 'timeout', error: '販売数の読み出しに時間がかかりすぎました。少し待ってからもう一度読んでください' };
   if (e && (e.code === '42883' || e.code === '42501')) return { ok: false, reason: 'no_privilege', error: '画面のロールに販売数を読む関数がまだありません (migration 0086 と create-master-edit-roles.mjs の流し直しが要ります)' };
   console.error(`[master-edit] 販売数のグラフを読めない: ${e && e.message}`);
   return { ok: false, reason: 'error', error: '販売数を読めません' };
