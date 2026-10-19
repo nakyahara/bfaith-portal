@@ -50,6 +50,7 @@
  *  76 Amazon SKU の未登録の一覧の「その場で登録」(10/17): 行の下に欄・名前 = Amazon の商品名・構成の原価
  *  77 新商品 (10/17): 「セット商品を作るか = 作る」の作るセットの表 (初めの値・付いていく・重なり / 0 行は ③ で止める・保留で隠す・保存で product-hub にセットの下書き)
  *  78 Amazon SKU を CSV でまとめて登録 (10/17): 試し取込 (Shift_JIS・表・絞る札・だめな理由・何も書かない)・保存 (DB に入る)・結果の CSV (BOM・式の注入の対策)・同じ CSV = 変わらない・390 ではみ出さない
+ *  79 ⑤-1 商品の画面の先方品番・入数 (10/18): 足す → 保存 (発注アプリの対応表)・未保存に数える・直して保存・消す
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -1859,7 +1860,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   assert.equal((await prefsPost(p, { order: [...LIST_DEFAULT.order], shown: [...LIST_DEFAULT.shown] })).status, 200);   // 前の試験の設定を消す
   await p.goto(B + '/?q=' + encodeURIComponent('単品'));
   assert.deepEqual(await shownHeads(p), LIST_DEFAULT.shown, 'いつもの列 (仕入先は出さない)');
-  assert.equal(await p.textContent('#colcnt'), '17/19');   // 画像の列 (出す)・🆕 0084 メーカーの列 (出さない)
+  assert.equal(await p.textContent('#colcnt'), '17/23');   // 画像の列 (出す)・🆕 0084 メーカー・🆕 0087 大きさ・重さ・🆕 0088 ブランド・段階の 3 列 (出さない)
   assert.equal(await p.isVisible('#list-tbl tbody tr:first-child .sup-sub'), true, '仕入先の列が無い = 名前の下に「仕入先」');
   // 板を開く: コードは外せない・↑↓ も押せない・FBA などは「並べられない」
   await p.click('#colbtn');
@@ -1888,7 +1889,7 @@ await ta('[52] 一覧の列 (10/8 PR1): 列の板 = 出す / 出さない・↑�
   // つまみで動かす (売価を名前の前へ)
   await p.dragAndDrop('#collist li[data-id="price"] .grip', '#collist li[data-id="name"]');
   assert.deepEqual((await shownHeads(p)).slice(0, 5), ['code', 'sup', 'img', 'price', 'name']);
-  assert.equal(await p.textContent('#colcnt'), '17/19');   // 画像の列 (出す)・🆕 0084 メーカーの列 (出さない)
+  assert.equal(await p.textContent('#colcnt'), '17/23');   // 画像の列 (出す)・🆕 0084 メーカー・🆕 0087 大きさ・重さ・🆕 0088 ブランド・段階の 3 列 (出さない)
   if (LIST_SHOTS) await p.waitForTimeout(400), await p.screenshot({ path: `${LIST_SHOTS}/1280_cols.png` });
   // 保存 → 「未保存」が消える・別の窓 (= 別の PC。同じログイン) で開いても同じ列
   await p.click('#cp-save');
@@ -2022,7 +2023,7 @@ await ta('[75] 一覧の画像の列 (10/17 中原さん「楽天の白抜き商
     await p.click('#collist li[data-id="img"] input');
     assert.ok(!(await shownHeads(p)).includes('img'));
     assert.equal(await p.isHidden(cell('s001')), true);
-    assert.equal(await p.textContent('#colcnt'), '16/19');   // 🆕 0084: メーカーの列 (出さない) で全部 19
+    assert.equal(await p.textContent('#colcnt'), '16/23');   // 画像の列 (出す)・🆕 0084 メーカー・🆕 0087 大きさ・重さ・🆕 0088 ブランド・段階の 3 列 (出さない)
     await p.click('#collist li[data-id="img"] input');
     assert.deepEqual((await shownHeads(p)).slice(0, 2), ['code', 'img']);
     assert.match(await p.textContent('#collist li[data-id="img"]'), /画像\s*新/);
@@ -3353,6 +3354,69 @@ await ta('[78] CSV でまとめて登録 (10/17): ファイルを選ぶ → 試�
   await p.waitForFunction(() => /試し取込をしました/.test(document.getElementById('bulk-msg').textContent) && /UTF-8/.test(document.getElementById('bulk-file-info').textContent));
   assert.match(await p.textContent('#bulk-rows tr[data-sku="pr-ui-bulk-1"]'), /変わらない/);
   assert.equal(await p.textContent('#bulk-apply'), '保存する SKU がありません');
+});
+
+await ta('[79] ⑤-1 商品の画面の先方品番・入数 (CompanyDB構想 27 §2.4): 足す → 保存 (発注アプリの対応表に入る)・打った行は未保存に数える・直して保存・古い版 = 409 の文・消す (確かめ) = 空の「足す」行に戻る・ほかの仕入先の行は消すだけ', async (p) => {
+  const NSK = await import('../apps/purchase-orders/new-skus.js');
+  const t0 = new Date().toISOString();
+  mirrorDb.prepare('insert or ignore into po_suppliers (supplier_code, name, created_at, updated_at) values (?,?,?,?)').run('1', 'AMC', t0, t0);
+  mirrorDb.prepare('insert or ignore into po_suppliers (supplier_code, name, created_at, updated_at) values (?,?,?,?)').run('7', 'ほかの仕入先', t0, t0);
+  mirrorDb.prepare("insert into po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) values ('7', 'k001', 'k001', 'OLD-7', null, ?)").run(t0);
+  const vrow = (sup) => mirrorDb.prepare('select * from po_vendor_code_map where supplier_code = ? and product_key = ?').get(sup, 'k001') || null;
+  NSK.setNewSkuReaderForTest(async () => ({ ok: true, map: new Map([['k001', { code: 'k001', name: 'k001', state: 'available', supplier: '1' }]]) }));
+  try {
+    p.on('dialog', (d) => d.accept());
+    await p.goto(B + '/sku/k001');
+    const r1 = '#po-vendor .po-vrow[data-sup="1"]';
+    await p.waitForSelector(r1);
+    assert.equal(await p.textContent(`${r1} .po-v-save`), '足す');
+    assert.equal(await p.isDisabled(`${r1} .po-v-save`), true, '何も打っていないのに押せる');
+    assert.equal(await p.isDisabled('#po-vendor .po-vrow[data-sup="7"] .po-v-code'), true, 'ほかの仕入先の行を直せる');
+    const d0 = await dirty(p);
+    await p.fill(`${r1} .po-v-code`, 'AC-K1');
+    await p.fill(`${r1} .po-v-qpu`, '２４');
+    assert.equal(await dirty(p), d0 + 1, '打った先方品番の行を未保存に数えない');
+    // 送っている間は欄も閉じる (送っていない値を「保存した」にしない・Codex R1 M1)
+    let release; const gate = new Promise((r) => { release = r; });
+    await p.route('**/vendor-code', async (route) => { await gate; await route.continue(); });
+    await p.click(`${r1} .po-v-save`);
+    await p.waitForFunction((s) => document.querySelector(s + ' .po-v-code').disabled && document.querySelector(s + ' .po-v-qpu').disabled, r1);
+    release();
+    await p.waitForFunction((s) => /保存しました/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
+    await p.unroute('**/vendor-code');
+    assert.equal(await p.isDisabled(`${r1} .po-v-code`), false, '保存の後に欄が開かない');
+    assert.deepEqual([vrow('1').vendor_code, vrow('1').qty_per_unit], ['AC-K1', 24]);
+    assert.equal(await p.inputValue(`${r1} .po-v-qpu`), '24');
+    assert.equal(await dirty(p), d0, '保存した後も未保存に数えている');
+    assert.equal(await p.textContent(`${r1} .po-v-save`), '保存');
+    // 画面の外で直す → この画面で保存 = 409 の文 (何も書かない)
+    const before = vrow('1');
+    mirrorDb.prepare("update po_vendor_code_map set vendor_code = 'BEHIND', updated_at = ? where supplier_code = '1' and product_key = 'k001'").run(new Date(Date.now() + 5000).toISOString());
+    await p.fill(`${r1} .po-v-code`, 'AC-K2');
+    await p.press(`${r1} .po-v-code`, 'Enter');
+    await p.waitForFunction((s) => /他の画面で変更されています/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
+    assert.equal(vrow('1').vendor_code, 'BEHIND');
+    mirrorDb.prepare("update po_vendor_code_map set vendor_code = ?, updated_at = ? where supplier_code = '1' and product_key = 'k001'").run(before.vendor_code, before.updated_at);
+    await p.fill(`${r1} .po-v-code`, 'AC-K2');
+    await p.click(`${r1} .po-v-save`);
+    await p.waitForFunction((s) => /保存しました/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
+    assert.equal(vrow('1').vendor_code, 'AC-K2');
+    // 消す (確かめ) = 空の「足す」行に戻る
+    await p.click(`${r1} .po-v-del`);
+    await p.waitForFunction((s) => /消しました/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
+    assert.equal(vrow('1'), null);
+    assert.deepEqual([await p.inputValue(`${r1} .po-v-code`), await p.textContent(`${r1} .po-v-save`), await p.$(`${r1} .po-v-del`)], ['', '足す', null]);
+    assert.equal(await p.isDisabled(`${r1} .po-v-code`), false, '消した後に「足す」の欄が開いている (統合の Codex P2)');
+    // ほかの仕入先の古い行 = 消すだけ (行ごと消える)
+    await p.click('#po-vendor .po-vrow[data-sup="7"] .po-v-del');
+    await p.waitForFunction(() => !document.querySelector('#po-vendor .po-vrow[data-sup="7"]'));
+    assert.equal(vrow('7'), null);
+    // 1024 幅 / 390 幅で横にはみ出さない
+    for (const w of [1024, 390]) {
+      await p.setViewportSize({ width: w, height: 800 });
+      assert.ok(await p.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), `${w} 幅で横にはみ出す`);
+    }
+  } finally { NSK.setNewSkuReaderForTest(null); }
 });
 
 await browser.close();

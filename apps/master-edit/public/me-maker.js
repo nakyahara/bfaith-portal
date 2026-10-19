@@ -1,5 +1,8 @@
 /*
  * me-maker.js — メーカー (製造元) の欄 (中原さん 2026-10-17・Company DB の 0084・部品 = views/_maker.ejs)
+ *   🆕 0088: 同じ動きをブランドの欄 (views/_brand.ejs・#f-brand…) にも使う = 下の名簿ごとの違い (K) で 1 回ずつ動かす。ブランドだけ:
+ *     候補の「自社」の札・「＋ 自社ブランドとして登録」(POST /api/brands の own)・「自社ブランドにする / 外す」(#f-brand-own = POST /api/brands/own・名簿の印をその場で変える)。
+ *     「仕入先と同じ」「入力なし」はメーカーだけ (ボタン・札がある欄だけ動く)。MasterEdit.brand もメーカーと同じ形
  *   新商品の登録 (単品)・色違い・サイズ違いのまとまり・商品の画面 (単品) の 3 つで同じ動き。
  *   - 打つと名簿から探す: かなの同一視 (サーバーの apps/master-edit/search-fold.mjs と同じ = NFKC・小文字・ひらがな → カタカナ) +
  *     空白で区切った言葉が全部入っている。日本語の変換中も探す。確定の Enter (Windows の Chrome・Edge は確定の後に keyCode 13 が来る) では選ばない
@@ -11,16 +14,24 @@
  *   - 「入力なし」(新商品の登録・public/me-none.js) を押す = メーカーを空にする。メーカーを選ぶ = 入力なしは外れる (me-none が隠した欄の input で外す)
  *   画面の JS に渡すもの: MasterEdit.maker = { label(番号), set(番号), sync(), value() }。値が変わったら MasterEdit.recount() (画面の数え直し)
  */
-(function () {
+// 名簿ごとの違い (key = 欄の id の名前 f-<key>-in など・MasterEdit[key]・返事の項目・opt = 候補の id の頭・own = 自社ブランドの印がある)
+[
+  { key: 'maker', noun: 'メーカー', api: '/api/makers', opt: 'mk-opt-', own: false },
+  { key: 'brand', noun: 'ブランド', api: '/api/brands', opt: 'br-opt-', own: true },
+].forEach(function (K) {
   'use strict';
   var ME = window.MasterEdit = window.MasterEdit || {};
   var $ = function (s, r) { return (r || document).querySelector(s); };
-  var dataEl = document.getElementById('me-maker');
-  var inp = document.getElementById('f-maker-in');
-  var hid = document.getElementById('f-maker');
-  var list = document.getElementById('f-maker-list');
-  var sameBtn = document.getElementById('f-maker-same');
-  var msgEl = document.getElementById('f-maker-msg');
+  var dataEl = document.getElementById('me-' + K.key);
+  var inp = document.getElementById('f-' + K.key + '-in');
+  var hid = document.getElementById('f-' + K.key);
+  var list = document.getElementById('f-' + K.key + '-list');
+  var sameBtn = document.getElementById('f-' + K.key + '-same');
+  var msgEl = document.getElementById('f-' + K.key + '-msg');
+  var ownBtn = K.own ? document.getElementById('f-' + K.key + '-own') : null;     // 🆕 0088: ブランドだけ
+  var ownTag = K.own ? document.getElementById('f-' + K.key + '-owntag') : null;
+  var NOUN = K.noun;
+  var NONE_SEL = 'input[type="checkbox"][data-none="' + K.key + '"]';
   if (!dataEl || !inp || !hid || !list) return;
   var P = JSON.parse(dataEl.textContent);
   var BASE = P.base || '';
@@ -32,15 +43,23 @@
   function clean(s) { return String(s == null ? '' : s).replace(/[ 　 ]+/g, ' ').trim(); }
   /** 同じと見る形 (lib/master-maker.mjs makerNameNorm = DB の core.maker_name_norm と同じ) */
   function norm(s) { return fold(clean(s)).replace(/ /g, ''); }
-  var MAKERS = (P.makers || []).map(function (m) { return { id: String(m[0]), name: m[1], f: fold(m[1]), k: norm(m[1]) }; });
+  var MAKERS = (P.makers || P.items || []).map(function (m) { return { id: String(m[0]), name: m[1], own: !!m[2], f: fold(m[1]), k: norm(m[1]) }; });   // [番号, 名前, (自社ブランド)]
   function byId(id) { id = String(id || ''); for (var i = 0; i < MAKERS.length; i++) if (MAKERS[i].id === id) return MAKERS[i]; return null; }
   function byNorm(k) { for (var i = 0; i < MAKERS.length; i++) if (MAKERS[i].k === k) return MAKERS[i]; return null; }
-  function add(m) { var x = byId(m.id); if (x) return x; x = { id: String(m.id), name: m.name, f: fold(m.name), k: norm(m.name) }; MAKERS.push(x); return x; }
+  function add(m) { var x = byId(m.id); if (x) { if (m.own != null) x.own = !!m.own; return x; } x = { id: String(m.id), name: m.name, own: !!m.own, f: fold(m.name), k: norm(m.name) }; MAKERS.push(x); return x; }
 
   var picked = byId(hid.value);   // 今選んでいるメーカー (無い = null)
   if (!picked && hid.value) picked = { id: hid.value, name: inp.value };
   function say(t, cls) { if (!msgEl) return; msgEl.className = 'fmsg' + (cls ? ' ' + cls : ''); msgEl.textContent = t || ''; }
   function recount() { if (typeof ME.recount === 'function') ME.recount(); }
+  /** 🆕 0088: 自社ブランドの札とボタン (ブランドだけ) = 選んでいるブランドの名簿の印 */
+  function ownShow() {
+    if (!K.own) return;
+    var m = picked && byId(picked.id);
+    if (ownTag) ownTag.hidden = !(m && m.own);
+    if (ownBtn) { ownBtn.hidden = !m || !P.canCreate; if (m) ownBtn.textContent = m.own ? '自社ブランドから外す' : '自社ブランドにする'; }
+  }
+  var lastPend = false;   // 🆕 0088: 前に数えたときの「打っただけで選んでいない」
   /** 値を決める (m = { id, name } / null = なし)。keepText = 打った名前を残す (選んだのをやめただけ) */
   var gen = 0;   // 選んでいる値を変えた回数 (名簿に足す返事を待つ間に人が選び直したかを見る・#maker Codex R2)
   function setVal(m, keepText) {
@@ -55,6 +74,8 @@
       hid.dispatchEvent(new Event('change', { bubbles: true }));
     }
     inp.setAttribute('aria-invalid', 'false');
+    ownShow();
+    lastPend = !!clean(inp.value) && !picked;
     recount();
   }
 
@@ -80,8 +101,8 @@
   function setSel(i) {
     S.sel = i;
     Array.prototype.forEach.call(list.querySelectorAll('.co'), function (o, k) { o.classList.toggle('sel', k === i); o.setAttribute('aria-selected', k === i ? 'true' : 'false'); });
-    if (i >= 0) inp.setAttribute('aria-activedescendant', 'mk-opt-' + i); else inp.removeAttribute('aria-activedescendant');
-    var o = document.getElementById('mk-opt-' + i); if (o && o.scrollIntoView) o.scrollIntoView({ block: 'nearest' });
+    if (i >= 0) inp.setAttribute('aria-activedescendant', K.opt + i); else inp.removeAttribute('aria-activedescendant');
+    var o = document.getElementById(K.opt + i); if (o && o.scrollIntoView) o.scrollIntoView({ block: 'nearest' });
   }
   /** 打った言葉で名簿を探して候補を出す (名簿は画面にある = 問い合わせない) */
   function render() {
@@ -101,17 +122,18 @@
     S.items = hits.map(function (m) { return { m: m }; });
     var tooLong = Array.from(q).length > MAX;
     if (!exact && P.canCreate && !tooLong) S.items.push({ create: q });
+    if (!exact && P.canCreate && !tooLong && K.own) S.items.push({ create: q, own: true });   // 🆕 0088: ブランド = 自社ブランドとして足す
     var h = '';
-    if (hits.length) h += '<div class="cs-h"><span>メーカー ' + hits.length + ' 件' + (more ? ' (上から 30 件。もっと打つと絞れます)' : '') + '</span></div>';
-    else h += '<div class="cs-empty">「' + esc(q) + '」に当たるメーカーは名簿にありません</div>';
+    if (hits.length) h += '<div class="cs-h"><span>' + NOUN + ' ' + hits.length + ' 件' + (more ? ' (上から 30 件。もっと打つと絞れます)' : '') + '</span></div>';
+    else h += '<div class="cs-empty">「' + esc(q) + '」に当たる' + NOUN + 'は名簿にありません</div>';
     S.items.forEach(function (x, i) {
       if (x.create) {
-        h += '<div class="co mk-new" role="option" id="mk-opt-' + i + '" data-i="' + i + '" aria-selected="false"><div class="cn">＋ 「' + esc(x.create) + '」を新しいメーカーとして登録</div></div>';
+        h += '<div class="co mk-new" role="option" id="' + K.opt + i + '" data-i="' + i + '" aria-selected="false"><div class="cn">＋ 「' + esc(x.create) + '」を' + (x.own ? '自社ブランド' : '新しい' + NOUN) + 'として登録</div></div>';
       } else {
-        h += '<div class="co" role="option" id="mk-opt-' + i + '" data-i="' + i + '" aria-selected="false"><div class="cn">' + mark(x.m.name, words) + (x.m.k === k ? ' <span class="b mute">同じ名前</span>' : '') + '</div></div>';
+        h += '<div class="co" role="option" id="' + K.opt + i + '" data-i="' + i + '" aria-selected="false"><div class="cn">' + mark(x.m.name, words) + (K.own && x.m.own ? ' <span class="b ok">自社</span>' : '') + (x.m.k === k ? ' <span class="b mute">同じ名前</span>' : '') + '</div></div>';
       }
     });
-    if (tooLong) h += '<div class="cs-empty bad">メーカーの名前は ' + MAX + ' 字までです</div>';
+    if (tooLong) h += '<div class="cs-empty bad">' + NOUN + 'の名前は ' + MAX + ' 字までです</div>';
     list.innerHTML = h;
     list.hidden = false;
     inp.setAttribute('aria-expanded', 'true');
@@ -129,7 +151,7 @@
     var x = S.items[i];
     if (!x) return;
     close();
-    if (x.create) { createAndPick(x.create, false); return; }
+    if (x.create) { createAndPick(x.create, false, !!x.own); return; }
     setVal(x.m);
     say('');
   }
@@ -143,36 +165,37 @@
   }
   var busy = false;
   var lastReq = null;   // { k, id } 通信が切れたときに同じ名前で押し直す = 同じ番号 (2 つ作らない)
-  function createAndPick(name0, fromSupplier) {
+  function createAndPick(name0, fromSupplier, own) {
     var name = clean(name0);
     if (!name || busy) return;
     var hit = byNorm(norm(name));
     if (hit) { setVal(hit); say((fromSupplier ? '仕入先と同じ' : '名簿にある') + '「' + hit.name + '」にしました', 'ok'); return; }
-    if (!P.canCreate) { say('このメーカーは名簿にありません (名簿に足せるのは名簿の人だけです)', 'warn'); return; }
-    var ask = (fromSupplier ? '代表の仕入先と同じ名前' : '') + '「' + name + '」を新しいメーカーとして名簿に登録しますか？\n(登録すると、ほかの商品でも選べるようになります)';
+    if (!P.canCreate) { say('この' + NOUN + 'は名簿にありません (名簿に足せるのは名簿の人だけです)', 'warn'); return; }
+    var ask = (fromSupplier ? '代表の仕入先と同じ名前' : '') + '「' + name + '」を' + (own ? '自社ブランド' : '新しい' + NOUN) + 'として名簿に登録しますか？\n(登録すると、ほかの商品でも選べるようになります)';
     if (!window.confirm(ask)) { say('登録しませんでした', ''); return; }
-    var k = norm(name);
+    var k = norm(name) + (own ? '|own' : '');
     if (!lastReq || lastReq.k !== k) lastReq = { k: k, id: uuid() };
     // 待つ間は前に選んでいたメーカーを使わない (隠した欄を空に = 保存も「あと N つ」も止まる・#maker Codex R2 M)。
     //   前の「入力なし」も外す (メーカーを決めに行った = 返事が来るまで決まっていない・#maker Codex R3 M)
-    var nb = document.querySelector('input[type="checkbox"][data-none="maker"]');
+    var nb = document.querySelector(NONE_SEL);
     if (nb && nb.checked) { nb.checked = false; nb.dispatchEvent(new Event('change', { bubbles: true })); }
     setVal(null, true); inp.value = name;
     var my = gen;
     busy = true; say('登録しています…', 'info');
     if (sameBtn) sameBtn.disabled = true;
     recount();
-    fetch(BASE + '/api/makers', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ request_id: lastReq.id, name: name }) })
+    fetch(BASE + K.api, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(K.own ? { request_id: lastReq.id, name: name, own: !!own } : { request_id: lastReq.id, name: name }) })
       .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
       .then(function (x) {
         busy = false; if (sameBtn) sameBtn.disabled = false;
         lastReq = null;   // 返事が来た = 次は新しい番号
-        if (!x.r.ok || !x.j.ok || !x.j.maker) { say(x.j.error || ('登録できませんでした (HTTP ' + x.r.status + ')'), 'err'); recount(); return; }   // 失敗も数え直す (待つ間に選び直した値で保存できるように・#maker Codex R4 M)
-        var m = add(x.j.maker);
+        if (!x.r.ok || !x.j.ok || !x.j[K.key]) { say(x.j.error || ('登録できませんでした (HTTP ' + x.r.status + ')'), 'err'); recount(); return; }   // 失敗も数え直す (待つ間に選び直した値で保存できるように・#maker Codex R4 M)
+        var m = add(x.j[K.key]);
         // 待つ間に人が選び直した (入力なし・別のメーカー・打ち直し・まとまりの選び直し) = 名簿に足しただけで選ばない (後から選んだ値を上書きしない・#maker Codex R2 M)
         if (gen !== my || clean(inp.value) !== name) { say('「' + m.name + '」を名簿に登録しました (待つ間に選び直したので、この欄には入れていません)', 'info'); recount(); return; }
         setVal(m);
-        say(x.j.existed ? '名簿にもうある「' + m.name + '」を選びました (同じ名前と見なしました)' : '「' + m.name + '」を名簿に登録して選びました', 'ok');
+        say(x.j.existed ? '名簿にもうある「' + m.name + '」を選びました (同じ名前と見なしました' + (K.own && !!own !== m.own ? '・自社ブランドの印は名簿のまま = ' + (m.own ? '自社' : '自社でない') : '') + ')'
+          : '「' + m.name + '」を名簿に' + (own ? '自社ブランドとして' : '') + '登録して選びました', 'ok');
       })
       .catch(function () { busy = false; if (sameBtn) sameBtn.disabled = false; recount(); say('通信できませんでした。もう一度押してください (同じ名前は 2 つ登録されません)', 'err'); });
   }
@@ -189,7 +212,30 @@
     var s = supplierName();
     if (!s.code) { say('先に代表の仕入先を選んでください', 'warn'); var sel = P.supplierSel ? $(P.supplierSel) : null; if (sel && !sel.disabled) sel.focus(); return; }
     if (!clean(s.name)) { say('仕入先 ' + s.code + ' の名前が分かりません (打って選んでください)', 'warn'); return; }
-    createAndPick(s.name, true);
+    createAndPick(s.name, true, false);
+  });
+
+  /* ---------- 🆕 0088: 自社ブランドの印 (ブランドだけ・名簿の行をその場で変える = 保存の箱とは別・このブランドの全部の商品に効く) ---------- */
+  var ownBusy = false;
+  var ownReq = null;   // { k, id } 通信が切れたときの押し直し = 同じ番号
+  if (ownBtn && !ownBtn.disabled) ownBtn.addEventListener('click', function () {
+    var m = picked && byId(picked.id);
+    if (!m || ownBusy) return;
+    var to = !m.own;
+    if (!window.confirm('「' + m.name + '」を' + (to ? '自社ブランドにしますか？' : '自社ブランドから外しますか？') + '\n(名簿の印なので、このブランドの全部の商品に効きます。すぐに名簿に残ります)')) return;
+    var k = m.id + '|' + to;
+    if (!ownReq || ownReq.k !== k) ownReq = { k: k, id: uuid() };
+    ownBusy = true; ownBtn.disabled = true; say('自社ブランドの印を変えています…', 'info');
+    fetch(BASE + K.api + '/own', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ request_id: ownReq.id, brand_id: m.id, own: to, seen_own: m.own }) })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
+      .then(function (x) {
+        ownBusy = false; ownBtn.disabled = false; ownReq = null;
+        if (!x.r.ok || !x.j.ok || !x.j.brand) { say(x.j.error || ('変えられませんでした (HTTP ' + x.r.status + ')'), 'err'); return; }
+        add(x.j.brand);
+        ownShow();
+        say('「' + x.j.brand.name + '」を' + (x.j.brand.own ? '自社ブランドにしました' : '自社ブランドから外しました'), 'ok');
+      })
+      .catch(function () { ownBusy = false; ownBtn.disabled = false; say('通信できませんでした。もう一度押してください', 'err'); });
   });
 
   /* ---------- 欄の動き ---------- */
@@ -199,10 +245,13 @@
       // 打ち直した = 選んでいたメーカーはやめる (打った名前は残す・選ぶまで値にしない)。変換中も探す (確定の前から候補が出る)
       if (picked && inp.value !== picked.name) setVal(null, true);
       // 🆕 #maker Codex R1: 「入力なし」のまま名前を打った = 入力なしを外す (選ぶまで「あと N つ」に残す = 打った名前が黙って捨てられない)
-      var nb = document.querySelector('input[type="checkbox"][data-none="maker"]');
+      var nb = document.querySelector(NONE_SEL);
       if (nb && nb.checked && clean(inp.value)) { nb.checked = false; nb.dispatchEvent(new Event('change', { bubbles: true })); }
       say('');
       render();
+      // 🆕 0088: 「打っただけで選んでいない」が変わった = 画面に数え直してもらう (まとまりの画面は欄の input で数え直さない = すすみぐあいに出す・消す)
+      var pn = !!clean(inp.value) && !picked;
+      if (pn !== lastPend) { lastPend = pn; recount(); }
     });
     inp.addEventListener('compositionend', function (e) { imeEndAt = e.timeStamp; render(); });
     inp.addEventListener('keyup', function () { imeEndAt = -1; });
@@ -223,7 +272,7 @@
       setTimeout(function () {
         if (document.activeElement === inp || busy) return;   // 名簿に足す返事を待つ間 (「仕入先と同じ」を押した) = 一言を上書きしない
         close();
-        if (clean(inp.value) && !picked) { say('一覧から選ぶか「新しいメーカーとして登録」を押してください (選ぶまでメーカーは入りません)', 'warn'); inp.setAttribute('aria-invalid', 'true'); }
+        if (clean(inp.value) && !picked) { say('一覧から選ぶか「新しい' + NOUN + 'として登録」を押してください (選ぶまで' + NOUN + 'は入りません)', 'warn'); inp.setAttribute('aria-invalid', 'true'); }
         else if (!clean(inp.value) && inp.value) inp.value = '';
       }, 0);
     });
@@ -232,13 +281,14 @@
     list.addEventListener('click', function (e) { var o = e.target.closest('.co'); if (o) choose(Number(o.getAttribute('data-i'))); });
   }
   // 「入力なし」を押した (me-none.js が隠した欄を空にする) = 名前の欄も空に
-  hid.addEventListener('change', function () { if (!hid.value && picked) { picked = null; inp.value = ''; close(); recount(); } });
+  hid.addEventListener('change', function () { if (!hid.value && picked) { picked = null; inp.value = ''; close(); ownShow(); recount(); } });
   document.addEventListener('change', function (e) {
     var t = e.target;
-    if (t && t.matches && t.matches('input[type="checkbox"][data-none="maker"]') && t.checked) { gen++; picked = null; inp.value = ''; close(); say(''); inp.setAttribute('aria-invalid', 'false'); }
+    if (t && t.matches && t.matches(NONE_SEL) && t.checked) { gen++; picked = null; inp.value = ''; close(); say(''); inp.setAttribute('aria-invalid', 'false'); ownShow(); }
   });
+  ownShow();
 
-  ME.maker = {
+  ME[K.key] = {
     /** 名簿の番号 → 名前 (空 = なし) */
     label: function (id) { if (!id) return 'なし'; var m = byId(id); return m ? m.name : (picked && picked.id === String(id) ? picked.name : '(番号 ' + id + ')'); },
     /** 番号で選ぶ。名簿に無い番号 (画面を開いた後にほかの人が足した) = 前の値を残さず空にして選び直してもらう (#maker Codex R2 M) */
@@ -246,14 +296,14 @@
       var m = byId(id);
       if (m) { setVal(m); say(''); return; }
       setVal(null); close();
-      say('写すメーカー (番号 ' + id + ') は画面を開いた後に名簿に足されたので、ここでは出せません。打って選んでください (画面を開き直すと出ます)', 'warn');
+      say('写す' + NOUN + ' (番号 ' + id + ') は画面を開いた後に名簿に足されたので、ここでは出せません。打って選んでください (画面を開き直すと出ます)', 'warn');
     },
     /** 隠した欄の値に名前の欄を合わせる (画面の「元に戻す」の後) */
-    sync: function () { var m = byId(hid.value); picked = m; inp.value = m ? m.name : ''; close(); say(''); },
+    sync: function () { var m = byId(hid.value); picked = m; inp.value = m ? m.name : ''; close(); say(''); ownShow(); },
     value: function () { return hid.value; },
     /** 名前を打ったが一覧から選んでいない (= 保存しても入らない・商品の画面は保存を止める・#maker Codex R1) */
     pending: function () { return busy || (!!clean(inp.value) && !picked); },
     /** メーカーを空にする (まとまりを選び直したとき) */
     clear: function () { setVal(null); say(''); close(); },
   };
-})();
+});

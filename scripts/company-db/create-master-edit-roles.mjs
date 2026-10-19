@@ -58,6 +58,12 @@
  * 🆕 0084 (メーカー・中原さん 2026-10-17): master_edit に名簿・商品ごとのメーカー・記録の 3 つの表の select (MAKER_SELECT) と、名簿に足す・商品に付ける の 2 つの関数と
  *   名前の形の 2 つ (掃除・同じと見る形 = 読むだけ) の実行 (MAKER_EDIT_FUNCTIONS)。表が無い DB (0084 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
  *   🚨 渡さない: 3 つの表の insert / update / delete (関数だけが書く)・守りの trigger・名前の問題の部品 (MAKER_OWNER_ONLY_FUNCTIONS)
+ * 🆕 0085 (商品ごとの入出庫履歴と月別のまとめ・CompanyDB構想 26): master_edit に読むだけの関数 4 つの実行 (MOVEMENT_FUNCTIONS)。出荷の表の select は渡さない
+ * 🆕 0086 (販売数のグラフ・10/17 中原さん): master_edit に読むだけの関数 1 つの実行 (SALES_CHART_FUNCTIONS)。注文の表の select は渡さない
+ * 🆕 0088 (ブランド・商品の段階・中原さん 2026-10-17): master_edit にブランドの名簿・商品ごとのブランド・商品の段階と記録の表の select (BRAND_LIFE_SELECT) と、
+ *   名簿に足す・自社ブランドの印・商品に付ける (ブランド・段階) の 4 つの関数と、初めて売った日・記録の始まりを読む 2 つ (注文・出荷の表は読ませない) の実行 (BRAND_LIFE_EDIT_FUNCTIONS)。
+ *   表が無い DB (0088 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
+ *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・要求の控え ops.brand_requests の select・守りの trigger・商品の行を確かめる部品 (BRAND_LIFE_OWNER_ONLY_FUNCTIONS)
  *
  * 🚨 パスワード (#1563 仮レビュー Low 2): 流し直しても、もうあるロールのパスワードは変えない (門のロールは Render と miniPC の両方が使う =
  *    黙って変えると門の記録が書けなくなり、切替が進められない)。パスワードを付けるのは、ロールを初めて作るときと --rotate-password <ロール> を付けたときだけ
@@ -251,7 +257,18 @@ export const ORDER_OUTBOX_SELECT = Object.freeze(['ops.order_settings_outbox', '
 export const ORDER_OUTBOX_EDIT_FUNCTIONS = Object.freeze(['ops.enqueue_order_settings(uuid, text, jsonb)',
   'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer, uuid[])', 'ops.finish_order_settings_event(uuid, text, text, jsonb, text)',
   'ops.dismiss_order_settings_event(uuid, text, text)']);
-export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()']);
+// 🆕 0089: ops.order_settings_payload_versions() = v2 の印 (アプリは「あるか」だけを見る = 実行権は持ち主だけ)
+export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()', 'ops.order_settings_payload_versions()']);
+/**
+ * 🆕 0087 (梱包の 縦・横・高さ・重さ・中原さん 2026-10-17): master_edit に人の値・記録の表とまとめた値のビューの select (PACKAGE_SELECT)・
+ *   出どころの値 (夜間ロードが書く core.product_physicals) の select (PACKAGE_SOURCE_SELECT・ほかのロールの権限は触らない)・人の値を書く関数の実行 (PACKAGE_EDIT_FUNCTIONS)。
+ *   表・関数が無い DB (0087 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
+ *   🚨 渡さない: 表の insert / update / delete (関数だけが書く)・守りの trigger (PACKAGE_OWNER_ONLY_FUNCTIONS)
+ */
+export const PACKAGE_SELECT = Object.freeze(['core.product_packages', 'ops.product_package_events', 'core.v_product_packages']);
+export const PACKAGE_SOURCE_SELECT = Object.freeze(['core.product_physicals']);
+export const PACKAGE_EDIT_FUNCTIONS = Object.freeze(['ops.set_product_package(uuid, text, bigint, integer, integer, integer, integer, bigint, text, text)']);
+export const PACKAGE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_package_tables()']);   // core.package_source_rank はビューの中で読む人の権限で呼ばれる = 外さない
 /**
  * 🆕 0078 (ロジザードに送るバーコードの決め方・CompanyDB構想 23・中原さんの決定 10/13 夜): master_edit に決め方の表の select (商品の画面) と、
  *   決め方を書く関数の実行 (新商品の登録の取引の中・商品の画面)。表・関数が無い DB (0078 の前) では付けない (流し直すと付く)。
@@ -277,6 +294,23 @@ export const MAKER_SELECT = Object.freeze(['core.makers', 'core.product_makers',
 export const MAKER_EDIT_FUNCTIONS = Object.freeze(['ops.create_maker(uuid, text, text)', 'ops.set_product_maker(uuid, text, bigint, bigint, bigint, text, text)',
   'core.maker_name_clean(text)', 'core.maker_name_norm(text)']);
 export const MAKER_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_maker_tables()', 'ops.maker_name_problem(text)']);
+/**
+ * 🆕 0085 (商品ごとの入出庫履歴と月別のまとめ・CompanyDB構想 26 の PR-1・PR-2): 読むだけの関数 4 つ (security definer) を master_edit に実行だけ。
+ *   出荷の表 (core.shipments ほか)・取得の回の表 (ops.ingest_runs) の select は渡さない (送り状番号などまで読めてしまう)。関数が無い DB (0085 の前) では付けない (流し直すと付く)
+ */
+export const MOVEMENT_FUNCTIONS = Object.freeze(['ops.sku_stock_anchors(bigint, date)', 'ops.sku_shipment_totals(bigint, timestamp with time zone[])',
+  'ops.sku_movement_shipments(bigint, timestamp with time zone, timestamp with time zone, text, integer)', 'ops.sku_shipments_monthly(bigint, date)']);
+/**
+ * 🆕 0086 (販売数のグラフ・商品の画面): 日 × モールの正味の販売数 (数量だけ・金額なし) を読むだけの関数 (security definer) を master_edit に実行だけ。
+ *   注文の表 (core.orders・order_lines) の select は渡さない (注文番号・金額まで読めてしまう)。関数が無い DB (0086 の前) では付けない (流し直すと付く)
+ */
+export const SALES_CHART_FUNCTIONS = Object.freeze(['ops.sku_sales_daily(bigint, date)']);
+/** 🆕 0088 (ブランド・商品の段階): 画面が読む表・画面が実行する関数・持ち主だけの部品 */
+export const BRAND_LIFE_SELECT = Object.freeze(['core.brands', 'core.product_brands', 'core.product_lifecycle', 'ops.product_brand_events', 'ops.brand_flag_events', 'ops.product_lifecycle_events']);
+export const BRAND_LIFE_EDIT_FUNCTIONS = Object.freeze(['ops.create_brand(uuid, text, text, boolean)', 'ops.set_brand_own(uuid, text, bigint, boolean, boolean, text)',
+  'ops.set_product_brand(uuid, text, bigint, bigint, bigint, text, text)', 'ops.set_product_lifecycle(uuid, text, bigint, text, date, text, date, text, text)',
+  'ops.sku_first_sold(bigint[])', 'ops.sales_records_from()']);
+export const BRAND_LIFE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_brand_life_tables()', 'ops.brand_life_target(bigint, text)']);
 /**
  * 🆕 0099 (表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安・Company DB構想 27 ④-1): master_edit に人の値・記録の表とまとめた値のビューの select (LABEL_SELECT)・
  *   人の値を書く関数の実行 (LABEL_EDIT_FUNCTIONS)。表・関数が無い DB (0099 の前) では付けない (流し直すと付く = それまで画面は欄を出さない)。
@@ -387,6 +421,12 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const t of ORDER_OUTBOX_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...ORDER_OUTBOX_EDIT_FUNCTIONS, ...ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of ORDER_OUTBOX_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0087 (梱包の大きさ・重さ): 表・ビュー・関数がある DB だけ。人の値の表・記録・ビューは前に付けた権限を外してから画面のロールに付け直す (読むだけ・書くのは関数だけ)。
+  //   出どころの core.product_physicals は select を足すだけ (夜間ロード・ほかのロールの権限は変えない)。0087 の前の DB では付けない (表があっても画面は 0087 が無いと読まない)
+  for (const t of PACKAGE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
+  for (const t of PACKAGE_SOURCE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null and to_regclass('core.v_product_packages') is not null then execute 'grant select on ${t} to master_edit'; end if; end $$`);
+  for (const f of [...PACKAGE_EDIT_FUNCTIONS, ...PACKAGE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of PACKAGE_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   // 🆕 0078 (ロジザードのバーコードの決め方): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (表は読むだけ・書くのは関数だけ)
   for (const t of LZ_BARCODE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...LZ_BARCODE_EDIT_FUNCTIONS, ...LZ_BARCODE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
@@ -395,6 +435,17 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   for (const t of MAKER_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...MAKER_EDIT_FUNCTIONS, ...MAKER_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of MAKER_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0085 (入出庫の履歴・月別のまとめ): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (読むだけ)
+  for (const f of MOVEMENT_FUNCTIONS) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of MOVEMENT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0086 (販売数のグラフ): 同じ形 (関数がある DB だけ・前に付けた実行権を外してから画面のロールに付け直す)
+  for (const f of SALES_CHART_FUNCTIONS) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of SALES_CHART_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0088 (ブランド・商品の段階): 表・関数がある DB だけ。前に付けた権限を外してから画面のロールに付け直す (表は読むだけ・書くのは関数だけ・要求の控えは読ませない)
+  for (const t of [...BRAND_LIFE_SELECT, 'ops.brand_requests']) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; end if; end $$`);
+  for (const t of BRAND_LIFE_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'grant select on ${t} to master_edit'; end if; end $$`);
+  for (const f of [...BRAND_LIFE_EDIT_FUNCTIONS, ...BRAND_LIFE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of BRAND_LIFE_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   // 🆕 0099 (表示の項目): 表・ビュー・関数がある DB だけ。人の値の表・記録・ビューは前に付けた権限を外してから画面のロールに付け直す (読むだけ・書くのは関数だけ)
   for (const t of LABEL_SELECT) s.push(`do $$ begin if to_regclass('${t}') is not null then execute 'revoke all on ${t} from ${all}'; execute 'grant select on ${t} to master_edit'; end if; end $$`);
   for (const f of [...LABEL_EDIT_FUNCTIONS, ...LABEL_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));

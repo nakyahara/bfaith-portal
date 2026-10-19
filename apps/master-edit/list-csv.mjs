@@ -12,6 +12,24 @@
  */
 import { fmtJst, fmtDay } from './ui-format.mjs';
 import { PLATFORM_FEE_RATES, ratePct1 } from '../../lib/profit-estimate.js';
+import { LIFE_STAGES } from '../../lib/master-brand-life.mjs';
+import { PACKAGE_AXES, sourceWords } from '../../lib/master-package.mjs';
+
+/** 🆕 0087: mm → cm の数 (小数 1 けた)。無い = null */
+const cmNum = (mm) => (mm == null ? null : Math.round(Number(mm)) / 10);
+/** 🆕 0087: 軸ごとの出どころの言葉 (同じ出どころの軸はまとめる)。例「縦・横・高さ = 人 / 重さ = FBA 納品 (実測)」 */
+function pkgSourcesText(p) {
+  if (!p) return '';
+  const by = new Map();
+  for (const a of PACKAGE_AXES) {
+    const src = p.sources && p.sources[a.axis];
+    if (!src || p[a.axis] == null) continue;
+    const w = sourceWords(src, p.refs && p.refs[a.axis]);
+    if (!by.has(w)) by.set(w, []);
+    by.get(w).push(a.label);
+  }
+  return [...by].map(([w, ls]) => `${ls.join('・')} = ${w}`).join(' / ');
+}
 
 export const KIND_LABELS = Object.freeze({ single: '単品', set: 'セット', exception: '例外' });
 const SALES_LABELS = Object.freeze({ 1: '1 自社', 2: '2 取引先限定', 3: '3 仕入', 4: '4 輸出' });
@@ -75,6 +93,18 @@ export function buildListCsv(data, extras, { poOk = false, nowMs = Date.now(), r
     ['商品コードの注意', (r) => r.code_note || ''],
     // 🆕 0084 (2026-10-17): メーカー (Company DB だけの値・単品だけ・セットは空)。前の列の並びは変えない (最後に足す)
     ['メーカー', (r) => r.maker || ''],
+    // 🆕 0087: 梱包した状態の 縦・横・高さ (cm)・重さ (g) = まとめた値 (人 → 出どころの順位 → 新しい順)・出どころ (単品だけ・無い = 空)。最後に足す
+    ['梱包の縦 (cm)', (r) => cmNum(r.pkg && r.pkg.length_mm)],
+    ['梱包の横 (cm)', (r) => cmNum(r.pkg && r.pkg.width_mm)],
+    ['梱包の高さ (cm)', (r) => cmNum(r.pkg && r.pkg.height_mm)],
+    ['梱包の重さ (g)', (r) => (r.pkg && r.pkg.weight_g != null ? r.pkg.weight_g : null)],
+    ['大きさ・重さの出どころ', (r) => pkgSourcesText(r.pkg)],
+    // 🆕 0088 (2026-10-17): ブランド・自社ブランド・定番 / 季節 / 試し・終売の予定日 (Company DB だけの値・単品だけ)。メーカーの後ろに足す (前の列の並びは変えない)。
+    //   発売日 (初めて売った日) は出さない (全部の商品の注文・出荷を読むと重い = 商品の画面だけ)
+    ['ブランド', (r) => r.brand || ''],
+    ['自社ブランド', (r) => (r.brand ? (r.brand_own ? '自社' : '') : '')],
+    ['定番/季節/試し', (r) => (r.life_stage ? LIFE_STAGES[r.life_stage] || r.life_stage : '')],
+    ['終売の予定日', (r) => (r.end_planned_on ? r.end_planned_on.replace(/-/g, '/') : '')],
   ];
   const lines = [cols.map(([h]) => csvCell(h)).join(',')];
   for (const r of data.rows) lines.push(cols.map(([, f]) => csvCell(f(r))).join(','));

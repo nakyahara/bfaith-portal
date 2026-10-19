@@ -372,16 +372,18 @@ await ta('[L1] 一覧のメーカーの列 (いつもの列に出さない・出
   assert.ok(COLS.COLUMN_IDS.includes('maker'));
   assert.ok(!COLS.DEFAULT_VIEW.shown.includes('maker'));
   assert.ok(!COLS.SORTABLE.includes('maker'));
-  assert.equal(COLS.COLUMN_IDS.at(-1), 'maker', '前の列の並びを変えない (最後に足す)');
+  assert.equal(COLS.COLUMN_IDS[COLS.COLUMN_IDS.indexOf('flags') + 1], 'maker', '前の列の並びを変えない (対応が必要の後ろに足す・🆕 0088 の列はその後ろ)');
   const data = await asEditor(() => RD.listSkus(db, RD.normalizeFilters({ q: 'mk-r1' }), { mode: 'all' }));
   const row = data.rows.find((r) => r.code === 'mk-r1');
   assert.equal(row.maker, 'はちみつ 本舗');
   const csv = CSV.buildListCsv(data, {}, {});
   const lines = csv.replace(/^﻿/, '').trim().split('\r\n');
   const head = lines[0].split(',');
-  assert.equal(head.at(-1), '"メーカー"');
-  assert.equal(head.at(-2), '"商品コードの注意"');
-  assert.ok(lines.find((l) => l.startsWith('"mk-r1"')).endsWith('"はちみつ 本舗"'));
+  // 🆕 0088: メーカーの後ろにブランドなどの列が続く (メーカーは「商品コードの注意」のすぐ後ろのまま)
+  const iMaker = head.indexOf('"メーカー"');
+  assert.ok(iMaker > 0, 'メーカーの列が無い');
+  assert.equal(head[iMaker - 1], '"商品コードの注意"');
+  assert.equal(lines.find((l) => l.startsWith('"mk-r1"')).split(',')[iMaker], '"はちみつ 本舗"');
   const list = await call('GET', '/?q=mk-r1');
   assert.match(list.text, /<td data-col="maker" hidden>はちみつ 本舗<\/td>/);
   const page = await call('GET', '/new?kind=single');
@@ -417,7 +419,7 @@ await ta('[B1] ロールの流し直しの前 (master_edit に関数の実行が
   try {
     assert.equal(await MK.makerReady(db), false);
     const page = await call('GET', '/new?kind=single');
-    assert.ok(!/data-row="maker"/.test(page.text) && !/me-maker\.js/.test(page.text), '欄が出ている');
+    assert.ok(!/data-row="maker"/.test(page.text) && !/id="me-maker"/.test(page.text), '欄が出ている');   // 🆕 0088: me-maker.js はブランドの欄にも使う = 名簿の JSON で見る
     // 古い画面と同じ = メーカーを送らない・入力なしの印も無い = 通る (数えない)
     const b = single('mk-b1'); b.blanks = b.blanks.filter((k) => k !== 'maker');
     B1_BODY = b;

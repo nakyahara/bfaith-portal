@@ -231,15 +231,26 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     }
     plan.suppliers = [...supMap.values()];
     const ssKeys = new Set();
+    // 🆕 ⑤-3 (CompanyDB構想 27 §2.4 の 7・11): 先方品番・入数の写しは発注アプリ (正本) と同じにする = engine が「行がある組はそのまま・無い組は空」に合わせる。
+    //   plan.vendorMap = 対応表を読めたか・生の行の (仕入先, 商品) を正規化した組 (SKU・仕入先の解決に頼らない = 解決できなかった行の写しを消さない)。
+    //   入数は列 (core.supplier_skus.stock_units_per_order_unit) が integer なので、整数のときだけ写す。整数でない = 写しは空 + 数を報告に出す
+    //   (写しの入数が空でも「発注アプリで未設定」とは限らない・読む側の約束)
+    plan.vendorMap = { read: false, rows: 0, pairs: [], nonInteger: [] };
     if (hasTable(mirror, 'po_vendor_code_map')) {
       const vc = rows(mirror, 'select * from po_vendor_code_map');
       src.po_vendor_code_map = vc.length;
+      plan.vendorMap.read = true;
+      plan.vendorMap.rows = vc.length;
       for (const r of vc) {
         const sc = s(r.supplier_code) ? canonicalSupplierCode(s(r.supplier_code)) : null, pc = s(r.product_code); if (!sc || !pc) continue;
         ssKeys.add(`${normSku(sc)}|${normSku(pc)}`);
+        plan.vendorMap.pairs.push([normSku(sc), normSku(pc)]);
+        const q = n(r.qty_per_unit);
+        if (q != null && !(q > 0 && Number.isInteger(q))) plan.vendorMap.nonInteger.push({ supplier: sc, sku: pc, qty_per_unit: q });
         // 商品コードは NE の表記に寄せる (発注アプリ 'REVIEW1' / NE 'review1' でも同じ SKU に付く。engine は原文一致で SKU を引くため)
-        plan.supplierSkus.push({ supplierCode: sc, skuCode: skuByNorm.get(normSku(pc))?.code ?? pc, vendorCode: s(r.vendor_code), stockUnitsPerOrderUnit: n(r.qty_per_unit) > 0 && Number.isInteger(n(r.qty_per_unit)) ? n(r.qty_per_unit) : null });
+        plan.supplierSkus.push({ supplierCode: sc, skuCode: skuByNorm.get(normSku(pc))?.code ?? pc, vendorCode: s(r.vendor_code), stockUnitsPerOrderUnit: q > 0 && Number.isInteger(q) ? q : null, fromVendorMap: true });
       }
+      src.po_vendor_code_map_qpu_non_integer = plan.vendorMap.nonInteger.length;
     }
     for (const sku of plan.skus) {
       if (!sku.supplierCode) continue;

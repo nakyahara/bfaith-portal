@@ -456,6 +456,8 @@
       NONE_ITEMS.forEach(function (x) { if (!S.conflicts[x[3]] || S.picks[x[3]]) need(x[0], x[1], x[2], 5); });
       // 🆕 0084: メーカー (全部の子に同じ値・値 = 名簿から選んだ = 打っただけでは値でない)。欄がある (0084 がある DB) ときだけ
       need('maker', 'メーカー (一覧から選ぶ)', '#f-maker-in', 5);
+      // 🆕 0088: ブランドは必須でない (数えない)。打っただけで一覧から選んでいない = 保存を止める (黙って捨てない)
+      if (ME.brand && ME.brand.pending()) Pi(5, 'miss', 'ブランドを一覧から選ぶ (入れないときは欄を空に)', '#f-brand-in');
       if (ME.orderSettings && ME.orderSettings.items) ME.orderSettings.items().forEach(function (x) { if (x.none) noneKeys.push(x.key); else if (!x.ok) Pi(5, 'miss', '発注の設定: ' + x.t + ' (値か「入力なし」)', x.focus); });
       NONE_CARD.forEach(function (x) { need(x[0], x[1], x[2], 5); });
       if (n && !janAll) need('children.jan', 'JAN の無い子 (' + live.filter(function (k) { return !k.jan; }).length + ' 件)', '#row-jan-none', 6);
@@ -837,11 +839,12 @@
       ['作る商品', '<b>' + m.n + ' 件</b> · JAN あり ' + jans + ' 件 · ほかは共通の値どおり'],
       ['共通と違う所', ex.length ? list(ex, 12) : 'なし'],
       ['作らない商品', offs.length ? list(offs.map(function (k) { return '<span class="mono">' + esc(k.code) + '</span> ' + esc(k.h.name + (k.v ? ' × ' + k.v.name : '')) + (k.prev ? ' (前回も作らなかった)' : ''); }), 12) : 'なし'],
-      ['共通の欄', '売価 ' + (m.cp ? yen(m.cp) + ' 円' : '—') + (m.cc != null && !Number.isNaN(m.cc) ? ' · 原価 ' + yen(m.cc) + ' 円' : ' · 原価はあとで') + ' · 税 ' + fv('tax', S.common.tax) + ' · 仕入先 ' + esc(fv('supplier', S.common.supplier)) + (ME.maker ? ' · メーカー ' + esc(ME.maker.label($('#f-maker') ? $('#f-maker').value : '')) : '')],
+      ['共通の欄', '売価 ' + (m.cp ? yen(m.cp) + ' 円' : '—') + (m.cc != null && !Number.isNaN(m.cc) ? ' · 原価 ' + yen(m.cc) + ' 円' : ' · 原価はあとで') + ' · 税 ' + fv('tax', S.common.tax) + ' · 仕入先 ' + esc(fv('supplier', S.common.supplier)) + (ME.maker ? ' · メーカー ' + esc(ME.maker.label($('#f-maker') ? $('#f-maker').value : '')) : '') + brandLifeSummary()],
       ['発注の設定', po ? '発注アプリへ (全部の子に同じ値)' : 'なし (あとで商品の画面で)'],
       ['入力なし', m.noneKeys.length ? esc(m.noneKeys.map(function (k) { return (P.blankLabels && P.blankLabels[k] ? P.blankLabels[k].label : k); }).join('・')) + ' <span class="hint aux">(わざと空けた = 登録の記録に残ります)</span>' : 'なし (全部の項目に値)'],
       ['出品カード', 'まとまりで 1 枚' + (m.ac === 2 ? ' (2 軸なので出品は止めたまま)' : '')],
-    ].concat(document.getElementById('np-lbl-country') ? [['表示の項目', (function () { var lb = labelBody(); return lb ? esc([lb.country, lb.net ? lb.net + (lb.net_uom || '') : '', lb.shelf ? lb.shelf + ' 日' : ''].filter(Boolean).join(' · ')) + ' (全部の子に同じ値)' : 'なし (あとで商品の画面で)'; })()]] : [])   // 🆕 0099 (欄があるときだけ)
+    ].concat(document.getElementById('np-length') ? [['大きさ・重さ', (function () { var pk = pkgBody(); return pk ? esc([pk.length, pk.width, pk.height].map(function (x) { return x || '?'; }).join(' × ') + ' cm · ' + (pk.weight ? pk.weight + ' g' : '重さ なし')) + ' (全部の子に同じ値)' : 'なし (あとで商品の画面で)'; })()]] : [])   // 🆕 0087 (欄があるときだけ)
+      .concat(document.getElementById('np-lbl-country') ? [['表示の項目', (function () { var lb = labelBody(); return lb ? esc([lb.country, lb.net ? lb.net + (lb.net_uom || '') : '', lb.shelf ? lb.shelf + ' 日' : ''].filter(Boolean).join(' · ')) + ' (全部の子に同じ値)' : 'なし (あとで商品の画面で)'; })()]] : [])   // 🆕 0099 (欄があるときだけ)
       .concat(S.nextOpts.length ? [['次に足す' + unitOf(m), S.nextOpts.length + ' ' + unitOf(m) + ' (今回は保存しない · 保存の後に続けて足す)']] : []);
   }
 
@@ -1041,6 +1044,7 @@
       var mks = rows.map(function (k) { return String((k.values && k.values.maker) || ''); });
       if (mks.length && mks[0] && mks.every(function (x) { return x === mks[0]; })) ME.maker.set(mks[0]); else ME.maker.clear();
     }
+    copyBrandLife(rows);   // 🆕 0088: ブランド・区分・終売の予定日も同じ (全部の子で同じ = 写す・違う / 無い = 空)
   }
   var pickSeq = 0;
   function pickGroup(id, then) {
@@ -1115,6 +1119,7 @@
       if (k === 'name') { e.manual = true; e.name = t.value; } else e[k] = t.value;
       light(); return;
     } else if (t.closest && t.closest('#sec-order, #sec-card')) { light(); return; }
+    else if (/^np-(length|width|height|weight)$/.test(id)) { light(); return; }   // 🆕 0087: 大きさ・重さ (未保存の数・確かめの中身を数え直す)
     else if (/^np-lbl-(country|net|net-uom|shelf)$/.test(id)) { light(); return; }   // 🆕 0099: 表示の項目 (未保存の数・確かめの中身を数え直す)
     else return;
     update();
@@ -1243,11 +1248,11 @@
     if (d.act === 'again') { if (ME.replacePage) ME.replacePage(BASE + '/new?kind=variation'); else location.replace(BASE + '/new?kind=variation'); return; }
     if (S.done && !d.go && !d.stepnav && !d.filter && !d.open) return;
     // 🆕 0084 (#maker Codex R2 M): 種類を切り替える・選び直す = メーカーも空に (ほかの共通の欄 = S.common と同じく前のまとまりの値を持ち越さない)
-    if (d.mode) { if (S.mode !== d.mode) { var keep = { gcode: S.gcode, gname: S.gname }; S = fresh(); S.mode = d.mode; if (d.mode === 'new') Object.assign(S, keep); else searchGroups(); if (ME.maker) ME.maker.clear(); full(); } return; }
+    if (d.mode) { if (S.mode !== d.mode) { var keep = { gcode: S.gcode, gname: S.gname }; S = fresh(); S.mode = d.mode; if (d.mode === 'new') Object.assign(S, keep); else searchGroups(); if (ME.maker) ME.maker.clear(); copyBrandLife([]); full(); } return; }
     if (d.pick) return pickGroup(d.pick);
     if (d.gotopick) { S.mode = 'add'; return pickGroup(d.gotopick); }
     if (d.act === 'rename') { if (S.pk && ME.vops) { var gid0 = S.pk.id; ME.vops.openLabels(gid0, { onDone: function () { refreshGroup(gid0); } }); } return; }
-    if (d.act === 'repick') { S = fresh(); S.mode = 'add'; if (ME.maker) ME.maker.clear(); full(); searchGroups(); setTimeout(function () { $('#g-q').focus(); }, 0); return; }
+    if (d.act === 'repick') { S = fresh(); S.mode = 'add'; if (ME.maker) ME.maker.clear(); copyBrandLife([]); full(); searchGroups(); setTimeout(function () { $('#g-q').focus(); }, 0); return; }
     if (d.act === 'split') return doSplit();
     if (d.act === 'unsplit') return unSplit();
     if (d.act === 'janpaste') { S.janPaste = !S.janPaste; S.janMsg = ''; update(); if (S.janPaste) setTimeout(function () { var jp = $('#jan-paste'); if (jp) jp.focus(); }, 0); return; }
@@ -1283,6 +1288,23 @@
   // 登録 1 回に 1 つ (通信が切れて押し直しても 2 回入らない)。返事が来た後にもう一度押すときは新しい番号
   var requestId = uuid();
   var val = function (id) { var e = document.getElementById(id); return e ? e.value.trim() : ''; };
+  /* ---------- 🆕 0088: ブランド・区分・終売の予定日 (共通の欄の 1 つの塊・必須でない) ---------- */
+  /** 今あるまとまりの子の値を写す (全部の子で同じ = 写す・違う / 無い子がある = 空 = 前のまとまりの値を持ち越さない)。rows = [] = 空にする */
+  function copyBrandLife(rows) {
+    var same = function (k) { var xs = rows.map(function (r) { return String((r.values && r.values[k]) || ''); }); return xs.length && xs[0] && xs.every(function (x) { return x === xs[0]; }) ? xs[0] : ''; };
+    if (ME.brand) { var b = same('brand'); if (b) ME.brand.set(b); else ME.brand.clear(); }
+    ['life_stage', 'end_planned_on'].forEach(function (k) { var el = $('#f-' + k); if (el) el.value = same(k); });
+  }
+  /** 確かめの窓の「共通の欄」に足す言葉 (欄が無い = '') */
+  function brandLifeSummary() {
+    var out = '';
+    if (ME.brand) out += ' · ブランド ' + esc(ME.brand.label($('#f-brand') ? $('#f-brand').value : ''));
+    var st = $('#f-life_stage');
+    if (st) out += ' · 区分 ' + esc(st.value ? st.options[st.selectedIndex].text : 'なし');
+    var en = $('#f-end_planned_on');
+    if (en) out += ' · 終売の予定日 ' + esc(en.value ? en.value.replace(/-/g, '/') : 'なし');
+    return out;
+  }
   function collect(m) {
     var C = S.common;
     var values = { standard_price: C.price, tax_rate: C.tax, sales_class: C.sales, primary_supplier: C.supplier, reorder_months: C.months, expiry_managed: C.expiry };
@@ -1291,6 +1313,8 @@
     if (String(C.cost).trim() !== '') values.cost = { jpy: C.cost };
     // 🆕 0084: メーカー (隠した欄 = 名簿の番号・欄が無い / 選んでいない = 送らない)
     var mkEl = $('#f-maker'); if (mkEl && mkEl.value) values.maker = mkEl.value;
+    // 🆕 0088: ブランド (隠した欄 = 名簿の番号)・区分・終売の予定日 (欄が無い / 空 = 送らない)
+    ['brand', 'life_stage', 'end_planned_on'].forEach(function (k) { var el = $('#f-' + k); if (el && el.value) values[k] = el.value; });
     var opts = [];
     m.axes.forEach(function (ax) {
       if (m.firstTime) ax.old.forEach(function (o) { opts.push({ axis: ax.i + 1, code: o.num, name: o.name }); });
@@ -1315,11 +1339,19 @@
     if (!m.add || m.firstTime) out.axes = m.axes.map(function (ax) { return { axis: ax.i + 1, name: ax.name }; });
     // 🆕 2026-10-13: 入力なしにした項目 (サーバーがもう一度確かめて、登録の理由に残す)
     out.blanks = m.noneKeys.slice();
+    // 🆕 0087: 梱包の大きさ・重さ (全部の子に同じ値・入れなくてよい・欄が無い / 全部空 = 送らない)
+    var pk = pkgBody(); if (pk) out.package = pk;
     // 🆕 0099: 表示の項目 (全部の子に同じ値・入れなくてよい・欄が無い / 全部空 = 送らない)
     var lb = labelBody(); if (lb) out.label = lb;
     var po = ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
     return out;
+  }
+  /** 🆕 0087: 梱包の 縦・横・高さ (cm)・重さ (g) の欄 (views/_package-new.ejs) → { length, width, height, weight } (全部空・欄が無い = null = 送らない。形はサーバーが確かめる) */
+  function pkgBody() {
+    var ids = { length: 'np-length', width: 'np-width', height: 'np-height', weight: 'np-weight' }, o = {}, any = false;
+    Object.keys(ids).forEach(function (k) { var e = document.getElementById(ids[k]); var v = e && !e.disabled ? String(e.value || '').trim() : ''; o[k] = v; if (v) any = true; });
+    return any ? o : null;
   }
   /** 🆕 0099: 表示の項目の欄 (views/_label-new.ejs・まとまりは型番を聞かない) → { country, net, net_uom, shelf } (全部空・欄が無い = null = 送らない) */
   function labelBody() {
@@ -1350,7 +1382,7 @@
     if (f === 'options') return '#sec-opts';
     if (f === 'children' && j.code && M) { var k = M.kids.filter(function (x) { return norm(x.code) === norm(j.code); })[0]; return k ? '#kid-' + k.idx : '#sec-kids'; }
     if (f === 'children') return '#sec-kids';
-    var MAP = { standard_price: '#c-price', cost: '#c-cost', tax_rate: '#c-tax', sales_class: '#c-sales', primary_supplier: '#f-primary_supplier', reorder_months: '#c-months', expiry_managed: '#c-expiry', inbound_date_managed: '#c-inbound', shipping_code: '#c-ship', maker: '#f-maker-in' };
+    var MAP = { standard_price: '#c-price', cost: '#c-cost', tax_rate: '#c-tax', sales_class: '#c-sales', primary_supplier: '#f-primary_supplier', reorder_months: '#c-months', expiry_managed: '#c-expiry', inbound_date_managed: '#c-inbound', shipping_code: '#c-ship', maker: '#f-maker-in', brand: '#f-brand-in', life_stage: '#f-life_stage', end_planned_on: '#f-end_planned_on' };
     if (MAP[f]) return MAP[f];
     if (f === 'card.amazon_url' || f === 'card.asin') return '#amazon-url';
     if (f === 'children.jan') return '#row-jan-none';
@@ -1429,6 +1461,7 @@
     if (FIELDS.some(function (f) { return S.common[f] !== COMMON0[f]; }) && S.mode === 'new') items.push('共通の欄');
     if (Object.keys(S.edits).length) items.push('子の一覧の変更');
     if (ME.orderSettings && ME.orderSettings.collect()) items.push('発注の設定');
+    if (pkgBody()) items.push('大きさ・重さ');   // 🆕 0087: 大きさ・重さだけ入れた後に離れても未保存の確認を出す
     if (labelBody()) items.push('表示の項目');   // 🆕 0099: 表示の項目だけ入れた後に離れても未保存の確認を出す
     return { n: items.length, items: items, impacts: [] };
   };

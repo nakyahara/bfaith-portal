@@ -624,45 +624,40 @@ function downloadTemplate() {
 }
 
 // ===== 送料自動判定 =====
+// ⚠ サーバー側 calcFbmShippingServer (router.js) と同じ決まり。寸法・重さが分からないときは
+//   送料を決めない (cost: null・「寸法不明」「重さ不明」)。以前は '-' を 0 とみなして安い便に決めていた
 function calcFbmShipping(dims) {
   const mode = document.getElementById('fbmShippingMode').value;
-
-  // Amazon EasyShipモード
-  if (mode === 'easyship') {
-    const smallCost = parseInt(document.getElementById('easyshipSmall').value) || 165;
-    const largeCost = parseInt(document.getElementById('easyshipLarge').value) || 210;
-    const h = parseFloat(dims?.height) || 0;
-    const l = parseFloat(dims?.length) || 0;
-    const w = parseFloat(dims?.width) || 0;
-    // 最小辺を厚さとみなす（Amazonの寸法は長い順でない場合がある）
-    const minDim = (l > 0 && w > 0 && h > 0) ? Math.min(l, w, h) : h;
-
-    if (minDim === 0) {
-      // 寸法不明 → 小型(165円)をデフォルト
-      return { cost: smallCost, method: 'EasyShip小型(寸法不明)' };
-    }
-    if (minDim <= 3) {
-      return { cost: smallCost, method: 'EasyShip小型' };
-    }
-    return { cost: largeCost, method: 'EasyShip大型' };
-  }
 
   // 固定額モード
   if (mode === 'fixed') {
     return { cost: parseInt(document.getElementById('fixedShipping').value) || 0, method: '固定額' };
   }
 
-  // サイズ自動判定(フルコスト): dims = { length, width, height, weight } (cm, kg)
-  const l = parseFloat(dims?.length) || 0;
-  const w = parseFloat(dims?.width) || 0;
-  const h = parseFloat(dims?.height) || 0;
-  const weightG = (parseFloat(dims?.weight) || 0) * 1000; // kg→g
-  const threeSum = l + w + h;
+  // dims = { length, width, height, weight } (cm, kg の文字列・分からない値は '-')
+  const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+  const l = num(dims?.length) || 0;
+  const w = num(dims?.width) || 0;
+  const h = num(dims?.height) || 0;
+  if (!(l > 0 && w > 0 && h > 0)) return { cost: null, method: '寸法不明' };
 
-  if (l === 0 && w === 0 && h === 0) {
-    // 寸法不明 → ネコポス（237円）をデフォルト
-    return { cost: 237, method: 'ネコポス(寸法不明)' };
+  // Amazon EasyShipモード
+  if (mode === 'easyship') {
+    const smallCost = parseInt(document.getElementById('easyshipSmall').value) || 165;
+    const largeCost = parseInt(document.getElementById('easyshipLarge').value) || 210;
+    // 最小辺を厚さとみなす（Amazonの寸法は長い順でない場合がある）
+    if (Math.min(l, w, h) <= 3) {
+      return { cost: smallCost, method: 'EasyShip小型' };
+    }
+    return { cost: largeCost, method: 'EasyShip大型' };
   }
+
+  // サイズ自動判定(フルコスト)
+  const kg = num(dims?.weight);
+  // "0.00" (10g 未満を小数2桁に丸めた値) は「分かっていてとても軽い」なので不明にしない
+  if (kg == null || kg < 0) return { cost: null, method: '重さ不明' };
+  const weightG = kg * 1000; // kg→g
+  const threeSum = l + w + h;
 
   // 送料テーブルから条件マッチ（コスト昇順でソート済み）
   for (const s of shippingTable) {
@@ -1087,6 +1082,18 @@ function renderTable(rows) {
     if (showFbm) {
       if (r.status === 'ok' && r.fbmAmazonFee !== null && r.fbmAmazonFee !== undefined) {
         const shipping = calcFbmShipping(r.dimensions);
+        if (shipping.cost == null) {
+          // 寸法・重さが分からず送料を決められない → 利益・判定は出さない (安い便に決めつけない)
+          r._fbmShippingCost = null;
+          r._fbmShippingMethod = shipping.method;
+          r._fbmProfit = null;
+          r._fbmProfitRate = null;
+          r._fbmJudgment = null;
+          fbmHtml = `
+          <td class="num fbm-col" style="font-size:11px;">-<span class="shipping-method">${escHtml(shipping.method)}</span></td>
+          <td class="fbm-col">-</td><td class="fbm-col">-</td><td class="fbm-col">-</td>
+        `;
+        } else {
         const fbmTotalCost = r.fbmAmazonFee + shipping.cost;
         const fbmProfit = r.sellingPrice - (r.wholesalePriceWithTax || 0) - fbmTotalCost;
         const fbmProfitRate = r.sellingPrice > 0 ? Math.round((fbmProfit / r.sellingPrice * 100) * 10) / 10 : 0;
@@ -1106,6 +1113,7 @@ function renderTable(rows) {
           <td class="num fbm-col ${fbmProfitClass}" style="font-weight:bold;">${fbmProfitRate}%</td>
           <td class="fbm-col"><span class="judgment-sm ${fbmJClass}">${fbmJudgment}</span></td>
         `;
+        }
       } else {
         fbmHtml = `<td class="fbm-col">-</td><td class="fbm-col">-</td><td class="fbm-col">-</td><td class="fbm-col">-</td>`;
       }

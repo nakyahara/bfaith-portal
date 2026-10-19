@@ -2765,6 +2765,19 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   🚨 ロールを流し直した瞬間から、開いたままの古い新商品の画面 (メーカーの欄も「入力なし」も無い) の登録は「画面を開き直してください」(400) になる (ほかの「入力なし」の項目を足したときと同じ)
 - 試験 = `node scripts/test-master-maker.mjs` (名前の形・0084 の形と権限・守り・名簿・登録・まとまり・商品の画面・一覧 / CSV・夜間ロード・ロールの流し直しの前) / `test-master-maker-ui.mjs` (画面の動き・日本語入力の確定の Enter・スマホの幅)
 
+### ブランドの名簿と商品ごとのブランド・商品の段階 (区分・終売の予定日)・初めて売った日 (0088・2026-10-17 中原さん)
+- **なぜ別の表か**: `core.products.brand` (0002) は夜間ロードの属性の解決 (`engine.mjs` の 10. = qoo10 / product_hub の観測) が書く列 = ポータルで入れた値を翌朝に上書きする / 消す道がある。`own_brand` は商品の行の印 (ブランドの印ではない・持ち主の表にも無い)。
+  `release_date` も夜間ロードが書く列 (カタログの発売日) = 「初めて売った日」とは別。→ メーカー (0084) と同じく **Company DB だけの別の表** (夜間ロード・NE / ロジザード / product-hub は触らない・送らない)。mart の `p.brand` / `p.own_brand` はそのまま
+- **表** `core.brands` (名簿・`name_norm` = メーカーと同じ決まり `core.maker_name_norm`・会社の中で一意・`own_brand` = 自社ブランド) / `core.product_brands` (単品の商品の行ごとの今のブランド) /
+  `core.product_lifecycle` (区分 `stage` = staple 定番 / seasonal 季節 / trial 試し・終売の予定日 `end_planned_on`・どちらも無い = 行が無い) /
+  記録 (追記だけ) `ops.product_brand_events`・`ops.brand_requests` (名簿に足す要求の控え)・`ops.brand_flag_events` (自社ブランドの印)・`ops.product_lifecycle_events`。書くのは関数の中だけ (印 `ops.brand_life_protocol`)・TRUNCATE できない
+- **関数** `ops.create_brand(request_id, 人, 名前, 自社か)` / `ops.set_brand_own(request_id, 人, ブランド, 印, 見ていた印, 理由)` / `ops.set_product_brand(…)`・`ops.set_product_lifecycle(…)` (メーカーと同じ門 = 新商品の登録・まとまりの登録・商品の画面の保存の取引の中だけ・見ていた値と違う = version_conflict) /
+  読む `ops.sku_first_sold(sku_ids)` (初めて売った日 = NE の出荷 (受注日・platform `_ignore` の店 = FBA 納品などは数えない) とモールの注文 (出品の構成・セットの構成品 1 段) のいちばん早い日と出どころ) / `ops.sales_records_from()` (記録の始まり)。注文・出荷の表は画面のロールに読ませない
+- **必須でない**: 新商品の登録の「値か入力なし」(`lib/master-register-blanks.mjs`) に数えない = 送らなくても登録できる (送ったときだけ確かめる)
+- 当て方 (🚨 まだ流さない): 番号 = 0088 (0084 メーカー・0085 入出庫の履歴・0086 販売数のグラフ・0087 大きさ・重さの次) → **アプリを先に** → `migrate.mjs --dry-run` (この 1 本だけ・表と関数を足すだけ) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す。
+  アプリは 0088 の前・ロールの流し直しの前のどちらでも欄を出さない (`brandLifeReady`)・値が来たら 503。「入力なし」に数えないので、流し直しで開いたままの古い画面が 400 になることは無い
+- 試験 = `node scripts/test-master-brand-life.mjs` / `test-master-brand-life-ui.mjs`
+
 ### 要確認 (quarantined) の商品を確認済みにする (0079・Company DB構想 22 の Q-1・中原さんの決定 10/13 夜 Q1〜Q5 = 全部 a)
 - **なぜ**: NE で直接作られた商品 (夜間ロードが見つけた要確認・本番 10/13 = 42 件) を「確認済み」にする道が無かった (関数が not_ready)。確認済み (`ne_confirmed`) になると新しいセットの構成品・NE 登録の CSV の構成品に使える
 - **照合 ② の確かめ待ち** (`ops.v_ne_reg_targets`): 要確認を全部 (単品もセットも・親のある子も・持ち主を問わず・コード 80 字まで) = 毎朝の照合 ② が要確認の NE の観測を残す (miniPC のコードは変えない・新しい定期実行なし)
@@ -2779,6 +2792,44 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 まだ流さない): 番号をマージの順に付け替え → `migrate.mjs --dry-run` (この 1 本だけ・今のデータは何も変えない) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` を流し直す
   (master_edit に 3 つの関数の実行) → `heavy-entry-manifest.mjs --verify` → 次の朝の照合 ② の後に `select ops.quarantine_confirm_list(null)` (watcher) で 42 件の表を見る。画面 (Q-2・Q-3) は別の PR
 - 試験 = `node scripts/test-master-quarantine-confirm.mjs` (PGlite) / `TEST_PG_URL=… node scripts/test-master-quarantine-confirm-pg.mjs` (本物のログイン・並ぶ取引)
+
+### 商品ごとの入出庫履歴と月別のまとめ (0085・AI_reference CompanyDB構想/26・2026-10-17 中原さん Q1〜Q10 = a・Q11・Q12)
+- **なぜ**: NE の商品の画面の「入出庫履歴」と「月別のまとめ」を、マスタの入力の商品の画面 (`/sku/:code`) に出す (参考・読むだけ)
+- **関数** (読むだけ・security definer・`master_edit` に実行だけ・出荷の表と `ops.ingest_runs` の select は渡さない = 送り状番号などは読めない):
+  `ops.sku_stock_anchors` (ロジザードの毎日の在庫 = 錨・取得時刻・SKU の数) / `ops.sku_shipment_totals` (取得時刻の区切りごとの出荷の数) /
+  `ops.sku_movement_shipments` (伝票ごとの出荷の行・新しい順・5,000 行まで) / `ops.sku_shipments_monthly` (月ごとの受注数 = 受注日・売上数 = 出荷確定日)
+- **計算はアプリ** (`apps/master-edit/movements.mjs`): 仕入・発注は発注アプリの SQLite (同じ Render) から・発注アプリの権限がある人だけ。在庫数 = ロジザードの毎日の在庫で合わせ、
+  合わない分は「在庫の調整 (ずれ)」の 1 行 (前後で打ち消し合う組 = 出荷確定の時刻のずれの見込みと書く・消さない)。ロジザードの日次の前は在庫数が空欄
+- 当て方 (🚨 まだ流さない): 番号 = 0085 (0083 = #1734・0084 = #1739 メーカーの次) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を足すだけ・表は変えない) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (引数なし)。それまで画面の欄は「画面のロールに出荷を読む関数がまだありません」と出す (画面のほかの所は動く)
+- 試験 = `node scripts/test-master-movements.mjs` (計算・関数の権限・API) / `test-master-movements-ui.mjs` (画面) / 測る道具 `scripts/company-db/movements-measure.mjs` (PR-0・watcher で読むだけ)
+
+### 販売数のグラフ (0086・2026-10-17 中原さん「販売数量のグラフが見れるようになるといいかも」)
+- **なぜ**: マスタの入力の商品の画面 (`/sku/:code`) に、モール別の販売数のグラフ (週 52・月 24・日 90) とロジザードの在庫の線を出す (参考・読むだけ)。0085 (入出庫の履歴) の後に積んだ作業ブランチ = 0085 のマージの後
+- **関数** (読むだけ・security definer・`master_edit` に実行だけ・注文の表の select は渡さない = 注文番号・金額は読めない): `ops.sku_sales_daily(sku_id, from)` = 日 × モールの正味の数 (数量 − 取消) とうちセット経由
+  - 数え方は売上日次 (0021) と `mart.sales_expanded_to_skus` (0042・見張り W6) と同じ規則 (試験で同じ数を確かめる・入れ子 5 / 6 段・循環・出品の境目も)。うちセット経由だけは道ごと (同じ出品に SKU とそれを含むセットがある行は 0042 が全部をセット経由にする)。0042 は売れた行から末端へ下る・ここは 1 つの SKU から「それを含むセット・出品」へ上る (会社の全部の売上を展開しない)
+  - `mart.v_sales_daily` でなく core を直に読む: メルカリ (売上日次を作らない) も入る・出品だけの明細を `ix_order_lines_listing` で引ける・朝の作り直しの前の注文も入る
+  - セットの画面 = そのセットとして売れた数。期間は 2025-01-01 (それより古くできない) 〜 今日 (先の日付の注文は入れない)
+- **画面** (`apps/master-edit/sales-chart.mjs`・`public/me-sales-chart.js`): SQL は 1 回 (販売数 + `ops.sku_stock_anchors`)・期限 8 秒。積み上げの棒 (楽天・Amazon・Yahoo!・その他) と在庫は別のグラフ (軸を 2 つ重ねない)・欠品 (締めた日の在庫 0) の帯・途中の週 / 月は薄い・表で見る・← → で読む。
+  卸・ほかの NE の店は入らない = 上の「売れた数 (7 日・30 日)」(商品管理リスト) と少し違う (画面にそう書く)。注文は 2025-01 から (それより前は空欄)
+- 当て方 (🚨 まだ流さない): 番号 = 0086 (0085 = #1741 入出庫の履歴の次) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を足すだけ) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (引数なし)。それまでグラフの欄は「画面のロールに販売数を読む関数がまだありません」と出す (画面のほかの所は動く)
+- 試験 = `node scripts/test-master-sales-chart.mjs` (計算・0042 と同じ数・関数の権限・API) / `test-master-sales-chart-ui.mjs` (画面)
+
+### 梱包した状態の 縦・横・高さ・重さ (0087・2026-10-17 中原さん「FBA 納品のアプリとか、定形外の発送方法で情報をもっていたはずだから集約して」)
+- **なぜ**: 梱包した状態の大きさ・重さは、定形外 (postage.db `pm_skus` の重さ g・厚み mm) と FBA 納品 (fba-box.db の 1 個の重さ = 実測 / Amazon のカタログ) にばらばらにあった。
+  縦・横はどこにも無い (profit-calculator は SP-API のカタログの寸法をその場で読むだけで残さない)。マスタの入力で人が入れられる 1 つの置き場にまとめる
+- **出どころの値** = `core.product_physicals` (0003・scope = package・夜間ロード `engine.mjs` の 11. が毎晩 pm_skus / fbx_weight_refs / fbx_weight_current から足す・ここでは変えない)
+- **人の値** = 🆕 `core.product_packages` (商品ごとに 1 行・縦・横・高さ = mm・重さ = g・軸ごとに空でよい・4 つとも空の行は持たない)・記録 `ops.product_package_events` (追記だけ)。
+  書くのは `ops.set_product_package` だけ (security definer・メーカー 0084 と同じ守り = 単品・やめていない・new_open・門を通った保存 (sku_edit) / 登録 (sku_create) の取引の中・
+  最後の記録の番号が画面の見ていたものと違う = version_conflict)。夜間ロードは触らない (product_physicals に人の行を足さない = 夜間ロードが有効行を規則 v1 で選び直すと消える)
+- **まとめた値** = 🆕 `core.v_product_packages` (軸ごとに 人 → `core.package_source_rank` (実測 1・Amazon のカタログ 2・Yahoo 3・仕入先 4・そのほか 5・定形外の見込み 8) → 新しい観測)。
+  出どころ × 参照ごとの最新の行だけ・先の時刻の行は使わない。FBA 納品・定形外・利益の計算がこれを読むのは次の PR (いまは画面・一覧・CSV だけ)
+- **画面**: 商品の画面の「大きさ・重さ」(人の値の欄 = cm / g・いま使う値・出どころの表・食い違いの印・「この値を入れる」)・新商品の登録 (単品・まとまり = 全部の子に同じ値)。
+  入れなくても登録できる (「値か入力なし」に数えない)。一覧の列「大きさ・重さ」(いつもは出さない)・一覧の CSV の最後の 5 列
+- 当て方 (🚨 まだ流さない): 番号 = 0087 (0084 メーカー・0085 入出庫の履歴・0086 販売数のグラフの次 = 欠番にしない) → アプリ (マージ) と `migrate.mjs --dry-run` (表・関数・ビューを足すだけ) → 中原さんの OK → 本適用 →
+  `create-master-edit-roles.mjs` を流し直す (master_edit に 3 つの select・`core.product_physicals` の select・書く関数の実行)。どちらが先でもよい (0087 の前・流し直しの前は画面が欄を出さない = 見るだけ・値を送ったら 503)
+- 試験 = `node scripts/test-master-package.mjs` (形・守り・まとめた値・商品の画面・登録・まとまり・一覧・CSV・夜間ロード・流し直しの前) / 画面 = `test-master-package-ui.mjs`
 
 ### 表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安 (0099 仮番号・AI_reference CompanyDB構想/27 §3.4 ④ v2・中原さんの決定 10/18 Q1〜Q9 = 全部 a)
 - **なぜ**: 原産国・内容量・メーカー型番・消費期限の目安 (日数) をマスタの入力で入れ、Company DB を正本にする (product-hub は読んで見せるだけ・差の印と「マスタの値を入れる」)。
