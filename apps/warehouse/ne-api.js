@@ -17,7 +17,7 @@
  *   2日以内の周期で実行すればトークンが切れない。
  *
  * 料金:
- *   月1,000回以内は無料。日次運用で約240回/月の見込み。
+ *   月1,000回以内は無料 (1,001〜2,000回は有料)。検索は 1 回で NE_SEARCH_LIMIT (1万件) まで取る = 朝の sync は 1 日 7 回前後。
  */
 import 'dotenv/config';
 import fs from 'fs';
@@ -36,6 +36,12 @@ const NE_API_BASE = 'https://api.next-engine.org';
 const CLIENT_ID = process.env.NE_CLIENT_ID;
 const CLIENT_SECRET = process.env.NE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.NE_REDIRECT_URI || 'https://localhost:3000/callback';
+/**
+ * 検索 API (商品・セット商品・受注ベース・受注明細) の 1 回の取得数 (limit)。NE の説明の limit の省略時 = 10000 (それより大きい値の説明は無い)。
+ * NE はアプリを API の回数 (月) で課金する (1,000 回まで無料) = 1 回で多く取って回数を減らす (以前は 1000 = 朝の sync が 1 日 30 回超)。
+ * ページングは今までどおり offset += この数・返った行がこの数より少なければ止める (ちょうどこの数なら次を呼ぶ = 0 行で止まる)
+ */
+export const NE_SEARCH_LIMIT = 10000;
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
 /**
@@ -108,8 +114,8 @@ async function authenticate(callbackUrl) {
 
 // 他モジュール (ne-sync-runner 等) から再利用するため export 化 (2026-06-06 構成 4 PR)
 export { callNE, loadTokens, saveTokens };
-// 取込の試験 (scripts/test-material-lineage.mjs の完了の印) 用
-export { fetchProducts, fetchSetProducts };
+// 取込の試験 (scripts/test-material-lineage.mjs の完了の印・scripts/test-ne-src.mjs の受注のページ) 用
+export { fetchProducts, fetchSetProducts, fetchOrders };
 async function callNE(endpoint, params = {}) {
   const tokens = loadTokens();
   if (!tokens) throw new Error('トークンがありません。先に認証してください: node ne-api.js auth <callback_url>');
@@ -181,7 +187,7 @@ async function fetchProductsRun(h) {
 
   let offset = 0;
   let total = 0;
-  const LIMIT = 1000;
+  const LIMIT = NE_SEARCH_LIMIT;
   // 取込の整合 (C1。Codex ③a-2 C-R1 H3): 取った行・コードが空で飛ばした行・同じコードが 2 度来た (ページの重なり = INSERT OR REPLACE で後の行だけ残る)
   let fetchedRows = 0, droppedNoCode = 0;
   const seenCodes = new Map();
@@ -317,7 +323,7 @@ async function fetchSetProductsRun(h) {
   const inProgress = db.transaction(() => beginNeFetch(db, 'setproducts', startedAt))();
   h.inProgress = inProgress;
   let offset = 0;
-  const LIMIT = 1000;
+  const LIMIT = NE_SEARCH_LIMIT;
 
   while (true) {
     const data = await callNE('/api_v1_master_setgoods/search', {
@@ -490,7 +496,7 @@ async function fetchOrders(days = 7) {
       fields: NE_ORDER_BASE_FIELDS,
       'receive_order_date-gte': startStr,
       'receive_order_date-lte': endStr,
-      limit: '1000',
+      limit: String(NE_SEARCH_LIMIT),
       offset: String(baseOffset),
     });
     const items = data.data || [];
@@ -511,8 +517,8 @@ async function fetchOrders(days = 7) {
     });
     tx();
     console.log(`[NE] 受注ベース: ${baseMap.size}件 (offset: ${baseOffset})`);
-    baseOffset += 1000;
-    if (items.length < 1000) break;
+    baseOffset += NE_SEARCH_LIMIT;
+    if (items.length < NE_SEARCH_LIMIT) break;
   }
   console.log(`[NE] 受注ベース保存: ${baseInserted}件挿入, ${baseUpdated}件更新`);
 
@@ -535,7 +541,7 @@ async function fetchOrders(days = 7) {
       fields: rowFields,
       'receive_order_date-gte': startStr,
       'receive_order_date-lte': endStr,
-      limit: '1000',
+      limit: String(NE_SEARCH_LIMIT),
       offset: String(rowOffset),
     });
 
@@ -594,8 +600,8 @@ async function fetchOrders(days = 7) {
     tx();
 
     console.log(`[NE] 受注明細: ${total}件処理, ${inserted}件挿入, ${updated}件更新 (offset: ${rowOffset})`);
-    rowOffset += 1000;
-    if (items.length < 1000) break;
+    rowOffset += NE_SEARCH_LIMIT;
+    if (items.length < NE_SEARCH_LIMIT) break;
   }
 
   console.log(`[NE] 受注データ取得完了: base ${baseMap.size}件, row ${total}件処理, ${inserted}件挿入, ${updated}件更新(キャンセル/状態変化), ${unchanged}件変化なし, ${errors}件エラー`);
@@ -673,7 +679,7 @@ async function fetchOrderBaseByModified(days = 3) {
   return stats;
 }
 
-const NE_BASE_LIMIT = 10000;
+const NE_BASE_LIMIT = NE_SEARCH_LIMIT;   // 出荷確定日・更新日の受注ベース (はじめから 10000)
 
 /**
  * 出荷確定日の任意区間で受注ベースを取得し raw_ne_order_base へ UPSERT する。

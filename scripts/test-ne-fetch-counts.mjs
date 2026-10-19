@@ -52,7 +52,8 @@ globalThis.fetch = async (url, opts) => {
   const data = pages ? (pages[offset / limit] || []) : (goods ? ne.goods : ne.setgoods).slice(offset, offset + limit);
   return { ok: true, status: 200, json: async () => ({ result: 'success', data }) };
 };
-const { fetchProducts, fetchSetProducts } = await quietly(() => import('../apps/warehouse/ne-api.js'));
+const { fetchProducts, fetchSetProducts, NE_SEARCH_LIMIT } = await quietly(() => import('../apps/warehouse/ne-api.js'));
+const L = NE_SEARCH_LIMIT;   // 1 回の取得数 (ne-api.js。今は 10000)。ページの試験はこの数で作る
 const { getDB, clearNeCompleteMarks } = await import('../apps/warehouse/db.js');
 const { readNeFetchCounts, evalNeFetchCounts, checkNeFetchCounts, beginNeFetch, endNeFetch, NE_FETCH_COUNTS_KEY, NE_FETCH_IN_PROGRESS_KEY, NE_FETCH_SEAL_KEYS, NE_FETCH_MISSING_FIELDS, NE_FETCH_FINGERPRINT_FILES, computeFetchFingerprint, releaseNeFetch, judgeNeFetchMark, NE_FETCH_STALE_MS } = await import('../apps/warehouse/ne-fetch-counts.js');
 const { spawnSync } = await import('node:child_process');
@@ -72,7 +73,7 @@ const sg = (p, c, extra = {}) => ({ set_goods_id: p, set_goods_name: `s-${p}`, s
 await ta('[1] 商品: 空のコード・同じコードが 2 度 (ページの重なり)・小文字にして衝突・2 ページ → 件数と関係・ページを完了の印と一緒に残す', async () => {
   ne.goodsPages = null;
   ne.goods = [
-    ...Array.from({ length: 998 }, (_, i) => g(`G${i}`)), g(''), g('ABC-1'),                 // 1 ページ目 1000 行 (空 1)
+    ...Array.from({ length: L - 2 }, (_, i) => g(`G${i}`)), g(''), g('ABC-1'),               // 1 ページ目 L 行 (空 1)
     g('G0'), g('G1'), g('G2'), g('abc-1'), { goods_name: 'goods_id の欄が無い' }, {}, g(null, { goods_name: null }),   // 欄が無い・全部の欄が無い・null = どれもコードが空 (1 行 1 分類)
     ...Array.from({ length: 243 }, (_, i) => g(`H${i}`)),   // 2 ページ目 250 行
   ];
@@ -80,13 +81,15 @@ await ta('[1] 商品: 空のコード・同じコードが 2 度 (ページの�
   const c = counts('products');
   // 重なり = write_attempts − stored_rows = 4 (G0〜G2 が 2 度 = 3・ABC-1 と abc-1 が小文字にして衝突 = 1)
   assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.dropped_no_code, c.dropped_missing_fields, c.dropped_missing_detail],
-    [1250, 1246, 1242, 4, 0, {}]);
-  assert.deepEqual([c.page_limit, c.pages, c.page_rows, c.last_page_rows], [1000, 2, [1000, 250], 250]);
+    [L + 250, L + 246, L + 242, 4, 0, {}]);
+  assert.deepEqual([c.page_limit, c.pages, c.page_rows, c.last_page_rows], [L, 2, [L, 250], 250]);
+  assert.equal(L, 10000);   // NE の limit の省略時の値 (1 回で 1 万件 = API の回数を減らす)
+  assert.deepEqual(ne.calls.filter((x) => x.goods).slice(-2).map((x) => [x.offset, x.limit]), [[0, L], [L, L]]);   // offset は L ずつ進む
   // 印と同じ回 (時刻・通し番号)・DB の行の数 = stored_rows
   assert.equal(c.complete_at, meta('ne_api_products_complete_at'));
   assert.equal(String(c.complete_rev), meta('ne_api_products_complete_rev'));
   assert.equal(String(c.stored_rows), meta('ne_api_products_complete_count'));
-  assert.equal(db().prepare('SELECT COUNT(*) AS n FROM raw_ne_products WHERE synced_at = ?').get(c.complete_at).n, 1242);
+  assert.equal(db().prepare('SELECT COUNT(*) AS n FROM raw_ne_products WHERE synced_at = ?').get(c.complete_at).n, L + 242);
   assert.deepEqual(checkNeFetchCounts('products', c), []);
   // 取得の版 = 固定の順の各ファイルの「パス + NUL + LF にそろえた中身 + NUL」をつなげた sha256 (この試験の中で別に計算する)
   const crypto = await import('node:crypto');
@@ -100,18 +103,18 @@ await ta('[1] 商品: 空のコード・同じコードが 2 度 (ページの�
   assert.equal(computeFetchFingerprint(), expectFp);
   // 今までの証跡は形も値も今までどおり (written_rows = 書いた回数・dup_codes = 小文字のコード)
   const it = JSON.parse(meta('ne_api_products_integrity'));
-  assert.deepEqual([it.fetched_rows, it.written_rows, it.dropped_no_code, it.distinct_codes, it.dup_code_count, it.dup_codes], [1250, 1246, 4, 1242, 4, ['g0', 'g1', 'g2', 'abc-1']]);
+  assert.deepEqual([it.fetched_rows, it.written_rows, it.dropped_no_code, it.distinct_codes, it.dup_code_count, it.dup_codes], [L + 250, L + 246, 4, L + 242, 4, ['g0', 'g1', 'g2', 'abc-1']]);
 });
 
-await ta('[2] 商品: ちょうど 1000 行 = 2 回目の呼び出しが 0 行で止まる (最後のページ 0) / 0 件の取得も記録する', async () => {
+await ta('[2] 商品: ちょうど L (1 回の取得数) 行 = 2 回目の呼び出しが 0 行で止まる (最後のページ 0) / 0 件の取得も記録する', async () => {
   await nextSecond();
-  ne.goods = Array.from({ length: 1000 }, (_, i) => g(`K${i}`));
+  ne.goods = Array.from({ length: L }, (_, i) => g(`K${i}`));
   ne.onCall = () => new Promise((r) => setTimeout(r, 700));   // API が遅い = 完了 (finished_at) は始め (started_at・完了の印の時刻) より後
   try { await quietly(fetchProducts); } finally { ne.onCall = null; }
   let c = counts('products');
   assert.ok(Date.parse(c.finished_at) - Date.parse(c.started_at) >= 1400, `${c.started_at} → ${c.finished_at}`);   // 2 回呼ぶ = 1.4 秒以上
   assert.equal(c.complete_at, c.started_at.replace('T', ' ').slice(0, 19));   // 完了の印の時刻は始めのまま (raw の集合の世代)
-  assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.pages, c.page_rows, c.last_page_rows], [1000, 1000, 1000, 2, [1000, 0], 0]);
+  assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.pages, c.page_rows, c.last_page_rows], [L, L, L, 2, [L, 0], 0]);
   await nextSecond();
   ne.goods = [];
   await quietly(fetchProducts);
@@ -159,32 +162,32 @@ await ta('[3] セット: 親が空・子が空・両方空・同じ親 × 子が
 
 await ta('[4] 最後のページが短い (R-g): 2 ページ目が 600 行で止まる = 記録に残る (pages・page_rows)。この PR では見抜かない (照合の only_in_cdb で見る)', async () => {
   await nextSecond();
-  ne.goodsPages = [Array.from({ length: 1000 }, (_, i) => g(`P${i}`)), Array.from({ length: 600 }, (_, i) => g(`Q${i}`)), Array.from({ length: 900 }, (_, i) => g(`R${i}`))];
+  ne.goodsPages = [Array.from({ length: L }, (_, i) => g(`P${i}`)), Array.from({ length: 600 }, (_, i) => g(`Q${i}`)), Array.from({ length: 900 }, (_, i) => g(`R${i}`))];
   ne.calls = [];
   await quietly(fetchProducts);
   const c = counts('products');
-  assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.pages, c.page_rows, c.last_page_rows], [1600, 1600, 1600, 2, [1000, 600], 600]);
+  assert.deepEqual([c.fetched_rows, c.write_attempts, c.stored_rows, c.pages, c.page_rows, c.last_page_rows], [L + 600, L + 600, L + 600, 2, [L, 600], 600]);
   assert.equal(ne.calls.filter((x) => x.goods).length, 2);   // 3 ページ目は呼ばれない (今の止め方のまま)
   assert.equal(readInTx((rdb) => readNeFetchCounts(rdb)).products.ok, true);
   // セットも同じ
-  ne.setPages = [Array.from({ length: 1000 }, (_, i) => sg(`T${i}`, 'C1')), Array.from({ length: 3 }, (_, i) => sg(`U${i}`, 'C1'))];
+  ne.setPages = [Array.from({ length: L }, (_, i) => sg(`T${i}`, 'C1')), Array.from({ length: 3 }, (_, i) => sg(`U${i}`, 'C1'))];
   await quietly(fetchSetProducts);
   const s = counts('setproducts');
-  assert.deepEqual([s.fetched_rows, s.write_attempts, s.stored_rows, s.pages, s.page_rows, s.last_page_rows], [1003, 1003, 1003, 2, [1000, 3], 3]);
+  assert.deepEqual([s.fetched_rows, s.write_attempts, s.stored_rows, s.pages, s.page_rows, s.last_page_rows], [L + 3, L + 3, L + 3, 2, [L, 3], 3]);
   ne.goodsPages = null; ne.setPages = null;
 });
 
 await ta('[5] 途中のページで失敗: 商品 = 印も件数も無い (前の回の分も消えたまま) / セット = 入れ替えない・前の回の印と件数がそのまま', async () => {
   await nextSecond();
-  ne.goods = Array.from({ length: 1500 }, (_, i) => g(`F${i}`));
-  ne.failAt = { goods: true, offset: 1000 };
+  ne.goods = Array.from({ length: L + L / 2 }, (_, i) => g(`F${i}`));
+  ne.failAt = { goods: true, offset: L };
   try { await assert.rejects(quietly(fetchProducts), /テストの途中の失敗/); } finally { ne.failAt = null; }
   for (const k of ['complete_at', 'complete_count', 'complete_rev', 'integrity', 'fetch_counts']) assert.equal(meta(`ne_api_products_${k}`), null, k);
   const pr = readInTx((rdb) => readNeFetchCounts(rdb)).products;   // 取得中の印が残る (途中で失敗した回)
   assert.deepEqual([pr.ok, pr.reason, pr.in_progress.kind, pr.in_progress.version], [false, 'fetch_in_progress', 'products', 'fc1']);
   const before = { at: meta('ne_api_setproducts_complete_at'), fc: meta(NE_FETCH_COUNTS_KEY.setproducts), rows: db().prepare('SELECT COUNT(*) AS n FROM raw_ne_set_products').get().n };
-  ne.setgoods = Array.from({ length: 1500 }, (_, i) => sg(`V${i}`, 'C1'));
-  ne.failAt = { goods: false, offset: 1000 };
+  ne.setgoods = Array.from({ length: L + L / 2 }, (_, i) => sg(`V${i}`, 'C1'));
+  ne.failAt = { goods: false, offset: L };
   try { await assert.rejects(quietly(fetchSetProducts), /テストの途中の失敗/); } finally { ne.failAt = null; }
   assert.deepEqual({ at: meta('ne_api_setproducts_complete_at'), fc: meta(NE_FETCH_COUNTS_KEY.setproducts), rows: db().prepare('SELECT COUNT(*) AS n FROM raw_ne_set_products').get().n }, before);
   // 前の回の印と件数は書き換えない。ただし取得中の印が残る = 読む関数は fetch_in_progress (開く前のゲートが拒む)
@@ -360,8 +363,8 @@ await ta('[11] 取得中の印 (R12): API と通信している間ずっとあ�
   ne.onCall = ({ goods }) => { seen.push([goods ? 'products' : 'setproducts', readInTx((rdb) => readNeFetchCounts(rdb))[goods ? 'products' : 'setproducts'].reason]); };
   try {
     await nextSecond();
-    ne.goods = Array.from({ length: 1500 }, (_, i) => g(`M${i}`));
-    ne.setgoods = Array.from({ length: 2100 }, (_, i) => sg(`N${i}`, 'C1'));
+    ne.goods = Array.from({ length: L + L / 2 }, (_, i) => g(`M${i}`));
+    ne.setgoods = Array.from({ length: 2 * L + L / 10 }, (_, i) => sg(`N${i}`, 'C1'));
     await quietly(fetchProducts); await quietly(fetchSetProducts);
     assert.deepEqual(seen, [['products', 'fetch_in_progress'], ['products', 'fetch_in_progress'], ['setproducts', 'fetch_in_progress'], ['setproducts', 'fetch_in_progress'], ['setproducts', 'fetch_in_progress']]);
     for (const k of ['products', 'setproducts']) assert.equal(meta(NE_FETCH_IN_PROGRESS_KEY[k]), null, k);   // 完了で消える
@@ -369,7 +372,7 @@ await ta('[11] 取得中の印 (R12): API と通信している間ずっとあ�
     assert.equal(r.ok, true, JSON.stringify(r));
     // 途中で失敗 → 残る (中身 = その回の時刻)
     await nextSecond();
-    ne.failAt = { goods: false, offset: 2000 };
+    ne.failAt = { goods: false, offset: 2 * L };
     let failedTs = null;
     ne.onCall = ({ goods }) => { if (!goods) failedTs = JSON.parse(meta(NE_FETCH_IN_PROGRESS_KEY.setproducts)).started_at; };
     try { await assert.rejects(quietly(fetchSetProducts), /テストの途中の失敗/); } finally { ne.failAt = null; }
