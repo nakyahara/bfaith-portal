@@ -2852,3 +2852,48 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 画面 = 商品の画面の「この下書きを消す」の帯に理由 (「ロジザード登録の CSV に出しています (ファイル #N)。ロジザードから消すのが先です」)。lib (`lib/master-draft-cancel.mjs`) は 0091 の前の DB でも同じ理由で断る (鍵なしの先回り)
 - 当て方 (🚨 まだ流さない): アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を作り直すだけ) → 中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま)
 - 試験 = `node scripts/test-master-draft-cancel.mjs` ([M4]・[Z]) / `scripts/test-master-draft-cancel-pg.mjs` ([8] 出すと消すの競り・実 PostgreSQL) / `scripts/test-master-variation-pg.mjs` ([7] 出すと子の廃止の競り)
+
+### 販売数のグラフを速くする (0092・2026-10-19・よく売れる SKU でグラフが 8 秒の期限に当たる)
+- **なぜ**: 本番で読むだけの EXPLAIN ANALYZE (いちばん売れる 0726-001931・p_from 2024-10-01・2,068 行) = **11.0 秒** (2 回目も 11 秒 = DB のメモリが小さく読んだ頁が残らない)。2 番目 0726-001389 = 10.3 秒。
+  遅いのは表の頁を 1 行ずつ読むこと = ① 出品だけの明細 (出品 7 つ・31,005 行) を `ix_order_lines_listing` で引いた後の明細の頁 (4.9 秒・読み 24,071 頁) ② 注文 33,646 件を主キーで引いた後の注文の頁 (約 6 秒・読み 26,882 頁)
+- **直し方** = 関数が読む列を全部持つ部分索引 3 本 (Index Only Scan = 表の頁を読まない) + 関数の明細の集まり (src) を materialized にして注文の番号の順に並べる (注文の索引を前から順に 1 回で読む)。
+  関数は 0086 の写しにこの 2 か所だけ (試験が 0086 の本文と比べる) = 数え方は同じ。`create or replace` = 権限はそのまま (`create-master-edit-roles.mjs` の流し直しは要らない)
+  - `ix_order_lines_listing_only_chart` = `order_lines (listing_id) include (company_id, order_id, qty, cancelled_qty) where listing_id is not null and sku_id is null and removed_at is null`
+  - `ix_order_lines_sku_chart` = `order_lines (sku_id) include (company_id, order_id, qty, cancelled_qty) where sku_id is not null and removed_at is null`
+  - `ix_orders_chart` = `orders (order_id) include (company_id, order_date_jst, mall, is_cancelled)`
+  - 注文の 2 表の autovacuum を 2% で動かす (`autovacuum_vacuum_scale_factor` / `autovacuum_vacuum_insert_scale_factor` = 0.02・既定 0.2)。索引だけで読めるのは「全部の行が見える」印 (visibility map) の付いた頁だけ = vacuum が印を付ける。
+    既定のままでは 約 400 万行の表は 数か月に 1 回 = 直近の頁に印が無い (数は同じ・その頁だけ表を読みに行く = 遅くなるだけ)。2% = 目安で 足した行・変わった行が 約 8 万 = 1〜2 週ごと (PG 18 の足した行の閾値は凍っていない頁の割合も掛かる = もっと早いこともある)。印の付いた頁は飛ばす = 1 回は前より軽いはず (負荷は当てた後の実績で見る)。
+    設定は vacuum を流す命令ではない = 当てた後に閾値に届いていなければ人が 1 回 vacuum を流す (下の当て方 5)。INCLUDE の列 (`orders.is_cancelled`・`order_lines.qty` / `cancelled_qty`) が変わる update は HOT にならなくなる (取消のときだけ = 書き込みが少し増えるだけ)
+  - 試さなかった道: 1 日ごとの写し (アプリの中・前日までの数) = 朝の注文の push の前に開くと、その日ずっと前日の注文が入らない・構成を直しても古い・初めて開く画面は速くならない /
+    夜の集計の表 = daily-sync に 1 段足す・公開の前の注文が入らない (0086 が core を直に読む理由と同じ) = 索引で足りるので作らない
+- **測った形** (使い捨ての PG 18・注文 400 万・明細 500 万・本番と同じ比 = いちばん売れる SKU の出品の行 約 3.1 万・SKU の行 約 2.6 千。時間は手元の SSD でほぼキャッシュ = 本番の時間ではない・比べるのは頁の数):
+  | いちばん売れる形 (明細 35,093 行・結果 1,310 行) | 前 (0086) | 後 (0092) |
+  |---|---|---|
+  | SKU の明細 | Bitmap Heap Scan = 表の頁 5,186 読み | Index Only Scan `ix_order_lines_sku_chart` = 46 頁 |
+  | 出品だけの明細 (出品 7 つ・29,989 行) | Index Scan + 表の頁 = 24,837 読み | Index Only Scan `ix_order_lines_listing_only_chart` = 229 頁 |
+  | 注文 35,093 件 | `orders_pkey` + 表の頁 = 読み 49,901 (hit 90k) | Index Only Scan `ix_orders_chart` (heap fetch 0) = 読み 20,074 (= 索引の葉 20,647 頁のほぼ全部) |
+  | 合計の読み (shared read) | **79,924** | **20,302** (−75%) |
+  - 数は前と後で同じ (いちばん売れる形・セット・小さい SKU の 3 つの結果の md5 が一致)。小さい SKU (289 行) = 読み 724 → 74
+  - 注文の索引の葉をほぼ全部読む = 読む量の下限はそこ (索引 約 160 MB / 注文 400 万)。関数の src を注文の番号の順に並べた (0092) = 注文 1 件ずつの探索のまま、葉を前から順に訪ねる (並べないと出品ごとに 7 回の飛び飛びの行き来)。連続の読みになる保証はない (先読みが効くかは本番の disk しだい)
+  - 直近 5% の頁に「全部見える」印が無いと、その分だけ表を読む (heap fetch・試験で読み 20k → 28k) = autovacuum を 2% にした理由
+  - 索引 3 本を作る時間 = 手元で 57〜60 秒 (注文 1.4 GB・明細 0.8 GB・できた索引 = 注文 161 MB・出品だけの明細 138 MB・SKU の明細 92 MB = 合計 約 390 MB)
+- **本番の見込み** (測れない = 仮定つきの試算・保証ではない = 8 秒に収まるかは当てた後の測定で決める): 前 = 読み 51k 頁で 11 秒 (= 平均 1 頁 約 0.2 ms)。後 = 明細は数百頁・注文は ix_orders_chart の葉 約 2 万頁を番号の順に。
+  同じ 0.2 ms / 頁なら 約 4 秒、索引を前から順に訪ねる分の OS の先読みが効けば 1〜2 秒、続けて開いて索引が DB / OS のメモリに残っていれば 1 秒より下 (手元 = 0.2〜0.4 秒)。
+  「全部見える」印の無い頁が多いとその分だけ遅い (heap fetch)。小さい SKU は 数十 ms。当てた後に `sales-chart-measure.mjs --call` で測って、ここに書き足す
+- **作る時間の見込み** = 手元 約 60 秒 (3 本) × 本番の遅い disk = 数分。その間 2 表の書き込みが待つ
+- 🚨 **lock**: ふつうの `create index` (concurrently でない) = 作っている間 `core.orders` / `core.order_lines` への **書き込みが待つ** (読むのは止めない = 画面・グラフ・見張りは動く)。3 本は 1 つの取引 = order_lines は 1 本目から・orders は 3 本目から commit まで。
+  runner がこの取引に `lock_timeout` 10 秒・`statement_timeout` 10 分を入れる。lock_timeout = 0092 が lock を取るのを待つ上限 (書いている取引があれば 10 秒で巻き戻して失敗 = 少し待ってもう一度)。取った後に相手を待たせる長さは縛らない。
+  statement_timeout は **1 文ごと** (取引の全体ではない) = 0092 の中で `set local statement_timeout = '3min'` に縮めた = 書き込みが待つのは索引 3 文の合計で長くて 約 9 分 (目安)。超えたら全部巻き戻す (索引・設定・関数のどれも残らない・invalid の索引も残らない)。
+  作っている間は sort の一時の file と WAL も使う (空きの見方は当て方 2)。
+  concurrent-index の migration (上の D-60 PR 3a-i) にしない理由 = **本番では今は流れない** (容量の読み手が Render の host の対応の回答を待って fail-closed = `RENDER_PG_HOST_MAPPING.confirmed = false`)
+- **当て方** (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後):
+  1. 0087〜0091 を各節の手順で先に当てる (runner は番号の順にしか流さない。0092 だけ先にはできない)
+  2. 読むだけで今の大きさと速さを測る (miniPC・watcher・begin read only): `set DOTENV_CONFIG_PATH=C:\Users\bfaith\bfaith-portal\.env&& node -r dotenv/config scripts/company-db/sales-chart-measure.mjs --code 0726-001931 --code 0726-001389 --code phenix9ml`
+     = 2 表の大きさ・全部見える頁 / 凍った頁の割合・最後の vacuum・vacuum の後に足した / 死んだ行・索引の予想の大きさ・関数の本文の explain analyze (診断)。`--call` を付けると画面と同じ「関数の呼び出し」の時間も (持ち主の接続 `COMPANY_DB_URL`・begin read only・本文の EXPLAIN より先 = 頁を温める前に測る)。Render の画面の Disk の空きが **索引の予想の合計 × 3 + 2GB** 以上あることを見る
+  3. **daily-sync (07:00・retry 11:30 まで) と夜間ロード (02:00) の間の昼** (例 13:00〜17:00)・daily-sync の ok を見てから: `node scripts\company-db\migrate.mjs --dry-run` (0092 の 1 本だけ = 索引 3 本・2 表の autovacuum の設定・関数の create or replace)
+  4. 中原さんの OK → `node scripts\company-db\migrate.mjs` (ふつうの migration = migrate-watched でなくてよい)。lock_timeout で失敗したら数分待ってもう一度
+  5. 2 を `--call` つきでもう一度流す = 3 本が valid・計画が `Index Only Scan using ix_…_chart`・heap_fetch が少ない・関数の呼び出しの時間。
+     全部見える頁の割合が低く heap_fetch が多いとき: vacuum の後に足した行・死んだ行が 2% (約 8 万) を超えていれば数分で autovacuum が動く (`last_autovacuum` が新しくなるのを待つ)。
+     超えていなければ (または待っても動かなければ) 中原さんの OK の後に `… sales-chart-measure.mjs --vacuum` (= `vacuum (analyze, truncate false)` を 2 表に・読み書きを止めない・取引の外) → 2 を流し直す
+  6. 商品の画面 (`/apps/master-edit/sku/0726-001931`) でグラフが出るのを見る。測った時間をこの節に書き足す
+- 試験 = `node scripts/test-master-sales-chart.mjs` (「速さ (0092)」= 索引の形・関数と同じ条件と列で Index Only Scan の計画が立つ・関数の本文が同じ形・数は同じ / 測る道具の純粋な関数)
