@@ -152,4 +152,19 @@ await ta('[9] NE の商品コードの書き方 (10/16 中原さん) = ロジザ
   assert.ok(entry.includes('まとめの最後に「⚠️ NE の商品コードの書き方 N 件」') && entry.includes('「⚠️ NE の商品コードの書き方」が出た:'), '台帳に説明と runbook が無い');
 });
 
+await ta('[10] NE へ送る (設計 25・10/19 中原さん) = ロジザードの影の後・見張りの前の 1 段 (--daily)・照合が失敗した朝は流さない・再試行に載せない・台帳に書いてある', async () => {
+  const SEND = 'scripts/company-db/ne-update-send.mjs';
+  assert.equal(count(SEND), 1);
+  const iSend = first(SEND);
+  assert.ok(first(LZ) < iSend && iSend < first(WATCH), '置き場所が違う');
+  assert.ok(body.indexOf('const lzCodeNotice = readLzCodeNotice({') < iSend, 'その朝のロジザードの書き方を読んだ後');
+  assert.match(body, /const neUpdateResult = masterCompareResult\.success\n\s+\? runScript\('scripts\/company-db\/ne-update-send\.mjs --daily', 'NEへ送る', 600000\)\n\s+: \{ success: true, skipped: true, summary: '⏭️ 見送り \(マスタ照合が失敗/);
+  assert.match(body, /results\.push\(\{ name: 'NEへ送る', \.\.\.neUpdateResult, warn: neUpdateResult\.success && isWarnSummary\(neUpdateResult\.summary\) \}\);/);
+  assert.doesNotMatch(ds.slice(ds.indexOf('const RETRYABLE_JOBS = ['), ds.indexOf('];', ds.indexOf('const RETRYABLE_JOBS = ['))), /NEへ送る/);
+  const reg = fs.readFileSync(path.join(ROOT, 'config/jobs-registry.mjs'), 'utf8');
+  const entry = reg.slice(reg.indexOf("id: 'warehouse-daily-sync'"), reg.indexOf("id: 'mf-daily-sync'"));
+  assert.ok(entry.includes('「ロジザード毎日の商品マスタ(影)」の後に「NEへ送る」(scripts/company-db/ne-update-send.mjs --daily'), '台帳に段の説明が無い');
+  assert.ok(entry.includes('「NEへ送る」が ❌'), '台帳の runbook に無い');
+});
+
 console.log(`\n${passed} passed${process.exitCode ? ' (失敗あり)' : ''}`);

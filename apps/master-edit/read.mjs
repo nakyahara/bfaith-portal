@@ -14,7 +14,7 @@ import { salesOfCodes } from './sales-qty.mjs';
 import { checkDeadline, ListTimeoutError } from './deadline.mjs';
 import { normProductCode } from '../purchase-orders/db.js';
 import { TOKEN_RE } from './search-token.mjs';
-import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES, logizardLockOf, regEditAfterIssue, REG_LOCK_AFTER_ISSUE } from '../../lib/master-write.mjs';
+import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, OVERRIDE_SOURCES, logizardLockOf, regEditAfterIssue, REG_LOCK_AFTER_ISSUE } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
@@ -653,7 +653,7 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = null
  *   reg = 新商品の NE 登録の CSV を配った後 (issued / import_declared / partial) = REG_CSV_FIELDS の欄 (409 reg_csv_issued)。
  *         単品の税率はそれを含むセット (今の構成 + 開いている構成の依頼) の CSV にも入る = そのセットの CSV も見る。
  *         🆕 0093 (2026-10-19 中原さん): 0093 の後の DB では閉じない (配った後も直せる = ほかの商品と同じ見た目)。0093 の前の DB だけ今までどおり 🔒
- *   csv =既にある商品の NE に取り込む CSV (0040) が出ている列 (409 csv_issued・issuedCsv と同じ条件)
+ *   (🆕 10/19・0094: 既にある商品の NE に取り込む CSV (0040) が出ている列は 🔒 にしない = 編集は自由)
  *   (🆕 PR-7: 代表 (親) は保存の欄から外した = この画面では直さない・🔒 も出さない。代表は「色違い・サイズ違い」の欄に読むだけで出す)
  *   reg_wait = 🆕 0093 の後もセットの構成 (依頼) だけは、そのセットの NE 登録の CSV の確かめが終わるまで閉じる (REG_LOCK_AFTER_ISSUE)
  * 戻り値 = { fields: { 欄: { why: 'reg' | 'reg_wait' | 'csv', exports: [番号] } }, regExports: [番号], taxParentCodes: [コード] }
@@ -686,14 +686,7 @@ async function readFieldLocks(db, cur) {
       }
     }
   }
-  const colToField = new Map(Object.entries(defs).filter(([, d]) => d.csvCol).map(([f, d]) => [d.csvCol, f]));
-  if (colToField.size) {
-    for (const r of await issuedCsv(db, cur.code_norm, [...colToField.keys()])) {
-      const f = colToField.get(r.col);
-      if (f && !fields[f]) put(f, 'csv', [r.export_id]);
-      else if (f && fields[f].why === 'csv') put(f, 'csv', [r.export_id]);
-    }
-  }
+  // 🆕 10/19 (0094): NE に取り込む CSV (0040) が出ている列も保存できる (編集は自由) = 🔒 にしない
   return { fields, regExports, taxParentCodes };
 }
 
