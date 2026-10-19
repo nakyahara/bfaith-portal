@@ -8,6 +8,7 @@
  *   2 DB の関数: 数え方 = 売上日次 (0021) を末端の SKU まで展開した mart.sales_expanded_to_skus (0042) と同じ数 (日 × モール)・メルカリも入る・取消の注文 / 明細の取消 / 外れた明細は数えない・
  *     出品だけの明細は出品の構成で・NE のセット (入れ子も) は構成品へ・セットの画面 = そのセットとして売れた数 / master_edit は呼べる・注文の表は読めない (42501)・public の実行権なし・search_path 固定
  *   3 API: 単品 (在庫の線あり)・セット (在庫なし)・無いコード = 404・関数の実行権が無い = 503 と言葉・期限切れ = 503 (timeout)
+ *     長く待つ読み (?wait=long・画面の「もう一度読む」): この値だけ 30 秒・ほかの値はふつうの 8 秒・文も期限で止める・同時に 1 本まで (busy)
  * 使い方: node scripts/test-master-sales-chart.mjs
  */
 import assert from 'node:assert/strict';
@@ -253,6 +254,91 @@ try {
     } finally { SALES_CHART_LIMITS.timeMs = keep; __setPgClientFactory(factory); }
     const bad = await C.readSalesChart({ query: async () => { throw Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' }); } }, { sku_id: '1', sku_kind: 'single' });
     assert.deepEqual([bad.ok, bad.reason], [false, 'timeout']);
+  });
+  // 🆕 10/19 中原さん「表示できなかったものはボタンを押したら表示されるように」= 画面の「もう一度読む」= ?wait=long (30 秒まで)
+  await t('長く待つ読み (?wait=long): この値だけ 30 秒・ほかの値はふつうの 8 秒・時間切れの形・1 つの文も期限で止める・同時に 1 本まで (busy)', async () => {
+    const keep = { ...SALES_CHART_LIMITS };
+    // ふつうの期限を 0 にする = 長い読みだけ通る
+    SALES_CHART_LIMITS.timeMs = 0;
+    try {
+      const short = await get('/api/sku/sc-a/sales-chart');
+      assert.deepEqual([short.status, short.j.ok, short.j.reason], [503, false, 'timeout'], JSON.stringify(short.j));
+      assert.match(short.j.error, /時間がかかりすぎました/);
+      const long = await get('/api/sku/sc-a/sales-chart?wait=long');
+      assert.equal(long.status, 200, JSON.stringify(long.j));
+      assert.deepEqual([long.j.ok, long.j.kind, long.j.views.month.totals.total], [true, 'single', 18], 'ふつうと同じ中身');
+      for (const q of ['?wait=LONG', '?wait=1', '?wait=30000', '?wait=long&wait=long', '?wait[]=long', '?wait=long%20', '?wait=']) {
+        const r = await get('/api/sku/sc-a/sales-chart' + q);
+        assert.deepEqual([q, r.status, r.j.reason], [q, 503, 'timeout'], 'ほかの値 = ふつうの期限 (長くしない)');
+      }
+    } finally { Object.assign(SALES_CHART_LIMITS, keep); }
+
+    // statement_timeout = min(30 秒, 残りの時間) (ふつうの 20 秒の上限より長く・期限は越えない) / ふつうは 8 秒まで。文が期限で止まった (57014) = 503 timeout (long: true)・接続を閉じる
+    const sets = [];
+    let ended = 0, mode = 'ok', gate = null;
+    const fake = async () => ({
+      query: async (q) => {
+        const m = /^set statement_timeout = '(\d+)(ms|s)'/.exec(q);
+        if (m) { sets.push(Number(m[1]) * (m[2] === 's' ? 1000 : 1)); return { rows: [] }; }
+        if (/^set /.test(q)) return { rows: [] };
+        if (/core\.skus/.test(q)) return { rows: [{ sku_id: '1', code: 'SC-A', code_norm: 'SC-A', sku_kind: 'single' }] };
+        if (gate) await gate.wait;
+        if (mode === 'cancel') throw Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
+        if (mode === 'locked') throw Object.assign(new Error('lock not available'), { code: '55P03' });
+        return { rows: [] };
+      },
+      end: async () => { ended++; }, on: () => {},
+    });
+    let opened = 0;
+    __setPgClientFactory(async (...a) => { opened++; return fake(...a); });
+    try {
+      let r = await get('/api/sku/sc-a/sales-chart?wait=long');
+      assert.equal(r.status, 200, JSON.stringify(r.j));
+      const longSets = sets.splice(0).filter((ms) => ms !== 20000);   // 20000 = 接続の初めの設定 (20s)
+      assert.ok(longSets.length >= 1 && longSets.every((ms) => ms > 20000 && ms <= 30000), `長い読みの文の上限: ${longSets}`);
+      r = await get('/api/sku/sc-a/sales-chart');
+      assert.equal(r.status, 200);
+      const shortSets = sets.splice(0).filter((ms) => ms !== 20000);
+      assert.ok(shortSets.length >= 1 && shortSets.every((ms) => ms <= 8000), `ふつうの文の上限: ${shortSets}`);
+
+      mode = 'cancel'; ended = 0;
+      r = await get('/api/sku/sc-a/sales-chart?wait=long');
+      assert.equal(r.status, 503);
+      assert.deepEqual(Object.keys(r.j).sort(), ['error', 'ok', 'reason'], '時間切れの形 = ほかの読めないときと同じ (画面は reason を見る)');
+      assert.deepEqual([r.j.ok, r.j.reason, ended], [false, 'timeout', 1], '期限で止まった = 時間切れ・接続を閉じた');
+      mode = 'ok';
+
+      // 同時に 1 本まで: 1 本目を止めている間の 2 本目 = 503 busy (接続を開かない)・ふつうの読みは通る / 1 本目が終わったら (失敗でも) また読める
+      let open; gate = { wait: new Promise((ok) => { open = ok; }) };
+      const first = get('/api/sku/sc-a/sales-chart?wait=long');
+      while (opened < 4) await new Promise((ok) => setTimeout(ok, 10));   // 1 本目が DB に入るまで (ここまでの 3 回 + 1)
+      const before = opened;
+      const busy = await get('/api/sku/sc-a/sales-chart?wait=long');
+      assert.deepEqual([busy.status, busy.j.ok, busy.j.reason, opened], [503, false, 'busy', before], JSON.stringify(busy.j));
+      assert.match(busy.j.error, /少し待ってから/);
+      gate = null; open();
+      assert.equal((await first).status, 200);
+      mode = 'cancel';
+      assert.equal((await get('/api/sku/sc-a/sales-chart?wait=long')).j.reason, 'timeout');
+      mode = 'ok';
+      assert.equal((await get('/api/sku/sc-a/sales-chart?wait=long')).status, 200, '失敗の後も数が戻る (busy にならない)');
+
+      // DB との道が黙って止まる (statement_timeout も効かない) = 期限 + answerGraceMs で時間切れと答える (読み込み中のままにしない)。
+      //   枠は接続を閉じ終わるまで返さない = その間の長い読みは busy (止まった接続を積み上げない・Codex R2 High)。後から来た答え (ここでは 55P03 の誤り) は捨てる (2 度送って落ちない・Codex R2 Medium)
+      Object.assign(SALES_CHART_LIMITS, { longMs: 100, answerGraceMs: 150 });
+      let open2; gate = { wait: new Promise((ok) => { open2 = ok; }) };
+      const openedBefore = opened, endedBefore = ended;
+      const t0 = Date.now();
+      const stuck = await get('/api/sku/sc-a/sales-chart?wait=long');
+      assert.deepEqual([stuck.status, stuck.j.reason], [503, 'timeout'], JSON.stringify(stuck.j));
+      assert.ok(Date.now() - t0 < 2000, `止まった読みも期限 + 少しで答える (${Date.now() - t0} ms)`);
+      const again = await get('/api/sku/sc-a/sales-chart?wait=long');
+      assert.deepEqual([again.status, again.j.reason, opened], [503, 'busy', openedBefore + 1], '止まった接続が残る間は次の長い読みを重ねない (接続を開かない)');
+      mode = 'locked'; gate = null; open2();
+      while (ended < endedBefore + 1) await new Promise((ok) => setTimeout(ok, 10));   // 止めていた読みが後から誤りで終わって接続を閉じる (答えは送らない)
+      mode = 'ok';
+      assert.equal((await get('/api/sku/sc-a/sales-chart?wait=long')).status, 200, '接続を閉じたら枠が戻る');
+    } finally { __setPgClientFactory(factory); gate = null; Object.assign(SALES_CHART_LIMITS, keep); }
   });
 } finally {
   server.close();

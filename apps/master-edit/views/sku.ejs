@@ -626,6 +626,8 @@
         </div>
       </div>
       <div class="hint sc-sum" id="sc-sum" aria-live="polite">読んでいます…</div>
+      <%# 🆕 10/19: 時間切れ (8 秒) のときだけ出す = 押すと長く (30 秒まで) 待って読み直す (public/me-sales-chart.js) %>
+      <div class="sc-retry" id="sc-retry" hidden><button type="button" class="btn soft sm" id="sc-retry-btn">もう一度読む (時間がかかることがあります)</button><span class="sc-wait hint" id="sc-wait" hidden><span class="sc-spin" aria-hidden="true"></span>読み込み中…</span></div>
       <ul class="sc-legend" id="sc-legend" hidden></ul>
       <div class="sc-chart" id="sc-chart" tabindex="0" role="group" aria-roledescription="グラフ" aria-label="販売数のグラフ (左右の矢印で期間を選ぶ)" aria-describedby="sc-sum" hidden>
         <div class="sc-svg" id="sc-sales"></div>

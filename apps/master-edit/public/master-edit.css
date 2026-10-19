@@ -1320,6 +1320,13 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
   --sc-grid: rgba(125, 170, 255, 0.10); --sc-axis: rgba(125, 170, 255, 0.32); --sc-hl: rgba(233, 238, 252, 0.07); }
 .sc-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
 .sc-bar .seg button { height: 32px; padding: 0 12px; }
+/* 時間切れの後の「もう一度読む」と 読み込み中… (10/19) */
+.sc-retry { display: flex; gap: 8px 12px; align-items: center; flex-wrap: wrap; margin: 8px 0 4px; }
+.sc-retry .btn { max-width: 100%; white-space: normal; height: auto; min-height: 32px; text-align: left; }
+.sc-wait { display: inline-flex; align-items: center; gap: 8px; }
+.sc-spin { width: 14px; height: 14px; flex: none; border-radius: 50%; border: 2px solid var(--line-strong); border-top-color: var(--accent); animation: scspin 0.8s linear infinite; }
+@keyframes scspin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .sc-spin { animation: none; } }
 .sc-legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 8px 0 6px; font-size: 13px; color: var(--text2); }
 .sc-legend li { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
 .sc-legend b { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
