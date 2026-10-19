@@ -188,6 +188,8 @@
           <% } %>
           <%# 🆕 0087: 梱包した状態の 縦・横・高さ・重さ (入れなくてよい・0087 の前の DB = 欄を出さない) %>
           <% if (locals.packageReady) { %><%- include('_package-new', { dis, forAll: false }) %><% } %>
+          <%# 🆕 0090: 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・入れなくてよい・0090 の前の DB = 欄を出さない) %>
+          <% if (locals.labelNew) { %><%- include('_label-new', { dis, forAll: false, ln: labelNew }) %><% } %>
           <% } %>
         </section>
 

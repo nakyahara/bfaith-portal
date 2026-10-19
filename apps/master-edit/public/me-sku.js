@@ -401,6 +401,7 @@
       'pkg_length', 'pkg_width', 'pkg_height', 'pkg_weight'];   // ロジザードの 2 つは下書きの間だけ欄が出る (無ければ送らない)・🆕 0084 のメーカー (隠した欄 = 名簿の番号・空 = 外す・欄が無い = 送らない)・🆕 0087 梱包の大きさ・重さは 0087 があって直せるときだけ欄が出る
   // 🆕 0088: ブランド (隠した欄 = 名簿の番号・空 = 外す)・区分・終売の予定日 (単品だけ・欄が無い = 送らない)
   if (!isSet) FIELDS = FIELDS.concat(['brand', 'life_stage', 'end_planned_on']);
+  if (!isSet) FIELDS = FIELDS.concat(['lbl_country', 'lbl_net', 'lbl_net_uom', 'lbl_model', 'lbl_shelf']);   // 🆕 0090 表示の項目 (0090 があって直せるときだけ欄が出る・無ければ送らない)
   function collect() {
     var values = {};
     FIELDS.forEach(function (f) {

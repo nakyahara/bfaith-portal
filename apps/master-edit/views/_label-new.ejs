@@ -1,0 +1,22 @@
+<%#
+  🆕 0090 表示の項目 (新商品の登録の単品・まとまりの共通の欄・Company DB構想 27 ④-1)。入れなくてよい (「値か入力なし」にも数えない)。
+  送る値 = 本文の label = { country, net, net_uom, model, shelf } (me-new.js / me-variation.js の labelBody・全部空 = 送らない)
+  渡す値: dis = ' disabled' | ''・forAll = まとまり (全部の子に同じ値・型番は聞かない)・ln = { suggest, uoms }
+%>
+<div class="f" data-row="label_country"><label class="lab" for="np-lbl-country">原産国<span class="opt">入れなくても可</span></label>
+  <div class="ctl"><input class="in w-m" id="np-lbl-country" list="np-lbl-country-list" autocomplete="off" maxlength="40" placeholder="例: 日本" data-dirty-field="label_country" data-label="原産国"<%= dis %>>
+    <datalist id="np-lbl-country-list"><% for (const s of ln.suggest) { %><option value="<%= s %>"></option><% } %></datalist>
+    <span class="hint">国名で (例: 日本・中国) · 「製」は付けません · Company DB だけ (NE には送りません) · product-hub (楽天の出品) が読みます</span></div></div>
+<div class="f" data-row="label_net"><div class="lab" id="lab-np-lbl-net">内容量<span class="opt">入れなくても可</span></div>
+  <div class="ctl"><span class="lbl-net" role="group" aria-labelledby="lab-np-lbl-net">
+    <label class="sr" for="np-lbl-net">内容量の数</label><input class="in w-s" id="np-lbl-net" inputmode="decimal" autocomplete="off" maxlength="12" placeholder="例: 50" data-dirty-field="label_net" data-label="内容量"<%= dis %>>
+    <label class="sr" for="np-lbl-net-uom">内容量の単位</label><select class="in w-xs" id="np-lbl-net-uom" data-dirty-field="label_net_uom" data-label="内容量の単位"<%= dis %>><option value="">単位</option><% for (const u of ln.uoms) { %><option value="<%= u %>"><%= u %></option><% } %></select></span>
+    <span class="hint">数 + 単位 (ml / g / 枚 / 個) · 小数は 2 けたまで<%= forAll ? ' · 全部の子に同じ値 (サイズで違うときは空のまま登録して、あとで商品の画面で子ごとに)' : '' %></span></div></div>
+<% if (!forAll) { %>
+<div class="f" data-row="label_model"><label class="lab" for="np-lbl-model">メーカー型番<span class="opt">入れなくても可</span></label>
+  <div class="ctl"><input class="in w-m mono" id="np-lbl-model" autocomplete="off" maxlength="60" data-dirty-field="label_model" data-label="メーカー型番"<%= dis %>>
+    <span class="hint">メーカーが付けた型番 (楽天の商品仕様の「メーカー型番」) · JAN・自社の商品コードとは別</span></div></div>
+<% } %>
+<div class="f" data-row="label_shelf"><label class="lab" for="np-lbl-shelf">消費期限の目安<span class="opt">入れなくても可</span></label>
+  <div class="ctl"><input class="in w-xs" id="np-lbl-shelf" inputmode="numeric" autocomplete="off" maxlength="5" data-dirty-field="label_shelf" data-label="消費期限の目安 (日数)"<%= dis %>><span class="unit">日</span>
+    <span class="hint">製造 (入荷) から何日もつか · 食品・化粧品など期限のある商品だけ (ほかは空のまま) · ロジザードの有効期限の管理とは別<%= forAll ? ' · 全部の子に同じ値' : '' %></span></div></div>

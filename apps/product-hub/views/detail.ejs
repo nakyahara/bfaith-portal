@@ -2229,6 +2229,8 @@ th.attr-unknown { color: #dc2626; }
       商品タイプを選ぶと、そのタイプで入力が要る項目だけが表示されます (値が入っている項目は常に表示)。
       <span style="color:#dc2626">*必須</span> は楽天の必須記載事項です。
     </p>
+    <%# 🆕 0090 表示の項目を商品マスタ (Company DB) と比べる箱 (Company DB構想 27 ④-2・読むだけ・部品 = _cdb-label.ejs) %>
+    <%- include('_cdb-label', { draftId: draft.id }) %>
     <div class="grid-2">
       <div class="field">
         <label>商品タイプ<span class="ftag ftag-m">手入力</span></label>
