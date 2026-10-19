@@ -588,7 +588,7 @@ await ta('[13] 朝のまとめの「NE の商品コードの書き方」(10/16 �
   // この daily-sync の回 (DAILY_SYNC_RUN_ID = ds_test) の証跡 → まとめの行
   const want = ['⚠️ NE の商品コードの書き方 2 件 (ロジザードに取り込んでいません)',
     '・b-2: NE に大文字・小文字だけ違う書き方が 2 つ (B-2 / b-2)・ロジザード = B-2 → NE で 1 つにそろえる',
-    '・u60e-10: NE = u60e-10 / ロジザード = U60E-10 → NE を U60E-10 に直す'];
+    '・u60e-10: NE = u60e-10 / ロジザード = U60E-10 → NE を U60E-10 に直す (NE の試しの後はポータルの「NEへ送る」が直します)'];
   assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_test' }), want);
   // 別の回・別の日・回の印が無い (手で流した) = 何も足さない
   assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_other' }), []);
@@ -625,7 +625,7 @@ await ta('[13] 朝のまとめの「NE の商品コードの書き方」(10/16 �
     '・c-2: NE の書き方が使えない (使えない文字・壊れた記録) → NE の商品コードを確かめる',
     '・c-3: NE に同じコードに読める商品が 2 つ以上・ロジザード = C-3 → NE で 1 つにそろえる',
     '・c-4: NE = c-4 / ロジザード = C-4 / c-4 (書き方が 2 つ) → どれが正しいか確かめて NE とロジザードをそろえる',
-    '・c-5: NE = c-5 / ロジザード = C-5 → NE を C-5 に直す',
+    '・c-5: NE = c-5 / ロジザード = C-5 → NE を C-5 に直す (NE の試しの後はポータルの「NEへ送る」が直します)',
   ]);
   // 上限 10 行 + ほか N 件 (件数は全部)
   const many = N.noticeLines(Array.from({ length: 12 }, (_, i) => ({ code_norm: `m-${String(i).padStart(2, '0')}`, ne_code: null, reason: 'code_collided' })));

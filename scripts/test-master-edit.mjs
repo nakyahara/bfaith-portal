@@ -517,7 +517,7 @@ await ta('[3] 単品: 名前・取扱・売価・税率・分類・送料・月�
   assert.deepEqual(await primaryOf('s003'), ['0002']);
   assert.equal((await reqRow(id)).status, 'done');
   assert.deepEqual((await reqRow(id)).result.changed.length, 7);
-  assert.ok(r.ne_steps.some((s) => /翌朝の照合/.test(s)));
+  assert.ok(r.ne_steps.some((s) => /「NEへ送る」の画面で CSV を作って取り込みます/.test(s)));
 });
 
 await ta('[3] 変更の記録: トリガーが actor = human・メール・portal_master_edit・request_id・理由を残す。設定は取引の外に漏れない', async () => {

@@ -44,6 +44,12 @@
  *   POST /api/ne-delete/exports/:id/download  ファイルを受け取る (作った JST の日だけ・中の品目が全部まだ依頼の途中のときだけ・初めてのダウンロードを残す = GET にしない)
  *   POST /api/ne-delete/items/:id/withdraw    依頼を取り下げる { reason, request_id }
  *   POST /api/ne-delete/handling    断られた単品の代わりに取扱中止の CSV を作る { item_ids, reason, request_id, confirm: true }
+ *   ── NE へ送る (🆕 0094・AI_reference CompanyDB構想/25・10/19 中原さん「差分がある部分を 1 日 1 回アップ・都度アップも」・lib/master-ne-update.mjs) ──
+ *   GET  /ne-update                 画面「NEへ送る」= 自社で直したけれど今朝の NE と違う所の一覧とボタン 1 つ (見るのはだれでも)
+ *   POST /api/ne-update/send-now    今すぐ NE へ送る { request_id } (頼みを積む = miniPC の送り手が数分で上げる・名簿 MASTER_EDITORS の人)
+ *   POST /api/ne-update/csv         CSV を作る (NE にアップする用) { request_id } (送り手が止まっているとき・名簿 MASTER_EDITORS の人)
+ *   POST /api/ne-update/files/:id/download  作った CSV を受け取る (作った日だけ・初めてのダウンロードを残す = GET にしない)
+ *   POST /api/ne-update/verified    NE の実物の試しの結果 { kind, col, entry, result, sha256?, note? } (名簿 MASTER_DECISION_APPROVERS の人)
  *   ── 発注の設定 (10/9・発注アプリの po_* に書く・apps/master-edit/order-settings.mjs → apps/purchase-orders/order-settings.js の 1 つの部品) ──
  *   POST /api/new の order_settings = { order_lot?, condition_id?, material_group_id?, capacity_per_unit?, case_group?, case_lot?, new_condition?, new_material? } (単品だけ):
  *        ① の前に形・グループ・代表の仕入先を確かめる (誤り = 400 / 409・何も書かない) → ① Company DB の登録 → 通ったら ② 発注アプリに書く。
@@ -147,6 +153,7 @@ import {
 import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
 import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, buildHandling, readNeDelOverview, neDelAvailable, hideBackorder, hideBackorderText, NE_DEL_STATUS_WORDS, NE_DEL_KIND_WORDS, NE_DEL_MAX } from '../../lib/master-ne-delete.mjs';
 import { readNeDeleteStock } from './ne-delete-stock.mjs';
+import { readNeUpdate, readSkuNeDiff, requestNeSendNow, makeNeUpdateCsv, downloadNeUpdateFile, recordNeUpdateVerified, VERIFY_TARGETS, COL_WORDS as NE_UPD_COL_WORDS } from '../../lib/master-ne-update.mjs';
 // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
@@ -1270,6 +1277,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   }
   res.render(view('sku.ejs'), {
     vendorSettings,
+    // 🆕 0093: NE とちがう所の数 (ふつうの言葉の 1 行と「NEへ送る」へのリンクだけ)。0093 の前・読めない = null (出さない)
+    neDiff: page ? await readSkuNeDiff(db, page.cur.sku_id) : null,
     // 🆕 0090: 表示の項目 (単品の商品の行だけ・人の値 + いま使う値 + product-hub の今の値 (参考・読むだけ))。読めない = 出さない (画面は止めない)
     label: page && page.cur.sku_kind === 'single' && page.cur.product_id ? await readLabelBlock(db, page.cur) : null,
     gone,
@@ -2274,6 +2283,36 @@ router.post('/api/ne-delete/items/:id/withdraw', (req, res) => neDelApi(req, res
   { actor, itemId: req.params.id, reason: b.reason, requestId: b.request_id }, { open: isOpen() }))));
 router.post('/api/ne-delete/handling', (req, res) => neDelApi(req, res, async (db, actor, b) => res.json(await buildHandling(db,
   { actor, itemIds: b.item_ids, reason: b.reason, requestId: b.request_id, confirm: b.confirm === true }, { open: isOpen() }))));
+
+// ─── NE へ送る (🆕 0094・lib/master-ne-update.mjs) ───
+router.get('/ne-update', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  const phase = await readPhaseView(db);
+  const view0 = db ? await readNeUpdate(db) : null;
+  const gate = editorGate(req);
+  const approver = approverGate(req);
+  res.render(view('ne-update.ejs'), {
+    ...pageLocals(req, phase), nav: 'neupd', dbError, nu: view0, canSend: gate.ok && !!view0 && view0.ready, sendMessage: gate.message || '',
+    canVerify: approver.ok, VERIFY_TARGETS, COL_WORDS: NE_UPD_COL_WORDS,
+  });
+}));
+/** NE へ送るの書き込み = 名簿 (MASTER_EDITORS) の人だけ (設計 25 Q2 a)・この画面だけのロールで */
+function neUpdApi(req, res, fn, gateOf = editorGate) {
+  const gate = gateOf(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });
+  const actor = String(req.session.email).trim().toLowerCase();
+  return withPgApi(res, async (db) => { res.set('Cache-Control', 'no-store'); return fn(db, actor, req.body || {}); }, 'write');
+}
+router.post('/api/ne-update/send-now', (req, res) => neUpdApi(req, res, async (db, actor, b) => res.json({ ok: true, ...(await requestNeSendNow(db, { actor, requestId: b.request_id })) })));
+router.post('/api/ne-update/csv', (req, res) => neUpdApi(req, res, async (db, actor, b) => res.json({ ok: true, ...(await makeNeUpdateCsv(db, { actor, requestId: b.request_id })) })));
+router.post('/api/ne-update/files/:id/download', (req, res) => neUpdApi(req, res, async (db, actor) => {
+  const f = await downloadNeUpdateFile(db, { actor, fileId: req.params.id });
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
+  res.set('X-Content-SHA256', f.sha256);
+  res.send(f.bytes);
+}));
+router.post('/api/ne-update/verified', (req, res) => neUpdApi(req, res, async (db, actor, b) => res.json({ ok: true, ...(await recordNeUpdateVerified(db,
+  { actor, kind: b.kind, col: b.col, entry: b.entry || 'bulk', result: b.result, sha256: b.sha256 ?? null, note: b.note ?? null })) }), approverGate));
 
 router.post('/api/sku/:code', (req, res) => {
   const gate = editorGate(req);

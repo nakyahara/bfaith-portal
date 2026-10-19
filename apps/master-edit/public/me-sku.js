@@ -113,7 +113,7 @@
     if (!isSet && has('handling') && hv('handling') === 'discontinued') {
       if (sets.length) out.push([1, 'この商品を使うセット ' + sets.join('・') + ' も中止になります (構成品が 1 つでも中止ならセットも中止)']);
       if (P.amazon) out.push([1, 'この商品を使う Amazon SKU が ' + P.amazon + ' 件あります (Amazon SKU の対応はそのままです)']);
-      if (!(P.reg === 'draft' || P.reg === 'ne_pending')) out.push([0, 'NE の取扱区分は、翌朝の照合で NE との差になり CSV で入れます']);
+      if (!(P.reg === 'draft' || P.reg === 'ne_pending')) out.push([0, 'NE の取扱区分は「NEへ送る」の画面で CSV を作って NE に取り込みます']);
     }
     if (!isSet && has('handling') && hv('handling') === 'active' && P.handling === 'discontinued' && sets.length) out.push([0, 'セット ' + sets.join('・') + ' の取扱も計算し直します (ほかの構成品も取扱中なら取扱中に戻ります)']);
     if (!isSet && has('tax_rate') && sets.length) out.push([0, 'この商品を使うセット ' + sets.join('・') + ' の税率も計算し直します (変わったら「NE でやること」に出ます)']);
@@ -126,7 +126,7 @@
     var neCsv = keys.filter(function (k) { var el = firstEl(k); return el && el.getAttribute('data-ne') === 'NE へ CSV' && k !== 'handling'; });
     var notInNe = P.reg === 'draft' || P.reg === 'ne_pending';   // 新商品で NE にまだ無い = NE への登録は NE 登録の CSV
     if (neCsv.length && notInNe) out.push([0, '新商品なので、NE への登録は「NE 登録の CSV」で行います (翌朝の照合の差にはなりません)']);
-    else if (neCsv.length) out.push([0, neCsv.map(function (k) { return k === 'cost' ? '原価' : (firstEl(k).getAttribute('data-label') || k); }).join('・') + ' は、翌朝の照合で NE との差になり、マスタの判断の CSV で NE に入れます']);
+    else if (neCsv.length) out.push([0, neCsv.map(function (k) { return k === 'cost' ? '原価' : (firstEl(k).getAttribute('data-label') || k); }).join('・') + ' は「NEへ送る」の画面で CSV を作って NE に取り込みます']);
     var regTouched = keys.filter(function (k) { return (P.regFields || []).indexOf(k) >= 0; });
     if (regTouched.length && (P.regBuilt || []).length) out.push([1, 'まだ配っていない NE 登録の CSV (ファイル ' + P.regBuilt.map(function (x) { return '#' + x; }).join('・') + ') は「使わない」になります (作り直してください)']);
     if (isSet && has('components')) {
