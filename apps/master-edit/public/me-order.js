@@ -307,6 +307,7 @@
             r.setAttribute('data-init', vVals(r));
             var sb = $('.po-v-save', r); if (sb) sb.textContent = '足す';
             var del = $('.po-v-del', r); if (del) del.parentNode.removeChild(del);
+            vState(r);   // 欄を開き直す (送っている間に閉じた・Codex #⑤ 統合の確かめ P2)
             vMsg(r, '消しました', 'ok');
           } else {
             r.parentNode.removeChild(r);

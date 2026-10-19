@@ -1412,11 +1412,6 @@ router.post('/api/new', (req, res) => {
     // ② がもう済んだ request_id (やり直し) = 前の結果を返すだけなので確かめない。まだ = 形・グループ・仕入先を確かめる (印 = validate-only・書かない)
     try { if (!registrationOrderDone(b.request_id)) writeOrderSettings({ ...orderInput, via: 'master-edit:new', seen: 'validate-only' }, { dryRun: true }); }
     catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
-    // 🆕 ⑤-2: 先方品番 = 代表の仕入先が発注アプリにある・この商品コードの行がまだ無い (書かない確かめ・届けるときにもう一度)
-    if (orderBase.vendor && !registrationOrderDone(b.request_id)) {
-      try { checkRegistrationVendor({ supplierCode: orderInput.supplierCode, code: b.code }); }
-      catch (e) { if (e instanceof VendorCodeError) return res.status(e.status).json({ ok: false, error: `発注の設定: ${e.message}`, reason: e.reason, field: `order_settings.${e.field || 'vendor_code'}` }); throw e; }
-    }
   }
   return withPgApi(res, async (db) => withRequestLock(db, b.request_id, async () => {   // 🆕 #1719 R5: 同じ request_id は 1 つずつ (鍵の後に保存済みかを見る)
     // 🆕 0075: 0075 が入っている = 発注の設定は ① と同じ取引の知らせ → commit の後に届ける (届かなくても知らせは残る = 届け直す)。
@@ -1433,6 +1428,12 @@ router.post('/api/new', (req, res) => {
     if (orderBase && orderBase.vendor && !po.replay && !(outbox && (await orderPayloadV2Ready(db)))) {
       return res.status(400).json({ ok: false, reason: 'vendor_not_ready', field: 'order_settings.vendor_code',
         error: '発注の設定: 先方品番・入数は、まだ新商品の登録では入れられません (Company DB の更新の前)。先方品番を空にして登録し、登録の後に商品の画面で入れてください。何も保存していません' });
+    }
+    // 🆕 ⑤-2: 先方品番 = 代表の仕入先が発注アプリにある・この商品コードの行がまだ無い (書かない確かめ・届けるときにもう一度)。
+    //   押し直し (この request_id の記録がある = 登録は済み・届け待ちのこともある) = 確かめない (lib が前の答えを返す・届けたあとに人が対応表を直していても 409 にしない)
+    if (orderBase && orderBase.vendor && !po.replay && !registrationOrderDone(b.request_id)) {
+      try { checkRegistrationVendor({ supplierCode: orderInput.supplierCode, code: b.code }); }
+      catch (e) { if (e instanceof VendorCodeError) return res.status(e.status).json({ ok: false, error: `発注の設定: ${e.message}`, reason: e.reason, field: `order_settings.${e.field || 'vendor_code'}` }); throw e; }
     }
     // 🆕 0080: 単品 = ロジザードのバーコード (値か空欄) が要る・ロジザードの写しでほかの商品の値 = 409 (何も書かない)
     let lzCopy = null;

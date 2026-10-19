@@ -2108,11 +2108,18 @@ await ta('[PO9] ⑤-2 新商品の登録の先方品番・入数 = 知らせ v2 
   // 届ける前 (Render の外 = すぐは届けない) に人が対応表で足して消した = 届けても戻さない (要確認)
   OSO.__setOrderDeliveryEnabledForTest(false);
   try {
-    const late = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9d', { ...emptyPatch, vendor_code: 'AC-9D' }), session: 'po-editor' });
+    var lateBody = orderBody('po-web-9d', { ...emptyPatch, vendor_code: 'AC-9D' });
+    const late = await call('POST', '/apps/master-edit/api/new', { body: lateBody, session: 'po-editor' });
     assert.equal(late.status, 200, late.text);
   } finally { OSO.__setOrderDeliveryEnabledForTest(true); }
   const VCM = await import('../apps/purchase-orders/vendor-codes.js');
   VCM.upsertVendorCode({ supplierCode: '1', productCode: 'po-web-9d', vendorCode: 'HUMAN-9D', baseUpdatedAt: null, prod: { prodSup: '1', error: null }, actor: 'other@test', via: 'po-admin' });
+  // 届け待ちの間に人が対応表に行を足した後の押し直し = 前の答え (先方品番の確かめで 409 にしない・統合の Codex P2)
+  OSO.__setOrderDeliveryEnabledForTest(false);
+  try {
+    const lateAgain = await call('POST', '/apps/master-edit/api/new', { body: lateBody, session: 'po-editor' });
+    assert.deepEqual([lateAgain.status, lateAgain.j.replayed], [200, true], lateAgain.text);
+  } finally { OSO.__setOrderDeliveryEnabledForTest(true); }
   VCM.deleteVendorCode({ supplierCode: '1', productCode: 'po-web-9d', base: vmapOf('1', 'po-web-9d').updated_at, actor: 'other@test', via: 'po-admin' });
   OSO.__resetOrderOutboxCacheForTest();
   await call('GET', '/apps/master-edit/api/order-settings-outbox', { session: 'po-editor' });

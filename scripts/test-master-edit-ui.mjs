@@ -3406,6 +3406,7 @@ await ta('[79] ⑤-1 商品の画面の先方品番・入数 (CompanyDB構想 27
     await p.waitForFunction((s) => /消しました/.test(document.querySelector(s + ' .po-v-msg').textContent), r1);
     assert.equal(vrow('1'), null);
     assert.deepEqual([await p.inputValue(`${r1} .po-v-code`), await p.textContent(`${r1} .po-v-save`), await p.$(`${r1} .po-v-del`)], ['', '足す', null]);
+    assert.equal(await p.isDisabled(`${r1} .po-v-code`), false, '消した後に「足す」の欄が開いている (統合の Codex P2)');
     // ほかの仕入先の古い行 = 消すだけ (行ごと消える)
     await p.click('#po-vendor .po-vrow[data-sup="7"] .po-v-del');
     await p.waitForFunction(() => !document.querySelector('#po-vendor .po-vrow[data-sup="7"]'));
