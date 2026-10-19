@@ -327,7 +327,8 @@ export const LABEL_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_label_tables
 export const NE_UPD_EDIT_FUNCTIONS = Object.freeze(['ops.ne_upd_overview()', 'ops.ne_upd_sku(bigint)', 'ops.ne_upd_request_now(uuid, text)', 'ops.ne_upd_make_download(uuid, text)',
   'ops.ne_upd_download(text, bigint)', 'ops.ne_upd_record_verified(text, text, text, text, text, text, text)']);
 export const NE_UPD_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_ne_upd_write()', 'ops.ne_upd_cols()', 'ops.ne_upd_cell(text, jsonb, text)', 'ops.ne_upd_quote(text)', 'ops.ne_upd_text(text)',
-  'ops.ne_upd_yen(numeric)', 'ops.ne_upd_units(bigint[])', 'ops.ne_upd_auto_limit()', 'ops.ne_upd_file_limit()', 'ops.ne_upd_busy()', 'ops._ne_upd_fill(bigint, boolean, text)',
+  'ops.ne_upd_yen(numeric)', 'ops.ne_upd_units(bigint[])', 'ops.ne_upd_auto_limit()', 'ops.ne_upd_file_limit()', 'ops.ne_upd_busy()', 'ops._ne_upd_fill(bigint, boolean, text, boolean)',
+  'ops.ne_upd_jstrim(text)', 'ops.ne_upd_file_out(text, timestamp with time zone, timestamp with time zone)',
   'ops._ne_upd_begin()', 'ops._ne_upd_worker_state()', 'ops._ne_upd_actor_ok(text)']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };

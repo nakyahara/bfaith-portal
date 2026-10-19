@@ -99,7 +99,7 @@ try {
       return r;
     };
     const recNe = (c, r) => c.query('select ops.record_ne_values($1::jsonb) as r', [JSON.stringify(nev(r, Date.now()))]).then((x) => x.rows[0].r);
-    const build = (c, how) => c.query('select ops.ne_upd_build($1, $2) as r', [how, 'minipc-pg']).then((x) => x.rows[0].r);
+    const build = (c, how) => c.query('select ops.ne_upd_build($1, $2, true) as r', [how, 'minipc-pg']).then((x) => x.rows[0].r);
     const markRun = async () => (await O.query('select compare_run_id from ops.master_ne_values_mark')).rows[0]?.compare_run_id ?? null;
 
     const r0 = await newRun();

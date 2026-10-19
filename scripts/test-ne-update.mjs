@@ -224,13 +224,16 @@ async function loadWrite(sql, p) {
 }
 const units = async (codes = null) => jsonOf((await one('select ops.ne_upd_units($1::bigint[]) as r', [codes ? await Promise.all(codes.map(sid)) : null])).r);
 const unitOf = (u, code, col) => u.units.find((x) => x.code_norm === code && x.col === col);
-const build = async (how) => jsonOf((await one('select ops.ne_upd_build($1, $2) as r', [how, 'minipc-test'])).r);
-const fileResult = (id, que, st, msg = null) => one('select ops.ne_upd_file_result($1, $2, $3, $4) as r', [id, que, st, msg]);
+/** 作る (既定 = API で上げるファイル = 送り手が claimed)。upload = false = 人が受け取る CSV */
+const build = async (how, upload = true) => jsonOf((await one('select ops.ne_upd_build($1, $2, $3) as r', [how, 'minipc-test', upload])).r);
+/** 上げた結果。st = 2 (ok) / -1 (failed) / 1 / null (queued) */
+const fileResult = (id, que, st, msg = null) => one('select ops.ne_upd_file_result($1, $2, $3, $4, $5) as r',
+  [id, que, st === 2 ? 'ok' : st === -1 ? 'failed' : 'queued', st, msg]);
 const csvOf = (f) => Buffer.from(f.bytes_b64, 'base64').toString('utf8');
 /** 前の回のファイルを全部「NE が受け付けた」にする (次の試験の邪魔をしない) */
 async function settleAll(status = 2) {
   for (const f of await q(`select f.file_id::text as id, coalesce(f.que_id, '1') as que from ops.ne_upd_files f join ops.ne_upd_sends s on s.send_id = f.send_id
-     where s.how <> 'download' and f.state in ('made', 'queued')`)) await fileResult(f.id, f.que, status);
+     where f.claimed_by is not null and f.state in ('made', 'queued')`)) await fileResult(f.id, f.que, status);
 }
 
 await seedLz({ 'u60e-10': 'U60E-10', 'u60e-05': 'U60E-05', 'k03': ['K03', 'k03'] });
@@ -394,7 +397,8 @@ await ta('[B1] 単品とセットは別のファイル・確かめていない�
   assert.equal(unitOf(u, 'a01', 'cost').status, 'sending');
   assert.equal(unitOf(u, 'u60e-05', 'cost').status, 'sending');
   for (const f of files) { await fileResult(f.file_id, String(100 + Number(f.file_id)), null); }
-  assert.equal((await one('select state from ops.ne_upd_sends where send_id = $1', [b.send_id])).state, 'sending');
+  assert.equal((await one('select state from ops.ne_upd_sends where send_id = $1', [b.send_id])).state, 'sent', 'NE に上げた = 送った (キューは聞かない = 翌朝の照合で確かめる)');
+  assert.equal(unitOf(await units(), 'a01', 'cost').status, 'sending');
   for (const f of files) await fileResult(f.file_id, String(100 + Number(f.file_id)), 2);
   assert.equal((await one('select state from ops.ne_upd_sends where send_id = $1', [b.send_id])).state, 'sent');
 });
@@ -412,7 +416,12 @@ await ta('[B2] 自動は同じ今朝の回で 1 回 (前の答え)・今すぐ�
   await settleAll(2);
 });
 await ta('[B3] 確かめた欄 (空欄 = 変えない が ok) は空欄にして 1 ファイル', async () => {
+  // 空欄の確かめは入口ごと: 画面の一括登録 (bulk) だけ ok では API のファイルは分けたまま
   for (const col of ['standard_price_jpy', 'cost', 'name']) await q('select ops.ne_upd_record_verified($1, $2, $3, $4, $5, null, null)', ['naka@test', 'products', col, 'bulk', 'ok']);
+  const u0 = await units();
+  assert.deepEqual(u0.blank_ok.bulk.products, ['cost', 'name', 'standard_price_jpy']);
+  assert.deepEqual(u0.blank_ok.api.products, []);
+  for (const col of ['standard_price_jpy', 'cost', 'name']) await q('select ops.ne_upd_record_verified($1, $2, $3, $4, $5, null, null)', ['naka@test', 'products', col, 'api', 'ok']);
   await save('q02', { cost: { jpy: '122', reason: '試験' } });
   await save('q03', { standard_price: '1333' });
   await save('q04', { cost: { jpy: '144', reason: '試験' }, standard_price: '1444' });
@@ -422,7 +431,7 @@ await ta('[B3] 確かめた欄 (空欄 = 変えない が ok) は空欄にして
   assert.equal(p.length, 1, p.map((f) => f.header).join(' / '));
   assert.equal(csvOf(p[0]), 'syohin_code,baika_tnk,genka_tnk\r\nq02,,122\r\nq03,1333,\r\nq04,1444,144\r\n');
   await settleAll(2);
-  await q("select ops.ne_upd_record_verified('naka@test', 'products', c, 'bulk', 'ng', null, '戻す') from unnest(array['standard_price_jpy', 'cost', 'name']) c");
+  await q("select ops.ne_upd_record_verified('naka@test', 'products', c, e, 'ng', null, '戻す') from unnest(array['standard_price_jpy', 'cost', 'name']) c, unnest(array['bulk', 'api']) e");
 });
 await ta('[B4] 自動の上限 (100 行) を超える = held (何も作らない)・前のファイルを NE が受け付け中 = 自動は held / 今すぐは busy (頼みは残る)', async () => {
   // 101 行の差 (NE の値をずらす = 人が直したものにするため、保存の記録を作る)
@@ -435,7 +444,7 @@ await ta('[B4] 自動の上限 (100 行) を超える = held (何も作らない
   await seedNe({ ne: Object.fromEntries(many.map((c) => [c, { standard_price_jpy: 1000 }])), spell: { 'u60e-05': ['U60E-05', 'u60e-05'], q01: ['Q01', 'q01'] } });
   const b = await build('auto');
   assert.equal(b.state, 'held');
-  assert.match(b.reason, /上限 \(100 行\)/);
+  assert.match(b.reason, /毎朝の上限 \(100 欄\)/);
   assert.equal((await one('select count(*)::int as n from ops.ne_upd_files where send_id = $1', [b.send_id])).n, 0);
   // 今すぐ = 上限なし (1 ファイル 1,000 行まで)
   await q('select ops.ne_upd_request_now($1, $2)', [crypto.randomUUID(), 'naka@test']);
@@ -445,7 +454,7 @@ await ta('[B4] 自動の上限 (100 行) を超える = held (何も作らない
   // 受け付け中 = 今すぐは busy (頼みは残る)
   await save('a10', { standard_price: '1010' });
   const req = jsonOf((await one('select ops.ne_upd_request_now($1, $2) as r', [crypto.randomUUID(), 'naka@test'])).r);
-  for (const f of n.files) await fileResult(f.file_id, '777', 1);
+  for (const f of n.files) await fileResult(f.file_id, String(700 + Number(f.file_id)), 1);
   assert.equal((await build('now')).state, 'busy');
   assert.equal((await one('select state from ops.ne_upd_sends where send_id = $1', [req.send_id])).state, 'waiting');
   // 同じ頼みを 2 回押しても 1 つ
@@ -501,7 +510,7 @@ await ta('[D1] CSV で受け取る: 作る (同じ request_id = 前の答え)・
   const row = await one('select downloaded_by, download_count from ops.ne_upd_files where file_id = $1', [f.file_id]);
   assert.deepEqual([row.downloaded_by, row.download_count], ['naka@test', 1]);
   assert.equal(unitOf(await units(), 'q05', 'standard_price_jpy').status, 'sending', '受け取った = 送っている途中');
-  const up = await one("select f.file_id::text as id from ops.ne_upd_files f join ops.ne_upd_sends s on s.send_id = f.send_id where s.how <> 'download' limit 1");
+  const up = await one("select f.file_id::text as id from ops.ne_upd_files f where f.claimed_by is not null limit 1");
   assert.match(String((await errOf(() => q('select ops.ne_upd_download($1, $2)', ['naka@test', up.id])))?.message), /not_download/);
   // 違う人の同じ request_id = 断る
   assert.match(String((await errOf(() => q('select ops.ne_upd_make_download($1, $2)', [id, 'other@test'])))?.message), /request_id_reused/);
@@ -519,42 +528,72 @@ await ta('[D2] 画面の一覧 (ops.ne_upd_overview): 差・回 (ファイル・
 
 // ═══════════ [W] 送り手 ═══════════
 console.log('[W] 送り手');
-function fakeNe({ failUpload = false, status = 2 } = {}) {
+function fakeNe({ reject = false, cut = false, status = 2 } = {}) {
   const ups = [];
+  const asks = [];
   return {
-    ups,
-    async upload(kind, text) { if (failUpload) throw new Error('アクセス情報[xxx]の許可が必要です'); ups.push({ kind, text }); return { que_id: String(9000 + ups.length) }; },
-    async queStatus() { return { status, message: status === -1 ? '1件失敗' : '処理完了' }; },
+    ups, asks,
+    async upload(kind, text) {
+      if (reject) throw new S.NeRejected('NE API エラー: アクセス情報[xxx]の許可が必要です');
+      if (cut) throw new TypeError('fetch failed');
+      ups.push({ kind, text }); return { que_id: String(9000 + ups.length) };
+    },
+    async queStatus(id) { asks.push(id); return { status, message: status === -1 ? '1件失敗' : '処理完了' }; },
   };
 }
-await ta('[W1] 止めてある (NE_UPDATE_UPLOAD が無い) = 上げない・差の数だけ / 自動は NE_UPDATE_AUTO も要る', async () => {
+await ta('[W1] 毎朝 (API の口は既定で止めてある) = 人が受け取る CSV を作るだけ・まとめに差の数と内訳 / 今すぐの頼みは拾わない / API は呼ばない', async () => {
   await save('a03', { name: '商品 a03 改 2' });
+  // 新しい朝 (B4 の 101 欄は NE が同じになった)
+  await seedNe({ ne: Object.fromEntries(Array.from({ length: 101 }, (_, i) => [`m${String(i).padStart(3, '0')}`, { standard_price_jpy: 2222 }])), spell: { 'u60e-05': ['U60E-05', 'u60e-05'], q01: ['Q01', 'q01'] } });
   const ne = fakeNe();
   const r = await S.runNeUpdateSend({ db, ne, mode: 'daily', env: {}, host: 'minipc-test', sleep: async () => {} });
-  assert.equal(r.code, 0);
-  assert.match(r.line, /^⏸️ NEへ送る: 自動で NE に上げるのは止めてあります/);
-  assert.match(r.line, /今の差 \d+ 欄/);
-  const r2 = await S.runNeUpdateSend({ db, ne, mode: 'daily', env: { NE_UPDATE_UPLOAD: '1' }, host: 'minipc-test', sleep: async () => {} });
-  assert.match(r2.line, /NE_UPDATE_AUTO=1/);
-  assert.equal(ne.ups.length, 0);
+  assert.equal(r.code, 0, r.line);
+  assert.match(r.line, /^✅ NEへ送る: NE とちがう所 \d+ 欄 \(.*名前.*\) → ポータルの「NEへ送る」で CSV を作って NE に取り込んでください$/);
+  assert.doesNotMatch(r.line, /API|回数/);
+  const f = await one('select count(*)::int as n, count(*) filter (where claimed_by is null)::int as unclaimed from ops.ne_upd_files where send_id = $1', [r.sends[0].send_id]);
+  assert.ok(f.n >= 1 && f.n === f.unclaimed, JSON.stringify(f));
+  assert.equal(unitOf(await units(), 'a03', 'name').status, 'send', '作っただけ (だれも受け取っていない) = まだ送っていない');
+  const again = await S.runNeUpdateSend({ db, ne, mode: 'daily', env: {}, host: 'minipc-test', sleep: async () => {} });
+  assert.match(again.line, /今朝の分はもう作ってあります/);
+  const p = await S.runNeUpdateSend({ db, ne, mode: 'pending', env: {}, host: 'minipc-test', sleep: async () => {} });
+  assert.match(p.line, /API の口は止めてあります/);
+  assert.deepEqual([ne.ups.length, ne.asks.length], [0, 0]);
 });
 await ta('[W2] 今すぐ: 頼みを拾って上げる (単品 = master_goods・セット = setgoods)・受付の結果を残す・まとめの 1 行', async () => {
   await q('select ops.ne_upd_request_now($1, $2)', [crypto.randomUUID(), 'naka@test']);
   const ne = fakeNe();
-  const r = await S.runNeUpdateSend({ db, ne, mode: 'pending', env: { NE_UPDATE_UPLOAD: '1' }, host: 'minipc-test', sleep: async () => {}, waitMs: 0, pollMs: 0 });
+  const r = await S.runNeUpdateSend({ db, ne, mode: 'pending', env: { NE_UPDATE_UPLOAD: '1' }, host: 'minipc-test', sleep: async () => {}, waitMs: 0 });
   assert.equal(r.code, 0, r.line);
   assert.ok(ne.ups.some((x) => x.kind === 'products' && /a03,商品 a03 改 2\r\n/.test(x.text)), JSON.stringify(ne.ups));
-  assert.match(r.line, /^✅ NEへ送る \(今すぐ\): \d+ 欄 \(.*名前 1.*\) を NE に上げた \(NE が受け付けた/);
+  assert.match(r.line, /^✅ NEへ送る \(今すぐ\): \d+ 欄 \(.*名前 1.*\) を NE に上げました \(翌朝の照合/);
+  assert.equal(ne.asks.length, 0, 'キューの結果は聞かない (既定)');
   assert.equal(unitOf(await units(), 'a03', 'name').status, 'sending');
-  assert.equal((await one("select count(*)::int as n from ops.ne_upd_files f join ops.ne_upd_sends s on s.send_id = f.send_id where s.how <> 'download' and f.state in ('made', 'queued')")).n, 0);
+  assert.equal((await one("select count(*)::int as n from ops.ne_upd_files where claimed_by is not null and state = 'made'")).n, 0);
+  // キューを聞く設定 = 1 ファイル 1 回だけ
+  await save('a03', { name: '商品 a03 改 2b' });
+  await settleAll(2);
+  await q('select ops.ne_upd_request_now($1, $2)', [crypto.randomUUID(), 'naka@test']);
+  const ne2 = fakeNe();
+  const r2 = await S.runNeUpdateSend({ db, ne: ne2, mode: 'pending', env: { NE_UPDATE_UPLOAD: '1', NE_UPDATE_QUE_CHECK: '1' }, host: 'minipc-test', sleep: async () => {}, waitMs: 0 });
+  assert.equal(r2.code, 0, r2.line);
+  assert.equal(ne2.asks.length, ne2.ups.length);
+  assert.equal((await one("select state from ops.ne_upd_files where que_id = $1", [ne2.asks[0]])).state, 'ok');
 });
-await ta('[W3] NE が断った (アップロードの失敗) = ❌・ファイルは failed (もう一度送れる)', async () => {
+await ta('[W3] NE がはっきり断った = ❌・failed (もう一度送れる) / 通信が切れた = ⚠️ unknown (送り直さない = 送っている途中のまま・翌朝の照合を待つ)', async () => {
   await save('a03', { name: '商品 a03 改 3' });
   await q('select ops.ne_upd_request_now($1, $2)', [crypto.randomUUID(), 'naka@test']);
-  const r = await S.runNeUpdateSend({ db, ne: fakeNe({ failUpload: true }), mode: 'pending', env: { NE_UPDATE_UPLOAD: '1' }, host: 'minipc-test', sleep: async () => {}, waitMs: 0, pollMs: 0 });
+  const r = await S.runNeUpdateSend({ db, ne: fakeNe({ reject: true }), mode: 'pending', env: { NE_UPDATE_UPLOAD: '1' }, host: 'minipc-test', sleep: async () => {}, waitMs: 0 });
   assert.equal(r.code, 1);
   assert.match(r.line, /^❌ NEへ送る \(今すぐ\): .*アクセス情報/);
   assert.equal(unitOf(await units(), 'a03', 'name').status, 'send');
+  await q('select ops.ne_upd_request_now($1, $2)', [crypto.randomUUID(), 'naka@test']);
+  const r2 = await S.runNeUpdateSend({ db, ne: fakeNe({ cut: true }), mode: 'pending', env: { NE_UPDATE_UPLOAD: '1' }, host: 'minipc-test', sleep: async () => {}, waitMs: 0 });
+  assert.equal(r2.code, 0, r2.line);
+  assert.match(r2.line, /^⚠️ NEへ送る \(今すぐ\): .*届いたか分かりません/);
+  assert.equal(unitOf(await units(), 'a03', 'name').status, 'sending', '受付が分からない = 自動では送り直さない');
+  // 前の答えは同じファイルを 2 回上げない (バイト列を渡さない)
+  const rp = await build('auto');
+  assert.ok(rp.replayed && (rp.files || []).every((x) => !x.bytes_b64), JSON.stringify(rp));
 });
 
 // ═══════════ [P] 権限 ═══════════
@@ -563,9 +602,9 @@ await ta('[P1] master_edit = 画面の関数だけ (作る・結果・生存は�
   const can = async (role, fn) => (await one(`select has_function_privilege($1, $2, 'execute') as ok`, [role, fn])).ok;
   for (const f of ['ops.ne_upd_overview()', 'ops.ne_upd_sku(bigint)', 'ops.ne_upd_request_now(uuid, text)', 'ops.ne_upd_make_download(uuid, text)', 'ops.ne_upd_download(text, bigint)',
     'ops.ne_upd_record_verified(text, text, text, text, text, text, text)']) assert.equal(await can('master_edit', f), true, f);
-  for (const f of ['ops.ne_upd_build(text, text)', 'ops.ne_upd_file_result(bigint, text, integer, text)', 'ops.ne_upd_queued_files()', 'ops.ne_upd_worker_seen(text, boolean, boolean, text)',
-    'ops.ne_upd_units(bigint[])', 'ops._ne_upd_fill(bigint, boolean, text)']) assert.equal(await can('master_edit', f), false, f);
-  for (const f of ['ops.ne_upd_build(text, text)', 'ops.ne_upd_file_result(bigint, text, integer, text)', 'ops.ne_upd_queued_files()', 'ops.ne_upd_worker_seen(text, boolean, boolean, text)',
+  for (const f of ['ops.ne_upd_build(text, text, boolean)', 'ops.ne_upd_file_result(bigint, text, text, integer, text)', 'ops.ne_upd_queued_files()', 'ops.ne_upd_worker_seen(text, boolean, boolean, text)',
+    'ops.ne_upd_units(bigint[])', 'ops._ne_upd_fill(bigint, boolean, text, boolean)']) assert.equal(await can('master_edit', f), false, f);
+  for (const f of ['ops.ne_upd_build(text, text, boolean)', 'ops.ne_upd_file_result(bigint, text, text, integer, text)', 'ops.ne_upd_queued_files()', 'ops.ne_upd_worker_seen(text, boolean, boolean, text)',
     'ops.ne_upd_overview()']) assert.equal(await can('watch_writer', f), true, f);
   for (const f of ['ops.ne_upd_request_now(uuid, text)', 'ops.ne_upd_make_download(uuid, text)', 'ops.ne_upd_download(text, bigint)']) assert.equal(await can('watch_writer', f), false, f);
   for (const role of ['master_edit', 'watch_writer', 'watcher']) {
@@ -595,7 +634,7 @@ await ta('[P2] 画面のロールで呼べる (overview・頼み)・送り手の
   const o = await as('master_edit', async () => jsonOf((await one('select ops.ne_upd_overview() as r')).r));
   assert.ok(Array.isArray(o.units));
   await as('master_edit', () => q('select ops.ne_upd_request_now($1, $2)', [crypto.randomUUID(), 'naka@test']));
-  const b = await as('watch_writer', async () => jsonOf((await one('select ops.ne_upd_build($1, $2) as r', ['now', 'minipc-test'])).r));
+  const b = await as('watch_writer', async () => jsonOf((await one('select ops.ne_upd_build($1, $2, true) as r', ['now', 'minipc-test'])).r));
   assert.ok(['built', 'empty'].includes(b.state), JSON.stringify(b));
   await settleAll(2);
 });
@@ -612,10 +651,10 @@ await ta('[P3] ロールが先・0093 が後 (本番の当て方) でも同じ�
   const can = async (role, fn) => (await pg2.query(`select has_function_privilege($1, $2, 'execute') as ok`, [role, fn])).rows[0].ok;
   assert.equal(await can('master_edit', 'ops.ne_upd_overview()'), true);
   assert.equal(await can('master_edit', 'ops.ne_upd_request_now(uuid, text)'), true);
-  assert.equal(await can('master_edit', 'ops.ne_upd_build(text, text)'), false);
-  assert.equal(await can('watch_writer', 'ops.ne_upd_build(text, text)'), true);
+  assert.equal(await can('master_edit', 'ops.ne_upd_build(text, text, boolean)'), false);
+  assert.equal(await can('watch_writer', 'ops.ne_upd_build(text, text, boolean)'), true);
   assert.equal(await can('watch_writer', 'ops.ne_upd_download(text, bigint)'), false);
-  assert.equal(await can('watcher', 'ops.ne_upd_build(text, text)'), false);
+  assert.equal(await can('watcher', 'ops.ne_upd_build(text, text, boolean)'), false);
   assert.equal(await can('master_edit', 'ops.ne_upd_units(bigint[])'), false);
   await pg2.close();
 });

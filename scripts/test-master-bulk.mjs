@@ -146,7 +146,7 @@ await ta('[1] 項目の板の判定: 例外は常に対象外・セット・中�
     { cost: 'out', standard_price: 'out', handling: 'ok', sales_class: 'out', tax_rate: 'out', primary_supplier: 'out' });
   assert.equal(v('b001', 'cost'), 'block'); assert.equal(v('b001', 'standard_price'), 'ok');
   assert.equal(v('b003', 'cost'), 'block'); assert.match(r.items.find((x) => x.code === 'b003').fields.cost.why, /含むセット s003/);
-  assert.equal(v('b002', 'cost'), 'ok'); assert.equal(v('b002', 'standard_price'), 'ok');   // 🆕 10/19 (0093): CSV が出ていても保存できる assert.equal(v('b002', 'tax_rate'), 'ok');
+  assert.equal(v('b002', 'cost'), 'ok'); assert.equal(v('b002', 'standard_price'), 'ok'); assert.equal(v('b002', 'tax_rate'), 'ok');   // 🆕 10/19 (0093): CSV が出ていても保存できる
   assert.equal(r.items.find((x) => x.code === 'b001').fields.cost.reason, 'cost_future');
   assert.equal(r.items.find((x) => x.code === 'x001').fields.handling.reason, 'exception_sku');
   // 今の値 (値の欄の「今の値」)

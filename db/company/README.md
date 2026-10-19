@@ -2898,29 +2898,36 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   6. 商品の画面 (`/apps/master-edit/sku/0726-001931`) でグラフが出るのを見る。測った時間をこの節に書き足す
 - 試験 = `node scripts/test-master-sales-chart.mjs` (「速さ (0092)」= 索引の形・関数と同じ条件と列で Index Only Scan の計画が立つ・関数の本文が同じ形・数は同じ / 測る道具の純粋な関数)
 
-### NE へ送る = 自社で直したけれど今朝の NE と違う欄だけを CSV にして NE に上げる (0093 仮番号・AI_reference CompanyDB構想/25 の PR-2・2026-10-19 中原さんの方針の変更)
+### NE へ送る = 自社で直したけれど今朝の NE と違う欄だけを CSV にする (0093 仮番号・AI_reference CompanyDB構想/25 の PR-2・2026-10-19 中原さんの方針の変更)
 - **なぜ**: 商品の画面で原価・売価などを直しても、NE には翌朝の照合 → マスタの判断 → 列ごとの CSV を通さないと届かなかった (遅い・手間・出ている CSV の列は直せない)。
   10/19 中原さん「シンプルに自由に編集できて、取り込み時に照合して差分がある部分を CSV で 1 日 1 回アップしたらよくない？あとは都度都度アップできるみたいな機能と 2 種類あればいい」
-  → **編集は自由** (NE に取り込む CSV (0040) が出ている列も保存を止めない・`lib/master-write.mjs` の 6.)・**毎朝の自動** (daily-sync の段「NEへ送る」)・**今すぐ送る** (画面の頼み → miniPC の送り手)・翌朝 NE と同じになったものは差から消える
-- **差** `ops.ne_upd_units(SKU | null)` (読むだけ) = 単位 (SKU・欄) ごとに、今朝の NE の値 (0083・その種類の取得の始めが今日 (JST)・値と書き方が同じ回) が ok で区分が同じで Company DB の今の値 (D2 の正規化) と違い、
-  **その欄の今の値を最後に入れたのが人 (変更の記録の source_system = portal_master_edit)** のもの (夜間ロード・NE の観測の値 = わざと残した差は出さない)。止める理由 (blocked): 段階が new_open でない (not_open)・今朝の取得でない (ne_not_today)・
-  変更の後のマスタの判断 (差を残す・CDB を直す・入力を直す・仕様・却下 = decided / fix_ne の承認の目標が違う = decision_other_value)・新商品の途中 (new_product)・NE から消す依頼の途中 (deleting)・
-  コードの書き方が決まらない (ne_code_unknown / ne_collided / lz_many / lz_old)・CSV に書けない値 (name_is_code ほか = `ne-csv.mjs` の列の表と同じ決まり)。
-  送った後 (今朝の取得の後に作ったファイルに同じ値・同じ書き方) = sending (翌朝の照合で NE と同じになれば一覧から消える)・2 回 NE が受け付けたのにまだ違う = stuck (自動では送らない)。
-  コードの書き方 = 設計 25 §2.4 (NE の書き方 / ロジザードの書き方が 1 つ = ロジザードの書き方)。値の差が無い単品で書き方だけ違う = 原価 → 売価 → 名前の順に NE と同じ欄を 1 つ入れた行 (role spelling)
-- **ファイル** `ops.ne_upd_build(how, 送り手)` (鍵の下で差を作り直す = DB が今の値から作る・アプリから値・列名・バイト列を受け取らない)。1 行 = 1 SKU・単品とセットは別のファイル・UTF-8・BOM なし・CRLF・1,000 行まで。
-  空欄のセル = NE の実物で「空欄 = 変えない」を確かめた欄 (`ops.ne_upd_verified` の最後が ok・`ops.ne_upd_record_verified`) だけ。確かめていない欄は空欄にしない (欄の組ごとのファイル)。
-  自動 (auto) = 同じ今朝の NE の回で 1 回 (2 回目は前の答え)・100 行を超える / この 14 日の平均の 5 倍 (20 行より多い) = held (作らない)・前のファイルを NE が受け付け中 = held。今すぐ (now) = 画面の頼み (waiting) を古い順に・受け付け中 = busy (頼みは残る)。
-  受け取り (download) = NE の API が使えない間の手の道 (`ops.ne_upd_make_download` → `ops.ne_upd_download` = 作った JST の日だけ・最初のダウンロードを残す)
-- **送り手** `scripts/company-db/ne-update-send.mjs` (miniPC だけ = NE のトークンは miniPC)。`--daily` = daily-sync の段「NEへ送る」/ `--pending` = 画面の頼み (数分おきの定期実行 = タスクを足すのは使い始めるとき)。
-  NE の API: 単品 `api_v1_master_goods/upload`・セット `api_v1_master_setgoods/upload` (data_type csv・非同期 = que_id) → `api_v1_system_que/search` の que_status_id (2 = 全部成功・-1 = 失敗・0 / 1 = 待ち / 処理中) を `ops.ne_upd_file_result` に。
-  🚨 **最初は止めてある**: miniPC の .env に `NE_UPDATE_UPLOAD=1` (上げてよい) が無ければ何も上げない。自動は `NE_UPDATE_AUTO=1` も要る。NE のアプリの「アクセス情報」に 商品マスタ / セット商品マスタのアップロードとアップロードキューの検索の許可が要る (無い = 006001 / 004001)
-- **守り**: 表へは関数の中でだけ書ける (印 `ops.ne_upd_protocol`・持ち主のロールでも)・行と中身は書き換えない・消さない (状態・結果の列だけ・終わったファイル / 回は戻さない)。
+  → **編集は自由** (NE に取り込む CSV (0040) が出ている列も保存を止めない・`lib/master-write.mjs` の 6.)・**毎朝、差の CSV を作る** (daily-sync の段「NEへ送る」)・**画面でいつでも作る** (PR-3 の画面「NEへ送る」)・
+  いちばん使う形 = **CSV を作る → 中原さんがダウンロード → NE の画面で手でアップ** (API の回数に入らない)。翌朝 NE と同じになったものは差から消える。
+  NE の API で上げる口もあるが **既定は止めてある** (env で開く・呼ぶ回数を少なく = 1 ファイル 1 回・キューの結果は既定で聞かない = 翌朝の照合で確かめる。NE の API は月 1,000 回まで無料)
+- **差** `ops.ne_upd_units(SKU | null)` (読むだけ) = 単位 (SKU・欄) ごとに、今朝の NE の値 (0083・その種類の取得の始めが今日 (JST)・値と書き方が同じ回) が ok で区分が同じで Company DB の今の値 (D2 の正規化・空白は JS の trim と同じ) と違い、
+  **その欄の今の値を入れたのが人 (変更の記録の source_system = portal_master_edit・原価は今の行の INSERT / cost_jpy・仕入先は is_primary の変更だけを見る)** のもの (夜間ロード・NE の観測の値 = わざと残した差は出さない)。
+  止める理由 (blocked): 段階が new_open でない (not_open)・今朝の取得でない (ne_not_today)・変更の後のマスタの判断 (差を残す・CDB を直す・入力を直す・仕様・却下 = decided / fix_ne の承認の目標が違う = decision_other_value)・
+  新商品の途中 (new_product)・NE から消す依頼の途中 / 配った消す CSV を取り下げて 30 日の中 (deleting)・取扱中止の CSV (0072) を人の取扱の直しより後に作った (handling_csv)・
+  コードの書き方が決まらない (ne_code_unknown / ne_collided / case_unverified / lz_many / lz_old)・CSV に書けない値 (name_is_code ほか = `ne-csv.mjs` の列の表と同じ決まり)。
+  送った後 (今朝の取得の後のその欄の最後の送りが同じ値・同じ書き方で、NE に上げた・受付が分からない・上げている最中・人がダウンロードした) = sending (翌朝の照合で NE と同じになれば一覧から消える)・
+  この 4 日に 2 回 NE に上げて、その後に始まった取得でもまだ違う = stuck (自動では送らない)。
+  コードの書き方 = 設計 25 §2.4 (NE の書き方 / ロジザードの書き方が 1 つ = ロジザードの書き方)。🚨 大文字・小文字の直しは NE の実物の試し (`ops.ne_upd_verified` の code_case が ok) の後だけ (前 = NE の今の書き方で送る)。
+  値の差が無い単品で書き方だけ違う = 原価 → 売価 → 名前の順に NE と同じ欄を 1 つ入れた行 (role spelling)
+- **ファイル** `ops.ne_upd_build(how, 送り手, API で上げるか)` (鍵の下で差を作り直す = DB が今の値から作る・アプリから値・列名・バイト列を受け取らない)。1 行 = 1 SKU・単品とセットは別のファイル・UTF-8・BOM なし・CRLF・1,000 行ずつ。
+  空欄のセル = NE の実物で「空欄 = 変えない」を確かめた欄 (`ops.ne_upd_verified` の入口ごとの最後が ok = 人の取り込み (bulk) と API (api) は別)。確かめていない欄は空欄にしない (欄の組ごとのファイル)。
+  毎朝 (auto) = 同じ今朝の NE の回で 1 回 (2 回目は前の答え・バイト列なし)・100 欄を超える / この 14 日の平均の 5 倍 (20 欄より多い) = held (作らない = まとめに「止めました」)。
+  人が受け取る CSV = `ops.ne_upd_make_download` → `ops.ne_upd_download` (作った JST の日だけ・最初のダウンロードを残す・API で上げるファイルは渡さない)
+- **送り手** `scripts/company-db/ne-update-send.mjs` (miniPC)。`--daily` = daily-sync の段「NEへ送る」(差の CSV を作ってまとめに 1 行) / `--pending` = 画面の「今すぐ NE へ送る」の頼み (API の口を開けたときだけ・数分おきの定期実行 = タスクを足すのは使い始めるとき)。
+  API の口 = `NE_UPDATE_UPLOAD=1` (今すぐ) + `NE_UPDATE_AUTO=1` (毎朝の分も)。単品 `api_v1_master_goods/upload`・セット `api_v1_master_setgoods/upload` (1 ファイル = 1 回)。キューの結果 (`api_v1_system_que/search`) は `NE_UPDATE_QUE_CHECK=1` のときだけ 1 ファイル 1 回。
+  NE がはっきり断った = failed (もう一度送れる) / 通信が切れた・上げる途中で止まった = unknown (受付が分からない = 自動では送り直さない・翌朝の照合を待つ)。上げてよいのは作った送り手が作った時の 1 回だけ (claimed)。
+  NE のアプリの「アクセス情報」に 商品マスタ / セット商品マスタのアップロード (キューを聞くならアップロードキューの検索も) の許可が要る (無い = 006001 / 004001)
+- **守り**: 表へは関数の中でだけ書ける (印 `ops.ne_upd_protocol`・持ち主のロールでも)・行と中身は書き換えない・消さない (状態・結果の列だけ・終わったファイル / 回は戻さない・que_id は変えない)。
   鍵 = `ops.ne_upd` (排他) → NE のコードの共有 → NE の値の共有 → ロジザードの書き方の共有 (record_ne_values / record_ne_codes / record_lz_codes はこの鍵を取らない = 輪にならない・保存とは鍵を共有しない)。
   **master_edit (画面) = 一覧・商品の差・今すぐの頼み・受け取り・試しの記録の実行だけ / watch_writer (送り手) = 作る・結果・待ちの一覧・生存・一覧の実行だけ / watcher = 表を読むだけ**
-- 当て方 (🚨 まだ流さない・本番 DB と NE の操作 = 中原さんの OK の後): 番号をマージの順に付け替え → **アプリが先** (マージ → Render と miniPC を同じ build に。0093 の前は送り手が「migration の前」で何もしない・保存は自由になる) →
+- 当て方 (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後): 番号をマージの順に付け替え → **アプリが先** (マージ → Render と miniPC を同じ build に。0093 の前は送り手が「migration の前」で何もしない・保存は自由になる) →
   `migrate.mjs --dry-run` (この 1 本だけ・表と関数を足すだけ・今のデータは変えない) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` と `create-watch-roles.mjs` を流し直す
-  (0093 の中でもロールがあれば実行権を付ける = 流し直しは決まりの姿にそろえるため) → 翌朝の「NEへ送る」の 1 行が「⏸️ … 今の差 N 欄」になるのを見る →
-  中原さんが NE の実物で試す (設計 25 §2.9・空欄の欄ごとの結果を `ops.ne_upd_record_verified` に) → NE のアクセス情報を確かめる → `.env` に `NE_UPDATE_UPLOAD=1` → 今すぐ送るのタスク → 様子を見て `NE_UPDATE_AUTO=1`
-- 試験 = `node scripts/test-ne-update.mjs` (差・書き方・作る・空欄・自動の上限・受け付け中・翌朝・受け取り・送り手・権限) / 本物の PG = `test-ne-update-pg.mjs` (record_ne_values・record_ne_codes と待ち合ってもデッドロックしない・同じ朝の自動を 2 回作らない・頼みは 1 つ) /
+  (0093 の中でもロールがあれば実行権を付ける = 流し直しは決まりの姿にそろえるため) → 翌朝の「NEへ送る」の 1 行 (差 N 欄) を見る → 画面で CSV を作って NE で取り込む →
+  中原さんが NE の実物で空欄を試す (設計 25 §2.9・欄ごとの結果を画面の「試しの結果を残す」で) → (API を使うなら) NE のアクセス情報を確かめる → `.env` に `NE_UPDATE_UPLOAD=1` → 今すぐ送るのタスク → 様子を見て `NE_UPDATE_AUTO=1`
+- 試験 = `node scripts/test-ne-update.mjs` (差・書き方・作る・空欄 (入口ごと)・毎朝の上限・翌朝・stuck・受け取り・送り手 (API は既定で呼ばない・断った / 受付が分からない)・権限) /
+  本物の PG = `test-ne-update-pg.mjs` (record_ne_values・record_ne_codes と待ち合ってもデッドロックしない・同じ朝の自動を 2 回作らない・頼みは 1 つ) /
   `test-master-edit.mjs` [10]・`test-master-edit-pg.mjs` [5]・`test-master-bulk.mjs` [4] (CSV が出ていても保存できる) / `test-daily-sync-step-order.mjs` [10] (段の場所)
