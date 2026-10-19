@@ -5,7 +5,7 @@
  *   1 単品: 開いた後にページ表記のタブに箱 (原産国 = 違う・内容量 = 一致・型番 = product-hub は空・消費期限 = 参考)・画面のエラーなし
  *   2 「マスタの値を入れる」(原産国) = ページ表記の 2 つの欄に 1 組で入る → 今の自動保存で product-hub に保存される (押した人の操作)・比べ直して一致になる
  *   3 「マスタの値を入れる」(型番) = 楽天のタブの欄に入るだけ (保存はそのタブのボタン = まだ保存しない)
- *   4 読めない = 「読めない」だけ (ボタンなし)・0099 の前 = 箱を出さない
+ *   4 読めない = 「読めない」だけ (ボタンなし)・0090 の前 = 箱を出さない
  *   5 390 幅: 箱がページを横にはみ出させない
  * 使い方: node scripts/test-ph-label-compare-ui.mjs   (Playwright / Chromium が無い = 失敗。飛ばすのは PH_UI_SKIP=1)
  */
@@ -119,7 +119,7 @@ try {
     assert.deepEqual(errors, []);
     await page.close();
   });
-  await ta('[4] 読めない = 「読めない」だけ (ボタンなし)・0099 の前 = 箱を出さない', async () => {
+  await ta('[4] 読めない = 「読めない」だけ (ボタンなし)・0090 の前 = 箱を出さない', async () => {
     mode = 'down';
     let { page, errors } = await openPage(`/apps/product-hub/detail/${dA1.id}`);
     await page.locator('#cdb-label-summary').getByText('読めない').waitFor({ state: 'visible' });

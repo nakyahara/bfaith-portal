@@ -1,5 +1,5 @@
 <%#
-  🆕 0099 表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安 (日数) (Company DB構想 27 ④-1・中原さんの決定 Q1〜Q9 = 全部 a・2026-10-18)。
+  🆕 0090 表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安 (日数) (Company DB構想 27 ④-1・中原さんの決定 Q1〜Q9 = 全部 a・2026-10-18)。
   商品の画面 (単品) の節。人の値は右の「保存する」で一緒に保存 (欄 = lbl_country / lbl_net + lbl_net_uom / lbl_model / lbl_shelf)。動き = public/me-label.js
   - 欄 = 人の値 (空 = 人の値なし)。いま使う値 = Company DB の core.v_product_label_facts (人 → 内容量だけ夜間の取り込みの値)
   - product-hub の今の値 = 同じ商品コードの下書き (ページ表記・楽天の型番) を読むだけ (参考)。「この値を入れる」= 欄に入れるだけ (保存は人)
@@ -20,7 +20,7 @@
 %>
 <section class="panel" id="p-label" aria-labelledby="h-label">
   <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-info"/></svg></span><h2 id="h-label">表示の項目</h2><span class="sub">原産国・内容量・メーカー型番・消費期限の目安 · Company DB だけ (NE・ロジザードには送りません) · product-hub (楽天の出品) が読みます · 入れなくても登録できます</span></div>
-  <% if (!lb.ready) { %><div class="callout info" id="lbl-not-ready"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">表示の項目は、Company DB に 0099 が入って権限を流し直した後に入れられます (いまは見るだけ)。</div></div><% } %>
+  <% if (!lb.ready) { %><div class="callout info" id="lbl-not-ready"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">表示の項目は、Company DB に 0090 が入って権限を流し直した後に入れられます (いまは見るだけ)。</div></div><% } %>
   <% if (phErr) { %><div class="callout info" id="lbl-ph-error"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">product-hub の今の値を読めませんでした (<%= ph.error %>)。欄はそのまま使えます。</div></div><% } %>
 
   <div class="f" data-row="lbl_country">

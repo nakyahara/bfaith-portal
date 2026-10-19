@@ -1,11 +1,11 @@
 /**
  * test-ph-label-compare.mjs — product-hub のページ表記・楽天の型番と、商品マスタ (Company DB) の表示の項目を比べる印 (Company DB構想 27 ④-2・読むだけ)
  *
- * Company DB = PGlite (最新の migration まで = 0099 の表示の項目)。product-hub = 一時の DATA_DIR の SQLite (本物の router)。
+ * Company DB = PGlite (最新の migration まで = 0090 の表示の項目)。product-hub = 一時の DATA_DIR の SQLite (本物の router)。
  * 固定する契約:
  *   J 項目ごとの印 (純粋な関数): 一致・違う・product-hub は空・商品マスタに無い・比べられない (直せない内容量・海外製で国名なし)・夜間の取り込みの値とは比べない (自分と比べない)・
  *     「入れる」値 (原産国 = 日本製 / 海外製 + 国名の 1 組・内容量 = 数 + 単位)
- *   P 本物の SQL: 単品・人の値が無い商品 (内容量だけ夜間の値)・無い商品コード・セット (構成品の原産国が全部同じときだけ参考)・🚨 読むだけの取引・0099 の前の DB = ready false
+ *   P 本物の SQL: 単品・人の値が無い商品 (内容量だけ夜間の値)・無い商品コード・セット (構成品の原産国が全部同じときだけ参考)・🚨 読むだけの取引・0090 の前の DB = ready false
  *   C 接続: JAN と同じ接続の道 (readCdbRowsWithin・同じ同時の上限)
  *   R router: GET /api/drafts/:id/label-check (単品 / まとまり / セット)・読めない = 200 で「読めない」・🚨 Company DB にも product-hub の SQLite にも何も書かない
  *   H 画面: 詳細のページ表記のタブに箱・画面の JS が読める (vm)
@@ -125,7 +125,7 @@ await ta('[P1] 単品の行・人の値が無い商品 (内容量だけ夜間の
   assert.deepEqual(s.comps.map((c) => [c.code, c.country, c.source]), [['a001', '中国', 'human'], ['a002', '中国', 'human']]);
   assert.deepEqual([stmts[0], stmts.at(-1)], ['begin transaction read only', 'rollback']);
 });
-await ta('[P2] 0099 の前の DB (ビューが無い) = ready false (読めないにしない)', async () => {
+await ta('[P2] 0090 の前の DB (ビューが無い) = ready false (読めないにしない)', async () => {
   const fake = { query: async (sql, p) => (/to_regclass\('core\.v_product_label_facts'\)/.test(sql) ? { rows: [{ ok: false }] } : pg.query(sql, p)) };
   const x = await L.queryCdbLabels(fake, 1, ['a001']);
   assert.deepEqual(x, { ready: false, rows: [] });
@@ -241,7 +241,7 @@ try {
     assert.deepEqual([r2.j.items.country.state, r2.j.items.country.put], ['master_empty', null]);
     assert.match(r2.j.items.country.detail, /子で違う/);
   });
-  await ta('[R5] 読めない = 200 で「読めない」・無いドラフト = 404・0099 の前 = ready false', async () => {
+  await ta('[R5] 読めない = 200 で「読めない」・無いドラフト = 404・0090 の前 = ready false', async () => {
     L.__setCdbLabelReader(async () => ({ ok: false, reason: '試験で読めない' }));
     try {
       const r = await check(dA1);

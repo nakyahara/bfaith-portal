@@ -844,7 +844,7 @@
       ['入力なし', m.noneKeys.length ? esc(m.noneKeys.map(function (k) { return (P.blankLabels && P.blankLabels[k] ? P.blankLabels[k].label : k); }).join('・')) + ' <span class="hint aux">(わざと空けた = 登録の記録に残ります)</span>' : 'なし (全部の項目に値)'],
       ['出品カード', 'まとまりで 1 枚' + (m.ac === 2 ? ' (2 軸なので出品は止めたまま)' : '')],
     ].concat(document.getElementById('np-length') ? [['大きさ・重さ', (function () { var pk = pkgBody(); return pk ? esc([pk.length, pk.width, pk.height].map(function (x) { return x || '?'; }).join(' × ') + ' cm · ' + (pk.weight ? pk.weight + ' g' : '重さ なし')) + ' (全部の子に同じ値)' : 'なし (あとで商品の画面で)'; })()]] : [])   // 🆕 0087 (欄があるときだけ)
-      .concat(document.getElementById('np-lbl-country') ? [['表示の項目', (function () { var lb = labelBody(); return lb ? esc([lb.country, lb.net ? lb.net + (lb.net_uom || '') : '', lb.shelf ? lb.shelf + ' 日' : ''].filter(Boolean).join(' · ')) + ' (全部の子に同じ値)' : 'なし (あとで商品の画面で)'; })()]] : [])   // 🆕 0099 (欄があるときだけ)
+      .concat(document.getElementById('np-lbl-country') ? [['表示の項目', (function () { var lb = labelBody(); return lb ? esc([lb.country, lb.net ? lb.net + (lb.net_uom || '') : '', lb.shelf ? lb.shelf + ' 日' : ''].filter(Boolean).join(' · ')) + ' (全部の子に同じ値)' : 'なし (あとで商品の画面で)'; })()]] : [])   // 🆕 0090 (欄があるときだけ)
       .concat(S.nextOpts.length ? [['次に足す' + unitOf(m), S.nextOpts.length + ' ' + unitOf(m) + ' (今回は保存しない · 保存の後に続けて足す)']] : []);
   }
 
@@ -1120,7 +1120,7 @@
       light(); return;
     } else if (t.closest && t.closest('#sec-order, #sec-card')) { light(); return; }
     else if (/^np-(length|width|height|weight)$/.test(id)) { light(); return; }   // 🆕 0087: 大きさ・重さ (未保存の数・確かめの中身を数え直す)
-    else if (/^np-lbl-(country|net|net-uom|shelf)$/.test(id)) { light(); return; }   // 🆕 0099: 表示の項目 (未保存の数・確かめの中身を数え直す)
+    else if (/^np-lbl-(country|net|net-uom|shelf)$/.test(id)) { light(); return; }   // 🆕 0090: 表示の項目 (未保存の数・確かめの中身を数え直す)
     else return;
     update();
   }
@@ -1341,7 +1341,7 @@
     out.blanks = m.noneKeys.slice();
     // 🆕 0087: 梱包の大きさ・重さ (全部の子に同じ値・入れなくてよい・欄が無い / 全部空 = 送らない)
     var pk = pkgBody(); if (pk) out.package = pk;
-    // 🆕 0099: 表示の項目 (全部の子に同じ値・入れなくてよい・欄が無い / 全部空 = 送らない)
+    // 🆕 0090: 表示の項目 (全部の子に同じ値・入れなくてよい・欄が無い / 全部空 = 送らない)
     var lb = labelBody(); if (lb) out.label = lb;
     var po = ME.orderSettings ? ME.orderSettings.collect() : null;
     if (po) out.order_settings = po;
@@ -1353,7 +1353,7 @@
     Object.keys(ids).forEach(function (k) { var e = document.getElementById(ids[k]); var v = e && !e.disabled ? String(e.value || '').trim() : ''; o[k] = v; if (v) any = true; });
     return any ? o : null;
   }
-  /** 🆕 0099: 表示の項目の欄 (views/_label-new.ejs・まとまりは型番を聞かない) → { country, net, net_uom, shelf } (全部空・欄が無い = null = 送らない) */
+  /** 🆕 0090: 表示の項目の欄 (views/_label-new.ejs・まとまりは型番を聞かない) → { country, net, net_uom, shelf } (全部空・欄が無い = null = 送らない) */
   function labelBody() {
     var ids = { country: 'np-lbl-country', net: 'np-lbl-net', net_uom: 'np-lbl-net-uom', shelf: 'np-lbl-shelf' }, o = {}, any = false;
     Object.keys(ids).forEach(function (k) { var e = document.getElementById(ids[k]); if (!e) return; var v = !e.disabled ? String(e.value || '').trim() : ''; o[k] = v; if (v) any = true; });
@@ -1462,7 +1462,7 @@
     if (Object.keys(S.edits).length) items.push('子の一覧の変更');
     if (ME.orderSettings && ME.orderSettings.collect()) items.push('発注の設定');
     if (pkgBody()) items.push('大きさ・重さ');   // 🆕 0087: 大きさ・重さだけ入れた後に離れても未保存の確認を出す
-    if (labelBody()) items.push('表示の項目');   // 🆕 0099: 表示の項目だけ入れた後に離れても未保存の確認を出す
+    if (labelBody()) items.push('表示の項目');   // 🆕 0090: 表示の項目だけ入れた後に離れても未保存の確認を出す
     return { n: items.length, items: items, impacts: [] };
   };
 

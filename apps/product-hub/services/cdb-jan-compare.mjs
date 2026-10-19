@@ -160,7 +160,7 @@ async function readRowsWithin(items, { env, deadlineMs }) {
 }
 
 /**
- * 🆕 0099 (表示の項目・services/cdb-label-compare.mjs と共通): 期限つきで接続して run(client, COMPANY_ID, 残りの ms) → rows を読む。
+ * 🆕 0090 (表示の項目・services/cdb-label-compare.mjs と共通): 期限つきで接続して run(client, COMPANY_ID, 残りの ms) → rows を読む。
  *   JAN と同じ接続先 (janReadUrlFrom)・同じ同時の上限 (JAN_READ_MAX_CONCURRENT = 2 本・JAN と表示の項目で合わせて)・同じ期限と閉じ方。
  *   run は読むだけの取引の中で読む (呼び手が begin transaction read only … rollback)。戻り値 { ok: true, rows } / { ok: false, reason, busy? }
  */

@@ -1,8 +1,8 @@
--- 0099 (仮の番号・マージの時に「すぐ次の番号」に付け替える。0084〜0088 は先に入る見込みのブランチが使う。migrate は欠番を断る):
+-- 0090 (0087 = 大きさ・重さ #1744・0088 = ブランド #1746・0089 = 先方品番の知らせ v2 #1747 の次。migrate は欠番を断る):
 --   商品 (単品) の表示の項目 = 原産国・内容量 (数 + 単位)・メーカー型番・消費期限の目安 (日数) (Company DB構想 27 ④-1・中原さんの決定 Q1〜Q9 = 全部 a・2026-10-18)
 --   中原さん「法定表示・出品の項目 (原産国・内容量・メーカー型番・消費期限の目安) をマスタの入力で入れたい」= 正本は Company DB・product-hub は読んで見せる・人が「マスタの値を入れる」を押す
 --
--- 考え方 (梱包の大きさ・重さ (0086 仮番号) と同じ形・設計 27 §3.4 = v2):
+-- 考え方 (梱包の大きさ・重さ (0087) と同じ形・設計 27 §3.4 = v2):
 --   - 人が入れた値 = 🆕 core.product_label_facts (商品ごとに 1 行・項目ごとに空でよい)。夜間ロードは触らない
 --     🚨 0003 の観測 + 解決 (source = master_edit の観測 + 規則の版 v2) にしない:
 --        夜間ロードは規則の版を v1 に固定して読む (apps/company-db/load/engine.mjs の RULE_VERSION)・触った商品の内容量を毎晩 v1 で選び直して
@@ -50,7 +50,7 @@ create table core.product_label_facts (
   constraint ck_product_label_facts_any check (country_of_origin is not null or net_content is not null or model_number is not null or shelf_life_days is not null),
   foreign key (company_id, product_id) references core.products (company_id, product_id)
 );
-comment on table core.product_label_facts is '🆕 0099: 商品 (単品の商品の行) の表示の項目 (原産国・内容量・メーカー型番・消費期限の目安の日数) の人の値 (行が無い = 人の値なし)。夜間ロードは触らない。書くのは ops.set_product_label_facts だけ。いま使う値は core.v_product_label_facts';
+comment on table core.product_label_facts is '🆕 0090: 商品 (単品の商品の行) の表示の項目 (原産国・内容量・メーカー型番・消費期限の目安の日数) の人の値 (行が無い = 人の値なし)。夜間ロードは触らない。書くのは ops.set_product_label_facts だけ。いま使う値は core.v_product_label_facts';
 
 create table ops.product_label_fact_events (
   event_id   bigint generated always as identity primary key,
@@ -69,7 +69,7 @@ create table ops.product_label_fact_events (
   unique (request_id, product_id)
 );
 create index ix_product_label_fact_events_product on ops.product_label_fact_events (product_id, event_id desc);
-comment on table ops.product_label_fact_events is '🆕 0099: 表示の項目の人の値を入れた・変えた・外した記録 (追記だけ・書くのは ops.set_product_label_facts だけ)。商品の最後の記録の番号 = 画面が見ていた版';
+comment on table ops.product_label_fact_events is '🆕 0090: 表示の項目の人の値を入れた・変えた・外した記録 (追記だけ・書くのは ops.set_product_label_facts だけ)。商品の最後の記録の番号 = 画面が見ていた版';
 revoke all on core.product_label_facts, ops.product_label_fact_events from public;
 
 -- 守り: 書くのは関数の中だけ (印 ops.label_protocol)・記録は追記だけ・TRUNCATE できない
@@ -210,11 +210,11 @@ select p.product_id,
   from core.products p
   left join core.product_label_facts h on h.product_id = p.product_id
  where h.product_id is not null or p.net_content is not null;
-comment on view core.v_product_label_facts is '🆕 0099: 商品ごとのいま使う表示の項目 (原産国・内容量・メーカー型番・消費期限の目安の日数)。項目ごとに 人 (core.product_label_facts) → 出どころ (内容量だけ = 夜間ロードの core.products.net_content)。人の値を含めた値を読むときはここ (正式な読み口)';
+comment on view core.v_product_label_facts is '🆕 0090: 商品ごとのいま使う表示の項目 (原産国・内容量・メーカー型番・消費期限の目安の日数)。項目ごとに 人 (core.product_label_facts) → 出どころ (内容量だけ = 夜間ロードの core.products.net_content)。人の値を含めた値を読むときはここ (正式な読み口)';
 revoke all on core.v_product_label_facts from public;
 
 -- 既にある列の注釈 (読む人が迷わないように。列・値は変えない)
-comment on column core.products.net_content is '内容量の数 (夜間ロードが product-hub などの観測から解決した参考の値)。🆕 0099: マスタの入力で人が入れた値を含めたいま使う値は core.v_product_label_facts';
-comment on column core.products.country_of_origin is '🆕 0099 の注釈: 使っていない列 (書く人なし)。原産国は core.v_product_label_facts (人が入れた値 = core.product_label_facts)';
-comment on column core.products.model_number is '🆕 0099 の注釈: 使っていない列 (書く人なし)。メーカー型番は core.v_product_label_facts (人が入れた値 = core.product_label_facts)';
-comment on column core.product_compliance.shelf_life_days is '🆕 0099 の注釈: 使っていない列 (夜間ロードは書かない)。消費期限の目安の日数は core.v_product_label_facts (人が入れた値 = core.product_label_facts)';
+comment on column core.products.net_content is '内容量の数 (夜間ロードが product-hub などの観測から解決した参考の値)。🆕 0090: マスタの入力で人が入れた値を含めたいま使う値は core.v_product_label_facts';
+comment on column core.products.country_of_origin is '🆕 0090 の注釈: 使っていない列 (書く人なし)。原産国は core.v_product_label_facts (人が入れた値 = core.product_label_facts)';
+comment on column core.products.model_number is '🆕 0090 の注釈: 使っていない列 (書く人なし)。メーカー型番は core.v_product_label_facts (人が入れた値 = core.product_label_facts)';
+comment on column core.product_compliance.shelf_life_days is '🆕 0090 の注釈: 使っていない列 (夜間ロードは書かない)。消費期限の目安の日数は core.v_product_label_facts (人が入れた値 = core.product_label_facts)';

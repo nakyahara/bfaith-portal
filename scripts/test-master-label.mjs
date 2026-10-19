@@ -1,11 +1,11 @@
 /**
- * test-master-label.mjs — 表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安 (Company DB構想 27 ④-1・Company DB の 0099 仮番号・lib/master-label.mjs)
+ * test-master-label.mjs — 表示の項目 = 原産国・内容量・メーカー型番・消費期限の目安 (Company DB構想 27 ④-1・Company DB の 0090・lib/master-label.mjs)
  *
  * Company DB = PGlite (scripts/fixtures/master-variation-db.mjs = 全部の migration を流した新しい DB・切替の後)。本物の router を HTTP 越しに通す。
  * 固定する契約:
  *   U 値の形: 原産国 (NFKC・「製」・よくある言い方)・内容量 (数 小数 2 けた + 単位 ml / g / 枚 / 個・片方だけ = 400)・型番・日数・登録の値の形 (知らない項目・まとまりの型番 = 400)・
  *     内容量の直し方 (L → ml・kg → g・cc・本 / mg = 直せない・丸めない)・product-hub の原産国の書き方 (日本製 ↔ 日本・海外製 + 国名)
- *   D 0099 の形: 表・関数 (security definer・search_path・public の実行権なし)・守り (関数の外では書けない・記録は追記だけ・TRUNCATE できない)・
+ *   D 0090 の形: 表・関数 (security definer・search_path・public の実行権なし)・守り (関数の外では書けない・記録は追記だけ・TRUNCATE できない)・
  *     画面のロール master_edit = 人の値・記録・ビューの select と書く関数の実行だけ・ほかのロールは読めない
  *   M いま使う値 (core.v_product_label_facts): 人 → 内容量だけ夜間ロードの値 (出どころ = 解決に使った観測)・人の値と記録の番号は 1 つの SELECT (全部外した後も番号を返す)
  *   S 商品の画面: 「表示の項目」の節 (欄・いま使う値・product-hub の今の値の参考・「この値を入れる」)・保存 (入れる・変える・外す・全部外す・記録 via sku_page)・押し直し・
@@ -130,7 +130,7 @@ async function nightly(runId, obs = []) {
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
-console.log('表示の項目 (0099)');
+console.log('表示の項目 (0090)');
 
 await ta('[U1] 値の形: 原産国・内容量 (数 + 単位)・型番・日数・空 = null・形の誤りの一言と欄', async () => {
   assert.equal(LB.countryIn('中国製'), '中国'); assert.equal(LB.countryIn(' 日本国 '), '日本'); assert.equal(LB.countryIn('Made in Japan'), '日本'); assert.equal(LB.countryIn('ＵＳＡ'), 'アメリカ');
@@ -172,7 +172,7 @@ await ta('[U2] 内容量の直し方 (丸めない)・比べ方・product-hub �
   assert.equal(LB.phCountryFields(''), null);
 });
 
-await ta('[D1] 0099 の形: 表・関数 (security definer・search_path 固定・public の実行権なし)・画面のロールの権限 (読む・関数だけ)・ほかのロールは読めない', async () => {
+await ta('[D1] 0090 の形: 表・関数 (security definer・search_path 固定・public の実行権なし)・画面のロールの権限 (読む・関数だけ)・ほかのロールは読めない', async () => {
   for (const t of ['core.product_label_facts', 'ops.product_label_fact_events', 'core.v_product_label_facts']) assert.ok((await one('select to_regclass($1) is not null as ok', [t])).ok, t);
   const f = await one(`select p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub from pg_proc p
     join pg_namespace s on s.oid = p.pronamespace where s.nspname = 'ops' and p.proname = 'set_product_label_facts'`);

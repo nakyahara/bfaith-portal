@@ -1,5 +1,5 @@
 /**
- * test-master-label-ui.mjs — 「表示の項目」(views/_label.ejs・_label-new.ejs・public/me-label.js・Company DB の 0099) を本物の router で描いたページで動かす (Playwright・Chromium)
+ * test-master-label-ui.mjs — 「表示の項目」(views/_label.ejs・_label-new.ejs・public/me-label.js・Company DB の 0090) を本物の router で描いたページで動かす (Playwright・Chromium)
  *
  * 固定する動き:
  *   ① 商品の画面: product-hub の今の値の「この値を入れる」= 欄に入れるだけ (原産国・内容量の数 + 単位・型番)・未保存の「前 → 後」・保存 → Company DB・元に戻す

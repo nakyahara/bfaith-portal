@@ -1362,7 +1362,7 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 #p-pkg .ctl.col { flex-wrap: nowrap; }   /* 縦に並べる欄で折り返しの行を作らない (作ると長い一言の幅に広がる) */
 @media (max-width: 760px) { #p-pkg .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #p-pkg .btn.sm { min-height: 44px; } }
 
-/* 🆕 0099 表示の項目 (商品の画面・views/_label.ejs) */
+/* 🆕 0090 表示の項目 (商品の画面・views/_label.ejs) */
 .lbl-net { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .lbl-net .in { text-align: right; }
 #p-label .lbl-ph { flex-basis: 100%; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

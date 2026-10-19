@@ -25,7 +25,7 @@ export const LABEL_STATE_SEVERITY = Object.freeze({ differs: 'warn', ph_empty: '
 
 /**
  * 読む SQL: 商品コードごとに SKU・区分・商品・いま使う値 (ビュー)・セットなら構成品の原産国 (人の値) を 1 行。
- *   to_regclass でビューが無い DB (0099 の前) を先に見る = ready false の 1 行だけ返す (呼び手は「まだ」と出す)
+ *   to_regclass でビューが無い DB (0090 の前) を先に見る = ready false の 1 行だけ返す (呼び手は「まだ」と出す)
  */
 export const LABEL_READY_SQL = "select to_regclass('core.v_product_label_facts') is not null as ok";
 export const LABEL_READ_SQL = `select x.ord::int as ord, k.sku_id::text as sku_id, k.sku_kind, k.product_id::text as product_id,
@@ -139,7 +139,7 @@ export async function compareDraftLabels(db, draft, { env = process.env, deadlin
   if (!codes.length) return empty(true, null);
   const read = await readCdbLabels(codes, { env, deadlineAt });
   if (!read.ok) return empty(false, read.reason);
-  if (!read.ready) return { ...empty(true, 'Company DB に表示の項目 (0099) がまだ入っていません', false), summary: { severity: 'none', label: '' } };
+  if (!read.ready) return { ...empty(true, 'Company DB に表示の項目 (0090) がまだ入っていません', false), summary: { severity: 'none', label: '' } };
   const rowOf = (c) => read.byCode.get(String(c).toLowerCase()) || null;
   const units = codes.map((c) => { const r = rowOf(c); return { code: c, kind: r ? r.sku_kind : null, missing: !r || r.sku_id == null, master: masterOf(r) }; });
   let items = null; let set = null; let kids = null; let mode = ju.mode;

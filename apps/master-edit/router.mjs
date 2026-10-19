@@ -157,7 +157,7 @@ import { makerReady, readMakers, createMaker, MAKER_NAME_MAX } from '../../lib/m
 // 🆕 0088 (ブランド・商品の段階・中原さん 2026-10-17): 名簿・名簿に足す・自社ブランドの印・欄を出すか・初めて売った日
 import { brandLifeReady, brandLifeTablesExist, readBrands, createBrand, setBrandOwn, firstSoldOf, salesRecordsFrom, firstSoldView, endBadge, daysUntil,
   BRAND_NAME_MAX, LIFE_STAGES, LIFE_FILTERS, END_SOON_DAYS } from '../../lib/master-brand-life.mjs';
-// 🆕 0099 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・Company DB構想 27 ④-1)
+// 🆕 0090 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・Company DB構想 27 ④-1)
 import { readLabelView, labelReady, defaultPhLabelLookup, COUNTRY_SUGGEST, NET_UOMS } from '../../lib/master-label.mjs';
 import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
 
@@ -436,11 +436,11 @@ function orderEventsView(evs, kids) {
 /** product-hub の下書きカードに同じ管理番号があるか (まとまりのコード = 楽天の商品管理番号・Render の SQLite)。試験は差し替える */
 let phDraftLookup = defaultPhDraftExists;
 export function __setPhDraftLookup(fn) { phDraftLookup = fn || defaultPhDraftExists; }
-/** 🆕 0099: product-hub の今の値 (商品の画面の「表示の項目」の参考・読むだけ・Render の SQLite)。試験は差し替える */
+/** 🆕 0090: product-hub の今の値 (商品の画面の「表示の項目」の参考・読むだけ・Render の SQLite)。試験は差し替える */
 let phLabelLookup = defaultPhLabelLookup;
 export function __setPhLabelLookup(fn) { phLabelLookup = fn || defaultPhLabelLookup; }
 /**
- * 🆕 0099: 商品の画面の「表示の項目」= readLabelView (人の値・記録の番号・いま使う値) + ready (書けるか) + ph (product-hub の今の値・読めない = { error })。
+ * 🆕 0090: 商品の画面の「表示の項目」= readLabelView (人の値・記録の番号・いま使う値) + ready (書けるか) + ph (product-hub の今の値・読めない = { error })。
  *   Company DB が読めない = null (節を出さない・画面は止めない)
  */
 async function readLabelBlock(db, cur) {
@@ -956,7 +956,7 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     packageReady: db && kind === 'single' ? await packageReady(db).catch(() => false) : false,   // 🆕 0087 (梱包の大きさ・重さの欄を出すか・入れなくてよい)
     // 🆕 0088: ブランド・商品の段階 (単品だけ・必須でない)
     ...(await brandLifeLocals(db, kind === 'single')),
-    // 🆕 0099: 表示の項目の欄を出すか (0099 がある DB・単品だけ・入れなくてよい)
+    // 🆕 0090: 表示の項目の欄を出すか (0090 がある DB・単品だけ・入れなくてよい)
     labelNew: db && kind === 'single' && await labelReady(db).catch(() => false) ? { suggest: COUNTRY_SUGGEST, uoms: NET_UOMS } : null,
   });
 }));
@@ -1011,7 +1011,7 @@ async function renderVariationNew(req, res, { db, dbError, page, shipping, local
     ...(await makerLocals(db, !gated)),   // 🆕 0084: メーカー (全部の子に同じ値)
     packageReady: db ? await packageReady(db).catch(() => false) : false,   // 🆕 0087 (梱包の大きさ・重さの欄を出すか・全部の子に同じ値・入れなくてよい)
     ...(await brandLifeLocals(db, !gated)),   // 🆕 0088: ブランド・商品の段階 (全部の子に同じ値・必須でない)
-    // 🆕 0099: 表示の項目の欄 (全部の子に同じ値・型番は聞かない・入れなくてよい・0099 の前の DB = 出さない)
+    // 🆕 0090: 表示の項目の欄 (全部の子に同じ値・型番は聞かない・入れなくてよい・0090 の前の DB = 出さない)
     labelNew: db && await labelReady(db).catch(() => false) ? { suggest: COUNTRY_SUGGEST, uoms: NET_UOMS } : null,
   });
 }
@@ -1204,7 +1204,7 @@ router.post('/api/new/variation', (req, res) => {
       reasonNote: po.note,              // 🆕 発注の設定の入力なし (DB に書く理由にだけ・ハッシュに入らない・#1706 Codex R2 M)
       lzCopy: lg.copy,                  // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果 (値の行に残す・ハッシュに入らない)
       package: b.package,               // 🆕 0087: 梱包の 縦・横・高さ (cm)・重さ (g) = 全部の子に同じ値 (入れなくてよい)
-      label: b.label,                   // 🆕 0099: 表示の項目 (原産国・内容量・消費期限の目安) = 全部の子に同じ値 (型番は聞かない・入れなくてよい)
+      label: b.label,                   // 🆕 0090: 表示の項目 (原産国・内容量・消費期限の目安) = 全部の子に同じ値 (型番は聞かない・入れなくてよい)
     }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, phDraftExists: phDraftLookup, orderOutbox: outbox, requireLz: true, codeReserved });
     let orderResult = null;
     const regId = String(r.request_id || rid).trim().toLowerCase();
@@ -1269,7 +1269,7 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   }
   res.render(view('sku.ejs'), {
     vendorSettings,
-    // 🆕 0099: 表示の項目 (単品の商品の行だけ・人の値 + いま使う値 + product-hub の今の値 (参考・読むだけ))。読めない = 出さない (画面は止めない)
+    // 🆕 0090: 表示の項目 (単品の商品の行だけ・人の値 + いま使う値 + product-hub の今の値 (参考・読むだけ))。読めない = 出さない (画面は止めない)
     label: page && page.cur.sku_kind === 'single' && page.cur.product_id ? await readLabelBlock(db, page.cur) : null,
     gone,
     // 🆕 0087: 梱包した状態の 縦・横・高さ・重さ (単品の商品の行だけ・人の値 + 出どころ (定形外・FBA 納品) + まとめた値)。読めない = 出さない (画面は止めない)
@@ -1480,7 +1480,7 @@ router.post('/api/new', (req, res) => {
     let parsed = null;
     try {
       parsed = parseRegisterRequest({ actor, requestId: b.request_id, kind: b.kind, code: b.code, reason: sb.reason ?? null, values: b.values, card: b.card, logizardBarcode: b.logizard_barcode, package: b.package,   // 🆕 0084: 理由はメーカーを数え直した後 (sb) = 登録の lib と同じ要求のハッシュ
-        label: b.label });   // 🆕 0099: 表示の項目も要求のハッシュに入る (作るセットを結ぶハッシュを lib と同じにする)
+        label: b.label });   // 🆕 0090: 表示の項目も要求のハッシュに入る (作るセットを結ぶハッシュを lib と同じにする)
     } catch (e) { if (!(e instanceof MasterWriteError)) throw e; /* 形の誤りは登録の lib が同じ文で断る */ }
     const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
     // ほかの登録が作るセットに決めたコード (カードの取り込み待ち) は、ふつうの商品コードにもさせない (Codex R1 Medium 1)。押し直しは前の答え (確かめない)
@@ -1509,7 +1509,7 @@ router.post('/api/new', (req, res) => {
         logizardBarcode: b.logizard_barcode,   // 🆕 0080 (CompanyDB構想 23 v4): ロジザードに送るバーコードの値か空欄 (単品だけ・要るかは上の lzRegisterGate)
         lzCopy,                                // 🆕 #1719 R1 High 2: ロジザードの写しと照らした結果
         package: b.package,                    // 🆕 0087: 梱包の 縦・横・高さ (cm)・重さ (g) (入れなくてよい・単品だけ)
-        label: b.label,                        // 🆕 0099: 表示の項目 (原産国・内容量・型番・消費期限の目安) (入れなくてよい・単品だけ)
+        label: b.label,                        // 🆕 0090: 表示の項目 (原産国・内容量・型番・消費期限の目安) (入れなくてよい・単品だけ)
       }, { open: isOpen(), shippingRates: await shippingRatesProvider(), now: clockOverridden ? new Date(clock()) : undefined, orderOutbox: outbox, requireLz: true, codeReserved });
     } catch (e) {
       // 登録が断られた (決まった誤り = MasterWriteError) = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)。

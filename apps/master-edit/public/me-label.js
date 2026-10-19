@@ -1,5 +1,5 @@
 /*
- * me-label.js — 商品の画面の「表示の項目」(0099・views/_label.ejs)
+ * me-label.js — 商品の画面の「表示の項目」(0090・views/_label.ejs)
  *   「この値を入れる」= その値を欄に入れるだけ (原産国 / 内容量の数 + 単位 / メーカー型番)。
  *   保存は右の「保存する」(欄は data-dirty-field = 未保存に数える)。欄を変えたら input / change を送って画面 (me-sku.js) に数え直してもらう
  */

@@ -698,7 +698,7 @@
     if (!isSet && $('#f-lzbc-in')) out.logizard_barcode = lzbc().body;
     // 🆕 0087: 梱包の大きさ・重さ (単品だけ・入れなくてよい・欄が無い / 全部空 = 送らない)
     if (!isSet) { var pk = pkgBody(); if (pk) out.package = pk; }
-    // 🆕 0099: 表示の項目 (単品だけ・入れなくてよい・欄が無い / 全部空 = 送らない)
+    // 🆕 0090: 表示の項目 (単品だけ・入れなくてよい・欄が無い / 全部空 = 送らない)
     if (!isSet) { var lb = labelBody(); if (lb) out.label = lb; }
     return out;
   }
@@ -710,7 +710,7 @@
     return any ? o : null;
   }
 
-  /** 🆕 0099: 表示の項目の欄 (views/_label-new.ejs) → { country, net, net_uom, model, shelf } (全部空・欄が無い = null = 送らない。形はサーバーが確かめる) */
+  /** 🆕 0090: 表示の項目の欄 (views/_label-new.ejs) → { country, net, net_uom, model, shelf } (全部空・欄が無い = null = 送らない。形はサーバーが確かめる) */
   function labelBody() {
     var ids = { country: 'np-lbl-country', net: 'np-lbl-net', net_uom: 'np-lbl-net-uom', model: 'np-lbl-model', shelf: 'np-lbl-shelf' }, o = {}, any = false;
     Object.keys(ids).forEach(function (k) { var e = document.getElementById(ids[k]); if (!e) return; var v = !e.disabled ? String(e.value || '').trim() : ''; o[k] = v; if (v) any = true; });

@@ -266,7 +266,7 @@
 
         <%# 🆕 0088 ブランド・商品の段階 (中原さん 2026-10-17・単品だけ・別の板 = 部品 _brandlife-sku.ejs)。0088 の前の DB・ロールの流し直しの前 = 出さない %>
         <% if (!isSet && locals.brandLife) { %><%- include('_brandlife-sku', { c, bl: brandLife, row, meta, editable, canSave, base }) %><% } %>
-        <%# 🆕 0099 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・単品だけ・人の値は右の「保存する」で一緒に・product-hub の今の値は参考・部品 = _label.ejs・public/me-label.js) %>
+        <%# 🆕 0090 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・単品だけ・人の値は右の「保存する」で一緒に・product-hub の今の値は参考・部品 = _label.ejs・public/me-label.js) %>
         <% if (typeof label !== 'undefined' && label && c.sku_kind === 'single') { %><%- include('_label', { lb: label, editable: !!label.ready && editable('lbl_country'), lockWhyHtml: label.ready ? lockWhy('lbl_country') : '', suggest: label.suggest || [], uoms: label.uoms || [] }) %><% } %>
 
         <%# 発注の設定 (発注アプリに保存・10/9 中原さん)。Company DB の「保存する」とは別のボタン (部品 = _order.ejs・public/me-order.js) %>
@@ -707,7 +707,7 @@
   <% if (page) { %><script src="<%= base %>/public/me-sales-chart.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0070: NE から消えた (やめる) = 押せる人・押せるときだけ %>
   <% if (page && typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %><script src="<%= base %>/public/me-gone.js?v=<%= assetV %>" defer></script><% } %>
-  <%# 🆕 0099: 表示の項目の「この値を入れる」(直せるときだけ・欄の数え直しは me-sku.js) %>
+  <%# 🆕 0090: 表示の項目の「この値を入れる」(直せるときだけ・欄の数え直しは me-sku.js) %>
   <% if (page && typeof label !== 'undefined' && label && label.ready && c.sku_kind === 'single' && editable('lbl_country')) { %><script src="<%= base %>/public/me-label.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>
