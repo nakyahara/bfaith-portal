@@ -6,6 +6,7 @@
  *   node apps/company-db/load/run-initial-load.mjs              # dry-run (全部やって巻き戻す。report だけ残す)
  *   node apps/company-db/load/run-initial-load.mjs --apply      # 本適用
  * 任意: --data-dir <dir> / --url <postgres url> / --out <report dir>
+ *       --vendor-clear-max <n> = 🆕 ⑤-3: 先方品番・入数の写しを空に戻す上限 (既定 30)。dry-run で候補の数を見てから、その回だけ上げて流す
  *
  * report は <DATA_DIR>/company-db/load-<run_id>.json と .md に残す (最新へのポインタ latest.json)。
  * 開始したことは running.json に永続化する (プロセスが途中で死んでも「始めたのに結果が無い」が分かる。
@@ -46,7 +47,7 @@ function clearRunning(dir, runId) {
   if (cur && cur.run_id === runId) { try { fs.unlinkSync(runningPath(dir)); } catch { /* 無ければよい */ } }
 }
 
-export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = console.log, host, runId: runIdIn, usePrepared = false, connect = openPgClient } = {}) {
+export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = console.log, host, runId: runIdIn, usePrepared = false, connect = openPgClient, vendorClearMax } = {}) {
   const runId = runIdIn || newLoadRunId();
   const dir = reportDir(dataDir, outDir);
   const l = (m) => log(`[company-db load] ${m}`);
@@ -72,7 +73,7 @@ export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = c
   const db = pgAdapter(client);
   let report;
   try {
-    report = await runInitialLoad(db, plan, { runId, dryRun: !apply, log: l, host: host || os.hostname(), usePrepared });
+    report = await runInitialLoad(db, plan, { runId, dryRun: !apply, log: l, host: host || os.hostname(), usePrepared, ...(Number.isInteger(vendorClearMax) ? { vendorClearMax } : {}) });
   } catch (e) {
     report = e.report || { run_id: runId, dry_run: !apply, ok: false, started_at: startedAt, error: String(e.message), sections: {}, conflicts: [], unresolved: {} };
     throw Object.assign(e, { report });
@@ -125,7 +126,9 @@ if (isMain) {
     process.exit(3);
   }
   if (busy) console.error(`[company-db load] ${busy.reason}`);
-  runLoadOnce({ dataDir, url, apply, outDir: getArg('--out') || undefined })
+  const vcm = getArg('--vendor-clear-max');
+  if (vcm != null && !/^\d+$/.test(vcm)) { console.error('--vendor-clear-max は 0 以上の整数'); process.exit(2); }
+  runLoadOnce({ dataDir, url, apply, outDir: getArg('--out') || undefined, ...(vcm != null ? { vendorClearMax: Number(vcm) } : {}) })
     .then((r) => { console.log(reportToMarkdown(r)); process.exit(r.ok ? 0 : 1); })
     .catch((e) => { console.error(`[company-db load] FAILED: ${e.message}`); if (e.report) console.log(reportToMarkdown(e.report)); process.exit(1); });
 }

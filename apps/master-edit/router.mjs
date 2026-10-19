@@ -49,6 +49,11 @@
  *        ① の前に形・グループ・代表の仕入先を確かめる (誤り = 400 / 409・何も書かない) → ① Company DB の登録 → 通ったら ② 発注アプリに書く。
  *        ② だけ失敗 = 登録は成功のまま・応答の order_settings = { ok: false, error } (画面は「商品の画面で入れてください」)。同じ request_id のやり直しでも ② をもう一度 (同じ値の上書き)
  *   POST /api/sku/:code/order-settings  商品の画面の「発注の設定を保存」{ request_id, seen: { updated_at }, values: {...} } (Company DB の保存とは別・開いたときの印が違えば 409)
+ *   🆕 ⑤-1 (CompanyDB構想 27 §2.4・apps/purchase-orders/vendor-codes.js の部品): 先方品番・入数 (発注アプリの先方番号対応表に保存・仕入先ごと・単品だけ)
+ *   POST /api/sku/:code/vendor-code         { supplier_code, vendor_code, qty_per_unit, base_updated_at (null = まだ無いつもり / 開いたときの版・必須) }
+ *        直せるのは仕入先一致を通る 1 社 (発注アプリのマスタ管理と同じ決まり)・同じ番号がほかの商品にも = 警告 (止めない)・版が違う = 409
+ *   POST /api/sku/:code/vendor-code/delete  { supplier_code, base_updated_at (開いたときの版・必須) } (仕入先は確かめない = 発注アプリと同じ)
+ *   POST /api/new の order_settings に vendor_code・qty_per_unit (単品・代表の仕入先・知らせ v2 = 0089 の後だけ。前 = 400 で何も書かない)
  *   書ける人 = 名簿 (MASTER_EDITORS) かつ 発注アプリの利用権。Company DB の切替の門は見ない (発注アプリのマスタ管理と同じく、いつでも)
  *   🆕 0075 (CompanyDB構想 21 C1・lib/order-settings-outbox.mjs): 新商品の登録 (単品・まとまり) の発注の設定は ① と同じ Postgres の取引に「発注の設定の知らせ」を積み、
  *        commit の後に発注アプリへ届ける (届かなくても知らせは残る = 画面を開いたとき・人の「もう一度」・夜間ロードの後ろの段で届け直す・24 時間で知らせる)。
@@ -121,9 +126,10 @@ import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
 import { writeOrderSettings, writeRegistrationOrderSettings, registrationOrderDone, OrderSettingsError } from '../purchase-orders/order-settings.js';
-import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf, orderNoneApplies } from './order-settings.mjs';
+import { orderWriteGate, orderScreen, orderInputOf, orderErrorBody, orderBaseOf, orderNoneApplies, vendorScreen } from './order-settings.mjs';
+import { upsertVendorCode, deleteVendorCode, productForVendorMap, checkRegistrationVendor, parseVendorInput, VendorCodeError } from '../purchase-orders/vendor-codes.js';
 import { orderOutboxReady, runOrderSettingsOutbox, readOrderSettingsForRegistration, deliveryInputOf, orderDeliveryEnabled, orderOutboxStatus, readOrderSettingsOutbox,
-  dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, readRegistrationOrderMark, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS } from '../../lib/order-settings-outbox.mjs';
+  dismissOrderSettingsEvent, orderPayloadOf, orderPayloadHash, readRegistrationOrderMark, ORDER_STATUS_LABELS, ORDER_OVERDUE_HOURS, orderPayloadV2Ready } from '../../lib/order-settings-outbox.mjs';
 import { ui } from './ui-format.mjs';
 import { readCutoverPhase, newEntryWritable, PHASE_LABELS } from '../../lib/master-cutover.mjs';
 import { readScreenOwnership, readScreenNewEntry, screenOwnerWritable } from '../../lib/master-owner-gate.mjs';
@@ -916,6 +922,7 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     setPlanLimits: { max: MAX_SET_PLANS, qtyMin: SET_QTY_MIN, qtyMax: SET_QTY_MAX, nameMax: SET_NAME_MAX, alertDays: SET_PLAN_ALERT_DAYS },
     // 発注の設定 (発注アプリ・単品だけ。発注アプリはセットを扱わない)
     orderSettings: kind === 'single' ? orderScreen(req, editorGate(req), null) : null,
+    vendorNew: kind === 'single',   // 🆕 ⑤-2: 新商品の登録 (単品) の先方品番・入数の欄 (views/_order.ejs)
     orderNoneApplies,   // 発注の設定の「入力なし」を出すか (API と同じ関数・views/_order.ejs)
     variationOn: variationOn(owner),
     // 「入力なし」にできる項目 (lib/master-register-blanks.mjs = サーバーと同じ名前)
@@ -1120,6 +1127,8 @@ router.post('/api/new/variation', (req, res) => {
   let orderInput = null;
   let orderBase = null;
   try { order = orderInputOf(b.order_settings); } catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
+  // 🆕 ⑤-2: 先方品番は子ごとに違う = まとまりの登録では受けない (登録の後に子の商品の画面で)
+  if (order && order.vendor) return res.status(400).json({ ok: false, error: '発注の設定: 先方品番・入数は、まとまりの登録では入れられません (登録の後に子の商品の画面で入れてください)', reason: 'invalid_input', field: 'order_settings.vendor_code' });
   if (order) {
     const og = orderWriteGate(req, gate);
     if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason, field: 'order_settings' });
@@ -1223,7 +1232,16 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
   const nedel = usable ? await readNeDelOverview(db, page.cur.sku_id) : null;
   const nedelLive = nedel ? nedel.items.filter((i) => i.action === 'delete' && i.state === 'live') : [];
   const gone = goneChk ? { ...goneView(goneChk), canApprove: approverGate(req).ok, fromRequest: nedelLive.length > 0, kind: page.cur.sku_kind } : null;
+  // 🆕 ⑤-1 (CompanyDB構想 27 §2.4 の 3・8): 先方品番・入数 = 発注アプリの対応表 (正本) を直接読む (発注アプリの権限がある人だけ・単品だけ)。
+  //   「仕入先」欄の先方品番も正本の値に差し替える (権限が無い人 = 今までどおり Company DB の写し)
+  const vendorSettings = page && page.cur.sku_kind === 'single' ? await vendorScreen(req, editorGate(req), page.cur.code, { primarySupplier: page.cur.primary_supplier || null }) : null;
+  if (vendorSettings && vendorSettings.data && vendorSettings.data.ok) {
+    const bySup = new Map(vendorSettings.data.rows.map((r) => [r.supplier_code, r.vendor_code]));
+    const normSup = (c) => { const t = String(c ?? '').trim(); return /^\d+$/.test(t) ? String(parseInt(t, 10)) : t; };
+    page.suppliers = page.suppliers.map((s) => ({ ...s, vendor_code: bySup.get(normSup(s.code)) ?? null }));
+  }
   res.render(view('sku.ejs'), {
+    vendorSettings,
     gone,
     // 🆕 0087: 梱包した状態の 縦・横・高さ・重さ (単品の商品の行だけ・人の値 + 出どころ (定形外・FBA 納品) + まとめた値)。読めない = 出さない (画面は止めない)
     pkg: page && page.cur.sku_kind === 'single' && page.cur.product_id
@@ -1405,6 +1423,18 @@ router.post('/api/new', (req, res) => {
     const sb = mk.body;
     const po = await orderBlanksFirstTime(db, req, gate, String(b.kind ?? ''), sb);
     if (!po.ok) return res.status(po.status).json(po.json);
+    // 🆕 ⑤-2 (CompanyDB構想 27 §2.4 の 4・5): 先方品番つき = 知らせ v2。DB が v2 を受けない (0075 の前・0089 の前) = 何も書かずに断る
+    //   (Company DB の登録だけ通って先方品番が消える、を作らない)。押し直し (記録がある) = lib が前の答えを返す = 確かめない
+    if (orderBase && orderBase.vendor && !po.replay && !(outbox && (await orderPayloadV2Ready(db)))) {
+      return res.status(400).json({ ok: false, reason: 'vendor_not_ready', field: 'order_settings.vendor_code',
+        error: '発注の設定: 先方品番・入数は、まだ新商品の登録では入れられません (Company DB の更新の前)。先方品番を空にして登録し、登録の後に商品の画面で入れてください。何も保存していません' });
+    }
+    // 🆕 ⑤-2: 先方品番 = 代表の仕入先が発注アプリにある・この商品コードの行がまだ無い (書かない確かめ・届けるときにもう一度)。
+    //   押し直し (この request_id の記録がある = 登録は済み・届け待ちのこともある) = 確かめない (lib が前の答えを返す・届けたあとに人が対応表を直していても 409 にしない)
+    if (orderBase && orderBase.vendor && !po.replay && !registrationOrderDone(b.request_id)) {
+      try { checkRegistrationVendor({ supplierCode: orderInput.supplierCode, code: b.code }); }
+      catch (e) { if (e instanceof VendorCodeError) return res.status(e.status).json({ ok: false, error: `発注の設定: ${e.message}`, reason: e.reason, field: `order_settings.${e.field || 'vendor_code'}` }); throw e; }
+    }
     // 🆕 0080: 単品 = ロジザードのバーコード (値か空欄) が要る・ロジザードの写しでほかの商品の値 = 409 (何も書かない)
     let lzCopy = null;
     //   🆕 #1719 Codex R4 High: 同じ request_id の記録がある (押し直し) = 今の写しで確かめない (lib が前の答えを返す)
@@ -1551,7 +1581,7 @@ router.post('/api/sku/:code/order-settings', (req, res) => {
   if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason });
   const b = req.body || {};
   let order;
-  try { order = orderInputOf(b.values == null ? {} : b.values, { allowEmpty: true }); }
+  try { order = orderInputOf(b.values == null ? {} : b.values, { allowEmpty: true, allowVendor: false }); }
   catch (e) { if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e)); throw e; }
   return withPgApi(res, async (db) => {
     const sku = (await db.query(`select s.code, s.sku_kind, (select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id
@@ -1569,6 +1599,59 @@ router.post('/api/sku/:code/order-settings', (req, res) => {
       if (e instanceof OrderSettingsError) return res.status(e.status).json(orderErrorBody(e));
       throw e;
     }
+  });
+});
+
+// ─── 🆕 ⑤-1: 先方品番・入数 (CompanyDB構想 27 §2.4・発注アプリの先方番号対応表 = 正本に直接書く・apps/purchase-orders/vendor-codes.js) ───
+/** 先に読んだ印 (base_updated_at): 必須。null = まだ無いつもり (保存だけ)・文字 = 開いたときの版 */
+function vendorBaseOf(b, { allowNull }) {
+  if (!b || !Object.prototype.hasOwnProperty.call(b, 'base_updated_at')) return { ok: false };
+  const v = b.base_updated_at;
+  if (v === null) return allowNull ? { ok: true, value: null } : { ok: false };
+  if (typeof v === 'string' && v.trim() !== '' && v.length <= 64) return { ok: true, value: v };
+  return { ok: false };
+}
+const VENDOR_SEEN_REQUIRED = { ok: false, reason: 'seen_required', error: '画面を開いたときの値 (base_updated_at) がありません。画面を開き直してから保存してください (ほかの人の変更を上書きしないため)' };
+/** 単品の商品 (Company DB)。無い・セット = 応答して null */
+async function vendorSkuOf(db, res, code) {
+  const sku = (await db.query('select s.code, s.sku_kind from core.skus s where s.company_id = 1 and s.code_norm = core.norm_code($1)', [String(code || '')])).rows[0];
+  if (!sku) { res.status(404).json({ ok: false, error: `商品コード ${code} は Company DB にありません` }); return null; }
+  if (sku.sku_kind !== 'single') { res.status(400).json({ ok: false, error: '先方品番は単品だけです (発注アプリはセットを扱わず、構成品で発注します)', reason: 'vendor_code_set' }); return null; }
+  return sku;
+}
+const requestIdOf = (b) => (typeof b.request_id === 'string' ? b.request_id.slice(0, 200) : null);
+router.post('/api/sku/:code/vendor-code', (req, res) => {
+  const og = orderWriteGate(req, editorGate(req));
+  if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason });
+  const b = req.body || {};
+  const base = vendorBaseOf(b, { allowNull: true });
+  if (!base.ok) return res.status(428).json(VENDOR_SEEN_REQUIRED);
+  let v;
+  try { v = parseVendorInput({ vendor_code: b.vendor_code ?? null, qty_per_unit: b.qty_per_unit ?? null }); }
+  catch (e) { if (e instanceof VendorCodeError) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, field: e.field }); throw e; }
+  if (!v) return res.status(400).json({ ok: false, error: '先方品番を入れてください (消すときは「消す」)', reason: 'invalid_input', field: 'vendor_code' });
+  return withPgApi(res, async (db) => {
+    const sku = await vendorSkuOf(db, res, req.params.code);
+    if (!sku) return;
+    // 仕入先一致 = 発注アプリのマスタ管理と同じ決まり (商品管理リスト → 無ければ新商品の代表の仕入先)。取引の前に読む (3 秒まで)
+    const prod = await productForVendorMap(sku.code, null, '商品管理リストに載ってから (NE 登録の翌朝) か、新商品の登録で作った商品だけです');
+    const out = upsertVendorCode({ supplierCode: b.supplier_code, productCode: sku.code, vendorCode: v.vendorCode, qtyPerUnit: v.qtyPerUnit,
+      baseUpdatedAt: base.value, prod, actor: String(req.session.email).trim().toLowerCase(), via: 'master-edit:sku', requestId: requestIdOf(b) });
+    const row = out.row ? { supplier_code: out.row.supplier_code, vendor_code: out.row.vendor_code, qty_per_unit: out.row.qty_per_unit ?? null, updated_at: out.row.updated_at } : null;
+    res.status(out.status).json({ ...out.body, row });
+  });
+});
+router.post('/api/sku/:code/vendor-code/delete', (req, res) => {
+  const og = orderWriteGate(req, editorGate(req));
+  if (!og.ok) return res.status(403).json({ ok: false, error: og.message, reason: og.reason });
+  const b = req.body || {};
+  const base = vendorBaseOf(b, { allowNull: false });
+  if (!base.ok) return res.status(428).json(VENDOR_SEEN_REQUIRED);
+  return withPgApi(res, async (db) => {
+    const sku = await vendorSkuOf(db, res, req.params.code);
+    if (!sku) return;
+    const out = deleteVendorCode({ supplierCode: b.supplier_code, productCode: sku.code, base: base.value, actor: String(req.session.email).trim().toLowerCase(), via: 'master-edit:sku', requestId: requestIdOf(b) });
+    res.status(out.status).json(out.body);
   });
 });
 

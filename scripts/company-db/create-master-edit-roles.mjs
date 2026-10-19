@@ -257,7 +257,8 @@ export const ORDER_OUTBOX_SELECT = Object.freeze(['ops.order_settings_outbox', '
 export const ORDER_OUTBOX_EDIT_FUNCTIONS = Object.freeze(['ops.enqueue_order_settings(uuid, text, jsonb)',
   'ops.claim_order_settings_events(text, text, uuid, uuid, integer, integer, integer, uuid[])', 'ops.finish_order_settings_event(uuid, text, text, jsonb, text)',
   'ops.dismiss_order_settings_event(uuid, text, text)']);
-export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()']);
+// 🆕 0089: ops.order_settings_payload_versions() = v2 の印 (アプリは「あるか」だけを見る = 実行権は持ち主だけ)
+export const ORDER_OUTBOX_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.order_settings_payload_problem(jsonb)', 'ops.guard_order_settings_outbox()', 'ops.order_settings_payload_versions()']);
 /**
  * 🆕 0087 (梱包の 縦・横・高さ・重さ・中原さん 2026-10-17): master_edit に人の値・記録の表とまとめた値のビューの select (PACKAGE_SELECT)・
  *   出どころの値 (夜間ロードが書く core.product_physicals) の select (PACKAGE_SOURCE_SELECT・ほかのロールの権限は触らない)・人の値を書く関数の実行 (PACKAGE_EDIT_FUNCTIONS)。

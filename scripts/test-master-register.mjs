@@ -2052,6 +2052,134 @@ await ta('[PO8] 🆕 0075 Render の外 (miniPC) = 登録の直後に届けな�
   assert.deepEqual([(await poOutboxOf('po-web-8')).status, attrsOf('po-web-8').order_lot], ['done', 4]);
 });
 
+// ── 🆕 ⑤ 先方品番・入数 (CompanyDB構想 27 §2.4・apps/purchase-orders/vendor-codes.js・発注アプリの po_vendor_code_map) ──
+const NSK = await import('../apps/purchase-orders/new-skus.js');
+const vmapOf = (sup, code) => podb.prepare('SELECT * FROM po_vendor_code_map WHERE supplier_code = ? AND product_key = ?').get(sup, String(code).toLowerCase()) || null;
+{ const t0 = new Date().toISOString(); podb.prepare('INSERT OR IGNORE INTO po_suppliers (supplier_code, name, created_at, updated_at) VALUES (?,?,?,?)').run('1', 'アメージングクラフト', t0, t0); podb.prepare('INSERT OR IGNORE INTO po_suppliers (supplier_code, name, created_at, updated_at) VALUES (?,?,?,?)').run('3', 'ほかの仕入先', t0, t0); podb.prepare('UPDATE po_suppliers SET lead_days = 21 WHERE supplier_code = ?').run('1'); }
+const emptyPatch = { order_lot: '', condition_id: '', material_group_id: '', capacity_per_unit: '', case_group: '', case_lot: '' };
+
+await ta('[PO9] ⑤-2 新商品の登録の先方品番・入数 = 知らせ v2 (0089) → 発注アプリの対応表 (代表の仕入先・記録 via master-edit:new)・先方品番だけでも積む・入数だけ = 400・まとまり = 400・行がもうある = 409 (何も書かない)・v2 の印が無い DB = 400 (何も書かない)・届ける前に人が足して消した = 要確認 (戻さない)', async () => {
+  // 画面: 単品の新商品の登録には 2 つの欄 (未保存に数える)・まとまりの登録には無い
+  let page = await call('GET', '/apps/master-edit/new?kind=single', { session: 'po-editor' });
+  assert.ok(page.text.includes('id="po-vendor_code"') && page.text.includes('id="po-qty_per_unit"') && page.text.includes('data-dirty-field="po_vendor_code"'), '新商品の画面に先方品番の欄が無い');
+  assert.match(page.text, /先方 1 単位 = 弊社/);
+  page = await call('GET', '/apps/master-edit/new?kind=variation', { session: 'po-editor' });
+  assert.ok(!page.text.includes('id="po-vendor_code"'), 'まとまりの登録に先方品番の欄を出した');
+  // 先方品番だけ (6 つの項目は空) = v2 の知らせ → 対応表に書く (発注の設定の行は作らない)
+  const body = orderBody('po-web-9', { ...emptyPatch, vendor_code: ' AC-9 ', qty_per_unit: '２４' });
+  const r = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.order_settings.ok, r.j.order_settings.status], [true, 'done'], r.text);
+  const ob = await poOutboxOf('po-web-9');
+  assert.deepEqual([ob.status, ob.payload.schema, ob.payload.vendor], ['done', 'po-settings-v2', { vendor_code: 'AC-9', qty_per_unit: '24' }]);
+  assert.deepEqual([vmapOf('1', 'po-web-9').vendor_code, vmapOf('1', 'po-web-9').qty_per_unit, vmapOf('1', 'po-web-9').product_code], ['AC-9', 24, 'po-web-9']);
+  assert.equal(attrsOf('po-web-9'), null, '先方品番だけの登録で発注の設定の行を作った');
+  const au = poAudit('supplier:1').at(-1);
+  assert.deepEqual([au.action, au.actor, au.request_id, au.detail.via, au.detail.product_key], ['vendor_map_entry_upsert', 'naka@test', body.request_id, 'master-edit:new', 'po-web-9']);
+  // 押し直し = 前の答え (書き直さない)
+  const again = await call('POST', '/apps/master-edit/api/new', { body, session: 'po-editor' });
+  assert.deepEqual([again.status, again.j.replayed, again.j.order_settings.ok], [200, true, true], again.text);
+  // 入数だけ = 400 (何も書かない)
+  const qOnly = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9q', { ...emptyPatch, vendor_code: '', qty_per_unit: '3' }), session: 'po-editor' });
+  assert.deepEqual([qOnly.status, qOnly.j.field], [400, 'order_settings.vendor_code'], qOnly.text);
+  assert.equal(await skuId('po-web-9q'), undefined);
+  // まとまりの登録 = 400 (子ごとに番号が違う)
+  const vr = await call('POST', '/apps/master-edit/api/new/variation', { body: { request_id: uuid(), group: { name: 'x' }, options: [], children: [], values: {}, order_settings: { vendor_code: 'X' } }, session: 'po-editor' });
+  assert.equal(vr.status, 400, vr.text);
+  // 対応表にこの商品コードの行がもうある = 登録の前に 409 (Company DB にも書かない)
+  podb.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1', 'po-web-9x', 'po-web-9x', 'HUMAN', ?)").run(new Date().toISOString());
+  const taken = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9x', { ...emptyPatch, vendor_code: 'AC-9X' }), session: 'po-editor' });
+  assert.deepEqual([taken.status, taken.j.field], [409, 'order_settings.vendor_code'], taken.text);
+  assert.equal(await skuId('po-web-9x'), undefined, '断ったのに Company DB に登録した');
+  // 行は無いが記録がある (前に足して消した) = 登録の前に 409 (Codex R1 M2)
+  podb.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code = '1' AND product_key = 'po-web-9x'").run();
+  podb.prepare("INSERT INTO po_audit_log (occurred_at, actor_type, actor, action, resource, detail_json) VALUES (?, 'user', 'x', 'vendor_map_entry_delete', 'supplier:1', ?)").run(new Date().toISOString(), JSON.stringify({ productCode: 'po-web-9x', vendorCode: 'HUMAN', product_key: 'po-web-9x' }));
+  const hist = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9x', { ...emptyPatch, vendor_code: 'AC-9X' }), session: 'po-editor' });
+  assert.deepEqual([hist.status, hist.j.reason, await skuId('po-web-9x')], [409, 'stale', undefined], hist.text);
+  // v2 の印の関数が無い DB (0089 の前) = 400 vendor_not_ready (何も書かない)・先方品番が無い登録は通る
+  await pg.query('alter function ops.order_settings_payload_versions() rename to order_settings_payload_versions_hidden');
+  try {
+    const nr = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9n', { ...emptyPatch, vendor_code: 'AC-9N' }), session: 'po-editor' });
+    assert.deepEqual([nr.status, nr.j.reason], [400, 'vendor_not_ready'], nr.text);
+    assert.equal(await skuId('po-web-9n'), undefined);
+    const plain = await call('POST', '/apps/master-edit/api/new', { body: orderBody('po-web-9p', { ...emptyPatch, order_lot: '2' }), session: 'po-editor' });
+    assert.deepEqual([plain.status, (await poOutboxOf('po-web-9p')).payload.schema], [200, 'po-settings-v1'], plain.text);
+  } finally { await pg.query('alter function ops.order_settings_payload_versions_hidden() rename to order_settings_payload_versions'); }
+  // 届ける前 (Render の外 = すぐは届けない) に人が対応表で足して消した = 届けても戻さない (要確認)
+  OSO.__setOrderDeliveryEnabledForTest(false);
+  try {
+    var lateBody = orderBody('po-web-9d', { ...emptyPatch, vendor_code: 'AC-9D' });
+    const late = await call('POST', '/apps/master-edit/api/new', { body: lateBody, session: 'po-editor' });
+    assert.equal(late.status, 200, late.text);
+  } finally { OSO.__setOrderDeliveryEnabledForTest(true); }
+  const VCM = await import('../apps/purchase-orders/vendor-codes.js');
+  VCM.upsertVendorCode({ supplierCode: '1', productCode: 'po-web-9d', vendorCode: 'HUMAN-9D', baseUpdatedAt: null, prod: { prodSup: '1', error: null }, actor: 'other@test', via: 'po-admin' });
+  // 届け待ちの間に人が対応表に行を足した後の押し直し = 前の答え (先方品番の確かめで 409 にしない・統合の Codex P2)
+  OSO.__setOrderDeliveryEnabledForTest(false);
+  try {
+    const lateAgain = await call('POST', '/apps/master-edit/api/new', { body: lateBody, session: 'po-editor' });
+    assert.deepEqual([lateAgain.status, lateAgain.j.replayed], [200, true], lateAgain.text);
+  } finally { OSO.__setOrderDeliveryEnabledForTest(true); }
+  VCM.deleteVendorCode({ supplierCode: '1', productCode: 'po-web-9d', base: vmapOf('1', 'po-web-9d').updated_at, actor: 'other@test', via: 'po-admin' });
+  OSO.__resetOrderOutboxCacheForTest();
+  await call('GET', '/apps/master-edit/api/order-settings-outbox', { session: 'po-editor' });
+  assert.deepEqual([(await poOutboxOf('po-web-9d')).status, vmapOf('1', 'po-web-9d')], ['conflict', null], '人が消した先方品番を届けて戻した');
+});
+
+await ta('[PO10] ⑤-1 商品の画面の先方品番・入数: 正本 (発注アプリの対応表) を出す・1 行ずつ保存 (版が要る 428・違う 409)・直せるのは仕入先一致の 1 社 (ほかの仕入先は消すだけ)・権限・単品だけ・「仕入先」欄の先方品番も正本・入数の名前を分ける', async () => {
+  NSK.setNewSkuReaderForTest(async () => ({ ok: true, map: new Map([['po-web-9', { code: 'po-web-9', name: 'x', state: 'draft', supplier: '1' }]]) }));
+  try {
+    // 写し (Company DB) と違う値にしておく = 画面は正本を出す
+    podb.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) VALUES ('3', 'po-web-9', 'po-web-9', 'OLD-3', 1.5, ?)").run(new Date().toISOString());
+    let page = await call('GET', '/apps/master-edit/sku/po-web-9', { session: 'po-editor' });
+    assert.equal(page.status, 200, page.text.slice(0, 300));
+    assert.ok(page.text.includes('id="po-vendor"'), '商品の画面に先方品番の段が無い');
+    assert.match(page.text, /class="f po-vrow" data-sup="1" data-base="[^"]+" data-mine="1"/);
+    assert.match(page.text, /class="f po-vrow" data-sup="3" data-base="[^"]+" data-mine=""/);
+    assert.match(page.text, /value="AC-9"/); assert.match(page.text, /value="24"/);
+    assert.match(page.text, /標準リードタイム 21 日/);
+    assert.match(page.text, /この商品の仕入先 \(発注アプリの決まり\) ではないので直せません/);
+    assert.match(page.text, /先方品番は 下の「発注の設定」で/);
+    assert.match(page.text, /発注の計算に使う弊社の個数/, 'ケースロットの説明 (入数の意味を分ける) が無い');
+    const sc = await checkScripts(page.text, 0);
+    assert.ok((sc.find((x) => x.includes('me-order.js — 「発注の設定」の欄の動き')) || '').includes("'/vendor-code'"), 'me-order.js が先方品番を保存しない');
+    // 発注アプリの権限が無い = 段を出さない (写しの値は今までどおり)
+    page = await call('GET', '/apps/master-edit/sku/po-web-9', { session: 'editor' });
+    assert.ok(!page.text.includes('class="f po-vrow"'));
+    const url = '/apps/master-edit/api/sku/po-web-9/vendor-code';
+    const cur = vmapOf('1', 'po-web-9');
+    // 版が無い = 428・権限 = 403・セット = 400・仕入先一致でない = 400・古い版 = 409・合う版 = 直す (記録 via master-edit:sku)
+    assert.equal((await call('POST', url, { session: 'po-editor', body: { supplier_code: '1', vendor_code: 'AC-9B' } })).status, 428);
+    assert.equal((await call('POST', url, { session: 'editor', body: { supplier_code: '1', vendor_code: 'AC-9B', base_updated_at: cur.updated_at } })).j.reason, 'no_po_access');
+    assert.equal((await call('POST', url, { session: 'po-viewer', body: { supplier_code: '1', vendor_code: 'AC-9B', base_updated_at: cur.updated_at } })).status, 403);
+    assert.equal((await call('POST', '/apps/master-edit/api/sku/new-set-1/vendor-code', { session: 'po-editor', body: { supplier_code: '1', vendor_code: 'X', base_updated_at: null } })).j.reason, 'vendor_code_set');
+    const other = await call('POST', url, { session: 'po-editor', body: { supplier_code: '3', vendor_code: 'NEW-3', base_updated_at: vmapOf('3', 'po-web-9').updated_at } });
+    assert.equal(other.status, 400, other.text); assert.match(other.j.error, /この商品の仕入先は 1 です/);
+    const stale = await call('POST', url, { session: 'po-editor', body: { supplier_code: '1', vendor_code: 'AC-9B', base_updated_at: '2020-01-01T00:00:00.000Z' } });
+    assert.deepEqual([stale.status, stale.j.conflict, vmapOf('1', 'po-web-9').vendor_code], [409, true, 'AC-9']);
+    const okr = await call('POST', url, { session: 'po-editor', body: { supplier_code: '0001', vendor_code: 'AC-9B', qty_per_unit: '１２', base_updated_at: cur.updated_at, request_id: 'rid-vc' } });
+    assert.deepEqual([okr.status, okr.j.ok, okr.j.updated, okr.j.row.vendor_code, okr.j.row.qty_per_unit], [200, true, true, 'AC-9B', 12], okr.text);
+    assert.ok(okr.j.row.updated_at > cur.updated_at);
+    const au = poAudit('supplier:1').at(-1);
+    assert.deepEqual([au.action, au.request_id, au.detail.via, au.detail.oldVendorCode], ['vendor_map_entry_upsert', 'rid-vc', 'master-edit:sku', 'AC-9']);
+    // 入数だけ = 400・空の先方品番 = 400
+    assert.equal((await call('POST', url, { session: 'po-editor', body: { supplier_code: '1', vendor_code: '', qty_per_unit: '3', base_updated_at: okr.j.row.updated_at } })).status, 400);
+    // 消す: 版が要る (null も断る)・違う = 409・ほかの仕入先の古い行も消せる
+    const del = '/apps/master-edit/api/sku/po-web-9/vendor-code/delete';
+    assert.equal((await call('POST', del, { session: 'po-editor', body: { supplier_code: '3', base_updated_at: null } })).status, 428);
+    assert.equal((await call('POST', del, { session: 'po-editor', body: { supplier_code: '3', base_updated_at: '2020-01-01' } })).status, 409);
+    const d = await call('POST', del, { session: 'po-editor', body: { supplier_code: '3', base_updated_at: vmapOf('3', 'po-web-9').updated_at } });
+    assert.deepEqual([d.status, vmapOf('3', 'po-web-9')], [200, null], d.text);
+    assert.deepEqual([poAudit('supplier:3').at(-1).action, poAudit('supplier:3').at(-1).detail.via], ['vendor_map_entry_delete', 'master-edit:sku']);
+    // 「仕入先」欄の先方品番 = 正本の値 (発注アプリの権限がある人)
+    page = await call('GET', '/apps/master-edit/sku/po-web-9', { session: 'po-editor' });
+    assert.match(page.text, /先方品番 AC-9B/);
+    // 発注の設定の保存は先方品番を受けない (別の保存)
+    const os = await call('POST', '/apps/master-edit/api/sku/po-web-9/order-settings', { session: 'po-editor', body: { seen: { updated_at: null }, values: { order_lot: '2', vendor_code: 'X' } } });
+    assert.equal(os.status, 400, os.text);
+  } finally { NSK.setNewSkuReaderForTest(null); }
+});
+
 console.log('\nproduct-hub (新規作成の入口・ボード)');
 
 let phCalls = 0;
