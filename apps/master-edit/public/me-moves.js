@@ -3,6 +3,7 @@
  *   - 履歴 = GET /api/sku/:code/movements (新しい順・出荷 200 行ずつ)。「もっと前を見る」= 前のページの切れ目 (next) から続きを足す
  *   - 月別 = GET /api/sku/:code/monthly (直近 13 か月)。データの無い月は空欄 (0 と出さない)
  *   - 時刻は日本時間。仕入は日付だけ (入庫日)。「在庫の調整 (ずれ)」の行は薄く・理由つき
+ *   - 履歴は高さを決めた枠 (#mv-box) の中でスクロール。件数 (全 N 件 / 新しい方から N 件) は枠の下
  */
 (function () {
   'use strict';
@@ -15,8 +16,21 @@
   var head = document.getElementById('mv-head');
   var more = document.getElementById('mv-more');
   var msg = document.getElementById('mv-msg');
+  var scroller = document.getElementById('mv-box');   // 履歴の枠 (高さを決めて中でスクロール)
   var next = null;
   var count = 0;
+  var cut = false;     // どこかのページで「1 日の出荷が多すぎて全部は読めなかった」= 「全 N 件」と言わない
+  var counted = false; // 件数を出している (読んでいる途中・読めなかったときは画面の大きさが変わっても書き換えない)
+
+  // 件数: 最後まで読んだ = 「全 N 件」/ まだ前がある = 「新しい方から N 件」/ 読めなかった日がある = 「読めた N 件」。
+  // 枠に入りきらないときだけ「枠の中でスクロール」を添える (画面の向き・大きさが変わったら数え直す)
+  function showCount() {
+    var over = scroller && scroller.scrollHeight > scroller.clientHeight + 1;
+    var t = (cut ? '1 日の出荷が多すぎて全部は読めませんでした (その日の在庫数は出していません) · 読めた ' : next ? '新しい方から ' : '全 ')
+      + count.toLocaleString('ja-JP') + ' 件' + (over ? ' (枠の中でスクロール)' : '') + (next ? ' · もっと前があります' : '');
+    if (msg.textContent !== t) msg.textContent = t;   // 同じ文なら書き換えない (読み上げを繰り返さない)
+    counted = true;
+  }
 
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
   function num(v) { return v == null ? '' : Number(v).toLocaleString('ja-JP'); }
@@ -63,6 +77,7 @@
 
   function load() {
     more.disabled = true;
+    counted = false;
     msg.textContent = next ? '前の分を読んでいます…' : '';
     api('/api/sku/' + encodeURIComponent(CODE) + '/movements' + (next ? '?before=' + encodeURIComponent(next) : '')).then(function (j) {
       more.disabled = false;
@@ -78,10 +93,12 @@
       count += j.rows.length;
       next = j.next;
       more.hidden = !next;
-      msg.textContent = (j.truncated ? '1 日の出荷が多すぎて全部は読めませんでした (その日の在庫数は出していません) · ' : '') + count.toLocaleString('ja-JP') + ' 行' + (next ? '' : ' (ここまで)');
+      if (j.truncated) cut = true;
+      showCount();   // 続きは tbody の末尾に足すだけ = 枠のスクロールの位置はそのまま
     });
   }
   more.addEventListener('click', load);
+  window.addEventListener('resize', function () { if (counted) showCount(); });
   load();
 
   // ── 月別のまとめ

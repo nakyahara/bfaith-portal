@@ -1305,6 +1305,12 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 .mv-foot { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
 .mv-notes { margin-top: 8px; }
 .tbl.mv td:nth-child(2) { white-space: nowrap; }
+/* 🆕 10/19 履歴の枠: よく売れる商品は出荷の行が 1 日に何十もある = ページが長くなりすぎる → 高さを決めて枠の中でスクロール (13〜14 行ほど見える)。
+   見出しの行は枠の上に貼り付ける (th の背景は塗りつぶし = 下の行が透けない)。横は今までどおり枠の中で送る (ページははみ出さない)。
+   低い画面 (スマホ) では画面の高さの 65% まで (枠の外を触ればページを送れる) */
+.tblwrap.mv-scroll { max-height: min(600px, 65vh); overflow: auto; }
+.tblwrap.mv-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }   /* 影でなく outline = 強制カラーでも消えない */
+.tblwrap.mv-scroll thead th { position: sticky; top: 0; z-index: 1; }
 
 /* ---------- 販売数のグラフ (10/17 中原さん・商品の画面の下) ----------
    色の役 (dataviz の手順・検査の道具で暗い面 #0e1626 に対して確かめた = 明るさ・彩度・色覚の差 (隣り合う組 ΔE 8.4 以上)・面との比 3:1 以上):
