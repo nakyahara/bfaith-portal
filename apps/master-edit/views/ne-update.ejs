@@ -59,7 +59,8 @@
           <span class="hint">CSV は作った日のうちに取り込んでください · Excel で開いて保存し直さないでください<% if (N.uploadReady && N.waitingNow) { %> · いま NE へ送る準備をしています (数分で届きます)<% } %></span>
         <% } %>
       </div>
-      <div id="nu-files"></div>
+      <div id="nu-files"><% if (canSend && N.todayFiles.length) { %><div class="hint" style="margin:8px 0 4px">今日作った CSV (受け取れなかったときは、もう一度ダウンロードできます)</div>
+        <% for (const f of N.todayFiles) { %><button class="btn sm" type="button" style="margin-right:8px" data-dl="<%= f.file_id %>" data-kind="<%= f.kind %>"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg><%= when(f.at) %> · <%= f.kind === 'sets' ? 'セット' : '単品' %> <%= f.line_count %> 件</button><% } %><% } %></div>
       <div class="msgline" id="nu-msg" role="status" aria-live="polite"></div>
     </section>
 

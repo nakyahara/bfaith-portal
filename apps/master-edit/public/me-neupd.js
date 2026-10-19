@@ -12,7 +12,11 @@
   if (!dataEl) return;
   var P = JSON.parse(dataEl.textContent || 'null');
   if (!P) return;
-  var busy = false, pending = {};
+  var busy = false;
+  // 押した番号 (結果が分からないまま画面を開き直しても同じ番号で送り直す = 2 回作らない・頼まない)
+  var KEY = 'me-neupd-pending';
+  var pending = (function () { try { return JSON.parse(sessionStorage.getItem(KEY) || '{}') || {}; } catch (e) { return {}; } })();
+  function keep() { try { sessionStorage.setItem(KEY, JSON.stringify(pending)); } catch (e) { /* 残せなくても動く */ } }
   function msg(t, cls, id) { var m = $(id || '#nu-msg'); if (m) { m.className = 'msgline ' + (cls || ''); m.textContent = t || ''; } }
   function uuid() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
@@ -31,14 +35,15 @@
   var send = $('#nu-send');
   if (send) send.addEventListener('click', function () {
     if (busy) return;
-    pending.send = pending.send || uuid();
+    pending.send = pending.send || uuid(); keep();
     busy = true; send.disabled = true; msg('送るように頼んでいます…');
     post(P.base + '/api/ne-update/send-now', { request_id: pending.send }).then(function (x) {
       busy = false;
       if (!sure(x)) { send.disabled = false; msg('頼めたか分かりません。もう一度押してください (同じ頼みとして送り直します)', 'err'); return; }
-      pending.send = null;
-      if (!x.r.ok || !x.j.ok) { send.disabled = false; msg(x.j.error || ('できませんでした (' + x.r.status + ')'), 'err'); return; }
-      msg('送るように頼みました。数分で NE に届きます (届いた分は、翌朝 NE と同じになれば一覧から消えます)', 'ok');
+      pending.send = null; keep();
+      send.disabled = false;
+      if (!x.r.ok || !x.j.ok) { msg(x.j.error || ('できませんでした (' + x.r.status + ')'), 'err'); return; }
+      msg('NE へ送る頼みを受け付けました。数分のうちに送ります (NE に入った分は、翌朝 NE と同じになれば一覧から消えます)', 'ok');
     }).catch(function () { busy = false; send.disabled = false; msg('通信できませんでした。もう一度押してください (同じ頼みとして送り直します)', 'err'); });
   });
 
@@ -58,7 +63,7 @@
             a.download = m ? m[1] : ('ne-update-' + id + '.csv');
             document.body.appendChild(a); a.click(); a.remove();
             setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
-            msg('保存しました (' + a.download + ')。NE の ' + (kind === 'sets' ? '[商品] → [商品管理の一括登録] の「セット商品」' : '[商品] → [商品管理の一括登録]') + ' で取り込んでください', 'ok');
+            msg('CSV を保存しました。NE の [商品] → [商品管理の一括登録] で' + (kind === 'sets' ? '「セット商品情報 CSV」' : '「商品 CSV」') + 'として取り込んでください', 'ok');
           });
         });
       })
@@ -68,14 +73,15 @@
   var csv = $('#nu-csv');
   if (csv) csv.addEventListener('click', function () {
     if (busy) return;
-    pending.csv = pending.csv || uuid();
+    pending.csv = pending.csv || uuid(); keep();
     busy = true; csv.disabled = true; msg('作っています…');
     post(P.base + '/api/ne-update/csv', { request_id: pending.csv }).then(function (x) {
       busy = false;
       if (!sure(x)) { csv.disabled = false; msg('作れたか分かりません。もう一度押してください (同じ CSV として送り直します)', 'err'); return; }
-      pending.csv = null;
-      if (!x.r.ok || !x.j.ok) { csv.disabled = false; msg(x.j.error || ('できませんでした (' + x.r.status + ')'), 'err'); return; }
-      if (x.j.state !== 'built' || !x.j.files.length) { csv.disabled = false; msg(x.j.reason || '送る所がありませんでした', 'err'); return; }
+      pending.csv = null; keep();
+      csv.disabled = false;
+      if (!x.r.ok || !x.j.ok) { msg(x.j.error || ('できませんでした (' + x.r.status + ')'), 'err'); return; }
+      if (x.j.state !== 'built' || !x.j.files.length) { msg(x.j.reason || '送る所がありませんでした', 'err'); return; }
       var box = $('#nu-files');
       box.innerHTML = '';
       x.j.files.forEach(function (f, i) {
@@ -88,6 +94,10 @@
       msg(x.j.files.length > 1 ? 'CSV を ' + x.j.files.length + ' つ作りました。1 つずつダウンロードして、順に NE に取り込んでください' + (x.j.left ? ' (残り ' + x.j.left + ' 件は次の回)' : '') : 'CSV を作りました。ダウンロードして NE に取り込んでください', 'ok');
       if (x.j.files.length === 1) download(x.j.files[0].file_id, x.j.files[0].kind);
     }).catch(function () { busy = false; csv.disabled = false; msg('通信できませんでした。もう一度押してください (同じ CSV として送り直します)', 'err'); });
+  });
+
+  Array.prototype.forEach.call(document.querySelectorAll('#nu-files [data-dl]'), function (b) {
+    b.addEventListener('click', function () { download(b.getAttribute('data-dl'), b.getAttribute('data-kind')); });
   });
 
   var vs = $('#nu-v-save');

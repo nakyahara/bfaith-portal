@@ -179,7 +179,10 @@ await ta('[S3] API: 名簿に無い = 403・今すぐ = 頼みを積む・CSV �
   assert.equal(buf.toString('utf8'), 'syohin_code,genka_tnk\r\na01,150\r\n');
   assert.equal(d.headers.get('x-content-sha256'), crypto.createHash('sha256').update(buf).digest('hex'));
   // 受け取った = 送っている途中 (画面の一言)
-  assert.match(bodyText(await page('/ne-update')), /この欄は今送っている途中です \(明日の朝に終わります\)/);
+  const after = await page('/ne-update');
+  assert.match(bodyText(after), /この欄は今送っている途中です \(NE に取り込めば、明日の朝に一覧から消えます\)/);
+  assert.match(after, new RegExp(`data-dl="${id}"`), '今日作った CSV をもう一度ダウンロードできる');
+  assert.doesNotMatch(bodyText(after), /#\d|ファイル #|ne-update-products/, 'ファイル番号・ファイル名は本文に出さない');
   EMAIL = 'edit@test';
   assert.equal((await api('/api/ne-update/verified', { kind: 'products', col: 'cost', result: 'ok' })).status, 403);
   EMAIL = 'naka@test';
@@ -231,7 +234,8 @@ else {
         await p.goto(`${B}/ne-update`);
         if (process.env.NEUPD_SHOT) await p.screenshot({ path: process.env.NEUPD_SHOT, fullPage: true });   // 見た目を人が見るとき (試験の判定には使わない)
         await p.click('#nu-send');
-        await p.waitForFunction(() => /送るように頼みました/.test(document.querySelector('#nu-msg')?.textContent || ''), null, { timeout: 15000 });
+        await p.waitForFunction(() => /NE へ送る頼みを受け付けました/.test(document.querySelector('#nu-msg')?.textContent || ''), null, { timeout: 15000 });
+        assert.equal(await p.locator('#nu-csv').isDisabled(), false, '作った後も次を作れる');
         assert.deepEqual(errors, []);
       } finally { await ctx.close(); }
     });
