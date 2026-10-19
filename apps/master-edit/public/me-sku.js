@@ -486,6 +486,7 @@
     box.innerHTML = savedHtml(n.j);
     var ph = $('#sku-ph'); if (ph && ph.parentNode) ph.parentNode.insertBefore(box, ph.nextSibling); else form.parentNode.insertBefore(box, form);
     $('#saved-note-close').addEventListener('click', function () { box.remove(); });
+    if (ME.showTab) ME.showTab('basic');   // 🆕 10/19: 保存の後に読み直したら基本情報のタブ (戻るの見張りで前の #tab に戻っていても)
     var ch = Array.isArray(n.j.changed) ? n.j.changed : [];
     ME.toast('保存しました' + (ch.length ? ' (' + changeText(ch[0]) + (ch.length > 1 ? ' ほか ' + (ch.length - 1) + ' 件' : '') + ')' : ''));
   }
@@ -533,6 +534,8 @@
   }
   function doSave() {
     if (!saveBtn || saveBtn.disabled || busy) return;
+    // 🆕 10/19: グラフ・履歴のタブで Ctrl+S = 基本情報のタブに戻してから (保存の箱・断られた欄が見える)
+    if (ME.showTab) ME.showTab('basic');
     // JAN の欄に打ったままなら、先に札にする (Ctrl+S は欄を離れない = blur が来ない)。札にできなければ保存しない (#1589 Codex R2 M1)
     if (janPending()) {
       if (!janAdd(janIn.value)) { msg('JAN の欄を直してから保存してください (何も保存していません)', 'err'); janIn.focus(); return; }
@@ -555,6 +558,7 @@
           return;
         }
         msg('', 'err');
+        if (ME.showTab) ME.showTab('basic');   // 返事を待つ間に別のタブへ移っていても、断られた理由と欄を見せる
         var reopen = showError(x.j, x.r.status);
         requestId = uuid();   // 返事が来た = この番号の保存は終わった。直してもう一度保存するときは新しい番号
         if (reopen) mustReload = true;
@@ -569,6 +573,7 @@
   var box = $('#savebox'), boxToggle = $('#savebox-toggle');
   function review() {
     if (!box) return;
+    if (ME.showTab) ME.showTab('basic');   // 🆕 10/19: 未保存の札・離れるときの「変更内容を確認する」= 基本情報のタブの保存の箱へ
     box.classList.add('open'); if (boxToggle) boxToggle.setAttribute('aria-expanded', 'true');
     box.scrollIntoView({ behavior: 'smooth', block: 'center' });
     var need = lastState.need && lastState.need[0];
@@ -581,7 +586,7 @@
   ME.onSave = canSave ? function () {
     if (saveBtn && !saveBtn.disabled) { doSave(); return; }
     if (lastState.need && lastState.need.length) { review(); ME.toast(lastState.need[0].t); return; }
-    if (mustReload) { ME.toast('この画面は古くなりました。「画面を開き直す」を押してください'); var rb = $('#reload'); if (rb) rb.focus(); return; }
+    if (mustReload) { if (ME.showTab) ME.showTab('basic'); ME.toast('この画面は古くなりました。「画面を開き直す」を押してください'); var rb = $('#reload'); if (rb) rb.focus(); return; }
     ME.toast(saved ? '保存しました。保存した後の値を読み直しています' : '保存する変更がありません');
   } : null;
 

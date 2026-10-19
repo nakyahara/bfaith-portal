@@ -6,6 +6,8 @@
  *   - 在庫 0 の日 (欠品) がある期間は両方のグラフで帯を付ける (凡例に「欠品」の言葉)。いちばん新しい期間 (途中) は薄い棒
  *   - 値は棒にかざす / グラフを選んで ← → で見る (同じ中身を読み上げにも)。表 (表で見る) にも全部ある = ツールチップだけに頼らない
  *   - 名前・数は textContent で入れる (innerHTML に値を混ぜない)。幅はグラフの箱に合わせて描き直す (スマホ 390 でもはみ出さない)
+ *   - 🆕 10/19: 画面のタブ (me-tabs.js)「販売数のグラフ」を初めて開いたときに読む (隠れたタブのまま読まない = 画面を開くのが速い)。
+ *     読んでいる間に別のタブへ移った = 隠れたまま描き、開き直したら箱の幅で描き直す (ResizeObserver)
  */
 (function () {
   'use strict';
@@ -376,5 +378,10 @@
     });
   }
   retryBtn.addEventListener('click', function () { load(true); });
-  load(false);
+  // 🆕 タブ (me-tabs.js): 隠れたタブの中 = そのタブを初めて開いたときに 1 回だけ読む (開いている = すぐ読む)
+  var tp = box.closest ? box.closest('[role="tabpanel"]') : null;
+  var started = false;
+  function start() { if (started) return; started = true; load(false); }
+  if (tp) tp.addEventListener('me:tabshown', function () { if (!started) start(); else if (data && Math.abs((chartEl.clientWidth || 0) - lastW) >= 2) draw(); });
+  if (!tp || !tp.hidden) start();
 })();

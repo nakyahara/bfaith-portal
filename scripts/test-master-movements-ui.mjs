@@ -12,6 +12,7 @@
  *     件数 (新しい方から N 件 / 全 N 件・枠の中でスクロール)・「もっと前を見る」は枠の中の末尾に足し、枠のスクロールの位置を変えない・
  *     Tab で枠に来て (tabindex・role=region・aria-label) キーで送れる・その下の月別のまとめはページの近くにある
  *   7 件数の言い方: 1 日の出荷を全部は読めなかった = 「読めた N 件」(全 と言わない)・画面の高さが変わったら「枠の中でスクロール」を数え直す
+ *   🆕 10/19: 履歴は商品の画面のタブ「入出庫の履歴」の中 (開いたときに読む) = #tab=moves で開く (タブそのものの試験は test-master-edit-ui [80]〜[81])
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ
  * 使い方: node scripts/test-master-movements-ui.mjs
  */
@@ -108,7 +109,7 @@ const cells = (p, sel) => p.$$eval(sel, (trs) => trs.map((tr) => [...tr.querySel
 
 try {
   await ta('[1] 単品 (発注アプリの権限あり): 出荷・仕入・在庫の調整 (ずれ)・在庫数・ロジザードの伝票NO・見出し・月別 13 か月', async (p) => {
-    await p.goto(B + '/sku/mv-a');
+    await p.goto(B + '/sku/mv-a#tab=moves');
     await p.waitForSelector('#mv-rows tr');
     const rows = await cells(p, '#mv-rows tr');
     // 日時 / 処理 / 入庫 / 出庫 / 在庫数 / 伝票番号 / 店舗・仕入先 / 理由 / 担当者
@@ -142,7 +143,7 @@ try {
   });
 
   await ta('[2] もっと前を見る: 続きを足す (区間の途中で切れない・錨の前は「—」)・最後まで読んだらボタンを隠す', async (p) => {
-    await p.goto(B + '/sku/mv-b');
+    await p.goto(B + '/sku/mv-b#tab=moves');
     await p.waitForSelector('#mv-rows tr');
     assert.equal(await p.$$eval('#mv-rows tr', (x) => x.length), 225);
     assert.equal(await p.isVisible('#mv-more'), true);
@@ -157,7 +158,7 @@ try {
   await ta('[3] 発注アプリの権限が無い人: 仕入の行も仕入・発注の欄も出さない (見出しにそう書く)', async (p) => {
     SESSION_APPS = ['master-edit'];
     try {
-      await p.goto(B + '/sku/mv-a');
+      await p.goto(B + '/sku/mv-a#tab=moves');
       await p.waitForSelector('#mv-rows tr');
       const rows = await cells(p, '#mv-rows tr');
       assert.equal(rows.some((r) => r[1] === '仕入'), false);
@@ -170,7 +171,7 @@ try {
   });
 
   await ta('[4] セット: 表を出さず構成品の画面へのリンク・画面の JS も読まない', async (p) => {
-    await p.goto(B + '/sku/mv-set');
+    await p.goto(B + '/sku/mv-set#tab=moves');
     assert.match(await p.textContent('#mv-set'), /セットには在庫がありません/);
     assert.deepEqual(await p.$$eval('#mv-set a', (x) => x.map((a) => [a.textContent, new URL(a.href).pathname])), [['mv-a', '/apps/master-edit/sku/mv-a'], ['mv-b', '/apps/master-edit/sku/mv-b']]);
     assert.equal(await p.$('#mv-tbl'), null);
@@ -178,14 +179,14 @@ try {
   });
 
   await ta('[5] スマホ 390: ページが横にはみ出さない (表は表の箱の中で横に送る)', async (p) => {
-    await p.goto(B + '/sku/mv-a');
+    await p.goto(B + '/sku/mv-a#tab=moves');
     await p.waitForSelector('#mv-rows tr');
     await p.waitForSelector('#mo-rows tr');
     const w = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: window.innerWidth, box: document.querySelector('#p-moves .tblwrap').scrollWidth > document.querySelector('#p-moves .tblwrap').clientWidth }));
     assert.ok(w.doc <= w.view, `横にはみ出す: ${w.doc} > ${w.view}`);
     assert.equal(w.box, true, '表は箱の中で横に送る');
     // 行の多い商品: 枠は画面の高さの 65% まで (844 × 0.65 = 548)・横も枠の中で送る・ページははみ出さない
-    await p.goto(B + '/sku/mv-b');
+    await p.goto(B + '/sku/mv-b#tab=moves');
     await p.waitForSelector('#mv-rows tr');
     const v = await p.evaluate(() => { const b = document.getElementById('mv-box'); return { h: b.clientHeight, sh: b.scrollHeight, sw: b.scrollWidth > b.clientWidth, doc: document.documentElement.scrollWidth, view: window.innerWidth }; });
     assert.ok(v.h <= 549 && v.sh > v.h, `スマホの枠の高さ ${v.h}`);
@@ -194,7 +195,7 @@ try {
   }, { width: 390, height: 844 });
 
   await ta('[6] 履歴の枠: 高さを決めて中でスクロール・見出しの行が残る・件数・続きは枠の中に足してスクロールの位置を変えない・キーボード', async (p) => {
-    await p.goto(B + '/sku/mv-b');
+    await p.goto(B + '/sku/mv-b#tab=moves');
     await p.waitForSelector('#mv-rows tr');
     assert.equal(await p.textContent('#mv-msg'), '新しい方から 225 件 (枠の中でスクロール) · もっと前があります');
     const a11y = await p.$eval('#mv-box', (b) => ({ tab: b.getAttribute('tabindex'), role: b.getAttribute('role'), label: b.getAttribute('aria-label'), inBox: !!document.getElementById('mv-rows').closest('#mv-box') }));
@@ -243,7 +244,7 @@ try {
     // API の答えを差し替える (読めなかった日がある・続きは無い・6 行)
     const row = (i) => ({ kind: 'ship', at: new Date(SEED_NOW - i * 3600e3).toISOString(), label: '出荷', in: null, out: 1, balance: null, slip: 'S' + i, party: '楽天', reason: '', actor: null });
     await p.route('**/api/sku/mv-a/movements*', (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify({ ok: true, rows: [0, 1, 2, 3, 4, 5].map(row), next: null, truncated: true, lastClose: null, firstDay: null }) }));
-    await p.goto(B + '/sku/mv-a');
+    await p.goto(B + '/sku/mv-a#tab=moves');
     await p.waitForFunction(() => document.querySelectorAll('#mv-rows tr').length === 6);
     const cutMsg = '1 日の出荷が多すぎて全部は読めませんでした (その日の在庫数は出していません) · 読めた 6 件';
     assert.equal(await p.textContent('#mv-msg'), cutMsg + ' (枠の中でスクロール)', '低い画面 (300 の 65% = 195px) では 6 行が入りきらない');

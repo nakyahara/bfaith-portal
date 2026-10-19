@@ -58,6 +58,7 @@
   ME.setUnsaved = function (n) {
     var u = $('#unsaved'); if (u) { u.hidden = n === 0; $('#unsaved-n').textContent = '未保存 ' + n + ' 件'; }
     var st = $('#sticky-unsaved'); if (st) { st.hidden = n === 0; st.textContent = '● 未保存 ' + n + ' 件'; }
+    var td = $('#tab-basic-dirty'); if (td) td.hidden = n === 0;   // 🆕 10/19: 商品の画面のタブ「基本情報」にも印 (グラフ・履歴のタブを見ている間も分かる)
     $$('.mb-n').forEach(function (x) { x.textContent = n ? '● 未保存 ' + n + ' 件' : '未保存の変更はありません'; x.style.color = n ? 'var(--warn)' : ''; });
     if (n > 0) armBackGuard();
   };
@@ -159,14 +160,22 @@
     e.preventDefault(); e.returnValue = '';
   });
   // ブラウザの戻る: 未保存になった時に 1 つ履歴を足しておき、戻ったら確認を出す (その間は同じページのまま)
+  //   🆕 10/19: 足す前の履歴 (この画面の元の 1 つ) に meBase の印を付ける = 戻ってそこへ来た時だけ確認を出す。
+  //   アドレスに #tab=… を打った (商品の画面のタブ・同じ画面の中の # の移り) = 印の無い新しい履歴 = 戻るではない (確認を出さない・見張りもそのまま)
   var backArmed = false;
   function armBackGuard() {
     if (backArmed || !window.history || !history.pushState) return;
-    try { history.pushState({ meGuard: true }, '', location.href); backArmed = true; } catch (err) { /* 履歴に足せないときは beforeunload だけ */ }
+    try {
+      // 前の見張りの履歴で読み直した画面 (保存の後に # の移りの分だけ戻りきらなかった) は meGuard を外す = 戻るでここへ来たら確認を出す (Codex R2 Medium)
+      var base = Object.assign({}, history.state); delete base.meGuard; base.meBase = true;
+      history.replaceState(base, '', location.href);
+      history.pushState({ meGuard: true }, '', location.href); backArmed = true;
+    } catch (err) { /* 履歴に足せないときは beforeunload だけ */ }
   }
   window.addEventListener('popstate', function (e) {
     if (!backArmed || leaving) return;
     if (e.state && e.state.meGuard) return;          // 進むで戻ってきた
+    if (!(e.state && e.state.meBase)) return;        // 同じ画面の中の # の移り (戻るではない)
     if (ME.dirty().n > 0) {
       try { history.pushState({ meGuard: true }, '', location.href); } catch (err) { /* */ }
       openLeave('back', document.activeElement);

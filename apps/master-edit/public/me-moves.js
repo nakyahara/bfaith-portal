@@ -4,6 +4,7 @@
  *   - 月別 = GET /api/sku/:code/monthly (直近 13 か月)。データの無い月は空欄 (0 と出さない)
  *   - 時刻は日本時間。仕入は日付だけ (入庫日)。「在庫の調整 (ずれ)」の行は薄く・理由つき
  *   - 履歴は高さを決めた枠 (#mv-box) の中でスクロール。件数 (全 N 件 / 新しい方から N 件) は枠の下
+ *   - 🆕 10/19: 画面のタブ (me-tabs.js)「入出庫の履歴」を初めて開いたときに読む (隠れたタブのまま読まない = 画面を開くのが速い)
  */
 (function () {
   'use strict';
@@ -99,12 +100,12 @@
   }
   more.addEventListener('click', load);
   window.addEventListener('resize', function () { if (counted) showCount(); });
-  load();
 
   // ── 月別のまとめ
   var moRows = document.getElementById('mo-rows');
   var moHead = document.getElementById('mo-head');
-  if (moRows) {
+  function loadMonthly() {
+    if (!moRows) return;
     api('/api/sku/' + encodeURIComponent(CODE) + '/monthly').then(function (j) {
       if (!j || !j.ok) { moHead.textContent = (j && j.error) || '読めませんでした'; return; }
       moHead.textContent = j.po === 'error' ? '発注アプリを読めないので、仕入・発注は空欄です' : '';
@@ -120,4 +121,12 @@
       }).join('');
     });
   }
+
+  // 🆕 タブ (me-tabs.js): 隠れたタブの中 = そのタブを初めて開いたときに 1 回だけ読む (開いている = すぐ読む)。
+  //   開き直すたびに件数の「枠の中でスクロール」を数え直す (隠れている間は枠の高さが 0 = 数えられない)
+  var tp = box.closest ? box.closest('[role="tabpanel"]') : null;
+  var started = false;
+  function start() { if (started) return; started = true; load(); loadMonthly(); }
+  if (tp) tp.addEventListener('me:tabshown', function () { if (!started) start(); else if (counted) showCount(); });
+  if (!tp || !tp.hidden) start();
 })();
