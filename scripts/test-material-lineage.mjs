@@ -343,24 +343,24 @@ globalThis.fetch = async (url, opts) => {
   return { ok: true, status: 200, json: async () => body };
 };
 const origLog = console.log; console.log = () => {};
-const { fetchProducts, fetchSetProducts } = await import('../apps/warehouse/ne-api.js');
+const { fetchProducts, fetchSetProducts, NE_SEARCH_LIMIT: L } = await import('../apps/warehouse/ne-api.js');   // L = 1 回の取得数 (今は 10000)
 const { getDB } = await import('../apps/warehouse/db.js');
 console.log = origLog;
 const metaOf = (k) => getDB().prepare('select value from sync_meta where key = ?').get(k)?.value ?? null;
 const quietly = async (fn) => { const l = console.log; console.log = () => {}; try { return await fn(); } finally { console.log = l; } };
 
 await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える (前回の印で集合を取り出させない) / セット商品は入れ替えと同じ取引', async () => {
-  ne.goods = Array.from({ length: 1003 }, (_, i) => ({ goods_id: `G${String(i).padStart(4, '0')}`, goods_name: `商品${i}` }));
+  ne.goods = Array.from({ length: L + 3 }, (_, i) => ({ goods_id: `G${String(i).padStart(4, '0')}`, goods_name: `商品${i}` }));
   await quietly(fetchProducts);
   const at = metaOf('ne_api_products_complete_at');
   assert.ok(at);
-  assert.equal(metaOf('ne_api_products_complete_count'), '1003');
-  assert.equal(getDB().prepare('select count(*) as c from raw_ne_products where synced_at = ?').get(at).c, 1003);
+  assert.equal(metaOf('ne_api_products_complete_count'), String(L + 3));
+  assert.equal(getDB().prepare('select count(*) as c from raw_ne_products where synced_at = ?').get(at).c, L + 3);
   // 印と一緒に、その時点の通し番号 (raw を書き換えた行の数) を残す
   const { readNeRawRev } = await import('../apps/warehouse/db.js');
   assert.equal(Number(metaOf('ne_api_products_complete_rev')), readNeRawRev('products'));
   // 取得の途中に別の書き込み (並行する取込・CSV) があれば、最後まで取れても印を付けない (Codex PR #1453 R1 High-2)
-  ne.onGoodsPage = (offset) => { if (offset === 1000) getDB().prepare("INSERT OR REPLACE INTO raw_ne_products (商品コード, synced_at) VALUES ('zz-other', 'x')").run(); };
+  ne.onGoodsPage = (offset) => { if (offset === L) getDB().prepare("INSERT OR REPLACE INTO raw_ne_products (商品コード, synced_at) VALUES ('zz-other', 'x')").run(); };
   await quietly(fetchProducts);
   ne.onGoodsPage = null;
   assert.equal(metaOf('ne_api_products_complete_at'), null);
@@ -368,8 +368,8 @@ await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える 
   getDB().prepare("DELETE FROM raw_ne_products WHERE 商品コード = 'zz-other'").run();
   await quietly(fetchProducts);
   assert.ok(metaOf('ne_api_products_complete_at'));
-  // 1 ページ目 (1000 件) は書けて 2 ページ目で失敗 → 印は無い
-  ne.failGoodsAtOffset = 1000;
+  // 1 ページ目 (L 件) は書けて 2 ページ目で失敗 → 印は無い
+  ne.failGoodsAtOffset = L;
   await assert.rejects(quietly(fetchProducts), /テストの失敗/);
   assert.equal(metaOf('ne_api_products_complete_at'), null);
   assert.equal(metaOf('ne_api_products_complete_count'), null);
@@ -377,7 +377,7 @@ await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える 
   ne.failGoodsAtOffset = null;
   await quietly(fetchProducts);
   assert.ok(metaOf('ne_api_products_complete_at'));
-  assert.equal(metaOf('ne_api_products_complete_count'), '1003');
+  assert.equal(metaOf('ne_api_products_complete_count'), String(L + 3));
   // セット商品: 成功で印と件数 (= synced_at が印の行)。失敗は入れ替えも印もしない (前の印のまま = 前の集合がそのまま取り出せる)
   ne.setgoods = [{ set_goods_id: 'SET1', set_goods_detail_goods_id: 'G0001', set_goods_detail_quantity: '2' }, { set_goods_id: 'SET1', set_goods_detail_goods_id: 'G0002', set_goods_detail_quantity: '1' }];
   await quietly(fetchSetProducts);
