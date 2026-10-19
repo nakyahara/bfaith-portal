@@ -1538,8 +1538,9 @@ await ta('[46] Amazon SKU (#1628 Codex R5 L2): 変わった項目が無い保存
 // MASTER_EDIT_UI_SHOTS_NAME=フォルダ を付けると [47] の写し (1440 幅) を残す
 const SHOTS_NAME = process.env.MASTER_EDIT_UI_SHOTS_NAME || '';
 const shotName = async (p, file) => { if (!SHOTS_NAME) return; await p.evaluate(() => window.scrollTo(0, 0)); await p.waitForTimeout(150); await p.screenshot({ path: `${SHOTS_NAME}/${file}.png` }); };
-await ta('[47] 名前を見出しのところで直す (10/6): 単品・セットとも ✎ で見出しが入力欄になる・名前の欄は 1 つだけ・Esc で戻す・変えた間は閉じない・Ctrl+S → 見出しが新しい名前 / 🔒 (NE に送った値) = 入力欄を出さず理由の印', async (p) => {
-  for (const [code, next, label] of [['k005', 'abc 小袋 改', '単品'], ['set001', 'セット 1 新', 'セット']]) {
+await ta('[47] 名前を見出しのところで直す (10/6): 単品・セットとも ✎ で見出しが入力欄になる・名前の欄は 1 つだけ・Esc で戻す・変えた間は閉じない・Ctrl+S → 見出しが新しい名前 / 🆕 0093 NE 登録の CSV を配った後も直せるの印', async (p) => {
+  // 🆕 0093 (2026-10-19 中原さん): NE 登録の CSV を配って申告した ui-new-1 ([38]) も、ほかの商品と同じように見出しで直せる (🔒 にしない)
+  for (const [code, next, label] of [['k005', 'abc 小袋 改', '単品'], ['set001', 'セット 1 新', 'セット'], ['ui-new-1', 'UI 新商品 1 改', '単品 (NE 登録の CSV を配った後)']]) {
     await p.goto(B + '/sku/' + code);
     assert.equal(await p.locator('[data-field="name"]').count(), 1, label + ': 名前の欄は 1 つだけ (下の「基本」に無い)');
     assert.equal(await p.locator('#p-basic [data-field="name"]').count(), 0);
@@ -1568,12 +1569,9 @@ await ta('[47] 名前を見出しのところで直す (10/6): 単品・セッ�
     assert.equal((await row(code)).name, next);
     assert.equal(await p.isVisible('#f-name'), false, label + ': 読み直した後は見出しに戻る');
   }
-  // 🔒 = NE に送った値 ([38] で CSV を配って申告した ui-new-1)。入力欄を出さず、見出しの横に理由
-  await p.goto(B + '/sku/ui-new-1');
-  assert.equal(await p.locator('#name-edit').count(), 0, '🔒 のときは「名前を直す」を出さない');
-  assert.equal(await p.locator('#f-name').count(), 0, '🔒 のときは入力欄を出さない');
-  assert.match(await p.textContent('.name-lock'), /NE に送った値/);
-  await shotName(p, '単品_🔒_NEに送った値');
+  // 配った後の ui-new-1 に 🔒・案内のカードを出さない (0093)
+  assert.equal(await p.locator('.name-lock').count(), 0);
+  assert.equal(await p.getByText('鍵がかかっています').count(), 0);
   // 🔒 = 保存を開いていない (セット)。入力欄を出さず、見出しの横に理由
   delete process.env.MASTER_EDIT_OPEN;
   try {

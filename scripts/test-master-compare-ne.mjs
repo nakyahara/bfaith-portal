@@ -1971,6 +1971,53 @@ await ta('[41] 🆕 0083 (設計 25 PR-1 = 影): 今朝の NE の値 = ② が�
   } finally { wh().prepare('DELETE FROM sync_meta WHERE key = ?').run('ne_api_products_in_progress'); }
 });
 
+await ta('[42] 🆕 0093 (2026-10-19 中原さん): NE 登録の CSV を配った後に Company DB で名前を直した新商品 = NE が配った CSV の名前なら確かめは verified (partial・cdb_drift にしない) / ② は名前を持ち主が C の値の差 (rule・company_owned・NE を C の値に) として出す', async () => {
+  const MASTER_OWNERSHIP = Object.freeze(Object.fromEntries((await import('../config/master-ownership.mjs')).OWNED_COLUMNS.map((k) => [k, 'load'])));
+  const own = { ...MASTER_OWNERSHIP, ...Object.fromEntries(['skus.name', 'products.name', 'skus.handling', 'products.status', 'skus.tax_rate', 'skus.tax_class', 'skus.standard_price', 'sku_costs', 'supplier_skus.is_primary'].map((k) => [k, 'company'])) };
+  // 下書きの新商品 r042 と、配って取り込んだと申告したファイル (期待値の名前 = 配った CSV の名前 '単品R')。[29] と同じく持ち主のロールで直接
+  await pg.query('begin');
+  const pid = (await pg.query(`insert into core.products (company_id, display_code, name, status) values (1, 'r042', '単品R', 'active') returning product_id`)).rows[0].product_id;
+  const sid = (await pg.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) values (1, $1, 'single', 'r042', '単品R') returning sku_id`, [pid])).rows[0].sku_id;
+  await pg.query('select ops.create_sku_registration($1, $2)', [sid, 'naka@test']);
+  await pg.query('commit');
+  const sha = 'f'.repeat(64);
+  const ex = (await pg.query(`insert into ops.ne_reg_exports (kind, schema_version, header, encoding, trial, item_count, row_count, aggregate_token, payload_hash, sha256, file_bytes, request_id, ne_codes_run, cost_day, created_by)
+    values ('products', 'ne-reg-single-v1', 'syohin_code', 'utf8', true, 1, 1, repeat('a', 64), repeat('b', 64), $1, '\\x00', gen_random_uuid(), 'x', '2031-02-01', 't') returning export_id`, [sha])).rows[0].export_id;
+  const expected = { kind: 'single', values: { name: '単品R', supplier: '0001', cost: 700, price: 7000, tax_rate: 0.1, handling: 'active', parent: null } };
+  const it = (await pg.query(`insert into ops.ne_reg_export_items (export_id, sku_id, code_norm, ne_code, sku_kind, item_token, expected, snapshot_hash, row_from, row_to, state_changed_by)
+    values ($1, $2, 'r042', 'r042', 'single', repeat('d', 64), $3::jsonb, repeat('e', 64), 1, 1, 't') returning item_id`, [ex, sid, JSON.stringify(expected)])).rows[0].item_id;
+  await pg.query(`update ops.ne_reg_export_items set state = 'issued' where item_id = $1`, [it]);
+  await pg.query(`update ops.ne_reg_exports set state = 'issued', issued_at = now(), issued_by = 't' where export_id = $1`, [ex]);
+  const att = (await pg.query(`insert into ops.ne_reg_attempts (export_id, sha256, declared_by, result) values ($1, $2, 't', 'ok') returning attempt_id`, [ex, sha])).rows[0].attempt_id;
+  await pg.query(`update ops.ne_reg_export_items set state = 'import_declared', attempt_id = $2 where item_id = $1`, [it, att]);
+  await pg.query(`update ops.ne_reg_exports set state = 'declared', declared_at = now(), declared_by = 't' where export_id = $1`, [ex]);
+  await pg.query(`select ops.transition_sku_registration($1, 'ne_pending', 'human', 't', null, '{}'::jsonb)`, [sid]);
+  // 配った後に Company DB で名前を直した (0093 = 商品の画面で直せる)。NE は配った CSV のまま ('単品R')
+  await db.query(`update core.skus set name = '単品R 改' where sku_id = $1`, [sid]);
+  await db.query(`update core.products set name = '単品R 改' where product_id = $1`, [pid]);
+  const NE = baseNe();
+  NE.products.push({ code: 'r042', name: '単品R', supplier: '0001', handling: '取扱中', cost_src: J('700'), price_src: J('7000'), tax_src: J('10'), rep: '', rep_src: J('') });
+  // 今朝の写し (m_products) = 持ち主が C の名前は C の値 (作り直しが company_owned の理由つきで重ねた)
+  const copyOfC = toMaterial(NE, (m) => setMat(m, 'r042', '商品名', '単品R 改'));
+  const reasons = [{ code: 'r042', kind: '単品', col: 'name', reason: 'company_owned', owner_key: 'x', cdb_value: null, value: '単品R 改', ne_value: '単品R', generation_no: 1 }];
+  const x = await day('2031-02-01', { ne: NE, material: copyOfC, reasons, ownership: own });
+  // 確かめ = 品目の期待値 (配った名前) = NE の観測 → verified (今の Company DB の名前とは比べない = 代表 (親) だけ)
+  assert.equal(x.result.ne.registrations.write, 'ok', JSON.stringify(x.result.ne.registrations));
+  assert.equal(x.result.ne.registrations.written.counts.verified, 1, JSON.stringify(x.result.ne.registrations.written));   // ほかの試験の待ちの商品 (n901) は waiting のまま
+  assert.ok(!x.result.ne.registrations.written.counts.partial, JSON.stringify(x.result.ne.registrations.written));
+  assert.deepEqual(x.result.ne.registrations.written.cdb_drift, []);
+  assert.deepEqual([(await pg.query('select state from ops.ne_reg_export_items where item_id = $1', [it])).rows[0].state,
+    (await pg.query('select state from ops.master_registrations where sku_id = $1', [sid])).rows[0].state], ['verified', 'ne_confirmed']);
+  // ② = 名前の差は普通の値の差 (持ち主が C = NE を C の値に)。NE 登録の不一致 (partial) には数えない
+  const cc = col(x.ne, 'value:r042', 'name');
+  assert.equal(cc.length, 1, JSON.stringify(x.ne.items.filter((i) => i.norm === 'r042')));
+  assert.deepEqual([cc[0].cls, cc[0].explained?.reason, cc[0].owner], ['rule', 'company_owned', 'company'], JSON.stringify(cc[0]));
+  const dn = x.ne.decisions.find((d) => d.subject_key === 'value:r042' && d.col === 'name');
+  assert.deepEqual(dn.proposal, { op: 'set_ne_value', value: '単品R 改' });
+  assert.ok(!x.ne.reg_pending.partial.some((e) => e.norm === 'r042'));
+  assert.ok(!x.ne.items.some((i) => i.columns.some((c) => c.cls === 'direction_unknown')));
+});
+
 await pg.close();
 try { WH.getDB().close(); } catch { /* */ }
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }

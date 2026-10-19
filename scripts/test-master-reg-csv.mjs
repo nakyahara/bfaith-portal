@@ -5,7 +5,7 @@
  * 固定する契約:
  *   C 新商品の NE 登録の CSV: 門 (切替の後だけ)・止まる理由 (原価・仕入先・NE にもうあるコード = 止める・構成品が NE 確認済みでない)・
  *     ファイル (見出し・UTF-8・BOM なし・CRLF・sha256・形の版・payload hash・印)・同じ番号 = 同じファイル・試し用の行の上限・
- *     配る前に直す = 自動で使わない / 配った後に NE に送る欄を直す = 409 (ほかの欄は直せる)・申告 (sha256・誰・いつ・draft → ne_pending)・
+ *     配る前に直す = 自動で使わない / 🆕 0093: 配った後も NE に送る欄を直せる (確かめは品目の期待値と比べる = 直した後も verified)・申告 (sha256・誰・いつ・draft → ne_pending)・
  *     翌朝の確かめ (申告の前の取得 = 待ち・違う列 = partial・全部合う = verified + ne_confirmed・無い = failed・信じられない = 待ち・申告の前に NE にある = 記録だけ・同じ回 = 1 回)・
  *     セットは同じ取得の構成品が全部合うときだけ・使わない (理由・直し方・確かめた) ・全部だめ = failed・実機の確かめの門・DB の守り
  *   J JAN: 足す・外すの記録 (誰・request_id・出どころ・理由)・書き換え / 物理の削除は拒む・SKU の version が変わる・一意 (409)・画面 B で直せる
@@ -14,7 +14,7 @@
  *     company = core を書かない・依頼が無い差 = 食い違い・依頼と同じ = 上げる・数は 0050 の厳密な整数・昇格の答え (もっと新しい観測など) は投げずに数える
  *   S 仕入先: 新しいコードの決まり・状態 ne_pending → 申告で ne_confirmed・申告の前は代表にできない・取引停止 (代表に使っている = 409 / 付け替え)・物理の削除は拒む
  *   D 書き込みの約束 (0051 の ops.master_write_sessions・#1571 R1 High 3): ⑤-2b の関数ごとに約束 (操作・DB が決めた相手・DB の payload_hash) と done・
- *     request_id は使い回せない・画面のロールは約束を作れない / CSV の表・JAN の行の守り (約束の操作・相手)・保存の直接の書き込みも配った CSV の欄は拒む・
+ *     request_id は使い回せない・画面のロールは約束を作れない / CSV の表・JAN の行の守り (約束の操作・相手)・保存の直接の書き込みも作っただけの CSV の欄は拒む (0093: 配った後は通る)・
  *     確かめる前の仕入先は設定に依らず代表にできない・仕入先の関数は画面のロールに渡さない・⑤-2b の操作の一覧は 1 か所
  *   V 0065 (CompanyDB構想/20 v7 §⑤・§⑩ PR-2): 形の版の決まり (lib = DB・single-v2 / variation-v1)・関数の作り直しの差は決めた所だけ・一部だけ入ったときの申告 (partial → verified / failed → 作り直し・申告しないと待ち)・
  *     3 者一致 (NE は合うが Company DB が違う = partial + cdb_drift)・一度でも配った商品の代表は変えない (409 parent_frozen・🔒・DB)
@@ -447,7 +447,8 @@ await ta('[C4] 配る前に NE に送る欄を直す = そのファイルは自�
 });
 
 let EXB = null; let SHAB = null;
-await ta('[C5] 配る = built → issued・byte 列はその後だけ・配った後は NE に送る欄 (名前・JAN・原価) を直せない (409)・送らない欄は直せる', async () => {
+const REG_NAME_EDITED = '配った後に直した名前';
+await ta('[C5] 配る = built → issued・byte 列はその後だけ・🆕 0093: 配った後も NE に送る欄 (名前・JAN・原価・税率) を直せる (品目の期待値・ファイルは変わらない)・送らない欄も直せる', async () => {
   const r = await build('products', ['new-a']);
   EXB = r.export.export_id; SHAB = r.export.sha256;
   assert.equal((await G.regExportFile(db, EXB)).bytes, null, 'built は配らない');
@@ -458,14 +459,29 @@ await ta('[C5] 配る = built → issued・byte 列はその後だけ・配っ�
   assert.equal(crypto.createHash('sha256').update(f.bytes).digest('hex'), SHAB);
   assert.match(f.file_name, /^ne_register_products_\d{8}_\d{6}_\d+\.csv$/);   // 0065: 単品 (v2) は試し用でない
   assert.deepEqual((await itemsOf(EXB)).map((i) => i.state), ['issued']);
-  for (const v of [{ name: '直したい' }, { jan: J2 }, { cost: { jpy: '999', reason: '改定' } }, { tax_rate: '8' }]) {
-    const e = await rejectsWith(save('new-a', v), 409, 'reg_csv_issued');
-    assert.match(e.message, new RegExp(`#${EXB}`));
+  const frozen = async () => one('select expected, item_token, snapshot_hash, state from ops.ne_reg_export_items where export_id = $1', [EXB]);
+  const before = await frozen();
+  // 🆕 0093 (2026-10-19 中原さん「名前修正できるようにしてよ」): 配った後も直せる (前 = 409 reg_csv_issued)
+  for (const v of [{ name: REG_NAME_EDITED }, { jan: jan13('490000000095') }, { cost: { jpy: '999', reason: '改定' } }, { tax_rate: '8' }]) {
+    const w = await save('new-a', v);
+    assert.equal(w.ok, true, JSON.stringify(v));
+    assert.ok(!w.no_change, JSON.stringify(v));
   }
-  // JAN の関数も自分で拒む (lib を通さずに呼んでも・#1571 R1 High 3)
-  const aId = await skuId('new-a');
-  await pgErr(as(E, 'master_edit', () => pg.query("select ops.edit_sku_jan(gen_random_uuid(), 'naka@test', null, $1::jsonb, $2::bigint, $3::jsonb, $4::jsonb)",
-    [OWN, aId, JSON.stringify([J1]), JSON.stringify([J2])])), /reg_csv_issued/);
+  const now = await W.readCurrent(db, await skuId('new-a'), TODAY);
+  assert.deepEqual([now.name, Number(now.tax_rate)], [REG_NAME_EDITED, 0.08]);
+  // 名前のほかは戻す (名前は [C7] の確かめまでこのまま = 確かめは品目の期待値 (配った値) と NE を比べる)
+  await save('new-a', { jan: J1 }); await save('new-a', { tax_rate: '10' }); await save('new-a', { cost: { jpy: '300', reason: '改定' } });
+  // 品目の期待値・印・状態は変わらない (配ったファイルの中身のまま)
+  assert.deepEqual(await frozen(), before);
+  assert.equal(before.expected.values.name, '新しい単品');
+  // 0093 の前の DB (印の関数が無い) = アプリは今までどおり 409 reg_csv_issued (アプリを先に出しても断る側)・画面は 🔒
+  await pg.query('alter function ops.reg_csv_edit_after_issue() rename to reg_csv_edit_after_issue__hidden');
+  try {
+    const e = await rejectsWith(save('new-a', { name: '当てる前' }), 409, 'reg_csv_issued');
+    assert.match(e.message, new RegExp(`#${EXB}`));
+    assert.equal(await W.regEditAfterIssue(db), false);
+  } finally { await pg.query('alter function ops.reg_csv_edit_after_issue__hidden() rename to reg_csv_edit_after_issue'); }
+  assert.equal(await W.regEditAfterIssue(db), true);
   const ok2 = await save('new-a', { reorder_months: '5' });
   assert.equal(ok2.ok, true);
 });
@@ -505,9 +521,14 @@ await ta('[C7] 翌朝の確かめ (単品): 申告の前の取得 = 待ち・違
   const r3 = await newRun();
   r = await check(r3, [obsSingle('new-a', { tax_rate: { st: 'invalid', v: null } })]);
   assert.deepEqual(r.counts, { partial: 1 }, '比べられない列は一致にしない');
+  // 🆕 0093: 配った後に Company DB の名前を直した ([C5]) = NE は配った CSV の名前 → 確かめは品目の期待値と比べる = verified (partial にしない・cdb_drift にしない)
+  assert.equal((await W.readCurrent(db, await skuId('new-a'), TODAY)).name, REG_NAME_EDITED);
   const r4 = await newRun();
   r = await check(r4, [obsSingle('new-a')]);
   assert.deepEqual(r.counts, { verified: 1 });
+  assert.deepEqual(r.cdb_drift, []);
+  const d4 = (await one('select detail from ops.ne_reg_checks where compare_run_id = $1', [r4])).detail;
+  assert.deepEqual([d4.compare.ok, d4.compare.cols.name.ok, d4.cdb.ok], [true, true, true], JSON.stringify(d4));
   assert.deepEqual([(await itemsOf(EXB))[0].state, await regOf('new-a')], ['verified', 'ne_confirmed']);
   const ev = await one("select e.evidence, e.actor_type from ops.master_registration_events e join core.skus s on s.sku_id = e.sku_id where s.code = 'new-a' and e.to_state = 'ne_confirmed'");
   assert.deepEqual([ev.evidence.compare_run_id, ev.evidence.matched, ev.actor_type], [r4, true, 'system']);
@@ -742,7 +763,14 @@ await ta('[C9] セット: 構成品が全部 NE 確認済み・構成品 1 つ�
   assert.equal(f, 'set_syohin_code,set_syohin_name,set_baika_tnk,tax_rate,syohin_code,suryo\r\nnew-set,新しいセット,2500,8,s001,1\r\nnew-set,新しいセット,2500,8,s002,2\r\n');
   await issue(id); await declare(id, r.export.sha256, 'ok');
   assert.equal(await regOf('new-set'), 'ne_pending');
-  const obsSet = (children) => ({ code_norm: 'new-set', present: true, trusted: true, kind: 'set', cols: { name: ok('新しいセット'), price: ok(2500) }, children });
+  // 🆕 0093: 配った後もセットの構成 (依頼) だけは確かめが終わるまで 409 (確かめは配った構成と NE を比べる = 先に NE を直すと partial のまま・Codex R1 Medium)。
+  //   (名前・売価の鍵は外した。ただし依頼だけの新しいセットは「今の構成が無い = 導く値が決まらない」で保存できないのは前から = この PR では変えない)
+  const ec = await rejectsWith(save('new-set', { components: [{ code: 's001', qty: 1 }, { code: 's002', qty: 3 }] }), 409, 'reg_csv_issued');
+  assert.deepEqual(ec.extra.exports, [String(id)]);
+  const { readSkuPage: readPage } = await import('../apps/master-edit/read.mjs');
+  const setPage = await readPage(db, 'new-set', { now: NOW, ownership: ALL_COMPANY, open: true });
+  assert.deepEqual([setPage.locks.fields.components?.why, setPage.locks.fields.name], ['reg_wait', undefined]);
+  const obsSet =(children) => ({ code_norm: 'new-set', present: true, trusted: true, kind: 'set', cols: { name: ok('新しいセット'), price: ok(2500) }, children });
   const r1 = await newRun();
   let c = await check(r1, [obsSet([{ code_norm: 's001', st: 'ok', v: 1 }])]);
   assert.deepEqual(c.counts, { partial: 1 }, '構成品が足りない = partial');
@@ -763,13 +791,13 @@ await ta('[C10] 使わない: 理由・NE で何をしたか・確かめた の�
   await rejectsWith(supersede(id, { reason: '' }), 400);
   await rejectsWith(supersede(id, { correction: '' }), 400);
   await rejectsWith(supersede(id, { confirm: false }), 400);
-  await rejectsWith(save('new-c', { name: 'C 改' }), 409, 'reg_csv_issued');
+  assert.equal((await save('new-c', { name: 'C 改' })).ok, true, '🆕 0093: 申告した後 (使わないにする前) も直せる');
   const s = await supersede(id, { reason: '売価を間違えた', correction: 'NE で取り込んだ商品を消した' });
   assert.equal(s.superseded, 1);
   const it = await one('select state, superseded_reason, superseded_correction from ops.ne_reg_export_items where export_id = $1', [id]);
   assert.deepEqual([it.state, it.superseded_reason, it.superseded_correction], ['superseded', '売価を間違えた', 'NE で取り込んだ商品を消した']);
   assert.equal(await regOf('new-c'), 'ne_pending');
-  assert.equal((await save('new-c', { name: 'C 改' })).ok, true);
+  assert.equal((await save('new-c', { name: 'C 改 2' })).ok, true);
   await rejectsWith(supersede(id), 409, 'closed');
   await rejectsWith(declare(id, r.export.sha256), 409, 'closed');
   // 全部だめ
@@ -842,6 +870,16 @@ await ta('[C13] 配る前に登録をやめた商品がある = 配らない (�
   assert.ok(w.warnings.some((m) => m.includes(`#${s.export.export_id}`)), JSON.stringify(w.warnings));
   assert.equal((await expOf(s.export.export_id)).state, 'closed');
   await save('s007', { tax_rate: '10' });
+  // 🆕 0093: 配った後なら s007 の税率は直せる (前 = 409)。依頼だけのセットの税率は保存では計算し直さない + 照合 ② はセットの税率を比べない
+  //   = 保存の答えに「NE の画面でセット new-set-h の税率を確かめる」を出す (Codex R1 High)
+  const s2 = await build('sets', ['new-set-h']);
+  await issue(s2.export.export_id);
+  const w2 = await save('s007', { tax_rate: '8' });
+  assert.equal(w2.ok, true);
+  assert.ok(w2.ne_steps.some((m) => /セット new-set-h の税率/.test(m)), JSON.stringify(w2.ne_steps));
+  assert.equal((await itemsOf(s2.export.export_id))[0].state, 'issued', '配ったファイルはそのまま');
+  await save('s007', { tax_rate: '10' });
+  await supersede(s2.export.export_id);
 });
 
 await ta('[C14] 権限の境界: 画面のロールは表を直接書けない・状態の関数を呼べない / 関数は呼び手の根拠を受けない・行から byte 列・確かめる値・NE の元のコードの回・状態を照らし直す', async () => {
@@ -1982,7 +2020,7 @@ await ta('[S2] 作る = ne_pending・同じ 4 桁 = 409・名前に【…】= 40
 });
 
 await ta('[S3] 取引停止: 代表に使っている = 409 (商品の一覧)・付け替え先を渡す = 同じ取引で付け替えて止める・物理の削除は拒む (二重を寄せる merge だけ通る)', async () => {
-  // 0012 を代表にした新商品の NE 登録の CSV を配った = 付け替えは画面の保存と同じく 409 (使わないにすれば付け替えられる)
+  // 0012 を代表にした新商品の NE 登録の CSV を配った = 🆕 0093: 付け替えは画面の保存と同じく通る (前 = 409 reg_csv_issued)
   await reg('single', 'new-sup2', single({ name: 'SUP2', primary_supplier: '0012' }));
   const sx = await build('products', ['new-sup2']);
   await issue(sx.export.export_id);
@@ -1990,12 +2028,13 @@ await ta('[S3] 取引停止: 代表に使っている = 409 (商品の一覧)・
   const e = await rejectsWith(SUP.deactivateSupplier(db, { actor: 'po@test', code: '0012', reason: '取引終了' }, SOPT), 409, 'supplier_in_use');
   assert.deepEqual(e.extra.skus, ['new-sup2', 's004']);
   await pgErr(pg.query("update core.suppliers set active = false where code = '0012'"), /supplier_in_use/);
-  const ei = await rejectsWith(SUP.deactivateSupplier(db, { actor: 'po@test', code: '0012', reason: '取引終了', reassignTo: '0002' }, SOPT), 409, 'reg_csv_issued');
-  assert.match(ei.message, /new-sup2/);
   assert.equal((await one("select active from core.suppliers where code = '0012'")).active, true, '何もしていない');
-  await supersede(sx.export.export_id);
   const r = await SUP.deactivateSupplier(db, { actor: 'po@test', code: '0012', reason: '取引終了', reassignTo: '0002' }, SOPT);
   assert.deepEqual([r.active, r.reassigned], [false, ['new-sup2', 's004']]);
+  // 配ったファイルの品目と期待値はそのまま (期待値の仕入先 = 配った 0012)
+  const sit = await one('select state, expected from ops.ne_reg_export_items where export_id = $1', [sx.export.export_id]);
+  assert.deepEqual([sit.state, sit.expected.values.supplier], ['issued', '0012']);
+  await supersede(sx.export.export_id);
   const prim = await q("select sp.code from core.supplier_skus x join core.suppliers sp on sp.supplier_id = x.supplier_id join core.skus k on k.sku_id = x.sku_id where k.code = 's004' and x.is_primary");
   assert.deepEqual(prim.map((p) => p.code), ['0002']);
   await pgErr(pg.query("delete from core.suppliers where code = '0012'"), /消さない/);
@@ -2157,26 +2196,32 @@ await ta('[D3] JAN の行の守り (専用・core.guard_master_edit_jan): JAN �
     await pg.query('drop function core.zz_t_jan(bigint, text, text)');
   }
   assert.equal((await q('select 1 from core.external_ids where external_value = $1', [J])).length, 0);
-  // ops.edit_sku_jan: 画面が見ていた JAN と違う = version_conflict・配った後 = reg_csv_issued
+  // ops.edit_sku_jan: 画面が見ていた JAN と違う = version_conflict (🆕 0093: 配った後も断らない = [C5])
   await pgErr(as(E, 'master_edit', () => pg.query("select ops.edit_sku_jan(gen_random_uuid(), 'boss@test', null, $1::jsonb, $2::bigint, '[\"4900000000000\"]'::jsonb, '[]'::jsonb)", [OWN, s6])), /version_conflict/);
 });
 
-await ta('[D4] 保存 (sku_edit) の直接の書き込みも、新規登録の CSV が出ている商品の NE に送る欄は DB が拒む (ops.guard_reg_csv_live)・NE に送らない欄は通る / 確かめる前の仕入先は設定に依らず代表にできない', async () => {
+await ta('[D4] 保存 (sku_edit) の直接の書き込みも、作っただけ (built) の新規登録の CSV の商品の NE に送る欄は DB が拒む (ops.guard_reg_csv_live)・🆕 0093: 配った後は通る・NE に送らない欄は通る / 確かめる前の仕入先は設定に依らず代表にできない', async () => {
   await reg('single', 'new-ff', single({ name: 'FF' }));
   const ff = await build('products', ['new-ff']);
   const fid = await skuId('new-ff');
   const pff = (await one('select product_id::text as p from core.skus where sku_id = $1', [fid])).p;
-  await asFakeSession('sku_edit', () => code42501(pg.query("update core.skus set name = 'FF2' where sku_id = $1", [fid]), /reg_csv_issued/), { skuId: fid, products: [pff] });
+  await asFakeSession('sku_edit', () => code42501(pg.query("update core.skus set name = 'FF2' where sku_id = $1", [fid]), /reg_csv_built/), { skuId: fid, products: [pff] });
   await asFakeSession('sku_edit', () => pg.query('update core.skus set reorder_months = 3 where sku_id = $1', [fid]), { skuId: fid, products: [pff] });
   // 代表の仕入先・原価も同じ (CSV の仕入先・原価の列)
   const sup2 = (await one("select supplier_id::text as id from core.suppliers where code = '0002'")).id;
   await asFakeSession('sku_edit', () => code42501(pg.query(`insert into core.supplier_skus (company_id, supplier_id, sku_id, is_primary, created_by_type, created_by_id)
     values (1, $1, $2, false, 'human', 'boss@test')`, [sup2, fid]).then(() => pg.query('update core.supplier_skus set is_primary = true where supplier_id = $1 and sku_id = $2', [sup2, fid])),
-  /reg_csv_issued/), { skuId: fid, products: [pff] });
-  await asFakeSession('sku_edit', () => code42501(pg.query("update core.sku_costs set valid_to = valid_from where sku_id = $1 and valid_to is null", [fid]), /reg_csv_issued/),
+  /reg_csv_built/), { skuId: fid, products: [pff] });
+  await asFakeSession('sku_edit', () => code42501(pg.query("update core.sku_costs set valid_to = valid_from where sku_id = $1 and valid_to is null", [fid]), /reg_csv_built/),
     { skuId: fid, products: [pff] });
   await supersede(ff.export.export_id);
   await asFakeSession('sku_edit', () => pg.query("update core.skus set name = 'FF2' where sku_id = $1", [fid]), { skuId: fid, products: [pff] });   // ファイルが無い = 通る
+  // 🆕 0093: 配った後 (issued) = 直接の書き込みも通る (名前・原価)。保存の流れ (saveSku) と同じ決まり
+  const ff2 = await build('products', ['new-ff']);
+  await issue(ff2.export.export_id);
+  await asFakeSession('sku_edit', () => pg.query("update core.skus set name = 'FF3' where sku_id = $1", [fid]), { skuId: fid, products: [pff] });
+  await asFakeSession('sku_edit', () => pg.query("update core.sku_costs set valid_to = valid_from where sku_id = $1 and valid_to is null", [fid]), { skuId: fid, products: [pff] });
+  await supersede(ff2.export.export_id);
   // 確かめる前 (ne_pending) の仕入先 = 画面のロールの書き込みでは代表にできない (core.source_system の設定が無くても)
   await SUP.createSupplier(db, { actor: 'po@test', code: '17', name: '十七商事' }, SOPT);
   const sup = (await one("select supplier_id::text as id from core.suppliers where code = '0017'")).id;
@@ -2491,11 +2536,17 @@ try {
     assert.equal(f.headers.get('x-content-sha256'), sha);
     let page = await call('GET', '/apps/master-edit/sku/new-web', { session: 'naka@test' });
     await checkScripts(page.text);
-    assert.match(page.text, /NE 登録の CSV/); assert.match(page.text, /鍵がかかっています/);
-    // 配った後 = NE に送る欄 (名前・売価・原価・税率・仕入先・取扱区分・代表・JAN) は入力欄にしない (🔒 の値・保存しても 409 reg_csv_issued)
-    for (const f of ['name', 'standard_price', 'tax_rate', 'primary_supplier', 'handling', 'parent_code', 'jan', 'cost']) assert.ok(!new RegExp(`data-field="${f}"`).test(page.text), `配った後の ${f} は入力欄にしない`);
-    assert.match(page.text, /data-field="shipping_code"/);   // NE へ送らない欄は直せる
-    assert.match(page.text, /NE に送った値 \(ファイル #\d+\)/);
+    // 🆕 0093 (2026-10-19 中原さん): 配った後も、ほかの商品と同じように直せる = NE に送る欄も入力欄・🔒 も案内のカードも出さない
+    assert.ok(!/鍵がかかっています/.test(page.text) && !/NE に送った値/.test(page.text), '配った後の 🔒・案内のカードは出さない');
+    for (const f of ['name', 'standard_price', 'tax_rate', 'primary_supplier', 'handling', 'jan']) assert.match(page.text, new RegExp(`data-field="${f}"`), `配った後の ${f} も入力欄`);
+    assert.ok(!/data-field="parent_code"/.test(page.text), '代表 (親) は商品の画面の欄に無い (PR-7)');
+    assert.match(page.text, /data-field="shipping_code"/);
+    // 画面の保存 (API) も通る = 名前を直す。品目の期待値は配った値のまま
+    const tok = page.text.match(/data-token="([0-9a-f]{64})"/)[1];
+    const sv = await call('POST', '/apps/master-edit/api/sku/new-web', { session: 'naka@test', body: { request_id: crypto.randomUUID(), reason: 'テスト', seen: { token: tok }, values: { name: '配った後の新しい名前' } } });
+    assert.equal(sv.status, 200, sv.text);
+    const webExp = (await one('select expected from ops.ne_reg_export_items where export_id = $1', [id])).expected;
+    assert.notEqual(webExp.values.name, '配った後の新しい名前');
     const d = await call('POST', `/apps/master-edit/api/reg-csv/exports/${id}/declare`, { body: { sha256: sha, result: 'ok', ne_message: '1件成功しました。' } });
     assert.equal(d.status, 200, d.text);
     assert.equal(await regOf('new-web'), 'ne_pending');

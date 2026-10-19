@@ -2897,3 +2897,16 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
      超えていなければ (または待っても動かなければ) 中原さんの OK の後に `… sales-chart-measure.mjs --vacuum` (= `vacuum (analyze, truncate false)` を 2 表に・読み書きを止めない・取引の外) → 2 を流し直す
   6. 商品の画面 (`/apps/master-edit/sku/0726-001931`) でグラフが出るのを見る。測った時間をこの節に書き足す
 - 試験 = `node scripts/test-master-sales-chart.mjs` (「速さ (0092)」= 索引の形・関数と同じ条件と列で Index Only Scan の計画が立つ・関数の本文が同じ形・数は同じ / 測る道具の純粋な関数)
+
+### NE 登録の CSV を配った後も NE に送る欄を直せる (0093・2026-10-19 中原さん「名前修正できるようにしてよ … 毎回修正できないとかが多すぎて使えない」)
+- **なぜ外してよいか**: 翌朝の照合の確かめ (`ops.record_ne_registration_check`・0065 の版) は、NE の観測を品目の行の期待値 (`ops.ne_reg_export_items.expected` = 作ったときに固めた値・trigger で変えられない) と比べる。
+  今の Company DB と比べるのは代表 (親) だけ (`ops.ne_reg_cdb_compare`) で、代表は 0065 の「一度でも配ったら変えない」が別に守る = 配った後に今の値を直しても確かめは壊れない (NE が配った CSV の値なら verified)。
+  確かめの後の NE と Company DB の差は、毎朝の照合 ② の値の差 (持ち主が Company DB の列 = rule・company_owned = NE を Company DB の値に) として出て、今までどおり「マスタの判断 → NE に取り込む CSV」(0040) で送る
+- **関数を作り直す** (どれも前の最後の版を写して 🆕 0093 の行だけ変えた・値は変えない): `ops.ne_reg_supersede_built` (0053 の版 = 配った後の品目があっても作っただけのファイルは使わないにする・`issued` は知らせるだけ)・
+  `ops.edit_sku_jan` (0080 の版)・`ops.deactivate_supplier` (0053 の版) から `reg_csv_issued` の断りを外す・`ops.guard_reg_csv_live` (0053 の版) = 断るのは作っただけ (built) の商品だけ (理由 `reg_csv_built`)。ただし**セットの構成の依頼**は今までどおり確かめが終わるまで断る (確かめは配った構成と NE を比べる = 先に NE の構成を直すと partial のまま止まる・Codex R1 Medium・アプリは `REG_LOCK_AFTER_ISSUE`)。
+  印 `ops.reg_csv_edit_after_issue()` = アプリが `to_regprocedure` で「0093 の後か」を見る (0093 の前の DB = アプリは今までどおり 409 `reg_csv_issued`・画面は 🔒 = アプリを先に出してもよい)
+- **変えない**: NE に取り込む CSV (0040) の `csv_issued` の断り (確かめに期待値の写しが無い = 設計 25 PR-2)・代表 (親) の 0065 の断り・ロジザードの最初の値 (0062)・品目の行と期待値・作る関数の「まだ終わっていないファイルがある」
+- 画面 = 商品の画面は、配った後もほかの商品と同じ見た目 (入力欄・案内のカードなし・セットの構成だけ「確かめが終わると直せます」の 1 行)。単品の税率を変えて、それを依頼だけに入れた新しいセットの CSV を配った後なら、保存の答えに「NE の画面でセットの税率を確かめる」を出す (照合 ② はセットの税率を比べない・Codex R1 High)。一括の変更も止める理由にしない。まだ配っていない (built) ファイルは、直すと今までどおり自動で使わないになる
+- 当て方 (🚨 まだ流さない): 0087〜0092 を各節の手順で先に当てる → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を作り直すだけ) → 中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま)
+- 試験 = `node scripts/test-master-reg-csv.mjs` ([C5] 配った後に直せる・期待値はそのまま・0093 の前の DB は 409 / [C7] 名前を直したまま verified / [D4] 直接の書き込み / [S3] 付け替え / [H] 画面) /
+  `scripts/test-master-compare-ne.mjs` ([42] 名前を直した新商品 = verified + ② の値の差 = rule・company_owned)

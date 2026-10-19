@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import { normSku } from '../../lib/sku-norm.js';
 import { canonicalSupplierCode } from '../company-db/load/sources.mjs';
 import {
-  saveSku, readCurrent, editTokenOf, sha256, stable, jstDate, issuedCsv, fieldsOf, fieldOwnership, REG_CSV_FIELDS, OVERRIDE_SOURCES,
+  saveSku, readCurrent, editTokenOf, sha256, stable, jstDate, issuedCsv, fieldsOf, fieldOwnership, REG_CSV_FIELDS, OVERRIDE_SOURCES, regEditAfterIssue,
   MasterWriteError, PARSERS, MAX_YEN, intIn, textIn, planSetDerived, setComponentInputs, COMPANY_ID,
 } from '../../lib/master-write.mjs';
 import { newEntryWritable } from '../../lib/master-cutover.mjs';
@@ -220,7 +220,8 @@ async function readFacts(db, codes, today) {
      where s.company_id = $1 and s.code_norm = any(select core.norm_code(x) from unnest($2::text[]) as t(x))`, [COMPANY_ID, codes])).rows;
   const byNorm = new Map(rows.map((r) => [r.code_norm, r]));
   const normOf = new Map((await db.query('select x, core.norm_code(x) as n from unnest($1::text[]) as t(x)', [codes])).rows.map((r) => [r.x, r.n]));
-  const hasRegItems = await regclass(db, 'ops.ne_reg_export_items');
+  // 🆕 0093: 0093 の後の DB = NE 登録の CSV を配った後も直せる (止める理由にしない)。0093 の前の DB だけ今までどおり
+  const hasRegItems = await regclass(db, 'ops.ne_reg_export_items') && !(await regEditAfterIssue(db));
   const out = [];
   for (const code of codes) {
     const hit = byNorm.get(normOf.get(code));
@@ -230,7 +231,7 @@ async function readFacts(db, codes, today) {
     const cols = [...new Set(Object.values(fieldsOf(cur.sku_kind)).map((d) => d.csvCol).filter(Boolean))];
     const csv = {};
     for (const r of await issuedCsv(db, cur.code_norm, cols)) (csv[r.col] = csv[r.col] || []).includes(r.export_id) || csv[r.col].push(r.export_id);
-    // NE 登録の CSV を配った後 (保存すると 409 reg_csv_issued)。単品の税率は含むセットの CSV にも入る
+    // NE 登録の CSV を配った後 (0093 の前の DB だけ = 保存すると 409 reg_csv_issued)。単品の税率は含むセットの CSV にも入る
     let regMine = [];
     let regParents = [];
     if (hasRegItems) {
