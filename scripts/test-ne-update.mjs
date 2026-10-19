@@ -222,7 +222,7 @@ async function loadWrite(sql, p) {
     await pg.query('commit');
   } catch (e) { await pg.query('rollback'); throw e; }
 }
-const units = async (codes = null) => jsonOf((await one('select ops.ne_upd_units($1::bigint[]) as r', [codes ? await Promise.all(codes.map(sid)) : null])).r);
+const units = async (codes = null, entry = 'bulk') => jsonOf((await one('select ops.ne_upd_units($1::bigint[], $2) as r', [codes ? await Promise.all(codes.map(sid)) : null, entry])).r);
 const unitOf = (u, code, col) => u.units.find((x) => x.code_norm === code && x.col === col);
 /** 作る (既定 = API で上げるファイル = 送り手が claimed)。upload = false = 人が受け取る CSV */
 const build = async (how, upload = true) => jsonOf((await one('select ops.ne_upd_build($1, $2, $3) as r', [how, 'minipc-test', upload])).r);
@@ -321,7 +321,7 @@ await ta('[U3] NE から消す依頼の途中 = deleting・新商品の途中 (d
   assert.equal(unitOf(uh, 'h01', 'handling').why, 'handling_csv');
   assert.equal(unitOf(uh, 'h01', 'standard_price_jpy').status, 'send', 'ほかの欄は送る');
   // 原価の持ち主が load の DB = 原価は出さない (保存も通らないが、記録が残っている場合も)
-  const u2 = jsonOf((await one(`select ops.ne_upd_units(null) as r`)).r);
+  const u2 = jsonOf((await one(`select ops.ne_upd_units(null, 'bulk') as r`)).r);
   assert.ok(unitOf(u2, 'a01', 'cost'));
 });
 await ta('[U4] コードの書き方: NE 小文字・ロジザード大文字 = ロジザード (spelling_fix)・collided + ロジザード 1 つ = ロジザード・ロジザードに無い = ne_collided・ロジザード 2 つ = lz_many・セットは NE のまま', async () => {
@@ -338,6 +338,9 @@ await ta('[U4] コードの書き方: NE 小文字・ロジザード大文字 = 
   assert.equal(unitOf(u0, 'k03', 'cost').status, 'send', 'ロジザードの書き方を使わない = ロジザードが 2 つでも送る');
   assert.equal(u0.units.filter((x) => x.code_norm === 'u60e-05').length, 0, '書き方だけの行は作らない');
   await q("select ops.ne_upd_record_verified('naka@test', 'products', 'code_case', 'bulk', 'ok', null, '10/17 の u60e の CSV で今ある商品の書き方が変わった')");
+  // 入口ごと: 人の取り込み (bulk) で確かめても API (api) では NE の今の書き方のまま
+  assert.equal(unitOf(await units(null, 'api'), 'u60e-10', 'cost').ne_code, 'u60e-10');
+  await q("select ops.ne_upd_record_verified('naka@test', 'products', 'code_case', 'api', 'ok', null, '試験')");
   const u = await units();
   const x = unitOf(u, 'u60e-10', 'cost');
   assert.deepEqual([x.status, x.ne_code, x.spelling_fix, x.ne_spelling, x.lz_spelling], ['send', 'U60E-10', true, 'u60e-10', 'U60E-10']);
@@ -514,6 +517,20 @@ await ta('[D1] CSV で受け取る: 作る (同じ request_id = 前の答え)・
   assert.match(String((await errOf(() => q('select ops.ne_upd_download($1, $2)', ['naka@test', up.id])))?.message), /not_download/);
   // 違う人の同じ request_id = 断る
   assert.match(String((await errOf(() => q('select ops.ne_upd_make_download($1, $2)', [id, 'other@test'])))?.message), /request_id_reused/);
+  // 同じ差で 2 つ目の CSV を作ってから 1 つ目を受け取った = 2 つ目は渡さない (同じ欄を 2 回出さない)
+  await save('q04', { standard_price: '1499' });
+  const m1 = jsonOf((await one('select ops.ne_upd_make_download($1, $2) as r', [crypto.randomUUID(), 'naka@test'])).r);
+  const m2 = jsonOf((await one('select ops.ne_upd_make_download($1, $2) as r', [crypto.randomUUID(), 'naka@test'])).r);
+  const f1 = m1.files.find((x) => x.kind === 'products'), f2 = m2.files.find((x) => x.kind === 'products');
+  await q('select ops.ne_upd_download($1, $2)', ['naka@test', f1.file_id]);
+  assert.match(String((await errOf(() => q('select ops.ne_upd_download($1, $2)', ['naka@test', f2.file_id])))?.message), /file_stale/);
+  await q('select ops.ne_upd_download($1, $2)', ['naka@test', f1.file_id]);   // 同じファイルのもう一度 = 渡す
+  // 作った後に値を直した = 渡さない
+  await save('q04', { standard_price: '1498' });
+  const m3 = jsonOf((await one('select ops.ne_upd_make_download($1, $2) as r', [crypto.randomUUID(), 'naka@test'])).r);
+  await save('q04', { standard_price: '1497' });
+  assert.match(String((await errOf(() => q('select ops.ne_upd_download($1, $2)', ['naka@test', m3.files.find((x) => x.kind === 'products').file_id])))?.message), /file_stale/);
+  assert.match(String((await errOf(() => q('select ops.ne_upd_download($1, $2)', ['naka@test', f1.file_id])))?.message), /file_stale/, '前に受け取ったファイルも値が変わったら渡さない');
 });
 await ta('[D2] 画面の一覧 (ops.ne_upd_overview): 差・回 (ファイル・バイト列なし)・送り手の様子・試しの記録 / 商品の画面 (ops.ne_upd_sku)', async () => {
   await q('select ops.ne_upd_worker_seen($1, true, false, $2)', ['minipc-test', 'v']);
@@ -578,6 +595,16 @@ await ta('[W2] 今すぐ: 頼みを拾って上げる (単品 = master_goods・�
   assert.equal(r2.code, 0, r2.line);
   assert.equal(ne2.asks.length, ne2.ups.length);
   assert.equal((await one("select state from ops.ne_upd_files where que_id = $1", [ne2.asks[0]])).state, 'ok');
+  // 答えが「処理中」= 聞いた印だけ残す → 次の回は聞かない (1 ファイル 1 回)
+  await save('a03', { name: '商品 a03 改 2c' });
+  await q('select ops.ne_upd_request_now($1, $2)', [crypto.randomUUID(), 'naka@test']);
+  const ne3 = fakeNe({ status: 1 });
+  await S.runNeUpdateSend({ db, ne: ne3, mode: 'pending', env: { NE_UPDATE_UPLOAD: '1', NE_UPDATE_QUE_CHECK: '1' }, host: 'minipc-test', sleep: async () => {}, waitMs: 0 });
+  assert.equal(ne3.asks.length, ne3.ups.length);
+  assert.ok((await one('select que_checked_at from ops.ne_upd_files where que_id = $1', [ne3.asks[0]])).que_checked_at);
+  await S.runNeUpdateSend({ db, ne: ne3, mode: 'pending', env: { NE_UPDATE_UPLOAD: '1', NE_UPDATE_QUE_CHECK: '1' }, host: 'minipc-test', sleep: async () => {}, waitMs: 0 });
+  assert.equal(ne3.asks.length, ne3.ups.length, '2 回目は聞かない');
+  await settleAll(2);
 });
 await ta('[W3] NE がはっきり断った = ❌・failed (もう一度送れる) / 通信が切れた = ⚠️ unknown (送り直さない = 送っている途中のまま・翌朝の照合を待つ)', async () => {
   await save('a03', { name: '商品 a03 改 3' });
@@ -603,7 +630,7 @@ await ta('[P1] master_edit = 画面の関数だけ (作る・結果・生存は�
   for (const f of ['ops.ne_upd_overview()', 'ops.ne_upd_sku(bigint)', 'ops.ne_upd_request_now(uuid, text)', 'ops.ne_upd_make_download(uuid, text)', 'ops.ne_upd_download(text, bigint)',
     'ops.ne_upd_record_verified(text, text, text, text, text, text, text)']) assert.equal(await can('master_edit', f), true, f);
   for (const f of ['ops.ne_upd_build(text, text, boolean)', 'ops.ne_upd_file_result(bigint, text, text, integer, text)', 'ops.ne_upd_queued_files()', 'ops.ne_upd_worker_seen(text, boolean, boolean, text)',
-    'ops.ne_upd_units(bigint[])', 'ops._ne_upd_fill(bigint, boolean, text, boolean)']) assert.equal(await can('master_edit', f), false, f);
+    'ops.ne_upd_units(bigint[], text)', 'ops._ne_upd_fill(bigint, boolean, text, boolean)']) assert.equal(await can('master_edit', f), false, f);
   for (const f of ['ops.ne_upd_build(text, text, boolean)', 'ops.ne_upd_file_result(bigint, text, text, integer, text)', 'ops.ne_upd_queued_files()', 'ops.ne_upd_worker_seen(text, boolean, boolean, text)',
     'ops.ne_upd_overview()']) assert.equal(await can('watch_writer', f), true, f);
   for (const f of ['ops.ne_upd_request_now(uuid, text)', 'ops.ne_upd_make_download(uuid, text)', 'ops.ne_upd_download(text, bigint)']) assert.equal(await can('watch_writer', f), false, f);
@@ -655,7 +682,7 @@ await ta('[P3] ロールが先・0093 が後 (本番の当て方) でも同じ�
   assert.equal(await can('watch_writer', 'ops.ne_upd_build(text, text, boolean)'), true);
   assert.equal(await can('watch_writer', 'ops.ne_upd_download(text, bigint)'), false);
   assert.equal(await can('watcher', 'ops.ne_upd_build(text, text, boolean)'), false);
-  assert.equal(await can('master_edit', 'ops.ne_upd_units(bigint[])'), false);
+  assert.equal(await can('master_edit', 'ops.ne_upd_units(bigint[], text)'), false);
   await pg2.close();
 });
 

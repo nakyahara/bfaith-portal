@@ -53,8 +53,9 @@ export async function realNeClient() {
         if (/^NE API エラー/.test(String(e && e.message))) throw new NeRejected(String(e.message));
         throw e;
       }
-      if (r.result !== 'success') throw new NeRejected(`NE がアップロードを受け付けなかった: ${oneLine(r.message || JSON.stringify(r), 300)}`);
-      if (r.que_id == null) throw new Error('NE の応答に que_id が無い (受付が分からない)');
+      // はっきり断った = result が error だけ。それ以外の読めない応答・que_id が無い / 形が違う = 受付が分からない (Codex PR-2 R2 High 4)
+      if (r && r.result === 'error') throw new NeRejected(`NE がアップロードを受け付けなかった: ${oneLine(r.message || JSON.stringify(r), 300)}`);
+      if (!r || r.result !== 'success' || r.que_id == null || !/^[0-9]{1,20}$/.test(String(r.que_id))) throw new Error(`NE の応答が読めない (受付が分からない): ${oneLine(JSON.stringify(r), 200)}`);
       return { que_id: String(r.que_id) };
     },
     async queStatus(queId) {
@@ -89,16 +90,21 @@ async function tidy(db, ne, { queCheck = false, now = Date.now() } = {}) {
     if (f.state === 'made' && now - Date.parse(f.claimed_at) > 30 * 60000) {
       await fileResult(db, f.file_id, null, 'unknown', null, '上げる途中で送り手が止まった (NE に入ったか分からない = 翌朝の照合で確かめる)');
       out.unknown++;
-    } else if (queCheck && ne && f.state === 'queued' && f.que_status == null && f.que_id && now - Date.parse(f.uploaded_at) > 60000) {
-      let st;
-      try { st = await ne.queStatus(f.que_id); } catch { continue; }
-      if (st.status === 2 || st.status === -1) {
-        const r = await fileResult(db, f.file_id, f.que_id, st.status === 2 ? 'ok' : 'failed', st.status, st.message);
-        if (r.state === 'ok') out.ok++; else if (r.state === 'failed') out.failed++;
-      }
+    } else if (queCheck && ne && f.state === 'queued' && !f.que_checked_at && f.que_id && now - Date.parse(f.uploaded_at) > 60000) {
+      const r = await checkOnce(db, ne, f.file_id, f.que_id);
+      if (r === 'ok') out.ok++; else if (r === 'failed') out.failed++;
     }
   }
   return out;
+}
+
+/** キューを 1 回だけ聞く (答えが待ち・処理中・無し・通信の誤りでも「聞いた」を残す = 次は聞かない・Codex PR-2 R2 Medium 5)。戻り値 = ファイルの状態 */
+async function checkOnce(db, ne, fileId, queId) {
+  let st = { status: null, message: null };
+  try { st = await ne.queStatus(queId); } catch (e) { st = { status: null, message: `キューを聞けなかった: ${oneLine(e && e.message, 200)}` }; }
+  const outcome = st.status === 2 ? 'ok' : st.status === -1 ? 'failed' : 'queued';
+  const r = await fileResult(db, fileId, queId, outcome, st.status ?? null, st.message ?? 'キューの結果はまだ (翌朝の照合で確かめる)');
+  return r.state;
 }
 
 /** 作ったファイルを NE に上げる (1 ファイル = 1 回)。キューを聞く設定なら少し待って 1 回だけ聞く */
@@ -122,14 +128,7 @@ async function uploadFiles(db, ne, files, { queCheck = false, waitMs = QUE_WAIT_
   }
   if (queCheck && res.some((u) => u.state === 'queued')) {
     await sleep(waitMs);
-    for (const u of res.filter((x) => x.state === 'queued')) {
-      let st;
-      try { st = await ne.queStatus(u.que_id); } catch { continue; }
-      if (st.status === 2 || st.status === -1) {
-        const r = await fileResult(db, u.file_id, u.que_id, st.status === 2 ? 'ok' : 'failed', st.status, st.message);
-        Object.assign(u, { state: r.state, message: st.message });
-      }
-    }
+    for (const u of res.filter((x) => x.state === 'queued')) u.state = await checkOnce(db, ne, u.file_id, u.que_id);
   }
   return res;
 }
@@ -147,7 +146,11 @@ export function lineOf(how, b, uploads, { upload = false } = {}) {
   if (b.state === 'nothing') return `✅ ${head}: 頼みなし`;
   if (b.state === 'busy') return `⏸️ ${head}: 前に上げたファイルがまだ動いているので、次の回に送ります`;
   const what = `${b.rows ?? '?'} 欄 (${colsText(b.summary) || '—'})`;
-  if (b.replayed && !uploads.length) return `✅ ${head}: 今朝の分はもう作ってあります (${what})`;
+  if (b.replayed && !uploads.length) {
+    if (b.state === 'failed') return `❌ ${head}: 今朝の分は NE に断られました — ${oneLine(b.reason, 200)} (ポータルの「NEへ送る」で CSV を作れます)`;
+    if (b.state === 'unknown') return `⚠️ ${head}: 今朝の分は NE に届いたか分かりません (翌朝の照合で確かめます)`;
+    return `✅ ${head}: 今朝の分はもう作ってあります (${what})`;
+  }
   if (!upload) return `✅ ${head}: NE とちがう所 ${what} → ポータルの「NEへ送る」で CSV を作って NE に取り込んでください`;
   const failed = uploads.filter((u) => u.state === 'failed');
   const unknown = uploads.filter((u) => u.state === 'unknown');
@@ -185,7 +188,7 @@ export async function runNeUpdateSend({ db, ne = null, mode, env = process.env, 
   }
   if (t.failed) lines.push(`前に上げたファイル ${t.failed} つを NE が断りました (ポータルの「NEへ送る」で CSV を作れます)`);
   if (!lines.length) lines.push(`✅ ${STEP_NAME} (今すぐ): 頼みなし`);
-  const bad = t.failed > 0 || sends.some((s) => (s.uploads || []).some((u) => u.state === 'failed'));
+  const bad = t.failed > 0 || sends.some((s) => (s.replayed && s.state === 'failed') || (s.uploads || []).some((u) => u.state === 'failed'));
   return { code: bad ? 1 : 0, line: lines.join(' / '), sends, tidy: t };
 }
 

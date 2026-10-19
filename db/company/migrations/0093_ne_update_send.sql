@@ -87,6 +87,7 @@ create table ops.ne_upd_files (
   state          text not null default 'made' check (state in ('made', 'queued', 'ok', 'failed', 'unknown')),
   claimed_by     text check (claimed_by is null or pg_catalog.length(claimed_by) <= 100),
   claimed_at     timestamptz,
+  que_checked_at timestamptz,   -- キューの結果を聞いた (NE_UPDATE_QUE_CHECK=1 のときだけ・1 ファイル 1 回 = 答えが 0 / 1 / 無し / 通信の誤りでも次は聞かない)
   que_id         text check (que_id is null or que_id ~ '^[0-9]{1,20}$'),
   que_status     integer,
   que_message    text check (que_message is null or pg_catalog.length(que_message) <= 2000),
@@ -160,7 +161,7 @@ begin
     if tg_table_name = 'ne_upd_rows' then raise exception 'ne_upd_write: 行は書き換えない' using errcode = '42501'; end if;
     v_keep := case tg_table_name
       when 'ne_upd_sends' then array['state', 'reason', 'ne_run', 'products_started_at', 'sets_started_at', 'lz_exported_at', 'row_count', 'line_count', 'left_count', 'built_at', 'finished_at', 'host', 'summary']
-      when 'ne_upd_files' then array['state', 'que_id', 'que_status', 'que_message', 'uploaded_at', 'finished_at', 'downloaded_at', 'downloaded_by', 'download_count']
+      when 'ne_upd_files' then array['state', 'que_id', 'que_status', 'que_message', 'que_checked_at', 'uploaded_at', 'finished_at', 'downloaded_at', 'downloaded_by', 'download_count']
       when 'ne_upd_workers' then array['seen_at', 'upload_on', 'auto_on', 'version']
       else array[]::text[] end;
     if (pg_catalog.to_jsonb(new) - v_keep) is distinct from (pg_catalog.to_jsonb(old) - v_keep) then
@@ -169,16 +170,17 @@ begin
     if tg_table_name = 'ne_upd_files' then
       -- 終わったファイルは戻さない・que_id と最初のダウンロードは一度入れたら変えない
       if old.state in ('ok', 'failed') and new.state is distinct from old.state then raise exception 'ne_upd_write: 終わったファイルの状態は戻さない' using errcode = '42501'; end if;
-      if old.state = 'unknown' and (new.state not in ('unknown', 'ok', 'failed') or (new.state <> 'unknown' and new.que_id is null)) then
+      if old.state = 'unknown' and (new.state not in ('unknown', 'queued', 'ok', 'failed') or (new.state <> 'unknown' and new.que_id is null)) then
         raise exception 'ne_upd_write: 受付が分からないファイルは、NE の受付の結果 (que_id) が分かったときだけ進める' using errcode = '42501';
       end if;
       if old.que_id is not null and new.que_id is distinct from old.que_id then raise exception 'ne_upd_write: que_id は変えない' using errcode = '42501'; end if;
+      if old.que_checked_at is not null and new.que_checked_at is distinct from old.que_checked_at then raise exception 'ne_upd_write: キューは 1 回だけ聞く' using errcode = '42501'; end if;
       if old.downloaded_at is not null and (new.downloaded_at, new.downloaded_by) is distinct from (old.downloaded_at, old.downloaded_by) then
         raise exception 'ne_upd_write: 最初のダウンロードの記録は変えない' using errcode = '42501';
       end if;
     end if;
     if tg_table_name = 'ne_upd_sends' then
-      if old.state in ('sent', 'failed', 'held', 'empty') and new.state is distinct from old.state then
+      if (old.state in ('failed', 'held', 'empty') or (old.state = 'sent' and new.state not in ('failed', 'unknown'))) and new.state is distinct from old.state then
         raise exception 'ne_upd_write: 終わった回の状態は戻さない' using errcode = '42501';
       end if;
     end if;
@@ -282,16 +284,15 @@ revoke all on function ops.ne_upd_yen(numeric) from public;
 
 -- ═══════════ 3. 差の一覧 (読むだけ) ═══════════
 /**
- * そのファイルは NE に出たか (送っている途中に数える): NE に上げた (受付待ち・受け付けた・受付が分からない) / 送り手が上げている最中 (作って 30 分の中) / 人がダウンロードした。
+ * そのファイルは NE に出たか (送っている途中に数える): NE に上げた (受付待ち・受け付けた・受付が分からない) / 送り手が上げると決めた (claimed・上げた記録の前に止まったかもしれない = 何分たっても) / 人がダウンロードした。
  *   NE がはっきり断った (failed)・だれも受け取っていない (作っただけ) = 出ていない = もう一度送る
  */
 create function ops.ne_upd_file_out(p_state text, p_claimed_at timestamptz, p_downloaded_at timestamptz) returns boolean language sql stable set search_path = pg_catalog, pg_temp as $$
-  select p_state in ('queued', 'ok', 'unknown') or p_downloaded_at is not null
-      or (p_state = 'made' and p_claimed_at is not null and p_claimed_at > pg_catalog.clock_timestamp() - interval '30 minutes')
+  select p_state in ('queued', 'ok', 'unknown') or p_downloaded_at is not null or (p_state = 'made' and p_claimed_at is not null)
 $$;
 revoke all on function ops.ne_upd_file_out(text, timestamptz, timestamptz) from public;
 /**
- * 差の一覧。p_sku_ids = その SKU だけ (商品の画面) / null = 全部。戻り値 = {
+ * 差の一覧。p_sku_ids = その SKU だけ (商品の画面) / null = 全部。p_entry = 使う入口 (bulk = 人が NE の画面で取り込む / api) = 大文字・小文字の直しの試しを入口ごとに見る。戻り値 = {
  *   ok (送ってよい状態か), problems: [{ reason, text }], ne: { run, products_started_at, sets_started_at, products_today, sets_today }, lz: { exported_at, fresh },
  *   blank_ok: { bulk: { products: [欄], sets: [欄] }, api: {...} } (空欄にしてよい欄 = 入口ごとに NE の実物で確かめた欄・Codex PR-2 R1 H4),
  *   units: [{ sku_id, code, code_norm, kind (products / sets), col, role (change / spelling), name, ne_value, cdb_value, cell, ne_code, ne_spelling, lz_spelling, spelling_fix,
@@ -299,7 +300,7 @@ revoke all on function ops.ne_upd_file_out(text, timestamptz, timestamptz) from 
  * why (blocked): ne_not_today / not_open / decided / decision_other_value / new_product / deleting / handling_csv (取扱中止の CSV (0072) を作った後の取扱) /
  *   ne_code_unknown / ne_collided / case_unverified (NE の書き方が 2 つ・大文字・小文字の直しを NE の実物で確かめる前) / lz_many / lz_old / <セルの理由>
  */
-create function ops.ne_upd_units(p_sku_ids bigint[]) returns jsonb
+create function ops.ne_upd_units(p_sku_ids bigint[], p_entry text) returns jsonb
   language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
 declare
   m        ops.master_ne_values_mark;
@@ -325,7 +326,8 @@ begin
   v_lz_fresh := v_lz_at is not null and v_lz_at > pg_catalog.clock_timestamp() - interval '36 hours';
   -- 大文字・小文字の直し (NE の書き方 → ロジザードの書き方) は、NE の実物で「今ある商品のコードを書き換える (新しい商品を作らない)」を確かめた後だけ (設計 25 §5 の 3)。
   --   確かめる前 = NE の今の書き方で送る (書き方が 2 つ = 決まらない = 送らない)・書き方だけの行も作らない
-  v_case_ok := coalesce((select v.result = 'ok' from ops.ne_upd_verified v where v.kind = 'products' and v.col = 'code_case' order by v.verified_id desc limit 1), false);
+  if p_entry is null or p_entry not in ('bulk', 'api') then raise exception 'invalid_input: 入口は bulk / api' using errcode = '22023'; end if;
+  v_case_ok := coalesce((select v.result = 'ok' from ops.ne_upd_verified v where v.kind = 'products' and v.col = 'code_case' and v.entry = p_entry order by v.verified_id desc limit 1), false);
   v_open := v_phase = 'new_open' and v_hash is not distinct from ops.ownership_hash(v_own);
   if not v_open then
     v_problems := v_problems || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object('reason', 'not_open', 'text', 'Company DB の保存がまだ開いていません (切替の段階)'));
@@ -417,7 +419,7 @@ begin
                   or exists (select 1 from ops.ne_reg_export_items i where i.sku_id = s.sku_id and i.state in ('built', 'issued', 'import_declared', 'partial')) then 'new_product'
                 when exists (select 1 from ops.ne_del_items i join ops.ne_del_exports e on e.export_id = i.export_id
                               where i.sku_id = s.sku_id and i.action = 'delete'
-                                and (i.state = 'live' or (i.state = 'withdrawn' and e.first_downloaded_at > pg_catalog.clock_timestamp() - interval '30 days'))) then 'deleting' end as why
+                                and (i.state = 'live' or (i.state = 'withdrawn' and e.first_downloaded_at is not null and i.state_changed_at > pg_catalog.clock_timestamp() - interval '30 days'))) then 'deleting' end as why
       from sk s left join ops.master_registrations r on r.sku_id = s.sku_id
   ),
   -- 値の差がある単位 + その欄の今の値を最後に入れた変更の記録
@@ -475,8 +477,8 @@ begin
            coalesce((select lr.expect = c.cdb and lr.ne_code = c.code_to
               from ops.ne_upd_rows lr join ops.ne_upd_files f on f.file_id = lr.file_id join ops.ne_upd_sends s on s.send_id = lr.send_id
              where lr.code_norm = c.code_norm and lr.col = c.col and ops.ne_upd_file_out(f.state, f.claimed_at, f.downloaded_at)
-               and s.built_at >= case c.kind when 'products' then m.products_started_at else m.sets_started_at end
-             order by lr.row_id desc limit 1), false) as in_flight,
+               and coalesce(f.downloaded_at, f.uploaded_at, f.claimed_at) >= case c.kind when 'products' then m.products_started_at else m.sets_started_at end
+             order by coalesce(f.downloaded_at, f.uploaded_at, f.claimed_at) desc, lr.row_id desc limit 1), false) as in_flight,
            (select pg_catalog.count(distinct r.send_id) from ops.ne_upd_rows r join ops.ne_upd_files f on f.file_id = r.file_id
              where r.code_norm = c.code_norm and r.col = c.col and r.expect = c.cdb and r.ne_code = c.code_to and f.state in ('queued', 'ok')
                and f.uploaded_at < case c.kind when 'products' then m.products_started_at else m.sets_started_at end
@@ -509,7 +511,7 @@ begin
   car2 as (
     select c.*, (c.cellr ->> 'cell') as cell,
            exists (select 1 from ops.ne_upd_rows r join ops.ne_upd_files f on f.file_id = r.file_id join ops.ne_upd_sends s on s.send_id = r.send_id
-                    where r.code_norm = c.code_norm and r.ne_code = c.code_to and s.built_at >= m.products_started_at
+                    where r.code_norm = c.code_norm and r.ne_code = c.code_to and coalesce(f.downloaded_at, f.uploaded_at, f.claimed_at) >= m.products_started_at
                       and ops.ne_upd_file_out(f.state, f.claimed_at, f.downloaded_at)) as in_flight,
            (select pg_catalog.count(distinct r.send_id) from ops.ne_upd_rows r join ops.ne_upd_files f on f.file_id = r.file_id
              where r.code_norm = c.code_norm and r.ne_code = c.code_to and f.state in ('queued', 'ok') and f.uploaded_at < m.products_started_at
@@ -542,7 +544,7 @@ begin
     'lz', pg_catalog.jsonb_build_object('exported_at', v_lz_at, 'fresh', v_lz_fresh),
     'blank_ok', v_blank, 'units', v_units);
 end $$;
-revoke all on function ops.ne_upd_units(bigint[]) from public;
+revoke all on function ops.ne_upd_units(bigint[], text) from public;
 
 -- ═══════════ 4. ファイルを作る ═══════════
 /** 毎朝の自動の上限 (行)。これを超える朝は作らない (held)。ふだん (この 14 日の自動の平均) の 5 倍を超える朝も (20 行より多いとき) */
@@ -572,7 +574,7 @@ revoke all on function ops.ne_upd_busy() from public;
 create function ops._ne_upd_fill(p_send_id bigint, p_cap boolean, p_host text, p_upload boolean) returns jsonb
   language plpgsql set search_path = pg_catalog, pg_temp as $$
 declare
-  u        jsonb := ops.ne_upd_units(null);
+  u        jsonb := ops.ne_upd_units(null, case when p_upload then 'api' else 'bulk' end);
   v_rows   jsonb;
   v_n      integer;
   v_avg    numeric;
@@ -763,20 +765,28 @@ begin
   if p_outcome in ('ok', 'failed') and f.state in ('queued', 'unknown') and coalesce(p_que_id, f.que_id) is null then
     raise exception 'invalid_input: 上げた後の結果には que_id が要る' using errcode = '22023';
   end if;
-  if f.state in ('ok', 'failed') or (f.state = 'unknown' and p_outcome in ('queued', 'unknown')) or (f.state = 'queued' and p_outcome = 'queued') then
+  if f.state = 'queued' and p_outcome = 'queued' then
+    -- キューを聞いた答えが「待ち・処理中・無し」= 聞いた印だけ (1 ファイル 1 回 = 次は聞かない)
+    update ops.ne_upd_files set que_checked_at = coalesce(que_checked_at, pg_catalog.clock_timestamp()), que_status = coalesce(p_que_status, que_status),
+           que_message = coalesce(pg_catalog.left(p_message, 2000), que_message) where file_id = p_file_id;
+    perform pg_catalog.set_config('ops.ne_upd_protocol', '', true);
+    return pg_catalog.jsonb_build_object('file_id', f.file_id::text, 'state', f.state, 'checked', true);
+  end if;
+  if f.state in ('ok', 'failed') or (f.state = 'unknown' and (p_outcome = 'unknown' or (p_outcome = 'queued' and (f.que_id is not null or p_que_id is null)))) then
     perform pg_catalog.set_config('ops.ne_upd_protocol', '', true);
     return pg_catalog.jsonb_build_object('file_id', f.file_id::text, 'state', f.state, 'already', true);
   end if;
   update ops.ne_upd_files set state = p_outcome, que_id = coalesce(que_id, p_que_id), que_status = coalesce(p_que_status, que_status), que_message = coalesce(pg_catalog.left(p_message, 2000), que_message),
          uploaded_at = coalesce(uploaded_at, case when p_que_id is not null then pg_catalog.clock_timestamp() end),
-         finished_at = case when p_outcome in ('ok', 'failed') then pg_catalog.clock_timestamp() end
+         finished_at = case when p_outcome in ('ok', 'failed') then pg_catalog.clock_timestamp() end,
+         que_checked_at = case when p_que_status is not null then coalesce(que_checked_at, pg_catalog.clock_timestamp()) else que_checked_at end
    where file_id = p_file_id;
   select pg_catalog.count(*) filter (where x.state = 'made'), pg_catalog.count(*) filter (where x.state = 'failed'), pg_catalog.count(*) filter (where x.state = 'unknown')
     into v_left, v_bad, v_unk from ops.ne_upd_files x where x.send_id = f.send_id;
   v_send_state := case when v_left > 0 then 'sending' when v_bad > 0 then 'failed' when v_unk > 0 then 'unknown' else 'sent' end;
   update ops.ne_upd_sends set state = v_send_state, finished_at = case when v_left = 0 then pg_catalog.clock_timestamp() end,
          reason = case when p_outcome in ('failed', 'unknown') then pg_catalog.left(coalesce(reason || ' / ', '') || coalesce(p_message, 'NE に上げられなかった'), 500) else reason end
-   where send_id = f.send_id and state in ('built', 'sending', 'unknown');
+   where send_id = f.send_id and state in ('built', 'sending', 'unknown', 'sent');
   perform pg_catalog.set_config('ops.ne_upd_protocol', '', true);
   return pg_catalog.jsonb_build_object('file_id', f.file_id::text, 'state', p_outcome, 'send_state', v_send_state);
 end $$;
@@ -785,7 +795,7 @@ revoke all on function ops.ne_upd_file_result(bigint, text, text, integer, text)
 /** 送り手: 上げる途中で止まったかもしれないファイル (上げるファイルで作っただけのまま) と、NE に上げてまだキューの結果を聞いていないファイル (バイト列は渡さない = 上げ直さない) */
 create function ops.ne_upd_queued_files() returns jsonb language sql stable security definer set search_path = pg_catalog, pg_temp as $$
   select coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('file_id', f.file_id::text, 'send_id', f.send_id::text, 'kind', f.kind, 'state', f.state, 'que_id', f.que_id,
-           'que_status', f.que_status, 'claimed_at', f.claimed_at, 'uploaded_at', f.uploaded_at) order by f.file_id), '[]'::jsonb)
+           'que_status', f.que_status, 'que_checked_at', f.que_checked_at, 'claimed_at', f.claimed_at, 'uploaded_at', f.uploaded_at) order by f.file_id), '[]'::jsonb)
     from ops.ne_upd_files f where f.claimed_by is not null and f.state in ('made', 'queued')
 $$;
 revoke all on function ops.ne_upd_queued_files() from public;
@@ -815,7 +825,7 @@ revoke all on function ops._ne_upd_worker_state() from public;
 /** 画面の一覧 (読むだけ・バイト列は出さない): 差の一覧 + この 14 日の回 (ファイルつき) + 送り手の様子 + 実機の試しの記録 */
 create function ops.ne_upd_overview() returns jsonb language plpgsql stable security definer set search_path = pg_catalog, pg_temp as $$
 declare
-  u jsonb := ops.ne_upd_units(null);
+  u jsonb := ops.ne_upd_units(null, 'bulk');
 begin
   return u || pg_catalog.jsonb_build_object(
     'today', core.jst_date(pg_catalog.clock_timestamp()),
@@ -836,7 +846,7 @@ revoke all on function ops.ne_upd_overview() from public;
 
 /** 商品の画面: その SKU の差 (送る・送っている途中・止まっている) */
 create function ops.ne_upd_sku(p_sku_id bigint) returns jsonb language sql stable security definer set search_path = pg_catalog, pg_temp as $$
-  select ops.ne_upd_units(array[p_sku_id]) || pg_catalog.jsonb_build_object('worker', ops._ne_upd_worker_state())
+  select ops.ne_upd_units(array[p_sku_id], 'bulk') || pg_catalog.jsonb_build_object('worker', ops._ne_upd_worker_state())
 $$;
 revoke all on function ops.ne_upd_sku(bigint) from public;
 
@@ -903,15 +913,32 @@ create function ops.ne_upd_download(p_actor text, p_file_id bigint) returns json
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
   f ops.ne_upd_files;
+  u jsonb;
+  v_bad integer;
 begin
   if not ops._ne_upd_actor_ok(p_actor) then raise exception 'invalid_input: 人 (ログインのメール) が要る' using errcode = '22023'; end if;
-  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('ops.ne_upd'));
+  perform ops._ne_upd_begin();
   select * into f from ops.ne_upd_files x where x.file_id = p_file_id for update;
   if f.file_id is null then raise exception 'not_found: ファイル % が無い', p_file_id using errcode = 'P0002'; end if;
   -- API で上げるファイル (送り手の claimed) は人に渡さない (2 つの道で同じファイルを NE に入れない)。毎朝の自動で作った人が受け取る CSV は渡す
   if f.claimed_by is not null then raise exception 'not_download: このファイルは送り手が NE に直接上げるもの (人が受け取るファイルでない)' using errcode = 'P0001'; end if;
   if core.jst_date(f.created_at) <> core.jst_date(pg_catalog.clock_timestamp()) then
     raise exception 'file_old: 前の日に作ったファイルは渡しません (今の値と違うかもしれない)。もう一度「CSV を作る」を押してください' using errcode = 'P0001';
+  end if;
+  -- 渡す前に、ファイルの行が今もそのまま送る差か確かめる (作った後に値を直した・ほかの CSV でもう出した・止める理由が出た・NE が同じになった = 渡さない・Codex PR-2 R2 High 1)。
+  --   もう受け取ったファイルのもう一度のダウンロードは、その行が「送っている途中」で同じ値のときだけ
+  u := ops.ne_upd_units((select pg_catalog.array_agg(distinct r.sku_id) from ops.ne_upd_rows r where r.file_id = f.file_id), 'bulk');
+  if (u ->> 'ok') is distinct from 'true' then
+    raise exception 'file_stale: いまは渡せません (%)。もう一度「CSV を作る」を押してください',
+      coalesce((select pg_catalog.string_agg(p ->> 'text', '・') from pg_catalog.jsonb_array_elements(u -> 'problems') p), '今朝の NE の値が無い') using errcode = 'P0001';
+  end if;
+  select pg_catalog.count(*) into v_bad from ops.ne_upd_rows r
+   where r.file_id = f.file_id and not exists (
+     select 1 from pg_catalog.jsonb_array_elements(u -> 'units') x
+      where x ->> 'code_norm' = r.code_norm and x ->> 'col' = r.col and x ->> 'role' = r.role and (x -> 'cdb_value') = r.expect and x ->> 'ne_code' = r.ne_code
+        and (x ->> 'status' = 'send' or (x ->> 'status' = 'sending' and f.downloaded_at is not null)));
+  if v_bad > 0 then
+    raise exception 'file_stale: このファイルを作った後に値が変わったか、ほかの CSV でもう出した欄があります (% 行)。もう一度「CSV を作る」を押してください', v_bad using errcode = 'P0001';
   end if;
   perform pg_catalog.set_config('ops.ne_upd_protocol', '1', true);
   update ops.ne_upd_files set downloaded_at = coalesce(downloaded_at, pg_catalog.clock_timestamp()), downloaded_by = coalesce(downloaded_by, p_actor), download_count = download_count + 1
