@@ -381,7 +381,12 @@ begin
   -- 取扱の空は 'unknown' (baseline.mjs の cdbValue)
   cur2 as (select u.*, case when u.col = 'handling' and u.cdb0 = 'null'::jsonb then '"unknown"'::jsonb else u.cdb0 end as cdb from cur u),
   d as (
-    select u.*, v.state as ne_state, v.value as ne, v.ne_kind
+    select u.*, v.state as ne_state, v.value as ne, v.ne_kind,
+           -- 今朝のその種類の取得の後に最後に出した値 (無ければ null)
+           (select lr.expect from ops.ne_upd_rows lr join ops.ne_upd_files f on f.file_id = lr.file_id
+             where lr.code_norm = u.code_norm and lr.col = u.col and lr.role = 'change' and ops.ne_upd_file_out(f.state, f.claimed_at, f.downloaded_at)
+               and coalesce(f.downloaded_at, f.uploaded_at, f.claimed_at) >= case u.kind when 'products' then m.products_started_at else m.sets_started_at end
+             order by coalesce(f.downloaded_at, f.uploaded_at, f.claimed_at) desc, lr.row_id desc limit 1) as last_out
       from cur2 u join ops.master_ne_values v on v.code_norm = u.code_norm and v.col = u.col
      where v.ne_kind = case u.sku_kind when 'single' then 'single' else 'set' end
   ),
@@ -443,7 +448,7 @@ begin
               and ((e3.operation = 'INSERT' and (e3.new_value ->> 'is_primary') = 'true') or (e3.operation = 'UPDATE' and e3.attribute = 'is_primary'))
             order by e3.recorded_at desc, e3.event_id desc limit 1)) x
         order by x.recorded_at desc, x.event_id desc limit 1) e on true
-     where d.ne_state = 'ok' and d.ne is distinct from d.cdb
+     where d.ne_state = 'ok' and (d.ne is distinct from d.cdb or (d.last_out is not null and d.last_out is distinct from d.cdb))   -- 出した古い値を正す (Codex PR-2 R3 H2)
   ),
   -- 人がポータルで入れた今の値だけ (夜間ロード・NE の観測の値 = わざと残した差 は出さない)
   human as (
@@ -766,11 +771,14 @@ begin
     raise exception 'invalid_input: 上げた後の結果には que_id が要る' using errcode = '22023';
   end if;
   if f.state = 'queued' and p_outcome = 'queued' then
-    -- キューを聞いた答えが「待ち・処理中・無し」= 聞いた印だけ (1 ファイル 1 回 = 次は聞かない)
-    update ops.ne_upd_files set que_checked_at = coalesce(que_checked_at, pg_catalog.clock_timestamp()), que_status = coalesce(p_que_status, que_status),
-           que_message = coalesce(pg_catalog.left(p_message, 2000), que_message) where file_id = p_file_id;
+    -- キューを聞く権利を取る = 聞いた印 (1 ファイル 1 回・聞く前に呼ぶ = 2 つの送り手が同じファイルを聞かない・Codex PR-2 R3 M4)。もう取ってある = claimed: false
+    if f.que_checked_at is not null then
+      perform pg_catalog.set_config('ops.ne_upd_protocol', '', true);
+      return pg_catalog.jsonb_build_object('file_id', f.file_id::text, 'state', f.state, 'claimed', false);
+    end if;
+    update ops.ne_upd_files set que_checked_at = pg_catalog.clock_timestamp(), que_message = coalesce(pg_catalog.left(p_message, 2000), que_message) where file_id = p_file_id;
     perform pg_catalog.set_config('ops.ne_upd_protocol', '', true);
-    return pg_catalog.jsonb_build_object('file_id', f.file_id::text, 'state', f.state, 'checked', true);
+    return pg_catalog.jsonb_build_object('file_id', f.file_id::text, 'state', f.state, 'claimed', true);
   end if;
   if f.state in ('ok', 'failed') or (f.state = 'unknown' and (p_outcome = 'unknown' or (p_outcome = 'queued' and (f.que_id is not null or p_que_id is null)))) then
     perform pg_catalog.set_config('ops.ne_upd_protocol', '', true);
@@ -936,9 +944,17 @@ begin
    where r.file_id = f.file_id and not exists (
      select 1 from pg_catalog.jsonb_array_elements(u -> 'units') x
       where x ->> 'code_norm' = r.code_norm and x ->> 'col' = r.col and x ->> 'role' = r.role and (x -> 'cdb_value') = r.expect and x ->> 'ne_code' = r.ne_code
-        and (x ->> 'status' = 'send' or (x ->> 'status' = 'sending' and f.downloaded_at is not null)));
+        and ((f.downloaded_at is null and x ->> 'status' = 'send') or (f.downloaded_at is not null and x ->> 'status' = 'sending')));
   if v_bad > 0 then
     raise exception 'file_stale: このファイルを作った後に値が変わったか、ほかの CSV でもう出した欄があります (% 行)。もう一度「CSV を作る」を押してください', v_bad using errcode = 'P0001';
+  end if;
+  -- 空欄のセル (見出しにあってその SKU の行に無い欄) が、今も NE の実物で確かめた欄か (Codex PR-2 R3 H3)
+  select pg_catalog.count(*) into v_bad
+    from (select distinct r.sku_id from ops.ne_upd_rows r where r.file_id = f.file_id) s, pg_catalog.unnest(f.cols) c(col)
+   where not exists (select 1 from ops.ne_upd_rows r where r.file_id = f.file_id and r.sku_id = s.sku_id and r.col = c.col)
+     and not (coalesce(u #> array['blank_ok', 'bulk', f.kind], '[]'::jsonb) ? c.col);
+  if v_bad > 0 then
+    raise exception 'file_stale: 空欄にした欄の確かめが取り消されました。もう一度「CSV を作る」を押してください' using errcode = 'P0001';
   end if;
   perform pg_catalog.set_config('ops.ne_upd_protocol', '1', true);
   update ops.ne_upd_files set downloaded_at = coalesce(downloaded_at, pg_catalog.clock_timestamp()), downloaded_by = coalesce(downloaded_by, p_actor), download_count = download_count + 1

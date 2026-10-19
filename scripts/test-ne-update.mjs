@@ -120,7 +120,7 @@ await ta('[F2] セルの決まり (DB) = ne-csv.mjs の COLUMNS の cell (JS)', 
 const single = (code, over = {}) => ({ code, name: `商品 ${code}`, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 3,
   cost: { jpy: 100, source: 'ne', status: 'COMPLETE' }, standardPriceJpy: 1000, shippingCode: 'S02', shippingMethod: '宅急便', shippingCostJpy: 520, reorderMonths: 2, ...over });
 const setSku = (code) => ({ ...single(code), kind: 'set', cost: { jpy: 200, source: 'set_calc', status: 'COMPLETE' }, standardPriceJpy: 3000 });
-const SINGLES = ['a01', 'a02', 'a03', 'a04', 'a05', 'a06', 'a07', 'a08', 'a09', 'a10', 'u60e-10', 'u60e-05', 'k01', 'k02', 'k03', 'x01', 'x02', 'x03', 'q01', 'q02', 'q03', 'q04', 'q05', 'h01'];
+const SINGLES = ['a01', 'a02', 'a03', 'a04', 'a05', 'a06', 'a07', 'a08', 'a09', 'a10', 'u60e-10', 'u60e-05', 'k01', 'k02', 'k03', 'x01', 'x02', 'x03', 'q01', 'q02', 'q03', 'q04', 'q05', 'h01', 'z01', 'z02', 'z03'];
 const SETS = ['s01', 's02'];
 const PLAN = {
   skus: [...SINGLES.map((c) => single(c)), ...SETS.map(setSku)],
@@ -531,6 +531,27 @@ await ta('[D1] CSV で受け取る: 作る (同じ request_id = 前の答え)・
   await save('q04', { standard_price: '1497' });
   assert.match(String((await errOf(() => q('select ops.ne_upd_download($1, $2)', ['naka@test', m3.files.find((x) => x.kind === 'products').file_id])))?.message), /file_stale/);
   assert.match(String((await errOf(() => q('select ops.ne_upd_download($1, $2)', ['naka@test', f1.file_id])))?.message), /file_stale/, '前に受け取ったファイルも値が変わったら渡さない');
+});
+await ta('[D3] 出した後に今朝の NE と同じ値に戻した = 正す行として送る / もう受け取ったファイルは「送っている途中」のときだけもう一度渡す / 空欄の確かめを取り消した = 渡さない (Codex PR-2 R3)', async () => {
+  await save('z03', { standard_price: '1700' });
+  const m = jsonOf((await one('select ops.ne_upd_make_download($1, $2) as r', [crypto.randomUUID(), 'naka@test'])).r);
+  const f = m.files.find((x) => x.kind === 'products');
+  await q('select ops.ne_upd_download($1, $2)', ['naka@test', f.file_id]);
+  assert.equal(unitOf(await units(), 'z03', 'standard_price_jpy').status, 'sending');
+  await save('z03', { standard_price: '1000' });   // 今朝の NE と同じに戻した = 1700 を出したので 1000 で正す
+  const u = unitOf(await units(), 'z03', 'standard_price_jpy');
+  assert.deepEqual([u.status, u.cell, u.ne_value, u.cdb_value], ['send', '1000', 1000, 1000]);
+  assert.match(String((await errOf(() => q('select ops.ne_upd_download($1, $2)', ['naka@test', f.file_id])))?.message), /file_stale/, '1700 のファイルはもう渡さない');
+  // 空欄: 売価・原価を確かめた (人の取り込み) → 1 つのファイルに空欄 → 原価の確かめを取り消した = 渡さない
+  for (const col of ['standard_price_jpy', 'cost']) await q('select ops.ne_upd_record_verified($1, $2, $3, $4, $5, null, null)', ['naka@test', 'products', col, 'bulk', 'ok']);
+  await save('z01', { standard_price: '1201' });
+  await save('z02', { cost: { jpy: '121', reason: '試験' } });
+  const m2 = jsonOf((await one('select ops.ne_upd_make_download($1, $2) as r', [crypto.randomUUID(), 'naka@test'])).r);
+  const f2 = m2.files.find((x) => x.kind === 'products' && x.header === 'syohin_code,baika_tnk,genka_tnk');
+  assert.ok(f2, JSON.stringify(m2.files));
+  await q("select ops.ne_upd_record_verified('naka@test', 'products', 'cost', 'bulk', 'ng', null, '取り消し')");
+  assert.match(String((await errOf(() => q('select ops.ne_upd_download($1, $2)', ['naka@test', f2.file_id])))?.message), /空欄にした欄の確かめが取り消されました/);
+  await q("select ops.ne_upd_record_verified('naka@test', 'products', 'standard_price_jpy', 'bulk', 'ng', null, '戻す')");
 });
 await ta('[D2] 画面の一覧 (ops.ne_upd_overview): 差・回 (ファイル・バイト列なし)・送り手の様子・試しの記録 / 商品の画面 (ops.ne_upd_sku)', async () => {
   await q('select ops.ne_upd_worker_seen($1, true, false, $2)', ['minipc-test', 'v']);

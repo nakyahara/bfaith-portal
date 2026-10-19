@@ -100,11 +100,13 @@ async function tidy(db, ne, { queCheck = false, now = Date.now() } = {}) {
 
 /** キューを 1 回だけ聞く (答えが待ち・処理中・無し・通信の誤りでも「聞いた」を残す = 次は聞かない・Codex PR-2 R2 Medium 5)。戻り値 = ファイルの状態 */
 async function checkOnce(db, ne, fileId, queId) {
+  // 聞く前に DB で聞く権利を取る (取れなかった = ほかの送り手が聞いた・聞いている = 聞かない。Codex PR-2 R3 M4)
+  const claim = await fileResult(db, fileId, queId, 'queued', null, 'キューの結果を聞いた (答えが待ち・処理中なら翌朝の照合で確かめる)');
+  if (!claim.claimed) return claim.state;
   let st = { status: null, message: null };
-  try { st = await ne.queStatus(queId); } catch (e) { st = { status: null, message: `キューを聞けなかった: ${oneLine(e && e.message, 200)}` }; }
-  const outcome = st.status === 2 ? 'ok' : st.status === -1 ? 'failed' : 'queued';
-  const r = await fileResult(db, fileId, queId, outcome, st.status ?? null, st.message ?? 'キューの結果はまだ (翌朝の照合で確かめる)');
-  return r.state;
+  try { st = await ne.queStatus(queId); } catch { return 'queued'; }
+  if (st.status !== 2 && st.status !== -1) return 'queued';
+  return (await fileResult(db, fileId, queId, st.status === 2 ? 'ok' : 'failed', st.status, st.message)).state;
 }
 
 /** 作ったファイルを NE に上げる (1 ファイル = 1 回)。キューを聞く設定なら少し待って 1 回だけ聞く */
