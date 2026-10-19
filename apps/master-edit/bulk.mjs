@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import { normSku } from '../../lib/sku-norm.js';
 import { canonicalSupplierCode } from '../company-db/load/sources.mjs';
 import {
-  saveSku, readCurrent, editTokenOf, sha256, stable, jstDate, issuedCsv, fieldsOf, fieldOwnership, REG_CSV_FIELDS, OVERRIDE_SOURCES,
+  saveSku, readCurrent, editTokenOf, sha256, stable, jstDate, fieldsOf, fieldOwnership, REG_CSV_FIELDS, OVERRIDE_SOURCES,
   MasterWriteError, PARSERS, MAX_YEN, intIn, textIn, planSetDerived, setComponentInputs, COMPANY_ID,
 } from '../../lib/master-write.mjs';
 import { newEntryWritable } from '../../lib/master-cutover.mjs';
@@ -226,10 +226,7 @@ async function readFacts(db, codes, today) {
     const hit = byNorm.get(normOf.get(code));
     if (!hit) { out.push({ code, found: false }); continue; }
     const cur = await readCurrent(db, hit.sku_id, today);
-    // NE に取り込む CSV が出ている列 (保存すると 409 csv_issued)
-    const cols = [...new Set(Object.values(fieldsOf(cur.sku_kind)).map((d) => d.csvCol).filter(Boolean))];
-    const csv = {};
-    for (const r of await issuedCsv(db, cur.code_norm, cols)) (csv[r.col] = csv[r.col] || []).includes(r.export_id) || csv[r.col].push(r.export_id);
+    // 🆕 10/19 (0093): NE に取り込む CSV (0040) が出ている列も保存できる (編集は自由) = ここでは見ない
     // NE 登録の CSV を配った後 (保存すると 409 reg_csv_issued)。単品の税率は含むセットの CSV にも入る
     let regMine = [];
     let regParents = [];
@@ -246,7 +243,7 @@ async function readFacts(db, codes, today) {
       ? (await db.query(`select k.code, c.valid_from::text as valid_from, c.cost_source from core.sku_costs c join core.skus k on k.sku_id = c.sku_id
            where c.sku_id = any($1::bigint[]) and c.valid_to is null and c.valid_from > $2::date order by k.code_norm`, [cur.parent_set_ids, today])).rows
         .filter((r) => !OVERRIDE_SOURCES.has(r.cost_source)) : [];
-    out.push({ code, found: true, cur, csv, regMine, regParents, parentFuture, token: editTokenOf(cur), self: bulkSelfToken(cur) });
+    out.push({ code, found: true, cur, regMine, regParents, parentFuture, token: editTokenOf(cur), self: bulkSelfToken(cur) });
   }
   return out;
 }
@@ -286,10 +283,6 @@ export function judgeBulk(f, field, value, { editable } = {}) {
   }
   if (field === 'cost' && f.parentFuture && f.parentFuture.length) {
     return { verdict: 'block', reason: 'set_cost_future', why: `含むセット ${f.parentFuture.map((p) => p.code).join('・')} に先の日の原価があります (${f.parentFuture[0].valid_from} から)` };
-  }
-  const csvCol = fieldsOf(c.sku_kind)[saveField]?.csvCol;
-  if (csvCol && f.csv && f.csv[csvCol] && f.csv[csvCol].length) {
-    return { verdict: 'block', reason: 'csv_issued', why: `この商品の${F.label}が入った NE に取り込む CSV (ファイル ${f.csv[csvCol].map((x) => `#${x}`).join('・')}) が出ています` };
   }
   const regFields = REG_CSV_FIELDS[c.sku_kind] || [];
   if (regFields.includes(saveField) && f.regMine && f.regMine.length) {

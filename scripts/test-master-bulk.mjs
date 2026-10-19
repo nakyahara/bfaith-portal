@@ -146,7 +146,7 @@ await ta('[1] 項目の板の判定: 例外は常に対象外・セット・中�
     { cost: 'out', standard_price: 'out', handling: 'ok', sales_class: 'out', tax_rate: 'out', primary_supplier: 'out' });
   assert.equal(v('b001', 'cost'), 'block'); assert.equal(v('b001', 'standard_price'), 'ok');
   assert.equal(v('b003', 'cost'), 'block'); assert.match(r.items.find((x) => x.code === 'b003').fields.cost.why, /含むセット s003/);
-  assert.equal(v('b002', 'cost'), 'block'); assert.equal(v('b002', 'standard_price'), 'block'); assert.equal(v('b002', 'tax_rate'), 'ok');
+  assert.equal(v('b002', 'cost'), 'ok'); assert.equal(v('b002', 'standard_price'), 'ok');   // 🆕 10/19 (0093): CSV が出ていても保存できる assert.equal(v('b002', 'tax_rate'), 'ok');
   assert.equal(r.items.find((x) => x.code === 'b001').fields.cost.reason, 'cost_future');
   assert.equal(r.items.find((x) => x.code === 'x001').fields.handling.reason, 'exception_sku');
   // 今の値 (値の欄の「今の値」)
@@ -414,11 +414,11 @@ await ta('[14] 商品の行が無い単品の売上分類 (Codex R1 M4): DB が�
   assert.match(src, /if \(hit !== 1\) throw new MasterWriteError\(409, 'no_product'/);
 });
 
-await ta('[4] 保存できない (先の日の原価・CSV) は送らない・直し方の組 (M7)・保存を開いていない = 全部だめ (later)', async () => {
+await ta('[4] 保存できない (先の日の原価) は送らない・CSV が出ていても変えられる (🆕 10/19)・直し方の組 (M7)・保存を開いていない = 全部だめ (later)', async () => {
   const p = await preview(['b001', 'b002', 'b003', 'm001'], 'cost', 777, { reason: 'x' });
-  assert.deepEqual(p.items.map((x) => [x.code, x.verdict, x.group]), [['b001', 'block', 'one'], ['b002', 'block', 'csv'], ['b003', 'block', 'one'], ['m001', 'chg', null]]);
+  assert.deepEqual(p.items.map((x) => [x.code, x.verdict, x.group]), [['b001', 'block', 'one'], ['b002', 'chg', null], ['b003', 'block', 'one'], ['m001', 'chg', null]]);
   const r = await run(['m001'], 'cost', 777, { p });
-  assert.deepEqual(r.results.map((x) => [x.code, x.ok]), [['m001', true]]);
+  assert.deepEqual(r.results.map((x) => [x.code, x.ok]), [['b002', true], ['m001', true]]);   // 🆕 10/19: CSV が出ている b002 も変えられる
   // 保存を開いていない (MASTER_EDIT_OPEN が無い) = 409 before_cutover・何も書かない
   const p2 = await preview(['m002'], 'standard_price', 1234);
   const c = await editor(() => B.bulkApplyChunk(db, { actor: 'naka@test', ticket: p2.ticket,

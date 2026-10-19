@@ -1720,6 +1720,16 @@ async function main() {
   const lzCodeNotice = readLzCodeNotice({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data'), asOf: lzDailyAsOf, syncRunId: process.env.DAILY_SYNC_RUN_ID,
     warn: (s) => console.warn(s) });
 
+  // ─── NE へ送る (AI_reference CompanyDB構想/25・2026-10-19 中原さん「差分がある部分を CSV で 1 日 1 回アップ」・migration 0093) ───
+  // 照合 ② (今朝の NE の値) とロジザードの影 (今朝のロジザードの書き方) の後に 1 回。自社で直したけれど今朝の NE と違う欄だけを CSV にして NE の API で上げる。
+  // 🚨 最初は止めて出す: miniPC の .env に NE_UPDATE_UPLOAD=1 と NE_UPDATE_AUTO=1 が無ければ上げない (差の数だけまとめに出す・exit 0)。
+  // 多すぎる朝 (100 行を超える・ふだんの 5 倍) は DB が作らない = ⚠️「送りませんでした」(exit 0)。上げられなかった・NE が断った = ❌ (exit 1)。
+  // 同じ今朝の NE の回で 2 回目は前の答え (retry に載せない = 載せても 2 回は送らない)。照合が失敗した朝は流さない
+  const neUpdateResult = masterCompareResult.success
+    ? runScript('scripts/company-db/ne-update-send.mjs --daily', 'NEへ送る', 600000)
+    : { success: true, skipped: true, summary: '⏭️ 見送り (マスタ照合が失敗 = 今朝の NE の値が無い・NE には何も送っていない)' };
+  results.push({ name: 'NEへ送る', ...neUpdateResult, warn: neUpdateResult.success && isWarnSummary(neUpdateResult.summary) });
+
   // ─── Company DB の見張り (設計 = AI_reference CompanyDB構想/09。全部の push の後・要約の前) ───
   // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
   // 判定 4 値 (pass / breach / blocked / execution_error) で「そろっているか → おかしくないか」を出す。🚨 「行がある = そろっている」と読まない。

@@ -760,7 +760,7 @@ await ta('[9] 「今日」は東京の日付 (UTC 14:59:59 と 15:00 の境目�
 
 console.log('\nNE に取り込む CSV');
 
-await ta('[10] CSV が出ている列は変えない (作った・確かめた / 申告して確かめ待ち)。CSV に無い列・void・確かめ済みは変えられる', async () => {
+await ta('[10] 🆕 10/19 (0093): NE に取り込む CSV (0040) が出ている列も保存できる (編集は自由・直した値は「NE へ送る」が次に送る)・CSV の予約は保存で変えない', async () => {
   const mk = async (state) => {
     const extra = state === 'declared' ? ', checked_at, checked_run, declared_at, declared_by' : '';
     const vals = state === 'declared' ? ", now(), 'mc_20300101T000000000Z_abcdef', now(), 'x@test'" : '';
@@ -771,21 +771,18 @@ await ta('[10] CSV が出ている列は変えない (作った・確かめた /
     values ($1, 'to_ne', $2, $3, $2, '{"value":"a"}', 'a', 1, '{}')`, [id, code, col]);
   const made = await mk('made');
   await row(made, 's003', 'name');
-  const monthsBefore = (await skuRow('s003')).months;
-  let e = await rejectsWith(save('s003', { name: '直したい', reorder_months: '3' }), 409, 'csv_issued');
-  assert.match(e.message, new RegExp(`#${made}`));
-  assert.equal((await skuRow('s003')).months, monthsBefore);
-  await save('s003', { reorder_months: '3' });
-  await pg.query("update ops.ne_csv_exports set state = 'void', void_at = now(), void_by = 'x@test', void_reason = 'by_user' where export_id = $1", [made]);
-  await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'void' where export_id = $1", [made]);
+  await save('s003', { name: '直したい', reorder_months: '3' });
+  assert.equal((await skuRow('s003')).name, '直したい');
+  assert.equal((await skuRow('s003')).months, 3);
   await save('s003', { name: '単品 3 改 2' });
   const declared = await mk('declared');
   await row(declared, 's003', 'tax_rate');
-  e = await rejectsWith(save('s003', { tax_rate: '10' }), 409, 'csv_issued');
-  assert.deepEqual(e.extra.exports.map((x) => [x.col, x.state]), [['tax_rate', 'declared']]);
-  await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'confirmed' where export_id = $1", [declared]);
   await save('s003', { tax_rate: '10' });
   assert.equal((await skuRow('s003')).tax_rate, 0.1);
+  assert.equal((await q("select count(*)::int as n from ops.ne_csv_export_rows where reserved and code_norm = 's003'"))[0].n, 2, 'CSV の予約は保存で変えない');
+  await pg.query("update ops.ne_csv_exports set state = 'void', void_at = now(), void_by = 'x@test', void_reason = 'by_user' where export_id = $1", [made]);
+  await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'void' where export_id = $1", [made]);
+  await pg.query("update ops.ne_csv_export_rows set reserved = false, released_at = now(), release_reason = 'confirmed' where export_id = $1", [declared]);
 });
 
 console.log('\nセット: 構成の依頼・NE の観測・上げる・食い違い');

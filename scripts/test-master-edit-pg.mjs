@@ -10,7 +10,7 @@
  *   2 同じ request_id が 2 つ並んで来る (押し直し): 後の方は request_id の鍵で待ち、前の方の結果をそのまま返す (記録は 1 行・変更も 1 回)
  *   3 同じ request_id を違う SKU へ同時に: 後の方は request_id の鍵で待ち、409 request_id_reused (500 にしない)
  *   4 画面を開いた後に別の接続が仕入先ごとの商品の行を足した (phantom) = 409
- *   5 CSV を作る側が CSV の鍵を持っている間は保存が待ち、その CSV (作った = 出ている) の列を変える保存は 409 csv_issued
+ *   5 CSV を作る側が CSV の鍵を持っている間は保存が待ち、その CSV (作った = 出ている) の列を変える保存も通る (🆕 10/19 = 編集は自由・0093)
  *   6 保存の途中で接続が切れた: 何も残らない (処理中の行を作らない) = 同じ request_id でもう一度保存できる
  *   7 切替の段階を変える取引 (排他の鍵) の途中は、保存が段階の共有の鍵で待つ
  *   8 構成の依頼を上げる × 単品の保存 (足す構成品): どちらが先でも、セットの値は新しい単品の値 / 後の保存は含むセットが増えたことに気づく
@@ -210,7 +210,7 @@ try {
     await assert.rejects(() => save(dbA, 'p002', { name: '直す' }, { token }), (e) => e.reason === 'version_conflict');
   });
 
-  await ta('[5] CSV を作る側が CSV の鍵を持っている間は保存が待つ → 作った CSV (出ている) の列は 409 csv_issued', async () => {
+  await ta('[5] CSV を作る側が CSV の鍵を持っている間は保存が待つ → 作った CSV (出ている) の列も保存できる (🆕 10/19 編集は自由・0093)', async () => {
     const token = await tokenOf('p001');
     await O.query('begin');
     await O.query("select pg_advisory_xact_lock(hashtext('ops.ne_csv'))");
@@ -222,7 +222,8 @@ try {
     assert.equal(a.done, false, '保存は CSV の鍵で待つ');
     await O.query('commit');
     const ra = await a.promise;
-    assert.equal(ra.err?.reason, 'csv_issued', ra.err?.message);
+    assert.equal(ra.err, undefined, ra.err?.message);
+    assert.equal((await O.query("select name from core.skus where code = 'p001'")).rows[0].name, 'CSV の後');
   });
 
   await ta('[6] 保存の途中で接続が切れた = 何も残らない (処理中の行なし) → 同じ request_id でもう一度保存できる', async () => {
