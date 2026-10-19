@@ -1380,3 +1380,22 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 .lbl-net .in { text-align: right; }
 #p-label .lbl-ph { flex-basis: 100%; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 @media (max-width: 760px) { #p-label .f { grid-template-columns: minmax(0, 1fr); gap: 6px; } #p-label .btn.sm { min-height: 44px; } }
+/* 🆕 10/19 商品の画面のタブ (views/sku.ejs・public/me-tabs.js): 小見出しとタブの帯をまとめて上の帯の下に残す (直す欄の途中からでも 1 回でグラフ・履歴へ)。
+   帯の高さは me-tabs.js が --sku-top-h に入れる = 右の保存の箱 (sticky) をその下に置く。狭い画面はタブを帯の中で横に送る (ページははみ出さない) */
+.sku-top { --gut: 28px; position: sticky; top: 58px; z-index: 30; margin: 0 calc(-1 * var(--gut)) 16px; background: rgba(7, 12, 23, 0.92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+.sku-top .stickyid { position: static; margin: 0; padding: 8px var(--gut); background: none; backdrop-filter: none; border-bottom: 1px solid var(--line-soft); }
+.sku-tabs { display: flex; gap: 4px; padding: 6px var(--gut) 0; overflow-x: auto; scrollbar-width: thin; }
+.sku-tab { flex: none; display: inline-flex; align-items: center; gap: 7px; height: 40px; padding: 0 14px; border: 0; border-bottom: 2px solid transparent; border-radius: 8px 8px 0 0; background: transparent; color: var(--text2); font: inherit; font-size: 14.5px; white-space: nowrap; cursor: pointer; }
+.sku-tab .ic { width: 16px; height: 16px; color: var(--muted); }
+.sku-tab small { color: var(--muted); font-size: 12px; margin-left: -4px; }
+.sku-tab:hover { color: #fff; background: rgba(255, 255, 255, 0.04); }
+.sku-tab[aria-selected="true"] { color: #fff; font-weight: 600; border-bottom-color: var(--accent); background: rgba(58, 231, 255, 0.08); }
+.sku-tab[aria-selected="true"] .ic { color: var(--accent); }
+.sku-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tab-dirty { color: var(--warn); font-size: 11px; margin-left: -2px; }
+.sku-tp:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 8px; }
+.sku-tp > .panel.moves:first-of-type { margin-top: 0; }
+#sku-page .side { top: calc(58px + var(--sku-top-h, 54px) + 12px); }
+@media (forced-colors: active) { .sku-tab[aria-selected="true"] { border-bottom-color: Highlight; } }
+@media (max-width: 1340px) { .sku-top { --gut: 20px; } }
+@media (max-width: 760px) { .sku-top { --gut: 12px; } .sku-tabs { gap: 2px; } .sku-tab { height: 44px; padding: 0 10px; } .sku-tab .ic, .sku-tab small { display: none; } }   /* スマホ = 3 つの名前が 1 行に入る (入らない幅は帯の中で横に送る) */

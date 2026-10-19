@@ -8,6 +8,7 @@
  *   - 一覧に無い (直して絞り込みに合わなくなった など) = 場所は「一覧に無い」・前へ・次へは押せない
  *   - パンくずの戻り先を、この商品が載る一覧のページ (offset) に直す (次へで次のページへ進んだ後も、戻るとその商品が見える)
  *   - キー (Alt + ← / →) は付けない: Windows の Chrome・Edge では「戻る・進む」なので重なる
+ *   - 🆕 10/19: 開いているタブ (me-tabs.js の #tab=…) を前へ・次へにも付ける = 続けて見ても同じタブ (タブを替えたら me-tabs.js がリンクを書き直す)
  */
 (function () {
   'use strict';
@@ -26,7 +27,7 @@
   qs.delete('offset');                        // ページ分けは見ない (一覧の全件の中の場所)
   qs.set('cur', code);
   var api = new URL('api/neighbors?' + qs.toString(), new URL(basePath, location.href)).href;
-  var skuHref = function (c) { return basePath + 'sku/' + encodeURIComponent(c); };
+  var skuHref = function (c) { return basePath + 'sku/' + encodeURIComponent(c) + (ME.tabHash ? ME.tabHash() : ''); };
   var num = function (n) { return Number(n).toLocaleString('ja-JP'); };
 
   function link(dir, c) {

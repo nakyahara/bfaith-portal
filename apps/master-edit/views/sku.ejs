@@ -142,11 +142,25 @@
         <a class="btn" href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>/history"><svg class="ic" aria-hidden="true"><use href="#i-history"/></svg>変更の記録</a>
       </div>
     </div>
+    <%# 🆕 10/19 中原さん「グラフとか入出庫履歴とか行くときにスクロールしないといけないからボタンかタブにしてほしい」:
+        画面をタブに分ける (public/me-tabs.js)。基本情報 = 直す欄と保存の箱 / 販売数のグラフ / 入出庫の履歴 (単品は月別のまとめも)。
+        タブの帯は小見出しと一緒に上の帯の下に残る (直す欄の途中からでも 1 回で行ける)。グラフ・履歴はそのタブを初めて開いたときに読む。
+        選んだタブはアドレスの #tab=… に残す (読み込み直す・戻る・前へ / 次へでも同じタブ)。タブを替えても欄の値はそのまま (隠すだけ) %>
+    <% const hasMoves = c.sku_kind === 'single' || isSet; %>
+    <div class="sku-top" id="sku-top">
     <div class="stickyid" id="sku-sticky" hidden>
       <span class="code-pill"><%= c.code %></span><span class="nm"><%= c.name %></span>
       <span class="right"><button class="unsaved" type="button" id="sticky-unsaved" hidden>● 未保存</button>
         <% if (editable('name')) { %><button class="btn sm" type="button" data-name-open>✎ 名前を直す</button><% } %></span>
     </div>
+    <div class="sku-tabs" id="sku-tabs" role="tablist" aria-label="この商品の画面">
+      <button type="button" class="sku-tab on" role="tab" id="tab-basic" data-tab="basic" aria-controls="tp-basic" aria-selected="true"><svg class="ic" aria-hidden="true"><use href="#i-edit"/></svg>基本情報<span class="tab-dirty" id="tab-basic-dirty" hidden><span aria-hidden="true">●</span><span class="sr">未保存の変更あり</span></span></button>
+      <button type="button" class="sku-tab" role="tab" id="tab-sales" data-tab="sales" aria-controls="tp-sales" aria-selected="false" tabindex="-1"><svg class="ic" aria-hidden="true"><use href="#i-cart"/></svg>販売数のグラフ</button>
+      <% if (hasMoves) { %><button type="button" class="sku-tab" role="tab" id="tab-moves" data-tab="moves" aria-controls="tp-moves" aria-selected="false" tabindex="-1"><svg class="ic" aria-hidden="true"><use href="#i-truck"/></svg>入出庫の履歴<% if (!isSet) { %><small>・月別</small><% } %></button><% } %>
+    </div>
+    </div>
+
+    <div class="sku-tp" id="tp-basic" role="tabpanel" aria-labelledby="tab-basic">
 
     <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= closedWhy %>)</div><div class="hint">見るだけです。切替日までは、この商品の正は NE・/register です。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
@@ -616,6 +630,9 @@
         </section>
       </aside>
     </form>
+    </div>
+    <%# タブ「販売数のグラフ」(初めて開いたときに読む = public/me-sales-chart.js が me:tabshown を待つ) %>
+    <div class="sku-tp" id="tp-sales" role="tabpanel" aria-labelledby="tab-sales" tabindex="0" hidden>
     <%# 🆕 販売数のグラフ (10/17 中原さん・参考 = 読むだけ)。グラフと表は画面の JS (public/me-sales-chart.js) が API (/api/sku/:code/sales-chart) から読んで描く。
         単品 = セットで売れた分も入れた数 + ロジザードの在庫の線 (別のグラフ・軸を 2 つにしない) / セット = そのセットとして売れた数 (在庫の線なし) %>
     <section class="panel moves sc" id="p-sales" aria-labelledby="h-sales" data-base="<%= base %>" data-code="<%= c.code %>" data-kind="<%= c.sku_kind %>">
@@ -639,8 +656,11 @@
       <details class="more sc-table" id="sc-table-box" hidden><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>表で見る (グラフと同じ数)</summary>
         <div class="tblwrap"><table class="tbl mv" id="sc-tbl"><caption class="sr">販売数 (新しい順)</caption><thead id="sc-thead"></thead><tbody id="sc-rows"></tbody></table></div>
       </details>
-      <div class="hint mv-notes" id="sc-notes">数える範囲 = Company DB に注文を入れているモール (楽天・Amazon (FBA も)・Yahoo!・その他 = au PAY・Qoo10・LINE ギフト・メルカリ)。卸・ほかの NE の店・FBA 納品は入りません = 上の「売れた数」(商品管理リスト) と少し違います · 今日は入れない (前日まで) · 注文は 2025-01 から (LINE ギフト 2026-02・Qoo10 2026-03 から) = それより前は空欄<%= isSet ? '' : ' · 在庫 = ロジザードの毎日の在庫 (その日の締め・倉庫だけ。FBA の在庫は入りません)' %></div>
+      <div class="hint mv-notes" id="sc-notes">数える範囲 = Company DB に注文を入れているモール (楽天・Amazon (FBA も)・Yahoo!・その他 = au PAY・Qoo10・LINE ギフト・メルカリ)。卸・ほかの NE の店・FBA 納品は入りません = 「基本情報」の「売れた数」(商品管理リスト) と少し違います · 今日は入れない (前日まで) · 注文は 2025-01 から (LINE ギフト 2026-02・Qoo10 2026-03 から) = それより前は空欄<%= isSet ? '' : ' · 在庫 = ロジザードの毎日の在庫 (その日の締め・倉庫だけ。FBA の在庫は入りません)' %></div>
     </section>
+    </div>
+    <%# タブ「入出庫の履歴」(単品 = 初めて開いたときに読む = public/me-moves.js が me:tabshown を待つ / セット = 構成品の画面へのリンク) %>
+    <% if (hasMoves) { %><div class="sku-tp" id="tp-moves" role="tabpanel" aria-labelledby="tab-moves" tabindex="0" hidden><% } %>
     <%# 🆕 入出庫の履歴と月別のまとめ (CompanyDB構想 26 の PR-1・PR-2・参考 = 読むだけ)。表は画面の JS (public/me-moves.js) が API から読んで描く。
         単品だけ (セットには在庫が無い = 構成品の画面へ・Q10 = a)。仕入・発注は発注アプリの権限がある人だけ (Q9 = a) %>
     <% if (c.sku_kind === 'single') { %>
@@ -668,9 +688,10 @@
     <section class="panel moves" id="p-moves" aria-labelledby="h-moves">
       <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-truck"/></svg></span><h2 id="h-moves">入出庫の履歴</h2></div>
       <div class="hint" id="mv-set">セットには在庫がありません (在庫は構成品が持ちます)。入出庫の履歴は構成品の画面で見ます<% if (c.components.length) { %>:
-        <% c.components.forEach((x, i) => { %><%= i ? ' · ' : '' %><a class="code" href="<%= base %>/sku/<%= encodeURIComponent(x.code) %>"><%= x.code %></a><% }) %><% } %></div>
+        <% c.components.forEach((x, i) => { %><%= i ? ' · ' : '' %><a class="code" href="<%= base %>/sku/<%= encodeURIComponent(x.code) %>#tab=moves"><%= x.code %></a><% }) %><% } %></div>
     </section>
     <% } %>
+    <% if (hasMoves) { %></div><% } %>
     <% if (typeof gone !== 'undefined' && gone && gone.show && gone.canGo && gone.canApprove && !dbError && !closed) { %>
     <div class="modal-bg" id="gone-bg">
       <div class="modal danger" role="alertdialog" aria-modal="true" aria-labelledby="gone-t" aria-describedby="gone-d">
@@ -685,6 +706,8 @@
   <% } %>
   </div>
   <%- include('_footer') %>
+  <%# 🆕 10/19: 画面のタブ (基本情報 / 販売数のグラフ / 入出庫の履歴)。いちばん先 = グラフ・履歴の JS より前に #tab=… のタブを開いておく (開いたタブだけ読む)・me-sku.js が MasterEdit.showTab を使う %>
+  <% if (page) { %><script src="<%= base %>/public/me-tabs.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 PR-7b: まとまりの操作の窓 (名前を直す・子の廃止・代表の採用) %>
   <% if (page && locals.variationOn && canEdit && !closed) { %><%- include('_vops') %><script src="<%= base %>/public/me-vops.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0084: メーカーの欄 (直せるときだけ・me-sku.js の前 = 未保存の「前 → 後」に名前を出す) %>

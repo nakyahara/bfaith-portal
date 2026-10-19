@@ -51,6 +51,9 @@
  *  77 新商品 (10/17): 「セット商品を作るか = 作る」の作るセットの表 (初めの値・付いていく・重なり / 0 行は ③ で止める・保留で隠す・保存で product-hub にセットの下書き)
  *  78 Amazon SKU を CSV でまとめて登録 (10/17): 試し取込 (Shift_JIS・表・絞る札・だめな理由・何も書かない)・保存 (DB に入る)・結果の CSV (BOM・式の注入の対策)・同じ CSV = 変わらない・390 ではみ出さない
  *  79 ⑤-1 商品の画面の先方品番・入数 (10/18): 足す → 保存 (発注アプリの対応表)・未保存に数える・直して保存・消す
+ *  80〜82 商品の画面のタブ (10/19): 基本情報 / 販売数のグラフ / 入出庫の履歴・role と aria・開いたタブだけ読む (1 回)・#tab=… (読み込み直す・戻る・# を打つ)・
+ *     ← → Home End・打った値と未保存はそのまま・Ctrl+S は基本情報で保存・前へ / 次へ・セットの構成品へのリンクも同じタブ・
+ *     帯は上に残る (保存の箱と開いた板は帯の下)・基本情報に戻るとスクロールの位置も戻る・スマホ 390 で 44px・はみ出さない
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -3417,6 +3420,181 @@ await ta('[79] ⑤-1 商品の画面の先方品番・入数 (CompanyDB構想 27
       assert.ok(await p.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), `${w} 幅で横にはみ出す`);
     }
   } finally { NSK.setNewSkuReaderForTest(null); }
+});
+
+// ── 🆕 10/19 中原さん「グラフとか入出庫履歴とか行くときにスクロールしないといけないからボタンかタブにしてほしい」= 商品の画面のタブ (public/me-tabs.js)
+const tabState = (p) => p.evaluate(() => ({
+  hash: location.hash,
+  sel: [...document.querySelectorAll('#sku-tabs [role="tab"]')].filter((t) => t.getAttribute('aria-selected') === 'true').map((t) => t.dataset.tab),
+  shown: [...document.querySelectorAll('[role="tabpanel"]')].filter((x) => !x.hidden).map((x) => x.id),
+}));
+/** 履歴・月別・グラフの API を読んだ回数 (開いたタブだけ読む) */
+function countReads(p) {
+  const n = { moves: 0, monthly: 0, sales: 0 };
+  p.on('request', (r) => {
+    const u = new URL(r.url()).pathname;
+    if (/\/api\/sku\/[^/]+\/movements$/.test(u)) n.moves++;
+    if (/\/api\/sku\/[^/]+\/monthly$/.test(u)) n.monthly++;
+    if (/\/api\/sku\/[^/]+\/sales-chart$/.test(u)) n.sales++;
+  });
+  return n;
+}
+
+await ta('[80] 商品の画面のタブ (10/19): 基本情報 / 販売数のグラフ / 入出庫の履歴・role と aria・開いたタブだけ読む (1 回だけ)・#tab=… に残る (読み込み直す・戻る・# を打つ)・← → Home End・タブを替えても打った値と未保存はそのまま・Ctrl+S は基本情報に戻して保存', async (p) => {
+  const n = countReads(p);
+  await p.goto(B + '/sku/s002');
+  await p.waitForLoadState('networkidle');
+  // 帯と板の印 (tablist・tab・tabpanel・aria-selected・aria-controls ⇔ aria-labelledby)
+  const a11y = await p.evaluate(() => [...document.querySelectorAll('#sku-tabs [role="tab"]')].map((t) => {
+    const tp = document.getElementById(t.getAttribute('aria-controls'));
+    const name = [...t.childNodes].filter((x) => !(x.classList && x.classList.contains('tab-dirty'))).map((x) => x.textContent).join('').trim();   // 未保存の印 (隠れている) は除く
+    return [t.dataset.tab, name, t.getAttribute('aria-selected'), t.tabIndex, tp && tp.getAttribute('role'), tp && tp.getAttribute('aria-labelledby') === t.id];
+  }));
+  assert.equal(await p.getAttribute('#sku-tabs', 'role'), 'tablist');
+  assert.deepEqual(a11y, [['basic', '基本情報', 'true', 0, 'tabpanel', true], ['sales', '販売数のグラフ', 'false', -1, 'tabpanel', true], ['moves', '入出庫の履歴・月別', 'false', -1, 'tabpanel', true]]);
+  assert.deepEqual(await tabState(p), { hash: '', sel: ['basic'], shown: ['tp-basic'] });
+  assert.deepEqual(n, { moves: 0, monthly: 0, sales: 0 }, '開いたとき = 隠れたタブ (グラフ・履歴) は読まない');
+  assert.equal(await p.isVisible('#f'), true);
+  // 打った値・未保存 → グラフのタブ (印は基本情報のタブにも)
+  const before = (await row('s002')).months;
+  await p.fill('#f-reorder_months', String(before + 2));
+  assert.equal(await dirty(p), 1);
+  assert.equal(await p.isVisible('#tab-basic-dirty'), true, '基本情報のタブに未保存の印');
+  await p.click('#tab-sales');
+  assert.deepEqual(await tabState(p), { hash: '#tab=sales', sel: ['sales'], shown: ['tp-sales'] });
+  await p.waitForFunction(() => document.getElementById('sc-sum').textContent !== '読んでいます…');
+  assert.deepEqual(n, { moves: 0, monthly: 0, sales: 1 }, 'グラフのタブを開いた = グラフだけ読む');
+  assert.equal(await p.isHidden('#f'), true);
+  assert.equal(await p.isVisible('#unsaved'), true, '上の帯の「未保存 N 件」は残る');
+  // キー: → = 入出庫の履歴 (フォーカスも)・→ = 先頭に回る・End / Home
+  await p.focus('#tab-sales');
+  await p.keyboard.press('ArrowRight');
+  assert.deepEqual(await tabState(p), { hash: '#tab=moves', sel: ['moves'], shown: ['tp-moves'] });
+  assert.equal(await active(p), 'tab-moves');
+  await p.waitForFunction(() => document.getElementById('mv-head').textContent !== '読んでいます…' && document.getElementById('mo-head').textContent !== '読んでいます…');
+  assert.deepEqual(n, { moves: 1, monthly: 1, sales: 1 }, '履歴のタブ = 履歴と月別を 1 回ずつ');
+  await p.keyboard.press('ArrowRight');
+  assert.deepEqual(await tabState(p), { hash: '', sel: ['basic'], shown: ['tp-basic'] }, '最後の → = 先頭 (基本情報 = # なし)');
+  assert.equal(await active(p), 'tab-basic');
+  await p.keyboard.press('ArrowLeft');
+  assert.deepEqual((await tabState(p)).sel, ['moves'], '先頭の ← = 最後');
+  await p.keyboard.press('Home');
+  assert.deepEqual((await tabState(p)).sel, ['basic']);
+  await p.keyboard.press('End');
+  assert.deepEqual((await tabState(p)).sel, ['moves']);
+  // 打った値・未保存の印はそのまま (隠しただけ)。行き来しても読み直さない
+  await p.click('#tab-basic');
+  assert.equal(await p.inputValue('#f-reorder_months'), String(before + 2));
+  assert.equal(await dirty(p), 1);
+  assert.equal(await p.locator('[data-row="reorder_months"].dirty').count(), 1, '欄の黄色い印も残る');
+  // 未保存のままアドレスの # を打つ (同じ画面の中の移り = 新しい履歴) = 離れるときの確認は出さない・そのタブ (Codex R1 High)
+  await p.evaluate(() => { location.hash = '#tab=moves'; });
+  await p.waitForTimeout(150);
+  assert.deepEqual((await tabState(p)).sel, ['moves']);
+  assert.equal(await p.locator('#leave-bg.on').count(), 0, '# を打っただけ = 聞かない');
+  assert.equal(await dirty(p), 1);
+  // ブラウザの戻る: 見張りの履歴へ戻っただけ = 聞かない (タブは戻る) → もう 1 回 = この画面の前へ = 今までどおり聞く
+  await p.goBack(); await p.waitForTimeout(150);
+  assert.equal(await p.locator('#leave-bg.on').count(), 0, '見張りの履歴へ戻っただけ = 聞かない');
+  assert.deepEqual((await tabState(p)).sel, ['basic']);
+  await p.goBack(); await p.waitForTimeout(200);
+  assert.equal(await p.locator('#leave-bg.on').count(), 1, 'この画面の前へ戻る = 聞く');
+  await p.click('#leave-stay');
+  assert.match(p.url(), /sku\/s002/);
+  assert.equal(await dirty(p), 1, 'ここに残る = 打った値はそのまま');
+  await p.click('#tab-sales'); await p.click('#tab-moves'); await p.click('#tab-basic');
+  await p.waitForTimeout(200);
+  assert.deepEqual(n, { moves: 1, monthly: 1, sales: 1 }, 'もう一度開いても読み直さない');
+  // 履歴のタブで Ctrl+S = 基本情報に戻して保存 (DB に入る)・読み直した後も基本情報
+  await p.click('#tab-moves');
+  await Promise.all([p.waitForNavigation(), p.keyboard.press('Control+s')]);
+  await p.waitForSelector('#saved-note');
+  assert.equal((await row('s002')).months, before + 2, '保存した');
+  assert.deepEqual(await tabState(p), { hash: '', sel: ['basic'], shown: ['tp-basic'] });
+  // # を打つ (同じ画面の #tab リンク) = そのタブ / 読み込み直す = 同じタブ (開いたらすぐ読む・グラフは読まない)
+  await p.goto(B + '/sku/s002#tab=moves');
+  assert.deepEqual(await tabState(p), { hash: '#tab=moves', sel: ['moves'], shown: ['tp-moves'] }, '# だけ変えた (hashchange)');
+  const n2 = countReads(p);
+  await p.reload();
+  await p.waitForLoadState('networkidle');
+  assert.deepEqual(await tabState(p), { hash: '#tab=moves', sel: ['moves'], shown: ['tp-moves'] }, '読み込み直しても同じタブ');
+  assert.deepEqual(n2, { moves: 1, monthly: 1, sales: 0 }, '開いているタブだけ読む');
+  // ほかの画面へ行って戻る = 同じタブ
+  await Promise.all([p.waitForNavigation(), p.click('.crumb a')]);
+  await p.goBack();
+  await p.waitForSelector('#sku-tabs');
+  assert.deepEqual((await tabState(p)).sel, ['moves'], '戻るでも同じタブ');
+  // 知らない名前 = 基本情報 (# を外す)
+  await p.goto(B + '/sku/s001#tab=zzz');
+  assert.deepEqual(await tabState(p), { hash: '', sel: ['basic'], shown: ['tp-basic'] });
+});
+
+await ta('[81] タブと前へ・次へ・セット・狭い画面 (10/19): 前へ・次へにも開いているタブを付ける (替えたら書き直す)・セットの履歴のタブから構成品の履歴のタブへ・帯は上に残り、保存の箱と開いた板の上端は帯の下・基本情報に戻るとスクロールの位置も戻る・スマホ 390 = 帯は 44px で横にはみ出さない', async (p) => {
+  await p.goto(B + '/?q=' + encodeURIComponent('はちみつ'));
+  const codes = await listCodes(p);
+  await Promise.all([p.waitForNavigation(), p.click(`a.rowlink:text-is("${codes[1]}")`)]);
+  await pnState(p);
+  await p.click('#tab-sales');
+  assert.match(await p.getAttribute('#pn-next', 'href'), new RegExp(`/sku/${codes[2]}#tab=sales$`));
+  await Promise.all([p.waitForNavigation(), p.click('#pn-next')]);
+  assert.deepEqual(await tabState(p), { hash: '#tab=sales', sel: ['sales'], shown: ['tp-sales'] }, '次の商品も同じタブ');
+  await pnState(p);
+  assert.match(await p.getAttribute('#pn-prev', 'href'), new RegExp(`/sku/${codes[1]}#tab=sales$`), '描いた時から付いている');
+  await p.click('#tab-basic');
+  assert.match(await p.getAttribute('#pn-prev', 'href'), new RegExp(`/sku/${codes[1]}$`), '基本情報 = # なし');
+  // セット: 履歴のタブ = 構成品へのリンク (構成品の画面も履歴のタブ)
+  await p.goto(B + '/sku/set001#tab=moves');
+  assert.deepEqual((await tabState(p)).sel, ['moves']);
+  assert.equal((await p.textContent('#tab-moves')).trim(), '入出庫の履歴', 'セットは月別なし');
+  await Promise.all([p.waitForNavigation(), p.click('#mv-set a:text-is("s001")')]);
+  assert.deepEqual((await tabState(p)).sel, ['moves']);
+  // 1440: 下へスクロール = 帯は上の帯 (58px) の下に残る・右の保存の箱は帯に隠れない → グラフ = 板の上端は帯の下 → 基本情報 = 元の位置
+  await p.goto(B + '/sku/s003');
+  await p.evaluate(() => window.scrollTo(0, 900));
+  await p.waitForTimeout(200);
+  const g = await p.evaluate(() => ({ field: document.getElementById('f-reorder_months').getBoundingClientRect().top, bar: document.getElementById('sku-top').getBoundingClientRect().toJSON(), side: document.querySelector('#tp-basic .side').getBoundingClientRect().top }));
+  assert.ok(Math.abs(g.bar.top - 58) < 1, `帯が上に残る ${g.bar.top}`);
+  assert.ok(g.side >= g.bar.bottom - 1, `保存の箱が帯に隠れない ${g.side} < ${g.bar.bottom}`);
+  await p.click('#tab-sales');
+  const s = await p.evaluate(() => ({ panel: document.getElementById('tp-sales').getBoundingClientRect().top, bar: document.getElementById('sku-top').getBoundingClientRect().bottom }));
+  assert.ok(s.panel >= s.bar - 1 && s.panel < s.bar + 40, `グラフの板の上端が帯のすぐ下 ${JSON.stringify(s)}`);
+  await p.click('#tab-basic');
+  await p.waitForTimeout(150);   // 小見出しが出る・消える (帯の高さ) の後の合わせ直しまで
+  const back = await p.evaluate(() => document.getElementById('f-reorder_months').getBoundingClientRect().top);
+  assert.ok(Math.abs(back - g.field) <= 2, `基本情報に戻ると同じ欄が同じ所に見える ${back} ≠ ${g.field}`);
+  if (process.env.MASTER_TABS_SHOT) await p.screenshot({ path: process.env.MASTER_TABS_SHOT });
+  // スマホ 390: 帯の中だけで横に送る (ページははみ出さない)・押す所は 44px
+  await p.setViewportSize({ width: 390, height: 844 });
+  await p.goto(B + '/sku/s003#tab=moves');
+  const m = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: innerWidth,
+    tabs: [...document.querySelectorAll('#sku-tabs [role="tab"]')].map((t) => Math.round(t.getBoundingClientRect().height)),
+    bar: document.getElementById('sku-tabs').getBoundingClientRect().right }));
+  assert.ok(m.doc <= m.view, `横にはみ出す ${m.doc} > ${m.view}`);
+  assert.ok(m.bar <= m.view + 0.5, `帯がはみ出す ${m.bar}`);
+  assert.ok(m.tabs.every((h) => h >= 44), `タブの高さ ${m.tabs}`);
+  await p.click('#tab-sales');
+  assert.deepEqual((await tabState(p)).sel, ['sales']);
+  if (process.env.MASTER_TABS_SHOT_SP) await p.screenshot({ path: process.env.MASTER_TABS_SHOT_SP });
+});
+
+await ta('[82] タブと戻るの見張り (10/19・Codex R2 Medium): 未保存 → アドレスに #tab=… を打つ → Ctrl+S で保存 (読み直し) → また直す → ブラウザの戻る = 今までどおり確認が出る', async (p) => {
+  await p.goto(B + '/');
+  await Promise.all([p.waitForNavigation(), p.click('a.rowlink:has-text("s003")')]);
+  const before = (await row('s003')).months;
+  await p.fill('#f-reorder_months', String(before + 1));
+  await p.evaluate(() => { location.hash = '#tab=sales'; });
+  await p.waitForTimeout(150);
+  assert.equal(await p.locator('#leave-bg.on').count(), 0, '# を打っただけ = 聞かない');
+  await Promise.all([p.waitForNavigation(), p.keyboard.press('Control+s')]);
+  await p.waitForSelector('#saved-note');
+  assert.equal((await row('s003')).months, before + 1, '保存した');
+  await p.fill('#f-reorder_months', String(before + 2));
+  assert.equal(await dirty(p), 1);
+  await p.goBack(); await p.waitForTimeout(200);
+  assert.equal(await p.locator('#leave-bg.on').count(), 1, '保存の後にまた直して戻る = 確認が出る');
+  await p.click('#leave-stay');
+  assert.equal(await dirty(p), 1, 'ここに残る = 打った値はそのまま');
+  assert.equal(await p.inputValue('#f-reorder_months'), String(before + 2));
 });
 
 await browser.close();
