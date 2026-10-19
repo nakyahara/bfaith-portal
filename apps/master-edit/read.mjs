@@ -14,7 +14,7 @@ import { salesOfCodes } from './sales-qty.mjs';
 import { checkDeadline, ListTimeoutError } from './deadline.mjs';
 import { normProductCode } from '../purchase-orders/db.js';
 import { TOKEN_RE } from './search-token.mjs';
-import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES, logizardLockOf } from '../../lib/master-write.mjs';
+import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, issuedCsv, OVERRIDE_SOURCES, logizardLockOf, regEditAfterIssue, REG_LOCK_AFTER_ISSUE } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
@@ -651,10 +651,12 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = null
 /**
  * 保存しても断られる欄 (画面は入力欄でなく 🔒 の値で見せる)。読むだけ = 保存の確かめ (lib/master-write.mjs) はそのまま。
  *   reg = 新商品の NE 登録の CSV を配った後 (issued / import_declared / partial) = REG_CSV_FIELDS の欄 (409 reg_csv_issued)。
- *         単品の税率はそれを含むセット (今の構成 + 開いている構成の依頼) の CSV にも入る = そのセットの CSV も見る
- *   csv = 既にある商品の NE に取り込む CSV (0040) が出ている列 (409 csv_issued・issuedCsv と同じ条件)
+ *         単品の税率はそれを含むセット (今の構成 + 開いている構成の依頼) の CSV にも入る = そのセットの CSV も見る。
+ *         🆕 0093 (2026-10-19 中原さん): 0093 の後の DB では閉じない (配った後も直せる = ほかの商品と同じ見た目)。0093 の前の DB だけ今までどおり 🔒
+ *   csv =既にある商品の NE に取り込む CSV (0040) が出ている列 (409 csv_issued・issuedCsv と同じ条件)
  *   (🆕 PR-7: 代表 (親) は保存の欄から外した = この画面では直さない・🔒 も出さない。代表は「色違い・サイズ違い」の欄に読むだけで出す)
- * 戻り値 = { fields: { 欄: { why: 'reg' | 'csv', exports: [番号] } }, regExports: [番号], taxParentCodes: [コード] }
+ *   reg_wait = 🆕 0093 の後もセットの構成 (依頼) だけは、そのセットの NE 登録の CSV の確かめが終わるまで閉じる (REG_LOCK_AFTER_ISSUE)
+ * 戻り値 = { fields: { 欄: { why: 'reg' | 'reg_wait' | 'csv', exports: [番号] } }, regExports: [番号], taxParentCodes: [コード] }
  */
 async function readFieldLocks(db, cur) {
   const fields = {};
@@ -670,8 +672,9 @@ async function readFieldLocks(db, cur) {
     const issued = ['issued', 'import_declared', 'partial'];
     const mine = (await db.query('select distinct export_id::text as id from ops.ne_reg_export_items where sku_id = $1 and state = any($2::text[]) order by 1', [cur.sku_id, issued])).rows.map((r) => r.id);
     regExports.push(...mine);
-    if (mine.length) for (const f of REG_CSV_FIELDS[kind] || []) put(f, 'reg', mine);
-    if (kind === 'single') {
+    const regLock = !(await regEditAfterIssue(db));   // 🆕 0093: 0093 の後の DB = 配った後も閉じない (セットの構成だけ確かめまで閉じる = REG_LOCK_AFTER_ISSUE)
+    if (mine.length) for (const f of (regLock ? REG_CSV_FIELDS[kind] : REG_LOCK_AFTER_ISSUE[kind]) || []) put(f, regLock ? 'reg' : 'reg_wait', mine);
+    if (regLock && kind === 'single') {
       const hasReq = await regclass(db, 'ops.sku_component_requests');
       const parents = (await db.query(`select distinct i.export_id::text as id, k.code from ops.ne_reg_export_items i join core.skus k on k.sku_id = i.sku_id
          where i.state = any($2::text[]) and (i.sku_id in (select c.parent_sku_id from core.sku_components c where c.child_sku_id = $1::bigint)
