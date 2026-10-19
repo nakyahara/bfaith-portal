@@ -73,6 +73,16 @@ await t('数の組み立て: モールの分け方・途中の期間・記録の
   assert.deepEqual([dd[89].from, dd[89].total, dd[89].stock.end, dd[88].stock.zeroDays, dd[87].stock], ['2026-10-17', 3, 6, 1, null]);
   assert.equal(dd.some((b) => b.partial), false, '日は途中にならない');
 });
+await t('測る道具 (0092・scripts/company-db/sales-chart-measure.mjs): 引数を埋めるのは数と日付の形だけ・計画の要約', async () => {
+  const M = await import('./company-db/sales-chart-measure.mjs');
+  assert.equal(M.bodyWith('select p_sku_id, p_from, xp_sku_id', 42), `select 42::bigint, date '2024-10-01', xp_sku_id`);
+  assert.throws(() => M.bodyWith('select p_sku_id', '1; drop table x'), /形が違う/);
+  assert.throws(() => M.bodyWith('select p_from', 1, "2024-10-01'; --"), /形が違う/);
+  const lines = M.planLines({ 'Node Type': 'Nested Loop', 'Actual Rows': 3, 'Actual Loops': 1, 'Shared Hit Blocks': 5, 'Shared Read Blocks': 1, Plans: [
+    { 'Node Type': 'Index Only Scan', 'Index Name': 'ix_orders_chart', 'Relation Name': 'orders', 'Actual Rows': 1, 'Actual Loops': 3, 'Shared Hit Blocks': 4, 'Shared Read Blocks': 0, 'Heap Fetches': 0 }] });
+  assert.deepEqual(lines, ['Nested Loop rows=3 loops=1 hit=5 read=1', '  Index Only Scan using ix_orders_chart on orders rows=1 loops=3 hit=4 read=0 heap_fetch=0']);
+  assert.deepEqual(M.CHART_INDEXES, ['ix_order_lines_listing_only_chart', 'ix_order_lines_sku_chart', 'ix_orders_chart']);
+});
 
 console.log('2 DB の関数 (PGlite)');
 const pg = new PGlite();
@@ -177,6 +187,50 @@ await t('master_edit は呼べる・注文の表は読めない・public の実�
   assert.ok(HEAVY_ENTRY_MANIFEST.some((e) => e.sig === SALES_CHART_FUNCTIONS[0] && e.cls === 'light' && e.public === false));
   const old = await all(`select count(*)::int as n from ops.sku_sales_daily($1::bigint, '1900-01-01')`, [ids.A]);
   assert.equal(old[0].n, 6, 'p_from が古すぎても 2025-01-01 から (2024-12-20 の注文は返さない)');
+});
+
+await t('速さ (0092): 関数の SQL は 3 つの索引を「索引だけで読む」(Index Only Scan) で読める (表の頁を読まない)・索引の形・2 表の autovacuum の設定', async () => {
+  const idx = Object.fromEntries((await all(`select c.relname as n, pg_get_indexdef(i.indexrelid) as def from pg_index i join pg_class c on c.oid = i.indexrelid
+    where c.relname in ('ix_order_lines_listing_only_chart', 'ix_order_lines_sku_chart', 'ix_orders_chart')`)).map((r) => [r.n, r.def.replace(/\s+/g, ' ')]));
+  assert.match(idx.ix_order_lines_listing_only_chart || '', /ON core\.order_lines USING btree \(listing_id\) INCLUDE \(company_id, order_id, qty, cancelled_qty\) WHERE \(\(listing_id IS NOT NULL\) AND \(sku_id IS NULL\) AND \(removed_at IS NULL\)\)/);
+  assert.match(idx.ix_order_lines_sku_chart || '', /ON core\.order_lines USING btree \(sku_id\) INCLUDE \(company_id, order_id, qty, cancelled_qty\) WHERE \(\(sku_id IS NOT NULL\) AND \(removed_at IS NULL\)\)/);
+  assert.match(idx.ix_orders_chart || '', /ON core\.orders USING btree \(order_id\) INCLUDE \(company_id, order_date_jst, mall, is_cancelled\)/);
+  const opts = await all(`select c.relname as n, array_to_string(c.reloptions, ',') as o from pg_class c join pg_namespace s on s.oid = c.relnamespace where s.nspname = 'core' and c.relname in ('orders', 'order_lines') order by 1`);
+  for (const r of opts) assert.equal(r.o, 'autovacuum_vacuum_scale_factor=0.02,autovacuum_vacuum_insert_scale_factor=0.02', r.n);
+  // 関数 (0086) の 3 つの読み方を同じ条件・同じ列で EXPLAIN する (見本の表は小さい = 関数のまま EXPLAIN すると planner が表を丸ごと読む形を選ぶ = 本番の大きさの計画は PR の測り方に書いた)。
+  // 表の頁を読む道 (seq / bitmap) を切って、index only scan の計画が立つ = 関数が読む列と条件が索引に収まっている (enable_indexscan は切らない = index only scan も一緒に切れる)
+  await pg.query('vacuum core.orders'); await pg.query('vacuum core.order_lines');
+  const one = async (sql) => (await all(sql))[0];
+  const { listing_id: lid } = await one(`select listing_id from core.order_lines where sku_id is null and removed_at is null limit 1`);
+  const { sku_id: sid, order_id: oid } = await one(`select sku_id, order_id from core.order_lines where sku_id is not null and removed_at is null limit 1`);
+  const shapes = [
+    ['ix_order_lines_listing_only_chart', 'order_lines', `select l.order_id, l.qty, l.cancelled_qty from core.order_lines l where l.listing_id = ${lid} and l.company_id = 1 and l.sku_id is null and l.removed_at is null`],
+    ['ix_order_lines_sku_chart', 'order_lines', `select l.order_id, l.qty, l.cancelled_qty from core.order_lines l where l.sku_id = ${sid} and l.company_id = 1 and l.removed_at is null`],
+    ['ix_orders_chart', 'orders', `select o.order_date_jst, o.mall, o.is_cancelled from core.orders o where o.order_id = ${oid} and o.company_id = 1
+      and o.order_date_jst >= greatest(date '2024-10-01', date '2025-01-01') and o.order_date_jst <= (pg_catalog.now() at time zone 'Asia/Tokyo')::date`],
+  ];
+  await pg.query('begin');
+  try {
+    for (const g of ['enable_seqscan', 'enable_bitmapscan']) await pg.query(`set local ${g} = off`);
+    for (const [name, rel, sql] of shapes) {
+      const plan = (await all(`explain (costs off) ${sql}`)).map((r) => r['QUERY PLAN']).join(' | ');
+      assert.match(plan, new RegExp(`^Index Only Scan using ${name} on ${rel}`), `${name}: ${plan}`);
+    }
+  } finally { await pg.query('rollback'); }
+  // 関数の本文が上の 3 つの形のまま (読む列・条件を変えたら、ここと索引を一緒に直す)
+  const src = (await one(`select prosrc from pg_proc where oid = 'ops.sku_sales_daily(bigint, date)'::regprocedure`)).prosrc.replace(/\s+/g, ' ');
+  for (const frag of ['select l.order_id, l.qty, l.cancelled_qty, up.mult, up.depth > 0 as via_set from up join core.order_lines l on l.sku_id = up.sku_id and l.company_id = 1 and l.removed_at is null',
+    'join core.order_lines l on l.listing_id = c.listing_id and l.company_id = 1 and l.sku_id is null and l.removed_at is null',
+    'select o.order_date_jst as d, o.mall, (s.qty - case when o.is_cancelled then s.qty else s.cancelled_qty end)::bigint * s.mult as n, s.via_set from src s join core.orders o on o.order_id = s.order_id where o.company_id = 1 and o.order_date_jst >= greatest(p_from, date \'2025-01-01\')']) {
+    assert.ok(src.includes(frag), frag);
+  }
+  assert.match(src, /src as materialized \(.* order by order_id -- /, '明細の集まりを注文の番号の順に (0092)');
+  // 0092 の関数 = 0086 の写し + 2 か所 (materialized・order by) だけ = 数え方は 0086 と同じ
+  const { readFileSync } = await import('node:fs');
+  const fnOf = (f) => readFileSync(new URL(`../db/company/migrations/${f}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n').match(/create (?:or replace )?function ops\.sku_sales_daily[\s\S]*?\n\$\$;/)[0];
+  const strip = (s) => s.replace('create or replace function', 'create function').replace('src as materialized (', 'src as (').replace(/\n\s*order by order_id\s+--[^\n]*/, '');
+  assert.equal(strip(fnOf('0092_sku_sales_chart_indexes.sql')), fnOf('0086_sku_sales_chart.sql'));
+  assert.deepEqual((await asEditor(() => fnRows(ids.S))).map((r) => [r.d, r.mall, r.q, r.v]), [['2026-10-10', 'yahoo', 1, 1], ['2026-10-15', 'amazon', 1, 0]], '数は同じ (上の数え方の試験と同じ)');
 });
 
 console.log('3 API (本物の router)');
