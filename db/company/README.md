@@ -2898,7 +2898,20 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   6. 商品の画面 (`/apps/master-edit/sku/0726-001931`) でグラフが出るのを見る。測った時間をこの節に書き足す
 - 試験 = `node scripts/test-master-sales-chart.mjs` (「速さ (0092)」= 索引の形・関数と同じ条件と列で Index Only Scan の計画が立つ・関数の本文が同じ形・数は同じ / 測る道具の純粋な関数)
 
-### NE へ送る = 自社で直したけれど今朝の NE と違う欄だけを CSV にする (0093 仮番号・AI_reference CompanyDB構想/25 の PR-2・2026-10-19 中原さんの方針の変更)
+### NE 登録の CSV を配った後も NE に送る欄を直せる (0093・2026-10-19 中原さん「名前修正できるようにしてよ … 毎回修正できないとかが多すぎて使えない」)
+- **なぜ外してよいか**: 翌朝の照合の確かめ (`ops.record_ne_registration_check`・0065 の版) は、NE の観測を品目の行の期待値 (`ops.ne_reg_export_items.expected` = 作ったときに固めた値・trigger で変えられない) と比べる。
+  今の Company DB と比べるのは代表 (親) だけ (`ops.ne_reg_cdb_compare`) で、代表は 0065 の「一度でも配ったら変えない」が別に守る = 配った後に今の値を直しても確かめは壊れない (NE が配った CSV の値なら verified)。
+  確かめの後の NE と Company DB の差は、毎朝の照合 ② の値の差 (持ち主が Company DB の列 = rule・company_owned = NE を Company DB の値に) として出て、今までどおり「マスタの判断 → NE に取り込む CSV」(0040) で送る
+- **関数を作り直す** (どれも前の最後の版を写して 🆕 0093 の行だけ変えた・値は変えない): `ops.ne_reg_supersede_built` (0053 の版 = 配った後の品目があっても作っただけのファイルは使わないにする・`issued` は知らせるだけ)・
+  `ops.edit_sku_jan` (0080 の版)・`ops.deactivate_supplier` (0053 の版) から `reg_csv_issued` の断りを外す・`ops.guard_reg_csv_live` (0053 の版) = 断るのは作っただけ (built) の商品だけ (理由 `reg_csv_built`)。ただし**セットの構成の依頼**は今までどおり確かめが終わるまで断る (確かめは配った構成と NE を比べる = 先に NE の構成を直すと partial のまま止まる・Codex R1 Medium・アプリは `REG_LOCK_AFTER_ISSUE`)。
+  印 `ops.reg_csv_edit_after_issue()` = アプリが `to_regprocedure` で「0093 の後か」を見る (0093 の前の DB = アプリは今までどおり 409 `reg_csv_issued`・画面は 🔒 = アプリを先に出してもよい)
+- **変えない**: NE に取り込む CSV (0040) の `csv_issued` の断り (確かめに期待値の写しが無い = 設計 25 PR-2)・代表 (親) の 0065 の断り・ロジザードの最初の値 (0062)・品目の行と期待値・作る関数の「まだ終わっていないファイルがある」
+- 画面 = 商品の画面は、配った後もほかの商品と同じ見た目 (入力欄・案内のカードなし・セットの構成だけ「確かめが終わると直せます」の 1 行)。単品の税率を変えて、それを依頼だけに入れた新しいセットの CSV を配った後なら、保存の答えに「NE の画面でセットの税率を確かめる」を出す (照合 ② はセットの税率を比べない・Codex R1 High)。一括の変更も止める理由にしない。まだ配っていない (built) ファイルは、直すと今までどおり自動で使わないになる
+- 当て方 (🚨 まだ流さない): 0087〜0092 を各節の手順で先に当てる → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を作り直すだけ) → 中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま)
+- 試験 = `node scripts/test-master-reg-csv.mjs` ([C5] 配った後に直せる・期待値はそのまま・0093 の前の DB は 409 / [C7] 名前を直したまま verified / [D4] 直接の書き込み / [S3] 付け替え / [H] 画面) /
+  `scripts/test-master-compare-ne.mjs` ([42] 名前を直した新商品 = verified + ② の値の差 = rule・company_owned)
+
+### NE へ送る = 自社で直したけれど今朝の NE と違う欄だけを CSV にする (0094 仮番号・AI_reference CompanyDB構想/25 の PR-2・2026-10-19 中原さんの方針の変更)
 - **なぜ**: 商品の画面で原価・売価などを直しても、NE には翌朝の照合 → マスタの判断 → 列ごとの CSV を通さないと届かなかった (遅い・手間・出ている CSV の列は直せない)。
   10/19 中原さん「シンプルに自由に編集できて、取り込み時に照合して差分がある部分を CSV で 1 日 1 回アップしたらよくない？あとは都度都度アップできるみたいな機能と 2 種類あればいい」
   → **編集は自由** (NE に取り込む CSV (0040) が出ている列も保存を止めない・`lib/master-write.mjs` の 6.)・**毎朝、差の CSV を作る** (daily-sync の段「NEへ送る」)・**画面でいつでも作る** (PR-3 の画面「NEへ送る」)・
@@ -2924,9 +2937,9 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - **守り**: 表へは関数の中でだけ書ける (印 `ops.ne_upd_protocol`・持ち主のロールでも)・行と中身は書き換えない・消さない (状態・結果の列だけ・終わったファイル / 回は戻さない・que_id は変えない)。
   鍵 = `ops.ne_upd` (排他) → NE のコードの共有 → NE の値の共有 → ロジザードの書き方の共有 (record_ne_values / record_ne_codes / record_lz_codes はこの鍵を取らない = 輪にならない・保存とは鍵を共有しない)。
   **master_edit (画面) = 一覧・商品の差・今すぐの頼み・受け取り・試しの記録の実行だけ / watch_writer (送り手) = 作る・結果・待ちの一覧・生存・一覧の実行だけ / watcher = 表を読むだけ**
-- 当て方 (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後): 番号をマージの順に付け替え → **アプリが先** (マージ → Render と miniPC を同じ build に。0093 の前は送り手が「migration の前」で何もしない・保存は自由になる) →
+- 当て方 (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後): 番号をマージの順に付け替え → **アプリが先** (マージ → Render と miniPC を同じ build に。0094 の前は送り手が「migration の前」で何もしない・保存は自由になる) →
   `migrate.mjs --dry-run` (この 1 本だけ・表と関数を足すだけ・今のデータは変えない) → 中原さんの OK → 本適用 → `create-master-edit-roles.mjs` と `create-watch-roles.mjs` を流し直す
-  (0093 の中でもロールがあれば実行権を付ける = 流し直しは決まりの姿にそろえるため) → 翌朝の「NEへ送る」の 1 行 (差 N 欄) を見る → 画面で CSV を作って NE で取り込む →
+  (0094 の中でもロールがあれば実行権を付ける = 流し直しは決まりの姿にそろえるため) → 翌朝の「NEへ送る」の 1 行 (差 N 欄) を見る → 画面で CSV を作って NE で取り込む →
   中原さんが NE の実物で空欄を試す (設計 25 §2.9・欄ごとの結果を画面の「試しの結果を残す」で) → (API を使うなら) NE のアクセス情報を確かめる → `.env` に `NE_UPDATE_UPLOAD=1` → 今すぐ送るのタスク → 様子を見て `NE_UPDATE_AUTO=1`
 - 試験 = `node scripts/test-ne-update.mjs` (差・書き方・作る・空欄 (入口ごと)・毎朝の上限・翌朝・stuck・受け取り・送り手 (API は既定で呼ばない・断った / 受付が分からない)・権限) /
   本物の PG = `test-ne-update-pg.mjs` (record_ne_values・record_ne_codes と待ち合ってもデッドロックしない・同じ朝の自動を 2 回作らない・頼みは 1 つ) /

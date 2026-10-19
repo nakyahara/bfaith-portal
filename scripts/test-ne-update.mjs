@@ -1,5 +1,5 @@
 /**
- * test-ne-update.mjs — NE へ送る (migration 0093・AI_reference CompanyDB構想/25 の PR-2・2026-10-19 の方針 = 編集は自由・自社 ≠ 今朝の NE の欄だけを CSV にして NE の API で上げる)
+ * test-ne-update.mjs — NE へ送る (migration 0094・AI_reference CompanyDB構想/25 の PR-2・2026-10-19 の方針 = 編集は自由・自社 ≠ 今朝の NE の欄だけを CSV にして NE の API で上げる)
  *
  * 固定する契約:
  *   [M] migration: security definer の関数 = search_path = pg_catalog, pg_temp・public の実行権なし・一時の表なし・既にある表と関数を作り直さない
@@ -686,7 +686,7 @@ await ta('[P2] 画面のロールで呼べる (overview・頼み)・送り手の
   assert.ok(['built', 'empty'].includes(b.state), JSON.stringify(b));
   await settleAll(2);
 });
-await ta('[P3] ロールが先・0093 が後 (本番の当て方) でも同じ実行権 (migration の中で付ける = ロールの流し直しを待たない)', async () => {
+await ta('[P3] ロールが先・0094 が後 (本番の当て方) でも同じ実行権 (migration の中で付ける = ロールの流し直しを待たない)', async () => {
   const pg2 = new PGlite();
   await pg2.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
   await pg2.query(`alter database ${(await pg2.query('select current_database() as d')).rows[0].d} owner to deploy`);

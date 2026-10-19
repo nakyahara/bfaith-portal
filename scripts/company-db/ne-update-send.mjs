@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * ne-update-send.mjs — NE へ送る (AI_reference CompanyDB構想/25・2026-10-19 の方針 = 編集は自由・自社 ≠ 今朝の NE の欄だけを CSV にする・migration 0093)
+ * ne-update-send.mjs — NE へ送る (AI_reference CompanyDB構想/25・2026-10-19 の方針 = 編集は自由・自社 ≠ 今朝の NE の欄だけを CSV にする・migration 0094)
  *
  * miniPC の送り手。
  *   --daily   = 毎朝の daily-sync の段「NEへ送る」(照合 ② とロジザードの影の後)。今朝の差の CSV を 1 回だけ作る (ops.ne_upd_build('auto'))。
@@ -14,7 +14,7 @@
  *   アプリの「アクセス情報」に 商品マスタ / セット商品マスタのアップロード (とキューを聞くならアップロードキューの検索) の許可が要る (無い = 006001 / 004001)
  *   API がはっきり断った (result = error) = failed (もう一度送れる) / 通信が切れた・応答が読めない = unknown (受付が分からない = 自動では送り直さない・翌朝の照合を待つ)
  *   同じファイルは作った送り手が作った時の 1 回だけ上げる (DB が claimed で守る・前の答えにバイト列は無い)
- * env: COMPANY_DB_WATCH_WRITER_URL (watch_writer = 0093 で ops.ne_upd_build ほかの実行を渡してある)・NE_CLIENT_ID / NE_CLIENT_SECRET (apps/warehouse/ne-api.js)
+ * env: COMPANY_DB_WATCH_WRITER_URL (watch_writer = 0094 で ops.ne_upd_build ほかの実行を渡してある)・NE_CLIENT_ID / NE_CLIENT_SECRET (apps/warehouse/ne-api.js)
  * 使い方: node -r dotenv/config scripts/company-db/ne-update-send.mjs --daily | --pending [--json]
  * 最後の行 = まとめの 1 行 (daily-sync が朝のまとめに出す)。DB に届かない・NE が断った = ❌ (exit 1)。差なし・多すぎ = exit 0
  */
@@ -67,7 +67,7 @@ export async function realNeClient() {
   };
 }
 
-/** 関数があって、この接続のロールが実行できるか (0093 の前・ロールの流し直しの前 = 何もしない) */
+/** 関数があって、この接続のロールが実行できるか (0094 の前・ロールの流し直しの前 = 何もしない) */
 async function ready(db) {
   for (const f of FNS) {
     const s = (await db.query(`select case when to_regprocedure($1::text) is null then 'not_applied'
@@ -167,7 +167,7 @@ export function lineOf(how, b, uploads, { upload = false } = {}) {
  */
 export async function runNeUpdateSend({ db, ne = null, mode, env = process.env, host = os.hostname(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)), waitMs = QUE_WAIT_MS }) {
   const r0 = await ready(db);
-  if (r0 !== 'ok') return { code: 0, line: `⏭️ ${STEP_NAME}: ${r0 === 'not_applied' ? 'Company DB にまだ仕組みが無い (migration 0093 の前)' : 'ロールの流し直しの前 (実行権が無い)'}`, sends: [] };
+  if (r0 !== 'ok') return { code: 0, line: `⏭️ ${STEP_NAME}: ${r0 === 'not_applied' ? 'Company DB にまだ仕組みが無い (migration 0094 の前)' : 'ロールの流し直しの前 (実行権が無い)'}`, sends: [] };
   const uploadOn = on(env, UPLOAD_ENV) && !!ne;
   const autoUpload = uploadOn && on(env, AUTO_ENV);
   const queCheck = uploadOn && on(env, QUE_CHECK_ENV);

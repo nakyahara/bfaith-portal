@@ -1,4 +1,4 @@
--- 0093 (仮の番号・マージの時に付け替える): NE へ送る = 自社で直したけれど、まだ今朝の NE と違う欄だけを CSV にして NE に上げる
+-- 0094 (仮の番号・マージの時に付け替える): NE へ送る = 自社で直したけれど、まだ今朝の NE と違う欄だけを CSV にして NE に上げる
 --   (AI_reference CompanyDB構想/25 の PR-2・2026-10-19 の方針の変更 = 中原さん「シンプルに自由に編集できて、取り込み時に照合して差分がある部分を CSV で 1 日 1 回アップ・都度アップも」)
 --
 -- なぜ: 商品の画面で原価・売価などを直しても、NE には翌朝の照合 → マスタの判断 → 列ごとの CSV を通さないと届かない (遅い・手間・直せない時間が長い)。
@@ -33,15 +33,15 @@
 -- ═══════════ 0. 前提 ═══════════
 do $$ begin
   if pg_catalog.to_regclass('ops.master_ne_values_mark') is null or pg_catalog.to_regclass('ops.master_lz_codes_mark') is null then
-    raise exception '0093 の前提: 今朝の NE の値・ロジザードの書き方 (0083) が無い';
+    raise exception '0094 の前提: 今朝の NE の値・ロジザードの書き方 (0083) が無い';
   end if;
   if pg_catalog.to_regclass('ops.ne_del_items') is null or pg_catalog.to_regclass('ops.ne_reg_export_items') is null or pg_catalog.to_regclass('ops.master_registrations') is null then
-    raise exception '0093 の前提: 登録の状態 (0052)・NE 登録の CSV (0053)・NE から消す CSV (0072) が無い';
+    raise exception '0094 の前提: 登録の状態 (0052)・NE 登録の CSV (0053)・NE から消す CSV (0072) が無い';
   end if;
   if pg_catalog.to_regprocedure('ops.master_ownership_active_map()') is null or pg_catalog.to_regprocedure('ops.ownership_hash(jsonb)') is null then
-    raise exception '0093 の前提: DB の active の持ち主 (0055 / 0058) が無い';
+    raise exception '0094 の前提: DB の active の持ち主 (0055 / 0058) が無い';
   end if;
-  if pg_catalog.to_regclass('ops.ne_upd_sends') is not null then raise exception '0093: ops.ne_upd_sends がもうある (別の migration が同じ名前を使った?)'; end if;
+  if pg_catalog.to_regclass('ops.ne_upd_sends') is not null then raise exception '0094: ops.ne_upd_sends がもうある (別の migration が同じ名前を使った?)'; end if;
 end $$;
 
 -- ═══════════ 1. 表 ═══════════
@@ -69,7 +69,7 @@ create table ops.ne_upd_sends (
   constraint ck_nus_built check ((state in ('waiting', 'held', 'empty')) or built_at is not null)
 );
 create index ix_ne_upd_sends_state on ops.ne_upd_sends (state, send_id);
-comment on table ops.ne_upd_sends is '🆕 0093 (設計 25 PR-2・10/19 の方針): NE へ送る 1 回。書くのは ops.ne_upd_* の関数だけ';
+comment on table ops.ne_upd_sends is '🆕 0094 (設計 25 PR-2・10/19 の方針): NE へ送る 1 回。書くのは ops.ne_upd_* の関数だけ';
 
 create table ops.ne_upd_files (
   file_id        bigint generated always as identity primary key,
@@ -148,7 +148,7 @@ create table ops.ne_upd_workers (
   version       text check (version is null or pg_catalog.length(version) <= 100)
 );
 
--- 表の守り: 書くのは 0093 の関数の中だけ (印 ops.ne_upd_protocol = '1')・消さない・行と中身は書き換えない (状態・結果の列だけ)
+-- 表の守り: 書くのは 0094 の関数の中だけ (印 ops.ne_upd_protocol = '1')・消さない・行と中身は書き換えない (状態・結果の列だけ)
 create function ops.guard_ne_upd_write() returns trigger language plpgsql set search_path = pg_catalog, pg_temp as $$
 declare
   v_keep text[];

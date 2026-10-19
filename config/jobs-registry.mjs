@@ -494,7 +494,7 @@ export const JOBS_REGISTRY = [
       + '要確認が 500 件を超える = 一覧は出さない (ops.quarantine_confirm_list の上限)・0079 の前 = 確かめの表は出さない・読めない / 届かない = ⚠️「読めない」(exit 0 = 止めない・再試行に載せない・その朝だけ見出しが ⚠️)。'
       + '🆕 2026-10-16 (中原さん): まとめの最後に「⚠️ NE の商品コードの書き方 N 件」= その朝の「ロジザード毎日の商品マスタ(影)」の報告 (report.json の classes.invalid のうち code_collided・lz_case_collision・code_invalid・norm_collided) を商品と直し方つきで (10 行 + ほか N 件・apps/master-decisions/lz-code-notice.mjs)。'
       + '段ではない (見出しの ✅ / ⚠️・retry は変えない・lz-daily の合否も変えない)。この回の証跡 lz-daily で sha256 が合うときだけ・読めない = 何も出さない。'
-      + '🆕 2026-10-19 (Company DB構想 25・中原さん「差分がある部分を CSV で 1 日 1 回アップ」・migration 0093): 「ロジザード毎日の商品マスタ(影)」の後に「NEへ送る」(scripts/company-db/ne-update-send.mjs --daily。新しい定期実行ではない・この台帳の ping に乗る)。'
+      + '🆕 2026-10-19 (Company DB構想 25・中原さん「差分がある部分を CSV で 1 日 1 回アップ」・migration 0094): 「ロジザード毎日の商品マスタ(影)」の後に「NEへ送る」(scripts/company-db/ne-update-send.mjs --daily。新しい定期実行ではない・この台帳の ping に乗る)。'
       + '自社で直したけれど今朝の NE と違う欄だけの CSV を作り、差の数と欄の内訳を 1 行で出す (中原さんがポータルの「NEへ送る」で CSV を作って NE の画面で取り込む)。'
       + 'NE の API で上げる口は既定で止めてある (miniPC の .env に NE_UPDATE_UPLOAD=1 と NE_UPDATE_AUTO=1 で開く・1 ファイル 1 回・キューの結果は NE_UPDATE_QUE_CHECK=1 のときだけ 1 回)。'
       + '多すぎる朝 (100 欄を超える・ふだんの 5 倍) は作らない (⚠️ 止めました・exit 0)。照合が失敗した朝は流さない (⏭️)。同じ今朝の NE の回で 2 回目は前の答え = 再試行に載せない。API を開けた朝に NE が断った = ❌ (exit 1)。'

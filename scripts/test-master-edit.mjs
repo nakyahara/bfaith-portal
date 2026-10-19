@@ -760,7 +760,7 @@ await ta('[9] 「今日」は東京の日付 (UTC 14:59:59 と 15:00 の境目�
 
 console.log('\nNE に取り込む CSV');
 
-await ta('[10] 🆕 10/19 (0093): NE に取り込む CSV (0040) が出ている列も保存できる (編集は自由・直した値は「NE へ送る」が次に送る)・CSV の予約は保存で変えない', async () => {
+await ta('[10] 🆕 10/19 (0094): NE に取り込む CSV (0040) が出ている列も保存できる (編集は自由・直した値は「NE へ送る」が次に送る)・CSV の予約は保存で変えない', async () => {
   const mk = async (state) => {
     const extra = state === 'declared' ? ', checked_at, checked_run, declared_at, declared_by' : '';
     const vals = state === 'declared' ? ", now(), 'mc_20300101T000000000Z_abcdef', now(), 'x@test'" : '';
