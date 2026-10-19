@@ -180,7 +180,7 @@ await ta('[S3] API: 名簿に無い = 403・今すぐ = 頼みを積む・CSV �
   assert.equal(d.headers.get('x-content-sha256'), crypto.createHash('sha256').update(buf).digest('hex'));
   // 受け取った = 送っている途中 (画面の一言)
   const after = await page('/ne-update');
-  assert.match(bodyText(after), /この欄は今送っている途中です \(NE に取り込めば、明日の朝に一覧から消えます\)/);
+  assert.match(bodyText(after), /この欄は送っている途中です \(CSV を NE に取り込めば、明日の朝に一覧から消えます\)/);
   assert.match(after, new RegExp(`data-dl="${id}"`), '今日作った CSV をもう一度ダウンロードできる');
   assert.doesNotMatch(bodyText(after), /#\d|ファイル #|ne-update-products/, 'ファイル番号・ファイル名は本文に出さない');
   EMAIL = 'edit@test';
@@ -223,7 +223,7 @@ else {
       const p = await ctx.newPage();
       const errors = []; p.on('pageerror', (e) => errors.push(e.message));
       p.on('console', (m) => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) errors.push(m.text()); });   // 4xx は下の response で (favicon.png はこの試験の app に無い)
-      p.on('response', (r) => { if (r.status() >= 400 && !/favicon/.test(r.url())) errors.push(`${r.status()} ${r.url()}`); });
+      p.on('response', (r) => { if (r.status() >= 400 && !/favicon/.test(r.url()) && !(r.status() === 409 && /\/download$/.test(r.url()))) errors.push(`${r.status()} ${r.url()}`); });   // 409 = 下でわざと断られる受け取り
       try {
         await p.goto(`${B}/ne-update`);
         const [dl] = await Promise.all([p.waitForEvent('download', { timeout: 15000 }), p.click('#nu-csv')]);
@@ -235,7 +235,14 @@ else {
         await p.goto(`${B}/ne-update`);
         if (process.env.NEUPD_SHOT) await p.screenshot({ path: process.env.NEUPD_SHOT, fullPage: true });   // 見た目を人が見るとき (試験の判定には使わない)
         await p.click('#nu-send');
-        await p.waitForFunction(() => /NE へ送る頼みを受け付けました/.test(document.querySelector('#nu-msg')?.textContent || ''), null, { timeout: 15000 });
+        await p.waitForFunction(() => /NE へ送る頼みを受け付けました|この頼みはもう済んでいます/.test(document.querySelector('#nu-msg')?.textContent || ''), null, { timeout: 15000 });
+        // 今日の CSV (1300) は、値を 1400 に直した後 = DB が断る → そのボタンを外して作り直しを案内
+        const n0 = await p.locator('#nu-files [data-dl]').count();
+        assert.ok(n0 >= 1, '今日の CSV のボタン');
+        await p.locator('#nu-files [data-dl]').first().click();
+        await p.waitForFunction(() => /もう一度「CSV を作る」/.test(document.querySelector('#nu-msg')?.textContent || ''), null, { timeout: 15000 });
+        assert.equal(await p.locator('#nu-files [data-dl]').count(), n0 - 1);
+        assert.equal(await p.locator('#nu-csv').isDisabled(), false, '断られた後も作れる');
         assert.deepEqual(errors, []);
       } finally { await ctx.close(); }
     });

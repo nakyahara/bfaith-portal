@@ -1,8 +1,10 @@
 /*
  * me-neupd.js — 「NEへ送る」の画面の動き (views/ne-update.ejs・lib/master-ne-update.mjs・0094)
- *   - 「今すぐ NE へ送る」= POST /api/ne-update/send-now (頼みを積む = miniPC の送り手が数分で上げる)
  *   - 「CSV を作る (NE にアップする用)」= POST /api/ne-update/csv → 作ったファイルを 1 つずつ「ダウンロード」(POST /api/ne-update/files/:id/download・sha256 を照らしてから保存)
+ *   - 「今すぐ NE へ送る」(API の口が開いているときだけ) = POST /api/ne-update/send-now (頼みを積む = miniPC の送り手が数分で上げる)
+ *   - 押している間 (作る・受け取る・頼む) は全部のボタンを止める (二重に押さない)。通信は 30 秒で打ち切る
  *   - 通信が分からないまま終わった = 同じ request_id で送り直す (2 回作らない・2 回頼まない)
+ *   - 受け取りを DB が断った (作った後に値が変わった・もう出した) = そのボタンを外して「もう一度 CSV を作る」を案内
  *   - (名簿の人だけ) NE の実物の試しの結果 = POST /api/ne-update/verified
  */
 (function () {
@@ -12,6 +14,7 @@
   if (!dataEl) return;
   var P = JSON.parse(dataEl.textContent || 'null');
   if (!P) return;
+  var TIMEOUT_MS = 30000;
   var busy = false;
   // 押した番号 (結果が分からないまま画面を開き直しても同じ番号で送り直す = 2 回作らない・頼まない)
   var KEY = 'me-neupd-pending';
@@ -24,8 +27,21 @@
     var h = Array.prototype.map.call(b, function (x) { return x.toString(16).padStart(2, '0'); }).join('');
     return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
   }
+  /** 押している間は全部のボタンを止める */
+  function lock(on) {
+    busy = on;
+    Array.prototype.forEach.call(document.querySelectorAll('#nu-csv, #nu-send, #nu-files button'), function (b) {
+      if (on) { b.setAttribute('data-was', b.disabled ? '1' : ''); b.disabled = true; } else { b.disabled = b.getAttribute('data-was') === '1'; b.removeAttribute('data-was'); }
+    });
+  }
+  function timed(url, opts) {
+    var ac = window.AbortController ? new AbortController() : null;
+    var t = ac ? setTimeout(function () { ac.abort(); }, TIMEOUT_MS) : null;
+    if (ac) opts.signal = ac.signal;
+    return fetch(url, opts).finally(function () { if (t) clearTimeout(t); });
+  }
   function post(url, body) {
-    return fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) })
+    return timed(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) })
       .then(function (r) { return r.json().catch(function () { return null; }).then(function (j) { return { r: r, j: j }; }); });
   }
   /** 結果がはっきりしたか (ok か、4xx の断り)。分からない = もう一度押せば同じ番号で送り直す */
@@ -36,68 +52,84 @@
   if (send) send.addEventListener('click', function () {
     if (busy) return;
     pending.send = pending.send || uuid(); keep();
-    busy = true; send.disabled = true; msg('送るように頼んでいます…');
+    lock(true); msg('NE へ送る頼みを出しています…');
     post(P.base + '/api/ne-update/send-now', { request_id: pending.send }).then(function (x) {
-      busy = false;
-      if (!sure(x)) { send.disabled = false; msg('頼めたか分かりません。もう一度押してください (同じ頼みとして送り直します)', 'err'); return; }
+      lock(false);
+      if (!sure(x)) { msg('頼めたか分かりません。もう一度押してください (同じ頼みとして送り直します)', 'err'); return; }
       pending.send = null; keep();
-      send.disabled = false;
       if (!x.r.ok || !x.j.ok) { msg(x.j.error || ('できませんでした (' + x.r.status + ')'), 'err'); return; }
-      msg('NE へ送る頼みを受け付けました。数分のうちに送ります (NE に入った分は、翌朝 NE と同じになれば一覧から消えます)', 'ok');
-    }).catch(function () { busy = false; send.disabled = false; msg('通信できませんでした。もう一度押してください (同じ頼みとして送り直します)', 'err'); });
+      msg(x.j.state === 'waiting'
+        ? 'NE へ送る頼みを受け付けました。数分のうちに送ります (NE に入った分は、翌朝 NE と同じになれば一覧から消えます)'
+        : 'この頼みはもう済んでいます。画面を開き直すと、いまの様子が分かります', 'ok');
+    }).catch(function () { lock(false); msg('通信できませんでした。もう一度押してください (同じ頼みとして送り直します)', 'err'); });
   });
 
-  function download(id, kind) {
-    msg('ファイルを受け取っています…');
-    fetch(P.base + '/api/ne-update/files/' + encodeURIComponent(id) + '/download', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+  function download(id, kind, btn) {
+    if (busy) return;
+    lock(true); msg('CSV を受け取っています…');
+    timed(P.base + '/api/ne-update/files/' + encodeURIComponent(id) + '/download', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}' })
       .then(function (res) {
-        if (!res.ok) return res.json().catch(function () { return {}; }).then(function (j) { throw new Error(j.error || ('受け取れませんでした (' + res.status + ')')); });
+        if (!res.ok) {
+          return res.json().catch(function () { return {}; }).then(function (j) {
+            var e = new Error(j.error || ('受け取れませんでした (' + res.status + ')'));
+            e.stale = res.status === 409;
+            throw e;
+          });
+        }
         var sha = res.headers.get('X-Content-SHA256') || '';
         var m = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '');
         return res.arrayBuffer().then(function (buf) {
           var check = window.crypto && window.crypto.subtle ? window.crypto.subtle.digest('SHA-256', buf).then(hex) : Promise.resolve(sha);
           return check.then(function (got) {
-            if (sha && got !== sha) throw new Error('受け取ったファイルが記録と違います (保存しません)。もう一度押してください');
+            if (sha && got !== sha) throw new Error('受け取った CSV が記録と違います (保存しません)。もう一度押してください');
             var a = document.createElement('a');
             a.href = URL.createObjectURL(new Blob([buf], { type: 'text/csv' }));
-            a.download = m ? m[1] : ('ne-update-' + id + '.csv');
+            a.download = m ? m[1] : 'ne-update.csv';
             document.body.appendChild(a); a.click(); a.remove();
             setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+            lock(false);
             msg('CSV を保存しました。NE の [商品] → [商品管理の一括登録] で' + (kind === 'sets' ? '「セット商品情報 CSV」' : '「商品 CSV」') + 'として取り込んでください', 'ok');
           });
         });
       })
-      .catch(function (e) { msg(e.message || String(e), 'err'); });
+      .catch(function (e) {
+        lock(false);
+        // DB が断った (作った後に値が変わった・ほかの CSV でもう出した・前の日の CSV) = このボタンはもう使えない → 外して作り直しを案内
+        if (e && e.stale && btn && btn.parentNode) btn.parentNode.removeChild(btn);
+        msg(e && e.name === 'AbortError' ? '時間がかかりすぎました。もう一度押してください' : (e.message || String(e)), 'err');
+      });
   }
 
   var csv = $('#nu-csv');
   if (csv) csv.addEventListener('click', function () {
     if (busy) return;
     pending.csv = pending.csv || uuid(); keep();
-    busy = true; csv.disabled = true; msg('作っています…');
+    lock(true); msg('CSV を作っています…');
     post(P.base + '/api/ne-update/csv', { request_id: pending.csv }).then(function (x) {
-      busy = false;
-      if (!sure(x)) { csv.disabled = false; msg('作れたか分かりません。もう一度押してください (同じ CSV として送り直します)', 'err'); return; }
+      lock(false);
+      if (!sure(x)) { msg('作れたか分かりません。もう一度押してください (同じ CSV として送り直します)', 'err'); return; }
       pending.csv = null; keep();
-      csv.disabled = false;
       if (!x.r.ok || !x.j.ok) { msg(x.j.error || ('できませんでした (' + x.r.status + ')'), 'err'); return; }
-      if (x.j.state !== 'built' || !x.j.files.length) { msg(x.j.reason || '送る所がありませんでした', 'err'); return; }
+      // 押し直しで前の答え (もう受け取った = sent) が返っても、ファイルがあれば出す
+      if (!x.j.files || !x.j.files.length) { msg(x.j.reason || 'NE とちがう所で、いま CSV にできるものはありませんでした', 'err'); return; }
       var box = $('#nu-files');
       box.innerHTML = '';
+      var first = null;
       x.j.files.forEach(function (f, i) {
         var b = document.createElement('button');
         b.type = 'button'; b.className = 'btn sm'; b.style.marginRight = '8px';
         b.textContent = 'ダウンロード ' + (x.j.files.length > 1 ? (i + 1) + ' / ' + x.j.files.length + ' ' : '') + '(' + (f.kind === 'sets' ? 'セット' : '単品') + ' ' + f.line_count + ' 件)';
-        b.addEventListener('click', function () { download(f.file_id, f.kind); });
+        b.addEventListener('click', function () { download(f.file_id, f.kind, b); });
         box.appendChild(b);
+        if (!first) first = { f: f, b: b };
       });
-      msg(x.j.files.length > 1 ? 'CSV を ' + x.j.files.length + ' つ作りました。1 つずつダウンロードして、順に NE に取り込んでください' + (x.j.left ? ' (残り ' + x.j.left + ' 件は次の回)' : '') : 'CSV を作りました。ダウンロードして NE に取り込んでください', 'ok');
-      if (x.j.files.length === 1) download(x.j.files[0].file_id, x.j.files[0].kind);
-    }).catch(function () { busy = false; csv.disabled = false; msg('通信できませんでした。もう一度押してください (同じ CSV として送り直します)', 'err'); });
+      msg(x.j.files.length > 1 ? 'CSV を ' + x.j.files.length + ' つ作りました。1 つずつダウンロードして、順に NE に取り込んでください' : 'CSV を作りました。NE に取り込んでください', 'ok');
+      if (x.j.files.length === 1) download(first.f.file_id, first.f.kind, first.b);
+    }).catch(function () { lock(false); msg('通信できませんでした。もう一度押してください (同じ CSV として送り直します)', 'err'); });
   });
 
   Array.prototype.forEach.call(document.querySelectorAll('#nu-files [data-dl]'), function (b) {
-    b.addEventListener('click', function () { download(b.getAttribute('data-dl'), b.getAttribute('data-kind')); });
+    b.addEventListener('click', function () { download(b.getAttribute('data-dl'), b.getAttribute('data-kind'), b); });
   });
 
   var vs = $('#nu-v-save');
