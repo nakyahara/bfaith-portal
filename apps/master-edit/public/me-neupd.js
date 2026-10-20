@@ -88,7 +88,10 @@
             document.body.appendChild(a); a.click(); a.remove();
             setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
             lock(false);
-            msg('CSV を保存しました。NE の [商品] → [商品管理の一括登録] で' + (kind === 'sets' ? '「セット商品情報 CSV」' : '「商品 CSV」') + 'として取り込んでください', 'ok');
+            // 🆕 0096: 前に受け取った CSV が、この CSV の直しを古い値で書いている = その CSV を後に取り込むと戻る
+            var older = Number(res.headers.get('X-NE-Older') || 0) > 0;
+            msg('CSV を保存しました。NE の [商品] → [商品管理の一括登録] で' + (kind === 'sets' ? '「セット商品情報 CSV」' : '「商品 CSV」') + 'として取り込んでください'
+              + (older ? '。前に受け取った CSV をまだ取り込んでいなければ、それは取り込まないでください (この CSV の直しが古い値に戻ります)' : ''), older ? 'err' : 'ok');
           });
         });
       })
@@ -118,12 +121,14 @@
       x.j.files.forEach(function (f, i) {
         var b = document.createElement('button');
         b.type = 'button'; b.className = 'btn sm'; b.style.marginRight = '8px';
-        b.textContent = 'ダウンロード ' + (x.j.files.length > 1 ? (i + 1) + ' / ' + x.j.files.length + ' ' : '') + '(' + (f.kind === 'sets' ? 'セット' : '単品') + ' ' + f.line_count + ' 件)';
+        // 🆕 0096: 「単品の CSV」「セットの CSV」(名前はサーバーが付ける = lib/master-ne-update.mjs の labelFiles)
+        b.textContent = 'ダウンロード: ' + (f.label || (f.kind === 'sets' ? 'セットの CSV' : '単品の CSV')) + ' (' + f.line_count + ' 件)';
         b.addEventListener('click', function () { download(f.file_id, f.kind, b); });
         box.appendChild(b);
         if (!first) first = { f: f, b: b };
       });
-      msg(x.j.files.length > 1 ? 'CSV を ' + x.j.files.length + ' つ作りました。1 つずつダウンロードして、順に NE に取り込んでください' : 'CSV を作りました。NE に取り込んでください', 'ok');
+      var apart = x.j.apart > 0 ? ' (' + x.j.apart + ' 件は NE の今の値が分からない欄があるので、別の CSV にしました)' : '';
+      msg((x.j.files.length > 1 ? 'CSV を ' + x.j.files.length + ' つ作りました。1 つずつダウンロードして NE に取り込んでください' : 'CSV を作りました。NE に取り込んでください') + apart, 'ok');
       if (x.j.files.length === 1) download(first.f.file_id, first.f.kind, first.b);
     }).catch(function () { lock(false); msg('通信できませんでした。もう一度押してください (同じ CSV として送り直します)', 'err'); });
   });

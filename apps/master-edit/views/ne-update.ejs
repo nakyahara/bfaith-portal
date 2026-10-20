@@ -9,6 +9,7 @@
     // 🆕 0094「NEへ送る」(AI_reference CompanyDB構想/25・10/19 中原さん「NE にあるないとか CSV をどうたらこうたらとかめっちゃわかりにくい」)。
     //   見せるのは「自社で直したけれど、まだ NE と違う所」の一覧とボタン 1 つだけ。ファイル番号・状態の名前・鍵・予約の言葉は出さない。止めている欄だけふつうの言葉で 1 行。
     //   画面の動き = public/me-neupd.js・読む / 頼む = lib/master-ne-update.mjs
+    //   🆕 0096: CSV は「単品の CSV」「セットの CSV」の 2 つまで (変えていない欄 = 今朝の NE の値)。その副作用だけ 1 行 (FILLER_WORDS)
     const N = nu;
     const ok = !dbError && !!N && N.ready;
     const when = (v) => (v ? new Date(new Date(v).getTime() + 9 * 3600e3).toISOString().slice(11, 16) : '');
@@ -56,18 +57,18 @@
         <% } else { %>
           <button class="btn pri" type="button" id="nu-csv"<%= waiting.length ? '' : ' disabled' %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>CSV を作る (NE にアップする用)</button>
           <% if (N.uploadReady) { %><button class="btn" type="button" id="nu-send"<%= waiting.length ? '' : ' disabled' %>><svg class="ic" aria-hidden="true"><use href="#i-up"/></svg>今すぐ NE へ送る</button><% } %>
-          <span class="hint">CSV は作った日のうちに取り込んでください · Excel で開いて保存し直さないでください<% if (N.uploadReady && N.waitingNow) { %> · いま NE へ送る準備をしています (数分で届きます)<% } %></span>
+          <span class="hint">CSV は作った日のうちに取り込んでください · Excel で開いて保存し直さないでください<% if (N.oneFile) { %> · <span id="nu-filler"><%= FILLER_WORDS %></span><% } %><% if (N.uploadReady && N.waitingNow) { %> · いま NE へ送る準備をしています (数分で届きます)<% } %></span>
         <% } %>
       </div>
       <div id="nu-files"><% if (canSend && N.todayFiles.length) { %><div class="hint" style="margin:8px 0 4px">今日作った CSV (受け取れなかったときは、もう一度ダウンロードできます)</div>
-        <% for (const f of N.todayFiles) { %><button class="btn sm" type="button" style="margin-right:8px" data-dl="<%= f.file_id %>" data-kind="<%= f.kind %>"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg><%= when(f.at) %> · <%= f.kind === 'sets' ? 'セット' : '単品' %> <%= f.line_count %> 件</button><% } %><% } %></div>
+        <% for (const f of N.todayFiles) { %><button class="btn sm" type="button" style="margin-right:8px" data-dl="<%= f.file_id %>" data-kind="<%= f.kind %>"><svg class="ic s" aria-hidden="true"><use href="#i-download"/></svg><%= when(f.at) %> · <%= f.label %> (<%= f.line_count %> 件)</button><% } %><% } %></div>
       <div class="msgline" id="nu-msg" role="status" aria-live="polite"></div>
     </section>
 
     <% if (canVerify) { %>
     <details class="panel" id="nu-verify">
       <summary>NE の実物の試しの結果を残す (中原さん)</summary>
-      <div class="hint">空欄のセルで NE の値が変わらないことを、欄ごとに NE の画面で確かめた結果を残します。ok の欄だけ、ほかの欄と 1 つのファイルにまとめて送ります (確かめる前は欄の組ごとに分けて送ります)。
+      <div class="hint">空欄のセルで NE の値が変わらないことを、欄ごとに NE の画面で確かめた結果を残します。ok の欄は、その商品で変えていないとき空欄にします (確かめる前は今朝の NE の値をそのまま書きます)。
         「コードの大文字・小文字」= ロジザードの書き方で送ったとき、NE が今ある商品のコードを書き換える (新しい商品を作らない) のを確かめたら ok。</div>
       <div class="buildbar">
         <select id="nu-v-target"><% for (const [k, c] of VERIFY_TARGETS) { %><option value="<%= k %>:<%= c %>"><%= c === 'code_case' ? 'コードの大文字・小文字' : COL_WORDS[k + ':' + c] %></option><% } %></select>

@@ -155,7 +155,7 @@ import {
 import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
 import { checkNeDelete, buildNeDelete, downloadNeDelete, withdrawNeDelete, buildHandling, readNeDelOverview, neDelAvailable, hideBackorder, hideBackorderText, NE_DEL_STATUS_WORDS, NE_DEL_KIND_WORDS, NE_DEL_MAX } from '../../lib/master-ne-delete.mjs';
 import { readNeDeleteStock } from './ne-delete-stock.mjs';
-import { readNeUpdate, readSkuNeDiff, requestNeSendNow, makeNeUpdateCsv, downloadNeUpdateFile, recordNeUpdateVerified, VERIFY_TARGETS, COL_WORDS as NE_UPD_COL_WORDS } from '../../lib/master-ne-update.mjs';
+import { readNeUpdate, readSkuNeDiff, requestNeSendNow, makeNeUpdateCsv, downloadNeUpdateFile, recordNeUpdateVerified, VERIFY_TARGETS, COL_WORDS as NE_UPD_COL_WORDS, FILLER_WORDS } from '../../lib/master-ne-update.mjs';
 // AMC 商品ラベルのバーコード印字 (Company DB構想 21 A1・発注アプリの po_barcode_labels に書く)
 import { amcLabelScreen, amcInputOf, saveAmcLabel, amcErrorBody, AmcLabelError, AMC_STATUSES, AMC_STATUS_WORDS, AMC_STATUS_HINTS } from './amc-label.mjs';
 import { lzBarcodeView, lzBarcodeIn, lzBarcodeReady, setLzBarcodeInTx, lzHolderInDb, lzValueShape, lzCopyNote, LZ_COPY_STATE_WORDS, LZ_KIND_WORDS, LZ_BARCODE_VIA } from '../../lib/logizard-barcode.mjs';
@@ -2296,7 +2296,7 @@ router.get('/ne-update', (req, res) => withPgPage(req, res, async (db, dbError) 
   const approver = approverGate(req);
   res.render(view('ne-update.ejs'), {
     ...pageLocals(req, phase), nav: 'neupd', dbError, nu: view0, canSend: gate.ok && !!view0 && view0.ready, sendMessage: gate.message || '',
-    canVerify: approver.ok, VERIFY_TARGETS, COL_WORDS: NE_UPD_COL_WORDS,
+    canVerify: approver.ok, VERIFY_TARGETS, COL_WORDS: NE_UPD_COL_WORDS, FILLER_WORDS,
   });
 }));
 /** NE へ送るの書き込み = 名簿 (MASTER_EDITORS) の人だけ (設計 25 Q2 a)・この画面だけのロールで */
@@ -2313,6 +2313,7 @@ router.post('/api/ne-update/files/:id/download', (req, res) => neUpdApi(req, res
   res.set('Content-Type', 'text/csv; charset=utf-8');
   res.set('Content-Disposition', `attachment; filename="${f.file_name}"`);
   res.set('X-Content-SHA256', f.sha256);
+  res.set('X-NE-Older', String(f.older || 0));   // 🆕 0096: 前に受け取った CSV がこの直しを古い値で書いている数 (画面の一言)
   res.send(f.bytes);
 }));
 router.post('/api/ne-update/verified', (req, res) => neUpdApi(req, res, async (db, actor, b) => res.json({ ok: true, ...(await recordNeUpdateVerified(db,
