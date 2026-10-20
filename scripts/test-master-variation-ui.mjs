@@ -375,14 +375,13 @@ await ta('[⑥] 上限を超える (45 色 × 3 = 135): 保存を止める・色
   assert.match(r2, /まだ CSV にしていない 120 件と今回の 15 件を合わせて 1 つのファイル \(135 行\) にして NE に取り込みます \(決まり = 1 回目の CSV を先に作ってから残りを足す。未処理の回が重なると 1 つのファイルにまとまる\)/);
   assert.doesNotMatch(r2, /この回の 15 件/);
   assert.equal((await kidsOf('roomwear2')).length, 135);
-  // NE 登録の CSV の画面: まとまり → 回 1 (120)・回 2 (15)
+  // NE 登録の CSV の画面 (🆕 10/20 ボタン 1 つ): まとまりの 135 件はふつうの単品と同じ「次の CSV」に入る (まとまりごとのボタンは無い)・登録した回は「これまでの記録」
   await p.goto(B + '/reg-csv');
+  assert.match(await p.textContent('#next'), /roomwear2/);
+  assert.equal(await p.locator('button[data-act="build-all"]').count(), 1, 'ボタンは「NE 登録の CSV を作る」1 つ');
+  assert.equal(await p.locator('button[data-act="build-variation"]').count(), 0, 'まとまりごとのボタンは無い');
   const card = p.locator('#vcands .vgroup:has(.mono:text-is("roomwear2"))');
-  assert.match(await card.innerText(), /回 1[\s\S]*子 120 件[\s\S]*回 2[\s\S]*子 15 件/);
-  assert.match(await card.innerText(), /回 1・回 2 は、どれもまだ CSV にしていない = 1 つのファイルにまとまります \(135 行\)/);
-  assert.equal(await card.locator('.vtoo').count(), 0);
-  assert.equal(await card.locator('button[data-act="build-variation"]:not([disabled])').count(), 1, '押せるのは「まとめて 1 ファイル」だけ');
-  assert.match(await card.locator('button[data-act="build-variation"]:not([disabled])').innerText(), /まとめて 1 ファイル \(135 件\) を作る/);
+  assert.match(await card.textContent(), /回 1[\s\S]*子 120 件[\s\S]*回 2[\s\S]*子 15 件/);
 });
 
 await ta('[⑥b] 1 つのファイルの上限 (試験は 136 行) を超える: 足す画面 = 「先に今ある分の CSV を作ってから」で保存を止める・API も 409 / NE 登録の CSV の画面 = 作れない理由と手順 (ボタンは押せない)', async (p) => {
@@ -405,15 +404,12 @@ await ta('[⑥b] 1 つのファイルの上限 (試験は 136 行) を超える:
     // NE 登録の CSV の画面: 上限 14 行 = roomwear2 (2 回・135 行) も hakama (1 回・15 行) も作れない → 理由と手順・ボタンは押せない
     V.__setMaxFileRowsForTest(14);
     await p.goto(B + '/reg-csv');
-    const card = p.locator('#vcands .vgroup:has(.mono:text-is("roomwear2"))');
-    assert.match(await card.locator('.vtoo').innerText(), /まだ CSV にしていない子が 135 件 = 1 つのファイル \(14 行まで\) にできないので、このまとまりの CSV は作れません[\s\S]*「このまとまりから外す \(廃止\)」で減らす[\s\S]*管理者へ/);
-    assert.equal(await card.locator('button[data-act="build-variation"]:not([disabled])').count(), 0, '作れないまとまりのボタンは押せない');
-    assert.doesNotMatch(await card.innerText(), /まとめて 1 ファイル/);
-    const hk = p.locator('#vcands .vgroup:has(.mono:text-is("hakama"))');
-    assert.match(await hk.locator('.vtoo').innerText(), /まだ CSV にしていない子が 15 件 = 1 つのファイル \(14 行まで\)/);
-    assert.equal(await hk.locator('button[data-act="build-variation"]').count(), 1, '1 回だけのまとまり = 回のボタンはある');
-    assert.equal(await hk.locator('button[data-act="build-variation"]:not([disabled])').count(), 0, '回のボタンも押せない');
-    await shot(p, '6b-too-many', '#vcands');
+    // 🆕 10/20: 入らないまとまりは「直すもの」に 1 行 (手順つき)・次の CSV には入れない
+    const fix = await p.textContent('#fix');
+    assert.match(fix, /まとまり roomwear2: まだ CSV にしていない子が 135 件 = 1 つのファイル \(14 行まで\) に入りません。作らない子を、その子の画面の「このまとまりから外す \(廃止\)」で減らしてください/);
+    assert.match(fix, /まとまり hakama: まだ CSV にしていない子が 15 件 = 1 つのファイル \(14 行まで\)/);
+    assert.doesNotMatch(await p.textContent('#next'), /まとまり (roomwear2|hakama)\)/);
+    await shot(p, '6b-too-many', '#fix');
   } finally { V.__setMaxFileRowsForTest(null); }
 });
 

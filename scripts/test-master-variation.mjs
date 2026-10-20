@@ -613,10 +613,16 @@ await ta('[N2] まとまりで 1 ファイル: 全部の子 = 作れる (版 var
   assert.equal(e1?.reason, 'variation_incomplete', e1?.message);
   const e2 = await errOf(build([...kids, 'grp1-RD'], { variation: true }));
   assert.equal(e2?.reason, 'variation_mixed', e2?.message);
+  // 🆕 0097 (仮番号・10/20 中原さん「まとまりごとでアップしないといけないから面倒」): 単品の版にもポータルのまとまりの子を入れてよい。ただし子が欠ける = variation_incomplete (まとまりで 1 ファイルのまま)
   const e3 = await errOf(build(['Hakama-WH-90']));
-  assert.equal(e3?.reason, 'variation_file_required', e3?.message);
+  assert.equal(e3?.reason, 'variation_incomplete', e3?.message);
   const e4 = await errOf(build(['gate-single'], { variation: true }));
   assert.equal(e4?.reason, 'not_ready', e4?.message);
+  const fs1 = await build(kids);   // 単品の版 (single-v2) = 全部の子・代表商品コード = まとまりのコード (版で行は変わらない)
+  assert.equal(fs1.export.schema_version, 'ne-reg-single-v2');
+  assert.deepEqual((await q('select cells from ops.ne_reg_export_rows where export_id = $1 order by row_no', [fs1.export.export_id])).map((r) => [r.cells[0], r.cells[7], r.cells[8]]),
+    [['Hakama-BK-90', 'Hakama', 'empty'], ['Hakama-WH-90', 'Hakama', 'empty'], ['Hakama-WH-95', 'Hakama', 'empty']]);
+  await asEditor(() => G.supersedeRegExport(db, { actor: 'boss@test', exportId: fs1.export.export_id, reason: '試験', correction: 'NE には取り込んでいない', confirm: true }, opts()));
   const f = await build(kids, { variation: true });
   assert.equal(f.export.schema_version, 'ne-reg-variation-v1');
   assert.equal(f.export.trial, false);
@@ -903,7 +909,9 @@ await ta('[S2] 本文の差: 0067 が置き換えた関数は前の最後の版�
     assert.equal(prev, want.base, `${name} の元にした版 (0067 より前の最後の定義) が変わった = 0067 の関数を新しい版から写し直す`);
     const d = lineDiff(fnDefIn(prev, name).split('\n'), fnDefIn(F0067, name).split('\n'));
     assert.deepEqual(d, { removed: want.removed, added: want.added }, `${name}: ${prev} との差`);
-    for (const later of MIG_FILES.filter((x) => x > F0067)) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0067 の試験の元を見直す`);
+    // 例外は名指しの 1 つ: 🆕 10/20 (0097 仮番号・reg_csv_one_file) が ops.ne_reg_build を 0067 の版から写す = その差は下の [S4] が確かめる
+    const oneFile = (x) => name === 'ops.ne_reg_build' && /^\d{4}_reg_csv_one_file\.sql$/.test(x);
+    for (const later of MIG_FILES.filter((x) => x > F0067 && !oneFile(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0067 の試験の元を見直す`);
   }
   // 形の版の決まり = variation-v1 の 1 行 (buildable / why) だけ
   const sr = lineDiff(fnDefIn('0065_ne_reg_csv_versions.sql', 'ops.ne_reg_schema_rule').split('\n'), fnDefIn(F0067, 'ops.ne_reg_schema_rule').split('\n'));
@@ -918,6 +926,35 @@ await ta('[S2] 本文の差: 0067 が置き換えた関数は前の最後の版�
   assert.deepEqual(await priv('ops.ne_reg_build(jsonb, bytea)'), { pub: false, me: true });
   assert.deepEqual(await priv('ops.ne_reg_canonical(bigint, date)'), { pub: false, me: false });
   assert.deepEqual(await priv('ops.ne_reg_schema_rule(text)'), { pub: false, me: false });
+});
+
+await ta('[S4] 🆕 10/20 (0097 仮番号・reg_csv_one_file): ops.ne_reg_build の 0067 との差は、単品の版にポータルのまとまりの子を入れてよい・まとまりごとに子が全部か確かめる、の行だけ・印の関数・権限はそのまま', async () => {
+  const F1 = MIG_FILES.find((x) => /^\d{4}_reg_csv_one_file\.sql$/.test(x));
+  assert.ok(F1, 'reg_csv_one_file の migration');
+  assert.equal(MIG_FILES.filter((x) => x > F0067 && fnDefIn(x, 'ops.ne_reg_build')).join(','), F1, 'ops.ne_reg_build を 0067 の後に作り直すのはこの 1 本だけ');
+  const d = lineDiff(fnDefIn(F0067, 'ops.ne_reg_build').split('\n'), fnDefIn(F1, 'ops.ne_reg_build').split('\n'));
+  assert.deepEqual(d, {
+    removed: [
+      '-- 🆕 0067: 代表の列の版の決まり (まとまりの版 = 全部が同じまとまりの子 / 単品の版 = ポータルで作ったまとまりの子は入れない)',
+      "raise exception 'variation_file_required: % はポータルで作ったまとまりの子 = ne-reg-variation-v1 のファイルで作る', v_sku.code using errcode = 'P0001';",
+      'if v_group is not null then',
+      "where cp.parent_product_id = v_group and mr.state in ('draft', 'ne_pending')",
+      'end if;'],
+    added: [
+      "v_groups   bigint[] := '{}';   -- 🆕 0097: 確かめるまとまり (単品の版に入れたポータルのまとまり + まとまりの版のまとまり)",
+      'v_g        bigint;   -- 🆕 0097',
+      '-- 🆕 0067: 代表の列の版の決まり (まとまりの版 = 全部が同じまとまりの子 / 🆕 0097: 単品の版 = ポータルで作ったまとまりの子も入れてよい・そのまとまりの子は全部)',
+      'if not (v_vpar = any (v_groups)) then v_groups := v_groups || v_vpar; end if;   -- 🆕 0097: 下でそのまとまりの NE 登録待ちの子が全部入っているかを確かめる',
+      '--   🆕 0097: 単品の版に入れたポータルのまとまりも、まとまりごとに同じ確かめ (1 つのファイルに 2 つ以上のまとまり・ふつうの単品があってよい)',
+      'if v_group is not null then v_groups := v_groups || v_group; end if;',
+      'foreach v_g in array v_groups loop',
+      "where cp.parent_product_id = v_g and mr.state in ('draft', 'ne_pending')",
+      'end loop;'] });
+  const priv = async (sig) => one(`select has_function_privilege('public', $1::regprocedure, 'execute') as pub, has_function_privilege('master_edit', $1::regprocedure, 'execute') as me,
+    (select prosecdef from pg_proc where oid = $1::regprocedure) as d`, [sig]);
+  assert.deepEqual(await priv('ops.ne_reg_build(jsonb, bytea)'), { pub: false, me: true, d: true });
+  assert.deepEqual(await priv('ops.reg_csv_one_file()'), { pub: false, me: false, d: false });
+  assert.equal(await G.regOneFileApplied(db), true);
 });
 
 await ta('[S3] 照合の確かめ待ちの view は今までの品目の行と列のまま (quarantined の行を足しただけ)・watcher が読める (関数の実行権が要らない)', async () => {

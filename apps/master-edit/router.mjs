@@ -86,6 +86,7 @@
  *   NE 登録の CSV (⑤-2b・0053・lib/master-reg-csv.mjs。作る・配る・申告・使わない・実機の確かめは MASTER_DECISION_APPROVERS の名簿の人だけ = マスタの判断の CSV と同じ):
  *   GET  /reg-csv                   画面
  *   GET  /api/reg-csv/summary       今日の照合の回・形の確かめ・候補と止まる理由・ファイル
+ *   POST /api/reg-csv/build-all     🆕 10/20 ボタン 1 つ = 今すぐ作れる商品を全部作って配る { request_id, exclude?: [...] } → { files, errors }。この後に /file でダウンロード
  *   POST /api/reg-csv/exports       作る { kind: products | sets, codes: [...], request_id }
  *   POST /api/reg-csv/exports/:id/issue     配る (built → issued)。この後に /file でダウンロード
  *   GET  /api/reg-csv/exports/:id/file      byte 列 (配った・申告したファイルだけ)
@@ -149,7 +150,7 @@ import { normSku } from '../../lib/sku-norm.js';
 import * as PF from '../../lib/profit-estimate.js';
 import { approverGate } from '../master-decisions/router.mjs';
 import {
-  regSummary, buildRegExport, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
+  regSummary, buildRegExport, buildRegAll, issueRegExport, regExportFile, declareRegExport, supersedeRegExport, recordRegVerified,
   REG_ITEM_STATES, REG_RESULTS,
 } from '../../lib/master-reg-csv.mjs';
 import { readGoneCheck, cancelSkuGoneFromNe, goneView } from '../../lib/master-gone.mjs';
@@ -2162,6 +2163,8 @@ function regWrite(req, res, fn) {
   return withPgApi(res, async (db) => res.json({ ok: true, ...(await fn(db, actor, req.body || {}, opts)) }), 'write');
 }
 router.post('/api/reg-csv/exports', (req, res) => regWrite(req, res, (db, actor, b, o) => buildRegExport(db, { actor, kind: b.kind, codes: b.codes, requestId: b.request_id, variation: b.variation === true }, o)));
+// 🆕 10/20 (中原さん「ボタンをワンクリックしたら CSV が作成できるように」): 今すぐ作れる商品を全部 = 単品 1 つ・セット 1 つのファイルを作って配る (ファイルごとに上の作る・配ると同じ道)
+router.post('/api/reg-csv/build-all', (req, res) => regWrite(req, res, (db, actor, b, o) => buildRegAll(db, { actor, requestId: b.request_id, exclude: b.exclude ?? null }, { ...o, maxRows: variationMaxFileRows() })));
 router.post('/api/reg-csv/exports/:id/issue', (req, res) => regWrite(req, res, (db, actor, b, o) => issueRegExport(db, { actor, exportId: req.params.id, requestId: b.request_id }, o)));
 router.post('/api/reg-csv/exports/:id/declare', (req, res) => regWrite(req, res, (db, actor, b, o) => declareRegExport(db, {
   actor, exportId: req.params.id, sha256: b.sha256, result: b.result, neMessage: b.ne_message ?? null, importedAt: b.imported_at ?? null, note: b.note ?? null, requestId: b.request_id,

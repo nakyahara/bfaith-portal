@@ -2975,3 +2975,16 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   画面のロールの実行権は migration が付ける (`create-master-edit-roles.mjs` の流し直しは要らない・流し直しても同じ)
 - 試験 = `node scripts/test-master-parent-gate.mjs` ([P19] まとまり A のずれは B・C を止めない / A の子・A を書く行・A の子を入れたセット・ずれた子は止まる / その場で直る / NE と違う・NE に無い / 全部止める形・[P20] 朝の要約・[P21] 写し) /
   `scripts/test-master-reg-csv.mjs` ([G1] 画面の候補・リンク・作る・DB の trigger・全部止める朝・権限) / `scripts/test-master-parent-gate-pg.mjs` ([R] 実 PostgreSQL のロール)
+
+### NE 登録の CSV をボタン 1 つに・まとまりの子も単品の CSV に (0097 仮番号・2026-10-20 中原さん「まとまりごとでアップしないといけないから面倒。ボタンをワンクリックしたら CSV が作成できるように。画面遷移がおおい」)
+- **なぜ入れてよいか**: 単品の版 (`ne-reg-single-v2`) とまとまりの版 (`ne-reg-variation-v1`) は見出し・行の作り方 (`ops.ne_reg_canonical`) が同じ = 版で行は変わらない。NE の CSV に代表 (親) の行は無く、代表商品コードは子の行の列。
+  NE はまだ知らない代表商品コードの子も CSV で受けた (本番 10/19 のまとまりのファイル #9〜#14 が翌朝 3 者一致) = 行の順の決まりは要らない (アプリはまとまりの子を並べて書く)
+- **関数を作り直す** `ops.ne_reg_build` (0067 の版を写して 🆕 の行だけ): 単品の版の `variation_file_required` を外し、入れたポータルのまとまりごとに `variation_incomplete` (そのまとまりの NE 登録待ちの子を全部) を確かめる。
+  まとまりの版は 0067 のまま。印 `ops.reg_csv_one_file()` = アプリが `to_regprocedure` で見る (前の DB = アプリはまとまりを今までどおりまとまりの版のファイルに分ける = アプリを先に出してよい)
+- **アプリ**: `lib/master-reg-csv.mjs` の `regPlan` (いま作れる商品を単品 1 つ・セット 1 つのファイルに分ける・まとまりは丸ごと・止まる子の居るまとまりは待つ) と `buildRegAll` (ファイルごとに今までの作る → 配るを通す・押し直し = 同じファイル・DB に断られた商品は外して作り直す)・
+  `POST /api/reg-csv/build-all`。画面 = 次の CSV (ボタン 1 つ)・NE で取り込む (「NE に取り込んだ」1 つ = 申告 ok)・直すもの・NE にもうある商品・前のファイルは「これまでの記録」にたたむ
+- **変えない**: 形の版の決まり・行と確かめる値・翌朝の確かめ (3 者一致)・配る・申告・使わない・代表 (親) の門 (0095)・まだ終わっていないファイル・NE にもうあるコード・1 ファイル 1,000 行
+- 当て方 (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後): 番号をマージの順に付け替え (同じころの NE 更新の CSV の migration と) → アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ・関数を作り直すだけ) →
+  中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま・印は public から外すだけ)
+- 試験 = `node scripts/test-master-variation.mjs` ([N2] 単品の版にまとまりの子・欠ける = variation_incomplete / [S4] 0067 との差) / `scripts/test-master-variation-batch.mjs` ([C1]・[C3] ボタン 1 つ・前の DB の分け方・外す・押し直し) /
+  `scripts/test-master-reg-csv.mjs` ([H1]・[H4] 画面と API・[G1]) / `scripts/test-master-register.mjs` ([G-0064]) / 画面 = `test-master-edit-ui.mjs` [38]・`test-master-variation-ui.mjs` [⑥]・[⑥b]

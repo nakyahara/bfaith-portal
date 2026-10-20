@@ -425,11 +425,12 @@ await ta('[C1] まとまりの子は回ごとに並ぶ (ふつうの候補には
   const f2 = await asEditor(() => G.buildRegExport(db, { actor: 'naka@test', kind: 'products', variation: true, codes: rw2.rounds[1].codes, requestId: uuid() }, { open: true, nowMs: NOW_MS }));
   assert.notEqual(f1.export.export_id, f2.export.export_id);
   assert.deepEqual([f1.export.item_count, f2.export.item_count], [1, 1]);
-  // 単品の版にはまとまりの子を入れない (DB)
+  // 🆕 0097 (仮番号・10/20): 単品の版にもまとまりの子を入れてよい (まとまりの NE 登録待ちの子が全部入るとき) = ふつうの単品と同じファイル
   const r3 = await reg({ group: { mode: 'add', product_id: r1.group_product_id }, options: [{ axis: 1, code: '-NV', name: 'ネイビー' }], children: [{ code: 'roomwear-NV', choices: { 1: '-NV' }, name: 'ルームウェア【ネイビー】' }], values: VALUES });
   assert.equal(r3.ok, true);
-  const e3 = await errOf(asEditor(() => G.buildRegExport(db, { actor: 'naka@test', kind: 'products', codes: ['roomwear-NV'], requestId: uuid() }, { open: true, nowMs: NOW_MS })));
-  assert.match(String(e3 && e3.message), /variation_file_required|ne-reg-variation-v1/);
+  const f3 = await asEditor(() => G.buildRegExport(db, { actor: 'naka@test', kind: 'products', codes: ['roomwear-NV'], requestId: uuid() }, { open: true, nowMs: NOW_MS }));
+  assert.equal(f3.export.schema_version, 'ne-reg-single-v2');
+  assert.deepEqual((await q('select r.cells from ops.ne_reg_export_rows r where r.export_id = $1', [f3.export.export_id])).map((x) => [x.cells[0], x.cells[7]]), [['roomwear-NV', 'roomwear']]);
   // 止まる子 (原価が無い) が居る回 = 作れない (画面のボタンは押せない・どの子の何かを出す)
   const { cost: _c, ...noCost } = VALUES;
   await reg({ group: { mode: 'new', code: 'nocost', name: '原価なし' }, axes: [{ axis: 1, name: 'カラー' }], options: [{ axis: 1, code: '-A', name: 'A' }, { axis: 1, code: '-B', name: 'B' }],
@@ -472,6 +473,56 @@ await ta('[C2] 未処理の子 (CSV にしていない) + 今回 が 1 つのフ
     assert.equal((await V.readVariationGroup(db, gid)).pending_unfiled, 2);
   } finally { V.__setMaxFileRowsForTest(null); }
   assert.equal(V.variationMaxFileRows(), G.REG_MAX_ROWS);
+});
+
+await ta('[C3] 🆕 10/20 ボタン 1 つ (buildRegAll): ふつうの単品と色違い・サイズ違いのまとまりの子を 1 つの単品のファイル (ne-reg-single-v2) に・まとまりは丸ごと (止まる子の居るまとまりは待つ・直すものに 1 行)・0097 の前の DB = まとまりごとのファイル・外す・その場で配る・押し直し = 同じファイル・もう無い = nothing_ready', async () => {
+  const S = await asEditor(() => G.regSummary(db, { nowMs: NOW_MS }));
+  assert.equal(S.one_file, true, '0097 (仮番号) の印');
+  const P = S.plan;
+  // 止まる子 (原価なし) の居るまとまり nocost = 入れない (作れる子は「一緒に入ります」・止まる子は直すもの)
+  assert.ok(!P.groups.some((g) => g.group_code === 'nocost'));
+  assert.deepEqual(P.held.find((h) => h.group_code === 'nocost'), { group_code: 'nocost', codes: ['nocost-A'], because: ['nocost-B'] });
+  assert.ok(P.fix.some((f) => f.code === 'nocost-B' && f.why.some((w) => /原価が無い/.test(w))), JSON.stringify(P.fix));
+  const cap = P.groups.find((g) => g.group_code === 'cap');
+  assert.deepEqual(cap.codes, ['cap-D', 'cap-E'], 'まとまりの NE 登録待ちの子 (生きているファイルの無い子) を全部');
+  const prod = P.files.filter((f) => f.kind === 'products');
+  assert.equal(prod.length, 1, `単品のファイルは 1 つ: ${JSON.stringify(P.files)}`);
+  assert.deepEqual(prod[0].codes, [...P.singles, ...P.groups.flatMap((g) => g.codes)], '並び = ふつうの単品 → まとまりごと');
+  assert.deepEqual([prod[0].variation, prod[0].groups], [false, P.groups.map((g) => g.group_code)]);
+  // 0097 の前の DB = まとまりは 1 まとまり 1 ファイル (まとまりの版)
+  const old = G.regPlan({ ...S, one_file: false });
+  assert.deepEqual(old.files.filter((f) => f.variation).map((f) => f.groups[0]), P.groups.map((g) => g.group_code));
+  assert.ok(old.files.filter((f) => f.variation).every((f) => f.codes.length === P.groups.find((g) => g.group_code === f.groups[0]).codes.length));
+  // 行の上限で分ける (まとまりは分けない)
+  const small = G.regPlan({ ...S, max_rows: 2 });
+  assert.ok(small.files.filter((f) => f.kind === 'products').every((f) => f.rows <= 2 || f.groups.length === 1));
+  assert.ok(small.files.filter((f) => f.kind === 'products').length > 1);
+  // 外す (まとまりは丸ごと)
+  const ex = G.regPlan(S, { exclude: ['cap-D'] });
+  assert.ok(!ex.groups.some((g) => g.group_code === 'cap') && ex.excluded.includes('cap-E'));
+  // 作る (ボタン 1 つ): 作る → 配る。rows の代表商品コード = まとまりのコード
+  const rid = uuid();
+  const r = await asEditor(() => G.buildRegAll(db, { actor: 'naka@test', requestId: rid }, { open: true, nowMs: NOW_MS }));
+  assert.deepEqual(r.errors, [], JSON.stringify(r.errors));
+  assert.equal(r.replayed, false);
+  const pf = r.files.filter((f) => f.kind === 'products');
+  assert.equal(pf.length, 1);
+  assert.deepEqual([pf[0].schema_version, pf[0].state, pf[0].item_count], ['ne-reg-single-v2', 'issued', prod[0].codes.length]);
+  const rows = await q('select r.cells from ops.ne_reg_export_rows r where r.export_id = $1 order by r.row_no', [pf[0].export_id]);
+  assert.deepEqual(rows.map((x) => x.cells[0]), prod[0].codes);
+  assert.deepEqual(rows.filter((x) => /^cap-/.test(x.cells[0])).map((x) => x.cells[7]), ['cap', 'cap']);
+  // 押し直し = 同じファイル (新しく作らない)
+  const n0 = (await one('select count(*)::int as n from ops.ne_reg_exports')).n;
+  const r2 = await asEditor(() => G.buildRegAll(db, { actor: 'naka@test', requestId: rid }, { open: true, nowMs: NOW_MS }));
+  assert.deepEqual([r2.replayed, r2.files.map((f) => f.export_id)], [true, r.files.map((f) => f.export_id)]);
+  assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, n0);
+  await rejects(asEditor(() => G.buildRegAll(db, { actor: 'boss@test', requestId: rid }, { open: true, nowMs: NOW_MS })), 409, 'request_id_reused');
+  // もう作れる商品が無い (セットは別) = nothing_ready
+  const S2 = await asEditor(() => G.regSummary(db, { nowMs: NOW_MS }));
+  assert.ok(!S2.plan.files.some((f) => f.kind === 'products'), JSON.stringify(S2.plan.files));
+  if (!S2.plan.files.length) await rejects(asEditor(() => G.buildRegAll(db, { actor: 'naka@test', requestId: uuid() }, { open: true, nowMs: NOW_MS })), 409, 'nothing_ready');
+  // 配ったファイルは使わないに戻す (後の試験のため)
+  for (const f of r.files) await asEditor(() => G.supersedeRegExport(db, { actor: 'naka@test', exportId: f.export_id, reason: '試験', correction: 'NE には取り込んでいない', confirm: true }, { open: true }));
 });
 
 await ta('[SP-V] 🆕 2026-10-17 (Codex R4): 作るセットに決まったコード (product-hub の予約・セットの下書き) = 新しいまとまりのコードにも子のコードにもさせない (開いた後 = コードの鍵の後にもう一度・何も保存しない)', async () => {
