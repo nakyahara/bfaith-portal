@@ -6,8 +6,10 @@
 <body>
   <%- include('_header') %>
   <%
-    // NE 登録の CSV (新しいデザイン・第 2 段 10/5): 上に 5 つの流れと件数・作れない商品は 🔒 と理由・ファイルごとに「次にやること」を 1 つだけ大きく。
-    // 申告は CSV のファイルを落とすとその場で sha256 を照合する (64 文字を写さない)。送り方 (API) は前と同じ。画面の動き = public/me-regcsv.js
+    // NE 登録の CSV (🆕 10/20 中原さん「過去の履歴表示が邪魔なうえにまとまりごとでアップしないといけないから面倒。ボタンをワンクリックしたら CSV が作成できるように。画面遷移がおおい」):
+    //   上から ① 次の CSV (ボタン 1 つ = 単品 1 つ・セット 1 つのファイルを作ってダウンロード) ② NE で取り込む (ダウンロード・「取り込んだ」のボタン 1 つ)
+    //   ③ 直すもの (1 行ずつ・商品の画面へのリンク) ④ NE にもうある商品 (短い 1 行)。前のファイル・まとまりの回は「これまでの記録」にたたむ。
+    //   分け方は lib の regPlan (= buildRegAll と同じ決まり)。画面の動き = public/me-regcsv.js
     const S = summary;
     const canAct = canApprove && !dbError && !closed && !!S && S.applied;
     const dis = canAct ? '' : ' disabled';
@@ -15,28 +17,13 @@
     const STATE_BADGE = { built: 'warn', issued: 'info', declared: 'info', closed: 'mute' };
     const CLOSE_BADGE = { finished: 'ok', superseded: 'mute', rejected_all: 'err' };
     const RESULT_DESC = { ok: ['i-check', 'NE の履歴が「処理成功」で、失敗の件数が無い'], partial: ['i-warn', '「処理成功」でも、メッセージに「N件失敗」がある'], rejected_all: ['i-x', '取り込めなかった'] };
+    const COL_WORDS = { name: '名前', cost: '原価', price: '売価', supplier: '仕入先', tax_rate: '税率', handling: '取扱区分', parent: '代表商品コード', children: '構成', jan: 'JAN' };
     const when = (v) => (v ? ui.fmtJst(v, { nowMs }) : '');
     const shortSha = (s) => (s ? String(s).slice(0, 8) + '…' + String(s).slice(-6) : '');
-    let pipe = null;
-    if (S && S.applied) {
-      // 🆕 PR-7: まとまりの子 = まとまりの NE 登録待ちの子を全部 1 つのファイル (1 回目の CSV を先に作ってから残りを足す・未処理の回が重なると 1 つにまとまる)
-      const vGroups = S.variation || [];
-      const buildable = S.candidates.filter((c) => !c.blockers.length).length
-        + vGroups.filter((g) => !g.too_many && g.rounds.every((r) => !r.pending || r.buildable)).reduce((a, g) => a + g.pending_total, 0);
-      const vPending = vGroups.reduce((a, g) => a + g.pending_total, 0);
-      const by = (st) => S.exports.filter((e) => e.state === st);
-      const verifiedItems = S.exports.reduce((a, e) => a + e.items.filter((i) => i.state === 'verified').length, 0);
-      pipe = [
-        { n: '① 作る', t: 'CSV にする', c: buildable, u: '件 作れる', s: `下書き・NE 登録待ち ${S.candidates.length + vPending} 件のうち`, hot: buildable > 0 },
-        { n: '② 配る', t: 'ダウンロード', c: by('built').length, u: '件', s: '作って まだ配っていない', hot: by('built').length > 0 },
-        { n: '③ NE で取り込む', t: 'NE の画面で', c: by('issued').length, u: '件 待ち', s: by('issued').length ? 'ファイル ' + by('issued').map((e) => '#' + e.export_id).join('・') + ' · 取り込めば翌朝自動で確かめる' : '配ったファイルを NE で取り込む (申告はしなくてよい)', hot: by('issued').length > 0, ne: true },
-        { n: '④ 申告', t: '「N件失敗」なら必ず', c: by('declared').length, u: '件', s: '全部成功なら要らない (翌朝の照合で確かめる)', hot: false },
-        { n: '⑤ 翌朝の確かめ', t: 'NE と同じだった', c: verifiedItems, u: '商品', s: '最近のファイルの中で · そろえば NE 確認済み', hot: false },
-      ];
-    }
     // 🆕 0095: 代表 (親) の門の 1 行 (ずれた商品のコードは商品の画面へのリンク = そこで「NE の代表を採用する」)
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
     const gateHtml = (g) => esc(g.pre) + g.codes.map((x) => `<a href="${esc(base)}/sku/${esc(encodeURIComponent(x))}">${esc(x)}</a>`).join('・') + esc(g.post);
+    const skuLink = (code) => `<a class="mono" href="${esc(base)}/sku/${esc(encodeURIComponent(code))}">${esc(code)}</a>`;
     const steps = (e) => {
       const done = (x) => ({ t: x, cls: 'done' });
       if (e.state === 'built') return [done('作った'), { t: '配る (ダウンロード)', cls: 'cur' }, { t: 'NE で取り込む' }, { t: '翌朝の確かめ (自動)' }];
@@ -45,13 +32,32 @@
       if (e.close_reason === 'finished') return [done('作った'), done('配った'), ...(e.declared_at ? [done('申告した')] : []), done('翌朝の確かめ')];
       return [done('作った'), { t: CLOSE_REASONS[e.close_reason] || '閉じた', cls: 'bad' }];
     };
+    let P = null, toDownload = [], toImport = [], partials = [], trialDone = [], waitingItems = 0;
+    if (S && S.applied) {
+      P = S.plan;
+      const open = S.exports.filter((e) => e.state !== 'closed');
+      toDownload = open.filter((e) => e.state === 'built');
+      toImport = open.filter((e) => e.state === 'issued' && e.items.some((i) => i.state === 'issued'));
+      partials = open.flatMap((e) => e.items.filter((i) => i.state === 'partial').map((i) => ({ e, i })));
+      waitingItems = open.filter((e) => !toDownload.includes(e) && !toImport.includes(e)).reduce((a, e) => a + e.items.filter((i) => ['issued', 'import_declared'].includes(i.state)).length, 0);
+      // 試し用のセットのファイルが全部 NE で確かめ済み = この形を「実機で確かめた」にする (中原さんの番)
+      trialDone = S.exports.filter((e) => e.trial && e.items.length && e.items.every((i) => i.state === 'verified') && e.verify && e.verify.can && !(S.verified[e.kind] && S.verified[e.kind].ok));
+    }
+    // 一部だけ違う品目の 1 行 (NE の値 / CSV の値)
+    const diffText = (i) => {
+      const cols = i.last_check && i.last_check.detail && i.last_check.detail.compare && i.last_check.detail.compare.cols;
+      if (!cols) return '';
+      const sh = (v) => { const s = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '(空)'); return s.length > 60 ? s.slice(0, 60) + '…' : s; };
+      return Object.entries(cols).filter(([, x]) => !x.ok).map(([c, x]) => `${COL_WORDS[c] || c} (NE「${sh(x.observed && x.observed.v !== undefined ? x.observed.v : x.observed)}」/ CSV「${sh(x.expected)}」)`).join('・');
+    };
+    const nPlan = P ? P.singles.length + P.groups.reduce((a, g) => a + g.codes.length, 0) + P.sets.length : 0;
   %>
   <div class="page" id="rc" data-base="<%= base %>">
     <nav class="crumb" aria-label="いまの場所"><a href="<%= base %>/" data-list-back>商品・セット</a><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg><span aria-current="page">NE 登録の CSV</span></nav>
     <div class="ph">
       <div>
         <h1>NE 登録の CSV</h1>
-        <div class="lead">新商品 (下書き) を NE の「商品一括登録」で取り込む CSV にします。<b style="color:var(--text)">作る → 配る (ダウンロード) → NE で取り込む → 翌朝の照合が自動で確かめて NE 確認済み</b>。「取り込んだと申告」はしなくて大丈夫です。</div>
+        <div class="lead">新商品 (下書き) を NE に登録する CSV です。<b style="color:var(--text)">ボタンを押すと CSV ができてダウンロードされます → NE の「商品一括登録」で取り込む → 翌朝、自動で確かめます</b>。</div>
       </div>
       <div class="ph-actions"><a class="btn" href="<%= base %>/manual#reg-csv"><svg class="ic" aria-hidden="true"><use href="#i-book"/></svg>つかいかた</a></div>
     </div>
@@ -60,12 +66,118 @@
     <% if (!canApprove) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= approveMessage %></div></div><% } %>
     <% if (S && !S.applied) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow">NE 登録の CSV の表 (migration 0053) がまだ入っていません。</div></div><% } %>
     <% if (S && S.applied) { %>
+    <% if (S.parent_gate_all) { %><div class="callout warn" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t"><%- gateHtml(S.parent_gate_all) %></div><div class="hint">配ったファイルの申告・「取り込めなかった」商品だけの作り直し・使わないはできます。</div></div></div><% } %>
+    <% if (P.not_today) { %><div class="callout warn" id="rc-not-today"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">今朝の照合がまだなので、いまは CSV を作れません</div><div class="hint">照合が終わると (ふつうは朝のうちに) 作れます。<%= S.today ? '' : `今日 (${S.today_jst}) の照合の回がまだ` %><%= S.ne_codes.current ? '' : '・NE のコードが今日の分でない' %></div></div></div><% } %>
 
-    <section class="panel hud" aria-label="流れと準備">
-      <ol class="pipeline">
-        <% for (const p of pipe) { %><li class="pipe<%= p.hot ? ' hot' : '' %><%= p.c ? '' : ' zero' %><%= p.ne ? ' ne' : '' %>"><div class="pn"><%= p.n %></div><div class="pt"><%= p.t %></div><div class="pc"><%= p.c %><small><%= p.u %></small></div><div class="ps"><%= p.s %></div></li><% } %>
-      </ol>
-      <div class="ready">
+    <section class="panel" id="next" aria-labelledby="h-next">
+      <div class="panel-h"><span class="hico" aria-hidden="true">①</span><h2 id="h-next">次の CSV</h2><span class="sub">いま作れる商品を全部まとめます</span></div>
+      <% if (nPlan) { %>
+      <p class="next-sum" style="margin:2px 0 10px;font-size:15px">
+        <% if (P.singles.length || P.groups.length) { %>単品 <b><%= P.singles.length + P.groups.reduce((a, g) => a + g.codes.length, 0) %></b> 件<% if (P.groups.length) { %> (色違い・サイズ違い <%= P.groups.length %> まとまり <%= P.groups.reduce((a, g) => a + g.codes.length, 0) %> 件を含む)<% } %><% } %><% if (P.sets.length) { %><%= P.singles.length || P.groups.length ? ' と ' : '' %>セット <b><%= P.sets.length %></b> 件<% } %>
+      </p>
+      <% const chipN = P.singles.length + P.groups.length + P.sets.length; %>
+      <% const chipsHtml = () => { let h = ''; for (const c of P.singles) h += `<span class="compchip">${skuLink(c)}</span>`; for (const g of P.groups) h += `<span class="compchip" title="${esc(g.codes.join('・'))}">${skuLink(g.codes[0])}<span class="hint">${g.codes.length > 1 ? ` ほか ${g.codes.length - 1} 件` : ""} (まとまり ${esc(g.group_code)})</span></span>`; for (const c of P.sets) h += `<span class="compchip"><span class="b vio">セット</span> ${skuLink(c)}</span>`; return h; }; %>
+      <% if (chipN <= 24) { %><div class="kidchips" id="next-items" style="display:flex;flex-wrap:wrap;gap:6px"><%- chipsHtml() %></div>
+      <% } else { %><details class="more" id="next-items-more"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>入る商品を見る</summary><div class="body kidchips" id="next-items" style="display:flex;flex-wrap:wrap;gap:6px"><%- chipsHtml() %></div></details><% } %>
+      <div class="buildbar">
+        <button class="btn pri lg" type="button" data-act="build-all"<%= canAct && P.files.length ? '' : ' disabled' %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>NE 登録の CSV を作る</button>
+        <span class="hint" id="next-hint">押すと CSV ができて、そのままダウンロードされます<%= P.files.length > 1 ? `（ファイルは ${P.files.length} つ: ${P.files.filter((f) => f.kind === 'products').length ? '単品' + (P.files.filter((f) => f.kind === 'products').length > 1 ? ' ' + P.files.filter((f) => f.kind === 'products').length + ' つ' : '') : ''}${P.files.some((f) => f.kind === 'products') && P.files.some((f) => f.kind === 'sets') ? '・' : ''}${P.files.some((f) => f.kind === 'sets') ? 'セット' : ''}）` : '' %></span>
+      </div>
+      <% if (P.files.some((f) => f.kind === 'sets' && f.trial)) { %><div class="hint" style="margin-top:6px">セットの CSV はまだ試しの段階です (1 回 <%= S.trial_rows %> 行まで)。NE で確かめられたら、下の「NE で取り込む」にボタンが出ます。</div><% } %>
+      <% if (canAct && P.files.length) { %>
+      <details class="more" id="pick-some"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>一部を外して作る</summary>
+        <div class="body"><div class="hint" style="margin-bottom:6px">外したい商品の印を外してから、上のボタンを押します (色違い・サイズ違いは、まとまりごと)。</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px 18px">
+          <% for (const c of P.singles) { %><label class="check-row"><input type="checkbox" class="pick" checked value="<%= c %>" data-codes="<%= JSON.stringify([c]) %>"<%= dis %>><span class="mono"><%= c %></span></label><% } %>
+          <% for (const g of P.groups) { %><label class="check-row"><input type="checkbox" class="pick" checked value="<%= g.group_code %>" data-codes="<%= JSON.stringify(g.codes) %>"<%= dis %>><span><span class="mono"><%= g.group_code %></span> のまとまり <%= g.codes.length %> 件</span></label><% } %>
+          <% for (const c of P.sets) { %><label class="check-row"><input type="checkbox" class="pick" checked value="<%= c %>" data-codes="<%= JSON.stringify([c]) %>"<%= dis %>><span><span class="b vio">セット</span> <span class="mono"><%= c %></span></span></label><% } %>
+          </div></div>
+      </details>
+      <% } else if (!canAct) { %>
+        <div style="display:none"><% for (const c of [...P.singles, ...P.sets]) { %><input type="checkbox" class="pick" value="<%= c %>" disabled><% } %></div>
+      <% } %>
+      <% } else { %>
+      <div class="empty" id="next-empty">いま CSV にできる商品はありません。<% if (!S.candidates.length && !(S.variation || []).length) { %><br>新商品は <a href="<%= base %>/new?kind=single">新商品の登録</a> で下書きにします。<% } %></div>
+      <% } %>
+      <% if (P.sets_waiting.length) { %><div class="hint" id="sets-waiting" style="margin-top:8px">セット <%= P.sets_waiting.map((x) => x.code).join('・') %> は、構成品が NE に入ってから作れます (構成品を NE に取り込んだ翌朝から)。</div><% } %>
+      <%# 試しのセット (#Codex R1 Medium 2・3): 次の CSV が空でも理由つきで出す %>
+      <% if (P.sets_later.length) { %><div class="hint" style="margin-top:6px" id="sets-later">セット <%= P.sets_later.join('・') %> は、<%= P.set_trial_waiting ? 'いま NE で確かめている試しのセットの CSV が終わってから' : '次の回に' %>作ります (セットの CSV はまだ試しの段階で、1 回 <%= S.trial_rows %> 行まで)。</div><% } %>
+      <% if (P.sets_too_big.length) { %><div class="why-wrn" style="margin-top:6px" id="sets-too-big"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>セット <%= P.sets_too_big.join('・') %> は構成品が多く、1 つの CSV の行の上限 (<%= P.set_trial ? S.trial_rows : S.max_rows %> 行) を超えるので作れません<%= P.set_trial ? ' (セットの試しが確かめられると 1,000 行まで作れます)' : '' %>。</span></div><% } %>
+      <div class="msgline" id="build-msg" role="status" aria-live="polite"></div>
+      <div id="build-result"></div>
+    </section>
+
+    <% if (toDownload.length || toImport.length || trialDone.length || waitingItems) { %>
+    <section class="panel" id="todo" aria-labelledby="h-todo">
+      <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-todo">NE で取り込む</h2><span class="sub">NE の「商品一括登録」で取り込みます</span></div>
+      <% for (const e of toDownload) { %>
+      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-label="<%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV">
+        <div class="fh"><span class="ttl"><%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV</span><span class="b warn">まだダウンロードしていません</span></div>
+        <div class="acts"><button class="btn pri" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>ダウンロード</button><span class="hint"><%= when(e.created_at) %> に作った</span></div>
+        <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
+      </article>
+      <% } %>
+      <% for (const e of toImport) { const notImp = e.items.some((i) => i.last_check && i.last_check.detail && i.last_check.detail.not_imported === true); %>
+      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-label="<%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV">
+        <div class="fh"><span class="ttl"><%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV</span><span class="b info"><span class="dot" aria-hidden="true"></span>NE で取り込むのを待っています</span></div>
+        <div class="fmeta"><span><%= when(e.issued_at) %> にダウンロード</span><span class="dotsep" aria-hidden="true"></span><span class="mono" style="font-size:12px"><%= e.file_name %></span></div>
+        <% if (notImp) { %><div class="why-wrn" style="margin-top:6px"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>日がたっても NE に出てきません。まだなら NE で取り込んでください (取り込まないなら「これまでの記録」から「使わない」に)</span></div><% } %>
+        <div class="acts">
+          <button class="btn pri" type="button" data-act="declare-quick" data-result="ok"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>NE に取り込んだ</button>
+          <button class="btn sm" type="button" data-act="issue"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
+          <span class="hint">押さなくても、翌朝 NE に出ていれば自動で確かめます</span>
+        </div>
+        <details class="more"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>NE で失敗があったとき (「N件失敗」・全部だめ)</summary>
+          <div class="body">
+            <div class="f"><label class="lab" for="qm-<%= e.export_id %>">NE のメッセージ</label><div class="ctl"><input class="in w-l" id="qm-<%= e.export_id %>" name="quick_message" maxlength="1000" autocomplete="off" placeholder="例: 3件成功しました。1件失敗しました。"></div></div>
+            <div class="acts">
+              <button class="btn" type="button" data-act="declare-quick" data-result="partial"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg>一部失敗した (N件失敗)</button>
+              <button class="btn danger sm" type="button" data-act="declare-quick" data-result="rejected_all"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg>全部だめだった</button>
+            </div>
+            <div class="hint">失敗を知らせると、翌朝、入らなかった商品が「次の CSV」に戻ります (直してからもう一度作れます)。</div>
+          </div>
+        </details>
+        <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
+      </article>
+      <% } %>
+      <% for (const e of trialDone) { %>
+      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>">
+        <div class="fh"><span class="ttl">試しの<%= kindLabel[e.kind] %>の CSV が NE で確かめられました</span></div>
+        <div class="hint" style="margin-top:4px">NE の画面も見て問題なければ押してください。次からは 1 回で <%= S.max_rows.toLocaleString('ja-JP') %> 行まで作れます。</div>
+        <div class="acts">
+          <button class="btn pri" type="button" data-act="verified" data-kind="<%= e.kind %>" data-result="ok"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>問題なし (この形で本番にする)</button>
+          <button class="btn danger sm" type="button" data-act="verified" data-kind="<%= e.kind %>" data-result="ng"<%= dis %>>問題があった</button>
+        </div>
+        <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
+      </article>
+      <% } %>
+      <% if (waitingItems) { %><div class="hint" id="wait-line"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg> 取り込んだ <%= waitingItems %> 件は、翌朝の確かめを待っています (何もしなくて大丈夫です)。</div><% } %>
+    </section>
+    <% } %>
+
+    <% if (P.fix.length || P.held.length || partials.length) { %>
+    <section class="panel" id="fix" aria-labelledby="h-fix">
+      <div class="panel-h"><span class="hico" aria-hidden="true">③</span><h2 id="h-fix">直すもの</h2><span class="sub">商品の画面で直すと、次の CSV に入ります</span></div>
+      <ul class="fixlist" style="margin:0;padding-left:0;list-style:none;display:grid;gap:8px">
+        <% for (const f of P.fix) { %><li class="why-blk" data-code="<%= f.code %>"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><% if (f.kind === 'group') { %>まとまり <span class="mono"><%= f.code %></span><% } else { %><%- skuLink(f.code) %><% } %>: <% f.why.forEach((b, n) => { %><%= n ? ' / ' : '' %><% if (f.gate && b === f.gate.text) { %><%- gateHtml(f.gate) %><% } else { %><%= b %><% } %><% }) %></span></li><% } %>
+        <% for (const h of P.held) { %><li class="why-wrn" data-group="<%= h.group_code %>"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>色違い・サイズ違いのまとまり <span class="mono"><%= h.group_code %></span> の <%= h.codes.join('・') %> は、<%- h.because.map(skuLink).join('・') %> がそろうと一緒に入ります (まとまりは同じ CSV に入れます)</span></li><% } %>
+        <% for (const { e, i } of partials) { %><li class="why-wrn" data-partial="<%= i.code %>"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span><%- skuLink(i.code) %>: NE に入りましたが、NE とちがう所があります — <%= diffText(i) || 'くわしくは「これまでの記録」' %>。NE の画面で CSV の値に直すと翌朝そろいます (NE の値の方が正しいときは「これまでの記録」でこのファイルを「使わない」に)</span></li><% } %>
+      </ul>
+    </section>
+    <% } %>
+
+    <% if (P.in_ne.length) { %>
+    <section class="panel" id="in-ne" aria-labelledby="h-in-ne">
+      <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-info"/></svg></span><h2 id="h-in-ne">NE にもうある商品</h2></div>
+      <div><%- P.in_ne.map((x) => skuLink(x.code)).join('・') %> は、NE に同じコードの商品がもうあるので CSV にしません (NE の画面で先に登録した商品)。</div>
+      <div class="hint" style="margin-top:4px">ここでは下書きのまま残ります。NE にある商品として登録済みにする操作は、まだありません。</div>
+    </section>
+    <% } %>
+
+    <details class="panel soft" id="history">
+      <summary><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>これまでの記録 <span class="b mute">ファイル <%= S.exports.length %></span><svg class="ic s chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
+      <div class="body">
+      <div class="ready" style="margin-top:0">
         <% if (S.today) { %><span class="ok"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>今日 (<%= S.today_jst %>) の照合 あり · <%= S.run %></span><% } else { %><span class="err"><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg>今日 (<%= S.today_jst %>) の照合の回がまだ = 作れません<%= S.run ? ' (最後 ' + S.run + ')' : '' %></span><% } %>
         <% if (S.ne_codes.current) { %><span class="ok"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>NE の元のコード 今日の分</span><% } else { %><span class="err"><svg class="ic s" aria-hidden="true"><use href="#i-x"/></svg>NE の元のコード まだ / 古い (作れません)</span><% } %>
         <% for (const [k, v] of Object.entries(S.verified)) { %>
@@ -75,84 +187,13 @@
       <details class="more"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>CSV の列の見出しと、気をつけること</summary>
         <div class="body hint">
           <% for (const [k, v] of Object.entries(S.verified)) { %><div><b style="color:var(--text2)"><%= kindLabel[k] %></b> <span class="mono" style="font-size:12px;overflow-wrap:anywhere"><%= v.header %></span></div><% } %>
-          <div style="margin-top:6px">配った後も、商品の画面で値を直せます (代表 (親) と、確かめが終わる前のセットの構成は変えられません)。直した値は翌朝の照合のあと「NE に取り込む CSV」で NE に送れます。
-          全部成功なら申告はしなくても、翌朝の照合が配った値と NE を全部の列で比べて確かめます。NE の履歴の状態が「処理成功」でも、メッセージに「N件失敗」があったときは <b style="color:var(--text)">必ず「一部失敗」を申告</b>してください (申告しないと、入らなかった商品は「待ち」のままで作り直せません。申告の翌朝に、入らなかった商品が「取り込めなかった」になり、その商品だけで新しいファイルを作れます)。
+          <div style="margin-top:6px">色違い・サイズ違いの子は、ふつうの単品と同じ CSV に入ります (代表商品コードの列 = まとまりのコード)。まとまりの NE 登録待ちの子は全部いっしょに入れます。
+          配った後も、商品の画面で値を直せます (代表 (親) と、確かめが終わる前のセットの構成は変えられません)。直した値は翌朝の照合のあと「NEへ送る」で NE に送れます。
+          全部成功なら「取り込んだ」は押さなくても、翌朝の照合が配った値と NE を全部の列で比べて確かめます。NE の履歴の状態が「処理成功」でも、メッセージに「N件失敗」があったときは <b style="color:var(--text)">必ず「一部失敗した」を押して</b>ください (押さないと、入らなかった商品は「待ち」のままで作り直せません)。
           単品の JAN は NE に送りません (JAN の列は常に empty・JAN は Company DB に残ります)。</div>
         </div>
       </details>
-    </section>
-
-    <% if (S.parent_gate_all) { %><div class="callout warn" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t"><%- gateHtml(S.parent_gate_all) %></div><div class="hint">配ったファイルの申告・「取り込めなかった」商品だけの作り直し・使わないはできます。</div></div></div><% } %>
-    <section class="panel" aria-labelledby="h-cands">
-      <div class="panel-h"><span class="hico" aria-hidden="true">①</span><h2 id="h-cands">CSV にする商品</h2><span class="sub">下書き · NE 登録待ち</span></div>
-      <% if (!S.candidates.length) { %><div class="empty">下書き・NE 登録待ちの商品はありません。<br>新商品は <a href="<%= base %>/new?kind=single">新商品の登録</a> で下書きにします。</div><% } else { %>
-      <div class="tblwrap">
-        <table class="tbl" id="cands">
-          <caption class="sr">CSV にする商品 (作れるものだけ選べます)</caption>
-          <thead><tr><th scope="col" style="width:44px"><input type="checkbox" class="pick" id="pick-all" aria-label="作れる商品を全部選ぶ"<%= dis %>></th><th scope="col">コード</th><th scope="col">種類</th><th scope="col">登録</th><th scope="col">作れるか</th></tr></thead>
-          <tbody>
-          <% for (const c of S.candidates) { const blocked = c.blockers.length > 0; %>
-            <tr class="<%= blocked ? 'row-del' : '' %>">
-              <td><% if (blocked) { %><span class="sr">選べません</span><% } %><input type="checkbox" class="pick" data-kind="<%= c.kind %>" aria-label="<%= c.code %> を選ぶ" value="<%= c.code %>"<%= blocked || !canAct ? ' disabled' : '' %>></td>
-              <td class="code"><a href="<%= base %>/sku/<%= encodeURIComponent(c.code) %>"><%= c.code %></a></td>
-              <td><span class="b <%= c.kind === 'sets' ? 'vio' : 'mute' %>"><%= kindLabel[c.kind] %></span></td>
-              <td><%= REG_STATES[c.state] || c.state %><% if (c.live) { %><span class="sub">ファイル #<%= c.live.export_id %> (<%= ITEM_STATES[c.live.state] || c.live.state %>)</span><% } %></td>
-              <td>
-                <% for (const b of c.blockers) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><% if (c.gate && b === c.gate.text) { %><%- gateHtml(c.gate) %><% } else { %><%= b %><% } %></span></div><% } %>
-                <% for (const w of c.warnings) { %><div class="why-wrn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span><%= w %></span></div><% } %>
-                <% if (!c.blockers.length) { %><span class="why-ok"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>作れます<%= c.kind === 'sets' ? ' (構成品は全部 NE 確認済み)' : '' %></span><% } %>
-              </td>
-            </tr>
-          <% } %>
-          </tbody>
-        </table>
-      </div>
-      <div class="buildbar">
-        <button class="btn pri" type="button" data-act="build" data-kind="products"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>選んだ単品 <span data-n="products">0</span> 件の CSV を作る</button>
-        <button class="btn soft" type="button" data-act="build" data-kind="sets"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>選んだセット <span data-n="sets">0</span> 件の CSV を作る</button>
-        <span class="hint">単品とセットは別のファイルになります。セットは構成品が全部 NE 確認済みのときだけ。</span>
-      </div>
-      <div class="msgline" id="build-msg" role="status" aria-live="polite"></div>
-      <% } %>
-    </section>
-
-    <% if (S.variation && S.variation.length) { %>
-    <%# 🆕 PR-7: 色違い・サイズ違いのまとまり = まとまりの NE 登録待ちの子で 1 ファイル (ne-reg-variation-v1・代表商品コード = まとまりのコード・JAN は empty)。
-        1 回目の CSV を先に作ってから残りを足す・未処理の回が重なると 1 つのファイルにまとまる (中原さんの決定 10/11)。1 ファイルの上限を超えたら止めて理由と手順を出す %>
-    <section class="panel" id="vcands" aria-labelledby="h-vcands">
-      <div class="panel-h"><span class="hico" aria-hidden="true">①</span><h2 id="h-vcands">色違い・サイズ違いのまとまり</h2><span class="sub">1 回目の CSV を先に作ってから残りを足す · 未処理の回が重なると 1 つのファイルにまとまる · 代表商品コードの列 = まとまりのコード · JAN は送りません</span></div>
-      <% for (const g of S.variation) { %>
-      <article class="filecard vgroup" data-gid="<%= g.group_product_id %>" aria-labelledby="vg-<%= g.group_product_id %>">
-        <div class="fh"><span class="ttl" id="vg-<%= g.group_product_id %>"><span class="mono"><%= g.group_code %></span> <%= g.group_name || '' %></span><span class="b info">まとまり · <%= g.rounds.length %> 回</span></div>
-        <% if (g.too_many) { %>
-        <div class="callout err vtoo" style="margin:8px 0" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t">まだ CSV にしていない子が <%= g.pending_total.toLocaleString('ja-JP') %> 件 = 1 つのファイル (<%= S.max_rows.toLocaleString('ja-JP') %> 行まで) にできないので、このまとまりの CSV は作れません</div>
-          <div class="hint">このまとまりの NE 登録待ちの子は全部 1 つのファイルに入れる決まりです (回ごとには分けられない)。手順: ① 作らない子があれば、その子の商品の画面の「このまとまりから外す (廃止)」で減らす (<%= S.max_rows.toLocaleString('ja-JP') %> 件以下に) → このボタンが押せるようになります。② 減らせないときは管理者へ (Company DB の決まりの直しが要ります)。新しい登録は、まとめての登録の画面が「先に今ある分の CSV を作ってから」と止めます。</div></div></div>
-        <% } else if (g.pending_rounds > 1) { const all = g.rounds.flatMap((r) => r.codes); const allOk = g.rounds.every((r) => !r.pending || r.buildable); %>
-        <div class="callout info" style="margin:8px 0"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t"><%= g.rounds.filter((r) => r.pending).map((r) => r.no ? '回 ' + r.no : '回の分からない子').join('・') %> は、どれもまだ CSV にしていない = 1 つのファイルにまとまります (<%= all.length %> 行)</div>
-          <div class="hint">まとまりの NE 登録待ちの子は全部 1 つのファイルに入れます (中原さんの決定)。分けたいときは、次から 1 回目の CSV を先に作ってから「残りを足す」でください。</div>
-          <div style="margin-top:8px"><button class="btn pri" type="button" data-act="build-variation" data-codes="<%= JSON.stringify(all) %>"<%= canAct && allOk ? '' : ' disabled' %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>まとめて 1 ファイル (<%= all.length %> 件) を作る</button></div></div></div>
-        <% } %>
-        <% for (const r of g.rounds) { %>
-        <div class="vround" style="border-top:1px dashed var(--line-soft);padding:10px 0">
-          <div style="display:flex;gap:8px 14px;align-items:center;flex-wrap:wrap"><b><%= r.no ? '回 ' + r.no : '回の分からない子' %></b><span class="hint"><%= r.created_at ? when(r.created_at) + ' に登録' : '' %> · 子 <%= r.kids.length %> 件<%= r.pending !== r.kids.length ? ' (ファイルあり ' + (r.kids.length - r.pending) + ' 件)' : '' %></span>
-            <% if (r.pending) { %><button class="btn <%= g.pending_rounds > 1 ? 'soft' : 'pri' %> sm" type="button" data-act="build-variation" data-codes="<%= JSON.stringify(r.codes) %>"<%= canAct && r.buildable && g.pending_rounds === 1 && !g.too_many ? '' : ' disabled' %>><svg class="ic s" aria-hidden="true"><use href="#i-file"/></svg>この回の <%= r.codes.length %> 件の CSV を作る</button><% } %></div>
-          <div class="kidchips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
-          <% for (const k of r.kids) { %><a class="compchip" href="<%= base %>/sku/<%= encodeURIComponent(k.code) %>" title="<%= k.blockers.join(' / ') %>"><span class="mono"><%= k.code %></span><% if (k.live) { %> <span class="b mute">#<%= k.live.export_id %></span><% } else if (k.blockers.length) { %> <span class="b err">止まる</span><% } %></a><% } %>
-          </div>
-          <%# 🆕 0095: 代表 (親) の門は同じ 1 行が子ごとに並ぶ = 1 つにまとめて、ほかの理由は子ごと %>
-          <% const gk = r.kids.filter((x) => !x.live && x.gate); const gLines = [...new Map(gk.map((x) => [x.gate.text, x.gate])).values()]; %>
-          <% for (const g of gLines) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= gk.filter((x) => x.gate.text === g.text).map((x) => x.code).join('・') %>: <%- gateHtml(g) %></span></div><% } %>
-          <% for (const k of r.kids.filter((x) => !x.live && x.blockers.some((b) => !(x.gate && b === x.gate.text)))) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= k.code %>: <%= k.blockers.filter((b) => !(k.gate && b === k.gate.text)).join(' / ') %></span></div><% } %>
-        </div>
-        <% } %>
-        <div class="msgline" data-msg role="status" aria-live="polite"></div>
-      </article>
-      <% } %>
-    </section>
-    <% } %>
-
-    <section class="panel" aria-labelledby="h-files">
-      <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-files">ファイル</h2><span class="sub">ファイルごとに「次にやること」を 1 つだけ大きく出します</span></div>
+      <div id="files" style="margin-top:14px">
       <% if (!S.exports.length) { %><div class="empty">まだありません。</div><% } %>
       <% for (const e of S.exports) { const open = e.state !== 'closed'; %>
       <article class="filecard exp<%= open ? '' : ' closed' %>" data-id="<%= e.export_id %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-labelledby="ft-<%= e.export_id %>">
@@ -244,7 +285,28 @@
         <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
       </article>
       <% } %>
-    </section>
+      </div>
+      <% if (S.variation && S.variation.length) { %>
+      <%# 色違い・サイズ違いのまとまりの回 (記録だけ。作るのは上の「次の CSV」= ふつうの単品と同じ CSV に入る) %>
+      <div id="vcands" style="margin-top:14px">
+        <h3 style="font-size:15px;margin:0 0 6px">色違い・サイズ違いのまとまり (登録した回)</h3>
+        <% for (const g of S.variation) { %>
+        <article class="filecard vgroup" data-gid="<%= g.group_product_id %>" aria-labelledby="vg-<%= g.group_product_id %>">
+          <div class="fh"><span class="ttl" id="vg-<%= g.group_product_id %>"><span class="mono"><%= g.group_code %></span> <%= g.group_name || '' %></span><span class="b info">まとまり · <%= g.rounds.length %> 回</span></div>
+          <% for (const r of g.rounds) { %>
+          <div class="vround" style="border-top:1px dashed var(--line-soft);padding:8px 0">
+            <div style="display:flex;gap:8px 14px;align-items:center;flex-wrap:wrap"><b><%= r.no ? '回 ' + r.no : '回の分からない子' %></b><span class="hint"><%= r.created_at ? when(r.created_at) + ' に登録' : '' %> · 子 <%= r.kids.length %> 件<%= r.pending !== r.kids.length ? ' (ファイルあり ' + (r.kids.length - r.pending) + ' 件)' : '' %></span></div>
+            <div class="kidchips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+            <% for (const k of r.kids) { %><a class="compchip" href="<%= base %>/sku/<%= encodeURIComponent(k.code) %>" title="<%= k.blockers.join(' / ') %>"><span class="mono"><%= k.code %></span><% if (k.live) { %> <span class="b mute">#<%= k.live.export_id %></span><% } else if (k.blockers.length) { %> <span class="b err">止まる</span><% } %></a><% } %>
+            </div>
+          </div>
+          <% } %>
+        </article>
+        <% } %>
+      </div>
+      <% } %>
+      </div>
+    </details>
     <% } %>
   </div>
   <%- include('_footer') %>

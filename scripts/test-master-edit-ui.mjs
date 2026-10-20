@@ -1395,7 +1395,7 @@ await ta('[37] Amazon SKU (10/5): 新しい対応 = 名前で未保存 1 件 (�
   assert.equal(await p.isDisabled('#save'), true, '作った後は変えた欄が無ければ押せない');
 });
 
-await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウンロード) → 申告の書きかけ = 未保存 (離れるときの確認) → 違うファイルは照合で止める → 同じファイルで申告 → 読み直し', async (p, ctx) => {
+await ta('[38] NE 登録の CSV (🆕 10/20 ボタン 1 つ): 「NE 登録の CSV を作る」= 作って配ってその場でダウンロード → 「NE に取り込んだ」1 つで申告 → 前のファイルは「これまでの記録」(たたむ) の中で申告し直せる (書きかけ = 未保存・違うファイルは照合で止める)', async (p, ctx) => {
   process.env.MASTER_DECISION_APPROVERS = 'naka@test';
   // 今日の照合の回と NE の元のコード (前からある商品 = NE にある / ui-new-1 = 無い)
   const run = 'mc_' + new Date().toISOString().replace(/[-:.]/g, '') + '_abcdef';
@@ -1406,22 +1406,29 @@ await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウ
   await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(db, { runId: run, withSet: true });
   try {
     await p.goto(B + '/reg-csv');
-    const pick = p.locator('input.pick[value="ui-new-1"]');
-    assert.equal(await pick.isDisabled(), false, await p.textContent('#cands'));
-    const buildBtn = p.locator('button[data-act="build"][data-kind="products"]');
-    assert.equal(await buildBtn.isDisabled(), true, '0 件は押せない');
-    await pick.check();
-    assert.match(await buildBtn.textContent(), /選んだ単品 1 件/);
-    assert.equal(await dirty(p), 0, '選ぶだけは未保存にしない');
-    await buildBtn.click();
-    await p.waitForSelector('.saved-note:has-text("を作りました")');
-    const card = p.locator('article.exp').first();
-    assert.match(await card.textContent(), /配る \(ダウンロード\)/);
-    const [dl] = await Promise.all([p.waitForEvent('download'), card.locator('button[data-act="issue"]').click()]);
+    assert.match(await p.textContent('#next'), /ui-new-1/);
+    assert.equal(await p.locator('#history').evaluate((d) => d.open), false, '前のファイルはたたんである');
+    const buildBtn = p.locator('button[data-act="build-all"]');
+    assert.equal(await buildBtn.isDisabled(), false);
+    assert.equal(await dirty(p), 0);
+    // ボタン 1 つ = 作る → 配る → ダウンロード (画面は移らない)
+    const [dl] = await Promise.all([p.waitForEvent('download'), buildBtn.click()]);
     const file = path.join(DATA_TMP, 'ui-reg.csv');
     await dl.saveAs(file);
-    await p.waitForSelector('.saved-note:has-text("配りました")');
-    const c2 = p.locator('article.exp').first();
+    assert.match(fs.readFileSync(file, 'utf8'), /ui-new-1/);
+    await p.waitForSelector('.saved-note:has-text("CSV ができました")');
+    assert.ok(/\/reg-csv$/.test(new URL(p.url()).pathname), p.url());
+    // 「NE で取り込む」のカード = 「NE に取り込んだ」1 つ
+    const todo = p.locator('#todo article.todo-card').first();
+    assert.match(await todo.textContent(), /単品 \d+ 件の CSV/);
+    await todo.locator('button[data-act="declare-quick"][data-result="ok"]').click();
+    await p.waitForSelector('.saved-note:has-text("NE に取り込んだ」を記録しました")');
+    const st = (await pg.query("select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code_norm = 'ui-new-1'")).rows[0].state;
+    assert.equal(st, 'ne_pending');
+    assert.equal(await p.locator('#todo article.todo-card').count(), 0, '取り込んだファイルのカードは消える');
+    // 「これまでの記録」の中のファイル = 申告し直せる (書きかけ = 未保存・違うファイルは照合で止める)
+    await p.click('#history > summary');
+    const c2 = p.locator('#history article.exp').first();
     await c2.locator('button[data-act="show-declare"]').first().click();
     await c2.locator('input[name="ne_message"]').fill('1件成功しました。');
     assert.equal(await dirty(p), 1, '申告の書きかけ = 未保存');
@@ -1445,8 +1452,6 @@ await ta('[38] NE 登録の CSV (10/5): 選んだ数で作る → 配る (ダウ
     assert.ok(Math.abs(new Date(imp).getTime() - Date.now()) < 5000, imp);
     await c2.locator('button[data-act="declare"]').click();
     await p.waitForSelector('.saved-note:has-text("申告しました")');
-    const st = (await pg.query("select r.state from ops.master_registrations r join core.skus s on s.sku_id = r.sku_id where s.code_norm = 'ui-new-1'")).rows[0].state;
-    assert.equal(st, 'ne_pending');
     const att = (await pg.query('select imported_at, declared_at from ops.ne_reg_attempts order by attempt_id desc limit 1')).rows[0];
     assert.ok(att.imported_at && new Date(att.imported_at) <= new Date(att.declared_at), JSON.stringify(att));
     assert.equal(await dirty(p), 0);
@@ -1460,7 +1465,12 @@ await ta('[60] NE 登録の CSV (10/12 中原さんの画面の写真): 試し�
   for (const [schema, code] of [['ne-reg-single-v1', 's003'], ['ne-reg-set-v1', 'set001'], ['ne-reg-single-v2', 'k004'], ['ne-reg-variation-v1', 'k002']]) ids[schema] = await seedTrialDoneExport(pg, { sessionUser, schema, code });
   try {
     await p.goto(B + '/reg-csv');
-    const card = (k) => p.locator(`article.exp[data-id="${ids[k]}"]`);
+    // 🆕 10/20: 試しのセットが全部確かめ済み = 上の「NE で取り込む」に「問題なし (この形で本番にする)」が出る・前のファイルは「これまでの記録」(たたんである) の中
+    const top = p.locator(`#todo article.todo-card[data-id="${ids['ne-reg-set-v1']}"]`);
+    assert.equal(await top.locator('button[data-act="verified"][data-result="ok"]').isVisible(), true, '試しのセットの「問題なし」は上に出る');
+    for (const k of ['ne-reg-single-v1', 'ne-reg-single-v2', 'ne-reg-variation-v1']) assert.equal(await p.locator(`#todo article[data-id="${ids[k]}"]`).count(), 0, k);
+    await p.click('#history > summary');
+    const card = (k) => p.locator(`#history article.exp[data-id="${ids[k]}"]`);
     const v1 = card('ne-reg-single-v1');
     await v1.waitFor();
     assert.equal(await v1.locator('button[data-act="verified"]').count(), 0, 'v1 = 確かめた / ng のボタンを出さない');
