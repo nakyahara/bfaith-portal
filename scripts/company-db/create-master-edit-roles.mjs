@@ -325,11 +325,14 @@ export const LABEL_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_label_tables
  *   差の部品と表の守り (NE_UPD_OWNER_ONLY_FUNCTIONS)。関数が無い DB (0094 の前) では付けない
  */
 export const NE_UPD_EDIT_FUNCTIONS = Object.freeze(['ops.ne_upd_overview()', 'ops.ne_upd_sku(bigint)', 'ops.ne_upd_request_now(uuid, text)', 'ops.ne_upd_make_download(uuid, text)',
-  'ops.ne_upd_download(text, bigint)', 'ops.ne_upd_record_verified(text, text, text, text, text, text, text)']);
+  'ops.ne_upd_download(text, bigint)', 'ops.ne_upd_record_verified(text, text, text, text, text, text, text)',
+  'ops.ne_upd_one_file()']);   // 🆕 0096 = 単品 1 つ・セット 1 つの CSV の印 (画面が「0096 の後か」を見る)
 export const NE_UPD_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_ne_upd_write()', 'ops.ne_upd_cols()', 'ops.ne_upd_cell(text, jsonb, text)', 'ops.ne_upd_quote(text)', 'ops.ne_upd_text(text)',
   'ops.ne_upd_yen(numeric)', 'ops.ne_upd_units(bigint[], text)', 'ops.ne_upd_auto_limit()', 'ops.ne_upd_file_limit()', 'ops.ne_upd_busy()', 'ops._ne_upd_fill(bigint, boolean, text, boolean)',
   'ops.ne_upd_jstrim(text)', 'ops.ne_upd_file_out(text, timestamp with time zone, timestamp with time zone)',
-  'ops._ne_upd_begin()', 'ops._ne_upd_worker_state()', 'ops._ne_upd_actor_ok(text)']);
+  'ops._ne_upd_begin()', 'ops._ne_upd_worker_state()', 'ops._ne_upd_actor_ok(text)',
+  // 🆕 0096: 埋めるセル・1 つの組のファイル (作る関数の中の部品)
+  'ops._ne_upd_filler(text, bigint, text, text, jsonb, timestamp with time zone, jsonb)', 'ops._ne_upd_emit(bigint, text, text[], text[], jsonb, jsonb, jsonb, text, boolean)']);
 /**
  * 🆕 0095 (代表 (親) の門をずれたまとまりだけに絞る・中原さん 10/19): master_edit に CSV の候補が門で止まるかを読む関数 (読むだけ) の実行 (PARENT_GATE_EDIT_FUNCTIONS)。
  *   止めるのは品目の表の trigger (画面を信じない)。🚨 渡さない: 分け方・判断の部品・表の守り (PARENT_GATE_OWNER_ONLY_FUNCTIONS)。関数が無い DB (0095 の前) では付けない

@@ -170,6 +170,7 @@ await ta('[S3] API: 名簿に無い = 403・今すぐ = 頼みを積む・CSV �
   assert.equal(c.status, 200, JSON.stringify(c.j));
   assert.equal(c.j.state, 'built');
   assert.equal(c.j.files.length, 1);
+  assert.deepEqual([c.j.files[0].label, c.j.apart], ['単品の CSV', 0], '🆕 0096: 名前 = 単品の CSV');
   const id = c.j.files[0].file_id;
   assert.equal((await fetch(`${B}/api/ne-update/files/${id}/download`)).status, 404, 'GET では受け取れない');
   const d = await api(`/api/ne-update/files/${id}/download`, {});
@@ -178,10 +179,14 @@ await ta('[S3] API: 名簿に無い = 403・今すぐ = 頼みを積む・CSV �
   const buf = Buffer.from(await d.arrayBuffer());
   assert.equal(buf.toString('utf8'), 'syohin_code,genka_tnk\r\na01,150\r\n');
   assert.equal(d.headers.get('x-content-sha256'), crypto.createHash('sha256').update(buf).digest('hex'));
+  assert.equal(d.headers.get('x-ne-older'), '0', '🆕 0096: 前の CSV と重ならない');
   // 受け取った = 送っている途中 (画面の一言)
   const after = await page('/ne-update');
   assert.match(bodyText(after), /この欄は送っている途中です \(CSV を NE に取り込めば、明日の朝に一覧から消えます\)/);
   assert.match(after, new RegExp(`data-dl="${id}"`), '今日作った CSV をもう一度ダウンロードできる');
+  assert.match(bodyText(after).replace(/\s+/g, ' '), /\d{2}:\d{2} · 単品の CSV \(1 件\)/, '🆕 0096: ボタン = 単品の CSV');
+  assert.match(bodyText(after), /NE の画面で今日直した値は、この CSV で朝の値に戻ります/, '🆕 0096: 埋めるセルの一言 (1 行だけ)');
+  assert.equal((bodyText(after).match(/朝の値に戻ります/g) || []).length, 1);
   assert.doesNotMatch(bodyText(after), /#\d|ファイル #|ne-update-products/, 'ファイル番号・ファイル名は本文に出さない');
   EMAIL = 'edit@test';
   assert.equal((await api('/api/ne-update/verified', { kind: 'products', col: 'cost', result: 'ok' })).status, 403);
@@ -228,6 +233,7 @@ else {
         await p.goto(`${B}/ne-update`);
         const [dl] = await Promise.all([p.waitForEvent('download', { timeout: 15000 }), p.click('#nu-csv')]);
         assert.equal(fs.readFileSync(await dl.path(), 'utf8'), 'syohin_code,baika_tnk\r\na03,1300\r\n');
+        assert.equal(await p.locator('#nu-files button').first().textContent(), 'ダウンロード: 単品の CSV (1 件)', '🆕 0096: ボタンの名前');
         await p.waitForFunction(() => /NE に取り込んでください|保存しました/.test(document.querySelector('#nu-msg')?.textContent || ''), null, { timeout: 15000 });
         assert.equal(await p.locator('#nu-csv').isDisabled(), false, 'CSV を作った後も次を作れる');
         await q('select ops.ne_upd_worker_seen($1, true, false, $2)', ['minipc', 'v']);
