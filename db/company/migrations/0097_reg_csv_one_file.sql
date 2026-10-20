@@ -1,4 +1,4 @@
--- 0096 (仮番号: 0095 の次。同じころの NE 更新の CSV (fix/ne-update-one-file) と番号はマージの順に付け替える。migrate は欠番を断る): 新商品の NE 登録の CSV を「単品 1 つのファイル」にまとめる =
+-- 0097 (0096 = NE へ送るの 1 ファイル (#1762) の次。同じころの NE 更新の CSV (fix/ne-update-one-file) と番号はマージの順に付け替える。migrate は欠番を断る): 新商品の NE 登録の CSV を「単品 1 つのファイル」にまとめる =
 --   ふつうの単品と、色違い・サイズ違いのまとまり (ポータルで作ったまとまり) の子を同じ単品のファイル (ne-reg-single-v2) に入れられるようにする
 --   (2026-10-20 中原さん「まとまりごとでアップしないといけないから面倒。ボタンをワンクリックしたら CSV が作成できるようにしてほしい」)
 --
@@ -9,8 +9,8 @@
 --     (本番 10/19 のまとまりのファイル #9〜#14 = 翌朝の照合で代表まで 3 者一致)。= 行の順 (親を先に) の決まりは要らない。アプリはまとまりの子を並べて書く
 --   ・「まとまりで 1 ファイル」(0067 の variation_incomplete・中原さんの決定 10/11) の中身 = まとまりの NE 登録待ちの子を全部同じファイルに入れる、は残す
 --     (単品の版でも、ポータルで作ったまとまりの子を入れたら、そのまとまりの NE 登録待ちの子を全部入れる = 下で確かめる)。1 つのファイルに 2 つ以上のまとまり・ふつうの単品を入れてよい
--- なにを (前の最後の版を写して 🆕 0096 の行だけ変えた・鍵・許可・形の版・印・ハッシュ・約束・権限・security definer・search_path は同じ):
---   1. ops.reg_csv_one_file() = 印 (アプリが to_regprocedure で「0096 の後の DB か」を見る。前の DB = アプリはまとまりを今までどおりまとまりの版のファイルに分ける)
+-- なにを (前の最後の版を写して 🆕 0097 の行だけ変えた・鍵・許可・形の版・印・ハッシュ・約束・権限・security definer・search_path は同じ):
+--   1. ops.reg_csv_one_file() = 印 (アプリが to_regprocedure で「0097 の後の DB か」を見る。前の DB = アプリはまとまりを今までどおりまとまりの版のファイルに分ける)
 --   2. ops.ne_reg_build (0067 の版): 単品の版の variation_file_required の断りを外し、入れたポータルのまとまりごとに variation_incomplete を確かめる。
 --      まとまりの版 (variation-v1) の決まり (まとまりの子だけ・1 つのまとまり・全部の子) は変えない (前に作ったファイルの再送・API はそのまま)
 -- 変えない: 形の版の決まり (ops.ne_reg_schema_rule)・行と確かめる値 (ops.ne_reg_canonical)・翌朝の確かめ (3 者一致)・配る・申告・使わない・代表 (親) の門 (0095 の trigger)・
@@ -20,13 +20,13 @@
 
 -- ═══════════ 1. 印 ═══════════
 create or replace function ops.reg_csv_one_file() returns boolean language sql immutable set search_path = pg_catalog, pg_temp as $$ select true $$;
-comment on function ops.reg_csv_one_file() is '0096: 新商品の NE 登録の CSV の単品のファイルに、ポータルで作ったまとまりの子も入れられる DB の印 (アプリが to_regprocedure で見る)';
+comment on function ops.reg_csv_one_file() is '0097: 新商品の NE 登録の CSV の単品のファイルに、ポータルで作ったまとまりの子も入れられる DB の印 (アプリが to_regprocedure で見る)';
 revoke all on function ops.reg_csv_one_file() from public;
 
 -- ═══════════ 2. NE 登録の CSV を作る (0067 の版から・引数は同じ) ═══════════
 /**
  * 0067 と同じ (鍵の順・許可・形の版の決まり・NE のコード・大文字のコードの確かめ・行と確かめる値の照らし直し・印とハッシュ・約束) で、変えたのは単品の版のまとまりの子だけ:
- *   🆕 0096: 単品の版 (parent = ne_code) にポータルで作ったまとまり (予約 source = portal) の子を入れてよい。入れたまとまりごとに、そのまとまりの NE 登録待ちの子
+ *   🆕 0097: 単品の版 (parent = ne_code) にポータルで作ったまとまり (予約 source = portal) の子を入れてよい。入れたまとまりごとに、そのまとまりの NE 登録待ちの子
  *     (下書き / NE 登録待ちで生きているファイルの無い単品) を全部入れる (variation_incomplete = まとまりで 1 ファイル・0067 と同じ文)。
  *     まとまりの版 (parent = group = ne-reg-variation-v1) は 0067 のまま (全部がまとまりの子・1 つのまとまり・全部の子)
  */
@@ -73,8 +73,8 @@ declare
   v_vpar     bigint;   -- 🆕 0067: 品目の親
   v_group    bigint;   -- 🆕 0067: まとまりの版のまとまり
   v_left     text;     -- 🆕 0067: まとまりの NE 登録待ちの子でファイルに入っていないもの
-  v_groups   bigint[] := '{}';   -- 🆕 0096: 確かめるまとまり (単品の版に入れたポータルのまとまり + まとまりの版のまとまり)
-  v_g        bigint;   -- 🆕 0096
+  v_groups   bigint[] := '{}';   -- 🆕 0097: 確かめるまとまり (単品の版に入れたポータルのまとまり + まとまりの版のまとまり)
+  v_g        bigint;   -- 🆕 0097
 begin
   if v_actor = '' or pg_catalog.length(v_actor) > 320 then raise exception 'invalid_input: 作る人 (actor) が要る' using errcode = '22023'; end if;
   begin v_rid := (p ->> 'request_id')::uuid; exception when others then raise exception 'invalid_input: request_id の形が違う' using errcode = '22023'; end;
@@ -150,14 +150,14 @@ begin
     end if;
     -- 🆕 0064: 大文字も (CSV には打ったとおりの書き方を書く・品目の ne_code の CHECK も同じ形)
     if v_sku.code !~ '^[A-Za-z0-9_-]{1,30}$' then raise exception 'not_ready: % は新しいコードの形でない', v_sku.code using errcode = 'P0001'; end if;
-    -- 🆕 0067: 代表の列の版の決まり (まとまりの版 = 全部が同じまとまりの子 / 🆕 0096: 単品の版 = ポータルで作ったまとまりの子も入れてよい・そのまとまりの子は全部)
+    -- 🆕 0067: 代表の列の版の決まり (まとまりの版 = 全部が同じまとまりの子 / 🆕 0097: 単品の版 = ポータルで作ったまとまりの子も入れてよい・そのまとまりの子は全部)
     select pp.parent_product_id into v_vpar from core.products pp where pp.product_id = v_sku.product_id;
     if (v_rule ->> 'parent') = 'group' then
       if v_vpar is null then raise exception 'not_ready: % はまとまりの子でない (形の版 % はまとまりの子だけ)', v_sku.code, v_schema using errcode = 'P0001'; end if;
       if v_group is null then v_group := v_vpar;
       elsif v_group <> v_vpar then raise exception 'variation_mixed: 1 つのファイルは 1 つのまとまりの子だけ (%)', v_sku.code using errcode = 'P0001'; end if;
     elsif v_vpar is not null and exists (select 1 from ops.variation_group_codes g where g.group_product_id = v_vpar and g.source = 'portal') then
-      if not (v_vpar = any (v_groups)) then v_groups := v_groups || v_vpar; end if;   -- 🆕 0096: 下でそのまとまりの NE 登録待ちの子が全部入っているかを確かめる
+      if not (v_vpar = any (v_groups)) then v_groups := v_groups || v_vpar; end if;   -- 🆕 0097: 下でそのまとまりの NE 登録待ちの子が全部入っているかを確かめる
     end if;
     select r.state into v_reg from ops.master_registrations r where r.sku_id = v_sku.sku_id for share;
     if v_reg is null or v_reg not in ('draft', 'ne_pending') then
@@ -205,7 +205,7 @@ begin
       'expected', v_canon -> 'expected', 'cells', v_canon -> 'cells', 'snapshot_hash', v_snap, 'item_token', v_token));
   end loop;
   -- 🆕 0067: まとまりの版 = そのまとまりの NE 登録待ちの子 (下書き / NE 登録待ち・生きているファイルなし) を全部入れる (まとまりで 1 ファイル)
-  --   🆕 0096: 単品の版に入れたポータルのまとまりも、まとまりごとに同じ確かめ (1 つのファイルに 2 つ以上のまとまり・ふつうの単品があってよい)
+  --   🆕 0097: 単品の版に入れたポータルのまとまりも、まとまりごとに同じ確かめ (1 つのファイルに 2 つ以上のまとまり・ふつうの単品があってよい)
   if v_group is not null then v_groups := v_groups || v_group; end if;
   foreach v_g in array v_groups loop
     select pg_catalog.string_agg(k.code, '・' order by k.code_norm) into v_left

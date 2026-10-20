@@ -613,7 +613,7 @@ await ta('[N2] まとまりで 1 ファイル: 全部の子 = 作れる (版 var
   assert.equal(e1?.reason, 'variation_incomplete', e1?.message);
   const e2 = await errOf(build([...kids, 'grp1-RD'], { variation: true }));
   assert.equal(e2?.reason, 'variation_mixed', e2?.message);
-  // 🆕 0096 (仮番号・10/20 中原さん「まとまりごとでアップしないといけないから面倒」): 単品の版にもポータルのまとまりの子を入れてよい。ただし子が欠ける = variation_incomplete (まとまりで 1 ファイルのまま)
+  // 🆕 0097 (仮番号・10/20 中原さん「まとまりごとでアップしないといけないから面倒」): 単品の版にもポータルのまとまりの子を入れてよい。ただし子が欠ける = variation_incomplete (まとまりで 1 ファイルのまま)
   const e3 = await errOf(build(['Hakama-WH-90']));
   assert.equal(e3?.reason, 'variation_incomplete', e3?.message);
   const e4 = await errOf(build(['gate-single'], { variation: true }));
@@ -909,7 +909,7 @@ await ta('[S2] 本文の差: 0067 が置き換えた関数は前の最後の版�
     assert.equal(prev, want.base, `${name} の元にした版 (0067 より前の最後の定義) が変わった = 0067 の関数を新しい版から写し直す`);
     const d = lineDiff(fnDefIn(prev, name).split('\n'), fnDefIn(F0067, name).split('\n'));
     assert.deepEqual(d, { removed: want.removed, added: want.added }, `${name}: ${prev} との差`);
-    // 例外は名指しの 1 つ: 🆕 10/20 (0096 仮番号・reg_csv_one_file) が ops.ne_reg_build を 0067 の版から写す = その差は下の [S4] が確かめる
+    // 例外は名指しの 1 つ: 🆕 10/20 (0097 仮番号・reg_csv_one_file) が ops.ne_reg_build を 0067 の版から写す = その差は下の [S4] が確かめる
     const oneFile = (x) => name === 'ops.ne_reg_build' && /^\d{4}_reg_csv_one_file\.sql$/.test(x);
     for (const later of MIG_FILES.filter((x) => x > F0067 && !oneFile(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0067 の試験の元を見直す`);
   }
@@ -928,7 +928,7 @@ await ta('[S2] 本文の差: 0067 が置き換えた関数は前の最後の版�
   assert.deepEqual(await priv('ops.ne_reg_schema_rule(text)'), { pub: false, me: false });
 });
 
-await ta('[S4] 🆕 10/20 (0096 仮番号・reg_csv_one_file): ops.ne_reg_build の 0067 との差は、単品の版にポータルのまとまりの子を入れてよい・まとまりごとに子が全部か確かめる、の行だけ・印の関数・権限はそのまま', async () => {
+await ta('[S4] 🆕 10/20 (0097 仮番号・reg_csv_one_file): ops.ne_reg_build の 0067 との差は、単品の版にポータルのまとまりの子を入れてよい・まとまりごとに子が全部か確かめる、の行だけ・印の関数・権限はそのまま', async () => {
   const F1 = MIG_FILES.find((x) => /^\d{4}_reg_csv_one_file\.sql$/.test(x));
   assert.ok(F1, 'reg_csv_one_file の migration');
   assert.equal(MIG_FILES.filter((x) => x > F0067 && fnDefIn(x, 'ops.ne_reg_build')).join(','), F1, 'ops.ne_reg_build を 0067 の後に作り直すのはこの 1 本だけ');
@@ -941,11 +941,11 @@ await ta('[S4] 🆕 10/20 (0096 仮番号・reg_csv_one_file): ops.ne_reg_build 
       "where cp.parent_product_id = v_group and mr.state in ('draft', 'ne_pending')",
       'end if;'],
     added: [
-      "v_groups   bigint[] := '{}';   -- 🆕 0096: 確かめるまとまり (単品の版に入れたポータルのまとまり + まとまりの版のまとまり)",
-      'v_g        bigint;   -- 🆕 0096',
-      '-- 🆕 0067: 代表の列の版の決まり (まとまりの版 = 全部が同じまとまりの子 / 🆕 0096: 単品の版 = ポータルで作ったまとまりの子も入れてよい・そのまとまりの子は全部)',
-      'if not (v_vpar = any (v_groups)) then v_groups := v_groups || v_vpar; end if;   -- 🆕 0096: 下でそのまとまりの NE 登録待ちの子が全部入っているかを確かめる',
-      '--   🆕 0096: 単品の版に入れたポータルのまとまりも、まとまりごとに同じ確かめ (1 つのファイルに 2 つ以上のまとまり・ふつうの単品があってよい)',
+      "v_groups   bigint[] := '{}';   -- 🆕 0097: 確かめるまとまり (単品の版に入れたポータルのまとまり + まとまりの版のまとまり)",
+      'v_g        bigint;   -- 🆕 0097',
+      '-- 🆕 0067: 代表の列の版の決まり (まとまりの版 = 全部が同じまとまりの子 / 🆕 0097: 単品の版 = ポータルで作ったまとまりの子も入れてよい・そのまとまりの子は全部)',
+      'if not (v_vpar = any (v_groups)) then v_groups := v_groups || v_vpar; end if;   -- 🆕 0097: 下でそのまとまりの NE 登録待ちの子が全部入っているかを確かめる',
+      '--   🆕 0097: 単品の版に入れたポータルのまとまりも、まとまりごとに同じ確かめ (1 つのファイルに 2 つ以上のまとまり・ふつうの単品があってよい)',
       'if v_group is not null then v_groups := v_groups || v_group; end if;',
       'foreach v_g in array v_groups loop',
       "where cp.parent_product_id = v_g and mr.state in ('draft', 'ne_pending')",

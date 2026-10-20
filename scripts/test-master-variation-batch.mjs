@@ -425,7 +425,7 @@ await ta('[C1] まとまりの子は回ごとに並ぶ (ふつうの候補には
   const f2 = await asEditor(() => G.buildRegExport(db, { actor: 'naka@test', kind: 'products', variation: true, codes: rw2.rounds[1].codes, requestId: uuid() }, { open: true, nowMs: NOW_MS }));
   assert.notEqual(f1.export.export_id, f2.export.export_id);
   assert.deepEqual([f1.export.item_count, f2.export.item_count], [1, 1]);
-  // 🆕 0096 (仮番号・10/20): 単品の版にもまとまりの子を入れてよい (まとまりの NE 登録待ちの子が全部入るとき) = ふつうの単品と同じファイル
+  // 🆕 0097 (仮番号・10/20): 単品の版にもまとまりの子を入れてよい (まとまりの NE 登録待ちの子が全部入るとき) = ふつうの単品と同じファイル
   const r3 = await reg({ group: { mode: 'add', product_id: r1.group_product_id }, options: [{ axis: 1, code: '-NV', name: 'ネイビー' }], children: [{ code: 'roomwear-NV', choices: { 1: '-NV' }, name: 'ルームウェア【ネイビー】' }], values: VALUES });
   assert.equal(r3.ok, true);
   const f3 = await asEditor(() => G.buildRegExport(db, { actor: 'naka@test', kind: 'products', codes: ['roomwear-NV'], requestId: uuid() }, { open: true, nowMs: NOW_MS }));
@@ -475,9 +475,9 @@ await ta('[C2] 未処理の子 (CSV にしていない) + 今回 が 1 つのフ
   assert.equal(V.variationMaxFileRows(), G.REG_MAX_ROWS);
 });
 
-await ta('[C3] 🆕 10/20 ボタン 1 つ (buildRegAll): ふつうの単品と色違い・サイズ違いのまとまりの子を 1 つの単品のファイル (ne-reg-single-v2) に・まとまりは丸ごと (止まる子の居るまとまりは待つ・直すものに 1 行)・0096 の前の DB = まとまりごとのファイル・外す・その場で配る・押し直し = 同じファイル・もう無い = nothing_ready', async () => {
+await ta('[C3] 🆕 10/20 ボタン 1 つ (buildRegAll): ふつうの単品と色違い・サイズ違いのまとまりの子を 1 つの単品のファイル (ne-reg-single-v2) に・まとまりは丸ごと (止まる子の居るまとまりは待つ・直すものに 1 行)・0097 の前の DB = まとまりごとのファイル・外す・その場で配る・押し直し = 同じファイル・もう無い = nothing_ready', async () => {
   const S = await asEditor(() => G.regSummary(db, { nowMs: NOW_MS }));
-  assert.equal(S.one_file, true, '0096 (仮番号) の印');
+  assert.equal(S.one_file, true, '0097 (仮番号) の印');
   const P = S.plan;
   // 止まる子 (原価なし) の居るまとまり nocost = 入れない (作れる子は「一緒に入ります」・止まる子は直すもの)
   assert.ok(!P.groups.some((g) => g.group_code === 'nocost'));
@@ -489,7 +489,7 @@ await ta('[C3] 🆕 10/20 ボタン 1 つ (buildRegAll): ふつうの単品と�
   assert.equal(prod.length, 1, `単品のファイルは 1 つ: ${JSON.stringify(P.files)}`);
   assert.deepEqual(prod[0].codes, [...P.singles, ...P.groups.flatMap((g) => g.codes)], '並び = ふつうの単品 → まとまりごと');
   assert.deepEqual([prod[0].variation, prod[0].groups], [false, P.groups.map((g) => g.group_code)]);
-  // 0096 の前の DB = まとまりは 1 まとまり 1 ファイル (まとまりの版)
+  // 0097 の前の DB = まとまりは 1 まとまり 1 ファイル (まとまりの版)
   const old = G.regPlan({ ...S, one_file: false });
   assert.deepEqual(old.files.filter((f) => f.variation).map((f) => f.groups[0]), P.groups.map((g) => g.group_code));
   assert.ok(old.files.filter((f) => f.variation).every((f) => f.codes.length === P.groups.find((g) => g.group_code === f.groups[0]).codes.length));

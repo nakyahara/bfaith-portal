@@ -1384,7 +1384,7 @@ await ta('[V2] 0065 の関数の作り直し: 0065 より前の最後の版と�
     // 例外は名指しの 0067 (PR-5 = まとまりの版): ops.ne_reg_canonical / ops.ne_reg_build を 0065 の版から写す = その中身は scripts/test-master-variation.mjs の [S2] が 0065 との差で確かめる
     //   🆕 0082 (新商品の許可の切れ目を 0 に): ops.ne_reg_issue を 0065 の版から写す = 差は下で確かめる
     const allowLater = ['ops.ne_reg_canonical', 'ops.ne_reg_build'].includes(name) ? ['0067_variation_groups.sql'] : name === 'ops.ne_reg_issue' ? ['0082_new_entry_no_gap.sql'] : [];
-    //   🆕 10/20 (0096 仮番号・reg_csv_one_file): ops.ne_reg_build を 0067 の版から写す = 差は scripts/test-master-variation.mjs の [S4] が 0067 との差で確かめる
+    //   🆕 10/20 (0097 仮番号・reg_csv_one_file): ops.ne_reg_build を 0067 の版から写す = 差は scripts/test-master-variation.mjs の [S4] が 0067 との差で確かめる
     const oneFile = (x) => name === 'ops.ne_reg_build' && /^\d{4}_reg_csv_one_file\.sql$/.test(x);
     for (const later of MIG_FILES.filter((x) => x > F0065 && !allowLater.includes(x) && !oneFile(x))) assert.equal(fnDefIn(later, name), null, `${later} も ${name} を作り直している = 0065 の試験の元を見直す`);
   }
