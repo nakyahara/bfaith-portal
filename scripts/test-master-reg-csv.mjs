@@ -2700,6 +2700,98 @@ await ta('[LZ1] 2026-10-08 中原さん: 商品の画面でロジザードの有
   await supersede(x.export.export_id);
 });
 
+await ta('[G1] 🆕 0095 代表 (親) の門 = ずれた色違いのまとまりの商品だけ止まる (中原さん 10/19): 画面の候補に理由の 1 行 (ずれた商品は商品の画面へのリンク)・ほかの商品は選べる / 作る = 鍵の後に同じ判断で先に止める (not_ready)・lib を通らない作るも DB (trigger) が止める / どのまとまりか分からないずれ = 上に 1 つの知らせ・候補は全部止まる・作る = 409 parent_gate_closed / 画面のロールは読み取りの関数だけ', async () => {
+  // 形: 札 PG-GRP (まとまり)・その子の下書き pg-kid・関係の無い下書き pg-free・NE では PG-GRP の子なのに社内は親なしの単品 D (今朝の照合のずれ)
+  await reg('single', 'pg-kid', single({ name: 'PG 子' }));
+  await reg('single', 'pg-free', single({ name: 'PG 関係なし' }));
+  const tagId = (await one("insert into core.products (company_id, display_code, name) values (1, 'PG-GRP', 'PG') returning product_id::text as id")).id;
+  await pg.query('begin');
+  await pg.query("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())");
+  await pg.query("update core.products set parent_product_id = $1, parent_set_by = 'load' where product_id = (select product_id from core.skus where code = 'pg-kid')", [tagId]);
+  await pg.query('commit');
+  const base = ['s001', 's002', 's003', 's004', 's005', 's006', 's007', 'set001'];
+  const D = (await one(`select k.code from core.skus k left join ops.master_registrations r on r.sku_id = k.sku_id join core.products p on p.product_id = k.product_id
+     where k.sku_kind = 'single' and k.code = any($1::text[]) and coalesce(r.state, 'available') not in ('draft', 'ne_pending', 'cancelled', 'quarantined') and p.parent_product_id is null
+       and not exists (select 1 from core.products c where c.parent_product_id = p.product_id) order by k.code limit 1`, [base])).code;
+  /** 次の朝: 照合の回・NE の元のコード (0041)・代表の数え (D だけ patch)・新商品の許可 (本番 = 照合 ② が残す) */
+  const newDay = async (run, at, patch) => {
+    await pg.query('insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ($1, $2, 0)', [run, at]);
+    const rows = [...base.map((c) => ({ kind: 'single', code_norm: c, spellings: JSON.stringify([c]) })), { kind: 'rep', code_norm: 'pg-grp', spellings: JSON.stringify(['PG-GRP']) }];
+    await pg.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: run, entries: CNE.resolveNeCodes({ ok: true, rows }).entries })]);
+    const mirror = (await q(`select k.code_norm, k.sku_kind, nullif(core.norm_code(pp.display_code), '') as rep, pp.display_code as raw from core.skus k
+        left join core.products p on p.product_id = k.product_id left join core.products pp on pp.product_id = p.parent_product_id
+       where k.company_id = 1 and k.sku_kind in ('single', 'set') order by k.code_norm`))
+      .map((r) => (r.code_norm === D ? patch : r.sku_kind === 'set' ? [r.code_norm, 'set', null, null, null] : [r.code_norm, 'single', 'ok', r.rep ?? null, r.rep ? r.raw : null]));
+    const obs = { format: 'parent-obs-v1', complete: true, untrusted: [], rep_spellings: { state: 'ok' }, trust: { fetch_counts: 'ok', integrity: 'ok', kind_gate_integrity: 'ok', rep_spellings: 'ok' }, rows: mirror };
+    const t = new Date(Date.now() - 60000).toISOString();
+    const r = (await one('select ops.record_parent_gate($1, $2::jsonb, $3, $4, $5::jsonb) as r', [run, JSON.stringify({ generation_id: `g_${run}`, raw_hash: 'd'.repeat(64), products_complete_at: t, setproducts_complete_at: t }),
+      'mat_g1', 'e'.repeat(64), JSON.stringify(obs)])).r;
+    await (await import('./fixtures/master-widen.mjs')).seedNewEntryLease(pgliteAdapter(pg), { runId: run, withSet: true });
+    return { ...r, gate: (await one('select ops.parent_gate_state() as s')).s };   // 門の状態は許可の回の後に読む (本番の照合 ② = 許可の回の記録の後に代表の数え)
+  };
+  const r1 = await newDay('mc_20300110T145000000Z_c0ffee', '2030-01-10T14:50:00Z', [D, 'single', 'ok', 'pg-grp', 'PG-GRP']);
+  assert.equal(r1.counts.parent_missing, 1, JSON.stringify(r1.counts));
+  assert.deepEqual([r1.gate.enforced, r1.gate.scope.all, r1.gate.scope.groups.map((g) => [g.label, g.codes])], [true, false, [['PG-GRP', [D]]]]);
+  const pre = '色違いのまとまり PG-GRP が NE とずれているので、この商品は CSV にできません。';
+  const want = `${pre}${D} などの代表を NE と同じにすると直ります`;
+  // 画面の候補 (画面のロール): pg-kid だけ止まる (理由の 1 行 + D へのリンク)・pg-free は選べる
+  const S1 = await as(E, 'master_edit', () => G.regSummary(db, { nowMs: NOW_MS }));
+  const kid = S1.candidates.find((c) => c.code === 'pg-kid'); const free = S1.candidates.find((c) => c.code === 'pg-free');
+  assert.deepEqual(kid.blockers, [want]);
+  assert.deepEqual(kid.gate, { kind: 'group', text: want, pre, codes: [D], post: ' などの代表を NE と同じにすると直ります' });
+  assert.deepEqual([free.blockers, free.gate, S1.parent_gate_all], [[], undefined, null]);
+  // ほかに止まるのは D を構成品に入れたセットだけ (今の構成・開いている構成の依頼)
+  const setsWithD = (await q(`select p.code from core.sku_components c join core.skus p on p.sku_id = c.parent_sku_id join core.skus k on k.sku_id = c.child_sku_id where k.code = $1
+     union select s.code from ops.sku_component_requests r join core.skus s on s.sku_id = r.set_sku_id, jsonb_array_elements(r.rows) x
+      where r.status = 'open' and (x ->> 'sku_id') = (select sku_id::text from core.skus where code = $1)`, [D])).map((x) => x.code);
+  const gated = S1.candidates.filter((c) => c.blockers.some((b) => /色違いのまとまり/.test(b)));
+  assert.deepEqual(gated.map((c) => c.code).sort(), ['pg-kid', ...S1.candidates.filter((c) => setsWithD.includes(c.code)).map((c) => c.code)].sort());
+  assert.ok(gated.length > 1 && gated.every((c) => c.gate && c.gate.text === want), '構成品に D があるセットも同じ 1 行');
+  // 作る: 止まる商品が入っていれば何も作らない (理由は同じ 1 行)・関係の無い商品だけなら作れる
+  const e1 = await rejectsWith(build('products', ['pg-kid', 'pg-free']), 409, 'not_ready');
+  assert.deepEqual(e1.extra.items, [{ code: 'pg-kid', stop: null, blockers: [want] }]);
+  const ok1 = await build('products', ['pg-free']);
+  assert.equal(ok1.export.state, 'built');
+  await supersede(ok1.export.export_id);
+  // lib を通らずに DB の関数で作っても、品目の表の trigger が止める (画面を信じない)
+  const kidId = await skuId('pg-kid');
+  const canon = (await one('select ops.ne_reg_canonical($1, $2::date) as c', [kidId, TODAY])).c;
+  assert.deepEqual(canon.blockers, []);
+  const spec = G.REG_SCHEMAS.products;
+  const mark = (await one('select compare_run_id from ops.master_ne_code_mark')).compare_run_id;
+  await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [JSON.stringify({ request_id: uuid(), actor: 'boss@test', ownership: ALL_COMPANY,
+    kind: 'products', schema_version: spec.schema, header: spec.header.join(','), ne_codes_run: mark, cost_day: TODAY, items: [{ sku_id: kidId, expected: canon.expected, rows: canon.cells }] }),
+    G.buildRegCsv(spec, canon.cells.map((r) => r.map(String))).bytes])), new RegExp(`^parent_gate_group: ${want}$`));
+  // 画面のロール = 読み取りの関数だけ (部品・表はだれにも渡さない)
+  assert.equal((await one("select has_function_privilege('master_edit', 'ops.parent_gate_csv_check(bigint[])', 'execute') as ok")).ok, true);
+  for (const f of ['ops._parent_gate_match(bigint, jsonb)', 'ops._parent_gate_items(text[])', 'ops._parent_gate_codes(text[], bigint[])', 'ops._parent_gate_global_problems()', 'ops._parent_gate_block(bigint, jsonb)', 'ops.parent_gate_state()']) {
+    assert.equal((await one("select has_function_privilege('master_edit', $1, 'execute') as ok", [f])).ok, false, f);
+  }
+  assert.equal((await one("select has_table_privilege('master_edit', 'ops.master_parent_gate_scopes', 'select') as ok")).ok, false);
+  // 画面: 理由の 1 行と D へのリンク・pg-kid は選べない・pg-free は選べる
+  process.env.MASTER_EDIT_OPEN = '1';
+  const srv = http.createServer(app);
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const get = async (url) => (await fetch(`http://127.0.0.1:${srv.address().port}${url}`, { headers: { Accept: 'text/html', 'x-test-session': 'boss@test' } })).text();
+  try {
+    let html = await get('/apps/master-edit/reg-csv');
+    assert.ok(html.includes(`<span>${pre}<a href="/apps/master-edit/sku/${D}">${D}</a> などの代表を NE と同じにすると直ります</span>`), '理由の 1 行とリンク');
+    assert.match(html, /value="pg-kid" disabled/); assert.match(html, /value="pg-free"(?![^>]*disabled)/);
+    // どのまとまりか分からないずれ (D の NE の代表が読めない) の朝 = 全部止める (上に 1 つの知らせ・候補には短い一言)
+    const r2 = await newDay('mc_20300110T145500000Z_c0ffef', '2030-01-10T14:55:00Z', [D, 'single', 'unknown', null, null]);
+    assert.equal(r2.gate.scope.all, true);
+    const allText = `NE とずれた商品の中に、どの色違いのまとまりか分からないものがあるので、いまは新しい商品の CSV を作れません。${D} などを直すと作れます`;
+    const S2 = await as(E, 'master_edit', () => G.regSummary(db, { nowMs: NOW_MS }));
+    assert.deepEqual(S2.parent_gate_all, { kind: 'all', text: allText, pre: 'NE とずれた商品の中に、どの色違いのまとまりか分からないものがあるので、いまは新しい商品の CSV を作れません。', codes: [D], post: ' などを直すと作れます' });
+    for (const c of ['pg-kid', 'pg-free']) assert.deepEqual(S2.candidates.find((x) => x.code === c).blockers.at(-1), G.PARENT_GATE_ALL_ROW, c);
+    const e2 = await rejectsWith(build('products', ['pg-free']), 409, 'parent_gate_closed');
+    assert.equal(e2.message, `${allText} (何も作っていません)`);
+    html = await get('/apps/master-edit/reg-csv');
+    assert.ok(html.includes(`<div class="t">NE とずれた商品の中に、どの色違いのまとまりか分からないものがあるので、いまは新しい商品の CSV を作れません。<a href="/apps/master-edit/sku/${D}">${D}</a> などを直すと作れます</div>`), '上の知らせ');
+    assert.match(html, /value="pg-free"[^>]*disabled/);
+  } finally { await new Promise((r) => srv.close(r)); }
+});
+
 try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch { /* Windows で開いたままのことがある */ }
 console.log(`\n${passed} 件 ok`);
 if (process.exitCode) console.log('NG があります');

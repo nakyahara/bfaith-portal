@@ -52,11 +52,11 @@ const plan = (codes) => ({ skus: [...codes.map(single), setOf('s01'), { ...singl
   suppliers: [{ code: '0001', name: 'AMC' }], supplierSkus: [] });
 
 /** 1 つの DB (0068 まで・本物の初期ロード・段階 new_open・products.parent = load) */
-async function setupDb(codes) {
+async function setupDb(codes, customPlan = null) {
   const pg = new PGlite();
   const db = pgliteAdapter(pg);
   await applyMigrations(db, { log: quiet });
-  const r = await runInitialLoad(db, plan(codes), { log: quiet, runId: `pg_load_${crypto.randomBytes(3).toString('hex')}`, host: 'test' });
+  const r = await runInitialLoad(db, customPlan || plan(codes), { log: quiet, runId: `pg_load_${crypto.randomBytes(3).toString('hex')}`, host: 'test' });
   assert.equal(r.ok, true, r.error);
   await forceNewOpen(db, BASE);
   const q = async (sql, p) => (await db.query(sql, p)).rows;
@@ -71,11 +71,11 @@ async function setupDb(codes) {
   const setParent = (childPid, parentPid) => tx(() => db.query("update core.products set parent_product_id = $2, parent_set_by = 'load' where product_id = $1", [childPid, parentPid]), PARENT_TX);
   const setReg = (code, state) => tx(() => db.query(`update ops.master_registrations set state = $2, state_changed_by = 't', state_changed_at = now()
     where sku_id = (select sku_id from core.skus where code = $1)`, [code, state]), ["select set_config('ops.registration_protocol', '1', true)"]);
-  const mkItem = async (code) => {
+  const mkItem = async (code, expected = {}) => {
     const e = (await one(`insert into ops.ne_reg_exports (kind, schema_version, header, encoding, trial, item_count, row_count, aggregate_token, payload_hash, sha256, file_bytes, request_id, ne_codes_run, cost_day, created_by)
       values ('products', 'ne-reg-single-v2', 'syohin_code', 'utf8', false, 1, 1, repeat('a', 64), repeat('b', 64), repeat('c', 64), '\\x00', gen_random_uuid(), 'x', current_date, 't') returning export_id`)).export_id;
     const i = (await one(`insert into ops.ne_reg_export_items (export_id, sku_id, code_norm, ne_code, sku_kind, item_token, expected, snapshot_hash, row_from, row_to, state_changed_by)
-      select $1, k.sku_id, k.code_norm, k.code, k.sku_kind, repeat('e', 64), '{}'::jsonb, repeat('f', 64), 1, 1, 't' from core.skus k where k.code = $2 returning item_id`, [e, code])).item_id;
+      select $1, k.sku_id, k.code_norm, k.code, k.sku_kind, repeat('e', 64), $3::jsonb, repeat('f', 64), 1, 1, 't' from core.skus k where k.code = $2 returning item_id`, [e, code, JSON.stringify(expected)])).item_id;
     return { exportId: e, itemId: i };
   };
   const step = async (it, to) => {
@@ -261,7 +261,7 @@ await ta('[P5] 門: 持ち主 load の間は閉じない (ずれがあっても�
   const tg = await G.tag('grpZ');
   await G.setParent(await G.pidOf('g01'), tg);
   for (const c of ['g02', 'g03', 'g04', 'g05', 'g06']) await G.setReg(c, 'draft');
-  const closedRe = /parent_gate_closed: 代表 \(親\) の数えの門が閉じている/;
+  const closedRe = /parent_gate_closed: .*代表 \(親\) の数えの門が閉じている/;
   const DRIFT = obsOf([S('g01'), S('g02'), S('g03'), S('g04'), S('g05'), S('g06')]);   // NE は g01 に親なし = 違う 1
   // ① load: 記録が無くても・ずれがあっても閉じない (今の単品の登録を止めない)
   const st0 = (await G.one('select ops.parent_gate_state() as s')).s;
@@ -376,9 +376,9 @@ await ta('[P7] JS: 観測 (nModelOf → parentObservations)・選べる解決・
   assert.match(lb, /^⚠️ ②: 判定できない \(stale_ne\) .* \/ ⚠️ 代表 \(親\) が NE とずれた単品 3 件/);
   // company: ずれ = 新しい CSV を閉じた (一番先頭)・記録できない = 閉じたまま
   const driftC = { ...driftL, owner: 'company' };
-  assert.match(summaryLine({ ...blocked, ne: { ...blocked.ne, parent_gate: driftC } }), /^⚠️ 代表 \(親\) が NE とずれた単品 3 件 .* → 新しい NE 登録の CSV \(作る・配る\) は閉じた .* \/ ⚠️ ②: 判定できない/);
+  assert.match(summaryLine({ ...blocked, ne: { ...blocked.ne, parent_gate: driftC } }), /^⚠️ 代表 \(親\) が NE とずれた単品 3 件 .* → 新しい NE 登録の CSV \(作る・配る\) は全部止めた .* \/ ⚠️ ②: 判定できない/);
   const failC = { state: 'failed', owner: 'company', error: 'writer down', counts: counts() };
-  assert.match(summaryLine(R(failC)), /^⚠️ 代表 \(親\) の数えを記録できない \(書けない: writer down\) → 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+  assert.match(summaryLine(R(failC)), /^⚠️ 代表 \(親\) の数えを記録できない \(書けない: writer down\) → 新しい NE 登録の CSV \(作る・配る\) は全部止めた/);
   assert.equal(parentNote({ parent_gate: failC }), null);
   // load: 記録できない = ℹ️ (後ろ・CSV は閉じない)・書く接続が無い朝で数え 0 = 黙る・関数が無い (0068 の前) = 黙る
   const failL = { state: 'failed', owner: 'load', error: 'writer down', counts: counts() };
@@ -549,11 +549,11 @@ await ta('[P12] (#1676 Codex R1 Medium) 持ち主が company で記録も重い�
   const a = await recordParentGate(writer, { compareRunId: runId(), parentObs, evidenceSha256: hex('e'), readDb: readDb(true) });
   assert.deepEqual([a.state, a.owner, a.gate?.enforced], ['failed', 'company', true]);
   assert.match(a.read_error, /statement timeout/);
-  assert.match(parentTrouble({ parent_gate: a }), /代表 \(親\) の数えを記録できない .*→ 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+  assert.match(parentTrouble({ parent_gate: a }), /代表 \(親\) の数えを記録できない .*→ 新しい NE 登録の CSV \(作る・配る\) は全部止めた/);
   assert.equal(parentNote({ parent_gate: a }), null);
   const b = await recordParentGate(writer, { compareRunId: runId(), parentObs, evidenceSha256: hex('e'), readDb: readDb(false) });
   assert.deepEqual([b.state, b.owner, b.gate], ['failed', undefined, undefined]);
-  assert.match(parentTrouble({ parent_gate: b }), /代表 \(親\) の数えを記録できない .*持ち主が分からない.*→ 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+  assert.match(parentTrouble({ parent_gate: b }), /代表 \(親\) の数えを記録できない .*持ち主が分からない.*→ 新しい NE 登録の CSV \(作る・配る\) は全部止めた/);
   assert.equal(parentNote({ parent_gate: b }), null, '持ち主が分からない朝に「持ち主は夜間ロード」と言わない');
   // 書く接続が無く読み直しもできない朝も同じ (持ち主が分からない = ⚠️)
   assert.match(parentTrouble({ parent_gate: { state: 'not_configured' } }), /持ち主が分からない/);
@@ -592,7 +592,7 @@ await ta('[P13] (#1676 Codex R2 High) 書き方の台帳 (raw_ne_code_spellings)
   assert.equal((await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n, n0, '記録は作らない');
   // 朝の要約: load = 照合は止めない・ℹ️ (CSV は閉じない) / company = ⚠️ 閉じたまま
   assert.match(parentNote({ parent_gate: r }), /^ℹ️ 代表 \(親\) の数えを記録できない \(NE のコードの元の書き方 \(代表\) を読めない: not_collected・持ち主は夜間ロード = CSV は閉じない\)$/);
-  assert.match(parentTrouble({ parent_gate: { ...r, owner: 'company' } }), /代表 \(親\) の数えを記録できない \(NE のコードの元の書き方 \(代表\) を読めない: not_collected\).* → 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+  assert.match(parentTrouble({ parent_gate: { ...r, owner: 'company' } }), /代表 \(親\) の数えを記録できない \(NE のコードの元の書き方 \(代表\) を読めない: not_collected\).* → 新しい NE 登録の CSV \(作る・配る\) は全部止めた/);
   // 照合の実行口: 台帳を読めない回も照合は最後まで走る (証跡・全件 JSON・要約)・記録は作らない
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vg6-pgate-sp-'));
   try {
@@ -669,7 +669,7 @@ await ta('[P14] (#1676 Codex R3 High 1・2) 確かめられない回 = 代表の
   // load = ℹ️ (照合は止めない・CSV は閉じない) / company = ⚠️ 閉じたまま
   assert.match(parentNote({ parent_gate: a }), /^ℹ️ 代表 \(親\) の数えを記録できない \(NE のコードの元の書き方 \(代表\) を読めない: invalid_rep_spellings:1・持ち主は夜間ロード = CSV は閉じない\)$/);
   assert.match(parentNote({ parent_gate: b }), /^ℹ️ 代表 \(親\) の数えを記録できない \(NE の取得を確かめられない \(取得の件数・取込の整合・区分のゲートの許可の一覧\): c1_set_rows_dropped・持ち主は夜間ロード = CSV は閉じない\)$/);
-  assert.match(parentTrouble({ parent_gate: { ...b, owner: 'company' } }), /代表 \(親\) の数えを記録できない \(NE の取得を確かめられない .*c1_set_rows_dropped\).* → 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+  assert.match(parentTrouble({ parent_gate: { ...b, owner: 'company' } }), /代表 \(親\) の数えを記録できない \(NE の取得を確かめられない .*c1_set_rows_dropped\).* → 新しい NE 登録の CSV \(作る・配る\) は全部止めた/);
   // 照合の実行口: 止めない (証跡は complete・要約は ℹ️ の一言)
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vg6-pgate-r3-'));
   try {
@@ -691,7 +691,7 @@ await ta('[P14] (#1676 Codex R3 High 1・2) 確かめられない回 = 代表の
     const run = runId(); await gate0(run);
     const r = await recordParentGate(async () => G.db, { compareRunId: run, parentObs: { obs, fetch: FETCH(), material_generation_id: 'mat_x' }, evidenceSha256: hex('e'), readDb: G.db });
     assert.deepEqual([r.owner, r.gate.open], ['company', false]);
-    assert.match(parentTrouble({ parent_gate: r }), /→ 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+    assert.match(parentTrouble({ parent_gate: r }), /→ 新しい NE 登録の CSV \(作る・配る\) は全部止めた/);
     assert.match((await errOf(G.mkItem('k02')))?.message ?? '', /parent_gate_closed: .*no_parent_gate_result/);
   }
   const runOk = runId(); await gate0(runOk);
@@ -799,7 +799,7 @@ await ta('[P16] (#1676 Codex R4 Medium) 照合 ② が代表の観測を作る�
     await seedActiveEpoch(G.db, COMPANY);
     const z = await runWith(G.db, blocked);
     assert.deepEqual([z.result.ne.parent_gate.owner, z.result.ne.parent_gate.gate.open], ['company', false]);
-    assert.match(z.line, /^⚠️ 代表 \(親\) の数えを記録できない \(照合 ② が代表の観測を作る前に止まった: ne_blocked:no_integrity\) → 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+    assert.match(z.line, /^⚠️ 代表 \(親\) の数えを記録できない \(照合 ② が代表の観測を作る前に止まった: ne_blocked:no_integrity\) → 新しい NE 登録の CSV \(作る・配る\) は全部止めた/);
     await G.pg.close();
     // 持ち主が分からない (門の状態を読めない) = company と同じ ⚠️ / 0068 の前 (関数が無い) = 黙る
     assert.match(parentTrouble({ parent_gate: { state: 'no_obs', reason: 'ne_error' } }), /持ち主が分からない.*→ 新しい NE 登録の CSV/);
@@ -908,7 +908,7 @@ await ta('[P17] (#1676 Codex R5 High 1・2) 4 つの信号は形が完全に正�
     const run = runId(); await gate0(run);
     const r = await recordParentGate(async () => company.db, { compareRunId: run, parentObs: { obs: { ...parentObservations(m, { trust: parentObsTrust(sigOk(sp)), repSpellings: sp }), rows: [S('r01'), S('r02')] }, fetch: FETCH(), material_generation_id: 'mat_x' }, evidenceSha256: hex('e'), readDb: company.db });
     assert.deepEqual([r.state, r.owner, r.gate.open], ['no_spellings', 'company', false]);
-    assert.match(parentTrouble({ parent_gate: r }), /代表 \(親\) の数えを記録できない \(NE のコードの元の書き方 \(代表\) を読めない: damaged_spellings:1\) → 新しい NE 登録の CSV \(作る・配る\) は閉じた/);
+    assert.match(parentTrouble({ parent_gate: r }), /代表 \(親\) の数えを記録できない \(NE のコードの元の書き方 \(代表\) を読めない: damaged_spellings:1\) → 新しい NE 登録の CSV \(作る・配る\) は全部止めた/);
     assert.match((await errOf(company.mkItem('r02')))?.message ?? '', /parent_gate_closed: .*no_parent_gate_result/);
   }
   // 台帳の答えの形 (damaged が無い・entries の形が違う・collided の形が違う) = ok にしない
@@ -1043,6 +1043,249 @@ await ta('[P18] (#1676 Codex R6 Medium) 取込の整合の件数と配列を照�
   }
   assert.equal((await E.one('select count(*)::int as n from ops.master_parent_gate_results')).n, n0, 'どの形も 0 件の記録を作らない');
   assert.ok((await driftList({ ne: neOf(INT_META()), db: E.db })).counted > 0, '正しい形 = 数える');
+});
+
+// ═══════════ 🆕 0095: 門をずれた色違いのまとまりだけに絞る (中原さん 10/19 = 作る) ═══════════
+await ta('[P19] 🆕 0095 門はずれたまとまりだけ: まとまり A のずれ (要確認の子・親なし) = A の子・A の代表を書く行・A の子を入れたセット・ずれた子そのものは止まる (DB の trigger) / B・C・代表なしの商品は作れる・配れる / 「NE の代表を採用する」と同じに社内を直す = その場で開く / NE と違う = 2 つのまとまり / NE に無い = 社内のまとまり / どのまとまりか分からないずれ・0095 の前の記録・分けた数が合わない・今朝の数えが無い = 全部止める', async () => {
+  const codes = ['a1', 'a2', 'ra', 'anew', 'b1', 'b2', 'bnew', 'n1', 'mx', 'cx', 'c1', 'cnew', 'vrow', 'repx', 'rx', 'xnew', 'dd', 'dnew'];
+  const P = { skus: [...codes.map(single), setOf('sa'), setOf('sb'), { ...single('x01'), kind: 'exception' }], variationGroups: [],
+    setComponents: [{ parentCode: 'sa', childCode: 'a1', qty: 1, source: 'ne' }, { parentCode: 'sb', childCode: 'b1', qty: 1, source: 'ne' }],
+    listings: [], observations: [], physicals: [], compliance: [], workers: [], suppliers: [{ code: '0001', name: 'AMC' }], supplierSkus: [] };
+  const G = await setupDb(codes, P);
+  const T2 = {};
+  for (const d of ['grpA', 'grpB', 'grpC']) T2[d] = await G.tag(d);
+  for (const c of ['a1', 'a2', 'anew']) await G.setParent(await G.pidOf(c), T2.grpA);
+  for (const c of ['b1', 'b2', 'bnew', 'mx']) await G.setParent(await G.pidOf(c), T2.grpB);
+  for (const c of ['c1', 'cnew']) await G.setParent(await G.pidOf(c), T2.grpC);
+  for (const c of ['anew', 'bnew', 'n1', 'cnew', 'vrow', 'xnew', 'dnew']) await G.setReg(c, 'draft');
+  // 名札 (display_code) と SKU のコードが違う代表の商品: repx の商品の名札 = DISPX (NE の代表商品コードは SKU のコード repx)・xnew の社内の代表 = その商品
+  await G.tx(() => G.q("update core.products set display_code = 'DISPX' where product_id = (select product_id from core.skus where code = 'repx')"));
+  await G.setParent(await G.pidOf('xnew'), await G.pidOf('repx'));
+  await G.setReg('ra', 'quarantined');   // NE で直接足した色違いの子 = 社内は親なし (10/19 の 6 件と同じ形)
+  await seedActiveEpoch(G.db, COMPANY);
+  const ROWS = (o = {}) => [S('a1', 'grpa', 'grpA'), S('a2', 'grpa', 'grpA'), S('ra', 'grpa', 'grpA'), S('b1', 'grpb', 'grpB'), S('b2', 'grpb', 'grpB'), S('mx', 'grpb', 'grpB'),
+    S('cx'), S('c1', 'grpc', 'grpC'), S('repx'), S('rx'), S('dd'), SET('sa'), SET('sb')].map((r) => (o[r[0]] === undefined ? r : o[r[0]])).filter(Boolean);
+  const record = async (obs) => {
+    const run = runId();
+    await G.q('select ops.close_new_entry_for_compare($1)', [run]);
+    await G.q('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', [run, nowRfc(), JSON.stringify(ZERO_GATE)]);
+    return (await G.one('select ops.record_parent_gate($1, $2::jsonb, $3, $4, $5::jsonb) as r', [run, JSON.stringify(FETCH()), 'mat_1', hex('d'), JSON.stringify(obs)])).r;
+  };
+  const sid = async (c) => String((await G.one('select sku_id from core.skus where code = $1', [c])).sku_id);
+  const check = async (cs) => (await G.one('select ops.parent_gate_csv_check($1::bigint[]) as r', [await Promise.all(cs.map(sid))])).r;
+  const blockedCodes = async (cs) => { const r = await check(cs); const by = new Map(await Promise.all(cs.map(async (c) => [await sid(c), c]))); return r.items.map((x) => by.get(x.sku_id)).sort(); };
+  const ALL = ['anew', 'bnew', 'n1', 'cnew', 'sa', 'sb', 'ra', 'vrow'];
+  const passes = async (c, exp = {}) => { const it = await G.mkItem(c, exp); await G.step(it, 'superseded'); };   // 作れた品目は使わないにする (生きている品目は 1 つの SKU に 1 つ)
+  const groupRe = (label, codesTxt, fix) => new RegExp(`^parent_gate_group: 色違いのまとまり ${label} が NE とずれているので、この商品は CSV にできません。${codesTxt} ${fix === 'adopt' ? 'などの画面で『NE の代表を採用する』を押すと直ります' : 'などの代表を NE と同じにすると直ります'}$`);
+
+  // ① まとまり A だけがずれた朝 (ra = 社内に親が無い)
+  const r1 = await record(obsOf(ROWS()));
+  assert.deepEqual(r1.counts, { parent_mismatch: 0, parent_incomparable: 0, parent_ambiguous: 0, parent_missing: 1, parent_two_level: 0, parent_loop: 0 });
+  const sc1 = (await G.one('select scope from ops.master_parent_gate_scopes where result_id = $1::bigint', [r1.result_id])).scope;
+  assert.deepEqual(sc1.global, { count: 0, codes: [] });
+  assert.deepEqual(sc1.items.map((x) => [x.code, x.class, x.group, x.fix, x.keys]), [['ra', 'parent_missing', 'grpa', 'adopt', ['grpa', 'ra']]]);
+  assert.deepEqual(r1.gate.scope, { all: false, problems: [], groups: [{ group: 'grpa', label: 'grpA', codes: ['ra'], count: 1, fix: 'adopt' }], group_count: 1, open_count: 1, resolved: 0 });
+  assert.deepEqual([r1.gate.enforced, r1.gate.open], [true, false], '記録の門 (open) は今までどおり = ずれ 1');
+  // まとまり B・C・代表なし・B の子を入れたセット = 作れる・配れる
+  for (const c of ['bnew', 'n1', 'cnew', 'sb']) { const it = await G.mkItem(c); await G.step(it, 'issued'); await G.step(it, 'superseded'); }
+  // まとまり A に触る = 止まる (A の子・A の子を入れたセット・ずれた子そのもの・CSV に A を代表として書く行)
+  for (const [c, exp] of [['anew', {}], ['sa', {}], ['ra', {}], ['vrow', { kind: 'single', values: { parent: 'grpa' } }]]) {
+    assert.match((await errOf(G.mkItem(c, exp)))?.message ?? '', groupRe('grpA', 'ra', 'adopt'), c);
+  }
+  assert.equal(await errOf(passes('vrow', { kind: 'single', values: { parent: 'grpb' } })), null, 'B を代表に書く行は作れる');
+  assert.deepEqual(await blockedCodes(ALL), ['anew', 'ra', 'sa'], '画面の読み取り = 同じ判断 (候補は今の社内の代表で見る)');
+  const ca = (await check(['anew'])).items[0];
+  assert.deepEqual([ca.kind, ca.label, ca.codes, ca.fix], ['group', 'grpA', ['ra'], 'adopt']);
+  assert.match(`parent_gate_group: ${ca.text}`, groupRe('grpA', 'ra', 'adopt'));
+  // 配る (built → issued) も同じ: 持ち主 load の間に作った A の子の built は配れない・B の子は配れる
+  await seedActiveEpoch(G.db, BASE);
+  const aBuilt = await G.mkItem('anew'); const bBuilt = await G.mkItem('b2');
+  const aOld = await G.mkItem('a2'); await G.step(aOld, 'issued');
+  await seedActiveEpoch(G.db, COMPANY);
+  assert.match((await errOf(G.step(aBuilt, 'issued')))?.message ?? '', groupRe('grpA', 'ra', 'adopt'), '配るも止まる');
+  await G.step(bBuilt, 'issued');
+  // 取り込めなかった A の子だけの作り直しは通す (0068 と同じ・画面も止めない)
+  assert.deepEqual(await blockedCodes(['a2']), ['a2']);
+  await G.step(aOld, 'import_declared'); await G.step(aOld, 'failed');
+  assert.deepEqual(await blockedCodes(['a2']), [], '作り直しの商品は画面でも止めない');
+  const redo = await G.mkItem('a2'); await G.step(redo, 'issued');
+  await G.step(aBuilt, 'superseded');
+  // ② その場で直す (「NE の代表を採用する」と同じ = 社内の ra の親を NE の代表 grpA に) = 翌朝を待たずに開く
+  await G.setParent(await G.pidOf('ra'), T2.grpA);
+  assert.equal(await errOf(passes('anew')), null, '直した後は作れる');
+  assert.deepEqual(await blockedCodes(ALL), []);
+  const st2 = (await G.one('select ops.parent_gate_state() as s')).s;
+  assert.deepEqual([st2.scope.all, st2.scope.groups, st2.scope.resolved, st2.open], [false, [], 1, false]);
+  // 違う所に付けた = 直っていない (NE の代表と同じ名札のときだけ)
+  await G.setParent(await G.pidOf('ra'), T2.grpB);
+  assert.deepEqual(await blockedCodes(['anew', 'bnew', 'cnew']), ['anew', 'bnew'], '今の社内の代表 (grpB) のまとまりも止める');
+  assert.match((await errOf(G.mkItem('bnew')))?.message ?? '', groupRe('grpB', 'ra', 'adopt'));
+
+  // ③ NE と違う (mx: 社内 grpB・NE grpA) = 2 つのまとまり (ラベルはその商品の代表)・直し方は「代表を NE と同じに」
+  await G.setParent(await G.pidOf('ra'), T2.grpA);
+  await record(obsOf(ROWS({ mx: S('mx', 'grpa', 'grpA') })));
+  assert.match((await errOf(G.mkItem('bnew')))?.message ?? '', groupRe('grpB', 'mx', 'fix'));
+  assert.match((await errOf(G.mkItem('anew')))?.message ?? '', groupRe('grpA', 'mx', 'fix'));
+  assert.equal(await errOf(passes('cnew')), null);
+  // 朝の要約・画面の「止めているまとまり」= 止める両方 (NE の代表 grpA・社内の代表 grpB)  (#Codex R1 Medium 2)
+  assert.deepEqual((await G.one('select ops.parent_gate_state() as s')).s.scope.groups,
+    [{ group: 'grpa', label: 'grpA', codes: ['mx'], count: 1, fix: 'fix' }, { group: 'grpb', label: 'grpB', codes: ['mx'], count: 1, fix: 'fix' }]);
+
+  // ④ NE に無い (cx: 社内 grpC・完全な取得に無い) = 社内のまとまり C だけ
+  await G.setParent(await G.pidOf('cx'), T2.grpC);
+  await record(obsOf(ROWS({ cx: null })));
+  assert.match((await errOf(G.mkItem('cnew')))?.message ?? '', groupRe('grpC', 'cx', 'fix'));
+  assert.deepEqual(await blockedCodes(ALL), ['cnew'], 'A・B は作れる');
+
+  // ⑤ どのまとまりか分からないずれ (b2 の NE の代表が読めない) = 全部止める (A・B・C・代表なし)
+  const r5 = await record(obsOf(ROWS({ cx: S('cx', 'grpc', 'grpC'), b2: ['b2', 'single', 'unknown', null, null] })));
+  assert.equal(r5.counts.parent_incomparable, 1);
+  assert.equal(r5.gate.scope.all, true); assert.match(r5.gate.scope.problems.join(' '), /parent_raw_global: どのまとまりか分からない代表のずれ 1 件 \(b2/);
+  const allRe = /^parent_gate_closed: NE とずれた商品の中に、どの色違いのまとまりか分からないものがあるので、いまは新しい商品の CSV を作れません。b2 などを直すと作れます。.*担当者向け: 代表 \(親\) の数えの門が閉じている = parent_raw_global/;
+  for (const c of ['n1', 'cnew', 'sb']) assert.match((await errOf(G.mkItem(c)))?.message ?? '', allRe, c);
+  const c5 = await check(['n1', 'bnew']);
+  assert.deepEqual([c5.all.kind, c5.all.why, c5.all.codes, c5.items, c5.all.problems], ['all', 'unknown_drift', ['b2'], [], undefined]);
+  // 全部止める朝も、取り込めなかった商品だけの作り直しは通す (trigger・画面の読み取り・lib の先の止め = 同じ・#Codex R1 Medium 1)
+  await seedActiveEpoch(G.db, BASE); const bf = await G.mkItem('b1'); await G.step(bf, 'issued'); await seedActiveEpoch(G.db, COMPANY);
+  await G.step(bf, 'import_declared'); await G.step(bf, 'failed');
+  assert.deepEqual((await check(['n1', 'b1'])).rebuild, [await sid('b1')]);
+  const { parentGateBlocks } = await import('../lib/master-reg-csv.mjs');
+  const pgb = await parentGateBlocks(G.db, [await sid('n1'), await sid('b1')]);
+  assert.deepEqual([pgb.all?.kind, [...pgb.rebuild], pgb.bySku.size], ['all', [await sid('b1')], 0]);
+  assert.equal(await errOf(passes('b1')), null, '全部止める朝も作り直しは作れる');
+
+  // ⑥ 0095 の前の記録 (まとまりに分けていない) でずれがある = 全部止める
+  const putRaw = async (counts, scope = null) => {
+    const run = runId();
+    await G.q('select ops.close_new_entry_for_compare($1)', [run]);
+    await G.q('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', [run, nowRfc(), JSON.stringify(ZERO_GATE)]);
+    await G.tx(async () => {
+      const id = (await G.one(`insert into ops.master_parent_gate_results (compare_run_id, ne_generation_id, ne_raw_hash, products_complete_at, setproducts_complete_at, material_generation_id,
+          evidence_sha256, obs_hash, counts, counted, excluded, samples, owner_at_record, recorded_by)
+        values ($1, 'g', $2, now(), now(), 'm', $2, $2, $3::jsonb, 1, '{}', '{"parent_mismatch": ["mx"]}', 'company', 't') returning result_id`, [run, hex('a'), JSON.stringify(counts)])).result_id;
+      if (scope) await G.q('insert into ops.master_parent_gate_scopes (result_id, scope) values ($1, $2::jsonb)', [id, JSON.stringify(scope)]);
+      for (const it of (scope ? scope.items : [])) for (const k of it.keys) await G.q('insert into ops.master_parent_gate_scope_keys (result_id, key, code_norm, klass, rep_norm) values ($1, $2, $3, $4, $5)', [id, k, it.code_norm, it.class, it.rep_norm]);
+    }, ["select set_config('ops.parent_gate_protocol', '1', true)"]);
+  };
+  const C1 = { parent_mismatch: 1, parent_incomparable: 0, parent_ambiguous: 0, parent_missing: 0, parent_two_level: 0, parent_loop: 0 };
+  await putRaw(C1);
+  assert.match((await errOf(G.mkItem('n1')))?.message ?? '', /^parent_gate_closed: NE とずれた商品の中に.*mx などを直すと作れます.*parent_raw_unscoped/);
+  // 分けた数が数えと合わない = 全部止める
+  await putRaw({ ...C1, parent_mismatch: 2 }, { format: 'parent-scope-v1', items: [{ code: 'mx', code_norm: 'mx', class: 'parent_mismatch', rep_norm: 'grpa', group: 'grpa', fix: 'fix', keys: ['grpa', 'grpb', 'mx'], names: {} }], global: { count: 0, codes: [] } });
+  assert.match((await errOf(G.mkItem('n1')))?.message ?? '', /parent_raw_scope_mismatch/);
+  // 分けた数が合えば絞る (同じ形の記録)
+  await putRaw(C1, { format: 'parent-scope-v1', items: [{ code: 'mx', code_norm: 'mx', class: 'parent_mismatch', rep_norm: 'grpa', group: 'grpa', fix: 'fix', keys: ['grpa', 'grpb', 'mx'], names: {} }], global: { count: 0, codes: [] } });
+  assert.equal(await errOf(passes('n1')), null);
+  assert.match((await errOf(G.mkItem('bnew')))?.message ?? '', /^parent_gate_group: 色違いのまとまり grpB /, '名前の無い記録は今の社内の名札の書き方');
+  // ⑦ 今朝の数えが無い (新商品の許可の回が後から入った) = 全部止める (平たい一言)
+  const runX = runId();
+  await G.q('select ops.close_new_entry_for_compare($1)', [runX]);
+  await G.q('select ops.record_new_entry_gate($1, $2, $2, $3::jsonb)', [runX, nowRfc(), JSON.stringify(ZERO_GATE)]);
+  assert.match((await errOf(G.mkItem('n1')))?.message ?? '', /^parent_gate_closed: 今朝の照合で色違いのまとまりを確かめられなかったので、いまは新しい商品の CSV を作れません。照合が済めば作れます。.*parent_gate_other_run/);
+  const c7 = await check(['n1']);
+  assert.deepEqual([c7.all.why, c7.all.codes], ['unchecked', []]);
+  // ⑧ 持ち主 load の間 = 何も止めない (画面の読み取りも)
+  await seedActiveEpoch(G.db, BASE);
+  assert.deepEqual(await check(['n1', 'anew']), { enforced: false, all: null, items: [] });
+  // ⑨ 代表の商品の名札 (DISPX) と SKU のコード (repx) が違う: NE の代表 = repx の子 rx (要確認・社内は親なし) のずれ = 社内の代表 DISPX の子 xnew も止める (#Codex R1 High)
+  await seedActiveEpoch(G.db, COMPANY);
+  await G.setReg('rx', 'quarantined');
+  const r9 = await record(obsOf(ROWS({ cx: S('cx', 'grpc', 'grpC'), rx: S('rx', 'repx', 'repx') })));
+  assert.deepEqual(r9.counts, { ...C1, parent_mismatch: 0, parent_missing: 1 });
+  assert.match((await errOf(G.mkItem('xnew')))?.message ?? '', groupRe('DISPX', 'rx', 'adopt'));
+  assert.deepEqual(await blockedCodes([...ALL, 'xnew', 'rx']), ['rx', 'xnew'], 'ほかのまとまりは止めない');
+  assert.deepEqual(r9.gate.scope.groups.map((g) => [g.group, g.label, g.codes]), [['dispx', 'DISPX', ['rx']], ['repx', 'repx', ['rx']]]);
+  // ⑩ 名札が同じ (norm) 別の 2 つの札 (dupd / DUPD)・dnew の社内の代表 = DUPD。朝は dd (社内は親なし・NE の代表 grpA) のずれ = dnew は当たらない →
+  //   記録の後に dd を dupd の札に付けた = 今の社内で dnew と同じ名札の札の下にずれがある = 止める (#Codex R3 High)
+  await G.setParent(await G.pidOf('rx'), await G.pidOf('repx'));
+  const tdA = await G.tag('dupd'), tdB = await G.tag('DUPD');
+  await G.setParent(await G.pidOf('dnew'), tdB);
+  await record(obsOf(ROWS({ cx: S('cx', 'grpc', 'grpC'), rx: S('rx', 'repx', 'repx'), dd: S('dd', 'grpa', 'grpA') })));
+  assert.equal(await errOf(passes('dnew')), null, '朝の形では当たらない');
+  await G.setParent(await G.pidOf('dd'), tdA);
+  assert.match((await errOf(G.mkItem('dnew')))?.message ?? '', groupRe('dupd', 'dd', 'fix'));
+  assert.deepEqual(await blockedCodes(['dnew', 'n1', 'anew']), ['anew', 'dnew'], 'dd の NE の代表 grpA のまとまりも止める');
+  // 直ったまとまり (dd を NE の代表 grpA に) = 行ごとに組み直さずに通す
+  await G.setParent(await G.pidOf('dd'), T2.grpA);
+  assert.deepEqual(await blockedCodes(['dnew', 'n1', 'anew']), []);
+  assert.equal(await errOf(passes('dnew')), null);
+  await seedActiveEpoch(G.db, BASE);
+  // 表は関数でだけ・追記だけ
+  await assert.rejects(G.q("insert into ops.master_parent_gate_scopes (result_id, scope) values ((select max(result_id) from ops.master_parent_gate_results), '{\"format\": \"parent-scope-v1\"}')"), /record_parent_gate でだけ書く/);
+  await assert.rejects(G.q("update ops.master_parent_gate_scopes set scope = scope"), /append-only/);
+  await assert.rejects(G.q('delete from ops.master_parent_gate_scopes'), /append-only/);
+  await assert.rejects(G.q("insert into ops.master_parent_gate_scope_keys (result_id, key, code_norm, klass) values ((select max(result_id) from ops.master_parent_gate_scopes), 'x', 'x', 'parent_missing')"), /record_parent_gate でだけ書く/);
+  await assert.rejects(G.q('delete from ops.master_parent_gate_scope_keys'), /append-only/);
+  // 前の品目を壊していない (配った B の子・作り直した A の子は配ったまま)
+  assert.deepEqual((await G.q("select k.code from ops.ne_reg_export_items i join core.skus k on k.sku_id = i.sku_id where i.state = 'issued' order by k.code")).map((x) => x.code), ['a2', 'b2']);
+  await G.pg.close();
+});
+
+await ta('[P20] 🆕 0095 朝の要約と drift-list: 絞った朝 = 止めたまとまりだけを言う (ほかは作れる)・全部止める朝・記録できない朝 = 「全部止めた」・直った後 = 止めていない', async () => {
+  const counts = { parent_mismatch: 0, parent_incomparable: 0, parent_ambiguous: 0, parent_missing: 6, parent_two_level: 0, parent_loop: 0 };
+  const samples = { parent_missing: ['diffuserrefill200-2-ra', 'diffuserrefill200-2-st', 'reeddiffuser-ra', 'reeddiffuser-st', 'wae10-ra', 'wae10-st'] };
+  const groups = [{ group: 'diffuserrefill200-2', label: 'diffuserrefill200-2', codes: ['diffuserrefill200-2-ra', 'diffuserrefill200-2-st'], count: 2, fix: 'adopt' },
+    { group: 'reeddiffuser', label: 'reeddiffuser', codes: ['reeddiffuser-ra', 'reeddiffuser-st'], count: 2, fix: 'adopt' }, { group: 'wae10', label: 'wae10', codes: ['wae10-ra', 'wae10-st'], count: 2, fix: 'adopt' }];
+  const pg = (scope) => ({ state: 'ok', owner: 'company', counts, samples, gate: { enforced: true, open: false, problems: ['parent_raw: x'], scope } });
+  assert.equal(parentTrouble({ parent_gate: pg({ all: false, problems: [], groups, group_count: 3 }) }),
+    '代表 (親) が NE とずれた単品 6 件 (社内に親が無い 6: diffuserrefill200-2-ra, diffuserrefill200-2-st, reeddiffuser-ra, reeddiffuser-st, wae10-ra ほか) → この色違いのまとまりの商品だけ NE 登録の CSV を止めた: diffuserrefill200-2・reeddiffuser・wae10 (ほかの商品は作れる)・一覧 = drift-list.mjs');
+  assert.match(parentTrouble({ parent_gate: pg({ all: false, problems: [], groups: [], group_count: 0 }) }), /→ NE 登録の CSV は止めていない \(ずれは記録の後に直った\)・一覧/);
+  assert.match(parentTrouble({ parent_gate: pg({ all: false, problems: [], groups: [...groups, ...groups], group_count: 7 }) }), /止めた: diffuserrefill200-2・reeddiffuser・wae10・diffuserrefill200-2・reeddiffuser ほか 2 \(ほかの商品は作れる\)/);
+  assert.match(parentTrouble({ parent_gate: pg({ all: true, problems: ['parent_raw_global: x'], groups: [], group_count: 0 }) }), /→ 新しい NE 登録の CSV \(作る・配る\) は全部止めた/);
+  // 画面の 1 行のリンク = DB が分けた pre・codes・post をそのまま (コードが「NE」でも後ろの『NE の代表を採用する』を拾わない・#Codex R1 Low)
+  const { parentGateView } = await import('../lib/master-reg-csv.mjs');
+  const pre = '色違いのまとまり X が NE とずれているので、この商品は CSV にできません。', post = ' などの画面で『NE の代表を採用する』を押すと直ります';
+  assert.deepEqual(parentGateView({ kind: 'group', codes: ['NE'], pre, post, text: `${pre}NE${post}` }), { kind: 'group', text: `${pre}NE${post}`, pre, codes: ['NE'], post });
+  assert.deepEqual(parentGateView({ kind: 'group', codes: ['a', 'b'], pre, post, text: `${pre}a・b${post}` }).codes, ['a', 'b']);
+  assert.deepEqual(parentGateView({ kind: 'group', codes: ['NE'], text: `${pre}NE${post}` }), { kind: 'group', text: `${pre}NE${post}`, pre: `${pre}NE${post}`, codes: [], post: '' }, '分けていない = リンクなし');
+  assert.deepEqual(parentGateView({ kind: 'all', codes: ['x'], pre: 'a', post: 'b', text: 'ちがう' }).codes, [], 'つないだものが text と違う = リンクなし');
+  assert.match(parentTrouble({ parent_gate: pg(undefined) }), /は全部止めた/, '0095 の前の DB (scope なし) = 今までどおり');
+  assert.match(parentTrouble({ parent_gate: { ...pg({ all: false, groups, group_count: 3 }), state: 'failed', error: 'x' } }), /^代表 \(親\) の数えを記録できない .*は全部止めた/, '記録できない朝は全部');
+  assert.match(parentTrouble({ parent_gate: { ...pg({ all: false, groups, group_count: 3 }), owner: 'load', gate: { enforced: false, scope: { all: false, groups } } } }), /知らせだけ/, 'load は知らせだけ');
+  const base = { counts, counted: 10, excluded: {}, ne_fetch: { products_complete_at: 'x' }, items: [] };
+  assert.match(formatDriftList({ ...base, gate: { enforced: true, open: false, problems: ['parent_raw: x'], scope: { all: false, groups: groups.slice(0, 1) } } })[3],
+    /門: 持ち主 company \(ずれたまとまりの新しい NE 登録の CSV が止まる\)・まとまりだけ止めている \(diffuserrefill200-2: diffuserrefill200-2-ra・diffuserrefill200-2-st\)/);
+  assert.match(formatDriftList({ ...base, gate: { enforced: true, open: false, problems: ['parent_gate_other_run: y'], scope: { all: true, problems: ['parent_gate_other_run: y'] } } })[3], /全部閉じている \(parent_gate_other_run: y\)/);
+});
+
+await ta('[P21] 🆕 0095 migration の写し: ops.record_parent_gate = 0070 の版 + 🆕 0095 の 1 行だけ・ops.parent_gate_state = 0068 の版 + 🆕 0095 の行だけ・門の trigger は見る所・持ち主・作り直しが 0068 と同じ', async () => {
+  const DIR = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
+  const files = fs.readdirSync(DIR).filter((x) => /^\d{4}_.*\.sql$/.test(x)).sort();
+  const read = (f) => fs.readFileSync(path.join(DIR, f), 'utf8').replace(/\r\n/g, '\n');
+  const fnText = (text, name) => {
+    const i = text.search(new RegExp(`create (?:or replace )?function ${name.replace(/\./g, '\\.')}\\(`));
+    if (i < 0) return null;
+    const k = text.indexOf(' as $$', i); const j = text.indexOf('$$;', k + 6);
+    return text.slice(i, j + 3).replace(/^create or replace function/, 'create function');
+  };
+  const F = files.find((x) => /^\d{4}_parent_gate_scoped\.sql$/.test(x));
+  assert.ok(F, '0095 の file');
+  const strip = (t) => t.split('\n').filter((l) => !/🆕 0095/.test(l)).map((l) => l.replace(/\s+$/, '')).join('\n');
+  for (const [name, from] of [['ops.record_parent_gate', '0070'], ['ops.parent_gate_state', '0068']]) {
+    const src = files.filter((x) => x < F && fnText(read(x), name)).pop();
+    assert.ok(src && src.startsWith(from), `${name} の前の最新の版が ${src} (期待 ${from})`);
+    const now = fnText(read(F), name);
+    assert.notEqual(now, fnText(read(src), name));
+    const before = strip(fnText(read(src), name));
+    if (name === 'ops.record_parent_gate') assert.equal(strip(now), before, `${name}: 印の行を外すと前の版と同じ`);
+    else assert.equal(strip(now).replace(/'created_at', r\.created_at,\n/, "'created_at', r.created_at);\n"), before, `${name}: 印の行を外すと前の版と同じ`);
+  }
+  const g = fnText(read(F), 'ops.guard_ne_reg_parent_gate');
+  for (const l of ["if new.state is distinct from 'built' then return new; end if;", "elsif not (old.state = 'built' and new.state = 'issued') then",
+    'if not ops.parent_gate_enforced() then return new; end if;', "if v_prev = 'failed' then return new; end if;",
+    "where i.sku_id = new.sku_id and i.item_id < new.item_id and i.state <> 'superseded' order by i.item_id desc limit 1;"]) assert.ok(g.includes(l), l);
+  for (const later of files.filter((x) => x > F)) for (const name of ['ops.record_parent_gate', 'ops.parent_gate_state', 'ops.guard_ne_reg_parent_gate']) {
+    assert.equal(fnText(read(later), name), null, `${later} も ${name} を作り直している = この試験の元を見直す`);
+  }
+  // 関数の形 (security definer は 2 つ + 作り直した 3 つ・search_path・public の実行権なし)
+  const fns = await E.q(`select p.proname, p.prosecdef as d, array_to_string(p.proconfig, ',') as c, has_function_privilege('public', p.oid, 'execute') as pub
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'ops' and (p.proname like '\\_parent\\_gate\\_%' or p.proname in ('parent_gate_csv_check',
+      'guard_master_parent_gate_scopes', '_record_parent_gate_scope')) order by 1`);
+  assert.deepEqual(fns.map((f) => f.proname).sort(), ['_parent_gate_all_block', '_parent_gate_block', '_parent_gate_codes', '_parent_gate_global_problems', '_parent_gate_hit', '_parent_gate_items', '_parent_gate_match',
+    '_parent_gate_problems', '_parent_gate_resolved', '_parent_gate_scope_of', '_parent_gate_scope_state', '_parent_gate_sku_keys', '_parent_gate_sku_pids', '_record_parent_gate_scope', 'guard_master_parent_gate_scopes',
+    'parent_gate_csv_check']);
+  for (const f of fns) { assert.equal(f.pub, false, f.proname); assert.equal(f.c, 'search_path=pg_catalog, pg_temp', f.proname); }
+  assert.deepEqual(fns.filter((f) => f.d).map((f) => f.proname), ['parent_gate_csv_check']);
 });
 
 await E.pg.close();

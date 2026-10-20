@@ -80,7 +80,12 @@ export function formatDriftList(r, { cls = null, limit = 200 } = {}) {
   const ex = r.excluded || {};
   lines.push(`  数えない: セット ${ex.set ?? 0}・例外 ${ex.exception ?? 0}・下書き ${ex.draft ?? 0}・配った確かめ待ち ${ex.issued ?? 0}・取り込めなかった ${ex.failed ?? 0}・やめた ${ex.cancelled ?? 0}`);
   const g = r.gate || {};
-  lines.push(`  門: 持ち主 ${g.enforced ? 'company (0 でないと新しい NE 登録の CSV が閉じる)' : 'load (知らせだけ)'}・${g.open ? '開いている' : `閉じている (${(g.problems || []).join(' / ')})`}`);
+  // 🆕 0095: 閉じるのは、ずれた色違いのまとまりに触る CSV だけ (scope.all = 全部止める)
+  const sc = g.scope && typeof g.scope === 'object' ? g.scope : null;
+  const shut = g.open ? '開いている' : sc && sc.all === false
+    ? `まとまりだけ止めている (${(sc.groups || []).map((x) => `${x.label ?? x.group}: ${(x.codes || []).join('・')}`).join(' / ') || '止めている商品は無い (記録の後に直った)'})`
+    : `全部閉じている (${((sc && sc.problems && sc.problems.length ? sc.problems : g.problems) || []).join(' / ')})`;
+  lines.push(`  門: 持ち主 ${g.enforced ? 'company (ずれたまとまりの新しい NE 登録の CSV が止まる)' : 'load (知らせだけ)'}・${shut}`);
   const items = (r.items || []).filter((x) => !cls || x.class === cls);
   for (const x of items.slice(0, limit)) {
     lines.push(`  ${x.class.padEnd(20)} ${String(x.code).padEnd(24)} NE の代表 ${x.ne_parent ?? '(なし)'} / 社内の親 ${x.cdb_parent ?? '(なし)'}${x.reason ? ` [${x.reason}]` : ''}`

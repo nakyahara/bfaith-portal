@@ -2944,3 +2944,23 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 試験 = `node scripts/test-ne-update.mjs` (差・書き方・作る・空欄 (入口ごと)・毎朝の上限・翌朝・stuck・受け取り・送り手 (API は既定で呼ばない・断った / 受付が分からない)・権限) /
   本物の PG = `test-ne-update-pg.mjs` (record_ne_values・record_ne_codes と待ち合ってもデッドロックしない・同じ朝の自動を 2 回作らない・頼みは 1 つ) /
   `test-master-edit.mjs` [10]・`test-master-edit-pg.mjs` [5]・`test-master-bulk.mjs` [4] (CSV が出ていても保存できる) / `test-daily-sync-step-order.mjs` [10] (段の場所)
+
+### 代表 (親) の門を、ずれた色違いのまとまりだけに絞る (0095・2026-10-19 中原さんの決定 = 作る)
+- **なぜ**: 0068 の門は、毎朝の照合 ② の代表のずれが 1 件でもあると新しい NE 登録の CSV (作る・配る) を全部閉じた。10/19、NE で直接足した色違いの子 6 件
+  (diffuserrefill200-2-ra/-st・reeddiffuser-ra/-st・wae10-ra/-st = 要確認・社内は親なし) のずれで、関係の無い新商品の CSV まで止まった。
+  門の目的 (配った後の代表は NE と社内で同じ = ずれたまとまりに CSV が代表を書かない・まとまりを崩さない) は、**そのまとまりに触る CSV だけ止めれば守れる**
+- **止める** (品目の表の trigger `ops.guard_ne_reg_parent_gate` を作り直す・見る所 = 作る (insert built)・配る (built → issued)・持ち主 company のときだけ・作り直し (前の品目が failed) は通す = 0068 と同じ):
+  この商品の鍵 = CSV に書く代表 (品目の期待の値)・社内の代表の名札・自分の名札・自分のコード・セットなら構成品 (期待の値・今の構成・開いている構成の依頼) の代表・名札・コード が、
+  まだ直っていないずれの鍵 = 記録の鍵 (ずれた単品のコード・名札・NE の代表・社内の代表) + 今の社内 (そのずれた単品の名札・代表) に当たる = `parent_gate_group`
+- **全部止める** (今までどおり = `parent_gate_closed`): 記録が無い・今朝の許可の回と違う・今日でない・数えが読めない・まとまりに分けていない記録 (0095 の前)・分けた数が数えと合わない・
+  分けられないずれ (比べられない = 取得で保持・NE ではセット・代表が読めない・行が落ちた / 2 段 / 循環)。分けられるずれ = NE と違う・社内に親が無い・当たる親が 2 つ以上・完全な取得に無い
+- **その場で開く**: 記録の後に社内を NE (記録した観測) に合わせた (「NE の代表を採用する」など) = 社内の親の名札の norm が NE の代表・2 段でない・NE の代表に当たる商品が 1 つ (翌朝の数えと同じ決まり・NE と違う / 社内に親が無いだけ)。NE を直したときは翌朝の照合の後
+- **表** `ops.master_parent_gate_scopes` (追記だけ・照合の回ごとに 1 行・数は生成列) と鍵の表 `ops.master_parent_gate_scope_keys` (ずれ × 鍵・(記録の回, 鍵) の索引 = 品目の行ごとの門はこの商品の鍵で引いた・同じ代表の下にいるずれだけを読む = ずれの数に比例しない・#Codex R2)・名札の norm の索引 `ix_products_display_norm` (同じ名札の別の商品の下にいるずれも引く・直ったかの数え・#Codex R3)。書くのは `ops.record_parent_gate` (0070 の版 + 🆕 0095 の 1 行) の中だけ。`ops.parent_gate_state()` に `scope` (全部止めるか・止めているまとまり) を足した (朝の要約・drift-list)
+- **画面**: `ops.parent_gate_csv_check(SKU の配列)` (master_edit・読むだけ) = 候補ごとに止まるか・理由の 1 行。「色違いのまとまり reeddiffuser が NE とずれているので、この商品は CSV にできません。reeddiffuser-ra などの画面で『NE の代表を採用する』を押すと直ります」(コードは商品の画面へのリンク)・
+  全部止める朝は上に 1 つの知らせ。作る (lib) は鍵の後に同じ判断で先に止める (not_ready)。止めるのは DB の trigger (画面・lib を信じない)
+- **朝の要約**: 絞った朝 = 「この色違いのまとまりの商品だけ NE 登録の CSV を止めた: reeddiffuser・wae10 … (ほかの商品は作れる)」/ 全部止める朝・記録できない朝 = 「全部止めた」
+- 鍵: 門は読むだけ (鍵を足さない)。記録 (照合 ② = 新商品の許可の排他の鍵) と作る / 配る (共有) は今までどおり重ならない
+- 当て方 (🚨 まだ流さない・本番 DB の操作 = 中原さんの OK の後): アプリ (マージ) → `migrate.mjs --dry-run` (この 1 本だけ) → 中原さんの OK → 本適用 → 翌朝の照合から絞る (当てた日の記録は分けていない = ずれがあれば今までどおり全部止める・急ぐなら照合 ② を流し直す)。
+  画面のロールの実行権は migration が付ける (`create-master-edit-roles.mjs` の流し直しは要らない・流し直しても同じ)
+- 試験 = `node scripts/test-master-parent-gate.mjs` ([P19] まとまり A のずれは B・C を止めない / A の子・A を書く行・A の子を入れたセット・ずれた子は止まる / その場で直る / NE と違う・NE に無い / 全部止める形・[P20] 朝の要約・[P21] 写し) /
+  `scripts/test-master-reg-csv.mjs` ([G1] 画面の候補・リンク・作る・DB の trigger・全部止める朝・権限) / `scripts/test-master-parent-gate-pg.mjs` ([R] 実 PostgreSQL のロール)
