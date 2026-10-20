@@ -128,6 +128,8 @@ import { readSalesRun, readSalesSku } from './sales-qty.mjs';
 import { readMovementsPage, readMonthly } from './movements.mjs';
 // 🆕 販売数のグラフ (10/17 中原さん・0086 の読むだけの関数)
 import { readSalesChart } from './sales-chart.mjs';
+// 🆕 モールの商品ページへのリンク (10/20 中原さん・Company DB の出品から)
+import { readMallLinks } from './mall-links.mjs';
 import { checkDeadline } from './deadline.mjs';
 import { putSearch, getSearch } from './search-token.mjs';
 import { sessionHasApp } from '../../lib/app-access.js';
@@ -1279,6 +1281,8 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     vendorSettings,
     // 🆕 0093: NE とちがう所の数 (ふつうの言葉の 1 行と「NEへ送る」へのリンクだけ)。0093 の前・読めない = null (出さない)
     neDiff: page ? await readSkuNeDiff(db, page.cur.sku_id) : null,
+    // 🆕 10/20 中原さん「商品マスタからそれぞれのモールに飛ぶリンク」: この商品だけでできた出品の商品ページ (mall-links.mjs)。読めない = 出さない (画面は止めない)
+    mallLinks: page ? await readMallLinks(db, page.cur.sku_id) : null,
     // 🆕 0090: 表示の項目 (単品の商品の行だけ・人の値 + いま使う値 + product-hub の今の値 (参考・読むだけ))。読めない = 出さない (画面は止めない)
     label: page && page.cur.sku_kind === 'single' && page.cur.product_id ? await readLabelBlock(db, page.cur) : null,
     gone,

@@ -1399,3 +1399,15 @@ a.ul-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px;
 @media (forced-colors: active) { .sku-tab[aria-selected="true"] { border-bottom-color: Highlight; } }
 @media (max-width: 1340px) { .sku-top { --gut: 20px; } }
 @media (max-width: 760px) { .sku-top { --gut: 12px; } .sku-tabs { gap: 2px; } .sku-tab { height: 44px; padding: 0 10px; } .sku-tab .ic, .sku-tab small { display: none; } }   /* スマホ = 3 つの名前が 1 行に入る (入らない幅は帯の中で横に送る) */
+/* 🆕 10/20 モールの商品ページへのリンク (views/sku.ejs の #sku-malls・apps/master-edit/mall-links.mjs): 見出しの下の 1 行。小さい札・新しいタブで開く。スマホは押せる 44px */
+.malls { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; margin-top: 10px; font-size: 13px; }
+.malls-t { color: var(--muted); }
+.malls-list { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 0; padding: 0; min-width: 0; }
+.malls-list li { display: flex; min-width: 0; }
+.mall { position: relative; display: inline-flex; align-items: center; gap: 5px; min-height: 28px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line-strong); background: rgba(255, 255, 255, 0.04); color: var(--text2); white-space: nowrap; max-width: 100%; }
+.mall small { font-family: var(--mono); font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; max-width: 16ch; }
+.mall .ic { color: var(--muted); width: 13px; height: 13px; }
+.mall:hover { border-color: var(--accent); color: #fff; text-decoration: none; }
+.mall:hover .ic { color: var(--accent); }
+.mall-more, .malls-none { display: inline-flex; align-items: center; color: var(--faint); font-size: 12.5px; }
+@media (max-width: 760px) { .mall { min-height: 44px; padding: 0 14px; } .malls-list { gap: 8px; } }
