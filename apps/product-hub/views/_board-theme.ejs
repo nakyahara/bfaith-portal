@@ -3,13 +3,19 @@
     レイアウト (幅・余白・並び) には触らない = 既存の挙動とテストに影響させない。
     タグ類は「明るい地 + 濃い文字」を「色の薄い半透明の地 + 明るい文字 + 色の縁」に置き換え、
     色の意味 (赤 = 要対応・緑 = 済・黄 = 保留 …) はそのまま残す。
-    黒背景は画面だけ (@media screen)。印刷は背景が落ちて白地に明るい文字が残るので、従来の明るい表示のまま %>
+    黒背景は画面だけ (@media screen)。印刷は背景が落ちて白地に明るい文字が残るので、従来の明るい表示のまま。
+    🆕 2026-10-19 中原さん要望: 黒 / 白を人ごとに選べる (boardTheme = 'dark' | 'light'・lib/board-theme.js)。
+    黒の <style> は消さずに media 属性で入り切りする (all = 効く / not all = 効かない) — 切り替えのボタンが
+    再読み込みなしで付け外しできる (board.ejs の kbSetTheme)。白 = 10/13 より前の明るい表示そのもの %>
+<% const kbDark = (locals.boardTheme || 'dark') !== 'light'; %>
 <style>
-  /* inline style から外した色の、明るい表示 (印刷) での受け皿 */
+  /* inline style から外した色の、明るい表示 (白・印刷) での受け皿 */
   .kb-col.kb-col-done { background: #f0fdf4; }
   .chip[data-alert] { border-color: #3b82f6; color: #1e40af; }
   .chip.chip-warn { border-color: #fdba74; color: #b45309; }
   #kb-search { border-color: #cbd5e1; }
+</style>
+<style id="kb-theme-dark" media="<%= kbDark ? 'all' : 'not all' %>">
   /* 重要度のセレクトは黒背景向けの色を inline で塗るので、印刷では地と文字を戻す */
   @media print { .kb-priority { background: #fff !important; color: #1f2430 !important; } }
 

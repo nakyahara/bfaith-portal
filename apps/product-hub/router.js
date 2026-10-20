@@ -59,6 +59,7 @@ import {
 import { syncDraftLinks } from '../product-links/sync.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { backLinkOf } from './lib/back-link.js';
+import { boardThemeOf, saveBoardTheme } from './lib/board-theme.js';
 // セットの画像計画の語彙 (§4.7)。画面と依頼書で同じ言葉を使う
 import {
   SET_IMAGE_ACTIONS, SET_IMAGE_ACTION_LABELS, productionInstructions, imageSortOfSlot,
@@ -3408,6 +3409,8 @@ router.get('/board', (req, res, next) => { sweepCdbCards().then(() => next()); }
   const neCount = neRegistrationCount(db);
   res.render(view('board.ejs'), {
     title: '工程ボード',
+    // 背景 (黒 / 白) は人ごと (2026-10-19)。鍵 = ログインのメール
+    boardTheme: boardThemeOf(db, req.session?.email),
     displayName: req.session?.displayName || req.session?.email || '',
     board,
     boardView,
@@ -3706,6 +3709,19 @@ router.post('/api/board/reorder', (req, res) => {
     const r = saveBoardOrder(getDB(), { view: req.body?.view, col: req.body?.col, items });
     res.json({ ok: true, saved: r.saved });
   } catch (e) { workflowError(res, e); }
+});
+
+// ボードの背景 (黒 / 白) を自分の分だけ保存する (2026-10-19 中原さん要望「アカウントごとに」)。
+// 鍵はセッションのメール = 本文に人の名前は受けない。見た目だけなので履歴 (draft_events) には残さない
+router.post('/api/board/theme', (req, res) => {
+  try {
+    const theme = saveBoardTheme(getDB(), req.session?.email, String(req.body?.theme ?? ''));
+    res.json({ ok: true, theme });
+  } catch (e) {
+    if (e && (e.status === 400 || e.status === 403)) return res.status(e.status).json({ ok: false, error: e.message });
+    console.error(`[product-hub] ボードの背景を保存できない: ${e && e.message}`);
+    res.status(500).json({ ok: false, error: '背景の設定を保存できませんでした' });
+  }
 });
 
 // TOP画像の重要度 (どれぐらい力を入れて作るかの目安)。現場の目安情報なので誰でも変更可・履歴は残す
