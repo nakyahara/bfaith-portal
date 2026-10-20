@@ -91,7 +91,8 @@ export async function runShadow({ dataDir, now = new Date(), forceWindow = false
       record.pre = { sha256: sha256(pre.buf), bytes: pre.buf.length, rows: lz.rows, ok: lz.ok, reason: lz.reason };
       if (!lz.ok) return { stop: `pre_export_${lz.reason}` };
       const pc = precheck({ csvBuf: t.csvBuf, lz });
-      record.precheck = { ok: pc.ok, rows: pc.rows, missing: pc.missing.slice(0, 50), missing_count: pc.missing.length, deleted: pc.deleted.slice(0, 50), deleted_count: pc.deleted.length };
+      record.precheck = { ok: pc.ok, rows: pc.rows, missing: pc.missing.slice(0, 50), missing_count: pc.missing.length, deleted: pc.deleted.slice(0, 50), deleted_count: pc.deleted.length,
+        case_variants: pc.case_variants.slice(0, 50), case_variants_count: pc.case_variants.length };
       if (!pc.ok) return { stop: 'precheck_failed' };
       record.preview = await ops.previewImport(t.csvPath, { captureDir: dir });
       return { ok: true };

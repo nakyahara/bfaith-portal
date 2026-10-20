@@ -1718,6 +1718,8 @@ async function main() {
   // 「NE の商品コードの書き方」の問題 (NE に大文字・小文字だけ違う書き方が 2 つ・NE とロジザードで書き方が違う など) を、商品と直し方つきでまとめの最後に出す (10/16 中原さん)。
   // 材料 = いま流した lz-daily の報告 (この回の証跡・sha256 が合うときだけ)。新しい問い合わせ・定期実行はしない・lz-daily の合否は変えない。
   // 読めない = 何も足さない (まとめを止めない・壊さない)。段の結果 (results) には足さない = 見出しの ✅ / ⚠️ と retry は今のまま
+  // 🆕 2026-10-21 (lzd-v4): 「ロジザードに送れなかった商品」(外した行 = 原価が無い・仕入先が無い なども) を全部、商品のページへのリンクと直し方つきで出す
+  //   (lz-daily の段の 1 行にも件数と先頭の 3 つのコード。外した行があっても、ほかが全部通れば合格 = その夜に取り込む)
   const lzCodeNotice = readLzCodeNotice({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data'), asOf: lzDailyAsOf, syncRunId: process.env.DAILY_SYNC_RUN_ID,
     warn: (s) => console.warn(s) });
 
@@ -1935,7 +1937,7 @@ async function main() {
     msg += `\n*💾 ディスク容量アラート:*\n`;
     for (const w of diskWarnings) msg += `${w}\n`;
   }
-  // NE の商品コードの書き方 (lz-daily の報告から。上限 10 行 + ほか N 件)。いちばん後ろ = 本文が長い朝に切られても上の大事な知らせは残る
+  // ロジザードに送れなかった商品 / NE の商品コードの書き方 (lz-daily の報告から。上限 10 行 + ほか N 件)。いちばん後ろ = 本文が長い朝に切られても上の大事な知らせは残る
   if (lzCodeNotice.length > 0) msg += `\n*${lzCodeNotice[0]}*\n${lzCodeNotice.slice(1).join('\n')}\n`;
 
   console.log('\n' + msg);  // ローカルログには全文を残す
