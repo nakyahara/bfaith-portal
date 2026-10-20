@@ -186,6 +186,8 @@
     <% if (reg === 'draft' && !page.locks.regExports.length) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">下書きです (新商品の登録)</div><div class="hint">NE・ロジザードへの登録はまだです。値はこの画面で直せます (ロジザードの有効期限・入荷日の管理も、NE 登録の CSV を配るまでは直せます)。NE への登録は「NE 登録の CSV」で行います。</div></div><a class="btn sm" href="<%= base %>/reg-csv">NE 登録の CSV を開く</a></div><% } %>
     <%# 🆕 0071: 新商品の下書きを消す (下書きのときだけ・DB の確かめの答え = deldraft) %>
     <%- include('_deldraft', { c }) %>
+    <%# 🆕 0098: NE にもう同じ商品がある下書き・NE 登録待ち = 「NE にあるので登録済みにする」(DB の確かめの答え = dine) %>
+    <%- include('_draftinne', { c }) %>
     <% if (cancelled) { %><div class="callout warn" id="cancelled-band"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">この商品は登録をやめました (やめた)</div><div class="hint">登録をやめた商品は直せません (見るだけです)。使うときは、新しい商品として登録し直してください。</div></div></div><% } %>
     <% if (reg === 'quarantined') { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">要確認</div><div class="hint">切替の後に夜間の処理が NE で見つけた、登録の記録の無い商品です。業務ではまだ使えません。</div></div></div><% } %>
     <%# 🆕 0093 (2026-10-19 中原さん): NE 登録の CSV を配った後も、ほかの商品と同じように直せる (案内のカードは出さない)。0093 の前の DB だけ欄が 🔒 (lockWhy) %>
@@ -728,6 +730,8 @@
   <% if (page) { %><script src="<%= base %>/public/me-prevnext.js?v=<%= assetV %>" defer></script><% } %>
   <%# 🆕 0071: 下書きを消す = 押せる人・押せるときだけ (me-sku.js の後 = 未保存の数を読む) %>
   <% if (page && typeof deldraft !== 'undefined' && deldraft && deldraft.show && deldraft.canGo && canEdit && !dbError && !closed) { %><script src="<%= base %>/public/me-draft-cancel.js?v=<%= assetV %>" defer></script><% } %>
+  <%# 🆕 0098: NE にあるので登録済みにする = 押せる人・押せるときだけ (me-sku.js の後 = 未保存の数を読む) %>
+  <% if (page && typeof dine !== 'undefined' && dine && dine.show && dine.canGo && dine.canApprove && !dbError && !closed) { %><script src="<%= base %>/public/me-draft-in-ne.js?v=<%= assetV %>" defer></script><% } %>
   <%# me-order.js は me-sku.js の後 (MasterEdit.dirty に発注の設定の未保存を足す) %>
   <% if (page && orderSettings && orderSettings.data && orderSettings.data.ok) { %><script src="<%= base %>/public/me-order.js?v=<%= assetV %>" defer></script><% } %>
   <%# me-amclabel.js も me-sku.js の後 (MasterEdit.dirty に AMC ラベルの未保存を足す) %>

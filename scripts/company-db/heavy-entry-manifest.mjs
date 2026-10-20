@@ -87,6 +87,12 @@ export const HEAVY_ENTRY_MANIFEST = Object.freeze([
   { sig: 'ops.sku_shipments_monthly(bigint, date)', cls: 'light', public: false, since: '0085', reason: 'SKU 1 つの月ごとの受注数・売上数 (0085・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。画面は 13 か月 (p_from = 13 か月前の月初)。本番を測った売れ筋で 7 ms' },
   // 🆕 0086 (販売数のグラフ・10/17 中原さん)。p_from が規則にかかる = ここで分ける。🚨 番号を付け替えたら since も
   { sig: 'ops.sku_sales_daily(bigint, date)', cls: 'light', public: false, since: '0086', reason: 'SKU 1 つの日 × モールの正味の販売数 (0086・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行・金額は返さない)。' + 'その SKU を含むセット (上へ 5 段・セットの構成の表は数千行) と出品の構成 (ix_listing_components_sku) から、明細を ix_order_lines_sku_chart / ix_order_lines_listing_only_chart・注文を ix_orders_chart で引く (0092 = 要る列を持つ部分索引 = 索引だけで読む・0092 の前は ix_order_lines_sku / ix_order_lines_listing・主キー + 表の頁・会社の全部の売上を展開しない)。' + '期間は 2025-01-01 (p_from をそれより古くできない) 〜 今日 (JST) の決まった日付 = 返す行はその日数 × 8 モールまで (画面は 24 か月だけ頼む)。商品の画面の「販売数のグラフ」を開くたびに 1 回 (画面の期限 8 秒・ロールの statement_timeout 20 秒)' },
+  // 0096 (NE へ送るの 1 ファイル・#1762)。p_since が規則にかかる = ここで分ける (0096 で足し忘れ = test-master-quarantine-confirm [H1] が落ちていた)
+  { sig: 'ops._ne_upd_filler(text, bigint, text, text, jsonb, timestamp with time zone, jsonb)', cls: 'light', public: false, since: '0096', reason: 'NE へ送るの CSV で、その SKU が変えていない欄の 1 つのセルを今朝の NE の値で埋める部品 (0096・SECURITY DEFINER でない・だれにも実行を渡さない)。' + 'SKU 1 件の今朝の NE の値 1 行 (主キー)・その欄のこの 2 日の CSV の行 (code_norm の索引) を読むだけ。p_since = 今朝の取得の始め (期間の集計ではない)' },
+  // 🆕 0098 (NE にあるので登録済みにする)。規則にはかからない (期間・件数の引数なし) = 手で足した (0079 と同じ・新しい関数は全部ここで分ける)。🚨 番号を付け替えたら since も
+  { sig: 'ops.draft_in_ne_check(bigint)', cls: 'light', public: false, since: '0098', reason: '下書き・NE 登録待ち 1 件を「NE にあるので登録済みにする」してよいかの表 (0098・SECURITY DEFINER・PUBLIC なし・master_edit と watcher に実行)。' + 'SKU 1 件を主キーで引き、NE のコードの台帳 1 行・最新の封をした照合の回の観測 1 行・生きている NE 登録の CSV の品目 (SKU の索引)・セットの構成品 (20 品まで)・NE 登録の CSV の期待値 (ops.ne_reg_canonical) を読むだけ。NE 登録の CSV の画面は候補 (下書き 200 件まで) のうち NE にもうあるものと一部違う品目だけ呼ぶ' },
+  { sig: 'ops.confirm_draft_in_ne(uuid, text, bigint, text)', cls: 'light', public: false, since: '0098', reason: '1 件を NE 確認済みにする (0098・SECURITY DEFINER・PUBLIC なし・master_edit にだけ実行)。1 件 = 1 取引・確かめ (上) を 2 回と登録の状態の 1 行・履歴の 1 行・一部違う品目の 1 行・約束と保存の記録の 1 行ずつ' },
+  { sig: 'ops._draft_in_ne_problem(text, text)', cls: 'light', public: false, since: '0098', reason: '確かめの表の 1 行を作る部品 (0098・定数の組み立てだけ・表を読まない・だれにも実行を渡さない)' },
 ]);
 
 export const MANIFEST_CLASSES = Object.freeze(['revoke', 'guard_later', 'light']);

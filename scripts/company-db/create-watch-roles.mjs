@@ -114,6 +114,8 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   for (const f of secdefFunctions) if (/^ops\.sku_gone_from_ne_(check|list)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
   //   🆕 0079 (要確認を確認済みにする): 確認済みにしてよいかの確かめ・一覧 (読むだけ) = watcher も読める (確認の関数は渡さない = create-master-edit-roles.mjs の master_edit だけ)
   for (const f of secdefFunctions) if (/^ops\.quarantine_confirm_(check|list)\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
+  //   🆕 0098 (NE にあるので登録済みにする): 登録済みにしてよいかの確かめ (読むだけ) = watcher も読める (登録済みにする関数は渡さない = create-master-edit-roles.mjs の master_edit だけ)
+  for (const f of secdefFunctions) if (/^ops\.draft_in_ne_check\(/.test(f)) s.push(`grant execute on function ${f} to watcher`);
   //   0058: 保守の印の表は「ops の全部の表」の select から外す (印の UUID を読ませない・G24)
   s.push(`do $$ begin if to_regclass('ops.master_maintenance_marks') is not null then execute 'revoke all on ops.master_maintenance_marks from watcher, watch_writer'; end if; end $$`);
   //   0058 (§3.9 の 3・R16 H1): 「全部の表に GRANT」の後に、配った CSV の byte 列 (ops.ne_reg_exports.file_bytes) を外して列ごとに付け直す (流し直しても戻らない)

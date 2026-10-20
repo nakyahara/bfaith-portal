@@ -189,6 +189,13 @@ export const OUTBOX_NS_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.enqueue_group_
  *   無い DB (0071 の前) では付けない (流し直すと付く)
  */
 export const DRAFT_CANCEL_FUNCTIONS = Object.freeze(['ops.cancel_sku_draft(uuid, text, text, bigint)', 'ops.sku_draft_cancel_check(bigint)']);
+/**
+ * 🆕 0098 (NE にあるので登録済みにする・中原さんの承認 10/20): 登録済みにする関数 (ops.confirm_draft_in_ne) と確かめ (読むだけ) を master_edit (画面・名簿 MASTER_DECISION_APPROVERS の人) に実行だけ。
+ *   master_ops (CLI) には渡さない。watcher の確かめは migration と create-watch-roles.mjs が付ける。無い DB (0098 の前) では付けない (流し直すと付く)
+ */
+export const DRAFT_IN_NE_FUNCTIONS = Object.freeze(['ops.confirm_draft_in_ne(uuid, text, bigint, text)', 'ops.draft_in_ne_check(bigint)']);
+/** 🆕 0098: だれにも渡さない (確かめの表の 1 行を作る部品 = 確かめの中から持ち主の権限で呼ぶ) */
+export const DRAFT_IN_NE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops._draft_in_ne_problem(text, text)']);
 /** 🆕 0067 (Company DB構想 20 の PR-5・まとまり): 画面のロールが実行する (どれも products.parent の DB の active が company のときだけ書く = 今は断る)。無い DB (0067 の前) では付けない */
 export const VARIATION_EDIT_FUNCTIONS = Object.freeze(['ops.variation_batch_open(uuid, text, text, jsonb, jsonb)', 'ops.variation_batch_close(uuid, text, jsonb, jsonb)',
   'ops.cancel_variation_child(uuid, text, text, jsonb, bigint)', 'ops.edit_variation_labels(uuid, text, text, jsonb, bigint, integer, jsonb)',
@@ -433,6 +440,9 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0079 (要確認を確認済みにする): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (watcher の確かめ・一覧は migration が付ける = ここでは外さない)
   for (const f of [...QUARANTINE_CONFIRM_FUNCTIONS, ...QUARANTINE_CONFIRM_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of QUARANTINE_CONFIRM_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0098 (NE にあるので登録済みにする): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (watcher の確かめは migration が付ける = ここでは外さない)
+  for (const f of [...DRAFT_IN_NE_FUNCTIONS, ...DRAFT_IN_NE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of DRAFT_IN_NE_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   // 🆕 0072 (NE から消す CSV): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (watcher の確かめ・一覧は migration が付ける = ここでは外さない)
   for (const f of [...NE_DEL_FUNCTIONS, ...NE_DEL_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of NE_DEL_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
