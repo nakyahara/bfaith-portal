@@ -18,6 +18,7 @@
  *
  * 料金:
  *   月1,000回以内は無料 (1,001〜2,000回は有料)。検索は 1 回で NE_SEARCH_LIMIT (1万件) まで取る = 朝の sync は 1 日 7 回前後。
+ *   NE に送った回数は 1 回ずつ DATA_DIR/ne-api-usage/ に数える (ne-api-usage.js)。月の回数は毎朝のまとめに出る
  */
 import 'dotenv/config';
 import fs from 'fs';
@@ -26,6 +27,7 @@ import { fileURLToPath } from 'url';
 import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev, neSrc, addSpelling, writeCodeSpellings } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
+import { recordNeApiCall, neApiCallsThisProcess, readMonthUsage, jstMonthOf } from './ne-api-usage.js';
 import { NE_FETCH_COUNTS_VERSION, NE_FETCH_COUNTS_KEY, checkNeFetchCounts, beginNeFetch, endNeFetch, releaseNeFetch, computeFetchFingerprint } from './ne-fetch-counts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -89,13 +91,20 @@ async function authenticate(callbackUrl) {
     client_secret: CLIENT_SECRET,
   });
 
-  const res = await fetch(NE_API_BASE + '/api_neauth', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString(),
-  });
-
-  const data = await res.json();
+  // NE に送った回数を数える (ne-api-usage.js。数えられなくても認証は止めない)
+  const t0 = Date.now();
+  let data, outcome = 'fail';
+  try {
+    const res = await fetch(NE_API_BASE + '/api_neauth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    data = await res.json();
+    outcome = data && data.result ? String(data.result) : 'fail';
+  } finally {
+    recordNeApiCall({ endpoint: '/api_neauth', ok: outcome === 'success', result: outcome, ms: Date.now() - t0 }, { dataDir: DATA_DIR, now: new Date(t0) });
+  }
   if (data.result !== 'success') {
     throw new Error('認証失敗: ' + JSON.stringify(data));
   }
@@ -127,13 +136,21 @@ async function callNE(endpoint, params = {}) {
     ...params,
   });
 
-  const res = await fetch(NE_API_BASE + endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  });
-
-  const data = await res.json();
+  // 🚨 NE に送った 1 回 = 課金の 1 回を 1 行数える (ne-api-usage.js)。送った後に 1 回だけ (成功・NE のエラー・通信や JSON の失敗のどれでも)。
+  //   数える側は throw しない = 返す値・投げるエラーは前と同じ。トークンが無くて送らなかった回は数えない
+  const t0 = Date.now();
+  let data, outcome = 'fail';
+  try {
+    const res = await fetch(NE_API_BASE + endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    data = await res.json();
+    outcome = data && data.result ? String(data.result) : 'fail';
+  } finally {
+    recordNeApiCall({ endpoint, ok: outcome !== 'error' && outcome !== 'fail', result: outcome, ms: Date.now() - t0 }, { dataDir: DATA_DIR, now: new Date(t0) });   // 月は送った時刻で決める (月末をまたいだ応答を翌月にしない)
+  }
 
   // トークン自動更新
   if (data.access_token && data.refresh_token) {
@@ -844,6 +861,9 @@ async function main() {
     await fetchOrderBaseByShipDate(14);
     // 更新日ベースの取り直し (確定取消・出荷日訂正・配送方法変更を追随。API 1回程度)
     await fetchOrderBaseByModified(3);
+    // この回の API の回数をログに残す (月の回数は毎朝のまとめに出る)
+    try { const m = jstMonthOf(new Date()); console.log(`[NE] この回の API: ${neApiCallsThisProcess()} 回 / 今月 (${m}) ${readMonthUsage(m, { dataDir: DATA_DIR }).total} 回`); }
+    catch (e) { console.warn(`[NE] ⚠️ 今月の API の回数を読めない (${e.message})`); }
   } else {
     console.log('使い方:');
     console.log('  node apps/warehouse/ne-api.js auth <callback_url>  → 初回認証');
