@@ -12,7 +12,9 @@
  *          ロジザードに無い = ne_collided・ロジザードが 2 つ = lz_many・セットは NE の書き方のまま
  *       U5 書き方だけの行 (spelling): 値の差が無い単品で NE の書き方 ≠ ロジザード → 原価の欄を NE と同じ値で 1 つ
  *       U6 今朝の NE の取得でない (昨日の取得) = ne_not_today・段階が new_open でない = not_open
- *   [B] 作る (ops.ne_upd_build): 単品とセットは別のファイル・確かめていない欄は空欄にしない (組ごとのファイル)・確かめた欄 (ops.ne_upd_verified) は空欄で 1 ファイル・
+ *   [B] 作る (ops.ne_upd_build): 🆕 0096 = 単品 1 つ・セット 1 つ (見出し = その種類で変える欄の全部)・変えていない欄 = 今朝の NE の値 (確かめた欄 (ops.ne_upd_verified) は空欄)・
+ *       1 行に違う欄の直し・列がずれない (B6)・埋められない行 (NE の取扱が中止・今朝の値が不明) = 2 つ目 → 最後の手 = その商品の欄だけ (B7)・
+ *       送っている途中の欄 = 出した値で埋める / 作った後に別の CSV でその欄を出した・今朝の値が入れ替わった = 渡さない (B8)・
  *       送った後は「送っている途中」(もう一度作っても入らない)・値をまた直した = 新しい値で入る・自動は同じ今朝の回で 1 回 (前の答え)・
  *       100 行を超える = held・前のファイルを NE が受け付け中 = 自動は held / 今すぐは busy (頼みは残る)・結果 (ok / failed) と回の状態・
  *       翌朝: NE が同じになった = 一覧から消える / まだ違う = もう一度 send / 2 回 NE が受け付けたのにまだ違う = stuck
@@ -69,6 +71,26 @@ await ta('[M1] security definer の関数 = search_path = pg_catalog, pg_temp・
   }
 });
 
+await ta('[M2] 🆕 0096 (単品 1 つ・セット 1 つ): 作り直すのは作る (_ne_upd_fill) と受け取り (ne_upd_download) だけ・security definer = search_path・public の実行権を外す・一時の表なし', async () => {
+  const f96 = fs.readdirSync(MIG).find((f) => /^\d{4}_ne_update_one_file\.sql$/.test(f));
+  assert.ok(f96, '0096 のファイル');
+  const S96 = fs.readFileSync(path.join(MIG, f96), 'utf8').replace(/\r\n/g, '\n');
+  assert.doesNotMatch(S96, /\b(create\s+(temp|temporary)\s+table|on commit drop)\b/i);
+  assert.deepEqual([...S96.matchAll(/create or replace function ([a-z_.]+)\(/g)].map((m) => m[1]).sort(), ['ops._ne_upd_fill', 'ops.ne_upd_download', 'ops.ne_upd_one_file']);
+  const defs = [...S96.matchAll(/create (?:or replace )?function ([a-z_.]+)\(([^)]*)\)[^$]*?as \$\$/g)];
+  assert.equal(defs.length, 5);
+  for (const d of defs) {
+    assert.match(d[0], /set search_path = pg_catalog, pg_temp/, `${d[1]} の search_path`);
+    assert.ok(S96.includes(`revoke all on function ${d[1]}(`), `${d[1]} の public の実行権を外していない`);
+  }
+  // 作り直した関数の引数・security definer は 0094 と同じ (実行権がそのまま残る)
+  for (const n of ['ops._ne_upd_fill', 'ops.ne_upd_download']) {
+    const a = SQL.match(new RegExp(`create function ${n.replace('.', '\\.')}\\(([^)]*)\\)[^$]*?as \\$\\$`));
+    const b = S96.match(new RegExp(`create or replace function ${n.replace('.', '\\.')}\\(([^)]*)\\)[^$]*?as \\$\\$`));
+    assert.equal(b[0], a[0].replace('create function', 'create or replace function'), n);
+  }
+});
+
 // ═══════════ DB の用意 ═══════════
 const pg = new PGlite();
 await pg.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
@@ -120,11 +142,13 @@ await ta('[F2] セルの決まり (DB) = ne-csv.mjs の COLUMNS の cell (JS)', 
 const single = (code, over = {}) => ({ code, name: `商品 ${code}`, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: 3,
   cost: { jpy: 100, source: 'ne', status: 'COMPLETE' }, standardPriceJpy: 1000, shippingCode: 'S02', shippingMethod: '宅急便', shippingCostJpy: 520, reorderMonths: 2, ...over });
 const setSku = (code) => ({ ...single(code), kind: 'set', cost: { jpy: 200, source: 'set_calc', status: 'COMPLETE' }, standardPriceJpy: 3000 });
-const SINGLES = ['a01', 'a02', 'a03', 'a04', 'a05', 'a06', 'a07', 'a08', 'a09', 'a10', 'u60e-10', 'u60e-05', 'k01', 'k02', 'k03', 'x01', 'x02', 'x03', 'q01', 'q02', 'q03', 'q04', 'q05', 'h01', 'z01', 'z02', 'z03'];
-const SETS = ['s01', 's02'];
+const SINGLES = ['a01', 'a02', 'a03', 'a04', 'a05', 'a06', 'a07', 'a08', 'a09', 'a10', 'u60e-10', 'u60e-05', 'k01', 'k02', 'k03', 'x01', 'x02', 'x03', 'q01', 'q02', 'q03', 'q04', 'q05', 'h01', 'z01', 'z02', 'z03',
+  'f01', 'f02', 'f03', 'f04', 'f05', 'f06', 'e01', 'e02', 'e03', 'e04', 'g01', 'g02', 'g03', 'g04', 'g05', 'g06', 'g07', 'g08'];   // 🆕 0096 の 1 つにまとめる試験 (B6〜B8)
+const SETS = ['s01', 's02', 's03'];
 const PLAN = {
   skus: [...SINGLES.map((c) => single(c)), ...SETS.map(setSku)],
-  setComponents: [{ parentCode: 's01', childCode: 'k01', qty: 1, source: 'ne' }, { parentCode: 's02', childCode: 'k02', qty: 1, source: 'ne' }],
+  setComponents: [{ parentCode: 's01', childCode: 'k01', qty: 1, source: 'ne' }, { parentCode: 's02', childCode: 'k02', qty: 1, source: 'ne' },
+    { parentCode: 's03', childCode: 'k01', qty: 2, source: 'ne' }],
   listings: [], observations: [], physicals: [], compliance: [], workers: [], variationGroups: [],
   suppliers: [{ code: '0001', name: 'AMC' }, { code: '0002', name: 'ビーフリー' }],
   supplierSkus: SINGLES.map((c) => ({ supplierCode: '0001', skuCode: c })), primarySuppliers: SINGLES.map((c) => ({ skuCode: c, supplierCode: '0001' })),
@@ -383,18 +407,27 @@ await ta('[U6] 今朝の取得でない = ne_not_today・段階が new_open で�
 
 // ═══════════ [B] 作る ═══════════
 console.log('[B] 作る');
-await ta('[B1] 単品とセットは別のファイル・確かめていない欄は空欄にしない (欄の組ごとのファイル)・バイト列 = ne-csv.mjs の buildCsv (1 欄のとき)', async () => {
+await ta('[B1] 🆕 0096: 単品 1 つ・セット 1 つ (見出し = その種類で変える欄の全部)・変えていない欄 = 今朝の NE の値 (確かめる前は空欄にしない)・1 欄だけのファイル = ne-csv.mjs の buildCsv', async () => {
   const b = await build('auto');
   assert.equal(b.state, 'built', JSON.stringify(b));
   const files = b.files;
   const heads = files.map((f) => `${f.kind}|${f.header}`).sort();
-  assert.deepEqual(heads, ['products|syohin_code,baika_tnk', 'products|syohin_code,genka_tnk', 'products|syohin_code,syohin_name', 'sets|set_syohin_code,set_baika_tnk']);
-  const cost = files.find((f) => f.header === 'syohin_code,genka_tnk');
-  const want = buildCsv(specOf('products', 'cost'), [{ ne_code: 'a01', cell: '150' }, { ne_code: 'U60E-05', cell: '100' }, { ne_code: 'U60E-10', cell: '110' }]);   // コードの小文字の順
-  assert.equal(csvOf(cost), want.bytes.toString('utf8'));
-  assert.equal(cost.sha256, want.sha256);
-  assert.equal(csvOf(files.find((f) => f.kind === 'sets')), 'set_syohin_code,set_baika_tnk\r\ns01,3100\r\n');
-  assert.match(csvOf(files.find((f) => f.header === 'syohin_code,baika_tnk')), /^syohin_code,baika_tnk\r\na02,1300\r\na06,1600\r\na09,1900\r\nh01,1001\r\n$/);
+  assert.deepEqual(heads, ['products|syohin_code,syohin_name,baika_tnk,genka_tnk', 'sets|set_syohin_code,set_baika_tnk']);
+  const p = files.find((f) => f.kind === 'products');
+  // 変えた欄 = 自社の値・変えていない欄 = 今朝の NE の値 (名前 = 商品 xxx・売価 1000・原価 100)。行 = コードの小文字の順・書き方の直し (U60E-) もそのまま
+  assert.equal(csvOf(p), 'syohin_code,syohin_name,baika_tnk,genka_tnk\r\n' + ['a01,商品 a01,1000,150', 'a02,商品 a02,1300,100', 'a03,商品 a03 改,1000,100', 'a06,商品 a06,1600,100',
+    'a09,商品 a09,1900,100', 'h01,商品 h01,1001,100', 'U60E-05,商品 u60e-05,1000,100', 'U60E-10,商品 u60e-10,1000,110'].map((l) => `${l}\r\n`).join(''));
+  // 埋めたセルはファイルに残す (8 行 × 3 欄 − 変えた 8 欄 = 16・src = ne)・変えた欄は行 (ops.ne_upd_rows) に残す
+  const fill = jsonOf((await one('select fill from ops.ne_upd_files where file_id = $1', [p.file_id])).fill);
+  assert.equal(fill.length, 16, JSON.stringify(fill));
+  assert.ok(fill.every((x) => x.src === 'ne' && typeof x.cell === 'string'), JSON.stringify(fill));
+  const a01id = String(await sid('a01'));
+  assert.deepEqual(fill.filter((x) => x.sku_id === a01id).map((x) => [x.col, x.cell]), [['name', '商品 a01'], ['standard_price_jpy', '1000']]);
+  assert.equal((await one('select count(*)::int as n from ops.ne_upd_rows where file_id = $1', [p.file_id])).n, 8);
+  const want = buildCsv(specOf('sets', 'standard_price_jpy'), [{ ne_code: 's01', cell: '3100' }]);
+  const st = files.find((f) => f.kind === 'sets');
+  assert.equal(csvOf(st), want.bytes.toString('utf8'));
+  assert.equal(st.sha256, want.sha256);
   // 送った後 = 送っている途中 (もう一度作っても入らない)
   const u = await units();
   assert.equal(unitOf(u, 'a01', 'cost').status, 'sending');
@@ -493,6 +526,137 @@ await ta('[B5] 翌朝: NE が同じになった = 一覧から消える / まだ
   const b = await build('auto');
   assert.ok(!(b.files || []).some((f) => /k02,/.test(csvOf(f))), 'stuck は自動で送らない');
   await settleAll(2);
+});
+
+// ─── 🆕 0096: 単品 1 つ・セット 1 つ (埋めるセル) ───
+/** 今朝の NE の値のセル (ops.ne_upd_cell と同じ書き方) */
+const neCell = (code, col) => {
+  const v = NE_STATE.get(code)[col];
+  if (col === 'handling') return v === 'active' ? '0' : '1';
+  if (col === 'tax_rate') return Number(v) === 0.08 ? '8' : '10';
+  if (col === 'primary_supplier') return v[0];
+  return String(v);
+};
+/** CSV → { header: [...], rows: { コード: { 見出し: セル } } } (試験のデータは引用符なし)。どの行も見出しと同じ数のセル */
+const parseCsv = (text) => {
+  assert.match(text, /\r\n$/);
+  const [h, ...lines] = text.slice(0, -2).split('\r\n');
+  const header = h.split(',');
+  const rows = {};
+  for (const l of lines) { const c = l.split(','); assert.equal(c.length, header.length, `列がずれた: ${l}`); rows[c[0]] = Object.fromEntries(header.map((k, i) => [k, c[i]])); }
+  return { header, rows };
+};
+const HEAD = { name: 'syohin_name', handling: 'toriatukai_kbn', tax_rate: 'tax_rate', standard_price_jpy: 'baika_tnk', cost: 'genka_tnk', primary_supplier: 'sire_code' };
+const CATCH_SPELL = { 'u60e-05': 'U60E-05', 'u60e-10': 'U60E-10', q01: ['Q01', 'q01'] };
+/** 新しい朝: NE が自社の今の値に追いついた (前の試験の差を消す)。extra = NE の上書き・skip = 追いつかない商品 */
+async function catchUp(extra = {}, skip = []) {
+  const ne = {};
+  for (const r of await cdbNow()) if (!skip.includes(r.code)) ne[r.code] = { ...r.cols };
+  for (const [c, v] of Object.entries(extra)) ne[c] = { ...(ne[c] || {}), ...v };
+  return seedNe({ ne, spell: CATCH_SPELL });
+}
+const makeDl = async () => jsonOf((await one('select ops.ne_upd_make_download($1, $2) as r', [crypto.randomUUID(), 'naka@test'])).r);
+const dl = async (id) => jsonOf((await one('select ops.ne_upd_download($1, $2) as r', ['naka@test', id])).r);
+const fileCsv = async (id) => Buffer.from((await dl(id)).bytes_b64, 'base64').toString('utf8');
+
+await ta('[B6] 🆕 0096 1 つにまとめる: 違う欄を直した単品 = 単品の CSV 1 つ (1 行に 2 つの欄の直しも)・変えていない欄 = 今朝の NE の値 (列がずれない)・セットは別の 1 つ', async () => {
+  await catchUp();
+  assert.equal((await units()).units.filter((x) => x.status === 'send').length, 0, '前の試験の差が残っていない');
+  await save('f01', { name: '商品 f01 改' });
+  await save('f02', { handling: 'discontinued' });
+  await save('f03', { tax_rate: '8' });
+  await save('f04', { standard_price: '1404', cost: { jpy: '144', reason: '試験' } });
+  await save('f05', { primary_supplier: '2' });
+  await save('s02', { name: 'セット s02 改' });
+  await save('s03', { standard_price: '3303' });
+  await q('select ops.ne_upd_request_now($1, $2)', [crypto.randomUUID(), 'naka@test']);
+  const b = await build('now');
+  assert.equal(b.state, 'built', JSON.stringify(b));
+  const p = b.files.filter((f) => f.kind === 'products'), st = b.files.filter((f) => f.kind === 'sets');
+  assert.deepEqual([p.length, st.length], [1, 1], b.files.map((f) => f.header).join(' / '));
+  const csv = parseCsv(csvOf(p[0]));
+  assert.deepEqual(csv.header, ['syohin_code', 'syohin_name', 'toriatukai_kbn', 'tax_rate', 'baika_tnk', 'genka_tnk', 'sire_code']);
+  const mine = { f01: { name: '商品 f01 改' }, f02: { handling: '1' }, f03: { tax_rate: '8' }, f04: { standard_price_jpy: '1404', cost: '144' }, f05: { primary_supplier: '0002' } };
+  assert.deepEqual(Object.keys(csv.rows), Object.keys(mine));
+  for (const [code, ch] of Object.entries(mine)) {
+    for (const col of Object.keys(HEAD)) {
+      const want = Object.hasOwn(ch, col) ? ch[col] : neCell(code, col);
+      assert.equal(csv.rows[code][HEAD[col]], want, `${code} ${col}`);
+    }
+  }
+  // 今朝の NE の値の例: f01 の取扱 = 0・税率 = 10・売価 = 1000・原価 = 100・仕入先 = 0001
+  assert.deepEqual(csv.rows.f01, { syohin_code: 'f01', syohin_name: '商品 f01 改', toriatukai_kbn: '0', tax_rate: '10', baika_tnk: '1000', genka_tnk: '100', sire_code: '0001' });
+  assert.equal(csvOf(st[0]), 'set_syohin_code,set_syohin_name,set_baika_tnk\r\ns02,セット s02 改,3000\r\ns03,商品 s03,3303\r\n');
+  assert.equal(b.rows, 8);
+  assert.equal(b.summary.apart, undefined);
+  await settleAll(2);
+});
+await ta('[B7] 🆕 0096 埋められない行は落とさない: NE の取扱が中止 (ﾒｰｶｰ取扱中止と区別できない)・今朝の NE の値が不明 = 2 つ目の CSV / そこでも埋められない = その商品の欄だけの CSV (summary.apart に理由)', async () => {
+  await catchUp({ e01: { handling: 'discontinued' }, e02: { cost: { unknown: true } } });
+  await save('e01', { cost: { jpy: '101', reason: '試験' } });   // 取扱の欄を埋められない (NE = 中止)
+  await save('e02', { standard_price: '1202' });                   // 原価の欄を埋められない (今朝の NE の値が不明)
+  await save('e03', { handling: 'discontinued' });
+  await save('e04', { cost: { jpy: '104', reason: '試験' } });
+  await q('select ops.ne_upd_request_now($1, $2)', [crypto.randomUUID(), 'naka@test']);
+  const b = await build('now');
+  assert.equal(b.state, 'built', JSON.stringify(b));
+  assert.deepEqual(b.files.map(csvOf), [
+    'syohin_code,toriatukai_kbn,baika_tnk,genka_tnk\r\ne03,1,1000,100\r\ne04,0,1000,104\r\n',   // 1 つ目 = 全部の欄
+    'syohin_code,baika_tnk,genka_tnk\r\ne01,1000,101\r\n',                                       // 2 つ目 = 残りの行の欄 (e01 の売価は今朝の NE の値で埋まる)
+    'syohin_code,baika_tnk\r\ne02,1202\r\n',                                                     // 最後の手 = e02 が変えた欄だけ (埋めるセルなし)
+  ]);
+  assert.equal(b.rows, 4, '送る欄は全部どこかのファイルに入る');
+  assert.deepEqual(b.summary.apart.map((a) => [a.code, a.col, a.why]), [['e01', 'handling', 'ne_handling_stop'], ['e02', 'cost', 'ne_unknown']]);
+  const u = await units();
+  for (const c of ['e01', 'e02', 'e03', 'e04']) assert.ok(u.units.filter((x) => x.code_norm === c).every((x) => x.status === 'sending'), c);
+  await settleAll(2);
+});
+await ta('[B8] 🆕 0096 送っている途中の欄は朝の値に戻さない (埋めるセル = 出した値)・作った後に別の CSV でその欄を出した / 今朝の NE の値が入れ替わった = 渡さない', async () => {
+  await catchUp();
+  // 1) g01 の売価を出した (受け取った) 後に、g01 の原価と g02 の売価 → g01 の売価のセル = 出した 1501 (今朝の 1000 に戻さない)
+  await save('g01', { standard_price: '1501' });
+  const a1 = await makeDl();
+  assert.equal(await fileCsv(a1.files[0].file_id), 'syohin_code,baika_tnk\r\ng01,1501\r\n');
+  await save('g01', { cost: { jpy: '111', reason: '試験' } });
+  await save('g02', { standard_price: '1502' });
+  const a2 = await makeDl();
+  assert.equal(a2.files.length, 1);
+  assert.equal(await fileCsv(a2.files[0].file_id), 'syohin_code,baika_tnk,genka_tnk\r\ng01,1501,111\r\ng02,1502,100\r\n');
+  const fill2 = jsonOf((await one('select fill from ops.ne_upd_files where file_id = $1', [a2.files[0].file_id])).fill);
+  assert.deepEqual(fill2.map((x) => [x.col, x.cell, x.src]), [['standard_price_jpy', '1501', 'sent'], ['cost', '100', 'ne']]);
+  // 2) 受け取った A3 (g03 の売価 = 今朝の 1000 で埋めた) の後に、g03 の売価を A4 で出した → A3 のもう一度のダウンロードは渡さない (1603 を 1000 に戻す)
+  await save('g03', { cost: { jpy: '113', reason: '試験' } });
+  await save('g04', { standard_price: '1504' });
+  const a3 = await makeDl();
+  assert.equal(await fileCsv(a3.files[0].file_id), 'syohin_code,baika_tnk,genka_tnk\r\ng03,1000,113\r\ng04,1504,100\r\n');
+  await save('g03', { standard_price: '1603' });
+  const a4 = await makeDl();
+  const d4 = await dl(a4.files[0].file_id);
+  assert.equal(Buffer.from(d4.bytes_b64, 'base64').toString('utf8'), 'syohin_code,baika_tnk\r\ng03,1603\r\n');
+  // A4 の後に A3 を取り込むと 1603 が 1000 に戻る (手元のファイルは止められない) = 受け取りの答えで知らせる (画面の一言・Codex 0096 R1 H1)
+  assert.deepEqual(d4.older.map((x) => x.file_id), [String(a3.files[0].file_id)]);
+  assert.match(String((await errOf(() => dl(a3.files[0].file_id)))?.message), /file_stale: このファイルを作った後に、変えていない欄の NE の値が変わったか/);
+  // 3) 作った後に今朝の NE の値が入れ替わった (NE の画面で直して、同じ日にもう一度取得した) = 渡さない
+  await save('g05', { cost: { jpy: '115', reason: '試験' } });
+  await save('g06', { standard_price: '1506' });
+  const a5 = await makeDl();
+  await catchUp({ g05: { standard_price_jpy: 1200 } }, ['g05', 'g06']);
+  assert.match(String((await errOf(() => dl(a5.files[0].file_id)))?.message), /file_stale: このファイルを作った後に、変えていない欄の NE の値が変わったか/);
+  // 作り直す = 新しい今朝の値 (1200) で埋める
+  const a6 = await makeDl();
+  assert.equal(await fileCsv(a6.files[0].file_id), 'syohin_code,baika_tnk,genka_tnk\r\ng05,1200,115\r\ng06,1506,100\r\n');
+  assert.deepEqual((await dl(a6.files[0].file_id)).older, [], '重ならない = 知らせない');
+  // 4) A7 (g07 の売価 = 今朝の 1000 で埋めた) をまだ受け取らずに、g07 の売価 1607 の A8 を受け取った → 同じ日にもう一度取得 (A8 はまだ NE に入っていない) →
+  //    A7 は渡さない (今日出した A8 を見る = 取得の時刻だけで忘れない・Codex 0096 R1 H2)
+  await save('g07', { cost: { jpy: '117', reason: '試験' } });
+  await save('g08', { standard_price: '1508' });
+  const a7 = await makeDl();
+  await save('g07', { standard_price: '1607' });
+  const a8 = await makeDl();
+  assert.equal(await fileCsv(a8.files[0].file_id), 'syohin_code,baika_tnk,genka_tnk\r\ng07,1607,117\r\ng08,1508,100\r\n');
+  await catchUp({}, ['g07', 'g08']);
+  assert.match(String((await errOf(() => dl(a7.files[0].file_id)))?.message), /file_stale: このファイルを作った後に、変えていない欄の NE の値が変わったか/);
+  await catchUp();
 });
 
 // ═══════════ [D] 画面 ═══════════
@@ -602,7 +766,7 @@ await ta('[W2] 今すぐ: 頼みを拾って上げる (単品 = master_goods・�
   const ne = fakeNe();
   const r = await S.runNeUpdateSend({ db, ne, mode: 'pending', env: { NE_UPDATE_UPLOAD: '1' }, host: 'minipc-test', sleep: async () => {}, waitMs: 0 });
   assert.equal(r.code, 0, r.line);
-  assert.ok(ne.ups.some((x) => x.kind === 'products' && /a03,商品 a03 改 2\r\n/.test(x.text)), JSON.stringify(ne.ups));
+  assert.ok(ne.ups.some((x) => x.kind === 'products' && /\r\na03,商品 a03 改 2,1000,100\r\n/.test(x.text)), JSON.stringify(ne.ups));
   assert.match(r.line, /^✅ NEへ送る \(今すぐ\): \d+ 欄 \(.*名前 1.*\) を NE に上げました \(翌朝の照合/);
   assert.equal(ne.asks.length, 0, 'キューの結果は聞かない (既定)');
   assert.equal(unitOf(await units(), 'a03', 'name').status, 'sending');
@@ -649,9 +813,12 @@ console.log('[P] 権限');
 await ta('[P1] master_edit = 画面の関数だけ (作る・結果・生存は不可)・watch_writer = 送り手の関数だけ (今すぐの頼み・受け取りは不可)・表はだれも直接書けない', async () => {
   const can = async (role, fn) => (await one(`select has_function_privilege($1, $2, 'execute') as ok`, [role, fn])).ok;
   for (const f of ['ops.ne_upd_overview()', 'ops.ne_upd_sku(bigint)', 'ops.ne_upd_request_now(uuid, text)', 'ops.ne_upd_make_download(uuid, text)', 'ops.ne_upd_download(text, bigint)',
-    'ops.ne_upd_record_verified(text, text, text, text, text, text, text)']) assert.equal(await can('master_edit', f), true, f);
+    'ops.ne_upd_record_verified(text, text, text, text, text, text, text)', 'ops.ne_upd_one_file()']) assert.equal(await can('master_edit', f), true, f);
   for (const f of ['ops.ne_upd_build(text, text, boolean)', 'ops.ne_upd_file_result(bigint, text, text, integer, text)', 'ops.ne_upd_queued_files()', 'ops.ne_upd_worker_seen(text, boolean, boolean, text)',
-    'ops.ne_upd_units(bigint[], text)', 'ops._ne_upd_fill(bigint, boolean, text, boolean)']) assert.equal(await can('master_edit', f), false, f);
+    'ops.ne_upd_units(bigint[], text)', 'ops._ne_upd_fill(bigint, boolean, text, boolean)',
+    'ops._ne_upd_filler(text, bigint, text, text, jsonb, timestamptz, jsonb)', 'ops._ne_upd_emit(bigint, text, text[], text[], jsonb, jsonb, jsonb, text, boolean)']) assert.equal(await can('master_edit', f), false, f);
+  for (const f of ['ops._ne_upd_filler(text, bigint, text, text, jsonb, timestamptz, jsonb)', 'ops._ne_upd_emit(bigint, text, text[], text[], jsonb, jsonb, jsonb, text, boolean)'])
+    assert.equal(await can('watch_writer', f), false, f);
   for (const f of ['ops.ne_upd_build(text, text, boolean)', 'ops.ne_upd_file_result(bigint, text, text, integer, text)', 'ops.ne_upd_queued_files()', 'ops.ne_upd_worker_seen(text, boolean, boolean, text)',
     'ops.ne_upd_overview()']) assert.equal(await can('watch_writer', f), true, f);
   for (const f of ['ops.ne_upd_request_now(uuid, text)', 'ops.ne_upd_make_download(uuid, text)', 'ops.ne_upd_download(text, bigint)']) assert.equal(await can('watch_writer', f), false, f);
@@ -677,6 +844,12 @@ await ta('[P1] master_edit = 画面の関数だけ (作る・結果・生存は�
   const e2 = await errOf(() => pg.query("update ops.ne_upd_files set header = 'x'"));
   await pg.query('rollback');
   assert.match(String(e2?.message), /中身は書き換えない/);
+  // 🆕 0096: 埋めたセル (fill) も書き換えない (受け取りの確かめの元)
+  await pg.query('begin');
+  await pg.query("select set_config('ops.ne_upd_protocol', '1', true)");
+  const e3 = await errOf(() => pg.query("update ops.ne_upd_files set fill = '[]'::jsonb where fill <> '[]'::jsonb"));
+  await pg.query('rollback');
+  assert.match(String(e3?.message), /中身は書き換えない/);
 });
 await ta('[P2] 画面のロールで呼べる (overview・頼み)・送り手のロールで作れる', async () => {
   const o = await as('master_edit', async () => jsonOf((await one('select ops.ne_upd_overview() as r')).r));

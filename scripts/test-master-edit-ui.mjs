@@ -54,6 +54,8 @@
  *  80〜82 商品の画面のタブ (10/19): 基本情報 / 販売数のグラフ / 入出庫の履歴・role と aria・開いたタブだけ読む (1 回)・#tab=… (読み込み直す・戻る・# を打つ)・
  *     ← → Home End・打った値と未保存はそのまま・Ctrl+S は基本情報で保存・前へ / 次へ・セットの構成品へのリンクも同じタブ・
  *     帯は上に残る (保存の箱と開いた板は帯の下)・基本情報に戻るとスクロールの位置も戻る・スマホ 390 で 44px・はみ出さない
+ *  83 モールの商品ページへのリンク (10/20): 見出しの下の札 (楽天・Amazon・Yahoo!・Qoo10)・新しいタブ (noopener)・×N・組んだ出品は出さない・どのタブでも見える・
+ *     出品が無い = 一言・スマホ 390 で 44px・はみ出さない
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
  * 使い方: node scripts/test-master-edit-ui.mjs
  */
@@ -3603,6 +3605,83 @@ await ta('[82] タブと戻るの見張り (10/19・Codex R2 Medium): 未保存 
   await p.click('#leave-stay');
   assert.equal(await dirty(p), 1, 'ここに残る = 打った値はそのまま');
   assert.equal(await p.inputValue('#f-reorder_months'), String(before + 2));
+});
+
+// ── 🆕 10/20 中原さん「商品マスタからそれぞれのモールに飛ぶリンク」= 見出しの下のモールの札 (apps/master-edit/mall-links.mjs) ──
+{
+  const sidOf = async (code) => (await pg.query('select sku_id from core.skus where code = $1', [code])).rows[0].sku_id;
+  const k4 = await sidOf('k004'), k5 = await sidOf('k005');
+  const lst = async (mall, code, comps, { itemId = null, asin = null } = {}) => {
+    const id = (await pg.query(`insert into core.listings (company_id, mall, shop_code, listing_code, mall_item_id, status) values (1, $1, $2, $3, $4, 'active') returning listing_id`,
+      [mall, mall === 'amazon' ? 'main@A1VC38T7YXB528' : 'main', code, itemId])).rows[0].listing_id;
+    let i = 0;
+    for (const [skuId, qty] of comps) await pg.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, sort_order, resolution, resolved_by_type) values (1, $1, $2, $3, $4, 'exact', 'system')`, [id, skuId, qty, i++]);
+    if (asin) {
+      const ci = (await pg.query(`insert into core.catalog_items (marketplace_id, asin) values ('A1VC38T7YXB528', $1) returning catalog_item_id`, [asin])).rows[0].catalog_item_id;
+      await pg.query('update core.listings set catalog_item_id = $1 where listing_id = $2', [ci, id]);
+    }
+  };
+  await lst('rakuten', 'k004', [[k4, 1]], { itemId: 'k004' });
+  await lst('amazon', 'ml-k004', [[k4, 1]], { asin: 'B0MLK00401' });
+  await lst('amazon', 'ml-k004-2p', [[k4, 2]], { asin: 'B0MLK00402' });
+  await lst('amazon', 'ml-k4k5', [[k4, 1], [k5, 1]], { asin: 'B0MLK00499' });   // ほかの商品と組んだ出品 = どちらの画面にも出さない
+  await lst('yahoo', 'k004', [[k4, 1]]);
+  await lst('qoo10', '1067124910', [[k4, 1]], { itemId: '1067124910' });
+}
+const mallState = (p) => p.evaluate(() => {
+  const box = document.getElementById('sku-malls');
+  const r = box && box.getBoundingClientRect();
+  return {
+    shown: !!box && r.width > 0 && r.height > 0 && !box.closest('[hidden]'),
+    inHead: !!box && !!box.closest('#sku-ph'),
+    links: box ? [...box.querySelectorAll('a.mall')].map((a) => [a.dataset.mall, a.textContent.replace('(新しいタブで開く)', '').trim(), a.getAttribute('href'), a.target, a.rel]) : [],
+    none: box ? (box.querySelector('.malls-none') || {}).textContent || '' : null,
+  };
+});
+await ta('[83] モールの商品ページへのリンク (10/20): 見出しの下に楽天・Amazon・Yahoo!・Qoo10 の札・新しいタブ (noopener)・まとめ売りは ×N・組んだ出品は出さない・どのタブでも見える・出品が無い = 一言・スマホ 390 で 44px・はみ出さない', async (p, ctx) => {
+  await p.goto(B + '/sku/k004');
+  const s = await mallState(p);
+  assert.equal(s.shown, true, 'モールの行が見える');
+  assert.equal(s.inHead, true, '見出しの中 (どのタブでも同じ所)');
+  const NR = 'noopener noreferrer';
+  assert.deepEqual(s.links, [
+    ['rakuten', '楽天', 'https://item.rakuten.co.jp/b-faith/k004/', '_blank', NR],
+    ['amazon', 'AmazonB0MLK00401', 'https://www.amazon.co.jp/dp/B0MLK00401', '_blank', NR],
+    ['amazon', 'Amazon×2', 'https://www.amazon.co.jp/dp/B0MLK00402', '_blank', NR],
+    ['yahoo', 'Yahoo!', 'https://store.shopping.yahoo.co.jp/b-faith01/k004.html', '_blank', NR],
+    ['qoo10', 'Qoo10', 'https://www.qoo10.jp/g/1067124910', '_blank', NR],
+  ]);
+  assert.match(await p.getAttribute('#sku-malls a[data-mall="amazon"] >> nth=1', 'title'), /2 個のまとめ売り/);
+  if (process.env.MASTER_MALLS_SHOT_PC) await p.screenshot({ path: process.env.MASTER_MALLS_SHOT_PC });
+  // どのタブでも見える (見出しはタブの外)
+  for (const tab of ['#tab-sales', '#tab-moves', '#tab-basic']) {
+    await p.click(tab);
+    assert.equal((await mallState(p)).shown, true, `${tab} でも見える`);
+  }
+  // 押すと新しいタブで開く (この画面はそのまま・未保存の確かめも出ない)
+  await ctx.route(/^https:\/\/item\.rakuten\.co\.jp\//, (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<p>rakuten</p>' }));
+  const [popup] = await Promise.all([ctx.waitForEvent('page'), p.click('#sku-malls a[data-mall="rakuten"]')]);
+  await popup.waitForLoadState();
+  assert.equal(popup.url(), 'https://item.rakuten.co.jp/b-faith/k004/');
+  assert.equal(await popup.evaluate(() => window.opener), null, 'noopener = 開いた先から元の画面を触れない');
+  await popup.close();
+  assert.equal(new URL(p.url()).pathname, '/apps/master-edit/sku/k004');
+  assert.equal(await p.locator('#leave-bg.on').count(), 0);
+  // 組んだ出品しか無い商品・出品が無い商品 = 一言だけ (札は出さない)
+  for (const code of ['k005', 's003']) {
+    await p.goto(B + '/sku/' + code);
+    const n = await mallState(p);
+    assert.deepEqual([n.shown, n.links, n.none], [true, [], '出品が見つかりません'], code);
+  }
+  // スマホ 390: 札は 44px・折り返してはみ出さない
+  await p.setViewportSize({ width: 390, height: 844 });
+  await p.goto(B + '/sku/k004');
+  const m = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: innerWidth,
+    chips: [...document.querySelectorAll('#sku-malls a.mall')].map((a) => { const r = a.getBoundingClientRect(); return [Math.round(r.height), Math.round(r.right)]; }) }));
+  assert.ok(m.doc <= m.view, `横にはみ出す ${m.doc} > ${m.view}`);
+  assert.equal(m.chips.length, 5);
+  assert.ok(m.chips.every(([h, right]) => h >= 44 && right <= m.view), `札 ${JSON.stringify(m.chips)}`);
+  if (process.env.MASTER_MALLS_SHOT) await p.screenshot({ path: process.env.MASTER_MALLS_SHOT });
 });
 
 await browser.close();

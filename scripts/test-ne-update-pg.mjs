@@ -8,6 +8,7 @@
  *   K3 照合の record_ne_codes (NE のコードの排他) を待っている間に、作る と record_ne_values が並んでも順に終わる (デッドロックしない)
  *   K4 同じ朝の自動を 2 つの接続で同時に = 1 つが作り、もう 1 つは待った後に前の答え (replayed = 2 回送らない)
  *   K5 今すぐの頼み (画面) を 2 つの接続で同時に = 頼みは 1 つ (後の方は前の頼みに乗る)
+ *   K6 🆕 0096 受け取り (ops.ne_upd_download = 埋めたセルを今朝の NE の値と照らす) は record_ne_values の取引の間は NE の値の鍵で待つ
  * 使い方: node scripts/test-ne-update-pg.mjs
  *   🚨 試験が自分で使い捨てのクラスタを起動する (test-ne-values-locks-pg.mjs と同じ): embedded-postgres (devDependencies の正確な版)。外の PostgreSQL には一切つながない
  */
@@ -173,6 +174,17 @@ try {
       assert.equal(rb.v.send_id, a.send_id);
       assert.equal(rb.v.joined, true);
       assert.equal((await O.query("select count(*)::int as n from ops.ne_upd_sends where how = 'now' and state = 'waiting'")).rows[0].n, 1);
+    });
+    await t('[K6] 🆕 0096 受け取り (埋めたセルを今朝の NE の値と照らす) は record_ne_values の取引の間は待つ = 入れ替えの途中の値で確かめない', async () => {
+      const r2 = await newRun();
+      await A.query('begin');
+      await recNe(A, r2);
+      const d = settled(B.query('select ops.ne_upd_download($1, $2) as r', ['a@test', '999999999']));
+      await waitBlocked(pb);
+      await A.query('commit');
+      const rd = await d;
+      assert.equal(rd.ok, false);
+      assert.match(String(rd.e && rd.e.message), /not_found/, '鍵を取った後にファイルを読む');
     });
   } finally { await su.end().catch(() => {}); }
 } catch (e) {

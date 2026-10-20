@@ -11472,6 +11472,21 @@ renders.push(
     console.log('  !!  board.ejs にカードのある fixture が見つからないため、裏面バッジの描画は確かめられていません');
   }
 }
+// 🆕 ボードの背景 (黒 / 白) を人ごとに (2026-10-19)。画像ビューの先頭カードに重要度を付けて、セレクトの色も黒 / 白で比べる
+{
+  const bi = wfp.boardData(db, { view: 'image' });
+  const first = bi.columns.flatMap((col) => col.cards)[0];
+  if (first) {
+    const withPr = {
+      ...bi,
+      columns: bi.columns.map((col) => ({ ...col, cards: col.cards.map((c) => (c === first ? { ...c, image_priority: dbmod.IMAGE_PRIORITIES[0].value } : c)) })),
+    };
+    renders.push(['board.ejs (背景: 黒)', 'board.ejs', { ...boardBase, boardView: 'image', board: withPr, boardTheme: 'dark' }]);
+    renders.push(['board.ejs (背景: 白)', 'board.ejs', { ...boardBase, boardView: 'image', board: withPr, boardTheme: 'light' }]);
+  } else {
+    console.log('  !!  画像ビューにカードが無いため、背景ごとの重要度の色は確かめられていません');
+  }
+}
 
 const renderedHtml = new Map();
 let dumpSeq = 0;   // PH_SMOKE_DUMP で書き出すときの通し番号
@@ -11602,6 +11617,85 @@ for (const [name, file, data] of renders) {
   const boardPlain = renderedHtml.get('board.ejs') || '';
   check('工程ボードのカードに「📷 裏面あり」が出る', board.includes('裏面あり') && board.includes('kb-tag backlabel'));
   check('写真が無いボードにはバッジを出さない', !boardPlain.includes('裏面あり'));
+}
+
+// ─── ボードの背景 (黒 / 白) を人ごとに (2026-10-19 中原さん要望) ───
+{
+  const plain = renderedHtml.get('board.ejs') || '';
+  const dark = renderedHtml.get('board.ejs (背景: 黒)') || '';
+  const light = renderedHtml.get('board.ejs (背景: 白)') || '';
+  check('背景: 未設定 (boardTheme を渡さない) はいつもの黒 = 黒の style が効く', plain.includes('<style id="kb-theme-dark" media="all">'));
+  check('背景: 白なら黒の style を止める (消さずに media="not all")', light.includes('<style id="kb-theme-dark" media="not all">'));
+  check('背景: 切り替えボタンの文字 = 押すとなる方', dark.includes('☀ 白背景にする') && light.includes('🌙 黒背景にする'));
+  const p0 = dbmod.IMAGE_PRIORITIES[0];
+  if (dark && light) {
+    check('背景: 黒の重要度セレクトは地と文字を入れ替える (#1718 の塗り方)',
+      dark.includes(`background:${p0.fg}40; color:${p0.bg}; border-color:${p0.bg}88;`));
+    check('背景: 白の重要度セレクトは 10/13 より前の塗り方',
+      light.includes(`background:${p0.bg}; color:${p0.fg}; border-color:${p0.fg}33;`) && !light.includes(`background:${p0.fg}40;`));
+  }
+
+  // 保存 (lib/board-theme.js)。鍵 = ログインのメール (小文字・前後の空白を除く)
+  const bt = await import('../lib/board-theme.js');
+  db.prepare('DELETE FROM ph_board_prefs').run();
+  check('背景: 保存が無い人はいつもの黒', bt.boardThemeOf(db, 'a@example.com') === 'dark');
+  check('背景: メールが無い (ログイン無し) は黒', bt.boardThemeOf(db, '') === 'dark' && bt.boardThemeOf(db, null) === 'dark');
+  bt.saveBoardTheme(db, ' A@Example.com ', 'light');
+  check('背景: 白を保存 → 同じ人 (大文字小文字・空白違い) は白', bt.boardThemeOf(db, 'a@example.com') === 'light');
+  check('背景: 別の人には効かない', bt.boardThemeOf(db, 'b@example.com') === 'dark');
+  bt.saveBoardTheme(db, 'a@example.com', 'dark');
+  check('背景: いつもの黒に戻す = 行を消す', bt.boardThemeOf(db, 'a@example.com') === 'dark'
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_board_prefs').get().n === 0);
+  let e400 = null; try { bt.saveBoardTheme(db, 'a@example.com', 'blue'); } catch (e) { e400 = e; }
+  check('背景: 知らない値は 400 で断る (保存しない)', e400?.status === 400
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_board_prefs').get().n === 0);
+  let e403 = null; try { bt.saveBoardTheme(db, '', 'light'); } catch (e) { e403 = e; }
+  check('背景: メールが無ければ 403 で断る', e403?.status === 403);
+  db.prepare("INSERT INTO ph_board_prefs (email, theme, updated_at) VALUES ('c@example.com', 'light', 'x')").run();
+  check('背景: 白の行がある人は白', bt.boardThemeOf(db, 'c@example.com') === 'light');
+  db.prepare('DELETE FROM ph_board_prefs').run();
+
+  // 切り替えボタンの JS (描画済みの script から切り出して動かす): その場で media を替え、保存に失敗したら元に戻す
+  const vm = await import('node:vm');
+  const html = dark || plain;
+  const s = html.indexOf('  // ─── 背景 (黒 / 白) の切り替え');
+  const e = html.indexOf("  const sel = document.getElementById('assignee-select');", s);
+  const chunk = s >= 0 && e > s ? html.slice(s, e) : '';
+  check('背景の切り替え: board.ejs の script から切り出せる', chunk.includes('kbSetTheme'), String(chunk.length));
+  const run = async (respond) => {
+    const style = { media: 'all' };
+    const ls = {};
+    const btn = { textContent: '', disabled: false, addEventListener: (t, fn) => { ls[t] = fn; } };
+    const sel = { value: p0.value, style: {} };
+    const posts = [];
+    const alerts = [];
+    const ctx = {
+      document: {
+        getElementById: (id) => ({ 'kb-theme-dark': style, 'kb-theme-toggle': btn }[id] || null),
+        querySelectorAll: (q) => (q === '.kb-priority' ? [sel] : []),
+      },
+      fetch: async (url, opt) => { posts.push({ url, body: JSON.parse(opt.body) }); return respond(); },
+      alert: (m) => alerts.push(String(m)),
+    };
+    vm.createContext(ctx);
+    vm.runInContext(chunk, ctx);
+    await ls.click();
+    return { style, btn, sel, posts, alerts };
+  };
+  if (chunk) {
+    const ok = await run(async () => ({ ok: true, json: async () => ({ ok: true, theme: 'light' }) }));
+    check('背景の切り替え: 押すと白になり (media="not all")、白を保存しに行く',
+      ok.style.media === 'not all' && ok.posts.length === 1 && ok.posts[0].url === '/apps/product-hub/api/board/theme'
+      && ok.posts[0].body.theme === 'light', JSON.stringify(ok.posts));
+    check('背景の切り替え: ボタンの文字と重要度セレクトの色も白に揃う',
+      ok.btn.textContent === '🌙 黒背景にする' && ok.sel.style.background === p0.bg && ok.sel.style.color === p0.fg && !ok.btn.disabled);
+    const ng = await run(async () => ({ ok: false, json: async () => ({ ok: false, error: '保存できない' }) }));
+    check('🚨 背景の切り替え: 保存に失敗したら黒に戻して知らせる',
+      ng.style.media === 'all' && ng.btn.textContent === '☀ 白背景にする' && ng.sel.style.background === `${p0.fg}40`
+      && ng.alerts.length === 1, JSON.stringify(ng.alerts));
+    const down = await run(async () => { throw new Error('offline'); });
+    check('🚨 背景の切り替え: 通信エラーでも黒に戻す', down.style.media === 'all' && down.alerts.some((m) => m.includes('offline')));
+  }
 }
 
 // ─── 白抜き画像の受信箱 (2026-09-14): 画像タブの白抜きの枠にボタン + 選択画面。JS への値は data 属性で渡す ───

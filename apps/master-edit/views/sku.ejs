@@ -133,6 +133,23 @@
           <% if (!isSet && c.brand) { %><span class="dotsep" aria-hidden="true"></span><span id="brand-head">ブランド <%= c.brand.name %><%= c.brand.own_brand ? ' (自社)' : '' %></span><% } %>
           <% if (page.registered) { %><span class="dotsep" aria-hidden="true"></span><span id="registered-on">登録日 <%= page.registered.date ? page.registered.date.replace(/-/g, '/') + ' (' + page.registered.label + ')' : '— (分かりません)' %></span><% } %>
         </div>
+        <%# 🆕 10/20 中原さん「商品マスタからそれぞれのモールに飛ぶリンク」: この商品だけでできた出品の商品ページ (apps/master-edit/mall-links.mjs・Company DB の出品)。
+            見出しの中 = どのタブでも見える。新しいタブで開く。出品の無いモールは出さない・1 つも無い = 一言だけ・読めない = 出さない %>
+        <% const ML = locals.mallLinks; %>
+        <% if (ML && ML.ok) { %>
+        <div class="malls" id="sku-malls">
+          <span class="malls-t" id="malls-t">モール</span>
+          <% if (ML.malls.length) { %>
+          <ul class="malls-list" aria-labelledby="malls-t">
+            <% for (const m of ML.malls) { %><% for (const l of m.links) { %>
+            <li><a class="mall" data-mall="<%= m.mall %>" href="<%= l.url %>" target="_blank" rel="noopener noreferrer" title="<%= l.title %>"><%= m.label %><% if (l.text) { %><small><%= l.text %></small><% } %><svg class="ic s" aria-hidden="true"><use href="#i-ext"/></svg><span class="sr">(新しいタブで開く)</span></a></li>
+            <% } %><% if (m.more > 0) { %><li class="mall-more" title="<%= m.label %> の出品はほかに <%= m.more %> つ">ほか <%= m.more %></li><% } %><% } %>
+          </ul>
+          <% } else { %>
+          <span class="malls-none">出品が見つかりません</span>
+          <% } %>
+        </div>
+        <% } %>
       </div>
       <div class="ph-actions" style="align-items:center">
         <% if (!isSet && c.sku_kind !== 'exception') { %>

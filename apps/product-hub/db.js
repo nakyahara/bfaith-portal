@@ -1284,6 +1284,15 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_ph_staff_roles_role ON ph_staff_roles(role_code);
 
+    -- 工程ボードの背景 (黒 / 白) を人ごとに覚える (2026-10-19 中原さん要望・lib/board-theme.js)。
+    -- 鍵 = ログインのメール (小文字)。ph_staff に紐付いていない人 (管理者など) も選べるよう staff_id ではなくメールで持つ。
+    -- 行が無い = いつもの黒
+    CREATE TABLE IF NOT EXISTS ph_board_prefs (
+      email      TEXT PRIMARY KEY,
+      theme      TEXT NOT NULL CHECK (theme IN ('dark', 'light')),
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS ph_steps (
       code        TEXT PRIMARY KEY,                  -- basic_info / ai_generate / …
       label       TEXT NOT NULL,
