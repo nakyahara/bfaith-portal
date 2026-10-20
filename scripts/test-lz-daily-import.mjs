@@ -130,6 +130,15 @@ await ta('[3b] 🆕 外した行 (lzd-v4): 合格の証跡の外した行を照�
     [{ evExtra: ex([cost], { excluded: { count: 2, rows: [cost] } }) }, 'excluded_bad'],
     // 外してよい理由でない (材料のずれの疑い) が外した行に入っている = 取り込まない
     [{ evExtra: ex([{ ...cost, reason: 'cdb_no_sku' }]) }, 'excluded_reason'],
+    // 商品を特定できない外した行 = 「CSV に無い」と言えない (Codex R1 Medium)
+    [{ evExtra: ex([{ reason: 'cdb_cost_missing' }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...cost, code_norm: 5 }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...cost, ne_code: null }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...cost, ne_code: '  ' }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...coll, lz_ids: [] }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...coll, lz_ids: undefined }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...coll, lz_ids: ['U60E-05', 7] }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...cost, reason: 'code_invalid' }]) }, 'excluded_reason'],
     // 上限はこちらの決まりで計算し直す (証跡の limit は使わない)
     [{ evExtra: ex([cost, coll], { counts: { targets: 99, invalid: 2, excluded: 2 } }) }, 'excluded_over_cap'],
     [{ evExtra: ex([cost], { counts: { invalid: 1, excluded: 1 } }) }, 'excluded_over_cap'],
@@ -144,9 +153,12 @@ await ta('[3b] 🆕 外した行 (lzd-v4): 合格の証跡の外した行を照�
   // 不合格の証跡は照らさない (影の取込は合否を問わない)
   s = setup({ verdict: 'fail', evExtra: ex([cost], { counts: { targets: 10, invalid: 1, excluded: 1 } }) });
   assert.equal(P.pickTarget({ dataDir: s.dataDir, now: NOW, requirePass: false }).ok, true);
-  // 外した行の無い v4 = そのまま
+  // 外した行の無い v4 = そのまま / NE の書き方が 1 つに決まらない理由 (code_collided) は ne_code なしで code_norm で照らす
   s = setup({ evExtra: ex([]) });
   assert.equal(P.pickTarget({ dataDir: s.dataDir, now: NOW }).ok, true);
+  const col = { code_norm: 'b-9', ne_code: null, reason: 'code_collided', lz_ids: ['B-9'] };
+  assert.equal(P.pickTarget({ dataDir: setup({ evExtra: ex([col]) }).dataDir, now: NOW }).ok, true);
+  assert.equal(P.pickTarget({ dataDir: setup({ ids: ['A-1', 'b-9'], evExtra: ex([col]) }).dataDir, now: NOW }).reason, 'excluded_in_csv');
 });
 
 // ── 影の取込 (runShadow) ──

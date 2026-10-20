@@ -130,10 +130,13 @@ export function classifyForLz({ neItems, cdb, lz, cdbLag = () => false }) {
  *   「取り込まなかった商品は全部の列が直前と同じ」を見る)。
  *   ここに無い理由 (Company DB に商品が無い cdb_no_sku・元のコードを読めない no_spelling* / code_not_read / code_not_in_cdb / code_cdb_mismatch など
  *   = 材料のずれ・全体の問題の疑い) と知らない理由は、今までどおりその朝全体を不合格にする (fail_by invalid)。
+ *   code_invalid も止める側 (書き方の記録が壊れた damaged もここに入る = 材料の破損。Codex R1 Medium)。
  *   外した行が上限 (EXCLUDE_CAP) を超える = 全体の問題の疑い = 不合格 (fail_by excluded_over_cap)
  */
 export const EXCLUDABLE_REASONS = Object.freeze(['cdb_cost_missing', 'cdb_cost_shape', 'cdb_supplier_count', 'cdb_supplier_shape', 'cdb_name_blank', 'ne_name_blank',
-  'lz_case_collision', 'lz_deleted', 'code_collided', 'code_invalid', 'norm_collided']);
+  'lz_case_collision', 'lz_deleted', 'code_collided', 'norm_collided']);
+/** 外した行の証跡で NE の書き方 (ne_code) が無くてよい理由 (NE の書き方が 1 つに決まらない = code_norm で商品を特定する) */
+export const EXCLUDED_NO_NE_CODE = Object.freeze(['code_collided', 'norm_collided']);
 /** 外してよい行の上限 = 100 行まで・かつ対象 (NE の取得の商品) の 2% まで */
 export const EXCLUDE_CAP = Object.freeze({ max: 100, ratio: 0.02 });
 /** 外してよい行の数 (対象の数から。小さい方) */

@@ -15,7 +15,7 @@ import crypto from 'node:crypto';
 import iconv from 'iconv-lite';
 import { readEvidence } from '../company-db/push/evidence.mjs';
 import { parseCsvBytes } from './lz-compare.mjs';
-import { EXCLUDABLE_REASONS, excludeLimit } from './lz-cdb.mjs';
+import { EXCLUDABLE_REASONS, EXCLUDED_NO_NE_CODE, excludeLimit } from './lz-cdb.mjs';
 
 export const WINDOW = Object.freeze({ fromMin: 15, toMin: 55 });   // JST 00:15〜00:55
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -86,6 +86,13 @@ export function checkExcluded(ev, csvBuf) {
   const x = ev.excluded;
   if (!x || typeof x !== 'object' || !Array.isArray(x.rows) || !Number.isSafeInteger(x.count) || x.count !== x.rows.length || invalid !== x.count || c.excluded !== x.count) return { ok: false, reason: 'excluded_bad' };
   if (x.rows.some((r) => !r || typeof r !== 'object' || !EXCLUDABLE_REASONS.includes(r.reason))) return { ok: false, reason: 'excluded_reason' };
+  // 商品を特定できない外した行 = 「CSV に無い」と言えない = 取り込まない (Codex R1 Medium)。
+  //   元のコード (code_norm) は必ず・NE の書き方 (ne_code) は書き方が 1 つに決まらない理由のときだけ無くてよい・大文字小文字ちがいはロジザードの ID も必ず
+  const str = (v) => typeof v === 'string' && v.trim() !== '';
+  if (x.rows.some((r) => !str(r.code_norm)
+    || (r.ne_code != null && !str(r.ne_code)) || (r.ne_code == null && !EXCLUDED_NO_NE_CODE.includes(r.reason))
+    || (r.lz_ids != null && (!Array.isArray(r.lz_ids) || !r.lz_ids.every(str)))
+    || (r.reason === 'lz_case_collision' && !(Array.isArray(r.lz_ids) && r.lz_ids.length >= 1)))) return { ok: false, reason: 'excluded_unidentified' };
   if (!Number.isSafeInteger(c.targets) || x.count > excludeLimit(c.targets)) return { ok: false, reason: 'excluded_over_cap' };
   const bad = new Set();
   for (const r of x.rows) for (const v of [r.ne_code, r.code_norm, ...(Array.isArray(r.lz_ids) ? r.lz_ids : [])]) if (typeof v === 'string' && v) bad.add(v.toLowerCase());

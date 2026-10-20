@@ -748,8 +748,9 @@ await ta('[15] 🆕 外した行 (lzd-v4・2026-10-21 中原さん): その行�
   sp = D.splitInvalid(Array.from({ length: 101 }, (_, i) => row(`c-${i}`, 'cdb_cost_missing')), { targets: 100000 });
   assert.deepEqual([sp.excluded.length, sp.limit, sp.over], [101, 100, true]);
   // 外してよい理由でない (材料のずれの疑い)・知らない理由 = 全体を止める
-  sp = D.splitInvalid([row('a', 'cdb_no_sku'), row('b', 'code_cdb_mismatch'), row('c', 'no_spelling'), row('d', 'no_spelling_x'), row('e', 'code_not_in_cdb'), row('f', 'code_not_read'), row('g', 'something_new'), row('h', 'cdb_cost_missing')], { targets: 5000 });
-  assert.deepEqual([sp.excluded.map((x) => x.code_norm), sp.blocking.map((x) => x.reason)], [['h'], ['cdb_no_sku', 'code_cdb_mismatch', 'no_spelling', 'no_spelling_x', 'code_not_in_cdb', 'code_not_read', 'something_new']]);
+  sp = D.splitInvalid([row('a', 'cdb_no_sku'), row('b', 'code_cdb_mismatch'), row('c', 'no_spelling'), row('d', 'no_spelling_x'), row('e', 'code_not_in_cdb'), row('f', 'code_not_read'), row('g', 'something_new'), row('h', 'cdb_cost_missing'),
+    row('i', 'code_invalid')], { targets: 5000 });   // code_invalid = 書き方の記録の破損 (damaged) も入る = 材料の破損 = 止める (Codex R1 Medium)
+  assert.deepEqual([sp.excluded.map((x) => x.code_norm), sp.blocking.map((x) => x.reason)], [['h'], ['cdb_no_sku', 'code_cdb_mismatch', 'no_spelling', 'no_spelling_x', 'code_not_in_cdb', 'code_not_read', 'something_new', 'code_invalid']]);
   assert.deepEqual(['cdb_supplier_count', 'lz_case_collision'].map((reason) => D.excludedLabel({ reason, suppliers: ['0001', '0002'], lz_ids: ['X'] })), ['仕入先が 2 つ以上', 'NE とロジザードで大文字小文字がちがう']);
 
   // ── runLzDaily: NEW-1 がロジザードにある・Company DB に原価が無い = 外した行 ──
