@@ -9,6 +9,7 @@
  *      ロードの完了 (① の行)・照合の失敗 (② の行) とは別に「代表のずれ」と「新しい NE 登録の CSV を閉じたか」を出す
  * 門 (DB の ops.parent_gate_state / 品目の表の trigger):
  *   products.parent の持ち主 (DB の active) が company のときだけ、数えが 0 でない朝は新しい一般の NE 登録の CSV (作る・配る) を閉じる。
+ *   🆕 0095 (中原さん 10/19): 閉じるのは、ずれた色違いのまとまりに触る CSV だけ (どのまとまりか分からないずれ・記録できない朝は今までどおり全部)。
  *   🚨 load の間 (今) は数えて知らせるだけ = 今の単品の登録を止めない (設計 v7 §⑩ PR-6「持ち主が load の間は知らせだけ・門は company の後」)。
  *   夜間ロードは止めない。配ったファイルの再取得・申告・照合・取り込めなかった商品だけの作り直し・廃止は門が閉じていても通す (自己デッドロックを防ぐ)
  * 差を残す承認 (accept_difference) では減らない (承認の台帳を読まない・DB の承認の trigger も代表には断る)
@@ -265,8 +266,21 @@ export function parentEnforced(ne) {
   return !ownerKnown(p);
 }
 const ownerKnown = (p) => p.owner === 'load' || p.owner === 'company' || (!!p.gate && typeof p.gate.enforced === 'boolean');
-const CLOSED_JA = '新しい NE 登録の CSV (作る・配る) は閉じた (夜間ロードは済んだ・配ったファイルの申告・照合・取り込めなかった商品だけの作り直し・廃止はできる)';
+const CLOSED_JA = '新しい NE 登録の CSV (作る・配る) は全部止めた (夜間ロードは済んだ・配ったファイルの申告・照合・取り込めなかった商品だけの作り直し・廃止はできる)';
 const recordWhy = (p) => `${STATE_JA[p.state] || p.state}${p.error ? `: ${String(p.error).slice(0, 80)}` : p.reason ? `: ${String(p.reason).slice(0, 80)}` : ''}`;
+/**
+ * 🆕 0095: 門をまとまりだけに絞った朝の「何を止めたか」(DB の ops.parent_gate_state の scope)。
+ *   scope が無い (0095 の前の DB・門の状態を読めない) / 全部止める (scope.all) = null (今までどおり「全部止めた」)
+ *   絞った = 「この色違いのまとまりの商品だけ … を止めた (ほかの商品は作れる)」/ 止めているまとまりが無い (記録の後に全部直った) = 「止めている商品は無い」
+ */
+export function parentScopeJa(p) {
+  const s = p && p.gate && p.gate.scope;
+  if (!s || typeof s !== 'object' || s.all !== false || !Array.isArray(s.groups)) return null;
+  if (!s.groups.length) return 'NE 登録の CSV は止めていない (ずれは記録の後に直った)';
+  const names = s.groups.slice(0, 5).map((g) => String(g.label ?? g.group ?? '?'));
+  const more = Number(s.group_count) > names.length ? ` ほか ${Number(s.group_count) - names.length}` : '';
+  return `この色違いのまとまりの商品だけ NE 登録の CSV を止めた: ${names.join('・')}${more} (ほかの商品は作れる)`;
+}
 
 /**
  * 朝の要約に ⚠️ で出す代表 (親) の知らせ (問題なし = null。run.mjs の summaryLine が先頭が ⚠️ になるように置く)。
@@ -284,7 +298,7 @@ export function parentTrouble(ne) {
     return drift ? `${drift}・知らせだけ (代表の持ち主は夜間ロード = CSV は閉じない・広げる前に 0 にする)・一覧 = drift-list.mjs` : null;
   }
   if (!drift) return null;
-  return `${drift} → ${enforced ? CLOSED_JA : '知らせだけ (代表の持ち主は夜間ロード = CSV は閉じない・広げる前に 0 にする)'}・一覧 = drift-list.mjs`;
+  return `${drift} → ${enforced ? (parentScopeJa(p) || CLOSED_JA) : '知らせだけ (代表の持ち主は夜間ロード = CSV は閉じない・広げる前に 0 にする)'}・一覧 = drift-list.mjs`;
 }
 
 /** 持ち主が load の間に数えを記録できなかった朝の一言 (ℹ️・要約の後ろ)。書く接続の無い朝 (試験・設定の前) は黙る */

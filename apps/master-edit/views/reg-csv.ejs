@@ -34,6 +34,9 @@
         { n: '⑤ 翌朝の確かめ', t: 'NE と同じだった', c: verifiedItems, u: '商品', s: '最近のファイルの中で · そろえば NE 確認済み', hot: false },
       ];
     }
+    // 🆕 0095: 代表 (親) の門の 1 行 (ずれた商品のコードは商品の画面へのリンク = そこで「NE の代表を採用する」)
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+    const gateHtml = (g) => esc(g.pre) + g.codes.map((x) => `<a href="${esc(base)}/sku/${esc(encodeURIComponent(x))}">${esc(x)}</a>`).join('・') + esc(g.post);
     const steps = (e) => {
       const done = (x) => ({ t: x, cls: 'done' });
       if (e.state === 'built') return [done('作った'), { t: '配る (ダウンロード)', cls: 'cur' }, { t: 'NE で取り込む' }, { t: '翌朝の確かめ (自動)' }];
@@ -79,6 +82,7 @@
       </details>
     </section>
 
+    <% if (S.parent_gate_all) { %><div class="callout warn" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t"><%- gateHtml(S.parent_gate_all) %></div><div class="hint">配ったファイルの申告・「取り込めなかった」商品だけの作り直し・使わないはできます。</div></div></div><% } %>
     <section class="panel" aria-labelledby="h-cands">
       <div class="panel-h"><span class="hico" aria-hidden="true">①</span><h2 id="h-cands">CSV にする商品</h2><span class="sub">下書き · NE 登録待ち</span></div>
       <% if (!S.candidates.length) { %><div class="empty">下書き・NE 登録待ちの商品はありません。<br>新商品は <a href="<%= base %>/new?kind=single">新商品の登録</a> で下書きにします。</div><% } else { %>
@@ -94,7 +98,7 @@
               <td><span class="b <%= c.kind === 'sets' ? 'vio' : 'mute' %>"><%= kindLabel[c.kind] %></span></td>
               <td><%= REG_STATES[c.state] || c.state %><% if (c.live) { %><span class="sub">ファイル #<%= c.live.export_id %> (<%= ITEM_STATES[c.live.state] || c.live.state %>)</span><% } %></td>
               <td>
-                <% for (const b of c.blockers) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= b %></span></div><% } %>
+                <% for (const b of c.blockers) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><% if (c.gate && b === c.gate.text) { %><%- gateHtml(c.gate) %><% } else { %><%= b %><% } %></span></div><% } %>
                 <% for (const w of c.warnings) { %><div class="why-wrn"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span><%= w %></span></div><% } %>
                 <% if (!c.blockers.length) { %><span class="why-ok"><svg class="ic s" aria-hidden="true"><use href="#i-check"/></svg>作れます<%= c.kind === 'sets' ? ' (構成品は全部 NE 確認済み)' : '' %></span><% } %>
               </td>
@@ -135,7 +139,10 @@
           <div class="kidchips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
           <% for (const k of r.kids) { %><a class="compchip" href="<%= base %>/sku/<%= encodeURIComponent(k.code) %>" title="<%= k.blockers.join(' / ') %>"><span class="mono"><%= k.code %></span><% if (k.live) { %> <span class="b mute">#<%= k.live.export_id %></span><% } else if (k.blockers.length) { %> <span class="b err">止まる</span><% } %></a><% } %>
           </div>
-          <% for (const k of r.kids.filter((x) => !x.live && x.blockers.length)) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= k.code %>: <%= k.blockers.join(' / ') %></span></div><% } %>
+          <%# 🆕 0095: 代表 (親) の門は同じ 1 行が子ごとに並ぶ = 1 つにまとめて、ほかの理由は子ごと %>
+          <% const gk = r.kids.filter((x) => !x.live && x.gate); const gLines = [...new Map(gk.map((x) => [x.gate.text, x.gate])).values()]; %>
+          <% for (const g of gLines) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= gk.filter((x) => x.gate.text === g.text).map((x) => x.code).join('・') %>: <%- gateHtml(g) %></span></div><% } %>
+          <% for (const k of r.kids.filter((x) => !x.live && x.blockers.some((b) => !(x.gate && b === x.gate.text)))) { %><div class="why-blk"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><%= k.code %>: <%= k.blockers.filter((b) => !(k.gate && b === k.gate.text)).join(' / ') %></span></div><% } %>
         </div>
         <% } %>
         <div class="msgline" data-msg role="status" aria-live="polite"></div>

@@ -330,6 +330,16 @@ export const NE_UPD_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_ne_upd_writ
   'ops.ne_upd_yen(numeric)', 'ops.ne_upd_units(bigint[], text)', 'ops.ne_upd_auto_limit()', 'ops.ne_upd_file_limit()', 'ops.ne_upd_busy()', 'ops._ne_upd_fill(bigint, boolean, text, boolean)',
   'ops.ne_upd_jstrim(text)', 'ops.ne_upd_file_out(text, timestamp with time zone, timestamp with time zone)',
   'ops._ne_upd_begin()', 'ops._ne_upd_worker_state()', 'ops._ne_upd_actor_ok(text)']);
+/**
+ * 🆕 0095 (代表 (親) の門をずれたまとまりだけに絞る・中原さん 10/19): master_edit に CSV の候補が門で止まるかを読む関数 (読むだけ) の実行 (PARENT_GATE_EDIT_FUNCTIONS)。
+ *   止めるのは品目の表の trigger (画面を信じない)。🚨 渡さない: 分け方・判断の部品・表の守り (PARENT_GATE_OWNER_ONLY_FUNCTIONS)。関数が無い DB (0095 の前) では付けない
+ */
+export const PARENT_GATE_EDIT_FUNCTIONS = Object.freeze(['ops.parent_gate_csv_check(bigint[])']);
+export const PARENT_GATE_OWNER_ONLY_FUNCTIONS = Object.freeze(['ops.guard_master_parent_gate_scopes()', 'ops._parent_gate_scope_of(jsonb)', 'ops._record_parent_gate_scope(bigint, jsonb)',
+  'ops._parent_gate_global_problems()', 'ops._parent_gate_resolved(text, text, text)', 'ops._parent_gate_items(text[])', 'ops._parent_gate_sku_keys(bigint, jsonb)',
+  'ops._parent_gate_sku_pids(bigint, jsonb)', 'ops._parent_gate_codes(text[], bigint[])',
+  'ops._parent_gate_hit(text[], jsonb)', 'ops._parent_gate_match(bigint, jsonb)', 'ops._parent_gate_all_block(text[])', 'ops._parent_gate_block(bigint, jsonb)',
+  'ops._parent_gate_scope_state(text[])']);
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -464,6 +474,9 @@ export function masterEditRoleStatements({ dbName, pw = {} }) {
   // 🆕 0094 (NE へ送る): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (送り手の関数 = watch_writer は migration / create-watch-roles.mjs が付ける = ここでは外さない)
   for (const f of [...NE_UPD_EDIT_FUNCTIONS, ...NE_UPD_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
   for (const f of NE_UPD_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
+  // 🆕 0095 (代表の門をまとまりだけに): 関数がある DB だけ。前に付けた実行権を外してから画面のロールに付け直す (部品はだれにも渡さない)
+  for (const f of [...PARENT_GATE_EDIT_FUNCTIONS, ...PARENT_GATE_OWNER_ONLY_FUNCTIONS]) s.push(ifFn(f, `execute 'revoke all on function ${f} from public, ${all}';`));
+  for (const f of PARENT_GATE_EDIT_FUNCTIONS) s.push(ifFn(f, `execute 'grant execute on function ${f} to master_edit';`));
   s.push(ifFn(ACK_V2_FUNCTION, `execute 'grant execute on function ${ACK_V2_FUNCTION} to master_gate';`));
   // new_entry_gate (NOINHERIT のログイン): ops の usage と許可を出す / 取り消す関数の実行・取り消した後に閉じたことを確かめる ops.new_entry_lease_valid (読むだけ・#1645)。
   //   表は読まない (ゲートの診断の表の読み取りは watcher の接続で)。new_entry_lease_valid は WIDEN_EDIT_FUNCTIONS (上で全部のロールから外して master_edit に付け直す) なので、
