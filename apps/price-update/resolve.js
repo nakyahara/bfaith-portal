@@ -153,6 +153,93 @@ export function parentCodeOf(code) {
   return m ? m[1] : null;
 }
 
+function columnExists(db, table, column) {
+  try {
+    return db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 代表商品コード (楽天の商品管理番号 / Yahoo の親の商品コード) を、ぶら下がるバリエーションの
+ * NEコードへ広げる。楽天RMS のように「商品ページ単位でまとめて」価格を直すための入口 (2026-10-20 現場要望)。
+ *
+ * 手がかりは3つ。どれか1つで当たれば子として扱う:
+ *   ne   … NE の代表商品コード (mirror_products.代表商品コード)
+ *   rms  … 楽天の商品管理番号 (mirror_rakuten_sku_map.manage_number)
+ *   code … コードの形 (親コード + 英字を含む枝番。parentCodeOf と同じ規則)
+ * ★NE の代表商品コードは空のまま色を足した商品があるので、1つだけには頼らない。
+ * ★子に広げるだけで、引き当て・ライブ確認・ガードは NEコードを入れた時と同じ道を通る
+ *   (ここで「確定」にはしない)。セット行が初期未選択なのもそのまま。
+ *
+ * @param db mirror DB ハンドル
+ * @param {string[]} codes 入力コード
+ * @returns {{codes:string[], expansions:Array<{parent:string, children:string[], sources:string[], parentIsProduct:boolean}>}}
+ *   codes = 展開後の NEコード (入力の並び順。親が商品マスタにある時は親も残す)
+ */
+export function expandParentCodes(db, codes) {
+  const inputs = [...new Set(codes.map((c) => String(c || '').trim()).filter(Boolean))];
+  const hasRep = columnExists(db, 'mirror_products', '代表商品コード');
+  const hasManage = columnExists(db, 'mirror_rakuten_sku_map', 'manage_number');
+  const products = loadProducts(db, inputs);
+
+  const out = [];
+  const seen = new Set();
+  const push = (c) => { const k = normCode(c); if (k && !seen.has(k)) { seen.add(k); out.push(c); } };
+  const expansions = [];
+
+  for (const code of inputs) {
+    const key = normCode(code);
+    const found = new Map();   // 子の照合キー → { code, sources:Set }
+    const add = (childCode, source) => {
+      const k = normCode(childCode);
+      if (!k || k === key) return;   // 自分自身 (単品で 代表商品コード = 商品コード) は子にしない
+      if (!found.has(k)) found.set(k, { code: String(childCode).trim(), sources: new Set() });
+      found.get(k).sources.add(source);
+    };
+    if (hasRep) {
+      for (const r of db.prepare(`
+        SELECT 商品コード AS code FROM mirror_products WHERE LOWER(TRIM(代表商品コード)) = ?
+      `).all(key)) add(r.code, 'ne');
+    }
+    if (hasManage) {
+      for (const r of db.prepare(`
+        SELECT DISTINCT ne_code AS code FROM mirror_rakuten_sku_map WHERE LOWER(TRIM(manage_number)) = ?
+      `).all(key)) add(r.code, 'rms');
+    }
+    // コードの形: LIKE の % _ は文字として扱う
+    const like = key.replace(/[\\%_]/g, (ch) => `\\${ch}`) + '-%';
+    for (const r of db.prepare(`
+      SELECT 商品コード AS code FROM mirror_products WHERE LOWER(TRIM(商品コード)) LIKE ? ESCAPE '\\'
+    `).all(like)) {
+      if (normCode(parentCodeOf(r.code)) === key) add(r.code, 'code');
+    }
+    // ★セット商品は子にしない (例: 枝番 `-set` が色と同じ形に見える)。子にすると単品の行として並び、
+    //   「まとめて入れる」で色と同じ売価が入ってしまう。セットは従来どおり「含むセット」として未選択で出る
+    const childProducts = loadProducts(db, [...found.values()].map((c) => c.code));
+    for (const [k, p] of childProducts) {
+      if (String(p.kind || '').trim() === 'セット' || Number(p.setCount) > 0) found.delete(k);
+    }
+
+    if (found.size === 0) { push(code); continue; }
+    const parentIsProduct = products.has(key);
+    // 親そのものも商品として登録されている時 (単品ページに色を足した形) は親も並べる
+    if (parentIsProduct) push(code);
+    const children = [...found.values()].sort((a, b) => normCode(a.code).localeCompare(normCode(b.code)));
+    for (const c of children) push(c.code);
+    const sources = new Set();
+    for (const c of children) for (const s of c.sources) sources.add(s);
+    expansions.push({
+      parent: code,
+      children: children.map((c) => c.code),
+      sources: ['ne', 'rms', 'code'].filter((s) => sources.has(s)),
+      parentIsProduct,
+    });
+  }
+  return { codes: out, expansions };
+}
+
 /**
  * Yahoo: mirror_yahoo_sku_map (手動map) + 規則。
  *
