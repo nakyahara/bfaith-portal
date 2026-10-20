@@ -20,6 +20,7 @@ import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesM
 import { financeCoordinatorEnabled, settlementStep, financePushStep, FINANCE_COORDINATOR_ENV, legacyGateCheck } from './finance-coordinator-switch.js';
 import { skipAfterCompare, gateRetryJobs, STEP_NAME as NEW_ENTRY_GATE_STEP } from '../company-db/master-compare/new-entry-gate.mjs';
 import { readLzCodeNotice } from '../master-decisions/lz-code-notice.mjs';
+import { neApiUsageForDailySync } from './ne-api-usage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -1887,6 +1888,16 @@ async function main() {
     }
   }
 
+  // ─── NE の API の回数 (今月・JST。ne-api-usage.js) ───
+  // NE を呼ぶ段 (NE・NEへ送る) が全部終わった後に 1 回読む。まとめに 1 行 (段の結果 = results には足さない = 見出しの ✅ / ⚠️ と retry は今のまま)。
+  // NE_API_MONTHLY_WARN (既定 700,900,1000) を超えたら ⚠️ の行 + その数ごとに月 1 回だけ別の GChat の知らせ (送れた数を覚える)。読めない・送れないでも止めない
+  let neApiUsageLine = null;
+  try {
+    neApiUsageLine = (await neApiUsageForDailySync({ dataDir: process.env.DATA_DIR || path.join(PROJECT_DIR, 'data'), notify })).line;
+  } catch (e) {
+    console.warn(`[DailySync] NE の API の回数を出せない (${e.message})`);
+  }
+
   // 通知メッセージ作成
   // 期限切れ系（🔴🟡）のみ通知に含め、設定チェック系は同期失敗時のみ表示
   const urgentWarnings = tokenWarnings.filter(w => w.startsWith('🔴') || w.startsWith('🟡'));
@@ -1900,6 +1911,7 @@ async function main() {
     const icon = resultIcon(r);
     msg += `${icon} ${r.name}: ${r.summary}\n`;
   }
+  if (neApiUsageLine) msg += `\n${neApiUsageLine}\n`;
   if (retryableFailed.length > 0) {
     if (retryStateWritten) {
       // 残っている再試行の時刻だけを書く。11:30 を過ぎていれば その日は自動で再試行されない = 手で (翌朝の再試行は別日の state を消す。#1538 Codex R1 High)
