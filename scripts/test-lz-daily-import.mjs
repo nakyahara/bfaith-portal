@@ -108,6 +108,10 @@ await ta('[3] 取り込む前の確かめ: CSV の全部の商品が直前の書
   const lz2 = D.readLzShohinMaster(lzCsv([{ id: 'A-1' }, { id: 'U60E-05' }, { id: 'u60e-05' }]), { minRows: 1 });
   assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['A-1', 'U60E-05']), lz: lz2 }), { ok: false, rows: 2, missing: [], deleted: [], case_variants: ['U60E-05'] });
   assert.equal(P.precheck({ csvBuf: dailyCsv(['A-1']), lz: lz2 }).ok, true);
+  // 🆕 別の書き方の方が無効 (削除フラグ 1) = 数えない (2026-10-21 中原さん) / CSV の商品そのものが無効 = 今までどおり押さない (deleted)
+  const lz3 = D.readLzShohinMaster(lzCsv([{ id: 'A-1' }, { id: 'U60E-05' }, { id: 'u60e-05', del: '1' }]), { minRows: 1 });
+  assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['A-1', 'U60E-05']), lz: lz3 }), { ok: true, rows: 2, missing: [], deleted: [], case_variants: [] });
+  assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['u60e-05']), lz: lz3 }), { ok: false, rows: 1, missing: [], deleted: ['u60e-05'], case_variants: ['u60e-05'] });
 });
 
 await ta('[3b] 🆕 外した行 (lzd-v4): 合格の証跡の外した行を照らし直す (数・理由・上限・CSV に外した商品が無い = 大文字小文字ちがいのロジザードの ID も) / v3 の合格に不正 = 取り込まない', async () => {

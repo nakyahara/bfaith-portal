@@ -753,6 +753,19 @@ await ta('[15] 🆕 外した行 (lzd-v4・2026-10-21 中原さん): その行�
   assert.deepEqual([sp.excluded.map((x) => x.code_norm), sp.blocking.map((x) => x.reason)], [['h'], ['cdb_no_sku', 'code_cdb_mismatch', 'no_spelling', 'no_spelling_x', 'code_not_in_cdb', 'code_not_read', 'something_new', 'code_invalid']]);
   assert.deepEqual(['cdb_supplier_count', 'lz_case_collision'].map((reason) => D.excludedLabel({ reason, suppliers: ['0001', '0002'], lz_ids: ['X'] })), ['仕入先が 2 つ以上', 'NE とロジザードで大文字小文字がちがう']);
 
+  // 🆕 ロジザードの大文字小文字ちがいの重複を「無効」(削除フラグ 1) にした = 重複に数えない = 有効な方は比べる・送る / 無効の方が NE の書き方なら送らない
+  const cdbU = cdbOf([{ norm: 'u60e-05', name: 'x', cost: 1, sups: ['0001'] }]);
+  let cu = D.classifyForLz({ neItems: [neItem('U60E-05')], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05'], { 'u60e-05': { del: '1' } }) });
+  assert.deepEqual([cu.compare.map((x) => x.key), cu.invalid], [['U60E-05'], []]);
+  cu = D.classifyForLz({ neItems: [neItem('U60E-05')], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05']) });   // 両方とも有効 = 今までどおり外す
+  assert.deepEqual(cu.invalid.map((x) => [x.reason, x.lz_ids]), [['lz_case_collision', ['U60E-05', 'u60e-05']]]);
+  cu = D.classifyForLz({ neItems: [{ ...neItem('U60E-05'), ne_code: 'u60e-05' }], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05'], { 'u60e-05': { del: '1' } }) });   // NE の書き方が無効の方
+  assert.deepEqual(cu.invalid.map((x) => [x.reason, x.lz_ids]), [['lz_case_collision', ['U60E-05', 'u60e-05']]]);
+  cu = D.classifyForLz({ neItems: [neItem('U60E-05')], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05'], { 'U60E-05': { del: '1' } }) });   // NE の書き方の方が無効・別の書き方が有効 = 外す (送らない)
+  assert.deepEqual(cu.invalid.map((x) => x.reason), ['lz_case_collision']);
+  cu = D.classifyForLz({ neItems: [neItem('U60E-05')], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05'], { 'U60E-05': { del: '1' }, 'u60e-05': { del: '1' } }) });   // 両方とも無効 = 送らない
+  assert.deepEqual(cu.invalid.map((x) => x.reason), ['lz_deleted']);
+
   // ── runLzDaily: NEW-1 がロジザードにある・Company DB に原価が無い = 外した行 ──
   const lzRows = [{ id: 'A-1', name: 'x' }, { id: 'B-2' }, { id: 'NEW-1' }];
   const noCost = cdbFake({ cdb: cdbOf([{ norm: 'a-1', name: '商品A', cost: 100, sups: ['0001'] }, { norm: 'b-2', name: '商品B', cost: 5200, sups: ['0001'] }, { norm: 'new-1', name: '新', sups: ['0001'] }]) });

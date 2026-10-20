@@ -15,7 +15,7 @@ import crypto from 'node:crypto';
 import iconv from 'iconv-lite';
 import { readEvidence } from '../company-db/push/evidence.mjs';
 import { parseCsvBytes } from './lz-compare.mjs';
-import { EXCLUDABLE_REASONS, EXCLUDED_NO_NE_CODE, excludeLimit } from './lz-cdb.mjs';
+import { EXCLUDABLE_REASONS, EXCLUDED_NO_NE_CODE, excludeLimit, isActiveLz } from './lz-cdb.mjs';
 
 export const WINDOW = Object.freeze({ fromMin: 15, toMin: 55 });   // JST 00:15〜00:55
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -108,7 +108,7 @@ export function csvIds(csvBuf) {
 
 /**
  * 取り込む前の確かめ: CSV の全部の商品 ID が、直前の書き出し (readLzShohinMaster の結果) にあり・削除されていない・
- * 🆕 大文字小文字だけ違う別の ID が直前の書き出しに無い (case_variants。朝の後にロジザードに別の書き方の商品ができた = 別の商品を書き換えるおそれ = 押さない)
+ * 🆕 大文字小文字だけ違う有効な別の ID が直前の書き出しに無い (case_variants。無効の ID は数えない。朝の後にロジザードに別の書き方の商品ができた = 別の商品を書き換えるおそれ = 押さない)
  * @returns {{ ok: boolean, rows: number, missing: string[], deleted: string[], case_variants: string[] }}
  */
 export function precheck({ csvBuf, lz }) {
@@ -117,8 +117,9 @@ export function precheck({ csvBuf, lz }) {
     const r = lz.byId.get(id);
     if (!r) missing.push(id);
     else if (r.deleted !== '0') deleted.push(id);
+    // 無効 (削除フラグ が 0 でない) の別の書き方は数えない (lz-cdb.mjs の classifyForLz と同じ。無効の ID は CSV に入らない = 値は書き込まない・取込の後の確かめで前と同じかを見る)
     const g = lz.lowerGroups ? lz.lowerGroups.get(id.toLowerCase()) : null;
-    if (g && g.some((v) => v !== id)) caseVariants.push(id);
+    if (g && g.some((v) => v !== id && isActiveLz(lz, v))) caseVariants.push(id);
   }
   return { ok: ids.length > 0 && !missing.length && !deleted.length && !caseVariants.length, rows: ids.length, missing, deleted, case_variants: caseVariants };
 }

@@ -72,6 +72,9 @@ export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
   return { ok: true, reason: null, rows: body.length, byId, lowerGroups, encoding };
 }
 
+/** ロジザードの一覧で有効な商品か (削除フラグ = '0')。無効 (削除フラグ が 0 でない) = 大文字小文字ちがいの重複に数えない */
+export const isActiveLz = (lz, id) => { const r = lz && lz.byId && lz.byId.get(id); return !!r && r.deleted === '0'; };
+
 /**
  * NE の取得の商品を 3 つに分け、比べる商品は両方の道の項目を作る (純粋)
  * @param {object} p
@@ -88,7 +91,9 @@ export function classifyForLz({ neItems, cdb, lz, cdbLag = () => false }) {
   const no = (it, reason, extra = {}) => invalid.push({ code_norm: it.code_norm, ne_code: it.ne_code || null, reason, ...extra });
   for (const it of neItems) {
     if (!it.ne_code) { no(it, it.code_reason || 'no_ne_code'); continue; }
-    const variants = lz.lowerGroups.get(it.ne_code.toLowerCase()) || [];
+    // 🆕 無効 (削除フラグ が 0 でない) の別の書き方は数えない (2026-10-21 中原さん: ロジザードに削除は無い = 小文字の重複を「無効」にする)。
+    //   無効の ID は CSV に入らない (下の lz_deleted・取込の前の precheck の deleted)・取込の後の確かめで全部の列が前と同じかを見る = 値は書き込まない
+    const variants = (lz.lowerGroups.get(it.ne_code.toLowerCase()) || []).filter((v) => v === it.ne_code || isActiveLz(lz, v));
     if (variants.some((v) => v !== it.ne_code)) { no(it, 'lz_case_collision', { lz_ids: variants }); continue; }
     const lzRow = lz.byId.get(it.ne_code);
     if (!lzRow) { awaiting.push({ code_norm: it.code_norm, ne_code: it.ne_code }); continue; }

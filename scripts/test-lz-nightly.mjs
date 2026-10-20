@@ -1143,6 +1143,21 @@ await ta('[36] 🆕 外した行 端から端まで (本物のエンジン・本
   assert.deepEqual([s.code, s.line.replace(/\(lzim_night_[^)]+\)/, '(id)')], [0, '✅ ロジザード毎日の商品マスタの取込 (毎晩): 取込 verified (id)・2 件を取り込んだ・ロジザードに送れなかった商品 2 件 (原価が無い 1・ロジザードに大文字小文字ちがいが 2 つ 1): C-3・U60E-05']);
 });
 
+await ta('[36b] 🆕 小文字の重複を無効 (削除フラグ 1) にした朝 (2026-10-21 中原さん): U60E-05 は送って verified・無効の u60e-05 は書き込まない (前後で全部の列が同じ)', async () => {
+  const rows = [...DAILY, ['U60E-05', 'U', 'U', '10', '0001']];
+  const buf = csvBuf(['形式/型番', '商品名', 'ふりがな', '仕入単価', '取引先id'], rows);
+  const p = portal();
+  p.putArtifact({ csvBuf: buf, sha256: sha(buf), rows: rows.length });
+  const dataDir = setupData({ rows, evExtra: v4([]) });
+  const lz = realLikeLz({ ids: ['A-1', 'B-2', 'U60E-05', 'u60e-05'], now: () => p.clock.now });
+  lz.st.lz.get('u60e-05')[LZ_SHOHIN.header.indexOf('削除フラグ')] = '1';
+  const before = [...lz.st.lz.get('u60e-05')];
+  const r = await N.runNightly(e2eOpts(p, dataDir, lz).o);
+  assert.deepEqual([r.state, r.result, r.ping, r.rows], ['imported', 'verified', 'ok', 3]);
+  assert.deepEqual(lz.st.lz.get('u60e-05'), before, '無効の ID に値を書き込まない');
+  assert.equal(lz.st.lz.get('U60E-05')[LZ_SHOHIN.header.indexOf('商品名')], 'U');
+});
+
 await ta('[37] 🆕 外した行 (守り): CSV に外した商品がある (大文字小文字ちがいの ID も)・外した行が多すぎる・外してよい理由でない = ロジザードに入らない / 直前の書き出しに CSV の商品の大文字小文字ちがいの別の ID ができた = 押さない', async () => {
   for (const [rows, ev, reason] of [
     [[...DAILY, ['c-3', 'C', 'C', '10', '0001']], v4([EX_COST]), 'target_excluded_in_csv'],
