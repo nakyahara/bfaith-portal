@@ -1,0 +1,23 @@
+<%#
+  🆕 0098: 「NE にあるので登録済みにする」(新商品の下書き・NE 登録待ちで、NE にもう同じ商品がある)。lib/master-draft-in-ne.mjs の draftInNeView = dine { show, canGo, why, diffs, checkHash, resolveItem, canApprove, button }。
+  押せる = DB の確かめが ok・名簿 MASTER_DECISION_APPROVERS の人・保存を開いている。動き = public/me-draft-in-ne.js (POST /api/sku/:code/draft-in-ne → 1 行 → 読み直し)
+  置き場所 = 商品の画面の上 (「下書きです」の帯・「この下書きを消す」のすぐ下)
+%>
+<% const N = typeof dine !== 'undefined' && dine && dine.show ? dine : null; const nCan = !!N && N.canGo && N.canApprove && !dbError && !closed; %>
+<% if (N) { %>
+<div class="callout <%= N.canGo ? 'info' : 'warn' %> dine" id="dine" data-base="<%= base %>">
+  <svg class="ic" aria-hidden="true"><use href="#i-<%= N.canGo ? 'check' : 'info' %>"/></svg>
+  <div class="grow">
+    <% if (N.canGo) { %>
+      <div class="t">この商品は NE にもうあります</div>
+      <div class="hint">NE の商品をそのまま使って、登録済みにできます。<% if (N.diffs.length) { %>NE とちがう所 (<%= N.diffs.join('・') %>) は、登録済みにした後「NEへ送る」に出ます。<% } else { %>NE と Company DB の値は同じです。<% } %><% if (N.resolveItem) { %> NE 登録の CSV (ファイル #<%= N.resolveItem.exportId %>) のこの商品は「使わない」にします。<% } %></div>
+      <% if (!N.canApprove) { %><div class="hint">登録済みにできるのは、NE 登録の CSV を扱う名簿 (MASTER_DECISION_APPROVERS) の人だけです。</div><% } else if (dbError || closed) { %><div class="hint">いまは保存できません (<%= dbError ? 'Company DB につながらない' : closedWhy %>)。</div><% } %>
+    <% } else { %>
+      <div class="t">この商品は NE にもうありますが、いまは登録済みにできません</div>
+      <ul class="dine-why" id="dine-why"><% for (const w of N.why) { %><li data-reason="<%= w.reason %>"><%= w.text %></li><% } %></ul>
+    <% } %>
+    <div class="msgline" data-dine-msg role="status" aria-live="polite"></div>
+  </div>
+  <% if (nCan) { %><button class="btn sm pri" type="button" id="dine-go" data-dine-code="<%= c.code %>" data-dine-hash="<%= N.checkHash %>" data-dine-reload="1"><%= N.button %></button><% } %>
+</div>
+<% } %>

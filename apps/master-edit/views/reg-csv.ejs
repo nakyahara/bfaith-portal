@@ -24,6 +24,16 @@
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
     const gateHtml = (g) => esc(g.pre) + g.codes.map((x) => `<a href="${esc(base)}/sku/${esc(encodeURIComponent(x))}">${esc(x)}</a>`).join('・') + esc(g.post);
     const skuLink = (code) => `<a class="mono" href="${esc(base)}/sku/${esc(encodeURIComponent(code))}">${esc(code)}</a>`;
+    // 🆕 0098: 「NE にあるので登録済みにする」の行ごと (DB の確かめ = S.dine[コード])。押せる = ボタン 1 つ (public/me-draft-in-ne.js)・押せない = DB の理由の最初の 1 つ
+    const DINE_BUTTON = 'NE にあるので登録済みにする';
+    const dineOf = (code) => (S && S.dine && Object.prototype.hasOwnProperty.call(S.dine, code) ? S.dine[code] : null);
+    const dineHtml = (code) => {
+      const d = dineOf(code);
+      if (!d) return '';
+      if (!d.canGo) return d.why.length ? `<span class="hint" data-dine-why="${esc(code)}">(登録済みにはまだできません: ${esc(d.why[0].text)})</span>` : '';
+      return `<span class="dine-row" data-dine-row><button class="btn sm pri" type="button" data-dine-code="${esc(code)}" data-dine-hash="${esc(d.checkHash)}"${canAct ? '' : ' disabled'}>${esc(DINE_BUTTON)}</button>`
+        + `${d.diffs.length ? `<span class="hint">NE とちがう所: ${esc(d.diffs.join('・'))}</span>` : ''}<span class="msgline" data-dine-msg role="status" aria-live="polite"></span></span>`;
+    };
     const steps = (e) => {
       const done = (x) => ({ t: x, cls: 'done' });
       if (e.state === 'built') return [done('作った'), { t: '配る (ダウンロード)', cls: 'cur' }, { t: 'NE で取り込む' }, { t: '翌朝の確かめ (自動)' }];
@@ -161,7 +171,7 @@
       <ul class="fixlist" style="margin:0;padding-left:0;list-style:none;display:grid;gap:8px">
         <% for (const f of P.fix) { %><li class="why-blk" data-code="<%= f.code %>"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span><% if (f.kind === 'group') { %>まとまり <span class="mono"><%= f.code %></span><% } else { %><%- skuLink(f.code) %><% } %>: <% f.why.forEach((b, n) => { %><%= n ? ' / ' : '' %><% if (f.gate && b === f.gate.text) { %><%- gateHtml(f.gate) %><% } else { %><%= b %><% } %><% }) %></span></li><% } %>
         <% for (const h of P.held) { %><li class="why-wrn" data-group="<%= h.group_code %>"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>色違い・サイズ違いのまとまり <span class="mono"><%= h.group_code %></span> の <%= h.codes.join('・') %> は、<%- h.because.map(skuLink).join('・') %> がそろうと一緒に入ります (まとまりは同じ CSV に入れます)</span></li><% } %>
-        <% for (const { e, i } of partials) { %><li class="why-wrn" data-partial="<%= i.code %>"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span><%- skuLink(i.code) %>: NE に入りましたが、NE とちがう所があります — <%= diffText(i) || 'くわしくは「これまでの記録」' %>。NE の画面で CSV の値に直すと翌朝そろいます (NE の値の方が正しいときは「これまでの記録」でこのファイルを「使わない」に)</span></li><% } %>
+        <% for (const { e, i } of partials) { %><li class="why-wrn" data-partial="<%= i.code %>"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span><%- skuLink(i.code) %>: NE に入りましたが、NE とちがう所があります — <%= diffText(i) || 'くわしくは「これまでの記録」' %>。<% if (dineOf(i.code) && dineOf(i.code).canGo) { %>この商品は「<%= DINE_BUTTON %>」を押すと、今の Company DB の値のまま登録済みになります (NE とちがう所は『NEへ送る』で NE に送れます)<% } else { %>NE の画面で CSV の値に直すと翌朝そろいます (NE の値の方が正しいときは「これまでの記録」でこのファイルを「使わない」に)<% } %> <%- dineHtml(i.code) %></span></li><% } %>
       </ul>
     </section>
     <% } %>
@@ -169,8 +179,10 @@
     <% if (P.in_ne.length) { %>
     <section class="panel" id="in-ne" aria-labelledby="h-in-ne">
       <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-info"/></svg></span><h2 id="h-in-ne">NE にもうある商品</h2></div>
-      <div><%- P.in_ne.map((x) => skuLink(x.code)).join('・') %> は、NE に同じコードの商品がもうあるので CSV にしません (NE の画面で先に登録した商品)。</div>
-      <div class="hint" style="margin-top:4px">ここでは下書きのまま残ります。NE にある商品として登録済みにする操作は、まだありません。</div>
+      <div>NE に同じコードの商品がもうあるので、CSV にしません (NE の画面で先に登録した商品)。NE の商品をそのまま使うときは「<%= DINE_BUTTON %>」を押します (NE とちがう所は『NEへ送る』に出ます)。</div>
+      <ul class="fixlist" id="in-ne-list" style="margin:8px 0 0;padding-left:0;list-style:none;display:grid;gap:8px">
+        <% for (const x of P.in_ne) { %><li data-in-ne="<%= x.code %>"><%- skuLink(x.code) %> <%- dineHtml(x.code) || '<span class="hint">ここでは下書きのまま残ります</span>' %></li><% } %>
+      </ul>
     </section>
     <% } %>
 
@@ -311,5 +323,6 @@
   </div>
   <%- include('_footer') %>
   <% if (S && S.applied) { %><script src="<%= base %>/public/me-regcsv.js?v=<%= assetV %>" defer></script><% } %>
+  <% if (canAct && S.dine && Object.values(S.dine).some((d) => d.canGo)) { %><script src="<%= base %>/public/me-draft-in-ne.js?v=<%= assetV %>" defer></script><% } %>
 </body>
 </html>

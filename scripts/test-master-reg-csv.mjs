@@ -237,8 +237,16 @@ const atOf = (run) => { if (!ATS.has(run)) ATS.set(run, new Date(Date.now() + 60
 const observe = async (run, observations, { productsAt = null, setsAt = null, absenceTrusted = true, targets, fetch = FETCH(run), snapshot = true } = {}) => {
   if (snapshot) await snapTargets(run);
   const pAt = productsAt ?? atOf(run);
+  // 🆕 0098: 確かめ待ちの写しに「NE のコードの台帳にもうある下書き」(生きている品目なし) も入る。本番の照合は取得から写しの全部の観測を送る。
+  //   この試験は品目の観測だけを渡す = 写しのその下書きには「無い」を足す (品目の観測は今までどおり試験が決める = 足りない品目は今までどおり断られる)
+  const given = new Set(observations.map((o) => o && o.code_norm));
+  const fill = (await pg.query(`select t.code_norm from ops.ne_reg_compare_targets c, unnest(c.target_codes) t(code_norm)
+      join core.skus k on k.code_norm = t.code_norm join ops.master_registrations r on r.sku_id = k.sku_id
+     where c.compare_run_id = $1 and r.state in ('draft', 'ne_pending')
+       and not exists (select 1 from ops.ne_reg_export_items i where i.sku_id = k.sku_id and i.state in ('issued', 'import_declared', 'partial'))`, [run])).rows
+    .map((x) => x.code_norm).filter((c) => !given.has(c)).map((c) => ({ code_norm: c, present: false, trusted: true, kind: null }));
   return as(E, 'watch_writer', async () => (await pg.query('select ops.record_ne_registration_observations($1::jsonb) as r', [JSON.stringify({ compare_run_id: run, fetch,
-    products_at: pAt, sets_at: setsAt ?? pAt, absence_trusted: absenceTrusted, ...(targets === undefined ? {} : { targets }), observations })])).rows[0].r);
+    products_at: pAt, sets_at: setsAt ?? pAt, absence_trusted: absenceTrusted, ...(targets === undefined ? {} : { targets }), observations: [...observations, ...fill] })])).rows[0].r);
 };
 const seal = (run, hash, evidence = 'e'.repeat(64)) => as(E, 'watch_writer', async () => (await pg.query('select ops.seal_ne_registration_run($1, $2, $3) as r', [run, hash, evidence])).rows[0].r);
 const checkRun = (run) => as(E, 'watch_writer', async () => (await pg.query('select ops.record_ne_registration_check($1) as r', [run])).rows[0].r);
@@ -1173,10 +1181,12 @@ await ta('[C18] 観測 = 回の始まりの写しとちょうど同じ商品 (#1
   // 1. 写し = DB が今の確かめ待ちから決める (呼び手は選べない)。2 つのうち 1 つだけ送る・targets を 1 つにする = 拒む
   const r1 = await newRun();
   const s1 = await snapTargets(r1);
-  assert.deepEqual([s1.state, s1.targets.map((t) => [t.code_norm, t.sku_kind])], ['taken', [['new-w1', 'single'], ['new-w2', 'single']]]);
+  // 🆕 0098: 写しには NE のコードの台帳にもうある下書き (生きている品目なし = この試験の new-dup ほか) も入る = 品目の商品だけを比べる
+  const dine = new Set((await pg.query("select code_norm from ops.v_ne_reg_targets where state = 'draft_in_ne'")).rows.map((x) => x.code_norm));
+  assert.deepEqual([s1.state, s1.targets.filter((t) => !dine.has(t.code_norm)).map((t) => [t.code_norm, t.sku_kind])], ['taken', [['new-w1', 'single'], ['new-w2', 'single']]]);
   const o1 = obsSingle('new-w1', { name: ok('W1') });
   const o2 = obsSingle('new-w2', { name: ok('W2') });
-  await pgErr(observe(r1, [o1]), /写しの商品 \(2 件\)/);
+  await pgErr(observe(r1, [o1]), /写しの商品 \(\d+ 件\)/);
   await pgErr(observe(r1, [o1], { targets: ['new-w1'] }), /targets が回の始まりの写し/);
   await pgErr(observe(r1, [o1, o1]), /写しの商品/);
   // 2. 写しは変えない: 写した後に配った商品 (W3) は入れない・写した後に使わないにした商品 (W2) も写しのまま (今の見え方でなく写しと比べる)
@@ -1187,7 +1197,7 @@ await ta('[C18] 観測 = 回の始まりの写しとちょうど同じ商品 (#1
   await pgErr(observe(r1, [o1, obsSingle('new-w3', { name: ok('W3') })]), /写しの商品/);
   const w = await observe(r1, [o1, o2]);
   assert.equal(w.state, 'written');
-  assert.deepEqual((await one('select target_codes from ops.ne_reg_compare_runs where compare_run_id = $1', [r1])).target_codes, ['new-w1', 'new-w2']);
+  assert.deepEqual((await one('select target_codes from ops.ne_reg_compare_runs where compare_run_id = $1', [r1])).target_codes.filter((c) => !dine.has(c)), ['new-w1', 'new-w2']);
   // 3. 同じ回の 2 回目 = 入力全体が同じなら何もしない (同じ時刻の別の書き方も同じ)・どれか違えば拒む (「無い」を信じるかを後から変えられない)
   const P = atOf(r1);
   assert.equal((await observe(r1, [o2, o1], { productsAt: P.replace('Z', '+00:00') })).state, 'unchanged');

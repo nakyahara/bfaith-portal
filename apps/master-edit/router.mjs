@@ -31,6 +31,8 @@
  *   POST /api/sku/:code/adopt-parent       NE で直接作られた商品 (quarantined) の代表を NE から 1 回だけ採用 { request_id, reason? }
  *   POST /api/sku/:code/draft-cancel       🆕 0071: 新商品の下書き (NE に一度も配っていない) を消す = 登録をやめた { request_id, reason, confirm: true } (名簿 MASTER_EDITORS の人・
  *                                          lib/master-draft-cancel.mjs)。Postgres の前に product-hub のカード (SQLite) を読み、除外していないカードがあれば 409 card_exists
+ *   POST /api/sku/:code/draft-in-ne        🆕 0098: NE にあるので登録済みにする { request_id, check_hash } (下書き・NE 登録待ちで NE にもう同じ商品がある・名簿 MASTER_DECISION_APPROVERS の人 =
+ *                                          NE 登録の CSV と同じ・lib/master-draft-in-ne.mjs)。答え = DB の関数の答え + message (画面の 1 行)
  *   GET  /api/code-check?code= 新しい商品コードを確かめる (形 + Company DB・NE・使ったことがあるか)
  *   POST /api/new            新商品の登録 { request_id, kind, code, reason?, values: {...}, card: {...} } (lib/master-register.mjs)。
  *                            保存が成功したら、同じ要求の中で product-hub のカードの取り込みを 1 回試す (うまくいかなくても登録は成功のまま)
@@ -113,6 +115,7 @@ import { registerVariationBatch, searchVariationGroups, readVariationGroup, chec
   parseVariationRequest, variationPayloadHashOf,
   editVariationLabels, cancelVariationChild, adoptNeParent } from '../../lib/master-variation.mjs';
 import { readDraftCancelCheck, draftCancelView, cancelSkuDraft } from '../../lib/master-draft-cancel.mjs';
+import { readDraftInNeCheck, draftInNeView, confirmDraftInNe, DRAFT_IN_NE_BUTTON } from '../../lib/master-draft-in-ne.mjs';
 import { runCardOutbox, runGroupOutbox, linkCardToExisting, CARD_STATUS_LABELS } from '../../lib/product-hub-outbox.mjs';
 import { SET_DECISION_REASONS } from '../product-hub/lib/set-decision.js';
 import { SHIPPING_METHOD_GROUPS } from '../product-hub/lib/shipping-groups.js';
@@ -1307,6 +1310,9 @@ router.get('/sku/:code', (req, res) => withPgPage(req, res, async (db, dbError) 
     // 🆕 0071: 下書きだけ「この下書きを消す」の確かめを読む (DB の ops.sku_draft_cancel_check・読めない = 出さない)。押せるのは名簿 MASTER_EDITORS の人
     deldraft: page && page.cur.registration && page.cur.registration.state === 'draft'
       ? draftCancelView(await readDraftCancelCheck(db, page.cur.sku_id), await liveCardsSafe({ skuId: page.cur.sku_id, code: page.cur.code })) : null,
+    // 🆕 0098: 下書き・NE 登録待ちで NE にもう同じ商品がある = 「NE にあるので登録済みにする」(DB の ops.draft_in_ne_check・読めない = 出さない)。押せるのは名簿 MASTER_DECISION_APPROVERS の人
+    dine: page && page.cur.registration && ['draft', 'ne_pending'].includes(page.cur.registration.state)
+      ? { ...draftInNeView(await readDraftInNeCheck(db, page.cur.sku_id)), canApprove: approverGate(req).ok, button: DRAFT_IN_NE_BUTTON } : null,
     // 🆕 0084: メーカー (単品だけ・代表の仕入先のすぐ下・保存は「保存する」と一緒 = saveSku)
     ...(await makerLocals(db, !!page && page.cur.sku_kind === 'single')),
     // 🆕 0088: ブランド・商品の段階 (単品だけ・別の板・保存は「保存する」と一緒 = saveSku)・初めて売った日 (読むだけ)
@@ -1622,6 +1628,18 @@ router.post('/api/sku/:code/adopt-parent', (req, res) => variationWrite(req, res
  *      (作っただけの CSV・構成の依頼・JAN・まだカードになっていない知らせ) は DB の関数が鍵の後に (lib/master-draft-cancel.mjs)。
  *   🚨 取り込みの借り (120 秒) が切れた後もまだ SQLite に書いている、のまれな競りだけは閉じない (受け入れ = 消した後にカードが出たら product-hub で除外)
  */
+/**
+ * 🆕 0098: NE にあるので登録済みにする { request_id, check_hash }。名簿 MASTER_DECISION_APPROVERS の人 (NE 登録の CSV を作る・配る・使わないと同じ)・この画面だけのロールで・
+ *   MASTER_EDIT_OPEN の後だけ。決めるのは DB の関数 (鍵の後の確かめ・約束・記録)。答え = { ok, ..., message: '登録済みにしました。NE とちがう所は『NEへ送る』に出ます' }
+ */
+router.post('/api/sku/:code/draft-in-ne', (req, res) => {
+  const gate = approverGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  const b = req.body || {};
+  const actor = String(req.session.email).trim().toLowerCase();
+  return withPgApi(res, async (db) => res.json(await confirmDraftInNe(db, { actor, code: req.params.code, checkHash: b.check_hash, requestId: b.request_id }, { open: isOpen() })), 'write');
+});
+
 router.post('/api/sku/:code/draft-cancel', (req, res) => {
   const gate = editorGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_editor' });

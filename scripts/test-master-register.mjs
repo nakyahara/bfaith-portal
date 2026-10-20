@@ -301,7 +301,8 @@ await ta('[S3] NE 登録待ち・NE 確認済みの根拠は 0053 (⑤-2b) の�
   const d = await skuId('tx-1');
   await assert.rejects(() => transition(d, 'ne_pending', { evidence: { export_id: 7, sha256: SHA } }), /caller_evidence/);
   await assert.rejects(() => transition(d, 'ne_pending'), /no_evidence/);
-  await assert.rejects(() => transition(d, 'ne_confirmed', { evidence: { compare_run_id: RUN, matched: true } }), /one_way/);
+  // 🆕 0098: 地図に draft > ne_confirmed (「NE にあるので登録済みにする」の約束の中だけ) = 約束の外は confirm_session_required (0098 の前の DB = one_way)
+  await assert.rejects(() => transition(d, 'ne_confirmed', { evidence: { compare_run_id: RUN, matched: true } }), /one_way|confirm_session_required/);
   await assert.rejects(() => transition(d, 'available', { evidence: { generation: 'g1', acks: ACKS('g1') } }), /one_way/);
   // 持ち主が状態を直接作った (試験だけ) としても、照合の確かめの記録が無い = 進めない
   await forceState(d, 'ne_pending');

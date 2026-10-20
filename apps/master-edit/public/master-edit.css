@@ -1069,6 +1069,13 @@ button.chip[aria-pressed="true"] { border-color: rgba(58, 231, 255, 0.65); backg
 #deldraft-bg .lab2 { font-size: 13px; color: var(--muted); }
 #deldraft-bg .msgline { margin-top: 8px; }
 @media (max-width: 760px) { .deldraft { flex-wrap: wrap; } .deldraft .btn.ghosty { width: 100%; min-height: 44px; } #deldraft-bg .btn, #deldraft-bg .in { min-height: 44px; } }
+/* 🆕 0098: NE にあるので登録済みにする (商品の画面の _draftinne.ejs・NE 登録の CSV の画面の行ごとのボタン) */
+.dine .btn { flex: none; align-self: center; }
+.dine-why { margin: 6px 0 0 18px; font-size: 13.5px; color: var(--text2); }
+.dine .msgline:empty { display: none; }
+.dine-row { display: inline-flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.dine-row .msgline { margin-top: 0; }
+@media (max-width: 760px) { .dine { flex-wrap: wrap; } .dine .btn { width: 100%; min-height: 44px; } .dine-row .btn { min-height: 44px; } }
 /* 新しい seller SKU の対応を自分で作る入口 (10/11・views/_amazon-create.ejs・amazon-new.ejs・public/me-amazon-new.js) */
 .create-sku .bigsearch.create { border-color: rgba(58, 231, 255, 0.55); background: rgba(58, 231, 255, 0.07); }
 .create-sku .bigsearch.create input { font-family: var(--mono); min-width: 0; }

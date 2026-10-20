@@ -2988,3 +2988,21 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
   中原さんの OK → 本適用。ロールの script の流し直しは要らない (create or replace = 権限はそのまま・印は public から外すだけ)
 - 試験 = `node scripts/test-master-variation.mjs` ([N2] 単品の版にまとまりの子・欠ける = variation_incomplete / [S4] 0067 との差) / `scripts/test-master-variation-batch.mjs` ([C1]・[C3] ボタン 1 つ・前の DB の分け方・外す・押し直し) /
   `scripts/test-master-reg-csv.mjs` ([H1]・[H4] 画面と API・[G1]) / `scripts/test-master-register.mjs` ([G-0064]) / 画面 = `test-master-edit-ui.mjs` [38]・`test-master-variation-ui.mjs` [⑥]・[⑥b]
+
+### NE にあるので登録済みにする (0098・2026-10-20 中原さんの承認)
+- **なぜ**: 新商品の下書きで NE に同じ商品がもうあるもの (NE の画面で先に登録した = CSV にできない already_in_ne / CSV を配った後に名前を直した = 品目の期待値が NE と合わず partial のまま) は、
+  下書き → NE 確認済みの道が無く止まっていた (本番 10/20 = chinaseima・guargum50・calculationwb・bikecover-BK / -SV・nanairos-yo)。下書きの間は「NEへ送る」も new_product で止まる
+- **決まり** (`ops.draft_in_ne_check`・読むだけ・security definer): 今朝の照合 ② の封をした回 (= NE のコードの台帳の回・取得が 36 時間以内) の観測にそのコードがある (present・trusted)・
+  NE のコードの書き方 (大文字・小文字) が社内のコードと完全に同じ・区分 (単品 / セット) が同じ・生きている NE 登録の CSV の品目は一部違う (partial) の 1 つだけ (消さずに superseded・理由 `resolved_by_human`)・
+  代表 (色違い) が NE と同じ (代表の門の「直った」= `ops._parent_gate_resolved` と同じ決まり)・セットは構成品が全部 NE 確認済み以降・構成の依頼なし・中身 (子と数量) が NE と同じ・NE から消す依頼なし。ロジザードの表には触らない
+- **登録済みにする** `ops.confirm_draft_in_ne(request_id, 人, SKU, check_hash)`: 1 件 = 1 取引・同じ request_id = 前の答え・画面の check_hash と違う = stale・約束 (操作 `draft_ne_confirm`) の中で
+  `ops.transition_sku_registration` (0079 の版 + 🆕 0098 のかたまり = 下書き / NE 登録待ち → NE 確認済みは、この約束の中だけ。地図に `draft > ne_confirmed`) → 品目を superseded → 保存の記録 done。
+  履歴 (`ops.master_registration_events`) の根拠 = DB が作った値 (rule `draft_in_ne_v1`・照合の回・観測のハッシュ・品目と `resolved_by_human`・NE と違う欄)
+- **照合 ② の確かめ待ち** `ops.v_ne_reg_targets` に「下書き・NE 登録待ちで NE のコードの台帳にあるもの (生きている品目なし)」を足した = 翌朝から観測が残る (CSV にしていない下書きは、当てた後の最初の照合の後から押せる)
+- **NE へ送る** `ops.ne_upd_units` (0094 の版 + 🆕 0098 の 2 行): この道で登録済みにした商品だけ、登録 (ポータルの INSERT) のまま直していない名前・取扱・税率・売価も「人が入れた値」として NE と違えば出す
+  (ほかの商品 = 照合で確かめた新商品・夜間ロードの商品は今までどおり「その欄を最後に UPDATE したのが人」だけ)
+- **画面**: 商品の画面の箱 (`_draftinne.ejs`)・「NE 登録の CSV」の「NE にもうある商品」「直すもの」の行ごとのボタン「NE にあるので登録済みにする」(名簿 `MASTER_DECISION_APPROVERS` の人だけ押せる)。
+  押した後の 1 行 =「登録済みにしました。NE とちがう所は『NEへ送る』に出ます」。押せないときは DB の理由の文をそのまま出す
+- 当て方 (🚨 本番 DB の操作 = 中原さんの OK の後): アプリ (マージ = 0098 の前の DB では画面に何も出さない) → `migrate.mjs --dry-run` (この 1 本・view と関数と CHECK を作り直すだけ・値は変えない) → 中原さんの OK → 本適用。
+  ロールの script の流し直しは要らない (migration の中で master_edit・watcher に実行権を付ける)
+- 試験 = `node scripts/test-master-draft-in-ne.mjs` ([M] 写し・[C] 確かめ・[F] 登録済みにする・[N] NE へ送る・[T]・[R] ロール・[S] 画面・[U] 画面の JS) / `scripts/test-master-reg-csv.mjs` [C18] / `scripts/test-master-register.mjs` [S3]
