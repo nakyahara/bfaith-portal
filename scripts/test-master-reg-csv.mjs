@@ -2576,6 +2576,8 @@ try {
     assert.deepEqual([P.files.map((f) => f.kind), P.sets_later, P.set_trial_waiting], [['products'], ['s1', 's2'], true]);
     P = G.regPlan({ ...S, exports: [{ kind: 'sets', trial: true, state: 'closed', close_reason: 'finished', items: [{ state: 'verified' }] }] });
     assert.deepEqual(P.sets_later, ['s1', 's2'], '全部確かめ済みで「問題なし」を押す前も待つ');
+    P = G.regPlan({ ...S, exports: [{ kind: 'sets', trial: true, state: 'closed', close_reason: 'finished', verify_recorded: true, items: [{ state: 'verified' }] }] });
+    assert.deepEqual([P.sets_later, P.files.find((f) => f.kind === 'sets').codes], [['s2'], ['s1']], '「問題があった」を記録した後は次の試しを作れる (#Codex R2 Medium 3)');
     // 試しが済んだ (実機の確かめ ok) = 1,000 行まで 1 つのファイル
     P = G.regPlan({ ...S, verified: { ...S.verified, sets: { ok: true, trial_gate: true } } });
     assert.deepEqual([P.files.find((f) => f.kind === 'sets').codes, P.sets_later, P.sets_too_big], [['s1', 's2', 's3'], [], []]);
@@ -2633,6 +2635,12 @@ try {
       const s = await call('POST', `/apps/master-edit/api/reg-csv/exports/${x.export_id}/supersede`, { body: { reason: '試験', correction: 'NE には取り込んでいない', confirm: true } });
       assert.equal(s.status, 200, s.text);
     }
+    // 🆕 #Codex R2 Medium 1: 閉じた後に同じ番号で押し直しても、その商品は作り直さない (前のファイルを返すだけ)
+    const n0 = (await one('select count(*)::int as n from ops.ne_reg_exports')).n;
+    const b3 = await call('POST', '/apps/master-edit/api/reg-csv/build-all', { body: { request_id: rid } });
+    assert.equal(b3.status, 200, b3.text);
+    assert.deepEqual(b3.j.files.map((x) => [x.export_id, x.state]), b.j.files.map((x) => [x.export_id, 'closed']));
+    assert.equal((await one('select count(*)::int as n from ops.ne_reg_exports')).n, n0, '新しいファイルを作らない');
   });
 } finally {
   await new Promise((r) => server.close(r));

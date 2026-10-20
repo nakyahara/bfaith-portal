@@ -41,7 +41,7 @@
       partials = open.flatMap((e) => e.items.filter((i) => i.state === 'partial').map((i) => ({ e, i })));
       waitingItems = open.filter((e) => !toDownload.includes(e) && !toImport.includes(e)).reduce((a, e) => a + e.items.filter((i) => ['issued', 'import_declared'].includes(i.state)).length, 0);
       // 試し用のセットのファイルが全部 NE で確かめ済み = この形を「実機で確かめた」にする (中原さんの番)
-      trialDone = S.exports.filter((e) => e.trial && e.items.length && e.items.every((i) => i.state === 'verified') && e.verify && e.verify.can && !(S.verified[e.kind] && S.verified[e.kind].ok));
+      trialDone = S.exports.filter((e) => e.trial && e.items.length && e.items.every((i) => i.state === 'verified') && e.verify && e.verify.can && !e.verify_recorded && !(S.verified[e.kind] && S.verified[e.kind].ok));
     }
     // 一部だけ違う品目の 1 行 (NE の値 / CSV の値)
     const diffText = (i) => {
