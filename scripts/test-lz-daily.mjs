@@ -787,8 +787,22 @@ await ta('[15] 🆕 外した行 (lzd-v4・2026-10-21 中原さん): その行�
   s = setup({ lzRows, compareItems: [] });
   await run(s, { readCdb: noCost, excludeCap: wide });
   assert.deepEqual([evOf(s.dataDir).verdict, evOf(s.dataDir).fail_by, evOf(s.dataDir).counts.excluded], ['fail', ['unexplained'], 1]);
+  // NE の書き方の記録に壊れた行がある (damaged) = 材料の破損 = 外した行があっても全体を止める (Codex R2 Medium)
+  s = setup({ lzRows });
+  await run(s, { readCdb: noCost, excludeCap: wide, readNe: neFake({ spellings_damaged: 1 }) });
+  assert.deepEqual([evOf(s.dataDir).verdict, evOf(s.dataDir).fail_by], ['fail', ['ne_spellings_damaged']]);
   // まとめ (daily-sync の最後): 外した行のリンクと直し方
   const N = await import('../apps/master-decisions/lz-code-notice.mjs');
+  // 外した行でない書き方の問題 (code_invalid = 全体を止める) も、外した行の後に今までの形で出る (Codex R2 Low)
+  const neBad = () => { const n = neFake()(); n.entries = n.entries.map((e) => (e.code_norm === 'b-2' ? { ...e, state: 'invalid', ne_code: null, spellings: ['B-2'] } : e)); return n; };
+  s = setup({ lzRows });
+  await run(s, { readCdb: noCost, excludeCap: wide, readNe: neBad });
+  assert.deepEqual([evOf(s.dataDir).verdict, evOf(s.dataDir).fail_by, evOf(s.dataDir).counts.excluded], ['fail', ['invalid'], 1]);
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_test' }), [
+    '⚠️ ロジザードに送れなかった商品 1 件 (原価が無い 1) = 今朝は不合格なので、今夜はロジザードに何も送りません',
+    '・<https://bfaith-portal.onrender.com/apps/master-edit/sku/NEW-1|NEW-1>: 原価が無い → 商品マスタで原価を入れる',
+    '⚠️ NE の商品コードの書き方 1 件 (ロジザードに取り込んでいません)',
+    '・b-2: NE の書き方が使えない (使えない文字・壊れた記録: B-2)・ロジザード = B-2 → NE の商品コードを確かめる']);
   assert.deepEqual(N.excludedNoticeLines({ verdict: 'pass', classes: { excluded: real.slice(10, 13).map(D.excludedRow) } }), [
     '⚠️ ロジザードに送れなかった商品 3 件 (原価が無い 1・仕入先が無い 2) = ほかの商品は今夜ロジザードに送ります',
     '・<https://bfaith-portal.onrender.com/apps/master-edit/sku/whitekaolin|whitekaolin>: 原価が無い → 商品マスタで原価を入れる',

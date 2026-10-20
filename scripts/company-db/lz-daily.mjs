@@ -176,6 +176,8 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
     ['lagging_stale', lagCheck.stale.length], ['lagging_undeterminable', lagCheck.undeterminable.length + lagCsv.unmade.length],   // 待ちでもロジザードの値が古い・決められない = 合格にしない
     ['unmade', cdbCsv.unmade.length + neCsv.unmade.length],
     ['no_compare', cls.compare.length ? 0 : 1],   // 比べた商品が無い = 何も確かめていない
+    // 🆕 NE の書き方の記録に壊れた行がある = 材料の破損 = 全体を止める (正規化の衝突などの「外した行」に隠れることがある。Codex R2 Medium)
+    ['ne_spellings_damaged', Number(ne.spellings_damaged) > 0 ? 1 : 0],
   ].filter(([, n]) => n > 0).map(([k]) => k);
   const verdict = failBy.length ? 'fail' : 'pass';
   // 書き方の問題で出さない商品には、NE の書き方 (この世代の書き方の集め) とロジザードの書き方を報告に添える

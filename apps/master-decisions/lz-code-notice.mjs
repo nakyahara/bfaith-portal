@@ -134,7 +134,12 @@ export function readLzCodeNotice({ dataDir, asOf, syncRunId, max = NOTICE_MAX_LI
     const report = JSON.parse(buf.toString('utf8'));
     if (!report || report.run_id !== ev.run_id) return [];
     // 🆕 lzd-v4 の報告 = 外した行を全部 (リンクつき)。前の版の報告 = 書き方の問題だけ (今までどおり)
-    if (report.classes && Array.isArray(report.classes.excluded)) return excludedNoticeLines(report, { max });
+    //   外した行でない書き方の問題 (code_invalid = 全体を止める) も、外した行の後に今までの形で出す (Codex R2 Low)
+    if (report.classes && Array.isArray(report.classes.excluded)) {
+      const out = new Set(report.classes.excluded.map((x) => `${x && x.code_norm}|${x && x.reason}`));
+      const rest = (Array.isArray(report.classes.invalid) ? report.classes.invalid : []).filter((x) => x && !out.has(`${x.code_norm}|${x.reason}`));
+      return [...excludedNoticeLines(report, { max }), ...noticeLines(rest, { max })];
+    }
     return noticeLines(report.classes && report.classes.invalid, { max });
   } catch (e) {
     warn(`[lz-code-notice] lz-daily の報告を読めない (まとめには足さない): ${String(e && e.message).slice(0, 160)}`);
