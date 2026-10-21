@@ -2617,6 +2617,12 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     check('配送費の試算: 実値の行はちょうど1つ (初期選択が決まる)',
       vari.profitShipChoices(opts, 'ネコポス', 237).filter((c) => c.isCurrent).length === 1
       && noMethod.filter((c) => c.isCurrent).length === 1);
+    // 🚨 配送方法名は分かるが送料が一つに決まらない (バリエーションで SKU ごとに送料が違う・未登録) とき、
+    //    代表送料の行を「登録値」(isCurrent) にしない (推定の利益を確かな値に見せない・2026-10-21 Codex)
+    const methodOnly = vari.profitShipChoices(opts, 'ネコポス', null);
+    check('🚨 配送費の試算: 送料が決まっていなければ、同じ配送方法名の代表送料を「登録値」にしない (名前が同じ印だけ残す)',
+      !methodOnly.some((c) => c.isCurrent) && methodOnly.find((c) => c.method === 'ネコポス')?.isNeMethod === true,
+      JSON.stringify(methodOnly));
   }
   {
     // 同数のときは高い方を代表にする (利益を実際より良く見せない側)
@@ -11172,6 +11178,15 @@ renders.push(
       neShipping: { group: null, label: null }, neCost: { ...d0[2].neCost, shippingCost: null, shippingMethod: null },
       setInfo: sd.setInfoOf(db, wfSetDraftId),
     }]);
+    // バリエーション (代表コードは商品として実在しない) で送料が入っていない子 SKU がある。
+    // 案内のリンクは代表コードではなく、送料の無い子 SKU の画面へ (2026-10-21 Codex)
+    renders.push(['detail.ejs (バリエーション・送料未登録の子あり)', 'detail.ejs', {
+      ...d0[2], setDrafts: [], setInfo: null,
+      draft: { ...d0[2].draft, ne_code: 'VGROUP-REP' },
+      neShipping: { group: null, label: null },
+      neCost: { ...d0[2].neCost, source: 'members', costVaries: false, shippingCost: null, shippingMethod: 'ネコポス',
+        skuCosts: [{ code: 'VGROUP-A', costExTax: 660, shippingCost: 237 }, { code: 'VGROUP-B', costExTax: 660, shippingCost: null }] },
+    }]);
   }
   // SKU別原価・売価 (2026-08-24): 原価がSKUで異なる分岐 (原価列 + SKU別売価入力 + 保存済み値)
   if (d0) {
@@ -12084,9 +12099,14 @@ for (const [name, file, data] of renders) {
     dm.includes('id="profit-ship-select"') && dm.includes('id="profit-ship-data"') && dm.includes('id="profit-sim-figs"')
     && !dm.includes('が無いため利益計算できません'));
   check('配送費の試算: 送料が未登録なら data-ship は空 (0 円で計算しない)', /id="profit-sim"[^>]*data-ship=""/.test(dm));
-  check('配送費の試算: 送料が未登録の案内に、マスタ編集の商品の画面へのリンクとセットの注意が出る',
+  check('配送費の試算: 送料が未登録の案内に、マスタ編集の商品の画面へのリンクとセットの注意が出る (セットは自分のコード)',
     dm.includes('id="profit-ship-missing"') && /href="\/apps\/master-edit\/sku\/[^"]+"/.test(dm)
-    && dm.includes('送料 (マスタの送料コード)') && dm.includes('新しく作ったセットは自動では入りません'));
+    && dm.includes('マスタの送料コード') && dm.includes('新しく作ったセットは自動では入りません'));
+  const dv = renderedHtml.get('detail.ejs (バリエーション・送料未登録の子あり)') || '';
+  check('🚨 配送費の試算: バリエーションは送料の無い子 SKU の画面へ案内する (代表コードの画面は無い)',
+    dv.includes('id="profit-ship-missing"') && dv.includes('href="/apps/master-edit/sku/VGROUP-B"')
+    && !dv.includes('href="/apps/master-edit/sku/VGROUP-REP"') && !dv.includes('href="/apps/master-edit/sku/VGROUP-A"'),
+    (dv.match(/href="\/apps\/master-edit\/sku\/[^"]+"/g) || []).join(' '));
   check('画面: 送料の出どころを「NE」と書かない (マスタの送料コード)',
     !dm.includes('NE の配送方法「') && !dm.includes('NE に本コードが載るのを待つか') && !dm.includes('NEの登録値'));
 }
@@ -14333,14 +14353,14 @@ for (const [name, file, data] of renders) {
   check('🚨 配送費の試算: 送料が未登録 (null) なら選ぶまで利益を出さない',
     /if \(ship == null \|\| !Number\.isFinite\(ship\)\) \{[\s\S]{0,200}figs\.hidden = true/.test(sim));
   check('🚨 配送費の試算: 送料が未登録なら先頭 (いちばん安い) を黙って選ばない。楽天の配送方法から 1 つに決まるときだけ仮に選ぶ',
-    sim.includes("ph.textContent = '— 配送方法を選んでください (送料が未登録) —'") && /sel\.value = near\.length === 1 \? near\[0\]\.method : ''/.test(sim)
+    sim.includes("ph.textContent = '— 配送方法を選んでください (送料が未登録) —'") && sim.includes("sel.value = want || (near.length === 1 ? near[0].method : '')")
     && !/data\.options\[0\]\.method/.test(sim));
   check('配送費の試算: 楽天の配送方法を変えたら候補を組み直す',
     /rkShip\.addEventListener\('change', build\)/.test(sim));
   check('配送費の試算: 売価の入力でも従来どおり再計算する',
     /priceInput\.addEventListener\('input', render\)/.test(sim));
   check('配送費の試算: 試算であってマスタや出品内容は変えないと画面に書く (未登録なら保存されないと書く)',
-    /試算だけで、マスタや出品内容は変わりません/.test(sim) && sim.includes('マスタに送料が未登録のため、ここでの選択は保存されません'));
+    /試算だけで、マスタや出品内容は変わりません/.test(sim) && sim.includes('マスタに送料が一つに決まっていないため、ここでの選択は保存されません'));
 }
 
   // ─── 楽天項目の保存が「前回の選択」を進めること (2026-09-03 #1152 / Codex R3 high) ───

@@ -472,7 +472,12 @@ export function profitShipChoices(options, neMethod, neShippingCost) {
   } else if (cur && !list.some((o) => o.isCurrent)) {
     list.unshift({ method: cur, cost: null, count: 0, isCurrent: true });
   }
+  // 🚨 「登録値」(isCurrent) は実際の送料があるときだけ。配送方法名だけ分かって送料が一つに決まらない
+  //    (バリエーションで SKU ごとに送料が違う・未登録) ときに代表送料を「登録値」と出すと、
+  //    推定の利益を確かな値に見せてしまう (2026-10-21 Codex)。その行は isCurrent を外し、
+  //    名前が同じことだけ isNeMethod で残す (画面は「仮」として選ぶ)
   return list
-    .map((o) => (o.isCurrent && hasActual ? { ...o, cost: actual } : o))
+    .map((o) => (o.isCurrent && hasActual ? { ...o, cost: actual }
+      : o.isCurrent ? { ...o, isCurrent: false, isNeMethod: true } : o))
     .filter((o) => o.cost != null);
 }

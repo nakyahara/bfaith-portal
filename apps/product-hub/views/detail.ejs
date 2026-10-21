@@ -858,10 +858,24 @@ th.attr-unknown { color: #dc2626; }
               <% if (neCost.shippingCost == null) { %>
                 <%# 送料が未登録でも試算の欄は出す (2026-10-21 中原さん: 以前は欄ごと消え、どこに入れるのか分からなかった)。
                     入れる場所 (マスタ編集の商品の画面の「送料コード」) を案内し、ここで選んだ配送方法で仮の利益を出す %>
+                <%# 送料コードは SKU ごと。バリエーションは代表コード (多くは商品として実在しない) ではなく、
+                    送料が無い子 SKU の画面へ案内する (代表コードの画面は無い・2026-10-21 Codex) %>
+                <% const shipFixSkus = neCost.source === 'members'
+                     ? (neCost.skuCosts || []).filter((s) => s.shippingCost == null).map((s) => s.code)
+                     : [draft.ne_code].filter(Boolean); %>
                 <div id="profit-ship-missing" style="margin-top:6px; padding:6px 8px; border-radius:6px; background:#fef3c7; border:1px solid #f59e0b; font-size:11px; line-height:1.5;">
-                  ⚠ この商品コードには<strong>送料 (マスタの送料コード)</strong>がまだ入っていません<%= setInfo ? ' (新しく作ったセットは自動では入りません)' : '' %>。
-                  下の「配送方法で試算」で選ぶと<strong>仮の</strong>利益が出ます。
-                  正式には <a href="/apps/master-edit/sku/<%= encodeURIComponent(draft.ne_code || '') %>" target="_blank" rel="noopener">マスタ編集の商品の画面 ↗</a> で「送料コード」を入れてください (翌朝からここにも自動で出ます)。
+                  <% if (neCost.source === 'members' && !shipFixSkus.length) { %>
+                    ⚠ SKU ごとに<strong>送料 (マスタの送料コード)</strong>が違うので、送料が一つに決まりません。
+                    下の「配送方法で試算」で選ぶと<strong>仮の</strong>利益が出ます。
+                  <% } else { %>
+                    ⚠ <%= neCost.source === 'members' ? '送料が入っていない SKU があります' : 'この商品コードには送料がまだ入っていません' %>
+                    (<strong>マスタの送料コード</strong><%= setInfo ? '。新しく作ったセットは自動では入りません' : '' %>)。
+                    下の「配送方法で試算」で選ぶと<strong>仮の</strong>利益が出ます。
+                    正式にはマスタ編集の商品の画面で「送料コード」を入れてください (翌朝からここにも自動で出ます):
+                    <% for (const code of shipFixSkus.slice(0, 10)) { %>
+                      <a href="/apps/master-edit/sku/<%= encodeURIComponent(code) %>" target="_blank" rel="noopener" style="margin-right:6px;"><%= code %> ↗</a>
+                    <% } %><%= shipFixSkus.length > 10 ? `ほか ${shipFixSkus.length - 10} 件` : '' %>
+                  <% } %>
                 </div>
               <% } %>
               <%# 利益額・利益率は大きく (2026-09-01 中原さん要望)。内訳は下に小さく添える %>
@@ -5855,13 +5869,15 @@ th.attr-unknown { color: #dc2626; }
         const want = [chosen, neCurrent].find((v) => v && data.options.some((o) => o.method === v));
         // 送料が未登録 (登録値の行が無い) なら先頭を黙って選ばない (2026-10-21)。楽天の配送方法から 1 つに決まるときだけ
         // それを仮に選び、決まらなければ「選んでください」の行にする (安い先頭を選ぶと利益を良く見せる)
-        if (!want && !current) {
+        if (!current) {
+          // 送料が登録されていない (または SKU ごとに違って一つに決まらない)。選び直せるように「選んでください」の行を置く。
+          // 初期の選択は、選んでいた行 → マスタの配送方法名 (代表送料・仮) → 楽天の配送方法から 1 つに決まる行 (仮) → 選んでください
           const ph = document.createElement('option');
           ph.value = '';
           ph.textContent = '— 配送方法を選んでください (送料が未登録) —';
           sel.insertBefore(ph, sel.firstChild);
-          sel.value = near.length === 1 ? near[0].method : '';
-          guessed = near.length === 1;
+          sel.value = want || (near.length === 1 ? near[0].method : '');
+          guessed = !want && near.length === 1;
         } else {
           sel.value = want || current.method;
           guessed = false;
@@ -5883,7 +5899,9 @@ th.attr-unknown { color: #dc2626; }
         note.textContent = isCur
           ? 'マスタに登録されている送料です'
           : !registered
-            ? (guessed ? '仮: 楽天の配送方法から選びました。' : '仮の試算です。') + 'マスタに送料が未登録のため、ここでの選択は保存されません'
+            ? (guessed ? '仮: 楽天の配送方法から選びました。'
+              : sel.value === neCurrent ? '仮: 登録されている配送方法「' + neCurrent + '」の代表的な送料です (SKU ごとに送料が違うか、送料が未登録)。'
+                : '仮の試算です。') + 'マスタに送料が一つに決まっていないため、ここでの選択は保存されません'
             : 'マスタの送料は「' + (neCurrent || '配送方法名なし') + '」です — ここでの変更は試算だけで、マスタや出品内容は変わりません';
         render();
       }
