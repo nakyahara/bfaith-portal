@@ -72,8 +72,10 @@ export const sameSetMembers = (a, b) => membersKey(a) === membersKey(b);
 const membersText = (list) => (list || []).map((x) => `${x.code ?? x.member_ne_code}×${x.qty}`).join('・') || 'なし';
 
 /**
- * 🆕 2026-10-21: このコードのカードが「新商品の登録 (単品) で決めたセットの下書き」で、セットの登録 (マスタの入力) がそのまま引き継げるか (読むだけ)。
- *   引き継げる = 同じコードのカードがこの 1 枚だけ・セットの下書き (parent_draft_id)・作るセットから作った (ph_cdb_set_plan_items の created)・
+ * 🆕 2026-10-21: このコードのカードがセットの下書きで、セットの登録 (マスタの入力) がそのまま引き継げるか (読むだけ)。
+ *   セットの下書き = 新商品の登録 (単品) で決めたもの (ph_cdb_set_plan_items の created・source 'set_plan') と、
+ *   product-hub の「セット商品を作る」で作って手でコードを入れたもの (source 'manual'・中原さん 10/21) のどちらも。
+ *   引き継げる = 同じコードのカードがこの 1 枚だけ・セットの下書き (parent_draft_id)・
  *   まだ Company DB の商品に結んでいない・除外していない・NE で本コードを確かめる前 (provisional_code = 1)・構成が同じ (components を渡したとき)。
  *   🚨 カードの取り込み (cdb-card-intake.js の applyCdbCardEvent) も同じ取引の中でこれで確かめてから結ぶ = 確かめた後にカードが変わっても違うカードに結ばない
  * @returns {null | { draft_id, code, name, is_set, takeable: boolean, why: string | null, parent_code?, members? }} null = このコードのカードは無い
@@ -88,14 +90,15 @@ export function plannedSetCardCheck(code, { components = null, db = getDB() } = 
   const no = (why, more = {}) => ({ ...base, ...more, takeable: false, why });
   if (cards.length > 1) return no(`product-hub に同じコードのカードが ${cards.length} 枚あります (${cards.map((x) => '#' + x.id).join('・')})`);
   if (d.parent_draft_id == null) return no('セットのカードではありません');
+  // 🆕 2026-10-21 (中原さん): product-hub の「セット商品を作る」で作って手でコードを入れたセットのカードも、同じ条件で引き継ぐ (作るセットから作ったかは問わない)
   const plan = db.prepare(`SELECT p.parent_code FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
     WHERE i.set_draft_id = ? AND i.outcome = 'created' LIMIT 1`).get(d.id);
-  if (!plan) return no('新商品の登録で決めたセットのカードではありません');
+  const parent = db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(d.parent_draft_id);
   if (d.cdb_sku_id != null) return no('もう Company DB の商品に結んであります');
   if (d.status === 'excluded') return no('除外にしてあります');
   if (d.provisional_code !== 1) return no('NE で本コードを確かめ済みです');
   const members = db.prepare('SELECT member_ne_code AS code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort').all(d.id);
-  const more = { parent_code: plan.parent_code, members };
+  const more = { parent_code: plan ? plan.parent_code : (parent ? parent.ne_code : null), members, source: plan ? 'set_plan' : 'manual' };
   if (!members.length) return no('カードに構成がありません', more);
   if (components != null && membersKey(members) !== membersKey(components)) {
     return no(`カードの構成 (${membersText(members)}) と入れた構成 (${membersText(components)}) がちがいます`, more);
@@ -170,22 +173,28 @@ export function plannedSetCardOf(draftId, { db = getDB() } = {}) {
 }
 
 /**
- * 🆕 2026-10-21: まだ Company DB に登録していない「新商品の登録で決めたセットの下書き」(マスタの入力の「下書き」の画面・読むだけ)。
+ * 🆕 2026-10-21: まだ Company DB に登録していないセットの下書き (マスタの入力の「下書き」の画面・読むだけ)。
+ *   ① 新商品の登録で決めたセットの下書き (source 'set_plan') と、② product-hub の「セット商品を作る」で作って手でコードを入れたセットのカード
+ *   (source 'manual'・中原さん 10/21。NE で確かめる前 = provisional_code = 1 だけ・仮コード SET-… のままのものは出さない = まだ登録できるコードが無い)。
  *   除外したカード・Company DB の商品に結んだカードは出さない。新しい順・limit 件まで
- * @returns {Array<{ draft_id, code, name, status, provisional, parent_code, qty, created_at, members }>}
+ * @returns {Array<{ draft_id, code, name, status, provisional, parent_code, qty, created_at, members, source }>}
  */
 export function openPlannedSetCards({ db = getDB(), limit = 200 } = {}) {
   const rows = db.prepare(`
-    SELECT d.id, d.ne_code, d.name, d.status, d.provisional_code, d.created_at, p.parent_code, i.qty
-    FROM ph_cdb_set_plan_items i
-    JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
-    JOIN product_drafts d ON d.id = i.set_draft_id
-    WHERE i.outcome = 'created' AND d.cdb_sku_id IS NULL AND d.status <> 'excluded'
+    SELECT d.id, d.ne_code, d.name, d.status, d.provisional_code, d.created_at, pd.ne_code AS parent_card_code,
+           (SELECT p.parent_code FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
+             WHERE i.set_draft_id = d.id AND i.outcome = 'created' LIMIT 1) AS plan_parent_code
+    FROM product_drafts d
+    LEFT JOIN product_drafts pd ON pd.id = d.parent_draft_id
+    WHERE d.parent_draft_id IS NOT NULL AND d.cdb_sku_id IS NULL AND d.status <> 'excluded'
+      AND (EXISTS (SELECT 1 FROM ph_cdb_set_plan_items i WHERE i.set_draft_id = d.id AND i.outcome = 'created')
+           OR (d.provisional_code = 1 AND UPPER(TRIM(d.ne_code)) NOT LIKE 'SET-%'))
     ORDER BY d.id DESC LIMIT ?
   `).all(Math.max(1, Math.min(1000, Number(limit) || 200)));
   const mem = db.prepare('SELECT member_ne_code AS code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort');
   return rows.map((r) => ({ draft_id: r.id, code: r.ne_code, name: r.name, status: r.status, provisional: r.provisional_code === 1,
-    parent_code: r.parent_code, qty: r.qty, created_at: r.created_at, members: mem.all(r.id) }));
+    parent_code: r.plan_parent_code ?? r.parent_card_code ?? null, created_at: r.created_at, members: mem.all(r.id),
+    source: r.plan_parent_code != null ? 'set_plan' : 'manual' }));
 }
 
 /**

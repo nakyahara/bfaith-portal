@@ -20,7 +20,7 @@
  *   POST /api/sku/:code      保存 { request_id, reason?, seen: { token (編集の印), event_id? }, values: {...} }
  *   GET  /new?kind=single|set|variation 新商品の登録 (画面 D・⑤-2a)。variation = 色違い・サイズ違いのまとまり (CompanyDB構想/20 §④・PR-7)。
  *        「まとまり」の札と画面は、DB の active の products.parent が company のときだけ出す (今は load = 出さない = 「切替の前」の帯)
- *        🆕 2026-10-21: &from_card=<product-hub のカードの番号> (セットだけ) = 新商品の登録で決めたセットの下書きの コード・名前・構成を入れておく
+ *        🆕 2026-10-21: &from_card=<product-hub のカードの番号> (セットだけ) = セットの下書き (新商品の登録で決めたもの・product-hub で作ってコードを入れたもの)の コード・名前・構成を入れておく
  *   GET  /drafts             🆕 2026-10-21: 下書き (マスタの入力の下書き = 登録の状態 draft と、まだ登録していない product-hub のセットの下書き)
  *   ── 色違い・サイズ違いのまとまり (PR-7・lib/master-variation.mjs。保存を開く門は新商品の登録と同じ + products.parent が company) ──
  *   GET  /api/variation/groups?q=      今あるまとまりを探す (コード・名前・子の商品コード)
@@ -557,7 +557,7 @@ async function resolveStaleSetPlans(db, codes, { actor = null, parentCode = null
 /**
  * このコードがほかの登録の作るセットに決まっているか (予約・セットの下書き)。決まっている = { status 409, reason, message, card_url?, draft_id? } / 読めない = 503 / 無い = null
  *   新商品の登録 (単品の入口と登録の取引の中 = codeReserved)・まとまりの子 (入口) が使う。
- *   🆕 2026-10-21: take = セットの登録 ({ components, cardCreate })。そのコードのカードが新商品の登録で決めたセットの下書きで、構成も同じ = 通す (null・
+ *   🆕 2026-10-21: take = セットの登録 ({ components, cardCreate })。そのコードのカードがセットの下書き (新商品の登録で決めたもの・product-hub で作ってコードを入れたもの)で、構成も同じ = 通す (null・
  *     登録の後のカードの取り込みがそのカードを引き継ぐ = cdb-card-intake.js)。引き継げない = 断る (どのカードか・なぜか・何をするか・カードを開く URL)
  */
 async function setCodeReservedFor(code, requestId, db = null, take = null) {

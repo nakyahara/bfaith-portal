@@ -14773,7 +14773,10 @@ for (const [name, file, data] of renders) {
   check('引き継ぎ: 構成が違う = 引き継がない (理由に両方の構成)', diff && diff.takeable === false && /SMK-TAKE×2.*SMK-TAKE×3.*ちがいます/.test(diff.why), JSON.stringify(diff));
   const m = mk('SMK-TAKE-3', { planned: false, qty: 3 });
   const man = sp.plannedSetCardCheck('SMK-TAKE-3', { components: [{ code: 'SMK-TAKE', qty: 3 }], db });
-  check('引き継ぎ: 作るセットから作ったのでないセットのカード = 引き継がない', man && man.takeable === false && man.draft_id === m && /新商品の登録で決めた/.test(man.why), JSON.stringify(man));
+  // 🆕 10/21 中原さん: product-hub の「セット商品を作る」で作って手でコードを入れたセットのカードも同じ条件で引き継ぐ
+  check('引き継ぎ: 手で作ったセットのカード (同じ構成) = 引き継げる', man && man.takeable === true && man.draft_id === m && man.source === 'manual' && man.parent_code === 'SMK-TAKE', JSON.stringify(man));
+  check('引き継ぎ: 手で作ったセットのカード (構成が違う) = 引き継がない', sp.plannedSetCardCheck('SMK-TAKE-3', { components: [{ code: 'SMK-TAKE', qty: 2 }], db })?.takeable === false);
+  check('引き継ぎ: 作るセットのカードは source = set_plan', ok?.source === 'set_plan');
   check('引き継ぎ: 単品のカード = 引き継がない', sp.plannedSetCardCheck('SMK-TAKE', { components: [], db })?.why === 'セットのカードではありません');
   check('引き継ぎ: カードが無い = null', sp.plannedSetCardCheck('SMK-NONE-2', { db }) === null);
   db.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(a);
@@ -14787,7 +14790,12 @@ for (const [name, file, data] of renders) {
   db.prepare(`UPDATE product_drafts SET provisional_code = 1 WHERE id = ?`).run(a);
   const row = sp.openPlannedSetCards({ db }).find((x) => x.draft_id === a);
   check('下書きの一覧: まだ登録していない作るセットの下書き (コード・名前・元の単品・構成)', row && row.code === 'SMK-TAKE-2' && row.parent_code === 'SMK-TAKE' && row.members.length === 1 && row.members[0].qty === 2, JSON.stringify(row));
-  check('下書きの一覧: 作るセットでないカードは出さない', !sp.openPlannedSetCards({ db }).some((x) => x.draft_id === m));
+  check('下書きの一覧: 手で作ったセットのカード (コードを入れた) も出す', sp.openPlannedSetCards({ db }).find((x) => x.draft_id === m)?.source === 'manual');
+  const provId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, status, parent_draft_id, provisional_code, created_by) VALUES ('SET-SMK-TAKE-01', '仮コードのセット', 'draft', ?, 1, 'smoke')`).run(parent).lastInsertRowid);
+  check('下書きの一覧: 仮コード SET-… のままのカードは出さない', !sp.openPlannedSetCards({ db }).some((x) => x.draft_id === provId));
+  db.prepare('UPDATE product_drafts SET provisional_code = 0 WHERE id = ?').run(m);
+  check('下書きの一覧: 手で作ったセットで NE 確認済み = 出さない', !sp.openPlannedSetCards({ db }).some((x) => x.draft_id === m));
+  db.prepare('UPDATE product_drafts SET provisional_code = 1 WHERE id = ?').run(m);
   // 予約 (登録の前): 引き継げるカードだけ・同じ request_id で違うカード = 断る・予約の間はコードの差し替えを止める・断られた = 外す
   const rid1 = '11111111-1111-4111-8111-111111111111';
   sp.reserveSetCardTakeover({ requestId: rid1, draftId: a, code: 'SMK-TAKE-2', components: [{ code: 'SMK-TAKE', qty: 2 }], actor: 'smoke' }, { db });

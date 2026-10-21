@@ -6,6 +6,7 @@
  *      残りを入れて保存 = その下書きを引き継ぐ (新しいカードは作らない・Company DB の SKU に結ぶ)・できた商品の画面の上に「引き継ぎました」
  *   ② 構成の違うセットを同じコードで登録 = 断る (理由の 1 行 + product-hub でカードを開くリンク)・何も保存しない
  *   ③ スマホの幅 (390): 「下書き」の画面が横にはみ出さない (表は囲いの中で横に送る)
+ *   ④ 🆕 10/21: product-hub の「セット商品を作る」で作ってコードを入れたセットのカードも出る → 「セットとして登録する」→ 保存で引き継ぐ
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 のときだけ
  * 使い方: node scripts/test-master-drafts-ui.mjs   (入れてある Chrome で動かす = node --import <use-chrome.mjs> scripts/test-master-drafts-ui.mjs)
  */
@@ -78,6 +79,13 @@ function plannedCard(parentCode, setCode, qty) {
 }
 const takeId = plannedCard('s001', 'ui-take-2', 2);
 const ntId = plannedCard('s002', 'ui-nt-2', 2);
+// 🆕 10/21: product-hub の「セット商品を作る」で作って手でコードを入れたセットのカード (作るセットの行は無い)
+const manId = (() => {
+  const parent = ph.prepare('SELECT id FROM product_drafts WHERE ne_code = ?').get('s002');
+  const id = Number(ph.prepare(`INSERT INTO product_drafts (ne_code, name, status, parent_draft_id, provisional_code, created_by) VALUES ('ui-man-3', 's002 3個セット (手で作った)', 'draft', ?, 1, 'ui')`).run(parent.id).lastInsertRowid);
+  ph.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, 3, 0)').run(id, 's002');
+  return id;
+})();
 const cardsOf = (code) => ph.prepare('SELECT * FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').all(code);
 const skuOf = async (code) => (await q('select sku_id::text as id from core.skus where code = $1', [code]))[0]?.id;
 
@@ -155,13 +163,35 @@ await ta('② 構成が違う = 断る (理由の 1 行・product-hub でカー�
   assert.equal(cardsOf('ui-nt-2')[0].cdb_sku_id, null);
 });
 
-await ta('③ スマホの幅 (390): 「下書き」の画面が横にはみ出さない (表は囲いの中で横に送る)', async (p) => {
+await ta('③ スマホの幅 (390): 「下書き」の画面が横にはみ出さない (表は囲いの中で横に送る)・手で作ったセットのカードも出る', async (p) => {
   await p.goto(B + '/drafts');
   const m = await p.evaluate(() => ({ sw: document.documentElement.scrollWidth, w: window.innerWidth,
     wide: [...document.querySelectorAll('body *')].filter((x) => x.getBoundingClientRect().right > window.innerWidth + 1 && !x.closest('.tblwrap, .scrollx')).slice(0, 6).map((x) => x.tagName + '.' + x.className + ' ' + x.textContent.slice(0, 30)) }));
   assert.ok(m.sw <= m.w + 1, `横にはみ出す (${m.sw} > ${m.w}) ${JSON.stringify(m.wide)}`);
   assert.equal(await p.locator(`tr[data-ph-draft="${ntId}"]`).count(), 1);
+  // 手で作ったセットのカードも出る (どこで作ったかの一言)
+  assert.match(await p.locator(`tr[data-ph-draft="${manId}"]`).textContent(), /ui-man-3[\s\S]*s002 × 3[\s\S]*product-hub で作った/);
 }, { width: 390, height: 844 });
+
+await ta('④ 手で作ったセットのカード (product-hub の「セット商品を作る」・コードを入れた) も「セットとして登録する」→ 保存で引き継ぐ', async (p) => {
+  await p.goto(B + '/drafts');
+  const man = p.locator(`tr[data-ph-draft="${manId}"]`);
+  assert.match(await man.textContent(), /product-hub で作った/);
+  await Promise.all([p.waitForURL(/from_card=/), man.locator('a', { hasText: 'セットとして登録する' }).click()]);
+  assert.equal(await p.inputValue('#code'), 'ui-man-3');
+  await p.waitForFunction(() => /単品 2/.test(document.querySelector('#comp-rows .c-name').textContent), null, { timeout: 10000 });
+  const rows = await p.locator('#comp-rows tr.comp-row').count();
+  if (rows > 1) await p.locator('#comp-rows tr.comp-row').nth(1).locator('button[data-act="del"]').click();
+  await p.fill('#f-standard_price', '8000');
+  await p.fill('#f-reorder_months', '1');
+  await noneRest(p);
+  await p.waitForSelector('#code-msg.ok');
+  await p.click('#save');
+  await p.waitForURL(/\/sku\/ui-man-3$/, { timeout: 15000 }).catch(async () => { throw new Error(`保存できない: ${await p.textContent('#result')} / ${await p.textContent('#msg')} / ${await p.textContent('#save')} / ${await p.isDisabled('#save')}`); });
+  await p.waitForSelector('#saved-note');
+  assert.match(await p.textContent('#saved-note'), new RegExp(`セットの下書き #${manId} を、このセットの出品カードとして引き継ぎました`));
+  assert.deepEqual([cardsOf('ui-man-3').length, String(cardsOf('ui-man-3')[0].cdb_sku_id)], [1, await skuOf('ui-man-3')]);
+});
 
 console.log(`\n${passed} ok${process.exitCode ? ' (NG あり)' : ''}`);
 await browser.close();
