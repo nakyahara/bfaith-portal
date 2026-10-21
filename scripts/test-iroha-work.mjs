@@ -8877,11 +8877,12 @@ console.log('\n[ボード] 📍 Zロケの数 = 在庫 − 引当 (2026-10-21 �
 {
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   const loc = new Function(html.match(/function locStockText\(c\) \{[\s\S]*?\r?\n\}/)[0] + '; return locStockText;')();
-  ok(loc({ loc_kind: 'Z', loc_stock: 50, loc_allocated: 7, loc_free: 43 }) === 'Zロケ 43', '在庫 50 − 引当 7 = 「Zロケ 43」');
-  ok(loc({ loc_kind: 'Z', loc_stock: 0, loc_allocated: 0, loc_free: 0 }) === 'Zロケ 0', 'Z に行が無い (在庫 0) は「Zロケ 0」');
-  ok(loc({ loc_kind: 'Z', loc_stock: null, loc_allocated: null, loc_free: null }) === '', 'ミラーが取れていなければ出さない (0 と読ませない)');
-  ok(loc({ loc_kind: 'Z', loc_stock: 5, loc_allocated: 8, loc_free: -3 }) === 'Zロケ 0', '引当が在庫を超えるずれはマイナスにしない');
-  ok(loc({ loc_kind: 'Y', loc_stock: 40, loc_allocated: 4, loc_free: 36 }) === 'Yロケ 36', '羅針盤・ワークセンターのカードは Y ロケ (作業情報と同じ)');
+  ok(loc({ z_stock: 50, z_allocated: 7, z_free: 43 }) === 'Zロケ 43', '在庫 50 − 引当 7 = 「Zロケ 43」');
+  ok(loc({ z_stock: 0, z_allocated: 0, z_free: 0 }) === 'Zロケ 0', 'Z に行が無い (在庫 0) は「Zロケ 0」');
+  ok(loc({ z_stock: null, z_allocated: null, z_free: null }) === '', 'ミラーが取れていなければ出さない (0 と読ませない)');
+  ok(loc({ z_stock: 5, z_allocated: 8, z_free: -3 }) === 'Zロケ 0', '引当が在庫を超えるずれはマイナスにしない');
+  ok(loc({ facility_code: 'workcenter', loc_kind: 'Y', loc_stock: 40, loc_free: 36, z_stock: 10, z_allocated: 0, z_free: 10 }) === 'Zロケ 10',
+    '⭐拠点で替わる loc_* (Y) ではなく、いつも Z を出す (分けた行で拠点と数が食い違わない — Codex)');
   ok(/locStockText\(c\) \? '📍 ' \+ locStockText\(c\) : null,/.test(html.match(/function bcardHtml\(c, status\) \{[\s\S]*?\r?\n\}/)[0]),
     'ボードのカードに Zロケの数を出す');
 }
