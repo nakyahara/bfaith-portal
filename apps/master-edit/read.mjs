@@ -14,7 +14,7 @@ import { salesOfCodes } from './sales-qty.mjs';
 import { checkDeadline, ListTimeoutError } from './deadline.mjs';
 import { normProductCode } from '../purchase-orders/db.js';
 import { TOKEN_RE } from './search-token.mjs';
-import { readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, OVERRIDE_SOURCES, logizardLockOf, regEditAfterIssue, REG_LOCK_AFTER_ISSUE } from '../../lib/master-write.mjs';
+import { setCompOnLoadReady, readCurrent, setDerivations, editTokenOf, changesSince, fieldOwnership, costAsOfJoin, jstDate, COMPANY_ID, fieldsOf, REG_CSV_FIELDS, OVERRIDE_SOURCES, logizardLockOf, regEditAfterIssue, REG_LOCK_AFTER_ISSUE } from '../../lib/master-write.mjs';
 import { deriveSetSalesClassCdb } from '../../lib/master-set-rules.js';
 import { readCutoverPhase, newEntryWritable } from '../../lib/master-cutover.mjs';
 import { latestRun } from '../master-decisions/decide.mjs';
@@ -637,7 +637,7 @@ export async function readSkuPage(db, code, { now = new Date(), ownership = null
       cur, costs, suppliers, activeSuppliers, jan, usedIn, usedInCount, amazon, csvRows, today, card, regItems, recent, locks, registered,
       state: cur.handling === 'discontinued' ? 'discontinued' : 'available',
       derived: cur.sku_kind === 'set' ? setDerivations(cur) : null,
-      fields: fieldOwnership(cur.sku_kind, ownership || {}, open && !!ownership && newEntryWritable(phase, ownership)),
+      fields: fieldOwnership(cur.sku_kind, ownership || {}, open && !!ownership && newEntryWritable(phase, ownership), { requestOnLoad: await setCompOnLoadReady(db) }),
       breaches,
       phase,
       token: editTokenOf(cur),
