@@ -15,6 +15,10 @@
  *   🆕 2026-10-17 中原さん: 「セット商品を作るか」= 作る のときは「作るセット」(個数・セット商品コード・セット商品名) を 1 つ以上 (③ に数える)。
  *     コード = 単品のコード-個数・名前 = 単品の名前 個数個セット を初めに入れる (直すまでは単品のコード・名前に付いていく)。決まり = lib/set-plan.mjs (サーバーも同じ)。
  *     コードは打つとその場で確かめる (/api/set-code-check = Company DB・NE・product-hub)。送る = card.sets (作る かつ カードを作るときだけ)
+ *   🆕 2026-10-21 中原さん (セット): 区切りの順 = ① 構成 → ② コードと名前 (右の「あと N つ」・飛び先の帯・保存のボタンの一言も同じ順)。
+ *     構成品の欄はコード・名前・JAN で探せる (候補 = public/me-comp-suggest.js・GET /api/new/components = 構成品にできる単品だけ・日本語入力の変換中は選ばない)。
+ *     打っている字がコードの形 (英数字・記号・空白なし) のときだけ打つとその場で引き当てる (名前を打っている間に「見つかりません」を出さない)。欄を出たら今までどおり引き当てる。
+ *     引き当てた構成品の名前の横に「コピー」(クリップボード) と「名前に使う」(セットの名前が空・数が 2 以上のとき = 名前 N個セット = lib/set-plan.mjs defaultSetName と同じ形)
  */
 (function () {
   'use strict';
@@ -114,17 +118,17 @@
   /** 項目 = { id, sec, t (名前), ok, focus (セレクタ), level 1|2|3 } */
   function items() {
     var code = $('#code').value;
-    var list = [
-      { id: 'code', sec: 'sec-code', t: '商品コード', ok: !codeShape(code) && !(codeState.code === code && codeState.ok === false), focus: '#code', level: 1 },
-      { id: 'name', sec: 'sec-code', t: '名前', ok: !!val('f-name'), focus: '#f-name', level: 1 },
-    ];
-    if (isSet) list.push({ id: 'components', sec: 'sec-comp', t: '構成 (1 品以上)', ok: components().some(function (r) { return r.code; }), focus: '#comp-rows .c-code', level: 1 });
+    var list = [];
+    // 🆕 2026-10-21: セットは 構成 → コードと名前 (画面の区切りの順と同じ)
     if (isSet) {
+      list.push({ id: 'components', sec: 'sec-comp', t: '構成 (1 品以上)', ok: components().some(function (r) { return r.code; }), focus: '#comp-rows .c-code', level: 1 });
       var cc = compCheck();
       if (cc.pending.length) list.push({ id: 'comp_pending', sec: 'sec-comp', t: '構成品を確かめています (' + cc.pending.length + ' 行)', ok: false, focus: '#comp-rows tr.comp-row:nth-child(' + (cc.pending[0].sectionRowIndex + 1) + ') .c-code', level: 1 });
       else if (cc.bad.length) list.push({ id: 'comp_bad', sec: 'sec-comp', t: '構成品にできないコードを直す (' + cc.bad.length + ' 行)', ok: false, focus: '#comp-rows tr.comp-row:nth-child(' + (cc.bad[0].sectionRowIndex + 1) + ') .c-code', level: 1 });
+      if (salesFromComp != null && val('f-set_sales_class_override')) list.push({ id: 'override', sec: 'sec-comp', t: '売上分類の上書きを空にする (構成品から導けます)', ok: false, focus: '#f-set_sales_class_override', level: 1 });
     }
-    if (isSet && salesFromComp != null && val('f-set_sales_class_override')) list.push({ id: 'override', sec: 'sec-comp', t: '売上分類の上書きを空にする (構成品から導けます)', ok: false, focus: '#f-set_sales_class_override', level: 1 });
+    list.push({ id: 'code', sec: 'sec-code', t: '商品コード', ok: !codeShape(code) && !(codeState.code === code && codeState.ok === false), focus: '#code', level: 1 });
+    list.push({ id: 'name', sec: 'sec-code', t: '名前', ok: !!val('f-name'), focus: '#f-name', level: 1 });
     list.push({ id: 'standard_price', sec: 'sec-money', t: '売価', ok: priceOk('f-standard_price'), focus: '#f-standard_price', level: 1 });
     if (!isSet) list.push({ id: 'tax_rate', sec: 'sec-tax', t: '税率', ok: !!segVal('f-tax_rate'), focus: '#f-tax_rate button', level: 1 });
     if (!isSet) list.push({ id: 'primary_supplier', sec: 'sec-tax', t: '代表の仕入先', ok: !!val('f-primary_supplier'), focus: '#f-primary_supplier', level: 1 });
@@ -234,6 +238,7 @@
       var sh = need.length ? 'あと ' + need.length + ' つ: ' + esc(need[0].t) : '下書きを保存する <span class="kbd" aria-hidden="true">Ctrl</span><span class="kbd" aria-hidden="true">S</span>';
       paint('#save', sh);
     }
+    compTools();
     ME.setUnsaved(names.length);
     lastState = { n: names.length, items: d.map(function (el) { return (el.getAttribute('data-label') || '') + ': ' + shown(el); }).filter(function (x, i, a) { return a.indexOf(x) === i; }), impacts: need.length ? ['保存していないので、下書きはまだできていません'] : [], need: need };
     yahooSummary();
@@ -298,8 +303,8 @@
     $('.no', tr).textContent = String(i + 1);
     $('.c-code', tr).setAttribute('aria-label', (i + 1) + ' 行目の構成品のコード');
     $('.c-qty', tr).setAttribute('aria-label', who + ' の数');
-    var acts = { up: 'を上へ', down: 'を下へ', del: 'を外す' };
-    $$('button[data-act]', tr).forEach(function (b) { b.setAttribute('aria-label', who + ' ' + acts[b.getAttribute('data-act')]); });
+    var acts = { up: 'を上へ', down: 'を下へ', del: 'を外す', 'copy-name': 'の名前をコピー', 'use-name': 'の名前をセットの名前に使う' };
+    $$('button[data-act]', tr).forEach(function (b) { var a = acts[b.getAttribute('data-act')]; if (a) b.setAttribute('aria-label', who + ' ' + a); });
   }
   function renumber() { $$('#comp-rows tr.comp-row').forEach(relabel); tiles(); update(); }
   /** 確かめ直しの間 (3 秒・10 秒・30 秒の 3 回)。試験だけ window.__meRetryWaits で短くする */
@@ -365,6 +370,73 @@
       })
       .catch(function (err) { if (err && err.name === 'AbortError') return; retry('引き当てできません (通信)', true); });
   }
+  /**
+   * 構成品の欄の字が変わった (打った・候補から選んだ・確定した)。古い答えを捨てて世代を進める (A → B → A と打ち直しても、前の A の答え・遅れて来る返事は使わない = #1628 Codex R3 L3)。
+   *   how = typed (打った) / composing (日本語入力の変換中 = 引き当てない) / chosen (候補から選んだ = すぐ引き当てる)。
+   *   🆕 2026-10-21: 打つとその場で引き当てるのはコードの形 (英数字・記号・全角の英数字・空白なし) のときだけ。名前で探している間は「見つかりません」を出さない (欄を出たら change で引き当てる)
+   */
+  function codeTyped(tr, how) {
+    var v = $('.c-code', tr).value.trim();
+    var f0 = facts.get(tr);
+    if (how === 'typed' && f0 && f0.code === v && !tr.__lookupTimer) return;   // 確定で字が変わっていない = 今の答えのまま
+    facts.delete(tr); tr.__lookupSeq = (tr.__lookupSeq || 0) + 1; tr.__inflight = null; tr.__retryN = 0; if (tr.__abort) tr.__abort.abort();
+    var codeLike = /^[\x21-\x7e！-～]+$/.test(v);
+    ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { $(c, tr).textContent = ''; }); $('.c-name', tr).textContent = v && (codeLike || how === 'chosen') && how !== 'composing' ? '確かめています…' : ''; $('.c-name', tr).classList.remove('bad');
+    tiles();
+    clearTimeout(tr.__lookupTimer); tr.__lookupTimer = null;
+    if (how === 'chosen') { lookup(tr); return; }
+    if (how === 'composing' || !codeLike) return;
+    tr.__lookupTimer = setTimeout(function () { tr.__lookupTimer = null; lookup(tr); }, 500);
+  }
+  /** 構成品の名前の横の「コピー」「名前に使う」: 引き当てた単品の行だけ出す。「名前に使う」はセットの名前が空・数が 2〜99 のときだけ押せる */
+  function compTools() {
+    if (!isSet) return;
+    var nameEmpty = !val('f-name');
+    $$('#comp-rows tr.comp-row').forEach(function (tr) {
+      var box = $('.c-tools', tr); if (!box) return;
+      var f = factOf(tr), ok = !!(f && f.item && f.item.kind === 'single' && f.item.name);
+      if (box.hidden !== !ok) box.hidden = !ok;
+      var use = $('[data-act="use-name"]', tr); if (!use || !ok || !canSave || saved) return;
+      var q = spQty($('.c-qty', tr).value);
+      var why = !nameEmpty ? '名前が空のときだけ使えます (コピーして直せます)' : q == null ? '数が ' + SP_MIN + '〜' + SP_QMAX + ' のときだけ使えます' : '';
+      use.disabled = !!why;
+      if (why) use.title = why; else use.removeAttribute('title');
+    });
+  }
+  /** 写す = me-shell.js の ME.copyText (クリップボードの API → 断られたら隠した欄から)。無いとき (読めない) だけ隠した欄から */
+  function copyNow(text) {
+    if (ME.copyText) return ME.copyText(text);
+    return new Promise(function (ok, ng) {
+      try {
+        var ta = document.createElement('textarea'); ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select(); var done = document.execCommand('copy'); document.body.removeChild(ta);
+        if (done) ok(); else ng(new Error('copy'));
+      } catch (e) { ng(e); }
+    });
+  }
+  /** ボタンの字を少しの間だけ変える (コピーしました・入れました) */
+  function flash(b, t) {
+    if (!b.__label) b.__label = b.textContent;
+    b.textContent = t; b.classList.add('done');
+    clearTimeout(b.__flash);
+    b.__flash = setTimeout(function () { b.textContent = b.__label; b.classList.remove('done'); }, 1600);
+    var say = $('#comp-suggest-status'); if (say) say.textContent = t;
+  }
+  function nameTool(tr, b, act) {
+    var f = factOf(tr); if (!f || !f.item || !f.item.name) return;
+    var nm = String(f.item.name);
+    if (act === 'copy-name') {
+      copyNow(nm).then(function () { flash(b, 'コピーしました'); }, function () { if (ME.toast) ME.toast('コピーできませんでした (ブラウザが許していない)'); });
+      return;
+    }
+    var nameEl = $('#f-name'), q = spQty($('.c-qty', tr).value);
+    if (!nameEl || nameEl.value.trim() || q == null) { compTools(); return; }
+    var v = (nm.trim() + ' ' + q + '個セット').trim();   // lib/set-plan.mjs defaultSetName と同じ形 (半角の空白 1 つ)
+    var max = Number(nameEl.getAttribute('maxlength')) || 255;
+    nameEl.value = Array.from(v).length > max ? Array.from(v).slice(0, max).join('') : v;
+    nameEl.dispatchEvent(new Event('input', { bubbles: true }));
+    flash(b, '入れました');
+  }
   /** 構成品から導いた売上分類 (導けない・分からない = null) */
   var salesFromComp = null;
   /** 売上分類の上書きの欄: 構成品から導ける間は押せない (入れてあれば空にできるよう開けておく = ① で止める) */
@@ -410,11 +482,13 @@
       put('t-price', yen(sum) + '<small> 円</small>', /^\d+$/.test(sp) ? 'セットの売価との差 ' + (Number(sp) - sum >= 0 ? '+' : '−') + yen(Math.abs(Number(sp) - sum)) + ' 円' : 'セットの売価とくらべる');
     }
   }
+  var sug = null;   // 構成品の候補の箱 (保存できる画面だけ)
   if (rowsEl && canSave) {
     rowsEl.addEventListener('click', function (e) {
       var b = e.target.closest('button[data-act]'); if (!b || b.disabled) return;
       var tr = b.closest('tr'), act = b.getAttribute('data-act');
       if (act === 'relookup') { tr.__retryN = 0; tr.__inflight = null; lookup(tr); return; }
+      if (act === 'copy-name' || act === 'use-name') { nameTool(tr, b, act); return; }
       if (act === 'del') { var next = tr.nextElementSibling || tr.previousElementSibling; clearTimeout(tr.__lookupTimer); tr.__lookupSeq = (tr.__lookupSeq || 0) + 1; tr.__inflight = null; if (tr.__abort) tr.__abort.abort(); facts.delete(tr); tr.remove(); if (next) $('.c-code', next).focus(); else $('#comp-add').focus(); }
       if (act === 'up' && tr.previousElementSibling) { tr.parentNode.insertBefore(tr, tr.previousElementSibling); b.focus(); }
       if (act === 'down' && tr.nextElementSibling) { tr.parentNode.insertBefore(tr.nextElementSibling, tr); b.focus(); }
@@ -423,18 +497,18 @@
     rowsEl.addEventListener('change', function (e) { if (e.target.classList.contains('c-code')) { var tr = e.target.closest('tr'); relabel(tr, $$('#comp-rows tr.comp-row').indexOf(tr)); lookup(tr); } });
     rowsEl.addEventListener('input', function (e) {
       if (e.target.classList.contains('c-qty')) tiles();
-      if (e.target.classList.contains('c-code')) {
-        var tr = e.target.closest('tr');
-        // 打った瞬間に古い答えを捨てて世代を進める (A → B → A と打ち直しても、前の A の答え・遅れて来る返事は使わない = #1628 Codex R3 L3)
-        facts.delete(tr); tr.__lookupSeq = (tr.__lookupSeq || 0) + 1; tr.__inflight = null; tr.__retryN = 0; if (tr.__abort) tr.__abort.abort();
-        ['.c-tax', '.c-sales', '.c-cost', '.c-handling'].forEach(function (c) { $(c, tr).textContent = ''; }); $('.c-name', tr).textContent = e.target.value.trim() ? '確かめています…' : ''; $('.c-name', tr).classList.remove('bad');
-        tiles();
-        clearTimeout(tr.__lookupTimer);
-        tr.__lookupTimer = setTimeout(function () { lookup(tr); }, 500);
-      }
+      if (e.target.classList.contains('c-code')) codeTyped(e.target.closest('tr'), e.isComposing ? 'composing' : 'typed');
     });
-    // 構成品のコードで Enter = 引き当てて数の欄へ (保存はしない)
+    // 日本語入力の確定 (全角の英数字のコードを打ったとき) = 確定した字で引き当てを待つ (変換中は引き当てない)
+    rowsEl.addEventListener('compositionend', function (e) { if (e.target.classList.contains('c-code')) codeTyped(e.target.closest('tr'), 'typed'); });
+    // 🆕 2026-10-21: 候補の箱 (コード・名前・JAN で探す = public/me-comp-suggest.js・構成品にできる単品だけ)。部品が無い (読めない) = 今までどおりコードを打つだけ
+    sug = ME.compSuggest && $('#comp-suggest') ? ME.compSuggest({ root: rowsEl, listbox: $('#comp-suggest'), say: $('#comp-suggest-status'), base: BASE, min: P.searchMin || 2, idPrefix: 'comp-opt-',
+      path: '/api/new/components', noneText: '構成品にできる単品',
+      usedAt: function (inp, code) { var n = ME.normCode(code), at = 0; $$('#comp-rows tr.comp-row').some(function (tr, i) { if ($('.c-code', tr) !== inp && ME.normCode($('.c-code', tr).value) === n) { at = i + 1; return true; } return false; }); return at; },
+      onChoose: function (inp, it) { var tr = inp.closest('tr'); codeTyped(tr, 'chosen'); relabel(tr, $$('#comp-rows tr.comp-row').indexOf(tr)); update(); var q = $('.c-qty', tr); if (q) { q.focus(); q.select(); } } }) : null;
+    // 構成品のコードで Enter = 引き当てて数の欄へ (保存はしない)。候補の箱が使ったキー (↑↓・選ぶ Enter・Esc・変換中・確定の Enter) はここでは何もしない
     rowsEl.addEventListener('keydown', function (e) {
+      if (sug && sug.onKey(e)) return;
       if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
       if (e.target.classList.contains('c-code')) { e.preventDefault(); var q = $('.c-qty', e.target.closest('tr')); if (q) { q.focus(); q.select(); } }
     });
@@ -851,6 +925,7 @@
     renumber();
     var trs = $$('#comp-rows tr.comp-row');
     comps.forEach(function (c, i) { setVal($('.c-qty', trs[i]), String(c.qty)); setVal($('.c-code', trs[i]), String(c.code)); });
+    if (sug) sug.close();
   }
 
   cardShow();
