@@ -7243,7 +7243,7 @@ let wfSetParentId = null;
         addRejected('match', skipText, skipJson);
         cr = cutsR();
         check('🚨 撮影指示書の材料: 参考の構成の番号が飛んでいても、要撮影の画像を見出しの番号で取り違えない',
-          cr.source === 'lp_draft' && cr.cuts.length === 1 && cr.cuts[0].content === '番号が飛んだ画像のカット', JSON.stringify(cr));
+          cr.source === 'lp_draft' && cr.cuts.length === 1 && cr.cuts[0].content === '番号が飛んだ画像のカット' && cr.cuts[0].lp_image.startsWith('3枚目'), JSON.stringify(cr));
         // 作り直しを頼んだ (いちばん新しい依頼が queued) なら古い参考の構成は使わない
         addJob(idR, 'queued', null);
         check('🚨 撮影指示書の材料: 作り直しを頼んだ後は古い参考の構成を使わない', cutsR().source === 'none');

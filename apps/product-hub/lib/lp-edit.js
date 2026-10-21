@@ -407,7 +407,8 @@ export function rejectedComposeDraft(db, draftId) {
   });
   if (nos.some((n) => n === null) || new Set(nos).size !== nos.length) return { job, edit: null, text, error: '画像の番号が読めない・重なっています' };
   const aiNeeds = aiNeedsShootOf(job);
-  const slots = r.slots.map((s, i) => ({ ...s, uid: `a${nos[i]}`, shoot: aiNeeds ? aiNeeds.get(nos[i]) === true : false }));
+  // no も見出しの番号にする (撮影指示書の「N枚目」の表示に使う・並び順のままだと 3枚目 が 2枚目 と出る・Codex)
+  const slots = r.slots.map((s, i) => ({ ...s, no: nos[i], uid: `a${nos[i]}`, shoot: aiNeeds ? aiNeeds.get(nos[i]) === true : false }));
   return { job, edit: null, text, head: r.head, tail: r.tail, slots };
 }
 
