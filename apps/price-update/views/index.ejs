@@ -56,6 +56,16 @@
   .grp-name { font-weight: 700; font-size: 13px; }
   .grp-meta { font-size: 12px; color: #64748b; margin-left: 8px; }
   tr.blocked td:not(.keep) { opacity: .62; }
+
+  /* まとめて入れる (代表商品コードで並べたバリエーションに同じ売価を入れる) */
+  .bulk { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
+          padding: 9px 12px; margin-bottom: 12px; font-size: 13px; }
+  .bulk-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+  .bulk-row label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .bulk-row label.hidden { display: none; }   /* 上の指定の方が .hidden より強いので明示する */
+  .bulk-row select { width: auto; max-width: 320px; }
+  /* input.〜 にする理由は下の price-in と同じ (共通ヘッダの全幅指定に負けないため) */
+  input.bulk-in { width: 100px; text-align: right; font-weight: 600; }
   /* ★セレクタは input.〜 にする: 共通ヘッダの `input[type=number] { width:100% }` は
      属性セレクタぶん詳細度が高く、`.price-in` だけだと負けて全幅になり、
      商品名の列が1文字幅まで潰れる (2026-08-30 の画面崩れ) */
@@ -122,8 +132,8 @@
     <details>
       <summary>使い方 (3ステップ) と、気をつけること</summary>
       <ol class="howto">
-        <li><b>NE商品コードを入れて「出品を検索」</b> — 楽天・Yahoo・au PAY・Qoo10 の出品と、いまの価格を集めます (数十秒)。</li>
-        <li><b>新しい売価を入れる</b> — 原価が変わったなら先に「新原価」を入れて計算し直します。粗利はその場で出ます。</li>
+        <li><b>NE商品コード (または代表商品コード) を入れて「出品を検索」</b> — 楽天・Yahoo・au PAY・Qoo10 の出品と、いまの価格を集めます (数十秒)。代表商品コードなら、その下のバリエーションが全部並びます。</li>
+        <li><b>新しい売価を入れる</b> — 原価が変わったなら先に「新原価」を入れて計算し直します。粗利はその場で出ます。全色同じ売価にするなら、表の上の「まとめて入れる」が早いです。</li>
         <li><b>「この内容を記録する」</b> — 履歴ができます。送信はその履歴の画面から、確認欄に入力してはじめて実行されます。</li>
       </ol>
       <ul class="howto">
@@ -136,11 +146,12 @@
   </div>
 
   <div class="card">
-    <h2><span class="step">1</span>NE商品コードを入れる</h2>
+    <h2><span class="step">1</span>NE商品コード または 代表商品コードを入れる</h2>
     <div class="pu-input">
       <div style="flex:1; min-width:320px;">
         <textarea id="codes" placeholder="abc-001&#10;abc-002&#10;(改行・カンマ・空白区切り。最大 <%= limits.maxNeCodes %> コード)"></textarea>
         <div class="pu-note">入れた単品と、それを含むセット商品もまとめて探します (セット行は初期状態では未選択)。</div>
+        <div class="pu-note">代表商品コード (楽天の商品管理番号・Yahoo の親の商品コード) を入れると、その下のバリエーションを全部並べます。</div>
       </div>
       <button class="btn btn-primary" id="resolve-btn" type="button">出品を検索</button>
     </div>
@@ -158,6 +169,16 @@
     <h2><span class="step">3</span>新しい売価を入れる
       <span class="h2-right"><label class="tgl"><input type="checkbox" id="detail-tgl">詳しく表示 (出品コード・引き当て・原価・送料)</label></span>
     </h2>
+    <div class="bulk hidden" id="bulk">
+      <b>まとめて入れる</b>
+      <span class="pu-note">単品で、いまの価格が取れた行に同じ売価を入れてチェックします。空欄のモールはそのまま。入れた後で1行ずつ直せます。</span>
+      <div class="bulk-row">
+        <label id="bulk-scope-wrap">対象 <select id="bulk-scope" aria-label="まとめて入れる対象"></select></label>
+        <span id="bulk-malls" class="bulk-row" style="margin-top:0;"></span>
+        <button class="btn btn-sm" id="bulk-btn" type="button">入れる</button>
+        <span class="pu-note" id="bulk-msg"></span>
+      </div>
+    </div>
     <div style="overflow-x:auto;">
       <table class="pu" id="rows-table">
         <thead>
@@ -238,6 +259,11 @@
   let previewId = null;
   let rows = [];
   let inputCodes = [];
+  /** 代表商品コードをどのバリエーションに広げたか (サーバの expandParentCodes の結果) */
+  let expansions = [];
+  const EXPAND_SOURCE_LABEL = { ne: 'NEの代表商品コード', rms: '楽天の商品管理番号', code: 'コードの形' };
+  /** 「まとめて入れる」の欄を出すモールの並び (送れるモールだけ) */
+  const BULK_MALLS = ['rakuten', 'yahoo', 'aupay', 'qoo10'];
   // 「すべて選ぶ」で選んでよい行のキー。★セット行と、止まっている行は入れない
   // (セットが初期状態で未選択なのは安全のためで、1操作で外してよいものではない)。
   // 売価がまだ空の行は入れる — これから入れる行を選べないと「すべて選ぶ」の意味が無い
@@ -300,13 +326,20 @@
       previewId = r.previewId;
       rows = r.rows;
       inputCodes = codes.split(/[\s,、\r\n\t]+/).map((s) => s.trim()).filter(Boolean);
+      expansions = r.expansions || [];
       const msgs = [];
+      expansions.forEach((x) => {
+        const n = x.children.length + (x.parentIsProduct ? 1 : 0);
+        msgs.push('代表商品コード ' + x.parent + ' → ' + n + ' 品を並べました ('
+          + x.sources.map((s) => EXPAND_SOURCE_LABEL[s] || s).join('・') + 'から)');
+      });
       if (r.unknownCodes.length) msgs.push('商品マスタに無いコード: ' + r.unknownCodes.join(', '));
       if (r.notices.length) msgs.push(r.notices.join(' / '));
       msgs.push('プレビュー有効期限 ' + new Date(r.expiresAt).toLocaleTimeString());
       $('resolve-msg').textContent = msgs.join(' — ');
       renderCosts();
       render();
+      renderBulk();
     } catch (e) {
       $('resolve-msg').textContent = 'エラー: ' + e.message;
     } finally {
@@ -521,6 +554,66 @@
     if (saving) setInputsDisabled(true);   // 記録中に応答が来て描き直しても入力は止めたまま
   }
 
+  /**
+   * 「まとめて入れる」の対象行。★単品で、いまの価格がモールから取れた (確定) 行だけ。
+   *   セット行は色と同じ売価になってはいけないので入れない。取れなかった行は入れても ⛔ になるだけなので入れない
+   */
+  function bulkTargets(mall, scope) {
+    const norm = (c) => String(c == null ? '' : c).trim().toLowerCase();
+    const x = scope === '' ? null : expansions[Number(scope)];
+    const inScope = x ? new Set([...x.children, ...(x.parentIsProduct ? [x.parent] : [])].map(norm)) : null;
+    // ★セットは rowKind だけでなく商品マスタの区分でも外す (セットのコードを直接入れると rowKind は 'single' — Codex R1)
+    return rows.filter((r) => !r.manual && r.rowKind === 'single' && !r.isSetProduct && r.confidence === 'confirmed'
+      && r.mall === mall && (!inScope || inScope.has(norm(r.neCode))));
+  }
+
+  /** 検索のたびに作り直す (入れかけた値は検索し直したら捨てる = 別の商品に入れない) */
+  function renderBulk() {
+    const malls = BULK_MALLS.filter((m) => bulkTargets(m, '').length > 0);
+    $('bulk').classList.toggle('hidden', malls.length === 0);
+    $('bulk-msg').textContent = '';
+    // 対象の選び分けは代表商品コードで広げた時だけ出す (ふつうに NEコードを並べた時は全部が対象)
+    $('bulk-scope-wrap').classList.toggle('hidden', expansions.length === 0);
+    const singles = new Set(rows.filter((r) => !r.manual && r.rowKind === 'single' && !r.isSetProduct).map((r) => r.neCode)).size;
+    $('bulk-scope').innerHTML = '<option value="">表示中の単品すべて (' + singles + ' 品)</option>'
+      + expansions.map((x, i) => '<option value="' + i + '">代表 ' + esc(x.parent) + ' のバリエーション ('
+        + (x.children.length + (x.parentIsProduct ? 1 : 0)) + ' 品)</option>').join('');
+    $('bulk-malls').innerHTML = malls.map((m) => '<label><span class="mall m-' + m + '">' + esc(MALL_LABEL[m] || m) + '</span>'
+      + '<input type="number" class="bulk-in" data-mall="' + m + '" min="1" step="1" placeholder="円"'
+      + ' aria-label="' + esc(MALL_LABEL[m] || m) + ' にまとめて入れる売価"></label>').join('');
+  }
+
+  function applyBulk() {
+    if (!previewId || saving || resolving) return;
+    const scope = $('bulk-scope').value;
+    const plan = [];
+    const bad = [];
+    document.querySelectorAll('.bulk-in').forEach((el) => {
+      const v = el.value.trim();
+      if (v === '') return;
+      const label = MALL_LABEL[el.dataset.mall] || el.dataset.mall;
+      // サーバ (parseStrictPrice) と同じく整数円だけ。小数を黙って丸めない
+      if (!/^\d{1,12}$/.test(v) || Number(v) < 1) { bad.push(label + ' ' + v); return; }
+      plan.push({ mall: el.dataset.mall, value: String(Number(v)) });
+    });
+    if (bad.length) { $('bulk-msg').textContent = '売価は 1 円以上の整数で入れてください: ' + bad.join(' / '); return; }
+    if (plan.length === 0) { $('bulk-msg').textContent = '入れる売価がありません (モールの欄に売価を入れてください)'; return; }
+    let filled = 0;
+    plan.forEach((p) => {
+      bulkTargets(p.mall, scope).forEach((r) => {
+        const inp = document.querySelector('.price-in[data-key="' + r.key + '"]');
+        const sel = document.querySelector('.sel[data-key="' + r.key + '"]');
+        if (!inp || inp.disabled) return;
+        inp.value = p.value;
+        if (sel) sel.checked = true;
+        filled++;
+      });
+    });
+    if (filled === 0) { $('bulk-msg').textContent = '入れられる行がありませんでした'; return; }
+    $('bulk-msg').textContent = filled + ' 行に入れてチェックしました。「判定」の列を確かめてから記録してください';
+    onInputChange();   // 1行ずつ入れた時と同じ道でサーバへ送る (記録とずれないように)
+  }
+
   function syncSelAll() {
     const target = [...document.querySelectorAll('.sel')].filter((el) => selectableKeys.has(el.dataset.key));
     const on = target.filter((el) => el.checked).length;
@@ -563,7 +656,7 @@
     timer = setTimeout(function () { timer = null; enqueuePreview(); }, 250);
   }
   function setInputsDisabled(v) {
-    document.querySelectorAll('.price-in, .sel, .cost-in, #sel-all').forEach((el) => { el.disabled = v; });
+    document.querySelectorAll('.price-in, .sel, .cost-in, #sel-all, .bulk-in, #bulk-scope, #bulk-btn').forEach((el) => { el.disabled = v; });
   }
   /**
    * 保存前: 入力を止めて、キューが完全に静止するまで待つ。失敗していれば例外を投げる。
@@ -661,6 +754,7 @@
   $('resolve-btn').onclick = doResolve;
   $('recost-btn').onclick = doResolve;
   $('save-btn').onclick = save;
+  $('bulk-btn').onclick = applyBulk;
   $('detail-tgl').onchange = function () { document.body.classList.toggle('show-detail', this.checked); };
   $('sel-all').onchange = async function () {
     const on = this.checked;
