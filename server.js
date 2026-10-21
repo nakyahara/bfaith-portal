@@ -66,7 +66,7 @@ import { startIrohaPrintQueueWorker } from './apps/iroha-work/print-worker.js';
 import { startNotifyOutbox as startFbaBoxNotifyOutbox } from './apps/fba-box/notify-outbox.js';
 import staffRouter from './apps/staff/router.js';
 import masterDecisionsRouter from './apps/master-decisions/router.mjs';
-import masterEditRouter from './apps/master-edit/router.mjs';
+import masterEditRouter, { lzExportFileForRunner } from './apps/master-edit/router.mjs';
 import { legacyAckHeartbeat, maybeRefreshLegacyAck, legacyAckState, ackLegacyGatesStopped, legacyAckHost, markPreviousInstanceStopped } from './lib/master-legacy-gate.mjs';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 // 🆕 新商品のパッケージ裏面ラベル写真を Drive へ送るキュー (プロセス内2分間隔の再試行)
@@ -112,6 +112,7 @@ import { isWarehouseDbReady } from './apps/warehouse/router.js';
 import jobsMonitorRouter from './apps/jobs-monitor/router.js';
 import logizardImportStateRouter from './apps/logizard-import-state/router.js';
 import logizardImportAdminRouter, { adminApiGate as logizardImportAdminGate, adminPageGate as logizardImportAdminPageGate, renderAdminPage as renderLogizardImportAdminPage } from './apps/logizard-import-state/admin-router.js';
+import { createLzBcRunnerRouter } from './apps/lz-bc-import/runner-router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 import shohyoLinksRouter from './apps/shohyo-links/router.js';
@@ -330,7 +331,15 @@ if (process.env.JOBS_MONITOR_ENABLED === '1') {
   app.use('/apps/logizard-import-state', logizardImportStateRouter);
   console.log('[server] logizard-import-state mounted');
 }
+// 🆕 2026-10-17「ロジザードに取り込む」ボタンの機械の口 (miniPC の bc-import-runner.js が取りに来る・Bearer LZ_BC_RUNNER_TOKEN)。
+// マスタの入力と同じく Render だけ (MASTER_EDIT_ENABLED=1 かつ PORTAL_VARIANT=render・帳面 = DATA_DIR/lz-bc-import.db)。どの body parser よりも前 (認証の前に本文を読まない)。
+// PORTAL_VARIANT の定数はこの下で決まるので、ここでは env を直に見る (同じ決め方)
+if (process.env.MASTER_EDIT_ENABLED === '1' && (process.env.PORTAL_VARIANT || 'render').toLowerCase() === 'render') {
+  app.use('/apps/lz-bc-import', createLzBcRunnerRouter({ readExportFile: lzExportFileForRunner }));
+  console.log('[server] lz-bc-import (機械の口) mounted');
+}
 // フォームの parser も /apps/logizard-import-state (機械の口・画面の口) は読まない = どちらも認証の後にその口だけの parser で読む (画面の口 = ログイン・管理者・Origin の後。③c-1b-3b-4a)
+// (/apps/lz-bc-import は上の router が全部の要求に答える = ここまで来ない)
 const urlencodedParser = express.urlencoded({ extended: true });
 app.use((req, res, next) => (String(req.path || '').toLowerCase().startsWith('/apps/logizard-import-state') ? next() : urlencodedParser(req, res, next)));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
@@ -385,6 +394,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/mgmt-accounting')) return next();
     // /apps/logizard-import-state (ロジザードの取込の状態の口) は router 内で「Bearer LZ_LOCK_TOKEN → 64KB parser」の順 (認証前 body parse を避ける)
     if (normalizedPath.toLowerCase().startsWith('/apps/logizard-import-state')) return next();
+    // /apps/lz-bc-import (「ロジザードに取り込む」の機械の口) も router 内で「Bearer LZ_BC_RUNNER_TOKEN → 128KB parser」の順
+    if (normalizedPath.toLowerCase().startsWith('/apps/lz-bc-import')) return next();
     // /aba-ext-api は router 内で「x-api-key 認証 → 64KB parser」の順に処理 (認証前 body parse を避ける)
     if (normalizedPath.startsWith('/aba-ext-api')) return next();
     // /apps/easy-ship/ext-api も同様に router 内で「x-api-key 認証 → 64KB parser」の順に処理

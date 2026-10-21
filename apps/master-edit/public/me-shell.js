@@ -326,8 +326,12 @@
   });
 
   /* ---------- 一覧: 商品コードのコピー (1 行のボタン・絞った一覧を全部) (10/5) ---------- */
+  // 🆕 2026-10-21 (Codex R1 Medium): クリップボードの API が断った (許可がない・フォーカスが無い) ときも、隠した欄からの写しを試す
   function copyText(text) {
-    if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) return navigator.clipboard.writeText(text);
+    if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) return navigator.clipboard.writeText(text).catch(function () { return legacyCopy(text); });
+    return legacyCopy(text);
+  }
+  function legacyCopy(text) {
     return new Promise(function (ok, ng) {
       var ta = document.createElement('textarea'); ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0';
       document.body.appendChild(ta); ta.select();

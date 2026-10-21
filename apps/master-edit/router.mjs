@@ -17,6 +17,7 @@
  *   GET  /sku/:code          1 つの商品 (単品 = 画面 B / セット = 画面 C)
  *   GET  /sku/:code/history  変更の記録
  *   GET  /api/lookup?code=   構成品の引き当て
+ *   GET  /api/new/components?q=  🆕 2026-10-21 新商品の登録 (セット) の構成品の欄の候補 (読むだけ・コード / 名前の言葉 / JAN・単品だけ・やめた / 要確認は出さない)
  *   POST /api/sku/:code      保存 { request_id, reason?, seen: { token (編集の印), event_id? }, values: {...} }
  *   GET  /new?kind=single|set|variation 新商品の登録 (画面 D・⑤-2a)。variation = 色違い・サイズ違いのまとまり (CompanyDB構想/20 §④・PR-7)。
  *        「まとまり」の札と画面は、DB の active の products.parent が company のときだけ出す (今は load = 出さない = 「切替の前」の帯)
@@ -177,6 +178,9 @@ import { brandLifeReady, brandLifeTablesExist, readBrands, createBrand, setBrand
 // 🆕 0090 表示の項目 (原産国・内容量・メーカー型番・消費期限の目安・Company DB構想 27 ④-1)
 import { readLabelView, labelReady, defaultPhLabelLookup, COUNTRY_SUGGEST, NET_UOMS } from '../../lib/master-label.mjs';
 import { lzListStale, lzNewCandidates, issueLzNewExport, lzNewExports, lzNewExportFile, voidLzNewExport, LZ_HOLD_WORDS, LZ_LIST_FRESH_HOURS } from '../../lib/lz-new-export.mjs';
+// 🆕 2026-10-17「ロジザードに取り込む」ボタン (miniPC が取りに来て ① 取込 → ② 書き出し。帳面 = Render の SQLite・apps/lz-bc-import)
+import * as BC from '../lz-bc-import/store.js';
+import { importStateBlock } from '../lz-bc-import/lz-state.js';
 
 /**
  * 注文残 (発注アプリの台帳 = 仕入先・発注日・数・納期) を見せてよいか = 発注アプリの利用権もある人だけ (#1620 Codex R1 M3)。
@@ -274,6 +278,12 @@ async function defaultLzMirror() {
 }
 let lzMirrorProvider = defaultLzMirror;
 export function __setLzMirrorProvider(fn) { lzMirrorProvider = fn || defaultLzMirror; }
+/** 🆕「ロジザードに取り込む」: ロジザードの毎日の商品マスタの取込の状態の止め (試験で差し替える) */
+let lzBcImportBlock = importStateBlock;
+export function __setLzBcImportBlock(fn) { lzBcImportBlock = fn || importStateBlock; }
+/** 🆕「ロジザードに取り込む」の帳面の時計 (夜の止め・期限。試験は機械の口と同じ時計を渡す・ほかの画面の時計は変えない) */
+let bcClock = () => clock();
+export function __setLzBcClock(fn) { bcClock = fn || (() => clock()); }
 /**
  * 🆕 #1719 Codex R5 Medium: 同じ request_id の要求を 1 つずつ通す (待つ形の DB の鍵 = この接続の間・この要求の終わりで外す)。
  *   鍵を取った後で「保存済みか」を確かめる = 先の要求が commit する前に重なった再送も、待ってから保存済みの答えを返す (今の写しで 409 にしない)。
@@ -978,7 +988,7 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
   // 新規開始の門 (2 層目・広げる道 PR-2): DB の開放の許可 (lease)・非常の止め。見せ方だけ (登録は lib が取引の中で読み直す)
   const lease = await readScreenNewEntry(db, kind);
   res.render(view('new.ejs'), {
-    ...locals, nav: 'new', dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS,
+    ...locals, nav: 'new', dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS, COMPONENT_SEARCH_MIN,
     // 登録を開いているか = 段階 new_open・持ち主表 (DB の active) のハッシュが段階の記録と同じ・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company・
     //   開放の許可 (lease)・書き込み用の接続 (画面だけのロール)・backfill 済み (lib/master-register.mjs と同じ)
     entryClosed: !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || NEW_ENTRY_OWNER_KEYS[kind].some((k) => own[k] !== 'company') || !lease.open
@@ -1490,6 +1500,21 @@ router.get('/api/sku/:code/sales-chart', async (req, res) => {
   }
 });
 
+/**
+ * 🆕 2026-10-21 新商品の登録 (セット) の構成品の欄の候補 (読むだけ)。?q= → { ok, items, more, short, stock }。
+ *   探し方は Amazon SKU の構成の候補と同じ (amazon-read.mjs searchMapComponents)。出す物 = セットの構成品にできる単品だけ (forSet = 保存の確かめと同じ決まり)
+ */
+router.get('/api/new/components', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q : '';
+  if (q.length > COMPONENT_SEARCH_Q_MAX) return res.status(400).json({ ok: false, error: `長すぎます (${COMPONENT_SEARCH_Q_MAX} 文字まで)` });
+  if (/[\x00-\x1f\x7f]/.test(q)) return res.status(400).json({ ok: false, error: '使えない文字があります' });
+  return withPgApi(res, async (db) => {
+    const st = await readWarehouseStock({ now: clock() });
+    const out = await searchMapComponents(db, q, { stock: st && st.ok ? st : null, forSet: true });
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, ...out, stock: st && st.ok ? { as_of: st.asOf, stale: !!st.stale } : null });
+  });
+});
 router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
   const code = String(req.query.code || '').trim();
   if (!code || code.length > 60) return res.status(400).json({ ok: false, error: 'コードを入れてください' });
@@ -2238,10 +2263,24 @@ router.get('/lz-csv', (req, res) => withPgPage(req, res, async (db, dbError) => 
   const exports = db ? await lzNewExports(db) : [];
   const phase = await readPhaseView(db);
   const gate = approverGate(req);
+  const ig = lzImportGate(req);
+  // 🆕「ロジザードに取り込む」の様子 (帳面 = Render の SQLite。読めない = ボタンを出さず理由を出す)
+  let bc = null, bcError = null;
+  // ボタンができる前に作った CSV = ダウンロードの記録が無い = 押すときに「手で取り込んでいない」の確かめを求める (Codex R3 High)
+  const createdMs = new Map();
+  if (db && exports.length) {
+    try { for (const x of (await db.query('select export_id::text as id, (extract(epoch from created_at) * 1000)::float8 as ms from ops.lz_new_exports where export_id = any($1::bigint[])', [exports.map((e) => e.id)])).rows) createdMs.set(x.id, Number(x.ms)); } catch (e) { console.error(`[master-edit] CSV の作った時刻を読めない: ${e && e.message}`); }
+  }
+  try {
+    bc = BC.screenStatus(BC.getLzBcDb(), { now: bcClock(), exportIds: exports.map((e) => e.id) });
+    for (const e of exports) if (bc.byExport[e.id]) bc.byExport[e.id].legacy = BC.legacyExport(BC.getLzBcDb(), createdMs.get(e.id));
+  } catch (e) { console.error(`[master-edit] 取り込みの帳面を読めない: ${e && e.message}`); bcError = '取り込みの帳面 (Render の lz-bc-import.db) を読めません'; }
   res.render(view('lz-csv.ejs'), {
     ...pageLocals(req, phase), nav: 'lzcsv', ui2: true, dbError, cands, exports, canApprove: gate.ok, approveMessage: gate.message || '',
     mirror: { ok: mirror.ok, reason: mirror.reason, list_as_of: mirror.list_as_of, bc_as_of: mirror.bc_as_of, rows: mirror.rows, stale: mirror.ok && lzListStale(mirror, clock()) },
     HOLD_WORDS: LZ_HOLD_WORDS, KINDS: LZ_KIND_WORDS, FRESH_HOURS: LZ_LIST_FRESH_HOURS,
+    bc, bcError, canImport: ig.ok && !bcError, importMessage: ig.message || '', importBlock: bc ? lzBcImportBlock(bcClock()) : null,
+    BC_STATE_WORDS: BC.STATE_WORDS, BC_NIGHT_WORDS: BC.NIGHT_WORDS,
   });
 }));
 router.post('/api/lz-csv/build', (req, res) => {
@@ -2262,6 +2301,14 @@ router.get('/lz-csv/:id/file', (req, res) => {
     const f = await lzNewExportFile(db, req.params.id);
     if (!f) return res.status(404).json({ ok: false, error: 'ファイルがありません' });
     if (f.state !== 'issued') return res.status(409).json({ ok: false, error: '取り消したファイルは出しません (作り直してください)', reason: 'voided' });
+    // 🆕 ダウンロードした印 (手でロジザードに取り込んだかもしれない = ボタンで取り込むときに「手で取り込んでいない」の確かめを求める)。
+    //   残せない = ダウンロードも出さない (印の無いまま手の道とボタンの道で 2 回取り込まないように)
+    //   ボタンで積んだ・取り込んでいる CSV はダウンロードさせない (Codex R1 High)
+    try { BC.recordDownload(BC.getLzBcDb(), { exportId: f.id, by: String(req.session.email).trim().toLowerCase(), now: bcClock() }); } catch (e) {
+      if (e instanceof BC.BcImportError) return res.status(e.status).json({ ok: false, error: e.message, reason: e.code });
+      console.error(`[master-edit] ダウンロードの印を残せない: ${e && e.message}`);
+      return res.status(503).json({ ok: false, error: 'ダウンロードの記録を残せないので、いまは出せません (少し待ってからもう一度)', reason: 'bc_db_unavailable' });
+    }
     // Shift_JIS の byte 列のまま (express の send は文字の型に charset=utf-8 を足すことがある = node の setHeader と end で)
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
@@ -2274,11 +2321,100 @@ router.get('/lz-csv/:id/file', (req, res) => {
 router.post('/api/lz-csv/:id/void', (req, res) => {
   const gate = approverGate(req);
   if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_approver' });
+  // 🆕 ロジザードに取り込んでいる途中・取り込めたか分からない・取り込んだ CSV は取り消さない (同じ商品がまた CSV に出て 2 回登録になる)
+  //   確かめと「取り消しの途中」の印は 1 つの取引 (印のある間は 積む・渡す・押す を断る = Company DB の取り消しを待つ間に取り込みが始まらない。Codex R1 High)
+  const exportId = String(req.params.id);
+  const actor = String(req.session.email || '').trim().toLowerCase();
+  if (!/^[1-9]\d{0,17}$/.test(exportId)) return res.status(404).json({ ok: false, error: 'ファイルがありません' });
+  let holdToken;
+  try { holdToken = BC.reserveVoid(BC.getLzBcDb(), { exportId, by: actor, now: bcClock() }); } catch (e) {
+    if (e instanceof BC.BcImportError) return res.status(e.status).json({ ok: false, error: e.message, reason: e.code });
+    console.error(`[master-edit] 取り込みの帳面を読めない: ${e && e.message}`);
+    return res.status(503).json({ ok: false, error: '取り込みの帳面を読めないので、いまは取り消せません', reason: 'bc_db_unavailable' });
+  }
+  let voided = false;
   return withPgApi(res, async (db) => {
-    const r = await voidLzNewExport(db, { actor: String(req.session.email).trim().toLowerCase(), exportId: req.params.id, reason: (req.body || {}).reason });
+    const r = await voidLzNewExport(db, { actor, exportId, reason: (req.body || {}).reason });
+    voided = true;
     res.json({ ok: true, ...r });
+  }, 'write').finally(() => {
+    // 取り消せなかった = 印を外す (取り消せた = 残す。期限 2 分で切れる・その後は Company DB の取り消しで断る)
+    if (!voided) { try { BC.releaseVoid(BC.getLzBcDb(), exportId, holdToken); } catch (e) { console.error(`[master-edit] 取り消しの途中の印を外せない: ${e && e.message}`); } }
+  });
+});
+
+// ─── 🆕 2026-10-17「ロジザードに取り込む」(apps/lz-bc-import・miniPC の tools/logizard-automation/bc-import-runner.js が取りに来る) ───
+//   押せる = 名簿 (マスタの判断 MASTER_DECISION_APPROVERS = CSV を作る・ダウンロードできる人) **かつ** マスタの入力の名簿 (MASTER_EDITORS)。
+//   書く口は /api/ の守り (Origin が Host と同じ・JSON) を通る。帳面の決まり = apps/lz-bc-import/store.js
+//   GET  /api/lz-csv/import-status?ids=1,2   画面の読み直し (miniPC・動いている回・CSV ごとの様子)
+//   POST /api/lz-csv/:id/import              { request_id, text_sha256, with_export, rerun_reason?, confirm_not_manual? }
+//   POST /api/lz-csv/import/:job/cancel      待ち・押す前だけ
+//   POST /api/lz-csv/import/:job/resolve     { outcome: imported | not_imported, note } (取り込めたか分からない回)
+function lzImportGate(req) {
+  const a = approverGate(req);
+  if (!a.ok) return { ok: false, message: `ロジザードに取り込むのは、CSV を作れる名簿 (マスタの判断) の人だけです` };
+  const e = editorGate(req);
+  if (!e.ok) return { ok: false, message: `ロジザードに取り込むのは、マスタの入力の名簿 (MASTER_EDITORS) にも入っている人だけです` };
+  return { ok: true, message: null };
+}
+const bcErrorBody = (res, e) => {
+  if (e instanceof BC.BcImportError) return res.status(e.status).json({ ok: false, error: e.message, reason: e.code, ...e.extra });
+  console.error(`[master-edit] lz-bc-import: ${e && e.stack || e}`);
+  return res.status(500).json({ ok: false, error: 'サーバーエラーが発生しました (積んでいません)' });
+};
+router.get('/api/lz-csv/import-status', (req, res) => {
+  const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter((s) => /^[1-9]\d{0,17}$/.test(s)).slice(0, 60);
+  try {
+    const st = BC.screenStatus(BC.getLzBcDb(), { now: bcClock(), exportIds: ids });
+    res.json({ ok: true, ...st, block: lzBcImportBlock(bcClock()), can_import: lzImportGate(req).ok });
+  } catch (e) { bcErrorBody(res, e); }
+});
+router.post('/api/lz-csv/:id/import', (req, res) => {
+  const gate = lzImportGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_allowed' });
+  const b = req.body || {};
+  const rid = String(b.request_id ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rid)) return res.status(400).json({ ok: false, error: '押した番号 (request_id) の形が違う。画面を開き直してください', reason: 'invalid_input' });
+  if (!/^[0-9a-f]{64}$/.test(String(b.text_sha256 || ''))) return res.status(400).json({ ok: false, error: '画面で見たファイルの印 (text_sha256) が無い。画面を開き直してください', reason: 'invalid_input' });
+  if (b.rerun_reason != null && typeof b.rerun_reason !== 'string') return res.status(400).json({ ok: false, error: '理由は文字で', reason: 'invalid_input' });
+  return withPgApi(res, async (db) => {
+    // ファイルは Company DB の帳面のものだけ (画面から中身は受け取らない)。byte 列の sha256 を積む = miniPC に渡すときにもう一度照らす
+    const f = await lzNewExportFile(db, req.params.id);
+    if (!f) return res.status(404).json({ ok: false, error: 'ファイルがありません', reason: 'not_found' });
+    const meta = (await db.query('select row_count, (extract(epoch from created_at) * 1000)::float8 as created_ms from ops.lz_new_exports where export_id = $1', [f.id])).rows[0] || {};
+    const rows = meta.row_count;
+    try {
+      const r = BC.enqueue(BC.getLzBcDb(), {
+        requestId: rid, exportId: f.id, exportState: f.state, fileSha256: f.file_sha256, textSha256: f.text_sha256, seenTextSha256: String(b.text_sha256), rows: Number(rows), exportCreatedMs: Number(meta.created_ms),
+        withExport: b.with_export !== false, by: String(req.session.email).trim().toLowerCase(), rerunReason: b.rerun_reason ?? null, confirmNotManual: b.confirm_not_manual === true,
+        importBlock: lzBcImportBlock(bcClock()), now: bcClock(),
+      });
+      res.json({ ok: true, ...r });
+    } catch (e) { bcErrorBody(res, e); }
   }, 'write');
 });
+router.post('/api/lz-csv/import/:job/cancel', (req, res) => {
+  const gate = lzImportGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_allowed' });
+  if (!/^[1-9]\d{0,12}$/.test(String(req.params.job))) return res.status(404).json({ ok: false, error: 'その回はありません', reason: 'not_found' });
+  try { res.json(BC.cancelJob(BC.getLzBcDb(), { jobId: Number(req.params.job), by: String(req.session.email).trim().toLowerCase(), now: bcClock() })); } catch (e) { bcErrorBody(res, e); }
+});
+router.post('/api/lz-csv/import/:job/resolve', (req, res) => {
+  const gate = lzImportGate(req);
+  if (!gate.ok) return res.status(403).json({ ok: false, error: gate.message, reason: 'not_allowed' });
+  if (!/^[1-9]\d{0,12}$/.test(String(req.params.job))) return res.status(404).json({ ok: false, error: 'その回はありません', reason: 'not_found' });
+  const b = req.body || {};
+  try { res.json(BC.resolveJob(BC.getLzBcDb(), { jobId: Number(req.params.job), outcome: b.outcome, note: b.note, by: String(req.session.email).trim().toLowerCase(), now: bcClock() })); } catch (e) { bcErrorBody(res, e); }
+});
+/**
+ * 機械の口 (apps/lz-bc-import/runner-router.js) が miniPC に渡すファイル = Company DB の帳面 (この画面だけのロール)。server.js が渡す。
+ * @returns {Promise<null | { id, state, file_name, file_bytes, file_sha256, text_sha256 }>}  つながらない = 例外
+ */
+export async function lzExportFileForRunner(exportId) {
+  const c = await connect('write');
+  if (!c.client) throw new Error(c.error || 'Company DB につながらない');
+  try { return await lzNewExportFile(pgAdapter(c.client), String(exportId)); } finally { try { await c.client.end(); } catch { /* */ } }
+}
 
 // ─── NE 登録の CSV (⑤-2b) ───
 router.get('/reg-csv', (req, res) => withPgPage(req, res, async (db, dbError) => {

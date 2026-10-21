@@ -124,6 +124,8 @@ await ta('① 左の列の「下書き」→ セットとして登録する → 
   assert.deepEqual([await r1.locator('.c-code').inputValue(), await r1.locator('.c-qty').inputValue()], ['s001', '2']);
   await p.waitForFunction(() => /単品 1/.test(document.querySelector('#comp-rows .c-name').textContent), null, { timeout: 10000 });
   await p.waitForSelector('#code-msg.ok');
+  assert.equal(await p.isHidden('#comp-suggest'), true, '🆕 10/21: 下書きを入れた後に構成品の候補の箱 (探しています…) を残さない');
+  assert.deepEqual(await p.evaluate(() => [...document.querySelectorAll('#jump a[data-sec]')].slice(0, 2).map((a) => a.getAttribute('data-sec'))), ['sec-comp', 'sec-code'], '🆕 10/21: セットは 構成 → コードと名前');
   // 2 行目 (空の行) は外す
   const rows = await p.locator('#comp-rows tr.comp-row').count();
   if (rows > 1) await p.locator('#comp-rows tr.comp-row').nth(1).locator('button[data-act="del"]').click();

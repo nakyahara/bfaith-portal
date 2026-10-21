@@ -188,6 +188,32 @@ function requireStaffPlan(req) {
   return { ok: true, worker: w.worker, staffUntil: until };
 }
 
+/**
+ * ⭐棚入完了の職員の関門 (中原さん 2026-10-21「1 カードにつき 1 回ずつ PIN を入れないといけない」)。
+ * 計画の操作と同じく、職員モード中 (PIN を入れた本人) なら PIN なしで通す。
+ * そうでなければ PIN を受け、通ったらその端末を職員モードにする = 続けて棚入完了できる。
+ * PIN が空なら照合しない (職員モードが切れた直後の空送りを「PIN 間違い」と数えてロックしない)。
+ * ⚠送られてきた中身を確かめた後に呼ぶこと (requireStaffPlan と同じ — 400 なのに端末だけ開かない)
+ * @returns {{ok:true}} | {{ok:false, status, body}}
+ */
+function requireStaffStocking(req, worker) {
+  if (hasSessionAccess(req)) return { ok: true };
+  if (worker.worker_type !== 'staff') {
+    return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: '棚入完了にできるのは職員だけです (職員の名前を選び、PINを入れてください)' } };
+  }
+  if (staffModeFor(req, worker).staff) return { ok: true };
+  if (String(req.body?.pin ?? '').trim() === '') {
+    return { ok: false, status: 403, body: { ok: false, error: 'pin_required', message: '職員のPINを入れてください' } };
+  }
+  const pin = verifyWorkerPin(worker.id, req.body.pin);
+  if (!pin.ok) return { ok: false, status: STATUS_HTTP[pin.error] || 403, body: { ok: false, ...pin } };
+  if (req.iwDevice) {
+    startStaffUnlock(req.iwDevice.id, worker.id);
+    safeLog({ action: 'staff_unlock', workerId: worker.id, workerName: worker.display_name, deviceLabel: deviceLabelOf(req), to: 'on (棚入完了)', ok: true });
+  }
+  return { ok: true };
+}
+
 function hasSessionAccess(req) {
   if (!req.session?.authenticated || !req.session?.email) return false;
   const allowed = req.session.allowedApps;
@@ -723,6 +749,12 @@ function changeStatusApp(req, res, worker) {
     : transitionNeedsStaff(t.status, to);
   let isStaff = false;
   if (hasSessionAccess(req)) {
+    isStaff = true;
+  } else if (worker.worker_type === 'staff' && needsStaff && to === 'closed' && req.body?.close_reason === 'stocked'
+    && (perBatch ? target.work_status : t.status) === 'ready_for_stocking') {
+    // ⭐棚入待ち → 棚入完了 だけは職員モード中なら PIN なし (分けた行の ✅ — まとめての口と同じ関門)
+    const gate = requireStaffStocking(req, worker);
+    if (!gate.ok) return res.status(gate.status).json(gate.body);
     isStaff = true;
   } else if (worker.worker_type === 'staff' && needsStaff) {
     const pinCheck = verifyWorkerPin(worker.id, req.body?.pin);
@@ -1270,16 +1302,14 @@ function lastNotionImportAt() {
 /**
  * まとめて棚入完了 (アプリ正本のみ)。棚入待ちのカードだけを 終了 (棚入完了) にする。
  * 職員限定 (transitionNeedsStaff('ready_for_stocking','closed') と同じ扱い): ポータルのセッション、
- * または職員の作業者 + PIN。選んだ後に状態が変わっていた分は skipped で返す
+ * または職員の作業者 + (職員モード中 か PIN)。選んだ後に状態が変わっていた分は skipped で返す
  */
 router.post('/api/bulk-stocked', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  if (!hasSessionAccess(req)) {
-    if (w.worker.worker_type !== 'staff') return res.status(403).json({ ok: false, error: 'staff_required', message: '棚入完了にできるのは職員だけです (職員の名前を選び、PINを入れてください)' });
-    const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
-    if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
+  if (!hasSessionAccess(req) && w.worker.worker_type !== 'staff') {
+    return res.status(403).json({ ok: false, error: 'staff_required', message: '棚入完了にできるのは職員だけです (職員の名前を選び、PINを入れてください)' });
   }
   // 画面は「選んだときに見えていた版」を必ず添える。選んでから別の端末が変えていたら、その分は飛ばす
   // (単票の変更と同じ楽観ロック — Codex PR1 R7)
@@ -1295,12 +1325,15 @@ router.post('/api/bulk-stocked', checkOrigin, api((req, res) => {
     return res.status(400).json({ ok: false, error: 'bad_request',
       message: '画面が古いようです。一覧を更新してから選び直してください' });
   }
+  // 職員モード中なら PIN なし。PIN を受けたら端末を職員モードにする (次のカードから聞かない)
+  const gate = requireStaffStocking(req, w.worker);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
   const r = bulkCloseReady({
     taskIds: items, actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
-  if (!r.ok) return res.status(taskErrorStatus(r.error)).json(r);
-  res.json(r);
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, staff_mode: staffModeOf(req) });
+  res.json({ ...r, staff_mode: staffModeOf(req) });
 }));
 
 /** JST の日付 (YYYY-MM-DD) */

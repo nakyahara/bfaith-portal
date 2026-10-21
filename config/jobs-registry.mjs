@@ -1497,6 +1497,27 @@ export const JOBS_REGISTRY = [
       + '手順と戻し方 = db/company/README.md「毎晩の本番の切替と GAS への戻し」',
   },
   {
+    id: 'lz-bc-import-runner',
+    type: 'heartbeat',
+    importance: 'P3',
+    owner: 'Claude + 中原さん',
+    purpose: 'ポータルの「ロジザード登録の CSV」の「ロジザードに取り込む」ボタンの受け手 (2026-10-17 中原さん「ボタン押してその都度動かすものもほしい」)。'
+      + 'miniPC が 1 分おきにポータル (Render) に取りに来て、積まれた回があれば その CSV そのもの (Company DB の帳面のファイル・sha256 を確かめる) を '
+      + '① インポート [PM07/FM07_01] 商品マスタ / 新商品バーコード登録 で取り込み、② バーコード情報を書き出してバーコードマスタ.csv を上書きし、件数・エラー件数・ログを画面に返す。'
+      + '手順は auto-barcode.js と同じ (tools/logizard-automation/barcode-steps.js・夜の止め・取込はフェイルクローズ)。'
+      + '止まると画面のボタンが「miniPC が来ていない」で押せなくなる (予備 = ダウンロードして手で・Stream Deck・GAS で取り込める = 現場は止まらない) = P3',
+    where: 'miniPC TaskScheduler [Logizard-BcImport] (1 分おき) → C:\\tools\\logizard-automation\\run-bc-import-poll.bat → bc-import-runner.js '
+      + '(ポータル側 = apps/lz-bc-import・機械の口 /apps/lz-bc-import/api・帳面 DATA_DIR/lz-bc-import.db・画面 /apps/master-edit/lz-csv)',
+    schedule: '常駐の代わりに 1 分おきの定時 (積まれた回が無ければすぐ終わる・JST 23:50〜01:30 は取らない)。生存 ping は 1 時間に 1 回へ間引き',
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: 'C:\\tools\\logizard-automation\\logs\\bc-import.log (1 回ごとの行・ポータルに返したログと同じ) と logs\\bc-import-pending\\ (送れていない終わりの知らせ = 次の回が送る)。'
+      + '画面 /apps/master-edit/lz-csv の「③ ロジザードへの取り込み」に miniPC が最後に来た時刻・忙しい理由・回の結果とログが出る。'
+      + '来ていない = ① 定時 [Logizard-BcImport] が有効か ② C:\\tools\\logizard-automation\\.env に LZ_BC_RUNNER_TOKEN (Render の env と同じ値) があるか ③ node bc-import-runner.js を手で 1 回 (積まれていなければ何もしない) の出力。'
+      + '「取り込めたか分からない」(unknown) = ロジザードのインポート履歴で logizard_bc_upload.csv の取込を見て、画面でその回に「取り込んだ / 取り込んでいない」を記す (記すまでその CSV は取り込み直せない)。'
+      + '鍵 logizard-session.lock を毎晩の取込・在庫・値札と共用 (使われている間は取らない)。配り方 = node tools/logizard-automation/deploy.mjs --pc minipc --apply → --check (manifest の minipc)',
+  },
+  {
     id: 'lz-daily-cutover',
     type: 'human_obligation',
     importance: 'P3',

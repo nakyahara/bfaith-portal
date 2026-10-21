@@ -564,6 +564,11 @@ a.chip, a.chip:hover { text-decoration: none; }
 .comp .acts .iconbtn { margin-left: 4px; }
 .comp .c-name { color: var(--text2); font-size: 13.5px; }
 .comp .c-name.bad { color: var(--err); }
+/* 🆕 2026-10-21 新商品の登録 (セット): 構成品の名前の横の「コピー」「名前に使う」(小さく・押すと少しの間「コピーしました」)。スマホは main .btn の 44px */
+.comp .c-tools { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: 6px; vertical-align: middle; }
+.comp .c-tools[hidden] { display: none; }
+.comp .c-tool { height: 24px; padding: 0 8px; font-size: 12px; border-radius: 7px; }
+.comp .c-tool.done { color: var(--ok); border-color: rgba(46, 230, 168, 0.45); }
 .comp tr.qty td { background: rgba(255, 200, 87, 0.06); border-color: rgba(255, 200, 87, 0.35); }
 .comp tr.qty .mk { color: var(--warn); }
 .comp .stepper input { width: 56px; }
