@@ -54,6 +54,9 @@
  *  80〜82 商品の画面のタブ (10/19): 基本情報 / 販売数のグラフ / 入出庫の履歴・role と aria・開いたタブだけ読む (1 回)・#tab=… (読み込み直す・戻る・# を打つ)・
  *     ← → Home End・打った値と未保存はそのまま・Ctrl+S は基本情報で保存・前へ / 次へ・セットの構成品へのリンクも同じタブ・
  *     帯は上に残る (保存の箱と開いた板は帯の下)・基本情報に戻るとスクロールの位置も戻る・スマホ 390 で 44px・はみ出さない
+ *  84〜86 新商品の登録 (セット・10/21 中原さん): ① 構成 → ② コードと名前 の順 (飛び先の帯・番号・右の「あと N つ」・保存のボタンの一言・Tab の順。単品は今までどおり)・
+ *     構成品の名前の「コピー」(クリップボード・使えないときは execCommand)・「名前に使う」(名前が空・数が 2 以上 = 名前 N個セット)・
+ *     構成品の欄を名前で探す (本物の IME (CDP)・変換中は選ばない / 引き当てない・確定の Enter で数の欄へ移らない・↑↓ Enter Esc・単品だけ = セット / やめた / 要確認は出さない・名前の < > は字のまま)
  *  83 モールの商品ページへのリンク (10/20): 見出しの下の札 (楽天・Amazon・Yahoo!・Qoo10)・新しいタブ (noopener)・×N・組んだ出品は出さない・どのタブでも見える・
  *     出品が無い = 一言・スマホ 390 で 44px・はみ出さない
  * Playwright か Chromium が無い = 失敗 (exit 1)。飛ばすのは MASTER_EDIT_UI_SKIP=1 を付けたときだけ (#1589 Codex R2 M4 = 成功と見分けがつかないので黙って飛ばさない)
@@ -3675,6 +3678,196 @@ await ta('[83] モールの商品ページへのリンク (10/20): 見出しの�
   assert.equal(m.chips.length, 5);
   assert.ok(m.chips.every(([h, right]) => h >= 44 && right <= m.view), `札 ${JSON.stringify(m.chips)}`);
   if (process.env.MASTER_MALLS_SHOT) await p.screenshot({ path: process.env.MASTER_MALLS_SHOT });
+});
+
+await ta('[84] 新商品の登録 (セット・10/21 中原さん): ① 構成 → ② コードと名前 の順 (飛び先の帯・区切りの番号・右の「あと N つ」・保存のボタンの一言・Tab の順)。単品は今までどおり ① コードと名前', async (p) => {
+  const order = () => p.evaluate(() => ({
+    jump: [...document.querySelectorAll('#jump a[data-sec]')].map((a) => a.getAttribute('data-sec') + ':' + a.querySelector('.n').textContent.trim()),
+    dom: [...document.querySelectorAll('#f section.panel[id], #f details.panel[id]')].map((s) => s.id),
+    steps: [...document.querySelectorAll('#f .stepno[data-step]')].map((s) => s.getAttribute('data-step') + ':' + s.textContent.trim()),
+    need: [...document.querySelectorAll('#checklist li.need .lbl')].map((x) => x.textContent),
+  }));
+  await p.goto(B + '/new?kind=set');
+  let o = await order();
+  assert.deepEqual(o.jump.slice(0, 3), ['sec-comp:1', 'sec-code:2', 'sec-money:3'], '飛び先の帯 = 構成が 1');
+  assert.deepEqual(o.dom.slice(0, 3), ['sec-comp', 'sec-code', 'sec-money'], '画面の並び = 構成が上');
+  assert.deepEqual(o.steps.slice(0, 2), ['sec-comp:1', 'sec-code:2'], '区切りの番号');
+  assert.deepEqual(o.need.slice(0, 3), ['構成 (1 品以上)', '商品コード', '名前'], '右の「あと N つ」も構成が先');
+  assert.match(await p.textContent('#save'), /あと \d+ つ: 構成 \(1 品以上\)/, '保存のボタンの一言 = いちばん上の残り');
+  // Tab の順: 種類の札の次は構成の 1 行目の欄 (コードと名前より先)
+  await p.focus('a.kindcard[href="?kind=set"]');
+  await p.keyboard.press('Tab');
+  assert.equal(await active(p), '1 行目の構成品のコード', 'Tab = 構成の欄が先');
+  // 右の残りを押す = その欄へ (構成 → コード の順で埋まる)
+  await p.click('#checklist li.need button');
+  assert.equal(await active(p), '1 行目の構成品のコード');
+  const rows = p.locator('#comp-rows tr.comp-row');
+  await rows.nth(0).locator('.c-code').fill('s001');
+  await rows.nth(0).locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /単品 1/.test(document.querySelector('#comp-rows .c-name').textContent));
+  o = await order();
+  assert.deepEqual(o.need.slice(0, 2), ['商品コード', '名前'], '構成を入れたら次はコードと名前');
+  await p.click('#checklist li.need button');
+  assert.equal(await active(p), 'code');
+  // 単品は今までどおり (コードと名前が 1)
+  await p.goto(B + '/new?kind=single');
+  o = await order();
+  assert.deepEqual(o.jump.slice(0, 2), ['sec-code:1', 'sec-money:2']);
+  assert.equal(o.dom[0], 'sec-code');
+  assert.deepEqual(o.need.slice(0, 2), ['商品コード', '名前']);
+  assert.equal(await p.locator('#comp-suggest').count(), 0, '単品の画面に構成の候補の箱は無い');
+});
+
+await ta('[85] 新商品の登録 (セット・10/21 中原さん): 構成品の名前の「コピー」(クリップボード・使えないときは execCommand の写し)・「名前に使う」(名前が空・数が 2 以上 = 名前 N個セット・名前があれば押せない)', async (p) => {
+  await p.goto(B + '/new?kind=set');
+  await p.evaluate(() => {
+    window.__copied = [];
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: (t) => { window.__copied.push(t); return Promise.resolve(); } } });
+  });
+  const row = p.locator('#comp-rows tr.comp-row').first();
+  assert.equal(await row.locator('.c-tools').isHidden(), true, '引き当てる前は出さない');
+  await row.locator('.c-code').fill('k001');
+  await row.locator('.c-code').press('Tab');
+  await p.waitForFunction(() => /国産 はちみつ 500g/.test(document.querySelector('#comp-rows .c-name').textContent));
+  assert.equal(await row.locator('.c-tools').isHidden(), false, '名前が出たら出す');
+  assert.equal(await row.locator('[data-act="copy-name"]').getAttribute('aria-label'), '1 行目 (k001) の名前をコピー');
+  await row.locator('[data-act="copy-name"]').click();
+  await p.waitForFunction(() => window.__copied.length === 1);
+  assert.deepEqual(await p.evaluate(() => window.__copied), ['国産 はちみつ 500g'], '名前だけ (コード・印は付けない)');
+  assert.equal((await row.locator('[data-act="copy-name"]').textContent()).trim(), 'コピーしました');
+  await p.waitForFunction(() => document.querySelector('#comp-rows [data-act="copy-name"]').textContent.trim() === 'コピー', null, { timeout: 4000 });
+  assert.equal(await dirty(p), 1, 'コピーは未保存に数えない (構成の 1 件だけ)');
+  // クリップボードが使えない = 隠した欄から execCommand('copy')
+  await p.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    window.__exec = [];
+    document.execCommand = (cmd) => { const ta = document.querySelector('textarea[readonly]'); window.__exec.push([cmd, ta && ta.value]); return true; };
+  });
+  await row.locator('[data-act="copy-name"]').click();
+  await p.waitForFunction(() => window.__exec.length === 1);
+  assert.deepEqual(await p.evaluate(() => window.__exec), [['copy', '国産 はちみつ 500g']]);
+  assert.equal((await row.locator('[data-act="copy-name"]').textContent()).trim(), 'コピーしました');
+  // クリップボードの API が断った (許可がない) = 隠した欄から写す (Codex R1 Medium)
+  await p.evaluate(() => { window.__exec = []; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => Promise.reject(new Error('NotAllowedError')) } }); });
+  await row.locator('[data-act="copy-name"]').click();
+  await p.waitForFunction(() => window.__exec.length === 1);
+  assert.deepEqual(await p.evaluate(() => window.__exec), [['copy', '国産 はちみつ 500g']], '断られたら execCommand で');
+  // 名前に使う: 数が 1 = 押せない → 3 = 押せる → 名前 3個セット (半角の空白 1 つ) → 名前があるので押せない
+  const use = row.locator('[data-act="use-name"]');
+  assert.equal(await use.isDisabled(), true, '数が 1 = 押せない');
+  assert.match(await use.getAttribute('title'), /数が 2〜99/);
+  await row.locator('.c-qty').fill('3');
+  assert.equal(await use.isDisabled(), false);
+  await use.click();
+  assert.equal(await p.inputValue('#f-name'), '国産 はちみつ 500g 3個セット');
+  assert.equal(await dirty(p), 2, '名前を入れた = 未保存に数える');
+  assert.equal(await use.isDisabled(), true, '名前がある = 押せない (上書きしない)');
+  assert.match(await use.getAttribute('title'), /名前が空のときだけ/);
+  await p.fill('#f-name', '');
+  assert.equal(await use.isDisabled(), false, '名前を空にすると押せる');
+  // 打ち直す = 引き当てるまで出さない
+  await row.locator('.c-code').fill('k00');
+  assert.equal(await row.locator('.c-tools').isHidden(), true, '打ち直した = 前の名前のボタンを出さない');
+});
+
+await ta('[86] 新商品の登録 (セット・10/21 中原さん): 構成品の欄を名前で探す = 本物の IME (CDP)・変換中から候補・変換中は引き当てない (「見つかりません」を出さない)・確定の Enter で数の欄へ移らない・↓ Enter で選ぶ = コードが入って引き当てる・Esc・単品だけ (セット・やめた・要確認は出さない)・名前の < > は字のまま', async (p) => {
+  const keep3 = await regUi('k003'), keep6 = await regUi('k006');
+  await setRegUi('k003', 'cancelled');
+  await setRegUi('k006', 'quarantined');
+  const name5 = (await pg.query("select name from core.skus where code = 'k005'")).rows[0].name;
+  await pg.query("update core.skus set name = $1 where code = 'k005'", ['abc 小袋 <img src=x onerror="window.__xss=1">']);
+  try {
+    await p.goto(B + '/new?kind=set');
+    const row = p.locator('#comp-rows tr.comp-row').first();
+    const inp = row.locator('.c-code');
+    assert.equal(await inp.getAttribute('role'), 'combobox');
+    const lookups = [];
+    p.on('request', (rq) => { if (/\/api\/lookup\?/.test(rq.url())) lookups.push(decodeURIComponent(new URL(rq.url()).searchParams.get('code'))); });
+    const cdp = await p.context().newCDPSession(p);
+    const key = (type, k, vk) => cdp.send('Input.dispatchKeyEvent', { type, key: k, code: k === 'Enter' ? 'Enter' : 'KeyA', windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+    const compose = async (steps) => { for (const s of steps) { await key('rawKeyDown', 'Process', 229); await cdp.send('Input.imeSetComposition', { text: s, selectionStart: s.length, selectionEnd: s.length }); await key('keyUp', 'a', 65); } };
+    await inp.focus();
+    await compose(['は', 'はち', 'はちみ', 'はちみつ']);
+    await sugOpen(p);
+    assert.deepEqual(await sugCodes(p), ['k001', 'k002'], '変換中から候補・単品だけ (やめた k003 は出さない)');
+    assert.equal(await p.textContent('#comp-rows .c-name'), '', '変換中は引き当てない');
+    // 変換中に候補をマウスで押しても選ばない (確定した字が後から欄を書き換える = Codex R1 Medium)
+    await p.click('#comp-suggest .co[data-i="0"]');
+    assert.notEqual(await inp.inputValue(), 'k001', '変換中は選ばない');
+    assert.equal(await active(p), '1 行目の構成品のコード', '数の欄へ移らない');
+    assert.deepEqual(lookups, [], '引き当ても聞かない');
+    // 確定の Enter (Windows の Chrome・Edge = 確定の後に keyCode 13) = 箱も欄もそのまま
+    await cdp.send('Input.insertText', { text: 'はちみつ' });
+    await key('rawKeyDown', 'Enter', 13);
+    await key('keyUp', 'Enter', 13);
+    await p.waitForTimeout(700);
+    assert.equal(await active(p), '1 行目の構成品のコード', '確定の Enter で数の欄へ移らない');
+    assert.equal(await inp.inputValue(), 'はちみつ');
+    assert.equal(await p.textContent('#comp-rows .c-name'), '', '名前を打っている間は「見つかりません」を出さない');
+    assert.deepEqual(lookups, [], '名前では引き当てを聞かない');
+    await sugOpen(p);
+    // ↓ Enter で選ぶ = コードが入る・すぐ引き当てる・数の欄へ
+    await inp.press('ArrowDown');
+    assert.equal(await selCode(p), 'k001');
+    await inp.press('Enter');
+    assert.equal(await inp.inputValue(), 'k001');
+    assert.equal(await p.isHidden('#comp-suggest'), true);
+    assert.equal(await active(p), '1 行目 (k001) の数', '選ぶと数の欄へ');
+    await p.waitForFunction(() => /国産 はちみつ 500g/.test(document.querySelector('#comp-rows .c-name').textContent));
+    assert.deepEqual(lookups, ['k001']);
+    // 2 行目: 1 行目にある品は灰色 (同じ品は 1 行)・Esc で閉じる
+    const inp2 = p.locator('#comp-rows tr.comp-row').nth(1).locator('.c-code');
+    await inp2.focus();
+    await compose(['はちみつ']);
+    await cdp.send('Input.insertText', { text: 'はちみつ' });
+    await sugOpen(p);
+    assert.deepEqual(await sugCodes(p), ['×k001', 'k002'], '1 行目にある品は選べない');
+    await inp2.press('Escape');
+    assert.equal(await p.isHidden('#comp-suggest'), true, 'Esc で閉じる');
+    // セット・要確認は出さない (名前・コードで当たっても)
+    const sugNone = () => p.waitForFunction(() => { const s = document.getElementById('comp-suggest'); return s && !s.hidden && /はありません/.test(s.textContent); });
+    const setName = (await pg.query("select name from core.skus where code = 'set001'")).rows[0].name;   // 前の試験で名前が変わる
+    await inp2.fill(setName);
+    await p.waitForFunction(() => { const s = document.getElementById('comp-suggest'); return s && !s.hidden && !s.classList.contains('stale') && (s.querySelector('.co') || /はありません/.test(s.textContent)); });
+    assert.ok(!(await sugCodes(p)).includes('set001'), 'セット (set001) は名前でも出さない');
+    await inp2.fill('みかん');
+    await sugNone();
+    assert.deepEqual(await sugCodes(p), [], '要確認 (k006) は出さない');
+    assert.match(await p.textContent('#comp-suggest'), /構成品にできる単品はありません/);
+    await inp2.fill('set001');
+    await sugNone();
+    assert.deepEqual(await sugCodes(p), [], 'セットのコードをぴったり打っても候補に出さない');
+    await inp2.press('Tab');
+    await p.waitForFunction(() => /単品でない/.test(document.querySelectorAll('#comp-rows .c-name')[1].textContent), null, { timeout: 5000 });
+    // 名前の < > は字のまま (候補の箱・構成品の名前・コピー)
+    await inp2.fill('abc');
+    await sugOpen(p);
+    assert.equal(await p.locator('#comp-suggest img').count(), 0, '候補の名前の HTML は効かない');
+    assert.match(await p.textContent('#comp-suggest'), /<img src=x onerror="window.__xss=1">/);
+    while ((await selCode(p)) !== 'k005') await inp2.press('ArrowDown');
+    await inp2.press('Enter');
+    await p.waitForFunction(() => /<img/.test(document.querySelectorAll('#comp-rows .c-name')[1].textContent));
+    assert.equal(await p.locator('#comp-rows img').count(), 0);
+    assert.equal(await p.evaluate(() => window.__xss), undefined);
+    // タップでも選べる (スマホ = 押す所は 44px)
+    await p.setViewportSize({ width: 390, height: 844 });
+    await p.click('#comp-add');
+    const inp3 = p.locator('#comp-rows tr.comp-row').nth(2).locator('.c-code');
+    await inp3.fill('レモン');
+    await sugOpen(p);
+    const h = await p.evaluate(() => Math.round(document.querySelector('#comp-suggest .co').getBoundingClientRect().height));
+    assert.ok(h >= 44, '候補の行は 44px ' + h);
+    await p.click('#comp-suggest .co[data-i="0"]');
+    assert.equal(await inp3.inputValue(), 'k002');
+    await p.waitForFunction(() => /ハチミツ レモン/.test(document.querySelectorAll('#comp-rows .c-name')[2].textContent));
+    const m = await p.evaluate(() => ({ doc: document.documentElement.scrollWidth, view: innerWidth, tools: [...document.querySelectorAll('#comp-rows .c-tools:not([hidden]) button')].map((b) => Math.round(b.getBoundingClientRect().height)) }));
+    assert.ok(m.doc <= m.view, `横にはみ出す ${m.doc} > ${m.view}`);
+    assert.ok(m.tools.length >= 2 && m.tools.every((x) => x >= 44), 'コピー・名前に使う は 44px ' + JSON.stringify(m.tools));
+  } finally {
+    await setRegUi('k003', keep3);
+    await setRegUi('k006', keep6);
+    await pg.query("update core.skus set name = $1 where code = 'k005'", [name5]);
+  }
 });
 
 await browser.close();

@@ -1513,6 +1513,46 @@ await ta('[14] 使えない商品 = 候補に出すが usable false と理由・
   assert.deepEqual(await compsOfListing('pick_from_search'), [['a003', 1, 0, 'manual'], ['a004', 1, 1, 'manual']]);
 });
 
+await ta('[14] 🆕 新商品の登録 (セット) の構成品の候補 (10/21・GET /api/new/components): 探し方は同じ・単品だけ (セット・例外は出さない)・やめた / 要確認は出さない (ぴったりでも)・全部 usable・長すぎ / 制御文字 = 400・名簿の外の人も見られる・何も書かない', async () => {
+  const keep2 = await regOf('a002'), keep6 = await regOf('a006');
+  const before = await snapshot(db);
+  try {
+    let r = await call('GET', '/api/new/components?q=a00');
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(codesOf(r.j), ['a001', 'a002', 'a003', 'a004', 'a005', 'a006', 'a007', 'a008'], '例外の a00x は出さない');
+    assert.ok(r.j.items.every((x) => x.kind === 'single' && x.usable === true && x.why === null), '出す物は全部 構成品にできる単品');
+    r = await call('GET', '/api/new/components?q=aset1');
+    assert.deepEqual(codesOf(r.j), [], 'セットはぴったりでも出さない (入れ子は不可)');
+    r = await call('GET', '/api/new/components?q=' + encodeURIComponent('せっと'));
+    assert.deepEqual(codesOf(r.j), [], 'セットは名前でも出さない');
+    r = await call('GET', '/api/new/components?q=a00x');
+    assert.deepEqual(codesOf(r.j), [], '例外の SKU はぴったりでも出さない');
+    r = await call('GET', '/api/new/components?q=' + encodeURIComponent('単品 FBM'));
+    assert.deepEqual(codesOf(r.j), ['a003', 'a004'], '名前の言葉 (Amazon の候補と同じ探し方)');
+    // やめた (cancelled)・要確認 (quarantined) = 保存の確かめ (lib/master-register.mjs resolveNewComponents) が断る = 出さない (ぴったりでも)
+    await setReg('a002', 'quarantined');
+    await setReg('a006', 'cancelled');
+    r = await call('GET', '/api/new/components?q=a00');
+    assert.deepEqual(codesOf(r.j), ['a001', 'a003', 'a004', 'a005', 'a007', 'a008']);
+    for (const c of ['a002', 'A006']) assert.deepEqual(codesOf((await call('GET', '/api/new/components?q=' + c)).j), [], c + ': ぴったりでも出さない');
+    // 下書き・NE 登録待ちの単品は使える (新しい単品と一緒にセットを作る)
+    await setReg('a002', 'draft');
+    r = await call('GET', '/api/new/components?q=a002');
+    assert.deepEqual([codesOf(r.j), r.j.items[0].not_in_ne], [['a002'], true]);
+    // Amazon の候補は今までどおり (要確認も出す・例外は灰色)
+    r = await call('GET', '/api/amazon/components?q=a00x');
+    assert.deepEqual([codesOf(r.j), r.j.items[0].usable], [['a00x'], false]);
+    // 入口の守り・見られる人
+    assert.equal((await call('GET', '/api/new/components?q=' + 'x'.repeat(61))).status, 400);
+    assert.equal((await call('GET', '/api/new/components?q=' + encodeURIComponent(`a0${String.fromCharCode(9)}`))).status, 400);
+    r = await call('GET', '/api/new/components?q=a');
+    assert.deepEqual([r.status, r.j.items, r.j.short], [200, [], true], '2 文字から');
+    assert.equal((await call('GET', '/api/new/components?q=a00', { session: 'viewer' })).status, 200, '読むだけ = 名簿の外の人も');
+  } finally { await setReg('a002', keep2); await setReg('a006', keep6); }
+  assert.deepEqual(await snapshot(db), before, '何も書かない');
+});
+
 await ta('[14] コードは保存と同じ正規化だけ (#1689 Codex R1 M2): ﾊﾁ-01 と ハチ-01 は別の商品 = 探すとそれぞれ自分だけ・名前は NFKC (かな) で両方・2 つとも構成に入れて保存できる / 画面の JS のコードの比べ方 = normSku と同じ', async () => {
   const n = (await q("select core.norm_code('ﾊﾁ-01') as h, core.norm_code('ハチ-01') as z"))[0];
   assert.notEqual(n.h, n.z, '前提: DB は半角カナと全角カナを別にする');

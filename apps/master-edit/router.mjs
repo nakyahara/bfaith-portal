@@ -17,6 +17,7 @@
  *   GET  /sku/:code          1 つの商品 (単品 = 画面 B / セット = 画面 C)
  *   GET  /sku/:code/history  変更の記録
  *   GET  /api/lookup?code=   構成品の引き当て
+ *   GET  /api/new/components?q=  🆕 2026-10-21 新商品の登録 (セット) の構成品の欄の候補 (読むだけ・コード / 名前の言葉 / JAN・単品だけ・やめた / 要確認は出さない)
  *   POST /api/sku/:code      保存 { request_id, reason?, seen: { token (編集の印), event_id? }, values: {...} }
  *   GET  /new?kind=single|set|variation 新商品の登録 (画面 D・⑤-2a)。variation = 色違い・サイズ違いのまとまり (CompanyDB構想/20 §④・PR-7)。
  *        「まとまり」の札と画面は、DB の active の products.parent が company のときだけ出す (今は load = 出さない = 「切替の前」の帯)
@@ -978,7 +979,7 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
   // 新規開始の門 (2 層目・広げる道 PR-2): DB の開放の許可 (lease)・非常の止め。見せ方だけ (登録は lib が取引の中で読み直す)
   const lease = await readScreenNewEntry(db, kind);
   res.render(view('new.ejs'), {
-    ...locals, nav: 'new', dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS,
+    ...locals, nav: 'new', dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS, COMPONENT_SEARCH_MIN,
     // 登録を開いているか = 段階 new_open・持ち主表 (DB の active) のハッシュが段階の記録と同じ・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company・
     //   開放の許可 (lease)・書き込み用の接続 (画面だけのロール)・backfill 済み (lib/master-register.mjs と同じ)
     entryClosed: !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || NEW_ENTRY_OWNER_KEYS[kind].some((k) => own[k] !== 'company') || !lease.open
@@ -1490,6 +1491,21 @@ router.get('/api/sku/:code/sales-chart', async (req, res) => {
   }
 });
 
+/**
+ * 🆕 2026-10-21 新商品の登録 (セット) の構成品の欄の候補 (読むだけ)。?q= → { ok, items, more, short, stock }。
+ *   探し方は Amazon SKU の構成の候補と同じ (amazon-read.mjs searchMapComponents)。出す物 = セットの構成品にできる単品だけ (forSet = 保存の確かめと同じ決まり)
+ */
+router.get('/api/new/components', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q : '';
+  if (q.length > COMPONENT_SEARCH_Q_MAX) return res.status(400).json({ ok: false, error: `長すぎます (${COMPONENT_SEARCH_Q_MAX} 文字まで)` });
+  if (/[\x00-\x1f\x7f]/.test(q)) return res.status(400).json({ ok: false, error: '使えない文字があります' });
+  return withPgApi(res, async (db) => {
+    const st = await readWarehouseStock({ now: clock() });
+    const out = await searchMapComponents(db, q, { stock: st && st.ok ? st : null, forSet: true });
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, ...out, stock: st && st.ok ? { as_of: st.asOf, stale: !!st.stale } : null });
+  });
+});
 router.get('/api/lookup', (req, res) => withPgApi(res, async (db) => {
   const code = String(req.query.code || '').trim();
   if (!code || code.length > 60) return res.status(400).json({ ok: false, error: 'コードを入れてください' });

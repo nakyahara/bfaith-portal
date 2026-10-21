@@ -6,7 +6,8 @@
  *   - ぴったりのコードが一番上で使えるときだけ、はじめから選んだ状態。欄の値が変わった後の古い候補は選べない (#1689 Codex R1 M1)
  *   - 日本語入力の確定の Enter (#1724・10/16): compositionend の後、次のキーを離すまでの 1 秒以内の Enter は確定の Enter と見て、箱も欄もそのまま
  *     (Windows の Chrome・Edge は確定の Enter の keydown が compositionend の後に keyCode 13・isComposing なしで来る)
- *   使い方: MasterEdit.compSuggest({ root, listbox, say, base, min, usedAt(input, code) → 行番号 (0 = 無い), onChoose(input, item) })
+ *   使い方: MasterEdit.compSuggest({ root, listbox, say, base, min, usedAt(input, code) → 行番号 (0 = 無い), onChoose(input, item), path, noneText })
+ *     🆕 2026-10-21 path = 聞く API (既定 = /api/amazon/components・新商品の登録のセット = /api/new/components)・noneText = 当たる物が無いときの一言の「何が」(既定 = NE の商品)
  *     root = 欄 (.c-code) を含む要素 (行が足されても効く = 委ねる)・listbox = 候補の箱 (root の外でよい。親を基準に置く)
  *   🚨 me-amazon.js は前からの同じ動きを持ったまま (この部品に置き換えるのは別の PR)
  */
@@ -43,6 +44,7 @@
   ME.compSuggest = function (o) {
     var root = o.root, sug = o.listbox, say = o.say || null, BASE = o.base || '', MIN = o.min || 2;
     var idp = o.idPrefix || 'csx-opt-';
+    var PATH = o.path || '/api/amazon/components', NONE = o.noneText || 'NE の商品';
     var S = { input: null, items: [], sel: -1, seq: 0, timer: 0, ctl: null, q: '', forQ: null };
     function placeSug() {
       if (sug.hidden || !S.input) return;
@@ -83,7 +85,7 @@
         return { it: it, off: !it.usable || at > 0, why: !it.usable ? it.why : at ? 'この構成の ' + at + ' 行目にもうあります (同じ品は 1 行にして数で)' : '' };
       });
       if (!S.items.length) {
-        showSug('<div class="cs-empty">「' + esc(S.q) + '」に当たる NE の商品はありません。コードの一部・名前の言葉 (空白で区切ると全部を含む)・JAN で探せます</div>');
+        showSug('<div class="cs-empty">「' + esc(S.q) + '」に当たる ' + esc(NONE) + 'はありません。コードの一部・名前の言葉 (空白で区切ると全部を含む)・JAN で探せます</div>');
         if (say) say.textContent = '候補はありません';
         S.sel = -1; return;
       }
@@ -112,7 +114,7 @@
       var ctl = window.AbortController ? new AbortController() : null;
       if (S.ctl) { try { S.ctl.abort(); } catch (e) { /* 前の問い合わせ */ } }
       S.ctl = ctl;
-      fetch(BASE + '/api/amazon/components?q=' + encodeURIComponent(q), { headers: { Accept: 'application/json' }, signal: ctl ? ctl.signal : undefined })
+      fetch(BASE + PATH + '?q=' + encodeURIComponent(q), { headers: { Accept: 'application/json' }, signal: ctl ? ctl.signal : undefined })
         .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { r: r, j: j }; }); })
         .then(function (x) {
           if (my !== S.seq || S.input !== inp || inp.value.trim() !== q || document.activeElement !== inp) return;
@@ -146,6 +148,8 @@
       var x = S.items[i], inp = S.input;
       if (!x || !inp) return;
       if (S.forQ == null || inp.value.trim() !== S.forQ) return;   // 古い候補は入れない
+      // 🆕 2026-10-21 (Codex R1 Medium): 日本語入力の変換中は選ばない (マウス・タップで選んでも、確定した字が後から欄の値を書き換える)
+      if (composing === inp) { if (say) say.textContent = '変換を確定してから選んでください'; if (ME.toast) ME.toast('変換を確定してから選んでください'); return; }
       if (x.off) { if (ME.toast) ME.toast('使えません: ' + x.why); return; }
       closeSug();
       inp.value = x.it.code;
@@ -163,15 +167,17 @@
       }
     }
     var isCode = function (el) { return el && el.classList && el.classList.contains('c-code'); };
-    var imeEnd = null, imeEndAt = 0;
+    var imeEnd = null, imeEndAt = 0, composing = null;
     root.addEventListener('input', function (e) { if (isCode(e.target)) queueSug(e.target); });
+    root.addEventListener('compositionstart', function (e) { if (isCode(e.target)) composing = e.target; });
     root.addEventListener('compositionend', function (e) {
+      if (composing === e.target) composing = null;
       if (!isCode(e.target)) return;
       imeEnd = e.target; imeEndAt = e.timeStamp;
       if (S.input !== e.target || e.target.value.trim() !== S.q) queueSug(e.target);
     });
     root.addEventListener('keyup', function () { imeEnd = null; });
-    root.addEventListener('focusout', function (e) { imeEnd = null; if (e.target === S.input) closeSug(); });
+    root.addEventListener('focusout', function (e) { imeEnd = null; if (composing === e.target) composing = null; if (e.target === S.input) closeSug(); });
     /** 欄のキー。true = 候補の箱が使った (呼び手は今までの Enter の動きをしない) */
     function onKey(e) {
       var confirmed = imeEnd === e.target && e.timeStamp - imeEndAt < 1000; imeEnd = null;
