@@ -40,7 +40,7 @@ const dailyCsv = (ids) => sj(['形式/型番,商品名,ふりがな,仕入単価
 // 前の日 (2030-01-15) の朝の lz-daily を置いた DATA_DIR。今 = 2030-01-16 00:20 JST
 const NOW = new Date('2030-01-15T15:20:00Z');
 const AS_OF = '2030-01-15', RUN_DIR = 'lzd_20300115T001500000Z_abcdef';
-function setup({ ids = ['A-1', 'B-2'], state = 'complete', verdict = 'pass', syncRun = true, deadline = '2030-01-16T01:00:00+09:00', csvBuf = null, rowsOverride = null, shaOverride = null, csvPath = null } = {}) {
+function setup({ ids = ['A-1', 'B-2'], state = 'complete', verdict = 'pass', syncRun = true, deadline = '2030-01-16T01:00:00+09:00', csvBuf = null, rowsOverride = null, shaOverride = null, csvPath = null, evExtra = {} } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-'));
   const buf = csvBuf || dailyCsv(ids);
   const rel = csvPath || `lz-daily/${AS_OF}/${RUN_DIR}/cdb_logizard_shohinmaster_upload.csv`;
@@ -48,7 +48,7 @@ function setup({ ids = ['A-1', 'B-2'], state = 'complete', verdict = 'pass', syn
   fs.writeFileSync(path.join(dataDir, rel), buf);
   const prev = process.env.DAILY_SYNC_RUN_ID;
   if (!syncRun) delete process.env.DAILY_SYNC_RUN_ID;
-  writeEvidence(dataDir, 'lz-daily', { state, version: 'lzd-v3', portal: { ok: true, stored: true }, as_of: AS_OF, run_id: RUN_DIR, verdict, deadline, csv: { path: rel, sha256: shaOverride || sha(buf), rows: rowsOverride ?? ids.length } }, { now: new Date('2030-01-15T00:20:00Z'), warn: () => {} });
+  writeEvidence(dataDir, 'lz-daily', { state, version: 'lzd-v3', portal: { ok: true, stored: true }, as_of: AS_OF, run_id: RUN_DIR, verdict, deadline, csv: { path: rel, sha256: shaOverride || sha(buf), rows: rowsOverride ?? ids.length }, ...evExtra }, { now: new Date('2030-01-15T00:20:00Z'), warn: () => {} });
   process.env.DAILY_SYNC_RUN_ID = prev;
   return { dataDir, csvFull: path.join(dataDir, rel) };
 }
@@ -100,10 +100,69 @@ await ta('[2] 対象: 前の日の正式な証跡だけ (無い・手の回・ru
 
 await ta('[3] 取り込む前の確かめ: CSV の全部の商品が直前の書き出しにあり・削除されていない', async () => {
   const lz = D.readLzShohinMaster(lzCsv([{ id: 'A-1' }, { id: 'B-2', del: '1' }]), { minRows: 1 });
-  assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['A-1']), lz }), { ok: true, rows: 1, missing: [], deleted: [] });
-  assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['A-1', 'B-2', 'C-3']), lz }), { ok: false, rows: 3, missing: ['C-3'], deleted: ['B-2'] });
+  assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['A-1']), lz }), { ok: true, rows: 1, missing: [], deleted: [], case_variants: [] });
+  assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['A-1', 'B-2', 'C-3']), lz }), { ok: false, rows: 3, missing: ['C-3'], deleted: ['B-2'], case_variants: [] });
   assert.equal(P.precheck({ csvBuf: dailyCsv([]), lz }).ok, false);
   assert.equal(P.precheck({ csvBuf: dailyCsv(['a-1']), lz }).ok, false);   // 大文字小文字だけ違う = 無い
+  // 🆕 直前の書き出しに大文字小文字だけ違う別の ID がある (朝の後にロジザードで登録された) = 別の商品を書き換えるおそれ = 押さない
+  const lz2 = D.readLzShohinMaster(lzCsv([{ id: 'A-1' }, { id: 'U60E-05' }, { id: 'u60e-05' }]), { minRows: 1 });
+  assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['A-1', 'U60E-05']), lz: lz2 }), { ok: false, rows: 2, missing: [], deleted: [], case_variants: ['U60E-05'] });
+  assert.equal(P.precheck({ csvBuf: dailyCsv(['A-1']), lz: lz2 }).ok, true);
+  // 🆕 別の書き方の方が無効 (削除フラグ 1) = 数えない (2026-10-21 中原さん) / CSV の商品そのものが無効 = 今までどおり押さない (deleted)
+  const lz3 = D.readLzShohinMaster(lzCsv([{ id: 'A-1' }, { id: 'U60E-05' }, { id: 'u60e-05', del: '1' }]), { minRows: 1 });
+  assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['A-1', 'U60E-05']), lz: lz3 }), { ok: true, rows: 2, missing: [], deleted: [], case_variants: [] });
+  assert.deepEqual(P.precheck({ csvBuf: dailyCsv(['u60e-05']), lz: lz3 }), { ok: false, rows: 1, missing: [], deleted: ['u60e-05'], case_variants: ['u60e-05'] });
+});
+
+await ta('[3b] 🆕 外した行 (lzd-v4): 合格の証跡の外した行を照らし直す (数・理由・上限・CSV に外した商品が無い = 大文字小文字ちがいのロジザードの ID も) / v3 の合格に不正 = 取り込まない', async () => {
+  const ex = (rows, extra = {}) => ({ version: 'lzd-v4', counts: { targets: 5122, invalid: rows.length, excluded: rows.length }, excluded: { count: rows.length, limit: 100, over_cap: false, rows }, ...extra });
+  const cost = { code_norm: 'c-3', ne_code: 'C-3', reason: 'cdb_cost_missing', label: '原価が無い' };
+  const coll = { code_norm: 'u60e-05', ne_code: 'U60E-05', reason: 'lz_case_collision', label: 'ロジザードに大文字小文字ちがいが 2 つ', lz_ids: ['U60E-05', 'u60e-05'] };
+  // 合っている = 取り込める (CSV = A-1・B-2 だけ)
+  let s = setup({ evExtra: ex([cost, coll]) });
+  let t = P.pickTarget({ dataDir: s.dataDir, now: NOW });
+  assert.deepEqual([t.ok, t.evidence.excluded.count], [true, 2]);
+  assert.deepEqual(P.checkExcluded(t.evidence, t.csvBuf), { ok: true, count: 2 });
+  const bad = [
+    // CSV に外した商品がある (大文字小文字を無視して)・大文字小文字ちがいのロジザードの ID がある
+    [{ ids: ['A-1', 'c-3'], evExtra: ex([cost]) }, 'excluded_in_csv'],
+    [{ ids: ['A-1', 'u60e-05'], evExtra: ex([coll]) }, 'excluded_in_csv'],
+    // 数が合わない・形が違う
+    [{ evExtra: ex([cost], { counts: { targets: 5122, invalid: 2, excluded: 1 } }) }, 'excluded_bad'],
+    [{ evExtra: ex([cost], { counts: { targets: 5122, invalid: 1, excluded: 0 } }) }, 'excluded_bad'],
+    [{ evExtra: { version: 'lzd-v4', counts: { targets: 5122, invalid: 0, excluded: 0 } } }, 'excluded_bad'],
+    [{ evExtra: ex([cost], { excluded: { count: 2, rows: [cost] } }) }, 'excluded_bad'],
+    // 外してよい理由でない (材料のずれの疑い) が外した行に入っている = 取り込まない
+    [{ evExtra: ex([{ ...cost, reason: 'cdb_no_sku' }]) }, 'excluded_reason'],
+    // 商品を特定できない外した行 = 「CSV に無い」と言えない (Codex R1 Medium)
+    [{ evExtra: ex([{ reason: 'cdb_cost_missing' }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...cost, code_norm: 5 }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...cost, ne_code: null }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...cost, ne_code: '  ' }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...coll, lz_ids: [] }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...coll, lz_ids: undefined }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...coll, lz_ids: ['U60E-05', 7] }]) }, 'excluded_unidentified'],
+    [{ evExtra: ex([{ ...cost, reason: 'code_invalid' }]) }, 'excluded_reason'],
+    // 上限はこちらの決まりで計算し直す (証跡の limit は使わない)
+    [{ evExtra: ex([cost, coll], { counts: { targets: 99, invalid: 2, excluded: 2 } }) }, 'excluded_over_cap'],
+    [{ evExtra: ex([cost], { counts: { invalid: 1, excluded: 1 } }) }, 'excluded_over_cap'],
+    // v3 の合格に不正がある = おかしい
+    [{ evExtra: { counts: { targets: 5122, invalid: 1 } } }, 'invalid_without_excluded'],
+  ];
+  for (const [o, reason] of bad) {
+    s = setup(o);
+    t = P.pickTarget({ dataDir: s.dataDir, now: NOW });
+    assert.deepEqual([t.ok, t.reason], [false, reason], JSON.stringify(o));
+  }
+  // 不合格の証跡は照らさない (影の取込は合否を問わない)
+  s = setup({ verdict: 'fail', evExtra: ex([cost], { counts: { targets: 10, invalid: 1, excluded: 1 } }) });
+  assert.equal(P.pickTarget({ dataDir: s.dataDir, now: NOW, requirePass: false }).ok, true);
+  // 外した行の無い v4 = そのまま / NE の書き方が 1 つに決まらない理由 (code_collided) は ne_code なしで code_norm で照らす
+  s = setup({ evExtra: ex([]) });
+  assert.equal(P.pickTarget({ dataDir: s.dataDir, now: NOW }).ok, true);
+  const col = { code_norm: 'b-9', ne_code: null, reason: 'code_collided', lz_ids: ['B-9'] };
+  assert.equal(P.pickTarget({ dataDir: setup({ evExtra: ex([col]) }).dataDir, now: NOW }).ok, true);
+  assert.equal(P.pickTarget({ dataDir: setup({ ids: ['A-1', 'b-9'], evExtra: ex([col]) }).dataDir, now: NOW }).reason, 'excluded_in_csv');
 });
 
 // ── 影の取込 (runShadow) ──

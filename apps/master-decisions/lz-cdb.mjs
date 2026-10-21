@@ -9,6 +9,7 @@
  *              = 翌朝のロード待ち。出さない (2026-09-29 中原さん。新商品を登録した翌朝に毎回不合格になっていた)。照合 ② が lag と言わない cdb_no_sku は invalid のまま。
  *              不合格に数えないのは、ロジザードに今ある値が NE の道の値と同じとき (= 出さなくても古い値が残らない) だけ = checkLagging (Codex #1527 R1 High)
  *   invalid  = 出さない (理由つき)。0 や空で埋めない (v2 H5)。1 件でも残れば、その商品を中原さんが認めない限り切替の合格にしない
+ *              🆕 2026-10-21 中原さんが「その行だけの問題 (EXCLUDABLE_REASONS) は外して残りを取り込む」と認めた = 外した行 (上限の内なら合格を止めない。splitInvalid)
  * 値の出どころ (v2 H5・L-4):
  *   形式/型番 = NE の元の書き方 (ops.master_ne_codes)・商品名 = core.skus.name (前後の空白を削った形 = 許す差 L-4)・
  *   仕入単価 = core.sku_costs の今の原価 (円の整数。無い・負・整数でない = 出さない。0 はそのまま出す = 中原さん L-9 C (2026-09-28)。
@@ -71,6 +72,9 @@ export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
   return { ok: true, reason: null, rows: body.length, byId, lowerGroups, encoding };
 }
 
+/** ロジザードの一覧で有効な商品か (削除フラグ = '0')。無効 (削除フラグ が 0 でない) = 大文字小文字ちがいの重複に数えない */
+export const isActiveLz = (lz, id) => { const r = lz && lz.byId && lz.byId.get(id); return !!r && r.deleted === '0'; };
+
 /**
  * NE の取得の商品を 3 つに分け、比べる商品は両方の道の項目を作る (純粋)
  * @param {object} p
@@ -87,7 +91,9 @@ export function classifyForLz({ neItems, cdb, lz, cdbLag = () => false }) {
   const no = (it, reason, extra = {}) => invalid.push({ code_norm: it.code_norm, ne_code: it.ne_code || null, reason, ...extra });
   for (const it of neItems) {
     if (!it.ne_code) { no(it, it.code_reason || 'no_ne_code'); continue; }
-    const variants = lz.lowerGroups.get(it.ne_code.toLowerCase()) || [];
+    // 🆕 無効 (削除フラグ が 0 でない) の別の書き方は数えない (2026-10-21 中原さん: ロジザードに削除は無い = 小文字の重複を「無効」にする)。
+    //   無効の ID は CSV に入らない (下の lz_deleted・取込の前の precheck の deleted)・取込の後の確かめで全部の列が前と同じかを見る = 値は書き込まない
+    const variants = (lz.lowerGroups.get(it.ne_code.toLowerCase()) || []).filter((v) => v === it.ne_code || isActiveLz(lz, v));
     if (variants.some((v) => v !== it.ne_code)) { no(it, 'lz_case_collision', { lz_ids: variants }); continue; }
     const lzRow = lz.byId.get(it.ne_code);
     if (!lzRow) { awaiting.push({ code_norm: it.code_norm, ne_code: it.ne_code }); continue; }
@@ -120,6 +126,78 @@ export function classifyForLz({ neItems, cdb, lz, cdbLag = () => false }) {
   const reasons = invalid.reduce((m, x) => ((m[x.reason] = (m[x.reason] || 0) + 1), m), {});
   return { compare, awaiting, lagging, invalid, cost_zero_over_lz: costZeroOverLz,
     counts: { targets: neItems.length, compare: compare.length, awaiting: awaiting.length, lagging: lagging.length, invalid: invalid.length, invalid_reasons: reasons, cost_zero: costZero, cost_zero_over_lz: costZeroOverLz.length } };
+}
+
+/**
+ * 🆕 外した行 (2026-10-21 中原さん「悪い行だけ外して、残りは毎晩取り込む」)。
+ *   その行だけの問題 (原価が無い・仕入先が無い・ロジザードに大文字小文字ちがいの ID が 2 つ など) = その行を CSV に出さず (もともと出していない)、
+ *   報告と証跡に理由つきで残し、ほかが全部通れば合格にする。外した行のロジザードの値はそのまま (取込で触らない = 取込の後の確かめで
+ *   「取り込まなかった商品は全部の列が直前と同じ」を見る)。
+ *   ここに無い理由 (Company DB に商品が無い cdb_no_sku・元のコードを読めない no_spelling* / code_not_read / code_not_in_cdb / code_cdb_mismatch など
+ *   = 材料のずれ・全体の問題の疑い) と知らない理由は、今までどおりその朝全体を不合格にする (fail_by invalid)。
+ *   code_invalid も止める側 (書き方の記録が壊れた damaged もここに入る = 材料の破損。Codex R1 Medium)。
+ *   外した行が上限 (EXCLUDE_CAP) を超える = 全体の問題の疑い = 不合格 (fail_by excluded_over_cap)
+ */
+export const EXCLUDABLE_REASONS = Object.freeze(['cdb_cost_missing', 'cdb_cost_shape', 'cdb_supplier_count', 'cdb_supplier_shape', 'cdb_name_blank', 'ne_name_blank',
+  'lz_case_collision', 'lz_deleted', 'code_collided', 'norm_collided']);
+/** 外した行の証跡で NE の書き方 (ne_code) が無くてよい理由 (NE の書き方が 1 つに決まらない = code_norm で商品を特定する) */
+export const EXCLUDED_NO_NE_CODE = Object.freeze(['code_collided', 'norm_collided']);
+/** 外してよい行の上限 = 100 行まで・かつ対象 (NE の取得の商品) の 2% まで */
+export const EXCLUDE_CAP = Object.freeze({ max: 100, ratio: 0.02 });
+/** 外してよい行の数 (対象の数から。小さい方) */
+export const excludeLimit = (targets, cap = EXCLUDE_CAP) => Math.max(0, Math.min(cap.max, Math.floor((Number(targets) || 0) * cap.ratio)));
+
+/** 外した行の理由のやさしい言い方 (まとめ・知らせに出す) */
+export function excludedLabel(x) {
+  const r = x && x.reason;
+  if (r === 'cdb_cost_missing') return '原価が無い';
+  if (r === 'cdb_cost_shape') return '原価の形が変';
+  if (r === 'cdb_supplier_count') return Array.isArray(x.suppliers) && x.suppliers.length >= 2 ? '仕入先が 2 つ以上' : '仕入先が無い';
+  if (r === 'cdb_supplier_shape') return '仕入先の番号が 4 桁でない';
+  if (r === 'cdb_name_blank') return '商品名が無い';
+  if (r === 'ne_name_blank') return 'NE の商品名が空';
+  if (r === 'lz_case_collision') return Array.isArray(x.lz_ids) && x.lz_ids.length >= 2 ? 'ロジザードに大文字小文字ちがいが 2 つ' : 'NE とロジザードで大文字小文字がちがう';
+  if (r === 'lz_deleted') return 'ロジザードで削除済み';
+  if (r === 'code_collided') return 'NE に大文字小文字ちがいが 2 つ';
+  if (r === 'code_invalid') return 'NE の商品コードが使えない';
+  if (r === 'norm_collided') return 'NE に同じコードに読める商品が 2 つ';
+  return String(r || '理由不明');
+}
+
+/**
+ * 不正 (出さない) の行を「外した行」と「全体を止める行」に分ける (純粋)
+ * @returns {{ excluded: object[], blocking: object[], limit: number, over: boolean }}
+ */
+export function splitInvalid(invalid, { targets, cap = EXCLUDE_CAP } = {}) {
+  const excluded = [], blocking = [];
+  for (const x of invalid || []) (EXCLUDABLE_REASONS.includes(x && x.reason) ? excluded : blocking).push(x);
+  const limit = excludeLimit(targets, cap);
+  return { excluded, blocking, limit, over: excluded.length > limit };
+}
+
+/** 外した行の証跡の 1 行 (コード・理由・やさしい言い方・大文字小文字ちがいのときはロジザードの ID) */
+export const excludedRow = (x) => ({ code_norm: x.code_norm, ne_code: x.ne_code ?? null, reason: x.reason, label: excludedLabel(x),
+  ...(Array.isArray(x.lz_ids) ? { lz_ids: x.lz_ids } : {}), ...(Array.isArray(x.suppliers) ? { suppliers: x.suppliers } : {}),
+  ...(Array.isArray(x.ne_spellings) ? { ne_spellings: x.ne_spellings } : {}) });
+
+/** まとめに出すコード (改行・制御文字・向きを変える文字を空白にして 1 行・40 文字まで) */
+export function showCodeText(x) {
+  const s = String(x ?? '?').replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, ' ').replace(/\s+/g, ' ').trim() || '?';
+  return s.length > 40 ? `${s.slice(0, 39)}…` : s;
+}
+/**
+ * 外した行のやさしい 1 文 (例: 「ロジザードに送れなかった商品 16 件 (原価が無い 11・仕入先が無い 2・ロジザードに大文字小文字ちがいが 2 つ 3): fuwear-ND・fuwear-WH・kinmokuset ほか 13」)。
+ * 0 件 = ''。rows = excludedRow の形 (label が無ければ理由から作る)。total = 全部の件数 (rows が先頭だけのとき)
+ */
+export function excludedSentence(rows, { show = 3, total = null } = {}) {
+  const xs = Array.isArray(rows) ? rows : [];
+  const n = Number.isSafeInteger(total) && total > xs.length ? total : xs.length;
+  if (!n) return '';
+  const by = new Map();
+  for (const x of xs) { const l = (x && x.label) || excludedLabel(x); by.set(l, (by.get(l) || 0) + 1); }
+  const kinds = [...by].map(([l, k]) => `${l} ${k}`).join('・');
+  const codes = xs.slice(0, show).map((x) => showCodeText(x && (x.ne_code ?? x.code_norm))).join('・');
+  return `ロジザードに送れなかった商品 ${n} 件 (${kinds})${codes ? `: ${codes}${n > Math.min(show, xs.length) ? ` ほか ${n - Math.min(show, xs.length)}` : ''}` : ''}`;
 }
 
 /** セルの中身のバイト = ロジザードの CSV と同じ変換・比べる側 (parseCsvBytes) と同じ復号 (引用符を外し "" を " に。Codex #1507 R1 Low) */

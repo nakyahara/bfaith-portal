@@ -36,6 +36,8 @@ export function readNeForLz(dataDir) {
     products: ne.products.map((r) => ({ code: r.code, name: r.name, cost_src: r.cost_src, supplier: r.supplier })),
     entries: resolved.ok ? resolved.entries.filter((e) => e.kind === 'product') : null,
     spellings_reason: resolved.ok ? null : resolved.reason,
+    // 🆕 書き方の記録の壊れた行の数 (lz-daily はこれが 1 つでもあれば全体を止める = 外した行に隠さない。Codex R2 Medium)
+    spellings_damaged: resolved.ok ? (Number(resolved.damaged) || 0) : null,
   };
 }
 

@@ -22,6 +22,10 @@
  *   - 証跡 lz-daily (完了の印) = 入力の世代・CSV の sha256・行数・取込の期限・合否とその理由・3 つの分け方の件数
  *   - 🚨 始めに running を書く = 同じ日の前の回の完了の印を無効にする。証跡を書けない = 作ること自体の失敗 (❌。前の合格を残さない)
  * 合否 (v2 H6・v3 M5): 説明できない差 0・判定できない 0 (NE の道の推測の形も)・形の差 0・不正で出さない 0・作れない行 0・比べる商品が 1 つ以上
+ *   🆕 lzd-v4 (2026-10-21 中原さん「悪い行だけ外して、残りは毎晩取り込む」): 不正のうち**その行だけの問題** (lz-cdb.mjs の EXCLUDABLE_REASONS =
+ *   原価が無い・仕入先が無い・ロジザードに大文字小文字ちがいの ID が 2 つ など) は「外した行」= CSV に出さない (もともと出していない)・報告と証跡 (excluded) に
+ *   理由つきで残す・合否を止めない。ほかの不正 (材料のずれの疑い) と、外した行が上限 (100 行・対象の 2%) を超える回は今までどおり不合格。
+ *   外した行はロジザードで触らない (取込の後の確かめが「取り込まなかった商品は全部の列が直前と同じ」を見る・毎晩の取込も証跡と CSV を照らし直す = lz-import-plan.mjs)
  * 終わり方 (v2 M9・v3 M6。材料が無いを成功にしない):
  *   作れた (合格でも不合格でも) **かつポータルが成果物を受け取れた** = exit 0 (✅ / ⚠️) + 成功の ping (台帳 lz-daily-build)
  *   材料が無い・未設定 = ⏭️ exit 3 (daily-sync と朝の再試行では失敗 = retry に載る) + fail の ping (理由つき)
@@ -45,7 +49,7 @@ import { connectDecisionWriter, functionReady } from '../../apps/company-db/mast
 import { readNeForLz, joinLzSnapshot } from '../../apps/master-decisions/lz-snapshot.mjs';
 import { buildLzCsv, DAILY, LZ_CONVERTER_VERSION } from '../../apps/master-decisions/lz-csv.mjs';
 import { compareLz, LZ_COMPARE_VERSION } from '../../apps/master-decisions/lz-compare.mjs';
-import { readLzShohinMaster, classifyForLz, compareNeIndex, cdbLagOf, checkLagging, explainCdbDiffs } from '../../apps/master-decisions/lz-cdb.mjs';
+import { readLzShohinMaster, classifyForLz, compareNeIndex, cdbLagOf, checkLagging, explainCdbDiffs, splitInvalid, excludedRow, excludedSentence, EXCLUDE_CAP } from '../../apps/master-decisions/lz-cdb.mjs';
 import { createImportStateClient } from '../../tools/logizard-automation/import-state-client.js';
 
 export const EVIDENCE_NAME = 'lz-daily';
@@ -56,7 +60,7 @@ export const DEFAULT_LZ_STAMP = 'C:\\tools\\logizard-automation\\logs\\shohin-la
 export const STAMP_MAX_LAG_MS = 15 * 60 * 1000;   // 保存 → Drive への転送 (最大 約 7 分) → 印。2026-09-28 の実測は 45 秒
 export const PREV_LOOKBACK_DAYS = 7;
 export const EXIT = Object.freeze({ complete: 0, error: 1, skipped: 3 });   // 2 は使わない (朝の再試行が「通知済み・打ち切り」と読む)
-export const LZ_DAILY_VERSION = 'lzd-v3';   // v3 = 成果物をポータルに送る (証跡の portal)。v2 = 送る前の版 (③c-1b-3b-3)
+export const LZ_DAILY_VERSION = 'lzd-v4';   // v4 = 外した行 (証跡の excluded。合格に外した行が入りうる・2026-10-21)。v3 =成果物をポータルに送る (証跡の portal)。v2 = 送る前の版 (③c-1b-3b-3)
 export const ARTIFACT_TRIES = 3;
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 /** YYYY-MM-DD の翌日 (暦の日付だけ。時刻の帯に関係なく) */
@@ -93,7 +97,7 @@ export function previousLzRows(dir, asOf, days = PREV_LOOKBACK_DAYS) {
  * @param {() => Promise<{ db, close }>} p.connect  Company DB (watcher)
  */
 export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath, lzStampPath = DEFAULT_LZ_STAMP, connect, now = new Date(), readNe = readNeForLz,
-  write = (d, n, p) => writeEvidence(d, n, p, { now }), lzMinRows = undefined,
+  write = (d, n, p) => writeEvidence(d, n, p, { now }), lzMinRows = undefined, excludeCap = EXCLUDE_CAP,
   readCdb = async () => { const c = await connect(); try { return await readCdbForLz(c.db); } finally { await c.close(); } }, writeLzCodes = null, recheckLz = lzMasterUnchanged }) {
   const runId = makeRunId(now);
   const save = (payload) => { if (!write(outDir, EVIDENCE_NAME, { as_of: asOf, run_id: runId, version: LZ_DAILY_VERSION, ...payload })) throw new Error('証跡 lz-daily を書けない'); };
@@ -163,12 +167,17 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
   const raw = compareLz({ gas: neCsv.bytes, ours: cdbCsv, compareCols: [0, 1, 2, 3, 4], header: DAILY.header });
   // NE の道の推測の形 (neCsv.rows の unverified) も判定に入れる (Codex #1507 R1 High)
   const result = explainCdbDiffs(raw, { compareIndex, byKey: new Map(cls.compare.map((x) => [x.key, x])), neRows: neCsv.rows });
+  // 🆕 lzd-v4: 不正を「外した行 (その行だけの問題)」と「全体を止める行」に分ける。外した行が上限を超える = 全体の問題の疑い = 不合格
+  const split = splitInvalid(cls.invalid, { targets: cls.counts.targets, cap: excludeCap });
   const failBy = [
     ['shape', result.shape.length], ['undeterminable', result.undeterminable.length], ['unexplained', result.unexplained.length],
-    ['invalid', cls.invalid.length],   // 不正で出さない商品が残る = 合格にしない (v3 M5)
+    ['invalid', split.blocking.length],   // 外してよい理由でない不正が残る = 合格にしない (v3 M5)
+    ['excluded_over_cap', split.over ? 1 : 0],   // 外した行が多すぎる = 全体の問題の疑い = 合格にしない
     ['lagging_stale', lagCheck.stale.length], ['lagging_undeterminable', lagCheck.undeterminable.length + lagCsv.unmade.length],   // 待ちでもロジザードの値が古い・決められない = 合格にしない
     ['unmade', cdbCsv.unmade.length + neCsv.unmade.length],
     ['no_compare', cls.compare.length ? 0 : 1],   // 比べた商品が無い = 何も確かめていない
+    // 🆕 NE の書き方の記録に壊れた行がある = 材料の破損 = 全体を止める (正規化の衝突などの「外した行」に隠れることがある。Codex R2 Medium)
+    ['ne_spellings_damaged', Number(ne.spellings_damaged) > 0 ? 1 : 0],
   ].filter(([, n]) => n > 0).map(([k]) => k);
   const verdict = failBy.length ? 'fail' : 'pass';
   // 書き方の問題で出さない商品には、NE の書き方 (この世代の書き方の集め) とロジザードの書き方を報告に添える
@@ -182,7 +191,13 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
   fs.mkdirSync(dir, { recursive: true });
   const csvRel = path.join(rel, `cdb_${DAILY.file}`).replace(/\\/g, '/');
   fs.writeFileSync(path.join(outDir, csvRel), cdbCsv.bytes, { flag: 'wx' });
-  const report = { run_id: runId, as_of: asOf, verdict, fail_by: failBy, classes: { counts: cls.counts, awaiting: cls.awaiting, lagging: cls.lagging.map(({ ne, ...x }) => x), lagging_check: lagCheck, invalid: invalidOut, cost_zero_over_lz: cls.cost_zero_over_lz }, compare: result,
+  // 外した行 (証跡の rows = 上限までの全部 = 毎晩の取込が CSV と照らし直す。上限を超えた回は不合格 = 先頭だけ。報告の classes.excluded は全部)
+  const outOf = new Map(cls.invalid.map((x, i) => [x, invalidOut[i]]));   // 書き方の問題の行は NE とロジザードの書き方つき (まとめ・毎晩の照らし直しに使う)
+  const excludedRows = split.excluded.map((x) => excludedRow(outOf.get(x) || x));
+  const excluded = { count: excludedRows.length, limit: split.limit, over_cap: split.over, cap: { max: excludeCap.max, ratio: excludeCap.ratio },
+    reasons: excludedRows.reduce((m, x) => ((m[x.reason] = (m[x.reason] || 0) + 1), m), {}), rows: excludedRows.slice(0, Math.max(split.limit, excludeCap.max)) };
+  const report = { run_id: runId, as_of: asOf, verdict, fail_by: failBy, classes: { counts: cls.counts, awaiting: cls.awaiting, lagging: cls.lagging.map(({ ne, ...x }) => x), lagging_check: lagCheck, invalid: invalidOut,
+    excluded: excludedRows, blocking: split.blocking.map((x) => ({ code_norm: x.code_norm, ne_code: x.ne_code ?? null, reason: x.reason })), cost_zero_over_lz: cls.cost_zero_over_lz }, compare: result,
     build: { counts: cdbCsv.counts, unmade: cdbCsv.unmade, subs: cdbCsv.rows.flatMap((r) => r.subs.map((x) => ({ code: r.key, ...x }))) } };
   const reportBuf = Buffer.from(JSON.stringify(report, null, 1), 'utf8');
   fs.writeFileSync(path.join(dir, 'report.json'), reportBuf, { flag: 'wx' });
@@ -194,15 +209,20 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
     report: { path: path.join(rel, 'report.json').replace(/\\/g, '/'), sha256: sha256(reportBuf) },
     // 取込 (③c-1b) はこの期限の内・この CSV の sha256 と行数が合うときだけ。取込は翌日 00:20 の回 = 期限は翌日 01:00 (契約 ③c-1b v2 §1)
     deadline: `${nextDay(asOf)}T01:00:00+09:00`,
-    counts: { ...cls.counts, lagging_held: lagCheck.held.length, lagging_stale: lagCheck.stale.length, lagging_undeterminable: lagCheck.undeterminable.length },
+    // 🆕 lzd-v4: 外した行 (CSV に無い・ロジザードで触らない)
+    excluded,
+    counts: { ...cls.counts, excluded: excludedRows.length, invalid_blocking: split.blocking.length, lagging_held: lagCheck.held.length, lagging_stale: lagCheck.stale.length, lagging_undeterminable: lagCheck.undeterminable.length },
     summary: { ...result.summary, same_rows: result.counts.same_rows, ne_rows: result.counts.gas_rows },
     allowed_by: result.allowed.reduce((m, a) => ((m[a.why || a.what] = (m[a.why || a.what] || 0) + 1), m), {}),
     lz_codes: lzCodes,   // 🆕 0083: ロジザードの書き方を Company DB に残したか (影)
   };
   save(evidence);
   const s = evidence.summary;
-  const line = `${verdict === 'pass' ? '✅' : '⚠️'} ロジザード毎日の商品マスタ (影): ${verdict === 'pass' ? '合格' : `不合格 (${failBy.join('・')})`}`
-    + ` / 比べる ${cls.counts.compare}・新商品待ち ${cls.counts.awaiting}・Company DB 待ち ${cls.counts.lagging} (値が同じ ${lagCheck.held.length})・不正 ${cls.counts.invalid}`
+  // 外した行があれば、やさしい 1 文 (件数・理由ごとの数・先頭の 3 つのコード) を見出しのすぐ後に
+  const exText = excludedSentence(excludedRows, { show: 3 });
+  const line = `${verdict === 'pass' ? '✅' : '⚠️'} ロジザード毎日の商品マスタ (影): ${verdict === 'pass' ? `合格${exText ? ` (今夜 ${cdbCsv.counts.made} 件をロジザードに送る)` : ''}` : `不合格 (${failBy.join('・')})`}`
+    + (exText ? ` / ${exText}${split.over ? ` = 多すぎる (上限 ${split.limit} 件) ので今夜は取り込まない` : ''}` : '')
+    + ` / 比べる ${cls.counts.compare}・新商品待ち ${cls.counts.awaiting}・Company DB 待ち ${cls.counts.lagging} (値が同じ ${lagCheck.held.length})・不正 ${cls.counts.invalid}${excludedRows.length ? ` (うち外した ${excludedRows.length})` : ''}`
     + ` / 同じ ${s.same_rows}・許す差 ${s.allowed}・説明できない ${s.unexplained}・判定できない ${s.undeterminable}・形の差 ${s.shape}`;
   return { state: 'complete', evidence: { as_of: asOf, run_id: runId, version: LZ_DAILY_VERSION, ...evidence }, line, runId, report };
 }
