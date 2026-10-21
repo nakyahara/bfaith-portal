@@ -551,7 +551,7 @@ await ta('[12] 入口 (cli): daily-sync の回 (--daily・--out-dir なし) だ�
   const real = { putArtifact: async (m) => { sent.push(m.sourceRunId); return { ok: true, ...S.putArtifact(db, { sourceRunId: m.sourceRunId, targetAsOf: m.targetAsOf, verdict: m.verdict, csvBuf: m.csvBuf, sha256: m.sha256, rows: m.rows, by: m.by }) }; } };
   // 送れた = ✅ exit 0・ok の ping・証跡の portal
   let x = await go(['--daily', '--as-of', asOf], { client: real });
-  assert.deepEqual([x.code, x.pings, sent.length, /ポータル 受け取った$/.test(x.last), evOf(x.s.dataDir).portal.ok, evOf(x.s.dataDir).version], [0, [['lz-daily-build', 'ok']], 1, true, true, 'lzd-v3']);
+  assert.deepEqual([x.code, x.pings, sent.length, /ポータル 受け取った$/.test(x.last), evOf(x.s.dataDir).portal.ok, evOf(x.s.dataDir).version], [0, [['lz-daily-build', 'ok']], 1, true, true, 'lzd-v4']);
   // LZ_LOCK_TOKEN が無い = 口を作れない = ❌ exit 1・fail の ping・証跡の portal.error
   x = await go(['--daily', '--as-of', asOf], { makeClient: () => { throw Object.assign(new Error('LZ_LOCK_TOKEN が無い'), { code: 'no_token' }); } });
   assert.deepEqual([x.code, x.pings, /^❌ .*送れない \(no_token\)/.test(x.last), evOf(x.s.dataDir).state, evOf(x.s.dataDir).portal.error], [1, [['lz-daily-build', 'fail']], true, 'complete', 'no_token']);
@@ -576,19 +576,30 @@ await ta('[13] 朝のまとめの「NE の商品コードの書き方」(10/16 �
       { code_norm: 'u60e-10', kind: 'product', state: 'ok', ne_code: 'u60e-10', spellings: ['u60e-10'] }]; return n; };
   const cdbCase = cdbFake({ codes: [{ code_norm: 'a-1', state: 'ok', ne_code: 'A-1' }, { code_norm: 'b-2', state: 'collided', ne_code: null }, { code_norm: 'new-1', state: 'ok', ne_code: 'NEW-1' },
     { code_norm: 'u60e-10', state: 'ok', ne_code: 'u60e-10' }] });
+  // 🆕 lzd-v4: 書き方の問題はその行だけの問題 = 外した行。既定の上限 (4 商品の 2% = 0 行) では多すぎる = 不合格・まとめは「今夜は何も送らない」
+  const s0 = setup({ lzRows: [{ id: 'A-1', name: 'x' }, { id: 'B-2' }, { id: 'U60E-10' }] });
+  await run(s0, { readNe: neCase, readCdb: cdbCase });
+  assert.deepEqual([evOf(s0.dataDir).verdict, evOf(s0.dataDir).fail_by, evOf(s0.dataDir).excluded.over_cap, evOf(s0.dataDir).excluded.limit], ['fail', ['excluded_over_cap'], true, 0]);
+  assert.match(N.readLzCodeNotice({ dataDir: s0.dataDir, asOf, syncRunId: 'ds_test' })[0], /^⚠️ ロジザードに送れなかった商品 2 件 .* = 今朝は不合格なので、今夜はロジザードに何も送りません$/);
+  // 上限を広げる (試験だけ) = 外した行 2 件で合格・ほかは今夜送る
   const s = setup({ lzRows: [{ id: 'A-1', name: 'x' }, { id: 'B-2' }, { id: 'U60E-10' }] });
-  const r = await run(s, { readNe: neCase, readCdb: cdbCase });
+  const r = await run(s, { readNe: neCase, readCdb: cdbCase, excludeCap: { max: 100, ratio: 1 } });
   const ev = evOf(s.dataDir);
-  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.invalid, ev.counts.invalid_reasons], ['fail', ['invalid'], 2, { code_collided: 1, lz_case_collision: 1 }], '合否と件数は今までどおり');
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.invalid, ev.counts.excluded, ev.counts.invalid_blocking, ev.counts.invalid_reasons], ['pass', [], 2, 2, 0, { code_collided: 1, lz_case_collision: 1 }], '外した行 = 合格・件数は今までどおり');
   const rep = JSON.parse(fs.readFileSync(path.join(s.dataDir, ev.report.path), 'utf8'));
   assert.deepEqual(rep.classes.invalid, [
     { code_norm: 'b-2', ne_code: null, reason: 'code_collided', ne_spellings: ['B-2', 'b-2'], lz_ids: ['B-2'] },
     { code_norm: 'u60e-10', ne_code: 'u60e-10', reason: 'lz_case_collision', lz_ids: ['U60E-10'] }]);
-  assert.match(r.line, /不合格 \(invalid\).*不正 2/);
-  // この daily-sync の回 (DAILY_SYNC_RUN_ID = ds_test) の証跡 → まとめの行
-  const want = ['⚠️ NE の商品コードの書き方 2 件 (ロジザードに取り込んでいません)',
-    '・b-2: NE に大文字・小文字だけ違う書き方が 2 つ (B-2 / b-2)・ロジザード = B-2 → NE で 1 つにそろえる',
-    '・u60e-10: NE = u60e-10 / ロジザード = U60E-10 → NE を U60E-10 に直す (NE の試しの後はポータルの「NEへ送る」が直します)'];
+  assert.deepEqual(rep.classes.excluded, [
+    { code_norm: 'b-2', ne_code: null, reason: 'code_collided', label: 'NE に大文字小文字ちがいが 2 つ', lz_ids: ['B-2'], ne_spellings: ['B-2', 'b-2'] },
+    { code_norm: 'u60e-10', ne_code: 'u60e-10', reason: 'lz_case_collision', label: 'NE とロジザードで大文字小文字がちがう', lz_ids: ['U60E-10'] }]);
+  assert.deepEqual(ev.excluded.rows, rep.classes.excluded);
+  assert.equal(r.line.split(' / ').slice(0, 2).join(' / '), '✅ ロジザード毎日の商品マスタ (影): 合格 (今夜 1 件をロジザードに送る) / ロジザードに送れなかった商品 2 件 (NE に大文字小文字ちがいが 2 つ 1・NE とロジザードで大文字小文字がちがう 1): b-2・u60e-10');
+  assert.match(r.line, /不正 2 \(うち外した 2\)/);
+  // この daily-sync の回 (DAILY_SYNC_RUN_ID = ds_test) の証跡 → まとめの行 (lzd-v4 = 外した行を全部・商品のページへのリンクつき)
+  const want = ['⚠️ ロジザードに送れなかった商品 2 件 (NE に大文字小文字ちがいが 2 つ 1・NE とロジザードで大文字小文字がちがう 1) = ほかの商品は今夜ロジザードに送ります',
+    '・<https://bfaith-portal.onrender.com/apps/master-edit/sku/b-2|b-2>: NE に大文字・小文字だけ違う書き方が 2 つ (B-2 / b-2)・ロジザード = B-2 → NE で 1 つにそろえる',
+    '・<https://bfaith-portal.onrender.com/apps/master-edit/sku/u60e-10|u60e-10>: NE = u60e-10 / ロジザード = U60E-10 → NE を U60E-10 に直す (NE の試しの後はポータルの「NEへ送る」が直します)'];
   assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_test' }), want);
   // 別の回・別の日・回の印が無い (手で流した) = 何も足さない
   assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_other' }), []);
@@ -718,6 +729,102 @@ await ta('[14] 🆕 0083 (設計 25 PR-1 = 影): ロジザードの全件の一�
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'lzd-cli-'));
   await go(['--daily', '--as-of', asOf, '--out-dir', out], { COMPANY_DB_WATCH_WRITER_URL: 'postgres://writer' });   // 手の試し (--out-dir) = 本番の DB に書かない
   assert.equal(urls.length, 1);
+});
+
+await ta('[15] 🆕 外した行 (lzd-v4・2026-10-21 中原さん): その行だけの問題 = CSV に出さず・理由つきで残して合格 / 上限 (100 行・対象の 2%) を超える = 不合格 / 外してよい理由でない不正・知らない理由 = 今までどおり不合格 / 説明できない差などは今までどおり', async () => {
+  // 決まり: 上限 = 100 行まで・かつ対象の 2% まで (小さい方)
+  assert.deepEqual([D.excludeLimit(5122), D.excludeLimit(1000), D.excludeLimit(49), D.excludeLimit(0)], [100, 20, 0, 0]);
+  const row = (code, reason, extra = {}) => ({ code_norm: code.toLowerCase(), ne_code: code, reason, ...extra });
+  // 2026-10-20 の本番と同じ形 (原価が無い 11・仕入先が無い 2・ロジザードに大文字小文字ちがいが 2 つ 3 / 5,122 商品) = 全部外せる・上限の内
+  const real = [...['fuwear-ND', 'fuwear-WH', 'kinmokuset', 'relaxgiftset2', 'sanrio3souPK-100', 'sanrio3souPK-90', 'sanrio3souPK-95', 'silkpowder10g', 'smhc-bkg', 'smhc-bks', 'whitekaolin'].map((c) => row(c, 'cdb_cost_missing')),
+    row('reeddiffuser-st', 'cdb_supplier_count', { suppliers: [] }), row('wae10-ra', 'cdb_supplier_count', { suppliers: [] }),
+    ...['U60E-05', 'U60E-08', 'U60E-10'].map((c) => row(c, 'lz_case_collision', { lz_ids: [c, c.toLowerCase()] }))];
+  let sp = D.splitInvalid(real, { targets: 5122 });
+  assert.deepEqual([sp.excluded.length, sp.blocking.length, sp.limit, sp.over], [16, 0, 100, false]);
+  assert.equal(D.excludedSentence(real.map(D.excludedRow)), 'ロジザードに送れなかった商品 16 件 (原価が無い 11・仕入先が無い 2・ロジザードに大文字小文字ちがいが 2 つ 3): fuwear-ND・fuwear-WH・kinmokuset ほか 13');
+  assert.equal(D.excludedSentence(real.slice(0, 2).map(D.excludedRow), { show: 3, total: 9 }), 'ロジザードに送れなかった商品 9 件 (原価が無い 2): fuwear-ND・fuwear-WH ほか 7');
+  assert.equal(D.excludedSentence([]), '');
+  // 上限を超える = 全体の問題の疑い
+  sp = D.splitInvalid(Array.from({ length: 101 }, (_, i) => row(`c-${i}`, 'cdb_cost_missing')), { targets: 100000 });
+  assert.deepEqual([sp.excluded.length, sp.limit, sp.over], [101, 100, true]);
+  // 外してよい理由でない (材料のずれの疑い)・知らない理由 = 全体を止める
+  sp = D.splitInvalid([row('a', 'cdb_no_sku'), row('b', 'code_cdb_mismatch'), row('c', 'no_spelling'), row('d', 'no_spelling_x'), row('e', 'code_not_in_cdb'), row('f', 'code_not_read'), row('g', 'something_new'), row('h', 'cdb_cost_missing'),
+    row('i', 'code_invalid')], { targets: 5000 });   // code_invalid = 書き方の記録の破損 (damaged) も入る = 材料の破損 = 止める (Codex R1 Medium)
+  assert.deepEqual([sp.excluded.map((x) => x.code_norm), sp.blocking.map((x) => x.reason)], [['h'], ['cdb_no_sku', 'code_cdb_mismatch', 'no_spelling', 'no_spelling_x', 'code_not_in_cdb', 'code_not_read', 'something_new', 'code_invalid']]);
+  assert.deepEqual(['cdb_supplier_count', 'lz_case_collision'].map((reason) => D.excludedLabel({ reason, suppliers: ['0001', '0002'], lz_ids: ['X'] })), ['仕入先が 2 つ以上', 'NE とロジザードで大文字小文字がちがう']);
+
+  // 🆕 ロジザードの大文字小文字ちがいの重複を「無効」(削除フラグ 1) にした = 重複に数えない = 有効な方は比べる・送る / 無効の方が NE の書き方なら送らない
+  const cdbU = cdbOf([{ norm: 'u60e-05', name: 'x', cost: 1, sups: ['0001'] }]);
+  let cu = D.classifyForLz({ neItems: [neItem('U60E-05')], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05'], { 'u60e-05': { del: '1' } }) });
+  assert.deepEqual([cu.compare.map((x) => x.key), cu.invalid], [['U60E-05'], []]);
+  cu = D.classifyForLz({ neItems: [neItem('U60E-05')], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05']) });   // 両方とも有効 = 今までどおり外す
+  assert.deepEqual(cu.invalid.map((x) => [x.reason, x.lz_ids]), [['lz_case_collision', ['U60E-05', 'u60e-05']]]);
+  cu = D.classifyForLz({ neItems: [{ ...neItem('U60E-05'), ne_code: 'u60e-05' }], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05'], { 'u60e-05': { del: '1' } }) });   // NE の書き方が無効の方
+  assert.deepEqual(cu.invalid.map((x) => [x.reason, x.lz_ids]), [['lz_case_collision', ['U60E-05', 'u60e-05']]]);
+  cu = D.classifyForLz({ neItems: [neItem('U60E-05')], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05'], { 'U60E-05': { del: '1' } }) });   // NE の書き方の方が無効・別の書き方が有効 = 外す (送らない)
+  assert.deepEqual(cu.invalid.map((x) => x.reason), ['lz_case_collision']);
+  cu = D.classifyForLz({ neItems: [neItem('U60E-05')], cdb: cdbU, lz: lzOf(['U60E-05', 'u60e-05'], { 'U60E-05': { del: '1' }, 'u60e-05': { del: '1' } }) });   // 両方とも無効 = 送らない
+  assert.deepEqual(cu.invalid.map((x) => x.reason), ['lz_deleted']);
+
+  // ── runLzDaily: NEW-1 がロジザードにある・Company DB に原価が無い = 外した行 ──
+  const lzRows = [{ id: 'A-1', name: 'x' }, { id: 'B-2' }, { id: 'NEW-1' }];
+  const noCost = cdbFake({ cdb: cdbOf([{ norm: 'a-1', name: '商品A', cost: 100, sups: ['0001'] }, { norm: 'b-2', name: '商品B', cost: 5200, sups: ['0001'] }, { norm: 'new-1', name: '新', sups: ['0001'] }]) });
+  const wide = { max: 100, ratio: 1 };   // 試験は 3 商品 = 既定の上限 (2%) は 0 行 = 広げる
+  let s = setup({ lzRows });
+  let r = await run(s, { readCdb: noCost, excludeCap: wide });
+  let ev = evOf(s.dataDir);
+  assert.deepEqual([ev.version, ev.verdict, ev.fail_by, ev.csv.rows, ev.counts.invalid, ev.counts.excluded, ev.excluded.count, ev.excluded.reasons, ev.excluded.over_cap],
+    ['lzd-v4', 'pass', [], 2, 1, 1, 1, { cdb_cost_missing: 1 }, false]);
+  assert.deepEqual(ev.excluded.rows, [{ code_norm: 'new-1', ne_code: 'NEW-1', reason: 'cdb_cost_missing', label: '原価が無い' }]);
+  const ids = iconv.decode(fs.readFileSync(path.join(s.dataDir, ev.csv.path)), 'cp932').split('\r\n').slice(1).map((l) => l.split(',')[0]);
+  assert.deepEqual(ids, ['A-1', 'B-2'], '外した行は CSV に無い・ほかは全部ある');
+  assert.equal(sha(fs.readFileSync(path.join(s.dataDir, ev.csv.path))), ev.csv.sha256);
+  assert.match(r.line, /^✅ ロジザード毎日の商品マスタ \(影\): 合格 \(今夜 2 件をロジザードに送る\) \/ ロジザードに送れなかった商品 1 件 \(原価が無い 1\): NEW-1 \//);
+  // 上限を超える (既定の上限 = 3 商品の 2% = 0 行) = 不合格 (excluded_over_cap)・CSV は同じ形で作る (取り込まない)
+  s = setup({ lzRows });
+  r = await run(s, { readCdb: noCost });
+  ev = evOf(s.dataDir);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.excluded.over_cap, ev.excluded.limit, ev.csv.rows], ['fail', ['excluded_over_cap'], true, 0, 2]);
+  assert.match(r.line, /^⚠️ .*不合格 \(excluded_over_cap\) \/ ロジザードに送れなかった商品 1 件 \(原価が無い 1\): NEW-1 = 多すぎる \(上限 0 件\) ので今夜は取り込まない/);
+  // 外してよい理由でない不正 (Company DB に商品が無い・照合 ② が lag と言わない) が混じる = 上限の内でも不合格 (invalid)
+  const noSku = cdbFake({ cdb: cdbOf([{ norm: 'a-1', name: '商品A', cost: 100, sups: ['0001'] }, { norm: 'b-2', name: '商品B', cost: 5200, sups: ['0001'] }]) });
+  s = setup({ lzRows });
+  await run(s, { readCdb: noSku, excludeCap: wide });
+  ev = evOf(s.dataDir);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.invalid_blocking, ev.counts.excluded], ['fail', ['invalid'], 1, 0]);
+  // 元のコードが読めない (Company DB と NE で書き方の対応が違う = code_cdb_mismatch) = 全体の問題の疑い = 不合格 (invalid)
+  s = setup({ lzRows });
+  await run(s, { readCdb: cdbFake({ codes: [{ code_norm: 'a-1', state: 'ok', ne_code: 'A-1' }, { code_norm: 'b-2', state: 'collided', ne_code: null }, { code_norm: 'new-1', state: 'ok', ne_code: 'NEW-1' }] }), excludeCap: wide });
+  assert.deepEqual([evOf(s.dataDir).verdict, evOf(s.dataDir).fail_by], ['fail', ['invalid']]);
+  // 外した行があっても、説明できない差は今までどおり不合格 (照合 ② に無い差)
+  s = setup({ lzRows, compareItems: [] });
+  await run(s, { readCdb: noCost, excludeCap: wide });
+  assert.deepEqual([evOf(s.dataDir).verdict, evOf(s.dataDir).fail_by, evOf(s.dataDir).counts.excluded], ['fail', ['unexplained'], 1]);
+  // NE の書き方の記録に壊れた行がある (damaged) = 材料の破損 = 外した行があっても全体を止める (Codex R2 Medium)
+  s = setup({ lzRows });
+  await run(s, { readCdb: noCost, excludeCap: wide, readNe: neFake({ spellings_damaged: 1 }) });
+  assert.deepEqual([evOf(s.dataDir).verdict, evOf(s.dataDir).fail_by], ['fail', ['ne_spellings_damaged']]);
+  // まとめ (daily-sync の最後): 外した行のリンクと直し方
+  const N = await import('../apps/master-decisions/lz-code-notice.mjs');
+  // 外した行でない書き方の問題 (code_invalid = 全体を止める) も、外した行の後に今までの形で出る (Codex R2 Low)
+  const neBad = () => { const n = neFake()(); n.entries = n.entries.map((e) => (e.code_norm === 'b-2' ? { ...e, state: 'invalid', ne_code: null, spellings: ['B-2'] } : e)); return n; };
+  s = setup({ lzRows });
+  await run(s, { readCdb: noCost, excludeCap: wide, readNe: neBad });
+  assert.deepEqual([evOf(s.dataDir).verdict, evOf(s.dataDir).fail_by, evOf(s.dataDir).counts.excluded], ['fail', ['invalid'], 1]);
+  assert.deepEqual(N.readLzCodeNotice({ dataDir: s.dataDir, asOf, syncRunId: 'ds_test' }), [
+    '⚠️ ロジザードに送れなかった商品 1 件 (原価が無い 1) = 今朝は不合格なので、今夜はロジザードに何も送りません',
+    '・<https://bfaith-portal.onrender.com/apps/master-edit/sku/NEW-1|NEW-1>: 原価が無い → 商品マスタで原価を入れる',
+    '⚠️ NE の商品コードの書き方 1 件 (ロジザードに取り込んでいません)',
+    '・b-2: NE の書き方が使えない (使えない文字・壊れた記録: B-2)・ロジザード = B-2 → NE の商品コードを確かめる']);
+  assert.deepEqual(N.excludedNoticeLines({ verdict: 'pass', classes: { excluded: real.slice(10, 13).map(D.excludedRow) } }), [
+    '⚠️ ロジザードに送れなかった商品 3 件 (原価が無い 1・仕入先が無い 2) = ほかの商品は今夜ロジザードに送ります',
+    '・<https://bfaith-portal.onrender.com/apps/master-edit/sku/whitekaolin|whitekaolin>: 原価が無い → 商品マスタで原価を入れる',
+    '・<https://bfaith-portal.onrender.com/apps/master-edit/sku/reeddiffuser-st|reeddiffuser-st>: 仕入先が無い → 商品マスタで仕入先を入れる',
+    '・<https://bfaith-portal.onrender.com/apps/master-edit/sku/wae10-ra|wae10-ra>: 仕入先が無い → 商品マスタで仕入先を入れる']);
+  assert.equal(N.excludedLine(row('a|b>c', 'cdb_cost_missing')), '・<https://bfaith-portal.onrender.com/apps/master-edit/sku/a%7Cb%3Ec|a b c>: 原価が無い → 商品マスタで原価を入れる', 'リンクの文字に | > を入れない');
+  const many = N.excludedNoticeLines({ verdict: 'pass', classes: { excluded: real.map(D.excludedRow) } });
+  assert.deepEqual([many.length, many[11]], [12, '・ほか 6 件 (lz-daily の報告 report.json の classes.excluded)']);
+  assert.deepEqual(N.excludedNoticeLines({ verdict: 'pass', classes: { excluded: [] } }), []);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
