@@ -121,7 +121,7 @@ import { photoSource, driveDownload } from '../inbound-check/back-label.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, listDriveFolderMaterialImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, listDriveFolderMaterialImages, MATERIAL_SCAN_LIMITS, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
   isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid, genreIdFromItemUrl,
@@ -4401,7 +4401,22 @@ function lpComposeInitialState(db, draft) {
     // 押したときに素材 (画像フォルダの下のフォルダ) を読むか。読むのは押したときだけ (ここでは Drive を読まない)
     materials_folder: parseDriveLink(draft.drive_folder_url)?.type === 'folder',
     spec: lpSpecSummary(db, 'product_analysis'),
+    shoot_sheet_info: lpComposeShootSheetInfo(db, draft),
   };
+}
+
+/**
+ * 撮影指示書の案内 (どの構成から何カット)。構成ができたら、読み直さなくても撮影指示書の欄の案内を書き換える
+ * (2026-10-21 スタッフ要望: 構成を作った直後も「LP構成がまだ無い」と出たまま)。文は shootSheetStateFor と同じ
+ */
+function lpComposeShootSheetInfo(db, draft) {
+  try {
+    const ip = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draft.id) || null;
+    return shootSheetStateFor(db, draft, ip).infoText;
+  } catch (e) {
+    console.error('[product-hub] 撮影指示書の案内:', String(e?.message || e).slice(0, 200));
+    return null;
+  }
 }
 
 // 誰でも押せる (中原さん 2026-10-01。既存の定型文ボタンと同じ扱い)。
@@ -4430,7 +4445,11 @@ router.post('/api/drafts/:id/lp-compose', async (req, res) => {
       // フォルダ直下も読む (2026-10-21 スタッフ要望): 直下の商品画像の枠 (商品コード_00 / _top / _番号) 以外の画像
       // (色別の nabesiki-be.jpg など) は画像タブにも素材にも入らず、AI が「1 色分しかない」と判定していた。
       // 枠の画像は画像タブ (draft_images) から渡しているので、枠以外だけを素材として先頭に足す
-      const [rootFiles, subFiles] = await Promise.all([listDriveFolderImages(folder.id), listDriveFolderMaterialImages(folder.id)]);
+      // 直下も素材の一覧と同じ時間の上限で読む (Drive が止まっていても押した画面をぶら下げない・Codex)
+      const [rootFiles, subFiles] = await Promise.all([
+        listDriveFolderImages(folder.id, { deadlineMs: MATERIAL_SCAN_LIMITS.deadlineMs }),
+        listDriveFolderMaterialImages(folder.id),
+      ]);
       ({ materials, folderFiles } = lpComposeFolderMaterials({ rootFiles, subFiles, neCode: draft.ne_code, skuLabels }));
     } catch (e) {
       console.error('[product-hub] lp-compose materials failed:', draft.id, String(e?.message || e).slice(0, 300));
@@ -4472,6 +4491,7 @@ router.get('/api/drafts/:id/lp-compose', (req, res) => {
     materials_folder: parseDriveLink(draft.drive_folder_url)?.type === 'folder',
     // 「仕様書: ○○ (YYYY-MM-DD 取込)」。古ければ人が上げ直す (設計 §4.1 のアップロード忘れ対策)
     spec: lpSpecSummary(db, 'product_analysis'),
+    shoot_sheet_info: lpComposeShootSheetInfo(db, draft),
   });
 });
 

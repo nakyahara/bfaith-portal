@@ -390,7 +390,7 @@ export function imagePlan(images) {
  * packet に入れて受付時に固定する (packet_hash で守られる)。スタッフは画面のコピーボタンで
  * 「📝 商品分析を準備」の定型文の最後に貼り、画像をこの順に添付する。AI (スキル) もこれに従う
  */
-export function buildImageGuide(images, materialsOmitted = 0, folderFiles = null) {
+export function buildImageGuide(images, materialsOmitted = 0, folderFiles = null, folderOmitted = 0) {
   const imgs = Array.isArray(images) ? images : [];
   if (!imgs.length) return '';
   const where = (f) => `${f.folder ? f.folder + '/' : ''}${f.name || '名前なし'}${f.sku_label ? ` = ${f.sku_label}` : ''}`;
@@ -418,13 +418,16 @@ export function buildImageGuide(images, materialsOmitted = 0, folderFiles = null
   const files = Array.isArray(folderFiles) ? folderFiles : [];
   if (files.length) {
     const unattached = files.filter((f) => !f.attached);
+    const omitted = Number(folderOmitted) > 0 ? Number(folderOmitted) : 0;
     lines.push('', '【画像フォルダの全画像】',
-      `商品の画像フォルダには、添付したものを含めて全 ${files.length} 枚の画像があります。`
+      `商品の画像フォルダには、添付したものを含めて全 ${files.length + omitted} 枚の画像があります。`
         + '添付していない画像も、フォルダに「ある」素材として扱ってください (デザイナーが使えます)。それで足りる画像は「要追加撮影」にしないでください。');
+    // 一覧を上限で打ち切ったら「全部」とは言わない (載っていない画像を「無い」と判定させない・Codex)
+    if (omitted) lines.push(`(一覧に載せたのは ${files.length} 枚まで。ほかに ${omitted} 枚あり、名前は分かりません。この一覧に無い色・種類も「無い」と決めつけず「要確認」と書いてください)`);
     if (unattached.length) {
       lines.push('添付していない画像:');
       for (const f of unattached.slice(0, MAX_GUIDE_UNATTACHED)) lines.push(`・${f.folder ? '' : '(フォルダ直下) '}${where(f)}`);
-      if (unattached.length > MAX_GUIDE_UNATTACHED) lines.push(`・ほか ${unattached.length - MAX_GUIDE_UNATTACHED} 枚`);
+      if (unattached.length > MAX_GUIDE_UNATTACHED) lines.push(`・ほか ${unattached.length - MAX_GUIDE_UNATTACHED} 枚 (名前は省略。フォルダにあります)`);
     } else {
       lines.push('(全部添付しています)');
     }
@@ -517,7 +520,7 @@ export function buildPacket({ draft, productInfo, colorVariations, images = [], 
     folder_files: folderList,
     folder_files_omitted: folderOmitted,
     // AI にもスタッフにも同じ文 (くらべっこを公平にする・codex #1593 High)
-    image_guide: buildImageGuide(imgs, materialsOmitted, folderList),
+    image_guide: buildImageGuide(imgs, materialsOmitted, folderList, folderOmitted),
     spec_kind: spec.kind,
     spec_id: Number(spec.id),
     spec_hash: spec.hash,
@@ -1479,13 +1482,16 @@ function emptyShootJudgement(jobId, missing) {
  *   summary・cuts の項目名は撮影指示書 (PR-D・lib/shoot-sheet.js) の SUMMARY_FIELDS・CUT_FIELDS と同じ (撮影指示書がそのまま使う)。
  *   images は PR-C の形のまま (v1 の判定から撮影指示書を作るときの材料。v2 では cut・composition にその画像を使うカットから入れる)
  */
-export function latestShootJudgement(db, draftId) {
+export function latestShootJudgement(db, draftId, { allowRejected = false } = {}) {
   const id = posInt(draftId);
   if (!id) return null;
-  const job = db.prepare(`SELECT j.id, j.status, j.output_text, j.shoot_json, j.shoot_error, j.packet_json, j.shoot_spec_id, j.shoot_spec_hash, g.model_check
+  const job = db.prepare(`SELECT j.id, j.status, j.error_code, j.output_text, j.shoot_json, j.shoot_error, j.packet_json, j.shoot_spec_id, j.shoot_spec_hash, g.model_check
     FROM ph_lp_compose_jobs j LEFT JOIN ph_lp_compose_generations g ON g.job_id = j.id
     WHERE j.draft_id = ? ORDER BY j.id DESC LIMIT 1`).get(id);
-  if (!job || job.status !== 'done' || job.model_check !== 'match' || !trim(job.output_text)) return null;
+  // allowRejected = 「チェックを通らなかった構成 (参考)」についた判定も読む (撮影指示書が、できた構成が無いときだけ使う・2026-10-21)。
+  // 撮影判定の箱 (shootSummaryFor) は今までどおりできた構成のものだけ
+  const usable = job && (job.status === 'done' || (allowRejected && job.status === 'failed' && job.error_code === 'rejected'));
+  if (!usable || job.model_check !== 'match' || !trim(job.output_text)) return null;
   let value = null;
   if (job.shoot_json) {
     // 保存した形をもう一度通す (DB を直接触られて壊れたものを、人が決める材料として出さない)。

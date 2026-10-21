@@ -219,6 +219,7 @@ async function cmdClaim(opt) {
       materials_omitted: Number(job.packet.materials_omitted) || 0,
       // 画像フォルダの全画像 (添付していないものも・packet 7)。検品で「フォルダにあるのに無いと判定」していないかを見るため
       folder_files: Array.isArray(job.packet.folder_files) ? job.packet.folder_files : null,
+      folder_files_omitted: Number(job.packet.folder_files_omitted) || 0,
     },
     // 証跡に file_id が要る。packet の並びをそのまま覚えておき、
     // images で n 番目 ↔ file_id を紐づける (Claude に手で写させない)
@@ -514,8 +515,11 @@ function cmdReviewData(id) {
     ...(Array.isArray(m.folder_files) && m.folder_files.some((f) => !f.attached)
       ? ['[画像フォルダにあるが添付していない画像 (フォルダに「ある」素材)]',
         ...m.folder_files.filter((f) => !f.attached).slice(0, 100)
-          .map((f) => `  ${f.folder ? f.folder + '/' : '(直下) '}${f.name || ''}${f.sku_label ? ` = ${f.sku_label}` : ''}`)]
+          .map((f) => `  ${f.folder ? f.folder + '/' : '(直下) '}${f.name || ''}${f.sku_label ? ` = ${f.sku_label}` : ''}`),
+        ...(m.folder_files.filter((f) => !f.attached).length > 100 ? [`  (ほか ${m.folder_files.filter((f) => !f.attached).length - 100} 枚・名前は省略)`] : [])]
       : []),
+    // 一覧を上限で打ち切った (名前の分からない画像がまだある)。載っていない色・種類も「無い」とは限らない
+    ...(Number(m.folder_files_omitted) ? [`  (画像フォルダの一覧は上限で打ち切り。ほかに ${Number(m.folder_files_omitted)} 枚あり、名前は分かりません)`] : []),
     '',
     '[商品情報]',
     nz(m.product_info),

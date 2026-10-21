@@ -1869,9 +1869,8 @@ th.attr-unknown { color: #dc2626; }
           <% } %>
           <div class="muted" style="font-size:11px; margin-top:4px;">
             <% if (shootSheet.ours) { %>作成・更新: <%= String(shootSheet.at || '').slice(0, 16).replace('T', ' ') %> <%= shootSheet.by || '' %> ・<% } %>
-            <% if (shootSheet.source === 'none') { %>LP構成がまだ無いので、カットの表は空で作ります (スプレッドシートで書き足せます)
-            <% } else if (shootSheet.cutsCount) { %>LP構成から撮るカット <%= shootSheet.cutsCount %> 点: <%= shootSheet.cutLabels.join(' / ') %>
-            <% } else { %>LP構成の「使用素材」に撮影が要る画像が見つからないので、カットの表は空で作ります (スプレッドシートで書き足せます)<% } %>
+            <%# どの構成から何カット (文はサーバの shootSheetInfoText だけ。構成ができたら initLpCompose が読み直さずに書き換える) %>
+            <span id="shoot-sheet-info"><%= shootSheet.infoText || '' %></span>
             ・ 置き場は商品の画像フォルダ。更新すると、スプレッドシートで直した内容は上書きされます
           </div>
         </div>
@@ -7421,6 +7420,10 @@ th.attr-unknown { color: #dc2626; }
           + ' / 画像=' + (job.images || []).map((im) => im.label + ':' + im.file_id).join(',')
           + ' / 状態=' + job.status;
       }
+
+      // 撮影指示書の欄の案内 (どの構成から何カット) も書き換える。構成ができた直後に「LP構成がまだ無い」と残さない (2026-10-21)
+      const shootInfo = document.getElementById('shoot-sheet-info');
+      if (shootInfo && s && typeof s.shoot_sheet_info === 'string') shootInfo.textContent = s.shoot_sheet_info;
 
       if (running || checkingModel(job)) schedule(); else stop();
       // 下の「LP構成」(initLpEdit) に、効いている構成がどれかを知らせる。新しい構成ができたら一覧を読み直す

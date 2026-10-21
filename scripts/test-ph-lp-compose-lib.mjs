@@ -791,6 +791,9 @@ console.log('⑭ 素材画像 = 画像フォルダの下のフォルダの画像
   const huge = Array.from({ length: lp.MAX_FOLDER_FILES + 5 }, (_, i) => ({ file_id: 'FILEIDHUGE' + String(i).padStart(4, '0'), name: `h${i}.jpg`, folder: 'x' }));
   const pH = lp.buildPacket({ draft: dF, productInfo: 'x', colorVariations: '', images: products, spec: lp.latestSpec(db), folderFiles: huge }).packet;
   ok(pH.folder_files.length === lp.MAX_FOLDER_FILES && pH.folder_files_omitted === 5, '一覧は上限まで・漏れた数を残す');
+  ok(pH.image_guide.includes(`全 ${lp.MAX_FOLDER_FILES + 5} 枚の画像があります`) && pH.image_guide.includes(`一覧に載せたのは ${lp.MAX_FOLDER_FILES} 枚まで。ほかに 5 枚あり`)
+    && pH.image_guide.includes('「無い」と決めつけず「要確認」'), '🚨 一覧を打ち切ったら「全部」と言わない (載っていない画像を無いと判定させない・Codex)');
+  ok(!pF.image_guide.includes('一覧に載せたのは'), '打ち切っていなければその断りは出さない');
   ok(pH.image_guide.includes(`・ほか ${lp.MAX_FOLDER_FILES - lp.MAX_GUIDE_UNATTACHED} 枚`), '説明に並べる名前も上限まで (残りは数)');
   eqj(lp.buildPacket({ draft: dF, productInfo: 'x', colorVariations: '', images: products, spec: lp.latestSpec(db) }).packet.folder_files, [], '画像フォルダが無ければ一覧は空');
   ok(lp.ACCEPTED_PACKET_VERSIONS.includes(6) && lp.ACCEPTED_PACKET_VERSIONS.includes(7), '🚨 デプロイの時点で待っている版 6 の依頼も claim で受ける');
@@ -903,6 +906,15 @@ console.log('⑮ 素材の一覧 (Drive の画像フォルダのサブフォル�
   const badIdDrive = { files: { list: async ({ q }) => ({ data: { files: q.includes("vnd.google-apps.folder") && q.includes('ROOT00000001') ? [{ id: "bad id'", name: 'x' }] : [] } }) } };
   let e8 = null; try { await listDriveFolderMaterialImages('ROOT00000001', { drive: badIdDrive }); } catch (e) { e8 = e; }
   ok(e8 && /形のおかしいフォルダ ID/.test(e8.message), `🚨 形のおかしい子フォルダ ID は飛ばさず止める (${e8?.message})`);
+  // 直下の一覧 (2026-10-21・LP 構成 AI の受付は直下も読む)。時間の上限を付けられる (Codex: 直下だけ上限なしで画面がぶら下がらない)
+  const { listDriveFolderImages } = await import('../apps/product-hub/services/rakuten-listing.js');
+  const rootGot = await listDriveFolderImages('ROOT00000001', { drive: fakeDrive, deadlineMs: 25_000 });
+  eqj(rootGot.map((g) => g.name), ['top.jpg'], '直下の画像だけ (中のフォルダは読まない)');
+  let e9 = null; try { await listDriveFolderImages('ROOT00000001', { drive: fakeDrive, deadlineMs: 1, }); await new Promise((r) => setTimeout(r, 5)); await listDriveFolderImages('ROOT00000001', { drive: { files: { list: async () => { await new Promise((r) => setTimeout(r, 10)); return { data: { files: [], nextPageToken: 'NEXT' } }; } } }, deadlineMs: 5 }); } catch (e) { e9 = e; }
+  ok(e9 && /秒で読み終わりませんでした/.test(e9.message), `🚨 直下の一覧も時間の上限で止める (${e9?.message})`);
+  let timeoutPassed = null;
+  await listDriveFolderImages('ROOT00000001', { drive: { files: { list: async (_q, opt) => { timeoutPassed = opt?.timeout; return { data: { files: [] } }; } } }, deadlineMs: 25_000 });
+  ok(Number.isFinite(timeoutPassed) && timeoutPassed > 0 && timeoutPassed <= 25_000, `Drive の呼び出しにも残り時間を渡す (${timeoutPassed})`);
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 件成功 / ${fail} 件失敗`);

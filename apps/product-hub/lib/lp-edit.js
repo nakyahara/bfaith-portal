@@ -378,6 +378,30 @@ export function effectiveCompose(db, draftId) {
 }
 
 /**
+ * 「チェックを通らなかった構成 (参考)」= いちばん新しい依頼が検品で rejected になり、書いた構成が残っているもの
+ * (実モデル一致・本文あり)。詳細画面に参考として出している構成と同じ (jobStateFor の draft_text)。
+ * 撮影指示書が、できた構成 (effectiveCompose) が無いときだけ材料にする (2026-10-21 スタッフ要望: 構成を作ったのに
+ * 撮影指示書が「LP構成がまだ無い」になりカット表が空だった)。編集・画像生成には使わない (できた構成だけ)。
+ * 🚨 いちばん新しい依頼だけを見る — 作り直しを頼んだ (queued/running)・別の理由で失敗した後に古い rejected を拾わない
+ * @returns {null|{job, edit:null, text, error?, head?, tail?, slots?}} 形は effectiveCompose と同じ (編集版は無い)
+ */
+export function rejectedComposeDraft(db, draftId) {
+  const id = posInt(draftId);
+  if (!id) return null;
+  const job = db.prepare(`SELECT j.*, g.model_check
+    FROM ph_lp_compose_jobs j LEFT JOIN ph_lp_compose_generations g ON g.job_id = j.id
+    WHERE j.draft_id = ? ORDER BY j.id DESC LIMIT 1`).get(id) || null;
+  if (!job || job.status !== 'failed' || job.error_code !== 'rejected' || job.model_check !== 'match'
+    || job.output_text == null || !String(job.output_text).trim()) return null;
+  const text = job.output_text;
+  const r = readComposition(text);
+  if (!r.ok) return { job, edit: null, text, error: r.error };
+  const aiNeeds = aiNeedsShootOf(job);
+  const slots = r.slots.map((s, i) => ({ ...s, uid: `a${i}`, shoot: aiNeeds ? aiNeeds.get(i) === true : false }));
+  return { job, edit: null, text, head: r.head, tail: r.tail, slots };
+}
+
+/**
  * 画像を作ったあとで構成が変わったか (「生成後に構成が変わりました」の印)。
  * いちばん新しい画像の依頼が、どの構成のどの版で作られたかを時刻で割り出して、いまの本文と比べる
  * (ph_lp_image_jobs は画像生成 (PR-E) の持ち場なので列は足さない)。
