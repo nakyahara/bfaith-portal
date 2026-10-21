@@ -10,7 +10,7 @@
  *   - cdb_sku_id のカードがもうある = 「結んであった」(linked)。増やさない
  *   - 同じ商品コードのカード (cdb_sku_id なし・別の SKU) がもうある = 衝突 (conflict)。増やさない・直さない・記録する (人が決める)
  *     人が決める = 「既存のカードをこの商品に結ぶ」(linkCdbCardToExisting・PR #1566 R1 M6) か、古いカードを片付けて「もう一度」
- *     🆕 2026-10-21: セットの登録で、そのカードが新商品の登録で決めたセットの下書き (構成も同じ・まだ結んでいない) = 衝突にせずに引き継ぐ (linked・taken_over)
+ *     🆕 2026-10-21: セットの登録で、そのカードがセットの下書き (新商品の登録で決めたもの・product-hub の「セット商品を作る」で作ってコードを入れたもの) (構成も同じ・まだ結んでいない) = 衝突にせずに引き継ぐ (linked・taken_over)
  *   - 同じ商品コード (LOWER(TRIM(ne_code))) のカードが 2 枚以上 = どれか決められない衝突 (ambiguous)。結ぶ道も出さない (片付けてから「もう一度」)
  *   - 前に作った・結んだ答え (記録・cdb_sku_id のカード) を使い回すのも、同じコードのカードがそのカード 1 枚だけのときだけ。
  *     SQLite で作った後に Postgres を done にできず、その間に同じコードのカードが増えた = 使い回さず ambiguous (知らせを done にしない・#1566 Codex R3 Medium 2)
@@ -144,7 +144,7 @@ export function applyCdbCardEvent(event, { db = getDB() } = {}) {
       }
       return ambiguous(linked.id);
     }
-    // 🆕 2026-10-21: セットの登録 (マスタの入力) が引き継ぐカード。セットの下書き (新商品の登録で決めたもの) で構成も同じ = そのカードを Company DB のセットに結ぶ
+    // 🆕 2026-10-21: セットの登録 (マスタの入力) が引き継ぐカード。セットの下書き (新商品の登録で決めたもの・product-hub で作ってコードを入れたもの) で構成も同じ = そのカードを Company DB のセットに結ぶ
     //   (新しいカードを作らない)。確かめはこの取引の中 (plannedSetCardCheck)。provisional_code = 1 のまま (NE の商品マスタに取り込まれたら reconcileProvisionalCode が確定する)
     const takeOver = (id) => {
       const d = db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(id);

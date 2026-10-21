@@ -17,7 +17,7 @@
     <div class="ph">
       <div>
         <h1>下書き</h1>
-        <div class="lead">まだ登録が終わっていない商品です。下書きは 2 か所にあります: マスタの入力 (NE にまだ登録していない商品) と、product-hub のセットの下書き (単品の登録で「セット商品を作る」にしたセット)。</div>
+        <div class="lead">まだ登録が終わっていない商品です。下書きは 2 か所にあります: マスタの入力 (NE にまだ登録していない商品) と、product-hub のセットの下書き (単品の登録で「セット商品を作る」にしたセットと、product-hub の「セット商品を作る」で作ってコードを入れたセット)。</div>
       </div>
       <div class="ph-actions">
         <a class="btn" href="<%= base %>/new?kind=set"><svg class="ic" aria-hidden="true"><use href="#i-box"/></svg>新しいセット</a>
@@ -29,7 +29,7 @@
     <section class="panel" id="drafts-ph" aria-labelledby="drafts-ph-h">
       <div class="panel-h"><h2 id="drafts-ph-h">product-hub のセットの下書き</h2>
         <% if (ph && ph.rows) { %><span class="b <%= ph.rows.length ? 'warn' : 'ok' %>" id="drafts-ph-n"><%= ph.rows.length %> 件</span><% } %>
-        <span class="sub">単品の登録で決めたセット。まだマスタの入力にセットとして登録していないもの</span></div>
+        <span class="sub">まだマスタの入力にセットとして登録していないもの (仮コード SET-… のままのカードは、product-hub でコードを入れると出ます)</span></div>
       <% if (ph && ph.error) { %>
         <div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t">product-hub のカードを読めません</div><div class="hint"><%= ph.error %></div></div></div>
       <% } else if (!ph || !ph.rows.length) { %>
@@ -42,7 +42,7 @@
             <tr data-ph-draft="<%= r.draft_id %>">
               <td class="code"><%= r.code %><span class="sub">product-hub #<%= r.draft_id %></span></td>
               <td class="nm"><%= r.name %></td>
-              <td><%= memText(r.members) %><span class="sub">単品 <a href="<%= base %>/sku/<%= encodeURIComponent(r.parent_code) %>"><%= r.parent_code %></a> から</span></td>
+              <td><%= memText(r.members) %><span class="sub"><% if (r.parent_code) { %>単品 <a href="<%= base %>/sku/<%= encodeURIComponent(r.parent_code) %>"><%= r.parent_code %></a> から · <% } %><span data-source="<%= r.source %>"><%= r.source === 'manual' ? 'product-hub で作った' : '単品の登録で決めた' %></span></span></td>
               <td><%= when(r.created_at) %></td>
               <td><% if (r.cdb_code) { %><span class="b info">マスタの入力にもあります</span><span class="sub">カードを結ぶのを待っています</span><% } else { %><span class="b warn">まだ登録していません</span><% } %><% if (PH_STATUS[r.status] && r.status !== 'draft') { %> <span class="b mute"><%= PH_STATUS[r.status] %></span><% } %></td>
               <td style="white-space:nowrap">
