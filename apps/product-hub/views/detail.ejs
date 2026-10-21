@@ -836,7 +836,10 @@ th.attr-unknown { color: #dc2626; }
           <label class="req">売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
           <input type="number" id="f-price" min="0" step="1" value="<%= draft.price != null ? draft.price : '' %>">
           <!-- 利益シミュレーション (Notion 数式の移植 2026-07-28):
-               利益額 = 売価×0.9 − 原価×(1+税率/100) − 配送関係費(=NEが配送方法から自動算出した送料) -->
+               利益額 = 売価×0.9 − 原価×(1+税率/100) − 配送関係費
+               配送関係費 = マスタの送料コード (Company DB core.skus.shipping_*) から決まる送料。毎朝 mirror_products.送料 に写る。
+               🚨 NE の値ではない (NE 登録の CSV に送料は無い)。セットは原価・税率は構成品から自動で決まるが、
+               送料コードは誰も自動で入れない = マスタ編集で入れるまで空 (2026-10-21 調査) -->
           <div id="profit-sim" style="margin-top:6px; font-size:12px;"
                data-cost="<%= neCost?.costExTax ?? '' %>"
                data-ship="<%= neCost?.shippingCost ?? '' %>"
@@ -849,12 +852,32 @@ th.attr-unknown { color: #dc2626; }
                 — 売価と利益は右の「NE商品マスタから自動取得」のSKU表でSKUごとに設定・確認してください</span>
             <% } else if (!neCost || neCost.costExTax == null) { %>
               <span class="muted">利益計算: NEに原価が無いため計算できません (NE登録後に自動反映)</span>
-            <% } else if (neCost.shippingCost == null) { %>
-              <span style="font-size:12px;">原価 <%= neCost.costExTax.toLocaleString() %>円<span class="muted"> (税抜・NE)</span></span>
-              <span class="muted"> — 送料 (配送方法からの自動算出値) が無いため利益計算できません</span>
             <% } else { %>
               <span class="ftag ftag-auto" style="margin-left:0">自動</span>
               <span style="font-size:12px;">原価 <%= neCost.costExTax.toLocaleString() %>円<span class="muted"> (税抜・NE<%= neCost.source === 'members' ? '・全SKU共通' : '' %>)</span></span>
+              <% if (neCost.shippingCost == null) { %>
+                <%# 送料が未登録でも試算の欄は出す (2026-10-21 中原さん: 以前は欄ごと消え、どこに入れるのか分からなかった)。
+                    入れる場所 (マスタ編集の商品の画面の「送料コード」) を案内し、ここで選んだ配送方法で仮の利益を出す %>
+                <%# 送料コードは SKU ごと。バリエーションは代表コード (多くは商品として実在しない) ではなく、
+                    送料が無い子 SKU の画面へ案内する (代表コードの画面は無い・2026-10-21 Codex) %>
+                <% const shipFixSkus = neCost.source === 'members'
+                     ? (neCost.skuCosts || []).filter((s) => s.shippingCost == null).map((s) => s.code)
+                     : [draft.ne_code].filter(Boolean); %>
+                <div id="profit-ship-missing" style="margin-top:6px; padding:6px 8px; border-radius:6px; background:#fef3c7; border:1px solid #f59e0b; font-size:11px; line-height:1.5;">
+                  <% if (neCost.source === 'members' && !shipFixSkus.length) { %>
+                    ⚠ SKU ごとに<strong>送料 (マスタの送料コード)</strong>が違うので、送料が一つに決まりません。
+                    下の「配送方法で試算」で選ぶと<strong>仮の</strong>利益が出ます。
+                  <% } else { %>
+                    ⚠ <%= neCost.source === 'members' ? '送料が入っていない SKU があります' : 'この商品コードには送料がまだ入っていません' %>
+                    (<strong>マスタの送料コード</strong><%= setInfo ? '。新しく作ったセットは自動では入りません' : '' %>)。
+                    下の「配送方法で試算」で選ぶと<strong>仮の</strong>利益が出ます。
+                    正式にはマスタ編集の商品の画面で「送料コード」を入れてください (翌朝からここにも自動で出ます):
+                    <% for (const code of shipFixSkus.slice(0, 10)) { %>
+                      <a href="/apps/master-edit/sku/<%= encodeURIComponent(code) %>" target="_blank" rel="noopener" style="margin-right:6px;"><%= code %> ↗</a>
+                    <% } %><%= shipFixSkus.length > 10 ? `ほか ${shipFixSkus.length - 10} 件` : '' %>
+                  <% } %>
+                </div>
+              <% } %>
               <%# 利益額・利益率は大きく (2026-09-01 中原さん要望)。内訳は下に小さく添える %>
               <div class="profit-figs" id="profit-sim-figs" hidden>
                 <div class="profit-fig"><span class="lbl">利益額</span><span class="val" id="profit-sim-amount">—</span></div>
@@ -863,7 +886,7 @@ th.attr-unknown { color: #dc2626; }
               <div id="profit-sim-body" class="muted" style="font-size:11px; margin-top:4px;"></div>
               <%# 配送方法を差し替えて試算する (2026-09-04 中原さん要望: 配送方法を変えても
                   金額が動かなかった)。楽天の配送方法グループは粒度が粗く送料が一意に決まらないので、
-                  選択肢は NE の配送方法 (= 送料が決まる方) にする %>
+                  選択肢は マスタの送料の配送方法 (= 送料が決まる方・mirror_products の配送方法) にする %>
               <div style="margin-top:6px;">
                 <label style="font-size:11px; margin-bottom:2px;" class="muted">配送方法で試算</label>
                 <select id="profit-ship-select" style="width:100%; font-size:12px;"
@@ -967,23 +990,23 @@ th.attr-unknown { color: #dc2626; }
           <% if (!rakuten?.shipping_method_group) { %>
             <% if (setInfo && neShipping.group) { %>
               <div class="muted" style="font-size:11px; margin-top:4px;">
-                セットは NE の配送方法「<%= neCost?.shippingMethod %>」をそのまま使います（選ばなくても出品できます）。
+                セットはマスタの送料コードの配送方法「<%= neCost?.shippingMethod %>」をそのまま使います（選ばなくても出品できます）。
                 違うものにするならここで選んでください。
               </div>
             <% } else if (setInfo) { %>
               <div style="font-size:11px; margin-top:4px; color:#b45309;">
-                配送方法が決まりません（このままでは出品できません）。NE に本コードが載るのを待つか、ここで選んでください。
+                配送方法が決まりません（このままでは出品できません）。マスタにこのセットの送料コードがまだ入っていません — ここで選ぶか、マスタ編集の商品の画面で送料コードを入れてください。
               </div>
             <% } else if (neShipping.group) { %>
               <div style="font-size:11px; margin-top:4px;">
                 <span style="color:#b45309;">未選択です（このままでは出品できません）。</span>
-                NE は「<%= neCost?.shippingMethod %>」→
+                マスタの送料は「<%= neCost?.shippingMethod %>」→
                 <button type="button" class="btn btn-sm" id="rk-ship-use-ne"
                         data-group="<%= neShipping.group %>">これにする</button>
               </div>
             <% } else { %>
               <div style="font-size:11px; margin-top:4px; color:#b45309;">
-                未選択です（このままでは出品できません）。NE にも配送方法が入っていないので、ここで選んでください。
+                未選択です（このままでは出品できません）。マスタにも送料コードが入っていないので、ここで選んでください。
               </div>
             <% } %>
           <% } %>
@@ -5750,8 +5773,9 @@ th.attr-unknown { color: #dc2626; }
     const tax = box.dataset.tax === '' || box.dataset.tax == null ? null : Number(box.dataset.tax);
     const take = Number(box.dataset.take);
     const priceInput = document.getElementById('f-price');
-    // 配送費は「選んでいる配送方法」で決まる (2026-09-04)。初期値は NE の送料
-    let ship = Number(box.dataset.ship);
+    // 配送費は「選んでいる配送方法」で決まる (2026-09-04)。初期値はマスタの送料 (送料コード)。
+    // 未登録 (空) なら null = 配送方法を選ぶまで利益を出さない (Number('') = 0 で利益を多く見せない・2026-10-21)
+    let ship = box.dataset.ship === '' || box.dataset.ship == null ? null : Number(box.dataset.ship);
     // 利益額・利益率は大きい数字で別枠に出す (2026-09-01)。内訳と未入力メッセージは body 側
     const figs = document.getElementById('profit-sim-figs');
     const amountEl = document.getElementById('profit-sim-amount');
@@ -5760,6 +5784,11 @@ th.attr-unknown { color: #dc2626; }
       if (tax == null || !Number.isFinite(tax)) {
         if (figs) figs.hidden = true;
         body.textContent = '税率が決まっていません (Company DB の税率が決まるまで利益は出しません)';
+        return;
+      }
+      if (ship == null || !Number.isFinite(ship)) {
+        if (figs) figs.hidden = true;
+        body.textContent = '送料が未登録です。下の「配送方法で試算」で配送方法を選ぶと、仮の利益額・利益率が出ます';
         return;
       }
       const price = Number(priceInput.value);
@@ -5818,7 +5847,7 @@ th.attr-unknown { color: #dc2626; }
             op.value = o.method;
             op.dataset.cost = o.cost;
             op.textContent = o.method + ' (' + Math.round(o.cost).toLocaleString() + '円'
-              + (o.isCurrent ? '・NEの登録値' : '') + ')';
+              + (o.isCurrent ? '・登録値' : '') + ')';
             parent.appendChild(op);
           }
         };
@@ -5834,24 +5863,50 @@ th.attr-unknown { color: #dc2626; }
         } else {
           addTo(sel, data.options);
         }
-        // 選択中の配送方法を保つ。無ければ「NEの登録値」の行 → それも無ければ先頭。
+        // 選択中の配送方法を保つ。無ければ「登録値」(マスタの送料) の行 → それも無ければ「選んでください」(送料が未登録・下)。
         // ここで実送料の行を外すと、開いただけで利益額が代表送料に変わる (Codex R3 P1)
         const current = data.options.find((o) => o.isCurrent);
         const want = [chosen, neCurrent].find((v) => v && data.options.some((o) => o.method === v));
-        sel.value = want || current?.method || data.options[0].method;
+        // 送料が未登録 (登録値の行が無い) なら先頭を黙って選ばない (2026-10-21)。楽天の配送方法から 1 つに決まるときだけ
+        // それを仮に選び、決まらなければ「選んでください」の行にする (安い先頭を選ぶと利益を良く見せる)
+        if (!current) {
+          // 送料が登録されていない (または SKU ごとに違って一つに決まらない)。選び直せるように「選んでください」の行を置く。
+          // 初期の選択は、選んでいた行 → マスタの配送方法名 (代表送料・仮) → 楽天の配送方法から 1 つに決まる行 (仮) → 選んでください
+          const ph = document.createElement('option');
+          ph.value = '';
+          ph.textContent = '— 配送方法を選んでください (送料が未登録) —';
+          sel.insertBefore(ph, sel.firstChild);
+          sel.value = want || (near.length === 1 ? near[0].method : '');
+          guessed = !want && near.length === 1;
+        } else {
+          sel.value = want || current.method;
+          guessed = false;
+        }
         apply();
       }
       function apply() {
         const op = sel.selectedOptions[0];
         if (!op) return;
+        if (sel.value === '') {
+          ship = null;
+          note.textContent = '';
+          render();
+          return;
+        }
         ship = Number(op.dataset.cost);
         const isCur = !!data.options.find((o) => o.method === sel.value)?.isCurrent;
+        const registered = data.options.some((o) => o.isCurrent);
         note.textContent = isCur
-          ? 'NE に登録されている送料です'
-          : 'NE は「' + (neCurrent || '未設定') + '」です — ここでの変更は試算だけで、NE や出品内容は変わりません';
+          ? 'マスタに登録されている送料です'
+          : !registered
+            ? (guessed ? '仮: 楽天の配送方法から選びました。'
+              : sel.value === neCurrent ? '仮: 登録されている配送方法「' + neCurrent + '」の代表的な送料です (SKU ごとに送料が違うか、送料が未登録)。'
+                : '仮の試算です。') + 'マスタに送料が一つに決まっていないため、ここでの選択は保存されません'
+            : 'マスタの送料は「' + (neCurrent || '配送方法名なし') + '」です — ここでの変更は試算だけで、マスタや出品内容は変わりません';
         render();
       }
-      sel.addEventListener('change', apply);
+      let guessed = false;
+      sel.addEventListener('change', () => { guessed = false; apply(); });
       if (rkShip) rkShip.addEventListener('change', build);
       build();
     })();

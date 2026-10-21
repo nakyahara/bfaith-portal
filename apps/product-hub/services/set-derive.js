@@ -260,8 +260,9 @@ function insertSetDraftRows(db, parent, { members, name, neCode, mode, actor, ct
   // article_number に統一したので、ここを抜かすと派生したセット商品から型番が消える
   // 🚨 配送方法 (shipping_method_group / postage_included / normal_delivery_date_id) は
   //    **コピーしない** (2026-09-04 §4.4 決⑥)。セットは重く・大きくなるので親と変わる。
-  //    空にしておけば effectiveShippingForDraft が NE の配送方法へフォールバックするので、
-  //    本コードが確定した時点で自動的に NE の値になる。誤った初期値を置いて後から直す方式は
+  //    空にしておけば effectiveShippingForDraft がマスタの送料コードの配送方法 (mirror_products) へフォールバックする。
+  //    🚨 ただしセットの送料コードは誰も自動では入れない (NE 登録の CSV に送料は無い・2026-10-21 調査)。
+  //    マスタ編集で入れるまで空なので、詳細画面がそれを案内する。誤った初期値を置いて後から直す方式は
   //    「直し忘れ」が残り、親の配送方法のまま出品されるほうが危ない。親の値は画面に参考表示する
   const prk = db.prepare('SELECT genre_id, attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(parentId);
   if (prk) {
@@ -318,7 +319,7 @@ function afterSetDraftRows(db, setId, parent, { memberText, dropped, priceInit, 
   }
   logEvent(db, setId, 'shipping_not_copied',
     '配送方法は親からコピーしていません (セットは個数で重さ・大きさが変わるため)。'
-    + 'NE の本コードが確定すると NE の配送方法が使われます',
+    + 'マスタ編集の商品の画面でこのセットの「送料コード」を入れると、出品と利益計算にその配送方法・送料が使われます (自動では入りません)',
     actor);
 }
 
