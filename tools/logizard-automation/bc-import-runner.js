@@ -393,6 +393,14 @@ async function main() {
   return 0;
 }
 
+// 終わり方: process.exit() をすぐ呼ばない。miniPC (Windows・Node 24) で fetch の直後に process.exit() を呼ぶと、
+//   閉じかけの通信の取っ手で libuv が落ちる (Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)・終了コード -1073740791)。
+//   exitCode を置いて自然に終わらせ、何かが残って終わらないときだけ 30 秒後に止める (unref = この時計は終わるのを待たせない)
+function finish(code) {
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 30000).unref();
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  main().then((code) => process.exit(code), (e) => { console.error(`❌ ${e && e.stack || e}`); process.exit(1); });
+  main().then((code) => finish(code), (e) => { console.error(`❌ ${e && e.stack || e}`); finish(1); });
 }
