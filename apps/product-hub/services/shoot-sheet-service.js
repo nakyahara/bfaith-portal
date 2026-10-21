@@ -20,7 +20,7 @@ import {
   acquireShootSheetLease, releaseShootSheetLease, assertShootSheetLease, markShootSheetWriting,
 } from '../db.js';
 import { parseDriveLink } from '../lib/drive-link.js';
-import { effectiveCompose } from '../lib/lp-edit.js';
+import { effectiveCompose, rejectedComposeDraft } from '../lib/lp-edit.js';
 import { latestShootJudgement } from '../lib/lp-compose.js';
 import {
   buildShootSheet, cutsFromComposeText, cutsFromSlots, shootSheetMaterialHash, shootRequestBody, shootSheetBlockReason,
@@ -63,19 +63,24 @@ export function shootSheetConfigured() {
  *     完成イメージ・使用用途・判定の結論) をそのまま使う (項目名は CUT_FIELDS / SUMMARY_FIELDS と同じ)
  *   - PR-C の形 (v1): cut → 撮影内容 / composition 等 → 完成イメージ / ng → 注意 に対応づけ、ほかは空欄。概要も空欄
  *   概要の撮影判定・撮影担当は、どちらでも撮影判定の箱の値 (人が決めた正本・materialOf が上書きする)
- * @returns {{cuts: Array, summary: object, source: 'lp'|'none', composeJobId: number|null, editId: number|null}}
+ * @returns {{cuts: Array, summary: object, source: 'lp'|'lp_draft'|'none', composeJobId: number|null, editId: number|null}}
  */
 export function shootSheetCutsFor(db, draft) {
-  const eff = effectiveCompose(db, draft?.id);
+  // できた構成が無ければ「チェックを通らなかった構成 (参考)」から作る (2026-10-21 スタッフ要望: 構成を作ったのに
+  // 「LP構成がまだ無い」でカット表が空だった)。そのときは source = 'lp_draft' (画面に参考の構成からと出す)
+  let eff = effectiveCompose(db, draft?.id);
+  const fromDraft = !eff;
+  if (!eff) eff = rejectedComposeDraft(db, draft?.id);
   if (!eff) return { cuts: [], summary: {}, source: 'none', composeJobId: null, editId: null };
+  const source = fromDraft ? 'lp_draft' : 'lp';
   const editId = eff.edit ? eff.edit.id : null;
   if (eff.error || !Array.isArray(eff.slots)) {
-    return { cuts: cutsFromComposeText(eff.text), summary: {}, source: 'lp', composeJobId: eff.job.id, editId };
+    return { cuts: cutsFromComposeText(eff.text), summary: {}, source, composeJobId: eff.job.id, editId };
   }
   // 編集版の要撮影が読めたか (slots_json が壊れていると、lp-edit は e<編集版>x<番号> の uid を振って shoot=false にする)
   const hasEditShoot = !!eff.edit && eff.slots.every((sl) => !/^e\d+x\d+$/.test(String(sl.uid)));
   // AI の撮影判定は、効いている構成と同じ構成 (job) のものだけ使う (新しい構成を AI が作り直している途中なら使わない)
-  const judge = latestShootJudgement(db, draft.id);
+  const judge = latestShootJudgement(db, draft.id, { allowRejected: fromDraft });
   const sameJob = !!(judge && judge.available && judge.job_id === eff.job.id);
   const aiImages = sameJob ? judge.images : null;
   // 仕様書の形 (v2・PR-C2) なら AI のカットと概要をそのまま使う。PR-C の形 (v1) は images からの対応づけ (cutsFromSlots の中)
@@ -96,7 +101,15 @@ export function shootSheetCutsFor(db, draft) {
     : modeChanged ? { ...SUMMARY_MODE_CHANGED }
       : (editBroken || !aiSummaryStillValid({ slots: eff.slots, hasEditShoot, aiImages })) ? { ...SUMMARY_NEEDS_REVIEW }
         : { ...judge.summary };
-  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages: aiImagesForCuts, aiCuts }), summary, source: 'lp', composeJobId: eff.job.id, editId };
+  return { cuts: cutsFromSlots({ slots: eff.slots, hasEditShoot, aiImages: aiImagesForCuts, aiCuts }), summary, source, composeJobId: eff.job.id, editId };
+}
+
+/** 詳細画面の撮影指示書の案内 (どの構成から何カット)。初めの描画と、構成ができたときの画面の書き換えで同じ文を使う */
+export function shootSheetInfoText({ source, cutsCount = 0, cutLabels = [] } = {}) {
+  if (source !== 'lp' && source !== 'lp_draft') return 'LP構成がまだ無いので、カットの表は空で作ります (スプレッドシートで書き足せます)';
+  const from = source === 'lp_draft' ? 'チェックを通らなかったLP構成 (参考)' : 'LP構成';
+  if (cutsCount) return `${from}から撮るカット ${cutsCount} 点: ${cutLabels.join(' / ')}`;
+  return `${from}の「使用素材」に撮影が要る画像が見つからないので、カットの表は空で作ります (スプレッドシートで書き足せます)`;
 }
 
 const folderIdOf = (draft) => {
@@ -132,6 +145,7 @@ export function shootSheetStateFor(db, draft, ip) {
     ours, url: ours ? url : null, fileId: ours ? fileId : null, manualUrl: !ours && url ? url : null,
     at: ours ? ip?.shoot_sheet_at || null : null, by: ours ? ip?.shoot_sheet_by || null : null,
     stale, blocked, cutsCount: cuts.length, cutLabels: cuts.map((c) => `${c.lp_image ? c.lp_image + ' ' : ''}${c.content}`.trim()), source,
+    infoText: shootSheetInfoText({ source, cutsCount: cuts.length, cutLabels: cuts.map((c) => `${c.lp_image ? c.lp_image + ' ' : ''}${c.content}`.trim()) }),
   };
 }
 

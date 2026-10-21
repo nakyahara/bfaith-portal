@@ -378,6 +378,41 @@ export function effectiveCompose(db, draftId) {
 }
 
 /**
+ * 「チェックを通らなかった構成 (参考)」= いちばん新しい依頼が検品で rejected になり、書いた構成が残っているもの
+ * (実モデル一致・本文あり)。詳細画面に参考として出している構成と同じ (jobStateFor の draft_text)。
+ * 撮影指示書が、できた構成 (effectiveCompose) が無いときだけ材料にする (2026-10-21 スタッフ要望: 構成を作ったのに
+ * 撮影指示書が「LP構成がまだ無い」になりカット表が空だった)。編集・画像生成には使わない (できた構成だけ)。
+ * 🚨 いちばん新しい依頼だけを見る — 作り直しを頼んだ (queued/running)・別の理由で失敗した後に古い rejected を拾わない
+ * @returns {null|{job, edit:null, text, error?, head?, tail?, slots?}} 形は effectiveCompose と同じ (編集版は無い)
+ */
+export function rejectedComposeDraft(db, draftId) {
+  const id = posInt(draftId);
+  if (!id) return null;
+  const job = db.prepare(`SELECT j.*, g.model_check
+    FROM ph_lp_compose_jobs j LEFT JOIN ph_lp_compose_generations g ON g.job_id = j.id
+    WHERE j.draft_id = ? ORDER BY j.id DESC LIMIT 1`).get(id) || null;
+  if (!job || job.status !== 'failed' || job.error_code !== 'rejected' || job.model_check !== 'match'
+    || job.output_text == null || !String(job.output_text).trim()) return null;
+  const text = job.output_text;
+  const r = readComposition(text);
+  if (!r.ok) return { job, edit: null, text, error: r.error };
+  // 🚨 uid と要撮影は見出しの番号 (# N枚目 の N) で引く。AI の撮影判定は見出しの番号で書かれている。
+  //    できた構成は lint で 0, 1, 2 … の連番と決まっているが、rejected の構成は lint を通っていないので
+  //    番号が飛ぶ・並びが違うことがある (並び順で引くと、要撮影の画像を取り違えてカットが落ちる・Codex)。
+  //    番号が読めない・重なるときは画像ごとに引かず、本文から拾う (cutsFromComposeText)
+  const nos = r.slots.map((s) => {
+    const m = String(s.headingLine || '').match(IMAGE_HEADING_RE);
+    const n = m ? Number.parseInt(m[1].replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)), 10) : NaN;
+    return Number.isInteger(n) && n >= 0 && n <= 99 ? n : null;
+  });
+  if (nos.some((n) => n === null) || new Set(nos).size !== nos.length) return { job, edit: null, text, error: '画像の番号が読めない・重なっています' };
+  const aiNeeds = aiNeedsShootOf(job);
+  // no も見出しの番号にする (撮影指示書の「N枚目」の表示に使う・並び順のままだと 3枚目 が 2枚目 と出る・Codex)
+  const slots = r.slots.map((s, i) => ({ ...s, no: nos[i], uid: `a${nos[i]}`, shoot: aiNeeds ? aiNeeds.get(nos[i]) === true : false }));
+  return { job, edit: null, text, head: r.head, tail: r.tail, slots };
+}
+
+/**
  * 画像を作ったあとで構成が変わったか (「生成後に構成が変わりました」の印)。
  * いちばん新しい画像の依頼が、どの構成のどの版で作られたかを時刻で割り出して、いまの本文と比べる
  * (ph_lp_image_jobs は画像生成 (PR-E) の持ち場なので列は足さない)。

@@ -183,7 +183,7 @@ function imageList(job) {
       n: i + 1, file: `img-${job.job_id}-${i + 1}.jpg`,
       kind: material ? 'material' : 'product',
       role: im.role || null,
-      ...(material ? { folder: im.folder || null, name: im.name || null } : {}),
+      ...(material ? { folder: im.folder || null, name: im.name || null, sku_label: im.sku_label || null } : {}),
     };
   });
 }
@@ -214,9 +214,12 @@ async function cmdClaim(opt) {
       name: job.packet.name, ne_code: job.packet.ne_code,
       product_info: job.packet.product_info, color_variations: job.packet.color_variations,
       images: (job.packet.images || []).length,
-      // 素材 (画像フォルダの下のフォルダの画像) の場所と名前。検品で「使用素材に無い素材を書いていないか」を見るため
-      materials: imageList(job).filter((im) => im.kind === 'material').map(({ n, folder, name }) => ({ n, folder, name })),
+      // 素材 (画像フォルダの、商品画像の枠以外の画像・直下の色別画像も) の場所と名前。検品で「使用素材に無い素材を書いていないか」を見るため
+      materials: imageList(job).filter((im) => im.kind === 'material').map(({ n, folder, name, sku_label }) => ({ n, folder, name, sku_label })),
       materials_omitted: Number(job.packet.materials_omitted) || 0,
+      // 画像フォルダの全画像 (添付していないものも・packet 7)。検品で「フォルダにあるのに無いと判定」していないかを見るため
+      folder_files: Array.isArray(job.packet.folder_files) ? job.packet.folder_files : null,
+      folder_files_omitted: Number(job.packet.folder_files_omitted) || 0,
     },
     // 証跡に file_id が要る。packet の並びをそのまま覚えておき、
     // images で n 番目 ↔ file_id を紐づける (Claude に手で写させない)
@@ -240,7 +243,7 @@ async function cmdClaim(opt) {
       color_variations: job.packet.color_variations,
       images: job.packet.images.length,
       // 何番が商品で何番が素材か (img-<ID>-<n>.jpg の n)。
-      // product = 商品の再現用 (形・ラベル・色)。material = 使用素材の候補 (画像フォルダの下のフォルダの画像)
+      // product = 商品の再現用 (形・ラベル・色)。material = 使用素材の候補 (画像フォルダの、商品画像の枠以外の画像。直下の色別画像と中のフォルダの画像)
       image_list: imageList(job),
       materials_omitted: Number(job.packet.materials_omitted) || 0,
       // 🚨 添付画像の説明 = スタッフの ChatGPT 版にも同じ文を貼る (くらべっこを公平にする)。素材の扱いはこれに従う
@@ -503,11 +506,20 @@ function cmdReviewData(id) {
     `商品名: ${nz(m.name)}`,
     `NEコード: ${nz(m.ne_code)}`,
     `画像: ${Number(m.images) || 0} 枚 (うち素材 ${(m.materials || []).length} 枚・実行役が取得できたのは ${imgs.length} 枚)`,
-    // 素材 = 画像フォルダの下のフォルダの画像。⑦ の「使用素材」はこの中から選ぶ (無い素材を書いていたら指摘)
+    // 素材 = 画像フォルダの、商品画像の枠以外の画像 (直下の色別画像・中のフォルダの画像)。⑦ の「使用素材」はこの中から選ぶ (無い素材を書いていたら指摘)
     ...((m.materials || []).length
-      ? ['[素材の一覧 (n = img-ID-n.jpg)]', ...(m.materials || []).map((x) => `  ${x.n}: ${x.folder ? x.folder + '/' : ''}${x.name || ''}`)]
+      ? ['[素材の一覧 (n = img-ID-n.jpg)]', ...(m.materials || []).map((x) => `  ${x.n}: ${x.folder ? x.folder + '/' : ''}${x.name || ''}${x.sku_label ? ` = ${x.sku_label}` : ''}`)]
       : ['[素材の一覧] (なし)']),
     ...(Number(m.materials_omitted) ? [`  (上限 10 枚で入らなかった素材 ${Number(m.materials_omitted)} 枚)`] : []),
+    // 画像フォルダの全画像のうち添付していないもの (packet 7・古い依頼には無い)。フォルダに「ある」素材として扱う
+    ...(Array.isArray(m.folder_files) && m.folder_files.some((f) => !f.attached)
+      ? ['[画像フォルダにあるが添付していない画像 (フォルダに「ある」素材)]',
+        ...m.folder_files.filter((f) => !f.attached).slice(0, 100)
+          .map((f) => `  ${f.folder ? f.folder + '/' : '(直下) '}${f.name || ''}${f.sku_label ? ` = ${f.sku_label}` : ''}`),
+        ...(m.folder_files.filter((f) => !f.attached).length > 100 ? [`  (ほか ${m.folder_files.filter((f) => !f.attached).length - 100} 枚・名前は省略)`] : [])]
+      : []),
+    // 一覧を上限で打ち切った (名前の分からない画像がまだある)。載っていない色・種類も「無い」とは限らない
+    ...(Number(m.folder_files_omitted) ? [`  (画像フォルダの一覧は上限で打ち切り。ほかに ${Number(m.folder_files_omitted)} 枚あり、名前は分かりません)`] : []),
     '',
     '[商品情報]',
     nz(m.product_info),

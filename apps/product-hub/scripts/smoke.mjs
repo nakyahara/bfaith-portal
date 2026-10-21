@@ -7238,6 +7238,66 @@ let wfSetParentId = null;
         // 編集版は追記専用 (消せない) なので、この商品は残す (ほかの試験は商品コードで引かない)
       }
 
+      // ── 材料 = 「チェックを通らなかった構成 (参考)」(2026-10-21 スタッフ要望: 構成を作ったのに撮影指示書が
+      //    「LP構成がまだ無い」でカット表が空だった。検品で rejected になった構成も画面には参考として出している) ──
+      {
+        const idR = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('DRV-SHEET-R', 'ハッカ油 R', 'smoke', ?)`).run(FOLDER).lastInsertRowid);
+        await call('POST', `/api/drafts/${idR}/shoot-mode`, { mode: 'inhouse' });
+        const blankR = { cut: '', composition: '', props: '', background: '', tone: '', ng: '' };
+        const shootJsonR = JSON.stringify({ recommended: 'inhouse', reason: '2枚目の写真が無い', images: [
+          { no: 0, needs_shoot: false, ...blankR }, { no: 1, needs_shoot: false, ...blankR },
+          { no: 2, needs_shoot: true, cut: '足りない色のカット', composition: '8色を並べる', props: '', background: '白', tone: '自然光', ng: '' }] });
+        const addRejected = (modelCheck = 'match', text = lpText, shootJson = shootJsonR) => {
+          const jid = Number(db.prepare(`INSERT INTO ph_lp_compose_jobs
+            (draft_id, idempotency_key, status, error_code, packet_json, packet_hash, packet_version, spec_id, spec_hash, requested_by, measurement_deadline_at, output_text, shoot_json)
+            VALUES (?, ?, 'failed', 'rejected', '{}', 'p', 1, ?, 'h', 'smoke', '2026-10-09T00:00:00Z', ?, ?)`).run(idR, `ss-key-${++jobSeq}`, specId, text, shootJson).lastInsertRowid);
+          db.prepare(`INSERT INTO ph_lp_compose_generations (job_id, packet_hash, lease_token, status, model, prompt_version, reserved_day, model_check)
+            VALUES (?, 'p', ?, 'rejected', 'claude-opus-5-5', 'lp-compose-v1', '2026-10-09', ?)`).run(jid, `lt-${jid}`, modelCheck);
+          return jid;
+        };
+        const cutsR = () => ssv.shootSheetCutsFor(db, { id: idR });
+        check('撮影指示書の材料: 構成が無ければ今までどおり none', cutsR().source === 'none');
+        const jobR = addRejected();
+        let cr = cutsR();
+        check('🚨 撮影指示書の材料: できた構成が無ければ「チェックを通らなかった構成 (参考)」から作る (AI の撮影判定のカットも使う)',
+          cr.source === 'lp_draft' && cr.composeJobId === jobR && cr.cuts.length === 1 && cr.cuts[0].lp_image.startsWith('2枚目') && cr.cuts[0].content === '足りない色のカット',
+          JSON.stringify(cr));
+        const infoR = ssv.shootSheetInfoText({ source: cr.source, cutsCount: cr.cuts.length, cutLabels: ['x'] });
+        check('撮影指示書の案内: 参考の構成から作ったと分かる', infoR.startsWith('チェックを通らなかったLP構成 (参考)から撮るカット 1 点'), infoR);
+        const pgR = await pageOf(idR);
+        check('画面: 撮影指示書の案内に参考の構成から撮るカットが出る (「LP構成がまだ無い」にしない)',
+          /<span id="shoot-sheet-info">チェックを通らなかったLP構成 \(参考\)から撮るカット 1 点/.test(pgR) && !pgR.includes('LP構成がまだ無いので'));
+        const gR = await call('GET', `/api/drafts/${idR}/lp-compose`);
+        check('🚨 構成の状態の応答にも撮影指示書の案内 (構成ができたら読み直さずに書き換える)',
+          gR.status === 200 && typeof gR.json.shoot_sheet_info === 'string' && gR.json.shoot_sheet_info.startsWith('チェックを通らなかったLP構成 (参考)から'), JSON.stringify(gR.json.shoot_sheet_info));
+        const rR = await sheetFor(idR, {});
+        check('撮影指示書: 参考の構成から作れる (カット 1)', rR.status === 200 && rR.json.cuts === 1, JSON.stringify(rR));
+        check('撮影判定の箱は今までどおり、できた構成の判定だけ (参考の構成の判定は出さない)', (await import('../lib/lp-compose.js')).shootSummaryFor(db, idR) === null);
+        // 実モデルが一致しない (別のモデルで作った) ものは使わない
+        db.prepare(`UPDATE ph_lp_compose_generations SET model_check = 'mismatch' WHERE job_id = ?`).run(jobR);
+        check('撮影指示書の材料: 実モデルが一致しない参考の構成は使わない', cutsR().source === 'none');
+        db.prepare(`UPDATE ph_lp_compose_generations SET model_check = 'match' WHERE job_id = ?`).run(jobR);
+        // 🚨 rejected の構成は lint を通っていないので番号が飛ぶことがある (0・1・3)。AI の判定は見出しの番号で引く (Codex)
+        const skipText = lpText.replace(/^# 2枚目｜/m, '# 3枚目｜');
+        const skipJson = JSON.stringify({ recommended: 'inhouse', reason: '3枚目の写真が無い', images: [
+          { no: 0, needs_shoot: false, ...blankR }, { no: 1, needs_shoot: false, ...blankR },
+          { no: 3, needs_shoot: true, cut: '番号が飛んだ画像のカット', composition: '並べる', props: '', background: '白', tone: '自然光', ng: '' }] });
+        check('撮影指示書の材料: (前提) 番号の飛んだ構成を作れた', skipText !== lpText);
+        addRejected('match', skipText, skipJson);
+        cr = cutsR();
+        check('🚨 撮影指示書の材料: 参考の構成の番号が飛んでいても、要撮影の画像を見出しの番号で取り違えない',
+          cr.source === 'lp_draft' && cr.cuts.length === 1 && cr.cuts[0].content === '番号が飛んだ画像のカット' && cr.cuts[0].lp_image.startsWith('3枚目'), JSON.stringify(cr));
+        // 作り直しを頼んだ (いちばん新しい依頼が queued) なら古い参考の構成は使わない
+        addJob(idR, 'queued', null);
+        check('🚨 撮影指示書の材料: 作り直しを頼んだ後は古い参考の構成を使わない', cutsR().source === 'none');
+        db.prepare(`UPDATE ph_lp_compose_jobs SET status = 'cancelled' WHERE draft_id = ? AND status = 'queued'`).run(idR);
+        // できた構成があればそちらが正本 (後から rejected が来ても、できた構成のまま)
+        addJob(idR, 'done', lpText);
+        addRejected();
+        cr = cutsR();
+        check('撮影指示書の材料: できた構成があればそちら (参考の構成より優先)', cr.source === 'lp', JSON.stringify(cr));
+      }
+
       // ── 撮影依頼文のいつもの宛先 (管理者が画面で変える・2026-10-09 中原さん決定) ──
       const setM = (body) => call('POST', '/api/settings/shoot-mention', body);
       smokeSession = { email: 'sheet-img@b-faith.biz', displayName: '画像登録者', role: 'user' };
@@ -11547,7 +11607,7 @@ for (const [name, file, data] of renders) {
         // LP構成の確認・修正 (2026-10-09 PR-B)。router は詳細画面に常に渡す。既定 = 構成がまだ無い (一覧は隠れる)
         lpEdit: { ok: true, available: false, can_edit: false, max_images: 10, min_images: 2, reason: 'LP構成がまだできていません' },
         // 撮影指示書の自動作成 (2026-10-09 PR-D): router は詳細画面に常に渡す。既定 = まだ作っていない・作れない (撮影判定なし)
-        shootSheet: { ours: false, url: null, manualUrl: null, at: null, by: null, stale: false, blocked: '撮影判定が「社内撮影」か「カメラマン撮影」のときに作れます', cutsCount: 0, cutLabels: [], source: 'none' },
+        shootSheet: { ours: false, url: null, manualUrl: null, at: null, by: null, stale: false, blocked: '撮影判定が「社内撮影」か「カメラマン撮影」のときに作れます', cutsCount: 0, cutLabels: [], source: 'none', infoText: 'LP構成がまだ無いので、カットの表は空で作ります (スプレッドシートで書き足せます)' },
         // 📄 LP構成の仕様書の取り込みカード (段階1・PR1-e)。router は一覧画面に常に渡す。
         // 既定 = 機能オン・いまの版あり (admin に出る形)。機能オフ・未取込の見え方は
         // 「index.ejs (LP仕様書: 機能オフ)」「(まだ取り込まれていない)」の fixture で上書きする

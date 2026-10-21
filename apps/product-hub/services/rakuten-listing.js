@@ -121,13 +121,18 @@ async function downloadDriveImage(fileId) {
  * Drive フォルダ直下の画像ファイル一覧 (共有ドライブ対応・ページング対応)。
  * 1000件を超えるフォルダは商品画像フォルダではない可能性が高いので fail-closed
  * (Codex R2: 打ち切った不完全な一覧で既存画像を置換しないため)。
+ * deadlineMs = 全体の時間の上限 (LP 構成 AI の受付で使う。素材の一覧 MATERIAL_SCAN_LIMITS と同じく、Drive が止まっていても
+ * 押した画面をぶら下げない・2026-10-21 Codex)。省略すれば今までどおり上限なし (画像フォルダの取り込み)
  * @returns {Promise<Array<{id: string, name: string, mimeType: string}>>}
  */
-export async function listDriveFolderImages(folderId) {
-  const drive = getDriveClient();
+export async function listDriveFolderImages(folderId, { drive: client = null, deadlineMs = null } = {}) {
+  const drive = client || getDriveClient();
+  const deadline = deadlineMs ? Date.now() + deadlineMs : null;
   const files = [];
   let pageToken;
   do {
+    const left = deadline ? deadline - Date.now() : null;
+    if (left !== null && left <= 0) throw new Error(`画像フォルダの一覧が ${Math.round(deadlineMs / 1000)} 秒で読み終わりませんでした (Drive が混んでいる可能性)`);
     const res = await drive.files.list({
       q: `'${folderId}' in parents and trashed = false and mimeType contains 'image/'`,
       fields: 'nextPageToken, files(id, name, mimeType, modifiedTime)',
@@ -136,7 +141,7 @@ export async function listDriveFolderImages(folderId) {
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
       pageToken,
-    });
+    }, left !== null ? { timeout: left } : undefined);
     files.push(...(res.data.files || []));
     pageToken = res.data.nextPageToken;
     if (files.length > 1000) {
