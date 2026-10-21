@@ -197,7 +197,8 @@ async function makeDraftSku(code) {
   });
 }
 // 🆕 0061 (2026-10-08 中原さん): 下書きの保存で要る欄 (単品の売上分類・有効期限の管理・推奨保有月数 / セットの推奨保有月数)。試験が入れていなければ足す (外す試験は undefined ではなく null を明示)
-const REQ_NEW = { single: { sales_class: '3', expiry_managed: '0', reorder_months: '1' }, set: { reorder_months: '1' } };
+// 🆕 2026-10-21 中原さん (案 a): セットの発送方法 (送料コード) も必須 = 入れていなければ S01 を足す
+const REQ_NEW = { single: { sales_class: '3', expiry_managed: '0', reorder_months: '1' }, set: { reorder_months: '1', shipping_code: 'S01' } };
 const withReq = (kind, values) => (values && typeof values === 'object' && !Array.isArray(values) ? { ...(REQ_NEW[kind] || {}), ...values } : values);
 const reg = (kind, code, values, card = {}, o = {}) => asEditor(() => R.registerNewSku(db, {
   actor: o.actor ?? 'Naka@Test', requestId: o.requestId ?? uuid(), kind, code, reason: o.reason ?? null, values: withReq(kind, values), card,
@@ -514,9 +515,17 @@ await ta('[R2b] 発送方法なし (2026-10-08 中原さん): 単品もセット
   // 欄が無い (画面が送らない) も同じ
   const r1 = await reg('single', 'noship-2', (({ shipping_code, ...x }) => x)(single()), { create: false });
   assert.deepEqual(r1.shipping, { code: null, method: null, cost_jpy: null });
-  // セットも (代表の仕入先は付けない)
-  const st = await reg('set', 'noship-set-1', { name: '発送方法なしのセット', standard_price: '3000', components: [{ code: 's002', qty: 1 }] }, { create: false });
-  assert.deepEqual([st.kind, st.state, st.shipping], ['set', 'draft', { code: null, method: null, cost_jpy: null }]);
+  // 🆕 2026-10-21 中原さん (案 a): セットは発送方法が必須 = 空・欄なしは 400 (field = shipping_code)・何も保存しない。
+  //   送料コードが空のセットは利益 (商品ハブ・一覧・見込み利益) がずっと出なかった (cranberryp30-2)
+  for (const v of [{ shipping_code: '' }, { shipping_code: null }]) {
+    const e = await rejectsWith(reg('set', 'noship-set-1', { name: '発送方法なしのセット', standard_price: '3000', components: [{ code: 's002', qty: 1 }], ...v }, { create: false }), 400, 'invalid_input');
+    assert.equal(e.extra.field, 'shipping_code');
+    assert.match(e.message, /セットは必須/);
+  }
+  assert.equal(await skuId('noship-set-1'), undefined);
+  // セットで選べば今までどおり (代表の仕入先は付けない)
+  const st = await reg('set', 'ship-set-1', { name: '発送方法ありのセット', standard_price: '3000', shipping_code: 'S02', components: [{ code: 's002', qty: 1 }] }, { create: false });
+  assert.deepEqual([st.kind, st.state, st.shipping], ['set', 'draft', { code: 'S02', method: '宅急便', cost_jpy: 520 }]);
   assert.equal((await one('select count(*)::int as n from core.supplier_skus where sku_id = $1', [st.sku_id])).n, 0);
   // 選べば今までどおり (送料の表で確かめる・気をつけることは出ない・表が読めなければ 503)
   const r2 = await reg('single', 'ship-1', single({ shipping_code: 'S02' }), { create: false });
@@ -1959,7 +1968,7 @@ await ta('[PO3] 登録の前の確かめ (① の前): ほかの仕入先の発�
     assert.match(r.j.error, re, body.code);
     assert.equal(await skuId(body.code), undefined, `${body.code} が Company DB に入った`);
   }
-  const set = await call('POST', '/apps/master-edit/api/new', { session: 'po-editor', body: { request_id: uuid(), kind: 'set', code: 'po-ng-set', values: { name: 'x', standard_price: '1', reorder_months: '1', components: [{ code: 's001', qty: 1 }] }, card: { create: false }, order_settings: { order_lot: '2' } } });
+  const set = await call('POST', '/apps/master-edit/api/new', { session: 'po-editor', body: { request_id: uuid(), kind: 'set', code: 'po-ng-set', values: { name: 'x', standard_price: '1', reorder_months: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }, card: { create: false }, order_settings: { order_lot: '2' } } });
   assert.deepEqual([set.status, set.j.reason], [400, 'order_settings_set']);
   assert.equal(await skuId('po-ng-set'), undefined);
   assert.deepEqual(poCounts(), c0, '断った登録で発注アプリに何か書いた');
@@ -2658,7 +2667,8 @@ await ta('[BL1] 入力なしの決まり (lib): 種類ごとの項目と並び�
   assert.deepEqual(BLK.missingBlankKeys('single', single, { orderApplicable: true }).slice(2, 8), ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit']);
   assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }), ['cost', 'maker', 'shipping_code', 'inbound_date_managed'], 'カードを作らない = カードの欄は数えない');
   assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }, { makerApplicable: false }), ['cost', 'shipping_code', 'inbound_date_managed'], '0084 の欄が無い = メーカーは数えない');
-  assert.deepEqual(BLK.missingBlankKeys('set', { kind: 'set', values: {}, card: {} }, { orderApplicable: true }), ['exception_cost', 'shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls',
+  // 🆕 2026-10-21: セットの発送方法は必須 (入力なしにできない) = 数えない
+  assert.deepEqual(BLK.missingBlankKeys('set', { kind: 'set', values: {}, card: {} }, { orderApplicable: true }), ['exception_cost', 'card.official_url', 'card.amazon', 'card.reference_urls',
     'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'], 'セットに発注の設定は無い');
   // 値があれば数えない (原価 = jpy・Amazon = URL か ASIN・参考 URL = 1 つ以上・発注条件 = 選んだか新しく作る)
   const filled = { ...single, values: { ...single.values, cost: { jpy: '300' }, shipping_code: 'S01', inbound_date_managed: '1', maker: '1' },
@@ -2763,12 +2773,13 @@ await ta('[BL2] 登録の API (単品): 印の無い項目 = 400 (どの項目�
 });
 
 await ta('[BL3] 登録の API (セット・発注の設定): セットは例外原価・発送方法・カードの欄 / 発注アプリに書ける人だけ発注の設定の 6 つも聞く (書けない人 = 聞かない)・発注条件グループの「なし」= 入力なし', async () => {
-  const setBody = { request_id: uuid(), kind: 'set', code: 'bl-set-1', values: { name: '入力なしのセット', standard_price: '2000', reorder_months: '1', components: [{ code: 's001', qty: 2 }] }, card: { create: true } };
+  const setBody = { request_id: uuid(), kind: 'set', code: 'bl-set-1', values: { name: '入力なしのセット', standard_price: '2000', reorder_months: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 2 }] }, card: { create: true } };
   let r = await call('POST', '/apps/master-edit/api/new', { body: setBody, blanks: 'raw' });
   assert.deepEqual([r.status, r.j.reason, r.j.field], [400, 'blank_unmarked', 'exception_cost'], r.text);
   r = await call('POST', '/apps/master-edit/api/new', { body: { ...setBody, blanks: BLK.missingBlankKeys('set', setBody) }, blanks: 'raw' });
   assert.equal(r.status, 200, r.text);
-  assert.match((await regEvents('bl-set-1'))[0].reason, /^新商品の登録 · 入力なし: 例外原価・発送方法・公式ページURL・Amazon・参考URL・Yahoo!売価/);
+  // 🆕 2026-10-21: セットの発送方法は必須 = 入力なしの項目に無い
+  assert.match((await regEvents('bl-set-1'))[0].reason, /^新商品の登録 · 入力なし: 例外原価・公式ページURL・Amazon・参考URL・Yahoo!売価/);
   // 発注アプリの権限が無い人 (editor) = 発注の設定の項目は聞かない (上の BL2 で通っている)・書ける人 (po-editor) = 6 つも聞く
   const po = blankBody('bl-po-1', { card: { create: false } });
   r = await call('POST', '/apps/master-edit/api/new', { body: { ...po, blanks: ['cost', 'maker', 'shipping_code', 'inbound_date_managed'] }, session: 'po-editor', blanks: 'raw' });
@@ -2785,7 +2796,7 @@ await ta('[BL3] 登録の API (セット・発注の設定): セットは例外�
   assert.equal(await skuId('bl-po-2'), undefined);
 });
 
-await ta('[BL4] 画面とつかいかた: 新商品の画面に「入力なし」のチェック (単品 12・発注アプリに書ける人は発注の設定の 4 つも・セット 10)・グループは初めは選ばない形・画面に渡す項目 = サーバーと同じ・つかいかたに決まりと後の門', async () => {
+await ta('[BL4] 画面とつかいかた: 新商品の画面に「入力なし」のチェック (単品 12・発注アプリに書ける人は発注の設定の 4 つも・セット 9 = 発送方法は必須)・グループは初めは選ばない形・画面に渡す項目 = サーバーと同じ・つかいかたに決まりと後の門', async () => {
   const nonesOf = (html) => [...html.matchAll(/<input type="checkbox" data-none="([^"]+)"/g)].map((m) => m[1]);
   const pageOf = (html) => JSON.parse((/<script type="application\/json" id="me-new">([\s\S]*?)<\/script>/.exec(html) || [])[1] || 'null');
   let r = await call('GET', '/apps/master-edit/new?kind=single');
@@ -2800,7 +2811,9 @@ await ta('[BL4] 画面とつかいかた: 新商品の画面に「入力なし�
   assert.deepEqual(nonesOf(r.text).filter((k) => k.startsWith('order_settings.')), ['order_settings.order_lot', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit']);
   for (const id of ['po-cond-mode', 'po-mat-mode']) assert.match((new RegExp('<div class="seg" role="group" id="' + id + '"[^>]*>').exec(r.text) || [''])[0], /data-value=""/, id + ' は初めは選ばない形');
   r = await call('GET', '/apps/master-edit/new?kind=set');
-  assert.deepEqual(nonesOf(r.text), ['exception_cost', 'shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
+  // 🆕 2026-10-21: セットの発送方法は必須 = 「入力なし」のチェックを置かない・必須の印を出す
+  assert.deepEqual(nonesOf(r.text), ['exception_cost', 'card.official_url', 'card.amazon', 'card.reference_urls', 'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path']);
+  assert.ok(r.text.includes('<label class="lab" for="shipping">発送方法<span class="req">必須</span>') && r.text.includes('セットは必須 (利益の計算'), 'セットの発送方法は必須と出す');
   assert.ok(!r.text.includes('セット商品を作るか'), 'セットに単品だけの項目の名前を出さない');
   // 商品の画面の発注の設定には入力なしを出さない (新商品の登録だけ)
   r = await call('GET', '/apps/master-edit/sku/bl-po-1', { session: 'po-editor' });
@@ -3344,7 +3357,7 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
 
 console.log('\nセットの登録が作るセットの下書きを引き継ぐ (2026-10-21 スタッフ「calypso-2-pb が product-hub のセットのカード (下書き) (#252) が使っています」)');
 /** セットの登録の本文 (カードを作る) */
-const setRegBody = (code, components, over = {}) => ({ request_id: uuid(), kind: 'set', code, values: { name: `${code} のセット`, standard_price: '2500', reorder_months: '1', components }, card: { create: true }, ...over });
+const setRegBody = (code, components, over = {}) => ({ request_id: uuid(), kind: 'set', code, values: { name: `${code} のセット`, standard_price: '2500', reorder_months: '1', shipping_code: 'S01', components }, card: { create: true }, ...over });
 /** 作るセットつきで単品を登録して、できたセットの下書き (カード) を返す */
 async function plannedSet(single, setCode, qty = 2) {
   const b = spBody(single, [{ qty, code: setCode, name: `${single} ${qty}個セット` }]);
@@ -3440,7 +3453,7 @@ await ta('[TK3] 確かめた後にカードが変わった (構成を直した) 
   // 登録の取引の中 (コードの鍵の後) の確かめでも、引き継げないカードなら断る (codeReserved = 入口と同じ)
   const planned2 = await plannedSet('sp-race3', 'sp-race3-2');
   ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(planned2.id);
-  const e = await rejectsWith(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'set', code: 'sp-race3-2', values: { name: 'x', standard_price: '2400', reorder_months: '1', components: [{ code: 'sp-race3', qty: 2 }] }, card: { create: true } },
+  const e = await rejectsWith(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'set', code: 'sp-race3-2', values: { name: 'x', standard_price: '2400', reorder_months: '1', shipping_code: 'S01', components: [{ code: 'sp-race3', qty: 2 }] }, card: { create: true } },
     { open: true, now: NOW, shippingRates: RATES, codeReserved: async () => ({ status: 409, reason: 'set_code_reserved', message: '商品コード sp-race3-2 は product-hub のセットのカード (下書き) が使っています', card_url: `/apps/product-hub/detail/${planned2.id}`, draft_id: planned2.id }) })), 409, 'set_code_reserved');
   assert.equal(e.extra.card_url, `/apps/product-hub/detail/${planned2.id}`);
   assert.equal(await skuId('sp-race3-2'), undefined);
@@ -3487,7 +3500,7 @@ await ta('[TK5] Codex R1 Medium: 登録の後 (取り込みの前) にカード�
   assert.notEqual(cardsOf('sp-ex-2')[0].id, p2.id, '除外したカードには結ばない');
   // 断られた登録 (Company DB の決まり) = 予約は dropped (コードの差し替えを止めない)
   const p3 = await plannedSet('sp-dr', 'sp-dr-2');
-  const b3 = setRegBody('sp-dr-2', [{ code: 'sp-dr', qty: 2 }], { values: { name: 'x', standard_price: '2500', reorder_months: '1', components: [{ code: 'sp-dr', qty: 2 }], set_sales_class_override: '3' } });
+  const b3 = setRegBody('sp-dr-2', [{ code: 'sp-dr', qty: 2 }], { values: { name: 'x', standard_price: '2500', reorder_months: '1', shipping_code: 'S01', components: [{ code: 'sp-dr', qty: 2 }], set_sales_class_override: '3' } });
   const r3 = await call('POST', '/apps/master-edit/api/new', { body: b3 });
   assert.equal(r3.status, 400, r3.text);
   assert.equal(ph.prepare('SELECT state FROM ph_set_card_takeovers WHERE request_id = ?').get(b3.request_id).state, 'dropped');

@@ -203,7 +203,7 @@ await ta('[E3] 断る: 取引の外 (もう commit した登録)・ほかの人�
   assert.match(String((await errOf(pg.query(`delete from ops.order_settings_outbox where code = 'posync-s1'`)))?.message), /消さない/);
   assert.ok(await errOf(pg.query('truncate ops.order_settings_outbox')));
   // セットには発注の設定が無い (lib でも断る)
-  e = await errOf(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'set', code: 'posync-set', values: { name: 'x', standard_price: '1', reorder_months: '1', components: [{ code: 's001', qty: 1 }] }, card: { create: false }, order: baseOf() },
+  e = await errOf(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'set', code: 'posync-set', values: { name: 'x', standard_price: '1', reorder_months: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }, card: { create: false }, order: baseOf() },
     { open: true, shippingRates: RATES, orderOutbox: true })));
   assert.equal(e && e.reason, 'order_settings_set');
 });

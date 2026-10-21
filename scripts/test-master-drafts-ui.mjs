@@ -104,6 +104,9 @@ async function ta(name, fn, viewport = { width: 1440, height: 1000 }) {
   await ctx.close();
 }
 const noneRest = (p) => p.evaluate(() => {
+  // 🆕 2026-10-21: セットの発送方法は必須 (入力なしにできない) = 空なら送料の表の先頭を選ぶ
+  const s = document.getElementById('shipping');
+  if (s && !s.value && s.options.length > 1) { s.value = s.options[1].value; s.dispatchEvent(new Event('input', { bubbles: true })); s.dispatchEvent(new Event('change', { bubbles: true })); }
   document.querySelectorAll('input[type="checkbox"][data-none]').forEach((c) => { if (!c.disabled && !c.checked && !window.MasterEdit.none.has(c.getAttribute('data-none'))) c.click(); });
 });
 console.log('下書きの画面・作るセットの下書きを引き継ぐ (画面)');

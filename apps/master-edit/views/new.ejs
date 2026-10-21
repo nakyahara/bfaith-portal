@@ -55,7 +55,7 @@
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
     <% if (locals.prefill && prefill.ok) { %><div class="callout info" id="prefill-note"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">product-hub のセットの下書き #<%= prefill.draft_id %> (<%= prefill.code %>) を、このセットのカードとして引き継いで登録します</div><div class="hint">コード・名前・構成を入れてあります。残りの項目を入れて保存してください。構成を変えると引き継げません。 <a href="<%= prefill.card_url %>" target="_blank" rel="noopener">product-hub で開く ↗</a></div></div></div><% } %>
     <% if (locals.prefill && !prefill.ok) { %><div class="callout warn" id="prefill-note"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= prefill.message %></div><% if (prefill.card_url) { %><div class="hint"><a href="<%= prefill.card_url %>" target="_blank" rel="noopener">product-hub で開く ↗</a></div><% } %></div></div><% } %>
-    <% if (page && !shippingRates) { %><div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">送料の表が読めないので、発送方法を選べません</div><div class="hint">発送方法は空のまま下書きにして、あとで商品の画面で入れられます。いま選ぶときは、少し待ってから画面を開き直してください。</div></div></div><% } %>
+    <% if (page && !shippingRates) { %><div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">送料の表が読めないので、発送方法を選べません</div><div class="hint"><%= isSet ? 'セットは発送方法が必須なので、いまは下書きにできません。少し待ってから画面を開き直してください。' : '発送方法は空のまま下書きにして、あとで商品の画面で入れられます。いま選ぶときは、少し待ってから画面を開き直してください。' %></div></div></div><% } %>
 
     <% if (page) { %>
     <form class="edit" id="f" novalidate data-kind="<%= kind %>" data-can-save="<%= canSave ? '1' : '0' %>">
@@ -159,16 +159,18 @@
 
         <section class="panel" id="sec-ship" aria-labelledby="h-ship">
           <div class="panel-h"><span class="stepno" data-step="sec-ship" aria-hidden="true"><%= no('sec-ship') %></span><h2 id="h-ship">発送</h2></div>
-          <div class="f" data-row="shipping_code"><label class="lab" for="shipping">発送方法<span class="opt">あとでも可</span></label>
+          <%# 🆕 2026-10-21 中原さん: セットは発送方法 (送料コード) が必須 (空だと利益がずっと出ない)。単品は今までどおり「あとでも可」 %>
+          <div class="f" data-row="shipping_code"><label class="lab" for="shipping">発送方法<% if (isSet) { %><span class="req">必須</span><% } else { %><span class="opt">あとでも可</span><% } %></label>
             <div class="ctl">
               <% if (shippingRates) { %>
               <select class="in w-m" id="shipping" data-field="shipping_code" data-dirty-field="shipping_code" data-label="発送方法"<%- part('shipping_code') %><%= dis %>>
                 <option value="">(選ぶ)</option>
                 <% for (const r of shippingRates) { %><option value="<%= r.code %>"><%= r.code %> <%= r.method || '' %> / <%= fmt.yen(r.cost) %> 円</option><% } %>
               </select>
-              <%- none('shipping_code') %>
-              <span class="hint">届いてサイズを見てから決めるときは「入力なし」(あとで商品の画面で入れる) · 送料コード → 方法と金額は送料の表から · product-hub の楽天の配送方法は対応表から (無ければカードに「要確認」)</span>
-              <% } else { %><span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg>送料の表が読めません</span><%- none('shipping_code') %><% } %>
+              <% if (!isSet) { %><%- none('shipping_code') %><% } %>
+              <% if (isSet) { %><span class="hint">セットは必須 (利益の計算・楽天の配送方法に使います。構成品と大きさが変わるので、セットの大きさで選んでください) · 送料コード → 方法と金額は送料の表から</span>
+              <% } else { %><span class="hint">届いてサイズを見てから決めるときは「入力なし」(あとで商品の画面で入れる) · 送料コード → 方法と金額は送料の表から · product-hub の楽天の配送方法は対応表から (無ければカードに「要確認」)</span><% } %>
+              <% } else { %><span class="lockval"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg>送料の表が読めません</span><% if (!isSet) { %><%- none('shipping_code') %><% } %><% } %>
             </div></div>
           <%# 推奨保有月数・ロジザードの有効期限の管理は下書きの保存で要る (2026-10-08 中原さん)。有効期限の管理は初めから選んだ形にしない (選ぶまで保存できない)。入荷日の管理は今までどおり %>
           <div class="f" data-row="reorder_months"><label class="lab" for="f-reorder_months">推奨保有月数<span class="req">必須</span></label>

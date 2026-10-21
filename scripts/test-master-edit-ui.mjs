@@ -972,6 +972,11 @@ await ta('[23] 詳細検索の長い条件 (#1620 Codex R1 M2): 本物の HTTP �
 const fillReq = async (p, { set = false } = {}) => {
   if (!set) { await p.click('#f-sales_class button[data-v="3"]'); await p.click('#f-expiry button[data-v="0"]'); }
   await p.fill('#f-reorder_months', '1');
+  // 🆕 2026-10-21: セットの発送方法は必須 = 空なら送料の表の先頭を選ぶ (単品は今までどおり任意)
+  if (set && (await p.locator('#shipping').count()) && !(await p.inputValue('#shipping'))) {
+    const first = await p.evaluate(() => [...document.querySelectorAll('#shipping option')].map((o) => o.value).find(Boolean));
+    if (first) await p.selectOption('#shipping', first);
+  }
   // 🆕 0080: 単品のロジザードのバーコード (必須 = 値か「空欄」)。ほかの決まりの試験は「空欄」
   if (!set && (await p.locator('#f-lzbc-blank').count())) await p.check('#f-lzbc-blank');
 };
@@ -2613,13 +2618,14 @@ await ta('[66] 入力なし (セット): 例外原価 (例外のときの欄) �
   await p.fill('#f-standard_price', '2400');
   await fillReq(p, { set: true });
   await p.click('#card-create button[data-v="0"]');
-  assert.match(await p.textContent('#save'), /あと 2 つ: 発送方法|あと 2 つ: 例外原価/, 'カードを作らない = 例外原価・発送方法の 2 つ');
+  // 🆕 2026-10-21: セットの発送方法は必須 (fillReq が選んだ) = 入力なしのチェックは無い・残りは例外原価の 1 つ
+  assert.equal(await p.locator('[data-row="shipping_code"] .nonechk').count(), 0, 'セットの発送方法に「入力なし」は無い');
+  assert.match(await p.textContent('#save'), /あと 1 つ: 例外原価/, 'カードを作らない = 例外原価の 1 つ');
   await p.click('#sec-comp details.more > summary');
   await p.click('[data-row="exception_cost"] .nonechk');
-  await p.click('[data-row="shipping_code"] .nonechk');
   assert.match(await p.textContent('#remain'), /下書きを保存できます/);
   await Promise.all([p.waitForURL(/\/sku\/ui-none-set$/), p.click('#save')]);
-  assert.equal(await regReason('ui-none-set'), '新商品の登録 · 入力なし: 例外原価・発送方法');
+  assert.equal(await regReason('ui-none-set'), '新商品の登録 · 入力なし: 例外原価');
 });
 
 await ta('[61] Amazon SKU の新しい対応 (10/13): 開くと構成の 1 行目 (空のコード・数 1・代表) とコードの欄にフォーカス・未保存 0・構成 → 名前 (社内) の順 (Tab も)・「足す」は空の行があれば足さない・コード → 名前が入る・2 行目を足せる (空の行は数えない)・元に戻す・保存', async (p) => {
