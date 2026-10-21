@@ -155,7 +155,7 @@ import {
 import {
   lpComposeEnabled, importSpec as importLpSpec, latestSpec as latestLpSpec, specSummary as lpSpecSummary, SPEC_KIND_LABELS as LP_SPEC_KIND_LABELS,
   requestJob as requestLpComposeJob, requestBlockReason as lpComposeBlockReason, requestPrecheck as lpComposeRequestPrecheck,
-  queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
+  folderMaterials as lpComposeFolderMaterials, queueSummary as lpComposeQueueSummary, claimJob as claimLpComposeJob,
   reserveGeneration as reserveLpComposeGeneration, submitResult as submitLpComposeResult,
   failJob as failLpComposeJob, releaseJob as releaseLpComposeJob,
   lpComposeImageRef, recordImageServed as recordLpComposeImageServed, imagePlan as lpComposeImagePlan, recordModelCheck as recordLpComposeModelCheck, jobStateFor as lpComposeStateFor, LP_COMPOSE_IMAGE_WIDTH, MAX_PRODUCT_IMAGES as LP_COMPOSE_MAX_PRODUCT_IMAGES,
@@ -4413,7 +4413,7 @@ router.post('/api/drafts/:id/lp-compose', async (req, res) => {
   if (!draft) return;
   const db = getDB();
   const spec = latestLpSpec(db, 'product_analysis');
-  const { productInfo, colorVariations, images } = lpComposeMaterial(db, draft);
+  const { productInfo, colorVariations, images, skuLabels } = lpComposeMaterial(db, draft);
   // 素材画像 = 商品の画像フォルダの**サブフォルダ (何階層下でも)** の画像 (2026-10-02 中原さん)。
   // 押したときに 1 回だけ Drive を読み、packet に固定する (画面のポーリング GET では読まない)。
   // 同じキーの再送は前の依頼を返すだけなので読まない (Drive が一時的に落ちていても再送は通る)。
@@ -4423,22 +4423,25 @@ router.post('/api/drafts/:id/lp-compose', async (req, res) => {
   const pre = lpComposeRequestPrecheck(db, { draft, productInfo, spec, images, idempotencyKey: req.body?.idempotency_key });
   if (pre?.code) return res.status(lpReqStatus(pre.code)).json({ ok: false, code: pre.code, error: pre.error });
   let materials = [];
+  let folderFiles = null;
   const folder = parseDriveLink(draft.drive_folder_url);
   if (!pre?.prior && folder && folder.type === 'folder') {
     try {
-      materials = (await listDriveFolderMaterialImages(folder.id)).map((m) => ({
-        file_id: m.id, drive_modified_time: m.modifiedTime, role: 'material', name: m.name, folder: m.folder,
-      }));
+      // フォルダ直下も読む (2026-10-21 スタッフ要望): 直下の商品画像の枠 (商品コード_00 / _top / _番号) 以外の画像
+      // (色別の nabesiki-be.jpg など) は画像タブにも素材にも入らず、AI が「1 色分しかない」と判定していた。
+      // 枠の画像は画像タブ (draft_images) から渡しているので、枠以外だけを素材として先頭に足す
+      const [rootFiles, subFiles] = await Promise.all([listDriveFolderImages(folder.id), listDriveFolderMaterialImages(folder.id)]);
+      ({ materials, folderFiles } = lpComposeFolderMaterials({ rootFiles, subFiles, neCode: draft.ne_code, skuLabels }));
     } catch (e) {
       console.error('[product-hub] lp-compose materials failed:', draft.id, String(e?.message || e).slice(0, 300));
       return res.status(502).json({
         ok: false, code: 'materials_unavailable',
-        error: '素材画像 (画像フォルダの下のフォルダ) を Drive から読めませんでした: ' + String(e?.message || e).slice(0, 160) + ' — もう一度押してください',
+        error: '画像フォルダの画像を Drive から読めませんでした: ' + String(e?.message || e).slice(0, 160) + ' — もう一度押してください',
       });
     }
   }
   const r = requestLpComposeJob(db, {
-    draft, productInfo, colorVariations, images: [...images, ...materials], spec,
+    draft, productInfo, colorVariations, images: [...images, ...materials], spec, folderFiles,
     idempotencyKey: req.body?.idempotency_key, actor: actorOf(req),
   });
   if (!r.ok) return res.status(lpReqStatus(r.code)).json({ ok: false, code: r.code, error: r.error });
@@ -4763,7 +4766,15 @@ function lpComposeMaterial(db, draft) {
       ? [{ drive_file_id: wb.white_bg_drive_file_id, drive_modified_time: wb.white_bg_modified_time, role: 'white_bg' }] : []),
     ...rows.map((r) => ({ drive_file_id: r.drive_file_id, drive_modified_time: r.drive_modified_time, role: 'slot:' + (Number(r.sort) + 1) })),
   ];
-  return { productInfo, colorVariations, images };
+  // SKU の商品コード (小文字) → 色・種類名 (カラバリの行と同じ値)。画像フォルダの「商品コード.jpg」が何色の写真かを AI に伝える (2026-10-21)
+  const skuLabels = new Map();
+  for (const m of (variation?.kind === 'variation' ? (variation.members || []) : [])) {
+    const key = String(m.商品コード || '').trim().toLowerCase();
+    if (!key) continue;
+    const label = String(selectorValues[key] || '').trim() || String(m.商品名 || '').trim();
+    if (label) skuLabels.set(key, label);
+  }
+  return { productInfo, colorVariations, images, skuLabels };
 }
 
 // ─── LP 構成の AI 生成 (段階1・2026-10-01) ───────────────────────

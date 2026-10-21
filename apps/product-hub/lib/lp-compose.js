@@ -29,6 +29,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
 import { lintComposition, lintSummary } from './lp-lint.js';
+import { parseImageFileName } from './folder-import.js';
 import { PRODUCT_ANALYSIS_INSTRUCTION } from './prompt-templates.js';
 import {
   SHOOT_JUDGE_INSTRUCTION, SHOOT_SPEC_INSTRUCTION, validateShootForComposition, shootFormatOfPacket, shootReadModel, shootWarnings,
@@ -53,12 +54,21 @@ import {
 // 6: 撮影判定の仕様書「新商品初動判定」(shoot_spec = {id, kind, hash}・取り込まれていなければ null) を入れた
 //    (画像制作の新フロー PR-C2・2026-10-09)。あれば shoot_instruction は SHOOT_SPEC_INSTRUCTION (形 v2)、
 //    無ければ今までどおり SHOOT_JUDGE_INSTRUCTION (形 v1)。構成の指示文 (instruction) は変えていない
-export const PACKET_VERSION = 6;
+// 7: 画像フォルダの全画像の一覧 (folder_files・名前と添付したか) を入れ、フォルダ直下の商品画像の枠以外の画像
+//    (色別の nabesiki-be.jpg など) も素材として添付するようにした (2026-10-21 スタッフ要望: 8 色の画像があるのに
+//    「1 色分しかない」と判定されて構成が止まった)。素材が足りない画像は構成から外さず「要追加撮影」と書く。
+//    構成の指示文 (instruction) は変えていない
+export const PACKET_VERSION = 7;
 /**
  * claim で受ける packet の版。5 (PR-C) は 6 から shoot_spec を除いただけ (= 仕様書を取り込む前の 6 と同じ材料) なので受ける
- * (デプロイの時点で待っている PR-C の依頼を、押し直しにしない・Codex PR-C2 名指し1 M)。4 以下は今どおり packet_outdated
+ * (デプロイの時点で待っている PR-C の依頼を、押し直しにしない・Codex PR-C2 名指し1 M)。4 以下は今どおり packet_outdated。
+ * 6 は 7 から folder_files を除いただけ (受付時の材料としては正しい) なので、デプロイの時点で待っている依頼も受ける
  */
-export const ACCEPTED_PACKET_VERSIONS = [5, PACKET_VERSION];
+export const ACCEPTED_PACKET_VERSIONS = [5, 6, PACKET_VERSION];
+/** packet に入れる画像フォルダの一覧の上限 (名前だけ。素材の一覧の歯止め maxImages 500 + 直下 より小さく抑える) */
+export const MAX_FOLDER_FILES = 300;
+/** 添付画像の説明 (image_guide) に名前を並べる「添付していない画像」の上限 (それより多いと数だけ書く) */
+export const MAX_GUIDE_UNATTACHED = 60;
 export const PROMPT_VERSION = 'lp-compose-v1';
 export const LEASE_MIN = 40;
 /** 測定の合格ライン (設計 §7.2)。受付時に created_at + これで deadline を固定する */
@@ -335,6 +345,8 @@ function normalizeImagesDetail(images) {
         // AI が「使用素材」に書く名前と、スタッフが同じ素材を探すための場所 (サブフォルダの道筋)
         name: trim(im?.name, 200) || null,
         folder: trim(im?.folder, 300) || null,
+        // ファイル名が SKU の商品コードと同じなら、その SKU の色・種類名 (nabesiki-be.jpg = ベージュ)。無ければ null
+        sku_label: trim(im?.sku_label, 200) || null,
       });
       continue;
     }
@@ -378,33 +390,103 @@ export function imagePlan(images) {
  * packet に入れて受付時に固定する (packet_hash で守られる)。スタッフは画面のコピーボタンで
  * 「📝 商品分析を準備」の定型文の最後に貼り、画像をこの順に添付する。AI (スキル) もこれに従う
  */
-export function buildImageGuide(images, materialsOmitted = 0) {
+export function buildImageGuide(images, materialsOmitted = 0, folderFiles = null) {
   const imgs = Array.isArray(images) ? images : [];
   if (!imgs.length) return '';
+  const where = (f) => `${f.folder ? f.folder + '/' : ''}${f.name || '名前なし'}${f.sku_label ? ` = ${f.sku_label}` : ''}`;
   const lines = ['【添付画像の説明】', `添付した画像は次の ${imgs.length} 枚です (この順に添付しています)。`];
   imgs.forEach((im, i) => {
     const label = imageRoleLabel(im.role);
     lines.push(isMaterialRole(im.role)
-      ? `${i + 1}枚目: 素材画像 (${label}・${im.folder ? im.folder + '/' : ''}${im.name || '名前なし'})`
+      ? `${i + 1}枚目: 素材画像 (${label}・${where(im)})`
       : `${i + 1}枚目: 商品画像 (${label})`);
   });
   const hasMaterial = imgs.some((im) => isMaterialRole(im.role));
   lines.push('', '【画像の使い方】', '- 商品画像は、商品の形・ラベル・色・容量表記を再現する手本です。');
   if (hasMaterial) {
     lines.push(
-      '- 素材画像は、LP の各画像で使う素材の候補です (商品の画像フォルダの中のフォルダにあった画像)。商品そのものの手本にはしないでください。',
+      '- 素材画像は、LP の各画像で使う素材の候補です (商品の画像フォルダにあった、商品画像の枠 (白抜き・TOP・番号つき) 以外の画像。色別・種類別の画像や、中のフォルダの画像)。商品そのものの手本にはしないでください。「= 色名」が付いた画像は、その色・種類の商品の写真です。',
       '- 各画像の「使用素材」には、商品画像を使うなら「提供された実物商品画像」、素材画像を使うなら上の場所と名前 (例: 素材/使用イメージ/玄関.jpg) を書いてください。',
-      '- 上の一覧に無い素材を作ったり、ほかから持ってきたりしないでください。合う素材が無い画像は、素材を使わない構成にしてください。',
+      '- 上の一覧 (と下の画像フォルダの一覧) に無い素材を作ったり、ほかから持ってきたりしないでください。',
     );
-    if (materialsOmitted > 0) lines.push(`- (素材は上限の 10 枚まで。ほかに ${materialsOmitted} 枚ありましたが添付していません)`);
+    if (materialsOmitted > 0) lines.push(`- (素材は上限の ${MAX_MATERIAL_IMAGES} 枚まで。ほかに ${materialsOmitted} 枚ありましたが添付していません)`);
   } else {
     lines.push('- 素材画像はありません。');
+  }
+  // 素材が足りない画像で構成を止めない (2026-10-21 スタッフ要望)。撮れば作れる画像は「要追加撮影」として残し、撮影判定のカットにする
+  lines.push('- 合う素材が無い画像も構成から外さないでください。「使用素材」に「要追加撮影: (何を撮る写真か。色・種類が足りないならどの色か)」と書いてください (撮影指示書のカットにします)。');
+  const files = Array.isArray(folderFiles) ? folderFiles : [];
+  if (files.length) {
+    const unattached = files.filter((f) => !f.attached);
+    lines.push('', '【画像フォルダの全画像】',
+      `商品の画像フォルダには、添付したものを含めて全 ${files.length} 枚の画像があります。`
+        + '添付していない画像も、フォルダに「ある」素材として扱ってください (デザイナーが使えます)。それで足りる画像は「要追加撮影」にしないでください。');
+    if (unattached.length) {
+      lines.push('添付していない画像:');
+      for (const f of unattached.slice(0, MAX_GUIDE_UNATTACHED)) lines.push(`・${f.folder ? '' : '(フォルダ直下) '}${where(f)}`);
+      if (unattached.length > MAX_GUIDE_UNATTACHED) lines.push(`・ほか ${unattached.length - MAX_GUIDE_UNATTACHED} 枚`);
+    } else {
+      lines.push('(全部添付しています)');
+    }
   }
   return lines.join('\n');
 }
 
-export function buildPacket({ draft, productInfo, colorVariations, images = [], spec, shootSpec = null }) {
+/**
+ * 画像フォルダを読んだ結果 → 素材として添付する画像と、全画像の一覧 (2026-10-21 スタッフ要望)。
+ * 直下の商品画像の枠 (商品コード_00 / _top / _番号) は画像タブ (draft_images・白抜き) から商品画像として渡すので、
+ * 枠**以外**の直下の画像 (色別の nabesiki-be.jpg・別の商品コードの画像など) を素材の先頭に足す。続けて中のフォルダの画像。
+ * 以前は中のフォルダだけを素材にしていたので、直下の色別画像が AI にもスタッフの定型文にも渡らず「1 色分しかない」と判定された。
+ * sku_label = ファイル名 (拡張子を除く・小文字) が SKU の商品コードと同じなら、その色・種類名
+ * @param {{rootFiles: Array<{id,name,modifiedTime}>, subFiles: Array<{id,name,modifiedTime,folder}>, neCode: string, skuLabels?: Map<string,string>}} p
+ * @returns {{materials: object[], folderFiles: object[]}}
+ */
+export function folderMaterials({ rootFiles = [], subFiles = [], neCode = '', skuLabels = new Map() } = {}) {
+  const code = String(neCode || '').trim().toLowerCase();
+  // キーの作り方は SKU 画像の取り込み (skuImageKeyOfFileName) と同じ
+  const skuLabelOf = (name) => skuLabels.get(String(name || '').trim().replace(/\.[A-Za-z0-9]{1,5}$/, '').trim().toLowerCase()) || null;
+  const isSlotFile = (name) => {
+    const p = parseImageFileName(name);
+    return !!p && code !== '' && String(p.base || '').trim().toLowerCase() === code;
+  };
+  const root = (rootFiles || []).map((f) => ({
+    file_id: f.id, drive_modified_time: f.modifiedTime || null, name: String(f.name || ''), folder: '', sku_label: skuLabelOf(f.name),
+  }));
+  const sub = (subFiles || []).map((m) => ({
+    file_id: m.id, drive_modified_time: m.modifiedTime || null, name: String(m.name || ''), folder: String(m.folder || ''), sku_label: skuLabelOf(m.name),
+  }));
+  return {
+    materials: [...root.filter((f) => !isSlotFile(f.name)), ...sub].map((m) => ({ ...m, role: 'material' })),
+    // 全画像 (添付しなかったものも名前で伝える。添付したかは buildPacket が file_id で付ける)
+    folderFiles: [...root, ...sub],
+  };
+}
+
+/**
+ * 画像フォルダの全画像 (直下 + 中のフォルダ) → packet に入れる一覧 [{name, folder, sku_label, attached}]。
+ * attached = 添付した画像 (packet.images) に同じ file_id があるか。名前の無いもの・重複 (同じ file_id) は除く。
+ * file_id は入れない (名前で AI とスタッフが探す。packet を小さくする)
+ * @returns {{files: object[], omitted: number}}
+ */
+function normalizeFolderFiles(folderFiles, imgs) {
+  const attachedIds = new Set(imgs.map((im) => im.file_id));
+  const seen = new Set();
+  const files = [];
+  let omitted = 0;
+  for (const f of Array.isArray(folderFiles) ? folderFiles : []) {
+    const id = trim(f?.file_id || f?.id, 200);
+    const name = trim(f?.name, 200);
+    if (!name || (id && seen.has(id))) continue;
+    if (id) seen.add(id);
+    if (files.length >= MAX_FOLDER_FILES) { omitted++; continue; }
+    files.push({ name, folder: trim(f?.folder, 300) || null, sku_label: trim(f?.sku_label, 200) || null, attached: !!(id && attachedIds.has(id)) });
+  }
+  return { files, omitted };
+}
+
+export function buildPacket({ draft, productInfo, colorVariations, images = [], spec, shootSpec = null, folderFiles = null }) {
   const { images: imgs, materialsOmitted } = normalizeImagesDetail(images);
+  const { files: folderList, omitted: folderOmitted } = normalizeFolderFiles(folderFiles, imgs);
   const packet = {
     packet_version: PACKET_VERSION,
     // 🚨 スタッフが ChatGPT に貼る定型文の【実行】と**同じ文**を渡す (設計 §5)。
@@ -431,8 +513,11 @@ export function buildPacket({ draft, productInfo, colorVariations, images = [], 
     images: imgs,
     // 上限 (素材 10 枚) で入らなかった素材の数。画面に「入らなかった素材 N 枚」と出す
     materials_omitted: materialsOmitted,
+    // 画像フォルダの全画像 (添付していないものも・名前だけ・packet 7)。「フォルダにあるのに無いと判定する」を防ぐ
+    folder_files: folderList,
+    folder_files_omitted: folderOmitted,
     // AI にもスタッフにも同じ文 (くらべっこを公平にする・codex #1593 High)
-    image_guide: buildImageGuide(imgs, materialsOmitted),
+    image_guide: buildImageGuide(imgs, materialsOmitted, folderList),
     spec_kind: spec.kind,
     spec_id: Number(spec.id),
     spec_hash: spec.hash,
@@ -486,7 +571,7 @@ export function requestPrecheck(db, { draft, productInfo, spec, images, idempote
  * 同じ draft + idempotency_key は既存の job を返す (二重クリック・通信リトライで増やさない)。
  * @returns {{ok:true, job, created:boolean}|{code:string, error:string}}
  */
-export function requestJob(db, { draft, productInfo, colorVariations, images, spec, idempotencyKey, actor, now = Date.now() } = {}) {
+export function requestJob(db, { draft, productInfo, colorVariations, images, spec, folderFiles = null, idempotencyKey, actor, now = Date.now() } = {}) {
   if (!lpComposeEnabled()) return { code: 'disabled', error: 'PH_LP_COMPOSE_ENABLED が無効です' };
   // 切り詰めない — 81 文字目以降だけ違うキーを同一視すると、別の依頼を既存 job として返す (コード R5)
   const key = exact(idempotencyKey, IDEMPOTENCY_KEY_RE);
@@ -518,7 +603,7 @@ export function requestJob(db, { draft, productInfo, colorVariations, images, sp
     // 撮影判定の仕様書 (新商品初動判定・PR-C2) は受付の瞬間の最新版を固める (画面からは渡さない — 押した人が選ぶものではない)。
     // 取り込まれていなければ null (PR-C の簡単な決まりで判定する)
     const shootSpecRow = latestSpec(db, 'initial_judge');
-    const { packet, hash } = buildPacket({ draft: { ...draft, id: draftId }, productInfo, colorVariations, images, spec: specRow, shootSpec: shootSpecRow });
+    const { packet, hash } = buildPacket({ draft: { ...draft, id: draftId }, productInfo, colorVariations, images, spec: specRow, shootSpec: shootSpecRow, folderFiles });
     recoverExpired(db, now);
     const live = db.prepare(`SELECT * FROM ph_lp_compose_jobs WHERE draft_id = ? AND status IN ('queued','running')`).get(draftId);
     if (live) return { code: 'already_running', error: 'この商品の構成をいま作っています', job: live };

@@ -110,7 +110,7 @@ console.log('②b 🚨 指示文はスタッフの定型文と同じもの 1 つ
   const staff = pt.buildProductAnalysisPrompt({ name: 'ハッカ油スプレー 100ml' }, { product_info_text: '天然ハッカ油' }, '');
   ok(staff.includes(packet.instruction),
     '🚨 スタッフの定型文に同じ文がそのまま入っている (二重に持っていない)');
-  eq(packet.packet_version, 6, 'packet の版が上がっている (形が変わった・4 = 素材画像・5 = 撮影判定の指示 PR-C・6 = 撮影判定の仕様書 PR-C2)');
+  eq(packet.packet_version, 7, 'packet の版が上がっている (形が変わった・4 = 素材画像・5 = 撮影判定の指示 PR-C・6 = 撮影判定の仕様書 PR-C2・7 = 画像フォルダの全画像)');
   // 🚨 撮影判定の指示は別の欄 (PR-C)。構成の指示文 (スタッフと共有の正本) には混ぜない
   ok(typeof packet.shoot_instruction === 'string' && packet.shoot_instruction.includes('needs_shoot')
     && !packet.instruction.includes('撮影判定'), '🚨 撮影判定の指示は shoot_instruction に入り、構成の指示文 (instruction) は変わらない');
@@ -715,7 +715,7 @@ console.log('⑭ 素材画像 = 画像フォルダの下のフォルダの画像
   const rM = lp.requestJob(db, args(dM, lp.latestSpec(db), 'key-mat-1', { now: min(4000), images: [...products, ...materials, { file_id: 'FILEIDPROD00', role: 'material', name: 'dup.jpg' }] }));
   ok(rM.ok, '受け付ける');
   const pM = JSON.parse(rM.job.packet_json);
-  eq(pM.packet_version, 6, 'packet の版 = 6 (4 で素材が入った・5 は撮影判定の指示・6 は撮影判定の仕様書)');
+  eq(pM.packet_version, 7, 'packet の版 = 7 (4 で素材が入った・5 は撮影判定の指示・6 は撮影判定の仕様書・7 は画像フォルダの全画像)');
   eq(pM.images.length, 16, '🚨 商品 6 + 素材 10 = 16 枚');
   eqj(pM.images.slice(0, 6).map((im) => im.role), ['white_bg', 'slot:1', 'slot:2', 'slot:3', 'slot:4', 'slot:5'], '先に商品画像 (6 枚まで・7 枚目は入らない)');
   eqj(pM.images.slice(6).map((im) => im.role), Array.from({ length: 10 }, (_, i) => 'material:' + (i + 1)), '続けて素材 (material:1〜10 を振り直す)');
@@ -734,12 +734,67 @@ console.log('⑭ 素材画像 = 画像フォルダの下のフォルダの画像
   ok(typeof g === 'string' && g.startsWith('【添付画像の説明】'), 'packet に添付画像の説明が入る (受付時に固定・hash で守られる)');
   ok(g.includes('1枚目: 商品画像 (白抜き)') && g.includes('2枚目: 商品画像 (1 TOP)'), '何枚目が商品画像か');
   ok(g.includes('7枚目: 素材画像 (素材1・素材/m0.jpg)') && g.includes('16枚目: 素材画像 (素材10・'), '何枚目が素材か (場所と名前つき)');
-  ok(g.includes('「使用素材」') && g.includes('上の一覧に無い素材を作ったり'), '素材の使い方の決まりが入る');
+  ok(g.includes('「使用素材」') && g.includes('に無い素材を作ったり'), '素材の使い方の決まりが入る');
   ok(g.includes('ほかに 2 枚ありましたが添付していません'), '入らなかった素材の数');
   eq(lp.jobStateFor(db, dM.id, { now: min(4000.5) }).job.image_guide, g, '🚨 画面 (スタッフのコピー用) にも同じ文が渡る');
   const g0 = lp.buildImageGuide([{ file_id: 'X', role: 'white_bg' }]);
-  ok(g0.includes('1枚目: 商品画像 (白抜き)') && g0.includes('素材画像はありません') && !g0.includes('使用素材'), '素材が無ければ素材の決まりは書かない');
+  ok(g0.includes('1枚目: 商品画像 (白抜き)') && g0.includes('素材画像はありません') && !g0.includes('素材画像は、LP の各画像で使う素材の候補') && g0.includes('要追加撮影'),
+    '素材が無ければ素材の決まりは書かない (素材が足りない画像は「要追加撮影」と書く決まりは残す)');
   eq(lp.buildImageGuide([]), '', '画像が無ければ空');
+  ok(g.includes('合う素材が無い画像も構成から外さないでください') && g.includes('要追加撮影'), '🚨 素材が足りない画像は構成から外さず「要追加撮影」と書く (撮影指示書のカットにする・2026-10-21)');
+  ok(!g.includes('素材を使わない構成にしてください'), '「素材を使わない構成に」(画像を外して逃げる) の決まりは消した');
+
+  console.log('⑭b 画像フォルダの直下の色別画像も素材にし、全画像の一覧を渡す (2026-10-21 鍋敷き: 8 色あるのに「1 色分」と判定)');
+  {
+  // 直下: 枠の画像 (_00 / _01) と、色別の画像 (商品コード-色.jpg)・別名の画像。中のフォルダ: 使用イメージ
+  const rootFiles = [
+    { id: 'FILEIDNB0000', name: 'nabesiki_00.jpg', modifiedTime: '2026-10-20T00:00:00Z' },
+    { id: 'FILEIDNB0001', name: 'nabesiki_01.jpg' },
+    ...['be', 'bk', 'gy', 'gr', 'nv', 'pk', 'rd', 'yl'].map((c) => ({ id: 'FILEIDNBC' + c.toUpperCase() + '0', name: `nabesiki-${c}.jpg` })),
+  ];
+  const subFiles = [{ id: 'FILEIDNBSUB1', name: '食卓.jpg', folder: '使用イメージ' }];
+  const skuLabels = new Map([['nabesiki-be', 'ベージュ'], ['nabesiki-bk', 'ブラック']]);
+  const fm = lp.folderMaterials({ rootFiles, subFiles, neCode: 'NABESIKI', skuLabels });
+  eqj(fm.materials.map((m) => m.name), [...rootFiles.slice(2).map((f) => f.name), '食卓.jpg'],
+    '🚨 直下の枠以外の画像 (色別 8 枚) を素材の先頭に・続けて中のフォルダ。枠の画像 (_00 / _01) は素材にしない (商品コードは大文字小文字を区別しない)');
+  ok(fm.materials.every((m) => m.role === 'material') && fm.materials[0].folder === '' && fm.materials[8].folder === '使用イメージ', '役割は素材・直下は folder が空');
+  eqj([fm.materials[0].sku_label, fm.materials[1].sku_label, fm.materials[2].sku_label], ['ベージュ', 'ブラック', null], 'ファイル名が SKU の商品コードなら色名が付く');
+  eq(fm.folderFiles.length, 11, '全画像の一覧は直下 10 + 中のフォルダ 1');
+  eq(lp.folderMaterials({ rootFiles, subFiles: [], neCode: '' }).materials.length, 10, '商品コードが空なら枠の判定をしない (全部素材の候補)');
+
+  const dF = mkDraft('NABESIKI', '鍋敷き');
+  const products = [{ file_id: 'FILEIDNB0000', role: 'white_bg' }, { file_id: 'FILEIDNB0001', role: 'slot:1' }];
+  const rF = lp.requestJob(db, args(dF, lp.latestSpec(db), 'key-folder-1', { now: min(4100), images: [...products, ...fm.materials], folderFiles: fm.folderFiles }));
+  ok(rF.ok, '受け付ける');
+  const pF = JSON.parse(rF.job.packet_json);
+  eq(pF.images.filter((im) => lp.isMaterialRole(im.role)).length, 9, '色別 8 + 使用イメージ 1 を素材として添付');
+  eq(pF.images[2].sku_label, 'ベージュ', '素材にも色名が残る (実行役の画像一覧・検品に出す)');
+  eq(pF.folder_files.length, 11, '🚨 packet に画像フォルダの全画像の一覧');
+  ok(pF.folder_files.every((f) => f.attached === true), '全部添付した (白抜き・TOP は商品画像として・ほかは素材として)');
+  ok(pF.folder_files.every((f) => !('file_id' in f)), '一覧には file_id を入れない (名前で探す)');
+  eq(pF.folder_files_omitted, 0, '一覧から漏れた数');
+  ok(pF.image_guide.includes('3枚目: 素材画像 (素材1・nabesiki-be.jpg = ベージュ)'), '添付画像の説明に色名つき');
+  ok(pF.image_guide.includes('全 11 枚の画像があります') && pF.image_guide.includes('(全部添付しています)'), '画像フォルダの全画像の説明');
+
+  // 素材の上限 (10 枚) を超える: 添付しなかった画像も名前で「ある」と伝える
+  const many = Array.from({ length: 13 }, (_, i) => ({ id: 'FILEIDNBM' + String(i).padStart(3, '0'), name: `nabesiki-c${i}.jpg` }));
+  const fm2 = lp.folderMaterials({ rootFiles: [rootFiles[0], ...many], subFiles: [], neCode: 'nabesiki' });
+  const dF2 = mkDraft('NABESIKI2', '鍋敷き2');
+  const rF2 = lp.requestJob(db, args(dF2, lp.latestSpec(db), 'key-folder-2', { now: min(4101), images: [products[0], ...fm2.materials], folderFiles: fm2.folderFiles }));
+  const pF2 = JSON.parse(rF2.job.packet_json);
+  eq(pF2.materials_omitted, 3, '素材は 10 枚まで');
+  eqj(pF2.folder_files.filter((f) => !f.attached).map((f) => f.name), ['nabesiki-c10.jpg', 'nabesiki-c11.jpg', 'nabesiki-c12.jpg'], '添付しなかった画像が分かる');
+  ok(pF2.image_guide.includes('添付していない画像:') && pF2.image_guide.includes('・(フォルダ直下) nabesiki-c12.jpg')
+    && pF2.image_guide.includes('フォルダに「ある」素材として扱ってください'), '🚨 添付しなかった画像も名前で並べ、「ある」素材として扱えと書く');
+
+  // 一覧の上限
+  const huge = Array.from({ length: lp.MAX_FOLDER_FILES + 5 }, (_, i) => ({ file_id: 'FILEIDHUGE' + String(i).padStart(4, '0'), name: `h${i}.jpg`, folder: 'x' }));
+  const pH = lp.buildPacket({ draft: dF, productInfo: 'x', colorVariations: '', images: products, spec: lp.latestSpec(db), folderFiles: huge }).packet;
+  ok(pH.folder_files.length === lp.MAX_FOLDER_FILES && pH.folder_files_omitted === 5, '一覧は上限まで・漏れた数を残す');
+  ok(pH.image_guide.includes(`・ほか ${lp.MAX_FOLDER_FILES - lp.MAX_GUIDE_UNATTACHED} 枚`), '説明に並べる名前も上限まで (残りは数)');
+  eqj(lp.buildPacket({ draft: dF, productInfo: 'x', colorVariations: '', images: products, spec: lp.latestSpec(db) }).packet.folder_files, [], '画像フォルダが無ければ一覧は空');
+  ok(lp.ACCEPTED_PACKET_VERSIONS.includes(6) && lp.ACCEPTED_PACKET_VERSIONS.includes(7), '🚨 デプロイの時点で待っている版 6 の依頼も claim で受ける');
+  }
 
   // 実行役が落とせる枚数 (codex #1593 Medium): 言わない古い phlp (6 枚まで) には 16 枚の依頼を掴ませない
   const cOld = lp.claimJob(db, { runnerRunId: 'run-old-phlp', now: min(4000.6) });
