@@ -818,7 +818,7 @@ await ta('[C10] 使わない: 理由・NE で何をしたか・確かめた の�
   assert.equal(await regOf('new-d'), 'draft');
 });
 
-await ta('[C11] 🆕 0100: セットの版 ne-reg-set-v2 は試し用の門なし (6 行のセットも 1 つのファイル・試し用でない)・実機の確かめは門の無い版として断る / 単品 (v2) も同じ', async () => {
+await ta('[C11] 🆕 0099: セットの版 ne-reg-set-v2 は試し用の門なし (6 行のセットも 1 つのファイル・試し用でない)・実機の確かめは門の無い版として断る / 単品 (v2) も同じ', async () => {
   await reg('set', 'new-big', { name: '大きいセット', standard_price: '9000', shipping_code: 'S02',
     components: ['s001', 's002', 's003', 's004', 's005', 's006'].map((c) => ({ code: c, qty: 1 })) });
   const big = await build('sets', ['new-big']);
@@ -1249,7 +1249,7 @@ await ta('[V1] 0065 形の版の決まり: lib の REG_SCHEMA_RULES = DB の ops
   assert.equal((await one("select ops.ne_reg_schema_rule('ne-reg-single-v3') as r")).r, null);
   assert.deepEqual([G.REG_SCHEMAS.products.schema, G.REG_SCHEMAS.products.trialGate, G.REG_SCHEMAS.sets.schema, G.REG_SCHEMAS.sets.trialGate], ['ne-reg-single-v2', false, 'ne-reg-set-v2', false]);
   assert.deepEqual(['ne-reg-set-v1', 'ne-reg-set-v2'].map((s) => [G.REG_SCHEMA_RULES[s].buildable, G.REG_SCHEMA_RULES[s].trialGate, G.REG_SCHEMA_RULES[s].header.join(',')]),
-    [[false, true, G.REG_SCHEMAS.sets.header.join(',')], [true, false, G.REG_SCHEMAS.sets.header.join(',')]], '🆕 0100: セットは v2 (見出しは v1 と同じ・門なし)・v1 は引退');
+    [[false, true, G.REG_SCHEMAS.sets.header.join(',')], [true, false, G.REG_SCHEMAS.sets.header.join(',')]], '🆕 0099: セットは v2 (見出しは v1 と同じ・門なし)・v1 は引退');
   const v = G.REG_VARIATION_SCHEMA;
   assert.deepEqual([v.kind, v.skuKind, v.schema, v.header.join(','), v.trialGate], ['products', 'single', 'ne-reg-variation-v1', G.REG_SCHEMAS.products.header.join(','), false]);
   assert.deepEqual(['buildable', 'jan', 'parent'].map((k) => G.REG_SCHEMA_RULES['ne-reg-variation-v1'][k]), [true, 'empty', 'group'], 'まとまりの版 = JAN は empty・代表商品コード = まとまりのコード・🆕 0067 (PR-5) から作れる');
@@ -1273,7 +1273,7 @@ await ta('[V6] 🆕 10/12 実機の確かめを押せるファイル (regVerifyT
     const v = G.regVerifyTargetOf({ kind: r.kind, schema_version: schema, header: hdr(schema) }, G.regSchemaRuleOf(schema));
     return [schema, [v.can, v.why]];
   }));
-  assert.deepEqual(got, { 'ne-reg-single-v1': [false, 'retired'], 'ne-reg-single-v2': [false, 'no_gate'], 'ne-reg-variation-v1': [false, 'no_gate'], 'ne-reg-set-v1': [false, 'retired'], 'ne-reg-set-v2': [false, 'no_gate'] });   // 🆕 0100: 門のある今の版は無い
+  assert.deepEqual(got, { 'ne-reg-single-v1': [false, 'retired'], 'ne-reg-single-v2': [false, 'no_gate'], 'ne-reg-variation-v1': [false, 'no_gate'], 'ne-reg-set-v1': [false, 'retired'], 'ne-reg-set-v2': [false, 'no_gate'] });   // 🆕 0099: 門のある今の版は無い
   // 決まりから導く (版を足したときもこの式で決まる): 押せる = 今の形 (REG_SCHEMAS) かつ trialGate
   for (const [schema, r] of Object.entries(G.REG_SCHEMA_RULES)) {
     const cur = G.REG_SCHEMAS[r.kind];
@@ -1711,7 +1711,7 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T090000000Z_0a5806', '2030-01-10T09:00:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T090000000Z_0a5806', ['new-dup', 'new-x1']);
   assert.equal(await isValid(), true, '停止の床より新しい結果の行の後に開く');
-  // ⑦ 🆕 0100: 単品の許可を出す (grant 'single') とセットの許可も同じ結果の行・同じ期限で出る / 取り消す (revoke 'single') とセットも取り消す (停止の床も両方)。
+  // ⑦ 🆕 0099: 単品の許可を出す (grant 'single') とセットの許可も同じ結果の行・同じ期限で出る / 取り消す (revoke 'single') とセットも取り消す (停止の床も両方)。
   //   セットの許可だけを出す / 取り消すことはできない。セットの許可が無い (取り消した) = セットの CSV を作る / 配る / 渡す の許可の確かめは閉じる
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T100000000Z_0a5807', '2030-01-10T10:00:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T100000000Z_0a5807', ['new-dup', 'new-x1'], { withSet: false });
@@ -1737,12 +1737,12 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
   await pgErr(inSession(() => pg.query('select ops.ne_reg_build($1::jsonb, $2::bytea) as r', [setPay, Buffer.from('x')])), /new_entry_closed: 新商品 \(set\)/);
   const setEx = (await one("select export_id::text as id from ops.ne_reg_exports where kind = 'sets' and state in ('issued', 'declared') order by export_id desc limit 1"))?.id;
   if (setEx) await pgErr(as(E, 'master_edit', () => pg.query('select * from ops.ne_reg_file($1::bigint)', [setEx])), /reg_file_expired/);
-  //   🆕 0100: 取り消し (停止の床) の後の新しい照合の回で単品もセットも開き直す
+  //   🆕 0099: 取り消し (停止の床) の後の新しい照合の回で単品もセットも開き直す
   await pg.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('mc_20300110T103000000Z_0a580a', '2030-01-10T10:30:00Z', 0)`);
   await recordNeCodes(pg, 'mc_20300110T103000000Z_0a580a', ['new-dup', 'new-x1'], { withSet: false });
   assert.equal(await isValid(), true);
   assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, true);
-  //   🆕 0100 を当てた時 (本物の migration の文 @@SET_LEASE_BEGIN@@〜@@SET_LEASE_END@@): 単品の許可だけが有効 (0100 の前の朝の grant) = 同じ結果の行・回・期限でセットの許可を出す /
+  //   🆕 0099 を当てた時 (本物の migration の文 @@SET_LEASE_BEGIN@@〜@@SET_LEASE_END@@): 単品の許可だけが有効 (0099 の前の朝の grant) = 同じ結果の行・回・期限でセットの許可を出す /
   //   もう一度流しても何もしない / 単品の許可が無い = 出さない
   {
     const mig = fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations',
@@ -1750,7 +1750,7 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
     const block = mig.slice(mig.indexOf('-- @@SET_LEASE_BEGIN@@'), mig.indexOf('-- @@SET_LEASE_END@@'));
     assert.match(block, /^-- @@SET_LEASE_BEGIN@@\r?\ndo \$\$/);
     await pg.query('begin'); await pg.query("select set_config('ops.lease_protocol', '1', true)");
-    await pg.query("update ops.master_new_entry_leases set revoked_at = clock_timestamp(), revoke_reason = '試験: 0100 の前の形 (単品の許可だけ)', revoked_by = 'test' where kind = 'set' and revoked_at is null");
+    await pg.query("update ops.master_new_entry_leases set revoked_at = clock_timestamp(), revoke_reason = '試験: 0099 の前の形 (単品の許可だけ)', revoked_by = 'test' where kind = 'set' and revoked_at is null");
     await pg.query('commit');
     assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, false);
     const nL = async () => (await one('select count(*)::int as n from ops.master_new_entry_leases')).n;
@@ -1760,7 +1760,7 @@ await ta('[W2] 0058 (広げる道 §3.9 の 3・4): 配ったファイルは ops
     const lp = await q(`select kind, result_id::text as r, compare_run_id as c, granted_at::text as g, expires_at::text as x, granted_by from ops.master_new_entry_leases
        where revoked_at is null order by kind`);
     assert.deepEqual(lp.map((x) => [x.kind, x.r, x.c, x.g, x.x]), [['set', lp[1].r, lp[1].c, lp[1].g, lp[1].x], ['single', lp[1].r, lp[1].c, lp[1].g, lp[1].x]]);
-    assert.match(lp[0].granted_by, /^0100 で単品の許可 \(lease \d+\) に合わせて出した$/);
+    assert.match(lp[0].granted_by, /^0099 で単品の許可 \(lease \d+\) に合わせて出した$/);
     assert.equal((await one("select ops.new_entry_lease_valid('set') as v")).v, true);
     await pg.query(block);
     assert.equal(await nL(), n0 + 1, 'もう一度流しても何もしない');
@@ -2497,7 +2497,7 @@ try {
     const sc = await checkScripts(r.text, 0);
     const rcJs = sc.find((x) => x.includes('me-regcsv.js — NE 登録の CSV の画面')) || '';
     for (const api of ["'/api/reg-csv/build-all'", "'/api/reg-csv/verified'", "'/declare'", "'/supersede'", "'/issue'", "'/file'"]) assert.ok(rcJs.includes(api), `画面が ${api} を呼んでいない`);
-    assert.match(r.text, /new-web/); assert.match(r.text, /NE にもうある/); assert.match(r.text, /セットの CSV の形 \(ne-reg-set-v2\)/);   // 🆕 0100: セットも門なし (試し用の文は出ない)
+    assert.match(r.text, /new-web/); assert.match(r.text, /NE にもうある/); assert.match(r.text, /セットの CSV の形 \(ne-reg-set-v2\)/);   // 🆕 0099: セットも門なし (試し用の文は出ない)
     assert.match(r.text, /value="new-web"(?![^>]*disabled)/);
     r = await call('GET', '/apps/master-edit/reg-csv', { session: 'naka@test' });
     assert.match(r.text, /名簿の人だけ/); assert.match(r.text, /value="new-web" disabled/);
@@ -2505,7 +2505,7 @@ try {
     assert.equal(s.j.applied, true);
   });
 
-  await ta('[H3] 🆕 10/12 画面の「この形を実機で確かめた」: 試し用で商品が全部 NE で確かめ済みのファイルのうち、押せる (今の形 + 門のある版) ものだけボタン (🆕 0100 = 門のある今の版は無い = どれも出ない)・引退した版 (v1) はボタンも「本番の行数で作れるようになります」も出さず一言・API も同じ文で 409', async () => {
+  await ta('[H3] 🆕 10/12 画面の「この形を実機で確かめた」: 試し用で商品が全部 NE で確かめ済みのファイルのうち、押せる (今の形 + 門のある版) ものだけボタン (🆕 0099 = 門のある今の版は無い = どれも出ない)・引退した版 (v1) はボタンも「本番の行数で作れるようになります」も出さず一言・API も同じ文で 409', async () => {
     // 本物の v1 のファイル ([V5] の V1_ISSUED) は画面の「最近の 30 件」から外れている = 同じ形のファイルを版ごとに置く (fixtures/reg-csv-trial-done.mjs)
     const { seedTrialDoneExport } = await import('./fixtures/reg-csv-trial-done.mjs');
     const ids = {};
@@ -2519,7 +2519,7 @@ try {
     const set = done.find((e) => e.export_id === ids['ne-reg-set-v1']);
     assert.ok(v1 && set, `引退した v1 とセットの試し用のファイル (全部確かめ済み) が画面に出ている: ${done.map((e) => e.schema_version).join(',')}`);
     assert.deepEqual(Object.fromEntries(Object.entries(ids).map(([k, id]) => [k, ((x) => (x ? x.verify.why : 'none'))(done.find((e) => e.export_id === id))])),
-      { 'ne-reg-single-v1': 'retired', 'ne-reg-set-v1': 'retired', 'ne-reg-single-v2': 'no_gate', 'ne-reg-variation-v1': 'no_gate', 'ne-reg-set-v2': 'no_gate' });   // 🆕 0100: セットの v1 も引退
+      { 'ne-reg-single-v1': 'retired', 'ne-reg-set-v1': 'retired', 'ne-reg-single-v2': 'no_gate', 'ne-reg-variation-v1': 'no_gate', 'ne-reg-set-v2': 'no_gate' });   // 🆕 0099: セットの v1 も引退
     for (const e of done) {
       const c = cardOf(e.export_id);
       assert.equal((c.match(/data-act="verified"/g) || []).length, e.verify.can ? 2 : 0, `#${e.export_id} ${e.schema_version}`);
@@ -2552,7 +2552,7 @@ try {
       }
     }
     assert.equal((await q('select 1 from ops.ne_csv_verified')).length, nRec, '何も記録しない');
-    // 🆕 0100: 引退したセットの v1 = 409 retired (何も記録しない)
+    // 🆕 0099: 引退したセットの v1 = 409 retired (何も記録しない)
     const xs = await call('POST', '/apps/master-edit/api/reg-csv/verified', { body: { kind: 'sets', result: 'ok', export_id: set.export_id, request_id: uuid() } });
     assert.deepEqual([xs.status, xs.j.reason, xs.j.why, xs.j.error], [409, 'export_mismatch', 'retired', set.verify.message]);
     assert.equal((await q('select 1 from ops.ne_csv_verified')).length, nRec, '何も記録しない');

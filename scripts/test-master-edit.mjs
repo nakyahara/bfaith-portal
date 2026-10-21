@@ -2730,7 +2730,7 @@ await ta('[22] 1 つの商品の画面の「← 前へ」「次へ →」(10/17 
   assert.deepEqual(await R.listNeighbors(db, { sort: 'profit' }, all[mid], { now: NOW }), expect(all, mid));
 });
 
-await ta('[11L] 🆕 0100: 構成の持ち主が load (NE が正) = 依頼を閉じるだけ (core の構成は書かない): 観測 ≠ 依頼 = mismatch・観測 = 依頼でも core がまだ = 次の観測でもう一度・夜間ロードが NE の中身を core に書いた後 = applied (並びは見ない)・依頼が無い = 何もしない (食い違いも開かない)', async () => {
+await ta('[11L] 🆕 0099: 構成の持ち主が load (NE が正) = 依頼を閉じるだけ (core の構成は書かない): 観測 ≠ 依頼 = mismatch・観測 = 依頼でも core がまだ = 次の観測でもう一度・夜間ロードが NE の中身を core に書いた後 = applied (並びは見ない)・依頼が無い = 何もしない (食い違いも開かない)', async () => {
   const LOAD_COMP = { ...ALL_COMPANY, sku_components: 'load' };
   const p = (id) => promote(id, { ownership: LOAD_COMP });
   const SET = 'set001';

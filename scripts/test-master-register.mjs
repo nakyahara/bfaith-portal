@@ -64,7 +64,7 @@ initMirrorDB();   // 本番では server.js が起動時に行う
 const PHDB = await import('../apps/product-hub/db.js');
 const PH = await import('../apps/product-hub/services/cdb-card-intake.js');
 
-/** 🆕 0100 (セットを構成の持ち主 load のまま登録・仮番号 = マージの時に付け替える) の migration のファイル名 */
+/** 🆕 0099 (セットを構成の持ち主 load のまま登録・仮番号 = マージの時に付け替える) の migration のファイル名 */
 const SET_ENTRY_MIG_RE = /^\d{4}_set_entry_on_load\.sql$/;
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -450,7 +450,7 @@ await ta('[R1] 段階 new_open でも、持ち主が load (今の本番の持ち
   await W2.setActiveOwnershipInDb(pg, ALL_COMPANY);
   e = await rejectsWith(reg('single', 'new-a1', single(), {}, { open: false }), 409, 'before_cutover');
   assert.equal(e.extra.open, false);
-  // 🆕 0100: 構成 (sku_components) が load でもセットは登録できる (構成は依頼だけ・core.sku_components は書かない)。ほかの列が load なら今までどおり 409
+  // 🆕 0099: 構成 (sku_components) が load でもセットは登録できる (構成は依頼だけ・core.sku_components は書かない)。ほかの列が load なら今までどおり 409
   await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, sku_components: 'load', 'skus.name': 'load' });
   e = await rejectsWith(reg('set', 'new-set-x', { name: 'x', standard_price: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }, {}), 409, 'before_cutover');
   assert.deepEqual(e.extra.load_keys, ['skus.name'], '構成 (依頼だけ) は load でよい = 断る理由に入れない');
@@ -705,7 +705,7 @@ await ta('[R9] 編集の印に登録の状態が入る (状態が変わった = 
   const tokA1 = W.editTokenOf(await W.readCurrent(db, a1, TODAY));
   const r = await asEditor(() => W.saveSku(db, { actor: 'naka@test', requestId: uuid(), code: 'new-a1', reason: null, seen: { token: tokA1 }, values: { reorder_months: '2' } }, { ownership: ALL_COMPANY, open: true, now: NOW }));
   assert.deepEqual(r.changed.map((c) => c.field), ['reorder_months']);
-  // 🆕 0100 (PR-0 Codex R1 Medium): 登録した直後のセット (今の構成が空・構成は依頼だけ) も名前・売価・送料を直せる (依頼の構成で確かめる)。導く値は空の構成で消さない
+  // 🆕 0099 (PR-0 Codex R1 Medium): 登録した直後のセット (今の構成が空・構成は依頼だけ) も名前・売価・送料を直せる (依頼の構成で確かめる)。導く値は空の構成で消さない
   const ns = await skuId('new-set-load');
   const before = await one('select tax_rate::float8 as t, handling, (select cost_jpy::int from core.sku_costs c where c.sku_id = s.sku_id and c.valid_to is null) as c from core.skus s where s.sku_id = $1', [ns]);
   const tokS = W.editTokenOf(await W.readCurrent(db, ns, TODAY));
@@ -946,7 +946,7 @@ await ta('[G4] 画面のロールが登録の関数を直接呼んで値を偽�
 await ta('[G-0060] 登録の関数の作り直し (0060): 0058 の本文との違いは「単品の代表の仕入先」「発送方法なし」「気をつけることの 1 行」の 3 か所だけ・権限はそのまま', async () => {
   const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
   const fnOf = (file) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf('create or replace function ops.register_new_sku('); assert.ok(i >= 0, file); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
-  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0058' && !['0060', '0061'].includes(x.slice(0, 4)) && !SET_ENTRY_MIG_RE.test(x));   // 🆕 0100 の作り直しは [G-0100] が見る
+  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0058' && !['0060', '0061'].includes(x.slice(0, 4)) && !SET_ENTRY_MIG_RE.test(x));   // 🆕 0099 の作り直しは [G-0099] が見る
   for (const file of later) assert.ok(!/function\s+ops\.register_new_sku\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), file + ' も登録の関数を作り直している = 0060 の元にする定義を見直す');
   const a = fnOf('0058_master_widen.sql').split('\n'); const b = fnOf('0060_master_register_required_fields.sql').split('\n');
   // 差 = 0060 で足した行だけ (0058 の行は全部同じ順で残る。変えたのは送料の確かめの if → elsif の 1 行)
@@ -1009,7 +1009,7 @@ await ta('[R-0061] 下書きの保存で要る欄 (2026-10-08 中原さん): 単
 await ta('[G-0061] 登録の関数の作り直し (0061): 0060 の本文との違いは「推奨保有月数が要る」「単品の売上分類が要る」の 2 か所 (4 行) だけ・DB を直接呼んでも空は断る・権限はそのまま', async () => {
   const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
   const fnOf = (file) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf('create or replace function ops.register_new_sku('); assert.ok(i >= 0, file); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
-  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0061' && !SET_ENTRY_MIG_RE.test(x));   // 🆕 0100 の作り直しは [G-0100] が見る
+  const later = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x) && x.slice(0, 4) > '0061' && !SET_ENTRY_MIG_RE.test(x));   // 🆕 0099 の作り直しは [G-0099] が見る
   for (const file of later) assert.ok(!/function\s+ops\.register_new_sku\s*\(/i.test(fs.readFileSync(path.join(MIG, file), 'utf8')), file + ' も登録の関数を作り直している = 0061 の元にする定義を見直す');
   const a = fnOf('0060_master_register_required_fields.sql').split('\n'); const b = fnOf('0061_master_register_require_class_months.sql').split('\n');
   const added = []; let i = 0;
@@ -1040,26 +1040,26 @@ await ta('[G-0061] 登録の関数の作り直し (0061): 0060 の本文との�
      from pg_proc where oid = 'ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)'::regprocedure`), { pub: false, me: true, d: true });
 });
 
-await ta('[G-0100] 🆕 0100 (セットを構成の持ち主 load のまま登録): 登録の関数は 0061 との違いが「セットも許可」の 1 行だけ・書き込みの守りは 0051 との違いが continue の 3 行だけ・権限はそのまま', async () => {
+await ta('[G-0099] 🆕 0099 (セットを構成の持ち主 load のまま登録): 登録の関数は 0061 との違いが「セットも許可」の 1 行だけ・書き込みの守りは 0051 との違いが continue の 3 行だけ・権限はそのまま', async () => {
   const MIG = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', 'db', 'company', 'migrations');
   const files = fs.readdirSync(MIG).filter((x) => /^\d{4}_.*\.sql$/.test(x));
-  const f0100 = files.find((x) => SET_ENTRY_MIG_RE.test(x));
-  assert.ok(f0100, '0100 (セットの登録) の migration が無い');
+  const f0099 = files.find((x) => SET_ENTRY_MIG_RE.test(x));
+  assert.ok(f0099, '0099 (セットの登録) の migration が無い');
   const fnOf = (file, head) => { const t = fs.readFileSync(path.join(MIG, file), 'utf8').replace(/\r\n/g, '\n'); const i = t.indexOf(head); assert.ok(i >= 0, `${file}: ${head}`); return t.slice(i, t.indexOf('\nend $$;\n', i) + 9); };
   for (const [re, label] of [[/function\s+ops\.register_new_sku\s*\(/i, '登録の関数'], [/function\s+ops\.guard_master_edit_write\s*\(/i, '書き込みの守り']]) {
-    for (const file of files.filter((x) => x > f0100)) assert.ok(!re.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も${label}を作り直している = [G-0100] を見直す`);
+    for (const file of files.filter((x) => x > f0099)) assert.ok(!re.test(fs.readFileSync(path.join(MIG, file), 'utf8')), `${file} も${label}を作り直している = [G-0099] を見直す`);
   }
   const diffOf = (a, b) => { const out = []; let i = 0; for (const line of b) { if (i < a.length && line === a[i]) i++; else out.push(line); } return { i, out }; };
   // 登録の関数: 0061 の 1 行 (単品だけ許可) を「種類の許可」に置き換えただけ
   const r61 = fnOf('0061_master_register_require_class_months.sql', 'create or replace function ops.register_new_sku(').split('\n');
-  const r100 = fnOf(f0100, 'create or replace function ops.register_new_sku(').split('\n');
+  const r100 = fnOf(f0099, 'create or replace function ops.register_new_sku(').split('\n');
   // 0061 から外した行 = 単品だけの許可・このあと (ne_steps) の 2 行
   const gone = ["  if v_kind = 'single' then perform ops._require_new_entry_lease('single'); end if;", "        '下書きで登録しました。NE・ロジザードへの登録 (新規登録の CSV) はまだです",
     "        case when v_kind = 'set' then 'セットの構成は「構成の依頼」として持っています。NE に登録して"];
   const keep = r61.filter((l) => !gone.some((g) => l.startsWith(g)));
   assert.equal(keep.length, r61.length - gone.length);
   const d1 = diffOf(keep, r100);
-  assert.equal(d1.i, keep.length, '0061 のほかの行が 0100 に同じ順で残っていない');
+  assert.equal(d1.i, keep.length, '0061 のほかの行が 0099 に同じ順で残っていない');
   assert.equal(d1.out.length, 4, JSON.stringify(d1.out));
   assert.ok(d1.out[0].trim().startsWith('perform ops._require_new_entry_lease(v_kind);'));
   assert.ok(d1.out[1].trim().startsWith("case when v_kind = 'set' then '下書きで登録しました。次は「NE 登録の CSV」"));
@@ -1067,11 +1067,11 @@ await ta('[G-0100] 🆕 0100 (セットを構成の持ち主 load のまま登�
   assert.ok(d1.out[3].trim().startsWith("case when v_kind = 'set' then 'セットの構成は「構成の依頼」として持っています。NE に取り込んで"));
   // 書き込みの守り: 0051 の本文 (create → create or replace) + continue の 3 行
   const g51 = fnOf('0051_master_edit.sql', 'create function ops.guard_master_edit_write()').replace('create function ops.guard_master_edit_write()', 'create or replace function ops.guard_master_edit_write()').split('\n');
-  const g100 = fnOf(f0100, 'create or replace function ops.guard_master_edit_write()').split('\n');
+  const g100 = fnOf(f0099, 'create or replace function ops.guard_master_edit_write()').split('\n');
   const d2 = diffOf(g51, g100);
-  assert.equal(d2.i, g51.length, '0051 の守りの行が 0100 に同じ順で残っていない');
+  assert.equal(d2.i, g51.length, '0051 の守りの行が 0099 に同じ順で残っていない');
   assert.equal(d2.out.length, 3, JSON.stringify(d2.out));
-  assert.ok(d2.out[0].trim().startsWith('-- 🆕 0100: 新商品の登録') && d2.out[1].trim().startsWith('--   (依頼は「NE に入れてほしい中身」') && d2.out[2].trim().startsWith("continue when k = 'sku_components'"), JSON.stringify(d2.out));
+  assert.ok(d2.out[0].trim().startsWith('-- 🆕 0099: 新商品の登録') && d2.out[1].trim().startsWith('--   (依頼は「NE に入れてほしい中身」') && d2.out[2].trim().startsWith("continue when k = 'sku_components'"), JSON.stringify(d2.out));
   assert.ok(d2.out[2].includes("v_sess.operation = 'sku_create'") && d2.out[2].includes("tg_op = 'INSERT'") && d2.out[2].includes("v_tbl = 'ops.sku_component_requests'"));
   for (const sig of ['ops.register_new_sku(uuid, text, text, jsonb, text, jsonb)', 'ops.guard_master_edit_write()']) {
     const p = await one(`select has_function_privilege('public', oid, 'execute') as pub, prosecdef as d from pg_proc where oid = $1::regprocedure`, [sig]);
@@ -1648,7 +1648,7 @@ await ta('[H1] 新商品の画面 (単品・セット): 描画・画面の JS・
   process.env.MASTER_EDIT_OPEN = '1';
   // 広げる道 PR-2: 画面も DB の active を読む (配った config ではない)
   await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, sku_components: 'load' });
-  // 🆕 0100: セットも構成の持ち主 load のまま開く (構成は依頼だけ)。区分などほかの列が load なら今までどおり閉じる
+  // 🆕 0099: セットも構成の持ち主 load のまま開く (構成は依頼だけ)。区分などほかの列が load なら今までどおり閉じる
   { const p = (await call('GET', '/apps/master-edit/new?kind=set')).text; assert.ok(!/切替前です/.test(p), 'セットは構成 (依頼だけ) が load でも開く'); assert.match(p, /data-can-save="1"/); }
   await W2.setActiveOwnershipInDb(pg, { ...ALL_COMPANY, sku_components: 'load', 'skus.sku_kind': 'load' });
   assert.match((await call('GET', '/apps/master-edit/new?kind=set')).text, /切替前です/);
@@ -2432,7 +2432,7 @@ await ta('[W1] 今の本番と同じ DB (active = 13 キー・許可なし。con
     let e = await rejectsWith(reg('single', 'w1-single', single()), 409, 'before_cutover');
     assert.deepEqual(e.extra.load_keys, ['skus.sku_kind']);
     e = await rejectsWith(reg('set', 'w1-set', { name: 'x', standard_price: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }), 409, 'before_cutover');
-    assert.deepEqual(e.extra.load_keys.sort(), ['skus.sku_kind'], '🆕 0100: 構成 (依頼だけ) は断る理由に入れない');
+    assert.deepEqual(e.extra.load_keys.sort(), ['skus.sku_kind'], '🆕 0099: 構成 (依頼だけ) は断る理由に入れない');
     // 許可があっても区分が load = 閉じたまま (許可は 2 層目 = 区分の門を開けない)
     await W2.setTestLease(pg, 'single', true);
     e = await rejectsWith(reg('single', 'w1-single', single()), 409, 'before_cutover');
@@ -2472,7 +2472,7 @@ await ta('[W2] DB の active に skus.sku_kind が入る (区分の widen の後
     const ok = await reg('single', 'w2-a', single({ name: 'W2 単品' }));
     assert.equal(ok.ok, true, JSON.stringify(ok));
     assert.equal((await one("select sku_kind from core.skus where code = 'w2-a'")).sku_kind, 'single');
-    // 🆕 0100: セットは構成 (sku_components) が load でも開く (構成は依頼だけ)。セットの許可が無い = 409 new_entry_closed / ある = 登録できる (core の構成は書かない)
+    // 🆕 0099: セットは構成 (sku_components) が load でも開く (構成は依頼だけ)。セットの許可が無い = 409 new_entry_closed / ある = 登録できる (core の構成は書かない)
     await W2.setTestLease(pg, 'set', false);
     e = await rejectsWith(reg('set', 'w2-set', { name: 'x', standard_price: '1', shipping_code: 'S01', components: [{ code: 's001', qty: 1 }] }), 409, 'new_entry_closed');
     await W2.setTestLease(pg, 'set', true, { futureSetLease: true });
