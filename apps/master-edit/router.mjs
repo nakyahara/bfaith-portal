@@ -20,6 +20,8 @@
  *   POST /api/sku/:code      保存 { request_id, reason?, seen: { token (編集の印), event_id? }, values: {...} }
  *   GET  /new?kind=single|set|variation 新商品の登録 (画面 D・⑤-2a)。variation = 色違い・サイズ違いのまとまり (CompanyDB構想/20 §④・PR-7)。
  *        「まとまり」の札と画面は、DB の active の products.parent が company のときだけ出す (今は load = 出さない = 「切替の前」の帯)
+ *        🆕 2026-10-21: &from_card=<product-hub のカードの番号> (セットだけ) = 新商品の登録で決めたセットの下書きの コード・名前・構成を入れておく
+ *   GET  /drafts             🆕 2026-10-21: 下書き (マスタの入力の下書き = 登録の状態 draft と、まだ登録していない product-hub のセットの下書き)
  *   ── 色違い・サイズ違いのまとまり (PR-7・lib/master-variation.mjs。保存を開く門は新商品の登録と同じ + products.parent が company) ──
  *   GET  /api/variation/groups?q=      今あるまとまりを探す (コード・名前・子の商品コード)
  *   GET  /api/variation/groups/:id     まとまりを 1 つ (軸・選択肢・今ある子と子の値 = 共通の欄に写す)
@@ -506,8 +508,14 @@ async function setPlans() {
   if (setPlanStore) return setPlanStore;
   const m = await import('../product-hub/services/cdb-set-plan.js');
   return { write: (x) => m.writeSetPlan(x), mark: (rid, x) => m.markSetPlan(rid, x), held: (code, o) => m.setCodeHeld(code, o), stale: (codes, o) => m.staleWaitingPlansFor(codes, o || {}),
-    touch: (rid) => m.touchWaitingPlan(rid), dropForSku: (sid, o) => m.dropPlansForSku(sid, o || {}) };
+    touch: (rid) => m.touchWaitingPlan(rid), dropForSku: (sid, o) => m.dropPlansForSku(sid, o || {}),
+    // 🆕 2026-10-21: セットの登録が引き継げる「作るセットの下書き」か (読むだけ)・まだ登録していない作るセットの下書き (「下書き」の画面)
+    planned: (code, o) => m.plannedSetCardCheck(code, o || {}), plannedById: (id) => m.plannedSetCardOf(id), openCards: (o) => m.openPlannedSetCards(o || {}),
+    // 🆕 Codex R1 Medium: 引き継ぐカードの予約 (登録の前)・答え (登録の後)
+    reserveTake: (x) => m.reserveSetCardTakeover(x), markTake: (rid, x) => m.markSetCardTakeover(rid, x) };
 }
+/** product-hub のカードを開く URL (同じポータル) */
+const phCardUrl = (id) => `/apps/product-hub/detail/${Number(id)}`;
 /**
  * 🆕 Codex R4 Medium 1: 予約の時間を過ぎた waiting の作るセット (このコードを持つもの) を、Company DB の保存の記録で決める。
  *   登録が通っていた (done) = registered (予約のまま・SKU の番号) / 記録が無い・失敗 = dropped (予約を外す)。読めない = throw (呼び手は 503)
@@ -547,20 +555,45 @@ async function resolveStaleSetPlans(db, codes, { actor = null, parentCode = null
   }
 }
 /**
- * このコードがほかの登録の作るセットに決まっているか (予約・セットの下書き)。決まっている = { status 409, reason, message } / 読めない = 503 / 無い = null
- *   新商品の登録 (単品の入口と登録の取引の中 = codeReserved)・まとまりの子 (入口) が使う
+ * このコードがほかの登録の作るセットに決まっているか (予約・セットの下書き)。決まっている = { status 409, reason, message, card_url?, draft_id? } / 読めない = 503 / 無い = null
+ *   新商品の登録 (単品の入口と登録の取引の中 = codeReserved)・まとまりの子 (入口) が使う。
+ *   🆕 2026-10-21: take = セットの登録 ({ components, cardCreate })。そのコードのカードが新商品の登録で決めたセットの下書きで、構成も同じ = 通す (null・
+ *     登録の後のカードの取り込みがそのカードを引き継ぐ = cdb-card-intake.js)。引き継げない = 断る (どのカードか・なぜか・何をするか・カードを開く URL)
  */
-async function setCodeReservedFor(code, requestId, db = null) {
+async function setCodeReservedFor(code, requestId, db = null, take = null) {
   let held;
+  let card = null;
   try {
     if (db) await resolveStaleSetPlans(db, [code]);
-    held = (await setPlans()).held(code, { requestId });
+    const st = await setPlans();
+    held = st.held(code, { requestId });
+    if (take && held && held.reason === 'ph_draft' && held.is_set && typeof st.planned === 'function') card = st.planned(code, { components: take.components });
   } catch (e) {
     console.error(`[master-edit] 作るセットの予約を読めない: ${e && e.message}`);
     return { status: 503, reason: 'ph_unreadable', message: 'product-hub の作るセットの予約を読めないので、このコードを使えるか確かめられません (少し待ってからもう一度)' };
   }
-  if (held && (held.reason === 'ph_set_plan' || (held.reason === 'ph_draft' && held.is_set))) return { status: 409, reason: 'set_code_reserved', message: `${held.message}。別のコードにしてください` };
+  if (!held) return null;
+  if (held.reason === 'ph_set_plan') {
+    return { status: 409, reason: 'set_code_reserved', message: `${held.message}。単品のカードと一緒にセットの下書きができてから登録すると、その下書きを引き継ぎます (急ぐときは別のコードに)` };
+  }
+  if (held.reason === 'ph_draft' && held.is_set) {
+    const link = { card_url: phCardUrl(held.draft_id), draft_id: held.draft_id };
+    if (take && card && card.takeable && card.draft_id === held.draft_id) {
+      if (take.cardCreate === false) return { status: 409, reason: 'set_card_needed', ...link, message: `${held.message}。このセットのカードとして引き継ぐので、「出品カードを作る」を外さずに登録してください` };
+      // 登録の取引の中の 2 回目 (take.inTx): 予約したカードと違う・入口では無かったカードを初めて見つけた (予約が無い) = 断る (予約したカードにしか結ばない・Codex R2 Medium 1)
+      if (take.inTx && take.reservedId !== card.draft_id) return { status: 409, reason: 'set_card_changed', ...link, message: `${held.message}。引き継ぐカードがちょうど変わりました。画面を開き直してください` };
+      take.draftId = card.draft_id;
+      return null;   // 引き継ぐ (登録の前に予約 → 登録の後のカードの取り込みが、このカードを Company DB のセットに結ぶ)
+    }
+    const why = take && card && card.why ? ` (${card.why})` : '';
+    const todo = take && card && /構成.*ちがいます/.test(card.why || '') ? '構成をカードと同じにするか、別のコードにしてください' : '別のコードにするか、product-hub でカードを確かめてください';
+    return { status: 409, reason: 'set_code_reserved', ...link, message: `${held.message}${why}。${todo}` };
+  }
   return null;
+}
+/** 🆕 2026-10-21: 引き継ぐカードの予約の答えを残す (登録の後)。失敗しても投げない (カードの取り込みは知らせの request_id で予約を引く = 状態は見ない) */
+async function markTakeSafe(requestId, x) {
+  try { const st = await setPlans(); if (typeof st.markTake === 'function') st.markTake(requestId, x); } catch (e) { console.error(`[master-edit] 引き継ぐカードの予約の答えを残せなかった (${requestId}): ${e && e.message}`); }
 }
 /** 作るセットの答えを残す (登録の後)。失敗しても投げない (取り込みは知らせの request_id で表を引く = 状態は見ない) */
 async function markSetPlanSafe(requestId, x) {
@@ -974,7 +1007,65 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     ...(await brandLifeLocals(db, kind === 'single')),
     // 🆕 0090: 表示の項目の欄を出すか (0090 がある DB・単品だけ・入れなくてよい)
     labelNew: db && kind === 'single' && await labelReady(db).catch(() => false) ? { suggest: COUNTRY_SUGGEST, uoms: NET_UOMS } : null,
+    // 🆕 2026-10-21: ?from_card= (「下書き」の画面の「セットとして登録する」) = product-hub のセットの下書きの コード・名前・構成を入れておく (セットだけ)
+    prefill: kind === 'set' && req.query.from_card != null ? await setPrefillOf(req.query.from_card) : null,
   });
+}));
+/**
+ * 🆕 2026-10-21: product-hub のセットの下書き (新商品の登録で決めたセット) → セットの登録の画面に入れておく値 (読むだけ)。
+ *   { ok: true, draft_id, code, name, components, card_url } / 引き継げない・読めない = { ok: false, message, card_url? }
+ */
+async function setPrefillOf(raw) {
+  const id = Number(raw);
+  if (!Number.isSafeInteger(id) || id <= 0) return { ok: false, message: 'カードの番号が違います' };
+  let c;
+  try {
+    const st = await setPlans();
+    c = typeof st.plannedById === 'function' ? st.plannedById(id) : null;
+  } catch (e) {
+    return { ok: false, message: `product-hub のカードを読めません (${String((e && e.message) || e).slice(0, 120)})` };
+  }
+  if (!c || c.draft_id !== id) return { ok: false, message: `product-hub のカード #${id} は、まだ登録していないセットの下書きではありません (番号が違うか、同じコードのカードがほかにもあります)`, card_url: phCardUrl(id) };
+  if (!c.takeable) return { ok: false, message: `product-hub のカード #${id} は、まだ登録していないセットの下書きではありません (${c.why})`, card_url: phCardUrl(id) };
+  return { ok: true, draft_id: id, code: c.code, name: c.name, components: (c.members || []).map((m) => ({ code: m.code, qty: m.qty })), card_url: phCardUrl(id) };
+}
+
+/**
+ * 🆕 2026-10-21: 「下書き」の画面 = まだ終わっていない登録の 2 か所をまとめて見る (読むだけ)。
+ *   ① マスタの入力 (Company DB) の下書き = 登録の状態が draft (NE にまだ登録していない)
+ *   ② product-hub のセットの下書き = 新商品の登録 (単品) で「セット商品を作る = 作る」にして作ったカードで、まだマスタの入力にセットとして登録していないもの
+ *      (Company DB に同じコードがある = 登録はした・カードを結ぶのを待っている)
+ */
+const DRAFT_LIST_MAX = 300;
+router.get('/drafts', (req, res) => withPgPage(req, res, async (db, dbError) => {
+  let cdb = null; let ph = null;
+  if (db) {
+    try {
+      const ready = (await db.query("select to_regclass('ops.master_registrations') is not null as ok")).rows[0].ok === true;
+      if (!ready) cdb = { ready: false, total: 0, rows: [] };
+      else {
+        const total = (await db.query(`select count(*)::int as n from ops.master_registrations r join core.skus k on k.sku_id = r.sku_id where r.state = 'draft' and k.company_id = $1`, [1])).rows[0].n;
+        const rows = (await db.query(`select k.code, k.name, k.sku_kind as kind, r.created_at::text as created_at, r.created_by
+            from ops.master_registrations r join core.skus k on k.sku_id = r.sku_id
+           where r.state = 'draft' and k.company_id = $1 order by r.created_at desc, k.code limit $2`, [1, DRAFT_LIST_MAX])).rows;
+        cdb = { ready: true, total, rows };
+      }
+    } catch (e) { cdb = { error: String((e && e.message) || e).slice(0, 200) }; }
+  }
+  try {
+    const st = await setPlans();
+    const rows = typeof st.openCards === 'function' ? st.openCards({ limit: DRAFT_LIST_MAX }) : [];
+    // Company DB に同じコードがあるか (登録はした = カードを結ぶのを待っている)
+    let inCdb = new Map();
+    if (db && rows.length) {
+      try {
+        const found = (await db.query(`select t.x as input, k.code from unnest($2::text[]) as t(x) join core.skus k on k.company_id = $1 and k.code_norm = core.norm_code(t.x)`, [1, rows.map((r) => r.code)])).rows;
+        inCdb = new Map(found.map((f) => [f.input, f.code]));
+      } catch { inCdb = null; }
+    }
+    ph = { rows: rows.map((r) => ({ ...r, card_url: phCardUrl(r.draft_id), cdb_code: inCdb ? inCdb.get(r.code) ?? null : undefined })) };
+  } catch (e) { ph = { error: String((e && e.message) || e).slice(0, 200) }; }
+  res.render(view('drafts.ejs'), { ...pageLocals(req), ui2: true, nav: 'drafts', dbError, cdb, ph, DRAFT_LIST_MAX, KINDS: KINDS_NEW });
 }));
 /**
  * 🆕 0088: ブランド・商品の段階の欄に渡す値 { brandLife: { brands, max, stages, first? } | null }。出さない・読めない (0088 の前・ロールの流し直しの前) = null = 欄なし。
@@ -1537,11 +1628,31 @@ router.post('/api/new', (req, res) => {
     const hasPlan = !!(parsed && parsed.card.sets && parsed.card.sets.length);
     // ほかの登録が作るセットに決めたコード (カードの取り込み待ち) は、ふつうの商品コードにもさせない (Codex R1 Medium 1)。押し直しは前の答え (確かめない)
     //   (Codex R2: セットの下書きのコードも・読めない = 登録しない・登録の取引でコードの鍵を取った後にもう一度 = codeReserved)
-    const codeReserved = (code) => setCodeReservedFor(code, rid, db);
+    //   🆕 2026-10-21: セットの登録 = 同じコードの「作るセットの下書き」(構成も同じ) は引き継ぐ (断らない)。取引の中でもう一度見るときも同じ (codeReserved)
+    const take = parsed && parsed.kind === 'set' ? { components: parsed.values.components || [], cardCreate: parsed.card.create !== false } : null;
+    const codeReserved = (code) => setCodeReservedFor(code, rid, db, take);
     if (parsed && !po.replay) {
       const held = await codeReserved(parsed.code);
-      if (held) return res.status(held.status).json({ ok: false, reason: held.reason, field: 'code', error: `${held.message}。何も保存していません` });
+      if (held) {
+        return res.status(held.status).json({ ok: false, reason: held.reason, field: 'code', error: `${held.message}。何も保存していません`,
+          ...(held.card_url ? { card_url: held.card_url, draft_id: held.draft_id } : {}) });
+      }
     }
+    // 🆕 2026-10-21 (Codex R1 Medium): 引き継ぐカードを登録の前に予約する (product-hub の表・書けない = 登録しない)。
+    //   カードの取り込みは予約したカードにだけ結ぶ (登録の後にコードを変えられても、新しいカードを作らずに衝突)。登録の取引の中の 2 回目の確かめも同じカードか見る
+    let reservedTake = false;
+    if (take && take.draftId != null && !po.replay) {
+      try {
+        (await setPlans()).reserveTake({ requestId: rid, draftId: take.draftId, code: parsed.code, components: take.components, actor });
+        take.reservedId = take.draftId;
+        reservedTake = true;
+      } catch (e) {
+        if (e && e.status) return res.status(e.status).json({ ok: false, error: e.message, reason: e.reason, field: 'code', ...(e.draft_id ? { card_url: phCardUrl(e.draft_id), draft_id: e.draft_id } : {}) });
+        console.error(`[master-edit] 引き継ぐカードを予約できない: ${e && e.stack || e}`);
+        return res.status(503).json({ ok: false, reason: 'ph_unwritable', field: 'code', error: '引き継ぐ product-hub のカードを予約できないので、登録していません (少し待ってからもう一度)' });
+      }
+    }
+    if (take) take.inTx = true;   // ここから先の確かめ (登録の取引の中) は、予約したカードのときだけ引き継ぐ
     if (hasPlan) {
       try {
         await resolveStaleSetPlans(db, parsed.card.sets.map((sp) => sp.code), { actor, parentCode: parsed.code, requestId: rid });   // 予約の時間を過ぎた waiting・同じ人の押し直しを Company DB の記録で決めてから (Codex R4 / R6)
@@ -1567,6 +1678,7 @@ router.post('/api/new', (req, res) => {
       // 登録が断られた (決まった誤り = MasterWriteError) = 作るセットの下書きは作らない (押し直しで通れば registered に戻す)。
       //   成否が分からない誤り (接続が切れた・commit の後など) = waiting のまま (予約を外さない)。時間を過ぎたら Company DB の保存の記録で決める (Codex R5 Medium 1)
       if (hasPlan && e instanceof MasterWriteError) await markSetPlanSafe(rid, { state: 'dropped', note: String((e && e.message) || e).slice(0, 300) });
+      if (reservedTake && e instanceof MasterWriteError) await markTakeSafe(rid, { state: 'dropped', note: String((e && e.message) || e).slice(0, 300) });
       // 🆕 Codex R6 Medium 1: 成否が分からない = 画面は同じ番号 (request_id) のまま押し直す (同じ登録は 2 回入らない・前の答えが返る)
       if (hasPlan && !(e instanceof MasterWriteError) && !(e && ['55P03', '40P01', '40001'].includes(e.code))) {
         console.error(`[master-edit] 作るセットつきの登録の成否が分からない (${rid}): ${e && e.stack || e}`);
@@ -1575,6 +1687,7 @@ router.post('/api/new', (req, res) => {
       throw e;
     }
     if (hasPlan) await markSetPlanSafe(rid, { state: 'registered', skuId: r.sku_id });
+    if (reservedTake) await markTakeSafe(rid, { state: 'registered', skuId: r.sku_id });
     let orderResult = null;
     const after = orderInput && outbox ? await ordersAfterRegistration(db, String(b.request_id).trim().toLowerCase(), !!r.replayed, orderBase) : { mode: orderInput ? 'legacy' : 'none' };
     if (after.mode === 'mismatch') orderResult = { ok: false, status: 'mismatch', reason: 'request_id_reused', pending: false, error: ORDER_MISMATCH_WORDS };
@@ -1598,7 +1711,11 @@ router.post('/api/new', (req, res) => {
     let card = r.card || null;
     if (card && card.status !== 'done') {
       const t = await tryCard(db, { eventId: card.event_id });
-      if (t) card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null, set_drafts: t.result?.set_drafts ?? null, set_skipped: t.result?.set_skipped ?? null };
+      if (t) {
+        card = { ...card, status: t.status, draft_id: t.result?.draft_id ?? null, error: t.error ?? null, set_drafts: t.result?.set_drafts ?? null, set_skipped: t.result?.set_skipped ?? null,
+          // 🆕 2026-10-21: 作るセットの下書きを引き継いだ (新しいカードは作っていない)・カードに入っていたので変えなかった欄
+          ...(t.result?.taken_over ? { taken_over: true, not_applied: t.result.not_applied || [] } : {}) };
+      }
     }
     res.json({ ...r, card, card_label: card ? CARD_STATUS_LABELS[card.status] || card.status : null, ...(orderInput ? { order_settings: orderResult } : {}),
       ...(await lzSavedUncheckedOf(db, b.request_id)) });   // #1719 R3 High: 押し直しでも DB に残した結果から

@@ -1914,6 +1914,22 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_ph_cdb_set_plan_items_code ON ph_cdb_set_plan_items(code_key);
     CREATE INDEX IF NOT EXISTS idx_ph_cdb_set_plan_items_draft ON ph_cdb_set_plan_items(set_draft_id);
   `);
+  // 🆕 2026-10-21: セットの登録 (マスタの入力) が引き継ぐ「作るセットの下書き」の予約 (services/cdb-set-plan.js の reserveSetCardTakeover)。
+  //   登録の request_id で 1 つ = どのカードを引き継ぐか。登録の前に書き (書けなければ登録しない) → 登録できた = registered → カードの取り込みが結ぶ = applied /
+  //   登録が断られた = dropped。カードの取り込みはこの行のカードにだけ結ぶ (コードを変えられた・構成が変わった = 新しいカードを作らずに衝突)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_set_card_takeovers (
+      request_id  TEXT PRIMARY KEY,
+      draft_id    INTEGER NOT NULL,
+      code_key    TEXT NOT NULL,
+      state       TEXT NOT NULL CHECK (state IN ('waiting', 'registered', 'applied', 'dropped')),
+      cdb_sku_id  INTEGER,
+      created_by  TEXT NOT NULL,
+      created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      note        TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_set_card_takeovers_draft ON ph_set_card_takeovers(draft_id);
+  `);
   // 🆕 まとまり (色違い・サイズ違い) のカード (2026-10-09・Company DB構想 20 v7 §⑤ / §⑩ の PR-4)。
   // Company DB の知らせ (ops.product_hub_outbox の entity_kind = variation_group・kind = group_snapshot・ph-group-v1) から
   // まとまりで 1 枚のカードを作る (services/cdb-group-intake.js)。

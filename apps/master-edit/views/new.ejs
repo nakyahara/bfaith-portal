@@ -30,7 +30,9 @@
   const part = (key) => ' data-none-part="' + h(key) + '"';
   const segPart = (key, html) => html.replace(/^<div class="seg"([^>]*)>/, (m0, attrs) => '<div class="seg"' + attrs + part(key) + '>');
   // 画面の JS に渡す値 (JSON = EJS の出力を JS の値の位置に直に置かない)
-  const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs, blankKeys, blankLabels } : null;
+  const pageData = page ? { base, kind, canSave, maxComponents: MAX_COMPONENTS, maxRefs: MAX_REFERENCE_URLS, secs, blankKeys, blankLabels,
+    // 🆕 2026-10-21: 「下書き」の画面の「セットとして登録する」= product-hub のセットの下書きの コード・名前・構成 (画面の JS が欄に入れる)
+    prefill: locals.prefill && locals.prefill.ok ? { code: prefill.code, name: prefill.name, components: prefill.components } : null } : null;
 %>
 <%
   // 🆕 0088: ブランド・商品の段階の板 (単品だけ・0088 の欄が使えるときだけ)。飛び先の帯は「税・分類・仕入先」の次 (どれも必須でない = 「あと N つ」には数えない)
@@ -51,6 +53,8 @@
     <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div><div class="hint">つながったら画面を開き直してください。</div></div></div><% } %>
     <% if (page && entryClosed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">切替前です (<%= entryWhy || ('段階: ' + phaseText) %>)</div><div class="hint">新商品はまだ NE・product-hub で登録します。この画面は見るだけです (登録を押しても「切替前」で断られ、何も変わりません)。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+    <% if (locals.prefill && prefill.ok) { %><div class="callout info" id="prefill-note"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><div class="t">product-hub のセットの下書き #<%= prefill.draft_id %> (<%= prefill.code %>) を、このセットのカードとして引き継いで登録します</div><div class="hint">コード・名前・構成を入れてあります。残りの項目を入れて保存してください。構成を変えると引き継げません。 <a href="<%= prefill.card_url %>" target="_blank" rel="noopener">product-hub で開く ↗</a></div></div></div><% } %>
+    <% if (locals.prefill && !prefill.ok) { %><div class="callout warn" id="prefill-note"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t"><%= prefill.message %></div><% if (prefill.card_url) { %><div class="hint"><a href="<%= prefill.card_url %>" target="_blank" rel="noopener">product-hub で開く ↗</a></div><% } %></div></div><% } %>
     <% if (page && !shippingRates) { %><div class="callout err"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><div class="grow"><div class="t">送料の表が読めないので、発送方法を選べません</div><div class="hint">発送方法は空のまま下書きにして、あとで商品の画面で入れられます。いま選ぶときは、少し待ってから画面を開き直してください。</div></div></div><% } %>
 
     <% if (page) { %>

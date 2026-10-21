@@ -14,6 +14,10 @@
  *   ④ カードの取り込み (保存の直後・ボードを開いたとき・「もう一度」) が applySetPlanInTx (applied)
  *   ③ を書く前に落ちても、④ は知らせの request_id で表を引くので下書きはできる (state は見ない = 知らせがある = 登録は入っている)
  * 🚨 下書きは provisional_code = 1 (NE で本コードを確かめるまで出品しない・services/set-derive.js の createPlannedSetDraft)
+ * 🆕 2026-10-21 (セットの登録が開いた後): その下書きと同じコード・同じ構成でセットを登録 (マスタの入力) = 断らない (plannedSetCardCheck)。
+ *   登録の後のカードの取り込み (cdb-card-intake.js) が、同じ取引の中でもう一度確かめてから、そのカードを新しいセットの SKU に結ぶ (= 引き継ぐ・新しいカードは作らない)。
+ *   順番 = ① 確かめ (読むだけ・登録の取引の中でもう一度) → ② Company DB の登録 (カードの知らせも同じ取引) → ③ 知らせの取り込みで結ぶ (SQLite の 1 つの取引・何度届いても 1 回)。
+ *   ③ の前に落ちても知らせは残る (届け直す)。確かめた後にカードが変わった (構成・除外・ほかのカード) = 結ばずに今までどおり衝突 (人が決める)
  */
 import { getDB, logEvent } from '../db.js';
 import { createPlannedSetDraft } from './set-derive.js';
@@ -48,8 +52,140 @@ export function setCodeHeld(code, { requestId = null, db = getDB(), includeStale
     LIMIT 1
   `).get(key, requestId, requestId, includeStale ? 1 : 0, `-${WAITING_HOLD_MINUTES} minutes`);
   //   includeStale = 時間を過ぎた waiting も押さえる (Company DB の保存の記録と照らせない呼び手 = product-hub の本コードの差し替え。照らせる master-edit は先に記録で決める)
-  if (p) return { reason: 'ph_set_plan', message: `商品コード ${code} は ${p.parent_code} の登録で作るセットに決まっています` };
+  if (p) return { reason: 'ph_set_plan', parent_code: p.parent_code, message: `商品コード ${code} は ${p.parent_code} の登録で作るセットに決まっています` };
   return null;
+}
+
+const codeKeyOf = (c) => String(c ?? '').trim().toLowerCase();
+/** 構成の比べ方: コード (大文字小文字・前後の空白は同じ) → 数 (同じ品は足す)。並びは見ない */
+function membersKey(list) {
+  const m = new Map();
+  for (const x of list || []) {
+    const k = codeKeyOf(x && (x.code ?? x.member_ne_code));
+    if (!k) continue;
+    m.set(k, (m.get(k) || 0) + Number(x.qty));
+  }
+  return [...m.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, q]) => `${k}×${q}`).join(',');
+}
+/** 2 つの構成が同じか (コードは大文字小文字を同じと見る・数・並びは見ない) */
+export const sameSetMembers = (a, b) => membersKey(a) === membersKey(b);
+const membersText = (list) => (list || []).map((x) => `${x.code ?? x.member_ne_code}×${x.qty}`).join('・') || 'なし';
+
+/**
+ * 🆕 2026-10-21: このコードのカードが「新商品の登録 (単品) で決めたセットの下書き」で、セットの登録 (マスタの入力) がそのまま引き継げるか (読むだけ)。
+ *   引き継げる = 同じコードのカードがこの 1 枚だけ・セットの下書き (parent_draft_id)・作るセットから作った (ph_cdb_set_plan_items の created)・
+ *   まだ Company DB の商品に結んでいない・除外していない・NE で本コードを確かめる前 (provisional_code = 1)・構成が同じ (components を渡したとき)。
+ *   🚨 カードの取り込み (cdb-card-intake.js の applyCdbCardEvent) も同じ取引の中でこれで確かめてから結ぶ = 確かめた後にカードが変わっても違うカードに結ばない
+ * @returns {null | { draft_id, code, name, is_set, takeable: boolean, why: string | null, parent_code?, members? }} null = このコードのカードは無い
+ */
+export function plannedSetCardCheck(code, { components = null, db = getDB() } = {}) {
+  const key = codeKeyOf(code);
+  if (!key) return null;
+  const cards = db.prepare('SELECT id, ne_code, name, status, parent_draft_id, provisional_code, cdb_sku_id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY parent_draft_id IS NULL, id').all(key);
+  if (!cards.length) return null;
+  const d = cards[0];
+  const base = { draft_id: d.id, code: d.ne_code, name: d.name, is_set: d.parent_draft_id != null };
+  const no = (why, more = {}) => ({ ...base, ...more, takeable: false, why });
+  if (cards.length > 1) return no(`product-hub に同じコードのカードが ${cards.length} 枚あります (${cards.map((x) => '#' + x.id).join('・')})`);
+  if (d.parent_draft_id == null) return no('セットのカードではありません');
+  const plan = db.prepare(`SELECT p.parent_code FROM ph_cdb_set_plan_items i JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
+    WHERE i.set_draft_id = ? AND i.outcome = 'created' LIMIT 1`).get(d.id);
+  if (!plan) return no('新商品の登録で決めたセットのカードではありません');
+  if (d.cdb_sku_id != null) return no('もう Company DB の商品に結んであります');
+  if (d.status === 'excluded') return no('除外にしてあります');
+  if (d.provisional_code !== 1) return no('NE で本コードを確かめ済みです');
+  const members = db.prepare('SELECT member_ne_code AS code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort').all(d.id);
+  const more = { parent_code: plan.parent_code, members };
+  if (!members.length) return no('カードに構成がありません', more);
+  if (components != null && membersKey(members) !== membersKey(components)) {
+    return no(`カードの構成 (${membersText(members)}) と入れた構成 (${membersText(components)}) がちがいます`, more);
+  }
+  return { ...base, ...more, takeable: true, why: null };
+}
+
+/** 予約がまだ効いている時間 (登録の答えが来ない waiting が product-hub のコードの差し替えを止める時間) */
+const TAKEOVER_HOLD_MINUTES = 60;
+
+/**
+ * 🆕 2026-10-21 (Codex R1 Medium): ① 登録の前に、引き継ぐカードを登録の request_id で予約する (同じ request_id = 押し直し = 同じカードなら何もしない)。
+ *   取引の中でもう一度 plannedSetCardCheck (引き継げる・同じカード)。断る = throw { status 409, reason, message, draft_id }
+ *   予約があると: カードの取り込みはこのカードにだけ結ぶ (コードを変えられていても新しいカードを作らない)・product-hub の本コードの差し替えを止める (liveTakeoverOf)
+ */
+export function reserveSetCardTakeover({ requestId, draftId, code, components, actor }, { db = getDB() } = {}) {
+  const rid = String(requestId ?? '').trim().toLowerCase();
+  if (!UUID_RE.test(rid)) throw refuse(400, 'invalid_input', '保存の番号 (request_id) の形が違う', { field: 'request_id' });
+  const id = Number(draftId);
+  return db.transaction(() => {
+    const prev = db.prepare('SELECT * FROM ph_set_card_takeovers WHERE request_id = ?').get(rid);
+    if (prev && prev.draft_id !== id) throw refuse(409, 'request_id_reused', '同じ保存の番号 (request_id) で違うカードを引き継ごうとしました。画面を開き直してください');
+    const c = plannedSetCardCheck(code, { components, db });
+    if (!c || !c.takeable || c.draft_id !== id) {
+      throw refuse(409, 'set_card_changed', `product-hub のカード #${id} がちょうど変わったので引き継げません${c && c.why ? ` (${c.why})` : ''}。画面を開き直してください`, { draft_id: id });
+    }
+    if (prev) {
+      db.prepare(`UPDATE ph_set_card_takeovers SET state = 'waiting', note = NULL, created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE request_id = ? AND state = 'dropped'`).run(rid);
+      return { ok: true, replayed: true };
+    }
+    db.prepare(`INSERT INTO ph_set_card_takeovers (request_id, draft_id, code_key, state, created_by) VALUES (?, ?, ?, 'waiting', ?)`)
+      .run(rid, id, codeKeyOf(code), String(actor || ACTOR));
+    return { ok: true, replayed: false };
+  })();
+}
+
+/** ③ 登録の答えを残す。registered = SKU の番号 / dropped = 登録が断られた。applied (もう結んだ) は変えない */
+export function markSetCardTakeover(requestId, { state, skuId = null, note = null }, { db = getDB() } = {}) {
+  const rid = String(requestId ?? '').trim().toLowerCase();
+  if (state === 'registered') {
+    return db.prepare(`UPDATE ph_set_card_takeovers SET state = 'registered', cdb_sku_id = ?, note = NULL WHERE request_id = ? AND state IN ('waiting', 'dropped', 'registered')`)
+      .run(skuId == null ? null : Number(skuId), rid).changes;
+  }
+  if (state === 'dropped') return db.prepare(`UPDATE ph_set_card_takeovers SET state = 'dropped', note = ? WHERE request_id = ? AND state = 'waiting'`).run(note ? String(note).slice(0, 500) : null, rid).changes;
+  throw new Error(`知らない状態: ${state}`);
+}
+
+/** その登録の予約 (カードの取り込みの取引の中で読む)。無い = null */
+export function setCardTakeoverOf(db, requestId) {
+  const rid = String(requestId ?? '').trim().toLowerCase();
+  if (!UUID_RE.test(rid)) return null;
+  return db.prepare('SELECT * FROM ph_set_card_takeovers WHERE request_id = ?').get(rid) || null;
+}
+
+/**
+ * このカードを引き継ぐ登録がまだ動いているか (registered = 取り込み待ち / waiting = 時間の中)。product-hub の本コードの差し替えを止める。
+ *   カードを除外した・コードがもう予約のときと違う = 止めない (Codex R2 Medium 2: 片付ける・直す操作を止めない。取り込みは予約で新しいカードを作らないので二重にならない)
+ */
+export function liveTakeoverOf(draftId, { db = getDB() } = {}) {
+  return db.prepare(`SELECT t.* FROM ph_set_card_takeovers t JOIN product_drafts d ON d.id = t.draft_id
+      WHERE t.draft_id = ? AND d.status <> 'excluded' AND LOWER(TRIM(d.ne_code)) = t.code_key
+        AND (t.state = 'registered' OR (t.state = 'waiting' AND t.created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?))) ORDER BY t.created_at DESC LIMIT 1`)
+    .get(Number(draftId), `-${TAKEOVER_HOLD_MINUTES} minutes`) || null;
+}
+
+/** 🆕 2026-10-21: カードの番号で plannedSetCardCheck (「下書き」の画面の「セットとして登録する」)。カードが無い / 同じコードの別のカードが先 = null */
+export function plannedSetCardOf(draftId, { db = getDB() } = {}) {
+  const d = db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(Number(draftId));
+  if (!d) return null;
+  const c = plannedSetCardCheck(d.ne_code, { db });
+  return c && c.draft_id === Number(draftId) ? c : null;
+}
+
+/**
+ * 🆕 2026-10-21: まだ Company DB に登録していない「新商品の登録で決めたセットの下書き」(マスタの入力の「下書き」の画面・読むだけ)。
+ *   除外したカード・Company DB の商品に結んだカードは出さない。新しい順・limit 件まで
+ * @returns {Array<{ draft_id, code, name, status, provisional, parent_code, qty, created_at, members }>}
+ */
+export function openPlannedSetCards({ db = getDB(), limit = 200 } = {}) {
+  const rows = db.prepare(`
+    SELECT d.id, d.ne_code, d.name, d.status, d.provisional_code, d.created_at, p.parent_code, i.qty
+    FROM ph_cdb_set_plan_items i
+    JOIN ph_cdb_set_plans p ON p.request_id = i.request_id
+    JOIN product_drafts d ON d.id = i.set_draft_id
+    WHERE i.outcome = 'created' AND d.cdb_sku_id IS NULL AND d.status <> 'excluded'
+    ORDER BY d.id DESC LIMIT ?
+  `).all(Math.max(1, Math.min(1000, Number(limit) || 200)));
+  const mem = db.prepare('SELECT member_ne_code AS code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort');
+  return rows.map((r) => ({ draft_id: r.id, code: r.ne_code, name: r.name, status: r.status, provisional: r.provisional_code === 1,
+    parent_code: r.parent_code, qty: r.qty, created_at: r.created_at, members: mem.all(r.id) }));
 }
 
 /**
@@ -78,6 +214,8 @@ export function touchWaitingPlan(requestId, { db = getDB() } = {}) {
 
 /** 親の下書きを消した (登録をやめた) = まだ下書きを作っていない作るセット (registered / waiting) を閉じる = 予約を外す (Codex R8 Medium 3) */
 export function dropPlansForSku(skuId, { db = getDB(), note = '親の下書きを消した (登録をやめた)' } = {}) {
+  // 🆕 2026-10-21: このセットの登録が引き継ぐはずだったカードの予約も外す (カードの取り込みはもう来ない = product-hub の本コードの差し替えを止めない)
+  db.prepare(`UPDATE ph_set_card_takeovers SET state = 'dropped', note = ? WHERE cdb_sku_id = ? AND state IN ('registered', 'waiting')`).run(String(note).slice(0, 500), Number(skuId));
   return db.prepare(`UPDATE ph_cdb_set_plans SET state = 'dropped', note = ? WHERE cdb_sku_id = ? AND state IN ('registered', 'waiting')`).run(String(note).slice(0, 500), Number(skuId)).changes;
 }
 

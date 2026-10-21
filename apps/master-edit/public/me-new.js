@@ -727,6 +727,8 @@
   function showError(j, status) {
     var h = '<div class="result err" role="alert"><div class="rt">' + esc(j.error || ('HTTP ' + status)) + '</div>';
     if (j.reason === 'set_underivable' && Array.isArray(j.blockers)) h += '<ul>' + j.blockers.map(function (b) { return '<li>' + esc(b) + '</li>'; }).join('') + '</ul>';
+    // 🆕 2026-10-21: コードを使っている product-hub のカード (同じポータルの URL だけ)
+    if (j.card_url && /^\/apps\/product-hub\/detail\/\d+$/.test(String(j.card_url))) h += '<div><a id="held-card" href="' + esc(j.card_url) + '" target="_blank" rel="noopener">product-hub でカード #' + esc(j.draft_id) + ' を開く ↗</a></div>';
     $('#result').innerHTML = h + '</div>';
     if (j.field) {
       if (/^card\./.test(String(j.field))) { var cf = $('#card-fields'); if (cf) cf.hidden = false; }   // 隠れた欄の誤りでも直せるように開く
@@ -778,6 +780,12 @@
           var warns = (x.j.warnings || []).slice();
           // 🆕 #1719 R2 High: ロジザードの写しと照らせていない値 = 手順の一文 (GAS の H 列に入れる前にロジザードの商品マスタで確かめる)。商品の画面にも同じ印が出る
           if (x.j.lz_unchecked) warns.push('ロジザードのバーコード: ' + (x.j.lz_unchecked.note || 'ロジザードの写しと照らせていません (' + x.j.lz_unchecked.words + ')'));
+          // 🆕 2026-10-21: product-hub の「作るセットの下書き」を、このセットのカードとして引き継いだ (新しいカードは作っていない)
+          if (x.j.card && x.j.card.taken_over) {
+            var na = Array.isArray(x.j.card.not_applied) ? x.j.card.not_applied : [];
+            warns.push('product-hub のセットの下書き #' + x.j.card.draft_id + ' を、このセットの出品カードとして引き継ぎました (新しいカードは作っていません)'
+              + (na.length ? '。カードに入っていたので変えなかった欄: ' + na.map(function (n) { return n.label + ' (カード ' + n.card + ' / 入れた値 ' + n.entered + ')'; }).join('・') : ''));
+          }
           if (x.j.card && x.j.card.status !== 'done') warns.push('product-hub の出品カード: ' + (x.j.card_label || x.j.card.status) + ' (商品の画面の「カードをもう一度作る」か、product-hub のボードを開くと作り直します)');
           // 🆕 作るセット: 下書きを作った = NE でやること (セット商品を NE に登録する)・作れなかった行 = 気をつけること
           var nes = (x.j.ne_steps || []).slice();
@@ -831,6 +839,19 @@
     if (need.length) { ME.toast('下書き保存まで あと ' + need.length + ' つ: ' + need[0].t); focusTo(need[0].focus); return; }
     ME.toast(saved ? '登録しました。商品の画面を開いています' : '登録しています…');
   } : null;
+
+  /* ---------- 🆕 2026-10-21: 「下書き」の画面の「セットとして登録する」= product-hub のセットの下書きのコード・名前・構成を入れておく (人が確かめて保存する) ---------- */
+  var pf = P.prefill;
+  if (pf && isSet && canSave && rowsEl) {
+    var setVal = function (el, v) { if (!el) return; el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); };
+    setVal($('#code'), String(pf.code || ''));
+    setVal($('#f-name'), String(pf.name || ''));
+    var comps = Array.isArray(pf.components) ? pf.components : [];
+    while ($$('#comp-rows tr.comp-row').length < comps.length) { rowsEl.appendChild($('#comp-tpl').content.firstElementChild.cloneNode(true)); }
+    renumber();
+    var trs = $$('#comp-rows tr.comp-row');
+    comps.forEach(function (c, i) { setVal($('.c-qty', trs[i]), String(c.qty)); setVal($('.c-code', trs[i]), String(c.code)); });
+  }
 
   cardShow();
   tiles();
