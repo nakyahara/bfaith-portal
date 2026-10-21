@@ -123,7 +123,7 @@
       <% for (const e of toDownload) { %>
       <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-label="<%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV">
         <div class="fh"><span class="ttl"><%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV</span><span class="b warn">まだダウンロードしていません</span></div>
-        <div class="acts"><button class="btn pri" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>ダウンロード</button><span class="hint"><%= when(e.created_at) %> に作った</span></div>
+        <div class="acts"><button class="btn pri" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>ダウンロード</button><% if (e.kind !== 'sets') { %><a class="btn sm" href="https://main.next-engine.com/User_Syohin_Csvupload_Item/upload" target="_blank" rel="noopener noreferrer"><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg>NE の商品一括登録を開く ↗</a><% } %><span class="hint"><%= when(e.created_at) %> に作った</span></div>
         <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
       </article>
       <% } %>
@@ -135,6 +135,7 @@
         <div class="acts">
           <button class="btn pri" type="button" data-act="declare-quick" data-result="ok"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>NE に取り込んだ</button>
           <button class="btn sm" type="button" data-act="issue"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
+          <% if (e.kind !== 'sets') { %><a class="btn sm" href="https://main.next-engine.com/User_Syohin_Csvupload_Item/upload" target="_blank" rel="noopener noreferrer"><svg class="ic s" aria-hidden="true"><use href="#i-up"/></svg>NE の商品一括登録を開く ↗</a><% } %>
           <span class="hint"><%= e.kind === 'sets' ? 'セットは、NE に取り込んだらこのボタンを押してください (押すと翌朝 NE で確かめます)' : '押さなくても、翌朝 NE に出ていれば自動で確かめます' %></span>
         </div>
         <details class="more"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>NE で失敗があったとき (「N件失敗」・全部だめ)</summary>

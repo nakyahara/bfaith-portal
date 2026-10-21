@@ -56,6 +56,7 @@
         <% if (!canSend) { %><span class="hint" id="nu-cannot"><%= sendMessage || 'いまは送れません' %></span>
         <% } else { %>
           <button class="btn pri" type="button" id="nu-csv"<%= waiting.length ? '' : ' disabled' %>><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>CSV を作る (NE にアップする用)</button>
+          <a class="btn " href="https://main.next-engine.com/User_Syohin_Csvupload_Item/upload" target="_blank" rel="noopener noreferrer"><svg class="ic" aria-hidden="true"><use href="#i-up"/></svg>NE の商品一括登録を開く ↗</a>
           <% if (N.uploadReady) { %><button class="btn" type="button" id="nu-send"<%= waiting.length ? '' : ' disabled' %>><svg class="ic" aria-hidden="true"><use href="#i-up"/></svg>今すぐ NE へ送る</button><% } %>
           <span class="hint">CSV は作った日のうちに取り込んでください · Excel で開いて保存し直さないでください<% if (N.oneFile) { %> · <span id="nu-filler"><%= FILLER_WORDS %></span><% } %><% if (N.uploadReady && N.waitingNow) { %> · いま NE へ送る準備をしています (数分で届きます)<% } %></span>
         <% } %>
