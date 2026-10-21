@@ -523,6 +523,17 @@ await ta('[R2b] 発送方法なし (2026-10-08 中原さん): 単品もセット
     assert.match(e.message, /セットは必須/);
   }
   assert.equal(await skuId('noship-set-1'), undefined);
+  // 🚨 前の版で発送方法なしに保存した要求の送り直し (答えが届かなかった) = 断らずに記録した答えを返す (Codex)。
+  //   前の版の保存を記録の行で作る (同じ要求のハッシュ・done・結果)
+  {
+    const rid = uuid();
+    const input = { actor: 'naka@test', requestId: rid, kind: 'set', code: 'old-noship-set', reason: null, values: { name: '前の版のセット', standard_price: '3000', reorder_months: '1', components: [{ code: 's002', qty: 1 }] }, card: { create: false } };
+    const hash = R.registerPayloadHashOf(R.parseRegisterRequest(input));
+    await pg.query(`insert into ops.master_edit_requests (request_id, actor_id, operation, target_code, payload_hash, status, result, started_at) values ($1::uuid, 'naka@test', 'sku_create', 'old-noship-set', $2, 'done', $3::jsonb, now())`,
+      [rid, 'f'.repeat(64), JSON.stringify({ ok: true, code: 'old-noship-set', kind: 'set', state: 'draft', request_payload_hash: hash })]);
+    const again = await asEditor(() => R.registerNewSku(db, input, { open: true, now: NOW, shippingRates: RATES }));
+    assert.deepEqual([again.replayed, again.code], [true, 'old-noship-set'], JSON.stringify(again));
+  }
   // セットで選べば今までどおり (代表の仕入先は付けない)
   const st = await reg('set', 'ship-set-1', { name: '発送方法ありのセット', standard_price: '3000', shipping_code: 'S02', components: [{ code: 's002', qty: 1 }] }, { create: false });
   assert.deepEqual([st.kind, st.state, st.shipping], ['set', 'draft', { code: 'S02', method: '宅急便', cost_jpy: 520 }]);
@@ -2667,8 +2678,7 @@ await ta('[BL1] 入力なしの決まり (lib): 種類ごとの項目と並び�
   assert.deepEqual(BLK.missingBlankKeys('single', single, { orderApplicable: true }).slice(2, 8), ['order_settings.order_lot', 'order_settings.condition', 'order_settings.material', 'order_settings.case_lot', 'order_settings.case_group', 'order_settings.capacity_per_unit']);
   assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }), ['cost', 'maker', 'shipping_code', 'inbound_date_managed'], 'カードを作らない = カードの欄は数えない');
   assert.deepEqual(BLK.missingBlankKeys('single', { ...single, card: { create: false } }, { makerApplicable: false }), ['cost', 'shipping_code', 'inbound_date_managed'], '0084 の欄が無い = メーカーは数えない');
-  // 🆕 2026-10-21: セットの発送方法は必須 (入力なしにできない) = 数えない
-  assert.deepEqual(BLK.missingBlankKeys('set', { kind: 'set', values: {}, card: {} }, { orderApplicable: true }), ['exception_cost', 'card.official_url', 'card.amazon', 'card.reference_urls',
+  assert.deepEqual(BLK.missingBlankKeys('set', { kind: 'set', values: {}, card: {} }, { orderApplicable: true }), ['exception_cost', 'shipping_code', 'card.official_url', 'card.amazon', 'card.reference_urls',
     'card.yahoo.price', 'card.yahoo.price_sagawa', 'card.yahoo.delivery_label', 'card.yahoo.category_id', 'card.yahoo.path'], 'セットに発注の設定は無い');
   // 値があれば数えない (原価 = jpy・Amazon = URL か ASIN・参考 URL = 1 つ以上・発注条件 = 選んだか新しく作る)
   const filled = { ...single, values: { ...single.values, cost: { jpy: '300' }, shipping_code: 'S01', inbound_date_managed: '1', maker: '1' },
