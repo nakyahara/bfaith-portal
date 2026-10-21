@@ -14752,5 +14752,57 @@ for (const [name, file, data] of renders) {
   }
 }
 
+// ─── 🆕 2026-10-21: セットの登録 (マスタの入力) が作るセットの下書きを引き継げるか (services/cdb-set-plan.js の plannedSetCardCheck・読むだけ) ───
+{
+  const sp = await import('../services/cdb-set-plan.js');
+  const parent = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('SMK-TAKE', '引き継ぎの単品', 'smoke')`).run().lastInsertRowid);
+  const mk = (code, { planned = true, qty = 2 } = {}) => {
+    const id = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, status, parent_draft_id, provisional_code, created_by) VALUES (?, ?, 'draft', ?, 1, 'smoke')`).run(code, `${code} のセット`, parent).lastInsertRowid);
+    db.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, 0)').run(id, 'SMK-TAKE', qty);
+    if (planned) {
+      const rid = `00000000-0000-4000-8000-${String(id).padStart(12, '0')}`;
+      db.prepare(`INSERT INTO ph_cdb_set_plans (request_id, schema, parent_code, parent_name, plan_hash, request_hash, state, created_by) VALUES (?, 'set-plan-v1', 'SMK-TAKE', 'x', ?, ?, 'applied', 'smoke')`).run(rid, 'a'.repeat(64), 'b'.repeat(64));
+      db.prepare(`INSERT INTO ph_cdb_set_plan_items (request_id, sort, qty, code, code_key, name, set_draft_id, outcome) VALUES (?, 0, ?, ?, ?, 'x', ?, 'created')`).run(rid, qty, code, code.toLowerCase(), id);
+    }
+    return id;
+  };
+  const a = mk('SMK-TAKE-2');
+  const ok = sp.plannedSetCardCheck('smk-take-2', { components: [{ code: 'smk-take', qty: 2 }], db });
+  check('引き継ぎ: 作るセットの下書き・同じ構成 (大文字小文字は同じ) = 引き継げる', ok && ok.takeable === true && ok.draft_id === a, JSON.stringify(ok));
+  const diff = sp.plannedSetCardCheck('SMK-TAKE-2', { components: [{ code: 'SMK-TAKE', qty: 3 }], db });
+  check('引き継ぎ: 構成が違う = 引き継がない (理由に両方の構成)', diff && diff.takeable === false && /SMK-TAKE×2.*SMK-TAKE×3.*ちがいます/.test(diff.why), JSON.stringify(diff));
+  const m = mk('SMK-TAKE-3', { planned: false, qty: 3 });
+  const man = sp.plannedSetCardCheck('SMK-TAKE-3', { components: [{ code: 'SMK-TAKE', qty: 3 }], db });
+  check('引き継ぎ: 作るセットから作ったのでないセットのカード = 引き継がない', man && man.takeable === false && man.draft_id === m && /新商品の登録で決めた/.test(man.why), JSON.stringify(man));
+  check('引き継ぎ: 単品のカード = 引き継がない', sp.plannedSetCardCheck('SMK-TAKE', { components: [], db })?.why === 'セットのカードではありません');
+  check('引き継ぎ: カードが無い = null', sp.plannedSetCardCheck('SMK-NONE-2', { db }) === null);
+  db.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(a);
+  check('引き継ぎ: 除外したカード = 引き継がない', sp.plannedSetCardCheck('SMK-TAKE-2', { db })?.why === '除外にしてあります');
+  check('下書きの一覧: 除外したカードは出さない', !sp.openPlannedSetCards({ db }).some((x) => x.draft_id === a));
+  db.prepare(`UPDATE product_drafts SET status = 'draft', cdb_sku_id = 990001 WHERE id = ?`).run(a);
+  check('引き継ぎ: もう Company DB の商品に結んだカード = 引き継がない', /もう Company DB の商品に結んで/.test(sp.plannedSetCardCheck('SMK-TAKE-2', { db })?.why || ''));
+  check('下書きの一覧: 結んだカードは出さない', !sp.openPlannedSetCards({ db }).some((x) => x.draft_id === a));
+  db.prepare(`UPDATE product_drafts SET cdb_sku_id = NULL, provisional_code = 0 WHERE id = ?`).run(a);
+  check('引き継ぎ: NE で本コードを確かめ済み = 引き継がない', sp.plannedSetCardCheck('SMK-TAKE-2', { db })?.takeable === false);
+  db.prepare(`UPDATE product_drafts SET provisional_code = 1 WHERE id = ?`).run(a);
+  const row = sp.openPlannedSetCards({ db }).find((x) => x.draft_id === a);
+  check('下書きの一覧: まだ登録していない作るセットの下書き (コード・名前・元の単品・構成)', row && row.code === 'SMK-TAKE-2' && row.parent_code === 'SMK-TAKE' && row.members.length === 1 && row.members[0].qty === 2, JSON.stringify(row));
+  check('下書きの一覧: 作るセットでないカードは出さない', !sp.openPlannedSetCards({ db }).some((x) => x.draft_id === m));
+  // 予約 (登録の前): 引き継げるカードだけ・同じ request_id で違うカード = 断る・予約の間はコードの差し替えを止める・断られた = 外す
+  const rid1 = '11111111-1111-4111-8111-111111111111';
+  sp.reserveSetCardTakeover({ requestId: rid1, draftId: a, code: 'SMK-TAKE-2', components: [{ code: 'SMK-TAKE', qty: 2 }], actor: 'smoke' }, { db });
+  check('予約: 引き継ぐカードを予約 = コードの差し替えを止める', sp.liveTakeoverOf(a, { db })?.request_id === rid1);
+  let rErr = null;
+  try { sp.reserveSetCardTakeover({ requestId: rid1, draftId: m, code: 'SMK-TAKE-3', components: [{ code: 'SMK-TAKE', qty: 3 }], actor: 'smoke' }, { db }); } catch (e) { rErr = e; }
+  check('予約: 同じ request_id で違うカード = 断る', rErr?.status === 409 && rErr.reason === 'request_id_reused', rErr?.message);
+  rErr = null;
+  try { sp.reserveSetCardTakeover({ requestId: '22222222-2222-4222-8222-222222222222', draftId: a, code: 'SMK-TAKE-2', components: [{ code: 'SMK-TAKE', qty: 5 }], actor: 'smoke' }, { db }); } catch (e) { rErr = e; }
+  check('予約: 引き継げない (構成が違う) = 断る', rErr?.status === 409 && rErr.reason === 'set_card_changed', rErr?.message);
+  sp.markSetCardTakeover(rid1, { state: 'dropped', note: '断られた' }, { db });
+  check('予約: 登録が断られた = 外す (コードの差し替えを止めない)', sp.liveTakeoverOf(a, { db }) === null);
+  check('構成の比べ方: 並び・大文字小文字は見ない・数は見る', sp.sameSetMembers([{ code: 'A', qty: 1 }, { code: 'b', qty: 2 }], [{ member_ne_code: 'B', qty: 2 }, { code: 'a', qty: 1 }])
+    && !sp.sameSetMembers([{ code: 'a', qty: 1 }], [{ code: 'a', qty: 2 }]));
+}
+
 console.log(failed === 0 ? '\nSMOKE: ALL PASS' : `\nSMOKE: ${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

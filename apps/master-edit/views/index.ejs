@@ -57,6 +57,8 @@
     <% if (dbError) { %><div class="callout err" role="alert"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg><div class="grow"><div class="t"><%= dbError %></div></div></div><% } %>
     <% if (closed) { %><div class="callout warn"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><div class="grow"><div class="t">いまは保存できません (<%= closedWhy %>)</div><div class="hint">この画面は見るだけです。切替日までは商品マスタの正は NE・/register です。</div></div></div><% } %>
     <% if (!canEdit) { %><div class="callout info"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow"><%= gateMessage %></div></div><% } %>
+    <%# 🆕 2026-10-21: 「登録が下書き」で絞ったとき = product-hub のセットの下書き (まだ登録していない) はここに出ない = 「下書き」の画面へ %>
+    <% if (filters.reg === 'draft') { %><div class="callout info" id="drafts-hint"><svg class="ic" aria-hidden="true"><use href="#i-info"/></svg><div class="grow">ここに出るのはマスタの入力に登録した下書きだけです。単品の登録で「セット商品を作る」にしたセットの下書き (product-hub) は <a href="<%= base %>/drafts">下書き</a> の画面に出ます。</div></div><% } %>
 
     <div class="panel hud">
       <form method="get" action="" role="search" class="bigsearch" id="list-search">

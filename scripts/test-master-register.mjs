@@ -3342,6 +3342,259 @@ await ta('[SP8] Codex R1: 断られた押し直しの作るセットは通った
   assert.deepEqual(setsOf(draftOf('sp-unknown').id).map((x) => x.ne_code), ['sp-unknown-2']);
 });
 
+console.log('\nセットの登録が作るセットの下書きを引き継ぐ (2026-10-21 スタッフ「calypso-2-pb が product-hub のセットのカード (下書き) (#252) が使っています」)');
+/** セットの登録の本文 (カードを作る) */
+const setRegBody = (code, components, over = {}) => ({ request_id: uuid(), kind: 'set', code, values: { name: `${code} のセット`, standard_price: '2500', reorder_months: '1', components }, card: { create: true }, ...over });
+/** 作るセットつきで単品を登録して、できたセットの下書き (カード) を返す */
+async function plannedSet(single, setCode, qty = 2) {
+  const b = spBody(single, [{ qty, code: setCode, name: `${single} ${qty}個セット` }]);
+  b.values.cost = { jpy: '600' };   // 原価がある単品 (セットの原価を構成品から合計できる)
+  const r = await call('POST', '/apps/master-edit/api/new', { body: b });
+  assert.equal(r.status, 200, r.text);
+  const d = draftOf(setCode.toLowerCase());
+  assert.ok(d && d.parent_draft_id && d.provisional_code === 1, `セットの下書きが無い: ${setCode}`);
+  return d;
+}
+const cardsOf = (code) => ph.prepare('SELECT * FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? ORDER BY id').all(String(code).toLowerCase());
+
+await ta('[TK1] 同じコード・同じ構成のセットの登録 = 断らない・カードの取り込みがその下書きを引き継ぐ (新しいカードは作らない・Company DB の SKU に結ぶ・仮コードのまま)・押し直し / 届け直しでも 1 枚・product-hub でコードを変えさせない', async () => {
+  const planned = await plannedSet('sp-take', 'sp-take-2');
+  // その場の確かめ (単品の画面の作るセットの確かめ) は、今までどおり「カードが使っている」
+  assert.equal((await call('GET', '/apps/master-edit/api/set-code-check?code=sp-take-2&parent=sp-x')).j.reason, 'ph_draft');
+  const body = setRegBody('sp-take-2', [{ code: 'SP-TAKE', qty: 2 }]);   // 構成品のコードは大文字小文字を同じと見る
+  const r = await call('POST', '/apps/master-edit/api/new', { body });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.card.status, r.j.card.draft_id, r.j.card.taken_over], ['done', planned.id, true], JSON.stringify(r.j.card));
+  const after = cardsOf('sp-take-2');
+  assert.equal(after.length, 1, '新しいカードを作らない');
+  assert.deepEqual([after[0].id, String(after[0].cdb_sku_id), after[0].provisional_code, after[0].parent_draft_id], [planned.id, String(r.j.sku_id), 1, planned.parent_draft_id]);
+  // 発送方法 (楽天の配送方法) は空だったので埋めた・売価はカードの値のまま (変えなかった欄として返す)
+  assert.ok(r.j.card.not_applied.some((x) => x.field === 'price'), JSON.stringify(r.j.card.not_applied));
+  assert.ok(!r.j.card.not_applied.some((x) => x.field === 'set_members'), '同じ構成は「変えなかった欄」に出さない');
+  assert.ok(ph.prepare("SELECT 1 FROM draft_events WHERE draft_id = ? AND event = 'cdb_card_taken_over'").get(planned.id), '引き継いだ記録');
+  const evRow = ph.prepare('SELECT outcome, draft_id FROM ph_cdb_card_events WHERE cdb_sku_id = ?').get(Number(r.j.sku_id));
+  assert.deepEqual([evRow.outcome, evRow.draft_id], ['linked', planned.id]);
+  // 登録の前に予約 (request_id → カード) → 登録できた → 取り込みで結んだ = applied
+  assert.deepEqual(ph.prepare('SELECT draft_id, state, cdb_sku_id FROM ph_set_card_takeovers WHERE request_id = ?').get(body.request_id), { draft_id: planned.id, state: 'applied', cdb_sku_id: Number(r.j.sku_id) });
+  // Company DB の知らせは done (結果 = linked)
+  const ob = await one('select status, result from ops.product_hub_outbox where sku_id = $1', [r.j.sku_id]);
+  assert.deepEqual([ob.status, ob.result.outcome, ob.result.taken_over], ['done', 'linked', true]);
+  // 押し直し (同じ request_id) = 前の結果・届け直し (別の知らせの番号) = 結んであった
+  const again = await call('POST', '/apps/master-edit/api/new', { body });
+  assert.deepEqual([again.status, again.j.replayed], [200, true], again.text);
+  const ev = await evOf(r.j.sku_id);
+  assert.equal(PH.applyCdbCardEvent({ event_id: ev.event_id, sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id, request_hash: ev.request_hash }).replayed, true);
+  assert.equal(PH.applyCdbCardEvent({ event_id: uuid(), sku_id: ev.sku_id, schema_version: 'ph-card-v1', payload: ev.payload, request_id: ev.request_id, request_hash: ev.request_hash }).outcome, 'linked');
+  assert.equal(cardsOf('sp-take-2').length, 1);
+  // 結んだカードのコードは product-hub の「本コードを入力」で変えさせない (Company DB とずれる)
+  const sc = await call('POST', `/apps/product-hub/api/drafts/${planned.id}/set-code`, { body: { ne_code: 'sp-take-9' } });
+  assert.equal(sc.status, 400, sc.text);
+  assert.match(sc.j.error, /マスタの入力で登録した商品に結んである/);
+  assert.equal(cardsOf('sp-take-2').length, 1);
+  // 同じコードでもう一度 (別の登録) = 断る (カードはもう Company DB の商品に結んである = 2 つ目の SKU に結ばない)
+  const dup = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-take-2', [{ code: 'sp-take', qty: 2 }]) });
+  assert.deepEqual([dup.status, dup.j.reason], [409, 'set_code_reserved'], dup.text);
+  assert.match(dup.j.error, /もう Company DB の商品に結んであります/);
+});
+
+await ta('[TK2] 引き継がない = 断る (どのカードか・なぜか・何をするかの 1 行・カードを開く URL)・何も保存しない: 構成が違う / 「出品カードを作る」を外した / 除外したカード / 作るセットでないセットのカード / 単品の登録', async () => {
+  const planned = await plannedSet('sp-nt', 'sp-nt-2');
+  const url = `/apps/product-hub/detail/${planned.id}`;
+  const refuse = async (body, reason, re) => {
+    const r = await call('POST', '/apps/master-edit/api/new', { body });
+    assert.deepEqual([r.status, r.j.reason, r.j.field, r.j.card_url, r.j.draft_id], [409, reason, 'code', url, planned.id], r.text);
+    assert.match(r.j.error, re);
+    assert.match(r.j.error, /何も保存していません$/);
+    assert.equal(await skuId(body.code), undefined);
+    return r;
+  };
+  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 3 }]), 'set_code_reserved', new RegExp(`\\(#${planned.id}\\) が使っています \\(カードの構成 \\(sp-nt×2\\) と入れた構成 \\(sp-nt×3\\) がちがいます\\)。構成をカードと同じにするか、別のコードにしてください`));
+  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }, { code: 's001', qty: 1 }]), 'set_code_reserved', /がちがいます/);
+  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }], { card: { create: false } }), 'set_card_needed', /「出品カードを作る」を外さずに登録してください/);
+  await refuse({ request_id: uuid(), kind: 'single', code: 'sp-nt-2', values: withReq('single', single()), card: { create: false } }, 'set_code_reserved', /セットのカード \(下書き\) \(#\d+\) が使っています。別のコードにするか、product-hub でカードを確かめてください/);
+  ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(planned.id);
+  await refuse(setRegBody('sp-nt-2', [{ code: 'sp-nt', qty: 2 }]), 'set_code_reserved', /\(除外にしてあります\)/);
+  ph.prepare(`UPDATE product_drafts SET status = 'draft' WHERE id = ?`).run(planned.id);
+  // 作るセットから作ったのでないセットのカード (product-hub の「セット商品を作る」でコードを入れたもの)
+  const parentId = draftOf('sp-nt').id;
+  const man = Number(ph.prepare(`INSERT INTO product_drafts (ne_code, name, status, parent_draft_id, provisional_code, created_by) VALUES ('sp-nt-3', '手で作ったセット', 'draft', ?, 1, 'x')`).run(parentId).lastInsertRowid);
+  ph.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, 3, 0)').run(man, 'sp-nt');
+  const r = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-nt-3', [{ code: 'sp-nt', qty: 3 }]) });
+  assert.deepEqual([r.status, r.j.reason, r.j.card_url], [409, 'set_code_reserved', `/apps/product-hub/detail/${man}`], r.text);
+  assert.match(r.j.error, /新商品の登録で決めたセットのカードではありません/);
+  // 画面の JS: 断った文の下にカードを開くリンク (同じポータルの URL だけ)
+  const page = await call('GET', '/apps/master-edit/new?kind=set');
+  const js = (await checkScripts(page.text, 0)).find((x) => x.includes('me-new.js — 新商品の登録の画面')) || '';
+  assert.ok(js.includes("/^\\/apps\\/product-hub\\/detail\\/\\d+$/.test(String(j.card_url))"), '画面がカードのリンクを出さない');
+  assert.ok(js.includes('を、このセットの出品カードとして引き継ぎました'), '画面が引き継いだことを知らせない');
+});
+
+await ta('[TK3] 確かめた後にカードが変わった (構成を直した) = 結ばずに衝突 (人が決める)・直したら「もう一度作る」で引き継ぐ・登録の取引の中でももう一度確かめる', async () => {
+  const planned = await plannedSet('sp-race', 'sp-race-2');
+  applierMode = 'boom';   // 登録の直後のカードの取り込みは落ちる (Company DB の登録と知らせは残る)
+  const r = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-race-2', [{ code: 'sp-race', qty: 2 }]) });
+  applierMode = 'real';
+  assert.deepEqual([r.status, r.j.card.status], [200, 'failed'], r.text);
+  ph.prepare('UPDATE draft_set_members SET qty = 3 WHERE set_draft_id = ?').run(planned.id);
+  let retry = await call('POST', '/apps/master-edit/api/sku/sp-race-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'conflict'], retry.text);
+  assert.equal(cardsOf('sp-race-2').length, 1);
+  assert.equal(cardsOf('sp-race-2')[0].cdb_sku_id, null, '構成の違うカードに結ばない');
+  ph.prepare('UPDATE draft_set_members SET qty = 2 WHERE set_draft_id = ?').run(planned.id);
+  retry = await call('POST', '/apps/master-edit/api/sku/sp-race-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'done'], retry.text);
+  assert.deepEqual([cardsOf('sp-race-2').length, String(cardsOf('sp-race-2')[0].cdb_sku_id)], [1, String(r.j.sku_id)]);
+  // 登録の取引の中 (コードの鍵の後) の確かめでも、引き継げないカードなら断る (codeReserved = 入口と同じ)
+  const planned2 = await plannedSet('sp-race3', 'sp-race3-2');
+  ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(planned2.id);
+  const e = await rejectsWith(asEditor(() => R.registerNewSku(db, { actor: 'naka@test', requestId: uuid(), kind: 'set', code: 'sp-race3-2', values: { name: 'x', standard_price: '2400', reorder_months: '1', components: [{ code: 'sp-race3', qty: 2 }] }, card: { create: true } },
+    { open: true, now: NOW, shippingRates: RATES, codeReserved: async () => ({ status: 409, reason: 'set_code_reserved', message: '商品コード sp-race3-2 は product-hub のセットのカード (下書き) が使っています', card_url: `/apps/product-hub/detail/${planned2.id}`, draft_id: planned2.id }) })), 409, 'set_code_reserved');
+  assert.equal(e.extra.card_url, `/apps/product-hub/detail/${planned2.id}`);
+  assert.equal(await skuId('sp-race3-2'), undefined);
+});
+
+await ta('[TK5] Codex R1 Medium: 登録の後 (取り込みの前) にカードのコードを変えた = 新しいカードを作らずに衝突 (予約したカードにだけ結ぶ)・取り込み待ちの間は product-hub でコードを変えさせない・除外したら新しいカード・断られた登録の予約は外す', async () => {
+  const planned = await plannedSet('sp-rn', 'sp-rn-2');
+  applierMode = 'boom';
+  const b = setRegBody('sp-rn-2', [{ code: 'sp-rn', qty: 2 }]);
+  const r = await call('POST', '/apps/master-edit/api/new', { body: b });
+  applierMode = 'real';
+  assert.deepEqual([r.status, r.j.card.status], [200, 'failed'], r.text);
+  assert.deepEqual(ph.prepare('SELECT draft_id, state, cdb_sku_id FROM ph_set_card_takeovers WHERE request_id = ?').get(b.request_id), { draft_id: planned.id, state: 'registered', cdb_sku_id: Number(r.j.sku_id) });
+  // 取り込み待ちの間 = product-hub の「本コードを入力」で変えさせない
+  const sc = await call('POST', `/apps/product-hub/api/drafts/${planned.id}/set-code`, { body: { ne_code: 'sp-rn-9' } });
+  assert.equal(sc.status, 409, sc.text);
+  assert.match(sc.j.error, /引き継ぐセットの登録をしているところ/);
+  // それでもコードが変わった (別の道) = 取り込みは新しいカードを作らない (衝突・予約したカードを見せる)
+  ph.prepare(`UPDATE product_drafts SET ne_code = 'sp-rn-9' WHERE id = ?`).run(planned.id);
+  let retry = await call('POST', '/apps/master-edit/api/sku/sp-rn-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'conflict'], retry.text);
+  assert.equal(cardsOf('sp-rn-2').length, 0, '新しいカードを作らない');
+  assert.match(retry.j.error || JSON.stringify(retry.j), /引き継ぐはずの product-hub のカード \(#\d+\) が、登録の後に変わりました \(カードのコードが sp-rn-9 に変わりました\)/);
+  // コードがもう予約のときと違う = 差し替えを止めない (直す操作を止めない・Codex R2 Medium 2)
+  assert.equal(SPS.liveTakeoverOf(planned.id), null);
+  // コードを戻せば引き継ぐ
+  ph.prepare(`UPDATE product_drafts SET ne_code = 'sp-rn-2' WHERE id = ?`).run(planned.id);
+  assert.ok(SPS.liveTakeoverOf(planned.id), 'コードを戻した = また止める');
+  retry = await call('POST', '/apps/master-edit/api/sku/sp-rn-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'done'], retry.text);
+  assert.deepEqual([cardsOf('sp-rn-2').length, cardsOf('sp-rn-2')[0].id], [1, planned.id]);
+  // 人が予約したカードを除外した (使わない) = 予約は使わない = 今までどおり (同じコードの除外したカードがある = 衝突 / 片付けてコードも変えた = 新しいカード)
+  const p2 = await plannedSet('sp-ex', 'sp-ex-2');
+  applierMode = 'boom';
+  const r2 = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-ex-2', [{ code: 'sp-ex', qty: 2 }]) });
+  applierMode = 'real';
+  assert.equal(r2.status, 200, r2.text);
+  ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(p2.id);
+  assert.equal(SPS.liveTakeoverOf(p2.id), null, '除外したカード = 差し替えを止めない (片付けられる・Codex R2 Medium 2)');
+  ph.prepare(`UPDATE product_drafts SET ne_code = 'sp-ex-2-old' WHERE id = ?`).run(p2.id);
+  retry = await call('POST', '/apps/master-edit/api/sku/sp-ex-2/card-retry', { body: {} });
+  assert.deepEqual([retry.status, retry.j.status], [200, 'done'], retry.text);
+  assert.equal(cardsOf('sp-ex-2').length, 1);
+  assert.notEqual(cardsOf('sp-ex-2')[0].id, p2.id, '除外したカードには結ばない');
+  // 断られた登録 (Company DB の決まり) = 予約は dropped (コードの差し替えを止めない)
+  const p3 = await plannedSet('sp-dr', 'sp-dr-2');
+  const b3 = setRegBody('sp-dr-2', [{ code: 'sp-dr', qty: 2 }], { values: { name: 'x', standard_price: '2500', reorder_months: '1', components: [{ code: 'sp-dr', qty: 2 }], set_sales_class_override: '3' } });
+  const r3 = await call('POST', '/apps/master-edit/api/new', { body: b3 });
+  assert.equal(r3.status, 400, r3.text);
+  assert.equal(ph.prepare('SELECT state FROM ph_set_card_takeovers WHERE request_id = ?').get(b3.request_id).state, 'dropped');
+  assert.equal(SPS.liveTakeoverOf(p3.id), null);
+});
+
+await ta('[TK6] Codex R2 Medium 1: 入口の確かめの後に、引き継げるカードが初めて現れた (予約していない) = 登録の取引の中の確かめで断る (予約の無いカードには結ばない)・何も保存しない', async () => {
+  const planned = await plannedSet('sp-late', 'sp-late-x');
+  // 入口の確かめのときは product-hub にこのコードのカードが無かった = 1 回目の held だけ「無い」と答える (その後に誰かがカードのコードを変えた、と同じ)
+  const real = { held: (c, o) => SPS.setCodeHeld(c, o), planned: (c, o) => SPS.plannedSetCardCheck(c, o || {}), reserveTake: (x) => SPS.reserveSetCardTakeover(x), markTake: (rid, x) => SPS.markSetCardTakeover(rid, x),
+    write: (x) => SPS.writeSetPlan(x), mark: (rid, x) => SPS.markSetPlan(rid, x), stale: (codes, o) => SPS.staleWaitingPlansFor(codes, o || {}) };
+  let n = 0;
+  MR.__setSetPlanStore({ ...real, held: (c, o) => (n++ === 0 ? null : real.held(c, o)) });
+  try {
+    ph.prepare(`UPDATE product_drafts SET ne_code = 'sp-late-2' WHERE id = ?`).run(planned.id);
+    const b = setRegBody('sp-late-2', [{ code: 'sp-late', qty: 2 }]);
+    const r = await call('POST', '/apps/master-edit/api/new', { body: b });
+    assert.deepEqual([r.status, r.j.reason, r.j.card_url], [409, 'set_card_changed', `/apps/product-hub/detail/${planned.id}`], r.text);
+    assert.match(r.j.error, /引き継ぐカードがちょうど変わりました。画面を開き直してください。何も保存していません/);
+    assert.equal(await skuId('sp-late-2'), undefined);
+    assert.equal(ph.prepare('SELECT COUNT(*) AS c FROM ph_set_card_takeovers WHERE request_id = ?').get(b.request_id).c, 0);
+  } finally { MR.__setSetPlanStore(null); }
+  // ふつうに押し直す (入口で見つかる = 予約する) = 引き継ぐ
+  const again = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('sp-late-2', [{ code: 'sp-late', qty: 2 }]) });
+  assert.equal(again.status, 200, again.text);
+  assert.deepEqual([again.j.card.taken_over, again.j.card.draft_id], [true, planned.id]);
+});
+
+await ta('[TK4] コードの書き方 (大文字小文字) だけ違う = 引き継いでカードのコードを Company DB の書き方にそろえる', async () => {
+  const planned = await plannedSet('sp-case', 'sp-case-2');
+  const r = await call('POST', '/apps/master-edit/api/new', { body: setRegBody('SP-Case-2', [{ code: 'sp-case', qty: 2 }]) });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual([r.j.card.taken_over, r.j.card.draft_id], [true, planned.id]);
+  assert.equal(ph.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(planned.id).ne_code, 'SP-Case-2');
+});
+
+await ta('[DR1] 「下書き」の画面: 左の列の入口・product-hub のまだ登録していないセットの下書き (コード・名前・構成・元の単品・開く・セットとして登録する) とマスタの入力の下書き (登録の状態 = 下書き)・引き継いだカードは出さない・一覧の「登録が下書き」から案内', async () => {
+  const planned = await plannedSet('sp-list', 'sp-list-2', 3);
+  const r = await call('GET', '/apps/master-edit/drafts');
+  assert.equal(r.status, 200, r.text.slice(0, 300));
+  await checkScripts(r.text);
+  assert.match(r.text, /<a class="nav on" href="\/apps\/master-edit\/drafts" aria-label="下書き" aria-current="page">/);
+  const phSec = /<section class="panel" id="drafts-ph"[\s\S]*?<\/section>/.exec(r.text)[0];
+  const row = new RegExp(`<tr data-ph-draft="${planned.id}">[\\s\\S]*?</tr>`).exec(phSec);
+  assert.ok(row, 'まだ登録していないセットの下書きが出ない');
+  assert.ok(row[0].includes('sp-list-2') && row[0].includes('sp-list 3個セット') && row[0].includes('sp-list × 3'), row[0]);
+  assert.ok(row[0].includes(`href="/apps/product-hub/detail/${planned.id}"`), 'product-hub で開くリンク');
+  assert.ok(row[0].includes(`href="/apps/master-edit/new?kind=set&amp;from_card=${planned.id}"`), 'セットとして登録する');
+  assert.ok(row[0].includes('href="/apps/master-edit/sku/sp-list"'), '元の単品');
+  assert.ok(!/data-ph-draft="[^"]*"[^>]*>[\s\S]{0,200}sp-take-2/.test(phSec) && !phSec.includes('>sp-take-2<'), '引き継いだ (登録した) カードは出さない');
+  // 除外したカードは出さない
+  const ex = draftOf('sp-nt-2');
+  ph.prepare(`UPDATE product_drafts SET status = 'excluded' WHERE id = ?`).run(ex.id);
+  assert.ok(!(await call('GET', '/apps/master-edit/drafts')).text.includes(`data-ph-draft="${ex.id}"`));
+  ph.prepare(`UPDATE product_drafts SET status = 'draft' WHERE id = ?`).run(ex.id);
+  // マスタの入力の下書き = 登録の状態が下書きの商品 (単品・セット)・商品の画面へ
+  const cdbSec = /<section class="panel" id="drafts-cdb"[\s\S]*?<\/section>/.exec(r.text)[0];
+  for (const code of ['sp-list', 'sp-take-2']) assert.ok(cdbSec.includes(`<tr data-cdb-draft="${code}">`), `マスタの入力の下書きに ${code} が無い`);
+  const n = (await one(`select count(*)::int as n from ops.master_registrations where state = 'draft'`)).n;
+  assert.match(cdbSec, new RegExp(`id="drafts-cdb-n">${n} 件<`));
+  // 見るだけの人: 「セットとして登録する」は出さない (開くのは出す)
+  const v = await call('GET', '/apps/master-edit/drafts', { session: 'viewer' });
+  assert.equal(v.status, 200);
+  assert.ok(v.text.includes(`data-ph-draft="${planned.id}"`) && !v.text.includes('data-take='), '見るだけの人に登録の入口');
+  // product-hub を読めない = その節だけ一言 (画面は出す)
+  MR.__setSetPlanStore({ write: () => 0, mark: () => 0, held: () => null, openCards: () => { throw new Error('SQLite を読めない'); } });
+  try {
+    const e = await call('GET', '/apps/master-edit/drafts');
+    assert.equal(e.status, 200);
+    assert.match(e.text, /product-hub のカードを読めません/);
+    assert.ok(e.text.includes('<tr data-cdb-draft="sp-list">'));
+  } finally { MR.__setSetPlanStore(null); }
+  // 一覧の「登録が下書き」で絞ったとき = 「下書き」の画面へ案内
+  const list = await call('GET', '/apps/master-edit/?reg=draft');
+  assert.match(list.text, /id="drafts-hint"[\s\S]*?href="\/apps\/master-edit\/drafts">下書き<\/a> の画面に出ます/);
+  assert.ok(!(await call('GET', '/apps/master-edit/')).text.includes('id="drafts-hint"'));
+});
+
+await ta('[DR2] 「セットとして登録する」= セットの登録の画面にコード・名前・構成を入れておく (画面の JS が欄に入れる)・引き継げないカード = 理由の帯・押して保存すると引き継ぐ', async () => {
+  const planned = draftOf('sp-list-2');
+  const r = await call('GET', `/apps/master-edit/new?kind=set&from_card=${planned.id}`);
+  assert.equal(r.status, 200);
+  const pageData = JSON.parse(/<script type="application\/json" id="me-new">([\s\S]*?)<\/script>/.exec(r.text)[1]);
+  assert.deepEqual(pageData.prefill, { code: 'sp-list-2', name: 'sp-list 3個セット', components: [{ code: 'sp-list', qty: 3 }] });
+  assert.match(r.text, new RegExp(`id="prefill-note"[\\s\\S]*?セットの下書き #${planned.id} \\(sp-list-2\\) を、このセットのカードとして引き継いで登録します`));
+  const js = (await checkScripts(r.text, 0)).find((x) => x.includes('me-new.js — 新商品の登録の画面')) || '';
+  assert.ok(js.includes('var pf = P.prefill;'), '画面の JS が入れておく値を使わない');
+  // 単品の画面・番号の違うカード・除外したカード
+  assert.equal(JSON.parse(/<script type="application\/json" id="me-new">([\s\S]*?)<\/script>/.exec((await call('GET', `/apps/master-edit/new?kind=single&from_card=${planned.id}`)).text)[1]).prefill, null);
+  const bad = await call('GET', '/apps/master-edit/new?kind=set&from_card=999999');
+  assert.match(bad.text, /id="prefill-note"[\s\S]*?まだ登録していないセットの下書きではありません/);
+  const taken = draftOf('sp-take-2');
+  assert.match((await call('GET', `/apps/master-edit/new?kind=set&from_card=${taken.id}`)).text, /まだ登録していないセットの下書きではありません/);
+  // そのまま登録 = 引き継ぐ
+  const s = await call('POST', '/apps/master-edit/api/new', { body: setRegBody(pageData.prefill.code, pageData.prefill.components) });
+  assert.equal(s.status, 200, s.text);
+  assert.deepEqual([s.j.card.taken_over, s.j.card.draft_id, cardsOf('sp-list-2').length], [true, planned.id, 1]);
+  assert.ok(!(await call('GET', '/apps/master-edit/drafts')).text.includes(`data-ph-draft="${planned.id}"`), '登録したら product-hub の節から消える');
+});
+
 server.close();
 try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch { /* Windows で開いたままのことがある */ }
 console.log(`\n${passed} 件 ok`);

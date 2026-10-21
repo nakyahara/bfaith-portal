@@ -10,6 +10,7 @@
  *   - cdb_sku_id のカードがもうある = 「結んであった」(linked)。増やさない
  *   - 同じ商品コードのカード (cdb_sku_id なし・別の SKU) がもうある = 衝突 (conflict)。増やさない・直さない・記録する (人が決める)
  *     人が決める = 「既存のカードをこの商品に結ぶ」(linkCdbCardToExisting・PR #1566 R1 M6) か、古いカードを片付けて「もう一度」
+ *     🆕 2026-10-21: セットの登録で、そのカードが新商品の登録で決めたセットの下書き (構成も同じ・まだ結んでいない) = 衝突にせずに引き継ぐ (linked・taken_over)
  *   - 同じ商品コード (LOWER(TRIM(ne_code))) のカードが 2 枚以上 = どれか決められない衝突 (ambiguous)。結ぶ道も出さない (片付けてから「もう一度」)
  *   - 前に作った・結んだ答え (記録・cdb_sku_id のカード) を使い回すのも、同じコードのカードがそのカード 1 枚だけのときだけ。
  *     SQLite で作った後に Postgres を done にできず、その間に同じコードのカードが増えた = 使い回さず ambiguous (知らせを done にしない・#1566 Codex R3 Medium 2)
@@ -27,7 +28,7 @@
 import { getDB, logEvent, upsertDraftYahoo } from '../db.js';
 import { SHIPPING_METHOD_GROUPS } from '../lib/shipping-groups.js';
 import { SET_DECISION_REASONS } from '../lib/set-decision.js';
-import { applySetPlanInTx, skipSetPlanInTx } from './cdb-set-plan.js';
+import { applySetPlanInTx, skipSetPlanInTx, plannedSetCardCheck, sameSetMembers, setCardTakeoverOf } from './cdb-set-plan.js';
 
 /** 取り込める payload の版 (Company DB の lib/product-hub-outbox.mjs の CARD_SCHEMA_VERSION) */
 export const CARD_SCHEMAS = Object.freeze(['ph-card-v1']);
@@ -143,9 +144,49 @@ export function applyCdbCardEvent(event, { db = getDB() } = {}) {
       }
       return ambiguous(linked.id);
     }
+    // 🆕 2026-10-21: セットの登録 (マスタの入力) が引き継ぐカード。セットの下書き (新商品の登録で決めたもの) で構成も同じ = そのカードを Company DB のセットに結ぶ
+    //   (新しいカードを作らない)。確かめはこの取引の中 (plannedSetCardCheck)。provisional_code = 1 のまま (NE の商品マスタに取り込まれたら reconcileProvisionalCode が確定する)
+    const takeOver = (id) => {
+      const d = db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(id);
+      const respelled = String(d.ne_code ?? '') !== code;
+      if (respelled) {
+        db.prepare(`UPDATE product_drafts SET ne_code = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`).run(code, id);
+        logEvent(db, id, 'cdb_card_code_spelling', `商品コードの書き方を Company DB の ${code} にそろえた (前 = ${d.ne_code})`, ACTOR);
+      }
+      const u = db.prepare(`UPDATE product_drafts SET cdb_sku_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND cdb_sku_id IS NULL`).run(skuId, id);
+      if (u.changes !== 1) throw fail(`カード #${id} をちょうどほかの処理が変えました`);
+      logEvent(db, id, 'cdb_card_taken_over', `Company DB のセット ${code} (SKU ${skuId}) の登録が、このセットの下書きを引き継いだ (新しいカードは作っていない)`, p.created_by || ACTOR);
+      const fill = fillEmptyCardFields(db, id, p, { requestId, requestHash, skuId });
+      if (fill.applied.length || fill.not_applied.length) {
+        logEvent(db, id, 'cdb_card_link_fields', `埋めた: ${fill.applied.join('・') || 'なし'} / 入っていたので変えなかった: ${fill.not_applied.map((x) => x.label).join('・') || 'なし'}`, ACTOR);
+      }
+      db.prepare(`UPDATE ph_set_card_takeovers SET state = 'applied', cdb_sku_id = ? WHERE request_id = ? AND draft_id = ?`).run(skuId, String(requestId ?? ''), id);
+      record('linked', id, null, null);
+      return { outcome: 'linked', draft_id: id, taken_over: true, applied: fill.applied, not_applied: fill.not_applied, respelled };
+    };
+    // 🆕 Codex R1 Medium: 登録の前に予約したカード (この登録の request_id) があれば、そのカードにだけ結ぶ。
+    //   予約の後にコードを変えられた・構成が変わった・同じコードのカードが増えた = 新しいカードを作らずに衝突 (人が決める)。
+    //   予約のカードが無くなった・除外した = 予約は使わない (人が片付けた = 今までどおり)
+    const tk = p.kind === 'set' && requestId ? setCardTakeoverOf(db, requestId) : null;
+    const tkCard = tk && tk.state !== 'applied' ? db.prepare('SELECT id, ne_code, status FROM product_drafts WHERE id = ?').get(tk.draft_id) : null;
+    if (tkCard && tkCard.status !== 'excluded') {
+      const chk = plannedSetCardCheck(code, { components: p.components, db });
+      if (ids.length === 1 && ids[0] === tkCard.id && chk && chk.takeable && chk.draft_id === tkCard.id) return takeOver(tkCard.id);
+      const why = String(tkCard.ne_code ?? '').trim().toLowerCase() !== codeKey ? `カードのコードが ${tkCard.ne_code} に変わりました`
+        : ids.length > 1 ? `同じコードのカードが ${ids.length} 枚 (${ids.map((x) => '#' + x).join('・')}) あります` : (chk && chk.why) || 'カードが変わりました';
+      record('conflict', null, tkCard.id, null);
+      logEvent(db, tkCard.id, 'cdb_card_conflict', `Company DB のセット ${code} (SKU ${skuId}) の登録が引き継ぐはずのカード (${why})`, ACTOR);
+      return { outcome: 'conflict', draft_id: null, conflict_draft_id: tkCard.id,
+        message: `このセットの登録で引き継ぐはずの product-hub のカード (#${tkCard.id}) が、登録の後に変わりました (${why})。新しいカードは作っていません。product-hub でカードを確かめてください (使わないなら除外してから「もう一度作る」)` };
+    }
     // 同じ商品コードのカード (別に作られていた) = 増やさない・記録する
     if (ids.length > 1) return ambiguous();
     if (ids.length === 1) {
+      // 予約の無い登録 (前の画面など) でも、そのカードが引き継げるなら引き継ぐ (同じ取引で確かめる)
+      if (p.kind === 'set') {
+        const chk = plannedSetCardCheck(code, { components: p.components, db });
+        if (chk && chk.takeable && chk.draft_id === ids[0]) return takeOver(ids[0]);
+      }
       record('conflict', null, ids[0], null);
       logEvent(db, ids[0], 'cdb_card_conflict', `Company DB の新商品 ${code} (SKU ${skuId}) と同じ商品コードのカード`, ACTOR);
       return { outcome: 'conflict', draft_id: null, conflict_draft_id: ids[0],
@@ -245,7 +286,9 @@ function fillEmptyCardFields(db, id, p, { requestId = null, requestHash = null, 
   }
   if (p.kind === 'set') {
     const n = db.prepare('SELECT COUNT(*) AS c FROM draft_set_members WHERE set_draft_id = ?').get(id).c;
-    if (n === 0) { writeSetMembers(db, id, p.components); applied.push('セットの構成品'); } else notApplied.push({ field: 'set_members', label: 'セットの構成品', card: `${n} 行`, entered: (p.components || []).map((c) => `${c.code}×${c.qty}`).join(', ') });
+    if (n === 0) { writeSetMembers(db, id, p.components); applied.push('セットの構成品'); }
+    else if (sameSetMembers(db.prepare('SELECT member_ne_code AS code, qty FROM draft_set_members WHERE set_draft_id = ?').all(id), p.components)) { /* 同じ構成 = 何もしない */ }
+    else notApplied.push({ field: 'set_members', label: 'セットの構成品', card: `${n} 行`, entered: (p.components || []).map((c) => `${c.code}×${c.qty}`).join(', ') });
   }
   // 楽天の配送方法 (対応があるとき・カードが空のとき)
   const ship = mapCdbShipping(db, p.shipping);

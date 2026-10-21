@@ -75,7 +75,7 @@ import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, newKindOfCode, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 // Company DB の「新商品の登録」から作るカード (2026-10-01・Company DB構想 14 ⑤-2a)。知らせ (outbox) の取り込みと、新規作成の入口の切り替え
 import { applyCdbCardEvent, cdbShippingCheckIds } from './services/cdb-card-intake.js';
-import { setPlanDraftAges, setCodeHeld } from './services/cdb-set-plan.js';
+import { setPlanDraftAges, setCodeHeld, liveTakeoverOf } from './services/cdb-set-plan.js';
 import { SET_PLAN_ALERT_DAYS } from '../../lib/set-plan.mjs';
 // 🆕 まとまり (色違い・サイズ違い) のカード (Company DB構想 20 v7 §⑤・PR-4): 取り込み・「要確認」・状態 (NE の写し待ち / 2 軸 = 出品の門)
 import { applyCdbGroupEvent, ackCdbGroupAttention } from './services/cdb-group-intake.js';
@@ -4060,6 +4060,14 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
   const db = getDB();
   if (draft.provisional_code !== 1) {
     return res.status(400).json({ ok: false, error: 'この商品の商品コードは仮ではありません' });
+  }
+  // 🆕 2026-10-21: Company DB の商品に結んだカード (マスタの入力でセットとして登録して引き継いだ下書きなど) = コードは Company DB と同じでないといけない = ここでは変えない
+  if (draft.cdb_sku_id != null) {
+    return res.status(400).json({ ok: false, error: 'このカードはマスタの入力で登録した商品に結んであるので、ここでは商品コードを変えられません (コードはマスタの入力の商品の画面で確かめてください)' });
+  }
+  //   🆕 Codex R1 Medium: マスタの入力でこのカードを引き継ぐセットの登録が動いている (予約あり・カードの取り込み待ち) = 変えない (変えると引き継げない)
+  if (liveTakeoverOf(draft.id, { db })) {
+    return res.status(409).json({ ok: false, error: 'マスタの入力でこのカードを引き継ぐセットの登録をしているところなので、いまは商品コードを変えられません (少し待ってから画面を開き直してください)' });
   }
   // 出品先を決める不可逆な操作なので、担当者本人か admin だけに許す (Codex R1 high)。
   // セット企画者はセットの NE登録工程を動かせる (§4.1) ので、本コードの入力もできないと
