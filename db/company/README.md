@@ -3006,3 +3006,22 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方 (🚨 本番 DB の操作 = 中原さんの OK の後): アプリ (マージ = 0098 の前の DB では画面に何も出さない) → `migrate.mjs --dry-run` (この 1 本・view と関数と CHECK を作り直すだけ・値は変えない) → 中原さんの OK → 本適用。
   ロールの script の流し直しは要らない (migration の中で master_edit・watcher に実行権を付ける)
 - 試験 = `node scripts/test-master-draft-in-ne.mjs` ([M] 写し・[C] 確かめ・[F] 登録済みにする・[N] NE へ送る・[T]・[R] ロール・[S] 画面・[U] 画面の JS) / `scripts/test-master-reg-csv.mjs` [C18] / `scripts/test-master-register.mjs` [S3]
+
+### セットの新商品を構成の持ち主 NE のまま登録する (0100 仮番号・2026-10-21 中原さん「セット商品つくれないんだけど。作れるようにして」「近道を作って」)
+- **なぜ**: 新商品の登録 (セット) は、構成の持ち主 `sku_components` が load (NE が正) なので閉じていた (画面「切替前です」)。登録が書くのはセットの SKU と構成の依頼 (`ops.sku_component_requests`) だけで、
+  `core.sku_components` は書かない = 持ち主を切り替えなくても開けてよい (AI_reference CompanyDB構想/24 §経緯 10/21 = 大きな切替 PR-1〜PR-7 は今は作らない)
+- **DB** (前の最後の版を写して 🆕 0100 の行だけ変えた・試験 [G-0100] が差を機械で確かめる):
+  - 許可: `ops.grant_new_entry_lease('single', 回)` が同じ結果の行・同じ期限でセットの許可も出す / `revoke_new_entry_lease('single')` がセットも取り消す (停止の床も両方)。毎朝の段 (new-entry-gate.mjs) は変えない。
+    当てた時点で単品の許可が有効なら同じ結果の行・期限でセットの許可を 1 つ出す (`@@SET_LEASE_BEGIN@@` の do ブロック・もう一度流しても何もしない)
+  - `ops.register_new_sku` (0061 の版): セットも許可を確かめる・登録の結果の「このあと」をセットだけ今の手順に
+  - `ops.guard_master_edit_write` (0051 の版): 登録の約束 (`sku_create`) の中の構成の依頼の INSERT だけ、持ち主 `sku_components` が load でも通す (既にあるセットの依頼・食い違いは今までどおり company のときだけ)
+  - `ops.ne_reg_schema_rule`: セットの NE 登録の CSV = `ne-reg-set-v2` (見出し・中身は v1 と同じ・試し用の 5 行の門なし = 24 の Q2 = a)・v1 は作らない / 配らない版 (本番でセットの CSV はまだ 0 件)
+  - 印 `ops.set_entry_on_load()`
+- **アプリ**: 新商品の登録の持ち主の条件は `NEW_ENTRY_OWNER_KEYS` (= `NEW_ENTRY_KEYS` から依頼だけのキー `sku_components` を除く)・夜間ロードの後の `promoteComponentRequest` は持ち主 load のとき
+  依頼を閉じるだけ (`closeRequestOnLoad`: 観測 = 依頼で core = 観測 = applied・違う = 食い違い mismatch / stale・core がまだ = 次の夜・core = 観測なら導く値を今の core で計算し直す・core の構成は書かない・依頼の無いセットは何もしない)。
+  今の構成が空の新しいセットは、画面の保存の確かめと計算し直しを依頼の構成でする。セットの NE 登録の CSV は「NE に取り込んだ」を押す (翌朝の自動の確かめはセットを比べない = 0063 の `set_not_compared`)
+- 当て方 (🚨 本番 DB の操作 = 中原さんの OK の後): `migrate.mjs --dry-run` (この 1 本・関数の置き換えと許可の行を 1 つ足すだけ・商品と構成の値は変えない) → 中原さんの OK → 本適用 → アプリを配る
+  (アプリが先でも、0100 の前の DB はセットの許可が無い = セットは閉じたまま)。ロールの script の流し直しは要らない (create or replace = 実行権はそのまま・新しい印は誰にも渡さない)。
+  夜間ロードの規則の指紋 (engine.mjs ほか) は変えない = Render と miniPC を同じ朝にそろえる必要はない
+- 戻し方: 非常の止め `MASTER_NEW_ENTRY_STOP=1` (Render の env) で新商品の登録と CSV を止める。持ち主は変えていない = 夜間ロード・古い表・出荷は今のまま
+- 試験 = `scripts/test-master-register.mjs` [R1]・[R9]・[W1]・[W2]・[G-0100] / `scripts/test-master-reg-csv.mjs` [C11]・[V1]・[V6]・[W2] ⑦ (許可と do ブロック)・[H1]・[H3] / `scripts/test-master-edit.mjs` [11L] / `scripts/test-master-edit-ui.mjs` [60]

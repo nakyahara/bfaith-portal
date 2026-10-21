@@ -2730,6 +2730,66 @@ await ta('[22] 1 つの商品の画面の「← 前へ」「次へ →」(10/17 
   assert.deepEqual(await R.listNeighbors(db, { sort: 'profit' }, all[mid], { now: NOW }), expect(all, mid));
 });
 
+await ta('[11L] 🆕 0100: 構成の持ち主が load (NE が正) = 依頼を閉じるだけ (core の構成は書かない): 観測 ≠ 依頼 = mismatch・観測 = 依頼でも core がまだ = 次の観測でもう一度・夜間ロードが NE の中身を core に書いた後 = applied (並びは見ない)・依頼が無い = 何もしない (食い違いも開かない)', async () => {
+  const LOAD_COMP = { ...ALL_COMPANY, sku_components: 'load' };
+  const p = (id) => promote(id, { ownership: LOAD_COMP });
+  const SET = 'set001';
+  const openBr = async () => (await q(`select kind from ops.sku_component_breaches where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1) order by kind`, [SET])).map((b) => b.kind);
+  const reqOf = async () => (await q(`select status, close_reason, applied_observation_id::text as oid from ops.sku_component_requests where set_sku_id = (select sku_id from core.skus where code = $1) order by component_request_id desc limit 1`, [SET]))[0];
+  // 依頼を作る (今の画面の保存 = company。新商品の登録 (セット) と同じ依頼の表)
+  await save(SET, { components: [{ code: 's001', qty: 3 }, { code: 's003', qty: 1 }] }, { reason: 'load の試験' });
+  assert.equal((await reqOf()).status, 'open');
+  const before = await compsOf(SET);
+  await W2.setActiveOwnershipInDb(pg, LOAD_COMP);
+  try {
+    // 観測 ≠ 依頼 = mismatch (core は変えない)
+    let r = await p((await observe([{ set_code: SET, rows: [{ code: 's001', qty: 1, sort: 1 }] }])).set001);
+    assert.deepEqual([r.promoted, r.reason], [false, 'mismatch'], JSON.stringify(r));
+    assert.deepEqual(await openBr(), ['mismatch']);
+    // 観測 = 依頼 (並びは逆) でも core がまだ NE の中身でない (夜間ロードの前) = 何も書かない (次の観測でもう一度)
+    const rev = [{ code: 's003', qty: 1, sort: 1 }, { code: 's001', qty: 3, sort: 2 }];
+    r = await p((await observe([{ set_code: SET, rows: rev }])).set001);
+    assert.deepEqual([r.promoted, r.reason], [false, 'retry'], JSON.stringify(r));
+    assert.deepEqual(await compsOf(SET), before);
+    assert.equal((await reqOf()).status, 'open');
+    // 夜間ロード (持ち主 load) が NE の中身を core に書いた = 依頼を applied で閉じる・食い違いを resolved・core は書かない (並び・source はロードのまま)
+    await pg.query('delete from core.sku_components where parent_sku_id = (select sku_id from core.skus where code = $1)', [SET]);
+    await pg.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) select 1, p.sku_id, c.sku_id, x.qty, 'ne'
+      from core.skus p cross join (values ('s003', 1), ('s001', 3)) as x(code, qty) join core.skus c on c.code = x.code where p.code = $1`, [SET]);
+    const loaded = await compsOf(SET);
+    const obsId = (await observe([{ set_code: SET, rows: rev }])).set001;
+    r = await p(obsId);
+    assert.deepEqual([r.promoted, r.reason], [true, 'matched_on_load'], JSON.stringify(r));
+    assert.deepEqual(await compsOf(SET), loaded, 'core の構成は書かない');
+    assert.deepEqual(await reqOf(), { status: 'applied', close_reason: 'matched', oid: obsId });
+    assert.deepEqual(await openBr(), []);
+    // Codex R1 High: NE が依頼と違う中身で取り込んだ (夜間ロードが core を NE の中身にした) = 食い違いを残し、導く値は今の core (NE の中身) で計算し直す
+    await W2.setActiveOwnershipInDb(pg, ALL_COMPANY);
+    await save(SET, { components: [{ code: 's001', qty: 1 }] }, { reason: 'load の試験 2' });
+    await W2.setActiveOwnershipInDb(pg, LOAD_COMP);
+    await pg.query('delete from core.sku_components where parent_sku_id = (select sku_id from core.skus where code = $1)', [SET]);
+    await pg.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) select 1, p.sku_id, c.sku_id, 1, 'ne'
+      from core.skus p join core.skus c on c.code = 's002' where p.code = $1`, [SET]);
+    r = await p((await observe([{ set_code: SET, rows: [{ code: 's002', qty: 1, sort: 1 }] }])).set001);
+    assert.deepEqual([r.promoted, r.reason], [false, 'mismatch'], JSON.stringify(r));
+    const s2cost = (await costsOf('s002')).at(-1).jpy;
+    assert.ok(r.derived.some((d) => d.col === 'cost' && d.to === s2cost), JSON.stringify(r.derived));
+    assert.equal((await costsOf(SET)).at(-1).jpy, s2cost, '導く値 (原価) は NE の中身 (s002 × 1) で');
+    assert.equal((await reqOf()).status, 'open');
+    assert.deepEqual(await openBr(), ['mismatch']);
+    await pg.query(`update ops.sku_component_requests set status = 'cancelled', closed_at = now(), closed_by = 'test', close_reason = 'withdrawn'
+      where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [SET]);
+    await pg.query(`update ops.sku_component_breaches set status = 'closed', closed_at = now(), closed_by = 'test', close_reason = 'dismissed'
+      where status = 'open' and set_sku_id = (select sku_id from core.skus where code = $1)`, [SET]);
+    const loaded2 = await compsOf(SET);
+    // 依頼が無い = 何もしない (NE が core と違っても食い違いを開かない = NE が正)
+    r = await p((await observe([{ set_code: SET, rows: [{ code: 's003', qty: 9, sort: 1 }] }])).set001);
+    assert.deepEqual([r.promoted, r.reason, r.owner], [false, 'no_open_request', 'load']);
+    assert.deepEqual(await openBr(), []);
+    assert.deepEqual(await compsOf(SET), loaded2);
+  } finally { await W2.setActiveOwnershipInDb(pg, ALL_COMPANY); }
+});
+
 server.close();
 console.log(`\n${passed} 件 ok`);
 if (process.exitCode) console.error('NG があります');

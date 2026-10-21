@@ -107,7 +107,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { saveSku, MasterWriteError, MAX_COMPONENTS, fieldsOf, REG_CSV_FIELDS, jstDate } from '../../lib/master-write.mjs';
-import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_KEYS, parseRegisterRequest, registerPayloadHashOf } from '../../lib/master-register.mjs';
+import { registerNewSku, checkNewCodeInDb, KINDS_NEW, SET_PLAN_CHOICES, MAX_REFERENCE_URLS, NEW_ENTRY_OWNER_KEYS, parseRegisterRequest, registerPayloadHashOf } from '../../lib/master-register.mjs';
 import { MAX_SET_PLANS, SET_QTY_MIN, SET_QTY_MAX, SET_NAME_MAX, SET_PLAN_ALERT_DAYS, setCodeShapeProblem } from '../../lib/set-plan.mjs';
 // 🆕 2026-10-13 中原さん: 必須でない項目は「値」か「入力なし」のどちらか (どちらでもない = 登録しない)。入力なしの一覧は登録の理由に残す
 import { prepareRegisterBody, orderBlanksForRequest, BLANK_KEYS, blankLabelsOf, legacyRefsScreen, hasRequestRecord } from '../../lib/master-register-blanks.mjs';
@@ -946,10 +946,10 @@ router.get('/new', (req, res) => withPgPage(req, res, async (db, dbError) => {
     ...locals, nav: 'new', dbError, kind, page, fmt, KINDS_NEW, MAX_COMPONENTS, MAX_REFERENCE_URLS,
     // 登録を開いているか = 段階 new_open・持ち主表 (DB の active) のハッシュが段階の記録と同じ・MASTER_EDIT_OPEN・この種類で書く列の持ち主が全部 company・
     //   開放の許可 (lease)・書き込み用の接続 (画面だけのロール)・backfill 済み (lib/master-register.mjs と同じ)
-    entryClosed: !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') || !lease.open
+    entryClosed: !screenOwnerWritable(page ? page.phase : null, owner) || !isOpen() || NEW_ENTRY_OWNER_KEYS[kind].some((k) => own[k] !== 'company') || !lease.open
       || !writeConfigured() || !(page && page.backfillDone),
     entryWhy: locals.closedWhy
-      || (NEW_ENTRY_KEYS[kind].some((k) => own[k] !== 'company') ? `${KINDS_NEW[kind]}で書く項目の持ち主がまだ NE・/register` : '')
+      || (NEW_ENTRY_OWNER_KEYS[kind].some((k) => own[k] !== 'company') ? `${KINDS_NEW[kind]}で書く項目の持ち主がまだ NE・/register` : '')
       || (!lease.open ? lease.why : '')
       || (!(page && page.backfillDone) ? '切替の手順の「既存の商品の登録の状態 (backfill)」がまだ' : ''),
     shippingRates: shipping ? [...shipping.entries()].map(([code, r]) => ({ code, method: r.method, cost: r.cost })) : null,
