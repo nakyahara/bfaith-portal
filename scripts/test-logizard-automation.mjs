@@ -290,7 +290,10 @@ await ta('[6] 夜の止め: JST 00:00 以上 01:30 未満は動かない (境目
 });
 
 await ta('[7] auto-barcode.js: 夜の止めは CSV・鍵・ブラウザに触る前 / 実行ボタンの前と各ステップの前でも見る / ③ が無い (③ の CSV を見ない・前の設定が残っていても。本物のファイルを時刻を差し替えて動かす)', async () => {
-  const s = fs.readFileSync(path.join(TOOL, 'auto-barcode.js'), 'utf8');
+  // ① ② の画面の手順は barcode-steps.js に移した (ポータルのボタンの道 bc-import-runner.js と同じ手順・2026-10-17)。決まりは 2 つを合わせた中身で見る
+  const ab = fs.readFileSync(path.join(TOOL, 'auto-barcode.js'), 'utf8');
+  const s = ab + '\n' + fs.readFileSync(path.join(TOOL, 'barcode-steps.js'), 'utf8');
+  assert.ok(ab.includes("from './barcode-steps.js';") && !/async function runImport\(/.test(ab) && !/async function runExport\(/.test(ab), 'auto-barcode.js は barcode-steps.js の手順を使う (2 つ持たない)');
   // 実行ボタン (① ③ = FM07_01・② = 書き出し) の直前に夜の止め
   // 処理を始めるボタン (実行・始める確認の OK) は持ち時間つきの nightClick だけで押す (Codex #1518 R1・R2)
   for (const gone of ["page.click('#FM07_01_executeBtn'", 'page.click(exeSel'].concat([])) assert.ok(!s.includes(gone), gone);
@@ -316,7 +319,7 @@ await ta('[7] auto-barcode.js: 夜の止めは CSV・鍵・ブラウザに触る
   // 本物の auto-barcode.js を一時フォルダ (playwright-core を読めるようにリポジトリの中) に写して、時刻を差し替えて動かす
   const tmp = fs.mkdtempSync(path.join(ROOT, '.tmp-lzbc-'));
   try {
-    for (const f of ['auto-barcode.js', 'barcode-mode.js', 'logizard-common.js', 'csv-util.js']) fs.copyFileSync(path.join(TOOL, f), path.join(tmp, f));
+    for (const f of ['auto-barcode.js', 'barcode-steps.js', 'barcode-mode.js', 'logizard-common.js', 'csv-util.js']) fs.copyFileSync(path.join(TOOL, f), path.join(tmp, f));
     fs.writeFileSync(path.join(tmp, 'fake-now.mjs'), `const FIXED = Date.parse(process.env.FAKE_NOW);
 const R = Date;
 class D extends R { constructor(...a) { super(...(a.length ? a : [FIXED])); } static now() { return FIXED; } }
@@ -463,7 +466,7 @@ await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前
   try { await import('playwright-core'); } catch { console.log('      (playwright-core が無い = この試験はとばす)'); passed--; return; }
   const tmp = fs.mkdtempSync(path.join(ROOT, '.tmp-lzbc-'));
   try {
-    for (const f of ['auto-barcode.js', 'barcode-mode.js', 'logizard-common.js', 'csv-util.js']) fs.copyFileSync(path.join(TOOL, f), path.join(tmp, f));
+    for (const f of ['auto-barcode.js', 'barcode-steps.js', 'barcode-mode.js', 'logizard-common.js', 'csv-util.js']) fs.copyFileSync(path.join(TOOL, f), path.join(tmp, f));
     fs.writeFileSync(path.join(tmp, 'mock-lz.mjs'), MOCK_LZ);
     fs.writeFileSync(path.join(tmp, 'in1.csv'), sj('"商品ID","バーコード"\r\n"A-1","4900000000001"\r\n'));
     fs.mkdirSync(path.join(tmp, 'out'));

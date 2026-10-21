@@ -31,6 +31,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import * as S from './store.js';
+import { bcPressInProgress } from '../lz-bc-import/store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** 画面の門 (ログイン = 違えば /login へ・管理者 = 違えば 403)。server.js が画面の前に置く (試験で本物の HTTP を通す。Codex #1542 R2 Medium) */
@@ -69,7 +70,14 @@ async function defaultNotify(text) {
  * @param {() => number} [opts.now]
  * @param {(text: string) => Promise<boolean>} [opts.notify]
  */
-export function createAdminRouter({ getDb = null, now = () => Date.now(), notify = defaultNotify } = {}) {
+export function createAdminRouter({ getDb = null, now = () => Date.now(), notify = defaultNotify, bcBusy = bcPressInProgress } = {}) {
+  // 🆕 2026-10-17「ロジザードに取り込む」ボタン (apps/lz-bc-import) が押した後の間は、手の取込を始めない (同じ時にロジザードに 2 つの取込を重ねない。Codex R5 High)
+  const refuseIfBcBusy = () => {
+    const j = bcBusy(now());
+    if (j && j.error) throw new S.ImportStateError('bc_state_unreadable', 'ボタンの取り込みの帳面を読めないので、手の取込は始めません (少し待ってからもう一度・続くなら Claude に)', 503);
+    if (j && j.state === 'unknown') throw new S.ImportStateError('bc_import_running', `「ロジザードに取り込む」ボタンの回 (#${j.job_id}・新商品の CSV #${j.export_id}) が「取り込めたか分からない」のままです (ロジザード側の取込が終わったと言えない)。ロジザード登録の CSV の画面でその回を確かめて記してから始めてください`, 409);
+    if (j) throw new S.ImportStateError('bc_import_running', `いま「ロジザードに取り込む」ボタンの回 (#${j.job_id}・新商品の CSV #${j.export_id}) がロジザードに取り込んでいます。終わってから始めてください`, 409);
+  };
   let db = null;
   const dbOf = () => (getDb ? getDb() : (db ||= S.openImportStateDb()));
   const router = Router();
@@ -120,12 +128,14 @@ export function createAdminRouter({ getDb = null, now = () => Date.now(), notify
   router.post('/mark-unknown', json, handle((b, req) => S.markUnknown(dbOf(), { runId: b.run_id, by: who(req), reason: b.reason ?? null, now: now() })));
   router.post('/manual/open', json, handle((b, req) => {
     if (typeof b.source_run_id !== 'string') throw bad('source_run_id (毎晩の成果物) が要る');
+    refuseIfBcBusy();   // 確かめと始めるは同じ同期の処理の中
     return S.openManualSession(dbOf(), { by: who(req), lzAccount: b.lz_account, source: { kind: 'cdb_artifact', sourceRunId: b.source_run_id }, expectedHaltRevision: haltRev(b.expected_halt_revision), now: now() });
   }));
   router.post('/manual/open-gas', csv, handle((body, req) => {
     if (!Buffer.isBuffer(body) || !body.length) throw bad('本文は GAS の CSV のバイト列 (application/octet-stream)');
     const q = req.query || {};
     const rev = one(q, 'expected_halt_revision');
+    refuseIfBcBusy();
     return S.openManualSession(dbOf(), { by: who(req), lzAccount: one(q, 'lz_account'), source: { kind: 'gas_upload', csvBuf: body, targetAsOf: one(q, 'target_as_of') },
       expectedHaltRevision: haltRev(rev !== undefined && /^[0-9]{1,12}$/.test(rev) ? Number(rev) : NaN), now: now() });
   }));
