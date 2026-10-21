@@ -59,7 +59,7 @@ export const STATE_WORDS = Object.freeze({
   cancelled: 'やめました (取り込んでいない)',
   expired: 'miniPC が取りに来ませんでした (取り込んでいない)',
 });
-export const EXPORT_WORDS = Object.freeze({ skipped: 'しない', ok: '書き出した', failed: '書き出せなかった (バーコードマスタ.csv は前のまま)', unknown: '分からない' });
+export const EXPORT_WORDS = Object.freeze({ skipped: 'しなかった', ok: '書き出した', failed: '書けなかった', unknown: '分からない (バーコードマスタ.csv の更新時刻を確かめる)' });
 
 export class BcImportError extends Error {
   constructor(code, message, status = 409, extra = {}) { super(message); this.code = code; this.status = status; this.extra = extra; }
@@ -274,7 +274,8 @@ export function sweep(db, now) {
         db.prepare("UPDATE bc_jobs SET state = 'unknown', finished_at = ?, reason = 'no_result', detail = ? WHERE job_id = ?").run(now, '押した後の結果が届かない。ロジザードのインポート履歴で取り込めたか確かめてください', j.job_id);
         ev(db, j.job_id, now, 'lease_expired', null, { from: 'executing' });
       } else if (j.state === 'exporting' && j.lease_until <= now) {
-        db.prepare("UPDATE bc_jobs SET state = 'imported', finished_at = ?, export_state = 'unknown', export_detail = ? WHERE job_id = ?").run(now, '② の結果が届かない (バーコードマスタ.csv を確かめる)', j.job_id);
+        // ポータルが ② を Drive に書いた (書けなかった) 結果があれば、そのまま残す (Codex R1 High)
+        db.prepare("UPDATE bc_jobs SET state = 'imported', finished_at = ?, export_detail = CASE WHEN export_state IS NULL THEN ? ELSE export_detail END, export_state = COALESCE(export_state, 'unknown') WHERE job_id = ?").run(now, '② の結果が届かない (バーコードマスタ.csv を確かめる)', j.job_id);
         ev(db, j.job_id, now, 'lease_expired', null, { from: 'exporting' });
       }
     }
@@ -282,16 +283,29 @@ export function sweep(db, now) {
   tx();
 }
 
-/** miniPC が来た (取りに来るたび) */
-export function touchRunner(db, { runnerId, version = null, busy = null, now }) {
-  db.prepare(`INSERT INTO bc_runner (id, runner_id, version, seen_at, busy) VALUES (1, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET runner_id = excluded.runner_id, version = excluded.version, seen_at = excluded.seen_at, busy = excluded.busy`)
-    .run(clean(runnerId, 80), clean(version, 80), now, clean(busy, 200));
+/**
+ * miniPC が来た (取りに来るたび)。exportUpload = ② のファイルをポータルに送れる runner か (true / false・古い runner は言わない = null = 分からない)。
+ *   表を変えないように bc_meta に置く (runner_export_upload = '1' / '0'・分からない = 消す)
+ */
+export function touchRunner(db, { runnerId, version = null, busy = null, exportUpload = null, now }) {
+  db.transaction(() => {
+    db.prepare(`INSERT INTO bc_runner (id, runner_id, version, seen_at, busy) VALUES (1, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET runner_id = excluded.runner_id, version = excluded.version, seen_at = excluded.seen_at, busy = excluded.busy`)
+      .run(clean(runnerId, 80), clean(version, 80), now, clean(busy, 200));
+    if (typeof exportUpload === 'boolean') db.prepare("INSERT INTO bc_meta (key, value) VALUES ('runner_export_upload', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(exportUpload ? '1' : '0');
+    else db.prepare("DELETE FROM bc_meta WHERE key = 'runner_export_upload'").run();
+  })();
 }
+const metaOf = (db, key) => { const r = db.prepare('SELECT value FROM bc_meta WHERE key = ?').get(key); return r ? r.value : null; };
 export function runnerView(db, now) {
   const r = db.prepare('SELECT * FROM bc_runner WHERE id = 1').get();
-  if (!r || !r.seen_at) return { seen_at: null, alive: false, busy: null, runner_id: null, version: null };
-  return { seen_at: r.seen_at, alive: now - r.seen_at <= LIMITS.runnerAliveMs, busy: r.busy, runner_id: r.runner_id, version: r.version };
+  if (!r || !r.seen_at) return { seen_at: null, alive: false, busy: null, runner_id: null, version: null, export_upload: null };
+  const eu = metaOf(db, 'runner_export_upload');
+  return { seen_at: r.seen_at, alive: now - r.seen_at <= LIMITS.runnerAliveMs, busy: r.busy, runner_id: r.runner_id, version: r.version, export_upload: eu === '1' ? true : eu === '0' ? false : null };
+}
+/** 最後に ② で Drive のバーコードマスタ.csv を書いた回 (画面の③) */
+export function lastDriveExport(db) {
+  try { const v = metaOf(db, 'drive_last'); return v ? JSON.parse(v) : null; } catch { return null; }
 }
 
 /** その CSV のロジザードへの取り込みの様子 */
@@ -505,13 +519,61 @@ export function reportFinal(db, { jobId, claimToken, executed = false, importRes
       return done(v.state, v.state, [v.detail, detail].filter(Boolean).join(' · '));
     }
     if (j.state === 'exporting' || lateExport) {
-      setExport('unknown');
+      // ② のファイルをポータルが Drive に書いた (書けなかった) = その結果のまま (miniPC の申告では変えない)
+      // ポータルが受けたのに結果が無い (Drive に書いた後に落ちた・応答が miniPC に届かない) = miniPC の「失敗」でなく分からない (Codex R2 Medium)
+      if (exportUploadBegun(db, jobId) && !exportUploadDone(db, jobId)) {
+        db.prepare("UPDATE bc_jobs SET export_state = 'unknown', export_rows = NULL, export_detail = ? WHERE job_id = ?").run('② のファイルはポータルが受けたが、共有ドライブに書けたか分からない (バーコードマスタ.csv の更新時刻を確かめる)', jobId);
+      } else if (!exportUploadDone(db, jobId)) setExport('unknown');
       return done('imported', null, detail);
     }
     if (ACTIVE.includes(j.state)) fail('bad_state', `いまの状態 ${j.state} には終わりを書けません`);
     // もう終わっている (送り直し) = 何もしない
     if (log) db.prepare('UPDATE bc_jobs SET log = ? WHERE job_id = ?').run(tailLog(j.log, log), jobId);
     return { ok: true, state: j.state, already: true };
+  })();
+}
+
+/**
+ * ② のファイルを受ける前の確かめ (runner-router の /jobs/:id/export-file)。② の途中 (exporting・結果がまだ) か、期限で「② は分からない」にした後だけ。
+ *   もう結果がある (ok / failed / skipped) = 断る (2 回書かない)
+ */
+const hasEvent = (db, jobId, kind) => !!db.prepare('SELECT 1 FROM bc_events WHERE job_id = ? AND kind = ? LIMIT 1').get(jobId, kind);
+/** ポータルが ② のファイルを受けた (Drive に書きに行った) 回か / その結果を書いた回か */
+export const exportUploadBegun = (db, jobId) => hasEvent(db, jobId, 'export_upload_begin');
+export const exportUploadDone = (db, jobId) => hasEvent(db, jobId, 'export_upload');
+export function beginExportUpload(db, { jobId, claimToken, now }) {
+  sweep(db, now);
+  return db.transaction(() => {
+    const j = jobOf(db, jobId);
+    tokenOk(j, claimToken);
+    if (!j.with_export) fail('bad_state', 'この回は ② をしない回です');
+    // 1 つの回で Drive に書きに行くのは 1 回だけ (送り直し・期限の後でも 2 回書かない。Codex R1 High)
+    if (exportUploadBegun(db, jobId)) fail('bad_state', 'この回の ② のファイルはもう受けました');
+    // 後の回がもう Drive に書いた = 古い中身で巻き戻さない (遅れて届いた古い回。Codex R2 High)
+    const last = lastDriveExport(db);
+    if (last && Number(last.job_id) > jobId) fail('bad_state', `後の取り込み (#${last.job_id}) がもう共有ドライブに書いたので、この回の ② は書きません`);
+    const lateExport = j.state === 'imported' && j.export_state === 'unknown';
+    if (!(j.state === 'exporting' && j.export_state == null) && !lateExport) fail('bad_state', `いまの状態 ${j.state} (② ${j.export_state || 'まだ'}) には ② のファイルを受けません`);
+    ev(db, jobId, now, 'export_upload_begin', j.runner_id);
+    return { job_id: j.job_id, rows: j.rows };
+  })();
+}
+/**
+ * ② の結果 (ポータルが Drive に書いた・書けなかった・書けたか分からない)。status = ok | failed | unknown。ok = 最後に書いた回として覚える (画面の③)。
+ *   受けた回 (beginExportUpload) なら、終わりの知らせ・期限の後でも、この結果が勝つ (Drive の本当の様子。Codex R1 Medium)
+ */
+export function recordExportUpload(db, { jobId, claimToken, status, rows = null, detail = null, modifiedTime = null, now }) {
+  return db.transaction(() => {
+    const j = jobOf(db, jobId);
+    tokenOk(j, claimToken);
+    if (!exportUploadBegun(db, jobId) || exportUploadDone(db, jobId)) return { ok: true, state: j.state, already: true };
+    const s = status === 'ok' ? 'ok' : status === 'unknown' ? 'unknown' : 'failed';
+    const n = Number.isInteger(rows) ? rows : null;
+    db.prepare('UPDATE bc_jobs SET export_state = ?, export_rows = ?, export_detail = ? WHERE job_id = ?').run(s, n, clean(detail, 300), jobId);
+    ev(db, jobId, now, 'export_upload', j.runner_id, { status: s, rows: n });
+    const last = lastDriveExport(db);
+    if (s === 'ok' && !(last && Number(last.job_id) > jobId)) db.prepare("INSERT INTO bc_meta (key, value) VALUES ('drive_last', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(JSON.stringify({ at: now, job_id: jobId, rows: n, modified_time: modifiedTime }));
+    return { ok: true, state: j.state };
   })();
 }
 
@@ -638,7 +700,7 @@ export function screenStatus(db, { now, exportIds = [] }) {
     };
   }
   return {
-    now, started_at: startedAt(db), night: nightOf(now), runner: runnerView(db, now),
+    now, started_at: startedAt(db), night: nightOf(now), runner: runnerView(db, now), drive_last: lastDriveExport(db),
     active: jobView(active, { withLog: true }),
     unresolved_any: jobView(db.prepare("SELECT * FROM bc_jobs WHERE state = 'unknown' AND resolved_outcome IS NULL ORDER BY job_id LIMIT 1").get() || null),
     latest: jobView(recent[0] || null, { withLog: true }),

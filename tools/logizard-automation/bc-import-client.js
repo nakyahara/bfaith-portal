@@ -23,12 +23,12 @@ export function createBcImportClient({ url = process.env.LZ_BC_PORTAL_URL || DEF
   try { origin = new URL(String(url).trim()).origin; } catch { throw new BcClientError('bad_url', `LZ_BC_PORTAL_URL が URL でない: ${url}`); }
   if (!/^https:/.test(origin) && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) throw new BcClientError('bad_url', 'https だけ (Bearer を載せるため。試験の localhost は除く)');
   if (!token) throw new BcClientError('no_token', 'LZ_BC_RUNNER_TOKEN が無い (このフォルダの .env)');
-  async function call(p, body) {
+  async function call(p, body, ms = timeoutMs) {
     let res;
     try {
       res = await fetchImpl(`${origin}${BASE_PATH}${p}`, {
         method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body || {}), signal: AbortSignal.timeout(timeoutMs),
+        body: JSON.stringify(body || {}), signal: AbortSignal.timeout(ms),
       });
     } catch (e) { throw new BcClientError('unreachable', `ポータルの口に届かない: ${String(e && e.message).slice(0, 160)}`); }
     let j = null;
@@ -40,6 +40,8 @@ export function createBcImportClient({ url = process.env.LZ_BC_PORTAL_URL || DEF
     claim: (b) => call('/claim', b),
     executing: (jobId, claimToken) => call(`/jobs/${encodeURIComponent(String(jobId))}/executing`, { claim_token: claimToken }),
     reportImport: (jobId, b) => call(`/jobs/${encodeURIComponent(String(jobId))}/import`, b),
+    // ② の書き出しのファイル (約 0.8 MB) をポータルに送る → ポータルが共有ドライブに書く (Drive の応答を待つので長め)
+    uploadExport: (jobId, b) => call(`/jobs/${encodeURIComponent(String(jobId))}/export-file`, b, Math.max(timeoutMs, 120000)),
     final: (jobId, b) => call(`/jobs/${encodeURIComponent(String(jobId))}/final`, b),
   };
 }
