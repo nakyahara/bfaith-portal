@@ -2625,6 +2625,29 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
       JSON.stringify(methodOnly));
   }
   {
+    // 開いたときに読んだ Company DB の送料 (送料コード) で写し (毎朝) を置き換える (2026-10-21 中原さん: 翌朝まで出なかった)
+    const live = (o) => ({ byCode: o });
+    const selfCost = { costExTax: 820, shippingCost: null, shippingMethod: null, source: 'self', skuCosts: [] };
+    const s1 = vari.applyLiveShipping(selfCost, live({ 'cranberryp30-2': { code: '5', method: 'ネコポス', cost: 237 } }), 'cranberryP30-2');
+    check('🚨 送料の即時反映: 写しに送料が無くても、Company DB に送料コードがあればその送料・配送方法にする (コードの大文字小文字は問わない)',
+      s1.shippingCost === 237 && s1.shippingMethod === 'ネコポス' && s1.shippingLive === true && s1.costExTax === 820, JSON.stringify(s1));
+    const s2 = vari.applyLiveShipping({ ...selfCost, shippingCost: 237, shippingMethod: 'ネコポス' }, live({ 'cranberryp30-2': { code: null, method: null, cost: null } }), 'cranberryp30-2');
+    check('送料の即時反映: Company DB で未登録なら未登録 (写しの古い値を使わない)', s2.shippingCost === null && s2.shippingLive === true);
+    check('送料の即時反映: Company DB を読めていない (答えが無い・そのコードが無い) なら写しのまま',
+      vari.applyLiveShipping(selfCost, null, 'cranberryp30-2') === selfCost && vari.applyLiveShipping(selfCost, live({ other: { cost: 1 } }), 'cranberryp30-2') === selfCost
+      && vari.applyLiveShipping(null, live({ x: { cost: 1 } }), 'x') === null);
+    const mem = { costExTax: 660, shippingCost: null, shippingMethod: null, source: 'members',
+      skuCosts: [{ code: 'V-A', costExTax: 660, shippingCost: null }, { code: 'V-B', costExTax: 660, shippingCost: null }] };
+    const m1 = vari.applyLiveShipping(mem, live({ 'v-a': { code: '5', method: 'ネコポス', cost: 237 }, 'v-b': { code: '5', method: 'ネコポス', cost: 237 } }), 'V');
+    check('送料の即時反映: バリエーションは子 SKU が全部読めたら置き換える (そろえばその送料)',
+      m1.shippingCost === 237 && m1.shippingMethod === 'ネコポス' && m1.skuCosts.every((s) => s.shippingCost === 237), JSON.stringify(m1));
+    const m2 = vari.applyLiveShipping(mem, live({ 'v-a': { code: '5', method: 'ネコポス', cost: 237 }, 'v-b': { code: '7', method: '宅急便60サイズ', cost: 544 } }), 'V');
+    check('送料の即時反映: 子 SKU で送料が違えば一つに決めない (null)・SKU ごとの送料は入れる',
+      m2.shippingCost === null && m2.shippingMethod === null && m2.skuCosts[1].shippingCost === 544);
+    check('🚨 送料の即時反映: 子 SKU の一部しか読めていなければ写しのまま (写しと混ぜない)',
+      vari.applyLiveShipping(mem, live({ 'v-a': { code: '5', method: 'ネコポス', cost: 237 } }), 'V') === mem);
+  }
+  {
     // 同数のときは高い方を代表にする (利益を実際より良く見せない側)
     db.prepare('DELETE FROM mirror_products WHERE product_id BETWEEN 99600 AND 99699').run();
     const ins2 = db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 原価, 送料, 配送方法, 消費税率, updated_at)

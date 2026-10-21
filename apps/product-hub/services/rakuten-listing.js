@@ -23,7 +23,7 @@ import sharp from 'sharp';
 import { google } from 'googleapis';
 
 import { getDB, logEvent } from '../db.js';
-import { resolveVariationGroup, getNeCost } from '../lib/variation.js';
+import { resolveVariationGroup, getNeCost, applyLiveShipping } from '../lib/variation.js';
 import { existingPageOfDraft } from '../lib/existing-page.js';
 import { imageTrackBlockReason } from '../lib/workflow-progress.js';
 // セットの画像の計画 (§4.7)。「作る」ことにした枠が埋まるまで出品させない
@@ -1212,7 +1212,7 @@ export const COMMON_TRAILING_BANNERS = [
  * 配送方法の解決: アプリ指定グループ > NE配送方法のマッピング。
  * 商品ページ表記の発送方法表示と末尾バナーの選択で共通に使う (router のプレビューも同じ関数)
  */
-export function effectiveShippingForDraft(db, neCode, shippingMethodGroup) {
+export function effectiveShippingForDraft(db, neCode, shippingMethodGroup, { neMethod } = {}) {
   // 値の解釈は toRakutenShippingGroup ただ1つ。DB には楽天グループIDしか入らないが、
   // 旧データ (分解前の複合キー) が残っていても同じ結果になるようここを通す
   const r = toRakutenShippingGroup(shippingMethodGroup);
@@ -1226,7 +1226,8 @@ export function effectiveShippingForDraft(db, neCode, shippingMethodGroup) {
       ...(r.yahooOverride ? { yahooDelivery: r.yahooOverride.yahooDelivery } : {}),
     };
   }
-  return mapNeShippingToRakuten(db, getNeCost(db, neCode)?.shippingMethod);
+  // neMethod を渡されたら (開いたときに Company DB から読んだ送料コードの配送方法・2026-10-21) それを使う。無ければ写し
+  return mapNeShippingToRakuten(db, neMethod !== undefined ? neMethod : getNeCost(db, neCode)?.shippingMethod);
 }
 
 /**
@@ -1451,7 +1452,10 @@ export function buildItemPayload(db, draftId, { tax = null, jan: janGate = null 
   const untransferredCount = currentImages.length - cabinet.length;
 
   // 発送方法 (アプリ指定 > NEマッピング)。商品ページ表記の表示名と末尾バナーの選択で共通
-  const effectiveShip = effectiveShippingForDraft(db, draft.ne_code, rk.shipping_method_group);
+  // 税率と一緒に Company DB から読んだ送料 (tax.shipping) があれば、写し (毎朝) ではなくそれで補う (2026-10-21)
+  const liveShipCost = tax?.shipping ? applyLiveShipping(getNeCost(db, draft.ne_code, { draftId: draft.id }), tax.shipping, draft.ne_code) : null;
+  const effectiveShip = effectiveShippingForDraft(db, draft.ne_code, rk.shipping_method_group,
+    liveShipCost?.shippingLive ? { neMethod: liveShipCost.shippingMethod } : {});
   const trailingBanners = trailingBannerLocations(effectiveShip.group);
 
   const reasons = [];

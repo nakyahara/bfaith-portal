@@ -871,7 +871,7 @@ th.attr-unknown { color: #dc2626; }
                     ⚠ <%= neCost.source === 'members' ? '送料が入っていない SKU があります' : 'この商品コードには送料がまだ入っていません' %>
                     (<strong>マスタの送料コード</strong><%= setInfo ? '。新しく作ったセットは自動では入りません' : '' %>)。
                     下の「配送方法で試算」で選ぶと<strong>仮の</strong>利益が出ます。
-                    正式にはマスタ編集の商品の画面で「送料コード」を入れてください (翌朝からここにも自動で出ます):
+                    正式にはマスタ編集の商品の画面で「送料コード」を入れてください (<%= neCost.shippingLive ? '入れたら、この画面を読み直すとすぐ出ます' : '翌朝からここにも自動で出ます' %>):
                     <% for (const code of shipFixSkus.slice(0, 10)) { %>
                       <a href="/apps/master-edit/sku/<%= encodeURIComponent(code) %>" target="_blank" rel="noopener" style="margin-right:6px;"><%= code %> ↗</a>
                     <% } %><%= shipFixSkus.length > 10 ? `ほか ${shipFixSkus.length - 10} 件` : '' %>

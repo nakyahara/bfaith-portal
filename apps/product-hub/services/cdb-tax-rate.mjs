@@ -7,6 +7,10 @@
  * ドラフトの商品コードが代表コード (バリエーションの親・SKU の行が無いことが多い) なら、構成の SKU (NE の写しの代表商品コードでまとまる子) の税率を読む。
  *   子の税率が混ざる・どれかが無い / 未解決 = 決められない (出品は止める)。Company DB を読めない = 決められない (fail-closed)
  * env: COMPANY_DB_URL (Render。無ければ COMPANY_DB_WATCH_URL)
+ *
+ * 送料 (core.skus.shipping_*・持ち主 company) も**同じ問い合わせ**で読む (2026-10-21 中原さん: マスタ編集で送料コードを入れても
+ *   商品ハブには翌朝の写し (mirror_products) まで出なかった。税率と同じく、開いたときの Company DB の値を使う)。
+ *   接続は増やさない。送料は決められなくても税率の判断は変えない (送料は試算と、セットの楽天配送方法の補完に使うだけ)
  */
 import { resolveVariationGroup } from '../lib/variation.js';
 
@@ -39,7 +43,8 @@ export async function readCdbTaxRates(codes, { env = process.env } = {}) {
       const { openPgClient } = await import('../../../scripts/company-db/migrate.mjs');
       const { COMPANY_ID } = await import('../../../lib/master-write.mjs');
       client = await openPgClient(url, { application_name: 'product-hub-cdb-tax', connectionTimeoutMillis: 5000, statement_timeout: 5000, query_timeout: 6000 });
-      rows = (await client.query(`select x.code, k.sku_id is not null as found, k.tax_rate::text as tax_rate, k.tax_class
+      rows = (await client.query(`select x.code, k.sku_id is not null as found, k.tax_rate::text as tax_rate, k.tax_class,
+            k.shipping_code, k.shipping_method, k.shipping_cost_jpy::text as shipping_cost_jpy
           from unnest($2::text[]) as x(code) left join core.skus k on k.company_id = $1 and k.code_norm = core.norm_code(x.code)`, [COMPANY_ID, list])).rows;
     } catch (e) {
       return { ok: false, reason: `Company DB を読めない (${String((e && e.message) || e).slice(0, 120)})` };
@@ -48,9 +53,36 @@ export async function readCdbTaxRates(codes, { env = process.env } = {}) {
     }
   }
   const byCode = new Map();
-  for (const r of rows) byCode.set(String(r.code), { found: r.found !== false, tax_rate: r.tax_rate == null ? null : Number(r.tax_rate), tax_class: r.tax_class ?? null });
+  for (const r of rows) {
+    byCode.set(String(r.code), {
+      found: r.found !== false, tax_rate: r.tax_rate == null ? null : Number(r.tax_rate), tax_class: r.tax_class ?? null,
+      // 送料の列を読んだ行だけ shipping を付ける (読み方を差し替えた試験で列が無い = 分からない = 写しのまま)
+      ...(Object.prototype.hasOwnProperty.call(r, 'shipping_code') ? { shipping: shippingOfRow(r) } : {}),
+    });
+  }
   for (const c of list) if (!byCode.has(c)) byCode.set(c, { found: false, tax_rate: null, tax_class: null });
   return { ok: true, byCode };
+}
+
+/** 1 行の送料 { code, method, cost } (送料コードが空 = 未登録・cost は数か null) */
+function shippingOfRow(r) {
+  const code = r.shipping_code == null || String(r.shipping_code).trim() === '' ? null : String(r.shipping_code).trim();
+  const method = r.shipping_method == null || String(r.shipping_method).trim() === '' ? null : String(r.shipping_method).trim();
+  const n = r.shipping_cost_jpy == null || r.shipping_cost_jpy === '' ? NaN : Number(r.shipping_cost_jpy);
+  return { code, method, cost: Number.isFinite(n) && n >= 0 ? n : null };
+}
+
+/**
+ * 読んだ行から送料の答え { byCode: { 正規化したコード: { code, method, cost } } } を作る。
+ * Company DB にある (found) で送料の列を読めたコードだけ入れる。1 つも無ければ null (= 写しのまま)
+ */
+export function shippingFromByCode(codes, byCode) {
+  const out = {};
+  for (const c of codes) {
+    const r = byCode.get(c);
+    if (r && r.found && r.shipping) out[String(c).trim().toLowerCase()] = r.shipping;
+  }
+  return Object.keys(out).length ? { byCode: out } : null;
 }
 
 /** 読んだ税率から 1 つに決める。無い・未解決・混ざる = 決められない */
@@ -84,7 +116,8 @@ export async function resolveCdbDraftTax(db, draft, { env = process.env } = {}) 
   if (!codes.length) return { ok: false, reason: '商品コードが無い', codes };
   const r = await readCdbTaxRates(codes, { env });
   if (!r.ok) return { ok: false, reason: r.reason, codes };
-  return { ...decideTax(codes, r.byCode), codes };
+  // 送料は税率を決められなくても返す (試算と案内に使う。税率の ok/ng は変えない)
+  return { ...decideTax(codes, r.byCode), codes, shipping: shippingFromByCode(codes, r.byCode) };
 }
 
 /** 互換 (1 つの商品コード) */
