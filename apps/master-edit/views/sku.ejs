@@ -321,7 +321,7 @@
         <% if (c.component_request) { const rq = c.component_request; const curMap = new Map(c.components.map((x) => [x.code, x.qty])); const reqMap = new Map(rq.rows.map((x) => [x.code, x.qty]));
              const removed = c.components.filter((x) => !reqMap.has(x.code)); const added = rq.rows.filter((x) => !curMap.has(x.code)); const qtyCh = rq.rows.filter((x) => curMap.has(x.code) && curMap.get(x.code) !== x.qty);
              const todo = [...removed.map((x) => x.code + ' (' + (x.name || '') + ') を外し'), ...added.map((x) => x.code + ' (' + (x.name || '') + ') を ' + x.qty + ' 個 入れ'), ...qtyCh.map((x) => x.code + ' の数を ' + curMap.get(x.code) + ' → ' + x.qty + ' にし')];
-             /* 🆕 0100: 新しいセット (NE 登録の前・今の構成なし) = NE でやることは「NE 登録の CSV を取り込む」 */ const newSet = !c.components.length && c.registration && ['draft', 'ne_pending'].includes(c.registration.state); %>
+             /* 🆕 0099: 新しいセット (NE 登録の前・今の構成なし) = NE でやることは「NE 登録の CSV を取り込む」 */ const newSet = !c.components.length && c.registration && ['draft', 'ne_pending'].includes(c.registration.state); %>
         <section class="panel" aria-labelledby="h-req">
           <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-layers"/></svg></span><h2 id="h-req">構成の依頼の進み</h2><span class="sub"><%= rq.reason ? '「' + rq.reason + '」 · ' : '' %><%= rq.requested_by %> <%= ui.fmtJst(rq.created_at, { nowMs }) %> · 依頼は保存してすぐには効かず、NE で確かめた後に「今の構成」になります</span></div>
           <ol class="steps" aria-label="構成の依頼の進み">

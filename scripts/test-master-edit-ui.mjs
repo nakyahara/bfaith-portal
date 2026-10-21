@@ -1460,14 +1460,14 @@ await ta('[38] NE 登録の CSV (🆕 10/20 ボタン 1 つ): 「NE 登録の CS
   } finally { delete process.env.MASTER_DECISION_APPROVERS; }
 });
 
-await ta('[60] NE 登録の CSV (10/12 中原さんの画面の写真): 試し用・閉じた・商品が全部 NE で確かめ済みのファイル = 引退した v1 は「この形を実機で確かめた」「問題があった (ng)」と「本番の行数で作れるようになります」を出さず「引退しました … このファイルですることはありません」/ 門の無い v2・まとまりも出さない / 🆕 0100: セットも v1 は引退・v2 は門なし = どれにもボタンを出さない', async (p) => {
+await ta('[60] NE 登録の CSV (10/12 中原さんの画面の写真): 試し用・閉じた・商品が全部 NE で確かめ済みのファイル = 引退した v1 は「この形を実機で確かめた」「問題があった (ng)」と「本番の行数で作れるようになります」を出さず「引退しました … このファイルですることはありません」/ 門の無い v2・まとまりも出さない / 🆕 0099: セットも v1 は引退・v2 は門なし = どれにもボタンを出さない', async (p) => {
   process.env.MASTER_DECISION_APPROVERS = 'naka@test';
   const { seedTrialDoneExport } = await import('./fixtures/reg-csv-trial-done.mjs');
   const ids = {};
   for (const [schema, code] of [['ne-reg-single-v1', 's003'], ['ne-reg-set-v1', 'set001'], ['ne-reg-single-v2', 'k004'], ['ne-reg-variation-v1', 'k002'], ['ne-reg-set-v2', 'set001']]) ids[schema] = await seedTrialDoneExport(pg, { sessionUser, schema, code });
   try {
     await p.goto(B + '/reg-csv');
-    // 🆕 0100: 門のある今の版は無い = 上の「NE で取り込む」に「問題なし (この形で本番にする)」は出ない・前のファイルは「これまでの記録」(たたんである) の中
+    // 🆕 0099: 門のある今の版は無い = 上の「NE で取り込む」に「問題なし (この形で本番にする)」は出ない・前のファイルは「これまでの記録」(たたんである) の中
     for (const k of ['ne-reg-single-v1', 'ne-reg-single-v2', 'ne-reg-variation-v1', 'ne-reg-set-v1', 'ne-reg-set-v2']) assert.equal(await p.locator(`#todo article[data-id="${ids[k]}"]`).count(), 0, k);
     await p.click('#history > summary');
     const card = (k) => p.locator(`#history article.exp[data-id="${ids[k]}"]`);
@@ -1485,7 +1485,7 @@ await ta('[60] NE 登録の CSV (10/12 中原さんの画面の写真): 試し�
       assert.equal(await c.locator('[data-verify-none="no_gate"]').isVisible(), true, k);
       assert.match(await c.textContent(), /実機の確かめが要(らず|りません).*このファイルですることはありません/, k);
     }
-    // 🆕 0100: セットの v1 も引退 = ボタンなし・「引退しました」の一言 (今の形 = ne-reg-set-v2)
+    // 🆕 0099: セットの v1 も引退 = ボタンなし・「引退しました」の一言 (今の形 = ne-reg-set-v2)
     const set = card('ne-reg-set-v1');
     assert.equal(await set.locator('button[data-act="verified"]').count(), 0);
     assert.match(await set.textContent(), /この形 \(ne-reg-set-v1\) は引退しました。今の形 \(ne-reg-set-v2\) は実機の確かめが要らず、最初から本番の行数で作れます/);

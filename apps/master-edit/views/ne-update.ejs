@@ -65,7 +65,7 @@
       <div class="msgline" id="nu-msg" role="status" aria-live="polite"></div>
     </section>
 
-    <%# 🆕 0101: セットの中身 (構成の依頼)。足す・数を変える = 「セットの中身の CSV」/ 外す・入れ替える = NE の画面で (CSV ではできない)。翌朝 NE とそろえば、その夜に依頼が閉じて一覧から消える %>
+    <%# 🆕 0100: セットの中身 (構成の依頼)。足す・数を変える = 「セットの中身の CSV」/ 外す・入れ替える = NE の画面で (CSV ではできない)。翌朝 NE とそろえば、その夜に依頼が閉じて一覧から消える %>
     <% if (locals.setComp) { const SC = setComp; const comp = (l) => l.map((x) => x.code + '×' + x.qty).join(', ') || 'なし'; %>
     <section class="panel" id="nu-sc-panel" aria-labelledby="h-nu-sc">
       <div class="panel-h"><span class="hico" aria-hidden="true"><svg class="ic"><use href="#i-layers"/></svg></span><h2 id="h-nu-sc">セットの中身を変える依頼 (<%= SC.items.length %>)</h2>

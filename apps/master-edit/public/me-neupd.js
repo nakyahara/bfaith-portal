@@ -6,7 +6,7 @@
  *   - 通信が分からないまま終わった = 同じ request_id で送り直す (2 回作らない・2 回頼まない)
  *   - 受け取りを DB が断った (作った後に値が変わった・もう出した) = そのボタンを外して「もう一度 CSV を作る」を案内
  *   - (名簿の人だけ) NE の実物の試しの結果 = POST /api/ne-update/verified
- *   - 🆕 0101: 「セットの中身の CSV を作る」= POST /api/ne-update/set-comp-csv (その場で作って渡す・sha256 を照らしてから保存・DB に記録しない = 何度押しても同じ中身)
+ *   - 🆕 0100: 「セットの中身の CSV を作る」= POST /api/ne-update/set-comp-csv (その場で作って渡す・sha256 を照らしてから保存・DB に記録しない = 何度押しても同じ中身)
  */
 (function () {
   'use strict';

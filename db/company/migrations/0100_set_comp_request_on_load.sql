@@ -1,12 +1,12 @@
--- 0101 (仮番号・0100 の次。マージの時に次の空き番号に付け替える。migrate は欠番を断る): 今あるセットの中身 (構成) を、構成の持ち主 (sku_components) が NE (load) のまま
+-- 0100 (仮番号・0099 の次。マージの時に次の空き番号に付け替える。migrate は欠番を断る): 今あるセットの中身 (構成) を、構成の持ち主 (sku_components) が NE (load) のまま
 --   「依頼」の形で変えられるようにする (2026-10-21 中原さん「近道を作って」・AI_reference CompanyDB構想/24 §経緯 10/21・PR-0b)
 --
 -- 流れ: 商品の画面で構成を変える = 構成の依頼 (ops.sku_component_requests・core.sku_components は書かない) →
 --   足す・数を変える = 「NEへ送る」の「セットの中身の CSV」/ 外す・入れ替える = NE の画面で (CSV ではできない) →
---   翌朝の NE の取得 → その夜の夜間ロードが core を NE の中身にし、依頼を閉じる (0100 の closeRequestOnLoad)
+--   翌朝の NE の取得 → その夜の夜間ロードが core を NE の中身にし、依頼を閉じる (0099 の closeRequestOnLoad)
 -- なにを:
---   1. ops.set_comp_request_on_load() = 印 (アプリが to_regprocedure で「0101 の後の DB か」を見る = 前の DB では今までどおり load の間は構成を直せない)
---   2. ops.guard_master_edit_write (0100 の版を写して 🆕 0101 の continue の行だけ変えた): 依頼と食い違いの表は、持ち主 sku_components が load でも通す
+--   1. ops.set_comp_request_on_load() = 印 (アプリが to_regprocedure で「0100 の後の DB か」を見る = 前の DB では今までどおり load の間は構成を直せない)
+--   2. ops.guard_master_edit_write (0099 の版を写して 🆕 0100 の continue の行だけ変えた): 依頼と食い違いの表は、持ち主 sku_components が load でも通す
 --      (表・操作の許可 (ops.master_write_allowed)・約束の相手の行・構成品は単品だけ (業務の約束) ・ほかの持ち主のキーは今までどおり)
 -- 変えない: core.sku_components (夜間ロードだけ)・持ち主表・照合 ②・NE 登録の CSV・夜間ロード
 -- 🚨 この migration は値を何も変えない (関数の置き換えと印だけ)。create or replace = 持ち主・実行権はそのまま (ロールの流し直しは要らない)
@@ -14,17 +14,17 @@
 -- ═══════════ 0. 前提 ═══════════
 do $$ begin
   if pg_catalog.to_regprocedure('ops.set_entry_on_load()') is null or pg_catalog.to_regprocedure('ops.guard_master_edit_write()') is null then
-    raise exception '0101 の前提: 0100 (セットの新商品を構成の持ち主 load のまま登録) が無い';
+    raise exception '0100 の前提: 0099 (セットの新商品を構成の持ち主 load のまま登録) が無い';
   end if;
-  if pg_catalog.to_regprocedure('ops.set_comp_request_on_load()') is not null then raise exception '0101: ops.set_comp_request_on_load がもうある'; end if;
+  if pg_catalog.to_regprocedure('ops.set_comp_request_on_load()') is not null then raise exception '0100: ops.set_comp_request_on_load がもうある'; end if;
 end $$;
 
 -- ═══════════ 1. 印 ═══════════
 create function ops.set_comp_request_on_load() returns boolean language sql immutable set search_path = pg_catalog, pg_temp as $$ select true $$;
-comment on function ops.set_comp_request_on_load() is '0101: 今あるセットの構成の依頼を構成の持ち主 load のまま作れる DB の印 (依頼と食い違いの表は持ち主 sku_components が load でも書ける)';
+comment on function ops.set_comp_request_on_load() is '0100: 今あるセットの構成の依頼を構成の持ち主 load のまま作れる DB の印 (依頼と食い違いの表は持ち主 sku_components が load でも書ける)';
 revoke all on function ops.set_comp_request_on_load() from public;
 
--- ═══════════ 2. 書き込みの守り (0100 の版 + 🆕 0101 の continue の行) ═══════════
+-- ═══════════ 2. 書き込みの守り (0099 の版 + 🆕 0100 の continue の行) ═══════════
 create or replace function ops.guard_master_edit_write() returns trigger
   language plpgsql security definer set search_path = pg_catalog, ops, core, pg_temp as $$
 declare
@@ -119,8 +119,8 @@ begin
     end if;
   end if;
   foreach k in array ops.master_edit_owner_keys(v_tbl, tg_op, v_old, v_new) loop
-    -- 🆕 0101: 構成の依頼と食い違いの表 (ops.sku_component_requests・ops.sku_component_breaches) は、構成の持ち主 (sku_components) が load でも通す
-    --   (0100 の新商品の登録に加えて、商品の画面の保存 (sku_edit) の依頼を作る・取り下げる・置き換える・食い違いを閉じる)。どれも core.sku_components は書かない
+    -- 🆕 0100: 構成の依頼と食い違いの表 (ops.sku_component_requests・ops.sku_component_breaches) は、構成の持ち主 (sku_components) が load でも通す
+    --   (0099 の新商品の登録に加えて、商品の画面の保存 (sku_edit) の依頼を作る・取り下げる・置き換える・食い違いを閉じる)。どれも core.sku_components は書かない
     --   (core の構成は今までどおり夜間ロードが NE から書く・依頼は夜間ロードの後に NE の観測と同じなら閉じる = lib/master-write.mjs の closeRequestOnLoad)
     continue when k = 'sku_components' and v_tbl in ('ops.sku_component_requests', 'ops.sku_component_breaches');
     if (v_sess.ownership ->> k) is distinct from 'company' then

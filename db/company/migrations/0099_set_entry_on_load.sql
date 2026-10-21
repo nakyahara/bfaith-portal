@@ -1,4 +1,4 @@
--- 0100 (仮番号・マージの時に次の空き番号に付け替える。migrate は欠番を断る): セットの新商品を、構成の持ち主 (sku_components) が NE (load) のままポータルで登録できるようにする
+-- 0099 (仮番号・マージの時に次の空き番号に付け替える。migrate は欠番を断る): セットの新商品を、構成の持ち主 (sku_components) が NE (load) のままポータルで登録できるようにする
 --   (2026-10-21 中原さん「セット商品つくれないんだけど。作れるようにして」・AI_reference CompanyDB構想/24 の「依頼 → NE で確かめる」の道を、持ち主の切替の前に使う)
 --
 -- なぜ切替なしで開けてよいか:
@@ -6,8 +6,8 @@
 --   ・core.sku_components は今までどおり夜間ロードが NE から書く (持ち主 load)。NE に取り込んだ後の夜に NE の中身が core に入る
 --     = 出荷・売上の古い表 (NE から作る) と core の構成は今と同じく NE の中身のまま。ポータルの依頼は「NE に入れてほしい中身」(NE 登録の CSV の元) だけ
 --   ・持ち主を変えないので、切替・戻す道は要らない (止めるのは今の非常の止め MASTER_NEW_ENTRY_STOP=1 か、毎朝の許可の取り消し)
--- なにを (前の最後の版を写して 🆕 0100 の行だけ変えた・鍵の順・security definer・search_path・実行権は同じ):
---   1. ops.set_entry_on_load() = 印 (アプリ・試験が to_regprocedure で「0100 の後の DB か」を見る)
+-- なにを (前の最後の版を写して 🆕 0099 の行だけ変えた・鍵の順・security definer・search_path・実行権は同じ):
+--   1. ops.set_entry_on_load() = 印 (アプリ・試験が to_regprocedure で「0099 の後の DB か」を見る)
 --   2. 毎朝の許可: 単品の許可を出すとき (ops.grant_new_entry_lease('single', 回)) にセットの許可も同じ結果の行・同じ期限で出す / 取り消す (revoke 'single') ときはセットも取り消す。
 --      毎朝の段 (new-entry-gate.mjs) は変えない (今までどおり single を呼ぶ)。'set' を直接出す / 取り消す呼び出しは今までどおり断る
 --   3. 当てた時点で単品の許可が有効なら、同じ結果の行・同じ期限でセットの許可を 1 つ出す (翌朝を待たずに開く)
@@ -26,18 +26,18 @@ do $$ begin
      or pg_catalog.to_regprocedure('ops.grant_new_entry_lease(text, text)') is null or pg_catalog.to_regprocedure('ops.revoke_new_entry_lease(text, text)') is null
      or pg_catalog.to_regprocedure('ops.ne_reg_schema_rule(text)') is null or pg_catalog.to_regprocedure('ops.new_entry_lease_expiry(timestamptz)') is null
      or pg_catalog.to_regprocedure('ops.draft_in_ne_check(bigint)') is null then
-    raise exception '0100 の前提: 新商品の登録 (0061)・書き込みの守り (0051)・許可 (0058・0082)・CSV の版 (0067)・0098 が無い';
+    raise exception '0099 の前提: 新商品の登録 (0061)・書き込みの守り (0051)・許可 (0058・0082)・CSV の版 (0067)・0098 が無い';
   end if;
-  if pg_catalog.to_regprocedure('ops.set_entry_on_load()') is not null then raise exception '0100: ops.set_entry_on_load がもうある'; end if;
+  if pg_catalog.to_regprocedure('ops.set_entry_on_load()') is not null then raise exception '0099: ops.set_entry_on_load がもうある'; end if;
 end $$;
 
 -- ═══════════ 1. 印 ═══════════
 create function ops.set_entry_on_load() returns boolean language sql immutable set search_path = pg_catalog, pg_temp as $$ select true $$;
-comment on function ops.set_entry_on_load() is '0100: セットの新商品を構成の持ち主 load のまま登録できる DB の印 (セットの許可は単品の許可と一緒に出る・CSV は ne-reg-set-v2)';
+comment on function ops.set_entry_on_load() is '0099: セットの新商品を構成の持ち主 load のまま登録できる DB の印 (セットの許可は単品の許可と一緒に出る・CSV は ne-reg-set-v2)';
 revoke all on function ops.set_entry_on_load() from public;
 
 -- ═══════════ 2. 毎朝の許可: 単品と一緒にセットも ═══════════
--- 2a. 許可を出す (0082 の版 + 🆕 0100 の行)。鍵の順 = single → set (ops.new_entry_lease_kinds の順 = 保存の取引の共有の鍵・照合 ② の結果の記録と同じ順)
+-- 2a. 許可を出す (0082 の版 + 🆕 0099 の行)。鍵の順 = single → set (ops.new_entry_lease_kinds の順 = 保存の取引の共有の鍵・照合 ② の結果の記録と同じ順)
 create or replace function ops.grant_new_entry_lease(p_kind text, p_compare_run_id text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
@@ -47,11 +47,11 @@ declare
   v_id       bigint;
   v_expires  timestamptz;
   v_replaced integer;
-  v_set_id   bigint;   -- 🆕 0100
+  v_set_id   bigint;   -- 🆕 0099
 begin
   if p_kind is distinct from 'single' then raise exception 'invalid_input: 知らない新商品の種類 % (single を出すとセットも一緒に出る)', p_kind using errcode = '22023'; end if;
   perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key(p_kind));
-  perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key('set'));   -- 🆕 0100: セットの許可も同じ取引で書く (single の後 = 鍵の順は同じ)
+  perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key('set'));   -- 🆕 0099: セットの許可も同じ取引で書く (single の後 = 鍵の順は同じ)
   -- 🆕 0082 (#1722 Codex R1 High 2): 今回の回の結果の行が無い (今朝の記録の前に落ちた) = 古い行の問題 (not_today など) を混ぜずに current_result_missing だけ
   --   (毎朝の段はこの理由では閉じない = 今の許可はそのまま)
   if not exists (select 1 from ops.new_entry_gate_results x where x.compare_run_id = p_compare_run_id) then
@@ -75,7 +75,7 @@ begin
   update ops.master_new_entry_leases set revoked_at = v_now, revoke_reason = pg_catalog.left('置き換え: 次の許可 (lease ' || v_id::text || ') が出た', 500), revoked_by = session_user::text
    where kind = p_kind and revoked_at is null and lease_id <> v_id;
   get diagnostics v_replaced = row_count;
-  -- 🆕 0100: セットの許可も同じ結果の行・同じ回・同じ期限で出す (セットの新商品は構成を依頼で持つだけ = 単品と同じ確かめ (照合 ② の区分のゲート) で開く)。前のセットの許可は置き換え
+  -- 🆕 0099: セットの許可も同じ結果の行・同じ回・同じ期限で出す (セットの新商品は構成を依頼で持つだけ = 単品と同じ確かめ (照合 ② の区分のゲート) で開く)。前のセットの許可は置き換え
   insert into ops.master_new_entry_leases (kind, result_id, compare_run_id, granted_by, granted_at, expires_at)
     values ('set', r.result_id, r.compare_run_id, session_user::text, v_now, v_expires)
     returning lease_id into v_set_id;
@@ -86,30 +86,30 @@ begin
     'set_lease_id', v_set_id::text);
 end $$;
 
--- 2b. 取り消す (0058 の版 + 🆕 0100 の行): single を取り消すとセットも取り消す (停止の床もセットに足す = 次の許可までセットも閉じる)
+-- 2b. 取り消す (0058 の版 + 🆕 0099 の行): single を取り消すとセットも取り消す (停止の床もセットに足す = 次の許可までセットも閉じる)
 create or replace function ops.revoke_new_entry_lease(p_kind text, p_reason text) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
   v_n     integer;
   v_floor bigint;
-  v_sn    integer;   -- 🆕 0100
+  v_sn    integer;   -- 🆕 0099
 begin
   if p_kind is distinct from 'single' then raise exception 'invalid_input: 知らない新商品の種類 % (single を取り消すとセットも一緒に取り消す)', p_kind using errcode = '22023'; end if;
   if p_reason is null or length(btrim(p_reason)) = 0 then raise exception 'invalid_input: 取り消しの理由が要る' using errcode = '22023'; end if;
   perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key(p_kind));
-  perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key('set'));   -- 🆕 0100
+  perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key('set'));   -- 🆕 0099
   perform pg_catalog.set_config('ops.lease_protocol', '1', true);
   update ops.master_new_entry_leases set revoked_at = clock_timestamp(), revoke_reason = left(btrim(p_reason), 500), revoked_by = session_user::text
    where kind = p_kind and revoked_at is null;
   get diagnostics v_n = row_count;
-  -- 🆕 0100: セットの許可も取り消す
+  -- 🆕 0099: セットの許可も取り消す
   update ops.master_new_entry_leases set revoked_at = clock_timestamp(), revoke_reason = left(btrim(p_reason), 500), revoked_by = session_user::text
    where kind = 'set' and revoked_at is null;
   get diagnostics v_sn = row_count;
   perform pg_catalog.set_config('ops.lease_protocol', '', true);
   select coalesce(max(x.result_id), 0) into v_floor from ops.new_entry_gate_results x;
   insert into ops.master_new_entry_stop_floors (kind, floor_result_id, reason, recorded_by) values (p_kind, v_floor, left(btrim(p_reason), 500), session_user::text);
-  insert into ops.master_new_entry_stop_floors (kind, floor_result_id, reason, recorded_by) values ('set', v_floor, left(btrim(p_reason), 500), session_user::text);   -- 🆕 0100
+  insert into ops.master_new_entry_stop_floors (kind, floor_result_id, reason, recorded_by) values ('set', v_floor, left(btrim(p_reason), 500), session_user::text);   -- 🆕 0099
   return jsonb_build_object('revoked', v_n, 'floor_result_id', v_floor::text, 'set_revoked', v_sn);
 end $$;
 
@@ -125,26 +125,26 @@ begin
   perform pg_catalog.pg_advisory_xact_lock(ops.new_entry_lease_lock_key('set'));
   select * into l from ops.master_new_entry_leases x where x.kind = 'single' order by x.lease_id desc limit 1;
   if not found or not ops._new_entry_lease_ok('single') then
-    raise notice '0100: 単品の許可が今は無い = セットの許可は次の朝の許可と一緒に出る';
+    raise notice '0099: 単品の許可が今は無い = セットの許可は次の朝の許可と一緒に出る';
     return;
   end if;
   if ops._new_entry_lease_ok('set') and exists (select 1 from ops.master_new_entry_leases x
        where x.lease_id = (select max(y.lease_id) from ops.master_new_entry_leases y where y.kind = 'set') and x.result_id = l.result_id) then
-    raise notice '0100: セットの許可はもう有効 (単品の許可 % と同じ結果の行)', l.lease_id;
+    raise notice '0099: セットの許可はもう有効 (単品の許可 % と同じ結果の行)', l.lease_id;
     return;
   end if;
   perform pg_catalog.set_config('ops.lease_protocol', '1', true);
   insert into ops.master_new_entry_leases (kind, result_id, compare_run_id, granted_by, granted_at, expires_at)
-    values ('set', l.result_id, l.compare_run_id, pg_catalog.left('0100 で単品の許可 (lease ' || l.lease_id::text || ') に合わせて出した', 500), l.granted_at, l.expires_at)
+    values ('set', l.result_id, l.compare_run_id, pg_catalog.left('0099 で単品の許可 (lease ' || l.lease_id::text || ') に合わせて出した', 500), l.granted_at, l.expires_at)
     returning lease_id into v_new;
-  update ops.master_new_entry_leases set revoked_at = pg_catalog.clock_timestamp(), revoke_reason = pg_catalog.left('置き換え: 0100 のセットの許可 (lease ' || v_new::text || ')', 500), revoked_by = session_user::text
+  update ops.master_new_entry_leases set revoked_at = pg_catalog.clock_timestamp(), revoke_reason = pg_catalog.left('置き換え: 0099 のセットの許可 (lease ' || v_new::text || ')', 500), revoked_by = session_user::text
    where kind = 'set' and revoked_at is null and lease_id <> v_new;
   perform pg_catalog.set_config('ops.lease_protocol', '', true);
-  raise notice '0100: セットの許可 % を出した (単品の許可 % と同じ結果の行・期限 %)', v_new, l.lease_id, l.expires_at;
+  raise notice '0099: セットの許可 % を出した (単品の許可 % と同じ結果の行・期限 %)', v_new, l.lease_id, l.expires_at;
 end $$;
 -- @@SET_LEASE_END@@
 
--- ═══════════ 4. 新商品の登録 (0061 の版 + 🆕 0100 の 1 行 = セットも許可を確かめる) ═══════════
+-- ═══════════ 4. 新商品の登録 (0061 の版 + 🆕 0099 の 1 行 = セットも許可を確かめる) ═══════════
 create or replace function ops.register_new_sku(p_request_id uuid, p_actor_id text, p_reason text, p_ownership jsonb, p_payload_hash text, p_entry jsonb) returns jsonb
   language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
 declare
@@ -243,7 +243,7 @@ begin
     raise exception 'invalid_input: request_id % はもう使われている (保存の記録がある)', p_request_id using errcode = '22023';
   end if;
   -- 🆕 0058 (§3.7・§3.8): 新商品の開放の許可 (種類ごと・共有の鍵 = 取り消し・照合 ② の始めに閉じる・結果の記録と並ぶ)。無い = new_entry_closed (アプリは 409)
-  perform ops._require_new_entry_lease(v_kind);   -- 🆕 0100: セットもセットの許可 (毎朝の単品の許可と一緒に出る)。0058〜0099 は単品だけ
+  perform ops._require_new_entry_lease(v_kind);   -- 🆕 0099: セットもセットの許可 (毎朝の単品の許可と一緒に出る)。0058〜0099 は単品だけ
   -- コード (新しいコードの鍵 = 画面と同じ鍵 → 決まり)
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('core.new_code:' || coalesce(core.norm_code(v_code), ''), 0));
   v_bad := ops.new_sku_code_problem(v_code);
@@ -450,9 +450,9 @@ begin
         case when v_name ~ '_(白ビ袋|梱機プ|長3封|白プチ|ネコ段|K-44|K-50|K-60|厚紙封|パフ箱|その他)$'
              then '名前の末尾に資材の印があります。資材は梱包アプリで登録します (新しい名前には付けない・D-47)' end], null)),
     'ne_steps', to_jsonb(array_remove(array[
-        case when v_kind = 'set' then '下書きで登録しました。次は「NE 登録の CSV」で CSV を作って NE に取り込み、「NE に取り込んだ」を押します (🆕 0100)'
+        case when v_kind = 'set' then '下書きで登録しました。次は「NE 登録の CSV」で CSV を作って NE に取り込み、「NE に取り込んだ」を押します (🆕 0099)'
              else '下書きで登録しました。NE・ロジザードへの登録 (新規登録の CSV) はまだです (次の段階で「NE 登録へ進む」を足します)' end,
-        case when v_kind = 'set' then 'セットの構成は「構成の依頼」として持っています。NE に取り込んで翌朝 NE の構成が同じと確かめたら、その夜に今の構成になります (🆕 0100)' end], null)),
+        case when v_kind = 'set' then 'セットの構成は「構成の依頼」として持っています。NE に取り込んで翌朝 NE の構成が同じと確かめたら、その夜に今の構成になります (🆕 0099)' end], null)),
     'card', case when v_event is null then null else jsonb_build_object('event_id', v_event::text, 'status', 'pending') end,
     'request_payload_hash', p_payload_hash);
   insert into ops.master_edit_requests (request_id, company_id, operation, target_code, sku_id, actor_id, payload_hash, status, result, started_at)
@@ -463,7 +463,7 @@ begin
   return v_result;
 end $$;
 
--- ═══════════ 5. 書き込みの守り (0051 の版 + 🆕 0100 の continue の 1 行) ═══════════
+-- ═══════════ 5. 書き込みの守り (0051 の版 + 🆕 0099 の continue の 1 行) ═══════════
 create or replace function ops.guard_master_edit_write() returns trigger
   language plpgsql security definer set search_path = pg_catalog, ops, core, pg_temp as $$
 declare
@@ -558,7 +558,7 @@ begin
     end if;
   end if;
   foreach k in array ops.master_edit_owner_keys(v_tbl, tg_op, v_old, v_new) loop
-    -- 🆕 0100: 新商品の登録 (約束 sku_create) が新しいセットの構成の依頼を 1 つ入れるのは、構成の持ち主 (sku_components) が load でも通す
+    -- 🆕 0099: 新商品の登録 (約束 sku_create) が新しいセットの構成の依頼を 1 つ入れるのは、構成の持ち主 (sku_components) が load でも通す
     --   (依頼は「NE に入れてほしい中身」だけ = core.sku_components は書かない。core の構成は今までどおり夜間ロードが NE から書く)
     continue when k = 'sku_components' and v_tbl = 'ops.sku_component_requests' and tg_op = 'INSERT' and v_sess.operation = 'sku_create';
     if (v_sess.ownership ->> k) is distinct from 'company' then
@@ -568,7 +568,7 @@ begin
   return case when tg_op = 'DELETE' then old else new end;
 end $$;
 
--- ═══════════ 6. NE 登録の CSV のセットの版 ne-reg-set-v2 (0067 の版 + 🆕 0100 の 2 行) ═══════════
+-- ═══════════ 6. NE 登録の CSV のセットの版 ne-reg-set-v2 (0067 の版 + 🆕 0099 の 2 行) ═══════════
 --   v2 = 試し用の門なし (最初から 1 ファイル 1,000 行まで)・見出しと中身 (ops.ne_reg_canonical) は v1 と同じ。v1 = 作らない・配らない (前の版の実機の確かめは引き継がない = 0065 と同じ考え)
 create or replace function ops.ne_reg_schema_rule(p_schema text) returns jsonb language sql immutable set search_path = pg_catalog, pg_temp as $$
   select case p_schema
@@ -579,7 +579,7 @@ create or replace function ops.ne_reg_schema_rule(p_schema text) returns jsonb l
     when 'ne-reg-variation-v1' then '{"kind": "products", "sku_kind": "single", "header": "syohin_code,syohin_name,sire_code,genka_tnk,baika_tnk,tax_rate,toriatukai_kbn,daihyo_syohin_code,jan_code",
       "buildable": true, "why": null, "trial_gate": false, "jan": "empty", "parent": "group"}'::jsonb
     when 'ne-reg-set-v1' then '{"kind": "sets", "sku_kind": "set", "header": "set_syohin_code,set_syohin_name,set_baika_tnk,tax_rate,syohin_code,suryo",
-      "buildable": false, "why": "0100 で引退 (試し用の 5 行の門のある版)。セットは ne-reg-set-v2", "trial_gate": true, "jan": null, "parent": null}'::jsonb
+      "buildable": false, "why": "0099 で引退 (試し用の 5 行の門のある版)。セットは ne-reg-set-v2", "trial_gate": true, "jan": null, "parent": null}'::jsonb
     when 'ne-reg-set-v2' then '{"kind": "sets", "sku_kind": "set", "header": "set_syohin_code,set_syohin_name,set_baika_tnk,tax_rate,syohin_code,suryo",
       "buildable": true, "why": null, "trial_gate": false, "jan": null, "parent": null}'::jsonb
   end
