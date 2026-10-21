@@ -160,7 +160,7 @@ console.log('② packet に撮影判定の指示 (別の欄)・構成の指示�
 {
   const d = mkDraft();
   const r = reserveFor(d);
-  eq(r.packet.packet_version, 6, 'packet の版は 6 (PR-C2 で撮影判定の仕様書 shoot_spec を足した)');
+  eq(r.packet.packet_version, 7, 'packet の版は 7 (PR-C2 で撮影判定の仕様書 shoot_spec・10-21 に画像フォルダの全画像を足した)');
   eq(r.packet.shoot_spec, null, '仕様書「新商品初動判定」を取り込む前は shoot_spec: null (PR-C の決まりのまま)');
   eq(r.packet.shoot_instruction, shootLib.SHOOT_JUDGE_INSTRUCTION, '🚨 claim で撮影判定の指示が届く (受付時に固定)');
   eq(r.packet.instruction, pt.PRODUCT_ANALYSIS_INSTRUCTION, '🚨 構成の指示文は正本のまま (くらべっこの前提を崩さない)');

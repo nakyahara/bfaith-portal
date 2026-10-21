@@ -328,7 +328,7 @@ let dV1, rV1;
 {
   dV1 = mkDraft();
   rV1 = reserveFor(dV1, { shootSpec: false });
-  eq([rV1.job.packet.packet_version, rV1.job.packet.shoot_spec, rV1.job.shoot_spec], [6, null, null], 'packet の版は 6・shoot_spec は null・claim にも仕様書は付かない');
+  eq([rV1.job.packet.packet_version, rV1.job.packet.shoot_spec, rV1.job.shoot_spec], [7, null, null], 'packet の版は 7・shoot_spec は null・claim にも仕様書は付かない');
   eq(rV1.job.packet.shoot_instruction, sh.SHOOT_JUDGE_INSTRUCTION, '🚨 指示は PR-C の簡単な決まり (取り込む前に壊れない)');
   const res = accept(rV1, { shoot: goodV1() });
   ok(res.ok && res.status === 'done' && res.shoot.status === 'saved', '古い実行役 (仕様書を知らない) でも v1 の判定を今どおり保存');

@@ -308,6 +308,16 @@ console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検�
       { file_id: 'FILEIDTOPM01', role: 'slot:1' },
       { file_id: 'FILEIDMATM01', role: 'material', folder: '素材/使用イメージ', name: '玄関.jpg' },
       { file_id: 'FILEIDMATM02', role: 'material', folder: '素材', name: 'パーツ.png' },
+      // 直下の色別画像 (2026-10-21)。ファイル名が SKU の商品コードなら色名つき
+      { file_id: 'FILEIDMATM03', role: 'material', folder: '', name: 'lp-run-m-be.jpg', sku_label: 'ベージュ' },
+    ],
+    // 画像フォルダの全画像 (添付していない lp-run-m-bk.jpg も名前で伝える)
+    folderFiles: [
+      { file_id: 'FILEIDTOPM01', name: 'LP-RUN-M_top.jpg', folder: '' },
+      { file_id: 'FILEIDMATM03', name: 'lp-run-m-be.jpg', folder: '', sku_label: 'ベージュ' },
+      { file_id: 'FILEIDMATM04', name: 'lp-run-m-bk.jpg', folder: '', sku_label: 'ブラック' },
+      { file_id: 'FILEIDMATM01', name: '玄関.jpg', folder: '素材/使用イメージ' },
+      { file_id: 'FILEIDMATM02', name: 'パーツ.png', folder: '素材' },
     ],
     idempotencyKey: 'runner-test-mat-1', actor: 'nakahara@x',
   });
@@ -316,7 +326,8 @@ console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検�
   const clM = await phlpWith({ PH_LP_RUN_ID: 'lpr-20261002-170000-mmmmmm' }, 'claim', '--run', 'lp-test-m');
   eq(clM.json.job_id, reqM.job.id, '素材つきの依頼が来る');
   const list = clM.json.packet.image_list || [];
-  ok(list.length === 3 && list[0].kind === 'product' && list[0].file === `img-${mid}-1.jpg`, '1 番は商品画像 (img-ID-1.jpg)');
+  ok(list.length === 4 && list[3].kind === 'material' && list[3].sku_label === 'ベージュ' && list[3].folder === null, '直下の色別画像も素材 (色名つき・場所は直下)');
+  ok(list[0].kind === 'product' && list[0].file === `img-${mid}-1.jpg`, '1 番は商品画像 (img-ID-1.jpg)');
   ok(list[1].kind === 'material' && list[1].folder === '素材/使用イメージ' && list[1].name === '玄関.jpg' && list[1].file === `img-${mid}-2.jpg`,
     '🚨 2 番は素材 (場所と名前つき) — Claude が「使用素材」に書く名前');
   ok(list[2].kind === 'material' && list[2].role === 'material:2', '3 番も素材');
@@ -325,7 +336,10 @@ console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検�
   fs.writeFileSync(path.join(work, `seen-${mid}.md`), 'img-1: 透明ボトル。img-2: 玄関でスプレー。img-3: キャップの部品。', 'utf8');
   fs.writeFileSync(path.join(work, `_lp_review_${mid}.md`), '# 構成案\n' + 'x'.repeat(100), 'utf8');
   const rdM = await phlp('reviewdata', mid);
-  ok(rdM.code === 0 && rdM.out.includes('うち素材 2 枚'), `検品の材料① に素材の枚数 (${rdM.out.split('\n').find((l) => l.includes('画像:'))})`);
+  ok(rdM.out.includes('4: lp-run-m-be.jpg = ベージュ'), '検品の素材の一覧に色名');
+  ok(rdM.out.includes('[画像フォルダにあるが添付していない画像 (フォルダに「ある」素材)]') && rdM.out.includes('(直下) lp-run-m-bk.jpg = ブラック') && !rdM.out.includes('(直下) lp-run-m-be.jpg'),
+    '🚨 検品に、添付していないがフォルダにある画像を渡す (「1 色分しかない」と誤って指摘させない)');
+  ok(rdM.code === 0 && rdM.out.includes('うち素材 3 枚'), `検品の材料① に素材の枚数 (${rdM.out.split('\n').find((l) => l.includes('画像:'))})`);
   ok(rdM.out.includes('[素材の一覧 (n = img-ID-n.jpg)]') && rdM.out.includes('2: 素材/使用イメージ/玄関.jpg') && rdM.out.includes('3: 素材/パーツ.png'),
     '🚨 検品の材料① に素材の一覧 (使用素材に無い素材を書いていないかを見るため)');
   // 🚨 検品の観点 6 は「素材画像」だけを素材の一覧と照らす。商品画像 (提供された実物商品画像) を指摘させない
@@ -333,6 +347,10 @@ console.log('⑩ 素材画像 — 何番が素材かを Claude に伝え、検�
   const reviewSh = fs.readFileSync(path.join(path.dirname(PHLP), 'phlpreview'), 'utf8');
   ok(/6\. 各画像の「使用素材」に\*\*素材画像\*\*を書いているなら/.test(reviewSh) && reviewSh.includes('「提供された実物商品画像」') && reviewSh.includes('これは指摘しない'),
     '🚨 検品の観点 6: 商品画像 (提供された実物商品画像) は素材の一覧に無くてよい');
+  // 🚨 観点 7 (2026-10-21): 素材が足りないこと自体は構成の誤りにしない (鍋敷き: 色別画像が無いと high にされ 2 巡で rejected)
+  ok(reviewSh.includes('7. 素材') && reviewSh.includes('足りないこと自体は**構成の誤りではありません**')
+    && reviewSh.includes('『要追加撮影』『要確認』と明記しているなら critical/high にしない') && reviewSh.includes('どちらもフォルダに**ある**素材です'),
+    '🚨 検品の観点 7: 素材不足は『要追加撮影』と書いてあれば critical/high にしない・フォルダにある画像は「ある」');
   ok(String(clM.json.packet.image_guide || '').includes('2枚目: 素材画像 (素材1・素材/使用イメージ/玄関.jpg)'),
     '🚨 claim に添付画像の説明 (スタッフの ChatGPT 版と同じ文) が出る');
   eq((await phlp('release', mid, '--reason', '試験の片付け')).code, 0, '片付け (予約前なので手放せる)');
