@@ -18,6 +18,9 @@
  *      終わりの知らせが届かない = 残して次の回に送る / 忙しい = 取らない / 途中で process が終わった = 残す
  *   P  本物の barcode-steps.js の ① を偽物のロジザードの画面で: 押す前にポータルへ「押す」・断られたら実行ボタンを押さない・結果の件数を読む
  *   U  画面 (本物のブラウザ): ボタンの状態 (miniPC が来ていない・夜・押せる・もう一度)・確かめの欄・積んだ後の様子・終わった後・分からない回を記す
+ *   E  🆕 2026-10-21 ② = ポータルが共有ドライブ (偽物の Drive) に書く: 書けない (設定・権限)・古い miniPC = ② の印を外して押せない (① だけ積む・古い runner には ② を外して渡す) /
+ *      miniPC が ② のファイルを送る → 確かめ → Drive を上書き / 書けない・中身がおかしい = ② は「書けなかった」で ① は取り込んだまま / 2 回は書かない /
+ *      CSV の商品が全部ロジザードの写しにある = 「もうあります (手で取り込み済み)」・ボタンなし・積まない / 「ボタンではまだ」
  * 使い方: node --import file:///…/use-chrome.mjs scripts/test-lz-bc-import.mjs (playwright の chromium の代わりに入れてある Chrome を使うとき)
  */
 import assert from 'node:assert/strict';
@@ -38,6 +41,16 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'lzbc-import-'));
 
 const BC = await import('../apps/lz-bc-import/store.js');
 BC.__setLzBcDb(BC.openLzBcDb(':memory:'));
+// 偽物の Drive (② の書く先・本物の共有ドライブには触らない)。DRIVE = 今の様子・UPLOADS = 書いた中身
+const DX = await import('../apps/lz-bc-import/drive-export.js');
+let DRIVE = { ok: true, code: null, message: null, modified_time: '2030-01-10T00:00:00.000Z', checked_at: 1 };
+const UPLOADS = [];
+DX.__setDriveTarget({
+  status: async () => DRIVE, peek: () => DRIVE,
+  upload: async (buf) => { if (!DRIVE.ok) throw new DX.DriveWriteError(DRIVE.code, DRIVE.message); UPLOADS.push(buf); return { modified_time: '2030-01-10T05:06:00.000Z' }; },
+});
+const DRIVE_OK = DRIVE;
+const DRIVE_NG = (code) => ({ ok: false, code, message: DX.DRIVE_WORDS[code], checked_at: 1 });
 const { createLzBcRunnerRouter } = await import('../apps/lz-bc-import/runner-router.js');
 const LS = await import('../apps/lz-bc-import/lz-state.js');
 const RUN = await import('../tools/logizard-automation/bc-import-runner.js');
@@ -91,7 +104,7 @@ let who = 'naka';
 const app = express();
 app.set('view engine', 'ejs');
 // 機械の口 = セッションの前・どの parser よりも前 (server.js と同じ)
-app.use('/apps/lz-bc-import', createLzBcRunnerRouter({ readExportFile: (id) => READ(id), now: clock, token: () => TOKEN_ENV, importBlock: () => BLOCK }));
+app.use('/apps/lz-bc-import', createLzBcRunnerRouter({ readExportFile: (id) => READ(id), now: clock, token: () => TOKEN_ENV, importBlock: () => BLOCK, exportMinRows: 1 }));
 app.use(express.json({ limit: '10mb' }));   // 後ろの共通の parser (機械の口には届かないこと)
 app.use((req, res, next) => { req.session = SESS[who]; next(); });
 app.use('/apps/master-edit', MR.default);
@@ -142,7 +155,11 @@ async function newExport(n = 1) {
   const f = await asEditor(() => LZE.lzNewExportFile(db, e.export_id));
   return { id: e.export_id, rows: n, sha: f.text_sha256, file: f };
 }
-const runnerSeen = (busy = null) => mcall('/claim', { runner_id: 'test-pc', version: 'v', busy });   // 来た印 (待ちがあれば取る)
+const runnerSeen = (busy = null, x = { export_upload: true }) => mcall('/claim', { runner_id: 'test-pc', version: 'v', busy, ...x });   // 来た印 (待ちがあれば取る・新しい runner = ② を送れる)
+/** ② の書き出しの偽物 (バーコードマスタ.csv の形・Shift_JIS)。n 行 */
+const bmBytes = (n) => iconv.encode(['商品ID,商品名,バーコード', ...Array.from({ length: n }, (_, i) => `p${i},名前${i},49${String(i).padStart(11, '0')}`)].join('\r\n'), 'cp932');
+/** 偽物の session の ②: exportOut に置く (本物の barcode-steps.js の runExport と同じ置き場所) */
+const fakeExport = (o, n) => { fs.writeFileSync(o.exportOut, bmBytes(n)); return { export: { status: 'SUCCESS', rows: n } }; };
 const importBody = (e, x = {}) => ({ request_id: crypto.randomUUID(), text_sha256: e.sha, with_export: true, ...x });
 const sj = (s) => iconv.encode(s, 'cp932');
 
@@ -613,12 +630,14 @@ await ta('[R] miniPC の 1 回: 成功 / 押すを断られた = 押さない / 
     calls.push(['press']);
     await o.onImported({ status: 'SUCCESS', summary: 'インポート結果 総件数 : 1 エラー件数 : 0', counts: STEPS.parseImportSummary('インポート結果 総件数 : 1 処理件数 : 1 処理不要件数 : 0 エラー件数 : 0') });
     console.log('② 書き出しの偽物');
-    return { export: { status: 'SUCCESS', rows: 4321 } };
+    return fakeExport(o, 4321);
   };
   let out = await RUN.runOnce({ client: client(), ...env, localBusy: () => null, session: okSession, log: () => {}, ...noExit });
   assert.deepEqual([out.state, out.executed, calls[0], calls[1]], ['ran', true, ['file', true, true], ['press']]);
   let j = jobRow(id);
   assert.deepEqual([j.state, j.import_total, j.import_errors, j.export_state, j.export_rows], ['imported', 1, 0, 'ok', 4321]);
+  assert.ok(UPLOADS.at(-1).equals(bmBytes(4321)), 'Drive に書いた = miniPC が置いた ② の byte 列そのもの (Shift_JIS のまま)');
+  assert.match(j.export_detail, /入荷バーコード発行.*更新 \(2030-01-10 14:06\)/);
   assert.match(j.log, /ファイルの確かめ[\s\S]*「押す」を知らせた[\s\S]*② 書き出しの偽物/);
   assert.equal(env.peek().import1.sha256, e.file.file_sha256, 'この PC の取込済みの記録 (CLI も飛ばす)');
   // この PC で同じ中身を取り込んだ = もう一度でなければ押さない
@@ -934,7 +953,9 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
     const form = page.locator(`tr[data-bc-form="${e.id}"]`);
     await form.waitFor();
     assert.equal(await form.locator(`#bc-nm-${e.id}`).count(), 0, 'ダウンロードしていない = 手の確かめは出ない');
-    assert.equal(await form.locator(`#bc-exp-${e.id}`).isChecked(), true, '② は既定で書き出す');
+    assert.equal(await form.locator(`#bc-exp-${e.id}`).isChecked(), true, '② は既定で書き出す (miniPC が新しい・Drive に書ける)');
+    assert.equal(await form.locator(`#bc-exp-${e.id}`).isDisabled(), false);
+    assert.equal(await form.locator(`[data-bc-exp-why="${e.id}"]`).count(), 0);
     await form.locator(`button[data-bc-go="${e.id}"]`).click();
     await page.locator(`[data-bc-cell="${e.id}"] [data-bc-state="queued"]`).waitFor({ timeout: 10000 });
     assert.equal(await page.locator(`[data-bc-cell="${e.id}"] button[data-bc-cancel]`).count(), 1, '待ちの間は「やめる」');
@@ -946,11 +967,13 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
     assert.match(await page.locator(`[data-bc-why="${e2.id}"]`).textContent(), /ほかの取り込み/);
     // miniPC が取り込む → 画面が読み直して「取り込みました」・もう一度
     const out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit,
-      session: async (o) => { await o.beforeExecute(); await o.onImported({ summary: 'インポート結果 総件数 : 1 エラー件数 : 0', counts: { total: 1, errors: 0 } }); return { export: { status: 'SUCCESS', rows: 77 } }; } });
+      session: async (o) => { await o.beforeExecute(); await o.onImported({ summary: 'インポート結果 総件数 : 1 エラー件数 : 0', counts: { total: 1, errors: 0 } }); return fakeExport(o, 77); } });
     assert.equal(jobRow(out.job_id).state, 'imported');
     await page.locator(`[data-bc-cell="${e.id}"] [data-bc-state="imported"]`).waitFor({ timeout: 15000 });
     assert.equal(await page.locator(`button[data-bc-import="${e.id}"]`).textContent(), 'もう一度取り込む');
     assert.match(await page.locator(`[data-bc-result="${out.job_id}"]`).textContent(), /総件数 1 · エラー件数 0/);
+    assert.match(await page.locator(`[data-bc-drive-last="${out.job_id}"]`).textContent(), /77 行/, '③ に最後に Drive に書いた回');
+    assert.deepEqual([jobRow(out.job_id).export_state, jobRow(out.job_id).export_rows], ['ok', 77]);
     // もう一度 = 理由が要る
     await page.locator(`button[data-bc-import="${e.id}"]`).click();
     await page.locator(`#bc-rr-${e.id}`).waitFor();
@@ -997,6 +1020,36 @@ await ta('[U] 画面: miniPC が来ていない = 押せない (理由) / 来て
     await page.waitForFunction((jid) => !document.querySelector(`[data-bc-resolve-cell="${jid}"]`), id, { timeout: 10000 });
     assert.equal(jobRow(id).resolved_outcome, 'imported');
     assert.equal(await page.locator(`button[data-bc-import="${e2.id}"]`).textContent(), 'もう一度取り込む');
+    // 🆕 ② ができない (Drive に書けない) = 印を外して押せない・理由 1 行 / 手で取り込み済みの CSV = ボタンなし / ボタンではまだ
+    {
+      NOW = jst('18:00', '2030-01-11');
+      clearUnknown();
+      DRIVE = DRIVE_NG('no_permission');
+      const e4 = await newExport(1);
+      const e5 = await newExport(1);
+      const c5 = (await pg.query('select code from ops.lz_new_export_items where export_id = $1', [e5.id])).rows.map((x) => x.code);
+      const keep = MIRROR;
+      MIRROR = mirrorOf({ keys: [...c5, 'zz-old'] });
+      try {
+        await runnerSeen();
+        await page.reload();
+        await page.locator(`button[data-bc-import="${e4.id}"]`).waitFor();
+        assert.equal(await page.locator(`[data-bc-cell="${e4.id}"] [data-bc-state="none"]`).textContent(), 'ボタンではまだ');
+        assert.equal(await page.locator(`[data-bc-cell="${e5.id}"] [data-bc-state="in_lz"]`).textContent(), 'ロジザードにもうあります (手で取り込み済み)');
+        assert.equal(await page.locator(`button[data-bc-import="${e5.id}"]`).count(), 0, '手で取り込み済み = ボタンを出さない');
+        assert.match(await page.locator('[data-bc-export]').textContent(), /閲覧者のまま/);
+        await page.locator(`button[data-bc-import="${e4.id}"]`).click();
+        const f4 = page.locator(`tr[data-bc-form="${e4.id}"]`);
+        await f4.waitFor();
+        assert.deepEqual([await f4.locator(`#bc-exp-${e4.id}`).isChecked(), await f4.locator(`#bc-exp-${e4.id}`).isDisabled()], [false, true], '② は外れて押せない');
+        assert.equal(await f4.locator(`[data-bc-exp-why="${e4.id}"]`).textContent(), '② (バーコードマスタの書き出し) は、' + DX.DRIVE_WORDS.no_permission + 'ので、しません。今までどおり Stream Deck で書き出してください');
+        await f4.locator(`button[data-bc-go="${e4.id}"]`).click();
+        await page.locator(`[data-bc-cell="${e4.id}"] [data-bc-state="queued"]`).waitFor({ timeout: 10000 });
+        const j4 = BC.getLzBcDb().prepare("select * from bc_jobs where export_id = ? order by job_id desc").get(String(e4.id));
+        assert.equal(j4.with_export, 0, '② なしで積んだ');
+        BC.cancelJob(BC.getLzBcDb(), { jobId: j4.job_id, by: 'naka@test', now: NOW });
+      } finally { MIRROR = keep; DRIVE = DRIVE_OK; }
+    }
     // 信用しない値は文字のまま (ログに HTML)
     assert.deepEqual(errs, [], errs.join('\n'));
   } finally { await browser.close(); }
@@ -1107,6 +1160,249 @@ await ta('[X] ボタンの回が押した後 (executing / exporting) は、別�
   } finally { process.env.DATA_DIR = prev; BC.__setLzBcDb(keep); }
 });
 
+await ta('[E] ② = ポータルが共有ドライブに書く: 書けない・古い miniPC = 印を外して ① だけ / 送る → 確かめ → 上書き / 書けない・中身がおかしい = ② だけ「書けなかった」/ 2 回は書かない / 手で取り込み済みの CSV', async () => {
+  clearUnknown();
+  NOW = jst('10:00', '2030-01-13');
+  const ok1 = { summary: 'インポート結果 総件数 : 1 エラー件数 : 0', counts: { total: 1, errors: 0 } };
+  // 1) Drive に書けない (設定がまだ・権限) = 画面の ② は外れて押せない・積んでも ② なし
+  for (const code of ['off', 'no_permission']) {
+    DRIVE = DRIVE_NG(code);
+    await runnerSeen();
+    const st = await call('GET', '/api/lz-csv/import-status');
+    assert.deepEqual([st.j.export.ok, st.j.export.code], [false, code]);
+    assert.match(st.j.export.message, /今までどおり Stream Deck で書き出してください/);
+    const e = await newExport(1);
+    const id = await queue(e);   // 画面から with_export: true が来ても
+    assert.equal(jobRow(id).with_export, 0, `${code}: ② なしで積む`);
+    let pressed = false;
+    await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit,
+      session: async (o) => { assert.equal(o.withExport, false); await o.beforeExecute(); pressed = true; await o.onImported(ok1); return { export: null }; } });
+    assert.deepEqual([pressed, jobRow(id).state, jobRow(id).export_state], [true, 'imported', 'skipped'], '① は押して取り込んだ');
+  }
+  DRIVE = DRIVE_OK;
+  // 2) 古い miniPC (export_upload を言わない) = ② は外れる / ② つきで積んだ回も、古い runner には ② を外して渡す (① だけ・ポータルの回は「② しなかった」で取り込んだ)
+  await runnerSeen(null, {});
+  assert.equal((await call('GET', '/api/lz-csv/import-status')).j.export.code, 'runner_old');
+  {
+    const e = await newExport(1);
+    await runnerSeen();
+    const r = await call('POST', `/api/lz-csv/${e.id}/import`, importBody(e));
+    assert.equal(r.status, 200, r.text);
+    assert.equal(jobRow(r.j.job_id).with_export, 1);
+    const cl = await runnerSeen(null, {});   // 古い runner が取る
+    assert.equal(cl.j.job.with_export, false, '古い runner には ② の印を外して渡す');
+    const tok = cl.j.claim_token;
+    await mcall(`/jobs/${r.j.job_id}/executing`, { claim_token: tok });
+    assert.equal((await mcall(`/jobs/${r.j.job_id}/import`, { claim_token: tok, import_result: { status: 'ok', counts: { total: 1, errors: 0 } } })).j.state, 'exporting');
+    const fin = await mcall(`/jobs/${r.j.job_id}/final`, { claim_token: tok, executed: true, import_result: { status: 'ok', counts: { total: 1, errors: 0 } }, export_result: { status: 'skipped' } });
+    assert.equal(fin.j.state, 'imported');
+    assert.equal(jobRow(r.j.job_id).export_state, 'skipped', '① は取り込んだ・② はしなかった (失敗にしない)');
+  }
+  // 3) 新しい miniPC + 書ける Drive: ② を送る → 上書き。押した後に Drive の権限が外れた = ② だけ「書けなかった (権限)」・① は取り込んだ
+  {
+    const e = await newExport(1);
+    const id = await queue(e);
+    assert.equal(jobRow(id).with_export, 1);
+    const n0 = UPLOADS.length;
+    let seenOut = null;
+    const out = await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit,
+      session: async (o) => { seenOut = o.exportOut; await o.beforeExecute(); await o.onImported(ok1); DRIVE = DRIVE_NG('no_permission'); return fakeExport(o, 5); } });
+    DRIVE = DRIVE_OK;
+    assert.match(seenOut, /job-\d+[\\/]barcode_master\.csv$/, '② は回ごとの作業用フォルダ (共有ドライブ G: に書かない)');
+    assert.equal(UPLOADS.length, n0, 'Drive には書いていない');
+    assert.deepEqual([out.executed, jobRow(id).state, jobRow(id).export_state], [true, 'imported', 'failed']);
+    assert.match(jobRow(id).export_detail, /書けなかった \(権限\)/);
+    assert.ok(fs.existsSync(seenOut), '書けなかった ② のファイルは残す (証跡)');
+  }
+  // 4) 中身がおかしい (見出しが違う・HTML) = 書かない (② だけ失敗)
+  {
+    const e = await newExport(1);
+    const id = await queue(e);
+    const n0 = UPLOADS.length;
+    await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit,
+      session: async (o) => { await o.beforeExecute(); await o.onImported(ok1); fs.writeFileSync(o.exportOut, sj('商品コード,名前\r\na,b')); return { export: { status: 'SUCCESS', rows: 1 } }; } });
+    assert.equal(UPLOADS.length, n0);
+    assert.deepEqual([jobRow(id).state, jobRow(id).export_state], ['imported', 'failed']);
+    assert.match(jobRow(id).export_detail, /見出しに「商品ID」が無い/);
+  }
+  // 5) 口の守り: 鍵が違う = 403 / ② の途中でない = 409 / 2 回目 = 409 (Drive に 2 回書かない) / sha256 が違う = 失敗
+  {
+    const e = await newExport(1);
+    const id = await queue(e);
+    const cl = await runnerSeen();
+    const tok = cl.j.claim_token;
+    const file = bmBytes(3);
+    const up = (b) => mcall(`/jobs/${id}/export-file`, { claim_token: tok, file_b64: file.toString('base64'), sha256: crypto.createHash('sha256').update(file).digest('hex'), ...b });
+    assert.equal((await up({})).status, 409, '押す前 (claimed) は受けない');
+    await mcall(`/jobs/${id}/executing`, { claim_token: tok });
+    await mcall(`/jobs/${id}/import`, { claim_token: tok, import_result: { status: 'ok', counts: { total: 1, errors: 0 } } });
+    assert.equal((await up({ claim_token: 'bad' })).status, 403);
+    let r = await up({ sha256: 'x'.repeat(64) });
+    assert.deepEqual([r.status, r.j.export.status], [200, 'failed']);
+    assert.match(r.j.export.detail, /sha256/);
+    assert.equal((await up({})).status, 409, '結果が出た後は受けない (2 回書かない)');
+    // 終わりの知らせで miniPC が「ok」と言っても、ポータルが書いた結果 (failed) のまま
+    await mcall(`/jobs/${id}/final`, { claim_token: tok, executed: true, import_result: { status: 'ok', counts: { total: 1, errors: 0 } }, export_result: { status: 'ok', rows: 3 } });
+    assert.deepEqual([jobRow(id).state, jobRow(id).export_state], ['imported', 'failed']);
+    // 大きい ② (約 0.8 MB = base64 で約 1.1 MB) も受ける (ほかの口は 256kb のまま)
+    const e2 = await newExport(1);
+    const id2 = await queue(e2);
+    const c2 = await runnerSeen();
+    await mcall(`/jobs/${id2}/executing`, { claim_token: c2.j.claim_token });
+    await mcall(`/jobs/${id2}/import`, { claim_token: c2.j.claim_token, import_result: { status: 'ok', counts: { total: 1, errors: 0 } } });
+    const big = bmBytes(30000);
+    assert.ok(big.length > 800 * 1024, String(big.length));
+    r = await mcall(`/jobs/${id2}/export-file`, { claim_token: c2.j.claim_token, file_b64: big.toString('base64'), sha256: crypto.createHash('sha256').update(big).digest('hex') });
+    assert.deepEqual([r.status, r.j.export.status, r.j.export.rows], [200, 'ok', 30000], r.text.slice(0, 300));
+    assert.ok(UPLOADS.at(-1).equals(big));
+    assert.equal((await mcall('/claim', null, { raw: JSON.stringify({ runner_id: 'x'.repeat(300 * 1024) }) })).status, 413, 'ほかの口は 256kb のまま');
+    await mcall(`/jobs/${id2}/final`, { claim_token: c2.j.claim_token, executed: true, import_result: { status: 'ok', counts: { total: 1, errors: 0 } }, export_result: { status: 'ok', rows: 30000 } });
+    assert.equal(jobRow(id2).export_state, 'ok');
+  }
+  // 6) 中身の確かめ (drive-export.js)
+  assert.equal(DX.checkBarcodeMasterBytes(bmBytes(4000)).ok, true);
+  assert.match(DX.checkBarcodeMasterBytes(bmBytes(10)).reason, /少なすぎる/);
+  assert.match(DX.checkBarcodeMasterBytes(Buffer.from('<html>login</html>')).reason, /HTML/);
+  assert.match(DX.checkBarcodeMasterBytes(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('商品ID,バーコード\r\na,1')]), { minRows: 1 }).reason, /UTF-8/);
+  assert.match(DX.checkBarcodeMasterBytes(Buffer.from([0x82, 0xa0, 0xff, 0xff]), { minRows: 1 }).reason, /Shift_JIS/);
+  assert.match(DX.checkBarcodeMasterBytes(sj('商品ID,バーコード\r\na,1,2'), { minRows: 1 }).reason, /列の数/);
+  // 7) 本物の書く先の決まり (偽物の googleapis): 設定が無い = 書かない (Drive に触らない) / 閲覧者 = 書けない / 違うファイル = 書かない / 書ける = 同じファイル ID を上書き
+  {
+    const calls = [];
+    let meta = { id: 'F', name: 'バーコードマスタ.csv', driveId: DX.DRIVE_ID, trashed: false, mimeType: 'text/csv', modifiedTime: '2030-01-01T00:00:00Z', size: '10', capabilities: { canEdit: false } };
+    const drive = { files: {
+      get: async (q) => { calls.push(['get', q.fileId, q.supportsAllDrives]); return { data: meta }; },
+      update: async (q) => { calls.push(['update', q.fileId, q.supportsAllDrives, q.media.mimeType]); const chunks = []; for await (const c of q.media.body) chunks.push(c); const b = Buffer.concat(chunks); return { data: { id: q.fileId, modifiedTime: '2030-01-02T00:00:00Z', md5Checksum: crypto.createHash('md5').update(b).digest('hex') } }; },
+    } };
+    let on = false;
+    const t = DX.createDriveTarget({ getDrive: async () => drive, enabled: () => on, fileId: () => 'F' });
+    assert.equal((await t.status()).code, 'off');
+    await assert.rejects(t.upload(bmBytes(5)), (x) => x.code === 'off');
+    assert.equal(calls.length, 0, '設定が無い = Drive に触らない');
+    on = true;
+    assert.equal((await t.status({ force: true })).code, 'no_permission', '閲覧者 = 書けない');
+    await assert.rejects(t.upload(bmBytes(5)), (x) => x.code === 'no_permission');
+    meta = { ...meta, name: 'ほかの.csv', capabilities: { canEdit: true } };
+    assert.equal((await t.status({ force: true })).code, 'wrong_file');
+    meta = { ...meta, name: 'バーコードマスタ.csv', driveId: 'other' };
+    assert.equal((await t.status({ force: true })).code, 'wrong_file', '違う共有ドライブ');
+    meta = { ...meta, driveId: DX.DRIVE_ID, size: String(10 * 1024 * 1024) };
+    await assert.rejects(t.upload(bmBytes(5)), (x) => x.code === 'shrunk', '今のファイルの半分より小さい = 書かない');
+    meta = { ...meta, size: '10' };
+    assert.deepEqual(await t.upload(bmBytes(5)), { modified_time: '2030-01-02T00:00:00Z' });
+    assert.deepEqual(calls.filter((c) => c[0] === 'update'), [['update', 'F', true, 'text/csv']], '同じファイル ID を中身だけ上書き (共有ドライブ)');
+    assert.ok(calls.every((c) => c[2] === true), 'いつも supportsAllDrives');
+  }
+  // 8) CSV の商品が全部ロジザードの写しにある = 「もうあります (手で取り込み済み)」・積まない / 一部 = 件数だけ / 無い = 「ボタンではまだ」
+  {
+    const e = await newExport(2);
+    const codes = (await pg.query('select code from ops.lz_new_export_items where export_id = $1 order by code', [e.id])).rows.map((x) => x.code);
+    const keep = MIRROR;
+    try {
+      MIRROR = mirrorOf({ keys: [...codes, 'zz-old'] });
+      await runnerSeen();
+      const r = await call('POST', `/api/lz-csv/${e.id}/import`, importBody(e));
+      assert.deepEqual([r.status, r.j.reason], [409, 'already_in_lz'], r.text);
+      for (const rr of ['', 'もう一度の理由']) {
+        const r2 = await call('POST', `/api/lz-csv/${e.id}/import`, importBody(e, { rerun_reason: rr }));
+        assert.deepEqual([r2.status, r2.j.reason], [409, 'already_in_lz'], `理由の欄で飛ばせない (${JSON.stringify(rr)}・Codex R1 High)`);
+      }
+      // ロジザードのバーコードマスタに大文字小文字だけ違う商品ID = いつも積まない (Codex R1 High)
+      MIRROR = { ...mirrorOf({ keys: ['zz-old'] }), ids: new Map([[codes[0].toLowerCase(), new Set([codes[0].toUpperCase()])]]) };
+      const r3 = await call('POST', `/api/lz-csv/${e.id}/import`, importBody(e));
+      assert.deepEqual([r3.status, r3.j.reason], [409, 'lz_case_collision'], r3.text);
+      assert.ok((await call('GET', '/lz-csv')).text.includes('"in_lz_collide":1'));
+      MIRROR = mirrorOf({ keys: [...codes, 'zz-old'] });
+      const pg1 = await call('GET', '/lz-csv');
+      assert.ok(pg1.text.includes('ロジザードにもうあります (手で取り込み済み)'));
+      // 一部だけある = その商品が 2 回登録になる = 積まない (Codex R2 High)
+      MIRROR = mirrorOf({ keys: [codes[0], 'zz-old'] });
+      const r4 = await call('POST', `/api/lz-csv/${e.id}/import`, importBody(e, { with_export: false }));
+      assert.deepEqual([r4.status, r4.j.reason], [409, 'partly_in_lz'], r4.text);
+      // 商品の一覧の写しが読めなくても、バーコードマスタの写しの商品ID では照らす (Codex R2 High)
+      MIRROR = { ...mirrorOf({ keys: [] }), ok: false, reason: '一覧なし', ids: new Map(codes.map((c) => [c.toLowerCase(), new Set([c])])) };
+      assert.equal((await call('POST', `/api/lz-csv/${e.id}/import`, importBody(e))).j.reason, 'already_in_lz');
+      // 本番の CSV #3 の形: ボタンの回が「押す前に止めた」で終わっている + 写しに全部ある = 「もうあります」・積まない
+      MIRROR = mirrorOf({ keys: ['zz-old'] });
+      const e6 = await newExport(1);
+      const id6 = await queue(e6);
+      const cl = await runnerSeen();
+      await mcall(`/jobs/${cl.j.job.job_id}/final`, { claim_token: cl.j.claim_token, executed: false, reason: 'precheck', detail: '② の保存先フォルダが無い' });
+      assert.equal(jobRow(id6).state, 'not_executed');
+      const c6 = (await pg.query('select code from ops.lz_new_export_items where export_id = $1', [e6.id])).rows.map((x) => x.code);
+      MIRROR = mirrorOf({ keys: [...c6, 'zz-old'] });
+      assert.equal((await call('POST', `/api/lz-csv/${e6.id}/import`, importBody(e6))).j.reason, 'already_in_lz');
+      assert.match((await call('GET', '/lz-csv')).text, new RegExp(`data-bc-cell="${e6.id}"><span class="hint">ロジザードにもうあります \\(手で取り込み済み\\)`));
+    } finally { MIRROR = keep; }
+  }
+  // 9) ② の結果の順番: 期限 (sweep) が来てもポータルが書いた結果は残る・2 回は受けない / 終わりの知らせ (miniPC の「失敗」) が先でも、後から届いた Drive の結果が勝つ (Codex R1 High・Medium)
+  {
+    const u = U(); alive(u);
+    let k = 0;
+    const go = (t0) => {
+      const a = BC.enqueue(u, base({ now: t0, rows: 1, exportId: String(900 + (++k)) }));
+      const c = BC.claimJob(u, { jobId: a.job_id, runnerId: 'pc', now: t0 });
+      BC.markExecuting(u, { jobId: a.job_id, claimToken: c.claimToken, now: t0 });
+      BC.reportImport(u, { jobId: a.job_id, claimToken: c.claimToken, importResult: { status: 'ok', counts: { total: 1, errors: 0 } }, now: t0 });
+      return [a.job_id, c.claimToken];
+    };
+    const row = (id) => u.prepare('select state, export_state, export_rows from bc_jobs where job_id = ?').get(id);
+    let [id, tok] = go(jst('10:00'));
+    BC.beginExportUpload(u, { jobId: id, claimToken: tok, now: jst('10:01') });
+    BC.recordExportUpload(u, { jobId: id, claimToken: tok, status: 'ok', rows: 9, now: jst('10:02') });
+    BC.sweep(u, jst('10:30'));
+    assert.deepEqual(Object.values(row(id)), ['imported', 'ok', 9], '期限の後も Drive に書いた結果のまま');
+    assert.equal(err(() => BC.beginExportUpload(u, { jobId: id, claimToken: tok, now: jst('10:31') })).code, 'bad_state', '2 回は受けない');
+    BC.reportFinal(u, { jobId: id, claimToken: tok, executed: true, importResult: { status: 'ok', counts: { total: 1, errors: 0 } }, exportResult: { status: 'failed', detail: 'x' }, now: jst('10:32') });
+    assert.equal(row(id).export_state, 'ok', '終わりの知らせの申告では変えない');
+    alive(u, jst('11:00'));
+    [id, tok] = go(jst('11:00'));
+    BC.beginExportUpload(u, { jobId: id, claimToken: tok, now: jst('11:01') });
+    BC.reportFinal(u, { jobId: id, claimToken: tok, executed: true, importResult: { status: 'ok', counts: { total: 1, errors: 0 } }, exportResult: { status: 'failed', detail: '送れない (時間切れ)' }, now: jst('11:02') });
+    assert.deepEqual(Object.values(row(id)), ['imported', 'unknown', null], 'ポータルが受けた・結果なし = miniPC の「失敗」でなく分からない (Codex R2 Medium)');
+    BC.recordExportUpload(u, { jobId: id, claimToken: tok, status: 'ok', rows: 7, now: jst('11:03') });
+    assert.deepEqual(Object.values(row(id)), ['imported', 'ok', 7], '後から届いた Drive の結果が勝つ');
+    assert.equal(BC.lastDriveExport(u).job_id, id);
+    // 受けていない回の結果は書かない
+    alive(u, jst('12:00'));
+    [id, tok] = go(jst('12:00'));
+    assert.equal(BC.recordExportUpload(u, { jobId: id, claimToken: tok, status: 'ok', now: jst('12:01') }).already, true);
+    // 遅れた古い回 (期限で「② 分からない」) は、後の回が Drive に書いた後は受けない (古い中身で巻き戻さない。Codex R2 High)
+    BC.sweep(u, jst('12:30'));
+    assert.equal(row(id).export_state, 'unknown');
+    const [oldId, oldTok] = [id, tok];
+    alive(u, jst('13:00'));
+    [id, tok] = go(jst('13:00'));
+    BC.beginExportUpload(u, { jobId: id, claimToken: tok, now: jst('13:01') });
+    BC.recordExportUpload(u, { jobId: id, claimToken: tok, status: 'ok', rows: 5, now: jst('13:02') });
+    assert.match(err(() => BC.beginExportUpload(u, { jobId: oldId, claimToken: oldTok, now: jst('13:03') })).message, /後の取り込み/);
+    assert.equal(BC.lastDriveExport(u).job_id, id);
+  }
+  // 10) 書きに行った後に答えが無い = 「分からない」(「前のまま」と言わない) / 商品ID が空の行 = 書かない
+  {
+    const e = await newExport(1);
+    const id = await queue(e);
+    const keepT = DX.getDriveTarget();
+    DX.__setDriveTarget({ ...keepT, upload: async () => { throw new DX.DriveWriteError('uncertain', '時間切れ'); } });
+    try {
+      await RUN.runOnce({ client: client(), ...runnerEnv(), localBusy: () => null, log: () => {}, ...noExit,
+        session: async (o) => { await o.beforeExecute(); await o.onImported(ok1); return fakeExport(o, 3); } });
+    } finally { DX.__setDriveTarget(keepT); }
+    assert.deepEqual([jobRow(id).state, jobRow(id).export_state], ['imported', 'unknown']);
+    assert.match(jobRow(id).export_detail, /書けたか分からない/);
+    assert.doesNotMatch(jobRow(id).export_detail, /前のまま/);
+    assert.match(DX.checkBarcodeMasterBytes(sj('商品ID,商品名,バーコード\r\n,名前,4901'), { minRows: 1 }).reason, /商品ID が空/);
+    assert.match(DX.checkBarcodeMasterBytes(sj('商品ID,商品名,バーコード\r\na,名前,\r\nb,名前,'), { minRows: 1 }).reason, /バーコードが空の行が多すぎる/);
+    // 本物の書く先: 5xx・時間切れ・md5 が違う = uncertain / 4xx = 書いていない
+    const mk = (update) => DX.createDriveTarget({ enabled: () => true, fileId: () => 'F', getDrive: async () => ({ files: {
+      get: async () => ({ data: { id: 'F', name: 'バーコードマスタ.csv', driveId: DX.DRIVE_ID, trashed: false, mimeType: 'text/csv', size: '10', capabilities: { canEdit: true } } }), update } }) });
+    await assert.rejects(mk(async () => { const x = new Error('boom'); x.code = 503; throw x; }).upload(bmBytes(5)), (x) => x.code === 'uncertain');
+    await assert.rejects(mk(async () => { throw new Error('ETIMEDOUT'); }).upload(bmBytes(5)), (x) => x.code === 'uncertain');
+    await assert.rejects(mk(async () => ({ data: { md5Checksum: 'nope' } })).upload(bmBytes(5)), (x) => x.code === 'uncertain');
+    await assert.rejects(mk(async () => { const x = new Error('bad'); x.code = 400; throw x; }).upload(bmBytes(5)), (x) => x.code === 'rejected');
+  }
+});
+
 await ta('[D] 配り方・台帳・つかいかた: miniPC に runner と手順の部品・Stream Deck に barcode-steps.js / 台帳 lz-bc-import-runner / server.js は parser の前に機械の口 / つかいかた', async () => {
   const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const m = JSON.parse(fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'manifest.json'), 'utf8'));
@@ -1126,7 +1422,7 @@ await ta('[D] 配り方・台帳・つかいかた: miniPC に runner と手順�
   const guard = s.lastIndexOf("if (process.env.MASTER_EDIT_ENABLED === '1' && (process.env.PORTAL_VARIANT || 'render').toLowerCase() === 'render') {", at);
   assert.ok(guard > 0 && !s.slice(guard, at).includes('}'), 'マスタの入力と同じ Render だけ');
   const man = await call('GET', '/manual');
-  for (const w of ['id="lz-import"', 'ロジザードに取り込む', '取り込めたか分かりません', 'インポート履歴', '23:45〜01:30', '両方に入っている人', 'ロジザード登録の CSV</a>」の画面で作ります', 'CSV に出した商品を GAS からも出さない']) assert.ok(man.text.includes(w), `つかいかたに「${w}」が無い`);
+  for (const w of ['id="lz-import"', 'ロジザードに取り込む', '取り込めたか分かりません', 'インポート履歴', '23:45〜01:30', '両方に入っている人', 'ロジザード登録の CSV</a>」の画面で作ります', 'CSV に出した商品を GAS からも出さない', '今までどおり Stream Deck で書き出す', 'ボタンではまだ', 'ロジザードにもうあります (手で取り込み済み)']) assert.ok(man.text.includes(w), `つかいかたに「${w}」が無い`);
 });
 
 server.close();
