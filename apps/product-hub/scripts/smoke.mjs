@@ -5878,6 +5878,49 @@ let wfSetParentId = null;
     let matErr = null;
     try { wfpEarly.setStepState(idV2, 'imgd_material', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { matErr = e; }
     check('v2: ③ 素材待ちは 社内準備 のままでは完了できない', matErr?.status === 400 && /素材完了/.test(matErr.message), matErr?.message);
+    // 2026-10-21 スタッフ要望: ボードで ③ より先へ動かしたら、撮影・素材ステータスを「素材完了」にそろえて通す
+    // (「商品発送済み」のままだと ⑤デザイン修正 へ動かせず、毎回 素材完了 に直していた)。詳細画面・API の ③完了 は今までどおり止める
+    {
+      const mkMv = (code) => {
+        const mid = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand, image_priority)
+          VALUES (?, 'ボード移動で素材完了', 'smoke', 1, '自社商品（重要度：高）')`).run(code).lastInsertRowid);
+        wfpEarly.ensureProgress(db, mid);
+        db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, 0)`).run(mid, `${code}-img-1`);
+        return mid;
+      };
+      const stOf = (mid, code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(mid, code)?.state;
+      const matOf = (mid) => db.prepare('SELECT material_status FROM draft_image_production WHERE draft_id = ?').get(mid)?.material_status;
+      // 自社商品 + 商品発送済み → ⑤デザイン修正 へ
+      const idMv = mkMv('DRV-MV-1');
+      dbmod.upsertImageProduction(db, idMv, { material_status: 'shipped' });
+      let mvErr = null;
+      try { wfpEarly.setStepState(idMv, 'imgd_material', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { mvErr = e; }
+      check('ボード移動で素材完了: 詳細画面・API の ③完了 は 商品発送済み のままでは今までどおり止める',
+        mvErr?.status === 400 && matOf(idMv) === 'shipped', mvErr?.message);
+      let mvRes = null; mvErr = null;
+      try { mvRes = wfpEarly.moveBoardCard(idMv, { view: 'image', kind: 'detail', to: 'design', expectedCurrent: 'imgd_request' }, 'smoke', ADMIN2); } catch (e) { mvErr = e; }
+      check('ボード移動で素材完了: 自社商品 + 商品発送済み でも ⑤デザイン修正 へ動かせ、ステータスが 素材完了 になる',
+        !mvErr && matOf(idMv) === 'ready' && stOf(idMv, 'imgd_material') === 'done' && stOf(idMv, 'imgd_ai') === 'done' && stOf(idMv, 'imgd_design') === 'todo',
+        mvErr?.message || JSON.stringify([mvRes, matOf(idMv)]));
+      check('ボード移動で素材完了: 変えたことを履歴に残す',
+        !!db.prepare(`SELECT 1 FROM draft_events WHERE draft_id = ? AND event = 'material_status_changed' AND detail LIKE '%商品発送済み%素材完了%'`).get(idMv));
+      // 戻しても素材完了は書き換えない (人が直す)
+      wfpEarly.moveBoardCard(idMv, { view: 'image', kind: 'detail', to: 'material', expectedCurrent: 'imgd_design' }, 'smoke', ADMIN2);
+      check('ボード移動で素材完了: ③ へ戻してもステータスはそのまま', stOf(idMv, 'imgd_material') === 'todo' && matOf(idMv) === 'ready');
+      // 撮影判定「カメラマン撮影」+ 撮影中 → ④AI制作 へ
+      const idMv2 = mkMv('DRV-MV-2');
+      dbmod.setShootMode(db, idMv2, 'photographer', { actor: 'smoke' });
+      dbmod.upsertImageProduction(db, idMv2, { material_status: 'shooting' });
+      mvErr = null;
+      try { wfpEarly.moveBoardCard(idMv2, { view: 'image', kind: 'detail', to: 'ai', expectedCurrent: 'imgd_request' }, 'smoke', ADMIN2); } catch (e) { mvErr = e; }
+      check('ボード移動で素材完了: 撮影判定 カメラマン撮影 + 撮影中 でも ④AI制作 へ動かせ、ステータスが 素材完了 になる',
+        !mvErr && matOf(idMv2) === 'ready' && stOf(idMv2, 'imgd_material') === 'done' && stOf(idMv2, 'imgd_ai') === 'todo', mvErr?.message);
+      // ③ より手前への移動では変えない
+      const idMv3 = mkMv('DRV-MV-3');
+      dbmod.upsertImageProduction(db, idMv3, { material_status: 'shipped' });
+      wfpEarly.moveBoardCard(idMv3, { view: 'image', kind: 'detail', to: 'material', expectedCurrent: 'imgd_request' }, 'smoke', ADMIN2);
+      check('ボード移動で素材完了: ③素材待ち までの移動ではステータスを変えない', matOf(idMv3) === 'shipped' && stOf(idMv3, 'imgd_material') === 'todo');
+    }
     dbmod.upsertImageProduction(db, idV2, { material_status: 'ready' });
     check('v2: 素材完了なら ③ 完了', wfpEarly.setStepState(idV2, 'imgd_material', { state: 'done' }, 'smoke', ADMIN2).changed === true);
     wfpEarly.setStepState(idV2, 'imgd_ai', { state: 'done' }, 'smoke', ADMIN2);
@@ -11217,22 +11260,6 @@ renders.push(
     board: wfp.boardData(db, { view: 'image', imageKind: 'top' }),
   }],
   ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
-  // 撮影指示書 (2026-10-01): 撮影不要 + 古い撮影指示URL あり。実データでは作りにくいので
-  // カードの値を直接差し替えて、画面が「対象外」を先に出すことを固定する
-  ['board.ejs (撮影指示書: 撮影不要 + 古いURL)', 'board.ejs', {
-    ...boardBase,
-    board: {
-      ...boardBase.board,
-      columns: boardBase.board.columns.map((c, i) => (i === 0 ? {
-        ...c,
-        cards: c.cards.slice(0, 1).map((card) => ({
-          ...card,
-          image: { ...card.image, cameraInstruction: { registered: true, notRequired: true } },
-        })),
-      } : { ...c, cards: [] })),
-      doneCards: [],
-    },
-  }],
   // 完了列のカードにも画像の状況を出す (2026-09-01)。実データでは完了が 0 件のこともあるので、
   // 進行中のカードを 1 枚借りて必ず描かせる
   ['board.ejs (完了列にカード)', 'board.ejs', {
@@ -11828,22 +11855,10 @@ for (const [name, file, data] of renders) {
   check('ボード: カードの 詳細画像 行に 済/まだ/対象外 のバッジが付く',
     rowsOk(rows.filter((r) => r.includes('>詳細画像<'))),
     rows.filter((r) => r.includes('>詳細画像<')).slice(0, 2).join(' | ') || '(詳細の行が無い)');
-  // 構成 (2026-09-13 スタッフ要望)。トップ画像・詳細画像と同じ形で 済/まだ/対象外 を出す
-  check('ボード: カードの 構成 行に 済/まだ/対象外 のバッジが付く',
-    rowsOk(rows.filter((r) => r.includes('>構成<'))),
-    rows.filter((r) => r.includes('>構成<')).slice(0, 2).join(' | ') || '(構成の行が無い)');
-  // 撮影指示書 (2026-10-01 スタッフ要望)。トップ画像・詳細画像と同じ形で 済/まだ/対象外 を出す
-  check('ボード: カードの 撮影指示書 行に 済/まだ/対象外 のバッジが付く',
-    rowsOk(rows.filter((r) => r.includes('>撮影指示書<'))),
-    rows.filter((r) => r.includes('>撮影指示書<')).slice(0, 2).join(' | ') || '(撮影指示書の行が無い)');
-  // 🚨 撮影不要 + 古い撮影指示URL は「対象外」が勝つ (URL を先に見ると「済」に出てしまう)
-  {
-    const bhCi = renderedHtml.get('board.ejs (撮影指示書: 撮影不要 + 古いURL)') || '';
-    const ciRows = krowsOf(bhCi).filter((r) => r.includes('>撮影指示書<'));
-    check('ボード 撮影指示書: 撮影不要 + 古いURL のときは「対象外」(URL より撮影不要を先に見る)',
-      ciRows.length > 0 && ciRows.every((r) => badgeOf(r)?.text === '対象外'),
-      ciRows.slice(0, 2).join(' | ') || '(撮影指示書の行が無い)');
-  }
+  // 構成・撮影指示書の行は 2026-10-21 に外した (縦列と被る・スタッフ要望)。カードは トップ画像 / 詳細画像 の 2 行だけ
+  check('ボード: カードに 構成 / 撮影指示書 の行を出さない (縦列と被るので外した・2026-10-21)',
+    rows.length > 0 && !rows.some((r) => r.includes('>構成<') || r.includes('>撮影指示書<')),
+    rows.filter((r) => r.includes('>構成<') || r.includes('>撮影指示書<')).slice(0, 2).join(' | '));
   // まとめて移動 (2026-09-13 スタッフ要望)。カードごとに選択のチェックがあり、リンクの外に置く (押しても詳細へ飛ばない)
   check('ボード: カードにまとめて移動の選択チェックがあり、リンクの外にある',
     /<label class="kb-pick"[^>]*><input type="checkbox" class="kb-pick-box"[^>]*><\/label>\s*<a class="kb-card-link"/.test(bh));
@@ -11861,9 +11876,9 @@ for (const [name, file, data] of renders) {
     const bhDone = renderedHtml.get('board.ejs (完了列にカード)') || '';
     const doneCol = bhDone.split('data-col="done"')[1] || '';
     const doneRows = krowsOf(doneCol);
-    check('ボード: 完了列のカードにも トップ画像 / 詳細画像 / 撮影指示書 の状況が出る',
+    check('ボード: 完了列のカードにも トップ画像 / 詳細画像 の状況が出る (撮影指示書は出さない)',
       rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<')))
-      && rowsOk(doneRows.filter((r) => r.includes('>撮影指示書<'))),
+      && !doneRows.some((r) => r.includes('>撮影指示書<')),
       doneRows.slice(0, 2).join(' | ') || '(完了列に画像の行が無い)');
     // 完了列のカードにも楽天の状態と商品名を持たせる (2026-09-10 監査: 差し戻し時の出品確認が
     // 商品名なし・対象外でも出ていた)

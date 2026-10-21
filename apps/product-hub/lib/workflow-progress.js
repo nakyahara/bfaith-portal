@@ -1015,6 +1015,20 @@ export function setStepState(
     // bypassGates = 移行 (Notion 画像DB 取り込み等) が「Notion 側で既に済んでいる段階」を写すときだけ。画面・D&D は必ずゲートを通る
     if (!bypassGates && state === 'done' && (((ownBrandDraft || shootNeeded) && code === 'imgd_material') || code === 'imgd_review_2')) {
       const ip = db.prepare('SELECT material_status FROM draft_image_production WHERE draft_id = ?').get(id) || {};
+      // ボードで ③素材待ち より先 (④AI制作・⑤デザイン修正…) へ動かした = 人が「素材が揃った」と決めた印として、
+      // 撮影・素材ステータスを「素材完了」にそろえてから通す (2026-10-21 スタッフ要望: 「商品発送済み」のままだと
+      // 列を動かせず、毎回 素材完了 に直す手間があった)。そろえるのはボードの移動だけ — 詳細画面・API の
+      // 「③を完了」は今までどおり止める。移動の transaction の中なので、あとの工程で止まれば一緒に戻る。
+      // ③ 完了 + 素材完了 なので materialStepWouldBreak・撮影判定の決まり・AI 制作のゲートとも食い違わない
+      const gateFails = code === 'imgd_material'
+        && (shootNeeded ? ip.material_status !== 'ready' : (ip.material_status !== 'ready' && ip.material_status !== 'not_required'));
+      if (gateFails && boardMove) {
+        db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
+        db.prepare(`UPDATE draft_image_production SET material_status = 'ready', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE draft_id = ?`).run(id);
+        logEvent(db, id, 'material_status_changed',
+          `ボードで ③素材待ち より先へ動かしたので、撮影・素材ステータスを「${MATERIAL_STATUS_LABELS[ip.material_status] || '未設定'}」→「素材完了」に`, actor);
+        ip.material_status = 'ready';
+      }
       if (code === 'imgd_material' && shootNeeded && ip.material_status !== 'ready') {
         throw badRequest(`完了にはまだ足りません: 撮影判定が「${matRow.shoot_mode === 'inhouse' ? '社内撮影' : 'カメラマン撮影'}」なので、撮影の素材が揃ってから撮影・素材ステータスを「素材完了」にしてください (いまは「${MATERIAL_STATUS_LABELS[ip.material_status] || '未設定'}」)`);
       }

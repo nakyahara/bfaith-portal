@@ -672,7 +672,7 @@ export const STEP_SEEDS = [
   {
     code: 'imgd_material', label: '素材待ち', track: 'image', image_kind: 'detail', image_stage: 'material',
     role_code: 'image', sort: 30, stall_days: 7, skippable: 0, listing_gate: 1,
-    description: '③ 撮影・社内準備した素材が揃うのを待つ (「撮影・素材」が 素材完了 か 撮影不要 で完了できる)',
+    description: '③ 撮影・社内準備した素材が揃うのを待つ (「撮影・素材」が 素材完了 か 撮影不要 で完了できる。ボードで ③ より先へ動かすと 素材完了 にそろう)',
   },
   {
     code: 'imgd_ai', label: 'AI制作', track: 'image', image_kind: 'detail', image_stage: 'ai',
