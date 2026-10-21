@@ -466,7 +466,7 @@ export function profitShipChoices(options, neMethod, neShippingCost) {
     // 置かないと画面が先頭候補を初期選択して、開いただけで利益額が代表送料に変わる
     // (バリエーションで送料は一致・配送方法名だけ割れている場合など — Codex R3 P1)
     list.unshift({
-      method: cur || 'NEの登録送料 (配送方法は未設定)',
+      method: cur || '登録済みの送料 (配送方法は未設定)',
       cost: actual, count: 0, isCurrent: true,
     });
   } else if (cur && !list.some((o) => o.isCurrent)) {
