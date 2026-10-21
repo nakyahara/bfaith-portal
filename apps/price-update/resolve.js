@@ -427,6 +427,9 @@ export function buildTargets(db, inputCodes, opts = {}) {
       rowKind,
       viaCode: viaCode || null,
       kind: p.kind,
+      // ★セット商品かどうかは商品マスタで決める。rowKind は「入力されたか / 含むセットとして足したか」なので、
+      //   セットのコードを直接入れると rowKind='single' になる (「まとめて入れる」から外すのに使う)
+      isSetProduct: String(p.kind || '').trim() === 'セット' || Number(p.setCount) > 0,
       handling: p.handling,
       cost,
       costSource,

@@ -361,6 +361,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         neCode: t.neCode,
         productName: t.name,
         rowKind: t.rowKind,
+        isSetProduct: !!t.isSetProduct,
         viaCode: t.viaCode,
         mall: l.mall,
         listingCode,

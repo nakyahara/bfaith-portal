@@ -122,6 +122,13 @@ console.log('\n── 広げた後の引き当て ──');
   const sets = targets.filter((t) => t.rowKind === 'set').map((t) => t.neCode);
   eq(singles, ['0726-001802-be', '0726-001802-bk', '0726-001802-gr'], '子はそれぞれ単品の行になる');
   eq(sets, ['0726-001802-set'], 'セットは今までどおり「含むセット」として別に出る (初期未選択)');
+  ok(targets.every((t) => t.isSetProduct === (t.neCode === '0726-001802-set')), 'isSetProduct はセットだけ true');
+}
+{
+  // ★セットのコードを直接入れると rowKind='single' になる。「まとめて入れる」から外す印は isSetProduct (Codex R1)
+  const { targets } = buildTargets(db, ['0726-001802-bk', '0726-001802-set']);
+  const set = targets.find((t) => t.neCode === '0726-001802-set');
+  eq([set.rowKind, set.isSetProduct], ['single', true], '直接入れたセット: rowKind は single でも isSetProduct は true');
 }
 
 console.log('\n── 列が無い mirror でも落ちない ──');

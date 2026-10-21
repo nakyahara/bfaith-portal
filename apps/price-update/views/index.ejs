@@ -562,7 +562,8 @@
     const norm = (c) => String(c == null ? '' : c).trim().toLowerCase();
     const x = scope === '' ? null : expansions[Number(scope)];
     const inScope = x ? new Set([...x.children, ...(x.parentIsProduct ? [x.parent] : [])].map(norm)) : null;
-    return rows.filter((r) => !r.manual && r.rowKind === 'single' && r.confidence === 'confirmed'
+    // ★セットは rowKind だけでなく商品マスタの区分でも外す (セットのコードを直接入れると rowKind は 'single' — Codex R1)
+    return rows.filter((r) => !r.manual && r.rowKind === 'single' && !r.isSetProduct && r.confidence === 'confirmed'
       && r.mall === mall && (!inScope || inScope.has(norm(r.neCode))));
   }
 
@@ -573,7 +574,7 @@
     $('bulk-msg').textContent = '';
     // 対象の選び分けは代表商品コードで広げた時だけ出す (ふつうに NEコードを並べた時は全部が対象)
     $('bulk-scope-wrap').classList.toggle('hidden', expansions.length === 0);
-    const singles = new Set(rows.filter((r) => !r.manual && r.rowKind === 'single').map((r) => r.neCode)).size;
+    const singles = new Set(rows.filter((r) => !r.manual && r.rowKind === 'single' && !r.isSetProduct).map((r) => r.neCode)).size;
     $('bulk-scope').innerHTML = '<option value="">表示中の単品すべて (' + singles + ' 品)</option>'
       + expansions.map((x, i) => '<option value="' + i + '">代表 ' + esc(x.parent) + ' のバリエーション ('
         + (x.children.length + (x.parentIsProduct ? 1 : 0)) + ' 品)</option>').join('');
