@@ -765,6 +765,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const compRet = await insertMany(db, 'core.sku_components', ['company_id', 'parent_sku_id', 'child_sku_id', 'qty', 'source', 'created_by_type', 'created_by_id'], compRows,
       { onConflict: "on conflict (parent_sku_id, child_sku_id) do update set qty = excluded.qty, source = excluded.source where core.sku_components.source <> 'manual' and (core.sku_components.qty, core.sku_components.source) is distinct from (excluded.qty, excluded.source)", returning: 'parent_sku_id' });
     compSec.applied = compRet.length;
+    // 🆕 構成を足した・直した・消した親 (commit の後にセットの導く値を計算し直す = lib/master-write.mjs の recomputeSetsAfterLoad)
+    const compChangedParents = new Set(compRet.map((r) => String(r.parent_sku_id)));
     compSec.same += compRows.length - compRet.length;   // 値が同じ行は UPDATE しない (変更の記録・親の version を無駄に増やさない)
     // 完全に読めた親 = plan に構成が 1 行以上あり、skip が無い。それ以外 (空・読めない・未解決) は触らない
     const pruneParents = compParents.filter((p) => !parentsWithSkip.has(p));
@@ -774,6 +776,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       const del = stale.filter((r) => r.source !== 'manual');
       for (const r of stale.filter((r) => r.source === 'manual')) { report.conflicts.push({ kind: 'set_component_manual_kept', parent_sku_id: Number(r.parent_sku_id), child_sku_id: Number(r.child_sku_id) }); manualKeptOnPrune.push([Number(r.parent_sku_id), Number(r.child_sku_id), Number(r.qty)]); }
       if (del.length) await db.query(`delete from core.sku_components where (parent_sku_id, child_sku_id) in (select unnest($1::bigint[]), unnest($2::bigint[]))`, [del.map((r) => r.parent_sku_id), del.map((r) => r.child_sku_id)]);
+      for (const r of del) compChangedParents.add(String(r.parent_sku_id));
       compSec.notes.push(`stale removed: ${del.length}`);
     }
     if (compSec.skipped.length) report.unresolved.set_components = compSec.skipped;
@@ -810,6 +813,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     //   🚨 並び (sort) は材料の行の順 (NE の API の順が rowid で運ばれたもの = NE の取得に並びの列は無い)
     report.set_observations = await recordSetObservations(db, plan, { runId, kindHeld });
     if (report.set_observations.note) compSec.notes.push(report.set_observations.note);
+    report.set_derived = { changed_parents: compChangedParents.size };   // 🆕 commit の後に計算し直す (下の recomputeSetsAfterLoad)
 
     // ── 5. sku_costs (有効行と違うときだけ付け替え) ──
     // 持ち主が Company DB なら原価の行を作らない・閉じない (予定 0 件)
@@ -1500,6 +1504,21 @@ export async function runInitialLoad(db, plan, opts = {}) {
       const tp = Date.now();
       report.set_observations.promotions = await promoteObservedSets(db, report.set_observations.candidates, { ownership, now, log });
       report.set_observations.promotions.ms = Date.now() - tp;
+    }
+    // 🆕 commit の後: 構成が変わったセット (この回 + 前の 7 日に夜間ロードが構成を変えたセット) の導く値 (税率・取扱・原価) を、画面の保存と同じ規則で計算し直す
+    //   (lib/master-write.mjs の recomputeSetsAfterLoad・セットごとに 1 取引・人の値 (例外原価・セット自身の取扱) は残す・失敗してもロードは成功のまま = 次の晩にもう一度)。
+    //   構成の持ち主が company (夜間ロードが構成を書かない) なら呼ばない = 構成の昇格 (promoteComponentRequest) が計算し直す
+    if (!dryRun && loadOwns('sku_components')) {
+      const td = Date.now();
+      try {
+        const { recomputeSetsAfterLoad } = await import('../../../lib/master-write.mjs');   // 読み込みの輪を避けて使うときに読む (promoteObservedSets と同じ)
+        report.set_derived = { ...report.set_derived, ...await recomputeSetsAfterLoad(db, { changedSetIds: [...compChangedParents], ownership, now, runId, host: opts.host, log }) };
+        if (report.set_derived.changed) log(`set_derived: ${report.set_derived.changed} 件のセットの導く値を計算し直した (対象 ${report.set_derived.candidates})`);
+      } catch (e) {
+        report.set_derived = { ...report.set_derived, errors: 1, error: String(e && e.message).slice(0, 200) };
+        log(`セットの導く値の計算し直しに失敗: ${e && e.message}`);
+      }
+      report.set_derived.ms = Date.now() - td;
     }
     return report;
   } catch (e) {

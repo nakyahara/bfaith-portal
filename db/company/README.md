@@ -3037,3 +3037,28 @@ node -r dotenv/config scripts\company-db\master-ownership-epoch.mjs status     #
 - 当て方: 0099 の後に `migrate.mjs --dry-run` (関数の置き換えと印だけ・値は変えない) → 中原さんの OK → 本適用 → アプリを配る。ロールの流し直しは要らない。夜間ロードの指紋は変えない
 - NE の実機の試し: `AI_reference/システム設計/CompanyDB構想/_raw/NE_CSV実機の試し_20261021_セットの中身` (数量を変える・足す・書かない内訳が残るか)。結果が出るまでは最初の 1 回を 1 セットで
 - 試験 = `scripts/test-master-reg-csv.mjs` [SC1] (依頼・CSV・外すだけ・取り下げ・0100 の前は 409) [SC2] (画面・API) / `scripts/test-master-edit.mjs` [11L] / `scripts/test-master-register.mjs` [G-0100]
+
+### 夜間ロードがセットの構成を変えたら、セットの導く値を計算し直す (migration なし・2026-10-21 中原さん承認)
+- **なぜ**: 10/5 からセットの税率・取扱・原価 (導く値) の持ち主は company = 構成品から導く (画面の保存・構成の昇格が計算し直す)。でも構成 (`sku_components`) の持ち主は load のまま =
+  NE でセットの中身を変えると、夜間ロードが `core.sku_components` を書き直すのに導く値は前の構成のまま残っていた (本番 10/21: maikoset の原価 1,562 円 ≠ 今の構成品の合計 2,040 円・
+  10/13 の夜間ロードが構成品を入れ替えた)。NE で直接作られた要確認 (quarantined) のセットも、構成は入るのに原価の行が無いまま (33 件)
+- **アプリ** (`lib/master-write.mjs` の `recomputeSetsAfterLoad`・`apps/company-db/load/engine.mjs` の commit の後 = 構成の依頼の昇格の次):
+  対象 = この回の夜間ロードが構成の行を足した・直した・消した親 ∪ 前の 7 日に夜間ロードが構成を変えた親 (変更の記録 `events.master_change_events` の `sku_component`・`company_db_load` =
+  前の晩に計算し直せなかったセットも拾う)。セットごとに 1 取引・鍵は構成の昇格と同じ順 (段階 共有 → 開いているか・導く値の持ち主が company か → マスタの書き込み 共有 (短く待つ) →
+  SKU ごと (セット + 構成品) → CSV → 行 → 読み直す)。計算は画面の保存と同じ `recomputeSet` (`planSetDerived` = `lib/master-set-rules.js`)。
+  人の値は残す: 例外原価 (`manual` / `override_zero`) は上書きしない・セット自身の取扱 (`handling_own`) が無いセットは構成品が止まったときだけ止める・先の日付の原価があるセットは計算しない。
+  変わらないセットは何も書かない (記録なし)。変更の記録 = `system`・actor_id = 夜間ロードの host・`company_db_load`・run_id = 夜間ロードの回・理由「構成の変更に合わせて計算し直し」。
+  計算し直せない (夜間ロードの鍵の最中・先の日付の原価・原価の期間が重なる) = 何も書かずに数えるだけ (次の晩にもう一度・7 日まで)。対象が 300 件より多い = 1 つも計算し直さない (守り)。
+  report の `set_derived` (changed_parents・candidates・changed・same・skipped・retry・reasons・results)。構成の持ち主が company になったら呼ばない (構成の昇格が計算し直す)
+- **NE には何も送らない**: NE のセットの欄は名前・売価だけ (「NEへ送る」0094 の `ck_nuv_kind_col`・照合 ② の `NE_VALUE_COLS.set`) = セットの税率・取扱・原価は「NEへ送る」に出ない。
+  古い表 (m_products) のセットの原価は作り直しが構成品から計算する (`set_calc` は Company DB の値を写さない) = 写しの値は変わらない
+- **前から残るずれの後始末** `scripts/company-db/set-derived-catchup.mjs` (人が 1 回流す道具・migration なし・定期実行ではない): 全部のセット (か `--code`) を今の構成で計算し直す。
+  既定 = dry-run (読み取りの取引・前 → 後・人の値で残すセット・直さないセット・計画のハッシュ) / `--apply --expect-hash <dry-run のハッシュ> --yes` = 1 つの取引 (鍵の後に読み直してハッシュを比べる・
+  書いた答えが計画と違えば巻き戻す)。変更の記録 = 人 (`--actor`)・理由 (`--reason`)・request_id・`set_derived_catchup`。2 回目の dry-run は「直す 0」= もう一度流しても何もしない
+  - 本番 10/21 の dry-run (読むだけ): セット 2,264 件のうち直す 34 件 = maikoset (available) の原価 1,562 → 2,040 円と、要確認のセット 33 件の原価 空 → 構成品の合計。税率・取扱の差は 0。
+    例外原価で残す 6 件 (構成品の合計と違う: agneyemask5-o・bathpowder21・keshiki-tstt・nemune-100gs・proherbem-st-ct・qais-bfaithset)
+- 当て方 (🚨 中原さんの OK の後): migration は無い。🚨 `engine.mjs` は夜間ロードの規則の指紋 (`LOAD_RULE_FILES`) に入る = **朝の照合の後〜次の夜間ロード (02:00) の前に Render と miniPC の両方へ配り** (同じ日のうちに)、
+  両方の build を確かめる (違う build だとその朝の照合 ① が `rule_mismatch`)。配った後の最初の夜間ロードが、前の 7 日に構成が変わったセットを計算し直す。
+  その後 miniPC で後始末の道具の dry-run → 中原さんが表を見て OK → 同じ日に `--apply --expect-hash … --yes` (同じ `--actor` / `--reason` / `--code`)
+- 戻し方: この PR を revert して両方へ配る (配る時刻の条件は上と同じ)。計算し直した値は変更の記録に残る (前の原価の行は昨日で閉じただけ = 消していない)
+- 試験 = `scripts/test-set-derived-load.mjs` (PGlite: [L1]〜[L5] 夜間ロード・[C1]〜[C3] 後始末の道具) / `scripts/test-set-derived-load-pg.mjs` (実 PostgreSQL: 鍵の待ち合わせ [P1]〜[P4])
