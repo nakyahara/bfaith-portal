@@ -396,8 +396,18 @@ export function rejectedComposeDraft(db, draftId) {
   const text = job.output_text;
   const r = readComposition(text);
   if (!r.ok) return { job, edit: null, text, error: r.error };
+  // 🚨 uid と要撮影は見出しの番号 (# N枚目 の N) で引く。AI の撮影判定は見出しの番号で書かれている。
+  //    できた構成は lint で 0, 1, 2 … の連番と決まっているが、rejected の構成は lint を通っていないので
+  //    番号が飛ぶ・並びが違うことがある (並び順で引くと、要撮影の画像を取り違えてカットが落ちる・Codex)。
+  //    番号が読めない・重なるときは画像ごとに引かず、本文から拾う (cutsFromComposeText)
+  const nos = r.slots.map((s) => {
+    const m = String(s.headingLine || '').match(IMAGE_HEADING_RE);
+    const n = m ? Number.parseInt(m[1].replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)), 10) : NaN;
+    return Number.isInteger(n) && n >= 0 && n <= 99 ? n : null;
+  });
+  if (nos.some((n) => n === null) || new Set(nos).size !== nos.length) return { job, edit: null, text, error: '画像の番号が読めない・重なっています' };
   const aiNeeds = aiNeedsShootOf(job);
-  const slots = r.slots.map((s, i) => ({ ...s, uid: `a${i}`, shoot: aiNeeds ? aiNeeds.get(i) === true : false }));
+  const slots = r.slots.map((s, i) => ({ ...s, uid: `a${nos[i]}`, shoot: aiNeeds ? aiNeeds.get(nos[i]) === true : false }));
   return { job, edit: null, text, head: r.head, tail: r.tail, slots };
 }
 

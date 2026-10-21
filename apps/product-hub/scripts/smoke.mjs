@@ -7204,10 +7204,10 @@ let wfSetParentId = null;
         const shootJsonR = JSON.stringify({ recommended: 'inhouse', reason: '2枚目の写真が無い', images: [
           { no: 0, needs_shoot: false, ...blankR }, { no: 1, needs_shoot: false, ...blankR },
           { no: 2, needs_shoot: true, cut: '足りない色のカット', composition: '8色を並べる', props: '', background: '白', tone: '自然光', ng: '' }] });
-        const addRejected = (modelCheck = 'match') => {
+        const addRejected = (modelCheck = 'match', text = lpText, shootJson = shootJsonR) => {
           const jid = Number(db.prepare(`INSERT INTO ph_lp_compose_jobs
             (draft_id, idempotency_key, status, error_code, packet_json, packet_hash, packet_version, spec_id, spec_hash, requested_by, measurement_deadline_at, output_text, shoot_json)
-            VALUES (?, ?, 'failed', 'rejected', '{}', 'p', 1, ?, 'h', 'smoke', '2026-10-09T00:00:00Z', ?, ?)`).run(idR, `ss-key-${++jobSeq}`, specId, lpText, shootJsonR).lastInsertRowid);
+            VALUES (?, ?, 'failed', 'rejected', '{}', 'p', 1, ?, 'h', 'smoke', '2026-10-09T00:00:00Z', ?, ?)`).run(idR, `ss-key-${++jobSeq}`, specId, text, shootJson).lastInsertRowid);
           db.prepare(`INSERT INTO ph_lp_compose_generations (job_id, packet_hash, lease_token, status, model, prompt_version, reserved_day, model_check)
             VALUES (?, 'p', ?, 'rejected', 'claude-opus-5-5', 'lp-compose-v1', '2026-10-09', ?)`).run(jid, `lt-${jid}`, modelCheck);
           return jid;
@@ -7234,6 +7234,16 @@ let wfSetParentId = null;
         db.prepare(`UPDATE ph_lp_compose_generations SET model_check = 'mismatch' WHERE job_id = ?`).run(jobR);
         check('撮影指示書の材料: 実モデルが一致しない参考の構成は使わない', cutsR().source === 'none');
         db.prepare(`UPDATE ph_lp_compose_generations SET model_check = 'match' WHERE job_id = ?`).run(jobR);
+        // 🚨 rejected の構成は lint を通っていないので番号が飛ぶことがある (0・1・3)。AI の判定は見出しの番号で引く (Codex)
+        const skipText = lpText.replace(/^# 2枚目｜/m, '# 3枚目｜');
+        const skipJson = JSON.stringify({ recommended: 'inhouse', reason: '3枚目の写真が無い', images: [
+          { no: 0, needs_shoot: false, ...blankR }, { no: 1, needs_shoot: false, ...blankR },
+          { no: 3, needs_shoot: true, cut: '番号が飛んだ画像のカット', composition: '並べる', props: '', background: '白', tone: '自然光', ng: '' }] });
+        check('撮影指示書の材料: (前提) 番号の飛んだ構成を作れた', skipText !== lpText);
+        addRejected('match', skipText, skipJson);
+        cr = cutsR();
+        check('🚨 撮影指示書の材料: 参考の構成の番号が飛んでいても、要撮影の画像を見出しの番号で取り違えない',
+          cr.source === 'lp_draft' && cr.cuts.length === 1 && cr.cuts[0].content === '番号が飛んだ画像のカット', JSON.stringify(cr));
         // 作り直しを頼んだ (いちばん新しい依頼が queued) なら古い参考の構成は使わない
         addJob(idR, 'queued', null);
         check('🚨 撮影指示書の材料: 作り直しを頼んだ後は古い参考の構成を使わない', cutsR().source === 'none');
