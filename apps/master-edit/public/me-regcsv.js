@@ -166,7 +166,7 @@
         }
         got.forEach(function (f, i) { setTimeout(function () { download(f.export_id); }, i * 700); });
         if (errs.length) { buildAllId = uuid(); b.disabled = false; return; }
-        setTimeout(function () { finish('CSV ができました (' + files.map(label).join('・') + ')。NE の「商品一括登録」で取り込んで、「NE に取り込んだ」を押してください (押さなくても翌朝自動で確かめます)'); }, 1200 + got.length * 700);
+        setTimeout(function () { finish('CSV ができました (' + files.map(label).join('・') + ')。NE の「商品一括登録」で取り込んで、「NE に取り込んだ」を押してください' + (files.some(function (f) { return f.kind === 'sets'; }) ? ' (セットの CSV は必ず押してください。単品は押さなくても翌朝自動で確かめます)' : ' (押さなくても翌朝自動で確かめます)')); }, 1200 + got.length * 700);
       });
     } else if (act === 'declare-quick') {
       // 🆕 10/20: ボタン 1 つの申告 = 配ったファイルの sha256 (この画面が持っている記録の値) をそのまま送る。DB が記録と同じかを確かめる
@@ -182,7 +182,7 @@
       p = post('/api/reg-csv/exports/' + id + '/issue', {}).then(function (r) {
         if (!r.ok || r.j.refused) { say(cardMsg, r.j.refused ? '使わないにした商品があるので配れません (ファイルを閉じました)。作り直してください' : errText(r.j, r.status), false); b.disabled = false; return; }
         download(id);
-        setTimeout(function () { finish('ファイル #' + id + ' を配りました (ダウンロード)。NE の「商品一括登録」で取り込んでください。翌朝の照合で自動で確かめます (申告はしなくて大丈夫です)'); }, 1200);
+        setTimeout(function () { finish('ファイル #' + id + ' を配りました (ダウンロード)。NE の「商品一括登録」で取り込んでください。' + (card.getAttribute('data-kind') === 'sets' ? 'セットは取り込んだら「NE に取り込んだ」を押してください (押すと翌朝の照合で確かめます)' : '翌朝の照合で自動で確かめます (申告はしなくて大丈夫です)')); }, 1200);
       });
     } else if (act === 'declare') {
       var res = $('input[type=radio]:checked', drawer);

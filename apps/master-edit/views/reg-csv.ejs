@@ -121,21 +121,21 @@
     <section class="panel" id="todo" aria-labelledby="h-todo">
       <div class="panel-h"><span class="hico" aria-hidden="true">②</span><h2 id="h-todo">NE で取り込む</h2><span class="sub">NE の「商品一括登録」で取り込みます</span></div>
       <% for (const e of toDownload) { %>
-      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-label="<%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV">
+      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-label="<%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV">
         <div class="fh"><span class="ttl"><%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV</span><span class="b warn">まだダウンロードしていません</span></div>
         <div class="acts"><button class="btn pri" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>ダウンロード</button><span class="hint"><%= when(e.created_at) %> に作った</span></div>
         <div class="msgline" data-msg-card role="status" aria-live="polite"></div>
       </article>
       <% } %>
       <% for (const e of toImport) { const notImp = e.items.some((i) => i.last_check && i.last_check.detail && i.last_check.detail.not_imported === true); %>
-      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-label="<%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV">
+      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-label="<%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV">
         <div class="fh"><span class="ttl"><%= kindLabel[e.kind] %> <%= e.item_count %> 件の CSV</span><span class="b info"><span class="dot" aria-hidden="true"></span>NE で取り込むのを待っています</span></div>
         <div class="fmeta"><span><%= when(e.issued_at) %> にダウンロード</span><span class="dotsep" aria-hidden="true"></span><span class="mono" style="font-size:12px"><%= e.file_name %></span></div>
         <% if (notImp) { %><div class="why-wrn" style="margin-top:6px"><svg class="ic" aria-hidden="true"><use href="#i-warn"/></svg><span>日がたっても NE に出てきません。まだなら NE で取り込んでください (取り込まないなら「これまでの記録」から「使わない」に)</span></div><% } %>
         <div class="acts">
           <button class="btn pri" type="button" data-act="declare-quick" data-result="ok"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>NE に取り込んだ</button>
           <button class="btn sm" type="button" data-act="issue"<%= dis %>><svg class="ic s" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
-          <span class="hint">押さなくても、翌朝 NE に出ていれば自動で確かめます</span>
+          <span class="hint"><%= e.kind === 'sets' ? 'セットは、NE に取り込んだらこのボタンを押してください (押すと翌朝 NE で確かめます)' : '押さなくても、翌朝 NE に出ていれば自動で確かめます' %></span>
         </div>
         <details class="more"><summary><svg class="ic s" aria-hidden="true"><use href="#i-chevr"/></svg>NE で失敗があったとき (「N件失敗」・全部だめ)</summary>
           <div class="body">
@@ -151,7 +151,7 @@
       </article>
       <% } %>
       <% for (const e of trialDone) { %>
-      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>">
+      <article class="filecard todo-card exp" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>">
         <div class="fh"><span class="ttl">試しの<%= kindLabel[e.kind] %>の CSV が NE で確かめられました</span></div>
         <div class="hint" style="margin-top:4px">NE の画面も見て問題なければ押してください。次からは 1 回で <%= S.max_rows.toLocaleString('ja-JP') %> 行まで作れます。</div>
         <div class="acts">
@@ -208,7 +208,7 @@
       <div id="files" style="margin-top:14px">
       <% if (!S.exports.length) { %><div class="empty">まだありません。</div><% } %>
       <% for (const e of S.exports) { const open = e.state !== 'closed'; %>
-      <article class="filecard exp<%= open ? '' : ' closed' %>" data-id="<%= e.export_id %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-labelledby="ft-<%= e.export_id %>">
+      <article class="filecard exp<%= open ? '' : ' closed' %>" data-id="<%= e.export_id %>" data-kind="<%= e.kind %>" data-sha="<%= e.sha256 %>" data-state="<%= e.state %>" aria-labelledby="ft-<%= e.export_id %>">
         <div class="fh"><span class="ttl" id="ft-<%= e.export_id %>">ファイル #<%= e.export_id %></span><span class="b <%= e.kind === 'sets' ? 'vio' : 'mute' %>"><%= kindLabel[e.kind] %></span><% if (e.trial) { %><span class="b warn">試し用</span><% } %>
           <span class="b <%= open ? STATE_BADGE[e.state] : (CLOSE_BADGE[e.close_reason] || 'mute') %>"><% if (open) { %><span class="dot" aria-hidden="true"></span><% } %><%= EXPORT_STATES[e.state] || e.state %><%= e.close_reason ? ` (${CLOSE_REASONS[e.close_reason] || e.close_reason})` : '' %></span></div>
         <div class="fmeta">
@@ -245,7 +245,7 @@
           <% if (e.state === 'built') { %>
             <button class="btn pri" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>配る (ダウンロード)</button>
           <% } else if (e.state === 'issued') { %>
-            <span class="hint">NE に取り込んで全部成功なら、翌朝の照合で自動で確かめます (申告は要りません)。「N件失敗」・全部だめのときは必ず申告</span>
+            <span class="hint"><%= e.kind === 'sets' ? 'セットは、NE に取り込んだら必ず申告してください (翌朝の照合で確かめます)' : 'NE に取り込んで全部成功なら、翌朝の照合で自動で確かめます (申告は要りません)。「N件失敗」・全部だめのときは必ず申告' %></span>
             <button class="btn" type="button" data-act="issue"<%= dis %>><svg class="ic" aria-hidden="true"><use href="#i-dl"/></svg>もう一度ダウンロード</button>
             <button class="btn sm" type="button" data-act="show-declare" aria-expanded="false" aria-controls="dr-d-<%= e.export_id %>"<%= dis %>>取り込んだと申告 (N件失敗・全部だめのときは必ず)</button>
           <% } else { %>
@@ -258,7 +258,7 @@
         </div>
         <% if (e.state !== 'built') { %>
         <div class="drawer" id="dr-d-<%= e.export_id %>" data-drawer="declare" hidden>
-          <div class="panel-h" style="margin-bottom:6px"><h3 style="font-size:15.5px">取り込んだと申告</h3><span class="sub">全部成功なら要りません (翌朝の照合で確かめます)。一部失敗 (「N件失敗」)・全部だめのときは必ず、NE の画面の結果をそのまま書きます (申告しないと入らなかった商品が待ちのまま)</span></div>
+          <div class="panel-h" style="margin-bottom:6px"><h3 style="font-size:15.5px">取り込んだと申告</h3><span class="sub"><%= e.kind === 'sets' ? 'セットは全部成功でも申告します (申告すると翌朝の照合で確かめます)' : '全部成功なら要りません (翌朝の照合で確かめます)' %>。一部失敗 (「N件失敗」)・全部だめのときは必ず、NE の画面の結果をそのまま書きます (申告しないと入らなかった商品が待ちのまま)</span></div>
           <div class="f" style="align-items:start"><div class="lab" style="padding-top:12px">取り込んだファイル</div><div class="ctl col">
             <label class="drop" data-drop>
               <span class="fileico"><svg class="ic l" aria-hidden="true"><use href="#i-file"/></svg></span>
